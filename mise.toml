@@ -1,0 +1,37 @@
+min_version = "2026.10.12"
+
+[settings]
+# Rust comes from rust-toolchain.toml; mise must not pin its own.
+idiomatic_version_file_enable_tools = ["rust"]
+auto_install = true
+cargo.binstall_native = true
+cargo.binstall_only = false
+
+[task_config]
+# Git Bash on Windows, so task scripts are the same everywhere.
+shell = "bash -o errexit -o pipefail -c"
+
+[tools]
+mr-boxington = "latest"
+"cargo:cargo-nextest" = "0.9"
+mold = { version = "latest", os = ["linux"] }
+hyperfine = "latest"
+"cargo:cargo-bloat" = "latest"
+"cargo:cargo-llvm-lines" = "latest"
+
+[wrappers.cargo]
+command = "mbx"
+env = { MBX_CARGO_SHIM_MODE = "1" }
+
+[tasks]
+build = "cargo build --workspace"
+release = "cargo build-release --workspace"
+fmt = "cargo fmt --all"
+test = "cargo nextest run --workspace --no-tests=pass"
+"check:fmt" = "cargo fmt --all --check"
+"check:clippy" = "cargo clippy --workspace --all-targets -- -D warnings"
+check = { depends = ["check:fmt", "check:clippy", "test"] }
+size = { depends = ["release"], run = 'f=target/release/a; [[ -e $f.exe ]] && f+=.exe; b=$(wc -c < "$f"); echo "a: $((b / 1024)) KiB of 4096 KiB"; ((b <= 4194304))' }
+startup = { depends = ["release"], run = 'hyperfine -N --warmup 50 -r 500 "target/release/a --version"' }
+bloat = "cargo bloat --release --crates -n 20"
+"bloat:lines" = "cargo llvm-lines --release -p a | head -30"

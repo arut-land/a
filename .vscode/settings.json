@@ -1,0 +1,25 @@
+{
+  // An inherited RUSTUP_TOOLCHAIN outranks rust-toolchain.toml.
+  "rust-analyzer.server.extraEnv": { "RUSTUP_TOOLCHAIN": null },
+  // Builds go through mise's cargo wrapper (mbx). Build scripts and checks share
+  // their own target dir so they never wait on terminal builds' lock.
+  "rust-analyzer.cargo.buildScripts.overrideCommand": [
+    "mise", "exec", "--", "cargo", "check", "--quiet", "--workspace", "--all-targets",
+    "--keep-going", "--message-format=json", "--target-dir", "target/rust-analyzer"
+  ],
+  "rust-analyzer.check.overrideCommand": [
+    "mise", "exec", "--", "cargo", "clippy", "--quiet", "--workspace", "--all-targets",
+    "--keep-going", "--message-format=json-diagnostic-rendered-ansi", "--target-dir", "target/rust-analyzer"
+  ],
+  "rust-analyzer.runnables.command": "mbx",
+  "[rust]": {
+    "editor.defaultFormatter": "rust-lang.rust-analyzer",
+    "editor.formatOnSave": true
+  },
+  "[toml]": {
+    "editor.defaultFormatter": "tamasfe.even-better-toml"
+  },
+  "files.associations": {
+    "mise.lock": "toml"
+  }
+}

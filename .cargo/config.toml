@@ -1,0 +1,19 @@
+include = [{ path = "profiles.toml" }]
+
+[unstable]
+codegen-backend = true
+
+[build]
+rustflags = ["-Zthreads=8"]
+
+# Target rustflags replace build.rustflags, so -Zthreads is repeated here.
+[target.'cfg(target_os = "linux")']
+linker = "clang"
+rustflags = ["-Zthreads=8", "-Clink-arg=-fuse-ld=mold"]
+
+[target.'cfg(all(windows, target_env = "msvc"))']
+rustflags = ["-Zthreads=8", "-Ctarget-feature=+crt-static", "-Clink-arg=/STACK:8388608"]
+
+[alias]
+# [unstable] build-std would also rebuild std for dev builds.
+build-release = "build --release -Zbuild-std=std,panic_unwind"
