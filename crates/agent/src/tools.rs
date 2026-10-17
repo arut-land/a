@@ -1,4 +1,4 @@
-use std::process::Command;
+use std::process::{Command, Stdio};
 use std::thread;
 use std::time::Duration;
 
@@ -13,18 +13,24 @@ impl Tool for RunCommand {
         "run_command"
     }
 
-    fn call(&self, input: &Value, cx: &Cx) -> Result<Value, String> {
+    fn call(&self, input: &Value, cx: &Cx<'_>) -> Result<Value, String> {
         let command = input["command"].as_str().ok_or("missing `command`")?;
-        let shell = if cfg!(windows) {
-            ["cmd", "/c"]
+        let (shell, flag) = if cfg!(windows) {
+            ("cmd", "/c")
         } else {
-            ["sh", "-c"]
+            ("sh", "-c")
         };
-        let out = Command::new(shell[0])
-            .args([shell[1], command])
-            .current_dir(&cx.cwd)
-            .output()
-            .map_err(|e| e.to_string())?;
+        let mut cmd = Command::new(shell);
+        cmd.args([flag, command])
+            .current_dir(cx.cwd)
+            .stdin(Stdio::null())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped());
+        #[cfg(unix)]
+        std::os::unix::process::CommandExt::process_group(&mut cmd, 0);
+        let child = cmd.spawn().map_err(|e| e.to_string())?;
+        (cx.spawned)(child.id());
+        let out = child.wait_with_output().map_err(|e| e.to_string())?;
         Ok(json!({
             "exit": out.status.code(),
             "stdout": String::from_utf8_lossy(&out.stdout),
@@ -44,7 +50,7 @@ impl Tool for Sleep {
         Replay::Safe
     }
 
-    fn call(&self, input: &Value, _cx: &Cx) -> Result<Value, String> {
+    fn call(&self, input: &Value, _cx: &Cx<'_>) -> Result<Value, String> {
         let seconds = input["seconds"].as_u64().ok_or("missing `seconds`")?;
         thread::sleep(Duration::from_secs(seconds));
         Ok(json!({ "slept": seconds }))

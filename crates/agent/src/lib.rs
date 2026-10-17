@@ -3,7 +3,7 @@
 //! An agent never performs I/O: it turns an [`Input`] into [`Action`]s, and the
 //! engine commits entries, runs tools and feeds results back in.
 
-use std::path::PathBuf;
+use std::path::Path;
 
 use protocol::{Body, Outcome};
 use serde_json::{Value, json};
@@ -56,8 +56,11 @@ pub enum Replay {
     Unsafe,
 }
 
-pub struct Cx {
-    pub cwd: PathBuf,
+pub struct Cx<'a> {
+    pub cwd: &'a Path,
+    /// Tools that start processes report each process group here, so the
+    /// engine can record it durably and kill it if the daemon dies mid-call.
+    pub spawned: &'a dyn Fn(u32),
 }
 
 pub trait Tool: Send + Sync {
@@ -67,7 +70,7 @@ pub trait Tool: Send + Sync {
         Replay::Unsafe
     }
 
-    fn call(&self, input: &Value, cx: &Cx) -> Result<Value, String>;
+    fn call(&self, input: &Value, cx: &Cx<'_>) -> Result<Value, String>;
 }
 
 pub struct Toolset {
@@ -88,7 +91,7 @@ impl Toolset {
             .map(AsRef::as_ref)
     }
 
-    pub fn run(&self, name: &str, input: &Value, cx: &Cx) -> Outcome {
+    pub fn run(&self, name: &str, input: &Value, cx: &Cx<'_>) -> Outcome {
         match self.get(name) {
             None => Outcome::Failed {
                 error: format!("unknown tool {name}"),

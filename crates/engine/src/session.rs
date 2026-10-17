@@ -99,29 +99,20 @@ impl Session {
 
     fn run(&self, tools: &Toolset, inbox: &Receiver<String>) {
         let mut agent = Echo;
-        let cx = Cx {
-            cwd: self.workspace.clone(),
-        };
-        if let Err(e) = self.recover(&mut agent, tools, &cx) {
+        if let Err(e) = self.recover(&mut agent, tools) {
             eprintln!("session {}: recovery: {e}", self.id.short());
         }
         for text in inbox {
             let result = self
                 .append(Body::User { text: text.clone() })
-                .and_then(|_| self.drive(&mut agent, tools, &cx, Input::User { text }));
+                .and_then(|_| self.drive(&mut agent, tools, Input::User { text }));
             if let Err(e) = result {
                 eprintln!("session {}: {e}", self.id.short());
             }
         }
     }
 
-    fn drive(
-        &self,
-        agent: &mut impl Agent,
-        tools: &Toolset,
-        cx: &Cx,
-        input: Input,
-    ) -> io::Result<()> {
+    fn drive(&self, agent: &mut impl Agent, tools: &Toolset, input: Input) -> io::Result<()> {
         let mut inputs = VecDeque::from([input]);
         while let Some(input) = inputs.pop_front() {
             for action in agent.step(input) {
@@ -134,7 +125,7 @@ impl Session {
                             tool: tool.clone(),
                             input: input.clone(),
                         })?;
-                        let outcome = tools.run(&tool, &input, cx);
+                        let outcome = self.run_tool(tools, call, &tool, &input);
                         self.append(Body::ToolResult {
                             call,
                             outcome: outcome.clone(),
@@ -147,26 +138,81 @@ impl Session {
         Ok(())
     }
 
+    fn run_tool(
+        &self,
+        tools: &Toolset,
+        call: u64,
+        tool: &str,
+        input: &serde_json::Value,
+    ) -> Outcome {
+        let spawned = |pgid| {
+            let Some(boot) = sys::boot_id() else { return };
+            let body = Body::ToolProcess {
+                call,
+                pgid,
+                boot: boot.to_owned(),
+            };
+            if let Err(e) = self.append(body) {
+                eprintln!("session {}: recording process {pgid}: {e}", self.id.short());
+            }
+        };
+        tools.run(
+            tool,
+            input,
+            &Cx {
+                cwd: &self.workspace,
+                spawned: &spawned,
+            },
+        )
+    }
+
     /// Finishes the effect sandwich for calls that have an intent but no
-    /// outcome: safe tools run again, everything else is marked interrupted.
-    fn recover(&self, agent: &mut impl Agent, tools: &Toolset, cx: &Cx) -> io::Result<()> {
+    /// outcome: their leftover processes are killed, then safe tools run
+    /// again and everything else is marked interrupted.
+    fn recover(&self, agent: &mut impl Agent, tools: &Toolset) -> io::Result<()> {
         let dangling = dangling_calls(&self.lock().entries);
-        for (call, tool, input) in dangling {
-            let outcome = match tools.get(&tool).map(agent::Tool::replay) {
-                Some(Replay::Safe) => tools.run(&tool, &input, cx),
+        for call in dangling {
+            let this_boot = call
+                .processes
+                .iter()
+                .filter(|(_, boot)| Some(boot.as_str()) == sys::boot_id());
+            for (pgid, _) in this_boot {
+                if let Err(e) = sys::kill_process_group(*pgid) {
+                    eprintln!(
+                        "session {}: killing process group {pgid}: {e}",
+                        self.id.short()
+                    );
+                }
+            }
+            let outcome = match tools.get(&call.tool).map(agent::Tool::replay) {
+                Some(Replay::Safe) => self.run_tool(tools, call.seq, &call.tool, &call.input),
                 _ => Outcome::Interrupted,
             };
             self.append(Body::ToolResult {
-                call,
+                call: call.seq,
                 outcome: outcome.clone(),
             })?;
-            self.drive(agent, tools, cx, Input::ToolDone { call, outcome })?;
+            self.drive(
+                agent,
+                tools,
+                Input::ToolDone {
+                    call: call.seq,
+                    outcome,
+                },
+            )?;
         }
         Ok(())
     }
 }
 
-fn dangling_calls(entries: &[Entry]) -> Vec<(u64, String, serde_json::Value)> {
+struct Dangling {
+    seq: u64,
+    tool: String,
+    input: serde_json::Value,
+    processes: Vec<(u32, String)>,
+}
+
+fn dangling_calls(entries: &[Entry]) -> Vec<Dangling> {
     let finished: HashSet<u64> = entries
         .iter()
         .filter_map(|e| match &e.body {
@@ -174,14 +220,26 @@ fn dangling_calls(entries: &[Entry]) -> Vec<(u64, String, serde_json::Value)> {
             _ => None,
         })
         .collect();
-    entries
-        .iter()
-        .filter(|e| !finished.contains(&e.seq))
-        .filter_map(|e| match &e.body {
-            Body::ToolCall { tool, input } => Some((e.seq, tool.clone(), input.clone())),
-            _ => None,
-        })
-        .collect()
+    let mut dangling: Vec<Dangling> = Vec::new();
+    for e in entries {
+        match &e.body {
+            Body::ToolCall { tool, input } if !finished.contains(&e.seq) => {
+                dangling.push(Dangling {
+                    seq: e.seq,
+                    tool: tool.clone(),
+                    input: input.clone(),
+                    processes: Vec::new(),
+                });
+            }
+            Body::ToolProcess { call, pgid, boot } => {
+                if let Some(d) = dangling.iter_mut().find(|d| d.seq == *call) {
+                    d.processes.push((*pgid, boot.clone()));
+                }
+            }
+            _ => {}
+        }
+    }
+    dangling
 }
 
 #[cfg(test)]
@@ -221,9 +279,18 @@ mod tests {
                     input: json!({}),
                 },
             ),
+            entry(
+                4,
+                Body::ToolProcess {
+                    call: 3,
+                    pgid: 42,
+                    boot: "boot".into(),
+                },
+            ),
         ];
         let dangling = dangling_calls(&entries);
         assert_eq!(dangling.len(), 1);
-        assert_eq!(dangling[0].0, 3);
+        assert_eq!(dangling[0].seq, 3);
+        assert_eq!(dangling[0].processes, [(42, "boot".to_owned())]);
     }
 }

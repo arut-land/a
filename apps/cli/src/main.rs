@@ -106,6 +106,7 @@ fn print_msg(msg: &DaemonMsg) {
                 Some(command) => println!("tool $ {command}"),
                 None => println!("tool {tool} {input}"),
             },
+            Body::ToolProcess { .. } => {}
             Body::ToolResult { outcome, .. } => print_outcome(outcome),
         },
         DaemonMsg::Synced { .. } | DaemonMsg::Welcome { .. } | DaemonMsg::Sessions { .. } => {}

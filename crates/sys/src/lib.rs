@@ -51,6 +51,16 @@ pub fn workspace_of(dir: &Path) -> PathBuf {
 #[cfg(unix)]
 pub use unix::*;
 
+#[cfg(not(unix))]
+pub fn boot_id() -> Option<&'static str> {
+    None
+}
+
+#[cfg(not(unix))]
+pub fn kill_process_group(_pgid: u32) -> io::Result<()> {
+    Err(io::Error::from(io::ErrorKind::Unsupported))
+}
+
 #[cfg(unix)]
 mod unix {
     use std::fs;
@@ -113,6 +123,42 @@ mod unix {
         })
     }
 
+    /// Identifies the current boot, so recorded pgids are never acted on after
+    /// a reboot. Computed once per process.
+    pub fn boot_id() -> Option<&'static str> {
+        static BOOT: std::sync::OnceLock<Option<String>> = std::sync::OnceLock::new();
+        BOOT.get_or_init(read_boot_id).as_deref()
+    }
+
+    #[cfg(target_os = "linux")]
+    fn read_boot_id() -> Option<String> {
+        let id = fs::read_to_string("/proc/sys/kernel/random/boot_id").ok()?;
+        Some(id.trim().to_owned())
+    }
+
+    #[cfg(not(target_os = "linux"))]
+    fn read_boot_id() -> Option<String> {
+        let out = std::process::Command::new("sysctl")
+            .args(["-n", "kern.bootsessionuuid"])
+            .output()
+            .ok()?;
+        let id = String::from_utf8(out.stdout).ok()?;
+        Some(id.trim().to_owned()).filter(|id| !id.is_empty())
+    }
+
+    /// Sends SIGKILL to a whole process group; a group that is already gone is
+    /// not an error.
+    pub fn kill_process_group(pgid: u32) -> io::Result<()> {
+        let group = i32::try_from(pgid)
+            .ok()
+            .and_then(rustix::process::Pid::from_raw)
+            .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "invalid pgid"))?;
+        match rustix::process::kill_process_group(group, rustix::process::Signal::KILL) {
+            Ok(()) | Err(rustix::io::Errno::SRCH) => Ok(()),
+            Err(e) => Err(e.into()),
+        }
+    }
+
     /// Leaves the spawning terminal's session so its hangup never reaches us.
     pub fn detach_session() -> io::Result<()> {
         rustix::process::setsid()?;
@@ -138,6 +184,21 @@ mod unix {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[cfg(unix)]
+    #[test]
+    fn kills_a_whole_process_group() {
+        use std::os::unix::process::CommandExt;
+        let mut child = std::process::Command::new("sh")
+            .args(["-c", "sleep 30 & sleep 30"])
+            .process_group(0)
+            .spawn()
+            .unwrap();
+        kill_process_group(child.id()).unwrap();
+        assert!(!child.wait().unwrap().success());
+        kill_process_group(child.id()).unwrap();
+        assert!(boot_id().is_some_and(|id| !id.is_empty()));
+    }
 
     #[test]
     fn workspace_is_git_root_or_dir() {

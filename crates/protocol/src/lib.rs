@@ -57,6 +57,13 @@ pub enum Body {
         tool: String,
         input: Value,
     },
+    /// The process group running a call, so recovery can kill it. Only
+    /// meaningful within the same `boot`: pgids are reused across reboots.
+    ToolProcess {
+        call: u64,
+        pgid: u32,
+        boot: String,
+    },
     ToolResult {
         call: u64,
         outcome: Outcome,
