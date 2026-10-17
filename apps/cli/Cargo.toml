@@ -5,6 +5,10 @@ edition.workspace = true
 publish.workspace = true
 
 [dependencies]
+client.workspace = true
+engine.workspace = true
+protocol.workspace = true
+sys.workspace = true
 usage-rs.workspace = true
 
 [lints]
