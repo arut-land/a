@@ -5,6 +5,7 @@ use std::path::PathBuf;
 
 use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
+use serde_json::Value;
 use uuid::Uuid;
 
 pub const PROTO: u32 = 1;
@@ -44,8 +45,35 @@ pub struct Entry {
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum Body {
-    User { text: String },
-    Assistant { text: String },
+    User {
+        text: String,
+    },
+    Assistant {
+        text: String,
+    },
+    /// The committed intent to run a tool. Its seq is the call's id and
+    /// idempotency key.
+    ToolCall {
+        tool: String,
+        input: Value,
+    },
+    ToolResult {
+        call: u64,
+        outcome: Outcome,
+    },
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "status", rename_all = "snake_case")]
+pub enum Outcome {
+    Done {
+        output: Value,
+    },
+    Failed {
+        error: String,
+    },
+    /// The daemon stopped mid-call and the tool is not safe to rerun.
+    Interrupted,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]

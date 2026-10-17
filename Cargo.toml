@@ -8,6 +8,7 @@ edition = "2024"
 publish = false
 
 [workspace.dependencies]
+agent = { path = "crates/agent" }
 client = { path = "crates/client" }
 engine = { path = "crates/engine" }
 protocol = { path = "crates/protocol" }

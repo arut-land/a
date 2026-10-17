@@ -1,98 +1,50 @@
-//! The daemon: owns every session, accepts clients, runs the agent.
+//! The daemon: owns every session, accepts clients, runs the agents.
+
+mod session;
 
 use std::io::{self, BufReader};
 use std::path::PathBuf;
-use std::sync::mpsc::{self, Sender};
+use std::sync::mpsc;
 use std::sync::{Arc, Mutex, PoisonError};
 use std::thread;
 
+use agent::Toolset;
 use protocol::{
-    BUILD, Body, ClientMsg, DaemonMsg, Entry, PROTO, SessionId, SessionSummary, Target, read_frame,
-    write_frame,
+    BUILD, ClientMsg, DaemonMsg, PROTO, SessionId, SessionSummary, Target, read_frame, write_frame,
 };
-use store::{Header, Log, Store};
+use session::Session;
+use store::{Header, Store};
 use sys::Home;
 
 #[cfg(unix)]
 use std::os::unix::net::{UnixListener, UnixStream};
 
-struct Session {
-    id: SessionId,
-    workspace: PathBuf,
-    state: Mutex<State>,
-}
-
-struct State {
-    entries: Vec<Entry>,
-    log: Log,
-    clients: Vec<Sender<DaemonMsg>>,
-}
-
-impl Session {
-    fn attach(&self, client: &Sender<DaemonMsg>, since: u64) {
-        let mut st = self.state.lock().unwrap_or_else(PoisonError::into_inner);
-        let _ = client.send(DaemonMsg::Attached {
-            session: self.id,
-            workspace: self.workspace.clone(),
-        });
-        for e in st.entries.iter().filter(|e| e.seq > since) {
-            let _ = client.send(DaemonMsg::Entry(e.clone()));
-        }
-        let seq = st.entries.last().map_or(0, |e| e.seq);
-        let _ = client.send(DaemonMsg::Synced { seq });
-        st.clients.push(client.clone());
-    }
-
-    fn append(&self, body: Body) -> io::Result<()> {
-        let mut st = self.state.lock().unwrap_or_else(PoisonError::into_inner);
-        let entry = Entry {
-            seq: st.entries.len() as u64 + 1,
-            epoch: 0,
-            body,
-        };
-        st.log.append(&entry)?;
-        st.clients
-            .retain(|c| c.send(DaemonMsg::Entry(entry.clone())).is_ok());
-        st.entries.push(entry);
-        Ok(())
-    }
-
-    fn summary(&self) -> SessionSummary {
-        let st = self.state.lock().unwrap_or_else(PoisonError::into_inner);
-        SessionSummary {
-            id: self.id,
-            workspace: self.workspace.clone(),
-            entries: st.entries.len() as u64,
-            clients: u32::try_from(st.clients.len()).unwrap_or(u32::MAX),
-        }
-    }
-}
-
 struct Daemon {
     store: Store,
+    tools: Arc<Toolset>,
     sessions: Mutex<Vec<Arc<Session>>>,
 }
 
 impl Daemon {
     fn load(home: &Home) -> io::Result<Self> {
         let store = Store::open(home.sessions_dir())?;
+        let tools = Arc::new(Toolset::builtin());
         let sessions = store
             .load_all()?
             .into_iter()
             .map(|l| {
-                Arc::new(Session {
-                    id: l.header.id,
-                    workspace: l.header.workspace,
-                    state: Mutex::new(State {
-                        entries: l.entries,
-                        log: l.log,
-                        clients: Vec::new(),
-                    }),
-                })
+                Session::start(
+                    l.header.id,
+                    l.header.workspace,
+                    l.entries,
+                    l.log,
+                    tools.clone(),
+                )
             })
             .collect();
         Ok(Self {
             store,
+            tools,
             sessions: Mutex::new(sessions),
         })
     }
@@ -122,15 +74,13 @@ impl Daemon {
             workspace,
         };
         let log = self.store.create(&header)?;
-        let session = Arc::new(Session {
-            id: header.id,
-            workspace: header.workspace,
-            state: Mutex::new(State {
-                entries: Vec::new(),
-                log,
-                clients: Vec::new(),
-            }),
-        });
+        let session = Session::start(
+            header.id,
+            header.workspace,
+            Vec::new(),
+            log,
+            self.tools.clone(),
+        );
         sessions.push(session.clone());
         Ok(session)
     }
@@ -139,12 +89,6 @@ impl Daemon {
         let sessions = self.sessions.lock().unwrap_or_else(PoisonError::into_inner);
         sessions.iter().map(|s| s.summary()).collect()
     }
-}
-
-/// The echo agent: replies with the user's text.
-fn respond(session: &Session, text: String) -> io::Result<()> {
-    session.append(Body::User { text: text.clone() })?;
-    session.append(Body::Assistant { text })
 }
 
 #[cfg(unix)]
@@ -207,7 +151,7 @@ fn handle(daemon: &Daemon, conn: UnixStream) -> io::Result<()> {
                 }
             },
             ClientMsg::Input { text } => match &attached {
-                Some(s) => respond(s, text)?,
+                Some(s) => s.submit(text),
                 None => {
                     let _ = tx.send(DaemonMsg::Error {
                         message: "not attached".into(),

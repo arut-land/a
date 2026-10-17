@@ -2,7 +2,7 @@ use std::io::{self, BufRead};
 use std::process::ExitCode;
 use std::thread;
 
-use protocol::{Body, ClientMsg, DaemonMsg, SessionId, Target};
+use protocol::{Body, ClientMsg, DaemonMsg, Outcome, SessionId, Target};
 use sys::Home;
 use usage_rs::{Cli, Subcommands};
 
@@ -102,10 +102,33 @@ fn print_msg(msg: &DaemonMsg) {
         DaemonMsg::Entry(e) => match &e.body {
             Body::User { text } => println!("you  {text}"),
             Body::Assistant { text } => println!("a    {text}"),
+            Body::ToolCall { tool, input } => match input["command"].as_str() {
+                Some(command) => println!("tool $ {command}"),
+                None => println!("tool {tool} {input}"),
+            },
+            Body::ToolResult { outcome, .. } => print_outcome(outcome),
         },
         DaemonMsg::Synced { .. } | DaemonMsg::Welcome { .. } | DaemonMsg::Sessions { .. } => {}
         DaemonMsg::Mismatch { supported } => eprintln!("[daemon speaks protocol {supported}]"),
         DaemonMsg::Error { message } => eprintln!("[error: {message}]"),
+    }
+}
+
+fn print_outcome(outcome: &Outcome) {
+    match outcome {
+        Outcome::Done { output } => {
+            if let Some(stdout) = output["stdout"].as_str() {
+                let stderr = output["stderr"].as_str().unwrap_or_default();
+                for line in stdout.lines().chain(stderr.lines()) {
+                    println!("  │ {line}");
+                }
+                println!("  └ exit {}", output["exit"]);
+            } else {
+                println!("  └ {output}");
+            }
+        }
+        Outcome::Failed { error } => println!("  └ failed: {error}"),
+        Outcome::Interrupted => println!("  └ interrupted: the daemon stopped mid-call"),
     }
 }
 
