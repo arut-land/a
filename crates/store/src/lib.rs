@@ -21,6 +21,17 @@ pub use memory::Memory;
 pub struct Header {
     pub id: SessionId,
     pub workspace: PathBuf,
+    /// The session and call that own this one, if it is a child.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub parent: Option<Parent>,
+}
+
+/// Where a child session hangs off its parent: the parent's `link` entry,
+/// whose seq is the owning call.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Parent {
+    pub session: SessionId,
+    pub call: u64,
 }
 
 /// A session's committed entries and the appender that continues them.

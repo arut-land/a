@@ -83,6 +83,7 @@ fn busy_sessions_recover_at_startup() {
         .create(&Header {
             id,
             workspace: "/w".into(),
+            parent: None,
         })
         .unwrap()
         .log;
@@ -125,4 +126,155 @@ fn busy_sessions_recover_at_startup() {
     ));
     assert_eq!(got.len(), 4);
     assert!(!still_busy);
+}
+
+fn fired(bodies: &[Body]) -> Vec<&Outcome> {
+    bodies
+        .iter()
+        .filter_map(|b| match b {
+            Body::Fired { outcome, .. } => Some(outcome),
+            _ => None,
+        })
+        .collect()
+}
+
+#[test]
+fn a_parent_hears_from_its_child_exactly_once() {
+    let (root, home) = home("links");
+    let daemon = Daemon::load(&home, &echo()).unwrap();
+    let parent = daemon.resolve(&Target::New, "/w".into()).unwrap();
+    let id = parent.session().id;
+    parent.session().submit("spawn hi".into());
+    settle(&daemon);
+    drop(parent);
+    let store = &*daemon.shared.store;
+    let got = bodies(store, id);
+    let Body::Link { child, .. } = got[1] else {
+        panic!("{got:?}")
+    };
+    let child_header = store.headers().unwrap().into_iter().find(|h| h.id == child);
+    let child_log = bodies(store, child);
+    let latest = Target::Latest {
+        any_workspace: false,
+    };
+    let resumed = daemon.resolve(&latest, "/w".into()).unwrap().session().id;
+    settle(&daemon);
+    drop(daemon);
+
+    // A restart finds nothing left to fire.
+    let again = Daemon::load(&home, &echo()).unwrap();
+    settle(&again);
+    let after = bodies(&*again.shared.store, id);
+    std::fs::remove_dir_all(&root).unwrap();
+
+    assert_eq!(
+        got[1..],
+        [
+            Body::Link {
+                child,
+                input: "hi".into()
+            },
+            Body::Watch { child },
+            Body::Fired {
+                watch: 3,
+                outcome: Outcome::Done {
+                    output: "hi".into()
+                }
+            },
+        ]
+    );
+    assert_eq!(child_header.unwrap().parent.unwrap().call, 2);
+    assert_eq!(resumed, id, "resuming picks the parent, not its child");
+    assert_eq!(
+        child_log,
+        [
+            Body::User { text: "hi".into() },
+            Body::Assistant { text: "hi".into() },
+        ]
+    );
+    assert_eq!(after, got);
+}
+
+/// Logs as a daemon killed at various points leaves them: each parent's
+/// watch fires once the next daemon has recovered, and never again.
+#[test]
+fn watches_rearm_after_a_crash_and_fire_once() {
+    let (root, home) = home("rearm");
+    let store = Jsonl::open(home.sessions_dir()).unwrap();
+    let write = |header: &Header, bodies: Vec<Body>, busy: bool| {
+        let mut log = store.create(header).unwrap().log;
+        for (seq, body) in (1..).zip(bodies) {
+            log.append(&Entry {
+                seq,
+                epoch: 0,
+                body,
+            })
+            .unwrap();
+        }
+        store.mark_busy(header.id, busy).unwrap();
+    };
+    let session = |parent: Option<SessionId>| Header {
+        id: SessionId::new(),
+        workspace: "/w".into(),
+        parent: parent.map(|session| store::Parent { session, call: 2 }),
+    };
+    let spawned = |child: SessionId, watched: bool| {
+        let mut bodies = vec![
+            Body::User {
+                text: "spawn sleep 0".into(),
+            },
+            Body::Link {
+                child,
+                input: "sleep 0".into(),
+            },
+        ];
+        if watched {
+            bodies.push(Body::Watch { child });
+        }
+        bodies
+    };
+    let opened = || Body::User {
+        text: "sleep 0".into(),
+    };
+    let sleep = || Body::ToolCall {
+        tool: "sleep".into(),
+        input: json!({ "seconds": 0 }),
+        id: None,
+    };
+    let slept = Outcome::Done {
+        output: json!({ "slept": 0 }),
+    };
+    let mut parents = Vec::new();
+
+    // Killed while the child ran.
+    let parent = session(None);
+    let child = session(Some(parent.id));
+    write(&parent, spawned(child.id, true), true);
+    write(&child, vec![opened(), sleep()], true);
+    parents.push(parent.id);
+    // Killed after the child finished, before the parent heard.
+    let parent = session(None);
+    let child = session(Some(parent.id));
+    write(&parent, spawned(child.id, true), true);
+    let done = Body::ToolResult {
+        call: 2,
+        outcome: slept.clone(),
+    };
+    write(&child, vec![opened(), sleep(), done], false);
+    parents.push(parent.id);
+    // Killed between the link and the child's creation.
+    let parent = session(None);
+    write(&parent, spawned(SessionId::new(), false), true);
+    parents.push(parent.id);
+
+    for _ in 0..2 {
+        let daemon = Daemon::load(&home, &echo()).unwrap();
+        settle(&daemon);
+    }
+    let got: Vec<_> = parents.iter().map(|&id| bodies(&store, id)).collect();
+    std::fs::remove_dir_all(&root).unwrap();
+
+    for log in &got {
+        assert_eq!(fired(log), [&slept], "{log:#?}");
+    }
 }

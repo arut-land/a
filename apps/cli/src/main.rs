@@ -343,7 +343,9 @@ impl View {
             Body::User { text } => println!("you  {text}"),
             Body::Assistant { text } => println!("a    {text}"),
             Body::ToolCall { tool, input, .. } => println!("tool {}", call_text(tool, input)),
-            Body::ToolResult { outcome, .. } => print_outcome(outcome),
+            Body::ToolResult { outcome, .. } | Body::Fired { outcome, .. } => {
+                print_outcome(outcome);
+            }
             Body::ModelResult { call, outcome } => {
                 // A streamed reply is on screen already; end its line.
                 if self.streaming.take() == Some(*call) {
@@ -388,7 +390,11 @@ impl View {
                 );
             }
             Body::Hook { hook, decision } => println!("  · hook {hook}: {decision:?}"),
-            Body::ToolProcess { .. } | Body::ModelCall { .. } | Body::Ask { .. } => {}
+            Body::Link { child, input } => println!("child {} {input}", child.short()),
+            Body::ToolProcess { .. }
+            | Body::ModelCall { .. }
+            | Body::Ask { .. }
+            | Body::Watch { .. } => {}
         }
     }
 }

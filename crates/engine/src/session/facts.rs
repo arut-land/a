@@ -85,7 +85,10 @@ pub fn replay(agent: &mut dyn Agent, entries: &[Entry]) -> VecDeque<Action> {
                 call: *call,
                 outcome: outcome.clone(),
             },
-            Body::Assistant { .. } | Body::ToolCall { .. } | Body::ModelCall { .. } => {
+            Body::Assistant { .. }
+            | Body::ToolCall { .. }
+            | Body::ModelCall { .. }
+            | Body::Link { .. } => {
                 // A log that disagrees with the agent (an earlier version
                 // wrote it) leaves nothing to redo.
                 if asked.front().is_some_and(|action| commits(action, &e.body)) {
@@ -95,7 +98,11 @@ pub fn replay(agent: &mut dyn Agent, entries: &[Entry]) -> VecDeque<Action> {
                 }
                 continue;
             }
-            Body::ToolProcess { .. } | Body::Hook { .. } | Body::Ask { .. } => continue,
+            Body::ToolProcess { .. }
+            | Body::Hook { .. }
+            | Body::Ask { .. }
+            | Body::Watch { .. }
+            | Body::Fired { .. } => continue,
         };
         asked.extend(agent.step(input));
     }
@@ -108,6 +115,7 @@ fn commits(action: &Action, body: &Body) -> bool {
         (Action::Emit(emitted), body) => emitted == body,
         (Action::RunTool { tool, .. }, Body::ToolCall { tool: called, .. }) => tool == called,
         (Action::CallModel, Body::ModelCall { .. }) => true,
+        (Action::Spawn { input }, Body::Link { input: linked, .. }) => input == linked,
         _ => false,
     }
 }

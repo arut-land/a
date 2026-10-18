@@ -4,19 +4,20 @@ use std::io;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::mpsc::{self, Receiver, Sender};
-use std::sync::{Arc, Condvar, Mutex, MutexGuard, PoisonError};
+use std::sync::{Arc, Condvar, Mutex, MutexGuard, PoisonError, Weak};
 use std::thread;
 use std::time::{Duration, Instant};
 
 use agent::{Action, Agent, Cx, Decided, DynTool, Gate, Hooks, Input, Replay, Toolset};
 use protocol::{Body, DaemonMsg, Decision, Entry, Outcome, SessionId, SessionSummary};
 use serde_json::Value;
-use store::{Header, Loaded, Log, LogStore};
+use store::{Header, Loaded, Log, LogStore, Parent};
 
-use crate::lock;
 use crate::model::Model;
+use crate::{Daemon, lock};
 
 mod facts;
+mod links;
 #[cfg(test)]
 mod tests;
 
@@ -30,11 +31,15 @@ pub struct Shared {
     pub hooks: Hooks,
     /// The model, or why there is none (shown as the failed model call).
     pub model: Result<Model, String>,
+    /// Where linked sessions are started and found.
+    pub(crate) daemon: Weak<Daemon>,
 }
 
 pub struct Session {
     pub id: SessionId,
     pub workspace: PathBuf,
+    /// The call that owns this session, if it is a child.
+    parent: Option<Parent>,
     state: Mutex<State>,
     /// The actor's messages. The session's inbox, what waits for the user,
     /// is in its log: see [`facts::inbox`].
@@ -42,7 +47,7 @@ pub struct Session {
     answers: Mutex<Answers>,
     answered: Condvar,
     /// Inputs submitted but not yet fully handled. They pin the daemon and
-    /// keep the session loaded.
+    /// keep the session loaded, as do watches not yet fired.
     queued: AtomicUsize,
     /// Open client attachments; a session with any stays loaded.
     attached: AtomicUsize,
@@ -52,6 +57,11 @@ pub struct Session {
 
 enum Msg {
     Input(String),
+    /// Child `child` settled with `outcome`.
+    Settled {
+        child: SessionId,
+        outcome: Outcome,
+    },
     Stop,
 }
 
@@ -91,9 +101,11 @@ impl Session {
     /// recovered first.
     pub fn start(header: Header, loaded: Loaded, shared: Arc<Shared>) -> Arc<Self> {
         let (mailbox, rx) = mpsc::channel();
+        let armed = links::armed(&loaded.entries).count();
         let session = Arc::new(Self {
             id: header.id,
             workspace: header.workspace,
+            parent: header.parent,
             state: Mutex::new(State {
                 entries: loaded.entries,
                 log: loaded.log,
@@ -102,8 +114,9 @@ impl Session {
             mailbox,
             answers: Mutex::default(),
             answered: Condvar::new(),
-            // Recovery counts as queued work until it has run.
-            queued: AtomicUsize::new(1),
+            // Recovery counts as queued work until it has run, and every
+            // armed watch until it fires.
+            queued: AtomicUsize::new(1 + armed),
             attached: AtomicUsize::new(0),
             last_active: Mutex::new(Instant::now()),
             shared,
@@ -246,12 +259,15 @@ impl Session {
         let mut agent = self.shared.agent.agent();
         self.work(|| self.recover(agent.as_mut()));
         for msg in mailbox {
-            let Msg::Input(text) = msg else { return };
-            self.work(|| {
-                self.append(Body::User { text: text.clone() })?;
-                let inputs = VecDeque::from([Input::User { text }]);
-                self.drive(agent.as_mut(), VecDeque::new(), inputs)
-            });
+            match msg {
+                Msg::Input(text) => self.work(|| {
+                    self.append(Body::User { text: text.clone() })?;
+                    let inputs = VecDeque::from([Input::User { text }]);
+                    self.drive(agent.as_mut(), VecDeque::new(), inputs)
+                }),
+                Msg::Settled { child, outcome } => self.fire(child, &outcome),
+                Msg::Stop => return,
+            }
         }
     }
 
@@ -265,12 +281,14 @@ impl Session {
         if let Err(e) = job() {
             self.warn(e);
         }
-        if self.queued.fetch_sub(1, Ordering::SeqCst) == 1
-            && let Err(e) = store.mark_busy(self.id, false)
-        {
+        let settled = self.queued.fetch_sub(1, Ordering::SeqCst) == 1;
+        if settled && let Err(e) = store.mark_busy(self.id, false) {
             self.warn(format_args!("busy marker: {e}"));
         }
         self.touch();
+        if settled {
+            self.report();
+        }
     }
 
     /// Runs `actions`, then steps the agent with `inputs` and every input
@@ -314,6 +332,10 @@ impl Session {
         let (call, seq, outcome) = match action {
             Action::Emit(body) => {
                 self.append(body)?;
+                return Ok(None);
+            }
+            Action::Spawn { input } => {
+                self.spawn(&input)?;
                 return Ok(None);
             }
             Action::CallModel => {
@@ -507,12 +529,13 @@ impl Session {
         })
     }
 
-    /// Picks up where the log leaves off. The agent is rebuilt from the
-    /// log; calls with an intent but no outcome are finished (leftover
-    /// processes killed, safe calls run again, the rest marked interrupted,
-    /// asks still waiting asked again); then whatever the agent asked for
-    /// that the log does not show runs.
+    /// Picks up where the log leaves off. Links are re-armed; the agent is
+    /// rebuilt from the log; calls with an intent but no outcome are
+    /// finished (leftover processes killed, safe calls run again, the rest
+    /// marked interrupted, asks still waiting asked again); then whatever
+    /// the agent asked for that the log does not show runs.
     fn recover(&self, agent: &mut dyn Agent) -> io::Result<()> {
+        self.relink()?;
         let (dangling, actions) = {
             let st = self.lock();
             (dangling_calls(&st.entries), replay(agent, &st.entries))

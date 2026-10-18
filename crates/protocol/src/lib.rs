@@ -109,6 +109,24 @@ pub enum Body {
     Ask {
         call: u64,
     },
+    /// The committed intent to start session `child` with `input`. Its seq
+    /// is the call that owns the child; the child's id is chosen before the
+    /// commit, so recovery finds the child instead of making another.
+    Link {
+        child: SessionId,
+        input: String,
+    },
+    /// A durable watch on `child`: when it settles, its result comes back
+    /// as a `fired` under this entry's seq, which is the idempotency key.
+    Watch {
+        child: SessionId,
+    },
+    /// Watch `watch` fired, with its child's result. Logged at most once
+    /// per watch.
+    Fired {
+        watch: u64,
+        outcome: Outcome,
+    },
 }
 
 /// What a hook decided, by decision point. Only decisions that change
@@ -418,6 +436,35 @@ mod tests {
         assert_eq!(
             serde_json::to_value(&by_user).unwrap()["decision"]["approval"]["call"],
             3
+        );
+    }
+
+    #[test]
+    fn link_entries_are_flat() {
+        let child = SessionId(Uuid::from_u128(1));
+        let entries = [
+            Body::Link {
+                child,
+                input: "hi".into(),
+            },
+            Body::Watch { child },
+            Body::Fired {
+                watch: 2,
+                outcome: Outcome::Interrupted,
+            },
+        ];
+        let json: Vec<_> = entries
+            .iter()
+            .map(|b| serde_json::to_string(b).unwrap())
+            .collect();
+        let id = "00000000-0000-0000-0000-000000000001";
+        assert_eq!(
+            json,
+            [
+                format!(r#"{{"kind":"link","child":"{id}","input":"hi"}}"#),
+                format!(r#"{{"kind":"watch","child":"{id}"}}"#),
+                r#"{"kind":"fired","watch":2,"outcome":{"status":"interrupted"}}"#.to_owned(),
+            ]
         );
     }
 }
