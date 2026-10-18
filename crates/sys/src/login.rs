@@ -6,7 +6,6 @@
 use std::ffi::OsString;
 use std::io::{self, Read};
 use std::os::unix::ffi::OsStringExt;
-use std::os::unix::process::CommandExt;
 use std::process::{Command, Stdio};
 use std::sync::mpsc;
 use std::thread;
@@ -29,14 +28,7 @@ pub fn login_env(shell: &OsString, timeout: Duration) -> io::Result<Vec<(OsStrin
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::null());
-    // SAFETY: `setsid` is async-signal-safe and touches no memory of the
-    // parent; it is all the child runs before `exec`.
-    unsafe {
-        command.pre_exec(|| {
-            rustix::process::setsid()?;
-            Ok(())
-        });
-    }
+    crate::new_session(&mut command);
     let mut child = command.spawn()?;
     let mut stdout = child.stdout.take().expect("stdout is piped");
     let (tx, rx) = mpsc::channel();

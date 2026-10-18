@@ -77,14 +77,7 @@ struct RecapBar: View {
     let recap: RecapInfo
 
     var body: some View {
-        var parts: [String] = []
-        if let prompt = recap.prompt { parts.append("you: \(prompt)") }
-        if !recap.tools.isEmpty { parts.append("ran \(recap.tools.joined(separator: ", "))") }
-        if recap.failed > 0 { parts.append("\(recap.failed) failed") }
-        if recap.running > 0 { parts.append("\(recap.running) running") }
-        if let reply = recap.reply { parts.append("a: \(reply)") }
-        if recap.asks > 0 { parts.append("\(recap.asks) waiting for approval") }
-        return Label(parts.joined(separator: " · "), systemImage: "clock.arrow.circlepath")
+        Label(recap.line, systemImage: "clock.arrow.circlepath")
             .font(.caption)
             .lineLimit(2)
             .frame(maxWidth: .infinity, alignment: .leading)
@@ -113,34 +106,25 @@ struct ItemView: View {
             ReplyView(
                 call: call, model: model, text: text, status: status, usage: usage,
                 streaming: store.streaming?.call == call ? store.streaming?.text : nil)
-        case .tool(let call, let tool, let input, let approval, let outcome, let card, let asked):
+        case .tool(let call, _, _, let title, let approval, let outcome, _, let asked):
             ToolView(
-                call: call, tool: tool, input: input, approval: approval, outcome: outcome,
-                card: card, asked: asked, store: store)
+                call: call, title: title, approval: approval, outcome: outcome, asked: asked,
+                store: store)
         case .command(_, let name, let args, let outcome):
             VStack(alignment: .leading) {
                 Note(icon: "slash.circle", text: "/\(name) \(args)")
-                if let outcome { OutcomeView(outcome: outcome, card: nil) }
+                if let outcome { OutcomeView(outcome: outcome) }
             }
-        case .hook(_, let hook, let decision):
-            Note(icon: "hook", text: "hook \(hook): \(Self.decision(decision))")
+        case .hook(_, let hook, _, let line):
+            Note(icon: "hook", text: "hook \(hook): \(line)")
         case .child(_, let child, let input, _, let fired):
             VStack(alignment: .leading) {
                 Note(icon: "arrow.triangle.branch", text: "child \(child.suffix(8)): \(input)")
-                if let fired { OutcomeView(outcome: fired, card: nil) }
+                if let fired { OutcomeView(outcome: fired) }
             }
         case .environment(_, let cwd):
             Note(icon: "folder", text: "environment: \(cwd)")
         }
-    }
-
-    /// A hook decision, `{"kind": {fields}}` on the wire, as `kind field=value…`.
-    static func decision(_ json: String) -> String {
-        guard let object = try? JSONSerialization.jsonObject(with: Data(json.utf8)) as? [String: Any],
-            let (kind, value) = object.first
-        else { return json }
-        let fields = (value as? [String: Any] ?? [:]).sorted { $0.key < $1.key }
-        return ([kind] + fields.map { "\($0.key)=\($0.value)" }).joined(separator: " ")
     }
 }
 
@@ -186,11 +170,9 @@ struct ReplyView: View {
 
 struct ToolView: View {
     let call: UInt64
-    let tool: String
-    let input: String
+    let title: String
     let approval: ApprovalState?
     let outcome: ToolOutcome?
-    let card: ToolCard?
     let asked: Bool
     let store: SessionStore
 
@@ -198,7 +180,7 @@ struct ToolView: View {
         VStack(alignment: .leading, spacing: 6) {
             HStack {
                 Image(systemName: "terminal")
-                Text(card?.title ?? Self.title(tool: tool, input: input)).font(.body.monospaced())
+                Text(title).font(.body.monospaced())
                 Spacer()
                 switch approval {
                 case .approved?: Text("approved").font(.caption).foregroundStyle(.green)
@@ -217,7 +199,7 @@ struct ToolView: View {
                 }
             }
             if let outcome {
-                OutcomeView(outcome: outcome, card: card)
+                OutcomeView(outcome: outcome)
             } else if approval != .pending {
                 ProgressView().controlSize(.small)
             }
@@ -225,55 +207,25 @@ struct ToolView: View {
         .padding(10)
         .background(.quaternary.opacity(0.5), in: .rect(cornerRadius: 8))
     }
-
-    /// A command as `$ command`, anything else as the tool and its input.
-    static func title(tool: String, input: String) -> String {
-        let object = try? JSONSerialization.jsonObject(with: Data(input.utf8)) as? [String: Any]
-        if let command = object?["command"] as? String { return "$ \(command)" }
-        return "\(tool) \(input)"
-    }
 }
 
 struct OutcomeView: View {
     let outcome: ToolOutcome
-    /// How the tool presents it, when it does.
-    let card: ToolCard?
-
-    var body: some View {
-        if case .done = outcome, let card, !card.note.isEmpty {
-            VStack(alignment: .leading, spacing: 2) {
-                if !card.body.isEmpty {
-                    Text(card.body.trimmingCharacters(in: .newlines))
-                        .font(.callout.monospaced()).textSelection(.enabled)
-                }
-                Text(card.note).font(.caption2).foregroundStyle(.secondary)
-            }
-        } else {
-            RawOutcome(outcome: outcome)
-        }
-    }
-}
-
-/// An outcome without a card: a command's streams as older logs hold them,
-/// anything else as JSON.
-struct RawOutcome: View {
-    let outcome: ToolOutcome
 
     var body: some View {
         switch outcome {
-        case .done(let json):
-            let output = try? JSONSerialization.jsonObject(with: Data(json.utf8)) as? [String: Any]
-            if let stdout = output?["stdout"] as? String {
-                let stderr = output?["stderr"] as? String ?? ""
-                VStack(alignment: .leading, spacing: 2) {
-                    Text((stdout + stderr).trimmingCharacters(in: .newlines))
+        case .done(_, let shown?):
+            VStack(alignment: .leading, spacing: 2) {
+                if !shown.text.isEmpty {
+                    Text(shown.text.trimmingCharacters(in: .newlines))
                         .font(.callout.monospaced()).textSelection(.enabled)
-                    Text("exit \(output?["exit"].map { "\($0)" } ?? "?")")
-                        .font(.caption2).foregroundStyle(.secondary)
                 }
-            } else {
-                Text(json).font(.callout.monospaced()).textSelection(.enabled)
+                if !shown.note.isEmpty {
+                    Text(shown.note).font(.caption2).foregroundStyle(.secondary)
+                }
             }
+        case .done(let json, nil):
+            Text(json).font(.callout.monospaced()).textSelection(.enabled)
         case .failed(let error):
             Label("failed: \(error)", systemImage: "xmark.octagon").foregroundStyle(.red)
         case .interrupted:

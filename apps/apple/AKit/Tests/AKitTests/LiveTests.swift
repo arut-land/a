@@ -40,12 +40,13 @@ func aLiveSessionChatsRunsAnApprovedToolAndIsListed() async throws {
 
     await store.send("$ echo hello")
     try await eventually("the ask") { !store.pendingAsks.isEmpty }
-    guard case .tool(let call, _, _, _, _, _, _) = store.pendingAsks[0] else { return }
+    guard case .tool(let call, _, _, _, _, _, _, _) = store.pendingAsks[0] else { return }
     await store.approve(call: call, approved: true)
     try await eventually("the outcome") {
         store.items.contains {
-            if case .tool(call, _, _, .approved?, .done(let output)?, let card, _) = $0 {
+            if case .tool(call, _, _, _, .approved?, .done(let output, let shown)?, let card, _) = $0 {
                 output.contains(#""output":"hello\n""#) && card?.note == "exit 0"
+                    && shown?.note == "exit 0"
             } else { false }
         }
     }
@@ -61,6 +62,8 @@ func aLiveSessionChatsRunsAnApprovedToolAndIsListed() async throws {
         other.link == .live && other.seq == store.seq && other.recap != nil
     }
     #expect(other.items == store.items.map(unasked))
+    // The recap reads as the Rust clients print it.
+    #expect(other.recap?.line.hasPrefix("recap · you: $ echo hello · ran bash") == true)
 
     await store.detach()
     await other.detach()
@@ -69,10 +72,9 @@ func aLiveSessionChatsRunsAnApprovedToolAndIsListed() async throws {
 
 /// `item` as a client that was not asked sees it.
 func unasked(_ item: ViewItem) -> ViewItem {
-    guard case .tool(let call, let tool, let input, let approval, let outcome, let card, _) = item else {
-        return item
-    }
+    guard case .tool(let call, let tool, let input, let title, let approval, let outcome, let card, _) = item
+    else { return item }
     return .tool(
-        call: call, tool: tool, inputJson: input, approval: approval, outcome: outcome, card: card,
-        asked: false)
+        call: call, tool: tool, inputJson: input, title: title, approval: approval, outcome: outcome,
+        card: card, asked: false)
 }

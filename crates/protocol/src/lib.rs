@@ -908,6 +908,7 @@ pub enum DaemonMsg {
         session: SessionId,
         workspace: PathBuf,
     },
+    #[serde(skip_deserializing)]
     Entry(Entry),
     /// Live text of an unfinished model call. Never logged: the committed
     /// `model_result` is the fact.
@@ -1039,16 +1040,24 @@ impl DaemonMsg {
     }
 }
 
-/// Writes one frame: a little-endian u32 length followed by a JSON body.
+/// Writes one frame: a little-endian u32 length followed by a JSON body,
+/// in one write.
 pub fn write_frame<T: Serialize>(w: &mut impl Write, msg: &T) -> io::Result<()> {
-    let body = serde_json::to_vec(msg)?;
-    let len = u32::try_from(body.len())
+    let mut bytes = Frame::start();
+    serde_json::to_writer(&mut bytes, msg)?;
+    prefix(&mut bytes)?;
+    w.write_all(&bytes)?;
+    w.flush()
+}
+
+/// Fills in the length of the frame `bytes` holds after its first four.
+fn prefix(bytes: &mut [u8]) -> io::Result<()> {
+    let len = u32::try_from(bytes.len() - 4)
         .ok()
         .filter(|&n| n <= MAX_FRAME)
         .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "frame too large"))?;
-    w.write_all(&len.to_le_bytes())?;
-    w.write_all(&body)?;
-    w.flush()
+    bytes[..4].copy_from_slice(&len.to_le_bytes());
+    Ok(())
 }
 
 /// A frame encoded once, length prefix included, for any number of peers:
@@ -1088,11 +1097,7 @@ impl Frame {
     }
 
     fn finish(mut bytes: Vec<u8>, seq: Option<u64>, class: Class) -> io::Result<Self> {
-        let len = u32::try_from(bytes.len() - 4)
-            .ok()
-            .filter(|&n| n <= MAX_FRAME)
-            .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "frame too large"))?;
-        bytes[..4].copy_from_slice(&len.to_le_bytes());
+        prefix(&mut bytes)?;
         Ok(Self {
             bytes: Arc::new(bytes),
             seq,
@@ -1143,20 +1148,22 @@ impl Decode for DaemonMsg {
             #[serde(default)]
             kind: Option<String>,
         }
-        serde_json::from_slice(bytes).or_else(|e| match serde_json::from_slice::<Tags>(bytes) {
-            // Decoded on its own: through the tagged enum, the whole view
-            // would be buffered to find the tag.
-            Ok(Tags { t, .. }) if t == "snapshot" => {
-                view::SessionView::from_json(bytes).map(|v| Self::Snapshot(Box::new(v)))
-            }
-            Ok(Tags { t, .. }) if !known_msg(&t) => Ok(Self::Unknown { seq: None }),
-            Ok(Tags {
-                t,
-                seq,
-                kind: Some(kind),
-            }) if t == "entry" && !known_kind(&kind) => Ok(Self::Unknown { seq }),
-            _ => Err(e),
-        })
+        let Ok(Tags { t, seq, kind }) = serde_json::from_slice(bytes) else {
+            return serde_json::from_slice(bytes);
+        };
+        match t.as_str() {
+            // Entries and views are decoded on their own: through the tagged
+            // enum, the whole message would be buffered to find the tag.
+            "entry" => Entry::from_json(bytes)
+                .map(Self::Entry)
+                .or_else(|e| match kind {
+                    Some(kind) if !known_kind(&kind) => Ok(Self::Unknown { seq }),
+                    _ => Err(e),
+                }),
+            "snapshot" => view::SessionView::from_json(bytes).map(|v| Self::Snapshot(Box::new(v))),
+            t if known_msg(t) => serde_json::from_slice(bytes),
+            _ => Ok(Self::Unknown { seq: None }),
+        }
     }
 }
 
@@ -1213,6 +1220,14 @@ fn known_kind(kind: &str) -> bool {
 
 /// Reads one frame; `Ok(None)` means the peer closed the stream cleanly.
 pub fn read_frame<T: Decode>(r: &mut impl Read) -> io::Result<Option<T>> {
+    match read_body(r)? {
+        Some(body) => Ok(Some(T::from_json(&body)?)),
+        None => Ok(None),
+    }
+}
+
+/// The body of the next frame, read once for every type and stream.
+fn read_body(r: &mut dyn Read) -> io::Result<Option<Vec<u8>>> {
     let mut len = [0; 4];
     match r.read_exact(&mut len) {
         Ok(()) => {}
@@ -1229,11 +1244,11 @@ pub fn read_frame<T: Decode>(r: &mut impl Read) -> io::Result<Option<T>> {
     // Grown as the bytes arrive, so a length alone allocates no more than
     // the peer goes on to send.
     let mut body = Vec::with_capacity((len as usize).min(64 * 1024));
-    r.by_ref().take(u64::from(len)).read_to_end(&mut body)?;
+    r.take(u64::from(len)).read_to_end(&mut body)?;
     if body.len() < len as usize {
         return Err(io::ErrorKind::UnexpectedEof.into());
     }
-    Ok(Some(T::from_json(&body)?))
+    Ok(Some(body))
 }
 
 #[cfg(test)]

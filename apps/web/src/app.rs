@@ -13,7 +13,7 @@ use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 use std::task::Poll;
 
 use client::{Connection, Writer};
-use protocol::view::{Change, Link, SessionList, SessionView};
+use protocol::view::{Change, Link, SessionView};
 use protocol::{ClientMsg, DaemonMsg, SessionId, SessionSummary, Target};
 use rt::Rt;
 use rt::channel::Receiver;
@@ -100,15 +100,7 @@ fn connect(daemon: &Daemon) -> io::Result<Connection> {
 }
 
 fn list(daemon: &Daemon) -> io::Result<Vec<SessionSummary>> {
-    let Connection {
-        mut reader,
-        mut writer,
-        ..
-    } = connect(daemon)?;
-    writer.send(&ClientMsg::List)?;
-    let mut list = SessionList::default();
-    let mut sessions =
-        reader.until(|msg| list.fold(&msg).then(|| std::mem::take(&mut list.sessions)))?;
+    let mut sessions = connect(daemon)?.sessions()?;
     // Newest first: ids are UUIDv7.
     sessions.sort_by_key(|s| std::cmp::Reverse(s.id.0));
     Ok(sessions)

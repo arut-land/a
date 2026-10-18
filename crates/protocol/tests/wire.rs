@@ -16,8 +16,9 @@ use std::path::{Path, PathBuf};
 
 use protocol::view::SessionView;
 use protocol::{
-    Activity, Body, Cap, Caps, Card, ClientDecl, ClientMsg, DaemonMsg, Decode, Entry, Environment,
-    Origin, PROTO, Recap, Rejection, Residency, Role, SessionId, SessionSummary, Target,
+    Activity, Body, Cap, Caps, Card, ClientDecl, ClientMsg, DaemonMsg, Decision, Decode, Entry,
+    Environment, Installed, Origin, Outcome, Overrides, PROTO, Permission, Recap, Rejection,
+    Residency, Role, SessionId, SessionSummary, Target,
 };
 use serde_json::json;
 use uuid::Uuid;
@@ -149,6 +150,20 @@ fn client_samples() -> Vec<Sample<ClientMsg>> {
                 client_seq: Some(2),
             },
         ),
+        sample(
+            "steer",
+            ClientMsg::Steer {
+                text: "also this".into(),
+                client_seq: None,
+            },
+        ),
+        sample(
+            "steer_numbered",
+            ClientMsg::Steer {
+                text: "also this".into(),
+                client_seq: Some(4),
+            },
+        ),
         sample("interrupt", ClientMsg::INTERRUPT),
         sample(
             "interrupt_numbered",
@@ -238,6 +253,242 @@ fn daemon_samples() -> Vec<Sample<DaemonMsg>> {
                 },
             ),
         ),
+        sample(
+            "entry_queued",
+            entry(
+                3,
+                Body::Queued {
+                    text: "also this".into(),
+                    steer: true,
+                },
+            ),
+        ),
+        sample(
+            "entry_steer",
+            entry(
+                4,
+                Body::Steer {
+                    text: "also this".into(),
+                    queued: 3,
+                },
+            ),
+        ),
+        sample(
+            "entry_tool_process",
+            entry(
+                5,
+                Body::ToolProcess {
+                    call: 2,
+                    pgid: 4242,
+                    boot: "b".into(),
+                    background: true,
+                },
+            ),
+        ),
+        sample(
+            "entry_progress",
+            entry(
+                6,
+                Body::Progress {
+                    call: 2,
+                    text: "src\n".into(),
+                },
+            ),
+        ),
+        sample(
+            "entry_tool_result",
+            entry(
+                7,
+                Body::ToolResult {
+                    call: 2,
+                    outcome: Outcome::Done {
+                        output: json!({ "exit": 0, "stdout": "src\n", "stderr": "" }),
+                    },
+                    card: Some(Card {
+                        title: "$ ls".into(),
+                        body: "src\n".into(),
+                        note: "exit 0".into(),
+                    }),
+                },
+            ),
+        ),
+        sample(
+            "entry_model_call",
+            entry(
+                8,
+                Body::ModelCall {
+                    model: "openai:m".into(),
+                },
+            ),
+        ),
+        sample(
+            "entry_model_result_failed",
+            entry(
+                9,
+                Body::ModelResult {
+                    call: 8,
+                    outcome: Outcome::Failed {
+                        error: "rate limited".into(),
+                    },
+                },
+            ),
+        ),
+        sample(
+            "entry_model_result_interrupted",
+            entry(
+                10,
+                Body::ModelResult {
+                    call: 8,
+                    outcome: Outcome::Interrupted {
+                        output: Some("so far".into()),
+                    },
+                },
+            ),
+        ),
+        sample(
+            "entry_assistant",
+            entry(
+                11,
+                Body::Assistant {
+                    text: "done".into(),
+                },
+            ),
+        ),
+        sample(
+            "entry_hook",
+            entry(
+                12,
+                Body::Hook {
+                    hook: "policy".into(),
+                    decision: Decision::Permission {
+                        tool: "bash".into(),
+                        permission: Permission::Ask,
+                    },
+                },
+            ),
+        ),
+        sample("entry_ask", entry(13, Body::Ask { call: 2 })),
+        sample(
+            "entry_approval",
+            entry(
+                14,
+                Body::Hook {
+                    hook: "user".into(),
+                    decision: Decision::Approval {
+                        tool: "bash".into(),
+                        approved: true,
+                        call: Some(2),
+                    },
+                },
+            ),
+        ),
+        sample(
+            "entry_link",
+            entry(
+                15,
+                Body::Link {
+                    child: SessionId(Uuid::from_u128(0xc)),
+                    input: "look".into(),
+                },
+            ),
+        ),
+        sample(
+            "entry_watch",
+            entry(
+                16,
+                Body::Watch {
+                    child: SessionId(Uuid::from_u128(0xc)),
+                },
+            ),
+        ),
+        sample(
+            "entry_fired",
+            entry(
+                17,
+                Body::Fired {
+                    watch: 16,
+                    outcome: Outcome::Done {
+                        output: json!({ "text": "found it" }),
+                    },
+                },
+            ),
+        ),
+        sample(
+            "entry_environment",
+            entry(
+                18,
+                Body::Environment(Environment {
+                    cwd: "/w".into(),
+                    vars: BTreeMap::from([("PATH".into(), "/bin".into())]),
+                    redacted: vec!["GITHUB_TOKEN".into()],
+                    tty: false,
+                }),
+            ),
+        ),
+        sample(
+            "entry_extensions",
+            entry(
+                19,
+                Body::Extensions {
+                    installed: vec![Installed {
+                        name: "shell".into(),
+                        version: 1,
+                    }],
+                },
+            ),
+        ),
+        sample(
+            "entry_ext",
+            entry(
+                20,
+                Body::Ext {
+                    ext: "shell".into(),
+                    state: "cwd".into(),
+                    data: json!("/w"),
+                },
+            ),
+        ),
+        sample(
+            "entry_context",
+            entry(
+                21,
+                Body::Context {
+                    text: "cwd: /w".into(),
+                },
+            ),
+        ),
+        sample(
+            "entry_command",
+            entry(
+                22,
+                Body::Command {
+                    name: "model".into(),
+                    args: "openai:m".into(),
+                },
+            ),
+        ),
+        sample(
+            "entry_command_result",
+            entry(
+                23,
+                Body::CommandResult {
+                    call: 22,
+                    outcome: Outcome::Done {
+                        output: json!(null),
+                    },
+                },
+            ),
+        ),
+        sample(
+            "entry_settings",
+            entry(
+                24,
+                Body::Settings(Overrides {
+                    model: Some("openai:m".into()),
+                }),
+            ),
+        ),
+        sample("entry_interrupt", entry(25, Body::Interrupt)),
         sample(
             "delta",
             DaemonMsg::Delta {
@@ -381,6 +632,11 @@ fn this_build_reads_the_whole_corpus() {
     }
 }
 
+/// Ungated messages the first daemons cannot read: no client sends them
+/// yet, and one that does must gate them behind a capability first, since
+/// those daemons drop a connection on a message they cannot decode.
+const UNREAD_BY_THE_FIRST: &[&str] = &["steer", "steer_numbered"];
+
 /// The first protocol 1 builds read every message sent to them: anything
 /// not gated by a capability, which they never ask for.
 #[test]
@@ -394,7 +650,7 @@ fn the_first_builds_read_what_is_sent_to_them() {
     let client: Vec<_> = client_samples().iter().map(|s| (s.name, s.gate)).collect();
     let daemon: Vec<_> = daemon_samples().iter().map(|s| (s.name, s.gate)).collect();
     for (name, bytes) in files("client") {
-        if gate(&client, &name).is_none() {
+        if gate(&client, &name).is_none() && !UNREAD_BY_THE_FIRST.contains(&name.as_str()) {
             serde_json::from_slice::<first::ClientMsg>(&bytes)
                 .unwrap_or_else(|e| panic!("client/{name}: {e}"));
         }
