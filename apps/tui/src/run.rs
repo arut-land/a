@@ -57,7 +57,9 @@ pub fn run(daemon: &Daemon, target: Target, viewport: Viewport) -> io::Result<()
     drop(terminal);
     match exit? {
         Exit::Detached => {
-            println!("[detached; the session keeps running. `a resume` to reattach]");
+            // The terminal may be gone (that is one way to detach).
+            let note = "[detached; the session keeps running. `a resume` to reattach]";
+            let _ = writeln!(io::stdout(), "{note}");
             Ok(())
         }
         Exit::Lost(why) => Err(io::Error::other(format!("daemon disconnected: {why}"))),
