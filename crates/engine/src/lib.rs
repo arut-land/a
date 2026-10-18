@@ -505,7 +505,7 @@ impl Drop for Client<'_> {
 
 /// Runs the daemon, as staged build `build`, until it has been idle for
 /// `config.idle` (no attached clients and no unfinished work) or has drained
-/// for a newer build. Sessions live in their logs, so the next client simply
+/// for a newer build. Sessions live in their logs, so the next client
 /// starts a new daemon.
 #[cfg(unix)]
 pub fn serve(listener: &UnixListener, home: &Home, config: &Config, build: &str) -> io::Result<()> {

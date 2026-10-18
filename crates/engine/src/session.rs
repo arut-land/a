@@ -16,7 +16,7 @@ use agent::{
 };
 use protocol::view::SessionView;
 use protocol::{
-    Activity, Body, Cap, DaemonMsg, Decision, Entry, Environment, Frame, Installed, Outcome,
+    Activity, Body, Cap, Card, DaemonMsg, Decision, Entry, Environment, Frame, Installed, Outcome,
     Overrides, Residency, SessionId, SessionSummary,
 };
 use rt::BoxFuture;
@@ -277,7 +277,8 @@ impl Session {
         let registry = self.shared.registry.get();
         let mut decided = Decided::new();
         registry.hooks().input(&mut text, &mut decided)?;
-        let command = slash(&text).is_some_and(|(name, _)| is_command(&registry, name));
+        let parsed = as_command(&registry, &text);
+        let command = parsed.is_some();
         let mut waiting = lock(&self.waiting);
         for (hook, decision) in decided {
             self.record(Body::Hook {
@@ -289,16 +290,16 @@ impl Session {
         // own entry starts its work.
         let started =
             waiting.is_empty() && !self.has_work() && !self.running.load(Ordering::SeqCst);
-        let body = match slash(&text) {
+        let body = match parsed {
             _ if !started => Body::Queued {
                 text: text.clone(),
                 steer,
             },
-            Some((name, args)) if command => Body::Command {
+            Some((name, args)) => Body::Command {
                 name: name.to_owned(),
                 args: args.to_owned(),
             },
-            _ => Body::User { text: text.clone() },
+            None => Body::User { text: text.clone() },
         };
         let seq = self.record(body);
         rt::block_on(self.flush()).map_err(|e| format!("logging the input: {e}"))?;
@@ -839,12 +840,11 @@ impl Session {
                 tool, input, id, ..
             } = action
             {
-                let card = registry.tools().get(&tool).and_then(|t| t.present(&input));
                 let call = self.record(Body::ToolCall {
+                    card: card(&registry, &tool, &input),
                     tool,
                     input,
                     id,
-                    card,
                 });
                 let outcome = Outcome::Interrupted { output: None };
                 self.record(Body::ToolResult {
@@ -896,10 +896,9 @@ impl Session {
                     self.decide(decided).await?;
                     verdict
                 };
-                let card = registry.tools().get(&tool);
                 let seq = self
                     .append(Body::ToolCall {
-                        card: card.and_then(|t| t.present(&input)),
+                        card: card(&registry, &tool, &input),
                         tool: tool.clone(),
                         input: input.clone(),
                         id,
@@ -1349,7 +1348,7 @@ impl Session {
     fn requeue(&self, queued: VecDeque<(u64, String, bool)>, registry: &Registry) {
         let count = queued.len();
         lock(&self.waiting).extend(queued.into_iter().map(|(seq, text, steer)| Waiting {
-            command: slash(&text).is_some_and(|(name, _)| is_command(registry, name)),
+            command: as_command(registry, &text).is_some(),
             seq,
             text,
             steer,
@@ -1414,9 +1413,10 @@ impl Session {
 /// The native command that sets the session's model.
 const MODEL: &str = "model";
 
-/// Whether `/name` is a command: an extension's, or a native one.
-fn is_command(registry: &Registry, name: &str) -> bool {
-    registry.command(name).is_some() || name == MODEL
+/// `text` as a command's name and arguments, if it names one: an
+/// extension's, or a native one.
+fn as_command<'a>(registry: &Registry, text: &'a str) -> Option<(&'a str, &'a str)> {
+    slash(text).filter(|&(name, _)| registry.command(name).is_some() || name == MODEL)
 }
 
 /// `work`'s output, or `None` once `cancel` is cancelled first; `work` is
@@ -1485,6 +1485,11 @@ impl Host for Effect {
     fn hooks(&self) -> &Hooks {
         self.registry.hooks()
     }
+}
+
+/// How clients show a call of `tool` with `input`.
+fn card(registry: &Registry, tool: &str, input: &Value) -> Option<Card> {
+    registry.tools().get(tool)?.present(input)
 }
 
 /// `/name args` as a command's name and arguments.

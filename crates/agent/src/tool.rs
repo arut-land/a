@@ -18,7 +18,7 @@ use sys::Signal;
 use crate::state::{Cwd, State, States};
 use crate::{Hooks, Spawn};
 
-/// Whether a call interrupted by a crash may simply run again.
+/// Whether a call interrupted by a crash may run again.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Replay {
     Safe,

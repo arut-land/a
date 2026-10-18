@@ -228,38 +228,37 @@ impl Registry {
 
     /// Registers `ext` after every extension so far in `tier`, or in place
     /// of the one of the same name.
-    pub fn with_in<E: Extension>(mut self, tier: Tier, ext: &E) -> Result<Self, Refused> {
+    pub fn with_in<E: Extension>(self, tier: Tier, ext: &E) -> Result<Self, Refused> {
         let mut made = Registrar::default();
         ext.contribute(&mut made);
-        let refuse = |why: &str| Err(Refused(format!("extension {}: {why}", E::NAME)));
-        if let Some(error) = made.errors.first() {
-            return refuse(error);
-        }
-        let guarded = |i: &Installed| i.name == E::NAME && i.tier == Tier::Guarded;
-        if tier != Tier::Guarded && self.installed.iter().any(guarded) {
-            return refuse("a guarded extension of that name is loaded");
-        }
-        for slot in &made.slots {
-            let holder = self
-                .installed
-                .iter()
-                .find(|i| i.name != E::NAME && i.made.slots.contains(slot));
-            if let Some(holder) = holder {
-                return refuse(&format!("{} already fills the {slot:?} slot", holder.name));
-            }
-        }
         self.install(Installed {
             name: E::NAME,
             version: E::VERSION,
             tier,
             made,
-        });
-        Ok(self)
+        })
     }
 
-    /// Installs `new` and rebuilds what the extensions make, in install
-    /// order.
-    fn install(&mut self, mut new: Installed) {
+    /// Installs `new` unless it breaks a rule, and rebuilds what the
+    /// extensions make, in install order.
+    fn install(mut self, mut new: Installed) -> Result<Self, Refused> {
+        let refuse = |why: &str| Err(Refused(format!("extension {}: {why}", new.name)));
+        if let Some(error) = new.made.errors.first() {
+            return refuse(error);
+        }
+        let guarded = |i: &Installed| i.name == new.name && i.tier == Tier::Guarded;
+        if new.tier != Tier::Guarded && self.installed.iter().any(guarded) {
+            return refuse("a guarded extension of that name is loaded");
+        }
+        for slot in &new.made.slots {
+            let holder = self
+                .installed
+                .iter()
+                .find(|i| i.name != new.name && i.made.slots.contains(slot));
+            if let Some(holder) = holder {
+                return refuse(&format!("{} already fills the {slot:?} slot", holder.name));
+            }
+        }
         if let Some(slot) = self.installed.iter_mut().find(|i| i.name == new.name) {
             new.tier = slot.tier;
             *slot = new;
@@ -294,6 +293,7 @@ impl Registry {
         self.commands = commands.into_iter().map(|c| c.1).collect();
         self.sections = sections.into_iter().map(|s| s.1).collect();
         self.hooks = Hooks(hooks);
+        Ok(self)
     }
 
     pub fn tools(&self) -> &Toolset {
