@@ -14,8 +14,8 @@ Researched 2026-10-18 on macOS arm64, `nightly-2026-10-17`, ld-prime.
 | Release binary | < 4 MB | `mise run size` | 473 KiB; 3018 KiB with the provider (see below) |
 | Cold start (`a --version`) | — | `mise run startup` | 2.5–2.8 ms |
 | CLI peak RSS | — | `/usr/bin/time -l target/release/a --version` | 1.79 MB |
-| Idle daemon RSS | < 10 MB | `ps -o rss= -p <pid>` after 5 s idle (`VmRSS` on Linux) | — |
-| Cold first daemon reply | < 50 ms | — | — |
+| Idle daemon RSS | < 10 MB | `ps -o rss= -p <pid>` after 5 s idle (`VmRSS` on Linux) | 6.4 MB RSS, 1.8 MB footprint (2026-10-19) |
+| Cold first daemon reply | < 50 ms | `mise run budgets` | 20–33 ms (2026-10-19, see engine hot paths) |
 | Where size goes | — | `mise run bloat`, `mise run bloat:lines` | `.text` 343.9 KiB |
 
 ## In place
@@ -55,6 +55,8 @@ Researched 2026-10-18 on macOS arm64, `nightly-2026-10-17`, ld-prime.
 | Avoid monomorphizing heavy generic types (dyn at boundaries) | `bloat:lines` shows generic blowup | Targeted size wins | uv size work |
 | Startup symbol ordering (two-pass link with an order file) | Binary > ~10 MB and RSS matters | Deno Linux idle RSS 47 → 29 MiB, −2 ms | deno#36219 |
 | zstd-compressed embedded payloads (web assets, Lua stdlib) | Embedded assets grow | Deno, Bun (ICU pruning + lazy zstd ~6.8 MB) | deno `cli/build.rs`, bun#41330 |
+| Commit with `F_BARRIERFSYNC` instead of `F_FULLFSYNC` on Apple | Owner accepts losing the last commits (never their order) on power loss | Per commit 2.6 ms → 0.25 ms: echo reply ~3.0 → ~0.6 ms | `fcntl` microbenchmark, 200 appends |
+| Commit the attaching client's environment without waiting | Cold REPL start matters more than recording the environment before the replay | One `F_FULLFSYNC` (2.6 ms) off the cold start | — |
 | `/OPT:SAFEICF` on Windows | Full ICF breaks function identity | Bun hit BigInt breakage with full ICF | bun#30219 |
 
 ## Notes from adding the LLM provider (2026-10-18)
@@ -79,6 +81,53 @@ Researched 2026-10-18 on macOS arm64, `nightly-2026-10-17`, ld-prime.
 | Agent loop, hooks, remote bridge and binary staging | 2422 KiB | — |
 | Shared record decoders (`protocol::Decode`, `llm::Response::from_value`): release builds instantiate a generic deserializer once per calling crate, so each large one is decoded in its owning crate; hook decisions externally tagged | 2211 KiB | — |
 
+## Engine hot paths (2026-10-19)
+
+Measured on macOS arm64 against the release build, base `eb361d9` vs the
+engine after the session-log, fan-out and cold-path changes. A Python client
+speaks the wire protocol over the daemon socket with the echo agent;
+time to first delta uses `A_AGENT=chat` against a local HTTP server replaying
+the recorded text reply of `fixtures/rig/cassettes/openai/streaming_grammar/
+tool_then_followup_text.yaml` (`OPENAI_BASE_URL`). Footprint is `footprint
+<pid>` (dirty memory), RSS is `ps`. Cold runs alternate the builds so machine
+load hits them alike; 40 runs each.
+
+| Metric | Base | Now | What changed |
+| --- | --- | --- | --- |
+| Echo reply, input to committed answer (p50) | 5.98 ms | 2.99 ms | A step's entries commit in one batch, one fsync |
+| First delta, local model (p50) | 6.26 ms | 3.48 ms | User message and model-call intent share an fsync |
+| Model reply committed (p50) | 8.08 ms | 6.02 ms | Same |
+| Cold `a new` (p50 / p10) | 20.6 / 18.4 ms | 13.7 / 12.0 ms | No fsync before a session's first entry, none on the pid file |
+| Cold `a ls` (p50 / p10) | 15.9 / 14.7 ms | 10.5 / 9.0 ms | No fsync on the pid file |
+| Idle daemon | 6384 KB RSS, 1808 KB footprint | 6384 KB, 1824 KB | — |
+| 50 sessions × 20 exchanges, attached (footprint) | 5969 KB | 5633 KB | Idle actor future 5960 → 136 B (each unit of work boxed) |
+| Same, detached / hibernated (footprint) | 5185 / 4304 KB | 4849 / 3936 KB | Same |
+| Allocations per echo exchange, 1 / 8 clients | 59 / 184 (just before frames) | 60 / 130 | Each frame encoded once and shared (`protocol::Frame`) |
+| Bytes allocated per exchange, 8 clients | 44.4 KB (same) | 28.2 KB | Same |
+| Release binary | 2341 KiB (`__text` 1,684,000 B) | 2373 KiB (`__text` 1,721,760 B) | Extension records, child results, store I/O off the workers; one shared entry serializer won back 13.8 KB of `__text` |
+
+Allocation counts come from a counting global allocator in a throwaway engine
+test that drives `handle` over a socket pair (client side included, so only
+the differences mean anything).
+
+Where the time and memory still go:
+
+- Every commit is one `F_FULLFSYNC` (Rust's `sync_data` on Apple), 2.6 ms
+  here; plain `fsync` is 34 µs and `F_BARRIERFSYNC` 247 µs. Most of the echo
+  reply and of the first-delta overhead is that one flush. `F_BARRIERFSYNC`
+  keeps write order (the torn-tail recovery already assumes a prefix
+  survives) but not durability across power loss, so it is the owner's
+  call; see the deferred table.
+- A cold REPL start still pays two flushes before its first reply: the
+  attaching client's environment is committed before the replay, and a new
+  file's first commit also syncs its directory.
+- Idle RSS is mostly clean pages of Security and CoreFoundation (linked for
+  native TLS); dirty footprint is 1.8 MB. Both TLS choices link Security on
+  macOS (the platform verifier does too).
+- Freed session memory stays in malloc's zones after hibernation (97%
+  fragmentation, 94 KB live of 2.8 MB) until the OS reclaims it under
+  pressure.
+
 ## Rejected for now, with the reason and when to revisit
 
 | Idea | Measured here | Why not now | Revisit if |
@@ -92,6 +141,8 @@ Researched 2026-10-18 on macOS arm64, `nightly-2026-10-17`, ld-prime.
 | `-Zshare-generics` in release | — | Zed: sharing made binaries bigger; removing it was −12.65% on macOS | — |
 | rust-lld `--icf=safe` on macOS | text −2.7 KB, file +16 KB | ld-prime already deduplicates (`-dead_strip`, no `-no_deduplicate`) | ld-prime changes or the binary grows a lot |
 | Zed's `-Wl,-unexported_symbol,__R*` | No-op | `nm -gU` shows only `__mh_execute_header` exported | We export symbols (plugins, FFI dylib) |
+| `malloc_zone_pressure_relief` after hibernating sessions | Hibernated footprint unchanged (4176 → 4016 KB, noise); it returned 0 in a standalone test too | No effect on this macOS | `malloc_trim` once Linux is measured |
+| One boxed `rt::unblock` for every store call | `__text` −704 B | Not worth the indirection | — |
 | `target-cpu=native` in distributed builds | — | Non-portable; no project ships it (Bun's x86 baseline is nehalem) | Local-only builds |
 | BOLT | — | mise's own PR calls its timing inconclusive | Large binary with a stable hot path on Linux |
 | wild linker | — | Unverified claims; Zed dropped mold and wild (zed#53078) | It becomes a rustc default or proves faster here |
