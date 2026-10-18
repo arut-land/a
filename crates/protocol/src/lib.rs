@@ -1220,6 +1220,14 @@ fn known_kind(kind: &str) -> bool {
 
 /// Reads one frame; `Ok(None)` means the peer closed the stream cleanly.
 pub fn read_frame<T: Decode>(r: &mut impl Read) -> io::Result<Option<T>> {
+    match read_body(r)? {
+        Some(body) => Ok(Some(T::from_json(&body)?)),
+        None => Ok(None),
+    }
+}
+
+/// The body of the next frame, read once for every type and stream.
+fn read_body(r: &mut dyn Read) -> io::Result<Option<Vec<u8>>> {
     let mut len = [0; 4];
     match r.read_exact(&mut len) {
         Ok(()) => {}
@@ -1236,11 +1244,11 @@ pub fn read_frame<T: Decode>(r: &mut impl Read) -> io::Result<Option<T>> {
     // Grown as the bytes arrive, so a length alone allocates no more than
     // the peer goes on to send.
     let mut body = Vec::with_capacity((len as usize).min(64 * 1024));
-    r.by_ref().take(u64::from(len)).read_to_end(&mut body)?;
+    r.take(u64::from(len)).read_to_end(&mut body)?;
     if body.len() < len as usize {
         return Err(io::ErrorKind::UnexpectedEof.into());
     }
-    Ok(Some(T::from_json(&body)?))
+    Ok(Some(body))
 }
 
 #[cfg(test)]
