@@ -10,7 +10,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use protocol::{ClientMsg, read_frame};
 use sys::Staged;
 
-use crate::{Connection, Reader, Writer};
+use crate::{Connection, Reader, Welcome, Writer};
 
 /// What the bridge prints, with its token, once it is connected.
 pub const SYNC: &str = "A-BRIDGE";
@@ -80,8 +80,9 @@ fn bridge(host: &str, script: &str, token: &str) -> io::Result<Option<Connection
     thread::spawn(move || reap(child));
     Ok(Some(Connection {
         reader: Reader(out),
-        writer: Writer(Box::new(stdin)),
+        writer: Writer::new(Box::new(stdin)),
         remote: Some(remote),
+        welcome: Welcome::default(),
     }))
 }
 

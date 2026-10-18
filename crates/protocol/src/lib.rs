@@ -11,7 +11,12 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use uuid::Uuid;
 
+/// The protocol this build speaks best.
 pub const PROTO: u32 = 1;
+
+/// The oldest protocol this build still speaks: a peer whose range
+/// overlaps `PROTO_MIN..=PROTO` is served at the highest version both speak.
+pub const PROTO_MIN: u32 = 1;
 
 const MAX_FRAME: u32 = 16 * 1024 * 1024;
 
@@ -376,6 +381,94 @@ pub struct SessionSummary {
     pub workspace: PathBuf,
     pub entries: u64,
     pub clients: u32,
+    #[serde(default)]
+    pub activity: Activity,
+    #[serde(default)]
+    pub residency: Residency,
+}
+
+/// What a session is doing. A daemon older than this field reports every
+/// session `idle`; a newer one's states this build does not know read as
+/// `other`.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum Activity {
+    #[default]
+    Idle,
+    /// Working on queued input, a command, or a watch not yet fired.
+    Running,
+    /// Requires action: a tool call waits for the user's approval.
+    Approval,
+    /// Requires action: a dialog waits for the user's input.
+    Input,
+    /// Requires action: a tool waits on something outside the session,
+    /// such as a sign-in.
+    Tool,
+    /// Requires action: a call routed to a client that has gone waits for
+    /// one to come back.
+    Client,
+    /// Parked on purpose; nothing runs until it is resumed.
+    Suspended,
+    /// Finished for good, such as a child whose result is in.
+    Done,
+    /// Ended by an error it cannot recover from.
+    Failed,
+    #[serde(other)]
+    Other,
+}
+
+impl Activity {
+    /// Whether the session waits on someone before it can go on.
+    pub const fn requires_action(self) -> bool {
+        matches!(
+            self,
+            Self::Approval | Self::Input | Self::Tool | Self::Client
+        )
+    }
+
+    pub const fn name(self) -> &'static str {
+        match self {
+            Self::Idle => "idle",
+            Self::Running => "running",
+            Self::Approval => "approval",
+            Self::Input => "input",
+            Self::Tool => "tool",
+            Self::Client => "client",
+            Self::Suspended => "suspended",
+            Self::Done => "done",
+            Self::Failed => "failed",
+            Self::Other => "other",
+        }
+    }
+}
+
+/// Where a session's state is.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum Residency {
+    /// In memory, its actor running.
+    Loaded,
+    /// Only in its log; it loads on the next attach.
+    #[default]
+    Hibernated,
+    /// Moving to another host.
+    Migrating,
+    /// Run by another host and followed from here.
+    Remote,
+    #[serde(other)]
+    Other,
+}
+
+impl Residency {
+    pub const fn name(self) -> &'static str {
+        match self {
+            Self::Loaded => "loaded",
+            Self::Hibernated => "hibernated",
+            Self::Migrating => "migrating",
+            Self::Remote => "remote",
+            Self::Other => "other",
+        }
+    }
 }
 
 /// What happened in a session, for a client that attaches: derived from the
@@ -396,13 +489,247 @@ pub struct Recap {
     pub asks: u32,
 }
 
+/// A feature beyond the base protocol. A client offers the ones it handles
+/// in its hello and the welcome names those the daemon takes up; what a
+/// capability brings is used only on connections that took it up, so adding
+/// one needs no protocol bump and leaves old peers as they were. A
+/// capability whose shape changes gets a new name (`snapshot.2`).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Cap {
+    /// The daemon may send a [`DaemonMsg::Snapshot`] in place of a long
+    /// replay, or to a client too slow to keep up.
+    Snapshot,
+    /// The client numbers its mutations (`client_seq`); the daemon answers
+    /// each with [`DaemonMsg::Ack`] or [`DaemonMsg::Rejected`] in place of
+    /// [`DaemonMsg::Error`], and a repeat the way it answered the first.
+    Ack,
+    /// The daemon takes [`ClientMsg::Declare`]. (The `decl` an attach
+    /// carries needs no capability: a daemon older than it ignores it.)
+    Declare,
+}
+
+impl Cap {
+    /// Every capability this build knows.
+    pub const ALL: [Self; 3] = [Self::Snapshot, Self::Ack, Self::Declare];
+
+    pub const fn name(self) -> &'static str {
+        match self {
+            Self::Snapshot => "snapshot",
+            Self::Ack => "ack",
+            Self::Declare => "declare",
+        }
+    }
+
+    const fn bit(self) -> u32 {
+        1 << self as u32
+    }
+}
+
+/// A set of [`Cap`]s. On the wire, a list of names; names this build does
+/// not know are dropped, since it could not use them anyway.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct Caps(u32);
+
+impl Caps {
+    pub const NONE: Self = Self(0);
+
+    /// Everything this build handles.
+    pub const ALL: Self = {
+        let mut bits = 0;
+        let mut i = 0;
+        while i < Cap::ALL.len() {
+            bits |= Cap::ALL[i].bit();
+            i += 1;
+        }
+        Self(bits)
+    };
+
+    pub const fn has(self, cap: Cap) -> bool {
+        self.0 & cap.bit() != 0
+    }
+
+    // A reference, as `skip_serializing_if` passes it.
+    #[allow(clippy::trivially_copy_pass_by_ref)]
+    pub const fn is_empty(&self) -> bool {
+        self.0 == 0
+    }
+
+    pub fn iter(self) -> impl Iterator<Item = Cap> {
+        Cap::ALL.into_iter().filter(move |&c| self.has(c))
+    }
+}
+
+/// The capabilities both sides take up.
+impl std::ops::BitAnd for Caps {
+    type Output = Self;
+
+    fn bitand(self, other: Self) -> Self {
+        Self(self.0 & other.0)
+    }
+}
+
+impl FromIterator<Cap> for Caps {
+    fn from_iter<I: IntoIterator<Item = Cap>>(caps: I) -> Self {
+        Self(caps.into_iter().fold(0, |bits, c| bits | c.bit()))
+    }
+}
+
+impl Serialize for Caps {
+    fn serialize<S: serde::Serializer>(&self, s: S) -> Result<S::Ok, S::Error> {
+        s.collect_seq(self.iter().map(Cap::name))
+    }
+}
+
+impl<'de> Deserialize<'de> for Caps {
+    fn deserialize<D: serde::Deserializer<'de>>(d: D) -> Result<Self, D::Error> {
+        let names = Vec::<String>::deserialize(d)?;
+        Ok(Cap::ALL
+            .into_iter()
+            .filter(|c| names.iter().any(|n| n == c.name()))
+            .collect())
+    }
+}
+
+/// The protocol versions a peer speaks, `min..=max`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Versions {
+    pub min: u32,
+    pub max: u32,
+}
+
+impl Versions {
+    /// This build's.
+    pub const OURS: Self = Self {
+        min: PROTO_MIN,
+        max: PROTO,
+    };
+
+    /// `min..=max`, or just `max` without a `min`.
+    pub fn new(min: Option<u32>, max: u32) -> Self {
+        Self {
+            min: min.unwrap_or(max).min(max),
+            max,
+        }
+    }
+
+    /// The highest version in both ranges.
+    pub fn common(self, other: Self) -> Option<u32> {
+        let max = self.max.min(other.max);
+        (self.min.max(other.min) <= max).then_some(max)
+    }
+
+    /// `min` as a hello or mismatch carries it: left out when it is `max`.
+    pub fn min_field(self) -> Option<u32> {
+        (self.min < self.max).then_some(self.min)
+    }
+}
+
+/// Just the one version.
+impl From<u32> for Versions {
+    fn from(proto: u32) -> Self {
+        Self {
+            min: proto,
+            max: proto,
+        }
+    }
+}
+
+impl fmt::Display for Versions {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        if self.min == self.max {
+            write!(f, "protocol {}", self.max)
+        } else {
+            write!(f, "protocols {}-{}", self.min, self.max)
+        }
+    }
+}
+
+/// What a client does for a session beyond showing it: declared on attach
+/// and changed live with [`ClientMsg::Declare`] (a phone going to the
+/// background, say). Calls the session routes to clients go to those that
+/// declared the tool, and UI contributions to those that render the site.
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ClientDecl {
+    #[serde(default, skip_serializing_if = "Role::is_owner")]
+    pub role: Role,
+    /// Tools this client runs itself, by name.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub tools: Vec<String>,
+    /// UI sites it renders, such as `dialog` or `status`.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub sites: Vec<String>,
+}
+
+impl ClientDecl {
+    pub fn is_default(&self) -> bool {
+        *self == Self::default()
+    }
+}
+
+/// What a client may do to a session.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum Role {
+    #[default]
+    Owner,
+    Collaborator,
+    /// Read-only: its mutations are rejected. A role this build does not
+    /// know counts as this one.
+    #[serde(other)]
+    Viewer,
+}
+
+impl Role {
+    // A reference, as `skip_serializing_if` passes it.
+    #[allow(clippy::trivially_copy_pass_by_ref)]
+    const fn is_owner(&self) -> bool {
+        matches!(self, Self::Owner)
+    }
+}
+
+/// Who caused something: connection `client`'s mutation `client_seq`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Origin {
+    pub client: u32,
+    pub client_seq: u64,
+}
+
+/// Why the daemon refused a mutation.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum Rejection {
+    /// No session is attached on this connection.
+    NotAttached,
+    /// The daemon is restarting for an upgrade: send it again once
+    /// reconnected.
+    Draining,
+    /// A hook refused it.
+    Refused,
+    /// The call is not waiting for approval.
+    NotWaiting,
+    /// This client attached as a viewer.
+    ReadOnly,
+    /// A repeat of a mutation too old for its answer to be kept.
+    Stale,
+    #[serde(other)]
+    Other,
+}
+
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(tag = "t", rename_all = "snake_case")]
 pub enum ClientMsg {
-    /// `build` is the client's staged build id (`<version>+<hash>`).
+    /// `build` is the client's staged build id (`<version>+<hash>`); it
+    /// speaks protocols `min..=proto`, or just `proto` without `min`, with
+    /// capabilities `caps`. Its first messages (attach, input) may follow
+    /// right behind, without waiting for the answer: unless that is a
+    /// welcome, the daemon acts on none of them.
     Hello {
         proto: u32,
         build: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        min: Option<u32>,
+        #[serde(default, skip_serializing_if = "Caps::is_empty")]
+        caps: Caps,
     },
     /// `env` is the client's, for the commands the session runs; without
     /// one the session keeps the environment it had.
@@ -412,11 +739,17 @@ pub enum ClientMsg {
         since: u64,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         env: Option<Environment>,
+        #[serde(default, skip_serializing_if = "ClientDecl::is_default")]
+        decl: ClientDecl,
     },
+    /// Replaces this client's declaration. Only sent with [`Cap::Declare`].
+    Declare(ClientDecl),
     /// Replaces the attached session's environment (`/env refresh`).
     Environment(Environment),
     Input {
         text: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        client_seq: Option<u64>,
     },
     List,
     Detach,
@@ -424,20 +757,71 @@ pub enum ClientMsg {
     Approve {
         call: u64,
         approved: bool,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        client_seq: Option<u64>,
     },
     /// Aborts the attached session's running tool call.
-    Interrupt,
+    Interrupt {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        client_seq: Option<u64>,
+    },
+}
+
+impl ClientMsg {
+    pub const INTERRUPT: Self = Self::Interrupt { client_seq: None };
+
+    pub fn input(text: impl Into<String>) -> Self {
+        Self::Input {
+            text: text.into(),
+            client_seq: None,
+        }
+    }
+
+    pub const fn approve(call: u64, approved: bool) -> Self {
+        Self::Approve {
+            call,
+            approved,
+            client_seq: None,
+        }
+    }
+
+    /// The idempotency key of a mutation (a message that changes the
+    /// session), which the client numbers; `None` for any other message.
+    pub const fn client_seq_mut(&mut self) -> Option<&mut Option<u64>> {
+        match self {
+            Self::Input { client_seq, .. }
+            | Self::Approve { client_seq, .. }
+            | Self::Interrupt { client_seq } => Some(client_seq),
+            Self::Hello { .. }
+            | Self::Attach { .. }
+            | Self::Declare(_)
+            | Self::Environment(_)
+            | Self::List
+            | Self::Detach => None,
+        }
+    }
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(tag = "t", rename_all = "snake_case")]
 pub enum DaemonMsg {
+    /// The hello is accepted at protocol `proto`. `caps` are the client's
+    /// capabilities the daemon takes up, and `client` this connection's id,
+    /// as [`Origin`]s name it.
     Welcome {
         proto: u32,
         build: String,
+        #[serde(default, skip_serializing_if = "Caps::is_empty")]
+        caps: Caps,
+        #[serde(default, skip_serializing_if = "is_zero")]
+        client: u32,
     },
+    /// The daemon speaks protocols `min..=supported` (just `supported`
+    /// without `min`), none of the client's.
     Mismatch {
         supported: u32,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        min: Option<u32>,
     },
     /// A newer build was staged: the daemon finishes in-flight work, exits,
     /// and closes every connection. Clients then reconnect, which starts the
@@ -474,6 +858,24 @@ pub enum DaemonMsg {
     Error {
         message: String,
     },
+    /// The whole log-derived view at `view.seq`, in place of the replay up
+    /// to it: for an attach from far behind, or a client that fell too far
+    /// behind live. Folding it and what follows equals folding the entries
+    /// it stands for. Only sent with [`Cap::Snapshot`].
+    #[serde(skip_deserializing)]
+    Snapshot(Box<view::SessionView>),
+    /// Mutation `origin` was taken; what it causes follows as entries. Only
+    /// sent with [`Cap::Ack`].
+    Ack {
+        origin: Origin,
+    },
+    /// Mutation `origin` was refused. Only sent with [`Cap::Ack`].
+    Rejected {
+        origin: Origin,
+        reason: Rejection,
+        #[serde(default, skip_serializing_if = "String::is_empty")]
+        message: String,
+    },
     /// A message, or an entry, of a kind this build does not know: a newer
     /// daemon's. Never sent; decoding yields it so a client skips what it
     /// cannot show instead of dropping the connection. `seq` is the
@@ -482,6 +884,77 @@ pub enum DaemonMsg {
     Unknown {
         seq: Option<u64>,
     },
+}
+
+// A reference, as `skip_serializing_if` passes it.
+#[allow(clippy::trivially_copy_pass_by_ref)]
+const fn is_zero(n: &u32) -> bool {
+    *n == 0
+}
+
+/// How a message stands to the session's log.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Class {
+    /// Derived from the log, so a replay from any seq gives it again: a
+    /// client that falls behind is caught up rather than sent every such
+    /// message it missed.
+    Durable,
+    /// Never logged: live progress a later durable fact supersedes, which
+    /// may be dropped for a client that is behind.
+    Ephemeral,
+    /// About the connection rather than the session: always delivered, in
+    /// order.
+    Control,
+}
+
+impl Body {
+    /// Every entry kind is durable so far. An ephemeral kind (usage ticks,
+    /// presence) would go to live clients and never be replayed. The match
+    /// fails to compile when a kind is added, so that it is classified.
+    pub const fn class(&self) -> Class {
+        match self {
+            Self::User { .. }
+            | Self::Assistant { .. }
+            | Self::ToolCall { .. }
+            | Self::ToolProcess { .. }
+            | Self::ToolResult { .. }
+            | Self::ModelCall { .. }
+            | Self::ModelResult { .. }
+            | Self::Hook { .. }
+            | Self::Ask { .. }
+            | Self::Link { .. }
+            | Self::Watch { .. }
+            | Self::Fired { .. }
+            | Self::Environment(_)
+            | Self::Extensions { .. }
+            | Self::Ext { .. }
+            | Self::Context { .. }
+            | Self::Command { .. }
+            | Self::CommandResult { .. } => Class::Durable,
+        }
+    }
+}
+
+impl DaemonMsg {
+    pub const fn class(&self) -> Class {
+        match self {
+            Self::Entry(e) => e.body.class(),
+            Self::Attached { .. }
+            | Self::Synced { .. }
+            | Self::Recap(_)
+            | Self::Ask { .. }
+            | Self::Snapshot(_) => Class::Durable,
+            Self::Delta { .. } => Class::Ephemeral,
+            Self::Welcome { .. }
+            | Self::Mismatch { .. }
+            | Self::Draining
+            | Self::Sessions { .. }
+            | Self::Error { .. }
+            | Self::Ack { .. }
+            | Self::Rejected { .. }
+            | Self::Unknown { .. } => Class::Control,
+        }
+    }
 }
 
 /// Writes one frame: a little-endian u32 length followed by a JSON body.
@@ -499,13 +972,18 @@ pub fn write_frame<T: Serialize>(w: &mut impl Write, msg: &T) -> io::Result<()> 
 /// A frame encoded once, length prefix included, for any number of peers:
 /// cloning it shares the bytes.
 #[derive(Clone, Debug)]
-pub struct Frame(Arc<Vec<u8>>);
+pub struct Frame {
+    bytes: Arc<Vec<u8>>,
+    /// The entry's seq, for an entry.
+    pub seq: Option<u64>,
+    pub class: Class,
+}
 
 impl Frame {
     pub fn new(msg: &DaemonMsg) -> io::Result<Self> {
         let mut bytes = Self::start();
         serde_json::to_writer(&mut bytes, msg)?;
-        Self::finish(bytes)
+        Self::finish(bytes, None, msg.class())
     }
 
     /// The frame of `DaemonMsg::Entry(entry.clone())`, without the clone:
@@ -516,7 +994,7 @@ impl Frame {
         let at = bytes.len();
         entry.encode(&mut bytes)?;
         bytes[at] = b',';
-        Self::finish(bytes)
+        Self::finish(bytes, Some(entry.seq), entry.body.class())
     }
 
     /// Room for the length, and as much again as `serde_json::to_vec`
@@ -527,17 +1005,21 @@ impl Frame {
         bytes
     }
 
-    fn finish(mut bytes: Vec<u8>) -> io::Result<Self> {
+    fn finish(mut bytes: Vec<u8>, seq: Option<u64>, class: Class) -> io::Result<Self> {
         let len = u32::try_from(bytes.len() - 4)
             .ok()
             .filter(|&n| n <= MAX_FRAME)
             .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "frame too large"))?;
         bytes[..4].copy_from_slice(&len.to_le_bytes());
-        Ok(Self(Arc::new(bytes)))
+        Ok(Self {
+            bytes: Arc::new(bytes),
+            seq,
+            class,
+        })
     }
 
     pub fn as_bytes(&self) -> &[u8] {
-        &self.0
+        &self.bytes
     }
 }
 
@@ -580,6 +1062,11 @@ impl Decode for DaemonMsg {
             kind: Option<String>,
         }
         serde_json::from_slice(bytes).or_else(|e| match serde_json::from_slice::<Tags>(bytes) {
+            // Decoded on its own: through the tagged enum, the whole view
+            // would be buffered to find the tag.
+            Ok(Tags { t, .. }) if t == "snapshot" => {
+                view::SessionView::from_json(bytes).map(|v| Self::Snapshot(Box::new(v)))
+            }
             Ok(Tags { t, .. }) if !known_msg(&t) => Ok(Self::Unknown { seq: None }),
             Ok(Tags {
                 t,
@@ -606,6 +1093,9 @@ fn known_msg(t: &str) -> bool {
             | "recap"
             | "ask"
             | "error"
+            | "snapshot"
+            | "ack"
+            | "rejected"
     )
 }
 
@@ -649,8 +1139,13 @@ pub fn read_frame<T: Decode>(r: &mut impl Read) -> io::Result<Option<T>> {
             "frame too large",
         ));
     }
-    let mut body = vec![0; len as usize];
-    r.read_exact(&mut body)?;
+    // Grown as the bytes arrive, so a length alone allocates no more than
+    // the peer goes on to send.
+    let mut body = Vec::with_capacity((len as usize).min(64 * 1024));
+    r.by_ref().take(u64::from(len)).read_to_end(&mut body)?;
+    if body.len() < len as usize {
+        return Err(io::ErrorKind::UnexpectedEof.into());
+    }
     Ok(Some(T::from_json(&body)?))
 }
 
@@ -674,15 +1169,35 @@ mod tests {
         assert_eq!(Frame::new(&msg).unwrap().as_bytes(), written);
     }
 
+    /// A length the peer never sends the bytes for costs it nothing but an
+    /// error: the body is read as it comes, not allocated up front.
+    #[test]
+    fn a_frame_cut_short_is_an_error_whatever_length_it_claims() {
+        /// Counts the bytes asked for: what reading the frame would buffer.
+        struct Counted<'a>(&'a [u8], usize);
+        impl Read for Counted<'_> {
+            fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
+                self.1 = self.1.max(buf.len());
+                self.0.read(buf)
+            }
+        }
+        let mut claim = MAX_FRAME.to_le_bytes().to_vec();
+        claim.extend_from_slice(br#"{"t":"list"}"#);
+        let mut r = Counted(&claim, 0);
+        let err = read_frame::<ClientMsg>(&mut r).unwrap_err();
+        assert_eq!(err.kind(), io::ErrorKind::UnexpectedEof);
+        assert!(r.1 <= 128 * 1024, "asked for {} bytes at once", r.1);
+    }
+
     #[test]
     fn frames_round_trip() {
-        let msg = ClientMsg::Input { text: "hi".into() };
+        let msg = ClientMsg::input("hi");
         let mut buf = Vec::new();
         write_frame(&mut buf, &msg).unwrap();
         write_frame(&mut buf, &ClientMsg::Detach).unwrap();
         let mut r = buf.as_slice();
         assert!(
-            matches!(read_frame(&mut r).unwrap(), Some(ClientMsg::Input { text }) if text == "hi")
+            matches!(read_frame(&mut r).unwrap(), Some(ClientMsg::Input { text, .. }) if text == "hi")
         );
         assert!(matches!(
             read_frame(&mut r).unwrap(),
@@ -906,8 +1421,13 @@ mod tests {
             DaemonMsg::Welcome {
                 proto: PROTO,
                 build: "b".into(),
+                caps: Caps::ALL,
+                client: 1,
             },
-            DaemonMsg::Mismatch { supported: PROTO },
+            DaemonMsg::Mismatch {
+                supported: PROTO,
+                min: None,
+            },
             DaemonMsg::Draining,
             DaemonMsg::Attached {
                 session: child,
@@ -933,6 +1453,21 @@ mod tests {
             DaemonMsg::Error {
                 message: "m".into(),
             },
+            DaemonMsg::Snapshot(Box::default()),
+            DaemonMsg::Ack {
+                origin: Origin {
+                    client: 1,
+                    client_seq: 1,
+                },
+            },
+            DaemonMsg::Rejected {
+                origin: Origin {
+                    client: 1,
+                    client_seq: 1,
+                },
+                reason: Rejection::Stale,
+                message: String::new(),
+            },
         ];
         for msg in &msgs {
             match msg {
@@ -947,7 +1482,10 @@ mod tests {
                 | DaemonMsg::Sessions { .. }
                 | DaemonMsg::Recap(_)
                 | DaemonMsg::Ask { .. }
-                | DaemonMsg::Error { .. } => {}
+                | DaemonMsg::Error { .. }
+                | DaemonMsg::Snapshot(_)
+                | DaemonMsg::Ack { .. }
+                | DaemonMsg::Rejected { .. } => {}
             }
             let json = serde_json::to_vec(msg).unwrap();
             let tags: Value = serde_json::from_slice(&json).unwrap();

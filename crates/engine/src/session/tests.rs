@@ -1,12 +1,11 @@
 use std::path::Path;
 use std::sync::atomic::AtomicBool;
-use std::sync::mpsc;
 use std::thread;
 
 use agent::{Extension, Hook, Policy, Registrar, Registry, Tool};
 use bytes::Bytes;
 use llm::http::{BoxFuture, Http};
-use protocol::{Card, Decision, Permission};
+use protocol::{Caps, Card, Decision, Permission};
 use serde::Deserialize as _;
 use serde_json::json;
 
@@ -805,14 +804,15 @@ fn an_ask_waits_in_the_inbox_through_a_stop_and_runs_once_approved() {
     session.stop();
 
     let resumed = fixture.start(&asked);
-    let (tx, rx) = mpsc::channel();
-    resumed.attach(&tx, asked.len() as u64);
+    let outbox = Outbox::new(Caps::NONE);
+    resumed.attach(&outbox, asked.len() as u64);
     resumed.answer(3, true).unwrap();
     let log = finished(&resumed, 3);
     resumed.stop();
 
-    let sent: Vec<DaemonMsg> = rx
-        .try_iter()
+    let sent: Vec<DaemonMsg> = outbox
+        .take()
+        .into_iter()
         .map(|frame: Frame| {
             protocol::read_frame(&mut frame.as_bytes())
                 .unwrap()

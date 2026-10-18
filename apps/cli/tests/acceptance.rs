@@ -403,6 +403,7 @@ fn sessions_outlive_their_daemon() {
     assert_eq!(env.run(&["daemon", "stop"]), "stopped\n");
     let listed = env.run(&["ls"]);
     assert!(listed.starts_with(&id), "{listed}");
+    assert!(listed.contains("  idle       hibernated  "), "{listed}");
 }
 
 #[test]
@@ -419,6 +420,8 @@ fn a_pending_approval_survives_detach_and_is_re_delivered_on_attach() {
     };
     let ask = |msg: DaemonMsg| matches!(msg, DaemonMsg::Ask { call: c, tool, .. } if c == call && tool == "bash");
     assert!(ask(conn.recv()));
+    let listed = env.run(&["ls"]);
+    assert!(listed.contains("  approval   loaded  "), "{listed}");
     drop(conn);
 
     let mut conn = env.connect();

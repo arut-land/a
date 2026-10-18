@@ -5,7 +5,7 @@
 
 use std::path::PathBuf;
 
-use protocol::view::{SessionView, Update};
+use protocol::view::{Change, SessionView, Update};
 use protocol::{
     Body, Card, DaemonMsg, Decision, Decode, Entry, Environment, Outcome, Recap, SessionId,
 };
@@ -233,6 +233,25 @@ impl Session {
         msgs
     }
 
+    /// [`Session::attach`] as a client that takes snapshots gets it from
+    /// far behind: the entries up to `upto` as one view, through its wire
+    /// form, in place of their replay.
+    fn attach_snapshot(&self, upto: u64) -> Vec<DaemonMsg> {
+        let entries: Vec<Entry> = self
+            .log
+            .iter()
+            .filter_map(|m| match m {
+                DaemonMsg::Entry(e) if e.seq <= upto => Some(e.clone()),
+                _ => None,
+            })
+            .collect();
+        let view = SessionView::from_log(SESSION, "/w".into(), &entries);
+        let wire = serde_json::to_vec(&DaemonMsg::Snapshot(Box::new(view))).unwrap();
+        let mut msgs = self.attach(upto, upto);
+        msgs.insert(1, DaemonMsg::from_json(&wire).unwrap());
+        msgs
+    }
+
     /// The live stream as a client attached from the start sees it.
     fn watched(&self) -> Vec<DaemonMsg> {
         let mut msgs = self.attach(0, 0);
@@ -324,6 +343,51 @@ fn a_reconnect_replay_from_any_seq_seen_is_idempotent() {
             .max()
             .unwrap_or(0);
         fold(&mut view, &s.attach(since, upto));
+        fold(&mut view, &watched[resume..]);
+        assert_same(&view, &whole, seed);
+    }
+}
+
+#[test]
+fn a_snapshot_folds_to_the_replay_it_stands_for() {
+    for seed in 1..=SEEDS {
+        let s = Session::generate(&mut Rng(seed));
+        let replayed = folded(&s.attach(0, s.seq));
+        let snapshot = folded(&s.attach_snapshot(s.seq));
+        assert_same(&snapshot, &replayed, seed);
+    }
+}
+
+/// A client that falls behind at any point and is caught up with a
+/// snapshot of any later point, then follows live again, ends where one
+/// that kept up does.
+#[test]
+fn a_snapshot_then_what_follows_equals_the_whole_session() {
+    for seed in 1..=SEEDS {
+        let mut rng = Rng(seed);
+        let s = Session::generate(&mut rng);
+        let watched = s.watched();
+        let whole = folded(&watched);
+
+        let cut = rng.below(watched.len() as u64 + 1) as usize;
+        let resume = cut + rng.below((watched.len() - cut) as u64 + 1) as usize;
+        let mut view = folded(&watched[..cut]);
+        let upto = watched[..resume]
+            .iter()
+            .filter_map(|m| match m {
+                DaemonMsg::Entry(e) => Some(e.seq),
+                DaemonMsg::Unknown { seq } => *seq,
+                _ => None,
+            })
+            .max()
+            .unwrap_or(0);
+        let updates = fold(&mut view, &s.attach_snapshot(upto));
+        assert!(
+            updates
+                .iter()
+                .any(|u| matches!(u.change, Change::Snapshot { .. })),
+            "seed {seed}"
+        );
         fold(&mut view, &watched[resume..]);
         assert_same(&view, &whole, seed);
     }
@@ -592,6 +656,53 @@ fn scenarios() -> Vec<(&'static str, Vec<Value>)> {
                 msg(DaemonMsg::Synced { seq: 5 }),
             ],
         ),
+        ("a client that fell behind is caught up with a snapshot", {
+            let asked = Body::ToolCall {
+                tool: "bash".into(),
+                input: json!({ "command": "echo hi" }),
+                id: None,
+                card: None,
+            };
+            let log = [
+                Body::User { text: "one".into() },
+                Body::ModelCall { model: "m".into() },
+                asked,
+                Body::Ask { call: 3 },
+            ]
+            .into_iter()
+            .zip(1..)
+            .map(|(body, seq)| Entry {
+                seq,
+                epoch: 0,
+                body,
+            })
+            .collect::<Vec<_>>();
+            let view = SessionView::from_log(SESSION, "/w".into(), &log);
+            vec![
+                attached(),
+                entry(1, Body::User { text: "one".into() }),
+                entry(2, Body::ModelCall { model: "m".into() }),
+                msg(DaemonMsg::Synced { seq: 2 }),
+                msg(DaemonMsg::Delta {
+                    call: 2,
+                    text: "thinking".into(),
+                }),
+                attached(),
+                msg(DaemonMsg::Snapshot(Box::new(view))),
+                msg(DaemonMsg::Synced { seq: 4 }),
+                msg(DaemonMsg::Ask {
+                    call: 3,
+                    tool: "bash".into(),
+                    input: json!({ "command": "echo hi" }),
+                }),
+                entry(
+                    5,
+                    Body::Assistant {
+                        text: "done".into(),
+                    },
+                ),
+            ]
+        }),
         ("generated session 7", generated(7)),
         ("generated session 11", generated(11)),
     ]

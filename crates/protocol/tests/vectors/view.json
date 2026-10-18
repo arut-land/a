@@ -1027,6 +1027,277 @@
     ]
   },
   {
+    "hash": "18fdd01a62b848a7",
+    "messages": [
+      {
+        "session": "00000000-0000-0000-0000-00000000000a",
+        "t": "attached",
+        "workspace": "/w"
+      },
+      {
+        "epoch": 0,
+        "kind": "user",
+        "seq": 1,
+        "t": "entry",
+        "text": "one"
+      },
+      {
+        "epoch": 0,
+        "kind": "model_call",
+        "model": "m",
+        "seq": 2,
+        "t": "entry"
+      },
+      {
+        "seq": 2,
+        "t": "synced"
+      },
+      {
+        "call": 2,
+        "t": "delta",
+        "text": "thinking"
+      },
+      {
+        "session": "00000000-0000-0000-0000-00000000000a",
+        "t": "attached",
+        "workspace": "/w"
+      },
+      {
+        "environment": null,
+        "items": [
+          {
+            "seq": 1,
+            "text": "one",
+            "type": "user"
+          },
+          {
+            "call": 2,
+            "model": "m",
+            "status": {
+              "status": "running"
+            },
+            "text": "",
+            "type": "reply",
+            "usage": null
+          },
+          {
+            "approval": "pending",
+            "call": 3,
+            "input": {
+              "command": "echo hi"
+            },
+            "outcome": null,
+            "tool": "bash",
+            "type": "tool"
+          }
+        ],
+        "seq": 4,
+        "session": "00000000-0000-0000-0000-00000000000a",
+        "t": "snapshot",
+        "workspace": "/w"
+      },
+      {
+        "seq": 4,
+        "t": "synced"
+      },
+      {
+        "call": 3,
+        "input": {
+          "command": "echo hi"
+        },
+        "t": "ask",
+        "tool": "bash"
+      },
+      {
+        "epoch": 0,
+        "kind": "assistant",
+        "seq": 5,
+        "t": "entry",
+        "text": "done"
+      }
+    ],
+    "name": "a client that fell behind is caught up with a snapshot",
+    "state": {
+      "environment": null,
+      "items": [
+        {
+          "seq": 1,
+          "text": "one",
+          "type": "user"
+        },
+        {
+          "call": 2,
+          "model": "m",
+          "status": {
+            "status": "running"
+          },
+          "text": "",
+          "type": "reply",
+          "usage": null
+        },
+        {
+          "approval": "pending",
+          "call": 3,
+          "input": {
+            "command": "echo hi"
+          },
+          "outcome": null,
+          "tool": "bash",
+          "type": "tool"
+        },
+        {
+          "seq": 5,
+          "text": "done",
+          "type": "assistant"
+        }
+      ],
+      "seq": 5,
+      "session": "00000000-0000-0000-0000-00000000000a",
+      "workspace": "/w"
+    },
+    "updates": [
+      {
+        "change": {
+          "change": "attached",
+          "reset": true,
+          "session": "00000000-0000-0000-0000-00000000000a",
+          "workspace": "/w"
+        },
+        "rev": 1,
+        "seq": 0
+      },
+      {
+        "change": {
+          "change": "added",
+          "index": 0,
+          "item": {
+            "seq": 1,
+            "text": "one",
+            "type": "user"
+          }
+        },
+        "rev": 2,
+        "seq": 1
+      },
+      {
+        "change": {
+          "change": "added",
+          "index": 1,
+          "item": {
+            "call": 2,
+            "model": "m",
+            "status": {
+              "status": "running"
+            },
+            "text": "",
+            "type": "reply",
+            "usage": null
+          }
+        },
+        "rev": 3,
+        "seq": 2
+      },
+      {
+        "change": {
+          "change": "synced"
+        },
+        "rev": 4,
+        "seq": 2
+      },
+      {
+        "change": {
+          "call": 2,
+          "change": "delta",
+          "text": "thinking"
+        },
+        "rev": 5,
+        "seq": 2
+      },
+      {
+        "change": {
+          "change": "attached",
+          "reset": false,
+          "session": "00000000-0000-0000-0000-00000000000a",
+          "workspace": "/w"
+        },
+        "rev": 6,
+        "seq": 2
+      },
+      {
+        "change": {
+          "change": "snapshot",
+          "items": [
+            {
+              "seq": 1,
+              "text": "one",
+              "type": "user"
+            },
+            {
+              "call": 2,
+              "model": "m",
+              "status": {
+                "status": "running"
+              },
+              "text": "",
+              "type": "reply",
+              "usage": null
+            },
+            {
+              "approval": "pending",
+              "call": 3,
+              "input": {
+                "command": "echo hi"
+              },
+              "outcome": null,
+              "tool": "bash",
+              "type": "tool"
+            }
+          ]
+        },
+        "rev": 7,
+        "seq": 4
+      },
+      {
+        "change": {
+          "change": "synced"
+        },
+        "rev": 8,
+        "seq": 4
+      },
+      {
+        "change": {
+          "change": "asked",
+          "index": 2,
+          "item": {
+            "approval": "pending",
+            "call": 3,
+            "input": {
+              "command": "echo hi"
+            },
+            "outcome": null,
+            "tool": "bash",
+            "type": "tool"
+          }
+        },
+        "rev": 9,
+        "seq": 4
+      },
+      {
+        "change": {
+          "change": "added",
+          "index": 3,
+          "item": {
+            "seq": 5,
+            "text": "done",
+            "type": "assistant"
+          }
+        },
+        "rev": 10,
+        "seq": 5
+      }
+    ]
+  },
+  {
     "hash": "bf08f5b5f14d1541",
     "messages": [
       {

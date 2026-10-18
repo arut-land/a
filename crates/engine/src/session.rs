@@ -6,7 +6,6 @@ use std::panic::{AssertUnwindSafe, catch_unwind};
 use std::path::PathBuf;
 use std::pin::pin;
 use std::sync::atomic::{AtomicUsize, Ordering};
-use std::sync::mpsc::Sender;
 use std::sync::{Arc, Mutex, MutexGuard, Weak};
 use std::task::{Poll, Waker};
 use std::time::{Duration, Instant};
@@ -14,14 +13,16 @@ use std::time::{Duration, Instant};
 use agent::{
     Action, Agent, Cancel, Cx, Decided, DynTool, Facts, Gate, Hooks, Host, Input, Replay, States,
 };
+use protocol::view::SessionView;
 use protocol::{
-    Body, DaemonMsg, Decision, Entry, Environment, Frame, Installed, Outcome, SessionId,
-    SessionSummary,
+    Activity, Body, Cap, DaemonMsg, Decision, Entry, Environment, Frame, Installed, Outcome,
+    Residency, SessionId, SessionSummary,
 };
 use serde_json::Value;
 use store::{Header, Loaded, Log, LogStore, Parent};
 
 use crate::model::{Model, Models};
+use crate::outbox::Outbox;
 use crate::{Daemon, lock};
 
 mod facts;
@@ -106,8 +107,12 @@ enum Msg {
 
 struct State {
     entries: Vec<Entry>,
-    clients: Vec<Sender<Frame>>,
+    clients: Vec<Outbox>,
 }
+
+/// How many entries behind a client must be to get a snapshot rather than
+/// a replay, when it takes them.
+const SNAPSHOT_GAP: usize = 256;
 
 /// Entries recorded and not yet committed. While `draining`, one blocking
 /// job commits them in batches, so log writes and their fsyncs stay off the
@@ -299,31 +304,62 @@ impl Session {
         self.shared.registry.hooks().session_end(self.id);
     }
 
-    pub fn attach(&self, client: &Sender<Frame>, since: u64) {
-        let send = |frame: io::Result<Frame>| {
-            if let Ok(frame) = frame {
-                let _ = client.send(frame);
-            }
-        };
+    /// Attaches `client`, which has the entries up to `since`: it is sent
+    /// what it missed, then everything live.
+    pub fn attach(&self, client: &Outbox, since: u64) {
         let mut st = self.lock();
-        send(Frame::new(&DaemonMsg::Attached {
+        let frames = self.catch_up_frames(&st.entries, client, since, true);
+        let follower = client.follow(self.this.clone(), since, frames);
+        st.clients.push(follower);
+    }
+
+    /// Catches up `client`, which fell behind after entry `since` while it
+    /// followed this session as its `following`th.
+    pub fn catch_up(&self, client: &Outbox, following: u64, since: u64) {
+        let st = self.lock();
+        let frames = self.catch_up_frames(&st.entries, client, since, false);
+        client.caught_up(following, frames);
+    }
+
+    /// What a client that has the entries up to `since` is missing: the
+    /// attach, a replay (or a snapshot, for one far behind that takes them)
+    /// and its end, optionally a recap, and the asks still waiting.
+    fn catch_up_frames(
+        &self,
+        entries: &[Entry],
+        client: &Outbox,
+        since: u64,
+        with_recap: bool,
+    ) -> Vec<Frame> {
+        let mut frames = Vec::new();
+        let mut push = |msg: &DaemonMsg| frames.extend(Frame::new(msg));
+        push(&DaemonMsg::Attached {
             session: self.id,
             workspace: self.workspace.clone(),
-        }));
-        for e in st.entries.iter().filter(|e| e.seq > since) {
-            send(Frame::entry(e));
+        });
+        let missed = entries.iter().filter(|e| e.seq > since);
+        let snapshot = (client.caps().has(Cap::Snapshot) && missed.clone().count() > SNAPSHOT_GAP)
+            .then(|| {
+                let view = SessionView::from_log(self.id, self.workspace.clone(), entries);
+                Frame::new(&DaemonMsg::Snapshot(Box::new(view)))
+            });
+        match snapshot {
+            // One too large for a frame is replayed instead.
+            Some(Ok(frame)) => frames.push(frame),
+            _ => frames.extend(missed.filter_map(|e| Frame::entry(e).ok())),
         }
-        let seq = st.entries.last().map_or(0, |e| e.seq);
-        send(Frame::new(&DaemonMsg::Synced { seq }));
-        if let Some(recap) = recap(&st.entries, since) {
-            send(Frame::new(&DaemonMsg::Recap(recap)));
+        let mut push = |msg: &DaemonMsg| frames.extend(Frame::new(msg));
+        let seq = entries.last().map_or(0, |e| e.seq);
+        push(&DaemonMsg::Synced { seq });
+        if with_recap && let Some(recap) = recap(entries, since) {
+            push(&DaemonMsg::Recap(recap));
         }
-        for call in inbox(&st.entries) {
-            if let Some(msg) = ask(&st.entries, call) {
-                send(Frame::new(&msg));
+        for call in inbox(entries) {
+            if let Some(msg) = ask(entries, call) {
+                push(&msg);
             }
         }
-        st.clients.push(client.clone());
+        frames
     }
 
     /// Runs commands from now on in `env`, the newest client's. Its redacted
@@ -339,11 +375,21 @@ impl Session {
     }
 
     pub fn summary(&self) -> SessionSummary {
+        let st = self.lock();
+        let activity = if !inbox(&st.entries).is_empty() {
+            Activity::Approval
+        } else if self.has_work() {
+            Activity::Running
+        } else {
+            Activity::Idle
+        };
         SessionSummary {
             id: self.id,
             workspace: self.workspace.clone(),
-            entries: self.lock().entries.len() as u64,
+            entries: st.entries.len() as u64,
             clients: u32::try_from(self.attached.load(Ordering::SeqCst)).unwrap_or(u32::MAX),
+            activity,
+            residency: Residency::Loaded,
         }
     }
 

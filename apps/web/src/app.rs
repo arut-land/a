@@ -117,13 +117,8 @@ fn list(daemon: &Daemon) -> io::Result<Vec<SessionSummary>> {
 /// Starts a session in the workspace `a web` runs in, with its environment
 /// (or a remote daemon's bridge's), as `a new` does.
 fn new_session(daemon: &Daemon) -> io::Result<SessionId> {
-    let mut conn = connect(daemon)?;
-    let (workspace, env) = conn.origin()?;
-    conn.writer.send(&ClientMsg::Attach {
-        target: Target::New,
-        workspace,
-        since: 0,
-        env: Some(env),
+    let mut conn = client::connect_with(&daemon.endpoint, &daemon.staged, &|| {}, &|conn| {
+        Ok(vec![conn.attach(Target::New, 0, true)?])
     })?;
     let session = conn.reader.until(|msg| match msg {
         DaemonMsg::Attached { session, .. } => Some(session),
@@ -136,15 +131,9 @@ fn new_session(daemon: &Daemon) -> io::Result<SessionId> {
 /// Attaches to `session` without an environment, so it keeps the one it
 /// has, replaying the entries after `since`.
 fn attach(daemon: &Daemon, session: SessionId, since: u64) -> io::Result<Connection> {
-    let mut conn = connect(daemon)?;
-    let (workspace, _) = conn.origin()?;
-    conn.writer.send(&ClientMsg::Attach {
-        target: Target::Id(session),
-        workspace,
-        since,
-        env: None,
-    })?;
-    Ok(conn)
+    client::connect_with(&daemon.endpoint, &daemon.staged, &|| {}, &|conn| {
+        Ok(vec![conn.attach(Target::Id(session), since, false)?])
+    })
 }
 
 fn parse_session(id: &str) -> Option<SessionId> {
@@ -381,13 +370,13 @@ async fn send(cx: &Cx, tab: String, text: String) -> Result<bool> {
         return Ok(false);
     }
     Ok(app_context::<App>(cx)
-        .tell(&tab, ClientMsg::Input { text })
+        .tell(&tab, ClientMsg::input(text))
         .await)
 }
 
 #[procedure("/api/approve")]
 pub async fn approve(cx: &Cx, tab: String, call: u64, approved: bool) -> Result<bool> {
     Ok(app_context::<App>(cx)
-        .tell(&tab, ClientMsg::Approve { call, approved })
+        .tell(&tab, ClientMsg::approve(call, approved))
         .await)
 }

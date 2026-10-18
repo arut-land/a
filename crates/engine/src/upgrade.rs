@@ -21,14 +21,15 @@
 //! CLI to `runtime/current/a`, so the two are the same build to begin with.
 
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::mpsc::Sender;
+
 use std::sync::{Mutex, OnceLock};
 use std::time::Instant;
 
-use protocol::{DaemonMsg, Frame, PROTO};
+use protocol::{DaemonMsg, Frame, Versions};
 use sys::Runtime;
 
 use crate::lock;
+use crate::outbox::Outbox;
 
 /// How the daemon answers a hello.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -44,10 +45,16 @@ impl Verdict {
     /// `own` means a newer build was staged (staging never downgrades), and a
     /// client of another build is the cue to hand over. Clients of this very
     /// build keep being served until then, whatever `current` says.
-    pub fn of(proto: u32, client: &str, own: &str, current: Option<&str>, draining: bool) -> Self {
+    pub fn of(
+        proto: impl Into<Versions>,
+        client: &str,
+        own: &str,
+        current: Option<&str>,
+        draining: bool,
+    ) -> Self {
         if draining || (client != own && current.is_some_and(|c| c != own)) {
             Self::Drain
-        } else if proto == PROTO {
+        } else if Versions::OURS.common(proto.into()).is_some() {
             Self::Welcome
         } else {
             Self::Mismatch
@@ -62,7 +69,7 @@ pub struct Lifecycle {
     /// When the drain began.
     draining: OnceLock<Instant>,
     /// Every open connection's outbox, told when a drain begins.
-    conns: Mutex<Vec<(u64, Sender<Frame>)>>,
+    conns: Mutex<Vec<(u64, Outbox)>>,
     next: AtomicU64,
 }
 
@@ -77,7 +84,7 @@ impl Lifecycle {
         }
     }
 
-    pub fn verdict(&self, proto: u32, client: &str) -> Verdict {
+    pub fn verdict(&self, proto: impl Into<Versions>, client: &str) -> Verdict {
         // A `current` that cannot be started is no reason to stop serving.
         let current = self
             .runtime
@@ -109,7 +116,7 @@ impl Lifecycle {
     }
 
     /// Registers a connection's outbox until the guard drops.
-    pub fn register(&self, tx: Sender<Frame>) -> Registered<'_> {
+    pub fn register(&self, tx: Outbox) -> Registered<'_> {
         let id = self.next.fetch_add(1, Ordering::Relaxed);
         lock(&self.conns).push((id, tx));
         Registered { life: self, id }
@@ -119,6 +126,14 @@ impl Lifecycle {
 pub struct Registered<'a> {
     life: &'a Lifecycle,
     id: u64,
+}
+
+impl Registered<'_> {
+    /// The connection's id for its client, from 1: what its welcome and
+    /// the origins of its mutations carry.
+    pub fn client(&self) -> u32 {
+        u32::try_from(self.id + 1).unwrap_or(u32::MAX)
+    }
 }
 
 impl Drop for Registered<'_> {

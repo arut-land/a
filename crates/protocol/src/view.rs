@@ -12,15 +12,17 @@
 use std::io;
 use std::path::PathBuf;
 
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
 use crate::{
-    Body, Card, DaemonMsg, Decision, Entry, Environment, Outcome, Recap, SessionId, SessionSummary,
+    Body, Card, DaemonMsg, Decision, Decode, Entry, Environment, Outcome, Recap, SessionId,
+    SessionSummary,
 };
 
-/// One session as a client shows it.
-#[derive(Clone, Debug, Default, PartialEq, Serialize)]
+/// One session as a client shows it. Its serialized form is also what a
+/// [`DaemonMsg::Snapshot`] carries.
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
 pub struct SessionView {
     pub session: Option<SessionId>,
     pub workspace: PathBuf,
@@ -68,7 +70,7 @@ pub struct Stream {
 
 /// A transcript item, keyed by the seq of the entry that started it (for a
 /// call, its call id).
-#[derive(Clone, Debug, PartialEq, Serialize)]
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum Item {
     User {
@@ -94,7 +96,7 @@ pub enum Item {
         approval: Option<Approval>,
         outcome: Option<Outcome>,
         /// How the tool presents the call, or once it has one, its outcome.
-        #[serde(skip_serializing_if = "Option::is_none")]
+        #[serde(default, skip_serializing_if = "Option::is_none")]
         card: Option<Card>,
         /// Whether this client was asked to approve it.
         #[serde(skip)]
@@ -144,7 +146,7 @@ impl Item {
     }
 }
 
-#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "status", rename_all = "snake_case")]
 pub enum Status {
     Running,
@@ -153,13 +155,13 @@ pub enum Status {
     Interrupted,
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Usage {
     pub input: u64,
     pub output: u64,
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum Approval {
     Pending,
@@ -208,6 +210,10 @@ pub enum Change {
         item: Item,
     },
     Synced,
+    /// The daemon sent the whole view: the items are these now.
+    Snapshot {
+        items: Vec<Item>,
+    },
     Recap(Recap),
     Draining,
     Mismatch {
@@ -229,6 +235,21 @@ pub enum Part {
 }
 
 impl SessionView {
+    /// The view of `session` as its log `entries` leave it: what a client
+    /// that attached and folded them would hold, but for what only a
+    /// connection sees.
+    pub fn from_log(session: SessionId, workspace: PathBuf, entries: &[Entry]) -> Self {
+        let mut view = Self {
+            session: Some(session),
+            workspace,
+            ..Self::default()
+        };
+        for e in entries {
+            view.entry(e);
+        }
+        view
+    }
+
     /// Folds one daemon message in. `None` when it changed nothing, such as
     /// an entry replayed again after a reconnect, a repeated ask, or a kind
     /// this build does not know.
@@ -314,20 +335,70 @@ impl SessionView {
                 self.link = Link::Draining;
                 Some(Change::Draining)
             }
-            DaemonMsg::Mismatch { supported } => Some(Change::Mismatch {
+            DaemonMsg::Mismatch { supported, .. } => Some(Change::Mismatch {
                 supported: *supported,
             }),
             DaemonMsg::Error { message } => Some(Change::Error {
                 message: message.clone(),
             }),
+            DaemonMsg::Rejected {
+                reason, message, ..
+            } => Some(Change::Error {
+                message: if message.is_empty() {
+                    format!("refused: {reason:?}")
+                } else {
+                    message.clone()
+                },
+            }),
+            DaemonMsg::Snapshot(view) => Some(self.adopt(view)),
             // Skipped, but a reconnect still starts after it.
             DaemonMsg::Unknown { seq: Some(seq) } => {
                 self.seq = self.seq.max(*seq);
                 None
             }
-            DaemonMsg::Welcome { .. } | DaemonMsg::Sessions { .. } | DaemonMsg::Unknown { .. } => {
-                None
+            DaemonMsg::Welcome { .. }
+            | DaemonMsg::Sessions { .. }
+            | DaemonMsg::Ack { .. }
+            | DaemonMsg::Unknown { .. } => None,
+        }
+    }
+
+    /// Takes the log-derived state of `snapshot`, keeping what only this
+    /// connection saw where it still holds: which waiting calls it was asked
+    /// about, and the reply streaming in.
+    fn adopt(&mut self, snapshot: &Self) -> Change {
+        let asked: Vec<u64> = if self.session == snapshot.session {
+            self.asked().collect()
+        } else {
+            Vec::new()
+        };
+        let mut items = snapshot.items.clone();
+        for item in &mut items {
+            if let Item::Tool {
+                call,
+                approval: Some(Approval::Pending),
+                asked: a,
+                ..
+            } = item
+            {
+                *a = asked.contains(call);
             }
+        }
+        let running = |call| {
+            items.iter().any(
+                |i| matches!(i, Item::Reply { call: c, status: Status::Running, .. } if *c == call),
+            )
+        };
+        if self.streaming.as_ref().is_some_and(|s| !running(s.call)) {
+            self.streaming = None;
+        }
+        self.session = snapshot.session;
+        self.workspace.clone_from(&snapshot.workspace);
+        self.seq = snapshot.seq;
+        self.environment.clone_from(&snapshot.environment);
+        self.items = items;
+        Change::Snapshot {
+            items: self.items.clone(),
         }
     }
 
@@ -650,6 +721,12 @@ impl SessionList {
             }
             _ => false,
         }
+    }
+}
+
+impl Decode for SessionView {
+    fn from_json(bytes: &[u8]) -> serde_json::Result<Self> {
+        serde_json::from_slice(bytes)
     }
 }
 

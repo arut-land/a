@@ -24,8 +24,12 @@ pub fn run(daemon: &Daemon, target: Target, viewport: Viewport) -> io::Result<()
     let early = match &daemon.endpoint {
         Endpoint::Ssh(_) => {
             let on_drain = || eprintln!("[waiting for the previous daemon to finish its work]");
-            let conn = client::connect(&daemon.endpoint, &daemon.staged, &on_drain)?;
-            Some(attach(conn, &target, 0)?)
+            Some(client::connect_with(
+                &daemon.endpoint,
+                &daemon.staged,
+                &on_drain,
+                &attach(&target, 0),
+            )?)
         }
         Endpoint::Local(_) => None,
     };
@@ -211,11 +215,17 @@ impl Client<'_> {
                 let text = "waiting for the previous daemon to finish its work".to_owned();
                 let _ = notice.send(Event::Notice(text));
             };
+            let first = attach(&target, since);
             let conn = match (&daemon.endpoint, restart) {
-                (Endpoint::Local(home), true) => client::restart(home, &daemon.staged),
-                (endpoint, _) => client::connect(endpoint, &daemon.staged, &on_drain),
+                (Endpoint::Local(home), true) => {
+                    client::restart(home, &daemon.staged).and_then(|mut conn| {
+                        conn.send_all(&first(&conn)?)?;
+                        Ok(conn)
+                    })
+                }
+                (endpoint, _) => client::connect_with(endpoint, &daemon.staged, &on_drain, &first),
             };
-            match conn.and_then(|conn| attach(conn, &target, since)) {
+            match conn {
                 Ok(conn) => read(conn, id, &tx),
                 Err(e) => {
                     let _ = tx.send(Event::Failed(id, e));
@@ -241,17 +251,11 @@ impl Client<'_> {
     }
 }
 
-/// Asks to attach to `target` over `conn` from this shell's workspace and
-/// with its environment (or a remote bridge's), replaying from `since`.
-fn attach(mut conn: Connection, target: &Target, since: u64) -> io::Result<Connection> {
-    let (workspace, env) = conn.origin()?;
-    conn.writer.send(&ClientMsg::Attach {
-        target: target.clone(),
-        workspace,
-        since,
-        env: Some(env),
-    })?;
-    Ok(conn)
+/// What a connection sends first: the attach to `target` from this shell's
+/// workspace and with its environment (or a remote bridge's), replaying
+/// from `since`.
+fn attach(target: &Target, since: u64) -> impl Fn(&Connection) -> io::Result<Vec<ClientMsg>> {
+    move |conn| Ok(vec![conn.attach(target.clone(), since, true)?])
 }
 
 /// Hands over the writer, then forwards every message until the
@@ -261,6 +265,7 @@ fn read(conn: Connection, id: u64, tx: &Sender<Event>) {
         mut reader,
         writer,
         remote,
+        ..
     } = conn;
     if tx
         .send(Event::Connected(id, writer, remote.is_some()))

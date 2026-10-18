@@ -101,6 +101,12 @@ pub struct SessionInfo {
     pub workspace: String,
     pub entries: u64,
     pub clients: u32,
+    /// What it is doing, such as `idle`, `running` or `approval`.
+    pub activity: String,
+    /// Whether it is `loaded` or `hibernated`.
+    pub residency: String,
+    /// Whether it waits on the user.
+    pub requires_action: bool,
 }
 
 impl From<&SessionSummary> for SessionInfo {
@@ -111,6 +117,9 @@ impl From<&SessionSummary> for SessionInfo {
             workspace: s.workspace.display().to_string(),
             entries: s.entries,
             clients: s.clients,
+            activity: s.activity.name().to_owned(),
+            residency: s.residency.name().to_owned(),
+            requires_action: s.activity.requires_action(),
         }
     }
 }
@@ -232,6 +241,10 @@ pub enum ViewChange {
     },
     /// The replay is complete; what follows is live.
     Synced,
+    /// The daemon sent the whole view: the items are these now.
+    Snapshot {
+        items: Vec<ViewItem>,
+    },
     Recap {
         recap: RecapInfo,
     },
@@ -493,6 +506,9 @@ impl From<&Change> for ViewChange {
                 item: item.into(),
             },
             Change::Synced => Self::Synced,
+            Change::Snapshot { items } => Self::Snapshot {
+                items: items.iter().map(Into::into).collect(),
+            },
             Change::Recap(recap) => Self::Recap {
                 recap: recap.into(),
             },

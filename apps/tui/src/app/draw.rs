@@ -194,8 +194,10 @@ impl App {
                         n => format!("  · {n} attached"),
                     };
                     let text = format!(
-                        "{here} {}  {:>5} entries  {}{attached}",
+                        "{here} {}  {:<9}  {:<10}  {:>5} entries  {}{attached}",
                         s.id.short(),
+                        s.activity.name(),
+                        s.residency.name(),
                         s.entries,
                         tilde(&s.workspace)
                     );

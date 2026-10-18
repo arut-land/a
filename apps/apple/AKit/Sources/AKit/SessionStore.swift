@@ -143,6 +143,13 @@ public final class SessionStore {
             }
         case .synced:
             link = .live
+        case .snapshot(let snapshot):
+            items = snapshot
+            if let call = streaming?.call, !items.contains(where: {
+                if case .reply(call, _, _, .running, _) = $0 { true } else { false }
+            }) {
+                streaming = nil
+            }
         case .recap(let recap):
             self.recap = recap
         case .draining:

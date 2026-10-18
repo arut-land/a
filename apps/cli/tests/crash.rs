@@ -65,7 +65,7 @@ fn every_entry_shown_survives_kill_9_at_random_points() {
 
         for _ in 0..=rng.below(3) {
             let text = rng.pick(INPUTS).to_string();
-            send(&mut stream, &ClientMsg::Input { text });
+            send(&mut stream, &ClientMsg::input(text));
         }
         let delay = Duration::from_millis(rng.below(200));
         let killer = thread::spawn(move || {
@@ -86,12 +86,7 @@ fn every_entry_shown_survives_kill_9_at_random_points() {
     let (mut stream, id, replay) = attach(&env, session);
     check(&shown, &replay, ROUNDS, seed);
     // One more turn, so whatever recovery repaired is written out.
-    send(
-        &mut stream,
-        &ClientMsg::Input {
-            text: "done".into(),
-        },
-    );
+    send(&mut stream, &ClientMsg::input("done"));
     let mut entries = replay;
     while !matches!(entries.last(), Some(Entry { body: Body::Assistant { text }, .. }) if text == "done")
     {
@@ -126,6 +121,8 @@ fn attach(env: &Env, session: Option<SessionId>) -> (UnixStream, SessionId, Vec<
         &ClientMsg::Hello {
             proto: PROTO,
             build: "crash".into(),
+            min: None,
+            caps: protocol::Caps::NONE,
         },
     );
     send(
@@ -135,6 +132,7 @@ fn attach(env: &Env, session: Option<SessionId>) -> (UnixStream, SessionId, Vec<
             workspace: env.ws.clone(),
             since: 0,
             env: None,
+            decl: protocol::ClientDecl::default(),
         },
     );
     let mut id = None;

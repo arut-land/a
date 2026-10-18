@@ -1,7 +1,8 @@
 use std::path::PathBuf;
 
 use protocol::{
-    Body, Card, ClientMsg, DaemonMsg, Entry, Outcome, Recap, SessionId, SessionSummary, Target,
+    Activity, Body, Card, ClientMsg, DaemonMsg, Entry, Outcome, Recap, Residency, SessionId,
+    SessionSummary, Target,
 };
 use serde_json::json;
 
@@ -110,7 +111,8 @@ fn an_approval_shows_buttons_and_y_or_a_click_answers_it() {
         press(&mut app, Key::Char('y')),
         Some(Effect::Send(ClientMsg::Approve {
             call: 3,
-            approved: true
+            approved: true,
+            ..
         }))
     ));
     let (x, y) = find(&rows, "[ n  no ]");
@@ -118,7 +120,8 @@ fn an_approval_shows_buttons_and_y_or_a_click_answers_it() {
         app.input(Input::Mouse(Mouse::Press { x: x + 2, y })),
         Some(Effect::Send(ClientMsg::Approve {
             call: 3,
-            approved: false
+            approved: false,
+            ..
         }))
     ));
     // With text in the input, y is typed.
@@ -270,7 +273,7 @@ fn ctrl_c_interrupts_a_running_call_and_shows_how_it_ended() {
     press(&mut app, Key::Char('x'));
     assert!(matches!(
         press(&mut app, Key::Ctrl('c')),
-        Some(Effect::Send(ClientMsg::Interrupt))
+        Some(Effect::Send(ClientMsg::Interrupt { .. }))
     ));
     assert!(!app.editor.is_empty(), "the draft stays");
     app.fold(&entry(
@@ -314,36 +317,38 @@ fn slash_commands() {
     // The daemon runs the rest, or says there is no such command.
     assert!(matches!(
         typed(&mut app, "/nope"),
-        Some(Effect::Send(ClientMsg::Input { text })) if text == "/nope"
+        Some(Effect::Send(ClientMsg::Input { text, .. })) if text == "/nope"
     ));
     assert!(matches!(
         typed(&mut app, "/interrupt"),
-        Some(Effect::Send(ClientMsg::Interrupt))
+        Some(Effect::Send(ClientMsg::Interrupt { .. }))
     ));
     assert!(matches!(
         typed(&mut app, "hello there"),
-        Some(Effect::Send(ClientMsg::Input { text })) if text == "hello there"
+        Some(Effect::Send(ClientMsg::Input { text, .. })) if text == "hello there"
     ));
     app.conn = super::Conn::Open { remote: true };
     assert!(typed(&mut app, "/env refresh").is_none());
 
     assert!(matches!(typed(&mut app, "/sessions"), Some(Effect::List)));
     let other = SessionId::new();
-    let summary = |id, workspace: &str| SessionSummary {
+    let summary = |id, workspace: &str, activity| SessionSummary {
         id,
         workspace: workspace.into(),
         entries: 3,
         clients: 0,
+        activity,
+        residency: Residency::Loaded,
     };
     app.fold(&DaemonMsg::Sessions {
         sessions: vec![
-            summary(other, "/elsewhere"),
-            summary(current, "/work/project"),
+            summary(other, "/elsewhere", Activity::Idle),
+            summary(current, "/work/project", Activity::Approval),
         ],
     });
-    let (_, rows) = frame(&mut app, 70, 14);
-    let (_, here) = find(&rows, &format!("• {}", current.short()));
-    let (x, there) = find(&rows, &other.short().to_string());
+    let (_, rows) = frame(&mut app, 80, 14);
+    let (_, here) = find(&rows, &format!("• {}  approval   loaded", current.short()));
+    let (x, there) = find(&rows, &format!("{}  idle", other.short()));
     assert!(here < there, "newest first");
     assert!(matches!(
         app.input(Input::Mouse(Mouse::Press { x, y: there })),

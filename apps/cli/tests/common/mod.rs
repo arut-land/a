@@ -178,6 +178,10 @@ impl Env {
             // Any build the daemon's staged `current` does not outrank: it
             // answers with a welcome, never a drain.
             build: "acceptance".to_owned(),
+            // None: these tests speak to the daemon as the first clients
+            // did, which it must keep serving.
+            min: None,
+            caps: protocol::Caps::NONE,
         });
         assert!(matches!(conn.recv(), DaemonMsg::Welcome { .. }));
         conn
@@ -242,7 +246,7 @@ impl Conn {
     }
 
     pub fn input(&mut self, text: &str) {
-        self.send(&ClientMsg::Input { text: text.into() });
+        self.send(&ClientMsg::input(text));
     }
 
     /// Attaches and returns the session and its replay, up to `Synced`.
@@ -254,6 +258,7 @@ impl Conn {
             workspace: ws.into(),
             since: 0,
             env: None,
+            decl: protocol::ClientDecl::default(),
         });
         let DaemonMsg::Attached { session, .. } = self.recv() else {
             panic!("expected attached");

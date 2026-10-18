@@ -14,7 +14,7 @@ use std::time::Duration;
 use boltffi::{EventSubscription, export};
 use client::{Connection, Endpoint, Reader, Writer};
 use protocol::view::{Link, SessionList};
-use protocol::{ClientMsg, Environment, SessionId, Target};
+use protocol::{ClientDecl, ClientMsg, Environment, SessionId, Target};
 use rt::{Runtime, Threads};
 use sys::install::CliLink;
 use sys::{Home, Staged};
@@ -90,14 +90,19 @@ impl Daemon {
         env: Option<Environment>,
         since: u64,
     ) -> io::Result<Connection> {
-        let mut conn = self.connect()?;
-        conn.writer.send(&ClientMsg::Attach {
+        let attach = ClientMsg::Attach {
             target,
             workspace,
             since,
             env,
-        })?;
-        Ok(conn)
+            decl: ClientDecl::default(),
+        };
+        client::connect_with(
+            &Endpoint::Local(self.home.clone()),
+            &self.staged,
+            &|| {},
+            &|_| Ok(vec![attach.clone()]),
+        )
     }
 }
 
@@ -326,12 +331,12 @@ impl Session {
 
     /// Sends the user's input.
     pub async fn send(&self, text: String) -> Result<(), ClientError> {
-        self.write(ClientMsg::Input { text }).await
+        self.write(ClientMsg::input(text)).await
     }
 
     /// Answers the ask for tool call `call`.
     pub async fn approve(&self, call: u64, approved: bool) -> Result<(), ClientError> {
-        self.write(ClientMsg::Approve { call, approved }).await
+        self.write(ClientMsg::approve(call, approved)).await
     }
 
     /// Detaches; the session keeps running in the daemon.

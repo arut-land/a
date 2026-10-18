@@ -35,9 +35,9 @@ input, overlays).
 - Input: multi-line (Ctrl-J or Alt-Enter for a new line, bracketed paste
   keeps newlines), readline keys, Up/Down through history (seeded from the
   session's own messages).
-- `/sessions` (a picker; also what `a resume` opens when this workspace has
-  no session), `/new`, `/env refresh`, `/interrupt`, `/detach`, `/help`
-  (or F1). Any other `/name` goes to the daemon, which runs the session's
+- `/sessions` (a picker showing each session's activity and residency;
+  also what `a resume` opens when this workspace has no session), `/new`,
+  `/env refresh`, `/interrupt`, `/detach`, `/help` (or F1). Any other `/name` goes to the daemon, which runs the session's
   slash command or says there is none.
 - Ctrl-C while a tool call or slash command runs sends
   `ClientMsg::Interrupt`, which stops it (a model call it does not); otherwise it
