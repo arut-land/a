@@ -1,5 +1,5 @@
-//! A bounded channel from a blocking producer to an async consumer: the
-//! sender parks while the channel is full, the receiver is a stream.
+//! A channel from any producer to an async consumer: the sender of a
+//! bounded channel parks while it is full, the receiver is a stream.
 
 use std::collections::VecDeque;
 use std::future::Future;
@@ -52,6 +52,12 @@ pub fn bounded<T>(capacity: usize) -> (Sender<T>, Receiver<T>) {
         capacity: capacity.max(1),
     });
     (Sender(Arc::clone(&shared)), Receiver(shared))
+}
+
+/// A channel whose sender never waits, for producers that must not block,
+/// such as async tasks.
+pub fn unbounded<T>() -> (Sender<T>, Receiver<T>) {
+    bounded(usize::MAX)
 }
 
 impl<T> Sender<T> {

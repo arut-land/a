@@ -1,8 +1,10 @@
 //! Typed tools, and the erased form a [`Toolset`] holds.
 
+use std::future::Future;
 use std::path::Path;
 
 use protocol::{Environment, Outcome};
+use rt::{BoxFuture, Runtime};
 use serde::Serialize;
 use serde::de::{Deserialize, DeserializeOwned};
 use serde_json::Value;
@@ -22,13 +24,16 @@ pub struct Cx<'a> {
     pub env: Option<&'a Environment>,
     /// Tools that start processes report each process group here, so the
     /// engine can record it durably and kill it if the daemon dies mid-call.
-    pub spawned: &'a dyn Fn(u32),
+    pub spawned: &'a (dyn Fn(u32) + Sync),
+    /// Where a tool sleeps and runs blocking work, so it never holds up a
+    /// runtime worker.
+    pub rt: &'a dyn Runtime,
 }
 
 /// A tool the model can call. Its output is the stored fact; what the model
 /// sees of it is [`Tool::to_model`].
 pub trait Tool: Send + Sync + 'static {
-    type In: DeserializeOwned;
+    type In: DeserializeOwned + Send;
     type Out: Serialize + DeserializeOwned;
 
     const NAME: &'static str;
@@ -39,7 +44,11 @@ pub trait Tool: Send + Sync + 'static {
     /// The JSON Schema of [`Tool::In`].
     fn schema() -> Value;
 
-    fn call(&self, input: Self::In, cx: &Cx<'_>) -> Result<Self::Out, String>;
+    fn call(
+        &self,
+        input: Self::In,
+        cx: &Cx<'_>,
+    ) -> impl Future<Output = Result<Self::Out, String>> + Send;
 
     fn to_model(output: &Self::Out) -> llm::Output {
         llm::Output::Json(serde_json::to_value(output).unwrap_or_default())
@@ -52,7 +61,7 @@ pub trait DynTool: Send + Sync {
     fn replay(&self) -> Replay;
     /// How the tool is offered to the model.
     fn spec(&self) -> llm::Tool;
-    fn call(&self, input: &Value, cx: &Cx<'_>) -> Outcome;
+    fn call<'a>(&'a self, input: &Value, cx: &'a Cx<'a>) -> BoxFuture<'a, Outcome>;
     /// What the model sees of a stored output.
     fn to_model(&self, output: &Value) -> llm::Output;
 }
@@ -75,15 +84,19 @@ impl<T: Tool> DynTool for T {
         }
     }
 
-    fn call(&self, input: &Value, cx: &Cx<'_>) -> Outcome {
-        let result = T::In::deserialize(input)
-            .map_err(|e| format!("invalid input: {e}"))
-            .and_then(|input| Tool::call(self, input, cx))
+    fn call<'a>(&'a self, input: &Value, cx: &'a Cx<'a>) -> BoxFuture<'a, Outcome> {
+        let input = T::In::deserialize(input).map_err(|e| format!("invalid input: {e}"));
+        Box::pin(async move {
+            let result = match input {
+                Ok(input) => Tool::call(self, input, cx).await,
+                Err(error) => Err(error),
+            }
             .and_then(|output| serde_json::to_value(output).map_err(|e| e.to_string()));
-        match result {
-            Ok(output) => Outcome::Done { output },
-            Err(error) => Outcome::Failed { error },
-        }
+            match result {
+                Ok(output) => Outcome::Done { output },
+                Err(error) => Outcome::Failed { error },
+            }
+        })
     }
 
     fn to_model(&self, output: &Value) -> llm::Output {
@@ -113,12 +126,12 @@ impl Toolset {
         self.0.iter().map(|t| t.spec()).collect()
     }
 
-    pub fn run(&self, name: &str, input: &Value, cx: &Cx<'_>) -> Outcome {
+    pub fn run<'a>(&self, name: &str, input: &Value, cx: &'a Cx<'a>) -> BoxFuture<'a, Outcome> {
         match self.get(name) {
             Some(tool) => tool.call(input, cx),
-            None => Outcome::Failed {
+            None => Box::pin(std::future::ready(Outcome::Failed {
                 error: format!("unknown tool {name}"),
-            },
+            })),
         }
     }
 

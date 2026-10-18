@@ -1,4 +1,6 @@
 use std::path::Path;
+use std::sync::mpsc;
+use std::thread;
 
 use agent::{Hook, Tool};
 use bytes::Bytes;
@@ -105,8 +107,8 @@ impl Tool for HarborLabel {
         json!({ "type": "object", "properties": {}, "required": [] })
     }
 
-    fn call(&self, _: Self::In, _: &Cx<'_>) -> Result<String, String> {
-        Ok("crimson-harbor".to_owned())
+    fn call(&self, _: Self::In, _: &Cx<'_>) -> impl Future<Output = Result<String, String>> + Send {
+        std::future::ready(Ok("crimson-harbor".to_owned()))
     }
 
     fn to_model(label: &String) -> llm::Output {
@@ -190,6 +192,8 @@ struct Fixture(Arc<Shared>);
 impl Fixture {
     fn new(agent: agent::Kind, tools: Toolset, hooks: Hooks, model: Model) -> Self {
         Self(Arc::new(Shared {
+            // One worker: no effect may hold it.
+            rt: Arc::new(rt::Threads::new(1)),
             store: Arc::new(store::Memory::default()),
             agent,
             tools,
@@ -378,6 +382,42 @@ fn hook_decisions_are_logged_and_replay_to_the_same_state() {
             llm::Message::user("and again"),
             llm::Message::assistant("and again")
         ]
+    );
+}
+
+/// One worker runs every session: a wait for approval, a sleep and running
+/// commands all overlap.
+#[test]
+fn sessions_wait_on_effects_without_holding_the_worker() {
+    let ask = agent::AskFor(vec![agent::tools::Sleep::NAME.to_owned()]);
+    let fixture = Fixture::new(
+        agent::Kind::Echo,
+        Toolset::default(),
+        std::iter::once(Box::new(ask) as Box<dyn Hook>).collect(),
+        openai(&Script::new(&[])),
+    );
+    let asked = fixture.start(&[]);
+    asked.submit("sleep 1".into());
+    settle(&asked);
+    let started = Instant::now();
+    let commands: Vec<_> = (0..2)
+        .map(|_| {
+            let session = fixture.start(&[]);
+            session.submit("$ sleep 1".into());
+            session
+        })
+        .collect();
+    asked.answer(3, true).unwrap();
+    for session in &commands {
+        finished(session, 2);
+        session.stop();
+    }
+    finished(&asked, 3);
+    let took = started.elapsed();
+    asked.stop();
+    assert!(
+        took < Duration::from_millis(1900),
+        "ran one at a time: {took:?}"
     );
 }
 

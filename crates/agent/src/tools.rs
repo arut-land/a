@@ -4,7 +4,6 @@ use std::fs::File;
 use std::io::Read;
 use std::path::{Component, Path};
 use std::process::{Command as Process, Stdio};
-use std::thread;
 use std::time::Duration;
 
 use serde::{Deserialize, Serialize};
@@ -52,7 +51,7 @@ impl Tool for RunCommand {
         object(&json!({ "command": { "type": "string", "description": "The command line." } }))
     }
 
-    fn call(&self, input: Command, cx: &Cx<'_>) -> Result<Ran, String> {
+    async fn call(&self, input: Command, cx: &Cx<'_>) -> Result<Ran, String> {
         let (shell, flag) = if cfg!(windows) {
             ("cmd", "/c")
         } else {
@@ -77,7 +76,9 @@ impl Tool for RunCommand {
         std::os::unix::process::CommandExt::process_group(&mut cmd, 0);
         let child = cmd.spawn().map_err(|e| e.to_string())?;
         (cx.spawned)(child.id());
-        let out = child.wait_with_output().map_err(|e| e.to_string())?;
+        let out = rt::unblock(cx.rt, move || child.wait_with_output())
+            .await
+            .map_err(|e| e.to_string())?;
         Ok(Ran {
             exit: out.status.code(),
             stdout: String::from_utf8_lossy(&out.stdout).into_owned(),
@@ -110,8 +111,8 @@ impl Tool for Sleep {
         object(&json!({ "seconds": { "type": "integer", "minimum": 0 } }))
     }
 
-    fn call(&self, input: Seconds, _: &Cx<'_>) -> Result<Slept, String> {
-        thread::sleep(Duration::from_secs(input.seconds));
+    async fn call(&self, input: Seconds, cx: &Cx<'_>) -> Result<Slept, String> {
+        cx.rt.sleep(Duration::from_secs(input.seconds)).await;
         Ok(Slept {
             slept: input.seconds,
         })
@@ -152,7 +153,7 @@ impl Tool for ReadFile {
         )
     }
 
-    fn call(&self, input: FilePath, cx: &Cx<'_>) -> Result<FileText, String> {
+    async fn call(&self, input: FilePath, cx: &Cx<'_>) -> Result<FileText, String> {
         let path = Path::new(&input.path);
         if !path
             .components()
@@ -160,10 +161,15 @@ impl Tool for ReadFile {
         {
             return Err(format!("{} is not a path inside the workspace", input.path));
         }
-        let mut bytes = Vec::new();
-        File::open(cx.cwd.join(path))
-            .and_then(|file| file.take(READ_LIMIT as u64 + 1).read_to_end(&mut bytes))
-            .map_err(|e| format!("{}: {e}", input.path))?;
+        let path = cx.cwd.join(path);
+        let mut bytes = rt::unblock(cx.rt, move || {
+            let mut bytes = Vec::new();
+            File::open(path)
+                .and_then(|file| file.take(READ_LIMIT as u64 + 1).read_to_end(&mut bytes))
+                .map(|_| bytes)
+        })
+        .await
+        .map_err(|e| format!("{}: {e}", input.path))?;
         let truncated = bytes.len() > READ_LIMIT;
         bytes.truncate(READ_LIMIT);
         Ok(FileText {
@@ -186,12 +192,19 @@ mod tests {
     use super::*;
     use crate::{DynTool, Toolset};
 
+    static RT: std::sync::LazyLock<rt::Threads> = std::sync::LazyLock::new(rt::Threads::default);
+
     fn cx(cwd: &Path) -> Cx<'_> {
         Cx {
             cwd,
             env: None,
             spawned: &|_| {},
+            rt: &*RT,
         }
+    }
+
+    fn call(tool: &dyn DynTool, input: &Value, cx: &Cx<'_>) -> protocol::Outcome {
+        rt::block_on(tool.call(input, cx))
     }
 
     #[test]
@@ -211,7 +224,7 @@ mod tests {
             ..cx(&dir)
         };
         let script = json!({ "command": "echo \"$ONLY_HERE $HOME\"; pwd -P" });
-        let ran = DynTool::call(&RunCommand, &script, &cx);
+        let ran = call(&RunCommand, &script, &cx);
         std::fs::remove_dir_all(&sub).unwrap();
         let protocol::Outcome::Done { output } = ran else {
             panic!("{ran:?}")
@@ -236,11 +249,11 @@ mod tests {
     #[test]
     fn inputs_are_typed() {
         let dir = std::env::temp_dir();
-        let outcome = DynTool::call(&RunCommand, &json!({ "cmd": "true" }), &cx(&dir));
+        let outcome = call(&RunCommand, &json!({ "cmd": "true" }), &cx(&dir));
         assert!(
             matches!(outcome, protocol::Outcome::Failed { error } if error.starts_with("invalid input"))
         );
-        let ran = DynTool::call(&RunCommand, &json!({ "command": "echo hi" }), &cx(&dir));
+        let ran = call(&RunCommand, &json!({ "command": "echo hi" }), &cx(&dir));
         assert!(
             matches!(ran, protocol::Outcome::Done { output } if output["stdout"] == "hi\n" && output["exit"] == 0)
         );
@@ -252,7 +265,7 @@ mod tests {
         std::fs::create_dir_all(&dir).unwrap();
         std::fs::write(dir.join("small.txt"), "hello").unwrap();
         std::fs::write(dir.join("big.txt"), vec![b'x'; READ_LIMIT + 10]).unwrap();
-        let read = |path: &str| DynTool::call(&ReadFile, &json!({ "path": path }), &cx(&dir));
+        let read = |path: &str| call(&ReadFile, &json!({ "path": path }), &cx(&dir));
         let small = read("small.txt");
         let big = read("./big.txt");
         let outside = [read("../small.txt"), read("/etc/hosts")];

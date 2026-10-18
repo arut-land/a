@@ -20,6 +20,7 @@ version = "0.0.0"
 dependencies = [
  "llm",
  "protocol",
+ "rt",
  "serde",
  "serde_json",
 ]

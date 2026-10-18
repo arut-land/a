@@ -99,3 +99,20 @@ fn sleeps_wake_in_deadline_order() {
     });
     assert_eq!(*order.lock().unwrap(), [1, 3, 2, 0]);
 }
+
+#[test]
+fn an_unbounded_sender_never_waits() {
+    let (tx, rx) = channel::unbounded();
+    for n in 0..1000 {
+        tx.send(n).unwrap();
+    }
+    drop(tx);
+    let got = block_on(async {
+        let mut got = 0;
+        while rx.recv().await.is_some() {
+            got += 1;
+        }
+        got
+    });
+    assert_eq!(got, 1000);
+}

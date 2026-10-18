@@ -3,6 +3,7 @@
 //! Threads start on first use, so an idle process pays for none.
 
 use std::collections::VecDeque;
+use std::panic::{self, AssertUnwindSafe};
 use std::sync::{Arc, Condvar, Mutex, OnceLock};
 use std::thread;
 use std::time::Duration;
@@ -78,8 +79,10 @@ impl Threads {
                 thread::Builder::new()
                     .name(format!("rt-worker-{n}"))
                     .spawn(move || {
+                        // A task that panics is closed; the worker lives on.
                         loop {
-                            tasks.pop().run();
+                            let task = tasks.pop();
+                            let _ = panic::catch_unwind(AssertUnwindSafe(|| task.run()));
                         }
                     })
                     .expect("spawn worker thread");

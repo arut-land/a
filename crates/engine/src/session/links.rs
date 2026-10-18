@@ -128,15 +128,14 @@ impl Session {
 
     /// Fires every armed watch on `child`; one that has fired already stays
     /// as it is.
-    pub(super) fn fire(&self, child: SessionId, outcome: &Outcome) {
+    pub(super) async fn fire(&self, child: SessionId, outcome: &Outcome) {
         let watches: Vec<u64> = armed(&self.lock().entries)
             .filter_map(|(watch, watched)| (watched == child).then_some(watch))
             .collect();
         for watch in watches {
-            self.work(|| {
-                let outcome = outcome.clone();
-                self.append(Body::Fired { watch, outcome }).map(drop)
-            });
+            let outcome = outcome.clone();
+            self.work(async { self.append(Body::Fired { watch, outcome }).map(drop) })
+                .await;
         }
     }
 

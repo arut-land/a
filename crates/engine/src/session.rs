@@ -1,11 +1,14 @@
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::fmt::Display;
+use std::future::{Future, poll_fn};
 use std::io;
+use std::panic::{AssertUnwindSafe, catch_unwind};
 use std::path::PathBuf;
+use std::pin::pin;
 use std::sync::atomic::{AtomicUsize, Ordering};
-use std::sync::mpsc::{self, Receiver, Sender};
-use std::sync::{Arc, Condvar, Mutex, MutexGuard, PoisonError, Weak};
-use std::thread;
+use std::sync::mpsc::Sender;
+use std::sync::{Arc, Mutex, MutexGuard, Weak};
+use std::task::{Poll, Waker};
 use std::time::{Duration, Instant};
 
 use agent::{Action, Agent, Cx, Decided, DynTool, Gate, Hooks, Input, Replay, Toolset};
@@ -25,6 +28,8 @@ use facts::{ask, inbox, recap, replay, transcript};
 
 /// What every session runs with.
 pub struct Shared {
+    /// Where session actors run as tasks, and effects sleep and block.
+    pub rt: rt::Rt,
     pub store: Arc<dyn LogStore>,
     pub agent: agent::Kind,
     pub tools: Toolset,
@@ -43,9 +48,8 @@ pub struct Session {
     state: Mutex<State>,
     /// The actor's messages. The session's inbox, what waits for the user,
     /// is in its log: see [`facts::inbox`].
-    mailbox: Sender<Msg>,
+    mailbox: rt::channel::Sender<Msg>,
     answers: Mutex<Answers>,
-    answered: Condvar,
     /// Inputs submitted but not yet fully handled. They pin the daemon and
     /// keep the session loaded, as do watches not yet fired.
     queued: AtomicUsize,
@@ -80,6 +84,16 @@ struct State {
 struct Answers {
     given: HashMap<u64, bool>,
     stopped: bool,
+    /// The actor, while it waits for an answer.
+    waiting: Option<Waker>,
+}
+
+impl Answers {
+    fn wake(&mut self) {
+        if let Some(waker) = self.waiting.take() {
+            waker.wake();
+        }
+    }
 }
 
 /// A client's hold on a session; dropping it detaches.
@@ -114,7 +128,7 @@ impl Session {
         shared: Arc<Shared>,
         env: Option<Environment>,
     ) -> Arc<Self> {
-        let (mailbox, rx) = mpsc::channel();
+        let (mailbox, rx) = rt::channel::unbounded();
         let armed = links::armed(&loaded.entries).count();
         let env = env.or_else(|| logged_env(&loaded.entries).cloned());
         let session = Arc::new(Self {
@@ -128,7 +142,6 @@ impl Session {
             }),
             mailbox,
             answers: Mutex::default(),
-            answered: Condvar::new(),
             // Recovery counts as queued work until it has run, and every
             // armed watch until it fires.
             queued: AtomicUsize::new(1 + armed),
@@ -138,7 +151,10 @@ impl Session {
             shared,
         });
         let actor = Arc::clone(&session);
-        thread::spawn(move || actor.run(&rx));
+        session
+            .shared
+            .rt
+            .spawn(Box::pin(async move { actor.run(&rx).await }));
         session
     }
 
@@ -161,8 +177,9 @@ impl Session {
         if !inbox(&self.lock().entries).contains(&call) {
             return Err(format!("call {call} is not waiting for approval"));
         }
-        lock(&self.answers).given.entry(call).or_insert(approved);
-        self.answered.notify_all();
+        let mut answers = lock(&self.answers);
+        answers.given.entry(call).or_insert(approved);
+        answers.wake();
         Ok(())
     }
 
@@ -181,8 +198,10 @@ impl Session {
     /// Stops the actor; the session lives on in its log. Callers check
     /// `idle_for` under the slot lock first.
     pub fn stop(&self) {
-        lock(&self.answers).stopped = true;
-        self.answered.notify_all();
+        let mut answers = lock(&self.answers);
+        answers.stopped = true;
+        answers.wake();
+        drop(answers);
         let _ = self.mailbox.send(Msg::Stop);
     }
 
@@ -283,17 +302,20 @@ impl Session {
         self.lock().clients.retain(|c| c.send(msg.clone()).is_ok());
     }
 
-    fn run(&self, mailbox: &Receiver<Msg>) {
+    async fn run(&self, mailbox: &rt::channel::Receiver<Msg>) {
         let mut agent = self.shared.agent.agent();
-        self.work(|| self.recover(agent.as_mut()));
-        for msg in mailbox {
+        self.work(self.recover(agent.as_mut())).await;
+        while let Some(msg) = mailbox.recv().await {
             match msg {
-                Msg::Input(text) => self.work(|| {
-                    self.append(Body::User { text: text.clone() })?;
-                    let inputs = VecDeque::from([Input::User { text }]);
-                    self.drive(agent.as_mut(), VecDeque::new(), inputs)
-                }),
-                Msg::Settled { child, outcome } => self.fire(child, &outcome),
+                Msg::Input(text) => {
+                    self.work(async {
+                        self.append(Body::User { text: text.clone() })?;
+                        let inputs = VecDeque::from([Input::User { text }]);
+                        self.drive(agent.as_mut(), VecDeque::new(), inputs).await
+                    })
+                    .await;
+                }
+                Msg::Settled { child, outcome } => self.fire(child, &outcome).await,
                 Msg::Stop => return,
             }
         }
@@ -301,12 +323,12 @@ impl Session {
 
     /// Runs one queued unit of work, with a busy marker on disk for as long
     /// as anything is in flight.
-    fn work(&self, job: impl FnOnce() -> io::Result<()>) {
+    async fn work(&self, job: impl Future<Output = io::Result<()>>) {
         let store = &self.shared.store;
         if let Err(e) = store.mark_busy(self.id, true) {
             self.warn(format_args!("busy marker: {e}"));
         }
-        if let Err(e) = job() {
+        if let Err(e) = job.await {
             self.warn(e);
         }
         let settled = self.queued.fetch_sub(1, Ordering::SeqCst) == 1;
@@ -322,7 +344,7 @@ impl Session {
     /// Runs `actions`, then steps the agent with `inputs` and every input
     /// the effects produce, in order. Once an agent that was stepped stops,
     /// the `on_stop` hooks may hand it more to do.
-    fn drive(
+    async fn drive(
         &self,
         agent: &mut dyn Agent,
         mut actions: VecDeque<Action>,
@@ -331,7 +353,7 @@ impl Session {
         let mut stepped = false;
         loop {
             while let Some(action) = actions.pop_front() {
-                inputs.extend(self.act(action)?);
+                inputs.extend(self.act(action).await?);
             }
             if let Some(input) = inputs.pop_front() {
                 actions.extend(agent.step(input));
@@ -356,7 +378,7 @@ impl Session {
 
     /// Carries out one action; an effect returns the input reporting its
     /// outcome.
-    fn act(&self, action: Action) -> io::Result<Option<Input>> {
+    async fn act(&self, action: Action) -> io::Result<Option<Input>> {
         let (call, seq, outcome) = match action {
             Action::Emit(body) => {
                 self.append(body)?;
@@ -373,7 +395,7 @@ impl Session {
                     .as_ref()
                     .map_or_else(|_| "none".to_owned(), Model::name);
                 let seq = self.append(Body::ModelCall { model })?;
-                (Call::Model, seq, self.run_model(seq))
+                (Call::Model, seq, self.run_model(seq).await)
             }
             Action::RunTool {
                 tool,
@@ -395,10 +417,10 @@ impl Session {
                     id,
                 })?;
                 let outcome = match gate {
-                    Ok(Gate::Run) => self.run_tool(seq, &tool, &input),
+                    Ok(Gate::Run) => self.run_tool(seq, &tool, &input).await,
                     Ok(Gate::Ask) => {
                         self.append(Body::Ask { call: seq })?;
-                        self.ask(seq, &tool, &input)?
+                        self.ask(seq, &tool, &input).await?
                     }
                     Err(error) => Outcome::Failed { error },
                 };
@@ -410,8 +432,8 @@ impl Session {
 
     /// Waits for the user's answer to the ask for call `seq`, logs it, and
     /// runs the call if approved.
-    fn ask(&self, seq: u64, tool: &str, input: &Value) -> io::Result<Outcome> {
-        let approved = self.answer_to(seq)?;
+    async fn ask(&self, seq: u64, tool: &str, input: &Value) -> io::Result<Outcome> {
+        let approved = self.answer_to(seq).await?;
         self.append(Body::Hook {
             hook: "user".to_owned(),
             decision: Decision::Approval {
@@ -421,33 +443,30 @@ impl Session {
             },
         })?;
         Ok(if approved {
-            self.run_tool(seq, tool, input)
+            self.run_tool(seq, tool, input).await
         } else {
             not_approved()
         })
     }
 
-    /// Blocks the actor, not the daemon, until call `call` is answered.
-    /// Waiting is not work: the session may hibernate, and the daemon exit,
-    /// with the ask in its inbox; recovery asks again. A stop while waiting
-    /// is an `Interrupted` error.
-    fn answer_to(&self, call: u64) -> io::Result<bool> {
+    /// Waits until call `call` is answered. Waiting is not work: the session
+    /// may hibernate, and the daemon exit, with the ask in its inbox;
+    /// recovery asks again. A stop while waiting is an `Interrupted` error.
+    async fn answer_to(&self, call: u64) -> io::Result<bool> {
         self.queued.fetch_sub(1, Ordering::SeqCst);
         self.touch();
-        let mut answers = lock(&self.answers);
-        let answer = loop {
+        let answer = poll_fn(|cx| {
+            let mut answers = lock(&self.answers);
             if let Some(approved) = answers.given.remove(&call) {
-                break Some(approved);
+                return Poll::Ready(Some(approved));
             }
             if answers.stopped {
-                break None;
+                return Poll::Ready(None);
             }
-            answers = self
-                .answered
-                .wait(answers)
-                .unwrap_or_else(PoisonError::into_inner);
-        };
-        drop(answers);
+            answers.waiting = Some(cx.waker().clone());
+            Poll::Pending
+        })
+        .await;
         self.queued.fetch_add(1, Ordering::SeqCst);
         answer.ok_or_else(|| {
             io::Error::new(
@@ -457,10 +476,10 @@ impl Session {
         })
     }
 
-    fn run_call(&self, call: &Call, seq: u64) -> Outcome {
+    async fn run_call(&self, call: &Call, seq: u64) -> Outcome {
         match call {
-            Call::Model => self.run_model(seq),
-            Call::Tool { tool, input } => self.run_tool(seq, tool, input),
+            Call::Model => self.run_model(seq).await,
+            Call::Tool { tool, input } => self.run_tool(seq, tool, input).await,
         }
     }
 
@@ -493,7 +512,7 @@ impl Session {
         Ok(input)
     }
 
-    fn run_tool(&self, call: u64, tool: &str, input: &Value) -> Outcome {
+    async fn run_tool(&self, call: u64, tool: &str, input: &Value) -> Outcome {
         let spawned = |pgid| {
             let Some(boot) = sys::boot_id() else { return };
             let body = Body::ToolProcess {
@@ -510,14 +529,15 @@ impl Session {
             cwd: &self.workspace,
             env: env.as_ref(),
             spawned: &spawned,
+            rt: &*self.shared.rt,
         };
-        contain(|| self.shared.tools.run(tool, input, &cx))
+        contain(self.shared.tools.run(tool, input, &cx)).await
     }
 
     /// Asks the model to reply to the transcript before `call`, offering the
     /// tools. Text streams to clients as it arrives; only the finished reply
     /// is committed.
-    fn run_model(&self, call: u64) -> Outcome {
+    async fn run_model(&self, call: u64) -> Outcome {
         let model = match &self.shared.model {
             Ok(model) => model,
             Err(error) => {
@@ -546,17 +566,20 @@ impl Session {
         };
         // The whole reply is the fact: replaying it later sends the
         // provider's own items (signatures, encrypted reasoning) back.
-        contain(|| match model.reply(&request, &mut on_text) {
-            Ok(reply) => match serde_json::to_value(&reply) {
-                Ok(output) => Outcome::Done { output },
+        contain(async {
+            match model.reply(&request, &mut on_text).await {
+                Ok(reply) => match serde_json::to_value(&reply) {
+                    Ok(output) => Outcome::Done { output },
+                    Err(error) => Outcome::Failed {
+                        error: error.to_string(),
+                    },
+                },
                 Err(error) => Outcome::Failed {
                     error: error.to_string(),
                 },
-            },
-            Err(error) => Outcome::Failed {
-                error: error.to_string(),
-            },
+            }
         })
+        .await
     }
 
     /// Picks up where the log leaves off. Links are re-armed; the agent is
@@ -564,7 +587,7 @@ impl Session {
     /// finished (leftover processes killed, safe calls run again, the rest
     /// marked interrupted, asks still waiting asked again); then whatever
     /// the agent asked for that the log does not show runs.
-    fn recover(&self, agent: &mut dyn Agent) -> io::Result<()> {
+    async fn recover(&self, agent: &mut dyn Agent) -> io::Result<()> {
         self.relink()?;
         let (dangling, actions) = {
             let st = self.lock();
@@ -588,7 +611,7 @@ impl Session {
             }
             let outcome = match &call {
                 Call::Tool { tool, input } if asked == Asked::Waiting => {
-                    self.ask(seq, tool, input)?
+                    self.ask(seq, tool, input).await?
                 }
                 Call::Tool { .. } if asked == Asked::Answered(false) => not_approved(),
                 Call::Tool { tool, .. }
@@ -596,11 +619,11 @@ impl Session {
                 {
                     Outcome::Interrupted
                 }
-                _ => self.run_call(&call, seq),
+                _ => self.run_call(&call, seq).await,
             };
             inputs.push_back(self.finish(&call, seq, outcome)?);
         }
-        self.drive(agent, actions, inputs)
+        self.drive(agent, actions, inputs).await
     }
 }
 
@@ -613,18 +636,22 @@ fn logged_env(entries: &[Entry]) -> Option<&Environment> {
 }
 
 /// Runs an effect so that a panic inside it fails the call instead of taking
-/// the session actor, and with it the daemon, down.
-fn contain(effect: impl FnOnce() -> Outcome) -> Outcome {
-    std::panic::catch_unwind(std::panic::AssertUnwindSafe(effect)).unwrap_or_else(|panic| {
-        let message = panic
-            .downcast_ref::<String>()
-            .map(String::as_str)
-            .or_else(|| panic.downcast_ref::<&str>().copied())
-            .unwrap_or("unknown panic");
-        Outcome::Failed {
-            error: format!("panicked: {message}"),
-        }
+/// the session actor down.
+async fn contain(effect: impl Future<Output = Outcome>) -> Outcome {
+    let mut effect = pin!(effect);
+    poll_fn(|cx| {
+        catch_unwind(AssertUnwindSafe(|| effect.as_mut().poll(cx))).unwrap_or_else(|panic| {
+            let message = panic
+                .downcast_ref::<String>()
+                .map(String::as_str)
+                .or_else(|| panic.downcast_ref::<&str>().copied())
+                .unwrap_or("unknown panic");
+            Poll::Ready(Outcome::Failed {
+                error: format!("panicked: {message}"),
+            })
+        })
     })
+    .await
 }
 
 fn not_approved() -> Outcome {

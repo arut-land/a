@@ -2,8 +2,9 @@
 //! (`host:model`, or a bare model on `OpenAI`), sent over ureq.
 
 use std::collections::HashMap;
-use std::sync::Arc;
+use std::pin::Pin;
 
+use futures_core::Stream;
 use llm::{Accumulator, Block, Event, Http, Message, Provider, Request, Response};
 
 pub struct Model {
@@ -13,7 +14,7 @@ pub struct Model {
 }
 
 impl Model {
-    pub fn from_spec(spec: &str, rt: Arc<dyn rt::Runtime>) -> Result<Self, String> {
+    pub fn from_spec(spec: &str, rt: rt::Rt) -> Result<Self, String> {
         let (provider, id) = llm::hosts::provider(spec).map_err(|e| e.to_string())?;
         Ok(Self::new(provider, id, llm::Ureq::new(rt)))
     }
@@ -43,33 +44,28 @@ impl Model {
 
     /// The reply to `request`. Answer text streams to `on_text` as it
     /// arrives.
-    pub fn reply(
+    pub async fn reply(
         &self,
         request: &Request,
-        on_text: &mut dyn FnMut(&str),
+        on_text: &mut (dyn FnMut(&str) + Send),
     ) -> Result<Response, llm::Error> {
-        rt::block_on(async {
-            let mut events = llm::stream(&*self.http, &self.provider, request);
-            let mut acc = Accumulator::new();
-            let mut blocks = HashMap::new();
-            while let Some(event) = std::future::poll_fn(|cx| {
-                futures_core::Stream::poll_next(std::pin::Pin::new(&mut events), cx)
-            })
-            .await
-            {
-                let event = event?;
-                match &event {
-                    Event::Start { index, block, .. } => {
-                        blocks.insert(*index, *block);
-                    }
-                    Event::Delta { index, text } if blocks.get(index) == Some(&Block::Text) => {
-                        on_text(text);
-                    }
-                    _ => {}
+        let mut events = llm::stream(&*self.http, &self.provider, request);
+        let mut acc = Accumulator::new();
+        let mut blocks = HashMap::new();
+        while let Some(event) = std::future::poll_fn(|cx| Pin::new(&mut events).poll_next(cx)).await
+        {
+            let event = event?;
+            match &event {
+                Event::Start { index, block, .. } => {
+                    blocks.insert(*index, *block);
                 }
-                acc.push(event)?;
+                Event::Delta { index, text } if blocks.get(index) == Some(&Block::Text) => {
+                    on_text(text);
+                }
+                _ => {}
             }
-            acc.finish(Some(llm::origin(&self.provider, &request.model)))
-        })
+            acc.push(event)?;
+        }
+        acc.finish(Some(llm::origin(&self.provider, &request.model)))
     }
 }

@@ -115,11 +115,11 @@ impl Daemon {
                 })
             })
             .collect();
-        // One worker: model calls block their session's actor, so the runtime
-        // only moves response bodies.
-        let model = model::Model::from_spec(&config.model, Arc::new(rt::Threads::new(1)));
+        let rt: rt::Rt = Arc::new(rt::Threads::default());
+        let model = model::Model::from_spec(&config.model, Arc::clone(&rt));
         let daemon = Arc::new_cyclic(|daemon| Self {
             shared: Arc::new(Shared {
+                rt,
                 store,
                 agent: config.agent,
                 tools: agent::Toolset::default(),
@@ -241,10 +241,10 @@ impl Daemon {
     /// idle for `config.idle`, or once a drain has no work left or runs out
     /// of grace. Every entry is durable when written, so exiting is all a
     /// drain needs; unfinished calls recover in the next daemon.
-    fn supervise(&self, life: &Lifecycle, config: &Config, socket: &Path, pid: File) {
+    async fn supervise(&self, life: &Lifecycle, config: &Config, socket: &Path, pid: File) {
         let mut since: Option<Instant> = None;
         loop {
-            thread::sleep(Duration::from_millis(250));
+            self.shared.rt.sleep(Duration::from_millis(250)).await;
             self.hibernate(config.hibernate);
             if let Some(began) = life.draining() {
                 if !self.has_work() || began.elapsed() >= config.drain {
@@ -305,7 +305,11 @@ pub fn serve(listener: &UnixListener, home: &Home, config: &Config, build: &str)
         config.clone(),
         home.socket(),
     );
-    thread::spawn(move || monitor.supervise(&watch, &config, &socket, pid));
+    daemon.shared.rt.spawn(Box::pin(async move {
+        monitor.supervise(&watch, &config, &socket, pid).await;
+    }));
+    // Connections block on their sockets, so each gets a thread of its own
+    // and reaches the sessions' tasks through their mailboxes.
     for conn in listener.incoming() {
         let conn = conn?;
         let (daemon, life) = (Arc::clone(&daemon), Arc::clone(&life));
