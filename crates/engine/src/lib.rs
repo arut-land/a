@@ -1,5 +1,6 @@
 //! The daemon: owns every session, accepts clients, runs the agents.
 
+pub mod config;
 mod model;
 mod session;
 mod upgrade;
@@ -31,10 +32,12 @@ pub struct Config {
     pub hibernate: Duration,
     /// `A_DRAIN_SECS`: how long an upgrade waits for in-flight work.
     pub drain: Duration,
-    /// `A_AGENT`: `echo` needs no model; anything else chats.
-    pub agent: agent::Kind,
-    /// `A_MODEL`: `host:model`, or a bare model on `OpenAI`.
-    pub model: String,
+    /// `A_AGENT` (`chat` or `echo`, which needs no model): overrides the
+    /// config files.
+    pub agent: Option<agent::Kind>,
+    /// `A_MODEL` (`host:model`, or a bare model on `OpenAI`): overrides the
+    /// config files.
+    pub model: Option<String>,
     /// `A_ASK`: comma-separated tools whose calls wait for the user's
     /// approval.
     pub ask: Vec<String>,
@@ -46,8 +49,8 @@ impl Default for Config {
             idle: Duration::from_secs(600),
             hibernate: Duration::from_secs(300),
             drain: Duration::from_secs(60),
-            agent: agent::Kind::Chat,
-            model: "gpt-6-luna".to_owned(),
+            agent: None,
+            model: None,
             ask: Vec::new(),
         }
     }
@@ -64,8 +67,8 @@ impl Config {
             idle: var("A_IDLE_SECS").map_or(defaults.idle, Duration::from_secs),
             hibernate: var("A_HIBERNATE_SECS").map_or(defaults.hibernate, Duration::from_secs),
             drain: var("A_DRAIN_SECS").map_or(defaults.drain, Duration::from_secs),
-            agent: var("A_AGENT").unwrap_or(defaults.agent),
-            model: var("A_MODEL").unwrap_or(defaults.model),
+            agent: var("A_AGENT").or(defaults.agent),
+            model: var("A_MODEL").or(defaults.model),
             ask: std::env::var("A_ASK").map_or(defaults.ask, |tools| {
                 tools
                     .split(',')
@@ -125,14 +128,16 @@ impl Daemon {
             })
             .collect();
         let rt: rt::Rt = Arc::new(rt::Threads::default());
-        let model = model::Model::from_spec(&config.model, Arc::clone(&rt));
+        let models = model::Models {
+            settings: config::Settings::new(home.config_file(), config.model.clone(), config.agent),
+            http: Arc::new(llm::Ureq::new(Arc::clone(&rt))),
+        };
         let daemon = Arc::new_cyclic(|daemon| Self {
             shared: Arc::new(Shared {
                 rt,
                 store,
-                agent: config.agent,
                 registry: config.registry(),
-                model,
+                models,
                 daemon: daemon.clone(),
             }),
             slots: Mutex::new(slots),

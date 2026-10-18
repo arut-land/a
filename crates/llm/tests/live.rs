@@ -19,7 +19,7 @@ fn http() -> Ureq {
 
 fn openai() -> Provider {
     let (host, quirks) = responses::HOSTS[0];
-    host.provider(responses::Responses::new(quirks))
+    host.provider(responses::Responses::new(quirks), &llm::protocol::env)
         .expect("OPENAI_API_KEY")
 }
 
@@ -99,7 +99,7 @@ fn responses_tool_round_trip_replays_its_items() {
 
 fn anthropic() -> Provider {
     let (host, quirks) = messages::HOSTS[0];
-    host.provider(messages::Messages::new(quirks))
+    host.provider(messages::Messages::new(quirks), &llm::protocol::env)
         .expect("ANTHROPIC_API_KEY")
 }
 
@@ -183,7 +183,7 @@ fn openai_chat() -> Provider {
         .find(|(host, _)| host.id == "openai")
         .copied()
         .expect("an openai chat host");
-    host.provider(chat::Chat::new(quirks))
+    host.provider(chat::Chat::new(quirks), &llm::protocol::env)
         .expect("OPENAI_API_KEY")
 }
 

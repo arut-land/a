@@ -16,7 +16,7 @@ fn home(name: &str) -> (PathBuf, Home) {
 
 fn echo() -> Config {
     Config {
-        agent: agent::Kind::Echo,
+        agent: Some(agent::Kind::Echo),
         ..Config::default()
     }
 }

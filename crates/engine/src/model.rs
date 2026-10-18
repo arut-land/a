@@ -1,32 +1,53 @@
-//! The model a session calls: a provider and model id from `A_MODEL`
+//! The model a session calls: a provider and model id from its settings
 //! (`host:model`, or a bare model on `OpenAI`), sent over ureq.
 
 use std::collections::HashMap;
+use std::path::Path;
 use std::pin::Pin;
+use std::sync::Arc;
 
 use futures_core::Stream;
 use llm::{Accumulator, Block, Event, Http, Message, Provider, Request, Response};
+use protocol::Environment;
+
+use crate::config::Settings;
+
+/// Where every session's model comes from: built per call, so a client's
+/// fresh environment or an edited config file applies to the next one.
+pub struct Models {
+    pub settings: Settings,
+    pub http: Arc<dyn Http>,
+}
+
+impl Models {
+    /// The model a session in `workspace` calls, with provider variables
+    /// looked up from its client environment `env` first; or why there is
+    /// none, said so the user can fix it.
+    pub fn model(&self, workspace: &Path, env: Option<&Environment>) -> Result<Model, String> {
+        let spec = self.settings.model(workspace)?;
+        let lookup = |name: &str| self.settings.var(env, name);
+        match llm::hosts::provider(&spec, &lookup) {
+            Ok((provider, id)) => Ok(Model {
+                provider,
+                id,
+                http: Arc::clone(&self.http),
+            }),
+            Err(e) if e.kind == llm::Kind::Auth => Err(format!(
+                "{e}, in the shell a client attaches from or under [env] in {}",
+                self.settings.home.path().display()
+            )),
+            Err(e) => Err(e.to_string()),
+        }
+    }
+}
 
 pub struct Model {
     provider: Provider,
     id: llm::SmolStr,
-    http: Box<dyn Http>,
+    http: Arc<dyn Http>,
 }
 
 impl Model {
-    pub fn from_spec(spec: &str, rt: rt::Rt) -> Result<Self, String> {
-        let (provider, id) = llm::hosts::provider(spec).map_err(|e| e.to_string())?;
-        Ok(Self::new(provider, id, llm::Ureq::new(rt)))
-    }
-
-    pub fn new(provider: Provider, id: llm::SmolStr, http: impl Http) -> Self {
-        Self {
-            provider,
-            id,
-            http: Box::new(http),
-        }
-    }
-
     /// How a call to this model is recorded: `host:model`.
     pub fn name(&self) -> String {
         format!("{}:{}", self.provider.id, self.id)

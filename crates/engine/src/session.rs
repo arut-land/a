@@ -19,7 +19,7 @@ use protocol::{
 use serde_json::Value;
 use store::{Header, Loaded, Log, LogStore, Parent};
 
-use crate::model::Model;
+use crate::model::{Model, Models};
 use crate::{Daemon, lock};
 
 mod facts;
@@ -34,11 +34,10 @@ pub struct Shared {
     /// Where session actors run as tasks, and effects sleep and block.
     pub rt: rt::Rt,
     pub store: Arc<dyn LogStore>,
-    pub agent: agent::Kind,
     /// The extensions' tools and hooks.
     pub registry: agent::Registry,
-    /// The model, or why there is none (shown as the failed model call).
-    pub model: Result<Model, String>,
+    /// The settings, and the model they name.
+    pub models: Models,
     /// Where linked sessions are started and found.
     pub(crate) daemon: Weak<Daemon>,
 }
@@ -467,11 +466,12 @@ impl Session {
     /// failed unit of work it is rebuilt from the log. Each unit's future is
     /// boxed, so an idle session's actor holds only what waiting takes.
     async fn run(&self, mailbox: &rt::channel::Receiver<Msg>) {
-        let mut agent = self.shared.agent.agent();
+        let kind = self.shared.models.settings.agent(&self.workspace);
+        let mut agent = kind.agent();
         let mut ok = Box::pin(self.work(self.recover(agent.as_mut()))).await;
         loop {
             if !ok {
-                agent = self.shared.agent.agent();
+                agent = kind.agent();
                 replay(agent.as_mut(), &self.lock().entries);
             }
             ok = match mailbox.recv().await {
@@ -571,13 +571,12 @@ impl Session {
                 return Ok(None);
             }
             Action::CallModel => {
-                let model = self
-                    .shared
-                    .model
+                let model = self.model();
+                let name = model
                     .as_ref()
                     .map_or_else(|_| "none".to_owned(), Model::name);
-                let seq = self.append(Body::ModelCall { model }).await?;
-                (Call::Model, seq, self.run_model(seq).await)
+                let seq = self.append(Body::ModelCall { model: name }).await?;
+                (Call::Model, seq, self.run_model(seq, model).await)
             }
             Action::RunTool {
                 tool,
@@ -668,7 +667,7 @@ impl Session {
 
     async fn run_call(&self, call: &Call, seq: u64) -> Outcome {
         match call {
-            Call::Model => self.run_model(seq).await,
+            Call::Model => self.run_model(seq, self.model()).await,
             Call::Tool { tool, input } => self.run_tool(seq, tool, input).await,
         }
     }
@@ -724,17 +723,20 @@ impl Session {
         contain(self.shared.registry.tools().run(tool, input, &cx)).await
     }
 
-    /// Asks the model to reply to the transcript before `call`, offering the
+    /// The model as the settings and the newest client's environment name
+    /// it now, or why there is none (shown as the failed model call).
+    fn model(&self) -> Result<Model, String> {
+        let env = lock(&self.env);
+        self.shared.models.model(&self.workspace, env.as_ref())
+    }
+
+    /// Asks `model` to reply to the transcript before `call`, offering the
     /// tools. Text streams to clients as it arrives; only the finished reply
     /// is committed.
-    async fn run_model(&self, call: u64) -> Outcome {
-        let model = match &self.shared.model {
+    async fn run_model(&self, call: u64, model: Result<Model, String>) -> Outcome {
+        let model = match model {
             Ok(model) => model,
-            Err(error) => {
-                return Outcome::Failed {
-                    error: error.clone(),
-                };
-            }
+            Err(error) => return Outcome::Failed { error },
         };
         let tools = self.shared.registry.tools();
         let history = transcript(&self.lock().entries, call, tools);

@@ -225,10 +225,18 @@ impl Provider {
     }
 }
 
-/// Reads an environment variable that may be unset or blank.
+/// Looks up the variables that configure a host: keys and base URLs.
+pub type Vars<'a> = dyn Fn(&str) -> Option<String> + 'a;
+
+/// Reads a variable of this process's environment: the lookup
+/// [`Host::provider`] takes when nothing else configures the host.
 pub fn env(name: &str) -> Option<String> {
-    std::env::var(name)
-        .ok()
+    std::env::var(name).ok()
+}
+
+/// Variable `name` from `lookup`, unless unset or blank.
+fn var(lookup: &Vars<'_>, name: &str) -> Option<String> {
+    lookup(name)
         .map(|value| value.trim().to_owned())
         .filter(|value| !value.is_empty())
 }
@@ -285,9 +293,9 @@ impl Host {
     }
 
     /// The provider for this host, `protocol` speaking to it, configured
-    /// from the environment.
-    pub fn provider(&self, protocol: impl Protocol) -> Result<Provider, Error> {
-        let auth = match self.key_env.iter().find_map(|name| env(name)) {
+    /// from the variables `env` looks up (such as [`env`], this process's).
+    pub fn provider(&self, protocol: impl Protocol, env: &Vars<'_>) -> Result<Provider, Error> {
+        let auth = match self.key_env.iter().find_map(|name| var(env, name)) {
             Some(key) => self.key.auth(Secret(key)),
             None if self.keyless => Auth::None,
             None => {
@@ -297,7 +305,7 @@ impl Host {
                 ));
             }
         };
-        let base_url = self.base_url_env.iter().find_map(|name| env(name));
+        let base_url = self.base_url_env.iter().find_map(|name| var(env, name));
         Ok(Provider::new(
             self.id,
             base_url.as_deref().unwrap_or(self.base_url),
