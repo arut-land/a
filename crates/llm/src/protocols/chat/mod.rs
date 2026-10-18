@@ -12,7 +12,7 @@ mod rules;
 pub use hosts::HOSTS;
 
 use crate::error::Error;
-use crate::protocol::{Decoder, Encoded, Framing, Protocol, Target};
+use crate::protocol::{Decoder, Encoded, Framing, Host, Hosted, Protocol, Target};
 use crate::spec::{Reason, Request};
 
 /// Where this protocol's options and part state go.
@@ -216,6 +216,17 @@ pub struct Chat {
 impl Chat {
     pub const fn new(quirks: Quirks) -> Self {
         Self { quirks }
+    }
+}
+
+impl Hosted for Chat {
+    type Quirks = Quirks;
+
+    const KEY: &'static str = KEY;
+    const HOSTS: &'static [(Host, Quirks)] = HOSTS;
+
+    fn with(quirks: Quirks) -> Self {
+        Self::new(quirks)
     }
 }
 

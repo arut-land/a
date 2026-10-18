@@ -5,17 +5,6 @@ use super::{LaterSystem, OutputCap, Quirks, Rewrite, Routing, Vendor};
 use crate::protocol::{Host, KeyStyle};
 use crate::spec::Reason;
 
-const fn host(id: &'static str, base_url: &'static str, key_env: &'static [&'static str]) -> Host {
-    Host {
-        id,
-        base_url,
-        key_env,
-        base_url_env: &[],
-        key: KeyStyle::Bearer,
-        keyless: false,
-    }
-}
-
 /// The `api-version` an Azure deployment is addressed with by default.
 pub const AZURE_API_VERSION: &str = "2024-10-21";
 
@@ -46,7 +35,7 @@ pub const HOSTS: &[(Host, Quirks)] = &[
     (
         Host {
             base_url_env: &["OPENAI_BASE_URL"],
-            ..host("openai", "https://api.openai.com/v1", &["OPENAI_API_KEY"])
+            ..Host::bearer("openai", "https://api.openai.com/v1", &["OPENAI_API_KEY"])
         },
         Quirks {
             vendor: Vendor::OpenAi,
@@ -62,7 +51,7 @@ pub const HOSTS: &[(Host, Quirks)] = &[
         Host {
             base_url_env: &["AZURE_ENDPOINT"],
             key: KeyStyle::Header("api-key"),
-            ..host("azure.openai", "", &["AZURE_API_KEY"])
+            ..Host::bearer("azure.openai", "", &["AZURE_API_KEY"])
         },
         Quirks {
             vendor: Vendor::Azure,
@@ -73,7 +62,7 @@ pub const HOSTS: &[(Host, Quirks)] = &[
         },
     ),
     (
-        host(
+        Host::bearer(
             "deepseek",
             "https://api.deepseek.com",
             &["DEEPSEEK_API_KEY"],
@@ -90,7 +79,7 @@ pub const HOSTS: &[(Host, Quirks)] = &[
         },
     ),
     (
-        host("groq", "https://api.groq.com/openai/v1", &["GROQ_API_KEY"]),
+        Host::bearer("groq", "https://api.groq.com/openai/v1", &["GROQ_API_KEY"]),
         Quirks {
             vendor: Vendor::Groq,
             ..Quirks::OPENAI
@@ -98,7 +87,7 @@ pub const HOSTS: &[(Host, Quirks)] = &[
     ),
     (
         // The bare host: the path carries its own `/v1`.
-        host(
+        Host::bearer(
             "hyperbolic",
             "https://api.hyperbolic.xyz",
             &["HYPERBOLIC_API_KEY"],
@@ -112,7 +101,7 @@ pub const HOSTS: &[(Host, Quirks)] = &[
         },
     ),
     (
-        host("mira", "https://api.mira.network", &["MIRA_API_KEY"]),
+        Host::bearer("mira", "https://api.mira.network", &["MIRA_API_KEY"]),
         Quirks {
             path: "/v1/chat/completions",
             vendor: Vendor::Mira,
@@ -127,7 +116,7 @@ pub const HOSTS: &[(Host, Quirks)] = &[
         },
     ),
     (
-        host(
+        Host::bearer(
             "perplexity",
             "https://api.perplexity.ai",
             &["PERPLEXITY_API_KEY"],
@@ -142,7 +131,7 @@ pub const HOSTS: &[(Host, Quirks)] = &[
         },
     ),
     (
-        host(
+        Host::bearer(
             "together",
             "https://api.together.xyz",
             &["TOGETHER_API_KEY"],
@@ -156,7 +145,7 @@ pub const HOSTS: &[(Host, Quirks)] = &[
         },
     ),
     (
-        host(
+        Host::bearer(
             "huggingface",
             "https://router.huggingface.co",
             &["HUGGINGFACE_API_KEY"],
@@ -173,7 +162,7 @@ pub const HOSTS: &[(Host, Quirks)] = &[
         Host {
             base_url_env: &["LLAMACPP_API_BASE_URL"],
             keyless: true,
-            ..host(
+            ..Host::bearer(
                 "llamacpp",
                 "http://localhost:8080/v1",
                 &["LLAMACPP_API_KEY"],
@@ -187,7 +176,7 @@ pub const HOSTS: &[(Host, Quirks)] = &[
         },
     ),
     (
-        host("mistral", "https://api.mistral.ai", &["MISTRAL_API_KEY"]),
+        Host::bearer("mistral", "https://api.mistral.ai", &["MISTRAL_API_KEY"]),
         Quirks {
             path: "/v1/chat/completions",
             vendor: Vendor::Mistral,
@@ -201,7 +190,7 @@ pub const HOSTS: &[(Host, Quirks)] = &[
     (
         Host {
             base_url_env: &["OPENROUTER_BASE_URL"],
-            ..host(
+            ..Host::bearer(
                 "openrouter",
                 "https://openrouter.ai/api/v1",
                 &["OPENROUTER_API_KEY"],
@@ -220,7 +209,7 @@ pub const HOSTS: &[(Host, Quirks)] = &[
     (
         Host {
             base_url_env: &["VENICE_BASE_URL"],
-            ..host(
+            ..Host::bearer(
                 "venice",
                 "https://api.venice.ai/api/v1",
                 &["VENICE_API_KEY"],
@@ -234,7 +223,7 @@ pub const HOSTS: &[(Host, Quirks)] = &[
     (
         Host {
             base_url_env: &["DOUBLEWORD_BASE_URL"],
-            ..host(
+            ..Host::bearer(
                 "doubleword",
                 "https://api.doubleword.ai/v1",
                 &["DOUBLEWORD_API_KEY"],
@@ -250,14 +239,14 @@ pub const HOSTS: &[(Host, Quirks)] = &[
     (
         Host {
             base_url_env: &["ZAI_API_BASE"],
-            ..host("zai", "https://api.z.ai/api/paas/v4", &["ZAI_API_KEY"])
+            ..Host::bearer("zai", "https://api.z.ai/api/paas/v4", &["ZAI_API_KEY"])
         },
         ZAI,
     ),
     (
         Host {
             base_url_env: &["ZAI_API_BASE"],
-            ..host(
+            ..Host::bearer(
                 "zai-coding",
                 "https://api.z.ai/api/coding/paas/v4",
                 &["ZAI_API_KEY"],
@@ -268,14 +257,14 @@ pub const HOSTS: &[(Host, Quirks)] = &[
     (
         Host {
             base_url_env: &["MINIMAX_API_BASE"],
-            ..host("minimax", "https://api.minimax.io/v1", &["MINIMAX_API_KEY"])
+            ..Host::bearer("minimax", "https://api.minimax.io/v1", &["MINIMAX_API_KEY"])
         },
         MINIMAX,
     ),
     (
         Host {
             base_url_env: &["MINIMAX_API_BASE"],
-            ..host(
+            ..Host::bearer(
                 "minimax-cn",
                 "https://api.minimaxi.com/v1",
                 &["MINIMAX_API_KEY"],
@@ -286,7 +275,7 @@ pub const HOSTS: &[(Host, Quirks)] = &[
     (
         Host {
             base_url_env: &["MOONSHOT_API_BASE"],
-            ..host(
+            ..Host::bearer(
                 "moonshot",
                 "https://api.moonshot.ai/v1",
                 &["MOONSHOT_API_KEY"],
@@ -297,7 +286,7 @@ pub const HOSTS: &[(Host, Quirks)] = &[
     (
         Host {
             base_url_env: &["MOONSHOT_API_BASE"],
-            ..host(
+            ..Host::bearer(
                 "moonshot-cn",
                 "https://api.moonshot.cn/v1",
                 &["MOONSHOT_API_KEY"],
@@ -308,7 +297,7 @@ pub const HOSTS: &[(Host, Quirks)] = &[
     (
         Host {
             base_url_env: &["XIAOMI_MIMO_API_BASE"],
-            ..host(
+            ..Host::bearer(
                 "xiaomimimo",
                 "https://api.xiaomimimo.com/v1",
                 &["XIAOMI_MIMO_API_KEY"],
@@ -323,7 +312,7 @@ pub const HOSTS: &[(Host, Quirks)] = &[
         },
     ),
     (
-        host(
+        Host::bearer(
             "cohere",
             "https://api.cohere.ai/compatibility/v1",
             &["COHERE_API_KEY"],
@@ -337,7 +326,7 @@ pub const HOSTS: &[(Host, Quirks)] = &[
         // A local daemon takes no credential; a proxied one takes a token.
         Host {
             keyless: true,
-            ..host("ollama", "http://localhost:11434/v1", &["OLLAMA_API_KEY"])
+            ..Host::bearer("ollama", "http://localhost:11434/v1", &["OLLAMA_API_KEY"])
         },
         Quirks {
             vendor: Vendor::Ollama,
@@ -348,7 +337,7 @@ pub const HOSTS: &[(Host, Quirks)] = &[
     (
         Host {
             base_url_env: &["XAI_BASE_URL"],
-            ..host("xai", "https://api.x.ai", &["XAI_API_KEY"])
+            ..Host::bearer("xai", "https://api.x.ai", &["XAI_API_KEY"])
         },
         Quirks {
             path: "/v1/chat/completions",

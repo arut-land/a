@@ -10,9 +10,9 @@ use serde_json::{Value, json};
 use super::KEY;
 use crate::error::{Error, Kind};
 use crate::json::Lenient;
-use crate::protocol::{Decoder, Flow, Frame};
-use crate::spec::{Event, Reason, SmolStr, Usage};
-use crate::writer::{CallFragment, End, Open, Writer};
+use crate::protocol::Flow;
+use crate::spec::{Reason, SmolStr, Usage};
+use crate::writer::{CallFragment, End, Open, Writer, Writes};
 
 const fn is_lifecycle(kind: &str) -> bool {
     matches!(
@@ -641,7 +641,7 @@ impl ResponsesDecoder {
         let (reason, raw, message) = finish_of(response);
         let usage = Usage {
             // Hosted tools report their requests beside the usage.
-            hosted_tool_calls: super::super::counters(
+            hosted_tool_calls: crate::json::counters(
                 response.get("tool_usage"),
                 Some("num_requests"),
             )
@@ -654,7 +654,7 @@ impl ResponsesDecoder {
             response_id: item_id(response).map(Into::into),
             model: response.str("model").map(Into::into),
             message,
-            meta: super::super::usage_meta(KEY, response.get("usage")),
+            raw_usage: response.get("usage").cloned(),
         })
     }
 
@@ -712,11 +712,13 @@ impl ResponsesDecoder {
     }
 }
 
-impl Decoder for ResponsesDecoder {
-    fn frame(&mut self, frame: Frame<'_>, out: &mut Vec<Event>) -> Result<Flow, Error> {
-        let flow = self.decode(frame.data);
-        self.w.drain(out);
-        flow
+impl Writes for ResponsesDecoder {
+    fn writer(&mut self) -> &mut Writer {
+        &mut self.w
+    }
+
+    fn data(&mut self, data: &str) -> Result<Flow, Error> {
+        self.decode(data)
     }
 }
 

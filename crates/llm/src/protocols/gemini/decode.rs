@@ -9,9 +9,9 @@ use serde_json::{Value, json};
 use super::KEY;
 use crate::error::{Error, Kind};
 use crate::json::Lenient;
-use crate::protocol::{Decoder, Flow, Frame};
-use crate::spec::{Event, Media, Reason, SmolStr, Source, Usage};
-use crate::writer::{End, Open, Writer};
+use crate::protocol::Flow;
+use crate::spec::{Media, Reason, SmolStr, Source, Usage};
+use crate::writer::{End, Open, Writer, Writes};
 
 /// The fields of a part that carry no data of their own.
 const fn is_bare(key: &str) -> bool {
@@ -280,7 +280,7 @@ impl GeminiDecoder {
             response_id: self.response_id.take(),
             model: self.model.take(),
             message: message.filter(|_| reason != Reason::Stop),
-            meta: super::super::usage_meta(KEY, self.usage.as_ref()),
+            raw_usage: self.usage.take(),
         })
     }
 
@@ -420,18 +420,18 @@ fn media_of(part: &Value) -> Option<Media> {
     })
 }
 
-impl Decoder for GeminiDecoder {
-    fn frame(&mut self, frame: Frame<'_>, out: &mut Vec<Event>) -> Result<Flow, Error> {
-        let flow = self.decode(frame.data);
-        self.w.drain(out);
-        flow
+impl Writes for GeminiDecoder {
+    fn writer(&mut self) -> &mut Writer {
+        &mut self.w
+    }
+
+    fn data(&mut self, data: &str) -> Result<Flow, Error> {
+        self.decode(data)
     }
 
     /// Gemini ends a reply at the end of its body, not at its first finish
     /// reason.
-    fn end(&mut self, out: &mut Vec<Event>) -> Result<(), Error> {
-        let flow = self.finish();
-        self.w.drain(out);
-        flow.map(drop)
+    fn ended(&mut self) -> Result<(), Error> {
+        self.finish().map(drop)
     }
 }

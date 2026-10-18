@@ -14,9 +14,9 @@ use serde_json::{Map, Value, json};
 use super::KEY;
 use crate::error::{Error, Kind as ErrorKind};
 use crate::json::Lenient;
-use crate::protocol::{Decoder, Flow, Frame};
-use crate::spec::{Event, Reason, SmolStr, Usage};
-use crate::writer::{AUTO_INDEX, CallFragment, End, Open, Writer, merge};
+use crate::protocol::Flow;
+use crate::spec::{Reason, SmolStr, Usage};
+use crate::writer::{AUTO_INDEX, CallFragment, End, Open, Writer, Writes, merge};
 
 /// The events the decoder reads; any other type is skipped. `message` is a
 /// whole message, as a gateway may send in place of a stream.
@@ -59,7 +59,7 @@ impl Counts {
             cache_creation: count("/cache_creation_input_tokens"),
             cache_creation_long: count("/cache_creation/ephemeral_1h_input_tokens"),
             thinking: count("/output_tokens_details/thinking_tokens"),
-            server_tools: super::super::counters(
+            server_tools: crate::json::counters(
                 usage.and_then(|usage| usage.get("server_tool_use")),
                 None,
             ),
@@ -427,7 +427,7 @@ impl MessagesDecoder {
             response_id: self.message_id.clone(),
             model: self.model.clone(),
             message,
-            meta: super::super::usage_meta(KEY, self.raw_usage.as_ref()),
+            raw_usage: self.raw_usage.clone(),
         })
     }
 
@@ -544,10 +544,12 @@ fn set_input(item: &mut Value, input: Value) {
     }
 }
 
-impl Decoder for MessagesDecoder {
-    fn frame(&mut self, frame: Frame<'_>, out: &mut Vec<Event>) -> Result<Flow, Error> {
-        let flow = self.decode(frame.data);
-        self.w.drain(out);
-        flow
+impl Writes for MessagesDecoder {
+    fn writer(&mut self) -> &mut Writer {
+        &mut self.w
+    }
+
+    fn data(&mut self, data: &str) -> Result<Flow, Error> {
+        self.decode(data)
     }
 }

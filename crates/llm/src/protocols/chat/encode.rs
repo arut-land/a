@@ -692,7 +692,7 @@ pub(super) fn body(
     }
     body.insert("stream".into(), json!(true));
     let mut body = Value::Object(body);
-    crate::protocol::merge(&mut body, &options);
+    crate::json::overlay(&mut body, &options);
     if let Some(fields) = body.as_object_mut() {
         super::rewrite::finish(quirks, fields)?;
     }

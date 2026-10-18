@@ -50,7 +50,7 @@ pub async fn generate(
     let mut events = stream(http, provider, request);
     let mut acc = Accumulator::new();
     while let Some(event) = std::future::poll_fn(|cx| Pin::new(&mut events).poll_next(cx)).await {
-        acc.push(&event?)?;
+        acc.push(event?)?;
     }
     acc.finish(Some(origin(provider, &request.model)))
 }
@@ -91,6 +91,47 @@ enum Framer {
     Ndjson(NdjsonFramer),
 }
 
+impl From<Framing> for Framer {
+    fn from(framing: Framing) -> Self {
+        match framing {
+            Framing::Sse => Self::Sse(SseFramer::new()),
+            Framing::Ndjson => Self::Ndjson(NdjsonFramer::new()),
+        }
+    }
+}
+
+impl Framer {
+    /// Decode the frames `chunk` completes, until the decoder is done.
+    fn feed(
+        &mut self,
+        decoder: &mut dyn Decoder,
+        chunk: &[u8],
+        out: &mut Vec<Event>,
+    ) -> Result<Flow, Error> {
+        match self {
+            Self::Sse(sse) => {
+                for event in sse.push(chunk) {
+                    let frame = Frame {
+                        event: &event.event,
+                        data: &event.data,
+                    };
+                    if decoder.frame(frame, out)? == Flow::Done {
+                        return Ok(Flow::Done);
+                    }
+                }
+            }
+            Self::Ndjson(lines) => {
+                for line in lines.push(chunk) {
+                    if line_frame(decoder, &line, out)? == Flow::Done {
+                        return Ok(Flow::Done);
+                    }
+                }
+            }
+        }
+        Ok(Flow::More)
+    }
+}
+
 /// A successful reply's body, being decoded.
 struct Reader {
     body: Body,
@@ -116,21 +157,21 @@ impl Stream for Events {
         let this = &mut *self;
         loop {
             match &mut this.state {
-                State::Sending {
-                    reply,
-                    framing,
-                    decoder,
-                } => {
-                    let reply = match ready!(reply.as_mut().poll(cx)) {
-                        Ok(reply) => reply,
+                State::Sending { reply, .. } => {
+                    let reply = ready!(reply.as_mut().poll(cx));
+                    let State::Sending {
+                        framing, decoder, ..
+                    } = std::mem::replace(&mut this.state, State::Over)
+                    else {
+                        continue;
+                    };
+                    let (parts, body) = match reply {
+                        Ok(reply) => reply.into_parts(),
                         Err(error) => {
                             this.state = State::Failed(Some(error.into()));
                             continue;
                         }
                     };
-                    let (parts, body) = reply.into_parts();
-                    let framing = *framing;
-                    let decoder = std::mem::replace(decoder, Box::new(Nothing));
                     this.state = if parts.status.is_success() {
                         State::Reading(Reader::new(body, framing, decoder))
                     } else {
@@ -178,10 +219,7 @@ impl Reader {
     fn new(body: Body, framing: Framing, decoder: Box<dyn Decoder>) -> Self {
         Self {
             body,
-            framer: match framing {
-                Framing::Sse => Framer::Sse(SseFramer::new()),
-                Framing::Ndjson => Framer::Ndjson(NdjsonFramer::new()),
-            },
+            framer: framing.into(),
             decoder,
             queue: VecDeque::new(),
             done: false,
@@ -213,7 +251,7 @@ impl Reader {
             }
             let mut out = Vec::new();
             let step = match ready!(self.body.as_mut().poll_next(cx)) {
-                Some(Ok(chunk)) => feed(&mut self.framer, self.decoder.as_mut(), &chunk, &mut out),
+                Some(Ok(chunk)) => self.framer.feed(self.decoder.as_mut(), &chunk, &mut out),
                 Some(Err(error)) => Err(Error::new(
                     Kind::Transport,
                     format!("the reply broke off: {error}"),
@@ -248,35 +286,6 @@ impl Reader {
     }
 }
 
-fn feed(
-    framer: &mut Framer,
-    decoder: &mut dyn Decoder,
-    chunk: &[u8],
-    out: &mut Vec<Event>,
-) -> Result<Flow, Error> {
-    match framer {
-        Framer::Sse(sse) => {
-            for event in sse.push(chunk) {
-                let frame = Frame {
-                    event: &event.event,
-                    data: &event.data,
-                };
-                if decoder.frame(frame, out)? == Flow::Done {
-                    return Ok(Flow::Done);
-                }
-            }
-        }
-        Framer::Ndjson(lines) => {
-            for line in lines.push(chunk) {
-                if line_frame(decoder, &line, out)? == Flow::Done {
-                    return Ok(Flow::Done);
-                }
-            }
-        }
-    }
-    Ok(Flow::More)
-}
-
 fn line_frame(decoder: &mut dyn Decoder, line: &[u8], out: &mut Vec<Event>) -> Result<Flow, Error> {
     let line = String::from_utf8_lossy(line);
     decoder.frame(
@@ -286,12 +295,4 @@ fn line_frame(decoder: &mut dyn Decoder, line: &[u8], out: &mut Vec<Event>) -> R
         },
         out,
     )
-}
-
-struct Nothing;
-
-impl Decoder for Nothing {
-    fn frame(&mut self, _: Frame<'_>, _: &mut Vec<Event>) -> Result<Flow, Error> {
-        Ok(Flow::Done)
-    }
 }

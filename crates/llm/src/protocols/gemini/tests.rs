@@ -51,7 +51,7 @@ fn decoded_by(model: &str, chunks: &[Value]) -> Result<Response, Error> {
         decoder.end(&mut events)?;
     }
     let mut acc = Accumulator::new();
-    for event in &events {
+    for event in events {
         acc.push(event)?;
     }
     acc.finish(Some(crate::origin(&provider, model)))

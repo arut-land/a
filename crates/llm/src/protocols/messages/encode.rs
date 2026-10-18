@@ -69,13 +69,13 @@ pub(super) fn body(
         })?;
     let mut body = base(quirks, model, request, &options, max_tokens)?;
     let mapped = options::generation(quirks, model, &request.generation, max_tokens);
-    crate::protocol::merge(&mut body, &mapped);
+    crate::json::overlay(&mut body, &mapped);
     let raw: Map<String, Value> = options
         .iter()
         .filter(|(key, _)| !READ.contains(&key.as_str()))
         .map(|(key, value)| (key.clone(), value.clone()))
         .collect();
-    crate::protocol::merge(&mut body, &raw);
+    crate::json::overlay(&mut body, &raw);
     let unbound =
         quirks.dialect == Dialect::Anthropic && binds_context(model) && drop_unbound(&mut body);
     // Anthropic rejects a tool choice without tools.
@@ -389,7 +389,7 @@ fn text_block(text: &str) -> Value {
 /// document's `title` or a `cache_control` marker.
 fn with_meta(mut block: Value, meta: &Meta) -> Value {
     if let Some(Value::Object(fields)) = meta.get(KEY) {
-        crate::protocol::merge(&mut block, fields);
+        crate::json::overlay(&mut block, fields);
     }
     block
 }

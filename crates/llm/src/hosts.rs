@@ -5,8 +5,9 @@
 //! last segment (`openai@chat:gpt-4.1`).
 
 use crate::error::{Error, Kind};
-use crate::protocol::Provider;
+use crate::protocol::{Hosted, Provider};
 use crate::protocols::{chat, gemini, messages, responses};
+use crate::spec::SmolStr;
 
 /// The default host for a bare model.
 pub const DEFAULT_HOST: &str = "openai";
@@ -24,10 +25,9 @@ pub struct Spec<'a> {
 /// `@protocol`.
 pub fn parse(spec: &str) -> Spec<'_> {
     let (host, model) = spec.split_once(':').unwrap_or((DEFAULT_HOST, spec));
-    let (host, protocol) = match host.split_once('@') {
-        Some((host, protocol)) => (host, Some(protocol)),
-        None => (host, None),
-    };
+    let (host, protocol) = host
+        .split_once('@')
+        .map_or((host, None), |(host, protocol)| (host, Some(protocol)));
     Spec {
         host,
         protocol,
@@ -35,8 +35,41 @@ pub fn parse(spec: &str) -> Spec<'_> {
     }
 }
 
+/// One protocol's host table, as lookups over it.
+struct Wire {
+    key: &'static str,
+    /// The provider a host id names, if the protocol lists it.
+    find: fn(&str) -> Option<Result<Provider, Error>>,
+    ids: fn() -> Box<dyn Iterator<Item = &'static str>>,
+}
+
+const fn wire<P: Hosted>() -> Wire {
+    Wire {
+        key: P::KEY,
+        find: find::<P>,
+        ids: host_ids::<P>,
+    }
+}
+
+fn find<P: Hosted>(id: &str) -> Option<Result<Provider, Error>> {
+    let (host, quirks) = P::HOSTS.iter().find(|(host, _)| host.id == id)?;
+    Some(host.provider(P::with(*quirks)))
+}
+
+fn host_ids<P: Hosted>() -> Box<dyn Iterator<Item = &'static str>> {
+    Box::new(P::HOSTS.iter().map(|(host, _)| host.id))
+}
+
+/// Every protocol, in lookup order.
+const WIRES: [Wire; 4] = [
+    wire::<responses::Responses>(),
+    wire::<chat::Chat>(),
+    wire::<messages::Messages>(),
+    wire::<gemini::Gemini>(),
+];
+
 /// The provider and model `spec` names, configured from the environment.
-pub fn provider(spec: &str) -> Result<(Provider, String), Error> {
+pub fn provider(spec: &str) -> Result<(Provider, SmolStr), Error> {
     let Spec {
         host,
         protocol,
@@ -48,54 +81,27 @@ pub fn provider(spec: &str) -> Result<(Provider, String), Error> {
             format!("`{spec}` names no model"),
         ));
     }
-    let wants =
-        |key: &str| protocol.is_none_or(|protocol| key.rsplit('.').next() == Some(protocol));
-    if wants(responses::KEY)
-        && let Some((found, quirks)) = responses::HOSTS.iter().find(|(found, _)| found.id == host)
-    {
-        return Ok((
-            found.provider(responses::Responses::new(*quirks))?,
-            model.to_owned(),
-        ));
-    }
-    if wants(chat::KEY)
-        && let Some((found, quirks)) = chat::HOSTS.iter().find(|(found, _)| found.id == host)
-    {
-        return Ok((found.provider(chat::Chat::new(*quirks))?, model.to_owned()));
-    }
-    if wants(messages::KEY)
-        && let Some((found, quirks)) = messages::HOSTS.iter().find(|(found, _)| found.id == host)
-    {
-        return Ok((
-            found.provider(messages::Messages::new(*quirks))?,
-            model.to_owned(),
-        ));
-    }
-    if wants(gemini::KEY)
-        && let Some((found, quirks)) = gemini::HOSTS.iter().find(|(found, _)| found.id == host)
-    {
-        return Ok((
-            found.provider(gemini::Gemini::new(*quirks))?,
-            model.to_owned(),
-        ));
-    }
-    Err(Error::new(
-        Kind::InvalidRequest,
-        format!(
-            "no known host `{host}` speaks {}",
-            protocol.unwrap_or("any protocol")
-        ),
-    ))
+    let provider = WIRES
+        .iter()
+        .filter(|wire| {
+            protocol.is_none_or(|protocol| wire.key.rsplit('.').next() == Some(protocol))
+        })
+        .find_map(|wire| (wire.find)(host))
+        .ok_or_else(|| {
+            Error::new(
+                Kind::InvalidRequest,
+                format!(
+                    "no known host `{host}` speaks {}",
+                    protocol.unwrap_or("any protocol")
+                ),
+            )
+        })?;
+    Ok((provider?, model.into()))
 }
 
 /// Every host id, in lookup order.
 pub fn ids() -> impl Iterator<Item = &'static str> {
-    responses::HOSTS
-        .iter()
-        .map(|(host, _)| host.id)
-        .chain(chat::HOSTS.iter().map(|(host, _)| host.id))
-        .chain(messages::HOSTS.iter().map(|(host, _)| host.id))
-        .chain(gemini::HOSTS.iter().map(|(host, _)| host.id))
+    WIRES.iter().flat_map(|wire| (wire.ids)())
 }
 
 #[cfg(test)]

@@ -22,7 +22,7 @@ mod options;
 mod strict;
 
 use crate::error::Error;
-use crate::protocol::{Decoder, Encoded, Framing, Host, KeyStyle, Protocol, Target};
+use crate::protocol::{Decoder, Encoded, Framing, Host, Hosted, KeyStyle, Protocol, Target};
 use crate::spec::Request;
 
 pub use crate::models::anthropic::{default_max_tokens, rejects_forced_tool_choice};
@@ -146,6 +146,17 @@ fn path(base_url: &str) -> &'static str {
         "/messages"
     } else {
         "/v1/messages"
+    }
+}
+
+impl Hosted for Messages {
+    type Quirks = Quirks;
+
+    const KEY: &'static str = KEY;
+    const HOSTS: &'static [(Host, Quirks)] = HOSTS;
+
+    fn with(quirks: Quirks) -> Self {
+        Self::new(quirks)
     }
 }
 

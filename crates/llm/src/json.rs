@@ -1,7 +1,9 @@
 //! JSON as providers send it: read leniently, and tool arguments parsed so
 //! a malformed or cut-off call never fails a reply (ported from rig).
 
-use serde_json::{Map, Value};
+use std::str::FromStr;
+
+use serde_json::{Map, Number, Value};
 
 /// Lenient reads of a JSON value: a missing field or one of the wrong type
 /// is `None`, and numbers may arrive as strings.
@@ -29,19 +31,11 @@ impl Lenient for Value {
     }
 
     fn i64(&self, key: &str) -> Option<i64> {
-        match self.get(key)? {
-            Value::Number(number) => number.as_i64(),
-            Value::String(text) => text.trim().parse().ok(),
-            _ => None,
-        }
+        number(self.get(key)?, Number::as_i64)
     }
 
     fn f64(&self, key: &str) -> Option<f64> {
-        match self.get(key)? {
-            Value::Number(number) => number.as_f64(),
-            Value::String(text) => text.trim().parse().ok(),
-            _ => None,
-        }
+        number(self.get(key)?, Number::as_f64)
     }
 
     fn bool(&self, key: &str) -> Option<bool> {
@@ -64,15 +58,58 @@ impl Lenient for Value {
 
     #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
     fn as_u64_lenient(&self) -> Option<u64> {
-        match self {
-            Value::Number(number) => number.as_u64().or_else(|| {
+        number(self, |number| {
+            number.as_u64().or_else(|| {
                 number
                     .as_f64()
                     .filter(|float| *float >= 0.0 && float.fract() == 0.0)
                     .map(|float| float as u64)
-            }),
-            Value::String(text) => text.trim().parse().ok(),
-            _ => None,
+            })
+        })
+    }
+}
+
+/// A number, or a string that parses as one.
+fn number<T: FromStr>(value: &Value, read: impl FnOnce(&Number) -> Option<T>) -> Option<T> {
+    match value {
+        Value::Number(number) => read(number),
+        Value::String(text) => text.trim().parse().ok(),
+        _ => None,
+    }
+}
+
+/// The sum of the counts in an object of counters (`{"web_search": 2}`),
+/// or of objects holding them under `key` (`{"web_search": {"num_requests":
+/// 2}}`): `None` when it holds none.
+pub(crate) fn counters(object: Option<&Value>, key: Option<&str>) -> Option<u64> {
+    object?
+        .as_object()?
+        .values()
+        .filter_map(|value| match key {
+            Some(key) => value.get(key)?.as_u64_lenient(),
+            None => value.as_u64_lenient(),
+        })
+        .fold(None, |sum, count| Some(sum.unwrap_or(0) + count))
+}
+
+/// `overlay` deep-merged into `body`: objects merge key by key, anything
+/// else replaces, and `null` removes.
+pub fn overlay(body: &mut Value, overlay: &Map<String, Value>) {
+    let Value::Object(map) = body else {
+        *body = Value::Object(overlay.clone());
+        return;
+    };
+    for (key, value) in overlay {
+        match (map.get_mut(key), value) {
+            (_, Value::Null) => {
+                map.remove(key);
+            }
+            (Some(existing @ Value::Object(_)), Value::Object(inner)) => {
+                self::overlay(existing, inner);
+            }
+            _ => {
+                map.insert(key.clone(), value.clone());
+            }
         }
     }
 }
@@ -176,13 +213,13 @@ pub fn parse_partial_object(text: &str) -> Option<Map<String, Value>> {
 /// It is for display only. A call's arguments are what its end states, and
 /// only those are validated and executed.
 ///
-/// ```ignore
+/// ```
 /// use llm::json::parse_partial_arguments;
 ///
 /// let partial = parse_partial_arguments(r#"{"path": "notes.md", "content": "Hel"#);
 /// assert_eq!(partial["path"], "notes.md");
 /// assert_eq!(partial["content"], "Hel");
-/// ```ignore
+/// ```
 pub fn parse_partial_arguments(text: &str) -> Map<String, Value> {
     if text.trim().is_empty() {
         return Map::new();

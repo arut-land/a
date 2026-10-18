@@ -10,7 +10,7 @@ mod decode;
 mod encode;
 
 use crate::error::Error;
-use crate::protocol::{Decoder, Encoded, Framing, Host, KeyStyle, Protocol, Target};
+use crate::protocol::{Decoder, Encoded, Framing, Host, Hosted, KeyStyle, Protocol, Target};
 use crate::spec::Request;
 
 /// Where this protocol's options and part state go.
@@ -61,6 +61,17 @@ pub struct Gemini {
 impl Gemini {
     pub const fn new(quirks: Quirks) -> Self {
         Self { quirks }
+    }
+}
+
+impl Hosted for Gemini {
+    type Quirks = Quirks;
+
+    const KEY: &'static str = KEY;
+    const HOSTS: &'static [(Host, Quirks)] = HOSTS;
+
+    fn with(quirks: Quirks) -> Self {
+        Self::new(quirks)
     }
 }
 

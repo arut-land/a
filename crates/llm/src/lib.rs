@@ -21,7 +21,7 @@ pub mod sse;
 mod ureq;
 pub mod writer;
 
-pub use accumulate::{Accumulator, merge_meta};
+pub use accumulate::Accumulator;
 pub use client::{Events, generate, origin, stream};
 pub use error::{Error, Kind};
 pub use http::Http;

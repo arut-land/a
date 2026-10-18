@@ -2,6 +2,7 @@
 //! in order: a part opens before it grows, and nothing follows `Finish`.
 
 use std::collections::BTreeMap;
+use std::collections::btree_map::Entry;
 
 use serde_json::Value;
 
@@ -14,9 +15,17 @@ use crate::spec::{
 #[derive(Debug, Default)]
 pub struct Accumulator {
     parts: BTreeMap<u32, Building>,
-    finish: Option<(Finish, Usage, Meta, Option<Vec<u32>>)>,
+    finish: Option<Finished>,
     id: Option<SmolStr>,
     model: Option<SmolStr>,
+}
+
+#[derive(Debug)]
+struct Finished {
+    finish: Finish,
+    usage: Usage,
+    meta: Meta,
+    order: Option<Vec<u32>>,
 }
 
 #[derive(Debug)]
@@ -55,38 +64,44 @@ impl Accumulator {
             .collect()
     }
 
-    pub fn push(&mut self, event: &Event) -> Result<(), Error> {
+    /// A part that opens at `index`, which must be new.
+    fn opens(&mut self, index: u32, part: Building) -> Result<(), Error> {
+        match self.parts.entry(index) {
+            Entry::Occupied(_) => Err(order(format!("part {index} opened twice"))),
+            Entry::Vacant(slot) => {
+                slot.insert(part);
+                Ok(())
+            }
+        }
+    }
+
+    pub fn push(&mut self, event: Event) -> Result<(), Error> {
         if self.finish.is_some() {
             return Err(order("an event followed the reply's finish"));
         }
         match event {
             Event::Metadata { id, model } => {
                 if id.is_some() {
-                    self.id.clone_from(id);
+                    self.id = id;
                 }
                 if model.is_some() {
-                    self.model.clone_from(model);
+                    self.model = model;
                 }
             }
-            Event::Start { index, block, name } => {
-                if self.parts.contains_key(index) {
-                    return Err(order(format!("part {index} opened twice")));
-                }
-                self.parts.insert(
-                    *index,
-                    Building::Open {
-                        block: *block,
-                        text: String::new(),
-                        name: name.clone(),
-                        meta: Meta::new(),
-                    },
-                );
-            }
-            Event::Delta { index, text: delta } => match self.parts.get_mut(index) {
-                Some(Building::Open { text, .. }) => text.push_str(delta),
+            Event::Start { index, block, name } => self.opens(
+                index,
+                Building::Open {
+                    block,
+                    text: String::new(),
+                    name,
+                    meta: Meta::new(),
+                },
+            )?,
+            Event::Delta { index, text: delta } => match self.parts.get_mut(&index) {
+                Some(Building::Open { text, .. }) => text.push_str(&delta),
                 _ => return Err(order(format!("part {index} grew while not open"))),
             },
-            Event::Meta { index, meta: more } => match self.parts.get_mut(index) {
+            Event::Meta { index, meta: more } => match self.parts.get_mut(&index) {
                 Some(Building::Open { meta, .. }) => merge_meta(meta, more),
                 Some(Building::Done(part)) => merge_meta(part.meta_mut(), more),
                 None => return Err(order(format!("state for part {index}, which never opened"))),
@@ -102,20 +117,20 @@ impl Accumulator {
                     text,
                     name,
                     meta,
-                }) = self.parts.remove(index)
+                }) = self.parts.remove(&index)
                 else {
                     return Err(order(format!("part {index} ended while not open")));
                 };
-                let text = restated.clone().unwrap_or(text);
+                let text = restated.unwrap_or(text);
                 let part = match block {
                     Block::Text => AssistantPart::Text(Text { text, meta }),
                     Block::Reasoning => AssistantPart::Reasoning(Reasoning {
                         text,
-                        redacted: *redacted,
+                        redacted,
                         meta,
                     }),
                     Block::ToolCall => {
-                        let Some(call) = call.clone() else {
+                        let Some(call) = call else {
                             return Err(order(format!("call {index} ended without its id")));
                         };
                         AssistantPart::ToolCall(ToolCall {
@@ -128,14 +143,9 @@ impl Accumulator {
                         })
                     }
                 };
-                self.parts.insert(*index, Building::Done(part));
+                self.parts.insert(index, Building::Done(part));
             }
-            Event::Part { index, part } => {
-                if self.parts.contains_key(index) {
-                    return Err(order(format!("part {index} opened twice")));
-                }
-                self.parts.insert(*index, Building::Done(part.clone()));
-            }
+            Event::Part { index, part } => self.opens(index, Building::Done(part))?,
             Event::Finish {
                 finish,
                 usage,
@@ -147,7 +157,12 @@ impl Accumulator {
                 }) {
                     return Err(order(format!("the reply finished with part {index} open")));
                 }
-                self.finish = Some((finish.clone(), *usage, meta.clone(), sequence.clone()));
+                self.finish = Some(Finished {
+                    finish,
+                    usage,
+                    meta,
+                    order: sequence,
+                });
             }
         }
         Ok(())
@@ -155,15 +170,19 @@ impl Accumulator {
 
     /// The reply, once finished. `origin` is stamped on its message.
     pub fn finish(mut self, origin: Option<Origin>) -> Result<Response, Error> {
-        let (finish, usage, meta, sequence) = self.finish.take().ok_or_else(Error::incomplete)?;
-        let mut done = |index: u32| match self.parts.remove(&index) {
-            Some(Building::Done(part)) => Some(part),
-            _ => None,
-        };
+        let Finished {
+            finish,
+            usage,
+            meta,
+            order: sequence,
+        } = self.finish.take().ok_or_else(Error::incomplete)?;
         let mut content: Vec<AssistantPart> = sequence
             .unwrap_or_default()
             .into_iter()
-            .filter_map(&mut done)
+            .filter_map(|index| match self.parts.remove(&index) {
+                Some(Building::Done(part)) => Some(part),
+                _ => None,
+            })
             .collect();
         content.extend(self.parts.into_values().filter_map(|part| match part {
             Building::Done(part) => Some(part),
@@ -186,16 +205,12 @@ fn order(message: impl Into<String>) -> Error {
 
 /// `more` over `meta`, key by key; object values merge one level down so
 /// state that arrives in pieces (a signature after the text) accumulates.
-pub fn merge_meta(meta: &mut Meta, more: &Meta) {
+pub(crate) fn merge_meta(meta: &mut Meta, more: Meta) {
     for (key, value) in more {
-        match (meta.get_mut(key), value) {
-            (Some(Value::Object(have)), Value::Object(add)) => {
-                for (field, value) in add {
-                    have.insert(field.clone(), value.clone());
-                }
-            }
-            _ => {
-                meta.insert(key.clone(), value.clone());
+        match (meta.get_mut(&key), value) {
+            (Some(Value::Object(have)), Value::Object(add)) => have.extend(add),
+            (_, value) => {
+                meta.insert(key, value);
             }
         }
     }
@@ -266,7 +281,7 @@ mod tests {
             },
             finish(None),
         ];
-        for event in &events {
+        for event in events {
             acc.push(event).unwrap();
         }
         let response = acc.finish(None).unwrap();
@@ -288,18 +303,18 @@ mod tests {
     fn a_restated_end_and_a_stated_order_win() {
         let mut acc = Accumulator::new();
         for index in [0, 1] {
-            acc.push(&Event::Start {
+            acc.push(Event::Start {
                 index,
                 block: Block::Text,
                 name: None,
             })
             .unwrap();
-            acc.push(&Event::Delta {
+            acc.push(Event::Delta {
                 index,
                 text: "draft".into(),
             })
             .unwrap();
-            acc.push(&Event::End {
+            acc.push(Event::End {
                 index,
                 redacted: false,
                 text: Some(format!("final {index}")),
@@ -307,7 +322,7 @@ mod tests {
             })
             .unwrap();
         }
-        acc.push(&finish(Some(vec![1, 0]))).unwrap();
+        acc.push(finish(Some(vec![1, 0]))).unwrap();
         let texts: Vec<_> = acc
             .finish(None)
             .unwrap()
@@ -326,15 +341,15 @@ mod tests {
     fn rejects_events_out_of_order() {
         let mut acc = Accumulator::new();
         assert!(
-            acc.push(&Event::Delta {
+            acc.push(Event::Delta {
                 index: 0,
                 text: "x".into()
             })
             .is_err()
         );
-        acc.push(&finish(None)).unwrap();
+        acc.push(finish(None)).unwrap();
         assert!(
-            acc.push(&Event::Metadata {
+            acc.push(Event::Metadata {
                 id: None,
                 model: None
             })

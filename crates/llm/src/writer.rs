@@ -16,9 +16,10 @@
 
 use std::collections::{BTreeMap, HashMap, HashSet};
 
-use serde_json::{Map, Value, json};
+use serde_json::{Map, Value};
 
-use crate::error::Error;
+use crate::error::{Error, Kind};
+use crate::protocol::{Decoder, Flow, Frame};
 use crate::replay::{Canon, fingerprint};
 use crate::spec::{
     AssistantPart, Block, CallEnd, Event, Finish, Media, Meta, Opaque, Reason, SmolStr, Usage,
@@ -30,6 +31,34 @@ pub const AUTO_INDEX: usize = 1 << 30;
 
 /// The most argument bytes one call accumulates.
 const MAX_ARGUMENTS: usize = 32 * 1024 * 1024;
+
+/// A decoder that writes through a [`Writer`]: what each frame wrote
+/// reaches the consumer once the frame is decoded.
+pub trait Writes: Send {
+    fn writer(&mut self) -> &mut Writer;
+
+    /// Decode one frame's data.
+    fn data(&mut self, data: &str) -> Result<Flow, Error>;
+
+    /// The body ended without [`Flow::Done`]; see [`Decoder::end`].
+    fn ended(&mut self) -> Result<(), Error> {
+        Err(Error::incomplete())
+    }
+}
+
+impl<T: Writes> Decoder for T {
+    fn frame(&mut self, frame: Frame<'_>, out: &mut Vec<Event>) -> Result<Flow, Error> {
+        let flow = self.data(frame.data);
+        self.writer().drain(out);
+        flow
+    }
+
+    fn end(&mut self, out: &mut Vec<Event>) -> Result<(), Error> {
+        let ended = self.ended();
+        self.writer().drain(out);
+        ended
+    }
+}
 
 /// What a provider item becomes when it opens.
 #[derive(Clone, Debug, PartialEq)]
@@ -71,8 +100,8 @@ pub struct End {
     /// The provider's account of a turn that went wrong: a refusal's
     /// explanation, why a reply is incomplete.
     pub message: Option<String>,
-    /// Reply-level provider state.
-    pub meta: Meta,
+    /// The provider's own usage object, kept on the reply's meta.
+    pub raw_usage: Option<Value>,
 }
 
 pub struct Writer {
@@ -96,7 +125,6 @@ pub struct Writer {
     by_index: Option<BTreeMap<u32, usize>>,
     lead: Option<u32>,
     first_incomplete: Option<u32>,
-    unfinished_call: bool,
     states_finish_reason: bool,
     /// Whether a call item holds its id in a slot replay can fill, so a call
     /// sent with no id keeps its item.
@@ -132,6 +160,25 @@ enum Body {
     Media(Media),
 }
 
+impl From<Open> for Body {
+    fn from(open: Open) -> Self {
+        match open {
+            Open::Text => Self::Text(String::new()),
+            Open::Reasoning { redacted } => Self::Reasoning {
+                text: String::new(),
+                redacted,
+            },
+            Open::Call { id, name } => Self::Call {
+                id: Some(id).filter(|id| stated(id)),
+                name,
+                arguments: Arguments::default(),
+            },
+            Open::Opaque { replay } => Self::Opaque { replay },
+            Open::Media(media) => Self::Media(media),
+        }
+    }
+}
+
 #[derive(Default)]
 struct Arguments {
     text: String,
@@ -157,14 +204,14 @@ impl Arguments {
         }
     }
 
-    fn end(&self) -> (Map<String, Value>, Option<String>) {
+    fn end(&mut self) -> (Map<String, Value>, Option<String>) {
         if self.text.is_empty()
-            && let Some(Value::Object(announced)) = &self.announced
+            && let Some(Value::Object(announced)) = self.announced.take()
         {
-            return (announced.clone(), None);
+            return (announced, None);
         }
         let (input, invalid) = crate::json::arguments(&self.text);
-        let invalid = invalid.or_else(|| self.overflowed.then(|| self.text.clone()));
+        let invalid = invalid.or_else(|| self.overflowed.then(|| std::mem::take(&mut self.text)));
         (input, invalid)
     }
 
@@ -174,18 +221,20 @@ impl Arguments {
         if "null".starts_with(self.text.trim()) {
             return None;
         }
-        let fragment = self.text.get(self.streamed..)?;
-        if fragment.is_empty() {
-            return None;
-        }
-        let fragment = fragment.to_owned();
+        let fragment = self
+            .text
+            .get(self.streamed..)
+            .filter(|rest| !rest.is_empty())?
+            .to_owned();
         self.streamed = self.text.len();
         Some(fragment)
     }
 
     /// Whether the text is a complete JSON object.
     fn complete(&self) -> bool {
-        !self.overflowed && matches!(serde_json::from_str(&self.text), Ok(Value::Object(_)))
+        !self.overflowed
+            && self.text.trim_start().starts_with('{')
+            && serde_json::from_str::<serde::de::IgnoredAny>(&self.text).is_ok()
     }
 }
 
@@ -221,7 +270,6 @@ impl Writer {
             by_index: None,
             lead: None,
             first_incomplete: None,
-            unfinished_call: false,
             states_finish_reason: true,
             call_id_slot: false,
             ids: seed(),
@@ -247,24 +295,9 @@ impl Writer {
         out.append(&mut self.out);
     }
 
-    fn emit(&mut self, event: Event) {
-        self.out.push(event);
-    }
-
-    fn next(&mut self) -> u32 {
-        let part = self.next_part;
-        self.next_part += 1;
-        part
-    }
-
     pub fn fresh_index(&mut self) -> usize {
-        let index = self.next_auto;
         self.next_auto += 1;
-        index
-    }
-
-    pub fn is_open(&self, index: usize) -> bool {
-        self.open.contains_key(&index)
+        self.next_auto - 1
     }
 
     /// Order the message's parts by wire index rather than by when they
@@ -294,41 +327,36 @@ impl Writer {
                 "",
             ));
         }
-        let body = match block {
-            Open::Text => Body::Text(String::new()),
-            Open::Reasoning { redacted } => Body::Reasoning {
-                text: String::new(),
-                redacted,
-            },
-            Open::Call { id, name } => Body::Call {
-                id: Some(id).filter(|id| stated(id)),
-                name,
-                arguments: Arguments::default(),
-            },
-            Open::Opaque { replay } => Body::Opaque { replay },
-            Open::Media(media) => Body::Media(media),
-        };
-        self.insert(index, body, item);
+        self.insert(index, block.into(), item);
         self.stream_call(index);
         Ok(())
     }
 
     fn insert(&mut self, index: usize, body: Body, item: Value) {
         self.ended.remove(&index);
-        let part = self.next();
+        let part = self.next_part;
+        self.next_part += 1;
         if let Some(by_index) = &mut self.by_index {
             by_index.insert(part, index);
         }
-        self.open.insert(
-            index,
-            Draft {
-                part,
-                started: false,
-                item,
-                body,
-                restated: false,
-            },
-        );
+        let draft = Draft {
+            part,
+            started: false,
+            item,
+            body,
+            restated: false,
+        };
+        self.open.insert(index, draft);
+    }
+
+    /// A part joins the message and opens to the consumer.
+    fn start(&mut self, part: u32, block: Block, name: Option<SmolStr>) {
+        self.parts.push(part);
+        self.out.push(Event::Start {
+            index: part,
+            block,
+            name,
+        });
     }
 
     /// Append text, reasoning, or a call's argument JSON to the item at
@@ -337,7 +365,7 @@ impl Writer {
         if fragment.is_empty() {
             return Ok(());
         }
-        let draft = self.open.get_mut(&index).ok_or_else(|| not_open(index))?;
+        let draft = self.draft(index)?;
         let block = match &mut draft.body {
             Body::Text(text) => {
                 text.push_str(fragment);
@@ -360,16 +388,10 @@ impl Writer {
             }
         };
         let part = draft.part;
-        if !draft.started {
-            draft.started = true;
-            self.parts.push(part);
-            self.emit(Event::Start {
-                index: part,
-                block,
-                name: None,
-            });
+        if !std::mem::replace(&mut draft.started, true) {
+            self.start(part, block, None);
         }
-        self.emit(Event::Delta {
+        self.out.push(Event::Delta {
             index: part,
             text: fragment.to_owned(),
         });
@@ -384,8 +406,8 @@ impl Writer {
             edit(&mut draft.item);
             return Ok(());
         }
-        let part = *self.ended.get(&index).ok_or_else(|| not_open(index))?;
-        if let Some((item, _)) = self.items.get_mut(&part) {
+        let part = self.ended.get(&index).ok_or_else(|| not_open(index))?;
+        if let Some((item, _)) = self.items.get_mut(part) {
             edit(item);
         }
         Ok(())
@@ -423,21 +445,6 @@ impl Writer {
     /// assembled becomes the part's state.
     pub fn finish(&mut self, index: usize) -> Result<(), Error> {
         self.close_item(index, true)
-    }
-
-    /// Finish every item still open, for a wire whose end of reply states
-    /// its items done.
-    pub fn finish_open(&mut self) -> Result<(), Error> {
-        let mut open: Vec<(u32, usize)> = self
-            .open
-            .iter()
-            .map(|(index, draft)| (draft.part, *index))
-            .collect();
-        open.sort_unstable();
-        for (_, index) in open {
-            self.close_item(index, true)?;
-        }
-        Ok(())
     }
 
     /// Open and finish the item at `index` in one step.
@@ -547,12 +554,10 @@ impl Writer {
     /// else the latest call while its arguments are incomplete, else a new one.
     fn unindexed_call(&mut self, new_id: Option<&str>) -> usize {
         let owner = new_id.and_then(|new| {
-            self.open
-                .iter()
-                .find_map(|(index, draft)| match &draft.body {
-                    Body::Call { id: Some(id), .. } if id == new => Some(*index),
-                    _ => None,
-                })
+            self.open.iter().find_map(|(index, draft)| {
+                matches!(&draft.body, Body::Call { id: Some(id), .. } if id == new)
+                    .then_some(*index)
+            })
         });
         let continues = |last: &usize| {
             self.open.get(last).is_some_and(|draft| {
@@ -588,7 +593,10 @@ impl Writer {
         let index = if let Some(index) = current {
             index
         } else {
-            self.end_run()?;
+            // Output of another kind interleaved the run: it ends.
+            if let Some(index) = self.run.take() {
+                self.close_item(index, true)?;
+            }
             let index = self.fresh_index();
             self.open(index, block, Value::Null)?;
             self.run = Some(index);
@@ -598,45 +606,35 @@ impl Writer {
         Ok(index)
     }
 
-    /// Close the part [`Self::run`] is extending: output of another kind
-    /// interleaved it.
-    pub fn end_run(&mut self) -> Result<(), Error> {
-        match self.run.take() {
-            Some(index) => self.close_item(index, true),
-            None => Ok(()),
-        }
-    }
-
     /// Carry what the open call at `index` has not streamed yet: its start
     /// once it names a tool, then the argument text since the last fragment.
     fn stream_call(&mut self, index: usize) {
-        let Some(draft) = self.open.get_mut(&index) else {
-            return;
-        };
-        let part = draft.part;
-        let Body::Call {
-            name, arguments, ..
-        } = &mut draft.body
+        let Some(Draft {
+            part,
+            started,
+            body: Body::Call {
+                name, arguments, ..
+            },
+            ..
+        }) = self.open.get_mut(&index)
         else {
             return;
         };
-        let mut events = Vec::new();
-        if !draft.started {
+        if !*started {
             if name.is_empty() {
                 return;
             }
-            draft.started = true;
-            self.parts.push(part);
-            events.push(Event::Start {
-                index: part,
+            *started = true;
+            self.parts.push(*part);
+            self.out.push(Event::Start {
+                index: *part,
                 block: Block::ToolCall,
                 name: Some(name.clone()),
             });
         }
         if let Some(text) = arguments.unstreamed() {
-            events.push(Event::Delta { index: part, text });
+            self.out.push(Event::Delta { index: *part, text });
         }
-        self.out.extend(events);
     }
 
     /// The id a closing call takes, and the item it keeps: its own, or a
@@ -665,7 +663,7 @@ impl Writer {
     /// Emit a part the provider stated whole.
     fn whole_part(&mut self, part: u32, whole: AssistantPart) {
         self.parts.push(part);
-        self.emit(Event::Part {
+        self.out.push(Event::Part {
             index: part,
             part: whole,
         });
@@ -677,7 +675,7 @@ impl Writer {
         part: u32,
         id: Option<SmolStr>,
         name: &str,
-        arguments: &Arguments,
+        mut arguments: Arguments,
         item: Value,
     ) {
         if name.is_empty() {
@@ -687,9 +685,9 @@ impl Writer {
         // A call that streamed no text (none arrived, or only a
         // placeholder `null`) states the arguments it ends with.
         if arguments.streamed == 0 {
-            self.emit(Event::Delta {
+            self.out.push(Event::Delta {
                 index: part,
-                text: Value::Object(input.clone()).to_string(),
+                text: serde_json::to_string(&input).unwrap_or_default(),
             });
         }
         let (id, item) = self.distinct_call_id(id, item);
@@ -697,7 +695,7 @@ impl Writer {
             let fp = fingerprint(Canon::Call(name, &input));
             self.items.insert(part, (item, fp));
         }
-        self.emit(Event::End {
+        self.out.push(Event::End {
             index: part,
             redacted: false,
             text: None,
@@ -712,18 +710,17 @@ impl Writer {
 
     fn close_item(&mut self, index: usize, complete: bool) -> Result<(), Error> {
         self.stream_call(index);
-        let draft = self.open.remove(&index).ok_or_else(|| not_open(index))?;
-        if self.run == Some(index) {
-            self.run = None;
-        }
-        self.ended.insert(index, draft.part);
         let Draft {
             part,
             started,
             item,
             body,
             restated,
-        } = draft;
+        } = self.open.remove(&index).ok_or_else(|| not_open(index))?;
+        if self.run == Some(index) {
+            self.run = None;
+        }
+        self.ended.insert(index, part);
         let item = match (complete, &body) {
             (true, _) | (false, Body::Opaque { .. } | Body::Media(_)) => item,
             (false, _) => {
@@ -733,22 +730,18 @@ impl Writer {
             }
         };
         let (block, redacted, text) = match body {
-            Body::Text(text) => {
-                if text.is_empty() && item.is_null() {
-                    return Ok(());
-                }
-                (Block::Text, false, text)
+            Body::Text(text) if text.is_empty() && item.is_null() => return Ok(()),
+            Body::Text(text) => (Block::Text, false, text),
+            Body::Reasoning { text, redacted }
+                if text.is_empty() && !redacted && item.is_null() =>
+            {
+                return Ok(());
             }
-            Body::Reasoning { text, redacted } => {
-                if text.is_empty() && !redacted && item.is_null() {
-                    return Ok(());
-                }
-                (Block::Reasoning, redacted, text)
-            }
+            Body::Reasoning { text, redacted } => (Block::Reasoning, redacted, text),
             Body::Opaque { replay } => {
                 self.opaque.insert(part, replay && complete);
                 self.items.insert(part, (item, String::new()));
-                self.whole_part(part, AssistantPart::Opaque(Opaque { meta: Meta::new() }));
+                self.whole_part(part, AssistantPart::Opaque(Opaque::default()));
                 return Ok(());
             }
             Body::Media(media) => {
@@ -765,7 +758,7 @@ impl Writer {
                 name,
                 arguments,
             } => {
-                self.close_call(part, id, &name, &arguments, item);
+                self.close_call(part, id, &name, arguments, item);
                 return Ok(());
             }
         };
@@ -777,15 +770,10 @@ impl Writer {
             self.items.insert(part, (item, fingerprint(canon)));
         }
         if !started {
-            self.parts.push(part);
-            self.emit(Event::Start {
-                index: part,
-                block,
-                name: None,
-            });
+            self.start(part, block, None);
         }
         // A restatement replaces what streamed.
-        self.emit(Event::End {
+        self.out.push(Event::End {
             index: part,
             redacted,
             text: restated.then_some(text),
@@ -798,35 +786,31 @@ impl Writer {
     /// is attached, and the finish follows. A wire whose end must name a
     /// reason fails a reply that names none, or that ends with a call left
     /// open.
-    pub fn end(&mut self, end: End) -> Result<crate::protocol::Flow, Error> {
+    pub fn end(&mut self, end: End) -> Result<Flow, Error> {
         let mut open: Vec<(u32, usize)> = self
             .open
             .iter()
             .map(|(index, draft)| (draft.part, *index))
             .collect();
         open.sort_unstable();
+        let unfinished_call = self
+            .open
+            .values()
+            .any(|draft| matches!(draft.body, Body::Call { .. }));
         for (_, index) in open {
-            let complete = self.run == Some(index);
-            if matches!(
-                self.open.get(&index).map(|draft| &draft.body),
-                Some(Body::Call { .. })
-            ) {
-                self.unfinished_call = true;
-            }
-            self.close_item(index, complete)?;
+            self.close_item(index, self.run == Some(index))?;
         }
         if self.states_finish_reason {
             match &end.reason {
                 None => {
                     return Err(Error::new(
-                        crate::Kind::Incomplete,
+                        Kind::Incomplete,
                         "the provider ended the reply without a finish reason",
                     ));
                 }
-                Some((Reason::Length, _)) => {}
-                Some(_) if self.unfinished_call => {
+                Some((reason, _)) if *reason != Reason::Length && unfinished_call => {
                     return Err(Error::new(
-                        crate::Kind::Incomplete,
+                        Kind::Incomplete,
                         "the provider ended the reply with a tool call it never finished",
                     ));
                 }
@@ -834,46 +818,53 @@ impl Writer {
             }
         }
         if end.response_id.is_some() || end.model.is_some() {
-            self.emit(Event::Metadata {
+            self.out.push(Event::Metadata {
                 id: end.response_id.filter(|id| !id.is_empty()),
                 model: end.model.filter(|model| !model.is_empty()),
             });
         }
         let canonical_from = self.first_incomplete.unwrap_or(u32::MAX);
-        let items = std::mem::take(&mut self.items);
-        for (part, (item, fp)) in items {
+        for (part, (item, fp)) in std::mem::take(&mut self.items) {
             let replay = self.opaque.get(&part).copied();
             if part >= canonical_from && replay.is_none() {
                 continue;
             }
-            let mut state = json!({ "item": item });
+            let mut state = Map::from_iter([("item".to_owned(), item)]);
             match replay {
-                Some(replay) => state["replay"] = Value::Bool(replay && part < canonical_from),
-                None => state["fp"] = Value::String(fp),
-            }
-            self.emit(Event::Meta {
+                Some(replay) => {
+                    state.insert("replay".into(), (replay && part < canonical_from).into())
+                }
+                None => state.insert("fp".into(), fp.into()),
+            };
+            self.out.push(Event::Meta {
                 index: part,
-                meta: Meta::from([(self.key.to_owned(), state)]),
+                meta: Meta::from([(self.key.to_owned(), state.into())]),
             });
         }
-        let has_call = !self.call_ids.is_empty();
         let (reason, raw) = match end.reason {
-            Some((Reason::Stop, raw)) if has_call => (Reason::ToolCalls, raw),
+            Some((Reason::Stop, raw)) if !self.call_ids.is_empty() => (Reason::ToolCalls, raw),
             Some((reason, raw)) => (reason, raw),
             None => (Reason::Stop, None),
         };
+        let meta = end
+            .raw_usage
+            .filter(Value::is_object)
+            .map_or_default(|usage| {
+                let state = Map::from_iter([("usage".to_owned(), usage)]);
+                Meta::from([(self.key.to_owned(), state.into())])
+            });
         let order = self.order();
-        self.emit(Event::Finish {
+        self.out.push(Event::Finish {
             finish: Finish {
                 reason,
                 raw,
                 message: end.message,
             },
             usage: end.usage,
-            meta: end.meta,
+            meta,
             order,
         });
-        Ok(crate::protocol::Flow::Done)
+        Ok(Flow::Done)
     }
 
     /// The parts' message order, when it is not the order they opened in.
@@ -888,9 +879,7 @@ impl Writer {
         if let Some(lead) = self.lead {
             parts.sort_by_key(|part| *part != lead);
         }
-        let mut natural = self.parts.clone();
-        natural.sort_unstable();
-        (parts != natural).then_some(parts)
+        (!parts.is_sorted()).then_some(parts)
     }
 }
 
@@ -904,10 +893,7 @@ pub fn merge(item: &mut Value, delta: &Map<String, Value>) {
     let Value::Object(item) = item else {
         return;
     };
-    for (key, value) in delta {
-        if key == "type" {
-            continue;
-        }
+    for (key, value) in delta.iter().filter(|(key, _)| *key != "type") {
         match (item.get_mut(key), value) {
             (Some(Value::String(existing)), Value::String(fragment)) => existing.push_str(fragment),
             (Some(Value::Array(existing)), Value::Array(more)) => {

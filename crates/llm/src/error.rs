@@ -26,6 +26,16 @@ pub enum Kind {
     Other,
 }
 
+impl Kind {
+    /// Whether the same request may succeed if sent again.
+    pub const fn is_retryable(self) -> bool {
+        matches!(
+            self,
+            Self::Transport | Self::RateLimit | Self::Server | Self::Incomplete | Self::Other
+        )
+    }
+}
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Error {
     pub kind: Kind,
@@ -68,32 +78,16 @@ impl Error {
         )
     }
 
-    #[must_use]
-    pub fn with_status(mut self, status: u16) -> Self {
-        self.status = Some(status);
-        self
-    }
-
     /// Whether the same request may succeed if sent again.
-    pub fn is_retryable(&self) -> bool {
-        match self.kind {
-            Kind::Transport | Kind::RateLimit | Kind::Server | Kind::Incomplete | Kind::Other => {
-                true
-            }
-            Kind::Auth
-            | Kind::Quota
-            | Kind::ContextOverflow
-            | Kind::InvalidRequest
-            | Kind::ContentFilter
-            | Kind::Decode
-            | Kind::Unsupported => false,
-        }
+    pub const fn is_retryable(&self) -> bool {
+        self.kind.is_retryable()
     }
 
     /// The error a non-success reply means, from its status, headers and
     /// body. Protocols refine the message from their error envelope.
     pub fn from_status(status: u16, headers: &http::HeaderMap, body: &[u8]) -> Self {
         let text = String::from_utf8_lossy(body);
+        let header = |name: &str| headers.get(name)?.to_str().ok();
         let kind = match status {
             401 | 403 => Kind::Auth,
             402 => Kind::Quota,
@@ -106,41 +100,26 @@ impl Error {
             500..=599 => Kind::Server,
             _ => Kind::Other,
         };
-        let mut error = Self::new(
-            kind,
-            message_of(&text).unwrap_or_else(|| format!("HTTP {status}")),
-        );
-        error.status = Some(status);
-        error.retry_after = retry_after(headers);
-        error.body = Some(quote(&text));
-        error.request_id = ["x-request-id", "request-id", "x-goog-request-id"]
-            .iter()
-            .find_map(|name| headers.get(*name)?.to_str().ok())
-            .map(str::to_owned);
-        if let Some(retry) = headers
-            .get("x-should-retry")
-            .and_then(|value| value.to_str().ok())
-        {
-            // The provider's own verdict wins.
-            error.kind = match (retry, error.kind) {
-                ("false", kind) if error.is_retryable() => {
-                    if kind == Kind::RateLimit {
-                        Kind::Quota
-                    } else {
-                        Kind::InvalidRequest
-                    }
-                }
-                ("true", kind) if !error.is_retryable() => {
-                    if kind == Kind::Auth {
-                        kind
-                    } else {
-                        Kind::Server
-                    }
-                }
-                (_, kind) => kind,
-            };
+        // The provider's own verdict wins.
+        let kind = match (header("x-should-retry"), kind) {
+            (Some("false"), Kind::RateLimit) => Kind::Quota,
+            (Some("false"), kind) if kind.is_retryable() => Kind::InvalidRequest,
+            (Some("true"), kind) if !kind.is_retryable() && kind != Kind::Auth => Kind::Server,
+            (_, kind) => kind,
+        };
+        Self {
+            status: Some(status),
+            retry_after: retry_after(headers),
+            body: Some(quote(&text)),
+            request_id: ["x-request-id", "request-id", "x-goog-request-id"]
+                .into_iter()
+                .find_map(header)
+                .map(str::to_owned),
+            ..Self::new(
+                kind,
+                message_of(&text).unwrap_or_else(|| format!("HTTP {status}")),
+            )
         }
-        error
     }
 
     /// An error the provider reported inside a successful reply.

@@ -8,7 +8,7 @@ use llm::{Accumulator, Block, Event, Message, Provider, Request, Response};
 
 pub struct Model {
     provider: Provider,
-    id: String,
+    id: llm::SmolStr,
     http: llm::Ureq,
 }
 
@@ -35,7 +35,7 @@ impl Model {
         on_text: &mut dyn FnMut(&str),
     ) -> Result<Response, llm::Error> {
         let request = Request {
-            model: self.id.as_str().into(),
+            model: self.id.clone(),
             messages,
             ..Request::default()
         };
@@ -58,7 +58,7 @@ impl Model {
                     }
                     _ => {}
                 }
-                acc.push(&event)?;
+                acc.push(event)?;
             }
             acc.finish(Some(llm::origin(&self.provider, &self.id)))
         })

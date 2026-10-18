@@ -461,6 +461,6 @@ pub(crate) fn body(
         body.insert("toolConfig".into(), tool_config(&request.tool_choice));
     }
     let mut body = Value::Object(body);
-    crate::protocol::merge(&mut body, &options);
+    crate::json::overlay(&mut body, &options);
     Ok(body)
 }

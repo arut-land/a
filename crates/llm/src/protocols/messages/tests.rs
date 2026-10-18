@@ -105,7 +105,7 @@ fn decode_on(provider: &Provider, model: &str, frames: &[Value]) -> Result<Respo
             &mut events,
         );
         for event in events.drain(..) {
-            acc.push(&event)?;
+            acc.push(event)?;
         }
         if flow? == crate::Flow::Done {
             done = true;
@@ -115,7 +115,7 @@ fn decode_on(provider: &Provider, model: &str, frames: &[Value]) -> Result<Respo
     if !done {
         let ended = decoder.end(&mut events);
         for event in events.drain(..) {
-            acc.push(&event)?;
+            acc.push(event)?;
         }
         ended?;
     }

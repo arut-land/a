@@ -13,9 +13,9 @@ use super::merge::{REASONING_DETAILS, merge_details, merge_fields};
 use super::{KEY, Quirks};
 use crate::error::Error;
 use crate::json::Lenient;
-use crate::protocol::{Decoder, Flow, Frame};
-use crate::spec::{Event, Media, Reason, SmolStr, Source, Usage};
-use crate::writer::{AUTO_INDEX, CallFragment, End, Open, Writer};
+use crate::protocol::Flow;
+use crate::spec::{Media, Reason, SmolStr, Source, Usage};
+use crate::writer::{AUTO_INDEX, CallFragment, End, Open, Writer, Writes};
 
 /// The finish reasons every host shares: `OpenAI`'s, the legacy
 /// `function_call`, and the spellings compatible servers use for the same
@@ -611,7 +611,7 @@ impl ChatDecoder {
             reason: self.finish.take().map(|(reason, raw)| (reason, Some(raw))),
             response_id: self.response_id.take(),
             model: self.response_model.take(),
-            meta: super::super::usage_meta(KEY, self.usage.as_ref()),
+            raw_usage: self.usage.take(),
             ..End::default()
         })
     }
@@ -684,19 +684,19 @@ impl ChatDecoder {
     }
 }
 
-impl Decoder for ChatDecoder {
-    fn frame(&mut self, frame: Frame<'_>, out: &mut Vec<Event>) -> Result<Flow, Error> {
-        let flow = self.decode(frame.data);
-        self.w.drain(out);
-        flow
+impl Writes for ChatDecoder {
+    fn writer(&mut self) -> &mut Writer {
+        &mut self.w
+    }
+
+    fn data(&mut self, data: &str) -> Result<Flow, Error> {
+        self.decode(data)
     }
 
     /// A stream that stops after a finish reason without `[DONE]` still
     /// ended: some hosts (Perplexity) never send the sentinel.
-    fn end(&mut self, out: &mut Vec<Event>) -> Result<(), Error> {
-        let ended = self.finish().map(drop);
-        self.w.drain(out);
-        ended
+    fn ended(&mut self) -> Result<(), Error> {
+        self.finish().map(drop)
     }
 }
 

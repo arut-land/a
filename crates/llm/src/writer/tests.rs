@@ -28,7 +28,7 @@ fn run(
     let mut acc = Accumulator::new();
     let outcome = written.and_then(|()| {
         for event in &events {
-            acc.push(event)?;
+            acc.push(event.clone())?;
         }
         acc.finish(None)
     });
@@ -222,7 +222,7 @@ fn a_wire_reply_that_names_no_finish_reason_failed() {
     let (_, outcome) = run(Writer::new("test"), End::default(), |w| {
         w.whole(0, Open::Text, json!({"type": "text"}), "hi")
     });
-    assert_eq!(outcome.unwrap_err().kind, crate::Kind::Incomplete);
+    assert_eq!(outcome.unwrap_err().kind, Kind::Incomplete);
 }
 
 #[test]

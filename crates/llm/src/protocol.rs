@@ -9,7 +9,7 @@ use std::sync::Arc;
 
 use serde_json::Value;
 
-use crate::error::Error;
+use crate::error::{Error, Kind};
 use crate::spec::{Event, Request, SmolStr};
 
 pub trait Protocol: Send + Sync + 'static {
@@ -37,6 +37,16 @@ pub trait Protocol: Send + Sync + 'static {
     }
 }
 
+/// A protocol with known hosts, each with the quirks it speaks it with.
+pub trait Hosted: Protocol + Sized {
+    type Quirks: Copy + 'static;
+
+    const KEY: &'static str;
+    const HOSTS: &'static [(Host, Self::Quirks)];
+
+    fn with(quirks: Self::Quirks) -> Self;
+}
+
 /// Who a request goes to.
 pub struct Target<'a> {
     pub provider: &'a Provider,
@@ -57,6 +67,16 @@ pub struct Encoded {
 pub enum Framing {
     Sse,
     Ndjson,
+}
+
+impl Framing {
+    /// The media type a request asks for.
+    pub const fn accept(self) -> &'static str {
+        match self {
+            Self::Sse => "text/event-stream",
+            Self::Ndjson => "application/x-ndjson",
+        }
+    }
 }
 
 /// One frame of a reply: an SSE event, or one NDJSON line (`event` empty).
@@ -141,19 +161,19 @@ impl Provider {
     ) -> Self {
         Self {
             id: id.into(),
-            base_url: base_url.into().trim_end_matches('/').to_owned(),
+            base_url: String::new(),
             auth,
             headers: Vec::new(),
             protocol: Arc::new(protocol),
         }
+        .with_base_url(base_url)
     }
 
     #[must_use]
     pub fn with_base_url(mut self, base_url: impl Into<String>) -> Self {
-        base_url
-            .into()
-            .trim_end_matches('/')
-            .clone_into(&mut self.base_url);
+        let mut base_url = base_url.into();
+        base_url.truncate(base_url.trim_end_matches('/').len());
+        self.base_url = base_url;
         self
     }
 
@@ -175,18 +195,12 @@ impl Provider {
         };
         let mut encoded = self.protocol.encode(&target, request)?;
         if let Some(overlay) = &request.body {
-            merge(&mut encoded.body, overlay);
+            crate::json::overlay(&mut encoded.body, overlay);
         }
         let mut uri = format!("{}{}", self.base_url, encoded.path);
         let mut builder = http::Request::post(&uri)
             .header(http::header::CONTENT_TYPE, "application/json")
-            .header(
-                http::header::ACCEPT,
-                match encoded.framing {
-                    Framing::Sse => "text/event-stream",
-                    Framing::Ndjson => "application/x-ndjson",
-                },
-            );
+            .header(http::header::ACCEPT, encoded.framing.accept());
         match &self.auth {
             Auth::None => {}
             Auth::Bearer(key) => {
@@ -197,10 +211,8 @@ impl Provider {
             }
             Auth::Header { name, key } => builder = builder.header(*name, key.expose()),
             Auth::Query { name, key } => {
-                uri.push(if uri.contains('?') { '&' } else { '?' });
-                uri.push_str(name);
-                uri.push('=');
-                uri.push_str(key.expose());
+                let separator = if uri.contains('?') { '&' } else { '?' };
+                uri = format!("{uri}{separator}{name}={}", key.expose());
                 builder = builder.uri(&uri);
             }
         }
@@ -216,26 +228,6 @@ impl Provider {
             .body(bytes::Bytes::from(body))
             .map_err(|error| Error::unsupported(format!("invalid request: {error}")))?;
         Ok((request, encoded.framing))
-    }
-}
-
-/// `overlay` deep-merged into `body`: objects merge key by key, anything
-/// else replaces, and `null` removes.
-pub fn merge(body: &mut Value, overlay: &serde_json::Map<String, Value>) {
-    let Value::Object(map) = body else {
-        *body = Value::Object(overlay.clone());
-        return;
-    };
-    for (key, value) in overlay {
-        match (map.get_mut(key), value) {
-            (_, Value::Null) => {
-                map.remove(key);
-            }
-            (Some(existing @ Value::Object(_)), Value::Object(inner)) => merge(existing, inner),
-            _ => {
-                map.insert(key.clone(), value.clone());
-            }
-        }
     }
 }
 
@@ -255,6 +247,17 @@ pub enum KeyStyle {
     Query(&'static str),
 }
 
+impl KeyStyle {
+    /// The authentication `key` goes as.
+    pub fn auth(self, key: Secret) -> Auth {
+        match self {
+            Self::Bearer => Auth::Bearer(key),
+            Self::Header(name) => Auth::Header { name, key },
+            Self::Query(name) => Auth::Query { name, key },
+        }
+    }
+}
+
 /// Where a host is and how it authenticates: the data a provider is built
 /// from, with the protocol (and its quirks) that speaks to it.
 #[derive(Clone, Copy, Debug)]
@@ -271,33 +274,41 @@ pub struct Host {
 }
 
 impl Host {
+    /// A host taking a bearer key, at a base URL no variable overrides.
+    pub const fn bearer(
+        id: &'static str,
+        base_url: &'static str,
+        key_env: &'static [&'static str],
+    ) -> Self {
+        Self {
+            id,
+            base_url,
+            key_env,
+            base_url_env: &[],
+            key: KeyStyle::Bearer,
+            keyless: false,
+        }
+    }
+
     /// The provider for this host, `protocol` speaking to it, configured
     /// from the environment.
     pub fn provider(&self, protocol: impl Protocol) -> Result<Provider, Error> {
-        let key = self.key_env.iter().find_map(|name| env(name));
-        let auth = match (key, self.key) {
-            (Some(key), KeyStyle::Bearer) => Auth::Bearer(Secret::new(key)),
-            (Some(key), KeyStyle::Header(name)) => Auth::Header {
-                name,
-                key: Secret::new(key),
-            },
-            (Some(key), KeyStyle::Query(name)) => Auth::Query {
-                name,
-                key: Secret::new(key),
-            },
-            (None, _) if self.keyless => Auth::None,
-            (None, _) => {
+        let auth = match self.key_env.iter().find_map(|name| env(name)) {
+            Some(key) => self.key.auth(Secret(key)),
+            None if self.keyless => Auth::None,
+            None => {
                 return Err(Error::new(
-                    crate::Kind::Auth,
+                    Kind::Auth,
                     format!("{} needs a key: set {}", self.id, self.key_env.join(" or ")),
                 ));
             }
         };
-        let base_url = self
-            .base_url_env
-            .iter()
-            .find_map(|name| env(name))
-            .unwrap_or_else(|| self.base_url.to_owned());
-        Ok(Provider::new(self.id, base_url, auth, protocol))
+        let base_url = self.base_url_env.iter().find_map(|name| env(name));
+        Ok(Provider::new(
+            self.id,
+            base_url.as_deref().unwrap_or(self.base_url),
+            auth,
+            protocol,
+        ))
     }
 }

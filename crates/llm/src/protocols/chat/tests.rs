@@ -120,7 +120,7 @@ pub(super) fn stream(
     let reply = ended.and_then(|()| {
         let mut acc = Accumulator::new();
         for event in &events {
-            acc.push(event)?;
+            acc.push(event.clone())?;
         }
         acc.finish(Some(crate::origin(provider, model)))
     });

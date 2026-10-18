@@ -42,21 +42,46 @@ impl<'a> Canon<'a> {
     }
 }
 
+/// FNV-1a, fed as a writer.
+struct Fnv(u64);
+
+impl Fnv {
+    fn eat(&mut self, parts: &[&[u8]]) {
+        for byte in parts.iter().copied().flatten() {
+            self.0 = (self.0 ^ u64::from(*byte)).wrapping_mul(0x0100_0000_01b3);
+        }
+    }
+}
+
+impl std::io::Write for Fnv {
+    fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+        self.eat(&[bytes]);
+        Ok(bytes.len())
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
+}
+
 /// A stable digest of `canon` (FNV-1a over a fixed projection), so a field
 /// added to a part's type never stales stored items.
 pub fn fingerprint(canon: Canon<'_>) -> String {
-    let projection = match canon {
-        Canon::Text(text) => format!("t\0{text}"),
-        Canon::Reasoning(text, redacted) => format!("r\0{redacted}\0{text}"),
-        Canon::Call(name, input) => format!("c\0{name}\0{}", Value::Object(input.clone())),
+    let mut hash = Fnv(0xcbf2_9ce4_8422_2325);
+    match canon {
+        Canon::Text(text) => hash.eat(&[b"t\0", text.as_bytes()]),
+        Canon::Reasoning(text, redacted) => {
+            let redacted = if redacted { "true" } else { "false" };
+            hash.eat(&[b"r\0", redacted.as_bytes(), b"\0", text.as_bytes()]);
+        }
+        Canon::Call(name, input) => {
+            hash.eat(&[b"c\0", name.as_bytes(), b"\0"]);
+            // Writing to a hash cannot fail.
+            let _ = serde_json::to_writer(&mut hash, input);
+        }
         Canon::Other => return String::new(),
-    };
-    let mut hash: u64 = 0xcbf2_9ce4_8422_2325;
-    for byte in projection.bytes() {
-        hash ^= u64::from(byte);
-        hash = hash.wrapping_mul(0x0100_0000_01b3);
     }
-    format!("{hash:016x}")
+    format!("{:016x}", hash.0)
 }
 
 /// What to send for `part` under protocol `key`. `identity` picks the keys
@@ -94,4 +119,20 @@ pub fn replays(part: &AssistantPart, key: &str) -> bool {
         .and_then(|state| state.get("replay"))
         .and_then(Value::as_bool)
         .unwrap_or(false)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Fingerprints are stored in session logs: they never change.
+    #[test]
+    fn fingerprints_are_stable() {
+        let input = serde_json::json!({"b": [true, null], "a": 1});
+        let input = input.as_object().unwrap();
+        assert_eq!(fingerprint(Canon::Text("hi")), "cad93eee6ddd9cfe");
+        assert_eq!(fingerprint(Canon::Reasoning("x", true)), "fddb7adfc2dd3d73");
+        assert_eq!(fingerprint(Canon::Call("f", input)), "0f90db0a3e870785");
+        assert_eq!(fingerprint(Canon::Other), "");
+    }
 }

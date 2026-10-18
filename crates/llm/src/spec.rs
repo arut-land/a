@@ -185,8 +185,15 @@ pub struct System {
 }
 
 impl System {
+    /// The text, its parts joined by newlines.
     pub fn text(&self) -> String {
-        join(self.content.iter().map(|text| text.text.as_str()))
+        let mut texts = self.content.iter().map(|text| text.text.as_str());
+        let mut joined = texts.next().unwrap_or_default().to_owned();
+        for text in texts {
+            joined.push('\n');
+            joined.push_str(text);
+        }
+        joined
     }
 }
 
@@ -371,20 +378,6 @@ impl Default for Output {
     }
 }
 
-impl Output {
-    /// The output as one string, for wires that take only text.
-    pub fn to_text(&self) -> String {
-        match self {
-            Self::Text(text) => text.clone(),
-            Self::Json(value) => value.to_string(),
-            Self::Content(parts) => join(parts.iter().filter_map(|part| match part {
-                UserPart::Text(text) => Some(text.text.as_str()),
-                UserPart::Media(_) => None,
-            })),
-        }
-    }
-}
-
 #[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
 pub struct Opaque {
     #[serde(default, skip_serializing_if = "Meta::is_empty")]
@@ -397,10 +390,6 @@ pub struct Origin {
     pub protocol: SmolStr,
     pub provider: SmolStr,
     pub model: SmolStr,
-}
-
-fn join<'a>(texts: impl Iterator<Item = &'a str>) -> String {
-    texts.collect::<Vec<_>>().join("\n")
 }
 
 /// Token counts, as the provider reported them; a count it left out is

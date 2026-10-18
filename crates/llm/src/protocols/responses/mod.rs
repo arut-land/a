@@ -5,7 +5,7 @@ mod decode;
 mod encode;
 
 use crate::error::Error;
-use crate::protocol::{Decoder, Encoded, Framing, Host, KeyStyle, Protocol, Target};
+use crate::protocol::{Decoder, Encoded, Framing, Host, Hosted, Protocol, Target};
 use crate::spec::Request;
 
 /// Where this protocol's options and part state go.
@@ -59,6 +59,17 @@ impl Responses {
     }
 }
 
+impl Hosted for Responses {
+    type Quirks = Quirks;
+
+    const KEY: &'static str = KEY;
+    const HOSTS: &'static [(Host, Quirks)] = HOSTS;
+
+    fn with(quirks: Quirks) -> Self {
+        Self::new(quirks)
+    }
+}
+
 impl Protocol for Responses {
     fn key(&self) -> &'static str {
         KEY
@@ -88,30 +99,19 @@ impl Protocol for Responses {
     }
 }
 
-const fn host(id: &'static str, base_url: &'static str, key_env: &'static [&'static str]) -> Host {
-    Host {
-        id,
-        base_url,
-        key_env,
-        base_url_env: &[],
-        key: KeyStyle::Bearer,
-        keyless: false,
-    }
-}
-
 /// The hosts that serve the Responses API, with their quirks.
 pub const HOSTS: &[(Host, Quirks)] = &[
     (
         Host {
             base_url_env: &["OPENAI_BASE_URL"],
-            ..host("openai", "https://api.openai.com/v1", &["OPENAI_API_KEY"])
+            ..Host::bearer("openai", "https://api.openai.com/v1", &["OPENAI_API_KEY"])
         },
         Quirks::OPENAI,
     ),
     (
         Host {
             base_url_env: &["OPENROUTER_BASE_URL"],
-            ..host(
+            ..Host::bearer(
                 "openrouter",
                 "https://openrouter.ai/api/v1",
                 &["OPENROUTER_API_KEY"],
@@ -125,7 +125,7 @@ pub const HOSTS: &[(Host, Quirks)] = &[
     (
         Host {
             base_url_env: &["XAI_BASE_URL"],
-            ..host("xai", "https://api.x.ai", &["XAI_API_KEY"])
+            ..Host::bearer("xai", "https://api.x.ai", &["XAI_API_KEY"])
         },
         Quirks {
             path: "/v1/responses",
