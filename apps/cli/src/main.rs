@@ -41,6 +41,12 @@ enum Cmd {
         /// Printed in the `A-BRIDGE` line that marks the start of the stream
         token: Option<String>,
     },
+    /// Serve the web UI and open the browser
+    Web {
+        /// Only print the link; do not open a browser
+        #[usage(long)]
+        no_open: bool,
+    },
     /// Inspect or control the background daemon
     Daemon {
         #[usage(subcommand)]
@@ -77,6 +83,7 @@ fn main() -> ExitCode {
             let token = token.as_deref().unwrap_or(&ctx.staged.id);
             client::bridge(&ctx.home, token)
         }
+        Some(Cmd::Web { no_open }) => web(ctx, !no_open),
         Some(Cmd::Daemon { action }) => daemon_cmd(&ctx, &action),
         Some(Cmd::Serve { listen_fd }) => daemon(&ctx, listen_fd),
     });
@@ -526,6 +533,20 @@ fn new(ctx: &Ctx) -> io::Result<()> {
     })?;
     println!("{}", session.short());
     conn.writer.send(&ClientMsg::Detach)
+}
+
+#[cfg(all(unix, feature = "web"))]
+fn web(ctx: Ctx, open: bool) -> io::Result<()> {
+    let daemon = web::Daemon {
+        endpoint: ctx.endpoint,
+        staged: ctx.staged,
+    };
+    web::run(daemon, open)
+}
+
+#[cfg(not(all(unix, feature = "web")))]
+fn web(_ctx: Ctx, _open: bool) -> io::Result<()> {
+    Err(io::Error::other("this build of a has no web UI"))
 }
 
 #[cfg(unix)]

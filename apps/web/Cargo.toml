@@ -1,0 +1,22 @@
+[package]
+name = "web"
+version.workspace = true
+edition.workspace = true
+publish.workspace = true
+
+[dependencies]
+client.workspace = true
+protocol.workspace = true
+rt.workspace = true
+sys.workspace = true
+http.workspace = true
+serde_json.workspace = true
+uuid = { workspace = true, features = ["v4"] }
+httparse = { version = "1", default-features = false, features = ["std"] }
+http-body-util = "0.1"
+# The render core only: our own server hosts it, so no `serve` (hyper and a
+# tokio runtime) and no WebSocket push.
+topcoat = { version = "=0.10.0", default-features = false, features = ["router", "view", "runtime", "asset"] }
+
+[lints]
+workspace = true

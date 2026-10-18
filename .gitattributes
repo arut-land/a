@@ -6,3 +6,4 @@ docs/** linguist-documentation=true
 apps/cli/a.usage.kdl linguist-generated=true
 fixtures/rig/cassettes/** linguist-vendored=true
 fixtures/rig/expected/** linguist-generated=true
+apps/web/assets/** linguist-vendored=true -diff
