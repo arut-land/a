@@ -1,0 +1,58 @@
+[
+  {
+    "exchange": 0,
+    "result": {
+      "parts": [
+        {
+          "type": "reasoning",
+          "text": "The user wants me to add 17 and 25 using the `add` tool and then reply with just the resulting number.\n\n1.  **Identify the tool**: `add`\n2.  **Identify the arguments**: `x = 17`, `y = 25`\n3.  **Execute the tool**: Call `add(x=17, y=25)`.\n4.  **Process the result**: The tool should return 42.\n5.  **Format the output**: The user requested \"just the number\".\n\nPlan:\n- Call `add(17, 25)`.\n- Return the result.\n\nLet's do it.\n",
+          "redacted": false
+        },
+        {
+          "type": "tool_call",
+          "id": "chatcmpl-tool-b888298fe6521bfb",
+          "name": "add",
+          "input": {
+            "x": 17,
+            "y": 25
+          },
+          "invalid": null
+        }
+      ],
+      "finish": "ToolCalls",
+      "refusal": null,
+      "usage": {
+        "input": 1308,
+        "output": 191,
+        "cache_read": 0,
+        "cache_write": null,
+        "reasoning": null
+      }
+    }
+  },
+  {
+    "exchange": 1,
+    "result": {
+      "parts": [
+        {
+          "type": "reasoning",
+          "text": "The user asked to add 17 and 25 using the tool and reply with just the number.\nThe tool returned 42.\nI will reply with \"42\".\n",
+          "redacted": false
+        },
+        {
+          "type": "text",
+          "text": "\n\n42"
+        }
+      ],
+      "finish": "Stop",
+      "refusal": null,
+      "usage": {
+        "input": 1516,
+        "output": 45,
+        "cache_read": 0,
+        "cache_write": null,
+        "reasoning": null
+      }
+    }
+  }
+]

@@ -1,0 +1,51 @@
+[
+  {
+    "exchange": 0,
+    "result": {
+      "parts": [
+        {
+          "type": "text",
+          "text": "Okay, the user is asking for the current weather in Tokyo. I need to use the get_weather tool provided. Let me check the function signature. The function requires a city name as a parameter. The city here is Tokyo.\n\nSo I should call get_weather with city set to \"Tokyo\". The response should be a JSON object with the function name and arguments. The arguments need to be a JSON object where the key is \"city\" and the value is \"Tokyo\".\n\nWait, the function's parameters are defined as having a city which is a string. The description says \"City name to get weather for\". So yes, I need to pass \"Tokyo\" as the city parameter.\n\nLet me make sure there's no typo in the city name. The user said Tokyo, which is correct.\n\nSo the tool call would be:\n\n{\n  \"name\": \"get_weather\",\n  \"arguments\": {\n    \"city\": \"Tokyo\"\n  }\n}\n\nYes, that seems right. I don't need to do anything else since the user just wants the tool call. The next step would be to get the response from the tool and then return the city name and a one-sentence summary. But for now, the task is to generate the tool call. So this is the correct JSON in the tool_call tags.\n</think>\n\n"
+        },
+        {
+          "type": "tool_call",
+          "id": "call_7bvcwd02",
+          "name": "get_weather",
+          "input": {
+            "city": "Tokyo"
+          },
+          "invalid": null
+        }
+      ],
+      "finish": "ToolCalls",
+      "refusal": null,
+      "usage": {
+        "input": 195,
+        "output": 291,
+        "cache_read": null,
+        "cache_write": null,
+        "reasoning": null
+      }
+    }
+  },
+  {
+    "exchange": 1,
+    "result": {
+      "parts": [
+        {
+          "type": "text",
+          "text": "{\n  \"city\": \"Tokyo\",\n  \"summary\": \"Sunny with light clouds, 72F (22C), humidity 45%, wind 8 mph NW\"\n}\n"
+        }
+      ],
+      "finish": "Stop",
+      "refusal": null,
+      "usage": {
+        "input": 526,
+        "output": 42,
+        "cache_read": null,
+        "cache_write": null,
+        "reasoning": null
+      }
+    }
+  }
+]

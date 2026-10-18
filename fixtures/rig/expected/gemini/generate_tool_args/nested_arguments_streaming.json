@@ -1,0 +1,38 @@
+[
+  {
+    "exchange": 0,
+    "result": {
+      "parts": [
+        {
+          "type": "tool_call",
+          "id": "941cde42-9382-4297-8f53-3e1c10be06b7",
+          "name": "plan_trip",
+          "input": {
+            "itinerary": {
+              "activities": [
+                "temples",
+                "tea ceremony"
+              ],
+              "city": "Kyoto",
+              "days": 3,
+              "lodging": {
+                "name": "Sakura Inn",
+                "rooms": 2
+              }
+            }
+          },
+          "invalid": null
+        }
+      ],
+      "finish": "ToolCalls",
+      "refusal": null,
+      "usage": {
+        "input": 301,
+        "output": 190,
+        "cache_read": null,
+        "cache_write": null,
+        "reasoning": 134
+      }
+    }
+  }
+]

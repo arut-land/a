@@ -1,0 +1,48 @@
+[
+  {
+    "exchange": 0,
+    "result": {
+      "parts": [
+        {
+          "type": "tool_call",
+          "id": "bb48cd8f-2437-484e-afeb-7b391c1f71ba",
+          "name": "add",
+          "input": {
+            "x": 21,
+            "y": 21
+          },
+          "invalid": null
+        }
+      ],
+      "finish": "ToolCalls",
+      "refusal": null,
+      "usage": {
+        "input": 109,
+        "output": 62,
+        "cache_read": null,
+        "cache_write": null,
+        "reasoning": 42
+      }
+    }
+  },
+  {
+    "exchange": 1,
+    "result": {
+      "parts": [
+        {
+          "type": "text",
+          "text": "The add tool is disabled for this request."
+        }
+      ],
+      "finish": "Stop",
+      "refusal": null,
+      "usage": {
+        "input": 150,
+        "output": 64,
+        "cache_read": null,
+        "cache_write": null,
+        "reasoning": 55
+      }
+    }
+  }
+]

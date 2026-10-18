@@ -1,0 +1,266 @@
+[
+  {
+    "exchange": 0,
+    "result": {
+      "parts": [
+        {
+          "type": "tool_call",
+          "id": "5b3fb2f3-08a8-4349-83a0-65fffe0538af",
+          "name": "list_files",
+          "input": {},
+          "invalid": null
+        }
+      ],
+      "finish": "ToolCalls",
+      "refusal": null,
+      "usage": {
+        "input": 465,
+        "output": 136,
+        "cache_read": null,
+        "cache_write": null,
+        "reasoning": 126
+      }
+    }
+  },
+  {
+    "exchange": 1,
+    "result": {
+      "parts": [
+        {
+          "type": "tool_call",
+          "id": "d7e5a6ec-6f66-4e80-b11d-88518d185b7e",
+          "name": "read_file",
+          "input": {
+            "path": "README.md"
+          },
+          "invalid": null
+        }
+      ],
+      "finish": "ToolCalls",
+      "refusal": null,
+      "usage": {
+        "input": 644,
+        "output": 37,
+        "cache_read": null,
+        "cache_write": null,
+        "reasoning": 20
+      }
+    }
+  },
+  {
+    "exchange": 2,
+    "result": {
+      "parts": [
+        {
+          "type": "tool_call",
+          "id": "8b8fa562-4657-4932-acab-1ce21f6a642f",
+          "name": "read_file",
+          "input": {
+            "path": "tests/basic.rs"
+          },
+          "invalid": null
+        }
+      ],
+      "finish": "ToolCalls",
+      "refusal": null,
+      "usage": {
+        "input": 770,
+        "output": 38,
+        "cache_read": 647,
+        "cache_write": null,
+        "reasoning": 19
+      }
+    }
+  },
+  {
+    "exchange": 3,
+    "result": {
+      "parts": [
+        {
+          "type": "tool_call",
+          "id": "fee824e8-7726-4ee8-a56c-267340a14071",
+          "name": "read_file",
+          "input": {
+            "path": "src/lib.rs"
+          },
+          "invalid": null
+        }
+      ],
+      "finish": "ToolCalls",
+      "refusal": null,
+      "usage": {
+        "input": 926,
+        "output": 38,
+        "cache_read": null,
+        "cache_write": null,
+        "reasoning": 19
+      }
+    }
+  },
+  {
+    "exchange": 4,
+    "result": {
+      "parts": [
+        {
+          "type": "tool_call",
+          "id": "c363537c-f71a-4980-af7d-78e326cc8e8d",
+          "name": "run_tests",
+          "input": {},
+          "invalid": null
+        }
+      ],
+      "finish": "ToolCalls",
+      "refusal": null,
+      "usage": {
+        "input": 1023,
+        "output": 27,
+        "cache_read": 697,
+        "cache_write": null,
+        "reasoning": 17
+      }
+    }
+  },
+  {
+    "exchange": 5,
+    "result": {
+      "parts": [
+        {
+          "type": "tool_call",
+          "id": "05af5cc1-d9c6-4030-a4ce-b1c240877670",
+          "name": "write_file",
+          "input": {
+            "content": "pub mod calendar;\n\n/// The number of days in a common (non-leap) year.\npub fn days_in_year() -> u32 {\n    365\n}\n",
+            "path": "src/lib.rs"
+          },
+          "invalid": null
+        }
+      ],
+      "finish": "ToolCalls",
+      "refusal": null,
+      "usage": {
+        "input": 1243,
+        "output": 195,
+        "cache_read": null,
+        "cache_write": null,
+        "reasoning": 127
+      }
+    }
+  },
+  {
+    "exchange": 6,
+    "result": {
+      "parts": [
+        {
+          "type": "tool_call",
+          "id": "d700b265-1fdd-404f-ae89-c4cc998c32f2",
+          "name": "run_tests",
+          "input": {},
+          "invalid": null
+        }
+      ],
+      "finish": "ToolCalls",
+      "refusal": null,
+      "usage": {
+        "input": 1464,
+        "output": 35,
+        "cache_read": null,
+        "cache_write": null,
+        "reasoning": 25
+      }
+    }
+  },
+  {
+    "exchange": 7,
+    "result": {
+      "parts": [
+        {
+          "type": "tool_call",
+          "id": "ebb70efa-8106-49af-85de-0f336f5eb178",
+          "name": "read_file",
+          "input": {
+            "path": "src/calendar.rs"
+          },
+          "invalid": null
+        }
+      ],
+      "finish": "ToolCalls",
+      "refusal": null,
+      "usage": {
+        "input": 1695,
+        "output": 167,
+        "cache_read": 781,
+        "cache_write": null,
+        "reasoning": 148
+      }
+    }
+  },
+  {
+    "exchange": 8,
+    "result": {
+      "parts": [
+        {
+          "type": "tool_call",
+          "id": "06f82411-09ef-4ad2-b73c-733409fd3426",
+          "name": "write_file",
+          "input": {
+            "content": "/// The number of days in a week.\npub fn days_in_week() -> u32 {\n    7\n}\n",
+            "path": "src/calendar.rs"
+          },
+          "invalid": null
+        }
+      ],
+      "finish": "ToolCalls",
+      "refusal": null,
+      "usage": {
+        "input": 1906,
+        "output": 90,
+        "cache_read": null,
+        "cache_write": null,
+        "reasoning": 37
+      }
+    }
+  },
+  {
+    "exchange": 9,
+    "result": {
+      "parts": [
+        {
+          "type": "tool_call",
+          "id": "420248b5-70cf-41f0-b462-3ae89a5a5e7c",
+          "name": "run_tests",
+          "input": {},
+          "invalid": null
+        }
+      ],
+      "finish": "ToolCalls",
+      "refusal": null,
+      "usage": {
+        "input": 2021,
+        "output": 35,
+        "cache_read": null,
+        "cache_write": null,
+        "reasoning": 25
+      }
+    }
+  },
+  {
+    "exchange": 10,
+    "result": {
+      "parts": [
+        {
+          "type": "text",
+          "text": "done"
+        }
+      ],
+      "finish": "Stop",
+      "refusal": null,
+      "usage": {
+        "input": 2135,
+        "output": 13,
+        "cache_read": null,
+        "cache_write": null,
+        "reasoning": 12
+      }
+    }
+  }
+]

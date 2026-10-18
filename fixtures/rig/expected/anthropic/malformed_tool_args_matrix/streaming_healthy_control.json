@@ -1,0 +1,48 @@
+[
+  {
+    "exchange": 0,
+    "result": {
+      "parts": [
+        {
+          "type": "tool_call",
+          "id": "toolu_01THeasJXTze6KDiNX81LypS",
+          "name": "subtract",
+          "input": {
+            "x": 2,
+            "y": 5
+          },
+          "invalid": null
+        }
+      ],
+      "finish": "ToolCalls",
+      "refusal": null,
+      "usage": {
+        "input": 703,
+        "output": 69,
+        "cache_read": 0,
+        "cache_write": 0,
+        "reasoning": null
+      }
+    }
+  },
+  {
+    "exchange": 1,
+    "result": {
+      "parts": [
+        {
+          "type": "text",
+          "text": "The result of 2 - 5 is **-3**."
+        }
+      ],
+      "finish": "Stop",
+      "refusal": null,
+      "usage": {
+        "input": 786,
+        "output": 18,
+        "cache_read": 0,
+        "cache_write": 0,
+        "reasoning": null
+      }
+    }
+  }
+]

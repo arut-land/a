@@ -1,0 +1,27 @@
+[
+  {
+    "exchange": 0,
+    "result": {
+      "parts": [
+        {
+          "type": "reasoning",
+          "text": "**Calculating multiples of six**\n\nI need to calculate how many multiples of 6 are below 400. So, I’ll take the floor of 399 divided by 6, which gives me 66. Then, for numbers that are divisible by both 6 and 9, I'll find the least common multiple, which is 18. Checking how many multiples of 18 are below 400, I find that it's 22. Finally, the difference is 66 minus 22, which is 44.",
+          "redacted": false
+        },
+        {
+          "type": "text",
+          "text": "44"
+        }
+      ],
+      "finish": "Stop",
+      "refusal": null,
+      "usage": {
+        "input": 51,
+        "output": 53,
+        "cache_read": 0,
+        "cache_write": 0,
+        "reasoning": 46
+      }
+    }
+  }
+]

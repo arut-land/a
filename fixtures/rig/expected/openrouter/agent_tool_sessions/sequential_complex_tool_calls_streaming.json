@@ -1,0 +1,141 @@
+[
+  {
+    "exchange": 0,
+    "result": {
+      "parts": [
+        {
+          "type": "tool_call",
+          "id": "call_m7kNXg2KeusmnQnbD3KApvt9",
+          "name": "ping_empty",
+          "input": {},
+          "invalid": null
+        }
+      ],
+      "finish": "ToolCalls",
+      "refusal": null,
+      "usage": {
+        "input": 352,
+        "output": 11,
+        "cache_read": 0,
+        "cache_write": 0,
+        "reasoning": 0
+      }
+    }
+  },
+  {
+    "exchange": 1,
+    "result": {
+      "parts": [
+        {
+          "type": "tool_call",
+          "id": "call_XppqPxlSDE5ZFMI8UT0Mf8TN",
+          "name": "inspect_manifest",
+          "input": {
+            "project": "rig-openrouter",
+            "flags": {
+              "critical": true,
+              "retries": 2
+            },
+            "steps": [
+              {
+                "name": "plan",
+                "weight": 1
+              },
+              {
+                "name": "verify",
+                "weight": 2
+              }
+            ],
+            "note": "line one; line two says \"hello\" and path C:\\rig\\openrouter"
+          },
+          "invalid": null
+        }
+      ],
+      "finish": "ToolCalls",
+      "refusal": null,
+      "usage": {
+        "input": 374,
+        "output": 67,
+        "cache_read": 0,
+        "cache_write": 0,
+        "reasoning": 0
+      }
+    }
+  },
+  {
+    "exchange": 2,
+    "result": {
+      "parts": [
+        {
+          "type": "tool_call",
+          "id": "call_0eyVaYHdQdMDvKrHuVDiLHE7",
+          "name": "join_labels",
+          "input": {
+            "labels": [
+              "north",
+              "beta gamma",
+              "quote:\"delta\"",
+              "slash\\path"
+            ],
+            "separator": "|"
+          },
+          "invalid": null
+        }
+      ],
+      "finish": "ToolCalls",
+      "refusal": null,
+      "usage": {
+        "input": 464,
+        "output": 31,
+        "cache_read": 0,
+        "cache_write": 0,
+        "reasoning": 0
+      }
+    }
+  },
+  {
+    "exchange": 3,
+    "result": {
+      "parts": [
+        {
+          "type": "tool_call",
+          "id": "call_gGoTjeh6zWUe1Ae41LjNaCKM",
+          "name": "escape_echo",
+          "input": {
+            "text": "Line 1\nLine \"2\" with backslash \\ and unicode snowman ☃"
+          },
+          "invalid": null
+        }
+      ],
+      "finish": "ToolCalls",
+      "refusal": null,
+      "usage": {
+        "input": 519,
+        "output": 31,
+        "cache_read": 0,
+        "cache_write": 0,
+        "reasoning": 0
+      }
+    }
+  },
+  {
+    "exchange": 4,
+    "result": {
+      "parts": [
+        {
+          "type": "text",
+          "text": "The production-readiness scenario results are: EMPTY-OK, MANIFEST-OK, LABELS-OK, and ESCAPE-OK."
+        }
+      ],
+      "finish": "Stop",
+      "refusal": null,
+      "usage": {
+        "input": 580,
+        "output": 29,
+        "cache_read": 0,
+        "cache_write": 0,
+        "reasoning": 0
+      }
+    }
+  }
+]

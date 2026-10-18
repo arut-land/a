@@ -1,0 +1,29 @@
+[
+  {
+    "exchange": 0,
+    "result": {
+      "parts": [
+        {
+          "type": "tool_call",
+          "id": "31a6f4df-2527-40cd-b8bb-9c35fc8ee492",
+          "name": "final_result",
+          "input": {
+            "category": "Technology",
+            "summary": "A local meetup for Rust enthusiasts in Seattle to connect, share knowledge, and collaborate.",
+            "title": "Seattle Rust Meetup"
+          },
+          "invalid": null
+        }
+      ],
+      "finish": "ToolCalls",
+      "refusal": null,
+      "usage": {
+        "input": 153,
+        "output": 192,
+        "cache_read": null,
+        "cache_write": null,
+        "reasoning": 149
+      }
+    }
+  }
+]

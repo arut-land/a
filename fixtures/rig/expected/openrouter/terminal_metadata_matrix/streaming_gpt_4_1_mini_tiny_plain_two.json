@@ -1,0 +1,22 @@
+[
+  {
+    "exchange": 0,
+    "result": {
+      "parts": [
+        {
+          "type": "text",
+          "text": "cobalt cobalt cobalt cobalt cobalt cobalt cobalt cobalt cobalt cobalt cobalt cobalt cobalt cobalt cobalt"
+        }
+      ],
+      "finish": "Length",
+      "refusal": null,
+      "usage": {
+        "input": 20,
+        "output": 16,
+        "cache_read": 0,
+        "cache_write": 0,
+        "reasoning": 0
+      }
+    }
+  }
+]

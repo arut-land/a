@@ -1,0 +1,30 @@
+[
+  {
+    "exchange": 0,
+    "result": {
+      "parts": [
+        {
+          "type": "tool_call",
+          "id": "toolu_01NDqAq8r1fZahaXwSMeGxSm",
+          "name": "stream_event",
+          "input": {
+            "event": {
+              "kind": "created",
+              "id": 9
+            }
+          },
+          "invalid": null
+        }
+      ],
+      "finish": "ToolCalls",
+      "refusal": null,
+      "usage": {
+        "input": 779,
+        "output": 43,
+        "cache_read": 0,
+        "cache_write": 0,
+        "reasoning": null
+      }
+    }
+  }
+]

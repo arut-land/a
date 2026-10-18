@@ -1,0 +1,27 @@
+[
+  {
+    "exchange": 0,
+    "result": {
+      "parts": [
+        {
+          "type": "reasoning",
+          "text": "144",
+          "redacted": false
+        },
+        {
+          "type": "text",
+          "text": "144"
+        }
+      ],
+      "finish": "Stop",
+      "refusal": null,
+      "usage": {
+        "input": 68,
+        "output": 13,
+        "cache_read": 0,
+        "cache_write": 0,
+        "reasoning": 7
+      }
+    }
+  }
+]

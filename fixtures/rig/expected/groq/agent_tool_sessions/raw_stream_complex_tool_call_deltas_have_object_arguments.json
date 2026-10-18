@@ -1,0 +1,42 @@
+[
+  {
+    "exchange": 0,
+    "result": {
+      "parts": [
+        {
+          "type": "tool_call",
+          "id": "w2acbw4dw",
+          "name": "inspect_manifest",
+          "input": {
+            "flags": {
+              "critical": true,
+              "retries": 2
+            },
+            "note": "streamed nested JSON",
+            "project": "rig-groq",
+            "steps": [
+              {
+                "name": "plan",
+                "weight": 1
+              },
+              {
+                "name": "verify",
+                "weight": 2
+              }
+            ]
+          },
+          "invalid": null
+        }
+      ],
+      "finish": "ToolCalls",
+      "refusal": null,
+      "usage": {
+        "input": 448,
+        "output": 104,
+        "cache_read": null,
+        "cache_write": null,
+        "reasoning": null
+      }
+    }
+  }
+]

@@ -1,0 +1,247 @@
+[
+  {
+    "exchange": 0,
+    "result": {
+      "parts": [
+        {
+          "type": "reasoning",
+          "text": "We need to use lookup_record twice: once with record:\"alpha\" and once with record:\"beta\". Then verify each returned code using verify_code, which may fail transiently. If transient failure occurs, retry once.\n\nWe must not guess a code; must use tool. So first call lookup_record for alpha. Then verify_code on that result. Then lookup_record for beta, then verify_code.\n\nWe need to output both codes with verification status. Format? \"Alpha: code X, verified\" etc.\n\nWe'll do the calls.\n\nWe need to call tools. We'll do sequentially: lookup_record alpha, verify_code, lookup_record beta, verify_code.\n\nLet's call first.",
+          "redacted": false
+        },
+        {
+          "type": "tool_call",
+          "id": "fc_45f9d237-1235-46e0-b25e-e9846bb74d73",
+          "name": "lookup_record",
+          "input": {
+            "record": "alpha"
+          },
+          "invalid": null
+        }
+      ],
+      "finish": "ToolCalls",
+      "refusal": null,
+      "usage": {
+        "input": 227,
+        "output": 160,
+        "cache_read": null,
+        "cache_write": null,
+        "reasoning": 137
+      }
+    }
+  },
+  {
+    "exchange": 1,
+    "result": {
+      "parts": [
+        {
+          "type": "reasoning",
+          "text": "Now verify.",
+          "redacted": false
+        },
+        {
+          "type": "tool_call",
+          "id": "fc_9878c954-654d-4a9c-b49a-b50103878a6d",
+          "name": "verify_code",
+          "input": {
+            "code": "alpha-code-7431"
+          },
+          "invalid": null
+        }
+      ],
+      "finish": "ToolCalls",
+      "refusal": null,
+      "usage": {
+        "input": 403,
+        "output": 27,
+        "cache_read": null,
+        "cache_write": null,
+        "reasoning": 4
+      }
+    }
+  },
+  {
+    "exchange": 2,
+    "result": {
+      "parts": [
+        {
+          "type": "reasoning",
+          "text": "Now lookup beta.",
+          "redacted": false
+        },
+        {
+          "type": "tool_call",
+          "id": "fc_4b34f161-6344-451c-b0ae-2f5db70db6f0",
+          "name": "lookup_record",
+          "input": {
+            "record": "beta"
+          },
+          "invalid": null
+        }
+      ],
+      "finish": "ToolCalls",
+      "refusal": null,
+      "usage": {
+        "input": 447,
+        "output": 24,
+        "cache_read": null,
+        "cache_write": null,
+        "reasoning": 5
+      }
+    }
+  },
+  {
+    "exchange": 3,
+    "result": {
+      "parts": [
+        {
+          "type": "reasoning",
+          "text": "Verify.",
+          "redacted": false
+        },
+        {
+          "type": "tool_call",
+          "id": "fc_74e11b2a-b57b-4897-bb9a-ae82c2ef1d2c",
+          "name": "verify_code",
+          "input": {
+            "code": "beta-code-2286"
+          },
+          "invalid": null
+        }
+      ],
+      "finish": "ToolCalls",
+      "refusal": null,
+      "usage": {
+        "input": 491,
+        "output": 26,
+        "cache_read": null,
+        "cache_write": null,
+        "reasoning": 3
+      }
+    }
+  },
+  {
+    "exchange": 4,
+    "result": {
+      "parts": [
+        {
+          "type": "reasoning",
+          "text": "The verification failed transiently. Per instruction, retry once.",
+          "redacted": false
+        },
+        {
+          "type": "tool_call",
+          "id": "fc_aaaf8163-1125-4c20-9336-cfed0a6c3662",
+          "name": "verify_code",
+          "input": {
+            "code": "beta-code-2286"
+          },
+          "invalid": null
+        }
+      ],
+      "finish": "ToolCalls",
+      "refusal": null,
+      "usage": {
+        "input": 531,
+        "output": 36,
+        "cache_read": null,
+        "cache_write": null,
+        "reasoning": 13
+      }
+    }
+  },
+  {
+    "exchange": 5,
+    "result": {
+      "parts": [
+        {
+          "type": "text",
+          "text": "Alpha record: code **alpha-code-7431** – verified.  \nBeta record: code **beta-code-2286** – verified."
+        }
+      ],
+      "finish": "Stop",
+      "refusal": null,
+      "usage": {
+        "input": 584,
+        "output": 33,
+        "cache_read": null,
+        "cache_write": null,
+        "reasoning": null
+      }
+    }
+  },
+  {
+    "exchange": 6,
+    "result": {
+      "parts": [
+        {
+          "type": "reasoning",
+          "text": "We need to verify the alpha code again. We have alpha code \"alpha-code-7431\". We'll call verify_code with that code. It may fail transiently but we only retry once. Let's do that.",
+          "redacted": false
+        },
+        {
+          "type": "tool_call",
+          "id": "fc_5277e74e-8638-45e9-aa94-2582867a0b35",
+          "name": "verify_code",
+          "input": {
+            "code": "alpha-code-7431"
+          },
+          "invalid": null
+        }
+      ],
+      "finish": "ToolCalls",
+      "refusal": null,
+      "usage": {
+        "input": 636,
+        "output": 68,
+        "cache_read": null,
+        "cache_write": null,
+        "reasoning": 44
+      }
+    }
+  },
+  {
+    "exchange": 7,
+    "result": {
+      "parts": [
+        {
+          "type": "text",
+          "text": "Alpha code **alpha-code-7431** remains unchanged – verification successful."
+        }
+      ],
+      "finish": "Stop",
+      "refusal": null,
+      "usage": {
+        "input": 720,
+        "output": 19,
+        "cache_read": null,
+        "cache_write": null,
+        "reasoning": null
+      }
+    }
+  },
+  {
+    "exchange": 8,
+    "result": {
+      "parts": [
+        {
+          "type": "reasoning",
+          "text": "We just need to output both codes separated by a comma, nothing else. The codes: \"alpha-code-7431\" and \"beta-code-2286\". Ensure no extra spaces? Probably just \"alpha-code-7431,beta-code-2286\".",
+          "redacted": false
+        },
+        {
+          "type": "text",
+          "text": "alpha-code-7431,beta-code-2286"
+        }
+      ],
+      "finish": "Stop",
+      "refusal": null,
+      "usage": {
+        "input": 762,
+        "output": 74,
+        "cache_read": null,
+        "cache_write": null,
+        "reasoning": 54
+      }
+    }
+  }
+]

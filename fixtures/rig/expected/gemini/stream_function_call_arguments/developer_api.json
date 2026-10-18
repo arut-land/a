@@ -1,0 +1,27 @@
+[
+  {
+    "exchange": 0,
+    "result": {
+      "parts": [
+        {
+          "type": "tool_call",
+          "id": "call_922115",
+          "name": "lookup",
+          "input": {
+            "q": "The bustling harbor remained a vital sanctuary where weathered fishing boats bobbed gently alongside massive cargo ships, while the salty breeze carried the rhythmic sounds of clanging metal and distant gulls soaring over the deep, shimmering blue waters near shore."
+          },
+          "invalid": null
+        }
+      ],
+      "finish": "ToolCalls",
+      "refusal": null,
+      "usage": {
+        "input": 56,
+        "output": 59,
+        "cache_read": null,
+        "cache_write": null,
+        "reasoning": null
+      }
+    }
+  }
+]

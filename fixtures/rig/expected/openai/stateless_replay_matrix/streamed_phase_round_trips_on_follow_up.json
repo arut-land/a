@@ -1,0 +1,52 @@
+[
+  {
+    "exchange": 0,
+    "result": {
+      "parts": [
+        {
+          "type": "reasoning",
+          "text": "",
+          "redacted": false
+        },
+        {
+          "type": "text",
+          "text": "ACK-1"
+        }
+      ],
+      "finish": "Stop",
+      "refusal": null,
+      "usage": {
+        "input": 21,
+        "output": 22,
+        "cache_read": 0,
+        "cache_write": 0,
+        "reasoning": 13
+      }
+    }
+  },
+  {
+    "exchange": 1,
+    "result": {
+      "parts": [
+        {
+          "type": "reasoning",
+          "text": "",
+          "redacted": false
+        },
+        {
+          "type": "text",
+          "text": "ALPHA-17"
+        }
+      ],
+      "finish": "Stop",
+      "refusal": null,
+      "usage": {
+        "input": 42,
+        "output": 46,
+        "cache_read": 0,
+        "cache_write": 0,
+        "reasoning": 36
+      }
+    }
+  }
+]

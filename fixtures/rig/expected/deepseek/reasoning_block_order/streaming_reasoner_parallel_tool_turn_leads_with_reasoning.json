@@ -1,0 +1,45 @@
+[
+  {
+    "exchange": 0,
+    "result": {
+      "parts": [
+        {
+          "type": "reasoning",
+          "text": "The user wants both weather and air quality for Tokyo. Both calls are independent, so I should call them in the same block.",
+          "redacted": false
+        },
+        {
+          "type": "text",
+          "text": "I'll check both for Tokyo."
+        },
+        {
+          "type": "tool_call",
+          "id": "call_00_scav8ucK5xp41PyGUyWO9633",
+          "name": "get_weather",
+          "input": {
+            "city": "Tokyo"
+          },
+          "invalid": null
+        },
+        {
+          "type": "tool_call",
+          "id": "call_01_y50uJnxoIgPD5iyUFeug8335",
+          "name": "get_air_quality",
+          "input": {
+            "city": "Tokyo"
+          },
+          "invalid": null
+        }
+      ],
+      "finish": "ToolCalls",
+      "refusal": null,
+      "usage": {
+        "input": 429,
+        "output": 102,
+        "cache_read": 256,
+        "cache_write": null,
+        "reasoning": 26
+      }
+    }
+  }
+]

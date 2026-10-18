@@ -1,0 +1,50 @@
+[
+  {
+    "exchange": 0,
+    "result": {
+      "parts": [
+        {
+          "type": "tool_call",
+          "id": "call-1ed39b96-2d95-4162-a14f-fd600114148f-0",
+          "name": "get_status_word",
+          "input": {},
+          "invalid": null
+        }
+      ],
+      "finish": "ToolCalls",
+      "refusal": null,
+      "usage": {
+        "input": 324,
+        "output": 266,
+        "cache_read": 192,
+        "cache_write": null,
+        "reasoning": 259
+      }
+    }
+  },
+  {
+    "exchange": 1,
+    "result": {
+      "parts": [
+        {
+          "type": "reasoning",
+          "text": "I will call get_status_word once and reply with the exact returned word in one short sentence.",
+          "redacted": false
+        },
+        {
+          "type": "text",
+          "text": "The word is azure."
+        }
+      ],
+      "finish": "Stop",
+      "refusal": null,
+      "usage": {
+        "input": 337,
+        "output": 288,
+        "cache_read": 320,
+        "cache_write": null,
+        "reasoning": 283
+      }
+    }
+  }
+]

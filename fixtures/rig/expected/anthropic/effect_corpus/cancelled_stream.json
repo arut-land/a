@@ -1,0 +1,22 @@
+[
+  {
+    "exchange": 0,
+    "result": {
+      "parts": [
+        {
+          "type": "text",
+          "text": "# The History of the Rust Programming Language\n\nRust is a systems programming language that has grown from a personal project into one of the most admired and widely adopted languages in the software development world. Its history is a story of careful design, community collaboration, and a relentless focus on solving some of the most persistent problems in computer science: memory safety and concurrency.\n\n## Origins: A Personal Project\n\nRust began in 2006 as a personal project by Graydon Hoare, a software developer working at Mozilla. Hoare was frustrated by a broken elevator in his apartment building — a failure he attributed to software bugs — and set out to design a language that could prevent the kinds of memory errors that plague systems programming. At the time, C and C++ dominated the systems programming landscape, but both languages are notorious for allowing dangerous bugs such as null pointer dereferences, buffer overflows, and data races. Hoare envisioned a language that would offer the performance of C while enforcing memory safety at compile time.\n\n## Mozilla's Involvement\n\nMozilla officially began sponsoring Rust's development in 2009, recognizing its potential for building safer, faster software. The company had a direct interest in the language because it was developing the Servo browser engine, an experimental parallel web browser designed to take advantage of modern multi-core processors. Servo became a proving ground for Rust, helping to shape the language's features and expose its weaknesses in real-world use.\n\nIn 2010, Rust was publicly announced, and the first pre-alpha release followed in 2012. During this period, the language underwent significant changes. Early versions of Rust included features like a garbage collector and a complex runtime system, but these were gradually removed as the team committed to a zero-cost abstractions philosophy — the idea that safety features should not come at a performance penalty.\n\n## The Ownership System\n\nThe most revolutionary aspect of Rust's design is its ownership system, a set of compile-time rules that govern how memory is allocated and freed. Rather than relying on a garbage collector or requiring manual memory management, Rust uses a system of ownership, borrowing, and lifetimes to ensure that memory is always valid and that data races are impossible. This approach was novel and required significant innovation from the language designers. The borrow checker, the compiler component that enforces these rules, became both Rust's defining feature and its most challenging learning curve.\n\n## Rust 1.0 and Stability\n\nAfter years of iteration and community feedback, Rust reached a major milestone on May 15, 2015, with the release of Rust 1.0. This release signaled a commitment to stability, promising that code written for Rust 1.0 would continue to compile with future versions of the language. The release was celebrated widely in the programming community and marked the beginning of Rust's serious adoption in production environments.\n\n## Growing Adoption and Recognition\n\nFollowing the 1.0 release, Rust's popularity grew steadily. Mozilla used it in Firefox's CSS engine, Stylo, which shipped in 2017. Companies like Dropbox, Cloudflare, Amazon, and Microsoft began adopting Rust for performance-critical and security-sensitive components. In 2020, the Rust Foundation was established as an independent nonprofit organization to support the language's development beyond Mozilla's stewardship, with founding members including Amazon, Google, Microsoft, and Huawei.\n\nPerhaps most notably, Rust has been voted the \"most loved programming language\" in Stack Overflow's annual developer survey every year from 2016 through the early 2020s, a testament to the enthusiasm of its community.\n\n## Conclusion\n\nFrom a personal frustration to a globally recognized programming language, Rust's history reflects a bold ambition: to make systems programming safe without sacrificing speed. Its innovative ownership model, strong community, and growing industry adoption suggest that Rust will remain a significant force in software development for decades to come."
+        }
+      ],
+      "finish": "Stop",
+      "refusal": null,
+      "usage": {
+        "input": 35,
+        "output": 857,
+        "cache_read": 0,
+        "cache_write": 0,
+        "reasoning": null
+      }
+    }
+  }
+]

@@ -1,0 +1,54 @@
+[
+  {
+    "exchange": 0,
+    "result": {
+      "parts": [
+        {
+          "type": "tool_call",
+          "id": "faJ5EviTi",
+          "name": "add",
+          "input": {
+            "a": 19,
+            "b": 23
+          },
+          "invalid": null
+        }
+      ],
+      "finish": "ToolCalls",
+      "refusal": null,
+      "usage": {
+        "input": 1288,
+        "output": 18,
+        "cache_read": null,
+        "cache_write": null,
+        "reasoning": null
+      }
+    }
+  },
+  {
+    "exchange": 1,
+    "result": {
+      "parts": [
+        {
+          "type": "tool_call",
+          "id": "EHVM8ch8K",
+          "name": "final_result",
+          "input": {
+            "answer": 42,
+            "explanation": "The sum of 19 and 23 is 42."
+          },
+          "invalid": null
+        }
+      ],
+      "finish": "ToolCalls",
+      "refusal": null,
+      "usage": {
+        "input": 1324,
+        "output": 33,
+        "cache_read": null,
+        "cache_write": null,
+        "reasoning": null
+      }
+    }
+  }
+]

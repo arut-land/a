@@ -1,0 +1,58 @@
+[
+  {
+    "exchange": 0,
+    "result": {
+      "parts": [
+        {
+          "type": "reasoning",
+          "text": "Okay, the user wants to calculate 2 minus 5. Let me check the available tools. There's a subtract function that takes x and y. Here, x should be 2 and y should be 5. So the function call would be subtract with x=2 and y=5. That should give the correct result.\n",
+          "redacted": false
+        },
+        {
+          "type": "tool_call",
+          "id": "Xak4BdT2BzzP0Ym0Xgvd8mCm6Pl7jcsc",
+          "name": "subtract",
+          "input": {
+            "x": 2,
+            "y": 5
+          },
+          "invalid": null
+        }
+      ],
+      "finish": "ToolCalls",
+      "refusal": null,
+      "usage": {
+        "input": 306,
+        "output": 97,
+        "cache_read": 0,
+        "cache_write": null,
+        "reasoning": null
+      }
+    }
+  },
+  {
+    "exchange": 1,
+    "result": {
+      "parts": [
+        {
+          "type": "reasoning",
+          "text": "Okay, the user asked to calculate 2 minus 5. I used the subtract function with x=2 and y=5. The result was -3. I need to present the answer clearly. Let me check if there's any further action needed. The user didn't ask for anything else, so I'll just state the result.\n",
+          "redacted": false
+        },
+        {
+          "type": "text",
+          "text": "The result of 2 minus 5 is -3."
+        }
+      ],
+      "finish": "Stop",
+      "refusal": null,
+      "usage": {
+        "input": 418,
+        "output": 86,
+        "cache_read": 402,
+        "cache_write": null,
+        "reasoning": null
+      }
+    }
+  }
+]

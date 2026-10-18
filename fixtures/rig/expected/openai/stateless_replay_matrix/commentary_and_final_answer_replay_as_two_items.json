@@ -1,0 +1,50 @@
+[
+  {
+    "exchange": 0,
+    "result": {
+      "parts": [
+        {
+          "type": "text",
+          "text": "Quick update: I’m generating three fruit names now."
+        },
+        {
+          "type": "text",
+          "text": "Apple, Banana, Mango."
+        }
+      ],
+      "finish": "Stop",
+      "refusal": null,
+      "usage": {
+        "input": 44,
+        "output": 28,
+        "cache_read": 0,
+        "cache_write": 0,
+        "reasoning": 0
+      }
+    }
+  },
+  {
+    "exchange": 1,
+    "result": {
+      "parts": [
+        {
+          "type": "text",
+          "text": "Quick update: I’m picking one additional fruit and will provide it in a single word."
+        },
+        {
+          "type": "text",
+          "text": "Orange"
+        }
+      ],
+      "finish": "Stop",
+      "refusal": null,
+      "usage": {
+        "input": 87,
+        "output": 30,
+        "cache_read": 0,
+        "cache_write": 0,
+        "reasoning": 0
+      }
+    }
+  }
+]

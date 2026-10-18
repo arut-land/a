@@ -1,0 +1,180 @@
+[
+  {
+    "exchange": 0,
+    "result": {
+      "parts": [
+        {
+          "type": "tool_call",
+          "id": "JKZmaBaDr",
+          "name": "lookup_record",
+          "input": {
+            "record": "alpha"
+          },
+          "invalid": null
+        },
+        {
+          "type": "tool_call",
+          "id": "mW69MkCqV",
+          "name": "lookup_record",
+          "input": {
+            "record": "beta"
+          },
+          "invalid": null
+        }
+      ],
+      "finish": "ToolCalls",
+      "refusal": null,
+      "usage": {
+        "input": 1165,
+        "output": 21,
+        "cache_read": null,
+        "cache_write": null,
+        "reasoning": null
+      }
+    }
+  },
+  {
+    "exchange": 1,
+    "result": {
+      "parts": [
+        {
+          "type": "tool_call",
+          "id": "ilfYTXAJO",
+          "name": "verify_code",
+          "input": {
+            "code": "alpha-code-7431"
+          },
+          "invalid": null
+        },
+        {
+          "type": "tool_call",
+          "id": "86ercWIXq",
+          "name": "verify_code",
+          "input": {
+            "code": "beta-code-2286"
+          },
+          "invalid": null
+        }
+      ],
+      "finish": "ToolCalls",
+      "refusal": null,
+      "usage": {
+        "input": 1242,
+        "output": 33,
+        "cache_read": null,
+        "cache_write": null,
+        "reasoning": null
+      }
+    }
+  },
+  {
+    "exchange": 2,
+    "result": {
+      "parts": [
+        {
+          "type": "tool_call",
+          "id": "rP28k15hx",
+          "name": "verify_code",
+          "input": {
+            "code": "beta-code-2286"
+          },
+          "invalid": null
+        }
+      ],
+      "finish": "ToolCalls",
+      "refusal": null,
+      "usage": {
+        "input": 1318,
+        "output": 17,
+        "cache_read": null,
+        "cache_write": null,
+        "reasoning": null
+      }
+    }
+  },
+  {
+    "exchange": 3,
+    "result": {
+      "parts": [
+        {
+          "type": "text",
+          "text": "- Alpha record code: `alpha-code-7431` (verified)\n- Beta record code: `beta-code-2286` (verified)"
+        }
+      ],
+      "finish": "Stop",
+      "refusal": null,
+      "usage": {
+        "input": 1365,
+        "output": 35,
+        "cache_read": null,
+        "cache_write": null,
+        "reasoning": null
+      }
+    }
+  },
+  {
+    "exchange": 4,
+    "result": {
+      "parts": [
+        {
+          "type": "tool_call",
+          "id": "Nz0YL3lvN",
+          "name": "verify_code",
+          "input": {
+            "code": "alpha-code-7431"
+          },
+          "invalid": null
+        }
+      ],
+      "finish": "ToolCalls",
+      "refusal": null,
+      "usage": {
+        "input": 1415,
+        "output": 17,
+        "cache_read": null,
+        "cache_write": null,
+        "reasoning": null
+      }
+    }
+  },
+  {
+    "exchange": 5,
+    "result": {
+      "parts": [
+        {
+          "type": "text",
+          "text": "The alpha code `alpha-code-7431` is unchanged and verified."
+        }
+      ],
+      "finish": "Stop",
+      "refusal": null,
+      "usage": {
+        "input": 1460,
+        "output": 18,
+        "cache_read": null,
+        "cache_write": null,
+        "reasoning": null
+      }
+    }
+  },
+  {
+    "exchange": 6,
+    "result": {
+      "parts": [
+        {
+          "type": "text",
+          "text": "alpha-code-7431, beta-code-2286"
+        }
+      ],
+      "finish": "Stop",
+      "refusal": null,
+      "usage": {
+        "input": 1497,
+        "output": 16,
+        "cache_read": null,
+        "cache_write": null,
+        "reasoning": null
+      }
+    }
+  }
+]

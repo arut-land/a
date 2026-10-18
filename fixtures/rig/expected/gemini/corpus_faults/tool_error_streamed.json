@@ -1,0 +1,48 @@
+[
+  {
+    "exchange": 0,
+    "result": {
+      "parts": [
+        {
+          "type": "tool_call",
+          "id": "call_1370204",
+          "name": "add",
+          "input": {
+            "x": 17,
+            "y": 25
+          },
+          "invalid": null
+        }
+      ],
+      "finish": "ToolCalls",
+      "refusal": null,
+      "usage": {
+        "input": 112,
+        "output": 80,
+        "cache_read": null,
+        "cache_write": null,
+        "reasoning": 62
+      }
+    }
+  },
+  {
+    "exchange": 1,
+    "result": {
+      "parts": [
+        {
+          "type": "text",
+          "text": "the adder is broken"
+        }
+      ],
+      "finish": "Stop",
+      "refusal": null,
+      "usage": {
+        "input": 207,
+        "output": 49,
+        "cache_read": null,
+        "cache_write": null,
+        "reasoning": 45
+      }
+    }
+  }
+]

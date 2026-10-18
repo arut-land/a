@@ -1,0 +1,22 @@
+[
+  {
+    "exchange": 0,
+    "result": {
+      "parts": [
+        {
+          "type": "text",
+          "text": "Maple trees are known for their vibrant fall foliage, which can range from"
+        }
+      ],
+      "finish": "Length",
+      "refusal": null,
+      "usage": {
+        "input": 978,
+        "output": 16,
+        "cache_read": null,
+        "cache_write": null,
+        "reasoning": null
+      }
+    }
+  }
+]

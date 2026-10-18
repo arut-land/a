@@ -1,0 +1,9 @@
+[
+  {
+    "exchange": 0,
+    "result": {
+      "error": "ProviderResponseError: status 404 Not Found: {\"error\":\"Specified model not found: venice-nonexistent-rig-test. Did you mean: venice-uncensored-1-2, venice-uncensored-role-play?\"}",
+      "events": 0
+    }
+  }
+]

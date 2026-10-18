@@ -1,0 +1,167 @@
+[
+  {
+    "exchange": 0,
+    "result": {
+      "parts": [
+        {
+          "type": "tool_call",
+          "id": "2g9gqs22f",
+          "name": "ping_empty",
+          "input": {},
+          "invalid": null
+        }
+      ],
+      "finish": "ToolCalls",
+      "refusal": null,
+      "usage": {
+        "input": 896,
+        "output": 15,
+        "cache_read": null,
+        "cache_write": null,
+        "reasoning": null
+      }
+    }
+  },
+  {
+    "exchange": 1,
+    "result": {
+      "parts": [
+        {
+          "type": "tool_call",
+          "id": "s4n9ph04b",
+          "name": "inspect_manifest",
+          "input": {
+            "flags": {
+              "critical": true,
+              "retries": 2
+            },
+            "note": "line one; line two says \"hello\" and path C:/rig/groq",
+            "project": "rig-groq",
+            "steps": [
+              {
+                "name": "plan",
+                "weight": 1
+              },
+              {
+                "name": "verify",
+                "weight": 2
+              }
+            ]
+          },
+          "invalid": null
+        }
+      ],
+      "finish": "ToolCalls",
+      "refusal": null,
+      "usage": {
+        "input": 931,
+        "output": 117,
+        "cache_read": null,
+        "cache_write": null,
+        "reasoning": null
+      }
+    }
+  },
+  {
+    "exchange": 2,
+    "result": {
+      "parts": [
+        {
+          "type": "tool_call",
+          "id": "fcvrhvnzk",
+          "name": "join_labels",
+          "input": {
+            "labels": [
+              "north",
+              "beta gamma",
+              "quote:\"delta\"",
+              "slash\\path"
+            ],
+            "separator": "|"
+          },
+          "invalid": null
+        }
+      ],
+      "finish": "ToolCalls",
+      "refusal": null,
+      "usage": {
+        "input": 1087,
+        "output": 55,
+        "cache_read": null,
+        "cache_write": null,
+        "reasoning": null
+      }
+    }
+  },
+  {
+    "exchange": 3,
+    "result": {
+      "parts": [
+        {
+          "type": "tool_call",
+          "id": "6xw6mzz14",
+          "name": "optional_nullable_probe",
+          "input": {
+            "name": "sentinel",
+            "nullable_code": null
+          },
+          "invalid": null
+        }
+      ],
+      "finish": "ToolCalls",
+      "refusal": null,
+      "usage": {
+        "input": 1175,
+        "output": 41,
+        "cache_read": null,
+        "cache_write": null,
+        "reasoning": null
+      }
+    }
+  },
+  {
+    "exchange": 4,
+    "result": {
+      "parts": [
+        {
+          "type": "tool_call",
+          "id": "36jharv3r",
+          "name": "escape_echo",
+          "input": {
+            "text": "Line 1\nLine \"2\" with colon: ok and unicode snowman ☃"
+          },
+          "invalid": null
+        }
+      ],
+      "finish": "ToolCalls",
+      "refusal": null,
+      "usage": {
+        "input": 1246,
+        "output": 43,
+        "cache_read": null,
+        "cache_write": null,
+        "reasoning": null
+      }
+    }
+  },
+  {
+    "exchange": 5,
+    "result": {
+      "parts": [
+        {
+          "type": "text",
+          "text": "All checks passed: EMPTY-OK, MANIFEST-OK, LABELS-OK, OPTIONAL-OK, ESCAPE-OK."
+        }
+      ],
+      "finish": "Stop",
+      "refusal": null,
+      "usage": {
+        "input": 1328,
+        "output": 28,
+        "cache_read": null,
+        "cache_write": null,
+        "reasoning": null
+      }
+    }
+  }
+]

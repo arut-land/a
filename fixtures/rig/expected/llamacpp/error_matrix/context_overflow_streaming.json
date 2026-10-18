@@ -1,0 +1,9 @@
+[
+  {
+    "exchange": 0,
+    "result": {
+      "error": "ProviderResponseError: status 400 Bad Request: {\"error\":{\"code\":400,\"message\":\"request (2009 tokens) exceeds the available context size (512 tokens), try increasing it\",\"n_ctx\":512,\"n_prompt_tokens\":2009,\"type\":\"exceed_context_size_error\"}}",
+      "events": 0
+    }
+  }
+]

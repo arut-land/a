@@ -1,0 +1,42 @@
+[
+  {
+    "exchange": 0,
+    "result": {
+      "parts": [
+        {
+          "type": "text",
+          "text": "ready."
+        }
+      ],
+      "finish": "Stop",
+      "refusal": null,
+      "usage": {
+        "input": 26,
+        "output": 5,
+        "cache_read": 0,
+        "cache_write": 0,
+        "reasoning": null
+      }
+    }
+  },
+  {
+    "exchange": 1,
+    "result": {
+      "parts": [
+        {
+          "type": "text",
+          "text": "again."
+        }
+      ],
+      "finish": "Stop",
+      "refusal": null,
+      "usage": {
+        "input": 43,
+        "output": 5,
+        "cache_read": 0,
+        "cache_write": 0,
+        "reasoning": null
+      }
+    }
+  }
+]

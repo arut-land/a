@@ -1,0 +1,22 @@
+[
+  {
+    "exchange": 0,
+    "result": {
+      "parts": [
+        {
+          "type": "text",
+          "text": "pong"
+        }
+      ],
+      "finish": "Stop",
+      "refusal": null,
+      "usage": {
+        "input": 1575,
+        "output": 2,
+        "cache_read": 0,
+        "cache_write": null,
+        "reasoning": 0
+      }
+    }
+  }
+]

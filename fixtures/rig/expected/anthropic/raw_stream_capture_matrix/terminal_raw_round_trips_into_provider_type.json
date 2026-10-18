@@ -1,0 +1,22 @@
+[
+  {
+    "exchange": 0,
+    "result": {
+      "parts": [
+        {
+          "type": "text",
+          "text": "raw stream capture probe"
+        }
+      ],
+      "finish": "Stop",
+      "refusal": null,
+      "usage": {
+        "input": 15,
+        "output": 7,
+        "cache_read": 0,
+        "cache_write": 0,
+        "reasoning": null
+      }
+    }
+  }
+]

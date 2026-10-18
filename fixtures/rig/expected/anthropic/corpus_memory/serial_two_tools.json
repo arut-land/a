@@ -1,0 +1,56 @@
+[
+  {
+    "exchange": 0,
+    "result": {
+      "parts": [
+        {
+          "type": "text",
+          "text": "I'll call both tools simultaneously right now!"
+        },
+        {
+          "type": "tool_call",
+          "id": "toolu_01LP4kcWedzFsZ8qpaqTTvYf",
+          "name": "lookup_harbor_label",
+          "input": {},
+          "invalid": null
+        },
+        {
+          "type": "tool_call",
+          "id": "toolu_01765NWXXeNERbBRmiuQTgFa",
+          "name": "lookup_orchard_label",
+          "input": {},
+          "invalid": null
+        }
+      ],
+      "finish": "ToolCalls",
+      "refusal": null,
+      "usage": {
+        "input": 700,
+        "output": 70,
+        "cache_read": 0,
+        "cache_write": 0,
+        "reasoning": null
+      }
+    }
+  },
+  {
+    "exchange": 1,
+    "result": {
+      "parts": [
+        {
+          "type": "text",
+          "text": "The alpha signal marker is **crimson-harbor** and the beta signal marker is **silver-orchard**."
+        }
+      ],
+      "finish": "Stop",
+      "refusal": null,
+      "usage": {
+        "input": 846,
+        "output": 26,
+        "cache_read": 0,
+        "cache_write": 0,
+        "reasoning": null
+      }
+    }
+  }
+]

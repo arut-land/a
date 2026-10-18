@@ -1,0 +1,27 @@
+[
+  {
+    "exchange": 0,
+    "result": {
+      "parts": [
+        {
+          "type": "reasoning",
+          "text": "The user wants a joke. I should just tell one. Keep it short and genuinely funny. No need for preamble.\n\nLet me pick something clean and actually funny. A classic two-liner works well.\n\nMaybe avoid the most overused ones. Something with a bit of wordplay.\n\nI'll go with one.",
+          "redacted": false
+        },
+        {
+          "type": "text",
+          "text": "A man walks into a library and asks for books about paranoia.\n\nThe librarian whispers, \"They're right behind you.\""
+        }
+      ],
+      "finish": "Stop",
+      "refusal": null,
+      "usage": {
+        "input": 40,
+        "output": 89,
+        "cache_read": 0,
+        "cache_write": null,
+        "reasoning": 63
+      }
+    }
+  }
+]

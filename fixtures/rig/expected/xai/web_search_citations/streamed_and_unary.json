@@ -1,0 +1,52 @@
+[
+  {
+    "exchange": 0,
+    "result": {
+      "parts": [
+        {
+          "type": "reasoning",
+          "text": "",
+          "redacted": false
+        },
+        {
+          "type": "opaque",
+          "kind": "web_search_call",
+          "replay": true
+        },
+        {
+          "type": "opaque",
+          "kind": "web_search_call",
+          "replay": true
+        },
+        {
+          "type": "reasoning",
+          "text": "",
+          "redacted": false
+        },
+        {
+          "type": "reasoning",
+          "text": "",
+          "redacted": false
+        },
+        {
+          "type": "reasoning",
+          "text": "",
+          "redacted": false
+        },
+        {
+          "type": "text",
+          "text": "**The latest stable Rust release is 1.99.0, released October 1, 2026.**[[1]](https://blog.rust-lang.org/2026/10/01/Rust-1.99.0/)"
+        }
+      ],
+      "finish": "Stop",
+      "refusal": null,
+      "usage": {
+        "input": 7861,
+        "output": 297,
+        "cache_read": 2048,
+        "cache_write": null,
+        "reasoning": 226
+      }
+    }
+  }
+]

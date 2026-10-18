@@ -1,0 +1,64 @@
+[
+  {
+    "exchange": 0,
+    "result": {
+      "parts": [
+        {
+          "type": "reasoning",
+          "text": "The user wants me to calculate 19 + 23 using the add function, then call final_result with answer=42 and a short explanation.\n\nLet me first use the add function to calculate 19 + 23.\n",
+          "redacted": false
+        },
+        {
+          "type": "tool_call",
+          "id": "chatcmpl-tool-bbe9ab08edb5e1e5",
+          "name": "add",
+          "input": {
+            "a": 19,
+            "b": 23
+          },
+          "invalid": null
+        }
+      ],
+      "finish": "ToolCalls",
+      "refusal": null,
+      "usage": {
+        "input": 540,
+        "output": 90,
+        "cache_read": 0,
+        "cache_write": 0,
+        "reasoning": null
+      }
+    }
+  },
+  {
+    "exchange": 1,
+    "result": {
+      "parts": [
+        {
+          "type": "reasoning",
+          "text": "Great, the add function returned 42, which is correct (19 + 23 = 42). Now I need to call final_result with answer=42 and a short explanation.\n",
+          "redacted": false
+        },
+        {
+          "type": "tool_call",
+          "id": "call_38d83e315f034009bb6928b0",
+          "name": "final_result",
+          "input": {
+            "answer": 42,
+            "explanation": "19 + 23 = 42"
+          },
+          "invalid": null
+        }
+      ],
+      "finish": "ToolCalls",
+      "refusal": null,
+      "usage": {
+        "input": 647,
+        "output": 95,
+        "cache_read": 0,
+        "cache_write": 0,
+        "reasoning": null
+      }
+    }
+  }
+]

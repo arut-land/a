@@ -1,0 +1,27 @@
+[
+  {
+    "exchange": 0,
+    "result": {
+      "parts": [
+        {
+          "type": "reasoning",
+          "text": "**Calculating divisible numbers**\n\nI’m trying to find how many numbers below 400 are divisible by 6 but not by 9. First, I calculate the total multiples of 6 under 400, which is 66. Then I look at the multiples of 18 (the least common multiple of 6 and 9), which gives me 22. By subtracting 22 from 66, I arrive at 44. So, the answer is 44 integers that fit the criteria!",
+          "redacted": false
+        },
+        {
+          "type": "text",
+          "text": "44"
+        }
+      ],
+      "finish": "Stop",
+      "refusal": null,
+      "usage": {
+        "input": 51,
+        "output": 70,
+        "cache_read": 0,
+        "cache_write": 0,
+        "reasoning": 63
+      }
+    }
+  }
+]

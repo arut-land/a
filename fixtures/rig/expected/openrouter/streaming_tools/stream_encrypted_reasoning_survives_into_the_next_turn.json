@@ -1,0 +1,57 @@
+[
+  {
+    "exchange": 0,
+    "result": {
+      "parts": [
+        {
+          "type": "reasoning",
+          "text": "",
+          "redacted": false
+        },
+        {
+          "type": "tool_call",
+          "id": "call_1ZXYiRWb1hi1C7NeEdU0b982",
+          "name": "get_weather",
+          "input": {
+            "city": "Tokyo, Japan"
+          },
+          "invalid": null
+        }
+      ],
+      "finish": "ToolCalls",
+      "refusal": null,
+      "usage": {
+        "input": 145,
+        "output": 306,
+        "cache_read": 0,
+        "cache_write": 0,
+        "reasoning": 256
+      }
+    }
+  },
+  {
+    "exchange": 1,
+    "result": {
+      "parts": [
+        {
+          "type": "reasoning",
+          "text": "",
+          "redacted": false
+        },
+        {
+          "type": "text",
+          "text": "Current weather in Tokyo: 72°F (22°C), mostly sunny with light clouds, 45% humidity, and a northwest breeze at 8 mph."
+        }
+      ],
+      "finish": "Stop",
+      "refusal": null,
+      "usage": {
+        "input": 171,
+        "output": 300,
+        "cache_read": 0,
+        "cache_write": 0,
+        "reasoning": 256
+      }
+    }
+  }
+]

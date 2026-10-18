@@ -1,0 +1,53 @@
+[
+  {
+    "exchange": 0,
+    "result": {
+      "parts": [
+        {
+          "type": "reasoning",
+          "text": "We need answer. Must use add tool. Need then reply just number. Let's call add.",
+          "redacted": false
+        },
+        {
+          "type": "tool_call",
+          "id": "call_00_YoKgf5kjEngBBLmLXnbY9542",
+          "name": "add",
+          "input": {
+            "x": 17,
+            "y": 25
+          },
+          "invalid": null
+        }
+      ],
+      "finish": "ToolCalls",
+      "refusal": null,
+      "usage": {
+        "input": 361,
+        "output": 73,
+        "cache_read": 128,
+        "cache_write": null,
+        "reasoning": 20
+      }
+    }
+  },
+  {
+    "exchange": 1,
+    "result": {
+      "parts": [
+        {
+          "type": "text",
+          "text": "42"
+        }
+      ],
+      "finish": "Stop",
+      "refusal": null,
+      "usage": {
+        "input": 447,
+        "output": 2,
+        "cache_read": 256,
+        "cache_write": null,
+        "reasoning": 0
+      }
+    }
+  }
+]

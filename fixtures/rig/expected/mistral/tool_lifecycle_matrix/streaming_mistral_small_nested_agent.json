@@ -1,0 +1,35 @@
+[
+  {
+    "exchange": 0,
+    "result": {
+      "parts": [
+        {
+          "type": "tool_call",
+          "id": "QkNzsTC5s",
+          "name": "record_payload",
+          "input": {
+            "label": "café 東京",
+            "values": [
+              3,
+              5,
+              8
+            ],
+            "meta": {
+              "active": true
+            }
+          },
+          "invalid": null
+        }
+      ],
+      "finish": "ToolCalls",
+      "refusal": null,
+      "usage": {
+        "input": 171,
+        "output": 35,
+        "cache_read": 144,
+        "cache_write": null,
+        "reasoning": null
+      }
+    }
+  }
+]

@@ -1,0 +1,48 @@
+[
+  {
+    "exchange": 0,
+    "result": {
+      "parts": [
+        {
+          "type": "tool_call",
+          "id": "call_w1R8MnviufcZUPgYvdoA4l1l",
+          "name": "add",
+          "input": {
+            "x": 17,
+            "y": 25
+          },
+          "invalid": null
+        }
+      ],
+      "finish": "ToolCalls",
+      "refusal": null,
+      "usage": {
+        "input": 101,
+        "output": 17,
+        "cache_read": 0,
+        "cache_write": null,
+        "reasoning": 0
+      }
+    }
+  },
+  {
+    "exchange": 1,
+    "result": {
+      "parts": [
+        {
+          "type": "text",
+          "text": "42"
+        }
+      ],
+      "finish": "Stop",
+      "refusal": null,
+      "usage": {
+        "input": 126,
+        "output": 2,
+        "cache_read": 0,
+        "cache_write": null,
+        "reasoning": 0
+      }
+    }
+  }
+]

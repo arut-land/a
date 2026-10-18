@@ -1,0 +1,25 @@
+[
+  {
+    "exchange": 0,
+    "result": {
+      "parts": [
+        {
+          "type": "tool_call",
+          "id": "call_00_c4vCr4N4Y11fqTENRHnk8655",
+          "name": "ping",
+          "input": {},
+          "invalid": null
+        }
+      ],
+      "finish": "ToolCalls",
+      "refusal": null,
+      "usage": {
+        "input": 277,
+        "output": 15,
+        "cache_read": 0,
+        "cache_write": null,
+        "reasoning": null
+      }
+    }
+  }
+]

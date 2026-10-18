@@ -1,0 +1,48 @@
+[
+  {
+    "exchange": 0,
+    "result": {
+      "parts": [
+        {
+          "type": "tool_call",
+          "id": "toolu_01NxjTaKdP28Q3SqeW6nitvq",
+          "name": "subtract",
+          "input": {
+            "x": 2,
+            "y": 5
+          },
+          "invalid": "{\"x\": 2, \"y\": 5"
+        }
+      ],
+      "finish": "Length",
+      "refusal": null,
+      "usage": {
+        "input": 703,
+        "output": 60,
+        "cache_read": 0,
+        "cache_write": 0,
+        "reasoning": null
+      }
+    }
+  },
+  {
+    "exchange": 1,
+    "result": {
+      "parts": [
+        {
+          "type": "text",
+          "text": "2 - 5 = **-3**"
+        }
+      ],
+      "finish": "Stop",
+      "refusal": null,
+      "usage": {
+        "input": 828,
+        "output": 14,
+        "cache_read": 0,
+        "cache_write": 0,
+        "reasoning": null
+      }
+    }
+  }
+]

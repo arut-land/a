@@ -1,0 +1,41 @@
+#!/usr/bin/env bash
+#MISE description="Import rig's recorded streaming cassettes and regenerate their parity results"
+# Regenerates fixtures/rig/{cassettes,expected} from one rig release; never
+# edit either by hand. The cassettes are rig's recordings, verbatim; the
+# expected results are what rig itself decodes from them (fixtures/rig/oracle).
+set -euo pipefail
+
+tag=v0.44.0
+providers=(anthropic deepseek doubleword gemini groq llamacpp mistral ollama openai openrouter perplexity venice xai)
+
+root=$MISE_PROJECT_ROOT/fixtures/rig
+tmp=$(mktemp -d)
+trap 'rm -rf "$tmp"' EXIT
+
+git clone --quiet --depth 1 --branch "$tag" https://github.com/0xPlaygrounds/rig.git "$tmp/rig"
+src=$tmp/rig/crates/rig-cassette/fixtures/cassettes
+
+rm -rf "$root/cassettes" "$root/expected"
+for provider in "${providers[@]}"; do
+    while IFS= read -r -d '' file; do
+        case $file in
+        *embed* | *image* | *audio* | *transcri* | *rerank* | *speech* | *websocket* | *interactions* | *cached_content* | *caching*) continue ;;
+        esac
+        # Base64 media recordings add size, not wire coverage.
+        [[ $(wc -c <"$file") -gt 150000 ]] && continue
+        grep -q 'text/event-stream' "$file" || continue
+        rel=${file#"$src"/}
+        mkdir -p "$root/cassettes/$(dirname "$rel")"
+        cp "$file" "$root/cassettes/$rel"
+    done < <(find "$src/$provider" -name '*.yaml' -print0)
+done
+
+cargo run --quiet --release --manifest-path "$root/oracle/Cargo.toml" --target-dir "$MISE_PROJECT_ROOT/target/oracle" -- "$root"
+
+# Keep only the cassettes the oracle covers.
+while IFS= read -r -d '' file; do
+    rel=${file#"$root/cassettes/"}
+    [[ -e $root/expected/${rel%.yaml}.json ]] || rm "$file"
+done < <(find "$root/cassettes" -name '*.yaml' -print0)
+find "$root/cassettes" -type d -empty -delete
+echo "$(find "$root/cassettes" -name '*.yaml' | wc -l | tr -d ' ') cassettes, $(du -sh "$root" | cut -f1) with oracle"

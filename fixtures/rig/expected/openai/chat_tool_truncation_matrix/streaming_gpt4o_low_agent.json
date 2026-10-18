@@ -1,0 +1,27 @@
+[
+  {
+    "exchange": 0,
+    "result": {
+      "parts": [
+        {
+          "type": "tool_call",
+          "id": "call_BECqI1ZGGJ5aVqFwbagKzt86",
+          "name": "file_report",
+          "input": {
+            "summary": "The cache warmer raced"
+          },
+          "invalid": "{\"summary\":\"The cache warmer raced"
+        }
+      ],
+      "finish": "Length",
+      "refusal": null,
+      "usage": {
+        "input": 101,
+        "output": 16,
+        "cache_read": 0,
+        "cache_write": null,
+        "reasoning": 0
+      }
+    }
+  }
+]

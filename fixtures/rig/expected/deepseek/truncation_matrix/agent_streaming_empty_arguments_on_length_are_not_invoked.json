@@ -1,0 +1,25 @@
+[
+  {
+    "exchange": 0,
+    "result": {
+      "parts": [
+        {
+          "type": "tool_call",
+          "id": "call_00_OLKCNNpBVvi9GSsf1CYz0755",
+          "name": "file_report",
+          "input": {},
+          "invalid": null
+        }
+      ],
+      "finish": "Length",
+      "refusal": null,
+      "usage": {
+        "input": 346,
+        "output": 16,
+        "cache_read": 128,
+        "cache_write": null,
+        "reasoning": null
+      }
+    }
+  }
+]

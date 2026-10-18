@@ -1,0 +1,23 @@
+[
+  {
+    "exchange": 0,
+    "result": {
+      "parts": [
+        {
+          "type": "reasoning",
+          "text": "",
+          "redacted": false
+        }
+      ],
+      "finish": "Length",
+      "refusal": null,
+      "usage": {
+        "input": 20,
+        "output": 32,
+        "cache_read": 0,
+        "cache_write": 0,
+        "reasoning": 32
+      }
+    }
+  }
+]

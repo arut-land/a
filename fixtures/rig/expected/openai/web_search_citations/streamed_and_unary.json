@@ -1,0 +1,37 @@
+[
+  {
+    "exchange": 0,
+    "result": {
+      "parts": [
+        {
+          "type": "reasoning",
+          "text": "",
+          "redacted": false
+        },
+        {
+          "type": "opaque",
+          "kind": "web_search_call",
+          "replay": true
+        },
+        {
+          "type": "reasoning",
+          "text": "",
+          "redacted": false
+        },
+        {
+          "type": "text",
+          "text": "The latest stable Rust release is **Rust 1.98.1**, released on **September 3, 2026**. ([blog.rust-lang.org](https://blog.rust-lang.org/releases/latest/?utm_source=openai))"
+        }
+      ],
+      "finish": "Stop",
+      "refusal": null,
+      "usage": {
+        "input": 8610,
+        "output": 136,
+        "cache_read": 0,
+        "cache_write": 0,
+        "reasoning": 89
+      }
+    }
+  }
+]

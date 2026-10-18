@@ -1,0 +1,22 @@
+[
+  {
+    "exchange": 0,
+    "result": {
+      "parts": [
+        {
+          "type": "text",
+          "text": "Maple trees are known for their distinctive lobed leaves and winged seeds called sam"
+        }
+      ],
+      "finish": "Length",
+      "refusal": null,
+      "usage": {
+        "input": 24,
+        "output": 16,
+        "cache_read": 0,
+        "cache_write": null,
+        "reasoning": null
+      }
+    }
+  }
+]

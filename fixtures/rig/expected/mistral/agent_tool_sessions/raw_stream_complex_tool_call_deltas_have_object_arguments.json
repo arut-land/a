@@ -1,0 +1,42 @@
+[
+  {
+    "exchange": 0,
+    "result": {
+      "parts": [
+        {
+          "type": "tool_call",
+          "id": "nuMBlkJsK",
+          "name": "inspect_manifest",
+          "input": {
+            "project": "rig-mistral",
+            "flags": {
+              "critical": true,
+              "retries": 2
+            },
+            "steps": [
+              {
+                "name": "plan",
+                "weight": 1
+              },
+              {
+                "name": "verify",
+                "weight": 2
+              }
+            ],
+            "note": "streamed nested JSON"
+          },
+          "invalid": null
+        }
+      ],
+      "finish": "ToolCalls",
+      "refusal": null,
+      "usage": {
+        "input": 261,
+        "output": 69,
+        "cache_read": 0,
+        "cache_write": null,
+        "reasoning": null
+      }
+    }
+  }
+]

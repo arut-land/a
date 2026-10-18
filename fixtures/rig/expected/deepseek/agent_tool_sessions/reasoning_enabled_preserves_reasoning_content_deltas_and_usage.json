@@ -1,0 +1,27 @@
+[
+  {
+    "exchange": 1,
+    "result": {
+      "parts": [
+        {
+          "type": "reasoning",
+          "text": "We need answer. User asks \"Briefly solve 2 + 2, then answer with the number.\" Need comply. We can briefly solve? Final should likely just number? \"answer with the number\" means output 4. Need no extra.",
+          "redacted": false
+        },
+        {
+          "type": "text",
+          "text": "4"
+        }
+      ],
+      "finish": "Stop",
+      "refusal": null,
+      "usage": {
+        "input": 45,
+        "output": 53,
+        "cache_read": 0,
+        "cache_write": null,
+        "reasoning": 51
+      }
+    }
+  }
+]

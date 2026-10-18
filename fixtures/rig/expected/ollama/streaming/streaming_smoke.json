@@ -1,0 +1,22 @@
+[
+  {
+    "exchange": 0,
+    "result": {
+      "parts": [
+        {
+          "type": "text",
+          "text": "Hmm, the user wants a concise explanation of what a solar eclipse is, and they specifically asked for it in one short paragraph with plain text. \n\nI need to make sure my response is accurate but super brief - no fluff. The key points are: solar eclipse = Moon blocking Sun's light, happens during lunar eclipse? Wait no, lunar is different - solar is Moon blocking Sun. Should clarify it's when the Moon passes between Earth and Sun, casting shadow on Earth. \n\nAlso important to mention it's a temporary event where Sun is partially or fully covered. Must avoid common mistakes like confusing with lunar eclipses. User said \"short paragraph\" so I'll aim for 20-30 words max. \n\nUser seems to want quick educational content - maybe a student doing homework or just curious. No need for complex terms like \"umbra\" or \"penumbra\" since they asked for concise. \n\nOkay, drafting: \"A solar eclipse occurs when the Moon passes between the Earth and Sun, temporarily blocking the Sun's light and casting a shadow on Earth.\" That's 15 words - perfect. Wait, is \"temporarily\" necessary? Well, it's brief but accurate. \n\nDouble-checking: yes, this covers the essentials without being technical. User said \"plain text\" so no markdown. Keeping it neutral and factual. \n\nFinal check: avoids saying \"lunar eclipse\" (which is wrong), specifies Moon between Earth/Sun, mentions shadow effect. Nailed it.\n</think>\n\nA solar eclipse occurs when the Moon passes directly between the Earth and the Sun, temporarily blocking the Sun's light and casting a shadow on Earth."
+        }
+      ],
+      "finish": "Stop",
+      "refusal": null,
+      "usage": {
+        "input": 39,
+        "output": 339,
+        "cache_read": null,
+        "cache_write": null,
+        "reasoning": null
+      }
+    }
+  }
+]

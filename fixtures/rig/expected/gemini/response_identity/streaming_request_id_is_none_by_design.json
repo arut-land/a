@@ -1,0 +1,22 @@
+[
+  {
+    "exchange": 0,
+    "result": {
+      "parts": [
+        {
+          "type": "text",
+          "text": "stream identity probe"
+        }
+      ],
+      "finish": "Stop",
+      "refusal": null,
+      "usage": {
+        "input": 8,
+        "output": 23,
+        "cache_read": null,
+        "cache_write": null,
+        "reasoning": 20
+      }
+    }
+  }
+]

@@ -1,0 +1,42 @@
+[
+  {
+    "exchange": 0,
+    "result": {
+      "parts": [
+        {
+          "type": "tool_call",
+          "id": "call_8Nfaknxf181yU7YoShxX7RSd",
+          "name": "inspect_manifest",
+          "input": {
+            "project": "rig-openrouter",
+            "flags": {
+              "critical": true,
+              "retries": 2
+            },
+            "steps": [
+              {
+                "name": "plan",
+                "weight": 1
+              },
+              {
+                "name": "verify",
+                "weight": 2
+              }
+            ],
+            "note": "streamed nested JSON"
+          },
+          "invalid": null
+        }
+      ],
+      "finish": "ToolCalls",
+      "refusal": null,
+      "usage": {
+        "input": 138,
+        "output": 54,
+        "cache_read": 0,
+        "cache_write": 0,
+        "reasoning": 0
+      }
+    }
+  }
+]

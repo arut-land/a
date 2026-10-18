@@ -1,0 +1,22 @@
+[
+  {
+    "exchange": 0,
+    "result": {
+      "parts": [
+        {
+          "type": "text",
+          "text": "**Date:** October 2, 2024\n**Type:** Annular solar eclipse (\"Ring of Fire\")\n**Location:** Visible over parts of the Pacific Ocean, southern Chile, and southern Argentina."
+        }
+      ],
+      "finish": "Stop",
+      "refusal": null,
+      "usage": {
+        "input": 19,
+        "output": 225,
+        "cache_read": null,
+        "cache_write": null,
+        "reasoning": 181
+      }
+    }
+  }
+]

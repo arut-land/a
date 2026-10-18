@@ -1,0 +1,290 @@
+//! The Anthropic Messages API (`POST /v1/messages`), and the hosts that serve
+//! it with their quirks: Anthropic itself and the Anthropic-format endpoints
+//! of Z.AI, `MiniMax`, Moonshot and Xiaomi `MiMo`.
+//!
+//! Typed options under [`KEY`] go into the body as the caller writes them,
+//! merged over what the request maps to, except these the encoder reads:
+//!
+//! - `tools`: provider tools (server tools, MCP toolsets), sent after the
+//!   request's own tools as given.
+//! - `cache_control`: the top-level cache marker, an `ephemeral` marker
+//!   with no `ttl`, `"5m"` or `"1h"`; it takes one breakpoint of four.
+//! - `prompt_caching: true`: breakpoints on the last tool, the system prompt
+//!   and the last block of the last non-assistant message.
+//! - `static_prefix_cache_ttl`: `"5m"` or `"1h"`, a breakpoint on the last
+//!   tool and the system prompt at that lifetime, apart from the tail's.
+//! - `betas`: `anthropic-beta` flags, sent beside the ones a request needs.
+
+mod cache;
+mod decode;
+mod encode;
+mod models;
+mod options;
+mod strict;
+
+use crate::error::Error;
+use crate::protocol::{Decoder, Encoded, Framing, Host, KeyStyle, Protocol, Target};
+use crate::spec::Request;
+
+pub use models::{default_max_tokens, rejects_forced_tool_choice};
+
+/// Where this protocol's options and part state go.
+pub const KEY: &str = "anthropic.messages";
+
+/// The `anthropic-version` every request names.
+pub const VERSION: &str = "2023-06-01";
+
+/// The beta that lets a request ask Anthropic to drop a thinking block bound
+/// to another context instead of rejecting the request.
+pub const THINKING_BINDING_BETA: &str = "thinking-binding-controls-2026-08-01";
+
+/// The beta that streams tool input as it is written, for a host that
+/// rejects the per-tool `eager_input_streaming` field.
+pub const FINE_GRAINED_TOOL_STREAMING_BETA: &str = "fine-grained-tool-streaming-2025-05-14";
+
+/// Whose Messages API this is: the generation options each takes differ.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Dialect {
+    Anthropic,
+    ZAi,
+    MiniMax,
+    Moonshot,
+    MiMo,
+    /// A gateway no option mapping is known for: only the fields every
+    /// dialect takes are sent.
+    Other,
+}
+
+/// Where `max_tokens` comes from when the request sets none; Anthropic
+/// requires the field.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum MaxTokens {
+    /// Anthropic's published per-model output limits.
+    ByModel,
+    /// One ceiling for every model, which is all a gateway documents.
+    Fixed(u32),
+}
+
+/// How a request with tools asks for each call's input as the model writes
+/// it. Without it, Anthropic holds a long argument back and sends it in one
+/// burst.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum ToolInputStreaming {
+    /// `eager_input_streaming: true` on each of the request's tools.
+    #[default]
+    Eager,
+    /// The [`FINE_GRAINED_TOOL_STREAMING_BETA`] flag, for a host that
+    /// rejects the per-tool field.
+    BetaHeader,
+    /// Neither: the host streams tool input as it chooses.
+    Off,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Quirks {
+    pub dialect: Dialect,
+    pub max_tokens: MaxTokens,
+    /// Whether the host implements Anthropic's constrained tool schemas; a
+    /// strict tool goes unchanged to one that does not.
+    pub strict_tool_schemas: bool,
+    /// Whether the host takes thinking back without a signature, as Kimi
+    /// does. Elsewhere unsigned thinking replays as text.
+    pub unsigned_thinking: bool,
+    pub tool_input_streaming: ToolInputStreaming,
+}
+
+impl Quirks {
+    pub const ANTHROPIC: Self = Self {
+        dialect: Dialect::Anthropic,
+        max_tokens: MaxTokens::ByModel,
+        strict_tool_schemas: true,
+        unsigned_thinking: false,
+        tool_input_streaming: ToolInputStreaming::Eager,
+    };
+
+    /// A gateway's: 4096 output tokens by default, no constrained tool
+    /// schemas, eager tool input.
+    pub const GATEWAY: Self = Self {
+        dialect: Dialect::Other,
+        max_tokens: MaxTokens::Fixed(4096),
+        strict_tool_schemas: false,
+        unsigned_thinking: false,
+        tool_input_streaming: ToolInputStreaming::Eager,
+    };
+
+    /// The `max_tokens` a request to `model` defaults to.
+    pub fn default_max_tokens(&self, model: &str) -> Option<u32> {
+        match self.max_tokens {
+            MaxTokens::ByModel => default_max_tokens(model),
+            MaxTokens::Fixed(tokens) => Some(tokens),
+        }
+    }
+}
+
+impl Default for Quirks {
+    fn default() -> Self {
+        Self::ANTHROPIC
+    }
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct Messages {
+    pub quirks: Quirks,
+}
+
+impl Messages {
+    pub const fn new(quirks: Quirks) -> Self {
+        Self { quirks }
+    }
+}
+
+/// The path to post to under `base_url`, which may already name the API
+/// version or the endpoint, as pasted from the docs.
+fn path(base_url: &str) -> &'static str {
+    if base_url.ends_with("/v1/messages") {
+        ""
+    } else if base_url.ends_with("/v1") {
+        "/messages"
+    } else {
+        "/v1/messages"
+    }
+}
+
+impl Protocol for Messages {
+    fn key(&self) -> &'static str {
+        KEY
+    }
+
+    fn encode(&self, target: &Target<'_>, request: &Request) -> Result<Encoded, Error> {
+        let (body, betas) = encode::body(self.quirks, target.model, request)?;
+        let mut headers = vec![("anthropic-version", VERSION.to_owned())];
+        if !betas.is_empty() {
+            headers.push(("anthropic-beta", betas.join(",")));
+        }
+        Ok(Encoded {
+            path: path(&target.provider.base_url).to_owned(),
+            body,
+            headers,
+            framing: Framing::Sse,
+        })
+    }
+
+    fn decoder(&self, _: &Target<'_>, _: &Request) -> Box<dyn Decoder> {
+        Box::new(decode::MessagesDecoder::new(self.quirks.unsigned_thinking))
+    }
+
+    /// Anthropic takes call ids of `[A-Za-z0-9_-]`, at most 64 long.
+    fn tool_id(&self, id: &str) -> Option<String> {
+        let fitted = match super::schema::legal_call_id(id, 64) {
+            // An id with nothing legal in it still names its call.
+            legal if legal.is_empty() => super::schema::short_hash(id),
+            legal => legal,
+        };
+        (fitted != id).then_some(fitted)
+    }
+
+    /// The status decides, refined by the envelope's `error.type` where it
+    /// says more (a `billing_error`, an `overloaded_error` on any status).
+    fn error(&self, status: u16, headers: &http::HeaderMap, body: &[u8]) -> Error {
+        let mut error = Error::from_status(status, headers, body);
+        let kind = serde_json::from_slice::<serde_json::Value>(body)
+            .ok()
+            .and_then(|envelope| {
+                let kind = envelope.pointer("/error/type")?.as_str()?;
+                Some(Error::provider(Some(kind), String::new()).kind)
+            });
+        // A gateway may wrap a rejected request as an `api_error`: a 4xx stays
+        // the client's fault.
+        let rejected = (400..500).contains(&status);
+        if let Some(kind) = kind.filter(|kind| {
+            !(matches!(
+                kind,
+                crate::Kind::Other | crate::Kind::InvalidRequest | crate::Kind::ContextOverflow
+            ) || rejected && *kind == crate::Kind::Server)
+        }) {
+            error.kind = kind;
+        }
+        error
+    }
+}
+
+const fn host(
+    id: &'static str,
+    base_url: &'static str,
+    key_env: &'static [&'static str],
+    base_url_env: &'static [&'static str],
+) -> Host {
+    Host {
+        id,
+        base_url,
+        key_env,
+        base_url_env,
+        key: KeyStyle::Header("x-api-key"),
+        keyless: false,
+    }
+}
+
+/// The hosts that serve the Messages API, with their quirks.
+pub const HOSTS: &[(Host, Quirks)] = &[
+    (
+        host(
+            "anthropic",
+            "https://api.anthropic.com",
+            &["ANTHROPIC_API_KEY"],
+            &["ANTHROPIC_BASE_URL"],
+        ),
+        Quirks::ANTHROPIC,
+    ),
+    (
+        host(
+            "zai",
+            "https://api.z.ai/api/anthropic",
+            &["ZAI_API_KEY"],
+            &["ZAI_ANTHROPIC_API_BASE"],
+        ),
+        Quirks {
+            dialect: Dialect::ZAi,
+            ..Quirks::GATEWAY
+        },
+    ),
+    (
+        host(
+            "minimax",
+            "https://api.minimax.io/anthropic",
+            &["MINIMAX_API_KEY"],
+            &["MINIMAX_ANTHROPIC_API_BASE"],
+        ),
+        Quirks {
+            dialect: Dialect::MiniMax,
+            ..Quirks::GATEWAY
+        },
+    ),
+    (
+        host(
+            "moonshot",
+            "https://api.moonshot.ai/anthropic",
+            &["MOONSHOT_API_KEY"],
+            &["MOONSHOT_ANTHROPIC_API_BASE"],
+        ),
+        Quirks {
+            dialect: Dialect::Moonshot,
+            unsigned_thinking: true,
+            ..Quirks::GATEWAY
+        },
+    ),
+    (
+        host(
+            "xiaomimimo",
+            "https://api.xiaomimimo.com/anthropic",
+            &["XIAOMI_MIMO_API_KEY"],
+            &["XIAOMI_MIMO_ANTHROPIC_API_BASE"],
+        ),
+        Quirks {
+            dialect: Dialect::MiMo,
+            ..Quirks::GATEWAY
+        },
+    ),
+];
+
+#[cfg(test)]
+mod tests;

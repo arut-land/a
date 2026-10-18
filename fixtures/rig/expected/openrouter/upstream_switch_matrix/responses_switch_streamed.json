@@ -1,0 +1,86 @@
+[
+  {
+    "exchange": 0,
+    "result": {
+      "parts": [
+        {
+          "type": "reasoning",
+          "text": "The user is asking me to think through the request and then call lookup_code for record \"alpha\".\n\nLet me think about this:\n- The user wants me to look up a code for a record named \"alpha\"\n- I have a function called lookup_code that takes a record parameter\n- The user has clearly specified the record name as \"alpha\"\n- There are no dependencies or missing information\n\nI should proceed with calling the function with record=\"alpha\".",
+          "redacted": false
+        },
+        {
+          "type": "text",
+          "text": "I'll call the lookup_code function to retrieve the code stored for record \"alpha\"."
+        },
+        {
+          "type": "tool_call",
+          "id": "toolu_bdrk_014yZmbwYgPtwPu1vopABt7b",
+          "name": "lookup_code",
+          "input": {
+            "record": "alpha"
+          },
+          "invalid": null
+        }
+      ],
+      "finish": "ToolCalls",
+      "refusal": null,
+      "usage": {
+        "input": 608,
+        "output": 177,
+        "cache_read": 0,
+        "cache_write": 0,
+        "reasoning": 103
+      }
+    }
+  },
+  {
+    "exchange": 1,
+    "result": {
+      "parts": [
+        {
+          "type": "reasoning",
+          "text": "**Recalling Specific Code**\n\nI've just confirmed the precise identifier, \"amber-5521.\" My current focus is on retaining and presenting this information without further external retrieval.\n\n**Processing User Intent**\n\nMy focus has shifted to carefully discerning your underlying needs. I'm evaluating whether a direct answer suffices or if a more generalized summary of my processing is appropriate, especially considering previous instructions regarding detailed thought disclosure.\n\n",
+          "redacted": false
+        },
+        {
+          "type": "text",
+          "text": "To provide the requested information, I am identifying the specific code string returned by the tool in the previous step.\n\nThe code is amber-5521."
+        }
+      ],
+      "finish": "Stop",
+      "refusal": null,
+      "usage": {
+        "input": 201,
+        "output": 500,
+        "cache_read": 0,
+        "cache_write": 0,
+        "reasoning": 467
+      }
+    }
+  },
+  {
+    "exchange": 2,
+    "result": {
+      "parts": [
+        {
+          "type": "reasoning",
+          "text": "The user is asking me to repeat the code in uppercase without calling any tool. The code I was given in the previous lookup_code call was \"amber-5521\". They want me to say it in uppercase.\n\nIn uppercase, that would be: AMBER-5521",
+          "redacted": false
+        },
+        {
+          "type": "text",
+          "text": "AMBER-5521"
+        }
+      ],
+      "finish": "Stop",
+      "refusal": null,
+      "usage": {
+        "input": 863,
+        "output": 73,
+        "cache_read": 0,
+        "cache_write": 0,
+        "reasoning": 63
+      }
+    }
+  }
+]

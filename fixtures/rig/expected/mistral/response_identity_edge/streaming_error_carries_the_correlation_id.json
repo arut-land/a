@@ -1,0 +1,9 @@
+[
+  {
+    "exchange": 0,
+    "result": {
+      "error": "ProviderResponseError: status 400 Bad Request: {\"code\":\"1500\",\"message\":\"Invalid model: definitely-not-a-model\",\"object\":\"error\",\"param\":null,\"raw_status_code\":400,\"type\":\"invalid_model\"} (request id: req_REDACTED_1)",
+      "events": 0
+    }
+  }
+]

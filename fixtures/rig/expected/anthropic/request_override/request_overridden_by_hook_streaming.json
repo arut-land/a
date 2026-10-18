@@ -1,0 +1,72 @@
+[
+  {
+    "exchange": 0,
+    "result": {
+      "parts": [
+        {
+          "type": "tool_call",
+          "id": "toolu_01KAijnCPPnsF91MLThAaHz6",
+          "name": "get_weather",
+          "input": {
+            "location": "Paris"
+          },
+          "invalid": null
+        }
+      ],
+      "finish": "ToolCalls",
+      "refusal": null,
+      "usage": {
+        "input": 692,
+        "output": 38,
+        "cache_read": 0,
+        "cache_write": 0,
+        "reasoning": null
+      }
+    }
+  },
+  {
+    "exchange": 1,
+    "result": {
+      "parts": [
+        {
+          "type": "tool_call",
+          "id": "toolu_018jdaqPMzX3FbBDMc6kx8xj",
+          "name": "get_time",
+          "input": {
+            "timezone": "Europe/Paris"
+          },
+          "invalid": null
+        }
+      ],
+      "finish": "ToolCalls",
+      "refusal": null,
+      "usage": {
+        "input": 742,
+        "output": 55,
+        "cache_read": 0,
+        "cache_write": 0,
+        "reasoning": null
+      }
+    }
+  },
+  {
+    "exchange": 2,
+    "result": {
+      "parts": [
+        {
+          "type": "text",
+          "text": "Great news — here's a quick travel briefing for **Paris** to help you prepare:\n\n---\n\n🕛 **Current Local Time:** 12:00 PM (Noon)\n*Paris is in the **Europe/Paris** timezone (CET/CEST). Make sure to adjust your schedule accordingly!*\n\n🌤️ **Current Weather:** 18°C (64°F) — Clear skies\n*The weather is lovely! Here are some packing tips:*\n- 👕 Light layers are ideal — comfortable for sightseeing\n- 🧥 Bring a light jacket for the evenings, which can be cooler\n- ☀️ Sunglasses and sunscreen are a good idea with clear skies\n- 👟 Comfortable walking shoes are a must for exploring the city\n\n---\n\n🗼 **Quick Paris Travel Tips:**\n- **Language:** French — a few basic phrases go a long way!\n- **Currency:** Euro (€)\n- **Transport:** The Metro is fast, affordable, and covers the whole city\n- **Must-sees:** Eiffel Tower, The Louvre, Notre-Dame, Montmartre, and the Seine River\n\nWould you like advice on specific activities, neighborhoods to stay in, or anything else for your Paris trip? 🗺️"
+        }
+      ],
+      "finish": "Stop",
+      "refusal": null,
+      "usage": {
+        "input": 812,
+        "output": 302,
+        "cache_read": 0,
+        "cache_write": 0,
+        "reasoning": null
+      }
+    }
+  }
+]

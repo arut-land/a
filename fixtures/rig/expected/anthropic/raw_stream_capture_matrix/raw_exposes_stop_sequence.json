@@ -1,0 +1,17 @@
+[
+  {
+    "exchange": 0,
+    "result": {
+      "parts": [],
+      "finish": "Stop",
+      "refusal": null,
+      "usage": {
+        "input": 18,
+        "output": 1,
+        "cache_read": 0,
+        "cache_write": 0,
+        "reasoning": null
+      }
+    }
+  }
+]

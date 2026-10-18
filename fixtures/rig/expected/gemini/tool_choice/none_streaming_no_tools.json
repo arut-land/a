@@ -1,0 +1,22 @@
+[
+  {
+    "exchange": 0,
+    "result": {
+      "parts": [
+        {
+          "type": "text",
+          "text": "42"
+        }
+      ],
+      "finish": "Stop",
+      "refusal": null,
+      "usage": {
+        "input": 146,
+        "output": 41,
+        "cache_read": null,
+        "cache_write": null,
+        "reasoning": 39
+      }
+    }
+  }
+]

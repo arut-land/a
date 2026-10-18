@@ -1,0 +1,145 @@
+[
+  {
+    "exchange": 0,
+    "result": {
+      "parts": [
+        {
+          "type": "text",
+          "text": "I'll run the scenario step by step, one tool call at a time."
+        },
+        {
+          "type": "tool_call",
+          "id": "call_00_F5Syx6vpsQzeGSFllG1l8635",
+          "name": "ping_empty",
+          "input": {},
+          "invalid": null
+        }
+      ],
+      "finish": "ToolCalls",
+      "refusal": null,
+      "usage": {
+        "input": 762,
+        "output": 36,
+        "cache_read": 512,
+        "cache_write": null,
+        "reasoning": null
+      }
+    }
+  },
+  {
+    "exchange": 1,
+    "result": {
+      "parts": [
+        {
+          "type": "tool_call",
+          "id": "call_00_mIaxQekKwyZ22TKsLICk2898",
+          "name": "inspect_manifest",
+          "input": {
+            "project": "rig-deepseek",
+            "flags": {
+              "critical": true,
+              "retries": 2
+            },
+            "steps": [
+              {
+                "name": "plan",
+                "weight": 1
+              },
+              {
+                "name": "verify",
+                "weight": 2
+              }
+            ],
+            "note": "line one; line two says \"hello\" and path C:\\rig\\deepseek"
+          },
+          "invalid": null
+        }
+      ],
+      "finish": "ToolCalls",
+      "refusal": null,
+      "usage": {
+        "input": 815,
+        "output": 140,
+        "cache_read": 640,
+        "cache_write": null,
+        "reasoning": null
+      }
+    }
+  },
+  {
+    "exchange": 2,
+    "result": {
+      "parts": [
+        {
+          "type": "tool_call",
+          "id": "call_00_4UM229aYebXihyBBCuh31218",
+          "name": "join_labels",
+          "input": {
+            "labels": [
+              "north",
+              "beta gamma",
+              "quote:\"delta\"",
+              "slash\\path"
+            ],
+            "separator": "|"
+          },
+          "invalid": null
+        }
+      ],
+      "finish": "ToolCalls",
+      "refusal": null,
+      "usage": {
+        "input": 985,
+        "output": 73,
+        "cache_read": 768,
+        "cache_write": null,
+        "reasoning": null
+      }
+    }
+  },
+  {
+    "exchange": 3,
+    "result": {
+      "parts": [
+        {
+          "type": "tool_call",
+          "id": "call_00_1ozqnVerWB6gp3EuDIUK8311",
+          "name": "escape_echo",
+          "input": {
+            "text": "Line 1\nLine \"2\" with backslash \\ and unicode snowman ☃"
+          },
+          "invalid": null
+        }
+      ],
+      "finish": "ToolCalls",
+      "refusal": null,
+      "usage": {
+        "input": 1087,
+        "output": 56,
+        "cache_read": 896,
+        "cache_write": null,
+        "reasoning": null
+      }
+    }
+  },
+  {
+    "exchange": 4,
+    "result": {
+      "parts": [
+        {
+          "type": "text",
+          "text": "All checks passed: EMPTY-OK, MANIFEST-OK, LABELS-OK, and ESCAPE-OK."
+        }
+      ],
+      "finish": "Stop",
+      "refusal": null,
+      "usage": {
+        "input": 1179,
+        "output": 26,
+        "cache_read": 1024,
+        "cache_write": null,
+        "reasoning": null
+      }
+    }
+  }
+]

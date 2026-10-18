@@ -1,0 +1,28 @@
+[
+  {
+    "exchange": 0,
+    "result": {
+      "parts": [
+        {
+          "type": "tool_call",
+          "id": "toolu_01NGZZvC7Q9QkrrijrimpyfQ",
+          "name": "write_note",
+          "input": {
+            "title": "Rust",
+            "body": "The Rust programming language has a fascinating history that traces back to a personal project and grew into one of the most beloved systems programming languages in the world. Its journey from a side experiment to a mainstream language is a testament to the power of community-driven development and a clear vision for safer, more reliable software.\n\nRust was originally conceived around 2006 by Graydon Hoare, a Mozilla employee who began working on the language as a personal project. Hoare was motivated by frustrations with existing systems programming languages, particularly the difficulty of writing memory-safe code in C and C++. He envisioned a language that could offer the low-level performance and control of C while eliminating entire classes of bugs related to memory management, such as null pointer dereferences, buffer overflows, and data races.\n\nMozilla officially began sponsoring the Rust project in 2009, recognizing its potential to build safer and more reliable software infrastructure. The language was intended, in part, to serve as the foundation for a new browser engine called Servo, which Mozilla was developing as a research project to explore parallel and safe web rendering. This gave Rust a real-world proving ground and helped shape many of its core design decisions.\n\nThe first stable release of Rust, version 1.0, was announced on May 15, 2015. This milestone marked a major turning point, signaling that the language had reached a level of maturity and stability suitable for production use. The release was accompanied by a strong commitment to backward compatibility, assuring developers that future versions would not break existing code.\n\nFollowing the 1.0 release, Rust's popularity grew steadily. It introduced a unique ownership and borrowing system that enforces memory safety at compile time without the need for a garbage collector. This innovation allowed developers to write highly performant code while avoiding many of the pitfalls common in systems programming.\n\nIn 2021, the Rust Foundation was established as an independent nonprofit organization to steward the language and support its growing ecosystem. Founding members included major technology companies such as Mozilla, Microsoft, Google, Amazon, and Huawei, reflecting the language's widespread industry adoption.\n\nRust has consistently ranked as the most admired programming language in Stack Overflow's annual developer surveys for nearly a decade. Today, it is used in operating systems, web browsers, cloud infrastructure, embedded systems, and beyond, cementing its place as a transformative force in modern software development."
+          },
+          "invalid": null
+        }
+      ],
+      "finish": "ToolCalls",
+      "refusal": null,
+      "usage": {
+        "input": 629,
+        "output": 591,
+        "cache_read": 0,
+        "cache_write": 0,
+        "reasoning": null
+      }
+    }
+  }
+]

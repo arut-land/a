@@ -1,0 +1,27 @@
+[
+  {
+    "exchange": 0,
+    "result": {
+      "parts": [
+        {
+          "type": "reasoning",
+          "text": "Hmm, the user wants me to reply with exactly one word: \"streamed\" and nothing else. \n\nThis seems straightforward - they're testing if I can follow precise instructions without adding anything. \n\nI recall the instruction says \"exactly this one word and nothing else\" so I must avoid any extra spaces, punctuation, or text. \n\nThe word \"streamed\" is already in the correct format. \n\nI'll just output it as requested - no explanations, no modifications. \n\nUser probably wants to see if I can be minimalist in responses. Maybe they're debugging something or testing AI behavior. \n\nOkay, response is locked in: just \"streamed\"\n",
+          "redacted": false
+        },
+        {
+          "type": "text",
+          "text": "streamed"
+        }
+      ],
+      "finish": "Stop",
+      "refusal": null,
+      "usage": {
+        "input": 21,
+        "output": 139,
+        "cache_read": null,
+        "cache_write": null,
+        "reasoning": null
+      }
+    }
+  }
+]

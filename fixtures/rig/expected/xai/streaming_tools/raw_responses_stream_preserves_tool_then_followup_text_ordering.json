@@ -1,0 +1,55 @@
+[
+  {
+    "exchange": 0,
+    "result": {
+      "parts": [
+        {
+          "type": "reasoning",
+          "text": "I will call get_status_word once and reply with the exact returned word in a short sentence.",
+          "redacted": false
+        },
+        {
+          "type": "tool_call",
+          "id": "call-6f736741-f6a6-4e41-a749-4839a8b8a442-0",
+          "name": "get_status_word",
+          "input": {},
+          "invalid": null
+        }
+      ],
+      "finish": "ToolCalls",
+      "refusal": null,
+      "usage": {
+        "input": 324,
+        "output": 282,
+        "cache_read": 192,
+        "cache_write": null,
+        "reasoning": 275
+      }
+    }
+  },
+  {
+    "exchange": 1,
+    "result": {
+      "parts": [
+        {
+          "type": "reasoning",
+          "text": "Preparing a one-sentence reply using only the provided tool result.\n\nThe tool result is \"azure\". The reply will be: \"The status word is azure.\"\n\nThe reply will be: \"The tool returned azure.\"",
+          "redacted": false
+        },
+        {
+          "type": "text",
+          "text": "The status word is azure."
+        }
+      ],
+      "finish": "Stop",
+      "refusal": null,
+      "usage": {
+        "input": 240,
+        "output": 509,
+        "cache_read": 128,
+        "cache_write": null,
+        "reasoning": 503
+      }
+    }
+  }
+]

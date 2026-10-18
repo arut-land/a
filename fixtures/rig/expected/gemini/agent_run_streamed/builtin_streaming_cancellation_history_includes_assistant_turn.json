@@ -1,0 +1,28 @@
+[
+  {
+    "exchange": 0,
+    "result": {
+      "parts": [
+        {
+          "type": "tool_call",
+          "id": "5be323d5-6663-4fe9-8c6c-508dca2f49f1",
+          "name": "add",
+          "input": {
+            "x": 21,
+            "y": 21
+          },
+          "invalid": null
+        }
+      ],
+      "finish": "ToolCalls",
+      "refusal": null,
+      "usage": {
+        "input": 109,
+        "output": 67,
+        "cache_read": null,
+        "cache_write": null,
+        "reasoning": 47
+      }
+    }
+  }
+]

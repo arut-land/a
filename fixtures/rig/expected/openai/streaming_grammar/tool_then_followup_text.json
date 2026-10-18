@@ -1,0 +1,50 @@
+[
+  {
+    "exchange": 0,
+    "result": {
+      "parts": [
+        {
+          "type": "tool_call",
+          "id": "call_lWZlGyrTej1Dov0dGJDf1U0M",
+          "name": "lookup_harbor_label",
+          "input": {},
+          "invalid": null
+        }
+      ],
+      "finish": "ToolCalls",
+      "refusal": null,
+      "usage": {
+        "input": 113,
+        "output": 17,
+        "cache_read": 0,
+        "cache_write": 0,
+        "reasoning": 0
+      }
+    }
+  },
+  {
+    "exchange": 1,
+    "result": {
+      "parts": [
+        {
+          "type": "reasoning",
+          "text": "",
+          "redacted": false
+        },
+        {
+          "type": "text",
+          "text": "The harbor label is crimson-harbor."
+        }
+      ],
+      "finish": "Stop",
+      "refusal": null,
+      "usage": {
+        "input": 136,
+        "output": 25,
+        "cache_read": 0,
+        "cache_write": 0,
+        "reasoning": 10
+      }
+    }
+  }
+]

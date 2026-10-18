@@ -1,0 +1,80 @@
+[
+  {
+    "exchange": 0,
+    "result": {
+      "parts": [
+        {
+          "type": "reasoning",
+          "text": "",
+          "redacted": false
+        },
+        {
+          "type": "tool_call",
+          "id": "call_2K29YYqsjSeq4wURCdv9vcq0",
+          "name": "lookup_harbor_label",
+          "input": {},
+          "invalid": null
+        }
+      ],
+      "finish": "ToolCalls",
+      "refusal": null,
+      "usage": {
+        "input": 130,
+        "output": 51,
+        "cache_read": 0,
+        "cache_write": 0,
+        "reasoning": 32
+      }
+    }
+  },
+  {
+    "exchange": 1,
+    "result": {
+      "parts": [
+        {
+          "type": "reasoning",
+          "text": "",
+          "redacted": false
+        },
+        {
+          "type": "text",
+          "text": "There are 12 such integers, and the tool output is crimson-harbor."
+        }
+      ],
+      "finish": "Stop",
+      "refusal": null,
+      "usage": {
+        "input": 153,
+        "output": 49,
+        "cache_read": 0,
+        "cache_write": 0,
+        "reasoning": 26
+      }
+    }
+  },
+  {
+    "exchange": 2,
+    "result": {
+      "parts": [
+        {
+          "type": "reasoning",
+          "text": "",
+          "redacted": false
+        },
+        {
+          "type": "text",
+          "text": "crimson-harbor"
+        }
+      ],
+      "finish": "Stop",
+      "refusal": null,
+      "usage": {
+        "input": 223,
+        "output": 23,
+        "cache_read": 0,
+        "cache_write": 0,
+        "reasoning": 12
+      }
+    }
+  }
+]

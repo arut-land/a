@@ -1,0 +1,196 @@
+when:
+  path: /v1/responses
+  method: POST
+  query_param: []
+  header:
+  - name: accept
+    value: text/event-stream
+  - name: content-type
+    value: application/json
+  body: '{"include":["reasoning.encrypted_content"],"input":[{"content":[{"text":"What''s the weather in Paris right now?","type":"input_text"}],"role":"user","type":"message"}],"instructions":"Before you call any tool, first send the user one short sentence saying what you are about to do. Then call the tool.","max_output_tokens":600,"model":"gpt-5.3-codex","reasoning":{"effort":"low"},"store":false,"stream":true,"tools":[{"description":"Look up the current weather for a city.","name":"get_weather","parameters":{"properties":{"city":{"type":"string"}},"required":["city"],"type":"object"},"strict":false,"type":"function"}]}'
+then:
+  status: 200
+  header:
+  - name: content-type
+    value: text/event-stream; charset=utf-8
+  - name: x-request-id
+    value: req_1fcaa3c9f9f54d0a9dab7218d99704d6
+  body: |+
+    event: response.created
+    data: {"response":{"access_programs":null,"background":false,"completed_at":null,"created_at":0,"error":null,"frequency_penalty":0.0,"id":"resp_0645eb46766b636c016abf34b7ad8487d0acfd7de3b39ddb3f","incomplete_details":null,"instructions":"Before you call any tool, first send the user one short sentence saying what you are about to do. Then call the tool.","max_output_tokens":600,"max_tool_calls":null,"metadata":{},"model":"gpt-5.3-codex","moderation":null,"object":"response","output":[],"parallel_tool_calls":true,"presence_penalty":0.0,"previous_response_id":null,"prompt_cache_key":null,"prompt_cache_retention":"24h","reasoning":{"context":"current_turn","effort":"low","mode":"standard","summary":null},"safety_identifier":null,"service_tier":"auto","status":"in_progress","store":false,"temperature":1.0,"text":{"format":{"type":"text"},"verbosity":"medium"},"tool_choice":"auto","tool_usage":{"image_gen":{"input_tokens":0,"input_tokens_details":{"image_tokens":0,"text_tokens":0},"output_tokens":0,"output_tokens_details":{"image_tokens":0,"text_tokens":0},"total_tokens":0},"web_search":{"num_requests":0}},"tools":[{"description":"Look up the current weather for a city.","name":"get_weather","output_schema":null,"parameters":{"properties":{"city":{"type":"string"}},"required":["city"],"type":"object"},"strict":false,"type":"function"}],"top_logprobs":0,"top_p":0.98,"truncation":"disabled","usage":null,"user":null},"sequence_number":0,"type":"response.created"}
+
+    event: response.in_progress
+    data: {"response":{"access_programs":null,"background":false,"completed_at":null,"created_at":0,"error":null,"frequency_penalty":0.0,"id":"resp_0645eb46766b636c016abf34b7ad8487d0acfd7de3b39ddb3f","incomplete_details":null,"instructions":"Before you call any tool, first send the user one short sentence saying what you are about to do. Then call the tool.","max_output_tokens":600,"max_tool_calls":null,"metadata":{},"model":"gpt-5.3-codex","moderation":null,"object":"response","output":[],"parallel_tool_calls":true,"presence_penalty":0.0,"previous_response_id":null,"prompt_cache_key":null,"prompt_cache_retention":"24h","reasoning":{"context":"current_turn","effort":"low","mode":"standard","summary":null},"safety_identifier":null,"service_tier":"auto","status":"in_progress","store":false,"temperature":1.0,"text":{"format":{"type":"text"},"verbosity":"medium"},"tool_choice":"auto","tool_usage":{"image_gen":{"input_tokens":0,"input_tokens_details":{"image_tokens":0,"text_tokens":0},"output_tokens":0,"output_tokens_details":{"image_tokens":0,"text_tokens":0},"total_tokens":0},"web_search":{"num_requests":0}},"tools":[{"description":"Look up the current weather for a city.","name":"get_weather","output_schema":null,"parameters":{"properties":{"city":{"type":"string"}},"required":["city"],"type":"object"},"strict":false,"type":"function"}],"top_logprobs":0,"top_p":0.98,"truncation":"disabled","usage":null,"user":null},"sequence_number":1,"type":"response.in_progress"}
+
+    event: response.output_item.added
+    data: {"item":{"content":[],"encrypted_content":"gAAAAABqvzS4u2iO1bDOJ_SBWRuPKRCzVTrzuGfkfzdkFZ0svKNn18Er8LG3HiHfr9XtMgXUa3QAK_QjtRpNAPrlK4jTGlljxRfHEl7Dhyu-zjQ1F8H8m7bDoOuGCz2tVluYD2z_T-48hp9euZeyhBSRjhPUcqut1tM8AMCVjmObtHsLIk3i51-cERMXqwGZbxWH3RLrvVXFHR2j9YW1RpX6msVlmgVAaj7Hf7lFxBaoBAMA1QZMxLV37i1z-zjRjjqu3t9Tzs2OzdmEwXZj7F8mGv1a25EdwLmPqynIoy0JNezUUcnEg1h5ScWj6pgAG1LxJ9-qRDBDiI2QpFDF_3JXBVP9wguAfvk7xFoZDQA-kWgfwEc9rKRiZOku97dgxh5wXtH2oZjlwzrdlAOogFMj3wdv1d1dulcuQuLN8vx0QzyLXxONqQllcQPsEqorVRkQw6StGAP5howWdC72AQ83s7OSn73iWiElbQjQrqjEiNYS1Gw4WjhBhvzHnOEMSkbGr8dhK9FN6ydtQa7RhERzFm_9VVZHu8NNMgtCaIsqKOMnqIwunx6SMSW9TGPGkhutFbsrNz6HDQzi9SeQP3hzzxXneUMgOGTx5G8MuqLSVSraK7PfcLpEjoMwuUsihsaxKw3th5eHSlANOGCNXD7p6xGzIW604QRGEGcw26S8HNXVrl6bj37MHaM3uRPyOcboAzVN4GyKytJJGuEEr7xgBKsKdY394sc4AInvrltbKAO7QYImbBh9Sv3OSYlWC5soXe_p8YUz-B56PeK_DU7psStw_CDHkTTjotytViUUfstYLJJFn_v7d9iHsrQfoZzLlG9Nr35TdmfltVsvywwr_YZUhrocBRkYJXw2UHq9kt8Bavx0Lg80R8w2OPhzpGkLWQuz7a9bUG9lD_N6-Mbh6vlDKK7-7o6gEgkl4MWvBLeoQBrL6yyuDj1YlbTsljo5OAdeeK1kNX4ivdyTlSGmzC9FDXle0O1oZGmhQhLpfzICUYpZEvpavi1tgQFV1FW-0zWR8WcoMHI9TiYnugRYEcgkGO5_1dNeYKRscOEx3vJROO2z2H1PVyiLwewy1sSjo0k6lMseslntDVeFuc24OzMMOvxOb7clWr6Ydv93LOViaze-ukSxpFItpSC1c33gp8dpoJLI7tEP9i9nR3e1ZmY1H2Haig==","id":"rs_0645eb46766b636c016abf34b83b8c87d0b7ffea80448d6a5e","summary":[],"type":"reasoning"},"output_index":0,"sequence_number":2,"type":"response.output_item.added"}
+
+    event: response.output_item.done
+    data: {"item":{"content":[],"encrypted_content":"gAAAAABqvzS422rw0Sm6-U6jyixkJN1KyDtw-F_nCKP4FW_xDBXl3FT7yvvBEsnP1JGgnpsclmhgjP8VhmP22ABlRmCNmmVs6bOjwE3h9Bvxw_LCKeVGi_gTvNDW3HBLJEgHn1oy1moDEIba7DVSpLwYiyxhM5IxVQ9wFTUVKQtHSFulEhW6yxNjS2jGPtWpEJvvJPNBVqJBRi67lO8_S158gDAMs7y23rs8iLKuHkZaUmqEjL03rwW4Xc_VKlSqsqmhPhzDZvIqDMbtDQ6vRe4tOoLrIttse2EzCw5juTOTOjsnhasoRBSJCgRErWYFgP6HVMzNa3_WCGL4tN97tg6Tt2wMArGPR779sgBVFMMpH-40m1IHoKke7J8Qzoe1_uYmdYfNZLIZktlcKRptLTnVBLxeb-OUOY85WQmiw9ZJ4hPNa2g9JPNiTLgARj9DlYRQ4CXsTyDpAYIIJRUWApI09Ji-Cg8KnLbgsnzrY6VuN_eE1VhH1ImqvNxCRXYOekRWml_XYvTix6r2_W8H5jxdkFLsTl2PWjBSIZcDUfrsiZmXjRbinLoq-uME1c21LU-3Zr82ztOrJ8Dr2y6lrESDYIkb0Raa75WYjPvrF5FVyP1dDJzXhKCIWubkJO9UnDKihbuWeo2hFxYoYkzIXPftDv8hshUk6BHGp184BgjEowd9ZgLETslxbN56RIBaUi2NinY2tzrSkTMKjaZPCRIX0K3rsnnQ9KfYyEv6V3DHC2arxFDyy4XgRB6DJHgtFTDyELfCrBFOgACoHN9LYbCX-WWejPo1QlmbwFAYX1BWbeDrb_lLMNsHGbVQs_gv2WaRp4la0tOqe6qAZ0KPXzsITqGL6Sq2RiaUppwtKoC1Ko9NHkY7Au4f88boWnqBojlb6-ey18zJVbaZfwF_zDA9UfmzqGkuxt0X9Vw-pcBIojh70JGqdKbmJbyn_eP-HpW_wN5n_cXTi0ReC-oXY1LXW_s_tuOJG_daG73mknKzIQe938Zw2DTZ039ufBUXFgVNmfQQzYCNFdStEPcI3GSwmJx0kijkBL27V2DdMDyTmNfCCjSPgUfls9jpSRrPrW9wIOZuZzj2U8yUjUglj4Mpr_2vbDnRpubcOV3V_BBqCUewZjL178-qHEUm0OVul6i8vmPH-QJblHQgt_Pjsd-RA5La9NhoitPYTSeICwHINeqq8GCsJJ9PrRMH9Xp3zhfQftwdsi96RVZNK3Xe8xsGTZDKgZvvWLt332BmhjvBELI82hHsTFsrxQGNXFwopo-aw3Q-HCvZ","id":"rs_0645eb46766b636c016abf34b83b8c87d0b7ffea80448d6a5e","summary":[],"type":"reasoning"},"output_index":0,"sequence_number":3,"type":"response.output_item.done"}
+
+    event: response.output_item.added
+    data: {"item":{"content":[],"id":"msg_0645eb46766b636c016abf34b86b2087d0b6c8da061d9b2be7","phase":"commentary","role":"assistant","status":"in_progress","type":"message"},"output_index":1,"sequence_number":4,"type":"response.output_item.added"}
+
+    event: response.content_part.added
+    data: {"content_index":0,"item_id":"msg_0645eb46766b636c016abf34b86b2087d0b6c8da061d9b2be7","output_index":1,"part":{"annotations":[],"logprobs":[],"text":"","type":"output_text"},"sequence_number":5,"type":"response.content_part.added"}
+
+    event: response.output_text.delta
+    data: {"content_index":0,"delta":"I","item_id":"msg_0645eb46766b636c016abf34b86b2087d0b6c8da061d9b2be7","logprobs":[],"obfuscation":"jhEfg2zJizPFXbj","output_index":1,"sequence_number":6,"type":"response.output_text.delta"}
+
+    event: response.output_text.delta
+    data: {"content_index":0,"delta":"’ll","item_id":"msg_0645eb46766b636c016abf34b86b2087d0b6c8da061d9b2be7","logprobs":[],"obfuscation":"LzpFCM8ABVmIC","output_index":1,"sequence_number":7,"type":"response.output_text.delta"}
+
+    event: response.output_text.delta
+    data: {"content_index":0,"delta":" quickly","item_id":"msg_0645eb46766b636c016abf34b86b2087d0b6c8da061d9b2be7","logprobs":[],"obfuscation":"nOM9bgVy","output_index":1,"sequence_number":8,"type":"response.output_text.delta"}
+
+    event: response.output_text.delta
+    data: {"content_index":0,"delta":" check","item_id":"msg_0645eb46766b636c016abf34b86b2087d0b6c8da061d9b2be7","logprobs":[],"obfuscation":"cCdTX7EPzT","output_index":1,"sequence_number":9,"type":"response.output_text.delta"}
+
+    event: response.output_text.delta
+    data: {"content_index":0,"delta":" the","item_id":"msg_0645eb46766b636c016abf34b86b2087d0b6c8da061d9b2be7","logprobs":[],"obfuscation":"U946lgyRm92j","output_index":1,"sequence_number":10,"type":"response.output_text.delta"}
+
+    event: response.output_text.delta
+    data: {"content_index":0,"delta":" current","item_id":"msg_0645eb46766b636c016abf34b86b2087d0b6c8da061d9b2be7","logprobs":[],"obfuscation":"uujNH7Ue","output_index":1,"sequence_number":11,"type":"response.output_text.delta"}
+
+    event: response.output_text.delta
+    data: {"content_index":0,"delta":" weather","item_id":"msg_0645eb46766b636c016abf34b86b2087d0b6c8da061d9b2be7","logprobs":[],"obfuscation":"8e1zfGVB","output_index":1,"sequence_number":12,"type":"response.output_text.delta"}
+
+    event: response.output_text.delta
+    data: {"content_index":0,"delta":" in","item_id":"msg_0645eb46766b636c016abf34b86b2087d0b6c8da061d9b2be7","logprobs":[],"obfuscation":"TTaGcu3GF80W3","output_index":1,"sequence_number":13,"type":"response.output_text.delta"}
+
+    event: response.output_text.delta
+    data: {"content_index":0,"delta":" Paris","item_id":"msg_0645eb46766b636c016abf34b86b2087d0b6c8da061d9b2be7","logprobs":[],"obfuscation":"NPHHKxeWVK","output_index":1,"sequence_number":14,"type":"response.output_text.delta"}
+
+    event: response.output_text.delta
+    data: {"content_index":0,"delta":" now","item_id":"msg_0645eb46766b636c016abf34b86b2087d0b6c8da061d9b2be7","logprobs":[],"obfuscation":"bB1lYBlQJKZ1","output_index":1,"sequence_number":15,"type":"response.output_text.delta"}
+
+    event: response.output_text.delta
+    data: {"content_index":0,"delta":".","item_id":"msg_0645eb46766b636c016abf34b86b2087d0b6c8da061d9b2be7","logprobs":[],"obfuscation":"3TKW1wXTncciupP","output_index":1,"sequence_number":16,"type":"response.output_text.delta"}
+
+    event: response.output_text.done
+    data: {"content_index":0,"item_id":"msg_0645eb46766b636c016abf34b86b2087d0b6c8da061d9b2be7","logprobs":[],"output_index":1,"sequence_number":17,"text":"I’ll quickly check the current weather in Paris now.","type":"response.output_text.done"}
+
+    event: response.content_part.done
+    data: {"content_index":0,"item_id":"msg_0645eb46766b636c016abf34b86b2087d0b6c8da061d9b2be7","output_index":1,"part":{"annotations":[],"logprobs":[],"text":"I’ll quickly check the current weather in Paris now.","type":"output_text"},"sequence_number":18,"type":"response.content_part.done"}
+
+    event: response.output_item.done
+    data: {"item":{"content":[{"annotations":[],"logprobs":[],"text":"I’ll quickly check the current weather in Paris now.","type":"output_text"}],"id":"msg_0645eb46766b636c016abf34b86b2087d0b6c8da061d9b2be7","phase":"commentary","role":"assistant","status":"completed","type":"message"},"output_index":1,"sequence_number":19,"type":"response.output_item.done"}
+
+    event: response.output_item.added
+    data: {"item":{"arguments":"","call_id":"call_idkUrOZF9QGSSAjBx290pxZQ","id":"fc_0645eb46766b636c016abf34b8928c87d0a49e83331eeeffa6","name":"get_weather","status":"in_progress","type":"function_call"},"output_index":2,"sequence_number":20,"type":"response.output_item.added"}
+
+    event: response.function_call_arguments.delta
+    data: {"delta":"{\"","item_id":"fc_0645eb46766b636c016abf34b8928c87d0a49e83331eeeffa6","obfuscation":"xHqkvvp2iZDbYc","output_index":2,"sequence_number":21,"type":"response.function_call_arguments.delta"}
+
+    event: response.function_call_arguments.delta
+    data: {"delta":"city","item_id":"fc_0645eb46766b636c016abf34b8928c87d0a49e83331eeeffa6","obfuscation":"eFSHDQeOkQRN","output_index":2,"sequence_number":22,"type":"response.function_call_arguments.delta"}
+
+    event: response.function_call_arguments.delta
+    data: {"delta":"\":\"","item_id":"fc_0645eb46766b636c016abf34b8928c87d0a49e83331eeeffa6","obfuscation":"3ebiwMJx0FqfP","output_index":2,"sequence_number":23,"type":"response.function_call_arguments.delta"}
+
+    event: response.function_call_arguments.delta
+    data: {"delta":"Paris","item_id":"fc_0645eb46766b636c016abf34b8928c87d0a49e83331eeeffa6","obfuscation":"TjXzQ3ZxUiO","output_index":2,"sequence_number":24,"type":"response.function_call_arguments.delta"}
+
+    event: response.function_call_arguments.delta
+    data: {"delta":"\"}","item_id":"fc_0645eb46766b636c016abf34b8928c87d0a49e83331eeeffa6","obfuscation":"hRt9ZQaLgBH6l3","output_index":2,"sequence_number":25,"type":"response.function_call_arguments.delta"}
+
+    event: response.function_call_arguments.done
+    data: {"arguments":"{\"city\":\"Paris\"}","item_id":"fc_0645eb46766b636c016abf34b8928c87d0a49e83331eeeffa6","output_index":2,"sequence_number":26,"type":"response.function_call_arguments.done"}
+
+    event: response.output_item.done
+    data: {"item":{"arguments":"{\"city\":\"Paris\"}","call_id":"call_idkUrOZF9QGSSAjBx290pxZQ","id":"fc_0645eb46766b636c016abf34b8928c87d0a49e83331eeeffa6","name":"get_weather","status":"completed","type":"function_call"},"output_index":2,"sequence_number":27,"type":"response.output_item.done"}
+
+    event: response.completed
+    data: {"response":{"access_programs":null,"background":false,"completed_at":0,"created_at":0,"error":null,"frequency_penalty":0.0,"id":"resp_0645eb46766b636c016abf34b7ad8487d0acfd7de3b39ddb3f","incomplete_details":null,"instructions":"Before you call any tool, first send the user one short sentence saying what you are about to do. Then call the tool.","max_output_tokens":600,"max_tool_calls":null,"metadata":{},"model":"gpt-5.3-codex","moderation":null,"object":"response","output":[{"content":[],"encrypted_content":"gAAAAABqvzS40dYiGyTdheOjaarKenemiaylKM_aWVbthSejIvBJOMjPoA0r7tMT8FbH1-FmRSdY0aZaaAXuip_wd1upsr539Hj7nGgze6rvB4CyxX7FIMAa2RcRsNWbqeMUxwN8Nx9_Kcp-pfR64RDqvkjU06Fe4EsGd1qp3hJkyuu_ZyYhYZULAHmrV-JrHfqoWiIvJlwVcXIi0jrI6lGlT-rjOT8kUfXYnPHGq-nXJSJJoOLKvHCZa5EVQ5cGVhYpiBEjH_GB6ZUc3n55clzhm-X3J5imhQfnjgaxXWFvX7IRXAdSLwyRd2DQUYdoRiIfdI7ElE9OgxcZUAl4prxgTdnUf88tUPykBdUHfzI33rIcJRQ330eZ6-dgqbswioYOtTMIpoWIDhGQTsQ1mInHZAhu_c4mDsY7wfYfEnY4JIYf-R4SCSXxZ5QPQGiJx0ytr3XMlPpcZFErr5zDL18Pp9cgIq--rpR4mRnTY4n0JVeIBz5b8_Wie8mxGIxC__p0T2_FtHBW8u2shRhyhpLmV0S0nwm0RIovs3aXs5VRvJjVhXQfMVJ-ysJoSK3EHRRTl1Pf9H3rr1P5fyEYIOZJJUDzeWyJgpg5gW2uQLTtCM_J6KoV_CwjyjE1OywZlw6w4ILL7lA-yyvdkb0u35qR0X3feBxQj123fbJbIoxi-xmjsEG4HJ9MMgB-l2x7aOlAHFVEdoQWvjCGFawBYo9tuWjNOc8JEhLfLBC9oYi8zut3M3rOryXEyIJzaZekoE8VgZ85psawdi3mPzIO6DF8kjDHB6zEqU3CJvu3mPHKKAEvlioThaEIfpJz4VCT2Vrb6qTclq7zqn9C5-Nl03NYEjFaBFKqAGKy7U7LD1wn7ZetGObtQJnG0gELLEGuhcA5fUsjHQ0cBK5_RtWVqJGScEig9Qx2T2FM6Mo5k2xto4SpN9TCATM4pykMBE9iIaVK-yh6xuQakWjlvvBhVXYO41LhcHg03iCx6wqQ3XqxuWzp4kf09bc3Vl_NJ01-mQjF60QaI8_mgUHG2Peo6AQI79E75bIkQgMKv8TlwGZ7PcVjvNAwSTYnL3cF-ZY48xTkLYJw-t2RRjggGey1GT0DAhBMv5Gnn6SnLCOWfWk1-YYzmrnN8jRZU-kLaT8p1O2ajHvSTLGJeK5posnUt-vfrUMRMmqcOKgyAYKYANT3Hh9cLYlJSyWAksLHW3MjImix_nV2Ij8f70lTjH2n6rxzYvTZIUom1aDijT9Pa90UHGcocHTXyPc8wTdNGmgCXA0WmXA2pXI4","id":"rs_0645eb46766b636c016abf34b83b8c87d0b7ffea80448d6a5e","summary":[],"type":"reasoning"},{"content":[{"annotations":[],"logprobs":[],"text":"I’ll quickly check the current weather in Paris now.","type":"output_text"}],"id":"msg_0645eb46766b636c016abf34b86b2087d0b6c8da061d9b2be7","phase":"commentary","role":"assistant","status":"completed","type":"message"},{"arguments":"{\"city\":\"Paris\"}","call_id":"call_idkUrOZF9QGSSAjBx290pxZQ","id":"fc_0645eb46766b636c016abf34b8928c87d0a49e83331eeeffa6","name":"get_weather","status":"completed","type":"function_call"}],"parallel_tool_calls":true,"presence_penalty":0.0,"previous_response_id":null,"prompt_cache_key":null,"prompt_cache_retention":"24h","reasoning":{"context":"current_turn","effort":"low","mode":"standard","summary":null},"safety_identifier":null,"service_tier":"default","status":"completed","store":false,"temperature":1.0,"text":{"format":{"type":"text"},"verbosity":"medium"},"tool_choice":"auto","tool_usage":{"image_gen":{"input_tokens":0,"input_tokens_details":{"image_tokens":0,"text_tokens":0},"output_tokens":0,"output_tokens_details":{"image_tokens":0,"text_tokens":0},"total_tokens":0},"web_search":{"num_requests":0}},"tools":[{"description":"Look up the current weather for a city.","name":"get_weather","output_schema":null,"parameters":{"properties":{"city":{"type":"string"}},"required":["city"],"type":"object"},"strict":false,"type":"function"}],"top_logprobs":0,"top_p":0.98,"truncation":"disabled","usage":{"input_tokens":83,"input_tokens_details":{"cache_write_tokens":0,"cached_tokens":0},"output_tokens":58,"output_tokens_details":{"reasoning_tokens":20},"total_tokens":141},"user":null},"sequence_number":28,"type":"response.completed"}
+
+---
+when:
+  path: /v1/responses
+  method: POST
+  query_param: []
+  header:
+  - name: accept
+    value: text/event-stream
+  - name: content-type
+    value: application/json
+  body: '{"include":["reasoning.encrypted_content"],"input":[{"content":[{"text":"What''s the weather in Paris right now?","type":"input_text"}],"role":"user","type":"message"},{"content":[],"encrypted_content":"gAAAAABqvzS422rw0Sm6-U6jyixkJN1KyDtw-F_nCKP4FW_xDBXl3FT7yvvBEsnP1JGgnpsclmhgjP8VhmP22ABlRmCNmmVs6bOjwE3h9Bvxw_LCKeVGi_gTvNDW3HBLJEgHn1oy1moDEIba7DVSpLwYiyxhM5IxVQ9wFTUVKQtHSFulEhW6yxNjS2jGPtWpEJvvJPNBVqJBRi67lO8_S158gDAMs7y23rs8iLKuHkZaUmqEjL03rwW4Xc_VKlSqsqmhPhzDZvIqDMbtDQ6vRe4tOoLrIttse2EzCw5juTOTOjsnhasoRBSJCgRErWYFgP6HVMzNa3_WCGL4tN97tg6Tt2wMArGPR779sgBVFMMpH-40m1IHoKke7J8Qzoe1_uYmdYfNZLIZktlcKRptLTnVBLxeb-OUOY85WQmiw9ZJ4hPNa2g9JPNiTLgARj9DlYRQ4CXsTyDpAYIIJRUWApI09Ji-Cg8KnLbgsnzrY6VuN_eE1VhH1ImqvNxCRXYOekRWml_XYvTix6r2_W8H5jxdkFLsTl2PWjBSIZcDUfrsiZmXjRbinLoq-uME1c21LU-3Zr82ztOrJ8Dr2y6lrESDYIkb0Raa75WYjPvrF5FVyP1dDJzXhKCIWubkJO9UnDKihbuWeo2hFxYoYkzIXPftDv8hshUk6BHGp184BgjEowd9ZgLETslxbN56RIBaUi2NinY2tzrSkTMKjaZPCRIX0K3rsnnQ9KfYyEv6V3DHC2arxFDyy4XgRB6DJHgtFTDyELfCrBFOgACoHN9LYbCX-WWejPo1QlmbwFAYX1BWbeDrb_lLMNsHGbVQs_gv2WaRp4la0tOqe6qAZ0KPXzsITqGL6Sq2RiaUppwtKoC1Ko9NHkY7Au4f88boWnqBojlb6-ey18zJVbaZfwF_zDA9UfmzqGkuxt0X9Vw-pcBIojh70JGqdKbmJbyn_eP-HpW_wN5n_cXTi0ReC-oXY1LXW_s_tuOJG_daG73mknKzIQe938Zw2DTZ039ufBUXFgVNmfQQzYCNFdStEPcI3GSwmJx0kijkBL27V2DdMDyTmNfCCjSPgUfls9jpSRrPrW9wIOZuZzj2U8yUjUglj4Mpr_2vbDnRpubcOV3V_BBqCUewZjL178-qHEUm0OVul6i8vmPH-QJblHQgt_Pjsd-RA5La9NhoitPYTSeICwHINeqq8GCsJJ9PrRMH9Xp3zhfQftwdsi96RVZNK3Xe8xsGTZDKgZvvWLt332BmhjvBELI82hHsTFsrxQGNXFwopo-aw3Q-HCvZ","id":"rs_0645eb46766b636c016abf34b83b8c87d0b7ffea80448d6a5e","summary":[],"type":"reasoning"},{"content":[{"annotations":[],"logprobs":[],"text":"I’ll quickly check the current weather in Paris now.","type":"output_text"}],"id":"msg_0645eb46766b636c016abf34b86b2087d0b6c8da061d9b2be7","phase":"commentary","role":"assistant","status":"completed","type":"message"},{"arguments":"{\"city\":\"Paris\"}","call_id":"call_idkUrOZF9QGSSAjBx290pxZQ","id":"fc_0645eb46766b636c016abf34b8928c87d0a49e83331eeeffa6","name":"get_weather","status":"completed","type":"function_call"},{"call_id":"call_idkUrOZF9QGSSAjBx290pxZQ","output":"Sunny, 21 °C.","status":"completed","type":"function_call_output"},{"content":[{"text":"Answer in one sentence. Do not call any tool.","type":"input_text"}],"role":"user","type":"message"}],"instructions":"Before you call any tool, first send the user one short sentence saying what you are about to do. Then call the tool.","max_output_tokens":600,"model":"gpt-5.3-codex","reasoning":{"effort":"low"},"store":false,"stream":true,"tools":[{"description":"Look up the current weather for a city.","name":"get_weather","parameters":{"properties":{"city":{"type":"string"}},"required":["city"],"type":"object"},"strict":false,"type":"function"}]}'
+then:
+  status: 200
+  header:
+  - name: content-type
+    value: text/event-stream; charset=utf-8
+  - name: x-request-id
+    value: req_90fd5e79c63949e4abaa6f9c9f6d40c8
+  body: |+
+    event: response.created
+    data: {"response":{"access_programs":null,"background":false,"completed_at":null,"created_at":0,"error":null,"frequency_penalty":0.0,"id":"resp_0645eb46766b636c016abf34b8d88c87d0a060ec83e167319b","incomplete_details":null,"instructions":"Before you call any tool, first send the user one short sentence saying what you are about to do. Then call the tool.","max_output_tokens":600,"max_tool_calls":null,"metadata":{},"model":"gpt-5.3-codex","moderation":null,"object":"response","output":[],"parallel_tool_calls":true,"presence_penalty":0.0,"previous_response_id":null,"prompt_cache_key":null,"prompt_cache_retention":"24h","reasoning":{"context":"current_turn","effort":"low","mode":"standard","summary":null},"safety_identifier":null,"service_tier":"auto","status":"in_progress","store":false,"temperature":1.0,"text":{"format":{"type":"text"},"verbosity":"medium"},"tool_choice":"auto","tool_usage":{"image_gen":{"input_tokens":0,"input_tokens_details":{"image_tokens":0,"text_tokens":0},"output_tokens":0,"output_tokens_details":{"image_tokens":0,"text_tokens":0},"total_tokens":0},"web_search":{"num_requests":0}},"tools":[{"description":"Look up the current weather for a city.","name":"get_weather","output_schema":null,"parameters":{"properties":{"city":{"type":"string"}},"required":["city"],"type":"object"},"strict":false,"type":"function"}],"top_logprobs":0,"top_p":0.98,"truncation":"disabled","usage":null,"user":null},"sequence_number":0,"type":"response.created"}
+
+    event: response.in_progress
+    data: {"response":{"access_programs":null,"background":false,"completed_at":null,"created_at":0,"error":null,"frequency_penalty":0.0,"id":"resp_0645eb46766b636c016abf34b8d88c87d0a060ec83e167319b","incomplete_details":null,"instructions":"Before you call any tool, first send the user one short sentence saying what you are about to do. Then call the tool.","max_output_tokens":600,"max_tool_calls":null,"metadata":{},"model":"gpt-5.3-codex","moderation":null,"object":"response","output":[],"parallel_tool_calls":true,"presence_penalty":0.0,"previous_response_id":null,"prompt_cache_key":null,"prompt_cache_retention":"24h","reasoning":{"context":"current_turn","effort":"low","mode":"standard","summary":null},"safety_identifier":null,"service_tier":"auto","status":"in_progress","store":false,"temperature":1.0,"text":{"format":{"type":"text"},"verbosity":"medium"},"tool_choice":"auto","tool_usage":{"image_gen":{"input_tokens":0,"input_tokens_details":{"image_tokens":0,"text_tokens":0},"output_tokens":0,"output_tokens_details":{"image_tokens":0,"text_tokens":0},"total_tokens":0},"web_search":{"num_requests":0}},"tools":[{"description":"Look up the current weather for a city.","name":"get_weather","output_schema":null,"parameters":{"properties":{"city":{"type":"string"}},"required":["city"],"type":"object"},"strict":false,"type":"function"}],"top_logprobs":0,"top_p":0.98,"truncation":"disabled","usage":null,"user":null},"sequence_number":1,"type":"response.in_progress"}
+
+    event: response.output_item.added
+    data: {"item":{"content":[],"encrypted_content":"gAAAAABqvzS57UCErinRMdQAzKxC_LjFxMbhonbUU16mdSqpWT58VrLis4TZATx0O-RV7FVCupxECJ3vqE2qUKwimonbhyXtAfp7xbc59YHnYUhavwMh_29dNmN8u4jb84lLIbeiNikTBGjNDoae_z0fOF6GPkzMi20QZDEPVsAdU6S-azQYIRjHhSwYbCGQXDRSu_6NkIHY-C5tqelPHhgj4WKzhb682iDr4GB6ulPvN2dXb0ZLzAvUZ7A5IvFcmZbpkJmDmtnfisBD1lRdE9cA0m3-g5UOvV9GITtmwUy9T9-bAb4NBZFCbhzZE3Oz2-Mve-FqxvFnZ8VdZ0gxu1gG5zdW0ZSXbKxU_a5cLSfc4bduCsk5fRBJRe7Tbus0GAPDEfG0LirLfNZA_JqXvY5G3d8VjDFamZdlV8uDjVO_2u5LmwDQwkqtD4QRBrglEEc8arQoOiv3sIYyWQZsRkkPELhS3tyEJ-muASP32F3FjAZ3iBmiDmF5Da4JYqNNrF6V4eSGGkG7KZAWGKTOJ7oNrwMFZ6PuS5GY-of2n-QAv5CLGqeYMV-osmL7sUImtDsK59Ws5SCcuWO-jntjbwuhHkElWNaNiHrqfXHl0d-KTUDA2VLsOIle7Q5YZY53UX7oDBhPpMcwUxhWKDcRq9zb2UlD9TYCNjORvMThNRXIYHP8_oR3y5PXl1HCGlemJNR-3BpEHlJT3poHiIZ9tmi5Mhfk2rQgICwQT2Q88VKlH43ph60nChf2TvHN1kIqFmr-Dip-uw1mJhvE0FNUTHSL6AiPbrAlpdN_Id1ZMc646pw7T_AL5e1V37F1tma6bFYf0DzzLWb8CmMi3QpbF2sYmaLZwZSNQUiDagj8bsAdVmxfKpS1Knok5qtkwaUD2ACgSfDgqvv7qf6s9V61ZeCaUy6BwwlUT7n3ctmAQSuOnznYvI8PEjsnAB7mu0W4vs0pCpi2zq8WxeO-PZcspm-z5-0G0YQkVZhUEdV0LyCUVRw_OCS8t6dYy-tYgAwRsuh8BrcLfEUElp8Zdc8H7JPLJnJa2wkijOVV7PKaGYrhV4tBAownRAFGIFGZWeBCO7iphe17PaJHb7ydbcpKR1FIFjSy8a6wxCzvQ7Iej2Eg_5GwC4FIu2qD2ivW0pO1ToR6EQ60gETKJhs-YQfy6qrAFHtHqzN-nw==","id":"rs_0645eb46766b636c016abf34b9bff887d09628d082ff4b59ce","summary":[],"type":"reasoning"},"output_index":0,"sequence_number":2,"type":"response.output_item.added"}
+
+    event: response.output_item.done
+    data: {"item":{"content":[],"encrypted_content":"gAAAAABqvzS5Mh_BjXvgPybdOG_p4AdwJLucmPgK4DBRZ2yV44yO1NaE5fvWMNlHMv5f8M6NOXdNxui1sHRJLsiWadzDAbcmbZeoB5zBLsQpjSTAnzqmrsI9OP1ATww2XIbrG-i4iLkMvuxvGEunTRtEPJEnkJdQJvx-lofTwIZJjfJnvL-ZzQfTYf4fVvW_3z_qYJrfZlAlC57V0JrNV_uRoeJMdETDWOqqbnTemBXlgrt0RbmkL3XAPi5XuSWDW_0XaDXPnCXPE4h1vuNYKQEzkZpUZs2MavjAj7SRSVLESg4cYOJjU0lbDr3Otsd_YWvFbULO831_A30aRxWc9MzpmAsYfo8HY4a4NUIqcOikkU0Gd6LpgIDuQOcr6ZdQ02Iw8eVQJJlrLUPHelbzVwAo27Ys7xdn75aVFTPpzzca4CiAML2FyFWr4M4YD57RraN48GwpR4BDvYP0vpeYIs4omZwHKwgL3I7hVU_8jeJwe_qhocoVoQaWGh2C9mPze9Wne3IrlCEmVbUR-3VpwxsRFxQkqY0ftWuh6sYguBftf2xCJ7C8qPU3At6rpkmQLZfsotVvvMuz4Diev4CCGrV6UMkZ9UXPgRbh1QkL47NQXrASKS_I_yVuy5dUApB_GRvq1Ny2SGOuPJ7hvmspHjros2GLgaxlG3TNRuzq7-Uhz0Lu_UXATnpxY26dy2z7JNk6HfjFJX93pA1wP7QA0qYWPEE0VpMjJ7-_mty5Uy4r1GUgtBo4d4R5QgZkKND4pRT2iOynJaXL4mE6aphFLZdd7zIMju94lAkoi1bks4vA7K_u-l9phjIbPe9hbqgeHti7M5WwH17HutyPdxuNvZx50DW_sP9qIDMCIzbzDEUbBTbqJGjUpF9BY0ZFmx_ZYiliNHu3fvTb8xa1LYA8mWJrW43AGm1NXPVlInOXJ5UDJ7V2eDmQNN4lMC33QTmwqtaAdr5Rzw2qvKPP8-hhNb-WNXvOzn-yC9hfebqB4eNh4MUg2pK5UQHrxEvBirf_wod6616RSaV1ahOPpJ0A_eEXek5kLq8vIKKnU3vtbRjUxjpEMOEYZkh25PaLYpjB_pQ5kIKP1yFSB_dTynqrQn3bMTok0BipNtV-RpOOs63EcbnJpvb0b9T66HPnajQv-1nK4imR5aZls01Em9gHV7RP42k02IZw9R7CY154fZlfpI8TTkCUn_iT_DzTMipmDqlOx9P3PQDb1PCwRov-vcWG0mEcgdDpI2iVM2nR1W9ncxjTiekvc4c=","id":"rs_0645eb46766b636c016abf34b9bff887d09628d082ff4b59ce","summary":[],"type":"reasoning"},"output_index":0,"sequence_number":3,"type":"response.output_item.done"}
+
+    event: response.output_item.added
+    data: {"item":{"content":[],"id":"msg_0645eb46766b636c016abf34b9e19487d0992ef2d929643d60","phase":"final_answer","role":"assistant","status":"in_progress","type":"message"},"output_index":1,"sequence_number":4,"type":"response.output_item.added"}
+
+    event: response.content_part.added
+    data: {"content_index":0,"item_id":"msg_0645eb46766b636c016abf34b9e19487d0992ef2d929643d60","output_index":1,"part":{"annotations":[],"logprobs":[],"text":"","type":"output_text"},"sequence_number":5,"type":"response.content_part.added"}
+
+    event: response.output_text.delta
+    data: {"content_index":0,"delta":"The","item_id":"msg_0645eb46766b636c016abf34b9e19487d0992ef2d929643d60","logprobs":[],"obfuscation":"B1aALM1ZII76r","output_index":1,"sequence_number":6,"type":"response.output_text.delta"}
+
+    event: response.output_text.delta
+    data: {"content_index":0,"delta":" weather","item_id":"msg_0645eb46766b636c016abf34b9e19487d0992ef2d929643d60","logprobs":[],"obfuscation":"sIelfzfN","output_index":1,"sequence_number":7,"type":"response.output_text.delta"}
+
+    event: response.output_text.delta
+    data: {"content_index":0,"delta":" in","item_id":"msg_0645eb46766b636c016abf34b9e19487d0992ef2d929643d60","logprobs":[],"obfuscation":"YgauOxIiKuQi3","output_index":1,"sequence_number":8,"type":"response.output_text.delta"}
+
+    event: response.output_text.delta
+    data: {"content_index":0,"delta":" Paris","item_id":"msg_0645eb46766b636c016abf34b9e19487d0992ef2d929643d60","logprobs":[],"obfuscation":"ZECEODahCz","output_index":1,"sequence_number":9,"type":"response.output_text.delta"}
+
+    event: response.output_text.delta
+    data: {"content_index":0,"delta":" right","item_id":"msg_0645eb46766b636c016abf34b9e19487d0992ef2d929643d60","logprobs":[],"obfuscation":"cAI5YkoVLC","output_index":1,"sequence_number":10,"type":"response.output_text.delta"}
+
+    event: response.output_text.delta
+    data: {"content_index":0,"delta":" now","item_id":"msg_0645eb46766b636c016abf34b9e19487d0992ef2d929643d60","logprobs":[],"obfuscation":"PFqOaDxdwUis","output_index":1,"sequence_number":11,"type":"response.output_text.delta"}
+
+    event: response.output_text.delta
+    data: {"content_index":0,"delta":" is","item_id":"msg_0645eb46766b636c016abf34b9e19487d0992ef2d929643d60","logprobs":[],"obfuscation":"lk5SfAuT9OFFa","output_index":1,"sequence_number":12,"type":"response.output_text.delta"}
+
+    event: response.output_text.delta
+    data: {"content_index":0,"delta":" sunny","item_id":"msg_0645eb46766b636c016abf34b9e19487d0992ef2d929643d60","logprobs":[],"obfuscation":"hF8tkCDRn2","output_index":1,"sequence_number":13,"type":"response.output_text.delta"}
+
+    event: response.output_text.delta
+    data: {"content_index":0,"delta":" and","item_id":"msg_0645eb46766b636c016abf34b9e19487d0992ef2d929643d60","logprobs":[],"obfuscation":"uggKrI7OExDx","output_index":1,"sequence_number":14,"type":"response.output_text.delta"}
+
+    event: response.output_text.delta
+    data: {"content_index":0,"delta":" ","item_id":"msg_0645eb46766b636c016abf34b9e19487d0992ef2d929643d60","logprobs":[],"obfuscation":"qOkE0B149uAc4uk","output_index":1,"sequence_number":15,"type":"response.output_text.delta"}
+
+    event: response.output_text.delta
+    data: {"content_index":0,"delta":"21","item_id":"msg_0645eb46766b636c016abf34b9e19487d0992ef2d929643d60","logprobs":[],"obfuscation":"PhYO4oe3EGRsyQ","output_index":1,"sequence_number":16,"type":"response.output_text.delta"}
+
+    event: response.output_text.delta
+    data: {"content_index":0,"delta":" ","item_id":"msg_0645eb46766b636c016abf34b9e19487d0992ef2d929643d60","logprobs":[],"obfuscation":"eRem5zxT1u1hIPG","output_index":1,"sequence_number":17,"type":"response.output_text.delta"}
+
+    event: response.output_text.delta
+    data: {"content_index":0,"delta":"°C","item_id":"msg_0645eb46766b636c016abf34b9e19487d0992ef2d929643d60","logprobs":[],"obfuscation":"bCk64cV3Xq7Suz","output_index":1,"sequence_number":18,"type":"response.output_text.delta"}
+
+    event: response.output_text.delta
+    data: {"content_index":0,"delta":".","item_id":"msg_0645eb46766b636c016abf34b9e19487d0992ef2d929643d60","logprobs":[],"obfuscation":"KcNHxxvw0PANkVT","output_index":1,"sequence_number":19,"type":"response.output_text.delta"}
+
+    event: response.output_text.done
+    data: {"content_index":0,"item_id":"msg_0645eb46766b636c016abf34b9e19487d0992ef2d929643d60","logprobs":[],"output_index":1,"sequence_number":20,"text":"The weather in Paris right now is sunny and 21 °C.","type":"response.output_text.done"}
+
+    event: response.content_part.done
+    data: {"content_index":0,"item_id":"msg_0645eb46766b636c016abf34b9e19487d0992ef2d929643d60","output_index":1,"part":{"annotations":[],"logprobs":[],"text":"The weather in Paris right now is sunny and 21 °C.","type":"output_text"},"sequence_number":21,"type":"response.content_part.done"}
+
+    event: response.output_item.done
+    data: {"item":{"content":[{"annotations":[],"logprobs":[],"text":"The weather in Paris right now is sunny and 21 °C.","type":"output_text"}],"id":"msg_0645eb46766b636c016abf34b9e19487d0992ef2d929643d60","phase":"final_answer","role":"assistant","status":"completed","type":"message"},"output_index":1,"sequence_number":22,"type":"response.output_item.done"}
+
+    event: response.completed
+    data: {"response":{"access_programs":null,"background":false,"completed_at":0,"created_at":0,"error":null,"frequency_penalty":0.0,"id":"resp_0645eb46766b636c016abf34b8d88c87d0a060ec83e167319b","incomplete_details":null,"instructions":"Before you call any tool, first send the user one short sentence saying what you are about to do. Then call the tool.","max_output_tokens":600,"max_tool_calls":null,"metadata":{},"model":"gpt-5.3-codex","moderation":null,"object":"response","output":[{"content":[],"encrypted_content":"gAAAAABqvzS6yRDiHBLnouc-jGFu6wXL0pxDwzeT7V5SQYFkR-NSbCubp6438iHlcW-42Is3kz0ft7tLnJqqEXHOvtH9t1kqhdajNR3sgN24XnxwmYRHy3UGXBlbk9iu9O4O1Vo17FKXWdPKUX-4gRSK8XJTFx0vR3VQTuFusMiEaGShvIFTfoxMGEPJCQofnKnzpxGW_RQB2RlwXMN-jUYi1zZmVrq7Tfc-1PqNBZmY4CeGhPjJ9XdwoPlaA61JXnxfLyLnAWSWnSjMCZvBrfx51xFkCp6FDOOpWpDp9_UELSwZg-hphXEk3eP675NHKYTucnHWSl_JX79HBGBACDpRZBjUQ0fzrHT-lR4xr0YMrBcyR5ag8h2hyk4Ni5peaZg1f69jUQbnluBddk-XKrhEAKbuWqJ2CcJq0Rwqsz43TCAtUKQkDlKwLQ0J6CG6OwZoDGIheUdEKCuUYJeQOby749b6kFWzIoXfdrRQYtNK1JdKpHj6uufh6Rn4WjYP5wmQMPWEFiLF2Y-XDRWm_bBWKkuhN58Nq3KPi4PgrOQ81y2ouwk6FlX7LvbUzAtCVQrCeNyNjTREmmaKUguIKu32BzsgpbxGh3b9mOhK9cFggsu4hNKC7Ieo8P-hkK8r1NAMyjHhjaUq9WnkK-FeTy9p9I4MtsD--TSHkacKGWQNPKwCivXf7punh4UIVQDeM7QPcHwnv6X3pmtmHbryawMdQTKd8kb1qiDQwPGYGzt___u21BAFdupDZf2VwAcg5M5V8BfGdeRKXxq_6Zy92dVp8iHspodPB1HC6VAw0RrLtj5g5lzMM8zMRSXZ3z6uFx5_EhTaghrsPb8JI5aypjgEbj42EuxR4VnWiDBY2Q9THbdtDgPgMrhbTU1TxlQS06_M4RjY6vaX0slspWAs1OUstzrQjXGdB5uJ75rcs22x7tFs3m_jN7_HbzGAf3Hz6XDBHHBrcnSbVO-mJb10Y6JMy7SoJRbEF9f9n1nHWvniESfpWKCaoLx3TWohW8yOarqPwMbD2TqIRUamwVSuPdQN_Z12cKmhcyAbWDAvIKnbQyftm3aiHRDGYOcQshM1vgBeYul-jjFElcJMMt64leB44DowRb8cYQXAPnU4JkcxBxOAXwuSUh4_sHSJv-0_dhwfKU2yaUxOjauWoOYW7Qun4FNBD-IBqpJry1xxrKUxb2YOMfbEjFZfeBTim5ovF2iq_VJtq97xQYeIDtGyf5CgKBrbuFlrRurU1kdeUDnAg8xWVYZHcsU=","id":"rs_0645eb46766b636c016abf34b9bff887d09628d082ff4b59ce","summary":[],"type":"reasoning"},{"content":[{"annotations":[],"logprobs":[],"text":"The weather in Paris right now is sunny and 21 °C.","type":"output_text"}],"id":"msg_0645eb46766b636c016abf34b9e19487d0992ef2d929643d60","phase":"final_answer","role":"assistant","status":"completed","type":"message"}],"parallel_tool_calls":true,"presence_penalty":0.0,"previous_response_id":null,"prompt_cache_key":null,"prompt_cache_retention":"24h","reasoning":{"context":"current_turn","effort":"low","mode":"standard","summary":null},"safety_identifier":null,"service_tier":"default","status":"completed","store":false,"temperature":1.0,"text":{"format":{"type":"text"},"verbosity":"medium"},"tool_choice":"auto","tool_usage":{"image_gen":{"input_tokens":0,"input_tokens_details":{"image_tokens":0,"text_tokens":0},"output_tokens":0,"output_tokens_details":{"image_tokens":0,"text_tokens":0},"total_tokens":0},"web_search":{"num_requests":0}},"tools":[{"description":"Look up the current weather for a city.","name":"get_weather","output_schema":null,"parameters":{"properties":{"city":{"type":"string"}},"required":["city"],"type":"object"},"strict":false,"type":"function"}],"top_logprobs":0,"top_p":0.98,"truncation":"disabled","usage":{"input_tokens":174,"input_tokens_details":{"cache_write_tokens":0,"cached_tokens":0},"output_tokens":34,"output_tokens_details":{"reasoning_tokens":14},"total_tokens":208},"user":null},"sequence_number":23,"type":"response.completed"}
+

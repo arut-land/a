@@ -1,0 +1,22 @@
+[
+  {
+    "exchange": 0,
+    "result": {
+      "parts": [
+        {
+          "type": "text",
+          "text": "Hmm, the user just asked me to reply with exactly the single word \"pong\". That's pretty straightforward. \n\nOkay, let me think about this. The user seems to be testing a very specific instruction - they want nothing but the word \"pong\" with no extra characters or explanations. \n\nI recall that in computing"
+        }
+      ],
+      "finish": "Length",
+      "refusal": null,
+      "usage": {
+        "input": 18,
+        "output": 64,
+        "cache_read": null,
+        "cache_write": null,
+        "reasoning": null
+      }
+    }
+  }
+]

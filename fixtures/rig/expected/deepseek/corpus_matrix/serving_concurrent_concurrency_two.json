@@ -1,0 +1,52 @@
+[
+  {
+    "exchange": 0,
+    "result": {
+      "parts": [
+        {
+          "type": "tool_call",
+          "id": "call_00_JjZ7DimmbCQiKYoXoqJd1981",
+          "name": "lookup_harbor_label",
+          "input": {},
+          "invalid": null
+        },
+        {
+          "type": "tool_call",
+          "id": "call_01_TbDSFwk6Kuj56KxakQxu9473",
+          "name": "lookup_orchard_label",
+          "input": {},
+          "invalid": null
+        }
+      ],
+      "finish": "ToolCalls",
+      "refusal": null,
+      "usage": {
+        "input": 395,
+        "output": 40,
+        "cache_read": 256,
+        "cache_write": null,
+        "reasoning": null
+      }
+    }
+  },
+  {
+    "exchange": 1,
+    "result": {
+      "parts": [
+        {
+          "type": "text",
+          "text": "The harbor label is crimson-harbor and the orchard label is silver-orchard."
+        }
+      ],
+      "finish": "Stop",
+      "refusal": null,
+      "usage": {
+        "input": 465,
+        "output": 17,
+        "cache_read": 256,
+        "cache_write": null,
+        "reasoning": null
+      }
+    }
+  }
+]

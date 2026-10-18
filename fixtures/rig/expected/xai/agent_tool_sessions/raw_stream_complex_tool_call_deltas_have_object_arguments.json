@@ -1,0 +1,47 @@
+[
+  {
+    "exchange": 0,
+    "result": {
+      "parts": [
+        {
+          "type": "reasoning",
+          "text": "Preparing to call inspect_manifest once for project rig-xai with critical=true, retries=2, and the specified steps. Will note `streamed nested JSON`.",
+          "redacted": false
+        },
+        {
+          "type": "tool_call",
+          "id": "call-b8c96329-bc14-4927-b39a-0ac006948d15-0",
+          "name": "inspect_manifest",
+          "input": {
+            "project": "rig-xai",
+            "flags": {
+              "critical": true,
+              "retries": 2
+            },
+            "steps": [
+              {
+                "name": "plan",
+                "weight": 1
+              },
+              {
+                "name": "verify",
+                "weight": 2
+              }
+            ],
+            "note": "streamed nested JSON"
+          },
+          "invalid": null
+        }
+      ],
+      "finish": "ToolCalls",
+      "refusal": null,
+      "usage": {
+        "input": 457,
+        "output": 540,
+        "cache_read": 128,
+        "cache_write": null,
+        "reasoning": 479
+      }
+    }
+  }
+]

@@ -1,0 +1,61 @@
+[
+  {
+    "exchange": 0,
+    "result": {
+      "parts": [
+        {
+          "type": "reasoning",
+          "text": "",
+          "redacted": false
+        },
+        {
+          "type": "text",
+          "text": "I’ll quickly check the current weather in Paris now."
+        },
+        {
+          "type": "tool_call",
+          "id": "call_idkUrOZF9QGSSAjBx290pxZQ",
+          "name": "get_weather",
+          "input": {
+            "city": "Paris"
+          },
+          "invalid": null
+        }
+      ],
+      "finish": "ToolCalls",
+      "refusal": null,
+      "usage": {
+        "input": 83,
+        "output": 58,
+        "cache_read": 0,
+        "cache_write": 0,
+        "reasoning": 20
+      }
+    }
+  },
+  {
+    "exchange": 1,
+    "result": {
+      "parts": [
+        {
+          "type": "reasoning",
+          "text": "",
+          "redacted": false
+        },
+        {
+          "type": "text",
+          "text": "The weather in Paris right now is sunny and 21 °C."
+        }
+      ],
+      "finish": "Stop",
+      "refusal": null,
+      "usage": {
+        "input": 174,
+        "output": 34,
+        "cache_read": 0,
+        "cache_write": 0,
+        "reasoning": 14
+      }
+    }
+  }
+]

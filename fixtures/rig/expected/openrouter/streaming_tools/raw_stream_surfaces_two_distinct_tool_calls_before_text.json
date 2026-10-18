@@ -1,0 +1,32 @@
+[
+  {
+    "exchange": 0,
+    "result": {
+      "parts": [
+        {
+          "type": "tool_call",
+          "id": "call_NcNQgk31ThHo5PPSMWpvVsgj",
+          "name": "lookup_harbor_label",
+          "input": {},
+          "invalid": null
+        },
+        {
+          "type": "tool_call",
+          "id": "call_aQJxmDlFQAZvsMHhBQVPZqpD",
+          "name": "lookup_orchard_label",
+          "input": {},
+          "invalid": null
+        }
+      ],
+      "finish": "ToolCalls",
+      "refusal": null,
+      "usage": {
+        "input": 157,
+        "output": 45,
+        "cache_read": 0,
+        "cache_write": 0,
+        "reasoning": 0
+      }
+    }
+  }
+]

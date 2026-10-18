@@ -1,0 +1,22 @@
+[
+  {
+    "exchange": 0,
+    "result": {
+      "parts": [
+        {
+          "type": "text",
+          "text": "Tidehaven"
+        }
+      ],
+      "finish": "Stop",
+      "refusal": null,
+      "usage": {
+        "input": 28,
+        "output": 8,
+        "cache_read": 27,
+        "cache_write": null,
+        "reasoning": null
+      }
+    }
+  }
+]

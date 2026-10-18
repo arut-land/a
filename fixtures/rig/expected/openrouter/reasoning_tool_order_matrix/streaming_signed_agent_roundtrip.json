@@ -1,0 +1,52 @@
+[
+  {
+    "exchange": 0,
+    "result": {
+      "parts": [
+        {
+          "type": "reasoning",
+          "text": "The user is asking me to:\n1. Think briefly about the instruction\n2. Call lookup exactly once with value \"cobalt\"\n3. Not answer in prose\n\nThe instruction is clear - I need to call the lookup function with the parameter value set to \"cobalt\". Let me do that now.",
+          "redacted": false
+        },
+        {
+          "type": "tool_call",
+          "id": "toolu_01EGVFsxXmBZQVGszJZHdp5V",
+          "name": "lookup",
+          "input": {
+            "value": "cobalt"
+          },
+          "invalid": null
+        }
+      ],
+      "finish": "ToolCalls",
+      "refusal": null,
+      "usage": {
+        "input": 635,
+        "output": 124,
+        "cache_read": 0,
+        "cache_write": 0,
+        "reasoning": 69
+      }
+    }
+  },
+  {
+    "exchange": 1,
+    "result": {
+      "parts": [
+        {
+          "type": "text",
+          "text": "DONE"
+        }
+      ],
+      "finish": "Stop",
+      "refusal": null,
+      "usage": {
+        "input": 781,
+        "output": 5,
+        "cache_read": 0,
+        "cache_write": 0,
+        "reasoning": 0
+      }
+    }
+  }
+]

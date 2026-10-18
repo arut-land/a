@@ -1,0 +1,22 @@
+[
+  {
+    "exchange": 0,
+    "result": {
+      "parts": [
+        {
+          "type": "text",
+          "text": "Maple trees are known for their vibrant fall foliage, displaying shades of red, orange, and yellow"
+        }
+      ],
+      "finish": "Length",
+      "refusal": null,
+      "usage": {
+        "input": 35,
+        "output": 24,
+        "cache_read": 34,
+        "cache_write": null,
+        "reasoning": null
+      }
+    }
+  }
+]

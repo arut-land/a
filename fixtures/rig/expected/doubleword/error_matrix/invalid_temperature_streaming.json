@@ -1,0 +1,9 @@
+[
+  {
+    "exchange": 0,
+    "result": {
+      "error": "ProviderResponseError: status 400 Bad Request: {\"error\":{\"code\":null,\"message\":\"Invalid request\",\"param\":null,\"type\":\"invalid_request_error\"}}",
+      "events": 0
+    }
+  }
+]

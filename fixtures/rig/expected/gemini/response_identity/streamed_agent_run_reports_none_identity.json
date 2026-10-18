@@ -1,0 +1,22 @@
+[
+  {
+    "exchange": 0,
+    "result": {
+      "parts": [
+        {
+          "type": "text",
+          "text": "streamed identity probe"
+        }
+      ],
+      "finish": "Stop",
+      "refusal": null,
+      "usage": {
+        "input": 15,
+        "output": 21,
+        "cache_read": null,
+        "cache_write": null,
+        "reasoning": 17
+      }
+    }
+  }
+]

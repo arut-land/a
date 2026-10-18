@@ -1,0 +1,22 @@
+[
+  {
+    "exchange": 0,
+    "result": {
+      "parts": [
+        {
+          "type": "text",
+          "text": "A solar eclipse occurs when the moon passes between the Earth and the sun, blocking all or part of the sun's light. This alignment causes the moon to cast a shadow on Earth, creating phenomena such as a partial, total, or annular eclipse, depending on the observer's location and the distances between the Earth, moon, and sun. During a total solar eclipse, the sun's corona becomes visible, offering a unique astronomical event."
+        }
+      ],
+      "finish": "Stop",
+      "refusal": null,
+      "usage": {
+        "input": 35,
+        "output": 89,
+        "cache_read": 0,
+        "cache_write": 0,
+        "reasoning": 0
+      }
+    }
+  }
+]

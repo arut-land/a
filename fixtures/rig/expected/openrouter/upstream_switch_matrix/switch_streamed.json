@@ -1,0 +1,86 @@
+[
+  {
+    "exchange": 0,
+    "result": {
+      "parts": [
+        {
+          "type": "reasoning",
+          "text": "The user is asking me to think it through, then call lookup_code for the record \"alpha\". \n\nLet me think about this:\n1. The user wants me to look up a code for a record named \"alpha\"\n2. I have the lookup_code function available that takes a record parameter\n3. The user has explicitly provided the record name as \"alpha\"\n4. I have all the information I need to make the function call\n\nSo I should call lookup_code with the parameter record set to \"alpha\".",
+          "redacted": false
+        },
+        {
+          "type": "text",
+          "text": "I'll call the lookup_code function to retrieve the code stored for the record \"alpha\"."
+        },
+        {
+          "type": "tool_call",
+          "id": "toolu_bdrk_01SCjQfMoNBsQGW8tXRUz9cY",
+          "name": "lookup_code",
+          "input": {
+            "record": "alpha"
+          },
+          "invalid": null
+        }
+      ],
+      "finish": "ToolCalls",
+      "refusal": null,
+      "usage": {
+        "input": 608,
+        "output": 192,
+        "cache_read": 0,
+        "cache_write": 0,
+        "reasoning": 117
+      }
+    }
+  },
+  {
+    "exchange": 1,
+    "result": {
+      "parts": [
+        {
+          "type": "reasoning",
+          "text": "",
+          "redacted": false
+        },
+        {
+          "type": "text",
+          "text": "The code for record alpha is amber-5521."
+        }
+      ],
+      "finish": "Stop",
+      "refusal": null,
+      "usage": {
+        "input": 216,
+        "output": 13,
+        "cache_read": 0,
+        "cache_write": 0,
+        "reasoning": 0
+      }
+    }
+  },
+  {
+    "exchange": 2,
+    "result": {
+      "parts": [
+        {
+          "type": "reasoning",
+          "text": "The user is asking me to repeat the code in uppercase without calling any tool. The code I was given was \"amber-5521\". In uppercase, that would be \"AMBER-5521\".",
+          "redacted": false
+        },
+        {
+          "type": "text",
+          "text": "AMBER-5521"
+        }
+      ],
+      "finish": "Stop",
+      "refusal": null,
+      "usage": {
+        "input": 751,
+        "output": 57,
+        "cache_read": 0,
+        "cache_write": 0,
+        "reasoning": 47
+      }
+    }
+  }
+]

@@ -1,0 +1,166 @@
+[
+  {
+    "exchange": 0,
+    "result": {
+      "parts": [
+        {
+          "type": "reasoning",
+          "text": "Running the production-readiness scenario.\n\nThe scenario requires four sequential tool calls: ping_empty, inspect_manifest with the exact note and flags, join_labels with the specified labels and separator, and escape_echo with the exact escaped text.",
+          "redacted": false
+        },
+        {
+          "type": "tool_call",
+          "id": "call-2d2983ce-88cc-489d-bccb-8c9cd0ff6044-0",
+          "name": "ping_empty",
+          "input": {},
+          "invalid": null
+        }
+      ],
+      "finish": "ToolCalls",
+      "refusal": null,
+      "usage": {
+        "input": 743,
+        "output": 367,
+        "cache_read": 192,
+        "cache_write": null,
+        "reasoning": 361
+      }
+    }
+  },
+  {
+    "exchange": 1,
+    "result": {
+      "parts": [
+        {
+          "type": "reasoning",
+          "text": "The first tool call returned an empty OK result.",
+          "redacted": false
+        },
+        {
+          "type": "tool_call",
+          "id": "call-84a772a9-2d10-4524-8bcf-6e0a9ceb5c65-1",
+          "name": "inspect_manifest",
+          "input": {
+            "project": "rig-xai",
+            "flags": {
+              "critical": true,
+              "retries": 2
+            },
+            "steps": [
+              {
+                "name": "plan",
+                "weight": 1
+              },
+              {
+                "name": "verify",
+                "weight": 2
+              }
+            ],
+            "note": "line one; line two says \"hello\" and path C:\\rig\\xai"
+          },
+          "invalid": null
+        }
+      ],
+      "finish": "ToolCalls",
+      "refusal": null,
+      "usage": {
+        "input": 1121,
+        "output": 196,
+        "cache_read": 704,
+        "cache_write": null,
+        "reasoning": 123
+      }
+    }
+  },
+  {
+    "exchange": 2,
+    "result": {
+      "parts": [
+        {
+          "type": "reasoning",
+          "text": "The second tool completed successfully. The manifest check returned MANIFEST-OK.",
+          "redacted": false
+        },
+        {
+          "type": "tool_call",
+          "id": "call-81f363d6-0303-45ec-9709-80fdda00de7c-2",
+          "name": "join_labels",
+          "input": {
+            "labels": [
+              "north",
+              "beta gamma",
+              "quote:\"delta\"",
+              "slash\\path"
+            ],
+            "separator": "|"
+          },
+          "invalid": null
+        }
+      ],
+      "finish": "ToolCalls",
+      "refusal": null,
+      "usage": {
+        "input": 1331,
+        "output": 166,
+        "cache_read": 1088,
+        "cache_write": null,
+        "reasoning": 138
+      }
+    }
+  },
+  {
+    "exchange": 3,
+    "result": {
+      "parts": [
+        {
+          "type": "reasoning",
+          "text": "",
+          "redacted": false
+        },
+        {
+          "type": "tool_call",
+          "id": "call-dbb890b9-e175-4214-9a9d-b25245e009db-3",
+          "name": "escape_echo",
+          "input": {
+            "text": "Line 1\nLine \"2\" with backslash \\ and unicode snowman ☃"
+          },
+          "invalid": null
+        }
+      ],
+      "finish": "ToolCalls",
+      "refusal": null,
+      "usage": {
+        "input": 1521,
+        "output": 100,
+        "cache_read": 1280,
+        "cache_write": null,
+        "reasoning": 73
+      }
+    }
+  },
+  {
+    "exchange": 4,
+    "result": {
+      "parts": [
+        {
+          "type": "reasoning",
+          "text": "",
+          "redacted": false
+        },
+        {
+          "type": "text",
+          "text": "Production readiness complete: EMPTY-OK MANIFEST-OK LABELS-OK ESCAPE-OK."
+        }
+      ],
+      "finish": "Stop",
+      "refusal": null,
+      "usage": {
+        "input": 1651,
+        "output": 53,
+        "cache_read": 192,
+        "cache_write": null,
+        "reasoning": 33
+      }
+    }
+  }
+]

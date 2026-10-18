@@ -1,0 +1,27 @@
+[
+  {
+    "exchange": 0,
+    "result": {
+      "parts": [
+        {
+          "type": "tool_call",
+          "id": "V4qB8yCqUhYSSntX6H2qqe5Ak1rfrQgE",
+          "name": "record",
+          "input": {
+            "note": "The"
+          },
+          "invalid": "{\"note\": \"The"
+        }
+      ],
+      "finish": "Length",
+      "refusal": null,
+      "usage": {
+        "input": 165,
+        "output": 20,
+        "cache_read": 164,
+        "cache_write": null,
+        "reasoning": null
+      }
+    }
+  }
+]

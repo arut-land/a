@@ -1,0 +1,22 @@
+[
+  {
+    "exchange": 0,
+    "result": {
+      "parts": [
+        {
+          "type": "text",
+          "text": "1. The Nile is traditionally considered the longest river in the world.  \n2. The Amazon River has the largest discharge of any river in the world.  \n3. The Yangtze River is the longest river in Asia.  \n4. The Mississippi-Missouri river system is the longest river system in North America.  \n5. Rivers are a key component of the Earth's hydrological cycle.  \n6. The Danube runs through or touches the borders of 10 countries in Europe.  \n7. The Indus River is the main source of water for Pakistan.  \n8. The Ganges River holds spiritual significance for Hindus.  \n9. The Volga River is the longest river in Europe.  \n10. River deltas are formed at the mouths of rivers.  \n11. The Congo River is the deepest river in the world.  \n12. Rivers can be classified as perennial, intermittent, or ephemeral based on their flow characteristics."
+        }
+      ],
+      "finish": "Stop",
+      "refusal": null,
+      "usage": {
+        "input": 30,
+        "output": 191,
+        "cache_read": 0,
+        "cache_write": null,
+        "reasoning": 0
+      }
+    }
+  }
+]

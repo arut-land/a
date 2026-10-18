@@ -1,0 +1,27 @@
+[
+  {
+    "exchange": 0,
+    "result": {
+      "parts": [
+        {
+          "type": "reasoning",
+          "text": "We need answer only number. 17*23=391. Must reply only number.",
+          "redacted": false
+        },
+        {
+          "type": "text",
+          "text": "391"
+        }
+      ],
+      "finish": "Stop",
+      "refusal": null,
+      "usage": {
+        "input": 45,
+        "output": 20,
+        "cache_read": 0,
+        "cache_write": null,
+        "reasoning": 18
+      }
+    }
+  }
+]

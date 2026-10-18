@@ -1,0 +1,32 @@
+[package]
+name = "llm"
+version.workspace = true
+edition.workspace = true
+publish.workspace = true
+
+[features]
+# An HTTP client over ureq, run through the `rt` runtime.
+ureq = ["dep:ureq", "dep:rt"]
+
+[dependencies]
+bytes.workspace = true
+futures-core = { version = "0.3", default-features = false, features = ["std"] }
+http.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+rt = { workspace = true, optional = true }
+
+# The OS's TLS on Apple platforms and Windows (Security.framework, SChannel):
+# no bundled crypto or root certificates. rustls elsewhere.
+[target.'cfg(any(target_vendor = "apple", windows))'.dependencies]
+ureq = { workspace = true, optional = true, features = ["native-tls"] }
+
+[target.'cfg(not(any(target_vendor = "apple", windows)))'.dependencies]
+ureq = { workspace = true, optional = true, features = ["rustls", "platform-verifier"] }
+
+[dev-dependencies]
+rt.workspace = true
+serde_yaml_ng = "0.10"
+
+[lints]
+workspace = true

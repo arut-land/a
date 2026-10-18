@@ -1,0 +1,32 @@
+[
+  {
+    "exchange": 0,
+    "result": {
+      "parts": [
+        {
+          "type": "text",
+          "text": "{\"total\": 42}"
+        },
+        {
+          "type": "tool_call",
+          "id": "call_REDACTED_1",
+          "name": "add",
+          "input": {
+            "x": 20,
+            "y": 22
+          },
+          "invalid": null
+        }
+      ],
+      "finish": "ToolCalls",
+      "refusal": null,
+      "usage": {
+        "input": 88,
+        "output": 25,
+        "cache_read": 0,
+        "cache_write": null,
+        "reasoning": null
+      }
+    }
+  }
+]

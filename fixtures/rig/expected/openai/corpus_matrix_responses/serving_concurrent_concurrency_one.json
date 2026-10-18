@@ -1,0 +1,62 @@
+[
+  {
+    "exchange": 0,
+    "result": {
+      "parts": [
+        {
+          "type": "reasoning",
+          "text": "",
+          "redacted": false
+        },
+        {
+          "type": "tool_call",
+          "id": "call_MaABxwBzSyX60KXhr7Q8qGWt",
+          "name": "lookup_harbor_label",
+          "input": {},
+          "invalid": null
+        },
+        {
+          "type": "tool_call",
+          "id": "call_i25wIqUkLvoc6nnHXzmD6ffn",
+          "name": "lookup_orchard_label",
+          "input": {},
+          "invalid": null
+        }
+      ],
+      "finish": "ToolCalls",
+      "refusal": null,
+      "usage": {
+        "input": 160,
+        "output": 226,
+        "cache_read": 0,
+        "cache_write": 0,
+        "reasoning": 128
+      }
+    }
+  },
+  {
+    "exchange": 1,
+    "result": {
+      "parts": [
+        {
+          "type": "reasoning",
+          "text": "",
+          "redacted": false
+        },
+        {
+          "type": "text",
+          "text": "The labels are crimson-harbor and silver-orchard."
+        }
+      ],
+      "finish": "Stop",
+      "refusal": null,
+      "usage": {
+        "input": 402,
+        "output": 99,
+        "cache_read": 0,
+        "cache_write": 0,
+        "reasoning": 64
+      }
+    }
+  }
+]

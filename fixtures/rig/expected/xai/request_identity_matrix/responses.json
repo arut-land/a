@@ -1,0 +1,29 @@
+[
+  {
+    "exchange": 1,
+    "result": {
+      "parts": [
+        {
+          "type": "text",
+          "text": "stream identity probe"
+        }
+      ],
+      "finish": "Stop",
+      "refusal": null,
+      "usage": {
+        "input": 199,
+        "output": 145,
+        "cache_read": 192,
+        "cache_write": null,
+        "reasoning": 142
+      }
+    }
+  },
+  {
+    "exchange": 2,
+    "result": {
+      "error": "ProviderResponseError: status 400 Bad Request: {\"code\":\"invalid-argument\",\"error\":\"Temperature must be less than 2 but temperature = 7\"} (request id: 9ae5354b-f047-97fd-bb1e-4557280f9b2d)",
+      "events": 0
+    }
+  }
+]

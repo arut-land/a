@@ -1,0 +1,27 @@
+[
+  {
+    "exchange": 0,
+    "result": {
+      "parts": [
+        {
+          "type": "reasoning",
+          "text": "The user says: \"Reply with exactly: stream identity probe\". The instruction is to reply with exactly that phrase. There's no conflict with policy. We can comply.",
+          "redacted": false
+        },
+        {
+          "type": "text",
+          "text": "stream identity probe"
+        }
+      ],
+      "finish": "Stop",
+      "refusal": null,
+      "usage": {
+        "input": 78,
+        "output": 46,
+        "cache_read": null,
+        "cache_write": null,
+        "reasoning": 34
+      }
+    }
+  }
+]

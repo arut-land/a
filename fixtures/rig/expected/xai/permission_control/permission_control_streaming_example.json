@@ -1,0 +1,62 @@
+[
+  {
+    "exchange": 0,
+    "result": {
+      "parts": [
+        {
+          "type": "reasoning",
+          "text": "Reading test.txt.\n\nUsing the available head and tail tools to read test.txt.",
+          "redacted": false
+        },
+        {
+          "type": "tool_call",
+          "id": "call-8b8a7c67-de24-44df-9d86-fddd5a35f99d-0",
+          "name": "read_file_head",
+          "input": {},
+          "invalid": null
+        },
+        {
+          "type": "tool_call",
+          "id": "call-8b8a7c67-de24-44df-9d86-fddd5a35f99d-1",
+          "name": "read_file_tail",
+          "input": {},
+          "invalid": null
+        }
+      ],
+      "finish": "ToolCalls",
+      "refusal": null,
+      "usage": {
+        "input": 341,
+        "output": 311,
+        "cache_read": 320,
+        "cache_write": null,
+        "reasoning": 298
+      }
+    }
+  },
+  {
+    "exchange": 1,
+    "result": {
+      "parts": [
+        {
+          "type": "reasoning",
+          "text": "",
+          "redacted": false
+        },
+        {
+          "type": "text",
+          "text": "hello world"
+        }
+      ],
+      "finish": "Stop",
+      "refusal": null,
+      "usage": {
+        "input": 689,
+        "output": 66,
+        "cache_read": 320,
+        "cache_write": null,
+        "reasoning": 64
+      }
+    }
+  }
+]
