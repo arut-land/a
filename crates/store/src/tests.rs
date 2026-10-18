@@ -91,6 +91,7 @@ fn header(workspace: &str) -> Header {
     Header {
         id: SessionId::new(),
         workspace: workspace.into(),
+        parent: None,
     }
 }
 
@@ -138,7 +139,11 @@ fn appends_keep_their_order_across_reopens(store: &dyn LogStore) {
 }
 
 fn headers_list_sessions_oldest_first(store: &dyn LogStore) {
-    let made: Vec<Header> = ["/a", "/b", "/c"].map(header).into();
+    let mut made: Vec<Header> = ["/a", "/b", "/c"].map(header).into();
+    made[2].parent = Some(Parent {
+        session: made[0].id,
+        call: 1,
+    });
     for h in made.iter().rev() {
         append(&mut *store.create(h).unwrap().log, 1..=2);
     }

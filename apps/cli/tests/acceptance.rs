@@ -232,6 +232,65 @@ fn entries_after_a_torn_tail_survive_a_restart() {
 }
 
 #[test]
+fn a_parents_watch_fires_exactly_once_after_the_daemon_is_killed_mid_child() {
+    let env = Env::new("watch");
+    env.start();
+    let mut conn = env.connect();
+    let (id, _) = conn.attach(Target::New, &env.ws);
+    conn.input("spawn sleep 2");
+    let linked = conn.until(|e| matches!(e.body, Body::Watch { .. }));
+    let Some(Body::Link { child, .. }) = linked
+        .iter()
+        .map(|e| &e.body)
+        .find(|b| matches!(b, Body::Link { .. }))
+        .cloned()
+    else {
+        panic!("no link in {linked:?}")
+    };
+    // The child is mid-sleep when the daemon dies.
+    let mut child_conn = env.connect();
+    let (_, started) = child_conn.attach(Target::Id(child), &env.ws);
+    if !started.iter().any(is_tool_call) {
+        child_conn.until(is_tool_call);
+    }
+    env.kill_daemon();
+    let torn = (env.log(id), env.log(child));
+
+    env.start();
+    let mut conn = env.connect();
+    let (_, mut entries) = conn.attach(Target::Id(id), &env.ws);
+    let is_fired = |e: &protocol::Entry| matches!(e.body, Body::Fired { .. });
+    if !entries.iter().any(is_fired) {
+        entries.extend(conn.until(is_fired));
+    }
+    drop(conn);
+    env.run(&["daemon", "stop"]);
+    // Another restart re-arms nothing: the watch has fired.
+    env.start();
+    let (_, replayed) = env.connect().attach(Target::Id(id), &env.ws);
+
+    assert!(!torn.0.iter().any(is_fired), "fired before the kill");
+    assert!(!torn.1.iter().any(|e| result_of(e, 2).is_some()));
+    assert_contiguous(&replayed);
+    assert_eq!(replayed, env.log(id));
+    let fired: Vec<_> = replayed
+        .iter()
+        .filter_map(|e| match &e.body {
+            Body::Fired { outcome, .. } => Some(outcome),
+            _ => None,
+        })
+        .collect();
+    let slept = Outcome::Done {
+        output: json!({ "slept": 2 }),
+    };
+    assert_eq!(fired, [&slept]);
+    let child_log = env.log(child);
+    assert_contiguous(&child_log);
+    let results: Vec<_> = child_log.iter().filter_map(|e| result_of(e, 2)).collect();
+    assert_eq!(results, [&slept]);
+}
+
+#[test]
 fn sessions_outlive_their_daemon() {
     let env = Env::new("outlive");
     let id = env.run(&["new"]).trim().to_owned();

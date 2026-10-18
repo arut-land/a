@@ -317,7 +317,9 @@ impl View {
                 Some(command) => println!("tool $ {command}"),
                 None => println!("tool {tool} {input}"),
             },
-            Body::ToolResult { outcome, .. } => print_outcome(outcome),
+            Body::ToolResult { outcome, .. } | Body::Fired { outcome, .. } => {
+                print_outcome(outcome);
+            }
             Body::ModelResult { call, outcome } => {
                 // A streamed reply is on screen already; end its line.
                 if self.streaming.take() == Some(*call) {
@@ -342,7 +344,8 @@ impl View {
                 }
             }
             Body::Hook { hook, decision } => println!("  · hook {hook}: {decision:?}"),
-            Body::ToolProcess { .. } | Body::ModelCall { .. } => {}
+            Body::Link { child, input } => println!("child {} {input}", child.short()),
+            Body::ToolProcess { .. } | Body::ModelCall { .. } | Body::Watch { .. } => {}
         }
     }
 }

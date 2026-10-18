@@ -36,6 +36,11 @@ pub enum Action {
     },
     /// Ask the model to reply to the conversation so far.
     CallModel,
+    /// Start a child session on `input` and watch it; its result comes back
+    /// into this session's log when it settles.
+    Spawn {
+        input: String,
+    },
 }
 
 pub trait Agent: Send {
@@ -140,8 +145,9 @@ fn refusal(call: &llm::ToolCall, limited: bool) -> Option<String> {
     limited.then(|| format!("not run: the limit of {MAX_STEPS} model calls per message is reached"))
 }
 
-/// Echoes messages back. `$ <command>` runs a shell command and
-/// `sleep <seconds>` sleeps, so tool calls can be exercised without a model.
+/// Echoes messages back. `$ <command>` runs a shell command,
+/// `sleep <seconds>` sleeps and `spawn <message>` hands the message to a
+/// child session, so tool calls and links can be exercised without a model.
 pub struct Echo;
 
 impl Agent for Echo {
@@ -149,6 +155,11 @@ impl Agent for Echo {
         let Input::User { text } = input else {
             return Vec::new();
         };
+        if let Some(input) = text.strip_prefix("spawn ") {
+            return vec![Action::Spawn {
+                input: input.to_owned(),
+            }];
+        }
         let (tool, input) = if let Some(command) = text.strip_prefix("$ ") {
             (tools::RunCommand::NAME, json!({ "command": command }))
         } else if let Some(Ok(seconds)) = text.strip_prefix("sleep ").map(str::parse::<u64>) {
@@ -189,6 +200,12 @@ mod tests {
         assert_eq!(tool_named(&echo.step(user("$ ls"))), Some("run_command"));
         assert_eq!(tool_named(&echo.step(user("sleep 2"))), Some("sleep"));
         assert!(matches!(&echo.step(user("sleep x"))[..], [Action::Emit(_)]));
+        assert_eq!(
+            echo.step(user("spawn sleep 1")),
+            [Action::Spawn {
+                input: "sleep 1".into()
+            }]
+        );
     }
 
     #[test]

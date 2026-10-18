@@ -195,6 +195,7 @@ impl Fixture {
             tools,
             hooks,
             model: Ok(model),
+            daemon: Weak::new(),
         }))
     }
 
@@ -203,6 +204,7 @@ impl Fixture {
         let header = Header {
             id: SessionId::new(),
             workspace: std::env::temp_dir(),
+            parent: None,
         };
         let mut log = self.0.store.create(&header).unwrap().log;
         for e in entries {

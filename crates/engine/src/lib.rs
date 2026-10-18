@@ -91,7 +91,7 @@ struct Slot {
 impl Daemon {
     /// Reads only session headers. Sessions with a busy marker were working
     /// when the last daemon stopped, so they load at once to recover.
-    fn load(home: &Home, config: &Config) -> io::Result<Self> {
+    fn load(home: &Home, config: &Config) -> io::Result<Arc<Self>> {
         let store = Arc::new(Jsonl::open(home.sessions_dir())?);
         let slots = store
             .headers()?
@@ -106,17 +106,18 @@ impl Daemon {
         // One worker: model calls block their session's actor, so the runtime
         // only moves response bodies.
         let model = model::Model::from_spec(&config.model, Arc::new(rt::Threads::new(1)));
-        let daemon = Self {
+        let daemon = Arc::new_cyclic(|daemon| Self {
             shared: Arc::new(Shared {
                 store,
                 agent: config.agent,
                 tools: agent::Toolset::default(),
                 hooks: agent::Hooks::default(),
                 model,
+                daemon: daemon.clone(),
             }),
             slots: Mutex::new(slots),
             clients: AtomicUsize::new(0),
-        };
+        });
         for slot in daemon.slots() {
             if daemon.shared.store.is_busy(slot.header.id)
                 && let Err(e) = daemon.with_live(&slot, |_| ())
@@ -156,10 +157,10 @@ impl Daemon {
         let found = match target {
             Target::New => return self.create(workspace),
             Target::Id(id) => slots.iter().find(|s| s.header.id == *id),
-            Target::Latest { any_workspace } => slots
-                .iter()
-                .rev()
-                .find(|s| *any_workspace || s.header.workspace == workspace),
+            // A child is reached through its parent, not resumed as latest.
+            Target::Latest { any_workspace } => slots.iter().rev().find(|s| {
+                s.header.parent.is_none() && (*any_workspace || s.header.workspace == workspace)
+            }),
         };
         let slot =
             found.ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, "no matching session"))?;
@@ -170,6 +171,7 @@ impl Daemon {
         let header = Header {
             id: SessionId::new(),
             workspace,
+            parent: None,
         };
         let loaded = self.shared.store.create(&header)?;
         let session = Session::start(header.clone(), loaded, Arc::clone(&self.shared));
@@ -280,7 +282,7 @@ impl Drop for Client<'_> {
 #[cfg(unix)]
 pub fn serve(listener: &UnixListener, home: &Home, config: &Config, build: &str) -> io::Result<()> {
     let pid = claim(home)?;
-    let daemon = Arc::new(Daemon::load(home, config)?);
+    let daemon = Daemon::load(home, config)?;
     let life = Arc::new(Lifecycle::new(build.to_owned(), home.runtime()));
     let (monitor, watch, config, socket) = (
         Arc::clone(&daemon),
