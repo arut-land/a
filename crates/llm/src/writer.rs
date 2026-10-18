@@ -741,17 +741,16 @@ impl Writer {
     /// fails, as does one that ends with a call left open short of the
     /// output limit.
     pub fn end(&mut self, end: End) -> Result<Flow, Error> {
-        let mut open: Vec<(u32, usize)> = self
-            .open
-            .iter()
-            .map(|(index, draft)| (draft.part, *index))
-            .collect();
-        open.sort_unstable();
         let unfinished_call = self
             .open
             .values()
             .any(|draft| matches!(draft.body, Body::Call { .. }));
-        for (_, index) in open {
+        // What is still open closes in the order it opened.
+        let first_open = |open: &BTreeMap<usize, Draft>| {
+            let first = open.iter().min_by_key(|(_, draft)| draft.part);
+            first.map(|(index, _)| *index)
+        };
+        while let Some(index) = first_open(&self.open) {
             self.close_item(index, false)?;
         }
         let Some((reason, raw)) = end.reason else {
@@ -824,9 +823,13 @@ impl Writer {
         }
         let mut parts = self.parts.clone();
         if let Some(by_index) = &self.by_index {
-            parts.sort_unstable_by_key(|part| {
-                (by_index.get(part).copied().unwrap_or(usize::MAX), *part)
-            });
+            // Sorting keys in their natural order compiles to a fraction of
+            // a sort by a key function.
+            let index = |part: &u32| by_index.get(part).copied().unwrap_or(usize::MAX);
+            let mut keyed: Vec<(usize, u32)> =
+                parts.iter().map(|part| (index(part), *part)).collect();
+            keyed.sort_unstable();
+            parts = keyed.into_iter().map(|(_, part)| part).collect();
         }
         if let Some(at) = self
             .lead
