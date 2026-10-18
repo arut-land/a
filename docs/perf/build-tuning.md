@@ -11,7 +11,7 @@ Researched 2026-10-18 on macOS arm64, `nightly-2026-10-17`, ld-prime.
 
 | Budget | Target | Command | Baseline (2026-10-18) |
 | --- | --- | --- | --- |
-| Release binary | < 4 MB | `mise run size` | 473 KiB |
+| Release binary | < 4 MB | `mise run size` | 473 KiB; 3018 KiB with the provider (see below) |
 | Cold start (`a --version`) | — | `mise run startup` | 2.5–2.8 ms |
 | CLI peak RSS | — | `/usr/bin/time -l target/release/a --version` | 1.79 MB |
 | Idle daemon RSS | < 10 MB | `ps -o rss= -p <pid>` after 5 s idle (`VmRSS` on Linux) | — |
@@ -32,6 +32,8 @@ Researched 2026-10-18 on macOS arm64, `nightly-2026-10-17`, ld-prime.
 | Linux: clang + mold | `.cargo/config.toml`, `mise.toml` | Link time. Untested until Linux CI |
 | Windows MSVC: `+crt-static`, `/STACK:8388608` | `.cargo/config.toml` | No VC++ runtime dependency (uv, ruff, Deno, Zed, oxc, ripgrep). Untested until Windows CI |
 | mbx (mr-boxington) cargo wrapper | `mise.toml` | Shared compile cache across checkouts and worktrees |
+| Native TLS on Apple and Windows (`ureq` `native-tls`), rustls + platform verifier elsewhere | `crates/provider/Cargo.toml` | 3968 → 3179 KiB on macOS: drops ring, rustls, webpki |
+| Release `opt-level = "s"` for cold crates (ureq, ureq-proto, url, http, usage-argv; rig-core and rig-http before `crates/llm`) | `.cargo/profiles.toml` | 3179 → 3018 KiB; startup unchanged (3.4 vs 3.5 ± 0.2 ms). serde_json stays at 3 (frames every message) |
 
 ## Deferred: adopt when the trigger fires
 
@@ -54,6 +56,23 @@ Researched 2026-10-18 on macOS arm64, `nightly-2026-10-17`, ld-prime.
 | Startup symbol ordering (two-pass link with an order file) | Binary > ~10 MB and RSS matters | Deno Linux idle RSS 47 → 29 MiB, −2 ms | deno#36219 |
 | zstd-compressed embedded payloads (web assets, Lua stdlib) | Embedded assets grow | Deno, Bun (ICU pruning + lazy zstd ~6.8 MB) | deno `cli/build.rs`, bun#41330 |
 | `/OPT:SAFEICF` on Windows | Full ICF breaks function identity | Bun hit BigInt breakage with full ICF | bun#30219 |
+
+## Notes from adding the LLM provider (2026-10-18)
+
+- Size before the provider: 473 KiB. With rig-core + ureq + rustls: 3968 KiB (std 626K, rig_core 394K, rustls 316K, serde_json 177K, ring 132K).
+- `ureq`'s TLS module is gated on its full `native-tls` feature; `native-tls-no-default` builds but panics at runtime ("feature is not enabled: native-tls"). The full feature also links `webpki-root-certs` (~213 KiB) although `RootCerts::PlatformVerifier` never uses it. Revisit if ureq gates the roots separately.
+- Dev builds compile workspace crates with Cranelift, which cannot unwind on macOS arm64: a panic aborts the process instead of unwinding. Release (LLVM) unwinds, and the engine wraps every effect in `catch_unwind`. Revisit if Cranelift gains unwinding here, or build `engine` with LLVM in dev if dev aborts become a problem.
+
+## Own provider layer instead of rig (2026-10-18)
+
+`crates/llm` replaces rig-core: its wire codecs and quirk tables, ported by hand onto a small core (spec, writer, client), with no catalog, telemetry or agent framework. Recorded rig cassettes (`fixtures/rig`) hold it to rig's decoding.
+
+| Step | Binary | Daemon footprint after a model call |
+| --- | --- | --- |
+| rig as published (catalog 428 KB) | 2873 KiB | 8.3 MB |
+| rig vendored, catalog trimmed, pricing patched out | 2453 KiB | 4.7 MB |
+| `crates/llm` (Responses only), stateless replay of provider items | 1774 KiB | 4.7 MB (two turns, encrypted reasoning replayed) |
+| `crates/llm`, all four wires (Responses, Chat with 24 hosts, Messages with 5, Gemini) | 2114 KiB | 4.4 MB (two turns on Claude through Messages) |
 
 ## Rejected for now, with the reason and when to revisit
 

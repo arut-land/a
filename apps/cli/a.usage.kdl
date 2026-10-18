@@ -1,0 +1,42 @@
+name a
+bin a
+version "0.0.0"
+about "Agent engine: attach to durable sessions run by a per-user daemon."
+flag "-h --help" help="Print help" action=help builtin=#true
+flag "-V --version" help="Print version" action=version builtin=#true
+cmd resume help="Resume the latest session in this workspace, or pick one" {
+    flag --any help="Take the latest session across all workspaces"
+    flag "-h --help" help="Print help" action=help builtin=#true
+    arg "[ID]"
+}
+cmd attach help="Attach to a session by id" {
+    flag "-h --help" help="Print help" action=help builtin=#true
+    arg <ID>
+}
+cmd ls help="List sessions" {
+    flag "-h --help" help="Print help" action=help builtin=#true
+}
+cmd new help="Start a new session without attaching" {
+    flag "-h --help" help="Print help" action=help builtin=#true
+}
+cmd bridge help="Pipe stdio to the local daemon (for `ssh host a bridge`)" {
+    flag "-h --help" help="Print help" action=help builtin=#true
+}
+cmd daemon help="Inspect or control the background daemon" subcommand_required=#true {
+    flag "-h --help" help="Print help" action=help builtin=#true
+    cmd status help="Show whether the daemon is running and responding" {
+        flag "-h --help" help="Print help" action=help builtin=#true
+    }
+    cmd stop help="Stop the daemon; sessions resume when it next starts" {
+        flag "-h --help" help="Print help" action=help builtin=#true
+    }
+    cmd restart help="Stop the daemon and start a fresh one" {
+        flag "-h --help" help="Print help" action=help builtin=#true
+    }
+}
+cmd __daemon hide=#true {
+    flag --listen-fd {
+        arg <LISTEN_FD>
+    }
+    flag "-h --help" help="Print help" action=help builtin=#true
+}

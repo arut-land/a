@@ -13,11 +13,29 @@ pub mod tools;
 pub enum Input {
     User { text: String },
     ToolDone { call: u64, outcome: Outcome },
+    ModelDone { call: u64, outcome: Outcome },
 }
 
 pub enum Action {
     Emit(Body),
-    RunTool { tool: String, input: Value },
+    RunTool {
+        tool: String,
+        input: Value,
+    },
+    /// Ask the model to reply to the conversation so far.
+    CallModel,
+}
+
+/// Hands every user message to the model.
+pub struct Chat;
+
+impl Agent for Chat {
+    fn step(&mut self, input: Input) -> Vec<Action> {
+        match input {
+            Input::User { .. } => vec![Action::CallModel],
+            Input::ToolDone { .. } | Input::ModelDone { .. } => Vec::new(),
+        }
+    }
 }
 
 pub trait Agent: Send {

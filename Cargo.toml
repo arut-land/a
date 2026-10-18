@@ -20,6 +20,7 @@ sys = { path = "crates/sys" }
 
 bytes = { version = "1", default-features = false, features = ["std"] }
 http = { version = "1", default-features = false, features = ["std"] }
+memchr = { version = "2", default-features = false, features = ["std"] }
 rustix = { version = "1", default-features = false, features = ["std", "fs", "process"] }
 serde = { version = "1", default-features = false, features = ["std", "derive"] }
 serde_json = { version = "1", default-features = false, features = ["std"] }

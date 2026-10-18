@@ -23,3 +23,20 @@ codegen-units = 1
 debug = "line-tables-only"
 split-debuginfo = "packed"
 strip = "symbols"
+
+# Cold paths (one request encode per model turn, argv parsed once): size over
+# speed. Network time dominates these; hot paths such as serde_json stay at 3.
+[profile.release.package.ureq]
+opt-level = "s"
+
+[profile.release.package.ureq-proto]
+opt-level = "s"
+
+[profile.release.package.url]
+opt-level = "s"
+
+[profile.release.package.http]
+opt-level = "s"
+
+[profile.release.package.usage-argv]
+opt-level = "s"

@@ -29,6 +29,11 @@ impl Home {
         self.run_dir().join("daemon.lock")
     }
 
+    /// Locked by the running daemon for its whole life, and holds its pid.
+    pub fn daemon_pid_file(&self) -> PathBuf {
+        self.run_dir().join("daemon.pid")
+    }
+
     pub fn sessions_dir(&self) -> PathBuf {
         self.root.join("sessions")
     }
@@ -58,6 +63,11 @@ pub fn boot_id() -> Option<&'static str> {
 
 #[cfg(not(unix))]
 pub fn kill_process_group(_pgid: u32) -> io::Result<()> {
+    Err(io::Error::from(io::ErrorKind::Unsupported))
+}
+
+#[cfg(not(unix))]
+pub fn signal_process(_pid: u32, _force: bool) -> io::Result<()> {
     Err(io::Error::from(io::ErrorKind::Unsupported))
 }
 
@@ -154,6 +164,23 @@ mod unix {
             .and_then(rustix::process::Pid::from_raw)
             .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "invalid pgid"))?;
         match rustix::process::kill_process_group(group, rustix::process::Signal::KILL) {
+            Ok(()) | Err(rustix::io::Errno::SRCH) => Ok(()),
+            Err(e) => Err(e.into()),
+        }
+    }
+
+    /// Asks a process to exit (SIGTERM), or forces it (SIGKILL).
+    pub fn signal_process(pid: u32, force: bool) -> io::Result<()> {
+        let pid = i32::try_from(pid)
+            .ok()
+            .and_then(rustix::process::Pid::from_raw)
+            .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "invalid pid"))?;
+        let signal = if force {
+            rustix::process::Signal::KILL
+        } else {
+            rustix::process::Signal::TERM
+        };
+        match rustix::process::kill_process(pid, signal) {
             Ok(()) | Err(rustix::io::Errno::SRCH) => Ok(()),
             Err(e) => Err(e.into()),
         }

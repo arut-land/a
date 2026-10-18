@@ -6,6 +6,9 @@ publish.workspace = true
 
 [dependencies]
 agent.workspace = true
+futures-core = { version = "0.3", default-features = false, features = ["std"] }
+llm = { workspace = true, features = ["ureq"] }
+rt.workspace = true
 serde_json.workspace = true
 protocol.workspace = true
 store.workspace = true

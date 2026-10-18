@@ -9,6 +9,7 @@ dependencies = [
  "client",
  "engine",
  "protocol",
+ "serde_json",
  "sys",
  "usage-rs",
 ]
@@ -275,7 +276,10 @@ name = "engine"
 version = "0.0.0"
 dependencies = [
  "agent",
+ "futures-core",
+ "llm",
  "protocol",
+ "rt",
  "serde_json",
  "store",
  "sys",
@@ -1002,6 +1006,7 @@ dependencies = [
 name = "store"
 version = "0.0.0"
 dependencies = [
+ "memchr",
  "protocol",
  "serde",
  "serde_json",

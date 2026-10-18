@@ -68,6 +68,15 @@ pub enum Body {
         call: u64,
         outcome: Outcome,
     },
+    /// The committed intent to ask a model for a reply.
+    ModelCall {
+        model: String,
+    },
+    /// The reply; `Done` carries `{"text": ...}`.
+    ModelResult {
+        call: u64,
+        outcome: Outcome,
+    },
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -133,6 +142,12 @@ pub enum DaemonMsg {
         workspace: PathBuf,
     },
     Entry(Entry),
+    /// Live text of an unfinished model call. Never logged: the committed
+    /// `model_result` is the fact.
+    Delta {
+        call: u64,
+        text: String,
+    },
     /// Replay is complete; everything after this is live.
     Synced {
         seq: u64,

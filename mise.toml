@@ -7,6 +7,10 @@ auto_install = true
 cargo.binstall_native = true
 cargo.binstall_only = false
 
+[env]
+# Local secrets (gitignored), e.g. OPENAI_API_KEY and OPENAI_BASE_URL.
+_.file = { path = ".env.local", redact = true }
+
 [task_config]
 # Git Bash on Windows, so task scripts are the same everywhere.
 shell = "bash -o errexit -o pipefail -c"
@@ -34,4 +38,5 @@ check = { depends = ["check:fmt", "check:clippy", "test"] }
 size = { depends = ["release"], run = 'f=target/release/a; [[ -e $f.exe ]] && f+=.exe; b=$(wc -c < "$f"); echo "a: $((b / 1024)) KiB of 4096 KiB"; ((b <= 4194304))' }
 startup = { depends = ["release"], run = 'hyperfine -N --warmup 50 -r 500 "target/release/a --version"' }
 bloat = "cargo bloat --release --crates -n 20"
+"generate:usage" = "cargo run -q -p a -- __usage_spec__ > apps/cli/a.usage.kdl"
 "bloat:lines" = "cargo llvm-lines --release -p a | head -30"

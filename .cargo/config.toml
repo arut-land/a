@@ -15,5 +15,7 @@ rustflags = ["-Zthreads=8", "-Clink-arg=-fuse-ld=mold"]
 rustflags = ["-Zthreads=8", "-Ctarget-feature=+crt-static", "-Clink-arg=/STACK:8388608"]
 
 [alias]
-# [unstable] build-std would also rebuild std for dev builds.
-build-release = "build --release -Zbuild-std=std,panic_unwind"
+# [unstable] build-std would also rebuild std for dev builds. Without std's
+# `backtrace` feature, panic backtraces print addresses, symbolicated offline
+# from the dSYM (-179 KiB).
+build-release = "build --release -Zbuild-std=std,panic_unwind -Zbuild-std-features=panic-unwind"
