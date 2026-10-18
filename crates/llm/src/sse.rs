@@ -5,9 +5,11 @@
 
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct SseEvent {
-    pub event: String,
+    pub event: Cow<'static, str>,
     pub data: String,
 }
+
+use std::borrow::Cow;
 
 const BOM: [u8; 3] = [0xef, 0xbb, 0xbf];
 
@@ -100,9 +102,9 @@ impl Fields {
         }
         self.data.pop();
         let event = if self.event_type.is_empty() {
-            "message".to_owned()
+            Cow::Borrowed("message")
         } else {
-            std::mem::take(&mut self.event_type)
+            Cow::Owned(std::mem::take(&mut self.event_type))
         };
         self.ready.push(SseEvent {
             event,
