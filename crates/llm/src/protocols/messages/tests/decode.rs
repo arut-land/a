@@ -715,3 +715,192 @@ fn the_container_is_kept_as_a_last_opaque_part() {
             "container": {"id": "container_1", "expires_at": "2026-10-03T00:00:00Z"}}))
     );
 }
+
+/// `frames` decoded through the typed fast path where it applies (`fast`),
+/// or every frame through a `Value`; `each` sees each frame's flow and
+/// events.
+fn decode_frames(
+    frames: &[String],
+    fast: bool,
+    mut each: impl FnMut(Result<crate::Flow, Error>, &mut Vec<Event>),
+) {
+    let mut decoder = super::super::decode::MessagesDecoder::new(false);
+    let mut events = Vec::new();
+    for data in frames {
+        let flow = if fast {
+            Decoder::frame(&mut decoder, Frame { event: "", data }, &mut events)
+        } else {
+            let flow = decoder.value(data);
+            crate::writer::Writes::writer(&mut decoder).drain(&mut events);
+            flow
+        };
+        each(flow, &mut events);
+        events.clear();
+    }
+}
+
+/// What each of `frames` decodes to.
+fn events_of(frames: &[String], fast: bool) -> Vec<String> {
+    let mut log = Vec::new();
+    decode_frames(frames, fast, |flow, events| {
+        log.push(format!("{flow:?} {events:?}"));
+    });
+    log
+}
+
+/// Frames the fast path takes, declines, or must agree on with the `Value`
+/// path: escapes, extra fields, empty and missing fragments, a string
+/// index, a duplicate field, deltas to a block that never started and to
+/// one of another kind.
+#[test]
+fn the_typed_delta_path_decodes_as_the_value_path_does() {
+    let start = |index: usize, block: Value| {
+        json!({"type": "content_block_start", "index": index, "content_block": block}).to_string()
+    };
+    let mut frames = vec![
+        json!({"type": "message_start", "message": {"id": "m", "usage": {}}}).to_string(),
+        start(0, json!({"type": "thinking", "thinking": ""})),
+        start(
+            1,
+            json!({"type": "tool_use", "id": "toolu_1", "name": "f", "input": {}}),
+        ),
+        start(
+            2,
+            json!({"type": "server_tool_use", "id": "srv", "name": "s"}),
+        ),
+    ];
+    for (index, delta) in [
+        (
+            json!(0),
+            json!({"type": "thinking_delta", "thinking": "plain"}),
+        ),
+        (
+            json!(0),
+            json!({"type": "thinking_delta", "thinking": "esc\"aped\n\u{e9}"}),
+        ),
+        (json!(0), json!({"type": "thinking_delta", "thinking": ""})),
+        (
+            json!(0),
+            json!({"type": "thinking_delta", "thinking": "x", "extra": [1]}),
+        ),
+        (
+            json!(0),
+            json!({"type": "thinking_delta", "thinking": "x", "signature": "s"}),
+        ),
+        (
+            json!(0),
+            json!({"type": "signature_delta", "signature": "sig\\"}),
+        ),
+        (json!(0), json!({"type": "signature_delta"})),
+        (
+            json!("0"),
+            json!({"type": "thinking_delta", "thinking": "string index"}),
+        ),
+        (
+            json!(1),
+            json!({"type": "input_json_delta", "partial_json": "{\"a\":"}),
+        ),
+        (
+            json!(1),
+            json!({"type": "input_json_delta", "partial_json": "\"\\u00e9\"}"}),
+        ),
+        (
+            json!(2),
+            json!({"type": "input_json_delta", "partial_json": "{}"}),
+        ),
+        (
+            json!(3),
+            json!({"type": "text_delta", "text": "opens block 3"}),
+        ),
+        (json!(3), json!({"type": "text_delta", "text": null})),
+        (
+            json!(0),
+            json!({"type": "input_json_delta", "partial_json": "{}"}),
+        ),
+    ] {
+        frames.push(
+            json!({"type": "content_block_delta", "index": index, "delta": delta}).to_string(),
+        );
+    }
+    frames.push(
+        r#"{"type":"content_block_delta","index":0,"delta":{"type":"thinking_delta","thinking":"a","thinking":"b"}}"#
+            .to_owned(),
+    );
+    frames.extend(
+        (0..4).map(|index| json!({"type": "content_block_stop", "index": index}).to_string()),
+    );
+    frames.push(
+        json!({"type": "message_delta", "delta": {"stop_reason": "end_turn"}, "usage": {}})
+            .to_string(),
+    );
+    // Frames after one that fails are decoded too: each path must agree on
+    // every frame, not only on the reply.
+    assert_eq!(events_of(&frames, true), events_of(&frames, false));
+}
+
+/// The frames of the recorded Anthropic stream `name`.
+fn recorded(name: &str) -> Vec<String> {
+    let path = format!(
+        "{}/../../fixtures/rig/cassettes/anthropic/{name}.yaml",
+        env!("CARGO_MANIFEST_DIR")
+    );
+    let text = std::fs::read_to_string(path).expect("the cassette");
+    let cassette: serde_yaml_ng::Value = serde_yaml_ng::from_str(&text).expect("yaml");
+    let body = cassette["then"]["body"].as_str().expect("a body");
+    crate::sse::SseFramer::new()
+        .push(body.as_bytes())
+        .map(|event| event.data)
+        .collect()
+}
+
+/// The typed path reads every delta of a recorded stream without building
+/// a `Value`, borrowing each fragment that needs no unescaping, and decodes
+/// the same events as the `Value` path. An optimized build is faster too;
+/// both timings are printed.
+#[test]
+fn the_typed_delta_path_reads_recorded_streams_without_values() {
+    use super::super::decode::Fast;
+    let frames: Vec<String> = [
+        "effect_corpus/cancelled_stream",
+        "corpus_endings/tool_call_delta_stop",
+    ]
+    .into_iter()
+    .flat_map(recorded)
+    .collect();
+    let deltas: Vec<&String> = frames
+        .iter()
+        .filter(|data| data.contains(r#""type":"content_block_delta""#))
+        .collect();
+    assert!(deltas.len() > 500, "{}", deltas.len());
+    let read: Vec<_> = deltas.iter().filter_map(|data| Fast::read(data)).collect();
+    assert_eq!(read.len(), deltas.len(), "every delta takes the typed path");
+    let escaped = deltas.iter().filter(|data| data.contains('\\')).count();
+    let owned = read
+        .iter()
+        .filter(|(.., fragment)| matches!(fragment, std::borrow::Cow::Owned(_)))
+        .count();
+    assert_eq!(owned, escaped, "only an escaped fragment is copied");
+    assert_eq!(events_of(&frames, true), events_of(&frames, false));
+    let time = |fast: bool| {
+        (0..15)
+            .map(|_| {
+                let start = std::time::Instant::now();
+                decode_frames(&frames, fast, |flow, events| {
+                    let _ = std::hint::black_box((flow, events));
+                });
+                start.elapsed()
+            })
+            .min()
+            .expect("rounds")
+    };
+    let (fast, slow) = (time(true), time(false));
+    eprintln!(
+        "{} frames, {} deltas ({owned} copied): typed {fast:?}, Value {slow:?} ({:.2}x)",
+        frames.len(),
+        deltas.len(),
+        slow.as_secs_f64() / fast.as_secs_f64()
+    );
+    if !cfg!(debug_assertions) {
+        assert!(fast < slow, "typed {fast:?}, Value {slow:?}");
+    }
+}
