@@ -1,68 +1,28 @@
 use std::collections::{HashSet, VecDeque};
+use std::fmt::Display;
 use std::io;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::mpsc::{self, Receiver, Sender};
-use std::sync::{Arc, Mutex, PoisonError};
+use std::sync::{Arc, Mutex, MutexGuard};
 use std::thread;
 use std::time::{Duration, Instant};
 
-use agent::{Action, Agent, Chat, Cx, Echo, Input, Replay, Toolset};
-
-use crate::model::Model;
+use agent::{Action, Agent, Cx, Input, Replay, Tool, Toolset};
 use protocol::{Body, DaemonMsg, Entry, Outcome, SessionId, SessionSummary};
 use serde_json::Value;
-use store::{Loaded, Log, Store};
+use store::{Header, Loaded, Log, Store};
+
+use crate::lock;
+use crate::model::Model;
 
 /// What every session runs with.
-pub struct Runtime {
-    pub agent: AgentKind,
+pub struct Shared {
+    pub store: Store,
+    pub agent: agent::Kind,
     pub tools: Toolset,
     /// The model, or why there is none (shown as the failed model call).
     pub model: Result<Model, String>,
-    pub pins: Pins,
-}
-
-/// What keeps the daemon alive: attached clients and unfinished work.
-#[derive(Default)]
-pub struct Pins {
-    clients: AtomicUsize,
-    work: AtomicUsize,
-}
-
-impl Pins {
-    pub fn idle(&self) -> bool {
-        self.clients.load(Ordering::SeqCst) == 0 && self.work.load(Ordering::SeqCst) == 0
-    }
-
-    pub fn client(&self) -> PinGuard<'_> {
-        PinGuard::new(&self.clients)
-    }
-
-    fn work(&self) -> PinGuard<'_> {
-        PinGuard::new(&self.work)
-    }
-}
-
-pub struct PinGuard<'a>(&'a AtomicUsize);
-
-impl<'a> PinGuard<'a> {
-    fn new(count: &'a AtomicUsize) -> Self {
-        count.fetch_add(1, Ordering::SeqCst);
-        Self(count)
-    }
-}
-
-impl Drop for PinGuard<'_> {
-    fn drop(&mut self) {
-        self.0.fetch_sub(1, Ordering::SeqCst);
-    }
-}
-
-#[derive(Clone, Copy)]
-pub enum AgentKind {
-    Echo,
-    Chat,
 }
 
 pub struct Session {
@@ -76,8 +36,7 @@ pub struct Session {
     /// Open client attachments; a session with any stays loaded.
     attached: AtomicUsize,
     last_active: Mutex<Instant>,
-    rt: Arc<Runtime>,
-    store: Arc<Store>,
+    shared: Arc<Shared>,
 }
 
 enum Msg {
@@ -108,35 +67,27 @@ impl Drop for Attachment {
 }
 
 impl Session {
-    /// Loads a session and starts its actor: the single writer that steps
-    /// the agent and runs its effects. Calls left dangling by a crash are
+    /// Starts a loaded session's actor: the single writer that steps the
+    /// agent and runs its effects. Calls left dangling by a crash are
     /// recovered first.
-    pub fn start(
-        id: SessionId,
-        workspace: PathBuf,
-        loaded: Loaded,
-        rt: Arc<Runtime>,
-        store: Arc<Store>,
-    ) -> Arc<Self> {
+    pub fn start(header: Header, loaded: Loaded, shared: Arc<Shared>) -> Arc<Self> {
         let (inbox, rx) = mpsc::channel();
-        let state = Mutex::new(State {
-            entries: loaded.entries,
-            log: loaded.log,
-            clients: Vec::new(),
-        });
         let session = Arc::new(Self {
-            id,
-            workspace,
-            state,
+            id: header.id,
+            workspace: header.workspace,
+            state: Mutex::new(State {
+                entries: loaded.entries,
+                log: loaded.log,
+                clients: Vec::new(),
+            }),
             inbox,
             // Recovery counts as queued work until it has run.
             queued: AtomicUsize::new(1),
             attached: AtomicUsize::new(0),
             last_active: Mutex::new(Instant::now()),
-            rt,
-            store,
+            shared,
         });
-        let actor = session.clone();
+        let actor = Arc::clone(&session);
         thread::spawn(move || actor.run(&rx));
         session
     }
@@ -146,7 +97,7 @@ impl Session {
     pub fn open(self: &Arc<Self>) -> Attachment {
         self.attached.fetch_add(1, Ordering::SeqCst);
         self.touch();
-        Attachment(self.clone())
+        Attachment(Arc::clone(self))
     }
 
     pub fn submit(&self, text: String) {
@@ -163,10 +114,7 @@ impl Session {
         if self.attached.load(Ordering::SeqCst) > 0 || self.has_work() {
             return Duration::ZERO;
         }
-        self.last_active
-            .lock()
-            .unwrap_or_else(PoisonError::into_inner)
-            .elapsed()
+        lock(&self.last_active).elapsed()
     }
 
     /// Stops the actor; the session lives on in its log. Callers check
@@ -190,24 +138,24 @@ impl Session {
     }
 
     pub fn summary(&self) -> SessionSummary {
-        let st = self.lock();
         SessionSummary {
             id: self.id,
             workspace: self.workspace.clone(),
-            entries: st.entries.len() as u64,
+            entries: self.lock().entries.len() as u64,
             clients: u32::try_from(self.attached.load(Ordering::SeqCst)).unwrap_or(u32::MAX),
         }
     }
 
     fn touch(&self) {
-        *self
-            .last_active
-            .lock()
-            .unwrap_or_else(PoisonError::into_inner) = Instant::now();
+        *lock(&self.last_active) = Instant::now();
     }
 
-    fn lock(&self) -> std::sync::MutexGuard<'_, State> {
-        self.state.lock().unwrap_or_else(PoisonError::into_inner)
+    fn lock(&self) -> MutexGuard<'_, State> {
+        lock(&self.state)
+    }
+
+    fn warn(&self, problem: impl Display) {
+        eprintln!("session {}: {problem}", self.id.short());
     }
 
     /// Commits an entry; only committed entries are ever shown to clients.
@@ -232,79 +180,87 @@ impl Session {
     }
 
     fn run(&self, inbox: &Receiver<Msg>) {
-        let rt = &*self.rt;
-        let mut agent: Box<dyn Agent> = match rt.agent {
-            AgentKind::Echo => Box::new(Echo),
-            AgentKind::Chat => Box::new(Chat),
-        };
-        self.work(|| self.recover(agent.as_mut(), rt));
+        let mut agent = self.shared.agent.agent();
+        self.work(|| self.recover(agent.as_mut()));
         for msg in inbox {
             let Msg::Input(text) = msg else { return };
             self.work(|| {
                 self.append(Body::User { text: text.clone() })?;
-                self.drive(agent.as_mut(), rt, Input::User { text })
+                self.drive(agent.as_mut(), Input::User { text })
             });
         }
     }
 
-    /// Runs one queued unit of work, with the daemon pinned and a busy marker
-    /// on disk for as long as anything is in flight.
+    /// Runs one queued unit of work, with a busy marker on disk for as long
+    /// as anything is in flight.
     fn work(&self, job: impl FnOnce() -> io::Result<()>) {
-        let _pinned = self.rt.pins.work();
-        if let Err(e) = self.store.mark_busy(self.id, true) {
-            eprintln!("session {}: busy marker: {e}", self.id.short());
+        let store = &self.shared.store;
+        if let Err(e) = store.mark_busy(self.id, true) {
+            self.warn(format_args!("busy marker: {e}"));
         }
         if let Err(e) = job() {
-            eprintln!("session {}: {e}", self.id.short());
+            self.warn(e);
         }
         if self.queued.fetch_sub(1, Ordering::SeqCst) == 1
-            && let Err(e) = self.store.mark_busy(self.id, false)
+            && let Err(e) = store.mark_busy(self.id, false)
         {
-            eprintln!("session {}: busy marker: {e}", self.id.short());
+            self.warn(format_args!("busy marker: {e}"));
         }
         self.touch();
     }
 
-    fn drive(&self, agent: &mut dyn Agent, rt: &Runtime, input: Input) -> io::Result<()> {
+    /// Steps the agent with `input` and every input its effects produce.
+    fn drive(&self, agent: &mut dyn Agent, input: Input) -> io::Result<()> {
         let mut inputs = VecDeque::from([input]);
         while let Some(input) = inputs.pop_front() {
             for action in agent.step(input) {
-                match action {
+                let call = match action {
                     Action::Emit(body) => {
                         self.append(body)?;
+                        continue;
                     }
-                    Action::RunTool { tool, input } => {
-                        let call = self.append(Body::ToolCall {
-                            tool: tool.clone(),
-                            input: input.clone(),
-                        })?;
-                        let outcome = self.run_tool(&rt.tools, call, &tool, &input);
-                        self.append(Body::ToolResult {
-                            call,
-                            outcome: outcome.clone(),
-                        })?;
-                        inputs.push_back(Input::ToolDone { call, outcome });
-                    }
-                    Action::CallModel => {
-                        let model = rt
-                            .model
-                            .as_ref()
-                            .map_or_else(|_| "none".to_owned(), Model::name);
-                        let call = self.append(Body::ModelCall { model })?;
-                        let outcome = self.run_model(rt, call);
-                        self.append(Body::ModelResult {
-                            call,
-                            outcome: outcome.clone(),
-                        })?;
-                        inputs.push_back(Input::ModelDone { call, outcome });
-                    }
-                }
+                    Action::RunTool { tool, input } => Call::Tool { tool, input },
+                    Action::CallModel => Call::Model,
+                };
+                let seq = self.append(call.intent(&self.shared.model))?;
+                let outcome = self.run_call(&call, seq);
+                inputs.push_back(self.finish(&call, seq, outcome)?);
             }
         }
         Ok(())
     }
 
-    fn run_tool(&self, tools: &Toolset, call: u64, tool: &str, input: &Value) -> Outcome {
+    fn run_call(&self, call: &Call, seq: u64) -> Outcome {
+        match call {
+            Call::Model => self.run_model(seq),
+            Call::Tool { tool, input } => self.run_tool(seq, tool, input),
+        }
+    }
+
+    /// Commits the outcome of call `seq`; returns the input that reports it
+    /// to the agent.
+    fn finish(&self, call: &Call, seq: u64, outcome: Outcome) -> io::Result<Input> {
+        let (body, input) = match call {
+            Call::Model => (
+                Body::ModelResult {
+                    call: seq,
+                    outcome: outcome.clone(),
+                },
+                Input::ModelDone { call: seq, outcome },
+            ),
+            Call::Tool { .. } => (
+                Body::ToolResult {
+                    call: seq,
+                    outcome: outcome.clone(),
+                },
+                Input::ToolDone { call: seq, outcome },
+            ),
+        };
+        self.append(body)?;
+        Ok(input)
+    }
+
+    fn run_tool(&self, call: u64, tool: &str, input: &Value) -> Outcome {
         let spawned = |pgid| {
             let Some(boot) = sys::boot_id() else { return };
             let body = Body::ToolProcess {
@@ -313,20 +269,20 @@ impl Session {
                 boot: boot.to_owned(),
             };
             if let Err(e) = self.append(body) {
-                eprintln!("session {}: recording process {pgid}: {e}", self.id.short());
+                self.warn(format_args!("recording process {pgid}: {e}"));
             }
         };
         let cx = Cx {
             cwd: &self.workspace,
             spawned: &spawned,
         };
-        contain(|| tools.run(tool, input, &cx))
+        contain(|| self.shared.tools.run(tool, input, &cx))
     }
 
     /// Asks the model to reply to the transcript before `call`. Text streams to
     /// clients as it arrives; only the finished reply is committed.
-    fn run_model(&self, rt: &Runtime, call: u64) -> Outcome {
-        let model = match &rt.model {
+    fn run_model(&self, call: u64) -> Outcome {
+        let model = match &self.shared.model {
             Ok(model) => model,
             Err(error) => {
                 return Outcome::Failed {
@@ -359,56 +315,32 @@ impl Session {
     /// Finishes the effect sandwich for calls that have an intent but no
     /// outcome: leftover processes are killed, then safe calls (model calls,
     /// safe tools) run again and everything else is marked interrupted.
-    fn recover(&self, agent: &mut dyn Agent, rt: &Runtime) -> io::Result<()> {
+    fn recover(&self, agent: &mut dyn Agent) -> io::Result<()> {
         let dangling = dangling_calls(&self.lock().entries);
-        for call in dangling {
-            let this_boot = call
-                .processes
+        for Dangling {
+            seq,
+            call,
+            processes,
+        } in dangling
+        {
+            let this_boot = processes
                 .iter()
                 .filter(|(_, boot)| Some(boot.as_str()) == sys::boot_id());
             for (pgid, _) in this_boot {
                 if let Err(e) = sys::kill_process_group(*pgid) {
-                    eprintln!(
-                        "session {}: killing process group {pgid}: {e}",
-                        self.id.short()
-                    );
+                    self.warn(format_args!("killing process group {pgid}: {e}"));
                 }
             }
-            match call.kind {
-                Pending::Model => {
-                    let outcome = self.run_model(rt, call.seq);
-                    self.append(Body::ModelResult {
-                        call: call.seq,
-                        outcome: outcome.clone(),
-                    })?;
-                    self.drive(
-                        agent,
-                        rt,
-                        Input::ModelDone {
-                            call: call.seq,
-                            outcome,
-                        },
-                    )?;
+            let outcome = match &call {
+                Call::Tool { tool, .. }
+                    if self.shared.tools.get(tool).map(Tool::replay) != Some(Replay::Safe) =>
+                {
+                    Outcome::Interrupted
                 }
-                Pending::Tool { tool, input } => {
-                    let outcome = match rt.tools.get(&tool).map(agent::Tool::replay) {
-                        Some(Replay::Safe) => self.run_tool(&rt.tools, call.seq, &tool, &input),
-                        _ => Outcome::Interrupted,
-                    };
-                    self.append(Body::ToolResult {
-                        call: call.seq,
-                        outcome: outcome.clone(),
-                    })?;
-                    self.drive(
-                        agent,
-                        rt,
-                        Input::ToolDone {
-                            call: call.seq,
-                            outcome,
-                        },
-                    )?;
-                }
-            }
+                _ => self.run_call(&call, seq),
+            };
+            let input = self.finish(&call, seq, outcome)?;
+            self.drive(agent, input)?;
         }
         Ok(())
     }
@@ -451,14 +383,33 @@ fn transcript(entries: &[Entry], before: u64) -> Vec<llm::Message> {
         .collect()
 }
 
-enum Pending {
+/// The effect an agent asked for, between its committed intent and outcome.
+enum Call {
     Model,
     Tool { tool: String, input: Value },
 }
 
+impl Call {
+    /// The entry that commits the intent to make this call.
+    fn intent(&self, model: &Result<Model, String>) -> Body {
+        match self {
+            Self::Model => Body::ModelCall {
+                model: model
+                    .as_ref()
+                    .map_or_else(|_| "none".to_owned(), Model::name),
+            },
+            Self::Tool { tool, input } => Body::ToolCall {
+                tool: tool.clone(),
+                input: input.clone(),
+            },
+        }
+    }
+}
+
+/// A call with an intent but no outcome, and the process groups it started.
 struct Dangling {
     seq: u64,
-    kind: Pending,
+    call: Call,
     processes: Vec<(u32, String)>,
 }
 
@@ -472,24 +423,24 @@ fn dangling_calls(entries: &[Entry]) -> Vec<Dangling> {
         .collect();
     let mut dangling: Vec<Dangling> = Vec::new();
     for e in entries {
-        let kind = match &e.body {
+        let call = match &e.body {
             Body::ToolProcess { call, pgid, boot } => {
-                if let Some(d) = dangling.iter_mut().find(|d| d.seq == *call) {
+                if let Some(d) = dangling.iter_mut().rev().find(|d| d.seq == *call) {
                     d.processes.push((*pgid, boot.clone()));
                 }
                 continue;
             }
             _ if finished.contains(&e.seq) => continue,
-            Body::ToolCall { tool, input } => Pending::Tool {
+            Body::ToolCall { tool, input } => Call::Tool {
                 tool: tool.clone(),
                 input: input.clone(),
             },
-            Body::ModelCall { .. } => Pending::Model,
+            Body::ModelCall { .. } => Call::Model,
             _ => continue,
         };
         dangling.push(Dangling {
             seq: e.seq,
-            kind,
+            call,
             processes: Vec::new(),
         });
     }
@@ -547,7 +498,7 @@ mod tests {
         assert_eq!(dangling.len(), 2);
         assert_eq!(dangling[0].seq, 3);
         assert_eq!(dangling[0].processes, [(42, "boot".to_owned())]);
-        assert!(matches!(dangling[1].kind, Pending::Model));
+        assert!(matches!(dangling[1].call, Call::Model));
     }
 
     #[test]

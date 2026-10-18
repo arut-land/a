@@ -4,6 +4,7 @@
 //! engine commits entries, runs tools and feeds results back in.
 
 use std::path::Path;
+use std::str::FromStr;
 
 use protocol::{Body, Outcome};
 use serde_json::{Value, json};
@@ -26,6 +27,39 @@ pub enum Action {
     CallModel,
 }
 
+pub trait Agent: Send {
+    fn step(&mut self, input: Input) -> Vec<Action>;
+}
+
+/// The agents a session can run.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum Kind {
+    Echo,
+    #[default]
+    Chat,
+}
+
+impl Kind {
+    pub fn agent(self) -> Box<dyn Agent> {
+        match self {
+            Self::Echo => Box::new(Echo),
+            Self::Chat => Box::new(Chat),
+        }
+    }
+}
+
+impl FromStr for Kind {
+    type Err = String;
+
+    fn from_str(name: &str) -> Result<Self, String> {
+        match name {
+            "echo" => Ok(Self::Echo),
+            "chat" => Ok(Self::Chat),
+            _ => Err(format!("unknown agent {name}")),
+        }
+    }
+}
+
 /// Hands every user message to the model.
 pub struct Chat;
 
@@ -38,10 +72,6 @@ impl Agent for Chat {
     }
 }
 
-pub trait Agent: Send {
-    fn step(&mut self, input: Input) -> Vec<Action>;
-}
-
 /// Echoes messages back. `$ <command>` runs a shell command and
 /// `sleep <seconds>` sleeps, so tool calls can be exercised without a model.
 pub struct Echo;
@@ -51,19 +81,17 @@ impl Agent for Echo {
         let Input::User { text } = input else {
             return Vec::new();
         };
-        if let Some(command) = text.strip_prefix("$ ") {
-            return vec![Action::RunTool {
-                tool: "run_command".into(),
-                input: json!({ "command": command }),
-            }];
-        }
-        if let Some(Ok(seconds)) = text.strip_prefix("sleep ").map(str::parse::<u64>) {
-            return vec![Action::RunTool {
-                tool: "sleep".into(),
-                input: json!({ "seconds": seconds }),
-            }];
-        }
-        vec![Action::Emit(Body::Assistant { text })]
+        let (tool, input) = if let Some(command) = text.strip_prefix("$ ") {
+            (tools::RunCommand.name(), json!({ "command": command }))
+        } else if let Some(Ok(seconds)) = text.strip_prefix("sleep ").map(str::parse::<u64>) {
+            (tools::Sleep.name(), json!({ "seconds": seconds }))
+        } else {
+            return vec![Action::Emit(Body::Assistant { text })];
+        };
+        vec![Action::RunTool {
+            tool: tool.to_owned(),
+            input,
+        }]
     }
 }
 
@@ -91,33 +119,30 @@ pub trait Tool: Send + Sync {
     fn call(&self, input: &Value, cx: &Cx<'_>) -> Result<Value, String>;
 }
 
-pub struct Toolset {
-    tools: Vec<Box<dyn Tool>>,
+/// The tools an agent may call, by name.
+pub struct Toolset(&'static [&'static dyn Tool]);
+
+impl Default for Toolset {
+    /// The built-in tools.
+    fn default() -> Self {
+        Self(&[&tools::RunCommand, &tools::Sleep])
+    }
 }
 
 impl Toolset {
-    pub fn builtin() -> Self {
-        Self {
-            tools: vec![Box::new(tools::RunCommand), Box::new(tools::Sleep)],
-        }
-    }
-
-    pub fn get(&self, name: &str) -> Option<&dyn Tool> {
-        self.tools
-            .iter()
-            .find(|t| t.name() == name)
-            .map(AsRef::as_ref)
+    pub fn get(&self, name: &str) -> Option<&'static dyn Tool> {
+        self.0.iter().copied().find(|t| t.name() == name)
     }
 
     pub fn run(&self, name: &str, input: &Value, cx: &Cx<'_>) -> Outcome {
-        match self.get(name) {
-            None => Outcome::Failed {
+        let Some(tool) = self.get(name) else {
+            return Outcome::Failed {
                 error: format!("unknown tool {name}"),
-            },
-            Some(tool) => match tool.call(input, cx) {
-                Ok(output) => Outcome::Done { output },
-                Err(error) => Outcome::Failed { error },
-            },
+            };
+        };
+        match tool.call(input, cx) {
+            Ok(output) => Outcome::Done { output },
+            Err(error) => Outcome::Failed { error },
         }
     }
 }
@@ -147,8 +172,15 @@ mod tests {
 
     #[test]
     fn replay_policy_is_per_tool() {
-        let tools = Toolset::builtin();
+        let tools = Toolset::default();
         assert_eq!(tools.get("run_command").unwrap().replay(), Replay::Unsafe);
         assert_eq!(tools.get("sleep").unwrap().replay(), Replay::Safe);
+    }
+
+    #[test]
+    fn agents_parse_by_name() {
+        assert_eq!("echo".parse(), Ok(Kind::Echo));
+        assert_eq!("chat".parse(), Ok(Kind::Chat));
+        assert!("other".parse::<Kind>().is_err());
     }
 }

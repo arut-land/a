@@ -30,15 +30,18 @@ impl Store {
         Ok(Self { dir })
     }
 
-    pub fn create(&self, header: &Header) -> io::Result<Log> {
-        let path = self.path(header.id);
+    /// A new, empty session log.
+    pub fn create(&self, header: &Header) -> io::Result<Loaded> {
         let mut file = OpenOptions::new()
             .create_new(true)
             .append(true)
-            .open(&path)?;
+            .open(self.path(header.id))?;
         write_line(&mut file, header)?;
         file.sync_all()?;
-        Ok(Log { file })
+        Ok(Loaded {
+            entries: Vec::new(),
+            log: Log { file },
+        })
     }
 
     /// Every session's header, oldest first, without reading the entries.
@@ -106,11 +109,11 @@ impl Store {
     }
 
     fn path(&self, id: SessionId) -> PathBuf {
-        self.dir.join(format!("{}.jsonl", id.0.simple()))
+        self.dir.join(format!("{id}.jsonl"))
     }
 
     fn busy_path(&self, id: SessionId) -> PathBuf {
-        self.dir.join(format!("{}.busy", id.0.simple()))
+        self.dir.join(format!("{id}.busy"))
     }
 }
 
@@ -148,7 +151,7 @@ mod tests {
             id: SessionId::new(),
             workspace: "/w".into(),
         };
-        let mut log = store.create(&header).unwrap();
+        let mut log = store.create(&header).unwrap().log;
         for seq in 1..=2 {
             let body = Body::User {
                 text: format!("m{seq}"),

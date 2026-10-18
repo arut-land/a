@@ -10,6 +10,12 @@ pub struct Home {
     root: PathBuf,
 }
 
+impl From<PathBuf> for Home {
+    fn from(root: PathBuf) -> Self {
+        Self { root }
+    }
+}
+
 impl Home {
     pub fn from_env() -> io::Result<Self> {
         let root = match std::env::var_os("A_HOME") {
@@ -18,7 +24,7 @@ impl Home {
                 .ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, "no home directory"))?
                 .join(".a"),
         };
-        Ok(Self { root })
+        Ok(root.into())
     }
 
     pub fn run_dir(&self) -> PathBuf {
@@ -53,6 +59,15 @@ pub fn workspace_of(dir: &Path) -> PathBuf {
         .to_path_buf()
 }
 
+/// How [`signal_process`] asks a process to go.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Signal {
+    /// SIGTERM: exit cleanly.
+    Terminate,
+    /// SIGKILL.
+    Kill,
+}
+
 #[cfg(unix)]
 pub use unix::*;
 
@@ -67,7 +82,7 @@ pub fn kill_process_group(_pgid: u32) -> io::Result<()> {
 }
 
 #[cfg(not(unix))]
-pub fn signal_process(_pid: u32, _force: bool) -> io::Result<()> {
+pub fn signal_process(_pid: u32, _signal: Signal) -> io::Result<()> {
     Err(io::Error::from(io::ErrorKind::Unsupported))
 }
 
@@ -81,7 +96,7 @@ mod unix {
     use std::path::PathBuf;
 
     use rustix::io::{FdFlags, fcntl_getfd, fcntl_setfd};
-    use rustix::process::getuid;
+    use rustix::process::{self, getuid};
 
     /// Lets a spawned child inherit `listener`; returns its fd number.
     pub fn make_inheritable(listener: &UnixListener) -> io::Result<RawFd> {
@@ -98,27 +113,35 @@ mod unix {
             socket_dir().join(format!("{hash:016x}.sock"))
         }
 
-        /// Creates the socket directory, or verifies an existing one is a real
-        /// directory owned by us with mode 0700 (it lives in shared `/tmp`).
-        pub fn prepare_socket_dir(&self) -> io::Result<()> {
-            let dir = socket_dir();
-            match fs::DirBuilder::new().mode(0o700).create(&dir) {
-                Ok(()) => return Ok(()),
-                Err(e) if e.kind() == io::ErrorKind::AlreadyExists => {}
-                Err(e) => return Err(e),
-            }
-            let meta = fs::symlink_metadata(&dir)?;
-            if !meta.is_dir() || meta.uid() != getuid().as_raw() || meta.mode() & 0o777 != 0o700 {
-                return Err(io::Error::new(
-                    io::ErrorKind::PermissionDenied,
-                    format!(
-                        "{} is not a private directory owned by this user",
-                        dir.display()
-                    ),
-                ));
-            }
-            Ok(())
+        /// Binds the daemon socket, replacing a stale one.
+        pub fn bind(&self) -> io::Result<UnixListener> {
+            prepare_socket_dir()?;
+            let socket = self.socket();
+            let _ = fs::remove_file(&socket);
+            UnixListener::bind(socket)
         }
+    }
+
+    /// Creates the socket directory, or verifies an existing one is a real
+    /// directory owned by us with mode 0700 (it lives in shared `/tmp`).
+    fn prepare_socket_dir() -> io::Result<()> {
+        let dir = socket_dir();
+        match fs::DirBuilder::new().mode(0o700).create(&dir) {
+            Ok(()) => return Ok(()),
+            Err(e) if e.kind() == io::ErrorKind::AlreadyExists => {}
+            Err(e) => return Err(e),
+        }
+        let meta = fs::symlink_metadata(&dir)?;
+        if !meta.is_dir() || meta.uid() != getuid().as_raw() || meta.mode() & 0o777 != 0o700 {
+            return Err(io::Error::new(
+                io::ErrorKind::PermissionDenied,
+                format!(
+                    "{} is not a private directory owned by this user",
+                    dir.display()
+                ),
+            ));
+        }
+        Ok(())
     }
 
     fn socket_dir() -> PathBuf {
@@ -156,31 +179,33 @@ mod unix {
         Some(id.trim().to_owned()).filter(|id| !id.is_empty())
     }
 
-    /// Sends SIGKILL to a whole process group; a group that is already gone is
-    /// not an error.
+    /// Sends SIGKILL to a whole process group.
     pub fn kill_process_group(pgid: u32) -> io::Result<()> {
-        let group = i32::try_from(pgid)
-            .ok()
-            .and_then(rustix::process::Pid::from_raw)
-            .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "invalid pgid"))?;
-        match rustix::process::kill_process_group(group, rustix::process::Signal::KILL) {
-            Ok(()) | Err(rustix::io::Errno::SRCH) => Ok(()),
-            Err(e) => Err(e.into()),
-        }
+        gone_is_ok(process::kill_process_group(
+            pid(pgid)?,
+            process::Signal::KILL,
+        ))
     }
 
-    /// Asks a process to exit (SIGTERM), or forces it (SIGKILL).
-    pub fn signal_process(pid: u32, force: bool) -> io::Result<()> {
-        let pid = i32::try_from(pid)
-            .ok()
-            .and_then(rustix::process::Pid::from_raw)
-            .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "invalid pid"))?;
-        let signal = if force {
-            rustix::process::Signal::KILL
-        } else {
-            rustix::process::Signal::TERM
+    /// Sends `signal` to a process.
+    pub fn signal_process(pid: u32, signal: super::Signal) -> io::Result<()> {
+        let signal = match signal {
+            super::Signal::Terminate => process::Signal::TERM,
+            super::Signal::Kill => process::Signal::KILL,
         };
-        match rustix::process::kill_process(pid, signal) {
+        gone_is_ok(process::kill_process(self::pid(pid)?, signal))
+    }
+
+    fn pid(raw: u32) -> io::Result<process::Pid> {
+        i32::try_from(raw)
+            .ok()
+            .and_then(process::Pid::from_raw)
+            .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "invalid pid"))
+    }
+
+    /// A process that is already gone has nothing left to signal.
+    fn gone_is_ok(result: rustix::io::Result<()>) -> io::Result<()> {
+        match result {
             Ok(()) | Err(rustix::io::Errno::SRCH) => Ok(()),
             Err(e) => Err(e.into()),
         }
@@ -188,7 +213,7 @@ mod unix {
 
     /// Leaves the spawning terminal's session so its hangup never reaches us.
     pub fn detach_session() -> io::Result<()> {
-        rustix::process::setsid()?;
+        process::setsid()?;
         Ok(())
     }
 

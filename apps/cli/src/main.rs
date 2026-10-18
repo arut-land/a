@@ -2,7 +2,7 @@ use std::io::{self, BufRead, IsTerminal, Write};
 use std::process::ExitCode;
 use std::thread;
 
-use protocol::{Body, ClientMsg, DaemonMsg, Outcome, SessionId, Target};
+use protocol::{Body, ClientMsg, DaemonMsg, Outcome, SessionId, SessionSummary, Target};
 use sys::Home;
 use usage_rs::{Cli, Subcommands};
 
@@ -77,7 +77,7 @@ fn main() -> ExitCode {
 
 /// Connects to the daemon. A wedged daemon is diagnosed; at a terminal the
 /// user can restart it on the spot, elsewhere `a daemon restart` is suggested.
-fn connect() -> io::Result<(client::Reader, client::Writer)> {
+fn connect() -> io::Result<client::Connection> {
     let home = Home::from_env()?;
     match client::connect(&home) {
         Err(e) if e.kind() == io::ErrorKind::TimedOut => recover(&home),
@@ -85,7 +85,7 @@ fn connect() -> io::Result<(client::Reader, client::Writer)> {
     }
 }
 
-fn recover(home: &Home) -> io::Result<(client::Reader, client::Writer)> {
+fn recover(home: &Home) -> io::Result<client::Connection> {
     let d = client::diagnose(home);
     let who = d.pid.map_or_else(
         || "the daemon".to_owned(),
@@ -110,7 +110,7 @@ fn recover(home: &Home) -> io::Result<(client::Reader, client::Writer)> {
         match answer.trim() {
             "r" => return client::restart(home),
             "l" => {
-                for line in &client::diagnose(home).log_tail {
+                for line in d.log_tail() {
                     eprintln!("  | {line}");
                 }
             }
@@ -151,18 +151,19 @@ fn daemon_cmd(action: &DaemonCmd) -> io::Result<()> {
     Ok(())
 }
 
-fn workspace() -> io::Result<std::path::PathBuf> {
-    Ok(sys::workspace_of(&std::env::current_dir()?))
+/// Connects and asks to attach to `target` from this directory's workspace.
+fn attach(target: Target) -> io::Result<client::Connection> {
+    let (reader, mut writer) = connect()?;
+    writer.send(&ClientMsg::Attach {
+        target,
+        workspace: sys::workspace_of(&std::env::current_dir()?),
+        since: 0,
+    })?;
+    Ok((reader, writer))
 }
 
 fn repl(target: Target) -> io::Result<()> {
-    let (mut reader, mut writer) = connect()?;
-    writer.send(&ClientMsg::Attach {
-        target,
-        workspace: workspace()?,
-        since: 0,
-    })?;
-
+    let (mut reader, mut writer) = attach(target)?;
     thread::spawn(move || {
         let mut view = View::default();
         while let Ok(Some(msg)) = reader.recv() {
@@ -225,14 +226,14 @@ impl View {
             },
             Body::ToolResult { outcome, .. } => print_outcome(outcome),
             Body::ModelResult { call, outcome } => {
-                let streamed = self.streaming.take() == Some(*call);
+                // A streamed reply is on screen already; end its line.
+                if self.streaming.take() == Some(*call) {
+                    println!();
+                } else if let Outcome::Done { output } = outcome {
+                    println!("a    {}", reply_text(output));
+                }
                 match outcome {
                     Outcome::Done { output } => {
-                        if streamed {
-                            println!();
-                        } else {
-                            println!("a    {}", reply_text(output));
-                        }
                         let usage = &output["usage"];
                         if let (Some(input), Some(out)) =
                             (usage["input"].as_u64(), usage["output"].as_u64())
@@ -240,12 +241,7 @@ impl View {
                             println!("     · {input} in, {out} out");
                         }
                     }
-                    Outcome::Failed { error } => {
-                        if streamed {
-                            println!();
-                        }
-                        println!("  └ model failed: {error}");
-                    }
+                    Outcome::Failed { error } => println!("  └ model failed: {error}"),
                     Outcome::Interrupted => println!("  └ model call interrupted"),
                 }
             }
@@ -288,24 +284,16 @@ fn print_outcome(outcome: &Outcome) {
     }
 }
 
-fn sessions() -> io::Result<Vec<protocol::SessionSummary>> {
-    list(connect()?)
-}
-
-fn list(
-    (mut reader, mut writer): (client::Reader, client::Writer),
-) -> io::Result<Vec<protocol::SessionSummary>> {
+fn list((mut reader, mut writer): client::Connection) -> io::Result<Vec<SessionSummary>> {
     writer.send(&ClientMsg::List)?;
-    while let Some(msg) = reader.recv()? {
-        if let DaemonMsg::Sessions { sessions } = msg {
-            return Ok(sessions);
-        }
-    }
-    Err(io::Error::other("daemon closed the connection"))
+    reader.until(|msg| match msg {
+        DaemonMsg::Sessions { sessions } => Some(sessions),
+        _ => None,
+    })
 }
 
 fn ls() -> io::Result<()> {
-    for s in sessions()? {
+    for s in list(connect()?)? {
         println!(
             "{}  {:>4} entries  {}",
             s.id.short(),
@@ -317,10 +305,10 @@ fn ls() -> io::Result<()> {
 }
 
 fn find(prefix: &str) -> io::Result<SessionId> {
-    let matches: Vec<_> = sessions()?
+    let matches: Vec<_> = list(connect()?)?
         .into_iter()
         .filter(|s| {
-            s.id.short().starts_with(prefix) || s.id.0.simple().to_string().starts_with(prefix)
+            s.id.short().to_string().starts_with(prefix) || s.id.to_string().starts_with(prefix)
         })
         .collect();
     match matches.as_slice() {
@@ -333,19 +321,13 @@ fn find(prefix: &str) -> io::Result<SessionId> {
 }
 
 fn new() -> io::Result<()> {
-    let (mut reader, mut writer) = connect()?;
-    writer.send(&ClientMsg::Attach {
-        target: Target::New,
-        workspace: workspace()?,
-        since: 0,
+    let (mut reader, mut writer) = attach(Target::New)?;
+    let session = reader.until(|msg| match msg {
+        DaemonMsg::Attached { session, .. } => Some(session),
+        _ => None,
     })?;
-    while let Some(msg) = reader.recv()? {
-        if let DaemonMsg::Attached { session, .. } = msg {
-            println!("{}", session.short());
-            return writer.send(&ClientMsg::Detach);
-        }
-    }
-    Err(io::Error::other("daemon closed the connection"))
+    println!("{}", session.short());
+    writer.send(&ClientMsg::Detach)
 }
 
 #[cfg(unix)]
@@ -355,24 +337,9 @@ fn daemon(listen_fd: Option<i32>) -> io::Result<()> {
         sys::detach_session()?;
         sys::adopt_listener(fd)?
     } else {
-        home.prepare_socket_dir()?;
-        let _ = std::fs::remove_file(home.socket());
-        std::os::unix::net::UnixListener::bind(home.socket())?
+        home.bind()?
     };
-    let idle = std::env::var("A_IDLE_SECS")
-        .ok()
-        .and_then(|s| s.parse().ok())
-        .unwrap_or(600);
-    let hibernate = std::env::var("A_HIBERNATE_SECS")
-        .ok()
-        .and_then(|s| s.parse().ok())
-        .unwrap_or(300);
-    engine::serve(
-        &listener,
-        &home,
-        std::time::Duration::from_secs(idle),
-        std::time::Duration::from_secs(hibernate),
-    )
+    engine::serve(&listener, &home, &engine::Config::from_env())
 }
 
 #[cfg(not(unix))]

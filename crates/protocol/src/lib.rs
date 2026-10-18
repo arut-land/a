@@ -1,5 +1,6 @@
 //! Wire types shared by the daemon and every client, plus framing.
 
+use std::fmt;
 use std::io::{self, Read, Write};
 use std::path::PathBuf;
 
@@ -23,14 +24,32 @@ impl SessionId {
     }
 
     /// Short form for display: the random tail of the `UUIDv7`.
-    pub fn short(&self) -> String {
-        self.0.simple().to_string()[24..].to_owned()
+    pub const fn short(self) -> Short {
+        Short(self)
     }
 }
 
 impl Default for SessionId {
     fn default() -> Self {
         Self::new()
+    }
+}
+
+/// All 32 hex digits, no dashes.
+impl fmt::Display for SessionId {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        fmt::Display::fmt(&self.0.simple(), f)
+    }
+}
+
+/// The last 8 hex digits of a [`SessionId`].
+#[derive(Clone, Copy, Debug)]
+pub struct Short(SessionId);
+
+impl fmt::Display for Short {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let mut buf = Uuid::encode_buffer();
+        f.write_str(&self.0.0.simple().encode_lower(&mut buf)[24..])
     }
 }
 
@@ -211,6 +230,13 @@ mod tests {
             Some(ClientMsg::Detach)
         ));
         assert!(read_frame::<ClientMsg>(&mut r).unwrap().is_none());
+    }
+
+    #[test]
+    fn session_ids_display_whole_and_short() {
+        let id = SessionId(Uuid::from_u128(0x0123_4567_89ab_cdef_0123_4567_89ab_cdef));
+        assert_eq!(id.to_string(), "0123456789abcdef0123456789abcdef");
+        assert_eq!(id.short().to_string(), "89abcdef");
     }
 
     #[test]
