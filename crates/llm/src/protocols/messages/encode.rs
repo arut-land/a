@@ -18,7 +18,6 @@ use crate::json::Lenient;
 use crate::models::anthropic::{
     binds_context, rejects_forced_tool_choice, takes_mid_conversation_system,
 };
-use crate::protocols::schema::{Sanitize, sanitize};
 use crate::replay::{Replay, replay, replays};
 use crate::spec::{
     Assistant, AssistantPart, Format, Media, Message, Output, Request, Source, System, Tool,
@@ -72,12 +71,7 @@ pub(super) fn body(
         && let Some(schema) = schema
     {
         let mut schema = schema.clone();
-        let rules = Sanitize {
-            strip_ref_siblings: false,
-            inject_empty_properties: false,
-            strip_numeric_constraints: true,
-        };
-        sanitize(&mut schema, rules);
+        crate::protocols::schema::anthropic(&mut schema);
         body["output_config"] = json!({"format": {"type": "json_schema", "schema": schema}});
     }
     if !options.contains_key("container")
