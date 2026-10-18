@@ -38,6 +38,8 @@ pub struct Env {
     pub exe: PathBuf,
     pub ws: PathBuf,
     pub home: Home,
+    /// More environment for every `a` this test runs, and so its daemons.
+    pub vars: Vec<(&'static str, &'static str)>,
 }
 
 impl Env {
@@ -56,6 +58,7 @@ impl Env {
             ws: fs::canonicalize(ws).unwrap(),
             root,
             exe,
+            vars: Vec::new(),
         };
         // A binary's first exec can be slow (macOS scans new files).
         env.run(&["--version"]);
@@ -80,7 +83,8 @@ impl Env {
             .current_dir(&self.ws)
             .env("A_HOME", self.root.join("home"))
             .env("A_AGENT", "echo")
-            .env("A_IDLE_SECS", "15");
+            .env("A_IDLE_SECS", "15")
+            .envs(self.vars.iter().copied());
         cmd
     }
 

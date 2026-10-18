@@ -37,6 +37,9 @@ pub struct Config {
     pub agent: agent::Kind,
     /// `A_MODEL`: `host:model`, or a bare model on `OpenAI`.
     pub model: String,
+    /// `A_ASK`: comma-separated tools whose calls wait for the user's
+    /// approval.
+    pub ask: Vec<String>,
 }
 
 impl Default for Config {
@@ -47,6 +50,7 @@ impl Default for Config {
             drain: Duration::from_secs(60),
             agent: agent::Kind::Chat,
             model: "gpt-6-luna".to_owned(),
+            ask: Vec::new(),
         }
     }
 }
@@ -64,6 +68,14 @@ impl Config {
             drain: var("A_DRAIN_SECS").map_or(defaults.drain, Duration::from_secs),
             agent: var("A_AGENT").unwrap_or(defaults.agent),
             model: var("A_MODEL").unwrap_or(defaults.model),
+            ask: std::env::var("A_ASK").map_or(defaults.ask, |tools| {
+                tools
+                    .split(',')
+                    .map(str::trim)
+                    .filter(|tool| !tool.is_empty())
+                    .map(str::to_owned)
+                    .collect()
+            }),
         }
     }
 }
@@ -111,7 +123,10 @@ impl Daemon {
                 store,
                 agent: config.agent,
                 tools: agent::Toolset::default(),
-                hooks: agent::Hooks::default(),
+                hooks: std::iter::once(
+                    Box::new(agent::AskFor(config.ask.clone())) as Box<dyn agent::Hook>
+                )
+                .collect(),
                 model,
             }),
             slots: Mutex::new(slots),
@@ -377,13 +392,21 @@ fn handle(daemon: &Daemon, life: &Lifecycle, conn: UnixStream) -> io::Result<()>
                 }
                 Err(e) => error(e.to_string()),
             },
-            ClientMsg::Input { .. } if life.draining().is_some() => {
+            ClientMsg::Input { .. } | ClientMsg::Approve { .. } if life.draining().is_some() => {
                 error(
                     "the daemon is restarting for an upgrade; send that again in a moment".into(),
                 );
             }
             ClientMsg::Input { text } => match &attached {
                 Some(s) => s.session().submit(text),
+                None => error("not attached".into()),
+            },
+            ClientMsg::Approve { call, approved } => match &attached {
+                Some(s) => {
+                    if let Err(message) = s.session().answer(call, approved) {
+                        error(message);
+                    }
+                }
                 None => error("not attached".into()),
             },
             ClientMsg::List => reply(DaemonMsg::Sessions {

@@ -378,3 +378,179 @@ fn hook_decisions_are_logged_and_replay_to_the_same_state() {
         ]
     );
 }
+
+fn asking() -> Fixture {
+    let ask = agent::AskFor(vec![agent::tools::RunCommand::NAME.to_owned()]);
+    Fixture::new(
+        agent::Kind::Echo,
+        Toolset::default(),
+        std::iter::once(Box::new(ask) as Box<dyn Hook>).collect(),
+        openai(&Script::new(&[])),
+    )
+}
+
+/// Waits for call `call`'s outcome to be committed.
+fn finished(session: &Session, call: u64) -> Vec<Entry> {
+    let deadline = Instant::now() + Duration::from_secs(10);
+    loop {
+        let log = log_of(session);
+        if log
+            .iter()
+            .any(|e| matches!(e.body, Body::ToolResult { call: c, .. } if c == call))
+        {
+            return log;
+        }
+        assert!(Instant::now() < deadline, "call {call} never finished");
+        thread::sleep(Duration::from_millis(5));
+    }
+}
+
+#[test]
+fn an_ask_waits_in_the_inbox_through_a_stop_and_runs_once_approved() {
+    let fixture = asking();
+    let session = fixture.start(&[]);
+    session.submit("$ echo approved".into());
+    // Waiting for an answer is not work.
+    settle(&session);
+    let asked = log_of(&session);
+    assert_eq!(inbox(&asked), [3]);
+    assert!(
+        session.answer(2, true).is_err(),
+        "only asked calls take answers"
+    );
+    session.stop();
+
+    let resumed = fixture.start(&asked);
+    let (tx, rx) = mpsc::channel();
+    resumed.attach(&tx, asked.len() as u64);
+    resumed.answer(3, true).unwrap();
+    let log = finished(&resumed, 3);
+    resumed.stop();
+
+    let sent: Vec<DaemonMsg> = rx.try_iter().collect();
+    assert!(
+        matches!(&sent[..], [
+            DaemonMsg::Attached { .. },
+            DaemonMsg::Synced { seq: 4 },
+            DaemonMsg::Ask { call: 3, tool, .. },
+            ..
+        ] if tool == "run_command"),
+        "{sent:#?}"
+    );
+    assert!(
+        matches!(
+            &bodies(&log)[..],
+            [
+                Body::User { .. },
+                Body::Hook {
+                    decision: Decision::Permission {
+                        permission: Permission::Ask,
+                        ..
+                    },
+                    ..
+                },
+                Body::ToolCall { .. },
+                Body::Ask { call: 3 },
+                Body::Hook {
+                    decision: Decision::Approval {
+                        approved: true,
+                        call: Some(3),
+                        ..
+                    },
+                    ..
+                },
+                Body::ToolProcess { call: 3, .. },
+                Body::ToolResult {
+                    call: 3,
+                    outcome: Outcome::Done { output },
+                },
+            ] if output["stdout"] == "approved\n"
+        ),
+        "{log:#?}"
+    );
+    assert_eq!(inbox(&log), Vec::<u64>::new());
+}
+
+#[test]
+fn a_refused_ask_answers_the_call_without_running_it() {
+    let fixture = asking();
+    let session = fixture.start(&[]);
+    session.submit("$ echo refused".into());
+    settle(&session);
+    session.answer(3, false).unwrap();
+    let log = finished(&session, 3);
+    session.stop();
+    assert_eq!(
+        bodies(&log)[4..],
+        [
+            &Body::Hook {
+                hook: "user".into(),
+                decision: Decision::Approval {
+                    tool: "run_command".into(),
+                    approved: false,
+                    call: Some(3),
+                },
+            },
+            &Body::ToolResult {
+                call: 3,
+                outcome: Outcome::Failed {
+                    error: "the user did not approve this call".into()
+                },
+            },
+        ]
+    );
+}
+
+#[test]
+fn a_recap_tells_the_last_prompt_and_what_followed() {
+    let call = |tool: &str| Body::ToolCall {
+        tool: tool.into(),
+        input: json!({}),
+        id: None,
+    };
+    let entries = [
+        entry(
+            1,
+            Body::User {
+                text: "first".into(),
+            },
+        ),
+        entry(
+            2,
+            Body::Assistant {
+                text: "first".into(),
+            },
+        ),
+        entry(
+            3,
+            Body::User {
+                text: "go on\nwith detail".into(),
+            },
+        ),
+        entry(4, call("sleep")),
+        entry(
+            5,
+            Body::ToolResult {
+                call: 4,
+                outcome: Outcome::Interrupted,
+            },
+        ),
+        entry(6, call("run_command")),
+        entry(7, Body::Ask { call: 6 }),
+        entry(8, call("sleep")),
+    ];
+    assert_eq!(recap(&entries, 8), None);
+    assert_eq!(
+        recap(&entries, 0),
+        Some(protocol::Recap {
+            prompt: Some("go on…".into()),
+            tools: vec!["sleep".into(), "run_command".into(), "sleep".into()],
+            failed: 1,
+            running: 1,
+            reply: None,
+            asks: 1,
+        })
+    );
+    let replied = recap(&entries[..2], 1).unwrap();
+    assert_eq!(replied.reply.as_deref(), Some("first"));
+}

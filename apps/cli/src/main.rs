@@ -4,7 +4,9 @@ use std::sync::{Arc, Mutex, PoisonError};
 use std::thread;
 
 use client::Endpoint;
-use protocol::{Body, ClientMsg, DaemonMsg, Outcome, SessionId, SessionSummary, Target};
+use protocol::{
+    Body, ClientMsg, DaemonMsg, Decision, Outcome, Recap, SessionId, SessionSummary, Target,
+};
 use sys::{Home, Staged};
 use usage_rs::{Cli, Subcommands};
 
@@ -222,8 +224,12 @@ fn repl(ctx: Ctx, target: Target) -> io::Result<()> {
     let (mut reader, writer) = attach(&ctx, target, 0)?;
     let writer = Arc::new(Mutex::new(writer));
     let swap = Arc::clone(&writer);
+    let asks = Arc::new(Mutex::new(Vec::new()));
+    let mut view = View {
+        asks: Arc::clone(&asks),
+        ..View::default()
+    };
     thread::spawn(move || {
-        let mut view = View::default();
         loop {
             while let Ok(Some(msg)) = reader.recv() {
                 view.show(&msg);
@@ -253,16 +259,28 @@ fn repl(ctx: Ctx, target: Target) -> io::Result<()> {
     };
     for line in io::stdin().lock().lines() {
         let line = line?;
-        match line.trim() {
-            "" => {}
-            "/detach" => break,
-            text => {
-                if let Err(e) = send(&ClientMsg::Input {
-                    text: text.to_owned(),
-                }) {
-                    eprintln!("[not sent: {e}]");
-                }
-            }
+        let asked = asks
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .first()
+            .copied();
+        let msg = match (line.trim(), asked) {
+            ("", _) => continue,
+            ("/detach", _) => break,
+            ("y" | "yes", Some(call)) => ClientMsg::Approve {
+                call,
+                approved: true,
+            },
+            ("n" | "no", Some(call)) => ClientMsg::Approve {
+                call,
+                approved: false,
+            },
+            (text, _) => ClientMsg::Input {
+                text: text.to_owned(),
+            },
+        };
+        if let Err(e) = send(&msg) {
+            eprintln!("[not sent: {e}]");
         }
     }
     send(&ClientMsg::Detach)?;
@@ -280,6 +298,9 @@ struct View {
     /// The last entry seen, so a reconnect replays only what came after.
     seq: u64,
     draining: bool,
+    /// Calls waiting for approval, oldest first; `y` or `n` answers the
+    /// first.
+    asks: Arc<Mutex<Vec<u64>>>,
 }
 
 impl View {
@@ -302,6 +323,14 @@ impl View {
                 self.entry(&e.body);
             }
             DaemonMsg::Synced { seq } => self.seq = *seq,
+            DaemonMsg::Recap(recap) => println!("{}", recap_line(recap)),
+            DaemonMsg::Ask { call, tool, input } => {
+                let mut asks = self.asks.lock().unwrap_or_else(PoisonError::into_inner);
+                if !asks.contains(call) {
+                    asks.push(*call);
+                    println!("? approve {}  [y/n]", call_text(tool, input));
+                }
+            }
             DaemonMsg::Draining => self.draining = true,
             DaemonMsg::Welcome { .. } | DaemonMsg::Sessions { .. } => {}
             DaemonMsg::Mismatch { supported } => eprintln!("[daemon speaks protocol {supported}]"),
@@ -313,10 +342,7 @@ impl View {
         match body {
             Body::User { text } => println!("you  {text}"),
             Body::Assistant { text } => println!("a    {text}"),
-            Body::ToolCall { tool, input, .. } => match input["command"].as_str() {
-                Some(command) => println!("tool $ {command}"),
-                None => println!("tool {tool} {input}"),
-            },
+            Body::ToolCall { tool, input, .. } => println!("tool {}", call_text(tool, input)),
             Body::ToolResult { outcome, .. } => print_outcome(outcome),
             Body::ModelResult { call, outcome } => {
                 // A streamed reply is on screen already; end its line.
@@ -341,10 +367,64 @@ impl View {
                     Outcome::Interrupted => println!("  └ model call interrupted"),
                 }
             }
+            Body::Hook {
+                decision:
+                    Decision::Approval {
+                        approved,
+                        call: Some(call),
+                        ..
+                    },
+                ..
+            } => {
+                let mut asks = self.asks.lock().unwrap_or_else(PoisonError::into_inner);
+                asks.retain(|c| c != call);
+                println!(
+                    "  · {}",
+                    if *approved {
+                        "approved"
+                    } else {
+                        "not approved"
+                    }
+                );
+            }
             Body::Hook { hook, decision } => println!("  · hook {hook}: {decision:?}"),
-            Body::ToolProcess { .. } | Body::ModelCall { .. } => {}
+            Body::ToolProcess { .. } | Body::ModelCall { .. } | Body::Ask { .. } => {}
         }
     }
+}
+
+/// A tool call as shown: a command as `$ command`, anything else as the
+/// tool and its input.
+fn call_text(tool: &str, input: &serde_json::Value) -> String {
+    match input["command"].as_str() {
+        Some(command) => format!("$ {command}"),
+        None => format!("{tool} {input}"),
+    }
+}
+
+/// One line on what a session did, shown after an attach's replay.
+fn recap_line(recap: &Recap) -> String {
+    let mut parts = vec!["[recap".to_owned()];
+    if let Some(prompt) = &recap.prompt {
+        parts.push(format!("you: {prompt}"));
+    }
+    match &recap.tools[..] {
+        [] => {}
+        few @ ([_] | [_, _] | [_, _, _]) => parts.push(format!("ran {}", few.join(", "))),
+        many => parts.push(format!("ran {} tools", many.len())),
+    }
+    let count = |parts: &mut Vec<String>, n: u32, what: &str| {
+        if n > 0 {
+            parts.push(format!("{n} {what}"));
+        }
+    };
+    count(&mut parts, recap.failed, "failed");
+    count(&mut parts, recap.running, "running");
+    if let Some(reply) = &recap.reply {
+        parts.push(format!("a: {reply}"));
+    }
+    count(&mut parts, recap.asks, "waiting for approval");
+    parts.join(" · ") + "]"
 }
 
 /// The answer text of a stored model reply: its message's text parts, or

@@ -14,7 +14,7 @@ mod hooks;
 mod tool;
 pub mod tools;
 
-pub use hooks::{Decided, Hook, Hooks, Pre};
+pub use hooks::{AskFor, Decided, Gate, Hook, Hooks, Pre};
 pub use tool::{Cx, DynTool, Replay, Tool, Toolset};
 
 pub enum Input {

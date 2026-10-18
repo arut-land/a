@@ -1,15 +1,15 @@
-use std::collections::{HashSet, VecDeque};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::fmt::Display;
 use std::io;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::mpsc::{self, Receiver, Sender};
-use std::sync::{Arc, Mutex, MutexGuard};
+use std::sync::{Arc, Condvar, Mutex, MutexGuard, PoisonError};
 use std::thread;
 use std::time::{Duration, Instant};
 
-use agent::{Action, Agent, Cx, Decided, DynTool, Hooks, Input, Replay, Toolset};
-use protocol::{Body, DaemonMsg, Entry, Outcome, SessionId, SessionSummary};
+use agent::{Action, Agent, Cx, Decided, DynTool, Gate, Hooks, Input, Replay, Toolset};
+use protocol::{Body, DaemonMsg, Decision, Entry, Outcome, SessionId, SessionSummary};
 use serde_json::Value;
 use store::{Header, Loaded, Log, LogStore};
 
@@ -20,7 +20,7 @@ mod facts;
 #[cfg(test)]
 mod tests;
 
-use facts::{replay, transcript};
+use facts::{ask, inbox, recap, replay, transcript};
 
 /// What every session runs with.
 pub struct Shared {
@@ -36,7 +36,11 @@ pub struct Session {
     pub id: SessionId,
     pub workspace: PathBuf,
     state: Mutex<State>,
-    inbox: Sender<Msg>,
+    /// The actor's messages. The session's inbox, what waits for the user,
+    /// is in its log: see [`facts::inbox`].
+    mailbox: Sender<Msg>,
+    answers: Mutex<Answers>,
+    answered: Condvar,
     /// Inputs submitted but not yet fully handled. They pin the daemon and
     /// keep the session loaded.
     queued: AtomicUsize,
@@ -55,6 +59,14 @@ struct State {
     entries: Vec<Entry>,
     log: Box<dyn Log>,
     clients: Vec<Sender<DaemonMsg>>,
+}
+
+/// Answers to the inbox's asks, until the actor takes them. `stopped` wakes
+/// an actor waiting for one so it can stop.
+#[derive(Default)]
+struct Answers {
+    given: HashMap<u64, bool>,
+    stopped: bool,
 }
 
 /// A client's hold on a session; dropping it detaches.
@@ -78,7 +90,7 @@ impl Session {
     /// agent and runs its effects. Calls left dangling by a crash are
     /// recovered first.
     pub fn start(header: Header, loaded: Loaded, shared: Arc<Shared>) -> Arc<Self> {
-        let (inbox, rx) = mpsc::channel();
+        let (mailbox, rx) = mpsc::channel();
         let session = Arc::new(Self {
             id: header.id,
             workspace: header.workspace,
@@ -87,7 +99,9 @@ impl Session {
                 log: loaded.log,
                 clients: Vec::new(),
             }),
-            inbox,
+            mailbox,
+            answers: Mutex::default(),
+            answered: Condvar::new(),
             // Recovery counts as queued work until it has run.
             queued: AtomicUsize::new(1),
             attached: AtomicUsize::new(0),
@@ -109,7 +123,18 @@ impl Session {
 
     pub fn submit(&self, text: String) {
         self.queued.fetch_add(1, Ordering::SeqCst);
-        let _ = self.inbox.send(Msg::Input(text));
+        let _ = self.mailbox.send(Msg::Input(text));
+    }
+
+    /// Answers the ask for tool call `call`; the actor logs the answer and
+    /// runs or refuses the call. The first answer wins.
+    pub fn answer(&self, call: u64, approved: bool) -> Result<(), String> {
+        if !inbox(&self.lock().entries).contains(&call) {
+            return Err(format!("call {call} is not waiting for approval"));
+        }
+        lock(&self.answers).given.entry(call).or_insert(approved);
+        self.answered.notify_all();
+        Ok(())
     }
 
     pub fn has_work(&self) -> bool {
@@ -127,7 +152,9 @@ impl Session {
     /// Stops the actor; the session lives on in its log. Callers check
     /// `idle_for` under the slot lock first.
     pub fn stop(&self) {
-        let _ = self.inbox.send(Msg::Stop);
+        lock(&self.answers).stopped = true;
+        self.answered.notify_all();
+        let _ = self.mailbox.send(Msg::Stop);
     }
 
     pub fn attach(&self, client: &Sender<DaemonMsg>, since: u64) {
@@ -141,6 +168,14 @@ impl Session {
         }
         let seq = st.entries.last().map_or(0, |e| e.seq);
         let _ = client.send(DaemonMsg::Synced { seq });
+        if let Some(recap) = recap(&st.entries, since) {
+            let _ = client.send(DaemonMsg::Recap(recap));
+        }
+        for call in inbox(&st.entries) {
+            if let Some(msg) = ask(&st.entries, call) {
+                let _ = client.send(msg);
+            }
+        }
         st.clients.push(client.clone());
     }
 
@@ -178,7 +213,16 @@ impl Session {
         st.clients
             .retain(|c| c.send(DaemonMsg::Entry(entry.clone())).is_ok());
         self.shared.hooks.observe(&entry);
+        let asked = match entry.body {
+            Body::Ask { call } => Some(call),
+            _ => None,
+        };
         st.entries.push(entry);
+        // Under the same lock as the entry, so a client attaching meanwhile
+        // gets the ask exactly once.
+        if let Some(msg) = asked.and_then(|call| ask(&st.entries, call)) {
+            st.clients.retain(|c| c.send(msg.clone()).is_ok());
+        }
         Ok(seq)
     }
 
@@ -198,10 +242,10 @@ impl Session {
         self.lock().clients.retain(|c| c.send(msg.clone()).is_ok());
     }
 
-    fn run(&self, inbox: &Receiver<Msg>) {
+    fn run(&self, mailbox: &Receiver<Msg>) {
         let mut agent = self.shared.agent.agent();
         self.work(|| self.recover(agent.as_mut()));
-        for msg in inbox {
+        for msg in mailbox {
             let Msg::Input(text) = msg else { return };
             self.work(|| {
                 self.append(Body::User { text: text.clone() })?;
@@ -287,7 +331,7 @@ impl Session {
                 id,
                 refuse,
             } => {
-                let verdict = if let Some(error) = refuse {
+                let gate = if let Some(error) = refuse {
                     Err(error)
                 } else {
                     let mut decided = Decided::new();
@@ -300,14 +344,67 @@ impl Session {
                     input: input.clone(),
                     id,
                 })?;
-                let outcome = match verdict {
-                    Ok(()) => self.run_tool(seq, &tool, &input),
+                let outcome = match gate {
+                    Ok(Gate::Run) => self.run_tool(seq, &tool, &input),
+                    Ok(Gate::Ask) => {
+                        self.append(Body::Ask { call: seq })?;
+                        self.ask(seq, &tool, &input)?
+                    }
                     Err(error) => Outcome::Failed { error },
                 };
                 (Call::Tool { tool, input }, seq, outcome)
             }
         };
         self.finish(&call, seq, outcome).map(Some)
+    }
+
+    /// Waits for the user's answer to the ask for call `seq`, logs it, and
+    /// runs the call if approved.
+    fn ask(&self, seq: u64, tool: &str, input: &Value) -> io::Result<Outcome> {
+        let approved = self.answer_to(seq)?;
+        self.append(Body::Hook {
+            hook: "user".to_owned(),
+            decision: Decision::Approval {
+                tool: tool.to_owned(),
+                approved,
+                call: Some(seq),
+            },
+        })?;
+        Ok(if approved {
+            self.run_tool(seq, tool, input)
+        } else {
+            not_approved()
+        })
+    }
+
+    /// Blocks the actor, not the daemon, until call `call` is answered.
+    /// Waiting is not work: the session may hibernate, and the daemon exit,
+    /// with the ask in its inbox; recovery asks again. A stop while waiting
+    /// is an `Interrupted` error.
+    fn answer_to(&self, call: u64) -> io::Result<bool> {
+        self.queued.fetch_sub(1, Ordering::SeqCst);
+        self.touch();
+        let mut answers = lock(&self.answers);
+        let answer = loop {
+            if let Some(approved) = answers.given.remove(&call) {
+                break Some(approved);
+            }
+            if answers.stopped {
+                break None;
+            }
+            answers = self
+                .answered
+                .wait(answers)
+                .unwrap_or_else(PoisonError::into_inner);
+        };
+        drop(answers);
+        self.queued.fetch_add(1, Ordering::SeqCst);
+        answer.ok_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::Interrupted,
+                format!("stopped while call {call} waits for approval"),
+            )
+        })
     }
 
     fn run_call(&self, call: &Call, seq: u64) -> Outcome {
@@ -412,8 +509,9 @@ impl Session {
 
     /// Picks up where the log leaves off. The agent is rebuilt from the
     /// log; calls with an intent but no outcome are finished (leftover
-    /// processes killed, safe calls run again, the rest marked interrupted);
-    /// then whatever the agent asked for that the log does not show runs.
+    /// processes killed, safe calls run again, the rest marked interrupted,
+    /// asks still waiting asked again); then whatever the agent asked for
+    /// that the log does not show runs.
     fn recover(&self, agent: &mut dyn Agent) -> io::Result<()> {
         let (dangling, actions) = {
             let st = self.lock();
@@ -424,6 +522,7 @@ impl Session {
             seq,
             call,
             processes,
+            asked,
         } in dangling
         {
             let this_boot = processes
@@ -435,6 +534,10 @@ impl Session {
                 }
             }
             let outcome = match &call {
+                Call::Tool { tool, input } if asked == Asked::Waiting => {
+                    self.ask(seq, tool, input)?
+                }
+                Call::Tool { .. } if asked == Asked::Answered(false) => not_approved(),
                 Call::Tool { tool, .. }
                     if self.shared.tools.get(tool).map(DynTool::replay) != Some(Replay::Safe) =>
                 {
@@ -463,17 +566,36 @@ fn contain(effect: impl FnOnce() -> Outcome) -> Outcome {
     })
 }
 
+fn not_approved() -> Outcome {
+    Outcome::Failed {
+        error: "the user did not approve this call".to_owned(),
+    }
+}
+
 /// The effect an agent asked for, between its committed intent and outcome.
 enum Call {
     Model,
     Tool { tool: String, input: Value },
 }
 
-/// A call with an intent but no outcome, and the process groups it started.
+/// A call with an intent but no outcome, the process groups it started, and
+/// whether the user was asked to approve it.
 struct Dangling {
     seq: u64,
     call: Call,
     processes: Vec<(u32, String)>,
+    asked: Asked,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Asked {
+    No,
+    Waiting,
+    Answered(bool),
+}
+
+fn find_call(dangling: &mut [Dangling], call: u64) -> Option<&mut Dangling> {
+    dangling.iter_mut().rev().find(|d| d.seq == call)
 }
 
 fn dangling_calls(entries: &[Entry]) -> Vec<Dangling> {
@@ -488,8 +610,28 @@ fn dangling_calls(entries: &[Entry]) -> Vec<Dangling> {
     for e in entries {
         let call = match &e.body {
             Body::ToolProcess { call, pgid, boot } => {
-                if let Some(d) = dangling.iter_mut().rev().find(|d| d.seq == *call) {
+                if let Some(d) = find_call(&mut dangling, *call) {
                     d.processes.push((*pgid, boot.clone()));
+                }
+                continue;
+            }
+            Body::Ask { call } => {
+                if let Some(d) = find_call(&mut dangling, *call) {
+                    d.asked = Asked::Waiting;
+                }
+                continue;
+            }
+            Body::Hook {
+                decision:
+                    Decision::Approval {
+                        call: Some(call),
+                        approved,
+                        ..
+                    },
+                ..
+            } => {
+                if let Some(d) = find_call(&mut dangling, *call) {
+                    d.asked = Asked::Answered(*approved);
                 }
                 continue;
             }
@@ -505,6 +647,7 @@ fn dangling_calls(entries: &[Entry]) -> Vec<Dangling> {
             seq: e.seq,
             call,
             processes: Vec::new(),
+            asked: Asked::No,
         });
     }
     dangling

@@ -7,7 +7,7 @@ use std::fs;
 use std::process::Command;
 
 use common::{Env, assert_contiguous, group_alive, is_tool_call, result_of, wait_for};
-use protocol::{Body, Outcome, Target};
+use protocol::{Body, DaemonMsg, Decision, Outcome, Recap, Target};
 use serde_json::json;
 
 const ANY: Target = Target::Latest {
@@ -108,6 +108,7 @@ fn resume_after_the_terminal_closes_mid_turn_replays_every_entry() {
             r#"  └ {"slept":1}"#,
         ]
     );
+    assert_eq!(resumed.line(), "[recap · you: sleep 1 · ran sleep]");
     resumed.finish();
 }
 
@@ -238,4 +239,73 @@ fn sessions_outlive_their_daemon() {
     assert_eq!(env.run(&["daemon", "stop"]), "stopped\n");
     let listed = env.run(&["ls"]);
     assert!(listed.starts_with(&id), "{listed}");
+}
+
+#[test]
+fn a_pending_approval_survives_detach_and_is_re_delivered_on_attach() {
+    let mut env = Env::new("approval");
+    env.vars.push(("A_ASK", "run_command"));
+    env.start();
+    let mut conn = env.connect();
+    let (id, _) = conn.attach(Target::New, &env.ws);
+    conn.input("$ echo ran > ran.txt");
+    let asked = conn.until(|e| matches!(e.body, Body::Ask { .. }));
+    let Body::Ask { call } = asked.last().unwrap().body else {
+        unreachable!()
+    };
+    let ask = |msg: DaemonMsg| matches!(msg, DaemonMsg::Ask { call: c, tool, .. } if c == call && tool == "run_command");
+    assert!(ask(conn.recv()));
+    drop(conn);
+
+    let mut conn = env.connect();
+    let (_, replayed) = conn.attach(Target::Id(id), &env.ws);
+    assert!(replayed.iter().any(|e| e.body == Body::Ask { call }));
+    let recap = Recap {
+        prompt: Some("$ echo ran > ran.txt".into()),
+        tools: vec!["run_command".into()],
+        asks: 1,
+        ..Recap::default()
+    };
+    assert!(matches!(conn.recv(), DaemonMsg::Recap(r) if r == recap));
+    assert!(ask(conn.recv()));
+    drop(conn);
+
+    env.kill_daemon();
+    env.start();
+    let ran = env.ws.join("ran.txt");
+    assert!(!ran.exists(), "the call ran unapproved");
+    let mut term = env.repl(&["resume"]);
+    let shown = term.lines_until("?");
+    assert_eq!(
+        &shown[shown.len() - 2..],
+        [
+            "[recap · you: $ echo ran > ran.txt · ran run_command · 1 waiting for approval]",
+            "? approve $ echo ran > ran.txt  [y/n]",
+        ]
+    );
+    term.type_line("y");
+    assert_eq!(term.lines_until("└"), ["  · approved", "  └ exit 0"]);
+    term.finish();
+
+    assert_eq!(fs::read_to_string(ran).unwrap(), "ran\n");
+    let log = env.log(id);
+    assert_contiguous(&log);
+    let answers: Vec<_> = log
+        .iter()
+        .filter(|e| {
+            matches!(
+                e.body,
+                Body::Hook {
+                    decision: Decision::Approval { .. },
+                    ..
+                }
+            )
+        })
+        .collect();
+    assert!(
+        matches!(&answers[..], [e] if matches!(&e.body, Body::Hook {
+            decision: Decision::Approval { approved: true, call: Some(c), .. }, ..
+        } if *c == call)),
+        "{log:#?}"
+    );
 }

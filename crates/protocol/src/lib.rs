@@ -103,6 +103,12 @@ pub enum Body {
         hook: String,
         decision: Decision,
     },
+    /// Tool call `call` waits for the user's approval. Until a
+    /// [`Decision::Approval`] for it is logged it is in the session's inbox:
+    /// delivered to every client, and again to each that attaches.
+    Ask {
+        call: u64,
+    },
 }
 
 /// What a hook decided, by decision point. Only decisions that change
@@ -123,8 +129,14 @@ pub enum Decision {
         tool: String,
         permission: Permission,
     },
-    /// The answer to a permission `ask`.
-    Approval { tool: String, approved: bool },
+    /// The answer to a permission `ask`; `call` is set when the user gave
+    /// it, to the call's [`Body::Ask`].
+    Approval {
+        tool: String,
+        approved: bool,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        call: Option<u64>,
+    },
     /// Call `call`'s outcome was replaced; `original` is what it replaced.
     PostTool { call: u64, original: Outcome },
     /// The agent stopped and was given `text` to continue with.
@@ -174,6 +186,24 @@ pub struct SessionSummary {
     pub clients: u32,
 }
 
+/// What happened in a session, for a client that attaches: derived from the
+/// log alone, so every client gets the same one.
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Recap {
+    /// The user's last message, shortened.
+    pub prompt: Option<String>,
+    /// The tools called since, in order.
+    pub tools: Vec<String>,
+    /// Calls since that failed or were interrupted.
+    pub failed: u32,
+    /// Calls since with no outcome yet.
+    pub running: u32,
+    /// The agent's last reply since, shortened.
+    pub reply: Option<String>,
+    /// Calls waiting for the user's approval.
+    pub asks: u32,
+}
+
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(tag = "t", rename_all = "snake_case")]
 pub enum ClientMsg {
@@ -192,6 +222,11 @@ pub enum ClientMsg {
     },
     List,
     Detach,
+    /// Answers the [`DaemonMsg::Ask`] for tool call `call`.
+    Approve {
+        call: u64,
+        approved: bool,
+    },
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -226,6 +261,15 @@ pub enum DaemonMsg {
     },
     Sessions {
         sessions: Vec<SessionSummary>,
+    },
+    /// Sent after `Synced` when the replay held entries.
+    Recap(Recap),
+    /// Tool call `call` waits for approval: sent when it is asked, and
+    /// after `Synced` for every call still waiting.
+    Ask {
+        call: u64,
+        tool: String,
+        input: Value,
     },
     Error {
         message: String,
@@ -355,6 +399,25 @@ mod tests {
                 "hook": "policy",
                 "decision": { "permission": { "tool": "run_command", "permission": "deny" } },
             })
+        );
+    }
+
+    #[test]
+    fn approvals_by_a_hook_keep_their_shape_and_the_users_name_the_call() {
+        let by_hook = r#"{"seq":2,"epoch":0,"kind":"hook","hook":"h","decision":{"approval":{"tool":"t","approved":true}}}"#;
+        let e: Entry = serde_json::from_str(by_hook).unwrap();
+        assert_eq!(serde_json::to_string(&e).unwrap(), by_hook);
+        let by_user = Body::Hook {
+            hook: "user".into(),
+            decision: Decision::Approval {
+                tool: "t".into(),
+                approved: false,
+                call: Some(3),
+            },
+        };
+        assert_eq!(
+            serde_json::to_value(&by_user).unwrap()["decision"]["approval"]["call"],
+            3
         );
     }
 }

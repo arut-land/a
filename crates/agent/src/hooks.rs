@@ -33,8 +33,8 @@ pub trait Hook: Send + Sync {
         Permission::Allow
     }
 
-    /// Answers a permission `ask`; the first answer wins. This is the seam
-    /// durable approvals (asked of a client, logged, resumable) replace.
+    /// Answers a permission `ask`; the first answer wins. An ask no hook
+    /// answers goes to the user, durably: see [`Gate::Ask`].
     fn approve(&self, _tool: &str, _input: &Value) -> Option<bool> {
         None
     }
@@ -58,6 +58,32 @@ pub enum Pre {
     Replace(Value),
     /// Answers the call with this reason instead of running it.
     Block(String),
+}
+
+/// What the hooks make of a tool call they do not refuse.
+#[derive(Debug, PartialEq, Eq)]
+pub enum Gate {
+    Run,
+    /// No hook answered a permission `ask`: the call runs once the user
+    /// approves it.
+    Ask,
+}
+
+/// Asks the user before running any of these tools.
+pub struct AskFor(pub Vec<String>);
+
+impl Hook for AskFor {
+    fn name(&self) -> &'static str {
+        "ask"
+    }
+
+    fn permission(&self, tool: &str, _: &Value) -> Permission {
+        if self.0.iter().any(|t| t == tool) {
+            Permission::Ask
+        } else {
+            Permission::Allow
+        }
+    }
 }
 
 /// Decisions to log, with the hook that made each.
@@ -85,7 +111,12 @@ impl Hooks {
 
     /// Whether a call may run, with `input` as the `pre_tool` chain leaves
     /// it. `Err` is why not, which answers the call.
-    pub fn gate(&self, tool: &str, input: &mut Value, decided: &mut Decided) -> Result<(), String> {
+    pub fn gate(
+        &self,
+        tool: &str,
+        input: &mut Value,
+        decided: &mut Decided,
+    ) -> Result<Gate, String> {
         for hook in &self.0 {
             match hook.pre_tool(tool, input) {
                 Pre::Pass => {}
@@ -114,7 +145,7 @@ impl Hooks {
             .filter(|(_, permission)| *permission > Permission::Allow)
             .reduce(|most, next| if next.1 > most.1 { next } else { most })
         else {
-            return Ok(());
+            return Ok(Gate::Run);
         };
         let tool = tool.to_owned();
         decided.push((
@@ -125,18 +156,26 @@ impl Hooks {
             },
         ));
         match permission {
-            Permission::Allow => Ok(()),
+            Permission::Allow => Ok(Gate::Run),
             Permission::Ask => {
                 let answer = self
                     .0
                     .iter()
                     .find_map(|hook| Some((hook.name(), hook.approve(&tool, input)?)));
                 let Some((who, approved)) = answer else {
-                    return Err(format!("{by} asks for approval, and no one can approve"));
+                    return Ok(Gate::Ask);
                 };
-                decided.push((who, Decision::Approval { tool, approved }));
+                let call = None;
+                decided.push((
+                    who,
+                    Decision::Approval {
+                        tool,
+                        approved,
+                        call,
+                    },
+                ));
                 if approved {
-                    Ok(())
+                    Ok(Gate::Run)
                 } else {
                     Err(format!("{who} did not approve this call"))
                 }
@@ -237,7 +276,7 @@ mod tests {
             .collect()
     }
 
-    fn gate(hooks: &Hooks) -> (Result<(), String>, Value, Decided) {
+    fn gate(hooks: &Hooks) -> (Result<Gate, String>, Value, Decided) {
         let mut input = json!({ "n": 0 });
         let mut decided = Decided::new();
         let verdict = hooks.gate("t", &mut input, &mut decided);
@@ -251,7 +290,7 @@ mod tests {
     #[test]
     fn no_hooks_allow_everything_and_log_nothing() {
         let (verdict, input, decided) = gate(&Hooks::default());
-        assert_eq!(verdict, Ok(()));
+        assert_eq!(verdict, Ok(Gate::Run));
         assert_eq!(input, json!({ "n": 0 }));
         assert_eq!(decided, Decided::new());
     }
@@ -270,7 +309,7 @@ mod tests {
             },
         ]);
         let (verdict, input, decided) = gate(&chained);
-        assert_eq!((verdict, input), (Ok(()), json!({ "n": 2 })));
+        assert_eq!((verdict, input), (Ok(Gate::Run), json!({ "n": 2 })));
         assert_eq!(names(&decided), ["a", "b"]);
 
         let blocked = hooks([
@@ -321,12 +360,13 @@ mod tests {
                 other => panic!("{other:?}"),
             });
             assert_eq!(got, want, "{permissions:?}");
-            assert_eq!(verdict.is_ok(), want.is_none(), "{permissions:?}");
+            let runs = verdict.is_ok_and(|gate| gate == Gate::Run);
+            assert_eq!(runs, want.is_none(), "{permissions:?}");
         }
     }
 
     #[test]
-    fn an_ask_runs_only_when_a_hook_approves() {
+    fn an_ask_runs_when_a_hook_approves_and_goes_to_the_user_when_none_answers() {
         let asks = |approve| {
             hooks([
                 Fixed {
@@ -340,7 +380,7 @@ mod tests {
             ])
         };
         let (approved, _, decided) = gate(&asks(Some(true)));
-        assert_eq!(approved, Ok(()));
+        assert_eq!(approved, Ok(Gate::Run));
         assert!(matches!(
             &decided[..],
             [
@@ -350,7 +390,7 @@ mod tests {
         ));
         assert!(gate(&asks(Some(false))).0.is_err());
         let (unanswered, _, decided) = gate(&asks(None));
-        assert!(unanswered.unwrap_err().contains("no one can approve"));
+        assert_eq!(unanswered, Ok(Gate::Ask));
         assert_eq!(names(&decided), ["policy"]);
     }
 
