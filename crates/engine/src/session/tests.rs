@@ -399,6 +399,34 @@ fn hook_decisions_are_logged_and_replay_to_the_same_state() {
     );
 }
 
+/// A crash after a gate's decisions but before its call: recovery gates the
+/// call again without logging the decisions twice.
+#[test]
+fn a_gate_cut_off_by_a_crash_logs_its_decisions_once() {
+    let fixture = Fixture::new(
+        agent::Kind::Echo,
+        Registry::default().with(&Builtin).with(&Policy),
+        openai(&Script::new(&[])),
+    );
+    let denied = Body::Hook {
+        hook: "policy".into(),
+        decision: Decision::Permission {
+            tool: "run_command".into(),
+            permission: Permission::Deny,
+        },
+    };
+    let user = Body::User {
+        text: "$ echo hi".into(),
+    };
+    let session = fixture.start(&[entry(1, user), entry(2, denied.clone())]);
+    let log = log_of(&session);
+    session.stop();
+
+    let decisions = log.iter().filter(|e| e.body == denied).count();
+    assert_eq!(decisions, 1, "{log:#?}");
+    assert!(matches!(log[2].body, Body::ToolCall { .. }), "{log:#?}");
+}
+
 /// One worker runs every session: a wait for approval, a sleep and running
 /// commands all overlap.
 #[test]

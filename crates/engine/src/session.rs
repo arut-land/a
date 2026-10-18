@@ -286,13 +286,34 @@ impl Session {
         Ok(seq)
     }
 
-    /// Commits what the hooks decided.
+    /// Commits what the hooks decided. Decisions that repeat the hook
+    /// entries ending the log are a gate recovery runs again because a crash
+    /// cut it off before its effect was committed: they are logged once.
     fn decide(&self, decided: Decided) -> io::Result<()> {
-        for (hook, decision) in decided {
-            self.append(Body::Hook {
+        let decided: Vec<Body> = decided
+            .into_iter()
+            .map(|(hook, decision)| Body::Hook {
                 hook: hook.to_owned(),
                 decision,
-            })?;
+            })
+            .collect();
+        {
+            let st = self.lock();
+            let tail = st
+                .entries
+                .iter()
+                .rev()
+                .take_while(|e| matches!(e.body, Body::Hook { .. }))
+                .count();
+            let logged = st.entries[st.entries.len() - tail..]
+                .iter()
+                .map(|e| &e.body);
+            if tail > 0 && logged.eq(&decided) {
+                return Ok(());
+            }
+        }
+        for body in decided {
+            self.append(body)?;
         }
         Ok(())
     }
