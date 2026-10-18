@@ -201,13 +201,14 @@ fn part_of(part: &AssistantPart, key: &str) -> Value {
     }
 }
 
+/// The counts rig reports; the rest of ours are checked per protocol.
+const RIG_COUNTS: [&str; 5] = ["input", "output", "cache_read", "cache_write", "reasoning"];
+
 /// Whether `ours` says what rig's `expected` says.
 fn agrees(expected: &Value, ours: &Value) -> bool {
     if expected.get("error").is_some() || ours.get("error").is_some() {
         return expected.get("error").is_some() == ours.get("error").is_some();
     }
-    // The counts rig reports; the rest of ours are checked per protocol.
-    const RIG_COUNTS: [&str; 5] = ["input", "output", "cache_read", "cache_write", "reasoning"];
     let usage = |value: &Value| -> BTreeMap<String, Value> {
         value["usage"]
             .as_object()

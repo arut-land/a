@@ -34,7 +34,8 @@ fmt = "cargo fmt --all"
 test = "cargo nextest run --workspace --no-tests=pass"
 "check:fmt" = "cargo fmt --all --check"
 "check:clippy" = "cargo clippy --workspace --all-targets -- -D warnings"
-check = { depends = ["check:fmt", "check:clippy", "test"] }
+# Sequential: the tests and clippy would rebuild the same target at once.
+check = { depends = ["check:fmt", "check:clippy"], run = "mise run test" }
 size = { depends = ["release"], run = 'f=target/release/a; [[ -e $f.exe ]] && f+=.exe; b=$(wc -c < "$f"); echo "a: $((b / 1024)) KiB of 4096 KiB"; ((b <= 4194304))' }
 startup = { depends = ["release"], run = 'hyperfine -N --warmup 50 -r 500 "target/release/a --version"' }
 bloat = "cargo bloat --release --crates -n 20"

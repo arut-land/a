@@ -12,8 +12,9 @@ pub(crate) mod schema;
 pub(crate) fn usage_meta(key: &str, usage: Option<&serde_json::Value>) -> crate::Meta {
     usage
         .filter(|usage| usage.is_object())
-        .map(|usage| crate::Meta::from([(key.to_owned(), serde_json::json!({ "usage": usage }))]))
-        .unwrap_or_default()
+        .map_or_default(|usage| {
+            crate::Meta::from([(key.to_owned(), serde_json::json!({ "usage": usage }))])
+        })
 }
 
 /// The sum of the counts in an object of counters (`{"web_search": 2}`),

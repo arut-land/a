@@ -671,6 +671,45 @@ impl Writer {
         });
     }
 
+    /// Close a call: its arguments parsed, its id made distinct.
+    fn close_call(
+        &mut self,
+        part: u32,
+        id: Option<String>,
+        name: &str,
+        arguments: &Arguments,
+        item: Value,
+    ) {
+        if name.is_empty() {
+            return;
+        }
+        let (input, invalid) = arguments.end();
+        // A call that streamed no text (none arrived, or only a
+        // placeholder `null`) states the arguments it ends with.
+        if arguments.streamed == 0 {
+            self.emit(Event::Delta {
+                index: part,
+                text: Value::Object(input.clone()).to_string(),
+            });
+        }
+        let (id, item) = self.distinct_call_id(id, item);
+        if !item.is_null() {
+            let fp = fingerprint(Canon::Call(name, &input));
+            self.items.insert(part, (item, fp));
+        }
+        self.emit(Event::End {
+            index: part,
+            redacted: false,
+            text: None,
+            call: Some(CallEnd {
+                id,
+                input,
+                invalid,
+                provider_executed: false,
+            }),
+        });
+    }
+
     fn close_item(&mut self, index: usize, complete: bool) -> Result<(), Error> {
         self.stream_call(index);
         let draft = self.open.remove(&index).ok_or_else(|| not_open(index))?;
@@ -726,34 +765,7 @@ impl Writer {
                 name,
                 arguments,
             } => {
-                if name.is_empty() {
-                    return Ok(());
-                }
-                let (input, invalid) = arguments.end();
-                // A call that streamed no text (none arrived, or only a
-                // placeholder `null`) states the arguments it ends with.
-                if arguments.streamed == 0 {
-                    self.emit(Event::Delta {
-                        index: part,
-                        text: Value::Object(input.clone()).to_string(),
-                    });
-                }
-                let (id, item) = self.distinct_call_id(id, item);
-                if !item.is_null() {
-                    let fp = fingerprint(Canon::Call(&name, &input));
-                    self.items.insert(part, (item, fp));
-                }
-                self.emit(Event::End {
-                    index: part,
-                    redacted: false,
-                    text: None,
-                    call: Some(CallEnd {
-                        id,
-                        input,
-                        invalid,
-                        provider_executed: false,
-                    }),
-                });
+                self.close_call(part, id, &name, &arguments, item);
                 return Ok(());
             }
         };
