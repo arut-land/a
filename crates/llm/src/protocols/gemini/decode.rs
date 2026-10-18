@@ -10,7 +10,7 @@ use super::KEY;
 use crate::error::{Error, Kind};
 use crate::json::Lenient;
 use crate::protocol::{Decoder, Flow, Frame};
-use crate::spec::{Event, Reason, Usage};
+use crate::spec::{Event, Media, Reason, Source, Usage};
 use crate::writer::{End, Open, Writer};
 
 /// The fields of a part that carry no data of their own.
@@ -41,24 +41,29 @@ pub(crate) const fn reason_of(name: &str) -> Reason {
 
 /// Usage from `usageMetadata`. Input is the prompt plus the tool-use
 /// prompt, output the candidates plus the thoughts; a count Gemini leaves
-/// out is zero, as its JSON omits zeros.
+/// out is zero, as its JSON omits zeros. Audio is read from the per-modality
+/// details.
 pub(crate) fn usage_of(usage: &Value) -> Usage {
     let count = |key: &str| usage.u64(key);
+    let modality = |key: &str, modality: &str| {
+        usage
+            .arr(key)
+            .iter()
+            .filter(|detail| detail.str("modality") == Some(modality))
+            .filter_map(|detail| detail.u64("tokenCount"))
+            .reduce(|a, b| a + b)
+    };
     let thoughts = count("thoughtsTokenCount");
+    let tool = count("toolUsePromptTokenCount");
     Usage {
-        input: Some(
-            count("promptTokenCount")
-                .unwrap_or(0)
-                .saturating_add(count("toolUsePromptTokenCount").unwrap_or(0)),
-        ),
-        output: Some(
-            count("candidatesTokenCount")
-                .unwrap_or(0)
-                .saturating_add(thoughts.unwrap_or(0)),
-        ),
+        input: Some(count("promptTokenCount").unwrap_or(0) + tool.unwrap_or(0)),
+        output: Some(count("candidatesTokenCount").unwrap_or(0) + thoughts.unwrap_or(0)),
         cache_read: count("cachedContentTokenCount"),
-        cache_write: None,
+        tool_input: tool,
+        audio_input: modality("promptTokensDetails", "AUDIO"),
         reasoning: thoughts,
+        audio_output: modality("candidatesTokensDetails", "AUDIO"),
+        ..Usage::default()
     }
 }
 
@@ -273,7 +278,7 @@ impl GeminiDecoder {
             response_id: self.response_id.take(),
             model: self.model.take(),
             message: message.filter(|_| reason != Reason::Stop),
-            meta: crate::Meta::new(),
+            meta: super::super::usage_meta(KEY, self.usage.as_ref()),
         })
     }
 
@@ -377,8 +382,40 @@ impl GeminiDecoder {
                 }
             });
         }
+        if let Some(media) = media_of(part) {
+            return self.open(Open::Media(media), part.clone(), "");
+        }
         self.open(Open::Opaque { replay: data }, part.clone(), "")
     }
+}
+
+/// The image (or other media) a reply part carries inline or by URI.
+fn media_of(part: &Value) -> Option<Media> {
+    let (media_type, source) = if let Some(inline) = part.obj("inlineData") {
+        let data = inline.get("data")?.as_str()?;
+        (
+            inline.get("mimeType")?.as_str()?,
+            Source::Data {
+                data: data.to_owned(),
+            },
+        )
+    } else {
+        let file = part.obj("fileData")?;
+        let url = file.get("fileUri")?.as_str()?;
+        (
+            file.get("mimeType")
+                .and_then(Value::as_str)
+                .unwrap_or("application/octet-stream"),
+            Source::Url {
+                url: url.to_owned(),
+            },
+        )
+    };
+    Some(Media {
+        media_type: media_type.to_owned(),
+        source,
+        meta: crate::Meta::new(),
+    })
 }
 
 impl Decoder for GeminiDecoder {

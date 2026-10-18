@@ -372,3 +372,35 @@ fn two_signed_thoughts_keep_both_signatures() {
         .collect();
     assert_eq!(signatures, ["b25l", "dHdv"]);
 }
+
+#[test]
+fn an_inline_image_decodes_as_media_and_keeps_its_signature() {
+    let reply = decoded(&[json!({
+        "candidates": [{
+            "content": {"role": "model", "parts": [
+                {"text": "Here it is."},
+                {"inlineData": {"mimeType": "image/png", "data": "iVBORw0KGgo="}, "thoughtSignature": "c2ln"},
+            ]},
+            "finishReason": "STOP",
+        }],
+        "usageMetadata": {"promptTokenCount": 5, "candidatesTokenCount": 7, "toolUsePromptTokenCount": 2,
+            "promptTokensDetails": [{"modality": "TEXT", "tokenCount": 3}, {"modality": "AUDIO", "tokenCount": 2}]},
+    })]);
+    let reply = reply.expect("the reply decodes");
+    let [AssistantPart::Text(_), AssistantPart::Media(media)] = reply.message.content.as_slice()
+    else {
+        panic!("{:?}", reply.message.content)
+    };
+    assert_eq!(media.media_type, "image/png");
+    assert_eq!(
+        media.source,
+        Source::Data {
+            data: "iVBORw0KGgo=".into()
+        }
+    );
+    assert_eq!(media.meta[KEY]["item"]["thoughtSignature"], "c2ln");
+    assert_eq!(reply.usage.input, Some(7));
+    assert_eq!(reply.usage.tool_input, Some(2));
+    assert_eq!(reply.usage.audio_input, Some(2));
+    assert_eq!(reply.meta[KEY]["usage"]["promptTokenCount"], 5);
+}

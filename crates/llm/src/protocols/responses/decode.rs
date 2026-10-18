@@ -221,6 +221,7 @@ pub(crate) fn usage_of(usage: &Value) -> Usage {
         cache_read: count("/input_tokens_details/cached_tokens"),
         cache_write: count("/input_tokens_details/cache_write_tokens"),
         reasoning: count("/output_tokens_details/reasoning_tokens"),
+        ..Usage::default()
     }
 }
 
@@ -638,13 +639,22 @@ impl ResponsesDecoder {
             }
         }
         let (reason, raw, message) = finish_of(response);
+        let usage = Usage {
+            // Hosted tools report their requests beside the usage.
+            hosted_tool_calls: super::super::counters(
+                response.get("tool_usage"),
+                Some("num_requests"),
+            )
+            .filter(|calls| *calls > 0),
+            ..response.get("usage").map_or_default(usage_of)
+        };
         self.w.end(End {
-            usage: response.get("usage").map_or_default(usage_of),
+            usage,
             reason: Some((reason, raw)),
             response_id: item_id(response).map(str::to_owned),
             model: response.str("model").map(str::to_owned),
             message,
-            meta: crate::Meta::new(),
+            meta: super::super::usage_meta(KEY, response.get("usage")),
         })
     }
 

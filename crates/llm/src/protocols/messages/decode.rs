@@ -42,7 +42,11 @@ struct Counts {
     output: Option<u64>,
     cache_read: Option<u64>,
     cache_creation: Option<u64>,
+    /// The part of `cache_creation` written for the one-hour retention.
+    cache_creation_long: Option<u64>,
     thinking: Option<u64>,
+    /// Requests server tools made (`server_tool_use`).
+    server_tools: Option<u64>,
 }
 
 impl Counts {
@@ -53,7 +57,12 @@ impl Counts {
             output: count("/output_tokens"),
             cache_read: count("/cache_read_input_tokens"),
             cache_creation: count("/cache_creation_input_tokens"),
+            cache_creation_long: count("/cache_creation/ephemeral_1h_input_tokens"),
             thinking: count("/output_tokens_details/thinking_tokens"),
+            server_tools: super::super::counters(
+                usage.and_then(|usage| usage.get("server_tool_use")),
+                None,
+            ),
         }
     }
 
@@ -67,7 +76,10 @@ impl Counts {
             output: self.output,
             cache_read: self.cache_read,
             cache_write: self.cache_creation,
+            cache_write_long: self.cache_creation_long,
             reasoning: self.thinking,
+            hosted_tool_calls: self.server_tools.filter(|calls| *calls > 0),
+            ..Usage::default()
         }
     }
 }
@@ -117,6 +129,9 @@ pub(crate) struct MessagesDecoder {
     /// The counters `message_start` reported, for a terminal `message_delta`
     /// that does not repeat them.
     start: Counts,
+    /// The provider's usage objects, `message_start`'s with the terminal
+    /// delta's fields over it.
+    raw_usage: Option<Value>,
     message_id: Option<String>,
     model: Option<String>,
     container: Option<Value>,
@@ -160,6 +175,7 @@ impl MessagesDecoder {
             opened: false,
             unsigned_thinking,
             start: Counts::default(),
+            raw_usage: None,
             message_id: None,
             model: None,
             container: None,
@@ -362,6 +378,10 @@ impl MessagesDecoder {
     /// Note the metadata a whole message or `message_start` states.
     fn metadata(&mut self, message: &Value) {
         self.start = Counts::of(message.get("usage"));
+        self.raw_usage = message
+            .get("usage")
+            .filter(|usage| usage.is_object())
+            .cloned();
         self.message_id = message.str("id").map(str::to_owned);
         self.model = message.str("model").map(str::to_owned);
         self.note_container(message.get("container"));
@@ -407,7 +427,7 @@ impl MessagesDecoder {
             response_id: self.message_id.clone(),
             model: self.model.clone(),
             message,
-            meta: crate::Meta::new(),
+            meta: super::super::usage_meta(KEY, self.raw_usage.as_ref()),
         })
     }
 
@@ -448,6 +468,9 @@ impl MessagesDecoder {
                 .or(self.start.input),
             cache_read: terminal.cache_read.or(self.start.cache_read),
             cache_creation: terminal.cache_creation.or(self.start.cache_creation),
+            cache_creation_long: terminal
+                .cache_creation_long
+                .or(self.start.cache_creation_long),
             ..terminal
         }
     }
@@ -488,6 +511,16 @@ impl MessagesDecoder {
                     return Ok(Flow::More);
                 };
                 let usage = self.terminal(frame.get("usage"));
+                if let Some(Value::Object(delta)) = frame.get("usage") {
+                    let raw = self.raw_usage.get_or_insert_with(|| json!({}));
+                    if let Some(raw) = raw.as_object_mut() {
+                        raw.extend(
+                            delta
+                                .iter()
+                                .map(|(key, value)| (key.clone(), value.clone())),
+                        );
+                    }
+                }
                 let details = delta.and_then(|delta| delta.get("stop_details"));
                 return self.end(usage, Some(reason), details);
             }

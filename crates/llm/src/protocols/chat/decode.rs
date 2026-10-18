@@ -611,6 +611,7 @@ impl ChatDecoder {
             reason: self.finish.take().map(|(reason, raw)| (reason, Some(raw))),
             response_id: self.response_id.take(),
             model: self.response_model.take(),
+            meta: super::super::usage_meta(KEY, self.usage.as_ref()),
             ..End::default()
         })
     }
@@ -758,8 +759,12 @@ fn usage_of(usage: &Value, quirks: &Quirks) -> Usage {
         cache_read: detail("prompt_tokens_details", "cached_tokens")
             .or_else(|| count("/num_cached_tokens"))
             .or_else(|| count("/prompt_cache_hit_tokens")),
-        cache_write: count("/prompt_tokens_details/cache_write_tokens"),
+        cache_write: count("/prompt_tokens_details/cache_write_tokens")
+            .or_else(|| count("/cache_creation_input_tokens")),
+        audio_input: count("/prompt_tokens_details/audio_tokens").filter(|tokens| *tokens > 0),
         reasoning: detail("completion_tokens_details", "reasoning_tokens")
             .filter(|_| quirks.reliable_reasoning_count),
+        audio_output: count("/completion_tokens_details/audio_tokens").filter(|tokens| *tokens > 0),
+        ..Usage::default()
     }
 }

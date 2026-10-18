@@ -206,12 +206,14 @@ fn agrees(expected: &Value, ours: &Value) -> bool {
     if expected.get("error").is_some() || ours.get("error").is_some() {
         return expected.get("error").is_some() == ours.get("error").is_some();
     }
+    // The counts rig reports; the rest of ours are checked per protocol.
+    const RIG_COUNTS: [&str; 5] = ["input", "output", "cache_read", "cache_write", "reasoning"];
     let usage = |value: &Value| -> BTreeMap<String, Value> {
         value["usage"]
             .as_object()
             .into_iter()
             .flatten()
-            .filter(|(_, count)| !count.is_null())
+            .filter(|(key, count)| !count.is_null() && RIG_COUNTS.contains(&key.as_str()))
             .map(|(key, count)| (key.clone(), count.clone()))
             .collect()
     };

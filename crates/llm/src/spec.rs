@@ -402,31 +402,100 @@ fn join<'a>(texts: impl Iterator<Item = &'a str>) -> String {
     texts.collect::<Vec<_>>().join("\n")
 }
 
-/// Token counts. `input` includes cached and cache-written tokens and
-/// `output` includes reasoning, so `cache_read + cache_write <= input` and
-/// `reasoning <= output`. A count the provider did not report is `None`.
+/// Token counts, as the provider reported them; a count it left out is
+/// `None`. Totals include their parts: `input` holds every input token
+/// (uncached, read from a cache, written to one, added by hosted tools) and
+/// `output` every output token (reasoning and audio included). The
+/// provider's own usage object rides on the reply's `meta` under its
+/// protocol's key, as `usage`.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default)]
 pub struct Usage {
-    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub input: Option<u64>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub output: Option<u64>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
+    /// The part of `input` read from the provider's cache.
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub cache_read: Option<u64>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
+    /// The part of `input` written to the provider's cache.
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub cache_write: Option<u64>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
+    /// The part of `cache_write` kept for the long retention (Anthropic's
+    /// one hour), which bills higher.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub cache_write_long: Option<u64>,
+    /// The part of `input` the provider's hosted tools added (Gemini's
+    /// tool-use prompt).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub tool_input: Option<u64>,
+    /// The part of `input` that was audio.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub audio_input: Option<u64>,
+    /// The part of `output` spent reasoning.
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub reasoning: Option<u64>,
+    /// The part of `output` that was audio.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub audio_output: Option<u64>,
+    /// Requests the provider's hosted tools made (web searches, fetches,
+    /// code runs), which bill per request.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub hosted_tool_calls: Option<u64>,
 }
 
 impl Usage {
-    /// `other`'s reported counts over this one's.
-    pub fn merge(&mut self, other: Self) {
-        self.input = other.input.or(self.input);
-        self.output = other.output.or(self.output);
-        self.cache_read = other.cache_read.or(self.cache_read);
-        self.cache_write = other.cache_write.or(self.cache_write);
-        self.reasoning = other.reasoning.or(self.reasoning);
+    /// The part of `input` neither read from nor written to a cache.
+    pub fn uncached_input(&self) -> Option<u64> {
+        let cached = self.cache_read.unwrap_or(0) + self.cache_write.unwrap_or(0);
+        self.input.map(|input| input.saturating_sub(cached))
+    }
+
+    /// The part of `output` that was the answer: neither reasoning nor audio.
+    pub fn answer_output(&self) -> Option<u64> {
+        let other = self.reasoning.unwrap_or(0) + self.audio_output.unwrap_or(0);
+        self.output.map(|output| output.saturating_sub(other))
+    }
+
+    pub fn total(&self) -> Option<u64> {
+        Some(self.input? + self.output?)
+    }
+}
+
+/// Usage across calls: each count sums what the calls reported, and stays
+/// `None` only when none did.
+impl std::ops::Add for Usage {
+    type Output = Self;
+
+    fn add(self, other: Self) -> Self {
+        let sum = |a: Option<u64>, b: Option<u64>| match (a, b) {
+            (None, None) => None,
+            (a, b) => Some(a.unwrap_or(0) + b.unwrap_or(0)),
+        };
+        Self {
+            input: sum(self.input, other.input),
+            output: sum(self.output, other.output),
+            cache_read: sum(self.cache_read, other.cache_read),
+            cache_write: sum(self.cache_write, other.cache_write),
+            cache_write_long: sum(self.cache_write_long, other.cache_write_long),
+            tool_input: sum(self.tool_input, other.tool_input),
+            audio_input: sum(self.audio_input, other.audio_input),
+            reasoning: sum(self.reasoning, other.reasoning),
+            audio_output: sum(self.audio_output, other.audio_output),
+            hosted_tool_calls: sum(self.hosted_tool_calls, other.hosted_tool_calls),
+        }
+    }
+}
+
+impl std::ops::AddAssign for Usage {
+    fn add_assign(&mut self, other: Self) {
+        *self = *self + other;
+    }
+}
+
+impl std::iter::Sum for Usage {
+    fn sum<I: Iterator<Item = Self>>(iter: I) -> Self {
+        iter.fold(Self::default(), |sum, usage| sum + usage)
     }
 }
 

@@ -110,8 +110,9 @@ struct Draft {
     started: bool,
     item: Value,
     body: Body,
-    /// The text or reasoning streamed so far, to tell a restatement apart.
-    sent: String,
+    /// Whether the provider restated the text or reasoning, so the part
+    /// ends holding something other than what streamed.
+    restated: bool,
 }
 
 enum Body {
@@ -325,7 +326,7 @@ impl Writer {
                 started: false,
                 item,
                 body,
-                sent: String::new(),
+                restated: false,
             },
         );
     }
@@ -358,7 +359,6 @@ impl Writer {
                 ));
             }
         };
-        draft.sent.push_str(fragment);
         let part = draft.part;
         if !draft.started {
             draft.started = true;
@@ -397,7 +397,12 @@ impl Writer {
     pub fn restate(&mut self, index: usize, text: &str) -> Result<(), Error> {
         let draft = self.draft(index)?;
         match &mut draft.body {
-            Body::Text(body) | Body::Reasoning { text: body, .. } => text.clone_into(body),
+            Body::Text(body) | Body::Reasoning { text: body, .. } => {
+                if body != text {
+                    text.clone_into(body);
+                    draft.restated = true;
+                }
+            }
             Body::Call { arguments, .. } => {
                 text.clone_into(&mut arguments.text);
                 // A call not yet started streams the restated text whole.
@@ -678,7 +683,7 @@ impl Writer {
             started,
             item,
             body,
-            sent,
+            restated,
         } = draft;
         let item = match (complete, &body) {
             (true, _) | (false, Body::Opaque { .. } | Body::Media(_)) => item,
@@ -708,6 +713,11 @@ impl Writer {
                 return Ok(());
             }
             Body::Media(media) => {
+                // An image may carry state its producer replays (Gemini's
+                // thought signature); nothing else about it can go stale.
+                if !item.is_null() {
+                    self.items.insert(part, (item, String::new()));
+                }
                 self.whole_part(part, AssistantPart::Media(media));
                 return Ok(());
             }
@@ -766,7 +776,7 @@ impl Writer {
         self.emit(Event::End {
             index: part,
             redacted,
-            text: (text != sent).then_some(text),
+            text: restated.then_some(text),
             call: None,
         });
         Ok(())
