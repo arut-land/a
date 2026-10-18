@@ -2,10 +2,12 @@
 //! it spawns, sleeps and runs blocking work through whichever runtime the
 //! host plugs in, and never names one itself. [`Threads`] is the built-in
 //! runtime; `smol` and `tokio` adapters sit behind features; [`block_on`]
-//! drives a future to completion on the calling thread.
+//! drives a future to completion on the calling thread. [`EventSink`] is
+//! the observability seam, free when off.
 
 mod block;
 pub mod channel;
+mod events;
 #[cfg(feature = "threads")]
 mod threads;
 #[cfg(feature = "threads")]
@@ -22,6 +24,7 @@ use std::sync::{Arc, Condvar, Mutex, MutexGuard, PoisonError};
 use std::time::Duration;
 
 pub use block::block_on;
+pub use events::{Event, EventSink, Noop, Stderr};
 #[cfg(feature = "threads")]
 pub use threads::Threads;
 
