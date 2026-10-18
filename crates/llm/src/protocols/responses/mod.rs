@@ -91,14 +91,10 @@ impl Protocol for Responses {
         Box::new(decode::ResponsesDecoder::new())
     }
 
+    /// The id cut to `[A-Za-z0-9_-]{1,64}`, without trailing `_`.
     fn tool_id(&self, id: &str) -> Option<String> {
         let legal = super::schema::legal_call_id(id, 64);
-        let fitted = match legal.trim_end_matches('_') {
-            // An id with nothing legal in it still names its call.
-            "" => super::schema::short_hash(id),
-            trimmed => trimmed.to_owned(),
-        };
-        (fitted != id).then_some(fitted)
+        super::schema::fit_call_id(id, legal.trim_end_matches('_'))
     }
 }
 

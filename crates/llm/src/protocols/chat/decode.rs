@@ -211,10 +211,9 @@ pub(super) struct ChatDecoder {
     audio_id: Option<Value>,
     /// The calls still open, in the order they opened.
     calls: Vec<OpenCall>,
-    usage: Option<Value>,
     finish: Option<(Reason, SmolStr)>,
-    response_id: Option<SmolStr>,
-    response_model: Option<SmolStr>,
+    /// The reply's id, model and usage object, as the end reports them.
+    end: End,
     /// Whether a finish reason or a whole reply ended the turn.
     ended: bool,
     /// Whether a stream chunk arrived.
@@ -232,10 +231,8 @@ impl ChatDecoder {
             reasoning_details: Map::new(),
             audio_id: None,
             calls: Vec::new(),
-            usage: None,
             finish: None,
-            response_id: None,
-            response_model: None,
+            end: End::default(),
             ended: false,
             chunked: false,
         }
@@ -248,8 +245,8 @@ impl ChatDecoder {
     /// in only when the normalized one is absent or empty.
     fn absorb<'a>(&mut self, frame: Frame<'a>) -> Option<Json<'a, Choice<'a>>> {
         for (slot, value) in [
-            (&mut self.response_id, frame.id.str()),
-            (&mut self.response_model, frame.model.str()),
+            (&mut self.end.response_id, frame.id.str()),
+            (&mut self.end.model, frame.model.str()),
         ] {
             // What every chunk restates is kept, not copied again.
             if let Some(value) = value.filter(|value| slot.as_deref() != Some(*value)) {
@@ -269,7 +266,7 @@ impl ChatDecoder {
             (usage, _) => usage,
         };
         if !usage.is_null() {
-            self.usage = Some(usage);
+            self.end.raw_usage = Some(usage);
         }
         let Some(Json::Object(found)) = &choice else {
             return choice;
@@ -606,18 +603,10 @@ impl ChatDecoder {
     fn end(&mut self) -> Result<Flow, Error> {
         self.close_writing()?;
         self.close_reasoning()?;
-        let usage = self
-            .usage
-            .as_ref()
-            .map_or_default(|usage| usage_of(usage, &self.quirks));
-        self.w.end(End {
-            usage,
-            reason: self.finish.take().map(|(reason, raw)| (reason, Some(raw))),
-            response_id: self.response_id.take(),
-            model: self.response_model.take(),
-            raw_usage: self.usage.take(),
-            ..End::default()
-        })
+        let mut end = std::mem::take(&mut self.end);
+        end.usage = (end.raw_usage.as_ref()).map_or_default(|usage| usage_of(usage, &self.quirks));
+        end.reason = self.finish.take().map(|(reason, raw)| (reason, Some(raw)));
+        self.w.end(end)
     }
 
     /// The stream ended: flush the calls the provider delivered, then end

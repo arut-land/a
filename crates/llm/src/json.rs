@@ -14,9 +14,6 @@ pub(crate) use read::{Json, Str, first, lax, present, tag, word};
 pub trait Lenient {
     fn str(&self, key: &str) -> Option<&str>;
     fn u64(&self, key: &str) -> Option<u64>;
-    fn i64(&self, key: &str) -> Option<i64>;
-    fn f64(&self, key: &str) -> Option<f64>;
-    fn bool(&self, key: &str) -> Option<bool>;
     fn obj(&self, key: &str) -> Option<&Map<String, Value>>;
     /// The array at `key`, empty when absent or of another type.
     fn arr(&self, key: &str) -> &[Value];
@@ -32,18 +29,6 @@ impl Lenient for Value {
 
     fn u64(&self, key: &str) -> Option<u64> {
         self.get(key)?.as_u64_lenient()
-    }
-
-    fn i64(&self, key: &str) -> Option<i64> {
-        number(self.get(key)?, Number::as_i64)
-    }
-
-    fn f64(&self, key: &str) -> Option<f64> {
-        number(self.get(key)?, Number::as_f64)
-    }
-
-    fn bool(&self, key: &str) -> Option<bool> {
-        self.get(key)?.as_bool()
     }
 
     fn obj(&self, key: &str) -> Option<&Map<String, Value>> {

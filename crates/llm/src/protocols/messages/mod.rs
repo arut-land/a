@@ -173,12 +173,7 @@ impl Protocol for Messages {
 
     /// Anthropic takes call ids of `[A-Za-z0-9_-]`, at most 64 long.
     fn tool_id(&self, id: &str) -> Option<String> {
-        let fitted = match super::schema::legal_call_id(id, 64) {
-            // An id with nothing legal in it still names its call.
-            legal if legal.is_empty() => super::schema::short_hash(id),
-            legal => legal,
-        };
-        (fitted != id).then_some(fitted)
+        super::schema::fit_call_id(id, &super::schema::legal_call_id(id, 64))
     }
 
     /// The status decides, refined by the envelope's `error.type` where it

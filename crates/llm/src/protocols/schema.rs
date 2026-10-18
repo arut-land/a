@@ -110,6 +110,18 @@ pub(crate) fn legal_call_id(id: &str, max: usize) -> String {
         .collect()
 }
 
+/// The id a call takes in place of `id`: `fitted`, or a hash of `id` when
+/// nothing legal is left of it, which still names its call; `None` when
+/// `id` already fits.
+pub(crate) fn fit_call_id(id: &str, fitted: &str) -> Option<String> {
+    let fitted = if fitted.is_empty() {
+        short_hash(id)
+    } else {
+        fitted.to_owned()
+    };
+    (fitted != id).then_some(fitted)
+}
+
 /// A short stable hash of `text` (cyrb53, base36), for ids with nothing
 /// legal in them.
 pub(crate) fn short_hash(text: &str) -> String {

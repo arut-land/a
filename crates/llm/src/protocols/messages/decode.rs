@@ -79,18 +79,17 @@ impl DeltaType {
     }
 }
 
-/// How each `stop_reason` ends the turn; any other is [`Reason::Other`].
-/// `pause_turn` is a server-tool loop that stopped at its limit: the turn
-/// is replayed as it is to resume it.
-const STOP_REASONS: [(&str, Reason); 7] = [
-    ("end_turn", Reason::Stop),
-    ("stop_sequence", Reason::Stop),
-    ("pause_turn", Reason::Stop),
-    ("max_tokens", Reason::Length),
-    ("model_context_window_exceeded", Reason::Length),
-    ("tool_use", Reason::ToolCalls),
-    ("refusal", Reason::ContentFilter),
-];
+/// How a `stop_reason` ends the turn. `pause_turn` is a server-tool loop
+/// that stopped at its limit: the turn is replayed as it is to resume it.
+fn stop_reason(stop: &str) -> Reason {
+    match stop {
+        "end_turn" | "stop_sequence" | "pause_turn" => Reason::Stop,
+        "max_tokens" | "model_context_window_exceeded" => Reason::Length,
+        "tool_use" => Reason::ToolCalls,
+        "refusal" => Reason::ContentFilter,
+        _ => Reason::Other,
+    }
+}
 
 /// A `content_block_delta` as nearly every token streams: one string beside
 /// the delta's type, borrowed from the frame unless it is escaped.
@@ -182,11 +181,9 @@ pub(crate) struct MessagesDecoder {
     /// Whether a block other than a leading `fallback` opened.
     opened: bool,
     unsigned_thinking: bool,
-    /// `message_start`'s usage object, then with the terminal delta's over
-    /// it.
-    raw_usage: Option<Value>,
-    message_id: Option<SmolStr>,
-    model: Option<SmolStr>,
+    /// The message's id and model, and its usage object: `message_start`'s,
+    /// then with the terminal delta's over it.
+    end: End,
     container: Option<Value>,
 }
 
@@ -221,9 +218,7 @@ impl MessagesDecoder {
             open: BTreeMap::new(),
             opened: false,
             unsigned_thinking,
-            raw_usage: None,
-            message_id: None,
-            model: None,
+            end: End::default(),
             container: None,
         }
     }
@@ -411,9 +406,9 @@ impl MessagesDecoder {
 
     fn metadata(&mut self, message: &Value) {
         let usage = message.get("usage");
-        self.raw_usage = usage.filter(|usage| usage.is_object()).cloned();
-        self.message_id = message.str("id").map(Into::into);
-        self.model = message.str("model").map(Into::into);
+        self.end.raw_usage = usage.filter(|usage| usage.is_object()).cloned();
+        self.end.response_id = message.str("id").map(Into::into);
+        self.end.model = message.str("model").map(Into::into);
         self.note_container(message.get("container"));
     }
 
@@ -444,11 +439,7 @@ impl MessagesDecoder {
             self.w
                 .whole(index, Open::Opaque { replay: true }, item, "")?;
         }
-        let reason = stop.map(|stop| {
-            let known = STOP_REASONS.iter().find(|(known, _)| *known == stop);
-            let reason = known.map_or(Reason::Other, |(_, reason)| *reason);
-            (reason, Some(stop.into()))
-        });
+        let reason = stop.map(|stop| (stop_reason(stop), Some(stop.into())));
         let message = matches!(reason, Some((Reason::ContentFilter, _))).then(|| {
             let explanation = details.and_then(|details| details.str("explanation"));
             let explanation = explanation.filter(|explanation| !explanation.is_empty());
@@ -459,10 +450,8 @@ impl MessagesDecoder {
         self.w.end(End {
             usage,
             reason,
-            response_id: self.message_id.take(),
-            model: self.model.take(),
             message,
-            raw_usage: self.raw_usage.take(),
+            ..std::mem::take(&mut self.end)
         })
     }
 
@@ -528,9 +517,9 @@ impl MessagesDecoder {
                 let Some(stop) = delta.and_then(|delta| delta.str("stop_reason")) else {
                     return Ok(Flow::More);
                 };
-                let usage = usage(frame.get("usage"), self.raw_usage.as_ref());
+                let usage = usage(frame.get("usage"), self.end.raw_usage.as_ref());
                 if let Some(delta) = frame.obj("usage")
-                    && let Value::Object(raw) = self.raw_usage.get_or_insert_with(|| json!({}))
+                    && let Value::Object(raw) = self.end.raw_usage.get_or_insert_with(|| json!({}))
                 {
                     raw.extend(delta.clone());
                 }
