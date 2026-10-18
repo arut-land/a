@@ -45,3 +45,8 @@ bloat = "cargo bloat --release --crates -n 20"
 "generate:usage" = "UPDATE_USAGE=1 cargo test -q -p a --bin a embedded_spec"
 "bloat:lines" = "cargo llvm-lines --release -p a | head -30"
 deny = "cargo deny check"
+# The black-box M1 acceptance tests (apps/cli/tests) on the dev build.
+acceptance = "cargo nextest run -p a --test acceptance --no-tests=fail"
+# Release binary size, then cold start and idle daemon RSS on it. Latency is
+# only held to its budget off CI; shared runners get slack.
+budgets = { depends = ["size"], run = 'A_BIN=$PWD/target/release/a A_STRICT_BUDGETS=$([[ -n ${CI:-} ]] && echo 0 || echo 1) cargo nextest run -p a --test budgets --test-threads 1 --no-capture' }
