@@ -95,7 +95,7 @@ pub fn replay(agent: &mut dyn Agent, entries: &[Entry]) -> VecDeque<Action> {
                 }
                 continue;
             }
-            Body::ToolProcess { .. } | Body::Hook { .. } => continue,
+            Body::ToolProcess { .. } | Body::Hook { .. } | Body::Environment(_) => continue,
         };
         asked.extend(agent.step(input));
     }

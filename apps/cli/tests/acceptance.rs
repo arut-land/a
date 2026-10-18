@@ -4,10 +4,11 @@
 mod common;
 
 use std::fs;
+use std::os::unix::fs::PermissionsExt;
 use std::process::Command;
 
 use common::{Env, assert_contiguous, group_alive, is_tool_call, result_of, wait_for};
-use protocol::{Body, Outcome, Target};
+use protocol::{Body, ClientMsg, Outcome, Target};
 use serde_json::json;
 
 const ANY: Target = Target::Latest {
@@ -68,7 +69,12 @@ fn resume_after_the_terminal_closes_mid_turn_replays_every_entry() {
     }
     assert_contiguous(&entries);
     assert_eq!(entries, env.log(id));
-    let bodies: Vec<_> = entries.into_iter().map(|e| e.body).collect();
+    let mut bodies: Vec<_> = entries.into_iter().map(|e| e.body).collect();
+    let attached = bodies.remove(0);
+    assert!(
+        matches!(&attached, Body::Environment(shell) if shell.cwd == env.ws),
+        "{attached:?}"
+    );
     assert_eq!(
         bodies,
         [
@@ -101,6 +107,7 @@ fn resume_after_the_terminal_closes_mid_turn_replays_every_entry() {
     assert_eq!(
         shown,
         [
+            &format!("  · env {}", env.ws.display()),
             "you  hello",
             "a    hello",
             "you  sleep 1",
@@ -199,6 +206,70 @@ fn an_unsafe_tool_is_interrupted_and_its_processes_killed_after_the_daemon_is_ki
     let results: Vec<_> = entries.iter().filter_map(|e| result_of(e, call)).collect();
     assert_eq!(results, [&Outcome::Interrupted]);
     assert_eq!(fs::read_to_string(ran).unwrap(), "ran\n");
+}
+
+#[test]
+fn a_command_run_by_the_agent_uses_the_attaching_shells_path_and_virtualenv() {
+    let env = Env::new("shell-env");
+    let venv = env.root.join("venv");
+    fs::create_dir_all(venv.join("bin")).unwrap();
+    let python = venv.join("bin/python");
+    fs::write(&python, "#!/bin/sh\necho \"venv python in $VIRTUAL_ENV\"\n").unwrap();
+    fs::set_permissions(&python, fs::Permissions::from_mode(0o755)).unwrap();
+    let start = || {
+        let started = env.cmd(&["ls"]).env_remove("VIRTUAL_ENV").status();
+        assert!(started.unwrap().success());
+    };
+    start();
+
+    let mut daemons = env.connect();
+    daemons.attach(Target::New, &env.ws);
+    let bare = daemons.run_command(r#"echo "[$VIRTUAL_ENV]""#);
+    assert_eq!(bare["stdout"], "[]\n", "the daemon runs outside the venv");
+
+    let mut shell = env.repl_from(&[], |cmd| {
+        cmd.env(
+            "PATH",
+            format!("{}:/usr/bin:/bin", venv.join("bin").display()),
+        )
+        .env("VIRTUAL_ENV", &venv)
+        .env("DEPLOY_TOKEN", "s3cret");
+    });
+    let session = shell.lines_until("[session").pop().unwrap();
+    let check = r#"python; [ -n "$DEPLOY_TOKEN" ] && echo has-token || echo no-token"#;
+    shell.type_line(&format!("$ {check}"));
+    let shown = shell.lines_until("└");
+    let in_venv = format!("  │ venv python in {}", venv.display());
+    assert!(shown.contains(&in_venv), "{shown:?}");
+    assert!(shown.contains(&"  │ has-token".to_owned()), "{shown:?}");
+    shell.finish();
+
+    // The environment outlives the daemon, without the secret's value.
+    env.run(&["daemon", "stop"]);
+    start();
+    let mut conn = env.connect();
+    let (id, _) = conn.attach(ANY, &env.ws);
+    assert!(session.contains(&id.short().to_string()), "{session}");
+    let after = conn.run_command(check);
+    assert_eq!(
+        after["stdout"],
+        format!("venv python in {}\nno-token\n", venv.display())
+    );
+    let log = fs::read_to_string(env.home.sessions_dir().join(format!("{id}.jsonl"))).unwrap();
+    assert!(
+        log.contains("DEPLOY_TOKEN") && !log.contains("s3cret"),
+        "{log}"
+    );
+
+    // A refresh (`/env refresh`) from a shell that left the venv.
+    let mut outside = protocol::Environment {
+        cwd: env.ws.clone(),
+        ..Default::default()
+    };
+    outside.vars.insert("PATH".into(), "/usr/bin:/bin".into());
+    conn.send(&ClientMsg::Environment(outside));
+    let refreshed = conn.run_command(r#"echo "[$VIRTUAL_ENV]""#);
+    assert_eq!(refreshed["stdout"], "[]\n");
 }
 
 #[test]

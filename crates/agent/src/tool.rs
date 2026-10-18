@@ -2,7 +2,7 @@
 
 use std::path::Path;
 
-use protocol::Outcome;
+use protocol::{Environment, Outcome};
 use serde::Serialize;
 use serde::de::{Deserialize, DeserializeOwned};
 use serde_json::Value;
@@ -17,6 +17,9 @@ pub enum Replay {
 pub struct Cx<'a> {
     /// The session's workspace.
     pub cwd: &'a Path,
+    /// The attaching client's environment, which processes run in. `None`
+    /// (a session no client has described) inherits the daemon's.
+    pub env: Option<&'a Environment>,
     /// Tools that start processes report each process group here, so the
     /// engine can record it durably and kill it if the daemon dies mid-call.
     pub spawned: &'a dyn Fn(u32),

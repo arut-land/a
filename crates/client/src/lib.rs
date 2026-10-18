@@ -6,12 +6,12 @@
 mod remote;
 
 use std::fs::{self, File};
-use std::io::{self, BufReader, Read, Write};
+use std::io::{self, BufReader, IsTerminal, Read, Write};
 use std::path::PathBuf;
 use std::thread;
 use std::time::{Duration, Instant};
 
-use protocol::{ClientMsg, DaemonMsg, PROTO, read_frame, write_frame};
+use protocol::{ClientMsg, DaemonMsg, Environment, PROTO, read_frame, write_frame};
 use sys::{Home, Signal};
 
 #[cfg(unix)]
@@ -27,7 +27,35 @@ pub struct Writer(Box<dyn Write + Send>);
 
 /// A daemon connection, split so reading and writing can run on their own
 /// threads.
-pub type Connection = (Reader, Writer);
+pub struct Connection {
+    pub reader: Reader,
+    pub writer: Writer,
+    /// The far host's environment, as its bridge captured it; `None` for
+    /// this machine's daemon.
+    pub remote: Option<Environment>,
+}
+
+impl Connection {
+    /// The workspace a session attached over this connection works in and
+    /// the environment its commands run with: this process's, or a remote
+    /// daemon's bridge's, never this machine's paths on another.
+    pub fn origin(&self) -> io::Result<(PathBuf, Environment)> {
+        if let Some(env) = &self.remote {
+            return Ok((env.cwd.clone(), env.clone()));
+        }
+        let env = capture()?;
+        Ok((sys::workspace_of(&env.cwd), env))
+    }
+}
+
+/// This process's environment, for the commands a session runs for it.
+pub fn capture() -> io::Result<Environment> {
+    Ok(Environment::new(
+        std::env::current_dir()?,
+        std::env::vars_os(),
+        io::stdin().is_terminal(),
+    ))
+}
 
 impl Reader {
     pub fn recv(&mut self) -> io::Result<Option<DaemonMsg>> {
@@ -85,28 +113,28 @@ pub fn connect(
     // A daemon exiting (idle) as we connect, or draining, gets one more try
     // each.
     for _ in 0..3 {
-        let (stream, (mut reader, mut writer)) = match endpoint {
+        let (stream, mut conn) = match endpoint {
             Endpoint::Local(home) => {
                 let stream = connect_or_spawn(home)?;
                 stream.set_read_timeout(Some(HELLO_TIMEOUT))?;
-                let halves = split(&stream)?;
-                (Some(stream), halves)
+                let conn = split(&stream)?;
+                (Some(stream), conn)
             }
             Endpoint::Ssh(host) => (None, remote::open(host, staged)?),
         };
-        match hello(&mut reader, &mut writer, &staged.id) {
+        match hello(&mut conn.reader, &mut conn.writer, &staged.id) {
             Ok(Greeting::Welcome) => {
                 if let Some(stream) = &stream {
                     stream.set_read_timeout(None)?;
                 }
-                return Ok((reader, writer));
+                return Ok(conn);
             }
             Ok(Greeting::Draining) => {
                 on_drain();
                 if let Some(stream) = &stream {
                     stream.set_read_timeout(Some(DRAIN_TIMEOUT))?;
                 }
-                reader.drained()?;
+                conn.reader.drained()?;
             }
             Err(e) if e.kind() == io::ErrorKind::UnexpectedEof => {}
             Err(e) => return Err(e),
@@ -117,10 +145,11 @@ pub fn connect(
 
 #[cfg(unix)]
 fn split(stream: &UnixStream) -> io::Result<Connection> {
-    Ok((
-        Reader(BufReader::new(Box::new(stream.try_clone()?))),
-        Writer(Box::new(stream.try_clone()?)),
-    ))
+    Ok(Connection {
+        reader: Reader(BufReader::new(Box::new(stream.try_clone()?))),
+        writer: Writer(Box::new(stream.try_clone()?)),
+        remote: None,
+    })
 }
 
 enum Greeting {
@@ -217,15 +246,19 @@ pub fn restart(home: &Home, staged: &Staged) -> io::Result<Connection> {
 }
 
 /// Serves `ssh <host> a bridge`: connects to this machine's daemon, prints
-/// the `A-BRIDGE <token>` sync line so the far side can skip whatever the
-/// login shell printed, then pipes stdin and stdout to the socket verbatim.
-/// The far client does its own hello. Ends when either side closes: the
-/// daemon may keep a connection open after its client is done.
+/// the `A-BRIDGE <token> <environment>` sync line so the far side can skip
+/// whatever the login shell printed, then pipes stdin and stdout to the
+/// socket verbatim. The environment, as JSON, is this side's: the far
+/// client attaches with it, so commands run with this host's `PATH` in this
+/// host's directories. The far client does its own hello. Ends when either
+/// side closes: the daemon may keep a connection open after its client is
+/// done.
 #[cfg(unix)]
 pub fn bridge(home: &Home, token: &str) -> io::Result<()> {
     let stream = connect_or_spawn(home)?;
+    let env = capture()?.to_json();
     let mut stdout = io::stdout().lock();
-    writeln!(stdout, "{} {token}", remote::SYNC)?;
+    writeln!(stdout, "{} {token} {env}", remote::SYNC)?;
     stdout.flush()?;
     let mut up = stream.try_clone()?;
     thread::spawn(move || {

@@ -7,6 +7,7 @@ use std::process::{Child, Command, Stdio};
 use std::thread;
 use std::time::{SystemTime, UNIX_EPOCH};
 
+use protocol::{Decode, Environment};
 use sys::Staged;
 
 use crate::{Connection, Reader, Writer};
@@ -46,7 +47,7 @@ fn bridge(host: &str, script: &str, token: &str) -> io::Result<Option<Connection
     let mut out = BufReader::new(stdout);
     let sync = format!("{SYNC} {token}");
     let mut line = Vec::new();
-    loop {
+    let remote = loop {
         line.clear();
         if out.read_until(b'\n', &mut line)? == 0 {
             return match child.wait()?.code() {
@@ -56,14 +57,26 @@ fn bridge(host: &str, script: &str, token: &str) -> io::Result<Option<Connection
                 ))),
             };
         }
-        if line.trim_ascii_end() == sync.as_bytes() {
-            break;
+        match line.trim_ascii_end().strip_prefix(sync.as_bytes()) {
+            Some([b' ', env @ ..]) => break Environment::from_json(env)?,
+            // Without the host's environment, commands would run with this
+            // machine's paths there.
+            Some([]) => {
+                return Err(io::Error::other(format!(
+                    "the `a` on {host} is too old to report its environment; update it"
+                )));
+            }
+            _ => {}
         }
-    }
+    };
     let stdin = child.stdin.take().expect("piped");
     // Reaps ssh once the connection is closed.
     thread::spawn(move || reap(child));
-    Ok(Some((Reader(out), Writer(Box::new(stdin)))))
+    Ok(Some(Connection {
+        reader: Reader(out),
+        writer: Writer(Box::new(stdin)),
+        remote: Some(remote),
+    }))
 }
 
 fn reap(mut child: Child) {

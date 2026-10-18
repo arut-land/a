@@ -46,8 +46,7 @@ impl Tool for RunCommand {
     type Out = Ran;
 
     const NAME: &'static str = "run_command";
-    const DESCRIPTION: &'static str =
-        "Runs a shell command in the workspace and returns its exit code, stdout and stderr.";
+    const DESCRIPTION: &'static str = "Runs a shell command in the user's working directory and environment and returns its exit code, stdout and stderr.";
 
     fn schema() -> Value {
         object(&json!({ "command": { "type": "string", "description": "The command line." } }))
@@ -60,8 +59,17 @@ impl Tool for RunCommand {
             ("sh", "-c")
         };
         let mut cmd = Process::new(shell);
+        let mut cwd = cx.cwd;
+        if let Some(env) = cx.env {
+            cmd.env_clear().envs(&env.vars);
+            // A directory removed since the capture falls back to the
+            // workspace rather than failing every command.
+            if env.cwd.is_dir() {
+                cwd = &env.cwd;
+            }
+        }
         cmd.args([flag, &input.command])
-            .current_dir(cx.cwd)
+            .current_dir(cwd)
             .stdin(Stdio::null())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped());
@@ -181,8 +189,38 @@ mod tests {
     fn cx(cwd: &Path) -> Cx<'_> {
         Cx {
             cwd,
+            env: None,
             spawned: &|_| {},
         }
+    }
+
+    #[test]
+    fn commands_run_in_the_clients_environment() {
+        let dir = std::env::temp_dir();
+        let sub = dir.join(format!("a-run-env-{}", std::process::id()));
+        std::fs::create_dir_all(&sub).unwrap();
+        let env = protocol::Environment {
+            cwd: std::fs::canonicalize(&sub).unwrap(),
+            vars: [("PATH", "/usr/bin:/bin"), ("ONLY_HERE", "1")]
+                .map(|(k, v)| (k.to_owned(), v.to_owned()))
+                .into(),
+            ..Default::default()
+        };
+        let cx = Cx {
+            env: Some(&env),
+            ..cx(&dir)
+        };
+        let script = json!({ "command": "echo \"$ONLY_HERE $HOME\"; pwd -P" });
+        let ran = DynTool::call(&RunCommand, &script, &cx);
+        std::fs::remove_dir_all(&sub).unwrap();
+        let protocol::Outcome::Done { output } = ran else {
+            panic!("{ran:?}")
+        };
+        assert_eq!(
+            output["stdout"],
+            format!("1 \n{}\n", env.cwd.display()),
+            "only the captured variables, in the captured directory"
+        );
     }
 
     #[test]
