@@ -8,7 +8,7 @@ use std::fs::{File, OpenOptions};
 use std::io::{self, BufReader, Write};
 use std::path::{Path, PathBuf};
 use std::str::FromStr;
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError, mpsc};
 use std::thread;
 use std::time::{Duration, Instant};
@@ -105,6 +105,9 @@ struct Daemon {
 struct Slot {
     header: Header,
     live: Mutex<Option<Arc<Session>>>,
+    /// The parent has fired its watch on this child, so reports are moot.
+    /// Known only since this daemon started.
+    heard: AtomicBool,
 }
 
 impl Daemon {
@@ -119,6 +122,7 @@ impl Daemon {
                 Arc::new(Slot {
                     header,
                     live: Mutex::new(None),
+                    heard: AtomicBool::new(false),
                 })
             })
             .collect();
@@ -190,6 +194,7 @@ impl Daemon {
             id: SessionId::new(),
             workspace,
             parent: None,
+            extensions: session::installed(&self.shared.registry),
         };
         let loaded = self.shared.store.create(&header)?;
         let session = Session::start(header.clone(), loaded, Arc::clone(&self.shared));
@@ -197,6 +202,7 @@ impl Daemon {
         lock(&self.slots).push(Arc::new(Slot {
             header,
             live: Mutex::new(Some(session)),
+            heard: AtomicBool::new(false),
         }));
         Ok(attachment)
     }

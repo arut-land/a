@@ -20,9 +20,45 @@ pub use hooks::{AskFor, Decided, Gate, Hook, Hooks, Pre};
 pub use tool::{Cx, DynTool, Replay, Tool, Toolset};
 
 pub enum Input {
-    User { text: String },
-    ToolDone { call: u64, outcome: Outcome },
-    ModelDone { call: u64, outcome: Outcome },
+    User {
+        text: String,
+    },
+    ToolDone {
+        call: u64,
+        outcome: Outcome,
+    },
+    ModelDone {
+        call: u64,
+        outcome: Outcome,
+    },
+    /// Watch `watch` fired: the child it watched settled with `outcome`.
+    ChildDone {
+        watch: u64,
+        outcome: Outcome,
+    },
+}
+
+/// The most of a child's result a parent's model sees, in bytes: about 8k
+/// tokens.
+pub const CHILD_RESULT_LIMIT: usize = 32 * 1024;
+
+/// A child's result as its parent's agent reads it, cut to
+/// [`CHILD_RESULT_LIMIT`].
+pub fn child_result(outcome: &Outcome) -> String {
+    let text = match outcome {
+        Outcome::Done {
+            output: Value::String(text),
+        } => format!("The child session finished:\n{text}"),
+        Outcome::Done { output } => format!("The child session finished:\n{output}"),
+        Outcome::Failed { error } => format!("The child session failed: {error}"),
+        Outcome::Interrupted => "The child session was interrupted.".to_owned(),
+    };
+    if text.len() > CHILD_RESULT_LIMIT {
+        let cut = text.floor_char_boundary(CHILD_RESULT_LIMIT);
+        let left = text.len() - cut;
+        return format!("{}\n[{left} more bytes not shown]", &text[..cut]);
+    }
+    text
 }
 
 #[derive(Debug, PartialEq)]
@@ -95,7 +131,8 @@ pub struct Chat {
 impl Agent for Chat {
     fn step(&mut self, input: Input) -> Vec<Action> {
         match input {
-            Input::User { .. } => {
+            // A child's result arrives between turns, so it starts one.
+            Input::User { .. } | Input::ChildDone { .. } => {
                 (self.steps, self.pending) = (1, 0);
                 vec![Action::CallModel]
             }
@@ -154,8 +191,13 @@ pub struct Echo;
 
 impl Agent for Echo {
     fn step(&mut self, input: Input) -> Vec<Action> {
-        let Input::User { text } = input else {
-            return Vec::new();
+        let text = match input {
+            Input::User { text } => text,
+            Input::ChildDone { outcome, .. } => {
+                let text = child_result(&outcome);
+                return vec![Action::Emit(Body::Assistant { text })];
+            }
+            Input::ToolDone { .. } | Input::ModelDone { .. } => return Vec::new(),
         };
         if let Some(input) = text.strip_prefix("spawn ") {
             return vec![Action::Spawn {
@@ -208,6 +250,38 @@ mod tests {
                 input: "sleep 1".into()
             }]
         );
+    }
+
+    #[test]
+    fn agents_hear_a_childs_result() {
+        let done = |output: Value| Input::ChildDone {
+            watch: 3,
+            outcome: Outcome::Done { output },
+        };
+        assert_eq!(
+            Echo.step(done("hi".into())),
+            [Action::Emit(Body::Assistant {
+                text: "The child session finished:\nhi".into()
+            })]
+        );
+        let mut chat = Chat::default();
+        assert_eq!(chat.step(done("hi".into())), [Action::CallModel]);
+        assert_eq!(chat.step(reply(&[])), NOTHING);
+    }
+
+    #[test]
+    fn a_childs_result_is_cut_for_the_model() {
+        let long = "é".repeat(CHILD_RESULT_LIMIT);
+        let text = child_result(&Outcome::Done {
+            output: long.into(),
+        });
+        let (shown, note) = text.rsplit_once('\n').unwrap();
+        assert!(shown.len() <= CHILD_RESULT_LIMIT);
+        assert!(note.starts_with('[') && note.ends_with("more bytes not shown]"));
+        let failed = Outcome::Failed {
+            error: "boom".into(),
+        };
+        assert_eq!(child_result(&failed), "The child session failed: boom");
     }
 
     #[test]

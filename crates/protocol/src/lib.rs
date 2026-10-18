@@ -132,6 +132,19 @@ pub enum Body {
     /// The environment the session's commands run in from here on, as the
     /// attaching client captured it, secrets redacted.
     Environment(Environment),
+    /// The extensions the session runs with from here on, in install order,
+    /// logged when they differ from those its header or an earlier entry
+    /// records.
+    Extensions {
+        installed: Vec<Installed>,
+    },
+}
+
+/// An extension a session ran with.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Installed {
+    pub name: String,
+    pub version: u32,
 }
 
 /// A client's shell environment: what a command the agent runs for it sees.

@@ -418,7 +418,8 @@ impl View {
             Body::ToolProcess { .. }
             | Body::ModelCall { .. }
             | Body::Ask { .. }
-            | Body::Watch { .. } => {}
+            | Body::Watch { .. }
+            | Body::Extensions { .. } => {}
         }
     }
 }

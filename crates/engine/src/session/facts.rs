@@ -23,6 +23,9 @@ pub fn transcript(entries: &[Entry], before: u64, tools: &Toolset) -> Vec<Messag
                 ..
             } => messages.push(Message::user(text.clone())),
             Body::Assistant { text } => messages.push(Message::assistant(text.clone())),
+            Body::Fired { outcome, .. } => {
+                messages.push(Message::user(agent::child_result(outcome)));
+            }
             Body::ModelResult {
                 outcome: Outcome::Done { output },
                 ..
@@ -85,6 +88,10 @@ pub fn replay(agent: &mut dyn Agent, entries: &[Entry]) -> VecDeque<Action> {
                 call: *call,
                 outcome: outcome.clone(),
             },
+            Body::Fired { watch, outcome } => Input::ChildDone {
+                watch: *watch,
+                outcome: outcome.clone(),
+            },
             Body::Assistant { .. }
             | Body::ToolCall { .. }
             | Body::ModelCall { .. }
@@ -102,8 +109,8 @@ pub fn replay(agent: &mut dyn Agent, entries: &[Entry]) -> VecDeque<Action> {
             | Body::Hook { .. }
             | Body::Ask { .. }
             | Body::Watch { .. }
-            | Body::Fired { .. }
-            | Body::Environment(_) => continue,
+            | Body::Environment(_)
+            | Body::Extensions { .. } => continue,
         };
         asked.extend(agent.step(input));
     }

@@ -12,7 +12,9 @@ use std::task::{Poll, Waker};
 use std::time::{Duration, Instant};
 
 use agent::{Action, Agent, Cx, Decided, DynTool, Gate, Input, Replay};
-use protocol::{Body, DaemonMsg, Decision, Entry, Environment, Outcome, SessionId, SessionSummary};
+use protocol::{
+    Body, DaemonMsg, Decision, Entry, Environment, Installed, Outcome, SessionId, SessionSummary,
+};
 use serde_json::Value;
 use store::{Header, Loaded, Log, LogStore, Parent};
 
@@ -41,11 +43,17 @@ pub struct Shared {
 }
 
 pub struct Session {
+    /// This session, for the jobs that commit its entries.
+    this: Weak<Session>,
     pub id: SessionId,
     pub workspace: PathBuf,
     /// The call that owns this session, if it is a child.
     parent: Option<Parent>,
     state: Mutex<State>,
+    /// The appender; only the job draining `queue` writes to it.
+    log: Mutex<Box<dyn Log>>,
+    /// Entries waiting to be committed, in order.
+    queue: Mutex<Queue>,
     /// The actor's messages. The session's inbox, what waits for the user,
     /// is in its log: see [`facts::inbox`].
     mailbox: rt::channel::Sender<Msg>,
@@ -74,8 +82,19 @@ enum Msg {
 
 struct State {
     entries: Vec<Entry>,
-    log: Box<dyn Log>,
     clients: Vec<Sender<DaemonMsg>>,
+}
+
+/// Where an entry's commit is reported: its seq, or why it failed.
+type Committed = rt::channel::Sender<io::Result<u64>>;
+
+/// Entries to commit, in the order they were appended. While `draining`, one
+/// blocking job commits them, so log writes and their fsyncs stay off the
+/// async workers and an entry is visible only after every earlier one.
+#[derive(Default)]
+struct Queue {
+    pending: VecDeque<(Body, Option<Committed>)>,
+    draining: bool,
 }
 
 /// Answers to the inbox's asks, until the actor takes them. `stopped` wakes
@@ -124,22 +143,27 @@ impl Session {
     /// one logged: a child runs in its parent's, secrets included.
     fn start_in(
         header: Header,
-        loaded: Loaded,
+        mut loaded: Loaded,
         shared: Arc<Shared>,
         env: Option<Environment>,
     ) -> Arc<Self> {
+        if let Err(e) = note_extensions(&header, &mut loaded, &shared.registry) {
+            eprintln!("session {}: recording extensions: {e}", header.id.short());
+        }
         let (mailbox, rx) = rt::channel::unbounded();
         let armed = links::armed(&loaded.entries).count();
         let env = env.or_else(|| logged_env(&loaded.entries).cloned());
-        let session = Arc::new(Self {
+        let session = Arc::new_cyclic(|this| Self {
+            this: this.clone(),
             id: header.id,
             workspace: header.workspace,
             parent: header.parent,
             state: Mutex::new(State {
                 entries: loaded.entries,
-                log: loaded.log,
                 clients: Vec::new(),
             }),
+            log: Mutex::new(loaded.log),
+            queue: Mutex::default(),
             mailbox,
             answers: Mutex::default(),
             // Recovery counts as queued work until it has run, and every
@@ -236,7 +260,7 @@ impl Session {
         if logged_env(&self.lock().entries) == Some(&logged) {
             return Ok(());
         }
-        self.append(Body::Environment(logged)).map(drop)
+        rt::block_on(self.append(Body::Environment(logged))).map(drop)
     }
 
     pub fn summary(&self) -> SessionSummary {
@@ -260,16 +284,68 @@ impl Session {
         eprintln!("session {}: {problem}", self.id.short());
     }
 
-    /// Commits an entry; only committed entries are ever shown to clients.
-    fn append(&self, body: Body) -> io::Result<u64> {
-        let mut st = self.lock();
-        let seq = st.entries.len() as u64 + 1;
+    /// Commits an entry, returning its seq; only committed entries are ever
+    /// shown to clients.
+    async fn append(&self, body: Body) -> io::Result<u64> {
+        let (tx, rx) = rt::channel::bounded(1);
+        self.enqueue(body, Some(tx));
+        rx.recv()
+            .await
+            .unwrap_or_else(|| Err(io::Error::other("the log writer stopped")))
+    }
+
+    /// Queues an entry to commit after every entry queued before it, and
+    /// starts the job that commits them unless it runs already.
+    fn enqueue(&self, body: Body, committed: Option<Committed>) {
+        let mut queue = lock(&self.queue);
+        queue.pending.push_back((body, committed));
+        if !std::mem::replace(&mut queue.draining, true)
+            && let Some(this) = self.this.upgrade()
+        {
+            self.shared
+                .rt
+                .spawn_blocking(Box::new(move || this.drain()));
+        }
+    }
+
+    /// Commits queued entries until none are left.
+    fn drain(&self) {
+        loop {
+            let next = {
+                let mut queue = lock(&self.queue);
+                let next = queue.pending.pop_front();
+                queue.draining = next.is_some();
+                next
+            };
+            let Some((body, committed)) = next else {
+                return;
+            };
+            let result = catch_unwind(AssertUnwindSafe(|| self.commit(body)))
+                .unwrap_or_else(|_| Err(io::Error::other("committing an entry panicked")));
+            match committed {
+                Some(tx) => drop(tx.send(result)),
+                None => {
+                    if let Err(e) = result {
+                        self.warn(e);
+                    }
+                }
+            }
+        }
+    }
+
+    /// Writes an entry durably, then shows it. Only [`Session::drain`] calls
+    /// it, so entries commit one at a time and in order.
+    fn commit(&self, body: Body) -> io::Result<u64> {
+        let mut log = lock(&self.log);
+        let seq = self.lock().entries.len() as u64 + 1;
         let entry = Entry {
             seq,
             epoch: 0,
             body,
         };
-        st.log.append(&entry)?;
+        log.append(&entry)?;
+        drop(log);
+        let mut st = self.lock();
         st.clients
             .retain(|c| c.send(DaemonMsg::Entry(entry.clone())).is_ok());
         self.shared.registry.hooks().observe(&entry);
@@ -289,7 +365,7 @@ impl Session {
     /// Commits what the hooks decided. Decisions that repeat the hook
     /// entries ending the log are a gate recovery runs again because a crash
     /// cut it off before its effect was committed: they are logged once.
-    fn decide(&self, decided: Decided) -> io::Result<()> {
+    async fn decide(&self, decided: Decided) -> io::Result<()> {
         let decided: Vec<Body> = decided
             .into_iter()
             .map(|(hook, decision)| Body::Hook {
@@ -299,21 +375,21 @@ impl Session {
             .collect();
         {
             let st = self.lock();
-            let tail = st
+            // What a restart logs before recovery runs is not part of it.
+            let logged: Vec<&Body> = st
                 .entries
                 .iter()
                 .rev()
-                .take_while(|e| matches!(e.body, Body::Hook { .. }))
-                .count();
-            let logged = st.entries[st.entries.len() - tail..]
-                .iter()
-                .map(|e| &e.body);
-            if tail > 0 && logged.eq(&decided) {
+                .map(|e| &e.body)
+                .filter(|b| !matches!(b, Body::Extensions { .. } | Body::Environment(_)))
+                .take_while(|b| matches!(b, Body::Hook { .. }))
+                .collect();
+            if !logged.is_empty() && logged.into_iter().rev().eq(&decided) {
                 return Ok(());
             }
         }
         for body in decided {
-            self.append(body)?;
+            self.append(body).await?;
         }
         Ok(())
     }
@@ -330,13 +406,15 @@ impl Session {
             match msg {
                 Msg::Input(text) => {
                     self.work(async {
-                        self.append(Body::User { text: text.clone() })?;
+                        self.append(Body::User { text: text.clone() }).await?;
                         let inputs = VecDeque::from([Input::User { text }]);
                         self.drive(agent.as_mut(), VecDeque::new(), inputs).await
                     })
                     .await;
                 }
-                Msg::Settled { child, outcome } => self.fire(child, &outcome).await,
+                Msg::Settled { child, outcome } => {
+                    self.fire(agent.as_mut(), child, outcome).await;
+                }
                 Msg::Stop => return,
             }
         }
@@ -345,21 +423,25 @@ impl Session {
     /// Runs one queued unit of work, with a busy marker on disk for as long
     /// as anything is in flight.
     async fn work(&self, job: impl Future<Output = io::Result<()>>) {
-        let store = &self.shared.store;
-        if let Err(e) = store.mark_busy(self.id, true) {
+        if let Err(e) = self.mark_busy(true).await {
             self.warn(format_args!("busy marker: {e}"));
         }
         if let Err(e) = job.await {
             self.warn(e);
         }
         let settled = self.queued.fetch_sub(1, Ordering::SeqCst) == 1;
-        if settled && let Err(e) = store.mark_busy(self.id, false) {
+        if settled && let Err(e) = self.mark_busy(false).await {
             self.warn(format_args!("busy marker: {e}"));
         }
         self.touch();
         if settled {
-            self.report();
+            self.report().await;
         }
+    }
+
+    async fn mark_busy(&self, busy: bool) -> io::Result<()> {
+        let (store, id) = (Arc::clone(&self.shared.store), self.id);
+        rt::unblock(&*self.shared.rt, move || store.mark_busy(id, busy)).await
     }
 
     /// Runs `actions`, then steps the agent with `inputs` and every input
@@ -390,7 +472,7 @@ impl Session {
                 .registry
                 .hooks()
                 .on_stop(&self.lock().entries, &mut decided);
-            self.decide(decided)?;
+            self.decide(decided).await?;
             match next {
                 Some(text) => inputs.push_back(Input::User { text }),
                 None => return Ok(()),
@@ -403,11 +485,11 @@ impl Session {
     async fn act(&self, action: Action) -> io::Result<Option<Input>> {
         let (call, seq, outcome) = match action {
             Action::Emit(body) => {
-                self.append(body)?;
+                self.append(body).await?;
                 return Ok(None);
             }
             Action::Spawn { input } => {
-                self.spawn(&input)?;
+                self.spawn(input).await?;
                 return Ok(None);
             }
             Action::CallModel => {
@@ -416,7 +498,7 @@ impl Session {
                     .model
                     .as_ref()
                     .map_or_else(|_| "none".to_owned(), Model::name);
-                let seq = self.append(Body::ModelCall { model })?;
+                let seq = self.append(Body::ModelCall { model }).await?;
                 (Call::Model, seq, self.run_model(seq).await)
             }
             Action::RunTool {
@@ -434,18 +516,20 @@ impl Session {
                             .registry
                             .hooks()
                             .gate(&tool, &mut input, &mut decided);
-                    self.decide(decided)?;
+                    self.decide(decided).await?;
                     verdict
                 };
-                let seq = self.append(Body::ToolCall {
-                    tool: tool.clone(),
-                    input: input.clone(),
-                    id,
-                })?;
+                let seq = self
+                    .append(Body::ToolCall {
+                        tool: tool.clone(),
+                        input: input.clone(),
+                        id,
+                    })
+                    .await?;
                 let outcome = match gate {
                     Ok(Gate::Run) => self.run_tool(seq, &tool, &input).await,
                     Ok(Gate::Ask) => {
-                        self.append(Body::Ask { call: seq })?;
+                        self.append(Body::Ask { call: seq }).await?;
                         self.ask(seq, &tool, &input).await?
                     }
                     Err(error) => Outcome::Failed { error },
@@ -453,7 +537,7 @@ impl Session {
                 (Call::Tool { tool, input }, seq, outcome)
             }
         };
-        self.finish(&call, seq, outcome).map(Some)
+        self.finish(&call, seq, outcome).await.map(Some)
     }
 
     /// Waits for the user's answer to the ask for call `seq`, logs it, and
@@ -467,7 +551,8 @@ impl Session {
                 approved,
                 call: Some(seq),
             },
-        })?;
+        })
+        .await?;
         Ok(if approved {
             self.run_tool(seq, tool, input).await
         } else {
@@ -511,7 +596,7 @@ impl Session {
 
     /// Commits the outcome of call `seq`, as the `post_tool` hooks leave a
     /// tool's; returns the input that reports it to the agent.
-    fn finish(&self, call: &Call, seq: u64, mut outcome: Outcome) -> io::Result<Input> {
+    async fn finish(&self, call: &Call, seq: u64, mut outcome: Outcome) -> io::Result<Input> {
         let (body, input) = match call {
             Call::Model => (
                 Body::ModelResult {
@@ -524,7 +609,7 @@ impl Session {
                 let mut decided = Decided::new();
                 let hooks = self.shared.registry.hooks();
                 hooks.post_tool(seq, (tool, input), &mut outcome, &mut decided);
-                self.decide(decided)?;
+                self.decide(decided).await?;
                 (
                     Body::ToolResult {
                         call: seq,
@@ -534,11 +619,12 @@ impl Session {
                 )
             }
         };
-        self.append(body)?;
+        self.append(body).await?;
         Ok(input)
     }
 
     async fn run_tool(&self, call: u64, tool: &str, input: &Value) -> Outcome {
+        // Queued without waiting: it still commits before the call's result.
         let spawned = |pgid| {
             let Some(boot) = sys::boot_id() else { return };
             let body = Body::ToolProcess {
@@ -546,9 +632,7 @@ impl Session {
                 pgid,
                 boot: boot.to_owned(),
             };
-            if let Err(e) = self.append(body) {
-                self.warn(format_args!("recording process {pgid}: {e}"));
-            }
+            self.enqueue(body, None);
         };
         let env = lock(&self.env).clone();
         let cx = Cx {
@@ -580,7 +664,7 @@ impl Session {
             .registry
             .hooks()
             .prepare_step(call, &mut request, &mut decided);
-        if let Err(e) = self.decide(decided) {
+        if let Err(e) = self.decide(decided).await {
             return Outcome::Failed {
                 error: e.to_string(),
             };
@@ -615,7 +699,7 @@ impl Session {
     /// marked interrupted, asks still waiting asked again); then whatever
     /// the agent asked for that the log does not show runs.
     async fn recover(&self, agent: &mut dyn Agent) -> io::Result<()> {
-        self.relink()?;
+        self.relink().await?;
         let (dangling, actions) = {
             let st = self.lock();
             (dangling_calls(&st.entries), replay(agent, &st.entries))
@@ -649,10 +733,58 @@ impl Session {
                 }
                 _ => self.run_call(&call, seq).await,
             };
-            inputs.push_back(self.finish(&call, seq, outcome)?);
+            inputs.push_back(self.finish(&call, seq, outcome).await?);
         }
         self.drive(agent, actions, inputs).await
     }
+}
+
+/// Logs the registry's extensions before the session's first step, unless
+/// they are the ones its log records last.
+fn note_extensions(
+    header: &Header,
+    loaded: &mut Loaded,
+    registry: &agent::Registry,
+) -> io::Result<()> {
+    let recorded = loaded
+        .entries
+        .iter()
+        .rev()
+        .find_map(|e| match &e.body {
+            Body::Extensions { installed } => Some(installed),
+            _ => None,
+        })
+        .unwrap_or(&header.extensions);
+    let same = recorded
+        .iter()
+        .map(|i| (i.name.as_str(), i.version))
+        .eq(registry
+            .extensions()
+            .map(|(name, version)| (name as &str, version)));
+    if same {
+        return Ok(());
+    }
+    let entry = Entry {
+        seq: loaded.entries.len() as u64 + 1,
+        epoch: 0,
+        body: Body::Extensions {
+            installed: installed(registry),
+        },
+    };
+    loaded.log.append(&entry)?;
+    loaded.entries.push(entry);
+    Ok(())
+}
+
+/// The registry's extensions as a log records them.
+pub fn installed(registry: &agent::Registry) -> Vec<Installed> {
+    registry
+        .extensions()
+        .map(|(name, version)| Installed {
+            name: name.to_owned(),
+            version,
+        })
+        .collect()
 }
 
 /// The environment most recently logged.

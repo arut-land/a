@@ -84,6 +84,8 @@ fn busy_sessions_recover_at_startup() {
             id,
             workspace: "/w".into(),
             parent: None,
+            // As an earlier version wrote it.
+            extensions: Vec::new(),
         })
         .unwrap()
         .log;
@@ -112,19 +114,21 @@ fn busy_sessions_recover_at_startup() {
     let still_busy = store.is_busy(id);
     std::fs::remove_dir_all(&root).unwrap();
 
-    // The safe sleep runs again; the shell command is not rerun.
+    // The log's header predates extension records, so recovery notes them
+    // first. The safe sleep runs again; the shell command is not rerun.
+    assert!(matches!(&got[2], Body::Extensions { installed } if installed.len() == 2));
     assert!(matches!(
-        &got[2],
+        &got[3],
         Body::ToolResult { call: 1, outcome: Outcome::Done { output } } if output["slept"] == 0
     ));
     assert!(matches!(
-        &got[3],
+        &got[4],
         Body::ToolResult {
             call: 2,
             outcome: Outcome::Interrupted
         }
     ));
-    assert_eq!(got.len(), 4);
+    assert_eq!(got.len(), 5);
     assert!(!still_busy);
 }
 
@@ -159,6 +163,15 @@ fn a_parent_hears_from_its_child_exactly_once() {
     };
     let resumed = daemon.resolve(&latest, "/w".into()).unwrap().session().id;
     settle(&daemon);
+    // The child working again reports nothing: the parent's watch fired,
+    // so the hibernated parent stays unloaded.
+    daemon.hibernate(Duration::ZERO);
+    let again = daemon.resolve(&Target::Id(child), "/w".into()).unwrap();
+    again.session().submit("more".into());
+    settle(&daemon);
+    drop(again);
+    let parent_slot = daemon.slots().into_iter().find(|s| s.header.id == id);
+    let parent_loaded = parent_slot.unwrap().live.lock().unwrap().is_some();
     drop(daemon);
 
     // A restart finds nothing left to fire.
@@ -181,8 +194,12 @@ fn a_parent_hears_from_its_child_exactly_once() {
                     output: "hi".into()
                 }
             },
+            Body::Assistant {
+                text: "The child session finished:\nhi".into()
+            },
         ]
     );
+    assert!(!parent_loaded, "a moot report loaded the parent");
     assert_eq!(child_header.unwrap().parent.unwrap().call, 2);
     assert_eq!(resumed, id, "resuming picks the parent, not its child");
     assert_eq!(
@@ -245,6 +262,7 @@ fn watches_rearm_after_a_crash_and_fire_once() {
         id: SessionId::new(),
         workspace: "/w".into(),
         parent: parent.map(|session| store::Parent { session, call: 2 }),
+        extensions: Vec::new(),
     };
     let spawned = |child: SessionId, watched: bool| {
         let mut bodies = vec![

@@ -92,6 +92,10 @@ fn header(workspace: &str) -> Header {
         id: SessionId::new(),
         workspace: workspace.into(),
         parent: None,
+        extensions: vec![Installed {
+            name: "builtin".into(),
+            version: 1,
+        }],
     }
 }
 
@@ -259,6 +263,21 @@ fn jsonl_drops_a_torn_tail_and_appends_after_it() {
         assert_eq!(store.load(h.id).unwrap().entries, written);
         assert_eq!(store.count(h.id).unwrap(), 4);
     }
+}
+
+#[test]
+fn jsonl_headers_from_before_extension_records_load() {
+    let store = jsonl();
+    let id = SessionId::new();
+    let path = store.dir.as_ref().unwrap().join(format!("{id}.jsonl"));
+    fs::write(
+        &path,
+        format!("{{\"id\":\"{}\",\"workspace\":\"/w\"}}\n", id.0),
+    )
+    .unwrap();
+    let headers = store.headers().unwrap();
+    assert_eq!(headers.len(), 1);
+    assert_eq!(headers[0].extensions, []);
 }
 
 #[test]

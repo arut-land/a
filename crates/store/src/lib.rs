@@ -11,7 +11,7 @@ mod tests;
 use std::io;
 use std::path::PathBuf;
 
-use protocol::{Entry, SessionId};
+use protocol::{Entry, Installed, SessionId};
 use serde::{Deserialize, Serialize};
 
 pub use jsonl::Jsonl;
@@ -24,6 +24,10 @@ pub struct Header {
     /// The session and call that own this one, if it is a child.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub parent: Option<Parent>,
+    /// The extensions the session was created with; a later
+    /// [`protocol::Body::Extensions`] entry supersedes them.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub extensions: Vec<Installed>,
 }
 
 /// Where a child session hangs off its parent: the parent's `link` entry,
