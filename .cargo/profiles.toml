@@ -45,3 +45,20 @@ opt-level = "s"
 # frame and saves ~160 KiB.
 [profile.release.package.llm]
 opt-level = "s"
+
+# The web UI renders at the pace of one person's clicks, and its views
+# monomorphize into a lot of code: z saves ~480 KiB over 3.
+[profile.release.package.web]
+opt-level = "z"
+
+[profile.release.package.topcoat-view]
+opt-level = "z"
+
+[profile.release.package.topcoat-router]
+opt-level = "z"
+
+[profile.release.package.topcoat-runtime]
+opt-level = "z"
+
+[profile.release.package.topcoat-core]
+opt-level = "z"

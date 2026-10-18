@@ -17,6 +17,7 @@ protocol = { path = "crates/protocol" }
 rt = { path = "crates/rt" }
 store = { path = "crates/store" }
 sys = { path = "crates/sys" }
+web = { path = "apps/web" }
 
 bytes = { version = "1", default-features = false, features = ["std"] }
 http = { version = "1", default-features = false, features = ["std"] }

@@ -26,6 +26,10 @@ cmd bridge help="Pipe stdio to the local daemon (for `ssh host a bridge`)" {
     flag "-h --help" help="Print help" action=help builtin=#true
     arg "[TOKEN]" help="Printed in the `A-BRIDGE` line that marks the start of the stream"
 }
+cmd web help="Serve the web UI and open the browser" {
+    flag --no-open help="Only print the link; do not open a browser"
+    flag "-h --help" help="Print help" action=help builtin=#true
+}
 cmd daemon help="Inspect or control the background daemon" subcommand_required=#true {
     flag "-h --help" help="Print help" action=help builtin=#true
     cmd status help="Show whether the daemon is running and responding" {

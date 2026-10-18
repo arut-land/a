@@ -11,6 +11,12 @@ protocol.workspace = true
 sys.workspace = true
 serde_json.workspace = true
 usage-rs.workspace = true
+web = { workspace = true, optional = true }
+
+[features]
+default = ["web"]
+# `a web`; about 0.8 MB of the release binary.
+web = ["dep:web"]
 
 [dev-dependencies]
 usage-rs = { workspace = true, features = ["spec"] }
