@@ -160,7 +160,8 @@ pub fn ask(entries: &[Entry], call: u64) -> Option<DaemonMsg> {
 }
 
 /// What a client attaching after `since` is told: the user's last message
-/// and what the agent did since. `None` when nothing is new.
+/// and what the agent did since. `None` when nothing worth telling is new,
+/// such as only an environment.
 pub fn recap(entries: &[Entry], since: u64) -> Option<Recap> {
     if entries.last().is_none_or(|e| e.seq <= since) {
         return None;
@@ -213,7 +214,7 @@ pub fn recap(entries: &[Entry], since: u64) -> Option<Recap> {
             _ => {}
         }
     }
-    Some(recap)
+    (recap != Recap::default()).then_some(recap)
 }
 
 /// The first line of `text`, cut to a recap's width.

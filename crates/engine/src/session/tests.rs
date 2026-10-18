@@ -595,4 +595,10 @@ fn a_recap_tells_the_last_prompt_and_what_followed() {
     );
     let replied = recap(&entries[..2], 1).unwrap();
     assert_eq!(replied.reply.as_deref(), Some("first"));
+    let env = entry(1, Body::Environment(Environment::default()));
+    assert_eq!(
+        recap(&[env], 0),
+        None,
+        "an environment alone is nothing to tell"
+    );
 }
