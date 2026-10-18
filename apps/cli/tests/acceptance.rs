@@ -7,7 +7,7 @@ use std::fs;
 use std::os::unix::fs::PermissionsExt;
 use std::process::Command;
 
-use common::{Env, assert_contiguous, group_alive, is_tool_call, result_of, wait_for};
+use common::{Env, Repl, assert_contiguous, group_alive, is_tool_call, result_of, wait_for};
 use protocol::{Body, ClientMsg, DaemonMsg, Decision, Outcome, Recap, Target};
 use serde_json::json;
 
@@ -442,4 +442,53 @@ fn a_pending_approval_survives_detach_and_is_re_delivered_on_attach() {
         } if *c == call)),
         "{log:#?}"
     );
+}
+
+/// Two installs of `a` in one home, such as the app's bundled build and an
+/// older CLI: the newer build takes over once, by a drain the attached older
+/// client rides out, and from then on both are served by its daemon. The
+/// older one never drains it back.
+#[test]
+fn an_older_and_a_newer_build_share_one_daemon_and_never_fight() {
+    let env = Env::new("two-builds");
+    let old = env.older_build();
+    let run_old = |args: &[&str]| {
+        let out = env.cmd_as(&old, args).output().unwrap();
+        assert!(
+            out.status.success(),
+            "{}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        String::from_utf8(out.stdout).unwrap()
+    };
+    let runtime = env.home.runtime();
+
+    // Only the older build has run: its daemon serves.
+    let id = run_old(&["new"]).trim().to_owned();
+    let first = env.pid().unwrap();
+    let old_id = runtime.current().unwrap();
+    let mut term = Repl::spawn(env.cmd_as(&old, &["attach", &id]));
+    term.lines_until("[session");
+
+    // The newer build stages itself as current and drains the old daemon;
+    // the attached older client reconnects to the new one.
+    assert!(env.run(&["ls"]).starts_with(&id));
+    let new_id = runtime.current().unwrap();
+    assert_ne!(new_id, old_id);
+    let second = env.pid().unwrap();
+    assert_ne!(second, first);
+    term.type_line("still here");
+    assert_eq!(
+        term.lines_until("a    still here").last().unwrap(),
+        "a    still here"
+    );
+
+    // From now on either build is welcomed by that daemon.
+    for _ in 0..3 {
+        assert!(run_old(&["ls"]).starts_with(&id));
+        assert!(env.run(&["ls"]).starts_with(&id));
+    }
+    assert_eq!(env.daemons(), [second]);
+    assert_eq!(runtime.current().unwrap(), new_id);
+    term.finish();
 }
