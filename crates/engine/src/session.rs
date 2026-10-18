@@ -1206,19 +1206,7 @@ impl Session {
             Err(error) => return Outcome::Failed { error },
         };
         let registry = self.registry();
-        let registry = &*registry;
-        let cancel = self.turn();
-        let tools = registry.tools();
-        let mut history = transcript(&self.lock().entries, call, tools);
-        let system = self
-            .shared
-            .system
-            .clone()
-            .unwrap_or_else(|| registry.system_prompt());
-        if !system.is_empty() {
-            history.insert(0, llm::Message::system(system));
-        }
-        let mut request = model.request(history, tools.specs());
+        let mut request = self.request(call, &model, &registry);
         let mut decided = Decided::new();
         registry
             .hooks()
@@ -1236,51 +1224,77 @@ impl Session {
                 text: text.to_owned(),
             });
         };
-        // The whole reply is the fact: replaying it later sends the
-        // provider's own items (signatures, encrypted reasoning) back.
-        let outcome = contain(async {
-            let mut retries = 0;
-            loop {
-                let Some(reply) = unless(&cancel, model.reply(&request, &mut on_text)).await else {
-                    return Outcome::Interrupted { output: None };
-                };
-                let error = match reply {
-                    Ok(reply) => {
-                        return match serde_json::to_value(&reply) {
-                            Ok(output) => Outcome::Done { output },
-                            Err(error) => Outcome::Failed {
-                                error: error.to_string(),
-                            },
-                        };
-                    }
-                    Err(error) => error.to_string(),
-                };
-                let mut decided = Decided::new();
-                let retry = (retries < MAX_RETRIES)
-                    .then(|| {
-                        registry.hooks().request_error(
-                            (call, retries + 1),
-                            &request,
-                            &error,
-                            &mut decided,
-                        )
-                    })
-                    .flatten();
-                match retry {
-                    Some(next) if self.decide(decided).await.is_ok() => {
-                        request = next;
-                        retries += 1;
-                    }
-                    _ => return Outcome::Failed { error },
-                }
-            }
-        })
-        .await;
-        match outcome {
+        let replied = self.reply(call, &model, &registry, request, &mut on_text);
+        match contain(replied).await {
             Outcome::Interrupted { .. } => Outcome::Interrupted {
                 output: (!said.is_empty()).then_some(said),
             },
             outcome => outcome,
+        }
+    }
+
+    /// The request for model call `call`: the system prompt, the transcript
+    /// before it, and the tools.
+    fn request(&self, call: u64, model: &Model, registry: &Registry) -> llm::Request {
+        let tools = registry.tools();
+        let mut history = transcript(&self.lock().entries, call, tools);
+        let system = self
+            .shared
+            .system
+            .clone()
+            .unwrap_or_else(|| registry.system_prompt());
+        if !system.is_empty() {
+            history.insert(0, llm::Message::system(system));
+        }
+        model.request(history, tools.specs())
+    }
+
+    /// `model`'s reply to `request`, retried as the `request_error` hooks
+    /// ask. The whole reply is the fact: replaying it later sends the
+    /// provider's own items (signatures, encrypted reasoning) back.
+    async fn reply(
+        &self,
+        call: u64,
+        model: &Model,
+        registry: &Registry,
+        mut request: llm::Request,
+        on_text: &mut (dyn FnMut(&str) + Send),
+    ) -> Outcome {
+        let cancel = self.turn();
+        let mut retries = 0;
+        loop {
+            let Some(reply) = unless(&cancel, model.reply(&request, on_text)).await else {
+                return Outcome::Interrupted { output: None };
+            };
+            let error = match reply {
+                Ok(reply) => {
+                    return match serde_json::to_value(&reply) {
+                        Ok(output) => Outcome::Done { output },
+                        Err(error) => Outcome::Failed {
+                            error: error.to_string(),
+                        },
+                    };
+                }
+                Err(error) => error.to_string(),
+            };
+            let mut decided = Decided::new();
+            let retry = (retries < MAX_RETRIES)
+                .then(|| {
+                    registry.hooks().request_error(
+                        (call, retries + 1),
+                        &request,
+                        &error,
+                        &mut decided,
+                    )
+                })
+                .flatten();
+            match retry {
+                Some(next) if self.decide(decided).await.is_ok() => {
+                    request = next;
+                    retries += 1;
+                }
+                _ => return Outcome::Failed { error },
+            }
         }
     }
 
@@ -1305,19 +1319,7 @@ impl Session {
         };
         let orphan = self.orphaned();
         let registry = self.registry();
-        let queued = queued.into_iter().map(|(seq, text, steer)| Waiting {
-            command: slash(&text).is_some_and(|(name, _)| is_command(&registry, name)),
-            seq,
-            text,
-            steer,
-            started: false,
-        });
-        let count = queued.len();
-        lock(&self.waiting).extend(queued);
-        self.queued.fetch_add(count, Ordering::SeqCst);
-        for _ in 0..count {
-            let _ = self.mailbox.send(Msg::Queued);
-        }
+        self.requeue(queued, &registry);
         // Owned by the session under a daemon that died without ending it:
         // ended now. Later loads in this daemon find them ended by `stop`.
         if lock(&self.shared.loaded).insert(self.id) {
@@ -1333,44 +1335,71 @@ impl Session {
             });
         }
         let mut inputs = VecDeque::new();
-        for Dangling {
-            seq,
-            call,
-            processes,
-            asked,
-        } in dangling
-        {
-            for (pgid, boot) in processes {
-                if Some(boot.as_str()) == sys::boot_id() {
-                    self.kill(pgid);
-                }
-            }
-            let interrupted = || Outcome::Interrupted {
-                output: partial(&self.lock().entries, seq),
-            };
-            let outcome = match &call {
-                _ if orphan => interrupted(),
-                Call::Tool { tool, input } if asked == Asked::Waiting => {
-                    self.ask(seq, tool, input).await?
-                }
-                Call::Tool { .. } if asked == Asked::Answered(false) => not_approved(),
-                Call::Tool { tool, .. }
-                    if registry.tools().get(tool).map(DynTool::replay) != Some(Replay::Safe) =>
-                {
-                    interrupted()
-                }
-                _ => {
-                    self.flush().await?;
-                    self.run_call(&call, seq).await
-                }
-            };
-            inputs.push_back(self.finish(&call, seq, outcome).await?);
+        for dangling in dangling {
+            inputs.push_back(self.finish_dangling(dangling, orphan, &registry).await?);
         }
         if orphan {
             self.warn("its owner is gone: what it was doing is not resumed");
             lock(&self.cancel).cancel();
         }
         self.drive(agent, actions, inputs).await
+    }
+
+    /// Queues again the input the log shows queued and not taken up.
+    fn requeue(&self, queued: VecDeque<(u64, String, bool)>, registry: &Registry) {
+        let count = queued.len();
+        lock(&self.waiting).extend(queued.into_iter().map(|(seq, text, steer)| Waiting {
+            command: slash(&text).is_some_and(|(name, _)| is_command(registry, name)),
+            seq,
+            text,
+            steer,
+            started: false,
+        }));
+        self.queued.fetch_add(count, Ordering::SeqCst);
+        for _ in 0..count {
+            let _ = self.mailbox.send(Msg::Queued);
+        }
+    }
+
+    /// Commits an outcome for a call a crash left without one, after
+    /// killing the processes it left running.
+    async fn finish_dangling(
+        &self,
+        dangling: Dangling,
+        orphan: bool,
+        registry: &Registry,
+    ) -> io::Result<Input> {
+        let Dangling {
+            seq,
+            call,
+            processes,
+            asked,
+        } = dangling;
+        for (pgid, boot) in processes {
+            if Some(boot.as_str()) == sys::boot_id() {
+                self.kill(pgid);
+            }
+        }
+        let interrupted = || Outcome::Interrupted {
+            output: partial(&self.lock().entries, seq),
+        };
+        let outcome = match &call {
+            _ if orphan => interrupted(),
+            Call::Tool { tool, input } if asked == Asked::Waiting => {
+                self.ask(seq, tool, input).await?
+            }
+            Call::Tool { .. } if asked == Asked::Answered(false) => not_approved(),
+            Call::Tool { tool, .. }
+                if registry.tools().get(tool).map(DynTool::replay) != Some(Replay::Safe) =>
+            {
+                interrupted()
+            }
+            _ => {
+                self.flush().await?;
+                self.run_call(&call, seq).await
+            }
+        };
+        self.finish(&call, seq, outcome).await
     }
 
     /// Whether this is a child whose owner is gone.
