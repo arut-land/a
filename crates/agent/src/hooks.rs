@@ -3,26 +3,49 @@
 //!
 //! | Point | Merge |
 //! | --- | --- |
+//! | `input` | replacement chain over the user's text; the first rejection wins |
 //! | `prepare_step` | replacement chain: each hook sees the request the last left |
+//! | `request_error` | the first retry wins |
 //! | `pre_tool` | replacement chain over the input; the first block wins |
 //! | `permission` | the most restrictive wins: deny > defer > ask > allow |
+//! | `spawn` | replacement chain over every process a tool starts |
 //! | `post_tool` | replacement chain over the outcome |
 //! | `on_stop` | the first continuation wins |
-//! | `observe` | every hook sees every entry and changes nothing |
+//! | `observe`, `session_start`, `session_end` | every hook is told, and changes nothing |
 //!
-//! Merges report what changed as [`Decision`]s, which the engine logs.
+//! Merges report what changed as [`Decision`]s, which the engine logs;
+//! `spawn` rewrites are not logged, as they follow from configuration
+//! rather than from what happened.
 
+use std::collections::BTreeMap;
+use std::path::PathBuf;
 use std::sync::Arc;
 
-use protocol::{Decision, Entry, Outcome, Permission};
+use protocol::{Decision, Entry, Outcome, Permission, SessionId};
 use serde_json::Value;
 
 /// One hook. Every method defaults to changing nothing. Its decisions are
 /// logged under the name of the [`Extension`](crate::Extension) that
 /// registered it.
 pub trait Hook: Send + Sync {
+    /// What becomes of the user's input before it is logged.
+    fn input(&self, _text: &str) -> Said {
+        Said::Pass
+    }
+
     /// A replacement for the next model request.
     fn prepare_step(&self, _request: &llm::Request) -> Option<llm::Request> {
+        None
+    }
+
+    /// A request to send instead of one that failed with `error`, such as
+    /// a compacted one after a context overflow.
+    fn request_error(&self, _request: &llm::Request, _error: &str) -> Option<llm::Request> {
+        None
+    }
+
+    /// A replacement for a process a tool is about to start.
+    fn spawn(&self, _spawn: &Spawn) -> Option<Spawn> {
         None
     }
 
@@ -51,6 +74,29 @@ pub trait Hook: Send + Sync {
     }
 
     fn observe(&self, _entry: &Entry) {}
+
+    /// The session's actor started: it was created, or loaded again.
+    fn session_start(&self, _session: SessionId) {}
+
+    /// The session's actor stopped: it hibernated, or the daemon drained.
+    fn session_end(&self, _session: SessionId) {}
+}
+
+/// An `input` answer.
+pub enum Said {
+    Pass,
+    Replace(String),
+    /// Refuses the input with this reason, which its client is told.
+    Reject(String),
+}
+
+/// A process a tool starts: `argv[0]` is the program.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Spawn {
+    pub argv: Vec<String>,
+    /// Exactly the variables it runs with.
+    pub env: BTreeMap<String, String>,
+    pub cwd: PathBuf,
 }
 
 /// A `pre_tool` answer.
@@ -93,6 +139,67 @@ pub type Decided = Vec<(&'static str, Decision)>;
 pub struct Hooks(pub(crate) Vec<(&'static str, Arc<dyn Hook>)>);
 
 impl Hooks {
+    /// The user's text as the `input` chain leaves it; `Err` is why it was
+    /// refused.
+    pub fn input(&self, text: &mut String, decided: &mut Decided) -> Result<(), String> {
+        for &(name, ref hook) in &self.0 {
+            match hook.input(text) {
+                Said::Pass => {}
+                Said::Replace(next) => {
+                    let original = std::mem::replace(text, next);
+                    decided.push((name, Decision::Input { original }));
+                }
+                Said::Reject(reason) => return Err(format!("{name}: {reason}")),
+            }
+        }
+        Ok(())
+    }
+
+    /// The request to retry model call `call` with after `error`, for the
+    /// `attempt`th time, if any hook offers one.
+    pub fn request_error(
+        &self,
+        (call, attempt): (u64, u32),
+        request: &llm::Request,
+        error: &str,
+        decided: &mut Decided,
+    ) -> Option<llm::Request> {
+        let (name, retry) = self
+            .0
+            .iter()
+            .find_map(|(name, hook)| Some((*name, hook.request_error(request, error)?)))?;
+        let error = error.to_owned();
+        decided.push((
+            name,
+            Decision::Retry {
+                call,
+                attempt,
+                error,
+            },
+        ));
+        Some(retry)
+    }
+
+    pub fn spawn(&self, spawn: &mut Spawn) {
+        for (_, hook) in &self.0 {
+            if let Some(next) = hook.spawn(spawn) {
+                *spawn = next;
+            }
+        }
+    }
+
+    pub fn session_start(&self, session: SessionId) {
+        for (_, hook) in &self.0 {
+            hook.session_start(session);
+        }
+    }
+
+    pub fn session_end(&self, session: SessionId) {
+        for (_, hook) in &self.0 {
+            hook.session_end(session);
+        }
+    }
+
     pub fn prepare_step(&self, call: u64, request: &mut llm::Request, decided: &mut Decided) {
         for &(name, ref hook) in &self.0 {
             if let Some(next) = hook.prepare_step(request) {
@@ -432,5 +539,78 @@ mod tests {
         decided.clear();
         assert_eq!(set.on_stop(&[], &mut decided).as_deref(), Some("go on"));
         assert_eq!(names(&decided), ["b"]);
+    }
+
+    /// Appends its mark to inputs and argv, refuses `no`, and retries
+    /// failed requests with its mark as the model.
+    struct Marks(&'static str);
+
+    impl Hook for Marks {
+        fn input(&self, text: &str) -> Said {
+            match text {
+                "no" => Said::Reject("not that".into()),
+                text => Said::Replace(format!("{text}{}", self.0)),
+            }
+        }
+
+        fn request_error(&self, _: &llm::Request, _: &str) -> Option<llm::Request> {
+            Some(llm::Request {
+                model: self.0.into(),
+                ..llm::Request::default()
+            })
+        }
+
+        fn spawn(&self, spawn: &Spawn) -> Option<Spawn> {
+            let mut next = spawn.clone();
+            next.argv.push(self.0.to_owned());
+            Some(next)
+        }
+    }
+
+    fn marks() -> Hooks {
+        Hooks(vec![
+            ("a", Arc::new(Marks("1")) as Arc<dyn Hook>),
+            ("b", Arc::new(Marks("2"))),
+        ])
+    }
+
+    #[test]
+    fn input_and_spawn_chain_and_the_first_retry_wins() {
+        let hooks = marks();
+        let mut decided = Decided::new();
+        let mut text = "hi".to_owned();
+        hooks.input(&mut text, &mut decided).unwrap();
+        assert_eq!(text, "hi12");
+        assert!(matches!(
+            &decided[..],
+            [("a", Decision::Input { original: a }), ("b", Decision::Input { original: b })]
+                if a == "hi" && b == "hi1"
+        ));
+        let mut refused = "no".to_owned();
+        assert_eq!(
+            hooks.input(&mut refused, &mut decided),
+            Err("a: not that".into())
+        );
+
+        decided.clear();
+        let retry = hooks.request_error((4, 1), &llm::Request::default(), "overflow", &mut decided);
+        assert_eq!(retry.unwrap().model, "1");
+        assert!(matches!(
+            &decided[..],
+            [("a", Decision::Retry { call: 4, attempt: 1, error })] if error == "overflow"
+        ));
+        assert!(
+            Hooks::default()
+                .request_error((4, 1), &llm::Request::default(), "e", &mut decided)
+                .is_none()
+        );
+
+        let mut spawn = Spawn {
+            argv: vec!["bash".into()],
+            env: BTreeMap::new(),
+            cwd: "/".into(),
+        };
+        hooks.spawn(&mut spawn);
+        assert_eq!(spawn.argv, ["bash", "1", "2"]);
     }
 }

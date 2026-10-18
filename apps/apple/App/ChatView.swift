@@ -113,16 +113,21 @@ struct ItemView: View {
             ReplyView(
                 call: call, model: model, text: text, status: status, usage: usage,
                 streaming: store.streaming?.call == call ? store.streaming?.text : nil)
-        case .tool(let call, let tool, let input, let approval, let outcome, let asked):
+        case .tool(let call, let tool, let input, let approval, let outcome, let card, let asked):
             ToolView(
                 call: call, tool: tool, input: input, approval: approval, outcome: outcome,
-                asked: asked, store: store)
+                card: card, asked: asked, store: store)
+        case .command(_, let name, let args, let outcome):
+            VStack(alignment: .leading) {
+                Note(icon: "slash.circle", text: "/\(name) \(args)")
+                if let outcome { OutcomeView(outcome: outcome, card: nil) }
+            }
         case .hook(_, let hook, let decision):
             Note(icon: "hook", text: "hook \(hook): \(Self.decision(decision))")
         case .child(_, let child, let input, _, let fired):
             VStack(alignment: .leading) {
                 Note(icon: "arrow.triangle.branch", text: "child \(child.suffix(8)): \(input)")
-                if let fired { OutcomeView(outcome: fired) }
+                if let fired { OutcomeView(outcome: fired, card: nil) }
             }
         case .environment(_, let cwd):
             Note(icon: "folder", text: "environment: \(cwd)")
@@ -185,6 +190,7 @@ struct ToolView: View {
     let input: String
     let approval: ApprovalState?
     let outcome: ToolOutcome?
+    let card: ToolCard?
     let asked: Bool
     let store: SessionStore
 
@@ -192,7 +198,7 @@ struct ToolView: View {
         VStack(alignment: .leading, spacing: 6) {
             HStack {
                 Image(systemName: "terminal")
-                Text(Self.title(tool: tool, input: input)).font(.body.monospaced())
+                Text(card?.title ?? Self.title(tool: tool, input: input)).font(.body.monospaced())
                 Spacer()
                 switch approval {
                 case .approved?: Text("approved").font(.caption).foregroundStyle(.green)
@@ -211,7 +217,7 @@ struct ToolView: View {
                 }
             }
             if let outcome {
-                OutcomeView(outcome: outcome)
+                OutcomeView(outcome: outcome, card: card)
             } else if approval != .pending {
                 ProgressView().controlSize(.small)
             }
@@ -229,6 +235,28 @@ struct ToolView: View {
 }
 
 struct OutcomeView: View {
+    let outcome: ToolOutcome
+    /// How the tool presents it, when it does.
+    let card: ToolCard?
+
+    var body: some View {
+        if case .done = outcome, let card, !card.note.isEmpty {
+            VStack(alignment: .leading, spacing: 2) {
+                if !card.body.isEmpty {
+                    Text(card.body.trimmingCharacters(in: .newlines))
+                        .font(.callout.monospaced()).textSelection(.enabled)
+                }
+                Text(card.note).font(.caption2).foregroundStyle(.secondary)
+            }
+        } else {
+            RawOutcome(outcome: outcome)
+        }
+    }
+}
+
+/// An outcome without a card: a command's streams as older logs hold them,
+/// anything else as JSON.
+struct RawOutcome: View {
     let outcome: ToolOutcome
 
     var body: some View {

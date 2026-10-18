@@ -50,6 +50,12 @@ impl Home {
         self.root.join("sessions")
     }
 
+    /// Where tools keep output too large for a session's log, a private
+    /// directory per session.
+    pub fn spill_dir(&self) -> PathBuf {
+        self.root.join("spill")
+    }
+
     pub fn daemon_log(&self) -> PathBuf {
         self.root.join("logs").join("daemon.log")
     }
@@ -98,6 +104,24 @@ pub fn boot_id() -> Option<&'static str> {
 #[cfg(not(unix))]
 pub fn kill_process_group(_pgid: u32) -> io::Result<()> {
     Err(io::Error::from(io::ErrorKind::Unsupported))
+}
+
+#[cfg(not(unix))]
+pub fn signal_group(_pgid: u32, _signal: Signal) -> io::Result<()> {
+    Err(io::Error::from(io::ErrorKind::Unsupported))
+}
+
+#[cfg(not(unix))]
+pub fn group_alive(_pgid: u32) -> bool {
+    false
+}
+
+#[cfg(not(unix))]
+pub fn new_session(_cmd: &mut std::process::Command) {}
+
+#[cfg(not(unix))]
+pub fn signal_name(raw: i32) -> String {
+    format!("signal {raw}")
 }
 
 #[cfg(not(unix))]
@@ -194,19 +218,73 @@ mod unix {
 
     /// Sends SIGKILL to a whole process group.
     pub fn kill_process_group(pgid: u32) -> io::Result<()> {
-        gone_is_ok(process::kill_process_group(
-            pid(pgid)?,
-            process::Signal::KILL,
-        ))
+        signal_group(pgid, super::Signal::Kill)
+    }
+
+    /// Sends `signal` to a whole process group.
+    pub fn signal_group(pgid: u32, signal: super::Signal) -> io::Result<()> {
+        gone_is_ok(process::kill_process_group(pid(pgid)?, raw(signal)))
+    }
+
+    /// Whether any process of group `pgid` is still alive.
+    pub fn group_alive(pgid: u32) -> bool {
+        pid(pgid).is_ok_and(|pgid| {
+            matches!(
+                process::test_kill_process_group(pgid),
+                Ok(()) | Err(rustix::io::Errno::PERM)
+            )
+        })
     }
 
     /// Sends `signal` to a process.
     pub fn signal_process(pid: u32, signal: super::Signal) -> io::Result<()> {
-        let signal = match signal {
+        gone_is_ok(process::kill_process(self::pid(pid)?, raw(signal)))
+    }
+
+    fn raw(signal: super::Signal) -> process::Signal {
+        match signal {
             super::Signal::Terminate => process::Signal::TERM,
             super::Signal::Kill => process::Signal::KILL,
+        }
+    }
+
+    /// Starts `cmd`'s process in a session of its own: no controlling
+    /// terminal, so a prompt for a password fails instead of waiting, and a
+    /// process group (its pgid is its pid) that can be signalled whole.
+    pub fn new_session(cmd: &mut std::process::Command) {
+        use std::os::unix::process::CommandExt;
+        // SAFETY: the closure runs in the forked child before exec and only
+        // calls setsid(2), which is async-signal-safe and allocates nothing.
+        unsafe {
+            cmd.pre_exec(|| {
+                process::setsid()?;
+                Ok(())
+            });
+        }
+    }
+
+    /// A signal's name, such as `SIGKILL`.
+    pub fn signal_name(raw: i32) -> String {
+        use process::Signal as S;
+        let name = match S::from_named_raw(raw) {
+            Some(S::HUP) => "SIGHUP",
+            Some(S::INT) => "SIGINT",
+            Some(S::QUIT) => "SIGQUIT",
+            Some(S::ILL) => "SIGILL",
+            Some(S::TRAP) => "SIGTRAP",
+            Some(S::ABORT) => "SIGABRT",
+            Some(S::BUS) => "SIGBUS",
+            Some(S::FPE) => "SIGFPE",
+            Some(S::KILL) => "SIGKILL",
+            Some(S::USR1) => "SIGUSR1",
+            Some(S::SEGV) => "SIGSEGV",
+            Some(S::USR2) => "SIGUSR2",
+            Some(S::PIPE) => "SIGPIPE",
+            Some(S::ALARM) => "SIGALRM",
+            Some(S::TERM) => "SIGTERM",
+            _ => return format!("signal {raw}"),
         };
-        gone_is_ok(process::kill_process(self::pid(pid)?, signal))
+        name.to_owned()
     }
 
     fn pid(raw: u32) -> io::Result<process::Pid> {
@@ -263,6 +341,22 @@ mod tests {
         assert!(!child.wait().unwrap().success());
         kill_process_group(child.id()).unwrap();
         assert!(boot_id().is_some_and(|id| !id.is_empty()));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_new_session_leads_its_own_group_and_names_signals() {
+        let mut cmd = std::process::Command::new("sleep");
+        cmd.arg("30");
+        new_session(&mut cmd);
+        let mut child = cmd.spawn().unwrap();
+        assert!(group_alive(child.id()));
+        signal_group(child.id(), Signal::Terminate).unwrap();
+        child.wait().unwrap();
+        assert!(!group_alive(child.id()));
+        assert_eq!(signal_name(9), "SIGKILL");
+        assert_eq!(signal_name(15), "SIGTERM");
+        assert_eq!(signal_name(6), "SIGABRT");
     }
 
     #[test]

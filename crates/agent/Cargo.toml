@@ -10,6 +10,7 @@ protocol.workspace = true
 rt.workspace = true
 serde.workspace = true
 serde_json.workspace = true
+sys.workspace = true
 
 [lints]
 workspace = true

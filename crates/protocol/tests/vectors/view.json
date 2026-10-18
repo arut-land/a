@@ -808,6 +808,225 @@
     ]
   },
   {
+    "hash": "dcf01e037d7052a0",
+    "messages": [
+      {
+        "session": "00000000-0000-0000-0000-00000000000a",
+        "t": "attached",
+        "workspace": "/w"
+      },
+      {
+        "card": {
+          "title": "$ echo hi"
+        },
+        "epoch": 0,
+        "input": {
+          "command": "echo hi"
+        },
+        "kind": "tool_call",
+        "seq": 1,
+        "t": "entry",
+        "tool": "bash"
+      },
+      {
+        "call": 1,
+        "card": {
+          "body": "hi\n",
+          "note": "exit 0",
+          "title": "$ echo hi"
+        },
+        "epoch": 0,
+        "kind": "tool_result",
+        "outcome": {
+          "output": {
+            "exit": 0,
+            "output": "hi\n"
+          },
+          "status": "done"
+        },
+        "seq": 2,
+        "t": "entry"
+      },
+      {
+        "data": {
+          "cwd": "/w/src"
+        },
+        "epoch": 0,
+        "ext": "shell",
+        "kind": "ext",
+        "seq": 3,
+        "state": "cwd",
+        "t": "entry"
+      },
+      {
+        "epoch": 0,
+        "kind": "command",
+        "name": "jobs",
+        "seq": 4,
+        "t": "entry"
+      },
+      {
+        "call": 4,
+        "epoch": 0,
+        "kind": "command_result",
+        "outcome": {
+          "output": "no jobs",
+          "status": "done"
+        },
+        "seq": 5,
+        "t": "entry"
+      },
+      {
+        "seq": 5,
+        "t": "synced"
+      }
+    ],
+    "name": "a tool's cards, then a slash command",
+    "state": {
+      "environment": null,
+      "items": [
+        {
+          "approval": null,
+          "call": 1,
+          "card": {
+            "body": "hi\n",
+            "note": "exit 0",
+            "title": "$ echo hi"
+          },
+          "input": {
+            "command": "echo hi"
+          },
+          "outcome": {
+            "output": {
+              "exit": 0,
+              "output": "hi\n"
+            },
+            "status": "done"
+          },
+          "tool": "bash",
+          "type": "tool"
+        },
+        {
+          "args": "",
+          "call": 4,
+          "name": "jobs",
+          "outcome": {
+            "output": "no jobs",
+            "status": "done"
+          },
+          "type": "command"
+        }
+      ],
+      "seq": 5,
+      "session": "00000000-0000-0000-0000-00000000000a",
+      "workspace": "/w"
+    },
+    "updates": [
+      {
+        "change": {
+          "change": "attached",
+          "reset": true,
+          "session": "00000000-0000-0000-0000-00000000000a",
+          "workspace": "/w"
+        },
+        "rev": 1,
+        "seq": 0
+      },
+      {
+        "change": {
+          "change": "added",
+          "index": 0,
+          "item": {
+            "approval": null,
+            "call": 1,
+            "card": {
+              "title": "$ echo hi"
+            },
+            "input": {
+              "command": "echo hi"
+            },
+            "outcome": null,
+            "tool": "bash",
+            "type": "tool"
+          }
+        },
+        "rev": 2,
+        "seq": 1
+      },
+      {
+        "change": {
+          "change": "updated",
+          "index": 0,
+          "item": {
+            "approval": null,
+            "call": 1,
+            "card": {
+              "body": "hi\n",
+              "note": "exit 0",
+              "title": "$ echo hi"
+            },
+            "input": {
+              "command": "echo hi"
+            },
+            "outcome": {
+              "output": {
+                "exit": 0,
+                "output": "hi\n"
+              },
+              "status": "done"
+            },
+            "tool": "bash",
+            "type": "tool"
+          },
+          "part": "outcome"
+        },
+        "rev": 3,
+        "seq": 2
+      },
+      {
+        "change": {
+          "change": "added",
+          "index": 1,
+          "item": {
+            "args": "",
+            "call": 4,
+            "name": "jobs",
+            "outcome": null,
+            "type": "command"
+          }
+        },
+        "rev": 4,
+        "seq": 4
+      },
+      {
+        "change": {
+          "change": "updated",
+          "index": 1,
+          "item": {
+            "args": "",
+            "call": 4,
+            "name": "jobs",
+            "outcome": {
+              "output": "no jobs",
+              "status": "done"
+            },
+            "type": "command"
+          },
+          "part": "outcome"
+        },
+        "rev": 5,
+        "seq": 5
+      },
+      {
+        "change": {
+          "change": "synced"
+        },
+        "rev": 6,
+        "seq": 5
+      }
+    ]
+  },
+  {
     "hash": "bf08f5b5f14d1541",
     "messages": [
       {

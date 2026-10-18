@@ -10,14 +10,20 @@ use std::str::FromStr;
 use protocol::{Body, Outcome};
 use serde_json::{Value, json};
 
+pub mod builtin;
 mod ext;
 mod hooks;
+mod state;
+#[cfg(test)]
+mod testing;
 mod tool;
 pub mod tools;
 
-pub use ext::{Builtin, Extension, Registrar, Registry};
-pub use hooks::{AskFor, Decided, Gate, Hook, Hooks, Pre};
-pub use tool::{Cx, DynTool, Replay, Tool, Toolset};
+pub use builtin::{Fixtures, Policy, builtins};
+pub use ext::{Command, DynCommand, Extension, Facts, Refused, Registrar, Registry, Section, Slot};
+pub use hooks::{AskFor, Decided, Gate, Hook, Hooks, Pre, Said, Spawn};
+pub use state::{Cwd, State, States};
+pub use tool::{Cancel, Cx, DynTool, Host, Kill, Replay, Tool, Toolset, session_dir};
 
 pub enum Input {
     User {
@@ -184,9 +190,10 @@ fn refusal(call: &llm::ToolCall, limited: bool) -> Option<String> {
     limited.then(|| format!("not run: the limit of {MAX_STEPS} model calls per message is reached"))
 }
 
-/// Echoes messages back. `$ <command>` runs a shell command,
-/// `sleep <seconds>` sleeps and `spawn <message>` hands the message to a
-/// child session, so tool calls and links can be exercised without a model.
+/// Echoes messages back. `$ <command>` runs it with `bash`,
+/// `sleep <seconds>` calls the `sleep` fixture and `spawn <message>` hands
+/// the message to a child session, so tool calls and links can be exercised
+/// without a model.
 pub struct Echo;
 
 impl Agent for Echo {
@@ -205,7 +212,7 @@ impl Agent for Echo {
             }];
         }
         let (tool, input) = if let Some(command) = text.strip_prefix("$ ") {
-            (tools::RunCommand::NAME, json!({ "command": command }))
+            (tools::Bash::NAME, json!({ "command": command }))
         } else if let Some(Ok(seconds)) = text.strip_prefix("sleep ").map(str::parse::<u64>) {
             (tools::Sleep::NAME, json!({ "seconds": seconds }))
         } else {
@@ -241,7 +248,7 @@ mod tests {
         assert!(
             matches!(&echo.step(user("hi"))[..], [Action::Emit(Body::Assistant { text })] if text == "hi")
         );
-        assert_eq!(tool_named(&echo.step(user("$ ls"))), Some("run_command"));
+        assert_eq!(tool_named(&echo.step(user("$ ls"))), Some("bash"));
         assert_eq!(tool_named(&echo.step(user("sleep 2"))), Some("sleep"));
         assert!(matches!(&echo.step(user("sleep x"))[..], [Action::Emit(_)]));
         assert_eq!(
@@ -286,11 +293,13 @@ mod tests {
 
     #[test]
     fn replay_policy_is_per_tool() {
-        let registry = Registry::default().with(&Builtin);
+        let registry = builtins(&Policy::default())
+            .and_then(|r| r.with(&Fixtures))
+            .unwrap();
         let tools = registry.tools();
-        assert_eq!(tools.get("run_command").unwrap().replay(), Replay::Unsafe);
+        assert_eq!(tools.get("bash").unwrap().replay(), Replay::Unsafe);
+        assert_eq!(tools.get("edit").unwrap().replay(), Replay::Unsafe);
         assert_eq!(tools.get("sleep").unwrap().replay(), Replay::Safe);
-        assert_eq!(tools.get("read_file").unwrap().replay(), Replay::Safe);
     }
 
     #[test]

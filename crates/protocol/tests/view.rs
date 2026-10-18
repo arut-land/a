@@ -6,7 +6,9 @@
 use std::path::PathBuf;
 
 use protocol::view::{SessionView, Update};
-use protocol::{Body, DaemonMsg, Decision, Decode, Entry, Environment, Outcome, Recap, SessionId};
+use protocol::{
+    Body, Card, DaemonMsg, Decision, Decode, Entry, Environment, Outcome, Recap, SessionId,
+};
 use serde_json::{Value, json};
 use uuid::Uuid;
 
@@ -109,6 +111,7 @@ impl Session {
             tool: "run_command".into(),
             input: input.clone(),
             id: None,
+            card: None,
         });
         if rng.chance(50) {
             self.commit(Body::Ask { call });
@@ -134,11 +137,16 @@ impl Session {
                 call,
                 pgid: 7,
                 boot: "b".into(),
+                background: false,
             });
         }
         if rng.chance(80) {
             let outcome = outcome(rng, json!({ "stdout": "x\n", "stderr": "", "exit": 0 }));
-            self.commit(Body::ToolResult { call, outcome });
+            self.commit(Body::ToolResult {
+                call,
+                outcome,
+                card: None,
+            });
         }
     }
 
@@ -425,6 +433,7 @@ fn scenarios() -> Vec<(&'static str, Vec<Value>)> {
                         tool: "run_command".into(),
                         input: command.clone(),
                         id: None,
+                        card: None,
                     },
                 ),
                 entry(2, Body::Ask { call: 1 }),
@@ -462,6 +471,7 @@ fn scenarios() -> Vec<(&'static str, Vec<Value>)> {
                         outcome: Outcome::Done {
                             output: json!({ "stdout": "hi\n", "stderr": "", "exit": 0 }),
                         },
+                        card: None,
                     },
                 ),
             ],
@@ -523,6 +533,63 @@ fn scenarios() -> Vec<(&'static str, Vec<Value>)> {
                     }),
                 ),
                 msg(DaemonMsg::Synced { seq: 2 }),
+            ],
+        ),
+        (
+            "a tool's cards, then a slash command",
+            vec![
+                attached(),
+                entry(
+                    1,
+                    Body::ToolCall {
+                        tool: "bash".into(),
+                        input: json!({ "command": "echo hi" }),
+                        id: None,
+                        card: Some(Card {
+                            title: "$ echo hi".into(),
+                            ..Card::default()
+                        }),
+                    },
+                ),
+                entry(
+                    2,
+                    Body::ToolResult {
+                        call: 1,
+                        outcome: Outcome::Done {
+                            output: json!({ "exit": 0, "output": "hi\n" }),
+                        },
+                        card: Some(Card {
+                            title: "$ echo hi".into(),
+                            body: "hi\n".into(),
+                            note: "exit 0".into(),
+                        }),
+                    },
+                ),
+                entry(
+                    3,
+                    Body::Ext {
+                        ext: "shell".into(),
+                        state: "cwd".into(),
+                        data: json!({ "cwd": "/w/src" }),
+                    },
+                ),
+                entry(
+                    4,
+                    Body::Command {
+                        name: "jobs".into(),
+                        args: String::new(),
+                    },
+                ),
+                entry(
+                    5,
+                    Body::CommandResult {
+                        call: 4,
+                        outcome: Outcome::Done {
+                            output: "no jobs".into(),
+                        },
+                    },
+                ),
+                msg(DaemonMsg::Synced { seq: 5 }),
             ],
         ),
         ("generated session 7", generated(7)),

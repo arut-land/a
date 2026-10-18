@@ -11,7 +11,9 @@ use std::sync::{Arc, Mutex, MutexGuard, Weak};
 use std::task::{Poll, Waker};
 use std::time::{Duration, Instant};
 
-use agent::{Action, Agent, Cx, Decided, DynTool, Gate, Input, Replay};
+use agent::{
+    Action, Agent, Cancel, Cx, Decided, DynTool, Facts, Gate, Hooks, Host, Input, Replay, States,
+};
 use protocol::{
     Body, DaemonMsg, Decision, Entry, Environment, Frame, Installed, Outcome, SessionId,
     SessionSummary,
@@ -39,8 +41,24 @@ pub struct Shared {
     pub registry: agent::Registry,
     /// The model, or why there is none (shown as the failed model call).
     pub model: Result<Model, String>,
+    /// The system prompt, in place of the one the extensions make.
+    pub system: Option<String>,
+    /// Where sessions keep output too large for their logs, a directory
+    /// each.
+    pub spill: PathBuf,
+    /// Sessions loaded since the daemon started.
+    pub(crate) loaded: Mutex<HashSet<SessionId>>,
     /// Where linked sessions are started and found.
     pub(crate) daemon: Weak<Daemon>,
+}
+
+impl Shared {
+    /// The model's name as calls record it.
+    fn model_name(&self) -> String {
+        self.model
+            .as_ref()
+            .map_or_else(|_| "none".to_owned(), Model::name)
+    }
 }
 
 pub struct Session {
@@ -68,11 +86,26 @@ pub struct Session {
     /// What commands run in: the last client's capture, secrets included,
     /// or after a restart the last one logged, without them.
     env: Mutex<Option<Environment>>,
+    /// The extensions' state, folded from the log.
+    states: Mutex<States>,
+    /// Stops the call running now.
+    cancel: Mutex<Cancel>,
+    /// Background process groups the session owns, until it ends.
+    jobs: Mutex<Vec<u32>>,
     shared: Arc<Shared>,
 }
 
 enum Msg {
-    Input(String),
+    /// The user's input, and what the `input` hooks decided about it.
+    Input {
+        text: String,
+        decided: Decided,
+    },
+    Command {
+        name: String,
+        args: String,
+        decided: Decided,
+    },
     /// Child `child` settled with `outcome`.
     Settled {
         child: SessionId,
@@ -156,6 +189,8 @@ impl Session {
         let armed = links::armed(&loaded.entries).count();
         let env = env.or_else(|| logged_env(&loaded.entries).cloned());
         let seq = loaded.entries.len() as u64;
+        let mut states = shared.registry.states();
+        states.replay(&loaded.entries);
         let session = Arc::new_cyclic(|this| Self {
             this: this.clone(),
             id: header.id,
@@ -178,8 +213,12 @@ impl Session {
             attached: AtomicUsize::new(0),
             last_active: Mutex::new(Instant::now()),
             env: Mutex::new(env),
+            states: Mutex::new(states),
+            cancel: Mutex::default(),
+            jobs: Mutex::default(),
             shared,
         });
+        session.shared.registry.hooks().session_start(session.id);
         let actor = Arc::clone(&session);
         session
             .shared
@@ -196,9 +235,29 @@ impl Session {
         Attachment(Arc::clone(self))
     }
 
-    pub fn submit(&self, text: String) {
+    /// Queues the user's input as the `input` hooks leave it: `/name args`
+    /// runs command `name` if there is one, anything else goes to the
+    /// agent. `Err` is why a hook refused it.
+    pub fn submit(&self, mut text: String) -> Result<(), String> {
+        let registry = &self.shared.registry;
+        let mut decided = Decided::new();
+        registry.hooks().input(&mut text, &mut decided)?;
+        let msg = match slash(&text).filter(|(name, _)| registry.command(name).is_some()) {
+            Some((name, args)) => Msg::Command {
+                name: name.to_owned(),
+                args: args.to_owned(),
+                decided,
+            },
+            None => Msg::Input { text, decided },
+        };
         self.queued.fetch_add(1, Ordering::SeqCst);
-        let _ = self.mailbox.send(Msg::Input(text));
+        let _ = self.mailbox.send(msg);
+        Ok(())
+    }
+
+    /// Stops the call running now, if any.
+    pub fn interrupt(&self) {
+        lock(&self.cancel).cancel();
     }
 
     /// Answers the ask for tool call `call`; the actor logs the answer and
@@ -217,22 +276,37 @@ impl Session {
         self.queued.load(Ordering::SeqCst) > 0
     }
 
-    /// How long the session has had no attachments and no work.
+    /// Whether any background process the session owns still runs.
+    pub fn has_jobs(&self) -> bool {
+        let mut jobs = lock(&self.jobs);
+        jobs.retain(|&pgid| sys::group_alive(pgid));
+        !jobs.is_empty()
+    }
+
+    /// How long the session has had no attachments, no work and no jobs.
     pub fn idle_for(&self) -> Duration {
-        if self.attached.load(Ordering::SeqCst) > 0 || self.has_work() {
+        if self.attached.load(Ordering::SeqCst) > 0 || self.has_work() || self.has_jobs() {
             return Duration::ZERO;
         }
         lock(&self.last_active).elapsed()
     }
 
-    /// Stops the actor; the session lives on in its log. Callers check
-    /// `idle_for` under the slot lock first.
+    /// Stops the actor, the call it runs and the processes it owns; the
+    /// session lives on in its log. Callers check `idle_for` under the slot
+    /// lock first, or are draining the daemon.
     pub fn stop(&self) {
+        self.interrupt();
         let mut answers = lock(&self.answers);
         answers.stopped = true;
         answers.wake();
         drop(answers);
         let _ = self.mailbox.send(Msg::Stop);
+        for pgid in lock(&self.jobs).drain(..) {
+            if let Err(e) = sys::kill_process_group(pgid) {
+                self.warn(format_args!("killing background group {pgid}: {e}"));
+            }
+        }
+        self.shared.registry.hooks().session_end(self.id);
     }
 
     pub fn attach(&self, client: &Sender<Frame>, since: u64) {
@@ -472,14 +546,30 @@ impl Session {
         loop {
             if !ok {
                 agent = self.shared.agent.agent();
-                replay(agent.as_mut(), &self.lock().entries);
+                let st = self.lock();
+                replay(agent.as_mut(), &st.entries);
+                let mut states = self.shared.registry.states();
+                states.replay(&st.entries);
+                *lock(&self.states) = states;
             }
             ok = match mailbox.recv().await {
-                Some(Msg::Input(text)) => {
+                Some(Msg::Input { text, decided }) => {
                     Box::pin(self.work(async {
+                        self.decide(decided).await?;
                         self.record(Body::User { text: text.clone() });
                         let inputs = VecDeque::from([Input::User { text }]);
                         self.drive(agent.as_mut(), VecDeque::new(), inputs).await
+                    }))
+                    .await
+                }
+                Some(Msg::Command {
+                    name,
+                    args,
+                    decided,
+                }) => {
+                    Box::pin(self.work(async {
+                        self.decide(decided).await?;
+                        self.command(&name, &args).await
                     }))
                     .await
                 }
@@ -571,11 +661,8 @@ impl Session {
                 return Ok(None);
             }
             Action::CallModel => {
-                let model = self
-                    .shared
-                    .model
-                    .as_ref()
-                    .map_or_else(|_| "none".to_owned(), Model::name);
+                self.note_context();
+                let model = self.shared.model_name();
                 let seq = self.append(Body::ModelCall { model }).await?;
                 (Call::Model, seq, self.run_model(seq).await)
             }
@@ -597,8 +684,10 @@ impl Session {
                     self.decide(decided).await?;
                     verdict
                 };
+                let card = self.shared.registry.tools().get(&tool);
                 let seq = self
                     .append(Body::ToolCall {
+                        card: card.and_then(|t| t.present(&input)),
                         tool: tool.clone(),
                         input: input.clone(),
                         id,
@@ -689,10 +778,20 @@ impl Session {
                 let hooks = self.shared.registry.hooks();
                 hooks.post_tool(seq, (tool, input), &mut outcome, &mut decided);
                 self.decide(decided).await?;
+                let card = match &outcome {
+                    Outcome::Done { output } => self
+                        .shared
+                        .registry
+                        .tools()
+                        .get(tool)
+                        .and_then(|t| t.present_result(input, output)),
+                    _ => None,
+                };
                 (
                     Body::ToolResult {
                         call: seq,
                         outcome: outcome.clone(),
+                        card,
                     },
                     Input::ToolDone { call: seq, outcome },
                 )
@@ -703,25 +802,56 @@ impl Session {
     }
 
     async fn run_tool(&self, call: u64, tool: &str, input: &Value) -> Outcome {
-        // Not waited for: it still commits before the call's result.
-        let spawned = |pgid| {
-            let Some(boot) = sys::boot_id() else { return };
-            let body = Body::ToolProcess {
-                call,
-                pgid,
-                boot: boot.to_owned(),
-            };
-            self.record(body);
-            self.kick();
+        let effect = Effect::new(self, call);
+        contain(self.shared.registry.tools().run(tool, input, &effect.cx())).await
+    }
+
+    /// Runs slash command `/name args`: logged, but no turn for the agent.
+    async fn command(&self, name: &str, args: &str) -> io::Result<()> {
+        let call = self
+            .append(Body::Command {
+                name: name.to_owned(),
+                args: args.to_owned(),
+            })
+            .await?;
+        let outcome = match self.shared.registry.command(name) {
+            Some(command) => {
+                let effect = Effect::new(self, call);
+                contain(command.run(args, &effect.cx())).await
+            }
+            None => Outcome::Failed {
+                error: format!("no command /{name}"),
+            },
         };
-        let env = lock(&self.env).clone();
-        let cx = Cx {
-            cwd: &self.workspace,
-            env: env.as_ref(),
-            spawned: &spawned,
-            rt: &*self.shared.rt,
+        self.record(Body::CommandResult { call, outcome });
+        Ok(())
+    }
+
+    /// The directory the session's commands run in now.
+    fn dir(&self) -> PathBuf {
+        let env = lock(&self.env);
+        agent::session_dir(&self.workspace, env.as_ref(), &lock(&self.states))
+    }
+
+    /// Logs the context the extensions give, before the session's first
+    /// model call.
+    fn note_context(&self) {
+        let noted = self
+            .lock()
+            .entries
+            .iter()
+            .any(|e| matches!(e.body, Body::Context { .. }));
+        if noted {
+            return;
+        }
+        let dir = self.dir();
+        let facts = Facts {
+            workspace: &self.workspace,
+            dir: &dir,
         };
-        contain(self.shared.registry.tools().run(tool, input, &cx)).await
+        if let Some(text) = self.shared.registry.context(&facts) {
+            self.record(Body::Context { text });
+        }
     }
 
     /// Asks the model to reply to the transcript before `call`, offering the
@@ -736,12 +866,20 @@ impl Session {
                 };
             }
         };
-        let tools = self.shared.registry.tools();
-        let history = transcript(&self.lock().entries, call, tools);
+        let registry = &self.shared.registry;
+        let tools = registry.tools();
+        let mut history = transcript(&self.lock().entries, call, tools);
+        let system = self
+            .shared
+            .system
+            .clone()
+            .unwrap_or_else(|| registry.system_prompt());
+        if !system.is_empty() {
+            history.insert(0, llm::Message::system(system));
+        }
         let mut request = model.request(history, tools.specs());
         let mut decided = Decided::new();
-        self.shared
-            .registry
+        registry
             .hooks()
             .prepare_step(call, &mut request, &mut decided);
         if let Err(e) = self.decide(decided).await {
@@ -758,16 +896,37 @@ impl Session {
         // The whole reply is the fact: replaying it later sends the
         // provider's own items (signatures, encrypted reasoning) back.
         contain(async {
-            match model.reply(&request, &mut on_text).await {
-                Ok(reply) => match serde_json::to_value(&reply) {
-                    Ok(output) => Outcome::Done { output },
-                    Err(error) => Outcome::Failed {
-                        error: error.to_string(),
-                    },
-                },
-                Err(error) => Outcome::Failed {
-                    error: error.to_string(),
-                },
+            let mut retries = 0;
+            loop {
+                let error = match model.reply(&request, &mut on_text).await {
+                    Ok(reply) => {
+                        return match serde_json::to_value(&reply) {
+                            Ok(output) => Outcome::Done { output },
+                            Err(error) => Outcome::Failed {
+                                error: error.to_string(),
+                            },
+                        };
+                    }
+                    Err(error) => error.to_string(),
+                };
+                let mut decided = Decided::new();
+                let retry = (retries < MAX_RETRIES)
+                    .then(|| {
+                        registry.hooks().request_error(
+                            (call, retries + 1),
+                            &request,
+                            &error,
+                            &mut decided,
+                        )
+                    })
+                    .flatten();
+                match retry {
+                    Some(next) if self.decide(decided).await.is_ok() => {
+                        request = next;
+                        retries += 1;
+                    }
+                    _ => return Outcome::Failed { error },
+                }
             }
         })
         .await
@@ -780,10 +939,31 @@ impl Session {
     /// the agent asked for that the log does not show runs.
     async fn recover(&self, agent: &mut dyn Agent) -> io::Result<()> {
         self.relink().await?;
-        let (dangling, actions) = {
+        let (dangling, actions, commands, jobs) = {
             let st = self.lock();
-            (dangling_calls(&st.entries), replay(agent, &st.entries))
+            (
+                dangling_calls(&st.entries),
+                replay(agent, &st.entries),
+                dangling_commands(&st.entries),
+                background_groups(&st.entries),
+            )
         };
+        // Owned by the session under a daemon that died without ending it:
+        // ended now. Later loads in this daemon find them ended by `stop`.
+        if lock(&self.shared.loaded).insert(self.id) {
+            for pgid in jobs.into_iter().filter(|&pgid| sys::group_alive(pgid)) {
+                if let Err(e) = sys::kill_process_group(pgid) {
+                    self.warn(format_args!("killing background group {pgid}: {e}"));
+                }
+            }
+        }
+        // A command cut off is not run again.
+        for call in commands {
+            self.record(Body::CommandResult {
+                call,
+                outcome: Outcome::Interrupted,
+            });
+        }
         let mut inputs = VecDeque::new();
         for Dangling {
             seq,
@@ -820,6 +1000,124 @@ impl Session {
         }
         self.drive(agent, actions, inputs).await
     }
+}
+
+/// Model calls one request may be retried, as `request_error` hooks ask.
+const MAX_RETRIES: u32 = 2;
+
+/// What a tool or command call runs with, held for the call's duration.
+struct Effect<'a> {
+    session: &'a Session,
+    call: u64,
+    env: Option<Environment>,
+    spill: PathBuf,
+    model: String,
+    cancel: Cancel,
+}
+
+impl<'a> Effect<'a> {
+    /// The effect of call `call`, which an interrupt now stops.
+    fn new(session: &'a Session, call: u64) -> Self {
+        let cancel = Cancel::default();
+        *lock(&session.cancel) = cancel.clone();
+        Self {
+            session,
+            call,
+            env: lock(&session.env).clone(),
+            spill: session.shared.spill.join(session.id.to_string()),
+            model: session.shared.model_name(),
+            cancel,
+        }
+    }
+
+    fn cx(&self) -> Cx<'_> {
+        Cx {
+            workspace: &self.session.workspace,
+            env: self.env.as_ref(),
+            session: self.session.id,
+            call: self.call,
+            model: &self.model,
+            spill: &self.spill,
+            cancel: &self.cancel,
+            rt: &*self.session.shared.rt,
+            host: self,
+        }
+    }
+}
+
+/// Entries a call records are not waited for: they still commit before
+/// its result.
+impl Host for Effect<'_> {
+    fn spawned(&self, pgid: u32, background: bool) {
+        if background {
+            lock(&self.session.jobs).push(pgid);
+        }
+        let Some(boot) = sys::boot_id() else { return };
+        self.session.record(Body::ToolProcess {
+            call: self.call,
+            pgid,
+            boot: boot.to_owned(),
+            background,
+        });
+        self.session.kick();
+    }
+
+    fn note(&self, ext: &'static str, state: &'static str, data: Value) {
+        lock(&self.session.states).fold(ext, state, &data);
+        self.session.record(Body::Ext {
+            ext: ext.to_owned(),
+            state: state.to_owned(),
+            data,
+        });
+        self.session.kick();
+    }
+
+    fn states(&self) -> MutexGuard<'_, States> {
+        lock(&self.session.states)
+    }
+
+    fn hooks(&self) -> &Hooks {
+        self.session.shared.registry.hooks()
+    }
+}
+
+/// `/name args` as a command's name and arguments.
+fn slash(text: &str) -> Option<(&str, &str)> {
+    let rest = text.strip_prefix('/')?;
+    let (name, args) = rest.split_once(char::is_whitespace).unwrap_or((rest, ""));
+    Some((name, args.trim()))
+}
+
+/// Commands with an intent but no outcome.
+fn dangling_commands(entries: &[Entry]) -> Vec<u64> {
+    let done: HashSet<u64> = entries
+        .iter()
+        .filter_map(|e| match e.body {
+            Body::CommandResult { call, .. } => Some(call),
+            _ => None,
+        })
+        .collect();
+    entries
+        .iter()
+        .filter(|e| matches!(e.body, Body::Command { .. }) && !done.contains(&e.seq))
+        .map(|e| e.seq)
+        .collect()
+}
+
+/// The background process groups the session started in this boot.
+fn background_groups(entries: &[Entry]) -> Vec<u32> {
+    entries
+        .iter()
+        .filter_map(|e| match &e.body {
+            Body::ToolProcess {
+                pgid,
+                boot,
+                background: true,
+                ..
+            } if Some(boot.as_str()) == sys::boot_id() => Some(*pgid),
+            _ => None,
+        })
+        .collect()
 }
 
 /// Logs the registry's extensions before the session's first step, unless
@@ -940,7 +1238,9 @@ fn dangling_calls(entries: &[Entry]) -> Vec<Dangling> {
     let mut dangling: Vec<Dangling> = Vec::new();
     for e in entries {
         let call = match &e.body {
-            Body::ToolProcess { call, pgid, boot } => {
+            Body::ToolProcess {
+                call, pgid, boot, ..
+            } => {
                 if let Some(d) = find_call(&mut dangling, *call) {
                     d.processes.push((*pgid, boot.clone()));
                 }

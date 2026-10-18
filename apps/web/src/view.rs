@@ -2,7 +2,7 @@
 //! markup, emitted again whole on every update.
 
 use protocol::view::{Approval, Item, SessionView, Status, Stream, Usage};
-use protocol::{Decision, Outcome, Recap};
+use protocol::{Card, Decision, Outcome, Recap};
 use serde_json::Value;
 use topcoat::Result;
 use topcoat::runtime::Event;
@@ -61,8 +61,16 @@ async fn item_row(item: Item, tab: String, streaming: Option<Stream>) -> Result<
             Item::Reply { call, text, status, usage, .. } => {
                 reply_row(text: text, status: status, usage: usage, live: streaming.filter(|s| s.call == call).map(|s| s.text))
             }
-            Item::Tool { call, tool, input, approval, outcome, asked } => {
-                tool_card(tab: tab, call: call, line: call_text(&tool, &input), approval: approval, asked: asked, outcome: outcome)
+            Item::Tool { call, tool, input, approval, outcome, card, asked } => {
+                tool_card(tab: tab, call: call, line: card.as_ref().map_or_else(|| call_text(&tool, &input), |c| c.title.clone()), approval: approval, asked: asked, outcome: outcome, card: card)
+            }
+            Item::Command { name, args, outcome, .. } => {
+                <div style=(style::NOTE)>
+                    <span style=(style::MONO)>"/" (name) " " (args)</span>
+                    if let Some(outcome) = outcome {
+                        " · " (outcome_text(&outcome))
+                    }
+                </div>
             }
             Item::Hook { hook, decision, .. } => {
                 <p style=(style::NOTE)>"hook " (hook) " · " (decision_text(&decision))</p>
@@ -127,6 +135,7 @@ async fn tool_card(
     approval: Option<Approval>,
     asked: bool,
     outcome: Option<Outcome>,
+    card: Option<Card>,
 ) -> Result<impl View> {
     let waiting = approval == Some(Approval::Pending);
     Ok(view! {
@@ -154,7 +163,7 @@ async fn tool_card(
             }
             match outcome {
                 Some(Outcome::Done { output }) => {
-                    output_block(output: output)
+                    output_block(output: output, card: card)
                 }
                 Some(Outcome::Failed { error }) => {
                     <pre style=(style::OUTPUT)><span style=(style::BAD)>(error)</span></pre>
@@ -168,18 +177,23 @@ async fn tool_card(
     })
 }
 
-/// A finished call's output: a command's streams and exit status, anything
-/// else as JSON.
+/// A finished call's output: as its tool presents it, a command's streams
+/// and exit status as older logs hold them, anything else as JSON.
 #[component]
-async fn output_block(output: Value) -> Result<impl View> {
-    let command = output["stdout"].as_str().map(|stdout| {
+async fn output_block(output: Value, card: Option<Card>) -> Result<impl View> {
+    let shown = card.filter(|c| !c.body.is_empty() || !c.note.is_empty());
+    let command = shown.map(|c| (c.body, c.note)).or_else(|| {
+        let stdout = output["stdout"].as_str()?;
         let stderr = output["stderr"].as_str().unwrap_or_default();
-        (format!("{stdout}{stderr}"), output["exit"].to_string())
+        Some((
+            format!("{stdout}{stderr}"),
+            format!("exit {}", output["exit"]),
+        ))
     });
     Ok(view! {
         match command {
-            Some((text, exit)) => {
-                <pre style=(style::OUTPUT)>(text) <span style=(style::DIM)>"exit " (exit)</span></pre>
+            Some((text, note)) => {
+                <pre style=(style::OUTPUT)>(text) <span style=(style::DIM)>(note)</span></pre>
             }
             None => {
                 <pre style=(style::OUTPUT)>(serde_json::to_string_pretty(&output).unwrap_or_default())</pre>
@@ -223,6 +237,12 @@ fn decision_text(decision: &Decision) -> String {
         }
         Decision::PostTool { call, .. } => format!("rewrote the outcome of call {call}"),
         Decision::OnStop { text } => format!("continued with: {text}"),
+        Decision::Input { original } => format!("rewrote your input: {original}"),
+        Decision::Retry {
+            call,
+            attempt,
+            error,
+        } => format!("retried call {call} (attempt {attempt}): {error}"),
     }
 }
 

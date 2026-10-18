@@ -341,7 +341,9 @@ pub fn assert_contiguous(entries: &[Entry]) {
 
 pub fn result_of(e: &Entry, call: u64) -> Option<&Outcome> {
     match &e.body {
-        Body::ToolResult { call: c, outcome } if *c == call => Some(outcome),
+        Body::ToolResult {
+            call: c, outcome, ..
+        } if *c == call => Some(outcome),
         _ => None,
     }
 }

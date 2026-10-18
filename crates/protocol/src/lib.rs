@@ -81,17 +81,27 @@ pub enum Body {
         input: Value,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         id: Option<String>,
+        /// How clients show the call, as the tool presents it.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        card: Option<Card>,
     },
     /// The process group running a call, so recovery can kill it. Only
     /// meaningful within the same `boot`: pgids are reused across reboots.
+    /// A `background` group outlives its call: the session owns it until
+    /// the session ends.
     ToolProcess {
         call: u64,
         pgid: u32,
         boot: String,
+        #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+        background: bool,
     },
     ToolResult {
         call: u64,
         outcome: Outcome,
+        /// How clients show the outcome, as the tool presents it.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        card: Option<Card>,
     },
     /// The committed intent to ask a model for a reply.
     ModelCall {
@@ -141,6 +151,46 @@ pub enum Body {
     Extensions {
         installed: Vec<Installed>,
     },
+    /// A change to extension `ext`'s durable state `state`: folding these
+    /// in log order rebuilds it.
+    Ext {
+        ext: String,
+        state: String,
+        data: Value,
+    },
+    /// Facts about where the session runs (its directory, the workspace's
+    /// agent notes), which the model reads as a user message ahead of the
+    /// conversation. Logged once, before the first model call, so the
+    /// system prompt stays the same across sessions and cacheable.
+    Context {
+        text: String,
+    },
+    /// The committed intent to run slash command `/name args`, which takes
+    /// no model turn. Its seq is the command's id.
+    Command {
+        name: String,
+        #[serde(default, skip_serializing_if = "String::is_empty")]
+        args: String,
+    },
+    CommandResult {
+        call: u64,
+        outcome: Outcome,
+    },
+}
+
+/// How a client shows a tool call or its outcome: pure data the tool
+/// derives from its input and output, so every client renders any tool
+/// alike without knowing it.
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Card {
+    /// One line: what the call does, such as `$ ls` or `edit src/main.rs`.
+    pub title: String,
+    /// Preformatted text under it, such as output or a diff.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub body: String,
+    /// A short status, such as `exit 1`.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub note: String,
 }
 
 /// An extension a session ran with.
@@ -273,6 +323,16 @@ pub enum Decision {
     PostTool { call: u64, original: Outcome },
     /// The agent stopped and was given `text` to continue with.
     OnStop { text: String },
+    /// The user's input was rewritten: the user entry that follows holds
+    /// the new text, `original` what it replaced.
+    Input { original: String },
+    /// Model call `call` failed with `error` and is sent again, for the
+    /// `attempt`th time, with the request as the hook left it.
+    Retry {
+        call: u64,
+        attempt: u32,
+        error: String,
+    },
 }
 
 /// Whether a tool call may run, from least to most restrictive: merging
@@ -365,6 +425,8 @@ pub enum ClientMsg {
         call: u64,
         approved: bool,
     },
+    /// Aborts the attached session's running tool call.
+    Interrupt,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -565,6 +627,10 @@ fn known_kind(kind: &str) -> bool {
             | "fired"
             | "environment"
             | "extensions"
+            | "ext"
+            | "context"
+            | "command"
+            | "command_result"
     )
 }
 
@@ -761,15 +827,18 @@ mod tests {
                 tool: "t".into(),
                 input: Value::Null,
                 id: None,
+                card: None,
             },
             Body::ToolProcess {
                 call: 1,
                 pgid: 1,
                 boot: "b".into(),
+                background: false,
             },
             Body::ToolResult {
                 call: 1,
                 outcome: Outcome::Interrupted,
+                card: None,
             },
             Body::ModelCall { model: "m".into() },
             Body::ModelResult {
@@ -794,6 +863,20 @@ mod tests {
             Body::Extensions {
                 installed: Vec::new(),
             },
+            Body::Ext {
+                ext: "e".into(),
+                state: "s".into(),
+                data: Value::Null,
+            },
+            Body::Context { text: "c".into() },
+            Body::Command {
+                name: "n".into(),
+                args: String::new(),
+            },
+            Body::CommandResult {
+                call: 1,
+                outcome: Outcome::Interrupted,
+            },
         ];
         for body in &bodies {
             match body {
@@ -810,7 +893,11 @@ mod tests {
                 | Body::Watch { .. }
                 | Body::Fired { .. }
                 | Body::Environment(_)
-                | Body::Extensions { .. } => {}
+                | Body::Extensions { .. }
+                | Body::Ext { .. }
+                | Body::Context { .. }
+                | Body::Command { .. }
+                | Body::CommandResult { .. } => {}
             }
             let json = serde_json::to_value(body).unwrap();
             assert!(known_kind(json["kind"].as_str().unwrap()), "{json}");
@@ -870,6 +957,36 @@ mod tests {
                 Ok(DaemonMsg::Unknown { .. })
             ));
         }
+    }
+
+    #[test]
+    fn calls_without_cards_keep_their_shape_and_new_entries_are_flat() {
+        let old = r#"{"seq":3,"epoch":0,"kind":"tool_result","call":2,"outcome":{"status":"done","output":{"exit":0,"stderr":"","stdout":"hi\n"}}}"#;
+        let e: Entry = serde_json::from_str(old).unwrap();
+        assert!(matches!(&e.body, Body::ToolResult { card: None, .. }));
+        assert_eq!(serde_json::to_string(&e).unwrap(), old);
+        let carded = Body::ToolCall {
+            tool: "bash".into(),
+            input: serde_json::json!({ "command": "ls" }),
+            id: None,
+            card: Some(Card {
+                title: "$ ls".into(),
+                ..Card::default()
+            }),
+        };
+        assert_eq!(
+            serde_json::to_string(&carded).unwrap(),
+            r#"{"kind":"tool_call","tool":"bash","input":{"command":"ls"},"card":{"title":"$ ls"}}"#
+        );
+        let ext = Body::Ext {
+            ext: "shell".into(),
+            state: "cwd".into(),
+            data: "/w".into(),
+        };
+        assert_eq!(
+            serde_json::to_string(&ext).unwrap(),
+            r#"{"kind":"ext","ext":"shell","state":"cwd","data":"/w"}"#
+        );
     }
 
     #[test]

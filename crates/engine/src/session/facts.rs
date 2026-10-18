@@ -10,9 +10,11 @@ use protocol::{Body, DaemonMsg, Decision, Entry, Outcome, Recap};
 /// The conversation before `before`, derived from the log's facts. A model
 /// reply is the assistant message it stored, provider state included; a
 /// reply logged as bare text (by an earlier version) reads back as text.
-/// A tool call the model made is answered under the model's id for it.
+/// A tool call the model made is answered under the model's id for it. The
+/// session's context comes first, wherever it was logged.
 pub fn transcript(entries: &[Entry], before: u64, tools: &Toolset) -> Vec<Message> {
     let mut messages = Vec::new();
+    let mut context = 0;
     // Model calls by our seq: the model's id and the tool.
     let mut calls = HashMap::new();
     for e in entries.iter().take_while(|e| e.seq < before) {
@@ -23,6 +25,10 @@ pub fn transcript(entries: &[Entry], before: u64, tools: &Toolset) -> Vec<Messag
                 ..
             } => messages.push(Message::user(text.clone())),
             Body::Assistant { text } => messages.push(Message::assistant(text.clone())),
+            Body::Context { text } => {
+                messages.insert(context, Message::user(text.clone()));
+                context += 1;
+            }
             Body::Fired { outcome, .. } => {
                 messages.push(Message::user(agent::child_result(outcome)));
             }
@@ -42,7 +48,7 @@ pub fn transcript(entries: &[Entry], before: u64, tools: &Toolset) -> Vec<Messag
             } => {
                 calls.insert(e.seq, (id.as_str(), tool.as_str()));
             }
-            Body::ToolResult { call, outcome } => {
+            Body::ToolResult { call, outcome, .. } => {
                 let Some(&(id, tool)) = calls.get(call) else {
                     continue;
                 };
@@ -80,7 +86,7 @@ pub fn replay(agent: &mut dyn Agent, entries: &[Entry]) -> VecDeque<Action> {
                 decision: Decision::OnStop { text },
                 ..
             } => Input::User { text: text.clone() },
-            Body::ToolResult { call, outcome } => Input::ToolDone {
+            Body::ToolResult { call, outcome, .. } => Input::ToolDone {
                 call: *call,
                 outcome: outcome.clone(),
             },
@@ -110,7 +116,11 @@ pub fn replay(agent: &mut dyn Agent, entries: &[Entry]) -> VecDeque<Action> {
             | Body::Ask { .. }
             | Body::Watch { .. }
             | Body::Environment(_)
-            | Body::Extensions { .. } => continue,
+            | Body::Extensions { .. }
+            | Body::Ext { .. }
+            | Body::Context { .. }
+            | Body::Command { .. }
+            | Body::CommandResult { .. } => continue,
         };
         asked.extend(agent.step(input));
     }
