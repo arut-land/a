@@ -52,7 +52,7 @@ impl LogStore for Memory {
             .values()
             .map(|s| s.header.clone())
             .collect();
-        headers.sort_by_key(|h| h.id.0);
+        headers.sort_unstable_by_key(|h| h.id.0);
         Ok(headers)
     }
 
@@ -94,10 +94,6 @@ impl LogStore for Memory {
 struct MemoryLog(Arc<Mutex<Vec<Entry>>>, Lease);
 
 impl Log for MemoryLog {
-    fn append(&mut self, entry: &Entry) -> io::Result<()> {
-        self.append_all(std::slice::from_ref(entry))
-    }
-
     fn append_all(&mut self, entries: &[Entry]) -> io::Result<()> {
         self.1.admit(entries)?;
         lock(&self.0).extend_from_slice(entries);

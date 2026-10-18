@@ -12,7 +12,7 @@ mod tests;
 use std::io;
 use std::path::PathBuf;
 
-use protocol::{Entry, Installed, SessionId};
+use protocol::{Body, Entry, Installed, SessionId};
 use serde::{Deserialize, Serialize};
 
 pub use jsonl::Jsonl;
@@ -47,6 +47,16 @@ pub struct Loaded {
     /// The epoch of the appender's lease, which every entry it appends
     /// carries.
     pub epoch: u32,
+}
+
+impl Loaded {
+    /// Appends `body` as the next entry, durably, and keeps it in `entries`.
+    pub fn append(&mut self, body: Body) -> io::Result<()> {
+        let entry = Entry::new(self.entries.len() as u64 + 1, self.epoch, body);
+        self.log.append(&entry)?;
+        self.entries.push(entry);
+        Ok(())
+    }
 }
 
 /// The newest epoch in `entries`: a new lease must be past it.
@@ -88,14 +98,14 @@ pub trait Log: Send {
     /// crash afterwards never loses it. Fails with `ResourceBusy` and writes
     /// nothing if the appender's lease was superseded or the entry carries
     /// another epoch.
-    fn append(&mut self, entry: &Entry) -> io::Result<()>;
+    fn append(&mut self, entry: &Entry) -> io::Result<()> {
+        self.append_all(std::slice::from_ref(entry))
+    }
 
     /// Appends `entries` in order, as durably as [`Log::append`]; a backend
     /// may make them durable together. After a crash the log holds a prefix
     /// of them.
-    fn append_all(&mut self, entries: &[Entry]) -> io::Result<()> {
-        entries.iter().try_for_each(|entry| self.append(entry))
-    }
+    fn append_all(&mut self, entries: &[Entry]) -> io::Result<()>;
 }
 
 fn not_found(id: SessionId) -> io::Error {

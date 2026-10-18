@@ -6,8 +6,8 @@
 
 use std::collections::{HashSet, VecDeque};
 use std::io;
-use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
+use std::sync::atomic::Ordering;
 
 use agent::{Agent, Input};
 use protocol::{Body, Entry, Environment, Outcome, SessionId};
@@ -114,17 +114,20 @@ impl Session {
     pub(super) async fn relink(&self) -> io::Result<()> {
         let links: Vec<(u64, SessionId, Linked)> = {
             let st = self.lock();
-            let armed: Vec<SessionId> = armed(&st.entries).map(|(_, child)| child).collect();
-            let watched = |child| {
-                st.entries
-                    .iter()
-                    .any(|e| matches!(e.body, Body::Watch { child: c } if c == child))
-            };
+            let armed: HashSet<SessionId> = armed(&st.entries).map(|(_, child)| child).collect();
+            let watched: HashSet<SessionId> = st
+                .entries
+                .iter()
+                .filter_map(|e| match e.body {
+                    Body::Watch { child } => Some(child),
+                    _ => None,
+                })
+                .collect();
             st.entries
                 .iter()
                 .filter_map(|e| match &e.body {
                     Body::Link { child, input } => {
-                        let linked = if !watched(*child) {
+                        let linked = if !watched.contains(child) {
                             Linked::Unwatched(input.clone())
                         } else if armed.contains(child) {
                             Linked::Armed(input.clone())
@@ -170,7 +173,7 @@ impl Session {
         for watch in watches {
             let outcome = outcome.clone();
             ok &= self
-                .work(async {
+                .work(Box::pin(async {
                     let fired = Body::Fired {
                         watch,
                         outcome: outcome.clone(),
@@ -178,7 +181,7 @@ impl Session {
                     self.record(fired);
                     let inputs = VecDeque::from([Input::ChildDone { watch, outcome }]);
                     self.drive(agent, VecDeque::new(), inputs).await
-                })
+                }))
                 .await;
         }
         self.heard(child);
@@ -211,22 +214,23 @@ impl Session {
 }
 
 impl Daemon {
+    /// The slots of the sessions `parent` owns.
+    fn owned(&self, parent: SessionId) -> impl Iterator<Item = Arc<Slot>> {
+        self.slots()
+            .into_iter()
+            .filter(move |s| s.header.parent.is_some_and(|p| p.session == parent))
+    }
+
     /// The loaded sessions `parent` owns.
     pub(crate) fn children(&self, parent: SessionId) -> Vec<Arc<Session>> {
-        self.slots()
-            .iter()
-            .filter(|s| s.header.parent.is_some_and(|p| p.session == parent))
+        self.owned(parent)
             .filter_map(|s| lock(&s.live).clone())
             .collect()
     }
 
     /// Unloads the sessions `parent` owns, each after its own children.
     pub(crate) fn unload_children(&self, parent: SessionId) {
-        let owned = self
-            .slots()
-            .into_iter()
-            .filter(|s| s.header.parent.is_some_and(|p| p.session == parent));
-        for slot in owned {
+        for slot in self.owned(parent) {
             let live = lock(&slot.live).take();
             if let Some(child) = live {
                 child.stop();
@@ -236,7 +240,7 @@ impl Daemon {
 
     /// Whether session `id` exists.
     pub(crate) fn knows(&self, id: SessionId) -> bool {
-        lock(&self.slots).iter().any(|s| s.header.id == id)
+        self.slot(id).is_some()
     }
 
     /// Starts child session `header.id` on `input` unless it runs already:
@@ -248,11 +252,7 @@ impl Daemon {
         let Some(slot) = slots.iter().find(|s| s.header.id == header.id).cloned() else {
             let loaded = self.shared.store.create(&header)?;
             let session = self.seed(header.clone(), loaded, input, env)?;
-            slots.push(Arc::new(Slot {
-                header,
-                live: Mutex::new(Some(session)),
-                heard: AtomicBool::new(false),
-            }));
+            slots.push(Slot::new(header, Some(session)));
             return Ok(());
         };
         drop(slots);
@@ -275,15 +275,12 @@ impl Daemon {
         env: Option<Environment>,
     ) -> io::Result<Arc<Session>> {
         if loaded.entries.is_empty() {
-            let opening = env.as_ref().map(|env| Body::Environment(env.redacted()));
-            let user = Body::User {
-                text: input.to_owned(),
-            };
-            for (seq, body) in (1..).zip(opening.into_iter().chain([user])) {
-                let entry = Entry::new(seq, loaded.epoch, body);
-                loaded.log.append(&entry)?;
-                loaded.entries.push(entry);
+            if let Some(env) = &env {
+                loaded.append(Body::Environment(env.redacted()))?;
             }
+            loaded.append(Body::User {
+                text: input.to_owned(),
+            })?;
         }
         Ok(Session::start_in(
             header,
@@ -296,22 +293,21 @@ impl Daemon {
     /// Hands child `child`'s result to its parent, loading the parent if it
     /// is hibernated, unless the parent has heard from it already.
     fn settled(&self, parent: SessionId, child: SessionId, outcome: Outcome) -> io::Result<()> {
-        let slot = |id| {
-            self.slots()
-                .into_iter()
-                .find(|s: &Arc<Slot>| s.header.id == id)
-        };
-        if slot(child).is_some_and(|s| s.heard.load(Ordering::SeqCst)) {
+        if self
+            .slot(child)
+            .is_some_and(|s| s.heard.load(Ordering::SeqCst))
+        {
             return Ok(());
         }
-        let parent = slot(parent)
+        let parent = self
+            .slot(parent)
             .ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, "no such parent session"))?;
         self.with_live(&parent, |session| session.settle(child, outcome))
     }
 
     /// Records that `child`'s parent has fired its watch on it.
     fn heard(&self, child: SessionId) {
-        if let Some(slot) = lock(&self.slots).iter().find(|s| s.header.id == child) {
+        if let Some(slot) = self.slot(child) {
             slot.heard.store(true, Ordering::SeqCst);
         }
     }

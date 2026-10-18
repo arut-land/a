@@ -265,13 +265,12 @@ impl Hooks {
                 let Some((who, approved)) = answer else {
                     return Ok(Gate::Ask);
                 };
-                let call = None;
                 decided.push((
                     who,
                     Decision::Approval {
                         tool,
                         approved,
-                        call,
+                        call: None,
                     },
                 ));
                 if approved {

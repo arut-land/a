@@ -315,18 +315,12 @@ impl Spill {
 /// can enter, never opening one that exists: at `path`, or at `path` with
 /// a number added when that is taken.
 pub fn create_private(path: &Path) -> io::Result<(File, PathBuf)> {
-    let mut dir = std::fs::DirBuilder::new();
-    dir.recursive(true);
     let mut open = std::fs::OpenOptions::new();
     open.write(true).create_new(true);
     #[cfg(unix)]
-    {
-        use std::os::unix::fs::{DirBuilderExt, OpenOptionsExt};
-        dir.mode(0o700);
-        open.mode(0o600);
-    }
+    std::os::unix::fs::OpenOptionsExt::mode(&mut open, 0o600);
     if let Some(parent) = path.parent() {
-        dir.create(parent)?;
+        private_dir(parent)?;
     }
     let stem = path.file_stem().unwrap_or_default().to_string_lossy();
     let ext = path.extension().unwrap_or_default().to_string_lossy();
@@ -345,6 +339,15 @@ pub fn create_private(path: &Path) -> io::Result<(File, PathBuf)> {
         io::ErrorKind::AlreadyExists,
         format!("{} and its alternatives exist", path.display()),
     ))
+}
+
+/// Creates `dir` and its parents, entered only by their owner.
+pub fn private_dir(dir: &Path) -> io::Result<()> {
+    let mut builder = std::fs::DirBuilder::new();
+    builder.recursive(true);
+    #[cfg(unix)]
+    std::os::unix::fs::DirBuilderExt::mode(&mut builder, 0o700);
+    builder.create(dir)
 }
 
 /// The most output a call reports as it runs: its log holds this much of

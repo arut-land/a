@@ -21,7 +21,7 @@ use protocol::{Card, Environment};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
-use super::output::{Live, Output, Rendered, Spill, create_private};
+use super::output::{Live, Output, Rendered, Spill, create_private, private_dir};
 use crate::state::Cwd;
 use crate::{Cancel, Cx, Kill, Spawn, Tool};
 
@@ -392,14 +392,6 @@ fn find_bash(env: &BTreeMap<String, String>) -> Option<String> {
 /// `text` as one shell word.
 fn quote(text: &str) -> String {
     format!("'{}'", text.replace('\'', r"'\''"))
-}
-
-fn private_dir(dir: &Path) -> io::Result<()> {
-    let mut builder = std::fs::DirBuilder::new();
-    builder.recursive(true);
-    #[cfg(unix)]
-    std::os::unix::fs::DirBuilderExt::mode(&mut builder, 0o700);
-    builder.create(dir)
 }
 
 fn duration_ms(started: Instant) -> u64 {

@@ -209,6 +209,16 @@ struct Slot {
     heard: AtomicBool,
 }
 
+impl Slot {
+    fn new(header: Header, live: Option<Arc<Session>>) -> Arc<Self> {
+        Arc::new(Self {
+            header,
+            live: Mutex::new(live),
+            heard: AtomicBool::new(false),
+        })
+    }
+}
+
 impl Daemon {
     /// Reads only session headers. Sessions with a busy marker were working
     /// when the last daemon stopped, so they load at once to recover.
@@ -217,13 +227,7 @@ impl Daemon {
         let slots = store
             .headers()?
             .into_iter()
-            .map(|header| {
-                Arc::new(Slot {
-                    header,
-                    live: Mutex::new(None),
-                    heard: AtomicBool::new(false),
-                })
-            })
+            .map(|header| Slot::new(header, None))
             .collect();
         let rt: rt::Rt = Arc::new(rt::Threads::default());
         let models = model::Models {
@@ -263,6 +267,13 @@ impl Daemon {
         lock(&self.slots).clone()
     }
 
+    fn slot(&self, id: SessionId) -> Option<Arc<Slot>> {
+        lock(&self.slots)
+            .iter()
+            .find(|s| s.header.id == id)
+            .cloned()
+    }
+
     /// Runs `f` on the slot's live session, loading it first if hibernated.
     fn with_live<T>(&self, slot: &Slot, f: impl FnOnce(&Arc<Session>) -> T) -> io::Result<T> {
         let mut live = lock(&slot.live);
@@ -281,18 +292,21 @@ impl Daemon {
     }
 
     fn resolve(&self, target: &Target, workspace: PathBuf) -> io::Result<Attachment> {
-        let slots = self.slots();
         let found = match target {
             Target::New => return self.create(workspace),
-            Target::Id(id) => slots.iter().find(|s| s.header.id == *id),
+            Target::Id(id) => self.slot(*id),
             // A child is reached through its parent, not resumed as latest.
-            Target::Latest { any_workspace } => slots.iter().rev().find(|s| {
-                s.header.parent.is_none() && (*any_workspace || s.header.workspace == workspace)
-            }),
+            Target::Latest { any_workspace } => lock(&self.slots)
+                .iter()
+                .rev()
+                .find(|s| {
+                    s.header.parent.is_none() && (*any_workspace || s.header.workspace == workspace)
+                })
+                .cloned(),
         };
         let slot =
             found.ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, "no matching session"))?;
-        self.with_live(slot, Session::open)
+        self.with_live(&slot, Session::open)
     }
 
     fn create(&self, workspace: PathBuf) -> io::Result<Attachment> {
@@ -305,11 +319,7 @@ impl Daemon {
         let loaded = self.shared.store.create(&header)?;
         let session = Session::start(header.clone(), loaded, Arc::clone(&self.shared));
         let attachment = session.open();
-        lock(&self.slots).push(Arc::new(Slot {
-            header,
-            live: Mutex::new(Some(session)),
-            heard: AtomicBool::new(false),
-        }));
+        lock(&self.slots).push(Slot::new(header, Some(session)));
         Ok(attachment)
     }
 
@@ -652,7 +662,6 @@ fn handle(daemon: &Daemon, life: &Lifecycle, conn: &UnixStream) -> io::Result<()
                 client: registered.client(),
                 attached: None,
                 decl: ClientDecl::default(),
-                answers: Answers::default(),
             };
             conn.reply(&DaemonMsg::Welcome {
                 proto,
@@ -703,7 +712,6 @@ struct Conn<'a> {
     client: u32,
     attached: Option<Attachment>,
     decl: ClientDecl,
-    answers: Answers,
 }
 
 impl Conn<'_> {
@@ -717,15 +725,11 @@ impl Conn<'_> {
 
     #[cfg(unix)]
     fn serve(&mut self, reader: &mut BufReader<UnixStream>) -> io::Result<()> {
+        let mut answers = Answers::default();
         while let Some(mut msg) = read_frame::<ClientMsg>(reader)? {
             if let Some(&mut client_seq) = msg.client_seq_mut() {
                 let answer = match client_seq {
-                    Some(seq) => {
-                        let mut answers = mem::take(&mut self.answers);
-                        let answer = answers.answer(seq, || self.mutate(msg));
-                        self.answers = answers;
-                        answer
-                    }
+                    Some(seq) => answers.answer(seq, || self.mutate(msg)),
                     None => self.mutate(msg),
                 };
                 self.answered(client_seq, answer);

@@ -165,6 +165,17 @@ pub fn untaken(entries: &[Entry]) -> VecDeque<(u64, String, bool)> {
     waiting
 }
 
+/// The model and tool calls in `entries` that have an outcome.
+pub fn finished(entries: &[Entry]) -> HashSet<u64> {
+    entries
+        .iter()
+        .filter_map(|e| match e.body {
+            Body::ToolResult { call, .. } | Body::ModelResult { call, .. } => Some(call),
+            _ => None,
+        })
+        .collect()
+}
+
 /// The output tool call `call` committed as it ran, if any.
 pub fn partial(entries: &[Entry], call: u64) -> Option<String> {
     let mut output: Option<String> = None;
@@ -236,13 +247,7 @@ pub fn recap(entries: &[Entry], since: u64) -> Option<Recap> {
         ..Recap::default()
     };
     let after = &entries[start.map_or(0, |at| at + 1)..];
-    let finished: HashSet<u64> = after
-        .iter()
-        .filter_map(|e| match e.body {
-            Body::ToolResult { call, .. } | Body::ModelResult { call, .. } => Some(call),
-            _ => None,
-        })
-        .collect();
+    let finished = finished(after);
     for e in after {
         let open = !finished.contains(&e.seq) && !asks.contains(&e.seq);
         match &e.body {

@@ -19,6 +19,7 @@ use protocol::{
     Activity, Body, Cap, DaemonMsg, Decision, Entry, Environment, Frame, Installed, Outcome,
     Overrides, Residency, SessionId, SessionSummary,
 };
+use rt::BoxFuture;
 use serde_json::{Value, json};
 use store::{Header, Loaded, Log, LogStore, Parent};
 
@@ -31,7 +32,7 @@ mod links;
 #[cfg(test)]
 mod tests;
 
-use facts::{ask, inbox, partial, recap, replay, transcript, untaken};
+use facts::{ask, finished, inbox, partial, recap, replay, transcript, untaken};
 
 /// What every session runs with.
 pub struct Shared {
@@ -385,9 +386,7 @@ impl Session {
         lock(&self.answers).wake();
         let _ = self.mailbox.send(Msg::Stop);
         for pgid in lock(&self.jobs).drain(..) {
-            if let Err(e) = sys::kill_process_group(pgid) {
-                self.warn(format_args!("killing background group {pgid}: {e}"));
-            }
+            self.kill(pgid);
         }
         self.registry().hooks().session_end(self.id);
     }
@@ -419,12 +418,12 @@ impl Session {
         since: u64,
         with_recap: bool,
     ) -> Vec<Frame> {
-        let mut frames = Vec::new();
-        let mut push = |msg: &DaemonMsg| frames.extend(Frame::new(msg));
-        push(&DaemonMsg::Attached {
+        let mut frames: Vec<Frame> = Frame::new(&DaemonMsg::Attached {
             session: self.id,
             workspace: self.workspace.clone(),
-        });
+        })
+        .into_iter()
+        .collect();
         let missed = entries.iter().filter(|e| e.seq > since);
         let snapshot = (client.caps().has(Cap::Snapshot) && missed.clone().count() > SNAPSHOT_GAP)
             .then(|| {
@@ -496,6 +495,12 @@ impl Session {
 
     fn warn(&self, problem: impl Display) {
         eprintln!("session {}: {problem}", self.id.short());
+    }
+
+    fn kill(&self, pgid: u32) {
+        if let Err(e) = sys::kill_process_group(pgid) {
+            self.warn(format_args!("killing process group {pgid}: {e}"));
+        }
     }
 
     /// Commits an entry and every one recorded before it, returning its seq.
@@ -669,7 +674,7 @@ impl Session {
     async fn run(&self, mailbox: &rt::channel::Receiver<Msg>, fresh: bool) {
         let kind = self.shared.models.settings.agent(&self.workspace);
         let mut agent = kind.agent();
-        let mut ok = fresh || Box::pin(self.work(self.recover(agent.as_mut()))).await;
+        let mut ok = fresh || Box::pin(self.work(Box::pin(self.recover(agent.as_mut())))).await;
         loop {
             if !ok {
                 agent = kind.agent();
@@ -682,13 +687,13 @@ impl Session {
             ok = match mailbox.recv().await {
                 Some(Msg::Queued) => {
                     let next = lock(&self.waiting).pop_front();
-                    let take = async {
+                    let take = Box::pin(async {
                         match next {
                             Some(input) => self.take(agent.as_mut(), input).await,
                             // A turn took it up already, as a steer.
                             None => Ok(()),
                         }
-                    };
+                    });
                     Box::pin(self.work(take)).await
                 }
                 Some(Msg::Settled { child, outcome }) => {
@@ -732,7 +737,8 @@ impl Session {
     /// Runs one queued unit of work, with a busy marker on disk for as long
     /// as anything is in flight, and commits what it recorded. An interrupt
     /// from here on stops it. Returns whether it all went well.
-    async fn work(&self, job: impl Future<Output = io::Result<()>>) -> bool {
+    /// The job is boxed so that every kind of work shares one copy of this.
+    async fn work(&self, job: BoxFuture<'_, io::Result<()>>) -> bool {
         let began = crate::stamp();
         self.touch();
         *lock(&self.cancel) = Cancel::default();
@@ -1316,9 +1322,7 @@ impl Session {
         // ended now. Later loads in this daemon find them ended by `stop`.
         if lock(&self.shared.loaded).insert(self.id) {
             for pgid in jobs.into_iter().filter(|&pgid| sys::group_alive(pgid)) {
-                if let Err(e) = sys::kill_process_group(pgid) {
-                    self.warn(format_args!("killing background group {pgid}: {e}"));
-                }
+                self.kill(pgid);
             }
         }
         // A command cut off is not run again.
@@ -1336,12 +1340,9 @@ impl Session {
             asked,
         } in dangling
         {
-            let this_boot = processes
-                .iter()
-                .filter(|(_, boot)| Some(boot.as_str()) == sys::boot_id());
-            for (pgid, _) in this_boot {
-                if let Err(e) = sys::kill_process_group(*pgid) {
-                    self.warn(format_args!("killing process group {pgid}: {e}"));
+            for (pgid, boot) in processes {
+                if Some(boot.as_str()) == sys::boot_id() {
+                    self.kill(pgid);
                 }
             }
             let interrupted = || Outcome::Interrupted {
@@ -1517,16 +1518,9 @@ fn note_extensions(header: &Header, loaded: &mut Loaded, registry: &Registry) ->
     if same {
         return Ok(());
     }
-    let entry = Entry::new(
-        loaded.entries.len() as u64 + 1,
-        loaded.epoch,
-        Body::Extensions {
-            installed: installed(registry),
-        },
-    );
-    loaded.log.append(&entry)?;
-    loaded.entries.push(entry);
-    Ok(())
+    loaded.append(Body::Extensions {
+        installed: installed(registry),
+    })
 }
 
 /// The registry's extensions as a log records them.
@@ -1600,13 +1594,7 @@ fn find_call(dangling: &mut [Dangling], call: u64) -> Option<&mut Dangling> {
 }
 
 fn dangling_calls(entries: &[Entry]) -> Vec<Dangling> {
-    let finished: HashSet<u64> = entries
-        .iter()
-        .filter_map(|e| match &e.body {
-            Body::ToolResult { call, .. } | Body::ModelResult { call, .. } => Some(*call),
-            _ => None,
-        })
-        .collect();
+    let finished = finished(entries);
     let mut dangling: Vec<Dangling> = Vec::new();
     for e in entries {
         let call = match &e.body {

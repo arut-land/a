@@ -70,7 +70,7 @@ impl LogStore for Jsonl {
                 }
             }
         }
-        headers.sort_by_key(|h| h.id.0);
+        headers.sort_unstable_by_key(|h| h.id.0);
         Ok(headers)
     }
 
@@ -144,10 +144,6 @@ struct JsonlLog {
 }
 
 impl Log for JsonlLog {
-    fn append(&mut self, entry: &Entry) -> io::Result<()> {
-        self.append_all(std::slice::from_ref(entry))
-    }
-
     /// One write and one sync for the lot.
     fn append_all(&mut self, entries: &[Entry]) -> io::Result<()> {
         self.lease.admit(entries)?;
