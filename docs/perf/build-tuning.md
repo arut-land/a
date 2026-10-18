@@ -73,6 +73,9 @@ Researched 2026-10-18 on macOS arm64, `nightly-2026-10-17`, ld-prime.
 | rig vendored, catalog trimmed, pricing patched out | 2453 KiB | 4.7 MB |
 | `crates/llm` (Responses only), stateless replay of provider items | 1774 KiB | 4.7 MB (two turns, encrypted reasoning replayed) |
 | `crates/llm`, all four wires (Responses, Chat with 24 hosts, Messages with 5, Gemini) | 2114 KiB | 4.4 MB (two turns on Claude through Messages) |
+| Simplified: shared model facts, `SmolStr` ids, typed borrowing stream parsers (decode ~2x faster, allocations per text frame 17→2 on Responses, 53→9 on Gemini) | 2291 KiB | — |
+| One deserializer instantiation per typed frame (Chat's repeated-key fallback reparses text) | 2259 KiB | — |
+| `llm` at `opt-level = "s"` (decoders ~6% slower per frame) | 2098 KiB | — |
 
 ## Rejected for now, with the reason and when to revisit
 

@@ -641,13 +641,16 @@ impl Writes for ChatDecoder {
             return self.finish();
         }
         let decode = |error| Error::decode(error, data);
-        let value: Value;
+        let rewritten: String;
         let frame: Json<'_, Frame<'_>, IgnoredAny> = if let Ok(frame) = serde_json::from_str(data) {
             frame
         } else {
-            // A frame that repeats a key: as a `Value`, the last one stands.
-            value = serde_json::from_str(data).map_err(decode)?;
-            Json::deserialize(&value).map_err(decode)?
+            // A frame that repeats a key: as a `Value` the last one stands,
+            // and written back out it reads through the same deserializer
+            // (one instantiation of the typed frame, not two).
+            let value: Value = serde_json::from_str(data).map_err(decode)?;
+            rewritten = value.to_string();
+            serde_json::from_str(&rewritten).map_err(decode)?
         };
         let frame = match frame {
             Json::Object(frame) => frame,

@@ -40,3 +40,8 @@ opt-level = "s"
 
 [profile.release.package.usage-argv]
 opt-level = "s"
+
+# Network time dominates the provider layer: s costs its decoders ~6% per
+# frame and saves ~160 KiB.
+[profile.release.package.llm]
+opt-level = "s"
