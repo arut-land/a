@@ -1043,8 +1043,24 @@ fn slash_commands_run_without_a_turn_and_input_hooks_rewrite_or_refuse() {
     let log = log_of(&session);
     session.stop();
 
+    // The command's result commits as soon as it has run: before or after
+    // the input behind it is taken in, but before that input is taken up.
+    let (ran, rest): (Vec<&Entry>, Vec<&Entry>) = log
+        .iter()
+        .partition(|e| matches!(e.body, Body::CommandResult { .. }));
+    let done = Body::CommandResult {
+        call: 1,
+        outcome: Outcome::Done {
+            output: "all of them in 1".into(),
+        },
+    };
+    assert!(matches!(&ran[..], [e] if e.seq < rest[4].seq && e.body == done));
+    let rest: Vec<Entry> = (1..)
+        .zip(rest)
+        .map(|(seq, e)| entry(seq, e.body.clone()))
+        .collect();
     assert_eq!(
-        bodies(&log),
+        bodies(&rest),
         [
             &Body::Command {
                 name: "jobs".into(),
@@ -1058,12 +1074,6 @@ fn slash_commands_run_without_a_turn_and_input_hooks_rewrite_or_refuse() {
                 }
             },
             &queued("SHOUT HI"),
-            &Body::CommandResult {
-                call: 1,
-                outcome: Outcome::Done {
-                    output: "all of them in 1".into()
-                }
-            },
             &user("/nope"),
             &echo("/nope"),
             &user("SHOUT HI"),
@@ -1075,7 +1085,7 @@ fn slash_commands_run_without_a_turn_and_input_hooks_rewrite_or_refuse() {
 
     // A command cut off by a crash is not run again; the input queued
     // behind it is taken up in order.
-    let cut = fixture.start(&log[..4]);
+    let cut = fixture.start(&rest[..4]);
     let recovered = log_of(&cut);
     cut.stop();
     assert_eq!(
