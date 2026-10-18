@@ -2,6 +2,7 @@
 
 mod model;
 mod session;
+mod upgrade;
 
 use std::fs::{File, OpenOptions};
 use std::io::{self, BufReader, Write};
@@ -13,11 +14,12 @@ use std::thread;
 use std::time::{Duration, Instant};
 
 use protocol::{
-    BUILD, ClientMsg, DaemonMsg, PROTO, SessionId, SessionSummary, Target, read_frame, write_frame,
+    ClientMsg, DaemonMsg, PROTO, SessionId, SessionSummary, Target, read_frame, write_frame,
 };
 use session::{Attachment, Session, Shared};
 use store::{Header, Store};
 use sys::Home;
+use upgrade::{Lifecycle, Verdict};
 
 #[cfg(unix)]
 use std::os::unix::net::{UnixListener, UnixStream};
@@ -29,6 +31,8 @@ pub struct Config {
     pub idle: Duration,
     /// `A_HIBERNATE_SECS`: unload a session after this long unused.
     pub hibernate: Duration,
+    /// `A_DRAIN_SECS`: how long an upgrade waits for in-flight work.
+    pub drain: Duration,
     /// `A_AGENT`: `echo` needs no model; anything else chats.
     pub agent: agent::Kind,
     /// `A_MODEL`: `host:model`, or a bare model on `OpenAI`.
@@ -40,6 +44,7 @@ impl Default for Config {
         Self {
             idle: Duration::from_secs(600),
             hibernate: Duration::from_secs(300),
+            drain: Duration::from_secs(60),
             agent: agent::Kind::Chat,
             model: "gpt-6-luna".to_owned(),
         }
@@ -56,6 +61,7 @@ impl Config {
         Self {
             idle: var("A_IDLE_SECS").map_or(defaults.idle, Duration::from_secs),
             hibernate: var("A_HIBERNATE_SECS").map_or(defaults.hibernate, Duration::from_secs),
+            drain: var("A_DRAIN_SECS").map_or(defaults.drain, Duration::from_secs),
             agent: var("A_AGENT").unwrap_or(defaults.agent),
             model: var("A_MODEL").unwrap_or(defaults.model),
         }
@@ -203,35 +209,52 @@ impl Daemon {
         }
     }
 
+    fn has_work(&self) -> bool {
+        self.slots()
+            .iter()
+            .any(|slot| lock(&slot.live).as_ref().is_some_and(|s| s.has_work()))
+    }
+
     /// No connections, and no loaded session has work.
     fn idle(&self) -> bool {
-        self.clients.load(Ordering::SeqCst) == 0
-            && !self
-                .slots()
-                .iter()
-                .any(|slot| lock(&slot.live).as_ref().is_some_and(|s| s.has_work()))
+        self.clients.load(Ordering::SeqCst) == 0 && !self.has_work()
     }
 
     /// Hibernates idle sessions, and exits once the whole daemon has been
-    /// idle for `idle`.
-    fn supervise(&self, idle: Duration, hibernate: Duration, socket: &Path) {
+    /// idle for `config.idle`, or once a drain has no work left or runs out
+    /// of grace. Every entry is durable when written, so exiting is all a
+    /// drain needs; unfinished calls recover in the next daemon.
+    fn supervise(&self, life: &Lifecycle, config: &Config, socket: &Path, pid: File) {
         let mut since: Option<Instant> = None;
         loop {
             thread::sleep(Duration::from_millis(250));
-            self.hibernate(hibernate);
+            self.hibernate(config.hibernate);
+            if let Some(began) = life.draining() {
+                if !self.has_work() || began.elapsed() >= config.drain {
+                    exit(socket, pid, "drained for a newer build");
+                }
+                continue;
+            }
             if !self.idle() {
                 since = None;
                 continue;
             }
-            if since.get_or_insert_with(Instant::now).elapsed() >= idle {
-                // Unlink first so new clients spawn a fresh daemon; one that
-                // raced into our backlog sees EOF and retries.
-                let _ = std::fs::remove_file(socket);
-                eprintln!("idle for {}s, exiting", idle.as_secs());
-                std::process::exit(0);
+            if since.get_or_insert_with(Instant::now).elapsed() >= config.idle {
+                exit(socket, pid, &format!("idle for {}s", config.idle.as_secs()));
             }
         }
     }
+}
+
+/// Unlinks the socket first so new clients spawn a fresh daemon (one that
+/// raced into our backlog sees EOF and retries), then releases the pid lock
+/// before the process closes its connections: a client reconnecting on EOF
+/// finds the lock free for the daemon it spawns.
+fn exit(socket: &Path, pid: File, why: &str) -> ! {
+    let _ = std::fs::remove_file(socket);
+    drop(pid);
+    eprintln!("{why}, exiting");
+    std::process::exit(0)
 }
 
 /// Counts one open connection for as long as it lives.
@@ -250,22 +273,28 @@ impl Drop for Client<'_> {
     }
 }
 
-/// Runs the daemon until it has been idle for `config.idle`: no attached
-/// clients and no unfinished work. Sessions live in their logs, so the next
-/// client simply starts a new daemon.
+/// Runs the daemon, as staged build `build`, until it has been idle for
+/// `config.idle` (no attached clients and no unfinished work) or has drained
+/// for a newer build. Sessions live in their logs, so the next client simply
+/// starts a new daemon.
 #[cfg(unix)]
-pub fn serve(listener: &UnixListener, home: &Home, config: &Config) -> io::Result<()> {
-    let _writer = claim(home)?;
+pub fn serve(listener: &UnixListener, home: &Home, config: &Config, build: &str) -> io::Result<()> {
+    let pid = claim(home)?;
     let daemon = Arc::new(Daemon::load(home, config)?);
-    let monitor = Arc::clone(&daemon);
-    let (idle, hibernate, socket) = (config.idle, config.hibernate, home.socket());
-    thread::spawn(move || monitor.supervise(idle, hibernate, &socket));
+    let life = Arc::new(Lifecycle::new(build.to_owned(), home.runtime()));
+    let (monitor, watch, config, socket) = (
+        Arc::clone(&daemon),
+        Arc::clone(&life),
+        config.clone(),
+        home.socket(),
+    );
+    thread::spawn(move || monitor.supervise(&watch, &config, &socket, pid));
     for conn in listener.incoming() {
         let conn = conn?;
-        let daemon = Arc::clone(&daemon);
+        let (daemon, life) = (Arc::clone(&daemon), Arc::clone(&life));
         thread::spawn(move || {
             let _client = Client::new(&daemon.clients);
-            if let Err(e) = handle(&daemon, conn) {
+            if let Err(e) = handle(&daemon, &life, conn) {
                 eprintln!("connection: {e}");
             }
         });
@@ -295,7 +324,7 @@ fn claim(home: &Home) -> io::Result<File> {
 }
 
 #[cfg(unix)]
-fn handle(daemon: &Daemon, conn: UnixStream) -> io::Result<()> {
+fn handle(daemon: &Daemon, life: &Lifecycle, conn: UnixStream) -> io::Result<()> {
     let mut reader = BufReader::new(conn.try_clone()?);
     let (tx, rx) = mpsc::channel::<DaemonMsg>();
     let mut writer = conn;
@@ -311,16 +340,28 @@ fn handle(daemon: &Daemon, conn: UnixStream) -> io::Result<()> {
     let reply = |msg| drop(tx.send(msg));
     let error = |message: String| reply(DaemonMsg::Error { message });
 
-    match read_frame(&mut reader)? {
-        Some(ClientMsg::Hello { proto, .. }) if proto == PROTO => reply(DaemonMsg::Welcome {
+    let verdict = match read_frame(&mut reader)? {
+        Some(ClientMsg::Hello { proto, build }) => life.verdict(proto, &build),
+        _ => Verdict::Mismatch,
+    };
+    match verdict {
+        Verdict::Welcome => reply(DaemonMsg::Welcome {
             proto: PROTO,
-            build: BUILD.to_owned(),
+            build: life.build.clone(),
         }),
-        _ => {
+        Verdict::Mismatch => {
             reply(DaemonMsg::Mismatch { supported: PROTO });
             return Ok(());
         }
+        Verdict::Drain => {
+            life.drain();
+            reply(DaemonMsg::Draining);
+            // Held open until we exit: the client's cue to reconnect.
+            while read_frame::<ClientMsg>(&mut reader)?.is_some() {}
+            return Ok(());
+        }
     }
+    let _registered = life.register(tx.clone());
 
     let mut attached: Option<Attachment> = None;
     while let Some(msg) = read_frame(&mut reader)? {
@@ -336,6 +377,11 @@ fn handle(daemon: &Daemon, conn: UnixStream) -> io::Result<()> {
                 }
                 Err(e) => error(e.to_string()),
             },
+            ClientMsg::Input { .. } if life.draining().is_some() => {
+                error(
+                    "the daemon is restarting for an upgrade; send that again in a moment".into(),
+                );
+            }
             ClientMsg::Input { text } => match &attached {
                 Some(s) => s.session().submit(text),
                 None => error("not attached".into()),

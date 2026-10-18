@@ -39,5 +39,7 @@ check = { depends = ["check:fmt", "check:clippy"], run = "mise run test" }
 size = { depends = ["release"], run = 'f=target/release/a; [[ -e $f.exe ]] && f+=.exe; b=$(wc -c < "$f"); echo "a: $((b / 1024)) KiB of 4096 KiB"; ((b <= 4194304))' }
 startup = { depends = ["release"], run = 'hyperfine -N --warmup 50 -r 500 "target/release/a --version"' }
 bloat = "cargo bloat --release --crates -n 20"
-"generate:usage" = "cargo run -q -p a -- __usage_spec__ > apps/cli/a.usage.kdl"
+# The binary embeds the checked-in file, so the test (which links the spec
+# writer) is what rewrites it.
+"generate:usage" = "UPDATE_USAGE=1 cargo test -q -p a --bin a embedded_spec"
 "bloat:lines" = "cargo llvm-lines --release -p a | head -30"

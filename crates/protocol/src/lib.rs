@@ -10,7 +10,6 @@ use serde_json::Value;
 use uuid::Uuid;
 
 pub const PROTO: u32 = 1;
-pub const BUILD: &str = env!("CARGO_PKG_VERSION");
 
 const MAX_FRAME: u32 = 16 * 1024 * 1024;
 
@@ -177,6 +176,7 @@ pub struct SessionSummary {
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(tag = "t", rename_all = "snake_case")]
 pub enum ClientMsg {
+    /// `build` is the client's staged build id (`<version>+<hash>`).
     Hello {
         proto: u32,
         build: String,
@@ -203,6 +203,11 @@ pub enum DaemonMsg {
     Mismatch {
         supported: u32,
     },
+    /// A newer build was staged: the daemon finishes in-flight work, exits,
+    /// and closes every connection. Clients then reconnect, which starts the
+    /// new build, and re-attach to replay what they missed. Sent as the reply
+    /// to a hello, or to connections already open when the drain began.
+    Draining,
     Attached {
         session: SessionId,
         workspace: PathBuf,
@@ -284,6 +289,14 @@ mod tests {
         let id = SessionId(Uuid::from_u128(0x0123_4567_89ab_cdef_0123_4567_89ab_cdef));
         assert_eq!(id.to_string(), "0123456789abcdef0123456789abcdef");
         assert_eq!(id.short().to_string(), "89abcdef");
+    }
+
+    #[test]
+    fn draining_is_a_bare_tag() {
+        assert_eq!(
+            serde_json::to_string(&DaemonMsg::Draining).unwrap(),
+            r#"{"t":"draining"}"#
+        );
     }
 
     #[test]

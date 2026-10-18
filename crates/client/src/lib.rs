@@ -1,29 +1,34 @@
-//! Client side: connect to the per-user daemon, spawning it if needed.
+//! Client side: reach a daemon and complete the hello. This machine's daemon
+//! is reached over its Unix socket and spawned if needed; another machine's
+//! through `ssh <host> a bridge`, whose stdio carries the same frames.
+
+#[cfg(unix)]
+mod remote;
 
 use std::fs::{self, File};
-use std::io::{self, BufReader};
+use std::io::{self, BufReader, Read, Write};
 use std::path::PathBuf;
 use std::thread;
 use std::time::{Duration, Instant};
 
-use protocol::{BUILD, ClientMsg, DaemonMsg, PROTO, read_frame, write_frame};
+use protocol::{ClientMsg, DaemonMsg, PROTO, read_frame, write_frame};
 use sys::{Home, Signal};
 
 #[cfg(unix)]
 use std::os::unix::net::UnixStream;
-
 #[cfg(unix)]
-pub struct Reader(BufReader<UnixStream>);
+use sys::Staged;
 
-#[cfg(unix)]
-pub struct Writer(UnixStream);
+/// The read half of a connection, over any byte stream.
+pub struct Reader(BufReader<Box<dyn Read + Send>>);
+
+/// The write half of a connection.
+pub struct Writer(Box<dyn Write + Send>);
 
 /// A daemon connection, split so reading and writing can run on their own
 /// threads.
-#[cfg(unix)]
 pub type Connection = (Reader, Writer);
 
-#[cfg(unix)]
 impl Reader {
     pub fn recv(&mut self) -> io::Result<Option<DaemonMsg>> {
         read_frame(&mut self.0)
@@ -38,38 +43,95 @@ impl Reader {
         }
         Err(io::Error::other("daemon closed the connection"))
     }
+
+    /// Waits for a draining daemon to close the connection as it exits.
+    fn drained(&mut self) -> io::Result<()> {
+        while self.recv()?.is_some() {}
+        Ok(())
+    }
 }
 
-#[cfg(unix)]
 impl Writer {
     pub fn send(&mut self, msg: &ClientMsg) -> io::Result<()> {
         write_frame(&mut self.0, msg)
     }
 }
 
+/// Where a daemon is.
+#[derive(Clone, Debug)]
+pub enum Endpoint {
+    /// This machine's, over its Unix socket.
+    Local(Home),
+    /// Another machine's, through `ssh <host> a bridge`.
+    Ssh(String),
+}
+
 /// How long a daemon may take to answer the hello before it counts as wedged.
 pub const HELLO_TIMEOUT: Duration = Duration::from_secs(2);
 
-/// Connects to the daemon (spawning it when absent) and completes the hello.
-/// A daemon that does not answer in time fails with `ErrorKind::TimedOut`;
-/// see [`diagnose`] and [`restart`].
+/// How long to wait for a draining daemon: its grace plus a margin.
+const DRAIN_TIMEOUT: Duration = Duration::from_secs(75);
+
+/// Connects as build `staged` and completes the hello. A daemon draining for
+/// a newer build is waited out (`on_drain` says so first), then the next
+/// attempt starts the new build. A local daemon that does not answer in time
+/// fails with `ErrorKind::TimedOut`; see [`diagnose`] and [`restart`].
 #[cfg(unix)]
-pub fn connect(home: &Home) -> io::Result<Connection> {
-    match hello(connect_or_spawn(home)?) {
-        // The daemon was exiting (idle) as we connected: start a fresh one.
-        Err(e) if e.kind() == io::ErrorKind::UnexpectedEof => hello(connect_or_spawn(home)?),
-        result => result,
+pub fn connect(
+    endpoint: &Endpoint,
+    staged: &Staged,
+    on_drain: &dyn Fn(),
+) -> io::Result<Connection> {
+    // A daemon exiting (idle) as we connect, or draining, gets one more try
+    // each.
+    for _ in 0..3 {
+        let (stream, (mut reader, mut writer)) = match endpoint {
+            Endpoint::Local(home) => {
+                let stream = connect_or_spawn(home)?;
+                stream.set_read_timeout(Some(HELLO_TIMEOUT))?;
+                let halves = split(&stream)?;
+                (Some(stream), halves)
+            }
+            Endpoint::Ssh(host) => (None, remote::open(host, staged)?),
+        };
+        match hello(&mut reader, &mut writer, &staged.id) {
+            Ok(Greeting::Welcome) => {
+                if let Some(stream) = &stream {
+                    stream.set_read_timeout(None)?;
+                }
+                return Ok((reader, writer));
+            }
+            Ok(Greeting::Draining) => {
+                on_drain();
+                if let Some(stream) = &stream {
+                    stream.set_read_timeout(Some(DRAIN_TIMEOUT))?;
+                }
+                reader.drained()?;
+            }
+            Err(e) if e.kind() == io::ErrorKind::UnexpectedEof => {}
+            Err(e) => return Err(e),
+        }
     }
+    Err(io::Error::other("the daemon kept closing the connection"))
 }
 
 #[cfg(unix)]
-fn hello(stream: UnixStream) -> io::Result<Connection> {
-    stream.set_read_timeout(Some(HELLO_TIMEOUT))?;
-    let mut reader = Reader(BufReader::new(stream.try_clone()?));
-    let mut writer = Writer(stream);
+fn split(stream: &UnixStream) -> io::Result<Connection> {
+    Ok((
+        Reader(BufReader::new(Box::new(stream.try_clone()?))),
+        Writer(Box::new(stream.try_clone()?)),
+    ))
+}
+
+enum Greeting {
+    Welcome,
+    Draining,
+}
+
+fn hello(reader: &mut Reader, writer: &mut Writer, build: &str) -> io::Result<Greeting> {
     writer.send(&ClientMsg::Hello {
         proto: PROTO,
-        build: BUILD.to_owned(),
+        build: build.to_owned(),
     })?;
     let reply = reader.recv().map_err(|e| match e.kind() {
         io::ErrorKind::WouldBlock | io::ErrorKind::TimedOut => {
@@ -78,9 +140,9 @@ fn hello(stream: UnixStream) -> io::Result<Connection> {
         io::ErrorKind::ConnectionReset => io::ErrorKind::UnexpectedEof.into(),
         _ => e,
     })?;
-    writer.0.set_read_timeout(None)?;
     match reply {
-        Some(DaemonMsg::Welcome { .. }) => Ok((reader, writer)),
+        Some(DaemonMsg::Welcome { .. }) => Ok(Greeting::Welcome),
+        Some(DaemonMsg::Draining) => Ok(Greeting::Draining),
         Some(DaemonMsg::Mismatch { supported }) => Err(io::Error::other(format!(
             "daemon speaks protocol {supported}, this client {PROTO}; restart the daemon"
         ))),
@@ -149,13 +211,48 @@ pub fn stop(home: &Home) -> io::Result<bool> {
 
 /// Stops any running daemon and connects to a fresh one.
 #[cfg(unix)]
-pub fn restart(home: &Home) -> io::Result<Connection> {
+pub fn restart(home: &Home, staged: &Staged) -> io::Result<Connection> {
     stop(home)?;
-    connect(home)
+    connect(&Endpoint::Local(home.clone()), staged, &|| {})
+}
+
+/// Serves `ssh <host> a bridge`: connects to this machine's daemon, prints
+/// the `A-BRIDGE <token>` sync line so the far side can skip whatever the
+/// login shell printed, then pipes stdin and stdout to the socket verbatim.
+/// The far client does its own hello. Ends when either side closes: the
+/// daemon may keep a connection open after its client is done.
+#[cfg(unix)]
+pub fn bridge(home: &Home, token: &str) -> io::Result<()> {
+    let stream = connect_or_spawn(home)?;
+    let mut stdout = io::stdout().lock();
+    writeln!(stdout, "{} {token}", remote::SYNC)?;
+    stdout.flush()?;
+    let mut up = stream.try_clone()?;
+    thread::spawn(move || {
+        let _ = pump(io::stdin().lock(), &mut up);
+        std::process::exit(0);
+    });
+    pump(&stream, stdout)
+}
+
+/// Copies until EOF, flushing each read: stdout is line-buffered and frames
+/// are not lines.
+#[cfg(unix)]
+fn pump(mut from: impl Read, mut to: impl Write) -> io::Result<()> {
+    let mut buf = vec![0; 64 * 1024];
+    loop {
+        let n = from.read(&mut buf)?;
+        if n == 0 {
+            return Ok(());
+        }
+        to.write_all(&buf[..n])?;
+        to.flush()?;
+    }
 }
 
 /// Zero-lag start: when no daemon is listening, bind the socket here, hand the
-/// listening fd to a detached daemon, and connect straight into its backlog.
+/// listening fd to a detached daemon running `runtime/current`, and connect
+/// straight into its backlog.
 #[cfg(unix)]
 fn connect_or_spawn(home: &Home) -> io::Result<UnixStream> {
     use std::fs::OpenOptions;
@@ -190,7 +287,7 @@ fn connect_or_spawn(home: &Home) -> io::Result<UnixStream> {
         .create(true)
         .append(true)
         .open(log_path)?;
-    Command::new(std::env::current_exe()?)
+    Command::new(home.runtime().current_exe())
         .args(["__daemon", "--listen-fd", &fd.to_string()])
         .stdin(Stdio::null())
         .stdout(Stdio::null())

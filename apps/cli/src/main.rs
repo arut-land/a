@@ -1,15 +1,20 @@
 use std::io::{self, BufRead, IsTerminal, Write};
 use std::process::ExitCode;
+use std::sync::{Arc, Mutex, PoisonError};
 use std::thread;
 
+use client::Endpoint;
 use protocol::{Body, ClientMsg, DaemonMsg, Outcome, SessionId, SessionSummary, Target};
-use sys::Home;
+use sys::{Home, Staged};
 use usage_rs::{Cli, Subcommands};
 
 /// Agent engine: attach to durable sessions run by a per-user daemon.
 #[derive(Cli)]
 #[usage(bin = "a", version = "0.0.0", spec_endpoint_file = "a.usage.kdl")]
 struct Args {
+    /// Use the daemon on HOST, reached with `ssh HOST a bridge`
+    #[usage(long, global, env = "A_HOST", value_name = "HOST")]
+    host: Option<String>,
     #[usage(subcommand)]
     cmd: Option<Cmd>,
 }
@@ -30,7 +35,10 @@ enum Cmd {
     /// Start a new session without attaching
     New,
     /// Pipe stdio to the local daemon (for `ssh host a bridge`)
-    Bridge,
+    Bridge {
+        /// Printed in the `A-BRIDGE` line that marks the start of the stream
+        token: Option<String>,
+    },
     /// Inspect or control the background daemon
     Daemon {
         #[usage(subcommand)]
@@ -54,18 +62,22 @@ enum DaemonCmd {
 }
 
 fn main() -> ExitCode {
-    let result = match Args::parse().cmd {
-        None => repl(Target::New),
-        Some(Cmd::Resume { id: None, any }) => repl(Target::Latest { any_workspace: any }),
+    let args = Args::parse();
+    let result = Ctx::new(args.host).and_then(|ctx| match args.cmd {
+        None => repl(ctx, Target::New),
+        Some(Cmd::Resume { id: None, any }) => repl(ctx, Target::Latest { any_workspace: any }),
         Some(Cmd::Resume { id: Some(id), .. } | Cmd::Attach { id }) => {
-            find(&id).and_then(|id| repl(Target::Id(id)))
+            find(&ctx, &id).and_then(|id| repl(ctx, Target::Id(id)))
         }
-        Some(Cmd::Ls) => ls(),
-        Some(Cmd::New) => new(),
-        Some(Cmd::Bridge) => Err(io::Error::other("bridge is not implemented yet")),
-        Some(Cmd::Daemon { action }) => daemon_cmd(&action),
-        Some(Cmd::Serve { listen_fd }) => daemon(listen_fd),
-    };
+        Some(Cmd::Ls) => ls(&ctx),
+        Some(Cmd::New) => new(&ctx),
+        Some(Cmd::Bridge { token }) => {
+            let token = token.as_deref().unwrap_or(&ctx.staged.id);
+            client::bridge(&ctx.home, token)
+        }
+        Some(Cmd::Daemon { action }) => daemon_cmd(&ctx, &action),
+        Some(Cmd::Serve { listen_fd }) => daemon(&ctx, listen_fd),
+    });
     match result {
         Ok(()) => ExitCode::SUCCESS,
         Err(e) => {
@@ -75,17 +87,56 @@ fn main() -> ExitCode {
     }
 }
 
-/// Connects to the daemon. A wedged daemon is diagnosed; at a terminal the
-/// user can restart it on the spot, elsewhere `a daemon restart` is suggested.
-fn connect() -> io::Result<client::Connection> {
-    let home = Home::from_env()?;
-    match client::connect(&home) {
-        Err(e) if e.kind() == io::ErrorKind::TimedOut => recover(&home),
-        result => result,
+/// This build, staged, and the daemon it talks to.
+#[derive(Clone)]
+struct Ctx {
+    home: Home,
+    staged: Staged,
+    endpoint: Endpoint,
+}
+
+impl Ctx {
+    /// Every entry point stages itself first, so the daemon it may spawn
+    /// runs the newest build.
+    fn new(host: Option<String>) -> io::Result<Self> {
+        let home = Home::from_env()?;
+        let staged = home.runtime().stage(&std::env::current_exe()?)?;
+        let endpoint = host.map_or_else(|| Endpoint::Local(home.clone()), Endpoint::Ssh);
+        Ok(Self {
+            home,
+            staged,
+            endpoint,
+        })
+    }
+
+    /// The home, for commands that only make sense on this machine.
+    fn local(&self) -> io::Result<&Home> {
+        match &self.endpoint {
+            Endpoint::Local(home) => Ok(home),
+            Endpoint::Ssh(host) => Err(io::Error::other(format!(
+                "this command acts on this machine; run it on {host} instead"
+            ))),
+        }
+    }
+
+    /// Connects to the daemon. A wedged local daemon is diagnosed; at a
+    /// terminal the user can restart it on the spot, elsewhere `a daemon
+    /// restart` is suggested.
+    fn connect(&self) -> io::Result<client::Connection> {
+        let on_drain = || eprintln!("[waiting for the previous daemon to finish its work]");
+        match client::connect(&self.endpoint, &self.staged, &on_drain) {
+            Err(e)
+                if e.kind() == io::ErrorKind::TimedOut
+                    && matches!(self.endpoint, Endpoint::Local(_)) =>
+            {
+                recover(&self.home, &self.staged)
+            }
+            result => result,
+        }
     }
 }
 
-fn recover(home: &Home) -> io::Result<client::Connection> {
+fn recover(home: &Home, staged: &Staged) -> io::Result<client::Connection> {
     let d = client::diagnose(home);
     let who = d.pid.map_or_else(
         || "the daemon".to_owned(),
@@ -108,7 +159,7 @@ fn recover(home: &Home) -> io::Result<client::Connection> {
         let mut answer = String::new();
         io::stdin().read_line(&mut answer)?;
         match answer.trim() {
-            "r" => return client::restart(home),
+            "r" => return client::restart(home, staged),
             "l" => {
                 for line in d.log_tail() {
                     eprintln!("  | {line}");
@@ -125,80 +176,117 @@ fn recover(home: &Home) -> io::Result<client::Connection> {
     }
 }
 
-fn daemon_cmd(action: &DaemonCmd) -> io::Result<()> {
-    let home = Home::from_env()?;
+fn daemon_cmd(ctx: &Ctx, action: &DaemonCmd) -> io::Result<()> {
+    let home = ctx.local()?;
     match action {
         DaemonCmd::Status => {
-            let d = client::diagnose(&home);
+            let d = client::diagnose(home);
             match d.pid {
                 None => println!("not running"),
-                Some(pid) => match client::connect(&home).and_then(list) {
-                    Ok(s) => println!("running (pid {pid}), {} sessions", s.len()),
-                    Err(e) => println!("running (pid {pid}) but not responding: {e}"),
-                },
+                Some(pid) => {
+                    match client::connect(&ctx.endpoint, &ctx.staged, &|| {}).and_then(list) {
+                        Ok(s) => println!("running (pid {pid}), {} sessions", s.len()),
+                        Err(e) => println!("running (pid {pid}) but not responding: {e}"),
+                    }
+                }
             }
             println!("log: {}", d.log.display());
         }
         DaemonCmd::Stop => {
-            let stopped = client::stop(&home)?;
+            let stopped = client::stop(home)?;
             println!("{}", if stopped { "stopped" } else { "not running" });
         }
         DaemonCmd::Restart => {
-            client::restart(&home)?;
+            client::restart(home, &ctx.staged)?;
             println!("restarted");
         }
     }
     Ok(())
 }
 
-/// Connects and asks to attach to `target` from this directory's workspace.
-fn attach(target: Target) -> io::Result<client::Connection> {
-    let (reader, mut writer) = connect()?;
+/// Connects and asks to attach to `target` from this directory's workspace,
+/// replaying entries after `since`.
+fn attach(ctx: &Ctx, target: Target, since: u64) -> io::Result<client::Connection> {
+    let (reader, mut writer) = ctx.connect()?;
     writer.send(&ClientMsg::Attach {
         target,
         workspace: sys::workspace_of(&std::env::current_dir()?),
-        since: 0,
+        since,
     })?;
     Ok((reader, writer))
 }
 
-fn repl(target: Target) -> io::Result<()> {
-    let (mut reader, mut writer) = attach(target)?;
+/// The line-mode client. When the daemon drains for an upgrade, it
+/// reconnects (starting the new build) and replays what it missed.
+fn repl(ctx: Ctx, target: Target) -> io::Result<()> {
+    let (mut reader, writer) = attach(&ctx, target, 0)?;
+    let writer = Arc::new(Mutex::new(writer));
+    let swap = Arc::clone(&writer);
     thread::spawn(move || {
         let mut view = View::default();
-        while let Ok(Some(msg)) = reader.recv() {
-            view.show(&msg);
+        loop {
+            while let Ok(Some(msg)) = reader.recv() {
+                view.show(&msg);
+            }
+            let Some(session) = view.session.filter(|_| view.draining) else {
+                eprintln!("[daemon disconnected]");
+                std::process::exit(1);
+            };
+            view.draining = false;
+            eprintln!("[daemon upgraded; reconnecting]");
+            let mut writer = swap.lock().unwrap_or_else(PoisonError::into_inner);
+            match attach(&ctx, Target::Id(session), view.seq) {
+                Ok((r, w)) => (reader, *writer) = (r, w),
+                Err(e) => {
+                    eprintln!("[reconnect failed: {e}]");
+                    std::process::exit(1);
+                }
+            }
         }
-        eprintln!("[daemon disconnected]");
-        std::process::exit(1);
     });
 
+    let send = |msg: &ClientMsg| {
+        writer
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .send(msg)
+    };
     for line in io::stdin().lock().lines() {
         let line = line?;
         match line.trim() {
             "" => {}
             "/detach" => break,
-            text => writer.send(&ClientMsg::Input {
-                text: text.to_owned(),
-            })?,
+            text => {
+                if let Err(e) = send(&ClientMsg::Input {
+                    text: text.to_owned(),
+                }) {
+                    eprintln!("[not sent: {e}]");
+                }
+            }
         }
     }
-    writer.send(&ClientMsg::Detach)?;
+    send(&ClientMsg::Detach)?;
     println!("[detached; the session keeps running. `a resume` to reattach]");
     Ok(())
 }
 
 /// Renders daemon messages. A model reply streams in as deltas; on replay
-/// there are none, so the committed text is printed instead.
+/// there are none, so the committed text is printed instead. Remembers what
+/// a reconnect needs.
 #[derive(Default)]
 struct View {
     streaming: Option<u64>,
+    session: Option<SessionId>,
+    /// The last entry seen, so a reconnect replays only what came after.
+    seq: u64,
+    draining: bool,
 }
 
 impl View {
     fn show(&mut self, msg: &DaemonMsg) {
         match msg {
             DaemonMsg::Attached { session, workspace } => {
+                self.session = Some(*session);
                 println!("[session {} · {}]", session.short(), workspace.display());
             }
             DaemonMsg::Delta { call, text } => {
@@ -209,8 +297,13 @@ impl View {
                 print!("{text}");
                 let _ = io::stdout().flush();
             }
-            DaemonMsg::Entry(e) => self.entry(&e.body),
-            DaemonMsg::Synced { .. } | DaemonMsg::Welcome { .. } | DaemonMsg::Sessions { .. } => {}
+            DaemonMsg::Entry(e) => {
+                self.seq = e.seq;
+                self.entry(&e.body);
+            }
+            DaemonMsg::Synced { seq } => self.seq = *seq,
+            DaemonMsg::Draining => self.draining = true,
+            DaemonMsg::Welcome { .. } | DaemonMsg::Sessions { .. } => {}
             DaemonMsg::Mismatch { supported } => eprintln!("[daemon speaks protocol {supported}]"),
             DaemonMsg::Error { message } => eprintln!("[error: {message}]"),
         }
@@ -296,8 +389,8 @@ fn list((mut reader, mut writer): client::Connection) -> io::Result<Vec<SessionS
     })
 }
 
-fn ls() -> io::Result<()> {
-    for s in list(connect()?)? {
+fn ls(ctx: &Ctx) -> io::Result<()> {
+    for s in list(ctx.connect()?)? {
         println!(
             "{}  {:>4} entries  {}",
             s.id.short(),
@@ -308,8 +401,8 @@ fn ls() -> io::Result<()> {
     Ok(())
 }
 
-fn find(prefix: &str) -> io::Result<SessionId> {
-    let matches: Vec<_> = list(connect()?)?
+fn find(ctx: &Ctx, prefix: &str) -> io::Result<SessionId> {
+    let matches: Vec<_> = list(ctx.connect()?)?
         .into_iter()
         .filter(|s| {
             s.id.short().to_string().starts_with(prefix) || s.id.to_string().starts_with(prefix)
@@ -324,8 +417,8 @@ fn find(prefix: &str) -> io::Result<SessionId> {
     }
 }
 
-fn new() -> io::Result<()> {
-    let (mut reader, mut writer) = attach(Target::New)?;
+fn new(ctx: &Ctx) -> io::Result<()> {
+    let (mut reader, mut writer) = attach(ctx, Target::New, 0)?;
     let session = reader.until(|msg| match msg {
         DaemonMsg::Attached { session, .. } => Some(session),
         _ => None,
@@ -335,19 +428,19 @@ fn new() -> io::Result<()> {
 }
 
 #[cfg(unix)]
-fn daemon(listen_fd: Option<i32>) -> io::Result<()> {
-    let home = Home::from_env()?;
+fn daemon(ctx: &Ctx, listen_fd: Option<i32>) -> io::Result<()> {
+    let home = &ctx.home;
     let listener = if let Some(fd) = listen_fd {
         sys::detach_session()?;
         sys::adopt_listener(fd)?
     } else {
         home.bind()?
     };
-    engine::serve(&listener, &home, &engine::Config::from_env())
+    engine::serve(&listener, home, &engine::Config::from_env(), &ctx.staged.id)
 }
 
 #[cfg(not(unix))]
-fn daemon(_listen_fd: Option<i32>) -> io::Result<()> {
+fn daemon(_ctx: &Ctx, _listen_fd: Option<i32>) -> io::Result<()> {
     Err(io::Error::other(
         "the daemon is not implemented on this platform yet",
     ))
@@ -360,9 +453,14 @@ mod tests {
     use super::Args;
 
     /// `a.usage.kdl` is checked in so the binary does not link the spec
-    /// writer; regenerate it with `mise run generate:usage`.
+    /// writer; `mise run generate:usage` rewrites it (`UPDATE_USAGE=1`).
     #[test]
     fn embedded_spec_matches_the_cli() {
+        if std::env::var_os("UPDATE_USAGE").is_some() {
+            let path = concat!(env!("CARGO_MANIFEST_DIR"), "/a.usage.kdl");
+            std::fs::write(path, Args::to_kdl()).unwrap();
+            return;
+        }
         let request = [OsStr::new(usage_rs::SPEC_REQUEST)];
         assert_eq!(
             Args::spec_request(&request).as_deref(),

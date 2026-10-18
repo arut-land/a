@@ -2,6 +2,9 @@ name a
 bin a
 version "0.0.0"
 about "Agent engine: attach to durable sessions run by a per-user daemon."
+flag --host help="Use the daemon on HOST, reached with `ssh HOST a bridge`" global=#true env=A_HOST {
+    arg <HOST>
+}
 flag "-h --help" help="Print help" action=help builtin=#true
 flag "-V --version" help="Print version" action=version builtin=#true
 cmd resume help="Resume the latest session in this workspace, or pick one" {
@@ -21,6 +24,7 @@ cmd new help="Start a new session without attaching" {
 }
 cmd bridge help="Pipe stdio to the local daemon (for `ssh host a bridge`)" {
     flag "-h --help" help="Print help" action=help builtin=#true
+    arg "[TOKEN]" help="Printed in the `A-BRIDGE` line that marks the start of the stream"
 }
 cmd daemon help="Inspect or control the background daemon" subcommand_required=#true {
     flag "-h --help" help="Print help" action=help builtin=#true
