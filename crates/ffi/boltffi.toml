@@ -1,0 +1,15 @@
+# `boltffi pack apple` (`mise run apple:ffi`): the Swift package the macOS
+# app links, generated into apps/apple/Generated (not checked in).
+[package]
+name = "a_ffi"
+crate = "a_ffi"
+
+[targets.apple]
+output = "../../apps/apple/Generated/AFfi"
+include_macos = true
+ios_architectures = []
+simulator_architectures = []
+macos_architectures = ["arm64"]
+
+[targets.apple.swift]
+module_name = "AFfi"

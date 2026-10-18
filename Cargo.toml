@@ -1,7 +1,8 @@
 [workspace]
 resolver = "3"
 members = ["apps/*", "crates/*"]
-exclude = ["fixtures/rig/oracle"]
+# apps/apple is an Xcode project, not a crate.
+exclude = ["fixtures/rig/oracle", "apps/apple"]
 
 [workspace.package]
 version = "0.0.0"
