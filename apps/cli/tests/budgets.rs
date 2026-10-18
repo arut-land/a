@@ -14,6 +14,10 @@ fn a_cold_start_hears_from_the_daemon_within_50ms() {
     let mut times: Vec<Duration> = (0..5)
         .map(|run| {
             let env = Env::new(&format!("cold-{run}"));
+            // A build is staged, and macOS scans the staged copy, once per
+            // build: run its daemon once, then measure a start with none.
+            assert!(env.cmd(&["ls"]).status().unwrap().success());
+            assert!(env.cmd(&["daemon", "stop"]).status().unwrap().success());
             let start = Instant::now();
             let mut term = env.repl(&[]);
             let first = term.line();

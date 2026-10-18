@@ -202,7 +202,6 @@ fn an_unsafe_tool_is_interrupted_and_its_processes_killed_after_the_daemon_is_ki
 }
 
 #[test]
-#[ignore = "store::load skips a torn tail but appends after it, so the next entry fuses with it and is lost"]
 fn entries_after_a_torn_tail_survive_a_restart() {
     let env = Env::new("torn-tail");
     env.start();
