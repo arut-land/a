@@ -5,8 +5,10 @@
 mod common;
 
 use std::fs;
+use std::os::unix::process::ExitStatusExt;
 
 use common::Env;
+use rustix::process::{Pid, Signal, kill_process};
 
 #[test]
 fn the_full_screen_client_shows_replies_and_answers_approvals_by_click() {
@@ -82,4 +84,18 @@ fn the_inline_client_prints_the_transcript_into_the_scrollback() {
     );
     term.send(b"\x04");
     assert!(term.wait().success());
+}
+
+#[test]
+fn sigterm_gives_the_terminal_back_before_it_ends_the_client() {
+    let env = Env::new("tui-sigterm");
+    let mut term = env.tty(&[], 80, 24);
+    term.wait_for("● live");
+    assert!(!term.cooked(), "the client runs the terminal raw");
+    let pid = Pid::from_child(&term.child);
+    kill_process(pid, Signal::TERM).unwrap();
+    assert_eq!(term.wait().signal(), Some(Signal::TERM.as_raw()));
+    assert!(term.cooked(), "raw mode outlived the client");
+    let out = String::from_utf8_lossy(&term.bytes()).into_owned();
+    assert!(out.contains("\x1b[?1049l"), "left the alternate screen");
 }

@@ -1,5 +1,5 @@
-//! Taking over the terminal and giving it back, on exit and on panic; and
-//! the thread that turns its input into events.
+//! Taking over the terminal and giving it back, on exit, on a panic and on
+//! SIGTERM or SIGHUP; and the thread that turns its input into events.
 
 use std::io::{self, Write};
 use std::sync::mpsc::Sender;
@@ -42,6 +42,7 @@ impl Terminal {
             Viewport::Inline => (INLINE_ON, INLINE_OFF),
         };
         let mode = tty::Mode::raw()?;
+        mode.restore_on_signal(off)?;
         *HELD.lock().unwrap_or_else(PoisonError::into_inner) = Some((mode, off));
         let mut out = io::stdout();
         out.write_all(on)?;
