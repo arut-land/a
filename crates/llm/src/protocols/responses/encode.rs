@@ -121,8 +121,8 @@ fn identity(item: &Value) -> Map<String, Value> {
         Some(ItemType::FunctionCall | ItemType::CustomToolCall) => &["type", "id"],
         _ => &[],
     };
-    let kept = keys.iter().map(|key| ((*key).to_owned(), item.get(*key)));
-    kept.filter_map(|(key, value)| Some((key, value?.clone())))
+    keys.iter()
+        .filter_map(|key| Some(((*key).to_owned(), item.get(*key)?.clone())))
         .collect()
 }
 
@@ -182,12 +182,12 @@ fn input(messages: &[Message], stateless: bool) -> Result<Vec<Value>, Error> {
     // Whether each call id the request sends is a custom call.
     let mut custom = HashMap::<SmolStr, bool>::new();
     let mut items = Vec::new();
-    for (position, message) in messages.iter().enumerate() {
-        let parts = match message {
+    let message = |role: &str, part: Value| json!({"type": ItemType::Message, "role": role, "content": [part]});
+    for (position, turn) in messages.iter().enumerate() {
+        let parts = match turn {
             Message::System(system) => {
-                let content = [json!({"type": PartType::InputText, "text": system.text()})];
-                items
-                    .push(json!({"type": ItemType::Message, "role": "system", "content": content}));
+                let text = json!({"type": PartType::InputText, "text": system.text()});
+                items.push(message("system", text));
                 continue;
             }
             Message::User(user) => {
@@ -198,10 +198,7 @@ fn input(messages: &[Message], stateless: bool) -> Result<Vec<Value>, Error> {
                     {
                         continue;
                     }
-                    let content = [user_part(part)?];
-                    items.push(
-                        json!({"type": ItemType::Message, "role": "user", "content": content}),
-                    );
+                    items.push(message("user", user_part(part)?));
                 }
                 continue;
             }

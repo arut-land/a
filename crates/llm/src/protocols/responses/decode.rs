@@ -234,11 +234,11 @@ fn finish_of(response: &Value) -> (Reason, Option<SmolStr>, Option<String>) {
     let Some(status) = response.str("status") else {
         return (Reason::Stop, None, None);
     };
-    let reason = response.at("/incomplete_details/reason");
-    let reason = reason
-        .and_then(Value::as_str)
-        .filter(|reason| !reason.is_empty());
-    let (raw, message) = match (word(status), reason) {
+    let reason = response
+        .at("/incomplete_details/reason")
+        .and_then(Value::as_str);
+    let reason = reason.filter(|reason| !reason.is_empty());
+    let message = match (word(status), reason) {
         (Some(Status::Completed), _) => return (Reason::Stop, None, None),
         (Some(Status::Incomplete), Some(reason)) => match word(reason) {
             Some(Incomplete::MaxOutputTokens) => {
@@ -247,34 +247,27 @@ fn finish_of(response: &Value) -> (Reason, Option<SmolStr>, Option<String>) {
             Some(Incomplete::ContentFilter) => {
                 return (Reason::ContentFilter, Some(reason.into()), None);
             }
-            None => (
-                smol_str::format_smolstr!("incomplete: {reason}"),
-                format!("Response incomplete: {reason}"),
-            ),
+            None => format!("Response incomplete: {reason}"),
         },
-        (Some(Status::Incomplete), None) => (
-            "incomplete".into(),
-            "Response incomplete without a provider reason".into(),
-        ),
+        (Some(Status::Incomplete), None) => "Response incomplete without a provider reason".into(),
         (Some(Status::Failed | Status::Cancelled), _) => {
             let stated: Vec<&str> = ["/error/code", "/error/message"]
                 .iter()
                 .filter_map(|pointer| response.at(pointer)?.as_str())
                 .collect();
-            let message = if stated.is_empty() {
+            if stated.is_empty() {
                 format!("Response {status}")
             } else {
                 stated.join(": ")
-            };
-            (status.into(), message)
+            }
         }
-        (Some(Status::Queued | Status::InProgress), _) => {
-            (status.into(), format!("Response ended while {status}"))
-        }
-        (None, _) => (
-            status.into(),
-            format!("Response ended with the unknown status `{status}`"),
-        ),
+        (Some(Status::Queued | Status::InProgress), _) => format!("Response ended while {status}"),
+        (None, _) => format!("Response ended with the unknown status `{status}`"),
+    };
+    // An incomplete reply's word names why.
+    let raw = match reason.filter(|_| status == "incomplete") {
+        Some(reason) => smol_str::format_smolstr!("incomplete: {reason}"),
+        None => status.into(),
     };
     (Reason::Other, Some(raw), Some(message))
 }
