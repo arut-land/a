@@ -41,7 +41,7 @@ public final class SessionStore {
     /// Calls this client was asked to approve that still wait, oldest first.
     public var pendingAsks: [ViewItem] {
         items.filter {
-            if case .tool(_, _, _, .pending?, _, _, true) = $0 { true } else { false }
+            if case .tool(_, _, _, _, .pending?, _, _, true) = $0 { true } else { false }
         }
     }
 

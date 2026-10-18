@@ -14,8 +14,11 @@ use std::fmt;
 use std::io;
 
 use boltffi::{data, error};
-use protocol::view::{self, Approval, Change, Item, Link, Part, SessionView, Status};
-use protocol::{Outcome, Recap, SessionSummary};
+use protocol::view::{
+    self, Approval, Change, Item, Link, Part, SessionView, Status, call_title, decision_line,
+    output_text, recap_line,
+};
+use protocol::{Card, Outcome, Recap, SessionSummary};
 
 pub use feed::Reducer;
 pub use live::{Client, Session};
@@ -289,6 +292,8 @@ pub enum ViewItem {
         tool: String,
         /// JSON.
         input_json: String,
+        /// The call in one line, as every client shows it.
+        title: String,
         approval: Option<ApprovalState>,
         outcome: Option<ToolOutcome>,
         /// How the tool presents the call, or once it has one, its outcome.
@@ -308,6 +313,8 @@ pub enum ViewItem {
         hook: String,
         /// JSON.
         decision_json: String,
+        /// The decision in one line, as every client shows it.
+        line: String,
     },
     Child {
         call: u64,
@@ -385,9 +392,11 @@ pub enum ItemPart {
 #[data]
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum ToolOutcome {
-    /// `output_json` is the tool's output as JSON.
+    /// `output_json` is the tool's output as JSON; `shown` is it as text,
+    /// as every client shows it, when the tool or the output says how.
     Done {
         output_json: String,
+        shown: Option<OutputText>,
     },
     Failed {
         error: String,
@@ -396,10 +405,21 @@ pub enum ToolOutcome {
     Interrupted,
 }
 
+/// A finished call's output as text, and a short note on it such as
+/// `exit 1`; see [`protocol::view::output_text`].
+#[data]
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct OutputText {
+    pub text: String,
+    pub note: String,
+}
+
 /// What happened in a session, sent on attach.
 #[data]
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct RecapInfo {
+    /// All of it in one line, as every client shows it.
+    pub line: String,
     pub prompt: Option<String>,
     pub tools: Vec<String>,
     pub failed: u32,
@@ -569,12 +589,13 @@ impl From<&Item> for ViewItem {
                 call: *call,
                 tool: tool.clone(),
                 input_json: input.to_string(),
+                title: call_title(tool, input, card.as_ref()),
                 approval: approval.map(|a| match a {
                     Approval::Pending => ApprovalState::Pending,
                     Approval::Approved => ApprovalState::Approved,
                     Approval::Denied => ApprovalState::Denied,
                 }),
-                outcome: outcome.as_ref().map(Into::into),
+                outcome: outcome.as_ref().map(|o| tool_outcome(o, card.as_ref())),
                 card: card.as_ref().map(|c| ToolCard {
                     title: c.title.clone(),
                     body: c.body.clone(),
@@ -591,7 +612,7 @@ impl From<&Item> for ViewItem {
                 call: *call,
                 name: name.clone(),
                 args: args.clone(),
-                outcome: outcome.as_ref().map(Into::into),
+                outcome: outcome.as_ref().map(|o| tool_outcome(o, None)),
             },
             Item::Hook {
                 seq,
@@ -601,6 +622,7 @@ impl From<&Item> for ViewItem {
                 seq: *seq,
                 hook: hook.clone(),
                 decision_json: serde_json::to_string(decision).unwrap_or_default(),
+                line: decision_line(decision),
             },
             Item::Child {
                 call,
@@ -613,7 +635,7 @@ impl From<&Item> for ViewItem {
                 child: child.to_string(),
                 input: input.clone(),
                 watch: *watch,
-                fired: fired.as_ref().map(Into::into),
+                fired: fired.as_ref().map(|o| tool_outcome(o, None)),
             },
             Item::Environment { seq, cwd } => Self::Environment {
                 seq: *seq,
@@ -623,23 +645,23 @@ impl From<&Item> for ViewItem {
     }
 }
 
-impl From<&Outcome> for ToolOutcome {
-    fn from(outcome: &Outcome) -> Self {
-        match outcome {
-            Outcome::Done { output } => Self::Done {
-                output_json: output.to_string(),
-            },
-            Outcome::Failed { error } => Self::Failed {
-                error: error.clone(),
-            },
-            Outcome::Interrupted { .. } => Self::Interrupted,
-        }
+fn tool_outcome(outcome: &Outcome, card: Option<&Card>) -> ToolOutcome {
+    match outcome {
+        Outcome::Done { output } => ToolOutcome::Done {
+            output_json: output.to_string(),
+            shown: output_text(output, card).map(|(text, note)| OutputText { text, note }),
+        },
+        Outcome::Failed { error } => ToolOutcome::Failed {
+            error: error.clone(),
+        },
+        Outcome::Interrupted { .. } => ToolOutcome::Interrupted,
     }
 }
 
 impl From<&Recap> for RecapInfo {
     fn from(r: &Recap) -> Self {
         Self {
+            line: recap_line(r),
             prompt: r.prompt.clone(),
             tools: r.tools.clone(),
             failed: r.failed,
