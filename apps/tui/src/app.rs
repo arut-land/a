@@ -383,8 +383,8 @@ impl App {
 
     fn mouse(&mut self, mouse: Mouse) -> Option<Effect> {
         match mouse {
-            Mouse::WheelUp { .. } => self.wheel(-1),
-            Mouse::WheelDown { .. } => self.wheel(1),
+            Mouse::WheelUp => self.wheel(-1),
+            Mouse::WheelDown => self.wheel(1),
             Mouse::Press { x, y } => {
                 let action = self
                     .hits

@@ -216,7 +216,7 @@ fn the_wheel_scrolls_and_new_rows_keep_a_scrolled_view_still() {
     let (mut app, _) = app(Viewport::Full, &msgs);
     let (_, rows) = frame(&mut app, 40, 12);
     find(&rows, "message 39");
-    app.input(Input::Mouse(Mouse::WheelUp { x: 0, y: 0 }));
+    app.input(Input::Mouse(Mouse::WheelUp));
     let (_, rows) = frame(&mut app, 40, 12);
     assert!(!rows.iter().any(|r| r.contains("message 39")));
     let top = rows[0].clone();
@@ -533,7 +533,7 @@ fn render_cost() {
     let mut scroll = Vec::new();
     for _ in 0..500 {
         let t = Instant::now();
-        app.input(Input::Mouse(Mouse::WheelUp { x: 0, y: 0 }));
+        app.input(Input::Mouse(Mouse::WheelUp));
         frame(&mut app, 120);
         scroll.push(t.elapsed());
     }
