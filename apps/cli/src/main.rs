@@ -159,12 +159,9 @@ impl Ctx {
 
 fn recover(home: &Home, staged: &Staged) -> io::Result<client::Connection> {
     let d = client::diagnose(home);
-    let who = d.pid.map_or_else(
-        || "the daemon".to_owned(),
-        |pid| format!("the daemon (pid {pid})"),
-    );
     eprintln!(
-        "! {who} is not responding after {}s",
+        "! {} is not responding after {}s",
+        d.who(),
         client::HELLO_TIMEOUT.as_secs()
     );
     eprintln!("  log: {}", d.log.display());

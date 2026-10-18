@@ -135,11 +135,7 @@ impl Client<'_> {
             Event::Failed(id, e) if id == self.id => match &self.daemon.endpoint {
                 Endpoint::Local(home) if e.kind() == io::ErrorKind::TimedOut => {
                     let d = client::diagnose(home);
-                    let who = d.pid.map_or_else(
-                        || "the daemon".to_owned(),
-                        |pid| format!("the daemon (pid {pid})"),
-                    );
-                    self.app.unresponsive(who, d.log_tail());
+                    self.app.unresponsive(d.who(), d.log_tail());
                 }
                 _ => self.app.conn = Conn::Lost(e.to_string()),
             },

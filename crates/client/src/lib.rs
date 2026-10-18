@@ -350,6 +350,14 @@ pub struct Diagnosis {
 }
 
 impl Diagnosis {
+    /// The daemon, by pid when one holds its lock.
+    pub fn who(&self) -> String {
+        self.pid.map_or_else(
+            || "the daemon".to_owned(),
+            |pid| format!("the daemon (pid {pid})"),
+        )
+    }
+
     /// The last lines of the daemon's log.
     pub fn log_tail(&self) -> Vec<String> {
         const LINES: usize = 10;
