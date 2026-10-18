@@ -44,12 +44,14 @@ skip-tree = [
 wildcards = "deny"
 allow-wildcard-paths = true
 deny = [
-    # Sync engine: no async runtime or the HTTP stacks built on one.
-    # topcoat (apps/web) depends on tokio for its sync primitives and on
-    # hyper for the server it would bring; `a web` hosts it on our own server
-    # and the rt runtime, so no tokio runtime runs.
-    { crate = "tokio", reason = "the shipped engine is sync; rt's tokio adapter is opt-in", wrappers = ["h2", "hyper", "hyper-util", "tokio-tungstenite", "tokio-util", "topcoat-core", "topcoat-router", "topcoat-runtime"] },
-    { crate = "async-std", reason = "the shipped engine is sync" },
+    # The engine is async on its own runtime (crates/rt): no third-party
+    # runtime or the HTTP stacks built on one. topcoat (apps/web) depends on
+    # tokio for its sync primitives, and topcoat-runtime forces on the
+    # WebSocket server it would bring; `a web` hosts it on our own server and
+    # the rt runtime, so no tokio runtime runs. `mise run check:no-tokio`
+    # keeps the core crates free of it.
+    { crate = "tokio", reason = "the engine runs on rt; rt's tokio adapter is opt-in", wrappers = ["h2", "hyper", "hyper-util", "tokio-tungstenite", "tokio-util", "topcoat-core", "topcoat-router", "topcoat-runtime"] },
+    { crate = "async-std", reason = "the engine runs on rt" },
     { crate = "hyper", reason = "ureq is the HTTP client", wrappers = ["hyper-util", "topcoat-router"] },
     { crate = "reqwest", reason = "ureq is the HTTP client" },
     # TLS is native on Apple and Windows, rustls elsewhere.

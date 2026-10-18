@@ -1,4 +1,13 @@
 [toolchain]
 channel = "nightly-2026-10-17"
 profile = "minimal"
-components = ["clippy", "rustfmt", "rust-src", "rustc-codegen-cranelift"]
+components = ["clippy", "rustfmt", "rust-src", "rustc-codegen-cranelift", "miri"]
+# What we ship: macOS (and iOS for the app's library), Linux on the host
+# target, and the Windows build CI checks.
+targets = [
+    "aarch64-apple-darwin",
+    "x86_64-apple-darwin",
+    "aarch64-apple-ios",
+    "aarch64-apple-ios-sim",
+    "x86_64-pc-windows-msvc",
+]

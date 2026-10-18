@@ -57,41 +57,88 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        os: [macos-latest, ubuntu-latest]
+        include:
+          - os: macos-latest
+            strict: 0
+          # Latency is held to the design's budgets on one lane.
+          - os: ubuntu-latest
+            strict: 1
     runs-on: ${{ matrix.os }}
+    env:
+      A_STRICT_BUDGETS: ${{ matrix.strict }}
     steps:
       - uses: actions/checkout@v7
       - *mbx-dir
       - *cache
       - *mise
       # Release size (4 MiB) and idle daemon RSS (10 MiB) are held exactly;
-      # cold-start latency gets slack on shared runners.
+      # cold start and attach latency too where strict, else with slack.
       - run: mise run budgets
 
   deny:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v7
-      - uses: jdx/mise-action@v5
+      - *mise
       - run: mise run deny
+
+  machete:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - *mise
+      - run: mise run machete
+
+  # No core crate depends on tokio; only the web UI does, through topcoat.
+  no-tokio:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - *mise
+      - run: mise run check:no-tokio
+
+  # Coverage-guided fuzzing of the framer, the JSON decoders and the view
+  # reducer, briefly: a regression gate, not a campaign.
+  fuzz:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - *mbx-dir
+      - *cache
+      - *mise
+      - run: mise run fuzz --time 30s
+      - if: failure()
+        uses: actions/upload-artifact@v5
+        with:
+          name: fuzz-crashes
+          path: crates/protocol/tests/__fuzz__/*/crashes
+
+  miri:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - *mbx-dir
+      - *cache
+      - *mise
+      - run: mise run test:miri
 
   windows:
     runs-on: windows-latest
     defaults:
       run:
         shell: bash
-    # `client` and the `a` CLI talk to the daemon over Unix sockets and do not
-    # build here yet. `engine` builds, but serves only on Unix (dead code
-    # warnings), so it is built rather than linted.
+    # The daemon and its transports are Unix only for now, so `engine` and
+    # the `a` CLI (which links it) are built rather than linted: their
+    # serving code is dead here. `a` runs its line REPL, which reports that.
     env:
-      PORTABLE: -p sys -p rt -p protocol -p store -p agent -p llm
+      PORTABLE: -p sys -p rt -p protocol -p store -p agent -p llm -p client -p tui
     steps:
       - uses: actions/checkout@v7
       - *mbx-dir
       - *cache
       - *mise
       - run: mise exec -- cargo clippy $PORTABLE --all-targets -- -D warnings
-      - run: mise exec -- cargo build -p engine
+      - run: mise exec -- cargo build -p engine -p a
       - name: test (advisory until first green on Windows)
         continue-on-error: true
         run: mise exec -- cargo nextest run $PORTABLE --no-tests=pass

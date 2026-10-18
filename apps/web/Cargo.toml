@@ -14,8 +14,11 @@ serde_json.workspace = true
 uuid = { workspace = true, features = ["v4"] }
 httparse = { version = "1", default-features = false, features = ["std"] }
 http-body-util = "0.1"
-# The render core only: our own server hosts it, so no `serve` (hyper and a
-# tokio runtime) and no WebSocket push.
+# Our own server hosts the render core, so no `serve` feature, but tokio is
+# still linked: topcoat-core uses its sync primitives, and topcoat-runtime's
+# `router` turns on topcoat-router's `websocket` (hyper, h2, tungstenite)
+# for every non-wasm target, with no feature to opt out. The linker keeps
+# about 40 KiB of that stack; no tokio runtime is ever started.
 topcoat = { version = "=0.10.0", default-features = false, features = ["router", "view", "runtime", "asset"] }
 
 [lints]
