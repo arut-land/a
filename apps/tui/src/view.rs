@@ -1,7 +1,7 @@
 //! Transcript items as rows: messages, replies, and tool call cards.
 
-use protocol::view::{Approval, Item, Status};
-use protocol::{Decision, Outcome, Recap};
+use protocol::view::{Approval, Item, Status, call_title, output_text};
+use protocol::{Decision, Outcome};
 use serde_json::Value;
 
 use super::render::{Color, Style, ellipsize};
@@ -34,7 +34,7 @@ pub struct Look<'a> {
 pub fn settled(item: &Item) -> bool {
     match item {
         Item::Reply { status, .. } => *status != Status::Running,
-        Item::Tool { outcome, .. } => outcome.is_some(),
+        Item::Tool { outcome, .. } | Item::Command { outcome, .. } => outcome.is_some(),
         _ => true,
     }
 }
@@ -68,15 +68,35 @@ pub fn rows(item: &Item, width: usize, look: Look) -> Vec<Line> {
             input,
             approval,
             outcome,
+            card: shown,
             asked,
         } => card(
             &Card {
                 call: *call,
-                tool,
-                input,
+                title: call_title(tool, input, shown.as_ref()),
+                input: input.get("command").is_none().then_some(input),
                 approval: *approval,
                 outcome: outcome.as_ref(),
+                shown: shown.as_ref(),
                 asked: *asked,
+            },
+            width,
+            look,
+        ),
+        Item::Command {
+            call,
+            name,
+            args,
+            outcome,
+        } => card(
+            &Card {
+                call: *call,
+                title: format!("/{name} {args}").trim_end().to_owned(),
+                input: None,
+                approval: None,
+                outcome: outcome.as_ref(),
+                shown: None,
+                asked: false,
             },
             width,
             look,
@@ -153,12 +173,16 @@ fn reply(
     out
 }
 
+/// A tool call or a slash command, as a card.
 struct Card<'a> {
     call: u64,
-    tool: &'a str,
-    input: &'a Value,
+    title: String,
+    /// Input the title does not show, for verbose mode.
+    input: Option<&'a Value>,
     approval: Option<Approval>,
     outcome: Option<&'a Outcome>,
+    /// How the tool presents it.
+    shown: Option<&'a protocol::Card>,
     asked: bool,
 }
 
@@ -167,11 +191,17 @@ struct Card<'a> {
 fn card(c: &Card, width: usize, look: Look) -> Vec<Line> {
     let toggle = Action::Toggle(c.call);
     let (status, style) = match (c.outcome, c.approval) {
-        (Some(Outcome::Done { output }), _) => match output["exit"].as_i64() {
-            Some(0) => ("✓ exit 0".to_owned(), OK),
-            Some(code) => (format!("✗ exit {code}"), BAD),
-            None => ("✓ done".to_owned(), OK),
-        },
+        (Some(Outcome::Done { output }), _) => {
+            let note = output_text(output, c.shown)
+                .map(|(_, note)| note)
+                .filter(|note| !note.is_empty())
+                .unwrap_or_else(|| "done".to_owned());
+            if failed(output) {
+                (format!("✗ {note}"), BAD)
+            } else {
+                (format!("✓ {note}"), OK)
+            }
+        }
         (Some(Outcome::Failed { .. }), _) => ("✗ failed".to_owned(), BAD),
         (Some(Outcome::Interrupted), _) => ("⚠ interrupted".to_owned(), WARN),
         (None, Some(Approval::Pending)) => ("? waiting for approval".to_owned(), ASK),
@@ -184,14 +214,13 @@ fn card(c: &Card, width: usize, look: Look) -> Vec<Line> {
         (false, true) => "▸ ",
         (false, false) => "▾ ",
     };
-    let call = call_text(c.tool, c.input);
     let room = width.saturating_sub(2 + 2 + super::text::width_of(&status));
     let mut out = vec![
         Line::default(),
         Line::from(vec![
             Span::button(marker, MUTED, toggle),
             Span::button(
-                ellipsize(&sanitize(&call).replace('\n', " "), room),
+                ellipsize(&sanitize(&c.title).replace('\n', " "), room),
                 Style::PLAIN.bold(),
                 toggle,
             ),
@@ -233,27 +262,39 @@ fn card(c: &Card, width: usize, look: Look) -> Vec<Line> {
     out
 }
 
-/// A call's output rows behind the card's `│` gutter.
+/// Whether a finished command did not succeed: a nonzero exit, a signal,
+/// a timeout or an interrupt.
+fn failed(output: &Value) -> bool {
+    output["exit"].as_i64().is_some_and(|code| code != 0)
+        || !output["signal"].is_null()
+        || !output["timed_out"].is_null()
+        || output["aborted"] == true
+}
+
+/// A call's output rows behind the card's `│` gutter; a diff colored as one.
 fn output_rows(c: &Card, width: usize, verbose: bool) -> Vec<Line> {
     let bar = [Span::new("  │ ", MUTED)];
     let mut rows = Vec::new();
-    let mut add = |text: &str, style: Style| {
+    let mut add = |text: &str, style: Style, diff: bool| {
         for line in sanitize(text).split('\n') {
+            let style = match line.as_bytes().first() {
+                Some(b'@') if diff => Style::fg(Color::Cyan),
+                Some(b'+') if diff => OK,
+                Some(b'-') if diff => BAD,
+                _ => style,
+            };
             rows.extend(wrap(&[Span::new(line, style)], width, &bar, &bar));
         }
     };
-    if verbose && c.input.get("command").is_none() {
-        add(&c.input.to_string(), MUTED);
+    if verbose && let Some(input) = c.input {
+        add(&input.to_string(), MUTED, false);
     }
     match c.outcome {
-        Some(Outcome::Done { output }) => match output["stdout"].as_str() {
-            Some(stdout) => {
-                let stderr = output["stderr"].as_str().unwrap_or_default();
-                for (text, style) in [(stdout, Style::PLAIN), (stderr, BAD.dim())] {
-                    let text = text.strip_suffix('\n').unwrap_or(text);
-                    if !text.is_empty() {
-                        add(text, style);
-                    }
+        Some(Outcome::Done { output }) => match output_text(output, c.shown) {
+            Some((text, _)) => {
+                let text = text.strip_suffix('\n').unwrap_or(&text);
+                if !text.is_empty() {
+                    add(text, Style::PLAIN, text.starts_with("@@ "));
                 }
             }
             None if output.is_null() => {}
@@ -261,48 +302,14 @@ fn output_rows(c: &Card, width: usize, verbose: bool) -> Vec<Line> {
                 let text = output
                     .as_str()
                     .map_or_else(|| output.to_string(), str::to_owned);
-                add(&text, Style::PLAIN);
+                add(&text, Style::PLAIN, false);
             }
         },
-        Some(Outcome::Failed { error }) => add(error, BAD),
-        Some(Outcome::Interrupted) => add("the daemon stopped mid-call", WARN),
+        Some(Outcome::Failed { error }) => add(error, BAD, false),
+        Some(Outcome::Interrupted) => add("the daemon stopped mid-call", WARN, false),
         None => {}
     }
     rows
-}
-
-/// A tool call as shown: a command as `$ command`, anything else as the
-/// tool and its input (as the line client and the web UI show it).
-pub fn call_text(tool: &str, input: &Value) -> String {
-    match input["command"].as_str() {
-        Some(command) => format!("$ {command}"),
-        None => format!("{tool} {input}"),
-    }
-}
-
-/// What a session did, shown after an attach's replay.
-pub fn recap_line(recap: &Recap) -> String {
-    let mut parts = vec!["recap".to_owned()];
-    if let Some(prompt) = &recap.prompt {
-        parts.push(format!("you: {prompt}"));
-    }
-    match &recap.tools[..] {
-        [] => {}
-        few @ ([_] | [_, _] | [_, _, _]) => parts.push(format!("ran {}", few.join(", "))),
-        many => parts.push(format!("ran {} tools", many.len())),
-    }
-    let count = |parts: &mut Vec<String>, n: u32, what: &str| {
-        if n > 0 {
-            parts.push(format!("{n} {what}"));
-        }
-    };
-    count(&mut parts, recap.failed, "failed");
-    count(&mut parts, recap.running, "running");
-    if let Some(reply) = &recap.reply {
-        parts.push(format!("a: {reply}"));
-    }
-    count(&mut parts, recap.asks, "waiting for approval");
-    parts.join(" · ")
 }
 
 fn decided(decision: &Decision) -> String {
@@ -336,10 +343,11 @@ mod tests {
     fn tool(outcome: Option<Outcome>, approval: Option<Approval>, asked: bool) -> Item {
         Item::Tool {
             call: 7,
-            tool: "run_command".into(),
+            tool: "bash".into(),
             input: json!({"command": "ls"}),
             approval,
             outcome,
+            card: None,
             asked,
         }
     }
@@ -418,5 +426,57 @@ mod tests {
         };
         let rows = rows_of(&tool(Some(done), None, false), Look::default());
         assert_eq!(rows[1..], ["▾ $ ls  ✗ exit 1", "  │ red"]);
+    }
+
+    #[test]
+    fn an_edit_card_shows_its_diff() {
+        let item = Item::Tool {
+            call: 7,
+            tool: "edit".into(),
+            input: json!({"path": "a.txt", "edits": []}),
+            approval: None,
+            outcome: Some(Outcome::Done {
+                output: json!({"path": "a.txt"}),
+            }),
+            card: Some(protocol::Card {
+                title: "edit a.txt".into(),
+                body: "@@ -2,1 +2,1 @@\n-two\n+2\n".into(),
+                note: "+1 -1".into(),
+            }),
+            asked: false,
+        };
+        let lines = rows(&item, 40, Look::default());
+        assert_eq!(
+            texts(&lines)[1..],
+            [
+                "▾ edit a.txt  ✓ +1 -1",
+                "  │ @@ -2,1 +2,1 @@",
+                "  │ -two",
+                "  │ +2"
+            ]
+        );
+        let color = |row: usize| lines[row].spans[1].style;
+        assert_eq!((color(3), color(4)), (BAD, OK));
+    }
+
+    #[test]
+    fn a_slash_command_shows_as_a_card() {
+        let mut item = Item::Command {
+            call: 4,
+            name: "model".into(),
+            args: String::new(),
+            outcome: None,
+        };
+        assert!(!settled(&item));
+        assert_eq!(rows_of(&item, Look::default())[1], "• /model  running…");
+        if let Item::Command { outcome, .. } = &mut item {
+            *outcome = Some(Outcome::Failed {
+                error: "no command /model".into(),
+            });
+        }
+        assert_eq!(
+            rows_of(&item, Look::default())[1..],
+            ["▾ /model  ✗ failed", "  │ no command /model"]
+        );
     }
 }

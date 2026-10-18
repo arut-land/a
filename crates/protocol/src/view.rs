@@ -584,6 +584,56 @@ fn usage_of(output: &Value) -> Option<Usage> {
     })
 }
 
+/// A tool call in one line: as its tool presents it, else a command as
+/// `$ command` and anything else as the tool and its input.
+pub fn call_title(tool: &str, input: &Value, card: Option<&Card>) -> String {
+    match (card, input["command"].as_str()) {
+        (Some(card), _) => card.title.clone(),
+        (None, Some(command)) => format!("$ {command}"),
+        (None, None) => format!("{tool} {input}"),
+    }
+}
+
+/// A finished call's output as text and a short note on it: as its tool's
+/// card presents it, else a command's streams and exit status as older logs
+/// hold them. `None` for any other output.
+pub fn output_text(output: &Value, card: Option<&Card>) -> Option<(String, String)> {
+    if let Some(card) = card.filter(|c| !c.body.is_empty() || !c.note.is_empty()) {
+        return Some((card.body.clone(), card.note.clone()));
+    }
+    let stdout = output["stdout"].as_str()?;
+    let stderr = output["stderr"].as_str().unwrap_or_default();
+    Some((
+        format!("{stdout}{stderr}"),
+        format!("exit {}", output["exit"]),
+    ))
+}
+
+/// One line on what a session did, shown after an attach's replay.
+pub fn recap_line(recap: &Recap) -> String {
+    let mut parts = vec!["recap".to_owned()];
+    if let Some(prompt) = &recap.prompt {
+        parts.push(format!("you: {prompt}"));
+    }
+    match &recap.tools[..] {
+        [] => {}
+        few @ ([_] | [_, _] | [_, _, _]) => parts.push(format!("ran {}", few.join(", "))),
+        many => parts.push(format!("ran {} tools", many.len())),
+    }
+    let count = |parts: &mut Vec<String>, n: u32, what: &str| {
+        if n > 0 {
+            parts.push(format!("{n} {what}"));
+        }
+    };
+    count(&mut parts, recap.failed, "failed");
+    count(&mut parts, recap.running, "running");
+    if let Some(reply) = &recap.reply {
+        parts.push(format!("a: {reply}"));
+    }
+    count(&mut parts, recap.asks, "waiting for approval");
+    parts.join(" · ")
+}
+
 /// The daemon's sessions, as `a ls` and a session picker show them.
 #[derive(Clone, Debug, Default, PartialEq, Eq, Serialize)]
 pub struct SessionList {

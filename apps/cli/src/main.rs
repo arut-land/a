@@ -5,8 +5,11 @@ use std::sync::{Arc, Mutex, PoisonError};
 use std::thread;
 
 use client::Endpoint;
-use protocol::view::{Approval, Change, Item, Link, Part, SessionList, SessionView, Status, Usage};
-use protocol::{Card, ClientMsg, DaemonMsg, Outcome, Recap, SessionId, SessionSummary, Target};
+use protocol::view::{
+    Approval, Change, Item, Link, Part, SessionList, SessionView, Status, Usage, call_title,
+    output_text, recap_line,
+};
+use protocol::{Card, ClientMsg, DaemonMsg, Outcome, SessionId, SessionSummary, Target};
 use sys::{Home, Staged};
 use usage_rs::{Cli, Subcommands};
 
@@ -372,8 +375,11 @@ impl Screen {
                     tool, input, card, ..
                 },
                 ..
-            } => println!("? approve {}  [y/n]", title(tool, input, card.as_ref())),
-            Change::Recap(recap) => println!("{}", recap_line(recap)),
+            } => println!(
+                "? approve {}  [y/n]",
+                call_title(tool, input, card.as_ref())
+            ),
+            Change::Recap(recap) => println!("[{}]", recap_line(recap)),
             Change::Mismatch { supported } => eprintln!("[daemon speaks protocol {supported}]"),
             Change::Error { message } => eprintln!("[error: {message}]"),
             Change::Asked { .. } | Change::Synced | Change::Draining => {}
@@ -453,7 +459,7 @@ fn added(item: &Item) {
         Item::Assistant { text, .. } => println!("a    {text}"),
         Item::Tool {
             tool, input, card, ..
-        } => println!("tool {}", title(tool, input, card.as_ref())),
+        } => println!("tool {}", call_title(tool, input, card.as_ref())),
         Item::Command { name, args, .. } => println!("cmd  /{name} {args}"),
         Item::Hook { hook, decision, .. } => println!("  · hook {hook}: {decision:?}"),
         Item::Child { child, input, .. } => println!("child {} {input}", child.short()),
@@ -462,69 +468,20 @@ fn added(item: &Item) {
     }
 }
 
-/// A tool call as shown: as its tool presents it, else a command as
-/// `$ command` and anything else as the tool and its input.
-fn title(tool: &str, input: &serde_json::Value, card: Option<&Card>) -> String {
-    match (card, input["command"].as_str()) {
-        (Some(card), _) => card.title.clone(),
-        (None, Some(command)) => format!("$ {command}"),
-        (None, None) => format!("{tool} {input}"),
-    }
-}
-
-/// One line on what a session did, shown after an attach's replay.
-fn recap_line(recap: &Recap) -> String {
-    let mut parts = vec!["[recap".to_owned()];
-    if let Some(prompt) = &recap.prompt {
-        parts.push(format!("you: {prompt}"));
-    }
-    match &recap.tools[..] {
-        [] => {}
-        few @ ([_] | [_, _] | [_, _, _]) => parts.push(format!("ran {}", few.join(", "))),
-        many => parts.push(format!("ran {} tools", many.len())),
-    }
-    let count = |parts: &mut Vec<String>, n: u32, what: &str| {
-        if n > 0 {
-            parts.push(format!("{n} {what}"));
-        }
-    };
-    count(&mut parts, recap.failed, "failed");
-    count(&mut parts, recap.running, "running");
-    if let Some(reply) = &recap.reply {
-        parts.push(format!("a: {reply}"));
-    }
-    count(&mut parts, recap.asks, "waiting for approval");
-    parts.join(" · ") + "]"
-}
-
 /// An outcome as its tool's card presents it, else a command's streams as
 /// older logs hold them, text as lines, and anything else as JSON.
 fn print_outcome(outcome: &Outcome, card: Option<&Card>) {
     match outcome {
-        Outcome::Done { .. } if let Some(card) = card.filter(|c| !c.note.is_empty()) => {
-            for line in card.body.lines() {
-                println!("  │ {line}");
-            }
-            println!("  └ {}", card.note);
-        }
-        Outcome::Done {
-            output: serde_json::Value::String(text),
-        } => {
+        Outcome::Done { output } => {
+            let (text, note) = match (output_text(output, card), output) {
+                (Some(shown), _) => shown,
+                (None, serde_json::Value::String(text)) => (text.clone(), String::new()),
+                (None, output) => (String::new(), output.to_string()),
+            };
             for line in text.lines() {
                 println!("  │ {line}");
             }
-            println!("  └ done");
-        }
-        Outcome::Done { output } => {
-            if let Some(stdout) = output["stdout"].as_str() {
-                let stderr = output["stderr"].as_str().unwrap_or_default();
-                for line in stdout.lines().chain(stderr.lines()) {
-                    println!("  │ {line}");
-                }
-                println!("  └ exit {}", output["exit"]);
-            } else {
-                println!("  └ {output}");
-            }
+            println!("  └ {}", if note.is_empty() { "done" } else { &note });
         }
         Outcome::Failed { error } => println!("  └ failed: {error}"),
         Outcome::Interrupted => println!("  └ interrupted: the daemon stopped mid-call"),

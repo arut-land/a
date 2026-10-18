@@ -645,3 +645,43 @@ fn vectors() {
         assert_eq!(stored, computed, "{}", stored["name"]);
     }
 }
+
+#[test]
+fn clients_describe_calls_and_recaps_alike() {
+    use protocol::view::{call_title, output_text, recap_line};
+
+    let ls = json!({"command": "ls"});
+    let card = Card {
+        title: "$ ls -a".into(),
+        body: "a\n".into(),
+        note: "exit 0".into(),
+    };
+    assert_eq!(call_title("bash", &ls, Some(&card)), "$ ls -a");
+    assert_eq!(call_title("bash", &ls, None), "$ ls");
+    assert_eq!(
+        call_title("edit", &json!({"path": "a"}), None),
+        r#"edit {"path":"a"}"#
+    );
+    let shown = |output: &Value, card| output_text(output, card);
+    assert_eq!(
+        shown(&json!({}), Some(&card)),
+        Some(("a\n".into(), "exit 0".into()))
+    );
+    assert_eq!(
+        shown(&json!({"stdout": "o\n", "stderr": "e\n", "exit": 2}), None),
+        Some(("o\ne\n".into(), "exit 2".into()))
+    );
+    assert_eq!(shown(&json!("text"), Some(&Card::default())), None);
+    let recap = Recap {
+        prompt: Some("hi".into()),
+        tools: vec!["bash".into(); 4],
+        asks: 1,
+        reply: Some("done".into()),
+        ..Recap::default()
+    };
+    assert_eq!(
+        recap_line(&recap),
+        "recap · you: hi · ran 4 tools · a: done · 1 waiting for approval"
+    );
+    assert_eq!(recap_line(&Recap::default()), "recap");
+}

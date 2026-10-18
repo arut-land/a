@@ -1,7 +1,7 @@
 use std::path::PathBuf;
 
 use protocol::{
-    Body, ClientMsg, DaemonMsg, Entry, Outcome, Recap, SessionId, SessionSummary, Target,
+    Body, Card, ClientMsg, DaemonMsg, Entry, Outcome, Recap, SessionId, SessionSummary, Target,
 };
 use serde_json::json;
 
@@ -79,16 +79,20 @@ fn asked_command() -> Vec<DaemonMsg> {
         entry(
             3,
             Body::ToolCall {
-                tool: "run_command".into(),
+                tool: "bash".into(),
                 input: json!({"command": "ls"}),
                 id: None,
+                card: Some(Card {
+                    title: "$ ls".into(),
+                    ..Card::default()
+                }),
             },
         ),
         entry(4, Body::Ask { call: 3 }),
         DaemonMsg::Synced { seq: 4 },
         DaemonMsg::Ask {
             call: 3,
-            tool: "run_command".into(),
+            tool: "bash".into(),
             input: json!({"command": "ls"}),
         },
     ]
@@ -174,8 +178,13 @@ fn a_card_folds_on_click_and_ctrl_o_shows_all_output() {
         Body::ToolResult {
             call: 3,
             outcome: Outcome::Done {
-                output: json!({"stdout": stdout, "stderr": "", "exit": 0}),
+                output: json!({"output": stdout, "exit": 0, "cwd": "/w", "duration_ms": 1}),
             },
+            card: Some(Card {
+                title: "$ ls".into(),
+                body: stdout.clone(),
+                note: "exit 0".into(),
+            }),
         },
     ));
     let (mut app, _) = app(Viewport::Full, &msgs);
@@ -244,6 +253,53 @@ fn ctrl_c_clears_the_input_then_detaches() {
 }
 
 #[test]
+fn ctrl_c_interrupts_a_running_call_and_shows_how_it_ended() {
+    let mut msgs = asked_command();
+    msgs.push(entry(
+        5,
+        Body::Hook {
+            hook: "user".into(),
+            decision: protocol::Decision::Approval {
+                tool: "bash".into(),
+                approved: true,
+                call: Some(3),
+            },
+        },
+    ));
+    let (mut app, _) = app(Viewport::Full, &msgs);
+    press(&mut app, Key::Char('x'));
+    assert!(matches!(
+        press(&mut app, Key::Ctrl('c')),
+        Some(Effect::Send(ClientMsg::Interrupt))
+    ));
+    assert!(!app.editor.is_empty(), "the draft stays");
+    app.fold(&entry(
+        6,
+        Body::ToolResult {
+            call: 3,
+            outcome: Outcome::Done {
+                output: json!({"output": "", "exit": null, "signal": "SIGTERM", "aborted": true}),
+            },
+            card: Some(Card {
+                title: "$ ls".into(),
+                body: String::new(),
+                note: "aborted · killed by SIGTERM".into(),
+            }),
+        },
+    ));
+    let (_, rows) = frame(&mut app, 60, 12);
+    find(&rows, "• $ ls  ✗ aborted · killed by SIGTERM");
+    assert!(
+        press(&mut app, Key::Ctrl('c')).is_none(),
+        "clears the input"
+    );
+    assert!(matches!(
+        press(&mut app, Key::Ctrl('c')),
+        Some(Effect::Detach)
+    ));
+}
+
+#[test]
 fn slash_commands() {
     let (mut app, current) = app(Viewport::Full, &[]);
     assert!(matches!(typed(&mut app, "/detach"), Some(Effect::Detach)));
@@ -255,9 +311,15 @@ fn slash_commands() {
         typed(&mut app, "/new"),
         Some(Effect::Open(Target::New))
     ));
-    assert!(typed(&mut app, "/nope").is_none());
-    let (_, rows) = frame(&mut app, 60, 10);
-    find(&rows, "unknown command /nope");
+    // The daemon runs the rest, or says there is no such command.
+    assert!(matches!(
+        typed(&mut app, "/nope"),
+        Some(Effect::Send(ClientMsg::Input { text })) if text == "/nope"
+    ));
+    assert!(matches!(
+        typed(&mut app, "/interrupt"),
+        Some(Effect::Send(ClientMsg::Interrupt))
+    ));
     assert!(matches!(
         typed(&mut app, "hello there"),
         Some(Effect::Send(ClientMsg::Input { text })) if text == "hello there"
@@ -314,7 +376,7 @@ fn resuming_where_there_is_no_session_opens_the_picker() {
 fn the_recap_shows_until_dismissed() {
     let recap = Recap {
         prompt: Some("$ ls".into()),
-        tools: vec!["run_command".into()],
+        tools: vec!["bash".into()],
         asks: 1,
         ..Recap::default()
     };
@@ -323,7 +385,7 @@ fn the_recap_shows_until_dismissed() {
     let (x, y) = find(&rows, "×");
     find(
         &rows,
-        "↺ recap · you: $ ls · ran run_command · 1 waiting for approval",
+        "↺ recap · you: $ ls · ran bash · 1 waiting for approval",
     );
     app.input(Input::Mouse(Mouse::Press { x, y }));
     let (_, rows) = frame(&mut app, 80, 10);
@@ -344,9 +406,11 @@ fn inline_prints_settled_items_once_and_keeps_the_rest_live() {
         5,
         Body::ToolResult {
             call: 3,
+            // As older logs hold a command's result.
             outcome: Outcome::Done {
                 output: json!({"stdout": "a\n", "stderr": "", "exit": 0}),
             },
+            card: None,
         },
     ));
     let printed: Vec<String> = app.scrollback(60).iter().map(Line::text).collect();
@@ -405,9 +469,10 @@ fn render_cost() {
         msgs.push(entry(
             seq + 2,
             Body::ToolCall {
-                tool: "run_command".into(),
+                tool: "bash".into(),
                 input: json!({"command": "ls"}),
                 id: None,
+                card: None,
             },
         ));
     }

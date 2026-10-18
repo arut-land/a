@@ -18,10 +18,14 @@ input, overlays).
 - Transcript: your messages, replies streamed from `SessionView::streaming`
   with light markdown (headings, bullets, quotes, fenced code, `**bold**`,
   `` `code` ``), hooks and environment changes as muted lines.
-- Tool cards: the call, its state (running, waiting for approval, not
-  approved, exit code, failed, interrupted) and the last 10 lines of output.
+- Tool cards: the call as its tool presents it (the `Card` from
+  `Tool::present`, else the input, as every client shows it via
+  `protocol::view`), its state (running, waiting for approval, not
+  approved, the card's note such as `exit 1` or `+3 -1`, failed,
+  interrupted) and the last 10 lines of output; an edit's diff is colored.
   A click on a card folds it; Ctrl-O shows every card's whole output.
-  Command output has its escapes stripped.
+  Command output has its escapes stripped. Slash commands the daemon runs
+  show as cards too.
 - Approvals: the oldest call `asked()` of this client shows above the
   input with `[ y yes ]` `[ n no ]` buttons, and on its card; `y` or `n`
   with an empty input answers it.
@@ -32,10 +36,13 @@ input, overlays).
   keeps newlines), readline keys, Up/Down through history (seeded from the
   session's own messages).
 - `/sessions` (a picker; also what `a resume` opens when this workspace has
-  no session), `/new`, `/env refresh`, `/detach`, `/help` (or F1).
-- Ctrl-C clears the input, or detaches when it is empty: the protocol has
-  no way to interrupt a turn, and nothing the client does stops the daemon.
-  Ctrl-D on an empty input detaches too.
+  no session), `/new`, `/env refresh`, `/interrupt`, `/detach`, `/help`
+  (or F1). Any other `/name` goes to the daemon, which runs the session's
+  slash command or says there is none.
+- Ctrl-C while a tool call or slash command runs sends
+  `ClientMsg::Interrupt`, which stops it (a model call it does not); otherwise it
+  clears the input, or detaches when it is empty. Nothing the client does
+  stops the daemon. Ctrl-D on an empty input detaches.
 - A daemon that drains for an upgrade is reconnected and replayed from
   `SessionView::seq`; one that does not answer the hello offers a restart.
 

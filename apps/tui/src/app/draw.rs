@@ -2,7 +2,7 @@
 
 use std::path::Path;
 
-use protocol::view::{Item, Link, Usage};
+use protocol::view::{Item, Link, Usage, call_title, recap_line};
 
 use super::super::render::{Buf, Color, Style, Viewport, ellipsize, fit};
 use super::super::text::{Action, Line, Span, width_of, wrap};
@@ -42,7 +42,7 @@ impl App {
         let mut out = Vec::new();
         if let Some(recap) = self.view.recap.as_ref().filter(|_| !self.recap_hidden) {
             let cyan = Style::fg(Color::Cyan);
-            let banner = [Span::new(view::recap_line(recap), cyan)];
+            let banner = [Span::new(recap_line(recap), cyan)];
             let first = [Span::new("↺ ", cyan)];
             let mut rows = wrap(
                 &banner,
@@ -66,10 +66,14 @@ impl App {
             Some(&self.view.items[at])
         });
         if let Some(Item::Tool {
-            call, tool, input, ..
+            call,
+            tool,
+            input,
+            card,
+            ..
         }) = asked
         {
-            let call_text = view::call_text(tool, input).replace('\n', " ");
+            let call_text = call_title(tool, input, card.as_ref()).replace('\n', " ");
             let room = width.saturating_sub("? approve   [ y  yes ]  [ n  no ]".len());
             out.push(Line::from(vec![
                 Span::new(format!("? approve {}  ", ellipsize(&call_text, room)), ASK),
@@ -96,6 +100,8 @@ impl App {
                 "y approves · n denies"
             } else if self.view.session.is_none() {
                 ""
+            } else if self.running() {
+                "ctrl-c stops the tool · /help"
             } else {
                 "message the agent · /help"
             };

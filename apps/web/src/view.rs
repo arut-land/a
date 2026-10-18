@@ -1,8 +1,10 @@
 //! How a session's transcript renders: the shared [`SessionView`] as
 //! markup, emitted again whole on every update.
 
-use protocol::view::{Approval, Item, SessionView, Status, Stream, Usage};
-use protocol::{Card, Decision, Outcome, Recap};
+use protocol::view::{
+    Approval, Item, SessionView, Status, Stream, Usage, call_title, output_text, recap_line,
+};
+use protocol::{Card, Decision, Outcome};
 use serde_json::Value;
 use topcoat::Result;
 use topcoat::runtime::Event;
@@ -62,7 +64,7 @@ async fn item_row(item: Item, tab: String, streaming: Option<Stream>) -> Result<
                 reply_row(text: text, status: status, usage: usage, live: streaming.filter(|s| s.call == call).map(|s| s.text))
             }
             Item::Tool { call, tool, input, approval, outcome, card, asked } => {
-                tool_card(tab: tab, call: call, line: card.as_ref().map_or_else(|| call_text(&tool, &input), |c| c.title.clone()), approval: approval, asked: asked, outcome: outcome, card: card)
+                tool_card(tab: tab, call: call, line: call_title(&tool, &input, card.as_ref()), approval: approval, asked: asked, outcome: outcome, card: card)
             }
             Item::Command { name, args, outcome, .. } => {
                 <div style=(style::NOTE)>
@@ -181,15 +183,7 @@ async fn tool_card(
 /// and exit status as older logs hold them, anything else as JSON.
 #[component]
 async fn output_block(output: Value, card: Option<Card>) -> Result<impl View> {
-    let shown = card.filter(|c| !c.body.is_empty() || !c.note.is_empty());
-    let command = shown.map(|c| (c.body, c.note)).or_else(|| {
-        let stdout = output["stdout"].as_str()?;
-        let stderr = output["stderr"].as_str().unwrap_or_default();
-        Some((
-            format!("{stdout}{stderr}"),
-            format!("exit {}", output["exit"]),
-        ))
-    });
+    let command = output_text(&output, card.as_ref());
     Ok(view! {
         match command {
             Some((text, note)) => {
@@ -200,15 +194,6 @@ async fn output_block(output: Value, card: Option<Card>) -> Result<impl View> {
             }
         }
     })
-}
-
-/// A tool call as shown: a command as `$ command`, anything else as the
-/// tool and its input.
-fn call_text(tool: &str, input: &Value) -> String {
-    match input["command"].as_str() {
-        Some(command) => format!("$ {command}"),
-        None => format!("{tool} {input}"),
-    }
 }
 
 fn outcome_text(outcome: &Outcome) -> String {
@@ -243,34 +228,5 @@ fn decision_text(decision: &Decision) -> String {
             attempt,
             error,
         } => format!("retried call {call} (attempt {attempt}): {error}"),
-    }
-}
-
-/// What the session did, shown after an attach's replay.
-fn recap_line(recap: &Recap) -> String {
-    let mut parts = Vec::new();
-    if let Some(prompt) = &recap.prompt {
-        parts.push(format!("you: {prompt}"));
-    }
-    match &recap.tools[..] {
-        [] => {}
-        few @ ([_] | [_, _] | [_, _, _]) => parts.push(format!("ran {}", few.join(", "))),
-        many => parts.push(format!("ran {} tools", many.len())),
-    }
-    let mut count = |n: u32, what: &str| {
-        if n > 0 {
-            parts.push(format!("{n} {what}"));
-        }
-    };
-    count(recap.failed, "failed");
-    count(recap.running, "running");
-    count(recap.asks, "waiting for approval");
-    if let Some(reply) = &recap.reply {
-        parts.push(format!("a: {reply}"));
-    }
-    if parts.is_empty() {
-        "Nothing happened yet.".to_owned()
-    } else {
-        parts.join(" · ")
     }
 }

@@ -11,7 +11,7 @@ mod tests;
 use std::collections::HashSet;
 use std::path::PathBuf;
 
-use protocol::view::{Change, Item, SessionList, SessionView, Usage};
+use protocol::view::{Approval, Change, Item, SessionList, SessionView, Usage};
 use protocol::{ClientMsg, DaemonMsg, SessionSummary, Target};
 
 use super::editor::{Edit, Editor};
@@ -115,10 +115,14 @@ const HELP: &[(&str, &str)] = &[
     ("esc", "back to the latest output"),
     ("ctrl-o", "show every card's whole output"),
     ("click a card", "fold or unfold it"),
-    ("ctrl-c", "clear the input, or detach"),
+    (
+        "ctrl-c",
+        "interrupt the running call; else clear the input, or detach",
+    ),
     ("ctrl-l", "redraw"),
     ("/sessions", "switch session"),
     ("/new", "start a new session"),
+    ("/interrupt", "stop the running tool call"),
     ("/env refresh", "send this shell's environment again"),
     ("/detach", "leave; the session keeps running"),
 ];
@@ -262,6 +266,7 @@ impl App {
         let asked = self.view.asked().next();
         let page = self.page();
         match key {
+            Key::Ctrl('c') if self.running() => return Some(self.interrupt()),
             Key::Ctrl('c') if !self.editor.is_empty() => self.editor.clear(),
             Key::Ctrl('c') => return Some(self.leave()),
             Key::Ctrl('d') if self.editor.is_empty() => return Some(self.leave()),
@@ -336,12 +341,9 @@ impl App {
                 Effect::List
             }
             "/new" => Effect::Open(Target::New),
+            "/interrupt" => self.interrupt(),
             "/help" => {
                 self.overlay = Some(Overlay::Help);
-                return None;
-            }
-            other if other.starts_with('/') && !other.contains(char::is_whitespace) => {
-                self.notice(format!("unknown command {other} (/help lists them)"), true);
                 return None;
             }
             _ => {
@@ -352,8 +354,27 @@ impl App {
         })
     }
 
-    /// Ctrl-C: the protocol cannot interrupt a turn, so it detaches; the
-    /// session (and the daemon) keep running.
+    /// Whether a tool call or slash command is running: what an interrupt
+    /// stops (a model call it does not).
+    pub fn running(&self) -> bool {
+        self.view.items.iter().rev().any(|item| match item {
+            Item::Tool {
+                outcome: None,
+                approval,
+                ..
+            } => !matches!(approval, Some(Approval::Pending | Approval::Denied)),
+            Item::Command { outcome, .. } => outcome.is_none(),
+            _ => false,
+        })
+    }
+
+    fn interrupt(&mut self) -> Effect {
+        self.notice("stopping the running tool (ctrl-d detaches)", false);
+        Effect::Send(ClientMsg::Interrupt)
+    }
+
+    /// Ctrl-C when nothing runs: detaches; the session (and the daemon)
+    /// keep running.
     fn leave(&self) -> Effect {
         if self.view.session.is_some() {
             Effect::Detach
