@@ -81,15 +81,12 @@ impl Protocol for Gemini {
     }
 
     fn encode(&self, target: &Target<'_>, request: &Request) -> Result<Encoded, Error> {
-        let model = target.model;
-        let model = model.strip_prefix("models/").unwrap_or(model);
+        let model = target.model.strip_prefix("models/").unwrap_or(target.model);
+        let models = self.quirks.models_path;
         Ok(Encoded {
             // `alt=sse` makes the reply an event stream rather than one JSON
             // array of the same chunks.
-            path: format!(
-                "{}/{model}:streamGenerateContent?alt=sse",
-                self.quirks.models_path
-            ),
+            path: format!("{models}/{model}:streamGenerateContent?alt=sse"),
             body: encode::body(self, target, request)?,
             headers: Vec::new(),
             framing: Framing::Sse,
