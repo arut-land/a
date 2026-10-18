@@ -12,6 +12,7 @@ agent = { path = "crates/agent" }
 client = { path = "crates/client" }
 engine = { path = "crates/engine" }
 protocol = { path = "crates/protocol" }
+rt = { path = "crates/rt" }
 store = { path = "crates/store" }
 sys = { path = "crates/sys" }
 
