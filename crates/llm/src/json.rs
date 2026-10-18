@@ -90,6 +90,18 @@ pub(crate) fn object(fields: impl IntoIterator<Item = (String, Value)>) -> Map<S
     object
 }
 
+/// A JSON object written as `json!` writes one, each value moved in with
+/// `Value::from`. `json!` serializes a copy of every value it interpolates,
+/// so a conversation nested in it is copied again at each level.
+macro_rules! obj {
+    ({ $($key:tt: $value:expr),* $(,)? }) => {
+        serde_json::Value::Object($crate::json::object([
+            $(($key.to_owned(), serde_json::Value::from($value))),*
+        ]))
+    };
+}
+pub(crate) use obj;
+
 /// `overlay` deep-merged into `body`: objects merge key by key, anything
 /// else replaces, and `null` removes.
 pub fn overlay(body: &mut Value, overlay: &Map<String, Value>) {

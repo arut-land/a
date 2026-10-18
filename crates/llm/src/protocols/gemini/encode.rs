@@ -14,7 +14,7 @@ use serde_json::{Map, Value, json};
 
 use super::{Gemini, KEY, ThoughtReplay};
 use crate::error::Error;
-use crate::json::Lenient;
+use crate::json::{Lenient, obj};
 use crate::models::Reasoning;
 use crate::models::google as model;
 use crate::protocol::Target;
@@ -36,11 +36,19 @@ pub(crate) const NO_OUTPUT: &str = "(no tool output)";
 /// rejects a call it did not sign without one.
 const UNSIGNED_CALL: &str = "skip_thought_signature_validator";
 
-#[derive(Clone, Copy, PartialEq, Eq, Serialize)]
-#[serde(rename_all = "lowercase")]
+#[derive(Clone, Copy, PartialEq, Eq)]
 enum Role {
     User,
     Model,
+}
+
+impl Role {
+    const fn as_str(self) -> &'static str {
+        match self {
+            Self::User => "user",
+            Self::Model => "model",
+        }
+    }
 }
 
 /// `functionCallingConfig.mode`.
@@ -66,16 +74,20 @@ fn some(value: Value) -> Option<Value> {
 }
 
 fn text_part(text: &str) -> Value {
-    json!({"text": text, "thought": false})
+    obj!({"text": text, "thought": false})
 }
 
 /// `media` as part data, a URL by reference and data inline; as a `whole`
 /// part, marked as no thought.
 fn media(media: &Media, whole: bool) -> Result<Value, Error> {
-    let mime = &media.media_type;
+    let mime = media.media_type.as_str();
     let mut part = match &media.source {
-        Source::Data { data } => json!({"inlineData": {"mimeType": mime, "data": data}}),
-        Source::Url { url } => json!({"fileData": {"mimeType": mime, "fileUri": url}}),
+        Source::Data { data } => {
+            obj!({"inlineData": obj!({"mimeType": mime, "data": data.as_str()})})
+        }
+        Source::Url { url } => {
+            obj!({"fileData": obj!({"mimeType": mime, "fileUri": url.as_str()})})
+        }
         Source::File { .. } => {
             let why = "Gemini cannot carry media by a file id; send its URI as a URL";
             return Err(Error::unsupported(why));
@@ -157,7 +169,7 @@ pub(super) fn contents(
         }
     }
     let contents = contents.0.into_iter();
-    let contents = contents.map(|(role, parts)| json!({"parts": parts, "role": role}));
+    let contents = contents.map(|(role, parts)| obj!({"parts": parts, "role": role.as_str()}));
     Ok((contents.collect(), system))
 }
 
@@ -211,13 +223,13 @@ fn function_response(
         0 | 1 => values.pop(),
         _ => Some(Value::Array(values)),
     };
-    let response = set(json!({
-        "name": result.name,
-        "id": ids.then_some(&result.id),
-        "response": value.map(|value| json!({ key: value })),
+    let response = set(obj!({
+        "name": result.name.as_str(),
+        "id": ids.then_some(result.id.as_str()),
+        "response": value.map(|value| obj!({ key: value })),
         "parts": some(inline.into()),
     }));
-    Ok(json!({"functionResponse": response, "thought": false}))
+    Ok(obj!({"functionResponse": response, "thought": false}))
 }
 
 /// Whether `text` is padded standard base64.
@@ -244,7 +256,7 @@ fn assistant_part(part: &AssistantPart, model: &str, ids: bool) -> Result<Option
         {
             // The call takes the id its response answers.
             if ids {
-                function.insert("id".into(), json!(call.id));
+                function.insert("id".into(), call.id.as_str().into());
             } else {
                 function.remove("id");
             }
@@ -259,17 +271,19 @@ fn assistant_part(part: &AssistantPart, model: &str, ids: bool) -> Result<Option
         return Ok(Some(item));
     }
     Ok(Some(match part {
-        AssistantPart::Text(text) if !text.text.trim().is_empty() => json!({"text": text.text}),
+        AssistantPart::Text(text) if !text.text.trim().is_empty() => {
+            obj!({"text": text.text.as_str()})
+        }
         AssistantPart::Reasoning(thought)
             if !thought.redacted && !thought.text.trim().is_empty() =>
         {
-            json!({"thought": true, "text": thought.text})
+            obj!({"thought": true, "text": thought.text.as_str()})
         }
         AssistantPart::ToolCall(call) => {
-            let id = ids.then_some(&call.id);
-            let function = set(json!({"name": call.name, "args": call.input, "id": id}));
+            let (id, name) = (ids.then_some(call.id.as_str()), call.name.as_str());
+            let function = set(obj!({"name": name, "args": call.input.clone(), "id": id}));
             let signature = model::validates_signatures(model).then_some(UNSIGNED_CALL);
-            set(json!({"functionCall": function, "thoughtSignature": signature}))
+            set(obj!({"functionCall": function, "thoughtSignature": signature}))
         }
         AssistantPart::Media(part) => media(part, true)?,
         _ => return Ok(None),
@@ -301,7 +315,7 @@ fn tool_config(choice: &ToolChoice) -> Value {
         ToolChoice::Tool(name) => (Mode::Any, Some([name])),
     };
     let config = set(json!({"mode": mode, "allowed_function_names": names}));
-    json!({ "functionCallingConfig": config })
+    obj!({"functionCallingConfig": config})
 }
 
 /// A tool as its function declaration. Its JSON Schema goes whole as
@@ -386,14 +400,14 @@ pub(crate) fn body(
     }
     let mut options = request.options_for(KEY);
     let declared = some(request.tools.iter().map(declaration).collect());
-    let mut tools = Vec::from_iter(declared.map(|tools| json!({ "functionDeclarations": tools })));
+    let mut tools = Vec::from_iter(declared.map(|tools| obj!({"functionDeclarations": tools})));
     if let Some(Value::Array(hosted)) = options.remove("tools") {
         tools.extend(hosted);
     }
     let choice = &request.tool_choice;
-    let mut body = set(json!({
+    let mut body = set(obj!({
         "contents": contents,
-        "systemInstruction": some(system.into()).map(|parts| json!({ "parts": parts })),
+        "systemInstruction": some(system.into()).map(|parts| obj!({"parts": parts})),
         "generationConfig": some(generation_config(model, request)),
         "tools": some(tools.into()),
         "toolConfig": (*choice != ToolChoice::Auto).then(|| tool_config(choice)),
