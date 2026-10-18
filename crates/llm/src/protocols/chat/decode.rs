@@ -298,11 +298,11 @@ impl ChatDecoder {
     /// call of a whole message (`whole`) at its position in the list.
     fn delta(&mut self, delta: Delta<'_>, whole: bool) -> Result<(), Error> {
         let texts = [
-            delta.reasoning_content,
-            delta.reasoning,
-            delta.reasoning_text,
+            &delta.reasoning_content,
+            &delta.reasoning,
+            &delta.reasoning_text,
         ];
-        if let Some((field, text)) = ReasoningField::first(texts.map(Json::into_text)) {
+        if let Some((field, text)) = ReasoningField::first(texts.map(Json::str)) {
             self.reason(text)?;
             self.reasoning_field.get_or_insert(field);
         }

@@ -104,11 +104,11 @@ impl ReasoningField {
 
     /// The first field of `texts` (one per field, in [`Self::ALL`]'s order)
     /// that carries text, with it.
-    pub fn first<T: AsRef<str>>(texts: [Option<T>; 3]) -> Option<(Self, T)> {
+    pub fn first(texts: [Option<&str>; 3]) -> Option<(Self, &str)> {
         Self::ALL
             .into_iter()
             .zip(texts)
-            .find_map(|(field, text)| Some((field, text.filter(|text| !text.as_ref().is_empty())?)))
+            .find_map(|(field, text)| Some((field, text.filter(|text| !text.is_empty())?)))
     }
 }
 
