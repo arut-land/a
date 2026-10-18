@@ -2,8 +2,9 @@
 //! so far: a reasoning part's details, a tool call's fields, a message's
 //! content parts.
 
-use serde_json::{Map, Value, json};
+use serde_json::{Map, Value};
 
+use super::PartKind;
 use crate::json::Lenient;
 
 /// The structured reasoning key, kept verbatim with the reasoning text.
@@ -50,51 +51,58 @@ pub(super) fn merge_details(block: &mut Map<String, Value>, details: Vec<Value>)
     }
 }
 
-/// The keys whose string fragments concatenate when a provider streams
-/// them: text and reasoning, a call's arguments or custom input, audio's
+/// Whether strings under `key` concatenate when a provider streams them:
+/// text and reasoning, a call's arguments or custom input, audio's
 /// transcript and data, a reasoning detail's text and summary. Every other
 /// string is an identifier, a tag or a signature a later fragment restates.
-const FRAGMENT_KEYS: [&str; 13] = [
-    "content",
-    "input",
-    "refusal",
-    "reasoning",
-    "reasoning_content",
-    "reasoning_text",
-    "thinking",
-    "tool_plan",
-    "transcript",
-    "data",
-    "arguments",
-    "text",
-    "summary",
-];
+fn fragment(key: &str) -> bool {
+    matches!(
+        key,
+        "content"
+            | "input"
+            | "refusal"
+            | "reasoning"
+            | "reasoning_content"
+            | "reasoning_text"
+            | "thinking"
+            | "tool_plan"
+            | "transcript"
+            | "data"
+            | "arguments"
+            | "text"
+            | "summary"
+    )
+}
+
+/// A string fragment appended; a literal `null` argument placeholder gives
+/// way to the first real fragment.
+fn append(existing: &mut String, more: &str) {
+    if existing.trim() == "null" && !more.trim().is_empty() {
+        existing.clear();
+    }
+    existing.push_str(more);
+}
 
 /// One streamed fragment of a provider object merged into what arrived so
 /// far: fragment strings append, arrays extend, objects merge key by key,
 /// and content parts (a message's `content`, a thinking part's `thinking`)
-/// merge as parts. A value never replaces one of another JSON type, a
-/// `null` or empty string never erases a value, and a literal `null`
-/// argument placeholder gives way to the first real fragment.
-pub(super) fn merge_fields(target: &mut Map<String, Value>, delta: &Map<String, Value>) {
+/// merge as parts. A value never replaces one of another JSON type, and a
+/// `null` or empty string never erases a value.
+pub(super) fn merge_fields<'a, K: AsRef<str>>(
+    target: &mut Map<String, Value>,
+    delta: impl IntoIterator<Item = (K, &'a Value)>,
+) {
     for (key, value) in delta {
-        let fragment = FRAGMENT_KEYS.contains(&key.as_str());
+        let key = key.as_ref();
         match (target.get_mut(key), value) {
             (Some(_), Value::Null) => {}
             (Some(existing), more)
-                if matches!(key.as_str(), "content" | "thinking")
+                if matches!(key, "content" | "thinking")
                     && (existing.is_array() || more.is_array()) =>
             {
                 merge_content(existing, more);
             }
-            (Some(Value::String(existing)), Value::String(more)) if fragment => {
-                if existing.trim() == "null" && !more.trim().is_empty() {
-                    existing.clear();
-                }
-                existing.push_str(more);
-            }
-            (Some(Value::String(existing)), Value::String(more))
-                if more.is_empty() && !existing.is_empty() => {}
+            (_, Value::String(more)) => merge_str(target, key, more),
             (Some(Value::Array(existing)), Value::Array(more)) => {
                 existing.extend(more.iter().cloned());
             }
@@ -103,8 +111,23 @@ pub(super) fn merge_fields(target: &mut Map<String, Value>, delta: &Map<String, 
                 if !existing.is_null()
                     && std::mem::discriminant(existing) != std::mem::discriminant(more) => {}
             _ => {
-                target.insert(key.clone(), value.clone());
+                target.insert(key.to_owned(), value.clone());
             }
+        }
+    }
+}
+
+/// A string merged as [`merge_fields`] merges one, without building its
+/// value first: a fragment appends, an empty string never erases one, and
+/// a string never replaces a value of another JSON type.
+fn merge_str(target: &mut Map<String, Value>, key: &str, more: &str) {
+    match target.get_mut(key) {
+        Some(Value::String(existing)) if fragment(key) => append(existing, more),
+        Some(Value::String(existing)) if more.is_empty() && !existing.is_empty() => {}
+        Some(existing @ (Value::Null | Value::String(_))) => *existing = more.into(),
+        Some(_) => {}
+        None => {
+            target.insert(key.to_owned(), more.into());
         }
     }
 }
@@ -116,18 +139,19 @@ fn merge_content(existing: &mut Value, more: &Value) {
     fn parts(value: Value) -> Vec<Value> {
         match value {
             Value::Array(parts) => parts,
-            Value::String(text) if !text.is_empty() => vec![json!({"type": "text", "text": text})],
+            Value::String(text) if !text.is_empty() => vec![PartKind::Text.part(text)],
             _ => Vec::new(),
         }
     }
     let mut merged = parts(std::mem::take(existing));
     for part in parts(more.clone()) {
-        let kind = part.str("type").map(str::to_owned);
-        let kind = kind.as_deref();
+        let joins = matches!(
+            PartKind::of(&part),
+            Some(PartKind::Text | PartKind::Thinking)
+        );
         match (merged.last_mut(), part) {
             (Some(Value::Object(last)), Value::Object(next))
-                if matches!(kind, Some("text" | "thinking"))
-                    && last.get("type").and_then(Value::as_str) == kind =>
+                if joins && last.get("type") == next.get("type") =>
             {
                 merge_fields(last, &next);
             }

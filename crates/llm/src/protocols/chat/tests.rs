@@ -164,7 +164,10 @@ fn the_done_sentinel_without_a_finish_fails() {
 /// stop, and a turn holding a call as a call, delivered whole.
 #[test]
 fn the_done_quirk_ends_a_turn_at_the_sentinel() {
-    let lenient = gateway(Quirks::OPENAI.done_without_finish_reason());
+    let lenient = gateway(Quirks {
+        done_without_finish_reason: true,
+        ..Quirks::OPENAI
+    });
     let response = decode(&lenient, "m", &[text("complete answer"), DONE.into()]);
     assert_eq!(response.finish.reason, Reason::Stop);
     assert_eq!(response.message.text(), "complete answer");
@@ -190,7 +193,10 @@ fn the_done_quirk_ends_a_turn_at_the_sentinel() {
 /// that stops without the sentinel.
 #[test]
 fn the_done_quirk_still_fails_what_never_ended() {
-    let lenient = gateway(Quirks::OPENAI.done_without_finish_reason());
+    let lenient = gateway(Quirks {
+        done_without_finish_reason: true,
+        ..Quirks::OPENAI
+    });
     for frames in [
         vec![DONE.to_owned()],
         vec!["\"noise\"".to_owned(), DONE.to_owned()],

@@ -11,6 +11,10 @@ mod rules;
 
 pub use hosts::HOSTS;
 
+use serde::{Deserialize, Serialize};
+use serde_json::{Map, Value, json};
+
+use super::schema::{legal_call_id, short_hash};
 use crate::error::Error;
 use crate::protocol::{Decoder, Encoded, Framing, Host, Hosted, Protocol, Target};
 use crate::spec::{Reason, Request};
@@ -49,34 +53,9 @@ pub enum LaterSystem {
     Leading,
 }
 
-/// The host's own change to the finished body.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum Rewrite {
-    None,
-    /// A forced tool choice dropped while the model thinks.
-    DeepSeek,
-    /// Every content array flattened to a string.
-    Mira,
-    /// Text-only content arrays sent as one string.
-    Perplexity,
-    /// A forced tool choice relaxed to `auto` beside a structured format,
-    /// and content parts as Mistral's chunks.
-    Mistral,
-    /// A specific-function tool choice refused: `llama-server` treats it as
-    /// `auto`.
-    LlamaCpp,
-    /// A specific-function tool choice refused, and `required` coerced to
-    /// `auto` with a steering message.
-    Moonshot,
-    /// Model ids name the upstream vendor; a PDF may go by URL.
-    OpenRouter,
-    /// `num_ctx` and `options` refused: only Ollama's native API reads them.
-    Ollama,
-}
-
-/// Whose model rules and option vocabulary a host follows: which models
-/// read images, and how the generation options are spelled. An option the
-/// model cannot take is left out.
+/// Whose model rules, option vocabulary, media support and body rewrite
+/// (`rewrite.rs`) a host follows. An option the model cannot take is left
+/// out.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Vendor {
     OpenAi,
@@ -102,6 +81,68 @@ pub enum Vendor {
     Other,
 }
 
+/// The fields an assistant message carries reasoning text under, in the
+/// order they are read: servers that send several send the same text under
+/// each, so the first that carries text is the one kept.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ReasoningField {
+    ReasoningContent,
+    Reasoning,
+    ReasoningText,
+}
+
+impl ReasoningField {
+    pub const ALL: [Self; 3] = [Self::ReasoningContent, Self::Reasoning, Self::ReasoningText];
+
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::ReasoningContent => "reasoning_content",
+            Self::Reasoning => "reasoning",
+            Self::ReasoningText => "reasoning_text",
+        }
+    }
+
+    /// The first field of `texts` (one per field, in [`Self::ALL`]'s order)
+    /// that carries text, with it.
+    pub fn first(texts: [Option<&str>; 3]) -> Option<(Self, &str)> {
+        Self::ALL
+            .into_iter()
+            .zip(texts)
+            .find_map(|(field, text)| Some((field, text.filter(|text| !text.is_empty())?)))
+    }
+}
+
+/// The content-part types this wire reads and writes. A part is
+/// `{"type": kind, kind: payload}`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(rename_all = "snake_case")]
+enum PartKind {
+    Text,
+    Refusal,
+    Thinking,
+    ImageUrl,
+    InputAudio,
+    VideoUrl,
+    File,
+}
+
+impl PartKind {
+    /// The kind `part`'s `type` names, if this wire knows it.
+    fn of(part: &Value) -> Option<Self> {
+        Self::deserialize(part.get("type")?).ok()
+    }
+
+    /// A part of this kind carrying `payload`.
+    fn part(self, payload: impl Into<Value>) -> Value {
+        let kind = json!(self);
+        let key = kind.as_str().unwrap_or_default().to_owned();
+        Value::Object(Map::from_iter([
+            ("type".to_owned(), kind),
+            (key, payload.into()),
+        ]))
+    }
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 #[allow(clippy::struct_excessive_bools)]
 pub struct Quirks {
@@ -109,7 +150,6 @@ pub struct Quirks {
     pub path: &'static str,
     pub routing: Routing,
     pub vendor: Vendor,
-    pub rewrite: Rewrite,
     /// Whether `tools` and `tool_choice` reach the host. A host without
     /// them gets the conversation's calls and results as text.
     pub supports_tools: bool,
@@ -130,7 +170,8 @@ pub struct Quirks {
     pub stream_usage: bool,
     /// Whether `[DONE]` ends a turn no finish reason ended: as tool calls
     /// when it holds one, a stop otherwise. Without it such a stream is
-    /// incomplete.
+    /// incomplete; with it, so is a cut-off stream that still sends
+    /// `[DONE]`, so set it only for a gateway known to omit the field.
     pub done_without_finish_reason: bool,
     pub output_cap: OutputCap,
     /// Whether an upstream's own `native_finish_reason` stands in for a
@@ -140,7 +181,7 @@ pub struct Quirks {
     pub finishes: &'static [(&'static str, Reason)],
     /// The field rebuilt reasoning goes back under, which every assistant
     /// message then carries, empty when the turn has none.
-    pub reasoning_field: Option<&'static str>,
+    pub reasoning_field: Option<ReasoningField>,
     /// Whether `completion_tokens_details.reasoning_tokens` is a part of
     /// `completion_tokens`, as `OpenAI` documents; otherwise unreported.
     pub reliable_reasoning_count: bool,
@@ -158,7 +199,6 @@ impl Quirks {
         path: "/chat/completions",
         routing: Routing::Path,
         vendor: Vendor::Other,
-        rewrite: Rewrite::None,
         supports_tools: true,
         supports_response_format: true,
         response_format_with_tools: false,
@@ -177,29 +217,6 @@ impl Quirks {
         file_ids: true,
         call_id_limit: None,
     };
-
-    /// These quirks without the streamed usage chunk.
-    #[must_use]
-    pub const fn without_stream_usage(mut self) -> Self {
-        self.stream_usage = false;
-        self
-    }
-
-    /// These quirks for a gateway whose streams omit `finish_reason`. A
-    /// cut-off stream that still sends `[DONE]` then reads as complete, so
-    /// set it only for a gateway known to omit the field.
-    #[must_use]
-    pub const fn done_without_finish_reason(mut self) -> Self {
-        self.done_without_finish_reason = true;
-        self
-    }
-
-    /// These quirks without structured output.
-    #[must_use]
-    pub const fn without_response_format(mut self) -> Self {
-        self.supports_response_format = false;
-        self
-    }
 }
 
 impl Default for Quirks {
@@ -260,24 +277,24 @@ impl Protocol for Chat {
     /// past 40 characters; a host with a limit cuts any other id to it, and
     /// the rest keep theirs.
     fn tool_id(&self, id: &str) -> Option<String> {
-        let fitted = if let Some((call, item)) = id.split_once('|') {
-            let call = super::schema::legal_call_id(call, usize::MAX);
-            let item = super::schema::legal_call_id(item, usize::MAX);
-            let joined = if item.is_empty() {
-                call.clone()
-            } else {
-                format!("{call}_{item}")
-            };
-            if joined.len() <= 40 {
-                joined
-            } else {
-                let hash: String = super::schema::short_hash(id).chars().take(8).collect();
-                let prefix: String = call.chars().take(40 - hash.len() - 1).collect();
-                format!("{prefix}_{hash}")
+        let fitted = match id.split_once('|') {
+            Some((call, item)) => {
+                let call = legal_call_id(call, usize::MAX);
+                let item = legal_call_id(item, usize::MAX);
+                let joined = if item.is_empty() {
+                    call.clone()
+                } else {
+                    format!("{call}_{item}")
+                };
+                if joined.len() <= 40 {
+                    joined
+                } else {
+                    let hash: String = short_hash(id).chars().take(8).collect();
+                    let prefix: String = call.chars().take(39 - hash.len()).collect();
+                    format!("{prefix}_{hash}")
+                }
             }
-        } else {
-            let limit = self.quirks.call_id_limit?;
-            id.chars().take(limit).collect()
+            None => id.chars().take(self.quirks.call_id_limit?).collect(),
         };
         (fitted != id).then_some(fitted)
     }

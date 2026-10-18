@@ -5,8 +5,11 @@
 
 use serde_json::{Map, Value, json};
 
-use super::{Quirks, Routing, Vendor};
-use crate::models::{self, Maker, deepseek, groq, minimax, moonshot, openai, perplexity, xai, zai};
+use super::{Quirks, ReasoningField, Routing, Vendor};
+use crate::models::{
+    self, LOW_TO_HIGH, Maker, Thinking, cohere, deepseek, groq, minimax, moonshot, openai,
+    perplexity, xai, zai,
+};
 use crate::spec::{Effort, Generation};
 
 /// Whose model rules a host's models follow; `None` for a host serving
@@ -23,25 +26,17 @@ fn maker(vendor: Vendor) -> Option<Maker> {
         Vendor::Moonshot => Maker::Moonshot,
         Vendor::MiniMax => Maker::MiniMax,
         Vendor::Mimo => Maker::Xiaomi,
-        Vendor::OpenRouter
-        | Vendor::Together
-        | Vendor::Venice
-        | Vendor::LlamaCpp
-        | Vendor::Ollama
-        | Vendor::Perplexity
-        | Vendor::Other => return None,
+        _ => return None,
     })
 }
 
 /// Whether `model` reads user images on a host of `vendor`. An
 /// `OpenRouter` id names its upstream, whose rule decides.
 pub(super) fn reads_images(vendor: Vendor, model: &str) -> bool {
-    let (maker, model) = match vendor {
-        Vendor::OpenRouter => match model.split_once('/') {
-            Some((upstream, model)) => (Maker::named(upstream), model),
-            None => (None, model),
-        },
-        vendor => (maker(vendor), model),
+    let (maker, model) = match (vendor, model.split_once('/')) {
+        (Vendor::OpenRouter, Some((upstream, model))) => (Maker::named(upstream), model),
+        (Vendor::OpenRouter, None) => (None, model),
+        (vendor, _) => (maker(vendor), model),
     };
     maker.is_none_or(|maker| maker.reads_images(model))
 }
@@ -53,11 +48,12 @@ pub(super) fn reasoning_field(
     quirks: &Quirks,
     base_url: &str,
     model: &str,
-) -> Option<&'static str> {
+) -> Option<ReasoningField> {
     let deepseek = base_url.to_ascii_lowercase().contains("deepseek.com");
+    let asks = deepseek || moonshot::replays_reasoning(model);
     quirks
         .reasoning_field
-        .or((deepseek || moonshot::replays_reasoning(model)).then_some("reasoning_content"))
+        .or(asks.then_some(ReasoningField::ReasoningContent))
 }
 
 /// What the request asks of the model's reasoning.
@@ -89,6 +85,15 @@ impl Reasoning {
             (Self::Effort(effort), model) => model.takes(*effort),
         })
     }
+
+    /// The level's word, `none` for off.
+    fn effort(self) -> Option<Effort> {
+        match self {
+            Self::Off => Some(Effort::None),
+            Self::Effort(effort) => Some(effort),
+            Self::Budget(_) => None,
+        }
+    }
 }
 
 /// The fields a host's options go under, filled as each is allowed.
@@ -100,16 +105,24 @@ impl Sent {
         self.0.insert(key.to_owned(), value.into());
     }
 
-    fn effort(&mut self, effort: Effort) {
-        self.send("reasoning_effort", effort.as_str());
+    /// `reasoning_effort`: the level's word, `none` for off.
+    fn effort(&mut self, reasoning: Option<Reasoning>) {
+        if let Some(effort) = reasoning.and_then(Reasoning::effort) {
+            self.send("reasoning_effort", effort.as_str());
+        }
     }
 
-    /// `reasoning_effort` as the level's word, `none` for off; a budget is
-    /// not taken.
-    fn plain(&mut self, reasoning: Option<Reasoning>) {
+    /// `thinking: {type: disabled}` for off; a level as `thinking: {type:
+    /// on}`, when given, beside `reasoning_effort`.
+    fn thinking(&mut self, reasoning: Option<Reasoning>, on: Option<&str>) {
         match reasoning {
-            Some(Reasoning::Off) => self.send("reasoning_effort", "none"),
-            Some(Reasoning::Effort(effort)) => self.effort(effort),
+            Some(Reasoning::Off) => self.send("thinking", json!({"type": "disabled"})),
+            Some(Reasoning::Effort(_)) => {
+                if let Some(on) = on {
+                    self.send("thinking", json!({ "type": on }));
+                }
+                self.effort(reasoning);
+            }
             Some(Reasoning::Budget(_)) | None => {}
         }
     }
@@ -122,36 +135,19 @@ struct Takes {
     /// The key `seed` goes under, when it is taken.
     seed: Option<&'static str>,
     parallel: bool,
-    stop: Stop,
-}
-
-/// How many stop sequences a vendor takes.
-#[derive(Clone, Copy)]
-enum Stop {
-    None,
-    Any,
-    AtMost(usize),
-}
-
-impl Stop {
-    fn takes(self, count: usize) -> bool {
-        match self {
-            Self::None => false,
-            Self::Any => true,
-            Self::AtMost(limit) => count <= limit,
-        }
-    }
+    /// How many stop sequences it takes.
+    stop: usize,
 }
 
 const NOTHING: Takes = Takes {
     top_p: false,
     seed: None,
     parallel: false,
-    stop: Stop::None,
+    stop: 0,
 };
 
 /// Everything, with at most `stop` stop sequences.
-const fn all(stop: Stop) -> Takes {
+const fn all(stop: usize) -> Takes {
     Takes {
         top_p: true,
         seed: Some("seed"),
@@ -161,7 +157,7 @@ const fn all(stop: Stop) -> Takes {
 }
 
 /// Only `top_p` and stop sequences: no `seed` or `parallel_tool_calls`.
-const fn sampling(stop: Stop) -> Takes {
+const fn sampling(stop: usize) -> Takes {
     Takes {
         top_p: true,
         stop,
@@ -172,45 +168,38 @@ const fn sampling(stop: Stop) -> Takes {
 /// What `vendor` takes for `model` beside reasoning; `off` says the request
 /// turns reasoning off.
 fn takes(vendor: Vendor, model: &str, generation: &Generation, off: bool) -> Takes {
+    const ANY: usize = usize::MAX;
     match vendor {
         // A reasoning model takes no `stop`, at any effort.
-        Vendor::OpenAi | Vendor::Azure => Takes {
-            stop: if openai::reasons(model) == Some(true) {
-                Stop::None
-            } else {
-                Stop::AtMost(4)
-            },
-            ..all(Stop::Any)
-        },
-        Vendor::OpenRouter | Vendor::Groq | Vendor::Venice => all(Stop::AtMost(4)),
-        Vendor::DeepSeek => sampling(Stop::AtMost(16)),
+        Vendor::OpenAi | Vendor::Azure => all(if openai::reasons(model) == Some(true) {
+            0
+        } else {
+            4
+        }),
+        Vendor::OpenRouter | Vendor::Groq | Vendor::Venice => all(4),
+        Vendor::DeepSeek => sampling(16),
         Vendor::Mistral => Takes {
             seed: Some("random_seed"),
-            ..all(Stop::Any)
+            ..all(ANY)
         },
         // A Grok model reasons unless its id says otherwise, and then takes
         // no stop sequences.
         Vendor::Xai => Takes {
             seed: None,
-            stop: if xai::reasons(model) {
-                Stop::None
-            } else {
-                Stop::Any
-            },
-            ..all(Stop::Any)
+            ..all(if xai::reasons(model) { 0 } else { ANY })
         },
         Vendor::Together | Vendor::Ollama | Vendor::Cohere => Takes {
             parallel: false,
-            ..all(Stop::Any)
+            ..all(ANY)
         },
-        Vendor::LlamaCpp => all(Stop::Any),
-        Vendor::Perplexity | Vendor::MiniMax => sampling(Stop::Any),
+        Vendor::LlamaCpp => all(ANY),
+        Vendor::Perplexity | Vendor::MiniMax => sampling(ANY),
         // Stop sequences of at most 32 bytes, five at most.
         Vendor::Moonshot => Takes {
             stop: if generation.stop.iter().all(|sequence| sequence.len() <= 32) {
-                Stop::AtMost(5)
+                5
             } else {
-                Stop::None
+                0
             },
             ..NOTHING
         },
@@ -218,12 +207,12 @@ fn takes(vendor: Vendor, model: &str, generation: &Generation, off: bool) -> Tak
             top_p: generation
                 .top_p
                 .is_some_and(|top_p| (0.01..=1.0).contains(&top_p)),
-            ..sampling(Stop::AtMost(4))
+            ..sampling(4)
         },
         // MiMo fixes `top_p` while it thinks.
         Vendor::Mimo => Takes {
             top_p: off,
-            ..sampling(Stop::AtMost(4))
+            ..sampling(4)
         },
         // Mira rejects every pass-through parameter, and the rest are
         // unverified.
@@ -253,12 +242,8 @@ pub(super) fn generation(
         sent.send("max_tokens", max.get());
     }
     reasoning_fields(&mut sent, quirks, model, reasoning);
-    let takes = takes(
-        quirks.vendor,
-        model,
-        generation,
-        reasoning == Some(Reasoning::Off),
-    );
+    let off = reasoning == Some(Reasoning::Off);
+    let takes = takes(quirks.vendor, model, generation, off);
     if let Some(top_p) = generation.top_p.filter(|_| takes.top_p && samples) {
         sent.send("top_p", top_p);
     }
@@ -269,7 +254,7 @@ pub(super) fn generation(
         sent.send("parallel_tool_calls", parallel);
     }
     let stop = &generation.stop;
-    if !stop.is_empty() && takes.stop.takes(stop.len()) {
+    if !stop.is_empty() && stop.len() <= takes.stop {
         sent.send("stop", stop.clone());
     }
     sent.0
@@ -277,73 +262,45 @@ pub(super) fn generation(
 
 /// The fields `reasoning` goes under for `model` on the host.
 fn reasoning_fields(sent: &mut Sent, quirks: &Quirks, model: &str, reasoning: Option<Reasoning>) {
+    let taken = |rules| Reasoning::taken(reasoning, rules);
     match quirks.vendor {
         Vendor::OpenAi | Vendor::Azure => openai_reasoning(sent, model, reasoning, quirks.routing),
         Vendor::OpenRouter => match reasoning {
-            Some(Reasoning::Off) => sent.send("reasoning", json!({"effort": "none"})),
-            Some(Reasoning::Effort(effort)) => {
-                sent.send("reasoning", json!({"effort": effort.as_str()}));
-            }
             // These upstreams take an effort level, not a budget.
             Some(Reasoning::Budget(_))
                 if model.starts_with("openai/") || model.starts_with("x-ai/") => {}
             Some(Reasoning::Budget(tokens)) => {
-                sent.send("reasoning", json!({"max_tokens": tokens}));
+                sent.send("reasoning", json!({ "max_tokens": tokens }));
+            }
+            Some(reasoning) => {
+                let effort = reasoning.effort().map(Effort::as_str);
+                sent.send("reasoning", json!({ "effort": effort }));
             }
             None => {}
         },
-        Vendor::DeepSeek | Vendor::Zai => {
-            let model = match quirks.vendor {
-                Vendor::Zai => zai::reasoning(model),
-                _ => deepseek::REASONING,
-            };
-            match Reasoning::taken(reasoning, model) {
-                Some(Reasoning::Off) => sent.send("thinking", json!({"type": "disabled"})),
-                Some(Reasoning::Effort(effort)) => {
-                    sent.send("thinking", json!({"type": "enabled"}));
-                    sent.effort(effort);
+        Vendor::DeepSeek => sent.thinking(taken(deepseek::REASONING), Some("enabled")),
+        Vendor::Zai => sent.thinking(taken(zai::reasoning(model)), Some("enabled")),
+        Vendor::MiniMax => sent.thinking(taken(minimax::reasoning(model)), Some("adaptive")),
+        Vendor::Moonshot => sent.thinking(taken(moonshot::reasoning(model)), None),
+        // MiMo takes no level, only an off.
+        Vendor::Mimo => sent.thinking(reasoning.filter(|r| *r == Reasoning::Off), None),
+        Vendor::Together => {
+            let rules = models::Reasoning::Takes(Thinking::levels(LOW_TO_HIGH).disabling());
+            if let Some(reasoning) = taken(rules) {
+                let enabled = reasoning != Reasoning::Off;
+                sent.send("reasoning", json!({ "enabled": enabled }));
+                if enabled {
+                    sent.effort(Some(reasoning));
                 }
-                _ => {}
             }
         }
         Vendor::Mistral | Vendor::Venice | Vendor::LlamaCpp | Vendor::Ollama => {
-            sent.plain(reasoning);
+            sent.effort(taken(models::Reasoning::Unknown));
         }
-        Vendor::Groq => sent.plain(Reasoning::taken(reasoning, groq::reasoning(model))),
-        Vendor::Xai => sent.plain(Reasoning::taken(reasoning, xai::REASONING)),
-        Vendor::Perplexity => sent.plain(Reasoning::taken(reasoning, perplexity::reasoning(model))),
-        Vendor::Together => match reasoning {
-            Some(Reasoning::Off) => sent.send("reasoning", json!({"enabled": false})),
-            Some(Reasoning::Effort(effort @ (Effort::Low | Effort::Medium | Effort::High))) => {
-                sent.send("reasoning", json!({"enabled": true}));
-                sent.effort(effort);
-            }
-            _ => {}
-        },
-        Vendor::Moonshot => match Reasoning::taken(reasoning, moonshot::reasoning(model)) {
-            Some(Reasoning::Off) => sent.send("thinking", json!({"type": "disabled"})),
-            Some(Reasoning::Effort(effort)) => sent.effort(effort),
-            _ => {}
-        },
-        // The Compatibility API takes only `none` and `high`.
-        Vendor::Cohere => match reasoning {
-            Some(Reasoning::Off) => sent.send("reasoning_effort", "none"),
-            Some(Reasoning::Effort(Effort::High)) => sent.effort(Effort::High),
-            _ => {}
-        },
-        Vendor::MiniMax => match Reasoning::taken(reasoning, minimax::reasoning(model)) {
-            Some(Reasoning::Off) => sent.send("thinking", json!({"type": "disabled"})),
-            Some(Reasoning::Effort(effort)) => {
-                sent.send("thinking", json!({"type": "adaptive"}));
-                sent.effort(effort);
-            }
-            _ => {}
-        },
-        Vendor::Mimo => {
-            if reasoning == Some(Reasoning::Off) {
-                sent.send("thinking", json!({"type": "disabled"}));
-            }
-        }
+        Vendor::Groq => sent.effort(taken(groq::reasoning(model))),
+        Vendor::Xai => sent.effort(taken(xai::REASONING)),
+        Vendor::Perplexity => sent.effort(taken(perplexity::reasoning(model))),
+        Vendor::Cohere => sent.effort(taken(cohere::REASONING)),
         Vendor::Mira | Vendor::Other => {}
     }
 }
@@ -360,15 +317,11 @@ fn openai_reasoning(sent: &mut Sent, model: &str, reasoning: Option<Reasoning>, 
     if dated || openai::reasons(model) == Some(false) {
         return;
     }
-    match reasoning {
-        Some(Reasoning::Off)
-            if openai::reasons(model) != Some(true) || openai::chat_can_disable(model) =>
-        {
-            sent.send("reasoning_effort", "none");
-        }
+    let reasoning = reasoning.filter(|reasoning| match reasoning {
+        Reasoning::Off => openai::reasons(model) != Some(true) || openai::chat_can_disable(model),
         // Azure takes `max` only on Responses.
-        Some(Reasoning::Effort(Effort::Max)) if azure.is_some() => {}
-        Some(Reasoning::Effort(effort)) => sent.effort(effort),
-        Some(Reasoning::Off | Reasoning::Budget(_)) | None => {}
-    }
+        Reasoning::Effort(effort) => !(*effort == Effort::Max && azure.is_some()),
+        Reasoning::Budget(_) => false,
+    });
+    sent.effort(reasoning);
 }

@@ -5,13 +5,13 @@
 //! model still reads, and a host without tools reads the conversation's
 //! calls and results as text.
 
-use std::borrow::Cow;
+use std::collections::BTreeMap;
 
+use serde::Serialize;
 use serde_json::{Map, Value, json};
 
-use super::decode::REASONING_TEXT_KEYS;
 use super::merge::merge_fields;
-use super::{KEY, LaterSystem, Quirks, Rewrite, Routing, Vendor, rules};
+use super::{KEY, LaterSystem, PartKind, Quirks, ReasoningField, Routing, Vendor as V, rules};
 use crate::error::Error;
 use crate::json::Lenient;
 use crate::models::openai;
@@ -19,7 +19,7 @@ use crate::protocol::Target;
 use crate::protocols::schema;
 use crate::replay::{Replay, replay, replays};
 use crate::spec::{
-    Assistant, AssistantPart, Format, Media, Message, Output, Request, Source, ToolCall,
+    Assistant, AssistantPart, Format, Media, Message, Output, Request, Source, Tool, ToolCall,
     ToolChoice, ToolResult, UserPart,
 };
 
@@ -43,6 +43,27 @@ pub(super) const DOCUMENT_UNSENDABLE: &str =
 /// What answers a call whose result says nothing.
 pub(super) const NO_TOOL_OUTPUT: &str = "(no tool output)";
 
+/// Who a message is from.
+#[derive(Clone, Copy, Serialize)]
+#[serde(rename_all = "lowercase")]
+pub(super) enum Role {
+    System,
+    User,
+    Assistant,
+    Tool,
+}
+
+impl Role {
+    /// Whether `message` is from this role.
+    fn sent(self, message: &Value) -> bool {
+        message.get("role") == Some(&json!(self))
+    }
+
+    pub(super) fn message(self, content: impl Into<Value>) -> Value {
+        json!({"role": self, "content": content.into()})
+    }
+}
+
 /// The keys of a stale item a rebuilt part keeps: a custom call's kind and
 /// Mistral's thinking part (`type`), or the field reasoning arrived in.
 /// Signed data such as `reasoning_details` never survives an edit.
@@ -50,10 +71,11 @@ fn identity(item: &Value) -> Map<String, Value> {
     if let Some(kind @ ("custom" | "thinking")) = item.str("type") {
         return Map::from_iter([("type".to_owned(), Value::from(kind))]);
     }
-    REASONING_TEXT_KEYS
+    ReasoningField::ALL
         .iter()
-        .find(|key| item.get(**key).is_some_and(Value::is_string))
-        .map_or_default(|key| Map::from_iter([((*key).to_owned(), Value::String(String::new()))]))
+        .map(|field| field.as_str())
+        .find(|key| item.get(*key).is_some_and(Value::is_string))
+        .map_or_default(|key| Map::from_iter([(key.to_owned(), Value::String(String::new()))]))
 }
 
 /// What the encoder knows about the target.
@@ -61,32 +83,35 @@ struct Context<'a> {
     quirks: &'a Quirks,
     /// Whether the model reads user images.
     images: bool,
-    reasoning_field: Option<&'static str>,
+    reasoning_field: Option<ReasoningField>,
     /// The custom tools the request declares, whose calls are custom calls.
-    custom: Vec<String>,
+    custom: Vec<&'a str>,
 }
 
+/// What media a host takes: content parts at all, media beyond images, and
+/// video.
 impl Context<'_> {
-    /// Whether the host takes content parts at all.
     fn parts(&self) -> bool {
-        !matches!(self.quirks.rewrite, Rewrite::DeepSeek | Rewrite::Mira)
+        !matches!(self.quirks.vendor, V::DeepSeek | V::Mira)
     }
 
-    /// Whether the host takes media beyond images.
     fn files(&self) -> bool {
-        self.parts()
-            && self.quirks.rewrite != Rewrite::Perplexity
-            && !matches!(self.quirks.vendor, Vendor::Cohere | Vendor::Ollama)
+        self.parts() && !matches!(self.quirks.vendor, V::Perplexity | V::Cohere | V::Ollama)
     }
 
-    /// Whether an image tool results carry is read there.
-    fn result_images(&self) -> bool {
-        self.images && self.quirks.image_tool_results
+    fn video(&self) -> bool {
+        self.files() && !matches!(self.quirks.vendor, V::OpenAi | V::Azure | V::Mistral)
     }
 }
 
 fn text_part(text: &str) -> Value {
-    json!({"type": "text", "text": text})
+    PartKind::Text.part(text)
+}
+
+/// The text of `parts`, one line each.
+pub(super) fn joined_text(parts: &[Value]) -> String {
+    let texts: Vec<&str> = parts.iter().filter_map(|part| part.str("text")).collect();
+    texts.join("\n")
 }
 
 fn data_url(media: &Media, data: &str) -> String {
@@ -99,14 +124,14 @@ fn image_url(media: &Media, ctx: &Context<'_>, user: bool) -> Option<Value> {
     let url = match &media.source {
         Source::Data { data } if ctx.parts() => data_url(media, data),
         // Ollama reads an image as data and never fetches a URL.
-        Source::Url { url } if ctx.parts() && ctx.quirks.vendor != Vendor::Ollama => url.clone(),
+        Source::Url { url } if ctx.parts() && ctx.quirks.vendor != V::Ollama => url.clone(),
         Source::Data { .. } | Source::Url { .. } | Source::File { .. } => return None,
     };
     let mut part = json!({"url": url});
     if user {
         part["detail"] = json!("auto");
     }
-    Some(json!({"type": "image_url", "image_url": part}))
+    Some(PartKind::ImageUrl.part(part))
 }
 
 /// The audio format a media type names.
@@ -120,43 +145,34 @@ fn audio_format(media_type: &str) -> &str {
 
 /// One user media part as the host takes it, or the note that replaces it.
 fn media_part(media: &Media, ctx: &Context<'_>) -> Result<Value, &'static str> {
-    let file = |file: Value| json!({"type": "file", "file": file});
+    let pdf = |file_data: String| json!({"file_data": file_data, "filename": "document.pdf"});
     let kind = media.media_type.split('/').next().unwrap_or_default();
     match (kind, &media.source) {
         ("image", _) if !ctx.images => Err(USER_IMAGE_OMITTED),
         ("image", _) => image_url(media, ctx, true).ok_or(IMAGE_UNSENDABLE),
-        ("audio", Source::Data { data }) if ctx.files() => Ok(json!({"type": "input_audio",
-            "input_audio": {"data": data, "format": audio_format(&media.media_type)}})),
+        ("audio", Source::Data { data }) if ctx.files() => Ok(PartKind::InputAudio
+            .part(json!({"data": data, "format": audio_format(&media.media_type)}))),
         ("audio", _) => Err(AUDIO_UNSENDABLE),
-        ("video", Source::Data { data }) if ctx.files() && video(ctx) => {
-            Ok(json!({"type": "video_url", "video_url": {"url": data_url(media, data)}}))
+        ("video", Source::Data { data }) if ctx.video() => {
+            Ok(PartKind::VideoUrl.part(json!({"url": data_url(media, data)})))
         }
-        ("video", Source::Url { url }) if ctx.files() && video(ctx) => {
-            Ok(json!({"type": "video_url", "video_url": {"url": url}}))
+        ("video", Source::Url { url }) if ctx.video() => {
+            Ok(PartKind::VideoUrl.part(json!({ "url": url })))
         }
         ("video", _) => Err(VIDEO_UNSENDABLE),
         (_, Source::File { id }) if ctx.files() && ctx.quirks.file_ids => {
-            Ok(file(json!({ "file_id": id })))
+            Ok(PartKind::File.part(json!({ "file_id": id })))
         }
         _ if media.media_type != "application/pdf" => Err(DOCUMENT_UNSENDABLE),
-        (_, Source::Data { data }) if ctx.files() => Ok(file(json!({
-            "file_data": data_url(media, data),
-            "filename": "document.pdf",
-        }))),
+        (_, Source::Data { data }) if ctx.files() => {
+            Ok(PartKind::File.part(pdf(data_url(media, data))))
+        }
         // OpenRouter and Mistral fetch a PDF a URL names.
-        (_, Source::Url { url })
-            if matches!(ctx.quirks.rewrite, Rewrite::OpenRouter | Rewrite::Mistral) =>
-        {
-            Ok(file(json!({"file_data": url, "filename": "document.pdf"})))
+        (_, Source::Url { url }) if matches!(ctx.quirks.vendor, V::OpenRouter | V::Mistral) => {
+            Ok(PartKind::File.part(pdf(url.clone())))
         }
         _ => Err(DOCUMENT_UNSENDABLE),
     }
-}
-
-/// Whether the host takes video: not `OpenAI`, Azure or Mistral.
-fn video(ctx: &Context<'_>) -> bool {
-    ctx.quirks.rewrite != Rewrite::Mistral
-        && !matches!(ctx.quirks.vendor, Vendor::OpenAi | Vendor::Azure)
 }
 
 /// `note` after `parts`, unless the last part already says it.
@@ -189,58 +205,51 @@ fn push_user(messages: &mut Vec<Value>, mut parts: Vec<Value>) {
     if parts.is_empty() {
         return;
     }
-    if let Some(previous) = messages
-        .last_mut()
-        .filter(|m| m.str("role") == Some("user"))
+    if messages
+        .last()
+        .is_some_and(|message| Role::User.sent(message))
+        && let Some(mut previous) = messages.pop()
     {
-        let mut joined = match previous.get_mut("content").map(Value::take) {
-            Some(Value::String(text)) => vec![text_part(&text)],
-            Some(Value::Array(earlier)) => earlier,
+        let mut joined = match previous["content"].take() {
+            Value::String(text) => vec![text_part(&text)],
+            Value::Array(earlier) => earlier,
             _ => Vec::new(),
         };
         joined.append(&mut parts);
         parts = joined;
-        messages.pop();
     }
-    let content = match parts.as_slice() {
-        [part] if part.str("type") == Some("text") => part.get("text").cloned().unwrap_or_default(),
+    messages.push(Role::User.message(match parts.as_slice() {
+        [part] if PartKind::of(part) == Some(PartKind::Text) => part["text"].clone(),
         _ => Value::Array(parts),
-    };
-    messages.push(json!({"role": "user", "content": content}));
+    }));
 }
 
 /// A result's parts: text, and the images the `tool` message can carry.
 /// One the model reads only from a user goes to `attached`, leaving a note.
 fn result_parts(result: &ToolResult, ctx: &Context<'_>, attached: &mut Vec<Value>) -> Vec<Value> {
+    let content = match &result.output {
+        Output::Text(text) => return vec![text_part(text)],
+        Output::Json(value) => return vec![text_part(&value.to_string())],
+        Output::Content(content) => content,
+    };
     let mut parts = Vec::new();
-    match &result.output {
-        Output::Text(text) => parts.push(text_part(text)),
-        Output::Json(value) => parts.push(text_part(&value.to_string())),
-        Output::Content(content) => {
-            for part in content {
-                match part {
-                    UserPart::Text(text) => parts.push(text_part(&text.text)),
-                    UserPart::Media(media) if media.media_type.starts_with("image/") => {
-                        if let Some(image) =
-                            image_url(media, ctx, false).filter(|_| ctx.result_images())
-                        {
-                            parts.push(image);
-                        } else if let Some(image) =
-                            image_url(media, ctx, true).filter(|_| ctx.images)
-                        {
-                            attached.push(image);
-                            note(&mut parts, TOOL_IMAGE_ATTACHED);
-                        } else {
-                            note(&mut parts, TOOL_IMAGE_OMITTED);
-                        }
-                    }
-                    UserPart::Media(media) => {
-                        note(
-                            &mut parts,
-                            media_part(media, ctx).err().unwrap_or(DOCUMENT_UNSENDABLE),
-                        );
-                    }
+    for part in content {
+        match part {
+            UserPart::Text(text) => parts.push(text_part(&text.text)),
+            UserPart::Media(media) if media.media_type.starts_with("image/") => {
+                let image = |user| image_url(media, ctx, user).filter(|_| ctx.images);
+                if let Some(image) = image(false).filter(|_| ctx.quirks.image_tool_results) {
+                    parts.push(image);
+                } else if let Some(image) = image(true) {
+                    attached.push(image);
+                    note(&mut parts, TOOL_IMAGE_ATTACHED);
+                } else {
+                    note(&mut parts, TOOL_IMAGE_OMITTED);
                 }
+            }
+            UserPart::Media(media) => {
+                let placeholder = media_part(media, ctx).err().unwrap_or(DOCUMENT_UNSENDABLE);
+                note(&mut parts, placeholder);
             }
         }
     }
@@ -252,25 +261,20 @@ fn result_parts(result: &ToolResult, ctx: &Context<'_>, attached: &mut Vec<Value
 /// result that says nothing says so.
 fn tool_message(result: &ToolResult, ctx: &Context<'_>, attached: &mut Vec<Value>) -> Value {
     let mut parts = result_parts(result, ctx, attached);
-    let image = |part: &Value| part.str("type") == Some("image_url");
+    let image = |part: &Value| PartKind::of(part) == Some(PartKind::ImageUrl);
     let blank = parts
         .iter()
         .all(|part| !image(part) && part.str("text").is_none_or(|text| text.trim().is_empty()));
     if blank {
-        let text = if result.error {
-            format!("[tool error] {NO_TOOL_OUTPUT}")
-        } else {
-            NO_TOOL_OUTPUT.to_owned()
-        };
-        parts = vec![text_part(&text)];
+        let error = if result.error { "[tool error] " } else { "" };
+        parts = vec![text_part(&format!("{error}{NO_TOOL_OUTPUT}"))];
     }
     let content = if ctx.quirks.tool_result_parts || parts.iter().any(image) {
         Value::Array(parts)
     } else {
-        let texts: Vec<&str> = parts.iter().filter_map(|part| part.str("text")).collect();
-        Value::String(texts.join("\n"))
+        Value::String(joined_text(&parts))
     };
-    json!({"role": "tool", "tool_call_id": result.id, "content": content})
+    json!({"role": Role::Tool, "tool_call_id": result.id, "content": content})
 }
 
 /// A result as the text a host without tools reads.
@@ -291,59 +295,38 @@ fn result_text(result: &ToolResult) -> String {
     format!("[tool {} {kind}] {text}", result.name)
 }
 
-/// The conversation with every later system message joined into the
-/// leading one, for a host that takes system text only there.
-fn leading_system(messages: &[Message]) -> Cow<'_, [Message]> {
-    let later = messages
-        .iter()
-        .skip_while(|message| matches!(message, Message::System(_)))
-        .any(|message| matches!(message, Message::System(_)));
-    if !later {
-        return Cow::Borrowed(messages);
-    }
-    let prompt: Vec<String> = messages
-        .iter()
-        .filter_map(|message| match message {
-            Message::System(system) => Some(system.text()),
-            _ => None,
-        })
-        .filter(|text| !text.trim().is_empty())
-        .collect();
-    let mut joined = Vec::with_capacity(messages.len());
-    if !prompt.is_empty() {
-        joined.push(Message::system(prompt.join("\n\n")));
-    }
-    joined.extend(
-        messages
-            .iter()
-            .filter(|message| !matches!(message, Message::System(_)))
-            .cloned(),
-    );
-    Cow::Owned(joined)
-}
-
 fn messages(history: &[Message], ctx: &Context<'_>) -> Result<Vec<Value>, Error> {
-    let history = match ctx.quirks.later_system {
-        LaterSystem::Leading => leading_system(history),
-        LaterSystem::InPlace => Cow::Borrowed(history),
+    let system = |message: &&Message| matches!(message, Message::System(_));
+    let system_text = |message: &Message| match message {
+        Message::System(system) => Some(system.text()).filter(|text| !text.trim().is_empty()),
+        _ => None,
     };
+    let system_message = |text: String| Role::System.message([text_part(&text)]);
+    // A host that takes system text only where the conversation begins gets
+    // it all there, once a system message comes later.
+    let join = ctx.quirks.later_system == LaterSystem::Leading
+        && history
+            .iter()
+            .skip_while(system)
+            .any(|message| system(&message));
     let mut messages = Vec::new();
-    for message in history.iter() {
+    if join {
+        let prompt: Vec<String> = history.iter().filter_map(system_text).collect();
+        if !prompt.is_empty() {
+            messages.push(system_message(prompt.join("\n\n")));
+        }
+    }
+    for message in history {
         match message {
-            Message::System(system) => {
-                let text = system.text();
-                if !text.trim().is_empty() {
-                    messages.push(json!({"role": "system", "content": [text_part(&text)]}));
-                }
-            }
+            Message::System(_) if join => {}
+            Message::System(_) => messages.extend(system_text(message).map(system_message)),
             Message::User(user) => push_user(&mut messages, user_parts(&user.content, ctx)),
             Message::Tool(tool) if !ctx.quirks.supports_tools => {
                 let parts = tool
                     .results
                     .iter()
-                    .map(|result| text_part(&result_text(result)))
-                    .collect();
-                push_user(&mut messages, parts);
+                    .map(|result| text_part(&result_text(result)));
+                push_user(&mut messages, parts.collect());
             }
             Message::Tool(tool) => {
                 let mut attached = Vec::new();
@@ -355,11 +338,7 @@ fn messages(history: &[Message], ctx: &Context<'_>) -> Result<Vec<Value>, Error>
                     push_user(&mut messages, attached);
                 }
             }
-            Message::Assistant(assistant) => {
-                if let Some(message) = assistant_message(assistant, ctx) {
-                    messages.push(message);
-                }
-            }
+            Message::Assistant(assistant) => messages.extend(assistant_message(assistant, ctx)),
         }
     }
     if messages.is_empty() {
@@ -373,17 +352,18 @@ fn messages(history: &[Message], ctx: &Context<'_>) -> Result<Vec<Value>, Error>
 /// One assistant message rebuilt from its parts: text joined into a
 /// `content` string, or a part array when a part is a content part
 /// (Mistral's thinking); reasoning under the field it arrived in, or the
-/// host's; an item's other fields beside it; and each call with its name
-/// and arguments. A message with neither content nor calls is not sent.
+/// host's, beside its item's other fields (`reasoning_details`); and each
+/// call with its name and arguments. A message with neither content nor
+/// calls is not sent.
 fn assistant_message(assistant: &Assistant, ctx: &Context<'_>) -> Option<Value> {
-    let (mut text, mut parts, mut has_parts) = (String::new(), Vec::new(), false);
-    let mut reasoning: Vec<(String, String)> = Vec::new();
+    const NO_ITEM: &Value = &Value::Null;
+    let (mut parts, mut has_parts) = (Vec::new(), false);
+    let mut reasoning: BTreeMap<String, Vec<&str>> = BTreeMap::new();
     let (mut fields, mut calls) = (Map::new(), Vec::new());
     for part in &assistant.content {
         let sent = replay(part, KEY, identity);
         match part {
             AssistantPart::Text(block) => {
-                text.push_str(&block.text);
                 parts.push(text_part(&block.text));
                 // A text item is message fields: an answer's audio.
                 if let Replay::Item(Value::Object(item)) = sent {
@@ -391,32 +371,42 @@ fn assistant_message(assistant: &Assistant, ctx: &Context<'_>) -> Option<Value> 
                 }
             }
             AssistantPart::Reasoning(block) => {
-                match reasoning_back(&block.text, sent, ctx, &mut fields) {
-                    Back::Part(part) => {
+                let (field, item) = match sent {
+                    Replay::Item(item) if item.get("type").is_some() => {
                         has_parts = true;
-                        parts.push(part);
+                        parts.push(item.clone());
+                        continue;
                     }
-                    Back::Field(field) => {
-                        match reasoning.iter_mut().find(|(name, _)| *name == field) {
-                            Some((_, joined)) => {
-                                joined.push('\n');
-                                joined.push_str(&block.text);
-                            }
-                            None => reasoning.push((field, block.text.clone())),
-                        }
+                    Replay::Identity(identity)
+                        if identity.get("type") == Some(&json!("thinking")) =>
+                    {
+                        has_parts = true;
+                        parts.push(PartKind::Thinking.part([text_part(&block.text)]));
+                        continue;
                     }
-                    Back::Nowhere => {}
+                    Replay::Item(item) => {
+                        let mut strings = item.as_object().into_iter().flatten();
+                        let field = strings.find(|(_, value)| value.is_string());
+                        (field.map(|(key, _)| key.clone()), item)
+                    }
+                    Replay::Identity(identity) => (identity.keys().next().cloned(), NO_ITEM),
+                    Replay::Rebuild => {
+                        (ctx.reasoning_field.map(|f| f.as_str().to_owned()), NO_ITEM)
+                    }
+                };
+                let others = item.as_object().into_iter().flatten();
+                merge_fields(&mut fields, others.filter(|(_, value)| !value.is_string()));
+                if let Some(field) = field {
+                    reasoning.entry(field).or_default().push(&block.text);
                 }
             }
             // A host without tools reads a call as text.
             AssistantPart::ToolCall(call) if !ctx.quirks.supports_tools => {
-                let said = format!(
-                    "[called tool {} with {}]",
-                    call.name,
-                    Value::Object(call.input.clone())
-                );
-                text.push_str(&said);
-                parts.push(text_part(&said));
+                let input = Value::Object(call.input.clone());
+                parts.push(text_part(&format!(
+                    "[called tool {} with {input}]",
+                    call.name
+                )));
             }
             AssistantPart::ToolCall(call) => calls.push(call_item(call, sent, &ctx.custom)),
             // An opaque item is a content part; one with no `type` is not.
@@ -434,15 +424,18 @@ fn assistant_message(assistant: &Assistant, ctx: &Context<'_>) -> Option<Value> 
             AssistantPart::Opaque(_) | AssistantPart::Media(_) | AssistantPart::ToolResult(_) => {}
         }
     }
-    let mut message = Map::from_iter([("role".to_owned(), Value::from("assistant"))]);
+    let mut message = Map::from_iter([("role".to_owned(), json!(Role::Assistant))]);
+    let text: String = parts.iter().filter_map(|part| part.str("text")).collect();
     if has_parts {
         message.insert("content".to_owned(), Value::Array(parts));
     } else if !text.is_empty() {
         message.insert("content".to_owned(), Value::String(text));
     }
-    for (field, text) in reasoning {
-        message.insert(field, Value::String(text));
-    }
+    message.extend(
+        reasoning
+            .into_iter()
+            .map(|(field, texts)| (field, texts.join("\n").into())),
+    );
     message.extend(fields);
     if !calls.is_empty() {
         message.insert("tool_calls".to_owned(), Value::Array(calls));
@@ -456,63 +449,17 @@ fn assistant_message(assistant: &Assistant, ctx: &Context<'_>) -> Option<Value> 
         };
     if let Some(field) = ctx.reasoning_field {
         message
-            .entry(field)
+            .entry(field.as_str())
             .or_insert_with(|| Value::String(String::new()));
     }
     has_content.then_some(Value::Object(message))
-}
-
-/// Where a reasoning part goes back.
-enum Back {
-    /// As a content part (Mistral's thinking).
-    Part(Value),
-    /// Under a message field.
-    Field(String),
-    /// Nowhere: the host takes no rebuilt reasoning.
-    Nowhere,
-}
-
-/// Where reasoning `text` goes back, from what replay hands the encoder:
-/// its current item's part or field (its other fields, such as
-/// `reasoning_details`, joining `fields`), an edited one's, or the host's
-/// field.
-fn reasoning_back(
-    text: &str,
-    sent: Replay<'_>,
-    ctx: &Context<'_>,
-    fields: &mut Map<String, Value>,
-) -> Back {
-    let field = match sent {
-        Replay::Item(item) if item.get("type").is_some() => return Back::Part(item.clone()),
-        Replay::Item(item) => {
-            let mut field = None;
-            for (key, value) in item.as_object().into_iter().flatten() {
-                if value.is_string() {
-                    field.get_or_insert_with(|| key.clone());
-                } else {
-                    merge_fields(fields, &Map::from_iter([(key.clone(), value.clone())]));
-                }
-            }
-            field
-        }
-        Replay::Identity(identity)
-            if identity.get("type").and_then(Value::as_str) == Some("thinking") =>
-        {
-            return Back::Part(
-                json!({"type": "thinking", "thinking": [{"type": "text", "text": text}]}),
-            );
-        }
-        Replay::Identity(identity) => identity.keys().next().cloned(),
-        Replay::Rebuild => ctx.reasoning_field.map(str::to_owned),
-    };
-    field.map_or(Back::Nowhere, Back::Field)
 }
 
 /// `call` as the item the host takes: its current item, an edited one's
 /// kind, or nothing. A call is custom when its item says so, or when it is
 /// rebuilt and the request declares a custom tool by its name; its input is
 /// then its arguments' `input`.
-fn call_item(call: &ToolCall, sent: Replay<'_>, custom: &[String]) -> Value {
+fn call_item(call: &ToolCall, sent: Replay<'_>, custom: &[&str]) -> Value {
     let mut item = match sent {
         Replay::Item(Value::Object(item)) => item.clone(),
         Replay::Identity(identity) => identity,
@@ -521,7 +468,7 @@ fn call_item(call: &ToolCall, sent: Replay<'_>, custom: &[String]) -> Value {
     let custom = if let Some(kind) = item.get("type").and_then(Value::as_str) {
         kind == "custom"
     } else {
-        let declared = custom.iter().any(|name| call.name == *name);
+        let declared = custom.contains(&call.name.as_str());
         let kind = if declared { "custom" } else { "function" };
         item.insert("type".to_owned(), Value::from(kind));
         declared
@@ -535,23 +482,22 @@ fn call_item(call: &ToolCall, sent: Replay<'_>, custom: &[String]) -> Value {
         };
         ("custom", "input", input)
     } else {
-        let arguments = Value::Object(call.input.clone()).to_string();
-        ("function", "arguments", arguments)
+        (
+            "function",
+            "arguments",
+            Value::Object(call.input.clone()).to_string(),
+        )
     };
-    let slot = item
-        .entry(slot)
-        .or_insert_with(|| Value::Object(Map::new()));
+    let slot = item.entry(slot).or_insert_with(|| json!({}));
     if !slot.is_object() {
-        *slot = Value::Object(Map::new());
+        *slot = json!({});
     }
-    if let Value::Object(fields) = slot {
-        fields.insert("name".to_owned(), Value::from(call.name.as_str()));
-        fields.insert(key.to_owned(), Value::String(value));
-    }
+    slot["name"] = call.name.as_str().into();
+    slot[key] = value.into();
     Value::Object(item)
 }
 
-fn function_tool(tool: &crate::spec::Tool, strict_by_default: bool) -> Value {
+fn function_tool(tool: &Tool, strict_by_default: bool) -> Value {
     let strict = tool.strict.unwrap_or(strict_by_default);
     let mut parameters = tool.schema.clone();
     if strict {
@@ -580,26 +526,21 @@ fn tool_choice(choice: &ToolChoice) -> Value {
 /// The `response_format` a JSON format takes: a schema strict, or JSON
 /// mode.
 fn response_format(format: &Format) -> Option<Value> {
-    let Format::Json {
-        schema: json_schema,
-        name,
-        ..
-    } = format
-    else {
+    let Format::Json { schema, name, .. } = format else {
         return None;
     };
-    let Some(json_schema) = json_schema else {
+    let Some(schema) = schema else {
         return Some(json!({"type": "json_object"}));
     };
-    let mut json_schema = json_schema.clone();
-    schema::openai(&mut json_schema);
+    let mut schema = schema.clone();
+    schema::openai(&mut schema);
     let name = name
         .as_deref()
-        .or_else(|| json_schema.str("title"))
+        .or_else(|| schema.str("title"))
         .unwrap_or("response_schema")
         .to_owned();
     Some(json!({"type": "json_schema",
-        "json_schema": {"name": name, "strict": true, "schema": json_schema}}))
+        "json_schema": {"name": name, "strict": true, "schema": schema}}))
 }
 
 /// The request body for `request` to `target`.
@@ -624,69 +565,59 @@ pub(super) fn body(
             .iter()
             .filter(|tool| tool.str("type") == Some("custom"))
             .filter_map(|tool| tool.at("/custom/name").and_then(Value::as_str))
-            .map(str::to_owned)
             .collect(),
     };
     let messages = messages(&request.messages, &ctx)?;
-
-    let mut tools: Vec<Value> = Vec::new();
-    if quirks.supports_tools {
-        tools.extend(
-            request
-                .tools
-                .iter()
-                .map(|tool| function_tool(tool, quirks.strict_tools)),
-        );
-    }
+    let typed = request.tools.iter().filter(|_| quirks.supports_tools);
+    let mut tools: Vec<Value> = typed
+        .map(|tool| function_tool(tool, quirks.strict_tools))
+        .collect();
     tools.extend(passthrough);
     let offers_tools = quirks.supports_tools && !tools.is_empty();
     if offers_tools
-        && matches!(quirks.vendor, Vendor::OpenAi | Vendor::Azure)
+        && matches!(quirks.vendor, V::OpenAi | V::Azure)
         && !openai::chat_calls_tools(model)
     {
         return Err(Error::unsupported(
             "the model cannot call tools through Chat Completions; use the Responses API",
         ));
     }
-
-    let mut body = Map::new();
-    if quirks.routing == Routing::Path {
-        body.insert("model".into(), json!(model));
-    }
     // A format waits for the first tool result unless the host takes both
     // at once, so the model can still call a tool.
-    let answered = messages
-        .iter()
-        .any(|message| message.str("role") == Some("tool"));
-    if let Some(format) = request
+    let answered = messages.iter().any(|message| Role::Tool.sent(message));
+    let format = request
         .format
         .as_ref()
         .filter(|_| quirks.supports_response_format)
         .filter(|_| quirks.response_format_with_tools || tools.is_empty() || answered)
-        .and_then(response_format)
-    {
-        body.insert("response_format".into(), format);
-    }
-    body.insert("messages".into(), Value::Array(messages));
-    if offers_tools && request.tool_choice != ToolChoice::Auto {
-        body.insert("tool_choice".into(), tool_choice(&request.tool_choice));
-    }
-    let has_tools = !tools.is_empty();
-    if has_tools {
-        body.insert("tools".into(), Value::Array(tools));
-    }
-    body.extend(rules::generation(
+        .and_then(response_format);
+    let choice = (offers_tools && request.tool_choice != ToolChoice::Auto)
+        .then(|| tool_choice(&request.tool_choice));
+    let generation = rules::generation(
         quirks,
         model,
         &request.generation,
         request.parallel_tool_calls,
-        has_tools,
-    ));
-    if let (Some(key), Vendor::OpenAi) = (&request.cache_key, quirks.vendor) {
-        body.insert("prompt_cache_key".into(), json!(key));
+        !tools.is_empty(),
+    );
+    let cache_key = request
+        .cache_key
+        .as_ref()
+        .filter(|_| quirks.vendor == V::OpenAi);
+    let mut body = json!({
+        "model": (quirks.routing == Routing::Path).then_some(model),
+        "response_format": format,
+        "messages": messages,
+        "tool_choice": choice,
+        "tools": (!tools.is_empty()).then_some(tools),
+        "prompt_cache_key": cache_key,
+        "stream": true,
+    });
+    if let Some(fields) = body.as_object_mut() {
+        // Each field left out is `null` here.
+        fields.retain(|_, value| !value.is_null());
+        fields.extend(generation);
     }
-    body.insert("stream".into(), json!(true));
-    let mut body = Value::Object(body);
     crate::json::overlay(&mut body, &options);
     if let Some(fields) = body.as_object_mut() {
         super::rewrite::finish(quirks, fields)?;
