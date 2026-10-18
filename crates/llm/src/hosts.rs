@@ -5,7 +5,7 @@
 //! last segment (`openai@chat:gpt-4.1`).
 
 use crate::error::{Error, Kind};
-use crate::protocol::{Hosted, Provider};
+use crate::protocol::{Hosted, Provider, Vars};
 use crate::protocols::{chat, gemini, messages, responses};
 use crate::spec::SmolStr;
 
@@ -38,8 +38,9 @@ fn parse(spec: &str) -> Spec<'_> {
 /// One protocol's host table, as lookups over it.
 struct Wire {
     key: &'static str,
-    /// The provider a host id names, if the protocol lists it.
-    find: fn(&str) -> Option<Result<Provider, Error>>,
+    /// The provider a host id names, if the protocol lists it, configured
+    /// from the variables a lookup finds.
+    find: fn(&str, &Vars<'_>) -> Option<Result<Provider, Error>>,
 }
 
 const fn wire<P: Hosted>() -> Wire {
@@ -49,9 +50,9 @@ const fn wire<P: Hosted>() -> Wire {
     }
 }
 
-fn find<P: Hosted>(id: &str) -> Option<Result<Provider, Error>> {
+fn find<P: Hosted>(id: &str, env: &Vars<'_>) -> Option<Result<Provider, Error>> {
     let (host, quirks) = P::HOSTS.iter().find(|(host, _)| host.id == id)?;
-    Some(host.provider(P::with(*quirks)))
+    Some(host.provider(P::with(*quirks), env))
 }
 
 /// Every protocol, in lookup order.
@@ -62,8 +63,9 @@ const WIRES: [Wire; 4] = [
     wire::<gemini::Gemini>(),
 ];
 
-/// The provider and model `spec` names, configured from the environment.
-pub fn provider(spec: &str) -> Result<(Provider, SmolStr), Error> {
+/// The provider and model `spec` names, configured from the variables `env`
+/// looks up (such as [`crate::protocol::env`], this process's).
+pub fn provider(spec: &str, env: &Vars<'_>) -> Result<(Provider, SmolStr), Error> {
     let Spec {
         host,
         protocol,
@@ -80,7 +82,7 @@ pub fn provider(spec: &str) -> Result<(Provider, SmolStr), Error> {
         .filter(|wire| {
             protocol.is_none_or(|protocol| wire.key.rsplit('.').next() == Some(protocol))
         })
-        .find_map(|wire| (wire.find)(host))
+        .find_map(|wire| (wire.find)(host, env))
         .ok_or_else(|| {
             Error::new(
                 Kind::InvalidRequest,
