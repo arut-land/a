@@ -82,7 +82,7 @@ fn the_table_holds_each_models_thinking_facts() {
     assert!(opus_4_8.thinking.budget.is_none() && opus_4_8.sampling == Sampling::Fixed);
     assert_eq!(
         claude(SONNET_5_5).expect("listed").thinking_off,
-        "between_tools"
+        crate::models::anthropic::ThinkingOff::BetweenTools
     );
     assert!(
         !claude("claude-opus-5-5-20260101")

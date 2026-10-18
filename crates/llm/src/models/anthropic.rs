@@ -12,7 +12,7 @@ pub struct Claude {
     pub max_output: u32,
     pub thinking: Thinking,
     /// The `thinking.type` that turns its reasoning off.
-    pub thinking_off: &'static str,
+    pub thinking_off: ThinkingOff,
     /// Whether an effort goes with `thinking: {"type": "adaptive"}`.
     pub adaptive: bool,
     /// Whether it takes `role: "system"` inside `messages`.
@@ -23,6 +23,14 @@ pub struct Claude {
     /// made under.
     pub binds_context: bool,
     pub sampling: Sampling,
+}
+
+/// A `thinking.type` that turns reasoning off.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ThinkingOff {
+    Disabled,
+    BetweenTools,
 }
 
 /// The thinking budgets Claude takes: from 1024 tokens, below the
@@ -40,7 +48,7 @@ const fn budgeted(id: &'static str, max_output: u32) -> Claude {
         id,
         max_output,
         thinking: Thinking::budget(BUDGET.min, BUDGET.max, true),
-        thinking_off: "disabled",
+        thinking_off: ThinkingOff::Disabled,
         adaptive: false,
         mid_system: false,
         rejects_forced_tool_choice: false,
@@ -55,7 +63,7 @@ const fn adaptive(id: &'static str) -> Claude {
         id,
         max_output: 128_000,
         thinking: Thinking::levels(LOW_TO_MAX).disabling(),
-        thinking_off: "disabled",
+        thinking_off: ThinkingOff::Disabled,
         adaptive: true,
         mid_system: false,
         rejects_forced_tool_choice: false,
@@ -107,7 +115,7 @@ const MODELS: &[Claude] = &[
         ..current("claude-opus-5", false)
     },
     Claude {
-        thinking_off: "between_tools",
+        thinking_off: ThinkingOff::BetweenTools,
         ..current("claude-sonnet-5-5", true)
     },
     adaptive("claude-sonnet-5"),

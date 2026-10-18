@@ -15,7 +15,7 @@
 use serde_json::{Map, Value, json};
 
 use super::{Dialect, Quirks};
-use crate::models::anthropic::{self, Claude, claude_spelled};
+use crate::models::anthropic::{self, Claude, ThinkingOff, claude_spelled};
 use crate::models::{Sampling, minimax};
 use crate::spec::{Effort, Generation};
 
@@ -87,7 +87,7 @@ fn claude_reasoning(
         return match claude {
             Some(claude) if !claude.thinking.can_disable => None,
             _ => {
-                let off = claude.map_or("disabled", |claude| claude.thinking_off);
+                let off = claude.map_or(ThinkingOff::Disabled, |claude| claude.thinking_off);
                 Some(json!({"thinking": {"type": off}}))
             }
         };
