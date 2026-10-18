@@ -348,3 +348,6 @@ fn handle(daemon: &Daemon, conn: UnixStream) -> io::Result<()> {
     }
     Ok(())
 }
+
+#[cfg(test)]
+mod tests;
