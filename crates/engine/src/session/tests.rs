@@ -1,4 +1,5 @@
 use std::path::Path;
+use std::sync::atomic::AtomicBool;
 use std::sync::mpsc;
 use std::thread;
 
@@ -237,6 +238,76 @@ impl Fixture {
         let loaded = self.0.store.load(header.id).unwrap();
         Session::start(header, loaded, Arc::clone(&self.0))
     }
+}
+
+/// A log that keeps the size of each batch it is handed, and fails while
+/// told to.
+#[derive(Clone, Default)]
+struct Probe {
+    batches: Arc<Mutex<Vec<usize>>>,
+    failing: Arc<AtomicBool>,
+}
+
+impl Log for Probe {
+    fn append(&mut self, entry: &Entry) -> io::Result<()> {
+        self.append_all(std::slice::from_ref(entry))
+    }
+
+    fn append_all(&mut self, entries: &[Entry]) -> io::Result<()> {
+        if self.failing.load(Ordering::SeqCst) {
+            return Err(io::Error::other("disk full"));
+        }
+        lock(&self.batches).push(entries.len());
+        Ok(())
+    }
+}
+
+#[test]
+fn a_step_commits_its_entries_together_and_a_failed_one_leaves_no_trace() {
+    let fixture = Fixture::new(
+        agent::Kind::Echo,
+        Registry::default(),
+        openai(&Script::new(&[])),
+    );
+    let probe = Probe::default();
+    let header = Header {
+        id: SessionId::new(),
+        workspace: std::env::temp_dir(),
+        parent: None,
+        extensions: Vec::new(),
+    };
+    let loaded = Loaded {
+        entries: Vec::new(),
+        log: Box::new(probe.clone()),
+    };
+    let session = Session::start(header, loaded, Arc::clone(&fixture.0));
+    settle(&session);
+    session.submit("hi".into());
+    settle(&session);
+    probe.failing.store(true, Ordering::SeqCst);
+    session.submit("lost".into());
+    settle(&session);
+    probe.failing.store(false, Ordering::SeqCst);
+    session.submit("again".into());
+    settle(&session);
+    let log = log_of(&session);
+    session.stop();
+
+    // Each message and its echo commit together; the failed pair is gone,
+    // seqs and all.
+    assert_eq!(*lock(&probe.batches), [2, 2]);
+    let said: Vec<_> = log.iter().map(|e| (e.seq, &e.body)).collect();
+    let user = |text: &str| Body::User { text: text.into() };
+    let echo = |text: &str| Body::Assistant { text: text.into() };
+    assert_eq!(
+        said,
+        [
+            (1, &user("hi")),
+            (2, &echo("hi")),
+            (3, &user("again")),
+            (4, &echo("again"))
+        ]
+    );
 }
 
 fn settle(session: &Session) {

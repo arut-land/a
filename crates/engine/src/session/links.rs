@@ -156,24 +156,32 @@ impl Session {
 
     /// Fires every armed watch on `child` and hands the agent the child's
     /// result; one that has fired already stays as it is.
-    pub(super) async fn fire(&self, agent: &mut dyn Agent, child: SessionId, outcome: Outcome) {
+    pub(super) async fn fire(
+        &self,
+        agent: &mut dyn Agent,
+        child: SessionId,
+        outcome: Outcome,
+    ) -> bool {
         let watches: Vec<u64> = armed(&self.lock().entries)
             .filter_map(|(watch, watched)| (watched == child).then_some(watch))
             .collect();
+        let mut ok = true;
         for watch in watches {
             let outcome = outcome.clone();
-            self.work(async {
-                let fired = Body::Fired {
-                    watch,
-                    outcome: outcome.clone(),
-                };
-                self.append(fired).await?;
-                let inputs = VecDeque::from([Input::ChildDone { watch, outcome }]);
-                self.drive(agent, VecDeque::new(), inputs).await
-            })
-            .await;
+            ok &= self
+                .work(async {
+                    let fired = Body::Fired {
+                        watch,
+                        outcome: outcome.clone(),
+                    };
+                    self.record(fired);
+                    let inputs = VecDeque::from([Input::ChildDone { watch, outcome }]);
+                    self.drive(agent, VecDeque::new(), inputs).await
+                })
+                .await;
         }
         self.heard(child);
+        ok
     }
 
     /// Marks `child`'s reports as no longer needed: its watch has fired.

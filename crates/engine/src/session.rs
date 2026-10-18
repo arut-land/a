@@ -85,15 +85,16 @@ struct State {
     clients: Vec<Sender<DaemonMsg>>,
 }
 
-/// Where an entry's commit is reported: its seq, or why it failed.
-type Committed = rt::channel::Sender<io::Result<u64>>;
-
-/// Entries to commit, in the order they were appended. While `draining`, one
-/// blocking job commits them, so log writes and their fsyncs stay off the
-/// async workers and an entry is visible only after every earlier one.
+/// Entries recorded and not yet committed. While `draining`, one blocking
+/// job commits them in batches, so log writes and their fsyncs stay off the
+/// async workers and an entry is shown only after every earlier one.
 #[derive(Default)]
 struct Queue {
-    pending: VecDeque<(Body, Option<Committed>)>,
+    /// The seq of the last entry recorded.
+    next: u64,
+    pending: Vec<Entry>,
+    /// Flushes waiting for every entry up to a seq to commit.
+    flushes: Vec<(u64, rt::channel::Sender<io::Result<()>>)>,
     draining: bool,
 }
 
@@ -153,6 +154,7 @@ impl Session {
         let (mailbox, rx) = rt::channel::unbounded();
         let armed = links::armed(&loaded.entries).count();
         let env = env.or_else(|| logged_env(&loaded.entries).cloned());
+        let seq = loaded.entries.len() as u64;
         let session = Arc::new_cyclic(|this| Self {
             this: this.clone(),
             id: header.id,
@@ -163,7 +165,10 @@ impl Session {
                 clients: Vec::new(),
             }),
             log: Mutex::new(loaded.log),
-            queue: Mutex::default(),
+            queue: Mutex::new(Queue {
+                next: seq,
+                ..Queue::default()
+            }),
             mailbox,
             answers: Mutex::default(),
             // Recovery counts as queued work until it has run, and every
@@ -284,21 +289,54 @@ impl Session {
         eprintln!("session {}: {problem}", self.id.short());
     }
 
-    /// Commits an entry, returning its seq; only committed entries are ever
-    /// shown to clients.
+    /// Commits an entry and every one recorded before it, returning its seq.
     async fn append(&self, body: Body) -> io::Result<u64> {
-        let (tx, rx) = rt::channel::bounded(1);
-        self.enqueue(body, Some(tx));
+        let seq = self.record(body);
+        self.flush().await?;
+        Ok(seq)
+    }
+
+    /// Records an entry to commit after every one recorded before it, and
+    /// returns its seq. It is committed, and shown, at the next flush: an
+    /// actor flushes before every effect, before reading its log and at the
+    /// end of each unit of work, so the entries of one step share an fsync.
+    fn record(&self, body: Body) -> u64 {
+        let mut queue = lock(&self.queue);
+        queue.next += 1;
+        let seq = queue.next;
+        queue.pending.push(Entry {
+            seq,
+            epoch: 0,
+            body,
+        });
+        seq
+    }
+
+    /// Commits every entry recorded so far, off the async workers.
+    async fn flush(&self) -> io::Result<()> {
+        let rx = {
+            let mut queue = lock(&self.queue);
+            if queue.pending.is_empty() && !queue.draining {
+                return Ok(());
+            }
+            let (tx, rx) = rt::channel::bounded(1);
+            let upto = queue.next;
+            queue.flushes.push((upto, tx));
+            self.drain_in(&mut queue);
+            rx
+        };
         rx.recv()
             .await
             .unwrap_or_else(|| Err(io::Error::other("the log writer stopped")))
     }
 
-    /// Queues an entry to commit after every entry queued before it, and
-    /// starts the job that commits them unless it runs already.
-    fn enqueue(&self, body: Body, committed: Option<Committed>) {
-        let mut queue = lock(&self.queue);
-        queue.pending.push_back((body, committed));
+    /// Starts committing what is recorded without waiting for it.
+    fn kick(&self) {
+        self.drain_in(&mut lock(&self.queue));
+    }
+
+    /// Starts the job that commits `queue` unless it runs already.
+    fn drain_in(&self, queue: &mut Queue) {
         if !std::mem::replace(&mut queue.draining, true)
             && let Some(this) = self.this.upgrade()
         {
@@ -308,64 +346,75 @@ impl Session {
         }
     }
 
-    /// Commits queued entries until none are left.
+    /// Commits recorded entries, a batch at a time, until none are left.
+    /// A batch that fails is dropped with everything recorded after it,
+    /// so the seqs of the next entries recorded follow the committed ones.
     fn drain(&self) {
+        let mut batch = Vec::new();
         loop {
-            let next = {
+            let flushes = {
                 let mut queue = lock(&self.queue);
-                let next = queue.pending.pop_front();
-                queue.draining = next.is_some();
-                next
-            };
-            let Some((body, committed)) = next else {
-                return;
-            };
-            let result = catch_unwind(AssertUnwindSafe(|| self.commit(body)))
-                .unwrap_or_else(|_| Err(io::Error::other("committing an entry panicked")));
-            match committed {
-                Some(tx) => drop(tx.send(result)),
-                None => {
-                    if let Err(e) = result {
-                        self.warn(e);
-                    }
+                if queue.pending.is_empty() && queue.flushes.is_empty() {
+                    queue.draining = false;
+                    return;
                 }
+                std::mem::swap(&mut batch, &mut queue.pending);
+                std::mem::take(&mut queue.flushes)
+            };
+            let result = catch_unwind(AssertUnwindSafe(|| self.commit(&mut batch)))
+                .unwrap_or_else(|_| Err(io::Error::other("committing entries panicked")));
+            batch.clear();
+            let committed = self.lock().entries.len() as u64;
+            if let Err(e) = &result {
+                let mut queue = lock(&self.queue);
+                queue.pending.clear();
+                queue.next = committed;
+                self.warn(e);
+            }
+            for (upto, tx) in flushes {
+                let done = match &result {
+                    _ if committed >= upto => Ok(()),
+                    Err(e) => Err(io::Error::new(e.kind(), e.to_string())),
+                    Ok(()) => Err(io::Error::other("an earlier entry failed to commit")),
+                };
+                drop(tx.send(done));
             }
         }
     }
 
-    /// Writes an entry durably, then shows it. Only [`Session::drain`] calls
-    /// it, so entries commit one at a time and in order.
-    fn commit(&self, body: Body) -> io::Result<u64> {
-        let mut log = lock(&self.log);
-        let seq = self.lock().entries.len() as u64 + 1;
-        let entry = Entry {
-            seq,
-            epoch: 0,
-            body,
-        };
-        log.append(&entry)?;
-        drop(log);
+    /// Writes `batch` durably, then shows it. Only [`Session::drain`] calls
+    /// it, so entries commit in order.
+    fn commit(&self, batch: &mut Vec<Entry>) -> io::Result<()> {
+        lock(&self.log).append_all(batch)?;
         let mut st = self.lock();
-        st.clients
-            .retain(|c| c.send(DaemonMsg::Entry(entry.clone())).is_ok());
-        self.shared.registry.hooks().observe(&entry);
-        let asked = match entry.body {
-            Body::Ask { call } => Some(call),
-            _ => None,
-        };
-        st.entries.push(entry);
-        // Under the same lock as the entry, so a client attaching meanwhile
-        // gets the ask exactly once.
-        if let Some(msg) = asked.and_then(|call| ask(&st.entries, call)) {
-            st.clients.retain(|c| c.send(msg.clone()).is_ok());
+        let hooks = self.shared.registry.hooks();
+        for entry in batch.drain(..) {
+            debug_assert_eq!(entry.seq, st.entries.len() as u64 + 1);
+            st.clients
+                .retain(|c| c.send(DaemonMsg::Entry(entry.clone())).is_ok());
+            hooks.observe(&entry);
+            let asked = match entry.body {
+                Body::Ask { call } => Some(call),
+                _ => None,
+            };
+            st.entries.push(entry);
+            // Under the same lock as the entry, so a client attaching
+            // meanwhile gets the ask exactly once.
+            if let Some(msg) = asked.and_then(|call| ask(&st.entries, call)) {
+                st.clients.retain(|c| c.send(msg.clone()).is_ok());
+            }
         }
-        Ok(seq)
+        Ok(())
     }
 
     /// Commits what the hooks decided. Decisions that repeat the hook
     /// entries ending the log are a gate recovery runs again because a crash
     /// cut it off before its effect was committed: they are logged once.
     async fn decide(&self, decided: Decided) -> io::Result<()> {
+        if decided.is_empty() {
+            return Ok(());
+        }
+        self.flush().await?;
         let decided: Vec<Body> = decided
             .into_iter()
             .map(|(hook, decision)| Body::Hook {
@@ -389,9 +438,9 @@ impl Session {
             }
         }
         for body in decided {
-            self.append(body).await?;
+            self.record(body);
         }
-        Ok(())
+        self.flush().await
     }
 
     /// Sends a message that is not part of the log to every attached client.
@@ -399,34 +448,45 @@ impl Session {
         self.lock().clients.retain(|c| c.send(msg.clone()).is_ok());
     }
 
+    /// An agent may step past entries that then fail to commit; after a
+    /// failed unit of work it is rebuilt from the log.
     async fn run(&self, mailbox: &rt::channel::Receiver<Msg>) {
         let mut agent = self.shared.agent.agent();
-        self.work(self.recover(agent.as_mut())).await;
-        while let Some(msg) = mailbox.recv().await {
-            match msg {
-                Msg::Input(text) => {
+        let mut ok = self.work(self.recover(agent.as_mut())).await;
+        loop {
+            if !ok {
+                agent = self.shared.agent.agent();
+                replay(agent.as_mut(), &self.lock().entries);
+            }
+            ok = match mailbox.recv().await {
+                Some(Msg::Input(text)) => {
                     self.work(async {
-                        self.append(Body::User { text: text.clone() }).await?;
+                        self.record(Body::User { text: text.clone() });
                         let inputs = VecDeque::from([Input::User { text }]);
                         self.drive(agent.as_mut(), VecDeque::new(), inputs).await
                     })
-                    .await;
+                    .await
                 }
-                Msg::Settled { child, outcome } => {
-                    self.fire(agent.as_mut(), child, outcome).await;
+                Some(Msg::Settled { child, outcome }) => {
+                    self.fire(agent.as_mut(), child, outcome).await
                 }
-                Msg::Stop => return,
-            }
+                Some(Msg::Stop) | None => return,
+            };
         }
     }
 
     /// Runs one queued unit of work, with a busy marker on disk for as long
-    /// as anything is in flight.
-    async fn work(&self, job: impl Future<Output = io::Result<()>>) {
+    /// as anything is in flight, and commits what it recorded. Returns
+    /// whether it all went well.
+    async fn work(&self, job: impl Future<Output = io::Result<()>>) -> bool {
         if let Err(e) = self.mark_busy(true).await {
             self.warn(format_args!("busy marker: {e}"));
         }
-        if let Err(e) = job.await {
+        let done = match job.await {
+            Ok(()) => self.flush().await,
+            Err(e) => self.flush().await.and(Err(e)),
+        };
+        if let Err(e) = &done {
             self.warn(e);
         }
         let settled = self.queued.fetch_sub(1, Ordering::SeqCst) == 1;
@@ -437,6 +497,7 @@ impl Session {
         if settled {
             self.report().await;
         }
+        done.is_ok()
     }
 
     async fn mark_busy(&self, busy: bool) -> io::Result<()> {
@@ -466,6 +527,7 @@ impl Session {
             if !std::mem::take(&mut stepped) {
                 return Ok(());
             }
+            self.flush().await?;
             let mut decided = Decided::new();
             let next = self
                 .shared
@@ -485,7 +547,7 @@ impl Session {
     async fn act(&self, action: Action) -> io::Result<Option<Input>> {
         let (call, seq, outcome) = match action {
             Action::Emit(body) => {
-                self.append(body).await?;
+                self.record(body);
                 return Ok(None);
             }
             Action::Spawn { input } => {
@@ -543,6 +605,7 @@ impl Session {
     /// Waits for the user's answer to the ask for call `seq`, logs it, and
     /// runs the call if approved.
     async fn ask(&self, seq: u64, tool: &str, input: &Value) -> io::Result<Outcome> {
+        self.flush().await?;
         let approved = self.answer_to(seq).await?;
         self.append(Body::Hook {
             hook: "user".to_owned(),
@@ -619,12 +682,12 @@ impl Session {
                 )
             }
         };
-        self.append(body).await?;
+        self.record(body);
         Ok(input)
     }
 
     async fn run_tool(&self, call: u64, tool: &str, input: &Value) -> Outcome {
-        // Queued without waiting: it still commits before the call's result.
+        // Not waited for: it still commits before the call's result.
         let spawned = |pgid| {
             let Some(boot) = sys::boot_id() else { return };
             let body = Body::ToolProcess {
@@ -632,7 +695,8 @@ impl Session {
                 pgid,
                 boot: boot.to_owned(),
             };
-            self.enqueue(body, None);
+            self.record(body);
+            self.kick();
         };
         let env = lock(&self.env).clone();
         let cx = Cx {
@@ -731,7 +795,10 @@ impl Session {
                 {
                     Outcome::Interrupted
                 }
-                _ => self.run_call(&call, seq).await,
+                _ => {
+                    self.flush().await?;
+                    self.run_call(&call, seq).await
+                }
             };
             inputs.push_back(self.finish(&call, seq, outcome).await?);
         }

@@ -72,6 +72,13 @@ pub trait Log: Send {
     /// Returns once the entry is as durable as the backend makes anything: a
     /// crash afterwards never loses it.
     fn append(&mut self, entry: &Entry) -> io::Result<()>;
+
+    /// Appends `entries` in order, as durably as [`Log::append`]; a backend
+    /// may make them durable together. After a crash the log holds a prefix
+    /// of them.
+    fn append_all(&mut self, entries: &[Entry]) -> io::Result<()> {
+        entries.iter().try_for_each(|entry| self.append(entry))
+    }
 }
 
 fn not_found(id: SessionId) -> io::Error {

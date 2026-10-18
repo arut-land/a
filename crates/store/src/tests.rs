@@ -75,6 +75,7 @@ macro_rules! conformance {
         $(cases!($backend;
             round_trip,
             appends_keep_their_order_across_reopens,
+            batches_append_in_order,
             headers_list_sessions_oldest_first,
             counts_follow_appends,
             busy_markers_set_clear_and_repeat,
@@ -140,6 +141,19 @@ fn appends_keep_their_order_across_reopens(store: &dyn LogStore) {
         written.extend(append(&mut *loaded.log, next..next + 10));
     }
     assert_eq!(store.load(h.id).unwrap().entries, written);
+}
+
+fn batches_append_in_order(store: &dyn LogStore) {
+    let h = header("/w");
+    let mut log = store.create(&h).unwrap().log;
+    let mut written = append(&mut *log, 1..=2);
+    let batch: Vec<Entry> = (3..=6).map(entry).collect();
+    log.append_all(&batch).unwrap();
+    log.append_all(&[]).unwrap();
+    written.extend(batch);
+    written.extend(append(&mut *log, 7..=7));
+    assert_eq!(store.load(h.id).unwrap().entries, written);
+    assert_eq!(store.count(h.id).unwrap(), 7);
 }
 
 fn headers_list_sessions_oldest_first(store: &dyn LogStore) {

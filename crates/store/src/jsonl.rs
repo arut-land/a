@@ -125,7 +125,20 @@ struct JsonlLog(File);
 
 impl Log for JsonlLog {
     fn append(&mut self, entry: &Entry) -> io::Result<()> {
-        write_line(&mut self.0, entry)?;
+        self.append_all(std::slice::from_ref(entry))
+    }
+
+    /// One write and one sync for the lot.
+    fn append_all(&mut self, entries: &[Entry]) -> io::Result<()> {
+        if entries.is_empty() {
+            return Ok(());
+        }
+        let mut lines = Vec::new();
+        for entry in entries {
+            serde_json::to_writer(&mut lines, entry)?;
+            lines.push(b'\n');
+        }
+        self.0.write_all(&lines)?;
         self.0.sync_data()
     }
 }
