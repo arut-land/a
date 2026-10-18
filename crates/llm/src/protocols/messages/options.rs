@@ -35,42 +35,38 @@ pub(super) fn generation(
             .then(|| json!({"thinking": {"type": "disabled"}})),
         Dialect::ZAi | Dialect::Moonshot | Dialect::Other => None,
     };
-    let mut fields = match reasoning {
-        Some(Value::Object(fields)) => fields,
-        _ => Map::new(),
-    };
-    let mut set = |key: &str, value: Value| {
-        fields.insert(key.to_owned(), value);
-    };
-    let fixed = quirks.dialect == Dialect::Anthropic
-        && claude.is_some_and(|claude| claude.sampling == Sampling::Fixed);
-    if let Some(temperature) = generation.temperature.filter(|_| !fixed) {
-        set("temperature", json!(temperature));
-    }
+    let anthropic = quirks.dialect == Dialect::Anthropic;
+    let fixed = anthropic && claude.is_some_and(|claude| claude.sampling == Sampling::Fixed);
     let top_p = generation.top_p.filter(|top_p| match quirks.dialect {
         Dialect::Anthropic => !fixed && generation.temperature.is_none(),
         Dialect::MiniMax => true,
         Dialect::MiMo => (0.01..=1.0).contains(top_p),
         Dialect::ZAi | Dialect::Moonshot | Dialect::Other => false,
     });
-    if let Some(top_p) = top_p {
-        set("top_p", json!(top_p));
-    }
-    if let Some(top_k) = generation
-        .top_k
-        .filter(|_| quirks.dialect == Dialect::Anthropic && !fixed)
-    {
-        set("top_k", json!(top_k.get()));
-    }
-    if !generation.stop.is_empty() && matches!(quirks.dialect, Dialect::Anthropic | Dialect::MiMo) {
-        set("stop_sequences", json!(generation.stop));
+    let temperature = generation.temperature.filter(|_| !fixed);
+    let top_k = generation.top_k.filter(|_| anthropic && !fixed);
+    let stop = !generation.stop.is_empty() && quirks.dialect.takes_parallel_off();
+    let mut fields = match reasoning {
+        Some(Value::Object(fields)) => fields,
+        _ => Map::new(),
+    };
+    for (key, value) in [
+        ("temperature", temperature.map(Value::from)),
+        ("top_p", top_p.map(Value::from)),
+        ("top_k", top_k.map(|top_k| top_k.get().into())),
+        ("stop_sequences", stop.then(|| json!(generation.stop))),
+    ] {
+        fields.extend(value.map(|value| (key.to_owned(), value)));
     }
     fields
 }
 
-/// Whether the dialect takes `disable_parallel_tool_use` on its tool choice.
-pub(super) const fn takes_parallel_off(dialect: Dialect) -> bool {
-    matches!(dialect, Dialect::Anthropic | Dialect::MiMo)
+impl Dialect {
+    /// Whether it takes stop sequences, and `disable_parallel_tool_use` on
+    /// its tool choice.
+    pub(super) const fn takes_parallel_off(self) -> bool {
+        matches!(self, Self::Anthropic | Self::MiMo)
+    }
 }
 
 /// The `thinking` and `output_config` the Claude model `claude` takes for
@@ -84,36 +80,22 @@ fn claude_reasoning(
 ) -> Option<Value> {
     let effort = generation.reasoning;
     if effort == Some(Effort::None) {
-        return match claude {
-            Some(claude) if !claude.thinking.can_disable => None,
-            _ => {
-                let off = claude.map_or(ThinkingOff::Disabled, |claude| claude.thinking_off);
-                Some(json!({"thinking": {"type": off}}))
-            }
-        };
+        let off = |claude: &Claude| claude.thinking.can_disable.then_some(claude.thinking_off);
+        let off = claude.map_or(Some(ThinkingOff::Disabled), off);
+        return off.map(|off| json!({"thinking": {"type": off}}));
     }
-    let budget = generation
-        .reasoning_budget
-        .map(std::num::NonZeroU32::get)
-        .filter(|tokens| {
-            claude
-                .map_or(Some(anthropic::BUDGET), |claude| claude.thinking.budget)
-                .is_some_and(|budget| budget.contains(*tokens))
-                && *tokens < max_tokens
-        });
-    if let Some(tokens) = budget {
+    let budgets = claude.map_or(Some(anthropic::BUDGET), |claude| claude.thinking.budget);
+    let fits = |tokens: &u32| budgets.is_some_and(|b| b.contains(*tokens)) && *tokens < max_tokens;
+    let budget = generation.reasoning_budget.map(std::num::NonZeroU32::get);
+    if let Some(tokens) = budget.filter(fits) {
         return Some(json!({"thinking": {"type": "enabled", "budget_tokens": tokens}}));
     }
     let effort = effort.filter(|effort| *effort != Effort::Minimal)?;
+    let output = json!({"effort": effort.as_str()});
     match claude {
         Some(claude) if !claude.thinking.takes(effort) => None,
-        Some(claude) if !claude.adaptive => {
-            Some(json!({"output_config": {"effort": effort.as_str()}}))
-        }
-        _ => Some(json!({
-            "thinking": {"type": "adaptive"},
-            "output_config": {"effort": effort.as_str()},
-        })),
+        Some(claude) if !claude.adaptive => Some(json!({"output_config": output})),
+        _ => Some(json!({"thinking": {"type": "adaptive"}, "output_config": output})),
     }
 }
 
@@ -122,9 +104,7 @@ fn claude_reasoning(
 fn minimax_reasoning(model: crate::models::Reasoning, effort: Option<Effort>) -> Option<Value> {
     match effort? {
         Effort::None if model.can_disable() => Some(json!({"thinking": {"type": "disabled"}})),
-        effort if model.takes(effort) => {
-            Some(json!({"output_config": {"effort": effort.as_str()}}))
-        }
+        effort if model.takes(effort) => Some(json!({"output_config": {"effort": effort}})),
         _ => None,
     }
 }

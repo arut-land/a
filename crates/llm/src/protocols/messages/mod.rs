@@ -21,7 +21,10 @@ mod encode;
 mod options;
 mod strict;
 
-use crate::error::Error;
+use serde::Deserialize;
+use serde_json::Value;
+
+use crate::error::{Error, Kind};
 use crate::protocol::{Decoder, Encoded, Framing, Host, Hosted, KeyStyle, Protocol, Target};
 use crate::spec::Request;
 
@@ -54,16 +57,6 @@ pub enum Dialect {
     Other,
 }
 
-/// Where `max_tokens` comes from when the request sets none; Anthropic
-/// requires the field.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum MaxTokens {
-    /// Anthropic's published per-model output limits.
-    ByModel,
-    /// One ceiling for every model, which is all a gateway documents.
-    Fixed(u32),
-}
-
 /// How a request with tools asks for each call's input as the model writes
 /// it. Without it, Anthropic holds a long argument back and sends it in one
 /// burst.
@@ -82,7 +75,10 @@ pub enum ToolInputStreaming {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Quirks {
     pub dialect: Dialect,
-    pub max_tokens: MaxTokens,
+    /// The `max_tokens` a request that sets none takes (Anthropic requires
+    /// the field): one ceiling for every model, all a gateway documents, or
+    /// `None` for Anthropic's published per-model output limits.
+    pub max_tokens: Option<u32>,
     /// Whether the host implements Anthropic's constrained tool schemas; a
     /// strict tool goes unchanged to one that does not.
     pub strict_tool_schemas: bool,
@@ -95,7 +91,7 @@ pub struct Quirks {
 impl Quirks {
     pub const ANTHROPIC: Self = Self {
         dialect: Dialect::Anthropic,
-        max_tokens: MaxTokens::ByModel,
+        max_tokens: None,
         strict_tool_schemas: true,
         unsigned_thinking: false,
         tool_input_streaming: ToolInputStreaming::Eager,
@@ -105,18 +101,13 @@ impl Quirks {
     /// schemas, eager tool input.
     pub const GATEWAY: Self = Self {
         dialect: Dialect::Other,
-        max_tokens: MaxTokens::Fixed(4096),
+        max_tokens: Some(4096),
         strict_tool_schemas: false,
-        unsigned_thinking: false,
-        tool_input_streaming: ToolInputStreaming::Eager,
+        ..Self::ANTHROPIC
     };
 
-    /// The `max_tokens` a request to `model` defaults to.
     pub fn default_max_tokens(&self, model: &str) -> Option<u32> {
-        match self.max_tokens {
-            MaxTokens::ByModel => default_max_tokens(model),
-            MaxTokens::Fixed(tokens) => Some(tokens),
-        }
+        self.max_tokens.or_else(|| default_max_tokens(model))
     }
 }
 
@@ -135,6 +126,11 @@ impl Messages {
     pub const fn new(quirks: Quirks) -> Self {
         Self { quirks }
     }
+}
+
+/// The wire word `value` states, which must be a string.
+fn tag<'v, T: Deserialize<'v>>(value: Option<&'v Value>) -> Option<T> {
+    T::deserialize(value.filter(|value| value.is_string())?).ok()
 }
 
 /// The path to post to under `base_url`, which may already name the API
@@ -168,9 +164,7 @@ impl Protocol for Messages {
     fn encode(&self, target: &Target<'_>, request: &Request) -> Result<Encoded, Error> {
         let (body, betas) = encode::body(self.quirks, target.model, request)?;
         let mut headers = vec![("anthropic-version", VERSION.to_owned())];
-        if !betas.is_empty() {
-            headers.push(("anthropic-beta", betas.join(",")));
-        }
+        headers.extend(betas.map(|betas| ("anthropic-beta", betas)));
         Ok(Encoded {
             path: path(&target.provider.base_url).to_owned(),
             body,
@@ -197,103 +191,64 @@ impl Protocol for Messages {
     /// says more (a `billing_error`, an `overloaded_error` on any status).
     fn error(&self, status: u16, headers: &http::HeaderMap, body: &[u8]) -> Error {
         let mut error = Error::from_status(status, headers, body);
-        let kind = serde_json::from_slice::<serde_json::Value>(body)
-            .ok()
-            .and_then(|envelope| {
-                let kind = envelope.pointer("/error/type")?.as_str()?;
-                Some(Error::provider(Some(kind), String::new()).kind)
-            });
-        // A gateway may wrap a rejected request as an `api_error`: a 4xx stays
-        // the client's fault.
-        let rejected = (400..500).contains(&status);
-        if let Some(kind) = kind.filter(|kind| {
-            !(matches!(
-                kind,
-                crate::Kind::Other | crate::Kind::InvalidRequest | crate::Kind::ContextOverflow
-            ) || rejected && *kind == crate::Kind::Server)
-        }) {
-            error.kind = kind;
+        let envelope: Option<Value> = serde_json::from_slice(body).ok();
+        let stated = envelope
+            .as_ref()
+            .and_then(|envelope| envelope.pointer("/error/type"));
+        let stated = stated.and_then(Value::as_str);
+        match stated.map(|kind| Error::provider(Some(kind), String::new()).kind) {
+            None | Some(Kind::Other | Kind::InvalidRequest | Kind::ContextOverflow) => {}
+            // A gateway may wrap a rejected request as an `api_error`: a 4xx
+            // stays the client's fault.
+            Some(Kind::Server) if (400..500).contains(&status) => {}
+            Some(kind) => error.kind = kind,
         }
         error
     }
 }
 
-const fn host(
-    id: &'static str,
-    base_url: &'static str,
-    key_env: &'static [&'static str],
-    base_url_env: &'static [&'static str],
-) -> Host {
+/// A gateway's host and quirks: its key in `<ENV>_API_KEY`, its base URL
+/// in `<ENV>_ANTHROPIC_API_BASE`.
+macro_rules! gateway {
+    ($id:literal, $base_url:literal, $env:literal, $($quirk:ident: $value:expr),+ $(,)?) => {
+        (
+            Host {
+                id: $id,
+                base_url: $base_url,
+                key_env: &[concat!($env, "_API_KEY")],
+                base_url_env: &[concat!($env, "_ANTHROPIC_API_BASE")],
+                ..ANTHROPIC.0
+            },
+            Quirks { $($quirk: $value,)+ ..Quirks::GATEWAY },
+        )
+    };
+}
+
+const ANTHROPIC: (Host, Quirks) = (
     Host {
-        id,
-        base_url,
-        key_env,
-        base_url_env,
+        id: "anthropic",
+        base_url: "https://api.anthropic.com",
+        key_env: &["ANTHROPIC_API_KEY"],
+        base_url_env: &["ANTHROPIC_BASE_URL"],
         key: KeyStyle::Header("x-api-key"),
         keyless: false,
-    }
-}
+    },
+    Quirks::ANTHROPIC,
+);
 
 /// The hosts that serve the Messages API, with their quirks.
 pub const HOSTS: &[(Host, Quirks)] = &[
-    (
-        host(
-            "anthropic",
-            "https://api.anthropic.com",
-            &["ANTHROPIC_API_KEY"],
-            &["ANTHROPIC_BASE_URL"],
-        ),
-        Quirks::ANTHROPIC,
+    ANTHROPIC,
+    gateway!("zai", "https://api.z.ai/api/anthropic", "ZAI", dialect: Dialect::ZAi),
+    gateway!("minimax", "https://api.minimax.io/anthropic", "MINIMAX", dialect: Dialect::MiniMax),
+    gateway!(
+        "moonshot",
+        "https://api.moonshot.ai/anthropic",
+        "MOONSHOT",
+        dialect: Dialect::Moonshot,
+        unsigned_thinking: true,
     ),
-    (
-        host(
-            "zai",
-            "https://api.z.ai/api/anthropic",
-            &["ZAI_API_KEY"],
-            &["ZAI_ANTHROPIC_API_BASE"],
-        ),
-        Quirks {
-            dialect: Dialect::ZAi,
-            ..Quirks::GATEWAY
-        },
-    ),
-    (
-        host(
-            "minimax",
-            "https://api.minimax.io/anthropic",
-            &["MINIMAX_API_KEY"],
-            &["MINIMAX_ANTHROPIC_API_BASE"],
-        ),
-        Quirks {
-            dialect: Dialect::MiniMax,
-            ..Quirks::GATEWAY
-        },
-    ),
-    (
-        host(
-            "moonshot",
-            "https://api.moonshot.ai/anthropic",
-            &["MOONSHOT_API_KEY"],
-            &["MOONSHOT_ANTHROPIC_API_BASE"],
-        ),
-        Quirks {
-            dialect: Dialect::Moonshot,
-            unsigned_thinking: true,
-            ..Quirks::GATEWAY
-        },
-    ),
-    (
-        host(
-            "xiaomimimo",
-            "https://api.xiaomimimo.com/anthropic",
-            &["XIAOMI_MIMO_API_KEY"],
-            &["XIAOMI_MIMO_ANTHROPIC_API_BASE"],
-        ),
-        Quirks {
-            dialect: Dialect::MiMo,
-            ..Quirks::GATEWAY
-        },
-    ),
+    gateway!("xiaomimimo", "https://api.xiaomimimo.com/anthropic", "XIAOMI_MIMO", dialect: Dialect::MiMo),
 ];
 
 #[cfg(test)]

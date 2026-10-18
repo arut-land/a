@@ -1,8 +1,10 @@
 //! Prompt-cache breakpoints: the top-level marker the caller sets, and the
 //! block markers manual caching places, within Anthropic's budget of four.
 
+use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value, json};
 
+use super::tag;
 use crate::error::Error;
 use crate::json::Lenient;
 
@@ -10,71 +12,54 @@ use crate::json::Lenient;
 const MAX_MARKERS: usize = 4;
 
 /// A cache breakpoint's lifetime.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(super) enum Ttl {
+#[derive(Clone, Copy, PartialEq, Eq, Deserialize, Serialize)]
+enum Ttl {
+    #[serde(rename = "5m")]
     FiveMinutes,
+    #[serde(rename = "1h")]
     OneHour,
 }
 
-impl Ttl {
-    fn parse(value: &Value) -> Option<Self> {
-        match value.as_str()? {
-            "5m" => Some(Self::FiveMinutes),
-            "1h" => Some(Self::OneHour),
-            _ => None,
-        }
+/// A `cache_control` marker.
+fn ephemeral(ttl: Option<Ttl>) -> Value {
+    let mut marker = json!({"type": "ephemeral"});
+    if let Some(ttl) = ttl {
+        marker["ttl"] = json!(ttl);
     }
-
-    const fn as_str(self) -> &'static str {
-        match self {
-            Self::FiveMinutes => "5m",
-            Self::OneHour => "1h",
-        }
-    }
+    marker
 }
 
-/// The caching the request's options ask for.
-#[derive(Clone, Debug, Default, PartialEq)]
+/// The caching the request's options ask for: a top-level marker sent as
+/// written, `prompt_caching` and `static_prefix_cache_ttl`.
 pub(super) struct Caching {
-    /// The top-level marker, checked, sent as written.
-    pub(super) top: Option<Value>,
-    /// Markers on the last tool, the system prompt and the conversation's
-    /// last block.
-    pub(super) manual: bool,
-    /// The static prefix's own lifetime: markers on the last tool and the
-    /// system prompt.
-    pub(super) static_ttl: Option<Ttl>,
+    top: Option<Value>,
+    manual: bool,
+    static_ttl: Option<Ttl>,
 }
 
 impl Caching {
     pub(super) fn of(options: &Map<String, Value>) -> Result<Self, Error> {
-        let top = match options.get("cache_control") {
-            None | Some(Value::Null) => None,
-            Some(marker) => {
-                let ttl = marker.get("ttl").filter(|ttl| !ttl.is_null());
-                if marker.str("type") != Some("ephemeral")
-                    || ttl.is_some_and(|ttl| Ttl::parse(ttl).is_none())
-                {
-                    return Err(Error::unsupported(format!(
-                        "an Anthropic `cache_control` option must be an ephemeral marker with \
-                         no ttl, \"5m\" or \"1h\": {marker}"
-                    )));
-                }
-                Some(marker.clone())
-            }
-        };
-        let static_ttl = match options.get("static_prefix_cache_ttl") {
-            None | Some(Value::Null) => None,
-            Some(ttl) => Some(Ttl::parse(ttl).ok_or_else(|| {
-                Error::unsupported(format!(
-                    "`static_prefix_cache_ttl` must be \"5m\" or \"1h\": {ttl}"
-                ))
-            })?),
-        };
+        let set = |key| options.get(key).filter(|value| !value.is_null());
+        let top = set("cache_control");
+        let ttl = top.and_then(|marker| marker.at("/ttl"));
+        if let Some(marker) = top
+            && (marker.str("type") != Some("ephemeral")
+                || ttl.is_some_and(|_| tag::<Ttl>(ttl).is_none()))
+        {
+            return Err(Error::unsupported(format!(
+                "an Anthropic `cache_control` option must be an ephemeral marker with no ttl, \
+                 \"5m\" or \"1h\": {marker}"
+            )));
+        }
+        let static_ttl = set("static_prefix_cache_ttl");
+        if let Some(ttl) = static_ttl.filter(|_| tag::<Ttl>(static_ttl).is_none()) {
+            let unknown = format!("`static_prefix_cache_ttl` must be \"5m\" or \"1h\": {ttl}");
+            return Err(Error::unsupported(unknown));
+        }
         Ok(Self {
-            top,
-            manual: options.get("prompt_caching").and_then(Value::as_bool) == Some(true),
-            static_ttl,
+            top: top.cloned(),
+            manual: options.get("prompt_caching") == Some(&Value::Bool(true)),
+            static_ttl: tag(static_ttl),
         })
     }
 
@@ -88,23 +73,19 @@ impl Caching {
         tools: &mut [Value],
     ) -> Result<(), Error> {
         for tool in tools.iter_mut().filter_map(Value::as_object_mut) {
-            if tool.get("cache_control").is_some_and(Value::is_null) {
-                tool.remove("cache_control");
-            }
+            tool.retain(|key, value| key != "cache_control" || !value.is_null());
         }
         let top = self.top.as_ref();
         let budget = MAX_MARKERS - usize::from(top.is_some());
-        let held = tools
-            .iter()
-            .filter(|tool| tool.get("cache_control").is_some())
-            .count();
+        let held = tools.iter().filter_map(|tool| tool.get("cache_control"));
+        let held = held.count();
         let Some(mut remaining) = budget.checked_sub(held) else {
             return Err(Error::unsupported(format!(
                 "Too many Anthropic tool `cache_control` markers: {held} exceeds the available \
                  prompt caching budget of {budget}"
             )));
         };
-        let top_ttl = top.and_then(|top| Ttl::parse(top.get("ttl")?));
+        let top_ttl = top.and_then(|top| tag(top.get("ttl")));
         if self.static_ttl == Some(Ttl::FiveMinutes) && top_ttl == Some(Ttl::OneHour) {
             return Err(Error::unsupported(
                 "a five-minute `static_prefix_cache_ttl` conflicts with the one-hour top-level \
@@ -112,15 +93,14 @@ impl Caching {
                  the static prefix precedes the conversation tail",
             ));
         }
+        let unmarked = |block: &&mut Map<String, Value>| !block.contains_key("cache_control");
         if self.manual || self.static_ttl.is_some() {
             let marker = ephemeral(self.static_ttl.or(top_ttl));
             let last_tool = tools
                 .iter_mut()
                 .filter_map(Value::as_object_mut)
                 .rfind(|tool| tool.get("defer_loading") != Some(&Value::Bool(true)));
-            if let Some(tool) = last_tool
-                && !tool.contains_key("cache_control")
-            {
+            if let Some(tool) = last_tool.filter(unmarked) {
                 if remaining == 0 {
                     return Err(Error::unsupported(
                         "Anthropic manual prompt caching requires a cache_control marker on the \
@@ -131,10 +111,8 @@ impl Caching {
                 tool.insert("cache_control".into(), marker.clone());
                 remaining -= 1;
             }
-            if remaining > 0
-                && let Some(Value::Object(block)) = system.last_mut()
-                && !block.contains_key("cache_control")
-            {
+            let system = system.last_mut().and_then(Value::as_object_mut);
+            if let Some(block) = system.filter(unmarked).filter(|_| remaining > 0) {
                 block.insert("cache_control".into(), marker);
                 remaining -= 1;
             }
@@ -149,31 +127,18 @@ impl Caching {
                 block.insert("cache_control".into(), ephemeral(None));
             }
         }
-        let mut short_seen = false;
-        let markers = tools
-            .iter()
-            .chain(system.iter())
-            .chain(messages.iter().flat_map(|message| message.arr("content")))
-            .filter_map(|block| block.get("cache_control"))
-            .chain(top);
-        for marker in markers {
-            if marker.str("ttl") != Some("1h") {
-                short_seen = true;
-            } else if short_seen {
-                return Err(Error::unsupported(
-                    "Anthropic cache_control markers with ttl `1h` must appear before markers \
-                     with the default 5-minute TTL",
-                ));
-            }
+        let content = messages.iter().flat_map(|message| message.arr("content"));
+        let markers = tools.iter().chain(&*system).chain(content);
+        let markers = markers.filter_map(|block| block.get("cache_control"));
+        let long = markers
+            .chain(top)
+            .map(|marker| tag(marker.get("ttl")) == Some(Ttl::OneHour));
+        if !long.is_sorted_by(|earlier, later| earlier >= later) {
+            return Err(Error::unsupported(
+                "Anthropic cache_control markers with ttl `1h` must appear before markers with \
+                 the default 5-minute TTL",
+            ));
         }
         Ok(())
-    }
-}
-
-/// A `cache_control` marker.
-fn ephemeral(ttl: Option<Ttl>) -> Value {
-    match ttl {
-        Some(ttl) => json!({"type": "ephemeral", "ttl": ttl.as_str()}),
-        None => json!({"type": "ephemeral"}),
     }
 }

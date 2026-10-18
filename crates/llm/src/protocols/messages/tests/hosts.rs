@@ -65,7 +65,7 @@ fn every_host_defaults_to_eager_tool_input() {
         );
         assert_eq!(host.key, KeyStyle::Header("x-api-key"), "{}", host.id);
     }
-    assert_eq!(Quirks::GATEWAY.max_tokens, MaxTokens::Fixed(4096));
+    assert_eq!(Quirks::GATEWAY.max_tokens, Some(4096));
 }
 
 /// Every host posts to exactly one `/v1/messages`, whether its base URL
