@@ -121,9 +121,10 @@ fn identity(item: &Value) -> Map<String, Value> {
         Some(ItemType::FunctionCall | ItemType::CustomToolCall) => &["type", "id"],
         _ => &[],
     };
-    keys.iter()
-        .filter_map(|key| Some(((*key).to_owned(), item.get(*key)?.clone())))
-        .collect()
+    crate::json::object(
+        keys.iter()
+            .filter_map(|key| Some(((*key).to_owned(), item.get(*key)?.clone()))),
+    )
 }
 
 fn unsendable(part: &str) -> Error {

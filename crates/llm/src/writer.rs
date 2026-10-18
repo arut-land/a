@@ -778,17 +778,15 @@ impl Writer {
             if part >= canonical_from && replay.is_none() {
                 continue;
             }
-            let mut state = Map::from_iter([("item".to_owned(), item)]);
+            let mut state = crate::json::object([("item".to_owned(), item)]);
             match replay {
                 Some(replay) => {
                     state.insert("replay".into(), (replay && part < canonical_from).into())
                 }
                 None => state.insert("fp".into(), fp.into()),
             };
-            self.out.push(Event::Meta {
-                index: part,
-                meta: Meta::from([(self.key.to_owned(), state.into())]),
-            });
+            let meta = self.meta(state);
+            self.out.push(Event::Meta { index: part, meta });
         }
         let reason = match reason {
             Reason::Stop if !self.call_ids.is_empty() => Reason::ToolCalls,
@@ -797,10 +795,7 @@ impl Writer {
         let meta = end
             .raw_usage
             .filter(Value::is_object)
-            .map_or_default(|usage| {
-                let state = Map::from_iter([("usage".to_owned(), usage)]);
-                Meta::from([(self.key.to_owned(), state.into())])
-            });
+            .map_or_default(|usage| self.meta(crate::json::object([("usage".to_owned(), usage)])));
         let order = self.order();
         self.out.push(Event::Finish {
             finish: Finish {
@@ -815,6 +810,13 @@ impl Writer {
         Ok(Flow::Done)
     }
 
+    /// `state` as the meta of this protocol.
+    fn meta(&self, state: Map<String, Value>) -> Meta {
+        let mut meta = Meta::new();
+        meta.insert(self.key.to_owned(), state.into());
+        meta
+    }
+
     /// The parts' message order, when it is not the order they opened in.
     fn order(&self) -> Option<Vec<u32>> {
         if self.by_index.is_none() && self.lead.is_none() {
@@ -822,7 +824,9 @@ impl Writer {
         }
         let mut parts = self.parts.clone();
         if let Some(by_index) = &self.by_index {
-            parts.sort_by_key(|part| (by_index.get(part).copied().unwrap_or(usize::MAX), *part));
+            parts.sort_unstable_by_key(|part| {
+                (by_index.get(part).copied().unwrap_or(usize::MAX), *part)
+            });
         }
         if let Some(at) = self
             .lead

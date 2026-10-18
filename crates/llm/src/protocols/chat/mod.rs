@@ -11,7 +11,7 @@ mod rules;
 pub use hosts::HOSTS;
 
 use serde::{Deserialize, Serialize};
-use serde_json::{Map, Value, json};
+use serde_json::{Value, json};
 
 use super::schema::{legal_call_id, short_hash};
 use crate::error::Error;
@@ -132,12 +132,12 @@ impl PartKind {
     }
 
     /// A part of this kind carrying `payload`.
-    fn part(self, payload: impl Into<Value>) -> Value {
+    fn part(self, payload: Value) -> Value {
         let kind = json!(self);
         let key = kind.as_str().unwrap_or_default().to_owned();
-        Value::Object(Map::from_iter([
+        Value::Object(crate::json::object([
             ("type".to_owned(), kind),
-            (key, payload.into()),
+            (key, payload),
         ]))
     }
 }

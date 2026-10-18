@@ -68,7 +68,7 @@ fn rewrite(vendor: Vendor, body: &mut Map<String, Value>) -> Result<(), Error> {
                 body.insert("tool_choice".to_owned(), Value::from("auto"));
                 if let Some(Value::Array(messages)) = body.get_mut("messages") {
                     let steer = "Please select a tool to handle the current issue.";
-                    messages.push(Role::User.message(steer));
+                    messages.push(Role::User.message(steer.into()));
                 }
             }
         }

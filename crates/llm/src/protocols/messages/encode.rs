@@ -389,7 +389,9 @@ fn base64(text: &str) -> Option<Vec<u8>> {
 /// call to the code execution that made it.
 fn identity(item: &Value) -> Map<String, Value> {
     match (item.str("type"), item.get("caller")) {
-        (Some("tool_use"), Some(caller)) => Map::from_iter([("caller".into(), caller.clone())]),
+        (Some("tool_use"), Some(caller)) => {
+            crate::json::object([("caller".into(), caller.clone())])
+        }
         _ => Map::new(),
     }
 }

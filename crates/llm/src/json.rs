@@ -81,6 +81,15 @@ pub(crate) fn counters(object: Option<&Value>, key: Option<&str>) -> Option<u64>
         .fold(None, |sum, count| Some(sum.unwrap_or(0) + count))
 }
 
+/// An object of `fields`, later ones winning. `Map::from_iter` would sort
+/// them first, and each source type it collects brings its own copy of a
+/// stable sort (~4 KiB); inserting sorts nothing.
+pub(crate) fn object(fields: impl IntoIterator<Item = (String, Value)>) -> Map<String, Value> {
+    let mut object = Map::new();
+    object.extend(fields);
+    object
+}
+
 /// `overlay` deep-merged into `body`: objects merge key by key, anything
 /// else replaces, and `null` removes.
 pub fn overlay(body: &mut Value, overlay: &Map<String, Value>) {

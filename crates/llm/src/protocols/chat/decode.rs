@@ -407,7 +407,7 @@ impl ChatDecoder {
                 .map(|id| json!({ "audio": { "id": id } })),
             Writing::Thinking => {
                 let text = self.w.text(index).unwrap_or_default();
-                Some(PartKind::Thinking.part([PartKind::Text.part(text)]))
+                Some(PartKind::Thinking.part(vec![PartKind::Text.part(text.into())].into()))
             }
         };
         if let Some(item) = item {

@@ -157,7 +157,7 @@ fn merge_content(existing: &mut Value, more: &Value) {
     fn parts(value: Value) -> Vec<Value> {
         match value {
             Value::Array(parts) => parts,
-            Value::String(text) if !text.is_empty() => vec![PartKind::Text.part(text)],
+            Value::String(text) if !text.is_empty() => vec![PartKind::Text.part(text.into())],
             _ => Vec::new(),
         }
     }

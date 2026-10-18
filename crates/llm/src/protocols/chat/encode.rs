@@ -59,8 +59,8 @@ impl Role {
         message.get("role") == Some(&json!(self))
     }
 
-    pub(super) fn message(self, content: impl Into<Value>) -> Value {
-        json!({"role": self, "content": content.into()})
+    pub(super) fn message(self, content: Value) -> Value {
+        json!({"role": self, "content": content})
     }
 }
 
@@ -69,13 +69,13 @@ impl Role {
 /// Signed data such as `reasoning_details` never survives an edit.
 fn identity(item: &Value) -> Map<String, Value> {
     if let Some(kind @ ("custom" | "thinking")) = item.str("type") {
-        return Map::from_iter([("type".to_owned(), Value::from(kind))]);
+        return crate::json::object([("type".to_owned(), Value::from(kind))]);
     }
     ReasoningField::ALL
         .iter()
         .map(|field| field.as_str())
         .find(|key| item.get(*key).is_some_and(Value::is_string))
-        .map_or_default(|key| Map::from_iter([(key.to_owned(), Value::String(String::new()))]))
+        .map_or_default(|key| crate::json::object([(key.to_owned(), Value::String(String::new()))]))
 }
 
 /// What the encoder knows about the target.
@@ -105,7 +105,7 @@ impl Context<'_> {
 }
 
 fn text_part(text: &str) -> Value {
-    PartKind::Text.part(text)
+    PartKind::Text.part(text.into())
 }
 
 /// The text of `parts`, one line each.
@@ -301,7 +301,7 @@ fn messages(history: &[Message], ctx: &Context<'_>) -> Result<Vec<Value>, Error>
         Message::System(system) => Some(system.text()).filter(|text| !text.trim().is_empty()),
         _ => None,
     };
-    let system_message = |text: String| Role::System.message([text_part(&text)]);
+    let system_message = |text: String| Role::System.message(vec![text_part(&text)].into());
     // A host that takes system text only where the conversation begins gets
     // it all there, once a system message comes later.
     let join = ctx.quirks.later_system == LaterSystem::Leading
@@ -381,7 +381,7 @@ fn assistant_message(assistant: &Assistant, ctx: &Context<'_>) -> Option<Value> 
                         if identity.get("type") == Some(&json!("thinking")) =>
                     {
                         has_parts = true;
-                        parts.push(PartKind::Thinking.part([text_part(&block.text)]));
+                        parts.push(PartKind::Thinking.part(vec![text_part(&block.text)].into()));
                         continue;
                     }
                     Replay::Item(item) => {
@@ -424,7 +424,7 @@ fn assistant_message(assistant: &Assistant, ctx: &Context<'_>) -> Option<Value> 
             AssistantPart::Opaque(_) | AssistantPart::Media(_) | AssistantPart::ToolResult(_) => {}
         }
     }
-    let mut message = Map::from_iter([("role".to_owned(), json!(Role::Assistant))]);
+    let mut message = crate::json::object([("role".to_owned(), json!(Role::Assistant))]);
     let text: String = parts.iter().filter_map(|part| part.str("text")).collect();
     if has_parts {
         message.insert("content".to_owned(), Value::Array(parts));
