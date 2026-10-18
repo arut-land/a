@@ -9,5 +9,10 @@ serde.workspace = true
 serde_json.workspace = true
 uuid.workspace = true
 
+[dev-dependencies]
+# tests/fuzz.rs: random input under `cargo test`, libFuzzer under
+# cargo-bolero.
+bolero = "0.13"
+
 [lints]
 workspace = true

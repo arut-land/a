@@ -1,5 +1,6 @@
 //! Latency and memory budgets. `mise run budgets` runs them on the release
-//! build: memory is held to its budget there, latency too except on CI.
+//! build: memory is held to its budget there, latency too except on CI
+//! lanes that leave `A_STRICT_BUDGETS` unset.
 #![cfg(unix)]
 
 mod common;
@@ -8,6 +9,7 @@ use std::process::Command;
 use std::time::{Duration, Instant};
 
 use common::{Env, latency_budget, release};
+use protocol::{Body, Target};
 
 #[test]
 fn a_cold_start_hears_from_the_daemon_within_50ms() {
@@ -35,6 +37,35 @@ fn a_cold_start_hears_from_the_daemon_within_50ms() {
         median < limit,
         "median {median:?} over {limit:?}: {times:?}"
     );
+}
+
+/// A client attaching to a warm daemon's session with some history:
+/// connect, hello, attach and the replay up to `Synced`.
+#[test]
+fn attaching_takes_under_2ms_at_p99() {
+    let env = Env::new("attach");
+    env.start();
+    let mut conn = env.connect();
+    let (id, _) = conn.attach(Target::New, &env.ws);
+    for n in 0..10 {
+        conn.input(&format!("message {n}"));
+        conn.until(|e| matches!(e.body, Body::Assistant { .. }));
+    }
+    drop(conn);
+    let mut times: Vec<Duration> = (0..500)
+        .map(|_| {
+            let start = Instant::now();
+            let (_, replay) = env.connect().attach(Target::Id(id), &env.ws);
+            let elapsed = start.elapsed();
+            assert_eq!(replay.len(), 20);
+            elapsed
+        })
+        .collect();
+    times.sort();
+    let (median, p99) = (times[times.len() / 2], times[times.len() * 99 / 100]);
+    let limit = latency_budget(Duration::from_millis(2));
+    eprintln!("attach with a 20-entry replay: median {median:?}, p99 {p99:?}");
+    assert!(p99 < limit, "p99 {p99:?} over {limit:?}");
 }
 
 #[test]
