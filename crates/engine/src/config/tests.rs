@@ -27,16 +27,15 @@ fn settings(root: &Path) -> Settings {
 
 #[test]
 fn files_parse_the_contract() {
-    let file: File = toml::from_str(
-        r#"
+    let file: File = r#"
         model = "openai:gpt-6-luna"
         agent = "chat"
         future = 1
 
         [env]
         OPENAI_API_KEY = "sk-test"
-        "#,
-    )
+        "#
+    .parse()
     .unwrap();
     assert_eq!(
         file,

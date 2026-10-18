@@ -4,41 +4,24 @@
 //! client first, then the home file's `[env]`, then the daemon's own
 //! environment; a workspace, being anyone's checkout, never sets them.
 
-use std::collections::BTreeMap;
-use std::io;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 use std::time::SystemTime;
 
 use protocol::Environment;
-use serde::Deserialize;
 
 use crate::lock;
 
 /// The model a session calls when no layer names one.
 pub const DEFAULT_MODEL: &str = "gpt-6-luna";
 
-/// A `config.toml`. Unknown keys are ignored, so a newer file still loads.
-#[derive(Debug, Default, PartialEq, Eq, Deserialize)]
-pub struct File {
-    /// `host[@protocol]:model`, or a bare model on `OpenAI`.
-    pub model: Option<String>,
-    /// `chat` or `echo`.
-    pub agent: Option<String>,
-    /// Provider variables, for sessions whose client has none.
-    #[serde(default)]
-    pub env: BTreeMap<String, String>,
-}
+/// A `config.toml`, read by [`sys::config`], which the app's settings pane
+/// also writes.
+pub use sys::config::Config as File;
 
-impl File {
-    /// The file at `path`; a missing one is empty.
-    fn read(path: &Path) -> Result<Self, String> {
-        match std::fs::read_to_string(path) {
-            Ok(text) => toml::from_str(&text).map_err(|e| format!("{}: {e}", path.display())),
-            Err(e) if e.kind() == io::ErrorKind::NotFound => Ok(Self::default()),
-            Err(e) => Err(format!("{}: {e}", path.display())),
-        }
-    }
+/// The file at `path`; a missing one is empty.
+fn load(path: &Path) -> Result<File, String> {
+    File::read(path).map_err(|e| e.to_string())
 }
 
 /// When a file last changed, as far as telling a rewrite apart goes.
@@ -78,7 +61,7 @@ impl Watched {
         match &*read {
             Some((then, file)) if *then == now => Arc::clone(file),
             _ => {
-                let file = Arc::new(File::read(&self.path));
+                let file = Arc::new(load(&self.path));
                 *read = Some((now, Arc::clone(&file)));
                 file
             }
@@ -113,7 +96,7 @@ impl Settings {
     /// The workspace's file, read afresh: it is only consulted when a
     /// session starts or calls the model.
     fn workspace(workspace: &Path) -> Result<File, String> {
-        File::read(&workspace.join(".a").join("config.toml"))
+        load(&workspace.join(".a").join("config.toml"))
     }
 
     /// The agent a session in `workspace` runs. A file that cannot be read

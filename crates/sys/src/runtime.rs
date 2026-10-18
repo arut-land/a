@@ -34,6 +34,10 @@ impl Runtime {
         Self { dir }
     }
 
+    pub fn dir(&self) -> &Path {
+        &self.dir
+    }
+
     /// What the daemon runs: `current/a`, resolved by `exec`.
     pub fn current_exe(&self) -> PathBuf {
         self.dir.join("current").join("a")
@@ -48,15 +52,20 @@ impl Runtime {
     /// Stages `exe` (copy, verify, then repoint `current` if it is newer)
     /// and keeps the two newest builds. Hashes the binary only the first time
     /// a given file is seen: a stamp keyed by its path and metadata remembers
-    /// the id.
+    /// the id. A build already outranked (staged once, then pruned) is not
+    /// copied again, so an older `a` that keeps being run
+    /// costs a lookup, not a copy.
     pub fn stage(&self, exe: &Path) -> io::Result<Staged> {
         let exe = fs::canonicalize(exe)?;
         let known = self.id_in_runtime(&exe).or_else(|| self.stamped(&exe));
         let id = match known {
-            Some(id) if self.current().as_ref() == Some(&id) => id,
+            Some(id) if self.current().as_ref() == Some(&id) || self.outranked(&id) => id,
             known => {
                 let _lock = self.lock()?;
-                let id = known.map_or_else(|| self.copy_in(&exe), Ok)?;
+                let id = match known.filter(|id| self.is_staged(id)) {
+                    Some(id) => id,
+                    None => self.copy_in(&exe)?,
+                };
                 self.promote(&id)?;
                 id
             }
@@ -90,10 +99,24 @@ impl Runtime {
             .join(format!("{:016x}", fnv1a(&key))))
     }
 
+    /// The id a stamp remembers for `exe`, staged or since pruned.
     fn stamped(&self, exe: &Path) -> Option<String> {
         let id = fs::read_link(self.stamp(exe).ok()?).ok()?.into_os_string();
-        let id = id.into_string().ok()?;
-        self.dir.join(&id).join("a").is_file().then_some(id)
+        id.into_string().ok()
+    }
+
+    fn is_staged(&self, id: &str) -> bool {
+        self.dir.join(id).join("a").is_file()
+    }
+
+    /// A known build that is no longer staged while `current` is: only
+    /// builds older than the two kept are pruned, and `current` never moves
+    /// back, so it can never win again.
+    fn outranked(&self, id: &str) -> bool {
+        !self.is_staged(id)
+            && self
+                .current()
+                .is_some_and(|c| c != id && self.is_staged(&c))
     }
 
     /// Copies `exe` to `runtime/<id>/a` through a temporary file, checks the
@@ -145,9 +168,12 @@ impl Runtime {
         self.prune()
     }
 
-    /// Keeps `current` and the newest other build, and drops stamps of
-    /// removed builds.
+    /// Keeps `current` and the newest other build. Stamps of removed builds
+    /// are what lets an older `a` skip staging, so the newest few of them
+    /// are kept too.
     fn prune(&self) -> io::Result<()> {
+        /// Enough for the few older installs one machine may keep running.
+        const OUTRANKED: usize = 8;
         let current = self.current();
         let mut others: Vec<(Order, String)> = fs::read_dir(&self.dir)?
             .filter_map(|e| e.ok()?.file_name().into_string().ok())
@@ -158,13 +184,18 @@ impl Runtime {
         for (_, id) in others.into_iter().skip(1) {
             fs::remove_dir_all(self.dir.join(id))?;
         }
-        if let Ok(stamps) = fs::read_dir(self.dir.join("stamps")) {
-            for stamp in stamps.flatten() {
-                let path = stamp.path();
-                if fs::read_link(&path).is_ok_and(|id| !self.dir.join(id).exists()) {
-                    fs::remove_file(path)?;
-                }
-            }
+        let Ok(stamps) = fs::read_dir(self.dir.join("stamps")) else {
+            return Ok(());
+        };
+        let mut dangling: Vec<(SystemTime, PathBuf)> = stamps
+            .flatten()
+            .map(|stamp| stamp.path())
+            .filter(|path| fs::read_link(path).is_ok_and(|id| !self.dir.join(id).exists()))
+            .filter_map(|path| Some((fs::symlink_metadata(&path).ok()?.modified().ok()?, path)))
+            .collect();
+        dangling.sort_by(|a, b| b.cmp(a));
+        for (_, path) in dangling.into_iter().skip(OUTRANKED) {
+            fs::remove_file(path)?;
         }
         Ok(())
     }
@@ -224,6 +255,7 @@ fn content_hash(bytes: &[u8]) -> u64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::os::unix::fs::PermissionsExt;
     use std::time::Duration;
 
     fn tmp(name: &str) -> PathBuf {
@@ -285,6 +317,13 @@ mod tests {
                 .starts_with(fs::canonicalize(&dir).unwrap().join("runtime"))
         );
         assert_eq!(builds(&dir.join("runtime")), kept);
+        // Running it again finds it outranked by its stamp: no copy, which
+        // a read-only runtime would refuse.
+        let runtime_dir = dir.join("runtime");
+        fs::set_permissions(&runtime_dir, fs::Permissions::from_mode(0o555)).unwrap();
+        let restaged = runtime.stage(&dir.join("bin/old2"));
+        fs::set_permissions(&runtime_dir, fs::Permissions::from_mode(0o755)).unwrap();
+        assert_eq!(restaged.unwrap(), again);
 
         // A known file is recognised by its stamp; the copy is never redone.
         fs::write(&new.exe, b"tampered").unwrap();

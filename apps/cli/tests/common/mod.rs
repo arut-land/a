@@ -80,13 +80,44 @@ impl Env {
                 cmd
             }
         };
-        cmd.args(args)
-            .current_dir(&self.ws)
+        cmd.args(args);
+        self.configure(cmd)
+    }
+
+    /// Another build of `a`, `exe`, with `args` and this test's home.
+    pub fn cmd_as(&self, exe: &Path, args: &[&str]) -> Command {
+        let mut cmd = Command::new(exe);
+        cmd.args(args);
+        self.configure(cmd)
+    }
+
+    fn configure(&self, mut cmd: Command) -> Command {
+        cmd.current_dir(&self.ws)
             .env("A_HOME", self.root.join("home"))
             .env("A_AGENT", "echo")
             .env("A_IDLE_SECS", "15")
             .envs(self.vars.iter().copied());
         cmd
+    }
+
+    /// A build of `a` other than the one under test, and older: the same
+    /// program with a byte more, so its build id differs, built an hour
+    /// earlier. As a CLI from another install would be next to the app's.
+    pub fn older_build(&self) -> PathBuf {
+        let exe = self.root.join("bin").join("a-old");
+        let mut bytes = fs::read(built()).unwrap();
+        bytes.push(0);
+        fs::write(&exe, bytes).unwrap();
+        let file = fs::File::options().write(true).open(&exe).unwrap();
+        let built = fs::metadata(built()).unwrap().modified().unwrap();
+        file.set_modified(built - Duration::from_secs(3600))
+            .unwrap();
+        file.set_permissions(std::os::unix::fs::PermissionsExt::from_mode(0o755))
+            .unwrap();
+        drop(file);
+        let out = Command::new(&exe).arg("--version").output().unwrap();
+        assert!(out.status.success(), "the older build does not run");
+        exe
     }
 
     pub fn run(&self, args: &[&str]) -> String {
@@ -159,16 +190,7 @@ impl Env {
     pub fn repl_from(&self, args: &[&str], shell: impl FnOnce(&mut Command)) -> Repl {
         let mut cmd = self.cmd(args);
         shell(&mut cmd);
-        let mut child = cmd
-            .stdin(Stdio::piped())
-            .stdout(Stdio::piped())
-            .spawn()
-            .unwrap();
-        Repl {
-            stdin: child.stdin.take(),
-            stdout: BufReader::new(child.stdout.take().unwrap()),
-            child,
-        }
+        Repl::spawn(cmd)
     }
 
     /// A session's log as stored, asserting that every line is a complete
@@ -282,6 +304,20 @@ pub struct Repl {
 }
 
 impl Repl {
+    /// Runs `cmd` with piped stdio.
+    pub fn spawn(mut cmd: Command) -> Self {
+        let mut child = cmd
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .spawn()
+            .unwrap();
+        Self {
+            stdin: child.stdin.take(),
+            stdout: BufReader::new(child.stdout.take().unwrap()),
+            child,
+        }
+    }
+
     pub fn line(&mut self) -> String {
         let mut line = String::new();
         assert_ne!(self.stdout.read_line(&mut line).unwrap(), 0, "a exited");

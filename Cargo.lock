@@ -597,7 +597,6 @@ dependencies = [
  "serde_yaml_ng",
  "store",
  "sys",
- "toml",
 ]
 
 [[package]]

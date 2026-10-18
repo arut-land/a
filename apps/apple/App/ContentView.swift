@@ -24,6 +24,9 @@ struct ContentView: View {
                     description: Text("Pick a session, or start one with ⌘N."))
             }
         }
+        .alert(
+            model.notice ?? "", isPresented: Binding(get: { model.notice != nil }, set: { if !$0 { model.notice = nil } })
+        ) {}
     }
 }
 

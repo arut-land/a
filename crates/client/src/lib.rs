@@ -123,6 +123,9 @@ pub fn connect(
             Endpoint::Ssh(host) => (None, remote::open(host, staged)?),
         };
         match hello(&mut conn.reader, &mut conn.writer, &staged.id) {
+            Ok(Greeting::Mismatch(supported)) => {
+                return Err(mismatch(endpoint, staged, supported));
+            }
             Ok(Greeting::Welcome) => {
                 if let Some(stream) = &stream {
                     stream.set_read_timeout(None)?;
@@ -155,6 +158,33 @@ fn split(stream: &UnixStream) -> io::Result<Connection> {
 enum Greeting {
     Welcome,
     Draining,
+    Mismatch(u32),
+}
+
+/// Why a daemon speaking another protocol cannot serve this client, and
+/// the fix. Staging never downgrades, so when a newer build is `current`,
+/// restarting the daemon would only start that build again: this `a` is
+/// the one to replace.
+#[cfg(unix)]
+fn mismatch(endpoint: &Endpoint, staged: &Staged, supported: u32) -> io::Error {
+    let ours = &staged.id;
+    let message = match endpoint {
+        Endpoint::Local(home) => match home.runtime().current() {
+            Some(current) if current != *ours => format!(
+                "the daemon runs a newer a ({current}, protocol {supported}) than this one \
+                 ({ours}, protocol {PROTO}); run {} instead, or update this a",
+                home.runtime().current_exe().display()
+            ),
+            _ => format!(
+                "the daemon speaks protocol {supported}, this a {PROTO}; restart the daemon"
+            ),
+        },
+        Endpoint::Ssh(host) => format!(
+            "the daemon on {host} speaks protocol {supported}, this a {PROTO}; \
+             update a on one side"
+        ),
+    };
+    io::Error::new(io::ErrorKind::Unsupported, message)
 }
 
 fn hello(reader: &mut Reader, writer: &mut Writer, build: &str) -> io::Result<Greeting> {
@@ -172,9 +202,7 @@ fn hello(reader: &mut Reader, writer: &mut Writer, build: &str) -> io::Result<Gr
     match reply {
         Some(DaemonMsg::Welcome { .. }) => Ok(Greeting::Welcome),
         Some(DaemonMsg::Draining) => Ok(Greeting::Draining),
-        Some(DaemonMsg::Mismatch { supported }) => Err(io::Error::other(format!(
-            "daemon speaks protocol {supported}, this client {PROTO}; restart the daemon"
-        ))),
+        Some(DaemonMsg::Mismatch { supported }) => Ok(Greeting::Mismatch(supported)),
         _ => Err(io::ErrorKind::UnexpectedEof.into()),
     }
 }
@@ -320,12 +348,50 @@ fn connect_or_spawn(home: &Home) -> io::Result<UnixStream> {
         .create(true)
         .append(true)
         .open(log_path)?;
-    Command::new(home.runtime().current_exe())
+    // The daemon leaves this process's session (`setsid`) as it starts, so
+    // it outlives this client, its terminal and its app. Reaped here should
+    // it exit first, so a long-lived client (the app) collects no zombies.
+    let mut daemon = Command::new(home.runtime().current_exe())
         .args(["__daemon", "--listen-fd", &fd.to_string()])
         .stdin(Stdio::null())
         .stdout(Stdio::null())
         .stderr(log)
         .spawn()?;
+    thread::spawn(move || daemon.wait());
     drop(listener);
     UnixStream::connect(&socket)
+}
+
+#[cfg(all(test, unix))]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn an_older_client_is_pointed_at_the_newer_build_not_at_a_restart() {
+        let root = std::env::temp_dir().join(format!("a-client-mismatch-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&root);
+        fs::create_dir_all(&root).unwrap();
+        let home = Home::from(root.join("home"));
+        let build = |name: &str| {
+            let exe = root.join(name);
+            fs::write(&exe, name).unwrap();
+            home.runtime().stage(&exe).unwrap()
+        };
+        let old = build("old");
+        // Built later, so newer.
+        thread::sleep(Duration::from_millis(20));
+        let new = build("new");
+        let local = Endpoint::Local(home.clone());
+
+        let told = mismatch(&local, &old, PROTO + 1).to_string();
+        let current = home.runtime().current_exe();
+        assert!(
+            told.contains(&new.id) && told.contains(&*current.to_string_lossy()),
+            "{told}"
+        );
+        assert!(!told.contains("restart"), "{told}");
+        let told = mismatch(&local, &new, PROTO + 1).to_string();
+        assert!(told.contains("restart the daemon"), "{told}");
+        fs::remove_dir_all(&root).unwrap();
+    }
 }
