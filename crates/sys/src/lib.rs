@@ -8,6 +8,8 @@ pub mod install;
 mod login;
 #[cfg(unix)]
 mod runtime;
+#[cfg(unix)]
+pub mod tty;
 
 use std::fs::File;
 use std::io;

@@ -62,3 +62,9 @@ opt-level = "z"
 
 [profile.release.package.topcoat-core]
 opt-level = "z"
+
+# The terminal client redraws once per streamed token at most: s saves
+# 32 KiB over 3 for ~40 µs a frame (90 µs on a 6000-item session); z would
+# save 48 KiB more at twice the frame time (docs/tui.md).
+[profile.release.package.tui]
+opt-level = "s"
