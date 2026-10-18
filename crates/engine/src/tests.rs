@@ -94,6 +94,7 @@ fn busy_sessions_recover_at_startup() {
         let body = Body::ToolCall {
             tool: tool.into(),
             input,
+            id: None,
         };
         log.append(&Entry {
             seq,

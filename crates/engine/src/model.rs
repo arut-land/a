@@ -4,22 +4,26 @@
 use std::collections::HashMap;
 use std::sync::Arc;
 
-use llm::{Accumulator, Block, Event, Message, Provider, Request, Response};
+use llm::{Accumulator, Block, Event, Http, Message, Provider, Request, Response};
 
 pub struct Model {
     provider: Provider,
     id: llm::SmolStr,
-    http: llm::Ureq,
+    http: Box<dyn Http>,
 }
 
 impl Model {
     pub fn from_spec(spec: &str, rt: Arc<dyn rt::Runtime>) -> Result<Self, String> {
         let (provider, id) = llm::hosts::provider(spec).map_err(|e| e.to_string())?;
-        Ok(Self {
+        Ok(Self::new(provider, id, llm::Ureq::new(rt)))
+    }
+
+    pub fn new(provider: Provider, id: llm::SmolStr, http: impl Http) -> Self {
+        Self {
             provider,
             id,
-            http: llm::Ureq::new(rt),
-        })
+            http: Box::new(http),
+        }
     }
 
     /// How a call to this model is recorded: `host:model`.
@@ -27,20 +31,25 @@ impl Model {
         format!("{}:{}", self.provider.id, self.id)
     }
 
-    /// The reply to `messages`. Answer text streams to `on_text` as it
+    /// A request to this model for a reply to `messages`, offering `tools`.
+    pub fn request(&self, messages: Vec<Message>, tools: Vec<llm::Tool>) -> Request {
+        Request {
+            model: self.id.clone(),
+            messages,
+            tools,
+            ..Request::default()
+        }
+    }
+
+    /// The reply to `request`. Answer text streams to `on_text` as it
     /// arrives.
     pub fn reply(
         &self,
-        messages: Vec<Message>,
+        request: &Request,
         on_text: &mut dyn FnMut(&str),
     ) -> Result<Response, llm::Error> {
-        let request = Request {
-            model: self.id.clone(),
-            messages,
-            ..Request::default()
-        };
         rt::block_on(async {
-            let mut events = llm::stream(&self.http, &self.provider, &request);
+            let mut events = llm::stream(&*self.http, &self.provider, request);
             let mut acc = Accumulator::new();
             let mut blocks = HashMap::new();
             while let Some(event) = std::future::poll_fn(|cx| {
@@ -60,7 +69,7 @@ impl Model {
                 }
                 acc.push(event)?;
             }
-            acc.finish(Some(llm::origin(&self.provider, &self.id)))
+            acc.finish(Some(llm::origin(&self.provider, &request.model)))
         })
     }
 }

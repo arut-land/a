@@ -18,7 +18,9 @@ dependencies = [
 name = "agent"
 version = "0.0.0"
 dependencies = [
+ "llm",
  "protocol",
+ "serde",
  "serde_json",
 ]
 
@@ -292,11 +294,15 @@ name = "engine"
 version = "0.0.0"
 dependencies = [
  "agent",
+ "bytes",
  "futures-core",
+ "http",
  "llm",
  "protocol",
  "rt",
+ "serde",
  "serde_json",
+ "serde_yaml_ng",
  "store",
  "sys",
 ]

@@ -71,10 +71,13 @@ pub enum Body {
         text: String,
     },
     /// The committed intent to run a tool. Its seq is the call's id and
-    /// idempotency key.
+    /// idempotency key; `id` is the model's own id for the call, under which
+    /// its result goes back.
     ToolCall {
         tool: String,
         input: Value,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        id: Option<String>,
     },
     /// The process group running a call, so recovery can kill it. Only
     /// meaningful within the same `boot`: pgids are reused across reboots.
@@ -91,11 +94,55 @@ pub enum Body {
     ModelCall {
         model: String,
     },
-    /// The reply; `Done` carries `{"text": ...}`.
+    /// The reply; `Done` carries the whole `llm::Response` (earlier versions
+    /// logged `{"text": ...}`).
     ModelResult {
         call: u64,
         outcome: Outcome,
     },
+    /// A hook changed what happens at a decision point.
+    Hook {
+        hook: String,
+        decision: Decision,
+    },
+}
+
+/// What a hook decided, by decision point. Only decisions that change
+/// something are logged.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "point", rename_all = "snake_case")]
+pub enum Decision {
+    /// The request of model call `call` was replaced before it was sent.
+    PrepareStep { call: u64 },
+    /// A tool call's input was replaced by `input`.
+    PreTool { tool: String, input: Value },
+    /// A tool call was blocked before it ran.
+    Block { tool: String, reason: String },
+    /// The most restrictive permission the hooks gave a tool call.
+    Permission {
+        tool: String,
+        permission: Permission,
+    },
+    /// The answer to a permission `ask`.
+    Approval { tool: String, approved: bool },
+    /// Call `call`'s outcome was replaced; `original` is what it replaced.
+    PostTool { call: u64, original: Outcome },
+    /// The agent stopped and was given `text` to continue with.
+    OnStop { text: String },
+}
+
+/// Whether a tool call may run, from least to most restrictive: merging
+/// takes the maximum.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum Permission {
+    #[default]
+    Allow,
+    /// Runs once someone approves it.
+    Ask,
+    /// Decided outside this run, later.
+    Defer,
+    Deny,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -249,6 +296,33 @@ mod tests {
         assert_eq!(
             serde_json::to_string(&e).unwrap(),
             r#"{"seq":1,"epoch":0,"kind":"user","text":"hi"}"#
+        );
+    }
+
+    #[test]
+    fn tool_calls_without_a_model_id_keep_their_shape() {
+        let old = r#"{"seq":2,"epoch":0,"kind":"tool_call","tool":"sleep","input":{"seconds":1}}"#;
+        let e: Entry = serde_json::from_str(old).unwrap();
+        assert!(matches!(&e.body, Body::ToolCall { id: None, .. }));
+        assert_eq!(serde_json::to_string(&e).unwrap(), old);
+    }
+
+    #[test]
+    fn hook_decisions_nest_under_their_point() {
+        let body = Body::Hook {
+            hook: "policy".into(),
+            decision: Decision::Permission {
+                tool: "run_command".into(),
+                permission: Permission::Deny,
+            },
+        };
+        assert_eq!(
+            serde_json::to_value(&body).unwrap(),
+            serde_json::json!({
+                "kind": "hook",
+                "hook": "policy",
+                "decision": { "point": "permission", "tool": "run_command", "permission": "deny" },
+            })
         );
     }
 }

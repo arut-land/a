@@ -105,6 +105,7 @@ impl Daemon {
                 store,
                 agent: config.agent,
                 tools: agent::Toolset::default(),
+                hooks: agent::Hooks::default(),
                 model,
             }),
             slots: Mutex::new(slots),

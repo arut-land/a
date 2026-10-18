@@ -220,7 +220,7 @@ impl View {
         match body {
             Body::User { text } => println!("you  {text}"),
             Body::Assistant { text } => println!("a    {text}"),
-            Body::ToolCall { tool, input } => match input["command"].as_str() {
+            Body::ToolCall { tool, input, .. } => match input["command"].as_str() {
                 Some(command) => println!("tool $ {command}"),
                 None => println!("tool {tool} {input}"),
             },
@@ -229,8 +229,11 @@ impl View {
                 // A streamed reply is on screen already; end its line.
                 if self.streaming.take() == Some(*call) {
                     println!();
-                } else if let Outcome::Done { output } = outcome {
-                    println!("a    {}", reply_text(output));
+                } else if let Outcome::Done { output } = outcome
+                    && let text = reply_text(output)
+                    && !text.is_empty()
+                {
+                    println!("a    {text}");
                 }
                 match outcome {
                     Outcome::Done { output } => {
@@ -245,6 +248,7 @@ impl View {
                     Outcome::Interrupted => println!("  └ model call interrupted"),
                 }
             }
+            Body::Hook { hook, decision } => println!("  · hook {hook}: {decision:?}"),
             Body::ToolProcess { .. } | Body::ModelCall { .. } => {}
         }
     }

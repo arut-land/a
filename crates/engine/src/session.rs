@@ -8,7 +8,7 @@ use std::sync::{Arc, Mutex, MutexGuard};
 use std::thread;
 use std::time::{Duration, Instant};
 
-use agent::{Action, Agent, Cx, Input, Replay, Tool, Toolset};
+use agent::{Action, Agent, Cx, Decided, DynTool, Hooks, Input, Replay, Toolset};
 use protocol::{Body, DaemonMsg, Entry, Outcome, SessionId, SessionSummary};
 use serde_json::Value;
 use store::{Header, Loaded, Log, Store};
@@ -16,11 +16,18 @@ use store::{Header, Loaded, Log, Store};
 use crate::lock;
 use crate::model::Model;
 
+mod facts;
+#[cfg(test)]
+mod tests;
+
+use facts::{replay, transcript};
+
 /// What every session runs with.
 pub struct Shared {
     pub store: Store,
     pub agent: agent::Kind,
     pub tools: Toolset,
+    pub hooks: Hooks,
     /// The model, or why there is none (shown as the failed model call).
     pub model: Result<Model, String>,
 }
@@ -170,8 +177,20 @@ impl Session {
         st.log.append(&entry)?;
         st.clients
             .retain(|c| c.send(DaemonMsg::Entry(entry.clone())).is_ok());
+        self.shared.hooks.observe(&entry);
         st.entries.push(entry);
         Ok(seq)
+    }
+
+    /// Commits what the hooks decided.
+    fn decide(&self, decided: Decided) -> io::Result<()> {
+        for (hook, decision) in decided {
+            self.append(Body::Hook {
+                hook: hook.to_owned(),
+                decision,
+            })?;
+        }
+        Ok(())
     }
 
     /// Sends a message that is not part of the log to every attached client.
@@ -186,7 +205,8 @@ impl Session {
             let Msg::Input(text) = msg else { return };
             self.work(|| {
                 self.append(Body::User { text: text.clone() })?;
-                self.drive(agent.as_mut(), Input::User { text })
+                let inputs = VecDeque::from([Input::User { text }]);
+                self.drive(agent.as_mut(), VecDeque::new(), inputs)
             });
         }
     }
@@ -209,25 +229,85 @@ impl Session {
         self.touch();
     }
 
-    /// Steps the agent with `input` and every input its effects produce.
-    fn drive(&self, agent: &mut dyn Agent, input: Input) -> io::Result<()> {
-        let mut inputs = VecDeque::from([input]);
-        while let Some(input) = inputs.pop_front() {
-            for action in agent.step(input) {
-                let call = match action {
-                    Action::Emit(body) => {
-                        self.append(body)?;
-                        continue;
-                    }
-                    Action::RunTool { tool, input } => Call::Tool { tool, input },
-                    Action::CallModel => Call::Model,
-                };
-                let seq = self.append(call.intent(&self.shared.model))?;
-                let outcome = self.run_call(&call, seq);
-                inputs.push_back(self.finish(&call, seq, outcome)?);
+    /// Runs `actions`, then steps the agent with `inputs` and every input
+    /// the effects produce, in order. Once an agent that was stepped stops,
+    /// the `on_stop` hooks may hand it more to do.
+    fn drive(
+        &self,
+        agent: &mut dyn Agent,
+        mut actions: VecDeque<Action>,
+        mut inputs: VecDeque<Input>,
+    ) -> io::Result<()> {
+        let mut stepped = false;
+        loop {
+            while let Some(action) = actions.pop_front() {
+                inputs.extend(self.act(action)?);
+            }
+            if let Some(input) = inputs.pop_front() {
+                actions.extend(agent.step(input));
+                stepped = true;
+                continue;
+            }
+            if !std::mem::take(&mut stepped) {
+                return Ok(());
+            }
+            let mut decided = Decided::new();
+            let next = self
+                .shared
+                .hooks
+                .on_stop(&self.lock().entries, &mut decided);
+            self.decide(decided)?;
+            match next {
+                Some(text) => inputs.push_back(Input::User { text }),
+                None => return Ok(()),
             }
         }
-        Ok(())
+    }
+
+    /// Carries out one action; an effect returns the input reporting its
+    /// outcome.
+    fn act(&self, action: Action) -> io::Result<Option<Input>> {
+        let (call, seq, outcome) = match action {
+            Action::Emit(body) => {
+                self.append(body)?;
+                return Ok(None);
+            }
+            Action::CallModel => {
+                let model = self
+                    .shared
+                    .model
+                    .as_ref()
+                    .map_or_else(|_| "none".to_owned(), Model::name);
+                let seq = self.append(Body::ModelCall { model })?;
+                (Call::Model, seq, self.run_model(seq))
+            }
+            Action::RunTool {
+                tool,
+                mut input,
+                id,
+                refuse,
+            } => {
+                let verdict = if let Some(error) = refuse {
+                    Err(error)
+                } else {
+                    let mut decided = Decided::new();
+                    let verdict = self.shared.hooks.gate(&tool, &mut input, &mut decided);
+                    self.decide(decided)?;
+                    verdict
+                };
+                let seq = self.append(Body::ToolCall {
+                    tool: tool.clone(),
+                    input: input.clone(),
+                    id,
+                })?;
+                let outcome = match verdict {
+                    Ok(()) => self.run_tool(seq, &tool, &input),
+                    Err(error) => Outcome::Failed { error },
+                };
+                (Call::Tool { tool, input }, seq, outcome)
+            }
+        };
+        self.finish(&call, seq, outcome).map(Some)
     }
 
     fn run_call(&self, call: &Call, seq: u64) -> Outcome {
@@ -237,9 +317,9 @@ impl Session {
         }
     }
 
-    /// Commits the outcome of call `seq`; returns the input that reports it
-    /// to the agent.
-    fn finish(&self, call: &Call, seq: u64, outcome: Outcome) -> io::Result<Input> {
+    /// Commits the outcome of call `seq`, as the `post_tool` hooks leave a
+    /// tool's; returns the input that reports it to the agent.
+    fn finish(&self, call: &Call, seq: u64, mut outcome: Outcome) -> io::Result<Input> {
         let (body, input) = match call {
             Call::Model => (
                 Body::ModelResult {
@@ -248,13 +328,19 @@ impl Session {
                 },
                 Input::ModelDone { call: seq, outcome },
             ),
-            Call::Tool { .. } => (
-                Body::ToolResult {
-                    call: seq,
-                    outcome: outcome.clone(),
-                },
-                Input::ToolDone { call: seq, outcome },
-            ),
+            Call::Tool { tool, input } => {
+                let mut decided = Decided::new();
+                let hooks = &self.shared.hooks;
+                hooks.post_tool(seq, (tool, input), &mut outcome, &mut decided);
+                self.decide(decided)?;
+                (
+                    Body::ToolResult {
+                        call: seq,
+                        outcome: outcome.clone(),
+                    },
+                    Input::ToolDone { call: seq, outcome },
+                )
+            }
         };
         self.append(body)?;
         Ok(input)
@@ -279,8 +365,9 @@ impl Session {
         contain(|| self.shared.tools.run(tool, input, &cx))
     }
 
-    /// Asks the model to reply to the transcript before `call`. Text streams to
-    /// clients as it arrives; only the finished reply is committed.
+    /// Asks the model to reply to the transcript before `call`, offering the
+    /// tools. Text streams to clients as it arrives; only the finished reply
+    /// is committed.
     fn run_model(&self, call: u64) -> Outcome {
         let model = match &self.shared.model {
             Ok(model) => model,
@@ -290,7 +377,18 @@ impl Session {
                 };
             }
         };
-        let history = transcript(&self.lock().entries, call);
+        let tools = &self.shared.tools;
+        let history = transcript(&self.lock().entries, call, tools);
+        let mut request = model.request(history, tools.specs());
+        let mut decided = Decided::new();
+        self.shared
+            .hooks
+            .prepare_step(call, &mut request, &mut decided);
+        if let Err(e) = self.decide(decided) {
+            return Outcome::Failed {
+                error: e.to_string(),
+            };
+        }
         let mut on_text = |text: &str| {
             self.broadcast(&DaemonMsg::Delta {
                 call,
@@ -299,7 +397,7 @@ impl Session {
         };
         // The whole reply is the fact: replaying it later sends the
         // provider's own items (signatures, encrypted reasoning) back.
-        contain(|| match model.reply(history, &mut on_text) {
+        contain(|| match model.reply(&request, &mut on_text) {
             Ok(reply) => match serde_json::to_value(&reply) {
                 Ok(output) => Outcome::Done { output },
                 Err(error) => Outcome::Failed {
@@ -312,11 +410,16 @@ impl Session {
         })
     }
 
-    /// Finishes the effect sandwich for calls that have an intent but no
-    /// outcome: leftover processes are killed, then safe calls (model calls,
-    /// safe tools) run again and everything else is marked interrupted.
+    /// Picks up where the log leaves off. The agent is rebuilt from the
+    /// log; calls with an intent but no outcome are finished (leftover
+    /// processes killed, safe calls run again, the rest marked interrupted);
+    /// then whatever the agent asked for that the log does not show runs.
     fn recover(&self, agent: &mut dyn Agent) -> io::Result<()> {
-        let dangling = dangling_calls(&self.lock().entries);
+        let (dangling, actions) = {
+            let st = self.lock();
+            (dangling_calls(&st.entries), replay(agent, &st.entries))
+        };
+        let mut inputs = VecDeque::new();
         for Dangling {
             seq,
             call,
@@ -333,16 +436,15 @@ impl Session {
             }
             let outcome = match &call {
                 Call::Tool { tool, .. }
-                    if self.shared.tools.get(tool).map(Tool::replay) != Some(Replay::Safe) =>
+                    if self.shared.tools.get(tool).map(DynTool::replay) != Some(Replay::Safe) =>
                 {
                     Outcome::Interrupted
                 }
                 _ => self.run_call(&call, seq),
             };
-            let input = self.finish(&call, seq, outcome)?;
-            self.drive(agent, input)?;
+            inputs.push_back(self.finish(&call, seq, outcome)?);
         }
-        Ok(())
+        self.drive(agent, actions, inputs)
     }
 }
 
@@ -361,49 +463,10 @@ fn contain(effect: impl FnOnce() -> Outcome) -> Outcome {
     })
 }
 
-/// The conversation the model sees, derived from the log's facts. A model
-/// reply is the assistant message it stored; a reply logged as bare text (by
-/// an earlier version) reads back as text.
-fn transcript(entries: &[Entry], before: u64) -> Vec<llm::Message> {
-    entries
-        .iter()
-        .take_while(|e| e.seq < before)
-        .filter_map(|e| match &e.body {
-            Body::User { text } => Some(llm::Message::user(text.clone())),
-            Body::Assistant { text } => Some(llm::Message::assistant(text.clone())),
-            Body::ModelResult {
-                outcome: Outcome::Done { output },
-                ..
-            } => match serde_json::from_value::<llm::Response>(output.clone()) {
-                Ok(reply) => Some(llm::Message::Assistant(reply.message)),
-                Err(_) => Some(llm::Message::assistant(output["text"].as_str()?.to_owned())),
-            },
-            _ => None,
-        })
-        .collect()
-}
-
 /// The effect an agent asked for, between its committed intent and outcome.
 enum Call {
     Model,
     Tool { tool: String, input: Value },
-}
-
-impl Call {
-    /// The entry that commits the intent to make this call.
-    fn intent(&self, model: &Result<Model, String>) -> Body {
-        match self {
-            Self::Model => Body::ModelCall {
-                model: model
-                    .as_ref()
-                    .map_or_else(|_| "none".to_owned(), Model::name),
-            },
-            Self::Tool { tool, input } => Body::ToolCall {
-                tool: tool.clone(),
-                input: input.clone(),
-            },
-        }
-    }
 }
 
 /// A call with an intent but no outcome, and the process groups it started.
@@ -431,7 +494,7 @@ fn dangling_calls(entries: &[Entry]) -> Vec<Dangling> {
                 continue;
             }
             _ if finished.contains(&e.seq) => continue,
-            Body::ToolCall { tool, input } => Call::Tool {
+            Body::ToolCall { tool, input, .. } => Call::Tool {
                 tool: tool.clone(),
                 input: input.clone(),
             },
@@ -445,104 +508,4 @@ fn dangling_calls(entries: &[Entry]) -> Vec<Dangling> {
         });
     }
     dangling
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use serde_json::json;
-
-    fn entry(seq: u64, body: Body) -> Entry {
-        Entry {
-            seq,
-            epoch: 0,
-            body,
-        }
-    }
-
-    #[test]
-    fn finds_calls_without_outcomes() {
-        let entries = [
-            entry(
-                1,
-                Body::ToolCall {
-                    tool: "sleep".into(),
-                    input: json!({}),
-                },
-            ),
-            entry(
-                2,
-                Body::ToolResult {
-                    call: 1,
-                    outcome: Outcome::Interrupted,
-                },
-            ),
-            entry(
-                3,
-                Body::ToolCall {
-                    tool: "run_command".into(),
-                    input: json!({}),
-                },
-            ),
-            entry(
-                4,
-                Body::ToolProcess {
-                    call: 3,
-                    pgid: 42,
-                    boot: "boot".into(),
-                },
-            ),
-            entry(5, Body::ModelCall { model: "m".into() }),
-        ];
-        let dangling = dangling_calls(&entries);
-        assert_eq!(dangling.len(), 2);
-        assert_eq!(dangling[0].seq, 3);
-        assert_eq!(dangling[0].processes, [(42, "boot".to_owned())]);
-        assert!(matches!(dangling[1].call, Call::Model));
-    }
-
-    #[test]
-    fn transcript_is_derived_from_facts() {
-        let done = Outcome::Done {
-            output: json!({ "text": "hello" }),
-        };
-        let entries = [
-            entry(1, Body::User { text: "hi".into() }),
-            entry(2, Body::ModelCall { model: "m".into() }),
-            entry(
-                3,
-                Body::ModelResult {
-                    call: 2,
-                    outcome: done,
-                },
-            ),
-            entry(
-                4,
-                Body::User {
-                    text: "again".into(),
-                },
-            ),
-            entry(5, Body::ModelCall { model: "m".into() }),
-        ];
-        let turns = transcript(&entries, 5);
-        let got: Vec<_> = turns
-            .iter()
-            .map(|message| match message {
-                llm::Message::User(user) => match &user.content[..] {
-                    [llm::UserPart::Text(text)] => ("user", text.text.clone()),
-                    _ => ("user", String::new()),
-                },
-                llm::Message::Assistant(assistant) => ("assistant", assistant.text()),
-                _ => ("other", String::new()),
-            })
-            .collect();
-        assert_eq!(
-            got,
-            [
-                ("user", "hi".to_owned()),
-                ("assistant", "hello".to_owned()),
-                ("user", "again".to_owned())
-            ]
-        );
-    }
 }

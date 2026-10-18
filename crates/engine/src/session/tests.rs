@@ -1,0 +1,400 @@
+use std::path::{Path, PathBuf};
+
+use agent::{Hook, Tool};
+use bytes::Bytes;
+use llm::http::{BoxFuture, Http};
+use llm::protocols::responses;
+use protocol::{Decision, Permission};
+use serde::Deserialize as _;
+use serde_json::json;
+
+use super::*;
+
+fn entry(seq: u64, body: Body) -> Entry {
+    Entry {
+        seq,
+        epoch: 0,
+        body,
+    }
+}
+
+fn bodies(entries: &[Entry]) -> Vec<&Body> {
+    entries.iter().map(|e| &e.body).collect()
+}
+
+#[test]
+fn finds_calls_without_outcomes() {
+    let tool_call = |tool: &str| Body::ToolCall {
+        tool: tool.into(),
+        input: json!({}),
+        id: None,
+    };
+    let entries = [
+        entry(1, tool_call("sleep")),
+        entry(
+            2,
+            Body::ToolResult {
+                call: 1,
+                outcome: Outcome::Interrupted,
+            },
+        ),
+        entry(3, tool_call("run_command")),
+        entry(
+            4,
+            Body::ToolProcess {
+                call: 3,
+                pgid: 42,
+                boot: "boot".into(),
+            },
+        ),
+        entry(5, Body::ModelCall { model: "m".into() }),
+    ];
+    let dangling = dangling_calls(&entries);
+    assert_eq!(dangling.len(), 2);
+    assert_eq!(dangling[0].seq, 3);
+    assert_eq!(dangling[0].processes, [(42, "boot".to_owned())]);
+    assert!(matches!(dangling[1].call, Call::Model));
+}
+
+#[test]
+fn transcripts_of_earlier_logs_read_replies_as_text() {
+    let done = Outcome::Done {
+        output: json!({ "text": "hello", "usage": { "input": 1, "output": 1 } }),
+    };
+    let entries = [
+        entry(1, Body::User { text: "hi".into() }),
+        entry(2, Body::ModelCall { model: "m".into() }),
+        entry(
+            3,
+            Body::ModelResult {
+                call: 2,
+                outcome: done,
+            },
+        ),
+        entry(
+            4,
+            Body::User {
+                text: "again".into(),
+            },
+        ),
+        entry(5, Body::ModelCall { model: "m".into() }),
+    ];
+    let turns = transcript(&entries, 5, &Toolset::default());
+    assert_eq!(
+        turns,
+        [
+            llm::Message::user("hi"),
+            llm::Message::assistant("hello"),
+            llm::Message::user("again"),
+        ]
+    );
+}
+
+/// The tool rig's recordings call.
+struct HarborLabel;
+
+impl Tool for HarborLabel {
+    type In = serde_json::Map<String, Value>;
+    type Out = String;
+
+    const NAME: &'static str = "lookup_harbor_label";
+    const DESCRIPTION: &'static str = "Return the alpha signal marker.";
+    const REPLAY: Replay = Replay::Safe;
+
+    fn schema() -> Value {
+        json!({ "type": "object", "properties": {}, "required": [] })
+    }
+
+    fn call(&self, _: Self::In, _: &Cx<'_>) -> Result<String, String> {
+        Ok("crimson-harbor".to_owned())
+    }
+
+    fn to_model(label: &String) -> llm::Output {
+        llm::Output::Text(label.clone())
+    }
+}
+
+/// A model endpoint that answers each request with the next canned SSE
+/// body, and keeps what it was sent.
+#[derive(Default)]
+struct Script {
+    replies: Mutex<VecDeque<String>>,
+    sent: Mutex<Vec<Value>>,
+}
+
+impl Script {
+    fn new(replies: &[String]) -> Arc<Self> {
+        Arc::new(Self {
+            replies: Mutex::new(replies.iter().cloned().collect()),
+            ..Self::default()
+        })
+    }
+
+    fn sent(&self) -> Vec<Value> {
+        lock(&self.sent).clone()
+    }
+}
+
+impl Http for Script {
+    fn send(
+        &self,
+        request: http::Request<Bytes>,
+    ) -> BoxFuture<'static, io::Result<llm::http::Response>> {
+        lock(&self.sent).push(serde_json::from_slice(request.body()).unwrap_or_default());
+        let reply = lock(&self.replies).pop_front().map(|body| {
+            http::Response::builder()
+                .status(200)
+                .header("content-type", "text/event-stream")
+                .body(llm::http::body([Bytes::from(body)]))
+                .expect("scripted response")
+        });
+        Box::pin(std::future::ready(reply.ok_or_else(|| {
+            io::Error::other("the script has no more replies")
+        })))
+    }
+}
+
+/// The replies recorded in a rig cassette, in order.
+fn cassette(path: &str) -> Vec<String> {
+    let path = Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("../../fixtures/rig/cassettes")
+        .join(path);
+    let text = std::fs::read_to_string(path).unwrap();
+    serde_yaml_ng::Deserializer::from_str(&text)
+        .map(|doc| {
+            let doc = serde_yaml_ng::Value::deserialize(doc).unwrap();
+            let body = doc.get("then").and_then(|then| then.get("body"));
+            body.and_then(serde_yaml_ng::Value::as_str)
+                .unwrap()
+                .to_owned()
+        })
+        .collect()
+}
+
+fn openai(script: &Arc<Script>) -> Model {
+    let (host, quirks) = responses::HOSTS
+        .iter()
+        .find(|(host, _)| host.id == "openai")
+        .unwrap();
+    let provider = llm::Provider::new(
+        host.id,
+        "http://scripted",
+        llm::Auth::None,
+        responses::Responses::new(*quirks),
+    );
+    Model::new(provider, "gpt-5.6".into(), Arc::clone(script))
+}
+
+struct Fixture {
+    root: PathBuf,
+    shared: Arc<Shared>,
+}
+
+impl Fixture {
+    fn new(name: &str, agent: agent::Kind, tools: Toolset, hooks: Hooks, model: Model) -> Self {
+        let root = std::env::temp_dir().join(format!("a-session-{name}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        let shared = Arc::new(Shared {
+            store: Store::open(root.join("sessions")).unwrap(),
+            agent,
+            tools,
+            hooks,
+            model: Ok(model),
+        });
+        Self { root, shared }
+    }
+
+    /// A session whose log holds `entries`, started as after a crash.
+    fn start(&self, entries: &[Entry]) -> Arc<Session> {
+        let header = Header {
+            id: SessionId::new(),
+            workspace: self.root.clone(),
+        };
+        let mut log = self.shared.store.create(&header).unwrap().log;
+        for e in entries {
+            log.append(e).unwrap();
+        }
+        let loaded = self.shared.store.load(header.id).unwrap();
+        let session = Session::start(header, loaded, Arc::clone(&self.shared));
+        settle(&session);
+        session
+    }
+}
+
+impl Drop for Fixture {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_dir_all(&self.root);
+    }
+}
+
+fn settle(session: &Session) {
+    let deadline = Instant::now() + Duration::from_secs(10);
+    while session.has_work() {
+        assert!(Instant::now() < deadline, "work never finished");
+        thread::sleep(Duration::from_millis(5));
+    }
+}
+
+fn log_of(session: &Session) -> Vec<Entry> {
+    session.lock().entries.clone()
+}
+
+#[test]
+fn the_model_calls_a_tool_and_answers_from_its_result() {
+    let replies = cassette("openai/streaming_grammar/tool_then_followup_text.yaml");
+    let script = Script::new(&replies);
+    let tools = Toolset(&[&HarborLabel]);
+    let fixture = Fixture::new(
+        "loop",
+        agent::Kind::Chat,
+        tools,
+        Hooks::default(),
+        openai(&script),
+    );
+    let session = fixture.start(&[]);
+    session.submit("Call the tool, then answer.".into());
+    settle(&session);
+    let log = log_of(&session);
+    session.stop();
+    let sent = script.sent();
+
+    let call_id = "call_lWZlGyrTej1Dov0dGJDf1U0M";
+    assert!(
+        matches!(
+            &bodies(&log)[..],
+            [
+                Body::User { .. },
+                Body::ModelCall { .. },
+                Body::ModelResult { call: 2, outcome: Outcome::Done { .. } },
+                Body::ToolCall { tool, id: Some(id), .. },
+                Body::ToolResult { call: 4, outcome: Outcome::Done { output } },
+                Body::ModelCall { .. },
+                Body::ModelResult { call: 6, outcome: Outcome::Done { output: answer } },
+            ] if tool == "lookup_harbor_label" && id == call_id && output == "crimson-harbor"
+                && answer["message"]["content"][1]["text"] == "The harbor label is crimson-harbor."
+        ),
+        "{log:#?}"
+    );
+    assert_eq!(sent.len(), 2);
+    assert_eq!(sent[0]["tools"][0]["name"], "lookup_harbor_label");
+    let items = sent[1]["input"].as_array().unwrap();
+    let result = items
+        .iter()
+        .find(|item| item["type"] == "function_call_output")
+        .unwrap();
+    assert_eq!(result["call_id"], call_id);
+    assert_eq!(result["output"], "crimson-harbor");
+    assert!(
+        items
+            .iter()
+            .any(|item| item["type"] == "function_call" && item["call_id"] == call_id),
+        "the reply's call goes back before its result: {items:#?}"
+    );
+
+    // Stopped after any fact, a session picks up from its log and ends the
+    // same way, sending the model the same second request.
+    for cut in 3..=6 {
+        let script = Script::new(&replies[1..]);
+        let fixture = Fixture::new(
+            &format!("resume-{cut}"),
+            agent::Kind::Chat,
+            Toolset(&[&HarborLabel]),
+            Hooks::default(),
+            openai(&script),
+        );
+        let resumed = fixture.start(&log[..cut]);
+        let got = log_of(&resumed);
+        resumed.stop();
+        assert_eq!(got, log, "cut after {cut}");
+        assert_eq!(script.sent(), sent[1..], "cut after {cut}");
+    }
+}
+
+/// Denies shell commands, and has the agent go on once after it stops.
+struct Policy;
+
+impl Hook for Policy {
+    fn name(&self) -> &'static str {
+        "policy"
+    }
+
+    fn permission(&self, tool: &str, _: &Value) -> Permission {
+        if tool == agent::tools::RunCommand::NAME {
+            Permission::Deny
+        } else {
+            Permission::Allow
+        }
+    }
+
+    fn on_stop(&self, entries: &[Entry]) -> Option<String> {
+        let continued = entries.iter().any(|e| {
+            matches!(
+                e.body,
+                Body::Hook {
+                    decision: Decision::OnStop { .. },
+                    ..
+                }
+            )
+        });
+        (!continued).then(|| "and again".to_owned())
+    }
+}
+
+#[test]
+fn hook_decisions_are_logged_and_replay_to_the_same_state() {
+    let fixture = Fixture::new(
+        "hooks",
+        agent::Kind::Echo,
+        Toolset::default(),
+        std::iter::once(Box::new(Policy) as Box<dyn Hook>).collect(),
+        openai(&Script::new(&[])),
+    );
+    let session = fixture.start(&[]);
+    session.submit("$ echo hi".into());
+    settle(&session);
+    let log = log_of(&session);
+    session.stop();
+
+    let policy = |decision| Body::Hook {
+        hook: "policy".into(),
+        decision,
+    };
+    assert_eq!(
+        bodies(&log),
+        [
+            &Body::User {
+                text: "$ echo hi".into()
+            },
+            &policy(Decision::Permission {
+                tool: "run_command".into(),
+                permission: Permission::Deny,
+            }),
+            &Body::ToolCall {
+                tool: "run_command".into(),
+                input: json!({ "command": "echo hi" }),
+                id: None,
+            },
+            &Body::ToolResult {
+                call: 3,
+                outcome: Outcome::Failed {
+                    error: "policy denied this call".into()
+                },
+            },
+            &policy(Decision::OnStop {
+                text: "and again".into()
+            }),
+            &Body::Assistant {
+                text: "and again".into()
+            },
+        ]
+    );
+    assert!(replay(agent::Kind::Echo.agent().as_mut(), &log).is_empty());
+    assert_eq!(
+        transcript(&log, u64::MAX, &Toolset::default()),
+        [
+            llm::Message::user("$ echo hi"),
+            llm::Message::user("and again"),
+            llm::Message::assistant("and again")
+        ]
+    );
+}
