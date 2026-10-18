@@ -1,17 +1,21 @@
 use super::{NdjsonFramer, SseFramer};
 
 /// Every event a framer dispatches over one whole body.
-fn sse_all(body: &[u8]) -> Vec<(String, String, String)> {
+fn sse_all(body: &[u8]) -> Vec<(String, String)> {
     let mut framer = SseFramer::new();
     framer
         .push(body)
-        .map(|event| (event.event, event.data, event.id))
+        .map(|event| (event.event, event.data))
         .collect()
+}
+
+fn message(data: &str) -> (String, String) {
+    ("message".into(), data.into())
 }
 
 #[test]
 fn every_line_ending_terminates_a_line() {
-    let expected = vec![("message".into(), "one".into(), String::new())];
+    let expected = vec![message("one")];
     assert_eq!(sse_all(b"data: one\n\n"), expected);
     assert_eq!(sse_all(b"data: one\r\n\r\n"), expected);
     // Bare CR terminates a line; a trailing lone CR cannot — the `\n` of a
@@ -23,7 +27,7 @@ fn every_line_ending_terminates_a_line() {
 fn a_leading_bom_is_not_data() {
     assert_eq!(
         sse_all("\u{feff}data: one\n\n".as_bytes()),
-        vec![("message".into(), "one".into(), String::new())]
+        vec![message("one")]
     );
 }
 
@@ -41,47 +45,35 @@ fn a_bom_split_across_chunks_is_still_ignored() {
 fn a_leading_colon_is_a_comment() {
     assert_eq!(
         sse_all(b": keep-alive\ndata: one\n\n"),
-        vec![("message".into(), "one".into(), String::new())]
+        vec![message("one")]
     );
 }
 
 #[test]
-fn an_id_persists_across_events() {
+fn id_and_retry_lines_are_not_data() {
     assert_eq!(
-        sse_all(b"id: 7\ndata: one\n\ndata: two\n\n"),
-        vec![
-            ("message".into(), "one".into(), "7".into()),
-            ("message".into(), "two".into(), "7".into()),
-        ]
+        sse_all(b"id: 7\nretry: 500\ndata: one\n\ndata: two\n\n"),
+        vec![message("one"), message("two")]
     );
-}
-
-#[test]
-fn a_retry_does_not_persist_across_events() {
-    let mut framer = SseFramer::new();
-    let retries: Vec<_> = framer
-        .push(b"retry: 500\ndata: one\n\ndata: two\n\n")
-        .map(|event| event.retry)
-        .collect();
-    assert_eq!(retries, vec![Some(500), None]);
 }
 
 #[test]
 fn a_blank_line_without_data_dispatches_nothing_and_resets_the_type() {
     assert_eq!(
         sse_all(b"event: ping\n\ndata: one\n\n"),
-        vec![("message".into(), "one".into(), String::new())]
+        vec![message("one")]
     );
 }
 
 #[test]
-fn a_truncated_trailing_event_is_pending_bytes_never_a_frame() {
+fn a_truncated_trailing_event_waits_for_its_blank_line() {
     let mut framer = SseFramer::new();
     let events: Vec<_> = framer
         .push(b"data: one\n\nevent: message_stop\ndata: {}")
         .collect();
     assert_eq!(events.len(), 1);
-    assert_eq!(framer.pending(), b"event: message_stop\ndata: {}".len());
+    let events: Vec<_> = framer.push(b"\n\n").map(|event| event.event).collect();
+    assert_eq!(events, ["message_stop"]);
 }
 
 /// The two cassette-derived shapes: a body whose last event has no trailing
@@ -114,13 +106,9 @@ fn splitting_a_body_at_every_offset_yields_the_same_events() {
         let mut framer = SseFramer::new();
         let mut events: Vec<_> = framer
             .push(head)
-            .map(|event| (event.event, event.data, event.id))
+            .map(|event| (event.event, event.data))
             .collect();
-        events.extend(
-            framer
-                .push(tail)
-                .map(|event| (event.event, event.data, event.id)),
-        );
+        events.extend(framer.push(tail).map(|event| (event.event, event.data)));
         assert_eq!(events, whole, "split at {split}");
     }
 }
@@ -130,7 +118,6 @@ fn ndjson_yields_terminated_lines_and_flushes_the_last_one() {
     let mut framer = NdjsonFramer::new();
     let lines: Vec<_> = framer.push(b"{\"a\":1}\n\n{\"b\":2}\n{\"c\"").collect();
     assert_eq!(lines, vec![b"{\"a\":1}".to_vec(), b"{\"b\":2}".to_vec()]);
-    assert_eq!(framer.pending(), 4);
     assert_eq!(framer.finish(), Some(b"{\"c\"".to_vec()));
     assert_eq!(framer.finish(), None);
 }

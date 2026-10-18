@@ -22,6 +22,6 @@ fn specs_name_a_host_a_protocol_and_a_model() {
 #[test]
 fn every_protocol_contributes_hosts() {
     for id in ["openai", "groq", "deepseek", "anthropic", "zai", "gemini"] {
-        assert!(ids().any(|known| known == id), "{id}");
+        assert!(WIRES.iter().any(|wire| (wire.find)(id).is_some()), "{id}");
     }
 }

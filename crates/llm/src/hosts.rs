@@ -9,21 +9,21 @@ use crate::protocol::{Hosted, Provider};
 use crate::protocols::{chat, gemini, messages, responses};
 use crate::spec::SmolStr;
 
-/// The default host for a bare model.
-pub const DEFAULT_HOST: &str = "openai";
+/// The host of a bare model.
+const DEFAULT_HOST: &str = "openai";
 
 /// A model spec's parts.
 #[derive(Debug, PartialEq, Eq)]
-pub struct Spec<'a> {
-    pub host: &'a str,
+struct Spec<'a> {
+    host: &'a str,
     /// The last segment of a protocol key (`chat`, `responses`).
-    pub protocol: Option<&'a str>,
-    pub model: &'a str,
+    protocol: Option<&'a str>,
+    model: &'a str,
 }
 
 /// `spec` split at its first `:` (model ids may hold more) and the host's
 /// `@protocol`.
-pub fn parse(spec: &str) -> Spec<'_> {
+fn parse(spec: &str) -> Spec<'_> {
     let (host, model) = spec.split_once(':').unwrap_or((DEFAULT_HOST, spec));
     let (host, protocol) = host
         .split_once('@')
@@ -40,24 +40,18 @@ struct Wire {
     key: &'static str,
     /// The provider a host id names, if the protocol lists it.
     find: fn(&str) -> Option<Result<Provider, Error>>,
-    ids: fn() -> Box<dyn Iterator<Item = &'static str>>,
 }
 
 const fn wire<P: Hosted>() -> Wire {
     Wire {
         key: P::KEY,
         find: find::<P>,
-        ids: host_ids::<P>,
     }
 }
 
 fn find<P: Hosted>(id: &str) -> Option<Result<Provider, Error>> {
     let (host, quirks) = P::HOSTS.iter().find(|(host, _)| host.id == id)?;
     Some(host.provider(P::with(*quirks)))
-}
-
-fn host_ids<P: Hosted>() -> Box<dyn Iterator<Item = &'static str>> {
-    Box::new(P::HOSTS.iter().map(|(host, _)| host.id))
 }
 
 /// Every protocol, in lookup order.
@@ -97,11 +91,6 @@ pub fn provider(spec: &str) -> Result<(Provider, SmolStr), Error> {
             )
         })?;
     Ok((provider?, model.into()))
-}
-
-/// Every host id, in lookup order.
-pub fn ids() -> impl Iterator<Item = &'static str> {
-    WIRES.iter().flat_map(|wire| (wire.ids)())
 }
 
 #[cfg(test)]
