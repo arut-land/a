@@ -139,12 +139,16 @@ fn two_terminals_on_one_session_see_identical_state() {
         _ => false,
     };
     let seen = [first.until(done), second.until(done)];
-    let (_, replayed) = env.connect().attach(Target::Id(id), &env.ws);
+    let mut third = env.connect();
+    let (_, replayed) = third.attach(Target::Id(id), &env.ws);
 
     assert_contiguous(&seen[0]);
     assert_eq!(seen[0], seen[1]);
     assert_eq!(seen[0], replayed);
     assert_eq!(seen[0], env.log(id));
+    let hashes = [&first, &second, &third].map(|c| c.view.state_hash());
+    assert_eq!(hashes, [hashes[0]; 3], "{:#?}", [first.view, third.view]);
+    assert_ne!(first.view.items, []);
 }
 
 #[test]

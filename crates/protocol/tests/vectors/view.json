@@ -1,0 +1,2474 @@
+[
+  {
+    "hash": "8cabc003e2a76195",
+    "messages": [
+      {
+        "session": "00000000-0000-0000-0000-00000000000a",
+        "t": "attached",
+        "workspace": "/w"
+      },
+      {
+        "seq": 0,
+        "t": "synced"
+      },
+      {
+        "epoch": 0,
+        "kind": "user",
+        "seq": 1,
+        "t": "entry",
+        "text": "hi"
+      },
+      {
+        "epoch": 0,
+        "kind": "model_call",
+        "model": "m",
+        "seq": 2,
+        "t": "entry"
+      },
+      {
+        "call": 2,
+        "t": "delta",
+        "text": "hel"
+      },
+      {
+        "call": 2,
+        "t": "delta",
+        "text": "lo"
+      },
+      {
+        "call": 2,
+        "epoch": 0,
+        "kind": "model_result",
+        "outcome": {
+          "output": {
+            "message": {
+              "content": [
+                {
+                  "text": "hello",
+                  "type": "text"
+                }
+              ]
+            },
+            "usage": {
+              "input": 4,
+              "output": 2
+            }
+          },
+          "status": "done"
+        },
+        "seq": 3,
+        "t": "entry"
+      }
+    ],
+    "name": "a streamed reply, then the committed one",
+    "state": {
+      "environment": null,
+      "items": [
+        {
+          "seq": 1,
+          "text": "hi",
+          "type": "user"
+        },
+        {
+          "call": 2,
+          "model": "m",
+          "status": {
+            "status": "done"
+          },
+          "text": "hello",
+          "type": "reply",
+          "usage": {
+            "input": 4,
+            "output": 2
+          }
+        }
+      ],
+      "seq": 3,
+      "session": "00000000-0000-0000-0000-00000000000a",
+      "workspace": "/w"
+    },
+    "updates": [
+      {
+        "change": {
+          "change": "attached",
+          "reset": true,
+          "session": "00000000-0000-0000-0000-00000000000a",
+          "workspace": "/w"
+        },
+        "rev": 1,
+        "seq": 0
+      },
+      {
+        "change": {
+          "change": "synced"
+        },
+        "rev": 2,
+        "seq": 0
+      },
+      {
+        "change": {
+          "change": "added",
+          "index": 0,
+          "item": {
+            "seq": 1,
+            "text": "hi",
+            "type": "user"
+          }
+        },
+        "rev": 3,
+        "seq": 1
+      },
+      {
+        "change": {
+          "change": "added",
+          "index": 1,
+          "item": {
+            "call": 2,
+            "model": "m",
+            "status": {
+              "status": "running"
+            },
+            "text": "",
+            "type": "reply",
+            "usage": null
+          }
+        },
+        "rev": 4,
+        "seq": 2
+      },
+      {
+        "change": {
+          "call": 2,
+          "change": "delta",
+          "text": "hel"
+        },
+        "rev": 5,
+        "seq": 2
+      },
+      {
+        "change": {
+          "call": 2,
+          "change": "delta",
+          "text": "lo"
+        },
+        "rev": 6,
+        "seq": 2
+      },
+      {
+        "change": {
+          "change": "updated",
+          "index": 1,
+          "item": {
+            "call": 2,
+            "model": "m",
+            "status": {
+              "status": "done"
+            },
+            "text": "hello",
+            "type": "reply",
+            "usage": {
+              "input": 4,
+              "output": 2
+            }
+          },
+          "part": "outcome"
+        },
+        "rev": 7,
+        "seq": 3
+      }
+    ]
+  },
+  {
+    "hash": "d8ec515c69444324",
+    "messages": [
+      {
+        "session": "00000000-0000-0000-0000-00000000000a",
+        "t": "attached",
+        "workspace": "/w"
+      },
+      {
+        "epoch": 0,
+        "input": {
+          "command": "echo hi"
+        },
+        "kind": "tool_call",
+        "seq": 1,
+        "t": "entry",
+        "tool": "run_command"
+      },
+      {
+        "call": 1,
+        "epoch": 0,
+        "kind": "ask",
+        "seq": 2,
+        "t": "entry"
+      },
+      {
+        "seq": 2,
+        "t": "synced"
+      },
+      {
+        "asks": 1,
+        "failed": 0,
+        "prompt": null,
+        "reply": null,
+        "running": 0,
+        "t": "recap",
+        "tools": [
+          "run_command"
+        ]
+      },
+      {
+        "call": 1,
+        "input": {
+          "command": "echo hi"
+        },
+        "t": "ask",
+        "tool": "run_command"
+      },
+      {
+        "call": 1,
+        "input": {
+          "command": "echo hi"
+        },
+        "t": "ask",
+        "tool": "run_command"
+      },
+      {
+        "decision": {
+          "approval": {
+            "approved": true,
+            "call": 1,
+            "tool": "run_command"
+          }
+        },
+        "epoch": 0,
+        "hook": "user",
+        "kind": "hook",
+        "seq": 3,
+        "t": "entry"
+      },
+      {
+        "call": 1,
+        "epoch": 0,
+        "kind": "tool_result",
+        "outcome": {
+          "output": {
+            "exit": 0,
+            "stderr": "",
+            "stdout": "hi\n"
+          },
+          "status": "done"
+        },
+        "seq": 4,
+        "t": "entry"
+      }
+    ],
+    "name": "an approval asked, re-delivered on attach, and answered",
+    "state": {
+      "environment": null,
+      "items": [
+        {
+          "approval": "approved",
+          "call": 1,
+          "input": {
+            "command": "echo hi"
+          },
+          "outcome": {
+            "output": {
+              "exit": 0,
+              "stderr": "",
+              "stdout": "hi\n"
+            },
+            "status": "done"
+          },
+          "tool": "run_command",
+          "type": "tool"
+        }
+      ],
+      "seq": 4,
+      "session": "00000000-0000-0000-0000-00000000000a",
+      "workspace": "/w"
+    },
+    "updates": [
+      {
+        "change": {
+          "change": "attached",
+          "reset": true,
+          "session": "00000000-0000-0000-0000-00000000000a",
+          "workspace": "/w"
+        },
+        "rev": 1,
+        "seq": 0
+      },
+      {
+        "change": {
+          "change": "added",
+          "index": 0,
+          "item": {
+            "approval": null,
+            "call": 1,
+            "input": {
+              "command": "echo hi"
+            },
+            "outcome": null,
+            "tool": "run_command",
+            "type": "tool"
+          }
+        },
+        "rev": 2,
+        "seq": 1
+      },
+      {
+        "change": {
+          "change": "updated",
+          "index": 0,
+          "item": {
+            "approval": "pending",
+            "call": 1,
+            "input": {
+              "command": "echo hi"
+            },
+            "outcome": null,
+            "tool": "run_command",
+            "type": "tool"
+          },
+          "part": "approval"
+        },
+        "rev": 3,
+        "seq": 2
+      },
+      {
+        "change": {
+          "change": "synced"
+        },
+        "rev": 4,
+        "seq": 2
+      },
+      {
+        "change": {
+          "asks": 1,
+          "change": "recap",
+          "failed": 0,
+          "prompt": null,
+          "reply": null,
+          "running": 0,
+          "tools": [
+            "run_command"
+          ]
+        },
+        "rev": 5,
+        "seq": 2
+      },
+      {
+        "change": {
+          "change": "asked",
+          "index": 0,
+          "item": {
+            "approval": "pending",
+            "call": 1,
+            "input": {
+              "command": "echo hi"
+            },
+            "outcome": null,
+            "tool": "run_command",
+            "type": "tool"
+          }
+        },
+        "rev": 6,
+        "seq": 2
+      },
+      {
+        "change": {
+          "change": "updated",
+          "index": 0,
+          "item": {
+            "approval": "approved",
+            "call": 1,
+            "input": {
+              "command": "echo hi"
+            },
+            "outcome": null,
+            "tool": "run_command",
+            "type": "tool"
+          },
+          "part": "approval"
+        },
+        "rev": 7,
+        "seq": 3
+      },
+      {
+        "change": {
+          "change": "updated",
+          "index": 0,
+          "item": {
+            "approval": "approved",
+            "call": 1,
+            "input": {
+              "command": "echo hi"
+            },
+            "outcome": {
+              "output": {
+                "exit": 0,
+                "stderr": "",
+                "stdout": "hi\n"
+              },
+              "status": "done"
+            },
+            "tool": "run_command",
+            "type": "tool"
+          },
+          "part": "outcome"
+        },
+        "rev": 8,
+        "seq": 4
+      }
+    ]
+  },
+  {
+    "hash": "238ad65aea0402a6",
+    "messages": [
+      {
+        "session": "00000000-0000-0000-0000-00000000000a",
+        "t": "attached",
+        "workspace": "/w"
+      },
+      {
+        "child": "00000000-0000-0000-0000-00000000000c",
+        "epoch": 0,
+        "input": "sleep 1",
+        "kind": "link",
+        "seq": 1,
+        "t": "entry"
+      },
+      {
+        "child": "00000000-0000-0000-0000-00000000000c",
+        "epoch": 0,
+        "kind": "watch",
+        "seq": 2,
+        "t": "entry"
+      },
+      {
+        "epoch": 0,
+        "kind": "fired",
+        "outcome": {
+          "output": {
+            "slept": 1
+          },
+          "status": "done"
+        },
+        "seq": 3,
+        "t": "entry",
+        "watch": 2
+      },
+      {
+        "seq": 3,
+        "t": "synced"
+      }
+    ],
+    "name": "a child, its watch, and the watch firing",
+    "state": {
+      "environment": null,
+      "items": [
+        {
+          "call": 1,
+          "child": "00000000-0000-0000-0000-00000000000c",
+          "fired": {
+            "output": {
+              "slept": 1
+            },
+            "status": "done"
+          },
+          "input": "sleep 1",
+          "type": "child",
+          "watch": 2
+        }
+      ],
+      "seq": 3,
+      "session": "00000000-0000-0000-0000-00000000000a",
+      "workspace": "/w"
+    },
+    "updates": [
+      {
+        "change": {
+          "change": "attached",
+          "reset": true,
+          "session": "00000000-0000-0000-0000-00000000000a",
+          "workspace": "/w"
+        },
+        "rev": 1,
+        "seq": 0
+      },
+      {
+        "change": {
+          "change": "added",
+          "index": 0,
+          "item": {
+            "call": 1,
+            "child": "00000000-0000-0000-0000-00000000000c",
+            "fired": null,
+            "input": "sleep 1",
+            "type": "child",
+            "watch": null
+          }
+        },
+        "rev": 2,
+        "seq": 1
+      },
+      {
+        "change": {
+          "change": "updated",
+          "index": 0,
+          "item": {
+            "call": 1,
+            "child": "00000000-0000-0000-0000-00000000000c",
+            "fired": null,
+            "input": "sleep 1",
+            "type": "child",
+            "watch": 2
+          },
+          "part": "watch"
+        },
+        "rev": 3,
+        "seq": 2
+      },
+      {
+        "change": {
+          "change": "updated",
+          "index": 0,
+          "item": {
+            "call": 1,
+            "child": "00000000-0000-0000-0000-00000000000c",
+            "fired": {
+              "output": {
+                "slept": 1
+              },
+              "status": "done"
+            },
+            "input": "sleep 1",
+            "type": "child",
+            "watch": 2
+          },
+          "part": "outcome"
+        },
+        "rev": 4,
+        "seq": 3
+      },
+      {
+        "change": {
+          "change": "synced"
+        },
+        "rev": 5,
+        "seq": 3
+      }
+    ]
+  },
+  {
+    "hash": "028a8c389a78a321",
+    "messages": [
+      {
+        "session": "00000000-0000-0000-0000-00000000000a",
+        "t": "attached",
+        "workspace": "/w"
+      },
+      {
+        "epoch": 0,
+        "kind": "user",
+        "seq": 1,
+        "t": "entry",
+        "text": "one"
+      },
+      {
+        "epoch": 0,
+        "kind": "assistant",
+        "seq": 2,
+        "t": "entry",
+        "text": "one"
+      },
+      {
+        "seq": 2,
+        "t": "synced"
+      },
+      {
+        "t": "draining"
+      },
+      {
+        "session": "00000000-0000-0000-0000-00000000000a",
+        "t": "attached",
+        "workspace": "/w"
+      },
+      {
+        "epoch": 0,
+        "kind": "assistant",
+        "seq": 2,
+        "t": "entry",
+        "text": "one"
+      },
+      {
+        "epoch": 0,
+        "kind": "user",
+        "seq": 3,
+        "t": "entry",
+        "text": "two"
+      },
+      {
+        "seq": 3,
+        "t": "synced"
+      }
+    ],
+    "name": "a drain, then a reconnect replaying entries already seen",
+    "state": {
+      "environment": null,
+      "items": [
+        {
+          "seq": 1,
+          "text": "one",
+          "type": "user"
+        },
+        {
+          "seq": 2,
+          "text": "one",
+          "type": "assistant"
+        },
+        {
+          "seq": 3,
+          "text": "two",
+          "type": "user"
+        }
+      ],
+      "seq": 3,
+      "session": "00000000-0000-0000-0000-00000000000a",
+      "workspace": "/w"
+    },
+    "updates": [
+      {
+        "change": {
+          "change": "attached",
+          "reset": true,
+          "session": "00000000-0000-0000-0000-00000000000a",
+          "workspace": "/w"
+        },
+        "rev": 1,
+        "seq": 0
+      },
+      {
+        "change": {
+          "change": "added",
+          "index": 0,
+          "item": {
+            "seq": 1,
+            "text": "one",
+            "type": "user"
+          }
+        },
+        "rev": 2,
+        "seq": 1
+      },
+      {
+        "change": {
+          "change": "added",
+          "index": 1,
+          "item": {
+            "seq": 2,
+            "text": "one",
+            "type": "assistant"
+          }
+        },
+        "rev": 3,
+        "seq": 2
+      },
+      {
+        "change": {
+          "change": "synced"
+        },
+        "rev": 4,
+        "seq": 2
+      },
+      {
+        "change": {
+          "change": "draining"
+        },
+        "rev": 5,
+        "seq": 2
+      },
+      {
+        "change": {
+          "change": "attached",
+          "reset": false,
+          "session": "00000000-0000-0000-0000-00000000000a",
+          "workspace": "/w"
+        },
+        "rev": 6,
+        "seq": 2
+      },
+      {
+        "change": {
+          "change": "added",
+          "index": 2,
+          "item": {
+            "seq": 3,
+            "text": "two",
+            "type": "user"
+          }
+        },
+        "rev": 7,
+        "seq": 3
+      },
+      {
+        "change": {
+          "change": "synced"
+        },
+        "rev": 8,
+        "seq": 3
+      }
+    ]
+  },
+  {
+    "hash": "59d0b09c7f0d6953",
+    "messages": [
+      {
+        "session": "00000000-0000-0000-0000-00000000000a",
+        "t": "attached",
+        "workspace": "/w"
+      },
+      {
+        "t": "presence",
+        "who": 1
+      },
+      {
+        "epoch": 0,
+        "kind": "from_a_newer_build",
+        "seq": 1,
+        "t": "entry",
+        "x": []
+      },
+      {
+        "cwd": "/w",
+        "epoch": 0,
+        "kind": "environment",
+        "seq": 2,
+        "t": "entry",
+        "tty": false,
+        "vars": {}
+      },
+      {
+        "seq": 2,
+        "t": "synced"
+      }
+    ],
+    "name": "kinds from a newer build are skipped",
+    "state": {
+      "environment": {
+        "cwd": "/w",
+        "tty": false,
+        "vars": {}
+      },
+      "items": [
+        {
+          "cwd": "/w",
+          "seq": 2,
+          "type": "environment"
+        }
+      ],
+      "seq": 2,
+      "session": "00000000-0000-0000-0000-00000000000a",
+      "workspace": "/w"
+    },
+    "updates": [
+      {
+        "change": {
+          "change": "attached",
+          "reset": true,
+          "session": "00000000-0000-0000-0000-00000000000a",
+          "workspace": "/w"
+        },
+        "rev": 1,
+        "seq": 0
+      },
+      {
+        "change": {
+          "change": "added",
+          "index": 0,
+          "item": {
+            "cwd": "/w",
+            "seq": 2,
+            "type": "environment"
+          }
+        },
+        "rev": 2,
+        "seq": 2
+      },
+      {
+        "change": {
+          "change": "synced"
+        },
+        "rev": 3,
+        "seq": 2
+      }
+    ]
+  },
+  {
+    "hash": "bf08f5b5f14d1541",
+    "messages": [
+      {
+        "session": "00000000-0000-0000-0000-00000000000a",
+        "t": "attached",
+        "workspace": "/w"
+      },
+      {
+        "seq": 0,
+        "t": "synced"
+      },
+      {
+        "asks": 0,
+        "failed": 0,
+        "prompt": null,
+        "reply": null,
+        "running": 0,
+        "t": "recap",
+        "tools": []
+      },
+      {
+        "child": "00000000-0000-0000-16df-9d6ac76bd322",
+        "epoch": 0,
+        "input": "go",
+        "kind": "link",
+        "seq": 1,
+        "t": "entry"
+      },
+      {
+        "child": "00000000-0000-0000-16df-9d6ac76bd322",
+        "epoch": 0,
+        "kind": "watch",
+        "seq": 2,
+        "t": "entry"
+      },
+      {
+        "epoch": 0,
+        "kind": "fired",
+        "outcome": {
+          "status": "interrupted"
+        },
+        "seq": 3,
+        "t": "entry",
+        "watch": 2
+      },
+      {
+        "message": "e",
+        "t": "error"
+      },
+      {
+        "epoch": 0,
+        "kind": "from_a_newer_build",
+        "seq": 4,
+        "t": "entry"
+      },
+      {
+        "decision": {
+          "block": {
+            "reason": "no",
+            "tool": "t"
+          }
+        },
+        "epoch": 0,
+        "hook": "policy",
+        "kind": "hook",
+        "seq": 5,
+        "t": "entry"
+      },
+      {
+        "message": "e",
+        "t": "error"
+      },
+      {
+        "message": "e",
+        "t": "error"
+      },
+      {
+        "message": "e",
+        "t": "error"
+      },
+      {
+        "epoch": 0,
+        "kind": "model_call",
+        "model": "m",
+        "seq": 6,
+        "t": "entry"
+      },
+      {
+        "call": 6,
+        "t": "delta",
+        "text": "r"
+      },
+      {
+        "call": 6,
+        "t": "delta",
+        "text": "ep"
+      },
+      {
+        "call": 6,
+        "t": "delta",
+        "text": "ly "
+      },
+      {
+        "call": 6,
+        "t": "delta",
+        "text": "3"
+      },
+      {
+        "call": 6,
+        "t": "delta",
+        "text": "2"
+      },
+      {
+        "epoch": 0,
+        "kind": "from_a_newer_build",
+        "seq": 7,
+        "t": "entry"
+      },
+      {
+        "epoch": 0,
+        "kind": "assistant",
+        "seq": 8,
+        "t": "entry",
+        "text": "a69"
+      },
+      {
+        "epoch": 0,
+        "input": {
+          "command": "echo 7"
+        },
+        "kind": "tool_call",
+        "seq": 9,
+        "t": "entry",
+        "tool": "run_command"
+      },
+      {
+        "call": 9,
+        "epoch": 0,
+        "kind": "ask",
+        "seq": 10,
+        "t": "entry"
+      },
+      {
+        "call": 9,
+        "input": {
+          "command": "echo 7"
+        },
+        "t": "ask",
+        "tool": "run_command"
+      },
+      {
+        "decision": {
+          "approval": {
+            "approved": false,
+            "call": 9,
+            "tool": "run_command"
+          }
+        },
+        "epoch": 0,
+        "hook": "user",
+        "kind": "hook",
+        "seq": 11,
+        "t": "entry"
+      },
+      {
+        "boot": "b",
+        "call": 9,
+        "epoch": 0,
+        "kind": "tool_process",
+        "pgid": 7,
+        "seq": 12,
+        "t": "entry"
+      },
+      {
+        "call": 9,
+        "epoch": 0,
+        "kind": "tool_result",
+        "outcome": {
+          "output": {
+            "exit": 0,
+            "stderr": "",
+            "stdout": "x\n"
+          },
+          "status": "done"
+        },
+        "seq": 13,
+        "t": "entry"
+      },
+      {
+        "epoch": 0,
+        "kind": "model_call",
+        "model": "m",
+        "seq": 14,
+        "t": "entry"
+      },
+      {
+        "call": 14,
+        "t": "delta",
+        "text": "r"
+      },
+      {
+        "call": 14,
+        "t": "delta",
+        "text": "ep"
+      },
+      {
+        "call": 14,
+        "t": "delta",
+        "text": "l"
+      },
+      {
+        "call": 14,
+        "t": "delta",
+        "text": "y "
+      },
+      {
+        "call": 14,
+        "t": "delta",
+        "text": "48"
+      },
+      {
+        "call": 14,
+        "t": "delta",
+        "text": "2"
+      },
+      {
+        "call": 14,
+        "epoch": 0,
+        "kind": "model_result",
+        "outcome": {
+          "output": {
+            "message": {
+              "content": [
+                {
+                  "text": "reply 482",
+                  "type": "text"
+                }
+              ]
+            },
+            "usage": {
+              "input": 3,
+              "output": 5
+            }
+          },
+          "status": "done"
+        },
+        "seq": 15,
+        "t": "entry"
+      },
+      {
+        "child": "00000000-0000-0000-8c31-dc059121ada3",
+        "epoch": 0,
+        "input": "go",
+        "kind": "link",
+        "seq": 16,
+        "t": "entry"
+      },
+      {
+        "child": "00000000-0000-0000-8c31-dc059121ada3",
+        "epoch": 0,
+        "kind": "watch",
+        "seq": 17,
+        "t": "entry"
+      },
+      {
+        "epoch": 0,
+        "kind": "fired",
+        "outcome": {
+          "output": {
+            "slept": 1
+          },
+          "status": "done"
+        },
+        "seq": 18,
+        "t": "entry",
+        "watch": 17
+      },
+      {
+        "decision": {
+          "block": {
+            "reason": "no",
+            "tool": "t"
+          }
+        },
+        "epoch": 0,
+        "hook": "policy",
+        "kind": "hook",
+        "seq": 19,
+        "t": "entry"
+      },
+      {
+        "message": "e",
+        "t": "error"
+      },
+      {
+        "epoch": 0,
+        "kind": "model_call",
+        "model": "m",
+        "seq": 20,
+        "t": "entry"
+      },
+      {
+        "call": 20,
+        "t": "delta",
+        "text": "r"
+      },
+      {
+        "call": 20,
+        "t": "delta",
+        "text": "e"
+      },
+      {
+        "call": 20,
+        "t": "delta",
+        "text": "ply "
+      },
+      {
+        "call": 20,
+        "t": "delta",
+        "text": "467"
+      },
+      {
+        "call": 20,
+        "epoch": 0,
+        "kind": "model_result",
+        "outcome": {
+          "output": {
+            "message": {
+              "content": [
+                {
+                  "text": "reply 467",
+                  "type": "text"
+                }
+              ]
+            },
+            "usage": {
+              "input": 3,
+              "output": 5
+            }
+          },
+          "status": "done"
+        },
+        "seq": 21,
+        "t": "entry"
+      },
+      {
+        "epoch": 0,
+        "kind": "user",
+        "seq": 22,
+        "t": "entry",
+        "text": "u47"
+      },
+      {
+        "epoch": 0,
+        "kind": "user",
+        "seq": 23,
+        "t": "entry",
+        "text": "u13"
+      },
+      {
+        "epoch": 0,
+        "kind": "from_a_newer_build",
+        "seq": 24,
+        "t": "entry"
+      },
+      {
+        "child": "00000000-0000-0000-0ceb-9e68e19650bf",
+        "epoch": 0,
+        "input": "go",
+        "kind": "link",
+        "seq": 25,
+        "t": "entry"
+      },
+      {
+        "child": "00000000-0000-0000-0ceb-9e68e19650bf",
+        "epoch": 0,
+        "kind": "watch",
+        "seq": 26,
+        "t": "entry"
+      },
+      {
+        "epoch": 0,
+        "kind": "fired",
+        "outcome": {
+          "error": "f",
+          "status": "failed"
+        },
+        "seq": 27,
+        "t": "entry",
+        "watch": 26
+      },
+      {
+        "epoch": 0,
+        "input": {
+          "command": "echo 3"
+        },
+        "kind": "tool_call",
+        "seq": 28,
+        "t": "entry",
+        "tool": "run_command"
+      },
+      {
+        "call": 28,
+        "epoch": 0,
+        "kind": "ask",
+        "seq": 29,
+        "t": "entry"
+      },
+      {
+        "call": 28,
+        "input": {
+          "command": "echo 3"
+        },
+        "t": "ask",
+        "tool": "run_command"
+      },
+      {
+        "epoch": 0,
+        "kind": "assistant",
+        "seq": 30,
+        "t": "entry",
+        "text": "a38"
+      }
+    ],
+    "name": "generated session 7",
+    "state": {
+      "environment": null,
+      "items": [
+        {
+          "call": 1,
+          "child": "00000000-0000-0000-16df-9d6ac76bd322",
+          "fired": {
+            "status": "interrupted"
+          },
+          "input": "go",
+          "type": "child",
+          "watch": 2
+        },
+        {
+          "decision": {
+            "block": {
+              "reason": "no",
+              "tool": "t"
+            }
+          },
+          "hook": "policy",
+          "seq": 5,
+          "type": "hook"
+        },
+        {
+          "call": 6,
+          "model": "m",
+          "status": {
+            "status": "running"
+          },
+          "text": "",
+          "type": "reply",
+          "usage": null
+        },
+        {
+          "seq": 8,
+          "text": "a69",
+          "type": "assistant"
+        },
+        {
+          "approval": "denied",
+          "call": 9,
+          "input": {
+            "command": "echo 7"
+          },
+          "outcome": {
+            "output": {
+              "exit": 0,
+              "stderr": "",
+              "stdout": "x\n"
+            },
+            "status": "done"
+          },
+          "tool": "run_command",
+          "type": "tool"
+        },
+        {
+          "call": 14,
+          "model": "m",
+          "status": {
+            "status": "done"
+          },
+          "text": "reply 482",
+          "type": "reply",
+          "usage": {
+            "input": 3,
+            "output": 5
+          }
+        },
+        {
+          "call": 16,
+          "child": "00000000-0000-0000-8c31-dc059121ada3",
+          "fired": {
+            "output": {
+              "slept": 1
+            },
+            "status": "done"
+          },
+          "input": "go",
+          "type": "child",
+          "watch": 17
+        },
+        {
+          "decision": {
+            "block": {
+              "reason": "no",
+              "tool": "t"
+            }
+          },
+          "hook": "policy",
+          "seq": 19,
+          "type": "hook"
+        },
+        {
+          "call": 20,
+          "model": "m",
+          "status": {
+            "status": "done"
+          },
+          "text": "reply 467",
+          "type": "reply",
+          "usage": {
+            "input": 3,
+            "output": 5
+          }
+        },
+        {
+          "seq": 22,
+          "text": "u47",
+          "type": "user"
+        },
+        {
+          "seq": 23,
+          "text": "u13",
+          "type": "user"
+        },
+        {
+          "call": 25,
+          "child": "00000000-0000-0000-0ceb-9e68e19650bf",
+          "fired": {
+            "error": "f",
+            "status": "failed"
+          },
+          "input": "go",
+          "type": "child",
+          "watch": 26
+        },
+        {
+          "approval": "pending",
+          "call": 28,
+          "input": {
+            "command": "echo 3"
+          },
+          "outcome": null,
+          "tool": "run_command",
+          "type": "tool"
+        },
+        {
+          "seq": 30,
+          "text": "a38",
+          "type": "assistant"
+        }
+      ],
+      "seq": 30,
+      "session": "00000000-0000-0000-0000-00000000000a",
+      "workspace": "/w"
+    },
+    "updates": [
+      {
+        "change": {
+          "change": "attached",
+          "reset": true,
+          "session": "00000000-0000-0000-0000-00000000000a",
+          "workspace": "/w"
+        },
+        "rev": 1,
+        "seq": 0
+      },
+      {
+        "change": {
+          "change": "synced"
+        },
+        "rev": 2,
+        "seq": 0
+      },
+      {
+        "change": {
+          "asks": 0,
+          "change": "recap",
+          "failed": 0,
+          "prompt": null,
+          "reply": null,
+          "running": 0,
+          "tools": []
+        },
+        "rev": 3,
+        "seq": 0
+      },
+      {
+        "change": {
+          "change": "added",
+          "index": 0,
+          "item": {
+            "call": 1,
+            "child": "00000000-0000-0000-16df-9d6ac76bd322",
+            "fired": null,
+            "input": "go",
+            "type": "child",
+            "watch": null
+          }
+        },
+        "rev": 4,
+        "seq": 1
+      },
+      {
+        "change": {
+          "change": "updated",
+          "index": 0,
+          "item": {
+            "call": 1,
+            "child": "00000000-0000-0000-16df-9d6ac76bd322",
+            "fired": null,
+            "input": "go",
+            "type": "child",
+            "watch": 2
+          },
+          "part": "watch"
+        },
+        "rev": 5,
+        "seq": 2
+      },
+      {
+        "change": {
+          "change": "updated",
+          "index": 0,
+          "item": {
+            "call": 1,
+            "child": "00000000-0000-0000-16df-9d6ac76bd322",
+            "fired": {
+              "status": "interrupted"
+            },
+            "input": "go",
+            "type": "child",
+            "watch": 2
+          },
+          "part": "outcome"
+        },
+        "rev": 6,
+        "seq": 3
+      },
+      {
+        "change": {
+          "change": "error",
+          "message": "e"
+        },
+        "rev": 7,
+        "seq": 3
+      },
+      {
+        "change": {
+          "change": "added",
+          "index": 1,
+          "item": {
+            "decision": {
+              "block": {
+                "reason": "no",
+                "tool": "t"
+              }
+            },
+            "hook": "policy",
+            "seq": 5,
+            "type": "hook"
+          }
+        },
+        "rev": 8,
+        "seq": 5
+      },
+      {
+        "change": {
+          "change": "error",
+          "message": "e"
+        },
+        "rev": 9,
+        "seq": 5
+      },
+      {
+        "change": {
+          "change": "error",
+          "message": "e"
+        },
+        "rev": 10,
+        "seq": 5
+      },
+      {
+        "change": {
+          "change": "error",
+          "message": "e"
+        },
+        "rev": 11,
+        "seq": 5
+      },
+      {
+        "change": {
+          "change": "added",
+          "index": 2,
+          "item": {
+            "call": 6,
+            "model": "m",
+            "status": {
+              "status": "running"
+            },
+            "text": "",
+            "type": "reply",
+            "usage": null
+          }
+        },
+        "rev": 12,
+        "seq": 6
+      },
+      {
+        "change": {
+          "call": 6,
+          "change": "delta",
+          "text": "r"
+        },
+        "rev": 13,
+        "seq": 6
+      },
+      {
+        "change": {
+          "call": 6,
+          "change": "delta",
+          "text": "ep"
+        },
+        "rev": 14,
+        "seq": 6
+      },
+      {
+        "change": {
+          "call": 6,
+          "change": "delta",
+          "text": "ly "
+        },
+        "rev": 15,
+        "seq": 6
+      },
+      {
+        "change": {
+          "call": 6,
+          "change": "delta",
+          "text": "3"
+        },
+        "rev": 16,
+        "seq": 6
+      },
+      {
+        "change": {
+          "call": 6,
+          "change": "delta",
+          "text": "2"
+        },
+        "rev": 17,
+        "seq": 6
+      },
+      {
+        "change": {
+          "change": "added",
+          "index": 3,
+          "item": {
+            "seq": 8,
+            "text": "a69",
+            "type": "assistant"
+          }
+        },
+        "rev": 18,
+        "seq": 8
+      },
+      {
+        "change": {
+          "change": "added",
+          "index": 4,
+          "item": {
+            "approval": null,
+            "call": 9,
+            "input": {
+              "command": "echo 7"
+            },
+            "outcome": null,
+            "tool": "run_command",
+            "type": "tool"
+          }
+        },
+        "rev": 19,
+        "seq": 9
+      },
+      {
+        "change": {
+          "change": "updated",
+          "index": 4,
+          "item": {
+            "approval": "pending",
+            "call": 9,
+            "input": {
+              "command": "echo 7"
+            },
+            "outcome": null,
+            "tool": "run_command",
+            "type": "tool"
+          },
+          "part": "approval"
+        },
+        "rev": 20,
+        "seq": 10
+      },
+      {
+        "change": {
+          "change": "asked",
+          "index": 4,
+          "item": {
+            "approval": "pending",
+            "call": 9,
+            "input": {
+              "command": "echo 7"
+            },
+            "outcome": null,
+            "tool": "run_command",
+            "type": "tool"
+          }
+        },
+        "rev": 21,
+        "seq": 10
+      },
+      {
+        "change": {
+          "change": "updated",
+          "index": 4,
+          "item": {
+            "approval": "denied",
+            "call": 9,
+            "input": {
+              "command": "echo 7"
+            },
+            "outcome": null,
+            "tool": "run_command",
+            "type": "tool"
+          },
+          "part": "approval"
+        },
+        "rev": 22,
+        "seq": 11
+      },
+      {
+        "change": {
+          "change": "updated",
+          "index": 4,
+          "item": {
+            "approval": "denied",
+            "call": 9,
+            "input": {
+              "command": "echo 7"
+            },
+            "outcome": {
+              "output": {
+                "exit": 0,
+                "stderr": "",
+                "stdout": "x\n"
+              },
+              "status": "done"
+            },
+            "tool": "run_command",
+            "type": "tool"
+          },
+          "part": "outcome"
+        },
+        "rev": 23,
+        "seq": 13
+      },
+      {
+        "change": {
+          "change": "added",
+          "index": 5,
+          "item": {
+            "call": 14,
+            "model": "m",
+            "status": {
+              "status": "running"
+            },
+            "text": "",
+            "type": "reply",
+            "usage": null
+          }
+        },
+        "rev": 24,
+        "seq": 14
+      },
+      {
+        "change": {
+          "call": 14,
+          "change": "delta",
+          "text": "r"
+        },
+        "rev": 25,
+        "seq": 14
+      },
+      {
+        "change": {
+          "call": 14,
+          "change": "delta",
+          "text": "ep"
+        },
+        "rev": 26,
+        "seq": 14
+      },
+      {
+        "change": {
+          "call": 14,
+          "change": "delta",
+          "text": "l"
+        },
+        "rev": 27,
+        "seq": 14
+      },
+      {
+        "change": {
+          "call": 14,
+          "change": "delta",
+          "text": "y "
+        },
+        "rev": 28,
+        "seq": 14
+      },
+      {
+        "change": {
+          "call": 14,
+          "change": "delta",
+          "text": "48"
+        },
+        "rev": 29,
+        "seq": 14
+      },
+      {
+        "change": {
+          "call": 14,
+          "change": "delta",
+          "text": "2"
+        },
+        "rev": 30,
+        "seq": 14
+      },
+      {
+        "change": {
+          "change": "updated",
+          "index": 5,
+          "item": {
+            "call": 14,
+            "model": "m",
+            "status": {
+              "status": "done"
+            },
+            "text": "reply 482",
+            "type": "reply",
+            "usage": {
+              "input": 3,
+              "output": 5
+            }
+          },
+          "part": "outcome"
+        },
+        "rev": 31,
+        "seq": 15
+      },
+      {
+        "change": {
+          "change": "added",
+          "index": 6,
+          "item": {
+            "call": 16,
+            "child": "00000000-0000-0000-8c31-dc059121ada3",
+            "fired": null,
+            "input": "go",
+            "type": "child",
+            "watch": null
+          }
+        },
+        "rev": 32,
+        "seq": 16
+      },
+      {
+        "change": {
+          "change": "updated",
+          "index": 6,
+          "item": {
+            "call": 16,
+            "child": "00000000-0000-0000-8c31-dc059121ada3",
+            "fired": null,
+            "input": "go",
+            "type": "child",
+            "watch": 17
+          },
+          "part": "watch"
+        },
+        "rev": 33,
+        "seq": 17
+      },
+      {
+        "change": {
+          "change": "updated",
+          "index": 6,
+          "item": {
+            "call": 16,
+            "child": "00000000-0000-0000-8c31-dc059121ada3",
+            "fired": {
+              "output": {
+                "slept": 1
+              },
+              "status": "done"
+            },
+            "input": "go",
+            "type": "child",
+            "watch": 17
+          },
+          "part": "outcome"
+        },
+        "rev": 34,
+        "seq": 18
+      },
+      {
+        "change": {
+          "change": "added",
+          "index": 7,
+          "item": {
+            "decision": {
+              "block": {
+                "reason": "no",
+                "tool": "t"
+              }
+            },
+            "hook": "policy",
+            "seq": 19,
+            "type": "hook"
+          }
+        },
+        "rev": 35,
+        "seq": 19
+      },
+      {
+        "change": {
+          "change": "error",
+          "message": "e"
+        },
+        "rev": 36,
+        "seq": 19
+      },
+      {
+        "change": {
+          "change": "added",
+          "index": 8,
+          "item": {
+            "call": 20,
+            "model": "m",
+            "status": {
+              "status": "running"
+            },
+            "text": "",
+            "type": "reply",
+            "usage": null
+          }
+        },
+        "rev": 37,
+        "seq": 20
+      },
+      {
+        "change": {
+          "call": 20,
+          "change": "delta",
+          "text": "r"
+        },
+        "rev": 38,
+        "seq": 20
+      },
+      {
+        "change": {
+          "call": 20,
+          "change": "delta",
+          "text": "e"
+        },
+        "rev": 39,
+        "seq": 20
+      },
+      {
+        "change": {
+          "call": 20,
+          "change": "delta",
+          "text": "ply "
+        },
+        "rev": 40,
+        "seq": 20
+      },
+      {
+        "change": {
+          "call": 20,
+          "change": "delta",
+          "text": "467"
+        },
+        "rev": 41,
+        "seq": 20
+      },
+      {
+        "change": {
+          "change": "updated",
+          "index": 8,
+          "item": {
+            "call": 20,
+            "model": "m",
+            "status": {
+              "status": "done"
+            },
+            "text": "reply 467",
+            "type": "reply",
+            "usage": {
+              "input": 3,
+              "output": 5
+            }
+          },
+          "part": "outcome"
+        },
+        "rev": 42,
+        "seq": 21
+      },
+      {
+        "change": {
+          "change": "added",
+          "index": 9,
+          "item": {
+            "seq": 22,
+            "text": "u47",
+            "type": "user"
+          }
+        },
+        "rev": 43,
+        "seq": 22
+      },
+      {
+        "change": {
+          "change": "added",
+          "index": 10,
+          "item": {
+            "seq": 23,
+            "text": "u13",
+            "type": "user"
+          }
+        },
+        "rev": 44,
+        "seq": 23
+      },
+      {
+        "change": {
+          "change": "added",
+          "index": 11,
+          "item": {
+            "call": 25,
+            "child": "00000000-0000-0000-0ceb-9e68e19650bf",
+            "fired": null,
+            "input": "go",
+            "type": "child",
+            "watch": null
+          }
+        },
+        "rev": 45,
+        "seq": 25
+      },
+      {
+        "change": {
+          "change": "updated",
+          "index": 11,
+          "item": {
+            "call": 25,
+            "child": "00000000-0000-0000-0ceb-9e68e19650bf",
+            "fired": null,
+            "input": "go",
+            "type": "child",
+            "watch": 26
+          },
+          "part": "watch"
+        },
+        "rev": 46,
+        "seq": 26
+      },
+      {
+        "change": {
+          "change": "updated",
+          "index": 11,
+          "item": {
+            "call": 25,
+            "child": "00000000-0000-0000-0ceb-9e68e19650bf",
+            "fired": {
+              "error": "f",
+              "status": "failed"
+            },
+            "input": "go",
+            "type": "child",
+            "watch": 26
+          },
+          "part": "outcome"
+        },
+        "rev": 47,
+        "seq": 27
+      },
+      {
+        "change": {
+          "change": "added",
+          "index": 12,
+          "item": {
+            "approval": null,
+            "call": 28,
+            "input": {
+              "command": "echo 3"
+            },
+            "outcome": null,
+            "tool": "run_command",
+            "type": "tool"
+          }
+        },
+        "rev": 48,
+        "seq": 28
+      },
+      {
+        "change": {
+          "change": "updated",
+          "index": 12,
+          "item": {
+            "approval": "pending",
+            "call": 28,
+            "input": {
+              "command": "echo 3"
+            },
+            "outcome": null,
+            "tool": "run_command",
+            "type": "tool"
+          },
+          "part": "approval"
+        },
+        "rev": 49,
+        "seq": 29
+      },
+      {
+        "change": {
+          "change": "asked",
+          "index": 12,
+          "item": {
+            "approval": "pending",
+            "call": 28,
+            "input": {
+              "command": "echo 3"
+            },
+            "outcome": null,
+            "tool": "run_command",
+            "type": "tool"
+          }
+        },
+        "rev": 50,
+        "seq": 29
+      },
+      {
+        "change": {
+          "change": "added",
+          "index": 13,
+          "item": {
+            "seq": 30,
+            "text": "a38",
+            "type": "assistant"
+          }
+        },
+        "rev": 51,
+        "seq": 30
+      }
+    ]
+  },
+  {
+    "hash": "0e6018bfe9d70435",
+    "messages": [
+      {
+        "session": "00000000-0000-0000-0000-00000000000a",
+        "t": "attached",
+        "workspace": "/w"
+      },
+      {
+        "seq": 0,
+        "t": "synced"
+      },
+      {
+        "asks": 0,
+        "failed": 0,
+        "prompt": null,
+        "reply": null,
+        "running": 0,
+        "t": "recap",
+        "tools": []
+      },
+      {
+        "epoch": 0,
+        "input": {
+          "command": "echo 1"
+        },
+        "kind": "tool_call",
+        "seq": 1,
+        "t": "entry",
+        "tool": "run_command"
+      },
+      {
+        "call": 1,
+        "epoch": 0,
+        "kind": "ask",
+        "seq": 2,
+        "t": "entry"
+      },
+      {
+        "call": 1,
+        "input": {
+          "command": "echo 1"
+        },
+        "t": "ask",
+        "tool": "run_command"
+      },
+      {
+        "decision": {
+          "approval": {
+            "approved": false,
+            "call": 1,
+            "tool": "run_command"
+          }
+        },
+        "epoch": 0,
+        "hook": "user",
+        "kind": "hook",
+        "seq": 3,
+        "t": "entry"
+      },
+      {
+        "call": 1,
+        "epoch": 0,
+        "kind": "tool_result",
+        "outcome": {
+          "output": {
+            "exit": 0,
+            "stderr": "",
+            "stdout": "x\n"
+          },
+          "status": "done"
+        },
+        "seq": 4,
+        "t": "entry"
+      },
+      {
+        "child": "00000000-0000-0000-77d3-d4856d3c62a6",
+        "epoch": 0,
+        "input": "go",
+        "kind": "link",
+        "seq": 5,
+        "t": "entry"
+      },
+      {
+        "child": "00000000-0000-0000-77d3-d4856d3c62a6",
+        "epoch": 0,
+        "kind": "watch",
+        "seq": 6,
+        "t": "entry"
+      },
+      {
+        "epoch": 0,
+        "kind": "fired",
+        "outcome": {
+          "output": {
+            "slept": 1
+          },
+          "status": "done"
+        },
+        "seq": 7,
+        "t": "entry",
+        "watch": 6
+      },
+      {
+        "message": "e",
+        "t": "error"
+      },
+      {
+        "message": "e",
+        "t": "error"
+      },
+      {
+        "epoch": 0,
+        "kind": "assistant",
+        "seq": 8,
+        "t": "entry",
+        "text": "a11"
+      }
+    ],
+    "name": "generated session 11",
+    "state": {
+      "environment": null,
+      "items": [
+        {
+          "approval": "denied",
+          "call": 1,
+          "input": {
+            "command": "echo 1"
+          },
+          "outcome": {
+            "output": {
+              "exit": 0,
+              "stderr": "",
+              "stdout": "x\n"
+            },
+            "status": "done"
+          },
+          "tool": "run_command",
+          "type": "tool"
+        },
+        {
+          "call": 5,
+          "child": "00000000-0000-0000-77d3-d4856d3c62a6",
+          "fired": {
+            "output": {
+              "slept": 1
+            },
+            "status": "done"
+          },
+          "input": "go",
+          "type": "child",
+          "watch": 6
+        },
+        {
+          "seq": 8,
+          "text": "a11",
+          "type": "assistant"
+        }
+      ],
+      "seq": 8,
+      "session": "00000000-0000-0000-0000-00000000000a",
+      "workspace": "/w"
+    },
+    "updates": [
+      {
+        "change": {
+          "change": "attached",
+          "reset": true,
+          "session": "00000000-0000-0000-0000-00000000000a",
+          "workspace": "/w"
+        },
+        "rev": 1,
+        "seq": 0
+      },
+      {
+        "change": {
+          "change": "synced"
+        },
+        "rev": 2,
+        "seq": 0
+      },
+      {
+        "change": {
+          "asks": 0,
+          "change": "recap",
+          "failed": 0,
+          "prompt": null,
+          "reply": null,
+          "running": 0,
+          "tools": []
+        },
+        "rev": 3,
+        "seq": 0
+      },
+      {
+        "change": {
+          "change": "added",
+          "index": 0,
+          "item": {
+            "approval": null,
+            "call": 1,
+            "input": {
+              "command": "echo 1"
+            },
+            "outcome": null,
+            "tool": "run_command",
+            "type": "tool"
+          }
+        },
+        "rev": 4,
+        "seq": 1
+      },
+      {
+        "change": {
+          "change": "updated",
+          "index": 0,
+          "item": {
+            "approval": "pending",
+            "call": 1,
+            "input": {
+              "command": "echo 1"
+            },
+            "outcome": null,
+            "tool": "run_command",
+            "type": "tool"
+          },
+          "part": "approval"
+        },
+        "rev": 5,
+        "seq": 2
+      },
+      {
+        "change": {
+          "change": "asked",
+          "index": 0,
+          "item": {
+            "approval": "pending",
+            "call": 1,
+            "input": {
+              "command": "echo 1"
+            },
+            "outcome": null,
+            "tool": "run_command",
+            "type": "tool"
+          }
+        },
+        "rev": 6,
+        "seq": 2
+      },
+      {
+        "change": {
+          "change": "updated",
+          "index": 0,
+          "item": {
+            "approval": "denied",
+            "call": 1,
+            "input": {
+              "command": "echo 1"
+            },
+            "outcome": null,
+            "tool": "run_command",
+            "type": "tool"
+          },
+          "part": "approval"
+        },
+        "rev": 7,
+        "seq": 3
+      },
+      {
+        "change": {
+          "change": "updated",
+          "index": 0,
+          "item": {
+            "approval": "denied",
+            "call": 1,
+            "input": {
+              "command": "echo 1"
+            },
+            "outcome": {
+              "output": {
+                "exit": 0,
+                "stderr": "",
+                "stdout": "x\n"
+              },
+              "status": "done"
+            },
+            "tool": "run_command",
+            "type": "tool"
+          },
+          "part": "outcome"
+        },
+        "rev": 8,
+        "seq": 4
+      },
+      {
+        "change": {
+          "change": "added",
+          "index": 1,
+          "item": {
+            "call": 5,
+            "child": "00000000-0000-0000-77d3-d4856d3c62a6",
+            "fired": null,
+            "input": "go",
+            "type": "child",
+            "watch": null
+          }
+        },
+        "rev": 9,
+        "seq": 5
+      },
+      {
+        "change": {
+          "change": "updated",
+          "index": 1,
+          "item": {
+            "call": 5,
+            "child": "00000000-0000-0000-77d3-d4856d3c62a6",
+            "fired": null,
+            "input": "go",
+            "type": "child",
+            "watch": 6
+          },
+          "part": "watch"
+        },
+        "rev": 10,
+        "seq": 6
+      },
+      {
+        "change": {
+          "change": "updated",
+          "index": 1,
+          "item": {
+            "call": 5,
+            "child": "00000000-0000-0000-77d3-d4856d3c62a6",
+            "fired": {
+              "output": {
+                "slept": 1
+              },
+              "status": "done"
+            },
+            "input": "go",
+            "type": "child",
+            "watch": 6
+          },
+          "part": "outcome"
+        },
+        "rev": 11,
+        "seq": 7
+      },
+      {
+        "change": {
+          "change": "error",
+          "message": "e"
+        },
+        "rev": 12,
+        "seq": 7
+      },
+      {
+        "change": {
+          "change": "error",
+          "message": "e"
+        },
+        "rev": 13,
+        "seq": 7
+      },
+      {
+        "change": {
+          "change": "added",
+          "index": 2,
+          "item": {
+            "seq": 8,
+            "text": "a11",
+            "type": "assistant"
+          }
+        },
+        "rev": 14,
+        "seq": 8
+      }
+    ]
+  }
+]

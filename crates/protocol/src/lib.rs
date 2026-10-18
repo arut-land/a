@@ -14,6 +14,8 @@ pub const PROTO: u32 = 1;
 
 const MAX_FRAME: u32 = 16 * 1024 * 1024;
 
+pub mod view;
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(transparent)]
 pub struct SessionId(pub Uuid);
@@ -294,7 +296,7 @@ pub enum Target {
     Id(SessionId),
 }
 
-#[derive(Clone, Debug, Serialize, Deserialize)]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SessionSummary {
     pub id: SessionId,
     pub workspace: PathBuf,
@@ -396,6 +398,14 @@ pub enum DaemonMsg {
     Error {
         message: String,
     },
+    /// A message, or an entry, of a kind this build does not know: a newer
+    /// daemon's. Never sent; decoding yields it so a client skips what it
+    /// cannot show instead of dropping the connection. `seq` is the
+    /// entry's.
+    #[serde(skip)]
+    Unknown {
+        seq: Option<u64>,
+    },
 }
 
 /// Writes one frame: a little-endian u32 length followed by a JSON body.
@@ -426,7 +436,69 @@ macro_rules! decode {
         }
     )*};
 }
-decode!(Entry, ClientMsg, DaemonMsg);
+decode!(Entry, ClientMsg);
+
+/// Unknown kinds never abort a client; a known one that is malformed does.
+impl Decode for DaemonMsg {
+    fn from_json(bytes: &[u8]) -> serde_json::Result<Self> {
+        /// Just the tags of a message.
+        #[derive(Deserialize)]
+        struct Tags {
+            t: String,
+            #[serde(default)]
+            seq: Option<u64>,
+            #[serde(default)]
+            kind: Option<String>,
+        }
+        serde_json::from_slice(bytes).or_else(|e| match serde_json::from_slice::<Tags>(bytes) {
+            Ok(Tags { t, .. }) if !known_msg(&t) => Ok(Self::Unknown { seq: None }),
+            Ok(Tags {
+                t,
+                seq,
+                kind: Some(kind),
+            }) if t == "entry" && !known_kind(&kind) => Ok(Self::Unknown { seq }),
+            _ => Err(e),
+        })
+    }
+}
+
+/// The `t` of every [`DaemonMsg`] this build sends.
+fn known_msg(t: &str) -> bool {
+    matches!(
+        t,
+        "welcome"
+            | "mismatch"
+            | "draining"
+            | "attached"
+            | "entry"
+            | "delta"
+            | "synced"
+            | "sessions"
+            | "recap"
+            | "ask"
+            | "error"
+    )
+}
+
+/// The `kind` of every [`Body`] this build logs.
+fn known_kind(kind: &str) -> bool {
+    matches!(
+        kind,
+        "user"
+            | "assistant"
+            | "tool_call"
+            | "tool_process"
+            | "tool_result"
+            | "model_call"
+            | "model_result"
+            | "hook"
+            | "ask"
+            | "link"
+            | "watch"
+            | "fired"
+            | "environment"
+    )
+}
 
 /// Reads one frame; `Ok(None)` means the peer closed the stream cleanly.
 pub fn read_frame<T: Decode>(r: &mut impl Read) -> io::Result<Option<T>> {
@@ -574,6 +646,142 @@ mod tests {
             serde_json::to_value(&by_user).unwrap()["decision"]["approval"]["call"],
             3
         );
+    }
+
+    #[test]
+    fn unknown_kinds_are_skipped_and_malformed_known_ones_are_fatal() {
+        let msg = |json: &str| DaemonMsg::from_json(json.as_bytes());
+        assert!(matches!(
+            msg(r#"{"t":"presence","who":1}"#),
+            Ok(DaemonMsg::Unknown { seq: None })
+        ));
+        assert!(matches!(
+            msg(r#"{"t":"entry","seq":4,"epoch":0,"kind":"later","x":1}"#),
+            Ok(DaemonMsg::Unknown { seq: Some(4) })
+        ));
+        assert!(msg(r#"{"t":"entry","seq":4,"epoch":0,"kind":"user"}"#).is_err());
+        assert!(msg(r#"{"t":"synced"}"#).is_err());
+        assert!(msg(r#"{"seq":1}"#).is_err());
+    }
+
+    /// The matches fail to compile when a variant is added, so that it is
+    /// added to the known tags as well.
+    #[test]
+    #[allow(clippy::too_many_lines)]
+    fn every_tag_this_build_sends_is_known() {
+        let child = SessionId(Uuid::from_u128(1));
+        let bodies = [
+            Body::User { text: "u".into() },
+            Body::Assistant { text: "a".into() },
+            Body::ToolCall {
+                tool: "t".into(),
+                input: Value::Null,
+                id: None,
+            },
+            Body::ToolProcess {
+                call: 1,
+                pgid: 1,
+                boot: "b".into(),
+            },
+            Body::ToolResult {
+                call: 1,
+                outcome: Outcome::Interrupted,
+            },
+            Body::ModelCall { model: "m".into() },
+            Body::ModelResult {
+                call: 1,
+                outcome: Outcome::Interrupted,
+            },
+            Body::Hook {
+                hook: "h".into(),
+                decision: Decision::OnStop { text: "t".into() },
+            },
+            Body::Ask { call: 1 },
+            Body::Link {
+                child,
+                input: "i".into(),
+            },
+            Body::Watch { child },
+            Body::Fired {
+                watch: 1,
+                outcome: Outcome::Interrupted,
+            },
+            Body::Environment(Environment::default()),
+        ];
+        for body in &bodies {
+            match body {
+                Body::User { .. }
+                | Body::Assistant { .. }
+                | Body::ToolCall { .. }
+                | Body::ToolProcess { .. }
+                | Body::ToolResult { .. }
+                | Body::ModelCall { .. }
+                | Body::ModelResult { .. }
+                | Body::Hook { .. }
+                | Body::Ask { .. }
+                | Body::Link { .. }
+                | Body::Watch { .. }
+                | Body::Fired { .. }
+                | Body::Environment(_) => {}
+            }
+            let json = serde_json::to_value(body).unwrap();
+            assert!(known_kind(json["kind"].as_str().unwrap()), "{json}");
+        }
+        let msgs = [
+            DaemonMsg::Welcome {
+                proto: PROTO,
+                build: "b".into(),
+            },
+            DaemonMsg::Mismatch { supported: PROTO },
+            DaemonMsg::Draining,
+            DaemonMsg::Attached {
+                session: child,
+                workspace: "/w".into(),
+            },
+            DaemonMsg::Entry(Entry {
+                seq: 1,
+                epoch: 0,
+                body: Body::Ask { call: 1 },
+            }),
+            DaemonMsg::Delta {
+                call: 1,
+                text: "t".into(),
+            },
+            DaemonMsg::Synced { seq: 1 },
+            DaemonMsg::Sessions { sessions: vec![] },
+            DaemonMsg::Recap(Recap::default()),
+            DaemonMsg::Ask {
+                call: 1,
+                tool: "t".into(),
+                input: Value::Null,
+            },
+            DaemonMsg::Error {
+                message: "m".into(),
+            },
+        ];
+        for msg in &msgs {
+            match msg {
+                DaemonMsg::Unknown { .. } => unreachable!(),
+                DaemonMsg::Welcome { .. }
+                | DaemonMsg::Mismatch { .. }
+                | DaemonMsg::Draining
+                | DaemonMsg::Attached { .. }
+                | DaemonMsg::Entry(_)
+                | DaemonMsg::Delta { .. }
+                | DaemonMsg::Synced { .. }
+                | DaemonMsg::Sessions { .. }
+                | DaemonMsg::Recap(_)
+                | DaemonMsg::Ask { .. }
+                | DaemonMsg::Error { .. } => {}
+            }
+            let json = serde_json::to_vec(msg).unwrap();
+            let tags: Value = serde_json::from_slice(&json).unwrap();
+            assert!(known_msg(tags["t"].as_str().unwrap()), "{tags}");
+            assert!(!matches!(
+                DaemonMsg::from_json(&json),
+                Ok(DaemonMsg::Unknown { .. })
+            ));
+        }
     }
 
     #[test]

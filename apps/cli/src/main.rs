@@ -1,12 +1,12 @@
 use std::io::{self, BufRead, IsTerminal, Write};
+use std::mem;
 use std::process::ExitCode;
 use std::sync::{Arc, Mutex, PoisonError};
 use std::thread;
 
 use client::Endpoint;
-use protocol::{
-    Body, ClientMsg, DaemonMsg, Decision, Outcome, Recap, SessionId, SessionSummary, Target,
-};
+use protocol::view::{Approval, Change, Item, Link, Part, SessionList, SessionView, Status, Usage};
+use protocol::{ClientMsg, DaemonMsg, Outcome, Recap, SessionId, SessionSummary, Target};
 use sys::{Home, Staged};
 use usage_rs::{Cli, Subcommands};
 
@@ -232,24 +232,32 @@ fn repl(ctx: Ctx, target: Target) -> io::Result<()> {
     let remote = remote.is_some();
     let writer = Arc::new(Mutex::new(writer));
     let swap = Arc::clone(&writer);
-    let asks = Arc::new(Mutex::new(Vec::new()));
-    let mut view = View {
-        asks: Arc::clone(&asks),
-        ..View::default()
-    };
+    // Shared with the input loop, which answers the first call asked.
+    let view = Arc::new(Mutex::new(SessionView::default()));
+    let folding = Arc::clone(&view);
     thread::spawn(move || {
+        let mut screen = Screen::default();
+        let lock = || folding.lock().unwrap_or_else(PoisonError::into_inner);
         loop {
             while let Ok(Some(msg)) = reader.recv() {
-                view.show(&msg);
+                if let Some(update) = lock().fold(&msg) {
+                    screen.show(&update.change);
+                }
             }
-            let Some(session) = view.session.filter(|_| view.draining) else {
+            let (session, since) = {
+                let view = lock();
+                (
+                    view.session.filter(|_| view.link == Link::Draining),
+                    view.seq,
+                )
+            };
+            let Some(session) = session else {
                 eprintln!("[daemon disconnected]");
                 std::process::exit(1);
             };
-            view.draining = false;
             eprintln!("[daemon upgraded; reconnecting]");
             let mut writer = swap.lock().unwrap_or_else(PoisonError::into_inner);
-            match attach(&ctx, Target::Id(session), view.seq) {
+            match attach(&ctx, Target::Id(session), since) {
                 Ok(conn) => (reader, *writer) = (conn.reader, conn.writer),
                 Err(e) => {
                     eprintln!("[reconnect failed: {e}]");
@@ -267,11 +275,11 @@ fn repl(ctx: Ctx, target: Target) -> io::Result<()> {
     };
     for line in io::stdin().lock().lines() {
         let line = line?;
-        let asked = asks
+        let asked = view
             .lock()
             .unwrap_or_else(PoisonError::into_inner)
-            .first()
-            .copied();
+            .asked()
+            .next();
         let msg = match (line.trim(), asked) {
             ("", _) => continue,
             ("/detach", _) => break,
@@ -311,29 +319,22 @@ fn repl(ctx: Ctx, target: Target) -> io::Result<()> {
     Ok(())
 }
 
-/// Renders daemon messages. A model reply streams in as deltas; on replay
-/// there are none, so the committed text is printed instead. Remembers what
-/// a reconnect needs.
+/// Prints the shared view's updates as transcript lines. A model reply
+/// streams in as deltas; on replay there are none, so the committed text is
+/// printed instead.
 #[derive(Default)]
-struct View {
+struct Screen {
+    /// The call whose streamed reply is on the current line.
     streaming: Option<u64>,
-    session: Option<SessionId>,
-    /// The last entry seen, so a reconnect replays only what came after.
-    seq: u64,
-    draining: bool,
-    /// Calls waiting for approval, oldest first; `y` or `n` answers the
-    /// first.
-    asks: Arc<Mutex<Vec<u64>>>,
 }
 
-impl View {
-    fn show(&mut self, msg: &DaemonMsg) {
-        match msg {
-            DaemonMsg::Attached { session, workspace } => {
-                self.session = Some(*session);
-                println!("[session {} · {}]", session.short(), workspace.display());
-            }
-            DaemonMsg::Delta { call, text } => {
+impl Screen {
+    fn show(&mut self, change: &Change) {
+        match change {
+            Change::Attached {
+                session, workspace, ..
+            } => println!("[session {} · {}]", session.short(), workspace.display()),
+            Change::Delta { call, text } => {
                 if self.streaming != Some(*call) {
                     self.streaming = Some(*call);
                     print!("a    ");
@@ -341,85 +342,87 @@ impl View {
                 print!("{text}");
                 let _ = io::stdout().flush();
             }
-            DaemonMsg::Entry(e) => {
-                self.seq = e.seq;
-                self.entry(&e.body);
-            }
-            DaemonMsg::Synced { seq } => self.seq = *seq,
-            DaemonMsg::Recap(recap) => println!("{}", recap_line(recap)),
-            DaemonMsg::Ask { call, tool, input } => {
-                let mut asks = self.asks.lock().unwrap_or_else(PoisonError::into_inner);
-                if !asks.contains(call) {
-                    asks.push(*call);
-                    println!("? approve {}  [y/n]", call_text(tool, input));
-                }
-            }
-            DaemonMsg::Draining => self.draining = true,
-            DaemonMsg::Welcome { .. } | DaemonMsg::Sessions { .. } => {}
-            DaemonMsg::Mismatch { supported } => eprintln!("[daemon speaks protocol {supported}]"),
-            DaemonMsg::Error { message } => eprintln!("[error: {message}]"),
+            Change::Added { item, .. } => added(item),
+            Change::Updated { item, part, .. } => self.updated(item, *part),
+            Change::Asked {
+                item: Item::Tool { tool, input, .. },
+                ..
+            } => println!("? approve {}  [y/n]", call_text(tool, input)),
+            Change::Recap(recap) => println!("{}", recap_line(recap)),
+            Change::Mismatch { supported } => eprintln!("[daemon speaks protocol {supported}]"),
+            Change::Error { message } => eprintln!("[error: {message}]"),
+            Change::Asked { .. } | Change::Synced | Change::Draining => {}
         }
     }
 
-    fn entry(&mut self, body: &Body) {
-        match body {
-            Body::User { text } => println!("you  {text}"),
-            Body::Assistant { text } => println!("a    {text}"),
-            Body::ToolCall { tool, input, .. } => println!("tool {}", call_text(tool, input)),
-            Body::ToolResult { outcome, .. } | Body::Fired { outcome, .. } => {
-                print_outcome(outcome);
-            }
-            Body::ModelResult { call, outcome } => {
+    fn updated(&mut self, item: &Item, part: Part) {
+        match (item, part) {
+            (
+                Item::Tool {
+                    outcome: Some(outcome),
+                    ..
+                }
+                | Item::Child {
+                    fired: Some(outcome),
+                    ..
+                },
+                Part::Outcome,
+            ) => print_outcome(outcome),
+            (
+                Item::Tool {
+                    approval: Some(answer @ (Approval::Approved | Approval::Denied)),
+                    ..
+                },
+                Part::Approval,
+            ) => println!(
+                "  · {}",
+                if *answer == Approval::Approved {
+                    "approved"
+                } else {
+                    "not approved"
+                }
+            ),
+            (
+                Item::Reply {
+                    call,
+                    text,
+                    status,
+                    usage,
+                    ..
+                },
+                Part::Outcome,
+            ) => {
                 // A streamed reply is on screen already; end its line.
                 if self.streaming.take() == Some(*call) {
                     println!();
-                } else if let Outcome::Done { output } = outcome
-                    && let text = reply_text(output)
-                    && !text.is_empty()
-                {
+                } else if *status == Status::Done && !text.is_empty() {
                     println!("a    {text}");
                 }
-                match outcome {
-                    Outcome::Done { output } => {
-                        let usage = &output["usage"];
-                        if let (Some(input), Some(out)) =
-                            (usage["input"].as_u64(), usage["output"].as_u64())
-                        {
-                            println!("     · {input} in, {out} out");
+                match status {
+                    Status::Done => {
+                        if let Some(Usage { input, output }) = usage {
+                            println!("     · {input} in, {output} out");
                         }
                     }
-                    Outcome::Failed { error } => println!("  └ model failed: {error}"),
-                    Outcome::Interrupted => println!("  └ model call interrupted"),
+                    Status::Failed { error } => println!("  └ model failed: {error}"),
+                    Status::Interrupted => println!("  └ model call interrupted"),
+                    Status::Running => {}
                 }
             }
-            Body::Hook {
-                decision:
-                    Decision::Approval {
-                        approved,
-                        call: Some(call),
-                        ..
-                    },
-                ..
-            } => {
-                let mut asks = self.asks.lock().unwrap_or_else(PoisonError::into_inner);
-                asks.retain(|c| c != call);
-                println!(
-                    "  · {}",
-                    if *approved {
-                        "approved"
-                    } else {
-                        "not approved"
-                    }
-                );
-            }
-            Body::Hook { hook, decision } => println!("  · hook {hook}: {decision:?}"),
-            Body::Link { child, input } => println!("child {} {input}", child.short()),
-            Body::Environment(env) => println!("  · env {}", env.cwd.display()),
-            Body::ToolProcess { .. }
-            | Body::ModelCall { .. }
-            | Body::Ask { .. }
-            | Body::Watch { .. } => {}
+            _ => {}
         }
+    }
+}
+
+fn added(item: &Item) {
+    match item {
+        Item::User { text, .. } => println!("you  {text}"),
+        Item::Assistant { text, .. } => println!("a    {text}"),
+        Item::Tool { tool, input, .. } => println!("tool {}", call_text(tool, input)),
+        Item::Hook { hook, decision, .. } => println!("  · hook {hook}: {decision:?}"),
+        Item::Child { child, input, .. } => println!("child {} {input}", child.short()),
+        Item::Environment { cwd, .. } => println!("  · env {}", cwd.display()),
+        Item::Reply { .. } => {}
     }
 }
 
@@ -457,22 +460,6 @@ fn recap_line(recap: &Recap) -> String {
     parts.join(" · ") + "]"
 }
 
-/// The answer text of a stored model reply: its message's text parts, or
-/// the bare text an earlier version logged.
-fn reply_text(output: &serde_json::Value) -> String {
-    match output
-        .pointer("/message/content")
-        .and_then(serde_json::Value::as_array)
-    {
-        Some(parts) => parts
-            .iter()
-            .filter(|part| part["type"] == "text")
-            .filter_map(|part| part["text"].as_str())
-            .collect(),
-        None => output["text"].as_str().unwrap_or_default().to_owned(),
-    }
-}
-
 fn print_outcome(outcome: &Outcome) {
     match outcome {
         Outcome::Done { output } => {
@@ -499,10 +486,8 @@ fn list(
     }: client::Connection,
 ) -> io::Result<Vec<SessionSummary>> {
     writer.send(&ClientMsg::List)?;
-    reader.until(|msg| match msg {
-        DaemonMsg::Sessions { sessions } => Some(sessions),
-        _ => None,
-    })
+    let mut list = SessionList::default();
+    reader.until(|msg| list.fold(&msg).then(|| mem::take(&mut list.sessions)))
 }
 
 fn ls(ctx: &Ctx) -> io::Result<()> {

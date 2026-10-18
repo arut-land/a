@@ -11,6 +11,7 @@ use std::path::{Path, PathBuf};
 use std::process::{Child, ChildStdin, ChildStdout, Command, Output, Stdio};
 use std::time::{Duration, Instant};
 
+use protocol::view::SessionView;
 use protocol::{Body, ClientMsg, DaemonMsg, Entry, Outcome, PROTO, SessionId, Target};
 use sys::{Home, Signal};
 
@@ -137,6 +138,7 @@ impl Env {
         let mut conn = Conn {
             reader: BufReader::new(stream.try_clone().unwrap()),
             writer: stream,
+            view: SessionView::default(),
         };
         conn.send(&ClientMsg::Hello {
             proto: PROTO,
@@ -198,6 +200,8 @@ impl Drop for Env {
 pub struct Conn {
     reader: BufReader<UnixStream>,
     writer: UnixStream,
+    /// Everything received, folded as a client's view.
+    pub view: SessionView,
 }
 
 impl Conn {
@@ -206,9 +210,11 @@ impl Conn {
     }
 
     pub fn recv(&mut self) -> DaemonMsg {
-        protocol::read_frame(&mut self.reader)
+        let msg = protocol::read_frame(&mut self.reader)
             .unwrap()
-            .expect("daemon closed the connection")
+            .expect("daemon closed the connection");
+        self.view.fold(&msg);
+        msg
     }
 
     pub fn input(&mut self, text: &str) {
