@@ -29,7 +29,9 @@ usage-rs = { version = "=7.0.2", default-features = false, features = ["help", "
 uuid = { version = "1", default-features = false, features = ["std", "v7", "serde"] }
 
 [workspace.lints.rust]
-# deny, not forbid: the sys crate is the single place allowed to opt out.
+# deny, not forbid: `sys` opts out for OS calls, and tests may opt out locally
+# (e.g. a counting global allocator) with an `#[allow(unsafe_code)]` and a
+# SAFETY comment.
 unsafe_code = "deny"
 unused_qualifications = "warn"
 
