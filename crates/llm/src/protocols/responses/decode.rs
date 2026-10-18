@@ -6,7 +6,6 @@
 //! one those fields do not fit, is read as a `Value`.
 
 use std::borrow::Cow;
-use std::collections::HashSet;
 
 use serde::Deserialize;
 use serde::de::{self, Deserializer};
@@ -562,7 +561,7 @@ impl ResponsesDecoder {
         index: usize,
         item: &Value,
         output: &[Value],
-        taken: &HashSet<usize>,
+        taken: &[usize],
     ) -> Option<usize> {
         let (id, kind) = (item_id(item), Item::of(item));
         let free = |at: &usize| !taken.contains(at) && self.slots[*at].kind == kind;
@@ -591,7 +590,7 @@ impl ResponsesDecoder {
             let open = Open::Reasoning { redacted: false };
             self.w.whole(0, open, Value::Null, reasoning)?;
         }
-        let mut taken = HashSet::new();
+        let mut taken = Vec::new();
         for (index, item) in output.iter().enumerate() {
             if !item.is_object() {
                 continue;
@@ -599,7 +598,7 @@ impl ResponsesDecoder {
             let slot = match self.restated(index, item, output, &taken) {
                 Some(slot) if self.slots[slot].open => slot,
                 Some(slot) => {
-                    taken.insert(slot);
+                    taken.push(slot);
                     let Slot { at, kind, .. } = self.slots[slot];
                     // Reasoning done without its ciphertext takes the
                     // terminal's.
@@ -619,7 +618,7 @@ impl ResponsesDecoder {
                     self.added(index, item)?
                 }
             };
-            taken.insert(slot);
+            taken.push(slot);
             self.done(slot, item.clone())?;
         }
         // Reasoning still waiting is complete when nothing after it is left
