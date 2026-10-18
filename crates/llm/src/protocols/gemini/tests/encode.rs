@@ -267,7 +267,11 @@ fn call_ids_follow_the_models_that_take_them() {
         ("gpt-oss-120b", true),
         ("gemma-3-27b-it", false),
     ] {
-        assert_eq!(model::takes_call_ids(model), takes, "{model}");
+        assert_eq!(
+            crate::models::google::takes_call_ids(model),
+            takes,
+            "{model}"
+        );
     }
     let foreign = format!("call.{}|x", "y".repeat(80));
     let fitted = Gemini::default().tool_id(&foreign).expect("refitted");

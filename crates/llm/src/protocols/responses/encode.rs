@@ -7,8 +7,9 @@ use serde_json::{Map, Value, json};
 use super::{Instructions, KEY, Responses};
 use crate::error::Error;
 use crate::json::Lenient;
+use crate::models::openai;
 use crate::protocol::Target;
-use crate::protocols::{openai, schema};
+use crate::protocols::schema;
 use crate::replay::{Replay, replay, replays};
 use crate::spec::{
     AssistantPart, Format, Media, Message, Output, Request, Source, ToolChoice, ToolResult,
@@ -345,7 +346,7 @@ pub(crate) fn body(
     }
     // Reasoning models reject sampling while they reason: dropped rather
     // than failing a request that would otherwise succeed.
-    if openai::takes_sampling(model, effort) {
+    if openai::sampling(model).takes(effort) {
         if let Some(temperature) = generation.temperature {
             body.insert("temperature".into(), json!(temperature));
         }

@@ -60,18 +60,26 @@ fn schema() -> Format {
 /// one.
 #[test]
 fn the_table_holds_each_models_thinking_facts() {
-    use super::super::models::claude;
+    use crate::models::Sampling;
+    use crate::models::anthropic::claude;
     let haiku = claude("claude-haiku-4-5-20251001").expect("listed");
-    assert!(haiku.efforts.is_empty() && haiku.budget && haiku.can_disable && !haiku.adaptive);
+    assert!(
+        haiku.thinking.efforts.is_empty()
+            && haiku.thinking.budget.is_some()
+            && haiku.thinking.can_disable
+            && !haiku.adaptive
+    );
     let opus_4_5 = claude("claude-opus-4-5").expect("listed");
-    assert_eq!(opus_4_5.efforts.len(), 3);
+    assert_eq!(opus_4_5.thinking.efforts.len(), 3);
     assert!(!opus_4_5.adaptive);
     let sonnet_4_6 = claude(SONNET_4_6).expect("listed");
     assert!(
-        sonnet_4_6.adaptive && sonnet_4_6.budget && !sonnet_4_6.efforts.contains(&Effort::XHigh)
+        sonnet_4_6.adaptive
+            && sonnet_4_6.thinking.budget.is_some()
+            && !sonnet_4_6.thinking.takes(Effort::XHigh)
     );
     let opus_4_8 = claude(OPUS_4_8).expect("listed");
-    assert!(!opus_4_8.budget && opus_4_8.fixed_sampling);
+    assert!(opus_4_8.thinking.budget.is_none() && opus_4_8.sampling == Sampling::Fixed);
     assert_eq!(
         claude(SONNET_5_5).expect("listed").thinking_off,
         "between_tools"
@@ -79,10 +87,21 @@ fn the_table_holds_each_models_thinking_facts() {
     assert!(
         !claude("claude-opus-5-5-20260101")
             .expect("a snapshot")
+            .thinking
             .can_disable
     );
-    assert!(!claude("claude-fable-5").expect("listed").can_disable);
-    assert!(claude("claude-opus-5").expect("listed").can_disable);
+    assert!(
+        !claude("claude-fable-5")
+            .expect("listed")
+            .thinking
+            .can_disable
+    );
+    assert!(
+        claude("claude-opus-5")
+            .expect("listed")
+            .thinking
+            .can_disable
+    );
     assert!(claude("claude-opus-5-50").is_none());
     assert!(claude("custom-model").is_none());
 }

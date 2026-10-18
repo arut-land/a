@@ -7,7 +7,7 @@ use serde_json::{Map, Value, json};
 use super::{OutputCap, Quirks, Rewrite};
 use crate::error::Error;
 use crate::json::Lenient;
-use crate::protocols::openai;
+use crate::models::openai;
 
 /// The writes made after the caller's options merged, which read them: the
 /// output cap's spelling, the usage chunk, and the host's own rewrite.

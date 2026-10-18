@@ -8,7 +8,6 @@
 
 mod decode;
 mod encode;
-mod model;
 
 use crate::error::Error;
 use crate::protocol::{Decoder, Encoded, Framing, Host, KeyStyle, Protocol, Target};

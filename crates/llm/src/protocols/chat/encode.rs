@@ -14,8 +14,9 @@ use super::merge::merge_fields;
 use super::{KEY, LaterSystem, Quirks, Rewrite, Routing, Vendor, rules};
 use crate::error::Error;
 use crate::json::Lenient;
+use crate::models::openai;
 use crate::protocol::Target;
-use crate::protocols::{openai, schema};
+use crate::protocols::schema;
 use crate::replay::{Replay, replay, replays};
 use crate::spec::{
     Assistant, AssistantPart, Format, Media, Message, Output, Request, Source, ToolCall,
@@ -646,8 +647,7 @@ pub(super) fn body(
     let offers_tools = quirks.supports_tools && !tools.is_empty();
     if offers_tools
         && matches!(quirks.vendor, Vendor::OpenAi | Vendor::Azure)
-        && openai::gpt_version(model).is_some_and(|(major, _)| major >= 6)
-        && !openai::responses_can_disable(model)
+        && !openai::chat_calls_tools(model)
     {
         return Err(Error::unsupported(
             "the model cannot call tools through Chat Completions; use the Responses API",

@@ -9,10 +9,11 @@
 
 use serde_json::{Map, Value, json};
 
-use super::model::{self, Thinking};
 use super::{Gemini, KEY, ThoughtReplay};
 use crate::error::Error;
 use crate::json::Lenient;
+use crate::models::google as model;
+use crate::models::{Reasoning, Thinking};
 use crate::protocol::Target;
 use crate::replay::{Replay, replay, replays};
 use crate::spec::{
@@ -333,46 +334,49 @@ fn declaration(tool: &crate::spec::Tool) -> Value {
 /// The `thinkingConfig` `generation` asks of `model`, with thought
 /// summaries whenever thinking stays on, so reasoning streams.
 fn thinking_config(model: &str, generation: &Generation) -> Option<Value> {
-    let thinking = model::thinking(model);
+    let reasoning = model::reasoning(model);
     let effort = generation.reasoning;
     let budget = generation.reasoning_budget.map(std::num::NonZeroU32::get);
     let level = |effort: Effort| json!({"thinkingLevel": effort.as_str()});
-    let config = match (effort, thinking) {
+    let config = match (effort, reasoning) {
+        (_, Reasoning::None) => return None,
         (
             Some(Effort::None),
-            Thinking::Budget {
-                can_disable: true, ..
-            },
-        ) => return Some(json!({"thinkingBudget": 0})),
-        (
-            Some(Effort::None),
-            Thinking::Levels {
-                can_disable: true, ..
-            },
-        ) => return Some(json!({"thinkingLevel": "minimal"})),
-        (_, Thinking::None) => return None,
+            Reasoning::Takes(Thinking {
+                can_disable: true,
+                budget: by_budget,
+                ..
+            }),
+        ) => {
+            return Some(if by_budget.is_some() {
+                json!({"thinkingBudget": 0})
+            } else {
+                json!({"thinkingLevel": "minimal"})
+            });
+        }
         // Thinking it cannot turn off goes on as the model's default.
         (Some(Effort::None), _) => None,
-        (Some(effort), Thinking::Levels { levels, .. }) if levels.contains(&effort) => {
-            Some(level(effort))
-        }
         // Gemini 2.5 takes a budget, and no table turns an effort into one.
-        (_, Thinking::Budget { min, max, .. }) => budget
-            .filter(|budget| (min..=max).contains(budget))
+        (
+            _,
+            Reasoning::Takes(Thinking {
+                budget: Some(range),
+                ..
+            }),
+        ) => budget
+            .filter(|budget| range.contains(*budget))
             .map(|budget| json!({"thinkingBudget": budget})),
+        (Some(effort), Reasoning::Takes(thinking)) if thinking.takes(effort) => Some(level(effort)),
         // Gemini's levels stop at `high`.
         (
             Some(effort @ (Effort::Minimal | Effort::Low | Effort::Medium | Effort::High)),
-            Thinking::Unknown,
+            Reasoning::Unknown,
         ) => Some(level(effort)),
-        (_, Thinking::Unknown) => budget.map(|budget| json!({"thinkingBudget": budget})),
-        (_, Thinking::Levels { .. }) => None,
+        (_, Reasoning::Unknown) => budget.map(|budget| json!({"thinkingBudget": budget})),
+        (_, Reasoning::Takes(_)) => None,
     };
-    let summarizes = match thinking {
-        Thinking::Levels { levels, .. } => !levels.is_empty(),
-        Thinking::Budget { .. } => true,
-        Thinking::None | Thinking::Unknown => false,
-    };
+    let summarizes = matches!(reasoning, Reasoning::Takes(thinking)
+        if thinking.budget.is_some() || !thinking.efforts.is_empty());
     let mut config = config.unwrap_or_else(|| json!({}));
     if summarizes {
         config["includeThoughts"] = Value::Bool(true);

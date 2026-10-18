@@ -18,7 +18,6 @@
 mod cache;
 mod decode;
 mod encode;
-mod models;
 mod options;
 mod strict;
 
@@ -26,7 +25,7 @@ use crate::error::Error;
 use crate::protocol::{Decoder, Encoded, Framing, Host, KeyStyle, Protocol, Target};
 use crate::spec::Request;
 
-pub use models::{default_max_tokens, rejects_forced_tool_choice};
+pub use crate::models::anthropic::{default_max_tokens, rejects_forced_tool_choice};
 
 /// Where this protocol's options and part state go.
 pub const KEY: &str = "anthropic.messages";

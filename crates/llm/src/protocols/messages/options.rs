@@ -3,7 +3,7 @@
 //! left out rather than failing the request (where rig refuses it):
 //!
 //! - Anthropic reads its effort levels, thinking budget and sampling from
-//!   the model ([`super::models`]); an unlisted model gets the newest
+//!   the model ([`crate::models::anthropic`]); an unlisted model gets the newest
 //!   models' shapes. `top_p` goes only without `temperature`, and a model
 //!   that fixes its sampling takes neither, nor `top_k`.
 //! - `MiniMax` turns thinking off on M3 and takes an effort on M3.1; `MiMo`
@@ -14,12 +14,10 @@
 
 use serde_json::{Map, Value, json};
 
-use super::models::{Claude, claude_spelled};
 use super::{Dialect, Quirks};
+use crate::models::anthropic::{self, Claude, claude_spelled};
+use crate::models::{Sampling, minimax};
 use crate::spec::{Effort, Generation};
-
-/// The smallest thinking budget Anthropic takes.
-const MIN_BUDGET: u32 = 1024;
 
 /// The body fields `generation` maps to on `quirks`' dialect for `model`,
 /// with `max_tokens` the request's output cap.
@@ -32,7 +30,7 @@ pub(super) fn generation(
     let claude = claude_spelled(model);
     let reasoning = match quirks.dialect {
         Dialect::Anthropic => claude_reasoning(claude, generation, max_tokens),
-        Dialect::MiniMax => minimax_reasoning(model, generation.reasoning),
+        Dialect::MiniMax => minimax_reasoning(minimax::reasoning(model), generation.reasoning),
         Dialect::MiMo => (generation.reasoning == Some(Effort::None))
             .then(|| json!({"thinking": {"type": "disabled"}})),
         Dialect::ZAi | Dialect::Moonshot | Dialect::Other => None,
@@ -44,8 +42,8 @@ pub(super) fn generation(
     let mut set = |key: &str, value: Value| {
         fields.insert(key.to_owned(), value);
     };
-    let fixed =
-        quirks.dialect == Dialect::Anthropic && claude.is_some_and(|claude| claude.fixed_sampling);
+    let fixed = quirks.dialect == Dialect::Anthropic
+        && claude.is_some_and(|claude| claude.sampling == Sampling::Fixed);
     if let Some(temperature) = generation.temperature.filter(|_| !fixed) {
         set("temperature", json!(temperature));
     }
@@ -87,7 +85,7 @@ fn claude_reasoning(
     let effort = generation.reasoning;
     if effort == Some(Effort::None) {
         return match claude {
-            Some(claude) if !claude.can_disable => None,
+            Some(claude) if !claude.thinking.can_disable => None,
             _ => {
                 let off = claude.map_or("disabled", |claude| claude.thinking_off);
                 Some(json!({"thinking": {"type": off}}))
@@ -98,8 +96,9 @@ fn claude_reasoning(
         .reasoning_budget
         .map(std::num::NonZeroU32::get)
         .filter(|tokens| {
-            claude.is_none_or(|claude| claude.budget)
-                && *tokens >= MIN_BUDGET
+            claude
+                .map_or(Some(anthropic::BUDGET), |claude| claude.thinking.budget)
+                .is_some_and(|budget| budget.contains(*tokens))
                 && *tokens < max_tokens
         });
     if let Some(tokens) = budget {
@@ -107,7 +106,7 @@ fn claude_reasoning(
     }
     let effort = effort.filter(|effort| *effort != Effort::Minimal)?;
     match claude {
-        Some(claude) if !claude.efforts.contains(&effort) => None,
+        Some(claude) if !claude.thinking.takes(effort) => None,
         Some(claude) if !claude.adaptive => {
             Some(json!({"output_config": {"effort": effort.as_str()}}))
         }
@@ -118,15 +117,14 @@ fn claude_reasoning(
     }
 }
 
-/// `MiniMax`'s reasoning: off on the M3 models, an effort on M3.1.
-fn minimax_reasoning(model: &str, effort: Option<Effort>) -> Option<Value> {
-    let model = model.to_ascii_lowercase();
-    let flash = model.starts_with("minimax-m3.1");
-    let m3 = !flash && model.starts_with("minimax-m3");
+/// `MiniMax`'s reasoning: off where the model turns it off, else an effort
+/// it takes.
+fn minimax_reasoning(model: crate::models::Reasoning, effort: Option<Effort>) -> Option<Value> {
     match effort? {
-        Effort::None if m3 => Some(json!({"thinking": {"type": "disabled"}})),
-        Effort::None | Effort::Minimal => None,
-        effort if flash => Some(json!({"output_config": {"effort": effort.as_str()}})),
+        Effort::None if model.can_disable() => Some(json!({"thinking": {"type": "disabled"}})),
+        effort if model.takes(effort) => {
+            Some(json!({"output_config": {"effort": effort.as_str()}}))
+        }
         _ => None,
     }
 }

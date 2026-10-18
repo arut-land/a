@@ -1,128 +1,63 @@
-//! What a host's models take, by model id (rig's rules for the ids its
-//! catalog does not list), and how each vendor spells the generation
-//! options. An option rig would refuse for the model is left out: the
-//! request still goes, without it. Effort levels a model's catalog entry
-//! would refuse are sent; the host decides.
+//! How each vendor spells the generation options, as far as the model takes
+//! them ([`crate::models`]). An option rig would refuse for the model is
+//! left out: the request still goes, without it. Effort levels a model's
+//! catalog entry would refuse are sent; the host decides.
 
 use serde_json::{Map, Value, json};
 
 use super::{Quirks, Routing, Vendor};
-use crate::protocols::openai;
+use crate::models::{self, Maker, deepseek, groq, minimax, moonshot, openai, perplexity, xai, zai};
 use crate::spec::{Effort, Generation};
 
-/// The model's own name, past a `vendor/` prefix.
-fn name(model: &str) -> &str {
-    model.rsplit('/').next().unwrap_or(model)
-}
-
-/// The image rule of the vendor an id names (a vendor or an `OpenRouter`
-/// model's upstream): `None` for one whose API takes text only.
-fn image_rule(vendor: &str) -> Option<fn(&str) -> bool> {
+/// Whose model rules a host's models follow; `None` for a host serving
+/// models of every kind.
+fn maker(vendor: Vendor) -> Option<Maker> {
     Some(match vendor {
-        "deepseek" | "mira" => return None,
-        "groq" => groq_images,
-        "mistral" | "mistralai" => mistral_images,
-        "openai" | "azure.openai" => openai::reads_images,
-        "xai" | "x-ai" => xai_images,
-        "cohere" => cohere_images,
-        "zai" | "z-ai" => zai_images,
-        "moonshot" | "moonshotai" => moonshot_images,
-        "minimax" => minimax_images,
-        "xiaomimimo" | "xiaomi" => mimo_images,
-        _ => |_| true,
+        Vendor::OpenAi | Vendor::Azure => Maker::OpenAi,
+        Vendor::DeepSeek | Vendor::Mira => Maker::TextOnly,
+        Vendor::Groq => Maker::Groq,
+        Vendor::Mistral => Maker::Mistral,
+        Vendor::Xai => Maker::Xai,
+        Vendor::Cohere => Maker::Cohere,
+        Vendor::Zai => Maker::Zai,
+        Vendor::Moonshot => Maker::Moonshot,
+        Vendor::MiniMax => Maker::MiniMax,
+        Vendor::Mimo => Maker::Xiaomi,
+        Vendor::OpenRouter
+        | Vendor::Together
+        | Vendor::Venice
+        | Vendor::LlamaCpp
+        | Vendor::Ollama
+        | Vendor::Perplexity
+        | Vendor::Other => return None,
     })
-}
-
-/// Groq reads images on its Llama 4 models.
-fn groq_images(model: &str) -> bool {
-    model.contains("llama-4")
-}
-
-/// Codestral and Devstral are text models.
-fn mistral_images(model: &str) -> bool {
-    !(model.starts_with("codestral") || model.starts_with("devstral"))
-}
-
-/// Grok 2 reads images only in its vision models; Grok 3 and Grok Code not.
-fn xai_images(model: &str) -> bool {
-    let model = model.to_ascii_lowercase();
-    !((model.starts_with("grok-2") && !model.contains("vision"))
-        || model.starts_with("grok-3")
-        || model.starts_with("grok-code"))
-}
-
-fn cohere_images(model: &str) -> bool {
-    model.contains("vision")
-}
-
-/// GLM vision models carry a `v` after their version: `glm-4.5v`.
-fn zai_images(model: &str) -> bool {
-    model.strip_prefix("glm-").is_some_and(|rest| {
-        rest.trim_start_matches(|c: char| c.is_ascii_digit() || c == '.')
-            .starts_with('v')
-    })
-}
-
-fn moonshot_images(model: &str) -> bool {
-    !(model == "kimi-k2"
-        || model.starts_with("kimi-k2-")
-        || (model.starts_with("moonshot-v1") && !model.contains("vision")))
-}
-
-fn minimax_images(model: &str) -> bool {
-    !model.to_ascii_lowercase().starts_with("minimax-m2")
-}
-
-fn mimo_images(model: &str) -> bool {
-    !((model.starts_with("mimo-v2-") && !model.contains("omni"))
-        || model.starts_with("mimo-v2.5-pro"))
 }
 
 /// Whether `model` reads user images on a host of `vendor`. An
 /// `OpenRouter` id names its upstream, whose rule decides.
 pub(super) fn reads_images(vendor: Vendor, model: &str) -> bool {
-    let rule = match vendor {
-        Vendor::OpenRouter => {
-            return match model.split_once('/') {
-                Some((upstream, model)) => image_rule(upstream).is_some_and(|rule| rule(model)),
-                None => true,
-            };
-        }
-        Vendor::DeepSeek | Vendor::Mira => None,
-        Vendor::Groq => image_rule("groq"),
-        Vendor::Mistral => image_rule("mistral"),
-        Vendor::OpenAi | Vendor::Azure => image_rule("openai"),
-        Vendor::Xai => image_rule("xai"),
-        Vendor::Cohere => image_rule("cohere"),
-        Vendor::Zai => image_rule("zai"),
-        Vendor::Moonshot => image_rule("moonshot"),
-        Vendor::MiniMax => image_rule("minimax"),
-        Vendor::Mimo => image_rule("xiaomimimo"),
-        Vendor::Together
-        | Vendor::Venice
-        | Vendor::LlamaCpp
-        | Vendor::Ollama
-        | Vendor::Perplexity
-        | Vendor::Other => return true,
+    let (maker, model) = match vendor {
+        Vendor::OpenRouter => match model.split_once('/') {
+            Some((upstream, model)) => (Maker::named(upstream), model),
+            None => (None, model),
+        },
+        vendor => (maker(vendor), model),
     };
-    rule.is_some_and(|rule| rule(model))
+    maker.is_none_or(|maker| maker.reads_images(model))
 }
 
 /// The field every assistant message carries its reasoning under: the
 /// host's own, `reasoning_content` for `DeepSeek` at any base URL, and the
-/// models that ask for it behind any gateway (Kimi K3, and `OpenRouter`'s
-/// `moonshotai/kimi-k2.6`).
+/// models that ask for it behind any gateway.
 pub(super) fn reasoning_field(
     quirks: &Quirks,
     base_url: &str,
     model: &str,
 ) -> Option<&'static str> {
     let deepseek = base_url.to_ascii_lowercase().contains("deepseek.com");
-    let kimi_k3 = name(model) == "kimi-k3" || name(model).starts_with("kimi-k3-");
-    let listed = kimi_k3 || model == "moonshotai/kimi-k2.6";
     quirks
         .reasoning_field
-        .or((deepseek || listed).then_some("reasoning_content"))
+        .or((deepseek || moonshot::replays_reasoning(model)).then_some("reasoning_content"))
 }
 
 /// What the request asks of the model's reasoning.
@@ -141,6 +76,18 @@ impl Reasoning {
             (None, Some(budget)) => Some(Self::Budget(budget.get())),
             (None, None) => None,
         }
+    }
+
+    /// The reasoning asked, if `model` takes it: an off it cannot turn off
+    /// or a level it lacks is dropped, and any budget. An unknown model
+    /// takes any off or level.
+    fn taken(reasoning: Option<Self>, model: models::Reasoning) -> Option<Self> {
+        reasoning.filter(|reasoning| match (reasoning, model) {
+            (Self::Budget(_), _) => false,
+            (_, models::Reasoning::Unknown) => true,
+            (Self::Off, model) => model.can_disable(),
+            (Self::Effort(effort), model) => model.takes(*effort),
+        })
     }
 }
 
@@ -245,10 +192,10 @@ fn takes(vendor: Vendor, model: &str, generation: &Generation, off: bool) -> Tak
         // no stop sequences.
         Vendor::Xai => Takes {
             seed: None,
-            stop: if model.contains("non-reasoning") {
-                Stop::Any
-            } else {
+            stop: if xai::reasons(model) {
                 Stop::None
+            } else {
+                Stop::Any
             },
             ..all(Stop::Any)
         },
@@ -298,7 +245,7 @@ pub(super) fn generation(
     let reasoning = Reasoning::of(generation);
     // OpenAI's reasoning models refuse sampling while they reason.
     let samples = !matches!(quirks.vendor, Vendor::OpenAi | Vendor::Azure)
-        || openai::takes_sampling(model, generation.reasoning);
+        || openai::sampling(model).takes(generation.reasoning);
     if let Some(temperature) = generation.temperature.filter(|_| samples) {
         sent.send("temperature", temperature);
     }
@@ -345,37 +292,26 @@ fn reasoning_fields(sent: &mut Sent, quirks: &Quirks, model: &str, reasoning: Op
             }
             None => {}
         },
-        Vendor::DeepSeek | Vendor::Zai => match reasoning {
-            Some(Reasoning::Off) => sent.send("thinking", json!({"type": "disabled"})),
-            // GLM 4 models switch thinking on and off and take no level.
-            Some(Reasoning::Effort(effort @ (Effort::Low | Effort::High | Effort::Max)))
-                if !(quirks.vendor == Vendor::Zai && model.starts_with("glm-4")) =>
-            {
-                sent.send("thinking", json!({"type": "enabled"}));
-                sent.effort(effort);
+        Vendor::DeepSeek | Vendor::Zai => {
+            let model = match quirks.vendor {
+                Vendor::Zai => zai::reasoning(model),
+                _ => deepseek::REASONING,
+            };
+            match Reasoning::taken(reasoning, model) {
+                Some(Reasoning::Off) => sent.send("thinking", json!({"type": "disabled"})),
+                Some(Reasoning::Effort(effort)) => {
+                    sent.send("thinking", json!({"type": "enabled"}));
+                    sent.effort(effort);
+                }
+                _ => {}
             }
-            _ => {}
-        },
+        }
         Vendor::Mistral | Vendor::Venice | Vendor::LlamaCpp | Vendor::Ollama => {
             sent.plain(reasoning);
         }
-        // GPT-OSS cannot turn reasoning off, and takes `low` to `high`.
-        Vendor::Groq if model.contains("gpt-oss") => {
-            if let Some(Reasoning::Effort(effort @ (Effort::Low | Effort::Medium | Effort::High))) =
-                reasoning
-            {
-                sent.effort(effort);
-            }
-        }
-        Vendor::Groq => sent.plain(reasoning),
-        // A reasoning Grok model cannot turn reasoning off.
-        Vendor::Xai => {
-            if let Some(Reasoning::Effort(effort)) = reasoning
-                && !matches!(effort, Effort::Minimal | Effort::Max)
-            {
-                sent.effort(effort);
-            }
-        }
+        Vendor::Groq => sent.plain(Reasoning::taken(reasoning, groq::reasoning(model))),
+        Vendor::Xai => sent.plain(Reasoning::taken(reasoning, xai::REASONING)),
+        Vendor::Perplexity => sent.plain(Reasoning::taken(reasoning, perplexity::reasoning(model))),
         Vendor::Together => match reasoning {
             Some(Reasoning::Off) => sent.send("reasoning", json!({"enabled": false})),
             Some(Reasoning::Effort(effort @ (Effort::Low | Effort::Medium | Effort::High))) => {
@@ -384,15 +320,9 @@ fn reasoning_fields(sent: &mut Sent, quirks: &Quirks, model: &str, reasoning: Op
             }
             _ => {}
         },
-        Vendor::Moonshot => match reasoning {
-            Some(Reasoning::Off) if name(model).starts_with("kimi-k2.6") => {
-                sent.send("thinking", json!({"type": "disabled"}));
-            }
-            Some(Reasoning::Effort(effort @ (Effort::Low | Effort::High | Effort::Max)))
-                if name(model).starts_with("kimi-k3") =>
-            {
-                sent.effort(effort);
-            }
+        Vendor::Moonshot => match Reasoning::taken(reasoning, moonshot::reasoning(model)) {
+            Some(Reasoning::Off) => sent.send("thinking", json!({"type": "disabled"})),
+            Some(Reasoning::Effort(effort)) => sent.effort(effort),
             _ => {}
         },
         // The Compatibility API takes only `none` and `high`.
@@ -401,29 +331,14 @@ fn reasoning_fields(sent: &mut Sent, quirks: &Quirks, model: &str, reasoning: Op
             Some(Reasoning::Effort(Effort::High)) => sent.effort(Effort::High),
             _ => {}
         },
-        // Only Sonar Deep Research takes an effort, `low` to `high`.
-        Vendor::Perplexity => {
-            if let Some(Reasoning::Effort(effort @ (Effort::Low | Effort::Medium | Effort::High))) =
-                reasoning
-                && model.starts_with("sonar-deep-research")
-            {
+        Vendor::MiniMax => match Reasoning::taken(reasoning, minimax::reasoning(model)) {
+            Some(Reasoning::Off) => sent.send("thinking", json!({"type": "disabled"})),
+            Some(Reasoning::Effort(effort)) => {
+                sent.send("thinking", json!({"type": "adaptive"}));
                 sent.effort(effort);
             }
-        }
-        Vendor::MiniMax => {
-            let model = model.to_ascii_lowercase();
-            let flash = model.starts_with("minimax-m3.1");
-            match reasoning {
-                Some(Reasoning::Off) if !flash && model.starts_with("minimax-m3") => {
-                    sent.send("thinking", json!({"type": "disabled"}));
-                }
-                Some(Reasoning::Effort(effort)) if flash && effort != Effort::Minimal => {
-                    sent.send("thinking", json!({"type": "adaptive"}));
-                    sent.effort(effort);
-                }
-                _ => {}
-            }
-        }
+            _ => {}
+        },
         Vendor::Mimo => {
             if reasoning == Some(Reasoning::Off) {
                 sent.send("thinking", json!({"type": "disabled"}));

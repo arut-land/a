@@ -10,6 +10,7 @@ mod error;
 pub mod hosts;
 pub mod http;
 pub mod json;
+pub mod models;
 mod prepare;
 pub mod protocol;
 pub mod protocols;

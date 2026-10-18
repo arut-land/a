@@ -9,13 +9,15 @@ use std::num::NonZeroU32;
 use serde_json::{Map, Value, json};
 
 use super::cache::Caching;
-use super::models::{binds_context, rejects_forced_tool_choice, takes_mid_conversation_system};
 use super::{
     Dialect, FINE_GRAINED_TOOL_STREAMING_BETA, KEY, Quirks, THINKING_BINDING_BETA,
     ToolInputStreaming, options, strict,
 };
 use crate::error::Error;
 use crate::json::Lenient;
+use crate::models::anthropic::{
+    binds_context, rejects_forced_tool_choice, takes_mid_conversation_system,
+};
 use crate::replay::{Replay, replay, replays};
 use crate::spec::{
     Assistant, AssistantPart, Format, Media, Message, Meta, Output, Request, Source, ToolChoice,

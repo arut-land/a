@@ -613,7 +613,7 @@ fn context_binding_reads_every_spelling_of_a_claude_model() {
         "us.anthropic.claude-opus-5-5-20260101-v1:0",
         "us.anthropic.claude-opus-5",
     ] {
-        assert!(models::binds_context(model), "{model}");
+        assert!(crate::models::anthropic::binds_context(model), "{model}");
     }
     for model in [
         "claude-sonnet-5",
@@ -621,7 +621,7 @@ fn context_binding_reads_every_spelling_of_a_claude_model() {
         "us.anthropic.claude-haiku-4-5-20251001-v1:0",
         "gpt-5",
     ] {
-        assert!(!models::binds_context(model), "{model}");
+        assert!(!crate::models::anthropic::binds_context(model), "{model}");
     }
 }
 

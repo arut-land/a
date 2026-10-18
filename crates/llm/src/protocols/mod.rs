@@ -4,7 +4,6 @@
 pub mod chat;
 pub mod gemini;
 pub mod messages;
-pub(crate) mod openai;
 pub mod responses;
 pub(crate) mod schema;
 

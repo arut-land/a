@@ -1,59 +1,51 @@
-//! What Claude model ids say about a model (rig's catalog rows for
-//! Anthropic, without the catalog): output limits, the reasoning each takes,
-//! and the request shapes each accepts.
+//! Claude model ids (rig's catalog rows for Anthropic, as a table): output
+//! limits, the reasoning each takes, and the request shapes each accepts.
 
+use super::{LOW_TO_HIGH, LOW_TO_MAX, Sampling, Thinking, has_prefix};
 use crate::spec::Effort;
 
 /// One Claude model's facts.
 #[allow(clippy::struct_excessive_bools)]
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(crate) struct Claude {
-    pub(crate) id: &'static str,
-    pub(crate) max_output: u32,
-    /// The effort levels it takes, empty when it takes a budget only.
-    pub(crate) efforts: &'static [Effort],
-    /// Whether it takes a thinking budget (from 1024 tokens).
-    pub(crate) budget: bool,
-    pub(crate) can_disable: bool,
+pub struct Claude {
+    pub id: &'static str,
+    pub max_output: u32,
+    pub thinking: Thinking,
     /// The `thinking.type` that turns its reasoning off.
-    pub(crate) thinking_off: &'static str,
+    pub thinking_off: &'static str,
     /// Whether an effort goes with `thinking: {"type": "adaptive"}`.
-    pub(crate) adaptive: bool,
+    pub adaptive: bool,
     /// Whether it takes `role: "system"` inside `messages`.
-    pub(crate) mid_system: bool,
+    pub mid_system: bool,
     /// Whether it answers a forced `tool_choice` with an error.
-    pub(crate) rejects_forced_tool_choice: bool,
+    pub rejects_forced_tool_choice: bool,
     /// Whether its thinking binds to the tools and system prompt it was
     /// made under.
-    pub(crate) binds_context: bool,
-    /// Whether it fixes its sampling: no `temperature`, `top_p` or `top_k`.
-    pub(crate) fixed_sampling: bool,
+    pub binds_context: bool,
+    pub sampling: Sampling,
 }
 
-const LOW_TO_HIGH: &[Effort] = &[Effort::Low, Effort::Medium, Effort::High];
-const LOW_TO_MAX: &[Effort] = &[Effort::Low, Effort::Medium, Effort::High, Effort::Max];
-const EVERY_LEVEL: &[Effort] = &[
-    Effort::Low,
-    Effort::Medium,
-    Effort::High,
-    Effort::XHigh,
-    Effort::Max,
-];
+/// The thinking budgets Claude takes: from 1024 tokens, below the
+/// request's `max_tokens`.
+pub const BUDGET: super::Budget = super::Budget {
+    min: 1024,
+    max: u32::MAX,
+};
+
+const LOW_TO_MAX_NO_XHIGH: &[Effort] = &[Effort::Low, Effort::Medium, Effort::High, Effort::Max];
 
 /// A Claude 4 model that thinks by budget only.
 const fn budgeted(id: &'static str, max_output: u32) -> Claude {
     Claude {
         id,
         max_output,
-        efforts: &[],
-        budget: true,
-        can_disable: true,
+        thinking: Thinking::budget(BUDGET.min, BUDGET.max, true),
         thinking_off: "disabled",
         adaptive: false,
         mid_system: false,
         rejects_forced_tool_choice: false,
         binds_context: false,
-        fixed_sampling: false,
+        sampling: Sampling::Free,
     }
 }
 
@@ -62,15 +54,13 @@ const fn adaptive(id: &'static str) -> Claude {
     Claude {
         id,
         max_output: 128_000,
-        efforts: EVERY_LEVEL,
-        budget: false,
-        can_disable: true,
+        thinking: Thinking::levels(LOW_TO_MAX).disabling(),
         thinking_off: "disabled",
         adaptive: true,
         mid_system: false,
         rejects_forced_tool_choice: false,
         binds_context: false,
-        fixed_sampling: true,
+        sampling: Sampling::Fixed,
     }
 }
 
@@ -85,19 +75,33 @@ const fn current(id: &'static str, binds: bool) -> Claude {
     }
 }
 
+/// `claude` with reasoning it cannot turn off.
+const fn always_thinks(claude: Claude) -> Claude {
+    Claude {
+        thinking: Thinking {
+            can_disable: false,
+            ..claude.thinking
+        },
+        ..claude
+    }
+}
+
+/// An adaptive model that also takes a budget and free sampling.
+const fn hybrid(id: &'static str) -> Claude {
+    Claude {
+        thinking: Thinking {
+            budget: Some(BUDGET),
+            ..Thinking::levels(LOW_TO_MAX_NO_XHIGH).disabling()
+        },
+        sampling: Sampling::Free,
+        ..adaptive(id)
+    }
+}
+
 const MODELS: &[Claude] = &[
-    Claude {
-        can_disable: false,
-        ..current("claude-fable-5", false)
-    },
-    Claude {
-        can_disable: false,
-        ..current("claude-fable-5-1", true)
-    },
-    Claude {
-        can_disable: false,
-        ..current("claude-opus-5-5", true)
-    },
+    always_thinks(current("claude-fable-5", false)),
+    always_thinks(current("claude-fable-5-1", true)),
+    always_thinks(current("claude-opus-5-5", true)),
     Claude {
         binds_context: true,
         ..current("claude-opus-5", false)
@@ -109,20 +113,13 @@ const MODELS: &[Claude] = &[
     adaptive("claude-sonnet-5"),
     current("claude-opus-4-8", false),
     adaptive("claude-opus-4-7"),
+    hybrid("claude-opus-4-6"),
+    hybrid("claude-sonnet-4-6"),
     Claude {
-        efforts: LOW_TO_MAX,
-        budget: true,
-        fixed_sampling: false,
-        ..adaptive("claude-opus-4-6")
-    },
-    Claude {
-        efforts: LOW_TO_MAX,
-        budget: true,
-        fixed_sampling: false,
-        ..adaptive("claude-sonnet-4-6")
-    },
-    Claude {
-        efforts: LOW_TO_HIGH,
+        thinking: Thinking {
+            efforts: LOW_TO_HIGH,
+            ..Thinking::budget(BUDGET.min, BUDGET.max, true)
+        },
         ..budgeted("claude-opus-4-5", 64_000)
     },
     budgeted("claude-sonnet-4-5", 64_000),
@@ -141,7 +138,7 @@ fn exact(model: &str) -> Option<&'static Claude> {
 /// The facts of Anthropic's `model`, or of the model a dated snapshot of it
 /// (`<id>-YYYYMMDD`, or any suffix from `-20`) names. `None` for a model
 /// this table does not list, which gets the newest models' behaviour.
-pub(crate) fn claude(model: &str) -> Option<&'static Claude> {
+pub fn claude(model: &str) -> Option<&'static Claude> {
     exact(model).or_else(|| {
         model
             .match_indices("-20")
@@ -153,7 +150,7 @@ pub(crate) fn claude(model: &str) -> Option<&'static Claude> {
 /// [`claude`] for `model` however a serving API spells it: Anthropic's
 /// `claude-opus-5-5`, `OpenRouter`'s `anthropic/claude-opus-5.5` or
 /// Bedrock's `us.anthropic.claude-opus-5-5-v1:0`.
-pub(crate) fn claude_spelled(model: &str) -> Option<&'static Claude> {
+pub fn claude_spelled(model: &str) -> Option<&'static Claude> {
     let model = model
         .rsplit_once("anthropic.")
         .map_or(model, |(_, rest)| rest);
@@ -168,10 +165,11 @@ pub(crate) fn claude_spelled(model: &str) -> Option<&'static Claude> {
 pub fn default_max_tokens(model: &str) -> Option<u32> {
     match claude(model) {
         Some(claude) => Some(claude.max_output),
-        None => ["claude-opus-4", "claude-sonnet-4", "claude-haiku-4-5"]
-            .iter()
-            .any(|prefix| model.starts_with(prefix))
-            .then_some(64_000),
+        None => has_prefix(
+            &["claude-opus-4", "claude-sonnet-4", "claude-haiku-4-5"],
+            model,
+        )
+        .then_some(64_000),
     }
 }
 
@@ -184,12 +182,12 @@ pub fn rejects_forced_tool_choice(model: &str) -> bool {
 
 /// Whether `model` takes `role: "system"` inside `messages`; one this table
 /// does not list takes system text only in `system`.
-pub(crate) fn takes_mid_conversation_system(model: &str) -> bool {
+pub fn takes_mid_conversation_system(model: &str) -> bool {
     claude(model).is_some_and(|claude| claude.mid_system)
 }
 
 /// Whether the Claude `model`, however spelled, binds its thinking blocks
 /// to the request's tools and system prompt.
-pub(crate) fn binds_context(model: &str) -> bool {
+pub fn binds_context(model: &str) -> bool {
     claude_spelled(model).is_some_and(|claude| claude.binds_context)
 }
