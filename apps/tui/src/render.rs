@@ -6,7 +6,7 @@
 
 use std::io::Write as _;
 
-use super::text::{Line, width_of};
+use super::text::{Line, char_width, width_of};
 
 /// Theme colors only (the terminal's palette entries 1–7 and bright black),
 /// never a fixed RGB, and no backgrounds but reverse video: legible on
@@ -133,20 +133,19 @@ impl Buf {
         self.cursor = None;
     }
 
-    /// Writes `text` from column `x` of row `y`, clipped at `limit`
-    /// columns; returns the column after it.
-    pub fn put_clipped(&mut self, mut x: u16, y: u16, text: &str, style: Style, limit: u16) -> u16 {
+    /// Writes `text` from column `x` of row `y`, clipped at the right
+    /// edge; returns the column after it.
+    pub fn put(&mut self, mut x: u16, y: u16, text: &str, style: Style) -> u16 {
         if y >= self.h {
             return x;
         }
-        let limit = limit.min(self.w);
         let row = usize::from(y) * usize::from(self.w);
         for ch in text.chars() {
-            let w = super::text::char_width(ch);
+            let w = char_width(ch);
             if w == 0 {
                 continue;
             }
-            if x + w > limit {
+            if x + w > self.w {
                 break;
             }
             let at = row + usize::from(x);
@@ -157,10 +156,6 @@ impl Buf {
             x += w;
         }
         x
-    }
-
-    pub fn put(&mut self, x: u16, y: u16, text: &str, style: Style) -> u16 {
-        self.put_clipped(x, y, text, style, self.w)
     }
 
     /// The rows as text, trailing blanks trimmed: what a test asserts on.
@@ -293,8 +288,7 @@ impl Screen {
                     // A wide character's second half counts as part of it.
                     Some(p) => {
                         p.cells[i] == cell
-                            && (super::text::char_width(cell.ch) < 2
-                                || p.cells[i + 1] == next.cells[i + 1])
+                            && (char_width(cell.ch) < 2 || p.cells[i + 1] == next.cells[i + 1])
                     }
                     None => cell == BLANK,
                 };
@@ -311,7 +305,7 @@ impl Screen {
                 let mut utf8 = [0; 4];
                 self.out
                     .extend_from_slice(cell.ch.encode_utf8(&mut utf8).as_bytes());
-                at = Some((x + super::text::char_width(cell.ch), y));
+                at = Some((x + char_width(cell.ch), y));
             }
         }
         self.out.extend_from_slice(b"\x1b[0m");
@@ -367,7 +361,7 @@ pub fn fit(text: &str, cols: usize) -> String {
     let mut out = String::with_capacity(text.len());
     let mut w = 0;
     for ch in text.chars() {
-        let cw = usize::from(super::text::char_width(ch));
+        let cw = usize::from(char_width(ch));
         if w + cw > cols {
             break;
         }
@@ -386,7 +380,7 @@ pub fn ellipsize(text: &str, cols: usize) -> String {
     let mut out = String::new();
     let mut w = 0;
     for ch in text.chars() {
-        let cw = usize::from(super::text::char_width(ch));
+        let cw = usize::from(char_width(ch));
         if w + cw + 1 > cols {
             break;
         }

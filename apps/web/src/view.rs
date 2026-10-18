@@ -2,9 +2,10 @@
 //! markup, emitted again whole on every update.
 
 use protocol::view::{
-    Approval, Item, SessionView, Status, Stream, Usage, call_title, output_text, recap_line,
+    Approval, Item, SessionView, Status, Stream, Usage, call_title, decision_line, output_text,
+    recap_line,
 };
-use protocol::{Card, Decision, Outcome};
+use protocol::{Card, Outcome};
 use serde_json::Value;
 use topcoat::Result;
 use topcoat::runtime::Event;
@@ -75,7 +76,7 @@ async fn item_row(item: Item, tab: String, streaming: Option<Stream>) -> Result<
                 </div>
             }
             Item::Hook { hook, decision, .. } => {
-                <p style=(style::NOTE)>"hook " (hook) " · " (decision_text(&decision))</p>
+                <p style=(style::NOTE)>"hook " (hook) " · " (decision_line(&decision))</p>
             }
             Item::Child { child, input, fired, .. } => {
                 <div style=(style::NOTE)>
@@ -201,32 +202,5 @@ fn outcome_text(outcome: &Outcome) -> String {
         Outcome::Done { output } => output.to_string(),
         Outcome::Failed { error } => format!("failed: {error}"),
         Outcome::Interrupted { .. } => "interrupted".to_owned(),
-    }
-}
-
-fn decision_text(decision: &Decision) -> String {
-    match decision {
-        Decision::PrepareStep { call } => format!("rewrote the request of call {call}"),
-        Decision::PreTool { tool, .. } => format!("rewrote the input of {tool}"),
-        Decision::Block { tool, reason } => format!("blocked {tool}: {reason}"),
-        Decision::Permission { tool, permission } => format!("{tool}: {permission:?}"),
-        Decision::Approval { tool, approved, .. } => {
-            format!(
-                "{tool} {}",
-                if *approved {
-                    "approved"
-                } else {
-                    "not approved"
-                }
-            )
-        }
-        Decision::PostTool { call, .. } => format!("rewrote the outcome of call {call}"),
-        Decision::OnStop { text } => format!("continued with: {text}"),
-        Decision::Input { original } => format!("rewrote your input: {original}"),
-        Decision::Retry {
-            call,
-            attempt,
-            error,
-        } => format!("retried call {call} (attempt {attempt}): {error}"),
     }
 }

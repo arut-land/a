@@ -146,10 +146,7 @@ impl App {
             flash: None,
             recap_hidden: false,
             hits: Vec::new(),
-            tokens: Usage {
-                input: 0,
-                output: 0,
-            },
+            tokens: Usage::default(),
             committed: 0,
             resuming: matches!(target, Target::Latest { .. }),
         }
@@ -175,10 +172,7 @@ impl App {
                     self.collapsed.clear();
                     self.anchor = None;
                     self.committed = 0;
-                    self.tokens = Usage {
-                        input: 0,
-                        output: 0,
-                    };
+                    self.tokens = Usage::default();
                     self.recap_hidden = false;
                     self.flash = None;
                 }
@@ -194,13 +188,7 @@ impl App {
                 }
             }
             Change::Updated { index, item, .. } | Change::Asked { index, item } => {
-                if let Item::Reply {
-                    usage: Some(usage), ..
-                } = item
-                {
-                    self.tokens.input += usage.input;
-                    self.tokens.output += usage.output;
-                }
+                spend(&mut self.tokens, &item);
                 if self.cache.len() == len {
                     self.cache[index] = None;
                 } else {
@@ -234,19 +222,10 @@ impl App {
                 self.cache.clear();
                 self.anchor = None;
                 self.committed = self.committed.min(len);
-                self.tokens = self.view.items.iter().fold(
-                    Usage {
-                        input: 0,
-                        output: 0,
-                    },
-                    |sum, item| match item {
-                        Item::Reply { usage: Some(u), .. } => Usage {
-                            input: sum.input + u.input,
-                            output: sum.output + u.output,
-                        },
-                        _ => sum,
-                    },
-                );
+                self.tokens = Usage::default();
+                for item in &self.view.items {
+                    spend(&mut self.tokens, item);
+                }
             }
             Change::Synced | Change::Draining => {}
         }
@@ -486,5 +465,16 @@ impl App {
 
     fn page(&self) -> i32 {
         i32::from(self.body).max(3) - 2
+    }
+}
+
+/// Adds what a finished model call used to `tokens`.
+fn spend(tokens: &mut Usage, item: &Item) {
+    if let Item::Reply {
+        usage: Some(usage), ..
+    } = item
+    {
+        tokens.input += usage.input;
+        tokens.output += usage.output;
     }
 }

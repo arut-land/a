@@ -745,7 +745,7 @@ fn vectors() {
 
 #[test]
 fn clients_describe_calls_and_recaps_alike() {
-    use protocol::view::{call_title, output_text, recap_line};
+    use protocol::view::{call_title, decision_line, output_text, recap_line};
 
     let ls = json!({"command": "ls"});
     let card = Card {
@@ -781,4 +781,14 @@ fn clients_describe_calls_and_recaps_alike() {
         "recap · you: hi · ran 4 tools · a: done · 1 waiting for approval"
     );
     assert_eq!(recap_line(&Recap::default()), "recap");
+    let blocked = Decision::Block {
+        tool: "bash".into(),
+        reason: "no network".into(),
+    };
+    assert_eq!(decision_line(&blocked), "blocked bash: no network");
+    let asked = Decision::Permission {
+        tool: "bash".into(),
+        permission: protocol::Permission::Ask,
+    };
+    assert_eq!(decision_line(&asked), "bash: ask");
 }

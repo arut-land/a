@@ -7,7 +7,7 @@ use std::thread;
 use client::Endpoint;
 use protocol::view::{
     Approval, Change, Item, Link, Part, SessionList, SessionView, Status, Usage, call_title,
-    output_text, recap_line,
+    decision_line, output_text, recap_line,
 };
 use protocol::{Card, ClientMsg, DaemonMsg, Outcome, SessionId, SessionSummary, Target};
 use sys::{Home, Staged};
@@ -471,7 +471,9 @@ fn added(item: &Item) {
             tool, input, card, ..
         } => println!("tool {}", call_title(tool, input, card.as_ref())),
         Item::Command { name, args, .. } => println!("cmd  /{name} {args}"),
-        Item::Hook { hook, decision, .. } => println!("  · hook {hook}: {decision:?}"),
+        Item::Hook { hook, decision, .. } => {
+            println!("  · hook {hook}: {}", decision_line(decision));
+        }
         Item::Child { child, input, .. } => println!("child {} {input}", child.short()),
         Item::Environment { cwd, .. } => println!("  · env {}", cwd.display()),
         Item::Reply { .. } => {}
