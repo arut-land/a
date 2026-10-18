@@ -5,7 +5,7 @@ fn sse_all(body: &[u8]) -> Vec<(String, String)> {
     let mut framer = SseFramer::new();
     framer
         .push(body)
-        .map(|event| (event.event, event.data))
+        .map(|event| (event.event.into_owned(), event.data))
         .collect()
 }
 
@@ -106,9 +106,13 @@ fn splitting_a_body_at_every_offset_yields_the_same_events() {
         let mut framer = SseFramer::new();
         let mut events: Vec<_> = framer
             .push(head)
-            .map(|event| (event.event, event.data))
+            .map(|event| (event.event.into_owned(), event.data))
             .collect();
-        events.extend(framer.push(tail).map(|event| (event.event, event.data)));
+        events.extend(
+            framer
+                .push(tail)
+                .map(|event| (event.event.into_owned(), event.data)),
+        );
         assert_eq!(events, whole, "split at {split}");
     }
 }

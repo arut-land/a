@@ -138,6 +138,8 @@ struct Reader {
     framer: Framer,
     decoder: Box<dyn Decoder>,
     queue: VecDeque<Event>,
+    /// What the last chunk decoded to, on its way to `queue`.
+    decoded: Vec<Event>,
     done: bool,
     finished: bool,
     /// A failure to report once `queue` drains.
@@ -222,6 +224,7 @@ impl Reader {
             framer: framing.into(),
             decoder,
             queue: VecDeque::new(),
+            decoded: Vec::new(),
             done: false,
             finished: false,
             failure: None,
@@ -249,8 +252,9 @@ impl Reader {
             if self.done {
                 return Poll::Ready(Next::Fail(Error::incomplete()));
             }
-            let mut out = Vec::new();
-            let step = match ready!(self.body.as_mut().poll_next(cx)) {
+            let polled = ready!(self.body.as_mut().poll_next(cx));
+            let mut out = std::mem::take(&mut self.decoded);
+            let step = match polled {
                 Some(Ok(chunk)) => self.framer.feed(self.decoder.as_mut(), &chunk, &mut out),
                 Some(Err(error)) => Err(Error::new(
                     Kind::Transport,
@@ -258,7 +262,8 @@ impl Reader {
                 )),
                 None => self.eof(&mut out),
             };
-            self.queue.extend(out);
+            self.queue.extend(out.drain(..));
+            self.decoded = out;
             match step {
                 Ok(Flow::More) => {}
                 Ok(Flow::Done) => self.done = true,

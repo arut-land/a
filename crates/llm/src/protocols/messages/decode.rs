@@ -332,7 +332,7 @@ impl MessagesDecoder {
         // A gateway that skips `content_block_start` still streams the
         // block's text, so its first delta opens it.
         if !self.w.opened(index) {
-            let block = Map::from_iter([("type".into(), key.into()), (key.into(), "".into())]);
+            let block = crate::json::object([("type".into(), key.into()), (key.into(), "".into())]);
             self.start(index, opens, &block)?;
         }
         let fragment = fragment.ok_or_else(missing)?;

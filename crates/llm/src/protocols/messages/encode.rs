@@ -8,6 +8,8 @@ use std::num::NonZeroU32;
 
 use serde_json::{Map, Value, json};
 
+use crate::json::obj;
+
 use super::cache::Caching;
 use super::{
     Dialect, FINE_GRAINED_TOOL_STREAMING_BETA, KEY, Quirks, THINKING_BINDING_BETA,
@@ -57,7 +59,7 @@ pub(super) fn body(
     let mid = takes_mid_conversation_system(model);
     let (mut system, mut messages) = conversation(&request.messages, mid)?;
     caching.place(&mut system, &mut messages, &mut tools)?;
-    let mut body = json!({"model": model, "messages": messages, "max_tokens": max_tokens});
+    let mut body = obj!({"model": model, "messages": messages, "max_tokens": max_tokens});
     if !system.is_empty() {
         body["system"] = system.into();
     }
@@ -72,7 +74,7 @@ pub(super) fn body(
     {
         let mut schema = schema.clone();
         crate::protocols::schema::anthropic(&mut schema);
-        body["output_config"] = json!({"format": {"type": "json_schema", "schema": schema}});
+        body["output_config"] = obj!({"format": obj!({"type": "json_schema", "schema": schema})});
     }
     if !options.contains_key("container")
         && let Some(container) = container(&request.messages)
@@ -119,7 +121,7 @@ pub(super) fn body(
 fn drop_unbound(body: &mut Value) -> bool {
     let binding = json!({"prefix_mismatch_behavior": "drop_block"});
     match body.get_mut("thinking") {
-        None => body["thinking"] = json!({"type": "adaptive", "block_binding": binding}),
+        None => body["thinking"] = obj!({"type": "adaptive", "block_binding": binding}),
         Some(Value::Object(thinking)) if thinking.get("type").is_some_and(|t| t == "adaptive") => {
             thinking.entry("block_binding").or_insert(binding);
         }
@@ -137,8 +139,8 @@ fn tool_json(tool: &Tool, quirks: Quirks) -> Value {
     if strict {
         strict::sanitize(&mut schema);
     }
-    let mut definition =
-        json!({"name": tool.name, "description": tool.description, "input_schema": schema});
+    let (name, description) = (tool.name.as_str(), tool.description.as_str());
+    let mut definition = obj!({"name": name, "description": description, "input_schema": schema});
     if strict {
         definition["strict"] = true.into();
     }
@@ -209,7 +211,7 @@ fn conversation(messages: &[Message], mid: bool) -> Result<(Vec<Value>, Vec<Valu
         }
     }
     let message = |role, content: Vec<Value>| {
-        (!content.is_empty()).then(|| json!({"role": role, "content": content}))
+        (!content.is_empty()).then(|| obj!({"role": role, "content": content}))
     };
     let (mut system, mut sent, mut deferred) = (Vec::new(), Vec::new(), Vec::new());
     // Whether a system message may follow the last turn that is not one: a
@@ -273,7 +275,7 @@ fn container(messages: &[Message]) -> Option<&str> {
 }
 
 fn text_block(text: &str) -> Value {
-    json!({"type": "text", "text": text})
+    obj!({"type": "text", "text": text})
 }
 
 /// A user turn's blocks. Anthropic requires its tool results before its
@@ -321,7 +323,8 @@ fn result_json(result: &ToolResult) -> Result<Value, Error> {
             })
             .collect::<Result<_, _>>()?,
     };
-    let mut block = json!({"type": "tool_result", "tool_use_id": result.id, "content": content});
+    let id = result.id.as_str();
+    let mut block = obj!({"type": "tool_result", "tool_use_id": id, "content": content});
     if result.error {
         block["is_error"] = true.into();
     }
@@ -339,26 +342,26 @@ fn media_block(media: &Media) -> Result<Value, Error> {
     let readable = ["image/jpeg", "image/png", "image/gif", "image/webp"].contains(&kind);
     let source = match &media.source {
         _ if kind.starts_with("audio/") || kind.starts_with("video/") => None,
-        Source::File { id } => Some(json!({"type": "file", "file_id": id})),
+        Source::File { id } => Some(obj!({"type": "file", "file_id": id.as_str()})),
         // Anthropic's document URL source is for PDFs and names no type, so
         // an untyped URL is one.
         Source::Url { url } if image || pdf || kind.is_empty() => {
-            Some(json!({"type": "url", "url": url}))
+            Some(obj!({"type": "url", "url": url.as_str()}))
         }
         Source::Data { data } if pdf || readable => {
-            Some(json!({"type": "base64", "media_type": kind, "data": data}))
+            Some(obj!({"type": "base64", "media_type": kind, "data": data.as_str()}))
         }
         Source::Url { .. } => None,
         Source::Data { .. } if image || kind.is_empty() => None,
         Source::Data { data } => base64(data)
             .and_then(|bytes| String::from_utf8(bytes).ok())
-            .map(|text| json!({"type": "text", "media_type": "text/plain", "data": text})),
+            .map(|text| obj!({"type": "text", "media_type": "text/plain", "data": text})),
     };
     let source = source.ok_or_else(|| {
         let kind = if kind.is_empty() { "untyped" } else { kind };
         Error::unsupported(format!("the Messages API cannot carry this {kind} media"))
     })?;
-    Ok(json!({"type": if image { "image" } else { "document" }, "source": source}))
+    Ok(obj!({"type": if image { "image" } else { "document" }, "source": source}))
 }
 
 /// Standard base64 decoded, padding optional; `None` for anything else.
@@ -389,7 +392,9 @@ fn base64(text: &str) -> Option<Vec<u8>> {
 /// call to the code execution that made it.
 fn identity(item: &Value) -> Map<String, Value> {
     match (item.str("type"), item.get("caller")) {
-        (Some("tool_use"), Some(caller)) => Map::from_iter([("caller".into(), caller.clone())]),
+        (Some("tool_use"), Some(caller)) => {
+            crate::json::object([("caller".into(), caller.clone())])
+        }
         _ => Map::new(),
     }
 }
@@ -441,8 +446,9 @@ fn assistant_blocks(assistant: &Assistant) -> Vec<Value> {
                 text_block(&reasoning.text)
             }
             AssistantPart::ToolCall(call) => {
-                let mut block = json!({"type": "tool_use", "id": call.id, "name": call.name,
-                    "input": call.input});
+                let (id, name) = (call.id.as_str(), call.name.as_str());
+                let input = call.input.clone();
+                let mut block = obj!({"type": "tool_use", "id": id, "name": name, "input": input});
                 if let Some(fields) = block.as_object_mut() {
                     fields.extend(identity);
                 }

@@ -7,13 +7,12 @@
 
 use std::collections::BTreeMap;
 
-use serde::Serialize;
 use serde_json::{Map, Value, json};
 
 use super::merge::merge_fields;
 use super::{KEY, LaterSystem, PartKind, Quirks, ReasoningField, Routing, Vendor as V, rules};
 use crate::error::Error;
-use crate::json::Lenient;
+use crate::json::{Lenient, obj};
 use crate::models::openai;
 use crate::protocol::Target;
 use crate::protocols::schema;
@@ -44,8 +43,7 @@ pub(super) const DOCUMENT_UNSENDABLE: &str =
 pub(super) const NO_TOOL_OUTPUT: &str = "(no tool output)";
 
 /// Who a message is from.
-#[derive(Clone, Copy, Serialize)]
-#[serde(rename_all = "lowercase")]
+#[derive(Clone, Copy)]
 pub(super) enum Role {
     System,
     User,
@@ -54,13 +52,22 @@ pub(super) enum Role {
 }
 
 impl Role {
-    /// Whether `message` is from this role.
-    fn sent(self, message: &Value) -> bool {
-        message.get("role") == Some(&json!(self))
+    const fn as_str(self) -> &'static str {
+        match self {
+            Self::System => "system",
+            Self::User => "user",
+            Self::Assistant => "assistant",
+            Self::Tool => "tool",
+        }
     }
 
-    pub(super) fn message(self, content: impl Into<Value>) -> Value {
-        json!({"role": self, "content": content.into()})
+    /// Whether `message` is from this role.
+    fn sent(self, message: &Value) -> bool {
+        message.str("role") == Some(self.as_str())
+    }
+
+    pub(super) fn message(self, content: Value) -> Value {
+        obj!({"role": self.as_str(), "content": content})
     }
 }
 
@@ -69,13 +76,13 @@ impl Role {
 /// Signed data such as `reasoning_details` never survives an edit.
 fn identity(item: &Value) -> Map<String, Value> {
     if let Some(kind @ ("custom" | "thinking")) = item.str("type") {
-        return Map::from_iter([("type".to_owned(), Value::from(kind))]);
+        return crate::json::object([("type".to_owned(), Value::from(kind))]);
     }
     ReasoningField::ALL
         .iter()
         .map(|field| field.as_str())
         .find(|key| item.get(*key).is_some_and(Value::is_string))
-        .map_or_default(|key| Map::from_iter([(key.to_owned(), Value::String(String::new()))]))
+        .map_or_default(|key| crate::json::object([(key.to_owned(), Value::String(String::new()))]))
 }
 
 /// What the encoder knows about the target.
@@ -105,7 +112,7 @@ impl Context<'_> {
 }
 
 fn text_part(text: &str) -> Value {
-    PartKind::Text.part(text)
+    PartKind::Text.part(text.into())
 }
 
 /// The text of `parts`, one line each.
@@ -127,9 +134,9 @@ fn image_url(media: &Media, ctx: &Context<'_>, user: bool) -> Option<Value> {
         Source::Url { url } if ctx.parts() && ctx.quirks.vendor != V::Ollama => url.clone(),
         Source::Data { .. } | Source::Url { .. } | Source::File { .. } => return None,
     };
-    let mut part = json!({"url": url});
+    let mut part = obj!({"url": url});
     if user {
-        part["detail"] = json!("auto");
+        part["detail"] = "auto".into();
     }
     Some(PartKind::ImageUrl.part(part))
 }
@@ -145,23 +152,23 @@ fn audio_format(media_type: &str) -> &str {
 
 /// One user media part as the host takes it, or the note that replaces it.
 fn media_part(media: &Media, ctx: &Context<'_>) -> Result<Value, &'static str> {
-    let pdf = |file_data: String| json!({"file_data": file_data, "filename": "document.pdf"});
+    let pdf = |file_data: String| obj!({"file_data": file_data, "filename": "document.pdf"});
     let kind = media.media_type.split('/').next().unwrap_or_default();
     match (kind, &media.source) {
         ("image", _) if !ctx.images => Err(USER_IMAGE_OMITTED),
         ("image", _) => image_url(media, ctx, true).ok_or(IMAGE_UNSENDABLE),
         ("audio", Source::Data { data }) if ctx.files() => Ok(PartKind::InputAudio
-            .part(json!({"data": data, "format": audio_format(&media.media_type)}))),
+            .part(obj!({"data": data.as_str(), "format": audio_format(&media.media_type)}))),
         ("audio", _) => Err(AUDIO_UNSENDABLE),
         ("video", Source::Data { data }) if ctx.video() => {
-            Ok(PartKind::VideoUrl.part(json!({"url": data_url(media, data)})))
+            Ok(PartKind::VideoUrl.part(obj!({"url": data_url(media, data)})))
         }
         ("video", Source::Url { url }) if ctx.video() => {
-            Ok(PartKind::VideoUrl.part(json!({ "url": url })))
+            Ok(PartKind::VideoUrl.part(obj!({"url": url.as_str()})))
         }
         ("video", _) => Err(VIDEO_UNSENDABLE),
         (_, Source::File { id }) if ctx.files() && ctx.quirks.file_ids => {
-            Ok(PartKind::File.part(json!({ "file_id": id })))
+            Ok(PartKind::File.part(obj!({"file_id": id.as_str()})))
         }
         _ if media.media_type != "application/pdf" => Err(DOCUMENT_UNSENDABLE),
         (_, Source::Data { data }) if ctx.files() => {
@@ -274,7 +281,8 @@ fn tool_message(result: &ToolResult, ctx: &Context<'_>, attached: &mut Vec<Value
     } else {
         Value::String(joined_text(&parts))
     };
-    json!({"role": Role::Tool, "tool_call_id": result.id, "content": content})
+    let (role, id) = (Role::Tool.as_str(), result.id.as_str());
+    obj!({"role": role, "tool_call_id": id, "content": content})
 }
 
 /// A result as the text a host without tools reads.
@@ -301,7 +309,7 @@ fn messages(history: &[Message], ctx: &Context<'_>) -> Result<Vec<Value>, Error>
         Message::System(system) => Some(system.text()).filter(|text| !text.trim().is_empty()),
         _ => None,
     };
-    let system_message = |text: String| Role::System.message([text_part(&text)]);
+    let system_message = |text: String| Role::System.message(vec![text_part(&text)].into());
     // A host that takes system text only where the conversation begins gets
     // it all there, once a system message comes later.
     let join = ctx.quirks.later_system == LaterSystem::Leading
@@ -381,7 +389,7 @@ fn assistant_message(assistant: &Assistant, ctx: &Context<'_>) -> Option<Value> 
                         if identity.get("type") == Some(&json!("thinking")) =>
                     {
                         has_parts = true;
-                        parts.push(PartKind::Thinking.part([text_part(&block.text)]));
+                        parts.push(PartKind::Thinking.part(vec![text_part(&block.text)].into()));
                         continue;
                     }
                     Replay::Item(item) => {
@@ -424,7 +432,7 @@ fn assistant_message(assistant: &Assistant, ctx: &Context<'_>) -> Option<Value> 
             AssistantPart::Opaque(_) | AssistantPart::Media(_) | AssistantPart::ToolResult(_) => {}
         }
     }
-    let mut message = Map::from_iter([("role".to_owned(), json!(Role::Assistant))]);
+    let mut message = crate::json::object([("role".to_owned(), Role::Assistant.as_str().into())]);
     let text: String = parts.iter().filter_map(|part| part.str("text")).collect();
     if has_parts {
         message.insert("content".to_owned(), Value::Array(parts));
@@ -503,15 +511,12 @@ fn function_tool(tool: &Tool, strict_by_default: bool) -> Value {
     if strict {
         schema::openai(&mut parameters);
     }
-    let mut function = json!({
-        "name": tool.name,
-        "description": tool.description,
-        "parameters": parameters,
-    });
+    let (name, description) = (tool.name.as_str(), tool.description.as_str());
+    let mut function = obj!({"name": name, "description": description, "parameters": parameters});
     if strict {
         function["strict"] = Value::Bool(true);
     }
-    json!({"type": "function", "function": function})
+    obj!({"type": "function", "function": function})
 }
 
 fn tool_choice(choice: &ToolChoice) -> Value {
@@ -539,8 +544,8 @@ fn response_format(format: &Format) -> Option<Value> {
         .or_else(|| schema.str("title"))
         .unwrap_or("response_schema")
         .to_owned();
-    Some(json!({"type": "json_schema",
-        "json_schema": {"name": name, "strict": true, "schema": schema}}))
+    let json_schema = obj!({"name": name, "strict": true, "schema": schema});
+    Some(obj!({"type": "json_schema", "json_schema": json_schema}))
 }
 
 /// The request body for `request` to `target`.
@@ -604,13 +609,13 @@ pub(super) fn body(
         .cache_key
         .as_ref()
         .filter(|_| quirks.vendor == V::OpenAi);
-    let mut body = json!({
+    let mut body = obj!({
         "model": (quirks.routing == Routing::Path).then_some(model),
         "response_format": format,
         "messages": messages,
         "tool_choice": choice,
         "tools": (!tools.is_empty()).then_some(tools),
-        "prompt_cache_key": cache_key,
+        "prompt_cache_key": cache_key.map(String::as_str),
         "stream": true,
     });
     if let Some(fields) = body.as_object_mut() {

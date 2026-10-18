@@ -81,6 +81,27 @@ pub(crate) fn counters(object: Option<&Value>, key: Option<&str>) -> Option<u64>
         .fold(None, |sum, count| Some(sum.unwrap_or(0) + count))
 }
 
+/// An object of `fields`, later ones winning. `Map::from_iter` would sort
+/// them first, and each source type it collects brings its own copy of a
+/// stable sort (~4 KiB); inserting sorts nothing.
+pub(crate) fn object(fields: impl IntoIterator<Item = (String, Value)>) -> Map<String, Value> {
+    let mut object = Map::new();
+    object.extend(fields);
+    object
+}
+
+/// A JSON object written as `json!` writes one, each value moved in with
+/// `Value::from`. `json!` serializes a copy of every value it interpolates,
+/// so a conversation nested in it is copied again at each level.
+macro_rules! obj {
+    ({ $($key:tt: $value:expr),* $(,)? }) => {
+        serde_json::Value::Object($crate::json::object([
+            $(($key.to_owned(), serde_json::Value::from($value))),*
+        ]))
+    };
+}
+pub(crate) use obj;
+
 /// `overlay` deep-merged into `body`: objects merge key by key, anything
 /// else replaces, and `null` removes.
 pub fn overlay(body: &mut Value, overlay: &Map<String, Value>) {

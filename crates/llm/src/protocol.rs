@@ -159,12 +159,17 @@ impl Provider {
         auth: Auth,
         protocol: impl Protocol,
     ) -> Self {
+        Self::build(id.into(), base_url.into(), auth, Arc::new(protocol))
+    }
+
+    /// [`Provider::new`] past its generic arguments, compiled once.
+    fn build(id: SmolStr, base_url: String, auth: Auth, protocol: Arc<dyn Protocol>) -> Self {
         Self {
-            id: id.into(),
+            id,
             base_url: String::new(),
             auth,
             headers: Vec::new(),
-            protocol: Arc::new(protocol),
+            protocol,
         }
         .with_base_url(base_url)
     }
@@ -295,6 +300,11 @@ impl Host {
     /// The provider for this host, `protocol` speaking to it, configured
     /// from the variables `env` looks up (such as [`env`], this process's).
     pub fn provider(&self, protocol: impl Protocol, env: &Vars<'_>) -> Result<Provider, Error> {
+        self.configure(Arc::new(protocol), env)
+    }
+
+    /// [`Host::provider`] past its generic argument, compiled once.
+    fn configure(&self, protocol: Arc<dyn Protocol>, env: &Vars<'_>) -> Result<Provider, Error> {
         let auth = match self.key_env.iter().find_map(|name| var(env, name)) {
             Some(key) => self.key.auth(Secret(key)),
             None if self.keyless => Auth::None,
@@ -306,9 +316,10 @@ impl Host {
             }
         };
         let base_url = self.base_url_env.iter().find_map(|name| var(env, name));
-        Ok(Provider::new(
-            self.id,
-            base_url.as_deref().unwrap_or(self.base_url),
+        let base_url = base_url.as_deref().unwrap_or(self.base_url);
+        Ok(Provider::build(
+            self.id.into(),
+            base_url.into(),
             auth,
             protocol,
         ))

@@ -19,11 +19,11 @@ use crate::spec::{
     UserPart,
 };
 
-/// The request body; the caller's options are laid over it.
+/// The request body but its `input` and `tools`, which move in after
+/// rather than serialize as copies; the caller's options are laid over it.
 #[derive(Serialize)]
 struct Body<'a> {
     model: &'a str,
-    input: Vec<Value>,
     stream: bool,
     #[serde(skip_serializing_if = "String::is_empty")]
     instructions: String,
@@ -33,8 +33,6 @@ struct Body<'a> {
     temperature: Option<f64>,
     #[serde(skip_serializing_if = "Option::is_none")]
     top_p: Option<f64>,
-    #[serde(skip_serializing_if = "Vec::is_empty")]
-    tools: Vec<Value>,
     #[serde(skip_serializing_if = "Option::is_none")]
     tool_choice: Option<Value>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -89,13 +87,11 @@ pub(crate) fn body(
     };
     let body = Body {
         model,
-        input,
         stream: true,
         instructions,
         max_output_tokens: generation.max_output_tokens.map(std::num::NonZeroU32::get),
         temperature: generation.temperature.filter(|_| sampling),
         top_p: generation.top_p.filter(|_| sampling),
-        tools,
         tool_choice,
         parallel_tool_calls: request.parallel_tool_calls.filter(|_| tooled),
         text: request.format.as_ref().and_then(text_format),
@@ -108,6 +104,10 @@ pub(crate) fn body(
     let mut body =
         serde_json::to_value(body).map_err(|error| Error::unsupported(error.to_string()))?;
     if let Some(fields) = body.as_object_mut() {
+        fields.insert("input".to_owned(), input.into());
+        if tooled {
+            fields.insert("tools".to_owned(), tools.into());
+        }
         fields.extend(options);
     }
     Ok(body)
@@ -121,9 +121,10 @@ fn identity(item: &Value) -> Map<String, Value> {
         Some(ItemType::FunctionCall | ItemType::CustomToolCall) => &["type", "id"],
         _ => &[],
     };
-    keys.iter()
-        .filter_map(|key| Some(((*key).to_owned(), item.get(*key)?.clone())))
-        .collect()
+    crate::json::object(
+        keys.iter()
+            .filter_map(|key| Some(((*key).to_owned(), item.get(*key)?.clone()))),
+    )
 }
 
 fn unsendable(part: &str) -> Error {
@@ -182,7 +183,11 @@ fn input(messages: &[Message], stateless: bool) -> Result<Vec<Value>, Error> {
     // Whether each call id the request sends is a custom call.
     let mut custom = HashMap::<SmolStr, bool>::new();
     let mut items = Vec::new();
-    let message = |role: &str, part: Value| json!({"type": ItemType::Message, "role": role, "content": [part]});
+    let message = |role: &str, part: Value| {
+        let mut message = json!({"type": ItemType::Message, "role": role});
+        message["content"] = vec![part].into();
+        message
+    };
     for (position, turn) in messages.iter().enumerate() {
         let parts = match turn {
             Message::System(system) => {
@@ -207,10 +212,16 @@ fn input(messages: &[Message], stateless: bool) -> Result<Vec<Value>, Error> {
             Message::Tool(tool) => {
                 for result in &tool.results {
                     let (id, output) = (&result.id, result_output(&result.output)?);
-                    items.push(match custom.get(id) {
-                        Some(true) => json!({"type": ItemType::CustomToolCallOutput, "call_id": id, "output": output}),
-                        _ => json!({"type": ItemType::FunctionCallOutput, "call_id": id, "output": output, "status": Status::Completed}),
-                    });
+                    let mut item = match custom.get(id) {
+                        Some(true) => {
+                            json!({"type": ItemType::CustomToolCallOutput, "call_id": id})
+                        }
+                        _ => {
+                            json!({"type": ItemType::FunctionCallOutput, "call_id": id, "status": Status::Completed})
+                        }
+                    };
+                    item["output"] = output;
+                    items.push(item);
                 }
                 continue;
             }

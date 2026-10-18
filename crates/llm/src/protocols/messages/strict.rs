@@ -185,12 +185,10 @@ fn merge_required(schema: &mut Schema, sibling: Value) {
 
 /// Each of `schemas` strict.
 fn each(schemas: Schema) -> Value {
-    Value::Object(
-        schemas
-            .into_iter()
-            .map(|(name, schema)| (name, strict(schema)))
-            .collect(),
-    )
+    let schemas = schemas.into_iter();
+    Value::Object(crate::json::object(
+        schemas.map(|(name, schema)| (name, strict(schema))),
+    ))
 }
 
 /// `schema` in the subset strict tool use compiles: objects closed, the
