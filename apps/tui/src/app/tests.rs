@@ -235,6 +235,14 @@ fn the_wheel_scrolls_and_new_rows_keep_a_scrolled_view_still() {
 }
 
 #[test]
+fn the_empty_input_hint_starts_after_the_caret() {
+    let (mut app, _) = app(Viewport::Full, &[]);
+    let (buf, rows) = frame(&mut app, 60, 10);
+    let (x, y) = find(&rows, "message the agent");
+    assert_eq!(buf.cursor, Some((x - 1, y)));
+}
+
+#[test]
 fn ctrl_c_clears_the_input_then_detaches() {
     let (mut app, _) = app(Viewport::Full, &[]);
     press(&mut app, Key::Char('a'));

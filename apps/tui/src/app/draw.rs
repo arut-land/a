@@ -96,14 +96,16 @@ impl App {
         out.push(Line::plain("─".repeat(width), MUTED));
         let (mut rows, (cx, cy)) = self.editor.lines(width, USER);
         if self.editor.is_empty() {
+            // From the column after the caret, which would hide a first
+            // letter under it.
             let hint = if asked.is_some() {
-                "y approves · n denies"
+                " y approves · n denies"
             } else if self.view.session.is_none() {
                 ""
             } else if self.running() {
-                "ctrl-c stops the tool · /help"
+                " ctrl-c stops the tool · /help"
             } else {
-                "message the agent · /help"
+                " message the agent · /help"
             };
             rows[0].spans.push(Span::new(hint, MUTED));
         }
