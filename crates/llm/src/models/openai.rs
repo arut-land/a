@@ -40,12 +40,11 @@ fn pro(name: &str) -> bool {
 /// that names neither (a deployment name, a fine-tune).
 pub fn reasons(model: &str) -> Option<bool> {
     let name = name(model);
-    let gpt = name
+    let major = name
         .strip_prefix("gpt-")
-        .and_then(|rest| rest.split(['.', '-']).next())
-        .filter(|major| major.len() == 1)
-        .and_then(|major| major.parse::<u32>().ok())
-        .is_some_and(|major| major >= 5);
+        .and_then(|rest| rest.split(['.', '-']).next());
+    // A one-digit major version: `gpt-10` is no GPT-5 successor this knows.
+    let gpt = major.is_some_and(|major| matches!(major.as_bytes(), [b'5'..=b'9']));
     if gpt || o_series(name) {
         Some(true)
     } else {
