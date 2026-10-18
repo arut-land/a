@@ -8,152 +8,129 @@
 
 use serde_json::{Map, Value, json};
 
+type Schema = Map<String, Value>;
+
 /// The keywords that hold a schema's definitions.
 const DEFINITIONS: [&str; 2] = ["$defs", "definitions"];
 
-/// The string formats Anthropic's strict schemas take.
-const STRICT_FORMATS: [&str; 10] = [
-    "date-time",
-    "time",
-    "date",
-    "duration",
-    "email",
-    "hostname",
-    "uri",
-    "ipv4",
-    "ipv6",
-    "uuid",
-];
-
 pub(super) fn sanitize(schema: &mut Value) {
-    let mut original = std::mem::take(schema);
-    inline_local_root_reference(&mut original);
-    if let Value::Object(root) = &mut original {
+    inline_root_ref(schema);
+    if let Value::Object(root) = schema {
         if let Some(all_of) = root.remove("allOf") {
             let mut conflicts = Map::new();
             merge_all_of(root, all_of, &mut conflicts);
-            if !conflicts.is_empty() {
-                root.insert("rootAllOfConstraints".into(), Value::Object(conflicts));
-            }
+            keep_conflicts(root, "rootAllOfConstraints", conflicts);
         }
-        if !root.contains_key("type")
-            && (root.contains_key("properties") || root.contains_key("$ref"))
+        if let [false, true, _] | [false, _, true] =
+            ["type", "properties", "$ref"].map(|key| root.contains_key(key))
         {
-            root.insert("type".into(), json!("object"));
+            root.insert("type".into(), "object".into());
         }
     }
-    *schema = strict(original);
+    *schema = strict(std::mem::take(schema));
 }
 
 /// Resolve a local root `$ref` into the root, keeping the definitions nested
 /// references need and the root's sibling keywords, which JSON Schema
 /// applies conjunctively.
-fn inline_local_root_reference(schema: &mut Value) {
+fn inline_root_ref(schema: &mut Value) {
     let mut seen = std::collections::BTreeSet::new();
-    while let Some(reference) = schema
-        .get("$ref")
-        .and_then(Value::as_str)
-        .map(str::to_owned)
-    {
+    while let Some(reference) = schema.get("$ref").and_then(Value::as_str) {
         let target = reference
             .strip_prefix('#')
-            .and_then(|pointer| schema.pointer(pointer));
-        let (Some(Value::Object(mut referenced)), Some(mut root)) =
-            (target.cloned(), schema.as_object().cloned())
-        else {
+            .and_then(|at| schema.pointer(at));
+        let Some(Value::Object(mut referenced)) = target.cloned() else {
             return;
         };
-        if !seen.insert(reference) {
+        if !seen.insert(reference.to_owned()) {
             return;
         }
+        let Value::Object(mut root) = std::mem::take(schema) else {
+            return;
+        };
         root.remove("$ref");
-        for keyword in DEFINITIONS {
-            if let Some(definitions) = root.remove(keyword) {
-                let merged = merge_definitions(definitions, referenced.remove(keyword));
-                referenced.insert(keyword.into(), merged);
-            }
-        }
+        adopt_definitions(&mut referenced, |keyword| root.remove(keyword));
         merge_siblings(&mut referenced, root);
         *schema = Value::Object(referenced);
     }
 }
 
-/// The root's definitions over the inlined schema's: absolute pointers
-/// still resolve from the document root.
-fn merge_definitions(root: Value, local: Option<Value>) -> Value {
-    match (root, local) {
-        (Value::Object(root), Some(Value::Object(mut local))) => {
-            local.extend(root);
-            Value::Object(local)
-        }
-        (root, _) => root,
+/// `outer`'s definitions over `schema`'s: absolute pointers still resolve
+/// from the document root.
+fn adopt_definitions(schema: &mut Schema, mut outer: impl FnMut(&str) -> Option<Value>) {
+    for keyword in DEFINITIONS {
+        let Some(outer) = outer(keyword) else {
+            continue;
+        };
+        let merged = match (outer, schema.remove(keyword)) {
+            (Value::Object(outer), Some(Value::Object(mut local))) => {
+                local.extend(outer);
+                Value::Object(local)
+            }
+            (outer, _) => outer,
+        };
+        schema.insert(keyword.into(), merged);
+    }
+}
+
+/// `conflicts`, the constraints a root cannot hold, kept as guidance.
+fn keep_conflicts(schema: &mut Schema, key: &str, conflicts: Schema) {
+    if !conflicts.is_empty() {
+        schema.insert(key.into(), Value::Object(conflicts));
     }
 }
 
 /// Merge keywords beside a root `$ref` into its resolved object. Unions and
-/// conflicting constraints, which a root cannot hold, stay as guidance.
-fn merge_siblings(referenced: &mut Map<String, Value>, siblings: Map<String, Value>) {
+/// conflicting constraints stay as guidance.
+fn merge_siblings(schema: &mut Schema, siblings: Schema) {
     let mut conflicts = Map::new();
     for (keyword, sibling) in siblings {
         match keyword.as_str() {
-            "properties" => merge_properties(referenced, sibling),
-            "required" => merge_required(referenced, sibling),
-            "allOf" => merge_all_of(referenced, sibling, &mut conflicts),
+            "properties" => merge_properties(schema, sibling),
+            "required" => merge_required(schema, sibling),
+            "allOf" => merge_all_of(schema, sibling, &mut conflicts),
             "anyOf" | "oneOf" => {
                 conflicts.insert(keyword, sibling);
             }
             // Annotations of the root document: the root's wins.
             "description" | "title" | "$schema" | "$id" | "$comment" | "default" | "examples"
             | "deprecated" | "readOnly" | "writeOnly" => {
-                referenced.insert(keyword, sibling);
+                schema.insert(keyword, sibling);
             }
-            _ => match referenced.get(&keyword) {
-                None => {
-                    referenced.insert(keyword, sibling);
-                }
-                Some(existing) if *existing == sibling => {}
-                Some(_) => {
-                    conflicts.insert(keyword, sibling);
-                }
-            },
+            _ if schema
+                .get(&keyword)
+                .is_none_or(|existing| *existing == sibling) =>
+            {
+                schema.insert(keyword, sibling);
+            }
+            _ => {
+                conflicts.insert(keyword, sibling);
+            }
         }
     }
-    if !conflicts.is_empty() {
-        referenced.insert("rootRefSiblingConstraints".into(), Value::Object(conflicts));
-    }
+    keep_conflicts(schema, "rootRefSiblingConstraints", conflicts);
 }
 
 /// Merge each object branch of a root `allOf` into `schema`; branches that
 /// are not objects stay as guidance.
-fn merge_all_of(
-    schema: &mut Map<String, Value>,
-    sibling: Value,
-    conflicts: &mut Map<String, Value>,
-) {
-    let Value::Array(branches) = sibling else {
-        conflicts.insert("allOf".into(), sibling);
+fn merge_all_of(schema: &mut Schema, all_of: Value, conflicts: &mut Schema) {
+    let Value::Array(branches) = all_of else {
+        conflicts.insert("allOf".into(), all_of);
         return;
     };
     let mut unsupported = Vec::new();
     for branch in branches {
-        let Value::Object(mut branch) = branch else {
-            unsupported.push(branch);
-            continue;
-        };
-        if branch.contains_key("$ref") {
-            for keyword in DEFINITIONS {
-                if let Some(definitions) = schema.get(keyword).cloned() {
-                    let merged = merge_definitions(definitions, branch.remove(keyword));
-                    branch.insert(keyword.into(), merged);
+        match branch {
+            Value::Object(mut branch) if branch.contains_key("$ref") => {
+                adopt_definitions(&mut branch, |keyword| schema.get(keyword).cloned());
+                let mut inlined = Value::Object(branch);
+                inline_root_ref(&mut inlined);
+                if let Value::Object(inlined) = inlined {
+                    merge_siblings(schema, inlined);
                 }
             }
-            let mut inlined = Value::Object(branch);
-            inline_local_root_reference(&mut inlined);
-            if let Value::Object(inlined) = inlined {
-                merge_siblings(schema, inlined);
-            }
-        } else {
-            merge_siblings(schema, branch);
+            Value::Object(branch) => merge_siblings(schema, branch),
+            branch => unsupported.push(branch),
         }
     }
     if !unsupported.is_empty() {
@@ -162,69 +139,68 @@ fn merge_all_of(
 }
 
 /// Merge sibling properties; a property both define must meet both.
-fn merge_properties(schema: &mut Map<String, Value>, sibling: Value) {
+fn merge_properties(schema: &mut Schema, sibling: Value) {
     let Value::Object(siblings) = sibling else {
         schema.entry("properties").or_insert(sibling);
         return;
     };
-    let Value::Object(properties) = schema.entry("properties").or_insert_with(|| json!({})) else {
-        return;
-    };
-    for (name, sibling) in siblings {
-        let merged = match properties.remove(&name) {
-            None => sibling,
-            Some(existing) if existing == sibling => existing,
-            Some(existing) => json!({ "allOf": [existing, sibling] }),
-        };
-        properties.insert(name, merged);
+    if let Value::Object(properties) = schema.entry("properties").or_insert_with(|| json!({})) {
+        for (name, sibling) in siblings {
+            let merged = match properties.remove(&name) {
+                Some(existing) if existing != sibling => json!({ "allOf": [existing, sibling] }),
+                _ => sibling,
+            };
+            properties.insert(name, merged);
+        }
     }
 }
 
 /// Merge sibling `required` names, each once.
-fn merge_required(schema: &mut Map<String, Value>, sibling: Value) {
+fn merge_required(schema: &mut Schema, sibling: Value) {
     let Value::Array(names) = sibling else {
         schema.entry("required").or_insert(sibling);
         return;
     };
-    let Value::Array(required) = schema.entry("required").or_insert_with(|| json!([])) else {
-        return;
-    };
-    for name in names {
-        if !required.contains(&name) {
-            required.push(name);
+    if let Value::Array(required) = schema.entry("required").or_insert_with(|| json!([])) {
+        for name in names {
+            if !required.contains(&name) {
+                required.push(name);
+            }
         }
     }
 }
 
+/// Each of `schemas` strict.
+fn each(schemas: Schema) -> Value {
+    Value::Object(
+        schemas
+            .into_iter()
+            .map(|(name, schema)| (name, strict(schema)))
+            .collect(),
+    )
+}
+
 /// `schema` in the subset strict tool use compiles: objects closed, the
-/// supported keywords kept, and every other one appended to the
-/// description as `{keyword: value, ...}`.
+/// supported keywords kept, a few of the wrong type dropped, and every
+/// other one appended to the description as `{keyword: value, ...}`.
 fn strict(schema: Value) -> Value {
     let Value::Object(mut source) = schema else {
         return schema;
     };
-    let each = |schemas: Map<String, Value>| {
-        Value::Object(
-            schemas
-                .into_iter()
-                .map(|(name, schema)| (name, strict(schema)))
-                .collect(),
-        )
-    };
     let mut kept = Map::new();
-    for keyword in DEFINITIONS {
-        match source.remove(keyword) {
-            Some(Value::Object(definitions)) => {
-                kept.insert(keyword.into(), each(definitions));
+    if source.contains_key("$ref") {
+        // A reference keeps only its definitions.
+        for (keyword, value) in source {
+            match (keyword.as_str(), value) {
+                ("$defs" | "definitions", Value::Object(definitions)) => {
+                    kept.insert(keyword, each(definitions));
+                }
+                ("$ref", reference) => {
+                    kept.insert(keyword, reference);
+                }
+                _ => {}
             }
-            Some(definitions) => {
-                source.insert(keyword.into(), definitions);
-            }
-            None => {}
         }
-    }
-    if let Some(reference) = source.remove("$ref") {
-        kept.insert("$ref".into(), reference);
         return Value::Object(kept);
     }
     let kind = source.remove("type");
@@ -233,108 +209,79 @@ fn strict(schema: Value) -> Value {
         Some(Value::Array(kinds)) => kinds.iter().any(|kind| kind.as_str() == Some(expected)),
         _ => false,
     };
-    match (alternatives(&mut source), &kind) {
-        (Some((keyword, variants)), _) => {
-            let variants = variants.into_iter().map(strict).collect();
-            kept.insert(keyword.into(), Value::Array(variants));
+    // `oneOf` merges into `anyOf`, which Anthropic takes in its place.
+    let shape = match ["anyOf", "oneOf", "allOf"].map(|keyword| source.remove(keyword)) {
+        [Some(Value::Array(variants)), ..] | [_, Some(Value::Array(variants)), _] => {
+            Some(("anyOf", variants.into_iter().map(strict).collect()))
         }
-        (None, Some(kind)) => {
-            kept.insert("type".into(), kind.clone());
+        [.., Some(Value::Array(variants))] => {
+            Some(("allOf", variants.into_iter().map(strict).collect()))
         }
-        (None, None) => {}
-    }
-    if let Some(Value::Array(values)) = source.remove("enum") {
-        kept.insert("enum".into(), Value::Array(values));
-    }
-    if let Some(constant) = source.remove("const") {
-        kept.insert("const".into(), constant);
-    }
-    for keyword in ["description", "title"] {
-        if let Some(Value::String(value)) = source.remove(keyword) {
-            kept.insert(keyword.into(), Value::String(value));
-        }
-    }
+        _ => kind.clone().map(|kind| ("type", kind)),
+    };
+    kept.extend(shape.map(|(keyword, shape)| (keyword.to_owned(), shape)));
     let has_properties = source.contains_key("properties");
-    if kind.is_none() && has_properties {
-        kept.insert("type".into(), json!("object"));
-    }
-    if is("object") || has_properties {
-        let properties = match source.remove("properties") {
-            Some(Value::Object(properties)) => each(properties),
-            _ => json!({}),
-        };
-        kept.insert("properties".into(), properties);
-        source.remove("additionalProperties");
-        kept.insert("additionalProperties".into(), Value::Bool(false));
-        if let Some(Value::Array(required)) = source.remove("required") {
-            kept.insert("required".into(), Value::Array(required));
+    let object = is("object") || has_properties;
+    if object {
+        kept.insert("properties".into(), json!({}));
+        kept.insert("additionalProperties".into(), false.into());
+        if kind.is_none() && has_properties {
+            kept.insert("type".into(), "object".into());
         }
     }
-    if is("string")
-        && let Some(format) = source.remove("format")
-    {
-        if format
+    let format = |format: &Value| {
+        let formats = ["date-time", "time", "date", "duration", "email", "hostname"];
+        let more = ["uri", "ipv4", "ipv6", "uuid"];
+        format
             .as_str()
-            .is_some_and(|format| STRICT_FORMATS.contains(&format))
-        {
-            kept.insert("format".into(), format);
-        } else {
-            source.insert("format".into(), format);
-        }
-    }
-    if is("array") {
-        if let Some(items) = source.remove("items") {
-            kept.insert("items".into(), strict(items));
-        }
-        if let Some(min_items) = source.remove("minItems") {
-            if matches!(min_items.as_u64(), Some(0 | 1)) {
-                kept.insert("minItems".into(), min_items);
-            } else {
-                source.insert("minItems".into(), min_items);
+            .is_some_and(|f| formats.contains(&f) || more.contains(&f))
+    };
+    let mut guided = Map::new();
+    for (keyword, value) in source {
+        // `Some` keeps, `None` drops, `Err` guides.
+        let sent = match (keyword.as_str(), value) {
+            ("$defs" | "definitions", Value::Object(definitions)) => Ok(Some(each(definitions))),
+            ("const", value)
+            | ("enum", value @ Value::Array(_))
+            | ("description" | "title", value @ Value::String(_)) => Ok(Some(value)),
+            ("properties", Value::Object(properties)) => Ok(Some(each(properties))),
+            ("enum" | "description" | "title" | "properties", _) => Ok(None),
+            ("required", value @ Value::Array(_)) if object => Ok(Some(value)),
+            ("additionalProperties" | "required", _) if object => Ok(None),
+            ("format", value) if is("string") && format(&value) => Ok(Some(value)),
+            ("items", value) if is("array") => Ok(Some(strict(value))),
+            ("minItems", value) if is("array") && matches!(value.as_u64(), Some(0 | 1)) => {
+                Ok(Some(value))
             }
-        }
+            (_, value) => Err(value),
+        };
+        match sent {
+            Ok(Some(value)) => kept.insert(keyword, value),
+            Ok(None) => None,
+            Err(value) => guided.insert(keyword, value),
+        };
     }
-    guide(&mut kept, source);
+    guide(&mut kept, &guided);
     Value::Object(kept)
-}
-
-/// The schema's combinator, taken out of `source`: `oneOf` merges into
-/// `anyOf`, which Anthropic takes in its place.
-fn alternatives(source: &mut Map<String, Value>) -> Option<(&'static str, Vec<Value>)> {
-    match (
-        source.remove("anyOf"),
-        source.remove("oneOf"),
-        source.remove("allOf"),
-    ) {
-        (Some(Value::Array(variants)), _, _) | (_, Some(Value::Array(variants)), _) => {
-            Some(("anyOf", variants))
-        }
-        (_, _, Some(Value::Array(variants))) => Some(("allOf", variants)),
-        _ => None,
-    }
 }
 
 /// The keywords `source` still holds, appended to `kept`'s description as
 /// `{keyword: value, ...}`.
-fn guide(kept: &mut Map<String, Value>, source: Map<String, Value>) {
+fn guide(kept: &mut Schema, source: &Schema) {
     if source.is_empty() {
         return;
     }
     let hints: Vec<String> = source
-        .into_iter()
-        .map(|(keyword, value)| match value {
-            Value::String(value) => format!("{keyword}: {value}"),
-            value => format!("{keyword}: {value}"),
+        .iter()
+        .map(|(keyword, value)| match value.as_str() {
+            Some(text) => format!("{keyword}: {text}"),
+            None => format!("{keyword}: {value}"),
         })
         .collect();
-    let suffix = format!("{{{}}}", hints.join(", "));
-    match kept.get_mut("description") {
-        Some(Value::String(description)) => {
-            description.push_str("\n\n");
-            description.push_str(&suffix);
-        }
-        _ => {
-            kept.insert("description".into(), Value::String(suffix));
-        }
-    }
+    let hints = format!("{{{}}}", hints.join(", "));
+    let description = match kept.remove("description") {
+        Some(Value::String(description)) => format!("{description}\n\n{hints}"),
+        _ => hints,
+    };
+    kept.insert("description".into(), description.into());
 }
