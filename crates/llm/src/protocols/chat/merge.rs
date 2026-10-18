@@ -120,7 +120,7 @@ pub(super) fn merge_fields<'a, K: AsRef<str>>(
 /// A string merged as [`merge_fields`] merges one, without building its
 /// value first: a fragment appends, an empty string never erases one, and
 /// a string never replaces a value of another JSON type.
-fn merge_str(target: &mut Map<String, Value>, key: &str, more: &str) {
+pub(super) fn merge_str(target: &mut Map<String, Value>, key: &str, more: &str) {
     match target.get_mut(key) {
         Some(Value::String(existing)) if fragment(key) => append(existing, more),
         Some(Value::String(existing)) if more.is_empty() && !existing.is_empty() => {}
@@ -129,6 +129,24 @@ fn merge_str(target: &mut Map<String, Value>, key: &str, more: &str) {
         None => {
             target.insert(key.to_owned(), more.into());
         }
+    }
+}
+
+/// An object merged under `key` as [`merge_fields`] merges one, its fields
+/// by `merge`.
+pub(super) fn merge_object(
+    target: &mut Map<String, Value>,
+    key: &str,
+    merge: impl FnOnce(&mut Map<String, Value>),
+) {
+    match target.get_mut(key) {
+        Some(Value::Object(existing)) => merge(existing),
+        None | Some(Value::Null) => {
+            let mut object = Map::new();
+            merge(&mut object);
+            target.insert(key.to_owned(), Value::Object(object));
+        }
+        Some(_) => {}
     }
 }
 

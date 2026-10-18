@@ -6,127 +6,298 @@
 //! each tool call, image and unknown content part is a part of its own. An
 //! answer's audio transcript is its text when it has no other, and its text
 //! part holds the audio's id.
+//!
+//! A frame is read into structs that borrow its strings ([`Json`]), so a
+//! token costs no allocation beyond the text its event owns, and a field of
+//! an unexpected type reads as what it is rather than failing the frame.
 
+use std::borrow::Cow;
+use std::fmt;
+use std::marker::PhantomData;
+
+use serde::de::value::MapAccessDeserializer;
+use serde::de::{self, IgnoredAny, MapAccess, SeqAccess, Visitor};
+use serde::{Deserialize, Deserializer};
 use serde_json::{Map, Value, json};
 
-use super::merge::{REASONING_DETAILS, merge_details, merge_fields};
-use super::{KEY, Quirks};
+use super::merge::{merge_details, merge_fields, merge_object, merge_str};
+use super::{KEY, PartKind, Quirks, ReasoningField};
 use crate::error::Error;
 use crate::json::Lenient;
 use crate::protocol::Flow;
-use crate::spec::{Media, Reason, SmolStr, Source, Usage};
+use crate::spec::{Media, Meta, Reason, SmolStr, Source, Usage};
 use crate::writer::{AUTO_INDEX, CallFragment, End, Open, Writer, Writes};
 
-/// The finish reasons every host shares: `OpenAI`'s, the legacy
-/// `function_call`, and the spellings compatible servers use for the same
-/// endings.
-const CHAT_FINISHES: &[(&str, Reason)] = &[
-    ("stop", Reason::Stop),
-    ("end", Reason::Stop),
-    ("eos", Reason::Stop),
-    ("end_turn", Reason::Stop),
-    ("stop_sequence", Reason::Stop),
-    ("length", Reason::Length),
-    ("max_tokens", Reason::Length),
-    ("model_length", Reason::Length),
-    ("tool_calls", Reason::ToolCalls),
-    ("function_call", Reason::ToolCalls),
-    ("content_filter", Reason::ContentFilter),
-];
-
-/// The upstreams' own reasons a gateway forwards beside its normalized one,
-/// compared lowercased.
-const NATIVE_FINISHES: &[(&str, Reason)] = &[
-    ("stop", Reason::Stop),
-    ("end_turn", Reason::Stop),
-    ("stop_sequence", Reason::Stop),
-    ("complete", Reason::Stop),
-    ("completed", Reason::Stop),
-    ("length", Reason::Length),
-    ("max_tokens", Reason::Length),
-    ("max_output_tokens", Reason::Length),
-    ("model_length", Reason::Length),
-    ("tool_calls", Reason::ToolCalls),
-    ("function_call", Reason::ToolCalls),
-    ("tool_use", Reason::ToolCalls),
-    ("content_filter", Reason::ContentFilter),
-    ("safety", Reason::ContentFilter),
-    ("blocklist", Reason::ContentFilter),
-    ("prohibited_content", Reason::ContentFilter),
-    ("spii", Reason::ContentFilter),
-];
-
-/// `reason` in the host's documented vocabulary and the shared one; any
-/// other is [`Reason::Other`].
+/// `reason` in the host's documented vocabulary, then the shared one.
 pub(super) fn finish_reason(reason: &str, quirks: &Quirks) -> Reason {
     quirks
         .finishes
         .iter()
-        .chain(CHAT_FINISHES)
         .find(|(name, _)| *name == reason)
-        .map_or(Reason::Other, |(_, finish)| *finish)
+        .map_or_else(|| shared_finish(reason), |(_, finish)| *finish)
 }
 
-fn native_finish_reason(reason: &str) -> Reason {
-    NATIVE_FINISHES
-        .iter()
-        .find(|(name, _)| *name == reason)
-        .map_or(Reason::Other, |(_, finish)| *finish)
+/// `OpenAI`'s reasons, the legacy `function_call`, and the spellings
+/// compatible servers use for the same endings.
+fn shared_finish(reason: &str) -> Reason {
+    match reason {
+        "stop" | "end" | "eos" | "end_turn" | "stop_sequence" => Reason::Stop,
+        "length" | "max_tokens" | "model_length" => Reason::Length,
+        "tool_calls" | "function_call" => Reason::ToolCalls,
+        "content_filter" => Reason::ContentFilter,
+        _ => Reason::Other,
+    }
 }
 
-/// The keys an assistant message carries reasoning under, in the order
-/// their text is read: servers that send several send the same text under
-/// each, so the first that carries text is the one kept.
-pub(super) const REASONING_TEXT_KEYS: [&str; 3] =
-    ["reasoning_content", "reasoning", "reasoning_text"];
-
-/// What one content part of a message is.
-enum Part {
-    /// A `text` part, or a `refusal` part's text.
-    Text(String),
-    /// Mistral's reasoning: a `thinking` part's text.
-    Thinking(String),
-    Image,
-    /// A part with no shared meaning, kept as it came.
-    Unknown,
+/// The upstreams' own reasons a gateway forwards beside its normalized one,
+/// compared lowercased.
+fn native_finish(reason: &str) -> Reason {
+    match reason {
+        "end" | "eos" => Reason::Other,
+        "complete" | "completed" => Reason::Stop,
+        "max_output_tokens" => Reason::Length,
+        "tool_use" => Reason::ToolCalls,
+        "safety" | "blocklist" | "prohibited_content" | "spii" => Reason::ContentFilter,
+        reason => shared_finish(reason),
+    }
 }
 
-impl Part {
-    /// The part `part` is, by its `type`; one with no `type` and a string
-    /// `text` is text.
-    fn of(part: &Value) -> Self {
-        let text = |key: &str| part.str(key).unwrap_or_default().to_owned();
-        match part.str("type") {
-            Some("text") => Self::Text(text("text")),
-            None if part.str("text").is_some() => Self::Text(text("text")),
-            Some("refusal") => Self::Text(text("refusal")),
-            Some("thinking") => Self::Thinking(match part.get("thinking") {
-                Some(Value::Array(chunks)) => chunks
-                    .iter()
-                    .filter_map(|chunk| chunk.str("text"))
-                    .collect(),
-                _ => text("thinking"),
-            }),
-            Some("image_url") => Self::Image,
-            _ => Self::Unknown,
+/// A JSON value as the decoder reads it: absent, a string (borrowed from
+/// the frame unless it has escapes), an object read as `T`, an array of
+/// `E`s, or any other value (`null`, a number, a boolean).
+#[derive(Default)]
+enum Json<'a, T = Value, E = Value> {
+    #[default]
+    Absent,
+    Str(Cow<'a, str>),
+    Object(T),
+    List(Vec<E>),
+    Other(Value),
+}
+
+impl<T, E> Json<'_, T, E> {
+    fn str(&self) -> Option<&str> {
+        match self {
+            Self::Str(text) => Some(text),
+            _ => None,
+        }
+    }
+
+    fn object(&self) -> Option<&T> {
+        match self {
+            Self::Object(object) => Some(object),
+            _ => None,
+        }
+    }
+
+    fn items(&self) -> &[E] {
+        match self {
+            Self::List(items) => items,
+            _ => &[],
         }
     }
 }
 
-/// What one tool call of a message is, by its `type`.
-#[derive(PartialEq, Eq)]
+impl<T> Json<'_, T> {
+    /// The value, unless it is absent or an object.
+    fn scalar(&self) -> Option<Value> {
+        match self {
+            Self::Absent | Self::Object(_) => None,
+            Self::Str(text) => Some(text.as_ref().into()),
+            Self::List(items) => Some(Value::Array(items.clone())),
+            Self::Other(value) => Some(value.clone()),
+        }
+    }
+
+    /// Merge the value under `key` as [`merge_fields`] merges one, an
+    /// object by `object`.
+    fn merge<M>(&self, target: &mut Map<String, Value>, key: &str, object: M)
+    where
+        M: FnOnce(&mut Map<String, Value>, &T),
+    {
+        match self {
+            Self::Str(text) => merge_str(target, key, text),
+            Self::Object(value) => object(target, value),
+            json => {
+                if let Some(value) = json.scalar() {
+                    merge_fields(target, [(key, &value)]);
+                }
+            }
+        }
+    }
+}
+
+impl Json<'_> {
+    fn merge_value(&self, target: &mut Map<String, Value>, key: &str) {
+        self.merge(target, key, |target, value| {
+            merge_fields(target, [(key, value)]);
+        });
+    }
+
+    /// The value as text: a string as it is, anything else but `null` as
+    /// JSON.
+    fn text(&self) -> Option<Cow<'_, str>> {
+        match self {
+            Self::Str(text) => Some(Cow::Borrowed(text)),
+            Self::Object(value) => Some(value.to_string().into()),
+            json => json
+                .scalar()
+                .filter(|value| !value.is_null())
+                .map(|value| value.to_string().into()),
+        }
+    }
+}
+
+struct Read<'a, T, E>(PhantomData<Json<'a, T, E>>);
+
+impl<'de: 'a, 'a, T: Deserialize<'de>, E: Deserialize<'de>> Visitor<'de> for Read<'a, T, E> {
+    type Value = Json<'a, T, E>;
+
+    fn expecting(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str("JSON")
+    }
+
+    fn visit_unit<X: de::Error>(self) -> Result<Self::Value, X> {
+        Ok(Json::Other(Value::Null))
+    }
+
+    fn visit_bool<X: de::Error>(self, value: bool) -> Result<Self::Value, X> {
+        Ok(Json::Other(value.into()))
+    }
+
+    fn visit_i64<X: de::Error>(self, value: i64) -> Result<Self::Value, X> {
+        Ok(Json::Other(value.into()))
+    }
+
+    fn visit_u64<X: de::Error>(self, value: u64) -> Result<Self::Value, X> {
+        Ok(Json::Other(value.into()))
+    }
+
+    fn visit_f64<X: de::Error>(self, value: f64) -> Result<Self::Value, X> {
+        Ok(Json::Other(value.into()))
+    }
+
+    fn visit_borrowed_str<X: de::Error>(self, text: &'de str) -> Result<Self::Value, X> {
+        Ok(Json::Str(Cow::Borrowed(text)))
+    }
+
+    fn visit_str<X: de::Error>(self, text: &str) -> Result<Self::Value, X> {
+        Ok(Json::Str(Cow::Owned(text.to_owned())))
+    }
+
+    fn visit_string<X: de::Error>(self, text: String) -> Result<Self::Value, X> {
+        Ok(Json::Str(Cow::Owned(text)))
+    }
+
+    fn visit_seq<A: SeqAccess<'de>>(self, mut seq: A) -> Result<Self::Value, A::Error> {
+        let mut items = Vec::new();
+        while let Some(item) = seq.next_element()? {
+            items.push(item);
+        }
+        Ok(Json::List(items))
+    }
+
+    fn visit_map<A: MapAccess<'de>>(self, map: A) -> Result<Self::Value, A::Error> {
+        T::deserialize(MapAccessDeserializer::new(map)).map(Json::Object)
+    }
+}
+
+impl<'de: 'a, 'a, T: Deserialize<'de>, E: Deserialize<'de>> Deserialize<'de> for Json<'a, T, E> {
+    fn deserialize<D: Deserializer<'de>>(json: D) -> Result<Self, D::Error> {
+        json.deserialize_any(Read(PhantomData))
+    }
+}
+
+/// An array of `T` objects, or any other value.
+type List<'a, T> = Json<'a, IgnoredAny, Json<'a, T>>;
+
+#[derive(Default, Deserialize)]
+#[serde(default, bound = "'de: 'a")]
+struct Frame<'a> {
+    id: Json<'a>,
+    model: Json<'a>,
+    object: Json<'a>,
+    choices: List<'a, Choice<'a>>,
+    usage: Value,
+    error: Value,
+}
+
+#[derive(Default, Deserialize)]
+#[serde(default, bound = "'de: 'a")]
+struct Choice<'a> {
+    index: Value,
+    finish_reason: Json<'a>,
+    native_finish_reason: Json<'a>,
+    usage: Value,
+    delta: Json<'a, Delta<'a>>,
+    message: Json<'a, Delta<'a>>,
+}
+
+/// A delta of the assistant message, or a whole message.
+#[derive(Default, Deserialize)]
+#[serde(default, bound = "'de: 'a")]
+struct Delta<'a> {
+    reasoning_content: Json<'a>,
+    reasoning: Json<'a>,
+    reasoning_text: Json<'a>,
+    reasoning_details: Value,
+    audio: Value,
+    content: Json<'a>,
+    refusal: Json<'a>,
+    images: Value,
+    tool_calls: List<'a, Call<'a>>,
+}
+
+/// A tool-call fragment. Every field but `index` joins the call's item.
+#[derive(Default, Deserialize)]
+#[serde(default, bound = "'de: 'a")]
+struct Call<'a> {
+    index: Value,
+    id: Json<'a>,
+    #[serde(rename = "type")]
+    kind: Json<'a>,
+    function: Json<'a, Function<'a>>,
+    #[serde(flatten)]
+    rest: Map<String, Value>,
+}
+
+#[derive(Default, Deserialize)]
+#[serde(default, bound = "'de: 'a")]
+struct Function<'a> {
+    name: Json<'a>,
+    arguments: Json<'a>,
+    #[serde(flatten)]
+    rest: Map<String, Value>,
+}
+
+impl Call<'_> {
+    fn merge(&self, item: &mut Map<String, Value>) {
+        self.id.merge_value(item, "id");
+        self.kind.merge_value(item, "type");
+        self.function.merge(item, "function", |item, function| {
+            merge_object(item, "function", |slot| {
+                function.name.merge_value(slot, "name");
+                function.arguments.merge_value(slot, "arguments");
+                merge_fields(slot, &function.rest);
+            });
+        });
+        merge_fields(item, &self.rest);
+    }
+}
+
+/// What one tool call of a message is, by its `type`: a function (or no
+/// `type`), a custom call whose arguments are its `{"input"}`, or a kind
+/// nothing can answer, kept but never sent back.
+#[derive(Clone, Copy, PartialEq, Eq)]
 enum CallKind {
-    /// Arguments as JSON text; a call with no `type` is one.
     Function,
-    /// Free-text input, the call's `{"input"}`.
     Custom,
-    /// A kind nothing can answer, kept but never sent back.
     Unknown,
 }
 
 impl CallKind {
-    fn of(call: &Value) -> Self {
-        match call.str("type") {
+    fn of(kind: Option<&str>) -> Self {
+        match kind {
             None | Some("function") => Self::Function,
             Some("custom") => Self::Custom,
             Some(_) => Self::Unknown,
@@ -141,11 +312,10 @@ enum Writing {
     Thinking,
 }
 
-/// A tool call the reply has open.
+/// A tool call the reply has open; `opaque` for a kind nothing can answer.
 struct OpenCall {
     at: usize,
     id: Option<String>,
-    /// A kind nothing can answer: an opaque part.
     opaque: bool,
     arguments: String,
 }
@@ -165,7 +335,7 @@ pub(super) struct ChatDecoder {
     /// will hold it: the field its text arrived in, its text, and every
     /// `reasoning_details` entry in order.
     reasoning: Option<usize>,
-    reasoning_field: Option<&'static str>,
+    reasoning_field: Option<ReasoningField>,
     reasoning_text: String,
     reasoning_details: Map<String, Value>,
     audio_id: Option<Value>,
@@ -203,102 +373,107 @@ impl ChatDecoder {
         }
     }
 
-    /// Absorb what every frame carries, and take its primary choice. Usage
-    /// is the frame's, or its choice's where Moonshot reports it.
-    fn absorb(&mut self, frame: &Value) -> Option<Value> {
-        if let Some(id) = frame.str("id") {
-            self.response_id = Some(id.into());
+    /// Absorb what every frame carries, and take its primary choice: `n >
+    /// 1` streams interleave candidates told apart only by their `index`,
+    /// and candidate 0 is the turn. Usage is the frame's, or its choice's
+    /// where Moonshot reports it. A gateway's upstream-native reason stands
+    /// in only when the normalized one is absent or empty.
+    fn absorb<'a>(&mut self, frame: Frame<'a>) -> Option<Json<'a, Choice<'a>>> {
+        for (slot, value) in [
+            (&mut self.response_id, frame.id.str()),
+            (&mut self.response_model, frame.model.str()),
+        ] {
+            // What every chunk restates is kept, not copied again.
+            if let Some(value) = value.filter(|value| slot.as_deref() != Some(*value)) {
+                *slot = Some(value.into());
+            }
         }
-        if let Some(model) = frame.str("model") {
-            self.response_model = Some(model.into());
+        let primary = |choice: &Json<'_, Choice<'_>>| {
+            let index = choice.object().map(|choice| choice.index.as_u64());
+            index.is_none_or(|index| index.is_none_or(|index| index == 0))
+        };
+        let mut choice = match frame.choices {
+            Json::List(choices) => choices.into_iter().find(primary),
+            _ => None,
+        };
+        let usage = match (frame.usage, &mut choice) {
+            (Value::Null, Some(Json::Object(choice))) => choice.usage.take(),
+            (usage, _) => usage,
+        };
+        if !usage.is_null() {
+            self.usage = Some(usage);
         }
-        // `n > 1` streams interleave candidates told apart only by their
-        // `index`; candidate 0 is the turn.
-        let choice = frame
-            .arr("choices")
-            .iter()
-            .find(|choice| {
-                choice
-                    .get("index")
-                    .and_then(Value::as_u64)
-                    .is_none_or(|index| index == 0)
-            })
-            .cloned();
-        if let Some(usage) = frame
-            .at("/usage")
-            .or_else(|| choice.as_ref().and_then(|choice| choice.at("/usage")))
-        {
-            self.usage = Some(usage.clone());
-        }
-        let choice = choice?;
-        // A gateway's upstream-native reason stands in only when the
-        // normalized one is absent or empty.
-        let reason = match choice
-            .str("finish_reason")
+        let Some(Json::Object(found)) = &choice else {
+            return choice;
+        };
+        let native = found.native_finish_reason.str();
+        let reason = match found
+            .finish_reason
+            .str()
             .filter(|reason| !reason.is_empty())
         {
-            Some(reason) => Some((finish_reason(reason, &self.quirks), reason.into())),
-            None => choice
-                .str("native_finish_reason")
+            Some(reason) => (finish_reason(reason, &self.quirks), reason.into()),
+            None => match native
                 .filter(|reason| self.quirks.native_finish_reason && !reason.is_empty())
-                .map(|reason| {
+            {
+                Some(reason) => {
                     let reason = reason.to_ascii_lowercase();
-                    (native_finish_reason(&reason), reason.into())
-                }),
+                    (native_finish(&reason), reason.into())
+                }
+                None => return choice,
+            },
         };
-        if let Some(reason) = reason {
-            self.finish = Some(reason);
-            self.ended = true;
-        }
-        Some(choice)
+        self.finish = Some(reason);
+        self.ended = true;
+        choice
     }
 
     /// One delta of the assistant message: its reasoning text and details
-    /// into the reasoning part, then the content, images and calls.
-    fn delta(&mut self, delta: &Value) -> Result<(), Error> {
-        let reasoning = REASONING_TEXT_KEYS.iter().find_map(|key| {
-            delta
-                .str(key)
-                .filter(|text| !text.is_empty())
-                .map(|text| (*key, text))
-        });
-        if let Some((key, text)) = reasoning {
+    /// into the reasoning part, then the content, images and calls, each
+    /// call of a whole message (`whole`) at its position in the list.
+    fn delta(&mut self, delta: Delta<'_>, whole: bool) -> Result<(), Error> {
+        let texts = [
+            &delta.reasoning_content,
+            &delta.reasoning,
+            &delta.reasoning_text,
+        ];
+        if let Some((field, text)) = ReasoningField::first(texts.map(Json::str)) {
             self.reason(text)?;
-            self.reasoning_field.get_or_insert(key);
+            self.reasoning_field.get_or_insert(field);
         }
-        if let Some(Value::Array(details)) = delta.get(REASONING_DETAILS)
+        if let Value::Array(details) = delta.reasoning_details
             && !details.is_empty()
         {
             self.reason("")?;
-            merge_details(&mut self.reasoning_details, details.clone());
+            merge_details(&mut self.reasoning_details, details);
         }
-        let audio = delta.get("audio");
-        if let Some(id) = audio.and_then(|audio| audio.at("/id")) {
+        if let Some(id) = delta.audio.at("/id") {
             self.audio_id = Some(id.clone());
         }
-        match delta.get("content") {
-            Some(Value::Array(parts)) => {
+        match &delta.content {
+            Json::List(parts) => {
                 for part in parts {
                     self.part(part)?;
                 }
             }
-            Some(part @ Value::Object(_)) => self.part(part)?,
-            _ => {
-                let text = ["content", "refusal"]
-                    .iter()
-                    .find_map(|key| delta.str(key).filter(|text| !text.is_empty()))
-                    .or_else(|| audio.and_then(|audio| audio.str("transcript")))
-                    .filter(|text| !text.is_empty());
-                if let Some(text) = text {
+            Json::Object(part) => self.part(part)?,
+            content => {
+                let texts = [
+                    content.str(),
+                    delta.refusal.str(),
+                    delta.audio.str("transcript"),
+                ];
+                if let Some(text) = texts.into_iter().flatten().find(|text| !text.is_empty()) {
                     self.write(Writing::Text, text)?;
                 }
             }
         }
-        for image in delta.arr("images") {
+        for image in delta.images.as_array().into_iter().flatten() {
             self.image(image)?;
         }
-        for call in delta.arr("tool_calls") {
-            self.call(call)?;
+        for (position, call) in delta.tool_calls.items().iter().enumerate() {
+            let call = call.object();
+            self.call(call, whole.then_some(position).filter(|_| call.is_some()))?;
         }
         Ok(())
     }
@@ -328,7 +503,7 @@ impl ChatDecoder {
         let text = std::mem::take(&mut self.reasoning_text);
         let mut item = Map::new();
         if let Some(field) = self.reasoning_field.take() {
-            item.insert(field.to_owned(), text.into());
+            item.insert(field.as_str().to_owned(), text.into());
         }
         item.append(&mut self.reasoning_details);
         self.w.edit(at, |slot| *slot = Value::Object(item))?;
@@ -361,20 +536,17 @@ impl ChatDecoder {
     /// Close the run being written, holding its item: the thinking part, or
     /// the audio's id.
     fn close_writing(&mut self) -> Result<(), Error> {
-        let (index, item) = match self.writing.take() {
-            None => return Ok(()),
-            Some((Writing::Text, index)) => (
-                index,
-                self.audio_id
-                    .take()
-                    .map(|id| json!({ "audio": { "id": id } })),
-            ),
-            Some((Writing::Thinking, index)) => {
+        let Some((writing, index)) = self.writing.take() else {
+            return Ok(());
+        };
+        let item = match writing {
+            Writing::Text => self
+                .audio_id
+                .take()
+                .map(|id| json!({ "audio": { "id": id } })),
+            Writing::Thinking => {
                 let text = std::mem::take(&mut self.thinking_text);
-                (
-                    index,
-                    Some(json!({"type": "thinking", "thinking": [{"type": "text", "text": text}]})),
-                )
+                Some(PartKind::Thinking.part([PartKind::Text.part(text)]))
             }
         };
         if let Some(item) = item {
@@ -383,12 +555,29 @@ impl ChatDecoder {
         self.w.finish(index)
     }
 
+    /// One content part, by its `type`: text (or a part with no `type` and
+    /// a string `text`), a refusal's text, Mistral's thinking, an image, or
+    /// a part with no shared meaning, kept as it came.
     fn part(&mut self, part: &Value) -> Result<(), Error> {
-        match Part::of(part) {
-            Part::Text(text) => self.write(Writing::Text, &text),
-            Part::Thinking(text) => self.write(Writing::Thinking, &text),
-            Part::Image => self.image(part),
-            Part::Unknown => {
+        let text = |key: &str| part.str(key).unwrap_or_default();
+        match PartKind::of(part) {
+            Some(PartKind::Text) => self.write(Writing::Text, text("text")),
+            None if part.str("type").is_none() && part.str("text").is_some() => {
+                self.write(Writing::Text, text("text"))
+            }
+            Some(PartKind::Refusal) => self.write(Writing::Text, text("refusal")),
+            Some(PartKind::Thinking) => match part.get("thinking") {
+                Some(Value::Array(chunks)) => {
+                    let text: String = chunks
+                        .iter()
+                        .filter_map(|chunk| chunk.str("text"))
+                        .collect();
+                    self.write(Writing::Thinking, &text)
+                }
+                _ => self.write(Writing::Thinking, text("thinking")),
+            },
+            Some(PartKind::ImageUrl) => self.image(part),
+            _ => {
                 self.close_writing()?;
                 let index = self.w.fresh_index();
                 self.w
@@ -405,61 +594,56 @@ impl ChatDecoder {
             .or_else(|| part.get("image_url"))
             .and_then(Value::as_str)
             .unwrap_or_default();
-        let media = match url
+        let (media_type, source) = match url
             .strip_prefix("data:")
             .and_then(|rest| rest.split_once(";base64,"))
         {
-            Some((media_type, data)) => Media {
-                media_type: media_type.into(),
-                source: Source::Data {
-                    data: data.to_owned(),
-                },
-                meta: crate::Meta::new(),
-            },
-            None => Media {
-                media_type: SmolStr::new_static("image/*"),
-                source: Source::Url {
-                    url: url.to_owned(),
-                },
-                meta: crate::Meta::new(),
-            },
+            Some((media_type, data)) => (media_type.into(), Source::Data { data: data.into() }),
+            None => (
+                SmolStr::new_static("image/*"),
+                Source::Url { url: url.into() },
+            ),
         };
         self.close_writing()?;
         let index = self.w.fresh_index();
+        let media = Media {
+            media_type,
+            source,
+            meta: Meta::new(),
+        };
         self.w.open(index, Open::Media(media), Value::Null)?;
         self.w.finish(index)
     }
 
-    /// One tool-call fragment. It goes to the call at its wire index, where
-    /// the writer tells a new id under it from the call it held. Without an
-    /// index it goes to the open call that states its id; one that states
-    /// no id continues the latest call while that call's arguments are not
-    /// yet a whole object, and otherwise opens a new call when it brings a
-    /// name or arguments. Its fields merge into the call's item.
-    fn call(&mut self, call: &Value) -> Result<(), Error> {
+    /// One tool-call fragment, `None` when it is no object. It goes to the
+    /// call at its wire index (or `position`), where the writer tells a new
+    /// id under it from the call it held. Without an index it goes to the
+    /// open call that states its id; one that states no id continues the
+    /// latest call while that call's arguments are not yet a whole object,
+    /// and otherwise opens a new call when it brings a name or arguments.
+    fn call(&mut self, call: Option<&Call<'_>>, position: Option<usize>) -> Result<(), Error> {
         self.close_writing()?;
-        let id = match call.get("id") {
-            Some(Value::String(id)) if !id.is_empty() && id != "null" => Some(id.clone()),
-            Some(id @ Value::Number(_)) => Some(id.to_string()),
+        let id = call.and_then(|call| match &call.id {
+            Json::Str(id) => Some(Cow::Borrowed(id.as_ref())),
+            Json::Other(id @ Value::Number(_)) => Some(Cow::Owned(id.to_string())),
             _ => None,
+        });
+        let id = id.filter(|id| !id.is_empty() && id != "null");
+        let function = call.and_then(|call| call.function.object());
+        let name = match function.map(|function| &function.name) {
+            None | Some(Json::Absent | Json::Other(Value::Null)) => call
+                .and_then(|call| call.rest.get("custom")?.at("/name"))
+                .and_then(Value::as_str),
+            Some(name) => name.str(),
         };
-        let index = call
-            .get("index")
-            .and_then(Value::as_u64)
-            .and_then(|index| usize::try_from(index).ok())
-            .filter(|index| *index < AUTO_INDEX);
-        let arguments = call
-            .at("/function/arguments")
-            .map(|arguments| match arguments {
-                Value::String(text) => text.clone(),
-                other => other.to_string(),
-            });
-        let name = call
-            .at("/function/name")
-            .or_else(|| call.at("/custom/name"))
-            .and_then(Value::as_str);
+        let arguments = function.and_then(|function| function.arguments.text());
+        let arguments = arguments.as_deref();
         let starts = name.is_some_and(|name| !name.is_empty())
-            || arguments.as_deref().is_some_and(|text| !text.is_empty());
+            || arguments.is_some_and(|text| !text.is_empty());
+        let index = position.or_else(|| {
+            let index = usize::try_from(call?.index.as_u64()?).ok()?;
+            Some(index).filter(|index| *index < AUTO_INDEX)
+        });
         let at = match index {
             Some(index) => index,
             None => match id.as_deref() {
@@ -475,45 +659,43 @@ impl ChatDecoder {
             .map_or_else(|| self.w.fresh_index(), |open| open.at),
         };
         let opaque = if let Some(open) = self.calls.iter_mut().find(|open| open.at == at) {
-            if id.is_some() {
-                open.id.clone_from(&id);
+            if let Some(id) = &id {
+                open.id = Some(id.as_ref().to_owned());
             }
-            open.arguments
-                .push_str(arguments.as_deref().unwrap_or_default());
+            open.arguments.push_str(arguments.unwrap_or_default());
             open.opaque
         } else {
-            let opaque = CallKind::of(call) == CallKind::Unknown;
+            let kind = call.map(|call| CallKind::of(call.kind.str()));
+            let opaque = kind == Some(CallKind::Unknown);
             if opaque {
                 self.w
                     .open(at, Open::Opaque { replay: false }, Value::Null)?;
             }
             self.calls.push(OpenCall {
                 at,
-                id: id.clone(),
+                id: id.as_deref().map(str::to_owned),
                 opaque,
-                arguments: arguments.clone().unwrap_or_default(),
+                arguments: arguments.unwrap_or_default().to_owned(),
             });
             opaque
         };
         if !opaque {
+            let id = id.as_deref();
             self.w.fragment(
                 Some(at),
                 CallFragment {
-                    id: id.as_deref(),
+                    id,
                     name,
-                    arguments: arguments.as_deref(),
+                    arguments,
                 },
             )?;
         }
-        let mut fields = call.as_object().cloned().unwrap_or_default();
-        // The index orders the stream; the call it assembles has none.
-        fields.remove("index");
         self.w.edit(at, |item| {
             if !item.is_object() {
                 *item = Value::Object(Map::new());
             }
-            if let Value::Object(item) = item {
-                merge_fields(item, &fields);
+            if let (Value::Object(item), Some(call)) = (item, call) {
+                call.merge(item);
             }
         })
     }
@@ -533,7 +715,7 @@ impl ChatDecoder {
             }
             let (mut input, mut complete) = (None, false);
             self.w.edit(call.at, |item| {
-                if CallKind::of(item) == CallKind::Custom {
+                if CallKind::of(item.str("type")) == CallKind::Custom {
                     let custom = item.at("/custom/input").cloned();
                     input = Some(custom.unwrap_or_else(|| Value::from("")));
                 }
@@ -558,44 +740,6 @@ impl ChatDecoder {
         }
         self.calls = waiting;
         Ok(())
-    }
-
-    /// One `chat.completion.chunk`.
-    fn chunk(&mut self, frame: &Value) -> Result<(), Error> {
-        let Some(choice) = self.absorb(frame) else {
-            return Ok(());
-        };
-        if let Some(delta) = choice.get("delta").filter(|delta| delta.is_object()) {
-            self.delta(delta)?;
-        }
-        // Text and reasoning stay open until the stream ends: a provider may
-        // still send either after the finish chunk.
-        if matches!(self.finish, Some((Reason::ToolCalls, _))) {
-            self.close_calls(false)?;
-        }
-        Ok(())
-    }
-
-    /// The `chat.completion` body: the one chunk whose delta is its whole
-    /// message, each call at its position in the list, then the end.
-    fn whole(&mut self, frame: &Value, data: &str) -> Result<Flow, Error> {
-        let Some(choice) = self.absorb(frame) else {
-            return Err(Error::decode("the reply holds no choices", data));
-        };
-        let Some(mut message) = choice.get("message").filter(|m| m.is_object()).cloned() else {
-            return Err(Error::decode("the reply holds no message", data));
-        };
-        self.ended = true;
-        if let Some(Value::Array(calls)) = message.get_mut("tool_calls") {
-            for (index, call) in calls.iter_mut().enumerate() {
-                if let Some(call) = call.as_object_mut() {
-                    call.insert("index".to_owned(), index.into());
-                }
-            }
-        }
-        self.delta(&message)?;
-        self.close_calls(true)?;
-        self.end()
     }
 
     /// Write the provider's end of the reply.
@@ -625,21 +769,6 @@ impl ChatDecoder {
         self.close_calls(true)?;
         self.end()
     }
-
-    /// The `[DONE]` sentinel. A host whose streams omit the finish reason
-    /// ends a turn that streamed a chunk: as tool calls when it holds one,
-    /// else as a stop.
-    fn done(&mut self) -> Result<Flow, Error> {
-        if !self.ended && self.chunked && self.quirks.done_without_finish_reason {
-            self.finish = Some(if self.calls.is_empty() {
-                (Reason::Stop, SmolStr::new_static("stop"))
-            } else {
-                (Reason::ToolCalls, SmolStr::new_static("tool_calls"))
-            });
-            self.ended = true;
-        }
-        self.finish()
-    }
 }
 
 impl Writes for ChatDecoder {
@@ -648,44 +777,88 @@ impl Writes for ChatDecoder {
     }
 
     fn data(&mut self, data: &str) -> Result<Flow, Error> {
+        // A host whose streams omit the finish reason ends a turn that
+        // streamed a chunk at `[DONE]`: as tool calls when it holds one,
+        // else as a stop.
         if data.trim() == "[DONE]" {
-            return self.done();
+            if !self.ended && self.chunked && self.quirks.done_without_finish_reason {
+                self.finish = Some(if self.calls.is_empty() {
+                    (Reason::Stop, SmolStr::new_static("stop"))
+                } else {
+                    (Reason::ToolCalls, SmolStr::new_static("tool_calls"))
+                });
+                self.ended = true;
+            }
+            return self.finish();
         }
-        let frame: Value =
-            serde_json::from_str(data).map_err(|error| Error::decode(error, data))?;
-        if let Some(error) = failure(&frame) {
+        let decode = |error| Error::decode(error, data);
+        let value: Value;
+        let frame: Json<'_, Frame<'_>, IgnoredAny> = if let Ok(frame) = serde_json::from_str(data) {
+            frame
+        } else {
+            // A frame that repeats a key: as a `Value`, the last one stands.
+            value = serde_json::from_str(data).map_err(decode)?;
+            Json::deserialize(&value).map_err(decode)?
+        };
+        let frame = match frame {
+            Json::Object(frame) => frame,
+            // A bare string is the whole answer, ended as a stop.
+            Json::Str(text) if self.quirks.bare_string_reply => {
+                self.ended = true;
+                self.finish = Some((Reason::Stop, SmolStr::new_static("stop")));
+                self.write(Writing::Text, &text)?;
+                return self.end();
+            }
+            _ => return Ok(Flow::More),
+        };
+        if let Some(error) = failure(&frame, data) {
             return Err(error);
         }
-        if let (true, Value::String(text)) = (self.quirks.bare_string_reply, &frame) {
-            // A bare string is the whole answer, ended as a stop.
-            self.ended = true;
-            self.finish = Some((Reason::Stop, SmolStr::new_static("stop")));
-            let text = text.clone();
-            self.write(Writing::Text, &text)?;
-            return self.end();
-        }
         // Without a `type`, a frame is a chunk when it says so or carries
-        // choices; anything else is not this wire's and is skipped.
-        let object = frame.str("object");
-        if !frame.is_object()
-            || !(object == Some("chat.completion.chunk") || frame.get("choices").is_some())
-        {
+        // choices; anything else is not this wire's and is skipped. The
+        // `object` tag decides when the host sends one: a stream chunk may
+        // carry a whole message.
+        let object = frame.object.str();
+        if object != Some("chat.completion.chunk") && matches!(frame.choices, Json::Absent) {
             return Ok(Flow::More);
         }
-        // The `object` tag decides when the host sends one: a stream chunk
-        // may carry a whole message.
-        let whole = match object {
-            Some(object) => object == "chat.completion",
-            None => frame
-                .arr("choices")
-                .iter()
-                .any(|choice| choice.obj("message").is_some()),
-        };
+        let whole = object.map_or_else(
+            || {
+                let mut choices = frame.choices.items().iter().filter_map(Json::object);
+                choices.any(|choice| choice.message.object().is_some())
+            },
+            |object| object == "chat.completion",
+        );
+        let choice = self.absorb(frame);
         if whole {
-            return self.whole(&frame, data);
+            let Some(choice) = choice else {
+                return Err(Error::decode("the reply holds no choices", data));
+            };
+            let Json::Object(Choice {
+                message: Json::Object(message),
+                ..
+            }) = choice
+            else {
+                return Err(Error::decode("the reply holds no message", data));
+            };
+            self.ended = true;
+            self.delta(message, true)?;
+            self.close_calls(true)?;
+            return self.end();
         }
         self.chunked = true;
-        self.chunk(&frame)?;
+        if let Some(Json::Object(Choice {
+            delta: Json::Object(delta),
+            ..
+        })) = choice
+        {
+            self.delta(delta, false)?;
+        }
+        // Text and reasoning stay open until the stream ends: a provider may
+        // still send either after the finish chunk.
+        if matches!(self.finish, Some((Reason::ToolCalls, _))) {
+            self.close_calls(false)?;
+        }
         Ok(Flow::More)
     }
 
@@ -699,25 +872,23 @@ impl Writes for ChatDecoder {
 /// The in-band error envelope, delivered with a 200 status. A `null` or
 /// empty `error` can accompany valid terminal usage, and only a populated
 /// `choices` array outranks the error.
-fn failure(frame: &Value) -> Option<Error> {
-    let error = frame
-        .get("error")
-        .filter(|error| error.is_object() || error.as_str().is_some_and(|text| !text.is_empty()))?;
-    if !frame.arr("choices").is_empty() {
+fn failure(frame: &Frame<'_>, data: &str) -> Option<Error> {
+    let error = &frame.error;
+    if !(error.is_object() || error.as_str().is_some_and(|text| !text.is_empty()))
+        || !frame.choices.items().is_empty()
+    {
         return None;
     }
-    let code = error
-        .get("code")
-        .and_then(|code| match code {
-            Value::String(code) => Some(code.clone()),
-            Value::Number(code) => Some(code.to_string()),
-            _ => None,
-        })
-        .or_else(|| error.str("type").map(str::to_owned));
-    let message = error
-        .as_str()
-        .or_else(|| error.str("message"))
-        .map_or_else(|| frame.to_string(), str::to_owned);
+    let code = match error.get("code") {
+        Some(Value::String(code)) => Some(code.clone()),
+        Some(Value::Number(code)) => Some(code.to_string()),
+        _ => error.str("type").map(str::to_owned),
+    };
+    let message = error.as_str().or_else(|| error.str("message"));
+    let message = message.map_or_else(
+        || serde_json::from_str::<Value>(data).map_or_default(|frame| frame.to_string()),
+        str::to_owned,
+    );
     Some(Error::provider(code.as_deref(), message))
 }
 
@@ -739,11 +910,11 @@ fn usage_of(usage: &Value, quirks: &Quirks) -> Usage {
         count("/completion_tokens"),
         count("/total_tokens"),
     );
-    let audio = count("/prompt_tokens_details/audio_tokens").unwrap_or(0);
+    let audio_input = count("/prompt_tokens_details/audio_tokens").filter(|tokens| *tokens > 0);
     let input = prompt.map(|prompt| {
-        let beside = prompt.saturating_add(audio);
+        let beside = prompt.saturating_add(audio_input.unwrap_or(0));
         let accounted = beside.saturating_add(completion.unwrap_or(0));
-        if audio != 0 && Some(accounted) == total {
+        if audio_input.is_some() && Some(accounted) == total {
             beside
         } else {
             prompt
@@ -757,7 +928,7 @@ fn usage_of(usage: &Value, quirks: &Quirks) -> Usage {
             .or_else(|| count("/prompt_cache_hit_tokens")),
         cache_write: count("/prompt_tokens_details/cache_write_tokens")
             .or_else(|| count("/cache_creation_input_tokens")),
-        audio_input: count("/prompt_tokens_details/audio_tokens").filter(|tokens| *tokens > 0),
+        audio_input,
         reasoning: detail("completion_tokens_details", "reasoning_tokens")
             .filter(|_| quirks.reliable_reasoning_count),
         audio_output: count("/completion_tokens_details/audio_tokens").filter(|tokens| *tokens > 0),
