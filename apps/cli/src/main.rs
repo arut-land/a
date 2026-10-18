@@ -206,22 +206,30 @@ fn daemon_cmd(ctx: &Ctx, action: &DaemonCmd) -> io::Result<()> {
     Ok(())
 }
 
-/// Connects and asks to attach to `target` from this directory's workspace,
-/// replaying entries after `since`.
+/// Connects and asks to attach to `target` from this directory's workspace
+/// (or a remote daemon's), with this shell's environment (or the remote
+/// bridge's), replaying entries after `since`.
 fn attach(ctx: &Ctx, target: Target, since: u64) -> io::Result<client::Connection> {
-    let (reader, mut writer) = ctx.connect()?;
-    writer.send(&ClientMsg::Attach {
+    let mut conn = ctx.connect()?;
+    let (workspace, env) = conn.origin()?;
+    conn.writer.send(&ClientMsg::Attach {
         target,
-        workspace: sys::workspace_of(&std::env::current_dir()?),
+        workspace,
         since,
+        env: Some(env),
     })?;
-    Ok((reader, writer))
+    Ok(conn)
 }
 
 /// The line-mode client. When the daemon drains for an upgrade, it
 /// reconnects (starting the new build) and replays what it missed.
 fn repl(ctx: Ctx, target: Target) -> io::Result<()> {
-    let (mut reader, writer) = attach(&ctx, target, 0)?;
+    let client::Connection {
+        mut reader,
+        writer,
+        remote,
+    } = attach(&ctx, target, 0)?;
+    let remote = remote.is_some();
     let writer = Arc::new(Mutex::new(writer));
     let swap = Arc::clone(&writer);
     let asks = Arc::new(Mutex::new(Vec::new()));
@@ -242,7 +250,7 @@ fn repl(ctx: Ctx, target: Target) -> io::Result<()> {
             eprintln!("[daemon upgraded; reconnecting]");
             let mut writer = swap.lock().unwrap_or_else(PoisonError::into_inner);
             match attach(&ctx, Target::Id(session), view.seq) {
-                Ok((r, w)) => (reader, *writer) = (r, w),
+                Ok(conn) => (reader, *writer) = (conn.reader, conn.writer),
                 Err(e) => {
                     eprintln!("[reconnect failed: {e}]");
                     std::process::exit(1);
@@ -267,6 +275,21 @@ fn repl(ctx: Ctx, target: Target) -> io::Result<()> {
         let msg = match (line.trim(), asked) {
             ("", _) => continue,
             ("/detach", _) => break,
+            // A remote host's environment is the one its bridge started
+            // with; reattaching captures it again.
+            ("/env refresh", _) if remote => {
+                eprintln!(
+                    "[the host's environment is captured when `a` connects; reattach to refresh it]"
+                );
+                continue;
+            }
+            ("/env refresh", _) => match client::capture() {
+                Ok(env) => ClientMsg::Environment(env),
+                Err(e) => {
+                    eprintln!("[not refreshed: {e}]");
+                    continue;
+                }
+            },
             ("y" | "yes", Some(call)) => ClientMsg::Approve {
                 call,
                 approved: true,
@@ -391,6 +414,7 @@ impl View {
             }
             Body::Hook { hook, decision } => println!("  · hook {hook}: {decision:?}"),
             Body::Link { child, input } => println!("child {} {input}", child.short()),
+            Body::Environment(env) => println!("  · env {}", env.cwd.display()),
             Body::ToolProcess { .. }
             | Body::ModelCall { .. }
             | Body::Ask { .. }
@@ -467,7 +491,13 @@ fn print_outcome(outcome: &Outcome) {
     }
 }
 
-fn list((mut reader, mut writer): client::Connection) -> io::Result<Vec<SessionSummary>> {
+fn list(
+    client::Connection {
+        mut reader,
+        mut writer,
+        ..
+    }: client::Connection,
+) -> io::Result<Vec<SessionSummary>> {
     writer.send(&ClientMsg::List)?;
     reader.until(|msg| match msg {
         DaemonMsg::Sessions { sessions } => Some(sessions),
@@ -504,13 +534,13 @@ fn find(ctx: &Ctx, prefix: &str) -> io::Result<SessionId> {
 }
 
 fn new(ctx: &Ctx) -> io::Result<()> {
-    let (mut reader, mut writer) = attach(ctx, Target::New, 0)?;
-    let session = reader.until(|msg| match msg {
+    let mut conn = attach(ctx, Target::New, 0)?;
+    let session = conn.reader.until(|msg| match msg {
         DaemonMsg::Attached { session, .. } => Some(session),
         _ => None,
     })?;
     println!("{}", session.short());
-    writer.send(&ClientMsg::Detach)
+    conn.writer.send(&ClientMsg::Detach)
 }
 
 #[cfg(unix)]

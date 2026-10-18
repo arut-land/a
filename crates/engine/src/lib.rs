@@ -380,6 +380,11 @@ fn handle(daemon: &Daemon, life: &Lifecycle, conn: UnixStream) -> io::Result<()>
     }
     let _registered = life.register(tx.clone());
 
+    let set_env = |s: &Attachment, env| {
+        if let Err(e) = s.session().set_env(env) {
+            error(format!("recording the environment: {e}"));
+        }
+    };
     let mut attached: Option<Attachment> = None;
     while let Some(msg) = read_frame(&mut reader)? {
         match msg {
@@ -387,12 +392,22 @@ fn handle(daemon: &Daemon, life: &Lifecycle, conn: UnixStream) -> io::Result<()>
                 target,
                 workspace,
                 since,
+                env,
             } => match daemon.resolve(&target, workspace) {
                 Ok(s) => {
+                    // Before the replay, so a client that saw itself
+                    // attached knows its environment is recorded.
+                    if let Some(env) = env {
+                        set_env(&s, env);
+                    }
                     s.session().attach(&tx, since);
                     attached = Some(s);
                 }
                 Err(e) => error(e.to_string()),
+            },
+            ClientMsg::Environment(env) => match &attached {
+                Some(s) => set_env(s, env),
+                None => error("not attached".into()),
             },
             ClientMsg::Input { .. } | ClientMsg::Approve { .. } if life.draining().is_some() => {
                 error(

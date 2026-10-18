@@ -150,8 +150,14 @@ impl Env {
 
     /// An interactive `a` with piped stdio, as a terminal would run it.
     pub fn repl(&self, args: &[&str]) -> Repl {
-        let mut child = self
-            .cmd(args)
+        self.repl_from(args, |_| {})
+    }
+
+    /// [`Env::repl`] from a shell that `shell` sets up.
+    pub fn repl_from(&self, args: &[&str], shell: impl FnOnce(&mut Command)) -> Repl {
+        let mut cmd = self.cmd(args);
+        shell(&mut cmd);
+        let mut child = cmd
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .spawn()
@@ -210,11 +216,14 @@ impl Conn {
     }
 
     /// Attaches and returns the session and its replay, up to `Synced`.
+    /// Attaches without an environment, so the session keeps the one it has
+    /// (none for a new session: commands inherit the daemon's).
     pub fn attach(&mut self, target: Target, ws: &Path) -> (SessionId, Vec<Entry>) {
         self.send(&ClientMsg::Attach {
             target,
             workspace: ws.into(),
             since: 0,
+            env: None,
         });
         let DaemonMsg::Attached { session, .. } = self.recv() else {
             panic!("expected attached");
@@ -229,6 +238,19 @@ impl Conn {
                 }
                 msg => panic!("unexpected during replay: {msg:?}"),
             }
+        }
+    }
+
+    /// Runs `command` through the echo agent and returns its output.
+    pub fn run_command(&mut self, command: &str) -> serde_json::Value {
+        self.input(&format!("$ {command}"));
+        let entries = self.until(|e| matches!(e.body, Body::ToolResult { .. }));
+        match &entries.last().unwrap().body {
+            Body::ToolResult {
+                outcome: Outcome::Done { output },
+                ..
+            } => output.clone(),
+            other => panic!("{command} did not run: {other:?}"),
         }
     }
 

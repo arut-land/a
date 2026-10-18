@@ -77,7 +77,11 @@ fn bridge_speaks_the_protocol_over_stdio() {
     let mut stdout = BufReader::new(child.stdout.take().unwrap());
     let mut sync = String::new();
     stdout.read_line(&mut sync).unwrap();
-    assert_eq!(sync, "A-BRIDGE tok\n");
+    assert_eq!(sync, "A-BRIDGE tok env\n");
+    let Some(ClientMsg::Environment(shell)) = read_frame(&mut stdout).unwrap() else {
+        panic!("no environment after the sync line");
+    };
+    assert_eq!(shell.cwd, std::env::current_dir().unwrap());
 
     let mut send = |msg: &ClientMsg| write_frame(&mut stdin, msg).unwrap();
     send(&ClientMsg::Hello {
@@ -88,6 +92,7 @@ fn bridge_speaks_the_protocol_over_stdio() {
         target: Target::New,
         workspace: "/w".into(),
         since: 0,
+        env: None,
     });
     send(&ClientMsg::Input { text: "hi".into() });
     let mut recv = || read_frame::<DaemonMsg>(&mut stdout).unwrap().unwrap();
@@ -159,6 +164,35 @@ fn a_host_without_a_gets_this_build_installed() {
     assert!(listed.starts_with(session.trim()), "{listed}");
     let log = fs::read_to_string(scratch.root.join("ssh.log")).unwrap();
     assert_eq!(log.matches("uname -sm").count(), 1, "{log}");
+}
+
+#[test]
+fn a_remote_session_runs_in_the_hosts_directory_and_environment() {
+    let mut scratch = Scratch::new("remote-env");
+    let (mut new, remote) = fake_remote(&mut scratch, "");
+    let local = scratch.root.join("here");
+    fs::create_dir_all(&local).unwrap();
+    let session = ok(&new
+        .arg("new")
+        .current_dir(&local)
+        .env("PATH", "/usr/bin:/bin:/only/here")
+        .output()
+        .unwrap());
+
+    let dir = remote.join("sessions");
+    let log = fs::read_dir(&dir).unwrap().next().unwrap().unwrap().path();
+    assert!(log.to_str().unwrap().contains(session.trim()), "{log:?}");
+    let text = fs::read_to_string(log).unwrap();
+    let mut lines = text.lines();
+    let header: serde_json::Value = serde_json::from_str(lines.next().unwrap()).unwrap();
+    let host = remote.parent().unwrap();
+    assert_eq!(header["workspace"], host.to_str().unwrap());
+    let entry: protocol::Entry = serde_json::from_str(lines.next().expect(&text)).unwrap();
+    let Body::Environment(env) = entry.body else {
+        panic!("{entry:?}")
+    };
+    assert_eq!(env.cwd, host);
+    assert_eq!(env.vars["PATH"], "/usr/bin:/bin");
 }
 
 #[test]

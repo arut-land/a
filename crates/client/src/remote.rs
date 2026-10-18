@@ -7,12 +7,16 @@ use std::process::{Child, Command, Stdio};
 use std::thread;
 use std::time::{SystemTime, UNIX_EPOCH};
 
+use protocol::{ClientMsg, read_frame};
 use sys::Staged;
 
 use crate::{Connection, Reader, Writer};
 
 /// What the bridge prints, with its token, once it is connected.
 pub const SYNC: &str = "A-BRIDGE";
+
+/// Ends a sync line followed by the host's environment, as a frame.
+pub const WITH_ENV: &[u8] = b" env";
 
 /// The exit status a POSIX shell gives a command it cannot find.
 const NOT_FOUND: i32 = 127;
@@ -46,7 +50,7 @@ fn bridge(host: &str, script: &str, token: &str) -> io::Result<Option<Connection
     let mut out = BufReader::new(stdout);
     let sync = format!("{SYNC} {token}");
     let mut line = Vec::new();
-    loop {
+    let remote = loop {
         line.clear();
         if out.read_until(b'\n', &mut line)? == 0 {
             return match child.wait()?.code() {
@@ -56,14 +60,29 @@ fn bridge(host: &str, script: &str, token: &str) -> io::Result<Option<Connection
                 ))),
             };
         }
-        if line.trim_ascii_end() == sync.as_bytes() {
-            break;
+        match line.trim_ascii_end().strip_prefix(sync.as_bytes()) {
+            Some(WITH_ENV) => match read_frame(&mut out)? {
+                Some(ClientMsg::Environment(env)) => break env,
+                _ => return Err(io::Error::other(format!("ssh {host}: no environment"))),
+            },
+            // Without the host's environment, commands would run with this
+            // machine's paths there.
+            Some([]) => {
+                return Err(io::Error::other(format!(
+                    "the `a` on {host} is too old to report its environment; update it"
+                )));
+            }
+            _ => {}
         }
-    }
+    };
     let stdin = child.stdin.take().expect("piped");
     // Reaps ssh once the connection is closed.
     thread::spawn(move || reap(child));
-    Ok(Some((Reader(out), Writer(Box::new(stdin)))))
+    Ok(Some(Connection {
+        reader: Reader(out),
+        writer: Writer(Box::new(stdin)),
+        remote: Some(remote),
+    }))
 }
 
 fn reap(mut child: Child) {

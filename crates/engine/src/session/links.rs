@@ -9,7 +9,7 @@ use std::io;
 use std::sync::atomic::Ordering;
 use std::sync::{Arc, Mutex};
 
-use protocol::{Body, Entry, Outcome, SessionId};
+use protocol::{Body, Entry, Environment, Outcome, SessionId};
 use serde_json::Value;
 use store::{Header, Loaded, Parent};
 
@@ -85,7 +85,7 @@ impl Session {
                 call,
             }),
         };
-        daemon.start_child(header, input)
+        daemon.start_child(header, input, lock(&self.env).clone())
     }
 
     /// Re-arms links after a restart: a link without a watch gets one, and
@@ -158,11 +158,12 @@ impl Daemon {
     /// Starts child session `header.id` on `input` unless it runs already:
     /// made if missing, given `input` if its log is empty, and loaded if
     /// hibernated. Calling it again is harmless, which recovery relies on.
-    fn start_child(&self, header: Header, input: &str) -> io::Result<()> {
+    /// It runs commands in `env`, its parent's.
+    fn start_child(&self, header: Header, input: &str, env: Option<Environment>) -> io::Result<()> {
         let mut slots = lock(&self.slots);
         let Some(slot) = slots.iter().find(|s| s.header.id == header.id).cloned() else {
             let loaded = self.shared.store.create(&header)?;
-            let session = self.seed(header.clone(), loaded, input)?;
+            let session = self.seed(header.clone(), loaded, input, env)?;
             slots.push(Arc::new(Slot {
                 header,
                 live: Mutex::new(Some(session)),
@@ -173,26 +174,42 @@ impl Daemon {
         let mut live = lock(&slot.live);
         if live.is_none() {
             let loaded = self.shared.store.load(slot.header.id)?;
-            *live = Some(self.seed(slot.header.clone(), loaded, input)?);
+            *live = Some(self.seed(slot.header.clone(), loaded, input, env)?);
         }
         Ok(())
     }
 
-    /// Starts a child, first committing `input` as its opening message if
-    /// its log is empty. Nothing else writes a log that has no actor yet.
-    fn seed(&self, header: Header, mut loaded: Loaded, input: &str) -> io::Result<Arc<Session>> {
+    /// Starts a child, first committing `env` (redacted) and `input` as its
+    /// opening entries if its log is empty. Nothing else writes a log that
+    /// has no actor yet.
+    fn seed(
+        &self,
+        header: Header,
+        mut loaded: Loaded,
+        input: &str,
+        env: Option<Environment>,
+    ) -> io::Result<Arc<Session>> {
         if loaded.entries.is_empty() {
-            let entry = Entry {
-                seq: 1,
-                epoch: 0,
-                body: Body::User {
-                    text: input.to_owned(),
-                },
+            let opening = env.as_ref().map(|env| Body::Environment(env.redacted()));
+            let user = Body::User {
+                text: input.to_owned(),
             };
-            loaded.log.append(&entry)?;
-            loaded.entries.push(entry);
+            for (seq, body) in (1..).zip(opening.into_iter().chain([user])) {
+                let entry = Entry {
+                    seq,
+                    epoch: 0,
+                    body,
+                };
+                loaded.log.append(&entry)?;
+                loaded.entries.push(entry);
+            }
         }
-        Ok(Session::start(header, loaded, Arc::clone(&self.shared)))
+        Ok(Session::start_in(
+            header,
+            loaded,
+            Arc::clone(&self.shared),
+            env,
+        ))
     }
 
     /// Hands child `child`'s result to its parent, loading the parent if it

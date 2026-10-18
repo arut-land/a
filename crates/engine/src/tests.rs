@@ -1,7 +1,7 @@
 use std::path::PathBuf;
 use std::time::{Duration, Instant};
 
-use protocol::{Body, Entry, Outcome, SessionId, Target};
+use protocol::{Body, Entry, Environment, Outcome, SessionId, Target};
 use serde_json::json;
 use store::{Header, Jsonl, LogStore};
 use sys::Home;
@@ -193,6 +193,34 @@ fn a_parent_hears_from_its_child_exactly_once() {
         ]
     );
     assert_eq!(after, got);
+}
+
+#[test]
+fn a_child_runs_in_its_parents_environment() {
+    let (root, home) = home("child-env");
+    let daemon = Daemon::load(&home, &echo()).unwrap();
+    let parent = daemon.resolve(&Target::New, "/w".into()).unwrap();
+    let id = parent.session().id;
+    let vars = [("PATH", "/venv/bin"), ("API_TOKEN", "s3cret")];
+    let env = Environment {
+        cwd: "/w/sub".into(),
+        vars: vars.map(|(k, v)| (k.into(), v.into())).into(),
+        ..Environment::default()
+    };
+    parent.session().set_env(env.clone()).unwrap();
+    parent.session().submit("spawn hi".into());
+    settle(&daemon);
+    drop(parent);
+    let store = &*daemon.shared.store;
+    let child = bodies(store, id).into_iter().find_map(|b| match b {
+        Body::Link { child, .. } => Some(child),
+        _ => None,
+    });
+    let opening = bodies(store, child.unwrap()).into_iter().next();
+    drop(daemon);
+    std::fs::remove_dir_all(&root).unwrap();
+
+    assert_eq!(opening, Some(Body::Environment(env.redacted())));
 }
 
 /// Logs as a daemon killed at various points leaves them: each parent's

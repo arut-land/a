@@ -102,7 +102,8 @@ pub fn replay(agent: &mut dyn Agent, entries: &[Entry]) -> VecDeque<Action> {
             | Body::Hook { .. }
             | Body::Ask { .. }
             | Body::Watch { .. }
-            | Body::Fired { .. } => continue,
+            | Body::Fired { .. }
+            | Body::Environment(_) => continue,
         };
         asked.extend(agent.step(input));
     }

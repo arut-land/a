@@ -1,5 +1,7 @@
 //! Wire types shared by the daemon and every client, plus framing.
 
+use std::collections::BTreeMap;
+use std::ffi::OsString;
 use std::fmt;
 use std::io::{self, Read, Write};
 use std::path::PathBuf;
@@ -127,6 +129,102 @@ pub enum Body {
         watch: u64,
         outcome: Outcome,
     },
+    /// The environment the session's commands run in from here on, as the
+    /// attaching client captured it, secrets redacted.
+    Environment(Environment),
+}
+
+/// A client's shell environment: what a command the agent runs for it sees.
+/// Commands run with exactly `vars` in `cwd`, never with the daemon's own.
+///
+/// Secret values live only in memory: the logged form names them in
+/// `redacted` instead, so after a daemon restart commands run without them
+/// until a client attaches or refreshes again.
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Environment {
+    pub cwd: PathBuf,
+    pub vars: BTreeMap<String, String>,
+    /// Secrets whose values were left out of `vars`.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub redacted: Vec<String>,
+    /// Whether the client ran at a terminal.
+    #[serde(default)]
+    pub tty: bool,
+}
+
+/// Bookkeeping of the client's shell, not meant for the commands run for
+/// it: never captured.
+const DENIED: &[&str] = &["_", "OLDPWD", "PWD", "SHLVL"];
+
+/// Never secret, whatever the patterns below say.
+const PUBLIC: &[&str] = &["SSH_AUTH_SOCK", "GPG_AGENT_INFO"];
+
+/// A name containing any of these, in any case, holds a secret…
+const SECRET_WORDS: &[&str] = &[
+    "PASSWORD",
+    "PASSWD",
+    "SECRET",
+    "TOKEN",
+    "CREDENTIAL",
+    "API_KEY",
+    "PRIVATE_KEY",
+];
+
+/// …as does one ending in one of these.
+const SECRET_SUFFIXES: &[&str] = &["_KEY", "_PASS", "_PAT", "_DSN", "_COOKIE"];
+
+impl Environment {
+    /// Captures `vars`, leaving out denied names and anything not UTF-8.
+    pub fn new(
+        cwd: PathBuf,
+        vars: impl IntoIterator<Item = (OsString, OsString)>,
+        tty: bool,
+    ) -> Self {
+        // Inserted one by one: collecting would sort, in code of its own.
+        let mut map = BTreeMap::new();
+        for (k, v) in vars {
+            if let (Ok(k), Ok(v)) = (k.into_string(), v.into_string())
+                && !DENIED.contains(&k.as_str())
+            {
+                map.insert(k, v);
+            }
+        }
+        Self {
+            cwd,
+            vars: map,
+            redacted: Vec::new(),
+            tty,
+        }
+    }
+
+    /// Whether variable `name` holds a secret, whose value is never logged.
+    pub fn is_secret(name: &str) -> bool {
+        let name = name.to_ascii_uppercase();
+        !PUBLIC.contains(&name.as_str())
+            && (SECRET_WORDS.iter().any(|w| name.contains(w))
+                || SECRET_SUFFIXES.iter().any(|s| name.ends_with(s)))
+    }
+
+    /// This environment as it may be logged: secret values dropped, their
+    /// names kept in `redacted`.
+    #[must_use]
+    pub fn redacted(&self) -> Self {
+        let mut redacted = self.redacted.clone();
+        let mut vars = BTreeMap::new();
+        for (k, v) in &self.vars {
+            if Self::is_secret(k) {
+                redacted.push(k.clone());
+            } else {
+                vars.insert(k.clone(), v.clone());
+            }
+        }
+        Self {
+            cwd: self.cwd.clone(),
+            vars,
+            redacted,
+            tty: self.tty,
+        }
+    }
 }
 
 /// What a hook decided, by decision point. Only decisions that change
@@ -230,11 +328,17 @@ pub enum ClientMsg {
         proto: u32,
         build: String,
     },
+    /// `env` is the client's, for the commands the session runs; without
+    /// one the session keeps the environment it had.
     Attach {
         target: Target,
         workspace: PathBuf,
         since: u64,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        env: Option<Environment>,
     },
+    /// Replaces the attached session's environment (`/env refresh`).
+    Environment(Environment),
     Input {
         text: String,
     },
@@ -399,6 +503,39 @@ mod tests {
         let e: Entry = serde_json::from_str(old).unwrap();
         assert!(matches!(&e.body, Body::ToolCall { id: None, .. }));
         assert_eq!(serde_json::to_string(&e).unwrap(), old);
+    }
+
+    #[test]
+    fn secrets_are_redacted_by_name() {
+        let vars = [
+            ("PATH", "/bin"),
+            ("OPENAI_API_KEY", "sk-1"),
+            ("GITHUB_TOKEN", "ghp-1"),
+            ("DB_PASSWORD", "hunter2"),
+            ("SSH_AUTH_SOCK", "/tmp/agent"),
+            ("PWD", "/x"),
+        ]
+        .map(|(k, v)| (k.into(), v.into()));
+        let env = Environment::new("/w".into(), vars, true);
+        assert!(!env.vars.contains_key("PWD"));
+        let logged = env.redacted();
+        assert_eq!(
+            logged.vars.keys().collect::<Vec<_>>(),
+            ["PATH", "SSH_AUTH_SOCK"]
+        );
+        assert_eq!(
+            logged.redacted.iter().collect::<Vec<_>>(),
+            ["DB_PASSWORD", "GITHUB_TOKEN", "OPENAI_API_KEY"]
+        );
+        assert_eq!(logged.redacted(), logged);
+        let json = serde_json::to_string(&Body::Environment(logged)).unwrap();
+        assert!(
+            json.starts_with(r#"{"kind":"environment","cwd":"/w","#),
+            "{json}"
+        );
+        for secret in ["sk-1", "ghp-1", "hunter2"] {
+            assert!(!json.contains(secret), "{json}");
+        }
     }
 
     #[test]

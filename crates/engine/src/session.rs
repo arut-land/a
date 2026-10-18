@@ -9,7 +9,7 @@ use std::thread;
 use std::time::{Duration, Instant};
 
 use agent::{Action, Agent, Cx, Decided, DynTool, Gate, Hooks, Input, Replay, Toolset};
-use protocol::{Body, DaemonMsg, Decision, Entry, Outcome, SessionId, SessionSummary};
+use protocol::{Body, DaemonMsg, Decision, Entry, Environment, Outcome, SessionId, SessionSummary};
 use serde_json::Value;
 use store::{Header, Loaded, Log, LogStore, Parent};
 
@@ -52,6 +52,9 @@ pub struct Session {
     /// Open client attachments; a session with any stays loaded.
     attached: AtomicUsize,
     last_active: Mutex<Instant>,
+    /// What commands run in: the last client's capture, secrets included,
+    /// or after a restart the last one logged, without them.
+    env: Mutex<Option<Environment>>,
     shared: Arc<Shared>,
 }
 
@@ -100,8 +103,20 @@ impl Session {
     /// agent and runs its effects. Calls left dangling by a crash are
     /// recovered first.
     pub fn start(header: Header, loaded: Loaded, shared: Arc<Shared>) -> Arc<Self> {
+        Self::start_in(header, loaded, shared, None)
+    }
+
+    /// [`Session::start`], running commands in `env` rather than the last
+    /// one logged: a child runs in its parent's, secrets included.
+    fn start_in(
+        header: Header,
+        loaded: Loaded,
+        shared: Arc<Shared>,
+        env: Option<Environment>,
+    ) -> Arc<Self> {
         let (mailbox, rx) = mpsc::channel();
         let armed = links::armed(&loaded.entries).count();
+        let env = env.or_else(|| logged_env(&loaded.entries).cloned());
         let session = Arc::new(Self {
             id: header.id,
             workspace: header.workspace,
@@ -119,6 +134,7 @@ impl Session {
             queued: AtomicUsize::new(1 + armed),
             attached: AtomicUsize::new(0),
             last_active: Mutex::new(Instant::now()),
+            env: Mutex::new(env),
             shared,
         });
         let actor = Arc::clone(&session);
@@ -190,6 +206,18 @@ impl Session {
             }
         }
         st.clients.push(client.clone());
+    }
+
+    /// Runs commands from now on in `env`, the newest client's. Its redacted
+    /// form is logged when that differs from the last one logged, so
+    /// re-attaching from the same shell adds nothing.
+    pub fn set_env(&self, env: Environment) -> io::Result<()> {
+        let logged = env.redacted();
+        *lock(&self.env) = Some(env);
+        if logged_env(&self.lock().entries) == Some(&logged) {
+            return Ok(());
+        }
+        self.append(Body::Environment(logged)).map(drop)
     }
 
     pub fn summary(&self) -> SessionSummary {
@@ -477,8 +505,10 @@ impl Session {
                 self.warn(format_args!("recording process {pgid}: {e}"));
             }
         };
+        let env = lock(&self.env).clone();
         let cx = Cx {
             cwd: &self.workspace,
+            env: env.as_ref(),
             spawned: &spawned,
         };
         contain(|| self.shared.tools.run(tool, input, &cx))
@@ -572,6 +602,14 @@ impl Session {
         }
         self.drive(agent, actions, inputs)
     }
+}
+
+/// The environment most recently logged.
+fn logged_env(entries: &[Entry]) -> Option<&Environment> {
+    entries.iter().rev().find_map(|e| match &e.body {
+        Body::Environment(env) => Some(env),
+        _ => None,
+    })
 }
 
 /// Runs an effect so that a panic inside it fails the call instead of taking
