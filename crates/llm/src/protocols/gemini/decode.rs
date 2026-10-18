@@ -3,38 +3,145 @@
 //! continues the part before it while its kind stays the same, and a part
 //! that carries only a thought signature joins the part beside it; any
 //! other part stands alone. Only the first candidate is read.
+//!
+//! Chunks parse into types that borrow their text, so streamed text costs
+//! only the copies its events keep. They read as [`Lenient`] does: a field
+//! of a type Gemini's schema does not give it is absent.
 
-use serde_json::{Value, json};
+use std::borrow::Cow;
+use std::fmt::{self, Write as _};
+use std::marker::PhantomData;
+
+use serde::Deserialize;
+use serde::de::{Deserializer, IgnoredAny, SeqAccess, Visitor};
+use serde_json::{Map, Value, json};
+use smol_str::format_smolstr;
 
 use super::KEY;
 use crate::error::{Error, Kind};
 use crate::json::Lenient;
 use crate::protocol::Flow;
-use crate::spec::{Media, Reason, SmolStr, Source, Usage};
+use crate::spec::{Media, Meta, Reason, SmolStr, Source, Usage};
 use crate::writer::{End, Open, Writer, Writes};
 
-/// The fields of a part that carry no data of their own.
-const fn is_bare(key: &str) -> bool {
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct Chunk<'a> {
+    #[serde(default, deserialize_with = "lax")]
+    response_id: Option<SmolStr>,
+    #[serde(default, deserialize_with = "lax")]
+    model_version: Option<SmolStr>,
+    #[serde(default, deserialize_with = "present")]
+    usage_metadata: bool,
+    error: Option<Value>,
+    prompt_feedback: Option<Value>,
+    /// The first: it holds every part and the finish, so one of the wrong
+    /// type, or with content or parts of the wrong type, fails the reply.
+    #[serde(borrow, default, deserialize_with = "first")]
+    candidates: Option<Candidate<'a>>,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct Candidate<'a> {
+    #[serde(default, deserialize_with = "lax")]
+    finish_reason: Option<FinishReason>,
+    #[serde(default, deserialize_with = "lax")]
+    finish_message: Option<String>,
+    #[serde(borrow)]
+    content: Option<Content<'a>>,
+}
+
+#[derive(Deserialize)]
+struct Content<'a> {
+    #[serde(borrow)]
+    parts: Option<Vec<Part<'a>>>,
+}
+
+/// Proto3 JSON spells an enum value its schema does not know as its number.
+#[derive(Deserialize)]
+#[serde(untagged)]
+enum FinishReason {
+    Name(SmolStr),
+    Number(serde_json::Number),
+}
+
+/// A text part, its text borrowed unless it holds escapes, or any other
+/// part as sent.
+#[derive(Deserialize)]
+#[serde(untagged)]
+enum Part<'a> {
+    Text {
+        #[serde(borrow)]
+        text: Cow<'a, str>,
+        #[serde(flatten)]
+        rest: Map<String, Value>,
+    },
+    Other(Value),
+}
+
+/// A chunk's usage, the rest unread.
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct UsageOf {
+    usage_metadata: Value,
+}
+
+fn present<'de, D: Deserializer<'de>>(field: D) -> Result<bool, D::Error> {
+    IgnoredAny::deserialize(field).map(|_| true)
+}
+
+/// A field of another type is absent.
+fn lax<'de, D: Deserializer<'de>, T: Deserialize<'de>>(field: D) -> Result<Option<T>, D::Error> {
+    #[derive(Deserialize)]
+    #[serde(untagged)]
+    enum Lax<T> {
+        Is(T),
+        Not(IgnoredAny),
+    }
+    Ok(match Option::deserialize(field)? {
+        Some(Lax::Is(value)) => Some(value),
+        Some(Lax::Not(_)) | None => None,
+    })
+}
+
+/// The first element of a list, or `None` for `null`.
+fn first<'de, D: Deserializer<'de>, T: Deserialize<'de>>(list: D) -> Result<Option<T>, D::Error> {
+    struct First<T>(PhantomData<T>);
+    impl<'de, T: Deserialize<'de>> Visitor<'de> for First<T> {
+        type Value = Option<T>;
+        fn expecting(&self, f: &mut fmt::Formatter) -> fmt::Result {
+            f.write_str("a list")
+        }
+        fn visit_unit<E>(self) -> Result<Option<T>, E> {
+            Ok(None)
+        }
+        fn visit_seq<A: SeqAccess<'de>>(self, mut list: A) -> Result<Option<T>, A::Error> {
+            let first = list.next_element()?;
+            while list.next_element::<IgnoredAny>()?.is_some() {}
+            Ok(first)
+        }
+    }
+    list.deserialize_any(First(PhantomData))
+}
+
+/// Whether a finish or block reason is a content filter's verdict, final.
+fn filtered(reason: &str) -> bool {
     matches!(
-        key.as_bytes(),
-        b"thought" | b"thoughtSignature" | b"partMetadata"
+        reason,
+        "SAFETY" | "BLOCKLIST" | "PROHIBITED_CONTENT" | "IMAGE_SAFETY" | "MODEL_ARMOR"
     )
 }
 
-/// What a Google `finishReason` means. Every reason but `STOP` and
-/// `MAX_TOKENS` is a failure: the content filters one kind, the rest
-/// (`RECITATION`, `MALFORMED_FUNCTION_CALL`, …) another.
-pub(crate) const fn reason_of(name: &str) -> Reason {
-    match name.as_bytes() {
-        b"STOP" => Reason::Stop,
-        b"MAX_TOKENS" => Reason::Length,
-        b"SAFETY"
-        | b"BLOCKLIST"
-        | b"PROHIBITED_CONTENT"
-        | b"SPII"
-        | b"IMAGE_SAFETY"
-        | b"IMAGE_PROHIBITED_CONTENT"
-        | b"MODEL_ARMOR" => Reason::ContentFilter,
+/// Every finish reason but `STOP` and `MAX_TOKENS` is a failure: the
+/// content filters' are one kind, the rest (`RECITATION`,
+/// `MALFORMED_FUNCTION_CALL`, …) another.
+fn reason_of(name: &str) -> Reason {
+    match name {
+        "STOP" => Reason::Stop,
+        "MAX_TOKENS" => Reason::Length,
+        "SPII" | "IMAGE_PROHIBITED_CONTENT" => Reason::ContentFilter,
+        name if filtered(name) => Reason::ContentFilter,
         _ => Reason::Other,
     }
 }
@@ -43,15 +150,12 @@ pub(crate) const fn reason_of(name: &str) -> Reason {
 /// prompt, output the candidates plus the thoughts; a count Gemini leaves
 /// out is zero, as its JSON omits zeros. Audio is read from the per-modality
 /// details.
-pub(crate) fn usage_of(usage: &Value) -> Usage {
+fn usage_of(usage: &Value) -> Usage {
     let count = |key: &str| usage.u64(key);
-    let modality = |key: &str, modality: &str| {
-        usage
-            .arr(key)
-            .iter()
-            .filter(|detail| detail.str("modality") == Some(modality))
-            .filter_map(|detail| detail.u64("tokenCount"))
-            .reduce(|a, b| a + b)
+    let is_audio = |detail: &&Value| detail.str("modality") == Some("AUDIO");
+    let audio = |key: &str| {
+        let all = usage.arr(key).iter().filter(is_audio);
+        all.filter_map(|d| d.u64("tokenCount")).reduce(|a, b| a + b)
     };
     let thoughts = count("thoughtsTokenCount");
     let tool = count("toolUsePromptTokenCount");
@@ -60,9 +164,9 @@ pub(crate) fn usage_of(usage: &Value) -> Usage {
         output: Some(count("candidatesTokenCount").unwrap_or(0) + thoughts.unwrap_or(0)),
         cache_read: count("cachedContentTokenCount"),
         tool_input: tool,
-        audio_input: modality("promptTokensDetails", "AUDIO"),
+        audio_input: audio("promptTokensDetails"),
         reasoning: thoughts,
-        audio_output: modality("candidatesTokensDetails", "AUDIO"),
+        audio_output: audio("candidatesTokensDetails"),
         ..Usage::default()
     }
 }
@@ -70,17 +174,14 @@ pub(crate) fn usage_of(usage: &Value) -> Usage {
 /// The error a blocked prompt's `promptFeedback` means; `None` when it
 /// names no block. A verdict on the content is final; `OTHER` and reasons
 /// no rule knows are transient.
-pub(crate) fn blocked(feedback: &Value) -> Option<Error> {
+fn blocked(feedback: &Value) -> Option<Error> {
     let reason = match feedback.get("blockReason")? {
         Value::String(reason) => reason.clone(),
         Value::Number(number) => format!("BLOCK_REASON_{number}"),
         _ => return None,
     };
     // The zero value: Gemini spells it `BLOCK_REASON_`, Vertex AI `BLOCKED_REASON_`.
-    if matches!(
-        reason.as_str(),
-        "BLOCK_REASON_UNSPECIFIED" | "BLOCKED_REASON_UNSPECIFIED"
-    ) {
+    if reason == "BLOCK_REASON_UNSPECIFIED" || reason == "BLOCKED_REASON_UNSPECIFIED" {
         return None;
     }
     let spelled = |value: Option<&Value>| match value {
@@ -88,97 +189,74 @@ pub(crate) fn blocked(feedback: &Value) -> Option<Error> {
         Some(other) => other.to_string(),
         None => "<unset>".to_owned(),
     };
-    let ratings: Vec<String> = feedback
-        .arr("safetyRatings")
-        .iter()
-        .map(|rating| {
-            format!(
-                "{}={}",
-                spelled(rating.get("category")),
-                spelled(rating.get("probability"))
-            )
-        })
-        .collect();
-    let ratings = if ratings.is_empty() {
-        String::new()
-    } else {
-        format!(", safety_ratings=[{}]", ratings.join(", "))
-    };
-    let message = format!("Gemini blocked the prompt: block_reason={reason}{ratings}");
+    let ratings = feedback.arr("safetyRatings").iter().map(|rating| {
+        let category = spelled(rating.get("category"));
+        format!("{category}={}", spelled(rating.get("probability")))
+    });
+    let ratings = ratings.collect::<Vec<_>>().join(", ");
+    let mut message = format!("Gemini blocked the prompt: block_reason={reason}");
+    if !ratings.is_empty() {
+        let _ = write!(message, ", safety_ratings=[{ratings}]");
+    }
     let mut error = Error::provider(Some(&reason), message);
-    if matches!(
-        reason.as_str(),
-        "SAFETY"
-            | "BLOCKLIST"
-            | "PROHIBITED_CONTENT"
-            | "IMAGE_SAFETY"
-            | "MODEL_ARMOR"
-            | "JAILBREAK"
-    ) {
+    if filtered(&reason) || reason == "JAILBREAK" {
         error.kind = Kind::ContentFilter;
     }
     Some(error)
 }
 
 /// The error an in-band `error` reports. A code that is an HTTP error
-/// status classifies as that status would; any other is the provider's.
+/// status classifies as that status would; any other, or one spelled as a
+/// string, is the provider's.
 fn in_band(error: &Value) -> Error {
     let body = json!({ "error": error }).to_string();
-    // A code spelled as a string is no status.
-    let status = error
-        .get("code")
-        .and_then(Value::as_u64)
-        .and_then(|code| u16::try_from(code).ok())
-        .filter(|code| (400..=599).contains(code));
-    if let Some(status) = status {
+    let code = error.get("code").and_then(Value::as_u64);
+    let status = code.and_then(|code| u16::try_from(code).ok());
+    if let Some(status) = status.filter(|status| (400..=599).contains(status)) {
         return Error::from_status(status, &http::HeaderMap::new(), body.as_bytes());
     }
-    let message = error
-        .str("message")
-        .map_or_else(|| body.clone(), str::to_owned);
+    let message = error.str("message").map_or(body, str::to_owned);
     Error::provider(error.str("status"), message)
 }
 
-fn malformed(what: &str, data: &str) -> Error {
-    Error::decode(format!("Gemini sent {what}"), data)
-}
-
-/// A streamed part merged into the part its block holds: the text appends,
-/// a non-empty `thoughtSignature` replaces the one held, and any other
-/// field replaces its namesake.
-fn merge_part(item: &mut Value, part: &Value) {
-    let (Value::Object(held), Value::Object(part)) = (&mut *item, part) else {
-        *item = part.clone();
-        return;
+/// The image (or other media) a reply part carries inline or by URI.
+fn media_of(part: &Map<String, Value>) -> Option<Media> {
+    let inline = part.get("inlineData").filter(|inline| inline.is_object());
+    let (media_type, source) = if let Some(inline) = inline {
+        let data = inline.str("data")?.to_owned();
+        (inline.str("mimeType")?, Source::Data { data })
+    } else {
+        let file = part.get("fileData")?;
+        let url = file.str("fileUri")?.to_owned();
+        let media_type = file.str("mimeType").unwrap_or("application/octet-stream");
+        (media_type, Source::Url { url })
     };
-    for (key, value) in part {
-        if key == "text"
-            && let (Some(Value::String(text)), Value::String(more)) = (held.get_mut("text"), value)
-        {
-            text.push_str(more);
-        } else if key != "thoughtSignature" || value.as_str() != Some("") {
-            held.insert(key.clone(), value.clone());
-        }
-    }
+    let media_type = media_type.into();
+    Some(Media {
+        media_type,
+        source,
+        meta: Meta::new(),
+    })
 }
 
 pub(crate) struct GeminiDecoder {
     w: Writer,
-    /// The latest `finishReason`, and the `finishMessage` beside it.
-    finish: Option<(SmolStr, Option<String>)>,
-    /// The latest `usageMetadata`.
-    usage: Option<Value>,
-    model: Option<SmolStr>,
-    response_id: Option<SmolStr>,
-    /// The text or thought run later parts continue, and whether it is
-    /// thought.
-    run: Option<(usize, bool)>,
-    /// Whether the run holds a signature.
-    signed: bool,
+    /// What the reply's end reports, as far as it is known: the latest
+    /// `finishReason` and the `finishMessage` beside it, the reply's id and
+    /// model.
+    end: End,
+    /// The latest chunk that carried `usageMetadata`, read when the reply
+    /// ends: most chunks carry one.
+    usage: String,
     /// The part written last.
     last: Option<usize>,
+    /// Whether that part is a run later text continues, and if so whether
+    /// thought.
+    run: Option<bool>,
+    /// Whether the run holds a signature.
+    signed: bool,
     /// A signature sent alone before any part, which the next part takes.
-    signature: Option<String>,
+    signature: Option<Value>,
 }
 
 impl GeminiDecoder {
@@ -187,13 +265,11 @@ impl GeminiDecoder {
             // A call Gemini sends without an id (Gemini 2.5) keeps its part,
             // which takes the id replay gives it.
             w: Writer::new(KEY).with_call_id_slot(),
-            finish: None,
-            usage: None,
-            model: None,
-            response_id: None,
+            end: End::default(),
+            usage: String::new(),
+            last: None,
             run: None,
             signed: false,
-            last: None,
             signature: None,
         }
     }
@@ -201,26 +277,23 @@ impl GeminiDecoder {
     /// End the reply on the latest finish reason; without one it never
     /// ended.
     fn finish(&mut self) -> Result<Flow, Error> {
-        let Some((name, message)) = self.finish.take() else {
+        let mut end = std::mem::take(&mut self.end);
+        let Some((reason, _)) = end.reason else {
             return Err(Error::incomplete());
         };
         self.close()?;
-        let reason = reason_of(&name);
-        self.w.end(End {
-            usage: self.usage.as_ref().map_or_default(usage_of),
-            reason: Some((reason, Some(name))),
-            response_id: self.response_id.take(),
-            model: self.model.take(),
-            message: message.filter(|_| reason != Reason::Stop),
-            raw_usage: self.usage.take(),
-        })
+        let chunk = serde_json::from_str::<UsageOf>(&self.usage).ok();
+        end.raw_usage = chunk.map(|chunk| chunk.usage_metadata);
+        end.usage = end.raw_usage.as_ref().map_or_default(usage_of);
+        end.message = end.message.filter(|_| reason != Reason::Stop);
+        self.w.end(end)
     }
 
     /// Finish the open run: Gemini states each part whole.
     fn close(&mut self) -> Result<(), Error> {
-        match self.run.take() {
-            Some((index, _)) => self.w.finish(index),
-            None => Ok(()),
+        match (self.run.take(), self.last) {
+            (Some(_), Some(index)) => self.w.finish(index),
+            _ => Ok(()),
         }
     }
 
@@ -231,125 +304,96 @@ impl GeminiDecoder {
         self.close()?;
         let index = self.w.fresh_index();
         if let (Some(signature), Some(fields)) = (self.signature.take(), item.as_object_mut()) {
-            fields
-                .entry("thoughtSignature")
-                .or_insert(Value::String(signature));
+            fields.entry("thoughtSignature").or_insert(signature);
         }
         self.last = Some(index);
-        self.signed = item
-            .str("thoughtSignature")
-            .is_some_and(|signature| !signature.is_empty());
-        let run = match block {
+        self.signed = item.str("thoughtSignature").is_some_and(|s| !s.is_empty());
+        self.run = match block {
             Open::Text => Some(false),
             Open::Reasoning { .. } => Some(true),
-            Open::Call { .. } | Open::Opaque { .. } | Open::Media(_) => None,
+            Open::Call { .. } | Open::Opaque { .. } | Open::Media(_) => {
+                return self.w.whole(index, block, item, text);
+            }
         };
         self.w.open(index, block, item)?;
-        self.w.push(index, text)?;
-        self.run = run.map(|thought| (index, thought));
-        if self.run.is_none() {
-            self.w.finish(index)?;
-        }
-        Ok(())
+        self.w.push(index, text)
     }
 
     /// One part of the candidate's content. A part with no model here
-    /// (inline data, code and its result, a kind Gemini adds later) is an
-    /// opaque part that replays; one with no data, or that is not an object,
-    /// is kept as one that does not.
-    fn part(&mut self, part: &Value) -> Result<(), Error> {
-        let Value::Object(fields) = part else {
-            return self.open(Open::Opaque { replay: false }, part.clone(), "");
+    /// (code and its result, a kind Gemini adds later) is an opaque part
+    /// that replays; one with no data, or that is not an object, is kept
+    /// as one that does not.
+    fn part(&mut self, part: Part<'_>) -> Result<(), Error> {
+        let (text, mut rest) = match part {
+            Part::Text { text, rest } => (Some(text), rest),
+            Part::Other(Value::Object(rest)) => (None, rest),
+            Part::Other(stray) => return self.open(Open::Opaque { replay: false }, stray, ""),
         };
-        let thought = part.bool("thought") == Some(true);
-        let signature = part
-            .str("thoughtSignature")
-            .filter(|signature| !signature.is_empty());
-        if let Some(text) = part.str("text") {
+        let thought = rest.get("thought").and_then(Value::as_bool) == Some(true);
+        let signature = rest.get("thoughtSignature").and_then(Value::as_str);
+        let signed = signature.is_some_and(|signature| !signature.is_empty());
+        if let Some(text) = text {
             // An empty part without a signature carries nothing.
-            if text.is_empty() && signature.is_none() {
+            if text.is_empty() && !signed {
                 return Ok(());
             }
             // A second signed part starts a part of its own, so each
             // signature stays with the part that carried it.
-            return match self.run {
-                Some((index, kind)) if kind == thought && !(self.signed && signature.is_some()) => {
-                    self.signed |= signature.is_some();
-                    self.w.push(index, text)?;
-                    self.w.edit(index, |item| merge_part(item, part))
-                }
-                _ if thought => self.open(Open::Reasoning { redacted: false }, part.clone(), text),
-                _ => self.open(Open::Text, part.clone(), text),
-            };
+            if let (Some(index), Some(run)) = (self.last, self.run)
+                && run == thought
+                && !(self.signed && signed)
+            {
+                self.signed |= signed;
+                self.w.push(index, &text)?;
+                // The text appends, a non-empty signature replaces the one
+                // held, and any other field replaces its namesake.
+                let kept =
+                    |(key, value): &(String, Value)| key != "thoughtSignature" || value != "";
+                let rest = rest.into_iter().filter(kept);
+                return self.w.edit(index, |item| {
+                    if let Some(Value::String(held)) = item.get_mut("text") {
+                        held.push_str(&text);
+                    }
+                    if let Some(item) = item.as_object_mut() {
+                        item.extend(rest);
+                    }
+                });
+            }
+            rest.insert("text".into(), text.as_ref().into());
+            let reasoning = Open::Reasoning { redacted: false };
+            let block = if thought { reasoning } else { Open::Text };
+            return self.open(block, Value::Object(rest), &text);
         }
-        if let Some(call) = part.obj("functionCall") {
+        if let Some(call) = rest.get("functionCall").and_then(Value::as_object) {
+            let field = |key| call.get(key).and_then(Value::as_str).unwrap_or_default();
             // Nothing can answer a call with no name.
-            let Some(name) = call
-                .get("name")
-                .and_then(Value::as_str)
-                .filter(|name| !name.is_empty())
-            else {
+            if field("name").is_empty() {
                 return Ok(());
-            };
+            }
+            let (id, name) = (field("id").into(), field("name").into());
             // Proto3 JSON leaves out an empty `args` struct.
-            let arguments = call
-                .get("args")
-                .map_or_else(|| "{}".to_owned(), Value::to_string);
-            let id = call.get("id").and_then(Value::as_str).unwrap_or_default();
-            let block = Open::Call {
-                id: id.into(),
-                name: name.into(),
-            };
-            return self.open(block, part.clone(), &arguments);
+            let arguments = call.get("args").map_or("{}".to_owned(), Value::to_string);
+            return self.open(Open::Call { id, name }, Value::Object(rest), &arguments);
         }
-        let data = fields.keys().any(|key| !is_bare(key));
-        if !data && let Some(signature) = signature {
+        let bare = ["thought", "thoughtSignature", "partMetadata"];
+        let data = rest.keys().any(|key| !bare.contains(&key.as_str()));
+        if !data && signed {
             // Gemini hangs a signature on the part before it, or the part
             // after when none came yet.
-            let Some(index) = self.run.map(|(index, _)| index).or(self.last) else {
-                self.signature = Some(signature.to_owned());
+            let signature = rest.remove("thoughtSignature");
+            let Some(index) = self.last else {
+                self.signature = signature;
                 return Ok(());
             };
             return self.w.edit(index, |item| {
-                if let Some(item) = item.as_object_mut() {
-                    item.insert("thoughtSignature".to_owned(), Value::from(signature));
+                if let (Some(item), Some(signature)) = (item.as_object_mut(), signature) {
+                    item.insert("thoughtSignature".into(), signature);
                 }
             });
         }
-        if let Some(media) = media_of(part) {
-            return self.open(Open::Media(media), part.clone(), "");
-        }
-        self.open(Open::Opaque { replay: data }, part.clone(), "")
+        let block = media_of(&rest).map_or(Open::Opaque { replay: data }, Open::Media);
+        self.open(block, Value::Object(rest), "")
     }
-}
-
-/// The image (or other media) a reply part carries inline or by URI.
-fn media_of(part: &Value) -> Option<Media> {
-    let (media_type, source) = if let Some(inline) = part.obj("inlineData") {
-        let data = inline.get("data")?.as_str()?;
-        (
-            inline.get("mimeType")?.as_str()?,
-            Source::Data {
-                data: data.to_owned(),
-            },
-        )
-    } else {
-        let file = part.obj("fileData")?;
-        let url = file.get("fileUri")?.as_str()?;
-        (
-            file.get("mimeType")
-                .and_then(Value::as_str)
-                .unwrap_or("application/octet-stream"),
-            Source::Url {
-                url: url.to_owned(),
-            },
-        )
-    };
-    Some(Media {
-        media_type: media_type.into(),
-        source,
-        meta: crate::Meta::new(),
-    })
 }
 
 impl Writes for GeminiDecoder {
@@ -358,68 +402,58 @@ impl Writes for GeminiDecoder {
     }
 
     fn data(&mut self, data: &str) -> Result<Flow, Error> {
-        let chunk: Value =
-            serde_json::from_str(data).map_err(|error| Error::decode(error, data))?;
-        if !chunk.is_object() {
-            return Ok(Flow::More);
+        let chunk = match serde_json::from_str::<Chunk<'_>>(data) {
+            Ok(chunk) => chunk,
+            // The chunk as a value tells what went wrong.
+            Err(shape) => {
+                let chunk: Value =
+                    serde_json::from_str(data).map_err(|error| Error::decode(error, data))?;
+                if !chunk.is_object() {
+                    return Ok(Flow::More);
+                }
+                if let Some(error) = chunk.at("/error") {
+                    return Err(in_band(error));
+                }
+                let shape = || Error::decode(format!("Gemini sent {shape}"), data);
+                let blocked = chunk.get("promptFeedback").and_then(blocked);
+                return Err(blocked.unwrap_or_else(shape));
+            }
+        };
+        if let Some(id) = chunk.response_id.filter(|id| !id.is_empty()) {
+            self.end.response_id = Some(id);
         }
-        if let Some(id) = chunk.str("responseId").filter(|id| !id.is_empty()) {
-            self.response_id = Some(id.into());
+        if let Some(model) = chunk.model_version.filter(|model| !model.is_empty()) {
+            self.end.model = Some(model);
         }
-        if let Some(model) = chunk.str("modelVersion").filter(|model| !model.is_empty()) {
-            self.model = Some(model.into());
+        if chunk.usage_metadata {
+            data.clone_into(&mut self.usage);
         }
-        if let Some(usage) = chunk.get("usageMetadata") {
-            self.usage = Some(usage.clone());
+        if let Some(error) = chunk.error {
+            return Err(in_band(&error));
         }
-        if let Some(error) = chunk.at("/error") {
-            return Err(in_band(error));
-        }
-        if let Some(error) = chunk.get("promptFeedback").and_then(blocked) {
+        if let Some(error) = chunk.prompt_feedback.as_ref().and_then(blocked) {
             return Err(error);
         }
-        // The candidate, its content and its parts hold every part and the
-        // finish, so a wrongly typed one fails the reply.
-        let candidate = match chunk.get("candidates") {
-            None | Some(Value::Null) => return Ok(Flow::More),
-            Some(Value::Array(candidates)) => match candidates.first() {
-                None => return Ok(Flow::More),
-                Some(candidate @ Value::Object(_)) => candidate,
-                Some(_) => return Err(malformed("a candidate that is not an object", data)),
-            },
-            Some(_) => return Err(malformed("candidates that are not a list", data)),
+        let Some(candidate) = chunk.candidates else {
+            return Ok(Flow::More);
         };
         // The last reason wins: a hosted-tool round can report one before
-        // the turn goes on. Proto3 JSON spells an enum value its schema does
-        // not know as its number.
-        let reason = match candidate.get("finishReason") {
-            Some(Value::String(name)) => Some(SmolStr::from(name)),
-            Some(Value::Number(number)) => {
-                Some(smol_str::format_smolstr!("FINISH_REASON_{number}"))
-            }
-            _ => None,
-        };
-        if let Some(reason) = &reason {
-            let message = candidate.str("finishMessage").map(str::to_owned);
-            self.finish = Some((reason.clone(), message));
+        // the turn goes on.
+        let name = candidate.finish_reason.map(|reason| match reason {
+            FinishReason::Name(name) => name,
+            FinishReason::Number(number) => format_smolstr!("FINISH_REASON_{number}"),
+        });
+        if let Some(name) = name {
+            self.end.reason = Some((reason_of(&name), Some(name)));
+            self.end.message = candidate.finish_message;
         }
-        let parts = match candidate.get("content") {
-            None | Some(Value::Null) => None,
-            Some(content @ Value::Object(_)) => content.get("parts"),
-            Some(_) => return Err(malformed("candidate content that is not an object", data)),
-        };
-        match parts {
-            None | Some(Value::Null) => {}
-            Some(Value::Array(parts)) => {
-                for part in parts {
-                    self.part(part)?;
-                }
-            }
-            Some(_) => return Err(malformed("candidate parts that are not a list", data)),
+        let parts = candidate.content.and_then(|content| content.parts);
+        for part in parts.into_iter().flatten() {
+            self.part(part)?;
         }
         // A failure is final: nothing after it is read. A stop waits for the
         // end of the body.
-        match reason.as_deref().map(reason_of) {
+        match self.end.reason.as_ref().map(|(reason, _)| *reason) {
             None | Some(Reason::Stop | Reason::Length) => Ok(Flow::More),
             Some(_) => self.finish(),
         }
