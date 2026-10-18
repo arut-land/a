@@ -14,7 +14,7 @@ use super::{KEY, Quirks};
 use crate::error::Error;
 use crate::json::Lenient;
 use crate::protocol::{Decoder, Flow, Frame};
-use crate::spec::{Event, Media, Reason, Source, Usage};
+use crate::spec::{Event, Media, Reason, SmolStr, Source, Usage};
 use crate::writer::{AUTO_INDEX, CallFragment, End, Open, Writer};
 
 /// The finish reasons every host shares: `OpenAI`'s, the legacy
@@ -172,9 +172,9 @@ pub(super) struct ChatDecoder {
     /// The calls still open, in the order they opened.
     calls: Vec<OpenCall>,
     usage: Option<Value>,
-    finish: Option<(Reason, String)>,
-    response_id: Option<String>,
-    response_model: Option<String>,
+    finish: Option<(Reason, SmolStr)>,
+    response_id: Option<SmolStr>,
+    response_model: Option<SmolStr>,
     /// Whether a finish reason or a whole reply ended the turn.
     ended: bool,
     /// Whether a stream chunk arrived.
@@ -207,10 +207,10 @@ impl ChatDecoder {
     /// is the frame's, or its choice's where Moonshot reports it.
     fn absorb(&mut self, frame: &Value) -> Option<Value> {
         if let Some(id) = frame.str("id") {
-            self.response_id = Some(id.to_owned());
+            self.response_id = Some(id.into());
         }
         if let Some(model) = frame.str("model") {
-            self.response_model = Some(model.to_owned());
+            self.response_model = Some(model.into());
         }
         // `n > 1` streams interleave candidates told apart only by their
         // `index`; candidate 0 is the turn.
@@ -237,13 +237,13 @@ impl ChatDecoder {
             .str("finish_reason")
             .filter(|reason| !reason.is_empty())
         {
-            Some(reason) => Some((finish_reason(reason, &self.quirks), reason.to_owned())),
+            Some(reason) => Some((finish_reason(reason, &self.quirks), reason.into())),
             None => choice
                 .str("native_finish_reason")
                 .filter(|reason| self.quirks.native_finish_reason && !reason.is_empty())
                 .map(|reason| {
                     let reason = reason.to_ascii_lowercase();
-                    (native_finish_reason(&reason), reason)
+                    (native_finish_reason(&reason), reason.into())
                 }),
         };
         if let Some(reason) = reason {
@@ -410,14 +410,14 @@ impl ChatDecoder {
             .and_then(|rest| rest.split_once(";base64,"))
         {
             Some((media_type, data)) => Media {
-                media_type: media_type.to_owned(),
+                media_type: media_type.into(),
                 source: Source::Data {
                     data: data.to_owned(),
                 },
                 meta: crate::Meta::new(),
             },
             None => Media {
-                media_type: "image/*".to_owned(),
+                media_type: SmolStr::new_static("image/*"),
                 source: Source::Url {
                     url: url.to_owned(),
                 },
@@ -632,9 +632,9 @@ impl ChatDecoder {
     fn done(&mut self) -> Result<Flow, Error> {
         if !self.ended && self.chunked && self.quirks.done_without_finish_reason {
             self.finish = Some(if self.calls.is_empty() {
-                (Reason::Stop, "stop".to_owned())
+                (Reason::Stop, SmolStr::new_static("stop"))
             } else {
-                (Reason::ToolCalls, "tool_calls".to_owned())
+                (Reason::ToolCalls, SmolStr::new_static("tool_calls"))
             });
             self.ended = true;
         }
@@ -653,7 +653,7 @@ impl ChatDecoder {
         if let (true, Value::String(text)) = (self.quirks.bare_string_reply, &frame) {
             // A bare string is the whole answer, ended as a stop.
             self.ended = true;
-            self.finish = Some((Reason::Stop, "stop".to_owned()));
+            self.finish = Some((Reason::Stop, SmolStr::new_static("stop")));
             let text = text.clone();
             self.write(Writing::Text, &text)?;
             return self.end();

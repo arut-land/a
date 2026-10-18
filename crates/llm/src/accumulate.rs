@@ -7,16 +7,16 @@ use serde_json::Value;
 
 use crate::error::{Error, Kind};
 use crate::spec::{
-    Assistant, AssistantPart, Block, Event, Finish, Meta, Origin, Reasoning, Response, Text,
-    ToolCall, Usage,
+    Assistant, AssistantPart, Block, Event, Finish, Meta, Origin, Reasoning, Response, SmolStr,
+    Text, ToolCall, Usage,
 };
 
 #[derive(Debug, Default)]
 pub struct Accumulator {
     parts: BTreeMap<u32, Building>,
     finish: Option<(Finish, Usage, Meta, Option<Vec<u32>>)>,
-    id: Option<String>,
-    model: Option<String>,
+    id: Option<SmolStr>,
+    model: Option<SmolStr>,
 }
 
 #[derive(Debug)]
@@ -24,7 +24,7 @@ enum Building {
     Open {
         block: Block,
         text: String,
-        name: Option<String>,
+        name: Option<SmolStr>,
         meta: Meta,
     },
     Done(AssistantPart),

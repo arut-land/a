@@ -20,7 +20,7 @@ fn body(messages: Vec<Message>) -> Value {
         provider: &provider,
         model: "gpt-6-luna",
     };
-    let request = crate::prepare(&request, &target);
+    let request = crate::prepare(request.clone(), &target);
     encode::body(&Responses::default(), &target, &request).unwrap()
 }
 

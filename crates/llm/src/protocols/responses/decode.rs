@@ -11,7 +11,7 @@ use super::KEY;
 use crate::error::{Error, Kind};
 use crate::json::Lenient;
 use crate::protocol::{Decoder, Flow, Frame};
-use crate::spec::{Event, Reason, Usage};
+use crate::spec::{Event, Reason, SmolStr, Usage};
 use crate::writer::{CallFragment, End, Open, Writer};
 
 const fn is_lifecycle(kind: &str) -> bool {
@@ -174,7 +174,7 @@ fn provider_message(response: &Value, fallback: &str) -> String {
 
 /// How the response ended: its reason, the provider's word, and why a reply
 /// that did not complete stopped.
-pub(crate) fn finish_of(response: &Value) -> (Reason, Option<String>, Option<String>) {
+pub(crate) fn finish_of(response: &Value) -> (Reason, Option<SmolStr>, Option<String>) {
     let reason = response
         .at("/incomplete_details/reason")
         .and_then(Value::as_str)
@@ -186,7 +186,7 @@ pub(crate) fn finish_of(response: &Value) -> (Reason, Option<String>, Option<Str
             Some("content_filter") => (Reason::ContentFilter, Some("content_filter".into()), None),
             Some(reason) => (
                 Reason::Other,
-                Some(format!("incomplete: {reason}")),
+                Some(smol_str::format_smolstr!("incomplete: {reason}")),
                 Some(format!("Response incomplete: {reason}")),
             ),
             None => (
@@ -197,17 +197,17 @@ pub(crate) fn finish_of(response: &Value) -> (Reason, Option<String>, Option<Str
         },
         Some(status @ ("failed" | "cancelled")) => (
             Reason::Other,
-            Some(status.to_owned()),
+            Some(status.into()),
             Some(provider_message(response, &format!("Response {status}"))),
         ),
         Some(status @ ("queued" | "in_progress")) => (
             Reason::Other,
-            Some(status.to_owned()),
+            Some(status.into()),
             Some(format!("Response ended while {status}")),
         ),
         Some(status) => (
             Reason::Other,
-            Some(status.to_owned()),
+            Some(status.into()),
             Some(format!("Response ended with the unknown status `{status}`")),
         ),
     }
@@ -651,8 +651,8 @@ impl ResponsesDecoder {
         self.w.end(End {
             usage,
             reason: Some((reason, raw)),
-            response_id: item_id(response).map(str::to_owned),
-            model: response.str("model").map(str::to_owned),
+            response_id: item_id(response).map(Into::into),
+            model: response.str("model").map(Into::into),
             message,
             meta: super::super::usage_meta(KEY, response.get("usage")),
         })

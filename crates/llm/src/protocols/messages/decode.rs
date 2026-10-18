@@ -15,7 +15,7 @@ use super::KEY;
 use crate::error::{Error, Kind as ErrorKind};
 use crate::json::Lenient;
 use crate::protocol::{Decoder, Flow, Frame};
-use crate::spec::{Event, Reason, Usage};
+use crate::spec::{Event, Reason, SmolStr, Usage};
 use crate::writer::{AUTO_INDEX, CallFragment, End, Open, Writer, merge};
 
 /// The events the decoder reads; any other type is skipped. `message` is a
@@ -132,8 +132,8 @@ pub(crate) struct MessagesDecoder {
     /// The provider's usage objects, `message_start`'s with the terminal
     /// delta's fields over it.
     raw_usage: Option<Value>,
-    message_id: Option<String>,
-    model: Option<String>,
+    message_id: Option<SmolStr>,
+    model: Option<SmolStr>,
     container: Option<Value>,
 }
 
@@ -210,11 +210,11 @@ impl MessagesDecoder {
             "redacted_thinking" => (Open::Reasoning { redacted: true }, Kind::Redacted, None),
             "tool_use" => {
                 self.open.insert(index, (Kind::Call, String::new()));
-                let id = block.str("id").unwrap_or_default().to_owned();
+                let id = block.str("id").unwrap_or_default().into();
                 let input = block.get("input").cloned().unwrap_or_default();
                 match block.str("name").filter(|name| !name.is_empty()) {
                     Some(name) => {
-                        let name = name.to_owned();
+                        let name = name.into();
                         self.w.open(index, Open::Call { id, name }, block)?;
                     }
                     // A nameless call: the writer drops it.
@@ -382,8 +382,8 @@ impl MessagesDecoder {
             .get("usage")
             .filter(|usage| usage.is_object())
             .cloned();
-        self.message_id = message.str("id").map(str::to_owned);
-        self.model = message.str("model").map(str::to_owned);
+        self.message_id = message.str("id").map(Into::into);
+        self.model = message.str("model").map(Into::into);
         self.note_container(message.get("container"));
     }
 
@@ -419,7 +419,7 @@ impl MessagesDecoder {
         }
         let (reason, message) = stop_reason.map_or((None, None), |raw| {
             let (reason, message) = finish_of(raw, details);
-            (Some((reason, Some(raw.to_owned()))), message)
+            (Some((reason, Some(raw.into()))), message)
         });
         self.w.end(End {
             usage: usage.usage(),

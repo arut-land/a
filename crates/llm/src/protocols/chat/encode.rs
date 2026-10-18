@@ -521,12 +521,12 @@ fn call_item(call: &ToolCall, sent: Replay<'_>, custom: &[String]) -> Value {
     let custom = if let Some(kind) = item.get("type").and_then(Value::as_str) {
         kind == "custom"
     } else {
-        let declared = custom.contains(&call.name);
+        let declared = custom.iter().any(|name| call.name == *name);
         let kind = if declared { "custom" } else { "function" };
         item.insert("type".to_owned(), Value::from(kind));
         declared
     };
-    item.insert("id".to_owned(), Value::String(call.id.clone()));
+    item.insert("id".to_owned(), call.id.as_str().into());
     let (slot, key, value) = if custom {
         let input = match call.input.get("input") {
             Some(Value::String(input)) => input.clone(),

@@ -75,14 +75,14 @@ fn chunk(parts: Value, finish: Option<&str>) -> Value {
 fn sent(model: &str, request: Request) -> Value {
     let provider = provider();
     let request = Request {
-        model: model.to_owned(),
+        model: model.into(),
         ..request
     };
     let target = Target {
         provider: &provider,
         model,
     };
-    let request = crate::prepare(&request, &target);
+    let request = crate::prepare(request.clone(), &target);
     provider
         .protocol
         .encode(&target, &request)

@@ -86,7 +86,7 @@ pub(super) fn stream(
     frames: &[String],
 ) -> (Vec<Event>, Result<Response, Error>) {
     let request = Request {
-        model: model.to_owned(),
+        model: model.into(),
         ..Request::default()
     };
     let target = Target { provider, model };
@@ -769,7 +769,7 @@ pub(super) fn request(model: &str, messages: Vec<Message>) -> Request {
         for name in names {
             if !tools.iter().any(|tool| tool.name == name) {
                 tools.push(crate::Tool {
-                    name: name.to_owned(),
+                    name: name.into(),
                     description: "a tool the conversation calls".to_owned(),
                     schema: json!({"type": "object", "properties": {}}),
                     strict: None,
@@ -778,7 +778,7 @@ pub(super) fn request(model: &str, messages: Vec<Message>) -> Request {
         }
     }
     Request {
-        model: model.to_owned(),
+        model: model.into(),
         messages,
         tools,
         ..Request::default()
@@ -792,7 +792,7 @@ pub(super) fn sent_to(provider: &Provider, request: &Request) -> Result<(String,
         provider,
         model: &request.model,
     };
-    let prepared = crate::prepare(request, &target);
+    let prepared = crate::prepare(request.clone(), &target);
     let (http, _) = provider.request(&request.model, &prepared)?;
     let body = serde_json::from_slice(http.body()).expect("a JSON body");
     Ok((http.uri().to_string(), body))

@@ -17,7 +17,7 @@ use crate::error::{Error, Kind};
 use crate::http::{Body, BoxFuture, Http};
 use crate::prepare::prepare;
 use crate::protocol::{Decoder, Flow, Frame, Framing, Provider, Target};
-use crate::spec::{Event, Origin, Request, Response};
+use crate::spec::{Event, Origin, Request, Response, SmolStr};
 use crate::sse::{NdjsonFramer, SseFramer};
 
 /// Streams the reply to `request` from `provider`.
@@ -26,7 +26,7 @@ pub fn stream(http: &dyn Http, provider: &Provider, request: &Request) -> Events
         provider,
         model: &request.model,
     };
-    let request = prepare(request, &target);
+    let request = prepare(request.clone(), &target);
     let state = match provider.request(&request.model, &request) {
         Ok((http_request, framing)) => State::Sending {
             reply: http.send(http_request),
@@ -58,9 +58,9 @@ pub async fn generate(
 /// What the reply's message names as its producer.
 pub fn origin(provider: &Provider, model: &str) -> Origin {
     Origin {
-        protocol: provider.protocol.key().to_owned(),
-        provider: provider.id.to_string(),
-        model: model.to_owned(),
+        protocol: SmolStr::new_static(provider.protocol.key()),
+        provider: provider.id.clone(),
+        model: model.into(),
     }
 }
 

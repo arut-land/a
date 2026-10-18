@@ -10,7 +10,7 @@ use super::KEY;
 use crate::error::{Error, Kind};
 use crate::json::Lenient;
 use crate::protocol::{Decoder, Flow, Frame};
-use crate::spec::{Event, Media, Reason, Source, Usage};
+use crate::spec::{Event, Media, Reason, SmolStr, Source, Usage};
 use crate::writer::{End, Open, Writer};
 
 /// The fields of a part that carry no data of their own.
@@ -165,11 +165,11 @@ fn merge_part(item: &mut Value, part: &Value) {
 pub(crate) struct GeminiDecoder {
     w: Writer,
     /// The latest `finishReason`, and the `finishMessage` beside it.
-    finish: Option<(String, Option<String>)>,
+    finish: Option<(SmolStr, Option<String>)>,
     /// The latest `usageMetadata`.
     usage: Option<Value>,
-    model: Option<String>,
-    response_id: Option<String>,
+    model: Option<SmolStr>,
+    response_id: Option<SmolStr>,
     /// The text or thought run later parts continue, and whether it is
     /// thought.
     run: Option<(usize, bool)>,
@@ -205,10 +205,10 @@ impl GeminiDecoder {
             return Ok(Flow::More);
         }
         if let Some(id) = chunk.str("responseId").filter(|id| !id.is_empty()) {
-            self.response_id = Some(id.to_owned());
+            self.response_id = Some(id.into());
         }
         if let Some(model) = chunk.str("modelVersion").filter(|model| !model.is_empty()) {
-            self.model = Some(model.to_owned());
+            self.model = Some(model.into());
         }
         if let Some(usage) = chunk.get("usageMetadata") {
             self.usage = Some(usage.clone());
@@ -234,8 +234,10 @@ impl GeminiDecoder {
         // the turn goes on. Proto3 JSON spells an enum value its schema does
         // not know as its number.
         let reason = match candidate.get("finishReason") {
-            Some(Value::String(name)) => Some(name.clone()),
-            Some(Value::Number(number)) => Some(format!("FINISH_REASON_{number}")),
+            Some(Value::String(name)) => Some(SmolStr::from(name)),
+            Some(Value::Number(number)) => {
+                Some(smol_str::format_smolstr!("FINISH_REASON_{number}"))
+            }
             _ => None,
         };
         if let Some(reason) = &reason {
@@ -363,8 +365,8 @@ impl GeminiDecoder {
                 .map_or_else(|| "{}".to_owned(), Value::to_string);
             let id = call.get("id").and_then(Value::as_str).unwrap_or_default();
             let block = Open::Call {
-                id: id.to_owned(),
-                name: name.to_owned(),
+                id: id.into(),
+                name: name.into(),
             };
             return self.open(block, part.clone(), &arguments);
         }
@@ -412,7 +414,7 @@ fn media_of(part: &Value) -> Option<Media> {
         )
     };
     Some(Media {
-        media_type: media_type.to_owned(),
+        media_type: media_type.into(),
         source,
         meta: crate::Meta::new(),
     })

@@ -12,8 +12,8 @@ use crate::protocol::Target;
 use crate::protocols::schema;
 use crate::replay::{Replay, replay, replays};
 use crate::spec::{
-    AssistantPart, Format, Media, Message, Output, Request, Source, ToolChoice, ToolResult,
-    UserPart,
+    AssistantPart, Format, Media, Message, Output, Request, SmolStr, Source, ToolChoice,
+    ToolResult, UserPart,
 };
 
 /// The keys of a stale item a rebuilt part keeps.
@@ -41,7 +41,7 @@ fn image_part(media: &Media) -> Value {
             format!("data:{};base64,{data}", media.media_type),
         ),
         Source::Url { url } => ("image_url", url.clone()),
-        Source::File { id } => ("file_id", id.clone()),
+        Source::File { id } => ("file_id", id.to_string()),
     };
     json!({"type": "input_image", "detail": "auto", key: source})
 }
@@ -104,7 +104,7 @@ fn result_item(result: &ToolResult, custom: bool) -> Result<Value, Error> {
 /// it is rebuilt with no item id, as another model's turn is.
 fn input(messages: &[Message], stateless: bool) -> Result<Vec<Value>, Error> {
     // Whether each call id the request sends is a custom call.
-    let mut custom = std::collections::HashMap::<String, bool>::new();
+    let mut custom = std::collections::HashMap::<SmolStr, bool>::new();
     let mut items = Vec::new();
     for (position, message) in messages.iter().enumerate() {
         match message {
@@ -148,7 +148,7 @@ fn assistant_items(
     content: &[AssistantPart],
     position: usize,
     stateless: bool,
-    custom: &mut std::collections::HashMap<String, bool>,
+    custom: &mut std::collections::HashMap<SmolStr, bool>,
     items: &mut Vec<Value>,
 ) -> Result<(), Error> {
     let mut texts = 0usize;
@@ -185,7 +185,7 @@ fn assistant_items(
                 }
                 if let AssistantPart::ToolCall(call) = part {
                     // The call takes the id its result answers.
-                    item["call_id"] = Value::String(call.id.clone());
+                    item["call_id"] = call.id.as_str().into();
                     custom.insert(
                         call.id.clone(),
                         item.str("type") == Some("custom_tool_call"),
@@ -211,7 +211,7 @@ fn rebuilt(
     identity: &Map<String, Value>,
     position: usize,
     texts: &mut usize,
-    custom: &mut std::collections::HashMap<String, bool>,
+    custom: &mut std::collections::HashMap<SmolStr, bool>,
 ) -> Result<Option<Value>, Error> {
     let id = |prefix: &str| {
         identity

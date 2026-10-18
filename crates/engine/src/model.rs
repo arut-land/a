@@ -35,7 +35,7 @@ impl Model {
         on_text: &mut dyn FnMut(&str),
     ) -> Result<Response, llm::Error> {
         let request = Request {
-            model: self.id.clone(),
+            model: self.id.as_str().into(),
             messages,
             ..Request::default()
         };

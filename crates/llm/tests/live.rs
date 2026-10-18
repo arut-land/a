@@ -23,8 +23,8 @@ fn openai() -> Provider {
         .expect("OPENAI_API_KEY")
 }
 
-fn model() -> String {
-    std::env::var("A_MODEL").unwrap_or_else(|_| "gpt-6-luna".into())
+fn model() -> llm::SmolStr {
+    std::env::var("A_MODEL").map_or_else(|_| "gpt-6-luna".into(), Into::into)
 }
 
 #[test]
@@ -103,8 +103,8 @@ fn anthropic() -> Provider {
         .expect("ANTHROPIC_API_KEY")
 }
 
-fn claude() -> String {
-    std::env::var("A_CLAUDE").unwrap_or_else(|_| "claude-sonnet-4-6".into())
+fn claude() -> llm::SmolStr {
+    std::env::var("A_CLAUDE").map_or_else(|_| "claude-sonnet-4-6".into(), Into::into)
 }
 
 #[test]

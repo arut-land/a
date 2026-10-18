@@ -139,7 +139,7 @@ fn decode(dir: &str, doc: &serde_yaml_ng::Value) -> Option<Value> {
             .to_owned(),
     };
     let request = Request {
-        model: model.to_owned(),
+        model: model.into(),
         messages: vec![llm::Message::user("hi")],
         // What the oracle asked for.
         generation: llm::Generation {

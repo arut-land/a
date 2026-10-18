@@ -40,7 +40,7 @@ fn target<'a>(provider: &'a Provider, model: &'a str) -> Target<'a> {
 /// A request to `model` holding `messages`, with room for 64 tokens.
 fn request(model: &str, messages: Vec<Message>) -> Request {
     Request {
-        model: model.to_owned(),
+        model: model.into(),
         messages,
         generation: crate::Generation {
             max_output_tokens: std::num::NonZeroU32::new(64),
@@ -56,7 +56,7 @@ type Sent = (Value, Vec<(&'static str, String)>);
 /// `request` prepared and encoded for `provider`.
 fn encoded(provider: &Provider, request: &Request) -> Result<Sent, Error> {
     let target = target(provider, &request.model);
-    let prepared = crate::prepare(request, &target);
+    let prepared = crate::prepare(request.clone(), &target);
     let encoded = provider.protocol.encode(&target, &prepared)?;
     Ok((encoded.body, encoded.headers))
 }
@@ -78,7 +78,7 @@ fn beta(provider: &Provider, request: &Request) -> Option<String> {
 /// A tool named `name` taking an empty object.
 fn tool(name: &str) -> Tool {
     Tool {
-        name: name.to_owned(),
+        name: name.into(),
         description: format!("{name} description"),
         schema: json!({"type": "object", "properties": {}}),
         strict: None,
@@ -205,8 +205,8 @@ fn sent_with(provider: &Provider, model: &str, history: Vec<Message>, tools: Vec
 fn answer(id: &str, text: &str) -> Message {
     Message::Tool(crate::ToolMessage {
         results: vec![crate::ToolResult {
-            id: id.to_owned(),
-            name: "add".to_owned(),
+            id: id.into(),
+            name: "add".into(),
             output: crate::Output::Text(text.to_owned()),
             error: false,
             meta: crate::Meta::new(),

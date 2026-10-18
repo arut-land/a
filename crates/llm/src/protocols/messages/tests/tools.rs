@@ -207,7 +207,7 @@ fn a_tool_choice_goes_only_with_tools() {
         sent(&provider, &request)["tool_choice"],
         json!({"type": "any"})
     );
-    request.tool_choice = ToolChoice::Tool("add".to_owned());
+    request.tool_choice = ToolChoice::Tool("add".into());
     assert_eq!(
         sent(&provider, &request)["tool_choice"],
         json!({"type": "tool", "name": "add"})
@@ -225,7 +225,7 @@ fn a_tool_choice_goes_only_with_tools() {
     assert_eq!(sent(&provider, &request)["stream"], true);
 
     assert!(rejects_forced_tool_choice(OPUS_5_5));
-    request.model = OPUS_5_5.to_owned();
+    request.model = OPUS_5_5.into();
     request.tool_choice = ToolChoice::Required;
     assert_eq!(
         sent(&provider, &request)["tool_choice"],

@@ -16,6 +16,7 @@ use std::num::NonZeroU32;
 
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
+pub use smol_str::SmolStr;
 
 /// Protocol-keyed provider state on a part or a reply.
 pub type Meta = BTreeMap<String, Value>;
@@ -23,7 +24,7 @@ pub type Meta = BTreeMap<String, Value>;
 /// One model call.
 #[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
 pub struct Request {
-    pub model: String,
+    pub model: SmolStr,
     /// The conversation. Leading system messages are the system prompt;
     /// later ones are instructions given mid-conversation.
     pub messages: Vec<Message>,
@@ -123,7 +124,7 @@ pub enum Format {
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct Tool {
-    pub name: String,
+    pub name: SmolStr,
     #[serde(default, skip_serializing_if = "String::is_empty")]
     pub description: String,
     /// JSON Schema of the input.
@@ -139,7 +140,7 @@ pub enum ToolChoice {
     Auto,
     None,
     Required,
-    Tool(String),
+    Tool(SmolStr),
 }
 
 impl ToolChoice {
@@ -306,7 +307,7 @@ pub struct Reasoning {
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct Media {
-    pub media_type: String,
+    pub media_type: SmolStr,
     pub source: Source,
     #[serde(default, skip_serializing_if = "Meta::is_empty")]
     pub meta: Meta,
@@ -324,14 +325,14 @@ pub enum Source {
     },
     /// A file the provider holds, by its id.
     File {
-        id: String,
+        id: SmolStr,
     },
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct ToolCall {
-    pub id: String,
-    pub name: String,
+    pub id: SmolStr,
+    pub name: SmolStr,
     pub input: serde_json::Map<String, Value>,
     /// The argument text, when it was no JSON object: `input` then holds
     /// what a cut-off object still states, and the caller answers with the
@@ -347,8 +348,8 @@ pub struct ToolCall {
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct ToolResult {
-    pub id: String,
-    pub name: String,
+    pub id: SmolStr,
+    pub name: SmolStr,
     pub output: Output,
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub error: bool,
@@ -393,9 +394,9 @@ pub struct Opaque {
 /// The wire protocol, provider and model that produced a message.
 #[derive(Clone, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub struct Origin {
-    pub protocol: String,
-    pub provider: String,
-    pub model: String,
+    pub protocol: SmolStr,
+    pub provider: SmolStr,
+    pub model: SmolStr,
 }
 
 fn join<'a>(texts: impl Iterator<Item = &'a str>) -> String {
@@ -516,13 +517,13 @@ pub enum Reason {
 pub struct Finish {
     pub reason: Reason,
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub raw: Option<String>,
+    pub raw: Option<SmolStr>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub message: Option<String>,
 }
 
 impl Finish {
-    pub fn new(reason: Reason, raw: impl Into<Option<String>>) -> Self {
+    pub fn new(reason: Reason, raw: impl Into<Option<SmolStr>>) -> Self {
         Self {
             reason,
             raw: raw.into(),
@@ -548,16 +549,16 @@ pub enum Event {
     /// What the provider said about the reply, once it is known.
     Metadata {
         #[serde(default, skip_serializing_if = "Option::is_none")]
-        id: Option<String>,
+        id: Option<SmolStr>,
         #[serde(default, skip_serializing_if = "Option::is_none")]
-        model: Option<String>,
+        model: Option<SmolStr>,
     },
     /// A part opens; a tool call opens once it names its tool.
     Start {
         index: u32,
         block: Block,
         #[serde(default, skip_serializing_if = "Option::is_none")]
-        name: Option<String>,
+        name: Option<SmolStr>,
     },
     /// Text, reasoning text, or a fragment of a call's argument JSON.
     Delta { index: u32, text: String },
@@ -590,7 +591,7 @@ pub enum Event {
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct CallEnd {
-    pub id: String,
+    pub id: SmolStr,
     pub input: serde_json::Map<String, Value>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub invalid: Option<String>,
@@ -605,9 +606,9 @@ pub struct Response {
     pub finish: Finish,
     pub usage: Usage,
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub id: Option<String>,
+    pub id: Option<SmolStr>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub model: Option<String>,
+    pub model: Option<SmolStr>,
     #[serde(default, skip_serializing_if = "Meta::is_empty")]
     pub meta: Meta,
 }

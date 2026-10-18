@@ -4,14 +4,13 @@
 //! to authenticate, and the protocol instance (with its host quirks) that
 //! speaks to it.
 
-use std::borrow::Cow;
 use std::fmt;
 use std::sync::Arc;
 
 use serde_json::Value;
 
 use crate::error::Error;
-use crate::spec::{Event, Request};
+use crate::spec::{Event, Request, SmolStr};
 
 pub trait Protocol: Send + Sync + 'static {
     /// The key this protocol's options and part state go under, and the
@@ -116,7 +115,7 @@ pub enum Auth {
 
 #[derive(Clone)]
 pub struct Provider {
-    pub id: Cow<'static, str>,
+    pub id: SmolStr,
     pub base_url: String,
     pub auth: Auth,
     pub headers: Vec<(String, String)>,
@@ -135,7 +134,7 @@ impl fmt::Debug for Provider {
 
 impl Provider {
     pub fn new(
-        id: impl Into<Cow<'static, str>>,
+        id: impl Into<SmolStr>,
         base_url: impl Into<String>,
         auth: Auth,
         protocol: impl Protocol,

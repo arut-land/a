@@ -21,7 +21,7 @@ use serde_json::{Map, Value, json};
 use crate::error::Error;
 use crate::replay::{Canon, fingerprint};
 use crate::spec::{
-    AssistantPart, Block, CallEnd, Event, Finish, Media, Meta, Opaque, Reason, Usage,
+    AssistantPart, Block, CallEnd, Event, Finish, Media, Meta, Opaque, Reason, SmolStr, Usage,
 };
 
 /// The first index the writer hands out itself ([`Writer::fresh_index`]);
@@ -39,8 +39,8 @@ pub enum Open {
         redacted: bool,
     },
     Call {
-        id: String,
-        name: String,
+        id: SmolStr,
+        name: SmolStr,
     },
     /// An item with no shared meaning; `replay` says whether it goes back
     /// to the model that produced it.
@@ -65,9 +65,9 @@ pub struct CallFragment<'a> {
 pub struct End {
     pub usage: Usage,
     /// The normalized reason and the provider's word for it.
-    pub reason: Option<(Reason, Option<String>)>,
-    pub response_id: Option<String>,
-    pub model: Option<String>,
+    pub reason: Option<(Reason, Option<SmolStr>)>,
+    pub response_id: Option<SmolStr>,
+    pub model: Option<SmolStr>,
     /// The provider's account of a turn that went wrong: a refusal's
     /// explanation, why a reply is incomplete.
     pub message: Option<String>,
@@ -89,7 +89,7 @@ pub struct Writer {
     /// Every part emitted, in emission order.
     parts: Vec<u32>,
     next_part: u32,
-    call_ids: HashSet<String>,
+    call_ids: HashSet<SmolStr>,
     last_call: Option<usize>,
     run: Option<usize>,
     next_auto: usize,
@@ -122,8 +122,8 @@ enum Body {
         redacted: bool,
     },
     Call {
-        id: Option<String>,
-        name: String,
+        id: Option<SmolStr>,
+        name: SmolStr,
         arguments: Arguments,
     },
     Opaque {
@@ -485,7 +485,7 @@ impl Writer {
         if !self.open.contains_key(&index) {
             let body = Body::Call {
                 id: None,
-                name: String::new(),
+                name: SmolStr::default(),
                 arguments: Arguments::default(),
             };
             self.insert(index, body, Value::Null);
@@ -502,12 +502,12 @@ impl Writer {
             ));
         };
         if let Some(call_id) = new_id {
-            *id = Some(call_id.to_owned());
+            *id = Some(call_id.into());
         }
         if name.is_empty()
             && let Some(fragment) = fragment.name.filter(|name| !name.is_empty())
         {
-            fragment.clone_into(name);
+            *name = fragment.into();
         }
         if let Some(fragment) = fragment.arguments {
             arguments.push(fragment);
@@ -642,7 +642,7 @@ impl Writer {
     /// The id a closing call takes, and the item it keeps: its own, or a
     /// fresh one when the provider sent none or one an earlier call holds.
     /// A renamed call keeps no item, since the item names the id it lost.
-    fn distinct_call_id(&mut self, id: Option<String>, item: Value) -> (String, Value) {
+    fn distinct_call_id(&mut self, id: Option<SmolStr>, item: Value) -> (SmolStr, Value) {
         let (id, item) = match id {
             Some(id) if !self.call_ids.contains(&id) => (id, item),
             None if self.call_id_slot => (self.local_id(), item),
@@ -652,10 +652,10 @@ impl Writer {
         (id, item)
     }
 
-    fn local_id(&mut self) -> String {
+    fn local_id(&mut self) -> SmolStr {
         loop {
             self.ids = self.ids.wrapping_add(0x9e37_79b9_7f4a_7c15);
-            let id = format!("call_{:016x}", self.ids);
+            let id = smol_str::format_smolstr!("call_{:016x}", self.ids);
             if !self.call_ids.contains(&id) {
                 return id;
             }
@@ -675,7 +675,7 @@ impl Writer {
     fn close_call(
         &mut self,
         part: u32,
-        id: Option<String>,
+        id: Option<SmolStr>,
         name: &str,
         arguments: &Arguments,
         item: Value,

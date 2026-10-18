@@ -585,7 +585,7 @@ fn assistant_blocks(assistant: &Assistant) -> Vec<Value> {
                 let mut item = sendable(item);
                 if let AssistantPart::ToolCall(call) = part {
                     // The call takes the id its result answers.
-                    item["id"] = Value::String(call.id.clone());
+                    item["id"] = call.id.as_str().into();
                 }
                 blocks.push(item);
                 continue;

@@ -14,6 +14,7 @@ futures-core = { version = "0.3", default-features = false, features = ["std"] }
 http.workspace = true
 serde.workspace = true
 serde_json.workspace = true
+smol_str = { version = "0.3", default-features = false, features = ["serde", "std"] }
 rt = { workspace = true, optional = true }
 
 # The OS's TLS on Apple platforms and Windows (Security.framework, SChannel):

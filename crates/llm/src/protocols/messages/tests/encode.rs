@@ -26,7 +26,7 @@ fn user_media(media: Media) -> Result<Value, Error> {
 
 fn media(media_type: &str, source: Source) -> Media {
     Media {
-        media_type: media_type.to_owned(),
+        media_type: media_type.into(),
         source,
         meta: Meta::new(),
     }
@@ -79,8 +79,8 @@ fn call(id: &str, name: &str, input: Value) -> AssistantPart {
         panic!("arguments are an object");
     };
     AssistantPart::ToolCall(ToolCall {
-        id: id.to_owned(),
-        name: name.to_owned(),
+        id: id.into(),
+        name: name.into(),
         input,
         invalid: None,
         provider_executed: false,
@@ -332,7 +332,7 @@ fn media_goes_in_exactly_the_forms_anthropic_takes() {
     let url = |url: &str| Source::Url {
         url: url.to_owned(),
     };
-    let file = |id: &str| Source::File { id: id.to_owned() };
+    let file = |id: &str| Source::File { id: id.into() };
     let images = [
         (media("image/png", data("aGk=")), true),
         (media("image/heic", data("aGk=")), false),
@@ -346,8 +346,8 @@ fn media_goes_in_exactly_the_forms_anthropic_takes() {
             native(vec![call("toolu_1", "shot", json!({}))]),
             Message::Tool(crate::ToolMessage {
                 results: vec![crate::ToolResult {
-                    id: "toolu_1".to_owned(),
-                    name: "shot".to_owned(),
+                    id: "toolu_1".into(),
+                    name: "shot".into(),
                     output: Output::Content(vec![UserPart::Media(image.clone())]),
                     error: false,
                     meta: Meta::new(),
@@ -694,9 +694,9 @@ fn violations(body: &Value) -> Vec<String> {
 #[test]
 fn adversarial_histories_encode_to_requests_anthropic_takes() {
     let other = Some(crate::Origin {
-        protocol: "openai.chat".to_owned(),
-        provider: "openai".to_owned(),
-        model: "gpt-4.1".to_owned(),
+        protocol: "openai.chat".into(),
+        provider: "openai".into(),
+        model: "gpt-4.1".into(),
     });
     let foreign = |content: Vec<AssistantPart>| {
         Message::Assistant(Assistant {

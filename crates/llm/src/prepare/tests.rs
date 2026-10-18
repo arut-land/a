@@ -3,7 +3,7 @@ use serde_json::json;
 use super::*;
 use crate::Error;
 use crate::protocol::{Auth, Decoder, Encoded, Protocol, Provider};
-use crate::spec::{Assistant, Meta, Reasoning, Text, ToolCall, User, UserPart};
+use crate::spec::{Assistant, Meta, Origin, Reasoning, Text, ToolCall, User, UserPart};
 
 struct Short;
 
@@ -74,7 +74,7 @@ fn run(messages: Vec<Message>) -> Vec<Message> {
         ..Request::default()
     };
     prepare(
-        &request,
+        request,
         &Target {
             provider: &provider,
             model: "m",
