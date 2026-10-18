@@ -1,0 +1,6 @@
+# Generated: `mise run apple:ffi`, `apple:gen` and `apple:build`.
+/Generated/
+/A.xcodeproj/
+/build/
+.build/
+.swiftpm/

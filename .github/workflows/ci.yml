@@ -95,3 +95,16 @@ jobs:
       - name: test (advisory until first green on Windows)
         continue-on-error: true
         run: mise exec -- cargo nextest run $PORTABLE --no-tests=pass
+
+  # The macOS app: the FFI package (boltffi pack apple --deny-skipped), the
+  # reducer vectors and a live session through it in Swift, then the app
+  # built headless with xcodebuild.
+  apple:
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v7
+      - *mbx-dir
+      - *cache
+      - *mise
+      - run: mise run apple:test
+      - run: mise run apple:build

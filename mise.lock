@@ -2,6 +2,16 @@
 
 lockfile_version = 3
 
+[[tools."aqua:yonaskolb/XcodeGen"]]
+version = "2.46.0"
+backend = "aqua:yonaskolb/XcodeGen"
+specifiers = ["2.46.0"]
+
+[tools."aqua:yonaskolb/XcodeGen"."platforms.macos-arm64"]
+checksum = "sha256:4d9e34b62172d645eed6457cac13fc222569974098ef4ee9c3368bedf0196806"
+url = "https://github.com/yonaskolb/XcodeGen/releases/download/2.46.0/xcodegen.zip"
+url_api = "https://api.github.com/repos/yonaskolb/XcodeGen/releases/assets/478866069"
+
 [[tools."cargo:cargo-bloat"]]
 version = "0.12.1"
 backend = "cargo:cargo-bloat"
@@ -24,6 +34,41 @@ specifiers = [
     "0.9",
     "0.9.148",
 ]
+
+[[tools."github:boltffi/boltffi"]]
+version = "0.31.1"
+backend = "github:boltffi/boltffi"
+specifiers = ["0.31.1"]
+
+[tools."github:boltffi/boltffi"."platforms.linux-arm64"]
+checksum = "sha256:419acc2c4087ef5dc3d9fc8886d849a418349a58f9aa71ac67168e5eb79ddce7"
+url = "https://github.com/boltffi/boltffi/releases/download/v0.31.1/boltffi-linux-aarch64.tar.gz"
+url_api = "https://api.github.com/repos/boltffi/boltffi/releases/assets/640521156"
+
+[tools."github:boltffi/boltffi"."platforms.linux-arm64-musl"]
+checksum = "sha256:201b7a4c8eb54d4cec2d4ba5f9b77a0e2ec7f426622dd9b087d8be1dd7d525da"
+url = "https://github.com/boltffi/boltffi/releases/download/v0.31.1/boltffi-linux-aarch64-musl.tar.gz"
+url_api = "https://api.github.com/repos/boltffi/boltffi/releases/assets/640516314"
+
+[tools."github:boltffi/boltffi"."platforms.linux-x64"]
+checksum = "sha256:ae02515544f6553e72b2fd5ea99ed604b047d163dfb7fa2e1534dda92756cc28"
+url = "https://github.com/boltffi/boltffi/releases/download/v0.31.1/boltffi-linux-x86_64.tar.gz"
+url_api = "https://api.github.com/repos/boltffi/boltffi/releases/assets/640520840"
+
+[tools."github:boltffi/boltffi"."platforms.linux-x64-musl"]
+checksum = "sha256:7123525702683f39ce44ea045e7f4fc1386fa8b0d0a764650c15610dbaa8b8fe"
+url = "https://github.com/boltffi/boltffi/releases/download/v0.31.1/boltffi-linux-x86_64-musl.tar.gz"
+url_api = "https://api.github.com/repos/boltffi/boltffi/releases/assets/640522451"
+
+[tools."github:boltffi/boltffi"."platforms.macos-arm64"]
+checksum = "sha256:3837df80dae7d8d1d84f6b9c73890b9b6f79b3b74360d9b5a788524740b7bfdf"
+url = "https://github.com/boltffi/boltffi/releases/download/v0.31.1/boltffi-darwin-aarch64.tar.gz"
+url_api = "https://api.github.com/repos/boltffi/boltffi/releases/assets/640537186"
+
+[tools."github:boltffi/boltffi"."platforms.windows-x64"]
+checksum = "sha256:8a5cd4e01114432f40b80b90f5a7fe3e892e39f6a717a056595c41f0483b8e60"
+url = "https://github.com/boltffi/boltffi/releases/download/v0.31.1/boltffi-windows-x86_64.zip"
+url_api = "https://api.github.com/repos/boltffi/boltffi/releases/assets/640535775"
 
 [[tools.hyperfine]]
 version = "2.0.0"

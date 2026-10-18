@@ -23,6 +23,10 @@ mold = { version = "latest", os = ["linux"] }
 hyperfine = "latest"
 "cargo:cargo-bloat" = "latest"
 "cargo:cargo-llvm-lines" = "latest"
+# The macOS app (apps/apple): the BoltFFI CLI at exactly the version of the
+# crates/ffi dependency, and XcodeGen for its project.
+"github:boltffi/boltffi" = { version = "0.31.1", os = ["macos"] }
+"aqua:yonaskolb/XcodeGen" = { version = "2.46.0", os = ["macos"] }
 
 [wrappers.cargo]
 command = "mbx"
@@ -50,3 +54,26 @@ acceptance = "cargo nextest run -p a --test acceptance --no-tests=fail"
 # Release binary size, then cold start and idle daemon RSS on it. Latency is
 # only held to its budget off CI; shared runners get slack.
 budgets = { depends = ["size"], run = 'A_BIN=$PWD/target/release/a A_STRICT_BUDGETS=$([[ -n ${CI:-} ]] && echo 0 || echo 1) cargo nextest run -p a --test budgets --test-threads 1 --no-capture' }
+
+# The macOS app (apps/apple). The FFI package: crates/ffi for macOS arm64
+# plus its Swift bindings, in apps/apple/Generated (pass --release for an
+# optimized library).
+"apple:ffi" = { dir = "crates/ffi", run = "boltffi pack apple --deny-skipped" }
+"apple:gen" = { dir = "apps/apple", run = "xcodegen generate --quiet" }
+# The shared reducer vectors and the session store through the FFI, then a
+# live session on a daemon of its own (a throwaway A_HOME, the echo agent).
+"apple:test" = { depends = ["apple:ffi"], run = '''
+cargo build -p a
+export A_HOME=$(mktemp -d) A_AGENT=echo A_ASK=run_command A_TEST_HELPER=$PWD/target/debug/a
+trap 'target/debug/a daemon stop >/dev/null; rm -rf "$A_HOME"' EXIT
+swift test --package-path apps/apple/AKit
+''' }
+# Headless and ad hoc signed, with the release `a` in Contents/Helpers:
+# apps/apple/build/Build/Products/Debug/A.app.
+"apple:build" = { depends = ["apple:ffi", "apple:gen"], run = [
+    "cargo build-release -p a",
+    "xcodebuild -quiet -project apps/apple/A.xcodeproj -scheme A -configuration Debug -destination platform=macOS,arch=arm64 -derivedDataPath apps/apple/build build",
+] }
+# In the foreground, with this shell's environment: `A_HOME=... A_AGENT=echo
+# mise run apple:run` gives the app and the daemon it starts their own home.
+"apple:run" = { depends = ["apple:build"], run = "apps/apple/build/Build/Products/Debug/A.app/Contents/MacOS/A" }

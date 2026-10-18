@@ -1,0 +1,50 @@
+# XcodeGen (`mise run apple:gen`) writes A.xcodeproj from this; the project
+# is not checked in. Generated/AFfi comes from `mise run apple:ffi`.
+name: A
+options:
+  bundleIdPrefix: dev.a
+  deploymentTarget:
+    macOS: "15.0"
+  createIntermediateGroups: true
+packages:
+  AKit:
+    path: AKit
+settings:
+  base:
+    SWIFT_VERSION: "6.0"
+    SWIFT_DEFAULT_ACTOR_ISOLATION: MainActor
+    MACOSX_DEPLOYMENT_TARGET: "15.0"
+    # Ad hoc for development; releases are signed with a Developer ID.
+    CODE_SIGN_IDENTITY: "-"
+    CODE_SIGN_STYLE: Manual
+    DEVELOPMENT_TEAM: ""
+    ENABLE_USER_SCRIPT_SANDBOXING: NO
+targets:
+  A:
+    type: application
+    platform: macOS
+    sources: [App]
+    dependencies:
+      - package: AKit
+    settings:
+      base:
+        PRODUCT_NAME: A
+        PRODUCT_BUNDLE_IDENTIFIER: dev.a.app
+        GENERATE_INFOPLIST_FILE: YES
+        INFOPLIST_KEY_CFBundleDisplayName: a
+        INFOPLIST_KEY_LSApplicationCategoryType: public.app-category.developer-tools
+        # Unsandboxed: the daemon it starts runs commands in the user's
+        # workspaces.
+        ENABLE_APP_SANDBOX: NO
+        ENABLE_HARDENED_RUNTIME: YES
+    postBuildScripts:
+      # The `a` the app stages and starts the daemon from. A_HELPER names
+      # another build; the default is the release build.
+      - name: Bundle the a helper
+        basedOnDependencyAnalysis: false
+        script: |
+          helper="${A_HELPER:-$SRCROOT/../../target/release/a}"
+          dest="$TARGET_BUILD_DIR/$CONTENTS_FOLDER_PATH/Helpers"
+          mkdir -p "$dest"
+          cp -f "$helper" "$dest/a"
+          codesign --force --sign "${EXPANDED_CODE_SIGN_IDENTITY:--}" --options runtime "$dest/a"
