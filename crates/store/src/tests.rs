@@ -75,6 +75,7 @@ macro_rules! conformance {
         $(cases!($backend;
             round_trip,
             appends_keep_their_order_across_reopens,
+            batches_append_in_order,
             headers_list_sessions_oldest_first,
             counts_follow_appends,
             busy_markers_set_clear_and_repeat,
@@ -92,6 +93,10 @@ fn header(workspace: &str) -> Header {
         id: SessionId::new(),
         workspace: workspace.into(),
         parent: None,
+        extensions: vec![Installed {
+            name: "builtin".into(),
+            version: 1,
+        }],
     }
 }
 
@@ -136,6 +141,19 @@ fn appends_keep_their_order_across_reopens(store: &dyn LogStore) {
         written.extend(append(&mut *loaded.log, next..next + 10));
     }
     assert_eq!(store.load(h.id).unwrap().entries, written);
+}
+
+fn batches_append_in_order(store: &dyn LogStore) {
+    let h = header("/w");
+    let mut log = store.create(&h).unwrap().log;
+    let mut written = append(&mut *log, 1..=2);
+    let batch: Vec<Entry> = (3..=6).map(entry).collect();
+    log.append_all(&batch).unwrap();
+    log.append_all(&[]).unwrap();
+    written.extend(batch);
+    written.extend(append(&mut *log, 7..=7));
+    assert_eq!(store.load(h.id).unwrap().entries, written);
+    assert_eq!(store.count(h.id).unwrap(), 7);
 }
 
 fn headers_list_sessions_oldest_first(store: &dyn LogStore) {
@@ -259,6 +277,35 @@ fn jsonl_drops_a_torn_tail_and_appends_after_it() {
         assert_eq!(store.load(h.id).unwrap().entries, written);
         assert_eq!(store.count(h.id).unwrap(), 4);
     }
+}
+
+#[test]
+fn jsonl_headers_from_before_extension_records_load() {
+    let store = jsonl();
+    let id = SessionId::new();
+    let path = store.dir.as_ref().unwrap().join(format!("{id}.jsonl"));
+    fs::write(
+        &path,
+        format!("{{\"id\":\"{}\",\"workspace\":\"/w\"}}\n", id.0),
+    )
+    .unwrap();
+    let headers = store.headers().unwrap();
+    assert_eq!(headers.len(), 1);
+    assert_eq!(headers[0].extensions, []);
+}
+
+#[test]
+fn jsonl_skips_a_file_whose_header_a_crash_cut_off() {
+    let store = jsonl();
+    let h = header("/w");
+    store.create(&h).unwrap();
+    let dir = store.dir.as_ref().unwrap();
+    fs::write(
+        dir.join(format!("{}.jsonl", SessionId::new())),
+        br#"{"id":"#,
+    )
+    .unwrap();
+    assert_eq!(store.headers().unwrap(), [h]);
 }
 
 #[test]

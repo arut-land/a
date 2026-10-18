@@ -8,14 +8,12 @@ use std::fs::{File, OpenOptions};
 use std::io::{self, BufReader, Write};
 use std::path::{Path, PathBuf};
 use std::str::FromStr;
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError, mpsc};
 use std::thread;
 use std::time::{Duration, Instant};
 
-use protocol::{
-    ClientMsg, DaemonMsg, PROTO, SessionId, SessionSummary, Target, read_frame, write_frame,
-};
+use protocol::{ClientMsg, DaemonMsg, Frame, PROTO, SessionId, SessionSummary, Target, read_frame};
 use session::{Attachment, Session, Shared};
 use store::{Header, Jsonl, LogStore};
 use sys::Home;
@@ -105,6 +103,9 @@ struct Daemon {
 struct Slot {
     header: Header,
     live: Mutex<Option<Arc<Session>>>,
+    /// The parent has fired its watch on this child, so reports are moot.
+    /// Known only since this daemon started.
+    heard: AtomicBool,
 }
 
 impl Daemon {
@@ -119,6 +120,7 @@ impl Daemon {
                 Arc::new(Slot {
                     header,
                     live: Mutex::new(None),
+                    heard: AtomicBool::new(false),
                 })
             })
             .collect();
@@ -190,6 +192,7 @@ impl Daemon {
             id: SessionId::new(),
             workspace,
             parent: None,
+            extensions: session::installed(&self.shared.registry),
         };
         let loaded = self.shared.store.create(&header)?;
         let session = Session::start(header.clone(), loaded, Arc::clone(&self.shared));
@@ -197,6 +200,7 @@ impl Daemon {
         lock(&self.slots).push(Arc::new(Slot {
             header,
             live: Mutex::new(Some(session)),
+            heard: AtomicBool::new(false),
         }));
         Ok(attachment)
     }
@@ -342,26 +346,31 @@ fn claim(home: &Home) -> io::Result<File> {
         ));
     }
     file.set_len(0)?;
+    // Not synced: clients read it while we hold the lock, and after a crash
+    // there is no lock to vouch for it.
     write!(file, "{}", std::process::id())?;
-    file.sync_data()?;
     Ok(file)
 }
 
 #[cfg(unix)]
 fn handle(daemon: &Daemon, life: &Lifecycle, conn: UnixStream) -> io::Result<()> {
     let mut reader = BufReader::new(conn.try_clone()?);
-    let (tx, rx) = mpsc::channel::<DaemonMsg>();
+    let (tx, rx) = mpsc::channel::<Frame>();
     let mut writer = conn;
     thread::spawn(move || {
-        for msg in rx {
-            if write_frame(&mut writer, &msg).is_err() {
+        for frame in rx {
+            if writer.write_all(frame.as_bytes()).is_err() {
                 break;
             }
         }
     });
     // The writer thread ends with the connection; a lost reply needs no
     // handling here.
-    let reply = |msg| drop(tx.send(msg));
+    let reply = |msg| {
+        if let Ok(frame) = Frame::new(&msg) {
+            drop(tx.send(frame));
+        }
+    };
     let error = |message: String| reply(DaemonMsg::Error { message });
 
     let verdict = match read_frame(&mut reader)? {

@@ -32,22 +32,25 @@ impl Jsonl {
 }
 
 impl LogStore for Jsonl {
+    /// The file, header included, becomes durable with its first entry: a
+    /// session with none has nothing to lose, and creating one costs no sync.
     fn create(&self, header: &Header) -> io::Result<Loaded> {
         let mut file = OpenOptions::new()
             .create_new(true)
             .append(true)
             .open(self.path(header.id))?;
         write_line(&mut file, header)?;
-        file.sync_all()?;
-        // The new file's name is only durable once its directory is.
-        #[cfg(unix)]
-        File::open(&self.dir)?.sync_all()?;
         Ok(Loaded {
             entries: Vec::new(),
-            log: Box::new(JsonlLog(file)),
+            log: Box::new(JsonlLog {
+                file,
+                new_in: Some(self.dir.clone()),
+            }),
         })
     }
 
+    /// A file whose header did not survive a crash holds no entries either,
+    /// so it holds no session.
     fn headers(&self) -> io::Result<Vec<Header>> {
         let mut headers = Vec::new();
         for item in fs::read_dir(&self.dir)? {
@@ -55,7 +58,9 @@ impl LogStore for Jsonl {
             if path.extension().is_some_and(|e| e == "jsonl") {
                 let mut line = String::new();
                 BufReader::new(File::open(&path)?).read_line(&mut line)?;
-                headers.push(serde_json::from_str::<Header>(&line)?);
+                if let Ok(header) = serde_json::from_str::<Header>(&line) {
+                    headers.push(header);
+                }
             }
         }
         headers.sort_by_key(|h| h.id.0);
@@ -87,7 +92,7 @@ impl LogStore for Jsonl {
         }
         Ok(Loaded {
             entries,
-            log: Box::new(JsonlLog(file)),
+            log: Box::new(JsonlLog { file, new_in: None }),
         })
     }
 
@@ -121,12 +126,36 @@ impl LogStore for Jsonl {
 }
 
 /// Durable once `sync_data` returns.
-struct JsonlLog(File);
+struct JsonlLog {
+    file: File,
+    /// The directory of a file not yet synced since it was created: its
+    /// name is only durable once the directory is.
+    new_in: Option<PathBuf>,
+}
 
 impl Log for JsonlLog {
     fn append(&mut self, entry: &Entry) -> io::Result<()> {
-        write_line(&mut self.0, entry)?;
-        self.0.sync_data()
+        self.append_all(std::slice::from_ref(entry))
+    }
+
+    /// One write and one sync for the lot.
+    fn append_all(&mut self, entries: &[Entry]) -> io::Result<()> {
+        if entries.is_empty() {
+            return Ok(());
+        }
+        let mut lines = Vec::new();
+        for entry in entries {
+            entry.encode(&mut lines)?;
+            lines.push(b'\n');
+        }
+        self.file.write_all(&lines)?;
+        self.file.sync_data()?;
+        #[cfg(unix)]
+        if let Some(dir) = &self.new_in {
+            File::open(dir)?.sync_all()?;
+        }
+        self.new_in = None;
+        Ok(())
     }
 }
 

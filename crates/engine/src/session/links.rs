@@ -4,16 +4,17 @@
 //! fired, and a watch fires at most once because only the parent's actor
 //! logs it, after checking the log.
 
-use std::collections::HashSet;
+use std::collections::{HashSet, VecDeque};
 use std::io;
-use std::sync::atomic::Ordering;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 
+use agent::{Agent, Input};
 use protocol::{Body, Entry, Environment, Outcome, SessionId};
 use serde_json::Value;
 use store::{Header, Loaded, Parent};
 
-use super::{Msg, Session};
+use super::{Msg, Session, installed};
 use crate::{Daemon, Slot, lock};
 
 /// The watches in `entries` that have not fired, as `(seq, child)`.
@@ -29,6 +30,14 @@ pub fn armed(entries: &[Entry]) -> impl Iterator<Item = (u64, SessionId)> {
         Body::Watch { child } if !fired.contains(&e.seq) => Some((e.seq, child)),
         _ => None,
     })
+}
+
+/// Where a link stands, by its watch. A link not yet watched or armed
+/// carries the child's input, to start it with.
+enum Linked {
+    Unwatched(String),
+    Armed(String),
+    Fired,
 }
 
 /// What a settled child hands back: its last answer or outcome.
@@ -54,24 +63,28 @@ impl Session {
     /// Starts a child on `input` and watches it. The link commits first, so
     /// a crash before the child exists, or before the watch, leaves the rest
     /// to recovery.
-    pub(super) fn spawn(&self, input: &str) -> io::Result<()> {
+    pub(super) async fn spawn(&self, input: String) -> io::Result<()> {
         let child = SessionId::new();
-        let call = self.append(Body::Link {
-            child,
-            input: input.to_owned(),
-        })?;
-        self.start_child(child, call, input)?;
-        self.watch(child)
+        let call = self
+            .append(Body::Link {
+                child,
+                input: input.clone(),
+            })
+            .await?;
+        self.start_child(child, call, input).await?;
+        self.watch(child).await
     }
 
     /// Commits a watch on `child`; it counts as work until it fires.
-    fn watch(&self, child: SessionId) -> io::Result<()> {
-        self.append(Body::Watch { child })?;
+    async fn watch(&self, child: SessionId) -> io::Result<()> {
+        self.append(Body::Watch { child }).await?;
         self.queued.fetch_add(1, Ordering::SeqCst);
         Ok(())
     }
 
-    fn start_child(&self, child: SessionId, call: u64, input: &str) -> io::Result<()> {
+    /// Starts the child off the async workers: making, seeding or loading
+    /// it is store I/O.
+    async fn start_child(&self, child: SessionId, call: u64, input: String) -> io::Result<()> {
         let daemon = self
             .shared
             .daemon
@@ -84,15 +97,21 @@ impl Session {
                 session: self.id,
                 call,
             }),
+            extensions: installed(&self.shared.registry),
         };
-        daemon.start_child(header, input, lock(&self.env).clone())
+        let env = lock(&self.env).clone();
+        rt::unblock(&*self.shared.rt, move || {
+            daemon.start_child(header, &input, env)
+        })
+        .await
     }
 
     /// Re-arms links after a restart: a link without a watch gets one, and
     /// every child still watched is started, so it runs to its end and
-    /// reports back.
-    pub(super) fn relink(&self) -> io::Result<()> {
-        let todo: Vec<(u64, SessionId, String, bool)> = {
+    /// reports back. Children whose watch fired are told their reports are
+    /// no longer needed.
+    pub(super) async fn relink(&self) -> io::Result<()> {
+        let links: Vec<(u64, SessionId, Linked)> = {
             let st = self.lock();
             let armed: Vec<SessionId> = armed(&st.entries).map(|(_, child)| child).collect();
             let watched = |child| {
@@ -104,50 +123,87 @@ impl Session {
                 .iter()
                 .filter_map(|e| match &e.body {
                     Body::Link { child, input } => {
-                        let watched = watched(*child);
-                        (!watched || armed.contains(child))
-                            .then(|| (e.seq, *child, input.clone(), watched))
+                        let linked = if !watched(*child) {
+                            Linked::Unwatched(input.clone())
+                        } else if armed.contains(child) {
+                            Linked::Armed(input.clone())
+                        } else {
+                            Linked::Fired
+                        };
+                        Some((e.seq, *child, linked))
                     }
                     _ => None,
                 })
                 .collect()
         };
-        for (call, child, input, watched) in todo {
-            self.start_child(child, call, &input)?;
-            if !watched {
-                self.watch(child)?;
+        for (call, child, linked) in links {
+            match linked {
+                Linked::Fired => self.heard(child),
+                Linked::Armed(input) => self.start_child(child, call, input).await?,
+                Linked::Unwatched(input) => {
+                    self.start_child(child, call, input).await?;
+                    self.watch(child).await?;
+                }
             }
         }
         Ok(())
     }
 
     /// Queues child `child`'s result for this session's actor.
-    fn settle(&self, child: SessionId, outcome: Outcome) {
+    pub(super) fn settle(&self, child: SessionId, outcome: Outcome) {
         let _ = self.mailbox.send(Msg::Settled { child, outcome });
     }
 
-    /// Fires every armed watch on `child`; one that has fired already stays
-    /// as it is.
-    pub(super) async fn fire(&self, child: SessionId, outcome: &Outcome) {
+    /// Fires every armed watch on `child` and hands the agent the child's
+    /// result; one that has fired already stays as it is.
+    pub(super) async fn fire(
+        &self,
+        agent: &mut dyn Agent,
+        child: SessionId,
+        outcome: Outcome,
+    ) -> bool {
         let watches: Vec<u64> = armed(&self.lock().entries)
             .filter_map(|(watch, watched)| (watched == child).then_some(watch))
             .collect();
+        let mut ok = true;
         for watch in watches {
             let outcome = outcome.clone();
-            self.work(async { self.append(Body::Fired { watch, outcome }).map(drop) })
+            ok &= self
+                .work(async {
+                    let fired = Body::Fired {
+                        watch,
+                        outcome: outcome.clone(),
+                    };
+                    self.record(fired);
+                    let inputs = VecDeque::from([Input::ChildDone { watch, outcome }]);
+                    self.drive(agent, VecDeque::new(), inputs).await
+                })
                 .await;
+        }
+        self.heard(child);
+        ok
+    }
+
+    /// Marks `child`'s reports as no longer needed: its watch has fired.
+    fn heard(&self, child: SessionId) {
+        if let Some(daemon) = self.shared.daemon.upgrade() {
+            daemon.heard(child);
         }
     }
 
     /// Tells the parent, if any, that this session has settled, and with
     /// what. The parent ignores reports for watches that have fired, so
-    /// reporting again is harmless.
-    pub(super) fn report(&self) {
+    /// reporting again is harmless; once the parent says its watch fired,
+    /// reports stop, so they never load a hibernated parent for nothing.
+    pub(super) async fn report(&self) {
         let (Some(parent), Some(daemon)) = (self.parent, self.shared.daemon.upgrade()) else {
             return;
         };
-        let outcome = result(&self.lock().entries);
-        if let Err(e) = daemon.settled(parent.session, self.id, outcome) {
+        let (child, outcome) = (self.id, result(&self.lock().entries));
+        let reported = rt::unblock(&*self.shared.rt, move || {
+            daemon.settled(parent.session, child, outcome)
+        });
+        if let Err(e) = reported.await {
             self.warn(format_args!("reporting to {}: {e}", parent.session.short()));
         }
     }
@@ -166,6 +222,7 @@ impl Daemon {
             slots.push(Arc::new(Slot {
                 header,
                 live: Mutex::new(Some(session)),
+                heard: AtomicBool::new(false),
             }));
             return Ok(());
         };
@@ -212,14 +269,26 @@ impl Daemon {
     }
 
     /// Hands child `child`'s result to its parent, loading the parent if it
-    /// is hibernated.
+    /// is hibernated, unless the parent has heard from it already.
     fn settled(&self, parent: SessionId, child: SessionId, outcome: Outcome) -> io::Result<()> {
-        let slot = self
-            .slots()
-            .into_iter()
-            .find(|s| s.header.id == parent)
+        let slot = |id| {
+            self.slots()
+                .into_iter()
+                .find(|s: &Arc<Slot>| s.header.id == id)
+        };
+        if slot(child).is_some_and(|s| s.heard.load(Ordering::SeqCst)) {
+            return Ok(());
+        }
+        let parent = slot(parent)
             .ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, "no such parent session"))?;
-        self.with_live(&slot, |session| session.settle(child, outcome))
+        self.with_live(&parent, |session| session.settle(child, outcome))
+    }
+
+    /// Records that `child`'s parent has fired its watch on it.
+    fn heard(&self, child: SessionId) {
+        if let Some(slot) = lock(&self.slots).iter().find(|s| s.header.id == child) {
+            slot.heard.store(true, Ordering::SeqCst);
+        }
     }
 }
 

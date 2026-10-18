@@ -5,6 +5,7 @@ use std::ffi::OsString;
 use std::fmt;
 use std::io::{self, Read, Write};
 use std::path::PathBuf;
+use std::sync::Arc;
 
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -134,6 +135,19 @@ pub enum Body {
     /// The environment the session's commands run in from here on, as the
     /// attaching client captured it, secrets redacted.
     Environment(Environment),
+    /// The extensions the session runs with from here on, in install order,
+    /// logged when they differ from those its header or an earlier entry
+    /// records.
+    Extensions {
+        installed: Vec<Installed>,
+    },
+}
+
+/// An extension a session ran with.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Installed {
+    pub name: String,
+    pub version: u32,
 }
 
 /// A client's shell environment: what a command the agent runs for it sees.
@@ -420,6 +434,59 @@ pub fn write_frame<T: Serialize>(w: &mut impl Write, msg: &T) -> io::Result<()> 
     w.flush()
 }
 
+/// A frame encoded once, length prefix included, for any number of peers:
+/// cloning it shares the bytes.
+#[derive(Clone, Debug)]
+pub struct Frame(Arc<Vec<u8>>);
+
+impl Frame {
+    pub fn new(msg: &DaemonMsg) -> io::Result<Self> {
+        let mut bytes = Self::start();
+        serde_json::to_writer(&mut bytes, msg)?;
+        Self::finish(bytes)
+    }
+
+    /// The frame of `DaemonMsg::Entry(entry.clone())`, without the clone:
+    /// the entry's own JSON with the tag spliced in first, as serde puts it.
+    pub fn entry(entry: &Entry) -> io::Result<Self> {
+        let mut bytes = Self::start();
+        bytes.extend_from_slice(br#"{"t":"entry""#);
+        let at = bytes.len();
+        entry.encode(&mut bytes)?;
+        bytes[at] = b',';
+        Self::finish(bytes)
+    }
+
+    /// Room for the length, and as much again as `serde_json::to_vec`
+    /// starts with.
+    fn start() -> Vec<u8> {
+        let mut bytes = Vec::with_capacity(132);
+        bytes.extend_from_slice(&[0; 4]);
+        bytes
+    }
+
+    fn finish(mut bytes: Vec<u8>) -> io::Result<Self> {
+        let len = u32::try_from(bytes.len() - 4)
+            .ok()
+            .filter(|&n| n <= MAX_FRAME)
+            .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "frame too large"))?;
+        bytes[..4].copy_from_slice(&len.to_le_bytes());
+        Ok(Self(Arc::new(bytes)))
+    }
+
+    pub fn as_bytes(&self) -> &[u8] {
+        &self.0
+    }
+}
+
+impl Entry {
+    /// Appends the entry's JSON object to `out`. Encoded here, once, for
+    /// the reason [`Decode`] gives.
+    pub fn encode(&self, out: &mut Vec<u8>) -> serde_json::Result<()> {
+        serde_json::to_writer(out, self)
+    }
+}
+
 /// A record decoded from JSON here, once, rather than in every crate that
 /// reads one: release builds do not share generic instantiations across
 /// crates, and these deserializers are large.
@@ -497,6 +564,7 @@ fn known_kind(kind: &str) -> bool {
             | "watch"
             | "fired"
             | "environment"
+            | "extensions"
     )
 }
 
@@ -523,6 +591,22 @@ pub fn read_frame<T: Decode>(r: &mut impl Read) -> io::Result<Option<T>> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_shared_frame_is_the_frame_written() {
+        let entry = Entry {
+            seq: 7,
+            epoch: 0,
+            body: Body::Assistant { text: "hi".into() },
+        };
+        let mut written = Vec::new();
+        write_frame(&mut written, &DaemonMsg::Entry(entry.clone())).unwrap();
+        assert_eq!(Frame::entry(&entry).unwrap().as_bytes(), written);
+        let msg = DaemonMsg::Synced { seq: 7 };
+        written.clear();
+        write_frame(&mut written, &msg).unwrap();
+        assert_eq!(Frame::new(&msg).unwrap().as_bytes(), written);
+    }
 
     #[test]
     fn frames_round_trip() {
@@ -707,6 +791,9 @@ mod tests {
                 outcome: Outcome::Interrupted,
             },
             Body::Environment(Environment::default()),
+            Body::Extensions {
+                installed: Vec::new(),
+            },
         ];
         for body in &bodies {
             match body {
@@ -722,7 +809,8 @@ mod tests {
                 | Body::Link { .. }
                 | Body::Watch { .. }
                 | Body::Fired { .. }
-                | Body::Environment(_) => {}
+                | Body::Environment(_)
+                | Body::Extensions { .. } => {}
             }
             let json = serde_json::to_value(body).unwrap();
             assert!(known_kind(json["kind"].as_str().unwrap()), "{json}");

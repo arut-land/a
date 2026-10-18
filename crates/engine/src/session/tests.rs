@@ -1,4 +1,5 @@
 use std::path::Path;
+use std::sync::atomic::AtomicBool;
 use std::sync::mpsc;
 use std::thread;
 
@@ -214,22 +215,99 @@ impl Fixture {
         }))
     }
 
-    /// A session whose log holds `entries`, started as after a crash.
+    /// A session whose log holds `entries`, started as after a crash, once
+    /// it has recovered.
     fn start(&self, entries: &[Entry]) -> Arc<Session> {
+        let session = self.load(entries);
+        settle(&session);
+        session
+    }
+
+    /// [`Fixture::start`], without waiting for recovery.
+    fn load(&self, entries: &[Entry]) -> Arc<Session> {
         let header = Header {
             id: SessionId::new(),
             workspace: std::env::temp_dir(),
             parent: None,
+            extensions: installed(&self.0.registry),
         };
         let mut log = self.0.store.create(&header).unwrap().log;
         for e in entries {
             log.append(e).unwrap();
         }
         let loaded = self.0.store.load(header.id).unwrap();
-        let session = Session::start(header, loaded, Arc::clone(&self.0));
-        settle(&session);
-        session
+        Session::start(header, loaded, Arc::clone(&self.0))
     }
+}
+
+/// A log that keeps the size of each batch it is handed, and fails while
+/// told to.
+#[derive(Clone, Default)]
+struct Probe {
+    batches: Arc<Mutex<Vec<usize>>>,
+    failing: Arc<AtomicBool>,
+}
+
+impl Log for Probe {
+    fn append(&mut self, entry: &Entry) -> io::Result<()> {
+        self.append_all(std::slice::from_ref(entry))
+    }
+
+    fn append_all(&mut self, entries: &[Entry]) -> io::Result<()> {
+        if self.failing.load(Ordering::SeqCst) {
+            return Err(io::Error::other("disk full"));
+        }
+        lock(&self.batches).push(entries.len());
+        Ok(())
+    }
+}
+
+#[test]
+fn a_step_commits_its_entries_together_and_a_failed_one_leaves_no_trace() {
+    let fixture = Fixture::new(
+        agent::Kind::Echo,
+        Registry::default(),
+        openai(&Script::new(&[])),
+    );
+    let probe = Probe::default();
+    let header = Header {
+        id: SessionId::new(),
+        workspace: std::env::temp_dir(),
+        parent: None,
+        extensions: Vec::new(),
+    };
+    let loaded = Loaded {
+        entries: Vec::new(),
+        log: Box::new(probe.clone()),
+    };
+    let session = Session::start(header, loaded, Arc::clone(&fixture.0));
+    settle(&session);
+    session.submit("hi".into());
+    settle(&session);
+    probe.failing.store(true, Ordering::SeqCst);
+    session.submit("lost".into());
+    settle(&session);
+    probe.failing.store(false, Ordering::SeqCst);
+    session.submit("again".into());
+    settle(&session);
+    let log = log_of(&session);
+    session.stop();
+
+    // Each message and its echo commit together; the failed pair is gone,
+    // seqs and all.
+    assert_eq!(*lock(&probe.batches), [2, 2]);
+    let said: Vec<_> = log.iter().map(|e| (e.seq, &e.body)).collect();
+    let user = |text: &str| Body::User { text: text.into() };
+    let echo = |text: &str| Body::Assistant { text: text.into() };
+    assert_eq!(
+        said,
+        [
+            (1, &user("hi")),
+            (2, &echo("hi")),
+            (3, &user("again")),
+            (4, &echo("again"))
+        ]
+    );
 }
 
 fn settle(session: &Session) {
@@ -305,6 +383,78 @@ fn the_model_calls_a_tool_and_answers_from_its_result() {
         assert_eq!(got, log, "cut after {cut}");
         assert_eq!(script.sent(), sent[1..], "cut after {cut}");
     }
+}
+
+#[test]
+fn a_fired_watch_wakes_the_model_with_the_childs_result() {
+    let replies = cassette("openai/streaming_grammar/tool_then_followup_text.yaml");
+    let fixture =
+        |script: &Arc<Script>| Fixture::new(agent::Kind::Chat, Registry::default(), openai(script));
+    let child = SessionId::new();
+    let script = Script::new(&replies[1..]);
+    let session = fixture(&script).load(&[entry(1, Body::Watch { child })]);
+    let found = Outcome::Done {
+        output: "found it".into(),
+    };
+    session.settle(child, found.clone());
+    settle(&session);
+    let log = log_of(&session);
+    session.stop();
+    let sent = script.sent();
+
+    assert!(
+        matches!(
+            &bodies(&log)[1..],
+            [
+                Body::Fired { watch: 1, outcome },
+                Body::ModelCall { .. },
+                Body::ModelResult { call: 3, outcome: Outcome::Done { .. } },
+            ] if *outcome == found
+        ),
+        "{log:#?}"
+    );
+    let input = sent[0]["input"].to_string();
+    assert!(
+        input.contains("The child session finished:\\nfound it"),
+        "{input}"
+    );
+
+    // Stopped after the watch fired, recovery takes the same step.
+    let script = Script::new(&replies[1..]);
+    let resumed = fixture(&script).start(&log[..2]);
+    let got = log_of(&resumed);
+    resumed.stop();
+    assert_eq!(got, log);
+    assert_eq!(script.sent(), sent);
+}
+
+#[test]
+fn extensions_are_logged_when_they_change() {
+    let script = Script::new(&[]);
+    let registry = Registry::default().with(&Harbor).with(&Builtin);
+    let fixture = Fixture::new(agent::Kind::Echo, registry, openai(&script));
+    // Created with these extensions: nothing to log.
+    let same = fixture.start(&[]);
+    let unchanged = log_of(&same);
+    same.stop();
+    // An older set, as an upgrade leaves it, is superseded once.
+    let older = Body::Extensions {
+        installed: vec![Installed {
+            name: "harbor".into(),
+            version: 0,
+        }],
+    };
+    let upgraded = fixture.start(&[entry(1, older)]);
+    let noted = log_of(&upgraded);
+    upgraded.stop();
+
+    assert_eq!(unchanged, []);
+    assert_eq!(
+        bodies(&noted)[1..],
+        [&Body::Extensions {
+            installed: installed(&fixture.0.registry)
+        }]
+    );
 }
 
 /// Denies shell commands, and has the agent go on once after it stops.
@@ -509,7 +659,14 @@ fn an_ask_waits_in_the_inbox_through_a_stop_and_runs_once_approved() {
     let log = finished(&resumed, 3);
     resumed.stop();
 
-    let sent: Vec<DaemonMsg> = rx.try_iter().collect();
+    let sent: Vec<DaemonMsg> = rx
+        .try_iter()
+        .map(|frame: Frame| {
+            protocol::read_frame(&mut frame.as_bytes())
+                .unwrap()
+                .unwrap()
+        })
+        .collect();
     assert!(
         matches!(&sent[..], [
             DaemonMsg::Attached { .. },

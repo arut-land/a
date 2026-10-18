@@ -11,7 +11,7 @@ mod tests;
 use std::io;
 use std::path::PathBuf;
 
-use protocol::{Entry, SessionId};
+use protocol::{Entry, Installed, SessionId};
 use serde::{Deserialize, Serialize};
 
 pub use jsonl::Jsonl;
@@ -24,6 +24,10 @@ pub struct Header {
     /// The session and call that own this one, if it is a child.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub parent: Option<Parent>,
+    /// The extensions the session was created with; a later
+    /// [`protocol::Body::Extensions`] entry supersedes them.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub extensions: Vec<Installed>,
 }
 
 /// Where a child session hangs off its parent: the parent's `link` entry,
@@ -68,6 +72,13 @@ pub trait Log: Send {
     /// Returns once the entry is as durable as the backend makes anything: a
     /// crash afterwards never loses it.
     fn append(&mut self, entry: &Entry) -> io::Result<()>;
+
+    /// Appends `entries` in order, as durably as [`Log::append`]; a backend
+    /// may make them durable together. After a crash the log holds a prefix
+    /// of them.
+    fn append_all(&mut self, entries: &[Entry]) -> io::Result<()> {
+        entries.iter().try_for_each(|entry| self.append(entry))
+    }
 }
 
 fn not_found(id: SessionId) -> io::Error {
