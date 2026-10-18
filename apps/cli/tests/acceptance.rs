@@ -83,7 +83,8 @@ fn resume_after_the_terminal_closes_mid_turn_replays_every_entry() {
             },
             Body::ToolCall {
                 tool: "sleep".into(),
-                input: json!({ "seconds": 1 })
+                input: json!({ "seconds": 1 }),
+                id: None,
             },
             Body::ToolResult {
                 call,

@@ -11,7 +11,7 @@ use std::path::{Path, PathBuf};
 use std::process::{Child, ChildStdin, ChildStdout, Command, Output, Stdio};
 use std::time::{Duration, Instant};
 
-use protocol::{BUILD, Body, ClientMsg, DaemonMsg, Entry, Outcome, PROTO, SessionId, Target};
+use protocol::{Body, ClientMsg, DaemonMsg, Entry, Outcome, PROTO, SessionId, Target};
 use sys::{Home, Signal};
 
 /// `A_STRICT_BUDGETS=1` holds latency to the design's budget; otherwise it
@@ -106,12 +106,14 @@ impl Env {
         client::diagnose(&self.home).pid
     }
 
-    /// Every daemon process started from this test's binary.
+    /// Every daemon process of this test: daemons run the build staged
+    /// under this test's home.
     pub fn daemons(&self) -> Vec<u32> {
-        let exe = self.exe.to_str().unwrap();
+        let runtime = self.root.join("home").join("runtime");
+        let runtime = runtime.to_str().unwrap();
         processes("pid=")
             .into_iter()
-            .filter(|(_, args)| args.starts_with(exe) && args.contains(" __daemon "))
+            .filter(|(_, args)| args.starts_with(runtime) && args.contains(" __daemon "))
             .map(|(pid, _)| pid)
             .collect()
     }
@@ -134,7 +136,9 @@ impl Env {
         };
         conn.send(&ClientMsg::Hello {
             proto: PROTO,
-            build: BUILD.to_owned(),
+            // Any build the daemon's staged `current` does not outrank: it
+            // answers with a welcome, never a drain.
+            build: "acceptance".to_owned(),
         });
         assert!(matches!(conn.recv(), DaemonMsg::Welcome { .. }));
         conn
