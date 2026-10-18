@@ -39,8 +39,8 @@ input, overlays).
   no session), `/new`, `/env refresh`, `/interrupt`, `/detach`, `/help`
   (or F1). Any other `/name` goes to the daemon, which runs the session's
   slash command or says there is none.
-- Ctrl-C while a tool call or slash command runs sends
-  `ClientMsg::Interrupt`, which stops it (a model call it does not); otherwise it
+- Ctrl-C while a model call, tool call or slash command runs sends
+  `ClientMsg::Interrupt`, which stops it and the rest of its turn; otherwise it
   clears the input, or detaches when it is empty. Nothing the client does
   stops the daemon. Ctrl-D on an empty input detaches.
 - A daemon that drains for an upgrade is reconnected and replayed from

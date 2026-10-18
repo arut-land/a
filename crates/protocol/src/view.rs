@@ -497,7 +497,7 @@ impl SessionView {
             Outcome::Failed { error } => Status::Failed {
                 error: error.clone(),
             },
-            Outcome::Interrupted => Status::Interrupted,
+            Outcome::Interrupted { .. } => Status::Interrupted,
         };
         Some(self.updated(at, Part::Outcome))
     }

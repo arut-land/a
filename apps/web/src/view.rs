@@ -170,8 +170,8 @@ async fn tool_card(
                 Some(Outcome::Failed { error }) => {
                     <pre style=(style::OUTPUT)><span style=(style::BAD)>(error)</span></pre>
                 }
-                Some(Outcome::Interrupted) => {
-                    <pre style=(style::OUTPUT)><span style=(style::WARN)>"interrupted: the daemon stopped mid-call"</span></pre>
+                Some(Outcome::Interrupted { .. }) => {
+                    <pre style=(style::OUTPUT)><span style=(style::WARN)>"interrupted before it finished"</span></pre>
                 }
                 None => {}
             }
@@ -200,7 +200,7 @@ fn outcome_text(outcome: &Outcome) -> String {
     match outcome {
         Outcome::Done { output } => output.to_string(),
         Outcome::Failed { error } => format!("failed: {error}"),
-        Outcome::Interrupted => "interrupted".to_owned(),
+        Outcome::Interrupted { .. } => "interrupted".to_owned(),
     }
 }
 

@@ -1,5 +1,5 @@
 //! What a session's log says, read back: the conversation the model sees,
-//! the agent's state, what waits for the user, and a recap.
+//! the agent's state, what waits for the user or the agent, and a recap.
 
 use std::collections::{HashMap, HashSet, VecDeque};
 
@@ -20,6 +20,7 @@ pub fn transcript(entries: &[Entry], before: u64, tools: &Toolset) -> Vec<Messag
     for e in entries.iter().take_while(|e| e.seq < before) {
         match &e.body {
             Body::User { text }
+            | Body::Steer { text, .. }
             | Body::Hook {
                 decision: Decision::OnStop { text },
                 ..
@@ -111,7 +112,17 @@ pub fn replay(agent: &mut dyn Agent, entries: &[Entry]) -> VecDeque<Action> {
                 }
                 continue;
             }
-            Body::ToolProcess { .. }
+            // The turn was cut short: what it asked for is not done.
+            Body::Interrupt => {
+                asked.clear();
+                continue;
+            }
+            // Read by the model, not stepped through the agent.
+            Body::Steer { .. }
+            | Body::Queued { .. }
+            | Body::Progress { .. }
+            | Body::Settings(_)
+            | Body::ToolProcess { .. }
             | Body::Hook { .. }
             | Body::Ask { .. }
             | Body::Watch { .. }
@@ -136,6 +147,35 @@ fn commits(action: &Action, body: &Body) -> bool {
         (Action::Spawn { input }, Body::Link { input: linked, .. }) => input == linked,
         _ => false,
     }
+}
+
+/// The input queued and not yet taken up, in order, as `(seq, text,
+/// steer)`. Each `user` or `command` entry takes up the oldest waiting, and
+/// a `steer` entry the one it names.
+pub fn untaken(entries: &[Entry]) -> VecDeque<(u64, String, bool)> {
+    let mut waiting = VecDeque::new();
+    for e in entries {
+        match &e.body {
+            Body::Queued { text, steer } => waiting.push_back((e.seq, text.clone(), *steer)),
+            Body::User { .. } | Body::Command { .. } => drop(waiting.pop_front()),
+            Body::Steer { queued, .. } => waiting.retain(|(seq, ..)| seq != queued),
+            _ => {}
+        }
+    }
+    waiting
+}
+
+/// The output tool call `call` committed as it ran, if any.
+pub fn partial(entries: &[Entry], call: u64) -> Option<String> {
+    let mut output: Option<String> = None;
+    for e in entries.iter().filter(|e| e.seq > call) {
+        if let Body::Progress { call: of, text } = &e.body
+            && *of == call
+        {
+            output.get_or_insert_default().push_str(text);
+        }
+    }
+    output
 }
 
 /// The session's inbox: the tool calls asked and not yet answered, in the

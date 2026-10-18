@@ -52,6 +52,7 @@ fn result(entries: &[Entry]) -> Outcome {
             Body::ToolResult { outcome, .. }
             | Body::ModelResult { outcome, .. }
             | Body::Fired { outcome, .. } => Some(outcome.clone()),
+            Body::Interrupt => Some(Outcome::Interrupted { output: None }),
             _ => None,
         })
         .unwrap_or_else(|| Outcome::Failed {
@@ -97,7 +98,7 @@ impl Session {
                 session: self.id,
                 call,
             }),
-            extensions: installed(&self.shared.registry),
+            extensions: installed(&self.registry()),
         };
         let env = lock(&self.env).clone();
         rt::unblock(&*self.shared.rt, move || {
@@ -210,6 +211,34 @@ impl Session {
 }
 
 impl Daemon {
+    /// The loaded sessions `parent` owns.
+    pub(crate) fn children(&self, parent: SessionId) -> Vec<Arc<Session>> {
+        self.slots()
+            .iter()
+            .filter(|s| s.header.parent.is_some_and(|p| p.session == parent))
+            .filter_map(|s| lock(&s.live).clone())
+            .collect()
+    }
+
+    /// Unloads the sessions `parent` owns, each after its own children.
+    pub(crate) fn unload_children(&self, parent: SessionId) {
+        let owned = self
+            .slots()
+            .into_iter()
+            .filter(|s| s.header.parent.is_some_and(|p| p.session == parent));
+        for slot in owned {
+            let live = lock(&slot.live).take();
+            if let Some(child) = live {
+                child.stop();
+            }
+        }
+    }
+
+    /// Whether session `id` exists.
+    pub(crate) fn knows(&self, id: SessionId) -> bool {
+        lock(&self.slots).iter().any(|s| s.header.id == id)
+    }
+
     /// Starts child session `header.id` on `input` unless it runs already:
     /// made if missing, given `input` if its log is empty, and loaded if
     /// hibernated. Calling it again is harmless, which recovery relies on.
@@ -251,11 +280,7 @@ impl Daemon {
                 text: input.to_owned(),
             };
             for (seq, body) in (1..).zip(opening.into_iter().chain([user])) {
-                let entry = Entry {
-                    seq,
-                    epoch: 0,
-                    body,
-                };
+                let entry = Entry::new(seq, loaded.epoch, body);
                 loaded.log.append(&entry)?;
                 loaded.entries.push(entry);
             }
@@ -297,11 +322,7 @@ mod tests {
     use super::*;
 
     fn entry(seq: u64, body: Body) -> Entry {
-        Entry {
-            seq,
-            epoch: 0,
-            body,
-        }
+        Entry::new(seq, 0, body)
     }
 
     #[test]
@@ -314,7 +335,7 @@ mod tests {
                 3,
                 Body::Fired {
                     watch: 1,
-                    outcome: Outcome::Interrupted,
+                    outcome: Outcome::Interrupted { output: None },
                 },
             ),
         ];

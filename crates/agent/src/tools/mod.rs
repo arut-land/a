@@ -53,7 +53,7 @@ impl Tool for Sleep {
         )
     }
 
-    async fn call(&self, input: Seconds, cx: &Cx<'_>) -> Result<Slept, String> {
+    async fn call(&self, input: Seconds, cx: &Cx) -> Result<Slept, String> {
         cx.rt.sleep(Duration::from_secs(input.seconds)).await;
         Ok(Slept {
             slept: input.seconds,

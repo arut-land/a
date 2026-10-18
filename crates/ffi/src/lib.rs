@@ -616,7 +616,7 @@ impl From<&Outcome> for ToolOutcome {
             Outcome::Failed { error } => Self::Failed {
                 error: error.clone(),
             },
-            Outcome::Interrupted => Self::Interrupted,
+            Outcome::Interrupted { .. } => Self::Interrupted,
         }
     }
 }

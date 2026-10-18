@@ -30,8 +30,8 @@ fn settle(daemon: &Daemon) {
 }
 
 fn bodies(store: &dyn LogStore, id: SessionId) -> Vec<Body> {
-    let loaded = store.load(id).unwrap();
-    loaded.entries.into_iter().map(|e| e.body).collect()
+    let entries = store.entries(id).unwrap();
+    entries.into_iter().map(|e| e.body).collect()
 }
 
 #[test]
@@ -79,7 +79,7 @@ fn busy_sessions_recover_at_startup() {
     let (root, home) = home("recover");
     let store = Jsonl::open(home.sessions_dir()).unwrap();
     let id = SessionId::new();
-    let mut log = store
+    let mut created = store
         .create(&Header {
             id,
             workspace: "/w".into(),
@@ -87,8 +87,7 @@ fn busy_sessions_recover_at_startup() {
             // As an earlier version wrote it.
             extensions: Vec::new(),
         })
-        .unwrap()
-        .log;
+        .unwrap();
     let calls = [
         ("sleep", json!({ "seconds": 0 })),
         ("run_command", json!({ "command": "true" })),
@@ -100,12 +99,10 @@ fn busy_sessions_recover_at_startup() {
             id: None,
             card: None,
         };
-        log.append(&Entry {
-            seq,
-            epoch: 0,
-            body,
-        })
-        .unwrap();
+        created
+            .log
+            .append(&Entry::new(seq, created.epoch, body))
+            .unwrap();
     }
     store.mark_busy(id, true).unwrap();
 
@@ -126,7 +123,7 @@ fn busy_sessions_recover_at_startup() {
         &got[4],
         Body::ToolResult {
             call: 2,
-            outcome: Outcome::Interrupted,
+            outcome: Outcome::Interrupted { output: None },
             card: None,
         }
     ));
@@ -249,14 +246,10 @@ fn watches_rearm_after_a_crash_and_fire_once() {
     let (root, home) = home("rearm");
     let store = Jsonl::open(home.sessions_dir()).unwrap();
     let write = |header: &Header, bodies: Vec<Body>, busy: bool| {
-        let mut log = store.create(header).unwrap().log;
+        let mut created = store.create(header).unwrap();
         for (seq, body) in (1..).zip(bodies) {
-            log.append(&Entry {
-                seq,
-                epoch: 0,
-                body,
-            })
-            .unwrap();
+            let entry = Entry::new(seq, created.epoch, body);
+            created.log.append(&entry).unwrap();
         }
         store.mark_busy(header.id, busy).unwrap();
     };
@@ -327,6 +320,116 @@ fn watches_rearm_after_a_crash_and_fire_once() {
     for log in &got {
         assert_eq!(fired(log), [&slept], "{log:#?}");
     }
+}
+
+/// Waits until `done` holds for session `id`'s committed log.
+fn until(daemon: &Daemon, id: SessionId, done: impl Fn(&[Body]) -> bool) -> Vec<Body> {
+    let deadline = Instant::now() + Duration::from_secs(10);
+    loop {
+        let log = bodies(&*daemon.shared.store, id);
+        if done(&log) {
+            return log;
+        }
+        assert!(Instant::now() < deadline, "never happened: {log:#?}");
+        std::thread::sleep(Duration::from_millis(5));
+    }
+}
+
+#[test]
+fn an_owner_idles_with_its_children_and_an_interrupt_stops_them_first() {
+    let (root, home) = home("owned");
+    std::fs::create_dir_all(&root).unwrap();
+    let daemon = Daemon::load(&home, &echo()).unwrap();
+    let parent = daemon.resolve(&Target::New, root.clone()).unwrap();
+    let id = parent.session().id;
+    parent.session().submit("spawn $ sleep 100".into()).unwrap();
+    drop(parent);
+    let slot = daemon.slots().into_iter().find(|s| s.header.id == id);
+    let session = slot.unwrap().live.lock().unwrap().clone().unwrap();
+    let log = until(&daemon, id, |log| {
+        log.iter().any(|b| matches!(b, Body::Watch { .. }))
+    });
+    let Some(Body::Link { child, .. }) = log.get(1) else {
+        panic!("{log:#?}")
+    };
+    until(&daemon, *child, |log| {
+        log.iter().any(|b| matches!(b, Body::ToolProcess { .. }))
+    });
+    let owned = daemon.children(id);
+    let busy = session.idle_for();
+    session.interrupt();
+    settle(&daemon);
+    let child_log = bodies(&*daemon.shared.store, *child);
+    let parent_log = bodies(&*daemon.shared.store, id);
+    daemon.hibernate(Duration::ZERO);
+    let unloaded = daemon.children(id).is_empty();
+    drop(daemon);
+    std::fs::remove_dir_all(&root).unwrap();
+
+    assert_eq!(owned.len(), 1);
+    assert_eq!(busy, Duration::ZERO);
+    let aborted = |b: &Body| matches!(b, Body::ToolResult { outcome: Outcome::Done { output }, .. } if output["aborted"] == true);
+    assert!(child_log.iter().any(aborted), "{child_log:#?}");
+    assert!(
+        matches!(parent_log.last(), Some(Body::Assistant { text }) if text.contains("aborted")),
+        "{parent_log:#?}"
+    );
+    assert!(unloaded);
+}
+
+#[test]
+fn an_orphan_does_not_resume_what_it_was_doing() {
+    let (root, home) = home("orphan");
+    let store = Jsonl::open(home.sessions_dir()).unwrap();
+    let header = Header {
+        id: SessionId::new(),
+        workspace: "/w".into(),
+        parent: Some(store::Parent {
+            session: SessionId::new(),
+            call: 2,
+        }),
+        extensions: Vec::new(),
+    };
+    let mut created = store.create(&header).unwrap();
+    let bodies_written = [
+        Body::User {
+            text: "sleep 0".into(),
+        },
+        Body::ToolCall {
+            tool: "sleep".into(),
+            input: json!({ "seconds": 0 }),
+            id: None,
+            card: None,
+        },
+    ];
+    for (seq, body) in (1..).zip(bodies_written) {
+        let entry = Entry::new(seq, created.epoch, body);
+        created.log.append(&entry).unwrap();
+    }
+    store.mark_busy(header.id, true).unwrap();
+    drop(created);
+
+    let daemon = Daemon::load(&home, &echo()).unwrap();
+    settle(&daemon);
+    let got = bodies(&store, header.id);
+    drop(daemon);
+    std::fs::remove_dir_all(&root).unwrap();
+
+    // The safe sleep would run again in a session whose owner is there.
+    assert!(
+        matches!(
+            &got[2..],
+            [
+                Body::Extensions { .. },
+                Body::ToolResult {
+                    call: 2,
+                    outcome: Outcome::Interrupted { output: None },
+                    ..
+                },
+            ]
+        ),
+        "{got:#?}"
+    );
 }
 
 /// Keeps every event the daemon emits in tests.
@@ -417,5 +520,5 @@ fn the_supervisor_sleeps_until_a_deadline_and_never_polls() {
     );
     assert_eq!(idle_wakes, 0);
     assert!(wakes < 20, "{wakes} wakes for one turn");
-    assert_eq!(names, ["step", "effect", "step", "hibernate"]);
+    assert_eq!(names, ["effect", "step", "hibernate"]);
 }

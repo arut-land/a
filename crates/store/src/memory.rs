@@ -4,13 +4,14 @@ use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 
 use protocol::{Entry, SessionId};
 
-use crate::{Header, Loaded, Log, LogStore, not_found};
+use crate::{Header, Lease, LeaseAuthority, Loaded, Local, Log, LogStore, floor, not_found};
 
 /// Sessions held in this process, for tests: durable until it exits.
 #[derive(Default)]
 pub struct Memory {
     sessions: Mutex<HashMap<SessionId, Stored>>,
     busy: Mutex<HashSet<SessionId>>,
+    leases: Local,
 }
 
 struct Stored {
@@ -19,7 +20,7 @@ struct Stored {
 }
 
 impl Memory {
-    fn entries(&self, id: SessionId) -> io::Result<Arc<Mutex<Vec<Entry>>>> {
+    fn shared(&self, id: SessionId) -> io::Result<Arc<Mutex<Vec<Entry>>>> {
         let sessions = lock(&self.sessions);
         let stored = sessions.get(&id).ok_or_else(|| not_found(id))?;
         Ok(Arc::clone(&stored.entries))
@@ -34,12 +35,15 @@ impl LogStore for Memory {
             return Err(io::Error::new(io::ErrorKind::AlreadyExists, taken));
         }
         let entries = Arc::default();
-        let log = Box::new(MemoryLog(Arc::clone(&entries)));
+        let lease = self.leases.acquire(header.id, 0);
+        let epoch = lease.epoch;
+        let log = Box::new(MemoryLog(Arc::clone(&entries), lease));
         let header = header.clone();
         sessions.insert(header.id, Stored { header, entries });
         Ok(Loaded {
             entries: Vec::new(),
             log,
+            epoch,
         })
     }
 
@@ -53,16 +57,22 @@ impl LogStore for Memory {
     }
 
     fn load(&self, id: SessionId) -> io::Result<Loaded> {
-        let shared = self.entries(id)?;
+        let shared = self.shared(id)?;
         let entries = lock(&shared).clone();
+        let lease = self.leases.acquire(id, floor(&entries));
         Ok(Loaded {
             entries,
-            log: Box::new(MemoryLog(shared)),
+            epoch: lease.epoch,
+            log: Box::new(MemoryLog(shared, lease)),
         })
     }
 
+    fn entries(&self, id: SessionId) -> io::Result<Vec<Entry>> {
+        Ok(lock(&*self.shared(id)?).clone())
+    }
+
     fn count(&self, id: SessionId) -> io::Result<u64> {
-        let entries = self.entries(id)?;
+        let entries = self.shared(id)?;
         Ok(lock(&entries).len() as u64)
     }
 
@@ -81,11 +91,16 @@ impl LogStore for Memory {
     }
 }
 
-struct MemoryLog(Arc<Mutex<Vec<Entry>>>);
+struct MemoryLog(Arc<Mutex<Vec<Entry>>>, Lease);
 
 impl Log for MemoryLog {
     fn append(&mut self, entry: &Entry) -> io::Result<()> {
-        lock(&self.0).push(entry.clone());
+        self.append_all(std::slice::from_ref(entry))
+    }
+
+    fn append_all(&mut self, entries: &[Entry]) -> io::Result<()> {
+        self.1.admit(entries)?;
+        lock(&self.0).extend_from_slice(entries);
         Ok(())
     }
 }

@@ -8,7 +8,7 @@ use std::sync::Arc;
 
 use futures_core::Stream;
 use llm::{Accumulator, Block, Event, Http, Message, Provider, Request, Response};
-use protocol::Environment;
+use protocol::{Environment, Overrides};
 
 use crate::config::Settings;
 
@@ -20,11 +20,16 @@ pub struct Models {
 }
 
 impl Models {
-    /// The model a session in `workspace` calls, with provider variables
-    /// looked up from its client environment `env` first; or why there is
-    /// none, said so the user can fix it.
-    pub fn model(&self, workspace: &Path, env: Option<&Environment>) -> Result<Model, String> {
-        let spec = self.settings.model(workspace)?;
+    /// The model a session in `workspace` with its own settings `session`
+    /// calls, with provider variables looked up from its client environment
+    /// `env` first; or why there is none, said so the user can fix it.
+    pub fn model(
+        &self,
+        workspace: &Path,
+        env: Option<&Environment>,
+        session: (Overrides, Option<u64>),
+    ) -> Result<Model, String> {
+        let (spec, _) = self.settings.model_in(workspace, session)?;
         let lookup = |name: &str| self.settings.var(env, name);
         match llm::hosts::provider(&spec, &lookup) {
             Ok((provider, id)) => Ok(Model {

@@ -508,7 +508,7 @@ mod tests {
             },
         ]);
         let mut decided = Decided::new();
-        let mut outcome = Outcome::Interrupted;
+        let mut outcome = Outcome::Interrupted { output: None };
         set.post_tool(7, ("t", &json!({})), &mut outcome, &mut decided);
         assert_eq!(
             outcome,
@@ -523,7 +523,7 @@ mod tests {
                     "a",
                     Decision::PostTool {
                         call: 7,
-                        original: Outcome::Interrupted
+                        original: Outcome::Interrupted { output: None }
                     }
                 ),
                 (

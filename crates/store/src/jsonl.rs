@@ -5,7 +5,7 @@ use std::path::PathBuf;
 use protocol::{Decode, Entry, SessionId};
 use serde::Serialize;
 
-use crate::{Header, Loaded, Log, LogStore};
+use crate::{Header, Lease, LeaseAuthority, Loaded, Local, Log, LogStore, floor};
 
 /// One append-only JSONL file per session in a directory: the header on the
 /// first line, one entry per line after it, and an empty `.busy` file beside
@@ -13,13 +13,17 @@ use crate::{Header, Loaded, Log, LogStore};
 /// a single writer per directory is the daemon lock's job.
 pub struct Jsonl {
     dir: PathBuf,
+    leases: Local,
 }
 
 impl Jsonl {
     pub fn open(dir: impl Into<PathBuf>) -> io::Result<Self> {
         let dir = dir.into();
         fs::create_dir_all(&dir)?;
-        Ok(Self { dir })
+        Ok(Self {
+            dir,
+            leases: Local::default(),
+        })
     }
 
     fn path(&self, id: SessionId) -> PathBuf {
@@ -40,11 +44,14 @@ impl LogStore for Jsonl {
             .append(true)
             .open(self.path(header.id))?;
         write_line(&mut file, header)?;
+        let lease = self.leases.acquire(header.id, 0);
         Ok(Loaded {
             entries: Vec::new(),
+            epoch: lease.epoch,
             log: Box::new(JsonlLog {
                 file,
                 new_in: Some(self.dir.clone()),
+                lease,
             }),
         })
     }
@@ -77,23 +84,25 @@ impl LogStore for Jsonl {
             .open(self.path(id))?;
         let mut bytes = Vec::new();
         file.read_to_end(&mut bytes)?;
-        let mut end = memchr::memchr(b'\n', &bytes).map_or(bytes.len(), |i| i + 1);
-        let mut entries = Vec::new();
-        for line in bytes[end..].split_inclusive(|&b| b == b'\n') {
-            match Entry::from_json(line) {
-                Ok(entry) if line.ends_with(b"\n") => entries.push(entry),
-                _ => break,
-            }
-            end += line.len();
-        }
+        let (entries, end) = parse(&bytes);
         if end < bytes.len() {
             file.set_len(end as u64)?;
             sys::sync_data(&file)?;
         }
+        let lease = self.leases.acquire(id, floor(&entries));
         Ok(Loaded {
             entries,
-            log: Box::new(JsonlLog { file, new_in: None }),
+            epoch: lease.epoch,
+            log: Box::new(JsonlLog {
+                file,
+                new_in: None,
+                lease,
+            }),
         })
+    }
+
+    fn entries(&self, id: SessionId) -> io::Result<Vec<Entry>> {
+        Ok(parse(&fs::read(self.path(id))?).0)
     }
 
     /// Counts lines rather than parsing them.
@@ -131,6 +140,7 @@ struct JsonlLog {
     /// The directory of a file not yet synced since it was created: its
     /// name is only durable once the directory is.
     new_in: Option<PathBuf>,
+    lease: Lease,
 }
 
 impl Log for JsonlLog {
@@ -140,6 +150,7 @@ impl Log for JsonlLog {
 
     /// One write and one sync for the lot.
     fn append_all(&mut self, entries: &[Entry]) -> io::Result<()> {
+        self.lease.admit(entries)?;
         if entries.is_empty() {
             return Ok(());
         }
@@ -157,6 +168,20 @@ impl Log for JsonlLog {
         self.new_in = None;
         Ok(())
     }
+}
+
+/// The entries of a session file's bytes, and where they end.
+fn parse(bytes: &[u8]) -> (Vec<Entry>, usize) {
+    let mut end = memchr::memchr(b'\n', bytes).map_or(bytes.len(), |i| i + 1);
+    let mut entries = Vec::new();
+    for line in bytes[end..].split_inclusive(|&b| b == b'\n') {
+        match Entry::from_json(line) {
+            Ok(entry) if line.ends_with(b"\n") => entries.push(entry),
+            _ => break,
+        }
+        end += line.len();
+    }
+    (entries, end)
 }
 
 fn write_line(file: &mut File, value: &impl Serialize) -> io::Result<()> {

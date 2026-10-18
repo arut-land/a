@@ -2,19 +2,20 @@
 //! commands, hooks, prompt sections and state through one [`Registry`] with
 //! the same verbs. The engine itself offers the model nothing.
 //!
-//! Registration is ordered, and that order is the hooks' merge order. A
-//! later registration of a name already taken replaces the earlier one in
-//! its install position: an extension of the same name replaces all it
-//! contributed, and a tool, command or prompt section of the same name, from
-//! another extension, replaces that one. So a user's `bash` overrides the
-//! built-in one without reordering anything. Within one extension a name
-//! taken twice is an error, as is a second extension claiming a [`Slot`]
-//! another holds.
+//! Registration is ordered, by [`Tier`] and then install order, and that
+//! order is the hooks' merge order. A later registration of a name already
+//! taken replaces the earlier one in its install position: an extension of
+//! the same name replaces all it contributed, and a tool, command or prompt
+//! section of the same name, from another extension, replaces that one. So a
+//! user's `bash` overrides the built-in one without reordering anything.
+//! Nothing replaces what a [`Tier::Guarded`] extension contributes, except
+//! another guarded one. Within one extension a name taken twice is an error,
+//! as is a second extension claiming a [`Slot`] another holds.
 
 use std::fmt;
 use std::future::Future;
 use std::path::Path;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex, PoisonError};
 
 use protocol::Outcome;
 use rt::BoxFuture;
@@ -30,6 +31,21 @@ pub trait Extension {
     const VERSION: u32;
 
     fn contribute(&self, r: &mut Registrar);
+}
+
+/// Where an extension loads: tiers load in this order, each in install
+/// order.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, PartialOrd, Ord)]
+pub enum Tier {
+    /// What later tiers cannot replace or remove, such as the permission
+    /// policy: repository config never loosens it.
+    Guarded,
+    /// The built-ins the user's extensions may replace.
+    Pre,
+    #[default]
+    User,
+    /// After the user's, to see what they did.
+    Post,
 }
 
 /// A role only one extension may fill.
@@ -49,14 +65,14 @@ pub trait Command: Send + Sync + 'static {
     const DESCRIPTION: &'static str;
 
     /// The output, shown to the user and logged; never sent to the model.
-    fn run(&self, args: &str, cx: &Cx<'_>) -> impl Future<Output = Result<Value, String>> + Send;
+    fn run(&self, args: &str, cx: &Cx) -> impl Future<Output = Result<Value, String>> + Send;
 }
 
 /// A [`Command`] behind a pointer.
 pub trait DynCommand: Send + Sync {
     fn name(&self) -> &'static str;
     fn description(&self) -> &'static str;
-    fn run<'a>(&'a self, args: &'a str, cx: &'a Cx<'a>) -> BoxFuture<'a, Outcome>;
+    fn run<'a>(&'a self, args: &'a str, cx: &'a Cx) -> BoxFuture<'a, Outcome>;
 }
 
 impl<C: Command> DynCommand for C {
@@ -68,7 +84,7 @@ impl<C: Command> DynCommand for C {
         C::DESCRIPTION
     }
 
-    fn run<'a>(&'a self, args: &'a str, cx: &'a Cx<'a>) -> BoxFuture<'a, Outcome> {
+    fn run<'a>(&'a self, args: &'a str, cx: &'a Cx) -> BoxFuture<'a, Outcome> {
         Box::pin(async move {
             match Command::run(self, args, cx).await {
                 Ok(output) => Outcome::Done { output },
@@ -190,6 +206,7 @@ impl std::error::Error for Refused {}
 struct Installed {
     name: &'static str,
     version: u32,
+    tier: Tier,
     made: Registrar,
 }
 
@@ -204,14 +221,23 @@ pub struct Registry {
 }
 
 impl Registry {
-    /// Registers `ext` after every extension so far, or in place of the one
-    /// of the same name.
-    pub fn with<E: Extension>(mut self, ext: &E) -> Result<Self, Refused> {
+    /// Registers `ext` in [`Tier::User`]: see [`Registry::with_in`].
+    pub fn with<E: Extension>(self, ext: &E) -> Result<Self, Refused> {
+        self.with_in(Tier::User, ext)
+    }
+
+    /// Registers `ext` after every extension so far in `tier`, or in place
+    /// of the one of the same name.
+    pub fn with_in<E: Extension>(mut self, tier: Tier, ext: &E) -> Result<Self, Refused> {
         let mut made = Registrar::default();
         ext.contribute(&mut made);
         let refuse = |why: &str| Err(Refused(format!("extension {}: {why}", E::NAME)));
         if let Some(error) = made.errors.first() {
             return refuse(error);
+        }
+        let guarded = |i: &Installed| i.name == E::NAME && i.tier == Tier::Guarded;
+        if tier != Tier::Guarded && self.installed.iter().any(guarded) {
+            return refuse("a guarded extension of that name is loaded");
         }
         for slot in &made.slots {
             let holder = self
@@ -225,6 +251,7 @@ impl Registry {
         self.install(Installed {
             name: E::NAME,
             version: E::VERSION,
+            tier,
             made,
         });
         Ok(self)
@@ -232,31 +259,40 @@ impl Registry {
 
     /// Installs `new` and rebuilds what the extensions make, in install
     /// order.
-    fn install(&mut self, new: Installed) {
-        match self.installed.iter_mut().find(|i| i.name == new.name) {
-            Some(slot) => *slot = new,
-            None => self.installed.push(new),
+    fn install(&mut self, mut new: Installed) {
+        if let Some(slot) = self.installed.iter_mut().find(|i| i.name == new.name) {
+            new.tier = slot.tier;
+            *slot = new;
+        } else {
+            let at = self.installed.partition_point(|i| i.tier <= new.tier);
+            self.installed.insert(at, new);
         }
-        let mut tools: Vec<Arc<dyn DynTool>> = Vec::new();
-        let mut commands: Vec<Arc<dyn DynCommand>> = Vec::new();
-        let mut sections: Vec<Section> = Vec::new();
+        let mut tools = Vec::new();
+        let mut commands = Vec::new();
+        let mut sections = Vec::new();
         let mut hooks = Vec::new();
-        for Installed { name, made, .. } in &self.installed {
+        for Installed {
+            name, made, tier, ..
+        } in &self.installed
+        {
+            let guarded = *tier == Tier::Guarded;
             for tool in &made.tools {
-                replace(&mut tools, Arc::clone(tool), |t| t.name());
+                replace(&mut tools, (guarded, Arc::clone(tool)), |t| t.1.name());
             }
             for command in &made.commands {
-                replace(&mut commands, Arc::clone(command), |c| c.name());
+                replace(&mut commands, (guarded, Arc::clone(command)), |c| {
+                    c.1.name()
+                });
             }
             for section in &made.sections {
-                replace(&mut sections, section.clone(), |s| s.name);
+                replace(&mut sections, (guarded, section.clone()), |s| s.1.name);
             }
             hooks.extend(made.hooks.iter().map(|hook| (*name, Arc::clone(hook))));
         }
-        sections.sort_by_key(|s| s.order);
-        self.tools = Toolset(tools);
-        self.commands = commands;
-        self.sections = sections;
+        sections.sort_by_key(|s| s.1.order);
+        self.tools = Toolset(tools.into_iter().map(|t| t.1).collect());
+        self.commands = commands.into_iter().map(|c| c.1).collect();
+        self.sections = sections.into_iter().map(|s| s.1).collect();
         self.hooks = Hooks(hooks);
     }
 
@@ -313,11 +349,33 @@ impl Registry {
     }
 }
 
-/// Puts `new` in place of the item of the same name, or last.
-fn replace<T>(items: &mut Vec<T>, new: T, name: impl Fn(&T) -> &str) {
+/// Puts `new` in place of the item of the same name, or last; a guarded
+/// item is replaced only by another.
+fn replace<T>(items: &mut Vec<(bool, T)>, new: (bool, T), name: impl Fn(&(bool, T)) -> &str) {
     match items.iter_mut().find(|t| name(t) == name(&new)) {
+        Some(slot) if slot.0 && !new.0 => {}
         Some(slot) => *slot = new,
         None => items.push(new),
+    }
+}
+
+/// The registry sessions run with. Replacing it (a reload) takes effect at
+/// each session's next step boundary: work already running finishes on the
+/// generation it started with.
+pub struct Current(Mutex<Arc<Registry>>);
+
+impl Current {
+    pub fn new(registry: Registry) -> Self {
+        Self(Mutex::new(Arc::new(registry)))
+    }
+
+    /// The newest generation.
+    pub fn get(&self) -> Arc<Registry> {
+        Arc::clone(&self.0.lock().unwrap_or_else(PoisonError::into_inner))
+    }
+
+    pub fn replace(&self, registry: Registry) {
+        *self.0.lock().unwrap_or_else(PoisonError::into_inner) = Arc::new(registry);
     }
 }
 
@@ -341,7 +399,7 @@ mod tests {
             json!({ "type": "object" })
         }
 
-        fn call(&self, _: Value, _: &Cx<'_>) -> impl Future<Output = Result<Value, String>> + Send {
+        fn call(&self, _: Value, _: &Cx) -> impl Future<Output = Result<Value, String>> + Send {
             std::future::ready(Ok(self.0.into()))
         }
     }
@@ -365,7 +423,7 @@ mod tests {
         const NAME: &'static str = "jobs";
         const DESCRIPTION: &'static str = "Lists jobs.";
 
-        fn run(&self, _: &str, _: &Cx<'_>) -> impl Future<Output = Result<Value, String>> + Send {
+        fn run(&self, _: &str, _: &Cx) -> impl Future<Output = Result<Value, String>> + Send {
             std::future::ready(Ok("none".into()))
         }
     }
@@ -419,7 +477,7 @@ mod tests {
         let extensions: Vec<_> = registry.extensions().collect();
         assert_eq!(
             extensions,
-            [("prompt", 1), ("shell", 1), ("edit", 1), ("policy", 1)]
+            [("policy", 1), ("prompt", 1), ("shell", 1), ("edit", 1)]
         );
 
         let mut decided = Decided::new();
@@ -503,6 +561,38 @@ mod tests {
             "{prompt}"
         );
         assert!(prompt.len() < 2000, "{} bytes", prompt.len());
+    }
+
+    extension!(Loose, "policy", 9, |r| r.on(Deny("nothing")));
+    extension!(Watcher, "watcher", 1, |r| r.on(Deny("c")));
+    extension!(Shadow, "shadow", 1, |r| r.command(Jobs));
+
+    #[test]
+    fn tiers_order_extensions_and_guarded_ones_stay() {
+        let registry = Registry::default()
+            .with_in(Tier::Post, &Watcher)
+            .and_then(|r| r.with(&Mine))
+            .and_then(|r| r.with_in(Tier::Guarded, &Commands))
+            .and_then(|r| r.with_in(Tier::Pre, &DenyA))
+            .unwrap();
+        let extensions: Vec<_> = registry.extensions().map(|(name, _)| name).collect();
+        assert_eq!(extensions, ["commands", "policy", "mine", "watcher"]);
+
+        let refused = registry.with(&Commands).err().unwrap();
+        assert!(refused.0.contains("guarded"), "{refused}");
+        let registry = crate::builtins(&Policy::default()).unwrap();
+        assert!(registry.with(&Loose).is_err());
+
+        // A user's command of a guarded one's name leaves it in place.
+        let registry = Registry::default()
+            .with_in(Tier::Guarded, &Commands)
+            .and_then(|r| r.with(&Shadow))
+            .unwrap();
+        assert_eq!(registry.commands.len(), 1);
+        assert!(Arc::ptr_eq(
+            &registry.commands[0],
+            &registry.installed[0].made.commands[0]
+        ));
     }
 
     #[test]

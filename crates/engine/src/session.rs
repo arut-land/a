@@ -5,20 +5,21 @@ use std::io;
 use std::panic::{AssertUnwindSafe, catch_unwind};
 use std::path::PathBuf;
 use std::pin::pin;
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::mpsc::Sender;
 use std::sync::{Arc, Mutex, MutexGuard, Weak};
 use std::task::{Poll, Waker};
 use std::time::{Duration, Instant};
 
 use agent::{
-    Action, Agent, Cancel, Cx, Decided, DynTool, Facts, Gate, Hooks, Host, Input, Replay, States,
+    Action, Agent, Cancel, Cx, Decided, DynTool, Facts, Gate, Hooks, Host, Input, Registry, Replay,
+    Route, States,
 };
 use protocol::{
-    Body, DaemonMsg, Decision, Entry, Environment, Frame, Installed, Outcome, SessionId,
+    Body, DaemonMsg, Decision, Entry, Environment, Frame, Installed, Outcome, Overrides, SessionId,
     SessionSummary,
 };
-use serde_json::Value;
+use serde_json::{Value, json};
 use store::{Header, Loaded, Log, LogStore, Parent};
 
 use crate::model::{Model, Models};
@@ -29,15 +30,16 @@ mod links;
 #[cfg(test)]
 mod tests;
 
-use facts::{ask, inbox, recap, replay, transcript};
+use facts::{ask, inbox, partial, recap, replay, transcript, untaken};
 
 /// What every session runs with.
 pub struct Shared {
     /// Where session actors run as tasks, and effects sleep and block.
     pub rt: rt::Rt,
     pub store: Arc<dyn LogStore>,
-    /// The extensions' tools and hooks.
-    pub registry: agent::Registry,
+    /// The extensions' tools and hooks, as each session resolves them at
+    /// its step boundaries.
+    pub registry: agent::Current,
     /// The settings, and the model they name.
     pub models: Models,
     /// The system prompt, in place of the one the extensions make.
@@ -58,6 +60,10 @@ pub struct Session {
     pub workspace: PathBuf,
     /// The call that owns this session, if it is a child.
     parent: Option<Parent>,
+    /// The epoch of the lease its log is appended under.
+    epoch: u32,
+    /// The registry generation the current step runs on.
+    step: Mutex<Arc<Registry>>,
     state: Mutex<State>,
     /// The appender; only the job draining `queue` writes to it.
     log: Mutex<Box<dyn Log>>,
@@ -67,9 +73,16 @@ pub struct Session {
     /// is in its log: see [`facts::inbox`].
     mailbox: rt::channel::Sender<Msg>,
     answers: Mutex<Answers>,
+    /// Input taken in and not yet taken up, in order; its log entries are
+    /// what lasts. Taking input in holds this lock until its entry commits,
+    /// so the order here is the log's.
+    waiting: Mutex<VecDeque<Waiting>>,
     /// Inputs submitted but not yet fully handled. They pin the daemon and
     /// keep the session loaded, as do watches not yet fired.
     queued: AtomicUsize,
+    /// Whether the actor is in a unit of work, even one that waits for an
+    /// answer and so is not counted in `queued`.
+    running: AtomicBool,
     /// Open client attachments; a session with any stays loaded.
     attached: AtomicUsize,
     last_active: Mutex<Instant>,
@@ -78,7 +91,7 @@ pub struct Session {
     env: Mutex<Option<Environment>>,
     /// The extensions' state, folded from the log.
     states: Mutex<States>,
-    /// Stops the call running now.
+    /// Stops the turn running now.
     cancel: Mutex<Cancel>,
     /// Background process groups the session owns, until it ends.
     jobs: Mutex<Vec<u32>>,
@@ -86,16 +99,9 @@ pub struct Session {
 }
 
 enum Msg {
-    /// The user's input, and what the `input` hooks decided about it.
-    Input {
-        text: String,
-        decided: Decided,
-    },
-    Command {
-        name: String,
-        args: String,
-        decided: Decided,
-    },
+    /// Input was taken in: the next of [`Session::waiting`] is the actor's
+    /// to take up, unless a turn took it already.
+    Queued,
     /// Child `child` settled with `outcome`.
     Settled {
         child: SessionId,
@@ -120,6 +126,19 @@ struct Queue {
     /// Flushes waiting for every entry up to a seq to commit.
     flushes: Vec<(u64, rt::channel::Sender<io::Result<()>>)>,
     draining: bool,
+}
+
+/// Input waiting for the actor.
+struct Waiting {
+    /// The entry that took it in.
+    seq: u64,
+    text: String,
+    steer: bool,
+    /// Whether it is a slash command.
+    command: bool,
+    /// Whether that entry is its `user` or `command` entry already: it
+    /// arrived with nothing running or waiting, so it was not queued.
+    started: bool,
 }
 
 /// Answers to the inbox's asks, until the actor takes them. `stopped` wakes
@@ -172,20 +191,25 @@ impl Session {
         shared: Arc<Shared>,
         env: Option<Environment>,
     ) -> Arc<Self> {
-        if let Err(e) = note_extensions(&header, &mut loaded, &shared.registry) {
+        let registry = shared.registry.get();
+        if let Err(e) = note_extensions(&header, &mut loaded, &registry) {
             eprintln!("session {}: recording extensions: {e}", header.id.short());
         }
         let (mailbox, rx) = rt::channel::unbounded();
         let armed = links::armed(&loaded.entries).count();
+        // A new session has nothing to recover.
+        let fresh = loaded.entries.is_empty();
         let env = env.or_else(|| logged_env(&loaded.entries).cloned());
         let seq = loaded.entries.len() as u64;
-        let mut states = shared.registry.states();
+        let mut states = registry.states();
         states.replay(&loaded.entries);
         let session = Arc::new_cyclic(|this| Self {
             this: this.clone(),
             id: header.id,
             workspace: header.workspace,
             parent: header.parent,
+            epoch: loaded.epoch,
+            step: Mutex::new(Arc::clone(&registry)),
             state: Mutex::new(State {
                 entries: loaded.entries,
                 clients: Vec::new(),
@@ -197,9 +221,11 @@ impl Session {
             }),
             mailbox,
             answers: Mutex::default(),
+            waiting: Mutex::default(),
             // Recovery counts as queued work until it has run, and every
             // armed watch until it fires.
-            queued: AtomicUsize::new(1 + armed),
+            queued: AtomicUsize::new(usize::from(!fresh) + armed),
+            running: AtomicBool::new(false),
             attached: AtomicUsize::new(0),
             last_active: Mutex::new(Instant::now()),
             env: Mutex::new(env),
@@ -208,12 +234,12 @@ impl Session {
             jobs: Mutex::default(),
             shared,
         });
-        session.shared.registry.hooks().session_start(session.id);
+        registry.hooks().session_start(session.id);
         let actor = Arc::clone(&session);
         session
             .shared
             .rt
-            .spawn(Box::pin(async move { actor.run(&rx).await }));
+            .spawn(Box::pin(async move { actor.run(&rx, fresh).await }));
         session
     }
 
@@ -225,28 +251,71 @@ impl Session {
         Attachment(Arc::clone(self))
     }
 
-    /// Queues the user's input as the `input` hooks leave it: `/name args`
-    /// runs command `name` if there is one, anything else goes to the
-    /// agent. `Err` is why a hook refused it.
-    pub fn submit(&self, mut text: String) -> Result<(), String> {
-        let registry = &self.shared.registry;
+    /// Takes the user's input in as the `input` hooks leave it, durably,
+    /// before returning: `/name args` runs command `name` if there is one,
+    /// anything else goes to the agent, after the turn running now and the
+    /// input already waiting. `Err` is why a hook refused it, or why it
+    /// could not be logged.
+    pub fn submit(&self, text: String) -> Result<(), String> {
+        self.take_in(text, false)
+    }
+
+    /// [`Session::submit`] for input the running turn takes at its next
+    /// step boundary, ahead of what waits; with no turn running it is plain
+    /// input.
+    pub fn steer(&self, text: String) -> Result<(), String> {
+        self.take_in(text, true)
+    }
+
+    fn take_in(&self, mut text: String, steer: bool) -> Result<(), String> {
+        let registry = self.shared.registry.get();
         let mut decided = Decided::new();
         registry.hooks().input(&mut text, &mut decided)?;
-        let msg = match slash(&text).filter(|(name, _)| registry.command(name).is_some()) {
-            Some((name, args)) => Msg::Command {
+        let command = slash(&text).is_some_and(|(name, _)| is_command(&registry, name));
+        let mut waiting = lock(&self.waiting);
+        for (hook, decision) in decided {
+            self.record(Body::Hook {
+                hook: hook.to_owned(),
+                decision,
+            });
+        }
+        // Nothing runs or waits, so nothing can come between: the input's
+        // own entry starts its work.
+        let started =
+            waiting.is_empty() && !self.has_work() && !self.running.load(Ordering::SeqCst);
+        let body = match slash(&text) {
+            _ if !started => Body::Queued {
+                text: text.clone(),
+                steer,
+            },
+            Some((name, args)) if command => Body::Command {
                 name: name.to_owned(),
                 args: args.to_owned(),
-                decided,
             },
-            None => Msg::Input { text, decided },
+            _ => Body::User { text: text.clone() },
         };
+        let seq = self.record(body);
+        rt::block_on(self.flush()).map_err(|e| format!("logging the input: {e}"))?;
+        waiting.push_back(Waiting {
+            seq,
+            text,
+            steer,
+            command,
+            started,
+        });
         self.queued.fetch_add(1, Ordering::SeqCst);
-        let _ = self.mailbox.send(msg);
+        drop(waiting);
+        let _ = self.mailbox.send(Msg::Queued);
         Ok(())
     }
 
-    /// Stops the call running now, if any.
+    /// Stops the running turn: its model or tool call, and what the agent
+    /// would have done next. The turns of the sessions it started stop
+    /// first, bottom-up.
     pub fn interrupt(&self) {
+        for child in self.children() {
+            child.interrupt();
+        }
         lock(&self.cancel).cancel();
     }
 
@@ -266,6 +335,20 @@ impl Session {
         self.queued.load(Ordering::SeqCst) > 0
     }
 
+    /// Whether the session or a child it owns has work or processes: an
+    /// owner is idle only once what it owns is.
+    fn busy(&self) -> bool {
+        self.has_work() || self.has_jobs() || self.children().iter().any(|c| c.busy())
+    }
+
+    /// The child sessions this one owns that are loaded.
+    fn children(&self) -> Vec<Arc<Self>> {
+        self.shared
+            .daemon
+            .upgrade()
+            .map_or_else(Vec::new, |daemon| daemon.children(self.id))
+    }
+
     /// Whether any background process the session owns still runs.
     pub fn has_jobs(&self) -> bool {
         let mut jobs = lock(&self.jobs);
@@ -273,30 +356,35 @@ impl Session {
         !jobs.is_empty()
     }
 
-    /// How long the session has had no attachments, no work and no jobs.
+    /// How long the session has had no attachments and nothing it owns has
+    /// had work or jobs.
     pub fn idle_for(&self) -> Duration {
-        if self.attached.load(Ordering::SeqCst) > 0 || self.has_work() || self.has_jobs() {
+        if self.attached.load(Ordering::SeqCst) > 0 || self.busy() {
             return Duration::ZERO;
         }
         lock(&self.last_active).elapsed()
     }
 
-    /// Stops the actor, the call it runs and the processes it owns; the
-    /// session lives on in its log. Callers check `idle_for` under the slot
-    /// lock first, or are draining the daemon.
+    /// Stops the actor, the turn it runs and the processes it owns, after
+    /// unloading the children it owns; the session lives on in its log.
+    /// Callers check `idle_for` under the slot lock first, or are draining
+    /// the daemon. Stopping again does nothing.
     pub fn stop(&self) {
-        self.interrupt();
-        let mut answers = lock(&self.answers);
-        answers.stopped = true;
-        answers.wake();
-        drop(answers);
+        if std::mem::replace(&mut lock(&self.answers).stopped, true) {
+            return;
+        }
+        if let Some(daemon) = self.shared.daemon.upgrade() {
+            daemon.unload_children(self.id);
+        }
+        lock(&self.cancel).cancel();
+        lock(&self.answers).wake();
         let _ = self.mailbox.send(Msg::Stop);
         for pgid in lock(&self.jobs).drain(..) {
             if let Err(e) = sys::kill_process_group(pgid) {
                 self.warn(format_args!("killing background group {pgid}: {e}"));
             }
         }
-        self.shared.registry.hooks().session_end(self.id);
+        self.registry().hooks().session_end(self.id);
     }
 
     pub fn attach(&self, client: &Sender<Frame>, since: u64) {
@@ -379,11 +467,7 @@ impl Session {
         let mut queue = lock(&self.queue);
         queue.next += 1;
         let seq = queue.next;
-        queue.pending.push(Entry {
-            seq,
-            epoch: 0,
-            body,
-        });
+        queue.pending.push(Entry::new(seq, self.epoch, body));
         seq
     }
 
@@ -461,8 +545,9 @@ impl Session {
     /// it, so entries commit in order.
     fn commit(&self, batch: &mut Vec<Entry>) -> io::Result<()> {
         lock(&self.log).append_all(batch)?;
+        let registry = self.registry();
+        let hooks = registry.hooks();
         let mut st = self.lock();
-        let hooks = self.shared.registry.hooks();
         for entry in batch.drain(..) {
             debug_assert_eq!(entry.seq, st.entries.len() as u64 + 1);
             // An entry too large for a frame ends every client's view
@@ -535,39 +620,30 @@ impl Session {
     /// An agent may step past entries that then fail to commit; after a
     /// failed unit of work it is rebuilt from the log. Each unit's future is
     /// boxed, so an idle session's actor holds only what waiting takes.
-    async fn run(&self, mailbox: &rt::channel::Receiver<Msg>) {
+    async fn run(&self, mailbox: &rt::channel::Receiver<Msg>, fresh: bool) {
         let kind = self.shared.models.settings.agent(&self.workspace);
         let mut agent = kind.agent();
-        let mut ok = Box::pin(self.work(self.recover(agent.as_mut()))).await;
+        let mut ok = fresh || Box::pin(self.work(self.recover(agent.as_mut()))).await;
         loop {
             if !ok {
                 agent = kind.agent();
                 let st = self.lock();
                 replay(agent.as_mut(), &st.entries);
-                let mut states = self.shared.registry.states();
+                let mut states = self.registry().states();
                 states.replay(&st.entries);
                 *lock(&self.states) = states;
             }
             ok = match mailbox.recv().await {
-                Some(Msg::Input { text, decided }) => {
-                    Box::pin(self.work(async {
-                        self.decide(decided).await?;
-                        self.record(Body::User { text: text.clone() });
-                        let inputs = VecDeque::from([Input::User { text }]);
-                        self.drive(agent.as_mut(), VecDeque::new(), inputs).await
-                    }))
-                    .await
-                }
-                Some(Msg::Command {
-                    name,
-                    args,
-                    decided,
-                }) => {
-                    Box::pin(self.work(async {
-                        self.decide(decided).await?;
-                        self.command(&name, &args).await
-                    }))
-                    .await
+                Some(Msg::Queued) => {
+                    let next = lock(&self.waiting).pop_front();
+                    let take = async {
+                        match next {
+                            Some(input) => self.take(agent.as_mut(), input).await,
+                            // A turn took it up already, as a steer.
+                            None => Ok(()),
+                        }
+                    };
+                    Box::pin(self.work(take)).await
                 }
                 Some(Msg::Settled { child, outcome }) => {
                     Box::pin(self.fire(agent.as_mut(), child, outcome)).await
@@ -577,12 +653,44 @@ impl Session {
         }
     }
 
+    /// Takes up input that was waiting: runs it as a command, or starts a
+    /// turn with it.
+    async fn take(&self, agent: &mut dyn Agent, input: Waiting) -> io::Result<()> {
+        self.resolve();
+        let Waiting {
+            seq,
+            text,
+            command,
+            started,
+            ..
+        } = input;
+        if let (true, Some((name, args))) = (command, slash(&text)) {
+            let call = if started {
+                seq
+            } else {
+                self.append(Body::Command {
+                    name: name.to_owned(),
+                    args: args.to_owned(),
+                })
+                .await?
+            };
+            return self.command(call, name, args).await;
+        }
+        if !started {
+            self.record(Body::User { text: text.clone() });
+        }
+        let inputs = VecDeque::from([Input::User { text }]);
+        self.drive(agent, VecDeque::new(), inputs).await
+    }
+
     /// Runs one queued unit of work, with a busy marker on disk for as long
-    /// as anything is in flight, and commits what it recorded. Returns
-    /// whether it all went well.
+    /// as anything is in flight, and commits what it recorded. An interrupt
+    /// from here on stops it. Returns whether it all went well.
     async fn work(&self, job: impl Future<Output = io::Result<()>>) -> bool {
         let began = crate::stamp();
         self.touch();
+        *lock(&self.cancel) = Cancel::default();
+        self.running.store(true, Ordering::SeqCst);
         if let Err(e) = self.mark_busy(true).await {
             self.warn(format_args!("busy marker: {e}"));
         }
@@ -598,6 +706,7 @@ impl Session {
             let how = if done.is_ok() { "done" } else { "failed" };
             format!("{how} in {elapsed:?}")
         });
+        self.running.store(false, Ordering::SeqCst);
         let settled = self.queued.fetch_sub(1, Ordering::SeqCst) == 1;
         if settled && let Err(e) = self.mark_busy(false).await {
             self.warn(format_args!("busy marker: {e}"));
@@ -615,8 +724,9 @@ impl Session {
     }
 
     /// Runs `actions`, then steps the agent with `inputs` and every input
-    /// the effects produce, in order. Once an agent that was stepped stops,
-    /// the `on_stop` hooks may hand it more to do.
+    /// the effects produce, in order, each step on the registry generation
+    /// newest when it began. Once an agent that was stepped stops, the
+    /// `on_stop` hooks may hand it more to do. An interrupt stops it all.
     async fn drive(
         &self,
         agent: &mut dyn Agent,
@@ -625,10 +735,15 @@ impl Session {
     ) -> io::Result<()> {
         let mut stepped = false;
         loop {
-            while let Some(action) = actions.pop_front() {
+            if self.turn().is_cancelled() {
+                return self.halt(agent, actions, inputs).await;
+            }
+            if let Some(action) = actions.pop_front() {
                 inputs.extend(self.act(action).await?);
+                continue;
             }
             if let Some(input) = inputs.pop_front() {
+                self.resolve();
                 actions.extend(agent.step(input));
                 stepped = true;
                 continue;
@@ -639,8 +754,7 @@ impl Session {
             self.flush().await?;
             let mut decided = Decided::new();
             let next = self
-                .shared
-                .registry
+                .registry()
                 .hooks()
                 .on_stop(&self.lock().entries, &mut decided);
             self.decide(decided).await?;
@@ -649,6 +763,48 @@ impl Session {
                 None => return Ok(()),
             }
         }
+    }
+
+    /// Ends an interrupted turn. The agent still hears what happened, as a
+    /// replay of the log would tell it, but what it asks for is dropped: a
+    /// tool call is logged as interrupted without running, so every call
+    /// the model made is answered, and the rest is not done.
+    async fn halt(
+        &self,
+        agent: &mut dyn Agent,
+        mut actions: VecDeque<Action>,
+        inputs: VecDeque<Input>,
+    ) -> io::Result<()> {
+        for input in inputs {
+            actions.extend(agent.step(input));
+        }
+        if actions.is_empty() {
+            return Ok(());
+        }
+        let registry = self.registry();
+        for action in actions {
+            if let Action::RunTool {
+                tool, input, id, ..
+            } = action
+            {
+                let card = registry.tools().get(&tool).and_then(|t| t.present(&input));
+                let call = self.record(Body::ToolCall {
+                    tool,
+                    input,
+                    id,
+                    card,
+                });
+                let outcome = Outcome::Interrupted { output: None };
+                self.record(Body::ToolResult {
+                    call,
+                    outcome: outcome.clone(),
+                    card: None,
+                });
+                drop(agent.step(Input::ToolDone { call, outcome }));
+            }
+        }
+        self.record(Body::Interrupt);
+        self.flush().await
     }
 
     /// Carries out one action; an effect returns the input reporting its
@@ -664,6 +820,7 @@ impl Session {
                 return Ok(None);
             }
             Action::CallModel => {
+                self.steer_in();
                 self.note_context();
                 let model = self.model();
                 let name = model
@@ -678,19 +835,16 @@ impl Session {
                 id,
                 refuse,
             } => {
+                let registry = self.registry();
                 let gate = if let Some(error) = refuse {
                     Err(error)
                 } else {
                     let mut decided = Decided::new();
-                    let verdict =
-                        self.shared
-                            .registry
-                            .hooks()
-                            .gate(&tool, &mut input, &mut decided);
+                    let verdict = registry.hooks().gate(&tool, &mut input, &mut decided);
                     self.decide(decided).await?;
                     verdict
                 };
-                let card = self.shared.registry.tools().get(&tool);
+                let card = registry.tools().get(&tool);
                 let seq = self
                     .append(Body::ToolCall {
                         card: card.and_then(|t| t.present(&input)),
@@ -781,13 +935,12 @@ impl Session {
             ),
             Call::Tool { tool, input } => {
                 let mut decided = Decided::new();
-                let hooks = self.shared.registry.hooks();
+                let registry = self.registry();
+                let hooks = registry.hooks();
                 hooks.post_tool(seq, (tool, input), &mut outcome, &mut decided);
                 self.decide(decided).await?;
                 let card = match &outcome {
-                    Outcome::Done { output } => self
-                        .shared
-                        .registry
+                    Outcome::Done { output } => registry
                         .tools()
                         .get(tool)
                         .and_then(|t| t.present_result(input, output)),
@@ -808,40 +961,153 @@ impl Session {
     }
 
     async fn run_tool(&self, call: u64, tool: &str, input: &Value) -> Outcome {
+        let registry = self.registry();
+        let route = registry.tools().get(tool).map(DynTool::route);
+        if route.is_some_and(|route| route != Route::Local) {
+            return Outcome::Failed {
+                error: format!("{tool} runs in a client, and this daemon routes none yet"),
+            };
+        }
+        let cx = self.cx(call, &registry);
         let began = crate::stamp();
-        let effect = Effect::new(self, call);
-        let outcome = contain(self.shared.registry.tools().run(tool, input, &effect.cx())).await;
+        let outcome = contain(registry.tools().run(tool, input, &cx)).await;
         crate::session_event("effect", self.id, || {
             let elapsed = began.map_or(Duration::ZERO, |t| t.elapsed());
             let how = match &outcome {
                 Outcome::Done { .. } => "done",
                 Outcome::Failed { .. } => "failed",
-                Outcome::Interrupted => "interrupted",
+                Outcome::Interrupted { .. } => "interrupted",
             };
             format!("{tool} call {call}: {how} in {elapsed:?}")
         });
         outcome
     }
 
-    /// Runs slash command `/name args`: logged, but no turn for the agent.
-    async fn command(&self, name: &str, args: &str) -> io::Result<()> {
-        let call = self
-            .append(Body::Command {
-                name: name.to_owned(),
-                args: args.to_owned(),
-            })
-            .await?;
-        let outcome = match self.shared.registry.command(name) {
+    /// Runs slash command `/name args`, logged as call `call`: no turn for
+    /// the agent.
+    async fn command(&self, call: u64, name: &str, args: &str) -> io::Result<()> {
+        let registry = self.registry();
+        let outcome = match registry.command(name) {
             Some(command) => {
-                let effect = Effect::new(self, call);
-                contain(command.run(args, &effect.cx())).await
+                let cx = self.cx(call, &registry);
+                contain(command.run(args, &cx)).await
             }
+            None if name == MODEL => self.set_model(args),
             None => Outcome::Failed {
                 error: format!("no command /{name}"),
             },
         };
         self.record(Body::CommandResult { call, outcome });
         Ok(())
+    }
+
+    /// `/model`: reports the model the session calls and the layer that
+    /// names it; `/model <host:model>` sets it for this session, over every
+    /// config layer, and `/model reset` leaves it to them again.
+    fn set_model(&self, args: &str) -> Outcome {
+        let set = if args.is_empty() {
+            self.overrides()
+        } else {
+            let model = (args != "reset").then(|| args.to_owned());
+            let set = Overrides { model };
+            let seq = self.record(Body::Settings(set.clone()));
+            (set, Some(seq))
+        };
+        match self.shared.models.settings.model_in(&self.workspace, set) {
+            Ok((model, from)) => Outcome::Done {
+                output: json!({ "model": model, "from": from.to_string() }),
+            },
+            Err(error) => Outcome::Failed { error },
+        }
+    }
+
+    /// The session's own settings, and the seq of the entry that set them.
+    fn overrides(&self) -> (Overrides, Option<u64>) {
+        self.lock()
+            .entries
+            .iter()
+            .rev()
+            .find_map(|e| match &e.body {
+                Body::Settings(set) => Some((set.clone(), Some(e.seq))),
+                _ => None,
+            })
+            .unwrap_or_default()
+    }
+
+    /// The model spec the settings name now.
+    fn model_spec(&self) -> String {
+        let set = self.overrides();
+        self.shared
+            .models
+            .settings
+            .model_in(&self.workspace, set)
+            .map_or_else(|_| "none".to_owned(), |(model, _)| model)
+    }
+
+    /// What call `call` runs with, on `registry`. An interrupt of the turn
+    /// stops it.
+    fn cx(&self, call: u64, registry: &Arc<Registry>) -> Cx {
+        let session = self
+            .this
+            .upgrade()
+            .expect("a session that runs a call is alive");
+        Cx {
+            workspace: Arc::from(self.workspace.as_path()),
+            env: lock(&self.env).clone().map(Arc::new),
+            session: self.id,
+            call,
+            model: self.model_spec().into(),
+            spill: Arc::from(self.shared.spill.join(self.id.to_string())),
+            cancel: self.turn(),
+            rt: Arc::clone(&self.shared.rt),
+            host: Arc::new(Effect {
+                session,
+                call,
+                registry: Arc::clone(registry),
+            }),
+        }
+    }
+
+    /// What stops the running turn.
+    fn turn(&self) -> Cancel {
+        lock(&self.cancel).clone()
+    }
+
+    /// The registry generation the current step runs on.
+    fn registry(&self) -> Arc<Registry> {
+        Arc::clone(&lock(&self.step))
+    }
+
+    /// Moves to the newest registry generation, at a step boundary,
+    /// logging the extensions it runs when they changed.
+    fn resolve(&self) {
+        let newest = self.shared.registry.get();
+        let mut step = lock(&self.step);
+        if Arc::ptr_eq(&step, &newest) {
+            return;
+        }
+        let changed = !step.extensions().eq(newest.extensions());
+        *step = newest;
+        if changed {
+            self.record(Body::Extensions {
+                installed: installed(&step),
+            });
+        }
+    }
+
+    /// Gives the running turn the steering input waiting, before the model
+    /// is next asked.
+    fn steer_in(&self) {
+        lock(&self.waiting).retain(|w| {
+            if !w.steer || w.started {
+                return true;
+            }
+            self.record(Body::Steer {
+                text: w.text.clone(),
+                queued: w.seq,
+            });
+            false
+        });
     }
 
     /// The directory the session's commands run in now.
@@ -866,7 +1132,7 @@ impl Session {
             workspace: &self.workspace,
             dir: &dir,
         };
-        if let Some(text) = self.shared.registry.context(&facts) {
+        if let Some(text) = self.registry().context(&facts) {
             self.record(Body::Context { text });
         }
     }
@@ -874,19 +1140,22 @@ impl Session {
     /// The model as the settings and the newest client's environment name
     /// it now, or why there is none (shown as the failed model call).
     fn model(&self) -> Result<Model, String> {
+        let set = self.overrides();
         let env = lock(&self.env);
-        self.shared.models.model(&self.workspace, env.as_ref())
+        self.shared.models.model(&self.workspace, env.as_ref(), set)
     }
 
     /// Asks `model` to reply to the transcript before `call`, offering the
     /// tools. Text streams to clients as it arrives; only the finished reply
-    /// is committed.
+    /// is committed, or on an interrupt the text so far.
     async fn run_model(&self, call: u64, model: Result<Model, String>) -> Outcome {
         let model = match model {
             Ok(model) => model,
             Err(error) => return Outcome::Failed { error },
         };
-        let registry = &self.shared.registry;
+        let registry = self.registry();
+        let registry = &*registry;
+        let cancel = self.turn();
         let tools = registry.tools();
         let mut history = transcript(&self.lock().entries, call, tools);
         let system = self
@@ -907,7 +1176,9 @@ impl Session {
                 error: e.to_string(),
             };
         }
+        let mut said = String::new();
         let mut on_text = |text: &str| {
+            said.push_str(text);
             self.broadcast(&DaemonMsg::Delta {
                 call,
                 text: text.to_owned(),
@@ -915,10 +1186,13 @@ impl Session {
         };
         // The whole reply is the fact: replaying it later sends the
         // provider's own items (signatures, encrypted reasoning) back.
-        contain(async {
+        let outcome = contain(async {
             let mut retries = 0;
             loop {
-                let error = match model.reply(&request, &mut on_text).await {
+                let Some(reply) = unless(&cancel, model.reply(&request, &mut on_text)).await else {
+                    return Outcome::Interrupted { output: None };
+                };
+                let error = match reply {
                     Ok(reply) => {
                         return match serde_json::to_value(&reply) {
                             Ok(output) => Outcome::Done { output },
@@ -949,25 +1223,49 @@ impl Session {
                 }
             }
         })
-        .await
+        .await;
+        match outcome {
+            Outcome::Interrupted { .. } => Outcome::Interrupted {
+                output: (!said.is_empty()).then_some(said),
+            },
+            outcome => outcome,
+        }
     }
 
     /// Picks up where the log leaves off. Links are re-armed; the agent is
     /// rebuilt from the log; calls with an intent but no outcome are
     /// finished (leftover processes killed, safe calls run again, the rest
-    /// marked interrupted, asks still waiting asked again); then whatever
-    /// the agent asked for that the log does not show runs.
+    /// marked interrupted with the output they committed, asks still
+    /// waiting asked again); then whatever the agent asked for that the log
+    /// does not show runs, and the input still queued is taken up. A child
+    /// whose owner is gone is an orphan: nothing of its turn runs again.
     async fn recover(&self, agent: &mut dyn Agent) -> io::Result<()> {
         self.relink().await?;
-        let (dangling, actions, commands, jobs) = {
+        let (dangling, actions, commands, jobs, queued) = {
             let st = self.lock();
             (
                 dangling_calls(&st.entries),
                 replay(agent, &st.entries),
                 dangling_commands(&st.entries),
                 background_groups(&st.entries),
+                untaken(&st.entries),
             )
         };
+        let orphan = self.orphaned();
+        let registry = self.registry();
+        let queued = queued.into_iter().map(|(seq, text, steer)| Waiting {
+            command: slash(&text).is_some_and(|(name, _)| is_command(&registry, name)),
+            seq,
+            text,
+            steer,
+            started: false,
+        });
+        let count = queued.len();
+        lock(&self.waiting).extend(queued);
+        self.queued.fetch_add(count, Ordering::SeqCst);
+        for _ in 0..count {
+            let _ = self.mailbox.send(Msg::Queued);
+        }
         // Owned by the session under a daemon that died without ending it:
         // ended now. Later loads in this daemon find them ended by `stop`.
         if lock(&self.shared.loaded).insert(self.id) {
@@ -981,7 +1279,7 @@ impl Session {
         for call in commands {
             self.record(Body::CommandResult {
                 call,
-                outcome: Outcome::Interrupted,
+                outcome: Outcome::Interrupted { output: None },
             });
         }
         let mut inputs = VecDeque::new();
@@ -1000,16 +1298,19 @@ impl Session {
                     self.warn(format_args!("killing process group {pgid}: {e}"));
                 }
             }
+            let interrupted = || Outcome::Interrupted {
+                output: partial(&self.lock().entries, seq),
+            };
             let outcome = match &call {
+                _ if orphan => interrupted(),
                 Call::Tool { tool, input } if asked == Asked::Waiting => {
                     self.ask(seq, tool, input).await?
                 }
                 Call::Tool { .. } if asked == Asked::Answered(false) => not_approved(),
                 Call::Tool { tool, .. }
-                    if self.shared.registry.tools().get(tool).map(DynTool::replay)
-                        != Some(Replay::Safe) =>
+                    if registry.tools().get(tool).map(DynTool::replay) != Some(Replay::Safe) =>
                 {
-                    Outcome::Interrupted
+                    interrupted()
                 }
                 _ => {
                     self.flush().await?;
@@ -1018,61 +1319,57 @@ impl Session {
             };
             inputs.push_back(self.finish(&call, seq, outcome).await?);
         }
+        if orphan {
+            self.warn("its owner is gone: what it was doing is not resumed");
+            lock(&self.cancel).cancel();
+        }
         self.drive(agent, actions, inputs).await
     }
+
+    /// Whether this is a child whose owner is gone.
+    fn orphaned(&self) -> bool {
+        let daemon = self.shared.daemon.upgrade();
+        self.parent
+            .zip(daemon)
+            .is_some_and(|(parent, daemon)| !daemon.knows(parent.session))
+    }
+}
+
+/// The native command that sets the session's model.
+const MODEL: &str = "model";
+
+/// Whether `/name` is a command: an extension's, or a native one.
+fn is_command(registry: &Registry, name: &str) -> bool {
+    registry.command(name).is_some() || name == MODEL
+}
+
+/// `work`'s output, or `None` once `cancel` is cancelled first; `work` is
+/// then dropped.
+async fn unless<T>(cancel: &Cancel, work: impl Future<Output = T>) -> Option<T> {
+    let (mut work, mut stop) = (pin!(work), pin!(cancel.cancelled()));
+    poll_fn(|cx| {
+        if let Poll::Ready(done) = work.as_mut().poll(cx) {
+            return Poll::Ready(Some(done));
+        }
+        stop.as_mut().poll(cx).map(|()| None)
+    })
+    .await
 }
 
 /// Model calls one request may be retried, as `request_error` hooks ask.
 const MAX_RETRIES: u32 = 2;
 
-/// What a tool or command call runs with, held for the call's duration.
-struct Effect<'a> {
-    session: &'a Session,
+/// The engine as tool or command call `call` reaches it, on the registry
+/// generation it started with.
+struct Effect {
+    session: Arc<Session>,
     call: u64,
-    env: Option<Environment>,
-    spill: PathBuf,
-    model: String,
-    cancel: Cancel,
-}
-
-impl<'a> Effect<'a> {
-    /// The effect of call `call`, which an interrupt now stops.
-    fn new(session: &'a Session, call: u64) -> Self {
-        let cancel = Cancel::default();
-        *lock(&session.cancel) = cancel.clone();
-        Self {
-            session,
-            call,
-            env: lock(&session.env).clone(),
-            spill: session.shared.spill.join(session.id.to_string()),
-            model: session
-                .shared
-                .models
-                .settings
-                .model(&session.workspace)
-                .unwrap_or_else(|_| "none".to_owned()),
-            cancel,
-        }
-    }
-
-    fn cx(&self) -> Cx<'_> {
-        Cx {
-            workspace: &self.session.workspace,
-            env: self.env.as_ref(),
-            session: self.session.id,
-            call: self.call,
-            model: &self.model,
-            spill: &self.spill,
-            cancel: &self.cancel,
-            rt: &*self.session.shared.rt,
-            host: self,
-        }
-    }
+    registry: Arc<Registry>,
 }
 
 /// Entries a call records are not waited for: they still commit before
 /// its result.
-impl Host for Effect<'_> {
+impl Host for Effect {
     fn spawned(&self, pgid: u32, background: bool) {
         if background {
             lock(&self.session.jobs).push(pgid);
@@ -1083,6 +1380,14 @@ impl Host for Effect<'_> {
             pgid,
             boot: boot.to_owned(),
             background,
+        });
+        self.session.kick();
+    }
+
+    fn progress(&self, text: &str) {
+        self.session.record(Body::Progress {
+            call: self.call,
+            text: text.to_owned(),
         });
         self.session.kick();
     }
@@ -1102,7 +1407,7 @@ impl Host for Effect<'_> {
     }
 
     fn hooks(&self) -> &Hooks {
-        self.session.shared.registry.hooks()
+        self.registry.hooks()
     }
 }
 
@@ -1147,11 +1452,7 @@ fn background_groups(entries: &[Entry]) -> Vec<u32> {
 
 /// Logs the registry's extensions before the session's first step, unless
 /// they are the ones its log records last.
-fn note_extensions(
-    header: &Header,
-    loaded: &mut Loaded,
-    registry: &agent::Registry,
-) -> io::Result<()> {
+fn note_extensions(header: &Header, loaded: &mut Loaded, registry: &Registry) -> io::Result<()> {
     let recorded = loaded
         .entries
         .iter()
@@ -1170,20 +1471,20 @@ fn note_extensions(
     if same {
         return Ok(());
     }
-    let entry = Entry {
-        seq: loaded.entries.len() as u64 + 1,
-        epoch: 0,
-        body: Body::Extensions {
+    let entry = Entry::new(
+        loaded.entries.len() as u64 + 1,
+        loaded.epoch,
+        Body::Extensions {
             installed: installed(registry),
         },
-    };
+    );
     loaded.log.append(&entry)?;
     loaded.entries.push(entry);
     Ok(())
 }
 
 /// The registry's extensions as a log records them.
-pub fn installed(registry: &agent::Registry) -> Vec<Installed> {
+pub fn installed(registry: &Registry) -> Vec<Installed> {
     registry
         .extensions()
         .map(|(name, version)| Installed {

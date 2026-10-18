@@ -11,7 +11,7 @@ mod tests;
 use std::collections::HashSet;
 use std::path::PathBuf;
 
-use protocol::view::{Approval, Change, Item, SessionList, SessionView, Usage};
+use protocol::view::{Approval, Change, Item, SessionList, SessionView, Status, Usage};
 use protocol::{ClientMsg, DaemonMsg, SessionSummary, Target};
 
 use super::editor::{Edit, Editor};
@@ -117,12 +117,12 @@ const HELP: &[(&str, &str)] = &[
     ("click a card", "fold or unfold it"),
     (
         "ctrl-c",
-        "interrupt the running call; else clear the input, or detach",
+        "interrupt the running turn; else clear the input, or detach",
     ),
     ("ctrl-l", "redraw"),
     ("/sessions", "switch session"),
     ("/new", "start a new session"),
-    ("/interrupt", "stop the running tool call"),
+    ("/interrupt", "stop the running turn"),
     ("/env refresh", "send this shell's environment again"),
     ("/detach", "leave; the session keeps running"),
 ];
@@ -354,10 +354,11 @@ impl App {
         })
     }
 
-    /// Whether a tool call or slash command is running: what an interrupt
-    /// stops (a model call it does not).
+    /// Whether a model call, tool call or slash command is running: what
+    /// an interrupt stops, with the rest of its turn.
     pub fn running(&self) -> bool {
         self.view.items.iter().rev().any(|item| match item {
+            Item::Reply { status, .. } => *status == Status::Running,
             Item::Tool {
                 outcome: None,
                 approval,
@@ -369,7 +370,7 @@ impl App {
     }
 
     fn interrupt(&mut self) -> Effect {
-        self.notice("stopping the running tool (ctrl-d detaches)", false);
+        self.notice("stopping the turn (ctrl-d detaches)", false);
         Effect::Send(ClientMsg::Interrupt)
     }
 

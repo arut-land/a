@@ -47,11 +47,7 @@ struct Session {
 impl Session {
     fn commit(&mut self, body: Body) -> u64 {
         self.seq += 1;
-        let msg = DaemonMsg::Entry(Entry {
-            seq: self.seq,
-            epoch: 0,
-            body,
-        });
+        let msg = DaemonMsg::Entry(Entry::new(self.seq, 0, body));
         self.log.push(msg.clone());
         self.live.push(msg);
         self.seq
@@ -244,7 +240,7 @@ impl Session {
 fn outcome(rng: &mut Rng, output: Value) -> Outcome {
     match rng.below(5) {
         0 => Outcome::Failed { error: "f".into() },
-        1 => Outcome::Interrupted,
+        1 => Outcome::Interrupted { output: None },
         _ => Outcome::Done { output },
     }
 }
@@ -367,13 +363,7 @@ fn vectors_path() -> PathBuf {
 /// Named scenarios: the daemon messages a client receives, as JSON.
 fn scenarios() -> Vec<(&'static str, Vec<Value>)> {
     let msg = |m: DaemonMsg| serde_json::to_value(m).unwrap();
-    let entry = |seq, body| {
-        msg(DaemonMsg::Entry(Entry {
-            seq,
-            epoch: 0,
-            body,
-        }))
-    };
+    let entry = |seq, body| msg(DaemonMsg::Entry(Entry::new(seq, 0, body)));
     let attached = || {
         msg(DaemonMsg::Attached {
             session: SESSION,
