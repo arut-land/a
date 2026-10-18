@@ -2,7 +2,7 @@ use std::path::Path;
 use std::sync::mpsc;
 use std::thread;
 
-use agent::{Hook, Tool};
+use agent::{Builtin, Extension, Hook, Registrar, Registry, Tool};
 use bytes::Bytes;
 use llm::http::{BoxFuture, Http};
 use llm::protocols::responses;
@@ -81,7 +81,7 @@ fn transcripts_of_earlier_logs_read_replies_as_text() {
         ),
         entry(5, Body::ModelCall { model: "m".into() }),
     ];
-    let turns = transcript(&entries, 5, &Toolset::default());
+    let turns = transcript(&entries, 5, &agent::Toolset::default());
     assert_eq!(
         turns,
         [
@@ -113,6 +113,18 @@ impl Tool for HarborLabel {
 
     fn to_model(label: &String) -> llm::Output {
         llm::Output::Text(label.clone())
+    }
+}
+
+/// Offers only [`HarborLabel`].
+struct Harbor;
+
+impl Extension for Harbor {
+    const NAME: &'static str = "harbor";
+    const VERSION: u32 = 1;
+
+    fn contribute(&self, r: &mut Registrar) {
+        r.tool(HarborLabel);
     }
 }
 
@@ -190,14 +202,13 @@ fn openai(script: &Arc<Script>) -> Model {
 struct Fixture(Arc<Shared>);
 
 impl Fixture {
-    fn new(agent: agent::Kind, tools: Toolset, hooks: Hooks, model: Model) -> Self {
+    fn new(agent: agent::Kind, registry: Registry, model: Model) -> Self {
         Self(Arc::new(Shared {
             // One worker: no effect may hold it.
             rt: Arc::new(rt::Threads::new(1)),
             store: Arc::new(store::Memory::default()),
             agent,
-            tools,
-            hooks,
+            registry,
             model: Ok(model),
             daemon: Weak::new(),
         }))
@@ -237,8 +248,8 @@ fn log_of(session: &Session) -> Vec<Entry> {
 fn the_model_calls_a_tool_and_answers_from_its_result() {
     let replies = cassette("openai/streaming_grammar/tool_then_followup_text.yaml");
     let script = Script::new(&replies);
-    let tools = Toolset(&[&HarborLabel]);
-    let fixture = Fixture::new(agent::Kind::Chat, tools, Hooks::default(), openai(&script));
+    let tools = Registry::default().with(&Harbor);
+    let fixture = Fixture::new(agent::Kind::Chat, tools, openai(&script));
     let session = fixture.start(&[]);
     session.submit("Call the tool, then answer.".into());
     settle(&session);
@@ -285,8 +296,7 @@ fn the_model_calls_a_tool_and_answers_from_its_result() {
         let script = Script::new(&replies[1..]);
         let fixture = Fixture::new(
             agent::Kind::Chat,
-            Toolset(&[&HarborLabel]),
-            Hooks::default(),
+            Registry::default().with(&Harbor),
             openai(&script),
         );
         let resumed = fixture.start(&log[..cut]);
@@ -300,11 +310,16 @@ fn the_model_calls_a_tool_and_answers_from_its_result() {
 /// Denies shell commands, and has the agent go on once after it stops.
 struct Policy;
 
-impl Hook for Policy {
-    fn name(&self) -> &'static str {
-        "policy"
-    }
+impl Extension for Policy {
+    const NAME: &'static str = "policy";
+    const VERSION: u32 = 1;
 
+    fn contribute(&self, r: &mut Registrar) {
+        r.on(Policy);
+    }
+}
+
+impl Hook for Policy {
     fn permission(&self, tool: &str, _: &Value) -> Permission {
         if tool == agent::tools::RunCommand::NAME {
             Permission::Deny
@@ -331,8 +346,7 @@ impl Hook for Policy {
 fn hook_decisions_are_logged_and_replay_to_the_same_state() {
     let fixture = Fixture::new(
         agent::Kind::Echo,
-        Toolset::default(),
-        std::iter::once(Box::new(Policy) as Box<dyn Hook>).collect(),
+        Registry::default().with(&Builtin).with(&Policy),
         openai(&Script::new(&[])),
     );
     let session = fixture.start(&[]);
@@ -376,7 +390,7 @@ fn hook_decisions_are_logged_and_replay_to_the_same_state() {
     );
     assert!(replay(agent::Kind::Echo.agent().as_mut(), &log).is_empty());
     assert_eq!(
-        transcript(&log, u64::MAX, &Toolset::default()),
+        transcript(&log, u64::MAX, &agent::Toolset::default()),
         [
             llm::Message::user("$ echo hi"),
             llm::Message::user("and again"),
@@ -392,8 +406,7 @@ fn sessions_wait_on_effects_without_holding_the_worker() {
     let ask = agent::AskFor(vec![agent::tools::Sleep::NAME.to_owned()]);
     let fixture = Fixture::new(
         agent::Kind::Echo,
-        Toolset::default(),
-        std::iter::once(Box::new(ask) as Box<dyn Hook>).collect(),
+        Registry::default().with(&Builtin).with(&ask),
         openai(&Script::new(&[])),
     );
     let asked = fixture.start(&[]);
@@ -425,8 +438,7 @@ fn asking() -> Fixture {
     let ask = agent::AskFor(vec![agent::tools::RunCommand::NAME.to_owned()]);
     Fixture::new(
         agent::Kind::Echo,
-        Toolset::default(),
-        std::iter::once(Box::new(ask) as Box<dyn Hook>).collect(),
+        Registry::default().with(&Builtin).with(&ask),
         openai(&Script::new(&[])),
     )
 }

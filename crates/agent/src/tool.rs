@@ -2,6 +2,7 @@
 
 use std::future::Future;
 use std::path::Path;
+use std::sync::Arc;
 
 use protocol::{Environment, Outcome};
 use rt::{BoxFuture, Runtime};
@@ -105,20 +106,14 @@ impl<T: Tool> DynTool for T {
     }
 }
 
-/// The tools an agent may call, by name.
-pub struct Toolset(pub &'static [&'static dyn DynTool]);
-
-impl Default for Toolset {
-    /// The built-in tools.
-    fn default() -> Self {
-        use crate::tools::{ReadFile, RunCommand, Sleep};
-        Self(&[&RunCommand, &Sleep, &ReadFile])
-    }
-}
+/// The tools an agent may call, by name, as a [`Registry`](crate::Registry)
+/// resolves them.
+#[derive(Default)]
+pub struct Toolset(pub(crate) Vec<Arc<dyn DynTool>>);
 
 impl Toolset {
-    pub fn get(&self, name: &str) -> Option<&'static dyn DynTool> {
-        self.0.iter().copied().find(|t| t.name() == name)
+    pub fn get(&self, name: &str) -> Option<&dyn DynTool> {
+        self.0.iter().map(|t| &**t).find(|t| t.name() == name)
     }
 
     /// Every tool, as offered to the model.
@@ -126,7 +121,7 @@ impl Toolset {
         self.0.iter().map(|t| t.spec()).collect()
     }
 
-    pub fn run<'a>(&self, name: &str, input: &Value, cx: &'a Cx<'a>) -> BoxFuture<'a, Outcome> {
+    pub fn run<'a>(&'a self, name: &str, input: &Value, cx: &'a Cx<'a>) -> BoxFuture<'a, Outcome> {
         match self.get(name) {
             Some(tool) => tool.call(input, cx),
             None => Box::pin(std::future::ready(Outcome::Failed {

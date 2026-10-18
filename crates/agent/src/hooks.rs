@@ -12,14 +12,15 @@
 //!
 //! Merges report what changed as [`Decision`]s, which the engine logs.
 
+use std::sync::Arc;
+
 use protocol::{Decision, Entry, Outcome, Permission};
 use serde_json::Value;
 
-/// One hook. Every method defaults to changing nothing.
+/// One hook. Every method defaults to changing nothing. Its decisions are
+/// logged under the name of the [`Extension`](crate::Extension) that
+/// registered it.
 pub trait Hook: Send + Sync {
-    /// Who made a decision, as logged.
-    fn name(&self) -> &'static str;
-
     /// A replacement for the next model request.
     fn prepare_step(&self, _request: &llm::Request) -> Option<llm::Request> {
         None
@@ -73,10 +74,6 @@ pub enum Gate {
 pub struct AskFor(pub Vec<String>);
 
 impl Hook for AskFor {
-    fn name(&self) -> &'static str {
-        "ask"
-    }
-
     fn permission(&self, tool: &str, _: &Value) -> Permission {
         if self.0.iter().any(|t| t == tool) {
             Permission::Ask
@@ -86,25 +83,21 @@ impl Hook for AskFor {
     }
 }
 
-/// Decisions to log, with the hook that made each.
+/// Decisions to log, with the extension whose hook made each.
 pub type Decided = Vec<(&'static str, Decision)>;
 
-/// Hooks in the order they run. The default, none, allows everything.
+/// Hooks in the order they run, each with its extension's name, as a
+/// [`Registry`](crate::Registry) resolves them. The default, none, allows
+/// everything.
 #[derive(Default)]
-pub struct Hooks(Vec<Box<dyn Hook>>);
-
-impl FromIterator<Box<dyn Hook>> for Hooks {
-    fn from_iter<I: IntoIterator<Item = Box<dyn Hook>>>(hooks: I) -> Self {
-        Self(hooks.into_iter().collect())
-    }
-}
+pub struct Hooks(pub(crate) Vec<(&'static str, Arc<dyn Hook>)>);
 
 impl Hooks {
     pub fn prepare_step(&self, call: u64, request: &mut llm::Request, decided: &mut Decided) {
-        for hook in &self.0 {
+        for &(name, ref hook) in &self.0 {
             if let Some(next) = hook.prepare_step(request) {
                 *request = next;
-                decided.push((hook.name(), Decision::PrepareStep { call }));
+                decided.push((name, Decision::PrepareStep { call }));
             }
         }
     }
@@ -117,7 +110,7 @@ impl Hooks {
         input: &mut Value,
         decided: &mut Decided,
     ) -> Result<Gate, String> {
-        for hook in &self.0 {
+        for &(name, ref hook) in &self.0 {
             match hook.pre_tool(tool, input) {
                 Pre::Pass => {}
                 Pre::Replace(next) => {
@@ -126,14 +119,14 @@ impl Hooks {
                         tool: tool.to_owned(),
                         input: input.clone(),
                     };
-                    decided.push((hook.name(), decision));
+                    decided.push((name, decision));
                 }
                 Pre::Block(reason) => {
                     let decision = Decision::Block {
                         tool: tool.to_owned(),
                         reason: reason.clone(),
                     };
-                    decided.push((hook.name(), decision));
+                    decided.push((name, decision));
                     return Err(reason);
                 }
             }
@@ -141,7 +134,7 @@ impl Hooks {
         let Some((by, permission)) = self
             .0
             .iter()
-            .map(|hook| (hook.name(), hook.permission(tool, input)))
+            .map(|(name, hook)| (*name, hook.permission(tool, input)))
             .filter(|(_, permission)| *permission > Permission::Allow)
             .reduce(|most, next| if next.1 > most.1 { next } else { most })
         else {
@@ -161,7 +154,7 @@ impl Hooks {
                 let answer = self
                     .0
                     .iter()
-                    .find_map(|hook| Some((hook.name(), hook.approve(&tool, input)?)));
+                    .find_map(|(name, hook)| Some((*name, hook.approve(&tool, input)?)));
                 let Some((who, approved)) = answer else {
                     return Ok(Gate::Ask);
                 };
@@ -192,10 +185,10 @@ impl Hooks {
         outcome: &mut Outcome,
         decided: &mut Decided,
     ) {
-        for hook in &self.0 {
+        for &(name, ref hook) in &self.0 {
             if let Some(next) = hook.post_tool(tool, input, outcome) {
                 let original = std::mem::replace(outcome, next);
-                decided.push((hook.name(), Decision::PostTool { call, original }));
+                decided.push((name, Decision::PostTool { call, original }));
             }
         }
     }
@@ -204,13 +197,13 @@ impl Hooks {
         let (hook, text) = self
             .0
             .iter()
-            .find_map(|hook| Some((hook.name(), hook.on_stop(entries)?)))?;
+            .find_map(|(name, hook)| Some((*name, hook.on_stop(entries)?)))?;
         decided.push((hook, Decision::OnStop { text: text.clone() }));
         Some(text)
     }
 
     pub fn observe(&self, entry: &Entry) {
-        for hook in &self.0 {
+        for (_, hook) in &self.0 {
             hook.observe(entry);
         }
     }
@@ -243,10 +236,6 @@ mod tests {
     }
 
     impl Hook for Fixed {
-        fn name(&self) -> &'static str {
-            self.name
-        }
-
         fn pre_tool(&self, _: &str, input: &Value) -> Pre {
             (self.pre)(input)
         }
@@ -271,9 +260,8 @@ mod tests {
     }
 
     fn hooks(list: impl IntoIterator<Item = Fixed>) -> Hooks {
-        list.into_iter()
-            .map(|hook| Box::new(hook) as Box<dyn Hook>)
-            .collect()
+        let named = |hook: Fixed| (hook.name, Arc::new(hook) as Arc<dyn Hook>);
+        Hooks(list.into_iter().map(named).collect())
     }
 
     fn gate(hooks: &Hooks) -> (Result<Gate, String>, Value, Decided) {

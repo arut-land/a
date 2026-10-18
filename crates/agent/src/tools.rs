@@ -190,7 +190,7 @@ impl Tool for ReadFile {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::{DynTool, Toolset};
+    use crate::{Builtin, DynTool, Registry};
 
     static RT: std::sync::LazyLock<rt::Threads> = std::sync::LazyLock::new(rt::Threads::default);
 
@@ -238,7 +238,7 @@ mod tests {
 
     #[test]
     fn schemas_name_every_input_field() {
-        for tool in Toolset::default().0 {
+        for tool in &Registry::default().with(&Builtin).tools().0 {
             let spec = tool.spec();
             assert_eq!(spec.schema["type"], "object", "{}", spec.name);
             assert_ne!(spec.description, "");

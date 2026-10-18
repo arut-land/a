@@ -1,5 +1,5 @@
 //! Agents as sans-IO step machines, the tools they call, and the hooks that
-//! intercept them.
+//! intercept them, as extensions contribute them.
 //!
 //! An agent never performs I/O: it turns an [`Input`] into [`Action`]s, and the
 //! engine commits entries, runs tools and feeds results back in. Every input
@@ -10,10 +10,12 @@ use std::str::FromStr;
 use protocol::{Body, Outcome};
 use serde_json::{Value, json};
 
+mod ext;
 mod hooks;
 mod tool;
 pub mod tools;
 
+pub use ext::{Builtin, Extension, Registrar, Registry};
 pub use hooks::{AskFor, Decided, Gate, Hook, Hooks, Pre};
 pub use tool::{Cx, DynTool, Replay, Tool, Toolset};
 
@@ -210,7 +212,8 @@ mod tests {
 
     #[test]
     fn replay_policy_is_per_tool() {
-        let tools = Toolset::default();
+        let registry = Registry::default().with(&Builtin);
+        let tools = registry.tools();
         assert_eq!(tools.get("run_command").unwrap().replay(), Replay::Unsafe);
         assert_eq!(tools.get("sleep").unwrap().replay(), Replay::Safe);
         assert_eq!(tools.get("read_file").unwrap().replay(), Replay::Safe);
