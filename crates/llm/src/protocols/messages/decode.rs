@@ -15,9 +15,9 @@ use std::collections::{BTreeMap, BTreeSet};
 use serde::Deserialize;
 use serde_json::{Map, Value, json};
 
-use super::{KEY, tag};
+use super::KEY;
 use crate::error::{Error, Kind};
-use crate::json::Lenient;
+use crate::json::{Lenient, Str, tag, whole_object};
 use crate::protocol::Flow;
 use crate::spec::{Reason, SmolStr, Usage};
 use crate::writer::{AUTO_INDEX, CallFragment, End, Open, Writer, Writes, merge};
@@ -110,18 +110,14 @@ struct FastDelta<'a> {
     #[serde(rename = "type")]
     kind: DeltaType,
     #[serde(borrow)]
-    text: Option<Fragment<'a>>,
+    text: Option<Str<'a>>,
     #[serde(borrow)]
-    thinking: Option<Fragment<'a>>,
+    thinking: Option<Str<'a>>,
     #[serde(borrow)]
-    partial_json: Option<Fragment<'a>>,
+    partial_json: Option<Str<'a>>,
     #[serde(borrow)]
-    signature: Option<Fragment<'a>>,
+    signature: Option<Str<'a>>,
 }
-
-/// A borrowing string inside an `Option`, where `Cow` alone never borrows.
-#[derive(Deserialize)]
-struct Fragment<'a>(#[serde(borrow)] Cow<'a, str>);
 
 impl<'a> Fast<'a> {
     /// The block, type and fragment of a delta stating exactly the field
@@ -419,11 +415,9 @@ impl MessagesDecoder {
         stop: Option<&str>,
         details: Option<&Value>,
     ) -> Result<Flow, Error> {
-        let whole = |json: &str| {
-            json.trim().is_empty() || matches!(serde_json::from_str(json), Ok(Value::Object(_)))
-        };
         let open = self.open.iter();
-        let open = open.filter(|(_, (kind, json))| *kind != BlockType::ToolUse || whole(json));
+        let open =
+            open.filter(|(_, (kind, json))| *kind != BlockType::ToolUse || whole_object(json));
         for index in open.map(|(index, _)| *index).collect::<Vec<_>>() {
             self.stop(index)?;
         }

@@ -4,9 +4,8 @@
 use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value, json};
 
-use super::tag;
 use crate::error::Error;
-use crate::json::Lenient;
+use crate::json::{Lenient, tag};
 
 /// The most `cache_control` markers Anthropic takes in one request.
 const MAX_MARKERS: usize = 4;

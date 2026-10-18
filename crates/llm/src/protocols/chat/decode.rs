@@ -12,18 +12,15 @@
 //! an unexpected type reads as what it is rather than failing the frame.
 
 use std::borrow::Cow;
-use std::fmt;
-use std::marker::PhantomData;
 
-use serde::de::value::MapAccessDeserializer;
-use serde::de::{self, IgnoredAny, MapAccess, SeqAccess, Visitor};
-use serde::{Deserialize, Deserializer};
+use serde::Deserialize;
+use serde::de::IgnoredAny;
 use serde_json::{Map, Value, json};
 
 use super::merge::{merge_details, merge_fields, merge_object, merge_str};
 use super::{KEY, PartKind, Quirks, ReasoningField};
 use crate::error::Error;
-use crate::json::Lenient;
+use crate::json::{Json, Lenient, whole_object};
 use crate::protocol::Flow;
 use crate::spec::{Media, Meta, Reason, SmolStr, Source, Usage};
 use crate::writer::{AUTO_INDEX, CallFragment, End, Open, Writer, Writes};
@@ -62,53 +59,7 @@ fn native_finish(reason: &str) -> Reason {
     }
 }
 
-/// A JSON value as the decoder reads it: absent, a string (borrowed from
-/// the frame unless it has escapes), an object read as `T`, an array of
-/// `E`s, or any other value (`null`, a number, a boolean).
-#[derive(Default)]
-enum Json<'a, T = Value, E = Value> {
-    #[default]
-    Absent,
-    Str(Cow<'a, str>),
-    Object(T),
-    List(Vec<E>),
-    Other(Value),
-}
-
-impl<T, E> Json<'_, T, E> {
-    fn str(&self) -> Option<&str> {
-        match self {
-            Self::Str(text) => Some(text),
-            _ => None,
-        }
-    }
-
-    fn object(&self) -> Option<&T> {
-        match self {
-            Self::Object(object) => Some(object),
-            _ => None,
-        }
-    }
-
-    fn items(&self) -> &[E] {
-        match self {
-            Self::List(items) => items,
-            _ => &[],
-        }
-    }
-}
-
 impl<T> Json<'_, T> {
-    /// The value, unless it is absent or an object.
-    fn scalar(&self) -> Option<Value> {
-        match self {
-            Self::Absent | Self::Object(_) => None,
-            Self::Str(text) => Some(text.as_ref().into()),
-            Self::List(items) => Some(Value::Array(items.clone())),
-            Self::Other(value) => Some(value.clone()),
-        }
-    }
-
     /// Merge the value under `key` as [`merge_fields`] merges one, an
     /// object by `object`.
     fn merge<M>(&self, target: &mut Map<String, Value>, key: &str, object: M)
@@ -132,79 +83,6 @@ impl Json<'_> {
         self.merge(target, key, |target, value| {
             merge_fields(target, [(key, value)]);
         });
-    }
-
-    /// The value as text: a string as it is, anything else but `null` as
-    /// JSON.
-    fn text(&self) -> Option<Cow<'_, str>> {
-        match self {
-            Self::Str(text) => Some(Cow::Borrowed(text)),
-            Self::Object(value) => Some(value.to_string().into()),
-            json => json
-                .scalar()
-                .filter(|value| !value.is_null())
-                .map(|value| value.to_string().into()),
-        }
-    }
-}
-
-struct Read<'a, T, E>(PhantomData<Json<'a, T, E>>);
-
-impl<'de: 'a, 'a, T: Deserialize<'de>, E: Deserialize<'de>> Visitor<'de> for Read<'a, T, E> {
-    type Value = Json<'a, T, E>;
-
-    fn expecting(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.write_str("JSON")
-    }
-
-    fn visit_unit<X: de::Error>(self) -> Result<Self::Value, X> {
-        Ok(Json::Other(Value::Null))
-    }
-
-    fn visit_bool<X: de::Error>(self, value: bool) -> Result<Self::Value, X> {
-        Ok(Json::Other(value.into()))
-    }
-
-    fn visit_i64<X: de::Error>(self, value: i64) -> Result<Self::Value, X> {
-        Ok(Json::Other(value.into()))
-    }
-
-    fn visit_u64<X: de::Error>(self, value: u64) -> Result<Self::Value, X> {
-        Ok(Json::Other(value.into()))
-    }
-
-    fn visit_f64<X: de::Error>(self, value: f64) -> Result<Self::Value, X> {
-        Ok(Json::Other(value.into()))
-    }
-
-    fn visit_borrowed_str<X: de::Error>(self, text: &'de str) -> Result<Self::Value, X> {
-        Ok(Json::Str(Cow::Borrowed(text)))
-    }
-
-    fn visit_str<X: de::Error>(self, text: &str) -> Result<Self::Value, X> {
-        Ok(Json::Str(Cow::Owned(text.to_owned())))
-    }
-
-    fn visit_string<X: de::Error>(self, text: String) -> Result<Self::Value, X> {
-        Ok(Json::Str(Cow::Owned(text)))
-    }
-
-    fn visit_seq<A: SeqAccess<'de>>(self, mut seq: A) -> Result<Self::Value, A::Error> {
-        let mut items = Vec::new();
-        while let Some(item) = seq.next_element()? {
-            items.push(item);
-        }
-        Ok(Json::List(items))
-    }
-
-    fn visit_map<A: MapAccess<'de>>(self, map: A) -> Result<Self::Value, A::Error> {
-        T::deserialize(MapAccessDeserializer::new(map)).map(Json::Object)
-    }
-}
-
-impl<'de: 'a, 'a, T: Deserialize<'de>, E: Deserialize<'de>> Deserialize<'de> for Json<'a, T, E> {
-    fn deserialize<D: Deserializer<'de>>(json: D) -> Result<Self, D::Error> {
-        json.deserialize_any(Read(PhantomData))
     }
 }
 
@@ -318,11 +196,6 @@ struct OpenCall {
     id: Option<String>,
     opaque: bool,
     arguments: String,
-}
-
-/// Whether `text` is a whole JSON object; nothing at all is one.
-fn whole_object(text: &str) -> bool {
-    text.trim().is_empty() || matches!(serde_json::from_str(text), Ok(Value::Object(_)))
 }
 
 pub(super) struct ChatDecoder {

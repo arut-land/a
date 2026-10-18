@@ -12,9 +12,9 @@ use serde::Deserialize;
 use serde::de::{self, Deserializer};
 use serde_json::{Value, json};
 
-use super::{ItemType, KEY, PartType, Status, word};
+use super::{ItemType, KEY, PartType, Status};
 use crate::error::{Error, Kind};
-use crate::json::Lenient;
+use crate::json::{Lenient, word};
 use crate::protocol::Flow;
 use crate::spec::{Reason, SmolStr, Usage};
 use crate::writer::{CallFragment, End, Open, Writer, Writes};

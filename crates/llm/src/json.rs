@@ -5,6 +5,10 @@ use std::str::FromStr;
 
 use serde_json::{Map, Number, Value};
 
+mod read;
+
+pub(crate) use read::{Json, Str, first, lax, present, tag, word};
+
 /// Lenient reads of a JSON value: a missing field or one of the wrong type
 /// is `None`, and numbers may arrive as strings.
 pub trait Lenient {
@@ -135,6 +139,11 @@ pub fn arguments(text: &str) -> (Map<String, Value>, Option<String>) {
         Err(_) => (parse_partial_object(text).unwrap_or_default(), true),
     };
     (arguments, invalid.then(|| text.to_owned()))
+}
+
+/// Whether `text` is a whole JSON object; nothing at all is one.
+pub(crate) fn whole_object(text: &str) -> bool {
+    text.trim().is_empty() || matches!(serde_json::from_str(text), Ok(Value::Object(_)))
 }
 
 pub fn parse_partial_object(text: &str) -> Option<Map<String, Value>> {

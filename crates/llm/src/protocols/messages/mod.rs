@@ -21,7 +21,6 @@ mod encode;
 mod options;
 mod strict;
 
-use serde::Deserialize;
 use serde_json::Value;
 
 use crate::error::{Error, Kind};
@@ -126,11 +125,6 @@ impl Messages {
     pub const fn new(quirks: Quirks) -> Self {
         Self { quirks }
     }
-}
-
-/// The wire word `value` states, which must be a string.
-fn tag<'v, T: Deserialize<'v>>(value: Option<&'v Value>) -> Option<T> {
-    T::deserialize(value.filter(|value| value.is_string())?).ok()
 }
 
 /// The path to post to under `base_url`, which may already name the API

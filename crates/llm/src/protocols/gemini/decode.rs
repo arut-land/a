@@ -9,17 +9,15 @@
 //! of a type Gemini's schema does not give it is absent.
 
 use std::borrow::Cow;
-use std::fmt::{self, Write as _};
-use std::marker::PhantomData;
+use std::fmt::Write as _;
 
 use serde::Deserialize;
-use serde::de::{Deserializer, IgnoredAny, SeqAccess, Visitor};
 use serde_json::{Map, Value, json};
 use smol_str::format_smolstr;
 
 use super::KEY;
 use crate::error::{Error, Kind};
-use crate::json::Lenient;
+use crate::json::{Lenient, first, lax, present};
 use crate::protocol::Flow;
 use crate::spec::{Media, Meta, Reason, SmolStr, Source, Usage};
 use crate::writer::{End, Open, Writer, Writes};
@@ -85,44 +83,6 @@ enum Part<'a> {
 #[serde(rename_all = "camelCase")]
 struct UsageOf {
     usage_metadata: Value,
-}
-
-fn present<'de, D: Deserializer<'de>>(field: D) -> Result<bool, D::Error> {
-    IgnoredAny::deserialize(field).map(|_| true)
-}
-
-/// A field of another type is absent.
-fn lax<'de, D: Deserializer<'de>, T: Deserialize<'de>>(field: D) -> Result<Option<T>, D::Error> {
-    #[derive(Deserialize)]
-    #[serde(untagged)]
-    enum Lax<T> {
-        Is(T),
-        Not(IgnoredAny),
-    }
-    Ok(match Option::deserialize(field)? {
-        Some(Lax::Is(value)) => Some(value),
-        Some(Lax::Not(_)) | None => None,
-    })
-}
-
-/// The first element of a list, or `None` for `null`.
-fn first<'de, D: Deserializer<'de>, T: Deserialize<'de>>(list: D) -> Result<Option<T>, D::Error> {
-    struct First<T>(PhantomData<T>);
-    impl<'de, T: Deserialize<'de>> Visitor<'de> for First<T> {
-        type Value = Option<T>;
-        fn expecting(&self, f: &mut fmt::Formatter) -> fmt::Result {
-            f.write_str("a list")
-        }
-        fn visit_unit<E>(self) -> Result<Option<T>, E> {
-            Ok(None)
-        }
-        fn visit_seq<A: SeqAccess<'de>>(self, mut list: A) -> Result<Option<T>, A::Error> {
-            let first = list.next_element()?;
-            while list.next_element::<IgnoredAny>()?.is_some() {}
-            Ok(first)
-        }
-    }
-    list.deserialize_any(First(PhantomData))
 }
 
 /// Whether a finish or block reason is a content filter's verdict, final.

@@ -4,7 +4,6 @@
 mod decode;
 mod encode;
 
-use serde::de::value::{self, BorrowedStrDeserializer};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
@@ -170,7 +169,7 @@ const CLIENT_EXECUTED: [ItemType; 5] = [
 impl ItemType {
     /// The type an item's `type` field names; `None` when it names none.
     pub(crate) fn of(kind: Option<&Value>) -> Option<Self> {
-        word(kind?.as_str()?)
+        crate::json::tag(kind)
     }
 
     /// Whether an item of this type goes back to the model that produced it.
@@ -200,11 +199,6 @@ pub(crate) enum Status {
     Cancelled,
     Queued,
     InProgress,
-}
-
-/// The word of a wire vocabulary `name` is; `None` for one it lacks.
-pub(crate) fn word<'a, T: Deserialize<'a>>(name: &'a str) -> Option<T> {
-    T::deserialize(BorrowedStrDeserializer::<value::Error>::new(name)).ok()
 }
 
 #[cfg(test)]
