@@ -145,7 +145,7 @@ impl Log for JsonlLog {
         }
         let mut lines = Vec::new();
         for entry in entries {
-            serde_json::to_writer(&mut lines, entry)?;
+            entry.encode(&mut lines)?;
             lines.push(b'\n');
         }
         self.file.write_all(&lines)?;

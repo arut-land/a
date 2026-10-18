@@ -431,24 +431,31 @@ pub struct Frame(Arc<Vec<u8>>);
 
 impl Frame {
     pub fn new(msg: &DaemonMsg) -> io::Result<Self> {
-        Self::encode(msg)
-    }
-
-    /// The frame of `DaemonMsg::Entry(entry.clone())`, without the clone.
-    pub fn entry(entry: &Entry) -> io::Result<Self> {
-        #[derive(Serialize)]
-        #[serde(tag = "t", rename_all = "snake_case")]
-        enum Borrowed<'a> {
-            Entry(&'a Entry),
-        }
-        Self::encode(&Borrowed::Entry(entry))
-    }
-
-    fn encode(msg: &impl Serialize) -> io::Result<Self> {
-        // As much room as `serde_json::to_vec` starts with.
-        let mut bytes = Vec::with_capacity(128);
-        bytes.extend_from_slice(&[0; 4]);
+        let mut bytes = Self::start();
         serde_json::to_writer(&mut bytes, msg)?;
+        Self::finish(bytes)
+    }
+
+    /// The frame of `DaemonMsg::Entry(entry.clone())`, without the clone:
+    /// the entry's own JSON with the tag spliced in first, as serde puts it.
+    pub fn entry(entry: &Entry) -> io::Result<Self> {
+        let mut bytes = Self::start();
+        bytes.extend_from_slice(br#"{"t":"entry""#);
+        let at = bytes.len();
+        entry.encode(&mut bytes)?;
+        bytes[at] = b',';
+        Self::finish(bytes)
+    }
+
+    /// Room for the length, and as much again as `serde_json::to_vec`
+    /// starts with.
+    fn start() -> Vec<u8> {
+        let mut bytes = Vec::with_capacity(132);
+        bytes.extend_from_slice(&[0; 4]);
+        bytes
+    }
+
+    fn finish(mut bytes: Vec<u8>) -> io::Result<Self> {
         let len = u32::try_from(bytes.len() - 4)
             .ok()
             .filter(|&n| n <= MAX_FRAME)
@@ -459,6 +466,14 @@ impl Frame {
 
     pub fn as_bytes(&self) -> &[u8] {
         &self.0
+    }
+}
+
+impl Entry {
+    /// Appends the entry's JSON object to `out`. Encoded here, once, for
+    /// the reason [`Decode`] gives.
+    pub fn encode(&self, out: &mut Vec<u8>) -> serde_json::Result<()> {
+        serde_json::to_writer(out, self)
     }
 }
 
