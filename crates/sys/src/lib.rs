@@ -1,8 +1,14 @@
 //! Platform specifics. The only crate allowed to use `unsafe`.
 #![allow(unsafe_code)]
 
+#[cfg(unix)]
+mod runtime;
+
 use std::io;
 use std::path::{Path, PathBuf};
+
+#[cfg(unix)]
+pub use runtime::{Runtime, Staged, VERSION};
 
 /// Locations under the per-user home (`$A_HOME`, default `~/.a`).
 #[derive(Clone, Debug)]
@@ -47,6 +53,11 @@ impl Home {
     pub fn daemon_log(&self) -> PathBuf {
         self.root.join("logs").join("daemon.log")
     }
+
+    #[cfg(unix)]
+    pub fn runtime(&self) -> Runtime {
+        Runtime::new(self.root.join("runtime"))
+    }
 }
 
 /// The workspace a directory belongs to: the nearest ancestor holding `.git`
@@ -66,6 +77,14 @@ pub enum Signal {
     Terminate,
     /// SIGKILL.
     Kill,
+}
+
+/// Stable across builds, unlike `std`'s hashers, so every version of `a`
+/// finds the same socket and the same staging stamps.
+fn fnv1a(bytes: &[u8]) -> u64 {
+    bytes.iter().fold(0xcbf2_9ce4_8422_2325, |h, &b| {
+        (h ^ u64::from(b)).wrapping_mul(0x0100_0000_01b3)
+    })
 }
 
 #[cfg(unix)]
@@ -97,6 +116,8 @@ mod unix {
 
     use rustix::io::{FdFlags, fcntl_getfd, fcntl_setfd};
     use rustix::process::{self, getuid};
+
+    use super::fnv1a;
 
     /// Lets a spawned child inherit `listener`; returns its fd number.
     pub fn make_inheritable(listener: &UnixListener) -> io::Result<RawFd> {
@@ -146,14 +167,6 @@ mod unix {
 
     fn socket_dir() -> PathBuf {
         PathBuf::from(format!("/tmp/a-{}", getuid().as_raw()))
-    }
-
-    /// Stable across builds, unlike `std`'s hashers, so every version of `a`
-    /// finds the same socket.
-    fn fnv1a(bytes: &[u8]) -> u64 {
-        bytes.iter().fold(0xcbf2_9ce4_8422_2325, |h, &b| {
-            (h ^ u64::from(b)).wrapping_mul(0x0100_0000_01b3)
-        })
     }
 
     /// Identifies the current boot, so recorded pgids are never acted on after
