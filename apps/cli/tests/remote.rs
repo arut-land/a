@@ -87,14 +87,17 @@ fn bridge_speaks_the_protocol_over_stdio() {
     send(&ClientMsg::Hello {
         proto: PROTO,
         build: "far".into(),
+        min: None,
+        caps: protocol::Caps::NONE,
     });
     send(&ClientMsg::Attach {
         target: Target::New,
         workspace: "/w".into(),
         since: 0,
         env: None,
+        decl: protocol::ClientDecl::default(),
     });
-    send(&ClientMsg::Input { text: "hi".into() });
+    send(&ClientMsg::input("hi"));
     let mut recv = || read_frame::<DaemonMsg>(&mut stdout).unwrap().unwrap();
     assert!(matches!(recv(), DaemonMsg::Welcome { proto: PROTO, .. }));
     assert!(matches!(recv(), DaemonMsg::Attached { .. }));

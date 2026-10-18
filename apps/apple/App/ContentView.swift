@@ -41,8 +41,9 @@ struct SessionList: View {
                         Text(session.short).font(.body.monospaced())
                         Text(URL(filePath: session.workspace).lastPathComponent)
                             .font(.caption).foregroundStyle(.secondary)
-                        Text("\(session.entries) entries · \(session.clients) attached")
-                            .font(.caption2).foregroundStyle(.tertiary)
+                        Text("\(session.activity) · \(session.residency) · \(session.entries) entries · \(session.clients) attached")
+                            .font(.caption2)
+                            .foregroundStyle(session.requiresAction ? AnyShapeStyle(.orange) : AnyShapeStyle(.tertiary))
                     }
                     .tag(session.id)
                 }

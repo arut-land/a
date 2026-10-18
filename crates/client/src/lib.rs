@@ -11,20 +11,26 @@ use std::path::PathBuf;
 use std::thread;
 use std::time::{Duration, Instant};
 
-use protocol::{ClientMsg, DaemonMsg, Environment, read_frame, write_frame};
+use protocol::{
+    Caps, ClientDecl, ClientMsg, DaemonMsg, Environment, Target, read_frame, write_frame,
+};
 use sys::crash::{Crashes, Record};
 use sys::{Home, Signal, Staged};
 
 #[cfg(unix)]
-use protocol::PROTO;
+use protocol::{PROTO, Versions};
 #[cfg(unix)]
 use std::os::unix::net::UnixStream;
 
 /// The read half of a connection, over any byte stream.
 pub struct Reader(BufReader<Box<dyn Read + Send>>);
 
-/// The write half of a connection.
-pub struct Writer(Box<dyn Write + Send>);
+/// The write half of a connection. It numbers the mutations it sends.
+pub struct Writer {
+    out: Box<dyn Write + Send>,
+    /// The `client_seq` of the last mutation sent.
+    seq: u64,
+}
 
 /// A daemon connection, split so reading and writing can run on their own
 /// threads.
@@ -34,6 +40,19 @@ pub struct Connection {
     /// The far host's environment, as its bridge captured it; `None` for
     /// this machine's daemon.
     pub remote: Option<Environment>,
+    /// What the hello settled.
+    pub welcome: Welcome,
+}
+
+/// What the daemon's welcome settled for a connection.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct Welcome {
+    pub proto: u32,
+    /// The capabilities taken up: none from a daemon older than them.
+    pub caps: Caps,
+    /// This connection's id, as origins name it; 0 from a daemon older
+    /// than them.
+    pub client: u32,
 }
 
 impl Connection {
@@ -46,6 +65,27 @@ impl Connection {
         }
         let env = capture()?;
         Ok((sys::workspace_of(&env.cwd), env))
+    }
+
+    /// The attach to `target` from this connection's [`origin`], replaying
+    /// the entries after `since`; with the origin's environment when
+    /// `with_env`, else the session keeps the one it has.
+    ///
+    /// [`origin`]: Connection::origin
+    pub fn attach(&self, target: Target, since: u64, with_env: bool) -> io::Result<ClientMsg> {
+        let (workspace, env) = self.origin()?;
+        Ok(ClientMsg::Attach {
+            target,
+            workspace,
+            since,
+            env: with_env.then_some(env),
+            decl: ClientDecl::default(),
+        })
+    }
+
+    /// Sends each of `msgs`.
+    pub fn send_all(&mut self, msgs: &[ClientMsg]) -> io::Result<()> {
+        msgs.iter().try_for_each(|msg| self.writer.send(msg))
     }
 }
 
@@ -82,8 +122,29 @@ impl Reader {
 }
 
 impl Writer {
+    #[cfg(unix)]
+    pub(crate) fn new(out: Box<dyn Write + Send>) -> Self {
+        Self { out, seq: 0 }
+    }
+
+    /// Sends `msg`, numbering it first if it is a mutation without a
+    /// number: a daemon that takes up [`protocol::Cap::Ack`] answers it by
+    /// that number, which [`Writer::last_seq`] gives.
     pub fn send(&mut self, msg: &ClientMsg) -> io::Result<()> {
-        write_frame(&mut self.0, msg)
+        let mut numbered = msg.clone();
+        match numbered.client_seq_mut() {
+            Some(seq @ None) => {
+                self.seq += 1;
+                *seq = Some(self.seq);
+                write_frame(&mut self.out, &numbered)
+            }
+            _ => write_frame(&mut self.out, msg),
+        }
+    }
+
+    /// The `client_seq` of the last mutation sent.
+    pub const fn last_seq(&self) -> u64 {
+        self.seq
     }
 }
 
@@ -113,6 +174,20 @@ pub fn connect(
     staged: &Staged,
     on_drain: &dyn Fn(),
 ) -> io::Result<Connection> {
+    connect_with(endpoint, staged, on_drain, &|_| Ok(Vec::new()))
+}
+
+/// [`connect`], sending the messages `first` makes for the connection (an
+/// attach, say) right behind the hello rather than after the welcome, which
+/// saves a round trip. A daemon that does not welcome the client acts on
+/// none of them, so each retry sends them again.
+#[cfg(unix)]
+pub fn connect_with(
+    endpoint: &Endpoint,
+    staged: &Staged,
+    on_drain: &dyn Fn(),
+    first: &dyn Fn(&Connection) -> io::Result<Vec<ClientMsg>>,
+) -> io::Result<Connection> {
     // A daemon exiting (idle) as we connect, or draining, gets one more try
     // each.
     for _ in 0..3 {
@@ -125,7 +200,8 @@ pub fn connect(
             }
             Endpoint::Ssh(host) => (None, remote::open(host, staged)?),
         };
-        match hello(&mut conn.reader, &mut conn.writer, &staged.id) {
+        let first = first(&conn)?;
+        match hello(&mut conn, &staged.id, &first) {
             Ok(Greeting::Mismatch(supported)) => {
                 return Err(mismatch(endpoint, staged, supported));
             }
@@ -161,6 +237,16 @@ pub fn connect(
 }
 
 #[cfg(not(unix))]
+pub fn connect_with(
+    _endpoint: &Endpoint,
+    _staged: &Staged,
+    _on_drain: &dyn Fn(),
+    _first: &dyn Fn(&Connection) -> io::Result<Vec<ClientMsg>>,
+) -> io::Result<Connection> {
+    Err(unsupported())
+}
+
+#[cfg(not(unix))]
 fn unsupported() -> io::Error {
     io::Error::new(
         io::ErrorKind::Unsupported,
@@ -172,8 +258,9 @@ fn unsupported() -> io::Error {
 fn split(stream: &UnixStream) -> io::Result<Connection> {
     Ok(Connection {
         reader: Reader(BufReader::new(Box::new(stream.try_clone()?))),
-        writer: Writer(Box::new(stream.try_clone()?)),
+        writer: Writer::new(Box::new(stream.try_clone()?)),
         remote: None,
+        welcome: Welcome::default(),
     })
 }
 
@@ -181,7 +268,8 @@ fn split(stream: &UnixStream) -> io::Result<Connection> {
 enum Greeting {
     Welcome,
     Draining,
-    Mismatch(u32),
+    /// The daemon's versions.
+    Mismatch(Versions),
 }
 
 /// Why a daemon speaking another protocol cannot serve this client, and
@@ -189,34 +277,38 @@ enum Greeting {
 /// restarting the daemon would only start that build again: this `a` is
 /// the one to replace.
 #[cfg(unix)]
-fn mismatch(endpoint: &Endpoint, staged: &Staged, supported: u32) -> io::Error {
+fn mismatch(endpoint: &Endpoint, staged: &Staged, supported: Versions) -> io::Error {
     let ours = &staged.id;
+    let mine = Versions::OURS;
     let message = match endpoint {
         Endpoint::Local(home) => match home.runtime().current() {
             Some(current) if current != *ours => format!(
-                "the daemon runs a newer a ({current}, protocol {supported}) than this one \
-                 ({ours}, protocol {PROTO}); run {} instead, or update this a",
+                "the daemon runs a newer a ({current}, {supported}) than this one \
+                 ({ours}, {mine}); run {} instead, or update this a",
                 home.runtime().current_exe().display()
             ),
-            _ => format!(
-                "the daemon speaks protocol {supported}, this a {PROTO}; restart the daemon"
-            ),
+            _ => format!("the daemon speaks {supported}, this a {mine}; restart the daemon"),
         },
-        Endpoint::Ssh(host) => format!(
-            "the daemon on {host} speaks protocol {supported}, this a {PROTO}; \
-             update a on one side"
-        ),
+        Endpoint::Ssh(host) => {
+            format!("the daemon on {host} speaks {supported}, this a {mine}; update a on one side")
+        }
     };
     io::Error::new(io::ErrorKind::Unsupported, message)
 }
 
+/// Sends the hello and `first` back to back, then reads the answer.
 #[cfg(unix)]
-fn hello(reader: &mut Reader, writer: &mut Writer, build: &str) -> io::Result<Greeting> {
-    writer.send(&ClientMsg::Hello {
+fn hello(conn: &mut Connection, build: &str, first: &[ClientMsg]) -> io::Result<Greeting> {
+    conn.writer.send(&ClientMsg::Hello {
         proto: PROTO,
         build: build.to_owned(),
+        min: Versions::OURS.min_field(),
+        caps: Caps::ALL,
     })?;
-    let reply = reader.recv().map_err(|e| match e.kind() {
+    // A daemon that refuses the hello may hang up before reading these, so
+    // failing to send them matters only once welcomed.
+    let sent = conn.send_all(first);
+    let reply = conn.reader.recv().map_err(|e| match e.kind() {
         io::ErrorKind::WouldBlock | io::ErrorKind::TimedOut => {
             io::Error::new(io::ErrorKind::TimedOut, "the daemon is not responding")
         }
@@ -224,9 +316,24 @@ fn hello(reader: &mut Reader, writer: &mut Writer, build: &str) -> io::Result<Gr
         _ => e,
     })?;
     match reply {
-        Some(DaemonMsg::Welcome { .. }) => Ok(Greeting::Welcome),
+        Some(DaemonMsg::Welcome {
+            proto,
+            caps,
+            client,
+            ..
+        }) => {
+            sent?;
+            conn.welcome = Welcome {
+                proto,
+                caps,
+                client,
+            };
+            Ok(Greeting::Welcome)
+        }
         Some(DaemonMsg::Draining) => Ok(Greeting::Draining),
-        Some(DaemonMsg::Mismatch { supported }) => Ok(Greeting::Mismatch(supported)),
+        Some(DaemonMsg::Mismatch { supported, min }) => {
+            Ok(Greeting::Mismatch(Versions::new(min, supported)))
+        }
         _ => Err(io::ErrorKind::UnexpectedEof.into()),
     }
 }
@@ -472,14 +579,14 @@ mod tests {
         let new = build("new");
         let local = Endpoint::Local(home.clone());
 
-        let told = mismatch(&local, &old, PROTO + 1).to_string();
+        let told = mismatch(&local, &old, (PROTO + 1).into()).to_string();
         let current = home.runtime().current_exe();
         assert!(
             told.contains(&new.id) && told.contains(&*current.to_string_lossy()),
             "{told}"
         );
         assert!(!told.contains("restart"), "{told}");
-        let told = mismatch(&local, &new, PROTO + 1).to_string();
+        let told = mismatch(&local, &new, (PROTO + 1).into()).to_string();
         assert!(told.contains("restart the daemon"), "{told}");
         fs::remove_dir_all(&root).unwrap();
     }

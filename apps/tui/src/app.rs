@@ -230,6 +230,24 @@ impl App {
                     Style::fg(Color::Red),
                 ));
             }
+            Change::Snapshot { .. } => {
+                self.cache.clear();
+                self.anchor = None;
+                self.committed = self.committed.min(len);
+                self.tokens = self.view.items.iter().fold(
+                    Usage {
+                        input: 0,
+                        output: 0,
+                    },
+                    |sum, item| match item {
+                        Item::Reply { usage: Some(u), .. } => Usage {
+                            input: sum.input + u.input,
+                            output: sum.output + u.output,
+                        },
+                        _ => sum,
+                    },
+                );
+            }
             Change::Synced | Change::Draining => {}
         }
         None
@@ -282,10 +300,10 @@ impl App {
             Key::Esc => self.recap_hidden = true,
             Key::Char(c @ ('y' | 'n' | 'Y' | 'N')) if self.editor.is_empty() && asked.is_some() => {
                 let call = asked?;
-                return Some(Effect::Send(ClientMsg::Approve {
+                return Some(Effect::Send(ClientMsg::approve(
                     call,
-                    approved: c.eq_ignore_ascii_case(&'y'),
-                }));
+                    c.eq_ignore_ascii_case(&'y'),
+                )));
             }
             key => {
                 if let Edit::Submit(text) = self.editor.key(key) {
@@ -349,7 +367,7 @@ impl App {
             _ => {
                 self.anchor = None;
                 self.recap_hidden = true;
-                Effect::Send(ClientMsg::Input { text })
+                Effect::Send(ClientMsg::input(text))
             }
         })
     }
@@ -371,7 +389,7 @@ impl App {
 
     fn interrupt(&mut self) -> Effect {
         self.notice("stopping the turn (ctrl-d detaches)", false);
-        Effect::Send(ClientMsg::Interrupt)
+        Effect::Send(ClientMsg::INTERRUPT)
     }
 
     /// Ctrl-C when nothing runs: detaches; the session (and the daemon)
@@ -420,7 +438,7 @@ impl App {
                 self.stale(call);
             }
             Action::Approve(call, approved) => {
-                return Some(Effect::Send(ClientMsg::Approve { call, approved }));
+                return Some(Effect::Send(ClientMsg::approve(call, approved)));
             }
             Action::Pick(n) => {
                 let id = self.listed().nth(n)?.id;

@@ -2,21 +2,27 @@
 
 pub mod config;
 mod model;
+mod outbox;
 mod session;
 mod upgrade;
 
+use std::collections::VecDeque;
 use std::fs::{File, OpenOptions};
 use std::future::{Future, poll_fn};
 use std::io::{self, BufReader, Write};
 use std::path::PathBuf;
 use std::str::FromStr;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
-use std::sync::{Arc, Mutex, MutexGuard, PoisonError, mpsc};
+use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 use std::task::{Poll, Waker};
 use std::time::{Duration, Instant};
 use std::{mem, thread};
 
-use protocol::{ClientMsg, DaemonMsg, Frame, PROTO, SessionId, SessionSummary, Target, read_frame};
+use outbox::{Next, Outbox};
+use protocol::{
+    Activity, Cap, Caps, ClientDecl, ClientMsg, DaemonMsg, Environment, Frame, Origin, PROTO,
+    Rejection, Residency, Role, SessionId, SessionSummary, Target, Versions, read_frame,
+};
 use session::{Attachment, Session, Shared};
 use store::{Header, Jsonl, LogStore};
 use sys::Home;
@@ -317,6 +323,9 @@ impl Daemon {
                     workspace: slot.header.workspace.clone(),
                     entries: self.shared.store.count(slot.header.id).unwrap_or(0),
                     clients: 0,
+                    // Only a session with no work is unloaded.
+                    activity: Activity::Idle,
+                    residency: Residency::Hibernated,
                 },
             })
             .collect()
@@ -509,7 +518,7 @@ pub fn serve(listener: &UnixListener, home: &Home, config: &Config, build: &str)
         let (daemon, life) = (Arc::clone(&daemon), Arc::clone(&life));
         thread::spawn(move || {
             let _client = Client::new(&daemon);
-            if let Err(e) = handle(&daemon, &life, conn) {
+            if let Err(e) = handle(&daemon, &life, &conn) {
                 eprintln!("connection: {e}");
             }
         });
@@ -546,116 +555,286 @@ fn claim(home: &Home, build: &str) -> io::Result<File> {
     Ok(file)
 }
 
-#[cfg(unix)]
-fn handle(daemon: &Daemon, life: &Lifecycle, conn: UnixStream) -> io::Result<()> {
-    let mut reader = BufReader::new(conn.try_clone()?);
-    let (tx, rx) = mpsc::channel::<Frame>();
-    let mut writer = conn;
-    thread::spawn(move || {
-        for frame in rx {
-            if writer.write_all(frame.as_bytes()).is_err() {
-                break;
-            }
-        }
-    });
-    // The writer thread ends with the connection; a lost reply needs no
-    // handling here.
-    let reply = |msg| {
-        if let Ok(frame) = Frame::new(&msg) {
-            drop(tx.send(frame));
-        }
-    };
-    let error = |message: String| reply(DaemonMsg::Error { message });
+/// How long a client refused at its hello has to read the answer and hang
+/// up before the daemon does.
+const REFUSED_GRACE: Duration = Duration::from_secs(2);
 
-    let verdict = match read_frame(&mut reader)? {
-        Some(ClientMsg::Hello { proto, build }) => life.verdict(proto, &build),
-        _ => Verdict::Mismatch,
-    };
-    match verdict {
-        Verdict::Welcome => reply(DaemonMsg::Welcome {
-            proto: PROTO,
-            build: life.build.clone(),
-        }),
-        Verdict::Mismatch => {
-            reply(DaemonMsg::Mismatch { supported: PROTO });
-            return Ok(());
+/// How many answers to a connection's numbered mutations are kept for
+/// repeats.
+const ANSWERS_KEPT: usize = 64;
+
+/// The answer to a mutation: done, or refused and why.
+type Answer = Result<(), (Rejection, String)>;
+
+/// A connection's answers to its numbered mutations, so a repeat gets the
+/// same answer and is not done again.
+#[derive(Default)]
+struct Answers {
+    last: u64,
+    recent: VecDeque<(u64, Answer)>,
+}
+
+impl Answers {
+    /// The answer to mutation `seq`: `act`'s if it is new, else the one
+    /// given before.
+    fn answer(&mut self, seq: u64, act: impl FnOnce() -> Answer) -> Answer {
+        if seq <= self.last {
+            return self.recent.iter().find(|(s, _)| *s == seq).map_or_else(
+                || Err((Rejection::Stale, "a repeat too old to answer again".into())),
+                |(_, a)| a.clone(),
+            );
         }
-        Verdict::Drain => {
+        let answer = act();
+        self.last = seq;
+        if self.recent.len() == ANSWERS_KEPT {
+            self.recent.pop_front();
+        }
+        self.recent.push_back((seq, answer.clone()));
+        answer
+    }
+}
+
+/// Writes what `outbox` hands out until it closes, catching the client up
+/// when it falls behind.
+#[cfg(unix)]
+fn write_out(mut conn: UnixStream, outbox: &Outbox) {
+    while let Some(next) = outbox.next() {
+        match next {
+            Next::Write(frame) => {
+                if conn.write_all(frame.as_bytes()).is_err() {
+                    outbox.abandon();
+                    return;
+                }
+            }
+            Next::CatchUp {
+                session,
+                following,
+                since,
+            } => match session.upgrade() {
+                Some(session) => session.catch_up(outbox, following, since),
+                None => outbox.unfollow(),
+            },
+        }
+    }
+}
+
+#[cfg(unix)]
+fn handle(daemon: &Daemon, life: &Lifecycle, conn: &UnixStream) -> io::Result<()> {
+    let mut reader = BufReader::new(conn.try_clone()?);
+    let (verdict, theirs, caps) = match read_frame(&mut reader)? {
+        Some(ClientMsg::Hello {
+            proto,
+            build,
+            min,
+            caps,
+        }) => {
+            let theirs = Versions::new(min, proto);
+            (life.verdict(theirs, &build), theirs, caps & Caps::ALL)
+        }
+        _ => (Verdict::Mismatch, Versions::from(0), Caps::NONE),
+    };
+    let outbox = Outbox::new(caps);
+    let writer = outbox.clone();
+    let stream = conn.try_clone()?;
+    thread::spawn(move || write_out(stream, &writer));
+    // Whatever the client sent behind a hello that is not welcomed is read
+    // and dropped, never acted on.
+    let refuse = |reader: &mut BufReader<UnixStream>| {
+        let _ = io::copy(reader, &mut io::sink());
+    };
+    let result = match (verdict, Versions::OURS.common(theirs)) {
+        (Verdict::Welcome, Some(proto)) => {
+            let registered = life.register(outbox.clone());
+            let mut conn = Conn {
+                daemon,
+                life,
+                outbox: &outbox,
+                client: registered.client(),
+                attached: None,
+                decl: ClientDecl::default(),
+                answers: Answers::default(),
+            };
+            conn.reply(&DaemonMsg::Welcome {
+                proto,
+                build: life.build.clone(),
+                caps,
+                client: conn.client,
+            });
+            conn.serve(&mut reader)
+        }
+        (Verdict::Drain, _) => {
             life.drain();
             daemon.pulse.wake();
-            reply(DaemonMsg::Draining);
+            reply(&outbox, &DaemonMsg::Draining);
             // Held open until we exit: the client's cue to reconnect.
-            while read_frame::<ClientMsg>(&mut reader)?.is_some() {}
-            return Ok(());
+            refuse(&mut reader);
+            Ok(())
         }
-    }
-    let _registered = life.register(tx.clone());
+        _ => {
+            reply(
+                &outbox,
+                &DaemonMsg::Mismatch {
+                    supported: PROTO,
+                    min: Versions::OURS.min_field(),
+                },
+            );
+            conn.set_read_timeout(Some(REFUSED_GRACE))?;
+            refuse(&mut reader);
+            Ok(())
+        }
+    };
+    outbox.close();
+    result
+}
 
-    let set_env = |s: &Attachment, env| {
-        if let Err(e) = s.session().set_env(env) {
-            error(format!("recording the environment: {e}"));
-        }
-    };
-    let input = |s: &Option<Attachment>, text, steer: bool| match s {
-        Some(s) if steer => s.session().steer(text).unwrap_or_else(error),
-        Some(s) => s.session().submit(text).unwrap_or_else(error),
-        None => error("not attached".into()),
-    };
-    let mut attached: Option<Attachment> = None;
-    while let Some(msg) = read_frame(&mut reader)? {
-        match msg {
-            ClientMsg::Attach {
-                target,
-                workspace,
-                since,
-                env,
-            } => match daemon.resolve(&target, workspace) {
-                Ok(s) => {
-                    // Before the replay, so a client that saw itself
-                    // attached knows its environment is recorded.
-                    if let Some(env) = env {
-                        set_env(&s, env);
+fn reply(outbox: &Outbox, msg: &DaemonMsg) {
+    // The writer ends with the connection; a lost reply needs no handling.
+    if let Ok(frame) = Frame::new(msg) {
+        let _ = outbox.send(frame);
+    }
+}
+
+/// A welcomed connection.
+struct Conn<'a> {
+    daemon: &'a Daemon,
+    life: &'a Lifecycle,
+    outbox: &'a Outbox,
+    /// Its id, as origins name it.
+    client: u32,
+    attached: Option<Attachment>,
+    decl: ClientDecl,
+    answers: Answers,
+}
+
+impl Conn<'_> {
+    fn reply(&self, msg: &DaemonMsg) {
+        reply(self.outbox, msg);
+    }
+
+    fn error(&self, message: String) {
+        self.reply(&DaemonMsg::Error { message });
+    }
+
+    #[cfg(unix)]
+    fn serve(&mut self, reader: &mut BufReader<UnixStream>) -> io::Result<()> {
+        while let Some(mut msg) = read_frame::<ClientMsg>(reader)? {
+            if let Some(&mut client_seq) = msg.client_seq_mut() {
+                let answer = match client_seq {
+                    Some(seq) => {
+                        let mut answers = mem::take(&mut self.answers);
+                        let answer = answers.answer(seq, || self.mutate(msg));
+                        self.answers = answers;
+                        answer
                     }
-                    s.session().attach(&tx, since);
-                    session_event("attach", s.session().id, || format!("since {since}"));
-                    attached = Some(s);
-                }
-                Err(e) => error(e.to_string()),
-            },
-            ClientMsg::Environment(env) => match &attached {
-                Some(s) => set_env(s, env),
-                None => error("not attached".into()),
-            },
-            ClientMsg::Input { .. } | ClientMsg::Steer { .. } | ClientMsg::Approve { .. }
-                if life.draining().is_some() =>
-            {
-                error(
-                    "the daemon is restarting for an upgrade; send that again in a moment".into(),
-                );
+                    None => self.mutate(msg),
+                };
+                self.answered(client_seq, answer);
+                continue;
             }
-            ClientMsg::Input { text } => input(&attached, text, false),
-            ClientMsg::Steer { text } => input(&attached, text, true),
-            ClientMsg::Interrupt => match &attached {
-                Some(s) => s.session().interrupt(),
-                None => error("not attached".into()),
-            },
-            ClientMsg::Approve { call, approved } => match &attached {
-                Some(s) => {
-                    if let Err(message) = s.session().answer(call, approved) {
-                        error(message);
+            match msg {
+                ClientMsg::Attach {
+                    target,
+                    workspace,
+                    since,
+                    env,
+                    decl,
+                } => match self.daemon.resolve(&target, workspace) {
+                    Ok(s) => {
+                        self.decl = decl;
+                        // Before the replay, so a client that saw itself
+                        // attached knows its environment is recorded.
+                        if let Some(env) = env {
+                            self.set_env(&s, env);
+                        }
+                        s.session().attach(self.outbox, since);
+                        session_event("attach", s.session().id, || format!("since {since}"));
+                        self.attached = Some(s);
                     }
-                }
-                None => error("not attached".into()),
-            },
-            ClientMsg::List => reply(DaemonMsg::Sessions {
-                sessions: daemon.list(),
-            }),
-            ClientMsg::Detach => break,
-            ClientMsg::Hello { .. } => {}
+                    Err(e) => self.error(e.to_string()),
+                },
+                ClientMsg::Declare(decl) => self.decl = decl,
+                ClientMsg::Environment(env) => match &self.attached {
+                    Some(s) => self.set_env(s, env),
+                    None => self.error("not attached".into()),
+                },
+                ClientMsg::List => self.reply(&DaemonMsg::Sessions {
+                    sessions: self.daemon.list(),
+                }),
+                ClientMsg::Detach => break,
+                ClientMsg::Hello { .. }
+                | ClientMsg::Input { .. }
+                | ClientMsg::Steer { .. }
+                | ClientMsg::Approve { .. }
+                | ClientMsg::Interrupt { .. } => {}
+            }
+        }
+        self.outbox.unfollow();
+        Ok(())
+    }
+
+    fn set_env(&self, s: &Attachment, env: Environment) {
+        if let Err(e) = s.session().set_env(env) {
+            self.error(format!("recording the environment: {e}"));
         }
     }
-    Ok(())
+
+    /// Does mutation `msg`, if this client may.
+    fn mutate(&self, msg: ClientMsg) -> Answer {
+        let session = match &self.attached {
+            _ if self.decl.role == Role::Viewer => {
+                return Err((Rejection::ReadOnly, "this client is a viewer".into()));
+            }
+            Some(s) => s.session(),
+            None => return Err((Rejection::NotAttached, "not attached".into())),
+        };
+        match msg {
+            ClientMsg::Interrupt { .. } => {
+                session.interrupt();
+                Ok(())
+            }
+            _ if self.life.draining().is_some() => Err((
+                Rejection::Draining,
+                "the daemon is restarting for an upgrade; send that again in a moment".into(),
+            )),
+            ClientMsg::Input { text, .. } => session
+                .submit(text)
+                .map_err(|message| (Rejection::Refused, message)),
+            ClientMsg::Steer { text, .. } => session
+                .steer(text)
+                .map_err(|message| (Rejection::Refused, message)),
+            ClientMsg::Approve { call, approved, .. } => session
+                .answer(call, approved)
+                .map_err(|message| (Rejection::NotWaiting, message)),
+            _ => Err((Rejection::Other, "not a mutation".into())),
+        }
+    }
+
+    /// Tells the client the answer to its mutation `client_seq`: an ack
+    /// or rejection where it takes them, else an error for a refusal.
+    fn answered(&self, client_seq: Option<u64>, answer: Answer) {
+        match (client_seq, answer) {
+            (Some(client_seq), answer) if self.outbox.caps().has(Cap::Ack) => {
+                let origin = Origin {
+                    client: self.client,
+                    client_seq,
+                };
+                self.reply(&match answer {
+                    Ok(()) => DaemonMsg::Ack { origin },
+                    Err((reason, message)) => DaemonMsg::Rejected {
+                        origin,
+                        reason,
+                        message,
+                    },
+                });
+            }
+            (_, Err((_, message))) => self.error(message),
+            (_, Ok(())) => {}
+        }
+    }
 }
 
 #[cfg(test)]
 mod tests;
+
+#[cfg(all(test, unix))]
+mod conn_tests;

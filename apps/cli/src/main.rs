@@ -135,13 +135,23 @@ impl Ctx {
     /// terminal the user can restart it on the spot, elsewhere `a daemon
     /// restart` is suggested.
     fn connect(&self) -> io::Result<client::Connection> {
+        self.connect_with(&|_| Ok(Vec::new()))
+    }
+
+    /// [`Ctx::connect`], sending what `first` makes right behind the hello.
+    fn connect_with(
+        &self,
+        first: &dyn Fn(&client::Connection) -> io::Result<Vec<ClientMsg>>,
+    ) -> io::Result<client::Connection> {
         let on_drain = || eprintln!("[waiting for the previous daemon to finish its work]");
-        match client::connect(&self.endpoint, &self.staged, &on_drain) {
+        match client::connect_with(&self.endpoint, &self.staged, &on_drain, first) {
             Err(e)
                 if e.kind() == io::ErrorKind::TimedOut
                     && matches!(self.endpoint, Endpoint::Local(_)) =>
             {
-                recover(&self.home, &self.staged)
+                let mut conn = recover(&self.home, &self.staged)?;
+                conn.send_all(&first(&conn)?)?;
+                Ok(conn)
             }
             result => result,
         }
@@ -241,15 +251,7 @@ fn session(ctx: Ctx, target: Target) -> io::Result<()> {
 /// (or a remote daemon's), with this shell's environment (or the remote
 /// bridge's), replaying entries after `since`.
 fn attach(ctx: &Ctx, target: Target, since: u64) -> io::Result<client::Connection> {
-    let mut conn = ctx.connect()?;
-    let (workspace, env) = conn.origin()?;
-    conn.writer.send(&ClientMsg::Attach {
-        target,
-        workspace,
-        since,
-        env: Some(env),
-    })?;
-    Ok(conn)
+    ctx.connect_with(&move |conn| Ok(vec![conn.attach(target.clone(), since, true)?]))
 }
 
 /// The line-mode client. When the daemon drains for an upgrade, it
@@ -259,6 +261,7 @@ fn repl(ctx: Ctx, target: Target) -> io::Result<()> {
         mut reader,
         writer,
         remote,
+        ..
     } = attach(&ctx, target, 0)?;
     let remote = remote.is_some();
     let writer = Arc::new(Mutex::new(writer));
@@ -314,7 +317,7 @@ fn repl(ctx: Ctx, target: Target) -> io::Result<()> {
         let msg = match (line.trim(), asked) {
             ("", _) => continue,
             ("/detach", _) => break,
-            ("/interrupt", _) => ClientMsg::Interrupt,
+            ("/interrupt", _) => ClientMsg::INTERRUPT,
             // A remote host's environment is the one its bridge started
             // with; reattaching captures it again.
             ("/env refresh", _) if remote => {
@@ -330,17 +333,9 @@ fn repl(ctx: Ctx, target: Target) -> io::Result<()> {
                     continue;
                 }
             },
-            ("y" | "yes", Some(call)) => ClientMsg::Approve {
-                call,
-                approved: true,
-            },
-            ("n" | "no", Some(call)) => ClientMsg::Approve {
-                call,
-                approved: false,
-            },
-            (text, _) => ClientMsg::Input {
-                text: text.to_owned(),
-            },
+            ("y" | "yes", Some(call)) => ClientMsg::approve(call, true),
+            ("n" | "no", Some(call)) => ClientMsg::approve(call, false),
+            (text, _) => ClientMsg::input(text),
         };
         if let Err(e) = send(&msg) {
             eprintln!("[not sent: {e}]");
@@ -375,6 +370,15 @@ impl Screen {
                 let _ = io::stdout().flush();
             }
             Change::Added { item, .. } => added(item),
+            // Sent in place of a long replay: shown as the replay would be.
+            Change::Snapshot { items } => {
+                for item in items {
+                    added(item);
+                    for part in [Part::Approval, Part::Outcome] {
+                        self.updated(item, part);
+                    }
+                }
+            }
             Change::Updated { item, part, .. } => self.updated(item, *part),
             Change::Asked {
                 item: Item::Tool {
@@ -514,8 +518,10 @@ fn list(
 fn ls(ctx: &Ctx) -> io::Result<()> {
     for s in list(ctx.connect()?)? {
         println!(
-            "{}  {:>4} entries  {}",
+            "{}  {:<9}  {:<10}  {:>4} entries  {}",
             s.id.short(),
+            s.activity.name(),
+            s.residency.name(),
             s.entries,
             s.workspace.display()
         );

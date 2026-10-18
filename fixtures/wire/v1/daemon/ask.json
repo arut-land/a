@@ -1,0 +1,1 @@
+{"t":"ask","call":2,"tool":"bash","input":{"command":"ls"}}
