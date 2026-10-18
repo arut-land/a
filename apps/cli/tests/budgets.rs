@@ -55,3 +55,71 @@ fn an_idle_daemon_stays_under_10mb() {
     eprintln!("idle daemon RSS: {kib} KiB");
     assert!(kib < limit, "{kib} KiB over {limit} KiB");
 }
+
+#[test]
+fn the_terminal_client_paints_its_first_frame_within_16ms() {
+    let mut times: Vec<Duration> = (0..5)
+        .map(|run| {
+            let env = Env::new(&format!("tui-cold-{run}"));
+            assert!(env.cmd(&["ls"]).status().unwrap().success());
+            assert!(env.cmd(&["daemon", "stop"]).status().unwrap().success());
+            let term = env.tty(&[], 100, 30);
+            term.wait_for("● live");
+            term.first_frame().expect("no frame")
+        })
+        .collect();
+    times.sort();
+    let median = times[times.len() / 2];
+    let limit = latency_budget(Duration::from_millis(16));
+    eprintln!("terminal client, spawn to first frame: {times:?}");
+    assert!(
+        median < limit,
+        "median {median:?} over {limit:?}: {times:?}"
+    );
+}
+
+#[test]
+fn an_idle_terminal_client_does_not_run() {
+    let env = Env::new("tui-idle");
+    let term = env.tty(&[], 100, 30);
+    term.wait_for("● live");
+    std::thread::sleep(Duration::from_millis(500));
+    let pid = term.child.id();
+    let before = cpu_time(pid);
+    std::thread::sleep(Duration::from_secs(3));
+    let used = cpu_time(pid).saturating_sub(before);
+    let out = Command::new("ps")
+        .args(["-o", "rss=", "-p", &pid.to_string()])
+        .output()
+        .unwrap();
+    let rss = String::from_utf8_lossy(&out.stdout).trim().to_owned();
+    eprintln!("idle terminal client: {used:?} of CPU in 3 s, {rss} KiB RSS");
+    assert!(
+        used <= Duration::from_millis(10),
+        "{used:?} of CPU while idle"
+    );
+}
+
+/// A process's user and system time so far.
+fn cpu_time(pid: u32) -> Duration {
+    if let Ok(stat) = std::fs::read_to_string(format!("/proc/{pid}/stat")) {
+        // utime and stime, in clock ticks (100 a second), after the
+        // parenthesized command name.
+        let fields: Vec<&str> = stat
+            .rsplit_once(')')
+            .unwrap()
+            .1
+            .split_whitespace()
+            .collect();
+        let ticks = fields[11].parse::<u64>().unwrap() + fields[12].parse::<u64>().unwrap();
+        return Duration::from_millis(ticks * 10);
+    }
+    // `ps` elsewhere: M:SS.cc.
+    let out = Command::new("ps")
+        .args(["-o", "time=", "-p", &pid.to_string()])
+        .output()
+        .unwrap();
+    let text = String::from_utf8_lossy(&out.stdout);
+    let (min, sec) = text.trim().split_once(':').unwrap();
+    Duration::from_secs_f64(min.parse::<f64>().unwrap() * 60.0 + sec.parse::<f64>().unwrap())
+}

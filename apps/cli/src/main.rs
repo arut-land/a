@@ -72,10 +72,10 @@ enum DaemonCmd {
 fn main() -> ExitCode {
     let args = Args::parse();
     let result = Ctx::new(args.host).and_then(|ctx| match args.cmd {
-        None => repl(ctx, Target::New),
-        Some(Cmd::Resume { id: None, any }) => repl(ctx, Target::Latest { any_workspace: any }),
+        None => session(ctx, Target::New),
+        Some(Cmd::Resume { id: None, any }) => session(ctx, Target::Latest { any_workspace: any }),
         Some(Cmd::Resume { id: Some(id), .. } | Cmd::Attach { id }) => {
-            find(&ctx, &id).and_then(|id| repl(ctx, Target::Id(id)))
+            find(&ctx, &id).and_then(|id| session(ctx, Target::Id(id)))
         }
         Some(Cmd::Ls) => ls(&ctx),
         Some(Cmd::New) => new(&ctx),
@@ -211,6 +211,21 @@ fn daemon_cmd(ctx: &Ctx, action: &DaemonCmd) -> io::Result<()> {
         }
     }
     Ok(())
+}
+
+/// The full-screen client at a terminal, the line REPL anywhere else (or
+/// with `A_TUI=plain`).
+fn session(ctx: Ctx, target: Target) -> io::Result<()> {
+    match tui::viewport() {
+        Some(viewport) => {
+            let daemon = tui::Daemon {
+                endpoint: ctx.endpoint,
+                staged: ctx.staged,
+            };
+            tui::run(&daemon, target, viewport)
+        }
+        None => repl(ctx, target),
+    }
 }
 
 /// Connects and asks to attach to `target` from this directory's workspace

@@ -10,6 +10,7 @@ engine.workspace = true
 protocol.workspace = true
 sys.workspace = true
 serde_json.workspace = true
+tui.workspace = true
 usage-rs.workspace = true
 web = { workspace = true, optional = true }
 
@@ -20,6 +21,11 @@ web = ["dep:web"]
 
 [dev-dependencies]
 usage-rs = { workspace = true, features = ["spec"] }
+
+[target.'cfg(unix)'.dev-dependencies]
+# A pseudo-terminal for the black-box tests of the terminal client.
+rustix = { workspace = true, features = ["pty", "termios"] }
+unicode-width = { version = "0.2", default-features = false }
 
 [lints]
 workspace = true

@@ -3,6 +3,8 @@
 
 #[cfg(unix)]
 mod runtime;
+#[cfg(unix)]
+pub mod tty;
 
 use std::io;
 use std::path::{Path, PathBuf};

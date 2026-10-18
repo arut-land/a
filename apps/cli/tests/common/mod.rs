@@ -4,6 +4,8 @@
 
 #![allow(dead_code)]
 
+mod pty;
+
 use std::fs;
 use std::io::{BufRead, BufReader, Read, Write};
 use std::os::unix::net::UnixStream;
