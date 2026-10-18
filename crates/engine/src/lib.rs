@@ -6,13 +6,15 @@ mod session;
 mod upgrade;
 
 use std::fs::{File, OpenOptions};
+use std::future::{Future, poll_fn};
 use std::io::{self, BufReader, Write};
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 use std::str::FromStr;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError, mpsc};
-use std::thread;
+use std::task::{Poll, Waker};
 use std::time::{Duration, Instant};
+use std::{mem, thread};
 
 use protocol::{ClientMsg, DaemonMsg, Frame, PROTO, SessionId, SessionSummary, Target, read_frame};
 use session::{Attachment, Session, Shared};
@@ -100,6 +102,47 @@ impl Config {
     }
 }
 
+/// Where the daemon's events go: nowhere unless built with the `events`
+/// feature (to its log), so emitting them costs nothing.
+#[cfg(not(any(test, feature = "events")))]
+static EVENTS: rt::Noop = rt::Noop;
+#[cfg(all(feature = "events", not(test)))]
+static EVENTS: rt::Stderr = rt::Stderr;
+#[cfg(test)]
+static EVENTS: tests::Recorder = tests::Recorder::new();
+
+/// Emits the event `build` makes, building it only if anyone listens.
+#[inline]
+fn event(build: impl FnOnce() -> rt::Event) {
+    emit(&EVENTS, build);
+}
+
+#[inline]
+fn emit<E: rt::EventSink>(sink: &E, build: impl FnOnce() -> rt::Event) {
+    if E::ENABLED {
+        sink.emit(build);
+    }
+}
+
+/// [`event`], about session `id`.
+#[inline]
+fn session_event(name: &'static str, id: SessionId, detail: impl FnOnce() -> String) {
+    event(|| rt::Event {
+        name,
+        session: Some(id.to_string()),
+        detail: detail(),
+    });
+}
+
+/// Now, if anyone listens for events: for timing one.
+#[inline]
+fn stamp() -> Option<Instant> {
+    fn enabled<E: rt::EventSink>(_: &E) -> bool {
+        E::ENABLED
+    }
+    enabled(&EVENTS).then(Instant::now)
+}
+
 /// Every lock here guards state a panicking holder leaves consistent, so
 /// poisoning is ignored.
 fn lock<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
@@ -111,7 +154,44 @@ struct Daemon {
     slots: Mutex<Vec<Arc<Slot>>>,
     /// Open connections; any keeps the daemon alive.
     clients: AtomicUsize,
+    /// Wakes the supervisor when what it decides on may have changed.
+    pulse: Pulse,
 }
+
+/// A wake-up for one waiting task, remembered until it waits.
+#[derive(Default)]
+struct Pulse(Mutex<(bool, Option<Waker>)>);
+
+impl Pulse {
+    fn wake(&self) {
+        let mut pulse = lock(&self.0);
+        pulse.0 = true;
+        if let Some(waker) = pulse.1.take() {
+            waker.wake();
+        }
+    }
+
+    /// Waits for a wake, or until `deadline`; `true` if woken.
+    fn wait(&self, rt: &dyn rt::Runtime, deadline: Option<Instant>) -> impl Future<Output = bool> {
+        let mut sleep = deadline.map(|at| rt.sleep(at.saturating_duration_since(Instant::now())));
+        poll_fn(move |cx| {
+            let mut pulse = lock(&self.0);
+            if mem::take(&mut pulse.0) {
+                return Poll::Ready(true);
+            }
+            pulse.1 = Some(cx.waker().clone());
+            drop(pulse);
+            match sleep.as_mut().map(|sleep| sleep.as_mut().poll(cx)) {
+                Some(Poll::Ready(())) => Poll::Ready(false),
+                _ => Poll::Pending,
+            }
+        })
+    }
+}
+
+/// How often the supervisor checks whether background processes have
+/// ended, while any run: nothing tells it when they do.
+const JOBS_CHECK: Duration = Duration::from_secs(5);
 
 /// A session the daemon knows about. Its log is loaded, and its actor runs,
 /// only while `live` is set; otherwise it is hibernated and costs nothing.
@@ -158,6 +238,7 @@ impl Daemon {
             }),
             slots: Mutex::new(slots),
             clients: AtomicUsize::new(0),
+            pulse: Pulse::default(),
         });
         for slot in daemon.slots() {
             if daemon.shared.store.is_busy(slot.header.id)
@@ -249,9 +330,20 @@ impl Daemon {
             if live.as_ref().is_some_and(|s| s.idle_for() >= after)
                 && let Some(session) = live.take()
             {
+                session_event("hibernate", session.id, String::new);
                 session.stop();
             }
         }
+    }
+
+    /// When the next loaded session is due to hibernate, if one is idle.
+    fn next_hibernation(&self, after: Duration, now: Instant) -> Option<Instant> {
+        self.live()
+            .iter()
+            .map(|s| s.idle_for())
+            .filter(|idle| !idle.is_zero())
+            .map(|idle| now + after.saturating_sub(idle))
+            .min()
     }
 
     fn has_work(&self) -> bool {
@@ -276,66 +368,119 @@ impl Daemon {
     /// idle for `config.idle`, or once a drain has no work left or runs out
     /// of grace. Every entry is durable when written, so exiting is all a
     /// drain needs; unfinished calls recover in the next daemon.
-    async fn supervise(&self, life: &Lifecycle, config: &Config, socket: &Path, pid: File) {
+    ///
+    /// It sleeps until the next deadline or until [`Daemon::pulse`] says
+    /// something changed (a client came or went, a session's work began or
+    /// ended), so an idle daemon does not wake at all. While work runs it
+    /// holds off system sleep.
+    async fn supervise(&self, life: &Lifecycle, config: &Config, exit: Exit) {
+        // When the daemon last became idle.
         let mut since: Option<Instant> = None;
         // When a drain out of grace stopped the calls still running.
         let mut stopped: Option<Instant> = None;
+        let mut awake: Option<Option<sys::Awake>> = None;
         loop {
-            self.shared.rt.sleep(Duration::from_millis(250)).await;
+            let now = Instant::now();
+            event(|| rt::Event {
+                name: "wake",
+                session: None,
+                detail: String::new(),
+            });
+            #[cfg(unix)]
+            if let Err(e) = sys::log::rotate_stderr(&exit.log) {
+                eprintln!("rotating the log: {e}");
+            }
             self.hibernate(config.hibernate);
-            if let Some(began) = life.draining() {
-                if began.elapsed() >= config.drain && stopped.is_none() {
+            let draining = life.draining();
+            let busy = draining.is_some() || self.has_work();
+            if busy != awake.is_some() {
+                awake = busy.then(|| sys::Awake::hold("a: an agent is at work"));
+            }
+            let mut next = self.next_hibernation(config.hibernate, now);
+            if self.live().iter().any(|s| s.has_jobs()) {
+                next = Some(earliest(next, now + JOBS_CHECK));
+            }
+            if let Some(began) = draining {
+                if now >= began + config.drain && stopped.is_none() {
                     for session in self.live() {
                         session.interrupt();
                     }
-                    stopped = Some(Instant::now());
+                    stopped = Some(now);
                 }
                 // A stopped call gets the time its processes have to go
                 // and its outcome to commit.
-                let settled = stopped.is_some_and(|at| at.elapsed() >= agent::Kill::GRACE * 2);
-                if !self.has_work() || settled {
+                let settled = stopped.map(|at| at + agent::Kill::GRACE * 2);
+                if !self.has_work() || settled.is_some_and(|at| now >= at) {
                     for session in self.live() {
                         session.stop();
                     }
-                    exit(socket, pid, "drained for a newer build");
+                    exit.now("drained for a newer build");
                 }
-                continue;
-            }
-            if !self.idle() {
+                next = Some(earliest(next, settled.unwrap_or(began + config.drain)));
+            } else if self.idle() {
+                let at = *since.get_or_insert(now) + config.idle;
+                if now >= at {
+                    exit.now(&format!("idle for {}s", config.idle.as_secs()));
+                }
+                next = Some(earliest(next, at));
+            } else {
                 since = None;
-                continue;
             }
-            if since.get_or_insert_with(Instant::now).elapsed() >= config.idle {
-                exit(socket, pid, &format!("idle for {}s", config.idle.as_secs()));
+            // Whatever woke us counts as activity: idleness starts again.
+            if self.pulse.wait(&*self.shared.rt, next).await {
+                since = None;
             }
         }
     }
 }
 
-/// Unlinks the socket first so new clients spawn a fresh daemon (one that
-/// raced into our backlog sees EOF and retries), then releases the pid lock
-/// before the process closes its connections: a client reconnecting on EOF
-/// finds the lock free for the daemon it spawns.
-fn exit(socket: &Path, pid: File, why: &str) -> ! {
-    let _ = std::fs::remove_file(socket);
-    drop(pid);
-    eprintln!("{why}, exiting");
-    std::process::exit(0)
+fn earliest(a: Option<Instant>, b: Instant) -> Instant {
+    a.map_or(b, |a| a.min(b))
+}
+
+/// What the daemon lets go of when it exits.
+struct Exit {
+    socket: PathBuf,
+    /// The locked pid file; see [`claim`].
+    pid: File,
+    log: PathBuf,
+}
+
+impl Exit {
+    /// Unlinks the socket first so new clients spawn a fresh daemon (one
+    /// that raced into our backlog sees EOF and retries), then empties the
+    /// record (a clean exit is no crash) and releases the pid lock before
+    /// the process closes its connections: a client reconnecting on EOF
+    /// finds the lock free for the daemon it spawns.
+    fn now(self, why: &str) -> ! {
+        let _ = std::fs::remove_file(&self.socket);
+        let _ = self.pid.set_len(0);
+        drop(self.pid);
+        event(|| rt::Event {
+            name: "exit",
+            session: None,
+            detail: why.to_owned(),
+        });
+        eprintln!("{why}, exiting");
+        std::process::exit(0)
+    }
 }
 
 /// Counts one open connection for as long as it lives.
-struct Client<'a>(&'a AtomicUsize);
+struct Client<'a>(&'a Daemon);
 
 impl<'a> Client<'a> {
-    fn new(count: &'a AtomicUsize) -> Self {
-        count.fetch_add(1, Ordering::SeqCst);
-        Self(count)
+    fn new(daemon: &'a Daemon) -> Self {
+        daemon.clients.fetch_add(1, Ordering::SeqCst);
+        daemon.pulse.wake();
+        Self(daemon)
     }
 }
 
 impl Drop for Client<'_> {
     fn drop(&mut self) {
-        self.0.fetch_sub(1, Ordering::SeqCst);
+        self.0.clients.fetch_sub(1, Ordering::SeqCst);
+        self.0.pulse.wake();
     }
 }
 
@@ -345,17 +490,17 @@ impl Drop for Client<'_> {
 /// starts a new daemon.
 #[cfg(unix)]
 pub fn serve(listener: &UnixListener, home: &Home, config: &Config, build: &str) -> io::Result<()> {
-    let pid = claim(home)?;
+    let pid = claim(home, build)?;
     let daemon = Daemon::load(home, config)?;
     let life = Arc::new(Lifecycle::new(build.to_owned(), home.runtime()));
-    let (monitor, watch, config, socket) = (
-        Arc::clone(&daemon),
-        Arc::clone(&life),
-        config.clone(),
-        home.socket(),
-    );
+    let (monitor, watch, config) = (Arc::clone(&daemon), Arc::clone(&life), config.clone());
+    let exit = Exit {
+        socket: home.socket(),
+        pid,
+        log: home.daemon_log(),
+    };
     daemon.shared.rt.spawn(Box::pin(async move {
-        monitor.supervise(&watch, &config, &socket, pid).await;
+        monitor.supervise(&watch, &config, exit).await;
     }));
     // Connections block on their sockets, so each gets a thread of its own
     // and reaches the sessions' tasks through their mailboxes.
@@ -363,7 +508,7 @@ pub fn serve(listener: &UnixListener, home: &Home, config: &Config, build: &str)
         let conn = conn?;
         let (daemon, life) = (Arc::clone(&daemon), Arc::clone(&life));
         thread::spawn(move || {
-            let _client = Client::new(&daemon.clients);
+            let _client = Client::new(&daemon);
             if let Err(e) = handle(&daemon, &life, conn) {
                 eprintln!("connection: {e}");
             }
@@ -372,13 +517,15 @@ pub fn serve(listener: &UnixListener, home: &Home, config: &Config, build: &str)
     Ok(())
 }
 
-/// Takes the daemon lock for this process's lifetime and records our pid in
-/// it. While the lock is held the pid is guaranteed to be ours, which is what
-/// lets clients kill a wedged daemon safely.
-fn claim(home: &Home) -> io::Result<File> {
+/// Takes the daemon lock for this process's lifetime and records us in it
+/// ([`sys::crash::Record`]), noting first a previous daemon that died
+/// holding it. While the lock is held the pid is guaranteed to be ours,
+/// which is what lets clients kill a wedged daemon safely.
+fn claim(home: &Home, build: &str) -> io::Result<File> {
     let mut file = OpenOptions::new()
         .create(true)
         .truncate(false)
+        .read(true)
         .write(true)
         .open(home.daemon_pid_file())?;
     if file.try_lock().is_err() {
@@ -387,10 +534,15 @@ fn claim(home: &Home) -> io::Result<File> {
             "another daemon is running",
         ));
     }
-    file.set_len(0)?;
+    if let Some(dead) = sys::crash::reap(home, &mut file)? {
+        eprintln!(
+            "the previous daemon (pid {}) stopped without shutting down",
+            dead.pid
+        );
+    }
     // Not synced: clients read it while we hold the lock, and after a crash
     // there is no lock to vouch for it.
-    write!(file, "{}", std::process::id())?;
+    write!(file, "{}", sys::crash::Record::current(build))?;
     Ok(file)
 }
 
@@ -430,6 +582,7 @@ fn handle(daemon: &Daemon, life: &Lifecycle, conn: UnixStream) -> io::Result<()>
         }
         Verdict::Drain => {
             life.drain();
+            daemon.pulse.wake();
             reply(DaemonMsg::Draining);
             // Held open until we exit: the client's cue to reconnect.
             while read_frame::<ClientMsg>(&mut reader)?.is_some() {}
@@ -459,6 +612,7 @@ fn handle(daemon: &Daemon, life: &Lifecycle, conn: UnixStream) -> io::Result<()>
                         set_env(&s, env);
                     }
                     s.session().attach(&tx, since);
+                    session_event("attach", s.session().id, || format!("since {since}"));
                     attached = Some(s);
                 }
                 Err(e) => error(e.to_string()),

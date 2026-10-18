@@ -328,3 +328,94 @@ fn watches_rearm_after_a_crash_and_fire_once() {
         assert_eq!(fired(log), [&slept], "{log:#?}");
     }
 }
+
+/// Keeps every event the daemon emits in tests.
+pub struct Recorder(std::sync::Mutex<Vec<rt::Event>>);
+
+impl Recorder {
+    pub const fn new() -> Self {
+        Self(std::sync::Mutex::new(Vec::new()))
+    }
+
+    fn count(&self, name: &str) -> usize {
+        crate::lock(&self.0)
+            .iter()
+            .filter(|e| e.name == name)
+            .count()
+    }
+
+    fn of(&self, session: SessionId) -> Vec<rt::Event> {
+        let session = session.to_string();
+        crate::lock(&self.0)
+            .iter()
+            .filter(|e| e.session.as_ref() == Some(&session))
+            .cloned()
+            .collect()
+    }
+}
+
+impl rt::EventSink for Recorder {
+    const ENABLED: bool = true;
+
+    fn emit(&self, event: impl FnOnce() -> rt::Event) {
+        crate::lock(&self.0).push(event());
+    }
+}
+
+fn wait_until(what: &str, done: impl Fn() -> bool) {
+    let deadline = Instant::now() + Duration::from_secs(10);
+    while !done() {
+        assert!(Instant::now() < deadline, "{what} never happened");
+        std::thread::sleep(Duration::from_millis(5));
+    }
+}
+
+#[test]
+fn the_supervisor_sleeps_until_a_deadline_and_never_polls() {
+    use super::{EVENTS, Exit, Lifecycle};
+
+    let (root, home) = home("supervise");
+    std::fs::create_dir_all(&root).unwrap();
+    let config = Config {
+        idle: Duration::from_secs(3600),
+        hibernate: Duration::from_millis(300),
+        ..echo()
+    };
+    let daemon = Daemon::load(&home, &config).unwrap();
+    let exit = Exit {
+        socket: root.join("socket"),
+        pid: std::fs::File::create(root.join("pid")).unwrap(),
+        log: root.join("log"),
+    };
+    let life = Lifecycle::new("test".into(), home.runtime());
+    let supervisor = std::sync::Arc::clone(&daemon);
+    daemon.shared.rt.spawn(Box::pin(async move {
+        supervisor.supervise(&life, &config, exit).await;
+    }));
+    wait_until("the first look", || EVENTS.count("wake") > 0);
+
+    let attachment = daemon.resolve(&Target::New, "/w".into()).unwrap();
+    let id = attachment.session().id;
+    attachment.session().submit("$ true".into()).unwrap();
+    settle(&daemon);
+    let detached = Instant::now();
+    drop(attachment);
+    let hibernated = || daemon.slots()[0].live.lock().unwrap().is_none();
+    wait_until("hibernation", hibernated);
+    let after = detached.elapsed();
+
+    // Nothing is due for an hour: nothing wakes the supervisor.
+    let wakes = EVENTS.count("wake");
+    std::thread::sleep(Duration::from_secs(1));
+    let idle_wakes = EVENTS.count("wake") - wakes;
+    let names: Vec<_> = EVENTS.of(id).iter().map(|e| e.name).collect();
+    std::fs::remove_dir_all(&root).unwrap();
+
+    assert!(
+        after >= Duration::from_millis(300),
+        "hibernated after {after:?}"
+    );
+    assert_eq!(idle_wakes, 0);
+    assert!(wakes < 20, "{wakes} wakes for one turn");
+    assert_eq!(names, ["step", "effect", "step", "hibernate"]);
+}

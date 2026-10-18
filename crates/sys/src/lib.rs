@@ -1,25 +1,31 @@
 //! Platform specifics. The only crate allowed to use `unsafe`.
 #![allow(unsafe_code)]
 
+mod awake;
 pub mod config;
+pub mod crash;
 #[cfg(unix)]
 pub mod install;
+pub mod log;
 #[cfg(unix)]
 mod login;
 #[cfg(unix)]
 mod runtime;
 #[cfg(unix)]
 pub mod tty;
+mod workspace;
 
 use std::fs::File;
 use std::io;
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 
+pub use awake::Awake;
 pub use config::Config;
 #[cfg(unix)]
 pub use login::login_env;
 #[cfg(unix)]
 pub use runtime::{Runtime, Staged, VERSION};
+pub use workspace::{GitEnv, workspace_in, workspace_of};
 
 /// Locations under the per-user home (`$A_HOME`, default `~/.a`).
 #[derive(Clone, Debug)]
@@ -67,8 +73,29 @@ impl Home {
         self.root.join("spill")
     }
 
+    pub fn logs_dir(&self) -> PathBuf {
+        self.root.join("logs")
+    }
+
     pub fn daemon_log(&self) -> PathBuf {
-        self.root.join("logs").join("daemon.log")
+        self.logs_dir().join("daemon.log")
+    }
+
+    /// The daemon's crash reports; see [`crash`].
+    pub fn crash_dir(&self) -> PathBuf {
+        self.root.join("crash")
+    }
+
+    /// Content-addressed attachments too large for a log.
+    pub fn blobs_dir(&self) -> PathBuf {
+        self.root.join("blobs")
+    }
+
+    /// A link to the daemon socket, where a person looking under the home
+    /// finds it. Clients connect to the socket itself, whose path is short
+    /// enough for `sun_path` wherever the home is.
+    pub fn socket_link(&self) -> PathBuf {
+        self.run_dir().join("daemon.sock")
     }
 
     /// The user's settings; see [`Config`].
@@ -82,16 +109,6 @@ impl Home {
     }
 }
 
-/// The workspace a directory belongs to: the nearest ancestor holding `.git`
-/// (a directory, or a file for worktrees and submodules), else the directory.
-pub fn workspace_of(dir: &Path) -> PathBuf {
-    let dir = std::fs::canonicalize(dir).unwrap_or_else(|_| dir.to_path_buf());
-    dir.ancestors()
-        .find(|d| d.join(".git").exists())
-        .unwrap_or(&dir)
-        .to_path_buf()
-}
-
 /// How [`signal_process`] asks a process to go.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Signal {
@@ -103,6 +120,7 @@ pub enum Signal {
 
 /// Stable across builds, unlike `std`'s hashers, so every version of `a`
 /// finds the same socket and the same staging stamps.
+#[cfg(unix)]
 fn fnv1a(bytes: &[u8]) -> u64 {
     bytes.iter().fold(0xcbf2_9ce4_8422_2325, |h, &b| {
         (h ^ u64::from(b)).wrapping_mul(0x0100_0000_01b3)
@@ -130,6 +148,11 @@ pub fn signal_group(_pgid: u32, _signal: Signal) -> io::Result<()> {
 #[cfg(not(unix))]
 pub fn group_alive(_pgid: u32) -> bool {
     false
+}
+
+#[cfg(not(unix))]
+pub fn process_started(_pid: u32) -> Option<u64> {
+    None
 }
 
 #[cfg(not(unix))]
@@ -174,12 +197,21 @@ mod unix {
             socket_dir().join(format!("{hash:016x}.sock"))
         }
 
-        /// Binds the daemon socket, replacing a stale one.
+        /// Binds the daemon socket, replacing a stale one, and points
+        /// [`super::Home::socket_link`] at it.
         pub fn bind(&self) -> io::Result<UnixListener> {
             prepare_socket_dir()?;
             let socket = self.socket();
             let _ = fs::remove_file(&socket);
-            UnixListener::bind(socket)
+            let listener = UnixListener::bind(&socket)?;
+            let link = self.socket_link();
+            if fs::read_link(&link).ok().as_ref() != Some(&socket) {
+                let _ = fs::remove_file(&link);
+                // Only a convenience: a home on a filesystem without
+                // symlinks still works.
+                let _ = std::os::unix::fs::symlink(&socket, &link);
+            }
+            Ok(listener)
         }
     }
 
@@ -230,6 +262,48 @@ mod unix {
             .ok()?;
         let id = String::from_utf8(out.stdout).ok()?;
         Some(id.trim().to_owned()).filter(|id| !id.is_empty())
+    }
+
+    /// When the OS says process `pid` started, in its own units: equal for
+    /// one process, different for a later one reusing the pid. `None` when
+    /// there is no such process.
+    #[cfg(target_os = "linux")]
+    pub fn process_started(pid: u32) -> Option<u64> {
+        let stat = fs::read_to_string(format!("/proc/{pid}/stat")).ok()?;
+        // Field 22, counting from the pid; the command name before it, in
+        // parentheses, may hold spaces.
+        let (_, rest) = stat.rsplit_once(')')?;
+        rest.split_whitespace().nth(19)?.parse().ok()
+    }
+
+    /// When the OS says process `pid` started, in microseconds since the
+    /// epoch. `None` when there is no such process.
+    #[cfg(target_vendor = "apple")]
+    pub fn process_started(pid: u32) -> Option<u64> {
+        let mut info = std::mem::MaybeUninit::<libc::proc_bsdinfo>::zeroed();
+        let size = i32::try_from(size_of::<libc::proc_bsdinfo>()).ok()?;
+        // SAFETY: `info` is a writable buffer of exactly `size` bytes, as
+        // the flavor requires; the call writes at most that.
+        let written = unsafe {
+            libc::proc_pidinfo(
+                i32::try_from(pid).ok()?,
+                libc::PROC_PIDTBSDINFO,
+                0,
+                info.as_mut_ptr().cast(),
+                size,
+            )
+        };
+        if written != size {
+            return None;
+        }
+        // SAFETY: the call filled the whole struct.
+        let info = unsafe { info.assume_init() };
+        Some(info.pbi_start_tvsec * 1_000_000 + info.pbi_start_tvusec)
+    }
+
+    #[cfg(not(any(target_os = "linux", target_vendor = "apple")))]
+    pub fn process_started(_pid: u32) -> Option<u64> {
+        None
     }
 
     /// Sends SIGKILL to a whole process group.
@@ -358,11 +432,10 @@ pub fn sync_data(file: &File) -> io::Result<()> {
     file.sync_data()
 }
 
-#[cfg(test)]
+#[cfg(all(test, unix))]
 mod tests {
     use super::*;
 
-    #[cfg(unix)]
     #[test]
     fn kills_a_whole_process_group() {
         use std::os::unix::process::CommandExt;
@@ -377,7 +450,6 @@ mod tests {
         assert!(boot_id().is_some_and(|id| !id.is_empty()));
     }
 
-    #[cfg(unix)]
     #[test]
     fn a_new_session_leads_its_own_group_and_names_signals() {
         let mut cmd = std::process::Command::new("sleep");
@@ -391,18 +463,5 @@ mod tests {
         assert_eq!(signal_name(9), "SIGKILL");
         assert_eq!(signal_name(15), "SIGTERM");
         assert_eq!(signal_name(6), "SIGABRT");
-    }
-
-    #[test]
-    fn workspace_is_git_root_or_dir() {
-        let tmp = std::env::temp_dir().join(format!("a-ws-{}", std::process::id()));
-        let nested = tmp.join("repo/src/deep");
-        std::fs::create_dir_all(&nested).unwrap();
-        let plain = workspace_of(&nested);
-        std::fs::create_dir_all(tmp.join("repo/.git")).unwrap();
-        let repo = workspace_of(&nested);
-        std::fs::remove_dir_all(&tmp).unwrap();
-        assert!(plain.ends_with("repo/src/deep"));
-        assert!(repo.ends_with("repo"));
     }
 }

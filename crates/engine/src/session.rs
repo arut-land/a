@@ -347,8 +347,13 @@ impl Session {
         }
     }
 
+    /// Notes activity, and tells the daemon's supervisor, which decides
+    /// on hibernation and idle exit.
     fn touch(&self) {
         *lock(&self.last_active) = Instant::now();
+        if let Some(daemon) = self.shared.daemon.upgrade() {
+            daemon.pulse.wake();
+        }
     }
 
     fn lock(&self) -> MutexGuard<'_, State> {
@@ -576,6 +581,8 @@ impl Session {
     /// as anything is in flight, and commits what it recorded. Returns
     /// whether it all went well.
     async fn work(&self, job: impl Future<Output = io::Result<()>>) -> bool {
+        let began = crate::stamp();
+        self.touch();
         if let Err(e) = self.mark_busy(true).await {
             self.warn(format_args!("busy marker: {e}"));
         }
@@ -586,6 +593,11 @@ impl Session {
         if let Err(e) = &done {
             self.warn(e);
         }
+        crate::session_event("step", self.id, || {
+            let elapsed = began.map_or(Duration::ZERO, |t| t.elapsed());
+            let how = if done.is_ok() { "done" } else { "failed" };
+            format!("{how} in {elapsed:?}")
+        });
         let settled = self.queued.fetch_sub(1, Ordering::SeqCst) == 1;
         if settled && let Err(e) = self.mark_busy(false).await {
             self.warn(format_args!("busy marker: {e}"));
@@ -796,8 +808,19 @@ impl Session {
     }
 
     async fn run_tool(&self, call: u64, tool: &str, input: &Value) -> Outcome {
+        let began = crate::stamp();
         let effect = Effect::new(self, call);
-        contain(self.shared.registry.tools().run(tool, input, &effect.cx())).await
+        let outcome = contain(self.shared.registry.tools().run(tool, input, &effect.cx())).await;
+        crate::session_event("effect", self.id, || {
+            let elapsed = began.map_or(Duration::ZERO, |t| t.elapsed());
+            let how = match &outcome {
+                Outcome::Done { .. } => "done",
+                Outcome::Failed { .. } => "failed",
+                Outcome::Interrupted => "interrupted",
+            };
+            format!("{tool} call {call}: {how} in {elapsed:?}")
+        });
+        outcome
     }
 
     /// Runs slash command `/name args`: logged, but no turn for the agent.

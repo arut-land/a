@@ -159,6 +159,9 @@ fn recover(home: &Home, staged: &Staged) -> io::Result<client::Connection> {
         client::HELLO_TIMEOUT.as_secs()
     );
     eprintln!("  log: {}", d.log.display());
+    if let Some(note) = d.crash_note() {
+        eprintln!("  {note}");
+    }
     if !io::stdin().is_terminal() {
         return Err(io::Error::new(
             io::ErrorKind::TimedOut,
@@ -203,6 +206,9 @@ fn daemon_cmd(ctx: &Ctx, action: &DaemonCmd) -> io::Result<()> {
                 }
             }
             println!("log: {}", d.log.display());
+            if let Some(note) = d.crash_note() {
+                println!("{note}");
+            }
         }
         DaemonCmd::Stop => {
             let stopped = client::stop(home)?;
@@ -555,6 +561,7 @@ fn web(_ctx: Ctx, _open: bool) -> io::Result<()> {
 #[cfg(unix)]
 fn daemon(ctx: &Ctx, listen_fd: Option<i32>) -> io::Result<()> {
     let home = &ctx.home;
+    sys::crash::install(home.crash_dir(), ctx.staged.id.clone());
     let listener = if let Some(fd) = listen_fd {
         sys::detach_session()?;
         sys::adopt_listener(fd)?

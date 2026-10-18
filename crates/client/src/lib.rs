@@ -12,6 +12,7 @@ use std::thread;
 use std::time::{Duration, Instant};
 
 use protocol::{ClientMsg, DaemonMsg, Environment, PROTO, read_frame, write_frame};
+use sys::crash::{Crashes, Record};
 use sys::{Home, Signal};
 
 #[cfg(unix)]
@@ -211,7 +212,11 @@ fn hello(reader: &mut Reader, writer: &mut Writer, build: &str) -> io::Result<Gr
 pub struct Diagnosis {
     /// The pid recorded by a daemon that still holds its lock.
     pub pid: Option<u32>,
+    /// What that daemon recorded about itself.
+    pub record: Option<Record>,
     pub log: PathBuf,
+    /// Recent crashes, and whether clients have stopped respawning.
+    pub crashes: Crashes,
 }
 
 impl Diagnosis {
@@ -223,53 +228,97 @@ impl Diagnosis {
         tail.reverse();
         tail
     }
-}
 
-pub fn diagnose(home: &Home) -> Diagnosis {
-    Diagnosis {
-        pid: live_daemon(home),
-        log: home.daemon_log(),
+    /// What to tell a person about recent crashes, if anything.
+    pub fn crash_note(&self) -> Option<String> {
+        let last = self.crashes.last.as_ref()?;
+        let summary = fs::read_to_string(last)
+            .ok()
+            .and_then(|text| text.lines().next().map(str::to_owned))
+            .unwrap_or_default();
+        let breaker = if self.crashes.tripped() {
+            format!(
+                "; it crashed {} times in a row soon after starting, so it is not restarted \
+                 automatically (`a daemon restart` tries again)",
+                self.crashes.young
+            )
+        } else {
+            String::new()
+        };
+        Some(format!(
+            "last crash: {summary} ({}){breaker}",
+            last.display()
+        ))
     }
 }
 
-/// The running daemon's pid. Only trusted while the daemon holds its lock:
-/// if we can take the lock, the daemon is gone and the pid may be reused.
-fn live_daemon(home: &Home) -> Option<u32> {
+pub fn diagnose(home: &Home) -> Diagnosis {
+    let record = live_daemon(home);
+    Diagnosis {
+        pid: record.as_ref().map(|r| r.pid),
+        record,
+        log: home.daemon_log(),
+        crashes: Crashes::of(home),
+    }
+}
+
+/// The running daemon's record. Only trusted while the daemon holds its
+/// lock: if we can take the lock, the daemon is gone and the pid may be
+/// reused.
+fn live_daemon(home: &Home) -> Option<Record> {
     let file = File::open(home.daemon_pid_file()).ok()?;
     if file.try_lock().is_ok() {
         return None;
     }
     fs::read_to_string(home.daemon_pid_file())
         .ok()?
-        .trim()
         .parse()
         .ok()
 }
 
 /// Stops the daemon: SIGTERM, then SIGKILL if it still holds its lock after
-/// `HELLO_TIMEOUT`. Returns whether a daemon was running.
+/// `HELLO_TIMEOUT`. Each signal goes only to the process the daemon
+/// recorded, checked by its start time as well as its pid. Returns whether
+/// a daemon was running.
 pub fn stop(home: &Home) -> io::Result<bool> {
-    let Some(pid) = live_daemon(home) else {
+    let Some(daemon) = live_daemon(home) else {
         return Ok(false);
     };
-    sys::signal_process(pid, Signal::Terminate)?;
+    let signal = |signal| {
+        if !daemon.is_live() {
+            return Err(io::Error::other(format!(
+                "pid {} is no longer the daemon that recorded it; not signalling it",
+                daemon.pid
+            )));
+        }
+        sys::signal_process(daemon.pid, signal)
+    };
+    signal(Signal::Terminate)?;
     let deadline = Instant::now() + HELLO_TIMEOUT;
-    // The held lock proves `pid` is still the daemon, so signalling it again
-    // is safe.
-    while live_daemon(home) == Some(pid) {
-        if Instant::now() >= deadline {
-            sys::signal_process(pid, Signal::Kill)?;
+    let mut killed = false;
+    while live_daemon(home).is_some_and(|d| d.pid == daemon.pid) {
+        if Instant::now() >= deadline && !killed {
+            signal(Signal::Kill)?;
+            killed = true;
         }
         thread::sleep(Duration::from_millis(20));
     }
     let _ = fs::remove_file(home.socket());
+    // Stopped on purpose: the record it left is not a crash.
+    if let Ok(file) = File::options().write(true).open(home.daemon_pid_file())
+        && file.try_lock().is_ok()
+    {
+        file.set_len(0)?;
+    }
     Ok(true)
 }
 
-/// Stops any running daemon and connects to a fresh one.
+/// Stops any running daemon and connects to a fresh one, even after the
+/// crash-loop breaker stopped respawning it.
 #[cfg(unix)]
 pub fn restart(home: &Home, staged: &Staged) -> io::Result<Connection> {
     stop(home)?;
+    sys::crash::reset(home)?;
     connect(&Endpoint::Local(home.clone()), staged, &|| {})
 }
 
@@ -336,6 +385,18 @@ fn connect_or_spawn(home: &Home) -> io::Result<UnixStream> {
     if let Ok(stream) = UnixStream::connect(&socket) {
         return Ok(stream);
     }
+    sys::crash::reap_unlocked(home)?;
+    let crashes = Crashes::of(home);
+    if crashes.tripped() {
+        let report = crashes
+            .last
+            .map_or_else(String::new, |p| format!("; see {}", p.display()));
+        return Err(io::Error::other(format!(
+            "the daemon crashed {} times in a row soon after starting{report}; \
+             `a daemon restart` tries again",
+            crashes.young
+        )));
+    }
 
     let listener = home.bind()?;
     let fd = sys::make_inheritable(&listener)?;
@@ -393,5 +454,60 @@ mod tests {
         let told = mismatch(&local, &new, PROTO + 1).to_string();
         assert!(told.contains("restart the daemon"), "{told}");
         fs::remove_dir_all(&root).unwrap();
+    }
+
+    fn scratch(name: &str) -> (PathBuf, Home) {
+        let root = std::env::temp_dir().join(format!("a-client-{name}-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&root);
+        fs::create_dir_all(root.join("run")).unwrap();
+        (root.clone(), Home::from(root))
+    }
+
+    #[test]
+    fn a_tripped_breaker_stops_the_respawning() {
+        let (root, home) = scratch("breaker");
+        let dead = Record {
+            pid: 999_997,
+            ..Record::current("b1")
+        };
+        for _ in 0..sys::crash::LIMIT {
+            fs::write(home.daemon_pid_file(), dead.to_string()).unwrap();
+            sys::crash::reap_unlocked(&home).unwrap();
+        }
+        let told = connect_or_spawn(&home).unwrap_err().to_string();
+        let note = diagnose(&home).crash_note().unwrap();
+        fs::remove_dir_all(&root).unwrap();
+        assert!(
+            told.contains("crashed 3 times") && told.contains("a daemon restart"),
+            "{told}"
+        );
+        assert!(
+            note.contains("pid 999997") && note.contains("not restarted"),
+            "{note}"
+        );
+    }
+
+    #[test]
+    fn stop_signals_only_the_process_that_recorded_itself() {
+        let (root, home) = scratch("stop");
+        let me = Record::current("b1");
+        // Another process now under the recorded pid: this one, which must
+        // not be signalled.
+        let impostor = Record {
+            token: Some(me.token.unwrap_or(0) + 1),
+            ..me
+        };
+        fs::write(home.daemon_pid_file(), impostor.to_string()).unwrap();
+        let held = File::open(home.daemon_pid_file()).unwrap();
+        held.lock().unwrap();
+        let stopped = stop(&home);
+        let pid = diagnose(&home).pid;
+        drop(held);
+        fs::remove_dir_all(&root).unwrap();
+        assert_eq!(pid, Some(std::process::id()));
+        if impostor.token.is_some() && sys::process_started(impostor.pid).is_some() {
+            let e = stopped.unwrap_err().to_string();
+            assert!(e.contains("no longer the daemon"), "{e}");
+        }
     }
 }

@@ -4,6 +4,10 @@ version.workspace = true
 edition.workspace = true
 publish.workspace = true
 
+[features]
+# The daemon's events, written to its log; see `EventSink`.
+events = []
+
 [dependencies]
 agent.workspace = true
 futures-core = { version = "0.3", default-features = false, features = ["std"] }
