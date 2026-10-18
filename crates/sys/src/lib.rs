@@ -11,6 +11,9 @@ pub mod log;
 mod login;
 #[cfg(unix)]
 mod runtime;
+#[cfg(not(unix))]
+#[path = "unstaged.rs"]
+mod runtime;
 #[cfg(unix)]
 pub mod tty;
 mod workspace;
@@ -23,7 +26,6 @@ pub use awake::Awake;
 pub use config::Config;
 #[cfg(unix)]
 pub use login::login_env;
-#[cfg(unix)]
 pub use runtime::{Runtime, Staged, VERSION};
 pub use workspace::{GitEnv, workspace_in, workspace_of};
 
@@ -103,7 +105,6 @@ impl Home {
         self.root.join("config.toml")
     }
 
-    #[cfg(unix)]
     pub fn runtime(&self) -> Runtime {
         Runtime::new(self.root.join("runtime"))
     }

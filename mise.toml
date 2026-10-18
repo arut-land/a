@@ -6,6 +6,8 @@ idiomatic_version_file_enable_tools = ["rust"]
 auto_install = true
 cargo.binstall_native = true
 cargo.binstall_only = false
+# Tool versions resolve through mise.lock, checksums included.
+lockfile = true
 
 [env]
 # Local secrets (gitignored), e.g. OPENAI_API_KEY and OPENAI_BASE_URL.
@@ -16,13 +18,19 @@ _.file = { path = ".env.local", redact = true }
 shell = "bash -o errexit -o pipefail -c"
 
 [tools]
-mr-boxington = "latest"
+mr-boxington = "1.24.1"
 "cargo:cargo-nextest" = "0.9"
 "cargo:cargo-deny" = "0.20"
-mold = { version = "latest", os = ["linux"] }
-hyperfine = "latest"
-"cargo:cargo-bloat" = "latest"
-"cargo:cargo-llvm-lines" = "latest"
+"cargo:cargo-machete" = "0.9.2"
+# Coverage-guided runs of the bolero targets (`mise run fuzz`).
+"cargo:cargo-bolero" = "0.13.5"
+mold = { version = "3.0.0", os = ["linux"] }
+hyperfine = "2.0.0"
+"cargo:cargo-bloat" = "0.12.1"
+"cargo:cargo-llvm-lines" = "0.4.48"
+# The usage CLI at the version of the usage-rs dependency, for completions
+# and the man page from apps/cli/a.usage.kdl.
+"aqua:jdx/usage" = "7.0.2"
 # The macOS app (apps/apple): the BoltFFI CLI at exactly the version of the
 # crates/ffi dependency, and XcodeGen for its project.
 "github:boltffi/boltffi" = { version = "0.31.1", os = ["macos"] }
@@ -48,7 +56,49 @@ bloat = "cargo bloat --release --crates -n 20"
 # writer) is what rewrites it.
 "generate:usage" = "UPDATE_USAGE=1 cargo test -q -p a --bin a embedded_spec"
 "bloat:lines" = "cargo llvm-lines --release -p a | head -30"
+# Shell completions and the man page, from the checked-in spec, into
+# target/generated. The completion scripts call `usage` on each Tab.
+"generate:completions" = '''
+mkdir -p target/generated/completions
+for shell in bash fish zsh nu powershell; do
+  usage generate completion "$shell" a -f apps/cli/a.usage.kdl > "target/generated/completions/a.$shell"
+done
+echo target/generated/completions
+'''
+"generate:man" = '''
+mkdir -p target/generated/man
+usage generate manpage -f apps/cli/a.usage.kdl -o target/generated/man/a.1
+echo target/generated/man/a.1
+'''
 deny = "cargo deny check"
+# Unused dependencies.
+machete = "cargo machete"
+# No core crate links the crate named exactly `tokio` (slab, bytes and the
+# rest of the tokio-rs org are fine). apps/web does, for topcoat's sync
+# primitives, and so does the default `a` build, which includes it.
+"check:no-tokio" = '''
+cargo tree -e normal --target all --workspace --exclude web --exclude a --prefix none -f '{p}' > target/no-tokio.txt
+cargo tree -e normal --target all -p a --no-default-features --prefix none -f '{p}' >> target/no-tokio.txt
+if grep -E '^tokio v' target/no-tokio.txt; then
+  echo "a core crate depends on tokio: cargo tree -i tokio shows which"
+  exit 1
+fi
+'''
+# Miri over sys, the one crate with unsafe code. Miri runs no processes and
+# (on macOS) sets no file times, so the tests that need either are skipped.
+"test:miri" = "MIRIFLAGS=-Zmiri-disable-isolation cargo miri test -p sys --lib -- --skip install:: --skip asks_a_shell --skip stages_newest --skip a_higher_version --skip tests::a_new_session --skip tests::kills"
+# Coverage-guided fuzzing (libFuzzer) of crates/protocol/tests/fuzz.rs:
+# each target, or the one named, for TIME. Crashes land in
+# crates/protocol/tests/__fuzz__/<target>/crashes, which every test run
+# replays; the corpus stays in target/fuzz.
+fuzz = { usage = '''
+arg "[target]" help="framer, json_decode or view_reducer; all by default"
+flag "-T --time <time>" default="60s"
+''', run = '''
+for target in ${usage_target:-framer json_decode view_reducer}; do
+  cargo bolero test -p protocol "$target" -T "$usage_time" --corpus-dir "target/fuzz/$target/corpus"
+done
+''' }
 # The black-box M1 acceptance tests (apps/cli/tests) on the dev build.
 acceptance = "cargo nextest run -p a --test acceptance --no-tests=fail"
 # `a web` on the dev build against an isolated home (target/web-home) and
@@ -62,9 +112,10 @@ target/debug/a web
 '''
 # The black-box web UI test (apps/cli/tests/web.rs) on the dev build.
 "test:web" = "cargo nextest run -p a --test web --no-tests=fail"
-# Release binary size, then cold start and idle daemon RSS on it. Latency is
-# only held to its budget off CI; shared runners get slack.
-budgets = { depends = ["size"], run = 'A_BIN=$PWD/target/release/a A_STRICT_BUDGETS=$([[ -n ${CI:-} ]] && echo 0 || echo 1) cargo nextest run -p a --test budgets --test-threads 1 --no-capture' }
+# Release binary size, then cold start, attach latency and idle daemon RSS
+# on it. Latency is held to its budget off CI, and on CI where the job sets
+# A_STRICT_BUDGETS=1; elsewhere shared runners get slack.
+budgets = { depends = ["size"], run = 'A_BIN=$PWD/target/release/a A_STRICT_BUDGETS=${A_STRICT_BUDGETS:-$([[ -n ${CI:-} ]] && echo 0 || echo 1)} cargo nextest run -p a --test budgets --test-threads 1 --no-capture' }
 
 # The macOS app (apps/apple). The FFI package: crates/ffi for macOS arm64
 # plus its Swift bindings, in apps/apple/Generated (pass --release for an

@@ -2,6 +2,41 @@
 
 lockfile_version = 3
 
+[[tools."aqua:jdx/usage"]]
+version = "7.0.2"
+backend = "aqua:jdx/usage"
+specifiers = ["7.0.2"]
+
+[tools."aqua:jdx/usage"."platforms.linux-arm64"]
+checksum = "sha256:2950ac2fffc9be15b24991a785b5474745e14df8e7fffa8aa8715c4bd9c8cb58"
+url = "https://github.com/jdx/usage/releases/download/v7.0.2/usage-aarch64-unknown-linux-gnu.tar.gz"
+url_api = "https://api.github.com/repos/jdx/usage/releases/assets/650146088"
+
+[tools."aqua:jdx/usage"."platforms.linux-arm64-musl"]
+checksum = "sha256:49f414e6c41ba37ba9ad2fd31e2ad50263ff7332e3ffe9fa1bc2ef5673f553d3"
+url = "https://github.com/jdx/usage/releases/download/v7.0.2/usage-aarch64-unknown-linux-musl.tar.gz"
+url_api = "https://api.github.com/repos/jdx/usage/releases/assets/650146234"
+
+[tools."aqua:jdx/usage"."platforms.linux-x64"]
+checksum = "sha256:1006d9659fb0c9620525a8e750b3853177a3bf772454d5984c4d78c4aa130aaa"
+url = "https://github.com/jdx/usage/releases/download/v7.0.2/usage-x86_64-unknown-linux-gnu.tar.gz"
+url_api = "https://api.github.com/repos/jdx/usage/releases/assets/650145698"
+
+[tools."aqua:jdx/usage"."platforms.linux-x64-musl"]
+checksum = "sha256:a79a88c35175d4697188c43dac6e0bbea5943f4f1631a750c0f9d5b2149ef381"
+url = "https://github.com/jdx/usage/releases/download/v7.0.2/usage-x86_64-unknown-linux-musl.tar.gz"
+url_api = "https://api.github.com/repos/jdx/usage/releases/assets/650146532"
+
+[tools."aqua:jdx/usage"."platforms.macos-arm64"]
+checksum = "sha256:13fad4f828a7cb2ddc298f1dea38a3389d2144f63584134b9c3c7489944c3de3"
+url = "https://github.com/jdx/usage/releases/download/v7.0.2/usage-universal-apple-darwin.tar.gz"
+url_api = "https://api.github.com/repos/jdx/usage/releases/assets/650147104"
+
+[tools."aqua:jdx/usage"."platforms.windows-x64"]
+checksum = "sha256:91586495a99681b405c62a5c7c8f60dffca0d006834d3526520ced8527818cb5"
+url = "https://github.com/jdx/usage/releases/download/v7.0.2/usage-x86_64-pc-windows-msvc.zip"
+url_api = "https://api.github.com/repos/jdx/usage/releases/assets/650149210"
+
 [[tools."aqua:yonaskolb/XcodeGen"]]
 version = "2.46.0"
 backend = "aqua:yonaskolb/XcodeGen"
@@ -15,7 +50,15 @@ url_api = "https://api.github.com/repos/yonaskolb/XcodeGen/releases/assets/47886
 [[tools."cargo:cargo-bloat"]]
 version = "0.12.1"
 backend = "cargo:cargo-bloat"
-specifiers = ["latest"]
+specifiers = [
+    "0.12.1",
+    "latest",
+]
+
+[[tools."cargo:cargo-bolero"]]
+version = "0.13.5"
+backend = "cargo:cargo-bolero"
+specifiers = ["0.13.5"]
 
 [[tools."cargo:cargo-deny"]]
 version = "0.20.2"
@@ -25,7 +68,15 @@ specifiers = ["0.20"]
 [[tools."cargo:cargo-llvm-lines"]]
 version = "0.4.48"
 backend = "cargo:cargo-llvm-lines"
-specifiers = ["latest"]
+specifiers = [
+    "0.4.48",
+    "latest",
+]
+
+[[tools."cargo:cargo-machete"]]
+version = "0.9.2"
+backend = "cargo:cargo-machete"
+specifiers = ["0.9.2"]
 
 [[tools."cargo:cargo-nextest"]]
 version = "0.9.148"
@@ -73,7 +124,10 @@ url_api = "https://api.github.com/repos/boltffi/boltffi/releases/assets/64053577
 [[tools.hyperfine]]
 version = "2.0.0"
 backend = "aqua:sharkdp/hyperfine"
-specifiers = ["latest"]
+specifiers = [
+    "2.0.0",
+    "latest",
+]
 
 [tools.hyperfine."platforms.linux-arm64"]
 checksum = "sha256:f8244d1e17f8da23ee6b3ae2cdc04a6a185a450f6b74e09bff12e498038fcbc9"
@@ -183,5 +237,6 @@ backend = "core:rust"
 specifiers = ["nightly-2026-10-17"]
 
 [tools.rust.options]
-components = "clippy,rust-src,rustc-codegen-cranelift,rustfmt"
+components = "clippy,miri,rust-src,rustc-codegen-cranelift,rustfmt"
 profile = "minimal"
+targets = "aarch64-apple-darwin,aarch64-apple-ios,aarch64-apple-ios-sim,x86_64-apple-darwin,x86_64-pc-windows-msvc"

@@ -68,3 +68,12 @@ opt-level = "z"
 # save 48 KiB more at twice the frame time (docs/tui.md).
 [profile.release.package.tui]
 opt-level = "s"
+
+# cargo-bolero (`mise run fuzz`): optimized, and LLVM throughout for
+# libFuzzer's coverage instrumentation.
+[profile.fuzz]
+inherits = "dev"
+opt-level = 3
+incremental = false
+codegen-units = 1
+codegen-backend = "llvm"
