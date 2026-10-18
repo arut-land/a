@@ -1,5 +1,5 @@
-//! Gemini model ids: rig's id rules, and its catalog rows for thinking
-//! written as family rules.
+//! Gemini model ids: what they say about versions, call ids and thinking,
+//! as family rules.
 
 use super::{Reasoning, Thinking, by_prefix};
 use crate::Effort;

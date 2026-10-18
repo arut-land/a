@@ -1,7 +1,6 @@
 //! What a decoder writes through: provider items by wire index, turned into
-//! [`Event`]s with the rules every wire shares (ported from rig's completion
-//! fold). A decoder states what the provider sent; the writer decides what
-//! a consumer sees.
+//! [`Event`]s with the rules every wire shares. A decoder states what the
+//! provider sent; the writer decides what a consumer sees.
 //!
 //! - A part opens to the consumer at its first content, so empty text and
 //!   reasoning never appear; a call opens once it names its tool, and one

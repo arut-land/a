@@ -1,13 +1,12 @@
-//! Incremental framing of response bytes (ported from rig-http). SSE
-//! dispatches an event at a blank line, so an event the body never
-//! terminates is never delivered; NDJSON flushes a final unterminated line.
+//! Incremental framing of response bytes. SSE dispatches an event at a
+//! blank line, so an event the body never terminates is never delivered;
+//! NDJSON flushes a final unterminated line. No reply is resumed, so SSE's
+//! `id` and `retry` fields are ignored.
 
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct SseEvent {
     pub event: String,
     pub data: String,
-    pub id: String,
-    pub retry: Option<u64>,
 }
 
 const BOM: [u8; 3] = [0xef, 0xbb, 0xbf];
@@ -26,9 +25,6 @@ struct Fields {
     ready: Vec<SseEvent>,
     event_type: String,
     data: String,
-    last_event_id: String,
-    retry: Option<u64>,
-    since_dispatch: usize,
 }
 
 impl SseFramer {
@@ -42,17 +38,11 @@ impl SseFramer {
         let mut start = 0;
         while let Some((line_len, consumed)) = terminated_line(&self.buffer[start..]) {
             let line = String::from_utf8_lossy(&self.buffer[start..start + line_len]);
-            self.fields.since_dispatch = self.fields.since_dispatch.saturating_add(consumed);
             self.fields.line(&line);
             start += consumed;
         }
         self.buffer.drain(..start);
         self.fields.ready.drain(..)
-    }
-
-    /// Bytes received since the last dispatched event.
-    pub fn pending(&self) -> usize {
-        self.fields.since_dispatch.saturating_add(self.buffer.len())
     }
 
     fn strip_bom<'a>(&mut self, chunk: &'a [u8]) -> &'a [u8] {
@@ -99,17 +89,11 @@ impl Fields {
                 self.data.push_str(value);
                 self.data.push('\n');
             }
-            // A NUL in an id is ignored outright, per the grammar.
-            "id" if !value.contains('\0') => value.clone_into(&mut self.last_event_id),
-            "retry" if !value.is_empty() && value.bytes().all(|b| b.is_ascii_digit()) => {
-                self.retry = value.parse().ok();
-            }
             _ => {}
         }
     }
 
     fn dispatch(&mut self) {
-        self.since_dispatch = 0;
         if self.data.is_empty() {
             self.event_type.clear();
             return;
@@ -123,8 +107,6 @@ impl Fields {
         self.ready.push(SseEvent {
             event,
             data: std::mem::take(&mut self.data),
-            id: self.last_event_id.clone(),
-            retry: self.retry.take(),
         });
     }
 }
@@ -143,7 +125,7 @@ impl NdjsonFramer {
     pub fn push(&mut self, chunk: &[u8]) -> std::vec::Drain<'_, Vec<u8>> {
         self.buffer.extend_from_slice(chunk);
         let mut start = 0;
-        while let Some(pos) = memchr(b'\n', &self.buffer[start..]) {
+        while let Some(pos) = self.buffer[start..].iter().position(|&b| b == b'\n') {
             let line = &self.buffer[start..start + pos];
             let line = line.strip_suffix(b"\r").unwrap_or(line);
             if !line.is_empty() {
@@ -159,16 +141,10 @@ impl NdjsonFramer {
         let line = std::mem::take(&mut self.buffer);
         (!line.is_empty()).then_some(line)
     }
-
-    pub fn pending(&self) -> usize {
-        self.buffer.len()
-    }
 }
 
-fn memchr(needle: u8, haystack: &[u8]) -> Option<usize> {
-    haystack.iter().position(|byte| *byte == needle)
-}
-
+/// The length of the line `buffer` starts with, and the bytes it takes with
+/// its terminator; `None` until the line is terminated.
 fn terminated_line(buffer: &[u8]) -> Option<(usize, usize)> {
     let pos = buffer
         .iter()

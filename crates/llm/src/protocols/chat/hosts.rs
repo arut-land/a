@@ -1,5 +1,4 @@
-//! The hosts that serve Chat Completions, with their quirks (rig's
-//! dialects).
+//! The hosts that serve Chat Completions, with their quirks.
 
 use super::{LaterSystem, OutputCap, Quirks, ReasoningField, Routing, Vendor};
 use crate::protocol::{Host, KeyStyle};

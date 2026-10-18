@@ -1,5 +1,5 @@
-//! Claude model ids (rig's catalog rows for Anthropic, as a table): output
-//! limits, the reasoning each takes, and the request shapes each accepts.
+//! Claude model ids, as a table: output limits, the reasoning each takes,
+//! and the request shapes each accepts.
 
 use super::{LOW_TO_HIGH, LOW_TO_MAX, Sampling, Thinking, has_prefix};
 use crate::spec::Effort;

@@ -1,22 +1,46 @@
 //! JSON Schema rewritten for providers with strict structured-output rules
-//! (`OpenAI`, Anthropic), ported from rig: `additionalProperties: false` and
-//! every property required, recursing into `$defs`, `properties`, `items`
-//! and combinators, with `oneOf` merged into `anyOf`.
+//! (`OpenAI`, Anthropic): `additionalProperties: false` and every property
+//! required, recursing into `$defs`, `properties`, `items` and combinators,
+//! with `oneOf` merged into `anyOf`.
 
 use serde_json::{Map, Value};
 
 /// Per-provider deltas.
 #[derive(Debug, Clone, Copy)]
-pub(crate) struct Sanitize {
+struct Sanitize {
     /// `OpenAI` allows no keywords beside `$ref`.
-    pub(crate) strip_ref_siblings: bool,
+    strip_ref_siblings: bool,
     /// `OpenAI` requires `properties` on every object schema.
-    pub(crate) inject_empty_properties: bool,
+    inject_empty_properties: bool,
     /// Anthropic takes no numeric constraints on numbers.
-    pub(crate) strip_numeric_constraints: bool,
+    strip_numeric_constraints: bool,
 }
 
-pub(crate) fn sanitize(schema: &mut Value, options: Sanitize) {
+/// `OpenAI`'s strict subset.
+pub(crate) fn openai(schema: &mut Value) {
+    sanitize(
+        schema,
+        Sanitize {
+            strip_ref_siblings: true,
+            inject_empty_properties: true,
+            strip_numeric_constraints: false,
+        },
+    );
+}
+
+/// The subset Anthropic's structured outputs take.
+pub(crate) fn anthropic(schema: &mut Value) {
+    sanitize(
+        schema,
+        Sanitize {
+            strip_ref_siblings: false,
+            inject_empty_properties: false,
+            strip_numeric_constraints: true,
+        },
+    );
+}
+
+fn sanitize(schema: &mut Value, options: Sanitize) {
     let Value::Object(obj) = schema else {
         return;
     };
@@ -82,18 +106,6 @@ pub(crate) fn sanitize(schema: &mut Value, options: Sanitize) {
             }
         }
     }
-}
-
-/// `OpenAI`'s strict subset.
-pub(crate) fn openai(schema: &mut Value) {
-    sanitize(
-        schema,
-        Sanitize {
-            strip_ref_siblings: true,
-            inject_empty_properties: true,
-            strip_numeric_constraints: false,
-        },
-    );
 }
 
 /// Characters other than `[A-Za-z0-9_-]` replaced by `_`, cut to `max`.

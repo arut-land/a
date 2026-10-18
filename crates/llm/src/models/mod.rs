@@ -1,7 +1,7 @@
 //! What model ids say about models: the few facts request shaping needs,
-//! as id rules and const tables (rig's rules, without its catalog). Each
-//! vendor's rules live in its module; protocols ask here, and keep only how
-//! their wire spells an option.
+//! as id rules and const tables rather than a catalog. Each vendor's rules
+//! live in its module; protocols ask here, and keep only how their wire
+//! spells an option.
 
 pub mod anthropic;
 pub mod cohere;

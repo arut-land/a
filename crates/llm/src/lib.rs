@@ -9,17 +9,17 @@ mod client;
 mod error;
 pub mod hosts;
 pub mod http;
-pub mod json;
+mod json;
 pub mod models;
 mod prepare;
 pub mod protocol;
 pub mod protocols;
-pub mod replay;
+mod replay;
 pub mod spec;
-pub mod sse;
+mod sse;
 #[cfg(feature = "ureq")]
 mod ureq;
-pub mod writer;
+mod writer;
 
 pub use accumulate::Accumulator;
 pub use client::{Events, generate, origin, stream};

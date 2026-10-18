@@ -1,5 +1,5 @@
 //! A strict tool's input schema in the subset Anthropic's constrained
-//! decoding compiles, by Anthropic's SDK policy (ported from rig).
+//! decoding compiles, by Anthropic's SDK policy.
 //!
 //! Strict tools take optional parameters, so declared `required` lists stay.
 //! Validation keywords the compiler rejects are moved into descriptions as

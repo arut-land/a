@@ -94,8 +94,8 @@ pub enum Body {
     ModelCall {
         model: String,
     },
-    /// The reply; `Done` carries the whole `llm::Response` (earlier versions
-    /// logged `{"text": ...}`).
+    /// The reply; `Done` carries the whole `llm::Response`, or
+    /// `{"text": ...}` in logs older than that.
     ModelResult {
         call: u64,
         outcome: Outcome,
