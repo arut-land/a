@@ -88,7 +88,7 @@ impl LogStore for Jsonl {
         }
         if end < bytes.len() {
             file.set_len(end as u64)?;
-            file.sync_data()?;
+            sys::sync_data(&file)?;
         }
         Ok(Loaded {
             entries,
@@ -125,7 +125,7 @@ impl LogStore for Jsonl {
     }
 }
 
-/// Durable once `sync_data` returns.
+/// Durable once [`sys::sync_data`] returns.
 struct JsonlLog {
     file: File,
     /// The directory of a file not yet synced since it was created: its
@@ -149,7 +149,7 @@ impl Log for JsonlLog {
             lines.push(b'\n');
         }
         self.file.write_all(&lines)?;
-        self.file.sync_data()?;
+        sys::sync_data(&self.file)?;
         #[cfg(unix)]
         if let Some(dir) = &self.new_in {
             File::open(dir)?.sync_all()?;

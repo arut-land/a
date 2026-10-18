@@ -4,6 +4,7 @@
 #[cfg(unix)]
 mod runtime;
 
+use std::fs::File;
 use std::io;
 use std::path::{Path, PathBuf};
 
@@ -244,6 +245,24 @@ mod unix {
         )?;
         Ok(listener)
     }
+}
+
+/// Makes what was written to `file` durable, in write order. On Apple this
+/// is a write barrier (`F_BARRIERFSYNC`, ~0.25 ms) rather than the cache
+/// flush `sync_data` does there (`F_FULLFSYNC`, ~2.6 ms): writes still land
+/// in order, but the newest may be lost on power loss. A filesystem without
+/// barriers gets the full sync.
+pub fn sync_data(file: &File) -> io::Result<()> {
+    #[cfg(target_vendor = "apple")]
+    {
+        use std::os::fd::AsRawFd;
+        // SAFETY: `fcntl` on a descriptor `file` owns and keeps open; the
+        // command takes no argument.
+        if unsafe { libc::fcntl(file.as_raw_fd(), libc::F_BARRIERFSYNC) } != -1 {
+            return Ok(());
+        }
+    }
+    file.sync_data()
 }
 
 #[cfg(test)]

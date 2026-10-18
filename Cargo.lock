@@ -1978,6 +1978,7 @@ dependencies = [
  "protocol",
  "serde",
  "serde_json",
+ "sys",
 ]
 
 [[package]]
@@ -2023,6 +2024,7 @@ dependencies = [
 name = "sys"
 version = "0.0.0"
 dependencies = [
+ "libc",
  "rustix",
 ]
 

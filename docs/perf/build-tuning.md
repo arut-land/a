@@ -55,7 +55,6 @@ Researched 2026-10-18 on macOS arm64, `nightly-2026-10-17`, ld-prime.
 | Avoid monomorphizing heavy generic types (dyn at boundaries) | `bloat:lines` shows generic blowup | Targeted size wins | uv size work |
 | Startup symbol ordering (two-pass link with an order file) | Binary > ~10 MB and RSS matters | Deno Linux idle RSS 47 → 29 MiB, −2 ms | deno#36219 |
 | zstd-compressed embedded payloads (web assets, Lua stdlib) | Embedded assets grow | Deno, Bun (ICU pruning + lazy zstd ~6.8 MB) | deno `cli/build.rs`, bun#41330 |
-| Commit with `F_BARRIERFSYNC` instead of `F_FULLFSYNC` on Apple | Owner accepts losing the last commits (never their order) on power loss | Per commit 2.6 ms → 0.25 ms: echo reply ~3.0 → ~0.6 ms | `fcntl` microbenchmark, 200 appends |
 | Commit the attaching client's environment without waiting | Cold REPL start matters more than recording the environment before the replay | One `F_FULLFSYNC` (2.6 ms) off the cold start | — |
 | `/OPT:SAFEICF` on Windows | Full ICF breaks function identity | Bun hit BigInt breakage with full ICF | bun#30219 |
 
@@ -112,12 +111,11 @@ the differences mean anything).
 
 Where the time and memory still go:
 
-- Every commit is one `F_FULLFSYNC` (Rust's `sync_data` on Apple), 2.6 ms
-  here; plain `fsync` is 34 µs and `F_BARRIERFSYNC` 247 µs. Most of the echo
-  reply and of the first-delta overhead is that one flush. `F_BARRIERFSYNC`
-  keeps write order (the torn-tail recovery already assumes a prefix
-  survives) but not durability across power loss, so it is the owner's
-  call; see the deferred table.
+- Every commit is one `F_BARRIERFSYNC` on Apple (`sys::sync_data`), 247 µs
+  here against 2.6 ms for `F_FULLFSYNC` (Rust's `sync_data`). It keeps write
+  order, which the torn-tail recovery relies on, but the newest commits may
+  be lost on power loss; the owner chose that. Echo reply p50 3.0 → 0.77 ms,
+  p90 1.7 ms (black-box harness, 200 exchanges).
 - A cold REPL start still pays two flushes before its first reply: the
   attaching client's environment is committed before the replay, and a new
   file's first commit also syncs its directory.
