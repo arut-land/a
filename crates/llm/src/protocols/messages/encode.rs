@@ -53,12 +53,7 @@ pub(super) fn body(
     model: &str,
     request: &Request,
 ) -> Result<(Value, Vec<String>), Error> {
-    let options = request
-        .options
-        .get(KEY)
-        .and_then(Value::as_object)
-        .cloned()
-        .unwrap_or_default();
+    let options = request.options_for(KEY);
     let max_tokens = request
         .generation
         .max_output_tokens

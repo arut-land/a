@@ -657,8 +657,14 @@ impl ResponsesDecoder {
             raw_usage: response.get("usage").cloned(),
         })
     }
+}
 
-    fn decode(&mut self, data: &str) -> Result<Flow, Error> {
+impl Writes for ResponsesDecoder {
+    fn writer(&mut self) -> &mut Writer {
+        &mut self.w
+    }
+
+    fn data(&mut self, data: &str) -> Result<Flow, Error> {
         if data.trim() == "[DONE]" {
             // The provider's end is `response.completed`.
             return Ok(Flow::More);
@@ -709,16 +715,6 @@ impl ResponsesDecoder {
                 Ok(Flow::More)
             }
         }
-    }
-}
-
-impl Writes for ResponsesDecoder {
-    fn writer(&mut self) -> &mut Writer {
-        &mut self.w
-    }
-
-    fn data(&mut self, data: &str) -> Result<Flow, Error> {
-        self.decode(data)
     }
 }
 

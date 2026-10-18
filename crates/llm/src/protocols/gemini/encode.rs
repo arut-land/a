@@ -430,12 +430,7 @@ pub(crate) fn body(
     if gemini.quirks.thought_replay == ThoughtReplay::CurrentTurn {
         drop_finished_signatures(&mut contents);
     }
-    let mut options = request
-        .options
-        .get(KEY)
-        .and_then(Value::as_object)
-        .cloned()
-        .unwrap_or_default();
+    let mut options = request.options_for(KEY);
     let mut tools = Vec::new();
     if !request.tools.is_empty() {
         let declared: Vec<Value> = request.tools.iter().map(declaration).collect();

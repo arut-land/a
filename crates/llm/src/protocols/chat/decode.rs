@@ -640,8 +640,14 @@ impl ChatDecoder {
         }
         self.finish()
     }
+}
 
-    fn decode(&mut self, data: &str) -> Result<Flow, Error> {
+impl Writes for ChatDecoder {
+    fn writer(&mut self) -> &mut Writer {
+        &mut self.w
+    }
+
+    fn data(&mut self, data: &str) -> Result<Flow, Error> {
         if data.trim() == "[DONE]" {
             return self.done();
         }
@@ -681,16 +687,6 @@ impl ChatDecoder {
         self.chunked = true;
         self.chunk(&frame)?;
         Ok(Flow::More)
-    }
-}
-
-impl Writes for ChatDecoder {
-    fn writer(&mut self) -> &mut Writer {
-        &mut self.w
-    }
-
-    fn data(&mut self, data: &str) -> Result<Flow, Error> {
-        self.decode(data)
     }
 
     /// A stream that stops after a finish reason without `[DONE]` still

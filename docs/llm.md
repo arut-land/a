@@ -10,12 +10,13 @@ everything around them is our own and small.
 | --- | --- | --- |
 | Spec | `spec.rs` | Provider-agnostic, serde-stable types. Messages are one enum per role (`System`, `User`, `Assistant`, `Tool`), each holding only the parts that role may. Every part carries `meta`: provider state keyed by the protocol that wrote it. |
 | Protocol | `protocol.rs` | A wire protocol is a pure `encode` (request to body) and a pure `Decoder` (frames to events). A `Provider` is data: id, base URL, auth, and a protocol value carrying that host's quirks. `Host` builds one from the environment. |
-| Writer | `writer.rs` | rig's completion fold as a sans-IO helper every decoder writes through. It owns the rules all wires share (see its module doc). |
+| Writer | `writer.rs` | rig's completion fold as a sans-IO helper every decoder writes through (`Writes`). It owns the rules all wires share (see its module doc). |
+| Models | `models/` | What model ids say: reasoning (levels, budgets, whether it turns off), sampling, vision and output limits, as id rules and const tables, one module per vendor. Protocols ask here and keep only how their wire spells an option. |
 | Replay | `replay.rs` | How an encoder sends back a part its own protocol produced: the provider item verbatim while the part is unchanged (fingerprint), its identity when edited, rebuilt otherwise. |
 | Prepare | `prepare.rs` | Runs before every encode: turns from another protocol, provider or model lose reasoning, opaque items and state; foreign tool ids are fitted; unanswered calls get error results. |
 | Client | `client.rs` | `stream` joins a provider, a protocol and an `Http` into a stream of events that ends with exactly one `Finish` or one error. `generate` accumulates it. No retries: `Error::is_retryable` says whether to. |
 | HTTP | `http.rs`, `ureq.rs` | `Http` sends one request and returns status, headers and a body stream. `Ureq` (feature `ureq`) runs ureq on the `rt` runtime's blocking pool. |
-| Hosts | `hosts.rs` | `host:model` specs (`openrouter:anthropic/claude-sonnet-5`, `openai@chat:gpt-4.1`) to a configured provider. |
+| Hosts | `hosts.rs` | `host:model` specs (`openrouter:anthropic/claude-sonnet-5`, `openai@chat:gpt-4.1`) to a configured provider, over every `Hosted` protocol's table. |
 
 Protocols live in `protocols/<name>/` with a `KEY`, a protocol type holding
 `Quirks`, and a `HOSTS` table:
@@ -31,8 +32,9 @@ Protocols live in `protocols/<name>/` with a `KEY`, a protocol type holding
 
 A host on an existing wire is one `HOSTS` entry: id, base URL, key and
 base-URL environment variables, key style, and the quirks it needs. A new
-wire is a new `protocols/` module implementing `Protocol`, whose decoder
-writes through `Writer`.
+wire is a new `protocols/` module implementing `Protocol` and `Hosted`,
+listed in `hosts.rs`, whose decoder writes through `Writer`. A fact about
+a model goes in `models/`.
 
 ## Testing
 
@@ -47,7 +49,8 @@ writes through `Writer`.
 
 ## Deliberate departures from rig
 
-- No model catalog: the few facts request shaping needs are model-id rules.
+- No model catalog: the few facts request shaping needs are model-id rules
+  (`models/`).
 - Options a model cannot take are omitted rather than refused: sampling on
   OpenAI reasoning models and on Claude models with fixed sampling, efforts
   and budgets a model has no level for, a forced tool choice where Claude

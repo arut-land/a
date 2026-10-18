@@ -177,12 +177,6 @@ impl Provider {
         self
     }
 
-    #[must_use]
-    pub fn with_header(mut self, name: impl Into<String>, value: impl Into<String>) -> Self {
-        self.headers.push((name.into(), value.into()));
-        self
-    }
-
     /// The HTTP request `request` becomes, encoded for `model`.
     pub fn request(
         &self,

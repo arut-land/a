@@ -15,13 +15,19 @@ const BOM: [u8; 3] = [0xef, 0xbb, 0xbf];
 #[derive(Debug, Default)]
 pub struct SseFramer {
     buffer: Vec<u8>,
+    bom_prefix: usize,
+    bom_done: bool,
+    fields: Fields,
+}
+
+/// The event being assembled from its field lines.
+#[derive(Debug, Default)]
+struct Fields {
     ready: Vec<SseEvent>,
     event_type: String,
     data: String,
     last_event_id: String,
     retry: Option<u64>,
-    bom_prefix: usize,
-    bom_done: bool,
     since_dispatch: usize,
 }
 
@@ -33,18 +39,20 @@ impl SseFramer {
     pub fn push(&mut self, chunk: &[u8]) -> std::vec::Drain<'_, SseEvent> {
         let chunk = self.strip_bom(chunk);
         self.buffer.extend_from_slice(chunk);
-        while let Some((line_len, consumed)) = terminated_line(&self.buffer) {
-            let line = String::from_utf8_lossy(&self.buffer[..line_len]).into_owned();
-            self.buffer.drain(..consumed);
-            self.since_dispatch = self.since_dispatch.saturating_add(consumed);
-            self.line(&line);
+        let mut start = 0;
+        while let Some((line_len, consumed)) = terminated_line(&self.buffer[start..]) {
+            let line = String::from_utf8_lossy(&self.buffer[start..start + line_len]);
+            self.fields.since_dispatch = self.fields.since_dispatch.saturating_add(consumed);
+            self.fields.line(&line);
+            start += consumed;
         }
-        self.ready.drain(..)
+        self.buffer.drain(..start);
+        self.fields.ready.drain(..)
     }
 
     /// Bytes received since the last dispatched event.
     pub fn pending(&self) -> usize {
-        self.since_dispatch.saturating_add(self.buffer.len())
+        self.fields.since_dispatch.saturating_add(self.buffer.len())
     }
 
     fn strip_bom<'a>(&mut self, chunk: &'a [u8]) -> &'a [u8] {
@@ -70,7 +78,9 @@ impl SseFramer {
         }
         rest
     }
+}
 
+impl Fields {
     fn line(&mut self, line: &str) {
         if line.is_empty() {
             self.dispatch();
@@ -84,19 +94,13 @@ impl SseFramer {
             None => (line, ""),
         };
         match field {
-            "event" => {
-                self.event_type.clear();
-                self.event_type.push_str(value);
-            }
+            "event" => value.clone_into(&mut self.event_type),
             "data" => {
                 self.data.push_str(value);
                 self.data.push('\n');
             }
             // A NUL in an id is ignored outright, per the grammar.
-            "id" if !value.contains('\0') => {
-                self.last_event_id.clear();
-                self.last_event_id.push_str(value);
-            }
+            "id" if !value.contains('\0') => value.clone_into(&mut self.last_event_id),
             "retry" if !value.is_empty() && value.bytes().all(|b| b.is_ascii_digit()) => {
                 self.retry = value.parse().ok();
             }
@@ -122,7 +126,6 @@ impl SseFramer {
             id: self.last_event_id.clone(),
             retry: self.retry.take(),
         });
-        self.event_type.clear();
     }
 }
 
@@ -139,16 +142,16 @@ impl NdjsonFramer {
 
     pub fn push(&mut self, chunk: &[u8]) -> std::vec::Drain<'_, Vec<u8>> {
         self.buffer.extend_from_slice(chunk);
-        while let Some(pos) = memchr(b'\n', &self.buffer) {
-            let mut line: Vec<u8> = self.buffer.drain(..=pos).collect();
-            line.pop();
-            if line.last() == Some(&b'\r') {
-                line.pop();
-            }
+        let mut start = 0;
+        while let Some(pos) = memchr(b'\n', &self.buffer[start..]) {
+            let line = &self.buffer[start..start + pos];
+            let line = line.strip_suffix(b"\r").unwrap_or(line);
             if !line.is_empty() {
-                self.ready.push(line);
+                self.ready.push(line.to_vec());
             }
+            start += pos + 1;
         }
+        self.buffer.drain(..start);
         self.ready.drain(..)
     }
 

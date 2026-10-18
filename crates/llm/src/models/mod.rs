@@ -203,3 +203,6 @@ impl Maker {
         }
     }
 }
+
+#[cfg(test)]
+mod tests;

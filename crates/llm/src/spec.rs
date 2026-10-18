@@ -54,6 +54,17 @@ pub struct Request {
     pub headers: Vec<(String, String)>,
 }
 
+impl Request {
+    /// The typed options under protocol `key`, as body fields.
+    pub fn options_for(&self, key: &str) -> serde_json::Map<String, Value> {
+        self.options
+            .get(key)
+            .and_then(Value::as_object)
+            .cloned()
+            .unwrap_or_default()
+    }
+}
+
 #[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
 pub struct Generation {
     #[serde(default, skip_serializing_if = "Option::is_none")]

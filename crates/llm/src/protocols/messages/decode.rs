@@ -474,8 +474,21 @@ impl MessagesDecoder {
             ..terminal
         }
     }
+}
 
-    fn decode(&mut self, data: &str) -> Result<Flow, Error> {
+/// `item`'s `input` set to `input`.
+fn set_input(item: &mut Value, input: Value) {
+    if let Some(fields) = item.as_object_mut() {
+        fields.insert("input".to_owned(), input);
+    }
+}
+
+impl Writes for MessagesDecoder {
+    fn writer(&mut self) -> &mut Writer {
+        &mut self.w
+    }
+
+    fn data(&mut self, data: &str) -> Result<Flow, Error> {
         if data.trim() == "[DONE]" {
             // The provider's end is the `message_delta` with a stop reason.
             return Ok(Flow::More);
@@ -534,22 +547,5 @@ impl MessagesDecoder {
             _ => {}
         }
         Ok(Flow::More)
-    }
-}
-
-/// `item`'s `input` set to `input`.
-fn set_input(item: &mut Value, input: Value) {
-    if let Some(fields) = item.as_object_mut() {
-        fields.insert("input".to_owned(), input);
-    }
-}
-
-impl Writes for MessagesDecoder {
-    fn writer(&mut self) -> &mut Writer {
-        &mut self.w
-    }
-
-    fn data(&mut self, data: &str) -> Result<Flow, Error> {
-        self.decode(data)
     }
 }

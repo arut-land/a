@@ -198,74 +198,6 @@ impl GeminiDecoder {
         }
     }
 
-    fn decode(&mut self, data: &str) -> Result<Flow, Error> {
-        let chunk: Value =
-            serde_json::from_str(data).map_err(|error| Error::decode(error, data))?;
-        if !chunk.is_object() {
-            return Ok(Flow::More);
-        }
-        if let Some(id) = chunk.str("responseId").filter(|id| !id.is_empty()) {
-            self.response_id = Some(id.into());
-        }
-        if let Some(model) = chunk.str("modelVersion").filter(|model| !model.is_empty()) {
-            self.model = Some(model.into());
-        }
-        if let Some(usage) = chunk.get("usageMetadata") {
-            self.usage = Some(usage.clone());
-        }
-        if let Some(error) = chunk.at("/error") {
-            return Err(in_band(error));
-        }
-        if let Some(error) = chunk.get("promptFeedback").and_then(blocked) {
-            return Err(error);
-        }
-        // The candidate, its content and its parts hold every part and the
-        // finish, so a wrongly typed one fails the reply.
-        let candidate = match chunk.get("candidates") {
-            None | Some(Value::Null) => return Ok(Flow::More),
-            Some(Value::Array(candidates)) => match candidates.first() {
-                None => return Ok(Flow::More),
-                Some(candidate @ Value::Object(_)) => candidate,
-                Some(_) => return Err(malformed("a candidate that is not an object", data)),
-            },
-            Some(_) => return Err(malformed("candidates that are not a list", data)),
-        };
-        // The last reason wins: a hosted-tool round can report one before
-        // the turn goes on. Proto3 JSON spells an enum value its schema does
-        // not know as its number.
-        let reason = match candidate.get("finishReason") {
-            Some(Value::String(name)) => Some(SmolStr::from(name)),
-            Some(Value::Number(number)) => {
-                Some(smol_str::format_smolstr!("FINISH_REASON_{number}"))
-            }
-            _ => None,
-        };
-        if let Some(reason) = &reason {
-            let message = candidate.str("finishMessage").map(str::to_owned);
-            self.finish = Some((reason.clone(), message));
-        }
-        let parts = match candidate.get("content") {
-            None | Some(Value::Null) => None,
-            Some(content @ Value::Object(_)) => content.get("parts"),
-            Some(_) => return Err(malformed("candidate content that is not an object", data)),
-        };
-        match parts {
-            None | Some(Value::Null) => {}
-            Some(Value::Array(parts)) => {
-                for part in parts {
-                    self.part(part)?;
-                }
-            }
-            Some(_) => return Err(malformed("candidate parts that are not a list", data)),
-        }
-        // A failure is final: nothing after it is read. A stop waits for the
-        // end of the body.
-        match reason.as_deref().map(reason_of) {
-            None | Some(Reason::Stop | Reason::Length) => Ok(Flow::More),
-            Some(_) => self.finish(),
-        }
-    }
-
     /// End the reply on the latest finish reason; without one it never
     /// ended.
     fn finish(&mut self) -> Result<Flow, Error> {
@@ -426,7 +358,71 @@ impl Writes for GeminiDecoder {
     }
 
     fn data(&mut self, data: &str) -> Result<Flow, Error> {
-        self.decode(data)
+        let chunk: Value =
+            serde_json::from_str(data).map_err(|error| Error::decode(error, data))?;
+        if !chunk.is_object() {
+            return Ok(Flow::More);
+        }
+        if let Some(id) = chunk.str("responseId").filter(|id| !id.is_empty()) {
+            self.response_id = Some(id.into());
+        }
+        if let Some(model) = chunk.str("modelVersion").filter(|model| !model.is_empty()) {
+            self.model = Some(model.into());
+        }
+        if let Some(usage) = chunk.get("usageMetadata") {
+            self.usage = Some(usage.clone());
+        }
+        if let Some(error) = chunk.at("/error") {
+            return Err(in_band(error));
+        }
+        if let Some(error) = chunk.get("promptFeedback").and_then(blocked) {
+            return Err(error);
+        }
+        // The candidate, its content and its parts hold every part and the
+        // finish, so a wrongly typed one fails the reply.
+        let candidate = match chunk.get("candidates") {
+            None | Some(Value::Null) => return Ok(Flow::More),
+            Some(Value::Array(candidates)) => match candidates.first() {
+                None => return Ok(Flow::More),
+                Some(candidate @ Value::Object(_)) => candidate,
+                Some(_) => return Err(malformed("a candidate that is not an object", data)),
+            },
+            Some(_) => return Err(malformed("candidates that are not a list", data)),
+        };
+        // The last reason wins: a hosted-tool round can report one before
+        // the turn goes on. Proto3 JSON spells an enum value its schema does
+        // not know as its number.
+        let reason = match candidate.get("finishReason") {
+            Some(Value::String(name)) => Some(SmolStr::from(name)),
+            Some(Value::Number(number)) => {
+                Some(smol_str::format_smolstr!("FINISH_REASON_{number}"))
+            }
+            _ => None,
+        };
+        if let Some(reason) = &reason {
+            let message = candidate.str("finishMessage").map(str::to_owned);
+            self.finish = Some((reason.clone(), message));
+        }
+        let parts = match candidate.get("content") {
+            None | Some(Value::Null) => None,
+            Some(content @ Value::Object(_)) => content.get("parts"),
+            Some(_) => return Err(malformed("candidate content that is not an object", data)),
+        };
+        match parts {
+            None | Some(Value::Null) => {}
+            Some(Value::Array(parts)) => {
+                for part in parts {
+                    self.part(part)?;
+                }
+            }
+            Some(_) => return Err(malformed("candidate parts that are not a list", data)),
+        }
+        // A failure is final: nothing after it is read. A stop waits for the
+        // end of the body.
+        match reason.as_deref().map(reason_of) {
+            None | Some(Reason::Stop | Reason::Length) => Ok(Flow::More),
+            Some(_) => self.finish(),
+        }
     }
 
     /// Gemini ends a reply at the end of its body, not at its first finish

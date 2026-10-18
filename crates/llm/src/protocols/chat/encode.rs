@@ -609,12 +609,7 @@ pub(super) fn body(
     request: &Request,
 ) -> Result<Value, Error> {
     let model = target.model;
-    let mut options = request
-        .options
-        .get(KEY)
-        .and_then(Value::as_object)
-        .cloned()
-        .unwrap_or_default();
+    let mut options = request.options_for(KEY);
     // The request's own tools, function or native (Groq's
     // `browser_search`), join the typed ones.
     let passthrough = match options.remove("tools") {

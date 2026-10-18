@@ -309,12 +309,7 @@ pub(crate) fn body(
     request: &Request,
 ) -> Result<Value, Error> {
     let model = target.model;
-    let options = request
-        .options
-        .get(KEY)
-        .and_then(Value::as_object)
-        .cloned()
-        .unwrap_or_default();
+    let options = request.options_for(KEY);
     // Stateless unless the caller keeps the conversation on the provider:
     // every turn is sent whole, and reasoning replays from its ciphertext.
     let stateless = options.get("store").and_then(Value::as_bool) != Some(true)

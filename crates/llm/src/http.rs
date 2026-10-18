@@ -44,12 +44,3 @@ pub fn body(chunks: impl IntoIterator<Item = Bytes>) -> Body {
 
     Box::pin(Ready(chunks.into_iter().collect::<Vec<_>>().into_iter()))
 }
-
-/// Reads a whole body.
-pub async fn collect(mut body: Body) -> io::Result<Vec<u8>> {
-    let mut out = Vec::new();
-    while let Some(chunk) = std::future::poll_fn(|cx| body.as_mut().poll_next(cx)).await {
-        out.extend_from_slice(&chunk?);
-    }
-    Ok(out)
-}
