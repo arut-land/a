@@ -1,4 +1,4 @@
-use std::path::{Path, PathBuf};
+use std::path::Path;
 
 use agent::{Hook, Tool};
 use bytes::Bytes;
@@ -185,45 +185,33 @@ fn openai(script: &Arc<Script>) -> Model {
     Model::new(provider, "gpt-5.6".into(), Arc::clone(script))
 }
 
-struct Fixture {
-    root: PathBuf,
-    shared: Arc<Shared>,
-}
+struct Fixture(Arc<Shared>);
 
 impl Fixture {
-    fn new(name: &str, agent: agent::Kind, tools: Toolset, hooks: Hooks, model: Model) -> Self {
-        let root = std::env::temp_dir().join(format!("a-session-{name}-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&root);
-        let shared = Arc::new(Shared {
-            store: Store::open(root.join("sessions")).unwrap(),
+    fn new(agent: agent::Kind, tools: Toolset, hooks: Hooks, model: Model) -> Self {
+        Self(Arc::new(Shared {
+            store: Arc::new(store::Memory::default()),
             agent,
             tools,
             hooks,
             model: Ok(model),
-        });
-        Self { root, shared }
+        }))
     }
 
     /// A session whose log holds `entries`, started as after a crash.
     fn start(&self, entries: &[Entry]) -> Arc<Session> {
         let header = Header {
             id: SessionId::new(),
-            workspace: self.root.clone(),
+            workspace: std::env::temp_dir(),
         };
-        let mut log = self.shared.store.create(&header).unwrap().log;
+        let mut log = self.0.store.create(&header).unwrap().log;
         for e in entries {
             log.append(e).unwrap();
         }
-        let loaded = self.shared.store.load(header.id).unwrap();
-        let session = Session::start(header, loaded, Arc::clone(&self.shared));
+        let loaded = self.0.store.load(header.id).unwrap();
+        let session = Session::start(header, loaded, Arc::clone(&self.0));
         settle(&session);
         session
-    }
-}
-
-impl Drop for Fixture {
-    fn drop(&mut self) {
-        let _ = std::fs::remove_dir_all(&self.root);
     }
 }
 
@@ -244,13 +232,7 @@ fn the_model_calls_a_tool_and_answers_from_its_result() {
     let replies = cassette("openai/streaming_grammar/tool_then_followup_text.yaml");
     let script = Script::new(&replies);
     let tools = Toolset(&[&HarborLabel]);
-    let fixture = Fixture::new(
-        "loop",
-        agent::Kind::Chat,
-        tools,
-        Hooks::default(),
-        openai(&script),
-    );
+    let fixture = Fixture::new(agent::Kind::Chat, tools, Hooks::default(), openai(&script));
     let session = fixture.start(&[]);
     session.submit("Call the tool, then answer.".into());
     settle(&session);
@@ -296,7 +278,6 @@ fn the_model_calls_a_tool_and_answers_from_its_result() {
     for cut in 3..=6 {
         let script = Script::new(&replies[1..]);
         let fixture = Fixture::new(
-            &format!("resume-{cut}"),
             agent::Kind::Chat,
             Toolset(&[&HarborLabel]),
             Hooks::default(),
@@ -343,7 +324,6 @@ impl Hook for Policy {
 #[test]
 fn hook_decisions_are_logged_and_replay_to_the_same_state() {
     let fixture = Fixture::new(
-        "hooks",
         agent::Kind::Echo,
         Toolset::default(),
         std::iter::once(Box::new(Policy) as Box<dyn Hook>).collect(),
