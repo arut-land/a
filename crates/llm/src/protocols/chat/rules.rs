@@ -1,7 +1,7 @@
 //! How each vendor spells the generation options, as far as the model takes
-//! them ([`crate::models`]). An option rig would refuse for the model is
-//! left out: the request still goes, without it. Effort levels a model's
-//! catalog entry would refuse are sent; the host decides.
+//! them ([`crate::models`]). An option the model cannot take is left out:
+//! the request still goes, without it. `OpenAI`'s effort levels go
+//! unchecked; the host decides.
 
 use serde_json::{Map, Value, json};
 

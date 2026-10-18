@@ -219,11 +219,12 @@ fn input(messages: &[Message], stateless: bool) -> Result<Vec<Value>, Error> {
         let (mut texts, mut unpaired) = (0, false);
         for part in parts {
             let reasoning = matches!(part, AssistantPart::Reasoning(_));
-            let mut sent = replay(part, KEY, identity);
-            if unpaired && !reasoning {
+            let sent = if unpaired && !reasoning {
                 unpaired = false;
-                sent = Replay::Rebuild;
-            }
+                Replay::Rebuild
+            } else {
+                replay(part, KEY, identity)
+            };
             let stated = |key: &str| match &sent {
                 Replay::Item(item) => item.get(key),
                 Replay::Identity(kept) => kept.get(key),

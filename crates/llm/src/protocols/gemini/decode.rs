@@ -340,7 +340,9 @@ impl GeminiDecoder {
             }
             let (id, name) = (field("id").into(), field("name").into());
             // Proto3 JSON leaves out an empty `args` struct.
-            let arguments = call.get("args").map_or("{}".to_owned(), Value::to_string);
+            let arguments = call
+                .get("args")
+                .map_or_else(|| "{}".to_owned(), Value::to_string);
             return self.open(Open::Call { id, name }, Value::Object(rest), arguments);
         }
         let bare = ["thought", "thoughtSignature", "partMetadata"];

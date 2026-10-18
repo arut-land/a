@@ -1,7 +1,7 @@
 //! JSON Schema rewritten for providers with strict structured-output rules
-//! (`OpenAI`, Anthropic), ported from rig: `additionalProperties: false` and
-//! every property required, recursing into `$defs`, `properties`, `items`
-//! and combinators, with `oneOf` merged into `anyOf`.
+//! (`OpenAI`, Anthropic): `additionalProperties: false` and every property
+//! required, recursing into `$defs`, `properties`, `items` and combinators,
+//! with `oneOf` merged into `anyOf`.
 
 use serde_json::{Map, Value};
 

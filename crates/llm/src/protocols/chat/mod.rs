@@ -1,6 +1,5 @@
 //! `OpenAI` Chat Completions (`POST /chat/completions`), and the
-//! OpenAI-compatible hosts that serve it with their quirks (ported from
-//! rig's Chat wire and its dialects).
+//! OpenAI-compatible hosts that serve it with their quirks.
 
 mod decode;
 mod encode;

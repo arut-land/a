@@ -34,7 +34,6 @@ enum Piece {
 
 impl Ureq {
     pub fn new(rt: Arc<dyn rt::Runtime>) -> Self {
-        // The OS's TLS on Apple platforms and Windows; rustls elsewhere.
         let provider = if cfg!(any(target_vendor = "apple", windows)) {
             TlsProvider::NativeTls
         } else {
@@ -99,14 +98,14 @@ impl Http for Ureq {
                     return Err(io::Error::other("the connection closed before a reply"));
                 }
             };
-            let body = futures_stream(rx);
+            let body = chunks(rx);
             Ok(http::Response::from_parts(parts, body))
         })
     }
 }
 
 /// The chunks after the head, as a body.
-fn futures_stream(rx: rt::channel::Receiver<io::Result<Piece>>) -> crate::http::Body {
+fn chunks(rx: rt::channel::Receiver<io::Result<Piece>>) -> crate::http::Body {
     struct Chunks(rt::channel::Receiver<io::Result<Piece>>);
 
     impl futures_core::Stream for Chunks {

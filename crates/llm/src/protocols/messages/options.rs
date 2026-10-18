@@ -1,6 +1,6 @@
 //! How each dialect answers the request's generation settings: the fields
 //! it merges into the body. A setting a model or a dialect cannot take is
-//! left out rather than failing the request (where rig refuses it):
+//! left out rather than failing the request:
 //!
 //! - Anthropic reads its effort levels, thinking budget and sampling from
 //!   the model ([`crate::models::anthropic`]); an unlisted model gets the newest
