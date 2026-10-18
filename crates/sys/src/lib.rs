@@ -1,12 +1,20 @@
 //! Platform specifics. The only crate allowed to use `unsafe`.
 #![allow(unsafe_code)]
 
+pub mod config;
+#[cfg(unix)]
+pub mod install;
+#[cfg(unix)]
+mod login;
 #[cfg(unix)]
 mod runtime;
 
 use std::io;
 use std::path::{Path, PathBuf};
 
+pub use config::Config;
+#[cfg(unix)]
+pub use login::login_env;
 #[cfg(unix)]
 pub use runtime::{Runtime, Staged, VERSION};
 
@@ -52,6 +60,11 @@ impl Home {
 
     pub fn daemon_log(&self) -> PathBuf {
         self.root.join("logs").join("daemon.log")
+    }
+
+    /// The user's settings; see [`Config`].
+    pub fn config_file(&self) -> PathBuf {
+        self.root.join("config.toml")
     }
 
     #[cfg(unix)]
