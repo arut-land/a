@@ -11,6 +11,7 @@ everything around them is our own and small.
 | Spec | `spec.rs` | Provider-agnostic, serde-stable types. Messages are one enum per role (`System`, `User`, `Assistant`, `Tool`), each holding only the parts that role may. Every part carries `meta`: provider state keyed by the protocol that wrote it. |
 | Protocol | `protocol.rs` | A wire protocol is a pure `encode` (request to body) and a pure `Decoder` (frames to events). A `Provider` is data: id, base URL, auth, and a protocol value carrying that host's quirks. `Host` builds one from the environment. |
 | Writer | `writer.rs` | rig's completion fold as a sans-IO helper every decoder writes through (`Writes`). It owns the rules all wires share (see its module doc). |
+| JSON | `json.rs` | Lenient reads of what providers send, the borrowing frame reader every decoder shares (`json/read.rs`), and tool arguments parsed so a cut-off call never fails a reply. |
 | Models | `models/` | What model ids say: reasoning (levels, budgets, whether it turns off), sampling, vision and output limits, as id rules and const tables, one module per vendor. Protocols ask here and keep only how their wire spells an option. |
 | Replay | `replay.rs` | How an encoder sends back a part its own protocol produced: the provider item verbatim while the part is unchanged (fingerprint), its identity when edited, rebuilt otherwise. |
 | Prepare | `prepare.rs` | Runs before every encode: turns from another protocol, provider or model lose reasoning, opaque items and state; foreign tool ids are fitted; unanswered calls get error results. |
@@ -33,8 +34,9 @@ Protocols live in `protocols/<name>/` with a `KEY`, a protocol type holding
 A host on an existing wire is one `HOSTS` entry: id, base URL, key and
 base-URL environment variables, key style, and the quirks it needs. A new
 wire is a new `protocols/` module implementing `Protocol` and `Hosted`,
-listed in `hosts.rs`, whose decoder writes through `Writer`. A fact about
-a model goes in `models/`.
+listed in `hosts.rs`, whose decoder reads frames through `json::read` and
+writes through `Writer`, asking it for what it holds rather than keeping a
+copy. A fact about a model goes in `models/`.
 
 ## Testing
 
