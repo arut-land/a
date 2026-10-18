@@ -46,6 +46,11 @@ impl Home {
         self.run_dir().join("daemon.pid")
     }
 
+    /// The settings every session starts from; see the engine's `config`.
+    pub fn config_file(&self) -> PathBuf {
+        self.root.join("config.toml")
+    }
+
     pub fn sessions_dir(&self) -> PathBuf {
         self.root.join("sessions")
     }

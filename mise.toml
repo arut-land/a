@@ -52,10 +52,11 @@ deny = "cargo deny check"
 # The black-box M1 acceptance tests (apps/cli/tests) on the dev build.
 acceptance = "cargo nextest run -p a --test acceptance --no-tests=fail"
 # `a web` on the dev build against an isolated home (target/web-home) and
-# the echo agent (A_AGENT=chat for a model); its daemon stops with it.
+# the model-backed agent, with the keys .env.local gives (A_AGENT=echo for
+# none); its daemon stops with it.
 web = '''
 cargo build -p a
-export A_HOME=$PWD/target/web-home A_AGENT=${A_AGENT:-echo}
+export A_HOME=$PWD/target/web-home
 trap 'target/debug/a daemon stop >/dev/null' EXIT
 target/debug/a web
 '''
@@ -84,6 +85,7 @@ swift test --package-path apps/apple/AKit
     "cargo build-release -p a",
     "xcodebuild -quiet -project apps/apple/A.xcodeproj -scheme A -configuration Debug -destination platform=macOS,arch=arm64 -derivedDataPath apps/apple/build build",
 ] }
-# In the foreground, with this shell's environment: `A_HOME=... A_AGENT=echo
-# mise run apple:run` gives the app and the daemon it starts their own home.
+# In the foreground, with this shell's environment (and .env.local's keys):
+# `A_HOME=... mise run apple:run` gives the app and the daemon it starts
+# their own home.
 "apple:run" = { depends = ["apple:build"], run = "apps/apple/build/Build/Products/Debug/A.app/Contents/MacOS/A" }

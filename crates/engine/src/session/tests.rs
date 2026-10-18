@@ -6,7 +6,6 @@ use std::thread;
 use agent::{Builtin, Extension, Hook, Registrar, Registry, Tool};
 use bytes::Bytes;
 use llm::http::{BoxFuture, Http};
-use llm::protocols::responses;
 use protocol::{Decision, Permission};
 use serde::Deserialize as _;
 use serde_json::json;
@@ -130,11 +129,12 @@ impl Extension for Harbor {
 }
 
 /// A model endpoint that answers each request with the next canned SSE
-/// body, and keeps what it was sent.
+/// body, and keeps what it was sent and the credential it came with.
 #[derive(Default)]
 struct Script {
     replies: Mutex<VecDeque<String>>,
     sent: Mutex<Vec<Value>>,
+    keys: Mutex<Vec<String>>,
 }
 
 impl Script {
@@ -148,6 +148,10 @@ impl Script {
     fn sent(&self) -> Vec<Value> {
         lock(&self.sent).clone()
     }
+
+    fn keys(&self) -> Vec<String> {
+        lock(&self.keys).clone()
+    }
 }
 
 impl Http for Script {
@@ -156,6 +160,8 @@ impl Http for Script {
         request: http::Request<Bytes>,
     ) -> BoxFuture<'static, io::Result<llm::http::Response>> {
         lock(&self.sent).push(serde_json::from_slice(request.body()).unwrap_or_default());
+        let key = request.headers().get("authorization");
+        lock(&self.keys).push(key.and_then(|k| k.to_str().ok()).unwrap_or("").to_owned());
         let reply = lock(&self.replies).pop_front().map(|body| {
             http::Response::builder()
                 .status(200)
@@ -186,31 +192,41 @@ fn cassette(path: &str) -> Vec<String> {
         .collect()
 }
 
-fn openai(script: &Arc<Script>) -> Model {
-    let (host, quirks) = responses::HOSTS
-        .iter()
-        .find(|(host, _)| host.id == "openai")
-        .unwrap();
-    let provider = llm::Provider::new(
-        host.id,
-        "http://scripted",
-        llm::Auth::None,
-        responses::Responses::new(*quirks),
-    );
-    Model::new(provider, "gpt-5.6".into(), Arc::clone(script))
+/// The daemon's environment in these tests: a key, and no home file.
+fn daemon_env(name: &str) -> Option<String> {
+    (name == "OPENAI_API_KEY").then(|| "daemon".to_owned())
+}
+
+/// `gpt-5.6` on `OpenAI`, answered by `script`.
+fn openai(script: &Arc<Script>) -> Models {
+    with_home(
+        script,
+        &std::env::temp_dir().join("a-engine-no-config.toml"),
+    )
+}
+
+/// [`openai`], with the home config file at `path`.
+fn with_home(script: &Arc<Script>, path: &Path) -> Models {
+    Models {
+        settings: crate::config::Settings {
+            process: daemon_env,
+            ..crate::config::Settings::new(path.to_owned(), Some("gpt-5.6".into()), None)
+        },
+        http: Arc::clone(script) as Arc<dyn Http>,
+    }
 }
 
 struct Fixture(Arc<Shared>);
 
 impl Fixture {
-    fn new(agent: agent::Kind, registry: Registry, model: Model) -> Self {
+    fn new(agent: agent::Kind, registry: Registry, mut models: Models) -> Self {
+        models.settings.agent = Some(agent);
         Self(Arc::new(Shared {
             // One worker: no effect may hold it.
             rt: Arc::new(rt::Threads::new(1)),
             store: Arc::new(store::Memory::default()),
-            agent,
             registry,
-            model: Ok(model),
+            models,
             daemon: Weak::new(),
         }))
     }
@@ -383,6 +399,112 @@ fn the_model_calls_a_tool_and_answers_from_its_result() {
         assert_eq!(got, log, "cut after {cut}");
         assert_eq!(script.sent(), sent[1..], "cut after {cut}");
     }
+}
+
+#[test]
+fn model_calls_take_credentials_from_the_client_then_the_config_then_the_daemon() {
+    let replies = cassette("openai/streaming_grammar/tool_then_followup_text.yaml");
+    let dir = std::env::temp_dir().join(format!("a-engine-credentials-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let config = dir.join("config.toml");
+    let key_sent = |client: Option<&str>, file: Option<&str>| {
+        let text = file.map_or_else(String::new, |key| {
+            format!("[env]\nOPENAI_API_KEY = \"{key}\"\n")
+        });
+        std::fs::write(&config, text).unwrap();
+        let script = Script::new(&replies);
+        let fixture = Fixture::new(
+            agent::Kind::Chat,
+            Registry::default().with(&Harbor),
+            with_home(&script, &config),
+        );
+        let session = fixture.start(&[]);
+        if let Some(key) = client {
+            let vars = [("OPENAI_API_KEY".into(), key.into())];
+            session
+                .set_env(Environment::new(dir.clone(), vars, false))
+                .unwrap();
+        }
+        session.submit("Call the tool, then answer.".into());
+        settle(&session);
+        session.stop();
+        let keys = script.keys();
+        assert_eq!(keys.len(), 2);
+        assert_eq!(keys[0], keys[1]);
+        keys[0].clone()
+    };
+    assert_eq!(key_sent(Some("client"), Some("file")), "Bearer client");
+    assert_eq!(key_sent(None, Some("file")), "Bearer file");
+    assert_eq!(key_sent(None, None), "Bearer daemon");
+    std::fs::remove_dir_all(dir).unwrap();
+}
+
+#[test]
+fn a_missing_credential_fails_the_model_call_saying_where_to_set_it() {
+    let script = Script::new(&[]);
+    let config = std::env::temp_dir().join("a-engine-no-config.toml");
+    let mut models = with_home(&script, &config);
+    models.settings.process = |_| None;
+    let fixture = Fixture::new(agent::Kind::Chat, Registry::default(), models);
+    let session = fixture.start(&[]);
+    session.submit("hi".into());
+    settle(&session);
+    let log = log_of(&session);
+    session.stop();
+    let error = match &bodies(&log)[..] {
+        [
+            Body::User { .. },
+            Body::ModelCall { model },
+            Body::ModelResult {
+                outcome: Outcome::Failed { error },
+                ..
+            },
+            ..,
+        ] if model == "none" => error.clone(),
+        other => panic!("{other:#?}"),
+    };
+    assert!(error.contains("OPENAI_API_KEY"), "{error}");
+    assert!(error.contains(&config.display().to_string()), "{error}");
+    assert_eq!(script.sent(), Vec::<Value>::new());
+}
+
+/// The engine's model path against a real endpoint: `mise exec -- cargo
+/// nextest run -p engine --run-ignored only live`. Keys, base URL and
+/// `A_MODEL` come from the environment, as a daemon's would.
+#[test]
+#[ignore = "calls a real endpoint"]
+fn live_the_model_calls_a_tool_and_answers_from_its_result() {
+    let rt: rt::Rt = Arc::new(rt::Threads::new(2));
+    let home = std::env::temp_dir().join("a-engine-no-config.toml");
+    let models = Models {
+        settings: crate::config::Settings::new(home, std::env::var("A_MODEL").ok(), None),
+        http: Arc::new(llm::Ureq::new(rt)),
+    };
+    let fixture = Fixture::new(agent::Kind::Chat, Registry::default().with(&Harbor), models);
+    let session = fixture.start(&[]);
+    session.submit("Call lookup_harbor_label, then tell me the label it returned.".into());
+    let deadline = Instant::now() + Duration::from_secs(120);
+    while session.has_work() {
+        assert!(Instant::now() < deadline, "no answer");
+        thread::sleep(Duration::from_millis(50));
+    }
+    let log = log_of(&session);
+    session.stop();
+    assert!(
+        log.iter().any(|e| matches!(
+            &e.body,
+            Body::ToolResult { outcome: Outcome::Done { output }, .. } if output == "crimson-harbor"
+        )),
+        "{log:#?}"
+    );
+    let Some(Body::ModelResult {
+        outcome: Outcome::Done { output },
+        ..
+    }) = log.last().map(|e| &e.body)
+    else {
+        panic!("{log:#?}");
+    };
+    assert!(output.to_string().contains("crimson-harbor"), "{output}");
 }
 
 #[test]
