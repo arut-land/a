@@ -78,6 +78,13 @@ impl Config {
             }),
         }
     }
+
+    /// The built-in extensions, registered as any other.
+    fn registry(&self) -> agent::Registry {
+        agent::Registry::default()
+            .with(&agent::Builtin)
+            .with(&agent::AskFor(self.ask.clone()))
+    }
 }
 
 /// Every lock here guards state a panicking holder leaves consistent, so
@@ -122,11 +129,7 @@ impl Daemon {
                 rt,
                 store,
                 agent: config.agent,
-                tools: agent::Toolset::default(),
-                hooks: std::iter::once(
-                    Box::new(agent::AskFor(config.ask.clone())) as Box<dyn agent::Hook>
-                )
-                .collect(),
+                registry: config.registry(),
                 model,
                 daemon: daemon.clone(),
             }),

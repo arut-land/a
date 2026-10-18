@@ -11,7 +11,7 @@ use std::sync::{Arc, Mutex, MutexGuard, Weak};
 use std::task::{Poll, Waker};
 use std::time::{Duration, Instant};
 
-use agent::{Action, Agent, Cx, Decided, DynTool, Gate, Hooks, Input, Replay, Toolset};
+use agent::{Action, Agent, Cx, Decided, DynTool, Gate, Input, Replay};
 use protocol::{Body, DaemonMsg, Decision, Entry, Environment, Outcome, SessionId, SessionSummary};
 use serde_json::Value;
 use store::{Header, Loaded, Log, LogStore, Parent};
@@ -32,8 +32,8 @@ pub struct Shared {
     pub rt: rt::Rt,
     pub store: Arc<dyn LogStore>,
     pub agent: agent::Kind,
-    pub tools: Toolset,
-    pub hooks: Hooks,
+    /// The extensions' tools and hooks.
+    pub registry: agent::Registry,
     /// The model, or why there is none (shown as the failed model call).
     pub model: Result<Model, String>,
     /// Where linked sessions are started and found.
@@ -272,7 +272,7 @@ impl Session {
         st.log.append(&entry)?;
         st.clients
             .retain(|c| c.send(DaemonMsg::Entry(entry.clone())).is_ok());
-        self.shared.hooks.observe(&entry);
+        self.shared.registry.hooks().observe(&entry);
         let asked = match entry.body {
             Body::Ask { call } => Some(call),
             _ => None,
@@ -366,7 +366,8 @@ impl Session {
             let mut decided = Decided::new();
             let next = self
                 .shared
-                .hooks
+                .registry
+                .hooks()
                 .on_stop(&self.lock().entries, &mut decided);
             self.decide(decided)?;
             match next {
@@ -407,7 +408,11 @@ impl Session {
                     Err(error)
                 } else {
                     let mut decided = Decided::new();
-                    let verdict = self.shared.hooks.gate(&tool, &mut input, &mut decided);
+                    let verdict =
+                        self.shared
+                            .registry
+                            .hooks()
+                            .gate(&tool, &mut input, &mut decided);
                     self.decide(decided)?;
                     verdict
                 };
@@ -496,7 +501,7 @@ impl Session {
             ),
             Call::Tool { tool, input } => {
                 let mut decided = Decided::new();
-                let hooks = &self.shared.hooks;
+                let hooks = self.shared.registry.hooks();
                 hooks.post_tool(seq, (tool, input), &mut outcome, &mut decided);
                 self.decide(decided)?;
                 (
@@ -531,7 +536,7 @@ impl Session {
             spawned: &spawned,
             rt: &*self.shared.rt,
         };
-        contain(self.shared.tools.run(tool, input, &cx)).await
+        contain(self.shared.registry.tools().run(tool, input, &cx)).await
     }
 
     /// Asks the model to reply to the transcript before `call`, offering the
@@ -546,12 +551,13 @@ impl Session {
                 };
             }
         };
-        let tools = &self.shared.tools;
+        let tools = self.shared.registry.tools();
         let history = transcript(&self.lock().entries, call, tools);
         let mut request = model.request(history, tools.specs());
         let mut decided = Decided::new();
         self.shared
-            .hooks
+            .registry
+            .hooks()
             .prepare_step(call, &mut request, &mut decided);
         if let Err(e) = self.decide(decided) {
             return Outcome::Failed {
@@ -615,7 +621,8 @@ impl Session {
                 }
                 Call::Tool { .. } if asked == Asked::Answered(false) => not_approved(),
                 Call::Tool { tool, .. }
-                    if self.shared.tools.get(tool).map(DynTool::replay) != Some(Replay::Safe) =>
+                    if self.shared.registry.tools().get(tool).map(DynTool::replay)
+                        != Some(Replay::Safe) =>
                 {
                     Outcome::Interrupted
                 }
