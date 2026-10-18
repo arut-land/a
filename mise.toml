@@ -18,6 +18,7 @@ shell = "bash -o errexit -o pipefail -c"
 [tools]
 mr-boxington = "latest"
 "cargo:cargo-nextest" = "0.9"
+"cargo:cargo-deny" = "0.20"
 mold = { version = "latest", os = ["linux"] }
 hyperfine = "latest"
 "cargo:cargo-bloat" = "latest"
@@ -43,3 +44,4 @@ bloat = "cargo bloat --release --crates -n 20"
 # writer) is what rewrites it.
 "generate:usage" = "UPDATE_USAGE=1 cargo test -q -p a --bin a embedded_spec"
 "bloat:lines" = "cargo llvm-lines --release -p a | head -30"
+deny = "cargo deny check"

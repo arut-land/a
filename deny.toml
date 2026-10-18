@@ -1,0 +1,55 @@
+# cargo-deny: `mise run deny`.
+
+[graph]
+# What we ship; the lockfile also resolves wasm, Android and other targets.
+targets = [
+    "aarch64-apple-darwin",
+    "x86_64-apple-darwin",
+    "x86_64-unknown-linux-gnu",
+    "aarch64-unknown-linux-gnu",
+    "x86_64-pc-windows-msvc",
+]
+
+[advisories]
+yanked = "deny"
+ignore = [
+    { id = "RUSTSEC-2024-0449", reason = "unsafe-libyaml is test-only: the llm parity tests read recorded YAML cassettes" },
+]
+
+[licenses]
+allow = [
+    "Apache-2.0",
+    "Apache-2.0 WITH LLVM-exception",
+    "BSD-3-Clause",
+    "CDLA-Permissive-2.0",
+    "ISC",
+    "MIT",
+    "Unicode-3.0",
+    "Unlicense",
+]
+confidence-threshold = 0.9
+
+[licenses.private]
+ignore = true
+
+[bans]
+multiple-versions = "deny"
+skip = [
+    { crate = "getrandom@0.2.17", reason = "ring pins 0.2; uuid and tempfile are on 0.4" },
+    { crate = "syn@2.0.119", reason = "openssl-macros, from native-tls's Linux branch, which never builds: ureq's features are unified across targets" },
+]
+wildcards = "deny"
+allow-wildcard-paths = true
+deny = [
+    # Sync engine: no async runtime or the HTTP stacks built on one.
+    { crate = "tokio", reason = "the shipped engine is sync; rt's tokio adapter is opt-in" },
+    { crate = "async-std", reason = "the shipped engine is sync" },
+    { crate = "hyper", reason = "ureq is the HTTP client" },
+    { crate = "reqwest", reason = "ureq is the HTTP client" },
+    # TLS is native on Apple and Windows, rustls elsewhere.
+    { crate = "aws-lc-sys", reason = "rustls uses ring" },
+]
+
+[sources]
+unknown-registry = "deny"
+unknown-git = "deny"
