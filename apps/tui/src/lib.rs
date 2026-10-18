@@ -8,6 +8,10 @@
 //! terminal and the daemon each feed it from their own thread, so an idle
 //! client never wakes.
 
+// The terminal is driven through Unix termios; elsewhere `a` runs the line
+// REPL and only the renderer's tests use the rest.
+#![cfg_attr(not(unix), allow(dead_code))]
+
 mod app;
 mod editor;
 mod keys;

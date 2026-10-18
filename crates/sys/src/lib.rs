@@ -8,6 +8,9 @@ pub mod install;
 mod login;
 #[cfg(unix)]
 mod runtime;
+#[cfg(not(unix))]
+#[path = "unstaged.rs"]
+mod runtime;
 #[cfg(unix)]
 pub mod tty;
 
@@ -18,7 +21,6 @@ use std::path::{Path, PathBuf};
 pub use config::Config;
 #[cfg(unix)]
 pub use login::login_env;
-#[cfg(unix)]
 pub use runtime::{Runtime, Staged, VERSION};
 
 /// Locations under the per-user home (`$A_HOME`, default `~/.a`).
@@ -76,7 +78,6 @@ impl Home {
         self.root.join("config.toml")
     }
 
-    #[cfg(unix)]
     pub fn runtime(&self) -> Runtime {
         Runtime::new(self.root.join("runtime"))
     }
@@ -103,6 +104,7 @@ pub enum Signal {
 
 /// Stable across builds, unlike `std`'s hashers, so every version of `a`
 /// finds the same socket and the same staging stamps.
+#[cfg(unix)]
 fn fnv1a(bytes: &[u8]) -> u64 {
     bytes.iter().fold(0xcbf2_9ce4_8422_2325, |h, &b| {
         (h ^ u64::from(b)).wrapping_mul(0x0100_0000_01b3)

@@ -11,13 +11,13 @@ use std::path::PathBuf;
 use std::thread;
 use std::time::{Duration, Instant};
 
-use protocol::{ClientMsg, DaemonMsg, Environment, PROTO, read_frame, write_frame};
-use sys::{Home, Signal};
+use protocol::{ClientMsg, DaemonMsg, Environment, read_frame, write_frame};
+use sys::{Home, Signal, Staged};
 
 #[cfg(unix)]
-use std::os::unix::net::UnixStream;
+use protocol::PROTO;
 #[cfg(unix)]
-use sys::Staged;
+use std::os::unix::net::UnixStream;
 
 /// The read half of a connection, over any byte stream.
 pub struct Reader(BufReader<Box<dyn Read + Send>>);
@@ -73,6 +73,7 @@ impl Reader {
     }
 
     /// Waits for a draining daemon to close the connection as it exits.
+    #[cfg(unix)]
     fn drained(&mut self) -> io::Result<()> {
         while self.recv()?.is_some() {}
         Ok(())
@@ -98,6 +99,7 @@ pub enum Endpoint {
 pub const HELLO_TIMEOUT: Duration = Duration::from_secs(2);
 
 /// How long to wait for a draining daemon: its grace plus a margin.
+#[cfg(unix)]
 const DRAIN_TIMEOUT: Duration = Duration::from_secs(75);
 
 /// Connects as build `staged` and completes the hello. A daemon draining for
@@ -146,6 +148,25 @@ pub fn connect(
     Err(io::Error::other("the daemon kept closing the connection"))
 }
 
+/// The daemon and its transports are Unix only until the named pipe
+/// transport lands.
+#[cfg(not(unix))]
+pub fn connect(
+    _endpoint: &Endpoint,
+    _staged: &Staged,
+    _on_drain: &dyn Fn(),
+) -> io::Result<Connection> {
+    Err(unsupported())
+}
+
+#[cfg(not(unix))]
+fn unsupported() -> io::Error {
+    io::Error::new(
+        io::ErrorKind::Unsupported,
+        "a's daemon does not run on this platform yet",
+    )
+}
+
 #[cfg(unix)]
 fn split(stream: &UnixStream) -> io::Result<Connection> {
     Ok(Connection {
@@ -155,6 +176,7 @@ fn split(stream: &UnixStream) -> io::Result<Connection> {
     })
 }
 
+#[cfg(unix)]
 enum Greeting {
     Welcome,
     Draining,
@@ -187,6 +209,7 @@ fn mismatch(endpoint: &Endpoint, staged: &Staged, supported: u32) -> io::Error {
     io::Error::new(io::ErrorKind::Unsupported, message)
 }
 
+#[cfg(unix)]
 fn hello(reader: &mut Reader, writer: &mut Writer, build: &str) -> io::Result<Greeting> {
     writer.send(&ClientMsg::Hello {
         proto: PROTO,
@@ -262,12 +285,12 @@ pub fn stop(home: &Home) -> io::Result<bool> {
         }
         thread::sleep(Duration::from_millis(20));
     }
+    #[cfg(unix)]
     let _ = fs::remove_file(home.socket());
     Ok(true)
 }
 
 /// Stops any running daemon and connects to a fresh one.
-#[cfg(unix)]
 pub fn restart(home: &Home, staged: &Staged) -> io::Result<Connection> {
     stop(home)?;
     connect(&Endpoint::Local(home.clone()), staged, &|| {})
@@ -294,6 +317,11 @@ pub fn bridge(home: &Home, token: &str) -> io::Result<()> {
         std::process::exit(0);
     });
     pump(&stream, stdout)
+}
+
+#[cfg(not(unix))]
+pub fn bridge(_home: &Home, _token: &str) -> io::Result<()> {
+    Err(unsupported())
 }
 
 /// Copies until EOF, flushing each read: stdout is line-buffered and frames
