@@ -3,7 +3,7 @@
 
 use std::ffi::OsString;
 use std::io::{self, BufRead, BufReader, Read};
-use std::process::{Child, Command, Stdio};
+use std::process::{Command, Stdio};
 use std::thread;
 use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -77,17 +77,13 @@ fn bridge(host: &str, script: &str, token: &str) -> io::Result<Option<Connection
     };
     let stdin = child.stdin.take().expect("piped");
     // Reaps ssh once the connection is closed.
-    thread::spawn(move || reap(child));
+    thread::spawn(move || child.wait());
     Ok(Some(Connection {
         reader: Reader(out),
         writer: Writer::new(Box::new(stdin)),
         remote: Some(remote),
         welcome: Welcome::default(),
     }))
-}
-
-fn reap(mut child: Child) {
-    let _ = child.wait();
 }
 
 /// Copies this build to `~/.a/runtime/<id>/a` on `host`; a host of another

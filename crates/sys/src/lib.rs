@@ -128,45 +128,48 @@ fn fnv1a(bytes: &[u8]) -> u64 {
     })
 }
 
+#[cfg(not(unix))]
+pub use other::*;
 #[cfg(unix)]
 pub use unix::*;
 
+/// Where processes have no groups or signals: nothing is running, and
+/// nothing can be signalled.
 #[cfg(not(unix))]
-pub fn boot_id() -> Option<&'static str> {
-    None
-}
+mod other {
+    use std::io;
 
-#[cfg(not(unix))]
-pub fn kill_process_group(_pgid: u32) -> io::Result<()> {
-    Err(io::Error::from(io::ErrorKind::Unsupported))
-}
+    use super::Signal;
 
-#[cfg(not(unix))]
-pub fn signal_group(_pgid: u32, _signal: Signal) -> io::Result<()> {
-    Err(io::Error::from(io::ErrorKind::Unsupported))
-}
+    pub fn boot_id() -> Option<&'static str> {
+        None
+    }
 
-#[cfg(not(unix))]
-pub fn group_alive(_pgid: u32) -> bool {
-    false
-}
+    pub fn kill_process_group(_pgid: u32) -> io::Result<()> {
+        Err(io::ErrorKind::Unsupported.into())
+    }
 
-#[cfg(not(unix))]
-pub fn process_started(_pid: u32) -> Option<u64> {
-    None
-}
+    pub fn signal_group(_pgid: u32, _signal: Signal) -> io::Result<()> {
+        Err(io::ErrorKind::Unsupported.into())
+    }
 
-#[cfg(not(unix))]
-pub fn new_session(_cmd: &mut std::process::Command) {}
+    pub fn group_alive(_pgid: u32) -> bool {
+        false
+    }
 
-#[cfg(not(unix))]
-pub fn signal_name(raw: i32) -> String {
-    format!("signal {raw}")
-}
+    pub fn process_started(_pid: u32) -> Option<u64> {
+        None
+    }
 
-#[cfg(not(unix))]
-pub fn signal_process(_pid: u32, _signal: Signal) -> io::Result<()> {
-    Err(io::Error::from(io::ErrorKind::Unsupported))
+    pub fn new_session(_cmd: &mut std::process::Command) {}
+
+    pub fn signal_name(raw: i32) -> String {
+        format!("signal {raw}")
+    }
+
+    pub fn signal_process(_pid: u32, _signal: Signal) -> io::Result<()> {
+        Err(io::ErrorKind::Unsupported.into())
+    }
 }
 
 #[cfg(unix)]

@@ -13,7 +13,7 @@ use std::time::Duration;
 
 use boltffi::{EventSubscription, export};
 use client::{Connection, Endpoint, Reader, Writer};
-use protocol::view::{Link, SessionList};
+use protocol::view::Link;
 use protocol::{ClientDecl, ClientMsg, Environment, SessionId, Target};
 use rt::{Runtime, Threads};
 use sys::install::CliLink;
@@ -136,15 +136,8 @@ impl Client {
     pub async fn sessions(&self) -> Result<Vec<SessionInfo>, ClientError> {
         let daemon = self.daemon.clone();
         blocking(move || {
-            let Connection {
-                mut reader,
-                mut writer,
-                ..
-            } = daemon.connect()?;
-            writer.send(&ClientMsg::List)?;
-            let mut list = SessionList::default();
-            reader.until(|msg| list.fold(&msg).then_some(()))?;
-            Ok(list.sessions.iter().map(Into::into).collect())
+            let sessions = daemon.connect()?.sessions()?;
+            Ok(sessions.iter().map(Into::into).collect())
         })
         .await
     }

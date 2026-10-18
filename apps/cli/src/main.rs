@@ -1,15 +1,14 @@
 use std::io::{self, BufRead, IsTerminal, Write};
-use std::mem;
 use std::process::ExitCode;
 use std::sync::{Arc, Mutex, PoisonError};
 use std::thread;
 
 use client::Endpoint;
 use protocol::view::{
-    Approval, Change, Item, Link, Part, SessionList, SessionView, Status, Usage, call_title,
-    decision_line, output_text, recap_line,
+    Approval, Change, Item, Link, Part, SessionView, Status, Usage, call_title, decision_line,
+    output_text, recap_line,
 };
-use protocol::{Card, ClientMsg, DaemonMsg, Outcome, SessionId, SessionSummary, Target};
+use protocol::{Card, ClientMsg, DaemonMsg, Outcome, SessionId, Target};
 use sys::{Home, Staged};
 use usage_rs::{Cli, Subcommands};
 
@@ -209,7 +208,9 @@ fn daemon_cmd(ctx: &Ctx, action: &DaemonCmd) -> io::Result<()> {
             match d.pid {
                 None => println!("not running"),
                 Some(pid) => {
-                    match client::connect(&ctx.endpoint, &ctx.staged, &|| {}).and_then(list) {
+                    match client::connect(&ctx.endpoint, &ctx.staged, &|| {})
+                        .and_then(client::Connection::sessions)
+                    {
                         Ok(s) => println!("running (pid {pid}), {} sessions", s.len()),
                         Err(e) => println!("running (pid {pid}) but not responding: {e}"),
                     }
@@ -505,20 +506,8 @@ fn print_outcome(outcome: &Outcome, card: Option<&Card>) {
     }
 }
 
-fn list(
-    client::Connection {
-        mut reader,
-        mut writer,
-        ..
-    }: client::Connection,
-) -> io::Result<Vec<SessionSummary>> {
-    writer.send(&ClientMsg::List)?;
-    let mut list = SessionList::default();
-    reader.until(|msg| list.fold(&msg).then(|| mem::take(&mut list.sessions)))
-}
-
 fn ls(ctx: &Ctx) -> io::Result<()> {
-    for s in list(ctx.connect()?)? {
+    for s in ctx.connect()?.sessions()? {
         println!(
             "{}  {:<9}  {:<10}  {:>4} entries  {}",
             s.id.short(),
@@ -532,7 +521,9 @@ fn ls(ctx: &Ctx) -> io::Result<()> {
 }
 
 fn find(ctx: &Ctx, prefix: &str) -> io::Result<SessionId> {
-    let matches: Vec<_> = list(ctx.connect()?)?
+    let matches: Vec<_> = ctx
+        .connect()?
+        .sessions()?
         .into_iter()
         .filter(|s| {
             s.id.short().to_string().starts_with(prefix) || s.id.to_string().starts_with(prefix)

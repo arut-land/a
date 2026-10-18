@@ -11,8 +11,10 @@ use std::path::PathBuf;
 use std::thread;
 use std::time::{Duration, Instant};
 
+use protocol::view::SessionList;
 use protocol::{
-    Caps, ClientDecl, ClientMsg, DaemonMsg, Environment, Target, read_frame, write_frame,
+    Caps, ClientDecl, ClientMsg, DaemonMsg, Environment, SessionSummary, Target, read_frame,
+    write_frame,
 };
 use sys::crash::{Crashes, Record};
 use sys::{Home, Signal, Staged};
@@ -86,6 +88,14 @@ impl Connection {
     /// Sends each of `msgs`.
     pub fn send_all(&mut self, msgs: &[ClientMsg]) -> io::Result<()> {
         msgs.iter().try_for_each(|msg| self.writer.send(msg))
+    }
+
+    /// The daemon's sessions.
+    pub fn sessions(mut self) -> io::Result<Vec<SessionSummary>> {
+        self.writer.send(&ClientMsg::List)?;
+        let mut list = SessionList::default();
+        self.reader
+            .until(|msg| list.fold(&msg).then(|| std::mem::take(&mut list.sessions)))
     }
 }
 
@@ -168,7 +178,6 @@ const DRAIN_TIMEOUT: Duration = Duration::from_secs(75);
 /// a newer build is waited out (`on_drain` says so first), then the next
 /// attempt starts the new build. A local daemon that does not answer in time
 /// fails with `ErrorKind::TimedOut`; see [`diagnose`] and [`restart`].
-#[cfg(unix)]
 pub fn connect(
     endpoint: &Endpoint,
     staged: &Staged,
@@ -227,15 +236,6 @@ pub fn connect_with(
 
 /// The daemon and its transports are Unix only until the named pipe
 /// transport lands.
-#[cfg(not(unix))]
-pub fn connect(
-    _endpoint: &Endpoint,
-    _staged: &Staged,
-    _on_drain: &dyn Fn(),
-) -> io::Result<Connection> {
-    Err(unsupported())
-}
-
 #[cfg(not(unix))]
 pub fn connect_with(
     _endpoint: &Endpoint,
