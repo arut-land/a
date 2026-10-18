@@ -16,7 +16,7 @@ use serde::Serialize;
 use serde_json::Value;
 
 use crate::{
-    Body, DaemonMsg, Decision, Entry, Environment, Outcome, Recap, SessionId, SessionSummary,
+    Body, Card, DaemonMsg, Decision, Entry, Environment, Outcome, Recap, SessionId, SessionSummary,
 };
 
 /// One session as a client shows it.
@@ -93,9 +93,19 @@ pub enum Item {
         input: Value,
         approval: Option<Approval>,
         outcome: Option<Outcome>,
+        /// How the tool presents the call, or once it has one, its outcome.
+        #[serde(skip_serializing_if = "Option::is_none")]
+        card: Option<Card>,
         /// Whether this client was asked to approve it.
         #[serde(skip)]
         asked: bool,
+    },
+    /// A slash command and its outcome.
+    Command {
+        call: u64,
+        name: String,
+        args: String,
+        outcome: Option<Outcome>,
     },
     /// A hook decision, other than a user's answer to an ask (which is the
     /// call's [`Approval`]).
@@ -126,7 +136,10 @@ impl Item {
             | Self::Assistant { seq, .. }
             | Self::Hook { seq, .. }
             | Self::Environment { seq, .. } => *seq,
-            Self::Reply { call, .. } | Self::Tool { call, .. } | Self::Child { call, .. } => *call,
+            Self::Reply { call, .. }
+            | Self::Tool { call, .. }
+            | Self::Child { call, .. }
+            | Self::Command { call, .. } => *call,
         }
     }
 }
@@ -209,7 +222,7 @@ pub enum Change {
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum Part {
-    /// A tool's result, a reply's, or a child's fired watch.
+    /// A tool's result, a reply's, a command's, or a child's fired watch.
     Outcome,
     Approval,
     Watch,
@@ -334,13 +347,22 @@ impl SessionView {
                 seq,
                 text: text.clone(),
             },
-            Body::ToolCall { tool, input, .. } => Item::Tool {
+            Body::ToolCall {
+                tool, input, card, ..
+            } => Item::Tool {
                 call: seq,
                 tool: tool.clone(),
                 input: input.clone(),
                 approval: None,
                 outcome: None,
+                card: card.clone(),
                 asked: false,
+            },
+            Body::Command { name, args } => Item::Command {
+                call: seq,
+                name: name.clone(),
+                args: args.clone(),
+                outcome: None,
             },
             Body::ModelCall { model } => Item::Reply {
                 call: seq,
@@ -384,9 +406,29 @@ impl SessionView {
     /// Folds entry `seq`, which changes an item already shown.
     fn change(&mut self, seq: u64, body: &Body) -> Option<Change> {
         match body {
-            Body::ToolResult { call, outcome } => {
+            Body::ToolResult {
+                call,
+                outcome,
+                card,
+            } => {
                 let at = self.call(*call)?;
-                let Item::Tool { outcome: o, .. } = &mut self.items[at] else {
+                let Item::Tool {
+                    outcome: o,
+                    card: shown,
+                    ..
+                } = &mut self.items[at]
+                else {
+                    return None;
+                };
+                *o = Some(outcome.clone());
+                if card.is_some() {
+                    shown.clone_from(card);
+                }
+                Some(self.updated(at, Part::Outcome))
+            }
+            Body::CommandResult { call, outcome } => {
+                let at = self.call(*call)?;
+                let Item::Command { outcome: o, .. } = &mut self.items[at] else {
                     return None;
                 };
                 *o = Some(outcome.clone());
@@ -473,6 +515,7 @@ impl SessionView {
                     input: input.clone(),
                     approval: Some(Approval::Pending),
                     outcome: None,
+                    card: None,
                     asked: false,
                 };
                 self.items.insert(at, item);

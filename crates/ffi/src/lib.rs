@@ -278,8 +278,17 @@ pub enum ViewItem {
         input_json: String,
         approval: Option<ApprovalState>,
         outcome: Option<ToolOutcome>,
+        /// How the tool presents the call, or once it has one, its outcome.
+        card: Option<ToolCard>,
         /// Whether this client was asked to approve it.
         asked: bool,
+    },
+    /// A slash command and its outcome.
+    Command {
+        call: u64,
+        name: String,
+        args: String,
+        outcome: Option<ToolOutcome>,
     },
     Hook {
         seq: u64,
@@ -309,9 +318,23 @@ impl ViewItem {
             | Self::Assistant { seq, .. }
             | Self::Hook { seq, .. }
             | Self::Environment { seq, .. } => *seq,
-            Self::Reply { call, .. } | Self::Tool { call, .. } | Self::Child { call, .. } => *call,
+            Self::Reply { call, .. }
+            | Self::Tool { call, .. }
+            | Self::Child { call, .. }
+            | Self::Command { call, .. } => *call,
         }
     }
+}
+
+/// How a tool call or its outcome is shown; see [`protocol::Card`].
+#[data]
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ToolCard {
+    pub title: String,
+    /// Preformatted text, such as output or a diff; may be empty.
+    pub body: String,
+    /// A short status, such as `exit 1`; may be empty.
+    pub note: String,
 }
 
 #[data]
@@ -524,6 +547,7 @@ impl From<&Item> for ViewItem {
                 input,
                 approval,
                 outcome,
+                card,
                 asked,
             } => Self::Tool {
                 call: *call,
@@ -535,7 +559,23 @@ impl From<&Item> for ViewItem {
                     Approval::Denied => ApprovalState::Denied,
                 }),
                 outcome: outcome.as_ref().map(Into::into),
+                card: card.as_ref().map(|c| ToolCard {
+                    title: c.title.clone(),
+                    body: c.body.clone(),
+                    note: c.note.clone(),
+                }),
                 asked: *asked,
+            },
+            Item::Command {
+                call,
+                name,
+                args,
+                outcome,
+            } => Self::Command {
+                call: *call,
+                name: name.clone(),
+                args: args.clone(),
+                outcome: outcome.as_ref().map(Into::into),
             },
             Item::Hook {
                 seq,

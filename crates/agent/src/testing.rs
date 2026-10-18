@@ -1,0 +1,130 @@
+//! A stand-in engine for tool tests: calls run against a registry, with
+//! state folded and processes recorded in memory.
+
+use std::path::PathBuf;
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{LazyLock, Mutex, MutexGuard, PoisonError};
+
+use protocol::{Body, Entry, Environment, Outcome, SessionId};
+use serde_json::Value;
+
+use crate::{Cancel, Cx, Hooks, Host, Registry, States};
+
+static RT: LazyLock<rt::Threads> = LazyLock::new(rt::Threads::default);
+
+fn lock<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
+    mutex.lock().unwrap_or_else(PoisonError::into_inner)
+}
+
+pub struct Rig {
+    pub registry: Registry,
+    pub dir: PathBuf,
+    pub env: Option<Environment>,
+    pub cancel: Cancel,
+    pub session: SessionId,
+    states: Mutex<States>,
+    /// The `ext` entries the calls logged.
+    pub log: Mutex<Vec<Entry>>,
+    pub spawned: Mutex<Vec<(u32, bool)>>,
+    calls: AtomicU64,
+}
+
+impl Rig {
+    /// A rig in a fresh directory named for `name`, its workspace.
+    pub fn new(name: &str, registry: Registry) -> Self {
+        let dir = std::env::temp_dir().join(format!("a-rig-{name}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(dir.join("ws")).unwrap();
+        let dir = std::fs::canonicalize(dir).unwrap();
+        Self {
+            states: Mutex::new(registry.states()),
+            registry,
+            dir,
+            env: None,
+            cancel: Cancel::default(),
+            session: SessionId::new(),
+            log: Mutex::default(),
+            spawned: Mutex::default(),
+            calls: AtomicU64::new(0),
+        }
+    }
+
+    pub fn workspace(&self) -> PathBuf {
+        self.dir.join("ws")
+    }
+
+    pub fn spill(&self) -> PathBuf {
+        self.dir.join("spill")
+    }
+
+    /// Runs tool `tool` on `input`.
+    pub fn call(&self, tool: &str, input: &Value) -> Outcome {
+        let call = self.calls.fetch_add(1, Ordering::SeqCst) + 1;
+        let (workspace, spill) = (self.workspace(), self.spill());
+        let cx = Cx {
+            workspace: &workspace,
+            env: self.env.as_ref(),
+            session: self.session,
+            call,
+            model: "test:model",
+            spill: &spill,
+            cancel: &self.cancel,
+            rt: &*RT,
+            host: self,
+        };
+        rt::block_on(self.registry.tools().run(tool, input, &cx))
+    }
+
+    /// The output of a call that must succeed.
+    pub fn done(&self, tool: &str, input: &Value) -> Value {
+        match self.call(tool, input) {
+            Outcome::Done { output } => output,
+            other => panic!("{tool} {input}: {other:?}"),
+        }
+    }
+
+    /// As after a restart: state rebuilt from the log alone.
+    pub fn restart(&self) {
+        let mut states = self.registry.states();
+        states.replay(&lock(&self.log));
+        *lock(&self.states) = states;
+    }
+}
+
+impl Drop for Rig {
+    fn drop(&mut self) {
+        for &(pgid, _) in lock(&self.spawned).iter() {
+            let _ = sys::kill_process_group(pgid);
+        }
+        let _ = std::fs::remove_dir_all(&self.dir);
+    }
+}
+
+impl Host for Rig {
+    fn spawned(&self, pgid: u32, background: bool) {
+        lock(&self.spawned).push((pgid, background));
+    }
+
+    fn note(&self, ext: &'static str, state: &'static str, data: Value) {
+        lock(&self.states).fold(ext, state, &data);
+        let mut log = lock(&self.log);
+        let seq = log.len() as u64 + 1;
+        log.push(Entry {
+            seq,
+            epoch: 0,
+            body: Body::Ext {
+                ext: ext.to_owned(),
+                state: state.to_owned(),
+                data,
+            },
+        });
+    }
+
+    fn states(&self) -> MutexGuard<'_, States> {
+        lock(&self.states)
+    }
+
+    fn hooks(&self) -> &Hooks {
+        self.registry.hooks()
+    }
+}

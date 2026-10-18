@@ -6,7 +6,7 @@ use std::thread;
 
 use client::Endpoint;
 use protocol::view::{Approval, Change, Item, Link, Part, SessionList, SessionView, Status, Usage};
-use protocol::{ClientMsg, DaemonMsg, Outcome, Recap, SessionId, SessionSummary, Target};
+use protocol::{Card, ClientMsg, DaemonMsg, Outcome, Recap, SessionId, SessionSummary, Target};
 use sys::{Home, Staged};
 use usage_rs::{Cli, Subcommands};
 
@@ -290,6 +290,7 @@ fn repl(ctx: Ctx, target: Target) -> io::Result<()> {
         let msg = match (line.trim(), asked) {
             ("", _) => continue,
             ("/detach", _) => break,
+            ("/interrupt", _) => ClientMsg::Interrupt,
             // A remote host's environment is the one its bridge started
             // with; reattaching captures it again.
             ("/env refresh", _) if remote => {
@@ -352,9 +353,11 @@ impl Screen {
             Change::Added { item, .. } => added(item),
             Change::Updated { item, part, .. } => self.updated(item, *part),
             Change::Asked {
-                item: Item::Tool { tool, input, .. },
+                item: Item::Tool {
+                    tool, input, card, ..
+                },
                 ..
-            } => println!("? approve {}  [y/n]", call_text(tool, input)),
+            } => println!("? approve {}  [y/n]", title(tool, input, card.as_ref())),
             Change::Recap(recap) => println!("{}", recap_line(recap)),
             Change::Mismatch { supported } => eprintln!("[daemon speaks protocol {supported}]"),
             Change::Error { message } => eprintln!("[error: {message}]"),
@@ -367,14 +370,22 @@ impl Screen {
             (
                 Item::Tool {
                     outcome: Some(outcome),
-                    ..
-                }
-                | Item::Child {
-                    fired: Some(outcome),
+                    card,
                     ..
                 },
                 Part::Outcome,
-            ) => print_outcome(outcome),
+            ) => print_outcome(outcome, card.as_ref()),
+            (
+                Item::Child {
+                    fired: Some(outcome),
+                    ..
+                }
+                | Item::Command {
+                    outcome: Some(outcome),
+                    ..
+                },
+                Part::Outcome,
+            ) => print_outcome(outcome, None),
             (
                 Item::Tool {
                     approval: Some(answer @ (Approval::Approved | Approval::Denied)),
@@ -425,7 +436,10 @@ fn added(item: &Item) {
     match item {
         Item::User { text, .. } => println!("you  {text}"),
         Item::Assistant { text, .. } => println!("a    {text}"),
-        Item::Tool { tool, input, .. } => println!("tool {}", call_text(tool, input)),
+        Item::Tool {
+            tool, input, card, ..
+        } => println!("tool {}", title(tool, input, card.as_ref())),
+        Item::Command { name, args, .. } => println!("cmd  /{name} {args}"),
         Item::Hook { hook, decision, .. } => println!("  · hook {hook}: {decision:?}"),
         Item::Child { child, input, .. } => println!("child {} {input}", child.short()),
         Item::Environment { cwd, .. } => println!("  · env {}", cwd.display()),
@@ -433,12 +447,13 @@ fn added(item: &Item) {
     }
 }
 
-/// A tool call as shown: a command as `$ command`, anything else as the
-/// tool and its input.
-fn call_text(tool: &str, input: &serde_json::Value) -> String {
-    match input["command"].as_str() {
-        Some(command) => format!("$ {command}"),
-        None => format!("{tool} {input}"),
+/// A tool call as shown: as its tool presents it, else a command as
+/// `$ command` and anything else as the tool and its input.
+fn title(tool: &str, input: &serde_json::Value, card: Option<&Card>) -> String {
+    match (card, input["command"].as_str()) {
+        (Some(card), _) => card.title.clone(),
+        (None, Some(command)) => format!("$ {command}"),
+        (None, None) => format!("{tool} {input}"),
     }
 }
 
@@ -467,8 +482,24 @@ fn recap_line(recap: &Recap) -> String {
     parts.join(" · ") + "]"
 }
 
-fn print_outcome(outcome: &Outcome) {
+/// An outcome as its tool's card presents it, else a command's streams as
+/// older logs hold them, text as lines, and anything else as JSON.
+fn print_outcome(outcome: &Outcome, card: Option<&Card>) {
     match outcome {
+        Outcome::Done { .. } if let Some(card) = card.filter(|c| !c.note.is_empty()) => {
+            for line in card.body.lines() {
+                println!("  │ {line}");
+            }
+            println!("  └ {}", card.note);
+        }
+        Outcome::Done {
+            output: serde_json::Value::String(text),
+        } => {
+            for line in text.lines() {
+                println!("  │ {line}");
+            }
+            println!("  └ done");
+        }
         Outcome::Done { output } => {
             if let Some(stdout) = output["stdout"].as_str() {
                 let stderr = output["stderr"].as_str().unwrap_or_default();

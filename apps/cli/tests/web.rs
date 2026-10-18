@@ -218,7 +218,7 @@ fn the_link_signs_in_once_and_foreign_requests_are_refused() {
 #[test]
 fn a_tab_streams_replies_and_answers_asks_until_it_closes() {
     let mut env = Env::new("web-chat");
-    env.vars.push(("A_ASK", "run_command"));
+    env.vars.push(("A_ASK", "bash"));
     let mut web = Web::start(&env);
     web.sign_in();
     let created = web.ours("POST", "/new", "");

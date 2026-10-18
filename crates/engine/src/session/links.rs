@@ -330,6 +330,7 @@ mod tests {
         let ran = Body::ToolResult {
             call: 1,
             outcome: done.clone(),
+            card: None,
         };
         assert_eq!(result(&[entry(1, said("a")), entry(2, ran)]), done);
         assert_eq!(

@@ -40,7 +40,7 @@ fn idle_sessions_hibernate_and_reload_on_attach() {
     let daemon = Daemon::load(&home, &echo()).unwrap();
     let attachment = daemon.resolve(&Target::New, "/w".into()).unwrap();
     let id = attachment.session().id;
-    attachment.session().submit("hi".into());
+    attachment.session().submit("hi".into()).unwrap();
     settle(&daemon);
     drop(attachment);
 
@@ -98,6 +98,7 @@ fn busy_sessions_recover_at_startup() {
             tool: tool.into(),
             input,
             id: None,
+            card: None,
         };
         log.append(&Entry {
             seq,
@@ -116,16 +117,17 @@ fn busy_sessions_recover_at_startup() {
 
     // The log's header predates extension records, so recovery notes them
     // first. The safe sleep runs again; the shell command is not rerun.
-    assert!(matches!(&got[2], Body::Extensions { installed } if installed.len() == 2));
+    assert!(matches!(&got[2], Body::Extensions { installed } if installed.len() == 5));
     assert!(matches!(
         &got[3],
-        Body::ToolResult { call: 1, outcome: Outcome::Done { output } } if output["slept"] == 0
+        Body::ToolResult { call: 1, outcome: Outcome::Done { output }, card: None } if output["slept"] == 0
     ));
     assert!(matches!(
         &got[4],
         Body::ToolResult {
             call: 2,
-            outcome: Outcome::Interrupted
+            outcome: Outcome::Interrupted,
+            card: None,
         }
     ));
     assert_eq!(got.len(), 5);
@@ -148,7 +150,7 @@ fn a_parent_hears_from_its_child_exactly_once() {
     let daemon = Daemon::load(&home, &echo()).unwrap();
     let parent = daemon.resolve(&Target::New, "/w".into()).unwrap();
     let id = parent.session().id;
-    parent.session().submit("spawn hi".into());
+    parent.session().submit("spawn hi".into()).unwrap();
     settle(&daemon);
     drop(parent);
     let store = &*daemon.shared.store;
@@ -167,7 +169,7 @@ fn a_parent_hears_from_its_child_exactly_once() {
     // so the hibernated parent stays unloaded.
     daemon.hibernate(Duration::ZERO);
     let again = daemon.resolve(&Target::Id(child), "/w".into()).unwrap();
-    again.session().submit("more".into());
+    again.session().submit("more".into()).unwrap();
     settle(&daemon);
     drop(again);
     let parent_slot = daemon.slots().into_iter().find(|s| s.header.id == id);
@@ -225,7 +227,7 @@ fn a_child_runs_in_its_parents_environment() {
         ..Environment::default()
     };
     parent.session().set_env(env.clone()).unwrap();
-    parent.session().submit("spawn hi".into());
+    parent.session().submit("spawn hi".into()).unwrap();
     settle(&daemon);
     drop(parent);
     let store = &*daemon.shared.store;
@@ -286,6 +288,7 @@ fn watches_rearm_after_a_crash_and_fire_once() {
         tool: "sleep".into(),
         input: json!({ "seconds": 0 }),
         id: None,
+        card: None,
     };
     let slept = Outcome::Done {
         output: json!({ "slept": 0 }),
@@ -305,6 +308,7 @@ fn watches_rearm_after_a_crash_and_fire_once() {
     let done = Body::ToolResult {
         call: 2,
         outcome: slept.clone(),
+        card: None,
     };
     write(&child, vec![opened(), sleep(), done], false);
     parents.push(parent.id);

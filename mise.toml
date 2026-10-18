@@ -75,7 +75,7 @@ budgets = { depends = ["size"], run = 'A_BIN=$PWD/target/release/a A_STRICT_BUDG
 # live session on a daemon of its own (a throwaway A_HOME, the echo agent).
 "apple:test" = { depends = ["apple:ffi"], run = '''
 cargo build -p a
-export A_HOME=$(mktemp -d) A_AGENT=echo A_ASK=run_command A_TEST_HELPER=$PWD/target/debug/a
+export A_HOME=$(mktemp -d) A_AGENT=echo A_ASK=bash A_TEST_HELPER=$PWD/target/debug/a
 trap 'target/debug/a daemon stop >/dev/null; rm -rf "$A_HOME"' EXIT
 swift test --package-path apps/apple/AKit
 ''' }

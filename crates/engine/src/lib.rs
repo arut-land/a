@@ -41,6 +41,9 @@ pub struct Config {
     /// `A_ASK`: comma-separated tools whose calls wait for the user's
     /// approval.
     pub ask: Vec<String>,
+    /// `A_SYSTEM_PROMPT`: the system prompt, in place of the one the
+    /// extensions make.
+    pub system_prompt: Option<String>,
 }
 
 impl Default for Config {
@@ -52,6 +55,7 @@ impl Default for Config {
             agent: None,
             model: None,
             ask: Vec::new(),
+            system_prompt: None,
         }
     }
 }
@@ -77,14 +81,22 @@ impl Config {
                     .map(str::to_owned)
                     .collect()
             }),
+            system_prompt: std::env::var("A_SYSTEM_PROMPT")
+                .ok()
+                .filter(|prompt| !prompt.is_empty()),
         }
     }
 
-    /// The built-in extensions, registered as any other.
-    fn registry(&self) -> agent::Registry {
-        agent::Registry::default()
-            .with(&agent::Builtin)
-            .with(&agent::AskFor(self.ask.clone()))
+    /// The built-in extensions, registered as any other. The echo agent's
+    /// `sleep` is a test fixture: no model is offered it.
+    fn registry(&self) -> Result<agent::Registry, agent::Refused> {
+        let registry = agent::builtins(&agent::Policy {
+            ask: self.ask.clone(),
+        })?;
+        match self.agent {
+            Some(agent::Kind::Echo) => registry.with(&agent::Fixtures),
+            _ => Ok(registry),
+        }
     }
 }
 
@@ -132,12 +144,16 @@ impl Daemon {
             settings: config::Settings::new(home.config_file(), config.model.clone(), config.agent),
             http: Arc::new(llm::Ureq::new(Arc::clone(&rt))),
         };
+        let registry = config.registry().map_err(io::Error::other)?;
         let daemon = Arc::new_cyclic(|daemon| Self {
             shared: Arc::new(Shared {
                 rt,
                 store,
-                registry: config.registry(),
+                registry,
                 models,
+                system: config.system_prompt.clone(),
+                spill: home.spill_dir(),
+                loaded: Mutex::default(),
                 daemon: daemon.clone(),
             }),
             slots: Mutex::new(slots),
@@ -239,14 +255,21 @@ impl Daemon {
     }
 
     fn has_work(&self) -> bool {
-        self.slots()
-            .iter()
-            .any(|slot| lock(&slot.live).as_ref().is_some_and(|s| s.has_work()))
+        self.live().iter().any(|s| s.has_work())
     }
 
-    /// No connections, and no loaded session has work.
+    fn live(&self) -> Vec<Arc<Session>> {
+        self.slots()
+            .iter()
+            .filter_map(|slot| lock(&slot.live).clone())
+            .collect()
+    }
+
+    /// No connections, and no loaded session has work or background
+    /// processes.
     fn idle(&self) -> bool {
-        self.clients.load(Ordering::SeqCst) == 0 && !self.has_work()
+        self.clients.load(Ordering::SeqCst) == 0
+            && !self.live().iter().any(|s| s.has_work() || s.has_jobs())
     }
 
     /// Hibernates idle sessions, and exits once the whole daemon has been
@@ -255,11 +278,25 @@ impl Daemon {
     /// drain needs; unfinished calls recover in the next daemon.
     async fn supervise(&self, life: &Lifecycle, config: &Config, socket: &Path, pid: File) {
         let mut since: Option<Instant> = None;
+        // When a drain out of grace stopped the calls still running.
+        let mut stopped: Option<Instant> = None;
         loop {
             self.shared.rt.sleep(Duration::from_millis(250)).await;
             self.hibernate(config.hibernate);
             if let Some(began) = life.draining() {
-                if !self.has_work() || began.elapsed() >= config.drain {
+                if began.elapsed() >= config.drain && stopped.is_none() {
+                    for session in self.live() {
+                        session.interrupt();
+                    }
+                    stopped = Some(Instant::now());
+                }
+                // A stopped call gets the time its processes have to go
+                // and its outcome to commit.
+                let settled = stopped.is_some_and(|at| at.elapsed() >= agent::Kill::GRACE * 2);
+                if !self.has_work() || settled {
+                    for session in self.live() {
+                        session.stop();
+                    }
                     exit(socket, pid, "drained for a newer build");
                 }
                 continue;
@@ -436,7 +473,15 @@ fn handle(daemon: &Daemon, life: &Lifecycle, conn: UnixStream) -> io::Result<()>
                 );
             }
             ClientMsg::Input { text } => match &attached {
-                Some(s) => s.session().submit(text),
+                Some(s) => {
+                    if let Err(message) = s.session().submit(text) {
+                        error(message);
+                    }
+                }
+                None => error("not attached".into()),
+            },
+            ClientMsg::Interrupt => match &attached {
+                Some(s) => s.session().interrupt(),
                 None => error("not attached".into()),
             },
             ClientMsg::Approve { call, approved } => match &attached {

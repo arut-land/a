@@ -3,10 +3,10 @@ use std::sync::atomic::AtomicBool;
 use std::sync::mpsc;
 use std::thread;
 
-use agent::{Builtin, Extension, Hook, Registrar, Registry, Tool};
+use agent::{Extension, Hook, Policy, Registrar, Registry, Tool};
 use bytes::Bytes;
 use llm::http::{BoxFuture, Http};
-use protocol::{Decision, Permission};
+use protocol::{Card, Decision, Permission};
 use serde::Deserialize as _;
 use serde_json::json;
 
@@ -30,6 +30,7 @@ fn finds_calls_without_outcomes() {
         tool: tool.into(),
         input: json!({}),
         id: None,
+        card: None,
     };
     let entries = [
         entry(1, tool_call("sleep")),
@@ -38,15 +39,17 @@ fn finds_calls_without_outcomes() {
             Body::ToolResult {
                 call: 1,
                 outcome: Outcome::Interrupted,
+                card: None,
             },
         ),
-        entry(3, tool_call("run_command")),
+        entry(3, tool_call("bash")),
         entry(
             4,
             Body::ToolProcess {
                 call: 3,
                 pgid: 42,
                 boot: "boot".into(),
+                background: false,
             },
         ),
         entry(5, Body::ModelCall { model: "m".into() }),
@@ -227,6 +230,9 @@ impl Fixture {
             store: Arc::new(store::Memory::default()),
             registry,
             models,
+            system: None,
+            spill: std::env::temp_dir().join(format!("a-spill-{}", std::process::id())),
+            loaded: Mutex::default(),
             daemon: Weak::new(),
         }))
     }
@@ -298,13 +304,13 @@ fn a_step_commits_its_entries_together_and_a_failed_one_leaves_no_trace() {
     };
     let session = Session::start(header, loaded, Arc::clone(&fixture.0));
     settle(&session);
-    session.submit("hi".into());
+    session.submit("hi".into()).unwrap();
     settle(&session);
     probe.failing.store(true, Ordering::SeqCst);
-    session.submit("lost".into());
+    session.submit("lost".into()).unwrap();
     settle(&session);
     probe.failing.store(false, Ordering::SeqCst);
-    session.submit("again".into());
+    session.submit("again".into()).unwrap();
     settle(&session);
     let log = log_of(&session);
     session.stop();
@@ -342,10 +348,12 @@ fn log_of(session: &Session) -> Vec<Entry> {
 fn the_model_calls_a_tool_and_answers_from_its_result() {
     let replies = cassette("openai/streaming_grammar/tool_then_followup_text.yaml");
     let script = Script::new(&replies);
-    let tools = Registry::default().with(&Harbor);
+    let tools = Registry::default().with(&Harbor).unwrap();
     let fixture = Fixture::new(agent::Kind::Chat, tools, openai(&script));
     let session = fixture.start(&[]);
-    session.submit("Call the tool, then answer.".into());
+    session
+        .submit("Call the tool, then answer.".into())
+        .unwrap();
     settle(&session);
     let log = log_of(&session);
     session.stop();
@@ -360,7 +368,7 @@ fn the_model_calls_a_tool_and_answers_from_its_result() {
                 Body::ModelCall { .. },
                 Body::ModelResult { call: 2, outcome: Outcome::Done { .. } },
                 Body::ToolCall { tool, id: Some(id), .. },
-                Body::ToolResult { call: 4, outcome: Outcome::Done { output } },
+                Body::ToolResult { call: 4, outcome: Outcome::Done { output }, card: None },
                 Body::ModelCall { .. },
                 Body::ModelResult { call: 6, outcome: Outcome::Done { output: answer } },
             ] if tool == "lookup_harbor_label" && id == call_id && output == "crimson-harbor"
@@ -390,7 +398,7 @@ fn the_model_calls_a_tool_and_answers_from_its_result() {
         let script = Script::new(&replies[1..]);
         let fixture = Fixture::new(
             agent::Kind::Chat,
-            Registry::default().with(&Harbor),
+            Registry::default().with(&Harbor).unwrap(),
             openai(&script),
         );
         let resumed = fixture.start(&log[..cut]);
@@ -415,7 +423,7 @@ fn model_calls_take_credentials_from_the_client_then_the_config_then_the_daemon(
         let script = Script::new(&replies);
         let fixture = Fixture::new(
             agent::Kind::Chat,
-            Registry::default().with(&Harbor),
+            Registry::default().with(&Harbor).unwrap(),
             with_home(&script, &config),
         );
         let session = fixture.start(&[]);
@@ -425,7 +433,9 @@ fn model_calls_take_credentials_from_the_client_then_the_config_then_the_daemon(
                 .set_env(Environment::new(dir.clone(), vars, false))
                 .unwrap();
         }
-        session.submit("Call the tool, then answer.".into());
+        session
+            .submit("Call the tool, then answer.".into())
+            .unwrap();
         settle(&session);
         session.stop();
         let keys = script.keys();
@@ -447,7 +457,7 @@ fn a_missing_credential_fails_the_model_call_saying_where_to_set_it() {
     models.settings.process = |_| None;
     let fixture = Fixture::new(agent::Kind::Chat, Registry::default(), models);
     let session = fixture.start(&[]);
-    session.submit("hi".into());
+    session.submit("hi".into()).unwrap();
     settle(&session);
     let log = log_of(&session);
     session.stop();
@@ -480,9 +490,15 @@ fn live_the_model_calls_a_tool_and_answers_from_its_result() {
         settings: crate::config::Settings::new(home, std::env::var("A_MODEL").ok(), None),
         http: Arc::new(llm::Ureq::new(rt)),
     };
-    let fixture = Fixture::new(agent::Kind::Chat, Registry::default().with(&Harbor), models);
+    let fixture = Fixture::new(
+        agent::Kind::Chat,
+        Registry::default().with(&Harbor).unwrap(),
+        models,
+    );
     let session = fixture.start(&[]);
-    session.submit("Call lookup_harbor_label, then tell me the label it returned.".into());
+    session
+        .submit("Call lookup_harbor_label, then tell me the label it returned.".into())
+        .unwrap();
     let deadline = Instant::now() + Duration::from_secs(120);
     while session.has_work() {
         assert!(Instant::now() < deadline, "no answer");
@@ -553,7 +569,10 @@ fn a_fired_watch_wakes_the_model_with_the_childs_result() {
 #[test]
 fn extensions_are_logged_when_they_change() {
     let script = Script::new(&[]);
-    let registry = Registry::default().with(&Harbor).with(&Builtin);
+    let registry = Registry::default()
+        .with(&Harbor)
+        .and_then(|r| r.with(&agent::builtin::Shell))
+        .unwrap();
     let fixture = Fixture::new(agent::Kind::Echo, registry, openai(&script));
     // Created with these extensions: nothing to log.
     let same = fixture.start(&[]);
@@ -579,21 +598,29 @@ fn extensions_are_logged_when_they_change() {
     );
 }
 
-/// Denies shell commands, and has the agent go on once after it stops.
-struct Policy;
+/// The built-ins and the `sleep` fixture, with `policy` as given.
+fn echoing(policy: &Policy) -> Registry {
+    agent::builtins(policy)
+        .and_then(|r| r.with(&agent::Fixtures))
+        .unwrap()
+}
 
-impl Extension for Policy {
+/// In place of the built-in `policy`: denies shell commands, and has the
+/// agent go on once after it stops.
+struct Strict;
+
+impl Extension for Strict {
     const NAME: &'static str = "policy";
     const VERSION: u32 = 1;
 
     fn contribute(&self, r: &mut Registrar) {
-        r.on(Policy);
+        r.on(Strict);
     }
 }
 
-impl Hook for Policy {
+impl Hook for Strict {
     fn permission(&self, tool: &str, _: &Value) -> Permission {
-        if tool == agent::tools::RunCommand::NAME {
+        if tool == agent::tools::Bash::NAME {
             Permission::Deny
         } else {
             Permission::Allow
@@ -618,11 +645,11 @@ impl Hook for Policy {
 fn hook_decisions_are_logged_and_replay_to_the_same_state() {
     let fixture = Fixture::new(
         agent::Kind::Echo,
-        Registry::default().with(&Builtin).with(&Policy),
+        echoing(&Policy::default()).with(&Strict).unwrap(),
         openai(&Script::new(&[])),
     );
     let session = fixture.start(&[]);
-    session.submit("$ echo hi".into());
+    session.submit("$ echo hi".into()).unwrap();
     settle(&session);
     let log = log_of(&session);
     session.stop();
@@ -638,19 +665,24 @@ fn hook_decisions_are_logged_and_replay_to_the_same_state() {
                 text: "$ echo hi".into()
             },
             &policy(Decision::Permission {
-                tool: "run_command".into(),
+                tool: "bash".into(),
                 permission: Permission::Deny,
             }),
             &Body::ToolCall {
-                tool: "run_command".into(),
+                tool: "bash".into(),
                 input: json!({ "command": "echo hi" }),
                 id: None,
+                card: Some(Card {
+                    title: "$ echo hi".into(),
+                    ..Card::default()
+                }),
             },
             &Body::ToolResult {
                 call: 3,
                 outcome: Outcome::Failed {
                     error: "policy denied this call".into()
                 },
+                card: None,
             },
             &policy(Decision::OnStop {
                 text: "and again".into()
@@ -677,13 +709,13 @@ fn hook_decisions_are_logged_and_replay_to_the_same_state() {
 fn a_gate_cut_off_by_a_crash_logs_its_decisions_once() {
     let fixture = Fixture::new(
         agent::Kind::Echo,
-        Registry::default().with(&Builtin).with(&Policy),
+        echoing(&Policy::default()).with(&Strict).unwrap(),
         openai(&Script::new(&[])),
     );
     let denied = Body::Hook {
         hook: "policy".into(),
         decision: Decision::Permission {
-            tool: "run_command".into(),
+            tool: "bash".into(),
             permission: Permission::Deny,
         },
     };
@@ -703,20 +735,19 @@ fn a_gate_cut_off_by_a_crash_logs_its_decisions_once() {
 /// commands all overlap.
 #[test]
 fn sessions_wait_on_effects_without_holding_the_worker() {
-    let ask = agent::AskFor(vec![agent::tools::Sleep::NAME.to_owned()]);
     let fixture = Fixture::new(
         agent::Kind::Echo,
-        Registry::default().with(&Builtin).with(&ask),
+        echoing(&Policy::ask(&["sleep"])),
         openai(&Script::new(&[])),
     );
     let asked = fixture.start(&[]);
-    asked.submit("sleep 1".into());
+    asked.submit("sleep 1".into()).unwrap();
     settle(&asked);
     let started = Instant::now();
     let commands: Vec<_> = (0..2)
         .map(|_| {
             let session = fixture.start(&[]);
-            session.submit("$ sleep 1".into());
+            session.submit("$ sleep 1".into()).unwrap();
             session
         })
         .collect();
@@ -735,10 +766,9 @@ fn sessions_wait_on_effects_without_holding_the_worker() {
 }
 
 fn asking() -> Fixture {
-    let ask = agent::AskFor(vec![agent::tools::RunCommand::NAME.to_owned()]);
     Fixture::new(
         agent::Kind::Echo,
-        Registry::default().with(&Builtin).with(&ask),
+        echoing(&Policy::ask(&["bash"])),
         openai(&Script::new(&[])),
     )
 }
@@ -763,7 +793,7 @@ fn finished(session: &Session, call: u64) -> Vec<Entry> {
 fn an_ask_waits_in_the_inbox_through_a_stop_and_runs_once_approved() {
     let fixture = asking();
     let session = fixture.start(&[]);
-    session.submit("$ echo approved".into());
+    session.submit("$ echo approved".into()).unwrap();
     // Waiting for an answer is not work.
     settle(&session);
     let asked = log_of(&session);
@@ -795,7 +825,7 @@ fn an_ask_waits_in_the_inbox_through_a_stop_and_runs_once_approved() {
             DaemonMsg::Synced { seq: 4 },
             DaemonMsg::Ask { call: 3, tool, .. },
             ..
-        ] if tool == "run_command"),
+        ] if tool == "bash"),
         "{sent:#?}"
     );
     assert!(
@@ -824,8 +854,9 @@ fn an_ask_waits_in_the_inbox_through_a_stop_and_runs_once_approved() {
                 Body::ToolResult {
                     call: 3,
                     outcome: Outcome::Done { output },
+                    card: Some(card),
                 },
-            ] if output["stdout"] == "approved\n"
+            ] if output["output"] == "approved\n" && card.note == "exit 0"
         ),
         "{log:#?}"
     );
@@ -836,7 +867,7 @@ fn an_ask_waits_in_the_inbox_through_a_stop_and_runs_once_approved() {
 fn a_refused_ask_answers_the_call_without_running_it() {
     let fixture = asking();
     let session = fixture.start(&[]);
-    session.submit("$ echo refused".into());
+    session.submit("$ echo refused".into()).unwrap();
     settle(&session);
     session.answer(3, false).unwrap();
     let log = finished(&session, 3);
@@ -847,7 +878,7 @@ fn a_refused_ask_answers_the_call_without_running_it() {
             &Body::Hook {
                 hook: "user".into(),
                 decision: Decision::Approval {
-                    tool: "run_command".into(),
+                    tool: "bash".into(),
                     approved: false,
                     call: Some(3),
                 },
@@ -857,6 +888,7 @@ fn a_refused_ask_answers_the_call_without_running_it() {
                 outcome: Outcome::Failed {
                     error: "the user did not approve this call".into()
                 },
+                card: None,
             },
         ]
     );
@@ -868,6 +900,7 @@ fn a_recap_tells_the_last_prompt_and_what_followed() {
         tool: tool.into(),
         input: json!({}),
         id: None,
+        card: None,
     };
     let entries = [
         entry(
@@ -894,9 +927,10 @@ fn a_recap_tells_the_last_prompt_and_what_followed() {
             Body::ToolResult {
                 call: 4,
                 outcome: Outcome::Interrupted,
+                card: None,
             },
         ),
-        entry(6, call("run_command")),
+        entry(6, call("bash")),
         entry(7, Body::Ask { call: 6 }),
         entry(8, call("sleep")),
     ];
@@ -905,7 +939,7 @@ fn a_recap_tells_the_last_prompt_and_what_followed() {
         recap(&entries, 0),
         Some(protocol::Recap {
             prompt: Some("go on…".into()),
-            tools: vec!["sleep".into(), "run_command".into(), "sleep".into()],
+            tools: vec!["sleep".into(), "bash".into(), "sleep".into()],
             failed: 1,
             running: 1,
             reply: None,
@@ -920,4 +954,290 @@ fn a_recap_tells_the_last_prompt_and_what_followed() {
         None,
         "an environment alone is nothing to tell"
     );
+}
+
+/// Waits until `done` holds for the session's log.
+fn until(session: &Session, what: &str, done: impl Fn(&[Entry]) -> bool) -> Vec<Entry> {
+    let deadline = Instant::now() + Duration::from_secs(10);
+    loop {
+        let log = log_of(session);
+        if done(&log) {
+            return log;
+        }
+        assert!(Instant::now() < deadline, "never {what}");
+        thread::sleep(Duration::from_millis(5));
+    }
+}
+
+/// `/jobs` answers without a model turn; `shout` rewrites input and
+/// refuses `no`; every `bash` call goes to the background; failed model
+/// requests are retried as `retried`.
+struct Extras;
+
+struct Jobs;
+
+impl agent::Command for Jobs {
+    const NAME: &'static str = "jobs";
+    const DESCRIPTION: &'static str = "Lists jobs.";
+
+    fn run(&self, args: &str, cx: &Cx<'_>) -> impl Future<Output = Result<Value, String>> + Send {
+        let said = format!("{args} in {}", cx.call);
+        std::future::ready(Ok(said.into()))
+    }
+}
+
+impl Extension for Extras {
+    const NAME: &'static str = "extras";
+    const VERSION: u32 = 1;
+
+    fn contribute(&self, r: &mut Registrar) {
+        r.command(Jobs).on(Extras);
+    }
+}
+
+impl Hook for Extras {
+    fn input(&self, text: &str) -> agent::Said {
+        match text {
+            "no" => agent::Said::Reject("not that".into()),
+            text if text.starts_with("shout ") => agent::Said::Replace(text.to_uppercase()),
+            _ => agent::Said::Pass,
+        }
+    }
+
+    fn pre_tool(&self, tool: &str, input: &Value) -> agent::Pre {
+        if tool != "bash" || input["background"] == true {
+            return agent::Pre::Pass;
+        }
+        let mut input = input.clone();
+        input["background"] = true.into();
+        agent::Pre::Replace(input)
+    }
+
+    fn request_error(&self, request: &llm::Request, _: &str) -> Option<llm::Request> {
+        Some(llm::Request {
+            model: "retried".into(),
+            ..request.clone()
+        })
+    }
+}
+
+#[test]
+fn slash_commands_run_without_a_turn_and_input_hooks_rewrite_or_refuse() {
+    let registry = Registry::default().with(&Extras).unwrap();
+    let fixture = Fixture::new(agent::Kind::Echo, registry, openai(&Script::new(&[])));
+    let session = fixture.start(&[]);
+    session.submit("/jobs all of them".into()).unwrap();
+    session.submit("/nope".into()).unwrap();
+    session.submit("shout hi".into()).unwrap();
+    assert_eq!(session.submit("no".into()), Err("extras: not that".into()));
+    settle(&session);
+    let log = log_of(&session);
+    session.stop();
+
+    assert_eq!(
+        bodies(&log),
+        [
+            &Body::Command {
+                name: "jobs".into(),
+                args: "all of them".into()
+            },
+            &Body::CommandResult {
+                call: 1,
+                outcome: Outcome::Done {
+                    output: "all of them in 1".into()
+                }
+            },
+            &Body::User {
+                text: "/nope".into()
+            },
+            &Body::Assistant {
+                text: "/nope".into()
+            },
+            &Body::Hook {
+                hook: "extras".into(),
+                decision: Decision::Input {
+                    original: "shout hi".into()
+                }
+            },
+            &Body::User {
+                text: "SHOUT HI".into()
+            },
+            &Body::Assistant {
+                text: "SHOUT HI".into()
+            },
+        ]
+    );
+    assert!(replay(agent::Kind::Echo.agent().as_mut(), &log).is_empty());
+
+    // A command cut off by a crash is not run again.
+    let cut = fixture.start(&log[..1]);
+    let recovered = log_of(&cut);
+    cut.stop();
+    assert_eq!(
+        bodies(&recovered)[1..],
+        [&Body::CommandResult {
+            call: 1,
+            outcome: Outcome::Interrupted
+        }]
+    );
+}
+
+#[test]
+fn the_model_gets_the_prompt_and_the_logged_context_first() {
+    let replies = cassette("openai/streaming_grammar/tool_then_followup_text.yaml");
+    let script = Script::new(&replies[1..]);
+    let fixture = Fixture::new(
+        agent::Kind::Chat,
+        echoing(&Policy::default()),
+        openai(&script),
+    );
+    let session = fixture.start(&[]);
+    session.submit("hi".into()).unwrap();
+    settle(&session);
+    let log = log_of(&session);
+    session.stop();
+
+    let Body::Context { text } = &log[1].body else {
+        panic!("{log:#?}")
+    };
+    assert!(
+        text.starts_with("<environment>\nworking directory: "),
+        "{text}"
+    );
+    assert!(matches!(log[2].body, Body::ModelCall { .. }));
+    let sent = script.sent();
+    let instructions = sent[0]["instructions"].as_str().unwrap();
+    assert!(instructions.starts_with("You are `a`"), "{instructions}");
+    assert_eq!(sent[0]["input"][0]["content"][0]["text"], *text);
+    assert_eq!(sent[0]["input"][1]["content"][0]["text"], "hi");
+    let tools: Vec<_> = sent[0]["tools"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|t| t["name"].as_str().unwrap())
+        .collect();
+    assert_eq!(tools, ["bash", "edit", "sleep"]);
+    assert_eq!(
+        transcript(&log, u64::MAX, fixture.0.registry.tools())[0],
+        llm::Message::user(text.clone())
+    );
+}
+
+#[test]
+fn a_failed_request_is_retried_as_a_hook_asks() {
+    let registry = Registry::default().with(&Extras).unwrap();
+    let script = Script::new(&[]);
+    let fixture = Fixture::new(agent::Kind::Chat, registry, openai(&script));
+    let session = fixture.start(&[]);
+    session.submit("hi".into()).unwrap();
+    settle(&session);
+    let log = log_of(&session);
+    session.stop();
+
+    let retries: Vec<_> = log
+        .iter()
+        .filter_map(|e| match &e.body {
+            Body::Hook {
+                decision: Decision::Retry { call, attempt, .. },
+                ..
+            } => Some((*call, *attempt)),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(retries, [(2, 1), (2, 2)]);
+    let models: Vec<_> = script.sent().iter().map(|r| r["model"].clone()).collect();
+    assert_eq!(models, ["gpt-5.6", "retried", "retried"]);
+    assert!(matches!(
+        &log.last().unwrap().body,
+        Body::ModelResult {
+            outcome: Outcome::Failed { .. },
+            ..
+        }
+    ));
+}
+
+#[test]
+fn the_shell_directory_survives_a_restart_and_an_interrupt_stops_a_call() {
+    let fixture = Fixture::new(
+        agent::Kind::Echo,
+        echoing(&Policy::default()),
+        openai(&Script::new(&[])),
+    );
+    let session = fixture.start(&[]);
+    let dir = format!("a-cwd-{}", std::process::id());
+    session
+        .submit(format!("$ mkdir -p {dir} && cd {dir}"))
+        .unwrap();
+    settle(&session);
+    let log = log_of(&session);
+    session.stop();
+
+    let again = fixture.start(&log);
+    again.submit("$ pwd".into()).unwrap();
+    let ran = finished(&again, log.len() as u64 + 2);
+    let Some(Body::ToolResult {
+        outcome: Outcome::Done { output },
+        ..
+    }) = ran.last().map(|e| &e.body)
+    else {
+        panic!("{ran:#?}")
+    };
+    assert!(
+        output["output"]
+            .as_str()
+            .unwrap()
+            .ends_with(&format!("/{dir}\n")),
+        "{output}"
+    );
+
+    again.submit("$ sleep 100".into()).unwrap();
+    until(&again, "started", |log| {
+        log.iter()
+            .filter(|e| matches!(e.body, Body::ToolProcess { .. }))
+            .count()
+            == 3
+    });
+    again.interrupt();
+    settle(&again);
+    let log = log_of(&again);
+    again.stop();
+    let _ = std::fs::remove_dir(std::env::temp_dir().join(&dir));
+    let Some(Body::ToolResult {
+        outcome: Outcome::Done { output },
+        ..
+    }) = log.last().map(|e| &e.body)
+    else {
+        panic!("{log:#?}")
+    };
+    assert_eq!(output["aborted"], true, "{output}");
+}
+
+#[test]
+fn background_processes_keep_the_session_and_end_with_it() {
+    let registry = echoing(&Policy::default()).with(&Extras).unwrap();
+    let fixture = Fixture::new(agent::Kind::Echo, registry, openai(&Script::new(&[])));
+    let session = fixture.start(&[]);
+    session.submit("$ sleep 100".into()).unwrap();
+    settle(&session);
+    let log = log_of(&session);
+    let pgid = log
+        .iter()
+        .find_map(|e| match e.body {
+            Body::ToolProcess {
+                pgid,
+                background: true,
+                ..
+            } => Some(pgid),
+            _ => None,
+        })
+        .unwrap();
+    assert!(session.has_jobs());
+    assert_eq!(session.idle_for(), Duration::ZERO);
+    session.stop();
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while sys::group_alive(pgid) {
+        assert!(Instant::now() < deadline, "the job outlived its session");
+        thread::sleep(Duration::from_millis(10));
+    }
+    assert!(!session.has_jobs());
 }

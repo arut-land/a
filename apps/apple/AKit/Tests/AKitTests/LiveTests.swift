@@ -5,7 +5,7 @@ import Testing
 
 /// A session against a real daemon, through the FFI. `mise run apple:test`
 /// runs it with a throwaway `A_HOME` and the echo agent asking before
-/// `run_command`; without `A_TEST_HELPER` (the `a` to stage) it is skipped,
+/// `bash`; without `A_TEST_HELPER` (the `a` to stage) it is skipped,
 /// and it never runs against the default home.
 nonisolated let live = ProcessInfo.processInfo.environment["A_TEST_HELPER"].flatMap { helper in
     ProcessInfo.processInfo.environment["A_HOME"] != nil ? helper : nil
@@ -40,12 +40,12 @@ func aLiveSessionChatsRunsAnApprovedToolAndIsListed() async throws {
 
     await store.send("$ echo hello")
     try await eventually("the ask") { !store.pendingAsks.isEmpty }
-    guard case .tool(let call, _, _, _, _, _) = store.pendingAsks[0] else { return }
+    guard case .tool(let call, _, _, _, _, _, _) = store.pendingAsks[0] else { return }
     await store.approve(call: call, approved: true)
     try await eventually("the outcome") {
         store.items.contains {
-            if case .tool(call, _, _, .approved?, .done(let output)?, _) = $0 {
-                output.contains(#""stdout":"hello\n""#)
+            if case .tool(call, _, _, .approved?, .done(let output)?, let card, _) = $0 {
+                output.contains(#""output":"hello\n""#) && card?.note == "exit 0"
             } else { false }
         }
     }
@@ -69,8 +69,10 @@ func aLiveSessionChatsRunsAnApprovedToolAndIsListed() async throws {
 
 /// `item` as a client that was not asked sees it.
 func unasked(_ item: ViewItem) -> ViewItem {
-    guard case .tool(let call, let tool, let input, let approval, let outcome, _) = item else {
+    guard case .tool(let call, let tool, let input, let approval, let outcome, let card, _) = item else {
         return item
     }
-    return .tool(call: call, tool: tool, inputJson: input, approval: approval, outcome: outcome, asked: false)
+    return .tool(
+        call: call, tool: tool, inputJson: input, approval: approval, outcome: outcome, card: card,
+        asked: false)
 }

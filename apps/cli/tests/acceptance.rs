@@ -91,12 +91,14 @@ fn resume_after_the_terminal_closes_mid_turn_replays_every_entry() {
                 tool: "sleep".into(),
                 input: json!({ "seconds": 1 }),
                 id: None,
+                card: None,
             },
             Body::ToolResult {
                 call,
                 outcome: Outcome::Done {
                     output: json!({ "slept": 1 })
-                }
+                },
+                card: None,
             },
         ]
     );
@@ -230,7 +232,7 @@ fn a_command_run_by_the_agent_uses_the_attaching_shells_path_and_virtualenv() {
     let mut daemons = env.connect();
     daemons.attach(Target::New, &env.ws);
     let bare = daemons.run_command(r#"echo "[$VIRTUAL_ENV]""#);
-    assert_eq!(bare["stdout"], "[]\n", "the daemon runs outside the venv");
+    assert_eq!(bare["output"], "[]\n", "the daemon runs outside the venv");
 
     let mut shell = env.repl_from(&[], |cmd| {
         cmd.env(
@@ -257,7 +259,7 @@ fn a_command_run_by_the_agent_uses_the_attaching_shells_path_and_virtualenv() {
     assert!(session.contains(&id.short().to_string()), "{session}");
     let after = conn.run_command(check);
     assert_eq!(
-        after["stdout"],
+        after["output"],
         format!("venv python in {}\nno-token\n", venv.display())
     );
     let log = fs::read_to_string(env.home.sessions_dir().join(format!("{id}.jsonl"))).unwrap();
@@ -274,7 +276,35 @@ fn a_command_run_by_the_agent_uses_the_attaching_shells_path_and_virtualenv() {
     outside.vars.insert("PATH".into(), "/usr/bin:/bin".into());
     conn.send(&ClientMsg::Environment(outside));
     let refreshed = conn.run_command(r#"echo "[$VIRTUAL_ENV]""#);
-    assert_eq!(refreshed["stdout"], "[]\n");
+    assert_eq!(refreshed["output"], "[]\n");
+}
+
+#[test]
+fn the_shell_keeps_its_directory_across_a_daemon_restart() {
+    let env = Env::new("shell-cwd");
+    env.start();
+    let mut conn = env.connect();
+    let (id, _) = conn.attach(Target::New, &env.ws);
+    let moved = conn.run_command("mkdir -p sub && cd sub");
+    assert_eq!(moved["cwd"], env.ws.join("sub").display().to_string());
+    drop(conn);
+    env.run(&["daemon", "stop"]);
+
+    env.start();
+    let mut conn = env.connect();
+    conn.attach(Target::Id(id), &env.ws);
+    let here = conn.run_command("pwd");
+    assert_eq!(
+        here["output"],
+        format!("{}\n", env.ws.join("sub").display())
+    );
+    let log = env.log(id);
+    assert!(
+        log.iter().any(
+            |e| matches!(&e.body, Body::Ext { ext, state, .. } if ext == "shell" && state == "cwd")
+        ),
+        "{log:#?}"
+    );
 }
 
 #[test]
@@ -378,7 +408,7 @@ fn sessions_outlive_their_daemon() {
 #[test]
 fn a_pending_approval_survives_detach_and_is_re_delivered_on_attach() {
     let mut env = Env::new("approval");
-    env.vars.push(("A_ASK", "run_command"));
+    env.vars.push(("A_ASK", "bash"));
     env.start();
     let mut conn = env.connect();
     let (id, _) = conn.attach(Target::New, &env.ws);
@@ -387,7 +417,7 @@ fn a_pending_approval_survives_detach_and_is_re_delivered_on_attach() {
     let Body::Ask { call } = asked.last().unwrap().body else {
         unreachable!()
     };
-    let ask = |msg: DaemonMsg| matches!(msg, DaemonMsg::Ask { call: c, tool, .. } if c == call && tool == "run_command");
+    let ask = |msg: DaemonMsg| matches!(msg, DaemonMsg::Ask { call: c, tool, .. } if c == call && tool == "bash");
     assert!(ask(conn.recv()));
     drop(conn);
 
@@ -396,7 +426,7 @@ fn a_pending_approval_survives_detach_and_is_re_delivered_on_attach() {
     assert!(replayed.iter().any(|e| e.body == Body::Ask { call }));
     let recap = Recap {
         prompt: Some("$ echo ran > ran.txt".into()),
-        tools: vec!["run_command".into()],
+        tools: vec!["bash".into()],
         asks: 1,
         ..Recap::default()
     };
@@ -413,7 +443,7 @@ fn a_pending_approval_survives_detach_and_is_re_delivered_on_attach() {
     assert_eq!(
         &shown[shown.len() - 2..],
         [
-            "[recap · you: $ echo ran > ran.txt · ran run_command · 1 waiting for approval]",
+            "[recap · you: $ echo ran > ran.txt · ran bash · 1 waiting for approval]",
             "? approve $ echo ran > ran.txt  [y/n]",
         ]
     );
