@@ -60,7 +60,7 @@ impl Http for Ureq {
         let agent = self.agent.clone();
         self.rt.spawn_blocking(Box::new(move || {
             let (parts, body) = request.into_parts();
-            let reply = match agent.run(http::Request::from_parts(parts, body.to_vec())) {
+            let reply = match agent.run(http::Request::from_parts(parts, &*body)) {
                 Ok(reply) => reply,
                 Err(error) => {
                     let _ = tx.send(Err(io::Error::other(error)));
@@ -72,14 +72,13 @@ impl Http for Ureq {
                 return;
             }
             let mut reader = body.into_reader();
+            // Each chunk is copied out at its size: a buffer handed over
+            // whole would hold its full capacity for a few bytes of frame.
+            let mut buf = vec![0; CHUNK];
             loop {
-                let mut buf = vec![0; CHUNK];
                 let piece = match reader.read(&mut buf) {
                     Ok(0) => return,
-                    Ok(n) => {
-                        buf.truncate(n);
-                        Ok(Piece::Chunk(Bytes::from(buf)))
-                    }
+                    Ok(n) => Ok(Piece::Chunk(Bytes::copy_from_slice(&buf[..n]))),
                     Err(error) => Err(error),
                 };
                 let failed = piece.is_err();
