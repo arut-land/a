@@ -250,9 +250,9 @@ fn jsonl_drops_a_torn_tail_and_appends_after_it() {
         assert_eq!(store.count(h.id).unwrap(), 2);
         let mut loaded = store.load(h.id).unwrap();
         assert_eq!(loaded.entries, written);
-        written.extend(append(&mut *loaded.log, [3]));
+        written.extend(append(&mut *loaded.log, 3..=4));
         assert_eq!(store.load(h.id).unwrap().entries, written);
-        assert_eq!(store.count(h.id).unwrap(), 3);
+        assert_eq!(store.count(h.id).unwrap(), 4);
     }
 }
 
