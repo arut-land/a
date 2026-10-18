@@ -14,7 +14,7 @@
 //!   never finished, is incomplete.
 
 use std::borrow::Cow;
-use std::collections::{BTreeMap, HashMap, HashSet};
+use std::collections::BTreeMap;
 
 use serde_json::{Map, Value};
 
@@ -109,7 +109,8 @@ pub struct Writer {
     out: Vec<Event>,
     open: BTreeMap<usize, Draft>,
     /// The part each wire index last closed, whose item may still be edited.
-    ended: HashMap<usize, u32>,
+    /// A reply holds few, and a list costs less code than a map.
+    ended: Vec<(usize, u32)>,
     /// Provider items of parts that closed, by part, with the fingerprint of
     /// the shared fields they were decoded to.
     items: BTreeMap<u32, (Value, String)>,
@@ -118,7 +119,8 @@ pub struct Writer {
     /// Every part emitted, in emission order.
     parts: Vec<u32>,
     next_part: u32,
-    call_ids: HashSet<SmolStr>,
+    /// The ids calls ended with, each once.
+    call_ids: Vec<SmolStr>,
     next_auto: usize,
     by_index: Option<BTreeMap<u32, usize>>,
     lead: Option<u32>,
@@ -253,12 +255,12 @@ impl Writer {
             key,
             out: Vec::new(),
             open: BTreeMap::new(),
-            ended: HashMap::new(),
+            ended: Vec::new(),
             items: BTreeMap::new(),
             opaque: BTreeMap::new(),
             parts: Vec::new(),
             next_part: 0,
-            call_ids: HashSet::new(),
+            call_ids: Vec::new(),
             next_auto: AUTO_INDEX,
             by_index: None,
             lead: None,
@@ -304,7 +306,13 @@ impl Writer {
 
     /// Whether an item opened at `index`, closed since or not.
     pub fn opened(&self, index: usize) -> bool {
-        self.open.contains_key(&index) || self.ended.contains_key(&index)
+        self.open.contains_key(&index) || self.closed(index).is_some()
+    }
+
+    /// The part wire `index` last closed.
+    fn closed(&self, index: usize) -> Option<u32> {
+        let mut ended = self.ended.iter();
+        ended.find(|(at, _)| *at == index).map(|(_, part)| *part)
     }
 
     /// The text, reasoning or argument JSON the open item at `index` holds
@@ -350,7 +358,7 @@ impl Writer {
     }
 
     fn insert(&mut self, index: usize, body: Body, item: Value) {
-        self.ended.remove(&index);
+        self.ended.retain(|(at, _)| *at != index);
         let part = self.next_part;
         self.next_part += 1;
         if let Some(by_index) = &mut self.by_index {
@@ -431,8 +439,8 @@ impl Writer {
             edit(&mut draft.item);
             return Ok(());
         }
-        let part = self.ended.get(&index).ok_or_else(|| not_open(index))?;
-        if let Some((item, _)) = self.items.get_mut(part) {
+        let part = self.closed(index).ok_or_else(|| not_open(index))?;
+        if let Some((item, _)) = self.items.get_mut(&part) {
             edit(item);
         }
         Ok(())
@@ -603,7 +611,7 @@ impl Writer {
             None if self.call_id_slot => (self.local_id(), item),
             Some(_) | None => (self.local_id(), Value::Null),
         };
-        self.call_ids.insert(id.clone());
+        self.call_ids.push(id.clone());
         (id, item)
     }
 
@@ -674,7 +682,8 @@ impl Writer {
             body,
             restated,
         } = self.open.remove(&index).ok_or_else(|| not_open(index))?;
-        self.ended.insert(index, part);
+        self.ended.retain(|(at, _)| *at != index);
+        self.ended.push((index, part));
         let item = match (complete, &body) {
             (true, _) | (false, Body::Opaque { .. } | Body::Media(_)) => item,
             (false, _) => {

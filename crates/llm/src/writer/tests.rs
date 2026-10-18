@@ -1,5 +1,7 @@
 //! Ported from rig's completion-writer tests.
 
+use std::collections::HashSet;
+
 use serde_json::{Value, json};
 
 use super::*;
