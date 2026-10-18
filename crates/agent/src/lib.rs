@@ -8,7 +8,6 @@
 use std::str::FromStr;
 
 use protocol::{Body, Outcome};
-use serde::Deserialize;
 use serde_json::{Value, json};
 
 mod hooks;
@@ -97,7 +96,7 @@ impl Agent for Chat {
                 outcome: Outcome::Done { output },
                 ..
             } => {
-                let Ok(reply) = llm::Response::deserialize(&output) else {
+                let Ok(reply) = llm::Response::from_value(&output) else {
                     return Vec::new();
                 };
                 let limited = self.steps >= MAX_STEPS;

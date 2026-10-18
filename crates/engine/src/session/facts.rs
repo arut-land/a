@@ -6,7 +6,6 @@ use std::collections::{HashMap, VecDeque};
 use agent::{Action, Agent, Input, Toolset};
 use llm::{Message, ToolMessage, ToolResult};
 use protocol::{Body, Decision, Entry, Outcome};
-use serde::Deserialize as _;
 
 /// The conversation before `before`, derived from the log's facts. A model
 /// reply is the assistant message it stored, provider state included; a
@@ -27,7 +26,7 @@ pub fn transcript(entries: &[Entry], before: u64, tools: &Toolset) -> Vec<Messag
             Body::ModelResult {
                 outcome: Outcome::Done { output },
                 ..
-            } => match llm::Response::deserialize(output) {
+            } => match llm::Response::from_value(output) {
                 Ok(reply) => messages.push(Message::Assistant(reply.message)),
                 Err(_) => {
                     if let Some(text) = output["text"].as_str() {

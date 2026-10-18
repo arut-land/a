@@ -4,7 +4,6 @@ use std::fmt;
 use std::io::{self, Read, Write};
 use std::path::PathBuf;
 
-use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use uuid::Uuid;
@@ -109,7 +108,9 @@ pub enum Body {
 /// What a hook decided, by decision point. Only decisions that change
 /// something are logged.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(tag = "point", rename_all = "snake_case")]
+// Externally tagged: an internally tagged enum inside the internally tagged
+// `Body` costs a buffered deserializer per variant.
+#[serde(rename_all = "snake_case")]
 pub enum Decision {
     /// The request of model call `call` was replaced before it was sent.
     PrepareStep { call: u64 },
@@ -243,8 +244,26 @@ pub fn write_frame<T: Serialize>(w: &mut impl Write, msg: &T) -> io::Result<()> 
     w.flush()
 }
 
+/// A record decoded from JSON here, once, rather than in every crate that
+/// reads one: release builds do not share generic instantiations across
+/// crates, and these deserializers are large.
+pub trait Decode: Sized {
+    fn from_json(bytes: &[u8]) -> serde_json::Result<Self>;
+}
+
+macro_rules! decode {
+    ($($t:ty),*) => {$(
+        impl Decode for $t {
+            fn from_json(bytes: &[u8]) -> serde_json::Result<Self> {
+                serde_json::from_slice(bytes)
+            }
+        }
+    )*};
+}
+decode!(Entry, ClientMsg, DaemonMsg);
+
 /// Reads one frame; `Ok(None)` means the peer closed the stream cleanly.
-pub fn read_frame<T: DeserializeOwned>(r: &mut impl Read) -> io::Result<Option<T>> {
+pub fn read_frame<T: Decode>(r: &mut impl Read) -> io::Result<Option<T>> {
     let mut len = [0; 4];
     match r.read_exact(&mut len) {
         Ok(()) => {}
@@ -260,7 +279,7 @@ pub fn read_frame<T: DeserializeOwned>(r: &mut impl Read) -> io::Result<Option<T
     }
     let mut body = vec![0; len as usize];
     r.read_exact(&mut body)?;
-    Ok(Some(serde_json::from_slice(&body)?))
+    Ok(Some(T::from_json(&body)?))
 }
 
 #[cfg(test)]
@@ -321,7 +340,7 @@ mod tests {
     }
 
     #[test]
-    fn hook_decisions_nest_under_their_point() {
+    fn hook_decisions_nest_under_their_point_name() {
         let body = Body::Hook {
             hook: "policy".into(),
             decision: Decision::Permission {
@@ -334,7 +353,7 @@ mod tests {
             serde_json::json!({
                 "kind": "hook",
                 "hook": "policy",
-                "decision": { "point": "permission", "tool": "run_command", "permission": "deny" },
+                "decision": { "permission": { "tool": "run_command", "permission": "deny" } },
             })
         );
     }

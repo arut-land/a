@@ -2,7 +2,7 @@ use std::fs::{self, File, OpenOptions};
 use std::io::{self, BufRead, BufReader, Read, Write};
 use std::path::PathBuf;
 
-use protocol::{Entry, SessionId};
+use protocol::{Decode, Entry, SessionId};
 use serde::Serialize;
 
 use crate::{Header, Loaded, Log, LogStore};
@@ -75,7 +75,7 @@ impl LogStore for Jsonl {
         let mut end = memchr::memchr(b'\n', &bytes).map_or(bytes.len(), |i| i + 1);
         let mut entries = Vec::new();
         for line in bytes[end..].split_inclusive(|&b| b == b'\n') {
-            match serde_json::from_slice(line) {
+            match Entry::from_json(line) {
                 Ok(entry) if line.ends_with(b"\n") => entries.push(entry),
                 _ => break,
             }

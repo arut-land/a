@@ -76,6 +76,8 @@ Researched 2026-10-18 on macOS arm64, `nightly-2026-10-17`, ld-prime.
 | Simplified: shared model facts, `SmolStr` ids, typed borrowing stream parsers (decode ~2x faster, allocations per text frame 17→2 on Responses, 53→9 on Gemini) | 2291 KiB | — |
 | One deserializer instantiation per typed frame (Chat's repeated-key fallback reparses text) | 2259 KiB | — |
 | `llm` at `opt-level = "s"` (decoders ~6% slower per frame) | 2098 KiB | — |
+| Agent loop, hooks, remote bridge and binary staging | 2422 KiB | — |
+| Shared record decoders (`protocol::Decode`, `llm::Response::from_value`): release builds instantiate a generic deserializer once per calling crate, so each large one is decoded in its owning crate; hook decisions externally tagged | 2211 KiB | — |
 
 ## Rejected for now, with the reason and when to revisit
 

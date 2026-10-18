@@ -612,3 +612,11 @@ pub struct Response {
     #[serde(default, skip_serializing_if = "Meta::is_empty")]
     pub meta: Meta,
 }
+
+impl Response {
+    /// A recorded reply, decoded here so callers share one instantiation of
+    /// its (large) deserializer.
+    pub fn from_value(value: &Value) -> serde_json::Result<Self> {
+        Self::deserialize(value)
+    }
+}
