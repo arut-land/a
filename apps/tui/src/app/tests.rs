@@ -15,11 +15,7 @@ fn ws() -> PathBuf {
 }
 
 fn entry(seq: u64, body: Body) -> DaemonMsg {
-    DaemonMsg::Entry(Entry {
-        seq,
-        epoch: 0,
-        body,
-    })
+    DaemonMsg::Entry(Entry::new(seq, 0, body))
 }
 
 /// An app attached to a fresh session, with `msgs` folded in.
@@ -297,6 +293,29 @@ fn ctrl_c_interrupts_a_running_call_and_shows_how_it_ended() {
         press(&mut app, Key::Ctrl('c')),
         Some(Effect::Detach)
     ));
+}
+
+#[test]
+fn ctrl_c_interrupts_a_running_model_call_too() {
+    let msgs = [
+        entry(1, Body::User { text: "hi".into() }),
+        entry(2, Body::ModelCall { model: "m".into() }),
+    ];
+    let (mut app, _) = app(Viewport::Full, &msgs);
+    assert!(matches!(
+        press(&mut app, Key::Ctrl('c')),
+        Some(Effect::Send(ClientMsg::Interrupt))
+    ));
+    app.fold(&entry(
+        3,
+        Body::ModelResult {
+            call: 2,
+            outcome: Outcome::Interrupted {
+                output: Some("so far".into()),
+            },
+        },
+    ));
+    assert!(!app.running());
 }
 
 #[test]

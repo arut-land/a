@@ -82,6 +82,8 @@ macro_rules! conformance {
             sessions_are_isolated,
             concurrent_sessions_do_not_interfere,
             ids_are_unique_and_missing_ones_not_found,
+            each_load_leases_a_newer_epoch,
+            a_superseded_or_mismatched_writer_cannot_append,
         );)*
     };
 }
@@ -100,21 +102,22 @@ fn header(workspace: &str) -> Header {
     }
 }
 
-fn entry(seq: u64) -> Entry {
-    Entry {
+fn entry(seq: u64, epoch: u32) -> Entry {
+    Entry::new(
         seq,
-        epoch: 0,
-        body: Body::User {
+        epoch,
+        Body::User {
             text: format!("m{seq}"),
         },
-    }
+    )
 }
 
-fn append(log: &mut dyn Log, seqs: impl IntoIterator<Item = u64>) -> Vec<Entry> {
+/// Appends entries `seqs` under `loaded`'s lease.
+fn append(loaded: &mut Loaded, seqs: impl IntoIterator<Item = u64>) -> Vec<Entry> {
     seqs.into_iter()
         .map(|seq| {
-            let e = entry(seq);
-            log.append(&e).unwrap();
+            let e = entry(seq, loaded.epoch);
+            loaded.log.append(&e).unwrap();
             e
         })
         .collect()
@@ -124,7 +127,7 @@ fn round_trip(store: &dyn LogStore) {
     let h = header("/w");
     let mut created = store.create(&h).unwrap();
     assert_eq!(created.entries, []);
-    let written = append(&mut *created.log, 1..=3);
+    let written = append(&mut created, 1..=3);
     drop(created);
 
     assert_eq!(store.load(h.id).unwrap().entries, written);
@@ -133,25 +136,25 @@ fn round_trip(store: &dyn LogStore) {
 
 fn appends_keep_their_order_across_reopens(store: &dyn LogStore) {
     let h = header("/w");
-    let mut written = append(&mut *store.create(&h).unwrap().log, 1..=50);
+    let mut written = append(&mut store.create(&h).unwrap(), 1..=50);
     for round in 0..3 {
         let mut loaded = store.load(h.id).unwrap();
         assert_eq!(loaded.entries, written);
         let next = 51 + round * 10;
-        written.extend(append(&mut *loaded.log, next..next + 10));
+        written.extend(append(&mut loaded, next..next + 10));
     }
     assert_eq!(store.load(h.id).unwrap().entries, written);
 }
 
 fn batches_append_in_order(store: &dyn LogStore) {
     let h = header("/w");
-    let mut log = store.create(&h).unwrap().log;
-    let mut written = append(&mut *log, 1..=2);
-    let batch: Vec<Entry> = (3..=6).map(entry).collect();
-    log.append_all(&batch).unwrap();
-    log.append_all(&[]).unwrap();
+    let mut log = store.create(&h).unwrap();
+    let mut written = append(&mut log, 1..=2);
+    let batch: Vec<Entry> = (3..=6).map(|seq| entry(seq, log.epoch)).collect();
+    log.log.append_all(&batch).unwrap();
+    log.log.append_all(&[]).unwrap();
     written.extend(batch);
-    written.extend(append(&mut *log, 7..=7));
+    written.extend(append(&mut log, 7..=7));
     assert_eq!(store.load(h.id).unwrap().entries, written);
     assert_eq!(store.count(h.id).unwrap(), 7);
 }
@@ -163,19 +166,19 @@ fn headers_list_sessions_oldest_first(store: &dyn LogStore) {
         call: 1,
     });
     for h in made.iter().rev() {
-        append(&mut *store.create(h).unwrap().log, 1..=2);
+        append(&mut store.create(h).unwrap(), 1..=2);
     }
     assert_eq!(store.headers().unwrap(), made);
 }
 
 fn counts_follow_appends(store: &dyn LogStore) {
     let h = header("/w");
-    let mut log = store.create(&h).unwrap().log;
+    let mut log = store.create(&h).unwrap();
     assert_eq!(store.count(h.id).unwrap(), 0);
-    append(&mut *log, 1..=4);
+    append(&mut log, 1..=4);
     assert_eq!(store.count(h.id).unwrap(), 4);
     drop(log);
-    append(&mut *store.load(h.id).unwrap().log, 5..=6);
+    append(&mut store.load(h.id).unwrap(), 5..=6);
     assert_eq!(store.count(h.id).unwrap(), 6);
 }
 
@@ -197,12 +200,12 @@ fn busy_markers_set_clear_and_repeat(store: &dyn LogStore) {
 
 fn sessions_are_isolated(store: &dyn LogStore) {
     let (a, b) = (header("/a"), header("/b"));
-    let mut log_a = store.create(&a).unwrap().log;
-    let mut log_b = store.create(&b).unwrap().log;
+    let mut log_a = store.create(&a).unwrap();
+    let mut log_b = store.create(&b).unwrap();
     let mut written_a = Vec::new();
     for seq in 1..=3 {
-        written_a.extend(append(&mut *log_a, [seq]));
-        append(&mut *log_b, [seq * 100]);
+        written_a.extend(append(&mut log_a, [seq]));
+        append(&mut log_b, [seq * 100]);
     }
     store.mark_busy(b.id, true).unwrap();
     assert_eq!(store.load(a.id).unwrap().entries, written_a);
@@ -217,8 +220,8 @@ fn concurrent_sessions_do_not_interfere(store: &dyn LogStore) {
             .iter()
             .map(|h| {
                 s.spawn(move || {
-                    let mut log = store.create(h).unwrap().log;
-                    append(&mut *log, 1..=25)
+                    let mut log = store.create(h).unwrap();
+                    append(&mut log, 1..=25)
                 })
             })
             .collect();
@@ -247,12 +250,48 @@ fn ids_are_unique_and_missing_ones_not_found(store: &dyn LogStore) {
     assert_eq!(store.headers().unwrap(), [h]);
 }
 
+fn each_load_leases_a_newer_epoch(store: &dyn LogStore) {
+    let h = header("/w");
+    let mut created = store.create(&h).unwrap();
+    append(&mut created, 1..=2);
+    drop(created);
+    let mut epochs = Vec::new();
+    for seq in 3..=5 {
+        let mut loaded = store.load(h.id).unwrap();
+        epochs.push(loaded.epoch);
+        append(&mut loaded, [seq]);
+    }
+    assert!(epochs[0] > 0, "{epochs:?}");
+    assert!(epochs.windows(2).all(|w| w[0] < w[1]), "{epochs:?}");
+    let loaded = store.load(h.id).unwrap();
+    let logged: Vec<u32> = loaded.entries.iter().map(|e| e.epoch).collect();
+    assert_eq!(logged[2..], epochs);
+    assert!(loaded.epoch > epochs[2]);
+}
+
+/// Reading entries leaves the writer's lease alone; loading supersedes it.
+fn a_superseded_or_mismatched_writer_cannot_append(store: &dyn LogStore) {
+    let h = header("/w");
+    let mut stale = store.create(&h).unwrap();
+    let written = append(&mut stale, 1..=2);
+    assert_eq!(store.entries(h.id).unwrap(), written);
+    append(&mut stale, [3]);
+    let mut current = store.load(h.id).unwrap();
+    let refused = stale.log.append(&entry(4, stale.epoch)).unwrap_err();
+    assert_eq!(refused.kind(), ErrorKind::ResourceBusy);
+    let batch = [entry(4, current.epoch), entry(5, current.epoch - 1)];
+    let mismatched = current.log.append_all(&batch).unwrap_err();
+    assert_eq!(mismatched.kind(), ErrorKind::ResourceBusy);
+    assert_eq!(store.entries(h.id).unwrap(), current.entries);
+    assert_eq!(current.entries.len(), 3);
+}
+
 /// A JSONL session file with `tail` written after its entries, as a crash
 /// mid-append leaves it.
 fn torn(tail: &[u8]) -> (Fixture, PathBuf, Header, Vec<Entry>) {
     let store = jsonl();
     let h = header("/w");
-    let written = append(&mut *store.create(&h).unwrap().log, 1..=2);
+    let written = append(&mut store.create(&h).unwrap(), 1..=2);
     let path = store.dir.as_ref().unwrap().join(format!("{}.jsonl", h.id));
     OpenOptions::new()
         .append(true)
@@ -273,7 +312,7 @@ fn jsonl_drops_a_torn_tail_and_appends_after_it() {
         assert_eq!(store.count(h.id).unwrap(), 2);
         let mut loaded = store.load(h.id).unwrap();
         assert_eq!(loaded.entries, written);
-        written.extend(append(&mut *loaded.log, 3..=4));
+        written.extend(append(&mut loaded, 3..=4));
         assert_eq!(store.load(h.id).unwrap().entries, written);
         assert_eq!(store.count(h.id).unwrap(), 4);
     }
@@ -318,4 +357,15 @@ fn jsonl_files_are_a_header_line_then_one_line_per_entry() {
     }
     assert_eq!(fs::read_to_string(&path).unwrap(), expected);
     assert!(path.with_extension("busy").exists());
+}
+
+#[test]
+fn jsonl_leases_past_the_epochs_its_files_hold() {
+    let store = jsonl();
+    let h = header("/w");
+    let mut created = store.create(&h).unwrap();
+    append(&mut created, 1..=2);
+    // As a later daemon, with no leases of its own yet.
+    let later = Jsonl::open(store.dir.as_ref().unwrap()).unwrap();
+    assert!(later.load(h.id).unwrap().epoch > created.epoch);
 }

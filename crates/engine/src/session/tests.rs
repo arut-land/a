@@ -13,15 +13,16 @@ use serde_json::json;
 use super::*;
 
 fn entry(seq: u64, body: Body) -> Entry {
-    Entry {
-        seq,
-        epoch: 0,
-        body,
-    }
+    Entry::new(seq, 0, body)
 }
 
 fn bodies(entries: &[Entry]) -> Vec<&Body> {
     entries.iter().map(|e| &e.body).collect()
+}
+
+/// What entries say, whichever lease wrote them.
+fn facts(entries: &[Entry]) -> Vec<(u64, &Body)> {
+    entries.iter().map(|e| (e.seq, &e.body)).collect()
 }
 
 #[test]
@@ -38,7 +39,7 @@ fn finds_calls_without_outcomes() {
             2,
             Body::ToolResult {
                 call: 1,
-                outcome: Outcome::Interrupted,
+                outcome: Outcome::Interrupted { output: None },
                 card: None,
             },
         ),
@@ -110,7 +111,7 @@ impl Tool for HarborLabel {
         json!({ "type": "object", "properties": {}, "required": [] })
     }
 
-    fn call(&self, _: Self::In, _: &Cx<'_>) -> impl Future<Output = Result<String, String>> + Send {
+    fn call(&self, _: Self::In, _: &Cx) -> impl Future<Output = Result<String, String>> + Send {
         std::future::ready(Ok("crimson-harbor".to_owned()))
     }
 
@@ -228,7 +229,7 @@ impl Fixture {
             // One worker: no effect may hold it.
             rt: Arc::new(rt::Threads::new(1)),
             store: Arc::new(store::Memory::default()),
-            registry,
+            registry: agent::Current::new(registry),
             models,
             system: None,
             spill: std::env::temp_dir().join(format!("a-spill-{}", std::process::id())),
@@ -251,11 +252,12 @@ impl Fixture {
             id: SessionId::new(),
             workspace: std::env::temp_dir(),
             parent: None,
-            extensions: installed(&self.0.registry),
+            extensions: installed(&self.0.registry.get()),
         };
-        let mut log = self.0.store.create(&header).unwrap().log;
+        let mut created = self.0.store.create(&header).unwrap();
         for e in entries {
-            log.append(e).unwrap();
+            let e = Entry::new(e.seq, created.epoch, e.body.clone());
+            created.log.append(&e).unwrap();
         }
         let loaded = self.0.store.load(header.id).unwrap();
         Session::start(header, loaded, Arc::clone(&self.0))
@@ -285,7 +287,7 @@ impl Log for Probe {
 }
 
 #[test]
-fn a_step_commits_its_entries_together_and_a_failed_one_leaves_no_trace() {
+fn input_commits_on_arrival_and_a_failed_commit_leaves_no_trace() {
     let fixture = Fixture::new(
         agent::Kind::Echo,
         Registry::default(),
@@ -301,13 +303,14 @@ fn a_step_commits_its_entries_together_and_a_failed_one_leaves_no_trace() {
     let loaded = Loaded {
         entries: Vec::new(),
         log: Box::new(probe.clone()),
+        epoch: 1,
     };
     let session = Session::start(header, loaded, Arc::clone(&fixture.0));
     settle(&session);
     session.submit("hi".into()).unwrap();
     settle(&session);
     probe.failing.store(true, Ordering::SeqCst);
-    session.submit("lost".into()).unwrap();
+    let lost = session.submit("lost".into());
     settle(&session);
     probe.failing.store(false, Ordering::SeqCst);
     session.submit("again".into()).unwrap();
@@ -315,20 +318,22 @@ fn a_step_commits_its_entries_together_and_a_failed_one_leaves_no_trace() {
     let log = log_of(&session);
     session.stop();
 
-    // Each message and its echo commit together; the failed pair is gone,
-    // seqs and all.
-    assert_eq!(*lock(&probe.batches), [2, 2]);
+    // Input commits as it arrives, before the turn it starts. Input that
+    // cannot be logged is refused and gone, seq and all.
+    assert_eq!(lost, Err("logging the input: disk full".into()));
+    assert_eq!(*lock(&probe.batches), [1, 1, 1, 1]);
     let said: Vec<_> = log.iter().map(|e| (e.seq, &e.body)).collect();
-    let user = |text: &str| Body::User { text: text.into() };
-    let echo = |text: &str| Body::Assistant { text: text.into() };
-    assert_eq!(
-        said,
-        [
-            (1, &user("hi")),
-            (2, &echo("hi")),
-            (3, &user("again")),
-            (4, &echo("again"))
-        ]
+    assert!(
+        matches!(
+            &said[..],
+            [
+                (1, Body::User { text: hi }),
+                (2, Body::Assistant { .. }),
+                (3, Body::User { text: again }),
+                (4, Body::Assistant { .. }),
+            ] if hi == "hi" && again == "again"
+        ),
+        "{said:#?}"
     );
 }
 
@@ -404,7 +409,7 @@ fn the_model_calls_a_tool_and_answers_from_its_result() {
         let resumed = fixture.start(&log[..cut]);
         let got = log_of(&resumed);
         resumed.stop();
-        assert_eq!(got, log, "cut after {cut}");
+        assert_eq!(facts(&got), facts(&log), "cut after {cut}");
         assert_eq!(script.sent(), sent[1..], "cut after {cut}");
     }
 }
@@ -562,7 +567,7 @@ fn a_fired_watch_wakes_the_model_with_the_childs_result() {
     let resumed = fixture(&script).start(&log[..2]);
     let got = log_of(&resumed);
     resumed.stop();
-    assert_eq!(got, log);
+    assert_eq!(facts(&got), facts(&log));
     assert_eq!(script.sent(), sent);
 }
 
@@ -593,7 +598,7 @@ fn extensions_are_logged_when_they_change() {
     assert_eq!(
         bodies(&noted)[1..],
         [&Body::Extensions {
-            installed: installed(&fixture.0.registry)
+            installed: installed(&fixture.0.registry.get())
         }]
     );
 }
@@ -645,7 +650,9 @@ impl Hook for Strict {
 fn hook_decisions_are_logged_and_replay_to_the_same_state() {
     let fixture = Fixture::new(
         agent::Kind::Echo,
-        echoing(&Policy::default()).with(&Strict).unwrap(),
+        echoing(&Policy::default())
+            .with_in(agent::Tier::Guarded, &Strict)
+            .unwrap(),
         openai(&Script::new(&[])),
     );
     let session = fixture.start(&[]);
@@ -709,7 +716,9 @@ fn hook_decisions_are_logged_and_replay_to_the_same_state() {
 fn a_gate_cut_off_by_a_crash_logs_its_decisions_once() {
     let fixture = Fixture::new(
         agent::Kind::Echo,
-        echoing(&Policy::default()).with(&Strict).unwrap(),
+        echoing(&Policy::default())
+            .with_in(agent::Tier::Guarded, &Strict)
+            .unwrap(),
         openai(&Script::new(&[])),
     );
     let denied = Body::Hook {
@@ -926,7 +935,7 @@ fn a_recap_tells_the_last_prompt_and_what_followed() {
             5,
             Body::ToolResult {
                 call: 4,
-                outcome: Outcome::Interrupted,
+                outcome: Outcome::Interrupted { output: None },
                 card: None,
             },
         ),
@@ -980,7 +989,7 @@ impl agent::Command for Jobs {
     const NAME: &'static str = "jobs";
     const DESCRIPTION: &'static str = "Lists jobs.";
 
-    fn run(&self, args: &str, cx: &Cx<'_>) -> impl Future<Output = Result<Value, String>> + Send {
+    fn run(&self, args: &str, cx: &Cx) -> impl Future<Output = Result<Value, String>> + Send {
         let said = format!("{args} in {}", cx.call);
         std::future::ready(Ok(said.into()))
     }
@@ -1041,45 +1050,62 @@ fn slash_commands_run_without_a_turn_and_input_hooks_rewrite_or_refuse() {
                 name: "jobs".into(),
                 args: "all of them".into()
             },
-            &Body::CommandResult {
-                call: 1,
-                outcome: Outcome::Done {
-                    output: "all of them in 1".into()
-                }
-            },
-            &Body::User {
-                text: "/nope".into()
-            },
-            &Body::Assistant {
-                text: "/nope".into()
-            },
+            &queued("/nope"),
             &Body::Hook {
                 hook: "extras".into(),
                 decision: Decision::Input {
                     original: "shout hi".into()
                 }
             },
-            &Body::User {
-                text: "SHOUT HI".into()
+            &queued("SHOUT HI"),
+            &Body::CommandResult {
+                call: 1,
+                outcome: Outcome::Done {
+                    output: "all of them in 1".into()
+                }
             },
-            &Body::Assistant {
-                text: "SHOUT HI".into()
-            },
+            &user("/nope"),
+            &echo("/nope"),
+            &user("SHOUT HI"),
+            &echo("SHOUT HI"),
         ]
     );
     assert!(replay(agent::Kind::Echo.agent().as_mut(), &log).is_empty());
+    assert!(untaken(&log).is_empty());
 
-    // A command cut off by a crash is not run again.
-    let cut = fixture.start(&log[..1]);
+    // A command cut off by a crash is not run again; the input queued
+    // behind it is taken up in order.
+    let cut = fixture.start(&log[..4]);
     let recovered = log_of(&cut);
     cut.stop();
     assert_eq!(
-        bodies(&recovered)[1..],
-        [&Body::CommandResult {
-            call: 1,
-            outcome: Outcome::Interrupted
-        }]
+        bodies(&recovered)[4..],
+        [
+            &Body::CommandResult {
+                call: 1,
+                outcome: Outcome::Interrupted { output: None }
+            },
+            &user("/nope"),
+            &echo("/nope"),
+            &user("SHOUT HI"),
+            &echo("SHOUT HI"),
+        ]
     );
+}
+
+fn user(text: &str) -> Body {
+    Body::User { text: text.into() }
+}
+
+fn echo(text: &str) -> Body {
+    Body::Assistant { text: text.into() }
+}
+
+fn queued(text: &str) -> Body {
+    Body::Queued {
+        text: text.into(),
+        steer: false,
+    }
 }
 
 #[test]
@@ -1118,7 +1144,7 @@ fn the_model_gets_the_prompt_and_the_logged_context_first() {
         .collect();
     assert_eq!(tools, ["bash", "edit", "sleep"]);
     assert_eq!(
-        transcript(&log, u64::MAX, fixture.0.registry.tools())[0],
+        transcript(&log, u64::MAX, fixture.0.registry.get().tools())[0],
         llm::Message::user(text.clone())
     );
 }
@@ -1240,4 +1266,326 @@ fn background_processes_keep_the_session_and_end_with_it() {
         thread::sleep(Duration::from_millis(10));
     }
     assert!(!session.has_jobs());
+}
+
+/// `lookup_harbor_label`, held until released or the turn is interrupted.
+struct Held(Arc<AtomicBool>);
+
+impl Tool for Held {
+    type In = serde_json::Map<String, Value>;
+    type Out = String;
+
+    const NAME: &'static str = "lookup_harbor_label";
+    const DESCRIPTION: &'static str = "Return the alpha signal marker.";
+
+    fn schema() -> Value {
+        json!({ "type": "object", "properties": {}, "required": [] })
+    }
+
+    async fn call(&self, _: Self::In, cx: &Cx) -> Result<String, String> {
+        while !self.0.load(Ordering::SeqCst) {
+            if cx.cancel.is_cancelled() {
+                return Err("stopped".into());
+            }
+            cx.rt.sleep(Duration::from_millis(5)).await;
+        }
+        Ok("crimson-harbor".into())
+    }
+}
+
+/// Offers [`Held`], released by the flag it is given.
+struct HeldHarbor(Arc<AtomicBool>);
+
+impl Extension for HeldHarbor {
+    const NAME: &'static str = "harbor";
+    const VERSION: u32 = 1;
+
+    fn contribute(&self, r: &mut Registrar) {
+        r.tool(Held(Arc::clone(&self.0)));
+    }
+}
+
+/// A model endpoint that never answers.
+struct Silent;
+
+impl Http for Silent {
+    fn send(&self, _: http::Request<Bytes>) -> BoxFuture<'static, io::Result<llm::http::Response>> {
+        Box::pin(std::future::pending())
+    }
+}
+
+fn tool_running(log: &[Entry]) -> bool {
+    log.iter().any(|e| matches!(e.body, Body::ToolCall { .. }))
+}
+
+#[test]
+fn a_steer_reaches_the_running_turn_before_the_model_is_next_asked() {
+    let replies = cassette("openai/streaming_grammar/tool_then_followup_text.yaml");
+    let script = Script::new(&replies);
+    let release = Arc::new(AtomicBool::new(false));
+    let tools = Registry::default()
+        .with(&HeldHarbor(Arc::clone(&release)))
+        .unwrap();
+    let fixture = Fixture::new(agent::Kind::Chat, tools, openai(&script));
+    let session = fixture.start(&[]);
+    session
+        .submit("Call the tool, then answer.".into())
+        .unwrap();
+    until(&session, "called the tool", tool_running);
+    session.steer("Say it twice.".into()).unwrap();
+    session.submit("And then this.".into()).unwrap();
+    release.store(true, Ordering::SeqCst);
+    let log = until(&session, "took the queued input", |log| {
+        log.iter()
+            .filter(|e| matches!(e.body, Body::User { .. }))
+            .count()
+            == 2
+    });
+    session.stop();
+
+    let after_tool: Vec<_> = bodies(&log)
+        .into_iter()
+        .skip_while(|b| !matches!(b, Body::ToolResult { .. }))
+        .collect();
+    assert!(
+        matches!(
+            &after_tool[..],
+            [
+                Body::ToolResult { .. },
+                Body::Steer { text, queued: 5 },
+                Body::ModelCall { .. },
+                Body::ModelResult { .. },
+                Body::User { text: then },
+                ..
+            ] if text == "Say it twice." && then == "And then this."
+        ),
+        "{log:#?}"
+    );
+    assert!(matches!(&log[4].body, Body::Queued { steer: true, .. }));
+    let input = script.sent()[1]["input"].to_string();
+    assert!(input.contains("Say it twice."), "{input}");
+    assert!(untaken(&log).is_empty());
+}
+
+#[test]
+fn an_interrupt_stops_the_model_call_and_ends_the_turn() {
+    let models = Models {
+        settings: crate::config::Settings {
+            process: daemon_env,
+            ..crate::config::Settings::new(
+                std::env::temp_dir().join("a-engine-no-config.toml"),
+                Some("gpt-5.6".into()),
+                None,
+            )
+        },
+        http: Arc::new(Silent),
+    };
+    let fixture = Fixture::new(agent::Kind::Chat, Registry::default(), models);
+    let session = fixture.start(&[]);
+    session.submit("hi".into()).unwrap();
+    until(&session, "called the model", |log| {
+        log.iter().any(|e| matches!(e.body, Body::ModelCall { .. }))
+    });
+    session.interrupt();
+    settle(&session);
+    let log = log_of(&session);
+    session.stop();
+    assert_eq!(
+        bodies(&log)[2..],
+        [&Body::ModelResult {
+            call: 2,
+            outcome: Outcome::Interrupted { output: None }
+        }]
+    );
+}
+
+#[test]
+fn an_interrupted_turn_answers_the_calls_it_leaves_and_goes_no_further() {
+    let replies = cassette("openai/streaming_grammar/tool_then_followup_text.yaml");
+    let script = Script::new(&replies);
+    let tools = Registry::default()
+        .with(&HeldHarbor(Arc::default()))
+        .unwrap();
+    let fixture = Fixture::new(agent::Kind::Chat, tools, openai(&script));
+    let session = fixture.start(&[]);
+    session
+        .submit("Call the tool, then answer.".into())
+        .unwrap();
+    until(&session, "called the tool", tool_running);
+    session.interrupt();
+    settle(&session);
+    let log = log_of(&session);
+    session.stop();
+
+    assert!(
+        matches!(
+            &bodies(&log)[3..],
+            [
+                Body::ToolCall { .. },
+                Body::ToolResult {
+                    call: 4,
+                    outcome: Outcome::Failed { .. },
+                    ..
+                },
+                Body::Interrupt,
+            ]
+        ),
+        "{log:#?}"
+    );
+    assert_eq!(script.sent().len(), 1, "no model call after the interrupt");
+    // Recovery finds nothing left to do.
+    let mut chat = agent::Kind::Chat.agent();
+    assert_eq!(replay(chat.as_mut(), &log), []);
+}
+
+#[test]
+fn an_unsafe_call_cut_off_reports_the_output_it_committed() {
+    let fixture = Fixture::new(
+        agent::Kind::Echo,
+        echoing(&Policy::default()),
+        openai(&Script::new(&[])),
+    );
+    let bash = Body::ToolCall {
+        tool: "bash".into(),
+        input: json!({ "command": "make" }),
+        id: None,
+        card: None,
+    };
+    let progress = |text: &str| Body::Progress {
+        call: 2,
+        text: text.into(),
+    };
+    let session = fixture.start(&[
+        entry(1, user("$ make")),
+        entry(2, bash),
+        entry(3, progress("one\n")),
+        entry(4, progress("two\n")),
+    ]);
+    let log = log_of(&session);
+    session.stop();
+    assert_eq!(
+        bodies(&log)[4..],
+        [&Body::ToolResult {
+            call: 2,
+            outcome: Outcome::Interrupted {
+                output: Some("one\ntwo\n".into())
+            },
+            card: None,
+        }]
+    );
+    let (output, error) = agent::Toolset::default().to_model(
+        "bash",
+        &Outcome::Interrupted {
+            output: Some("one\n".into()),
+        },
+    );
+    assert!(error);
+    assert_eq!(
+        output,
+        llm::Output::Text("one\n\n[interrupted before it finished]".into())
+    );
+}
+
+#[test]
+fn the_model_is_set_per_session_and_says_where_it_comes_from() {
+    let fixture = Fixture::new(
+        agent::Kind::Echo,
+        Registry::default(),
+        openai(&Script::new(&[])),
+    );
+    let session = fixture.start(&[]);
+    for text in [
+        "/model",
+        "/model anthropic:claude-x",
+        "/model",
+        "/model reset",
+    ] {
+        session.submit(text.into()).unwrap();
+        settle(&session);
+    }
+    let log = log_of(&session);
+    let results: Vec<&Value> = log
+        .iter()
+        .filter_map(|e| match &e.body {
+            Body::CommandResult {
+                outcome: Outcome::Done { output },
+                ..
+            } => Some(output),
+            _ => None,
+        })
+        .collect();
+    let set = |from: &str, model: &str| json!({ "model": model, "from": from });
+    assert_eq!(
+        results,
+        [
+            &set("the daemon's environment", "gpt-5.6"),
+            &set("this session, at entry 4", "anthropic:claude-x"),
+            &set("this session, at entry 4", "anthropic:claude-x"),
+            &set("the daemon's environment", "gpt-5.6"),
+        ]
+    );
+    let chosen = Body::Settings(Overrides {
+        model: Some("anthropic:claude-x".into()),
+    });
+    assert_eq!(log[3].body, chosen);
+    assert_eq!(session.model_spec(), "gpt-5.6");
+    session.stop();
+
+    // The session's own setting lasts in its log.
+    let again = fixture.start(&log[..5]);
+    assert_eq!(again.model_spec(), "anthropic:claude-x");
+    again.stop();
+}
+
+#[test]
+fn a_new_registry_generation_applies_from_the_next_step() {
+    let fixture = Fixture::new(
+        agent::Kind::Echo,
+        echoing(&Policy::default()),
+        openai(&Script::new(&[])),
+    );
+    let session = fixture.start(&[]);
+    session.submit("hi".into()).unwrap();
+    settle(&session);
+    let reloaded = echoing(&Policy::default()).with(&Extras).unwrap();
+    fixture.0.registry.replace(reloaded);
+    session.submit("/jobs now".into()).unwrap();
+    settle(&session);
+    let log = log_of(&session);
+    session.stop();
+    let after: Vec<_> = bodies(&log).into_iter().skip(2).collect();
+    assert!(
+        matches!(
+            &after[..],
+            [
+                Body::Command { .. },
+                Body::Extensions { installed },
+                Body::CommandResult { outcome: Outcome::Done { .. }, .. },
+            ] if installed.last().is_some_and(|i| i.name == "extras")
+        ),
+        "{log:#?}"
+    );
+}
+
+#[test]
+fn input_waits_its_turn_behind_a_call_waiting_for_approval() {
+    let fixture = asking();
+    let session = fixture.start(&[]);
+    session.submit("$ echo approved".into()).unwrap();
+    settle(&session);
+    session.submit("next".into()).unwrap();
+    let waiting = log_of(&session);
+    session.answer(3, true).unwrap();
+    let log = until(&session, "took the input", |log| {
+        log.iter().any(|e| e.body == echo("next"))
+    });
+    session.stop();
+
+    assert_eq!(waiting.last().map(|e| &e.body), Some(&queued("next")));
+    let after: Vec<_> = bodies(&log)
+        .into_iter()
+        .skip_while(|b| !matches!(b, Body::ToolResult { .. }))
+        .skip(1)
+        .collect();
+    assert_eq!(after, [&user("next"), &echo("next")]);
 }

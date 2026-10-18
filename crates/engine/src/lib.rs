@@ -144,7 +144,7 @@ impl Daemon {
             settings: config::Settings::new(home.config_file(), config.model.clone(), config.agent),
             http: Arc::new(llm::Ureq::new(Arc::clone(&rt))),
         };
-        let registry = config.registry().map_err(io::Error::other)?;
+        let registry = agent::Current::new(config.registry().map_err(io::Error::other)?);
         let daemon = Arc::new_cyclic(|daemon| Self {
             shared: Arc::new(Shared {
                 rt,
@@ -213,7 +213,7 @@ impl Daemon {
             id: SessionId::new(),
             workspace,
             parent: None,
-            extensions: session::installed(&self.shared.registry),
+            extensions: session::installed(&self.shared.registry.get()),
         };
         let loaded = self.shared.store.create(&header)?;
         let session = Session::start(header.clone(), loaded, Arc::clone(&self.shared));
@@ -443,6 +443,11 @@ fn handle(daemon: &Daemon, life: &Lifecycle, conn: UnixStream) -> io::Result<()>
             error(format!("recording the environment: {e}"));
         }
     };
+    let input = |s: &Option<Attachment>, text, steer: bool| match s {
+        Some(s) if steer => s.session().steer(text).unwrap_or_else(error),
+        Some(s) => s.session().submit(text).unwrap_or_else(error),
+        None => error("not attached".into()),
+    };
     let mut attached: Option<Attachment> = None;
     while let Some(msg) = read_frame(&mut reader)? {
         match msg {
@@ -467,19 +472,15 @@ fn handle(daemon: &Daemon, life: &Lifecycle, conn: UnixStream) -> io::Result<()>
                 Some(s) => set_env(s, env),
                 None => error("not attached".into()),
             },
-            ClientMsg::Input { .. } | ClientMsg::Approve { .. } if life.draining().is_some() => {
+            ClientMsg::Input { .. } | ClientMsg::Steer { .. } | ClientMsg::Approve { .. }
+                if life.draining().is_some() =>
+            {
                 error(
                     "the daemon is restarting for an upgrade; send that again in a moment".into(),
                 );
             }
-            ClientMsg::Input { text } => match &attached {
-                Some(s) => {
-                    if let Err(message) = s.session().submit(text) {
-                        error(message);
-                    }
-                }
-                None => error("not attached".into()),
-            },
+            ClientMsg::Input { text } => input(&attached, text, false),
+            ClientMsg::Steer { text } => input(&attached, text, true),
             ClientMsg::Interrupt => match &attached {
                 Some(s) => s.session().interrupt(),
                 None => error("not attached".into()),

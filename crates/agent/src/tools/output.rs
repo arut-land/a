@@ -347,6 +347,57 @@ pub fn create_private(path: &Path) -> io::Result<(File, PathBuf)> {
     ))
 }
 
+/// The most output a call reports as it runs: its log holds this much of
+/// it, cleaned, for an interrupted call to show.
+pub const LIVE_CAP: usize = HEAD + TAIL;
+
+/// The start of the output, cleaned line by line as it arrives, for
+/// reporting while the command runs. Binary output is not reported.
+#[derive(Default)]
+pub struct Live {
+    clean: Clean,
+    fresh: String,
+    taken: usize,
+    done: bool,
+}
+
+impl Live {
+    pub fn push(&mut self, chunk: &[u8]) {
+        if self.done {
+            return;
+        }
+        if chunk.contains(&0) {
+            self.done = true;
+            self.fresh.clear();
+            return;
+        }
+        let Self {
+            clean,
+            fresh,
+            taken,
+            done,
+        } = self;
+        clean.feed(chunk, &mut |piece| {
+            let room = LIVE_CAP.saturating_sub(*taken + fresh.len());
+            if piece.len() > room {
+                fresh.push_str(&piece[..piece.floor_char_boundary(room)]);
+                *done = true;
+            } else if !*done {
+                fresh.push_str(piece);
+            }
+        });
+    }
+
+    /// The text cleaned since the last take, if any.
+    pub fn take(&mut self) -> Option<String> {
+        if self.fresh.is_empty() {
+            return None;
+        }
+        self.taken += self.fresh.len();
+        Some(std::mem::take(&mut self.fresh))
+    }
+}
+
 /// Decodes UTF-8 across chunk boundaries and drops what only a terminal
 /// renders: escape sequences, control characters other than tab and
 /// newline, and lines a carriage return overwrote. Passes on whole lines.
@@ -612,5 +663,26 @@ mod tests {
         std::fs::remove_dir_all(&dir).unwrap();
         assert_eq!(first, path);
         assert_eq!(second, dir.join("2-1.log"));
+    }
+
+    #[test]
+    fn live_output_is_whole_clean_lines_up_to_its_cap() {
+        let mut live = Live::default();
+        live.push(b"\x1b[1mone\x1b[0m\ntw");
+        assert_eq!(live.take().as_deref(), Some("one\n"));
+        assert_eq!(live.take(), None);
+        live.push(b"o\n");
+        live.push(&vec![b'x'; LIVE_CAP]);
+        live.push(b"\nmore\n");
+        let text = live.take().unwrap();
+        assert!(text.starts_with("two\nxxx"), "{text}");
+        assert_eq!(text.len(), LIVE_CAP - "one\n".len());
+        live.push(b"after the cap\n");
+        assert_eq!(live.take(), None);
+
+        let mut binary = Live::default();
+        binary.push(b"text\n\0bin");
+        binary.push(b"more\n");
+        assert_eq!(binary.take(), None);
     }
 }

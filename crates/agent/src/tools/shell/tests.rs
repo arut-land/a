@@ -200,7 +200,7 @@ fn a_moved_client_starts_commands_where_it_is() {
     let mut rig = rig("moved");
     let ws = rig.workspace();
     std::fs::create_dir_all(ws.join("a/b")).unwrap();
-    let env = |dir: &str| protocol::Environment {
+    let env = |dir: &str| Environment {
         cwd: ws.join(dir),
         vars: [("PATH".to_owned(), "/usr/bin:/bin".to_owned())].into(),
         ..Default::default()
@@ -218,7 +218,7 @@ fn a_moved_client_starts_commands_where_it_is() {
 #[test]
 fn commands_get_the_session_environment_quieted() {
     let mut rig = rig("env");
-    rig.env = Some(protocol::Environment {
+    rig.env = Some(Environment {
         cwd: rig.workspace(),
         vars: [
             ("PATH", "/usr/bin:/bin"),
@@ -242,18 +242,7 @@ fn commands_get_the_session_environment_quieted() {
 #[test]
 fn without_a_client_the_daemons_secrets_stay_out() {
     let rig = rig("secrets");
-    let (ws, spill) = (rig.workspace(), rig.spill());
-    let cx = Cx {
-        workspace: &ws,
-        env: None,
-        session: rig.session,
-        call: 1,
-        model: "m",
-        spill: &spill,
-        cancel: &rig.cancel,
-        rt: &rt::Threads::new(1),
-        host: &rig,
-    };
+    let cx = rig.cx();
     let daemon = [
         "PATH",
         "OPENAI_API_KEY",
@@ -273,6 +262,16 @@ fn without_a_client_the_daemons_secrets_stay_out() {
     ] {
         assert!(!env.contains_key(secret), "{secret}");
     }
+}
+
+#[test]
+fn output_is_reported_as_it_arrives() {
+    let rig = rig("progress");
+    let ran = run(&rig, "echo one; sleep 0.3; echo two");
+    let reported = rig.progress.lock().unwrap().clone();
+    assert_eq!(ran.output, "one\ntwo\n");
+    assert!(reported.starts_with("one\n"), "{reported:?}");
+    assert!(ran.output.starts_with(&reported), "{reported:?}");
 }
 
 #[test]

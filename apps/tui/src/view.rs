@@ -121,7 +121,7 @@ pub fn rows(item: &Item, width: usize, look: Look) -> Vec<Line> {
                 None => Span::new("running…", BUSY),
                 Some(Outcome::Done { .. }) => Span::new("✓ done", OK),
                 Some(Outcome::Failed { error }) => Span::new(format!("✗ {error}"), BAD),
-                Some(Outcome::Interrupted) => Span::new("⚠ interrupted", WARN),
+                Some(Outcome::Interrupted { .. }) => Span::new("⚠ interrupted", WARN),
             });
             let mut out = vec![blank, Line::from(head)];
             let body = [Span::new(sanitize(input).replace('\n', " "), MUTED)];
@@ -203,7 +203,7 @@ fn card(c: &Card, width: usize, look: Look) -> Vec<Line> {
             }
         }
         (Some(Outcome::Failed { .. }), _) => ("✗ failed".to_owned(), BAD),
-        (Some(Outcome::Interrupted), _) => ("⚠ interrupted".to_owned(), WARN),
+        (Some(Outcome::Interrupted { .. }), _) => ("⚠ interrupted".to_owned(), WARN),
         (None, Some(Approval::Pending)) => ("? waiting for approval".to_owned(), ASK),
         (None, Some(Approval::Denied)) => ("⊘ not approved".to_owned(), BAD),
         (None, _) => ("running…".to_owned(), BUSY),
@@ -306,7 +306,12 @@ fn output_rows(c: &Card, width: usize, verbose: bool) -> Vec<Line> {
             }
         },
         Some(Outcome::Failed { error }) => add(error, BAD, false),
-        Some(Outcome::Interrupted) => add("the daemon stopped mid-call", WARN, false),
+        Some(Outcome::Interrupted { output }) => {
+            if let Some(text) = output.as_deref().map(|t| t.trim_end_matches('\n')) {
+                add(text, Style::PLAIN, false);
+            }
+            add("stopped before it finished", WARN, false);
+        }
         None => {}
     }
     rows

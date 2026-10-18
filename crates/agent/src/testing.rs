@@ -1,32 +1,48 @@
 //! A stand-in engine for tool tests: calls run against a registry, with
 //! state folded and processes recorded in memory.
 
+use std::ops::Deref;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{LazyLock, Mutex, MutexGuard, PoisonError};
+use std::sync::{Arc, LazyLock, Mutex, MutexGuard, PoisonError};
 
 use protocol::{Body, Entry, Environment, Outcome, SessionId};
 use serde_json::Value;
 
 use crate::{Cancel, Cx, Hooks, Host, Registry, States};
 
-static RT: LazyLock<rt::Threads> = LazyLock::new(rt::Threads::default);
+static RT: LazyLock<rt::Rt> = LazyLock::new(|| Arc::new(rt::Threads::default()));
 
 fn lock<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
     mutex.lock().unwrap_or_else(PoisonError::into_inner)
 }
 
 pub struct Rig {
-    pub registry: Registry,
     pub dir: PathBuf,
     pub env: Option<Environment>,
     pub cancel: Cancel,
     pub session: SessionId,
+    host: Arc<Recorder>,
+    calls: AtomicU64,
+}
+
+/// What the calls tell the engine.
+pub struct Recorder {
+    pub registry: Registry,
     states: Mutex<States>,
     /// The `ext` entries the calls logged.
     pub log: Mutex<Vec<Entry>>,
     pub spawned: Mutex<Vec<(u32, bool)>>,
-    calls: AtomicU64,
+    /// The output the calls reported as they ran.
+    pub progress: Mutex<String>,
+}
+
+impl Deref for Rig {
+    type Target = Recorder;
+
+    fn deref(&self) -> &Recorder {
+        &self.host
+    }
 }
 
 impl Rig {
@@ -37,14 +53,17 @@ impl Rig {
         std::fs::create_dir_all(dir.join("ws")).unwrap();
         let dir = std::fs::canonicalize(dir).unwrap();
         Self {
-            states: Mutex::new(registry.states()),
-            registry,
             dir,
             env: None,
             cancel: Cancel::default(),
             session: SessionId::new(),
-            log: Mutex::default(),
-            spawned: Mutex::default(),
+            host: Arc::new(Recorder {
+                states: Mutex::new(registry.states()),
+                registry,
+                log: Mutex::default(),
+                spawned: Mutex::default(),
+                progress: Mutex::default(),
+            }),
             calls: AtomicU64::new(0),
         }
     }
@@ -57,21 +76,24 @@ impl Rig {
         self.dir.join("spill")
     }
 
+    /// What the next call runs with.
+    pub fn cx(&self) -> Cx {
+        Cx {
+            workspace: self.workspace().into(),
+            env: self.env.clone().map(Arc::new),
+            session: self.session,
+            call: self.calls.fetch_add(1, Ordering::SeqCst) + 1,
+            model: "test:model".into(),
+            spill: self.spill().into(),
+            cancel: self.cancel.clone(),
+            rt: Arc::clone(&RT),
+            host: Arc::clone(&self.host) as _,
+        }
+    }
+
     /// Runs tool `tool` on `input`.
     pub fn call(&self, tool: &str, input: &Value) -> Outcome {
-        let call = self.calls.fetch_add(1, Ordering::SeqCst) + 1;
-        let (workspace, spill) = (self.workspace(), self.spill());
-        let cx = Cx {
-            workspace: &workspace,
-            env: self.env.as_ref(),
-            session: self.session,
-            call,
-            model: "test:model",
-            spill: &spill,
-            cancel: &self.cancel,
-            rt: &*RT,
-            host: self,
-        };
+        let cx = self.cx();
         rt::block_on(self.registry.tools().run(tool, input, &cx))
     }
 
@@ -100,24 +122,28 @@ impl Drop for Rig {
     }
 }
 
-impl Host for Rig {
+impl Host for Recorder {
     fn spawned(&self, pgid: u32, background: bool) {
         lock(&self.spawned).push((pgid, background));
+    }
+
+    fn progress(&self, text: &str) {
+        lock(&self.progress).push_str(text);
     }
 
     fn note(&self, ext: &'static str, state: &'static str, data: Value) {
         lock(&self.states).fold(ext, state, &data);
         let mut log = lock(&self.log);
         let seq = log.len() as u64 + 1;
-        log.push(Entry {
+        log.push(Entry::new(
             seq,
-            epoch: 0,
-            body: Body::Ext {
+            0,
+            Body::Ext {
                 ext: ext.to_owned(),
                 state: state.to_owned(),
                 data,
             },
-        });
+        ));
     }
 
     fn states(&self) -> MutexGuard<'_, States> {

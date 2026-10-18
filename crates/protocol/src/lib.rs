@@ -59,16 +59,56 @@ impl fmt::Display for Short {
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Entry {
     pub seq: u64,
+    /// The lease its writer held: a store refuses the appends of a writer
+    /// whose lease was superseded.
     pub epoch: u32,
+    /// Reserved for entries addressed across sessions, as forks and
+    /// migration will need: a global id, and the entry this one follows
+    /// when that is not the one before it. They share the entry's object
+    /// with its body's fields, so no body has fields of these names (a tool
+    /// call's `id` is the model's).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub uuid: Option<Uuid>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub parent: Option<Uuid>,
     #[serde(flatten)]
     pub body: Body,
+}
+
+impl Entry {
+    pub const fn new(seq: u64, epoch: u32, body: Body) -> Self {
+        Self {
+            seq,
+            epoch,
+            uuid: None,
+            parent: None,
+            body,
+        }
+    }
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum Body {
+    /// The user's message, starting a turn.
     User {
         text: String,
+    },
+    /// Input taken in, logged on arrival so that it survives a crash and
+    /// every client sees it waiting. Queued input is taken in order: each
+    /// `user` or `command` entry takes the oldest still waiting, and a
+    /// `steer` entry the one it names. A `steer` goes to the running turn
+    /// at its next step boundary rather than after it.
+    Queued {
+        text: String,
+        #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+        steer: bool,
+    },
+    /// Steering input `queued`, given to the running turn: the model reads
+    /// it as the user's before its next reply.
+    Steer {
+        text: String,
+        queued: u64,
     },
     Assistant {
         text: String,
@@ -95,6 +135,13 @@ pub enum Body {
         boot: String,
         #[serde(default, skip_serializing_if = "std::ops::Not::not")]
         background: bool,
+    },
+    /// Output tool call `call` produced since its last progress entry,
+    /// committed as it runs: what an interrupted call reports, and what
+    /// clients show meanwhile.
+    Progress {
+        call: u64,
+        text: String,
     },
     ToolResult {
         call: u64,
@@ -176,6 +223,21 @@ pub enum Body {
         call: u64,
         outcome: Outcome,
     },
+    /// The user interrupted the turn: what the agent asked for and had not
+    /// started is dropped.
+    Interrupt,
+    /// The session's own settings from here on, over every config layer;
+    /// each entry replaces the one before.
+    Settings(Overrides),
+}
+
+/// Settings a session sets for itself; those unset come from the config
+/// layers.
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Overrides {
+    /// The model, as `host:model`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub model: Option<String>,
 }
 
 /// How a client shows a tool call or its outcome: pure data the tool
@@ -358,8 +420,13 @@ pub enum Outcome {
     Failed {
         error: String,
     },
-    /// The daemon stopped mid-call and the tool is not safe to rerun.
-    Interrupted,
+    /// The call stopped before it finished: the user interrupted the turn,
+    /// or the daemon stopped and the tool is not safe to rerun. `output` is
+    /// what it had produced by then.
+    Interrupted {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        output: Option<String>,
+    },
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -418,6 +485,11 @@ pub enum ClientMsg {
     Input {
         text: String,
     },
+    /// Input for the running turn, given to it at its next step boundary;
+    /// with no turn running it is plain input.
+    Steer {
+        text: String,
+    },
     List,
     Detach,
     /// Answers the [`DaemonMsg::Ask`] for tool call `call`.
@@ -425,7 +497,8 @@ pub enum ClientMsg {
         call: u64,
         approved: bool,
     },
-    /// Aborts the attached session's running tool call.
+    /// Stops the attached session's turn: its running model or tool call
+    /// and, bottom-up, the turns of the sessions it started.
     Interrupt,
 }
 
@@ -614,6 +687,11 @@ fn known_kind(kind: &str) -> bool {
     matches!(
         kind,
         "user"
+            | "queued"
+            | "steer"
+            | "progress"
+            | "interrupt"
+            | "settings"
             | "assistant"
             | "tool_call"
             | "tool_process"
@@ -660,11 +738,7 @@ mod tests {
 
     #[test]
     fn a_shared_frame_is_the_frame_written() {
-        let entry = Entry {
-            seq: 7,
-            epoch: 0,
-            body: Body::Assistant { text: "hi".into() },
-        };
+        let entry = Entry::new(7, 0, Body::Assistant { text: "hi".into() });
         let mut written = Vec::new();
         write_frame(&mut written, &DaemonMsg::Entry(entry.clone())).unwrap();
         assert_eq!(Frame::entry(&entry).unwrap().as_bytes(), written);
@@ -708,11 +782,7 @@ mod tests {
 
     #[test]
     fn entry_wire_shape_is_flat() {
-        let e = Entry {
-            seq: 1,
-            epoch: 0,
-            body: Body::User { text: "hi".into() },
-        };
+        let e = Entry::new(1, 0, Body::User { text: "hi".into() });
         assert_eq!(
             serde_json::to_string(&e).unwrap(),
             r#"{"seq":1,"epoch":0,"kind":"user","text":"hi"}"#
@@ -822,6 +892,14 @@ mod tests {
         let child = SessionId(Uuid::from_u128(1));
         let bodies = [
             Body::User { text: "u".into() },
+            Body::Queued {
+                text: "q".into(),
+                steer: true,
+            },
+            Body::Steer {
+                text: "s".into(),
+                queued: 1,
+            },
             Body::Assistant { text: "a".into() },
             Body::ToolCall {
                 tool: "t".into(),
@@ -835,15 +913,19 @@ mod tests {
                 boot: "b".into(),
                 background: false,
             },
+            Body::Progress {
+                call: 1,
+                text: "p".into(),
+            },
             Body::ToolResult {
                 call: 1,
-                outcome: Outcome::Interrupted,
+                outcome: Outcome::Interrupted { output: None },
                 card: None,
             },
             Body::ModelCall { model: "m".into() },
             Body::ModelResult {
                 call: 1,
-                outcome: Outcome::Interrupted,
+                outcome: Outcome::Interrupted { output: None },
             },
             Body::Hook {
                 hook: "h".into(),
@@ -857,7 +939,7 @@ mod tests {
             Body::Watch { child },
             Body::Fired {
                 watch: 1,
-                outcome: Outcome::Interrupted,
+                outcome: Outcome::Interrupted { output: None },
             },
             Body::Environment(Environment::default()),
             Body::Extensions {
@@ -875,12 +957,19 @@ mod tests {
             },
             Body::CommandResult {
                 call: 1,
-                outcome: Outcome::Interrupted,
+                outcome: Outcome::Interrupted { output: None },
             },
+            Body::Interrupt,
+            Body::Settings(Overrides::default()),
         ];
         for body in &bodies {
             match body {
                 Body::User { .. }
+                | Body::Queued { .. }
+                | Body::Steer { .. }
+                | Body::Progress { .. }
+                | Body::Interrupt
+                | Body::Settings(_)
                 | Body::Assistant { .. }
                 | Body::ToolCall { .. }
                 | Body::ToolProcess { .. }
@@ -913,11 +1002,7 @@ mod tests {
                 session: child,
                 workspace: "/w".into(),
             },
-            DaemonMsg::Entry(Entry {
-                seq: 1,
-                epoch: 0,
-                body: Body::Ask { call: 1 },
-            }),
+            DaemonMsg::Entry(Entry::new(1, 0, Body::Ask { call: 1 })),
             DaemonMsg::Delta {
                 call: 1,
                 text: "t".into(),
@@ -990,6 +1075,75 @@ mod tests {
     }
 
     #[test]
+    fn interrupted_outcomes_keep_their_shape_and_new_entries_are_flat() {
+        let old = r#"{"seq":3,"epoch":0,"kind":"tool_result","call":2,"outcome":{"status":"interrupted"}}"#;
+        let e = Entry::from_json(old.as_bytes()).unwrap();
+        assert!(matches!(
+            &e.body,
+            Body::ToolResult {
+                outcome: Outcome::Interrupted { output: None },
+                ..
+            }
+        ));
+        assert_eq!(serde_json::to_string(&e).unwrap(), old);
+        let bodies = [
+            Body::Queued {
+                text: "q".into(),
+                steer: false,
+            },
+            Body::Steer {
+                text: "s".into(),
+                queued: 4,
+            },
+            Body::Progress {
+                call: 2,
+                text: "p\n".into(),
+            },
+            Body::ModelResult {
+                call: 2,
+                outcome: Outcome::Interrupted {
+                    output: Some("so far".into()),
+                },
+            },
+            Body::Interrupt,
+            Body::Settings(Overrides {
+                model: Some("m".into()),
+            }),
+        ];
+        let json: Vec<_> = bodies
+            .iter()
+            .map(|b| serde_json::to_string(&Entry::new(5, 1, b.clone())).unwrap())
+            .collect();
+        assert_eq!(
+            json,
+            [
+                r#"{"seq":5,"epoch":1,"kind":"queued","text":"q"}"#,
+                r#"{"seq":5,"epoch":1,"kind":"steer","text":"s","queued":4}"#,
+                r#"{"seq":5,"epoch":1,"kind":"progress","call":2,"text":"p\n"}"#,
+                r#"{"seq":5,"epoch":1,"kind":"model_result","call":2,"outcome":{"status":"interrupted","output":"so far"}}"#,
+                r#"{"seq":5,"epoch":1,"kind":"interrupt"}"#,
+                r#"{"seq":5,"epoch":1,"kind":"settings","model":"m"}"#,
+            ]
+        );
+        for (body, json) in bodies.iter().zip(&json) {
+            assert_eq!(&Entry::from_json(json.as_bytes()).unwrap().body, body);
+        }
+        let call = Body::ToolCall {
+            tool: "t".into(),
+            input: Value::Null,
+            id: Some("call_1".into()),
+            card: None,
+        };
+        let reserved = Entry {
+            uuid: Some(Uuid::from_u128(7)),
+            parent: Some(Uuid::from_u128(6)),
+            ..Entry::new(1, 1, call)
+        };
+        let json = serde_json::to_string(&reserved).unwrap();
+        assert_eq!(Entry::from_json(json.as_bytes()).unwrap(), reserved);
+    }
+
+    #[test]
     fn link_entries_are_flat() {
         let child = SessionId(Uuid::from_u128(1));
         let entries = [
@@ -1000,7 +1154,7 @@ mod tests {
             Body::Watch { child },
             Body::Fired {
                 watch: 2,
-                outcome: Outcome::Interrupted,
+                outcome: Outcome::Interrupted { output: None },
             },
         ];
         let json: Vec<_> = entries

@@ -4,18 +4,19 @@
 use std::fmt::Write as _;
 use std::io::Read;
 
-use crate::ext::{Extension, Facts, Refused, Registrar, Registry, Section, Slot};
+use crate::ext::{Extension, Facts, Refused, Registrar, Registry, Section, Slot, Tier};
 use crate::state::Cwd;
 use crate::tools::{self, edit::Seen};
 use crate::{AskFor, Tool};
 
-/// The built-ins in their install order, with `policy` as configured.
+/// The built-ins in their install order, with `policy` as configured and
+/// guarded.
 pub fn builtins(policy: &Policy) -> Result<Registry, Refused> {
     Registry::default()
-        .with(&Prompt)?
-        .with(&Shell)?
-        .with(&Edit)?
-        .with(policy)
+        .with_in(Tier::Guarded, policy)?
+        .with_in(Tier::Pre, &Prompt)?
+        .with_in(Tier::Pre, &Shell)?
+        .with_in(Tier::Pre, &Edit)
 }
 
 /// The system prompt's one line of identity, and the facts the model is

@@ -103,11 +103,11 @@ impl Tool for Edit {
         )
     }
 
-    async fn call(&self, input: Change, cx: &Cx<'_>) -> Result<Edited, String> {
+    async fn call(&self, input: Change, cx: &Cx) -> Result<Edited, String> {
         let path = cx.dir().join(&input.path);
         let shown = input.path.clone();
         let read = path.clone();
-        let original = rt::unblock(cx.rt, move || match std::fs::read(&read) {
+        let original = rt::unblock(&*cx.rt, move || match std::fs::read(&read) {
             Ok(bytes) => Ok(Some(bytes)),
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
             Err(e) => Err(e),
@@ -133,7 +133,7 @@ impl Tool for Edit {
         let (content, diff) = apply(text, &input.edits).map_err(|e| format!("{shown}: {e}"))?;
 
         let write = (path.clone(), content.clone());
-        rt::unblock(cx.rt, move || {
+        rt::unblock(&*cx.rt, move || {
             if let Some(parent) = write.0.parent() {
                 std::fs::create_dir_all(parent)?;
             }

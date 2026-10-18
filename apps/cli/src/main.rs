@@ -484,7 +484,12 @@ fn print_outcome(outcome: &Outcome, card: Option<&Card>) {
             println!("  └ {}", if note.is_empty() { "done" } else { &note });
         }
         Outcome::Failed { error } => println!("  └ failed: {error}"),
-        Outcome::Interrupted => println!("  └ interrupted: the daemon stopped mid-call"),
+        Outcome::Interrupted { output } => {
+            for line in output.iter().flat_map(|text| text.lines()) {
+                println!("  │ {line}");
+            }
+            println!("  └ interrupted before it finished");
+        }
     }
 }
 

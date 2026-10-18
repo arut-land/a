@@ -17,11 +17,11 @@ use std::process::{Child, Command as Process, ExitStatus, Stdio};
 use std::sync::mpsc::{self, RecvTimeoutError};
 use std::time::{Duration, Instant};
 
-use protocol::Card;
+use protocol::{Card, Environment};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
-use super::output::{Output, Rendered, Spill, create_private};
+use super::output::{Live, Output, Rendered, Spill, create_private};
 use crate::state::Cwd;
 use crate::{Cancel, Cx, Kill, Spawn, Tool};
 
@@ -36,6 +36,9 @@ const IDLE: Duration = Duration::from_millis(100);
 /// After the shell exits, the most the call waits for its output to end.
 const LINGER: Duration = Duration::from_secs(2);
 const TICK: Duration = Duration::from_millis(20);
+/// How often output is reported as it arrives: each report is committed,
+/// so this bounds how often a busy command syncs the log.
+const REPORT: Duration = Duration::from_millis(100);
 
 /// Set for every command: no colors, pagers or prompts, as no one is at a
 /// terminal to see or answer them.
@@ -124,7 +127,7 @@ impl Tool for Bash {
         )
     }
 
-    async fn call(&self, input: Command, cx: &Cx<'_>) -> Result<Ran, String> {
+    async fn call(&self, input: Command, cx: &Cx) -> Result<Ran, String> {
         run(input, cx).await.map_err(|e| e.to_string())
     }
 
@@ -215,7 +218,7 @@ fn model_text(ran: &Ran) -> String {
     text
 }
 
-async fn run(input: Command, cx: &Cx<'_>) -> io::Result<Ran> {
+async fn run(input: Command, cx: &Cx) -> io::Result<Ran> {
     let started = Instant::now();
     let dir = cx.dir();
     let env = environment(cx, std::env::vars());
@@ -236,10 +239,10 @@ async fn run(input: Command, cx: &Cx<'_>) -> io::Result<Ran> {
     let pgid = child.id();
     cx.spawned(pgid, false);
     let limit = input.timeout.unwrap_or(TIMEOUT).clamp(1, MAX_TIMEOUT);
-    let cancel = cx.cancel.clone();
     let output = Output::new(Spill::new(log));
-    let done = rt::unblock(cx.rt, move || {
-        supervise(child, reader, Duration::from_secs(limit), &cancel, output)
+    let reporter = cx.clone();
+    let done = rt::unblock(&*cx.rt, move || {
+        supervise(child, reader, Duration::from_secs(limit), &reporter, output)
     })
     .await?;
 
@@ -251,7 +254,7 @@ async fn run(input: Command, cx: &Cx<'_>) -> io::Result<Ran> {
         .unwrap_or_else(|| dir.clone());
     // `pwd -P` resolves symlinks the starting directory may have.
     if std::fs::canonicalize(&dir).ok().as_ref() != Some(&cwd) {
-        let base = cx.env.map(|env| env.cwd.as_path());
+        let base = cx.env.as_ref().map(|env| env.cwd.as_path());
         cx.update::<Cwd>(Cwd::change(&cwd, base));
     }
     if done.lingering {
@@ -279,7 +282,7 @@ async fn run(input: Command, cx: &Cx<'_>) -> io::Result<Ran> {
 
 /// Starts the command with its output going straight to its log, and
 /// leaves it running: the session owns it from here.
-fn background(cx: &Cx<'_>, spawn: Spawn, log: &Path) -> io::Result<Ran> {
+fn background(cx: &Cx, spawn: Spawn, log: &Path) -> io::Result<Ran> {
     let started = Instant::now();
     let (file, log) = create_private(log)?;
     let mut cmd = process(&spawn);
@@ -302,7 +305,7 @@ fn background(cx: &Cx<'_>, spawn: Spawn, log: &Path) -> io::Result<Ran> {
 /// startup files, so the user's prompt and aliases stay out of it, given a
 /// script that reports where it ended to `report`.
 fn spawn(
-    cx: &Cx<'_>,
+    cx: &Cx,
     command: &str,
     dir: &Path,
     env: BTreeMap<String, String>,
@@ -315,7 +318,7 @@ fn spawn(
         )
     })?;
     if report.is_some() {
-        private_dir(cx.spill)?;
+        private_dir(&cx.spill)?;
     }
     let mut script = String::new();
     if let Some(report) = report {
@@ -357,28 +360,21 @@ fn process(spawn: &Spawn) -> Process {
 /// The session's environment (the client's, or else the daemon's without
 /// its secrets), quieted, and told which session and model it serves.
 fn environment(
-    cx: &Cx<'_>,
+    cx: &Cx,
     daemon: impl Iterator<Item = (String, String)>,
 ) -> BTreeMap<String, String> {
-    let mut env: BTreeMap<String, String> = match cx.env {
+    let mut env: BTreeMap<String, String> = match &cx.env {
         Some(env) => env.vars.clone(),
-        None => daemon.filter(|(name, _)| !secret(name)).collect(),
+        None => daemon
+            .filter(|(name, _)| !Environment::is_secret(name))
+            .collect(),
     };
     for (name, value) in QUIET {
         env.insert(name.to_owned(), value.to_owned());
     }
     env.insert("A_SESSION_ID".to_owned(), cx.session.to_string());
-    env.insert("A_MODEL".to_owned(), cx.model.to_owned());
+    env.insert("A_MODEL".to_owned(), cx.model.to_string());
     env
-}
-
-/// Whether a daemon variable may hold a secret, such as the model's API
-/// key, which commands must not inherit.
-fn secret(name: &str) -> bool {
-    let name = name.to_ascii_uppercase();
-    ["KEY", "PASSWORD", "SECRET", "TOKEN"]
-        .iter()
-        .any(|word| name.contains(word))
 }
 
 fn find_bash(env: &BTreeMap<String, String>) -> Option<String> {
@@ -433,15 +429,19 @@ struct Finished {
     output: Rendered,
 }
 
-/// Reads the command's output until it ends, stopping the command when it
-/// runs out of time or the call is cancelled. Blocks.
+/// Reads the command's output until it ends, reporting it as it comes and
+/// stopping the command when it runs out of time or the call is cancelled.
+/// Blocks.
 fn supervise(
     mut child: Child,
     mut reader: io::PipeReader,
     limit: Duration,
-    cancel: &Cancel,
+    cx: &Cx,
     mut output: Output,
 ) -> io::Result<Finished> {
+    let cancel: &Cancel = &cx.cancel;
+    let mut live = Live::default();
+    let mut reported = Instant::now();
     // A reader of its own, so waiting for output never hides an exit. It
     // ends at EOF, or at the first chunk after this call stopped
     // listening; a process that escaped the group and holds the pipe
@@ -468,11 +468,18 @@ fn supervise(
             match rx.recv_timeout(TICK) {
                 Ok(chunk) => {
                     output.push(&chunk);
+                    live.push(&chunk);
                     heard = Instant::now();
                 }
                 Err(RecvTimeoutError::Timeout) => {}
                 Err(RecvTimeoutError::Disconnected) => eof = true,
             }
+        }
+        if reported.elapsed() >= REPORT
+            && let Some(text) = live.take()
+        {
+            cx.progress(&text);
+            reported = Instant::now();
         }
         if status.is_none() {
             status = child.try_wait()?;

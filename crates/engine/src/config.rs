@@ -4,11 +4,12 @@
 //! client first, then the home file's `[env]`, then the daemon's own
 //! environment; a workspace, being anyone's checkout, never sets them.
 
+use std::fmt;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 use std::time::SystemTime;
 
-use protocol::Environment;
+use protocol::{Environment, Overrides};
 
 use crate::lock;
 
@@ -69,6 +70,30 @@ impl Watched {
     }
 }
 
+/// The layer a setting came from.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Source {
+    Default,
+    Home,
+    Workspace,
+    /// `A_MODEL` or `A_AGENT`.
+    Env,
+    /// The session's own, set by its entry `seq`.
+    Session(u64),
+}
+
+impl fmt::Display for Source {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Default => f.write_str("the built-in default"),
+            Self::Home => f.write_str("the home config.toml"),
+            Self::Workspace => f.write_str("the workspace's .a/config.toml"),
+            Self::Env => f.write_str("the daemon's environment"),
+            Self::Session(seq) => write!(f, "this session, at entry {seq}"),
+        }
+    }
+}
+
 /// The layers, and the overrides on top of them.
 pub struct Settings {
     /// `$A_HOME/config.toml`.
@@ -115,18 +140,36 @@ impl Settings {
         .unwrap_or_default()
     }
 
-    /// The model spec for a session in `workspace`.
+    /// The model spec for a session in `workspace` that sets none itself.
     pub fn model(&self, workspace: &Path) -> Result<String, String> {
+        self.model_in(workspace, (Overrides::default(), None))
+            .map(|(model, _)| model)
+    }
+
+    /// The model spec for a session in `workspace` with its own settings
+    /// `session` (and the seq of the entry that set them), and the layer
+    /// that named it: the session's own over every other.
+    pub fn model_in(
+        &self,
+        workspace: &Path,
+        session: (Overrides, Option<u64>),
+    ) -> Result<(String, Source), String> {
+        if let (Overrides { model: Some(model) }, seq) = session {
+            return Ok((model, Source::Session(seq.unwrap_or_default())));
+        }
         if let Some(model) = &self.model {
-            return Ok(model.clone());
+            return Ok((model.clone(), Source::Env));
         }
         let local = Self::workspace(workspace)?;
+        if let Some(model) = local.model {
+            return Ok((model, Source::Workspace));
+        }
         let home = self.home.get();
         let home = home.as_ref().as_ref().map_err(Clone::clone)?;
-        Ok(local
-            .model
-            .or_else(|| home.model.clone())
-            .unwrap_or_else(|| DEFAULT_MODEL.to_owned()))
+        Ok(home.model.clone().map_or_else(
+            || (DEFAULT_MODEL.to_owned(), Source::Default),
+            |model| (model, Source::Home),
+        ))
     }
 
     /// Variable `name` for a session whose client environment is `client`:

@@ -69,7 +69,12 @@ fn resume_after_the_terminal_closes_mid_turn_replays_every_entry() {
     }
     assert_contiguous(&entries);
     assert_eq!(entries, env.log(id));
-    let mut bodies: Vec<_> = entries.into_iter().map(|e| e.body).collect();
+    // Input typed while a turn runs is logged as queued first.
+    let mut bodies: Vec<_> = entries
+        .into_iter()
+        .map(|e| e.body)
+        .filter(|b| !matches!(b, Body::Queued { .. }))
+        .collect();
     let attached = bodies.remove(0);
     assert!(
         matches!(&attached, Body::Environment(shell) if shell.cwd == env.ws),
@@ -184,18 +189,20 @@ fn a_safe_tool_reruns_after_the_daemon_is_killed() {
 }
 
 #[test]
-fn an_unsafe_tool_is_interrupted_and_its_processes_killed_after_the_daemon_is_killed() {
+fn an_unsafe_tool_is_interrupted_with_its_output_and_its_processes_killed() {
     let env = Env::new("kill-unsafe");
     env.start();
     let mut conn = env.connect();
     let (id, _) = conn.attach(Target::New, &env.ws);
-    conn.input("$ echo ran >> ran.txt; sleep 30");
+    conn.input("$ echo ran >> ran.txt; echo started; sleep 30");
     let entries = conn.until(|e| matches!(e.body, Body::ToolProcess { .. }));
     let Body::ToolProcess { call, pgid, .. } = entries.last().unwrap().body else {
         unreachable!()
     };
     let ran = env.ws.join("ran.txt");
     wait_for("the command to start", || ran.exists());
+    // Its output so far is committed as it runs.
+    conn.until(|e| matches!(&e.body, Body::Progress { call: c, .. } if *c == call));
     env.kill_daemon();
     let orphaned = group_alive(pgid);
 
@@ -211,7 +218,12 @@ fn an_unsafe_tool_is_interrupted_and_its_processes_killed_after_the_daemon_is_ki
     assert_contiguous(&entries);
     assert_eq!(entries, env.log(id));
     let results: Vec<_> = entries.iter().filter_map(|e| result_of(e, call)).collect();
-    assert_eq!(results, [&Outcome::Interrupted]);
+    assert_eq!(
+        results,
+        [&Outcome::Interrupted {
+            output: Some("started\n".into())
+        }]
+    );
     assert_eq!(fs::read_to_string(ran).unwrap(), "ran\n");
 }
 
@@ -332,7 +344,8 @@ fn entries_after_a_torn_tail_survive_a_restart() {
 
     env.start();
     let (_, entries) = env.connect().attach(Target::Id(id), &env.ws);
-    assert_eq!(entries.len(), 4);
+    let queued = |e: &&protocol::Entry| matches!(e.body, Body::Queued { .. });
+    assert_eq!(entries.iter().filter(|e| !queued(e)).count(), 4);
     assert_contiguous(&entries);
     assert_eq!(entries, env.log(id));
 }

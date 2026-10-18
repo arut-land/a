@@ -4,6 +4,7 @@
 //! to the same contract.
 
 mod jsonl;
+mod lease;
 mod memory;
 #[cfg(test)]
 mod tests;
@@ -15,6 +16,7 @@ use protocol::{Entry, Installed, SessionId};
 use serde::{Deserialize, Serialize};
 
 pub use jsonl::Jsonl;
+pub use lease::{Lease, LeaseAuthority, Local};
 pub use memory::Memory;
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -42,10 +44,19 @@ pub struct Parent {
 pub struct Loaded {
     pub entries: Vec<Entry>,
     pub log: Box<dyn Log>,
+    /// The epoch of the appender's lease, which every entry it appends
+    /// carries.
+    pub epoch: u32,
 }
 
-/// Where session logs live. Callers keep at most one appender per session
-/// open at a time.
+/// The newest epoch in `entries`: a new lease must be past it.
+fn floor(entries: &[Entry]) -> u32 {
+    entries.last().map_or(0, |e| e.epoch)
+}
+
+/// Where session logs live. Each `create` or `load` leases the appender it
+/// returns, superseding any earlier one for the session: that one's appends
+/// fail from then on.
 pub trait LogStore: Send + Sync {
     /// A new, empty session log; fails with `AlreadyExists` if the id is taken.
     fn create(&self, header: &Header) -> io::Result<Loaded>;
@@ -55,6 +66,10 @@ pub trait LogStore: Send + Sync {
 
     /// One session's entries and an appender; `NotFound` if there is none.
     fn load(&self, id: SessionId) -> io::Result<Loaded>;
+
+    /// One session's committed entries, read without taking its lease: its
+    /// writer goes on appending.
+    fn entries(&self, id: SessionId) -> io::Result<Vec<Entry>>;
 
     /// The number of committed entries, without loading them.
     fn count(&self, id: SessionId) -> io::Result<u64>;
@@ -70,7 +85,9 @@ pub trait LogStore: Send + Sync {
 /// One session's appender.
 pub trait Log: Send {
     /// Returns once the entry is as durable as the backend makes anything: a
-    /// crash afterwards never loses it.
+    /// crash afterwards never loses it. Fails with `ResourceBusy` and writes
+    /// nothing if the appender's lease was superseded or the entry carries
+    /// another epoch.
     fn append(&mut self, entry: &Entry) -> io::Result<()>;
 
     /// Appends `entries` in order, as durably as [`Log::append`]; a backend

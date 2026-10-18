@@ -20,10 +20,13 @@ mod tool;
 pub mod tools;
 
 pub use builtin::{Fixtures, Policy, builtins};
-pub use ext::{Command, DynCommand, Extension, Facts, Refused, Registrar, Registry, Section, Slot};
+pub use ext::{
+    Command, Current, DynCommand, Extension, Facts, Refused, Registrar, Registry, Section, Slot,
+    Tier,
+};
 pub use hooks::{AskFor, Decided, Gate, Hook, Hooks, Pre, Said, Spawn};
 pub use state::{Cwd, State, States};
-pub use tool::{Cancel, Cx, DynTool, Host, Kill, Replay, Tool, Toolset, session_dir};
+pub use tool::{Cancel, Cx, DynTool, Host, Kill, Replay, Route, Tool, Toolset, session_dir};
 
 pub enum Input {
     User {
@@ -57,7 +60,7 @@ pub fn child_result(outcome: &Outcome) -> String {
         } => format!("The child session finished:\n{text}"),
         Outcome::Done { output } => format!("The child session finished:\n{output}"),
         Outcome::Failed { error } => format!("The child session failed: {error}"),
-        Outcome::Interrupted => "The child session was interrupted.".to_owned(),
+        Outcome::Interrupted { .. } => "The child session was interrupted.".to_owned(),
     };
     if text.len() > CHILD_RESULT_LIMIT {
         let cut = text.floor_char_boundary(CHILD_RESULT_LIMIT);
@@ -137,6 +140,12 @@ pub struct Chat {
 impl Agent for Chat {
     fn step(&mut self, input: Input) -> Vec<Action> {
         match input {
+            // A child interrupted with its owner hands back nothing to go
+            // on with.
+            Input::ChildDone {
+                outcome: Outcome::Interrupted { .. },
+                ..
+            } => Vec::new(),
             // A child's result arrives between turns, so it starts one.
             Input::User { .. } | Input::ChildDone { .. } => {
                 (self.steps, self.pending) = (1, 0);
@@ -347,7 +356,7 @@ mod tests {
     fn done() -> Input {
         Input::ToolDone {
             call: 0,
-            outcome: Outcome::Interrupted,
+            outcome: Outcome::Interrupted { output: None },
         }
     }
 
