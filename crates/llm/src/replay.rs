@@ -68,7 +68,7 @@ pub fn fingerprint(canon: Canon<'_>) -> String {
         Canon::Text(text) => write!(hash, "t\0{text}"),
         Canon::Reasoning(text, redacted) => write!(hash, "r\0{redacted}\0{text}"),
         Canon::Call(name, input) => write!(hash, "c\0{name}\0")
-            .and_then(|()| serde_json::to_writer(&mut hash, input).map_err(Into::into)),
+            .and_then(|()| hash.write_all(serde_json::to_string(input)?.as_bytes())),
         Canon::Other => return String::new(),
     };
     format!("{:016x}", hash.0)

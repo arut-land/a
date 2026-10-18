@@ -32,7 +32,7 @@ pub fn prepare(mut request: Request, target: &Target<'_>) -> Request {
         })
     };
     let mut ids = Ids::default();
-    let messages = std::mem::take(&mut request.messages)
+    let messages: Vec<Message> = std::mem::take(&mut request.messages)
         .into_iter()
         .filter_map(|message| match message {
             Message::Assistant(mut assistant) => {
@@ -62,7 +62,8 @@ pub fn prepare(mut request: Request, target: &Target<'_>) -> Request {
                 Some(Message::Tool(tool))
             }
             other => Some(other),
-        });
+        })
+        .collect();
     request.messages = repair(messages);
     request
 }
@@ -100,8 +101,8 @@ impl Ids {
 }
 
 /// Pairs every call with a result, in place.
-fn repair(messages: impl Iterator<Item = Message>) -> Vec<Message> {
-    let mut out = Vec::with_capacity(messages.size_hint().0);
+fn repair(messages: Vec<Message>) -> Vec<Message> {
+    let mut out = Vec::with_capacity(messages.len());
     // Calls awaiting results, in call order: (id, name).
     let mut pending: Vec<(SmolStr, SmolStr)> = Vec::new();
     let mut held: Vec<Message> = Vec::new();

@@ -232,9 +232,7 @@ impl Arguments {
 
     /// Whether the text is a complete JSON object.
     fn complete(&self) -> bool {
-        !self.overflowed
-            && self.text.trim_start().starts_with('{')
-            && serde_json::from_str::<serde::de::IgnoredAny>(&self.text).is_ok()
+        !self.overflowed && matches!(serde_json::from_str(&self.text), Ok(Value::Object(_)))
     }
 }
 
@@ -876,8 +874,11 @@ impl Writer {
         if let Some(by_index) = &self.by_index {
             parts.sort_by_key(|part| (by_index.get(part).copied().unwrap_or(usize::MAX), *part));
         }
-        if let Some(lead) = self.lead {
-            parts.sort_by_key(|part| *part != lead);
+        if let Some(at) = self
+            .lead
+            .and_then(|lead| parts.iter().position(|part| *part == lead))
+        {
+            parts[..=at].rotate_right(1);
         }
         (!parts.is_sorted()).then_some(parts)
     }
