@@ -3,21 +3,26 @@
 //! blocking I/O, so it runs on the `rt` runtime's blocking pool and the
 //! exported async methods only await it.
 
+use std::collections::BTreeMap;
+use std::ffi::OsString;
 use std::io;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
+use std::time::Duration;
 
 use boltffi::{EventSubscription, export};
 use client::{Connection, Endpoint, Reader, Writer};
 use protocol::view::{Link, SessionList};
 use protocol::{ClientMsg, Environment, SessionId, Target};
 use rt::{Runtime, Threads};
+use sys::install::CliLink;
 use sys::{Home, Staged};
 
 use crate::feed::{Feed, lock};
 use crate::{
-    ClientError, OpenTarget, Resync, SessionInfo, SessionSnapshot, ViewChange, ViewUpdate,
+    CliStatus, ClientError, EnvVar, OpenTarget, Resync, SessionInfo, SessionSnapshot, Settings,
+    ViewChange, ViewUpdate,
 };
 
 fn runtime() -> &'static Threads {
@@ -30,6 +35,40 @@ async fn blocking<T: Send + 'static>(
     work: impl FnOnce() -> Result<T, ClientError> + Send + 'static,
 ) -> Result<T, ClientError> {
     rt::unblock(runtime(), work).await
+}
+
+/// The environment a new session's commands run with: this process's, and
+/// over it what the user's login shell exports. An app opened from Finder
+/// or the Dock has launchd's environment, whose `PATH` lacks everything the
+/// user installed, so their shell is asked once (with a timeout; on failure
+/// the process environment stands). Started from a terminal (`TERM` is
+/// set), the process has the shell's environment already, and tests stay
+/// hermetic.
+fn session_vars() -> Vec<(OsString, OsString)> {
+    static LOGIN: OnceLock<Vec<(OsString, OsString)>> = OnceLock::new();
+    let login = LOGIN.get_or_init(|| {
+        if std::env::var_os("TERM").is_some() {
+            return Vec::new();
+        }
+        let shell = std::env::var_os("SHELL")
+            .filter(|s| !s.is_empty())
+            .unwrap_or_else(|| "/bin/zsh".into());
+        sys::login_env(&shell, Duration::from_secs(5)).unwrap_or_else(|e| {
+            eprintln!("a: the login shell's environment: {e}");
+            Vec::new()
+        })
+    });
+    let mut vars: BTreeMap<OsString, OsString> = std::env::vars_os().collect();
+    vars.extend(login.iter().cloned());
+    vars.into_iter().collect()
+}
+
+/// The `PATH` a session's commands get.
+fn session_path() -> OsString {
+    session_vars()
+        .into_iter()
+        .find_map(|(k, v)| (k == "PATH").then_some(v))
+        .unwrap_or_default()
 }
 
 /// This build of `a`, staged in the per-user home, and the daemon it runs.
@@ -105,6 +144,87 @@ impl Client {
         .await
     }
 
+    /// The pid of the running daemon, if one is.
+    pub fn daemon_pid(&self) -> Option<u32> {
+        client::diagnose(&self.daemon.home).pid
+    }
+
+    /// `$A_HOME/config.toml`, as the settings pane shows it.
+    pub fn settings(&self) -> Result<Settings, ClientError> {
+        let path = self.daemon.home.config_file();
+        let config = sys::Config::read(&path)?;
+        Ok(Settings {
+            model: config.model,
+            agent: config.agent,
+            env: config
+                .env
+                .into_iter()
+                .map(|(name, value)| EnvVar { name, value })
+                .collect(),
+            path: path.display().to_string(),
+        })
+    }
+
+    /// Writes `settings` to `$A_HOME/config.toml` (0600, replaced whole),
+    /// keeping comments and keys the pane does not show. The daemon reads
+    /// the file again when it changes.
+    pub fn save_settings(&self, settings: Settings) -> Result<(), ClientError> {
+        let given = |s: Option<String>| s.map(|s| s.trim().to_owned()).filter(|s| !s.is_empty());
+        let mut env = BTreeMap::new();
+        for EnvVar { name, value } in settings.env {
+            let name = name.trim().to_owned();
+            if name.is_empty() {
+                continue;
+            }
+            if !sys::config::is_var_name(&name) {
+                return Err(ClientError::InvalidArgument {
+                    message: format!("not a variable name: {name}"),
+                });
+            }
+            env.insert(name, value);
+        }
+        let config = sys::Config {
+            model: given(settings.model),
+            agent: given(settings.agent),
+            env,
+        };
+        config.write(&self.daemon.home.config_file())?;
+        Ok(())
+    }
+
+    /// What `a` resolves to with `dir` in front of `search` (a `PATH`;
+    /// `None` is the one sessions get, which may take the login shell a
+    /// moment the first time).
+    pub async fn cli_status(
+        &self,
+        dir: String,
+        search: Option<String>,
+    ) -> Result<CliStatus, ClientError> {
+        let runtime = self.daemon.home.runtime();
+        blocking(move || {
+            let search = search.map_or_else(session_path, OsString::from);
+            Ok(CliLink::find(&runtime, Path::new(&dir), &search).into())
+        })
+        .await
+    }
+
+    /// Links `dir/a` to the staged `runtime/current/a`, so the CLI runs the
+    /// build the daemon runs: only where no `a` is found on `search`, or
+    /// over a link an earlier install made when `replace` is set.
+    pub async fn install_cli(
+        &self,
+        dir: String,
+        search: Option<String>,
+        replace: bool,
+    ) -> Result<CliStatus, ClientError> {
+        let runtime = self.daemon.home.runtime();
+        blocking(move || {
+            let search = search.map_or_else(session_path, OsString::from);
+            Ok(CliLink::install(&runtime, Path::new(&dir), &search, replace)?.into())
+        })
+        .await
+    }
+
     /// Replaces a daemon that stopped answering (`not_responding`).
     pub async fn restart_daemon(&self) -> Result<(), ClientError> {
         let daemon = self.daemon.clone();
@@ -173,8 +293,7 @@ impl Session {
         let (target, workspace, env) = match target {
             OpenTarget::New { workspace } => {
                 let dir = PathBuf::from(workspace);
-                let env = Environment::new(dir.clone(), std::env::vars_os(), false);
-                (Target::New, sys::workspace_of(&dir), Some(env))
+                (Target::New, sys::workspace_of(&dir), Some(dir))
             }
             OpenTarget::Latest {
                 workspace,
@@ -193,6 +312,7 @@ impl Session {
                     message: "the session was opened already".into(),
                 });
             }
+            let env = env.map(|dir| Environment::new(dir, session_vars(), false));
             let conn = daemon
                 .attach(target, workspace, env, 0)
                 .inspect_err(|_| shared.opened.store(false, Ordering::Release))?;

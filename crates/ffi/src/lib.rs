@@ -115,6 +115,64 @@ impl From<&SessionSummary> for SessionInfo {
     }
 }
 
+/// `$A_HOME/config.toml`: what a model call uses when its session does not
+/// say; see `sys::Config`.
+#[data]
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Settings {
+    /// `host[@protocol]:model`, such as `openai:gpt-6-luna`.
+    pub model: Option<String>,
+    /// `chat` (the default) or `echo`.
+    pub agent: Option<String>,
+    /// Provider variables, such as `OPENAI_API_KEY` and `OPENAI_BASE_URL`.
+    pub env: Vec<EnvVar>,
+    /// The file, for display; ignored when saving.
+    pub path: String,
+}
+
+#[data]
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct EnvVar {
+    pub name: String,
+    pub value: String,
+}
+
+/// What stands where "Install CLI" would link `a`; see
+/// `sys::install::CliLink`.
+#[data]
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum CliStatus {
+    /// A link to the staged `runtime/current/a`: the CLI is the daemon's
+    /// build.
+    Installed { path: String },
+    /// A link an earlier install made to another build; replaceable.
+    Stale { path: String, target: String },
+    /// An `a` installed some other way, left alone.
+    Foreign { path: String },
+    /// Nothing yet: installing links `path`. `on_path` says whether its
+    /// directory is on the `PATH` searched.
+    Absent { path: String, on_path: bool },
+}
+
+impl From<sys::install::CliLink> for CliStatus {
+    fn from(link: sys::install::CliLink) -> Self {
+        use sys::install::CliLink;
+        let text = |p: std::path::PathBuf| p.display().to_string();
+        match link {
+            CliLink::Installed { path } => Self::Installed { path: text(path) },
+            CliLink::Stale { path, target } => Self::Stale {
+                path: text(path),
+                target: text(target),
+            },
+            CliLink::Foreign { path } => Self::Foreign { path: text(path) },
+            CliLink::Absent { path, on_path } => Self::Absent {
+                path: text(path),
+                on_path,
+            },
+        }
+    }
+}
+
 /// Which session to open.
 #[data]
 #[derive(Clone, Debug, PartialEq, Eq)]

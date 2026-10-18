@@ -84,6 +84,16 @@ swift test --package-path apps/apple/AKit
     "cargo build-release -p a",
     "xcodebuild -quiet -project apps/apple/A.xcodeproj -scheme A -configuration Debug -destination platform=macOS,arch=arm64 -derivedDataPath apps/apple/build build",
 ] }
-# In the foreground, with this shell's environment: `A_HOME=... A_AGENT=echo
-# mise run apple:run` gives the app and the daemon it starts their own home.
+# The Release configuration as a distribution archive (ad hoc signed; a
+# Developer ID export re-signs it), checked to carry and seal its helper:
+# apps/apple/build/A.xcarchive.
+"apple:archive" = { depends = ["apple:ffi", "apple:gen"], run = [
+    "cargo build-release -p a",
+    "xcodebuild -quiet -project apps/apple/A.xcodeproj -scheme A -configuration Release -destination generic/platform=macOS ARCHS=arm64 -derivedDataPath apps/apple/build archive -archivePath apps/apple/build/A.xcarchive",
+    "codesign --verify --deep --strict apps/apple/build/A.xcarchive/Products/Applications/A.app",
+    "apps/apple/build/A.xcarchive/Products/Applications/A.app/Contents/Helpers/a --version",
+] }
+# In the foreground, with this shell's environment: `A_HOME=... mise run
+# apple:run` gives the app and the daemon it starts their own home. The
+# daemon runs the chat agent unless A_AGENT=echo says otherwise.
 "apple:run" = { depends = ["apple:build"], run = "apps/apple/build/Build/Products/Debug/A.app/Contents/MacOS/A" }

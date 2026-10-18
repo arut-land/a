@@ -38,13 +38,29 @@ targets:
         ENABLE_APP_SANDBOX: NO
         ENABLE_HARDENED_RUNTIME: YES
     postBuildScripts:
-      # The `a` the app stages and starts the daemon from. A_HELPER names
-      # another build; the default is the release build.
+      # The `a` the app stages and starts the daemon from, and the CLI that
+      # "Install Command Line Tool" links (through the staged copy): users
+      # never download it separately. A_HELPER names another build; the
+      # default is the release build. It runs for every action (build,
+      # archive), before Xcode signs the app, which then seals the helper as
+      # nested code; it is signed here with the app's identity so both pass
+      # `codesign --verify --deep --strict` and notarization.
       - name: Bundle the a helper
         basedOnDependencyAnalysis: false
+        shell: /bin/sh
         script: |
+          set -eu
           helper="${A_HELPER:-$SRCROOT/../../target/release/a}"
+          if [ ! -x "$helper" ]; then
+            echo "error: no a helper at $helper; run cargo build-release -p a" >&2
+            exit 1
+          fi
           dest="$TARGET_BUILD_DIR/$CONTENTS_FOLDER_PATH/Helpers"
           mkdir -p "$dest"
           cp -f "$helper" "$dest/a"
-          codesign --force --sign "${EXPANDED_CODE_SIGN_IDENTITY:--}" --options runtime "$dest/a"
+          identity="${EXPANDED_CODE_SIGN_IDENTITY:--}"
+          # A secure timestamp needs a real identity (and the network).
+          timestamp=--timestamp=none
+          if [ "$identity" != "-" ]; then timestamp=--timestamp; fi
+          codesign --force --sign "$identity" --identifier "$PRODUCT_BUNDLE_IDENTIFIER.cli" \
+            --options runtime "$timestamp" "$dest/a"
