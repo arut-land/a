@@ -26,10 +26,18 @@ pub(crate) enum Json<'a, T = Value, E = Value> {
     Other(Value),
 }
 
-impl<T, E> Json<'_, T, E> {
+impl<'a, T, E> Json<'a, T, E> {
     pub(crate) fn str(&self) -> Option<&str> {
         match self {
             Self::Str(text) => Some(text),
+            _ => None,
+        }
+    }
+
+    /// The string, unless it is empty or the value is no string.
+    pub(crate) fn into_text(self) -> Option<Cow<'a, str>> {
+        match self {
+            Self::Str(text) if !text.is_empty() => Some(text),
             _ => None,
         }
     }

@@ -249,18 +249,30 @@ impl GeminiDecoder {
         self.w.end(end)
     }
 
-    /// Finish the open run: Gemini states each part whole.
+    /// Finish the open run, its item holding the text it streamed: Gemini
+    /// states each part whole.
     fn close(&mut self) -> Result<(), Error> {
-        match (self.run.take(), self.last) {
-            (Some(_), Some(index)) => self.w.finish(index),
-            _ => Ok(()),
-        }
+        let (Some(_), Some(index)) = (self.run.take(), self.last) else {
+            return Ok(());
+        };
+        let text = self.w.text(index).unwrap_or_default().to_owned();
+        self.w.edit(index, |item| {
+            if let Some(item) = item.as_object_mut() {
+                item.insert("text".into(), text.into());
+            }
+        })?;
+        self.w.finish(index)
     }
 
     /// Write a part at a fresh index, closing the run before it. Text and
     /// thought stay open as the run later parts continue; any other part is
     /// whole.
-    fn open(&mut self, block: Open, mut item: Value, text: &str) -> Result<(), Error> {
+    fn open<'a>(
+        &mut self,
+        block: Open,
+        mut item: Value,
+        text: impl Into<Cow<'a, str>>,
+    ) -> Result<(), Error> {
         self.close()?;
         let index = self.w.fresh_index();
         if let (Some(signature), Some(fields)) = (self.signature.take(), item.as_object_mut()) {
@@ -304,25 +316,21 @@ impl GeminiDecoder {
                 && !(self.signed && signed)
             {
                 self.signed |= signed;
-                self.w.push(index, &text)?;
-                // The text appends, a non-empty signature replaces the one
-                // held, and any other field replaces its namesake.
+                self.w.push(index, text)?;
+                // A non-empty signature replaces the one held, and any other
+                // field replaces its namesake.
                 let kept =
                     |(key, value): &(String, Value)| key != "thoughtSignature" || value != "";
                 let rest = rest.into_iter().filter(kept);
                 return self.w.edit(index, |item| {
-                    if let Some(Value::String(held)) = item.get_mut("text") {
-                        held.push_str(&text);
-                    }
                     if let Some(item) = item.as_object_mut() {
                         item.extend(rest);
                     }
                 });
             }
-            rest.insert("text".into(), text.as_ref().into());
             let reasoning = Open::Reasoning { redacted: false };
             let block = if thought { reasoning } else { Open::Text };
-            return self.open(block, Value::Object(rest), &text);
+            return self.open(block, Value::Object(rest), text);
         }
         if let Some(call) = rest.get("functionCall").and_then(Value::as_object) {
             let field = |key| call.get(key).and_then(Value::as_str).unwrap_or_default();
@@ -333,7 +341,7 @@ impl GeminiDecoder {
             let (id, name) = (field("id").into(), field("name").into());
             // Proto3 JSON leaves out an empty `args` struct.
             let arguments = call.get("args").map_or("{}".to_owned(), Value::to_string);
-            return self.open(Open::Call { id, name }, Value::Object(rest), &arguments);
+            return self.open(Open::Call { id, name }, Value::Object(rest), arguments);
         }
         let bare = ["thought", "thoughtSignature", "partMetadata"];
         let data = rest.keys().any(|key| !bare.contains(&key.as_str()));

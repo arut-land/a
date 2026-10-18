@@ -5,16 +5,16 @@ use serde_json::{Value, json};
 use super::*;
 use crate::{Accumulator, Response};
 
-/// One reply written by `write`, then ended with no finish reason on a wire
-/// that need not state one.
+/// One reply written by `write`, then ended by the output limit, which
+/// leaves a call that never finished standing.
 fn write(
     write: impl FnOnce(&mut Writer) -> Result<(), Error>,
 ) -> (Vec<Event>, Result<Response, Error>) {
-    run(
-        Writer::new("test").without_finish_reason(),
-        End::default(),
-        write,
-    )
+    let end = End {
+        reason: Some((Reason::Length, None)),
+        ..End::default()
+    };
+    run(Writer::new("test"), end, write)
 }
 
 fn run(
@@ -198,26 +198,6 @@ fn writing_to_an_item_that_is_not_open_is_an_error() {
 }
 
 #[test]
-fn a_boundaryless_run_continues_while_the_kind_stays_the_same() {
-    let (_, outcome) = write(|w| {
-        w.run(Open::Text, "a")?;
-        w.run(Open::Text, "b")?;
-        w.run(Open::Reasoning { redacted: false }, "r")?;
-        w.run(Open::Text, "c")?;
-        Ok(())
-    });
-    let texts: Vec<_> = parts(outcome)
-        .into_iter()
-        .map(|part| match part {
-            AssistantPart::Text(text) => format!("text:{}", text.text),
-            AssistantPart::Reasoning(reasoning) => format!("reasoning:{}", reasoning.text),
-            other => panic!("{other:?}"),
-        })
-        .collect();
-    assert_eq!(texts, ["text:ab", "reasoning:r", "text:c"]);
-}
-
-#[test]
 fn a_wire_reply_that_names_no_finish_reason_failed() {
     let (_, outcome) = run(Writer::new("test"), End::default(), |w| {
         w.whole(0, Open::Text, json!({"type": "text"}), "hi")
@@ -251,7 +231,7 @@ fn parts_from_the_first_unfinished_item_on_keep_no_state() {
 fn a_call_sent_without_an_id_keeps_its_item_only_where_the_item_has_an_id_slot() {
     let idless = |w: &mut Writer| {
         w.fragment(
-            Some(0),
+            0,
             CallFragment {
                 id: None,
                 name: Some("lookup"),
@@ -274,18 +254,17 @@ fn a_call_sent_without_an_id_keeps_its_item_only_where_the_item_has_an_id_slot()
 }
 
 #[test]
-fn index_less_fragments_with_new_ids_are_new_calls() {
+fn a_new_id_under_an_index_starts_a_call_once_the_held_one_is_whole() {
     let fragment = |id: Option<&'static str>, arguments: &'static str| CallFragment {
         id,
         name: id.map(|_| "weather"),
         arguments: Some(arguments),
     };
     let (_, outcome) = write(|w| {
-        w.fragment(None, fragment(Some("a1"), r#"{"city":"#))?;
-        w.fragment(None, fragment(None, r#""Paris"}"#))?;
-        w.fragment(None, fragment(Some("b2"), r#"{"city":"Rome"}"#))?;
-        w.fragment(Some(0), fragment(Some("c3"), r#"{"city":"Oslo"}"#))?;
-        w.fragment(Some(0), fragment(Some("d4"), r#"{"city":"Bern"}"#))?;
+        w.fragment(0, fragment(Some("a1"), r#"{"city":"#))?;
+        w.fragment(0, fragment(None, r#""Paris"}"#))?;
+        w.fragment(0, fragment(Some("b2"), r#"{"city":"Rome"}"#))?;
+        w.fragment(0, fragment(Some("c3"), r#"{"city":"Oslo"}"#))?;
         Ok(())
     });
     assert_eq!(
@@ -294,7 +273,6 @@ fn index_less_fragments_with_new_ids_are_new_calls() {
             ("a1".to_owned(), json!({"city": "Paris"})),
             ("b2".to_owned(), json!({"city": "Rome"})),
             ("c3".to_owned(), json!({"city": "Oslo"})),
-            ("d4".to_owned(), json!({"city": "Bern"})),
         ]
     );
 }
@@ -305,7 +283,7 @@ fn a_new_id_under_an_index_continues_a_call_whose_arguments_are_incomplete() {
     let (_, outcome) = write(|w| {
         for (id, name, arguments) in [("x1", "lookup", r#"{"q":"#), ("x2", "", r#""x"}"#)] {
             w.fragment(
-                Some(0),
+                0,
                 CallFragment {
                     id: Some(id),
                     name: Some(name),
@@ -323,33 +301,11 @@ fn a_new_id_under_an_index_continues_a_call_whose_arguments_are_incomplete() {
 }
 
 #[test]
-fn index_less_id_less_fragments_open_a_call_once_the_last_is_whole() {
-    let (_, outcome) = write(|w| {
-        for arguments in [r#"{"q":"a"}"#, r#"{"q":"#, r#""b"}"#] {
-            w.fragment(
-                None,
-                CallFragment {
-                    id: None,
-                    name: Some("weather"),
-                    arguments: Some(arguments),
-                },
-            )?;
-        }
-        Ok(())
-    });
-    let calls: Vec<Value> = arguments(&parts(outcome))
-        .into_iter()
-        .map(|(_, args)| args)
-        .collect();
-    assert_eq!(calls, [json!({"q": "a"}), json!({"q": "b"})]);
-}
-
-#[test]
 fn an_empty_or_null_id_names_no_call() {
     for stated in ["", "null"] {
         let (_, outcome) = write(|w| {
             w.fragment(
-                Some(0),
+                0,
                 CallFragment {
                     id: Some(stated),
                     name: Some("lookup"),
@@ -396,10 +352,10 @@ fn fragments_before_the_name_wait_for_it_then_stream() {
             name,
             arguments,
         };
-        w.fragment(Some(0), fragment(None, Some(r#"{"x":"#)))?;
-        w.fragment(Some(0), fragment(Some("add"), None))?;
-        w.fragment(Some(0), fragment(None, Some("1,")))?;
-        w.fragment(Some(0), fragment(None, Some(r#""y":2}"#)))?;
+        w.fragment(0, fragment(None, Some(r#"{"x":"#)))?;
+        w.fragment(0, fragment(Some("add"), None))?;
+        w.fragment(0, fragment(None, Some("1,")))?;
+        w.fragment(0, fragment(None, Some(r#""y":2}"#)))?;
         Ok(())
     });
     assert_eq!(
@@ -422,10 +378,10 @@ fn parallel_calls_interleave_under_their_own_parts() {
             name: Some(name),
             arguments: Some(arguments),
         };
-        w.fragment(Some(0), fragment("a", "add", r#"{"x":"#))?;
-        w.fragment(Some(1), fragment("b", "weather", r#"{"city":"#))?;
-        w.fragment(Some(0), fragment("a", "add", "1}"))?;
-        w.fragment(Some(1), fragment("b", "weather", r#""Rome"}"#))?;
+        w.fragment(0, fragment("a", "add", r#"{"x":"#))?;
+        w.fragment(1, fragment("b", "weather", r#"{"city":"#))?;
+        w.fragment(0, fragment("a", "add", "1}"))?;
+        w.fragment(1, fragment("b", "weather", r#""Rome"}"#))?;
         Ok(())
     });
     assert_eq!(
@@ -467,7 +423,7 @@ fn a_call_sent_whole_starts_streams_once_and_ends() {
 fn a_call_that_never_names_a_tool_streams_nothing() {
     let (events, _) = write(|w| {
         w.fragment(
-            Some(0),
+            0,
             CallFragment {
                 id: Some("call_1"),
                 name: None,
@@ -489,9 +445,9 @@ fn a_placeholder_null_waits_for_the_real_arguments() {
             name: Some("add"),
             arguments: Some(arguments),
         };
-        w.fragment(Some(0), fragment("null"))?;
-        w.fragment(Some(0), fragment(r#"{"x":"#))?;
-        w.fragment(Some(0), fragment("1}"))?;
+        w.fragment(0, fragment("null"))?;
+        w.fragment(0, fragment(r#"{"x":"#))?;
+        w.fragment(0, fragment("1}"))?;
         Ok(())
     });
     assert_eq!(
@@ -509,8 +465,8 @@ fn a_started_call_keeps_the_name_its_start_stated() {
             name,
             arguments,
         };
-        w.fragment(Some(0), fragment(Some("add"), Some(r#"{"x":1,"#)))?;
-        w.fragment(Some(0), fragment(Some("multiply"), Some(r#""y":2}"#)))?;
+        w.fragment(0, fragment(Some("add"), Some(r#"{"x":1,"#)))?;
+        w.fragment(0, fragment(Some("multiply"), Some(r#""y":2}"#)))?;
         Ok(())
     });
     assert_eq!(
@@ -529,7 +485,7 @@ fn a_started_call_keeps_the_name_its_start_stated() {
 fn a_placeholder_null_never_replaced_streams_the_ended_arguments() {
     let (events, _) = write(|w| {
         w.fragment(
-            Some(0),
+            0,
             CallFragment {
                 id: Some("call_1"),
                 name: Some("noop"),

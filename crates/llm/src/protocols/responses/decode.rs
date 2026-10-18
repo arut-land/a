@@ -125,7 +125,6 @@ impl Item {
 
 /// One output item as it streams.
 #[derive(Default)]
-#[allow(clippy::struct_excessive_bools)]
 struct Slot {
     /// Its wire index in the writer, and the output index it holds until
     /// another item takes it.
@@ -135,47 +134,40 @@ struct Slot {
     custom: bool,
     id: Option<String>,
     open: bool,
-    /// The text its deltas wrote, the event they came in, and the content
-    /// or summary part that last extended it.
-    text: String,
+    /// The event its deltas came in, and the content or summary part that
+    /// last extended it.
     field: Option<Event>,
     part: u64,
-    /// A call's argument text (a custom call's raw input), and how much of
-    /// its argument JSON the writer has.
-    arguments: String,
-    sent: usize,
-    /// Whether the call's id, and its tool name, were stated when it opened.
+    /// Whether the call's id was stated when it opened.
     named: bool,
-    titled: bool,
 }
 
 impl Slot {
     /// End the call with what its done `item` states, or else with what
-    /// streamed; argument JSON that does not extend what the writer has
-    /// restates it.
+    /// streamed (a custom call's input closed as the object it opened);
+    /// argument JSON that does not extend what the writer has restates it.
     fn end_call(&self, w: &mut Writer, item: Option<&Value>) -> Result<(), Error> {
-        let streamed = if self.custom {
-            json!({ "input": self.arguments }).to_string()
-        } else {
-            self.arguments.clone()
-        };
-        let stated = item.and_then(arguments_of);
-        let whole = stated.as_deref().unwrap_or(&streamed);
-        let rest = whole.strip_prefix(&streamed[..self.sent]);
+        let held = w.text(self.at).unwrap_or_default().to_owned();
+        let whole =
+            item.and_then(arguments_of)
+                .unwrap_or_else(|| match (self.custom, held.as_str()) {
+                    (false, _) => held.clone(),
+                    (true, "") => r#"{"input":""}"#.to_owned(),
+                    (true, held) => format!("{held}\"}}"),
+                });
+        let rest = whole.strip_prefix(&held);
         if rest.is_none() {
-            w.restate(self.at, whole)?;
+            w.restate(self.at, &whole)?;
         }
         let stated = |key: &str| item.and_then(|item| item.str(key));
         let (id, name) = (stated("call_id").filter(|_| !self.named), stated("name"));
         let arguments = Some(rest.unwrap_or_default());
-        w.fragment(
-            Some(self.at),
-            CallFragment {
-                id,
-                name,
-                arguments,
-            },
-        )
+        let fragment = CallFragment {
+            id,
+            name,
+            arguments,
+        };
+        w.fragment(self.at, fragment)
     }
 }
 
@@ -386,41 +378,34 @@ impl ResponsesDecoder {
             id: item_id(item).map(str::to_owned),
             open: true,
             named: id.is_some_and(|id| !id.is_empty()),
-            titled: name.is_some_and(|name| !name.is_empty()),
             ..Slot::default()
         });
         let slot = self.slots.len() - 1;
         if kind == Item::Call {
             let arguments = item.str(if custom { "input" } else { "arguments" });
-            self.stream(slot, arguments.unwrap_or_default())?;
+            self.stream(slot, arguments.unwrap_or_default().into())?;
         }
         Ok(slot)
     }
 
-    /// Append `fragment` to the call at `slot` and write it on: a custom
-    /// call's input as the `{"input": …}` string it extends.
-    fn stream(&mut self, slot: usize, fragment: &str) -> Result<(), Error> {
-        let call = &mut self.slots[slot];
-        if fragment.is_empty() {
-            return Ok(());
+    /// Write `fragment` on to the call at `slot`: a custom call's input as
+    /// the `{"input": …}` string it extends.
+    fn stream(&mut self, slot: usize, fragment: Cow<'_, str>) -> Result<(), Error> {
+        let call = &self.slots[slot];
+        if !call.custom || fragment.is_empty() {
+            return self.w.push(call.at, fragment);
         }
-        let first = call.arguments.is_empty();
-        call.arguments.push_str(fragment);
-        let mut json = fragment;
-        if call.custom {
-            self.escaped.clear();
-            if first {
-                self.escaped.extend_from_slice(b"{\"input\":");
-            }
-            let escaped = serde_json::to_writer(&mut self.escaped, fragment);
-            escaped.map_err(|error| Error::decode(error, fragment))?;
-            // The string stays open: later input extends it.
-            self.escaped.pop();
-            json = std::str::from_utf8(&self.escaped).unwrap_or_default();
-            json = if first { json } else { &json[1..] };
+        let first = self.w.text(call.at).is_none_or(str::is_empty);
+        self.escaped.clear();
+        if first {
+            self.escaped.extend_from_slice(b"{\"input\":");
         }
-        call.sent += json.len();
-        self.w.push(call.at, json)
+        let escaped = serde_json::to_writer(&mut self.escaped, &fragment);
+        escaped.map_err(|error| Error::decode(error, &fragment))?;
+        // The string stays open: later input extends it.
+        self.escaped.pop();
+        let json = std::str::from_utf8(&self.escaped).unwrap_or_default();
+        self.w.push(call.at, if first { json } else { &json[1..] })
     }
 
     /// Close the open `slot` without the item that would complete it:
@@ -450,9 +435,8 @@ impl ResponsesDecoder {
         Ok(())
     }
 
-    fn delta(&mut self, delta: &Delta<'_>) -> Result<(), Error> {
-        let event = delta.event;
-        let text = &*delta.text;
+    fn delta(&mut self, delta: Delta<'_>) -> Result<(), Error> {
+        let (event, text) = (delta.event, delta.text);
         if text.is_empty() {
             return Ok(());
         }
@@ -482,12 +466,14 @@ impl ResponsesDecoder {
         }
         let part = part.unwrap_or(0);
         // Summary parts of one reasoning item are paragraphs.
-        if streamed.part != part && kind == Item::Reasoning && !streamed.text.is_empty() {
-            streamed.text.push_str("\n\n");
+        let wrote = self
+            .w
+            .text(streamed.at)
+            .is_some_and(|text| !text.is_empty());
+        if streamed.part != part && kind == Item::Reasoning && wrote {
             self.w.push(streamed.at, "\n\n")?;
         }
         (streamed.field, streamed.part) = (Some(event), part);
-        streamed.text.push_str(text);
         self.w.push(streamed.at, text)
     }
 
@@ -526,16 +512,18 @@ impl ResponsesDecoder {
         if done.id.is_none() {
             done.id = item_id(&item).map(str::to_owned);
         }
-        let at = done.at;
+        let (at, kind) = (done.at, done.kind);
         // A call with no name is dropped, so the reasoning it held has no
         // item to go with.
         let unnamed = item.str("name").is_none_or(str::is_empty);
-        let nameless = done.kind == Item::Call && !done.titled && unnamed;
+        let untitled = self.w.call(at).is_none_or(|call| call.name.is_none());
+        let nameless = kind == Item::Call && untitled && unnamed;
         let text = text_of(&item);
-        match done.kind {
+        let streamed = self.w.text(at).unwrap_or_default();
+        match kind {
             Item::Call => done.end_call(&mut self.w, Some(&item))?,
             Item::Opaque => {}
-            _ if !text.is_empty() => match text.strip_prefix(&done.text) {
+            _ if !text.is_empty() => match text.strip_prefix(streamed) {
                 Some(rest) => self.w.push(at, rest)?,
                 // The done item states the whole text.
                 None => self.w.restate(at, &text)?,
@@ -543,17 +531,17 @@ impl ResponsesDecoder {
             // An item that leaves its text out states it, so it replays as
             // the part it is. Raw reasoning text stays out: as a summary it
             // would replay one the provider never produced.
-            _ if done.text.is_empty() || done.field == Some(Event::Reasoning) => {}
+            _ if streamed.is_empty() || done.field == Some(Event::Reasoning) => {}
             Item::Message => {
                 let part =
-                    json!({"type": PartType::OutputText, "text": done.text, "annotations": []});
+                    json!({"type": PartType::OutputText, "text": streamed, "annotations": []});
                 item["content"] = json!([part]);
             }
             Item::Reasoning => {
-                item["summary"] = json!([{"type": PartType::SummaryText, "text": done.text}]);
+                item["summary"] = json!([{"type": PartType::SummaryText, "text": streamed}]);
             }
         }
-        let reasoning = done.kind == Item::Reasoning;
+        let reasoning = kind == Item::Reasoning;
         self.w.edit(at, |stored| *stored = item)?;
         if reasoning {
             // Reasoning is sent only with the item it precedes, so it is
@@ -702,7 +690,7 @@ impl ResponsesDecoder {
             (Some(Event::Added), Some(item)) => self.added(index()?, item).map(drop)?,
             (Some(Event::Done), Some(item)) => self.item_done(index()?, address(&frame), item)?,
             (Some(Event::Added | Event::Done) | None, _) => {}
-            (Some(event), _) => self.delta(&Delta::lenient(event, &frame))?,
+            (Some(event), _) => self.delta(Delta::lenient(event, &frame))?,
         }
         Ok(Flow::More)
     }
@@ -715,7 +703,7 @@ impl Writes for ResponsesDecoder {
 
     fn data(&mut self, data: &str) -> Result<Flow, Error> {
         match typed(data) {
-            Some(delta) => self.delta(&delta).map(|()| Flow::More),
+            Some(delta) => self.delta(delta).map(|()| Flow::More),
             None => self.lenient(data),
         }
     }

@@ -14,6 +14,7 @@
 //! - A reply the provider ended without a finish reason, or with a call it
 //!   never finished, is incomplete.
 
+use std::borrow::Cow;
 use std::collections::{BTreeMap, HashMap, HashSet};
 
 use serde_json::{Map, Value};
@@ -119,13 +120,10 @@ pub struct Writer {
     parts: Vec<u32>,
     next_part: u32,
     call_ids: HashSet<SmolStr>,
-    last_call: Option<usize>,
-    run: Option<usize>,
     next_auto: usize,
     by_index: Option<BTreeMap<u32, usize>>,
     lead: Option<u32>,
     first_incomplete: Option<u32>,
-    states_finish_reason: bool,
     /// Whether a call item holds its id in a slot replay can fill, so a call
     /// sent with no id keeps its item.
     call_id_slot: bool,
@@ -262,23 +260,13 @@ impl Writer {
             parts: Vec::new(),
             next_part: 0,
             call_ids: HashSet::new(),
-            last_call: None,
-            run: None,
             next_auto: AUTO_INDEX,
             by_index: None,
             lead: None,
             first_incomplete: None,
-            states_finish_reason: true,
             call_id_slot: false,
             ids: seed(),
         }
-    }
-
-    /// A wire whose end need not name a finish reason.
-    #[must_use]
-    pub fn without_finish_reason(mut self) -> Self {
-        self.states_finish_reason = false;
-        self
     }
 
     /// A wire whose call items hold their id in a slot replay can fill.
@@ -313,6 +301,38 @@ impl Writer {
 
     fn draft(&mut self, index: usize) -> Result<&mut Draft, Error> {
         self.open.get_mut(&index).ok_or_else(|| not_open(index))
+    }
+
+    /// Whether an item opened at `index`, closed since or not.
+    pub fn opened(&self, index: usize) -> bool {
+        self.open.contains_key(&index) || self.ended.contains_key(&index)
+    }
+
+    /// The text, reasoning or argument JSON the open item at `index` holds
+    /// so far; `None` for an item of none.
+    pub fn text(&self, index: usize) -> Option<&str> {
+        match &self.open.get(&index)?.body {
+            Body::Text(text) | Body::Reasoning { text, .. } => Some(text),
+            Body::Call { arguments, .. } => Some(&arguments.text),
+            Body::Opaque { .. } | Body::Media(_) => None,
+        }
+    }
+
+    /// What the open call at `index` holds so far: its id and tool name
+    /// once stated, and its argument JSON.
+    pub fn call(&self, index: usize) -> Option<CallFragment<'_>> {
+        match &self.open.get(&index)?.body {
+            Body::Call {
+                id,
+                name,
+                arguments,
+            } => Some(CallFragment {
+                id: id.as_deref(),
+                name: Some(name.as_str()).filter(|name| !name.is_empty()),
+                arguments: Some(&arguments.text),
+            }),
+            _ => None,
+        }
     }
 
     /// Open the provider item at wire `index`. `item` is the item as its
@@ -358,30 +378,38 @@ impl Writer {
     }
 
     /// Append text, reasoning, or a call's argument JSON to the item at
-    /// `index`.
-    pub fn push(&mut self, index: usize, fragment: &str) -> Result<(), Error> {
+    /// `index`. Owned text moves into the event that carries it.
+    pub fn push<'a>(
+        &mut self,
+        index: usize,
+        fragment: impl Into<Cow<'a, str>>,
+    ) -> Result<(), Error> {
+        self.push_text(index, fragment.into())
+    }
+
+    fn push_text(&mut self, index: usize, fragment: Cow<'_, str>) -> Result<(), Error> {
         if fragment.is_empty() {
             return Ok(());
         }
         let draft = self.draft(index)?;
         let block = match &mut draft.body {
             Body::Text(text) => {
-                text.push_str(fragment);
+                text.push_str(&fragment);
                 Block::Text
             }
             Body::Reasoning { text, .. } => {
-                text.push_str(fragment);
+                text.push_str(&fragment);
                 Block::Reasoning
             }
             Body::Call { arguments, .. } => {
-                arguments.push(fragment);
+                arguments.push(&fragment);
                 self.stream_call(index);
                 return Ok(());
             }
             Body::Opaque { .. } | Body::Media(_) => {
                 return Err(Error::decode(
                     format!("the reply wrote text to the whole item {index}"),
-                    fragment,
+                    &fragment,
                 ));
             }
         };
@@ -391,7 +419,7 @@ impl Writer {
         }
         self.out.push(Event::Delta {
             index: part,
-            text: fragment.to_owned(),
+            text: fragment.into_owned(),
         });
         Ok(())
     }
@@ -446,12 +474,12 @@ impl Writer {
     }
 
     /// Open and finish the item at `index` in one step.
-    pub fn whole(
+    pub fn whole<'a>(
         &mut self,
         index: usize,
         block: Open,
         item: Value,
-        text: &str,
+        text: impl Into<Cow<'a, str>>,
     ) -> Result<(), Error> {
         self.open(index, block, item)?;
         self.push(index, text)?;
@@ -467,26 +495,15 @@ impl Writer {
         Ok(())
     }
 
-    /// One fragment of a call the provider streams, opening the call at its
-    /// first fragment. Its id and name may arrive in any fragment, and the
-    /// first name it is given stays. Calls are told apart by `index` when
-    /// the wire gives one: a new id under an index starts a new call once
-    /// the held call's arguments are a complete object or the new fragment
-    /// names a tool (some providers send a fresh id, and no name, with every
-    /// chunk of one call). Without an index, a fragment with an unseen id
-    /// opens a call, and one with no id continues the latest call while its
-    /// arguments are incomplete.
-    pub fn fragment(
-        &mut self,
-        index: Option<usize>,
-        fragment: CallFragment<'_>,
-    ) -> Result<(), Error> {
+    /// One fragment of a call the provider streams under wire `index`,
+    /// opening the call at its first fragment. Its id and name may arrive in
+    /// any fragment, and the first name it is given stays. A new id under
+    /// the index starts a new call once the held call's arguments are a
+    /// complete object or the new fragment names a tool (some providers send
+    /// a fresh id, and no name, with every chunk of one call).
+    pub fn fragment(&mut self, index: usize, fragment: CallFragment<'_>) -> Result<(), Error> {
         let new_id = fragment.id.filter(|id| stated(id));
-        let index = match index {
-            Some(index) => self.indexed_call(index, new_id, fragment.name)?,
-            None => self.unindexed_call(new_id),
-        };
-        self.last_call = Some(index);
+        self.take_over(index, new_id, fragment.name)?;
         if !self.open.contains_key(&index) {
             let body = Body::Call {
                 id: None,
@@ -521,14 +538,13 @@ impl Writer {
         Ok(())
     }
 
-    /// The call a fragment under wire `index` writes to. When another call
-    /// takes over the index, the one it held ends there.
-    fn indexed_call(
+    /// When another call takes over wire `index`, the one it held ends.
+    fn take_over(
         &mut self,
         index: usize,
         new_id: Option<&str>,
         name: Option<&str>,
-    ) -> Result<usize, Error> {
+    ) -> Result<(), Error> {
         let names = name.is_some_and(|name| !name.is_empty());
         let held = self.open.get(&index).and_then(|draft| match &draft.body {
             Body::Call {
@@ -545,63 +561,7 @@ impl Writer {
             }
             self.close_item(moved, complete)?;
         }
-        Ok(index)
-    }
-
-    /// The call an index-less fragment writes to: the open call with its id,
-    /// else the latest call while its arguments are incomplete, else a new one.
-    fn unindexed_call(&mut self, new_id: Option<&str>) -> usize {
-        let owner = new_id.and_then(|new| {
-            self.open.iter().find_map(|(index, draft)| {
-                matches!(&draft.body, Body::Call { id: Some(id), .. } if id == new)
-                    .then_some(*index)
-            })
-        });
-        let continues = |last: &usize| {
-            self.open.get(last).is_some_and(|draft| {
-                matches!(&draft.body, Body::Call { arguments, .. } if !arguments.complete())
-            })
-        };
-        match (owner, new_id, self.last_call) {
-            (Some(index), _, _) => index,
-            (None, None, Some(last)) if continues(&last) => last,
-            _ => self.fresh_index(),
-        }
-    }
-
-    /// A fragment on a wire that marks no item boundaries: it continues the
-    /// part the last fragment went to while `block` is the same kind, and
-    /// otherwise closes that part and opens a new one. Returns its index.
-    pub fn run(&mut self, block: Open, fragment: &str) -> Result<usize, Error> {
-        let current = self.run.filter(|index| {
-            self.open.get(index).is_some_and(|draft| {
-                matches!(
-                    (&draft.body, &block),
-                    (Body::Text(_), Open::Text)
-                        | (
-                            Body::Reasoning {
-                                redacted: false,
-                                ..
-                            },
-                            Open::Reasoning { redacted: false }
-                        )
-                )
-            })
-        });
-        let index = if let Some(index) = current {
-            index
-        } else {
-            // Output of another kind interleaved the run: it ends.
-            if let Some(index) = self.run.take() {
-                self.close_item(index, true)?;
-            }
-            let index = self.fresh_index();
-            self.open(index, block, Value::Null)?;
-            self.run = Some(index);
-            index
-        };
-        self.push(index, fragment)?;
-        Ok(index)
+        Ok(())
     }
 
     /// Carry what the open call at `index` has not streamed yet: its start
@@ -715,9 +675,6 @@ impl Writer {
             body,
             restated,
         } = self.open.remove(&index).ok_or_else(|| not_open(index))?;
-        if self.run == Some(index) {
-            self.run = None;
-        }
         self.ended.insert(index, part);
         let item = match (complete, &body) {
             (true, _) | (false, Body::Opaque { .. } | Body::Media(_)) => item,
@@ -781,9 +738,9 @@ impl Writer {
     }
 
     /// The reply ends: what is still open closes, the parts' provider state
-    /// is attached, and the finish follows. A wire whose end must name a
-    /// reason fails a reply that names none, or that ends with a call left
-    /// open.
+    /// is attached, and the finish follows. A reply that names no reason
+    /// fails, as does one that ends with a call left open short of the
+    /// output limit.
     pub fn end(&mut self, end: End) -> Result<Flow, Error> {
         let mut open: Vec<(u32, usize)> = self
             .open
@@ -796,24 +753,19 @@ impl Writer {
             .values()
             .any(|draft| matches!(draft.body, Body::Call { .. }));
         for (_, index) in open {
-            self.close_item(index, self.run == Some(index))?;
+            self.close_item(index, false)?;
         }
-        if self.states_finish_reason {
-            match &end.reason {
-                None => {
-                    return Err(Error::new(
-                        Kind::Incomplete,
-                        "the provider ended the reply without a finish reason",
-                    ));
-                }
-                Some((reason, _)) if *reason != Reason::Length && unfinished_call => {
-                    return Err(Error::new(
-                        Kind::Incomplete,
-                        "the provider ended the reply with a tool call it never finished",
-                    ));
-                }
-                Some(_) => {}
-            }
+        let Some((reason, raw)) = end.reason else {
+            return Err(Error::new(
+                Kind::Incomplete,
+                "the provider ended the reply without a finish reason",
+            ));
+        };
+        if reason != Reason::Length && unfinished_call {
+            return Err(Error::new(
+                Kind::Incomplete,
+                "the provider ended the reply with a tool call it never finished",
+            ));
         }
         if end.response_id.is_some() || end.model.is_some() {
             self.out.push(Event::Metadata {
@@ -839,10 +791,9 @@ impl Writer {
                 meta: Meta::from([(self.key.to_owned(), state.into())]),
             });
         }
-        let (reason, raw) = match end.reason {
-            Some((Reason::Stop, raw)) if !self.call_ids.is_empty() => (Reason::ToolCalls, raw),
-            Some((reason, raw)) => (reason, raw),
-            None => (Reason::Stop, None),
+        let reason = match reason {
+            Reason::Stop if !self.call_ids.is_empty() => Reason::ToolCalls,
+            reason => reason,
         };
         let meta = end
             .raw_usage

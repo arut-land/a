@@ -10,7 +10,7 @@
 //! which replays them.
 
 use std::borrow::Cow;
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::BTreeMap;
 
 use serde::Deserialize;
 use serde_json::{Map, Value, json};
@@ -179,8 +179,6 @@ pub(crate) struct MessagesDecoder {
     /// Each open block's type (a fallback's as `Other`) and the input JSON
     /// streamed to it.
     open: BTreeMap<usize, (BlockType, String)>,
-    /// Every index a block opened at, closed or not.
-    started: BTreeSet<usize>,
     /// Whether a block other than a leading `fallback` opened.
     opened: bool,
     unsigned_thinking: bool,
@@ -221,7 +219,6 @@ impl MessagesDecoder {
         Self {
             w: Writer::new(KEY).with_call_id_slot(),
             open: BTreeMap::new(),
-            started: BTreeSet::new(),
             opened: false,
             unsigned_thinking,
             raw_usage: None,
@@ -233,7 +230,6 @@ impl MessagesDecoder {
 
     /// Open the content block at `index` as the provider states it.
     fn start(&mut self, index: usize, kind: BlockType, block: &Fields) -> Result<(), Error> {
-        self.started.insert(index);
         let fallback = kind == BlockType::Fallback;
         // A leading `fallback` names the model that took over; one after
         // output began is a fallback no part can represent (pi's rule).
@@ -256,7 +252,7 @@ impl MessagesDecoder {
         };
         let text = text.unwrap_or_default().to_owned();
         self.w.open(index, open, block)?;
-        self.w.push(index, &text)
+        self.w.push(index, text)
     }
 
     /// Open a `tool_use` block. A whole reply states the input on the
@@ -274,34 +270,51 @@ impl MessagesDecoder {
                 id,
                 ..CallFragment::default()
             };
-            self.w.fragment(Some(index), fragment)?;
+            self.w.fragment(index, fragment)?;
         }
         self.w.announce(index, input)
     }
 
     /// Apply a delta to the block at `index`: text and thinking grow the
     /// part, input JSON is assembled, and every delta but input JSON then
-    /// lands on the item through `merge`. `fragment` is the string field
-    /// [`DeltaType::field`] names.
+    /// lands on the item, as the whole `delta` object where one was read
+    /// (through [`merge`]), else as its one string field. `fragment` is the
+    /// string field [`DeltaType::field`] names.
     fn delta(
         &mut self,
         index: usize,
         kind: DeltaType,
-        fragment: Option<&str>,
+        fragment: Option<Cow<'_, str>>,
+        delta: Option<&Fields>,
         data: &str,
-        merge: impl FnOnce(&mut Value),
     ) -> Result<(), Error> {
         let (wire, key) = kind.field().unwrap_or_default();
+        let land = |item: &mut Value, fragment: &str| match (delta, item) {
+            (None, item) => append(item, key, fragment),
+            (Some(delta), Value::Object(item)) if kind == DeltaType::CitationsDelta => {
+                let citation = delta.get("citation").cloned().unwrap_or_default();
+                match item.get_mut("citations") {
+                    Some(Value::Array(citations)) => citations.push(citation),
+                    _ => {
+                        item.insert("citations".into(), json!([citation]));
+                    }
+                }
+            }
+            (Some(_), _) if kind == DeltaType::CitationsDelta => {}
+            // Text and signatures concatenate; deltas never seen before
+            // land in the item too.
+            (Some(delta), item) => merge(item, delta),
+        };
         // The fragment a block is built from must be text.
-        let fragment = || {
-            let missing = || format!("an Anthropic `{wire}` carries no string `{key}`");
-            fragment.ok_or_else(|| Error::decode(missing(), data))
+        let missing = || {
+            let missing = format!("an Anthropic `{wire}` carries no string `{key}`");
+            Error::decode(missing, data)
         };
         let opens = match kind {
             DeltaType::TextDelta => BlockType::Text,
             DeltaType::ThinkingDelta => BlockType::Thinking,
             DeltaType::InputJsonDelta => {
-                let fragment = fragment()?;
+                let fragment = fragment.ok_or_else(missing)?;
                 let Some((kind @ (BlockType::ToolUse | BlockType::Other), json)) =
                     self.open.get_mut(&index)
                 else {
@@ -310,22 +323,26 @@ impl MessagesDecoder {
                     );
                     return Err(Error::decode(takes_none, data));
                 };
-                json.push_str(fragment);
+                json.push_str(&fragment);
                 if *kind == BlockType::ToolUse {
                     self.w.push(index, fragment)?;
                 }
                 return Ok(());
             }
-            _ => return self.w.edit(index, merge),
+            _ => {
+                let fragment = fragment.as_deref().unwrap_or_default();
+                return self.w.edit(index, |item| land(item, fragment));
+            }
         };
         // A gateway that skips `content_block_start` still streams the
         // block's text, so its first delta opens it.
-        if !self.started.contains(&index) {
+        if !self.w.opened(index) {
             let block = Map::from_iter([("type".into(), key.into()), (key.into(), "".into())]);
             self.start(index, opens, &block)?;
         }
-        self.w.push(index, fragment()?)?;
-        self.w.edit(index, merge)
+        let fragment = fragment.ok_or_else(missing)?;
+        self.w.edit(index, |item| land(item, &fragment))?;
+        self.w.push(index, fragment)
     }
 
     /// End the block at `index` as stated complete. Its item becomes the
@@ -495,21 +512,13 @@ impl MessagesDecoder {
             Some(EventType::ContentBlockDelta) => {
                 let (kind, delta) = typed::<DeltaType>(frame.get("delta"), data, missing("delta"))?;
                 let fragment = kind.field().and_then(|(_, key)| delta.get(key)?.as_str());
-                self.delta(index()?, kind, fragment, data, |item| match item {
-                    Value::Object(item) if kind == DeltaType::CitationsDelta => {
-                        let citation = delta.get("citation").cloned().unwrap_or_default();
-                        match item.get_mut("citations") {
-                            Some(Value::Array(citations)) => citations.push(citation),
-                            _ => {
-                                item.insert("citations".into(), json!([citation]));
-                            }
-                        }
-                    }
-                    _ if kind == DeltaType::CitationsDelta => {}
-                    // Text and signatures concatenate; deltas never seen
-                    // before land in the item too.
-                    item => merge(item, delta),
-                })?;
+                self.delta(
+                    index()?,
+                    kind,
+                    fragment.map(Cow::Borrowed),
+                    Some(delta),
+                    data,
+                )?;
             }
             Some(EventType::ContentBlockStop) => self.stop(index()?)?,
             Some(EventType::MessageDelta) => {
@@ -554,9 +563,7 @@ impl Writes for MessagesDecoder {
         let Some((index, kind, fragment)) = Fast::read(data) else {
             return self.value(data);
         };
-        let (_, key) = kind.field().unwrap_or_default();
-        let merge = |item: &mut Value| append(item, key, &fragment);
-        self.delta(index, kind, Some(&*fragment), data, merge)?;
+        self.delta(index, kind, Some(fragment), None, data)?;
         Ok(Flow::More)
     }
 }

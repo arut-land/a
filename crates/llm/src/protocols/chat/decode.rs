@@ -195,7 +195,6 @@ struct OpenCall {
     at: usize,
     id: Option<String>,
     opaque: bool,
-    arguments: String,
 }
 
 pub(super) struct ChatDecoder {
@@ -203,13 +202,11 @@ pub(super) struct ChatDecoder {
     quirks: Quirks,
     /// The run being written and its index.
     writing: Option<(Writing, usize)>,
-    thinking_text: String,
     /// The message's reasoning part while it is open, and its item as it
     /// will hold it: the field its text arrived in, its text, and every
     /// `reasoning_details` entry in order.
     reasoning: Option<usize>,
     reasoning_field: Option<ReasoningField>,
-    reasoning_text: String,
     reasoning_details: Map<String, Value>,
     audio_id: Option<Value>,
     /// The calls still open, in the order they opened.
@@ -230,10 +227,8 @@ impl ChatDecoder {
             w: Writer::new(KEY).with_call_id_slot(),
             quirks,
             writing: None,
-            thinking_text: String::new(),
             reasoning: None,
             reasoning_field: None,
-            reasoning_text: String::new(),
             reasoning_details: Map::new(),
             audio_id: None,
             calls: Vec::new(),
@@ -306,11 +301,11 @@ impl ChatDecoder {
     /// call of a whole message (`whole`) at its position in the list.
     fn delta(&mut self, delta: Delta<'_>, whole: bool) -> Result<(), Error> {
         let texts = [
-            &delta.reasoning_content,
-            &delta.reasoning,
-            &delta.reasoning_text,
+            delta.reasoning_content,
+            delta.reasoning,
+            delta.reasoning_text,
         ];
-        if let Some((field, text)) = ReasoningField::first(texts.map(Json::str)) {
+        if let Some((field, text)) = ReasoningField::first(texts.map(Json::into_text)) {
             self.reason(text)?;
             self.reasoning_field.get_or_insert(field);
         }
@@ -323,20 +318,20 @@ impl ChatDecoder {
         if let Some(id) = delta.audio.at("/id") {
             self.audio_id = Some(id.clone());
         }
-        match &delta.content {
+        match delta.content {
             Json::List(parts) => {
-                for part in parts {
+                for part in &parts {
                     self.part(part)?;
                 }
             }
-            Json::Object(part) => self.part(part)?,
+            Json::Object(part) => self.part(&part)?,
             content => {
-                let texts = [
-                    content.str(),
-                    delta.refusal.str(),
-                    delta.audio.str("transcript"),
-                ];
-                if let Some(text) = texts.into_iter().flatten().find(|text| !text.is_empty()) {
+                let transcript = delta
+                    .audio
+                    .str("transcript")
+                    .filter(|text| !text.is_empty());
+                let text = content.into_text().or_else(|| delta.refusal.into_text());
+                if let Some(text) = text.or(transcript.map(Cow::Borrowed)) {
                     self.write(Writing::Text, text)?;
                 }
             }
@@ -352,7 +347,7 @@ impl ChatDecoder {
     }
 
     /// Append `text` to the message's reasoning part, opening it first.
-    fn reason(&mut self, text: &str) -> Result<(), Error> {
+    fn reason<'a>(&mut self, text: impl Into<Cow<'a, str>>) -> Result<(), Error> {
         let at = if let Some(at) = self.reasoning {
             at
         } else {
@@ -363,7 +358,6 @@ impl ChatDecoder {
             self.reasoning = Some(at);
             at
         };
-        self.reasoning_text.push_str(text);
         self.w.push(at, text)
     }
 
@@ -373,9 +367,9 @@ impl ChatDecoder {
         let Some(at) = self.reasoning.take() else {
             return Ok(());
         };
-        let text = std::mem::take(&mut self.reasoning_text);
         let mut item = Map::new();
         if let Some(field) = self.reasoning_field.take() {
+            let text = self.w.text(at).unwrap_or_default();
             item.insert(field.as_str().to_owned(), text.into());
         }
         item.append(&mut self.reasoning_details);
@@ -385,7 +379,7 @@ impl ChatDecoder {
 
     /// Append `text` to a run of kind `writing`, first closing the run being
     /// written when it is of another kind.
-    fn write(&mut self, writing: Writing, text: &str) -> Result<(), Error> {
+    fn write<'a>(&mut self, writing: Writing, text: impl Into<Cow<'a, str>>) -> Result<(), Error> {
         let index = match self.writing {
             Some((current, index)) if current == writing => index,
             _ => {
@@ -400,9 +394,6 @@ impl ChatDecoder {
                 index
             }
         };
-        if writing == Writing::Thinking {
-            self.thinking_text.push_str(text);
-        }
         self.w.push(index, text)
     }
 
@@ -418,7 +409,7 @@ impl ChatDecoder {
                 .take()
                 .map(|id| json!({ "audio": { "id": id } })),
             Writing::Thinking => {
-                let text = std::mem::take(&mut self.thinking_text);
+                let text = self.w.text(index).unwrap_or_default();
                 Some(PartKind::Thinking.part([PartKind::Text.part(text)]))
             }
         };
@@ -445,7 +436,7 @@ impl ChatDecoder {
                         .iter()
                         .filter_map(|chunk| chunk.str("text"))
                         .collect();
-                    self.write(Writing::Thinking, &text)
+                    self.write(Writing::Thinking, text)
                 }
                 _ => self.write(Writing::Thinking, text("thinking")),
             },
@@ -524,10 +515,10 @@ impl ChatDecoder {
                     .calls
                     .iter()
                     .find(|open| open.id.as_deref() == Some(id)),
-                None => self
-                    .calls
-                    .last()
-                    .filter(|open| open.opaque || !whole_object(&open.arguments) || !starts),
+                None => self.calls.last().filter(|open| {
+                    let arguments = self.w.text(open.at).unwrap_or_default();
+                    open.opaque || !whole_object(arguments) || !starts
+                }),
             }
             .map_or_else(|| self.w.fresh_index(), |open| open.at),
         };
@@ -535,7 +526,6 @@ impl ChatDecoder {
             if let Some(id) = &id {
                 open.id = Some(id.as_ref().to_owned());
             }
-            open.arguments.push_str(arguments.unwrap_or_default());
             open.opaque
         } else {
             let kind = call.map(|call| CallKind::of(call.kind.str()));
@@ -548,20 +538,17 @@ impl ChatDecoder {
                 at,
                 id: id.as_deref().map(str::to_owned),
                 opaque,
-                arguments: arguments.unwrap_or_default().to_owned(),
             });
             opaque
         };
         if !opaque {
             let id = id.as_deref();
-            self.w.fragment(
-                Some(at),
-                CallFragment {
-                    id,
-                    name,
-                    arguments,
-                },
-            )?;
+            let fragment = CallFragment {
+                id,
+                name,
+                arguments,
+            };
+            self.w.fragment(at, fragment)?;
         }
         self.w.edit(at, |item| {
             if !item.is_object() {
@@ -679,7 +666,7 @@ impl Writes for ChatDecoder {
             Json::Str(text) if self.quirks.bare_string_reply => {
                 self.ended = true;
                 self.finish = Some((Reason::Stop, SmolStr::new_static("stop")));
-                self.write(Writing::Text, &text)?;
+                self.write(Writing::Text, text)?;
                 return self.end();
             }
             _ => return Ok(Flow::More),
