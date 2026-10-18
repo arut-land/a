@@ -1,14 +1,16 @@
 //! One timer thread for every sleep: a deadline heap and the wakers due.
 
-use std::cmp::Reverse;
+use std::cmp::{Ordering, Reverse};
 use std::collections::BinaryHeap;
 use std::future::Future;
 use std::pin::Pin;
-use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, Condvar, Mutex, OnceLock, PoisonError};
+use std::sync::atomic::{self, AtomicBool};
+use std::sync::{Arc, Condvar, Mutex, OnceLock};
 use std::task::{Context, Poll, Waker};
 use std::thread;
 use std::time::{Duration, Instant};
+
+use crate::{lock, wait, wait_timeout};
 
 struct Entry {
     at: Instant,
@@ -17,30 +19,43 @@ struct Entry {
     waker: Waker,
 }
 
+impl Entry {
+    const fn key(&self) -> (Instant, u64) {
+        (self.at, self.seq)
+    }
+}
+
 impl PartialEq for Entry {
     fn eq(&self, other: &Self) -> bool {
-        (self.at, self.seq) == (other.at, other.seq)
+        self.key() == other.key()
     }
 }
 
 impl Eq for Entry {}
 
 impl PartialOrd for Entry {
-    fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
+    fn partial_cmp(&self, other: &Self) -> Option<Ordering> {
         Some(self.cmp(other))
     }
 }
 
 impl Ord for Entry {
-    fn cmp(&self, other: &Self) -> std::cmp::Ordering {
-        (self.at, self.seq).cmp(&(other.at, other.seq))
+    fn cmp(&self, other: &Self) -> Ordering {
+        self.key().cmp(&other.key())
     }
 }
 
 #[derive(Default)]
 struct Wheel {
-    heap: Mutex<(BinaryHeap<Reverse<Entry>>, u64)>,
+    state: Mutex<Deadlines>,
     changed: Condvar,
+}
+
+/// Pending wakeups, earliest first; `seq` breaks ties in insertion order.
+#[derive(Default)]
+struct Deadlines {
+    heap: BinaryHeap<Reverse<Entry>>,
+    seq: u64,
 }
 
 fn wheel() -> &'static Wheel {
@@ -57,35 +72,29 @@ fn wheel() -> &'static Wheel {
 
 impl Wheel {
     fn run(&self) {
-        let mut guard = self.heap.lock().unwrap_or_else(PoisonError::into_inner);
+        let mut state = lock(&self.state);
         loop {
             let now = Instant::now();
-            while guard.0.peek().is_some_and(|Reverse(e)| e.at <= now) {
-                let Reverse(entry) = guard.0.pop().expect("peeked");
-                entry.fired.store(true, Ordering::Release);
+            while state.heap.peek().is_some_and(|Reverse(e)| e.at <= now) {
+                let Reverse(entry) = state.heap.pop().expect("peeked");
+                entry.fired.store(true, atomic::Ordering::Release);
                 entry.waker.wake();
             }
-            guard = match guard.0.peek() {
+            state = match state.heap.peek() {
                 Some(Reverse(next)) => {
                     let wait = next.at.saturating_duration_since(now);
-                    self.changed
-                        .wait_timeout(guard, wait)
-                        .unwrap_or_else(PoisonError::into_inner)
-                        .0
+                    wait_timeout(&self.changed, state, wait).0
                 }
-                None => self
-                    .changed
-                    .wait(guard)
-                    .unwrap_or_else(PoisonError::into_inner),
+                None => wait(&self.changed, state),
             };
         }
     }
 
     fn insert(&self, at: Instant, fired: Arc<AtomicBool>, waker: Waker) {
-        let mut guard = self.heap.lock().unwrap_or_else(PoisonError::into_inner);
-        guard.1 += 1;
-        let seq = guard.1;
-        guard.0.push(Reverse(Entry {
+        let mut state = lock(&self.state);
+        state.seq += 1;
+        let seq = state.seq;
+        state.heap.push(Reverse(Entry {
             at,
             seq,
             fired,
@@ -115,7 +124,7 @@ impl Future for Sleep {
             || self
                 .fired
                 .as_ref()
-                .is_some_and(|f| f.load(Ordering::Acquire))
+                .is_some_and(|f| f.load(atomic::Ordering::Acquire))
         {
             return Poll::Ready(());
         }

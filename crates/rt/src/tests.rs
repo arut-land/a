@@ -59,7 +59,7 @@ fn a_bounded_channel_streams_and_ends() {
     }));
     let got = block_on(async {
         let mut got = Vec::new();
-        while let Some(n) = std::future::poll_fn(|cx| rx.poll_recv(cx)).await {
+        while let Some(n) = rx.recv().await {
             got.push(n);
         }
         got
@@ -75,4 +75,27 @@ fn a_dropped_receiver_releases_a_waiting_sender() {
     std::thread::sleep(Duration::from_millis(20));
     drop(rx);
     assert_eq!(waiting.join().unwrap(), Err(2));
+}
+
+#[test]
+fn sleeps_wake_in_deadline_order() {
+    let rt = Threads::new(1);
+    let order = Arc::new(Mutex::new(Vec::new()));
+    let jobs: Vec<_> = [30, 10, 20, 10]
+        .into_iter()
+        .enumerate()
+        .map(|(n, ms)| {
+            let (order, sleep) = (Arc::clone(&order), rt.sleep(Duration::from_millis(ms)));
+            spawn(&rt, async move {
+                sleep.await;
+                order.lock().unwrap().push(n);
+            })
+        })
+        .collect();
+    block_on(async {
+        for job in jobs {
+            job.await;
+        }
+    });
+    assert_eq!(*order.lock().unwrap(), [1, 3, 2, 0]);
 }
