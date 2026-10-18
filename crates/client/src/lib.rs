@@ -246,20 +246,20 @@ pub fn restart(home: &Home, staged: &Staged) -> io::Result<Connection> {
 }
 
 /// Serves `ssh <host> a bridge`: connects to this machine's daemon, prints
-/// the `A-BRIDGE <token> <environment>` sync line so the far side can skip
-/// whatever the login shell printed, then pipes stdin and stdout to the
-/// socket verbatim. The environment, as JSON, is this side's: the far
-/// client attaches with it, so commands run with this host's `PATH` in this
+/// the `A-BRIDGE <token> env` sync line so the far side can skip whatever
+/// the login shell printed, then this side's environment as a frame, then
+/// pipes stdin and stdout to the socket verbatim. The far client attaches
+/// with that environment, so commands run with this host's `PATH` in this
 /// host's directories. The far client does its own hello. Ends when either
 /// side closes: the daemon may keep a connection open after its client is
 /// done.
 #[cfg(unix)]
 pub fn bridge(home: &Home, token: &str) -> io::Result<()> {
     let stream = connect_or_spawn(home)?;
-    let env = capture()?.to_json();
+    let env = ClientMsg::Environment(capture()?);
     let mut stdout = io::stdout().lock();
-    writeln!(stdout, "{} {token} {env}", remote::SYNC)?;
-    stdout.flush()?;
+    writeln!(stdout, "{} {token} env", remote::SYNC)?;
+    write_frame(&mut stdout, &env)?;
     let mut up = stream.try_clone()?;
     thread::spawn(move || {
         let _ = pump(io::stdin().lock(), &mut up);

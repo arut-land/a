@@ -8,7 +8,7 @@ use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output, Stdio};
 
-use protocol::{Body, ClientMsg, DaemonMsg, Environment, PROTO, Target, read_frame, write_frame};
+use protocol::{Body, ClientMsg, DaemonMsg, PROTO, Target, read_frame, write_frame};
 
 const A: &str = env!("CARGO_BIN_EXE_a");
 
@@ -77,8 +77,10 @@ fn bridge_speaks_the_protocol_over_stdio() {
     let mut stdout = BufReader::new(child.stdout.take().unwrap());
     let mut sync = String::new();
     stdout.read_line(&mut sync).unwrap();
-    let shell = sync.strip_prefix("A-BRIDGE tok ").expect(&sync);
-    let shell: Environment = serde_json::from_str(shell).unwrap();
+    assert_eq!(sync, "A-BRIDGE tok env\n");
+    let Some(ClientMsg::Environment(shell)) = read_frame(&mut stdout).unwrap() else {
+        panic!("no environment after the sync line");
+    };
     assert_eq!(shell.cwd, std::env::current_dir().unwrap());
 
     let mut send = |msg: &ClientMsg| write_frame(&mut stdin, msg).unwrap();

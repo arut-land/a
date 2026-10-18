@@ -7,13 +7,16 @@ use std::process::{Child, Command, Stdio};
 use std::thread;
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use protocol::{Decode, Environment};
+use protocol::{ClientMsg, read_frame};
 use sys::Staged;
 
 use crate::{Connection, Reader, Writer};
 
 /// What the bridge prints, with its token, once it is connected.
 pub const SYNC: &str = "A-BRIDGE";
+
+/// Ends a sync line followed by the host's environment, as a frame.
+pub const WITH_ENV: &[u8] = b" env";
 
 /// The exit status a POSIX shell gives a command it cannot find.
 const NOT_FOUND: i32 = 127;
@@ -58,7 +61,10 @@ fn bridge(host: &str, script: &str, token: &str) -> io::Result<Option<Connection
             };
         }
         match line.trim_ascii_end().strip_prefix(sync.as_bytes()) {
-            Some([b' ', env @ ..]) => break Environment::from_json(env)?,
+            Some(WITH_ENV) => match read_frame(&mut out)? {
+                Some(ClientMsg::Environment(env)) => break env,
+                _ => return Err(io::Error::other(format!("ssh {host}: no environment"))),
+            },
             // Without the host's environment, commands would run with this
             // machine's paths there.
             Some([]) => {

@@ -1,6 +1,6 @@
 //! Wire types shared by the daemon and every client, plus framing.
 
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::BTreeMap;
 use std::ffi::OsString;
 use std::fmt;
 use std::io::{self, Read, Write};
@@ -121,8 +121,8 @@ pub struct Environment {
     pub cwd: PathBuf,
     pub vars: BTreeMap<String, String>,
     /// Secrets whose values were left out of `vars`.
-    #[serde(default, skip_serializing_if = "BTreeSet::is_empty")]
-    pub redacted: BTreeSet<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub redacted: Vec<String>,
     /// Whether the client ran at a terminal.
     #[serde(default)]
     pub tty: bool,
@@ -156,15 +156,19 @@ impl Environment {
         vars: impl IntoIterator<Item = (OsString, OsString)>,
         tty: bool,
     ) -> Self {
-        let vars = vars
-            .into_iter()
-            .filter_map(|(k, v)| Some((k.into_string().ok()?, v.into_string().ok()?)))
-            .filter(|(k, _)| !DENIED.contains(&k.as_str()))
-            .collect();
+        // Inserted one by one: collecting would sort, in code of its own.
+        let mut map = BTreeMap::new();
+        for (k, v) in vars {
+            if let (Ok(k), Ok(v)) = (k.into_string(), v.into_string())
+                && !DENIED.contains(&k.as_str())
+            {
+                map.insert(k, v);
+            }
+        }
         Self {
             cwd,
-            vars,
-            redacted: BTreeSet::new(),
+            vars: map,
+            redacted: Vec::new(),
             tty,
         }
     }
@@ -185,7 +189,7 @@ impl Environment {
         let mut vars = BTreeMap::new();
         for (k, v) in &self.vars {
             if Self::is_secret(k) {
-                redacted.insert(k.clone());
+                redacted.push(k.clone());
             } else {
                 vars.insert(k.clone(), v.clone());
             }
@@ -196,11 +200,6 @@ impl Environment {
             redacted,
             tty: self.tty,
         }
-    }
-
-    /// One line of JSON, as a bridge prints it.
-    pub fn to_json(&self) -> String {
-        serde_json::to_string(self).unwrap_or_default()
     }
 }
 
@@ -365,7 +364,7 @@ macro_rules! decode {
         }
     )*};
 }
-decode!(Entry, ClientMsg, DaemonMsg, Environment);
+decode!(Entry, ClientMsg, DaemonMsg);
 
 /// Reads one frame; `Ok(None)` means the peer closed the stream cleanly.
 pub fn read_frame<T: Decode>(r: &mut impl Read) -> io::Result<Option<T>> {
