@@ -1,0 +1,97 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  check:
+    name: check (${{ matrix.os }})
+    strategy:
+      fail-fast: false
+      matrix:
+        # Apple silicon and x86_64 Linux.
+        os: [macos-latest, ubuntu-latest]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v7
+      # mbx (the cargo wrapper in mise.toml) keeps compiled crates in its own
+      # store; caching that store and the toolchain is what makes reruns fast.
+      - &mbx-dir
+        shell: bash
+        run: echo "MBX_CACHE_DIR=$RUNNER_TEMP/mbx" >> "$GITHUB_ENV"
+      - &cache
+        uses: actions/cache@v6
+        with:
+          path: |
+            ~/.rustup/toolchains
+            ~/.cargo/registry/index
+            ~/.cargo/registry/cache
+            ${{ runner.temp }}/mbx/actions
+          key: cargo-${{ runner.os }}-${{ github.job }}-${{ hashFiles('rust-toolchain.toml', 'Cargo.lock', '.cargo/*.toml') }}
+          restore-keys: cargo-${{ runner.os }}-${{ github.job }}-
+      - &mise
+        uses: jdx/mise-action@v5
+      # The no-polling acceptance test traces the client's syscalls.
+      - if: runner.os == 'Linux'
+        run: sudo apt-get install -y --no-install-recommends strace
+      # fmt, clippy -D warnings, then every test: unit, llm parity, and the
+      # black-box M1 acceptance and budget tests in apps/cli/tests (budgets
+      # with CI slack). Live-model tests stay #[ignore]d; there are no secrets.
+      - run: mise run check
+
+  budgets:
+    name: budgets (${{ matrix.os }})
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [macos-latest, ubuntu-latest]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v7
+      - *mbx-dir
+      - *cache
+      - *mise
+      # Release size (4 MiB) and idle daemon RSS (10 MiB) are held exactly;
+      # cold-start latency gets slack on shared runners.
+      - run: mise run budgets
+
+  deny:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: jdx/mise-action@v5
+      - run: mise run deny
+
+  windows:
+    runs-on: windows-latest
+    defaults:
+      run:
+        shell: bash
+    # `client` and the `a` CLI talk to the daemon over Unix sockets and do not
+    # build here yet. `engine` builds, but serves only on Unix (dead code
+    # warnings), so it is built rather than linted.
+    env:
+      PORTABLE: -p sys -p rt -p protocol -p store -p agent -p llm
+    steps:
+      - uses: actions/checkout@v7
+      - *mbx-dir
+      - *cache
+      - *mise
+      - run: mise exec -- cargo clippy $PORTABLE --all-targets -- -D warnings
+      - run: mise exec -- cargo build -p engine
+      - name: test (advisory until first green on Windows)
+        continue-on-error: true
+        run: mise exec -- cargo nextest run $PORTABLE --no-tests=pass
