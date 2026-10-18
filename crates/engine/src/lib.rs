@@ -17,7 +17,7 @@ use protocol::{
     ClientMsg, DaemonMsg, PROTO, SessionId, SessionSummary, Target, read_frame, write_frame,
 };
 use session::{Attachment, Session, Shared};
-use store::{Header, Store};
+use store::{Header, Jsonl, LogStore};
 use sys::Home;
 use upgrade::{Lifecycle, Verdict};
 
@@ -92,7 +92,7 @@ impl Daemon {
     /// Reads only session headers. Sessions with a busy marker were working
     /// when the last daemon stopped, so they load at once to recover.
     fn load(home: &Home, config: &Config) -> io::Result<Self> {
-        let store = Store::open(home.sessions_dir())?;
+        let store = Arc::new(Jsonl::open(home.sessions_dir())?);
         let slots = store
             .headers()?
             .into_iter()

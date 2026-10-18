@@ -3,7 +3,7 @@ use std::time::{Duration, Instant};
 
 use protocol::{Body, Entry, Outcome, SessionId, Target};
 use serde_json::json;
-use store::{Header, Store};
+use store::{Header, Jsonl, LogStore};
 use sys::Home;
 
 use super::{Config, Daemon};
@@ -29,7 +29,7 @@ fn settle(daemon: &Daemon) {
     }
 }
 
-fn bodies(store: &Store, id: SessionId) -> Vec<Body> {
+fn bodies(store: &dyn LogStore, id: SessionId) -> Vec<Body> {
     let loaded = store.load(id).unwrap();
     loaded.entries.into_iter().map(|e| e.body).collect()
 }
@@ -77,7 +77,7 @@ fn idle_sessions_hibernate_and_reload_on_attach() {
 #[test]
 fn busy_sessions_recover_at_startup() {
     let (root, home) = home("recover");
-    let store = Store::open(home.sessions_dir()).unwrap();
+    let store = Jsonl::open(home.sessions_dir()).unwrap();
     let id = SessionId::new();
     let mut log = store
         .create(&Header {

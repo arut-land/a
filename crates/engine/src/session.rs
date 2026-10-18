@@ -11,7 +11,7 @@ use std::time::{Duration, Instant};
 use agent::{Action, Agent, Cx, Decided, DynTool, Hooks, Input, Replay, Toolset};
 use protocol::{Body, DaemonMsg, Entry, Outcome, SessionId, SessionSummary};
 use serde_json::Value;
-use store::{Header, Loaded, Log, Store};
+use store::{Header, Loaded, Log, LogStore};
 
 use crate::lock;
 use crate::model::Model;
@@ -24,7 +24,7 @@ use facts::{replay, transcript};
 
 /// What every session runs with.
 pub struct Shared {
-    pub store: Store,
+    pub store: Arc<dyn LogStore>,
     pub agent: agent::Kind,
     pub tools: Toolset,
     pub hooks: Hooks,
@@ -53,7 +53,7 @@ enum Msg {
 
 struct State {
     entries: Vec<Entry>,
-    log: Log,
+    log: Box<dyn Log>,
     clients: Vec<Sender<DaemonMsg>>,
 }
 
