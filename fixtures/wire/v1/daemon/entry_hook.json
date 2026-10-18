@@ -1,0 +1,1 @@
+{"t":"entry","seq":12,"epoch":0,"kind":"hook","hook":"policy","decision":{"permission":{"tool":"bash","permission":"ask"}}}
