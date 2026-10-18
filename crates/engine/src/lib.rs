@@ -346,8 +346,9 @@ fn claim(home: &Home) -> io::Result<File> {
         ));
     }
     file.set_len(0)?;
+    // Not synced: clients read it while we hold the lock, and after a crash
+    // there is no lock to vouch for it.
     write!(file, "{}", std::process::id())?;
-    file.sync_data()?;
     Ok(file)
 }
 

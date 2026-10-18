@@ -295,6 +295,20 @@ fn jsonl_headers_from_before_extension_records_load() {
 }
 
 #[test]
+fn jsonl_skips_a_file_whose_header_a_crash_cut_off() {
+    let store = jsonl();
+    let h = header("/w");
+    store.create(&h).unwrap();
+    let dir = store.dir.as_ref().unwrap();
+    fs::write(
+        dir.join(format!("{}.jsonl", SessionId::new())),
+        br#"{"id":"#,
+    )
+    .unwrap();
+    assert_eq!(store.headers().unwrap(), [h]);
+}
+
+#[test]
 fn jsonl_files_are_a_header_line_then_one_line_per_entry() {
     let (store, path, h, written) = torn(b"");
     store.mark_busy(h.id, true).unwrap();
