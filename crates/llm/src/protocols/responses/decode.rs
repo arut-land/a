@@ -1,60 +1,111 @@
 //! Responses frames into parts: one part per output item, in the order the
 //! items arrive, each holding the item as the provider stated it complete.
 //! Every field is read leniently, so a gateway that omits or retypes a field
-//! no part or finish needs never fails a reply.
+//! no part or finish needs never fails a reply. Delta events, nearly every
+//! frame, are read into fields borrowed from the frame; any other frame, or
+//! one those fields do not fit, is read as a `Value`.
 
-use std::collections::{HashMap, HashSet};
+use std::borrow::Cow;
+use std::collections::HashSet;
 
+use serde::Deserialize;
+use serde::de::{self, Deserializer};
 use serde_json::{Value, json};
 
-use super::KEY;
+use super::{ItemType, KEY, PartType, Status, word};
 use crate::error::{Error, Kind};
 use crate::json::Lenient;
 use crate::protocol::Flow;
 use crate::spec::{Reason, SmolStr, Usage};
 use crate::writer::{CallFragment, End, Open, Writer, Writes};
 
-const fn is_lifecycle(kind: &str) -> bool {
-    matches!(
-        kind.as_bytes(),
-        b"response.created"
-            | b"response.queued"
-            | b"response.in_progress"
-            | b"response.completed"
-            | b"response.failed"
-            | b"response.incomplete"
-    )
-}
-
 /// The events the decoder reads; any other type is skipped.
-fn is_known(kind: &str) -> bool {
-    is_lifecycle(kind)
-        || matches!(
-            kind,
-            "error"
-                | "response.output_item.added"
-                | "response.output_item.done"
-                | "response.content_part.added"
-                | "response.content_part.done"
-                | "response.output_text.delta"
-                | "response.output_text.done"
-                | "response.refusal.delta"
-                | "response.refusal.done"
-                | "response.function_call_arguments.delta"
-                | "response.function_call_arguments.done"
-                | "response.custom_tool_call_input.delta"
-                | "response.custom_tool_call_input.done"
-                | "response.reasoning_summary_part.added"
-                | "response.reasoning_summary_part.done"
-                | "response.reasoning_summary_text.delta"
-                | "response.reasoning_summary_text.done"
-                | "response.reasoning_text.delta"
-                | "response.reasoning_text.done"
-        )
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Deserialize)]
+enum Event {
+    #[serde(rename = "error", alias = "response.failed")]
+    Failed,
+    #[serde(rename = "response.completed")]
+    Completed,
+    #[serde(rename = "response.incomplete")]
+    Incomplete,
+    #[serde(rename = "response.output_item.added")]
+    Added,
+    #[serde(rename = "response.output_item.done")]
+    Done,
+    // A refusal is the assistant's message for that turn.
+    #[serde(
+        rename = "response.output_text.delta",
+        alias = "response.refusal.delta"
+    )]
+    Text,
+    #[serde(rename = "response.reasoning_summary_text.delta")]
+    Summary,
+    #[serde(rename = "response.reasoning_text.delta")]
+    Reasoning,
+    #[serde(rename = "response.function_call_arguments.delta")]
+    #[serde(alias = "response.custom_tool_call_input.delta")]
+    Arguments,
 }
 
-#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+/// The reasons a response is incomplete that have a finish of their own.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "snake_case")]
+enum Incomplete {
+    MaxOutputTokens,
+    ContentFilter,
+}
+
+/// A delta event's fields, borrowed from its frame.
+#[derive(Deserialize)]
+struct Delta<'a> {
+    /// Only a delta event reads as one, so any other frame stops at its
+    /// type.
+    #[serde(rename = "type", deserialize_with = "delta_event")]
+    event: Event,
+    #[serde(rename = "delta", borrow)]
+    text: Cow<'a, str>,
+    output_index: Option<u64>,
+    item_id: Option<&'a str>,
+    content_index: Option<u64>,
+    summary_index: Option<u64>,
+    /// A frame stating an item or a response is no delta this reads: the
+    /// `Value` path addresses an event by its item's id.
+    #[serde(rename = "item", default, deserialize_with = "refuse")]
+    _item: (),
+    #[serde(rename = "response", default, deserialize_with = "refuse")]
+    _response: (),
+}
+
+fn delta_event<'de, D: Deserializer<'de>>(kind: D) -> Result<Event, D::Error> {
+    match Event::deserialize(kind)? {
+        event @ (Event::Text | Event::Summary | Event::Reasoning | Event::Arguments) => Ok(event),
+        _ => Err(de::Error::custom("not a delta event")),
+    }
+}
+
+fn refuse<'de, D: Deserializer<'de>>(_: D) -> Result<(), D::Error> {
+    Err(de::Error::custom("not a delta event"))
+}
+
+impl<'a> Delta<'a> {
+    fn lenient(event: Event, frame: &'a Value) -> Self {
+        Self {
+            event,
+            text: frame.str("delta").unwrap_or_default().into(),
+            output_index: frame.u64("output_index"),
+            item_id: address(frame),
+            content_index: frame.u64("content_index"),
+            summary_index: frame.u64("summary_index"),
+            _item: (),
+            _response: (),
+        }
+    }
+}
+
+/// What an output item becomes.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 enum Item {
+    #[default]
     Message,
     Reasoning,
     Call,
@@ -63,54 +114,90 @@ enum Item {
 
 impl Item {
     fn of(item: &Value) -> Self {
-        match item.str("type") {
-            Some("message") => Self::Message,
-            Some("reasoning") => Self::Reasoning,
-            Some("function_call" | "custom_tool_call") => Self::Call,
+        match ItemType::of(item.get("type")) {
+            Some(ItemType::Message) => Self::Message,
+            Some(ItemType::Reasoning) => Self::Reasoning,
+            Some(ItemType::FunctionCall | ItemType::CustomToolCall) => Self::Call,
             _ => Self::Opaque,
         }
     }
 }
 
 /// One output item as it streams.
+#[derive(Default)]
 #[allow(clippy::struct_excessive_bools)]
 struct Slot {
-    /// Its wire index in the writer.
+    /// Its wire index in the writer, and the output index it holds until
+    /// another item takes it.
     at: usize,
+    index: Option<usize>,
     kind: Item,
+    custom: bool,
     id: Option<String>,
     open: bool,
+    /// The text its deltas wrote, the event they came in, and the content
+    /// or summary part that last extended it.
     text: String,
-    /// The field its text streams from: `message`, `summary` or `reasoning`.
-    field: Option<&'static str>,
-    /// The content or summary part the text last came from.
+    field: Option<Event>,
     part: u64,
+    /// A call's argument text (a custom call's raw input), and how much of
+    /// its argument JSON the writer has.
     arguments: String,
-    /// The argument text the writer has.
-    sent: String,
-    custom: bool,
+    sent: usize,
+    /// Whether the call's id, and its tool name, were stated when it opened.
     named: bool,
     titled: bool,
 }
 
-/// Items a client executes: kept, never sent back.
-const CLIENT_EXECUTED: &[&str] = &[
-    "computer_call",
-    "local_shell_call",
-    "shell_call",
-    "apply_patch_call",
-    "mcp_approval_request",
-];
+impl Slot {
+    /// End the call with what its done `item` states, or else with what
+    /// streamed; argument JSON that does not extend what the writer has
+    /// restates it.
+    fn end_call(&self, w: &mut Writer, item: Option<&Value>) -> Result<(), Error> {
+        let streamed = if self.custom {
+            json!({ "input": self.arguments }).to_string()
+        } else {
+            self.arguments.clone()
+        };
+        let stated = item.and_then(arguments_of);
+        let whole = stated.as_deref().unwrap_or(&streamed);
+        let rest = whole.strip_prefix(&streamed[..self.sent]);
+        if rest.is_none() {
+            w.restate(self.at, whole)?;
+        }
+        let stated = |key: &str| item.and_then(|item| item.str(key));
+        let (id, name) = (stated("call_id").filter(|_| !self.named), stated("name"));
+        let arguments = Some(rest.unwrap_or_default());
+        w.fragment(
+            Some(self.at),
+            CallFragment {
+                id,
+                name,
+                arguments,
+            },
+        )
+    }
+}
 
 fn item_id(item: &Value) -> Option<&str> {
     item.str("id").filter(|id| !id.is_empty())
 }
 
+/// The item id an event addresses.
+fn address(frame: &Value) -> Option<&str> {
+    let id = frame.at("/item/id").and_then(Value::as_str);
+    id.or_else(|| frame.str("item_id"))
+}
+
+fn ciphertext(item: &Value) -> Option<&Value> {
+    let cipher = item.get("encrypted_content");
+    cipher.filter(|cipher| cipher.as_str().is_some_and(|text| !text.is_empty()))
+}
+
 fn arguments_of(item: &Value) -> Option<String> {
-    if item.str("type") == Some("custom_tool_call") {
-        return item
-            .str("input")
-            .map(|input| json!({ "input": input }).to_string());
+    if ItemType::of(item.get("type")) == Some(ItemType::CustomToolCall) {
+        let input = item.str("input")?;
+        return Some(json!({ "input": input }).to_string());
     }
     match item.get("arguments")? {
         Value::String(arguments) if arguments.is_empty() => None,
@@ -122,18 +209,14 @@ fn arguments_of(item: &Value) -> Option<String> {
 
 fn text_of(item: &Value) -> String {
     let texts = |key: &str| -> Vec<&str> {
-        match item.get(key) {
-            Some(Value::String(text)) => vec![text.as_str()],
-            _ => item
-                .arr(key)
-                .iter()
-                .filter_map(|part| {
-                    part.as_str()
-                        .or_else(|| part.str("text"))
-                        .or_else(|| part.str("refusal"))
-                })
-                .collect(),
+        if let Some(Value::String(text)) = item.get(key) {
+            return vec![text];
         }
+        let text = |part| [Value::as_str(part), part.str("text"), part.str("refusal")];
+        let parts = item.arr(key).iter();
+        parts
+            .filter_map(|part| text(part).into_iter().flatten().next())
+            .collect()
     };
     match Item::of(item) {
         Item::Message => texts("content").concat(),
@@ -145,75 +228,58 @@ fn text_of(item: &Value) -> String {
     }
 }
 
-/// `item` stating `text` as its only content or summary part.
-fn stating(mut item: Value, kind: Item, text: &str) -> Value {
-    let (key, part) = match kind {
-        Item::Message => (
-            "content",
-            json!({"type": "output_text", "text": text, "annotations": []}),
-        ),
-        _ => ("summary", json!({"type": "summary_text", "text": text})),
-    };
-    if let Some(fields) = item.as_object_mut() {
-        fields.insert(key.to_owned(), json!([part]));
-    }
-    item
-}
-
-fn provider_message(response: &Value, fallback: &str) -> String {
-    let parts: Vec<&str> = ["/error/code", "/error/message"]
-        .iter()
-        .filter_map(|pointer| response.at(pointer).and_then(Value::as_str))
-        .collect();
-    if parts.is_empty() {
-        fallback.to_owned()
-    } else {
-        parts.join(": ")
-    }
-}
-
 /// How the response ended: its reason, the provider's word, and why a reply
 /// that did not complete stopped.
-pub(crate) fn finish_of(response: &Value) -> (Reason, Option<SmolStr>, Option<String>) {
-    let reason = response
-        .at("/incomplete_details/reason")
+fn finish_of(response: &Value) -> (Reason, Option<SmolStr>, Option<String>) {
+    let Some(status) = response.str("status") else {
+        return (Reason::Stop, None, None);
+    };
+    let reason = response.at("/incomplete_details/reason");
+    let reason = reason
         .and_then(Value::as_str)
         .filter(|reason| !reason.is_empty());
-    match response.str("status") {
-        None | Some("completed") => (Reason::Stop, None, None),
-        Some("incomplete") => match reason {
-            Some("max_output_tokens") => (Reason::Length, Some("max_output_tokens".into()), None),
-            Some("content_filter") => (Reason::ContentFilter, Some("content_filter".into()), None),
-            Some(reason) => (
-                Reason::Other,
-                Some(smol_str::format_smolstr!("incomplete: {reason}")),
-                Some(format!("Response incomplete: {reason}")),
-            ),
+    let (raw, message) = match (word(status), reason) {
+        (Some(Status::Completed), _) => return (Reason::Stop, None, None),
+        (Some(Status::Incomplete), Some(reason)) => match word(reason) {
+            Some(Incomplete::MaxOutputTokens) => {
+                return (Reason::Length, Some(reason.into()), None);
+            }
+            Some(Incomplete::ContentFilter) => {
+                return (Reason::ContentFilter, Some(reason.into()), None);
+            }
             None => (
-                Reason::Other,
-                Some("incomplete".into()),
-                Some("Response incomplete without a provider reason".into()),
+                smol_str::format_smolstr!("incomplete: {reason}"),
+                format!("Response incomplete: {reason}"),
             ),
         },
-        Some(status @ ("failed" | "cancelled")) => (
-            Reason::Other,
-            Some(status.into()),
-            Some(provider_message(response, &format!("Response {status}"))),
+        (Some(Status::Incomplete), None) => (
+            "incomplete".into(),
+            "Response incomplete without a provider reason".into(),
         ),
-        Some(status @ ("queued" | "in_progress")) => (
-            Reason::Other,
-            Some(status.into()),
-            Some(format!("Response ended while {status}")),
+        (Some(Status::Failed | Status::Cancelled), _) => {
+            let stated: Vec<&str> = ["/error/code", "/error/message"]
+                .iter()
+                .filter_map(|pointer| response.at(pointer)?.as_str())
+                .collect();
+            let message = if stated.is_empty() {
+                format!("Response {status}")
+            } else {
+                stated.join(": ")
+            };
+            (status.into(), message)
+        }
+        (Some(Status::Queued | Status::InProgress), _) => {
+            (status.into(), format!("Response ended while {status}"))
+        }
+        (None, _) => (
+            status.into(),
+            format!("Response ended with the unknown status `{status}`"),
         ),
-        Some(status) => (
-            Reason::Other,
-            Some(status.into()),
-            Some(format!("Response ended with the unknown status `{status}`")),
-        ),
-    }
+    };
+    (Reason::Other, Some(raw), Some(message))
 }
 
-pub(crate) fn usage_of(usage: &Value) -> Usage {
+fn usage_of(usage: &Value) -> Usage {
     let count = |pointer: &str| usage.at(pointer).and_then(Lenient::as_u64_lenient);
     Usage {
         input: count("/input_tokens"),
@@ -226,27 +292,32 @@ pub(crate) fn usage_of(usage: &Value) -> Usage {
 }
 
 /// The error a failure frame or a failed response reports.
-pub(crate) fn failure(frame: &Value) -> Error {
-    let error = frame
-        .get("error")
-        .filter(|error| error.is_object())
+fn failure(frame: &Value) -> Error {
+    let error = frame.get("error").filter(|error| error.is_object());
+    let error = error
         .or_else(|| frame.at("/response/error"))
         .unwrap_or(frame);
     let code = error.str("code").or_else(|| error.str("type"));
-    let message = error
-        .str("message")
-        .map_or_else(|| frame.to_string(), str::to_owned);
-    Error::provider(code, message)
+    let message = error.str("message").map(str::to_owned);
+    Error::provider(code, message.unwrap_or_else(|| frame.to_string()))
+}
+
+fn output_index(index: Option<u64>) -> Result<Option<usize>, Error> {
+    let fits = |index: u64| {
+        let message = || format!("output_index {index} is out of range");
+        usize::try_from(index).map_err(|_| Error::new(Kind::Decode, message()))
+    };
+    index.map(fits).transpose()
 }
 
 pub(crate) struct ResponsesDecoder {
     w: Writer,
+    /// Every output item, in the order it arrived.
     slots: Vec<Slot>,
-    /// The slot at each output index.
-    indexed: HashMap<usize, usize>,
-    current: Option<usize>,
     /// Reasoning parts waiting for the item they precede to complete.
     held: Vec<usize>,
+    /// A custom call's input as the JSON string it streams in.
+    escaped: Vec<u8>,
 }
 
 impl ResponsesDecoder {
@@ -258,108 +329,119 @@ impl ResponsesDecoder {
         Self {
             w,
             slots: Vec::new(),
-            indexed: HashMap::new(),
-            current: None,
             held: Vec::new(),
+            escaped: Vec::new(),
         }
     }
 
-    /// The slot `frame` addresses: by output index, then by item id, then
-    /// the open slot of `kind` the stream is writing.
-    fn addressed(&self, frame: &Value, kind: Item) -> Result<Option<usize>, Error> {
-        let index = output_index(frame)?;
-        if let Some(slot) = index.and_then(|index| self.indexed.get(&index)) {
-            return Ok(Some(*slot));
-        }
-        let id = frame
-            .at("/item/id")
-            .and_then(Value::as_str)
-            .or_else(|| frame.str("item_id"));
-        if let Some(slot) = id.filter(|id| !id.is_empty()).and_then(|id| {
-            self.slots
-                .iter()
-                .rposition(|slot| slot.id.as_deref() == Some(id))
-        }) {
-            return Ok(Some(slot));
-        }
-        Ok(self.current.filter(|current| {
-            (index.is_none() || !self.indexed.values().any(|slot| slot == current))
-                && self
-                    .slots
-                    .get(*current)
-                    .is_some_and(|slot| slot.open && slot.kind == kind)
-        }))
+    fn holding(&self, index: usize) -> Option<usize> {
+        self.slots.iter().position(|slot| slot.index == Some(index))
+    }
+
+    /// The slot an event addresses: by output index, then by item id, then
+    /// the latest item while the stream is writing it as one of `kind`.
+    fn addressed(&self, index: Option<usize>, id: Option<&str>, kind: Item) -> Option<usize> {
+        let by_id = || {
+            let id = id.filter(|id| !id.is_empty())?;
+            (self.slots.iter()).rposition(|slot| slot.id.as_deref() == Some(id))
+        };
+        let latest = || {
+            let at = self.slots.len().checked_sub(1)?;
+            let slot = &self.slots[at];
+            let writing = slot.open && slot.kind == kind;
+            (writing && (index.is_none() || slot.index.is_none())).then_some(at)
+        };
+        let held = index.and_then(|index| self.holding(index));
+        held.or_else(by_id).or_else(latest)
     }
 
     fn added(&mut self, index: Option<usize>, item: &Value) -> Result<usize, Error> {
-        if let Some(previous) = index.and_then(|index| self.indexed.get(&index).copied()) {
+        if let Some(previous) = index.and_then(|index| self.holding(index)) {
+            self.slots[previous].index = None;
             self.vacate(previous)?;
         }
         let at = match index {
             Some(index) if !self.slots.iter().any(|slot| slot.at == index) => index,
             _ => self.w.fresh_index(),
         };
-        let kind = Item::of(item);
-        let custom = item.str("type") == Some("custom_tool_call");
-        match kind {
-            Item::Message => self.w.open(at, Open::Text, Value::Null)?,
-            Item::Reasoning => self
-                .w
-                .open(at, Open::Reasoning { redacted: false }, Value::Null)?,
-            Item::Call => self.w.fragment(
-                Some(at),
-                CallFragment {
-                    id: item.str("call_id"),
-                    name: item.str("name"),
-                    arguments: None,
-                },
-            )?,
+        let (kind, ty) = (Item::of(item), ItemType::of(item.get("type")));
+        let (id, name) = (item.str("call_id"), item.str("name"));
+        let (open, state) = match kind {
+            Item::Message => (Open::Text, Value::Null),
+            Item::Reasoning => (Open::Reasoning { redacted: false }, Value::Null),
+            Item::Call => {
+                let (id, name) = (id.unwrap_or_default(), name.unwrap_or_default());
+                let open = Open::Call {
+                    id: id.into(),
+                    name: name.into(),
+                };
+                (open, Value::Null)
+            }
             // An item that names no type is kept and never sent back.
             Item::Opaque => {
-                let replay = item
-                    .str("type")
-                    .is_some_and(|kind| !CLIENT_EXECUTED.contains(&kind));
-                self.w.open(at, Open::Opaque { replay }, item.clone())?;
+                let replay = ty.is_some_and(ItemType::replays);
+                (Open::Opaque { replay }, item.clone())
             }
-        }
-        let arguments = item.str(if custom { "input" } else { "arguments" });
+        };
+        self.w.open(at, open, state)?;
+        let custom = ty == Some(ItemType::CustomToolCall);
         self.slots.push(Slot {
             at,
+            index,
             kind,
+            custom,
             id: item_id(item).map(str::to_owned),
             open: true,
-            text: String::new(),
-            field: None,
-            part: 0,
-            arguments: arguments.unwrap_or_default().to_owned(),
-            sent: String::new(),
-            custom,
-            named: item.str("call_id").is_some_and(|id| !id.is_empty()),
-            titled: item.str("name").is_some_and(|name| !name.is_empty()),
+            named: id.is_some_and(|id| !id.is_empty()),
+            titled: name.is_some_and(|name| !name.is_empty()),
+            ..Slot::default()
         });
         let slot = self.slots.len() - 1;
-        if let Some(index) = index {
-            self.indexed.insert(index, slot);
-        }
-        self.current = Some(slot);
-        if self.slots[slot].kind == Item::Call {
-            send(&mut self.slots[slot], &mut self.w)?;
+        if kind == Item::Call {
+            let arguments = item.str(if custom { "input" } else { "arguments" });
+            self.stream(slot, arguments.unwrap_or_default())?;
         }
         Ok(slot)
     }
 
-    /// Close the open slot `slot` without the item that would complete it:
+    /// Append `fragment` to the call at `slot` and write it on: a custom
+    /// call's input as the `{"input": …}` string it extends.
+    fn stream(&mut self, slot: usize, fragment: &str) -> Result<(), Error> {
+        let call = &mut self.slots[slot];
+        if fragment.is_empty() {
+            return Ok(());
+        }
+        let first = call.arguments.is_empty();
+        call.arguments.push_str(fragment);
+        let mut json = fragment;
+        if call.custom {
+            self.escaped.clear();
+            if first {
+                self.escaped.extend_from_slice(b"{\"input\":");
+            }
+            let escaped = serde_json::to_writer(&mut self.escaped, fragment);
+            escaped.map_err(|error| Error::decode(error, fragment))?;
+            // The string stays open: later input extends it.
+            self.escaped.pop();
+            json = std::str::from_utf8(&self.escaped).unwrap_or_default();
+            json = if first { json } else { &json[1..] };
+        }
+        call.sent += json.len();
+        self.w.push(call.at, json)
+    }
+
+    /// Close the open `slot` without the item that would complete it:
     /// another item took its output index.
     fn vacate(&mut self, slot: usize) -> Result<(), Error> {
-        let Some(open) = self.slots.get_mut(slot).filter(|slot| slot.open) else {
+        let slot = &mut self.slots[slot];
+        if !slot.open {
             return Ok(());
-        };
-        open.open = false;
-        let at = open.at;
-        if open.kind == Item::Call {
-            flush(open, &mut self.w)?;
         }
-        self.w.close(at)?;
+        slot.open = false;
+        if slot.kind == Item::Call {
+            slot.end_call(&mut self.w, None)?;
+        }
+        self.w.close(slot.at)?;
         self.release(false)
     }
 
@@ -375,102 +457,108 @@ impl ResponsesDecoder {
         Ok(())
     }
 
-    fn text(&mut self, frame: &Value, field: &'static str, part: &str) -> Result<(), Error> {
-        let delta = frame.str("delta").unwrap_or_default();
-        if delta.is_empty() {
+    fn delta(&mut self, delta: &Delta<'_>) -> Result<(), Error> {
+        let event = delta.event;
+        let text = &*delta.text;
+        if text.is_empty() {
             return Ok(());
         }
-        let part = frame.u64(part).unwrap_or(0);
-        let kind = match field {
-            "message" => Item::Message,
-            _ => Item::Reasoning,
+        let index = output_index(delta.output_index)?;
+        let id = delta.item_id;
+        let (kind, part) = match event {
+            Event::Text => (Item::Message, delta.content_index),
+            Event::Summary => (Item::Reasoning, delta.summary_index),
+            Event::Reasoning => (Item::Reasoning, delta.content_index),
+            _ => {
+                let call = self.addressed(index, id, Item::Call);
+                let open = |at: &usize| self.slots[*at].open && self.slots[*at].kind == Item::Call;
+                return (call.filter(open)).map_or(Ok(()), |call| self.stream(call, text));
+            }
         };
-        let known = self.addressed(frame, kind)?.and_then(|at| {
-            let slot = self.slots.get(at)?;
-            Some((at, slot.open, slot.kind == kind))
-        });
-        let slot = match known {
-            Some((slot, true, true)) => slot,
+        let slot = match self.addressed(index, id, kind) {
             // A delta for an item that already closed is left to the item,
             // which states its text.
-            Some((_, false, true)) => return Ok(()),
-            _ => self.added(
-                output_index(frame)?,
-                &json!({"type": if kind == Item::Message { "message" } else { "reasoning" }}),
-            )?,
+            Some(at) if self.slots[at].kind == kind && !self.slots[at].open => return Ok(()),
+            Some(at) if self.slots[at].kind == kind => at,
+            _ if kind == Item::Message => self.added(index, &json!({"type": ItemType::Message}))?,
+            _ => self.added(index, &json!({"type": ItemType::Reasoning}))?,
         };
-        let Some(streamed) = self.slots.get_mut(slot).filter(|slot| slot.open) else {
-            return Ok(());
-        };
-        if streamed.field.is_some_and(|known| known != field) {
+        let streamed = &mut self.slots[slot];
+        if streamed.field.is_some_and(|field| field != event) {
             return Ok(());
         }
+        let part = part.unwrap_or(0);
         // Summary parts of one reasoning item are paragraphs.
-        if streamed.part != part && kind != Item::Message && !streamed.text.is_empty() {
+        if streamed.part != part && kind == Item::Reasoning && !streamed.text.is_empty() {
             streamed.text.push_str("\n\n");
             self.w.push(streamed.at, "\n\n")?;
         }
-        streamed.field = Some(field);
-        streamed.part = part;
-        streamed.text.push_str(delta);
-        self.w.push(streamed.at, delta)
+        (streamed.field, streamed.part) = (Some(event), part);
+        streamed.text.push_str(text);
+        self.w.push(streamed.at, text)
     }
 
-    fn arguments(&mut self, frame: &Value) -> Result<(), Error> {
-        let slot = self.addressed(frame, Item::Call)?;
-        if let Some(call) = slot
-            .and_then(|slot| self.slots.get_mut(slot))
-            .filter(|slot| slot.open && slot.kind == Item::Call)
-        {
-            call.arguments
-                .push_str(frame.str("delta").unwrap_or_default());
-            send(call, &mut self.w)?;
-        }
-        Ok(())
-    }
-
-    fn done(&mut self, slot: usize, item: Value) -> Result<(), Error> {
-        let Some(done) = self.slots.get_mut(slot) else {
-            return Ok(());
+    /// The done event for `item`, at output `index`, addressing item `id`.
+    fn item_done(
+        &mut self,
+        index: Option<usize>,
+        id: Option<&str>,
+        item: &Value,
+    ) -> Result<(), Error> {
+        let (kind, stated) = (Item::of(item), item_id(item));
+        let known = self.addressed(index, id, kind);
+        let slot = match known.map(|at| (at, &self.slots[at])) {
+            // At a named output index the item is the one there, whatever
+            // id it states.
+            Some((at, slot))
+                if slot.open
+                    && slot.kind == kind
+                    && (index.is_some()
+                        || stated
+                            .zip(slot.id.as_deref())
+                            .is_none_or(|(id, known)| id == known)) =>
+            {
+                at
+            }
+            // The item this one restates is already done.
+            Some((_, slot)) if stated.is_some() && slot.id.as_deref() == stated => return Ok(()),
+            _ => self.added(index, item)?,
         };
+        self.done(slot, item.clone())
+    }
+
+    fn done(&mut self, slot: usize, mut item: Value) -> Result<(), Error> {
+        let done = &mut self.slots[slot];
         done.open = false;
         if done.id.is_none() {
             done.id = item_id(&item).map(str::to_owned);
         }
         let at = done.at;
-        let mut item = item;
-        let mut nameless = false;
+        // A call with no name is dropped, so the reasoning it held has no
+        // item to go with.
+        let unnamed = item.str("name").is_none_or(str::is_empty);
+        let nameless = done.kind == Item::Call && !done.titled && unnamed;
+        let text = text_of(&item);
         match done.kind {
-            Item::Call => {
-                nameless = !done.titled && item.str("name").is_none_or(str::is_empty);
-                let arguments = arguments_of(&item).unwrap_or_else(|| streamed_arguments(done));
-                let rest = remainder(done, &arguments, &mut self.w)?;
-                self.w.fragment(
-                    Some(at),
-                    CallFragment {
-                        id: item.str("call_id").filter(|_| !done.named),
-                        name: item.str("name"),
-                        arguments: Some(&rest),
-                    },
-                )?;
-            }
-            Item::Message | Item::Reasoning => {
-                let text = text_of(&item);
-                if text.is_empty() {
-                    // Raw reasoning text the done item leaves out stays out:
-                    // written in as a summary, it would replay one the
-                    // provider never produced.
-                    if !done.text.is_empty() && done.field != Some("reasoning") {
-                        item = stating(item, done.kind, &done.text);
-                    }
-                } else if let Some(rest) = text.strip_prefix(done.text.as_str()) {
-                    self.w.push(at, rest)?;
-                } else {
-                    // The done item states the whole text.
-                    self.w.restate(at, &text)?;
-                }
-            }
+            Item::Call => done.end_call(&mut self.w, Some(&item))?,
             Item::Opaque => {}
+            _ if !text.is_empty() => match text.strip_prefix(&done.text) {
+                Some(rest) => self.w.push(at, rest)?,
+                // The done item states the whole text.
+                None => self.w.restate(at, &text)?,
+            },
+            // An item that leaves its text out states it, so it replays as
+            // the part it is. Raw reasoning text stays out: as a summary it
+            // would replay one the provider never produced.
+            _ if done.text.is_empty() || done.field == Some(Event::Reasoning) => {}
+            Item::Message => {
+                let part =
+                    json!({"type": PartType::OutputText, "text": done.text, "annotations": []});
+                item["content"] = json!([part]);
+            }
+            Item::Reasoning => {
+                item["summary"] = json!([{"type": PartType::SummaryText, "text": done.text}]);
+            }
         }
         let reasoning = done.kind == Item::Reasoning;
         self.w.edit(at, |stored| *stored = item)?;
@@ -481,58 +569,13 @@ impl ResponsesDecoder {
             return Ok(());
         }
         self.w.finish(at)?;
-        // A call with no name is dropped, so the reasoning it held has no
-        // item to go with.
         self.release(!nameless)
     }
 
-    fn item_event(&mut self, kind: &str, frame: &Value) -> Result<(), Error> {
-        match kind {
-            "response.output_item.added" | "response.output_item.done" => {
-                let Some(item) = frame.get("item").filter(|item| item.is_object()) else {
-                    return Ok(());
-                };
-                let index = output_index(frame)?;
-                if kind == "response.output_item.added" {
-                    return self.added(index, item).map(drop);
-                }
-                let known = self.addressed(frame, Item::of(item))?;
-                // At a named output index the item is the one there,
-                // whatever id it states.
-                let restates = |slot: &Slot| {
-                    slot.kind == Item::of(item)
-                        && (index.is_some()
-                            || item_id(item)
-                                .zip(slot.id.as_deref())
-                                .is_none_or(|(id, known)| id == known))
-                };
-                let known = known.and_then(|at| {
-                    let slot = self.slots.get(at)?;
-                    let same = item_id(item).is_some() && slot.id.as_deref() == item_id(item);
-                    Some((at, slot.open && restates(slot), same))
-                });
-                let slot = match known {
-                    Some((slot, true, _)) => slot,
-                    // The item this one restates is already done.
-                    Some((_, false, true)) => return Ok(()),
-                    _ => self.added(index, item)?,
-                };
-                self.done(slot, item.clone())
-            }
-            // A refusal is the assistant's message for that turn.
-            "response.output_text.delta" | "response.refusal.delta" => {
-                self.text(frame, "message", "content_index")
-            }
-            "response.reasoning_summary_text.delta" => self.text(frame, "summary", "summary_index"),
-            "response.reasoning_text.delta" => self.text(frame, "reasoning", "content_index"),
-            "response.function_call_arguments.delta" | "response.custom_tool_call_input.delta" => {
-                self.arguments(frame)
-            }
-            _ => Ok(()),
-        }
-    }
-
-    /// The slot an item of the terminal's `output` restates.
+    /// The slot an item of the terminal's `output` restates: a free one of
+    /// its kind with its id, else the one at its output index, else one no
+    /// id tells apart that holds no index, else one holding an index whose
+    /// output item is of another kind.
     fn restated(
         &self,
         index: usize,
@@ -540,40 +583,20 @@ impl ResponsesDecoder {
         output: &[Value],
         taken: &HashSet<usize>,
     ) -> Option<usize> {
-        let id = item_id(item);
-        let free = |at: &usize| {
-            !taken.contains(at)
-                && self
-                    .slots
-                    .get(*at)
-                    .is_some_and(|slot| slot.kind == Item::of(item))
+        let (id, kind) = (item_id(item), Item::of(item));
+        let free = |at: &usize| !taken.contains(at) && self.slots[*at].kind == kind;
+        let find = |fits: &dyn Fn(&Slot) -> bool| {
+            (0..self.slots.len()).find(|at| free(at) && fits(&self.slots[*at]))
         };
-        let find = |fits: &dyn Fn(usize, &Slot) -> bool| {
-            self.slots
-                .iter()
-                .enumerate()
-                .find(|(at, slot)| free(at) && fits(*at, slot))
-                .map(|(at, _)| at)
+        let anonymous = |slot: &Slot| id.is_none() || slot.id.is_none();
+        let moved = |slot: &Slot| {
+            let streamed = slot.index.map(|streamed| output.get(streamed));
+            streamed.is_some_and(|other| other.is_none_or(|other| Item::of(other) != slot.kind))
         };
-        id.and_then(|id| find(&|_, slot| slot.id.as_deref() == Some(id)))
-            .or_else(|| self.indexed.get(&index).copied().filter(free))
-            .or_else(|| {
-                find(&|at, slot| {
-                    !self.indexed.values().any(|indexed| *indexed == at)
-                        && (id.is_none() || slot.id.is_none())
-                })
-            })
-            .or_else(|| {
-                find(&|at, slot| {
-                    (id.is_none() || slot.id.is_none())
-                        && self.indexed.iter().any(|(streamed, indexed)| {
-                            *indexed == at
-                                && output
-                                    .get(*streamed)
-                                    .is_none_or(|other| Item::of(other) != slot.kind)
-                        })
-                })
-            })
+        id.and_then(|id| find(&|slot| slot.id.as_deref() == Some(id)))
+            .or_else(|| self.holding(index).filter(free))
+            .or_else(|| find(&|slot| anonymous(slot) && slot.index.is_none()))
+            .or_else(|| find(&|slot| anonymous(slot) && moved(slot)))
     }
 
     fn finish(&mut self, response: &Value) -> Result<Flow, Error> {
@@ -584,68 +607,54 @@ impl ResponsesDecoder {
         {
             // Index 0 orders it before the output; it closes at once, so the
             // output's first item may open there after it.
-            self.w.whole(
-                0,
-                Open::Reasoning { redacted: false },
-                Value::Null,
-                reasoning,
-            )?;
+            let open = Open::Reasoning { redacted: false };
+            self.w.whole(0, open, Value::Null, reasoning)?;
         }
         let mut taken = HashSet::new();
-        for (index, item) in output
-            .iter()
-            .enumerate()
-            .filter(|(_, item)| item.is_object())
-        {
-            let known = self.restated(index, item, output, &taken).and_then(|at| {
-                let slot = self.slots.get(at)?;
-                Some((at, slot.open, slot.kind, slot.at))
-            });
-            let slot = match known {
-                Some((slot, false, kind, at)) => {
+        for (index, item) in output.iter().enumerate() {
+            if !item.is_object() {
+                continue;
+            }
+            let slot = match self.restated(index, item, output, &taken) {
+                Some(slot) if self.slots[slot].open => slot,
+                Some(slot) => {
                     taken.insert(slot);
-                    let ciphertext = item
-                        .get("encrypted_content")
-                        .filter(|cipher| cipher.as_str().is_some_and(|cipher| !cipher.is_empty()));
-                    if let (Item::Reasoning, Some(ciphertext)) = (kind, ciphertext) {
+                    let Slot { at, kind, .. } = self.slots[slot];
+                    // Reasoning done without its ciphertext takes the
+                    // terminal's.
+                    if let (Item::Reasoning, Some(cipher)) = (kind, ciphertext(item)) {
                         self.w.edit(at, |stored| {
-                            let stated = stored
-                                .str("encrypted_content")
-                                .is_some_and(|cipher| !cipher.is_empty());
-                            if let (false, Some(fields)) = (stated, stored.as_object_mut()) {
-                                fields.insert("encrypted_content".to_owned(), ciphertext.clone());
+                            if ciphertext(stored).is_none()
+                                && let Some(fields) = stored.as_object_mut()
+                            {
+                                fields.insert("encrypted_content".to_owned(), cipher.clone());
                             }
                         })?;
                     }
                     continue;
                 }
-                Some((slot, ..)) => slot,
-                None => self.added(
-                    Some(index).filter(|index| !self.indexed.contains_key(index)),
-                    item,
-                )?,
+                None => {
+                    let index = Some(index).filter(|index| self.holding(*index).is_none());
+                    self.added(index, item)?
+                }
             };
             taken.insert(slot);
             self.done(slot, item.clone())?;
         }
         // Reasoning still waiting is complete when nothing after it is left
         // open.
-        let open = self.slots.iter().any(|slot| slot.open);
-        self.release(!open)?;
+        self.release(!self.slots.iter().any(|slot| slot.open))?;
         // A call never done shows what streamed, in a turn that fails.
-        for slot in self.slots.iter_mut().filter(|slot| slot.open) {
-            if slot.kind == Item::Call {
-                flush(slot, &mut self.w)?;
+        for slot in &self.slots {
+            if slot.open && slot.kind == Item::Call {
+                slot.end_call(&mut self.w, None)?;
             }
         }
         let (reason, raw, message) = finish_of(response);
+        // Hosted tools report their requests beside the usage.
+        let hosted = crate::json::counters(response.get("tool_usage"), Some("num_requests"));
         let usage = Usage {
-            // Hosted tools report their requests beside the usage.
-            hosted_tool_calls: crate::json::counters(
-                response.get("tool_usage"),
-                Some("num_requests"),
-            )
-            .filter(|calls| *calls > 0),
+            hosted_tool_calls: hosted.filter(|calls| *calls > 0),
             ..response.get("usage").map_or_default(usage_of)
         };
         self.w.end(End {
@@ -657,6 +666,53 @@ impl ResponsesDecoder {
             raw_usage: response.get("usage").cloned(),
         })
     }
+
+    /// A frame read as a `Value`: every event, leniently.
+    fn lenient(&mut self, data: &str) -> Result<Flow, Error> {
+        if data.trim() == "[DONE]" {
+            // The provider's end is `response.completed`.
+            return Ok(Flow::More);
+        }
+        let mut frame: Value =
+            serde_json::from_str(data).map_err(|error| Error::decode(error, data))?;
+        if !frame.is_object() {
+            return Ok(Flow::More);
+        }
+        let Some(kind) = frame.str("type") else {
+            // An untagged body: the whole response, or its error.
+            let stated = |key: &str| frame.get(key).is_some();
+            let failed = frame.get("error").is_some_and(|error| !error.is_null());
+            if failed && !stated("output") && !stated("status") {
+                return Err(failure(&frame));
+            }
+            if ["object", "output", "status", "id"].into_iter().any(stated) {
+                return self.finish(&frame);
+            }
+            return Ok(Flow::More);
+        };
+        let item = frame.get("item").filter(|item| item.is_object());
+        let index = || output_index(frame.u64("output_index"));
+        match (word(kind), item) {
+            (Some(Event::Failed), _) => return Err(failure(&frame)),
+            // `response.incomplete` is a terminal that keeps the partial
+            // output and usage, incomplete whatever its `status` says.
+            (Some(event @ (Event::Completed | Event::Incomplete)), _) => {
+                let response = frame
+                    .get_mut("response")
+                    .filter(|response| response.is_object());
+                let mut response = response.map_or_else(|| json!({}), Value::take);
+                if event == Event::Incomplete {
+                    response["status"] = json!(Status::Incomplete);
+                }
+                return self.finish(&response);
+            }
+            (Some(Event::Added), Some(item)) => self.added(index()?, item).map(drop)?,
+            (Some(Event::Done), Some(item)) => self.item_done(index()?, address(&frame), item)?,
+            (Some(Event::Added | Event::Done) | None, _) => {}
+            (Some(event), _) => self.delta(&Delta::lenient(event, &frame))?,
+        }
+        Ok(Flow::More)
+    }
 }
 
 impl Writes for ResponsesDecoder {
@@ -665,131 +721,18 @@ impl Writes for ResponsesDecoder {
     }
 
     fn data(&mut self, data: &str) -> Result<Flow, Error> {
-        if data.trim() == "[DONE]" {
-            // The provider's end is `response.completed`.
-            return Ok(Flow::More);
-        }
-        let frame: Value =
-            serde_json::from_str(data).map_err(|error| Error::decode(error, data))?;
-        if !frame.is_object() {
-            return Ok(Flow::More);
-        }
-        let Some(kind) = frame.str("type") else {
-            // An untagged body: the whole response, or its error.
-            let failed = frame.get("error").is_some_and(|error| !error.is_null());
-            if failed && frame.get("output").is_none() && frame.get("status").is_none() {
-                return Err(failure(&frame));
-            }
-            if ["object", "output", "status", "id"]
-                .iter()
-                .any(|key| frame.get(*key).is_some())
-            {
-                return self.finish(&frame);
-            }
-            return Ok(Flow::More);
-        };
-        if !is_known(kind) {
-            return Ok(Flow::More);
-        }
-        match kind {
-            // `response.incomplete` is a terminal that keeps the partial
-            // output and usage, incomplete whatever its `status` says.
-            "response.completed" | "response.incomplete" => {
-                let mut response = frame
-                    .get("response")
-                    .filter(|response| response.is_object())
-                    .cloned()
-                    .unwrap_or_else(|| json!({}));
-                if let (true, Some(fields)) =
-                    (kind == "response.incomplete", response.as_object_mut())
-                {
-                    fields.insert("status".to_owned(), json!("incomplete"));
-                }
-                self.finish(&response)
-            }
-            "error" | "response.failed" => Err(failure(&frame)),
-            kind if is_lifecycle(kind) => Ok(Flow::More),
-            kind => {
-                let kind = kind.to_owned();
-                self.item_event(&kind, &frame)?;
-                Ok(Flow::More)
-            }
+        match typed(data) {
+            Some(delta) => self.delta(&delta).map(|()| Flow::More),
+            None => self.lenient(data),
         }
     }
 }
 
-/// Write the argument text the writer does not have yet.
-fn send(slot: &mut Slot, w: &mut Writer) -> Result<(), Error> {
-    if slot.arguments.is_empty() {
-        return Ok(());
-    }
-    let streamed = if slot.custom {
-        let quoted = Value::String(slot.arguments.clone()).to_string();
-        // The string without its closing quote: later input extends it.
-        format!("{{\"input\":{}", &quoted[..quoted.len() - 1])
-    } else {
-        slot.arguments.clone()
-    };
-    let Some(rest) = streamed
-        .strip_prefix(slot.sent.as_str())
-        .filter(|rest| !rest.is_empty())
-    else {
-        return Ok(());
-    };
-    w.fragment(
-        Some(slot.at),
-        CallFragment {
-            arguments: Some(rest),
-            ..CallFragment::default()
-        },
-    )?;
-    slot.sent = streamed;
-    Ok(())
+/// A delta frame read into fields borrowed from it; `None` for any other
+/// frame, or one those fields do not fit.
+fn typed(data: &str) -> Option<Delta<'_>> {
+    serde_json::from_str(data).ok()
 }
 
-fn flush(slot: &mut Slot, w: &mut Writer) -> Result<(), Error> {
-    let arguments = streamed_arguments(slot);
-    let rest = remainder(slot, &arguments, w)?;
-    w.fragment(
-        Some(slot.at),
-        CallFragment {
-            arguments: Some(&rest),
-            ..CallFragment::default()
-        },
-    )
-}
-
-/// What `arguments` adds to what the writer has; a call whose text the
-/// provider restated differently is restated whole.
-fn remainder(slot: &mut Slot, arguments: &str, w: &mut Writer) -> Result<String, Error> {
-    let rest = if let Some(rest) = arguments.strip_prefix(slot.sent.as_str()) {
-        rest.to_owned()
-    } else {
-        w.restate(slot.at, arguments)?;
-        String::new()
-    };
-    arguments.clone_into(&mut slot.sent);
-    Ok(rest)
-}
-
-fn streamed_arguments(slot: &Slot) -> String {
-    if slot.custom {
-        json!({ "input": slot.arguments }).to_string()
-    } else {
-        slot.arguments.clone()
-    }
-}
-
-fn output_index(frame: &Value) -> Result<Option<usize>, Error> {
-    frame
-        .u64("output_index")
-        .map(|index| {
-            usize::try_from(index).map_err(|_| {
-                Error::new(
-                    Kind::Decode,
-                    format!("output_index {index} is out of range"),
-                )
-            })
-        })
-        .transpose()
-}
+#[cfg(test)]
+mod tests;

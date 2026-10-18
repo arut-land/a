@@ -4,6 +4,10 @@
 mod decode;
 mod encode;
 
+use serde::de::value::{self, BorrowedStrDeserializer};
+use serde::{Deserialize, Serialize};
+use serde_json::Value;
+
 use crate::error::Error;
 use crate::protocol::{Decoder, Encoded, Framing, Host, Hosted, Protocol, Target};
 use crate::spec::Request;
@@ -134,6 +138,74 @@ pub const HOSTS: &[(Host, Quirks)] = &[
         },
     ),
 ];
+
+/// The item types this protocol sends or tells apart.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub(crate) enum ItemType {
+    Message,
+    Reasoning,
+    FunctionCall,
+    CustomToolCall,
+    FunctionCallOutput,
+    CustomToolCallOutput,
+    ComputerCall,
+    LocalShellCall,
+    ShellCall,
+    ApplyPatchCall,
+    McpApprovalRequest,
+    #[serde(other)]
+    Other,
+}
+
+/// Items a client executes: kept, never sent back.
+const CLIENT_EXECUTED: [ItemType; 5] = [
+    ItemType::ComputerCall,
+    ItemType::LocalShellCall,
+    ItemType::ShellCall,
+    ItemType::ApplyPatchCall,
+    ItemType::McpApprovalRequest,
+];
+
+impl ItemType {
+    /// The type an item's `type` field names; `None` when it names none.
+    pub(crate) fn of(kind: Option<&Value>) -> Option<Self> {
+        word(kind?.as_str()?)
+    }
+
+    /// Whether an item of this type goes back to the model that produced it.
+    pub(crate) fn replays(self) -> bool {
+        !CLIENT_EXECUTED.contains(&self)
+    }
+}
+
+/// The content and summary part types this protocol writes.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub(crate) enum PartType {
+    InputText,
+    InputImage,
+    InputFile,
+    OutputText,
+    SummaryText,
+}
+
+/// A response's or an item's status.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub(crate) enum Status {
+    Completed,
+    Incomplete,
+    Failed,
+    Cancelled,
+    Queued,
+    InProgress,
+}
+
+/// The word of a wire vocabulary `name` is; `None` for one it lacks.
+pub(crate) fn word<'a, T: Deserialize<'a>>(name: &'a str) -> Option<T> {
+    T::deserialize(BorrowedStrDeserializer::<value::Error>::new(name)).ok()
+}
 
 #[cfg(test)]
 mod tests;
