@@ -13,12 +13,17 @@ type Schema = Map<String, Value>;
 /// The keywords that hold a schema's definitions.
 const DEFINITIONS: [&str; 2] = ["$defs", "definitions"];
 
+/// References being inlined, so a definition that refers to itself (through
+/// `$ref` or `allOf`) is merged once instead of forever.
+type Seen = std::collections::BTreeSet<String>;
+
 pub(super) fn sanitize(schema: &mut Value) {
-    inline_root_ref(schema);
+    let mut seen = Seen::new();
+    inline_root_ref(schema, &mut seen);
     if let Value::Object(root) = schema {
         if let Some(all_of) = root.remove("allOf") {
             let mut conflicts = Map::new();
-            merge_all_of(root, all_of, &mut conflicts);
+            merge_all_of(root, all_of, &mut conflicts, &mut seen);
             keep_conflicts(root, "rootAllOfConstraints", conflicts);
         }
         if let [false, true, _] | [false, _, true] =
@@ -33,8 +38,7 @@ pub(super) fn sanitize(schema: &mut Value) {
 /// Resolve a local root `$ref` into the root, keeping the definitions nested
 /// references need and the root's sibling keywords, which JSON Schema
 /// applies conjunctively.
-fn inline_root_ref(schema: &mut Value) {
-    let mut seen = std::collections::BTreeSet::new();
+fn inline_root_ref(schema: &mut Value, seen: &mut Seen) {
     while let Some(reference) = schema.get("$ref").and_then(Value::as_str) {
         let target = reference
             .strip_prefix('#')
@@ -50,7 +54,7 @@ fn inline_root_ref(schema: &mut Value) {
         };
         root.remove("$ref");
         adopt_definitions(&mut referenced, |keyword| root.remove(keyword));
-        merge_siblings(&mut referenced, root);
+        merge_siblings(&mut referenced, root, seen);
         *schema = Value::Object(referenced);
     }
 }
@@ -82,13 +86,13 @@ fn keep_conflicts(schema: &mut Schema, key: &str, conflicts: Schema) {
 
 /// Merge keywords beside a root `$ref` into its resolved object. Unions and
 /// conflicting constraints stay as guidance.
-fn merge_siblings(schema: &mut Schema, siblings: Schema) {
+fn merge_siblings(schema: &mut Schema, siblings: Schema, seen: &mut Seen) {
     let mut conflicts = Map::new();
     for (keyword, sibling) in siblings {
         match keyword.as_str() {
             "properties" => merge_properties(schema, sibling),
             "required" => merge_required(schema, sibling),
-            "allOf" => merge_all_of(schema, sibling, &mut conflicts),
+            "allOf" => merge_all_of(schema, sibling, &mut conflicts, seen),
             "anyOf" | "oneOf" => {
                 conflicts.insert(keyword, sibling);
             }
@@ -113,23 +117,32 @@ fn merge_siblings(schema: &mut Schema, siblings: Schema) {
 
 /// Merge each object branch of a root `allOf` into `schema`; branches that
 /// are not objects stay as guidance.
-fn merge_all_of(schema: &mut Schema, all_of: Value, conflicts: &mut Schema) {
+fn merge_all_of(schema: &mut Schema, all_of: Value, conflicts: &mut Schema, seen: &mut Seen) {
     let Value::Array(branches) = all_of else {
         conflicts.insert("allOf".into(), all_of);
         return;
     };
     let mut unsupported = Vec::new();
     for branch in branches {
+        let reference = branch.get("$ref").and_then(Value::as_str);
         match branch {
-            Value::Object(mut branch) if branch.contains_key("$ref") => {
-                adopt_definitions(&mut branch, |keyword| schema.get(keyword).cloned());
-                let mut inlined = Value::Object(branch);
-                inline_root_ref(&mut inlined);
-                if let Value::Object(inlined) = inlined {
-                    merge_siblings(schema, inlined);
-                }
+            // A reference already being inlined is a cycle: kept as guidance.
+            Value::Object(_) if reference.is_some_and(|reference| seen.contains(reference)) => {
+                unsupported.push(branch);
             }
-            Value::Object(branch) => merge_siblings(schema, branch),
+            Value::Object(mut branch) if reference.is_some() => {
+                adopt_definitions(&mut branch, |keyword| schema.get(keyword).cloned());
+                // Only the references on the current path form a cycle: a
+                // definition reused by a sibling branch is inlined again.
+                let path = seen.clone();
+                let mut inlined = Value::Object(branch);
+                inline_root_ref(&mut inlined, seen);
+                if let Value::Object(inlined) = inlined {
+                    merge_siblings(schema, inlined, seen);
+                }
+                *seen = path;
+            }
+            Value::Object(branch) => merge_siblings(schema, branch, seen),
             branch => unsupported.push(branch),
         }
     }

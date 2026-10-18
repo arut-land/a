@@ -232,3 +232,24 @@ fn a_tool_choice_goes_only_with_tools() {
         json!({"type": "auto"})
     );
 }
+
+#[test]
+fn a_self_referencing_all_of_is_merged_once_instead_of_forever() {
+    let mut schema = serde_json::json!({
+        "$defs": {"A": {"allOf": [{"$ref": "#/$defs/A"}], "properties": {"x": {"type": "string"}}}},
+        "allOf": [{"$ref": "#/$defs/A"}],
+    });
+    strict::sanitize(&mut schema);
+    assert_eq!(schema["properties"]["x"]["type"], "string");
+}
+
+#[test]
+fn a_definition_two_branches_share_is_inlined_for_both() {
+    let mut schema = serde_json::json!({
+        "$defs": {"B": {"properties": {"y": {"type": "integer"}}}},
+        "allOf": [{"$ref": "#/$defs/B"}, {"$ref": "#/$defs/B", "required": ["y"]}],
+    });
+    strict::sanitize(&mut schema);
+    assert_eq!(schema["properties"]["y"]["type"], "integer");
+    assert_eq!(schema["required"], serde_json::json!(["y"]));
+}
