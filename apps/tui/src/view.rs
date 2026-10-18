@@ -1,7 +1,7 @@
 //! Transcript items as rows: messages, replies, and tool call cards.
 
-use protocol::view::{Approval, Item, Status, call_title, output_text};
-use protocol::{Decision, Outcome};
+use protocol::Outcome;
+use protocol::view::{Approval, Item, Status, call_title, decision_line, output_text};
 use serde_json::Value;
 
 use super::render::{Color, Style, ellipsize};
@@ -103,7 +103,10 @@ pub fn rows(item: &Item, width: usize, look: Look) -> Vec<Line> {
         ),
         Item::Hook { hook, decision, .. } => {
             vec![Line::plain(
-                ellipsize(&format!("  · hook {hook}: {}", decided(decision)), width),
+                ellipsize(
+                    &sanitize(&format!("  · hook {hook}: {}", decision_line(decision))),
+                    width,
+                ),
                 MUTED,
             )]
         }
@@ -315,24 +318,6 @@ fn output_rows(c: &Card, width: usize, verbose: bool) -> Vec<Line> {
         None => {}
     }
     rows
-}
-
-fn decided(decision: &Decision) -> String {
-    match decision {
-        Decision::PrepareStep { .. } => "request replaced".into(),
-        Decision::PreTool { tool, .. } => format!("{tool} input replaced"),
-        Decision::Block { tool, reason } => format!("{tool} blocked: {reason}"),
-        Decision::Permission { tool, permission } => {
-            format!("{tool} {}", format!("{permission:?}").to_lowercase())
-        }
-        Decision::Approval { tool, approved, .. } => {
-            format!("{tool} {}", if *approved { "approved" } else { "denied" })
-        }
-        Decision::PostTool { .. } => "result replaced".into(),
-        Decision::OnStop { text } => format!("continued: {}", sanitize(text)),
-        #[allow(unreachable_patterns)]
-        other => format!("{other:?}"),
-    }
 }
 
 #[cfg(test)]

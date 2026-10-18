@@ -63,6 +63,38 @@ opt-level = "z"
 [profile.release.package.topcoat-core]
 opt-level = "z"
 
+# What only topcoat links (its sync primitives, and the websocket stack its
+# router brings and no request reaches): z saves 16 KiB over 3.
+[profile.release.package.topcoat-asset]
+opt-level = "z"
+
+[profile.release.package.tokio]
+opt-level = "z"
+
+[profile.release.package.tokio-tungstenite]
+opt-level = "z"
+
+[profile.release.package.tungstenite]
+opt-level = "z"
+
+[profile.release.package.hyper]
+opt-level = "z"
+
+[profile.release.package.hyper-util]
+opt-level = "z"
+
+[profile.release.package.h2]
+opt-level = "z"
+
+[profile.release.package.futures-util]
+opt-level = "z"
+
+[profile.release.package.matchit]
+opt-level = "z"
+
+[profile.release.package.http-body-util]
+opt-level = "z"
+
 # The terminal client redraws once per streamed token at most: s saves
 # 32 KiB over 3 for ~40 µs a frame (90 µs on a 6000-item session); z would
 # save 48 KiB more at twice the frame time (docs/tui.md).

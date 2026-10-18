@@ -9,7 +9,7 @@ use std::sync::{Arc, Mutex, PoisonError};
 use std::time::{Duration, Instant};
 
 use rustix::pty::{OpenptFlags, grantpt, openpt, ptsname, unlockpt};
-use rustix::termios::{Winsize, tcsetwinsize};
+use rustix::termios::{LocalModes, Winsize, tcgetattr, tcsetwinsize};
 use unicode_width::UnicodeWidthChar;
 
 use super::Env;
@@ -133,6 +133,13 @@ impl Pty {
     pub fn click(&mut self, (x, y): (u16, u16)) {
         let report = format!("\x1b[<0;{};{}M\x1b[<0;{};{}m", x + 1, y + 1, x + 1, y + 1);
         self.send(report.as_bytes());
+    }
+
+    /// Whether the terminal is in cooked mode: echoing and by lines.
+    pub fn cooked(&self) -> bool {
+        let mode = tcgetattr(&self.master).unwrap();
+        mode.local_modes
+            .contains(LocalModes::ECHO | LocalModes::ICANON)
     }
 
     pub fn wait(&mut self) -> ExitStatus {

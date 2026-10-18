@@ -16,8 +16,8 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
 use crate::{
-    Body, Card, DaemonMsg, Decision, Decode, Entry, Environment, Outcome, Recap, SessionId,
-    SessionSummary,
+    Body, Card, DaemonMsg, Decision, Decode, Entry, Environment, Outcome, Permission, Recap,
+    SessionId, SessionSummary,
 };
 
 /// One session as a client shows it. Its serialized form is also what a
@@ -155,7 +155,7 @@ pub enum Status {
     Interrupted,
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Usage {
     pub input: u64,
     pub output: u64,
@@ -703,6 +703,40 @@ pub fn recap_line(recap: &Recap) -> String {
     }
     count(&mut parts, recap.asks, "waiting for approval");
     parts.join(" · ")
+}
+
+/// What a hook decided, in one line.
+pub fn decision_line(decision: &Decision) -> String {
+    match decision {
+        Decision::PrepareStep { call } => format!("rewrote the request of call {call}"),
+        Decision::PreTool { tool, .. } => format!("rewrote the input of {tool}"),
+        Decision::Block { tool, reason } => format!("blocked {tool}: {reason}"),
+        Decision::Permission { tool, permission } => {
+            let permission = match permission {
+                Permission::Allow => "allow",
+                Permission::Ask => "ask",
+                Permission::Defer => "defer",
+                Permission::Deny => "deny",
+            };
+            format!("{tool}: {permission}")
+        }
+        Decision::Approval { tool, approved, .. } => {
+            let answer = if *approved {
+                "approved"
+            } else {
+                "not approved"
+            };
+            format!("{tool} {answer}")
+        }
+        Decision::PostTool { call, .. } => format!("rewrote the outcome of call {call}"),
+        Decision::OnStop { text } => format!("continued with: {text}"),
+        Decision::Input { original } => format!("rewrote your input: {original}"),
+        Decision::Retry {
+            call,
+            attempt,
+            error,
+        } => format!("retried call {call} (attempt {attempt}): {error}"),
+    }
 }
 
 /// The daemon's sessions, as `a ls` and a session picker show them.

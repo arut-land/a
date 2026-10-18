@@ -3,7 +3,7 @@
 //! daemon only ever runs `runtime/current`, so the newest build wins.
 
 use std::fs::{self, File};
-use std::io::{self, Write};
+use std::io::{self, Read};
 use std::os::unix::fs::{MetadataExt, OpenOptionsExt, symlink};
 use std::path::{Path, PathBuf};
 use std::time::SystemTime;
@@ -122,8 +122,7 @@ impl Runtime {
     /// Copies `exe` to `runtime/<id>/a` through a temporary file, checks the
     /// copy's hash, and renames it into place.
     fn copy_in(&self, exe: &Path) -> io::Result<String> {
-        let bytes = fs::read(exe)?;
-        let hash = content_hash(&bytes);
+        let hash = content_hash(File::open(exe)?)?;
         let id = format!("{VERSION}+{hash:016x}");
         let dir = self.dir.join(&id);
         let target = dir.join("a");
@@ -136,11 +135,11 @@ impl Runtime {
                 .truncate(true)
                 .mode(0o755)
                 .open(&tmp)?;
-            file.write_all(&bytes)?;
+            io::copy(&mut File::open(exe)?, &mut file)?;
             // The build's own time orders builds of one version.
             file.set_modified(fs::metadata(exe)?.modified()?)?;
             file.sync_all()?;
-            if content_hash(&fs::read(&tmp)?) != hash {
+            if content_hash(File::open(&tmp)?)? != hash {
                 let _ = fs::remove_file(&tmp);
                 return Err(io::Error::new(
                     io::ErrorKind::InvalidData,
@@ -242,14 +241,29 @@ fn replace_symlink(target: &str, link: &Path) -> io::Result<()> {
 /// FNV-1a over 64-bit words with a rotate, so a multi-megabyte binary hashes
 /// in milliseconds even unoptimized. Detects corrupt copies and names builds;
 /// not a defence against an attacker, who could replace `runtime/` anyway.
-fn content_hash(bytes: &[u8]) -> u64 {
-    let (words, tail) = bytes.as_chunks::<8>();
-    let h = words.iter().fold(0xcbf2_9ce4_8422_2325_u64, |h, w| {
-        (h ^ u64::from_le_bytes(*w))
-            .wrapping_mul(0x0100_0000_01b3)
-            .rotate_left(29)
-    });
-    fnv1a(tail).wrapping_add(h) ^ bytes.len() as u64
+///
+/// Read in blocks: a buffer the size of the binary, once freed, stays in
+/// the RSS of a client that just staged it (8 MB of a 15 MB terminal
+/// client on macOS).
+fn content_hash(mut from: impl Read) -> io::Result<u64> {
+    /// A multiple of 8, so only the last block has a tail.
+    const BLOCK: usize = 64 * 1024;
+    let mut block = Vec::with_capacity(BLOCK);
+    let (mut h, mut len) = (0xcbf2_9ce4_8422_2325_u64, 0);
+    loop {
+        block.clear();
+        (&mut from).take(BLOCK as u64).read_to_end(&mut block)?;
+        len += block.len() as u64;
+        let (words, tail) = block.as_chunks::<8>();
+        h = words.iter().fold(h, |h, w| {
+            (h ^ u64::from_le_bytes(*w))
+                .wrapping_mul(0x0100_0000_01b3)
+                .rotate_left(29)
+        });
+        if block.len() < BLOCK {
+            return Ok(fnv1a(tail).wrapping_add(h) ^ len);
+        }
+    }
 }
 
 #[cfg(test)]
@@ -355,15 +369,37 @@ mod tests {
         fs::remove_dir_all(&dir).unwrap();
     }
 
+    fn hash(bytes: &[u8]) -> u64 {
+        content_hash(bytes).unwrap()
+    }
+
     #[test]
     fn content_hash_sees_every_byte() {
         let base = vec![7_u8; 1029];
-        let h = content_hash(&base);
+        let h = hash(&base);
         for i in [0, 7, 8, 1023, 1028] {
             let mut changed = base.clone();
             changed[i] ^= 0x80;
-            assert_ne!(content_hash(&changed), h, "byte {i}");
+            assert_ne!(hash(&changed), h, "byte {i}");
         }
-        assert_ne!(content_hash(&base[..1028]), h);
+        assert_ne!(hash(&base[..1028]), h);
+    }
+
+    /// Reading in blocks names a build as hashing it whole did.
+    #[test]
+    fn content_hash_is_the_same_across_blocks() {
+        let whole = |bytes: &[u8]| {
+            let (words, tail) = bytes.as_chunks::<8>();
+            let h = words.iter().fold(0xcbf2_9ce4_8422_2325_u64, |h, w| {
+                (h ^ u64::from_le_bytes(*w))
+                    .wrapping_mul(0x0100_0000_01b3)
+                    .rotate_left(29)
+            });
+            fnv1a(tail).wrapping_add(h) ^ bytes.len() as u64
+        };
+        let bytes: Vec<u8> = (0..200_003_u32).map(|n| (n * 31 % 251) as u8).collect();
+        for len in [0, 5, 65_536, 65_541, 131_072, 200_003] {
+            assert_eq!(hash(&bytes[..len]), whole(&bytes[..len]), "{len} bytes");
+        }
     }
 }

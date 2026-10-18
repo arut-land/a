@@ -32,8 +32,8 @@ pub enum Key {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Mouse {
     Press { x: u16, y: u16 },
-    WheelUp { x: u16, y: u16 },
-    WheelDown { x: u16, y: u16 },
+    WheelUp,
+    WheelDown,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -164,8 +164,8 @@ impl Parser {
             if let [b, x, y] = nums(rest)[..] {
                 let (x, y) = (x.saturating_sub(1), y.saturating_sub(1));
                 let mouse = match (b & !0b1_1100, last) {
-                    (64, b'M') => Some(Mouse::WheelUp { x, y }),
-                    (65, b'M') => Some(Mouse::WheelDown { x, y }),
+                    (64, b'M') => Some(Mouse::WheelUp),
+                    (65, b'M') => Some(Mouse::WheelDown),
                     (0, b'M') if b & 32 == 0 => Some(Mouse::Press { x, y }),
                     _ => None,
                 };
@@ -273,8 +273,8 @@ mod tests {
         assert_eq!(
             parse(b"\x1b[<64;10;5M\x1b[<65;1;1M\x1b[<0;3;4M\x1b[<0;3;4m"),
             [
-                Input::Mouse(Mouse::WheelUp { x: 9, y: 4 }),
-                Input::Mouse(Mouse::WheelDown { x: 0, y: 0 }),
+                Input::Mouse(Mouse::WheelUp),
+                Input::Mouse(Mouse::WheelDown),
                 Input::Mouse(Mouse::Press { x: 2, y: 3 }),
             ]
         );
@@ -290,10 +290,7 @@ mod tests {
         parser.feed(b"\xa5", &mut out);
         assert_eq!(
             out,
-            [
-                Input::Mouse(Mouse::WheelUp { x: 0, y: 0 }),
-                Input::Key(Key::Char('日'))
-            ]
+            [Input::Mouse(Mouse::WheelUp), Input::Key(Key::Char('日'))]
         );
         parser.feed(b"\x1b", &mut out);
         assert!(parser.pending());

@@ -37,8 +37,9 @@ input, overlays).
   session's own messages).
 - `/sessions` (a picker showing each session's activity and residency;
   also what `a resume` opens when this workspace has no session), `/new`,
-  `/env refresh`, `/interrupt`, `/detach`, `/help` (or F1). Any other `/name` goes to the daemon, which runs the session's
-  slash command or says there is none.
+  `/env refresh`, `/interrupt`, `/detach`, `/help` (or F1). Any other
+  `/name` goes to the daemon, which runs the session's slash command or
+  says there is none.
 - Ctrl-C while a model call, tool call or slash command runs sends
   `ClientMsg::Interrupt`, which stops it and the rest of its turn; otherwise it
   clears the input, or detaches when it is empty. Nothing the client does
@@ -75,8 +76,9 @@ daemon reader(s) ─Daemon─┘                           │
   what it shows, counted from the bottom or from the scroll anchor (an item
   and a row, which stays put as output arrives below). A 6000-item session
   costs about what a short one does to draw, resize or resume.
-- The terminal is restored on exit, on a panic (a hook), and when stdin
-  closes.
+- The terminal is restored on exit, on a panic (a hook), when stdin
+  closes, and on SIGTERM or SIGHUP (a handler in `sys::tty` restores it,
+  then lets the signal end the process).
 - The first frame is painted before the daemon is reached; connecting (and
   spawning the daemon) happens on the reader thread. An ssh endpoint
   connects first, since ssh may prompt on the terminal.
@@ -143,7 +145,11 @@ client adds the same 162 KiB.
 
 With the release build (`mise run budgets`): spawn to the end of the first
 frame 6.6–8.3 ms (median 7.3 ms) with no daemon running; no CPU over 3 s
-idle; about 6.8 MB RSS attached, 7.6 MB after 300 turns.
+idle; about 6.8 MB RSS attached (7.1 MB on the run that stages a new
+build, as in the budget test), 7.6 MB after 300 turns. Staging used to
+read the 3.8 MB binary whole, twice; macOS malloc kept both freed buffers
+resident, so that run sat at 15 MB until the hash and copy read it in
+blocks.
 
 ## Tests
 
@@ -154,8 +160,9 @@ idle; about 6.8 MB RSS attached, 7.6 MB after 300 turns.
 - `apps/cli/tests/tui.rs` runs `a` on a pseudo-terminal against an echo
   agent daemon in its own `A_HOME`, reads the screen through a small
   terminal model (`tests/common/pty.rs`), and checks a reply, an approval
-  answered by a click, the command's result, detaching, and an inline
-  `a resume` that prints the replay into the scrollback.
+  answered by a click, the command's result, detaching, an inline
+  `a resume` that prints the replay into the scrollback, and a SIGTERM
+  that leaves the terminal cooked.
 - `apps/cli/tests/budgets.rs` holds the first frame to 16 ms and an idle
   client to no CPU.
 
@@ -163,8 +170,7 @@ idle; about 6.8 MB RSS attached, 7.6 MB after 300 turns.
 
 - Grapheme clusters are drawn per character: an emoji ZWJ sequence or a
   combining mark may not line up with what the terminal draws.
-- SIGTERM or SIGKILL leave the terminal in raw mode (`reset` fixes it); a
-  closed terminal needs nothing restored.
+- SIGKILL leaves the terminal in raw mode (`reset` fixes it).
 - Ctrl-Z is not handled (raw mode receives it as a key).
 - The full screen reports the mouse, so selecting text takes the terminal's
   override (Shift-drag in most, Option-drag in iTerm2 and Terminal.app);

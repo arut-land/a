@@ -3,7 +3,7 @@
 //! never runs.
 
 use std::io;
-use std::os::fd::{AsFd, OwnedFd};
+use std::os::fd::{AsFd, BorrowedFd, OwnedFd};
 use std::sync::OnceLock;
 use std::time::Duration;
 
@@ -33,7 +33,39 @@ impl Mode {
     pub fn restore(&self) {
         let _ = termios::tcsetattr(io::stdin(), OptionalActions::Now, &self.0);
     }
+
+    /// Has a SIGTERM or SIGHUP write `off` to stdout and restore this mode
+    /// before the signal ends the process as it otherwise would. The first
+    /// mode a process registers is the one restored.
+    pub fn restore_on_signal(&self, off: &'static [u8]) -> io::Result<()> {
+        if ON_SIGNAL.set((self.0.clone(), off)).is_err() {
+            return Ok(());
+        }
+        for signal in [libc::SIGTERM, libc::SIGHUP] {
+            // SAFETY: the action only calls write(2), tcsetattr(3), signal(3)
+            // and raise(3), all async-signal-safe, on fds 0 and 1 and data
+            // set before it was registered; it never allocates, locks or
+            // panics. With the default action back, the raised signal (held
+            // until the handler returns) ends the process.
+            unsafe {
+                signal_hook_registry::register(signal, move || {
+                    if let Some((mode, off)) = ON_SIGNAL.get() {
+                        let (stdin, stdout) =
+                            (BorrowedFd::borrow_raw(0), BorrowedFd::borrow_raw(1));
+                        let _ = rustix::io::write(stdout, off);
+                        let _ = termios::tcsetattr(stdin, OptionalActions::Now, mode);
+                    }
+                    libc::signal(signal, libc::SIG_DFL);
+                    libc::raise(signal);
+                })?;
+            }
+        }
+        Ok(())
+    }
 }
+
+/// What [`Mode::restore_on_signal`] puts back.
+static ON_SIGNAL: OnceLock<(Termios, &'static [u8])> = OnceLock::new();
 
 /// The terminal's size as (columns, rows), from stdout.
 pub fn size() -> io::Result<(u16, u16)> {
