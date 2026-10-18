@@ -13,9 +13,7 @@ use std::sync::{Arc, Mutex, MutexGuard, PoisonError, mpsc};
 use std::thread;
 use std::time::{Duration, Instant};
 
-use protocol::{
-    ClientMsg, DaemonMsg, PROTO, SessionId, SessionSummary, Target, read_frame, write_frame,
-};
+use protocol::{ClientMsg, DaemonMsg, Frame, PROTO, SessionId, SessionSummary, Target, read_frame};
 use session::{Attachment, Session, Shared};
 use store::{Header, Jsonl, LogStore};
 use sys::Home;
@@ -356,18 +354,22 @@ fn claim(home: &Home) -> io::Result<File> {
 #[cfg(unix)]
 fn handle(daemon: &Daemon, life: &Lifecycle, conn: UnixStream) -> io::Result<()> {
     let mut reader = BufReader::new(conn.try_clone()?);
-    let (tx, rx) = mpsc::channel::<DaemonMsg>();
+    let (tx, rx) = mpsc::channel::<Frame>();
     let mut writer = conn;
     thread::spawn(move || {
-        for msg in rx {
-            if write_frame(&mut writer, &msg).is_err() {
+        for frame in rx {
+            if writer.write_all(frame.as_bytes()).is_err() {
                 break;
             }
         }
     });
     // The writer thread ends with the connection; a lost reply needs no
     // handling here.
-    let reply = |msg| drop(tx.send(msg));
+    let reply = |msg| {
+        if let Ok(frame) = Frame::new(&msg) {
+            drop(tx.send(frame));
+        }
+    };
     let error = |message: String| reply(DaemonMsg::Error { message });
 
     let verdict = match read_frame(&mut reader)? {

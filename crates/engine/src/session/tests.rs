@@ -659,7 +659,14 @@ fn an_ask_waits_in_the_inbox_through_a_stop_and_runs_once_approved() {
     let log = finished(&resumed, 3);
     resumed.stop();
 
-    let sent: Vec<DaemonMsg> = rx.try_iter().collect();
+    let sent: Vec<DaemonMsg> = rx
+        .try_iter()
+        .map(|frame: Frame| {
+            protocol::read_frame(&mut frame.as_bytes())
+                .unwrap()
+                .unwrap()
+        })
+        .collect();
     assert!(
         matches!(&sent[..], [
             DaemonMsg::Attached { .. },

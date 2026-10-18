@@ -7,7 +7,7 @@ use std::sync::mpsc::Sender;
 use std::sync::{Mutex, OnceLock};
 use std::time::Instant;
 
-use protocol::{DaemonMsg, PROTO};
+use protocol::{DaemonMsg, Frame, PROTO};
 use sys::Runtime;
 
 use crate::lock;
@@ -44,7 +44,7 @@ pub struct Lifecycle {
     /// When the drain began.
     draining: OnceLock<Instant>,
     /// Every open connection's outbox, told when a drain begins.
-    conns: Mutex<Vec<(u64, Sender<DaemonMsg>)>>,
+    conns: Mutex<Vec<(u64, Sender<Frame>)>>,
     next: AtomicU64,
 }
 
@@ -78,14 +78,16 @@ impl Lifecycle {
     pub fn drain(&self) {
         if self.draining.set(Instant::now()).is_ok() {
             eprintln!("a newer build is staged; draining");
-            for (_, tx) in &*lock(&self.conns) {
-                let _ = tx.send(DaemonMsg::Draining);
+            if let Ok(draining) = Frame::new(&DaemonMsg::Draining) {
+                for (_, tx) in &*lock(&self.conns) {
+                    let _ = tx.send(draining.clone());
+                }
             }
         }
     }
 
     /// Registers a connection's outbox until the guard drops.
-    pub fn register(&self, tx: Sender<DaemonMsg>) -> Registered<'_> {
+    pub fn register(&self, tx: Sender<Frame>) -> Registered<'_> {
         let id = self.next.fetch_add(1, Ordering::Relaxed);
         lock(&self.conns).push((id, tx));
         Registered { life: self, id }

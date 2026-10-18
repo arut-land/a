@@ -13,7 +13,8 @@ use std::time::{Duration, Instant};
 
 use agent::{Action, Agent, Cx, Decided, DynTool, Gate, Input, Replay};
 use protocol::{
-    Body, DaemonMsg, Decision, Entry, Environment, Installed, Outcome, SessionId, SessionSummary,
+    Body, DaemonMsg, Decision, Entry, Environment, Frame, Installed, Outcome, SessionId,
+    SessionSummary,
 };
 use serde_json::Value;
 use store::{Header, Loaded, Log, LogStore, Parent};
@@ -82,7 +83,7 @@ enum Msg {
 
 struct State {
     entries: Vec<Entry>,
-    clients: Vec<Sender<DaemonMsg>>,
+    clients: Vec<Sender<Frame>>,
 }
 
 /// Entries recorded and not yet committed. While `draining`, one blocking
@@ -234,23 +235,28 @@ impl Session {
         let _ = self.mailbox.send(Msg::Stop);
     }
 
-    pub fn attach(&self, client: &Sender<DaemonMsg>, since: u64) {
+    pub fn attach(&self, client: &Sender<Frame>, since: u64) {
+        let send = |frame: io::Result<Frame>| {
+            if let Ok(frame) = frame {
+                let _ = client.send(frame);
+            }
+        };
         let mut st = self.lock();
-        let _ = client.send(DaemonMsg::Attached {
+        send(Frame::new(&DaemonMsg::Attached {
             session: self.id,
             workspace: self.workspace.clone(),
-        });
+        }));
         for e in st.entries.iter().filter(|e| e.seq > since) {
-            let _ = client.send(DaemonMsg::Entry(e.clone()));
+            send(Frame::entry(e));
         }
         let seq = st.entries.last().map_or(0, |e| e.seq);
-        let _ = client.send(DaemonMsg::Synced { seq });
+        send(Frame::new(&DaemonMsg::Synced { seq }));
         if let Some(recap) = recap(&st.entries, since) {
-            let _ = client.send(DaemonMsg::Recap(recap));
+            send(Frame::new(&DaemonMsg::Recap(recap)));
         }
         for call in inbox(&st.entries) {
             if let Some(msg) = ask(&st.entries, call) {
-                let _ = client.send(msg);
+                send(Frame::new(&msg));
             }
         }
         st.clients.push(client.clone());
@@ -390,8 +396,12 @@ impl Session {
         let hooks = self.shared.registry.hooks();
         for entry in batch.drain(..) {
             debug_assert_eq!(entry.seq, st.entries.len() as u64 + 1);
-            st.clients
-                .retain(|c| c.send(DaemonMsg::Entry(entry.clone())).is_ok());
+            // An entry too large for a frame ends every client's view
+            // rather than leaving a gap in it.
+            match Frame::entry(&entry) {
+                Ok(frame) => st.clients.retain(|c| c.send(frame.clone()).is_ok()),
+                Err(_) => st.clients.clear(),
+            }
             hooks.observe(&entry);
             let asked = match entry.body {
                 Body::Ask { call } => Some(call),
@@ -400,8 +410,9 @@ impl Session {
             st.entries.push(entry);
             // Under the same lock as the entry, so a client attaching
             // meanwhile gets the ask exactly once.
-            if let Some(msg) = asked.and_then(|call| ask(&st.entries, call)) {
-                st.clients.retain(|c| c.send(msg.clone()).is_ok());
+            let msg = asked.and_then(|call| ask(&st.entries, call));
+            if let Some(Ok(frame)) = msg.as_ref().map(Frame::new) {
+                st.clients.retain(|c| c.send(frame.clone()).is_ok());
             }
         }
         Ok(())
@@ -445,14 +456,19 @@ impl Session {
 
     /// Sends a message that is not part of the log to every attached client.
     fn broadcast(&self, msg: &DaemonMsg) {
-        self.lock().clients.retain(|c| c.send(msg.clone()).is_ok());
+        if let Ok(frame) = Frame::new(msg) {
+            self.lock()
+                .clients
+                .retain(|c| c.send(frame.clone()).is_ok());
+        }
     }
 
     /// An agent may step past entries that then fail to commit; after a
-    /// failed unit of work it is rebuilt from the log.
+    /// failed unit of work it is rebuilt from the log. Each unit's future is
+    /// boxed, so an idle session's actor holds only what waiting takes.
     async fn run(&self, mailbox: &rt::channel::Receiver<Msg>) {
         let mut agent = self.shared.agent.agent();
-        let mut ok = self.work(self.recover(agent.as_mut())).await;
+        let mut ok = Box::pin(self.work(self.recover(agent.as_mut()))).await;
         loop {
             if !ok {
                 agent = self.shared.agent.agent();
@@ -460,15 +476,15 @@ impl Session {
             }
             ok = match mailbox.recv().await {
                 Some(Msg::Input(text)) => {
-                    self.work(async {
+                    Box::pin(self.work(async {
                         self.record(Body::User { text: text.clone() });
                         let inputs = VecDeque::from([Input::User { text }]);
                         self.drive(agent.as_mut(), VecDeque::new(), inputs).await
-                    })
+                    }))
                     .await
                 }
                 Some(Msg::Settled { child, outcome }) => {
-                    self.fire(agent.as_mut(), child, outcome).await
+                    Box::pin(self.fire(agent.as_mut(), child, outcome)).await
                 }
                 Some(Msg::Stop) | None => return,
             };
