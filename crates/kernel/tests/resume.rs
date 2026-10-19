@@ -1,0 +1,344 @@
+//! Recovery: every phase a crash can leave a call in, picked up by the one
+//! recovery path, [`kernel::Core::resume`].
+
+mod common;
+
+use common::*;
+use kernel::{Effect, Load, MAX_ATTEMPTS, Owner};
+use protocol::{Body, Decision, Json, Outcome, Permission, Verdict};
+use serde_json::json;
+
+/// A session the daemon was running when it stopped.
+const BUSY_LOAD: Load<'static> = Load {
+    boot: Some("boot-1"),
+    fresh: true,
+    owner: Owner::None,
+    busy: true,
+};
+
+fn resume(reg: Reg, bodies: impl IntoIterator<Item = Body>, load: &Load<'_>) -> (Session, Vec<Effect>) {
+    let (s, fx) = Session::resume(reg.arc(), log(bodies), load);
+    (s, fx.into_vec())
+}
+
+fn progress(call: u64, text: &str) -> Body {
+    Body::Progress {
+        call,
+        text: text.into(),
+    }
+}
+
+/// A safe call whose gate a crash cut off is gated and run again; an
+/// interrupt before it runs stops it.
+#[test]
+fn a_safe_call_cut_off_runs_again_and_an_interrupt_before_it_stops_it() {
+    let (mut s, fx) = resume(Reg::echo(), [input("sleep 1"), sleep_call(1)], &Load::default());
+    assert_eq!(fx, [BUSY, run_tool(2, "sleep", json!({ "seconds": 1 }))]);
+    s.table(vec![
+        (interrupt(), vec![cancel(2)]),
+        (
+            tool_done(2, INTERRUPTED),
+            vec![append(3, tool_result(2, INTERRUPTED)), append(4, Body::INTERRUPT), IDLE],
+        ),
+    ]);
+}
+
+#[test]
+fn an_unsafe_call_cut_off_reports_the_output_it_committed() {
+    let bodies = [input("$ make"), bash("make"), progress(2, "one\n"), progress(2, "two\n")];
+    let (_, fx) = resume(Reg::echo(), bodies, &BUSY_LOAD);
+    let cut = Outcome::Interrupted {
+        output: Some("one\ntwo\n".into()),
+    };
+    assert_eq!(fx, [append(5, tool_result(2, cut)), IDLE]);
+}
+
+/// An unsafe call gated before the crash may have started: it is not run
+/// twice.
+#[test]
+fn an_unsafe_call_gated_before_a_crash_is_never_run_twice() {
+    let (_, fx) = resume(Reg::echo(), [input("$ rm"), bash("rm")], &BUSY_LOAD);
+    assert_eq!(fx, [append(3, tool_result(2, INTERRUPTED)), IDLE]);
+}
+
+/// The gate asked again decides as it did: what it logged before the
+/// crash is not logged again.
+#[test]
+fn a_gate_cut_off_by_a_crash_logs_its_decisions_once() {
+    let rewritten = Json::new(&json!({ "rewritten": true }));
+    let pre = decision("policy", Some(2), Verdict::PreTool { input: rewritten });
+    let reg = Reg::echo().policy(Policy::RewriteThenDeny);
+    let (_, fx) = resume(reg, [input("$ echo hi"), bash("echo hi"), pre], &BUSY_LOAD);
+    assert_eq!(
+        fx,
+        [
+            append(4, permission(2, Permission::Deny)),
+            append(5, tool_result(2, failed("policy denied this call"))),
+            IDLE,
+        ]
+    );
+}
+
+/// A wait is in the log, not in memory: it outlives the daemon.
+#[test]
+fn a_wait_survives_a_restart_and_runs_once_answered() {
+    let reg = Reg::echo().policy(Policy::Ask(&["bash"]));
+    let bodies = [input("$ echo"), bash("echo"), permission(2, Permission::Ask)];
+    let (mut s, fx) = resume(reg, bodies, &BUSY_LOAD);
+    assert_eq!(fx, [IDLE], "waiting is not work");
+    let answered = Body::Answer {
+        call: id(2),
+        value: true.into(),
+        origin: None,
+    };
+    s.table(vec![(
+        approve(2, true),
+        vec![BUSY, append(4, answered), run_bash(2, "echo")],
+    )]);
+}
+
+/// The same, from a log an earlier build wrote: the gate's decision before
+/// the call, and an `ask`.
+#[test]
+fn an_old_logs_ask_waits_as_a_new_one_does() {
+    let hook = Body::Hook {
+        hook: "policy".into(),
+        decision: Decision::Permission {
+            tool: "bash".into(),
+            permission: Permission::Ask,
+        },
+    };
+    let old = [Body::User { text: "$ echo".into() }, hook, bash("echo"), Body::Ask { call: 3 }];
+    let reg = Reg::echo().policy(Policy::Ask(&["bash"]));
+    let (mut s, fx) = resume(reg, old, &Load::default());
+    assert_eq!(fx, []);
+    assert_eq!(s.core.ledger().inbox(), [3]);
+    let answered = Body::Answer {
+        call: id(3),
+        value: true.into(),
+        origin: None,
+    };
+    s.table(vec![(
+        approve(3, true),
+        vec![BUSY, append(5, answered), run_bash(3, "echo")],
+    )]);
+}
+
+/// A model call a restart cut off is a retry of its own, so restarts count
+/// as attempts.
+#[test]
+fn a_model_call_cut_off_is_sent_again_as_a_retry() {
+    let (_, fx) = resume(Reg::chat(), [input("hi"), model_call(0)], &BUSY_LOAD);
+    let retry = Verdict::Retry {
+        attempt: 1,
+        error: "the daemon stopped during the call".into(),
+    };
+    assert_eq!(
+        fx,
+        [
+            append(3, decision("kernel", Some(2), retry)),
+            append(4, model_result(2, INTERRUPTED)),
+            append(5, model_call(1)),
+            call_model(5, 1),
+        ]
+    );
+}
+
+/// Restarts count as attempts: a session that crashes during every model
+/// call settles it failed at the cap.
+#[test]
+fn a_crash_loop_cannot_retry_forever() {
+    let mut log = log([input("hi"), model_call(0)]);
+    for _ in 1..MAX_ATTEMPTS {
+        let (s, fx) = Session::resume(Reg::chat().arc(), log, &BUSY_LOAD);
+        assert!(matches!(fx.last(), Some(Effect::CallModel { .. })), "{fx:?}");
+        log = s.log;
+    }
+    let (_, fx) = Session::resume(Reg::chat().arc(), log.clone(), &BUSY_LOAD);
+    let gave_up = failed(&format!("gave up after {MAX_ATTEMPTS} attempts"));
+    let call = log.len() as u64;
+    assert_eq!(fx.as_slice(), [append(call + 1, model_result(call, gave_up)), IDLE]);
+}
+
+/// A retry that was to be sent after its backoff is sent on resume.
+#[test]
+fn a_retry_in_backoff_is_sent_on_resume() {
+    let retry = Verdict::Retry {
+        attempt: 1,
+        error: "slow down".into(),
+    };
+    let bodies = [
+        input("hi"),
+        model_call(0),
+        decision("retry", Some(2), retry),
+        model_result(2, failed("slow down")),
+    ];
+    let (_, fx) = resume(Reg::chat(), bodies, &BUSY_LOAD);
+    assert_eq!(fx, [append(5, model_call(1)), call_model(5, 1)]);
+}
+
+/// What the agent asked for that the log does not show is carried out.
+#[test]
+fn what_the_agent_asked_for_and_the_log_does_not_show_is_carried_out() {
+    let (_, fx) = resume(Reg::echo(), [input("hi")], &Load::default());
+    assert_eq!(fx, [append(2, said("hi"))]);
+}
+
+/// Input still queued is taken up once, in order, before input that
+/// arrives after the load.
+#[test]
+fn input_queued_before_a_restart_runs_once_in_order() {
+    let bodies = [input("one"), said("one"), queued("left")];
+    let (mut s, fx) = resume(Reg::echo(), bodies, &BUSY_LOAD);
+    assert_eq!(fx, [append(4, take(3)), append(5, said("left")), IDLE]);
+    s.table(vec![(user("two"), vec![append(6, input("two")), append(7, said("two"))])]);
+}
+
+#[test]
+fn an_orphan_does_not_resume_what_it_was_doing() {
+    let load = Load {
+        owner: Owner::Gone,
+        ..BUSY_LOAD
+    };
+    let (_, fx) = resume(Reg::echo(), [input("sleep 1"), sleep_call(1)], &load);
+    assert_eq!(
+        fx,
+        [append(3, tool_result(2, INTERRUPTED)), append(4, Body::INTERRUPT), IDLE]
+    );
+}
+
+/// Process groups are killed only in the boot they ran in: elsewhere their
+/// ids are someone else's. Background ones are left over only on the first
+/// load since the daemon started.
+#[test]
+fn leftover_processes_of_this_boot_are_killed() {
+    let process = |pgid, boot: &str, background| Body::ToolProcess {
+        call: 2,
+        pgid,
+        boot: boot.into(),
+        background,
+    };
+    let bodies = || {
+        [
+            input("$ make"),
+            bash("make"),
+            process(7, "boot-1", false),
+            process(8, "boot-1", true),
+            process(9, "boot-0", false),
+        ]
+    };
+    let (_, fx) = resume(Reg::echo(), bodies(), &BUSY_LOAD);
+    assert_eq!(
+        fx,
+        [
+            Effect::Kill { pgid: 7 },
+            Effect::Kill { pgid: 8 },
+            append(6, tool_result(2, INTERRUPTED)),
+            IDLE,
+        ]
+    );
+    // A background group outlives its call, until the session ends.
+    let ended = [
+        input("$ serve &"),
+        bash("serve &"),
+        process(8, "boot-1", true),
+        tool_result(2, done(json!(0))),
+    ];
+    let (_, fx) = resume(Reg::echo(), ended.clone(), &BUSY_LOAD);
+    assert_eq!(fx, [Effect::Kill { pgid: 8 }, IDLE]);
+    let again = Load {
+        fresh: false,
+        ..BUSY_LOAD
+    };
+    let (_, fx) = resume(Reg::echo(), ended, &again);
+    assert_eq!(fx, [IDLE]);
+}
+
+/// Links are re-armed: a link not yet watched is watched, and each child
+/// still watched is started again, to run to its end and report.
+#[test]
+fn links_are_rearmed() {
+    let link = || Body::Link {
+        child: child(),
+        input: "go".into(),
+    };
+    let start = || Effect::StartChild {
+        link: seq(1),
+        child: child(),
+        input: "go".into(),
+    };
+    let (_, fx) = resume(Reg::echo(), [link()], &Load::default());
+    assert_eq!(fx, [BUSY, append(2, Body::Watch { child: child() }), start()]);
+    let watch = Body::Watch { child: child() };
+    let (_, fx) = resume(Reg::echo(), [link(), watch.clone()], &Load::default());
+    assert_eq!(fx, [BUSY, start()]);
+    let fired = Body::Fired {
+        watch: 2,
+        outcome: done(json!("ok")),
+    };
+    let (_, fx) = resume(Reg::echo(), [link(), watch, fired], &Load::default());
+    // The agent is yet to say the child's result; the child is not started.
+    assert_eq!(fx, [append(4, said("child: \"ok\""))], "a watch fires once");
+}
+
+/// A call waiting on a child whose result came in before the crash goes on
+/// with it.
+#[test]
+fn a_call_whose_child_settled_before_a_crash_resumes_with_its_result() {
+    let task = json!({ "input": "go" });
+    let ok = done(json!("ok"));
+    let bodies = [
+        input("task go"),
+        tool_call("task", task.clone()),
+        Body::Link {
+            child: child(),
+            input: "go".into(),
+        },
+        Body::Watch { child: child() },
+        wait_child(2, 3),
+        Body::Fired {
+            watch: 4,
+            outcome: ok.clone(),
+        },
+    ];
+    let (_, fx) = resume(Reg::echo(), bodies, &BUSY_LOAD);
+    assert_eq!(
+        fx,
+        [Effect::Resume {
+            call: id(2),
+            tool: "task".into(),
+            input: Json::new(&task),
+            value: Json::new(&json!({ "status": "done", "output": "ok" })),
+        }]
+    );
+}
+
+#[test]
+fn a_command_cut_off_is_not_run_again() {
+    let command = Body::ToolCall {
+        tool: "jobs".into(),
+        input: Json::new(&json!({ "args": "" })),
+        id: None,
+        card: None,
+        by: protocol::Audience::User,
+    };
+    let (_, fx) = resume(Reg::echo(), [input("/jobs"), command], &BUSY_LOAD);
+    assert_eq!(fx, [append(3, tool_result(2, INTERRUPTED)), IDLE]);
+}
+
+/// A failed commit is a resume from what committed: the intent that did
+/// commit is carried on, none is made twice.
+#[test]
+fn a_failed_commit_is_resume() {
+    let mut s = Session::new(Reg::echo().arc());
+    s.step(user("sleep 1"));
+    let committed = s.log.clone();
+    // The result's commit fails: the driver resumes from what committed.
+    s.step(tool_done(2, done(json!({ "slept": 1 }))));
+    let (mut s, fx) = Session::resume(Reg::echo().arc(), committed, &BUSY_LOAD);
+    assert_eq!(fx.as_slice(), [run_tool(2, "sleep", json!({ "seconds": 1 }))]);
+    s.step(tool_done(2, done(json!({ "slept": 1 }))));
+    let calls = s.bodies().into_iter().filter(|b| matches!(b, Body::ToolCall { .. })).count();
+    assert_eq!(calls, 1, "{:#?}", s.log);
+    assert_eq!(*s.core.turn(), kernel::Turn::Idle);
+}

@@ -1,0 +1,1052 @@
+//! The turn and call state machine: one [`Core`] per session.
+
+use std::collections::VecDeque;
+use std::mem;
+use std::sync::Arc;
+
+use protocol::ledger::{Call, Ledger, OutcomeKind, Phase};
+use protocol::{
+    Audience, Author, Body, CallId, Entry, Json, Mode, Outcome, Seq, SessionId, Verdict, WaitOn,
+};
+use serde_json::json;
+use smallvec::SmallVec;
+
+use crate::fold::{Fold, Next};
+use crate::{
+    Action, Answer, Chained, Effect, Effects, Event, Gate, Gated, Load, ModelPhase, Note, Owner,
+    Recover, Registry, Replay, Replied, Step, Ticket, Turn,
+};
+
+/// The most times one model call is sent, retries and restarts alike: past
+/// it the call fails, so a crash loop cannot retry forever.
+pub const MAX_ATTEMPTS: u16 = 10;
+
+/// Who logs what the kernel decides itself: a restart's retry.
+const KERNEL: &str = "kernel";
+
+/// Who refused a call the agent would not run.
+const AGENT: &str = "agent";
+
+/// A session's kernel: its log folded, its turn, and the registry
+/// generation its steps run on.
+pub struct Core {
+    registry: Arc<dyn Registry>,
+    /// The generation to take up at the next step boundary.
+    next: Option<Arc<dyn Registry>>,
+    fold: Fold,
+    turn: Turn,
+    /// Whether the session is a child, which reports as it settles.
+    child: bool,
+    /// What the busy mark says.
+    busy: bool,
+    /// The last entry when the session last reported.
+    reported: u64,
+    /// Results of children no call waits on, held until the turn running
+    /// ends: each starts a turn of its own.
+    deferred: VecDeque<(SessionId, Outcome)>,
+}
+
+impl Core {
+    /// The session `log` records, picked up where it leaves off: the one
+    /// way a session recovers, from a load, a failed commit (the driver
+    /// cancels what it has in flight and passes what committed), a
+    /// registry reload or a panic.
+    ///
+    /// Links are re-armed; process groups left over in this boot are
+    /// killed; a command cut off is interrupted; each open call goes on as
+    /// its phase says (a gate is asked again, a wait stays, a safe call
+    /// runs again, an unsafe one is interrupted with the output it logged,
+    /// a model call is retried while attempts last); then what the agent
+    /// asked for that the log does not show is carried out, and queued
+    /// input taken up.
+    pub fn resume<'e>(
+        registry: Arc<dyn Registry>,
+        log: impl IntoIterator<Item = &'e Entry>,
+        load: &Load<'_>,
+    ) -> (Self, Effects) {
+        let mut fold = Fold::new(registry.agent());
+        for e in log {
+            fold.apply(e, &*registry);
+        }
+        // What the log shows the agent stepped through is done.
+        fold.stepped = false;
+        let mut core = Self {
+            registry,
+            next: None,
+            fold,
+            turn: Turn::Idle,
+            child: load.owner == Owner::Present,
+            busy: load.busy,
+            reported: 0,
+            deferred: VecDeque::new(),
+        };
+        let mut fx = Effects::new();
+        core.recover(load, &mut fx);
+        core.finish(&mut fx);
+        (core, fx)
+    }
+
+    /// What follows `event`.
+    pub fn step(&mut self, event: Event) -> Effects {
+        let mut fx = Effects::new();
+        match event {
+            Event::Input {
+                text,
+                mode,
+                origin,
+                ticket,
+            } => self.input(text, mode, origin, ticket, &mut fx),
+            Event::Interrupt { origin, ticket } => {
+                if !self.resent(origin) {
+                    self.interrupt(origin, &mut fx);
+                }
+                reply(&mut fx, ticket, Ok(()));
+            }
+            Event::Answer {
+                call,
+                value,
+                origin,
+                ticket,
+            } => {
+                let result = if self.resent(origin) {
+                    Ok(())
+                } else {
+                    self.answer(call, value, origin, &mut fx)
+                };
+                reply(&mut fx, ticket, result);
+            }
+            Event::ModelDone { call, replied } => self.model_done(call, replied, &mut fx),
+            Event::ToolDone { call, outcome } => self.tool_done(call, outcome, &mut fx),
+            Event::Note { call, note } => self.note(call, note, &mut fx),
+            Event::Waits { call, on } => self.waits(call, on, &mut fx),
+            Event::Spawn {
+                call,
+                child,
+                input,
+                wait,
+            } => self.spawn(call, child, input, wait, &mut fx),
+            Event::Gated { call, gated } => {
+                if let Some(Step::Awaiting { skip, resumed }) = self.step_of(call) {
+                    self.gated(call, gated, skip, resumed, &mut fx);
+                }
+            }
+            Event::Woke { call } => {
+                if let Turn::Model {
+                    call: failed,
+                    attempt,
+                    phase: ModelPhase::Backoff,
+                } = self.turn
+                    && failed == call
+                {
+                    self.send(attempt + 1, &mut fx);
+                }
+            }
+            Event::ChildSettled { child, outcome } => self.child_settled(child, outcome, &mut fx),
+            Event::Registry(registry) => self.next = Some(registry),
+        }
+        self.finish(&mut fx);
+        fx
+    }
+
+    pub const fn turn(&self) -> &Turn {
+        &self.turn
+    }
+
+    /// What the log says now, through the last entry appended.
+    pub const fn ledger(&self) -> &Ledger {
+        &self.fold.ledger
+    }
+
+    fn finish(&mut self, fx: &mut Effects) {
+        self.advance(fx);
+        self.marks(fx);
+    }
+
+    // ── events ────────────────────────────────────────────────────────
+
+    fn input(
+        &mut self,
+        text: String,
+        mode: Mode,
+        origin: Option<Author>,
+        ticket: Option<Ticket>,
+        fx: &mut Effects,
+    ) {
+        if self.resent(origin) {
+            return reply(fx, ticket, Ok(()));
+        }
+        let Chained {
+            value: text,
+            decisions,
+        } = match self.registry.input(text) {
+            Ok(chained) => chained,
+            Err(why) => return reply(fx, ticket, Err(why)),
+        };
+        for (by, d) in decisions {
+            self.decide(None, &by, d, fx);
+        }
+        // Nothing runs or waits, so nothing comes between: it starts now.
+        let taken = self.turn == Turn::Idle
+            && self.fold.asked.is_empty()
+            && self.fold.ledger.untaken().is_empty();
+        self.append(
+            fx,
+            Body::Input {
+                text,
+                mode,
+                taken,
+                origin,
+            },
+        );
+        reply(fx, ticket, Ok(()));
+    }
+
+    /// Stops the turn running: its model call or the calls it waits on.
+    /// An interrupt with no turn running stops nothing, and starts nothing
+    /// in any state: what waits settles at once, what runs is cancelled and
+    /// settles as it reports.
+    fn interrupt(&mut self, origin: Option<Author>, fx: &mut Effects) {
+        let open = match mem::take(&mut self.turn) {
+            Turn::Idle => return,
+            stopping @ Turn::Stopping { .. } => {
+                self.turn = stopping;
+                return;
+            }
+            Turn::Model { call, phase, .. } => {
+                fx.push(Effect::Cancel { call });
+                match phase {
+                    ModelPhase::Streaming => SmallVec::from_elem(call, 1),
+                    // Its failed attempt is logged already.
+                    ModelPhase::Backoff => SmallVec::new(),
+                }
+            }
+            Turn::Acting { open } => {
+                let mut left = SmallVec::new();
+                for (call, step) in open {
+                    match (step, self.child_of(call)) {
+                        (Step::Running, _) => {
+                            fx.push(Effect::Cancel { call });
+                            left.push(call);
+                        }
+                        (Step::Awaiting { .. }, _) => {
+                            fx.push(Effect::Cancel { call });
+                            self.settle(call, self.interrupted(call), fx);
+                        }
+                        // Its child stops first, and reports.
+                        (Step::Waiting, Some(child)) => {
+                            fx.push(Effect::Interrupt { child });
+                            left.push(call);
+                        }
+                        (Step::Waiting, None) => self.settle(call, self.interrupted(call), fx),
+                    }
+                }
+                left
+            }
+        };
+        self.turn = Turn::Stopping { open, origin };
+    }
+
+    /// The first answer to what call `call` waits on wins.
+    fn answer(
+        &mut self,
+        call: CallId,
+        value: Json,
+        origin: Option<Author>,
+        fx: &mut Effects,
+    ) -> Result<(), String> {
+        let on = match self.fold.ledger.call(call.get()).map(|open| &open.phase) {
+            Some(Phase::Waiting(on)) if !matches!(on, WaitOn::Child { .. }) => on.clone(),
+            _ => return Err(format!("call {call} is not waiting for an answer")),
+        };
+        self.append(
+            fx,
+            Body::Answer {
+                call,
+                value: value.clone(),
+                origin,
+            },
+        );
+        match on {
+            WaitOn::Approval if value.parse::<bool>().unwrap_or(false) => self.run(call, fx),
+            WaitOn::Approval => {
+                self.close(call);
+                let error = "the user did not approve this call".to_owned();
+                self.settle(call, Outcome::Failed { error }, fx);
+            }
+            _ => self.resume_call(call, value, fx),
+        }
+        Ok(())
+    }
+
+    fn model_done(&mut self, call: CallId, replied: Replied, fx: &mut Effects) {
+        match &self.turn {
+            &Turn::Model {
+                call: sent,
+                attempt,
+                phase: ModelPhase::Streaming,
+            } if sent == call => {
+                let outcome = match replied {
+                    Replied::Failed(error) => {
+                        if self.retry(call, attempt, &error, fx) {
+                            return;
+                        }
+                        Outcome::Failed {
+                            error: error.to_string(),
+                        }
+                    }
+                    replied => outcome(replied),
+                };
+                self.turn = Turn::Acting {
+                    open: SmallVec::new(),
+                };
+                self.settle(call, outcome, fx);
+            }
+            Turn::Stopping { open, .. } if open.contains(&call) => {
+                self.close(call);
+                self.settle(call, outcome(replied), fx);
+            }
+            _ => {}
+        }
+    }
+
+    /// Whether the `request_error` point has failed model call `call` sent
+    /// again; if so, it is logged as failed, and sent once the backoff the
+    /// point asks for is over.
+    fn retry(&mut self, call: CallId, attempt: u16, error: &llm::Error, fx: &mut Effects) -> bool {
+        let next = attempt + 1;
+        let retry = (next < MAX_ATTEMPTS)
+            .then(|| self.registry.request_error(call, next, error))
+            .flatten();
+        let Some((by, Recover::Retry { after })) = retry else {
+            return false;
+        };
+        let error = error.to_string();
+        let d = Verdict::Retry {
+            attempt: next,
+            error: error.clone(),
+        };
+        self.decide(Some(call), &by, d, fx);
+        self.settle(call, Outcome::Failed { error }, fx);
+        fx.push(Effect::Sleep { call, after });
+        self.turn = Turn::Model {
+            call,
+            attempt,
+            phase: ModelPhase::Backoff,
+        };
+        true
+    }
+
+    fn tool_done(&mut self, call: CallId, outcome: Outcome, fx: &mut Effects) {
+        if self.step_of(call) != Some(Step::Running) {
+            return;
+        }
+        let Some((tool, input)) = self.tool_of(call) else {
+            return;
+        };
+        let Chained {
+            value: outcome,
+            decisions,
+        } = self.registry.post_tool(call, &tool, &input, outcome);
+        for (by, d) in decisions {
+            self.decide(Some(call), &by, d, fx);
+        }
+        let card = match &outcome {
+            Outcome::Done { output } => self.registry.result_card(&tool, &input, output),
+            _ => None,
+        };
+        self.close(call);
+        self.append(
+            fx,
+            Body::ToolResult {
+                call: call.get(),
+                outcome,
+                card,
+            },
+        );
+    }
+
+    /// Logs what a running call reports; a call not running reports
+    /// nothing more.
+    fn note(&mut self, call: CallId, note: Note, fx: &mut Effects) {
+        if self.step_of(call) != Some(Step::Running) {
+            return;
+        }
+        let body = match note {
+            Note::Process {
+                pgid,
+                boot,
+                background,
+            } => Body::ToolProcess {
+                call: call.get(),
+                pgid,
+                boot,
+                background,
+            },
+            Note::Progress(text) => Body::Progress {
+                call: call.get(),
+                text,
+            },
+            Note::State { ext, state, data } => Body::Ext { ext, state, data },
+        };
+        self.append(fx, body);
+    }
+
+    fn waits(&mut self, call: CallId, on: WaitOn, fx: &mut Effects) {
+        let acting = matches!(self.turn, Turn::Acting { .. });
+        if !acting
+            || self.step_of(call) != Some(Step::Running)
+            || !matches!(on, WaitOn::Dialog { .. } | WaitOn::Client { .. })
+        {
+            return;
+        }
+        self.append(fx, Body::Wait { call, on });
+        self.set_step(call, Step::Waiting);
+    }
+
+    /// Links child `child` to call `call` and watches it: the link commits
+    /// before the child starts, so a crash before it, or before the watch,
+    /// leaves the rest to [`Core::resume`].
+    fn spawn(
+        &mut self,
+        call: CallId,
+        child: SessionId,
+        input: String,
+        wait: bool,
+        fx: &mut Effects,
+    ) {
+        let acting = matches!(self.turn, Turn::Acting { .. });
+        if !acting || self.step_of(call) != Some(Step::Running) {
+            return;
+        }
+        let link = self.append(
+            fx,
+            Body::Link {
+                child,
+                input: input.clone(),
+            },
+        );
+        self.append(fx, Body::Watch { child });
+        fx.push(Effect::StartChild {
+            link: link.0,
+            child,
+            input,
+        });
+        if wait {
+            self.append(
+                fx,
+                Body::Wait {
+                    call,
+                    on: WaitOn::Child { link: link.0 },
+                },
+            );
+            self.set_step(call, Step::Waiting);
+        }
+    }
+
+    /// Fires the watches on `child`. A call waiting on it goes on with its
+    /// result; otherwise the result is the agent's, between turns.
+    fn child_settled(&mut self, child: SessionId, outcome: Outcome, fx: &mut Effects) {
+        let Some(call) = self.fold.owner(child) else {
+            if self.turn == Turn::Idle {
+                self.fire(child, &outcome, fx);
+            } else if self.fold.ledger.armed().any(|(_, c)| c == child) {
+                self.deferred.push_back((child, outcome));
+            }
+            return;
+        };
+        if !self.fire(child, &outcome, fx) {
+            return;
+        }
+        match (&self.turn, self.step_of(call)) {
+            (Turn::Stopping { .. }, Some(_)) => {
+                self.close(call);
+                self.settle(call, self.interrupted(call), fx);
+            }
+            (_, Some(Step::Waiting)) => self.resume_call(call, to_json(&outcome), fx),
+            _ => {}
+        }
+    }
+
+    /// Logs each armed watch on `child` fired; whether any was.
+    fn fire(&mut self, child: SessionId, outcome: &Outcome, fx: &mut Effects) -> bool {
+        let watches: SmallVec<[u64; 1]> = (self.fold.ledger.armed())
+            .filter_map(|(watch, watched)| (watched == child).then_some(watch))
+            .collect();
+        for &watch in &watches {
+            let outcome = outcome.clone();
+            self.append(fx, Body::Fired { watch, outcome });
+        }
+        !watches.is_empty()
+    }
+
+    // ── the turn ──────────────────────────────────────────────────────
+
+    /// Carries out what is asked for while nothing is open: the agent's
+    /// next action; once it stopped, what the `on_stop` point gives it;
+    /// then queued input, and children's results.
+    fn advance(&mut self, fx: &mut Effects) {
+        loop {
+            match &self.turn {
+                Turn::Model { .. } => return,
+                Turn::Acting { open } if !open.is_empty() => return,
+                Turn::Stopping { open, .. } if !open.is_empty() => return,
+                Turn::Stopping { .. } => {
+                    self.stopped(fx);
+                    continue;
+                }
+                Turn::Acting { .. } | Turn::Idle => {}
+            }
+            if let Some(next) = self.fold.asked.front().cloned() {
+                self.resolve(fx);
+                self.turn = Turn::Acting {
+                    open: SmallVec::new(),
+                };
+                self.act(next, fx);
+                continue;
+            }
+            if mem::take(&mut self.fold.stepped)
+                && let Some((by, text)) = self.registry.on_stop()
+            {
+                self.decide(None, &by, Verdict::OnStop { text }, fx);
+                continue;
+            }
+            self.turn = Turn::Idle;
+            if let Some(input) = self
+                .fold
+                .ledger
+                .untaken()
+                .front()
+                .and_then(|q| Seq::new(q.seq))
+            {
+                self.resolve(fx);
+                self.turn = Turn::Acting {
+                    open: SmallVec::new(),
+                };
+                self.append(fx, Body::Take { input });
+                continue;
+            }
+            if let Some((child, outcome)) = self.deferred.pop_front() {
+                self.fire(child, &outcome, fx);
+                continue;
+            }
+            return;
+        }
+    }
+
+    /// Carries out `next`: its entry takes it off what is asked for.
+    fn act(&mut self, next: Next, fx: &mut Effects) {
+        match next {
+            Next::Agent(Action::Say(text)) => {
+                self.append(fx, Body::Assistant { text });
+            }
+            Next::Agent(Action::CallModel) => {
+                // Steering input reaches the turn before the model is
+                // next asked.
+                let steers: SmallVec<[Seq; 2]> = (self.fold.ledger.untaken().iter())
+                    .filter(|q| q.steer)
+                    .filter_map(|q| Seq::new(q.seq))
+                    .collect();
+                for input in steers {
+                    self.append(fx, Body::Take { input });
+                }
+                if !self.fold.ledger.has_context()
+                    && let Some(text) = self.registry.context()
+                {
+                    self.append(fx, Body::Context { text });
+                }
+                self.send(0, fx);
+            }
+            Next::Agent(Action::Call { tool, input, id }) => {
+                let call = self.call(&tool, &input, id, Audience::Model, fx);
+                self.gate(call, &tool, &input, fx);
+            }
+            Next::Agent(Action::Refuse {
+                tool,
+                input,
+                id,
+                why,
+            }) => {
+                let call = self.call(&tool, &input, id, Audience::Model, fx);
+                let reason = why.clone();
+                self.decide(Some(call), AGENT, Verdict::Block { reason }, fx);
+                self.settle(call, Outcome::Failed { error: why }, fx);
+            }
+            Next::Command { name, args } => {
+                let input = Json::new(&json!({ "args": args }));
+                let call = self.call(&name, &input, None, Audience::User, fx);
+                self.gate(call, &name, &input, fx);
+            }
+        }
+    }
+
+    /// Logs the intent to call `tool`.
+    fn call(
+        &mut self,
+        tool: &str,
+        input: &Json,
+        id: Option<String>,
+        by: Audience,
+        fx: &mut Effects,
+    ) -> CallId {
+        let card = self.registry.card(tool, input);
+        let body = Body::ToolCall {
+            tool: tool.to_owned(),
+            input: input.clone(),
+            id,
+            card,
+            by,
+        };
+        self.append(fx, body)
+    }
+
+    /// Sends a model call, for the `attempt`th time.
+    fn send(&mut self, attempt: u16, fx: &mut Effects) {
+        let model = self.registry.model();
+        let call = self.append(fx, Body::ModelCall { model, attempt });
+        fx.push(Effect::CallModel { call, attempt });
+        self.turn = Turn::Model {
+            call,
+            attempt,
+            phase: ModelPhase::Streaming,
+        };
+    }
+
+    fn gate(&mut self, call: CallId, tool: &str, input: &Json, fx: &mut Effects) {
+        match self.registry.gate(call, tool, input) {
+            Answer::Now(gated) => self.gated(call, gated, 0, false, fx),
+            Answer::Later(answer) => {
+                self.set_step(
+                    call,
+                    Step::Awaiting {
+                        skip: 0,
+                        resumed: false,
+                    },
+                );
+                fx.push(Effect::Await { call, answer });
+            }
+        }
+    }
+
+    /// Logs what call `call`'s gate decided (but the first `skip`, logged
+    /// already), then runs it, has it wait for an approval or answers it
+    /// with why not. One gated before a restart may have run: an unsafe
+    /// one is interrupted rather than run twice.
+    fn gated(&mut self, call: CallId, gated: Gated, skip: u16, resumed: bool, fx: &mut Effects) {
+        let Gated {
+            input,
+            decisions,
+            gate,
+        } = gated;
+        for (by, d) in decisions.into_iter().skip(usize::from(skip)) {
+            self.decide(Some(call), &by, d, fx);
+        }
+        match gate {
+            Gate::Run if resumed && !self.safe(call) => {
+                self.close(call);
+                self.settle(call, self.interrupted(call), fx);
+            }
+            Gate::Run => {
+                let Some((tool, _)) = self.tool_of(call) else {
+                    return;
+                };
+                self.set_step(call, Step::Running);
+                fx.push(Effect::RunTool { call, tool, input });
+            }
+            Gate::Ask => {
+                let asked = matches!(
+                    self.fold.ledger.call(call.get()).map(|open| &open.phase),
+                    Some(Phase::Waiting(WaitOn::Approval))
+                );
+                if !asked {
+                    let on = WaitOn::Approval;
+                    self.append(fx, Body::Wait { call, on });
+                }
+                self.set_step(call, Step::Waiting);
+            }
+            Gate::Refuse(error) => {
+                self.close(call);
+                self.settle(call, Outcome::Failed { error }, fx);
+            }
+        }
+    }
+
+    /// Runs call `call`, approved.
+    fn run(&mut self, call: CallId, fx: &mut Effects) {
+        let Some((tool, input)) = self.tool_of(call) else {
+            return;
+        };
+        self.set_step(call, Step::Running);
+        fx.push(Effect::RunTool { call, tool, input });
+    }
+
+    /// Hands call `call` what it waited on.
+    fn resume_call(&mut self, call: CallId, value: Json, fx: &mut Effects) {
+        let Some((tool, input)) = self.tool_of(call) else {
+            return;
+        };
+        self.set_step(call, Step::Running);
+        fx.push(Effect::Resume {
+            call,
+            tool,
+            input,
+            value,
+        });
+    }
+
+    /// Ends an interrupted turn whose calls have settled. Every tool call
+    /// the agent asked for is answered, interrupted, so that each call a
+    /// model made has its answer; nothing else it asked for is done.
+    fn stopped(&mut self, fx: &mut Effects) {
+        let Turn::Stopping { origin, .. } = mem::take(&mut self.turn) else {
+            return;
+        };
+        // Only what was asked before the stop: an agent told of an
+        // interrupted call may ask for more.
+        for _ in 0..self.fold.asked.len() {
+            let Some(next) = self.fold.asked.front().cloned() else {
+                break;
+            };
+            let (tool, input, id, by) = match next {
+                Next::Agent(
+                    Action::Call { tool, input, id }
+                    | Action::Refuse {
+                        tool, input, id, ..
+                    },
+                ) => (tool, input, id, Audience::Model),
+                Next::Command { name, args } => (
+                    name,
+                    Json::new(&json!({ "args": args })),
+                    None,
+                    Audience::User,
+                ),
+                Next::Agent(Action::Say(_) | Action::CallModel) => {
+                    self.fold.asked.pop_front();
+                    continue;
+                }
+            };
+            let call = self.call(&tool, &input, id, by, fx);
+            self.settle(call, Outcome::Interrupted { output: None }, fx);
+        }
+        self.append(fx, Body::Interrupt { origin });
+        self.fold.stepped = false;
+    }
+
+    /// Takes up the newest registry generation, at a step boundary,
+    /// logging the extensions it runs when they changed.
+    fn resolve(&mut self, fx: &mut Effects) {
+        let Some(next) = self.next.take() else {
+            return;
+        };
+        let installed = next.installed();
+        let changed = installed != self.registry.installed();
+        self.registry = next;
+        if changed {
+            self.append(fx, Body::Extensions { installed });
+        }
+    }
+
+    /// Marks the session busy while it has work in flight (waiting is not
+    /// work), and has a child report each time it settles.
+    fn marks(&mut self, fx: &mut Effects) {
+        let ledger = &self.fold.ledger;
+        let armed = ledger.armed().next().is_some();
+        let queued = !ledger.untaken().is_empty();
+        let working = match &self.turn {
+            Turn::Idle => false,
+            Turn::Acting { open } => open.iter().any(|&(_, step)| step != Step::Waiting),
+            Turn::Model { .. } | Turn::Stopping { .. } => true,
+        };
+        let busy = working || queued || armed;
+        if busy != self.busy {
+            self.busy = busy;
+            // Marked before the work starts, cleared after it ends.
+            if busy {
+                fx.insert(0, Effect::MarkBusy(true));
+            } else {
+                fx.push(Effect::MarkBusy(false));
+            }
+        }
+        // Settled with something new since it last reported (a log with
+        // nothing in it has not run yet).
+        let settled = self.turn == Turn::Idle && !queued && !armed;
+        if settled && self.child && ledger.seq() > self.reported {
+            self.reported = ledger.seq();
+            let outcome = ledger.result().cloned().unwrap_or_else(|| Outcome::Failed {
+                error: "the child settled without a result".to_owned(),
+            });
+            fx.push(Effect::Report { outcome });
+        }
+    }
+
+    // ── recovery ──────────────────────────────────────────────────────
+
+    fn recover(&mut self, load: &Load<'_>, fx: &mut Effects) {
+        let ledger = &self.fold.ledger;
+        let here = |boot: &str| load.boot == Some(boot);
+        let open = ledger.open_calls().map(|(_, open)| open);
+        let commands = ledger.open_commands().filter_map(|seq| ledger.call(seq));
+        let mut kills: SmallVec<[u32; 2]> = open
+            .chain(commands)
+            .flat_map(|open| &open.processes)
+            .filter(|(_, boot)| here(boot))
+            .map(|&(pgid, _)| pgid)
+            .collect();
+        if load.fresh {
+            let jobs = ledger.background().iter().filter(|(_, boot)| here(boot));
+            for &(pgid, _) in jobs {
+                if !kills.contains(&pgid) {
+                    kills.push(pgid);
+                }
+            }
+        }
+        fx.extend(kills.into_iter().map(|pgid| Effect::Kill { pgid }));
+        self.relink(fx);
+        // A command cut off is not run again.
+        let commands: SmallVec<[u64; 1]> = self.fold.ledger.open_commands().collect();
+        for call in commands.into_iter().filter_map(CallId::new) {
+            self.settle(call, self.interrupted(call), fx);
+        }
+        let open: Vec<(CallId, Call, Phase)> = (self.fold.ledger.open_calls())
+            .filter_map(|(seq, open)| {
+                Some((CallId::new(seq)?, open.call.clone(), open.phase.clone()))
+            })
+            .collect();
+        if !open.is_empty() || !self.fold.asked.is_empty() || self.fold.retry.is_some() {
+            self.turn = Turn::Acting {
+                open: SmallVec::new(),
+            };
+        }
+        let orphan = load.owner == Owner::Gone;
+        for (call, kind, phase) in open {
+            if orphan {
+                self.settle(call, self.interrupted(call), fx);
+                continue;
+            }
+            match kind {
+                Call::Model { attempt } => self.restart(call, attempt, fx),
+                Call::Tool { tool, input, .. } => self.reopen(call, &tool, &input, &phase, fx),
+            }
+        }
+        if orphan {
+            self.fold.retry = None;
+            if self.turn != Turn::Idle {
+                self.turn = Turn::Stopping {
+                    open: SmallVec::new(),
+                    origin: None,
+                };
+            }
+            return;
+        }
+        // A retry that was to be sent after its backoff is sent now.
+        if let Some((_, attempt)) = self.fold.retry
+            && !matches!(self.turn, Turn::Model { .. })
+        {
+            self.send(attempt, fx);
+        }
+    }
+
+    /// Re-arms links: a link not yet watched is watched, and every child
+    /// still watched is started, so it runs to its end and reports back.
+    fn relink(&mut self, fx: &mut Effects) {
+        let ledger = &self.fold.ledger;
+        let links: SmallVec<[_; 1]> = (ledger.links().iter())
+            .filter_map(|link| {
+                let watched = ledger.watched(link.child);
+                let armed = ledger.armed().any(|(_, child)| child == link.child);
+                (armed || !watched)
+                    .then(|| (Seq::new(link.seq), link.child, link.input.clone(), watched))
+            })
+            .collect();
+        for (link, child, input, watched) in links {
+            if !watched {
+                self.append(fx, Body::Watch { child });
+            }
+            if let Some(link) = link {
+                fx.push(Effect::StartChild { link, child, input });
+            }
+        }
+    }
+
+    /// A model call a restart cut off is sent again, as a retry of its own
+    /// (so restarts count as attempts), while attempts last.
+    fn restart(&mut self, call: CallId, attempt: u16, fx: &mut Effects) {
+        let next = attempt + 1;
+        if next >= MAX_ATTEMPTS {
+            let error = format!("gave up after {next} attempts");
+            return self.settle(call, Outcome::Failed { error }, fx);
+        }
+        let error = "the daemon stopped during the call".to_owned();
+        let d = Verdict::Retry {
+            attempt: next,
+            error,
+        };
+        self.decide(Some(call), KERNEL, d, fx);
+        self.settle(call, Outcome::Interrupted { output: None }, fx);
+        self.send(next, fx);
+    }
+
+    /// Picks tool call `call` up as its phase says.
+    fn reopen(&mut self, call: CallId, tool: &str, input: &Json, phase: &Phase, fx: &mut Effects) {
+        match *phase {
+            Phase::Gating { at } => match self.registry.gate(call, tool, input) {
+                Answer::Now(gated) => self.gated(call, gated, at, true, fx),
+                Answer::Later(answer) => {
+                    let skip = at;
+                    self.set_step(
+                        call,
+                        Step::Awaiting {
+                            skip,
+                            resumed: true,
+                        },
+                    );
+                    fx.push(Effect::Await { call, answer });
+                }
+            },
+            Phase::Waiting(WaitOn::Child { .. }) => match self.fold.fired(call).cloned() {
+                Some(outcome) => self.resume_call(call, to_json(&outcome), fx),
+                None => self.set_step(call, Step::Waiting),
+            },
+            Phase::Waiting(_) => self.set_step(call, Step::Waiting),
+            Phase::Running if self.safe(call) => self.run(call, fx),
+            Phase::Running => self.settle(call, self.interrupted(call), fx),
+            Phase::Settled(kind) => {
+                let outcome = match kind {
+                    OutcomeKind::Done => Outcome::Done {
+                        output: Json::null(),
+                    },
+                    OutcomeKind::Failed => Outcome::Failed {
+                        error: "the call was refused".to_owned(),
+                    },
+                    OutcomeKind::Interrupted => self.interrupted(call),
+                };
+                self.settle(call, outcome, fx);
+            }
+        }
+    }
+
+    // ── helpers ───────────────────────────────────────────────────────
+
+    /// Numbers `body` next, folds it and has it appended; its seq.
+    fn append(&mut self, fx: &mut Effects, body: Body) -> CallId {
+        let seq = self.fold.ledger.seq() + 1;
+        let entry = Entry::new(seq, 0, body);
+        self.fold.apply(&entry, &*self.registry);
+        fx.push(Effect::Append(entry));
+        CallId::new(seq).expect("an entry after the last has a seq")
+    }
+
+    fn decide(&mut self, call: Option<CallId>, by: &str, d: Verdict, fx: &mut Effects) {
+        let by = by.to_owned();
+        self.append(fx, Body::Decision { by, call, d });
+    }
+
+    /// Logs call `call`'s outcome.
+    fn settle(&mut self, call: CallId, outcome: Outcome, fx: &mut Effects) {
+        let body = match self.fold.ledger.call(call.get()).map(|open| &open.call) {
+            Some(Call::Model { .. }) => Body::ModelResult {
+                call: call.get(),
+                outcome,
+            },
+            Some(Call::Tool { .. }) => Body::ToolResult {
+                call: call.get(),
+                outcome,
+                card: None,
+            },
+            None => return,
+        };
+        self.append(fx, body);
+    }
+
+    /// An interrupted outcome for call `call`, with the output it logged.
+    fn interrupted(&self, call: CallId) -> Outcome {
+        let output = (self.fold.ledger.call(call.get())).and_then(|open| open.progress.clone());
+        Outcome::Interrupted { output }
+    }
+
+    /// Whether a mutation from `origin` was logged already: a resend,
+    /// answered as the first was.
+    fn resent(&self, origin: Option<Author>) -> bool {
+        origin.is_some_and(|a| {
+            self.fold
+                .ledger
+                .last_of(a.client)
+                .is_some_and(|last| a.seq <= last)
+        })
+    }
+
+    /// The tool and input call `call` runs with: as its gate left it.
+    fn tool_of(&self, call: CallId) -> Option<(String, Json)> {
+        match &self.fold.ledger.call(call.get())?.call {
+            Call::Tool { tool, input, .. } => {
+                let input = self.fold.input_of(call).unwrap_or(input);
+                Some((tool.clone(), input.clone()))
+            }
+            Call::Model { .. } => None,
+        }
+    }
+
+    fn safe(&self, call: CallId) -> bool {
+        self.tool_of(call)
+            .and_then(|(tool, _)| self.registry.callable(&tool))
+            .is_some_and(|c| c.replay == Replay::Safe)
+    }
+
+    /// The child call `call` waits on.
+    fn child_of(&self, call: CallId) -> Option<SessionId> {
+        let ledger = &self.fold.ledger;
+        let Phase::Waiting(WaitOn::Child { link }) = ledger.call(call.get())?.phase else {
+            return None;
+        };
+        let link = ledger.links().iter().find(|l| l.seq == link.get())?;
+        Some(link.child)
+    }
+
+    /// Where open call `call` stands in the turn; a call the interrupted
+    /// turn waits for reports as running.
+    fn step_of(&self, call: CallId) -> Option<Step> {
+        match &self.turn {
+            Turn::Acting { open } => open.iter().find(|(c, _)| *c == call).map(|&(_, s)| s),
+            Turn::Stopping { open, .. } => open.contains(&call).then_some(Step::Running),
+            Turn::Idle | Turn::Model { .. } => None,
+        }
+    }
+
+    fn set_step(&mut self, call: CallId, step: Step) {
+        if let Turn::Acting { open } = &mut self.turn {
+            match open.iter_mut().find(|(c, _)| *c == call) {
+                Some((_, s)) => *s = step,
+                None => open.push((call, step)),
+            }
+        }
+    }
+
+    /// Takes call `call` off the turn's open calls.
+    fn close(&mut self, call: CallId) {
+        match &mut self.turn {
+            Turn::Acting { open } => open.retain(|(c, _)| *c != call),
+            Turn::Stopping { open, .. } => open.retain(|c| *c != call),
+            Turn::Idle | Turn::Model { .. } => {}
+        }
+    }
+}
+
+fn reply(fx: &mut Effects, ticket: Option<Ticket>, result: Result<(), String>) {
+    if let Some(ticket) = ticket {
+        fx.push(Effect::Reply { ticket, result });
+    }
+}
+
+/// A model call's outcome, but a failure, which is first offered to retry.
+fn outcome(replied: Replied) -> Outcome {
+    match replied {
+        Replied::Done(output) => Outcome::Done { output },
+        Replied::Failed(error) => Outcome::Failed {
+            error: error.to_string(),
+        },
+        Replied::Interrupted(output) => Outcome::Interrupted { output },
+    }
+}
+
+fn to_json(outcome: &Outcome) -> Json {
+    Json::new(&serde_json::to_value(outcome).unwrap_or_default())
+}
