@@ -292,6 +292,18 @@ fn a_cancelled_call_stops_with_its_partial_output() {
     assert!(text.contains("\n[aborted]\n["), "{text}");
 }
 
+/// Nothing wakes the supervisor for a cancel that came first: it must not
+/// wait for one.
+#[test]
+fn a_call_cancelled_before_it_starts_stops_at_once() {
+    let rig = rig("cancelled");
+    rig.cancel.cancel();
+    let started = Instant::now();
+    let ran = run(&rig, "sleep 100");
+    assert!(started.elapsed() < Duration::from_secs(3));
+    assert!(ran.aborted, "{ran:?}");
+}
+
 #[test]
 fn a_background_command_returns_at_once_with_its_log() {
     let rig = rig("background");

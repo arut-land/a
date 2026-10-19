@@ -488,7 +488,13 @@ fn listen(
         });
     }
     let waker = Waker::from(Arc::new(Notify(tx)));
-    let _ = pin!(cancel.cancelled()).poll(&mut Context::from_waker(&waker));
+    // Cancelled already, nothing registers the waker: it is woken now.
+    if pin!(cancel.cancelled())
+        .poll(&mut Context::from_waker(&waker))
+        .is_ready()
+    {
+        waker.wake();
+    }
     (rx, poll)
 }
 
