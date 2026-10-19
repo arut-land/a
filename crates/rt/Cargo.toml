@@ -7,17 +7,21 @@ publish.workspace = true
 [features]
 default = ["threads"]
 # The built-in runtime.
-threads = ["dep:async-task", "dep:futures-timer"]
+threads = ["dep:async-task"]
 smol = ["dep:smol"]
 tokio = ["dep:tokio"]
 
 [dependencies]
 async-task = { version = "4", optional = true }
 futures-core = { version = "0.3", default-features = false, features = ["std"] }
-futures-timer = { version = "3", optional = true }
+# The reactor's poller: kqueue, epoll, or IOCP on Windows.
+mio = { version = "1", default-features = false, features = ["os-poll", "os-ext"] }
 pollster = "1"
 smol = { version = "2", optional = true }
 tokio = { version = "1", default-features = false, features = ["rt", "time"], optional = true }
+
+[target.'cfg(unix)'.dependencies]
+rustix.workspace = true
 
 [lints]
 workspace = true

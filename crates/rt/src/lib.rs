@@ -2,11 +2,14 @@
 //! it spawns, sleeps and runs blocking work through whichever runtime the
 //! host plugs in, and never names one itself. [`Threads`] is the built-in
 //! runtime; `smol` and `tokio` adapters sit behind features; [`block_on`]
-//! drives a future to completion on the calling thread. [`EventSink`] is
-//! the observability seam, free when off.
+//! drives a future to completion on the calling thread. Waiting on the OS
+//! ([`Async`] descriptors, [`Timer`]s) goes through one reactor thread that
+//! every runtime shares. [`EventSink`] is the observability seam, free when
+//! off.
 
 pub mod channel;
 mod events;
+mod reactor;
 #[cfg(feature = "threads")]
 mod threads;
 
@@ -22,6 +25,9 @@ use std::time::Duration;
 
 pub use events::{Event, EventSink, Noop, Stderr};
 pub use pollster::block_on;
+#[cfg(unix)]
+pub use reactor::Async;
+pub use reactor::{Timer, wakes};
 #[cfg(feature = "threads")]
 pub use threads::Threads;
 
