@@ -320,14 +320,36 @@ mod unix {
         gone_is_ok(process::kill_process_group(pid(pgid)?, raw(signal)))
     }
 
-    /// Whether any process of group `pgid` is still alive.
+    /// Whether any process of group `pgid` is still alive. A group we may
+    /// not signal (a member changed user, as sudo does) is alive too.
     pub fn group_alive(pgid: u32) -> bool {
-        pid(pgid).is_ok_and(|pgid| {
-            matches!(
-                process::test_kill_process_group(pgid),
-                Ok(()) | Err(rustix::io::Errno::PERM)
-            )
+        pid(pgid).is_ok_and(|pgid| match process::test_kill_process_group(pgid) {
+            Ok(()) => true,
+            Err(rustix::io::Errno::PERM) => has_members(pgid),
+            Err(_) => false,
         })
+    }
+
+    /// Whether the OS lists any process in group `pgid`. macOS answers
+    /// `EPERM`, not `ESRCH`, for a few milliseconds after a group's last
+    /// process is reaped, so its denial alone does not mean a member.
+    #[cfg(target_vendor = "apple")]
+    pub(crate) fn has_members(pgid: process::Pid) -> bool {
+        let mut member: libc::pid_t = 0;
+        let Ok(size) = i32::try_from(size_of_val(&member)) else {
+            return true;
+        };
+        // SAFETY: `member` is a writable buffer of `size` bytes; the call
+        // fills at most that and returns the bytes written (or -1).
+        let written = unsafe {
+            libc::proc_listpgrppids(pgid.as_raw_nonzero().get(), (&raw mut member).cast(), size)
+        };
+        written != 0
+    }
+
+    #[cfg(not(target_vendor = "apple"))]
+    pub(crate) fn has_members(_pgid: process::Pid) -> bool {
+        true
     }
 
     /// Sends `signal` to a process.
@@ -461,9 +483,12 @@ mod tests {
         new_session(&mut cmd);
         let mut child = cmd.spawn().unwrap();
         assert!(group_alive(child.id()));
+        let pgid = rustix::process::Pid::from_raw(child.id().cast_signed()).unwrap();
+        assert!(has_members(pgid));
         signal_group(child.id(), Signal::Terminate).unwrap();
         child.wait().unwrap();
         assert!(!group_alive(child.id()));
+        assert!(!has_members(pgid));
         assert_eq!(signal_name(9), "SIGKILL");
         assert_eq!(signal_name(15), "SIGTERM");
         assert_eq!(signal_name(6), "SIGABRT");
