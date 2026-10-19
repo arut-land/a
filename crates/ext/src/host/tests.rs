@@ -346,7 +346,10 @@ fn commands_and_agents_are_found_by_name() {
         .unwrap();
     let commands: Vec<_> = registry.commands().map(DynTool::description).collect();
     assert_eq!(commands, ["Lists jobs."]);
-    assert!(registry.tools().specs().is_empty(), "a command is not the model's");
+    assert!(
+        registry.tools().specs().is_empty(),
+        "a command is not the model's"
+    );
     assert_eq!(registry.agents().collect::<Vec<_>>(), ["idle"]);
     // An unknown name runs the first agent registered.
     let said = registry

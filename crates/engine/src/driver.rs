@@ -26,8 +26,8 @@ use ext::{
 use kernel::{Answer, Core, Effect, Effects, Event, Load, Note, Owner, Replied, Ticket};
 use protocol::view::SessionView;
 use protocol::{
-    Author, Body, CallId, Cap, Card, DaemonMsg, Entry, Environment, Frame, Installed,
-    Json, Mode, Outcome, Overrides, Residency, SessionId, SessionSummary, Verdict,
+    Author, Body, CallId, Cap, Card, DaemonMsg, Entry, Environment, Frame, Installed, Json, Mode,
+    Outcome, Overrides, Residency, SessionId, SessionSummary, Verdict,
 };
 use rt::{channel, oneshot};
 
@@ -424,7 +424,10 @@ impl Actor {
         registry.hooks().session_end(&self.live.session.point());
         // Closed and let go before the end is told: a reload never makes
         // a second writer, and what is told the end holds the last of it.
-        let (ended, daemon) = (self.live.ended.clone(), self.live.session.shared.daemon.clone());
+        let (ended, daemon) = (
+            self.live.ended.clone(),
+            self.live.session.shared.daemon.clone(),
+        );
         drop((self, mail));
         ended.end();
         if let Some(daemon) = daemon.upgrade() {
