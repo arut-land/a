@@ -1,63 +1,119 @@
 //! What a session's log says, read back: the conversation the model sees,
 //! the agent's state, what waits for the user or the agent, and a recap.
 
+use std::borrow::Borrow;
 use std::collections::{HashMap, VecDeque};
+use std::sync::Arc;
 
-use agent::{Action, Agent, Input, Toolset};
-use llm::{Message, ToolMessage, ToolResult};
+use agent::{Action, Agent, Input, Registry};
+use llm::{Assistant, Message, ToolMessage, ToolResult};
 use protocol::ledger::Ledger;
 use protocol::{Body, DaemonMsg, Decision, Entry, Outcome, Recap};
 
-/// The conversation before `before`, derived from the log's facts. A model
+/// The conversation the model sees, folded from the log's facts as they
+/// commit, so that a model call reads it rather than the log. A model
 /// reply is the assistant message it stored, provider state included; a
-/// reply logged as bare text (by an earlier version) reads back as text.
-/// A tool call the model made is answered under the model's id for it. The
+/// reply logged as bare text (by an earlier version) reads back as text. A
+/// tool call the model made is answered under the model's id for it, as
+/// the tools of the registry it was folded on present the result. The
 /// session's context comes first, wherever it was logged.
-pub fn transcript(entries: &[Entry], before: u64, tools: &Toolset) -> Vec<Message> {
-    let mut messages = Vec::new();
-    let mut context = 0;
-    // Model calls by our seq: the model's id and the tool.
-    let mut calls = HashMap::new();
-    for e in entries.iter().take_while(|e| e.seq < before) {
-        match &e.body {
-            Body::User { text }
-            | Body::Steer { text, .. }
+pub struct Transcript {
+    messages: Vec<Message>,
+    /// How many context messages lead `messages`.
+    context: usize,
+    /// The model's id and the tool of each call the model made and that is
+    /// not yet answered, by seq.
+    calls: HashMap<u64, (String, String)>,
+    /// The seq of the last entry that changed the messages.
+    last: u64,
+    /// The answer of the current turn's last reply, as a recap tells it.
+    reply: Option<String>,
+    registry: Arc<Registry>,
+}
+
+impl Transcript {
+    pub fn new(registry: Arc<Registry>) -> Self {
+        Self {
+            messages: Vec::new(),
+            context: 0,
+            calls: HashMap::new(),
+            last: 0,
+            reply: None,
+            registry,
+        }
+    }
+
+    /// The transcript of `entries`, on `registry`.
+    pub fn of(
+        entries: impl IntoIterator<Item = impl Borrow<Entry>>,
+        registry: Arc<Registry>,
+    ) -> Self {
+        let mut transcript = Self::new(registry);
+        for e in entries {
+            transcript.apply(e.borrow(), None);
+        }
+        transcript
+    }
+
+    /// Folds entry `e`. `fresh` is the message of the reply this daemon
+    /// just had, which `e` stores: taken as it is rather than read again.
+    pub fn apply(&mut self, e: &Entry, fresh: Option<Assistant>) {
+        let message = match &e.body {
+            Body::User { text } => {
+                self.reply = None;
+                Message::user(text.clone())
+            }
+            Body::Steer { text, .. }
             | Body::Hook {
                 decision: Decision::OnStop { text },
                 ..
-            } => messages.push(Message::user(text.clone())),
-            Body::Assistant { text } => messages.push(Message::assistant(text.clone())),
+            } => Message::user(text.clone()),
+            Body::Assistant { text } => {
+                self.reply = Some(text.clone());
+                Message::assistant(text.clone())
+            }
             Body::Context { text } => {
-                messages.insert(context, Message::user(text.clone()));
-                context += 1;
+                self.messages
+                    .insert(self.context, Message::user(text.clone()));
+                self.context += 1;
+                self.last = e.seq;
+                return;
             }
-            Body::Fired { outcome, .. } => {
-                messages.push(Message::user(agent::child_result(outcome)));
-            }
+            Body::Fired { outcome, .. } => Message::user(agent::child_result(outcome)),
             Body::ModelResult {
                 outcome: Outcome::Done { output },
                 ..
             } => {
-                let output = output.value();
-                match llm::Response::from_value(&output) {
-                    Ok(reply) => messages.push(Message::Assistant(reply.message)),
-                    Err(_) => {
-                        if let Some(text) = output["text"].as_str() {
-                            messages.push(Message::assistant(text));
+                let reply = match fresh {
+                    Some(message) => Ok(message),
+                    None => llm::Response::from_value(&output.value()).map(|r| r.message),
+                };
+                match reply {
+                    Ok(message) => {
+                        let text = message.text();
+                        if !text.is_empty() {
+                            self.reply = Some(text);
                         }
+                        Message::Assistant(message)
                     }
+                    // A reply an earlier version logged as bare text.
+                    Err(_) => match output.value()["text"].as_str() {
+                        Some(text) => Message::assistant(text),
+                        None => return,
+                    },
                 }
             }
             Body::ToolCall {
                 tool, id: Some(id), ..
             } => {
-                calls.insert(e.seq, (id.as_str(), tool.as_str()));
+                self.calls.insert(e.seq, (id.clone(), tool.clone()));
+                return;
             }
             Body::ToolResult { call, outcome, .. } => {
-                let Some(&(id, tool)) = calls.get(call) else {
-                    continue;
+                let Some((id, tool)) = self.calls.remove(call) else {
+                    return;
                 };
-                let (output, error) = tools.to_model(tool, outcome);
+                let (output, error) = self.registry.tools().to_model(&tool, outcome);
                 let result = ToolResult {
                     id: id.into(),
                     name: tool.into(),
@@ -65,17 +121,39 @@ pub fn transcript(entries: &[Entry], before: u64, tools: &Toolset) -> Vec<Messag
                     error,
                     meta: llm::Meta::new(),
                 };
-                match messages.last_mut() {
+                self.last = e.seq;
+                match self.messages.last_mut() {
                     Some(Message::Tool(answers)) => answers.results.push(result),
-                    _ => messages.push(Message::Tool(ToolMessage {
+                    _ => self.messages.push(Message::Tool(ToolMessage {
                         results: vec![result],
                     })),
                 }
+                return;
             }
-            _ => {}
-        }
+            _ => return,
+        };
+        self.messages.push(message);
+        self.last = e.seq;
     }
-    messages
+
+    /// Whether the tools of `registry` presented the results.
+    pub fn is_on(&self, registry: &Arc<Registry>) -> bool {
+        Arc::ptr_eq(&self.registry, registry)
+    }
+
+    /// The conversation before entry `before`, if it is all of it.
+    pub fn before(&self, before: u64) -> Option<&[Message]> {
+        (self.last < before).then_some(&self.messages[..])
+    }
+
+    pub fn into_messages(self) -> Vec<Message> {
+        self.messages
+    }
+
+    /// The answer of the current turn's last reply.
+    pub fn reply(&self) -> Option<&str> {
+        self.reply.as_deref()
+    }
 }
 
 /// Steps a fresh `agent` through every input the log records, so it is in
@@ -180,30 +258,6 @@ pub fn recap(ledger: &Ledger, reply: Option<&str>, since: u64) -> Option<Recap> 
         asks: u32::try_from(ledger.inbox().len()).unwrap_or(u32::MAX),
     };
     (recap != Recap::default()).then_some(recap)
-}
-
-/// The answer of the last reply among `entries`, as a recap tells it: an
-/// assistant message, or a model reply with text.
-pub fn reply(entries: &[Entry]) -> Option<String> {
-    let mut reply = None;
-    for e in entries {
-        match &e.body {
-            Body::Assistant { text } => reply = Some(text.clone()),
-            Body::ModelResult {
-                outcome: Outcome::Done { output },
-                ..
-            } => {
-                let text = llm::Response::from_value(&output.value()).map(|r| r.message.text());
-                if let Ok(text) = text
-                    && !text.is_empty()
-                {
-                    reply = Some(text);
-                }
-            }
-            _ => {}
-        }
-    }
-    reply
 }
 
 /// The first line of `text`, cut to a recap's width.

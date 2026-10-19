@@ -33,7 +33,13 @@ fn untaken(entries: &[Entry]) -> Vec<ledger::Queued> {
 fn recap_of(entries: &[Entry], since: u64) -> Option<protocol::Recap> {
     let ledger = Ledger::of(entries);
     let after = entries.partition_point(|e| e.seq <= ledger.turn_start());
-    recap(&ledger, facts::reply(&entries[after..]).as_deref(), since)
+    recap(&ledger, oracle::reply(&entries[after..]).as_deref(), since)
+}
+
+/// The conversation before `before`, as `registry`'s tools present it.
+fn transcript(entries: &[Entry], before: u64, registry: Arc<Registry>) -> Vec<llm::Message> {
+    let before = entries.iter().take_while(|e| e.seq < before);
+    Transcript::of(before, registry).into_messages()
 }
 
 /// What entries say, whichever lease wrote them.
@@ -101,7 +107,7 @@ fn transcripts_of_earlier_logs_read_replies_as_text() {
         ),
         entry(5, Body::ModelCall { model: "m".into() }),
     ];
-    let turns = transcript(&entries, 5, &agent::Toolset::default());
+    let turns = transcript(&entries, 5, Arc::default());
     assert_eq!(
         turns,
         [
@@ -717,7 +723,7 @@ fn hook_decisions_are_logged_and_replay_to_the_same_state() {
     );
     assert!(replay(agent::Kind::Echo.agent().as_mut(), &log).is_empty());
     assert_eq!(
-        transcript(&log, u64::MAX, &agent::Toolset::default()),
+        transcript(&log, u64::MAX, Arc::default()),
         [
             llm::Message::user("$ echo hi"),
             llm::Message::user("and again"),
@@ -1316,7 +1322,7 @@ fn the_model_gets_the_prompt_and_the_logged_context_first() {
         .collect();
     assert_eq!(tools, ["bash", "edit", "sleep"]);
     assert_eq!(
-        transcript(&log, u64::MAX, fixture.0.registry.get().tools())[0],
+        transcript(&log, u64::MAX, fixture.0.registry.get())[0],
         llm::Message::user(text.clone())
     );
 }

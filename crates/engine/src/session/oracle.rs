@@ -1,12 +1,15 @@
 //! The scans of the whole log the ledger replaced, kept as its oracle: a
 //! ledger folded from a log says what each of these says of it.
 
-use std::collections::{HashSet, VecDeque};
+use std::collections::{HashMap, HashSet, VecDeque};
 
 use protocol::ledger::{Call, Ledger, Phase};
 use protocol::{
     Body, Decision, Entry, Environment, Installed, Outcome, Overrides, Recap, SessionId,
 };
+
+use agent::Toolset;
+use llm::{Message, ToolMessage, ToolResult};
 
 use super::facts;
 
@@ -97,7 +100,7 @@ pub fn check(entries: &[Entry], ledger: &Ledger) {
     assert_eq!(hooks, trailing_hooks(entries), "trailing hooks");
     for since in [0, ledger.seq().saturating_sub(1), ledger.seq()] {
         let after = entries.partition_point(|e| e.seq <= ledger.turn_start());
-        let reply = facts::reply(&entries[after..]);
+        let reply = reply(&entries[after..]);
         assert_eq!(
             facts::recap(ledger, reply.as_deref(), since),
             recap(entries, since),
@@ -428,4 +431,98 @@ fn trailing_hooks(entries: &[Entry]) -> Vec<Body> {
         .collect();
     logged.reverse();
     logged
+}
+
+/// The conversation before `before`, derived from the log's facts. A model
+/// reply is the assistant message it stored, provider state included; a
+/// reply logged as bare text (by an earlier version) reads back as text.
+/// A tool call the model made is answered under the model's id for it. The
+/// session's context comes first, wherever it was logged.
+pub fn transcript(entries: &[Entry], before: u64, tools: &Toolset) -> Vec<Message> {
+    let mut messages = Vec::new();
+    let mut context = 0;
+    // Model calls by our seq: the model's id and the tool.
+    let mut calls = HashMap::new();
+    for e in entries.iter().take_while(|e| e.seq < before) {
+        match &e.body {
+            Body::User { text }
+            | Body::Steer { text, .. }
+            | Body::Hook {
+                decision: Decision::OnStop { text },
+                ..
+            } => messages.push(Message::user(text.clone())),
+            Body::Assistant { text } => messages.push(Message::assistant(text.clone())),
+            Body::Context { text } => {
+                messages.insert(context, Message::user(text.clone()));
+                context += 1;
+            }
+            Body::Fired { outcome, .. } => {
+                messages.push(Message::user(agent::child_result(outcome)));
+            }
+            Body::ModelResult {
+                outcome: Outcome::Done { output },
+                ..
+            } => {
+                let output = output.value();
+                match llm::Response::from_value(&output) {
+                    Ok(reply) => messages.push(Message::Assistant(reply.message)),
+                    Err(_) => {
+                        if let Some(text) = output["text"].as_str() {
+                            messages.push(Message::assistant(text));
+                        }
+                    }
+                }
+            }
+            Body::ToolCall {
+                tool, id: Some(id), ..
+            } => {
+                calls.insert(e.seq, (id.as_str(), tool.as_str()));
+            }
+            Body::ToolResult { call, outcome, .. } => {
+                let Some(&(id, tool)) = calls.get(call) else {
+                    continue;
+                };
+                let (output, error) = tools.to_model(tool, outcome);
+                let result = ToolResult {
+                    id: id.into(),
+                    name: tool.into(),
+                    output,
+                    error,
+                    meta: llm::Meta::new(),
+                };
+                match messages.last_mut() {
+                    Some(Message::Tool(answers)) => answers.results.push(result),
+                    _ => messages.push(Message::Tool(ToolMessage {
+                        results: vec![result],
+                    })),
+                }
+            }
+            _ => {}
+        }
+    }
+    messages
+}
+
+/// The answer of the last reply among `entries`, as a recap tells it: an
+/// assistant message, or a model reply with text.
+pub fn reply(entries: &[Entry]) -> Option<String> {
+    let mut reply = None;
+    for e in entries {
+        match &e.body {
+            Body::Assistant { text } => reply = Some(text.clone()),
+            Body::ModelResult {
+                outcome: Outcome::Done { output },
+                ..
+            } => {
+                let text = llm::Response::from_value(&output.value()).map(|r| r.message.text());
+                if let Ok(text) = text
+                    && !text.is_empty()
+                {
+                    reply = Some(text);
+                }
+            }
+            _ => {}
+        }
+    }
+    reply
 }

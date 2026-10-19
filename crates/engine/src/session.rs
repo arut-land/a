@@ -35,7 +35,7 @@ mod oracle;
 #[cfg(test)]
 mod tests;
 
-use facts::{ask, recap, replay, transcript};
+use facts::{Transcript, ask, recap, replay};
 
 /// What every session runs with.
 pub struct Shared {
@@ -101,6 +101,9 @@ pub struct Session {
     states: Mutex<States>,
     /// Stops the turn running now.
     cancel: Mutex<Cancel>,
+    /// The message of the reply model call `.0` just had, until its result
+    /// commits.
+    fresh: Mutex<Option<(u64, llm::Assistant)>>,
     /// Background process groups the session owns, until it ends.
     jobs: Mutex<Vec<u32>>,
     shared: Arc<Shared>,
@@ -122,10 +125,13 @@ struct State {
     entries: Vec<Entry>,
     /// What the entries say, folded as each commits.
     ledger: Ledger,
+    /// The conversation the model sees, folded as each entry commits.
+    transcript: Transcript,
     /// The clients following the session.
     clients: Vec<Outbox>,
-    /// The last snapshot made, and the seq it is at.
-    snapshot: Option<(u64, Frame)>,
+    /// The last snapshot made, and the seq it is at; `None` for one too
+    /// large for a frame.
+    snapshot: Option<(u64, Option<Frame>)>,
 }
 
 /// How many entries behind a client must be to get a snapshot rather than
@@ -223,6 +229,7 @@ impl Session {
         for e in &loaded.entries {
             frames.push(Frame::entry(e).ok());
         }
+        let transcript = Transcript::of(&loaded.entries, Arc::clone(&registry));
         let mut states = registry.states();
         states.replay(&loaded.entries);
         let session = Arc::new_cyclic(|this| Self {
@@ -235,6 +242,7 @@ impl Session {
             state: Mutex::new(State {
                 entries: loaded.entries,
                 ledger,
+                transcript,
                 clients: Vec::new(),
                 snapshot: None,
             }),
@@ -256,6 +264,7 @@ impl Session {
             env: Mutex::new(env),
             states: Mutex::new(states),
             cancel: Mutex::default(),
+            fresh: Mutex::default(),
             jobs: Mutex::default(),
             shared,
         });
@@ -444,10 +453,7 @@ impl Session {
         frames.extend(snapshot.map(|frame| (seq, frame)));
         let mut push = |msg: &DaemonMsg| frames.extend(Frame::new(msg).ok().map(|f| (seq, f)));
         push(&DaemonMsg::Synced { seq });
-        let entries = &st.entries;
-        let after = entries.partition_point(|e| e.seq <= st.ledger.turn_start());
-        let reply = facts::reply(&entries[after..]);
-        if let Some(recap) = recap(&st.ledger, reply.as_deref(), since) {
+        if let Some(recap) = recap(&st.ledger, st.transcript.reply(), since) {
             push(&DaemonMsg::Recap(recap));
         }
         for &call in st.ledger.inbox() {
@@ -466,12 +472,12 @@ impl Session {
         if let Some((at, frame)) = &st.snapshot
             && *at == seq
         {
-            return Some(frame.clone());
+            return frame.clone();
         }
         let view = SessionView::from_log(self.id, self.workspace.clone(), &st.entries);
-        let frame = Frame::new(&DaemonMsg::Snapshot(Box::new(view))).ok()?;
+        let frame = Frame::new(&DaemonMsg::Snapshot(Box::new(view))).ok();
         st.snapshot = Some((seq, frame.clone()));
-        Some(frame)
+        frame
     }
 
     /// Runs commands from now on in `env`, the newest client's. Its redacted
@@ -633,6 +639,16 @@ impl Session {
             self.frames.push(frame);
             hooks.observe(&entry);
             st.ledger.apply(&entry);
+            let fresh = match &entry.body {
+                Body::ModelResult { call, .. } => lock(&self.fresh)
+                    .take_if(|(of, _)| of == call)
+                    .map(|(_, message)| message),
+                _ => None,
+            };
+            if !st.transcript.is_on(&registry) {
+                st.transcript = Transcript::of(&st.entries, Arc::clone(&registry));
+            }
+            st.transcript.apply(&entry, fresh);
             // Under the same lock as the entry, so a client attaching
             // meanwhile gets the ask exactly once.
             if let Body::Ask { call } = entry.body
@@ -1270,9 +1286,9 @@ impl Session {
 
     /// The request for model call `call`: the system prompt, the transcript
     /// before it, and the tools.
-    fn request(&self, call: u64, model: &Model, registry: &Registry) -> llm::Request {
+    fn request(&self, call: u64, model: &Model, registry: &Arc<Registry>) -> llm::Request {
         let tools = registry.tools();
-        let mut history = transcript(&self.lock().entries, call, tools);
+        let mut history = self.history(call, registry);
         let system = self
             .shared
             .system
@@ -1282,6 +1298,30 @@ impl Session {
             history.insert(0, llm::Message::system(system));
         }
         model.request(history, tools.specs())
+    }
+
+    /// The conversation before model call `call`, as the tools of
+    /// `registry` present results: the transcript kept as entries commit,
+    /// made again only for other tools, or for a call that recovery runs
+    /// after entries it does not see.
+    fn history(&self, call: u64, registry: &Arc<Registry>) -> Vec<llm::Message> {
+        let mut st = self.lock();
+        if !st.transcript.is_on(registry) {
+            st.transcript = Transcript::of(&st.entries, Arc::clone(registry));
+        }
+        let history = if let Some(messages) = st.transcript.before(call) {
+            messages.to_vec()
+        } else {
+            let before = st.entries.iter().take_while(|e| e.seq < call);
+            Transcript::of(before, Arc::clone(registry)).into_messages()
+        };
+        #[cfg(test)]
+        assert_eq!(
+            history,
+            oracle::transcript(&st.entries, call, registry.tools()),
+            "the transcript kept"
+        );
+        history
     }
 
     /// `model`'s reply to `request`, retried as the `request_error` hooks
@@ -1304,9 +1344,12 @@ impl Session {
             let error = match reply {
                 Ok(reply) => {
                     return match serde_json::to_value(&reply) {
-                        Ok(output) => Outcome::Done {
-                            output: output.into(),
-                        },
+                        Ok(output) => {
+                            *lock(&self.fresh) = Some((call, reply.message));
+                            Outcome::Done {
+                                output: output.into(),
+                            }
+                        }
                         Err(error) => Outcome::Failed {
                             error: error.to_string(),
                         },
