@@ -168,6 +168,13 @@ struct Daemon {
     clients: AtomicUsize,
     /// Wakes the supervisor when what it decides on may have changed.
     pulse: Pulse,
+    /// The connections watching the session list, and the list as they
+    /// were last sent it.
+    watchers: Mutex<(Vec<Outbox>, Vec<SessionSummary>)>,
+    /// A client asked the daemon to stop.
+    stopping: AtomicBool,
+    /// When it started, in seconds since the Unix epoch.
+    started: u64,
 }
 
 /// A wake-up for one waiting task, remembered until it waits.
@@ -259,6 +266,11 @@ impl Daemon {
             slots: Mutex::new(slots),
             clients: AtomicUsize::new(0),
             pulse: Pulse::default(),
+            watchers: Mutex::default(),
+            stopping: AtomicBool::new(false),
+            started: std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map_or(0, |d| d.as_secs()),
         });
         for slot in daemon.slots() {
             if daemon.shared.store.is_busy(slot.header.id)
@@ -312,6 +324,28 @@ impl Daemon {
         let found = match target {
             Target::New => return self.create(workspace()),
             Target::Id(id) => self.slot(*id),
+            Target::Prefix(prefix) => {
+                let slots = lock(&self.slots);
+                let mut matching = slots.iter().filter(|s| {
+                    let id = s.header.id;
+                    id.to_string().starts_with(prefix.as_str())
+                        || id.short().to_string().starts_with(prefix.as_str())
+                });
+                match (matching.next(), matching.next()) {
+                    (Some(one), None) => Some(Arc::clone(one)),
+                    (Some(_), Some(_)) => {
+                        return Err(io::Error::other(format!(
+                            "{prefix} matches several sessions"
+                        )));
+                    }
+                    (None, _) => {
+                        return Err(io::Error::new(
+                            io::ErrorKind::NotFound,
+                            format!("no session matches {prefix}"),
+                        ));
+                    }
+                }
+            }
             // A child is reached through its parent, not resumed as latest.
             Target::Latest { any_workspace } => {
                 let workspace = (!any_workspace).then(workspace);
@@ -379,6 +413,41 @@ impl Daemon {
         }
     }
 
+    /// Starts sending `outbox` the session list, now and on each change.
+    fn watch_list(&self, outbox: &Outbox) {
+        let sessions = self.list();
+        let mut watchers = lock(&self.watchers);
+        reply(
+            outbox,
+            &DaemonMsg::Sessions {
+                sessions: sessions.clone(),
+            },
+        );
+        watchers.0.push(outbox.clone());
+        watchers.1 = sessions;
+    }
+
+    /// Sends the watchers the session list, if it changed. Whatever changes
+    /// a summary (a client coming or going, work beginning or ending, a
+    /// session loading or unloading) wakes the supervisor, which calls
+    /// this.
+    fn publish_list(&self) {
+        let mut watchers = lock(&self.watchers);
+        if watchers.0.is_empty() {
+            return;
+        }
+        let sessions = self.list();
+        if sessions == watchers.1 {
+            return;
+        }
+        if let Ok(frame) = Frame::new(&DaemonMsg::Sessions {
+            sessions: sessions.clone(),
+        }) {
+            watchers.0.retain(|w| w.send(frame.clone()).is_ok());
+        }
+        watchers.1 = sessions;
+    }
+
     /// When the next loaded session is due to hibernate, if one is idle.
     fn next_hibernation(&self, after: Duration, now: Instant) -> Option<Instant> {
         self.live()
@@ -436,6 +505,13 @@ impl Daemon {
                 eprintln!("rotating the log: {e}");
             }
             self.hibernate(config.hibernate);
+            self.publish_list();
+            if self.stopping.load(Ordering::SeqCst) {
+                for session in self.live() {
+                    session.stop();
+                }
+                exit.now("asked to stop");
+            }
             let draining = life.draining();
             let busy = draining.is_some() || self.has_work();
             if busy != awake.is_some() {
@@ -908,6 +984,22 @@ impl Conn<'_> {
                     sessions: self.daemon.list(),
                 }),
                 ClientMsg::Settings { change } => self.reply(&self.settings(change.as_ref())),
+                ClientMsg::WatchSessions => self.daemon.watch_list(self.outbox),
+                ClientMsg::Status => self.reply(&DaemonMsg::Status {
+                    pid: std::process::id(),
+                    build: self.life.build.clone(),
+                    started: self.daemon.started,
+                    clients: u32::try_from(self.daemon.clients.load(Ordering::SeqCst))
+                        .unwrap_or(u32::MAX),
+                    sessions: u32::try_from(lock(&self.daemon.slots).len()).unwrap_or(u32::MAX),
+                }),
+                ClientMsg::Shutdown if self.decl.role == Role::Viewer => {
+                    self.error("this client is a viewer".into());
+                }
+                ClientMsg::Shutdown => {
+                    self.daemon.stopping.store(true, Ordering::SeqCst);
+                    self.daemon.pulse.wake();
+                }
                 ClientMsg::Detach => break,
                 ClientMsg::Hello { .. }
                 | ClientMsg::Input { .. }

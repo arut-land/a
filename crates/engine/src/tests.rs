@@ -576,3 +576,92 @@ fn a_daemon_after_a_crash_loop_refuses_to_serve_until_reset() {
     assert_eq!(sys::crash::Crashes::of(&home).young, 0);
     std::fs::remove_dir_all(root).unwrap();
 }
+
+#[test]
+fn watchers_are_sent_the_session_list_as_it_changes() {
+    use super::outbox::Outbox;
+    use super::{Exit, Lifecycle};
+    use protocol::{Caps, DaemonMsg, SessionSummary};
+
+    let (root, home) = home("watch");
+    std::fs::create_dir_all(&root).unwrap();
+    let config = Config {
+        idle: Duration::from_secs(3600),
+        ..echo()
+    };
+    let daemon = Daemon::load(&home, &config).unwrap();
+    let exit = Exit {
+        socket: root.join("socket"),
+        pid: std::fs::File::create(root.join("pid")).unwrap(),
+        log: None,
+    };
+    let life = Lifecycle::new("test".into(), home.runtime());
+    let supervisor = std::sync::Arc::clone(&daemon);
+    daemon.shared.rt.spawn(Box::pin(async move {
+        supervisor.supervise(&life, &config, exit).await;
+    }));
+
+    let watcher = Outbox::new(Caps::ALL);
+    daemon.watch_list(&watcher);
+    let seen = std::sync::Mutex::new(Vec::<Vec<SessionSummary>>::new());
+    let latest = |pick: &dyn Fn(&[SessionSummary]) -> bool| {
+        let mut seen = seen.lock().unwrap();
+        for frame in watcher.take() {
+            if let Ok(Some(DaemonMsg::Sessions { sessions })) =
+                protocol::read_frame::<DaemonMsg>(&mut frame.as_bytes())
+            {
+                seen.push(sessions);
+            }
+        }
+        seen.last().is_some_and(|list| pick(list))
+    };
+    assert!(
+        latest(&|list| list.is_empty()),
+        "the list as it is, at once"
+    );
+
+    let attachment = daemon.resolve(&Target::New, || "/w".into()).unwrap();
+    wait_until("the new session listed", || {
+        latest(&|list| list.len() == 1 && list[0].clients == 1)
+    });
+    drop(attachment);
+    wait_until("its client gone", || {
+        latest(&|list| list.len() == 1 && list[0].clients == 0)
+    });
+    // Only changes are sent.
+    let sent = seen.lock().unwrap().len();
+    std::thread::sleep(Duration::from_millis(100));
+    latest(&|_| true);
+    assert_eq!(seen.lock().unwrap().len(), sent);
+    settle(&daemon);
+    std::fs::remove_dir_all(&root).unwrap();
+}
+
+#[test]
+fn a_session_is_found_by_any_unambiguous_prefix_of_its_id() {
+    let (root, home) = home("prefix");
+    let daemon = Daemon::load(&home, &echo()).unwrap();
+    let ids: Vec<SessionId> = (0..2)
+        .map(|_| {
+            daemon
+                .resolve(&Target::New, || "/w".into())
+                .unwrap()
+                .session()
+                .id
+        })
+        .collect();
+    let found = |prefix: String| {
+        daemon
+            .resolve(&Target::Prefix(prefix), || "/w".into())
+            .map(|a| a.session().id)
+    };
+    assert_eq!(found(ids[0].to_string()).unwrap(), ids[0]);
+    assert_eq!(found(ids[1].short().to_string()).unwrap(), ids[1]);
+    // UUIDv7s made together share their first digits.
+    let several = found(ids[0].to_string()[..4].to_owned()).unwrap_err();
+    assert!(several.to_string().contains("several"), "{several}");
+    let none = found("zz".into()).unwrap_err();
+    assert_eq!(none.kind(), std::io::ErrorKind::NotFound);
+    settle(&daemon);
+    std::fs::remove_dir_all(&root).unwrap();
+}

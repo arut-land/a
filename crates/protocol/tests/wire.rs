@@ -194,6 +194,20 @@ fn client_samples() -> Vec<Sample<ClientMsg>> {
             ClientMsg::Settings { change: None },
             Cap::Settings,
         ),
+        gated("watch_sessions", ClientMsg::WatchSessions, Cap::Sessions),
+        gated(
+            "attach_prefix",
+            ClientMsg::Attach {
+                target: Target::Prefix("0190a".into()),
+                workspace: "/w".into(),
+                since: 0,
+                env: None,
+                decl: ClientDecl::default(),
+            },
+            Cap::Sessions,
+        ),
+        gated("status", ClientMsg::Status, Cap::Daemon),
+        gated("shutdown", ClientMsg::Shutdown, Cap::Daemon),
         gated(
             "settings_change",
             ClientMsg::Settings {
@@ -617,6 +631,17 @@ fn daemon_samples() -> Vec<Sample<DaemonMsg>> {
                 error: None,
             },
             Cap::Settings,
+        ),
+        gated(
+            "status",
+            DaemonMsg::Status {
+                pid: 4242,
+                build: "0.0.0+0123456789abcdef".into(),
+                started: 1_760_000_000,
+                clients: 2,
+                sessions: 7,
+            },
+            Cap::Daemon,
         ),
         gated(
             "settings_refused",

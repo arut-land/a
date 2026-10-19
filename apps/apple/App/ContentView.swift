@@ -59,12 +59,7 @@ struct SessionList: View {
             Button("New Session", systemImage: "plus") { model.chooseWorkspace() }
         }
         .task {
-            // The daemon has no list subscription yet: poll it.
-            while !Task.isCancelled {
-                await model.list?.refresh()
-                model.openRequested()
-                try? await Task.sleep(for: .seconds(3))
-            }
+            await model.list?.follow { model.openRequested() }
         }
     }
 }

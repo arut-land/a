@@ -84,7 +84,7 @@ fn main() -> ExitCode {
         None => session(ctx, Target::New),
         Some(Cmd::Resume { id: None, any }) => session(ctx, Target::Latest { any_workspace: any }),
         Some(Cmd::Resume { id: Some(id), .. } | Cmd::Attach { id }) => {
-            find(&ctx, &id).and_then(|id| session(ctx, Target::Id(id)))
+            target(&ctx, id).and_then(|target| session(ctx, target))
         }
         Some(Cmd::Ls) => ls(&ctx),
         Some(Cmd::New) => new(&ctx),
@@ -213,16 +213,16 @@ fn daemon_cmd(ctx: &Ctx, action: &DaemonCmd) -> io::Result<()> {
     match action {
         DaemonCmd::Status => {
             let d = client::diagnose(home);
-            match d.pid {
-                None => println!("not running"),
-                Some(pid) => {
-                    match client::connect(&ctx.endpoint, &ctx.staged, &|| {})
-                        .and_then(client::Connection::sessions)
-                    {
-                        Ok(s) => println!("running (pid {pid}), {} sessions", s.len()),
-                        Err(e) => println!("running (pid {pid}) but not responding: {e}"),
-                    }
-                }
+            match (d.pid, client::status(home)) {
+                (None, _) | (_, Ok(None)) => println!("not running"),
+                (_, Ok(Some(s))) => println!(
+                    "running (pid {}, {}), {} sessions, {} other clients",
+                    s.pid,
+                    s.build,
+                    s.sessions,
+                    s.clients.saturating_sub(1)
+                ),
+                (Some(pid), Err(e)) => println!("running (pid {pid}) but not responding: {e}"),
             }
             println!("log: {}", d.log.display());
             if let Some(note) = d.crash_note() {
@@ -287,7 +287,13 @@ fn repl(ctx: Ctx, target: Target) -> io::Result<()> {
         let lock = || folding.lock().unwrap_or_else(PoisonError::into_inner);
         loop {
             while let Ok(Some(msg)) = reader.recv() {
-                if let Some(update) = lock().fold(&msg) {
+                let mut view = lock();
+                // Nothing to attach to: no such session.
+                if let (None, DaemonMsg::Error { message }) = (view.session, &msg) {
+                    eprintln!("a: {message}");
+                    std::process::exit(1);
+                }
+                if let Some(update) = view.fold(&msg) {
                     screen.show(&update.change);
                 }
             }
@@ -534,6 +540,16 @@ fn ls(ctx: &Ctx) -> io::Result<()> {
         );
     }
     Ok(())
+}
+
+/// The session `id` names, in full or as a prefix: this machine's daemon
+/// resolves it as it attaches; another machine's, which may be older, is
+/// asked for its list first.
+fn target(ctx: &Ctx, id: String) -> io::Result<Target> {
+    match ctx.endpoint {
+        Endpoint::Local(_) => Ok(Target::Prefix(id)),
+        Endpoint::Ssh(_) => find(ctx, &id).map(Target::Id),
+    }
 }
 
 fn find(ctx: &Ctx, prefix: &str) -> io::Result<SessionId> {

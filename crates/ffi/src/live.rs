@@ -11,18 +11,18 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
 use std::time::Duration;
 
-use boltffi::{EventSubscription, export};
+use boltffi::{EventSubscription, StreamProducer, export};
 use client::{Connection, Endpoint, Reader, Writer};
 use protocol::view::Link;
-use protocol::{ClientDecl, ClientMsg, Environment, SessionId, SettingsChange, Target};
+use protocol::{ClientDecl, ClientMsg, DaemonMsg, Environment, SessionId, SettingsChange, Target};
 use rt::{Runtime, Threads};
 use sys::install::CliLink;
 use sys::{Home, Staged};
 
 use crate::feed::{Feed, lock};
 use crate::{
-    CliStatus, ClientError, EnvVar, OpenTarget, Resync, SessionInfo, SessionSnapshot, Settings,
-    ViewChange, ViewUpdate,
+    CliStatus, ClientError, EnvVar, OpenTarget, Resync, SessionListUpdate, SessionSnapshot,
+    Settings, ViewChange, ViewUpdate,
 };
 
 fn runtime() -> &'static Threads {
@@ -132,16 +132,6 @@ impl Client {
         self.daemon.home.daemon_log().display().to_string()
     }
 
-    /// The daemon's sessions, starting it if needed.
-    pub async fn sessions(&self) -> Result<Vec<SessionInfo>, ClientError> {
-        let daemon = self.daemon.clone();
-        blocking(move || {
-            let sessions = daemon.connect()?.sessions()?;
-            Ok(sessions.iter().map(Into::into).collect())
-        })
-        .await
-    }
-
     /// The pid of the running daemon, if one is.
     pub fn daemon_pid(&self) -> Option<u32> {
         client::diagnose(&self.daemon.home).pid
@@ -213,6 +203,100 @@ impl Client {
             Ok(())
         })
         .await
+    }
+}
+
+/// How long a session watch waits to reconnect after losing the daemon.
+const REWATCH: Duration = Duration::from_secs(1);
+
+/// The daemon's session list as it changes, pushed by the daemon over one
+/// connection: subscribe to `updates`, then `start`.
+pub struct SessionWatch {
+    daemon: Daemon,
+    producer: Arc<StreamProducer<SessionListUpdate>>,
+    /// The open connection's write half, for the detach that ends it.
+    writer: Arc<Mutex<Option<Writer>>>,
+    /// Set when the watch is dropped: its reader stops reconnecting.
+    done: Arc<AtomicBool>,
+    started: AtomicBool,
+}
+
+#[export]
+impl SessionWatch {
+    pub fn new(client: &Client) -> Self {
+        Self {
+            daemon: client.daemon.clone(),
+            producer: Arc::new(StreamProducer::new(64)),
+            writer: Arc::default(),
+            done: Arc::default(),
+            started: AtomicBool::new(false),
+        }
+    }
+
+    /// The list now and after each change.
+    #[ffi_stream(item = SessionListUpdate)]
+    pub fn updates(&self) -> Arc<EventSubscription<SessionListUpdate>> {
+        self.producer.subscribe()
+    }
+
+    /// Watches until dropped, starting the daemon if needed and again
+    /// after it restarts (an upgrade, say); while it cannot be reached an
+    /// update says why. Starts once.
+    pub fn start(&self) {
+        if self.started.swap(true, Ordering::AcqRel) {
+            return;
+        }
+        let (daemon, producer) = (self.daemon.clone(), Arc::clone(&self.producer));
+        let (writer, done) = (Arc::clone(&self.writer), Arc::clone(&self.done));
+        runtime().spawn_blocking(Box::new(move || {
+            while !done.load(Ordering::Acquire) {
+                let problem = match daemon.connect().and_then(|mut conn| {
+                    conn.watch_sessions()?;
+                    Ok(conn)
+                }) {
+                    Ok(Connection {
+                        mut reader,
+                        writer: w,
+                        ..
+                    }) => {
+                        *lock(&writer) = Some(w);
+                        loop {
+                            match reader.recv() {
+                                Ok(Some(DaemonMsg::Sessions { sessions })) => {
+                                    producer.push(SessionListUpdate {
+                                        sessions: sessions.iter().map(Into::into).collect(),
+                                        problem: None,
+                                    });
+                                }
+                                Ok(Some(_)) => {}
+                                Ok(None) => break "the daemon closed the connection".to_owned(),
+                                Err(e) => break e.to_string(),
+                            }
+                        }
+                    }
+                    Err(e) => e.to_string(),
+                };
+                lock(&writer).take();
+                if done.load(Ordering::Acquire) {
+                    return;
+                }
+                producer.push(SessionListUpdate {
+                    sessions: Vec::new(),
+                    problem: Some(problem),
+                });
+                std::thread::sleep(REWATCH);
+            }
+        }));
+    }
+}
+
+/// Released by the app: the daemon is told, and the reader then ends.
+impl Drop for SessionWatch {
+    fn drop(&mut self) {
+        self.done.store(true, Ordering::Release);
+        if let Some(mut writer) = lock(&self.writer).take() {
+            let _ = writer.send(&ClientMsg::Detach);
+        }
     }
 }
 

@@ -5,8 +5,9 @@
 mod common;
 
 use std::fs;
-use std::io::BufReader;
+use std::io::{BufReader, Read};
 use std::os::unix::net::UnixStream;
+use std::process::Stdio;
 
 use common::Env;
 use protocol::{Body, Caps, ClientMsg, DaemonMsg, Outcome, PROTO, Target, read_frame, write_frame};
@@ -89,4 +90,46 @@ fn a_crash_loop_is_the_daemons_to_refuse() {
     env.run(&["ls"]);
     let count = fs::read_to_string(env.home.run_dir().join("crashes")).ok();
     assert!(count.as_ref().is_none_or(|n| n.trim() == "0"), "{count:?}");
+}
+
+/// What the daemon can answer, it is asked: the session a prefix names,
+/// its status, and to stop.
+#[test]
+fn the_daemon_resolves_prefixes_reports_its_status_and_stops_when_asked() {
+    let env = Env::new("ask");
+    let short = env.run(&["new"]).trim().to_owned();
+
+    let mut repl = env.repl(&["attach", &short[..5]]);
+    let shown = repl.lines_until("[session");
+    assert!(shown.last().unwrap().contains(&short), "{shown:?}");
+    repl.finish();
+    // Its stdin held open: it ends on the daemon's answer, not on EOF.
+    let mut missing = env
+        .cmd(&["attach", "zzzz"])
+        .stdin(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    let stdin = missing.stdin.take();
+    let mut told = String::new();
+    missing
+        .stderr
+        .take()
+        .unwrap()
+        .read_to_string(&mut told)
+        .unwrap();
+    assert!(!missing.wait().unwrap().success());
+    drop(stdin);
+    assert!(told.contains("no session matches zzzz"), "{told}");
+
+    let status = env.run(&["daemon", "status"]);
+    let pid = env.pid().unwrap();
+    assert!(
+        status.contains(&format!("running (pid {pid}")) && status.contains("1 sessions"),
+        "{status}"
+    );
+    assert_eq!(env.run(&["daemon", "stop"]).trim(), "stopped");
+    assert_eq!(env.pid(), None);
+    let log = fs::read_to_string(env.home.daemon_log()).unwrap();
+    assert!(log.contains("asked to stop, exiting"), "{log}");
 }

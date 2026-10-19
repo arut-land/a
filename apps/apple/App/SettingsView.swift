@@ -36,7 +36,7 @@ struct ModelSettings: View {
     @State private var vars: [VarRow] = []
     /// The settings as last loaded or saved: a save sends only the edit
     /// made since, so it keeps what another client saved meanwhile.
-    @State private var loaded: Settings?
+    @State private var loaded: AFfi.Settings?
     @State private var problem: String?
     @State private var saved = false
 
@@ -102,7 +102,7 @@ struct ModelSettings: View {
         .task { await load() }
     }
 
-    private func show(_ settings: Settings) {
+    private func show(_ settings: AFfi.Settings) {
         loaded = settings
         modelName = settings.model ?? ""
         agent = settings.agent
@@ -125,7 +125,7 @@ struct ModelSettings: View {
         let env = vars.map { EnvVar(name: $0.name, value: $0.value) }
         do {
             show(try await client.saveSettings(
-                from: loaded, to: Settings(model: modelName, agent: agent, env: env)))
+                from: loaded, to: AFfi.Settings(model: modelName, agent: agent, env: env)))
             problem = nil
             saved = true
         } catch {

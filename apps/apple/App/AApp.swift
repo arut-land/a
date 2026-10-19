@@ -81,7 +81,6 @@ final class AppModel {
         stores[id] = draft
         self.draft = nil
         selection = id
-        Task { await list?.refresh() }
     }
 
     func chooseWorkspace() {

@@ -443,8 +443,13 @@ tagged! {
 #[serde(rename_all = "snake_case")]
 pub enum Target {
     New,
-    Latest { any_workspace: bool },
+    Latest {
+        any_workspace: bool,
+    },
     Id(SessionId),
+    /// The one session whose id starts with this, in full or short form.
+    /// Only sent with [`Cap::Sessions`].
+    Prefix(String),
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -584,16 +589,23 @@ pub enum Cap {
     /// The daemon takes [`ClientMsg::Settings`]: it is the one writer of
     /// `$A_HOME/config.toml`.
     Settings,
+    /// The daemon takes [`ClientMsg::WatchSessions`] and attaches to a
+    /// [`Target::Prefix`].
+    Sessions,
+    /// The daemon takes [`ClientMsg::Status`] and [`ClientMsg::Shutdown`].
+    Daemon,
 }
 
 impl Cap {
     /// Every capability this build knows.
-    pub const ALL: [Self; 5] = [
+    pub const ALL: [Self; 7] = [
         Self::Snapshot,
         Self::Ack,
         Self::Declare,
         Self::Steer,
         Self::Settings,
+        Self::Sessions,
+        Self::Daemon,
     ];
 
     pub const fn name(self) -> &'static str {
@@ -603,6 +615,8 @@ impl Cap {
             Self::Declare => "declare",
             Self::Steer => "steer",
             Self::Settings => "settings",
+            Self::Sessions => "sessions",
+            Self::Daemon => "daemon",
         }
     }
 
@@ -879,6 +893,15 @@ tagged! {
         },
         List,
         Detach,
+        /// Asks for [`DaemonMsg::Sessions`] now and whenever a session's
+        /// summary changes, for as long as the connection lasts. Only sent
+        /// with [`Cap::Sessions`].
+        WatchSessions,
+        /// Asks for [`DaemonMsg::Status`]. Only sent with [`Cap::Daemon`].
+        Status,
+        /// Stops the daemon, as an idle one stops; the connection closes as
+        /// it exits. Only sent with [`Cap::Daemon`].
+        Shutdown,
         /// Asks for the [`HomeSettings`], after making `change` to them if
         /// there is one; answered with [`DaemonMsg::Settings`]. Only sent
         /// with [`Cap::Settings`].
@@ -934,6 +957,9 @@ impl ClientMsg {
             | Self::Environment(_)
             | Self::List
             | Self::Detach
+            | Self::WatchSessions
+            | Self::Status
+            | Self::Shutdown
             | Self::Settings { .. } => None,
         }
     }
@@ -983,6 +1009,15 @@ tagged! {
         },
         Sessions {
             sessions: Vec<SessionSummary>,
+        },
+        /// The answer to [`ClientMsg::Status`].
+        Status {
+            pid: u32,
+            build: String,
+            /// Seconds since the Unix epoch at start.
+            started: u64,
+            clients: u32,
+            sessions: u32,
         },
         /// The answer to [`ClientMsg::Settings`]: the settings as they are
         /// now, and why its change was not made, if it was not.
@@ -1102,6 +1137,7 @@ impl DaemonMsg {
             | Self::Draining
             | Self::Sessions { .. }
             | Self::Settings { .. }
+            | Self::Status { .. }
             | Self::Error { .. }
             | Self::Ack { .. }
             | Self::Rejected { .. }
@@ -1284,6 +1320,7 @@ fn known_msg(t: &str) -> bool {
             | "synced"
             | "sessions"
             | "settings"
+            | "status"
             | "recap"
             | "ask"
             | "error"
@@ -1662,6 +1699,13 @@ mod tests {
                 settings: HomeSettings::default(),
                 error: None,
             },
+            DaemonMsg::Status {
+                pid: 1,
+                build: "b".into(),
+                started: 0,
+                clients: 1,
+                sessions: 0,
+            },
             DaemonMsg::Recap(Recap::default()),
             DaemonMsg::Ask {
                 call: 1,
@@ -1699,6 +1743,7 @@ mod tests {
                 | DaemonMsg::Synced { .. }
                 | DaemonMsg::Sessions { .. }
                 | DaemonMsg::Settings { .. }
+                | DaemonMsg::Status { .. }
                 | DaemonMsg::Recap(_)
                 | DaemonMsg::Ask { .. }
                 | DaemonMsg::Error { .. }

@@ -21,7 +21,7 @@ use protocol::view::{
 use protocol::{Card, Outcome, Recap, SessionSummary};
 
 pub use feed::Reducer;
-pub use live::{Client, Session};
+pub use live::{Client, Session, SessionWatch};
 
 /// What went wrong, by kind. [`ClientError::code`] is stable across builds,
 /// for clients that branch on it or localize it.
@@ -111,6 +111,15 @@ pub struct SessionInfo {
     pub residency: String,
     /// Whether it waits on the user.
     pub requires_action: bool,
+}
+
+/// The daemon's sessions, oldest first, as a [`SessionWatch`] sees them
+/// change; or, while it cannot reach the daemon, why.
+#[data]
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct SessionListUpdate {
+    pub sessions: Vec<SessionInfo>,
+    pub problem: Option<String>,
 }
 
 impl From<&SessionSummary> for SessionInfo {

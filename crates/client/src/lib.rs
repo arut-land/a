@@ -128,6 +128,18 @@ impl Connection {
         }
     }
 
+    /// Asks for the session list now and on every change, as
+    /// [`DaemonMsg::Sessions`].
+    pub fn watch_sessions(&mut self) -> io::Result<()> {
+        if !self.welcome.caps.has(Cap::Sessions) {
+            return Err(io::Error::new(
+                io::ErrorKind::Unsupported,
+                "the daemon is older than this a; restart it to watch sessions",
+            ));
+        }
+        self.writer.send(&ClientMsg::WatchSessions)
+    }
+
     /// The daemon's sessions.
     pub fn sessions(mut self) -> io::Result<Vec<SessionSummary>> {
         self.writer.send(&ClientMsg::List)?;
@@ -471,14 +483,25 @@ fn live_daemon(home: &Home) -> Option<Record> {
         .ok()
 }
 
-/// Stops the daemon: SIGTERM, then SIGKILL if it still holds its lock after
-/// `HELLO_TIMEOUT`. Each signal goes only to the process the daemon
-/// recorded, checked by its start time as well as its pid. Returns whether
-/// a daemon was running.
+/// Stops the daemon: asked over its socket, as an idle one stops; else, as
+/// for one too old to be asked or too wedged to answer, SIGTERM, then
+/// SIGKILL if it still holds its lock after `HELLO_TIMEOUT`. Each signal
+/// goes only to the process the daemon recorded, checked by its start time
+/// as well as its pid. Returns whether a daemon was running.
 pub fn stop(home: &Home) -> io::Result<bool> {
     let Some(daemon) = live_daemon(home) else {
         return Ok(false);
     };
+    #[cfg(unix)]
+    if ask_to_stop(home, &daemon.build).is_ok() {
+        let deadline = Instant::now() + HELLO_TIMEOUT;
+        while live_daemon(home).is_some_and(|d| d.pid == daemon.pid) && Instant::now() < deadline {
+            thread::sleep(Duration::from_millis(5));
+        }
+        if live_daemon(home).is_none_or(|d| d.pid != daemon.pid) {
+            return Ok(true);
+        }
+    }
     let signal = |signal| {
         if !daemon.is_live() {
             return Err(io::Error::other(format!(
@@ -507,6 +530,78 @@ pub fn stop(home: &Home) -> io::Result<bool> {
         file.set_len(0)?;
     }
     Ok(true)
+}
+
+/// Connects to the running daemon, as its own build `build` so as not to
+/// set off a drain, without starting one.
+#[cfg(unix)]
+fn reach(home: &Home, build: &str) -> io::Result<(UnixStream, Connection)> {
+    let stream = UnixStream::connect(home.socket())?;
+    read_timeout(&stream, Some(HELLO_TIMEOUT))?;
+    let mut conn = split(&stream)?;
+    match hello(&mut conn, build, &[])? {
+        Greeting::Welcome if conn.welcome.caps.has(Cap::Daemon) => Ok((stream, conn)),
+        _ => Err(io::Error::new(
+            io::ErrorKind::Unsupported,
+            "the daemon cannot be asked",
+        )),
+    }
+}
+
+/// Asks the daemon to stop, and waits for it to close the connection as
+/// it exits.
+#[cfg(unix)]
+fn ask_to_stop(home: &Home, build: &str) -> io::Result<()> {
+    let (stream, mut conn) = reach(home, build)?;
+    conn.writer.send(&ClientMsg::Shutdown)?;
+    read_timeout(&stream, Some(DRAIN_TIMEOUT))?;
+    conn.reader.drained()
+}
+
+/// What the running daemon says of itself, if one runs and answers; never
+/// starts one.
+#[cfg(unix)]
+pub fn status(home: &Home) -> io::Result<Option<Status>> {
+    let Some(daemon) = live_daemon(home) else {
+        return Ok(None);
+    };
+    let (_, mut conn) = reach(home, &daemon.build)?;
+    conn.writer.send(&ClientMsg::Status)?;
+    conn.reader
+        .until(|msg| match msg {
+            DaemonMsg::Status {
+                pid,
+                build,
+                started,
+                clients,
+                sessions,
+            } => Some(Status {
+                pid,
+                build,
+                started,
+                clients,
+                sessions,
+            }),
+            _ => None,
+        })
+        .map(Some)
+}
+
+#[cfg(not(unix))]
+pub fn status(_home: &Home) -> io::Result<Option<Status>> {
+    Err(unsupported())
+}
+
+/// What a daemon says of itself; see [`status`].
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Status {
+    pub pid: u32,
+    pub build: String,
+    /// Seconds since the Unix epoch at start.
+    pub started: u64,
+    /// Connections open, this one included.
+    pub clients: u32,
+    pub sessions: u32,
 }
 
 /// Stops any running daemon and connects to a fresh one, which serves even
