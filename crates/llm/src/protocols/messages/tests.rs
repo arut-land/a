@@ -6,6 +6,7 @@ mod decode;
 mod encode;
 mod hosts;
 mod options;
+mod oracle;
 mod tools;
 
 use serde_json::{Value, json};

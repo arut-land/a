@@ -7,7 +7,11 @@ use serde_json::{Map, Number, Value};
 
 mod read;
 
-pub(crate) use read::{Fields, First, Json, Obj, Str, fields, next, tag, word};
+#[cfg(test)]
+pub(crate) use read::Str;
+pub(crate) use read::{
+    Count, Fielded, Fields, First, FromFields, Json, Obj, Word, fields, next, tag, word,
+};
 
 /// Lenient reads of a JSON value: a missing field or one of the wrong type
 /// is `None`, and numbers may arrive as strings.
