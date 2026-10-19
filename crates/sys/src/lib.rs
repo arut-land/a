@@ -148,10 +148,6 @@ mod other {
         None
     }
 
-    pub fn await_exit(_pid: u32) -> io::Result<()> {
-        Err(io::ErrorKind::Unsupported.into())
-    }
-
     pub fn exit_watch(_pid: u32) -> io::Result<std::convert::Infallible> {
         Err(io::ErrorKind::Unsupported.into())
     }
@@ -336,19 +332,6 @@ mod unix {
     #[cfg(not(any(target_os = "linux", target_vendor = "apple")))]
     pub fn process_started(_pid: u32) -> Option<u64> {
         None
-    }
-
-    /// Blocks until child `pid` has exited, leaving it to be reaped: its
-    /// `Child` still collects the status.
-    pub fn await_exit(pid: u32) -> io::Result<()> {
-        let pid = self::pid(pid)?;
-        let options = process::WaitIdOptions::EXITED | process::WaitIdOptions::NOWAIT;
-        loop {
-            match process::waitid(process::WaitId::Pid(pid), options) {
-                Err(rustix::io::Errno::INTR) => {}
-                result => return result.map(drop).map_err(io::Error::from),
-            }
-        }
     }
 
     /// A descriptor that turns readable once process `pid` has exited
@@ -630,17 +613,6 @@ mod tests {
         assert!(!child.wait().unwrap().success());
         kill_process_group(child.id()).unwrap();
         assert!(boot_id().is_some_and(|id| !id.is_empty()));
-    }
-
-    #[test]
-    fn an_exit_is_awaited_and_left_for_the_child_to_reap() {
-        let mut child = std::process::Command::new("sh")
-            .args(["-c", "exit 3"])
-            .spawn()
-            .unwrap();
-        await_exit(child.id()).unwrap();
-        await_exit(child.id()).unwrap();
-        assert_eq!(child.try_wait().unwrap().and_then(|s| s.code()), Some(3));
     }
 
     #[test]

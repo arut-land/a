@@ -103,15 +103,21 @@ impl Kill {
         Self { pgid, asked: None }
     }
 
-    /// Moves the stop along; call it until the leader has exited.
-    pub fn tick(&mut self) {
+    /// Moves the stop along; call it again by the time it returns, until
+    /// the leader has exited. `None` once it is down to SIGKILL.
+    pub fn tick(&mut self) -> Option<Instant> {
         match self.asked {
             None => {
-                self.asked = Some(Instant::now());
+                let now = Instant::now();
+                self.asked = Some(now);
                 let _ = sys::signal_group(self.pgid, Signal::Terminate);
+                Some(now + Self::GRACE)
             }
-            Some(at) if at.elapsed() >= Self::GRACE => self.now(),
-            Some(_) => {}
+            Some(at) if at.elapsed() >= Self::GRACE => {
+                self.now();
+                None
+            }
+            Some(at) => Some(at + Self::GRACE),
         }
     }
 

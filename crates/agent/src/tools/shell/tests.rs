@@ -308,6 +308,19 @@ fn a_call_cancelled_before_it_starts_spawns_nothing() {
     assert_eq!(model(&ran), "(no output)\n[aborted]");
 }
 
+/// Waiting on a command costs the reactor a wake for its exit and its
+/// output, not one per tick.
+#[test]
+fn a_quiet_command_wakes_nothing_while_it_runs() {
+    let rig = rig("quiet");
+    run(&rig, "true");
+    let before = rt::wakes();
+    let ran = run(&rig, "sleep 1");
+    let woke = rt::wakes() - before;
+    assert_eq!(ran.exit, Some(0));
+    assert!(woke < 10, "{woke} wakes");
+}
+
 #[test]
 fn a_background_command_returns_at_once_with_its_log() {
     let rig = rig("background");
@@ -334,7 +347,7 @@ fn a_background_command_returns_at_once_with_its_log() {
 #[test]
 fn a_job_end_is_seen_at_once() {
     let rig = rig("job-ends");
-    for command in ["sleep 0.3", "(sleep 0.3 &); exit 0"] {
+    for command in ["sleep 1", "(sleep 1 &); exit 0"] {
         let mut seen = crate::job::ENDED.count();
         let ran = bash(&rig, &json!({ "command": command, "background": true }));
         let pgid = ran.background.unwrap().pgid;
@@ -342,8 +355,9 @@ fn a_job_end_is_seen_at_once() {
         rt::block_on(crate::job::ENDED.changed(&mut seen));
         let took = started.elapsed();
         assert!(!sys::group_alive(pgid), "{command}");
-        assert!(took >= Duration::from_millis(250), "{command}: {took:?}");
-        assert!(took < Duration::from_millis(1000), "{command}: {took:?}");
+        // Re-checking on a backoff would first look again at 1.55 s.
+        assert!(took >= Duration::from_millis(900), "{command}: {took:?}");
+        assert!(took < Duration::from_millis(1300), "{command}: {took:?}");
     }
 }
 

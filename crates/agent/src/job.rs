@@ -45,7 +45,7 @@ async fn any_exit(pgid: u32) -> bool {
 
     let watches: Vec<_> = sys::group_members(pgid)
         .into_iter()
-        .filter_map(|pid| rt::Async::new(sys::exit_watch(pid).ok()?).ok())
+        .filter_map(|pid| rt::Async::for_reading(sys::exit_watch(pid).ok()?).ok())
         .collect();
     if watches.is_empty() {
         return false;

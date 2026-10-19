@@ -11,24 +11,30 @@
 
 use std::collections::BTreeMap;
 use std::fmt::Write as _;
-use std::future::Future;
-use std::io::{self, Read};
+#[cfg(unix)]
+use std::future::{Future, poll_fn};
+use std::io;
+#[cfg(unix)]
+use std::io::Read;
 use std::path::{Path, PathBuf};
-use std::pin::pin;
+#[cfg(unix)]
+use std::pin::{Pin, pin};
 use std::process::{Child, Command as Process, ExitStatus, Stdio};
-use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::mpsc::{self, RecvTimeoutError};
-use std::task::{Context, Wake, Waker};
+#[cfg(unix)]
+use std::task::Poll;
 use std::time::{Duration, Instant};
 
 use protocol::{Card, Environment};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
-use super::output::{Live, Output, Rendered, Spill, create_private, private_dir};
+#[cfg(unix)]
+use super::output::Live;
+use super::output::{Output, Rendered, Spill, create_private, private_dir};
+#[cfg(unix)]
+use crate::Kill;
 use crate::state::Cwd;
-use crate::{Cancel, Cx, Kill, Spawn, Tool};
+use crate::{Cx, Spawn, Tool};
 
 pub struct Bash;
 
@@ -253,11 +259,7 @@ async fn run(input: Command, cx: &Cx) -> io::Result<Ran> {
     cx.spawned(pgid, false);
     let limit = input.timeout.unwrap_or(TIMEOUT).clamp(1, MAX_TIMEOUT);
     let output = Output::new(Spill::new(log));
-    let reporter = cx.clone();
-    let done = rt::unblock(&*cx.rt, move || {
-        supervise(child, reader, Duration::from_secs(limit), &reporter, output)
-    })
-    .await?;
+    let done = supervise(child, reader, Duration::from_secs(limit), cx, output).await?;
 
     let ended = std::fs::read_to_string(&report).ok();
     let _ = std::fs::remove_file(&report);
@@ -433,91 +435,30 @@ struct Finished {
     output: Rendered,
 }
 
-/// What the supervisor of a command hears about.
-enum Event {
-    Output(Vec<u8>),
-    /// Every holder of the pipe closed it.
-    Eof,
-    /// The shell exited, or waiting for it failed: either way its status
-    /// is looked at.
-    Exited,
-    /// The call was cancelled.
-    Cancelled,
-}
-
-/// Wakes the supervisor when the call is cancelled.
-struct Notify(mpsc::SyncSender<Event>);
-
-impl Wake for Notify {
-    fn wake(self: Arc<Self>) {
-        // A full channel is read at once anyway, and every read checks the
-        // flag.
-        let _ = self.0.try_send(Event::Cancelled);
-    }
-}
-
-/// The events of a command whose shell is `pgid`, as the threads reading its
-/// output and awaiting its exit, and a cancel of the call, send them; and
-/// whether its exit has to be polled for instead, where nothing reports it.
-fn listen(
-    mut reader: io::PipeReader,
-    pgid: u32,
-    cancel: &Cancel,
-) -> (mpsc::Receiver<Event>, Arc<AtomicBool>) {
-    let (tx, rx) = mpsc::sync_channel::<Event>(16);
-    // A reader of its own, so waiting for output never hides an exit. It
-    // ends at EOF, or at the first chunk after this call stopped
-    // listening; a process that escaped the group and holds the pipe
-    // silently keeps it parked until that process exits.
-    let out = tx.clone();
-    std::thread::spawn(move || {
-        let mut buf = vec![0; 64 * 1024];
-        while let Ok(n @ 1..) = reader.read(&mut buf) {
-            if out.send(Event::Output(buf[..n].to_vec())).is_err() {
-                return;
-            }
-        }
-        let _ = out.send(Event::Eof);
-    });
-    let poll = Arc::new(AtomicBool::new(cfg!(not(unix))));
-    if cfg!(unix) {
-        let (exited, poll) = (tx.clone(), Arc::clone(&poll));
-        std::thread::spawn(move || {
-            if sys::await_exit(pgid).is_err() {
-                poll.store(true, Ordering::Relaxed);
-            }
-            let _ = exited.send(Event::Exited);
-        });
-    }
-    let waker = Waker::from(Arc::new(Notify(tx)));
-    // Cancelled already, nothing registers the waker: it is woken now.
-    if pin!(cancel.cancelled())
-        .poll(&mut Context::from_waker(&waker))
-        .is_ready()
-    {
-        waker.wake();
-    }
-    (rx, poll)
-}
-
 /// Reads the command's output until it ends, reporting it as it comes and
 /// stopping the command when it runs out of time or the call is cancelled.
-/// Blocks, waking only for output, the shell's exit, a cancel or a
-/// deadline: a quiet command costs nothing while it runs.
-fn supervise(
+/// It waits, as a task on the reactor, for whichever comes first of
+/// output, the shell's exit, a cancel and the next deadline: a quiet
+/// command costs no thread and no wake-up while it runs.
+#[cfg(unix)]
+async fn supervise(
     mut child: Child,
     reader: io::PipeReader,
     limit: Duration,
     cx: &Cx,
     mut output: Output,
 ) -> io::Result<Finished> {
-    let cancel: &Cancel = &cx.cancel;
-    let mut live = Live::default();
     let pgid = child.id();
-    let (rx, poll) = listen(reader, pgid, cancel);
+    let pipe = rt::Async::for_reading(reader)?;
+    // Where the exit cannot be watched (a kernel without pidfds), it is
+    // looked for every tick.
+    let exit = sys::exit_watch(pgid).and_then(rt::Async::for_reading).ok();
+    let mut buf = vec![0; 64 * 1024];
+    let mut live = Live::default();
     let started = Instant::now();
     let mut kill = Kill::new(pgid);
-    let (mut status, mut stopped, mut eof) = (None, None, false);
+    let mut killing: Option<Instant> = None;
+    let (mut status, mut stopped, mut eof, mut exit_seen) = (None, None, false, false);
     let mut exited: Option<Instant> = None;
     let mut heard = Instant::now();
     let mut reported = Instant::now();
@@ -525,25 +466,42 @@ fn supervise(
     loop {
         let next = match exited {
             Some(at) => (heard.max(at) + IDLE).min(at + LINGER),
-            None if stopped.is_some() || poll.load(Ordering::Relaxed) => Instant::now() + TICK,
-            None => started + limit,
+            None if exit.is_none() || exit_seen => Instant::now() + TICK,
+            None => match stopped {
+                Some(_) => killing.unwrap_or(started + Duration::from_secs(MAX_TIMEOUT * 2)),
+                None => started + limit,
+            },
         };
         let next = if unreported {
             next.min(reported + REPORT)
         } else {
             next
         };
-        let event = rx.recv_timeout(next.saturating_duration_since(Instant::now()));
-        match event {
-            Ok(Event::Output(chunk)) => {
-                output.push(&chunk);
-                live.push(&chunk);
-                heard = Instant::now();
-                unreported = true;
-            }
-            Ok(Event::Eof) | Err(RecvTimeoutError::Disconnected) => eof = true,
-            Ok(Event::Exited | Event::Cancelled) | Err(RecvTimeoutError::Timeout) => {}
+        let wait = next.saturating_duration_since(Instant::now());
+        if !wait.is_zero() {
+            let readable = when(!eof, pipe.readable());
+            let watched = exit.as_ref().filter(|_| status.is_none() && !exit_seen);
+            let exits = when(watched.is_some(), async {
+                if let Some(exit) = watched {
+                    exit.readable().await;
+                }
+            });
+            let cancelled = when(stopped.is_none(), cx.cancel.cancelled());
+            let woke = first([
+                pin!(readable),
+                pin!(exits),
+                pin!(cancelled),
+                pin!(cx.rt.sleep(wait)),
+            ])
+            .await;
+            exit_seen |= woke == 1;
         }
+        eof |= drain(&pipe, &mut buf, |chunk| {
+            output.push(chunk);
+            live.push(chunk);
+            heard = Instant::now();
+            unreported = true;
+        });
         if unreported && reported.elapsed() >= REPORT {
             unreported = false;
             if let Some(text) = live.take() {
@@ -565,7 +523,7 @@ fn supervise(
             continue;
         }
         if stopped.is_none() {
-            stopped = if cancel.is_cancelled() {
+            stopped = if cx.cancel.is_cancelled() {
                 Some(Stop::Aborted)
             } else if started.elapsed() >= limit {
                 Some(Stop::TimedOut)
@@ -573,19 +531,11 @@ fn supervise(
                 None
             };
         }
-        if stopped.is_some() {
-            kill.tick();
-            // Without process groups to signal, only the shell can be.
-            if cfg!(not(unix)) {
-                let _ = child.kill();
-            }
+        if stopped.is_some() && killing.is_none_or(|at| Instant::now() >= at) {
+            killing = kill.tick();
         }
     }
-    while let Ok(event) = rx.try_recv() {
-        if let Event::Output(chunk) = event {
-            output.push(&chunk);
-        }
-    }
+    drain(&pipe, &mut buf, |chunk| output.push(chunk));
     let mut lingering = sys::group_alive(pgid);
     // A command that was stopped leaves nothing behind.
     if lingering && stopped.is_some() {
@@ -597,6 +547,56 @@ fn supervise(
         stopped,
         lingering,
         output: output.finish(),
+    })
+}
+
+/// No daemon runs where processes have no groups to stop.
+#[cfg(not(unix))]
+#[allow(clippy::unused_async)]
+async fn supervise(
+    _child: Child,
+    _reader: io::PipeReader,
+    _limit: Duration,
+    _cx: &Cx,
+    _output: Output,
+) -> io::Result<Finished> {
+    Err(io::ErrorKind::Unsupported.into())
+}
+
+/// Reads what the pipe has without waiting, handing each chunk to
+/// `chunk`; whether it ended.
+#[cfg(unix)]
+fn drain(pipe: &rt::Async<io::PipeReader>, buf: &mut [u8], mut chunk: impl FnMut(&[u8])) -> bool {
+    loop {
+        match { pipe.get_ref() }.read(buf) {
+            Ok(0) => return true,
+            Ok(n) => chunk(&buf[..n]),
+            Err(e) if e.kind() == io::ErrorKind::Interrupted => {}
+            Err(e) => return e.kind() != io::ErrorKind::WouldBlock,
+        }
+    }
+}
+
+/// `future`, or one that never resolves when `cond` does not hold.
+#[cfg(unix)]
+async fn when(cond: bool, future: impl Future<Output = ()>) {
+    if cond {
+        future.await;
+    } else {
+        std::future::pending::<()>().await;
+    }
+}
+
+/// Which of `futures` resolved first.
+#[cfg(unix)]
+fn first<const N: usize>(
+    mut futures: [Pin<&mut (dyn Future<Output = ()> + Send)>; N],
+) -> impl Future<Output = usize> {
+    poll_fn(move |cx| {
+        futures
+            .iter_mut()
+            .position(|f| f.as_mut().poll(cx).is_ready())
+            .map_or(Poll::Pending, Poll::Ready)
     })
 }
 

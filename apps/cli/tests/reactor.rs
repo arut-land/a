@@ -34,6 +34,50 @@ fn an_idle_daemon_never_wakes() {
 }
 
 #[test]
+fn a_running_quiet_command_costs_no_threads() {
+    const CALLS: usize = 30;
+    let env = Env::new("quiet-threads");
+    let pid = env.start();
+    let mut conns: Vec<_> = (0..CALLS)
+        .map(|_| {
+            let mut conn = env.connect();
+            conn.attach(Target::New, &env.ws);
+            conn
+        })
+        .collect();
+    // Warm: one call each first, so pools are as big as they get.
+    for conn in &mut conns {
+        conn.input("$ true");
+    }
+    for conn in &mut conns {
+        conn.until(|e| matches!(e.body, Body::ToolResult { .. }));
+    }
+    let (idle, _) = threads_and_switches(pid);
+    for conn in &mut conns {
+        conn.input("$ sleep 30");
+    }
+    for conn in &mut conns {
+        conn.until(|e| matches!(e.body, Body::ToolProcess { .. }));
+    }
+    std::thread::sleep(Duration::from_millis(300));
+    let (running, before) = threads_and_switches(pid);
+    std::thread::sleep(Duration::from_secs(2));
+    let (_, after) = threads_and_switches(pid);
+    eprintln!(
+        "threads: {idle} with {CALLS} sessions, {running} with {CALLS} `sleep 30` running; \
+         {} wakes in 2 s while they run",
+        after - before
+    );
+    assert!(
+        running <= idle,
+        "{CALLS} quiet commands took {} threads",
+        running - idle
+    );
+    assert_eq!(after - before, 0, "quiet commands woke the daemon");
+    env.cmd(&["daemon", "stop"]).status().unwrap();
+}
+
+#[test]
 fn a_job_end_is_seen_at_once() {
     let env = Env::new("job-exit");
     let config = env.home.config_file();

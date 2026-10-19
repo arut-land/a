@@ -244,17 +244,32 @@ mod io {
 
     impl<T: AsFd> Async<T> {
         pub fn new(io: T) -> io::Result<Self> {
-            rustix::io::ioctl_fionbio(&io, true)?;
+            Self::register(io, Interest::READABLE | Interest::WRITABLE)
+        }
+
+        /// For a descriptor only ever read, or one that only signals (a
+        /// pipe's read end, a pidfd): it is not watched for writing, which
+        /// some descriptors refuse.
+        pub fn for_reading(io: T) -> io::Result<Self> {
+            Self::register(io, Interest::READABLE)
+        }
+
+        fn register(io: T, interest: Interest) -> io::Result<Self> {
+            match rustix::io::ioctl_fionbio(&io, true) {
+                // Nothing is read from a descriptor that has no modes,
+                // such as a kqueue watching a process: it only signals.
+                Ok(()) | Err(rustix::io::Errno::NOTTY) => {}
+                Err(e) => return Err(e.into()),
+            }
             let reactor = Reactor::get();
             let key = usize::try_from(reactor.id()).map_err(io::Error::other)?;
             let source = Arc::new(Source::default());
             lock(&reactor.sources).insert(key, Arc::clone(&source));
             let fd = io.as_fd().as_raw_fd();
-            let registered = reactor.registry.register(
-                &mut SourceFd(&fd),
-                mio::Token(key),
-                Interest::READABLE | Interest::WRITABLE,
-            );
+            let registered =
+                reactor
+                    .registry
+                    .register(&mut SourceFd(&fd), mio::Token(key), interest);
             if let Err(e) = registered {
                 lock(&reactor.sources).remove(&key);
                 return Err(e);
