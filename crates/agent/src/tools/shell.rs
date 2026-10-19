@@ -368,11 +368,16 @@ fn environment(
     cx: &Cx,
     daemon: impl Iterator<Item = (String, String)>,
 ) -> BTreeMap<String, String> {
-    let mut env: BTreeMap<String, String> = match &cx.env {
+    let mut env = match &cx.env {
         Some(env) => env.vars.clone(),
-        None => daemon
-            .filter(|(name, _)| !Environment::is_secret(name))
-            .collect(),
+        None => {
+            // Inserted one by one: collecting would sort, in code of its own.
+            let mut env = BTreeMap::new();
+            for (name, value) in daemon.filter(|(name, _)| !Environment::is_secret(name)) {
+                env.insert(name, value);
+            }
+            env
+        }
     };
     for (name, value) in QUIET {
         env.insert(name.to_owned(), value.to_owned());
