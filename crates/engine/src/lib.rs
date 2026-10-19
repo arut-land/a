@@ -207,9 +207,10 @@ struct Slot {
     /// The parent has fired its watch on this child, so reports are moot.
     /// Known only since this daemon started.
     heard: AtomicBool,
-    /// How many entries its log holds while hibernated, once counted:
-    /// only a loaded session appends, so listing reads each log once.
-    entries: Mutex<Option<u64>>,
+    /// How it lists while hibernated: as it was when it hibernated, or
+    /// once counted from its log. Only a loaded session appends, so listing
+    /// reads each log once.
+    last: Mutex<Option<SessionSummary>>,
 }
 
 impl Slot {
@@ -218,7 +219,7 @@ impl Slot {
             header,
             live: Mutex::new(live),
             heard: AtomicBool::new(false),
-            entries: Mutex::new(None),
+            last: Mutex::new(None),
         })
     }
 }
@@ -285,7 +286,7 @@ impl Daemon {
             Some(session) => session,
             empty @ None => {
                 let loaded = self.shared.store.load(slot.header.id)?;
-                *lock(&slot.entries) = None;
+                *lock(&slot.last) = None;
                 empty.insert(Session::start(
                     slot.header.clone(),
                     loaded,
@@ -333,17 +334,18 @@ impl Daemon {
             .iter()
             .map(|slot| match &*lock(&slot.live) {
                 Some(session) => session.summary(),
-                None => SessionSummary {
-                    id: slot.header.id,
-                    workspace: slot.header.workspace.clone(),
-                    entries: *lock(&slot.entries).get_or_insert_with(|| {
-                        self.shared.store.count(slot.header.id).unwrap_or(0)
-                    }),
-                    clients: 0,
-                    // Only a session with no work is unloaded.
-                    activity: Activity::Idle,
-                    residency: Residency::Hibernated,
-                },
+                None => lock(&slot.last)
+                    .get_or_insert_with(|| SessionSummary {
+                        id: slot.header.id,
+                        workspace: slot.header.workspace.clone(),
+                        entries: self.shared.store.count(slot.header.id).unwrap_or(0),
+                        clients: 0,
+                        // Not loaded since the daemon started, so idle: one
+                        // with work or an ask has a busy marker, and loads.
+                        activity: Activity::Idle,
+                        residency: Residency::Hibernated,
+                    })
+                    .clone(),
             })
             .collect()
     }
@@ -356,7 +358,11 @@ impl Daemon {
             if live.as_ref().is_some_and(|s| s.idle_for() >= after)
                 && let Some(session) = live.take()
             {
-                *lock(&slot.entries) = Some(session.summary().entries);
+                *lock(&slot.last) = Some(SessionSummary {
+                    clients: 0,
+                    residency: Residency::Hibernated,
+                    ..session.summary()
+                });
                 session_event("hibernate", session.id, String::new);
                 session.stop();
             }

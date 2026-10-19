@@ -1,7 +1,7 @@
 use std::path::PathBuf;
 use std::time::{Duration, Instant};
 
-use protocol::{Body, Entry, Environment, Outcome, SessionId, Target};
+use protocol::{Activity, Body, Entry, Environment, Outcome, Residency, SessionId, Target};
 use serde_json::json;
 use store::{Header, Jsonl, LogStore};
 use sys::Home;
@@ -158,6 +158,52 @@ fn busy_sessions_recover_at_startup() {
     ));
     assert_eq!(got.len(), 5);
     assert!(!still_busy);
+}
+
+/// A session waiting for approval is listed as such once hibernated, and
+/// a restarted daemon loads it at once to ask again.
+#[test]
+fn a_session_waiting_for_approval_stays_waiting_through_hibernation_and_a_restart() {
+    let (root, home) = home("asked");
+    let config = Config {
+        ask: vec!["bash".into()],
+        ..echo()
+    };
+    let daemon = Daemon::load(&home, &config).unwrap();
+    let attachment = daemon.resolve(&Target::New, "/w".into()).unwrap();
+    let id = attachment.session().id;
+    attachment.session().submit("$ echo hi".into()).unwrap();
+    settle(&daemon);
+    drop(attachment);
+    daemon.hibernate(Duration::ZERO);
+    let hibernated = daemon.list().remove(0);
+    // The stopped actor ends its unit of work.
+    let deadline = Instant::now() + Duration::from_millis(300);
+    while daemon.shared.store.is_busy(id) && Instant::now() < deadline {
+        std::thread::sleep(Duration::from_millis(5));
+    }
+    drop(daemon);
+
+    let restarted = Daemon::load(&home, &config).unwrap();
+    let listed = restarted.list().remove(0);
+    let asked = restarted.slots()[0]
+        .live
+        .lock()
+        .unwrap()
+        .as_ref()
+        .map(|s| s.summary().activity);
+    drop(restarted);
+    std::fs::remove_dir_all(&root).unwrap();
+
+    assert_eq!(
+        (hibernated.activity, hibernated.residency),
+        (Activity::Approval, Residency::Hibernated)
+    );
+    assert_eq!(
+        (listed.activity, listed.residency),
+        (Activity::Approval, Residency::Loaded)
+    );
+    assert_eq!(asked, Some(Activity::Approval));
 }
 
 fn fired(bodies: &[Body]) -> Vec<&Outcome> {

@@ -770,7 +770,14 @@ impl Session {
             self.running.store(false, Ordering::SeqCst);
         }
         let settled = self.queued.fetch_sub(1, Ordering::SeqCst) == 1;
-        if settled && let Err(e) = self.mark_busy(false).await {
+        // Stopped while it waits for approval, it stays marked: the next
+        // daemon loads it at once and asks again.
+        let stopped = lock(&self.answers).stopped;
+        let asking = stopped && !inbox(&self.lock().entries).is_empty();
+        if settled
+            && !asking
+            && let Err(e) = self.mark_busy(false).await
+        {
             self.warn(format_args!("busy marker: {e}"));
         }
         self.touch();
