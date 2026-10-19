@@ -10,18 +10,19 @@
 //! OPENAI_BASE_URL = "https://.../v1"
 //! ```
 //!
-//! Only the TOML this schema needs is read: comments, `[table]` headers and
-//! `key = "string"` (basic or literal). Anything else is kept verbatim on
-//! write but ignored, so a hand-edited file loses nothing to the app's
-//! settings pane. The file may hold secrets: it is written 0600, through an
-//! exclusive temporary file renamed into place.
+//! The file is edited in place: writing changes only the schema's keys, so
+//! comments and the keys and tables a hand-edited file adds survive the
+//! app's settings pane. The file may hold secrets: it is written 0600,
+//! through an exclusive temporary file renamed into place.
 
 use std::collections::BTreeMap;
-use std::fmt::Write as _;
+use std::fmt;
 use std::fs;
 use std::io::{self, Write as _};
 use std::path::Path;
 use std::str::FromStr;
+
+use toml_edit::{DocumentMut, Item, TableLike, TomlError};
 
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct Config {
@@ -32,24 +33,11 @@ pub struct Config {
     pub env: BTreeMap<String, String>,
 }
 
-/// The keys this schema knows, by table (`None` is the root).
-fn known(table: Option<&str>, key: &str) -> bool {
-    match table {
-        None => matches!(key, "model" | "agent"),
-        Some(table) => table == "env",
-    }
-}
-
 impl Config {
     /// The file at `path`; a missing file is the empty config.
     pub fn read(path: &Path) -> io::Result<Self> {
         match fs::read_to_string(path) {
-            Ok(text) => text.parse().map_err(|e: ParseError| {
-                io::Error::new(
-                    io::ErrorKind::InvalidData,
-                    format!("{}: {e}", path.display()),
-                )
-            }),
+            Ok(text) => text.parse().map_err(|e| invalid(path, &e)),
             Err(e) if e.kind() == io::ErrorKind::NotFound => Ok(Self::default()),
             Err(e) => Err(e),
         }
@@ -71,87 +59,56 @@ impl Config {
             Err(e) if e.kind() == io::ErrorKind::NotFound => String::new(),
             Err(e) => return Err(e),
         };
-        write_private(path, self.render(&old).as_bytes())
+        let text = self.render(&old).map_err(|e| invalid(path, &e))?;
+        write_private(path, text.as_bytes())
     }
 
     /// `old` with the schema's keys replaced by this config's: in place
     /// where they were, else at the end of their table.
-    fn render(&self, old: &str) -> String {
-        let mut out = String::new();
-        let mut table: Option<String> = None;
-        let mut env_seen = false;
-        let mut written = Vec::new();
-        for line in old.lines() {
-            match parse_line(line) {
-                Ok(Line::Table(name)) => {
-                    self.finish(table.as_deref(), &mut written, &mut out);
-                    env_seen |= name == "env";
-                    table = Some(name);
-                }
-                Ok(Line::Pair(key, _)) if known(table.as_deref(), &key) => {
-                    let scoped = (table.is_some(), key);
-                    if let Some(value) = self.value(table.as_deref(), &scoped.1)
-                        && !written.contains(&scoped)
-                    {
-                        pair(&mut out, &scoped.1, value);
-                        written.push(scoped);
-                    }
-                    continue;
-                }
-                _ => {}
-            }
-            out.push_str(line);
-            out.push('\n');
-        }
-        self.finish(table.as_deref(), &mut written, &mut out);
-        if !env_seen && !self.env.is_empty() {
-            if !out.is_empty() && !out.ends_with("\n\n") {
-                out.push('\n');
-            }
-            out.push_str("[env]\n");
-            self.finish(Some("env"), &mut written, &mut out);
-        }
-        out
-    }
-
-    /// Appends the keys of `table` not written yet, before the blank lines
-    /// that end it. Root keys go before the first header: after it they
-    /// would belong to that table.
-    fn finish(&self, table: Option<&str>, written: &mut Vec<(bool, String)>, out: &mut String) {
-        let missing: Vec<(&str, &str)> = match table {
-            None => [("model", &self.model), ("agent", &self.agent)]
-                .into_iter()
-                .filter_map(|(k, v)| Some((k, v.as_deref()?)))
-                .collect(),
-            Some("env") => self
-                .env
+    fn render(&self, old: &str) -> Result<String, ParseError> {
+        let mut doc: DocumentMut = old.parse()?;
+        let root = doc.as_table_mut();
+        set(root, "model", self.model.as_deref());
+        set(root, "agent", self.agent.as_deref());
+        if !self.env.is_empty() || root.contains_key("env") {
+            let env = root
+                .entry("env")
+                .or_insert_with(toml_edit::table)
+                .as_table_like_mut()
+                .ok_or_else(|| ParseError("env must be a table".into()))?;
+            let gone: Vec<String> = env
                 .iter()
-                .map(|(k, v)| (k.as_str(), v.as_str()))
-                .collect(),
-            Some(_) => return,
-        };
-        let mut tail = String::new();
-        for (key, value) in missing {
-            let scoped = (table.is_some(), key.to_owned());
-            if !written.contains(&scoped) {
-                pair(&mut tail, key, value);
-                written.push(scoped);
+                .filter(|(key, _)| !self.env.contains_key(*key))
+                .map(|(key, _)| key.to_owned())
+                .collect();
+            for key in gone {
+                env.remove(&key);
+            }
+            for (key, value) in &self.env {
+                set(env, key, Some(value));
             }
         }
-        if !tail.is_empty() {
-            let blank = (out.len() - out.trim_end_matches('\n').len()).saturating_sub(1);
-            out.truncate(out.len() - blank);
-            out.push_str(&tail);
-            out.push_str(&"\n".repeat(blank));
-        }
+        Ok(doc.to_string())
     }
+}
 
-    fn value(&self, table: Option<&str>, key: &str) -> Option<&str> {
-        match (table, key) {
-            (None, "model") => self.model.as_deref(),
-            (None, "agent") => self.agent.as_deref(),
-            (None, _) => None,
-            (Some(_), key) => self.env.get(key).map(String::as_str),
+/// Sets `key` to the string `value`, or removes it for `None`. A value it
+/// replaces keeps its comments.
+fn set(table: &mut dyn TableLike, key: &str, value: Option<&str>) {
+    let Some(value) = value else {
+        table.remove(key);
+        return;
+    };
+    match table.get_mut(key) {
+        Some(Item::Value(old)) => {
+            if old.as_str() != Some(value) {
+                let decor = old.decor().clone();
+                *old = value.into();
+                *old.decor_mut() = decor;
+            }
+        }
+        _ => {
+            table.insert(key, toml_edit::value(value));
         }
     }
 }
@@ -160,156 +117,58 @@ impl FromStr for Config {
     type Err = ParseError;
 
     fn from_str(text: &str) -> Result<Self, ParseError> {
-        let mut config = Self::default();
-        let mut table: Option<String> = None;
-        for (i, line) in text.lines().enumerate() {
-            let at = |message: String| ParseError {
-                line: i + 1,
-                message,
-            };
-            match parse_line(line).map_err(at)? {
-                Line::Table(name) => table = Some(name),
-                Line::Pair(key, value) if known(table.as_deref(), &key) => {
-                    let value = value.ok_or_else(|| at(format!("{key} must be a string")))?;
-                    match table {
-                        None if key == "model" => config.model = Some(value),
-                        None => config.agent = Some(value),
-                        Some(_) => {
-                            config.env.insert(key, value);
-                        }
-                    }
+        let doc: DocumentMut = text.parse()?;
+        let mut config = Self {
+            model: string(doc.as_table(), "model", "")?,
+            agent: string(doc.as_table(), "agent", "")?,
+            env: BTreeMap::new(),
+        };
+        if let Some(env) = doc.get("env") {
+            let env = env
+                .as_table_like()
+                .ok_or_else(|| ParseError("env must be a table".into()))?;
+            for (key, _) in env.iter() {
+                if let Some(value) = string(env, key, "env.")? {
+                    config.env.insert(key.to_owned(), value);
                 }
-                Line::Pair(..) | Line::Other => {}
             }
         }
         Ok(config)
     }
 }
 
-/// Where and why the file did not parse.
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub struct ParseError {
-    pub line: usize,
-    pub message: String,
+/// The string at `key`, if there is one; anything else there is an error.
+fn string(table: &dyn TableLike, key: &str, scope: &str) -> Result<Option<String>, ParseError> {
+    table.get(key).map_or(Ok(None), |item| {
+        item.as_str()
+            .map(|s| Some(s.to_owned()))
+            .ok_or_else(|| ParseError(format!("{scope}{key} must be a string")))
+    })
 }
 
-impl std::fmt::Display for ParseError {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(f, "line {}: {}", self.line, self.message)
+/// Why the file did not parse, and where.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ParseError(String);
+
+impl From<TomlError> for ParseError {
+    fn from(e: TomlError) -> Self {
+        Self(e.to_string().trim_end().to_owned())
+    }
+}
+
+impl fmt::Display for ParseError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(&self.0)
     }
 }
 
 impl std::error::Error for ParseError {}
 
-enum Line {
-    Table(String),
-    /// A key and its value, if that is a string.
-    Pair(String, Option<String>),
-    /// Blank, a comment, or something this schema does not read.
-    Other,
-}
-
-fn parse_line(line: &str) -> Result<Line, String> {
-    let line = line.trim();
-    if line.is_empty() || line.starts_with('#') {
-        return Ok(Line::Other);
-    }
-    if let Some(rest) = line.strip_prefix('[') {
-        if rest.starts_with('[') {
-            return Ok(Line::Other);
-        }
-        let (name, after) = rest
-            .split_once(']')
-            .ok_or_else(|| "unclosed table header".to_owned())?;
-        if !after.trim().is_empty() && !after.trim().starts_with('#') {
-            return Err("text after a table header".into());
-        }
-        return Ok(Line::Table(name.trim().to_owned()));
-    }
-    let (key, rest) = if let Some(quoted) = line.strip_prefix('"') {
-        let (key, len) = basic(quoted)?;
-        (key, quoted[len..].trim_start())
-    } else {
-        let end = line
-            .find(|c: char| !(c.is_ascii_alphanumeric() || c == '_' || c == '-'))
-            .unwrap_or(line.len());
-        (line[..end].to_owned(), line[end..].trim_start())
-    };
-    let Some(value) = rest.strip_prefix('=').map(str::trim_start) else {
-        // A dotted key or anything else: not ours.
-        return Ok(Line::Other);
-    };
-    if key.is_empty() {
-        return Err("a key is missing".into());
-    }
-    let (value, rest) = if let Some(quoted) = value.strip_prefix('"') {
-        let (value, len) = basic(quoted)?;
-        (Some(value), &quoted[len..])
-    } else if let Some(quoted) = value.strip_prefix('\'') {
-        let end = quoted
-            .find('\'')
-            .ok_or_else(|| "unclosed string".to_owned())?;
-        (Some(quoted[..end].to_owned()), &quoted[end + 1..])
-    } else {
-        (None, "")
-    };
-    let rest = rest.trim();
-    if !rest.is_empty() && !rest.starts_with('#') {
-        return Err(format!("text after the value of {key}"));
-    }
-    Ok(Line::Pair(key, value))
-}
-
-/// A basic string's value, from just after its opening quote, and the bytes
-/// it took including the closing quote.
-fn basic(s: &str) -> Result<(String, usize), String> {
-    let mut out = String::new();
-    let mut chars = s.char_indices();
-    while let Some((i, c)) = chars.next() {
-        match c {
-            '"' => return Ok((out, i + 1)),
-            '\\' => {
-                let (_, e) = chars.next().ok_or("unclosed string")?;
-                match e {
-                    'n' => out.push('\n'),
-                    't' => out.push('\t'),
-                    'r' => out.push('\r'),
-                    '"' => out.push('"'),
-                    '\\' => out.push('\\'),
-                    'u' | 'U' => {
-                        let len = if e == 'u' { 4 } else { 8 };
-                        let hex: String = chars.by_ref().take(len).map(|(_, c)| c).collect();
-                        let c = u32::from_str_radix(&hex, 16)
-                            .ok()
-                            .and_then(char::from_u32)
-                            .ok_or_else(|| format!("bad escape \\{e}{hex}"))?;
-                        out.push(c);
-                    }
-                    e => return Err(format!("bad escape \\{e}")),
-                }
-            }
-            c => out.push(c),
-        }
-    }
-    Err("unclosed string".into())
-}
-
-fn pair(out: &mut String, key: &str, value: &str) {
-    let _ = write!(out, "{key} = \"");
-    for c in value.chars() {
-        match c {
-            '"' => out.push_str("\\\""),
-            '\\' => out.push_str("\\\\"),
-            '\n' => out.push_str("\\n"),
-            '\t' => out.push_str("\\t"),
-            '\r' => out.push_str("\\r"),
-            c if c.is_control() => {
-                let _ = write!(out, "\\u{:04x}", u32::from(c));
-            }
-            c => out.push(c),
-        }
-    }
-    out.push_str("\"\n");
+fn invalid(path: &Path, e: &ParseError) -> io::Error {
+    io::Error::new(
+        io::ErrorKind::InvalidData,
+        format!("{}: {e}", path.display()),
+    )
 }
 
 /// A name a shell could export: written as a bare key.
@@ -365,7 +224,7 @@ mod tests {
 # defaults
 model = "openai:gpt-6-luna"   # the model
 agent = 'echo'
-other = 3
+count = 3
 
 [env]
 OPENAI_API_KEY = "sk-\"x\"\né"
@@ -382,42 +241,57 @@ model = "not this one"
         assert_eq!(config.env.len(), 2);
 
         let bad = "model = 3\n".parse::<Config>().unwrap_err();
-        assert_eq!(bad.line, 1);
-        assert!("model = \"open\n".parse::<Config>().is_err());
+        assert_eq!(bad.to_string(), "model must be a string");
+        let bad = "\n[env]\nK = 1\n".parse::<Config>().unwrap_err();
+        assert_eq!(bad.to_string(), "env.K must be a string");
+        let bad = "model = \"open\n".parse::<Config>().unwrap_err();
+        assert!(bad.to_string().contains("line 1"), "{bad}");
         assert_eq!("".parse::<Config>().unwrap(), Config::default());
     }
 
     #[test]
+    fn dotted_and_inline_env_keys_are_read() {
+        let dotted: Config = "env.A = \"1\"\nenv.B = \"2\"\n".parse().unwrap();
+        assert_eq!(dotted.env.len(), 2);
+        assert_eq!(dotted.env["A"], "1");
+        let inline: Config = "env = { B = \"2\" }\n".parse().unwrap();
+        assert_eq!(inline.env["B"], "2");
+    }
+
+    #[test]
     fn writing_keeps_what_the_schema_does_not_know() {
-        let old = "# mine\nmodel = \"a:b\"\nother = 3\n\n[env]\n# keys\nA = \"1\"\nB = \"2\"\n\n[x]\nk = 1\n";
+        let old = "# mine\nmodel = \"a:b\" # which\nother = 3\n\n[env]\n# keys\nA = \"1\"\nB = \"2\"\n\n[x]\nk = 1\n";
         let new = config(Some("c:d"), &[("A", "one"), ("C", "3")]);
-        let text = new.render(old);
+        let text = new.render(old).unwrap();
         assert_eq!(
             text,
-            "# mine\nmodel = \"c:d\"\nother = 3\n\n[env]\n# keys\nA = \"one\"\nC = \"3\"\n\n[x]\nk = 1\n"
+            "# mine\nmodel = \"c:d\" # which\nother = 3\n\n[env]\n# keys\nA = \"one\"\nC = \"3\"\n\n[x]\nk = 1\n"
         );
         assert_eq!(text.parse::<Config>().unwrap(), new);
         // Idempotent.
-        assert_eq!(new.render(&text), text);
+        assert_eq!(new.render(&text).unwrap(), text);
     }
 
     #[test]
     fn writing_from_nothing_and_removing_keys() {
         let new = config(Some("openai:m"), &[("K", "a\"b\\c\nd")]);
-        let text = new.render("");
-        assert_eq!(
-            text,
-            "model = \"openai:m\"\n\n[env]\nK = \"a\\\"b\\\\c\\nd\"\n"
-        );
+        let text = new.render("").unwrap();
         assert_eq!(text.parse::<Config>().unwrap(), new);
+        assert!(
+            text.starts_with("model = \"openai:m\"\n\n[env]\nK = "),
+            "{text}"
+        );
 
         // A root key goes before the first table, never into it.
-        let text = config(Some("m"), &[]).render("[env]\nK = \"v\"\n");
+        let text = config(Some("m"), &[]).render("[env]\nK = \"v\"\n").unwrap();
         assert_eq!(text, "model = \"m\"\n[env]\n");
         assert_eq!(
-            Config::default().render("model = \"m\"\n[env]\nK = \"v\"\n"),
+            Config::default()
+                .render("model = \"m\"\n[env]\nK = \"v\"\n")
+                .unwrap(),
             "[env]\n"
         );
+        assert!(Config::default().render("model = \"\n").is_err());
     }
 
     #[cfg(unix)]
