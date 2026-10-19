@@ -26,8 +26,9 @@ strip = "symbols"
 
 # Cold paths (one request encode per model turn, argv parsed once): size over
 # speed. Network time dominates these; hot paths such as serde_json stay at 3.
+# ureq and usage-argv are smaller at z (-38 KiB); http is not.
 [profile.release.package.ureq]
-opt-level = "s"
+opt-level = "z"
 
 [profile.release.package.ureq-proto]
 opt-level = "s"
@@ -39,6 +40,27 @@ opt-level = "s"
 opt-level = "s"
 
 [profile.release.package.usage-argv]
+opt-level = "z"
+
+# The daemon's control flow (sessions, tools, the log, the runtime, OS
+# calls) and the clients' connection: syscalls and the model dominate, and
+# s saves about 160 KiB with no measured change in daemon CPU.
+[profile.release.package.engine]
+opt-level = "s"
+
+[profile.release.package.agent]
+opt-level = "s"
+
+[profile.release.package.store]
+opt-level = "s"
+
+[profile.release.package.client]
+opt-level = "s"
+
+[profile.release.package.sys]
+opt-level = "s"
+
+[profile.release.package.rt]
 opt-level = "s"
 
 # Network time dominates the provider layer: s costs its decoders ~6% per
