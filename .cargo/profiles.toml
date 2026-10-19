@@ -51,6 +51,9 @@ opt-level = "s"
 [profile.release.package.ext]
 opt-level = "s"
 
+[profile.release.package.kernel]
+opt-level = "s"
+
 [profile.release.package.ext-chat]
 opt-level = "s"
 
