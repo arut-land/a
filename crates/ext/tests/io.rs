@@ -46,6 +46,9 @@ fn the_sdk_does_no_io() {
         "tokio",
         "smol",
         "async-task",
+        "async-io",
+        "async-executor",
+        "polling",
     ] {
         assert!(!crates.contains(&io), "ext pulls in {io}:\n{tree}");
     }
