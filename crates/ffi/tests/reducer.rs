@@ -74,6 +74,27 @@ fn a_missed_update_is_handed_back_and_a_long_gap_gets_a_snapshot() {
     assert!(matches!(reducer.resync(900), Resync::Updates { updates } if updates.len() == 101));
 }
 
+/// Updates that carry big outputs are kept for a resync up to a few
+/// megabytes, not a fixed count: past that a gap takes a snapshot.
+#[test]
+fn big_outputs_are_kept_for_a_resync_by_size() {
+    let reducer = Reducer::new();
+    let attached = json!({ "t": "attached", "session": "00000000-0000-0000-0000-00000000000a", "workspace": "/w" });
+    reducer.fold(&attached.to_string()).unwrap();
+    let output = "x".repeat(64 * 1024);
+    for call in (1..=200).map(|n| n * 2 - 1) {
+        let started = json!({ "t": "entry", "seq": call, "epoch": 0, "kind": "tool_call",
+            "tool": "bash", "input": { "command": "yes" } });
+        let done = json!({ "t": "entry", "seq": call + 1, "epoch": 0, "kind": "tool_result",
+            "call": call, "outcome": { "status": "done", "output": { "exit": 0, "output": output } } });
+        reducer.fold(&started.to_string()).unwrap();
+        reducer.fold(&done.to_string()).unwrap();
+    }
+    let rev = reducer.snapshot().rev;
+    assert!(matches!(reducer.resync(rev - 20), Resync::Updates { updates } if updates.len() == 20));
+    assert!(matches!(reducer.resync(rev - 200), Resync::Snapshot { .. }));
+}
+
 #[test]
 fn a_malformed_message_is_a_protocol_error_with_a_stable_code() {
     let reducer = Reducer::new();
