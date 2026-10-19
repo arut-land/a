@@ -34,21 +34,6 @@ impl Jsonl {
     fn busy_path(&self, id: SessionId) -> PathBuf {
         self.dir.join(format!("{id}.busy"))
     }
-
-    fn loaded(&self, index: Index, seq: u64, lease: Lease, new_in: Option<PathBuf>) -> Loaded {
-        let index = Arc::new(index);
-        Loaded {
-            lines: Arc::clone(&index) as Arc<dyn Lines>,
-            seq,
-            epoch: lease.epoch,
-            log: Box::new(JsonlLog {
-                index,
-                new_in,
-                lease,
-                torn: false,
-            }),
-        }
-    }
 }
 
 impl LogStore for Jsonl {
@@ -65,7 +50,7 @@ impl LogStore for Jsonl {
         file.write_all(&line)?;
         let index = Index::new(file, line.len() as u64);
         let lease = self.leases.acquire(header.id, 0);
-        Ok(self.loaded(index, 0, lease, Some(self.dir.clone())))
+        Ok(index.loaded(0, lease, Some(self.dir.clone())))
     }
 
     /// A file whose header did not survive a crash holds no entries either,
@@ -107,7 +92,7 @@ impl LogStore for Jsonl {
             sys::sync_data(&index.file)?;
         }
         let lease = self.leases.acquire(id, floor);
-        Ok(self.loaded(index, seq, lease, None))
+        Ok(index.loaded(seq, lease, None))
     }
 
     fn entries(&self, id: SessionId) -> io::Result<Vec<Entry>> {
@@ -167,6 +152,23 @@ impl Index {
         }
     }
 
+    /// The lines indexed and an appender continuing them, whose entries up
+    /// to `seq` are committed.
+    fn loaded(self, seq: u64, lease: Lease, new_in: Option<PathBuf>) -> Loaded {
+        let index = Arc::new(self);
+        Loaded {
+            lines: Arc::clone(&index) as Arc<dyn Lines>,
+            seq,
+            epoch: lease.epoch,
+            log: Box::new(JsonlLog {
+                index,
+                new_in,
+                lease,
+                torn: false,
+            }),
+        }
+    }
+
     fn read(&self) -> std::sync::RwLockReadGuard<'_, Vec<u64>> {
         self.ends.read().unwrap_or_else(PoisonError::into_inner)
     }
@@ -219,7 +221,8 @@ impl Lines for Index {
             (from, ends[first + count - 1], count)
         };
         let at = out.len();
-        out.resize(at + (to - from) as usize, 0);
+        let len = usize::try_from(to - from).map_err(io::Error::other)?;
+        out.resize(at + len, 0);
         sys::read_exact_at(&self.file, &mut out[at..], from)?;
         Ok(count as u64)
     }

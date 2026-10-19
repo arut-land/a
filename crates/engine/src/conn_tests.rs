@@ -16,11 +16,11 @@ use store::{Header, Jsonl, LogStore};
 use sys::Home;
 
 use super::outbox::Outbox;
-use super::{Config, Daemon, Lifecycle, handle};
+use super::{Config, Daemon, Lifecycle, Owner, handle};
 
 struct Fixture {
     root: PathBuf,
-    daemon: Arc<Daemon>,
+    daemon: Owner,
     life: Arc<Lifecycle>,
 }
 

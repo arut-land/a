@@ -1,10 +1,12 @@
 import Foundation
 import Observation
 
-/// One session as the app shows it: a copy of the Rust view, kept in step
-/// by its numbered updates. The stream drops updates when its buffer is
-/// full, so a `rev` gap asks the source for what was missed (or a snapshot)
-/// before going on.
+/// One session as the app shows it: a copy of the Rust session client's
+/// view, kept in step by its numbered updates. It holds no rule of its own:
+/// the turn (what runs, what waits, what the controls offer), each call's
+/// phase and the link come computed from Rust. The stream drops updates
+/// when its buffer is full, so a `rev` gap asks the source for what was
+/// missed (or a snapshot) before going on.
 @Observable
 public final class SessionStore {
     public private(set) var items: [ViewItem] = []
@@ -12,6 +14,9 @@ public final class SessionStore {
     public private(set) var streaming: StreamingText?
     public private(set) var recap: RecapInfo?
     public private(set) var link: LinkState = .connecting
+    /// What the session's turn is doing and what the controls offer.
+    public private(set) var turn = TurnInfo(
+        running: false, asking: nil, asks: 0, canInterrupt: false, canSteer: false, canSend: false)
     public private(set) var sessionId: String?
     public private(set) var workspace = ""
     /// The last update applied.
@@ -38,26 +43,6 @@ public final class SessionStore {
         self.session = nil
     }
 
-    /// Calls this client was asked to approve that still wait, oldest first.
-    public var pendingAsks: [ViewItem] {
-        items.filter {
-            if case .tool(_, _, _, _, .pending?, _, _, true) = $0 { true } else { false }
-        }
-    }
-
-    /// Whether a model call, tool call or command runs: what an interrupt
-    /// stops. The rule of the Rust clients' `SessionView::running`.
-    public var running: Bool {
-        items.contains {
-            switch $0 {
-            case .reply(_, _, _, .running, _): true
-            case .tool(_, _, _, _, let approval, nil, _, _): approval != .denied
-            case .command(_, _, _, nil): true
-            default: false
-            }
-        }
-    }
-
     /// Starts following the source's updates.
     public func listen() {
         guard listening == nil else { return }
@@ -70,13 +55,37 @@ public final class SessionStore {
     }
 
     /// Follows the session, then attaches to `target`.
-    public func open(_ target: OpenTarget) async {
+    public func open(_ target: OpenTarget) {
         listen()
-        await run { try await $0.open(target: target) }
+        do {
+            try session?.open(target: target)
+        } catch {
+            problem = error.localizedDescription
+        }
     }
 
     public func send(_ text: String) async {
         await run { try await $0.send(text: text) }
+    }
+
+    /// A line typed, parsed by the commands every client shares; what it
+    /// asks of the app comes back.
+    public func submit(_ line: String) async -> AppAction? {
+        guard let session else { return nil }
+        do {
+            return try await session.submit(line: line)
+        } catch {
+            problem = error.localizedDescription
+            return nil
+        }
+    }
+
+    /// Every slash command, for help and completion.
+    public var commands: [CommandHelp] { session?.commands() ?? [] }
+
+    /// Replaces a daemon that stopped answering, and attaches again.
+    public func restart() async {
+        await run { try await $0.restart() }
     }
 
     public func approve(call: UInt64, approved: Bool) async {
@@ -126,17 +135,17 @@ public final class SessionStore {
 
     private func adopt(_ s: SessionSnapshot) {
         (rev, seq, sessionId, workspace) = (s.rev, s.seq, s.session, s.workspace)
-        (items, link, recap, streaming) = (s.items, s.link, s.recap, s.streaming)
+        (items, link, recap, streaming, turn) = (s.items, s.link, s.recap, s.streaming, s.turn)
     }
 
     private func fold(_ update: ViewUpdate) {
-        (rev, seq) = (update.rev, update.seq)
+        (rev, seq, turn) = (update.rev, update.seq, update.turn)
         switch update.change {
         case .attached(let session, let workspace, let reset):
             if reset {
                 (items, recap, streaming) = ([], nil, nil)
             }
-            (sessionId, self.workspace, link) = (session, workspace, .replaying)
+            (sessionId, self.workspace) = (session, workspace)
         case .added(let index, let item):
             items.insert(item, at: min(Int(index), items.count))
         case .updated(let index, let item, let part):
@@ -159,7 +168,7 @@ public final class SessionStore {
                 streaming = StreamingText(call: call, text: text)
             }
         case .synced:
-            link = .live
+            break
         case .snapshot(let snapshot):
             items = snapshot
             if let call = streaming?.call, !items.contains(where: {
@@ -170,16 +179,14 @@ public final class SessionStore {
         case .recap(let recap):
             self.recap = recap
         case .draining:
-            link = .draining
+            break
         case .mismatch(let supported):
             problem = "The daemon speaks protocol \(supported); restart it."
         case .error(let message):
             problem = message
-        case .closed(let message):
-            link = .closed
-            problem = message
-        case .detached:
-            link = .closed
+        case .link(let state):
+            link = state
+            if case .lost(let message) = state { problem = message }
         }
     }
 }
@@ -206,7 +213,7 @@ public final class SessionListStore {
             if let problem = update.problem {
                 self.problem = problem
             } else {
-                (sessions, problem) = (update.sessions.reversed(), nil)
+                (sessions, problem) = (update.sessions, nil)
             }
             changed()
         }

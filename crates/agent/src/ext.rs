@@ -312,6 +312,11 @@ impl Registry {
         &self.hooks
     }
 
+    /// Every command, in registration order.
+    pub fn commands(&self) -> impl Iterator<Item = &dyn DynCommand> {
+        self.commands.iter().map(|c| &**c)
+    }
+
     pub fn command(&self, name: &str) -> Option<&dyn DynCommand> {
         self.commands
             .iter()

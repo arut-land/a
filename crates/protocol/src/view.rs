@@ -33,8 +33,6 @@ pub struct SessionView {
     pub items: Vec<Item>,
     /// The environment the session's commands run in.
     pub environment: Option<Environment>,
-    #[serde(skip)]
-    pub link: Link,
     /// The recap the daemon sent on the latest attach.
     #[serde(skip)]
     pub recap: Option<Recap>,
@@ -47,20 +45,6 @@ pub struct SessionView {
     /// FFI stream's buffer was full): take a fresh snapshot of the view.
     #[serde(skip)]
     pub rev: u64,
-}
-
-/// Where this client's connection to the session stands.
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
-pub enum Link {
-    #[default]
-    Connecting,
-    /// Attached; the replay of what was missed is arriving.
-    Replaying,
-    /// Synced: what arrives now is live.
-    Live,
-    /// The daemon is draining for an upgrade: reconnect and attach from
-    /// [`SessionView::seq`].
-    Draining,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -132,6 +116,44 @@ pub enum Item {
 }
 
 impl Item {
+    /// Where the call this item shows stands; `None` for an item that is
+    /// not a call.
+    pub const fn phase(&self) -> Option<Phase> {
+        Some(match self {
+            Self::Reply { status, .. } => match status {
+                Status::Running => Phase::Running,
+                Status::Done => Phase::Done,
+                Status::Failed { .. } => Phase::Failed,
+                Status::Interrupted => Phase::Interrupted,
+            },
+            Self::Tool {
+                outcome: Some(outcome),
+                ..
+            }
+            | Self::Command {
+                outcome: Some(outcome),
+                ..
+            } => Phase::of(outcome),
+            Self::Tool {
+                approval: Some(Approval::Pending),
+                asked,
+                ..
+            } => {
+                if *asked {
+                    Phase::Asking
+                } else {
+                    Phase::Waiting
+                }
+            }
+            Self::Tool {
+                approval: Some(Approval::Denied),
+                ..
+            } => Phase::Denied,
+            Self::Tool { .. } | Self::Command { .. } => Phase::Running,
+            _ => return None,
+        })
+    }
+
     /// The seq of the entry that started this item.
     pub const fn key(&self) -> u64 {
         match self {
@@ -168,6 +190,57 @@ pub enum Approval {
     Pending,
     Approved,
     Denied,
+}
+
+/// Where a model call, tool call or slash command stands: the decision
+/// table over an item's status, approval and outcome, kept here once so
+/// that no client re-derives it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum Phase {
+    /// It runs, or is about to.
+    Running,
+    /// It waits for this client's approval.
+    Asking,
+    /// It waits for an approval asked of another client.
+    Waiting,
+    /// Not approved; it will not run.
+    Denied,
+    Done,
+    Failed,
+    Interrupted,
+}
+
+impl Phase {
+    /// Whether it is unsettled: what an interrupt stops. A call waiting for
+    /// approval counts, since an interrupt settles it without running it.
+    pub const fn open(self) -> bool {
+        matches!(self, Self::Running | Self::Asking | Self::Waiting)
+    }
+
+    /// Whether it has its outcome: nothing about it changes any more.
+    pub const fn settled(self) -> bool {
+        matches!(self, Self::Done | Self::Failed | Self::Interrupted)
+    }
+
+    const fn of(outcome: &Outcome) -> Self {
+        match outcome {
+            Outcome::Done { .. } => Self::Done,
+            Outcome::Failed { .. } => Self::Failed,
+            Outcome::Interrupted { .. } => Self::Interrupted,
+        }
+    }
+}
+
+/// What a session's turn is doing, as [`SessionView::turn`] finds it.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize)]
+pub struct Turn {
+    /// A call is unsettled: an interrupt has something to stop.
+    pub running: bool,
+    /// The oldest call waiting for this client's approval.
+    pub asking: Option<u64>,
+    /// How many calls wait for this client's approval.
+    pub asks: u32,
 }
 
 /// What one daemon message changed, as owned data a client applies to its
@@ -271,31 +344,29 @@ impl SessionView {
     /// Tool calls this client was asked to approve that are still waiting,
     /// oldest first.
     pub fn asked(&self) -> impl Iterator<Item = u64> + '_ {
-        self.items.iter().filter_map(|item| match item {
-            Item::Tool {
-                call,
-                approval: Some(Approval::Pending),
-                asked: true,
-                ..
-            } => Some(*call),
-            _ => None,
-        })
+        self.items
+            .iter()
+            .filter(|item| item.phase() == Some(Phase::Asking))
+            .map(Item::key)
     }
 
-    /// Whether a model call, tool call or slash command is running: what
-    /// an interrupt stops, with the rest of its turn. A call waiting for
-    /// approval counts: an interrupt settles it without running it.
-    pub fn running(&self) -> bool {
-        self.items.iter().rev().any(|item| match item {
-            Item::Reply { status, .. } => *status == Status::Running,
-            Item::Tool {
-                outcome: None,
-                approval,
-                ..
-            } => *approval != Some(Approval::Denied),
-            Item::Command { outcome, .. } => outcome.is_none(),
-            _ => false,
-        })
+    /// Where the session's turn stands, from the items' phases: the one
+    /// place any client learns whether something runs and what waits on
+    /// it.
+    pub fn turn(&self) -> Turn {
+        let mut turn = Turn::default();
+        for item in &self.items {
+            match item.phase() {
+                Some(Phase::Asking) => {
+                    turn.running = true;
+                    turn.asks += 1;
+                    turn.asking = turn.asking.or(Some(item.key()));
+                }
+                Some(phase) if phase.open() => turn.running = true,
+                _ => {}
+            }
+        }
+        turn
     }
 
     /// A hash of the log-derived state (the serialized view): equal on every
@@ -319,7 +390,6 @@ impl SessionView {
                     };
                 }
                 self.workspace.clone_from(workspace);
-                self.link = Link::Replaying;
                 Some(Change::Attached {
                     session: *session,
                     workspace: workspace.clone(),
@@ -344,7 +414,6 @@ impl SessionView {
             }
             DaemonMsg::Synced { seq } => {
                 self.seq = self.seq.max(*seq);
-                self.link = Link::Live;
                 Some(Change::Synced)
             }
             DaemonMsg::Recap(recap) => {
@@ -352,10 +421,7 @@ impl SessionView {
                 Some(Change::Recap(recap.clone()))
             }
             DaemonMsg::Ask { call, tool, input } => self.ask(*call, tool, input),
-            DaemonMsg::Draining => {
-                self.link = Link::Draining;
-                Some(Change::Draining)
-            }
+            DaemonMsg::Draining => Some(Change::Draining),
             DaemonMsg::Mismatch { supported, .. } => Some(Change::Mismatch {
                 supported: *supported,
             }),

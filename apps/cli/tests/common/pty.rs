@@ -4,7 +4,7 @@
 
 use std::fs::File;
 use std::io::{Read, Write};
-use std::process::{Child, ExitStatus, Stdio};
+use std::process::{Child, Command, ExitStatus, Stdio};
 use std::sync::{Arc, Mutex, PoisonError};
 use std::time::{Duration, Instant};
 
@@ -33,7 +33,11 @@ pub struct Pty {
 impl Env {
     /// `a` with `args` on a `cols` × `rows` terminal.
     pub fn tty(&self, args: &[&str], cols: u16, rows: u16) -> Pty {
-        let mut cmd = self.cmd(args);
+        Self::tty_of(self.cmd(args), cols, rows)
+    }
+
+    /// `cmd` on a `cols` × `rows` terminal.
+    pub fn tty_of(mut cmd: Command, cols: u16, rows: u16) -> Pty {
         let master = openpt(OpenptFlags::RDWR | OpenptFlags::NOCTTY).unwrap();
         grantpt(&master).unwrap();
         unlockpt(&master).unwrap();

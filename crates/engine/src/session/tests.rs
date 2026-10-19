@@ -1,5 +1,5 @@
 use std::path::Path;
-use std::sync::atomic::AtomicBool;
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::thread;
 
 use agent::{Extension, Hook, Policy, Registrar, Registry, Tool};
@@ -219,8 +219,12 @@ fn cassette(path: &str) -> Vec<String> {
 }
 
 /// The home config file of these tests: `gpt-5.6` on `OpenAI`, with a key.
+/// Each call writes a file of its own: rewriting one shared file truncates
+/// it under a session that is reading it.
 fn gpt_home() -> PathBuf {
-    let path = std::env::temp_dir().join(format!("a-engine-gpt-{}.toml", std::process::id()));
+    static NEXT: AtomicUsize = AtomicUsize::new(0);
+    let n = NEXT.fetch_add(1, Ordering::Relaxed);
+    let path = std::env::temp_dir().join(format!("a-engine-gpt-{}-{n}.toml", std::process::id()));
     std::fs::write(
         &path,
         "model = \"gpt-5.6\"\n[env]\nOPENAI_API_KEY = \"daemon\"\n",

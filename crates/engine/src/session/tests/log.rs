@@ -187,11 +187,11 @@ fn a_committed_entry_is_encoded_exactly_once() {
     assert_eq!(live.len(), 2, "the input and its answer");
     for (live, replayed) in live.iter().zip(&replayed) {
         let seq = live.seq.unwrap();
-        let line = &written[usize::try_from(seq).unwrap() - 1];
-        assert_eq!(*line, self::line(&Entry::from_json(line).unwrap()));
+        let stored = &written[usize::try_from(seq).unwrap() - 1];
+        assert_eq!(*stored, line(&Entry::from_json(stored).unwrap()));
         assert_eq!(
             live.as_bytes(),
-            Frame::from_line(seq, line).unwrap().as_bytes()
+            Frame::from_line(seq, stored).unwrap().as_bytes()
         );
         assert_eq!(live.as_bytes(), replayed.as_bytes(), "entry {seq}");
     }

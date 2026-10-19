@@ -419,7 +419,7 @@ fn a_torn_tail_is_never_indexed() {
             .iter()
             .flat_map(|e| [encoded(e), b"\n".to_vec()].concat())
             .collect();
-        assert_eq!(file[cut as usize..], after);
+        assert_eq!(file[usize::try_from(cut).unwrap()..], after);
     }
 }
 

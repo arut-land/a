@@ -6,7 +6,7 @@ use std::panic::{AssertUnwindSafe, catch_unwind};
 use std::path::PathBuf;
 use std::pin::pin;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
-use std::sync::{Arc, Mutex, MutexGuard, Weak};
+use std::sync::{Arc, Condvar, Mutex, MutexGuard, PoisonError, Weak};
 use std::task::{Poll, Waker};
 use std::time::{Duration, Instant};
 
@@ -73,8 +73,9 @@ pub struct Session {
     /// The committed entries, encoded once for every client; they commit
     /// under `state`'s lock.
     frames: Arc<FrameLog>,
-    /// The appender; only the job draining `queue` writes to it.
-    log: Mutex<Box<dyn Log>>,
+    /// The appender, until the actor ends; only the job draining `queue`
+    /// writes to it.
+    log: Mutex<Option<Box<dyn Log>>>,
     /// Entries waiting to be committed, in order.
     queue: Mutex<Queue>,
     /// The actor's messages. The session's inbox, what waits for the user,
@@ -106,6 +107,8 @@ pub struct Session {
     replied: Mutex<Option<(u64, llm::Assistant)>>,
     /// Background process groups the session owns, until it ends.
     jobs: Mutex<Vec<u32>>,
+    /// Over once the actor has returned and the log is closed.
+    ended: Ended,
     shared: Arc<Shared>,
 }
 
@@ -116,6 +119,70 @@ pub enum Open {
     Create,
     /// Loaded, and recovered if it holds any entries.
     Load,
+}
+
+/// The end of a session's actor: over once its `run` has returned (or
+/// panicked) and its log is closed, so nothing of this daemon writes the
+/// session any more. Loading it again waits for this: a log has one writer.
+#[derive(Clone, Default)]
+pub struct Ended(Arc<End>);
+
+#[derive(Default)]
+struct End {
+    /// Whether it is over, and the tasks waiting until it is.
+    state: Mutex<(bool, Vec<Waker>)>,
+    over: Condvar,
+}
+
+impl Ended {
+    fn end(&self) {
+        let mut state = lock(&self.0.state);
+        state.0 = true;
+        state.1.drain(..).for_each(Waker::wake);
+        self.0.over.notify_all();
+    }
+
+    pub fn is_over(&self) -> bool {
+        lock(&self.0.state).0
+    }
+
+    /// Blocks until it is over: for threads that may block, never an async
+    /// worker.
+    pub fn wait(&self) {
+        let mut state = lock(&self.0.state);
+        while !state.0 {
+            state = self
+                .0
+                .over
+                .wait(state)
+                .unwrap_or_else(PoisonError::into_inner);
+        }
+    }
+
+    /// Over, as a future.
+    pub fn over(&self) -> impl Future<Output = ()> + '_ {
+        poll_fn(|cx| {
+            let mut state = lock(&self.0.state);
+            if state.0 {
+                return Poll::Ready(());
+            }
+            if !state.1.iter().any(|w| w.will_wake(cx.waker())) {
+                state.1.push(cx.waker().clone());
+            }
+            Poll::Pending
+        })
+    }
+}
+
+/// The actor's hold on its session: dropped as `run` returns or unwinds,
+/// it closes the log and only then ends the actor.
+struct Actor(Arc<Session>);
+
+impl Drop for Actor {
+    fn drop(&mut self) {
+        lock(&self.0.log).take();
+        self.0.ended.end();
+    }
 }
 
 enum Msg {
@@ -283,7 +350,7 @@ impl Session {
                 snapshot: None,
             }),
             frames: Arc::new(frames),
-            log: Mutex::new(log),
+            log: Mutex::new(Some(log)),
             queue: Mutex::new(Queue {
                 next: seq,
                 ..Queue::default()
@@ -302,12 +369,14 @@ impl Session {
             cancel: Mutex::default(),
             replied: Mutex::default(),
             jobs: Mutex::default(),
+            ended: Ended::default(),
             shared,
         });
         registry.hooks().session_start(session.id);
-        let actor = Arc::clone(&session);
+        let actor = Actor(Arc::clone(&session));
         session.shared.rt.spawn(Box::pin(async move {
-            actor.run(&rx, kind, agent, recover).await;
+            actor.0.run(&rx, kind, agent, recover).await;
+            drop(actor);
         }));
         Ok(session)
     }
@@ -423,6 +492,11 @@ impl Session {
             .map_or_else(Vec::new, |daemon| daemon.children(self.id))
     }
 
+    #[cfg(test)]
+    pub(crate) fn ended(&self) -> Ended {
+        self.ended.clone()
+    }
+
     /// Whether any background process the session owns still runs.
     pub fn has_jobs(&self) -> bool {
         let mut jobs = lock(&self.jobs);
@@ -442,10 +516,11 @@ impl Session {
     /// Stops the actor, the turn it runs and the processes it owns, after
     /// unloading the children it owns; the session lives on in its log.
     /// Callers check `idle_for` under the slot lock first, or are draining
-    /// the daemon. Stopping again does nothing.
-    pub fn stop(&self) {
+    /// the daemon. Stopping again does nothing more. Returns the actor's
+    /// end, to wait for before the log is loaded again.
+    pub fn stop(&self) -> Ended {
         if std::mem::replace(&mut lock(&self.answers).stopped, true) {
-            return;
+            return self.ended.clone();
         }
         if let Some(daemon) = self.shared.daemon.upgrade() {
             daemon.unload_children(self.id);
@@ -457,6 +532,7 @@ impl Session {
             self.kill(pgid);
         }
         self.registry().hooks().session_end(self.id);
+        self.ended.clone()
     }
 
     /// Attaches `client`, which has the entries up to `since`: it is sent
@@ -662,7 +738,10 @@ impl Session {
     /// Writes `batch` durably, then shows it. Only [`Session::drain`] calls
     /// it, so entries commit in order.
     fn commit(&self, batch: &mut Vec<Entry>) -> io::Result<()> {
-        lock(&self.log).append_all(batch)?;
+        lock(&self.log)
+            .as_mut()
+            .ok_or_else(|| io::Error::other("the session has stopped"))?
+            .append_all(batch)?;
         let registry = self.registry();
         let hooks = registry.hooks();
         let mut st = self.lock();
@@ -1575,6 +1654,22 @@ impl Load {
 
 /// The native command that sets the session's model.
 const MODEL: &str = "model";
+
+/// The slash commands a session runs, as a welcome advertises them.
+pub fn commands(registry: &Registry) -> Vec<protocol::CommandInfo> {
+    let native = protocol::CommandInfo {
+        name: MODEL.to_owned(),
+        description: "set the session's model".to_owned(),
+    };
+    registry
+        .commands()
+        .map(|c| protocol::CommandInfo {
+            name: c.name().to_owned(),
+            description: c.description().to_owned(),
+        })
+        .chain([native])
+        .collect()
+}
 
 /// `text` as a command's name and arguments, if it names one: an
 /// extension's, or a native one.

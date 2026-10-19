@@ -15,7 +15,7 @@ use protocol::{Body, Environment, Outcome, SessionId};
 use store::{Header, Parent};
 
 use super::{Msg, Open, Session, installed};
-use crate::{Daemon, Residence, Slot, lock};
+use crate::{Daemon, Slot, lock};
 
 /// Where a link stands, by its watch. A link not yet watched or armed
 /// carries the child's input, to start it with.
@@ -194,10 +194,7 @@ impl Daemon {
     /// Unloads the sessions `parent` owns, each after its own children.
     pub(crate) fn unload_children(&self, parent: SessionId) {
         for slot in self.owned(parent) {
-            let unloaded = lock(&slot.residence).unload();
-            if let Some(child) = unloaded {
-                child.stop();
-            }
+            lock(&slot.residence).unload();
         }
     }
 
@@ -218,11 +215,8 @@ impl Daemon {
             return Ok(());
         };
         drop(slots);
-        let mut residence = lock(&slot.residence);
-        if residence.live().is_none() {
-            *residence = Residence::Live(self.seed(slot.header.clone(), Open::Load, input, env)?);
-        }
-        Ok(())
+        let start = || self.seed(slot.header.clone(), Open::Load, input, env);
+        slot.live_or(start, |_| ())
     }
 
     /// Starts a child, first committing `env` (redacted) and `input` as its

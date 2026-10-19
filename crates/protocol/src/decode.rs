@@ -21,9 +21,9 @@ use uuid::Uuid;
 
 use crate::view::{Approval, Item, SessionView, Status, Usage};
 use crate::{
-    Body, Caps, Card, ClientDecl, ClientMsg, DaemonMsg, Decision, Decode, Entry, Environment,
-    HomeSettings, Installed, Json, Origin, Outcome, Overrides, Recap, Rejection, Role, SessionId,
-    SessionSummary, SettingsChange, Target,
+    Body, Caps, Card, ClientDecl, ClientMsg, CommandInfo, DaemonMsg, Decision, Decode, Entry,
+    Environment, HomeSettings, Installed, Json, Origin, Outcome, Overrides, Recap, Rejection, Role,
+    SessionId, SessionSummary, SettingsChange, Target,
 };
 
 /// A field every variant that has it requires.
@@ -215,6 +215,7 @@ struct Fields {
     build: Option<String>,
     caps: Option<Caps>,
     client: Option<u32>,
+    commands: Option<Vec<CommandInfo>>,
     supported: Option<u32>,
     min: Option<u32>,
     session: Option<SessionId>,
@@ -393,6 +394,7 @@ impl Fields {
                 build: req(f.build.take(), "build")?,
                 caps: f.caps.take().unwrap_or_default(),
                 client: f.client.take().unwrap_or_default(),
+                commands: f.commands.take().unwrap_or_default(),
             },
             Tag::Mismatch => DaemonMsg::Mismatch {
                 supported: req(f.supported.take(), "supported")?,

@@ -1,15 +1,18 @@
-//! The shared reducer behind a stream: folds daemon messages, numbers the
-//! updates, and keeps the latest so a client that missed some can catch up
-//! without a full snapshot.
+//! A session client behind a stream: what it tells the app goes out as
+//! numbered changes, and the latest are kept so a client that missed some
+//! can catch up without a full snapshot. The app renders the changes; every
+//! rule (what runs, what waits, what the controls offer) comes computed.
 
 use std::collections::VecDeque;
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 
 use boltffi::{EventSubscription, StreamProducer, export};
-use protocol::view::SessionView;
-use protocol::{DaemonMsg, Decode};
+use client::{Effect, Event, SessionClient, Welcome};
+use protocol::{Caps, DaemonMsg, Decode};
 
-use crate::{ClientError, Resync, SessionSnapshot, ToolOutcome, ViewChange, ViewItem, ViewUpdate};
+use crate::{
+    ClientError, Resync, SessionSnapshot, ToolOutcome, TurnInfo, ViewChange, ViewItem, ViewUpdate,
+};
 
 /// How many updates a stream buffers for a slow reader before it drops.
 const BUFFER: usize = 1024;
@@ -22,22 +25,22 @@ const KEPT: usize = 512;
 const KEPT_BYTES: usize = 4 << 20;
 
 pub(crate) struct Feed {
-    pub view: SessionView,
+    pub client: SessionClient,
+    /// The number of the last update published.
+    rev: u64,
     recent: VecDeque<ViewUpdate>,
     /// What [`weight`] puts on `recent`.
     recent_bytes: usize,
-    /// The connection ended for good.
-    pub closed: bool,
     producer: StreamProducer<ViewUpdate>,
 }
 
 impl Feed {
-    pub fn new() -> Self {
+    pub fn new(client: SessionClient) -> Self {
         Self {
-            view: SessionView::default(),
+            client,
+            rev: 0,
             recent: VecDeque::with_capacity(KEPT),
             recent_bytes: 0,
-            closed: false,
             producer: StreamProducer::new(BUFFER),
         }
     }
@@ -46,25 +49,42 @@ impl Feed {
         self.producer.subscribe()
     }
 
-    /// Folds `msg` and publishes what it changed.
-    pub fn fold(&mut self, msg: &DaemonMsg) -> Option<&ViewUpdate> {
-        let update = ViewUpdate::from(&self.view.fold(msg)?);
-        Some(self.publish(update))
+    /// Steps the client with `event`, publishing what it tells the app;
+    /// returns what the driver is to do.
+    pub fn step(&mut self, event: Event) -> Vec<Effect> {
+        let effects = self.client.step(event);
+        self.absorb(effects)
     }
 
-    /// Publishes a change of this facade's own, numbered in the view's
-    /// sequence.
-    pub fn local(&mut self, change: ViewChange) {
-        self.view.rev += 1;
+    /// Publishes the app's effects, handing back the driver's.
+    pub fn absorb(&mut self, effects: Vec<Effect>) -> Vec<Effect> {
+        let mut io = Vec::new();
+        for effect in effects {
+            let change = match effect {
+                Effect::View(update) => (&update.change).into(),
+                Effect::Link => ViewChange::Link {
+                    state: self.client.link().into(),
+                },
+                Effect::Notice(message) => ViewChange::Error { message },
+                Effect::Sessions => continue,
+                effect => {
+                    io.push(effect);
+                    continue;
+                }
+            };
+            self.publish(change);
+        }
+        io
+    }
+
+    fn publish(&mut self, change: ViewChange) -> &ViewUpdate {
+        self.rev += 1;
         let update = ViewUpdate {
-            rev: self.view.rev,
-            seq: self.view.seq,
+            rev: self.rev,
+            seq: self.client.view().seq,
             change,
+            turn: self.client.turn().into(),
         };
-        self.publish(update);
-    }
-
-    fn publish(&mut self, update: ViewUpdate) -> &ViewUpdate {
         self.producer.push(update.clone());
         self.recent_bytes += weight(&update.change);
         self.recent.push_back(update);
@@ -78,7 +98,7 @@ impl Feed {
     }
 
     pub fn snapshot(&self) -> SessionSnapshot {
-        SessionSnapshot::of(&self.view, self.closed)
+        SessionSnapshot::of(&self.client, self.rev)
     }
 
     /// The updates after rev `from`, or a snapshot once some are no longer
@@ -142,9 +162,9 @@ pub(crate) fn lock<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
     mutex.lock().unwrap_or_else(PoisonError::into_inner)
 }
 
-/// The shared reducer on messages handed in as JSON, with no daemon: what
+/// The session client on messages handed in as JSON, with no daemon: what
 /// the bindings' tests run the shared vectors through, and a way to fold a
-/// recorded session.
+/// recorded session. It folds as if from a connection that is live.
 pub struct Reducer {
     feed: Mutex<Feed>,
 }
@@ -158,8 +178,20 @@ impl Default for Reducer {
 #[export]
 impl Reducer {
     pub fn new() -> Self {
+        let mut client = SessionClient::new(client::Env::Keep);
+        client.open(protocol::Target::New);
+        client.step(Event::Connected {
+            id: 1,
+            welcome: Welcome {
+                proto: protocol::PROTO,
+                caps: Caps::ALL,
+                client: 0,
+            },
+            remote: false,
+            commands: Vec::new(),
+        });
         Self {
-            feed: Mutex::new(Feed::new()),
+            feed: Mutex::new(Feed::new(client)),
         }
     }
 
@@ -169,7 +201,16 @@ impl Reducer {
         let msg = DaemonMsg::from_json(message.as_bytes()).map_err(|e| ClientError::Protocol {
             message: e.to_string(),
         })?;
-        Ok(lock(&self.feed).fold(&msg).cloned())
+        let mut feed = lock(&self.feed);
+        let effects = feed.client.step(Event::Msg { id: 1, msg });
+        // As a view alone: no link to change.
+        let shown = effects
+            .into_iter()
+            .filter(|e| matches!(e, Effect::View(_)))
+            .collect();
+        let rev = feed.rev;
+        feed.absorb(shown);
+        Ok((feed.rev > rev).then(|| feed.recent[feed.recent.len() - 1].clone()))
     }
 
     #[ffi_stream(item = ViewUpdate)]
@@ -187,6 +228,11 @@ impl Reducer {
 
     /// The log-derived state as JSON, the form the vectors' `state` is in.
     pub fn state_json(&self) -> String {
-        serde_json::to_string(&lock(&self.feed).view).unwrap_or_default()
+        serde_json::to_string(lock(&self.feed).client.view()).unwrap_or_default()
+    }
+
+    /// What the controls offer for the turn now.
+    pub fn turn(&self) -> TurnInfo {
+        lock(&self.feed).client.turn().into()
     }
 }
