@@ -3,12 +3,12 @@
 
 use std::fs::{self, OpenOptions};
 use std::io::{ErrorKind, Write};
-use std::ops::Deref;
+use std::ops::{Deref, RangeInclusive};
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::thread;
 
-use protocol::{Body, Entry, Frame, SessionId};
+use protocol::{Body, Entry, SessionId};
 
 use super::*;
 
@@ -76,7 +76,7 @@ macro_rules! conformance {
             round_trip,
             appends_keep_their_order_across_reopens,
             batches_append_in_order,
-            framed_batches_append_as_their_frames_hold,
+            lines_read_back_as_appended,
             headers_list_sessions_oldest_first,
             counts_follow_appends,
             busy_markers_set_clear_and_repeat,
@@ -124,14 +124,26 @@ fn append(loaded: &mut Loaded, seqs: impl IntoIterator<Item = u64>) -> Vec<Entry
         .collect()
 }
 
+/// Loads session `id`, and the entries the load handed over.
+fn load(store: &dyn LogStore, id: SessionId) -> (Loaded, Vec<Entry>) {
+    let mut entries = Vec::new();
+    let loaded = store.load(id, &mut |e| entries.push(e)).unwrap();
+    assert_eq!(loaded.seq, entries.len() as u64);
+    (loaded, entries)
+}
+
+fn entries_of(store: &dyn LogStore, id: SessionId) -> Vec<Entry> {
+    load(store, id).1
+}
+
 fn round_trip(store: &dyn LogStore) {
     let h = header("/w");
     let mut created = store.create(&h).unwrap();
-    assert_eq!(created.entries, []);
+    assert_eq!(created.seq, 0);
     let written = append(&mut created, 1..=3);
     drop(created);
 
-    assert_eq!(store.load(h.id).unwrap().entries, written);
+    assert_eq!(entries_of(store, h.id), written);
     assert_eq!(store.headers().unwrap(), [h]);
 }
 
@@ -139,12 +151,12 @@ fn appends_keep_their_order_across_reopens(store: &dyn LogStore) {
     let h = header("/w");
     let mut written = append(&mut store.create(&h).unwrap(), 1..=50);
     for round in 0..3 {
-        let mut loaded = store.load(h.id).unwrap();
-        assert_eq!(loaded.entries, written);
+        let (mut loaded, entries) = load(store, h.id);
+        assert_eq!(entries, written);
         let next = 51 + round * 10;
         written.extend(append(&mut loaded, next..next + 10));
     }
-    assert_eq!(store.load(h.id).unwrap().entries, written);
+    assert_eq!(entries_of(store, h.id), written);
 }
 
 fn batches_append_in_order(store: &dyn LogStore) {
@@ -156,32 +168,72 @@ fn batches_append_in_order(store: &dyn LogStore) {
     log.log.append_all(&[]).unwrap();
     written.extend(batch);
     written.extend(append(&mut log, 7..=7));
-    assert_eq!(store.load(h.id).unwrap().entries, written);
+    assert_eq!(entries_of(store, h.id), written);
     assert_eq!(store.count(h.id).unwrap(), 7);
 }
 
-fn framed_batches_append_as_their_frames_hold(store: &dyn LogStore) {
-    let (encoded, plain) = (header("/w"), header("/w"));
-    let mut log = store.create(&encoded).unwrap();
-    let batch: Vec<Entry> = (1..=3).map(|seq| entry(seq, log.epoch)).collect();
-    let frames: Vec<Frame> = batch.iter().map(|e| Frame::entry(e).unwrap()).collect();
-    log.log.append_framed(&batch, &frames).unwrap();
-    store
-        .create(&plain)
-        .unwrap()
-        .log
-        .append_all(&batch)
-        .unwrap();
-    assert_eq!(store.load(encoded.id).unwrap().entries, batch);
-    assert_eq!(
-        store.entries(encoded.id).unwrap(),
-        store.entries(plain.id).unwrap()
-    );
-    let stale: Vec<Entry> = (4..=4).map(|seq| entry(seq, log.epoch)).collect();
-    let stale_frames: Vec<Frame> = stale.iter().map(|e| Frame::entry(e).unwrap()).collect();
-    drop(store.load(encoded.id).unwrap());
-    let refused = log.log.append_framed(&stale, &stale_frames).unwrap_err();
+/// Entry `seq`'s line, read back through `lines`.
+fn line(lines: &dyn Lines, seq: u64) -> io::Result<Vec<u8>> {
+    let (count, mut read) = run(lines, seq..=seq, 0)?;
+    assert_eq!((count, read.pop()), (1, Some(b'\n')));
+    Ok(read)
+}
+
+/// How many lines reading `seqs` within `limit` gets, and what it appends.
+fn run(lines: &dyn Lines, seqs: RangeInclusive<u64>, limit: usize) -> io::Result<(u64, Vec<u8>)> {
+    let mut out = b"kept".to_vec();
+    let count = lines.read(seqs, limit, &mut out)?;
+    assert!(out.starts_with(b"kept"), "read appends");
+    Ok((count, out.split_off(4)))
+}
+
+/// Entries' lines end to end, as a file holds them.
+fn file_of<'a>(entries: impl IntoIterator<Item = &'a Entry>) -> Vec<u8> {
+    entries
+        .into_iter()
+        .flat_map(|e| [encoded(e), b"\n".to_vec()].concat())
+        .collect()
+}
+
+fn encoded(e: &Entry) -> Vec<u8> {
+    let mut line = Vec::new();
+    e.encode(&mut line).unwrap();
+    line
+}
+
+/// Each committed entry reads back as the line it was encoded to once,
+/// through the lines of the load that committed it or loaded it; nothing
+/// past the last committed entry reads.
+fn lines_read_back_as_appended(store: &dyn LogStore) {
+    let h = header("/w");
+    let mut created = store.create(&h).unwrap();
+    let mut written = append(&mut created, 1..=3);
+    let (mut loaded, _) = load(store, h.id);
+    assert_eq!(loaded.seq, 3);
+    written.extend(append(&mut loaded, 4..=5));
+    let refused = created.log.append(&entry(6, created.epoch)).unwrap_err();
     assert_eq!(refused.kind(), ErrorKind::ResourceBusy);
+    let again = load(store, h.id).0;
+    for (lines, upto) in [(&created.lines, 3), (&loaded.lines, 5), (&again.lines, 5)] {
+        for e in &written[..upto] {
+            assert_eq!(line(&**lines, e.seq).unwrap(), encoded(e), "{}", e.seq);
+        }
+        for seq in [0, 6] {
+            assert_eq!(line(&**lines, seq).unwrap_err().kind(), ErrorKind::NotFound);
+        }
+    }
+    // A run is as many whole lines as fit, and at least one.
+    let lines = &*again.lines;
+    assert_eq!(
+        run(lines, 1..=5, usize::MAX).unwrap(),
+        (5, file_of(&written))
+    );
+    let two = file_of(&written[1..3]);
+    assert_eq!(run(lines, 2..=5, two.len() + 1).unwrap(), (2, two));
+    assert_eq!(
+        run(lines, 4..=6, 0).unwrap_err().kind(),
+        ErrorKind::NotFound
+    );
 }
 
 fn headers_list_sessions_oldest_first(store: &dyn LogStore) {
@@ -203,7 +255,7 @@ fn counts_follow_appends(store: &dyn LogStore) {
     append(&mut log, 1..=4);
     assert_eq!(store.count(h.id).unwrap(), 4);
     drop(log);
-    append(&mut store.load(h.id).unwrap(), 5..=6);
+    append(&mut load(store, h.id).0, 5..=6);
     assert_eq!(store.count(h.id).unwrap(), 6);
 }
 
@@ -233,7 +285,7 @@ fn sessions_are_isolated(store: &dyn LogStore) {
         append(&mut log_b, [seq * 100]);
     }
     store.mark_busy(b.id, true).unwrap();
-    assert_eq!(store.load(a.id).unwrap().entries, written_a);
+    assert_eq!(entries_of(store, a.id), written_a);
     assert_eq!(store.count(b.id).unwrap(), 3);
     assert!(!store.is_busy(a.id));
 }
@@ -253,7 +305,7 @@ fn concurrent_sessions_do_not_interfere(store: &dyn LogStore) {
         workers.into_iter().map(|w| w.join().unwrap()).collect()
     });
     for (h, written) in made.iter().zip(written) {
-        assert_eq!(store.load(h.id).unwrap().entries, written);
+        assert_eq!(entries_of(store, h.id), written);
     }
     assert_eq!(store.headers().unwrap().len(), made.len());
 }
@@ -265,7 +317,7 @@ fn ids_are_unique_and_missing_ones_not_found(store: &dyn LogStore) {
     assert_eq!(again.kind(), ErrorKind::AlreadyExists);
     let missing = SessionId::new();
     assert_eq!(
-        store.load(missing).map(drop).unwrap_err().kind(),
+        store.load(missing, &mut drop).map(drop).unwrap_err().kind(),
         ErrorKind::NotFound
     );
     assert_eq!(
@@ -282,14 +334,14 @@ fn each_load_leases_a_newer_epoch(store: &dyn LogStore) {
     drop(created);
     let mut epochs = Vec::new();
     for seq in 3..=5 {
-        let mut loaded = store.load(h.id).unwrap();
+        let mut loaded = load(store, h.id).0;
         epochs.push(loaded.epoch);
         append(&mut loaded, [seq]);
     }
     assert!(epochs[0] > 0, "{epochs:?}");
     assert!(epochs.windows(2).all(|w| w[0] < w[1]), "{epochs:?}");
-    let loaded = store.load(h.id).unwrap();
-    let logged: Vec<u32> = loaded.entries.iter().map(|e| e.epoch).collect();
+    let (loaded, entries) = load(store, h.id);
+    let logged: Vec<u32> = entries.iter().map(|e| e.epoch).collect();
     assert_eq!(logged[2..], epochs);
     assert!(loaded.epoch > epochs[2]);
 }
@@ -301,14 +353,14 @@ fn a_superseded_or_mismatched_writer_cannot_append(store: &dyn LogStore) {
     let written = append(&mut stale, 1..=2);
     assert_eq!(store.entries(h.id).unwrap(), written);
     append(&mut stale, [3]);
-    let mut current = store.load(h.id).unwrap();
+    let (mut current, entries) = load(store, h.id);
     let refused = stale.log.append(&entry(4, stale.epoch)).unwrap_err();
     assert_eq!(refused.kind(), ErrorKind::ResourceBusy);
     let batch = [entry(4, current.epoch), entry(5, current.epoch - 1)];
     let mismatched = current.log.append_all(&batch).unwrap_err();
     assert_eq!(mismatched.kind(), ErrorKind::ResourceBusy);
-    assert_eq!(store.entries(h.id).unwrap(), current.entries);
-    assert_eq!(current.entries.len(), 3);
+    assert_eq!(store.entries(h.id).unwrap(), entries);
+    assert_eq!(entries.len(), 3);
 }
 
 /// A JSONL session file with `tail` written after its entries, as a crash
@@ -335,11 +387,39 @@ fn jsonl_drops_a_torn_tail_and_appends_after_it() {
     ] {
         let (store, _, h, mut written) = torn(tail);
         assert_eq!(store.count(h.id).unwrap(), 2);
-        let mut loaded = store.load(h.id).unwrap();
-        assert_eq!(loaded.entries, written);
+        let (mut loaded, entries) = load(&*store, h.id);
+        assert_eq!(entries, written);
         written.extend(append(&mut loaded, 3..=4));
-        assert_eq!(store.load(h.id).unwrap().entries, written);
+        assert_eq!(entries_of(&*store, h.id), written);
         assert_eq!(store.count(h.id).unwrap(), 4);
+    }
+}
+
+/// What a crash cut short is cut off before anything indexes it: no read
+/// lands in it, and what is appended after it reads back whole.
+#[test]
+fn a_torn_tail_is_never_indexed() {
+    let unterminated = br#"{"seq":3,"epoch":0,"kind":"user","text":"m3"}"#;
+    for tail in [&br#"{"seq":3,"epo"#[..], unterminated, b"not json\n"] {
+        let (store, path, h, mut written) = torn(tail);
+        let (mut loaded, _) = load(&*store, h.id);
+        assert_eq!(
+            line(&*loaded.lines, 3).unwrap_err().kind(),
+            ErrorKind::NotFound
+        );
+        let cut = fs::metadata(&path).unwrap().len();
+        written.extend(append(&mut loaded, 3..=4));
+        for lines in [&loaded.lines, &load(&*store, h.id).0.lines] {
+            for e in &written {
+                assert_eq!(line(&**lines, e.seq).unwrap(), encoded(e), "{}", e.seq);
+            }
+        }
+        let file = fs::read(&path).unwrap();
+        let after: Vec<u8> = written[2..]
+            .iter()
+            .flat_map(|e| [encoded(e), b"\n".to_vec()].concat())
+            .collect();
+        assert_eq!(file[cut as usize..], after);
     }
 }
 
@@ -392,5 +472,5 @@ fn jsonl_leases_past_the_epochs_its_files_hold() {
     append(&mut created, 1..=2);
     // As a later daemon, with no leases of its own yet.
     let later = Jsonl::open(store.dir.as_ref().unwrap()).unwrap();
-    assert!(later.load(h.id).unwrap().epoch > created.epoch);
+    assert!(later.load(h.id, &mut drop).unwrap().epoch > created.epoch);
 }

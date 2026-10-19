@@ -245,12 +245,21 @@ fn with_home(script: &Arc<Script>, path: &Path) -> Models {
 struct Fixture(Arc<Shared>);
 
 impl Fixture {
-    fn new(agent: agent::Kind, registry: Registry, mut models: Models) -> Self {
+    fn new(agent: agent::Kind, registry: Registry, models: Models) -> Self {
+        Self::on(Arc::new(store::Memory::default()), agent, registry, models)
+    }
+
+    fn on(
+        store: Arc<dyn LogStore>,
+        agent: agent::Kind,
+        registry: Registry,
+        mut models: Models,
+    ) -> Self {
         models.settings.agent = Some(agent);
         Self(Arc::new(Shared {
             // One worker: no effect may hold it.
             rt: Arc::new(rt::Threads::new(1)),
-            store: Arc::new(store::Memory::default()),
+            store,
             registry: agent::Current::new(registry),
             models,
             system: None,
@@ -281,53 +290,79 @@ impl Fixture {
             let e = Entry::new(e.seq, created.epoch, e.body.clone());
             created.log.append(&e).unwrap();
         }
-        let loaded = self.0.store.load(header.id).unwrap();
-        Session::start(header, loaded, Arc::clone(&self.0))
+        Session::start(header, Arc::clone(&self.0), Open::Load).unwrap()
     }
 }
 
-/// A log that keeps the size of each batch it is handed, and fails while
-/// told to.
+/// A store whose logs keep the size of each batch they are handed, and
+/// fail while told to.
 #[derive(Clone, Default)]
 struct Probe {
+    store: Arc<store::Memory>,
     batches: Arc<Mutex<Vec<usize>>>,
     failing: Arc<AtomicBool>,
 }
 
-impl Log for Probe {
-    fn append(&mut self, entry: &Entry) -> io::Result<()> {
-        self.append_all(std::slice::from_ref(entry))
-    }
+struct Probed(Box<dyn Log>, Probe);
 
+impl Log for Probed {
     fn append_all(&mut self, entries: &[Entry]) -> io::Result<()> {
-        if self.failing.load(Ordering::SeqCst) {
+        if self.1.failing.load(Ordering::SeqCst) {
             return Err(io::Error::other("disk full"));
         }
-        lock(&self.batches).push(entries.len());
-        Ok(())
+        lock(&self.1.batches).push(entries.len());
+        self.0.append_all(entries)
+    }
+}
+
+impl LogStore for Probe {
+    fn create(&self, header: &Header) -> io::Result<Loaded> {
+        let mut loaded = self.store.create(header)?;
+        loaded.log = Box::new(Probed(loaded.log, self.clone()));
+        Ok(loaded)
+    }
+
+    fn headers(&self) -> io::Result<Vec<Header>> {
+        self.store.headers()
+    }
+
+    fn load(&self, id: SessionId, each: &mut dyn FnMut(Entry)) -> io::Result<Loaded> {
+        self.store.load(id, each)
+    }
+
+    fn entries(&self, id: SessionId) -> io::Result<Vec<Entry>> {
+        self.store.entries(id)
+    }
+
+    fn count(&self, id: SessionId) -> io::Result<u64> {
+        self.store.count(id)
+    }
+
+    fn mark_busy(&self, id: SessionId, busy: bool) -> io::Result<()> {
+        self.store.mark_busy(id, busy)
+    }
+
+    fn is_busy(&self, id: SessionId) -> bool {
+        self.store.is_busy(id)
     }
 }
 
 #[test]
 fn input_commits_on_arrival_and_a_failed_commit_leaves_no_trace() {
-    let fixture = Fixture::new(
+    let probe = Probe::default();
+    let fixture = Fixture::on(
+        Arc::new(probe.clone()),
         agent::Kind::Echo,
         Registry::default(),
         openai(&Script::new(&[])),
     );
-    let probe = Probe::default();
     let header = Header {
         id: SessionId::new(),
         workspace: std::env::temp_dir(),
         parent: None,
         extensions: Vec::new(),
     };
-    let loaded = Loaded {
-        entries: Vec::new(),
-        log: Box::new(probe.clone()),
-        epoch: 1,
-    };
-    let session = Session::start(header, loaded, Arc::clone(&fixture.0));
+    let session = Session::start(header, Arc::clone(&fixture.0), Open::Create).unwrap();
     settle(&session);
     session.submit("hi".into()).unwrap();
     settle(&session);
@@ -1808,46 +1843,4 @@ fn input_taken_in_during_recovery_runs_once() {
     }
 }
 mod interrupt;
-
-#[test]
-fn a_committed_entry_is_encoded_exactly_once() {
-    let fixture = Fixture::new(
-        agent::Kind::Echo,
-        Registry::default(),
-        openai(&Script::new(&[])),
-    );
-    let turns: Vec<Entry> = (1..=300)
-        .map(|seq| {
-            let text = format!("m{seq}");
-            let body = if seq % 2 == 1 {
-                Body::User { text }
-            } else {
-                Body::Assistant { text }
-            };
-            entry(seq, body)
-        })
-        .collect();
-    let session = fixture.start(&turns);
-    let sent = |caps| {
-        let outbox = Outbox::new(caps);
-        session.attach(&outbox, 0);
-        std::iter::from_fn(|| outbox.try_next()).collect::<Vec<Frame>>()
-    };
-    let shared = |a: &Frame, b: &Frame| std::ptr::eq(a.as_bytes(), b.as_bytes());
-    let (first, second) = (sent(Caps::ALL), sent(Caps::ALL));
-    assert_eq!(first.len(), 4, "attached, snapshot, synced, recap");
-    assert!(shared(&first[1], &second[1]), "one snapshot for both");
-    let (first, second) = (sent(Caps::NONE), sent(Caps::NONE));
-    assert_eq!(first.len(), 303);
-    assert!(shared(&first[1], &second[1]), "one frame of each entry");
-    // Live, then replayed: the frame committed is the one sent both times.
-    let live = Outbox::new(Caps::NONE);
-    session.attach(&live, 300);
-    session.submit("again".into()).unwrap();
-    settle(&session);
-    let of = |frames: Vec<Frame>| frames.into_iter().find(|f| f.seq == Some(301)).unwrap();
-    let sent_live = of(std::iter::from_fn(|| live.try_next()).collect());
-    let replayed = of(sent(Caps::NONE));
-    session.stop();
-    assert!(shared(&sent_live, &replayed), "encoded once, at commit");
-}
+mod log;

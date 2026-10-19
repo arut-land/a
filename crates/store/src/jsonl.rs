@@ -1,11 +1,12 @@
 use std::fs::{self, File, OpenOptions};
 use std::io::{self, BufRead, BufReader, Read, Write};
+use std::ops::RangeInclusive;
 use std::path::PathBuf;
+use std::sync::{Arc, PoisonError, RwLock};
 
-use protocol::{Decode, Entry, Frame, SessionId};
-use serde::Serialize;
+use protocol::{Decode, Entry, SessionId};
 
-use crate::{Header, Lease, LeaseAuthority, Loaded, Local, Log, LogStore, floor};
+use crate::{Header, Lease, LeaseAuthority, Lines, Loaded, Local, Log, LogStore, span};
 
 /// One append-only JSONL file per session in a directory: the header on the
 /// first line, one entry per line after it, and an empty `.busy` file beside
@@ -33,6 +34,21 @@ impl Jsonl {
     fn busy_path(&self, id: SessionId) -> PathBuf {
         self.dir.join(format!("{id}.busy"))
     }
+
+    fn loaded(&self, index: Index, seq: u64, lease: Lease, new_in: Option<PathBuf>) -> Loaded {
+        let index = Arc::new(index);
+        Loaded {
+            lines: Arc::clone(&index) as Arc<dyn Lines>,
+            seq,
+            epoch: lease.epoch,
+            log: Box::new(JsonlLog {
+                index,
+                new_in,
+                lease,
+                torn: false,
+            }),
+        }
+    }
 }
 
 impl LogStore for Jsonl {
@@ -41,19 +57,15 @@ impl LogStore for Jsonl {
     fn create(&self, header: &Header) -> io::Result<Loaded> {
         let mut file = OpenOptions::new()
             .create_new(true)
+            .read(true)
             .append(true)
             .open(self.path(header.id))?;
-        write_line(&mut file, header)?;
+        let mut line = serde_json::to_vec(header)?;
+        line.push(b'\n');
+        file.write_all(&line)?;
+        let index = Index::new(file, line.len() as u64);
         let lease = self.leases.acquire(header.id, 0);
-        Ok(Loaded {
-            entries: Vec::new(),
-            epoch: lease.epoch,
-            log: Box::new(JsonlLog {
-                file,
-                new_in: Some(self.dir.clone()),
-                lease,
-            }),
-        })
+        Ok(self.loaded(index, 0, lease, Some(self.dir.clone())))
     }
 
     /// A file whose header did not survive a crash holds no entries either,
@@ -76,33 +88,32 @@ impl LogStore for Jsonl {
 
     /// Entries end at the first line that is unterminated or unreadable: a
     /// crash mid-append, never acknowledged. The file is cut back to there
-    /// so the next append starts on a fresh line.
-    fn load(&self, id: SessionId) -> io::Result<Loaded> {
-        let mut file = OpenOptions::new()
+    /// before any line is indexed past it, so the next append starts on a
+    /// fresh line and no read lands in what was cut.
+    fn load(&self, id: SessionId, each: &mut dyn FnMut(Entry)) -> io::Result<Loaded> {
+        let file = OpenOptions::new()
             .read(true)
             .append(true)
             .open(self.path(id))?;
-        let mut bytes = Vec::new();
-        file.read_to_end(&mut bytes)?;
-        let (entries, end) = parse(&bytes);
-        if end < bytes.len() {
-            file.set_len(end as u64)?;
-            sys::sync_data(&file)?;
+        let mut index = Index::new(file, 0);
+        let mut floor = 0;
+        index.scan(|entry| {
+            floor = entry.epoch;
+            each(entry);
+        })?;
+        let seq = index.read().len() as u64;
+        if index.end() < index.file.metadata()?.len() {
+            index.file.set_len(index.end())?;
+            sys::sync_data(&index.file)?;
         }
-        let lease = self.leases.acquire(id, floor(&entries));
-        Ok(Loaded {
-            entries,
-            epoch: lease.epoch,
-            log: Box::new(JsonlLog {
-                file,
-                new_in: None,
-                lease,
-            }),
-        })
+        let lease = self.leases.acquire(id, floor);
+        Ok(self.loaded(index, seq, lease, None))
     }
 
     fn entries(&self, id: SessionId) -> io::Result<Vec<Entry>> {
-        Ok(parse(&fs::read(self.path(id))?).0)
+        let mut entries = Vec::new();
+        Index::new(File::open(self.path(id))?, 0).scan(|e| entries.push(e))?;
+        Ok(entries)
     }
 
     /// Counts lines rather than parsing them.
@@ -134,13 +145,97 @@ impl LogStore for Jsonl {
     }
 }
 
+/// Where each committed line of a session file is, so that a line is read
+/// back with one positioned read when asked for, from the OS's page cache
+/// rather than the daemon's memory: 8 bytes an entry. Only lines read whole
+/// and terminated are indexed, and only those appended in full after them.
+struct Index {
+    file: File,
+    /// Where the header line ends.
+    start: u64,
+    /// Where each entry's line ends, newline included: entry `seq`'s at
+    /// `seq - 1`.
+    ends: RwLock<Vec<u64>>,
+}
+
+impl Index {
+    fn new(file: File, start: u64) -> Self {
+        Self {
+            file,
+            start,
+            ends: RwLock::default(),
+        }
+    }
+
+    fn read(&self) -> std::sync::RwLockReadGuard<'_, Vec<u64>> {
+        self.ends.read().unwrap_or_else(PoisonError::into_inner)
+    }
+
+    /// Where the last line indexed ends: where the next is appended.
+    fn end(&self) -> u64 {
+        self.read().last().copied().unwrap_or(self.start)
+    }
+
+    /// Indexes the lines of `lines`, appended at the end.
+    fn extend(&self, lines: &[u8]) {
+        let at = self.end();
+        let mut ends = self.ends.write().unwrap_or_else(PoisonError::into_inner);
+        ends.extend(memchr::memchr_iter(b'\n', lines).map(|i| at + i as u64 + 1));
+    }
+
+    /// Reads the file from the start, line by line, indexing and handing
+    /// `each` every entry up to the first unterminated or unreadable line.
+    fn scan(&mut self, mut each: impl FnMut(Entry)) -> io::Result<()> {
+        let mut reader = BufReader::with_capacity(64 * 1024, &self.file);
+        let mut line = Vec::new();
+        self.start = reader.read_until(b'\n', &mut line)? as u64;
+        let ends = self.ends.get_mut().unwrap_or_else(PoisonError::into_inner);
+        let mut end = self.start;
+        loop {
+            line.clear();
+            let n = reader.read_until(b'\n', &mut line)?;
+            if !line.ends_with(b"\n") {
+                return Ok(());
+            }
+            let Ok(entry) = Entry::from_json(&line) else {
+                return Ok(());
+            };
+            end += n as u64;
+            ends.push(end);
+            each(entry);
+        }
+    }
+}
+
+impl Lines for Index {
+    /// One positioned read for the lot: the lines lie end to end.
+    fn read(&self, seqs: RangeInclusive<u64>, limit: usize, out: &mut Vec<u8>) -> io::Result<u64> {
+        let (from, to, count) = {
+            let ends = self.read();
+            let (first, last) = span(&seqs, ends.len())?;
+            let from = first.checked_sub(1).map_or(self.start, |i| ends[i]);
+            let fit = ends[first..=last].partition_point(|&end| end - from <= limit as u64);
+            let count = fit.max(1);
+            (from, ends[first + count - 1], count)
+        };
+        let at = out.len();
+        out.resize(at + (to - from) as usize, 0);
+        sys::read_exact_at(&self.file, &mut out[at..], from)?;
+        Ok(count as u64)
+    }
+}
+
 /// Durable once [`sys::sync_data`] returns.
 struct JsonlLog {
-    file: File,
+    index: Arc<Index>,
     /// The directory of a file not yet synced since it was created: its
     /// name is only durable once the directory is.
     new_in: Option<PathBuf>,
     lease: Lease,
+    /// A failed append may have left part of its lines past the last one
+    /// indexed, and cutting them off failed too: the next append cuts them
+    /// first.
+    torn: bool,
 }
 
 impl Log for JsonlLog {
@@ -154,15 +249,6 @@ impl Log for JsonlLog {
         }
         self.write(&lines)
     }
-
-    fn append_framed(&mut self, entries: &[Entry], frames: &[Frame]) -> io::Result<()> {
-        self.lease.admit(entries)?;
-        let mut lines = Vec::with_capacity(frames.iter().map(|f| f.as_bytes().len()).sum());
-        for frame in frames {
-            frame.line_into(&mut lines);
-        }
-        self.write(&lines)
-    }
 }
 
 impl JsonlLog {
@@ -170,33 +256,31 @@ impl JsonlLog {
         if lines.is_empty() {
             return Ok(());
         }
-        self.file.write_all(lines)?;
-        sys::sync_data(&self.file)?;
-        #[cfg(unix)]
-        if let Some(dir) = &self.new_in {
-            File::open(dir)?.sync_all()?;
+        let end = self.index.end();
+        let file = &self.index.file;
+        if self.torn {
+            file.set_len(end)?;
+            self.torn = false;
         }
-        self.new_in = None;
-        Ok(())
-    }
-}
-
-/// The entries of a session file's bytes, and where they end.
-fn parse(bytes: &[u8]) -> (Vec<Entry>, usize) {
-    let mut end = memchr::memchr(b'\n', bytes).map_or(bytes.len(), |i| i + 1);
-    let mut entries = Vec::new();
-    for line in bytes[end..].split_inclusive(|&b| b == b'\n') {
-        match Entry::from_json(line) {
-            Ok(entry) if line.ends_with(b"\n") => entries.push(entry),
-            _ => break,
+        let written = (|| {
+            (&*file).write_all(lines)?;
+            sys::sync_data(file)?;
+            #[cfg(unix)]
+            if let Some(dir) = &self.new_in {
+                File::open(dir)?.sync_all()?;
+            }
+            io::Result::Ok(())
+        })();
+        match written {
+            Ok(()) => {
+                self.new_in = None;
+                self.index.extend(lines);
+                Ok(())
+            }
+            Err(e) => {
+                self.torn = file.set_len(end).is_err();
+                Err(e)
+            }
         }
-        end += line.len();
     }
-    (entries, end)
-}
-
-fn write_line(file: &mut File, value: &impl Serialize) -> io::Result<()> {
-    let mut line = serde_json::to_vec(value)?;
-    line.push(b'\n');
-    file.write_all(&line)
 }

@@ -10,9 +10,11 @@ mod memory;
 mod tests;
 
 use std::io;
+use std::ops::RangeInclusive;
 use std::path::PathBuf;
+use std::sync::Arc;
 
-use protocol::{Body, Entry, Frame, Installed, SessionId};
+use protocol::{Body, Entry, Installed, SessionId};
 use serde::{Deserialize, Serialize};
 
 pub use jsonl::Jsonl;
@@ -40,28 +42,27 @@ pub struct Parent {
     pub call: u64,
 }
 
-/// A session's committed entries and the appender that continues them.
+/// A session's appender, and the entries it continues as their lines.
 pub struct Loaded {
-    pub entries: Vec<Entry>,
     pub log: Box<dyn Log>,
+    /// The committed entries' lines, read back by seq from where the log
+    /// keeps them rather than held in memory; appends add to them.
+    pub lines: Arc<dyn Lines>,
+    /// The seq of the last entry committed.
+    pub seq: u64,
     /// The epoch of the appender's lease, which every entry it appends
     /// carries.
     pub epoch: u32,
 }
 
 impl Loaded {
-    /// Appends `body` as the next entry, durably, and keeps it in `entries`.
-    pub fn append(&mut self, body: Body) -> io::Result<()> {
-        let entry = Entry::new(self.entries.len() as u64 + 1, self.epoch, body);
+    /// Appends `body` as the next entry, durably, and returns it.
+    pub fn append(&mut self, body: Body) -> io::Result<Entry> {
+        let entry = Entry::new(self.seq + 1, self.epoch, body);
         self.log.append(&entry)?;
-        self.entries.push(entry);
-        Ok(())
+        self.seq = entry.seq;
+        Ok(entry)
     }
-}
-
-/// The newest epoch in `entries`: a new lease must be past it.
-fn floor(entries: &[Entry]) -> u32 {
-    entries.last().map_or(0, |e| e.epoch)
 }
 
 /// Where session logs live. Each `create` or `load` leases the appender it
@@ -74,8 +75,10 @@ pub trait LogStore: Send + Sync {
     /// Every session's header, oldest first, without reading the entries.
     fn headers(&self) -> io::Result<Vec<Header>>;
 
-    /// One session's entries and an appender; `NotFound` if there is none.
-    fn load(&self, id: SessionId) -> io::Result<Loaded>;
+    /// One session's appender, handing `each` the committed entries in
+    /// order as they are read, one at a time: loading keeps none that
+    /// `each` does not. `NotFound` if there is none.
+    fn load(&self, id: SessionId, each: &mut dyn FnMut(Entry)) -> io::Result<Loaded>;
 
     /// One session's committed entries, read without taking its lease: its
     /// writer goes on appending.
@@ -104,18 +107,32 @@ pub trait Log: Send {
 
     /// Appends `entries` in order, as durably as [`Log::append`]; a backend
     /// may make them durable together. After a crash the log holds a prefix
-    /// of them.
+    /// of them, and after a failure none.
     fn append_all(&mut self, entries: &[Entry]) -> io::Result<()>;
+}
 
-    /// [`Log::append_all`], given each entry's frame, which holds the line
-    /// a log of lines stores: an entry is encoded once, for its log and
-    /// every client.
-    fn append_framed(&mut self, entries: &[Entry], frames: &[Frame]) -> io::Result<()> {
-        debug_assert_eq!(entries.len(), frames.len());
-        self.append_all(entries)
-    }
+/// A session's committed entries as the lines its log stores: each one's
+/// JSON, encoded once as it was appended, and read back as it was written.
+pub trait Lines: Send + Sync {
+    /// Appends the lines of the entries `seqs` starts with, each with its
+    /// newline, to `out`: as many as fit in `limit` bytes, and at least
+    /// one. Returns how many; `NotFound` if `seqs` holds one not committed.
+    fn read(&self, seqs: RangeInclusive<u64>, limit: usize, out: &mut Vec<u8>) -> io::Result<u64>;
 }
 
 fn not_found(id: SessionId) -> io::Error {
     io::Error::new(io::ErrorKind::NotFound, format!("no session {id}"))
+}
+
+/// Where entries `seqs` are among `len` committed: the index of the first
+/// and of the last; `NotFound` unless all are committed.
+fn span(seqs: &RangeInclusive<u64>, len: usize) -> io::Result<(usize, usize)> {
+    let index = |seq: u64| {
+        let at = usize::try_from(seq.checked_sub(1)?).ok()?;
+        (at < len).then_some(at)
+    };
+    index(*seqs.start())
+        .zip(index(*seqs.end()))
+        .filter(|(first, last)| first <= last)
+        .ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, format!("no entries {seqs:?}")))
 }

@@ -12,6 +12,7 @@ events = []
 agent.workspace = true
 futures-core = { version = "0.3", default-features = false, features = ["std"] }
 llm = { workspace = true, features = ["ureq"] }
+memchr.workspace = true
 rt.workspace = true
 serde.workspace = true
 serde_json.workspace = true

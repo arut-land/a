@@ -23,7 +23,7 @@ use protocol::{
     Origin, PROTO, Rejection, Residency, Role, SessionId, SessionSummary, SettingsChange, Target,
     Versions, read_frame,
 };
-use session::{Attachment, Session, Shared};
+use session::{Attachment, Open, Session, Shared};
 use store::{Header, Jsonl, LogStore};
 use sys::Home;
 use upgrade::{Lifecycle, Verdict};
@@ -331,8 +331,7 @@ impl Daemon {
         if let Some(session) = residence.live() {
             return Ok(f(session));
         }
-        let loaded = self.shared.store.load(slot.header.id)?;
-        let session = Session::start(slot.header.clone(), loaded, Arc::clone(&self.shared));
+        let session = Session::start(slot.header.clone(), Arc::clone(&self.shared), Open::Load)?;
         let done = f(&session);
         *residence = Residence::Live(session);
         Ok(done)
@@ -395,8 +394,7 @@ impl Daemon {
             parent: None,
             extensions: session::installed(&self.shared.registry.get()),
         };
-        let loaded = self.shared.store.create(&header)?;
-        let session = Session::start(header.clone(), loaded, Arc::clone(&self.shared));
+        let session = Session::start(header.clone(), Arc::clone(&self.shared), Open::Create)?;
         let attachment = session.open();
         lock(&self.slots).push(Slot::new(header, Some(session)));
         Ok(attachment)
