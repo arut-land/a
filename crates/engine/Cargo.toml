@@ -10,7 +10,6 @@ events = []
 
 [dependencies]
 ext.workspace = true
-ext-builtin.workspace = true
 futures-core = { version = "0.3", default-features = false, features = ["std"] }
 llm = { workspace = true, features = ["ureq"] }
 memchr.workspace = true
@@ -28,4 +27,10 @@ workspace = true
 bytes.workspace = true
 http.workspace = true
 serde_yaml_ng = "0.10"
-ext-builtin = { workspace = true, features = ["default", "fixtures"] }
+# The extensions sessions under test run.
+ext-chat.workspace = true
+ext-edit.workspace = true
+ext-fixtures = { workspace = true, features = ["on"] }
+ext-policy.workspace = true
+ext-prompt.workspace = true
+ext-shell.workspace = true

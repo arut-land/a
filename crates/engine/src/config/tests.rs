@@ -54,19 +54,16 @@ fn later_layers_win() {
     );
     let s = settings(&root);
     assert_eq!(s.model(&ws).unwrap(), "ws:m");
-    assert_eq!(s.agent(&ws), ext_builtin::agents::ECHO);
+    assert_eq!(s.agent(&ws), Some(ext_fixtures::ECHO.to_owned()));
     assert_eq!(s.model(&root).unwrap(), "home:m");
 
-    let overridden = Settings::new(
-        root.join("config.toml"),
-        Some(ext_builtin::agents::CHAT.into()),
-    );
-    assert_eq!(overridden.agent(&ws), ext_builtin::agents::CHAT);
+    let overridden = Settings::new(root.join("config.toml"), Some(ext_chat::CHAT.into()));
+    assert_eq!(overridden.agent(&ws), Some(ext_chat::CHAT.to_owned()));
 
     let (bare, ws) = dirs("defaults", None, None);
     let s = settings(&bare);
     assert_eq!(s.model(&ws).unwrap(), DEFAULT_MODEL);
-    assert_eq!(s.agent(&ws), ext_builtin::agents::CHAT);
+    assert_eq!(s.agent(&ws), None);
     std::fs::remove_dir_all(root).unwrap();
     std::fs::remove_dir_all(bare).unwrap();
 }
@@ -110,7 +107,7 @@ fn an_edited_home_file_applies_without_a_restart() {
     std::fs::write(root.join("config.toml"), "model = ").unwrap();
     let error = s.model(&ws).unwrap_err();
     assert!(error.contains("config.toml"), "{error}");
-    assert_eq!(s.agent(&ws), ext_builtin::agents::CHAT);
+    assert_eq!(s.agent(&ws), None);
     std::fs::remove_dir_all(root).unwrap();
 }
 

@@ -4,12 +4,12 @@ use protocol::Outcome;
 use serde_json::{Value, json};
 
 use super::*;
-use crate::testing::Rig;
-use crate::{DynTool, Extension, Policy, Registrar, builtins};
-use ext::Rewrite;
+use ext::host::Registry;
+use ext::testing::Rig;
+use ext::{DynTool, Extension, Registrar, Rewrite};
 
 fn rig(name: &str) -> Rig {
-    Rig::new(name, builtins(&Policy::default()).unwrap())
+    Rig::new(name, Registry::default().with(&crate::Shell).unwrap())
 }
 
 fn bash(rig: &Rig, input: &Value) -> Ran {
@@ -134,7 +134,7 @@ fn huge_output_is_cut_and_spilled_whole() {
     assert_eq!(saved.lines().count(), 200_000);
     assert!(ran.output.starts_with("1\n2\n3\n"));
     assert!(ran.output.ends_with("199999\n200000\n"));
-    assert!(ran.output.lines().count() <= super::super::output::LINES + 1);
+    assert!(ran.output.lines().count() <= crate::output::LINES + 1);
     assert!(
         ran.output
             .contains(&format!("omitted; full output: {}]", full.display()))
@@ -383,7 +383,8 @@ impl Extension for Wrapper {
 
 #[test]
 fn every_process_goes_through_the_spawn_hooks() {
-    let registry = builtins(&Policy::default())
+    let registry = Registry::default()
+        .with(&crate::Shell)
         .and_then(|r| r.with(&Wrapper))
         .unwrap();
     let rig = Rig::new("spawn-hook", registry);

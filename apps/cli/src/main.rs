@@ -1,3 +1,5 @@
+mod exts;
+
 use std::io::{self, BufRead, IsTerminal, Write};
 use std::process::ExitCode;
 use std::sync::mpsc;
@@ -612,7 +614,10 @@ fn daemon(
     engine::serve(
         &listener,
         home,
-        &engine::Config::load(home),
+        &engine::Config {
+            extensions: exts::registry,
+            ..engine::Config::load(home)
+        },
         &ctx.staged.id,
         start,
     )

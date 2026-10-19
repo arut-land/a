@@ -263,14 +263,17 @@ impl Registry {
             .map(|c| Command(&**c))
     }
 
-    /// A new loop of the agent named `name`. A name no extension registers
-    /// is reported, and the first agent registered runs instead; with none,
-    /// a loop that does nothing.
-    pub fn agent(&self, name: &str) -> Box<dyn Agent> {
-        let named = self.agents.iter().find(|(n, _)| &**n == name);
-        if named.is_none() {
-            eprintln!("warning: no agent named {name} is registered");
-        }
+    /// A new loop of the agent named `name`, or of the first registered
+    /// with no name given. A name no extension registers is reported, and
+    /// the first agent runs instead; with none, a loop that does nothing.
+    pub fn agent(&self, name: Option<&str>) -> Box<dyn Agent> {
+        let named = name.and_then(|name| {
+            let named = self.agents.iter().find(|(n, _)| &**n == name);
+            if named.is_none() {
+                eprintln!("warning: no agent named {name} is registered");
+            }
+            named
+        });
         match named.or(self.agents.first()) {
             Some((_, make)) => make(),
             None => Box::new(Idle),

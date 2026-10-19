@@ -297,7 +297,7 @@ impl Session {
             ledger: Ledger::default(),
             states: registry.states(),
             replay: Replayer::default(),
-            agent: registry.agent(&kind),
+            agent: registry.agent(kind.as_deref()),
         };
         // Each entry is folded as it is read and dropped: what loading
         // keeps is what the session keeps, never the entries.
@@ -823,7 +823,7 @@ impl Session {
     async fn run(
         &self,
         mailbox: &rt::channel::Receiver<Msg>,
-        kind: String,
+        kind: Option<String>,
         mut agent: Box<dyn Agent>,
         recover: Option<VecDeque<Action>>,
     ) {
@@ -833,7 +833,7 @@ impl Session {
         };
         loop {
             if !ok {
-                agent = self.registry().agent(&kind);
+                agent = self.registry().agent(kind.as_deref());
                 replay(agent.as_mut(), self.frames.entries());
                 let mut states = self.registry().states();
                 states.replay(self.frames.entries());

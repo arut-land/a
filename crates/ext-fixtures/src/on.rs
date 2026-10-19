@@ -1,0 +1,147 @@
+use std::time::Duration;
+
+use ext::{Action, Agent, Cx, Extension, Input, Registrar, Replay, Tool};
+use protocol::Body;
+use serde::{Deserialize, Serialize};
+use serde_json::{Value, json};
+
+/// The `fixtures` extension.
+pub struct Fixtures;
+
+impl Extension for Fixtures {
+    const NAME: &'static str = "fixtures";
+    const VERSION: u32 = 1;
+
+    fn contribute(&self, r: &mut Registrar) {
+        r.tool(Sleep).agent(crate::ECHO, || Box::new(Echo));
+    }
+}
+
+/// Echoes messages back. `$ <command>` runs it with `bash`,
+/// `sleep <seconds>` calls the `sleep` fixture and `spawn <message>` hands
+/// the message to a child session, so tool calls and links can be exercised
+/// without a model.
+pub struct Echo;
+
+impl Agent for Echo {
+    fn step(&mut self, input: Input) -> Vec<Action> {
+        let text = match input {
+            Input::User { text } => text,
+            Input::ChildDone { outcome, .. } => {
+                let text = ext::child_result(&outcome);
+                return vec![Action::Emit(Body::Assistant { text })];
+            }
+            Input::ToolDone { .. } | Input::ModelDone { .. } => return Vec::new(),
+        };
+        if let Some(input) = text.strip_prefix("spawn ") {
+            return vec![Action::Spawn {
+                input: input.to_owned(),
+            }];
+        }
+        let (tool, input) = if let Some(command) = text.strip_prefix("$ ") {
+            ("bash", json!({ "command": command }))
+        } else if let Some(Ok(seconds)) = text.strip_prefix("sleep ").map(str::parse::<u64>) {
+            (Sleep::NAME, json!({ "seconds": seconds }))
+        } else {
+            return vec![Action::Emit(Body::Assistant { text })];
+        };
+        vec![Action::RunTool {
+            tool: tool.to_owned(),
+            input,
+            id: None,
+            refuse: None,
+        }]
+    }
+}
+
+/// Waits: a safe tool, so tests can watch a call that recovery reruns.
+pub struct Sleep;
+
+#[derive(Deserialize)]
+pub struct Seconds {
+    pub seconds: u64,
+}
+
+#[derive(Serialize, Deserialize)]
+pub struct Slept {
+    pub slept: u64,
+}
+
+impl Tool for Sleep {
+    type In = Seconds;
+    type Out = Slept;
+
+    const NAME: &'static str = "sleep";
+    const DESCRIPTION: &'static str = "Waits for a number of seconds.";
+    const REPLAY: Replay = Replay::Safe;
+
+    fn schema() -> Value {
+        serde_json::from_str(
+            r#"{
+                "type": "object",
+                "properties": { "seconds": { "type": "integer", "minimum": 0 } },
+                "required": ["seconds"],
+                "additionalProperties": false
+            }"#,
+        )
+        .expect("a tool schema is valid JSON")
+    }
+
+    async fn call(&self, input: Seconds, cx: &Cx) -> Result<Slept, String> {
+        cx.rt.sleep(Duration::from_secs(input.seconds)).await;
+        Ok(Slept {
+            slept: input.seconds,
+        })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use protocol::Outcome;
+
+    use super::*;
+
+    fn user(text: &str) -> Input {
+        Input::User { text: text.into() }
+    }
+
+    fn tool_named(actions: &[Action]) -> Option<&str> {
+        match actions {
+            [Action::RunTool { tool, .. }] => Some(tool),
+            _ => None,
+        }
+    }
+
+    #[test]
+    fn echo_routes_messages_and_tools() {
+        let mut echo = Echo;
+        assert!(
+            matches!(&echo.step(user("hi"))[..], [Action::Emit(Body::Assistant { text })] if text == "hi")
+        );
+        assert_eq!(tool_named(&echo.step(user("$ ls"))), Some("bash"));
+        assert_eq!(tool_named(&echo.step(user("sleep 2"))), Some("sleep"));
+        assert!(matches!(&echo.step(user("sleep x"))[..], [Action::Emit(_)]));
+        assert_eq!(
+            echo.step(user("spawn sleep 1")),
+            [Action::Spawn {
+                input: "sleep 1".into()
+            }]
+        );
+    }
+
+    #[test]
+    fn echo_hears_a_childs_result() {
+        let done = Input::ChildDone {
+            watch: 3,
+            outcome: Outcome::Done {
+                output: Value::from("hi").into(),
+            },
+        };
+        assert_eq!(
+            Echo.step(done),
+            [Action::Emit(Body::Assistant {
+                text: "The child session finished:\nhi".into()
+            })]
+        );
+    }
+}

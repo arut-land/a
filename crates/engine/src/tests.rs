@@ -6,6 +6,8 @@ use serde_json::json;
 use store::{Header, Jsonl, LogStore};
 use sys::Home;
 
+use ext::host::Registry;
+
 use super::{Config, Daemon};
 
 fn home(name: &str) -> (PathBuf, Home) {
@@ -14,9 +16,28 @@ fn home(name: &str) -> (PathBuf, Home) {
     (root.clone(), Home::from(root))
 }
 
+/// Every extension in the repository, as `a` links them, with `policy`,
+/// and the fixtures.
+pub(crate) fn extensions(policy: &ext_policy::Policy) -> Result<Registry, ext::Refused> {
+    Registry::default()
+        .with_in(ext::Tier::Guarded, policy)?
+        .with_in(ext::Tier::Pre, &ext_prompt::Prompt)?
+        .with_in(ext::Tier::Pre, &ext_shell::Shell)?
+        .with_in(ext::Tier::Pre, &ext_edit::Edit)?
+        .with_in(ext::Tier::Pre, &ext_chat::Chat)?
+        .with_in(ext::Tier::Pre, &ext_fixtures::Fixtures)
+}
+
+/// [`extensions`], configured as `config` says.
+pub(crate) fn configured(config: &Config) -> Result<Registry, ext::Refused> {
+    extensions(&ext_policy::Policy {
+        ask: config.ask.clone(),
+    })
+}
+
 fn echo() -> Config {
     Config {
-        agent: Some(ext_builtin::agents::ECHO.into()),
+        agent: Some(ext_fixtures::ECHO.into()),
         ..Config::default()
     }
 }

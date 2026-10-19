@@ -29,12 +29,12 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
 #[cfg(unix)]
-use super::output::Live;
-use super::output::{Output, Rendered, Spill, create_private, private_dir};
-#[cfg(unix)]
-use crate::Kill;
+use crate::output::Live;
+use crate::output::{Output, Rendered, Spill, create_private, private_dir};
 use crate::state::Cwd;
-use crate::{Cx, Spawn, Tool};
+#[cfg(unix)]
+use ext::Kill;
+use ext::{Cx, SpawnSpec as Spawn, Tool};
 
 pub struct Bash;
 
@@ -116,7 +116,7 @@ impl Tool for Bash {
     const DESCRIPTION: &'static str = "Runs a bash command in the session's working directory, which persists across calls, and returns its combined stdout and stderr with its exit status. There is no stdin or terminal.";
 
     fn schema() -> Value {
-        super::schema(
+        crate::schema(
             r#"{
                 "type": "object",
                 "properties": {
@@ -273,7 +273,7 @@ async fn run(input: Command, cx: &Cx) -> io::Result<Ran> {
         cx.update::<Cwd>(Cwd::change(&cwd, base));
     }
     if done.lingering {
-        cx.own(pgid, None);
+        cx.own(pgid, crate::job::ended(pgid, None));
     }
     let Rendered {
         text,
@@ -305,7 +305,7 @@ fn background(cx: &Cx, spawn: Spawn, log: &Path) -> io::Result<Ran> {
     let child = cmd.spawn()?;
     drop(cmd);
     let pgid = child.id();
-    cx.own(pgid, Some(child));
+    cx.own(pgid, crate::job::ended(pgid, Some(child)));
     Ok(Ran {
         cwd: spawn.cwd,
         duration_ms: duration_ms(started),

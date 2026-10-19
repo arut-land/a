@@ -160,17 +160,15 @@ impl Settings {
         watched.get()
     }
 
-    /// The name of the agent a session in `workspace` runs, `chat` unless
-    /// configured otherwise. A file that cannot be read is passed over
-    /// here; the model call reports it.
-    pub fn agent(&self, workspace: &Path) -> String {
+    /// The name of the agent a session in `workspace` runs, if configured:
+    /// otherwise the first an extension registers. A file that cannot be
+    /// read is passed over here; the model call reports it.
+    pub fn agent(&self, workspace: &Path) -> Option<String> {
         if let Some(name) = &self.agent {
-            return name.clone();
+            return Some(name.clone());
         }
         let named = |file: &Result<File, String>| file.as_ref().ok()?.agent.clone();
-        named(&self.workspace(workspace))
-            .or_else(|| named(&self.home.get()))
-            .unwrap_or_else(|| ext_builtin::agents::CHAT.to_owned())
+        named(&self.workspace(workspace)).or_else(|| named(&self.home.get()))
     }
 
     /// The model spec for a session in `workspace` that sets none itself.

@@ -10,9 +10,15 @@ edition = "2024"
 publish = false
 
 [workspace.dependencies]
+# The extension SDK, and the extensions: one crate each, or a small group
+# that belongs together. A binary links the ones it runs.
 ext = { path = "crates/ext" }
-# Each user picks the built-ins it runs; `a` takes them all.
-ext-builtin = { path = "crates/ext-builtin", default-features = false }
+ext-chat = { path = "crates/ext-chat" }
+ext-edit = { path = "crates/ext-edit" }
+ext-fixtures = { path = "crates/ext-fixtures" }
+ext-policy = { path = "crates/ext-policy" }
+ext-prompt = { path = "crates/ext-prompt" }
+ext-shell = { path = "crates/ext-shell" }
 client = { path = "crates/client" }
 engine = { path = "crates/engine" }
 llm = { path = "crates/llm" }

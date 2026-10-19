@@ -4,7 +4,6 @@
 use std::collections::BTreeMap;
 use std::future::Future;
 use std::path::{Path, PathBuf};
-use std::process::Child;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
@@ -195,12 +194,12 @@ impl Cx {
     }
 
     /// Hands process group `pgid` to the session, past this call: it is
-    /// recorded, then watched until it ends (reaping `leader`, the child
-    /// that leads it, when it exits), when [`job::ENDED`] is notified.
-    pub fn own(&self, pgid: u32, leader: Option<Child>) {
+    /// recorded, and [`job::ENDED`] is notified once `ended`, which watches
+    /// it, resolves.
+    pub fn own(&self, pgid: u32, ended: impl Future<Output = ()> + Send + 'static) {
         self.host.spawned(pgid, true);
         self.rt.spawn(Box::pin(async move {
-            job::ended(pgid, leader).await;
+            ended.await;
             job::ENDED.notify();
         }));
     }

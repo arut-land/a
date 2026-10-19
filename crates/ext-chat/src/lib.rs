@@ -1,20 +1,23 @@
-//! The agent loops the built-ins register.
+//! `chat`: the model-backed agent loop.
 
-#[cfg(any(test, feature = "fixtures"))]
-use ext::Tool;
-use ext::{Action, Agent, Input};
-#[cfg(any(test, feature = "fixtures"))]
-use protocol::Body;
+use ext::{Action, Agent, Extension, Input, Registrar};
 use protocol::Outcome;
 use serde_json::Value;
-#[cfg(any(test, feature = "fixtures"))]
-use serde_json::json;
 
-/// The model-backed agent's name, which sessions run unless configured
-/// otherwise.
+/// The agent's name.
 pub const CHAT: &str = "chat";
-/// The test agent's name.
-pub const ECHO: &str = "echo";
+
+/// The `chat` extension, which registers the [`Loop`] as [`CHAT`].
+pub struct Chat;
+
+impl Extension for Chat {
+    const NAME: &'static str = "chat";
+    const VERSION: u32 = 1;
+
+    fn contribute(&self, r: &mut Registrar) {
+        r.agent(CHAT, || Box::new(Loop::default()));
+    }
+}
 
 /// Model calls one user message may lead to; the calls of the last reply
 /// are answered with an error instead of run.
@@ -23,14 +26,14 @@ pub const MAX_STEPS: u32 = 20;
 /// Hands every user message to the model, runs the tools it calls and gives
 /// it their results, until it answers without calling any.
 #[derive(Default)]
-pub struct Chat {
+pub struct Loop {
     /// Model calls since the last user message.
     steps: u32,
     /// Calls of the last reply still unanswered.
     pending: usize,
 }
 
-impl Agent for Chat {
+impl Agent for Loop {
     fn step(&mut self, input: Input) -> Vec<Action> {
         match input {
             // A child interrupted with its owner hands back nothing to go
@@ -92,45 +95,6 @@ fn refusal(call: &llm::ToolCall, limited: bool) -> Option<String> {
     limited.then(|| format!("not run: the limit of {MAX_STEPS} model calls per message is reached"))
 }
 
-/// Echoes messages back. `$ <command>` runs it with `bash`,
-/// `sleep <seconds>` calls the `sleep` fixture and `spawn <message>` hands
-/// the message to a child session, so tool calls and links can be exercised
-/// without a model.
-#[cfg(any(test, feature = "fixtures"))]
-pub struct Echo;
-
-#[cfg(any(test, feature = "fixtures"))]
-impl Agent for Echo {
-    fn step(&mut self, input: Input) -> Vec<Action> {
-        let text = match input {
-            Input::User { text } => text,
-            Input::ChildDone { outcome, .. } => {
-                let text = ext::child_result(&outcome);
-                return vec![Action::Emit(Body::Assistant { text })];
-            }
-            Input::ToolDone { .. } | Input::ModelDone { .. } => return Vec::new(),
-        };
-        if let Some(input) = text.strip_prefix("spawn ") {
-            return vec![Action::Spawn {
-                input: input.to_owned(),
-            }];
-        }
-        let (tool, input) = if let Some(command) = text.strip_prefix("$ ") {
-            (crate::tools::Bash::NAME, json!({ "command": command }))
-        } else if let Some(Ok(seconds)) = text.strip_prefix("sleep ").map(str::parse::<u64>) {
-            (crate::tools::Sleep::NAME, json!({ "seconds": seconds }))
-        } else {
-            return vec![Action::Emit(Body::Assistant { text })];
-        };
-        vec![Action::RunTool {
-            tool: tool.to_owned(),
-            input,
-            id: None,
-            refuse: None,
-        }]
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -139,45 +103,15 @@ mod tests {
         Input::User { text: text.into() }
     }
 
-    fn tool_named(actions: &[Action]) -> Option<&str> {
-        match actions {
-            [Action::RunTool { tool, .. }] => Some(tool),
-            _ => None,
-        }
-    }
-
     #[test]
-    fn echo_routes_messages_and_tools() {
-        let mut echo = Echo;
-        assert!(
-            matches!(&echo.step(user("hi"))[..], [Action::Emit(Body::Assistant { text })] if text == "hi")
-        );
-        assert_eq!(tool_named(&echo.step(user("$ ls"))), Some("bash"));
-        assert_eq!(tool_named(&echo.step(user("sleep 2"))), Some("sleep"));
-        assert!(matches!(&echo.step(user("sleep x"))[..], [Action::Emit(_)]));
-        assert_eq!(
-            echo.step(user("spawn sleep 1")),
-            [Action::Spawn {
-                input: "sleep 1".into()
-            }]
-        );
-    }
-
-    #[test]
-    fn agents_hear_a_childs_result() {
+    fn chat_hears_a_childs_result() {
         let done = |output: Value| Input::ChildDone {
             watch: 3,
             outcome: Outcome::Done {
                 output: output.into(),
             },
         };
-        assert_eq!(
-            Echo.step(done("hi".into())),
-            [Action::Emit(Body::Assistant {
-                text: "The child session finished:\nhi".into()
-            })]
-        );
-        let mut chat = Chat::default();
+        let mut chat = Loop::default();
         assert_eq!(chat.step(done("hi".into())), [Action::CallModel]);
         assert_eq!(chat.step(reply(&[])), NOTHING);
     }
@@ -228,7 +162,7 @@ mod tests {
 
     #[test]
     fn chat_calls_the_model_again_once_every_call_is_answered() {
-        let mut chat = Chat::default();
+        let mut chat = Loop::default();
         assert_eq!(chat.step(user("hi")), [Action::CallModel]);
         let calls = chat.step(reply(&[("a", None), ("b", Some("{\"sec"))]));
         let ids: Vec<_> = calls
@@ -248,7 +182,7 @@ mod tests {
 
     #[test]
     fn chat_stops_at_the_step_limit() {
-        let mut chat = Chat::default();
+        let mut chat = Loop::default();
         chat.step(user("hi"));
         for _ in 1..MAX_STEPS {
             assert_eq!(chat.step(reply(&[("a", None)])).len(), 1);

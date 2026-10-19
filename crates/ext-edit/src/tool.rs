@@ -18,7 +18,7 @@ use serde_json::Value;
 
 use ext::Fold;
 
-use crate::{Cx, Tool};
+use ext::{Cx, Tool};
 
 pub struct Edit;
 
@@ -86,7 +86,7 @@ impl Tool for Edit {
     const DESCRIPTION: &'static str = "Edits a text file by exact replacement. Each `old` must appear exactly once in the file as it was before this call, and edits must not overlap. One edit with an empty `old` writes `new` as the whole file, creating it if needed.";
 
     fn schema() -> Value {
-        super::schema(
+        crate::schema(
             r#"{
                 "type": "object",
                 "properties": {
@@ -325,8 +325,9 @@ fn hash(bytes: &[u8]) -> u64 {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::testing::Rig;
-    use crate::{DynTool, Policy, builtins};
+    use ext::DynTool;
+    use ext::host::Registry;
+    use ext::testing::Rig;
     use protocol::Outcome;
     use serde_json::json;
 
@@ -384,6 +385,14 @@ mod tests {
         assert_eq!((diff.added, diff.removed), (1, 1));
     }
 
+    /// The shell, where edits are made, and the edit.
+    fn registry() -> Registry {
+        Registry::default()
+            .with(&ext_shell::Shell)
+            .and_then(|r| r.with(&crate::Edit))
+            .unwrap()
+    }
+
     fn change(rig: &Rig, path: &str, pairs: &[(&str, &str)]) -> Outcome {
         let edits: Vec<Value> = pairs
             .iter()
@@ -401,7 +410,7 @@ mod tests {
 
     #[test]
     fn edits_create_and_change_files_and_catch_stale_reads() {
-        let rig = Rig::new("edit", builtins(&Policy::default()).unwrap());
+        let rig = Rig::new("edit", registry());
         let file = rig.workspace().join("notes.txt");
         let created = change(&rig, "notes.txt", &[("", "one\ntwo\n")]);
         assert!(matches!(&created, Outcome::Done { output } if output.value()["created"] == true));
@@ -440,7 +449,7 @@ mod tests {
 
     #[test]
     fn paths_are_relative_to_where_the_shell_left_off() {
-        let rig = Rig::new("edit-cwd", builtins(&Policy::default()).unwrap());
+        let rig = Rig::new("edit-cwd", registry());
         rig.done("bash", &json!({ "command": "mkdir sub && cd sub" }));
         assert!(matches!(
             change(&rig, "x.txt", &[("", "x")]),

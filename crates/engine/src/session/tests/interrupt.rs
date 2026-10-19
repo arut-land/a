@@ -58,7 +58,7 @@ fn over_ureq(port: u16) -> (Fixture, PathBuf) {
         settings: crate::config::Settings::new(home.clone(), None),
         http: Arc::new(llm::Ureq::new(Arc::new(rt::Threads::new(1)))),
     };
-    let fixture = Fixture::new(ext_builtin::agents::CHAT, Registry::default(), models);
+    let fixture = Fixture::new(ext_chat::CHAT, Registry::default(), models);
     (fixture, home)
 }
 
@@ -154,7 +154,7 @@ fn a_request_failing_after_an_interrupt_is_not_retried() {
         ..openai(&Script::new(&[]))
     };
     let registry = Registry::default().with(&Extras).unwrap();
-    let fixture = Fixture::new(ext_builtin::agents::CHAT, registry, models);
+    let fixture = Fixture::new(ext_chat::CHAT, registry, models);
     let session = fixture.start(&[]);
     http.session.set(Arc::downgrade(&session)).unwrap();
     session.submit("hi".into()).unwrap();

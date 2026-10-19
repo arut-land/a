@@ -71,7 +71,7 @@ fn on_disk(name: &str) -> OnDisk {
     let store = Arc::new(store::Jsonl::open(&dir).unwrap());
     let fixture = Fixture::on(
         store,
-        ext_builtin::agents::ECHO,
+        ext_fixtures::ECHO,
         Registry::default(),
         openai(&Script::new(&[])),
     );

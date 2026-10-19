@@ -26,6 +26,8 @@ pub mod job;
 pub mod point;
 mod service;
 mod state;
+#[cfg(feature = "testing")]
+pub mod testing;
 mod tool;
 
 pub use ext::{Command, DynExtension, Extension, Facts, Place, Refused, Registrar, Text, Tier};

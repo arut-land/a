@@ -8,7 +8,13 @@ version = "0.0.0"
 dependencies = [
  "client",
  "engine",
- "ext-builtin",
+ "ext",
+ "ext-chat",
+ "ext-edit",
+ "ext-fixtures",
+ "ext-policy",
+ "ext-prompt",
+ "ext-shell",
  "libc",
  "protocol",
  "rustix",
@@ -538,7 +544,12 @@ version = "0.0.0"
 dependencies = [
  "bytes",
  "ext",
- "ext-builtin",
+ "ext-chat",
+ "ext-edit",
+ "ext-fixtures",
+ "ext-policy",
+ "ext-prompt",
+ "ext-shell",
  "futures-core",
  "http",
  "llm",
@@ -601,7 +612,55 @@ dependencies = [
 ]
 
 [[package]]
-name = "ext-builtin"
+name = "ext-chat"
+version = "0.0.0"
+dependencies = [
+ "ext",
+ "llm",
+ "protocol",
+ "serde_json",
+]
+
+[[package]]
+name = "ext-edit"
+version = "0.0.0"
+dependencies = [
+ "ext",
+ "ext-shell",
+ "llm",
+ "protocol",
+ "rt",
+ "serde",
+ "serde_json",
+]
+
+[[package]]
+name = "ext-fixtures"
+version = "0.0.0"
+dependencies = [
+ "ext",
+ "protocol",
+ "serde",
+ "serde_json",
+]
+
+[[package]]
+name = "ext-policy"
+version = "0.0.0"
+dependencies = [
+ "ext",
+ "protocol",
+]
+
+[[package]]
+name = "ext-prompt"
+version = "0.0.0"
+dependencies = [
+ "ext",
+]
+
+[[package]]
+name = "ext-shell"
 version = "0.0.0"
 dependencies = [
  "ext",

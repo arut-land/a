@@ -1,0 +1,55 @@
+//! `prompt`: the system prompt's one line of identity, and the facts the
+//! model is first given about where it runs: the directory, the platform,
+//! and the workspace's `AGENTS.md`.
+
+use std::fmt::Write as _;
+use std::io::Read;
+
+use ext::{Extension, Facts, Registrar, Text};
+
+/// The `prompt` extension.
+pub struct Prompt;
+
+/// The most of `AGENTS.md` the model is given.
+const AGENTS_LIMIT: u64 = 32 * 1024;
+
+impl Extension for Prompt {
+    const NAME: &'static str = "prompt";
+    const VERSION: u32 = 1;
+
+    fn contribute(&self, r: &mut Registrar) {
+        r.text(Text::system("identity", 0, "You are `a`, a coding agent working in the user's workspace through the tools you are given. Do the work rather than describe it, and keep replies short."))
+            .text(Text::context("environment", 0, |facts| Some(context(facts))));
+    }
+}
+
+fn context(facts: &Facts<'_>) -> String {
+    let mut text = format!(
+        "<environment>\nworking directory: {}\n",
+        facts.dir.display()
+    );
+    if facts.workspace != facts.dir {
+        let _ = writeln!(text, "workspace: {}", facts.workspace.display());
+    }
+    let _ = write!(
+        text,
+        "platform: {} {}\n</environment>",
+        std::env::consts::OS,
+        std::env::consts::ARCH
+    );
+    let path = facts.workspace.join("AGENTS.md");
+    let mut notes = String::new();
+    if std::fs::File::open(&path)
+        .and_then(|file| file.take(AGENTS_LIMIT).read_to_string(&mut notes))
+        .is_ok()
+        && !notes.trim().is_empty()
+    {
+        let _ = write!(
+            text,
+            "\n\n<agents_md path=\"{}\">\n{}\n</agents_md>",
+            path.display(),
+            notes.trim()
+        );
+    }
+    text
+}

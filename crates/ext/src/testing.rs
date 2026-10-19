@@ -1,5 +1,5 @@
-//! A stand-in engine for tool tests: calls run against a registry, with
-//! state folded and processes recorded in memory.
+//! A stand-in engine for an extension's tests: calls run against a
+//! registry, with state folded and processes recorded in memory.
 
 use std::ops::Deref;
 use std::path::PathBuf;
@@ -9,8 +9,8 @@ use std::sync::{Arc, LazyLock, Mutex, MutexGuard, PoisonError};
 use protocol::{Body, Entry, Environment, Outcome, SessionId};
 use serde_json::Value;
 
-use ext::host::{Host, Parts, Registry};
-use ext::{Cancel, Cx, States};
+use crate::host::{Host, Parts, Registry};
+use crate::{Cancel, Cx, States};
 
 static RT: LazyLock<rt::Rt> = LazyLock::new(|| Arc::new(rt::Threads::default()));
 

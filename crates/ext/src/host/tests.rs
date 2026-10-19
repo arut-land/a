@@ -336,7 +336,7 @@ fn commands_and_agents_are_found_by_name() {
     assert_eq!(registry.agents().collect::<Vec<_>>(), ["idle"]);
     // An unknown name runs the first agent registered.
     let said = registry
-        .agent("nope")
+        .agent(Some("nope"))
         .step(crate::Input::User { text: "hi".into() });
     assert_eq!(said, []);
 }

@@ -44,7 +44,7 @@ pub struct Config {
     pub hibernate: Duration,
     /// How long an upgrade waits for in-flight work.
     pub drain: Duration,
-    /// `chat` or `echo` (which needs no model): overrides the config files'
+    /// The agent sessions run, by name: overrides the config files'
     /// `agent`.
     pub agent: Option<String>,
     /// Tools whose calls wait for the user's approval.
@@ -54,6 +54,9 @@ pub struct Config {
     /// Young deaths in a row after which a daemon refuses to serve (0 for
     /// never); see [`sys::crash`].
     pub crash_limit: u32,
+    /// The registry of the extensions this build links, assembled for this
+    /// configuration. The engine itself offers the model nothing.
+    pub extensions: fn(&Config) -> Result<ext::host::Registry, ext::Refused>,
 }
 
 impl Default for Config {
@@ -66,6 +69,10 @@ impl Default for Config {
             ask: Vec::new(),
             system_prompt: None,
             crash_limit: sys::crash::LIMIT,
+            #[cfg(not(test))]
+            extensions: |_| Ok(ext::host::Registry::default()),
+            #[cfg(test)]
+            extensions: tests::configured,
         }
     }
 }
@@ -81,13 +88,10 @@ impl Config {
         Self::from(file.daemon)
     }
 
-    /// The built-in extensions, registered as any other. The echo agent's
-    /// `sleep` is a test fixture: no model is offered it.
+    /// The extensions' registry; an agent configured by name must be one
+    /// of theirs.
     fn registry(&self) -> Result<ext::host::Registry, ext::Refused> {
-        let policy = ext_builtin::Policy {
-            ask: self.ask.clone(),
-        };
-        let registry = ext_builtin::registry(&policy, self.agent.as_deref())?;
+        let registry = (self.extensions)(self)?;
         if let Some(name) = self
             .agent
             .as_deref()
@@ -113,6 +117,7 @@ impl From<sys::config::Daemon> for Config {
             crash_limit: file.crash_limit.map_or(defaults.crash_limit, |n| {
                 u32::try_from(n).unwrap_or(u32::MAX)
             }),
+            extensions: defaults.extensions,
         }
     }
 }

@@ -4,6 +4,10 @@ version.workspace = true
 edition.workspace = true
 publish.workspace = true
 
+[features]
+# `testing::Rig`, a stand-in engine for an extension's tests.
+testing = []
+
 [dependencies]
 llm.workspace = true
 protocol.workspace = true
