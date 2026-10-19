@@ -14,15 +14,17 @@ use ext::{DynExtension, Refused, Tier};
 /// `[ext.<name>]` table sets it, with the policy guarded. The fixtures
 /// come only with the `echo` agent they serve, in a build that has them.
 pub fn extensions(config: &Config) -> Result<Vec<Installed>, Refused> {
-    let setting = |e: sys::config::ParseError| Refused(e.to_string());
-    let max_steps = config.ext.table(ext::LOOP).whole("max_steps");
     let step_limit = ext::StepLimit {
-        max: match max_steps.map_err(setting)? {
-            Some(max) => {
-                u16::try_from(max).map_err(|_| Refused("ext.loop.max_steps is too large".into()))?
-            }
-            None => ext::StepLimit::default().max,
-        },
+        max: whole(config, ext::LOOP, "max_steps")?.unwrap_or(ext::StepLimit::default().max),
+    };
+    #[cfg(feature = "retry")]
+    let retry = {
+        let default = ext_retry::Retry::default();
+        ext_retry::Retry {
+            attempts: whole(config, "retry", "attempts")?.unwrap_or(default.attempts),
+            transport: whole(config, "retry", "transport")?.unwrap_or(default.transport),
+            ..default
+        }
     };
     let mut all: Vec<Installed> = vec![
         (Tier::Pre, Box::new(step_limit)),
@@ -41,12 +43,13 @@ pub fn extensions(config: &Config) -> Result<Vec<Installed>, Refused> {
         (Tier::Pre, Box::new(ext_edit::Edit)),
         #[cfg(feature = "chat")]
         (Tier::Pre, Box::new(ext_chat::Chat)),
-        #[cfg(feature = "retry")]
-        (Tier::Pre, Box::new(ext_retry::Retry::default())),
         #[cfg(feature = "settings")]
         (Tier::Pre, Box::new(ext_settings::Settings)),
         #[cfg(feature = "subagent")]
         (Tier::Pre, Box::new(ext_subagent::Subagent)),
+        // After every other: what another extension owns it is not asked.
+        #[cfg(feature = "retry")]
+        (Tier::Post, Box::new(retry)),
     ];
     if config.agent.as_deref() == Some(ext_fixtures::ECHO)
         && let Some(fixtures) = ext_fixtures::extension()
@@ -58,6 +61,13 @@ pub fn extensions(config: &Config) -> Result<Vec<Installed>, Refused> {
 
 /// An extension to install, and where.
 pub type Installed = (Tier, Box<dyn DynExtension>);
+
+/// Whole number `key` of extension `ext`'s table, if it sets one.
+fn whole<T: TryFrom<u64>>(config: &Config, ext: &str, key: &str) -> Result<Option<T>, Refused> {
+    let n = (config.ext.table(ext).whole(key)).map_err(|e| Refused(e.to_string()))?;
+    n.map(|n| T::try_from(n).map_err(|_| Refused(format!("ext.{ext}.{key} is too large"))))
+        .transpose()
+}
 
 /// The registry of [`extensions`].
 pub fn registry(config: &Config) -> Result<Registry, Refused> {
@@ -133,9 +143,9 @@ mod tests {
                 ("shell", 1),
                 ("edit", 1),
                 ("chat", 1),
-                ("retry", 1),
                 ("settings", 1),
-                ("subagent", 1)
+                ("subagent", 1),
+                ("retry", 1)
             ]
         );
         assert_eq!(
@@ -234,6 +244,109 @@ mod tests {
             chat.agents().collect::<Vec<_>>(),
             [ext::LOOP, ext_chat::CHAT]
         );
+    }
+
+    /// Every kind of model failure there is.
+    const KINDS: [llm::Kind; 12] = {
+        use llm::Kind::*;
+        [
+            Transport,
+            Auth,
+            RateLimit,
+            Quota,
+            ContextOverflow,
+            InvalidRequest,
+            ContentFilter,
+            Server,
+            Decode,
+            Incomplete,
+            Unsupported,
+            Other,
+        ]
+    };
+
+    /// A kind added to `llm` is a kind this table must place: the match
+    /// is exhaustive.
+    const fn listed(kind: llm::Kind) -> bool {
+        use llm::Kind::*;
+        match kind {
+            Transport | Auth | RateLimit | Quota | ContextOverflow | InvalidRequest
+            | ContentFilter | Server | Decode | Incomplete | Unsupported | Other => true,
+        }
+    }
+
+    /// Who answers a failure of `kind`, in `registry`.
+    fn answers(registry: &Registry, kind: llm::Kind) -> Option<String> {
+        let view = Bare;
+        let cx = PointCx::new(SessionId::new(), Path::new("/w"), &view).about(2);
+        let error = llm::Error::new(kind, "x");
+        let failed = ext::point::Failed {
+            error: &error,
+            attempt: 0,
+        };
+        match registry.hooks().request_error(&cx, failed) {
+            ext::Asked::None => None,
+            ext::Asked::Now(by, _) | ext::Asked::Later { by, .. } => Some(by.to_string()),
+        }
+    }
+
+    /// Each kind of model failure is owned by at most one of the default
+    /// extensions: none asks about another's. So which answers does not
+    /// depend on their order.
+    #[test]
+    fn request_error_kinds_partition() {
+        let config = config(&[], None);
+        let defaults = extensions(&config).unwrap();
+        for kind in KINDS {
+            assert!(listed(kind));
+            let owners: Vec<String> = defaults
+                .iter()
+                .filter_map(|(tier, ext)| {
+                    let alone = Registry::default().with_dyn(*tier, &**ext).ok()?;
+                    answers(&alone, kind)
+                })
+                .collect();
+            assert!(owners.len() <= 1, "{kind:?} is owned by {owners:?}");
+            let owner = owners.first().map(String::as_str);
+            let want = kind.is_retryable().then_some("retry");
+            assert_eq!(owner, want, "{kind:?}");
+        }
+    }
+
+    /// Falls back to another model on a rate limit: a user's handler for a
+    /// kind retry owns too.
+    struct Fallback;
+
+    impl ext::Extension for Fallback {
+        const NAME: &'static str = "fallback";
+        const VERSION: u32 = 1;
+
+        fn contribute(&self, r: &mut ext::Registrar) {
+            r.on::<ext::point::RequestError>(|_, failed| {
+                let mine = failed.error.kind == llm::Kind::RateLimit;
+                ext::Answer::Now(mine.then_some(ext::Recover::Resend))
+            });
+        }
+    }
+
+    /// Retry installs after every other extension: a handler of the user's
+    /// for a kind it would retry is asked first, whatever the install order.
+    #[test]
+    fn retry_answers_last_however_it_is_installed() {
+        let retry_first = Registry::default()
+            .with_in(Tier::Post, &ext_retry::Retry::default())
+            .and_then(|r| r.with(&Fallback))
+            .unwrap();
+        let retry_last = Registry::default()
+            .with(&Fallback)
+            .and_then(|r| r.with_in(Tier::Post, &ext_retry::Retry::default()))
+            .unwrap();
+        for registry in [retry_first, retry_last] {
+            let rate = answers(&registry, llm::Kind::RateLimit);
+            assert_eq!(rate.as_deref(), Some("fallback"));
+            let server = answers(&registry, llm::Kind::Server);
+            assert_eq!(server.as_deref(), Some("retry"));
+        }
     }
 
     #[test]

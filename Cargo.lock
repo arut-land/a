@@ -19,6 +19,7 @@ dependencies = [
  "ext-shell",
  "ext-subagent",
  "libc",
+ "llm",
  "protocol",
  "rustix",
  "serde_json",

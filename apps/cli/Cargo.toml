@@ -52,6 +52,7 @@ fixtures = ["ext-fixtures/on"]
 
 [dev-dependencies]
 ext-fixtures = { workspace = true, features = ["on"] }
+llm.workspace = true
 
 [target.'cfg(unix)'.dev-dependencies]
 # A pseudo-terminal for the black-box tests of the terminal client.
