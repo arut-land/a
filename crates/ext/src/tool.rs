@@ -92,7 +92,7 @@ impl Kill {
             None => {
                 let now = Instant::now();
                 self.asked = Some(now);
-                let _ = sys::signal_group(self.pgid, Signal::Terminate);
+                let _ = sys::Group(self.pgid).signal(Signal::Terminate);
                 Some(now + Self::GRACE)
             }
             Some(at) if at.elapsed() >= Self::GRACE => {
@@ -105,7 +105,7 @@ impl Kill {
 
     /// SIGKILL, at once.
     pub fn now(&mut self) {
-        let _ = sys::signal_group(self.pgid, Signal::Kill);
+        let _ = sys::Group(self.pgid).signal(Signal::Kill);
     }
 }
 

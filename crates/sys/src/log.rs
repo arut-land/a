@@ -40,8 +40,8 @@ fn numbered(path: &Path, n: usize) -> PathBuf {
     PathBuf::from(name)
 }
 
-/// Points this process's stderr at the log `path`, appending.
-#[cfg(unix)]
+/// Points this process's stderr at the log `path`, appending. Windows
+/// (`SetStdHandle`) waits for its daemon.
 pub fn redirect_stderr(path: &Path) -> io::Result<()> {
     if let Some(dir) = path.parent() {
         fs::create_dir_all(dir)?;
@@ -50,13 +50,22 @@ pub fn redirect_stderr(path: &Path) -> io::Result<()> {
         .create(true)
         .append(true)
         .open(path)?;
-    rustix::stdio::dup2_stderr(&log)?;
+    stderr_to(&log)
+}
+
+#[cfg(unix)]
+fn stderr_to(log: &fs::File) -> io::Result<()> {
+    rustix::stdio::dup2_stderr(log)?;
     Ok(())
+}
+
+#[cfg(windows)]
+fn stderr_to(_log: &fs::File) -> io::Result<()> {
+    Err(io::ErrorKind::Unsupported.into())
 }
 
 /// Rotates `path`, the log [`redirect_stderr`] pointed stderr at, and
 /// points stderr at a fresh one.
-#[cfg(unix)]
 pub fn rotate_stderr(path: &Path) -> io::Result<bool> {
     let rotated = rotate(path, MAX, KEEP)?;
     if rotated {

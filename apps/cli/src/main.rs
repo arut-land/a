@@ -573,7 +573,7 @@ fn new(ctx: &Ctx) -> io::Result<()> {
     conn.writer.send(&ClientMsg::Detach)
 }
 
-#[cfg(all(unix, feature = "web"))]
+#[cfg(feature = "web")]
 fn web(ctx: Ctx, open: bool) -> io::Result<()> {
     let daemon = web::Daemon {
         endpoint: ctx.endpoint,
@@ -582,7 +582,7 @@ fn web(ctx: Ctx, open: bool) -> io::Result<()> {
     web::run(daemon, open)
 }
 
-#[cfg(not(all(unix, feature = "web")))]
+#[cfg(not(feature = "web"))]
 fn web(_ctx: Ctx, _open: bool) -> io::Result<()> {
     Err(io::Error::other("this build of a has no web UI"))
 }
@@ -590,7 +590,6 @@ fn web(_ctx: Ctx, _open: bool) -> io::Result<()> {
 /// The daemon. Started by a client (`listen_fd`), it leaves the client's
 /// session and logs to `logs/daemon.log`; by hand, it stays at the
 /// terminal.
-#[cfg(unix)]
 fn daemon(
     ctx: &Ctx,
     listen_fd: Option<i32>,
@@ -602,12 +601,12 @@ fn daemon(
     let listener = if let Some(fd) = listen_fd {
         sys::detach_session()?;
         sys::log::redirect_stderr(&home.daemon_log())?;
-        sys::adopt_listener(fd)?
+        sys::Listener::adopt(fd.into())?
     } else {
         home.bind()?
     };
     let start = engine::Start {
-        lock: lock_fd.map(sys::adopt_lock).transpose()?,
+        lock: lock_fd.map(|fd| sys::adopt_lock(fd.into())).transpose()?,
         reset_breaker,
         logs: listen_fd.is_some(),
     };
@@ -621,18 +620,6 @@ fn daemon(
         &ctx.staged.id,
         start,
     )
-}
-
-#[cfg(not(unix))]
-fn daemon(
-    _ctx: &Ctx,
-    _listen_fd: Option<i32>,
-    _lock_fd: Option<i32>,
-    _reset_breaker: bool,
-) -> io::Result<()> {
-    Err(io::Error::other(
-        "the daemon is not implemented on this platform yet",
-    ))
 }
 
 #[cfg(test)]

@@ -174,6 +174,43 @@ impl Drop for Timer {
 
 #[cfg(unix)]
 pub use io::Async;
+#[cfg(windows)]
+pub use iocp::Async;
+
+/// Windows waits for handles through completions (IOCP), which take
+/// overlapped I/O rather than readiness; until the Windows daemon brings
+/// that, no handle can be registered, so nothing ever waits on one.
+#[cfg(windows)]
+mod iocp {
+    use std::io;
+    use std::os::windows::io::AsHandle;
+
+    pub struct Async<T: AsHandle> {
+        io: T,
+    }
+
+    impl<T: AsHandle> Async<T> {
+        pub fn new(_io: T) -> io::Result<Self> {
+            Err(io::ErrorKind::Unsupported.into())
+        }
+
+        pub fn for_reading(io: T) -> io::Result<Self> {
+            Self::new(io)
+        }
+
+        pub fn get_ref(&self) -> &T {
+            &self.io
+        }
+
+        pub async fn readable(&self) {
+            std::future::pending::<()>().await;
+        }
+
+        pub async fn writable(&self) {
+            std::future::pending::<()>().await;
+        }
+    }
+}
 
 #[cfg(unix)]
 mod io {

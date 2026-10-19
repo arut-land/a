@@ -1484,7 +1484,7 @@ fn background_processes_keep_the_session_and_end_with_it() {
     assert_eq!(session.idle_for(), Duration::ZERO);
     session.stop();
     let deadline = Instant::now() + Duration::from_secs(5);
-    while sys::group_alive(pgid) {
+    while sys::Group(pgid).alive() {
         assert!(Instant::now() < deadline, "the job outlived its session");
         thread::sleep(Duration::from_millis(10));
     }

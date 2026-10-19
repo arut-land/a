@@ -43,7 +43,7 @@ fn a_daemon_that_never_accepts_is_waited_on_without_spinning() {
 
     // Exactly one connection is in the backlog, its hello already sent.
     listener.set_nonblocking(true).unwrap();
-    let (mut conn, _) = listener.accept().unwrap();
+    let mut conn = listener.accept().unwrap();
     conn.set_nonblocking(false).unwrap();
     let hello = read_frame::<ClientMsg>(&mut conn).unwrap();
     assert!(matches!(hello, Some(ClientMsg::Hello { .. })), "{hello:?}");
@@ -51,7 +51,7 @@ fn a_daemon_that_never_accepts_is_waited_on_without_spinning() {
         listener.accept().err().map(|e| e.kind()),
         Some(io::ErrorKind::WouldBlock)
     );
-    let _ = fs::remove_file(home.socket());
+    home.endpoint().remove();
     fs::remove_dir_all(&root).unwrap();
 }
 
