@@ -126,8 +126,15 @@ impl Reader {
     /// Waits for a draining daemon to close the connection as it exits.
     #[cfg(unix)]
     fn drained(&mut self) -> io::Result<()> {
-        while self.recv()?.is_some() {}
-        Ok(())
+        loop {
+            match self.recv() {
+                Ok(Some(_)) => {}
+                Ok(None) => return Ok(()),
+                // It exited with what we sent behind the hello unread.
+                Err(e) if e.kind() == io::ErrorKind::ConnectionReset => return Ok(()),
+                Err(e) => return Err(e),
+            }
+        }
     }
 }
 
@@ -170,6 +177,12 @@ pub enum Endpoint {
 /// How long a daemon may take to answer the hello before it counts as wedged.
 pub const HELLO_TIMEOUT: Duration = Duration::from_secs(2);
 
+/// [`HELLO_TIMEOUT`] for a daemon this client just started: the first run
+/// of a newly staged build is scanned by macOS first, which takes half a
+/// second on an idle machine and seconds on a busy one.
+#[cfg(unix)]
+const START_TIMEOUT: Duration = Duration::from_secs(30);
+
 /// How long to wait for a draining daemon: its grace plus a margin.
 #[cfg(unix)]
 const DRAIN_TIMEOUT: Duration = Duration::from_secs(75);
@@ -202,8 +215,13 @@ pub fn connect_with(
     for _ in 0..3 {
         let (stream, mut conn) = match endpoint {
             Endpoint::Local(home) => {
-                let stream = connect_or_spawn(home)?;
-                stream.set_read_timeout(Some(HELLO_TIMEOUT))?;
+                let (stream, started) = connect_or_spawn(home)?;
+                let timeout = if started {
+                    START_TIMEOUT
+                } else {
+                    HELLO_TIMEOUT
+                };
+                read_timeout(&stream, Some(timeout))?;
                 let conn = split(&stream)?;
                 (Some(stream), conn)
             }
@@ -216,14 +234,14 @@ pub fn connect_with(
             }
             Ok(Greeting::Welcome) => {
                 if let Some(stream) = &stream {
-                    stream.set_read_timeout(None)?;
+                    read_timeout(stream, None)?;
                 }
                 return Ok(conn);
             }
             Ok(Greeting::Draining) => {
                 on_drain();
                 if let Some(stream) = &stream {
-                    stream.set_read_timeout(Some(DRAIN_TIMEOUT))?;
+                    read_timeout(stream, Some(DRAIN_TIMEOUT))?;
                 }
                 conn.reader.drained()?;
             }
@@ -252,6 +270,17 @@ fn unsupported() -> io::Error {
         io::ErrorKind::Unsupported,
         "a's daemon does not run on this platform yet",
     )
+}
+
+/// Sets how long reads on `stream` wait. macOS refuses (`EINVAL`) once the
+/// daemon has hung up, as a draining one does when it exits; the next read
+/// says so.
+#[cfg(unix)]
+fn read_timeout(stream: &UnixStream, timeout: Option<Duration>) -> io::Result<()> {
+    match stream.set_read_timeout(timeout) {
+        Err(e) if e.kind() == io::ErrorKind::InvalidInput => Ok(()),
+        done => done,
+    }
 }
 
 #[cfg(unix)]
@@ -470,7 +499,7 @@ pub fn restart(home: &Home, staged: &Staged) -> io::Result<Connection> {
 /// done.
 #[cfg(unix)]
 pub fn bridge(home: &Home, token: &str) -> io::Result<()> {
-    let stream = connect_or_spawn(home)?;
+    let (stream, _) = connect_or_spawn(home)?;
     let env = ClientMsg::Environment(capture()?);
     let mut stdout = io::stdout().lock();
     writeln!(stdout, "{} {token} env", remote::SYNC)?;
@@ -505,16 +534,16 @@ fn pump(mut from: impl Read, mut to: impl Write) -> io::Result<()> {
 
 /// Zero-lag start: when no daemon is listening, bind the socket here, hand the
 /// listening fd to a detached daemon running `runtime/current`, and connect
-/// straight into its backlog.
+/// straight into its backlog. Says whether it started that daemon.
 #[cfg(unix)]
-fn connect_or_spawn(home: &Home) -> io::Result<UnixStream> {
+fn connect_or_spawn(home: &Home) -> io::Result<(UnixStream, bool)> {
     use std::fs::OpenOptions;
     use std::os::unix::fs::{DirBuilderExt, PermissionsExt};
     use std::process::{Command, Stdio};
 
     let socket = home.socket();
     if let Ok(stream) = UnixStream::connect(&socket) {
-        return Ok(stream);
+        return Ok((stream, false));
     }
 
     let run = home.run_dir();
@@ -526,7 +555,7 @@ fn connect_or_spawn(home: &Home) -> io::Result<UnixStream> {
     let lock = File::create(home.spawn_lock())?;
     lock.lock()?;
     if let Ok(stream) = UnixStream::connect(&socket) {
-        return Ok(stream);
+        return Ok((stream, false));
     }
     sys::crash::reap_unlocked(home)?;
     let crashes = Crashes::of(home);
@@ -563,7 +592,7 @@ fn connect_or_spawn(home: &Home) -> io::Result<UnixStream> {
         .spawn()?;
     thread::spawn(move || daemon.wait());
     drop(listener);
-    UnixStream::connect(&socket)
+    Ok((UnixStream::connect(&socket)?, true))
 }
 
 #[cfg(all(test, unix))]
