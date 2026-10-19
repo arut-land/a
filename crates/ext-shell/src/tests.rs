@@ -22,7 +22,7 @@ fn an_extension_cannot_hold_session_state_across_an_await() {
             let before = reader.state(|cwd: &Cwd| cwd.after(None).map(Path::to_path_buf));
             paused.0.send(()).unwrap();
             while resume.1.try_recv().is_err() {
-                rt::Timer::after(Duration::from_millis(5)).await;
+                rt::Reactor::AsyncIo.sleep(Duration::from_millis(5)).await;
             }
             let after = reader.state(|cwd: &Cwd| cwd.after(None).map(Path::to_path_buf));
             (before, after)

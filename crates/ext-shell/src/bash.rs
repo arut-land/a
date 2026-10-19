@@ -295,7 +295,7 @@ async fn run(input: Command, cx: &Cx) -> io::Result<Ran> {
         cx.update::<Cwd>(Cwd::change(&cwd, base));
     }
     if done.lingering {
-        cx.own(pgid, crate::job::ended(pgid, None));
+        cx.own(pgid, crate::job::ended(runtime(cx)?.reactor(), pgid, None));
     }
     let Rendered {
         text,
@@ -328,7 +328,10 @@ fn background(cx: &Cx, spawn: Spawn, log: &Path) -> io::Result<Ran> {
     let child = cmd.spawn()?;
     drop(cmd);
     let pgid = child.id();
-    cx.own(pgid, crate::job::ended(pgid, Some(child)));
+    cx.own(
+        pgid,
+        crate::job::ended(runtime(cx)?.reactor(), pgid, Some(child)),
+    );
     Ok(Ran {
         cwd: spawn.cwd,
         duration_ms: duration_ms(started),
@@ -564,13 +567,18 @@ struct Finished {
 async fn supervise(mut child: Child, log: &Path, limit: Duration, cx: &Cx) -> io::Result<Finished> {
     let pgid = child.id();
     let mut file = File::open(log)?;
+    let rt = runtime(cx)?;
+    let reactor = rt.reactor();
     // Where writes or the exit cannot be watched, they are looked for
     // every tick.
-    let written = sys::write_watch(log).and_then(rt::Async::for_reading).ok();
-    let exit = sys::exit_watch(pgid).and_then(rt::Async::for_reading).ok();
+    let written = sys::write_watch(log)
+        .and_then(|watch| rt::Async::for_reading(&reactor, watch))
+        .ok();
+    let exit = sys::exit_watch(pgid)
+        .and_then(|watch| rt::Async::for_reading(&reactor, watch))
+        .ok();
     let mut buf = vec![0; 64 * 1024];
     let (mut output, mut live) = (Output::default(), Live::default());
-    let rt = runtime(cx)?;
     let start = rt.now();
     let mut run = Run::Running {
         deadline: start + limit,

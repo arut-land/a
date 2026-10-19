@@ -880,8 +880,10 @@ pub fn serve(
     )? {
         Claim::Serve(pid) => pid,
         Claim::Tripped(why) => {
-            if let Ok(listener) = rt::Async::new(listener) {
-                rt::block_on(server::refuse(&listener, &why));
+            // The reactor of the runtime the daemon would serve on.
+            let reactor = rt::Runtime::reactor(&rt::Threads::default());
+            if let Ok(listener) = rt::Async::new(&reactor, listener) {
+                rt::block_on(server::refuse(&reactor, &listener, &why));
             }
             home.endpoint().remove();
             return Err(io::Error::other(why));
@@ -900,7 +902,8 @@ pub fn serve(
     }));
     // Connections are tasks waiting on the reactor, and reach the
     // sessions' actors through their mailboxes.
-    rt::block_on(server::accept(&rt::Async::new(listener)?, &daemon, &life))
+    let listener = rt::Async::new(&daemon.shared.rt.reactor(), listener)?;
+    rt::block_on(server::accept(&listener, &daemon, &life))
 }
 
 /// Whether a daemon may serve.

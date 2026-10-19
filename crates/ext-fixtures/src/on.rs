@@ -87,8 +87,11 @@ impl Tool for Sleep {
         .expect("a tool schema is valid JSON")
     }
 
-    async fn call(&self, input: Seconds, _: &Cx) -> Result<Slept, String> {
-        rt::Timer::after(Duration::from_secs(input.seconds)).await;
+    async fn call(&self, input: Seconds, cx: &Cx) -> Result<Slept, String> {
+        let rt = cx
+            .service::<dyn rt::Runtime>()
+            .ok_or("the engine provides no runtime")?;
+        rt.sleep(Duration::from_secs(input.seconds)).await;
         Ok(Slept {
             slept: input.seconds,
         })

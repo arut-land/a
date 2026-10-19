@@ -17,7 +17,7 @@ use protocol::{
     Author, Caps, ClientDecl, ClientId, ClientMsg, ClientSeq, DaemonMsg, Decode, Environment,
     Frame, HomeSettings, Mode, Origin, PROTO, Rejection, Role, SettingsChange, Versions,
 };
-use rt::Async;
+use rt::{Async, Reactor};
 use sys::{Listener, Stream};
 
 use crate::driver::{self, Attachment, Request};
@@ -72,20 +72,20 @@ impl Drop for Client<'_> {
 /// Answers every client that connects, until none waits (or, if none
 /// came, for [`REFUSED_GRACE`]), with `why` in place of a welcome: for a
 /// daemon that must not serve.
-pub(crate) async fn refuse(listener: &Async<&Listener>, why: &str) {
+pub(crate) async fn refuse(reactor: &Reactor, listener: &Async<&Listener>, why: &str) {
     let Ok(frame) = Frame::new(&DaemonMsg::Error {
         message: why.to_owned(),
     }) else {
         return;
     };
-    let first = within(REFUSED_GRACE, listener.read_with(|l| l.accept())).await;
+    let first = within(reactor, REFUSED_GRACE, listener.read_with(|l| l.accept())).await;
     let mut next = first.and_then(Result::ok);
     while let Some(stream) = next.take() {
-        if let Ok(io) = Async::new(stream) {
+        if let Ok(io) = Async::new(reactor, stream) {
             let io = Arc::new(io);
             if write_all(&io, frame.as_bytes()).await.is_ok() {
                 // What it sent is read and dropped until it hangs up.
-                within(REFUSED_GRACE, Frames::new(io).drain()).await;
+                within(reactor, REFUSED_GRACE, Frames::new(io).drain()).await;
             }
         }
         next = listener.get_ref().accept().ok();
@@ -93,8 +93,8 @@ pub(crate) async fn refuse(listener: &Async<&Listener>, why: &str) {
 }
 
 /// `work`'s output, unless `limit` passes first.
-async fn within<T>(limit: Duration, work: impl Future<Output = T>) -> Option<T> {
-    let (mut work, mut late) = (pin!(work), pin!(rt::Timer::after(limit)));
+async fn within<T>(reactor: &Reactor, limit: Duration, work: impl Future<Output = T>) -> Option<T> {
+    let (mut work, mut late) = (pin!(work), reactor.sleep(limit));
     poll_fn(|cx| {
         if let Poll::Ready(done) = work.as_mut().poll(cx) {
             return Poll::Ready(Some(done));
@@ -184,7 +184,7 @@ pub(crate) async fn handle(
     life: &Lifecycle,
     stream: Stream,
 ) -> io::Result<()> {
-    let io = Arc::new(Async::new(stream)?);
+    let io = Arc::new(Async::new(&daemon.shared.rt.reactor(), stream)?);
     let mut frames = Frames::new(Arc::clone(&io));
     let (verdict, theirs, caps, client) = match frames.next().await? {
         Some(ClientMsg::Hello {
@@ -246,7 +246,7 @@ pub(crate) async fn handle(
                     min: Versions::OURS.min_field(),
                 },
             );
-            within(REFUSED_GRACE, frames.drain()).await;
+            within(&daemon.shared.rt.reactor(), REFUSED_GRACE, frames.drain()).await;
             Ok(())
         }
     };

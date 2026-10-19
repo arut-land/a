@@ -1,16 +1,17 @@
-//! The built-in runtime: a few async workers, a pool of blocking threads
-//! that grows on demand and shrinks when idle, and the reactor's timers.
-//! Threads start on first use, so an idle process pays for none.
+//! The built-in runtime: async-executor's work-stealing workers, a pool of
+//! blocking threads that grows on demand and shrinks when idle, and
+//! async-io's reactor and timers. Threads start on first use, so an idle
+//! process pays for none, and none wakes until there is work.
 
 use std::collections::VecDeque;
-use std::panic::{self, AssertUnwindSafe};
+use std::future;
 use std::sync::{Arc, Condvar, Mutex, OnceLock};
 use std::thread;
 use std::time::Duration;
 
-use async_task::Runnable;
+use async_executor::Executor;
 
-use crate::{BoxFuture, Runtime, lock, wait, wait_timeout};
+use crate::{BoxFuture, Reactor, Runtime, lock, wait_timeout};
 
 /// How long a blocking thread waits for more work before it exits.
 const IDLE: Duration = Duration::from_secs(10);
@@ -18,36 +19,14 @@ const IDLE: Duration = Duration::from_secs(10);
 pub struct Threads {
     workers: usize,
     started: OnceLock<()>,
-    tasks: Arc<Tasks>,
+    tasks: Arc<Executor<'static>>,
     blocking: Arc<Blocking>,
-}
-
-/// Runnable tasks for the async workers.
-#[derive(Default)]
-struct Tasks {
-    queue: Mutex<VecDeque<Runnable>>,
-    ready: Condvar,
-}
-
-impl Tasks {
-    fn push(&self, task: Runnable) {
-        lock(&self.queue).push_back(task);
-        self.ready.notify_one();
-    }
-
-    fn pop(&self) -> Runnable {
-        let mut queue = lock(&self.queue);
-        loop {
-            if let Some(task) = queue.pop_front() {
-                return task;
-            }
-            queue = wait(&self.ready, queue);
-        }
-    }
 }
 
 type Work = Box<dyn FnOnce() + Send>;
 
+/// Ours rather than the `blocking` crate's, whose last thread polls every
+/// 500 ms while it waits for work.
 #[derive(Default)]
 struct Blocking {
     state: Mutex<Pool>,
@@ -76,15 +55,12 @@ impl Threads {
         self.started.get_or_init(|| {
             for n in 0..self.workers {
                 let tasks = Arc::clone(&self.tasks);
+                // A task that panics is closed; the worker lives on. Parked
+                // in `block_on` rather than async-io's, whose reactor thread
+                // polls while any thread is.
                 thread::Builder::new()
                     .name(format!("rt-worker-{n}"))
-                    .spawn(move || {
-                        // A task that panics is closed; the worker lives on.
-                        loop {
-                            let task = tasks.pop();
-                            let _ = panic::catch_unwind(AssertUnwindSafe(|| task.run()));
-                        }
-                    })
+                    .spawn(move || crate::block_on(tasks.run(future::pending::<()>())))
                     .expect("spawn worker thread");
             }
         });
@@ -101,10 +77,7 @@ impl Default for Threads {
 impl Runtime for Threads {
     fn spawn(&self, task: BoxFuture<'static, ()>) {
         self.start();
-        let tasks = Arc::clone(&self.tasks);
-        let (runnable, handle) = async_task::spawn(task, move |runnable| tasks.push(runnable));
-        handle.detach();
-        runnable.schedule();
+        self.tasks.spawn(task).detach();
     }
 
     fn spawn_blocking(&self, work: Work) {
@@ -124,8 +97,8 @@ impl Runtime for Threads {
             .expect("spawn blocking thread");
     }
 
-    fn sleep(&self, duration: Duration) -> BoxFuture<'static, ()> {
-        Box::pin(crate::Timer::after(duration))
+    fn reactor(&self) -> Reactor {
+        Reactor::AsyncIo
     }
 }
 

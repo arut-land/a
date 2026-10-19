@@ -127,48 +127,46 @@ fn an_unbounded_sender_never_waits() {
     assert_eq!(got, 1000);
 }
 
-// Each test runs in a process of its own (nextest), so the reactor's
-// wake count is this test's alone.
+// Each test runs in a process of its own (nextest), so the wake count is
+// this test's alone.
 #[test]
-fn an_idle_reactor_never_wakes() {
-    block_on(Timer::after(Duration::from_millis(5)));
-    // A dropped timer is forgotten, not woken for.
-    let pending = std::pin::pin!(Timer::after(Duration::from_millis(50)))
-        .poll(&mut Context::from_waker(Waker::noop()));
-    assert!(pending.is_pending());
-    // Setting it woke the reactor to wait for it.
-    thread::sleep(Duration::from_millis(10));
+fn an_idle_runtime_never_wakes() {
+    let rt = Threads::new(2);
+    block_on(spawn(&rt, rt.sleep(Duration::from_millis(5))));
+    // A task waiting for a later deadline keeps every worker asleep.
+    let late = spawn(&rt, rt.sleep(Duration::from_secs(30)));
+    thread::sleep(Duration::from_millis(20));
     let before = wakes();
     thread::sleep(Duration::from_millis(500));
     assert_eq!(wakes(), before);
+    drop(late);
 }
 
 #[test]
 fn a_timer_wakes_at_its_deadline_not_before() {
+    let rt = Threads::new(1);
     let started = Instant::now();
-    block_on(Timer::after(Duration::from_millis(30)));
+    block_on(rt.sleep(Duration::from_millis(30)));
     let took = started.elapsed();
     assert!(took >= Duration::from_millis(30), "{took:?}");
     assert!(took < Duration::from_millis(500), "{took:?}");
     // A deadline earlier than the one the reactor waits for still fires
     // on time.
-    let rt = Threads::new(1);
-    let late = spawn(&rt, Timer::after(Duration::from_secs(30)));
+    let late = spawn(&rt, rt.sleep(Duration::from_secs(30)));
     thread::sleep(Duration::from_millis(10));
     let started = Instant::now();
-    block_on(Timer::after(Duration::from_millis(10)));
+    block_on(rt.sleep(Duration::from_millis(10)));
     assert!(started.elapsed() < Duration::from_millis(500));
     drop(late);
 }
 
+/// Reads a pipe through `rt`'s reactor while another thread writes it.
 #[cfg(unix)]
-#[test]
-fn a_registered_pipe_reads_when_written_without_a_thread_per_read() {
+fn read_a_pipe(rt: &dyn Runtime) -> Vec<u8> {
     use std::io::{Read, Write};
     let (reader, mut writer) = std::io::pipe().unwrap();
-    let reader = Async::new(reader).unwrap();
-    let rt = Threads::new(1);
-    let wrote = unblock(&rt, move || {
+    let reader = Async::for_reading(&rt.reactor(), reader).unwrap();
+    let wrote = thread::spawn(move || {
         for chunk in [&b"one"[..], b"two"] {
             thread::sleep(Duration::from_millis(20));
             writer.write_all(chunk).unwrap();
@@ -185,6 +183,50 @@ fn a_registered_pipe_reads_when_written_without_a_thread_per_read() {
             got.extend_from_slice(&buf[..n]);
         }
     });
-    block_on(wrote);
-    assert_eq!(got, b"onetwo");
+    wrote.join().unwrap();
+    got
+}
+
+/// A descriptor that turns ready wakes its waiter once or twice, not in a
+/// race with the reactor for a newer tick.
+#[cfg(unix)]
+#[test]
+fn readiness_wakes_a_waiter_once_not_in_a_spin() {
+    use std::io::Write;
+    let rt = Threads::new(1);
+    let (reader, mut writer) = std::io::pipe().unwrap();
+    let reader = Async::for_reading(&rt.reactor(), reader).unwrap();
+    let wrote = thread::spawn(move || {
+        thread::sleep(Duration::from_millis(50));
+        writer.write_all(b"x").unwrap();
+        thread::sleep(Duration::from_millis(200));
+    });
+    let before = wakes();
+    block_on(reader.readable());
+    let woke = wakes() - before;
+    assert!(woke <= 3, "{woke} wakes");
+    wrote.join().unwrap();
+}
+
+#[cfg(unix)]
+#[test]
+fn a_registered_pipe_reads_when_written_without_a_thread_per_read() {
+    assert_eq!(read_a_pipe(&Threads::new(1)), b"onetwo");
+}
+
+/// A tokio host's descriptors wait on tokio's reactor, the only one it
+/// runs.
+#[cfg(all(unix, feature = "tokio"))]
+#[test]
+fn a_tokio_runtime_reads_through_its_own_reactor() {
+    let host = ::tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .unwrap();
+    let rt = Tokio(host.handle().clone());
+    // A current-thread runtime's reactor turns while it blocks on a task.
+    let driving = thread::spawn(move || host.block_on(std::future::pending::<()>()));
+    assert_eq!(read_a_pipe(&rt), b"onetwo");
+    block_on(rt.sleep(Duration::from_millis(5)));
+    drop(driving);
 }

@@ -1,8 +1,6 @@
-use std::time::Duration;
+use crate::{BoxFuture, Reactor, Runtime};
 
-use crate::{BoxFuture, Runtime};
-
-/// smol's global executor, blocking pool and timers.
+/// smol's global executor, blocking pool and timers, on async-io's reactor.
 #[derive(Clone, Copy, Debug, Default)]
 pub struct Smol;
 
@@ -15,9 +13,7 @@ impl Runtime for Smol {
         smol::spawn(smol::unblock(work)).detach();
     }
 
-    fn sleep(&self, duration: Duration) -> BoxFuture<'static, ()> {
-        Box::pin(async move {
-            smol::Timer::after(duration).await;
-        })
+    fn reactor(&self) -> Reactor {
+        Reactor::AsyncIo
     }
 }
