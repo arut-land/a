@@ -74,7 +74,7 @@ fn every_host_defaults_to_eager_tool_input() {
 fn every_host_posts_to_one_v1_messages() {
     for (host, quirks) in HOSTS {
         let provider = provider_with(host.id, *quirks).with_base_url(host.base_url);
-        let (http, _) = provider
+        let http = provider
             .request("a-model", &request("a-model", vec![Message::user("hello")]))
             .expect("the request encodes");
         let path = http.uri().path().to_owned();
@@ -88,7 +88,7 @@ fn every_host_posts_to_one_v1_messages() {
         "https://gateway.example/anthropic/v1/messages/",
     ] {
         let provider = provider("anthropic").with_base_url(base);
-        let (http, _) = provider
+        let http = provider
             .request("a-model", &request("a-model", vec![Message::user("hello")]))
             .expect("the request encodes");
         assert_eq!(http.uri().path(), "/anthropic/v1/messages", "{base}");

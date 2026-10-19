@@ -16,11 +16,8 @@ fn recorded(cassette: &str) -> Vec<String> {
         .next()
         .expect("an exchange");
     let body = doc["then"]["body"].as_str().expect("a body");
-    let mut framer = crate::sse::SseFramer::new();
-    framer
-        .push(body.as_bytes())
-        .map(|event| event.data)
-        .collect()
+    let events = crate::sse::events(&mut crate::sse::SseFramer::new(), body.as_bytes());
+    events.into_iter().map(|(_, data)| data).collect()
 }
 
 /// The events `frames` decode to, `value` reading every frame as a `Value`.

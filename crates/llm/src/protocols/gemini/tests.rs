@@ -14,7 +14,7 @@ use crate::spec::{
     Assistant, AssistantPart, Effort, Format, Generation, Media, Message, Meta, Output, Reason,
     Reasoning, Response, Source, Text, Tool, ToolCall, ToolMessage, ToolResult, User, UserPart,
 };
-use crate::{Accumulator, Framing, Kind};
+use crate::{Accumulator, Kind};
 
 fn provider() -> Provider {
     Provider::new(

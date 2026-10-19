@@ -847,10 +847,8 @@ fn recorded(name: &str) -> Vec<String> {
     let text = std::fs::read_to_string(path).expect("the cassette");
     let cassette: serde_yaml_ng::Value = serde_yaml_ng::from_str(&text).expect("yaml");
     let body = cassette["then"]["body"].as_str().expect("a body");
-    crate::sse::SseFramer::new()
-        .push(body.as_bytes())
-        .map(|event| event.data)
-        .collect()
+    let events = crate::sse::events(&mut crate::sse::SseFramer::new(), body.as_bytes());
+    events.into_iter().map(|(_, data)| data).collect()
 }
 
 /// The typed path reads every delta of a recorded stream without building

@@ -60,26 +60,9 @@ pub struct Encoded {
     pub path: String,
     pub body: Value,
     pub headers: Vec<(&'static str, String)>,
-    pub framing: Framing,
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum Framing {
-    Sse,
-    Ndjson,
-}
-
-impl Framing {
-    /// The media type a request asks for.
-    pub const fn accept(self) -> &'static str {
-        match self {
-            Self::Sse => "text/event-stream",
-            Self::Ndjson => "application/x-ndjson",
-        }
-    }
-}
-
-/// One frame of a reply: an SSE event, or one NDJSON line (`event` empty).
+/// One event of a reply's server-sent event stream.
 #[derive(Clone, Copy, Debug)]
 pub struct Frame<'a> {
     pub event: &'a str,
@@ -187,7 +170,7 @@ impl Provider {
         &self,
         model: &str,
         request: &Request,
-    ) -> Result<(http::Request<bytes::Bytes>, Framing), Error> {
+    ) -> Result<http::Request<bytes::Bytes>, Error> {
         let target = Target {
             provider: self,
             model,
@@ -199,7 +182,7 @@ impl Provider {
         let mut uri = format!("{}{}", self.base_url, encoded.path);
         let mut builder = http::Request::post(&uri)
             .header(http::header::CONTENT_TYPE, "application/json")
-            .header(http::header::ACCEPT, encoded.framing.accept());
+            .header(http::header::ACCEPT, "text/event-stream");
         match &self.auth {
             Auth::None => {}
             Auth::Bearer(key) => {
@@ -223,10 +206,9 @@ impl Provider {
         }
         let body = serde_json::to_vec(&encoded.body)
             .map_err(|error| Error::unsupported(error.to_string()))?;
-        let request = builder
+        builder
             .body(bytes::Bytes::from(body))
-            .map_err(|error| Error::unsupported(format!("invalid request: {error}")))?;
-        Ok((request, encoded.framing))
+            .map_err(|error| Error::unsupported(format!("invalid request: {error}")))
     }
 }
 

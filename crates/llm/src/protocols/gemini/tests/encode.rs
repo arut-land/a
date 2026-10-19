@@ -565,7 +565,7 @@ fn the_request_goes_to_the_models_stream() {
         Gemini::new(HOSTS[0].1),
     );
     for model in ["gemini-2.5-flash", "models/gemini-2.5-flash"] {
-        let (request, framing) = provider
+        let request = provider
             .request(model, &asking(vec![Message::user("hi")]))
             .expect("the request builds");
         assert_eq!(
@@ -573,7 +573,7 @@ fn the_request_goes_to_the_models_stream() {
             "https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash:streamGenerateContent?alt=sse"
         );
         assert_eq!(request.headers()["x-goog-api-key"], "k");
-        assert_eq!(framing, Framing::Sse);
+        assert_eq!(request.headers()["accept"], "text/event-stream");
     }
 }
 
