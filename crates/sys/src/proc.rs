@@ -471,9 +471,10 @@ mod imp {
     }
 }
 
-/// Windows until its daemon lands (job objects, handle lists, process
-/// handles as exit watches): commands still lead a console process group
-/// of their own, and what needs the rest says it is unsupported.
+/// Windows until its daemon lands (job objects, handle lists): commands
+/// still lead a console process group of their own, a process's exit is
+/// waited for through its handle, and what needs the rest says it is
+/// unsupported.
 #[cfg(windows)]
 mod imp {
     use std::fs::File;
@@ -540,8 +541,30 @@ mod imp {
         None
     }
 
-    pub fn exit_watch(_pid: u32) -> io::Result<OwnedHandle> {
-        Err(unsupported())
+    /// A handle on the process that can only wait for it (`SYNCHRONIZE`):
+    /// it is signalled once the process exits.
+    pub fn exit_watch(pid: u32) -> io::Result<OwnedHandle> {
+        use std::os::windows::io::{FromRawHandle, RawHandle};
+
+        const SYNCHRONIZE: u32 = 0x0010_0000;
+        /// What `OpenProcess` fails with for a pid no process has.
+        const ERROR_INVALID_PARAMETER: i32 = 87;
+        #[link(name = "kernel32")]
+        unsafe extern "system" {
+            fn OpenProcess(access: u32, inherit: i32, pid: u32) -> RawHandle;
+        }
+        // SAFETY: takes plain values; a null return is checked below.
+        let handle = unsafe { OpenProcess(SYNCHRONIZE, 0, pid) };
+        if handle.is_null() {
+            let e = io::Error::last_os_error();
+            return Err(if e.raw_os_error() == Some(ERROR_INVALID_PARAMETER) {
+                io::ErrorKind::NotFound.into()
+            } else {
+                e
+            });
+        }
+        // SAFETY: a handle just opened, which nothing else owns.
+        Ok(unsafe { OwnedHandle::from_raw_handle(handle) })
     }
 
     pub fn group_members(_pgid: u32) -> Vec<u32> {
