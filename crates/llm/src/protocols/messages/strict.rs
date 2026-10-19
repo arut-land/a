@@ -14,8 +14,8 @@ type Schema = Map<String, Value>;
 const DEFINITIONS: [&str; 2] = ["$defs", "definitions"];
 
 /// References being inlined, so a definition that refers to itself (through
-/// `$ref` or `allOf`) is merged once instead of forever.
-type Seen = std::collections::BTreeSet<String>;
+/// `$ref` or `allOf`) is merged once instead of forever. A path holds few.
+type Seen = Vec<String>;
 
 pub(super) fn sanitize(schema: &mut Value) {
     let mut seen = Seen::new();
@@ -46,9 +46,10 @@ fn inline_root_ref(schema: &mut Value, seen: &mut Seen) {
         let Some(Value::Object(mut referenced)) = target.cloned() else {
             return;
         };
-        if !seen.insert(reference.to_owned()) {
+        if seen.iter().any(|seen| seen == reference) {
             return;
         }
+        seen.push(reference.to_owned());
         let Value::Object(mut root) = std::mem::take(schema) else {
             return;
         };
@@ -127,7 +128,9 @@ fn merge_all_of(schema: &mut Schema, all_of: Value, conflicts: &mut Schema, seen
         let reference = branch.get("$ref").and_then(Value::as_str);
         match branch {
             // A reference already being inlined is a cycle: kept as guidance.
-            Value::Object(_) if reference.is_some_and(|reference| seen.contains(reference)) => {
+            Value::Object(_)
+                if reference.is_some_and(|reference| seen.iter().any(|seen| seen == reference)) =>
+            {
                 unsupported.push(branch);
             }
             Value::Object(mut branch) if reference.is_some() => {

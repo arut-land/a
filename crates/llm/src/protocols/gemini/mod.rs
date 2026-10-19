@@ -10,7 +10,7 @@ mod decode;
 mod encode;
 
 use crate::error::Error;
-use crate::protocol::{Decoder, Encoded, Framing, Host, Hosted, KeyStyle, Protocol, Target};
+use crate::protocol::{Decoder, Encoded, Host, Hosted, KeyStyle, Protocol, Target};
 use crate::spec::Request;
 
 /// Where this protocol's options and part state go.
@@ -89,7 +89,6 @@ impl Protocol for Gemini {
             path: format!("{models}/{model}:streamGenerateContent?alt=sse"),
             body: encode::body(self, target, request)?,
             headers: Vec::new(),
-            framing: Framing::Sse,
         })
     }
 

@@ -1,12 +1,9 @@
-use super::{NdjsonFramer, SseFramer};
+use super::{SseFramer, events};
+use crate::protocol::Flow;
 
 /// Every event a framer dispatches over one whole body.
 fn sse_all(body: &[u8]) -> Vec<(String, String)> {
-    let mut framer = SseFramer::new();
-    framer
-        .push(body)
-        .map(|event| (event.event.into_owned(), event.data))
-        .collect()
+    events(&mut SseFramer::new(), body)
 }
 
 fn message(data: &str) -> (String, String) {
@@ -34,11 +31,11 @@ fn a_leading_bom_is_not_data() {
 #[test]
 fn a_bom_split_across_chunks_is_still_ignored() {
     let mut framer = SseFramer::new();
-    assert_eq!(framer.push(&[0xef]).len(), 0);
-    assert_eq!(framer.push(&[0xbb]).len(), 0);
-    assert_eq!(framer.push(&[0xbf]).len(), 0);
-    let events: Vec<_> = framer.push(b"data: one\n\n").collect();
-    assert_eq!(events.first().map(|event| event.data.as_str()), Some("one"));
+    assert_eq!(events(&mut framer, &[0xef]).len(), 0);
+    assert_eq!(events(&mut framer, &[0xbb]).len(), 0);
+    assert_eq!(events(&mut framer, &[0xbf]).len(), 0);
+    let events = events(&mut framer, b"data: one\n\n");
+    assert_eq!(events.first().map(|(_, data)| data.as_str()), Some("one"));
 }
 
 #[test]
@@ -68,12 +65,10 @@ fn a_blank_line_without_data_dispatches_nothing_and_resets_the_type() {
 #[test]
 fn a_truncated_trailing_event_waits_for_its_blank_line() {
     let mut framer = SseFramer::new();
-    let events: Vec<_> = framer
-        .push(b"data: one\n\nevent: message_stop\ndata: {}")
-        .collect();
-    assert_eq!(events.len(), 1);
-    let events: Vec<_> = framer.push(b"\n\n").map(|event| event.event).collect();
-    assert_eq!(events, ["message_stop"]);
+    let first = events(&mut framer, b"data: one\n\nevent: message_stop\ndata: {}");
+    assert_eq!(first.len(), 1);
+    let rest = events(&mut framer, b"\n\n");
+    assert_eq!(rest, [("message_stop".to_owned(), "{}".to_owned())]);
 }
 
 /// The two cassette-derived shapes: a body whose last event has no trailing
@@ -104,32 +99,21 @@ fn splitting_a_body_at_every_offset_yields_the_same_events() {
     for split in 0..=body.len() {
         let (head, tail) = body.split_at(split);
         let mut framer = SseFramer::new();
-        let mut events: Vec<_> = framer
-            .push(head)
-            .map(|event| (event.event.into_owned(), event.data))
-            .collect();
-        events.extend(
-            framer
-                .push(tail)
-                .map(|event| (event.event.into_owned(), event.data)),
-        );
-        assert_eq!(events, whole, "split at {split}");
+        let mut split_events = events(&mut framer, head);
+        split_events.extend(events(&mut framer, tail));
+        assert_eq!(split_events, whole, "split at {split}");
     }
 }
 
+/// The reply's end stops the framing: no event after it is handed over.
 #[test]
-fn ndjson_yields_terminated_lines_and_flushes_the_last_one() {
-    let mut framer = NdjsonFramer::new();
-    let lines: Vec<_> = framer.push(b"{\"a\":1}\n\n{\"b\":2}\n{\"c\"").collect();
-    assert_eq!(lines, vec![b"{\"a\":1}".to_vec(), b"{\"b\":2}".to_vec()]);
-    assert_eq!(framer.finish(), Some(b"{\"c\"".to_vec()));
-    assert_eq!(framer.finish(), None);
-}
-
-#[test]
-fn ndjson_lines_split_across_chunks_rejoin() {
-    let mut framer = NdjsonFramer::new();
-    assert_eq!(framer.push(b"{\"a\":").len(), 0);
-    let lines: Vec<_> = framer.push(b"1}\r\n").collect();
-    assert_eq!(lines, vec![b"{\"a\":1}".to_vec()]);
+fn a_done_event_stops_the_framing() {
+    let mut framer = SseFramer::new();
+    let mut seen = Vec::new();
+    let flow = framer.push(b"data: one\n\ndata: two\n\n", |frame| {
+        seen.push(frame.data.to_owned());
+        Ok(Flow::Done)
+    });
+    assert!(matches!(flow, Ok(Flow::Done)));
+    assert_eq!(seen, ["one"]);
 }

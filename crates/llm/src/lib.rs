@@ -27,9 +27,7 @@ pub use error::{Error, Kind};
 pub use http::Http;
 pub use json::parse_partial_arguments;
 pub use prepare::{NO_RESULT, prepare};
-pub use protocol::{
-    Auth, Decoder, Encoded, Flow, Frame, Framing, Protocol, Provider, Secret, Target,
-};
+pub use protocol::{Auth, Decoder, Encoded, Flow, Frame, Protocol, Provider, Secret, Target};
 pub use spec::*;
 #[cfg(feature = "ureq")]
 pub use ureq::Ureq;

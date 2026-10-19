@@ -1,5 +1,33 @@
 use super::*;
 
+/// `at` finds what `Value::pointer` finds for a pointer that escapes
+/// nothing, `null` aside.
+#[test]
+fn at_reads_a_pointer_as_value_pointer_does() {
+    let value = serde_json::json!({"a": {"b": [10, {"c": null}, 12]}, "": 1, "n": null});
+    for pointer in [
+        "",
+        "/a",
+        "/a/b",
+        "/a/b/0",
+        "/a/b/2",
+        "/a/b/3",
+        "/a/b/00",
+        "/a/b/+1",
+        "/a/b/-1",
+        "/a/b/1/c",
+        "/a/x",
+        "/",
+        "a",
+        "/n",
+        "/a/b/0/x",
+        "/a/b/1/c/d",
+    ] {
+        let expected = value.pointer(pointer).filter(|value| !value.is_null());
+        assert_eq!(value.at(pointer), expected, "{pointer}");
+    }
+}
+
 #[test]
 fn text_that_states_no_object_has_none() {
     for text in ["not json", "[1, 2", "\"str", "12"] {

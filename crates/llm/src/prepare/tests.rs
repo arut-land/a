@@ -73,14 +73,16 @@ fn run(messages: Vec<Message>) -> Vec<Message> {
         messages,
         ..Request::default()
     };
-    prepare(
-        request,
-        &Target {
-            provider: &provider,
-            model: "m",
-        },
-    )
-    .messages
+    let target = Target {
+        provider: &provider,
+        model: "m",
+    };
+    let prepared = prepare(&request, &target);
+    // The request is copied only when the pass changes it.
+    let rebuilt = rebuild(request.clone(), &target);
+    assert_eq!(*prepared, rebuilt);
+    assert_eq!(matches!(prepared, Cow::Borrowed(_)), rebuilt == request);
+    prepared.into_owned().messages
 }
 
 #[test]

@@ -24,7 +24,7 @@ mod strict;
 use serde_json::Value;
 
 use crate::error::{Error, Kind};
-use crate::protocol::{Decoder, Encoded, Framing, Host, Hosted, KeyStyle, Protocol, Target};
+use crate::protocol::{Decoder, Encoded, Host, Hosted, KeyStyle, Protocol, Target};
 use crate::spec::Request;
 
 pub use crate::models::anthropic::{default_max_tokens, rejects_forced_tool_choice};
@@ -163,7 +163,6 @@ impl Protocol for Messages {
             path: path(&target.provider.base_url).to_owned(),
             body,
             headers,
-            framing: Framing::Sse,
         })
     }
 

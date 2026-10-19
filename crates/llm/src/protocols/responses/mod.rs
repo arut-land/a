@@ -8,7 +8,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
 use crate::error::Error;
-use crate::protocol::{Decoder, Encoded, Framing, Host, Hosted, Protocol, Target};
+use crate::protocol::{Decoder, Encoded, Host, Hosted, Protocol, Target};
 use crate::spec::Request;
 
 /// Where this protocol's options and part state go.
@@ -83,7 +83,6 @@ impl Protocol for Responses {
             path: self.quirks.path.to_owned(),
             body: encode::body(self, target, request)?,
             headers: Vec::new(),
-            framing: Framing::Sse,
         })
     }
 

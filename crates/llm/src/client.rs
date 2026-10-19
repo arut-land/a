@@ -16,9 +16,9 @@ use crate::accumulate::Accumulator;
 use crate::error::{Error, Kind};
 use crate::http::{Body, BoxFuture, Http};
 use crate::prepare::prepare;
-use crate::protocol::{Decoder, Flow, Frame, Framing, Provider, Target};
+use crate::protocol::{Decoder, Flow, Provider, Target};
 use crate::spec::{Event, Origin, Request, Response, SmolStr};
-use crate::sse::{NdjsonFramer, SseFramer};
+use crate::sse::SseFramer;
 
 /// Streams the reply to `request` from `provider`.
 pub fn stream(http: &dyn Http, provider: &Provider, request: &Request) -> Events {
@@ -26,11 +26,10 @@ pub fn stream(http: &dyn Http, provider: &Provider, request: &Request) -> Events
         provider,
         model: &request.model,
     };
-    let request = prepare(request.clone(), &target);
+    let request = prepare(request, &target);
     let state = match provider.request(&request.model, &request) {
-        Ok((http_request, framing)) => State::Sending {
+        Ok(http_request) => State::Sending {
             reply: http.send(http_request),
-            framing,
             decoder: provider.protocol.decoder(&target, &request),
         },
         Err(error) => State::Failed(Some(error)),
@@ -72,7 +71,6 @@ pub struct Events {
 enum State {
     Sending {
         reply: BoxFuture<'static, io::Result<crate::http::Response>>,
-        framing: Framing,
         decoder: Box<dyn Decoder>,
     },
     Failing {
@@ -86,56 +84,10 @@ enum State {
     Over,
 }
 
-enum Framer {
-    Sse(SseFramer),
-    Ndjson(NdjsonFramer),
-}
-
-impl From<Framing> for Framer {
-    fn from(framing: Framing) -> Self {
-        match framing {
-            Framing::Sse => Self::Sse(SseFramer::new()),
-            Framing::Ndjson => Self::Ndjson(NdjsonFramer::new()),
-        }
-    }
-}
-
-impl Framer {
-    /// Decode the frames `chunk` completes, until the decoder is done.
-    fn feed(
-        &mut self,
-        decoder: &mut dyn Decoder,
-        chunk: &[u8],
-        out: &mut Vec<Event>,
-    ) -> Result<Flow, Error> {
-        match self {
-            Self::Sse(sse) => {
-                for event in sse.push(chunk) {
-                    let frame = Frame {
-                        event: &event.event,
-                        data: &event.data,
-                    };
-                    if decoder.frame(frame, out)? == Flow::Done {
-                        return Ok(Flow::Done);
-                    }
-                }
-            }
-            Self::Ndjson(lines) => {
-                for line in lines.push(chunk) {
-                    if line_frame(decoder, &line, out)? == Flow::Done {
-                        return Ok(Flow::Done);
-                    }
-                }
-            }
-        }
-        Ok(Flow::More)
-    }
-}
-
 /// A successful reply's body, being decoded.
 struct Reader {
     body: Body,
-    framer: Framer,
+    sse: SseFramer,
     decoder: Box<dyn Decoder>,
     queue: VecDeque<Event>,
     /// What the last chunk decoded to, on its way to `queue`.
@@ -161,9 +113,8 @@ impl Stream for Events {
             match &mut this.state {
                 State::Sending { reply, .. } => {
                     let reply = ready!(reply.as_mut().poll(cx));
-                    let State::Sending {
-                        framing, decoder, ..
-                    } = std::mem::replace(&mut this.state, State::Over)
+                    let State::Sending { decoder, .. } =
+                        std::mem::replace(&mut this.state, State::Over)
                     else {
                         continue;
                     };
@@ -175,7 +126,7 @@ impl Stream for Events {
                         }
                     };
                     this.state = if parts.status.is_success() {
-                        State::Reading(Reader::new(body, framing, decoder))
+                        State::Reading(Reader::new(body, decoder))
                     } else {
                         State::Failing {
                             status: parts.status.as_u16(),
@@ -218,10 +169,10 @@ impl Stream for Events {
 }
 
 impl Reader {
-    fn new(body: Body, framing: Framing, decoder: Box<dyn Decoder>) -> Self {
+    fn new(body: Body, decoder: Box<dyn Decoder>) -> Self {
         Self {
             body,
-            framer: framing.into(),
+            sse: SseFramer::new(),
             decoder,
             queue: VecDeque::new(),
             decoded: Vec::new(),
@@ -255,12 +206,19 @@ impl Reader {
             let polled = ready!(self.body.as_mut().poll_next(cx));
             let mut out = std::mem::take(&mut self.decoded);
             let step = match polled {
-                Some(Ok(chunk)) => self.framer.feed(self.decoder.as_mut(), &chunk, &mut out),
+                Some(Ok(chunk)) => {
+                    let decoder = &mut self.decoder;
+                    self.sse
+                        .push(&chunk, |frame| decoder.frame(frame, &mut out))
+                }
                 Some(Err(error)) => Err(Error::new(
                     Kind::Transport,
                     format!("the reply broke off: {error}"),
                 )),
-                None => self.eof(&mut out),
+                None => {
+                    self.done = true;
+                    self.decoder.end(&mut out).map(|()| Flow::Done)
+                }
             };
             self.queue.extend(out.drain(..));
             self.decoded = out;
@@ -273,31 +231,4 @@ impl Reader {
             }
         }
     }
-
-    fn eof(&mut self, out: &mut Vec<Event>) -> Result<Flow, Error> {
-        self.done = true;
-        let flushed = match &mut self.framer {
-            Framer::Ndjson(lines) => lines.finish(),
-            Framer::Sse(_) => None,
-        };
-        let last = match flushed {
-            Some(line) => line_frame(self.decoder.as_mut(), &line, out)?,
-            None => Flow::More,
-        };
-        if last == Flow::More {
-            self.decoder.end(out)?;
-        }
-        Ok(Flow::Done)
-    }
-}
-
-fn line_frame(decoder: &mut dyn Decoder, line: &[u8], out: &mut Vec<Event>) -> Result<Flow, Error> {
-    let line = String::from_utf8_lossy(line);
-    decoder.frame(
-        Frame {
-            event: "",
-            data: &line,
-        },
-        out,
-    )
 }

@@ -1,20 +1,19 @@
 //! Builds the finished reply from a reply's events, and checks they arrive
 //! in order: a part opens before it grows, and nothing follows `Finish`.
 
-use std::collections::BTreeMap;
-use std::collections::btree_map::Entry;
-
 use serde_json::Value;
 
 use crate::error::{Error, Kind};
 use crate::spec::{
-    Assistant, AssistantPart, Block, Event, Finish, Meta, Origin, Reasoning, Response, SmolStr,
-    Text, ToolCall, Usage,
+    Assistant, AssistantPart, Block, CallEnd, Event, Finish, Meta, Opaque, Origin, Reasoning,
+    Response, SmolStr, Text, ToolCall, Usage,
 };
 
 #[derive(Debug, Default)]
 pub struct Accumulator {
-    parts: BTreeMap<u32, Building>,
+    /// The parts by index, in index order. A reply holds few, and a list
+    /// costs less code than a map.
+    parts: Vec<(u32, Building)>,
     finish: Option<Finished>,
     id: Option<SmolStr>,
     model: Option<SmolStr>,
@@ -39,6 +38,49 @@ enum Building {
     Done(AssistantPart),
 }
 
+impl Building {
+    /// The part an open part ends as.
+    fn end(
+        self,
+        index: u32,
+        redacted: bool,
+        restated: Option<String>,
+        call: Option<CallEnd>,
+    ) -> Result<AssistantPart, Error> {
+        let Self::Open {
+            block,
+            text,
+            name,
+            meta,
+        } = self
+        else {
+            return Err(order(format!("part {index} ended while not open")));
+        };
+        let text = restated.unwrap_or(text);
+        Ok(match block {
+            Block::Text => AssistantPart::Text(Text { text, meta }),
+            Block::Reasoning => AssistantPart::Reasoning(Reasoning {
+                text,
+                redacted,
+                meta,
+            }),
+            Block::ToolCall => {
+                let Some(call) = call else {
+                    return Err(order(format!("call {index} ended without its id")));
+                };
+                AssistantPart::ToolCall(ToolCall {
+                    id: call.id,
+                    name: name.unwrap_or_default(),
+                    input: call.input,
+                    invalid: call.invalid,
+                    provider_executed: call.provider_executed,
+                    meta,
+                })
+            }
+        })
+    }
+}
+
 impl Accumulator {
     pub fn new() -> Self {
         Self::default()
@@ -46,13 +88,21 @@ impl Accumulator {
 
     /// A part that opens at `index`, which must be new.
     fn opens(&mut self, index: u32, part: Building) -> Result<(), Error> {
-        match self.parts.entry(index) {
-            Entry::Occupied(_) => Err(order(format!("part {index} opened twice"))),
-            Entry::Vacant(slot) => {
-                slot.insert(part);
+        match self.parts.binary_search_by_key(&index, |(at, _)| *at) {
+            Ok(_) => Err(order(format!("part {index} opened twice"))),
+            Err(at) => {
+                self.parts.insert(at, (index, part));
                 Ok(())
             }
         }
+    }
+
+    fn part(&mut self, index: u32) -> Option<&mut Building> {
+        let at = self
+            .parts
+            .binary_search_by_key(&index, |(at, _)| *at)
+            .ok()?;
+        Some(&mut self.parts[at].1)
     }
 
     pub fn push(&mut self, event: Event) -> Result<(), Error> {
@@ -77,11 +127,11 @@ impl Accumulator {
                     meta: Meta::new(),
                 },
             )?,
-            Event::Delta { index, text: delta } => match self.parts.get_mut(&index) {
+            Event::Delta { index, text: delta } => match self.part(index) {
                 Some(Building::Open { text, .. }) => text.push_str(&delta),
                 _ => return Err(order(format!("part {index} grew while not open"))),
             },
-            Event::Meta { index, meta: more } => match self.parts.get_mut(&index) {
+            Event::Meta { index, meta: more } => match self.part(index) {
                 Some(Building::Open { meta, .. }) => merge_meta(meta, more),
                 Some(Building::Done(part)) => merge_meta(part.meta_mut(), more),
                 None => return Err(order(format!("state for part {index}, which never opened"))),
@@ -92,38 +142,19 @@ impl Accumulator {
                 text: restated,
                 call,
             } => {
-                let Some(Building::Open {
-                    block,
-                    text,
-                    name,
-                    meta,
-                }) = self.parts.remove(&index)
+                let Some(slot) = self
+                    .part(index)
+                    .filter(|part| matches!(part, Building::Open { .. }))
                 else {
                     return Err(order(format!("part {index} ended while not open")));
                 };
-                let text = restated.unwrap_or(text);
-                let part = match block {
-                    Block::Text => AssistantPart::Text(Text { text, meta }),
-                    Block::Reasoning => AssistantPart::Reasoning(Reasoning {
-                        text,
-                        redacted,
-                        meta,
-                    }),
-                    Block::ToolCall => {
-                        let Some(call) = call else {
-                            return Err(order(format!("call {index} ended without its id")));
-                        };
-                        AssistantPart::ToolCall(ToolCall {
-                            id: call.id,
-                            name: name.unwrap_or_default(),
-                            input: call.input,
-                            invalid: call.invalid,
-                            provider_executed: call.provider_executed,
-                            meta,
-                        })
-                    }
-                };
-                self.parts.insert(index, Building::Done(part));
+                // An empty opaque part holds the slot meanwhile, at no
+                // allocation.
+                let open = std::mem::replace(
+                    slot,
+                    Building::Done(AssistantPart::Opaque(Opaque::default())),
+                );
+                *slot = Building::Done(open.end(index, redacted, restated, call)?);
             }
             Event::Part { index, part } => self.opens(index, Building::Done(part))?,
             Event::Finish {
@@ -156,18 +187,19 @@ impl Accumulator {
             meta,
             order: sequence,
         } = self.finish.take().ok_or_else(Error::incomplete)?;
-        let mut content: Vec<AssistantPart> = sequence
-            .unwrap_or_default()
-            .into_iter()
-            .filter_map(|index| match self.parts.remove(&index) {
-                Some(Building::Done(part)) => Some(part),
-                _ => None,
+        let mut parts: Vec<(u32, Option<AssistantPart>)> = (self.parts.into_iter())
+            .map(|(index, part)| match part {
+                Building::Done(part) => (index, Some(part)),
+                Building::Open { .. } => (index, None),
             })
             .collect();
-        content.extend(self.parts.into_values().filter_map(|part| match part {
-            Building::Done(part) => Some(part),
-            Building::Open { .. } => None,
-        }));
+        let mut content = Vec::with_capacity(parts.len());
+        for index in sequence.unwrap_or_default() {
+            if let Ok(at) = parts.binary_search_by_key(&index, |(at, _)| *at) {
+                content.extend(parts[at].1.take());
+            }
+        }
+        content.extend(parts.into_iter().filter_map(|(_, part)| part));
         Ok(Response {
             message: Assistant { content, origin },
             finish,

@@ -5,8 +5,6 @@
 //! model still reads, and a host without tools reads the conversation's
 //! calls and results as text.
 
-use std::collections::BTreeMap;
-
 use serde_json::{Map, Value, json};
 
 use super::merge::merge_fields;
@@ -366,7 +364,8 @@ fn messages(history: &[Message], ctx: &Context<'_>) -> Result<Vec<Value>, Error>
 fn assistant_message(assistant: &Assistant, ctx: &Context<'_>) -> Option<Value> {
     const NO_ITEM: &Value = &Value::Null;
     let (mut parts, mut has_parts) = (Vec::new(), false);
-    let mut reasoning: BTreeMap<String, Vec<&str>> = BTreeMap::new();
+    // The reasoning texts by the field they go under; a message has few.
+    let mut reasoning: Vec<(String, Vec<&str>)> = Vec::new();
     let (mut fields, mut calls) = (Map::new(), Vec::new());
     for part in &assistant.content {
         let sent = replay(part, KEY, identity);
@@ -405,7 +404,10 @@ fn assistant_message(assistant: &Assistant, ctx: &Context<'_>) -> Option<Value> 
                 let others = item.as_object().into_iter().flatten();
                 merge_fields(&mut fields, others.filter(|(_, value)| !value.is_string()));
                 if let Some(field) = field {
-                    reasoning.entry(field).or_default().push(&block.text);
+                    match reasoning.iter_mut().find(|(held, _)| *held == field) {
+                        Some((_, texts)) => texts.push(&block.text),
+                        None => reasoning.push((field, vec![&block.text])),
+                    }
                 }
             }
             // A host without tools reads a call as text.

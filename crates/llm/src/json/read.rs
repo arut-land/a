@@ -69,6 +69,19 @@ impl<T> Json<'_, T> {
     }
 }
 
+impl<T> Json<'_, T> {
+    /// The value, `T` aside: `None` for an object.
+    pub(crate) fn into_value(self) -> Option<Value> {
+        match self {
+            Self::Absent => Some(Value::Null),
+            Self::Str(text) => Some(text.into_owned().into()),
+            Self::Object(_) => None,
+            Self::List(items) => Some(Value::Array(items)),
+            Self::Other(value) => Some(value),
+        }
+    }
+}
+
 impl Json<'_> {
     /// The value as text: a string as it is, anything else but `null` as
     /// JSON.
@@ -144,56 +157,131 @@ impl<'de: 'a, 'a, T: Deserialize<'de>, E: Deserialize<'de>> Deserialize<'de> for
     }
 }
 
+/// An object read as `T`, or `None` for any other value: a slot where only
+/// an object means anything, at less code than a [`Json`].
+pub(crate) struct Obj<T>(pub(crate) Option<T>);
+
+impl<T> Default for Obj<T> {
+    fn default() -> Self {
+        Self(None)
+    }
+}
+
+impl<'de, T: Deserialize<'de>> Deserialize<'de> for Obj<T> {
+    fn deserialize<D: Deserializer<'de>>(json: D) -> Result<Self, D::Error> {
+        struct Read<T>(PhantomData<T>);
+        impl<'de, T: Deserialize<'de>> Visitor<'de> for Read<T> {
+            type Value = Obj<T>;
+            fn expecting(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+                f.write_str("JSON")
+            }
+            fn visit_map<A: MapAccess<'de>>(self, map: A) -> Result<Obj<T>, A::Error> {
+                T::deserialize(MapAccessDeserializer::new(map)).map(|object| Obj(Some(object)))
+            }
+            fn visit_seq<A: SeqAccess<'de>>(self, list: A) -> Result<Obj<T>, A::Error> {
+                IgnoredAny.visit_seq(list).map(|_| Obj(None))
+            }
+            fn visit_unit<X: de::Error>(self) -> Result<Obj<T>, X> {
+                Ok(Obj(None))
+            }
+            fn visit_bool<X: de::Error>(self, _: bool) -> Result<Obj<T>, X> {
+                Ok(Obj(None))
+            }
+            fn visit_i64<X: de::Error>(self, _: i64) -> Result<Obj<T>, X> {
+                Ok(Obj(None))
+            }
+            fn visit_u64<X: de::Error>(self, _: u64) -> Result<Obj<T>, X> {
+                Ok(Obj(None))
+            }
+            fn visit_f64<X: de::Error>(self, _: f64) -> Result<Obj<T>, X> {
+                Ok(Obj(None))
+            }
+            fn visit_str<X: de::Error>(self, _: &str) -> Result<Obj<T>, X> {
+                Ok(Obj(None))
+            }
+        }
+        json.deserialize_any(Read(PhantomData))
+    }
+}
+
 /// A string that borrows from the frame inside an `Option`, where a bare
 /// `Cow` never borrows.
 #[derive(Deserialize)]
 pub(crate) struct Str<'a>(#[serde(borrow)] pub(crate) Cow<'a, str>);
 
-/// Whether the field is present, whatever it holds (`null` included).
-pub(crate) fn present<'de, D: Deserializer<'de>>(field: D) -> Result<bool, D::Error> {
-    IgnoredAny::deserialize(field).map(|_| true)
+/// An object read field by field: [`Fields::field`] takes the fields it
+/// names, and the rest gather in [`Fields::rest`] or are skipped. A field
+/// stated twice reads as its last value, as in a `Value`. serde's `flatten`
+/// would buffer every field first, and a derive costs more code a type.
+pub(crate) trait Fields<'de>: Default {
+    /// Read the value of `key` when it is a field of `Self`; `false` leaves
+    /// it to the rest.
+    fn field<A: MapAccess<'de>>(&mut self, key: &str, map: &mut A) -> Result<bool, A::Error>;
+
+    /// Where the other fields go; `None` skips them.
+    fn rest(&mut self) -> Option<&mut serde_json::Map<String, Value>> {
+        None
+    }
 }
 
-/// A field of another type is absent.
-pub(crate) fn lax<'de, D, T>(field: D) -> Result<Option<T>, D::Error>
-where
-    D: Deserializer<'de>,
-    T: Deserialize<'de>,
-{
-    #[derive(Deserialize)]
-    #[serde(untagged)]
-    enum Lax<T> {
-        Is(T),
-        Not(IgnoredAny),
+/// The next value of `map`, compiled once a type rather than at each field
+/// that reads one.
+#[inline(never)]
+pub(crate) fn next<'de, A: MapAccess<'de>, T: Deserialize<'de>>(
+    map: &mut A,
+) -> Result<T, A::Error> {
+    map.next_value()
+}
+
+/// The object `json` holds, read as `T`'s [`Fields`].
+pub(crate) fn fields<'de, D: Deserializer<'de>, T: Fields<'de>>(json: D) -> Result<T, D::Error> {
+    struct Read<T>(PhantomData<T>);
+    impl<'de, T: Fields<'de>> Visitor<'de> for Read<T> {
+        type Value = T;
+        fn expecting(&self, f: &mut fmt::Formatter) -> fmt::Result {
+            f.write_str("an object")
+        }
+        fn visit_map<A: MapAccess<'de>>(self, mut map: A) -> Result<T, A::Error> {
+            let mut out = T::default();
+            while let Some(Str(key)) = map.next_key()? {
+                if out.field(&key, &mut map)? {
+                    continue;
+                }
+                if let Some(rest) = out.rest() {
+                    let value = next(&mut map)?;
+                    rest.insert(key.into_owned(), value);
+                } else {
+                    map.next_value::<IgnoredAny>()?;
+                }
+            }
+            Ok(out)
+        }
     }
-    Ok(match Option::deserialize(field)? {
-        Some(Lax::Is(value)) => Some(value),
-        Some(Lax::Not(_)) | None => None,
-    })
+    json.deserialize_map(Read(PhantomData))
 }
 
 /// The first element of a list, or `None` for `null`; any other value fails.
-pub(crate) fn first<'de, D, T>(list: D) -> Result<Option<T>, D::Error>
-where
-    D: Deserializer<'de>,
-    T: Deserialize<'de>,
-{
-    struct First<T>(PhantomData<T>);
-    impl<'de, T: Deserialize<'de>> Visitor<'de> for First<T> {
-        type Value = Option<T>;
-        fn expecting(&self, f: &mut fmt::Formatter) -> fmt::Result {
-            f.write_str("a list")
+pub(crate) struct First<T>(pub(crate) Option<T>);
+
+impl<'de, T: Deserialize<'de>> Deserialize<'de> for First<T> {
+    fn deserialize<D: Deserializer<'de>>(list: D) -> Result<Self, D::Error> {
+        struct Read<T>(PhantomData<T>);
+        impl<'de, T: Deserialize<'de>> Visitor<'de> for Read<T> {
+            type Value = First<T>;
+            fn expecting(&self, f: &mut fmt::Formatter) -> fmt::Result {
+                f.write_str("a list")
+            }
+            fn visit_unit<E>(self) -> Result<First<T>, E> {
+                Ok(First(None))
+            }
+            fn visit_seq<A: SeqAccess<'de>>(self, mut list: A) -> Result<First<T>, A::Error> {
+                let first = list.next_element()?;
+                while list.next_element::<IgnoredAny>()?.is_some() {}
+                Ok(First(first))
+            }
         }
-        fn visit_unit<E>(self) -> Result<Option<T>, E> {
-            Ok(None)
-        }
-        fn visit_seq<A: SeqAccess<'de>>(self, mut list: A) -> Result<Option<T>, A::Error> {
-            let first = list.next_element()?;
-            while list.next_element::<IgnoredAny>()?.is_some() {}
-            Ok(first)
-        }
+        list.deserialize_any(Read(PhantomData))
     }
-    list.deserialize_any(First(PhantomData))
 }
 
 /// The word of a wire vocabulary `name` is; `None` for one it lacks.

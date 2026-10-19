@@ -15,7 +15,7 @@ use serde_json::{Value, json};
 
 use super::schema::{legal_call_id, short_hash};
 use crate::error::Error;
-use crate::protocol::{Decoder, Encoded, Framing, Host, Hosted, Protocol, Target};
+use crate::protocol::{Decoder, Encoded, Host, Hosted, Protocol, Target};
 use crate::spec::{Reason, Request};
 
 /// Where this protocol's options and part state go.
@@ -264,7 +264,6 @@ impl Protocol for Chat {
             path,
             body: encode::body(&self.quirks, target, request)?,
             headers: Vec::new(),
-            framing: Framing::Sse,
         })
     }
 

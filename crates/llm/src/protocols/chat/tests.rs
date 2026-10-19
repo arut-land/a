@@ -225,6 +225,24 @@ fn a_finished_stream_needs_no_sentinel() {
     assert_eq!(response.finish.reason, Reason::Stop);
 }
 
+/// A key a frame repeats reads as its last value, at every level.
+#[test]
+fn a_repeated_key_reads_as_its_last_value() {
+    let frames = [
+        r#"{"choices":[{"index":0,"delta":{"content":"no","content":"yes"}}]}"#.to_owned(),
+        r#"{"choices":[{"index":0,"delta":{"tool_calls":[{"index":0,"id":"a","id":"c1","function":{"name":"x","name":"run","arguments":"{}"}}]}}]}"#.to_owned(),
+        r#"{"choices":[{"index":0,"finish_reason":"stop","finish_reason":"tool_calls","delta":{}}]}"#.to_owned(),
+    ];
+    let response = decode(&provider("openai"), "m", &frames);
+    assert_eq!(response.message.text(), "yes");
+    let calls: Vec<_> = response.message.tool_calls().collect();
+    assert_eq!(
+        (calls[0].id.as_str(), calls[0].name.as_str()),
+        ("c1", "run")
+    );
+    assert_eq!(response.finish.reason, Reason::ToolCalls);
+}
+
 /// The in-band error envelope arrives with a 200 status: it fails the turn
 /// with the provider's message. A `null` or empty `error` beside terminal
 /// usage, or any error beside content, is no failure.
@@ -799,8 +817,8 @@ pub(super) fn sent_to(provider: &Provider, request: &Request) -> Result<(String,
         provider,
         model: &request.model,
     };
-    let prepared = crate::prepare(request.clone(), &target);
-    let (http, _) = provider.request(&request.model, &prepared)?;
+    let prepared = crate::prepare(request, &target);
+    let http = provider.request(&request.model, &prepared)?;
     let body = serde_json::from_slice(http.body()).expect("a JSON body");
     Ok((http.uri().to_string(), body))
 }

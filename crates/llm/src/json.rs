@@ -7,7 +7,7 @@ use serde_json::{Map, Number, Value};
 
 mod read;
 
-pub(crate) use read::{Json, Str, first, lax, present, tag, word};
+pub(crate) use read::{Fields, First, Json, Obj, Str, fields, next, tag, word};
 
 /// Lenient reads of a JSON value: a missing field or one of the wrong type
 /// is `None`, and numbers may arrive as strings.
@@ -41,8 +41,25 @@ impl Lenient for Value {
             .map_or(&[], Vec::as_slice)
     }
 
+    /// The pointers here are written out and escape nothing, so each token
+    /// is the key itself: `Value::pointer` copies every token, twice, to
+    /// unescape it.
     fn at(&self, pointer: &str) -> Option<&Value> {
-        self.pointer(pointer).filter(|value| !value.is_null())
+        let mut value = self;
+        if !pointer.is_empty() {
+            for token in pointer.strip_prefix('/')?.split('/') {
+                value = match value {
+                    Value::Object(map) => map.get(token)?,
+                    // An index as `Value::pointer` reads one: no sign, no
+                    // leading zero.
+                    Value::Array(items) if !token.starts_with(['+', '0']) || token == "0" => {
+                        items.get(token.parse::<usize>().ok()?)?
+                    }
+                    _ => return None,
+                };
+            }
+        }
+        Some(value).filter(|value| !value.is_null())
     }
 
     #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]

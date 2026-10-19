@@ -10,7 +10,6 @@
 //! which replays them.
 
 use std::borrow::Cow;
-use std::collections::BTreeMap;
 
 use serde::Deserialize;
 use serde_json::{Map, Value, json};
@@ -175,9 +174,9 @@ fn usage(terminal: Option<&Value>, start: Option<&Value>) -> Usage {
 /// block still open complete, but a call whose input is not yet JSON.
 pub(crate) struct MessagesDecoder {
     w: Writer,
-    /// Each open block's type (a fallback's as `Other`) and the input JSON
-    /// streamed to it.
-    open: BTreeMap<usize, (BlockType, String)>,
+    /// Each open block by index, in index order: its type (a fallback's as
+    /// `Other`) and the input JSON streamed to it.
+    open: Vec<(usize, BlockType, String)>,
     /// Whether a block other than a leading `fallback` opened.
     opened: bool,
     unsigned_thinking: bool,
@@ -215,7 +214,7 @@ impl MessagesDecoder {
     pub(crate) fn new(unsigned_thinking: bool) -> Self {
         Self {
             w: Writer::new(KEY).with_call_id_slot(),
-            open: BTreeMap::new(),
+            open: Vec::new(),
             opened: false,
             unsigned_thinking,
             end: End::default(),
@@ -236,7 +235,11 @@ impl MessagesDecoder {
         }
         self.opened |= !fallback;
         let held = if fallback { BlockType::Other } else { kind };
-        self.open.insert(index, (held, String::new()));
+        let at = self.open.partition_point(|(at, ..)| *at < index);
+        match self.open.get_mut(at) {
+            Some(slot) if slot.0 == index => *slot = (index, held, String::new()),
+            _ => self.open.insert(at, (index, held, String::new())),
+        }
         let block = Value::Object(block.clone());
         let (open, text) = match kind {
             BlockType::Text => (Open::Text, block.str("text")),
@@ -310,9 +313,8 @@ impl MessagesDecoder {
             DeltaType::ThinkingDelta => BlockType::Thinking,
             DeltaType::InputJsonDelta => {
                 let fragment = fragment.ok_or_else(missing)?;
-                let Some((kind @ (BlockType::ToolUse | BlockType::Other), json)) =
-                    self.open.get_mut(&index)
-                else {
+                let open = self.open.iter_mut().find(|(at, ..)| *at == index);
+                let Some((_, kind @ (BlockType::ToolUse | BlockType::Other), json)) = open else {
                     let takes_none = format!(
                         "Anthropic streamed input to content block {index}, which takes none"
                     );
@@ -347,9 +349,10 @@ impl MessagesDecoder {
     /// object `input`, set from what streamed. A hosted item whose input is
     /// not an object never completed.
     fn stop(&mut self, index: usize) -> Result<(), Error> {
-        let Some((kind, json)) = self.open.remove(&index) else {
+        let Some(at) = self.open.iter().position(|(at, ..)| *at == index) else {
             return self.w.finish(index);
         };
+        let (_, kind, json) = self.open.remove(at);
         let call = kind == BlockType::ToolUse;
         let unsigned = self.unsigned_thinking;
         let (mut complete, mut arguments) = (true, None);
@@ -428,9 +431,8 @@ impl MessagesDecoder {
         details: Option<&Value>,
     ) -> Result<Flow, Error> {
         let open = self.open.iter();
-        let open =
-            open.filter(|(_, (kind, json))| *kind != BlockType::ToolUse || whole_object(json));
-        for index in open.map(|(index, _)| *index).collect::<Vec<_>>() {
+        let open = open.filter(|(_, kind, json)| *kind != BlockType::ToolUse || whole_object(json));
+        for index in open.map(|(index, ..)| *index).collect::<Vec<_>>() {
             self.stop(index)?;
         }
         if let Some(container) = self.container.take() {

@@ -13,14 +13,17 @@
 
 use std::borrow::Cow;
 
-use serde::Deserialize;
-use serde::de::IgnoredAny;
+use std::fmt;
+use std::marker::PhantomData;
+
+use serde::de::{IgnoredAny, MapAccess, SeqAccess, Visitor};
+use serde::{Deserialize, Deserializer};
 use serde_json::{Map, Value, json};
 
 use super::merge::{merge_details, merge_fields, merge_object, merge_str};
 use super::{KEY, PartKind, Quirks, ReasoningField};
 use crate::error::Error;
-use crate::json::{Json, Lenient, whole_object};
+use crate::json::{Fields, Json, Lenient, Obj, fields, next, whole_object};
 use crate::protocol::Flow;
 use crate::spec::{Media, Meta, Reason, SmolStr, Source, Usage};
 use crate::writer::{AUTO_INDEX, CallFragment, End, Open, Writer, Writes};
@@ -87,33 +90,143 @@ impl Json<'_> {
 }
 
 /// An array of `T` objects, or any other value.
-type List<'a, T> = Json<'a, IgnoredAny, Json<'a, T>>;
+type List<'a, T> = Json<'a, IgnoredAny, Obj<T>>;
 
-#[derive(Default, Deserialize)]
-#[serde(default, bound = "'de: 'a")]
+#[derive(Default)]
 struct Frame<'a> {
     id: Json<'a>,
     model: Json<'a>,
     object: Json<'a>,
-    choices: List<'a, Choice<'a>>,
+    choices: Choices<'a>,
     usage: Value,
     error: Value,
 }
 
-#[derive(Default, Deserialize)]
-#[serde(default, bound = "'de: 'a")]
+/// A frame's `choices`, of which only the primary one is kept: `n > 1`
+/// streams interleave candidates told apart only by their `index`, and
+/// candidate 0 is the turn. Any value that is no list holds none.
+#[derive(Default)]
+struct Choices<'a> {
+    /// Whether the frame has the field at all.
+    stated: bool,
+    count: usize,
+    /// Whether any choice is a whole message.
+    whole: bool,
+    primary: Option<Json<'a, Choice<'a>>>,
+}
+
+impl<'de: 'a, 'a> Deserialize<'de> for Choices<'a> {
+    fn deserialize<D: Deserializer<'de>>(json: D) -> Result<Self, D::Error> {
+        struct Read<'a>(PhantomData<Choices<'a>>);
+        impl<'de: 'a, 'a> Visitor<'de> for Read<'a> {
+            type Value = Choices<'a>;
+            fn expecting(&self, f: &mut fmt::Formatter) -> fmt::Result {
+                f.write_str("JSON")
+            }
+            fn visit_seq<A: SeqAccess<'de>>(self, mut list: A) -> Result<Choices<'a>, A::Error> {
+                let mut choices = Choices::none();
+                while let Some(choice) = list.next_element::<Json<'a, Choice<'a>>>()? {
+                    choices.count += 1;
+                    let object = choice.object();
+                    choices.whole |= object.is_some_and(|choice| choice.message.0.is_some());
+                    let index = object.map(|choice| choice.index.as_u64());
+                    let primary = index.is_none_or(|index| index.is_none_or(|index| index == 0));
+                    if primary && choices.primary.is_none() {
+                        choices.primary = Some(choice);
+                    }
+                }
+                Ok(choices)
+            }
+            fn visit_map<A: MapAccess<'de>>(self, map: A) -> Result<Choices<'a>, A::Error> {
+                IgnoredAny.visit_map(map).map(|_| Choices::none())
+            }
+            fn visit_unit<E>(self) -> Result<Choices<'a>, E> {
+                Ok(Choices::none())
+            }
+            fn visit_bool<E>(self, _: bool) -> Result<Choices<'a>, E> {
+                Ok(Choices::none())
+            }
+            fn visit_i64<E>(self, _: i64) -> Result<Choices<'a>, E> {
+                Ok(Choices::none())
+            }
+            fn visit_u64<E>(self, _: u64) -> Result<Choices<'a>, E> {
+                Ok(Choices::none())
+            }
+            fn visit_f64<E>(self, _: f64) -> Result<Choices<'a>, E> {
+                Ok(Choices::none())
+            }
+            fn visit_str<E>(self, _: &str) -> Result<Choices<'a>, E> {
+                Ok(Choices::none())
+            }
+        }
+        json.deserialize_any(Read(PhantomData))
+    }
+}
+
+impl Choices<'_> {
+    /// A stated field holding no choices.
+    fn none() -> Self {
+        Self {
+            stated: true,
+            ..Self::default()
+        }
+    }
+}
+
+impl<'de: 'a, 'a> Fields<'de> for Frame<'a> {
+    fn field<A: MapAccess<'de>>(&mut self, key: &str, map: &mut A) -> Result<bool, A::Error> {
+        match key {
+            "id" => self.id = next(map)?,
+            "model" => self.model = next(map)?,
+            "object" => self.object = next(map)?,
+            "choices" => self.choices = next(map)?,
+            "usage" => self.usage = next(map)?,
+            "error" => self.error = next(map)?,
+            _ => return Ok(false),
+        }
+        Ok(true)
+    }
+}
+
+impl<'de: 'a, 'a> Deserialize<'de> for Frame<'a> {
+    fn deserialize<D: Deserializer<'de>>(json: D) -> Result<Self, D::Error> {
+        fields(json)
+    }
+}
+
+#[derive(Default)]
 struct Choice<'a> {
     index: Value,
     finish_reason: Json<'a>,
     native_finish_reason: Json<'a>,
     usage: Value,
-    delta: Json<'a, Delta<'a>>,
-    message: Json<'a, Delta<'a>>,
+    delta: Obj<Delta<'a>>,
+    message: Obj<Delta<'a>>,
+}
+
+impl<'de: 'a, 'a> Fields<'de> for Choice<'a> {
+    fn field<A: MapAccess<'de>>(&mut self, key: &str, map: &mut A) -> Result<bool, A::Error> {
+        match key {
+            "index" => self.index = next(map)?,
+            "finish_reason" => self.finish_reason = next(map)?,
+            "native_finish_reason" => self.native_finish_reason = next(map)?,
+            "usage" => self.usage = next(map)?,
+            "delta" => self.delta = next(map)?,
+            "message" => self.message = next(map)?,
+            _ => return Ok(false),
+        }
+        Ok(true)
+    }
+}
+
+impl<'de: 'a, 'a> Deserialize<'de> for Choice<'a> {
+    fn deserialize<D: Deserializer<'de>>(json: D) -> Result<Self, D::Error> {
+        fields(json)
+    }
 }
 
 /// A delta of the assistant message, or a whole message.
-#[derive(Default, Deserialize)]
-#[serde(default, bound = "'de: 'a")]
+#[derive(Default)]
 struct Delta<'a> {
     reasoning_content: Json<'a>,
     reasoning: Json<'a>,
@@ -126,26 +239,89 @@ struct Delta<'a> {
     tool_calls: List<'a, Call<'a>>,
 }
 
+impl<'de: 'a, 'a> Fields<'de> for Delta<'a> {
+    fn field<A: MapAccess<'de>>(&mut self, key: &str, map: &mut A) -> Result<bool, A::Error> {
+        match key {
+            "reasoning_content" => self.reasoning_content = next(map)?,
+            "reasoning" => self.reasoning = next(map)?,
+            "reasoning_text" => self.reasoning_text = next(map)?,
+            "reasoning_details" => self.reasoning_details = next(map)?,
+            "audio" => self.audio = next(map)?,
+            "content" => self.content = next(map)?,
+            "refusal" => self.refusal = next(map)?,
+            "images" => self.images = next(map)?,
+            "tool_calls" => self.tool_calls = next(map)?,
+            _ => return Ok(false),
+        }
+        Ok(true)
+    }
+}
+
+impl<'de: 'a, 'a> Deserialize<'de> for Delta<'a> {
+    fn deserialize<D: Deserializer<'de>>(json: D) -> Result<Self, D::Error> {
+        fields(json)
+    }
+}
+
 /// A tool-call fragment. Every field but `index` joins the call's item.
-#[derive(Default, Deserialize)]
-#[serde(default, bound = "'de: 'a")]
+#[derive(Default)]
 struct Call<'a> {
     index: Value,
     id: Json<'a>,
-    #[serde(rename = "type")]
     kind: Json<'a>,
     function: Json<'a, Function<'a>>,
-    #[serde(flatten)]
     rest: Map<String, Value>,
 }
 
-#[derive(Default, Deserialize)]
-#[serde(default, bound = "'de: 'a")]
+impl<'de: 'a, 'a> Fields<'de> for Call<'a> {
+    fn field<A: MapAccess<'de>>(&mut self, key: &str, map: &mut A) -> Result<bool, A::Error> {
+        match key {
+            "index" => self.index = next(map)?,
+            "id" => self.id = next(map)?,
+            "type" => self.kind = next(map)?,
+            "function" => self.function = next(map)?,
+            _ => return Ok(false),
+        }
+        Ok(true)
+    }
+
+    fn rest(&mut self) -> Option<&mut Map<String, Value>> {
+        Some(&mut self.rest)
+    }
+}
+
+impl<'de: 'a, 'a> Deserialize<'de> for Call<'a> {
+    fn deserialize<D: Deserializer<'de>>(json: D) -> Result<Self, D::Error> {
+        fields(json)
+    }
+}
+
+#[derive(Default)]
 struct Function<'a> {
     name: Json<'a>,
     arguments: Json<'a>,
-    #[serde(flatten)]
     rest: Map<String, Value>,
+}
+
+impl<'de: 'a, 'a> Fields<'de> for Function<'a> {
+    fn field<A: MapAccess<'de>>(&mut self, key: &str, map: &mut A) -> Result<bool, A::Error> {
+        match key {
+            "name" => self.name = next(map)?,
+            "arguments" => self.arguments = next(map)?,
+            _ => return Ok(false),
+        }
+        Ok(true)
+    }
+
+    fn rest(&mut self) -> Option<&mut Map<String, Value>> {
+        Some(&mut self.rest)
+    }
+}
+
+impl<'de: 'a, 'a> Deserialize<'de> for Function<'a> {
+    fn deserialize<D: Deserializer<'de>>(json: D) -> Result<Self, D::Error> {
+        fields(json)
+    }
 }
 
 impl Call<'_> {
@@ -238,9 +414,8 @@ impl ChatDecoder {
         }
     }
 
-    /// Absorb what every frame carries, and take its primary choice: `n >
-    /// 1` streams interleave candidates told apart only by their `index`,
-    /// and candidate 0 is the turn. Usage is the frame's, or its choice's
+    /// Absorb what every frame carries, and take its primary choice. Usage
+    /// is the frame's, or its choice's
     /// where Moonshot reports it. A gateway's upstream-native reason stands
     /// in only when the normalized one is absent or empty.
     fn absorb<'a>(&mut self, frame: Frame<'a>) -> Option<Json<'a, Choice<'a>>> {
@@ -253,14 +428,7 @@ impl ChatDecoder {
                 *slot = Some(value.into());
             }
         }
-        let primary = |choice: &Json<'_, Choice<'_>>| {
-            let index = choice.object().map(|choice| choice.index.as_u64());
-            index.is_none_or(|index| index.is_none_or(|index| index == 0))
-        };
-        let mut choice = match frame.choices {
-            Json::List(choices) => choices.into_iter().find(primary),
-            _ => None,
-        };
+        let mut choice = frame.choices.primary;
         let usage = match (frame.usage, &mut choice) {
             (Value::Null, Some(Json::Object(choice))) => choice.usage.take(),
             (usage, _) => usage,
@@ -337,7 +505,7 @@ impl ChatDecoder {
             self.image(image)?;
         }
         for (position, call) in delta.tool_calls.items().iter().enumerate() {
-            let call = call.object();
+            let call = call.0.as_ref();
             self.call(call, whole.then_some(position).filter(|_| call.is_some()))?;
         }
         Ok(())
@@ -640,18 +808,9 @@ impl Writes for ChatDecoder {
             }
             return self.finish();
         }
-        let decode = |error| Error::decode(error, data);
-        let rewritten: String;
-        let frame: Json<'_, Frame<'_>, IgnoredAny> = if let Ok(frame) = serde_json::from_str(data) {
-            frame
-        } else {
-            // A frame that repeats a key: as a `Value` the last one stands,
-            // and written back out it reads through the same deserializer
-            // (one instantiation of the typed frame, not two).
-            let value: Value = serde_json::from_str(data).map_err(decode)?;
-            rewritten = value.to_string();
-            serde_json::from_str(&rewritten).map_err(decode)?
-        };
+        // Any JSON reads as a frame; a repeated key's last value stands.
+        let frame: Json<'_, Frame<'_>, IgnoredAny> =
+            serde_json::from_str(data).map_err(|error| Error::decode(error, data))?;
         let frame = match frame {
             Json::Object(frame) => frame,
             // A bare string is the whole answer, ended as a stop.
@@ -671,23 +830,17 @@ impl Writes for ChatDecoder {
         // `object` tag decides when the host sends one: a stream chunk may
         // carry a whole message.
         let object = frame.object.str();
-        if object != Some("chat.completion.chunk") && matches!(frame.choices, Json::Absent) {
+        if object != Some("chat.completion.chunk") && !frame.choices.stated {
             return Ok(Flow::More);
         }
-        let whole = object.map_or_else(
-            || {
-                let mut choices = frame.choices.items().iter().filter_map(Json::object);
-                choices.any(|choice| choice.message.object().is_some())
-            },
-            |object| object == "chat.completion",
-        );
+        let whole = object.map_or(frame.choices.whole, |object| object == "chat.completion");
         let choice = self.absorb(frame);
         if whole {
             let Some(choice) = choice else {
                 return Err(Error::decode("the reply holds no choices", data));
             };
             let Json::Object(Choice {
-                message: Json::Object(message),
+                message: Obj(Some(message)),
                 ..
             }) = choice
             else {
@@ -700,7 +853,7 @@ impl Writes for ChatDecoder {
         }
         self.chunked = true;
         if let Some(Json::Object(Choice {
-            delta: Json::Object(delta),
+            delta: Obj(Some(delta)),
             ..
         })) = choice
         {
@@ -727,7 +880,7 @@ impl Writes for ChatDecoder {
 fn failure(frame: &Frame<'_>, data: &str) -> Option<Error> {
     let error = &frame.error;
     if !(error.is_object() || error.as_str().is_some_and(|text| !text.is_empty()))
-        || !frame.choices.items().is_empty()
+        || frame.choices.count > 0
     {
         return None;
     }
