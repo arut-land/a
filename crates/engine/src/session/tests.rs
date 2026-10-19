@@ -935,6 +935,121 @@ fn an_interrupt_while_asked_settles_the_call_without_running_it() {
     assert_eq!(inbox(&log), Vec::<u64>::new());
 }
 
+/// Allows every call, interrupting the session as it gates one: an
+/// interrupt that lands while the gate's decisions commit.
+#[derive(Clone, Default)]
+struct Interrupter(Arc<std::sync::OnceLock<Weak<Session>>>);
+
+impl Extension for Interrupter {
+    const NAME: &'static str = "policy";
+    const VERSION: u32 = 1;
+
+    fn contribute(&self, r: &mut Registrar) {
+        r.on(self.clone());
+    }
+}
+
+impl Hook for Interrupter {
+    fn permission(&self, _: &str, _: &Value) -> Permission {
+        if let Some(session) = self.0.get().and_then(Weak::upgrade) {
+            session.interrupt();
+        }
+        Permission::Allow
+    }
+}
+
+#[test]
+fn an_interrupt_while_a_call_is_gated_starts_nothing() {
+    let interrupter = Interrupter::default();
+    let fixture = Fixture::new(
+        agent::Kind::Echo,
+        echoing(&Policy::default())
+            .with_in(agent::Tier::Guarded, &interrupter)
+            .unwrap(),
+        openai(&Script::new(&[])),
+    );
+    let session = fixture.start(&[]);
+    interrupter.0.set(Arc::downgrade(&session)).unwrap();
+    session.submit("$ echo ran".into()).unwrap();
+    finished(&session, 2);
+    settle(&session);
+    let log = log_of(&session);
+    session.stop();
+    assert!(
+        !log.iter()
+            .any(|e| matches!(e.body, Body::ToolProcess { .. })),
+        "{log:#?}"
+    );
+    assert!(
+        log.iter().any(|e| e.body
+            == Body::ToolResult {
+                call: 2,
+                outcome: Outcome::Interrupted { output: None },
+                card: None,
+            }),
+        "{log:#?}"
+    );
+}
+
+/// A client sees a call a crash left running as soon as the session loads:
+/// an interrupt before recovery starts stops it, rather than going to work
+/// that already ended.
+#[test]
+fn an_interrupt_before_recovery_starts_stops_it() {
+    let fixture = Fixture::new(
+        agent::Kind::Echo,
+        echoing(&Policy::default()),
+        openai(&Script::new(&[])),
+    );
+    // Holds the one worker, so the actor has not started yet.
+    let (release, held) = std::sync::mpsc::channel::<()>();
+    fixture.0.rt.spawn(Box::pin(async move {
+        let _ = held.recv();
+    }));
+    let session = fixture.load(&[entry(
+        1,
+        Body::ToolCall {
+            tool: "sleep".into(),
+            input: json!({ "seconds": 1 }),
+            id: None,
+            card: None,
+        },
+    )]);
+    session.interrupt();
+    drop(release);
+    let log = finished(&session, 1);
+    settle(&session);
+    session.stop();
+    assert_eq!(
+        log[1].body,
+        Body::ToolResult {
+            call: 1,
+            outcome: Outcome::Interrupted { output: None },
+            card: None,
+        },
+        "{log:#?}"
+    );
+}
+
+/// An interrupt with nothing running stops nothing: not the next turn.
+#[test]
+fn an_interrupt_between_turns_is_not_kept_for_the_next() {
+    let fixture = asking();
+    let session = fixture.start(&[]);
+    session.interrupt();
+    session.submit("hi".into()).unwrap();
+    settle(&session);
+    let log = log_of(&session);
+    session.stop();
+    assert!(
+        matches!(
+            &bodies(&log)[..],
+            [Body::User { .. }, Body::Assistant { .. }]
+        ),
+        "{log:#?}"
+    );
+}
+
 #[test]
 fn a_recap_tells_the_last_prompt_and_what_followed() {
     let call = |tool: &str| Body::ToolCall {

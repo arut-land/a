@@ -83,7 +83,7 @@ pub struct Session {
     /// keep the session loaded, as do watches not yet fired.
     queued: AtomicUsize,
     /// Whether the actor is in a unit of work, even one that waits for an
-    /// answer and so is not counted in `queued`.
+    /// answer and so is not counted in `queued`. Recovery is from the start.
     running: AtomicBool,
     /// Open client attachments; a session with any stays loaded.
     attached: AtomicUsize,
@@ -231,7 +231,7 @@ impl Session {
             // Recovery counts as queued work until it has run, and every
             // armed watch until it fires.
             queued: AtomicUsize::new(usize::from(!fresh) + armed),
-            running: AtomicBool::new(false),
+            running: AtomicBool::new(!fresh),
             attached: AtomicUsize::new(0),
             last_active: Mutex::new(Instant::now()),
             env: Mutex::new(env),
@@ -318,12 +318,16 @@ impl Session {
 
     /// Stops the running turn: its model or tool call, and what the agent
     /// would have done next. The turns of the sessions it started stop
-    /// first, bottom-up.
+    /// first, bottom-up. With no unit of work running there is nothing to
+    /// stop.
     pub fn interrupt(&self) {
         for child in self.children() {
             child.interrupt();
         }
-        lock(&self.cancel).cancel();
+        let cancel = lock(&self.cancel);
+        if self.running.load(Ordering::SeqCst) {
+            cancel.cancel();
+        }
     }
 
     /// Answers the ask for tool call `call`; the actor logs the answer and
@@ -742,7 +746,6 @@ impl Session {
     async fn work(&self, job: BoxFuture<'_, io::Result<()>>) -> bool {
         let began = crate::stamp();
         self.touch();
-        *lock(&self.cancel) = Cancel::default();
         self.running.store(true, Ordering::SeqCst);
         if let Err(e) = self.mark_busy(true).await {
             self.warn(format_args!("busy marker: {e}"));
@@ -759,7 +762,13 @@ impl Session {
             let how = if done.is_ok() { "done" } else { "failed" };
             format!("{how} in {elapsed:?}")
         });
-        self.running.store(false, Ordering::SeqCst);
+        {
+            // Under the lock an interrupt takes: it stops this unit, or
+            // finds nothing running and stops nothing, never the next.
+            let mut cancel = lock(&self.cancel);
+            *cancel = Cancel::default();
+            self.running.store(false, Ordering::SeqCst);
+        }
         let settled = self.queued.fetch_sub(1, Ordering::SeqCst) == 1;
         if settled && let Err(e) = self.mark_busy(false).await {
             self.warn(format_args!("busy marker: {e}"));
@@ -1024,7 +1033,12 @@ impl Session {
         Ok(input)
     }
 
+    /// Runs tool call `call`, unless the turn was interrupted already, as
+    /// it may be while the call's gate and intent commit.
     async fn run_tool(&self, call: u64, tool: &str, input: &Value) -> Outcome {
+        if self.turn().is_cancelled() {
+            return Outcome::Interrupted { output: None };
+        }
         let registry = self.registry();
         let route = registry.tools().get(tool).map(DynTool::route);
         if route.is_some_and(|route| route != Route::Local) {
