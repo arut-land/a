@@ -19,6 +19,7 @@ ext-fixtures = { path = "crates/ext-fixtures" }
 ext-policy = { path = "crates/ext-policy" }
 ext-prompt = { path = "crates/ext-prompt" }
 ext-retry = { path = "crates/ext-retry" }
+ext-settings = { path = "crates/ext-settings" }
 ext-shell = { path = "crates/ext-shell" }
 client = { path = "crates/client" }
 engine = { path = "crates/engine" }

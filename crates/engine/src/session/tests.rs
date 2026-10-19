@@ -1036,7 +1036,7 @@ fn an_interrupt_while_asked_settles_the_call_without_running_it() {
 /// Allows every call, interrupting the session as it gates one: an
 /// interrupt that lands while the gate's decisions commit.
 #[derive(Clone, Default)]
-struct Interrupter(Arc<std::sync::OnceLock<Weak<Session>>>);
+struct Interrupter(Arc<OnceLock<Weak<Session>>>);
 
 impl Extension for Interrupter {
     const NAME: &'static str = "policy";
@@ -1729,7 +1729,7 @@ fn an_unsafe_call_cut_off_reports_the_output_it_committed() {
 fn the_model_is_set_per_session_and_says_where_it_comes_from() {
     let fixture = Fixture::new(
         ext_fixtures::ECHO,
-        Registry::default(),
+        Registry::default().with(&ext_settings::Settings).unwrap(),
         openai(&Script::new(&[])),
     );
     let session = fixture.start(&[]);
@@ -1774,6 +1774,25 @@ fn the_model_is_set_per_session_and_says_where_it_comes_from() {
     let again = fixture.start(&log[..5]);
     assert_eq!(again.model_spec(), "anthropic:claude-x");
     again.stop();
+}
+
+/// Every command is an extension's: without one, `/model` is input like
+/// any other, and a session advertises no commands.
+#[test]
+fn the_kernel_knows_no_command_names() {
+    let registry = Registry::default();
+    assert_eq!(commands(&registry), []);
+    let fixture = Fixture::new(ext_fixtures::ECHO, registry, openai(&Script::new(&[])));
+    let session = fixture.start(&[]);
+    session.submit("/model gpt".into()).unwrap();
+    settle(&session);
+    let log = log_of(&session);
+    session.stop();
+    assert_eq!(bodies(&log), [&user("/model gpt"), &echo("/model gpt")]);
+
+    let with = Registry::default().with(&ext_settings::Settings).unwrap();
+    let names: Vec<_> = commands(&with).into_iter().map(|c| c.name).collect();
+    assert_eq!(names, ["model"]);
 }
 
 #[test]

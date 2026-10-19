@@ -1,3 +1,4 @@
+use std::any::{Any, TypeId};
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::fmt::Display;
 use std::future::{Future, poll_fn};
@@ -6,7 +7,7 @@ use std::panic::{AssertUnwindSafe, catch_unwind};
 use std::path::PathBuf;
 use std::pin::pin;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
-use std::sync::{Arc, Condvar, Mutex, MutexGuard, PoisonError, Weak};
+use std::sync::{Arc, Condvar, Mutex, MutexGuard, OnceLock, PoisonError, Weak};
 use std::task::{Poll, Waker};
 use std::time::{Duration, Instant};
 
@@ -20,7 +21,7 @@ use protocol::{
     Outcome, Overrides, Residency, SessionId, SessionSummary,
 };
 use rt::BoxFuture;
-use serde_json::{Value, json};
+use serde_json::Value;
 use store::{Header, Loaded, Log, LogStore, Parent};
 
 use crate::model::{Model, Models};
@@ -1238,33 +1239,12 @@ impl Session {
                 let cx = self.cx(call, &registry);
                 contain(command.run(args, &cx)).await
             }
-            None if name == MODEL => self.set_model(args),
             None => Outcome::Failed {
                 error: format!("no command /{name}"),
             },
         };
         self.record(Body::CommandResult { call, outcome });
         Ok(())
-    }
-
-    /// `/model`: reports the model the session calls and the layer that
-    /// names it; `/model <host:model>` sets it for this session, over every
-    /// config layer, and `/model reset` leaves it to them again.
-    fn set_model(&self, args: &str) -> Outcome {
-        let set = if args.is_empty() {
-            self.overrides()
-        } else {
-            let model = (args != "reset").then(|| args.to_owned());
-            let set = Overrides { model };
-            let seq = self.record(Body::Settings(set.clone()));
-            (set, Some(seq))
-        };
-        match self.shared.models.settings.model_in(&self.workspace, set) {
-            Ok((model, from)) => Outcome::Done {
-                output: json!({ "model": model, "from": from.to_string() }).into(),
-            },
-            Err(error) => Outcome::Failed { error },
-        }
     }
 
     /// The session's own settings, and the seq of the entry that set them.
@@ -1303,6 +1283,7 @@ impl Session {
             session,
             call,
             registry: Arc::clone(registry),
+            settings: OnceLock::new(),
         }))
     }
 
@@ -1704,29 +1685,21 @@ impl Load {
     }
 }
 
-/// The native command that sets the session's model.
-const MODEL: &str = "model";
-
-/// The slash commands a session runs, as a welcome advertises them.
+/// The slash commands a session runs, as a welcome advertises them: the
+/// extensions', as the engine has none of its own.
 pub fn commands(registry: &Registry) -> Vec<protocol::CommandInfo> {
-    let native = protocol::CommandInfo {
-        name: MODEL.to_owned(),
-        description: "set the session's model".to_owned(),
-    };
     registry
         .commands()
         .map(|c| protocol::CommandInfo {
             name: c.name().to_owned(),
             description: c.description().to_owned(),
         })
-        .chain([native])
         .collect()
 }
 
-/// `text` as a command's name and arguments, if it names one: an
-/// extension's, or a native one.
+/// `text` as a command's name and arguments, if it names one.
 fn as_command<'a>(registry: &Registry, text: &'a str) -> Option<(&'a str, &'a str)> {
-    slash(text).filter(|&(name, _)| registry.command(name).is_some() || name == MODEL)
+    slash(text).filter(|&(name, _)| registry.command(name).is_some())
 }
 
 /// `work`'s output, or `None` once `cancel` is cancelled first; `work` is
@@ -1751,6 +1724,24 @@ struct Effect {
     session: Arc<Session>,
     call: u64,
     registry: Arc<Registry>,
+    /// The session's settings, made when a call first asks.
+    settings: OnceLock<Arc<dyn ext::Settings>>,
+}
+
+/// A session's settings, as its calls reach them.
+struct Own(Arc<Session>);
+
+impl ext::Settings for Own {
+    fn model(&self, _: &Cx) -> Result<(String, String), String> {
+        let session = &self.0;
+        let settings = &session.shared.models.settings;
+        let (model, from) = settings.model_in(&session.workspace, session.overrides())?;
+        Ok((model, from.to_string()))
+    }
+
+    fn set<'a>(&'a self, _: &'a Cx, set: Overrides) -> BoxFuture<'a, io::Result<()>> {
+        Box::pin(async move { self.0.append(Body::Settings(set)).await.map(drop) })
+    }
 }
 
 /// Entries a call records are not waited for: they still commit before
@@ -1794,6 +1785,14 @@ impl Host for Effect {
 
     fn registry(&self) -> &Registry {
         &self.registry
+    }
+
+    fn service(&self, ty: TypeId) -> Option<&(dyn Any + Send + Sync)> {
+        if ty == TypeId::of::<dyn ext::Settings>() {
+            let own = || Arc::new(Own(Arc::clone(&self.session))) as Arc<dyn ext::Settings>;
+            return Some(self.settings.get_or_init(own));
+        }
+        None
     }
 }
 

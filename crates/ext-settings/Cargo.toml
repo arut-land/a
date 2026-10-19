@@ -1,0 +1,13 @@
+[package]
+name = "ext-settings"
+version.workspace = true
+edition.workspace = true
+publish.workspace = true
+
+[dependencies]
+ext.workspace = true
+protocol.workspace = true
+serde_json.workspace = true
+
+[lints]
+workspace = true

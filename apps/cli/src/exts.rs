@@ -32,6 +32,8 @@ pub fn extensions(config: &Config) -> Vec<(Tier, Box<dyn DynExtension>)> {
         (Tier::Pre, Box::new(ext_chat::Chat)),
         #[cfg(feature = "retry")]
         (Tier::Pre, Box::new(ext_retry::Retry::default())),
+        #[cfg(feature = "settings")]
+        (Tier::Pre, Box::new(ext_settings::Settings)),
     ];
     if config.agent.as_deref() == Some(ext_fixtures::ECHO)
         && let Some(fixtures) = ext_fixtures::extension()
@@ -107,7 +109,8 @@ mod tests {
                 ("shell", 1),
                 ("edit", 1),
                 ("chat", 1),
-                ("retry", 1)
+                ("retry", 1),
+                ("settings", 1)
             ]
         );
         assert_eq!(registry.agents().collect::<Vec<_>>(), [ext_chat::CHAT]);
@@ -135,13 +138,14 @@ mod tests {
             r.system_prompt().split("\n\n").map(str::to_owned).collect()
         };
         // What each contributes that the others do not.
-        let own: [(&str, &[&str], usize, bool); 6] = [
+        let own: [(&str, &[&str], usize, bool); 7] = [
             ("policy", &[], 0, false),
             ("prompt", &[], 1, false),
             ("shell", &["bash"], 1, false),
             ("edit", &["edit"], 1, false),
             ("chat", &[], 0, true),
             ("retry", &[], 0, false),
+            ("settings", &[], 0, false),
         ];
         for (name, tools_of, texts_of, agent_of) in own {
             let rest = extensions(&config)

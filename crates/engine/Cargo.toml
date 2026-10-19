@@ -34,4 +34,5 @@ ext-fixtures = { workspace = true, features = ["on"] }
 ext-policy.workspace = true
 ext-prompt.workspace = true
 ext-retry.workspace = true
+ext-settings.workspace = true
 ext-shell.workspace = true
