@@ -4,10 +4,9 @@
 use std::any::{Any, TypeId};
 use std::borrow::Borrow;
 
-use protocol::{Body, Entry};
+use protocol::{Body, Entry, Json};
 use serde::Serialize;
-use serde::de::{Deserialize, DeserializeOwned};
-use serde_json::Value;
+use serde::de::DeserializeOwned;
 
 use crate::Name;
 
@@ -45,7 +44,7 @@ pub(crate) struct Decl {
     pub name: &'static str,
     pub ty: TypeId,
     make: fn() -> Box<dyn Any + Send>,
-    fold: fn(&mut dyn Any, &Value) -> Result<(), String>,
+    fold: fn(&mut dyn Any, &Json) -> Result<(), String>,
 }
 
 impl Decl {
@@ -55,7 +54,7 @@ impl Decl {
             ty: TypeId::of::<S>(),
             make: || Box::new(S::default()),
             fold: |state, data| {
-                let change = S::Change::deserialize(data).map_err(|e| e.to_string())?;
+                let change = data.parse::<S::Change>().map_err(|e| e.to_string())?;
                 if let Some(state) = state.downcast_mut::<S>() {
                     state.apply(&change);
                 }
@@ -102,13 +101,13 @@ impl States {
     /// Folds one change in. A change to a state no extension registers now
     /// (one removed since) is skipped, and so, with a warning, is one its
     /// state cannot read.
-    pub fn fold(&mut self, ext: &str, state: &str, data: &Value) {
+    pub fn fold(&mut self, ext: &str, state: &str, data: &Json) {
         if let Err(e) = self.try_fold(ext, state, data) {
             eprintln!("warning: {e}");
         }
     }
 
-    fn try_fold(&mut self, ext: &str, state: &str, data: &Value) -> Result<(), String> {
+    fn try_fold(&mut self, ext: &str, state: &str, data: &Json) -> Result<(), String> {
         let held = self.0.iter_mut();
         for held in held.filter(|h| &*h.ext == ext && h.decl.name == state) {
             (held.decl.fold)(&mut *held.value, data)
@@ -120,7 +119,7 @@ impl States {
     /// Folds the change `e` records, if any.
     pub fn apply(&mut self, e: &Entry) {
         if let Body::Ext { ext, state, data } = &e.body {
-            self.fold(ext, state, &data.value());
+            self.fold(ext, state, data);
         }
     }
 
@@ -154,7 +153,6 @@ pub(crate) fn read<S: Fold, R>(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use serde_json::json;
 
     #[derive(Default)]
     struct Count(u64);
@@ -171,14 +169,14 @@ mod tests {
     #[test]
     fn a_change_its_state_cannot_read_is_skipped_with_a_warning() {
         let mut states = States::new([(Name::from("counter"), Decl::of::<Count>())]);
-        states.fold("counter", "count", &json!(2));
-        let bad = states.try_fold("counter", "count", &json!("two"));
+        states.fold("counter", "count", &Json::encode(&2).unwrap());
+        let bad = states.try_fold("counter", "count", &Json::encode("two").unwrap());
         assert!(
             bad.unwrap_err()
                 .starts_with("extension counter: a count change")
         );
         // Another extension's state of the same name is not this one.
-        states.fold("other", "count", &json!(5));
+        states.fold("other", "count", &Json::encode(&5).unwrap());
         assert_eq!(states.get::<Count>().unwrap().0, 2);
     }
 }

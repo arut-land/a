@@ -12,6 +12,7 @@ publish.workspace = true
 testing = ["dep:rt", "dep:sys"]
 
 [dependencies]
+ext-derive.workspace = true
 llm.workspace = true
 protocol.workspace = true
 serde.workspace = true

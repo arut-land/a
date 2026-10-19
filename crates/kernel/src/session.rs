@@ -9,8 +9,10 @@ use protocol::{
     Audience, Author, Body, CallId, Entry, Json, Mode, Outcome, Seq, SessionId, ToolChoice,
     Verdict, WaitOn,
 };
-use serde_json::json;
 use smallvec::SmallVec;
+
+use ext::Parsed;
+use protocol::Card;
 
 use crate::fold::{Fold, Next};
 use crate::{
@@ -40,6 +42,10 @@ pub struct Core {
     deferred: VecDeque<(SessionId, Outcome)>,
     /// Why the model call being recovered failed, while a handler decides.
     failed: Option<String>,
+    /// Each open tool call's input as its tool read it at its intent, with
+    /// the text it was read from: its run is given it rather than reading
+    /// it again, unless the gate rewrote it.
+    parsed: Vec<(CallId, Json, Parsed)>,
 }
 
 impl Core {
@@ -82,6 +88,7 @@ impl Core {
             reported: 0,
             deferred: VecDeque::new(),
             failed: None,
+            parsed: Vec::new(),
         }
     }
 
@@ -137,7 +144,11 @@ impl Core {
                 reply(&mut fx, ticket, result);
             }
             Event::ModelDone { call, replied } => self.model_done(call, replied, &mut fx),
-            Event::ToolDone { call, outcome } => self.tool_done(call, outcome, &mut fx),
+            Event::ToolDone {
+                call,
+                outcome,
+                card,
+            } => self.tool_done(call, outcome, card, &mut fx),
             Event::Note { call, note } => self.note(call, note, &mut fx),
             Event::Waits { call, on } => self.waits(call, on, &mut fx),
             Event::Spawn {
@@ -434,7 +445,9 @@ impl Core {
         };
     }
 
-    fn tool_done(&mut self, call: CallId, outcome: Outcome, fx: &mut Effects) {
+    /// Logs a call's outcome as the `post_tool` chain leaves it, with the
+    /// card its tool showed it with, unless a handler replaced it.
+    fn tool_done(&mut self, call: CallId, outcome: Outcome, card: Option<Card>, fx: &mut Effects) {
         if self.step_of(call) != Some(Step::Running) {
             return;
         }
@@ -445,13 +458,10 @@ impl Core {
             value: outcome,
             decisions,
         } = self.registry.post_tool(call, &tool, &input, outcome);
+        let card = card.filter(|_| decisions.is_empty());
         for (by, d) in decisions {
             self.decide(Some(call), &by, d, fx);
         }
-        let card = match &outcome {
-            Outcome::Done { output } => self.registry.result_card(&tool, &input, output),
-            _ => None,
-        };
         self.close(call);
         self.append(
             fx,
@@ -673,7 +683,7 @@ impl Core {
                 self.settle(call, Outcome::Failed { error: why }, fx);
             }
             Next::Command { name, args } => {
-                let input = Json::new(&json!({ "args": args }));
+                let input = args_of(args);
                 let call = self.call(&name, &input, None, Audience::User, fx);
                 self.gate(call, &name, &input, fx);
             }
@@ -689,7 +699,7 @@ impl Core {
         by: Audience,
         fx: &mut Effects,
     ) -> CallId {
-        let card = self.registry.card(tool, input);
+        let (parsed, card) = self.registry.read(tool, input);
         let body = Body::ToolCall {
             tool: tool.to_owned(),
             input: input.clone(),
@@ -697,7 +707,26 @@ impl Core {
             card,
             by,
         };
-        self.append(fx, body)
+        let call = self.append(fx, body);
+        if let Some(parsed) = parsed {
+            self.parsed.push((call, input.clone(), parsed));
+        }
+        call
+    }
+
+    /// Runs tool call `call`, on its input as read at its intent if the
+    /// gate left it as it was.
+    fn run_tool(&mut self, call: CallId, tool: String, input: Json, fx: &mut Effects) {
+        let parsed = (self.parsed.iter().position(|(c, _, _)| *c == call))
+            .map(|at| self.parsed.swap_remove(at))
+            .and_then(|(_, read, parsed)| (read == input).then_some(parsed));
+        self.set_step(call, Step::Running);
+        fx.push(Effect::RunTool {
+            call,
+            tool,
+            input,
+            parsed,
+        });
     }
 
     fn gate(&mut self, call: CallId, tool: &str, input: &Json, fx: &mut Effects) {
@@ -738,8 +767,7 @@ impl Core {
                 let Some((tool, _)) = self.tool_of(call) else {
                     return;
                 };
-                self.set_step(call, Step::Running);
-                fx.push(Effect::RunTool { call, tool, input });
+                self.run_tool(call, tool, input, fx);
             }
             Gate::Ask => {
                 let asked = matches!(
@@ -764,8 +792,7 @@ impl Core {
         let Some((tool, input)) = self.tool_of(call) else {
             return;
         };
-        self.set_step(call, Step::Running);
-        fx.push(Effect::RunTool { call, tool, input });
+        self.run_tool(call, tool, input, fx);
     }
 
     /// Hands call `call` what it waited on.
@@ -802,12 +829,7 @@ impl Core {
                         tool, input, id, ..
                     },
                 ) => (tool, input, id, Audience::Model),
-                Next::Command { name, args } => (
-                    name,
-                    Json::new(&json!({ "args": args })),
-                    None,
-                    Audience::User,
-                ),
+                Next::Command { name, args } => (name, args_of(args), None, Audience::User),
                 Next::Agent(Action::Say(_) | Action::CallModel { .. }) => {
                     self.fold.asked.pop_front();
                     continue;
@@ -1105,6 +1127,7 @@ impl Core {
 
     /// Takes call `call` off the turn's open calls.
     fn close(&mut self, call: CallId) {
+        self.parsed.retain(|(c, _, _)| *c != call);
         match &mut self.turn {
             Turn::Acting { open } => open.retain(|(c, _)| *c != call),
             Turn::Stopping { open, .. } => open.retain(|c| *c != call),
@@ -1131,5 +1154,10 @@ fn outcome(replied: Replied) -> Outcome {
 }
 
 fn to_json(outcome: &Outcome) -> Json {
-    Json::new(&serde_json::to_value(outcome).unwrap_or_default())
+    Json::encode(outcome).unwrap_or_default()
+}
+
+/// A command's input: the text after its name.
+fn args_of(args: String) -> Json {
+    Json::encode(&ext::Args { args }).unwrap_or_default()
 }

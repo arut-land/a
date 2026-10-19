@@ -1,9 +1,11 @@
 //! Typed tools, the erased form a toolset holds, and what a call runs
 //! with.
 
-use std::any::TypeId;
+use std::any::{Any, TypeId};
 use std::collections::BTreeMap;
+use std::fmt;
 use std::future::{Future, poll_fn};
+use std::marker::PhantomData;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, PoisonError};
@@ -11,14 +13,17 @@ use std::task::{Poll, Waker};
 
 use protocol::{Audience, Card, Environment, Json, Outcome, SessionId};
 use serde::Serialize;
-use serde::de::{Deserialize, DeserializeOwned};
-use serde_json::Value;
+use serde::de::DeserializeOwned;
 
 use crate::BoxFuture;
 #[cfg(doc)]
 use crate::CwdOf;
 use crate::host::Host;
 use crate::point::{PointCx, View};
+use crate::schema::Schema;
+use crate::shape::Output;
+#[cfg(doc)]
+use crate::shape::Streamed;
 use crate::state::{self, Fold, States};
 
 /// Whether a call interrupted by a crash may run again.
@@ -30,10 +35,16 @@ pub enum Replay {
 }
 
 /// What a user's command is given: the text after its name.
-#[derive(Clone, Debug, Default, PartialEq, Eq, serde::Deserialize)]
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, serde::Deserialize)]
 pub struct Args {
     #[serde(default)]
     pub args: String,
+}
+
+impl Schema for Args {
+    fn schema(out: &mut String) {
+        out.push_str(r#"{"type":"object","properties":{"args":{"type":"string"}},"required":[],"additionalProperties":false}"#);
+    }
 }
 
 /// What the kernel knows of a callable: who may call it, and whether a
@@ -169,12 +180,14 @@ impl Cx {
 
     /// Commits `change` to state `S`; nothing when no extension registered
     /// it.
+    // Given up to the log, as a change is.
+    #[allow(clippy::needless_pass_by_value)]
     pub fn update<S: Fold>(&self, change: S::Change) {
         let mut ext = None;
         self.host
             .states(&mut |states| ext = states.ext_of::<S>().cloned());
         let Some(ext) = ext else { return };
-        match serde_json::to_value(change) {
+        match Json::encode(&change) {
             Ok(data) => self.host.note(&ext, S::NAME, data),
             Err(e) => eprintln!("warning: extension {ext}: a {} change: {e}", S::NAME),
         }
@@ -249,12 +262,14 @@ impl View for Cx {
     }
 }
 
-/// A tool the model can call. Its output is the stored fact; what the model
-/// sees of it is [`Tool::to_model`], and what clients show of it the cards
+/// A tool the model can call. Its input is read once, from the call's
+/// text, into [`Tool::In`], whose type is its schema ([`Schema`]); its
+/// output is the stored fact, encoded once. What the model sees of an
+/// output is [`Tool::to_model`], and what clients show of a call the cards
 /// [`Tool::present`] and [`Tool::present_result`] describe.
 pub trait Tool: Send + Sync + 'static {
-    type In: DeserializeOwned + Send;
-    type Out: Serialize + DeserializeOwned;
+    type In: DeserializeOwned + Schema + Send + Sync;
+    type Out: Serialize + DeserializeOwned + Send;
 
     const NAME: &'static str;
     const DESCRIPTION: &'static str;
@@ -265,14 +280,11 @@ pub trait Tool: Send + Sync + 'static {
     const REPLAY: Replay = Replay::Unsafe;
     const ROUTE: Route = Route::Local;
 
-    /// The JSON Schema of [`Tool::In`].
-    fn schema() -> Value;
-
-    fn call(
-        &self,
-        input: Self::In,
-        cx: &Cx,
-    ) -> impl Future<Output = Result<Self::Out, String>> + Send;
+    /// Runs a call. What it returns is its shape ([`Output`]): a
+    /// `Result<Self::Out, String>` for a call done at once, a future of one
+    /// for a call that waits (an `async fn`), or a [`Streamed`] call whose
+    /// partial outputs are its progress.
+    fn call(&self, input: &Self::In, cx: &Cx) -> impl Send;
 
     fn to_model(output: &Self::Out) -> llm::Output {
         llm::Output::Json(serde_json::to_value(output).unwrap_or_default())
@@ -289,24 +301,81 @@ pub trait Tool: Send + Sync + 'static {
     }
 }
 
-/// A tool over JSON, so tools of every type, and tools named only at run
-/// time, fit one toolset.
+/// A call's input, read into its tool's own type: what its card is made
+/// of and its run is given, so it is read once.
+pub struct Parsed(Box<dyn Any + Send + Sync>);
+
+impl Parsed {
+    pub fn new<T: Any + Send + Sync>(input: T) -> Self {
+        Self(Box::new(input))
+    }
+
+    pub fn get<T: Any>(&self) -> Option<&T> {
+        self.0.downcast_ref()
+    }
+
+    fn take<T: Any>(self) -> Option<T> {
+        self.0.downcast().ok().map(|input| *input)
+    }
+}
+
+impl fmt::Debug for Parsed {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str("Parsed")
+    }
+}
+
+/// The input it was read from is what tells two apart.
+impl PartialEq for Parsed {
+    fn eq(&self, _: &Self) -> bool {
+        true
+    }
+}
+
+/// How a call ended: its outcome, and how clients show it.
+#[derive(Debug, PartialEq)]
+pub struct Called {
+    pub outcome: Outcome,
+    pub card: Option<Card>,
+}
+
+impl Called {
+    pub const fn failed(error: String) -> Self {
+        Self {
+            outcome: Outcome::Failed { error },
+            card: None,
+        }
+    }
+}
+
+/// A tool over JSON text, so tools of every type, and tools named only at
+/// run time, fit one toolset.
 pub trait DynTool: Send + Sync {
     fn name(&self) -> &str;
     fn description(&self) -> &str;
     fn audience(&self) -> Audience;
     fn replay(&self) -> Replay;
     fn route(&self) -> Route;
-    /// How the tool is offered to the model.
+    /// How the tool is offered to the model, its schema written now.
     fn spec(&self) -> llm::Tool;
-    fn call<'a>(&'a self, input: &Value, cx: &'a Cx) -> BoxFuture<'a, Outcome>;
+    /// Reads a call's input into the tool's own type.
+    fn parse(&self, input: &Json) -> Result<Parsed, String>;
+    /// Runs a call on an input [`DynTool::parse`] read.
+    fn call<'a>(&'a self, input: Parsed, cx: &'a Cx) -> BoxFuture<'a, Called>;
     /// What the model sees of a stored output.
     fn to_model(&self, output: &Json) -> llm::Output;
-    fn present(&self, input: &Value) -> Option<Card>;
-    fn present_result(&self, input: &Value, output: &Json) -> Option<Card>;
+    fn present(&self, input: &Parsed) -> Option<Card>;
 }
 
-impl<T: Tool> DynTool for T {
+/// A typed tool as a [`DynTool`], the shape `M` of its calls found from
+/// what its `call` returns.
+pub(crate) struct Erased<T, M>(pub T, pub PhantomData<fn() -> M>);
+
+impl<T, M> DynTool for Erased<T, M>
+where
+    T: Tool,
+    T::call(..): Output<T::Out, M>,
+{
     fn name(&self) -> &str {
         T::NAME
     }
@@ -328,27 +397,38 @@ impl<T: Tool> DynTool for T {
     }
 
     fn spec(&self) -> llm::Tool {
+        let schema = crate::schema::of::<T::In>();
         llm::Tool {
             name: llm::SmolStr::new_static(T::NAME),
             description: T::DESCRIPTION.to_owned(),
-            schema: T::schema(),
+            schema: serde_json::from_str(&schema).expect("a derived schema is JSON"),
             strict: None,
         }
     }
 
-    fn call<'a>(&'a self, input: &Value, cx: &'a Cx) -> BoxFuture<'a, Outcome> {
-        let input = T::In::deserialize(input).map_err(|e| format!("invalid input: {e}"));
+    fn parse(&self, input: &Json) -> Result<Parsed, String> {
+        (input.parse::<T::In>())
+            .map(Parsed::new)
+            .map_err(|e| format!("invalid input: {e}"))
+    }
+
+    fn call<'a>(&'a self, input: Parsed, cx: &'a Cx) -> BoxFuture<'a, Called> {
+        let Some(input) = input.take::<T::In>() else {
+            let error = format!("the input is not one {} reads", T::NAME);
+            return Box::pin(std::future::ready(Called::failed(error)));
+        };
         Box::pin(async move {
-            let result = match input {
-                Ok(input) => Tool::call(self, input, cx).await,
-                Err(error) => Err(error),
-            }
-            .and_then(|output| serde_json::to_value(output).map_err(|e| e.to_string()));
-            match result {
-                Ok(output) => Outcome::Done {
-                    output: output.into(),
+            let progress = |text: &str| cx.progress(text);
+            let output = match self.0.call(&input, cx).run(&progress).await {
+                Ok(output) => output,
+                Err(error) => return Called::failed(error),
+            };
+            match Json::encode(&output) {
+                Ok(json) => Called {
+                    card: T::present_result(&input, &output),
+                    outcome: Outcome::Done { output: json },
                 },
-                Err(error) => Outcome::Failed { error },
+                Err(e) => Called::failed(e.to_string()),
             }
         })
     }
@@ -359,13 +439,8 @@ impl<T: Tool> DynTool for T {
             .map_or_else(|_| llm::Output::Json(output.value()), |o| T::to_model(&o))
     }
 
-    fn present(&self, input: &Value) -> Option<Card> {
-        T::present(&T::In::deserialize(input).ok()?)
-    }
-
-    fn present_result(&self, input: &Value, output: &Json) -> Option<Card> {
-        let input = T::In::deserialize(input).ok()?;
-        T::present_result(&input, &output.parse().ok()?)
+    fn present(&self, input: &Parsed) -> Option<Card> {
+        T::present(input.get()?)
     }
 }
 

@@ -20,6 +20,7 @@ use super::*;
 
 mod interrupt;
 mod log;
+mod parsed;
 mod retry;
 
 fn entry(seq: u64, body: Body) -> Entry {
@@ -87,20 +88,27 @@ fn facts(entries: &[Entry]) -> Vec<(u64, &Body)> {
 /// The tool rig's recordings call.
 struct HarborLabel;
 
+/// The tool's input: nothing, under the schema the recordings offer it
+/// with.
+#[derive(serde::Deserialize)]
+struct Nothing {}
+
+impl ext::Schema for Nothing {
+    fn schema(out: &mut String) {
+        out.push_str(r#"{"type":"object","properties":{},"required":[]}"#);
+    }
+}
+
 impl Tool for HarborLabel {
-    type In = serde_json::Map<String, Value>;
+    type In = Nothing;
     type Out = String;
 
     const NAME: &'static str = "lookup_harbor_label";
     const DESCRIPTION: &'static str = "Return the alpha signal marker.";
     const REPLAY: Replay = Replay::Safe;
 
-    fn schema() -> Value {
-        json!({ "type": "object", "properties": {}, "required": [] })
-    }
-
-    fn call(&self, _: Self::In, _: &Cx) -> impl Future<Output = Result<String, String>> + Send {
-        std::future::ready(Ok("crimson-harbor".to_owned()))
+    fn call(&self, _: &Nothing, _: &Cx) -> Result<String, String> {
+        Ok("crimson-harbor".to_owned())
     }
 
     fn to_model(label: &String) -> llm::Output {
@@ -1059,13 +1067,8 @@ impl Tool for Jobs {
     const DESCRIPTION: &'static str = "Lists jobs.";
     const AUDIENCE: Audience = Audience::User;
 
-    fn schema() -> Value {
-        json!({ "type": "object" })
-    }
-
-    fn call(&self, i: ext::Args, cx: &Cx) -> impl Future<Output = Result<Value, String>> + Send {
-        let said = format!("{} in {}", i.args, cx.call);
-        std::future::ready(Ok(said.into()))
+    fn call(&self, i: &ext::Args, cx: &Cx) -> Result<Value, String> {
+        Ok(format!("{} in {}", i.args, cx.call).into())
     }
 }
 
@@ -1081,12 +1084,12 @@ impl Extension for Extras {
                 _ => Rewrite::Pass,
             })
             .on::<point::PreTool>(|_, call| {
-                if call.tool != "bash" || call.input["background"] == true {
+                let mut input = call.input.value();
+                if call.tool != "bash" || input["background"] == true {
                     return Rewrite::Pass;
                 }
-                let mut input = call.input.clone();
                 input["background"] = true.into();
-                Rewrite::Replace(input)
+                Rewrite::Replace(Json::new(&input))
             });
     }
 }
@@ -1309,17 +1312,13 @@ fn background_processes_keep_the_session_and_end_with_it() {
 struct Held(Arc<AtomicBool>);
 
 impl Tool for Held {
-    type In = serde_json::Map<String, Value>;
+    type In = Nothing;
     type Out = String;
 
     const NAME: &'static str = "lookup_harbor_label";
     const DESCRIPTION: &'static str = "Return the alpha signal marker.";
 
-    fn schema() -> Value {
-        json!({ "type": "object", "properties": {}, "required": [] })
-    }
-
-    async fn call(&self, _: Self::In, cx: &Cx) -> Result<String, String> {
+    async fn call(&self, _: &Nothing, cx: &Cx) -> Result<String, String> {
         while !self.0.load(Ordering::SeqCst) {
             if cx.cancel.is_cancelled() {
                 return Err("stopped".into());

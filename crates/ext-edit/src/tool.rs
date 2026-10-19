@@ -14,11 +14,10 @@ use std::path::{Path, PathBuf};
 
 use protocol::Card;
 use serde::{Deserialize, Serialize};
-use serde_json::Value;
 
 use ext::Fold;
 
-use ext::{Cx, Tool};
+use ext::{Cx, Schema, Tool};
 
 /// The runtime the engine runs the call on, whose blocking pool file work
 /// goes to.
@@ -32,15 +31,19 @@ pub struct Edit;
 /// The most of a diff an outcome keeps.
 const DIFF_LIMIT: usize = 16 * 1024;
 
-#[derive(Deserialize)]
+#[derive(Deserialize, Schema)]
 pub struct Change {
+    /// Relative to the working directory, or absolute.
     pub path: String,
+    #[schema(min_items = 1)]
     pub edits: Vec<Replace>,
 }
 
-#[derive(Deserialize)]
+#[derive(Deserialize, Schema)]
 pub struct Replace {
+    /// The exact text to replace.
     pub old: String,
+    /// What replaces it.
     pub new: String,
 }
 
@@ -92,36 +95,7 @@ impl Tool for Edit {
     const NAME: &'static str = "edit";
     const DESCRIPTION: &'static str = "Edits a text file by exact replacement. Each `old` must appear exactly once in the file as it was before this call, and edits must not overlap. One edit with an empty `old` writes `new` as the whole file, creating it if needed.";
 
-    fn schema() -> Value {
-        crate::schema(
-            r#"{
-                "type": "object",
-                "properties": {
-                    "path": {
-                        "type": "string",
-                        "description": "Relative to the working directory, or absolute."
-                    },
-                    "edits": {
-                        "type": "array",
-                        "minItems": 1,
-                        "items": {
-                            "type": "object",
-                            "properties": {
-                                "old": { "type": "string", "description": "The exact text to replace." },
-                                "new": { "type": "string", "description": "What replaces it." }
-                            },
-                            "required": ["old", "new"],
-                            "additionalProperties": false
-                        }
-                    }
-                },
-                "required": ["path", "edits"],
-                "additionalProperties": false
-            }"#,
-        )
-    }
-
-    async fn call(&self, input: Change, cx: &Cx) -> Result<Edited, String> {
+    async fn call(&self, input: &Change, cx: &Cx) -> Result<Edited, String> {
         let path = cx.dir().join(&input.path);
         let shown = input.path.clone();
         let read = path.clone();
@@ -332,10 +306,10 @@ fn hash(bytes: &[u8]) -> u64 {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use ext::DynTool;
     use ext::host::Registry;
     use ext::testing::Rig;
     use protocol::Outcome;
+    use serde_json::Value;
     use serde_json::json;
 
     fn edits(pairs: &[(&str, &str)]) -> Vec<Replace> {
@@ -426,8 +400,11 @@ mod tests {
             panic!()
         };
         assert_eq!(output.value()["diff"], "@@ -2,1 +2,1 @@\n-two\n+2\n");
-        let card =
-            DynTool::present_result(&Edit, &json!({ "path": "notes.txt", "edits": [] }), &output);
+        let input = Change {
+            path: "notes.txt".into(),
+            edits: Vec::new(),
+        };
+        let card = Edit::present_result(&input, &output.parse().unwrap());
         assert_eq!(card.unwrap().note, "+1 -1");
 
         // Changed behind the session's back, even across a restart.

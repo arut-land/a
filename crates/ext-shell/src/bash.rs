@@ -28,13 +28,13 @@ use std::time::{Duration, Instant};
 
 use protocol::{Card, Environment};
 use serde::{Deserialize, Serialize};
-use serde_json::Value;
 use sys::Signal;
 
 pub use crate::output::OUTPUT_CAP;
 use crate::output::{Live, Output, Rendered, create_private, private_dir};
 use crate::state::Cwd;
-use ext::{Cx, SpawnSpec as Spawn, Tool};
+use ext::shape::{self, Streams};
+use ext::{Cx, Partials, Schema, SpawnSpec as Spawn, Tool};
 
 pub struct Bash;
 
@@ -72,12 +72,15 @@ const QUIET: [(&str, &str); 5] = [
     ("GIT_TERMINAL_PROMPT", "0"),
 ];
 
-#[derive(Deserialize)]
+#[derive(Deserialize, Schema)]
 pub struct Command {
+    /// The command line.
     pub command: String,
-    /// Seconds; [`TIMEOUT`] by default, at most [`MAX_TIMEOUT`].
+    /// Seconds before the command is stopped; 120 by default.
     #[serde(default)]
+    #[schema(min = 1, max = 600)]
     pub timeout: Option<u64>,
+    /// Start it in the background, for servers and watchers, and return at once with its process group and log file.
     #[serde(default)]
     pub background: bool,
 }
@@ -129,31 +132,9 @@ impl Tool for Bash {
     const NAME: &'static str = "bash";
     const DESCRIPTION: &'static str = "Runs a bash command in the session's working directory, which persists across calls, and returns its combined stdout and stderr with its exit status. There is no stdin or terminal.";
 
-    fn schema() -> Value {
-        crate::schema(
-            r#"{
-                "type": "object",
-                "properties": {
-                    "command": { "type": "string", "description": "The command line." },
-                    "timeout": {
-                        "type": "integer",
-                        "minimum": 1,
-                        "maximum": 600,
-                        "description": "Seconds before the command is stopped; 120 by default."
-                    },
-                    "background": {
-                        "type": "boolean",
-                        "description": "Start it in the background, for servers and watchers, and return at once with its process group and log file."
-                    }
-                },
-                "required": ["command"],
-                "additionalProperties": false
-            }"#,
-        )
-    }
-
-    async fn call(&self, input: Command, cx: &Cx) -> Result<Ran, String> {
-        run(input, cx).await.map_err(|e| e.to_string())
+    /// Streams: its output as it comes is its progress.
+    fn call(&self, input: &Command, cx: &Cx) -> impl shape::Output<Ran, Streams<String>> {
+        ext::stream(|output| async move { run(input, cx, output).await.map_err(|e| e.to_string()) })
     }
 
     fn to_model(ran: &Ran) -> llm::Output {
@@ -249,7 +230,7 @@ fn model_text(ran: &Ran) -> String {
     text
 }
 
-async fn run(input: Command, cx: &Cx) -> io::Result<Ran> {
+async fn run(input: &Command, cx: &Cx, progress: Partials<String>) -> io::Result<Ran> {
     let started = Instant::now();
     let dir = cx.dir();
     // An interrupted turn's call starts nothing.
@@ -277,7 +258,7 @@ async fn run(input: Command, cx: &Cx) -> io::Result<Ran> {
     let pgid = child.id();
     cx.spawned(pgid, false);
     let limit = input.timeout.unwrap_or(TIMEOUT).clamp(1, MAX_TIMEOUT);
-    let done = supervise(child, &log, Duration::from_secs(limit), cx).await?;
+    let done = supervise(child, &log, Duration::from_secs(limit), cx, &progress).await?;
     // The file is kept as the whole output only when the model saw less.
     if done.output.full.is_none() {
         let _ = std::fs::remove_file(&log);
@@ -564,7 +545,13 @@ struct Finished {
 /// runs. Once the shell has exited, the output has ended when nothing of
 /// its group is left to write, or it has paused [`IDLE`], or after
 /// [`LINGER`].
-async fn supervise(mut child: Child, log: &Path, limit: Duration, cx: &Cx) -> io::Result<Finished> {
+async fn supervise(
+    mut child: Child,
+    log: &Path,
+    limit: Duration,
+    cx: &Cx,
+    progress: &Partials<String>,
+) -> io::Result<Finished> {
     let pgid = child.id();
     let mut file = File::open(log)?;
     let rt = runtime(cx)?;
@@ -633,7 +620,7 @@ async fn supervise(mut child: Child, log: &Path, limit: Duration, cx: &Cx) -> io
         if unreported && now >= reported + REPORT {
             unreported = false;
             if let Some(text) = live.take() {
-                cx.progress(&text);
+                progress.send(text);
                 reported = now;
             }
         }

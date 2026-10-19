@@ -1,0 +1,19 @@
+[package]
+name = "ext-derive"
+version.workspace = true
+edition.workspace = true
+publish.workspace = true
+
+# `#[derive(Schema)]`: a tool's input schema, from its type. Code that
+# writes the schema's text when a request needs it, so the binary keeps no
+# schema and nothing builds a tree (schemars: +32 KiB for three inputs).
+[lib]
+proc-macro = true
+
+[dependencies]
+proc-macro2 = "1"
+quote = "1"
+syn = { version = "3", default-features = false, features = ["derive", "parsing", "printing", "proc-macro"] }
+
+[lints]
+workspace = true

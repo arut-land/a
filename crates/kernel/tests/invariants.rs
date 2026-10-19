@@ -25,6 +25,7 @@ fn drive(s: &mut Session, fx: Effects) {
                 Event::ToolDone {
                     call,
                     outcome: done(json!(tool)),
+                    card: None,
                 }
             }
             Effect::CallModel { call, .. } => {

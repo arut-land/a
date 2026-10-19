@@ -14,6 +14,7 @@ publish = false
 # that belongs together. A binary links the ones it runs.
 ext = { path = "crates/ext" }
 ext-chat = { path = "crates/ext-chat" }
+ext-derive = { path = "crates/ext-derive" }
 ext-edit = { path = "crates/ext-edit" }
 ext-fixtures = { path = "crates/ext-fixtures" }
 ext-policy = { path = "crates/ext-policy" }
@@ -48,6 +49,9 @@ uuid = { version = "1", default-features = false, features = ["std", "v7", "serd
 # SAFETY comment.
 unsafe_code = "deny"
 unused_qualifications = "warn"
+# A tool's `call` returns what its shape is (`ext::shape`): an impl names
+# the type, which the trait leaves open.
+refining_impl_trait = { level = "allow", priority = -1 }
 
 [workspace.lints.clippy]
 pedantic = { level = "warn", priority = -1 }

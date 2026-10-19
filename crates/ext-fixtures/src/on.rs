@@ -1,9 +1,11 @@
 use std::time::Duration;
 
-use ext::{Action, Actions, Agent, Cx, Extension, Input, LoopPoints, Registrar, Replay, Tool};
+use ext::{
+    Action, Actions, Agent, Cx, Extension, Input, LoopPoints, Registrar, Replay, Schema, Tool,
+};
 use protocol::Json;
 use serde::{Deserialize, Serialize};
-use serde_json::{Value, json};
+use serde_json::json;
 
 /// The `fixtures` extension.
 pub struct Fixtures;
@@ -57,8 +59,9 @@ impl Agent for Echo {
 /// Waits: a safe tool, so tests can watch a call that recovery reruns.
 pub struct Sleep;
 
-#[derive(Deserialize)]
+#[derive(Deserialize, Schema)]
 pub struct Seconds {
+    #[schema(min = 0)]
     pub seconds: u64,
 }
 
@@ -75,19 +78,7 @@ impl Tool for Sleep {
     const DESCRIPTION: &'static str = "Waits for a number of seconds.";
     const REPLAY: Replay = Replay::Safe;
 
-    fn schema() -> Value {
-        serde_json::from_str(
-            r#"{
-                "type": "object",
-                "properties": { "seconds": { "type": "integer", "minimum": 0 } },
-                "required": ["seconds"],
-                "additionalProperties": false
-            }"#,
-        )
-        .expect("a tool schema is valid JSON")
-    }
-
-    async fn call(&self, input: Seconds, cx: &Cx) -> Result<Slept, String> {
+    async fn call(&self, input: &Seconds, cx: &Cx) -> Result<Slept, String> {
         let rt = cx
             .service::<dyn rt::Runtime>()
             .ok_or("the engine provides no runtime")?;
@@ -144,7 +135,7 @@ mod tests {
         let done = Input::ChildDone {
             watch: protocol::Seq::new(3).unwrap(),
             outcome: Outcome::Done {
-                output: Value::from("hi").into(),
+                output: Json::encode("hi").unwrap(),
             },
         };
         assert_eq!(

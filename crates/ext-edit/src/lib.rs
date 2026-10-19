@@ -2,7 +2,6 @@
 //! commands run, so it needs [`CwdOf`].
 
 use ext::{CwdOf, Extension, Registrar, Text, Tool as _};
-use serde_json::Value;
 
 pub mod tool;
 
@@ -19,9 +18,4 @@ impl Extension for Edit {
             .need::<dyn CwdOf>()
             .text(Text::system("edit", 20, "`edit` changes a file by exact replacement: each `old` must appear exactly once in the file as it was before the call, so include enough of the text around it, and the edits of one call must not overlap. One edit with an empty `old` writes the whole file. Look at a file before editing it: an edit to a file that changed since this session last edited it fails until you look again.").for_tool(tool::Edit::NAME));
     }
-}
-
-/// A schema written as JSON text: smaller in the binary than one built.
-fn schema(text: &str) -> Value {
-    serde_json::from_str(text).expect("a tool schema is valid JSON")
 }

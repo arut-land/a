@@ -16,12 +16,15 @@
 use std::any::{Any, TypeId, type_name};
 use std::borrow::Cow;
 use std::fmt;
+use std::marker::PhantomData;
 use std::path::Path;
 use std::sync::Arc;
 
 use crate::point::{ERASED, ErasedHandler, Handler, Hooked, Point};
+use crate::shape::Output;
 use crate::state::Decl;
-use crate::{Agent, DynTool, Fold, Name};
+use crate::tool::Erased;
+use crate::{Agent, DynTool, Fold, Name, Tool};
 
 /// A unit of features, named so decisions can say who made them.
 pub trait Extension: Send + Sync {
@@ -160,11 +163,15 @@ pub struct Registrar {
 }
 
 impl Registrar {
-    /// Offers `tool`; an `Arc<dyn DynTool>` is a tool named at run time.
-    pub fn tool(&mut self, tool: impl DynTool + 'static) -> &mut Self {
-        self.dyn_tool(Arc::new(tool))
+    /// Offers `tool`, whose calls are shaped `M` as what it returns.
+    pub fn tool<T: Tool, M: 'static>(&mut self, tool: T) -> &mut Self
+    where
+        T::call(..): Output<T::Out, M>,
+    {
+        self.dyn_tool(Arc::new(Erased(tool, PhantomData)))
     }
 
+    /// Offers a tool named at run time.
     pub fn dyn_tool(&mut self, tool: Arc<dyn DynTool>) -> &mut Self {
         let names = self.tools.iter().map(|t| t.name());
         self.errors.extend(twice("tool", tool.name(), names));

@@ -1499,7 +1499,9 @@ mod tests {
                 format!(
                     r#"{head}"decision","by":"policy","call":4,"d":"permission","permission":"ask"}}"#
                 ),
-                format!(r#"{head}"decision","by":"hook","call":3,"d":"prepare_step","model":"cheap"}}"#),
+                format!(
+                    r#"{head}"decision","by":"hook","call":3,"d":"prepare_step","model":"cheap"}}"#
+                ),
                 format!(
                     r#"{head}"decision","by":"hook","call":4,"d":"post_tool","original":{{"status":"failed","error":"e"}}}}"#
                 ),

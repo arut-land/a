@@ -3,9 +3,8 @@
 //! [`Sessions`] starts the child, owned by the call: it is interrupted with
 //! the turn, survives a restart, and is heard from once.
 
-use ext::{Cx, Extension, Registrar, Replay, Sessions, Text, Tool};
+use ext::{Cx, Extension, Registrar, Replay, Schema, Sessions, Text, Tool};
 use serde::Deserialize;
-use serde_json::Value;
 
 /// The `subagent` extension.
 pub struct Subagent;
@@ -22,8 +21,9 @@ impl Extension for Subagent {
 /// `task`: runs a child session on a prompt.
 pub struct Task;
 
-#[derive(Deserialize)]
+#[derive(Deserialize, Schema)]
 pub struct Prompt {
+    /// The work, said in full.
     pub prompt: String,
 }
 
@@ -37,25 +37,11 @@ impl Tool for Task {
     /// Run again, it waits on the child it started, which is the call's.
     const REPLAY: Replay = Replay::Safe;
 
-    fn schema() -> Value {
-        serde_json::from_str(
-            r#"{
-                "type": "object",
-                "properties": {
-                    "prompt": { "type": "string", "description": "The work, said in full." }
-                },
-                "required": ["prompt"],
-                "additionalProperties": false
-            }"#,
-        )
-        .expect("a tool schema is valid JSON")
-    }
-
-    async fn call(&self, input: Prompt, cx: &Cx) -> Result<String, String> {
+    async fn call(&self, input: &Prompt, cx: &Cx) -> Result<String, String> {
         let sessions = cx
             .service::<dyn Sessions>()
             .ok_or("this engine runs no child sessions")?;
-        let outcome = sessions.child(cx, input.prompt).await;
+        let outcome = sessions.child(cx, input.prompt.clone()).await;
         Ok(ext::child_result(&outcome))
     }
 

@@ -425,6 +425,7 @@ pub fn tool_done(call: u64, outcome: Outcome) -> Event {
     Event::ToolDone {
         call: id(call),
         outcome,
+        card: None,
     }
 }
 
@@ -613,6 +614,7 @@ pub fn run_tool(call: u64, tool: &str, input: Value) -> Effect {
         call: id(call),
         tool: tool.to_owned(),
         input: Json::new(&input),
+        parsed: None,
     }
 }
 

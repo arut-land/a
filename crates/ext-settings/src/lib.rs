@@ -30,11 +30,7 @@ impl Tool for Model {
     const DESCRIPTION: &'static str = "set the session's model";
     const AUDIENCE: Audience = Audience::User;
 
-    fn schema() -> Value {
-        json!({ "type": "object", "properties": { "args": { "type": "string" } } })
-    }
-
-    async fn call(&self, Args { args }: Args, cx: &Cx) -> Result<Value, String> {
+    async fn call(&self, Args { args }: &Args, cx: &Cx) -> Result<Value, String> {
         let args = args.as_str();
         let settings = cx
             .service::<dyn ext::Settings>()

@@ -344,7 +344,7 @@ fn a_call_whose_child_settled_before_a_crash_resumes_with_its_result() {
             call: id(2),
             tool: "task".into(),
             input: Json::new(&task),
-            value: Json::new(&json!({ "status": "done", "output": "ok" })),
+            value: Json::encode(&ok).unwrap(),
         }]
     );
 }

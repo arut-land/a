@@ -26,7 +26,7 @@ use std::time::Duration;
 
 pub use ext::{
     Action, Actions, Agent, Answer, Callable, Chained, Gate, Gated, Input, Later, LoopPoints, Name,
-    Recover, Replay,
+    Parsed, Recover, Replay,
 };
 use protocol::{
     Author, CallId, Card, Entry, Environment, Installed, Json, Mode, Outcome, Seq, SessionId,
@@ -73,8 +73,12 @@ pub enum Event {
     },
     /// Model call `call` ended.
     ModelDone { call: CallId, replied: Replied },
-    /// Tool call `call` ended.
-    ToolDone { call: CallId, outcome: Outcome },
+    /// Tool call `call` ended, its outcome shown as `card`.
+    ToolDone {
+        call: CallId,
+        outcome: Outcome,
+        card: Option<Card>,
+    },
     /// Tool call `call`, running, reports something to log.
     Note { call: CallId, note: Note },
     /// Tool call `call`, running, waits on a dialog or a client.
@@ -158,11 +162,13 @@ pub enum Effect {
         attempt: u16,
         choice: ToolChoice,
     },
-    /// Run tool call `call`.
+    /// Run tool call `call`: on `input`, read already as `parsed` unless
+    /// it is to be read now.
     RunTool {
         call: CallId,
         tool: String,
         input: Json,
+        parsed: Option<Parsed>,
     },
     /// Hand tool call `call` the answer to what it waited on.
     Resume {
@@ -280,12 +286,10 @@ pub trait Registry: Send + Sync {
         None
     }
 
-    fn card(&self, _tool: &str, _input: &Json) -> Option<Card> {
-        None
-    }
-
-    fn result_card(&self, _tool: &str, _input: &Json, _output: &Json) -> Option<Card> {
-        None
+    /// Call `tool`'s input as its tool reads it, once, and the card clients
+    /// show the call with.
+    fn read(&self, _tool: &str, _input: &Json) -> (Option<Parsed>, Option<Card>) {
+        (None, None)
     }
 
     /// The `input` point: the text as the chain leaves it, or why it is

@@ -7,7 +7,6 @@ use std::sync::Arc;
 
 use ext::{CwdOf, Cx, Extension, Registrar, SpawnSpec, Spawner, States, Text, Tool};
 use protocol::Environment;
-use serde_json::Value;
 
 pub mod bash;
 mod job;
@@ -55,11 +54,6 @@ impl Spawner for Shell {
         }
         Ok(bash::process(&spawn))
     }
-}
-
-/// A schema written as JSON text: smaller in the binary than one built.
-fn schema(text: &str) -> Value {
-    serde_json::from_str(text).expect("a tool schema is valid JSON")
 }
 
 #[cfg(test)]

@@ -7,7 +7,7 @@ use std::path::PathBuf;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, LazyLock, Mutex, MutexGuard, PoisonError};
 
-use protocol::{Body, Entry, Environment, Outcome, SessionId};
+use protocol::{Body, Entry, Environment, Json, Outcome, SessionId};
 use serde_json::Value;
 
 use crate::host::{Host, Parts, Registry};
@@ -99,7 +99,8 @@ impl Rig {
     /// Runs tool `tool` on `input`.
     pub fn call(&self, tool: &str, input: &Value) -> Outcome {
         let cx = self.cx();
-        rt::block_on(self.registry.tools().run(tool, input, &cx))
+        let input = Json::new(input);
+        rt::block_on(self.registry.tools().run(tool, &input, None, &cx)).outcome
     }
 
     /// The output of a call that must succeed.
@@ -145,7 +146,7 @@ impl Host for Recorder {
         lock(&self.progress).push_str(text);
     }
 
-    fn note(&self, ext: &str, state: &str, data: Value) {
+    fn note(&self, ext: &str, state: &str, data: Json) {
         lock(&self.states).fold(ext, state, &data);
         let mut log = lock(&self.log);
         let seq = log.len() as u64 + 1;
@@ -155,7 +156,7 @@ impl Host for Recorder {
             Body::Ext {
                 ext: ext.to_owned(),
                 state: state.to_owned(),
-                data: data.into(),
+                data,
             },
         ));
     }

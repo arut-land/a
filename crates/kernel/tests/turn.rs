@@ -817,7 +817,7 @@ fn a_call_waits_on_the_child_it_links_and_resumes_with_its_result() {
                     call: id(2),
                     tool: "task".into(),
                     input: Json::new(&json!({ "input": "go" })),
-                    value: Json::new(&json!({ "status": "done", "output": "ok" })),
+                    value: Json::encode(&done(json!("ok"))).unwrap(),
                 },
             ],
         ),

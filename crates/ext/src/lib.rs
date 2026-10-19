@@ -16,6 +16,9 @@
 //!
 //! [`host`] is the engine's side of all this.
 
+// A tool's call shape is the type its `call` returns, named in bounds.
+#![feature(return_type_notation)]
+
 use std::future::Future;
 use std::pin::Pin;
 use std::sync::Arc;
@@ -27,7 +30,9 @@ mod ext;
 pub mod host;
 mod r#loop;
 pub mod point;
+pub mod schema;
 mod service;
+pub mod shape;
 mod state;
 #[cfg(feature = "testing")]
 pub mod testing;
@@ -37,9 +42,13 @@ pub use agent::{Action, Actions, Agent, Input};
 pub use ext::{DynExtension, Extension, Facts, Place, Refused, Registrar, Text, Tier};
 pub use r#loop::{Defaults, LOOP, Loop, LoopPoints, Resume, StepLimit};
 pub use point::{Answer, Asked, Chained, Gate, Gated, Gating, Later, PointCx, Recover, Rewrite};
+pub use schema::Schema;
 pub use service::{Budget, CwdOf, Models, Sessions, Settings, Side, Spawner};
+pub use shape::{Output, Partials, Streamed, stream};
 pub use state::{Fold, States};
-pub use tool::{Args, Callable, Cancel, Cx, DynTool, Replay, Route, SpawnSpec, Tool};
+pub use tool::{
+    Args, Callable, Called, Cancel, Cx, DynTool, Parsed, Replay, Route, SpawnSpec, Tool,
+};
 
 /// A runtime name: of an extension, a tool, an agent. Typed Rust items
 /// name themselves with a `&'static str`, converted once as they register;

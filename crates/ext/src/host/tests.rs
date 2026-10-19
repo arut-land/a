@@ -1,7 +1,5 @@
-use std::future::Future;
-
 use protocol::{Card, Json, Permission, Verdict};
-use serde_json::json;
+use serde_json::{Value, json};
 
 use super::*;
 use crate::point::{self, PointCx, View};
@@ -16,12 +14,8 @@ impl Tool for Named {
     const NAME: &'static str = "bash";
     const DESCRIPTION: &'static str = "mine";
 
-    fn schema() -> Value {
-        json!({ "type": "object" })
-    }
-
-    fn call(&self, _: Value, _: &Cx) -> impl Future<Output = Result<Value, String>> + Send {
-        std::future::ready(Ok(self.0.into()))
+    fn call(&self, _: &Value, _: &Cx) -> Result<Value, String> {
+        Ok(self.0.into())
     }
 }
 
@@ -46,12 +40,8 @@ impl Tool for Jobs {
     const DESCRIPTION: &'static str = "Lists jobs.";
     const AUDIENCE: Audience = Audience::User;
 
-    fn schema() -> Value {
-        json!({ "type": "object" })
-    }
-
-    fn call(&self, _: Args, _: &Cx) -> impl Future<Output = Result<Value, String>> + Send {
-        std::future::ready(Ok("none".into()))
+    fn call(&self, _: &Args, _: &Cx) -> Result<Value, String> {
+        Ok("none".into())
     }
 }
 
@@ -213,18 +203,21 @@ impl DynTool for Declared {
             strict: None,
         }
     }
-    fn call<'a>(&'a self, _: &Value, _: &'a Cx) -> BoxFuture<'a, Outcome> {
-        Box::pin(std::future::ready(Outcome::Done {
-            output: json!("declared").into(),
+    fn parse(&self, _: &Json) -> Result<Parsed, String> {
+        Ok(Parsed::new(()))
+    }
+    fn call<'a>(&'a self, _: Parsed, _: &'a Cx) -> BoxFuture<'a, Called> {
+        Box::pin(std::future::ready(Called {
+            outcome: Outcome::Done {
+                output: json!("declared").into(),
+            },
+            card: None,
         }))
     }
     fn to_model(&self, output: &Json) -> llm::Output {
         llm::Output::Json(output.value())
     }
-    fn present(&self, _: &Value) -> Option<Card> {
-        None
-    }
-    fn present_result(&self, _: &Value, _: &Json) -> Option<Card> {
+    fn present(&self, _: &Parsed) -> Option<Card> {
         None
     }
 }

@@ -42,8 +42,8 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use protocol::{Entry, Json, Outcome, SessionId, Verdict};
+use serde::Serialize;
 use serde::de::DeserializeOwned;
-use serde_json::{Value, json};
 
 use crate::{Actions, Cx, Fold, Name, States};
 
@@ -327,18 +327,19 @@ impl<'a> PointCx<'a> {
     }
 }
 
-/// A tool call, as handlers see it.
-#[derive(Clone, Copy, Debug)]
+/// A tool call, as handlers see it: its input the text the call holds,
+/// which a handler that reads a field of it parses into its own type.
+#[derive(Clone, Copy, Debug, Serialize)]
 pub struct ToolUse<'a> {
     pub tool: &'a str,
-    pub input: &'a Value,
+    pub input: &'a Json,
 }
 
 /// A finished tool call, as `post_tool` handlers see it.
 #[derive(Clone, Copy, Debug)]
 pub struct Finished<'a> {
     pub tool: &'a str,
-    pub input: &'a Value,
+    pub input: &'a Json,
     pub outcome: &'a Outcome,
 }
 
@@ -436,9 +437,9 @@ impl Point for PreTool {
     type Cx<'c> = PointCx<'c>;
     type Facts<'a> = &'a str;
     type In<'a> = ToolUse<'a>;
-    type Out = Rewrite<Value, String>;
+    type Out = Rewrite<Json, String>;
 
-    fn input<'a, 'b: 'a>(tool: &'b str, input: &'a Value) -> ToolUse<'a> {
+    fn input<'a, 'b: 'a>(tool: &'b str, input: &'a Json) -> ToolUse<'a> {
         ToolUse { tool, input }
     }
 }
@@ -585,91 +586,102 @@ impl Point for Resume {
     }
 }
 
-/// A handler over JSON: what a Lua mod, a WASM component or an extension
-/// process registers. It is given the point's input as JSON, and answers
-/// as the point's [`Rule`] reads JSON: `null` passes, a chain takes
-/// `{"replace": ..}` or `{"stop": ..}`, a permission its name.
+/// A handler over JSON text: what a Lua mod, a WASM component or an
+/// extension process registers. It is given the point's input as JSON,
+/// and answers as the point's [`Rule`] reads JSON: `null` passes, a chain
+/// takes `{"replace": ..}` or `{"stop": ..}`, a permission its name. The
+/// text is handed over as it is, for the handler to read as it reads JSON.
 pub trait ErasedHandler: Send + Sync {
-    fn on(&self, cx: &PointCx<'_>, args: &Value) -> Value;
+    fn on(&self, cx: &PointCx<'_>, args: &Json) -> Json;
 }
 
 /// A point that takes [`ErasedHandler`]s.
 trait Wire: for<'c> Point<Cx<'c> = PointCx<'c>> {
-    fn to_json(input: &Self::In<'_>) -> Value;
-    fn from_json(answer: Value) -> Self::Out;
+    fn to_json(input: &Self::In<'_>) -> Json;
+    fn from_json(answer: &Json) -> Self::Out;
+}
+
+/// `value` as JSON text; `null` for one that cannot be.
+fn encode(value: &impl Serialize) -> Json {
+    Json::encode(value).unwrap_or_default()
 }
 
 impl Wire for Input {
-    fn to_json(text: &&str) -> Value {
-        Value::from(*text)
+    fn to_json(text: &&str) -> Json {
+        encode(text)
     }
 
-    fn from_json(answer: Value) -> Self::Out {
+    fn from_json(answer: &Json) -> Self::Out {
         rewrite(answer)
     }
 }
 
 impl Wire for PreTool {
-    fn to_json(call: &ToolUse<'_>) -> Value {
-        json!({ "tool": call.tool, "input": call.input })
+    fn to_json(call: &ToolUse<'_>) -> Json {
+        encode(call)
     }
 
-    fn from_json(answer: Value) -> Self::Out {
+    fn from_json(answer: &Json) -> Self::Out {
         rewrite(answer)
     }
 }
 
 impl Wire for Permission {
-    fn to_json(call: &ToolUse<'_>) -> Value {
-        PreTool::to_json(call)
+    fn to_json(call: &ToolUse<'_>) -> Json {
+        encode(call)
     }
 
     /// One it cannot read denies: a policy fails closed.
-    fn from_json(answer: Value) -> Self::Out {
-        serde_json::from_value(answer).unwrap_or(protocol::Permission::Deny)
+    fn from_json(answer: &Json) -> Self::Out {
+        answer.parse().unwrap_or(protocol::Permission::Deny)
     }
 }
 
 impl Wire for Approve {
-    fn to_json(call: &ToolUse<'_>) -> Value {
-        PreTool::to_json(call)
+    fn to_json(call: &ToolUse<'_>) -> Json {
+        encode(call)
     }
 
-    fn from_json(answer: Value) -> Self::Out {
-        Answer::Now(answer.as_bool())
+    fn from_json(answer: &Json) -> Self::Out {
+        Answer::Now(answer.parse().ok())
     }
 }
 
 impl Wire for OnStop {
-    fn to_json((): &()) -> Value {
-        Value::Null
+    fn to_json((): &()) -> Json {
+        Json::null()
     }
 
-    fn from_json(answer: Value) -> Self::Out {
-        answer.as_str().map(str::to_owned)
+    fn from_json(answer: &Json) -> Self::Out {
+        answer.parse().ok()
     }
 }
 
 impl Wire for Observe {
-    fn to_json(entry: &&Entry) -> Value {
-        serde_json::to_value(entry).unwrap_or_default()
+    fn to_json(entry: &&Entry) -> Json {
+        encode(entry)
     }
 
-    fn from_json(_: Value) {}
+    fn from_json(_: &Json) {}
 }
 
 /// A chain answer from JSON; one it cannot read passes.
-fn rewrite<T: DeserializeOwned>(answer: Value) -> Rewrite<T, String> {
-    let Value::Object(mut answer) = answer else {
-        return Rewrite::Pass;
-    };
-    if let Some(Value::String(why)) = answer.remove("stop") {
-        return Rewrite::Stop(why);
+fn rewrite<T: DeserializeOwned>(answer: &Json) -> Rewrite<T, String> {
+    #[derive(serde::Deserialize)]
+    struct Chain<T> {
+        stop: Option<String>,
+        replace: Option<T>,
     }
-    answer
-        .remove("replace")
-        .and_then(|next| serde_json::from_value(next).ok())
-        .map_or(Rewrite::Pass, Rewrite::Replace)
+    match answer.parse::<Chain<T>>() {
+        Ok(Chain {
+            stop: Some(why), ..
+        }) => Rewrite::Stop(why),
+        Ok(Chain {
+            replace: Some(next),
+            ..
+        }) => Rewrite::Replace(next),
+        _ => Rewrite::Pass,
+    }
 }
 
 /// The points that take erased handlers, and how to adapt one to each.
@@ -687,7 +699,7 @@ pub(crate) const ERASED: &[(&str, Adapt)] = &[
 
 fn adapt<P: Wire>(erased: Arc<dyn ErasedHandler>) -> Hooked {
     let handler: Handler<P> =
-        Arc::new(move |cx, input| P::from_json(erased.on(cx, &P::to_json(&input))));
+        Arc::new(move |cx, input| P::from_json(&erased.on(cx, &P::to_json(&input))));
     Hooked::of::<P>(handler)
 }
 
@@ -960,17 +972,12 @@ impl Hooks {
     /// `pre_tool` chain leaves it, and what each handler decided; or, when
     /// an `approve` handler answers later, what was decided before it.
     pub fn gate(&self, cx: &PointCx<'_>, tool: &str, input: &Json) -> Gating {
-        let mut value = input.value();
+        let mut input = input.clone();
         let mut decisions = Decided::new();
-        let chained = self.run::<PreTool>(cx, tool, &mut value, &mut |name, _, input| {
-            let input = Json::new(input);
+        let chained = self.run::<PreTool>(cx, tool, &mut input, &mut |name, _, input| {
+            let input = input.clone();
             decisions.push((Name::clone(name), Verdict::PreTool { input }));
         });
-        let input = if decisions.is_empty() {
-            input.clone()
-        } else {
-            Json::new(&value)
-        };
         let gate = match chained {
             Err((name, reason)) => {
                 let block = Verdict::Block {
@@ -979,7 +986,7 @@ impl Hooks {
                 decisions.push((name, block));
                 Gate::Refuse(reason)
             }
-            Ok(()) => match self.permit(cx, tool, &value, &mut decisions) {
+            Ok(()) => match self.permit(cx, tool, &input, &mut decisions) {
                 Ok(gate) => gate,
                 Err(Asked::Later { by, at, answer }) => {
                     return Gating::Approving(Approving {
@@ -1006,7 +1013,7 @@ impl Hooks {
         &self,
         cx: &PointCx<'_>,
         tool: &str,
-        input: &Value,
+        input: &Json,
         decided: &mut Decided,
     ) -> Result<Gate, Asked<bool>> {
         let call = ToolUse { tool, input };
@@ -1032,7 +1039,7 @@ impl Hooks {
         &self,
         cx: &PointCx<'_>,
         tool: &str,
-        input: &Value,
+        input: &Json,
         from: usize,
     ) -> Asked<bool> {
         self.ask_from::<Approve, _>(cx, ToolUse { tool, input }, from)
@@ -1055,7 +1062,7 @@ impl Hooks {
     pub fn post_tool(
         &self,
         cx: &PointCx<'_>,
-        (tool, input): (&str, &Value),
+        (tool, input): (&str, &Json),
         mut outcome: Outcome,
     ) -> Chained<Outcome> {
         let mut decisions = Decided::new();

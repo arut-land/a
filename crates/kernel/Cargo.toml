@@ -12,11 +12,11 @@ publish.workspace = true
 ext.workspace = true
 llm.workspace = true
 protocol.workspace = true
-serde_json.workspace = true
 smallvec = { version = "1.13", default-features = false }
 
 [lints]
 workspace = true
 
 [dev-dependencies]
+serde_json.workspace = true
 uuid.workspace = true

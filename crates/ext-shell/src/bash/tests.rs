@@ -8,7 +8,7 @@ use serde_json::{Value, json};
 use super::*;
 use ext::host::Registry;
 use ext::testing::Rig;
-use ext::{DynTool, Extension, Registrar, Rewrite};
+use ext::{Extension, Registrar, Rewrite};
 
 /// Counts the heap the tests hold, and its peak.
 pub struct Counting {
@@ -65,9 +65,7 @@ fn run(rig: &Rig, command: &str) -> Ran {
 }
 
 fn model(ran: &Ran) -> String {
-    let llm::Output::Text(text) =
-        DynTool::to_model(&Bash, &serde_json::to_value(ran).unwrap().into())
-    else {
+    let llm::Output::Text(text) = Bash::to_model(ran) else {
         panic!("bash answers in text")
     };
     text
@@ -437,7 +435,8 @@ fn every_process_goes_through_the_spawn_hooks() {
 
 #[test]
 fn invalid_input_fails_the_call() {
-    let limit = &<Bash as Tool>::schema()["properties"]["timeout"]["maximum"];
+    let schema: Value = serde_json::from_str(&ext::schema::of::<Command>()).unwrap();
+    let limit = &schema["properties"]["timeout"]["maximum"];
     assert_eq!(*limit, MAX_TIMEOUT);
     let rig = rig("invalid");
     let outcome = rig.call("bash", &json!({ "cmd": "true" }));

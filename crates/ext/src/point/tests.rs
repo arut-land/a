@@ -4,7 +4,7 @@ use std::sync::Mutex;
 use std::sync::atomic::{AtomicUsize, Ordering};
 
 use protocol::Permission as Level;
-use serde_json::json;
+use serde_json::{Value, json};
 
 use super::*;
 use crate::{Registrar, SpawnSpec};
@@ -249,7 +249,7 @@ fn merge_rules_are_applied_identically_for_every_point() {
     let failed = |error: &str| Outcome::Failed {
         error: error.into(),
     };
-    let input = json!({});
+    let input = Json::new(&json!({}));
     let call = ToolUse {
         tool: "t",
         input: &input,
@@ -259,7 +259,7 @@ fn merge_rules_are_applied_identically_for_every_point() {
     let view = Counted::default();
     let cx = &point_cx(&view);
     chains::<Input, _, _>(cx, (), texts, stop.clone());
-    chains::<PreTool, _, _>(cx, "t", [json!(0), json!(1), json!(2)], stop);
+    chains::<PreTool, _, _>(cx, "t", [0, 1, 2].map(|n| Json::new(&json!(n))), stop);
     chains::<Spawn, _, _>(cx, (), ["0", "a", "b"].map(spawn), None);
     chains::<PostTool, _, _>(cx, call, ["0", "a", "b"].map(failed), None);
     let say = |text: &str| Actions::from_elem(crate::Action::Say(text.into()), 1);
@@ -327,7 +327,7 @@ fn merge_rules_are_applied_identically_for_every_point() {
 fn a_point_with_no_handler_costs_nothing() {
     let view = Counted::default();
     let cx = point_cx(&view);
-    let input = json!({ "n": 0 });
+    let input = Json::new(&json!({ "n": 0 }));
     // Handlers elsewhere are not asked, nor is the context read.
     let elsewhere = hooks(vec![one("other", |r| {
         r.on::<OnStop>(|cx, ()| Some(cx.model()));
@@ -336,7 +336,7 @@ fn a_point_with_no_handler_costs_nothing() {
         let outcome = Outcome::Interrupted { output: None };
         let text = hooks.input(&cx, "hi".to_owned());
         assert_eq!(text, Ok(Chained::new("hi".to_owned())));
-        let subject = Json::new(&input);
+        let subject = input.clone();
         assert_eq!(
             hooks.gate(&cx, "t", &subject),
             Gating::Now(Gated::run(subject))
@@ -371,7 +371,8 @@ fn gate_logs_what_the_chain_and_the_policy_decided() {
     let cx = point_cx(&view);
     let bump = |r: &mut Registrar| {
         r.on::<PreTool>(|_, call| {
-            Rewrite::Replace(json!({ "n": call.input["n"].as_i64().unwrap() + 1 }))
+            let n = call.input.value()["n"].as_i64().unwrap();
+            Rewrite::Replace(Json::new(&json!({ "n": n + 1 })))
         });
     };
     let gate = |hooks: &Hooks| {
@@ -470,7 +471,7 @@ fn a_later_answer_resumes_the_merge_where_it_stopped() {
     assert_eq!(told.load(Ordering::SeqCst), 0);
     assert_eq!(rt::block_on(approving.answer.0), None);
     // Its none goes on from the next handler.
-    let input = json!({});
+    let input = Json::new(&json!({}));
     let rest = set.approve_from(&cx, "bash", &input, approving.next);
     assert_eq!(rest, Asked::Now("last".into(), false));
     assert_eq!(told.load(Ordering::SeqCst), 1);
@@ -559,7 +560,7 @@ fn input_rejections_name_who_and_post_tool_logs_the_original() {
     assert_eq!(set.input(&cx, "no".to_owned()), Err("a: not that".into()));
 
     let outcome = Outcome::Interrupted { output: None };
-    let Chained { value, decisions } = set.post_tool(&cx, ("t", &json!({})), outcome);
+    let Chained { value, decisions } = set.post_tool(&cx, ("t", &Json::null()), outcome);
     assert_eq!(value, Outcome::Failed { error: "t".into() });
     assert!(matches!(
         &decisions[..],
@@ -576,8 +577,8 @@ fn input_rejections_name_who_and_post_tool_logs_the_original() {
 struct Erased(fn(&Value) -> Value);
 
 impl ErasedHandler for Erased {
-    fn on(&self, _: &PointCx<'_>, args: &Value) -> Value {
-        (self.0)(args)
+    fn on(&self, _: &PointCx<'_>, args: &Json) -> Json {
+        Json::new(&(self.0)(&args.value()))
     }
 }
 

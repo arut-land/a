@@ -608,6 +608,7 @@ dependencies = [
 name = "ext"
 version = "0.0.0"
 dependencies = [
+ "ext-derive",
  "llm",
  "protocol",
  "rt",
@@ -622,6 +623,15 @@ name = "ext-chat"
 version = "0.0.0"
 dependencies = [
  "ext",
+]
+
+[[package]]
+name = "ext-derive"
+version = "0.0.0"
+dependencies = [
+ "proc-macro2",
+ "quote",
+ "syn 3.0.9",
 ]
 
 [[package]]

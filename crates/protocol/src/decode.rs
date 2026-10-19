@@ -667,9 +667,9 @@ impl Decode for Entry {
 /// an entry and derives its decoder.
 impl<'de> Deserialize<'de> for Entry {
     fn deserialize<D: Deserializer<'de>>(d: D) -> std::result::Result<Self, D::Error> {
-        let value = serde_json::Value::deserialize(d)?;
-        let bytes = serde_json::to_vec(&value).map_err(D::Error::custom)?;
-        Self::from_json(&bytes).map_err(D::Error::custom)
+        // As text, so what it holds keeps the text it was written as.
+        let raw = Box::<serde_json::value::RawValue>::deserialize(d)?;
+        Self::from_json(raw.get().as_bytes()).map_err(D::Error::custom)
     }
 }
 

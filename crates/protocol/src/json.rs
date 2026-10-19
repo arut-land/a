@@ -2,8 +2,8 @@
 //! model replies, extension state.
 
 use std::fmt;
+use std::sync::Arc;
 
-use serde::de::DeserializeOwned;
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
 use serde_json::Value;
 use serde_json::value::RawValue;
@@ -15,20 +15,21 @@ use serde_json::value::RawValue;
 ///
 /// Two are equal when their text is: what this build encodes is compact,
 /// with an object's keys in order, so the same value has the same text.
+/// Shared: a clone is a count.
 #[derive(Clone)]
-pub struct Json(Box<RawValue>);
+pub struct Json(Arc<RawValue>);
 
 impl Json {
     /// `value`, encoded as a [`Value`] encodes: its text is what encoding
     /// the tree would have written.
     pub fn new(value: &Value) -> Self {
-        Self(serde_json::value::to_raw_value(value).expect("a value always encodes"))
+        Self::encode(value).expect("a value always encodes")
     }
 
     /// `value` encoded straight to text, with no tree between: what a
     /// model's reply is stored as.
     pub fn encode<T: Serialize + ?Sized>(value: &T) -> serde_json::Result<Self> {
-        serde_json::value::to_raw_value(value).map(Self)
+        serde_json::value::to_raw_value(value).map(|raw| Self(Arc::from(raw)))
     }
 
     pub fn null() -> Self {
@@ -45,9 +46,10 @@ impl Json {
         self.parse().unwrap_or_default()
     }
 
-    /// The payload as a `T`.
-    pub fn parse<T: DeserializeOwned>(&self) -> serde_json::Result<T> {
-        serde_json::from_slice(self.raw().as_bytes())
+    /// The payload as a `T`, read straight from the text: one that
+    /// borrows (a `&str`, a `&RawValue`) borrows it.
+    pub fn parse<'a, T: Deserialize<'a>>(&'a self) -> serde_json::Result<T> {
+        serde_json::from_str(self.raw())
     }
 }
 
@@ -92,6 +94,6 @@ impl Serialize for Json {
 
 impl<'de> Deserialize<'de> for Json {
     fn deserialize<D: Deserializer<'de>>(d: D) -> Result<Self, D::Error> {
-        Box::<RawValue>::deserialize(d).map(Self)
+        Box::<RawValue>::deserialize(d).map(|raw| Self(Arc::from(raw)))
     }
 }

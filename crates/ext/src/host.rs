@@ -6,14 +6,13 @@ use std::any::{Any, TypeId};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex, OnceLock, PoisonError};
 
-use protocol::{Audience, Environment, Outcome, SessionId};
-use serde_json::Value;
+use protocol::{Audience, Environment, Json, Outcome, SessionId};
 
 use crate::ext::MakeAgent;
 use crate::state::States;
 use crate::{
-    Agent, BoxFuture, Cancel, CwdOf, Cx, DynExtension, DynTool, Extension, Facts, Loop, Name,
-    Place, Refused, Registrar, Text, Tier,
+    Agent, BoxFuture, Called, Cancel, CwdOf, Cx, DynExtension, DynTool, Extension, Facts, Loop,
+    Name, Parsed, Place, Refused, Registrar, Text, Tier,
 };
 
 pub use crate::point::{Decided, Hooks};
@@ -29,7 +28,7 @@ pub trait Host: Send + Sync {
     fn progress(&self, text: &str);
     /// Commits `data` as a change to extension `ext`'s state `state`, and
     /// folds it in.
-    fn note(&self, ext: &str, state: &str, data: Value);
+    fn note(&self, ext: &str, state: &str, data: Json);
     /// Lends the session's states to `read`, which cannot keep them.
     fn states(&self, read: &mut dyn FnMut(&States));
     /// The registry generation the call started on.
@@ -76,12 +75,22 @@ impl Toolset {
             .collect()
     }
 
-    pub fn run<'a>(&'a self, name: &str, input: &Value, cx: &'a Cx) -> BoxFuture<'a, Outcome> {
-        match self.get(name) {
-            Some(tool) => tool.call(input, cx),
-            None => Box::pin(std::future::ready(Outcome::Failed {
-                error: format!("unknown tool {name}"),
-            })),
+    /// Runs a call of tool `name` on `input`, read now unless `parsed`
+    /// holds it read already.
+    pub fn run<'a>(
+        &'a self,
+        name: &str,
+        input: &Json,
+        parsed: Option<Parsed>,
+        cx: &'a Cx,
+    ) -> BoxFuture<'a, Called> {
+        let Some(tool) = self.get(name) else {
+            let error = format!("unknown tool {name}");
+            return Box::pin(std::future::ready(Called::failed(error)));
+        };
+        match parsed.map_or_else(|| tool.parse(input), Ok) {
+            Ok(input) => tool.call(input, cx),
+            Err(error) => Box::pin(std::future::ready(Called::failed(error))),
         }
     }
 

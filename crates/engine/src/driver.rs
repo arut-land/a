@@ -21,8 +21,8 @@ use crate::store::{Header, Parent, Writer};
 use ext::host::{Host, Parts, Registry};
 use ext::point::{Approving, Failed, View};
 use ext::{
-    Asked, BoxFuture, Callable, Cancel, Chained, Cx, Facts, Gated, Gating, Name, PointCx, Recover,
-    Route, States,
+    Asked, BoxFuture, Callable, Called, Cancel, Chained, Cx, Facts, Gated, Gating, Name, Parsed,
+    PointCx, Recover, Route, States,
 };
 use kernel::{Answer, Core, Effect, Effects, Event, Load, Note, Owner, Replied, Ticket};
 use protocol::view::SessionView;
@@ -708,7 +708,12 @@ impl Actor {
                 attempt,
                 choice,
             } => self.call_model(call, attempt, choice),
-            Effect::RunTool { call, tool, input } => self.run_tool(call, tool, input),
+            Effect::RunTool {
+                call,
+                tool,
+                input,
+                parsed,
+            } => self.run_tool(call, tool, input, parsed),
             Effect::Resume {
                 call,
                 tool,
@@ -719,7 +724,7 @@ impl Actor {
                     waiting.send(value);
                 } else {
                     self.answers.insert(call, value);
-                    self.run_tool(call, tool, input);
+                    self.run_tool(call, tool, input, None);
                 }
             }
             Effect::Await { call, answer } => {
@@ -899,7 +904,7 @@ impl Actor {
 
     /// Runs tool call `call`, the model's or a user's command, reporting
     /// its outcome.
-    fn run_tool(&mut self, call: CallId, tool: String, input: Json) {
+    fn run_tool(&mut self, call: CallId, tool: String, input: Json, parsed: Option<Parsed>) {
         let cancel = Cancel::default();
         self.cancels.insert(call, cancel.clone());
         self.reporting += 1;
@@ -909,16 +914,16 @@ impl Actor {
         let id = self.live.id;
         self.live.session.shared.rt.spawn(Box::pin(async move {
             let began = crate::stamp();
-            let outcome = if registry
+            let Called { outcome, card } = if registry
                 .tools()
                 .get(&tool)
                 .is_some_and(|t| t.route() != Route::Local)
             {
-                Outcome::Failed {
-                    error: format!("{tool} runs in a client, and this daemon routes none yet"),
-                }
+                Called::failed(format!(
+                    "{tool} runs in a client, and this daemon routes none yet"
+                ))
             } else {
-                contain(registry.tools().run(&tool, &input.value(), &cx)).await
+                contain(registry.tools().run(&tool, &input, parsed, &cx)).await
             };
             crate::session_event("effect", id, || {
                 let elapsed = began.map_or(std::time::Duration::ZERO, |t| t.elapsed());
@@ -929,7 +934,12 @@ impl Actor {
                 };
                 format!("{tool} call {call}: {how} in {elapsed:?}")
             });
-            let _ = mail.send(Msg::Step(Event::ToolDone { call, outcome }));
+            let done = Event::ToolDone {
+                call,
+                outcome,
+                card,
+            };
+            let _ = mail.send(Msg::Step(done));
         }));
     }
 
@@ -1147,13 +1157,12 @@ impl Bound {
             let answer = match answer {
                 Ok(Some(approved)) => Some((asked.by, approved)),
                 Ok(None) => {
-                    let value = asked.input.value();
                     let rest = guarded(
                         || {
                             (self.registry.hooks()).approve_from(
                                 &self.about(call),
                                 &tool,
-                                &value,
+                                &asked.input,
                                 asked.next,
                             )
                         },
@@ -1275,14 +1284,15 @@ impl kernel::Registry for Bound {
         guarded(|| self.registry.context(&facts), |_| None)
     }
 
-    fn card(&self, tool: &str, input: &Json) -> Option<Card> {
-        let tool = self.registry.tools().get(tool)?;
-        guarded(|| tool.present(&input.value()), |_| None)
-    }
-
-    fn result_card(&self, tool: &str, input: &Json, output: &Json) -> Option<Card> {
-        let tool = self.registry.tools().get(tool)?;
-        guarded(|| tool.present_result(&input.value(), output), |_| None)
+    fn read(&self, tool: &str, input: &Json) -> (Option<Parsed>, Option<Card>) {
+        let Some(tool) = self.registry.tools().get(tool) else {
+            return (None, None);
+        };
+        let Ok(parsed) = tool.parse(input) else {
+            return (None, None);
+        };
+        let card = guarded(|| tool.present(&parsed), |_| None);
+        (Some(parsed), card)
     }
 
     /// A transform fails open: the text goes on as it was.
@@ -1348,10 +1358,16 @@ impl kernel::Registry for Bound {
     }
 
     /// A transform fails open: the outcome goes on as it was.
-    fn post_tool(&self, _: CallId, tool: &str, input: &Json, outcome: Outcome) -> Chained<Outcome> {
-        let (input, original) = (input.value(), outcome.clone());
+    fn post_tool(
+        &self,
+        call: CallId,
+        tool: &str,
+        input: &Json,
+        outcome: Outcome,
+    ) -> Chained<Outcome> {
+        let original = outcome.clone();
         guarded(
-            || (self.registry.hooks()).post_tool(&self.point(), (tool, &input), outcome),
+            || (self.registry.hooks()).post_tool(&self.about(call), (tool, input), outcome),
             |_| Chained::new(original),
         )
     }
@@ -1469,8 +1485,8 @@ impl Host for Calling {
         self.report(Note::Progress(text.to_owned()));
     }
 
-    fn note(&self, ext: &str, state: &str, data: serde_json::Value) {
-        let (ext, state, data) = (ext.to_owned(), state.to_owned(), data.into());
+    fn note(&self, ext: &str, state: &str, data: Json) {
+        let (ext, state) = (ext.to_owned(), state.to_owned());
         self.report(Note::State { ext, state, data });
     }
 
@@ -1628,9 +1644,9 @@ impl<T> Failure for Result<T, String> {
     }
 }
 
-impl Failure for Outcome {
+impl Failure for Called {
     fn failed(error: String) -> Self {
-        Self::Failed { error }
+        Self::failed(error)
     }
 }
 
