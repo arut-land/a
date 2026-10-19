@@ -562,8 +562,10 @@ pub enum Event {
     },
     /// Text, reasoning text, or a fragment of a call's argument JSON.
     Delta { index: u32, text: String },
-    /// A part ends. `text` replaces what streamed when the provider
-    /// restated it; a call ends with its id and arguments.
+    /// A part ends. Text and reasoning end with their whole `text` (what
+    /// streamed, or what the provider restated), moved rather than copied:
+    /// deltas carry pieces, and only the end the whole. A call ends with its
+    /// id and arguments.
     End {
         index: u32,
         #[serde(default, skip_serializing_if = "std::ops::Not::not")]

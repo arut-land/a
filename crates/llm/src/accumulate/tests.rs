@@ -41,7 +41,7 @@ fn builds_parts_in_index_order_with_state_and_calls() {
         Event::End {
             index: 0,
             redacted: false,
-            text: None,
+            text: Some("think".into()),
             call: None,
         },
         Event::Meta {

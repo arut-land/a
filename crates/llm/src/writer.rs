@@ -57,6 +57,11 @@ impl<T: Writes> Decoder for T {
         self.writer().drain(out);
         ended
     }
+
+    fn cut(&mut self, out: &mut Vec<Event>) {
+        self.writer().cut();
+        self.writer().drain(out);
+    }
 }
 
 /// What a provider item becomes when it opens.
@@ -146,9 +151,6 @@ struct Draft {
     started: bool,
     item: Value,
     body: Body,
-    /// Whether the provider restated the text or reasoning, so the part
-    /// ends holding something other than what streamed.
-    restated: bool,
 }
 
 enum Body {
@@ -402,7 +404,6 @@ impl Writer {
             started: false,
             item,
             body,
-            restated: false,
         };
         self.open.push((index, draft));
     }
@@ -418,7 +419,8 @@ impl Writer {
     }
 
     /// Append text, reasoning, or a call's argument JSON to the item at
-    /// `index`. Owned text moves into the event that carries it.
+    /// `index`: the part's one copy of its text grows in place, and the
+    /// event carries the new piece only.
     pub fn push<'a>(
         &mut self,
         index: usize,
@@ -488,7 +490,6 @@ impl Writer {
             Body::Text(body) | Body::Reasoning { text: body, .. } => {
                 if body != text {
                     text.clone_into(body);
-                    draft.restated = true;
                 }
             }
             Body::Call { arguments, .. } => {
@@ -713,7 +714,6 @@ impl Writer {
             started,
             item,
             body,
-            restated,
         } = self.take(index).ok_or_else(|| not_open(index))?;
         self.ended.retain(|(at, _)| *at != index);
         self.ended.push((index, part));
@@ -767,14 +767,25 @@ impl Writer {
         if !started {
             self.start(part, block, None);
         }
-        // A restatement replaces what streamed.
+        // The text moves to the consumer whole: what streamed, or what the
+        // provider restated.
         self.out.push(Event::End {
             index: part,
             redacted,
-            text: restated.then_some(text),
+            text: Some(text),
             call: None,
         });
         Ok(())
+    }
+
+    /// The reader stopped reading: what is still open closes as far as it
+    /// got, in the order it opened, and keeps no provider item.
+    pub fn cut(&mut self) {
+        while let Some(index) = first_open(&self.open) {
+            if self.close_item(index, false).is_err() {
+                break;
+            }
+        }
     }
 
     /// The reply ends: what is still open closes, the parts' provider state
@@ -787,10 +798,6 @@ impl Writer {
             .iter()
             .any(|(_, draft)| matches!(draft.body, Body::Call { .. }));
         // What is still open closes in the order it opened.
-        let first_open = |open: &[(usize, Draft)]| {
-            let first = open.iter().min_by_key(|(_, draft)| draft.part);
-            first.map(|(index, _)| *index)
-        };
         while let Some(index) = first_open(&self.open) {
             self.close_item(index, false)?;
         }
@@ -888,6 +895,12 @@ impl Writer {
         }
         (!parts.is_sorted()).then_some(parts)
     }
+}
+
+/// The wire index of the item in `open` that opened first.
+fn first_open(open: &[(usize, Draft)]) -> Option<usize> {
+    let first = open.iter().min_by_key(|(_, draft)| draft.part);
+    first.map(|(index, _)| *index)
 }
 
 /// The open item at wire `index` in `open`.

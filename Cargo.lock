@@ -548,7 +548,6 @@ version = "0.0.0"
 dependencies = [
  "agent",
  "bytes",
- "futures-core",
  "http",
  "llm",
  "protocol",

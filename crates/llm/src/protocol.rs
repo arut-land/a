@@ -86,6 +86,12 @@ pub trait Decoder: Send {
         let _ = out;
         Err(Error::incomplete())
     }
+
+    /// The reader stopped reading (an interrupt): what is open ends as far
+    /// as it got, so the reply's text so far reaches the consumer.
+    fn cut(&mut self, out: &mut Vec<Event>) {
+        let _ = out;
+    }
 }
 
 /// A credential: shown nowhere.

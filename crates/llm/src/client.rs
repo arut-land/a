@@ -3,14 +3,14 @@
 //! body that stops before the provider finished is [`Kind::Incomplete`].
 //! Nothing here retries; [`Error::is_retryable`] tells the caller whether
 //! to.
+//!
+//! The events build the reply as they are read: each is lent to the
+//! reader, then folded into the reply, so its text is never copied out.
 
 use std::collections::VecDeque;
 use std::io;
-use std::pin::Pin;
 use std::sync::Arc;
 use std::task::{Context, Poll, ready};
-
-use futures_core::Stream;
 
 use crate::accumulate::Accumulator;
 use crate::error::{Error, Kind};
@@ -37,6 +37,8 @@ pub fn stream(http: &dyn Http, provider: &Provider, request: &Request) -> Events
     Events {
         state,
         protocol: Arc::clone(&provider.protocol),
+        reply: Accumulator::new(),
+        read: None,
     }
 }
 
@@ -47,11 +49,10 @@ pub async fn generate(
     request: &Request,
 ) -> Result<Response, Error> {
     let mut events = stream(http, provider, request);
-    let mut acc = Accumulator::new();
-    while let Some(event) = std::future::poll_fn(|cx| Pin::new(&mut events).poll_next(cx)).await {
-        acc.push(event?)?;
+    while let Some(event) = events.next().await {
+        event?;
     }
-    acc.finish(Some(origin(provider, &request.model)))
+    events.finish(Some(origin(provider, &request.model)))
 }
 
 /// What the reply's message names as its producer.
@@ -66,6 +67,63 @@ pub fn origin(provider: &Provider, model: &str) -> Origin {
 pub struct Events {
     state: State,
     protocol: Arc<dyn crate::protocol::Protocol>,
+    /// The reply the events read so far build.
+    reply: Accumulator,
+    /// The event lent to the reader, folded into `reply` at the next read.
+    read: Option<Event>,
+}
+
+impl Events {
+    /// The reply's next event, lent until the next read; `None` once the
+    /// reply ended or failed.
+    pub async fn next(&mut self) -> Option<Result<&Event, Error>> {
+        match std::future::poll_fn(|cx| self.advance(cx)).await? {
+            Ok(()) => self.read.as_ref().map(Ok),
+            Err(error) => Some(Err(error)),
+        }
+    }
+
+    fn advance(&mut self, cx: &mut Context<'_>) -> Poll<Option<Result<(), Error>>> {
+        if let Some(event) = self.read.take()
+            && let Err(error) = self.reply.push(event)
+        {
+            self.state = State::Over;
+            return Poll::Ready(Some(Err(error)));
+        }
+        Poll::Ready(match ready!(self.poll_event(cx)) {
+            Some(Ok(event)) => {
+                self.read = Some(event);
+                Some(Ok(()))
+            }
+            Some(Err(error)) => Some(Err(error)),
+            None => None,
+        })
+    }
+
+    /// The finished reply, `origin` stamped on its message.
+    pub fn finish(mut self, origin: Option<Origin>) -> Result<Response, Error> {
+        if let Some(event) = self.read.take() {
+            self.reply.push(event)?;
+        }
+        self.reply.finish(origin)
+    }
+
+    /// The answer text so far of a reply its reader stopped reading:
+    /// everything decoded, and what is still open as far as it got.
+    pub fn interrupted(mut self) -> Option<String> {
+        let mut cut = Vec::from_iter(self.read.take());
+        if let State::Reading(reader) = &mut self.state {
+            cut.extend(reader.queue.drain(..));
+            reader.decoder.cut(&mut cut);
+        }
+        for event in cut {
+            // An event out of order ends what can be read.
+            if self.reply.push(event).is_err() {
+                break;
+            }
+        }
+        self.reply.into_text()
+    }
 }
 
 enum State {
@@ -104,11 +162,9 @@ enum Next {
     Over,
 }
 
-impl Stream for Events {
-    type Item = Result<Event, Error>;
-
-    fn poll_next(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
-        let this = &mut *self;
+impl Events {
+    fn poll_event(&mut self, cx: &mut Context<'_>) -> Poll<Option<Result<Event, Error>>> {
+        let this = self;
         loop {
             match &mut this.state {
                 State::Sending { reply, .. } => {

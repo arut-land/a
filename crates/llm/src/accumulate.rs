@@ -1,5 +1,7 @@
 //! Builds the finished reply from a reply's events, and checks they arrive
 //! in order: a part opens before it grows, and nothing follows `Finish`.
+//! It keeps no copy of the text that streams: a part's text arrives whole,
+//! moved, with its end.
 
 use serde_json::Value;
 
@@ -31,7 +33,6 @@ struct Finished {
 enum Building {
     Open {
         block: Block,
-        text: String,
         name: Option<SmolStr>,
         meta: Meta,
     },
@@ -44,19 +45,13 @@ impl Building {
         self,
         index: u32,
         redacted: bool,
-        restated: Option<String>,
+        text: Option<String>,
         call: Option<CallEnd>,
     ) -> Result<AssistantPart, Error> {
-        let Self::Open {
-            block,
-            text,
-            name,
-            meta,
-        } = self
-        else {
+        let Self::Open { block, name, meta } = self else {
             return Err(order(format!("part {index} ended while not open")));
         };
-        let text = restated.unwrap_or(text);
+        let text = text.unwrap_or_default();
         Ok(match block {
             Block::Text => AssistantPart::Text(Text { text, meta }),
             Block::Reasoning => AssistantPart::Reasoning(Reasoning {
@@ -122,15 +117,15 @@ impl Accumulator {
                 index,
                 Building::Open {
                     block,
-                    text: String::new(),
                     name,
                     meta: Meta::new(),
                 },
             )?,
-            Event::Delta { index, text: delta } => match self.part(index) {
-                Some(Building::Open { text, .. }) => text.push_str(&delta),
-                _ => return Err(order(format!("part {index} grew while not open"))),
-            },
+            Event::Delta { index, .. } => {
+                if !matches!(self.part(index), Some(Building::Open { .. })) {
+                    return Err(order(format!("part {index} grew while not open")));
+                }
+            }
             Event::Meta { index, meta: more } => match self.part(index) {
                 Some(Building::Open { meta, .. }) => merge_meta(meta, more),
                 Some(Building::Done(part)) => merge_meta(part.meta_mut(), more),
@@ -139,7 +134,7 @@ impl Accumulator {
             Event::End {
                 index,
                 redacted,
-                text: restated,
+                text,
                 call,
             } => {
                 let Some(slot) = self
@@ -154,7 +149,7 @@ impl Accumulator {
                     slot,
                     Building::Done(AssistantPart::Opaque(Opaque::default())),
                 );
-                *slot = Building::Done(open.end(index, redacted, restated, call)?);
+                *slot = Building::Done(open.end(index, redacted, text, call)?);
             }
             Event::Part { index, part } => self.opens(index, Building::Done(part))?,
             Event::Finish {
@@ -177,6 +172,18 @@ impl Accumulator {
             }
         }
         Ok(())
+    }
+
+    /// The answer text of the parts that ended, in index order: a reply
+    /// cut short. One part's text is moved, not copied.
+    pub fn into_text(self) -> Option<String> {
+        let mut texts = self.parts.into_iter().filter_map(|(_, part)| match part {
+            Building::Done(AssistantPart::Text(text)) => Some(text.text),
+            _ => None,
+        });
+        let mut text = texts.next()?;
+        texts.for_each(|more| text.push_str(&more));
+        Some(text).filter(|text| !text.is_empty())
     }
 
     /// The reply, once finished. `origin` is stamped on its message.
