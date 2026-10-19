@@ -95,7 +95,7 @@ func expectInStep(_ store: SessionStore, _ reducer: Reducer, _ name: String) {
     var last: ViewUpdate?
     for seq in 1...1000 {
         last = try reducer.fold(
-            message: #"{"t":"entry","seq":\#(seq),"epoch":0,"kind":"user","text":"m\#(seq)"}"#)
+            message: #"{"t":"entry","seq":\#(seq),"epoch":0,"kind":"input","text":"m\#(seq)","taken":true}"#)
     }
     store.apply(last!)
     expectInStep(store, reducer, "far behind")
@@ -109,7 +109,7 @@ func expectInStep(_ store: SessionStore, _ reducer: Reducer, _ name: String) {
     for message in [
         #"{"t":"attached","session":"00000000-0000-0000-0000-00000000000a","workspace":"/w"}"#,
         #"{"t":"entry","seq":1,"epoch":0,"kind":"tool_call","tool":"bash","input":{"command":"ls"}}"#,
-        #"{"t":"entry","seq":2,"epoch":0,"kind":"ask","call":1}"#,
+        #"{"t":"entry","seq":2,"epoch":0,"kind":"decision","by":"policy","call":1,"d":"permission","permission":"ask"}"#,
     ] {
         if let update = try reducer.fold(message: message) { store.apply(update) }
     }

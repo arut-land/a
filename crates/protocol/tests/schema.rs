@@ -80,14 +80,19 @@ fn a_log_replays_byte_identically() {
     }
 }
 
-/// Every recorded line folds, and what waits in the inbox is asked.
+/// Every recorded line folds, and what waits in the inbox is an open
+/// tool call.
 #[test]
 fn every_recorded_log_folds() {
     let mut ledger = Ledger::default();
     for line in recorded_lines() {
         ledger.apply(&Entry::from_json(&line).unwrap());
     }
-    assert!(ledger.inbox().iter().all(|&c| ledger.asked(c).is_some()));
+    assert!(
+        ledger
+            .inbox()
+            .all(|c| matches!(ledger.call(c).map(|o| &o.call), Some(Call::Tool { .. })))
+    );
 }
 
 /// The bytes of a payload (a tool's input, a model's reply, an extension's
@@ -150,8 +155,7 @@ fn log() -> Vec<Vec<u8>> {
     .to_vec()
 }
 
-/// What a ledger says of a session, without the seqs, which differ between
-/// two logs of it.
+/// What a ledger says of a session, without the seqs.
 #[derive(Debug, PartialEq)]
 struct Said {
     open: Vec<(Option<String>, Phase, usize, Option<String>)>,
@@ -160,10 +164,6 @@ struct Said {
     untaken: Vec<(String, bool)>,
     model: Option<String>,
     result: Option<String>,
-    prompt: Option<String>,
-    tools: Vec<String>,
-    failed: u32,
-    running: u32,
     activity: Activity,
     context: bool,
 }
@@ -186,7 +186,7 @@ fn said(ledger: &Ledger) -> Said {
             })
             .collect(),
         commands: ledger.open_commands().count(),
-        inbox: ledger.inbox().iter().map(|&c| input(c)).collect(),
+        inbox: ledger.inbox().map(input).collect(),
         untaken: ledger
             .untaken()
             .iter()
@@ -194,10 +194,6 @@ fn said(ledger: &Ledger) -> Said {
             .collect(),
         model: ledger.settings().0.model,
         result: ledger.result().map(|r| format!("{r:?}")),
-        prompt: ledger.prompt().map(str::to_owned),
-        tools: ledger.turn_tools().to_vec(),
-        failed: ledger.turn_failed(),
-        running: ledger.turn_running(),
         activity: ledger.activity(),
         context: ledger.has_context(),
     }
@@ -212,7 +208,6 @@ fn a_log_folds_to_what_its_session_did() {
     let asked = said(&at(6));
     assert_eq!(asked.activity, Activity::Approval);
     assert_eq!(asked.inbox, [Some(r#"{"command":"ls"}"#.to_owned())]);
-    assert_eq!(asked.tools, ["bash"]);
     let steered = said(&at(7));
     assert_eq!(steered.untaken, [("and sizes".to_owned(), true)]);
     let running = said(&at(10));
@@ -230,7 +225,7 @@ fn a_log_folds_to_what_its_session_did() {
     assert_eq!(end.activity(), Activity::Approval);
     assert_eq!(end.untaken().len(), 1);
     assert_eq!(end.settings().0.model.as_deref(), Some("openai:n"));
-    assert_eq!(end.prompt(), Some("list files"));
+    assert_eq!(end.turn_start(), 2);
     assert!(end.has_context());
 }
 
@@ -252,7 +247,7 @@ fn the_first_answer_wins() {
     ] {
         ledger.apply(&line(json));
     }
-    assert_eq!(ledger.inbox(), [0; 0]);
+    assert_eq!(ledger.inbox().count(), 0);
     assert!(matches!(
         ledger.call(1).unwrap().phase,
         Phase::Settled(protocol::ledger::OutcomeKind::Failed)
@@ -297,7 +292,7 @@ fn every_wait_is_a_phase_of_its_call() {
         )));
         assert_eq!(ledger.call(1).unwrap().phase, Phase::Waiting(on));
         assert_eq!(ledger.activity(), activity);
-        assert_eq!(ledger.inbox(), [0; 0], "only approvals are asked");
+        assert_eq!(ledger.inbox().count(), 0, "only approvals are asked");
         ledger.apply(&line(&format!(
             r#"{{"seq":{},"epoch":0,"kind":"answer","call":1,"value":"a.txt"}}"#,
             seq + 1

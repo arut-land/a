@@ -154,21 +154,14 @@ public final class SessionStore {
             if part == .outcome, case .reply(let call, _, _, _, _) = item, streaming?.call == call {
                 streaming = nil
             }
-        case .asked(let index, let item):
-            let at = Int(index)
-            if at < items.count, items[at].key() == item.key() {
-                items[at] = item
-            } else {
-                items.insert(item, at: min(at, items.count))
-            }
         case .delta(let call, let text):
             if streaming?.call == call {
                 streaming?.text += text
             } else {
                 streaming = StreamingText(call: call, text: text)
             }
-        case .synced:
-            break
+        case .synced(let recap):
+            self.recap = recap
         case .snapshot(let snapshot):
             items = snapshot
             if let call = streaming?.call, !items.contains(where: {
@@ -176,8 +169,6 @@ public final class SessionStore {
             }) {
                 streaming = nil
             }
-        case .recap(let recap):
-            self.recap = recap
         case .draining:
             break
         case .mismatch(let supported):

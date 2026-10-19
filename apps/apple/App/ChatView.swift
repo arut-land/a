@@ -234,7 +234,7 @@ struct ToolView: View {
                 Text(title).font(.body.monospaced())
                 Spacer()
                 switch (phase, approval) {
-                case (.asking, _), (.waiting, _):
+                case (.asking, _):
                     Text("waiting for approval").font(.caption).foregroundStyle(.orange)
                 case (.denied, _), (_, .denied?): Text("denied").font(.caption).foregroundStyle(.red)
                 case (_, .approved?): Text("approved").font(.caption).foregroundStyle(.green)

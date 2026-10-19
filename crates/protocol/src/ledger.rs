@@ -18,9 +18,6 @@ pub struct Ledger {
     seq: u64,
     /// Model and tool calls with an intent and no outcome, by seq.
     open: BySeq<Open>,
-    /// The open calls waiting for an approval, in the order they began to:
-    /// the session's inbox.
-    inbox: Vec<u64>,
     /// Input queued and not yet taken up, in order.
     untaken: VecDeque<Queued>,
     /// Watches that have not fired, by seq.
@@ -38,7 +35,9 @@ pub struct Ledger {
     clients: Vec<(ClientId, ClientSeq)>,
     /// What the session last settled with, as a child hands it back.
     result: Option<Outcome>,
-    turn: Turn,
+    /// The seq of the input that started the current turn; 0 before the
+    /// first.
+    turn: u64,
 }
 
 /// A call between its intent and its outcome.
@@ -105,17 +104,6 @@ pub struct Link {
     pub input: String,
 }
 
-/// What the current turn did, from the input that started it on: what a
-/// recap tells but the reply, which only a model's reply format can read.
-#[derive(Clone, Debug, Default)]
-struct Turn {
-    /// The seq of its input; 0 before the first.
-    start: u64,
-    prompt: Option<String>,
-    tools: Vec<String>,
-    failed: u32,
-}
-
 impl Ledger {
     /// Folds every entry of `entries`, in order.
     pub fn of<'a>(entries: impl IntoIterator<Item = &'a Entry>) -> Self {
@@ -141,7 +129,7 @@ impl Ledger {
             } => {
                 self.author(*origin);
                 if *taken {
-                    self.turn = Turn::start(seq, text);
+                    self.turn = seq;
                 } else {
                     self.untaken.push_back(Queued {
                         seq,
@@ -155,7 +143,7 @@ impl Ledger {
                     && let Some(q) = self.untaken.remove(at)
                     && !q.steer
                 {
-                    self.turn = Turn::start(seq, &q.text);
+                    self.turn = seq;
                 }
             }
             Body::ToolCall { .. }
@@ -210,9 +198,6 @@ impl Ledger {
             Body::ToolCall {
                 tool, input, by, ..
             } => {
-                if *by != Audience::User {
-                    self.turn.tools.push(tool.clone());
-                }
                 self.open(
                     seq,
                     Call::Tool {
@@ -283,21 +268,10 @@ impl Ledger {
         let Some(open) = self.open.remove(call) else {
             return;
         };
-        self.inbox.retain(|&c| c != call);
         // A command the user ran is not the agent's work.
-        if matches!(
-            open.call,
-            Call::Tool {
-                by: Audience::User,
-                ..
-            }
-        ) {
-            return;
+        if !open.by_user() {
+            self.result = Some(outcome.clone());
         }
-        if !matches!(outcome, Outcome::Done { .. }) {
-            self.turn.failed += 1;
-        }
-        self.result = Some(outcome.clone());
     }
 
     /// A decision about call `call`, made at its gate.
@@ -331,9 +305,6 @@ impl Ledger {
                         at: at.saturating_add(1),
                     },
                 };
-                if open.waits() {
-                    self.inbox.push(call);
-                }
             }
             _ => {}
         }
@@ -351,9 +322,6 @@ impl Ledger {
         };
         if may && matches!(open.call, Call::Tool { .. }) {
             open.phase = Phase::Waiting(on.clone());
-            if *on == WaitOn::Approval {
-                self.inbox.push(call);
-            }
         }
     }
 
@@ -379,7 +347,6 @@ impl Ledger {
                 Phase::Settled(OutcomeKind::Failed)
             };
         }
-        self.inbox.retain(|&c| c != call);
     }
 
     fn author(&mut self, origin: Option<Author>) {
@@ -407,21 +374,13 @@ impl Ledger {
         self.open.get(seq)
     }
 
-    /// The tool calls waiting for an approval, in the order they began to.
-    pub fn inbox(&self) -> &[u64] {
-        &self.inbox
-    }
-
-    /// The tool and input of call `call`, while it waits in the inbox.
-    pub fn asked(&self, call: u64) -> Option<(&str, &Json)> {
-        match self.open.get(call) {
-            Some(Open {
-                call: Call::Tool { tool, input, .. },
-                phase: Phase::Waiting(WaitOn::Approval),
-                ..
-            }) => Some((tool, input)),
-            _ => None,
-        }
+    /// The tool calls waiting for an approval, by seq: the session's
+    /// inbox.
+    pub fn inbox(&self) -> impl Iterator<Item = u64> + '_ {
+        self.open
+            .iter()
+            .filter(|(_, open)| open.phase == Phase::Waiting(WaitOn::Approval))
+            .map(|(seq, _)| seq)
     }
 
     pub fn untaken(&self) -> &VecDeque<Queued> {
@@ -493,31 +452,7 @@ impl Ledger {
 
     /// The seq of the current turn's input; 0 before the first.
     pub const fn turn_start(&self) -> u64 {
-        self.turn.start
-    }
-
-    /// The current turn's input.
-    pub fn prompt(&self) -> Option<&str> {
-        self.turn.prompt.as_deref()
-    }
-
-    /// The tools the current turn called, in order.
-    pub fn turn_tools(&self) -> &[String] {
-        &self.turn.tools
-    }
-
-    /// How many of the current turn's calls did not finish well.
-    pub const fn turn_failed(&self) -> u32 {
-        self.turn.failed
-    }
-
-    /// How many of the current turn's calls are open and not waiting.
-    pub fn turn_running(&self) -> u32 {
-        let running = self
-            .open_calls()
-            .filter(|&(seq, open)| seq > self.turn.start && !open.waits())
-            .count();
-        u32::try_from(running).unwrap_or(u32::MAX)
+        self.turn
     }
 
     /// What the session is doing, as its log says: what waits on someone
@@ -556,26 +491,11 @@ impl Open {
         )
     }
 
-    /// It waits on someone: not on a child, whose work is the call's.
-    fn waits(&self) -> bool {
-        matches!(&self.phase, Phase::Waiting(on) if !matches!(on, WaitOn::Child { .. }))
-    }
-
     /// It is seen running: a process or progress of a gated call says its
     /// gate let it through.
     fn ran(&mut self) {
         if let Phase::Gating { .. } = self.phase {
             self.phase = Phase::Running;
-        }
-    }
-}
-
-impl Turn {
-    fn start(seq: u64, text: &str) -> Self {
-        Self {
-            start: seq,
-            prompt: Some(text.to_owned()),
-            ..Self::default()
         }
     }
 }

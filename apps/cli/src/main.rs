@@ -521,8 +521,8 @@ fn added(item: &Item) {
     }
 }
 
-/// An outcome as its tool's card presents it, else a command's streams as
-/// older logs hold them, text as lines, and anything else as JSON.
+/// An outcome as its tool's card presents it, else text as lines and
+/// anything else as JSON.
 fn print_outcome(outcome: &Outcome, card: Option<&Card>) {
     match outcome {
         Outcome::Done { output } => {

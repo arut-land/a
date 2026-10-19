@@ -65,7 +65,7 @@ func aLiveSessionChatsRunsAnApprovedToolAndIsListed() async throws {
     try await eventually("the replay and recap") {
         other.link == .live && other.seq == store.seq && other.recap != nil
     }
-    #expect(other.items == store.items.map(unasked))
+    #expect(other.items == store.items)
     // The recap reads as the Rust clients print it.
     #expect(other.recap?.line.hasPrefix("recap · you: $ echo hello · ran bash") == true)
 
@@ -91,13 +91,4 @@ func aLiveSessionChatsRunsAnApprovedToolAndIsListed() async throws {
         list.sessions.contains { $0.id == id && $0.clients == 0 }
     }
     following.cancel()
-}
-
-/// `item` as a client that was not asked sees it.
-func unasked(_ item: ViewItem) -> ViewItem {
-    guard case .tool(let call, let tool, let input, let title, let approval, let outcome, let card, let phase) = item
-    else { return item }
-    return .tool(
-        call: call, tool: tool, inputJson: input, title: title, approval: approval, outcome: outcome,
-        card: card, phase: phase == .asking ? .waiting : phase)
 }

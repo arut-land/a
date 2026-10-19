@@ -27,9 +27,9 @@ pub enum Input {
         call: CallId,
         outcome: Outcome,
     },
-    /// Watch `watch` fired: the child it watched settled with `outcome`.
-    /// Only a log an earlier build wrote has watches an agent asked for;
-    /// children are a tool's now.
+    /// Watch `watch` fired: the session it watched settled with `outcome`.
+    /// Only a watch on a session the agent did not link comes here: a
+    /// linked child's result is its tool call's.
     ChildDone {
         watch: Seq,
         outcome: Outcome,

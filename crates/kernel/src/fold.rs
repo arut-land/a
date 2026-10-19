@@ -208,8 +208,8 @@ impl Fold {
     }
 
     /// The entry just folded carries out what was asked for next, if it
-    /// matches: else the log disagrees with the agent (an earlier version
-    /// wrote it), and nothing is left to redo.
+    /// matches: else the log disagrees with the agent, and nothing is left
+    /// to redo.
     fn carried(&mut self, matches: impl FnOnce(&Next) -> bool) {
         if self.asked.front().is_some_and(matches) {
             self.asked.pop_front();

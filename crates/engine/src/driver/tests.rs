@@ -68,7 +68,7 @@ fn decision(by: &str, call: Option<u64>, d: Verdict) -> Body {
 
 /// The calls asked about and not yet answered.
 fn inbox(entries: &[Entry]) -> Vec<u64> {
-    protocol::ledger::Ledger::of(entries).inbox().to_vec()
+    protocol::ledger::Ledger::of(entries).inbox().collect()
 }
 
 /// The conversation before `before`, as `registry`'s tools present it.
