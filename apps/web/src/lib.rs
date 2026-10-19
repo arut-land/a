@@ -8,7 +8,7 @@ mod http;
 mod style;
 mod view;
 
-use std::io;
+use std::io::{self, Write};
 use std::net::TcpListener;
 use std::process::{Command, Stdio};
 use std::sync::Arc;
@@ -36,8 +36,16 @@ pub fn run(daemon: Daemon, open: bool) -> io::Result<()> {
     let rt: Rt = Arc::new(rt::Threads::default());
     let router = app::router(daemon, Arc::clone(&rt));
 
-    println!("a web: {link}");
-    println!("[the link works once; stop with Ctrl-C, sessions keep running]");
+    // Whoever reads the link may stop reading (`a web | head -1`): the
+    // server keeps going without its stdout.
+    let mut out = io::stdout().lock();
+    let _ = writeln!(out, "a web: {link}").and_then(|()| {
+        writeln!(
+            out,
+            "[the link works once; stop with Ctrl-C, sessions keep running]"
+        )
+    });
+    drop(out);
     if open && let Err(e) = open_browser(&link) {
         eprintln!("[could not open a browser: {e}; open the link above]");
     }

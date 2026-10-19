@@ -1,5 +1,6 @@
 use std::io::{self, BufRead, IsTerminal, Write};
 use std::process::ExitCode;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, PoisonError};
 use std::thread;
 
@@ -264,6 +265,10 @@ fn repl(ctx: Ctx, target: Target) -> io::Result<()> {
     let remote = remote.is_some();
     let writer = Arc::new(Mutex::new(writer));
     let swap = Arc::clone(&writer);
+    // Set before the detach goes out: the daemon closing the connection
+    // then is the answer, not a lost daemon.
+    let detaching = Arc::new(AtomicBool::new(false));
+    let detached = Arc::clone(&detaching);
     // Shared with the input loop, which answers the first call asked.
     let view = Arc::new(Mutex::new(SessionView::default()));
     let folding = Arc::clone(&view);
@@ -283,6 +288,9 @@ fn repl(ctx: Ctx, target: Target) -> io::Result<()> {
                     view.seq,
                 )
             };
+            if detached.load(Ordering::SeqCst) {
+                return;
+            }
             let Some(session) = session else {
                 eprintln!("[daemon disconnected]");
                 std::process::exit(1);
@@ -339,6 +347,7 @@ fn repl(ctx: Ctx, target: Target) -> io::Result<()> {
             eprintln!("[not sent: {e}]");
         }
     }
+    detaching.store(true, Ordering::SeqCst);
     send(&ClientMsg::Detach)?;
     println!("[detached; the session keeps running. `a resume` to reattach]");
     Ok(())
