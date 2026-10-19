@@ -82,7 +82,7 @@ fn sent(model: &str, request: Request) -> Value {
         provider: &provider,
         model,
     };
-    let request = crate::prepare(request.clone(), &target);
+    let request = crate::prepare(&request, &target);
     provider
         .protocol
         .encode(&target, &request)

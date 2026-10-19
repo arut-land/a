@@ -56,7 +56,7 @@ type Sent = (Value, Vec<(&'static str, String)>);
 /// `request` prepared and encoded for `provider`.
 fn encoded(provider: &Provider, request: &Request) -> Result<Sent, Error> {
     let target = target(provider, &request.model);
-    let prepared = crate::prepare(request.clone(), &target);
+    let prepared = crate::prepare(request, &target);
     let encoded = provider.protocol.encode(&target, &prepared)?;
     Ok((encoded.body, encoded.headers))
 }

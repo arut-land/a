@@ -26,7 +26,7 @@ pub fn stream(http: &dyn Http, provider: &Provider, request: &Request) -> Events
         provider,
         model: &request.model,
     };
-    let request = prepare(request.clone(), &target);
+    let request = prepare(request, &target);
     let state = match provider.request(&request.model, &request) {
         Ok((http_request, framing)) => State::Sending {
             reply: http.send(http_request),

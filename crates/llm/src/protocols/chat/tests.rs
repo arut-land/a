@@ -799,7 +799,7 @@ pub(super) fn sent_to(provider: &Provider, request: &Request) -> Result<(String,
         provider,
         model: &request.model,
     };
-    let prepared = crate::prepare(request.clone(), &target);
+    let prepared = crate::prepare(request, &target);
     let (http, _) = provider.request(&request.model, &prepared)?;
     let body = serde_json::from_slice(http.body()).expect("a JSON body");
     Ok((http.uri().to_string(), body))
