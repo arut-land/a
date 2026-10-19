@@ -1521,6 +1521,12 @@ dependencies = [
 ]
 
 [[package]]
+name = "pollster"
+version = "1.0.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "bc6355899e1c9462875b6757c79f3caa011a1fdae12bbb1a2e72dd1f234f8336"
+
+[[package]]
 name = "polyval"
 version = "0.6.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1736,6 +1742,7 @@ dependencies = [
  "async-task",
  "futures-core",
  "futures-timer",
+ "pollster",
  "smol",
  "tokio",
 ]
