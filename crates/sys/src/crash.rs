@@ -213,8 +213,69 @@ fn describe(info: &PanicHookInfo<'_>, build: &str) -> String {
         std::process::id(),
         thread.name().unwrap_or("unnamed"),
         now(),
-        std::backtrace::Backtrace::force_capture()
+        stack()
     )
+}
+
+/// This thread's stack. A build with a symbolizing std names its frames.
+#[cfg(any(debug_assertions, not(unix)))]
+fn stack() -> String {
+    std::backtrace::Backtrace::force_capture().to_string()
+}
+
+/// This thread's stack, a frame a line as the image holding its return
+/// address and the offset into it, which the build's debug info names
+/// offline (`atos -o a.dSYM/... -l 0x100000000 <0x100000000 + offset>`,
+/// `addr2line -e a <offset>`). A release std carries no symbolizer, and
+/// std's [`Backtrace`](std::backtrace::Backtrace) would link its demangler
+/// for names it never resolves, and print addresses the image's load slide
+/// leaves meaningless.
+#[cfg(all(unix, not(debug_assertions)))]
+fn stack() -> String {
+    use std::ffi::{CStr, c_int, c_void};
+    use std::fmt::Write as _;
+
+    /// Frames past it are left out: a crash report is read, not replayed.
+    const DEEP: usize = 128;
+
+    unsafe extern "C" {
+        fn _Unwind_Backtrace(
+            frame: extern "C" fn(*mut c_void, *mut c_void) -> c_int,
+            ips: *mut c_void,
+        ) -> c_int;
+        fn _Unwind_GetIP(cx: *mut c_void) -> usize;
+    }
+
+    extern "C" fn frame(cx: *mut c_void, ips: *mut c_void) -> c_int {
+        // SAFETY: `ips` is the vector `stack` hands the unwinder, which
+        // calls this on the same thread while `stack` waits.
+        let ips = unsafe { &mut *ips.cast::<Vec<usize>>() };
+        // SAFETY: `cx` is the unwinder's context for the frame it is at.
+        ips.push(unsafe { _Unwind_GetIP(cx) });
+        // _URC_NO_REASON goes on; _URC_END_OF_STACK (5) stops.
+        if ips.len() < DEEP { 0 } else { 5 }
+    }
+
+    let mut ips: Vec<usize> = Vec::with_capacity(DEEP);
+    // SAFETY: `frame` only pushes to `ips`, which outlives the call.
+    unsafe { _Unwind_Backtrace(frame, (&raw mut ips).cast()) };
+    let mut out = String::new();
+    for (n, ip) in ips.into_iter().enumerate() {
+        let mut info = std::mem::MaybeUninit::<libc::Dl_info>::zeroed();
+        // SAFETY: dladdr only reads the address and fills `info`.
+        let found = unsafe { libc::dladdr(ip as *const c_void, info.as_mut_ptr()) } != 0;
+        // SAFETY: zeroed, then filled by dladdr; a null name is checked.
+        let info = unsafe { info.assume_init() };
+        let image = (found && !info.dli_fname.is_null())
+            // SAFETY: dladdr's file name is a C string the loader owns.
+            .then(|| unsafe { CStr::from_ptr(info.dli_fname) }.to_string_lossy())
+            .map(|path| path.rsplit('/').next().unwrap_or_default().to_owned());
+        let _ = match image {
+            Some(image) => writeln!(out, "{n:4}: {image} +{:#x}", ip - info.dli_fbase as usize),
+            None => writeln!(out, "{n:4}: {ip:#x}"),
+        };
+    }
+    out
 }
 
 /// Writes `text` as a new report named `<unix ms>-<pid>.txt`, keeping the
