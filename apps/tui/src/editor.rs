@@ -1,7 +1,8 @@
 //! The input: multi-line text with a cursor, readline keys, and history.
 
+use ratatui_core::style::Style;
+
 use super::keys::Key;
-use super::render::Style;
 use super::text::{Line, Span, char_width};
 
 #[derive(Default)]
@@ -226,7 +227,7 @@ impl Editor {
                 } else {
                     Span::new("  ", prompt)
                 };
-                rows.push(Line::from(vec![pad, Span::new(row.clone(), Style::PLAIN)]));
+                rows.push(Line::from(vec![pad, Span::new(row.clone(), Style::new())]));
             }
             offset += logical.len() + 1;
         }
@@ -304,12 +305,12 @@ mod tests {
     fn lines_wrap_and_place_the_cursor() {
         let mut e = Editor::default();
         typed(&mut e, "abcdef\nx");
-        let (rows, cursor) = e.lines(6, Style::PLAIN);
+        let (rows, cursor) = e.lines(6, Style::new());
         let rows: Vec<String> = rows.iter().map(Line::text).collect();
         assert_eq!(rows, ["› abcd", "  ef", "  x"]);
         assert_eq!(cursor, (3, 2));
         e.key(Key::Up);
-        let (_, cursor) = e.lines(6, Style::PLAIN);
+        let (_, cursor) = e.lines(6, Style::new());
         assert_eq!(cursor, (3, 0));
     }
 }

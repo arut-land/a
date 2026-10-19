@@ -3,7 +3,7 @@
 
 use unicode_width::UnicodeWidthChar;
 
-use super::render::{Color, Style};
+use ratatui_core::style::{Color, Style};
 
 /// What a click on a span does.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -226,7 +226,7 @@ fn push(line: &mut Line, from: &Span, text: &str) {
     }
 }
 
-pub const CODE: Style = Style::fg(Color::Cyan);
+pub const CODE: Style = Style::new().fg(Color::Cyan);
 
 /// A reply's markdown as rows: `#` headings bold, `-`/`*` bullets as `•`,
 /// `>` quotes, fenced code verbatim, and `**bold**` and `` `code` `` inline.
@@ -333,6 +333,8 @@ fn inline(text: &str, base: Style) -> Vec<Span> {
 
 #[cfg(test)]
 mod tests {
+    use ratatui_core::style::Modifier;
+
     use super::*;
 
     fn texts(lines: &[Line]) -> Vec<String> {
@@ -341,25 +343,25 @@ mod tests {
 
     #[test]
     fn wraps_at_spaces_by_display_width() {
-        let spans = [Span::new("the quick brown fox jumps", Style::PLAIN)];
+        let spans = [Span::new("the quick brown fox jumps", Style::new())];
         let lines = wrap(&spans, 10, &[], &[]);
         assert_eq!(texts(&lines), ["the quick", "brown fox", "jumps"]);
-        let lines = wrap(&[Span::new("日本語 日本語", Style::PLAIN)], 7, &[], &[]);
+        let lines = wrap(&[Span::new("日本語 日本語", Style::new())], 7, &[], &[]);
         assert_eq!(texts(&lines), ["日本語", "日本語"]);
     }
 
     #[test]
     fn breaks_words_longer_than_a_row_and_indents_the_rest() {
-        let pre = [Span::new("> ", Style::PLAIN)];
-        let pad = [Span::new("  ", Style::PLAIN)];
-        let lines = wrap(&[Span::new("abcdefghij k", Style::PLAIN)], 6, &pre, &pad);
+        let pre = [Span::new("> ", Style::new())];
+        let pad = [Span::new("  ", Style::new())];
+        let lines = wrap(&[Span::new("abcdefghij k", Style::new())], 6, &pre, &pad);
         assert_eq!(texts(&lines), ["> abcd", "  efgh", "  ij k"]);
     }
 
     #[test]
     fn keeps_styles_across_a_wrap() {
-        let bold = Style::PLAIN.bold();
-        let spans = [Span::new("aaa ", Style::PLAIN), Span::new("bbb ccc", bold)];
+        let bold = Style::new().bold();
+        let spans = [Span::new("aaa ", Style::new()), Span::new("bbb ccc", bold)];
         let lines = wrap(&spans, 7, &[], &[]);
         assert_eq!(texts(&lines), ["aaa bbb", "ccc"]);
         assert_eq!(lines[1].spans[0].style, bold);
@@ -370,19 +372,24 @@ mod tests {
         let lines = markdown(
             "# Title\n- one **two** `x`\n```\nfn a()\n```",
             40,
-            Style::PLAIN,
+            Style::new(),
         );
         assert_eq!(
             texts(&lines),
             ["  Title", "  • one two x", "  ```", "  fn a()", "  ```"]
         );
-        assert!(lines[0].spans.iter().any(|s| s.style.bold));
+        assert!(
+            lines[0]
+                .spans
+                .iter()
+                .any(|s| s.style.add_modifier.contains(Modifier::BOLD))
+        );
         let two = lines[1]
             .spans
             .iter()
             .find(|s| s.text.contains("two"))
             .unwrap();
-        assert!(two.style.bold);
+        assert!(two.style.add_modifier.contains(Modifier::BOLD));
         let x = lines[1].spans.iter().find(|s| s.text == "x").unwrap();
         assert_eq!(x.style, CODE);
     }

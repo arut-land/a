@@ -66,6 +66,7 @@ impl Env {
         let master = File::from(master);
         let output = Arc::new(Mutex::new(Output::default()));
         let (mut reader, sink) = (master.try_clone().unwrap(), Arc::clone(&output));
+        let mut answer = master.try_clone().unwrap();
         std::thread::spawn(move || {
             let mut buf = [0; 8192];
             // EIO once the child and every copy of the slave are gone.
@@ -74,6 +75,11 @@ impl Env {
                 out.bytes.extend_from_slice(&buf[..n]);
                 if out.first_frame.is_none() && contains(&out.bytes, b"\x1b[?2026l") {
                     out.first_frame = Some(Instant::now());
+                }
+                // A cursor position request, as a terminal answers it.
+                if contains(&buf[..n], b"\x1b[6n") {
+                    let (x, y) = Screen::parse(&out.bytes, cols, rows).cursor;
+                    let _ = write!(answer, "\x1b[{};{}R", y + 1, x + 1);
                 }
             }
         });
@@ -166,6 +172,7 @@ pub struct Screen {
     rows: Vec<Vec<char>>,
     /// Rows scrolled off the top, oldest first.
     pub scrollback: Vec<String>,
+    cursor: (usize, usize),
 }
 
 impl Screen {
@@ -174,6 +181,7 @@ impl Screen {
         let mut screen = Self {
             rows: vec![vec![' '; width]; height],
             scrollback: Vec::new(),
+            cursor: (0, 0),
         };
         let (mut x, mut y) = (0usize, 0usize);
         let text = String::from_utf8_lossy(bytes);
@@ -257,6 +265,7 @@ impl Screen {
                 }
             }
         }
+        screen.cursor = (x.min(width - 1), y);
         screen
     }
 

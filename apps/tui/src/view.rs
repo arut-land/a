@@ -4,19 +4,21 @@ use protocol::Outcome;
 use protocol::view::{Approval, Item, Status, call_title, decision_line, output_text};
 use serde_json::Value;
 
-use super::render::{Color, Style, ellipsize};
+use ratatui_core::style::{Color, Modifier, Style};
+
+use super::render::ellipsize;
 use super::text::{Action, Line, Span, markdown, sanitize, wrap};
 
 /// How much of a card's output shows unless everything is expanded.
 const TAIL: usize = 10;
 
-pub const MUTED: Style = Style::fg(Color::Gray);
-pub const USER: Style = Style::fg(Color::Magenta).bold();
-const OK: Style = Style::fg(Color::Green);
-const BAD: Style = Style::fg(Color::Red);
-const WARN: Style = Style::fg(Color::Yellow);
-const BUSY: Style = Style::fg(Color::Blue);
-pub const ASK: Style = Style::fg(Color::Yellow).bold();
+pub const MUTED: Style = Style::new().fg(Color::DarkGray);
+pub const USER: Style = Style::new().fg(Color::Magenta).add_modifier(Modifier::BOLD);
+const OK: Style = Style::new().fg(Color::Green);
+const BAD: Style = Style::new().fg(Color::Red);
+const WARN: Style = Style::new().fg(Color::Yellow);
+const BUSY: Style = Style::new().fg(Color::Blue);
+pub const ASK: Style = Style::new().fg(Color::Yellow).add_modifier(Modifier::BOLD);
 
 /// How an item is shown.
 #[derive(Clone, Copy, Debug, Default)]
@@ -46,14 +48,14 @@ pub fn rows(item: &Item, width: usize, look: Look) -> Vec<Line> {
             let mut out = vec![blank];
             for (n, line) in sanitize(text).split('\n').enumerate() {
                 let first = Span::new(if n == 0 { "› " } else { "  " }, USER);
-                let body = [Span::new(line, Style::PLAIN.bold())];
+                let body = [Span::new(line, Style::new().bold())];
                 out.extend(wrap(&body, width, &[first], &[Span::new("  ", USER)]));
             }
             out
         }
         Item::Assistant { text, .. } => {
             let mut out = vec![blank];
-            out.extend(markdown(text, width, Style::PLAIN));
+            out.extend(markdown(text, width, Style::new()));
             out
         }
         Item::Reply {
@@ -118,7 +120,7 @@ pub fn rows(item: &Item, width: usize, look: Look) -> Vec<Line> {
         } => {
             let mut head = vec![
                 Span::new("⑂ ", BUSY),
-                Span::new(format!("child {} ", child.short()), Style::PLAIN.bold()),
+                Span::new(format!("child {} ", child.short()), Style::new().bold()),
             ];
             head.push(match fired {
                 None => Span::new("running…", BUSY),
@@ -151,14 +153,14 @@ fn reply(
     let mut out = vec![Line::default()];
     match (status, streaming) {
         (Status::Running, Some(live)) => {
-            out.extend(markdown(live, width, Style::PLAIN));
+            out.extend(markdown(live, width, Style::new()));
             if let Some(last) = out.last_mut() {
                 last.spans.push(Span::new("▍", MUTED));
             }
         }
         (Status::Running, None) => out.push(Line::plain(format!("  … {model}"), MUTED)),
         (Status::Done, _) if text.is_empty() => return Vec::new(),
-        (Status::Done, _) => out.extend(markdown(text, width, Style::PLAIN)),
+        (Status::Done, _) => out.extend(markdown(text, width, Style::new())),
         (Status::Failed { error }, _) => {
             let body = [Span::new(
                 format!("✗ model failed: {}", sanitize(error)),
@@ -224,10 +226,10 @@ fn card(c: &Card, width: usize, look: Look) -> Vec<Line> {
             Span::button(marker, MUTED, toggle),
             Span::button(
                 ellipsize(&sanitize(&c.title).replace('\n', " "), room),
-                Style::PLAIN.bold(),
+                Style::new().bold(),
                 toggle,
             ),
-            Span::button("  ", Style::PLAIN, toggle),
+            Span::button("  ", Style::new(), toggle),
             Span::button(status, style, toggle),
         ]),
     ];
@@ -255,7 +257,7 @@ fn card(c: &Card, width: usize, look: Look) -> Vec<Line> {
             Line::from(vec![
                 Span::new("  allow this call?  ", ASK),
                 Span::button("[ y  yes ]", OK.bold(), Action::Approve(c.call, true)),
-                Span::new("  ", Style::PLAIN),
+                Span::new("  ", Style::new()),
                 Span::button("[ n  no ]", BAD.bold(), Action::Approve(c.call, false)),
             ])
         } else {
@@ -281,7 +283,7 @@ fn output_rows(c: &Card, width: usize, verbose: bool) -> Vec<Line> {
     let mut add = |text: &str, style: Style, diff: bool| {
         for line in sanitize(text).split('\n') {
             let style = match line.as_bytes().first() {
-                Some(b'@') if diff => Style::fg(Color::Cyan),
+                Some(b'@') if diff => Style::new().fg(Color::Cyan),
                 Some(b'+') if diff => OK,
                 Some(b'-') if diff => BAD,
                 _ => style,
@@ -297,7 +299,7 @@ fn output_rows(c: &Card, width: usize, verbose: bool) -> Vec<Line> {
             Some((text, _)) => {
                 let text = text.strip_suffix('\n').unwrap_or(&text);
                 if !text.is_empty() {
-                    add(text, Style::PLAIN, text.starts_with("@@ "));
+                    add(text, Style::new(), text.starts_with("@@ "));
                 }
             }
             None if output.is_null() => {}
@@ -305,13 +307,13 @@ fn output_rows(c: &Card, width: usize, verbose: bool) -> Vec<Line> {
                 let text = output
                     .as_str()
                     .map_or_else(|| output.to_string(), str::to_owned);
-                add(&text, Style::PLAIN, false);
+                add(&text, Style::new(), false);
             }
         },
         Some(Outcome::Failed { error }) => add(error, BAD, false),
         Some(Outcome::Interrupted { output }) => {
             if let Some(text) = output.as_deref().map(|t| t.trim_end_matches('\n')) {
-                add(text, Style::PLAIN, false);
+                add(text, Style::new(), false);
             }
             add("stopped before it finished", WARN, false);
         }
