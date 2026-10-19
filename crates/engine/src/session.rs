@@ -25,7 +25,7 @@ use serde_json::{Value, json};
 use store::{Header, Loaded, Log, LogStore, Parent};
 
 use crate::model::{Model, Models};
-use crate::outbox::Outbox;
+use crate::outbox::{FrameLog, Outbox};
 use crate::{Daemon, lock};
 
 mod facts;
@@ -70,6 +70,9 @@ pub struct Session {
     /// The registry generation the current step runs on.
     step: Mutex<Arc<Registry>>,
     state: Mutex<State>,
+    /// The committed entries, encoded once for every client; they commit
+    /// under `state`'s lock.
+    frames: Arc<FrameLog>,
     /// The appender; only the job draining `queue` writes to it.
     log: Mutex<Box<dyn Log>>,
     /// Entries waiting to be committed, in order.
@@ -119,12 +122,15 @@ struct State {
     entries: Vec<Entry>,
     /// What the entries say, folded as each commits.
     ledger: Ledger,
+    /// The clients following the session.
     clients: Vec<Outbox>,
+    /// The last snapshot made, and the seq it is at.
+    snapshot: Option<(u64, Frame)>,
 }
 
 /// How many entries behind a client must be to get a snapshot rather than
 /// a replay, when it takes them.
-const SNAPSHOT_GAP: usize = 256;
+const SNAPSHOT_GAP: u64 = 256;
 
 /// Entries recorded and not yet committed. While `draining`, one blocking
 /// job commits them in batches, so log writes and their fsyncs stay off the
@@ -213,6 +219,10 @@ impl Session {
         let fresh = loaded.entries.is_empty();
         let env = env.or_else(|| ledger.env().cloned());
         let seq = loaded.entries.len() as u64;
+        let frames = FrameLog::default();
+        for e in &loaded.entries {
+            frames.push(Frame::entry(e).ok());
+        }
         let mut states = registry.states();
         states.replay(&loaded.entries);
         let session = Arc::new_cyclic(|this| Self {
@@ -226,7 +236,9 @@ impl Session {
                 entries: loaded.entries,
                 ledger,
                 clients: Vec::new(),
+                snapshot: None,
             }),
+            frames: Arc::new(frames),
             log: Mutex::new(loaded.log),
             queue: Mutex::new(Queue {
                 next: seq,
@@ -404,66 +416,62 @@ impl Session {
     }
 
     /// Attaches `client`, which has the entries up to `since`: it is sent
-    /// what it missed, then everything live.
+    /// the attach, what it missed (or a snapshot, if it is far behind and
+    /// takes them) and its end, a recap and the asks still waiting, then
+    /// everything live. What it missed is read from the shared frame log as
+    /// it writes, so attaching copies nothing.
     pub fn attach(&self, client: &Outbox, since: u64) {
         let mut st = self.lock();
-        let frames = self.catch_up_frames(&st, client, since, true);
-        let follower = client.follow(self.this.clone(), since, frames);
-        st.clients.push(follower);
-    }
-
-    /// Catches up `client`, which fell behind after entry `since` while it
-    /// followed this session as its `following`th.
-    pub fn catch_up(&self, client: &Outbox, following: u64, since: u64) {
-        let st = self.lock();
-        let frames = self.catch_up_frames(&st, client, since, false);
-        client.caught_up(following, frames);
-    }
-
-    /// What a client that has the entries up to `since` is missing: the
-    /// attach, a replay (or a snapshot, for one far behind that takes them)
-    /// and its end, optionally a recap, and the asks still waiting.
-    fn catch_up_frames(
-        &self,
-        st: &State,
-        client: &Outbox,
-        since: u64,
-        with_recap: bool,
-    ) -> Vec<Frame> {
-        let mut frames: Vec<Frame> = Frame::new(&DaemonMsg::Attached {
-            session: self.id,
-            workspace: self.workspace.clone(),
-        })
-        .into_iter()
-        .collect();
-        let entries = &st.entries;
-        let missed = entries.iter().filter(|e| e.seq > since);
-        let snapshot = (client.caps().has(Cap::Snapshot) && missed.clone().count() > SNAPSHOT_GAP)
-            .then(|| {
-                let view = SessionView::from_log(self.id, self.workspace.clone(), entries);
-                Frame::new(&DaemonMsg::Snapshot(Box::new(view)))
-            });
-        match snapshot {
-            // One too large for a frame is replayed instead.
-            Some(Ok(frame)) => frames.push(frame),
-            _ => frames.extend(missed.filter_map(|e| Frame::entry(e).ok())),
-        }
-        let mut push = |msg: &DaemonMsg| frames.extend(Frame::new(msg));
-        let seq = entries.last().map_or(0, |e| e.seq);
+        let seq = self.frames.seq();
+        let far = client.caps().has(Cap::Snapshot) && seq.saturating_sub(since) > SNAPSHOT_GAP;
+        let snapshot = far.then(|| self.snapshot(&mut st, seq)).flatten();
+        let cursor = if snapshot.is_some() {
+            seq
+        } else {
+            since.min(seq)
+        };
+        let mut frames = Vec::new();
+        let mut push = |after: u64, msg: &DaemonMsg| {
+            frames.extend(Frame::new(msg).ok().map(|frame| (after, frame)));
+        };
+        push(
+            cursor,
+            &DaemonMsg::Attached {
+                session: self.id,
+                workspace: self.workspace.clone(),
+            },
+        );
+        frames.extend(snapshot.map(|frame| (seq, frame)));
+        let mut push = |msg: &DaemonMsg| frames.extend(Frame::new(msg).ok().map(|f| (seq, f)));
         push(&DaemonMsg::Synced { seq });
-        if with_recap {
-            let after = entries.partition_point(|e| e.seq <= st.ledger.turn_start());
-            let reply = facts::reply(&entries[after..]);
-            if let Some(recap) = recap(&st.ledger, reply.as_deref(), since) {
-                push(&DaemonMsg::Recap(recap));
-            }
+        let entries = &st.entries;
+        let after = entries.partition_point(|e| e.seq <= st.ledger.turn_start());
+        let reply = facts::reply(&entries[after..]);
+        if let Some(recap) = recap(&st.ledger, reply.as_deref(), since) {
+            push(&DaemonMsg::Recap(recap));
         }
         for &call in st.ledger.inbox() {
             if let Some(msg) = ask(&st.ledger, call) {
                 push(&msg);
             }
         }
-        frames
+        let follower = client.follow(Arc::clone(&self.frames), cursor, frames);
+        st.clients.push(follower);
+    }
+
+    /// The snapshot of the session at entry `seq`, the last committed,
+    /// made once for every client attaching then; `None` if too large for
+    /// a frame, so that it is replayed instead.
+    fn snapshot(&self, st: &mut State, seq: u64) -> Option<Frame> {
+        if let Some((at, frame)) = &st.snapshot
+            && *at == seq
+        {
+            return Some(frame.clone());
+        }
+        let view = SessionView::from_log(self.id, self.workspace.clone(), &st.entries);
+        let frame = Frame::new(&DaemonMsg::Snapshot(Box::new(view))).ok()?;
+        st.snapshot = Some((seq, frame.clone()));
+        Some(frame)
     }
 
     /// Runs commands from now on in `env`, the newest client's. Its redacted
@@ -612,32 +620,30 @@ impl Session {
     /// Writes `batch` durably, then shows it. Only [`Session::drain`] calls
     /// it, so entries commit in order.
     fn commit(&self, batch: &mut Vec<Entry>) -> io::Result<()> {
-        lock(&self.log).append_all(batch)?;
+        let frames: Vec<Option<Frame>> = batch.iter().map(|e| Frame::entry(e).ok()).collect();
+        match frames.iter().cloned().collect::<Option<Vec<Frame>>>() {
+            Some(all) => lock(&self.log).append_framed(batch, &all)?,
+            None => lock(&self.log).append_all(batch)?,
+        }
         let registry = self.registry();
         let hooks = registry.hooks();
         let mut st = self.lock();
-        for entry in batch.drain(..) {
-            debug_assert_eq!(entry.seq, st.entries.len() as u64 + 1);
-            // An entry too large for a frame ends every client's view
-            // rather than leaving a gap in it.
-            match Frame::entry(&entry) {
-                Ok(frame) => st.clients.retain(|c| c.send(frame.clone()).is_ok()),
-                Err(_) => st.clients.clear(),
-            }
+        for (entry, frame) in batch.drain(..).zip(frames) {
+            debug_assert_eq!(entry.seq, self.frames.seq() + 1);
+            self.frames.push(frame);
             hooks.observe(&entry);
             st.ledger.apply(&entry);
-            let asked = match entry.body {
-                Body::Ask { call } => Some(call),
-                _ => None,
-            };
-            st.entries.push(entry);
             // Under the same lock as the entry, so a client attaching
             // meanwhile gets the ask exactly once.
-            let msg = asked.and_then(|call| ask(&st.ledger, call));
-            if let Some(Ok(frame)) = msg.as_ref().map(Frame::new) {
-                st.clients.retain(|c| c.send(frame.clone()).is_ok());
+            if let Body::Ask { call } = entry.body
+                && let Some(Ok(frame)) = ask(&st.ledger, call).as_ref().map(Frame::new)
+            {
+                st.clients
+                    .retain(|c| c.send_after(entry.seq, frame.clone()).is_ok());
             }
+            st.entries.push(entry);
         }
+        st.clients.retain(|c| c.wake().is_ok());
         #[cfg(test)]
         oracle::check(&st.entries, &st.ledger);
         Ok(())
@@ -675,9 +681,10 @@ impl Session {
     /// Sends a message that is not part of the log to every attached client.
     fn broadcast(&self, msg: &DaemonMsg) {
         if let Ok(frame) = Frame::new(msg) {
-            self.lock()
-                .clients
-                .retain(|c| c.send(frame.clone()).is_ok());
+            let mut st = self.lock();
+            let after = self.frames.seq();
+            st.clients
+                .retain(|c| c.send_after(after, frame.clone()).is_ok());
         }
     }
 

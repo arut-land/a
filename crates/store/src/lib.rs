@@ -12,7 +12,7 @@ mod tests;
 use std::io;
 use std::path::PathBuf;
 
-use protocol::{Body, Entry, Installed, SessionId};
+use protocol::{Body, Entry, Frame, Installed, SessionId};
 use serde::{Deserialize, Serialize};
 
 pub use jsonl::Jsonl;
@@ -106,6 +106,14 @@ pub trait Log: Send {
     /// may make them durable together. After a crash the log holds a prefix
     /// of them.
     fn append_all(&mut self, entries: &[Entry]) -> io::Result<()>;
+
+    /// [`Log::append_all`], given each entry's frame, which holds the line
+    /// a log of lines stores: an entry is encoded once, for its log and
+    /// every client.
+    fn append_framed(&mut self, entries: &[Entry], frames: &[Frame]) -> io::Result<()> {
+        debug_assert_eq!(entries.len(), frames.len());
+        self.append_all(entries)
+    }
 }
 
 fn not_found(id: SessionId) -> io::Error {

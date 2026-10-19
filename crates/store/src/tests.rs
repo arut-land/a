@@ -8,7 +8,7 @@ use std::path::PathBuf;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::thread;
 
-use protocol::{Body, Entry, SessionId};
+use protocol::{Body, Entry, Frame, SessionId};
 
 use super::*;
 
@@ -76,6 +76,7 @@ macro_rules! conformance {
             round_trip,
             appends_keep_their_order_across_reopens,
             batches_append_in_order,
+            framed_batches_append_as_their_frames_hold,
             headers_list_sessions_oldest_first,
             counts_follow_appends,
             busy_markers_set_clear_and_repeat,
@@ -157,6 +158,30 @@ fn batches_append_in_order(store: &dyn LogStore) {
     written.extend(append(&mut log, 7..=7));
     assert_eq!(store.load(h.id).unwrap().entries, written);
     assert_eq!(store.count(h.id).unwrap(), 7);
+}
+
+fn framed_batches_append_as_their_frames_hold(store: &dyn LogStore) {
+    let (encoded, plain) = (header("/w"), header("/w"));
+    let mut log = store.create(&encoded).unwrap();
+    let batch: Vec<Entry> = (1..=3).map(|seq| entry(seq, log.epoch)).collect();
+    let frames: Vec<Frame> = batch.iter().map(|e| Frame::entry(e).unwrap()).collect();
+    log.log.append_framed(&batch, &frames).unwrap();
+    store
+        .create(&plain)
+        .unwrap()
+        .log
+        .append_all(&batch)
+        .unwrap();
+    assert_eq!(store.load(encoded.id).unwrap().entries, batch);
+    assert_eq!(
+        store.entries(encoded.id).unwrap(),
+        store.entries(plain.id).unwrap()
+    );
+    let stale: Vec<Entry> = (4..=4).map(|seq| entry(seq, log.epoch)).collect();
+    let stale_frames: Vec<Frame> = stale.iter().map(|e| Frame::entry(e).unwrap()).collect();
+    drop(store.load(encoded.id).unwrap());
+    let refused = log.log.append_framed(&stale, &stale_frames).unwrap_err();
+    assert_eq!(refused.kind(), ErrorKind::ResourceBusy);
 }
 
 fn headers_list_sessions_oldest_first(store: &dyn LogStore) {

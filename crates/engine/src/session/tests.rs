@@ -836,9 +836,7 @@ fn an_ask_waits_in_the_inbox_through_a_stop_and_runs_once_approved() {
     let log = finished(&resumed, 3);
     resumed.stop();
 
-    let sent: Vec<DaemonMsg> = outbox
-        .take()
-        .into_iter()
+    let sent: Vec<DaemonMsg> = std::iter::from_fn(|| outbox.try_next())
         .map(|frame: Frame| {
             protocol::read_frame(&mut frame.as_bytes())
                 .unwrap()
@@ -1803,3 +1801,37 @@ fn input_taken_in_during_recovery_runs_once() {
     }
 }
 mod interrupt;
+
+#[test]
+fn clients_attaching_at_one_seq_share_one_snapshot_and_the_log_frames() {
+    let fixture = Fixture::new(
+        agent::Kind::Echo,
+        Registry::default(),
+        openai(&Script::new(&[])),
+    );
+    let turns: Vec<Entry> = (1..=300)
+        .map(|seq| {
+            let text = format!("m{seq}");
+            let body = if seq % 2 == 1 {
+                Body::User { text }
+            } else {
+                Body::Assistant { text }
+            };
+            entry(seq, body)
+        })
+        .collect();
+    let session = fixture.start(&turns);
+    let sent = |caps| {
+        let outbox = Outbox::new(caps);
+        session.attach(&outbox, 0);
+        std::iter::from_fn(|| outbox.try_next()).collect::<Vec<Frame>>()
+    };
+    let shared = |a: &Frame, b: &Frame| std::ptr::eq(a.as_bytes(), b.as_bytes());
+    let (first, second) = (sent(Caps::ALL), sent(Caps::ALL));
+    assert_eq!(first.len(), 4, "attached, snapshot, synced, recap");
+    assert!(shared(&first[1], &second[1]), "one snapshot for both");
+    let (first, second) = (sent(Caps::NONE), sent(Caps::NONE));
+    session.stop();
+    assert_eq!(first.len(), 303);
+    assert!(shared(&first[1], &second[1]), "one frame of each entry");
+}

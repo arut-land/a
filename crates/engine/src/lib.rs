@@ -18,7 +18,7 @@ use std::task::{Poll, Waker};
 use std::time::{Duration, Instant};
 use std::{mem, thread};
 
-use outbox::{Next, Outbox};
+use outbox::Outbox;
 use protocol::{
     Activity, Cap, Caps, ClientDecl, ClientMsg, DaemonMsg, Environment, Frame, Origin, PROTO,
     Rejection, Residency, Role, SessionId, SessionSummary, Target, Versions, read_frame,
@@ -621,26 +621,13 @@ impl Answers {
     }
 }
 
-/// Writes what `outbox` hands out until it closes, catching the client up
-/// when it falls behind.
+/// Writes what `outbox` hands out until it closes.
 #[cfg(unix)]
 fn write_out(mut conn: UnixStream, outbox: &Outbox) {
-    while let Some(next) = outbox.next() {
-        match next {
-            Next::Write(frame) => {
-                if conn.write_all(frame.as_bytes()).is_err() {
-                    outbox.abandon();
-                    return;
-                }
-            }
-            Next::CatchUp {
-                session,
-                following,
-                since,
-            } => match session.upgrade() {
-                Some(session) => session.catch_up(outbox, following, since),
-                None => outbox.unfollow(),
-            },
+    while let Some(frame) = outbox.next() {
+        if conn.write_all(frame.as_bytes()).is_err() {
+            outbox.abandon();
+            return;
         }
     }
 }

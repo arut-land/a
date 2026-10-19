@@ -659,6 +659,25 @@ fn this_build_reads_the_whole_corpus() {
     }
 }
 
+/// An entry's frame holds its log line, and decodes back to the entry: a
+/// daemon stores, sends and reads again the one encoding.
+#[test]
+fn an_entry_frame_is_its_log_line_tagged() {
+    for sample in daemon_samples() {
+        let DaemonMsg::Entry(entry) = &sample.msg else {
+            continue;
+        };
+        let frame = protocol::Frame::entry(entry).unwrap();
+        let mut line = Vec::new();
+        frame.line_into(&mut line);
+        let mut encoded = Vec::new();
+        entry.encode(&mut encoded).unwrap();
+        encoded.push(b'\n');
+        assert_eq!(line, encoded, "{}", sample.name);
+        assert_eq!(&Entry::from_json(&frame.as_bytes()[4..]).unwrap(), entry);
+    }
+}
+
 /// Ungated messages the first daemons cannot read, which no client may
 /// send until a capability gates them: those daemons drop a connection on
 /// a message they cannot decode. None now; `steer` waits for

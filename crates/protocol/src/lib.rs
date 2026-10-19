@@ -1071,7 +1071,7 @@ fn prefix(bytes: &mut [u8]) -> io::Result<()> {
 /// cloning it shares the bytes.
 #[derive(Clone, Debug)]
 pub struct Frame {
-    bytes: Arc<Vec<u8>>,
+    bytes: Arc<[u8]>,
     /// The entry's seq, for an entry.
     pub seq: Option<u64>,
     pub class: Class,
@@ -1106,7 +1106,7 @@ impl Frame {
     fn finish(mut bytes: Vec<u8>, seq: Option<u64>, class: Class) -> io::Result<Self> {
         prefix(&mut bytes)?;
         Ok(Self {
-            bytes: Arc::new(bytes),
+            bytes: Arc::from(bytes),
             seq,
             class,
         })
@@ -1114,6 +1114,16 @@ impl Frame {
 
     pub fn as_bytes(&self) -> &[u8] {
         &self.bytes
+    }
+
+    /// An entry's frame as the line a log stores, appended to `out`: the
+    /// entry's JSON without the tag, and a newline.
+    pub fn line_into(&self, out: &mut Vec<u8>) {
+        const TAGGED: usize = 4 + br#"{"t":"entry","#.len();
+        debug_assert!(self.seq.is_some(), "only an entry's frame is a line");
+        out.push(b'{');
+        out.extend_from_slice(&self.bytes[TAGGED..]);
+        out.push(b'\n');
     }
 }
 
