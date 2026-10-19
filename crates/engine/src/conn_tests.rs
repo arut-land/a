@@ -16,7 +16,8 @@ use protocol::{
 use sys::Home;
 
 use super::outbox::Outbox;
-use super::{Config, Daemon, Lifecycle, Owner, handle};
+use super::server::handle;
+use super::{Config, Daemon, Lifecycle, Owner};
 
 struct Fixture {
     root: PathBuf,
@@ -60,7 +61,10 @@ impl Fixture {
     fn connect(&self) -> Peer {
         let (ours, theirs) = UnixStream::pair().unwrap();
         let (daemon, life) = (Arc::clone(&self.daemon), Arc::clone(&self.life));
-        std::thread::spawn(move || handle(&daemon, &life, &theirs.into()));
+        let rt = Arc::clone(&daemon.shared.rt);
+        rt.spawn(Box::pin(async move {
+            let _ = handle(&daemon, &life, theirs.into()).await;
+        }));
         ours.set_read_timeout(Some(Duration::from_secs(10)))
             .unwrap();
         Peer {

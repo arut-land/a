@@ -114,3 +114,81 @@ fn a_job_end_is_seen_at_once() {
     assert!(took >= Duration::from_millis(3500), "{took:?}");
     assert!(took < Duration::from_millis(4600), "{took:?}");
 }
+
+/// What `rt::Threads` names its async workers.
+const WORKER: &str = "rt-worker";
+
+/// The daemon's threads but its blocking pool's, which grows and retires
+/// with blocking work rather than with clients.
+fn threads(pid: u32) -> usize {
+    thread_names(pid)
+        .iter()
+        .filter(|name| *name != BLOCKING)
+        .count()
+}
+
+/// #33: a connection is two tasks on the reactor, not two threads: a
+/// hundred clients attached cost the daemon no thread more than one.
+#[test]
+fn connections_add_no_threads() {
+    let env = Env::new("conn-threads");
+    let pid = env.start();
+    let mut first = env.connect();
+    let (id, _) = first.attach(Target::New, &env.ws);
+    first.input("hello");
+    first.until(|e| matches!(e.body, Body::Assistant { .. }));
+    let one = threads(pid);
+    let conns: Vec<_> = (0..100)
+        .map(|_| {
+            let mut conn = env.connect();
+            conn.attach(Target::Id(id), &env.ws);
+            conn
+        })
+        .collect();
+    let hundred = threads(pid);
+    eprintln!("daemon threads: {one} with 1 client, {hundred} with 101");
+    assert!(
+        thread_names(pid)
+            .iter()
+            .any(|name| name.starts_with(WORKER)),
+        "{:?}",
+        thread_names(pid)
+    );
+    assert_eq!(hundred, one, "{:?}", thread_names(pid));
+    drop(conns);
+}
+
+/// #58: nothing a connection does holds up the others: with two hundred
+/// clients connected and a hundred of them attached but never reading
+/// while a session floods them, a fresh client is served at once.
+#[test]
+fn nothing_blocks_the_reactor() {
+    let env = Env::new("no-block");
+    env.start();
+    let mut busy = env.connect();
+    let (id, _) = busy.attach(Target::New, &env.ws);
+    // Never read: their sockets fill and their writers wait.
+    let stuck: Vec<_> = (0..100)
+        .map(|_| {
+            let mut conn = env.connect();
+            conn.attach(Target::Id(id), &env.ws);
+            conn
+        })
+        .collect();
+    // Connected, saying nothing more.
+    let idle: Vec<_> = (0..100).map(|_| env.connect()).collect();
+    for n in 0..20 {
+        busy.input(&format!(
+            "$ head -c 200000 /dev/zero | tr '\\0' x; echo {n}"
+        ));
+    }
+    let started = Instant::now();
+    let mut fresh = env.connect();
+    fresh.attach(Target::New, &env.ws);
+    fresh.input("still here");
+    fresh.until(|e| matches!(e.body, Body::Assistant { .. }));
+    let took = started.elapsed();
+    eprintln!("a fresh client's turn among 200 others: {took:?}");
+    assert!(took < Duration::from_secs(2), "{took:?}");
+    drop((stuck, idle));
+}

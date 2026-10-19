@@ -1462,6 +1462,24 @@ pub fn read_frame<T: Decode>(r: &mut impl Read) -> io::Result<Option<T>> {
     }
 }
 
+/// The frame `buf` starts with, once it holds all of it: its length,
+/// prefix included, and its body. For a reader that never blocks: it reads
+/// what is there and asks again.
+pub fn frame_in(buf: &[u8]) -> io::Result<Option<(usize, &[u8])>> {
+    let Some(&[a, b, c, d]) = buf.get(..4) else {
+        return Ok(None);
+    };
+    let len = u32::from_le_bytes([a, b, c, d]);
+    if len > MAX_FRAME {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "frame too large",
+        ));
+    }
+    let end = 4 + len as usize;
+    Ok(buf.get(4..end).map(|body| (end, body)))
+}
+
 /// The body of the next frame, read once for every type and stream.
 fn read_body(r: &mut dyn Read) -> io::Result<Option<Vec<u8>>> {
     let mut len = [0; 4];

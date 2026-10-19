@@ -106,7 +106,7 @@ fn an_interrupt_mid_reply_closes_its_connection_and_keeps_the_text_so_far() {
     session.submit("hi").unwrap();
     got.recv().unwrap();
     // Interrupted once the delta reached clients, so it is the text so far.
-    while let Some(frame) = outbox.next() {
+    while let Some(frame) = rt::block_on(outbox.next()) {
         let msg = protocol::read_frame(&mut frame.as_bytes()).unwrap();
         if let Some(DaemonMsg::Delta { .. }) = msg {
             break;

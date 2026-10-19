@@ -8,7 +8,7 @@
 use std::collections::VecDeque;
 use std::io;
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{Arc, Condvar, Mutex, PoisonError};
+use std::sync::{Arc, Mutex};
 
 use crate::store::Lines;
 use protocol::{Caps, Class, Decode, Entry, Frame};
@@ -128,7 +128,8 @@ pub struct Outbox {
 
 struct Shared {
     queue: Mutex<Queue>,
-    ready: Condvar,
+    /// Notified as there may be more to write: the writer's one wake.
+    ready: rt::Notify,
     caps: Caps,
 }
 
@@ -165,7 +166,7 @@ impl Outbox {
         Self {
             shared: Arc::new(Shared {
                 queue: Mutex::default(),
-                ready: Condvar::new(),
+                ready: rt::Notify::new(),
                 caps,
             }),
             following: 0,
@@ -206,7 +207,7 @@ impl Outbox {
             q.ephemeral += len;
         }
         q.frames.push_back((after, frame));
-        self.shared.ready.notify_one();
+        self.shared.ready.notify();
         Ok(())
     }
 
@@ -216,7 +217,7 @@ impl Outbox {
         if q.closed || (self.following != 0 && self.following != q.follows) {
             return Err(Closed);
         }
-        self.shared.ready.notify_one();
+        self.shared.ready.notify();
         Ok(())
     }
 
@@ -234,7 +235,7 @@ impl Outbox {
             ahead: VecDeque::new(),
         });
         q.frames.extend(frames);
-        self.shared.ready.notify_one();
+        self.shared.ready.notify();
         Self {
             shared: Arc::clone(&self.shared),
             following: q.follows,
@@ -247,21 +248,20 @@ impl Outbox {
     }
 
     /// The next frame to write, once there is one; `None` once closed and
-    /// all written.
-    pub fn next(&self) -> Option<Frame> {
-        let mut q = self.queue();
+    /// all written. The writer waits here, a task: no thread per client.
+    pub async fn next(&self) -> Option<Frame> {
         loop {
-            if let Some(frame) = q.step() {
-                return Some(frame);
+            let mut seen = self.shared.ready.count();
+            {
+                let mut q = self.queue();
+                if let Some(frame) = q.step() {
+                    return Some(frame);
+                }
+                if q.closed {
+                    return None;
+                }
             }
-            if q.closed {
-                return None;
-            }
-            q = self
-                .shared
-                .ready
-                .wait(q)
-                .unwrap_or_else(PoisonError::into_inner);
+            self.shared.ready.changed(&mut seen).await;
         }
     }
 
@@ -274,7 +274,7 @@ impl Outbox {
     /// now on.
     pub fn close(&self) {
         self.queue().closed = true;
-        self.shared.ready.notify_all();
+        self.shared.ready.notify();
     }
 
     /// Ends the connection now, dropping what is queued: the writer failed.
@@ -284,7 +284,7 @@ impl Outbox {
         q.follow = None;
         q.frames.clear();
         q.ephemeral = 0;
-        self.shared.ready.notify_all();
+        self.shared.ready.notify();
     }
 }
 
@@ -463,7 +463,7 @@ mod tests {
         outbox.send(delta()).unwrap();
         outbox.close();
         assert!(outbox.send(entry(1, "a")).is_err());
-        assert!(outbox.next().is_some());
-        assert!(outbox.next().is_none());
+        assert!(rt::block_on(outbox.next()).is_some());
+        assert!(rt::block_on(outbox.next()).is_none());
     }
 }

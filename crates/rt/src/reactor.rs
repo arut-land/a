@@ -213,6 +213,14 @@ mod iocp {
         pub async fn writable(&self) {
             std::future::pending::<()>().await;
         }
+
+        pub async fn read_with<R>(&self, _op: impl FnMut(&T) -> io::Result<R>) -> io::Result<R> {
+            std::future::pending().await
+        }
+
+        pub async fn write_with<R>(&self, _op: impl FnMut(&T) -> io::Result<R>) -> io::Result<R> {
+            std::future::pending().await
+        }
     }
 }
 

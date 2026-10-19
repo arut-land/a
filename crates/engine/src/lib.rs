@@ -4,33 +4,32 @@ pub mod config;
 mod driver;
 mod model;
 mod outbox;
+mod server;
 mod store;
 mod transcript;
 mod upgrade;
 
 use std::fs::{File, OpenOptions};
 use std::future::{Future, poll_fn};
-use std::io::{self, BufReader, Write};
+use std::io::{self, Write};
 use std::ops::Deref;
 use std::path::PathBuf;
 use std::pin::pin;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 use std::task::Poll;
-use std::thread;
 use std::time::{Duration, Instant};
 
 use crate::store::{Header, Jsonl, LogStore};
 use driver::{Attachment, Ended, Live, Open, Request, Shared};
 use outbox::Outbox;
 use protocol::{
-    Activity, Author, Cap, Caps, ClientDecl, ClientId, ClientMsg, ClientSeq, DaemonMsg,
-    Environment, Frame, HomeSettings, Mode, Origin, Outcome, PROTO, Rejection, Role, SessionId,
-    SessionSummary, SettingsChange, Target, Versions, read_frame,
+    Activity, DaemonMsg, Environment, Frame, Mode, Outcome, SessionId, SessionSummary, Target,
 };
 use rt::oneshot;
-use sys::{Home, Listener, Stream};
-use upgrade::{Lifecycle, Verdict};
+use server::reply;
+use sys::{Home, Listener};
+use upgrade::Lifecycle;
 
 /// How the daemon runs: the `[daemon]` table of `$A_HOME/config.toml`,
 /// read as it starts. Never its environment, which is whichever client's
@@ -842,24 +841,6 @@ impl Exit {
     }
 }
 
-/// Counts one open connection for as long as it lives.
-struct Client<'a>(&'a Daemon);
-
-impl<'a> Client<'a> {
-    fn new(daemon: &'a Daemon) -> Self {
-        daemon.clients.fetch_add(1, Ordering::SeqCst);
-        daemon.pulse.notify();
-        Self(daemon)
-    }
-}
-
-impl Drop for Client<'_> {
-    fn drop(&mut self) {
-        self.0.clients.fetch_sub(1, Ordering::SeqCst);
-        self.0.pulse.notify();
-    }
-}
-
 /// How a daemon was started.
 #[derive(Debug, Default)]
 pub struct Start {
@@ -893,7 +874,9 @@ pub fn serve(
     )? {
         Claim::Serve(pid) => pid,
         Claim::Tripped(why) => {
-            refuse(listener, &why);
+            if let Ok(listener) = rt::Async::new(listener) {
+                rt::block_on(server::refuse(&listener, &why));
+            }
             home.endpoint().remove();
             return Err(io::Error::other(why));
         }
@@ -909,18 +892,9 @@ pub fn serve(
     daemon.shared.rt.spawn(Box::pin(async move {
         monitor.supervise(&watch, &config, exit).await;
     }));
-    // Connections block on their sockets, so each gets a thread of its own
-    // and reaches the sessions' tasks through their mailboxes.
-    loop {
-        let conn = listener.accept()?;
-        let (daemon, life) = (Arc::clone(&daemon), Arc::clone(&life));
-        thread::spawn(move || {
-            let _client = Client::new(&daemon);
-            if let Err(e) = handle(&daemon, &life, &conn) {
-                eprintln!("connection: {e}");
-            }
-        });
-    }
+    // Connections are tasks waiting on the reactor, and reach the
+    // sessions' actors through their mailboxes.
+    rt::block_on(server::accept(&rt::Async::new(listener)?, &daemon, &life))
 }
 
 /// Whether a daemon may serve.
@@ -986,332 +960,6 @@ fn claim(
     // there is no lock to vouch for it.
     write!(file, "{}", sys::crash::Record::current(build))?;
     Ok(Claim::Serve(file))
-}
-
-/// Answers every client that connects, until none waits (or, if none
-/// came, for [`REFUSED_GRACE`]), with `why` in place of a welcome: for a
-/// daemon that must not serve.
-fn refuse(listener: &Listener, why: &str) {
-    let Ok(frame) = Frame::new(&DaemonMsg::Error {
-        message: why.to_owned(),
-    }) else {
-        return;
-    };
-    if listener.set_nonblocking(true).is_err() {
-        return;
-    }
-    let deadline = Instant::now() + REFUSED_GRACE;
-    let mut answered = false;
-    loop {
-        match listener.accept() {
-            Ok(mut conn) => {
-                answered = true;
-                let _ = conn.set_nonblocking(false);
-                let _ = conn.set_read_timeout(Some(REFUSED_GRACE));
-                let _ = conn.write_all(frame.as_bytes());
-                // What it sent is read and dropped until it hangs up.
-                let _ = io::copy(&mut conn, &mut io::sink());
-            }
-            Err(e)
-                if e.kind() == io::ErrorKind::WouldBlock
-                    && !answered
-                    && Instant::now() < deadline =>
-            {
-                thread::sleep(Duration::from_millis(10));
-            }
-            Err(_) => return,
-        }
-    }
-}
-
-/// How long a client refused at its hello has to read the answer and hang
-/// up before the daemon does.
-const REFUSED_GRACE: Duration = Duration::from_secs(2);
-
-/// The answer to a mutation: done, or refused and why.
-type Answer = Result<(), (Rejection, String)>;
-
-/// Writes what `outbox` hands out until it closes, as many frames as are
-/// ready at a time, up to [`WRITE_BATCH`] bytes.
-fn write_out(mut conn: Stream, outbox: &Outbox) {
-    let mut batch = Vec::new();
-    while let Some(frame) = outbox.next() {
-        batch.extend_from_slice(frame.as_bytes());
-        while batch.len() < WRITE_BATCH
-            && let Some(frame) = outbox.try_next()
-        {
-            batch.extend_from_slice(frame.as_bytes());
-        }
-        if conn.write_all(&batch).is_err() {
-            outbox.abandon();
-            return;
-        }
-        batch.clear();
-    }
-}
-
-/// How many bytes of ready frames go to a client in one write.
-const WRITE_BATCH: usize = 64 << 10;
-
-fn handle(daemon: &Daemon, life: &Lifecycle, conn: &Stream) -> io::Result<()> {
-    let mut reader = BufReader::new(conn.try_clone()?);
-    let (verdict, theirs, caps, client) = match read_frame(&mut reader)? {
-        Some(ClientMsg::Hello {
-            proto,
-            build,
-            min,
-            caps,
-            client,
-        }) => {
-            let theirs = Versions::new(min, proto);
-            let caps = caps & Caps::SERVED;
-            (life.verdict(theirs, &build), theirs, caps, client)
-        }
-        _ => (Verdict::Mismatch, Versions::from(0), Caps::NONE, None),
-    };
-    let outbox = Outbox::new(caps);
-    let writer = outbox.clone();
-    let stream = conn.try_clone()?;
-    thread::spawn(move || write_out(stream, &writer));
-    // Whatever the client sent behind a hello that is not welcomed is read
-    // and dropped, never acted on.
-    let refuse = |reader: &mut BufReader<Stream>| {
-        let _ = io::copy(reader, &mut io::sink());
-    };
-    let result = match (verdict, Versions::OURS.common(theirs)) {
-        (Verdict::Welcome, Some(proto)) => {
-            let registered = life.register(outbox.clone());
-            let mut conn = Conn {
-                daemon,
-                life,
-                outbox: &outbox,
-                number: registered.client(),
-                // One that does not name itself is one client for as long
-                // as its connection lasts.
-                client: client.unwrap_or_default(),
-                attached: None,
-                decl: ClientDecl::default(),
-            };
-            conn.reply(&DaemonMsg::Welcome {
-                proto,
-                build: life.build.clone(),
-                caps,
-                client: conn.number,
-                commands: driver::commands(&daemon.shared.registry.get()),
-            });
-            conn.serve(&mut reader)
-        }
-        (Verdict::Drain, _) => {
-            life.drain();
-            daemon.pulse.notify();
-            reply(&outbox, &DaemonMsg::Draining);
-            // Held open until we exit: the client's cue to reconnect.
-            refuse(&mut reader);
-            Ok(())
-        }
-        _ => {
-            reply(
-                &outbox,
-                &DaemonMsg::Mismatch {
-                    supported: PROTO,
-                    min: Versions::OURS.min_field(),
-                },
-            );
-            conn.set_read_timeout(Some(REFUSED_GRACE))?;
-            refuse(&mut reader);
-            Ok(())
-        }
-    };
-    outbox.close();
-    result
-}
-
-/// The workspace a client in `dir` works in: the git working tree `dir` is
-/// in, found with the client's git variables (`GIT_DIR`, ceilings), not the
-/// daemon's, so every client, local or bridged, gets the same rule.
-fn workspace_of(dir: &std::path::Path, env: Option<&Environment>) -> PathBuf {
-    let var = |name: &str| env?.vars.get(name).map(Into::into);
-    sys::workspace_in(dir, &sys::GitEnv::from_vars(var))
-}
-
-fn reply(outbox: &Outbox, msg: &DaemonMsg) {
-    // The writer ends with the connection; a lost reply needs no handling.
-    if let Ok(frame) = Frame::new(msg) {
-        let _ = outbox.send(frame);
-    }
-}
-
-/// A welcomed connection.
-struct Conn<'a> {
-    daemon: &'a Daemon,
-    life: &'a Lifecycle,
-    outbox: &'a Outbox,
-    /// The connection's number, as acks name it.
-    number: u32,
-    /// The client, as the log names who did what: a mutation it numbered
-    /// that the log holds already is a resend, answered as the first was,
-    /// across reconnects and daemon restarts.
-    client: ClientId,
-    attached: Option<Attachment>,
-    decl: ClientDecl,
-}
-
-impl Conn<'_> {
-    fn reply(&self, msg: &DaemonMsg) {
-        reply(self.outbox, msg);
-    }
-
-    fn error(&self, message: String) {
-        self.reply(&DaemonMsg::Error { message });
-    }
-
-    fn serve(&mut self, reader: &mut BufReader<Stream>) -> io::Result<()> {
-        while let Some(mut msg) = read_frame::<ClientMsg>(reader)? {
-            if let Some(&mut client_seq) = msg.client_seq_mut() {
-                let origin = client_seq.and_then(ClientSeq::new).map(|seq| Author {
-                    client: self.client,
-                    seq,
-                });
-                let answer = self.mutate(msg, origin);
-                self.answered(client_seq, answer);
-                continue;
-            }
-            match msg {
-                ClientMsg::Attach {
-                    target,
-                    workspace,
-                    since,
-                    env,
-                    decl,
-                } => {
-                    let found = workspace_of(&workspace, env.as_ref());
-                    match rt::block_on(self.daemon.resolve(&target, || found)) {
-                        Ok(s) => {
-                            self.decl = decl;
-                            // Before the replay, so a client that saw itself
-                            // attached knows its environment is recorded.
-                            if let Some(env) = env {
-                                s.session().set_env(env);
-                            }
-                            rt::block_on(s.session().attach(self.outbox.clone(), since));
-                            session_event("attach", s.session().id, || format!("since {since}"));
-                            self.attached = Some(s);
-                        }
-                        Err(e) => self.error(e.to_string()),
-                    }
-                }
-                ClientMsg::Declare(decl) => self.decl = decl,
-                ClientMsg::Environment(env) => match &self.attached {
-                    Some(s) => s.session().set_env(env),
-                    None => self.error("not attached".into()),
-                },
-                ClientMsg::List => self.reply(&DaemonMsg::Sessions {
-                    sessions: self.daemon.list(),
-                }),
-                ClientMsg::Settings { change } => self.reply(&self.settings(change.as_ref())),
-                ClientMsg::WatchSessions => self.daemon.watch_list(self.outbox),
-                ClientMsg::Status => self.reply(&DaemonMsg::Status {
-                    pid: std::process::id(),
-                    build: self.life.build.clone(),
-                    started: self.daemon.started,
-                    clients: u32::try_from(self.daemon.clients.load(Ordering::SeqCst))
-                        .unwrap_or(u32::MAX),
-                    known: u32::try_from(lock(&self.daemon.slots).len()).unwrap_or(u32::MAX),
-                }),
-                ClientMsg::Shutdown if self.decl.role == Role::Viewer => {
-                    self.error("this client is a viewer".into());
-                }
-                ClientMsg::Shutdown => {
-                    self.daemon.stopping.store(true, Ordering::SeqCst);
-                    self.daemon.pulse.notify();
-                }
-                ClientMsg::Detach => break,
-                ClientMsg::Hello { .. }
-                | ClientMsg::Input { .. }
-                | ClientMsg::Steer { .. }
-                | ClientMsg::Approve { .. }
-                | ClientMsg::Interrupt { .. } => {}
-            }
-        }
-        self.outbox.unfollow();
-        Ok(())
-    }
-
-    /// The home settings, after `change` if this client may make it.
-    fn settings(&self, change: Option<&SettingsChange>) -> DaemonMsg {
-        let home = &self.daemon.shared.models.settings.home;
-        let (file, refused) = match change {
-            None => (home.get(), None),
-            Some(_) if self.decl.role == Role::Viewer => {
-                (home.get(), Some("this client is a viewer".to_owned()))
-            }
-            Some(change) => home
-                .change(change)
-                .map_or_else(|e| (home.get(), Some(e)), |file| (file, None)),
-        };
-        let (settings, error) = match &*file {
-            Ok(file) => (config::shown(file), refused),
-            Err(e) => (HomeSettings::default(), refused.or_else(|| Some(e.clone()))),
-        };
-        DaemonMsg::Settings { settings, error }
-    }
-
-    /// Does mutation `msg`, from `origin`, if this client may.
-    fn mutate(&self, msg: ClientMsg, origin: Option<Author>) -> Answer {
-        let session = match &self.attached {
-            _ if self.decl.role == Role::Viewer => {
-                return Err((Rejection::ReadOnly, "this client is a viewer".into()));
-            }
-            Some(s) => s.session(),
-            None => return Err((Rejection::NotAttached, "not attached".into())),
-        };
-        let (request, refused) = match msg {
-            ClientMsg::Interrupt { .. } => (Request::Interrupt, Rejection::Other),
-            _ if self.life.draining().is_some() => {
-                return Err((
-                    Rejection::Draining,
-                    "the daemon is restarting for an upgrade; send that again in a moment".into(),
-                ));
-            }
-            ClientMsg::Input { text, .. } => {
-                let mode = Mode::Queue;
-                (Request::Input { text, mode }, Rejection::Refused)
-            }
-            ClientMsg::Steer { text, .. } => {
-                let mode = Mode::Steer;
-                (Request::Input { text, mode }, Rejection::Refused)
-            }
-            ClientMsg::Approve { call, approved, .. } => {
-                let value = approved.into();
-                (Request::Answer { call, value }, Rejection::NotWaiting)
-            }
-            _ => return Err((Rejection::Other, "not a mutation".into())),
-        };
-        rt::block_on(session.request(request, origin)).map_err(|message| (refused, message))
-    }
-
-    /// Tells the client the answer to its mutation `client_seq`: an ack
-    /// or rejection where it takes them, else an error for a refusal.
-    fn answered(&self, client_seq: Option<u64>, answer: Answer) {
-        match (client_seq, answer) {
-            (Some(client_seq), answer) if self.outbox.caps().has(Cap::Ack) => {
-                let origin = Origin {
-                    client: self.number,
-                    client_seq,
-                };
-                self.reply(&match answer {
-                    Ok(()) => DaemonMsg::Ack { origin },
-                    Err((reason, message)) => DaemonMsg::Rejected {
-                        origin,
-                        reason,
-                        message,
-                    },
-                });
-            }
-            (_, Err((_, message))) => self.error(message),
-            (_, Ok(())) => {}
-        }
-    }
 }
 
 #[cfg(test)]

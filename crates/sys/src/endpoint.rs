@@ -92,6 +92,36 @@ impl Stream {
     }
 }
 
+/// What the reactor registers: a stream or listener is waited on, never
+/// blocked on, by the daemon's tasks.
+#[cfg(unix)]
+impl std::os::fd::AsFd for Stream {
+    fn as_fd(&self) -> std::os::fd::BorrowedFd<'_> {
+        self.0.as_fd()
+    }
+}
+
+#[cfg(unix)]
+impl std::os::fd::AsFd for Listener {
+    fn as_fd(&self) -> std::os::fd::BorrowedFd<'_> {
+        self.0.as_fd()
+    }
+}
+
+#[cfg(windows)]
+impl std::os::windows::io::AsHandle for Stream {
+    fn as_handle(&self) -> std::os::windows::io::BorrowedHandle<'_> {
+        self.0.as_handle()
+    }
+}
+
+#[cfg(windows)]
+impl std::os::windows::io::AsHandle for Listener {
+    fn as_handle(&self) -> std::os::windows::io::BorrowedHandle<'_> {
+        self.0.as_handle()
+    }
+}
+
 #[cfg(unix)]
 impl From<std::os::unix::net::UnixStream> for Stream {
     fn from(stream: std::os::unix::net::UnixStream) -> Self {
