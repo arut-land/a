@@ -158,7 +158,7 @@ impl Extension for Again {
     fn contribute(&self, r: &mut Registrar) {
         r.on::<point::RequestError>(|_, _| {
             let after = Duration::ZERO;
-            Some(Recover::Retry { after })
+            Answer::Now(Some(Recover::Retry { after }))
         });
     }
 }

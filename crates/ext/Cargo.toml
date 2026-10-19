@@ -22,3 +22,6 @@ sys = { workspace = true, optional = true }
 
 [lints]
 workspace = true
+
+[dev-dependencies]
+rt.workspace = true

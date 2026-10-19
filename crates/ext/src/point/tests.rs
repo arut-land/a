@@ -183,6 +183,38 @@ where
     assert_eq!(asked.load(Ordering::SeqCst), 0, "{}", P::NAME);
 }
 
+/// A first-answer point whose handlers may answer later, all answering
+/// now, merges as one that may not.
+fn first_now<P, T>(cx: &P::Cx<'_>, facts: P::Facts<'_>, [a, b]: [T; 2])
+where
+    P: Point<Out = Answer<Option<T>>>,
+    T: Clone + PartialEq + Debug + Send + Sync + 'static,
+{
+    let asked = Arc::new(AtomicUsize::new(0));
+    let after = Arc::clone(&asked);
+    let set = hooks(vec![
+        one("none", |r| {
+            r.on::<P>(|_, _| Answer::Now(None));
+        }),
+        one("a", move |r| {
+            r.on::<P>(move |_, _| Answer::Now(Some(a.clone())));
+        }),
+        one("b", move |r| {
+            r.on::<P>(move |_, _| {
+                after.fetch_add(1, Ordering::SeqCst);
+                Answer::Now(Some(b.clone()))
+            });
+        }),
+    ]);
+    let merged = set.run::<P>(cx, facts, &mut (), &mut |_, (), ()| {});
+    assert!(
+        matches!(&merged, Asked::Now(name, _) if &**name == "a"),
+        "{}: {merged:?}",
+        P::NAME
+    );
+    assert_eq!(asked.load(Ordering::SeqCst), 0, "{}", P::NAME);
+}
+
 /// An observed point tells every handler, in order.
 fn observes<P: Point<Out = ()>>(cx: &P::Cx<'_>, facts: P::Facts<'_>) {
     let told = Arc::new(Mutex::new(Vec::new()));
@@ -252,15 +284,12 @@ fn merge_rules_are_applied_identically_for_every_point() {
         error: &overflow,
         attempt: 0,
     };
-    first::<RequestError, _>(
-        cx,
-        error,
-        [
-            Recover::Replace(Box::new(request("a"))),
-            Recover::Replace(Box::new(request("b"))),
-        ],
-    );
-    first::<Approve, _>(cx, call, [true, false]);
+    let after = |ms| Recover::Retry {
+        after: Duration::from_millis(ms),
+    };
+    first_now::<RequestError, _>(cx, error, [after(1), Recover::Resend]);
+    first_now::<Approve, _>(cx, call, [true, false]);
+    chains::<Step, _, _>(cx, (), ["0", "a", "b"].map(request), None);
     first::<OnStop, _>(cx, (), ["a", "b"].map(str::to_owned));
 
     let entry = Entry::new(1, 0, protocol::Body::INTERRUPT);
@@ -308,13 +337,18 @@ fn a_point_with_no_handler_costs_nothing() {
         let text = hooks.input(&cx, "hi".to_owned());
         assert_eq!(text, Ok(Chained::new("hi".to_owned())));
         let subject = Json::new(&input);
-        assert_eq!(hooks.gate(&cx, "t", &subject), Gated::run(subject));
+        assert_eq!(
+            hooks.gate(&cx, "t", &subject),
+            Gating::Now(Gated::run(subject))
+        );
         let error = llm::Error::new(llm::Kind::Server, "e");
         let failed = Failed {
             error: &error,
             attempt: 0,
         };
-        assert!(hooks.request_error(&cx, failed).is_none());
+        assert_eq!(hooks.request_error(&cx, failed), Asked::None);
+        let mut request = llm::Request::default();
+        assert_eq!(hooks.step(&cx, &mut request), (Decided::new(), None));
         let after = hooks.post_tool(&cx, ("t", &input), outcome.clone());
         assert_eq!(after, Chained::new(outcome));
         hooks.observe(&cx, &Entry::new(1, 0, protocol::Body::INTERRUPT));
@@ -341,7 +375,7 @@ fn gate_logs_what_the_chain_and_the_policy_decided() {
         });
     };
     let gate = |hooks: &Hooks| {
-        let gated = hooks.gate(&cx, "t", &Json::new(&json!({ "n": 0 })));
+        let gated = (hooks.gate(&cx, "t", &Json::new(&json!({ "n": 0 }))).now()).unwrap();
         (gated.gate, gated.input.value(), gated.decisions)
     };
     let (verdict, input, decided) = gate(&hooks(vec![one("a", bump), one("b", bump)]));
@@ -369,7 +403,7 @@ fn gate_logs_what_the_chain_and_the_policy_decided() {
                 r.on::<Permission>(|_, _| Level::Ask);
             }),
             one("approver", move |r| {
-                r.on::<Approve>(move |_, _| approve);
+                r.on::<Approve>(move |_, _| Answer::Now(approve));
             }),
         ])
     };
@@ -398,6 +432,109 @@ fn gate_logs_what_the_chain_and_the_policy_decided() {
         gate(&denies).0,
         Gate::Refuse("strict denied this call".into())
     );
+}
+
+/// An `approve` handler that answers later stops the merge at itself: the
+/// gate waits with what was decided before, and an answer of none goes on
+/// from the handler after it.
+#[test]
+fn a_later_answer_resumes_the_merge_where_it_stopped() {
+    let view = Counted::default();
+    let cx = point_cx(&view);
+    let told = Arc::new(AtomicUsize::new(0));
+    let after = Arc::clone(&told);
+    let set = hooks(vec![
+        one("policy", |r| {
+            r.on::<Permission>(|_, _| Level::Ask);
+        }),
+        one("none", |r| {
+            r.on::<Approve>(|_, _| Answer::Now(None));
+        }),
+        one("judge", |r| {
+            r.on::<Approve>(|_, _| Answer::Later(Later::new(async { None })));
+        }),
+        one("last", move |r| {
+            r.on::<Approve>(move |_, _| {
+                after.fetch_add(1, Ordering::SeqCst);
+                Answer::Now(Some(false))
+            });
+        }),
+    ]);
+    let Gating::Approving(approving) = set.gate(&cx, "bash", &Json::new(&json!({}))) else {
+        panic!("the judge answers later")
+    };
+    assert_eq!(&*approving.by, "judge");
+    assert_eq!(approving.next, 2);
+    assert_eq!(names(&approving.decisions), ["policy"]);
+    // Nothing after the judge was asked.
+    assert_eq!(told.load(Ordering::SeqCst), 0);
+    assert_eq!(rt::block_on(approving.answer.0), None);
+    // Its none goes on from the next handler.
+    let input = json!({});
+    let rest = set.approve_from(&cx, "bash", &input, approving.next);
+    assert_eq!(rest, Asked::Now("last".into(), false));
+    assert_eq!(told.load(Ordering::SeqCst), 1);
+    let gated = Gated::approved(
+        Json::null(),
+        approving.decisions,
+        Some(("last".into(), false)),
+    );
+    assert_eq!(
+        gated.gate,
+        Gate::Refuse("last did not approve this call".into())
+    );
+    assert_eq!(names(&gated.decisions), ["policy", "last"]);
+    // From past the last handler, no one answers: the user is asked.
+    assert_eq!(set.approve_from(&cx, "bash", &input, 3), Asked::None);
+    let gated = Gated::approved(Json::null(), Decided::new(), None);
+    assert_eq!(gated.gate, Gate::Ask);
+}
+
+/// A `step` rewrite is logged, with the model when it changed; an answer
+/// ends the chain with who gave it.
+#[test]
+fn a_step_rewrite_is_logged_and_an_answer_ends_it() {
+    let view = Counted::default();
+    let cx = point_cx(&view);
+    let set = hooks(vec![
+        one("fallback", |r| {
+            r.on::<Step>(|_, request| {
+                Rewrite::Replace(llm::Request {
+                    model: "cheap".into(),
+                    ..request.clone()
+                })
+            });
+        }),
+        one("cache", |r| {
+            r.on::<Step>(|_, request| {
+                let message = llm::Assistant {
+                    content: Vec::new(),
+                    origin: None,
+                };
+                let answer = llm::Response {
+                    message,
+                    finish: llm::Finish::new(llm::Reason::Stop, None),
+                    usage: llm::Usage::default(),
+                    id: None,
+                    model: Some(request.model.clone()),
+                    meta: llm::Meta::new(),
+                };
+                Rewrite::Stop(answer)
+            });
+        }),
+    ]);
+    let mut request = llm::Request {
+        model: "big".into(),
+        ..llm::Request::default()
+    };
+    let (decided, answered) = set.step(&cx, &mut request);
+    assert_eq!(request.model, "cheap");
+    assert!(matches!(
+        &decided[..],
+        [(by, Verdict::PrepareStep { model: Some(m) })] if &**by == "fallback" && m == "cheap"
+    ));
+    let (by, answer) = answered.unwrap();
+    assert_eq!((&*by, answer.model.as_deref()), ("cache", Some("cheap")));
 }
 
 #[test]
@@ -464,12 +601,12 @@ fn erased_handlers_answer_in_json_and_a_policy_that_cannot_be_read_denies() {
         );
         assert_eq!(r.errors, Vec::<String>::new());
     })]);
-    let gated = set.gate(&cx, "bash", &Json::new(&json!({})));
+    let gated = set.gate(&cx, "bash", &Json::new(&json!({}))).now().unwrap();
     assert_eq!(
         (gated.gate, gated.input.value()),
         (Gate::Ask, json!({ "tool": "bash" }))
     );
-    let gated = set.gate(&cx, "edit", &Json::new(&json!({})));
+    let gated = set.gate(&cx, "edit", &Json::new(&json!({}))).now().unwrap();
     assert_eq!(gated.gate, Gate::Refuse("lua denied this call".into()));
 
     let mut r = Registrar::default();

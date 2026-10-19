@@ -19,9 +19,10 @@ use std::time::Instant;
 
 use crate::store::{Header, Parent, Writer};
 use ext::host::{Host, Parts, Registry};
-use ext::point::{Failed, View};
+use ext::point::{Approving, Failed, View};
 use ext::{
-    BoxFuture, Callable, Cancel, Chained, Cx, Facts, Gated, Name, PointCx, Recover, Route, States,
+    Asked, BoxFuture, Callable, Cancel, Chained, Cx, Facts, Gated, Gating, Name, PointCx, Recover,
+    Route, States,
 };
 use kernel::{Answer, Core, Effect, Effects, Event, Load, Note, Owner, Replied, Ticket};
 use protocol::view::SessionView;
@@ -692,6 +693,7 @@ impl Actor {
                 | Effect::RunTool { .. }
                 | Effect::Resume { .. }
                 | Effect::Await { .. }
+                | Effect::Recover { .. }
                 | Effect::Sleep { .. }
                 | Effect::StartChild { .. }
         );
@@ -705,8 +707,7 @@ impl Actor {
                 call,
                 attempt,
                 choice,
-                request,
-            } => self.call_model(call, attempt, choice, request),
+            } => self.call_model(call, attempt, choice),
             Effect::RunTool { call, tool, input } => self.run_tool(call, tool, input),
             Effect::Resume {
                 call,
@@ -724,6 +725,13 @@ impl Actor {
             Effect::Await { call, answer } => {
                 let gated = self.cancellable(call, answer.0);
                 self.later(gated, move |gated| Event::Gated { call, gated });
+            }
+            Effect::Recover { call, answer } => {
+                let recovered = self.cancellable(call, answer.0);
+                self.later(recovered, move |recovered| Event::Recovered {
+                    call,
+                    recovered,
+                });
             }
             Effect::Sleep { call, after } => {
                 let slept = self.cancellable(call, shared.rt.sleep(after));
@@ -833,15 +841,9 @@ impl Actor {
     /// Asks the model to reply to the transcript before `call`, with the
     /// tools `choice` lets it call, its text streaming to followers under
     /// `attempt`.
-    fn call_model(
-        &mut self,
-        call: CallId,
-        attempt: u16,
-        choice: ToolChoice,
-        request: Option<Box<llm::Request>>,
-    ) {
+    fn call_model(&mut self, call: CallId, attempt: u16, choice: ToolChoice) {
         let work = self.live.session.model().map(|model| {
-            let mut request = request.map_or_else(|| self.request(call, &model), |r| *r);
+            let mut request = self.request(call, &model);
             request.tool_choice = match choice {
                 ToolChoice::Auto => llm::ToolChoice::Auto,
                 ToolChoice::None => llm::ToolChoice::None,
@@ -1109,6 +1111,7 @@ impl View for Session {
 
 /// A registry generation bound to a session: the kernel's view of the
 /// extensions.
+#[derive(Clone)]
 struct Bound {
     registry: Arc<Registry>,
     session: Arc<Session>,
@@ -1128,6 +1131,112 @@ impl Bound {
 
     fn point(&self) -> PointCx<'_> {
         self.session.point()
+    }
+
+    /// The session, as handlers deciding about call `call` see it.
+    fn about(&self, call: CallId) -> PointCx<'_> {
+        PointCx::new(self.session.id, &self.session.workspace, self).about(call.get())
+    }
+
+    /// The gate of call `call` once the `approve` handler it waits on
+    /// answers: with none, the handlers after it are asked, and with no
+    /// answer at all the user is. A handler that panics refuses the call.
+    async fn approving(self, call: CallId, tool: String, mut asked: Approving) -> Gated {
+        loop {
+            let answer = contain(async { Ok(asked.answer.0.await) }).await;
+            let answer = match answer {
+                Ok(Some(approved)) => Some((asked.by, approved)),
+                Ok(None) => {
+                    let value = asked.input.value();
+                    let rest = guarded(
+                        || {
+                            (self.registry.hooks()).approve_from(
+                                &self.about(call),
+                                &tool,
+                                &value,
+                                asked.next,
+                            )
+                        },
+                        |_| Asked::Now(Name::from("gate"), false),
+                    );
+                    match rest {
+                        Asked::None => None,
+                        Asked::Now(by, approved) => Some((by, approved)),
+                        Asked::Later { by, at, answer } => {
+                            (asked.by, asked.next, asked.answer) = (by, at + 1, answer);
+                            continue;
+                        }
+                    }
+                }
+                Err(why) => {
+                    let mut decisions = asked.decisions;
+                    let reason = format!("{} {why}", asked.by);
+                    decisions.push((
+                        asked.by,
+                        Verdict::Block {
+                            reason: reason.clone(),
+                        },
+                    ));
+                    return Gated {
+                        input: asked.input,
+                        decisions,
+                        gate: ext::Gate::Refuse(reason),
+                    };
+                }
+            };
+            return Gated::approved(asked.input, asked.decisions, answer);
+        }
+    }
+
+    /// How to recover model call `call` from `error` once the
+    /// `request_error` handler `by`, the `at`th, answers: with none, or if
+    /// it panics, the handlers after it are asked.
+    async fn recovering(
+        self,
+        call: CallId,
+        attempt: u16,
+        error: llm::Error,
+        (mut by, mut at, mut answer): (Name, usize, ext::Later<Option<Recover>>),
+    ) -> Option<(Name, Recover)> {
+        loop {
+            if let Ok(Some(recover)) = contain(async { Ok(answer.0.await) }).await {
+                return Some((by, recover));
+            }
+            let failed = Failed {
+                error: &error,
+                attempt,
+            };
+            let rest = guarded(
+                || (self.registry.hooks()).request_error_from(&self.about(call), failed, at + 1),
+                |_| Asked::None,
+            );
+            match rest {
+                Asked::None => return None,
+                Asked::Now(by, recover) => return Some((by, recover)),
+                Asked::Later {
+                    by: next,
+                    at: next_at,
+                    answer: next_answer,
+                } => (by, at, answer) = (next, next_at, next_answer),
+            }
+        }
+    }
+}
+
+/// What a decision about a call reads of the session, and the call's own
+/// context for work it answers later with.
+impl View for Bound {
+    fn model(&self) -> String {
+        self.session.model_spec()
+    }
+
+    fn states(&self, read: &mut dyn FnMut(&States)) {
+        read(&lock(&self.session.states));
+    }
+
+    fn cx(&self, call: u64) -> Option<Cx> {
+        let call = CallId::new(call)?;
+        Some(self.session.cx(call, &self.registry, Cancel::default()))
     }
 }
 
@@ -1187,33 +1296,55 @@ impl kernel::Registry for Bound {
 
     /// #43 `a_failing_gate_fails_closed`: a gate that cannot decide denies
     /// the call, and says why.
-    fn gate(&self, _: CallId, tool: &str, input: &Json) -> Answer<Gated> {
-        Answer::Now(guarded(
-            || self.registry.hooks().gate(&self.point(), tool, input),
-            |why| Gated {
-                input: input.clone(),
-                decisions: vec![(
-                    Name::from("gate"),
-                    Verdict::Block {
-                        reason: why.clone(),
-                    },
-                )],
-                gate: ext::Gate::Refuse(format!("the gate {why}")),
+    fn gate(&self, call: CallId, tool: &str, input: &Json) -> Answer<Gated> {
+        let gating = guarded(
+            || self.registry.hooks().gate(&self.about(call), tool, input),
+            |why| {
+                Gating::Now(Gated {
+                    input: input.clone(),
+                    decisions: vec![(
+                        Name::from("gate"),
+                        Verdict::Block {
+                            reason: why.clone(),
+                        },
+                    )],
+                    gate: ext::Gate::Refuse(format!("the gate {why}")),
+                })
             },
-        ))
+        );
+        match gating {
+            Gating::Now(gated) => Answer::Now(gated),
+            Gating::Approving(asked) => {
+                let later = self.clone().approving(call, tool.to_owned(), asked);
+                Answer::Later(ext::Later::new(later))
+            }
+        }
     }
 
     fn request_error(
         &self,
-        _: CallId,
+        call: CallId,
         attempt: u16,
         error: &llm::Error,
-    ) -> Option<(Name, Recover)> {
+    ) -> Answer<Option<(Name, Recover)>> {
         let failed = Failed { error, attempt };
-        guarded(
-            || self.registry.hooks().request_error(&self.point(), failed),
-            |_| None,
-        )
+        let asked = guarded(
+            || {
+                self.registry
+                    .hooks()
+                    .request_error(&self.about(call), failed)
+            },
+            |_| Asked::None,
+        );
+        match asked {
+            Asked::None => Answer::Now(None),
+            Asked::Now(by, recover) => Answer::Now(Some((by, recover))),
+            Asked::Later { by, at, answer } => {
+                let later =
+                    (self.clone()).recovering(call, attempt, error.clone(), (by, at, answer));
+                Answer::Later(ext::Later::new(later))
+            }
+        }
     }
 
     /// A transform fails open: the outcome goes on as it was.
@@ -1489,6 +1620,12 @@ async fn contain<T: Failure>(effect: impl Future<Output = T>) -> T {
 /// What an effect that panicked reports.
 trait Failure {
     fn failed(error: String) -> Self;
+}
+
+impl<T> Failure for Result<T, String> {
+    fn failed(error: String) -> Self {
+        Err(error)
+    }
 }
 
 impl Failure for Outcome {

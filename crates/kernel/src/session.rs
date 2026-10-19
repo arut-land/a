@@ -38,6 +38,8 @@ pub struct Core {
     /// Results of children no call waits on, held until the turn running
     /// ends: each starts a turn of its own.
     deferred: VecDeque<(SessionId, Outcome)>,
+    /// Why the model call being recovered failed, while a handler decides.
+    failed: Option<String>,
 }
 
 impl Core {
@@ -79,6 +81,7 @@ impl Core {
             busy: false,
             reported: 0,
             deferred: VecDeque::new(),
+            failed: None,
         }
     }
 
@@ -156,7 +159,26 @@ impl Core {
                 } = self.turn
                     && failed == call
                 {
-                    self.again(call, attempt, None, &mut fx);
+                    self.again(call, attempt, &mut fx);
+                }
+            }
+            Event::Recovered { call, recovered } => {
+                if let Turn::Model {
+                    call: failed,
+                    attempt,
+                    phase: ModelPhase::Recovering,
+                } = self.turn
+                    && failed == call
+                {
+                    let error = self.failed.take().unwrap_or_default();
+                    if let Some((by, recover)) = recovered {
+                        self.recovered(call, attempt, &by, recover, error, &mut fx);
+                    } else {
+                        self.turn = Turn::Acting {
+                            open: SmallVec::new(),
+                        };
+                        self.settle(call, Outcome::Failed { error }, &mut fx);
+                    }
                 }
             }
             Event::ChildSettled { child, outcome } => self.child_settled(child, outcome, &mut fx),
@@ -244,7 +266,8 @@ impl Core {
                 match phase {
                     ModelPhase::Streaming => SmallVec::from_elem(call, 1),
                     // Nothing is out to report.
-                    ModelPhase::Backoff => {
+                    ModelPhase::Backoff | ModelPhase::Recovering => {
+                        self.failed = None;
                         self.settle(call, Outcome::Interrupted { output: None }, fx);
                         SmallVec::new()
                     }
@@ -340,18 +363,46 @@ impl Core {
     }
 
     /// Whether the `request_error` point recovers model call `call` from
-    /// the failure of attempt `attempt`: if so, the next attempt is logged,
-    /// and sent at once or once the backoff the point asks for is over.
+    /// the failure of attempt `attempt`, now or once a handler answers
+    /// later: if so, the next attempt is logged, and sent at once or once
+    /// the backoff the point asks for is over.
     fn retry(&mut self, call: CallId, attempt: u16, error: &llm::Error, fx: &mut Effects) -> bool {
-        let Some((by, recover)) = self.registry.request_error(call, attempt, error) else {
-            return false;
-        };
+        match self.registry.request_error(call, attempt, error) {
+            Answer::Now(None) => false,
+            Answer::Now(Some((by, recover))) => {
+                self.recovered(call, attempt, &by, recover, error.to_string(), fx);
+                true
+            }
+            Answer::Later(answer) => {
+                self.failed = Some(error.to_string());
+                fx.push(Effect::Recover { call, answer });
+                self.turn = Turn::Model {
+                    call,
+                    attempt,
+                    phase: ModelPhase::Recovering,
+                };
+                true
+            }
+        }
+    }
+
+    /// Recovers model call `call` from the failure of attempt `attempt`
+    /// as `by` says: the next attempt is logged, then sent.
+    fn recovered(
+        &mut self,
+        call: CallId,
+        attempt: u16,
+        by: &str,
+        recover: Recover,
+        error: String,
+        fx: &mut Effects,
+    ) {
         let next = attempt.saturating_add(1);
         let d = Verdict::Retry {
             attempt: next,
-            error: error.to_string(),
+            error,
         };
-        self.decide(Some(call), &by, d, fx);
+        self.decide(Some(call), by, d, fx);
         match recover {
             Recover::Retry { after } => {
                 fx.push(Effect::Sleep { call, after });
@@ -361,19 +412,12 @@ impl Core {
                     phase: ModelPhase::Backoff,
                 };
             }
-            Recover::Replace(request) => self.again(call, next, Some(request), fx),
+            Recover::Resend => self.again(call, next, fx),
         }
-        true
     }
 
     /// Sends model call `call` again, as attempt `attempt`.
-    fn again(
-        &mut self,
-        call: CallId,
-        attempt: u16,
-        request: Option<Box<llm::Request>>,
-        fx: &mut Effects,
-    ) {
+    fn again(&mut self, call: CallId, attempt: u16, fx: &mut Effects) {
         let choice = match self.fold.ledger.call(call.get()).map(|open| &open.call) {
             Some(&Call::Model { choice, .. }) => choice,
             _ => ToolChoice::Auto,
@@ -382,7 +426,6 @@ impl Core {
             call,
             attempt,
             choice,
-            request,
         });
         self.turn = Turn::Model {
             call,
@@ -612,7 +655,7 @@ impl Core {
                     choice,
                 };
                 let call = self.append(fx, body);
-                self.again(call, 0, None, fx);
+                self.again(call, 0, fx);
             }
             Next::Agent(Action::Call { tool, input, id }) => {
                 let call = self.call(&tool, &input, id, Audience::Model, fx);

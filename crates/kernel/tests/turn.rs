@@ -6,7 +6,7 @@ mod common;
 use std::time::Duration;
 
 use common::*;
-use kernel::{Effect, Event, Gated, Later, Load, Note, Owner, Ticket};
+use kernel::{Effect, Event, Gated, Later, Load, Note, Owner, Recover, Ticket};
 use protocol::{Audience, Body, Installed, Json, Mode, Outcome, Permission, Verdict};
 use serde_json::json;
 
@@ -512,6 +512,79 @@ fn an_interrupt_in_backoff_sends_nothing_again() {
             ],
         ),
         (Event::Woke { call: id(2) }, vec![]),
+    ]);
+}
+
+/// A handler that answers later how to recover holds the call meanwhile:
+/// nothing is sent until it answers.
+fn recovering() -> (Session, Effect) {
+    let mut s = Session::new(Reg::chat().resend().arc());
+    s.step(user("hi"));
+    let mut fx = s.step(model_failed(2)).into_vec();
+    assert_eq!(fx.len(), 1, "{fx:?}");
+    (s, fx.remove(0))
+}
+
+/// `resend` sends the call again at once, as its next attempt, with the
+/// request made from the transcript as it is then: the effect names no
+/// request of its own.
+#[test]
+fn a_resend_rebuilds_from_the_transcript() {
+    let (mut s, recover) = recovering();
+    assert_eq!(
+        recover,
+        Effect::Recover {
+            call: id(2),
+            answer: Later::new(async { None }),
+        }
+    );
+    let retry = Verdict::Retry {
+        attempt: 1,
+        error: "slow down".into(),
+    };
+    s.table(vec![(
+        Event::Recovered {
+            call: id(2),
+            recovered: Some(("compact".into(), Recover::Resend)),
+        },
+        vec![
+            append(3, decision("compact", Some(2), retry)),
+            call_model(2, 1),
+        ],
+    )]);
+    // An answer of none fails the call with its error.
+    let (mut s, _) = recovering();
+    let recovered = Event::Recovered {
+        call: id(2),
+        recovered: None,
+    };
+    s.table(vec![(
+        recovered,
+        vec![append(3, model_result(2, failed("slow down"))), IDLE],
+    )]);
+}
+
+#[test]
+fn an_interrupt_in_recovering_sends_nothing() {
+    let (mut s, _) = recovering();
+    s.table(vec![
+        (
+            interrupt(),
+            vec![
+                cancel(2),
+                append(3, model_result(2, INTERRUPTED)),
+                append(4, Body::INTERRUPT),
+                IDLE,
+            ],
+        ),
+        // An answer that comes anyway changes nothing.
+        (
+            Event::Recovered {
+                call: id(2),
+                recovered: Some(("compact".into(), Recover::Resend)),
+            },
+            vec![],
+        ),
     ]);
 }
 

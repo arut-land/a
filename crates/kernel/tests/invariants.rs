@@ -236,6 +236,12 @@ fn states() -> Vec<(&'static str, Session)> {
     state("model streaming", Reg::chat(), vec![user("hi")]);
     let retrying = Reg::chat().retry(Duration::from_secs(1));
     state("model backoff", retrying, vec![user("hi"), model_failed(2)]);
+    let recovering = Reg::chat().resend();
+    state(
+        "model recovering",
+        recovering,
+        vec![user("hi"), model_failed(2)],
+    );
     state("tool running", Reg::echo(), vec![user("sleep 1")]);
     state(
         "gate awaiting",
@@ -270,7 +276,8 @@ fn starts_work(effect: &Effect, open_at_interrupt: u64) -> bool {
         Effect::RunTool { call, .. }
         | Effect::Resume { call, .. }
         | Effect::CallModel { call, .. }
-        | Effect::Await { call, .. } => call.get() <= open_at_interrupt,
+        | Effect::Await { call, .. }
+        | Effect::Recover { call, .. } => call.get() <= open_at_interrupt,
         Effect::StartChild { .. } => true,
         _ => false,
     }

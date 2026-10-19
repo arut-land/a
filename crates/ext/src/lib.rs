@@ -36,8 +36,8 @@ mod tool;
 pub use agent::{Action, Actions, Agent, Input};
 pub use ext::{DynExtension, Extension, Facts, Place, Refused, Registrar, Text, Tier};
 pub use r#loop::{Defaults, LOOP, Loop, LoopPoints, Resume, StepLimit};
-pub use point::{Answer, Chained, Gate, Gated, Later, PointCx, Recover, Rewrite};
-pub use service::{CwdOf, Sessions, Settings, Spawner};
+pub use point::{Answer, Asked, Chained, Gate, Gated, Gating, Later, PointCx, Recover, Rewrite};
+pub use service::{Budget, CwdOf, Models, Sessions, Settings, Side, Spawner};
 pub use state::{Fold, States};
 pub use tool::{Args, Callable, Cancel, Cx, DynTool, Replay, Route, SpawnSpec, Tool};
 

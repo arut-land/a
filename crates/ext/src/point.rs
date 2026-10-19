@@ -5,6 +5,7 @@
 //! | Point | Merge |
 //! | --- | --- |
 //! | [`Input`] | replacement chain over the user's text; the first rejection wins |
+//! | [`Step`] | replacement chain over a model request; the first answer of its own wins |
 //! | [`RequestError`] | the first recovery wins |
 //! | [`PreTool`] | replacement chain over the input; the first block wins |
 //! | [`Permission`] | the most restrictive wins: deny > defer > ask > allow |
@@ -23,7 +24,10 @@
 //!
 //! The four rules are [`Merge`]'s, each implemented once, by the
 //! [`Rule`] that carries it, for every point. Handlers run in
-//! registration order, each given a [`PointCx`]. What changed is reported
+//! registration order, each given a [`PointCx`]. A handler at a
+//! first-answer point whose answer is an [`Answer`] may answer later: the
+//! merge stops at it, and goes on from the handler after it if what comes
+//! is no answer. What changed is reported
 //! as [`Verdict`]s, which the engine logs under the extension's name;
 //! `spawn` rewrites are not logged, as they follow from configuration
 //! rather than from what happened.
@@ -41,7 +45,7 @@ use protocol::{Entry, Json, Outcome, SessionId, Verdict};
 use serde::de::DeserializeOwned;
 use serde_json::{Value, json};
 
-use crate::{Actions, Fold, Name, States};
+use crate::{Actions, Cx, Fold, Name, States};
 
 /// How a point merges its handlers' answers, in registration order.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -169,6 +173,61 @@ impl<T: 'static> Rule for Option<T> {
     }
 }
 
+/// What a first-answer point whose handlers may answer later came to.
+#[derive(Debug, PartialEq)]
+pub enum Asked<T> {
+    /// No handler answered.
+    None,
+    Now(Name, T),
+    /// Handler `by`, the `at`th, answers later. With no answer, the merge
+    /// goes on from the one after it.
+    Later {
+        by: Name,
+        at: usize,
+        answer: Later<Option<T>>,
+    },
+}
+
+impl<T> Asked<T> {
+    /// The answer of a merge begun at handler `from`.
+    fn from(self, from: usize) -> Self {
+        match self {
+            Self::Later { by, at, answer } => Self::Later {
+                by,
+                at: at + from,
+                answer,
+            },
+            asked => asked,
+        }
+    }
+}
+
+impl<T: 'static> Rule for Answer<Option<T>> {
+    const MERGE: Merge = Merge::FirstSome;
+    type Subject = ();
+    type Merged = Asked<T>;
+
+    fn merge<P: Point<Out = Self>>(
+        handlers: &[(Name, Handler<P>)],
+        cx: &P::Cx<'_>,
+        facts: P::Facts<'_>,
+        (): &mut (),
+        _: &mut Replaced<'_, ()>,
+    ) -> Asked<T> {
+        for (at, (name, handler)) in handlers.iter().enumerate() {
+            match handler(cx, P::input(facts, &())) {
+                Answer::Now(None) => {}
+                Answer::Now(Some(answer)) => return Asked::Now(Name::clone(name), answer),
+                Answer::Later(answer) => {
+                    let by = Name::clone(name);
+                    return Asked::Later { by, at, answer };
+                }
+            }
+        }
+        Asked::None
+    }
+}
+
 impl Rule for protocol::Permission {
     const MERGE: Merge = Merge::MostRestrictive;
     type Subject = ();
@@ -210,10 +269,13 @@ impl Rule for () {
     }
 }
 
-/// What every handler is given: the session it decides for.
+/// What every handler is given: the session it decides for, and the call
+/// it decides about, if one.
 pub struct PointCx<'a> {
     pub session: SessionId,
     pub workspace: &'a Path,
+    /// The call: the seq of its intent.
+    pub call: Option<u64>,
     view: &'a dyn View,
 }
 
@@ -222,6 +284,11 @@ pub trait View: Sync {
     /// The model the session talks to, as `host:model`.
     fn model(&self) -> String;
     fn states(&self, read: &mut dyn FnMut(&States));
+    /// What call `call` runs with, owned, for work its handler answers
+    /// later with.
+    fn cx(&self, _call: u64) -> Option<Cx> {
+        None
+    }
 }
 
 impl<'a> PointCx<'a> {
@@ -229,8 +296,25 @@ impl<'a> PointCx<'a> {
         Self {
             session,
             workspace,
+            call: None,
             view,
         }
+    }
+
+    /// The same, about call `call`.
+    #[must_use]
+    pub fn about(self, call: u64) -> Self {
+        Self {
+            call: Some(call),
+            ..self
+        }
+    }
+
+    /// What the call this decides about runs with, owned and cheap to
+    /// clone, so an [`Answer::Later`] can take it along: to a side model
+    /// request, say ([`Cx::models`]). `None` for a point about no call.
+    pub fn cx(&self) -> Option<Cx> {
+        self.call.and_then(|call| self.view.cx(call))
     }
 
     pub fn model(&self) -> String {
@@ -268,13 +352,15 @@ pub struct Failed<'a> {
 }
 
 /// What to do about a failed model request.
-#[derive(Clone, Debug, PartialEq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Recover {
     /// Sends the same request again once `after` has passed; an interrupt
     /// meanwhile ends the call with nothing sent.
     Retry { after: Duration },
-    /// Sends `request` instead, at once: a compacted one, say.
-    Replace(Box<llm::Request>),
+    /// Sends the request made from the transcript as it is now, at once:
+    /// what a handler changed of the transcript (an `edit` that compacts
+    /// it, say) is in it.
+    Resend,
 }
 
 /// Declares a point whose handlers read its facts as they are.
@@ -315,11 +401,31 @@ impl Point for Input {
 
 point!(
     /// How to recover from a failed model request: send it again later, or
-    /// another in its place. With no answer the call fails.
+    /// a new one at once. With no answer the call fails. A handler may
+    /// answer later, after a side model request, say: the call waits
+    /// meanwhile, and an interrupt ends it.
     RequestError = "request_error",
     Failed<'a>,
-    Option<Recover>
+    Answer<Option<Recover>>
 );
+
+/// The request of a model call, about to be sent: a handler may rewrite it
+/// (a model fallback, a reminder appended at the tail) or answer it itself
+/// (a fixture, a cache). Each rewrite is logged as `prepare_step`, and an
+/// answer as the call's reply.
+pub struct Step;
+
+impl Point for Step {
+    const NAME: &'static str = "step";
+    type Cx<'c> = PointCx<'c>;
+    type Facts<'a> = ();
+    type In<'a> = &'a llm::Request;
+    type Out = Rewrite<llm::Request, llm::Response>;
+
+    fn input<'a, 'b: 'a>((): (), request: &'a llm::Request) -> &'a llm::Request {
+        request
+    }
+}
 
 /// What a tool call runs with: a replacement input, or a block that
 /// answers the call with why instead of running it.
@@ -345,10 +451,11 @@ point!(
 );
 point!(
     /// Answers a permission `ask`. An ask no handler answers goes to the
-    /// user, durably: see [`Gate::Ask`].
+    /// user, durably: see [`Gate::Ask`]. A handler may answer later, after
+    /// a side model request, say: the call waits meanwhile.
     Approve = "approve",
     ToolUse<'a>,
-    Option<bool>
+    Answer<Option<bool>>
 );
 
 /// A replacement for a process a tool is about to start.
@@ -529,7 +636,7 @@ impl Wire for Approve {
     }
 
     fn from_json(answer: Value) -> Self::Out {
-        answer.as_bool()
+        Answer::Now(answer.as_bool())
     }
 }
 
@@ -675,6 +782,62 @@ impl Gated {
             gate: Gate::Run,
         }
     }
+
+    /// The gate of a call asked about once the `approve` point answered:
+    /// with no answer, the user is asked.
+    pub fn approved(input: Json, mut decisions: Decided, answer: Option<(Name, bool)>) -> Self {
+        let gate = match answer {
+            None => Gate::Ask,
+            Some((who, approved)) => approval(who, approved, &mut decisions),
+        };
+        Self {
+            input,
+            decisions,
+            gate,
+        }
+    }
+}
+
+/// The gate once `who` answered an ask, its decision logged.
+fn approval(who: Name, approved: bool, decided: &mut Decided) -> Gate {
+    let gate = if approved {
+        Gate::Run
+    } else {
+        Gate::Refuse(format!("{who} did not approve this call"))
+    };
+    decided.push((who, Verdict::Approval { approved }));
+    gate
+}
+
+/// What the gate makes of a call: decided now, or once an `approve`
+/// handler's later answer comes.
+#[derive(Debug, PartialEq)]
+pub enum Gating {
+    Now(Gated),
+    Approving(Approving),
+}
+
+impl Gating {
+    /// What was decided, if it all was now.
+    pub fn now(self) -> Option<Gated> {
+        match self {
+            Self::Now(gated) => Some(gated),
+            Self::Approving(_) => None,
+        }
+    }
+}
+
+/// A call's gate waiting on an `approve` handler's later answer.
+#[derive(Debug, PartialEq)]
+pub struct Approving {
+    /// The input as the `pre_tool` chain left it.
+    pub input: Json,
+    /// What was decided before the ask.
+    pub decisions: Decided,
+    pub by: Name,
+    /// The `approve` handler the merge goes on from if the answer is none.
+    pub next: usize,
+    pub answer: Later<Option<bool>>,
 }
 
 /// What the gate makes of a tool call.
@@ -749,9 +912,36 @@ impl Hooks {
     }
 
     /// How to recover a model call from `failed`, if any handler says, and
-    /// who said: the kernel logs it as the attempt it starts.
-    pub fn request_error(&self, cx: &PointCx<'_>, failed: Failed<'_>) -> Option<(Name, Recover)> {
-        self.ask::<RequestError>(cx, failed)
+    /// who said: the kernel logs it as the attempt it starts. A handler
+    /// that answers later is asked from: if its answer is none, the
+    /// handlers after it are asked with [`Hooks::request_error_from`].
+    pub fn request_error(&self, cx: &PointCx<'_>, failed: Failed<'_>) -> Asked<Recover> {
+        self.request_error_from(cx, failed, 0)
+    }
+
+    /// The `request_error` merge from its `from`th handler on.
+    pub fn request_error_from(
+        &self,
+        cx: &PointCx<'_>,
+        failed: Failed<'_>,
+        from: usize,
+    ) -> Asked<Recover> {
+        self.ask_from::<RequestError, _>(cx, failed, from)
+    }
+
+    /// The request as the `step` chain leaves it, with the rewrites to log
+    /// and, if a handler answered it, who and with what.
+    pub fn step(
+        &self,
+        cx: &PointCx<'_>,
+        request: &mut llm::Request,
+    ) -> (Decided, Option<(Name, llm::Response)>) {
+        let mut decisions = Decided::new();
+        let answered = self.run::<Step>(cx, (), request, &mut |name, before, after| {
+            let model = (before.model != after.model).then(|| after.model.to_string());
+            decisions.push((Name::clone(name), Verdict::PrepareStep { model }));
+        });
+        (decisions, answered.err())
     }
 
     pub fn spawn(&self, cx: &PointCx<'_>, spawn: &mut crate::SpawnSpec) {
@@ -767,8 +957,9 @@ impl Hooks {
     }
 
     /// Whether a call of `tool` on `input` may run, with the input as the
-    /// `pre_tool` chain leaves it, and what each handler decided.
-    pub fn gate(&self, cx: &PointCx<'_>, tool: &str, input: &Json) -> Gated {
+    /// `pre_tool` chain leaves it, and what each handler decided; or, when
+    /// an `approve` handler answers later, what was decided before it.
+    pub fn gate(&self, cx: &PointCx<'_>, tool: &str, input: &Json) -> Gating {
         let mut value = input.value();
         let mut decisions = Decided::new();
         let chained = self.run::<PreTool>(cx, tool, &mut value, &mut |name, _, input| {
@@ -788,35 +979,76 @@ impl Hooks {
                 decisions.push((name, block));
                 Gate::Refuse(reason)
             }
-            Ok(()) => self.permit(cx, tool, &value, &mut decisions),
+            Ok(()) => match self.permit(cx, tool, &value, &mut decisions) {
+                Ok(gate) => gate,
+                Err(Asked::Later { by, at, answer }) => {
+                    return Gating::Approving(Approving {
+                        input,
+                        decisions,
+                        by,
+                        next: at + 1,
+                        answer,
+                    });
+                }
+                Err(_) => unreachable!("only a later answer is left to come"),
+            },
         };
-        Gated {
+        Gating::Now(Gated {
             input,
             decisions,
             gate,
-        }
+        })
     }
 
-    /// The `permission` and `approve` points over a call let through.
-    fn permit(&self, cx: &PointCx<'_>, tool: &str, input: &Value, decided: &mut Decided) -> Gate {
+    /// The `permission` and `approve` points over a call let through: the
+    /// gate, or the `approve` answer that comes later.
+    fn permit(
+        &self,
+        cx: &PointCx<'_>,
+        tool: &str,
+        input: &Value,
+        decided: &mut Decided,
+    ) -> Result<Gate, Asked<bool>> {
         let call = ToolUse { tool, input };
         let Some((by, permission)) = self.ask::<Permission>(cx, call) else {
-            return Gate::Run;
+            return Ok(Gate::Run);
         };
         decided.push((Name::clone(&by), Verdict::Permission { permission }));
-        match permission {
+        Ok(match permission {
             protocol::Permission::Allow => Gate::Run,
-            protocol::Permission::Ask => {
-                let Some((who, approved)) = self.ask::<Approve>(cx, call) else {
-                    return Gate::Ask;
-                };
-                let why = (!approved).then(|| format!("{who} did not approve this call"));
-                decided.push((who, Verdict::Approval { approved }));
-                why.map_or(Gate::Run, Gate::Refuse)
-            }
+            protocol::Permission::Ask => match self.approve_from(cx, tool, input, 0) {
+                Asked::None => Gate::Ask,
+                Asked::Now(who, approved) => approval(who, approved, decided),
+                later @ Asked::Later { .. } => return Err(later),
+            },
             protocol::Permission::Defer => Gate::Refuse(format!("{by} deferred this call")),
             protocol::Permission::Deny => Gate::Refuse(format!("{by} denied this call")),
-        }
+        })
+    }
+
+    /// The `approve` merge over a call asked about, from its `from`th
+    /// handler on: what an answer that came later as none goes on to.
+    pub fn approve_from(
+        &self,
+        cx: &PointCx<'_>,
+        tool: &str,
+        input: &Value,
+        from: usize,
+    ) -> Asked<bool> {
+        self.ask_from::<Approve, _>(cx, ToolUse { tool, input }, from)
+    }
+
+    /// The answer at a first-answer point whose handlers may answer later,
+    /// from its `from`th handler on.
+    fn ask_from<P: Point<Out = Answer<Option<T>>>, T: 'static>(
+        &self,
+        cx: &P::Cx<'_>,
+        facts: P::Facts<'_>,
+        from: usize,
+    ) -> Asked<T> {
+        let handlers = self.handlers::<P>();
+        let rest = handlers.get(from..).unwrap_or_default();
+        P::Out::merge::<P>(rest, cx, facts, &mut (), &mut |_, (), ()| {}).from(from)
     }
 
     /// A call's outcome as the `post_tool` chain leaves it.

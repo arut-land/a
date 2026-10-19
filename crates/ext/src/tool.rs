@@ -200,6 +200,11 @@ impl Cx {
         self.host.progress(text);
     }
 
+    /// Side model requests on behalf of this call: see [`Models`].
+    pub fn models(&self) -> Option<&dyn crate::Models> {
+        self.service::<dyn crate::Models>()
+    }
+
     /// Service `S`, if an extension or the engine provides it.
     pub fn service<S: ?Sized + 'static>(&self) -> Option<&S> {
         self.host.registry().service::<S>().or_else(|| {
@@ -210,7 +215,7 @@ impl Cx {
 
     /// The call's session, as handlers at decision points see it.
     pub fn point(&self) -> PointCx<'_> {
-        PointCx::new(self.session, &self.workspace, self)
+        PointCx::new(self.session, &self.workspace, self).about(self.call)
     }
 
     /// `spawn` as the `spawn` point leaves it: every process a tool starts
@@ -237,6 +242,10 @@ impl View for Cx {
 
     fn states(&self, read: &mut dyn FnMut(&States)) {
         self.host.states(read);
+    }
+
+    fn cx(&self, call: u64) -> Option<Cx> {
+        (call == self.call).then(|| self.clone())
     }
 }
 

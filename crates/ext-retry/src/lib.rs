@@ -7,7 +7,7 @@
 use std::time::Duration;
 
 use ext::point::{Failed, Recover, RequestError};
-use ext::{Extension, Registrar};
+use ext::{Answer, Extension, Registrar};
 
 /// The `retry` extension.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -48,7 +48,7 @@ impl Extension for Retry {
 
     fn contribute(&self, r: &mut Registrar) {
         let this = *self;
-        r.on::<RequestError>(move |_, failed| this.recover(&failed));
+        r.on::<RequestError>(move |_, failed| Answer::Now(this.recover(&failed)));
     }
 }
 
@@ -62,7 +62,7 @@ mod tests {
         let failed = Failed { error, attempt };
         retry.recover(&failed).map(|r| match r {
             Recover::Retry { after } => after,
-            Recover::Replace(_) => panic!("a retry sends the same request"),
+            Recover::Resend => panic!("a retry waits"),
         })
     }
 

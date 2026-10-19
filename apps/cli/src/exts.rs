@@ -105,7 +105,11 @@ mod tests {
     fn gate(registry: &Registry, tool: &str, decided: &mut Decided) -> Gate {
         let view = Bare;
         let cx = PointCx::new(SessionId::new(), Path::new("/w"), &view);
-        let gated = registry.hooks().gate(&cx, tool, &Json::new(&json!({})));
+        let gated = (registry
+            .hooks()
+            .gate(&cx, tool, &Json::new(&json!({})))
+            .now())
+        .unwrap();
         *decided = gated.decisions;
         gated.gate
     }

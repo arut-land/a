@@ -50,6 +50,9 @@ pub struct Reg {
     pub extensions: &'static [&'static str],
     /// The handlers at the loop points.
     pub points: Option<ext::host::Registry>,
+    /// Recovers a failed model call later, by sending it again as the
+    /// transcript is then (as compaction does).
+    pub resend: bool,
 }
 
 impl Reg {
@@ -62,7 +65,13 @@ impl Reg {
             stopped: AtomicBool::new(false),
             extensions: &["fixtures"],
             points: None,
+            resend: false,
         }
+    }
+
+    pub fn resend(mut self) -> Self {
+        self.resend = true;
+        self
     }
 
     /// The default loop, asking `points`' handlers.
@@ -198,17 +207,22 @@ impl Registry for Reg {
         Answer::Now(gated)
     }
 
-    /// Retries what may pass, three times.
+    /// Retries what may pass, three times; or answers later to resend.
     fn request_error(
         &self,
         _: CallId,
         attempt: u16,
         error: &llm::Error,
-    ) -> Option<(Name, Recover)> {
+    ) -> Answer<Option<(Name, Recover)>> {
+        if self.resend {
+            return Answer::Later(Later::new(async {
+                Some((name("compact"), Recover::Resend))
+            }));
+        }
         let after = self
             .retry
-            .filter(|_| error.is_retryable() && attempt < RETRIES)?;
-        Some((name("retry"), Recover::Retry { after }))
+            .filter(|_| error.is_retryable() && attempt < RETRIES);
+        Answer::Now(after.map(|after| (name("retry"), Recover::Retry { after })))
     }
 
     fn on_stop(&self) -> Option<(Name, String)> {
@@ -611,7 +625,6 @@ pub fn call_model(call: u64, attempt: u16) -> Effect {
         call: id(call),
         attempt,
         choice: ToolChoice::Auto,
-        request: None,
     }
 }
 

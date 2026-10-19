@@ -355,8 +355,9 @@ kinds! {
     /// holds it beside its call: the call names the tool.
     #[derive(Clone, Debug, PartialEq, Eq, Serialize)]
     pub enum Verdict: d = "d" in EntryFields {
-        /// The request of the model call was replaced before it was sent.
-        PrepareStep "prepare_step";
+        /// The request of the model call was replaced before it was sent;
+        /// `model` is the model it went to instead, if that changed.
+        PrepareStep "prepare_step" { model: Option<String> = default };
         /// The tool call's input was replaced by `input`.
         PreTool "pre_tool" { input: Json };
         /// The tool call was blocked before it ran.
@@ -1453,7 +1454,9 @@ mod tests {
             Body::Decision {
                 by: "hook".into(),
                 call: CallId::new(3),
-                d: Verdict::PrepareStep,
+                d: Verdict::PrepareStep {
+                    model: Some("cheap".into()),
+                },
             },
             Body::Decision {
                 by: "hook".into(),
@@ -1496,7 +1499,7 @@ mod tests {
                 format!(
                     r#"{head}"decision","by":"policy","call":4,"d":"permission","permission":"ask"}}"#
                 ),
-                format!(r#"{head}"decision","by":"hook","call":3,"d":"prepare_step"}}"#),
+                format!(r#"{head}"decision","by":"hook","call":3,"d":"prepare_step","model":"cheap"}}"#),
                 format!(
                     r#"{head}"decision","by":"hook","call":4,"d":"post_tool","original":{{"status":"failed","error":"e"}}}}"#
                 ),

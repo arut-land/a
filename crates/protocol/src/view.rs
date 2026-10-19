@@ -872,7 +872,10 @@ pub fn recap_line(recap: &Recap) -> String {
 pub fn decision_line(tool: &str, call: Option<u64>, decision: &Verdict) -> String {
     let call = call.unwrap_or_default();
     match decision {
-        Verdict::PrepareStep => format!("rewrote the request of call {call}"),
+        Verdict::PrepareStep { model: None } => format!("rewrote the request of call {call}"),
+        Verdict::PrepareStep { model: Some(model) } => {
+            format!("sent call {call} to {model}")
+        }
         Verdict::PreTool { .. } => format!("rewrote the input of {tool}"),
         Verdict::Block { reason } => format!("blocked {tool}: {reason}"),
         Verdict::Permission { permission } => {

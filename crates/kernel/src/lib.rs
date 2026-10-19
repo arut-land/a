@@ -91,6 +91,12 @@ pub enum Event {
     Gated { call: CallId, gated: Gated },
     /// The backoff before retrying model call `call` is over.
     Woke { call: CallId },
+    /// How to recover model call `call`, answered later
+    /// ([`Effect::Recover`]): `None` fails it.
+    Recovered {
+        call: CallId,
+        recovered: Option<(Name, Recover)>,
+    },
     /// Child session `child` settled with `outcome`.
     ChildSettled { child: SessionId, outcome: Outcome },
     /// A new registry generation, taken up at the next step boundary.
@@ -144,15 +150,13 @@ pub enum Effect {
         ticket: Ticket,
         result: Result<(), String>,
     },
-    /// Ask the model to reply to the transcript before `call`, as attempt
-    /// `attempt` (from 0), streaming under it, with the tools `choice`
-    /// lets it call; with `request`, send that instead, as the
-    /// `request_error` point replaced it.
+    /// Ask the model to reply to the transcript before `call`, as it is
+    /// now, as attempt `attempt` (from 0), streaming under it, with the
+    /// tools `choice` lets it call.
     CallModel {
         call: CallId,
         attempt: u16,
         choice: ToolChoice,
-        request: Option<Box<llm::Request>>,
     },
     /// Run tool call `call`.
     RunTool {
@@ -170,6 +174,13 @@ pub enum Effect {
     /// Await the gate's answer for call `call`; it comes back as
     /// [`Event::Gated`]. Dropped by a [`Effect::Cancel`] of the call.
     Await { call: CallId, answer: Later<Gated> },
+    /// Await how to recover model call `call`, which a `request_error`
+    /// handler answers later; it comes back as [`Event::Recovered`].
+    /// Dropped by a [`Effect::Cancel`] of the call.
+    Recover {
+        call: CallId,
+        answer: Later<Option<(Name, Recover)>>,
+    },
     /// Wake the session with [`Event::Woke`] after `after`.
     Sleep { call: CallId, after: Duration },
     /// Stop what runs, or sleeps, for call `call`; it reports as it ends.
@@ -219,6 +230,9 @@ pub enum ModelPhase {
     Streaming,
     /// Its last attempt failed; it is sent again once [`Event::Woke`].
     Backoff,
+    /// Its last attempt failed, and a `request_error` handler answers
+    /// later how to recover ([`Event::Recovered`]).
+    Recovering,
 }
 
 /// Where an open tool call stands, as the kernel drives it.
@@ -287,14 +301,15 @@ pub trait Registry: Send + Sync {
 
     /// The `request_error` point: how to recover model call `call` from
     /// the failure of its attempt `attempt` (from 0, counted in the log, so
-    /// a restart does not start again). With no answer the call fails.
+    /// a restart does not start again), and who says; now or later. With
+    /// no answer the call fails.
     fn request_error(
         &self,
         _call: CallId,
         _attempt: u16,
         _error: &llm::Error,
-    ) -> Option<(Name, Recover)> {
-        None
+    ) -> Answer<Option<(Name, Recover)>> {
+        Answer::Now(None)
     }
 
     /// The `post_tool` point: the outcome as the chain leaves it.
