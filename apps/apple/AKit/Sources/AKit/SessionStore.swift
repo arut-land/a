@@ -45,6 +45,19 @@ public final class SessionStore {
         }
     }
 
+    /// Whether a model call, tool call or command runs: what an interrupt
+    /// stops. The rule of the Rust clients' `SessionView::running`.
+    public var running: Bool {
+        items.contains {
+            switch $0 {
+            case .reply(_, _, _, .running, _): true
+            case .tool(_, _, _, _, let approval, nil, _, _): approval != .pending && approval != .denied
+            case .command(_, _, _, nil): true
+            default: false
+            }
+        }
+    }
+
     /// Starts following the source's updates.
     public func listen() {
         guard listening == nil else { return }
@@ -68,6 +81,10 @@ public final class SessionStore {
 
     public func approve(call: UInt64, approved: Bool) async {
         await run { try await $0.approve(call: call, approved: approved) }
+    }
+
+    public func interrupt() async {
+        await run { try await $0.interrupt() }
     }
 
     public func detach() async {

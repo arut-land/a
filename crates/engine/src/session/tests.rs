@@ -1599,3 +1599,5 @@ fn input_waits_its_turn_behind_a_call_waiting_for_approval() {
         .collect();
     assert_eq!(after, [&user("next"), &echo("next")]);
 }
+
+mod interrupt;

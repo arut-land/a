@@ -33,6 +33,10 @@ struct ChatView: View {
                 TextField("Message, or $ command", text: $input)
                     .textFieldStyle(.plain)
                     .onSubmit(send)
+                if store.running {
+                    Button("Stop", systemImage: "stop.circle") { Task { await store.interrupt() } }
+                        .keyboardShortcut(".", modifiers: .command)
+                }
                 Button("Send", action: send)
                     .keyboardShortcut(.return, modifiers: .command)
                     .disabled(input.trimmingCharacters(in: .whitespaces).isEmpty || store.link == .closed)

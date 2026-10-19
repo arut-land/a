@@ -11,7 +11,7 @@ use topcoat::Result;
 use topcoat::runtime::Event;
 use topcoat::view::{View, component, view};
 
-use crate::app::approve;
+use crate::app::{approve, interrupt};
 use crate::style;
 
 /// The transcript of `view`, as the browser tab `tab` shows it.
@@ -22,12 +22,14 @@ pub async fn transcript_column(
     error: Option<String>,
     ended: bool,
 ) -> Result<impl View> {
+    let running = view.running();
     let SessionView {
         items,
         recap,
         streaming,
         ..
     } = view;
+    let stop = tab.clone();
     let empty = items.is_empty();
     Ok(view! {
         <div style=(style::COLUMN)>
@@ -40,6 +42,11 @@ pub async fn transcript_column(
             #[key(item.key())]
             for item in items {
                 item_row(item: item, tab: tab.clone(), streaming: streaming.clone())
+            }
+            if running {
+                <div style=(style::ASK)>
+                    <button style=(style::BUTTON_QUIET) @click=$(async |_e: Event| { interrupt(stop).await; })>"Stop"</button>
+                </div>
             }
             if let Some(error) = error {
                 <p style=(style::BAD)>(error)</p>

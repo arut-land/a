@@ -65,6 +65,16 @@ func aLiveSessionChatsRunsAnApprovedToolAndIsListed() async throws {
     // The recap reads as the Rust clients print it.
     #expect(other.recap?.line.hasPrefix("recap · you: $ echo hello · ran bash") == true)
 
+    // A running call stops on an interrupt.
+    #expect(!store.running)
+    await store.send("$ sleep 30")
+    try await eventually("the second ask") { !store.pendingAsks.isEmpty }
+    guard case .tool(let sleep, _, _, _, _, _, _, _) = store.pendingAsks[0] else { return }
+    await store.approve(call: sleep, approved: true)
+    try await eventually("the call to run") { store.running }
+    await store.interrupt()
+    try await eventually("the call to stop") { !store.running }
+
     await store.detach()
     await other.detach()
     #expect(store.problem == nil && other.problem == nil)
