@@ -37,7 +37,7 @@ use smallvec::SmallVec;
 mod fold;
 mod session;
 
-pub use crate::session::Core;
+pub use crate::session::{Core, RESTART_CAP};
 
 /// What a step returns, in order. The driver commits each run of
 /// [`Effect::Append`]s before the effect after it starts, and the last run

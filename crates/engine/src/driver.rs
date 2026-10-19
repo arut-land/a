@@ -1295,12 +1295,12 @@ impl kernel::Registry for Bound {
         (Some(parsed), card)
     }
 
-    /// A transform fails open: the text goes on as it was.
+    /// Fails closed ([`ext::point::Input::ON_ERROR`]): input a handler
+    /// could not decide on is refused, and its client told why.
     fn input(&self, text: String) -> Result<Chained<String>, String> {
-        let original = text.clone();
         guarded(
             || self.registry.hooks().input(&self.point(), text),
-            |_| Ok(Chained::new(original)),
+            |why| Err(format!("the input point {why}")),
         )
     }
 

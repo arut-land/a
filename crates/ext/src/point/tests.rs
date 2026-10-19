@@ -67,7 +67,8 @@ macro_rules! every_point {
             SessionEnd,
             Turn,
             Reply,
-            Resume
+            Resume,
+            Step
         )
     };
 }
@@ -88,6 +89,7 @@ const TABLE: &[(&str, Merge)] = &[
     ("turn", Merge::Chain),
     ("reply", Merge::Chain),
     ("resume", Merge::FirstSome),
+    ("step", Merge::Chain),
 ];
 
 /// A chain point merges as a chain: each handler sees what the last left,
@@ -226,6 +228,35 @@ fn observes<P: Point<Out = ()>>(cx: &P::Cx<'_>, facts: P::Facts<'_>) {
     });
     hooks(by.into()).run::<P>(cx, facts, &mut (), &mut |_, (), ()| {});
     assert_eq!(*told.lock().unwrap(), ["a", "b", "c"], "{}", P::NAME);
+}
+
+/// Every point says what a failing handler comes to, and what decides
+/// about running something fails closed.
+#[test]
+fn every_point_declares_its_failure_policy() {
+    use OnError::{FailClosed, FailOpen};
+    macro_rules! table {
+        ($($point:ident),*) => { [$(($point::NAME, $point::ON_ERROR)),*] };
+    }
+    let declared = every_point!(table);
+    let want = [
+        ("input", FailClosed),
+        ("request_error", FailOpen),
+        ("pre_tool", FailClosed),
+        ("permission", FailClosed),
+        ("approve", FailClosed),
+        ("spawn", FailClosed),
+        ("post_tool", FailOpen),
+        ("on_stop", FailOpen),
+        ("observe", FailOpen),
+        ("session_start", FailOpen),
+        ("session_end", FailOpen),
+        ("turn", FailOpen),
+        ("reply", FailOpen),
+        ("resume", FailOpen),
+        ("step", FailOpen),
+    ];
+    assert_eq!(declared, want);
 }
 
 #[test]

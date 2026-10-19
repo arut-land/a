@@ -18,6 +18,7 @@ use serde_json::{Value, json};
 
 use super::*;
 
+mod fails;
 mod interrupt;
 mod log;
 mod parsed;

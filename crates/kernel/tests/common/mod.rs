@@ -53,6 +53,8 @@ pub struct Reg {
     /// Recovers a failed model call later, by sending it again as the
     /// transcript is then (as compaction does).
     pub resend: bool,
+    /// Retries every failure, however often: a retry policy with no limit.
+    pub forever: bool,
 }
 
 impl Reg {
@@ -66,7 +68,13 @@ impl Reg {
             extensions: &["fixtures"],
             points: None,
             resend: false,
+            forever: false,
         }
+    }
+
+    pub fn forever(mut self) -> Self {
+        self.forever = true;
+        self
     }
 
     pub fn resend(mut self) -> Self {
@@ -214,6 +222,10 @@ impl Registry for Reg {
         attempt: u16,
         error: &llm::Error,
     ) -> Answer<Option<(Name, Recover)>> {
+        if self.forever {
+            let after = Duration::ZERO;
+            return Answer::Now(Some((name("retry"), Recover::Retry { after })));
+        }
         if self.resend {
             return Answer::Later(Later::new(async {
                 Some((name("compact"), Recover::Resend))

@@ -35,6 +35,30 @@ fn progress(call: u64, text: &str) -> Body {
     }
 }
 
+/// A daemon that keeps dying during a model call: each restart counts the
+/// attempt it cut off, and past [`kernel::RESTART_CAP`] the call fails,
+/// whatever the `request_error` point would say.
+#[test]
+fn a_crash_loop_cannot_retry_forever() {
+    let reg = || Reg::chat().forever().arc();
+    let mut log = log([input("hi"), model_call(0)]);
+    for _ in 0..kernel::RESTART_CAP {
+        let (s, fx) = Session::resume(reg(), log, &BUSY_LOAD);
+        assert!(matches!(fx.last(), Some(Effect::Sleep { .. })), "{fx:?}");
+        log = s.log;
+    }
+    let (s, fx) = Session::resume(reg(), log, &BUSY_LOAD);
+    assert!(
+        !fx.iter()
+            .any(|e| matches!(e, Effect::Sleep { .. } | Effect::CallModel { .. }))
+    );
+    let last = &s.log.last().unwrap().body;
+    assert!(
+        matches!(last, Body::ModelResult { outcome: Outcome::Failed { error }, .. } if error.contains("gave up after 10 attempts")),
+        "{last:?}"
+    );
+}
+
 /// A call the agent refused is answered so after a crash cut it off
 /// before its answer committed: never run, whatever of it committed.
 #[test]
@@ -189,7 +213,7 @@ fn a_model_call_cut_off_is_retried_as_a_failed_attempt() {
 /// Restarts count as attempts, in the log: a session that crashes during
 /// every attempt fails the call once the retries run out.
 #[test]
-fn a_crash_loop_cannot_retry_forever() {
+fn a_crash_loop_fails_once_the_retries_run_out() {
     let reg = || Reg::chat().retry(Duration::ZERO).arc();
     let mut log = log([input("hi"), model_call(0)]);
     for _ in 0..RETRIES {

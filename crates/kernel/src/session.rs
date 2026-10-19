@@ -23,6 +23,11 @@ use crate::{
 /// Who refused a call the agent would not run.
 const AGENT: &str = "agent";
 
+/// The most attempts a model call a restart cut off is sent again after,
+/// whatever the `request_error` point says: a daemon that keeps dying
+/// mid-call cannot retry it forever.
+pub const RESTART_CAP: u16 = 10;
+
 /// A session's kernel: its log folded, its turn, and the registry
 /// generation its steps run on.
 pub struct Core {
@@ -976,6 +981,10 @@ impl Core {
     /// count as attempts and a crash loop cannot retry forever.
     fn restart(&mut self, call: CallId, attempt: u16, fx: &mut Effects) {
         let error = llm::Error::new(llm::Kind::Incomplete, "the daemon stopped during the call");
+        if attempt >= RESTART_CAP {
+            let error = format!("{error}; gave up after {attempt} attempts");
+            return self.settle(call, Outcome::Failed { error }, fx);
+        }
         if !self.retry(call, attempt, &error, fx) {
             let error = error.to_string();
             self.settle(call, Outcome::Failed { error }, fx);

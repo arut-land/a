@@ -62,10 +62,23 @@ pub enum Merge {
     Observe,
 }
 
+/// What a handler that fails (panics) at a point comes to: declared by
+/// every point, applied by the engine.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum OnError {
+    /// It is passed over: what it would have changed stays as it was.
+    FailOpen,
+    /// What it decides about is refused: a call is not run, a process not
+    /// started, input not taken.
+    FailClosed,
+}
+
 /// A decision point.
 pub trait Point: Sized + 'static {
     /// The point's name, as an [`ErasedHandler`] gives it.
     const NAME: &'static str;
+    /// What a handler that fails here comes to.
+    const ON_ERROR: OnError;
     /// What a handler is given of the session: a [`PointCx`], or `()` at
     /// a loop point.
     type Cx<'c>;
@@ -366,12 +379,13 @@ pub enum Recover {
 
 /// Declares a point whose handlers read its facts as they are.
 macro_rules! point {
-    ($(#[$doc:meta])* $point:ident = $name:literal, $facts:ty, $out:ty) => {
+    ($(#[$doc:meta])* $point:ident = $name:literal, $on_error:ident, $facts:ty, $out:ty) => {
         $(#[$doc])*
         pub struct $point;
 
         impl Point for $point {
             const NAME: &'static str = $name;
+            const ON_ERROR: OnError = OnError::$on_error;
             type Cx<'c> = PointCx<'c>;
             type Facts<'a> = $facts;
             type In<'a> = $facts;
@@ -390,6 +404,7 @@ pub struct Input;
 
 impl Point for Input {
     const NAME: &'static str = "input";
+    const ON_ERROR: OnError = OnError::FailClosed;
     type Cx<'c> = PointCx<'c>;
     type Facts<'a> = ();
     type In<'a> = &'a str;
@@ -406,6 +421,7 @@ point!(
     /// answer later, after a side model request, say: the call waits
     /// meanwhile, and an interrupt ends it.
     RequestError = "request_error",
+    FailOpen,
     Failed<'a>,
     Answer<Option<Recover>>
 );
@@ -418,6 +434,7 @@ pub struct Step;
 
 impl Point for Step {
     const NAME: &'static str = "step";
+    const ON_ERROR: OnError = OnError::FailOpen;
     type Cx<'c> = PointCx<'c>;
     type Facts<'a> = ();
     type In<'a> = &'a llm::Request;
@@ -434,6 +451,7 @@ pub struct PreTool;
 
 impl Point for PreTool {
     const NAME: &'static str = "pre_tool";
+    const ON_ERROR: OnError = OnError::FailClosed;
     type Cx<'c> = PointCx<'c>;
     type Facts<'a> = &'a str;
     type In<'a> = ToolUse<'a>;
@@ -447,6 +465,7 @@ impl Point for PreTool {
 point!(
     /// Whether a call may run.
     Permission = "permission",
+    FailClosed,
     ToolUse<'a>,
     protocol::Permission
 );
@@ -455,6 +474,7 @@ point!(
     /// user, durably: see [`Gate::Ask`]. A handler may answer later, after
     /// a side model request, say: the call waits meanwhile.
     Approve = "approve",
+    FailClosed,
     ToolUse<'a>,
     Answer<Option<bool>>
 );
@@ -462,8 +482,11 @@ point!(
 /// A replacement for a process a tool is about to start.
 pub struct Spawn;
 
+/// A panicking handler refuses the process: one a sandbox would have
+/// wrapped is never started bare.
 impl Point for Spawn {
     const NAME: &'static str = "spawn";
+    const ON_ERROR: OnError = OnError::FailClosed;
     type Cx<'c> = PointCx<'c>;
     type Facts<'a> = ();
     type In<'a> = &'a crate::SpawnSpec;
@@ -479,6 +502,7 @@ pub struct PostTool;
 
 impl Point for PostTool {
     const NAME: &'static str = "post_tool";
+    const ON_ERROR: OnError = OnError::FailOpen;
     type Cx<'c> = PointCx<'c>;
     type Facts<'a> = ToolUse<'a>;
     type In<'a> = Finished<'a>;
@@ -497,24 +521,28 @@ point!(
     /// Text to continue with once the agent stopped. A handler that reads
     /// the session's log folds what it needs of it as typed state.
     OnStop = "on_stop",
+    FailOpen,
     (),
     Option<String>
 );
 point!(
     /// Each entry, once committed.
     Observe = "observe",
+    FailOpen,
     &'a Entry,
     ()
 );
 point!(
     /// The session's actor started: it was created, or loaded again.
     SessionStart = "session_start",
+    FailOpen,
     (),
     ()
 );
 point!(
     /// The session's actor stopped: it hibernated, or the daemon drained.
     SessionEnd = "session_end",
+    FailOpen,
     (),
     ()
 );
@@ -526,6 +554,7 @@ pub struct Turn;
 
 impl Point for Turn {
     const NAME: &'static str = "turn";
+    const ON_ERROR: OnError = OnError::FailOpen;
     type Cx<'c> = ();
     type Facts<'a> = &'a crate::Input;
     type In<'a> = (&'a crate::Input, &'a Actions);
@@ -553,6 +582,7 @@ pub struct Replied<'a> {
 
 impl Point for Reply {
     const NAME: &'static str = "reply";
+    const ON_ERROR: OnError = OnError::FailOpen;
     type Cx<'c> = ();
     type Facts<'a> = (u16, &'a llm::Response);
     type In<'a> = Replied<'a>;
@@ -576,6 +606,7 @@ pub struct Resume;
 
 impl Point for Resume {
     const NAME: &'static str = "resume";
+    const ON_ERROR: OnError = OnError::FailOpen;
     type Cx<'c> = ();
     type Facts<'a> = u16;
     type In<'a> = u16;
@@ -956,6 +987,9 @@ impl Hooks {
         (decisions, answered.err())
     }
 
+    /// `spawn` as the `spawn` chain leaves it. A handler that panics takes
+    /// the call that asked down with it, before its process starts: the
+    /// engine contains the call, which fails ([`Spawn::ON_ERROR`]).
     pub fn spawn(&self, cx: &PointCx<'_>, spawn: &mut crate::SpawnSpec) {
         let Ok(()) = self.run::<Spawn>(cx, (), spawn, &mut |_, _, _| {});
     }
