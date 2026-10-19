@@ -426,6 +426,7 @@ fn hello(conn: &mut Connection, build: &str, first: &[ClientMsg]) -> io::Result<
         build: build.to_owned(),
         min: Versions::OURS.min_field(),
         caps: Caps::ALL,
+        client: None,
     })?;
     // A daemon that refuses the hello may hang up before reading these, so
     // failing to send them matters only once welcomed.

@@ -279,13 +279,23 @@ mod tests {
         let done = Outcome::Done {
             output: serde_json::json!({ "slept": 1 }).into(),
         };
+        let call = Body::ToolCall {
+            tool: "sleep".into(),
+            input: protocol::Json::null(),
+            id: None,
+            card: None,
+            by: protocol::Audience::Model,
+        };
         let ran = Body::ToolResult {
-            call: 1,
+            call: 2,
             outcome: done.clone(),
             card: None,
         };
         let of = |entries: &[Entry]| result(&Ledger::of(entries));
-        assert_eq!(of(&[entry(1, said("a")), entry(2, ran)]), done);
+        assert_eq!(
+            of(&[entry(1, said("a")), entry(2, call), entry(3, ran)]),
+            done
+        );
         assert_eq!(
             of(&[entry(1, said("a")), entry(2, said("b"))]),
             Outcome::Done { output: "b".into() }

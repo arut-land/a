@@ -98,6 +98,7 @@ fn bridge_speaks_the_protocol_over_stdio() {
         build: "far".into(),
         min: None,
         caps: protocol::Caps::NONE,
+        client: None,
     });
     send(&ClientMsg::Attach {
         target: Target::New,

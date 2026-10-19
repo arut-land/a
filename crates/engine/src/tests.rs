@@ -1,7 +1,9 @@
 use std::path::PathBuf;
 use std::time::{Duration, Instant};
 
-use protocol::{Activity, Body, Entry, Environment, Outcome, Residency, SessionId, Target};
+use protocol::{
+    Activity, Audience, Body, Entry, Environment, Outcome, Residency, SessionId, Target,
+};
 use serde_json::json;
 use store::{Header, Jsonl, LogStore};
 use sys::Home;
@@ -141,6 +143,7 @@ fn busy_sessions_recover_at_startup() {
             input: input.into(),
             id: None,
             card: None,
+            by: Audience::Model,
         };
         created
             .log
@@ -440,6 +443,7 @@ fn watches_rearm_after_a_crash_and_fire_once() {
         input: json!({ "seconds": 0 }).into(),
         id: None,
         card: None,
+        by: Audience::Model,
     };
     let slept = Outcome::Done {
         output: json!({ "slept": 0 }).into(),
@@ -565,6 +569,7 @@ fn an_orphan_does_not_resume_what_it_was_doing() {
             input: json!({ "seconds": 0 }).into(),
             id: None,
             card: None,
+            by: Audience::Model,
         },
     ];
     for (seq, body) in (1..).zip(bodies_written) {

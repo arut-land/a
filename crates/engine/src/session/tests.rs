@@ -58,6 +58,7 @@ fn finds_calls_without_outcomes() {
         input: json!({}).into(),
         id: None,
         card: None,
+        by: Audience::Model,
     };
     let entries = [
         entry(1, tool_call("sleep")),
@@ -79,7 +80,13 @@ fn finds_calls_without_outcomes() {
                 background: false,
             },
         ),
-        entry(5, Body::ModelCall { model: "m".into() }),
+        entry(
+            5,
+            Body::ModelCall {
+                model: "m".into(),
+                attempt: 0,
+            },
+        ),
     ];
     let dangling = dangling_calls(&Ledger::of(&entries));
     assert_eq!(dangling.len(), 2);
@@ -95,7 +102,13 @@ fn transcripts_of_earlier_logs_read_replies_as_text() {
     };
     let entries = [
         entry(1, Body::User { text: "hi".into() }),
-        entry(2, Body::ModelCall { model: "m".into() }),
+        entry(
+            2,
+            Body::ModelCall {
+                model: "m".into(),
+                attempt: 0,
+            },
+        ),
         entry(
             3,
             Body::ModelResult {
@@ -109,7 +122,13 @@ fn transcripts_of_earlier_logs_read_replies_as_text() {
                 text: "again".into(),
             },
         ),
-        entry(5, Body::ModelCall { model: "m".into() }),
+        entry(
+            5,
+            Body::ModelCall {
+                model: "m".into(),
+                attempt: 0,
+            },
+        ),
     ];
     let turns = transcript(&entries, 5, Arc::default());
     assert_eq!(
@@ -547,7 +566,7 @@ fn a_missing_credential_fails_the_model_call_saying_where_to_set_it() {
     let error = match &bodies(&log)[..] {
         [
             Body::User { .. },
-            Body::ModelCall { model },
+            Body::ModelCall { model, .. },
             Body::ModelResult {
                 outcome: Outcome::Failed { error },
                 ..
@@ -764,6 +783,7 @@ fn hook_decisions_are_logged_and_replay_to_the_same_state() {
                     title: "$ echo hi".into(),
                     ..Card::default()
                 }),
+                by: Audience::Model,
             },
             &Body::ToolResult {
                 call: 3,
@@ -1090,6 +1110,7 @@ fn an_interrupt_before_recovery_starts_stops_it() {
             input: json!({ "seconds": 1 }).into(),
             id: None,
             card: None,
+            by: Audience::Model,
         },
     )]);
     session.interrupt();
@@ -1134,6 +1155,7 @@ fn a_recap_tells_the_last_prompt_and_what_followed() {
         input: json!({}).into(),
         id: None,
         card: None,
+        by: Audience::Model,
     };
     let entries = [
         entry(
@@ -1646,7 +1668,7 @@ fn an_interrupted_turn_answers_the_calls_it_leaves_and_goes_no_further() {
                     outcome: Outcome::Failed { .. },
                     ..
                 },
-                Body::Interrupt,
+                Body::Interrupt { .. },
             ]
         ),
         "{log:#?}"
@@ -1669,6 +1691,7 @@ fn an_unsafe_call_cut_off_reports_the_output_it_committed() {
         input: json!({ "command": "make" }).into(),
         id: None,
         card: None,
+        by: Audience::Model,
     };
     let progress = |text: &str| Body::Progress {
         call: 2,

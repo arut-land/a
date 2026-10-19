@@ -238,7 +238,7 @@ fn merge_rules_are_applied_identically_for_every_point() {
     first::<Approve, _>(call, [true, false]);
     first::<OnStop, _>(&Vec::new(), ["a", "b"].map(str::to_owned));
 
-    let entry = Entry::new(1, 0, protocol::Body::Interrupt);
+    let entry = Entry::new(1, 0, protocol::Body::INTERRUPT);
     observes::<Observe>(&entry);
     observes::<SessionStart>(());
     observes::<SessionEnd>(());
@@ -293,7 +293,7 @@ fn a_point_with_no_handler_costs_nothing() {
         let retry = hooks.request_error(&cx, (1, 1), &request, "e", &mut decided);
         assert!(retry.is_none());
         hooks.post_tool(&cx, 1, ("t", &input), &mut outcome, &mut decided);
-        hooks.observe(&cx, &Entry::new(1, 0, protocol::Body::Interrupt));
+        hooks.observe(&cx, &Entry::new(1, 0, protocol::Body::INTERRUPT));
         hooks.session_start(&cx);
         hooks.session_end(&cx);
         assert_eq!((text.as_str(), &subject), ("hi", &input));

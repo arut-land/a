@@ -12,11 +12,11 @@ use std::time::{Duration, Instant};
 
 use ext::host::{Decided, Gate, Host, Parts, Registry};
 use ext::{Action, Agent, Cancel, Cx, DynTool, Facts, Input, Replay, Route, States};
-use protocol::ledger::{self, Ledger, Phase};
+use protocol::ledger::{self, Ledger, OutcomeKind, Phase};
 use protocol::view::SessionView;
 use protocol::{
-    Activity, Body, Cap, Card, DaemonMsg, Decision, Entry, Environment, Frame, Installed, Json,
-    Outcome, Overrides, Residency, SessionId, SessionSummary,
+    Activity, Audience, Body, Cap, Card, DaemonMsg, Decision, Entry, Environment, Frame, Installed,
+    Json, Outcome, Overrides, Residency, SessionId, SessionSummary, WaitOn,
 };
 use rt::BoxFuture;
 use serde_json::{Value, json};
@@ -1011,6 +1011,7 @@ impl Session {
                     tool,
                     input: input.into(),
                     id,
+                    by: Audience::Model,
                 });
                 let outcome = Outcome::Interrupted { output: None };
                 self.record(Body::ToolResult {
@@ -1021,7 +1022,7 @@ impl Session {
                 drop(agent.step(Input::ToolDone { call, outcome }));
             }
         }
-        self.record(Body::Interrupt);
+        self.record(Body::INTERRUPT);
         self.flush().await
     }
 
@@ -1044,7 +1045,12 @@ impl Session {
                 let name = model
                     .as_ref()
                     .map_or_else(|_| "none".to_owned(), Model::name);
-                let seq = self.append(Body::ModelCall { model: name }).await?;
+                let seq = self
+                    .append(Body::ModelCall {
+                        model: name,
+                        attempt: 0,
+                    })
+                    .await?;
                 (Call::Model, seq, self.run_model(seq, model).await)
             }
             Action::RunTool {
@@ -1071,6 +1077,7 @@ impl Session {
                         tool: tool.clone(),
                         input: Json::new(&input),
                         id,
+                        by: Audience::Model,
                     })
                     .await?;
                 let outcome = match gate {
@@ -1400,6 +1407,7 @@ impl Session {
             self.broadcast(&DaemonMsg::Delta {
                 call,
                 text: text.to_owned(),
+                attempt: 0,
             });
         };
         contain(self.reply(call, &model, &registry, request, &mut on_text)).await
@@ -1624,10 +1632,10 @@ impl Session {
         };
         let outcome = match &call {
             _ if orphan => interrupted(),
-            Call::Tool { tool, input } if phase == Phase::Asked => {
+            Call::Tool { tool, input } if phase == Phase::Waiting(WaitOn::Approval) => {
                 self.ask(seq, tool, input).await?
             }
-            Call::Tool { .. } if phase == (Phase::Answered { approved: false }) => not_approved(),
+            Call::Tool { .. } if phase == Phase::Settled(OutcomeKind::Failed) => not_approved(),
             Call::Tool { tool, .. }
                 if registry.tools().get(tool).map(DynTool::replay) != Some(Replay::Safe) =>
             {
@@ -1849,14 +1857,14 @@ fn dangling_calls(ledger: &Ledger) -> Vec<Dangling> {
         .map(|(seq, open)| Dangling {
             seq,
             call: match &open.call {
-                ledger::Call::Model => Call::Model,
-                ledger::Call::Tool { tool, input } => Call::Tool {
+                ledger::Call::Model { .. } => Call::Model,
+                ledger::Call::Tool { tool, input, .. } => Call::Tool {
                     tool: tool.clone(),
                     input: input.value(),
                 },
             },
             processes: open.processes.clone(),
-            phase: open.phase,
+            phase: open.phase.clone(),
         })
         .collect()
 }

@@ -121,6 +121,7 @@ fn hello(caps: Caps) -> ClientMsg {
         build: "test".into(),
         min: None,
         caps,
+        client: None,
     }
 }
 
@@ -169,7 +170,7 @@ fn a_pipelined_hello_attach_and_input_are_answered_in_order() {
     let DaemonMsg::Welcome { caps, client, .. } = peer.recv() else {
         panic!("no welcome");
     };
-    assert_eq!((caps, client), (Caps::ALL, 1));
+    assert_eq!((caps, client), (Caps::SERVED, 1));
     assert!(matches!(peer.recv(), DaemonMsg::Attached { .. }));
     assert!(matches!(peer.recv(), DaemonMsg::Synced { seq: 0 }));
     // The input is logged before it is acknowledged.
@@ -305,6 +306,7 @@ fn a_mismatched_hello_gets_the_range_and_nothing_behind_it_is_done() {
         build: "test".into(),
         min: Some(PROTO + 1),
         caps: Caps::ALL,
+        client: None,
     });
     peer.send(&attach(Target::New, 0, ClientDecl::default()));
     peer.send(&input("hi", 1));
@@ -325,6 +327,7 @@ fn a_mismatched_hello_gets_the_range_and_nothing_behind_it_is_done() {
         build: "test".into(),
         min: Some(PROTO),
         caps: Caps::NONE,
+        client: None,
     });
     assert!(matches!(
         peer.recv(),

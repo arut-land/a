@@ -527,7 +527,7 @@ const fn numbered(msg: &ClientMsg, seq: u64) -> bool {
 mod tests {
     use std::path::PathBuf;
 
-    use protocol::{Body, Caps, Entry, Origin, SessionId};
+    use protocol::{Audience, Body, Caps, Entry, Origin, SessionId};
 
     use super::*;
 
@@ -756,6 +756,7 @@ mod tests {
                     input: serde_json::json!({ "command": "ls" }).into(),
                     id: None,
                     card: None,
+                    by: Audience::Model,
                 },
             )),
         ));

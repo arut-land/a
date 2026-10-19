@@ -397,7 +397,7 @@ impl SessionView {
                 })
             }
             DaemonMsg::Entry(e) => self.entry(e),
-            DaemonMsg::Delta { call, text } => {
+            DaemonMsg::Delta { call, text, .. } => {
                 match &mut self.streaming {
                     Some(s) if s.call == *call => s.text.push_str(text),
                     s => {
@@ -524,7 +524,7 @@ impl SessionView {
                 args: args.clone(),
                 outcome: None,
             },
-            Body::ModelCall { model } => Item::Reply {
+            Body::ModelCall { model, .. } => Item::Reply {
                 call: seq,
                 model: model.clone(),
                 text: String::new(),
