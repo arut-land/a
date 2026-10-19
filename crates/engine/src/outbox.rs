@@ -6,9 +6,12 @@
 //! many wait.
 
 use std::collections::VecDeque;
-use std::sync::{Arc, Condvar, Mutex, PoisonError, RwLock};
+use std::io;
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Arc, Condvar, Mutex, PoisonError};
 
 use protocol::{Caps, Class, Decode, Entry, Frame};
+use store::Lines;
 
 use crate::lock;
 
@@ -16,32 +19,55 @@ use crate::lock;
 /// it gets the committed outcome without the deltas.
 const BUDGET: usize = 1 << 20;
 
-/// The frames of a session's committed entries, each encoded once as it
-/// committed or loaded: entry `seq`'s is at `seq - 1`. `None` stands for
-/// one too large for a frame, which ends the view of a client that comes
-/// to it rather than leaving a gap in it.
-#[derive(Default)]
-pub struct FrameLog(RwLock<Vec<Option<Frame>>>);
+/// A session's committed entries, shown to its clients: the lines its log
+/// stores, each encoded once as it committed, read back by seq as a client
+/// comes to it. The bytes stay where the log keeps them (for a file, the
+/// OS's page cache), not in the daemon's memory.
+pub struct FrameLog {
+    lines: Arc<dyn Lines>,
+    /// The seq of the last entry shown. Entries are shown under the lock
+    /// they commit under, after the log holds them.
+    seq: AtomicU64,
+}
 
 impl FrameLog {
+    /// The log of `lines`, whose entries up to `seq` are committed.
+    pub fn new(lines: Arc<dyn Lines>, seq: u64) -> Self {
+        Self {
+            lines,
+            seq: AtomicU64::new(seq),
+        }
+    }
+
     /// The seq of the last entry committed.
     pub fn seq(&self) -> u64 {
-        self.read().len() as u64
+        self.seq.load(Ordering::Acquire)
     }
 
-    pub fn push(&self, frame: Option<Frame>) {
-        self.0
-            .write()
-            .unwrap_or_else(PoisonError::into_inner)
-            .push(frame);
+    /// Shows entry `seq`, the next, which the log holds already.
+    pub fn push(&self, seq: u64) {
+        let last = self.seq.swap(seq, Ordering::Release);
+        debug_assert_eq!(last + 1, seq, "entries are shown in order");
     }
 
-    /// The entries after `seq`, decoded again from their frames, in order:
-    /// for what reads the log rarely, such as recovery after a failure.
+    /// The entries after `seq`, decoded from their lines a run at a time,
+    /// in order: for what reads the log rarely, such as recovery after a
+    /// failure.
     pub fn entries_after(&self, seq: u64) -> impl Iterator<Item = Entry> + '_ {
-        (seq + 1..=self.seq()).filter_map(|seq| {
-            let frame = self.get(seq)?.ok()?;
-            Entry::from_json(&frame.as_bytes()[4..]).ok()
+        let (mut next, last) = (seq + 1, self.seq());
+        let (mut run, mut read) = (Vec::new(), VecDeque::new());
+        std::iter::from_fn(move || {
+            loop {
+                if let Some(entry) = read.pop_front() {
+                    return Some(entry);
+                }
+                if next > last {
+                    return None;
+                }
+                run.clear();
+                next += self.lines.read(next..=last, RUN, &mut run).ok()?;
+                read.extend(lines(&run).filter_map(|line| Entry::from_json(line).ok()));
+            }
         })
     }
 
@@ -49,17 +75,39 @@ impl FrameLog {
         self.entries_after(0)
     }
 
-    /// Entry `seq`'s frame, if it is committed.
-    fn get(&self, seq: u64) -> Option<Result<Frame, TooLarge>> {
-        let at = usize::try_from(seq.checked_sub(1)?).ok()?;
-        self.read()
-            .get(at)
-            .map(|frame| frame.clone().ok_or(TooLarge))
+    /// Queues the frames of the entries after `after` that one read of the
+    /// log gets, none if there are no more. One too large for a frame, or
+    /// that cannot be read back, is an error that ends the view of a client
+    /// that comes to it rather than leaving a gap in it.
+    fn read_after(&self, after: u64, ahead: &mut VecDeque<io::Result<Frame>>) {
+        let last = self.seq();
+        if after >= last {
+            return;
+        }
+        let mut run = Vec::new();
+        match self.lines.read(after + 1..=last, RUN, &mut run) {
+            Ok(_) => ahead.extend(
+                lines(&run)
+                    .zip(after + 1..)
+                    .map(|(line, seq)| Frame::from_line(seq, line)),
+            ),
+            Err(e) => ahead.push_back(Err(e)),
+        }
     }
+}
 
-    fn read(&self) -> std::sync::RwLockReadGuard<'_, Vec<Option<Frame>>> {
-        self.0.read().unwrap_or_else(PoisonError::into_inner)
-    }
+/// How many bytes of lines past the first one read of the log takes: the
+/// most a client that lags holds of what it has yet to be sent.
+const RUN: usize = 16 << 10;
+
+/// The lines of a run read, each of which ends in a newline, without it.
+fn lines(run: &[u8]) -> impl Iterator<Item = &[u8]> {
+    let mut start = 0;
+    memchr::memchr_iter(b'\n', run).map(move |end| {
+        let line = &run[start..end];
+        start = end + 1;
+        line
+    })
 }
 
 impl ext::History for FrameLog {
@@ -67,9 +115,6 @@ impl ext::History for FrameLog {
         Box::new(self.entries_after(0))
     }
 }
-
-/// An entry too large for a frame.
-struct TooLarge;
 
 /// The sending side. The connection's own is for its replies; the one
 /// [`Outbox::follow`] returns is a session's, which stops taking frames
@@ -106,6 +151,9 @@ struct Follow {
     log: Arc<FrameLog>,
     /// The seq of the last entry written.
     cursor: u64,
+    /// The frames of the entries after it, read from the log and not yet
+    /// written: at most one read's worth.
+    ahead: VecDeque<io::Result<Frame>>,
 }
 
 /// The connection is gone, or follows another session.
@@ -180,7 +228,11 @@ impl Outbox {
     pub fn follow(&self, log: Arc<FrameLog>, cursor: u64, frames: Vec<(u64, Frame)>) -> Self {
         let mut q = self.queue();
         q.unfollow();
-        q.follow = Some(Follow { log, cursor });
+        q.follow = Some(Follow {
+            log,
+            cursor,
+            ahead: VecDeque::new(),
+        });
         q.frames.extend(frames);
         self.shared.ready.notify_one();
         Self {
@@ -253,11 +305,14 @@ impl Queue {
             return Some(frame);
         }
         let follow = self.follow.as_mut()?;
-        if let Ok(frame) = follow.log.get(follow.cursor + 1)? {
+        if follow.ahead.is_empty() {
+            follow.log.read_after(follow.cursor, &mut follow.ahead);
+        }
+        if let Ok(frame) = follow.ahead.pop_front()? {
             follow.cursor += 1;
             return Some(frame);
         }
-        // Too large for a frame: the view ends here.
+        // Too large for a frame, or unreadable: the view ends here.
         self.unfollow();
         self.step()
     }
@@ -290,10 +345,32 @@ mod tests {
         .unwrap()
     }
 
-    fn log(frames: impl IntoIterator<Item = Frame>) -> Arc<FrameLog> {
-        let log = Arc::new(FrameLog::default());
-        for frame in frames {
-            log.push(Some(frame));
+    /// A session's log, and the frame log that shows it.
+    struct Shown(store::Loaded, Arc<FrameLog>);
+
+    impl Shown {
+        fn push(&mut self, text: &str) {
+            let e = self.0.append(Body::User { text: text.into() }).unwrap();
+            self.1.push(e.seq);
+        }
+
+        fn frames(&self) -> Arc<FrameLog> {
+            Arc::clone(&self.1)
+        }
+    }
+
+    fn log(texts: &[&str]) -> Shown {
+        let header = store::Header {
+            id: protocol::SessionId::new(),
+            workspace: "/w".into(),
+            parent: None,
+            extensions: Vec::new(),
+        };
+        let loaded = store::LogStore::create(&store::Memory::default(), &header).unwrap();
+        let frames = Arc::new(FrameLog::new(Arc::clone(&loaded.lines), 0));
+        let mut log = Shown(loaded, frames);
+        for text in texts {
+            log.push(text);
         }
         log
     }
@@ -307,25 +384,25 @@ mod tests {
 
     #[test]
     fn a_follower_reads_the_shared_log_from_its_cursor_and_frames_wait_for_their_entry() {
-        let log = log([entry(1, "a"), entry(2, "b")]);
+        let mut log = log(&["a", "b"]);
         let outbox = Outbox::new(Caps::NONE);
         let synced = Frame::new(&DaemonMsg::Synced { seq: 2 }).unwrap();
-        let session = outbox.follow(Arc::clone(&log), 1, vec![(2, synced)]);
+        let session = outbox.follow(log.frames(), 1, vec![(2, synced)]);
         outbox.send(delta()).unwrap();
         assert_eq!(written(&outbox), [Some(2), None, None]);
-        log.push(Some(entry(3, "c")));
+        log.push("c");
         session.wake().unwrap();
         assert_eq!(written(&outbox), [Some(3)]);
     }
 
     #[test]
     fn a_slow_viewer_never_grows_daemon_memory_beyond_its_cursor() {
-        let log = log([]);
+        let mut log = log(&[]);
         let outbox = Outbox::new(Caps::NONE);
-        let session = outbox.follow(Arc::clone(&log), 0, Vec::new());
+        let session = outbox.follow(log.frames(), 0, Vec::new());
         let big = "x".repeat(BUDGET);
         for seq in 1..=64 {
-            log.push(Some(entry(seq, &big)));
+            log.push(&big);
             session.wake().unwrap();
             session.send_after(seq, delta()).unwrap();
         }
@@ -356,11 +433,11 @@ mod tests {
 
     #[test]
     fn an_entry_too_large_for_a_frame_ends_the_view() {
-        let log = log([entry(1, "a")]);
-        log.push(None);
-        log.push(Some(entry(3, "c")));
+        let mut log = log(&["a"]);
+        log.push(&"x".repeat(16 << 20));
+        log.push("c");
         let outbox = Outbox::new(Caps::NONE);
-        let session = outbox.follow(log, 0, Vec::new());
+        let session = outbox.follow(log.frames(), 0, Vec::new());
         assert_eq!(written(&outbox), [Some(1)]);
         assert!(session.send(delta()).is_err());
     }
@@ -368,8 +445,8 @@ mod tests {
     #[test]
     fn a_session_no_longer_followed_is_refused() {
         let outbox = Outbox::new(Caps::NONE);
-        let first = outbox.follow(log([]), 0, Vec::new());
-        let second = outbox.follow(log([]), 0, Vec::new());
+        let first = outbox.follow(log(&[]).frames(), 0, Vec::new());
+        let second = outbox.follow(log(&[]).frames(), 0, Vec::new());
         assert!(first.send(entry(1, "a")).is_err());
         second.send(entry(1, "b")).unwrap();
         outbox.unfollow();

@@ -12,9 +12,9 @@ use std::sync::atomic::Ordering;
 use ext::{Agent, Input};
 use protocol::ledger::Ledger;
 use protocol::{Body, Environment, Outcome, SessionId};
-use store::{Header, Loaded, Parent};
+use store::{Header, Parent};
 
-use super::{Msg, Session, installed};
+use super::{Msg, Open, Session, installed};
 use crate::{Daemon, Slot, lock};
 
 /// Where a link stands, by its watch. A link not yet watched or armed
@@ -210,14 +210,13 @@ impl Daemon {
     fn start_child(&self, header: Header, input: &str, env: Option<Environment>) -> io::Result<()> {
         let mut slots = lock(&self.slots);
         let Some(slot) = slots.iter().find(|s| s.header.id == header.id).cloned() else {
-            let loaded = self.shared.store.create(&header)?;
-            let session = self.seed(header.clone(), loaded, input, env)?;
+            let session = self.seed(header.clone(), Open::Create, input, env)?;
             slots.push(Slot::new(header, Some(session)));
             return Ok(());
         };
         drop(slots);
-        let start = |loaded| self.seed(slot.header.clone(), loaded, input, env);
-        self.live_or(&slot, start, |_| ())
+        let start = || self.seed(slot.header.clone(), Open::Load, input, env);
+        slot.live_or(start, |_| ())
     }
 
     /// Starts a child, first committing `env` (redacted) and `input` as its
@@ -226,24 +225,19 @@ impl Daemon {
     fn seed(
         &self,
         header: Header,
-        mut loaded: Loaded,
+        open: Open,
         input: &str,
         env: Option<Environment>,
     ) -> io::Result<Arc<Session>> {
-        if loaded.entries.is_empty() {
-            if let Some(env) = &env {
-                loaded.append(Body::Environment(env.redacted()))?;
-            }
-            loaded.append(Body::User {
+        let opening = env
+            .as_ref()
+            .map(|env| Body::Environment(env.redacted()))
+            .into_iter()
+            .chain([Body::User {
                 text: input.to_owned(),
-            })?;
-        }
-        Ok(Session::start_in(
-            header,
-            loaded,
-            Arc::clone(&self.shared),
-            env,
-        ))
+            }])
+            .collect();
+        Session::start_in(header, Arc::clone(&self.shared), open, env, opening)
     }
 
     /// Hands child `child`'s result to its parent, loading the parent if it

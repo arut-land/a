@@ -25,7 +25,7 @@ use protocol::{
     Origin, PROTO, Rejection, Residency, Role, SessionId, SessionSummary, SettingsChange, Target,
     Versions, read_frame,
 };
-use session::{Attachment, Ended, Session, Shared};
+use session::{Attachment, Ended, Open, Session, Shared};
 use store::{Header, Jsonl, LogStore};
 use sys::Home;
 use upgrade::{Lifecycle, Verdict};
@@ -209,6 +209,35 @@ impl Slot {
             heard: AtomicBool::new(false),
         })
     }
+
+    /// Runs `f` on the slot's live session, first starting one with `start`
+    /// from its log if it is not loaded: once the actor that last had it has
+    /// ended, so its log has one writer. That wait blocks, outside the slot
+    /// lock (the ending actor may need others), so callers are threads that
+    /// may block, never async workers.
+    fn live_or<T>(
+        &self,
+        start: impl FnOnce() -> io::Result<Arc<Session>>,
+        f: impl FnOnce(&Arc<Session>) -> T,
+    ) -> io::Result<T> {
+        let mut residence = loop {
+            let residence = lock(&self.residence);
+            match residence.ending().cloned() {
+                Some(ended) => {
+                    drop(residence);
+                    ended.wait();
+                }
+                None => break residence,
+            }
+        };
+        if let Some(session) = residence.live() {
+            return Ok(f(session));
+        }
+        let session = start()?;
+        let done = f(&session);
+        *residence = Residence::Live(session);
+        Ok(done)
+    }
 }
 
 /// Whether a session's log is loaded and its actor runs.
@@ -324,38 +353,8 @@ impl Daemon {
     /// Runs `f` on the slot's live session, loading it first if hibernated.
     fn with_live<T>(&self, slot: &Slot, f: impl FnOnce(&Arc<Session>) -> T) -> io::Result<T> {
         let shared = Arc::clone(&self.shared);
-        let start = |loaded| Ok(Session::start(slot.header.clone(), loaded, shared));
-        self.live_or(slot, start, f)
-    }
-
-    /// Runs `f` on the slot's live session, first starting one with `start`
-    /// from its log if it is not loaded: once the actor that last had it has
-    /// ended, so its log has one writer. That wait blocks, outside the slot
-    /// lock (the ending actor may need others), so callers are threads that
-    /// may block, never async workers.
-    fn live_or<T>(
-        &self,
-        slot: &Slot,
-        start: impl FnOnce(store::Loaded) -> io::Result<Arc<Session>>,
-        f: impl FnOnce(&Arc<Session>) -> T,
-    ) -> io::Result<T> {
-        let mut residence = loop {
-            let residence = lock(&slot.residence);
-            match residence.ending().cloned() {
-                Some(ended) => {
-                    drop(residence);
-                    ended.wait();
-                }
-                None => break residence,
-            }
-        };
-        if let Some(session) = residence.live() {
-            return Ok(f(session));
-        }
-        let session = start(self.shared.store.load(slot.header.id)?)?;
-        let done = f(&session);
-        *residence = Residence::Live(session);
-        Ok(done)
+        let start = || Session::start(slot.header.clone(), shared, Open::Load);
+        slot.live_or(start, f)
     }
 
     /// The session `target` names, attached. `workspace` is only worked
@@ -415,8 +414,7 @@ impl Daemon {
             parent: None,
             extensions: session::installed(&self.shared.registry.get()),
         };
-        let loaded = self.shared.store.create(&header)?;
-        let session = Session::start(header.clone(), loaded, Arc::clone(&self.shared));
+        let session = Session::start(header.clone(), Arc::clone(&self.shared), Open::Create)?;
         let attachment = session.open();
         lock(&self.slots).push(Slot::new(header, Some(session)));
         Ok(attachment)

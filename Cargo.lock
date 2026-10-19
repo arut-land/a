@@ -542,6 +542,7 @@ dependencies = [
  "futures-core",
  "http",
  "llm",
+ "memchr",
  "protocol",
  "rt",
  "serde",
