@@ -153,15 +153,15 @@ impl Ctx {
         first: &dyn Fn(&client::Connection) -> io::Result<Vec<ClientMsg>>,
     ) -> io::Result<client::Connection> {
         let on_drain = || eprintln!("[waiting for the previous daemon to finish its work]");
-        client::connect_with(&self.endpoint, &self.staged, &on_drain, first).map_err(
-            |e| match &self.endpoint {
+        client::connect_with(&self.endpoint, &self.staged, None, &on_drain, first).map_err(|e| {
+            match &self.endpoint {
                 Endpoint::Local(home) if e.kind() == io::ErrorKind::TimedOut => {
                     report(&client::diagnose(home));
                     io::Error::new(e.kind(), RESTART)
                 }
                 _ => e,
-            },
-        )
+            }
+        })
     }
 }
 
@@ -193,7 +193,7 @@ fn daemon_cmd(ctx: &Ctx, action: &DaemonCmd) -> io::Result<()> {
             println!("{}", if stopped { "stopped" } else { "not running" });
         }
         DaemonCmd::Restart => {
-            client::restart(home, &ctx.staged)?;
+            client::restart(home, &ctx.staged, None)?;
             println!("restarted");
         }
     }

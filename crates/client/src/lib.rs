@@ -26,8 +26,8 @@ use std::time::{Duration, Instant};
 
 use protocol::view::SessionList;
 use protocol::{
-    Cap, Caps, ClientDecl, ClientMsg, CommandInfo, DaemonMsg, Environment, HomeSettings, PROTO,
-    SessionSummary, SettingsChange, Target, Versions, read_frame, write_frame,
+    Cap, Caps, ClientDecl, ClientId, ClientMsg, CommandInfo, DaemonMsg, Environment, HomeSettings,
+    PROTO, SessionSummary, SettingsChange, Target, Versions, read_frame, write_frame,
 };
 use sys::crash::{Crashes, Record};
 use sys::{Home, Signal, Staged, Stream};
@@ -280,16 +280,18 @@ pub fn connect(
     staged: &Staged,
     on_drain: &dyn Fn(),
 ) -> io::Result<Connection> {
-    connect_with(endpoint, staged, on_drain, &|_| Ok(Vec::new()))
+    connect_with(endpoint, staged, None, on_drain, &|_| Ok(Vec::new()))
 }
 
 /// [`connect`], sending the messages `first` makes for the connection (an
 /// attach, say) right behind the hello rather than after the welcome, which
 /// saves a round trip. A daemon that does not welcome the client acts on
-/// none of them, so each retry sends them again.
+/// none of them, so each retry sends them again. `client` names the client
+/// across its connections, so a mutation it sends again is done once.
 pub fn connect_with(
     endpoint: &Endpoint,
     staged: &Staged,
+    client: Option<ClientId>,
     on_drain: &dyn Fn(),
     first: &dyn Fn(&Connection) -> io::Result<Vec<ClientMsg>>,
 ) -> io::Result<Connection> {
@@ -311,7 +313,7 @@ pub fn connect_with(
             Endpoint::Ssh(host) => (None, remote::open(host, staged)?),
         };
         let first = first(&conn)?;
-        match hello(&mut conn, &staged.id, &first) {
+        match hello(&mut conn, &staged.id, client, &first) {
             Ok(Greeting::Mismatch(supported)) => {
                 return Err(mismatch(endpoint, staged, supported));
             }
@@ -375,14 +377,23 @@ fn mismatch(endpoint: &Endpoint, staged: &Staged, supported: Versions) -> io::Er
     io::Error::new(io::ErrorKind::Unsupported, message)
 }
 
+/// What a client takes up: all but [`Cap::Ledger`], as clients still take
+/// what waits and the recap from the daemon.
+const OFFERED: Caps = Caps::ALL.without(Cap::Ledger);
+
 /// Sends the hello and `first` back to back, then reads the answer.
-fn hello(conn: &mut Connection, build: &str, first: &[ClientMsg]) -> io::Result<Greeting> {
+fn hello(
+    conn: &mut Connection,
+    build: &str,
+    client: Option<ClientId>,
+    first: &[ClientMsg],
+) -> io::Result<Greeting> {
     conn.writer.send(&ClientMsg::Hello {
         proto: PROTO,
         build: build.to_owned(),
         min: Versions::OURS.min_field(),
-        caps: Caps::ALL,
-        client: None,
+        caps: OFFERED,
+        client,
     })?;
     // A daemon that refuses the hello may hang up before reading these, so
     // failing to send them matters only once welcomed.
@@ -546,7 +557,7 @@ fn reach(home: &Home, build: &str) -> io::Result<(Stream, Connection)> {
     let stream = home.endpoint().connect()?;
     stream.set_read_timeout(Some(HELLO_TIMEOUT))?;
     let mut conn = split(&stream)?;
-    match hello(&mut conn, build, &[])? {
+    match hello(&mut conn, build, None, &[])? {
         Greeting::Welcome if conn.welcome.caps.has(Cap::Daemon) => Ok((stream, conn)),
         _ => Err(io::Error::new(
             io::ErrorKind::Unsupported,
@@ -605,11 +616,13 @@ pub struct Status {
 }
 
 /// Stops any running daemon and connects to a fresh one, which serves even
-/// after the crash-loop breaker stopped the last ones.
-pub fn restart(home: &Home, staged: &Staged) -> io::Result<Connection> {
+/// after the crash-loop breaker stopped the last ones; as `client`, if it
+/// is named.
+pub fn restart(home: &Home, staged: &Staged, client: Option<ClientId>) -> io::Result<Connection> {
     stop(home)?;
     drop(connect_or_spawn(home, true)?);
-    connect(&Endpoint::Local(home.clone()), staged, &|| {})
+    let endpoint = Endpoint::Local(home.clone());
+    connect_with(&endpoint, staged, client, &|| {}, &|_| Ok(Vec::new()))
 }
 
 /// Serves `ssh <host> a bridge`: connects to this machine's daemon, prints

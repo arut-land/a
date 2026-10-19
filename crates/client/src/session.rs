@@ -407,9 +407,16 @@ impl SessionClient {
                     synced: false,
                 };
                 self.commands = commands;
-                // Neither answered nor refused before the drain: whether
-                // it was done is in the replay.
-                self.unanswered.clear();
+                // Neither answered nor refused on the last connection: a
+                // daemon that keeps who sent what is sent them again, and
+                // does each once; to any other, whether it was done is in
+                // the replay.
+                let resent = std::mem::take(&mut self.unanswered);
+                if matches!(&self.link, Link::Live { welcome, .. } if welcome.caps.has(Cap::Origin))
+                {
+                    out.extend(resent.iter().cloned().map(Effect::Send));
+                    self.unanswered = resent;
+                }
                 out.push(Effect::Link);
                 for msg in std::mem::take(&mut self.queued) {
                     self.put(msg, &mut out);
@@ -676,10 +683,32 @@ mod tests {
             *id = 2;
         }
         let out = client.step(reconnected);
+        // Unanswered, "one" goes again under its number: a daemon that keeps
+        // who sent what does it once.
         assert!(
-            matches!(sends(&out)[..], [ClientMsg::Input { text, client_seq: Some(2) }] if text == "two"),
+            matches!(&sends(&out)[..], [
+                ClientMsg::Input { text: one, client_seq: Some(1) },
+                ClientMsg::Input { text: two, client_seq: Some(2) },
+            ] if one == "one" && two == "two"),
             "{out:?}"
         );
+    }
+
+    #[test]
+    fn an_unanswered_intent_is_not_resent_to_a_daemon_that_cannot_tell() {
+        let (mut client, _) = attached(Env::Origin);
+        client.run(Cmd::Input("one".into()));
+        client.step(msg(1, DaemonMsg::Draining));
+        client.step(Event::Closed {
+            id: 1,
+            why: String::new(),
+        });
+        let mut reconnected = live(Caps::ALL.without(Cap::Origin));
+        if let Event::Connected { id, .. } = &mut reconnected {
+            *id = 2;
+        }
+        // Whether it was done is in the replay.
+        assert!(sends(&client.step(reconnected)).is_empty());
     }
 
     #[test]

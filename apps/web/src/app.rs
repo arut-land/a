@@ -209,7 +209,7 @@ fn list(daemon: &Daemon) -> io::Result<Vec<SessionSummary>> {
 /// (or a remote daemon's bridge's), as `a new` does.
 fn new_session(daemon: &Daemon) -> io::Result<SessionId> {
     let new = Attach::new(Target::New, Env::Origin);
-    let mut conn = client::connect_with(&daemon.endpoint, &daemon.staged, &|| {}, &|conn| {
+    let mut conn = client::connect_with(&daemon.endpoint, &daemon.staged, None, &|| {}, &|conn| {
         Ok(vec![conn.attach(&new)?])
     })?;
     let session = conn.reader.until(|msg| match msg {

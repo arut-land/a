@@ -9,8 +9,8 @@ use std::time::{Duration, Instant};
 
 use protocol::view::SessionView;
 use protocol::{
-    Body, Caps, ClientDecl, ClientMsg, DaemonMsg, Entry, Environment, Origin, PROTO, Rejection,
-    Role, SettingsChange, Target, read_frame, write_frame,
+    Body, Caps, ClientDecl, ClientId, ClientMsg, DaemonMsg, Entry, Environment, Origin, PROTO,
+    Rejection, Role, SessionId, SettingsChange, Target, read_frame, write_frame,
 };
 use store::{Header, Jsonl, LogStore};
 use sys::Home;
@@ -22,6 +22,7 @@ struct Fixture {
     root: PathBuf,
     daemon: Owner,
     life: Arc<Lifecycle>,
+    config: Config,
 }
 
 impl Fixture {
@@ -41,7 +42,18 @@ impl Fixture {
         };
         let daemon = Daemon::load(&home, &config).unwrap();
         let life = Arc::new(Lifecycle::new("test".into(), home.runtime()));
-        Self { root, daemon, life }
+        Self {
+            root,
+            daemon,
+            life,
+            config,
+        }
+    }
+
+    /// As after the daemon exits and the next starts on the same home.
+    fn restart(&mut self) {
+        let home = Home::from(self.root.clone());
+        self.daemon = Daemon::load(&home, &self.config).unwrap();
     }
 
     /// A client connection, served as the daemon serves one.
@@ -126,6 +138,61 @@ fn hello(caps: Caps) -> ClientMsg {
         caps,
         client: None,
     }
+}
+
+/// The hello of client `client`.
+fn hello_as(client: ClientId) -> ClientMsg {
+    ClientMsg::Hello {
+        proto: PROTO,
+        build: "test".into(),
+        min: None,
+        caps: Caps::ALL,
+        client: Some(client),
+    }
+}
+
+/// The inputs session `id`'s log holds.
+fn inputs(fixture: &Fixture, id: SessionId) -> usize {
+    let entries = fixture.daemon.shared.store.entries(id).unwrap();
+    entries.iter().filter(|e| is_input(&e.body)).count()
+}
+
+/// #12: client `client` sends input 1 to a new session, and again on a
+/// connection after its first, whichever `again` makes; it is acked both
+/// times, and done once.
+fn resent_once(fixture: &mut Fixture, again: impl FnOnce(&mut Fixture)) {
+    let client = ClientId::new();
+    let mut peer = fixture.connect();
+    peer.send(&hello_as(client));
+    peer.send(&attach(Target::New, 0, ClientDecl::default()));
+    peer.send(&input("hi", 1));
+    let acked = |m: &DaemonMsg| matches!(m, DaemonMsg::Ack { origin } if origin.client_seq == 1);
+    let seen = peer.until(acked);
+    let attached = seen.iter().find_map(|m| match m {
+        DaemonMsg::Attached { session, .. } => Some(*session),
+        _ => None,
+    });
+    let session = attached.unwrap();
+    fixture.settle();
+    drop(peer);
+    again(fixture);
+    let mut peer = fixture.connect();
+    peer.send(&hello_as(client));
+    peer.send(&attach(Target::Id(session), 0, ClientDecl::default()));
+    peer.send(&input("hi", 1));
+    peer.until(acked);
+    fixture.settle();
+    assert_eq!(inputs(fixture, session), 1);
+}
+
+#[test]
+fn a_resend_after_reconnect_runs_once() {
+    resent_once(&mut Fixture::new("resend"), |_| {});
+}
+
+#[test]
+fn a_resend_after_restart_runs_once() {
+    resent_once(&mut Fixture::new("resend-restart"), Fixture::restart);
 }
 
 fn attach(target: Target, since: u64, decl: ClientDecl) -> ClientMsg {
@@ -214,15 +281,9 @@ fn a_repeated_mutation_is_answered_again_but_not_done_again() {
             DaemonMsg::Rejected { origin: o, reason: Rejection::NotWaiting, .. } if o == origin(1, 2)
         ));
     }
-    // A seq older than the last, never answered, is stale.
-    peer.send(&input("again", 0));
-    assert!(matches!(
-        peer.answer(),
-        DaemonMsg::Rejected {
-            reason: Rejection::Stale,
-            ..
-        }
-    ));
+    // An older one, sent again, is answered as it was.
+    peer.send(&input("hi", 1));
+    assert!(acked(peer.answer()));
     peer.send(&ClientMsg::List);
     let DaemonMsg::Sessions { sessions } = peer.answer() else {
         panic!("no list");
@@ -336,7 +397,7 @@ fn a_mismatched_hello_gets_the_range_and_nothing_behind_it_is_done() {
 /// one, an old client the replay.
 #[test]
 fn far_behind_a_client_gets_a_snapshot_if_it_takes_them() {
-    let id = protocol::SessionId::new();
+    let id = SessionId::new();
     let fixture = Fixture::with("snapshot", |home| {
         let store = Jsonl::open(home.sessions_dir()).unwrap();
         let created = store

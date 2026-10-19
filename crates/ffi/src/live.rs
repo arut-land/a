@@ -180,7 +180,7 @@ impl Client {
     pub async fn restart_daemon(&self) -> Result<(), ClientError> {
         let daemon = self.daemon.clone();
         blocking(move || {
-            client::restart(&daemon.home, &daemon.staged)?;
+            client::restart(&daemon.home, &daemon.staged, None)?;
             Ok(())
         })
         .await

@@ -7,7 +7,6 @@ mod outbox;
 mod transcript;
 mod upgrade;
 
-use std::collections::VecDeque;
 use std::fs::{File, OpenOptions};
 use std::future::{Future, poll_fn};
 use std::io::{self, BufReader, Write};
@@ -23,9 +22,9 @@ use std::time::{Duration, Instant};
 use driver::{Attachment, Ended, Live, Open, Request, Shared};
 use outbox::Outbox;
 use protocol::{
-    Activity, Cap, Caps, ClientDecl, ClientMsg, DaemonMsg, Environment, Frame, HomeSettings, Mode,
-    Origin, Outcome, PROTO, Rejection, Role, SessionId, SessionSummary, SettingsChange, Target,
-    Versions, read_frame,
+    Activity, Author, Cap, Caps, ClientDecl, ClientId, ClientMsg, ClientSeq, DaemonMsg,
+    Environment, Frame, HomeSettings, Mode, Origin, Outcome, PROTO, Rejection, Role, SessionId,
+    SessionSummary, SettingsChange, Target, Versions, read_frame,
 };
 use rt::oneshot;
 use store::{Header, Jsonl, LogStore};
@@ -1028,40 +1027,8 @@ fn refuse(listener: &Listener, why: &str) {
 /// up before the daemon does.
 const REFUSED_GRACE: Duration = Duration::from_secs(2);
 
-/// How many answers to a connection's numbered mutations are kept for
-/// repeats.
-const ANSWERS_KEPT: usize = 64;
-
 /// The answer to a mutation: done, or refused and why.
 type Answer = Result<(), (Rejection, String)>;
-
-/// A connection's answers to its numbered mutations, so a repeat gets the
-/// same answer and is not done again.
-#[derive(Default)]
-struct Answers {
-    last: u64,
-    recent: VecDeque<(u64, Answer)>,
-}
-
-impl Answers {
-    /// The answer to mutation `seq`: `act`'s if it is new, else the one
-    /// given before.
-    fn answer(&mut self, seq: u64, act: impl FnOnce() -> Answer) -> Answer {
-        if seq <= self.last {
-            return self.recent.iter().find(|(s, _)| *s == seq).map_or_else(
-                || Err((Rejection::Stale, "a repeat too old to answer again".into())),
-                |(_, a)| a.clone(),
-            );
-        }
-        let answer = act();
-        self.last = seq;
-        if self.recent.len() == ANSWERS_KEPT {
-            self.recent.pop_front();
-        }
-        self.recent.push_back((seq, answer.clone()));
-        answer
-    }
-}
 
 /// Writes what `outbox` hands out until it closes, as many frames as are
 /// ready at a time, up to [`WRITE_BATCH`] bytes.
@@ -1087,18 +1054,19 @@ const WRITE_BATCH: usize = 64 << 10;
 
 fn handle(daemon: &Daemon, life: &Lifecycle, conn: &Stream) -> io::Result<()> {
     let mut reader = BufReader::new(conn.try_clone()?);
-    let (verdict, theirs, caps) = match read_frame(&mut reader)? {
+    let (verdict, theirs, caps, client) = match read_frame(&mut reader)? {
         Some(ClientMsg::Hello {
             proto,
             build,
             min,
             caps,
-            ..
+            client,
         }) => {
             let theirs = Versions::new(min, proto);
-            (life.verdict(theirs, &build), theirs, caps & Caps::SERVED)
+            let caps = caps & Caps::SERVED;
+            (life.verdict(theirs, &build), theirs, caps, client)
         }
-        _ => (Verdict::Mismatch, Versions::from(0), Caps::NONE),
+        _ => (Verdict::Mismatch, Versions::from(0), Caps::NONE, None),
     };
     let outbox = Outbox::new(caps);
     let writer = outbox.clone();
@@ -1116,7 +1084,10 @@ fn handle(daemon: &Daemon, life: &Lifecycle, conn: &Stream) -> io::Result<()> {
                 daemon,
                 life,
                 outbox: &outbox,
-                client: registered.client(),
+                number: registered.client(),
+                // One that does not name itself is one client for as long
+                // as its connection lasts.
+                client: client.unwrap_or_default(),
                 attached: None,
                 decl: ClientDecl::default(),
             };
@@ -1124,7 +1095,7 @@ fn handle(daemon: &Daemon, life: &Lifecycle, conn: &Stream) -> io::Result<()> {
                 proto,
                 build: life.build.clone(),
                 caps,
-                client: conn.client,
+                client: conn.number,
                 commands: driver::commands(&daemon.shared.registry.get()),
             });
             conn.serve(&mut reader)
@@ -1174,8 +1145,12 @@ struct Conn<'a> {
     daemon: &'a Daemon,
     life: &'a Lifecycle,
     outbox: &'a Outbox,
-    /// Its id, as origins name it.
-    client: u32,
+    /// The connection's number, as acks name it.
+    number: u32,
+    /// The client, as the log names who did what: a mutation it numbered
+    /// that the log holds already is a resend, answered as the first was,
+    /// across reconnects and daemon restarts.
+    client: ClientId,
     attached: Option<Attachment>,
     decl: ClientDecl,
 }
@@ -1190,13 +1165,13 @@ impl Conn<'_> {
     }
 
     fn serve(&mut self, reader: &mut BufReader<Stream>) -> io::Result<()> {
-        let mut answers = Answers::default();
         while let Some(mut msg) = read_frame::<ClientMsg>(reader)? {
             if let Some(&mut client_seq) = msg.client_seq_mut() {
-                let answer = match client_seq {
-                    Some(seq) => answers.answer(seq, || self.mutate(msg)),
-                    None => self.mutate(msg),
-                };
+                let origin = client_seq.and_then(ClientSeq::new).map(|seq| Author {
+                    client: self.client,
+                    seq,
+                });
+                let answer = self.mutate(msg, origin);
                 self.answered(client_seq, answer);
                 continue;
             }
@@ -1280,8 +1255,8 @@ impl Conn<'_> {
         DaemonMsg::Settings { settings, error }
     }
 
-    /// Does mutation `msg`, if this client may.
-    fn mutate(&self, msg: ClientMsg) -> Answer {
+    /// Does mutation `msg`, from `origin`, if this client may.
+    fn mutate(&self, msg: ClientMsg, origin: Option<Author>) -> Answer {
         let session = match &self.attached {
             _ if self.decl.role == Role::Viewer => {
                 return Err((Rejection::ReadOnly, "this client is a viewer".into()));
@@ -1311,7 +1286,7 @@ impl Conn<'_> {
             }
             _ => return Err((Rejection::Other, "not a mutation".into())),
         };
-        rt::block_on(session.request(request, None)).map_err(|message| (refused, message))
+        rt::block_on(session.request(request, origin)).map_err(|message| (refused, message))
     }
 
     /// Tells the client the answer to its mutation `client_seq`: an ack
@@ -1320,7 +1295,7 @@ impl Conn<'_> {
         match (client_seq, answer) {
             (Some(client_seq), answer) if self.outbox.caps().has(Cap::Ack) => {
                 let origin = Origin {
-                    client: self.client,
+                    client: self.number,
                     client_seq,
                 };
                 self.reply(&match answer {

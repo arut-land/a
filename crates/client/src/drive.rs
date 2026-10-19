@@ -10,7 +10,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 use std::thread;
 
-use protocol::{ClientMsg, Environment};
+use protocol::{ClientId, ClientMsg, Environment};
 use sys::Staged;
 
 use crate::{Attach, Connection, Effect, Endpoint, Event, Writer};
@@ -25,6 +25,8 @@ pub struct Driver(Arc<Inner>);
 struct Inner {
     endpoint: Endpoint,
     staged: Staged,
+    /// Who the session client is, on every connection it makes.
+    client: ClientId,
     /// The newest connection asked for, and its write half once it is up.
     latest: AtomicU64,
     writer: Mutex<Option<(u64, Writer)>>,
@@ -59,6 +61,7 @@ impl Driver {
         Self(Arc::new(Inner {
             endpoint,
             staged,
+            client: ClientId::new(),
             latest: AtomicU64::new(0),
             writer: Mutex::new(None),
             origin: Box::new(origin),
@@ -114,12 +117,15 @@ impl Driver {
         let first = |conn: &Connection| Ok(vec![conn.attach(attach)?]);
         let made = match &self.0.endpoint {
             Endpoint::Local(home) if restart => {
-                crate::restart(home, &self.0.staged).and_then(|mut conn| {
+                crate::restart(home, &self.0.staged, Some(self.0.client)).and_then(|mut conn| {
                     conn.send_all(&first(&conn)?)?;
                     Ok(conn)
                 })
             }
-            endpoint => crate::connect_with(endpoint, &self.0.staged, &on_drain, &first),
+            endpoint => {
+                let client = Some(self.0.client);
+                crate::connect_with(endpoint, &self.0.staged, client, &on_drain, &first)
+            }
         };
         let Connection {
             mut reader,

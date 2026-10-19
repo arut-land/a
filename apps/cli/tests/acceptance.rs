@@ -77,6 +77,12 @@ fn resume_after_the_terminal_closes_mid_turn_replays_every_entry() {
         .map(|e| e.body)
         .filter(|b| !matches!(b, Body::Input { taken: false, .. } | Body::Take { .. }))
         .collect();
+    // Which client sent each, under which number, is its own.
+    for body in &mut bodies {
+        if let Body::Input { origin, .. } = body {
+            assert!(origin.take().is_some(), "{body:?}");
+        }
+    }
     let taken = |text: &str| Body::Input {
         text: text.into(),
         mode: Mode::Queue,

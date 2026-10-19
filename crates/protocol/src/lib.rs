@@ -930,9 +930,14 @@ impl Caps {
         Self(bits)
     };
 
-    /// What this build's daemon takes up: all but what only the v2 engine
-    /// will serve, which a client may already offer.
-    pub const SERVED: Self = Self(Self::ALL.0 & !(Cap::Ledger.bit() | Cap::Origin.bit()));
+    /// What this build's daemon takes up.
+    pub const SERVED: Self = Self::ALL;
+
+    /// These, but `cap`.
+    #[must_use]
+    pub const fn without(self, cap: Cap) -> Self {
+        Self(self.0 & !cap.bit())
+    }
 
     pub const fn has(self, cap: Cap) -> bool {
         self.0 & cap.bit() != 0
