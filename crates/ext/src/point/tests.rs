@@ -236,7 +236,7 @@ fn merge_rules_are_applied_identically_for_every_point() {
     };
     first::<RequestError, _>(error, [request("a"), request("b")]);
     first::<Approve, _>(call, [true, false]);
-    first::<OnStop, _>(&[], ["a", "b"].map(str::to_owned));
+    first::<OnStop, _>(&Vec::new(), ["a", "b"].map(str::to_owned));
 
     let entry = Entry::new(1, 0, protocol::Body::Interrupt);
     observes::<Observe>(&entry);
@@ -304,7 +304,7 @@ fn a_point_with_no_handler_costs_nothing() {
     let reads = hooks(vec![one("reader", |r| {
         r.on::<OnStop>(|cx, _| Some(cx.model()));
     })]);
-    let said = reads.on_stop(&cx, &[], &mut Decided::new());
+    let said = reads.on_stop(&cx, &Vec::new(), &mut Decided::new());
     assert_eq!(said.as_deref(), Some("test:model"));
     assert_eq!(view.0.load(Ordering::SeqCst), 1);
 }

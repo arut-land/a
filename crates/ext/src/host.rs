@@ -16,7 +16,7 @@ use crate::{
     Registrar, Text, Tier,
 };
 
-pub use crate::point::{Decided, Gate, Hooks};
+pub use crate::point::{Decided, Gate, History, Hooks};
 
 /// The engine, as a running call reaches it.
 pub trait Host: Send + Sync {

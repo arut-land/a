@@ -45,7 +45,7 @@ fn idle_sessions_hibernate_and_reload_on_attach() {
     drop(attachment);
 
     daemon.hibernate(Duration::ZERO);
-    let hibernated = daemon.slots()[0].live.lock().unwrap().is_none();
+    let hibernated = daemon.slots()[0].residence.lock().unwrap().live().is_none();
     let listed = daemon.list();
     let again = daemon
         .resolve(&Target::Id(id), || "/elsewhere".into())
@@ -130,6 +130,8 @@ fn busy_sessions_recover_at_startup() {
 
     let daemon = Daemon::load(&home, &echo()).unwrap();
     settle(&daemon);
+    // Its actor clears the marker after the work it settles.
+    drop(daemon);
     let got = bodies(&store, id);
     let still_busy = store.is_busy(id);
     std::fs::remove_dir_all(&root).unwrap();
@@ -170,20 +172,16 @@ fn a_session_waiting_for_approval_stays_waiting_through_hibernation_and_a_restar
     drop(attachment);
     daemon.hibernate(Duration::ZERO);
     let hibernated = daemon.list().remove(0);
-    // The stopped actor ends its unit of work.
-    let deadline = Instant::now() + Duration::from_millis(300);
-    while daemon.shared.store.is_busy(id) && Instant::now() < deadline {
-        std::thread::sleep(Duration::from_millis(5));
-    }
     drop(daemon);
+    let marked = Jsonl::open(home.sessions_dir()).unwrap().is_busy(id);
 
     let restarted = Daemon::load(&home, &config).unwrap();
     let listed = restarted.list().remove(0);
     let asked = restarted.slots()[0]
-        .live
+        .residence
         .lock()
         .unwrap()
-        .as_ref()
+        .live()
         .map(|s| s.summary().activity);
     drop(restarted);
     std::fs::remove_dir_all(&root).unwrap();
@@ -196,7 +194,68 @@ fn a_session_waiting_for_approval_stays_waiting_through_hibernation_and_a_restar
         (listed.activity, listed.residency),
         (Activity::Approval, Residency::Loaded)
     );
+    assert!(marked, "a session still asking stays marked");
     assert_eq!(asked, Some(Activity::Approval));
+}
+
+/// A daemon whose `bash` calls wait for approval.
+fn asking(name: &str) -> (PathBuf, Home, super::Owner) {
+    let (root, home) = home(name);
+    let config = Config {
+        ask: vec!["bash".into()],
+        ..echo()
+    };
+    let daemon = Daemon::load(&home, &config).unwrap();
+    (root, home, daemon)
+}
+
+#[test]
+fn no_writer_outlives_its_daemon() {
+    let (root, home, daemon) = asking("outlives");
+    let waiting = daemon.resolve(&Target::New, || "/w".into()).unwrap();
+    waiting.session().submit("$ echo hi".into()).unwrap();
+    let idle = daemon.resolve(&Target::New, || "/w".into()).unwrap();
+    settle(&daemon);
+    let ended = [waiting.session().ended(), idle.session().ended()];
+    let id = waiting.session().id;
+    drop(daemon);
+
+    let over = ended.iter().map(super::Ended::is_over).collect::<Vec<_>>();
+    let store = Jsonl::open(home.sessions_dir()).unwrap();
+    let at_exit = store.count(id).unwrap();
+    // A client still holding on cannot write either: the log is closed.
+    let refused = waiting.session().submit("more".into());
+    let after = store.count(id).unwrap();
+    drop((waiting, idle));
+    std::fs::remove_dir_all(&root).unwrap();
+
+    assert_eq!(over, [true, true]);
+    assert!(refused.is_err());
+    assert_eq!(after, at_exit);
+}
+
+#[test]
+fn a_hibernated_session_reloads_only_after_its_actor_has_exited() {
+    let (root, _, daemon) = asking("reload");
+    let attachment = daemon.resolve(&Target::New, || "/w".into()).unwrap();
+    let id = attachment.session().id;
+    attachment.session().submit("$ echo hi".into()).unwrap();
+    settle(&daemon);
+    let first = attachment.session().ended();
+    drop(attachment);
+
+    // Hibernated while its actor still waits for the answer, then wanted
+    // at once.
+    daemon.hibernate(Duration::ZERO);
+    let again = daemon.resolve(&Target::Id(id), || "/w".into()).unwrap();
+    let over = first.is_over();
+    let asks = again.session().summary().activity;
+    drop(again);
+    drop(daemon);
+    std::fs::remove_dir_all(&root).unwrap();
+
+    assert!(over, "loaded while the last actor ran on");
+    assert_eq!(asks, Activity::Approval);
 }
 
 fn fired(bodies: &[Body]) -> Vec<&Outcome> {
@@ -242,7 +301,13 @@ fn a_parent_hears_from_its_child_exactly_once() {
     settle(&daemon);
     drop(again);
     let parent_slot = daemon.slots().into_iter().find(|s| s.header.id == id);
-    let parent_loaded = parent_slot.unwrap().live.lock().unwrap().is_some();
+    let parent_loaded = parent_slot
+        .unwrap()
+        .residence
+        .lock()
+        .unwrap()
+        .live()
+        .is_some();
     drop(daemon);
 
     // A restart finds nothing left to fire.
@@ -417,7 +482,14 @@ fn an_owner_idles_with_its_children_and_an_interrupt_stops_them_first() {
     parent.session().submit("spawn $ sleep 100".into()).unwrap();
     drop(parent);
     let slot = daemon.slots().into_iter().find(|s| s.header.id == id);
-    let session = slot.unwrap().live.lock().unwrap().clone().unwrap();
+    let session = slot
+        .unwrap()
+        .residence
+        .lock()
+        .unwrap()
+        .live()
+        .cloned()
+        .unwrap();
     let log = until(&daemon, id, |log| {
         log.iter().any(|b| matches!(b, Body::Watch { .. }))
     });
@@ -575,7 +647,7 @@ fn the_supervisor_sleeps_until_a_deadline_and_never_polls() {
     settle(&daemon);
     let detached = Instant::now();
     drop(attachment);
-    let hibernated = || daemon.slots()[0].live.lock().unwrap().is_none();
+    let hibernated = || daemon.slots()[0].residence.lock().unwrap().live().is_none();
     wait_until("hibernation", hibernated);
     let after = detached.elapsed();
 
@@ -652,7 +724,7 @@ fn watchers_are_sent_the_session_list_as_it_changes() {
     let seen = std::sync::Mutex::new(Vec::<Vec<SessionSummary>>::new());
     let latest = |pick: &dyn Fn(&[SessionSummary]) -> bool| {
         let mut seen = seen.lock().unwrap();
-        for frame in watcher.take() {
+        for frame in std::iter::from_fn(|| watcher.try_next()) {
             if let Ok(Some(DaemonMsg::Sessions { sessions })) =
                 protocol::read_frame::<DaemonMsg>(&mut frame.as_bytes())
             {

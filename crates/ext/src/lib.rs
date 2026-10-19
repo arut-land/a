@@ -28,7 +28,7 @@ mod state;
 mod tool;
 
 pub use ext::{Command, DynExtension, Extension, Facts, Place, Refused, Registrar, Text, Tier};
-pub use point::{PointCx, Rewrite};
+pub use point::{History, PointCx, Rewrite};
 pub use service::{CwdOf, Spawner};
 pub use state::{Fold, States};
 pub use tool::{Cancel, Cx, DynTool, Kill, Replay, Route, SpawnSpec, Tool};

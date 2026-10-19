@@ -9,6 +9,7 @@
 //! (streamed text, the recap, which asks were delivered, the link state) is
 //! kept beside it and left out.
 
+use std::borrow::Borrow;
 use std::io;
 use std::path::PathBuf;
 
@@ -238,14 +239,18 @@ impl SessionView {
     /// The view of `session` as its log `entries` leave it: what a client
     /// that attached and folded them would hold, but for what only a
     /// connection sees.
-    pub fn from_log(session: SessionId, workspace: PathBuf, entries: &[Entry]) -> Self {
+    pub fn from_log(
+        session: SessionId,
+        workspace: PathBuf,
+        entries: impl IntoIterator<Item = impl Borrow<Entry>>,
+    ) -> Self {
         let mut view = Self {
             session: Some(session),
             workspace,
             ..Self::default()
         };
         for e in entries {
-            view.entry(e);
+            view.entry(e.borrow());
         }
         view
     }

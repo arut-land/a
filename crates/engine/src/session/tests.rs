@@ -1,5 +1,5 @@
 use std::path::Path;
-use std::sync::atomic::AtomicBool;
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::thread;
 
 use bytes::Bytes;
@@ -19,6 +19,29 @@ fn entry(seq: u64, body: Body) -> Entry {
 
 fn bodies(entries: &[Entry]) -> Vec<&Body> {
     entries.iter().map(|e| &e.body).collect()
+}
+
+/// The calls asked about and not yet answered.
+fn inbox(entries: &[Entry]) -> Vec<u64> {
+    Ledger::of(entries).inbox().to_vec()
+}
+
+/// Whether input waits to be taken up.
+fn untaken(entries: &[Entry]) -> Vec<ledger::Queued> {
+    Ledger::of(entries).untaken().iter().cloned().collect()
+}
+
+/// What an attach after `since` is told of `entries`.
+fn recap_of(entries: &[Entry], since: u64) -> Option<protocol::Recap> {
+    let ledger = Ledger::of(entries);
+    let after = entries.partition_point(|e| e.seq <= ledger.turn_start());
+    recap(&ledger, facts::reply(&entries[after..]).as_deref(), since)
+}
+
+/// The conversation before `before`, as `registry`'s tools present it.
+fn transcript(entries: &[Entry], before: u64, registry: Arc<Registry>) -> Vec<llm::Message> {
+    let before = entries.iter().take_while(|e| e.seq < before);
+    Transcript::of(before, registry).into_messages()
 }
 
 /// What entries say, whichever lease wrote them.
@@ -56,7 +79,7 @@ fn finds_calls_without_outcomes() {
         ),
         entry(5, Body::ModelCall { model: "m".into() }),
     ];
-    let dangling = dangling_calls(&entries);
+    let dangling = dangling_calls(&Ledger::of(&entries));
     assert_eq!(dangling.len(), 2);
     assert_eq!(dangling[0].seq, 3);
     assert_eq!(dangling[0].processes, [(42, "boot".to_owned())]);
@@ -86,7 +109,7 @@ fn transcripts_of_earlier_logs_read_replies_as_text() {
         ),
         entry(5, Body::ModelCall { model: "m".into() }),
     ];
-    let turns = transcript(&entries, 5, &ext::host::Toolset::default());
+    let turns = transcript(&entries, 5, Arc::default());
     assert_eq!(
         turns,
         [
@@ -198,8 +221,12 @@ fn cassette(path: &str) -> Vec<String> {
 }
 
 /// The home config file of these tests: `gpt-5.6` on `OpenAI`, with a key.
+/// Each call writes a file of its own: rewriting one shared file truncates
+/// it under a session that is reading it.
 fn gpt_home() -> PathBuf {
-    let path = std::env::temp_dir().join(format!("a-engine-gpt-{}.toml", std::process::id()));
+    static NEXT: AtomicUsize = AtomicUsize::new(0);
+    let n = NEXT.fetch_add(1, Ordering::Relaxed);
+    let path = std::env::temp_dir().join(format!("a-engine-gpt-{}-{n}.toml", std::process::id()));
     std::fs::write(
         &path,
         "model = \"gpt-5.6\"\n[env]\nOPENAI_API_KEY = \"daemon\"\n",
@@ -370,7 +397,7 @@ fn settle(session: &Session) {
 }
 
 fn log_of(session: &Session) -> Vec<Entry> {
-    session.lock().entries.clone()
+    session.frames.entries().collect()
 }
 
 #[test]
@@ -663,8 +690,8 @@ impl Extension for Strict {
                 Permission::Allow
             }
         })
-        .on::<point::OnStop>(|_, entries| {
-            let continued = entries.iter().any(|e| {
+        .on::<point::OnStop>(|_, history| {
+            let continued = history.entries().any(|e| {
                 matches!(
                     e.body,
                     Body::Hook {
@@ -733,7 +760,7 @@ fn hook_decisions_are_logged_and_replay_to_the_same_state() {
     );
     assert!(replay(&mut ext_builtin::agents::Echo, &log).is_empty());
     assert_eq!(
-        transcript(&log, u64::MAX, &ext::host::Toolset::default()),
+        transcript(&log, u64::MAX, Arc::default()),
         [
             llm::Message::user("$ echo hi"),
             llm::Message::user("and again"),
@@ -852,9 +879,7 @@ fn an_ask_waits_in_the_inbox_through_a_stop_and_runs_once_approved() {
     let log = finished(&resumed, 3);
     resumed.stop();
 
-    let sent: Vec<DaemonMsg> = outbox
-        .take()
-        .into_iter()
+    let sent: Vec<DaemonMsg> = std::iter::from_fn(|| outbox.try_next())
         .map(|frame: Frame| {
             protocol::read_frame(&mut frame.as_bytes())
                 .unwrap()
@@ -1120,9 +1145,9 @@ fn a_recap_tells_the_last_prompt_and_what_followed() {
         entry(7, Body::Ask { call: 6 }),
         entry(8, call("sleep")),
     ];
-    assert_eq!(recap(&entries, 8), None);
+    assert_eq!(recap_of(&entries, 8), None);
     assert_eq!(
-        recap(&entries, 0),
+        recap_of(&entries, 0),
         Some(protocol::Recap {
             prompt: Some("go on…".into()),
             tools: vec!["sleep".into(), "bash".into(), "sleep".into()],
@@ -1132,11 +1157,11 @@ fn a_recap_tells_the_last_prompt_and_what_followed() {
             asks: 1,
         })
     );
-    let replied = recap(&entries[..2], 1).unwrap();
+    let replied = recap_of(&entries[..2], 1).unwrap();
     assert_eq!(replied.reply.as_deref(), Some("first"));
     let env = entry(1, Body::Environment(Environment::default()));
     assert_eq!(
-        recap(&[env], 0),
+        recap_of(&[env], 0),
         None,
         "an environment alone is nothing to tell"
     );
@@ -1255,7 +1280,7 @@ fn slash_commands_run_without_a_turn_and_input_hooks_rewrite_or_refuse() {
         ]
     );
     assert!(replay(&mut ext_builtin::agents::Echo, &log).is_empty());
-    assert!(untaken(&log).is_empty());
+    assert_eq!(untaken(&log), []);
 
     // A command cut off by a crash is not run again; the input queued
     // behind it is taken up in order.
@@ -1328,7 +1353,7 @@ fn the_model_gets_the_prompt_and_the_logged_context_first() {
         .collect();
     assert_eq!(tools, ["bash", "edit", "sleep"]);
     assert_eq!(
-        transcript(&log, u64::MAX, fixture.0.registry.get().tools())[0],
+        transcript(&log, u64::MAX, fixture.0.registry.get())[0],
         llm::Message::user(text.clone())
     );
 }
@@ -1552,7 +1577,7 @@ fn a_steer_reaches_the_running_turn_before_the_model_is_next_asked() {
     assert!(matches!(&log[4].body, Body::Queued { steer: true, .. }));
     let input = script.sent()[1]["input"].to_string();
     assert!(input.contains("Say it twice."), "{input}");
-    assert!(untaken(&log).is_empty());
+    assert_eq!(untaken(&log), []);
 }
 
 #[test]
@@ -1810,3 +1835,46 @@ fn input_taken_in_during_recovery_runs_once() {
     }
 }
 mod interrupt;
+
+#[test]
+fn a_committed_entry_is_encoded_exactly_once() {
+    let fixture = Fixture::new(
+        ext_builtin::agents::ECHO,
+        Registry::default(),
+        openai(&Script::new(&[])),
+    );
+    let turns: Vec<Entry> = (1..=300)
+        .map(|seq| {
+            let text = format!("m{seq}");
+            let body = if seq % 2 == 1 {
+                Body::User { text }
+            } else {
+                Body::Assistant { text }
+            };
+            entry(seq, body)
+        })
+        .collect();
+    let session = fixture.start(&turns);
+    let sent = |caps| {
+        let outbox = Outbox::new(caps);
+        session.attach(&outbox, 0);
+        std::iter::from_fn(|| outbox.try_next()).collect::<Vec<Frame>>()
+    };
+    let shared = |a: &Frame, b: &Frame| std::ptr::eq(a.as_bytes(), b.as_bytes());
+    let (first, second) = (sent(Caps::ALL), sent(Caps::ALL));
+    assert_eq!(first.len(), 4, "attached, snapshot, synced, recap");
+    assert!(shared(&first[1], &second[1]), "one snapshot for both");
+    let (first, second) = (sent(Caps::NONE), sent(Caps::NONE));
+    assert_eq!(first.len(), 303);
+    assert!(shared(&first[1], &second[1]), "one frame of each entry");
+    // Live, then replayed: the frame committed is the one sent both times.
+    let live = Outbox::new(Caps::NONE);
+    session.attach(&live, 300);
+    session.submit("again".into()).unwrap();
+    settle(&session);
+    let of = |frames: Vec<Frame>| frames.into_iter().find(|f| f.seq == Some(301)).unwrap();
+    let sent_live = of(std::iter::from_fn(|| live.try_next()).collect());
+    let replayed = of(sent(Caps::NONE));
+    session.stop();
+    assert!(shared(&sent_live, &replayed), "encoded once, at commit");
+}

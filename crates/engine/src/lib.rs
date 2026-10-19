@@ -10,6 +10,7 @@ use std::collections::VecDeque;
 use std::fs::{File, OpenOptions};
 use std::future::{Future, poll_fn};
 use std::io::{self, BufReader, Write};
+use std::ops::Deref;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
@@ -17,13 +18,13 @@ use std::task::{Poll, Waker};
 use std::time::{Duration, Instant};
 use std::{mem, thread};
 
-use outbox::{Next, Outbox};
+use outbox::Outbox;
 use protocol::{
     Activity, Cap, Caps, ClientDecl, ClientMsg, DaemonMsg, Environment, Frame, HomeSettings,
     Origin, PROTO, Rejection, Residency, Role, SessionId, SessionSummary, SettingsChange, Target,
     Versions, read_frame,
 };
-use session::{Attachment, Session, Shared};
+use session::{Attachment, Ended, Session, Shared};
 use store::{Header, Jsonl, LogStore};
 use sys::Home;
 use upgrade::{Lifecycle, Verdict};
@@ -213,35 +214,80 @@ impl Pulse {
 /// ended, while any run: nothing tells it when they do.
 const JOBS_CHECK: Duration = Duration::from_secs(5);
 
-/// A session the daemon knows about. Its log is loaded, and its actor runs,
-/// only while `live` is set; otherwise it is hibernated and costs nothing.
+/// A session the daemon knows about.
 struct Slot {
     header: Header,
-    live: Mutex<Option<Arc<Session>>>,
+    residence: Mutex<Residence>,
     /// The parent has fired its watch on this child, so reports are moot.
     /// Known only since this daemon started.
     heard: AtomicBool,
-    /// How it lists while hibernated: as it was when it hibernated, or
-    /// once counted from its log. Only a loaded session appends, so listing
-    /// reads each log once.
-    last: Mutex<Option<SessionSummary>>,
 }
 
 impl Slot {
     fn new(header: Header, live: Option<Arc<Session>>) -> Arc<Self> {
+        let residence = live.map_or(Residence::Hibernated { last: None }, Residence::Live);
         Arc::new(Self {
             header,
-            live: Mutex::new(live),
+            residence: Mutex::new(residence),
             heard: AtomicBool::new(false),
-            last: Mutex::new(None),
         })
+    }
+}
+
+/// Whether a session's log is loaded and its actor runs.
+enum Residence {
+    /// Unloaded, costing nothing. `last` is how it lists: as it was when it
+    /// was unloaded, or once counted from its log. Only a loaded session
+    /// appends, so listing reads each log once.
+    Hibernated {
+        last: Option<SessionSummary>,
+    },
+    /// Unloaded, its actor not yet ended: it lists as `last`, and loads
+    /// again only once the actor has.
+    Stopping {
+        last: SessionSummary,
+        ended: Ended,
+    },
+    Live(Arc<Session>),
+}
+
+impl Residence {
+    const fn live(&self) -> Option<&Arc<Session>> {
+        match self {
+            Self::Live(session) => Some(session),
+            Self::Hibernated { .. } | Self::Stopping { .. } => None,
+        }
+    }
+
+    /// The end of the actor that last had the session, while it runs on.
+    fn ending(&self) -> Option<&Ended> {
+        match self {
+            Self::Stopping { ended, .. } if !ended.is_over() => Some(ended),
+            _ => None,
+        }
+    }
+
+    /// Unloads and stops the session, keeping how it lists; `false` if it
+    /// was not loaded.
+    fn unload(&mut self) -> bool {
+        let Some(session) = self.live() else {
+            return false;
+        };
+        let last = SessionSummary {
+            clients: 0,
+            residency: Residency::Hibernated,
+            ..session.summary()
+        };
+        let ended = session.stop();
+        *self = Self::Stopping { last, ended };
+        true
     }
 }
 
 impl Daemon {
     /// Reads only session headers. Sessions with a busy marker were working
     /// when the last daemon stopped, so they load at once to recover.
-    fn load(home: &Home, config: &Config) -> io::Result<Arc<Self>> {
+    fn load(home: &Home, config: &Config) -> io::Result<Owner> {
         let store = Arc::new(Jsonl::open(home.sessions_dir())?);
         let slots = store
             .headers()?
@@ -284,7 +330,7 @@ impl Daemon {
                 );
             }
         }
-        Ok(daemon)
+        Ok(Owner(daemon))
     }
 
     fn slots(&self) -> Vec<Arc<Slot>> {
@@ -300,20 +346,39 @@ impl Daemon {
 
     /// Runs `f` on the slot's live session, loading it first if hibernated.
     fn with_live<T>(&self, slot: &Slot, f: impl FnOnce(&Arc<Session>) -> T) -> io::Result<T> {
-        let mut live = lock(&slot.live);
-        let session = match &mut *live {
-            Some(session) => session,
-            empty @ None => {
-                let loaded = self.shared.store.load(slot.header.id)?;
-                *lock(&slot.last) = None;
-                empty.insert(Session::start(
-                    slot.header.clone(),
-                    loaded,
-                    Arc::clone(&self.shared),
-                ))
+        let shared = Arc::clone(&self.shared);
+        let start = |loaded| Ok(Session::start(slot.header.clone(), loaded, shared));
+        self.live_or(slot, start, f)
+    }
+
+    /// Runs `f` on the slot's live session, first starting one with `start`
+    /// from its log if it is not loaded: once the actor that last had it has
+    /// ended, so its log has one writer. That wait blocks, outside the slot
+    /// lock (the ending actor may need others), so callers are threads that
+    /// may block, never async workers.
+    fn live_or<T>(
+        &self,
+        slot: &Slot,
+        start: impl FnOnce(store::Loaded) -> io::Result<Arc<Session>>,
+        f: impl FnOnce(&Arc<Session>) -> T,
+    ) -> io::Result<T> {
+        let mut residence = loop {
+            let residence = lock(&slot.residence);
+            match residence.ending().cloned() {
+                Some(ended) => {
+                    drop(residence);
+                    ended.wait();
+                }
+                None => break residence,
             }
         };
-        Ok(f(session))
+        if let Some(session) = residence.live() {
+            return Ok(f(session));
+        }
+        let session = start(self.shared.store.load(slot.header.id)?)?;
+        let done = f(&session);
+        *residence = Residence::Live(session);
+        Ok(done)
     }
 
     /// The session `target` names, attached. `workspace` is only worked
@@ -383,9 +448,10 @@ impl Daemon {
     fn list(&self) -> Vec<SessionSummary> {
         self.slots()
             .iter()
-            .map(|slot| match &*lock(&slot.live) {
-                Some(session) => session.summary(),
-                None => lock(&slot.last)
+            .map(|slot| match &mut *lock(&slot.residence) {
+                Residence::Live(session) => session.summary(),
+                Residence::Stopping { last, .. } => last.clone(),
+                Residence::Hibernated { last } => last
                     .get_or_insert_with(|| SessionSummary {
                         id: slot.header.id,
                         workspace: slot.header.workspace.clone(),
@@ -405,17 +471,9 @@ impl Daemon {
     /// under the slot lock, which `resolve` also holds while attaching.
     fn hibernate(&self, after: Duration) {
         for slot in self.slots() {
-            let mut live = lock(&slot.live);
-            if live.as_ref().is_some_and(|s| s.idle_for() >= after)
-                && let Some(session) = live.take()
-            {
-                *lock(&slot.last) = Some(SessionSummary {
-                    clients: 0,
-                    residency: Residency::Hibernated,
-                    ..session.summary()
-                });
-                session_event("hibernate", session.id, String::new);
-                session.stop();
+            let mut residence = lock(&slot.residence);
+            if residence.live().is_some_and(|s| s.idle_for() >= after) && residence.unload() {
+                session_event("hibernate", slot.header.id, String::new);
             }
         }
     }
@@ -472,8 +530,41 @@ impl Daemon {
     fn live(&self) -> Vec<Arc<Session>> {
         self.slots()
             .iter()
-            .filter_map(|slot| lock(&slot.live).clone())
+            .filter_map(|slot| lock(&slot.residence).live().cloned())
             .collect()
+    }
+
+    /// Stops every loaded session and waits, up to [`STOP_GRACE`], for
+    /// their actors to end; one loaded meanwhile is stopped in turn.
+    async fn shutdown(&self) {
+        let mut grace = self.shared.rt.sleep(STOP_GRACE);
+        loop {
+            let ending: Vec<Ended> = self
+                .slots()
+                .iter()
+                .filter_map(|slot| {
+                    let mut residence = lock(&slot.residence);
+                    residence.unload();
+                    residence.ending().cloned()
+                })
+                .collect();
+            if ending.is_empty() {
+                return;
+            }
+            let mut all = std::pin::pin!(async {
+                for ended in &ending {
+                    ended.over().await;
+                }
+            });
+            let ended = poll_fn(|cx| match all.as_mut().poll(cx) {
+                Poll::Ready(()) => Poll::Ready(true),
+                Poll::Pending => grace.as_mut().poll(cx).map(|()| false),
+            });
+            if !ended.await {
+                eprintln!("{} sessions still stopping, exiting", ending.len());
+                return;
+            }
+        }
     }
 
     /// No connections, and no loaded session has work or background
@@ -514,10 +605,7 @@ impl Daemon {
             self.hibernate(config.hibernate);
             self.publish_list();
             if self.stopping.load(Ordering::SeqCst) {
-                for session in self.live() {
-                    session.stop();
-                }
-                exit.now("asked to stop");
+                exit.now(self, "asked to stop").await;
             }
             let draining = life.draining();
             let busy = draining.is_some() || self.has_work();
@@ -539,16 +627,14 @@ impl Daemon {
                 // and its outcome to commit.
                 let settled = stopped.map(|at| at + ext::Kill::GRACE * 2);
                 if !self.has_work() || settled.is_some_and(|at| now >= at) {
-                    for session in self.live() {
-                        session.stop();
-                    }
-                    exit.now("drained for a newer build");
+                    exit.now(self, "drained for a newer build").await;
                 }
                 next = Some(earliest(next, settled.unwrap_or(began + config.drain)));
             } else if self.idle() {
                 let at = *since.get_or_insert(now) + config.idle;
                 if now >= at {
-                    exit.now(&format!("idle for {}s", config.idle.as_secs()));
+                    exit.now(self, &format!("idle for {}s", config.idle.as_secs()))
+                        .await;
                 }
                 next = Some(earliest(next, at));
             } else {
@@ -566,6 +652,30 @@ fn earliest(a: Option<Instant>, b: Instant) -> Instant {
     a.map_or(b, |a| a.min(b))
 }
 
+/// How long stopping the daemon waits for its sessions' actors to end:
+/// time for a stopped call's processes to go and its outcome to commit.
+const STOP_GRACE: Duration = ext::Kill::GRACE.saturating_mul(2);
+
+/// The daemon, as its owner holds it: dropping it stops every session and
+/// waits for their actors, so no writer outlives it. Every other holder
+/// (the supervisor, connections, sessions) has a plain `Arc`. Dropped only
+/// where blocking is fine: [`serve`]'s thread, or a test's.
+struct Owner(Arc<Daemon>);
+
+impl Deref for Owner {
+    type Target = Arc<Daemon>;
+
+    fn deref(&self) -> &Arc<Daemon> {
+        &self.0
+    }
+}
+
+impl Drop for Owner {
+    fn drop(&mut self) {
+        rt::block_on(self.0.shutdown());
+    }
+}
+
 /// What the daemon lets go of when it exits.
 struct Exit {
     home: Home,
@@ -577,13 +687,16 @@ struct Exit {
 
 impl Exit {
     /// Unlinks the socket first so new clients spawn a fresh daemon (one
-    /// that raced into our backlog sees EOF and retries), then empties the
+    /// that raced into our backlog sees EOF and retries), then stops
+    /// `daemon`'s sessions, so the next daemon, which waits for the pid
+    /// lock, never loads a log one of ours still writes. Then it empties the
     /// record and clears the crash breaker (a clean exit is no crash, and
-    /// ends any run of them) and releases the pid lock before
-    /// the process closes its connections: a client reconnecting on EOF
-    /// finds the lock free for the daemon it spawns.
-    fn now(self, why: &str) -> ! {
+    /// ends any run of them) and releases the pid lock before the process
+    /// closes its connections: a client reconnecting on EOF finds the lock
+    /// free for the daemon it spawns.
+    async fn now(self, daemon: &Daemon, why: &str) -> ! {
         let _ = std::fs::remove_file(self.home.socket());
+        daemon.shutdown().await;
         if let Err(e) = sys::crash::exited(&self.home, &self.pid) {
             eprintln!("noting a clean exit: {e}");
         }
@@ -822,29 +935,29 @@ impl Answers {
     }
 }
 
-/// Writes what `outbox` hands out until it closes, catching the client up
-/// when it falls behind.
+/// Writes what `outbox` hands out until it closes, as many frames as are
+/// ready at a time, up to [`WRITE_BATCH`] bytes.
 #[cfg(unix)]
 fn write_out(mut conn: UnixStream, outbox: &Outbox) {
-    while let Some(next) = outbox.next() {
-        match next {
-            Next::Write(frame) => {
-                if conn.write_all(frame.as_bytes()).is_err() {
-                    outbox.abandon();
-                    return;
-                }
-            }
-            Next::CatchUp {
-                session,
-                following,
-                since,
-            } => match session.upgrade() {
-                Some(session) => session.catch_up(outbox, following, since),
-                None => outbox.unfollow(),
-            },
+    let mut batch = Vec::new();
+    while let Some(frame) = outbox.next() {
+        batch.extend_from_slice(frame.as_bytes());
+        while batch.len() < WRITE_BATCH
+            && let Some(frame) = outbox.try_next()
+        {
+            batch.extend_from_slice(frame.as_bytes());
         }
+        if conn.write_all(&batch).is_err() {
+            outbox.abandon();
+            return;
+        }
+        batch.clear();
     }
 }
+
+/// How many bytes of ready frames go to a client in one write.
+#[cfg(unix)]
+const WRITE_BATCH: usize = 64 << 10;
 
 #[cfg(unix)]
 fn handle(daemon: &Daemon, life: &Lifecycle, conn: &UnixStream) -> io::Result<()> {

@@ -368,10 +368,23 @@ impl Point for PostTool {
     }
 }
 
+/// A session's log as a handler reads it: decoded on demand, each time
+/// [`History::entries`] is called, as only a handler that reads it needs it.
+pub trait History {
+    fn entries(&self) -> Box<dyn Iterator<Item = Entry> + '_>;
+}
+
+impl History for Vec<Entry> {
+    fn entries(&self) -> Box<dyn Iterator<Item = Entry> + '_> {
+        Box::new(self.iter().cloned())
+    }
+}
+
 point!(
-    /// Text to continue with once the agent stopped, given the log.
+    /// Text to continue with once the agent stopped, given the session's
+    /// log so far.
     OnStop = "on_stop",
-    &'a [Entry],
+    &'a dyn History,
     Option<String>
 );
 point!(
@@ -449,7 +462,8 @@ impl Wire for Approve {
 }
 
 impl Wire for OnStop {
-    fn to_json(entries: &&[Entry]) -> Value {
+    fn to_json(history: &&dyn History) -> Value {
+        let entries: Vec<Entry> = history.entries().collect();
         serde_json::to_value(entries).unwrap_or_default()
     }
 
@@ -715,10 +729,10 @@ impl Hooks {
     pub fn on_stop(
         &self,
         cx: &PointCx<'_>,
-        entries: &[Entry],
+        history: &dyn History,
         decided: &mut Decided,
     ) -> Option<String> {
-        let (name, text) = self.ask::<OnStop>(cx, entries)?;
+        let (name, text) = self.ask::<OnStop>(cx, history)?;
         decided.push((name, Decision::OnStop { text: text.clone() }));
         Some(text)
     }

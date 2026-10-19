@@ -2,7 +2,7 @@ use std::fs::{self, File, OpenOptions};
 use std::io::{self, BufRead, BufReader, Read, Write};
 use std::path::PathBuf;
 
-use protocol::{Decode, Entry, SessionId};
+use protocol::{Decode, Entry, Frame, SessionId};
 use serde::Serialize;
 
 use crate::{Header, Lease, LeaseAuthority, Loaded, Local, Log, LogStore, floor};
@@ -147,15 +147,30 @@ impl Log for JsonlLog {
     /// One write and one sync for the lot.
     fn append_all(&mut self, entries: &[Entry]) -> io::Result<()> {
         self.lease.admit(entries)?;
-        if entries.is_empty() {
-            return Ok(());
-        }
         let mut lines = Vec::new();
         for entry in entries {
             entry.encode(&mut lines)?;
             lines.push(b'\n');
         }
-        self.file.write_all(&lines)?;
+        self.write(&lines)
+    }
+
+    fn append_framed(&mut self, entries: &[Entry], frames: &[Frame]) -> io::Result<()> {
+        self.lease.admit(entries)?;
+        let mut lines = Vec::with_capacity(frames.iter().map(|f| f.as_bytes().len()).sum());
+        for frame in frames {
+            frame.line_into(&mut lines);
+        }
+        self.write(&lines)
+    }
+}
+
+impl JsonlLog {
+    fn write(&mut self, lines: &[u8]) -> io::Result<()> {
+        if lines.is_empty() {
+            return Ok(());
+        }
+        self.file.write_all(lines)?;
         sys::sync_data(&self.file)?;
         #[cfg(unix)]
         if let Some(dir) = &self.new_in {
