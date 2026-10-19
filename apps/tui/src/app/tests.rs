@@ -149,6 +149,18 @@ fn an_approval_shows_buttons_and_y_or_a_click_answers_it() {
     assert!(press(&mut app, Key::Char('y')).is_none());
 }
 
+/// An interrupt settles a call waiting for approval, so Ctrl-C sends one
+/// rather than leaving.
+#[test]
+fn ctrl_c_interrupts_a_call_waiting_for_approval() {
+    let (mut app, _) = app(Viewport::Full, &asked_command());
+    assert!(app.running());
+    assert!(matches!(
+        press(&mut app, Key::Ctrl('c')),
+        Some(Effect::Send(ClientMsg::Interrupt { client_seq: None }))
+    ));
+}
+
 #[test]
 fn a_streamed_reply_shows_live_then_its_committed_text() {
     let (mut app, _) = app(
