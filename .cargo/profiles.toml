@@ -63,6 +63,12 @@ opt-level = "s"
 [profile.release.package.rt]
 opt-level = "s"
 
+# The command line's dispatch, run once a process (-32 KiB). An override
+# on the binary's own package loses the profile's strip, so it is repeated.
+[profile.release.package.a]
+opt-level = "s"
+strip = "symbols"
+
 # The wire codec: s costs a small entry's decode ~6% and its encode ~30%
 # (still over 300 and 1000 MB/s; a frame is encoded once for every peer)
 # and saves 92 KiB. std (build-std) saves 13 KiB more at no measured cost;
