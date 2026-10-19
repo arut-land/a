@@ -203,9 +203,31 @@ mod imp {
         Ok(listener)
     }
 
+    /// A connection the daemon writes to without blocking: its send buffer
+    /// holds a whole write batch, so the writer waits on the socket once a
+    /// batch rather than once each default 8 KiB macOS buffers.
     pub fn accept(listener: &UnixListener) -> io::Result<UnixStream> {
-        listener.accept().map(|(stream, _)| stream)
+        let (stream, _) = listener.accept()?;
+        let size: libc::c_int = SEND_BUFFER;
+        // SAFETY: `stream` is an open socket we own, and `size` is a
+        // c_int that outlives the call, whose length we pass.
+        let set = unsafe {
+            libc::setsockopt(
+                std::os::fd::AsRawFd::as_raw_fd(&stream),
+                libc::SOL_SOCKET,
+                libc::SO_SNDBUF,
+                (&raw const size).cast(),
+                INT_LEN,
+            )
+        };
+        // Only a speed-up: a socket that keeps its default still works.
+        let _ = set;
+        Ok(stream)
     }
+
+    const SEND_BUFFER: libc::c_int = 256 << 10;
+    #[expect(clippy::cast_possible_truncation, reason = "a c_int is 4 bytes")]
+    const INT_LEN: libc::socklen_t = size_of::<libc::c_int>() as libc::socklen_t;
 
     pub fn listener_nonblocking(listener: &UnixListener, nonblocking: bool) -> io::Result<()> {
         listener.set_nonblocking(nonblocking)
@@ -316,5 +338,36 @@ mod imp {
 
     pub fn stream_nonblocking(_stream: &File, _nonblocking: bool) -> io::Result<()> {
         Err(unsupported())
+    }
+}
+
+#[cfg(all(test, unix))]
+mod tests {
+    use std::io::{self, Write};
+
+    use crate::Home;
+
+    /// A client that reads slowly costs the daemon's writer one wait per
+    /// batch it writes, not one per default socket buffer (8 KiB on macOS).
+    #[test]
+    fn an_accepted_connection_takes_a_write_batch_without_blocking() {
+        let root = std::env::temp_dir().join(format!("a-endpoint-{}", std::process::id()));
+        std::fs::create_dir_all(&root).unwrap();
+        let home = Home::from(root.clone());
+        let listener = home.bind().unwrap();
+        let _client = home.endpoint().connect().unwrap();
+        let mut stream = listener.accept().unwrap();
+        stream.set_nonblocking(true).unwrap();
+        let (chunk, mut taken) = ([0u8; 4096], 0);
+        loop {
+            match stream.write(&chunk) {
+                Ok(n) => taken += n,
+                Err(e) if e.kind() == io::ErrorKind::WouldBlock => break,
+                Err(e) => panic!("{e}"),
+            }
+        }
+        home.endpoint().remove();
+        std::fs::remove_dir_all(&root).unwrap();
+        assert!(taken >= 64 << 10, "{taken} bytes before it would block");
     }
 }
