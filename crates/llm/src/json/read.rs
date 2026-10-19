@@ -157,6 +157,53 @@ impl<'de: 'a, 'a, T: Deserialize<'de>, E: Deserialize<'de>> Deserialize<'de> for
     }
 }
 
+/// An object read as `T`, or `None` for any other value: a slot where only
+/// an object means anything, at less code than a [`Json`].
+pub(crate) struct Obj<T>(pub(crate) Option<T>);
+
+impl<T> Default for Obj<T> {
+    fn default() -> Self {
+        Self(None)
+    }
+}
+
+impl<'de, T: Deserialize<'de>> Deserialize<'de> for Obj<T> {
+    fn deserialize<D: Deserializer<'de>>(json: D) -> Result<Self, D::Error> {
+        struct Read<T>(PhantomData<T>);
+        impl<'de, T: Deserialize<'de>> Visitor<'de> for Read<T> {
+            type Value = Obj<T>;
+            fn expecting(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+                f.write_str("JSON")
+            }
+            fn visit_map<A: MapAccess<'de>>(self, map: A) -> Result<Obj<T>, A::Error> {
+                T::deserialize(MapAccessDeserializer::new(map)).map(|object| Obj(Some(object)))
+            }
+            fn visit_seq<A: SeqAccess<'de>>(self, list: A) -> Result<Obj<T>, A::Error> {
+                IgnoredAny.visit_seq(list).map(|_| Obj(None))
+            }
+            fn visit_unit<X: de::Error>(self) -> Result<Obj<T>, X> {
+                Ok(Obj(None))
+            }
+            fn visit_bool<X: de::Error>(self, _: bool) -> Result<Obj<T>, X> {
+                Ok(Obj(None))
+            }
+            fn visit_i64<X: de::Error>(self, _: i64) -> Result<Obj<T>, X> {
+                Ok(Obj(None))
+            }
+            fn visit_u64<X: de::Error>(self, _: u64) -> Result<Obj<T>, X> {
+                Ok(Obj(None))
+            }
+            fn visit_f64<X: de::Error>(self, _: f64) -> Result<Obj<T>, X> {
+                Ok(Obj(None))
+            }
+            fn visit_str<X: de::Error>(self, _: &str) -> Result<Obj<T>, X> {
+                Ok(Obj(None))
+            }
+        }
+        json.deserialize_any(Read(PhantomData))
+    }
+}
+
 /// A string that borrows from the frame inside an `Option`, where a bare
 /// `Cow` never borrows.
 #[derive(Deserialize)]

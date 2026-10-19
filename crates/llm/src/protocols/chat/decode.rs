@@ -23,7 +23,7 @@ use serde_json::{Map, Value, json};
 use super::merge::{merge_details, merge_fields, merge_object, merge_str};
 use super::{KEY, PartKind, Quirks, ReasoningField};
 use crate::error::Error;
-use crate::json::{Fields, Json, Lenient, fields, next, whole_object};
+use crate::json::{Fields, Json, Lenient, Obj, fields, next, whole_object};
 use crate::protocol::Flow;
 use crate::spec::{Media, Meta, Reason, SmolStr, Source, Usage};
 use crate::writer::{AUTO_INDEX, CallFragment, End, Open, Writer, Writes};
@@ -90,7 +90,7 @@ impl Json<'_> {
 }
 
 /// An array of `T` objects, or any other value.
-type List<'a, T> = Json<'a, IgnoredAny, Json<'a, T>>;
+type List<'a, T> = Json<'a, IgnoredAny, Obj<T>>;
 
 #[derive(Default)]
 struct Frame<'a> {
@@ -128,7 +128,7 @@ impl<'de: 'a, 'a> Deserialize<'de> for Choices<'a> {
                 while let Some(choice) = list.next_element::<Json<'a, Choice<'a>>>()? {
                     choices.count += 1;
                     let object = choice.object();
-                    choices.whole |= object.is_some_and(|choice| choice.message.object().is_some());
+                    choices.whole |= object.is_some_and(|choice| choice.message.0.is_some());
                     let index = object.map(|choice| choice.index.as_u64());
                     let primary = index.is_none_or(|index| index.is_none_or(|index| index == 0));
                     if primary && choices.primary.is_none() {
@@ -200,8 +200,8 @@ struct Choice<'a> {
     finish_reason: Json<'a>,
     native_finish_reason: Json<'a>,
     usage: Value,
-    delta: Json<'a, Delta<'a>>,
-    message: Json<'a, Delta<'a>>,
+    delta: Obj<Delta<'a>>,
+    message: Obj<Delta<'a>>,
 }
 
 impl<'de: 'a, 'a> Fields<'de> for Choice<'a> {
@@ -505,7 +505,7 @@ impl ChatDecoder {
             self.image(image)?;
         }
         for (position, call) in delta.tool_calls.items().iter().enumerate() {
-            let call = call.object();
+            let call = call.0.as_ref();
             self.call(call, whole.then_some(position).filter(|_| call.is_some()))?;
         }
         Ok(())
@@ -840,7 +840,7 @@ impl Writes for ChatDecoder {
                 return Err(Error::decode("the reply holds no choices", data));
             };
             let Json::Object(Choice {
-                message: Json::Object(message),
+                message: Obj(Some(message)),
                 ..
             }) = choice
             else {
@@ -853,7 +853,7 @@ impl Writes for ChatDecoder {
         }
         self.chunked = true;
         if let Some(Json::Object(Choice {
-            delta: Json::Object(delta),
+            delta: Obj(Some(delta)),
             ..
         })) = choice
         {
