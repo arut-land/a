@@ -190,7 +190,7 @@ impl Env {
     }
 
     pub fn connect(&self) -> Conn {
-        let stream = UnixStream::connect(self.home.socket()).unwrap();
+        let stream = UnixStream::connect(self.home.endpoint().path()).unwrap();
         stream
             .set_read_timeout(Some(Duration::from_secs(30)))
             .unwrap();
@@ -246,7 +246,7 @@ impl Drop for Env {
         for pid in self.daemons() {
             let _ = sys::signal_process(pid, Signal::Kill);
         }
-        let _ = fs::remove_file(self.home.socket());
+        let _ = fs::remove_file(self.home.endpoint().path());
         // A failed test's home, with the daemon's log, is kept to look at.
         if std::thread::panicking() {
             eprintln!("kept {}", self.root.display());

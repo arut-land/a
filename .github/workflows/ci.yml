@@ -51,6 +51,9 @@ jobs:
       # black-box M1 acceptance and budget tests in apps/cli/tests (budgets
       # with CI slack). Live-model tests stay #[ignore]d; there are no secrets.
       - run: mise run check
+      # The Windows build, cross-linted: no platform cfg above `sys`/`rt`.
+      - if: runner.os == 'Linux'
+        run: mise run check:windows
 
   budgets:
     name: budgets (${{ matrix.os }})
@@ -127,9 +130,9 @@ jobs:
     defaults:
       run:
         shell: bash
-    # The daemon and its transports are Unix only for now, so `engine` and
-    # the `a` CLI (which links it) are built rather than linted: their
-    # serving code is dead here. `a` runs its line REPL, which reports that.
+    # Everything builds and lints here, the daemon and `a` included: the
+    # platform seams live in `sys` and `rt`, whose Windows halves the daemon
+    # still lacks report that they are unsupported. `a` runs its line REPL.
     env:
       PORTABLE: -p sys -p rt -p protocol -p store -p ext -p ext-chat -p ext-edit -p ext-fixtures -p ext-policy -p ext-prompt -p ext-shell -p llm -p client -p tui
     steps:
@@ -137,7 +140,8 @@ jobs:
       - *mbx-dir
       - *cache
       - *mise
-      - run: mise exec -- cargo clippy $PORTABLE --all-targets -- -D warnings
+      - run: mise exec -- cargo clippy $PORTABLE -p engine -p a --all-targets -- -D warnings
+      - run: mise exec -- cargo check --target x86_64-pc-windows-msvc -p a
       - run: mise exec -- cargo build -p engine -p a
       - name: test (advisory until first green on Windows)
         continue-on-error: true

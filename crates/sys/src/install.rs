@@ -7,7 +7,6 @@
 use std::ffi::OsStr;
 use std::fs;
 use std::io;
-use std::os::unix::fs::{PermissionsExt, symlink};
 use std::path::{Path, PathBuf};
 
 use crate::Runtime;
@@ -86,7 +85,7 @@ impl CliLink {
         }
         let tmp = path.with_file_name(format!(".a.{}", std::process::id()));
         let _ = fs::remove_file(&tmp);
-        symlink(runtime.current_exe(), &tmp)?;
+        symlink(&runtime.current_exe(), &tmp)?;
         fs::rename(&tmp, &path).inspect_err(|_| {
             let _ = fs::remove_file(&tmp);
         })?;
@@ -123,14 +122,34 @@ fn same_dir(a: &Path, b: &Path) -> bool {
     a == b || fs::canonicalize(a).is_ok_and(|a| fs::canonicalize(b).is_ok_and(|b| a == b))
 }
 
+#[cfg(unix)]
 fn is_executable(path: &Path) -> bool {
+    use std::os::unix::fs::PermissionsExt;
     fs::metadata(path).is_ok_and(|m| m.is_file() && m.permissions().mode() & 0o111 != 0)
 }
 
-#[cfg(test)]
+#[cfg(windows)]
+fn is_executable(path: &Path) -> bool {
+    fs::metadata(path).is_ok_and(|m| m.is_file())
+}
+
+#[cfg(unix)]
+fn symlink(target: &Path, link: &Path) -> io::Result<()> {
+    std::os::unix::fs::symlink(target, link)
+}
+
+/// Granted only in developer mode, else refused: the app's installer is
+/// macOS's for now.
+#[cfg(windows)]
+fn symlink(target: &Path, link: &Path) -> io::Result<()> {
+    std::os::windows::fs::symlink_file(target, link)
+}
+
+#[cfg(all(test, unix))]
 mod tests {
     use super::*;
     use std::ffi::OsString;
+    use std::os::unix::fs::{PermissionsExt, symlink};
 
     struct Fixture {
         root: PathBuf,

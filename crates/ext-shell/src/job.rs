@@ -19,7 +19,7 @@ pub(crate) async fn ended(pgid: u32, mut leader: Option<Child>) {
         {
             leader = None;
         }
-        if !sys::group_alive(pgid) {
+        if !sys::Group(pgid).alive() {
             return;
         }
         if any_exit(pgid).await {
@@ -33,12 +33,12 @@ pub(crate) async fn ended(pgid: u32, mut leader: Option<Child>) {
 
 /// Waits for any live process of group `pgid` to exit; `false`, at once,
 /// when none can be watched.
-#[cfg(unix)]
 async fn any_exit(pgid: u32) -> bool {
     use std::future::poll_fn;
     use std::task::Poll;
 
-    let watches: Vec<_> = sys::group_members(pgid)
+    let watches: Vec<_> = sys::Group(pgid)
+        .members()
         .into_iter()
         .filter_map(|pid| rt::Async::for_reading(sys::exit_watch(pid).ok()?).ok())
         .collect();
@@ -57,9 +57,4 @@ async fn any_exit(pgid: u32) -> bool {
         }
     })
     .await
-}
-
-#[cfg(not(unix))]
-fn any_exit(_pgid: u32) -> std::future::Ready<bool> {
-    std::future::ready(false)
 }

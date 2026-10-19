@@ -56,8 +56,8 @@ fn a_crash_loop_is_the_daemons_to_refuse() {
     // Started by hand, without a client's lock: it refuses all the same.
     let mut by_hand = env.cmd(&["__daemon"]).spawn().unwrap();
     // Not by connecting: the first connection it answers is its last.
-    common::wait_for("the socket", || env.home.socket().exists());
-    let mut conn = UnixStream::connect(env.home.socket()).unwrap();
+    common::wait_for("the socket", || env.home.endpoint().path().exists());
+    let mut conn = UnixStream::connect(env.home.endpoint().path()).unwrap();
     write_frame(
         &mut conn,
         &ClientMsg::Hello {

@@ -103,7 +103,7 @@ mod imp {
                 .stdin(Stdio::null())
                 .stdout(Stdio::null())
                 .stderr(Stdio::null());
-            crate::new_session(&mut cmd);
+            crate::Group::lead(&mut cmd);
             cmd.spawn().ok().map(Self)
         }
     }
@@ -111,7 +111,7 @@ mod imp {
     impl Drop for Hold {
         fn drop(&mut self) {
             // Its group: `systemd-inhibit` and the `sleep` it waits on.
-            let _ = crate::kill_process_group(self.0.id());
+            let _ = crate::Group(self.0.id()).kill();
             let _ = self.0.wait();
         }
     }

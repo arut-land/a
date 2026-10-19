@@ -48,7 +48,7 @@ impl Fixture {
     fn connect(&self) -> Peer {
         let (ours, theirs) = UnixStream::pair().unwrap();
         let (daemon, life) = (Arc::clone(&self.daemon), Arc::clone(&self.life));
-        std::thread::spawn(move || handle(&daemon, &life, &theirs));
+        std::thread::spawn(move || handle(&daemon, &life, &theirs.into()));
         ours.set_read_timeout(Some(Duration::from_secs(10)))
             .unwrap();
         Peer {

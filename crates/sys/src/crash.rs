@@ -1,6 +1,6 @@
 //! What a dying daemon leaves behind: a report per crash under `crash/`,
-//! and a breaker that stops a daemon that keeps dying soon after it starts
-//! from serving again.
+//! and a [`Breaker`] that stops a daemon that keeps dying soon after it
+//! starts from serving again.
 //!
 //! The running daemon locks `run/daemon.pid` and records itself in it
 //! ([`Record`]); a clean exit empties it. The lock is taken by the client
@@ -90,11 +90,85 @@ impl FromStr for Record {
     }
 }
 
+/// How a daemon's run ended, as the breaker counts it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Ended {
+    /// It exited on its own: idle, drained, or asked to stop.
+    Clean,
+    /// It died holding the lock, after running for `lived`.
+    Crashed { lived: Duration },
+    /// A person asked for a fresh daemon (`a daemon restart`).
+    Reset,
+}
+
+/// The crash-loop breaker: how many daemons in a row died within [`YOUNG`]
+/// of starting. [`Breaker::on`] is its whole transition function, and only
+/// the daemon holding the lock applies it, so the count has one writer.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct Breaker {
+    young: u32,
+}
+
+impl Breaker {
+    /// The breaker after a daemon ended `ended`: a clean exit or a reset
+    /// ends any run of deaths, a young death extends it, and one that was
+    /// healthy for [`YOUNG`] first is no loop.
+    #[must_use]
+    pub const fn on(self, ended: Ended) -> Self {
+        let young = match ended {
+            Ended::Crashed { lived } if lived.as_millis() < YOUNG.as_millis() => {
+                self.young.saturating_add(1)
+            }
+            Ended::Clean | Ended::Reset | Ended::Crashed { .. } => 0,
+        };
+        Self { young }
+    }
+
+    /// Young deaths in a row.
+    pub const fn young(self) -> u32 {
+        self.young
+    }
+
+    /// Whether a starting daemon must refuse to serve, after `limit` young
+    /// deaths in a row (0 for never). A refusing daemon records nothing, so
+    /// its exit is no death and the breaker stays as it is until a clean
+    /// exit or a reset.
+    pub const fn tripped(self, limit: u32) -> bool {
+        limit > 0 && self.young >= limit
+    }
+
+    /// The breaker as `home` has it.
+    pub fn of(home: &Home) -> Self {
+        let young = fs::read_to_string(breaker_file(home))
+            .ok()
+            .and_then(|t| t.trim().parse().ok())
+            .unwrap_or(0);
+        Self { young }
+    }
+
+    fn store(self, home: &Home) -> io::Result<()> {
+        if self.young == 0 {
+            return match fs::remove_file(breaker_file(home)) {
+                Err(e) if e.kind() != io::ErrorKind::NotFound => Err(e),
+                _ => Ok(()),
+            };
+        }
+        fs::create_dir_all(home.run_dir())?;
+        fs::write(breaker_file(home), format!("{}\n", self.young))
+    }
+
+    /// Applies `ended` to the breaker `home` has.
+    fn note(home: &Home, ended: Ended) -> io::Result<Self> {
+        let next = Self::of(home).on(ended);
+        next.store(home)?;
+        Ok(next)
+    }
+}
+
 /// How the daemon's crashes stand.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct Crashes {
-    /// Deaths in a row, each within [`YOUNG`] of starting.
-    pub young: u32,
+    pub breaker: Breaker,
     /// The newest report.
     pub last: Option<PathBuf>,
 }
@@ -102,27 +176,15 @@ pub struct Crashes {
 impl Crashes {
     pub fn of(home: &Home) -> Self {
         Self {
-            young: fs::read_to_string(breaker_file(home))
-                .ok()
-                .and_then(|t| t.trim().parse().ok())
-                .unwrap_or(0),
+            breaker: Breaker::of(home),
             last: reports(&home.crash_dir()).pop(),
         }
-    }
-
-    /// Whether a daemon should refuse to serve, after `limit` young deaths
-    /// in a row (0 for never).
-    pub const fn tripped(&self, limit: u32) -> bool {
-        limit > 0 && self.young >= limit
     }
 }
 
 /// Clears the breaker, for a user who asked for a fresh daemon.
 pub fn reset(home: &Home) -> io::Result<()> {
-    match fs::remove_file(breaker_file(home)) {
-        Err(e) if e.kind() != io::ErrorKind::NotFound => Err(e),
-        _ => Ok(()),
-    }
+    Breaker::note(home, Ended::Reset).map(drop)
 }
 
 /// Notes a clean exit in the daemon's record, `pid_file`: emptied, so no
@@ -130,7 +192,7 @@ pub fn reset(home: &Home) -> io::Result<()> {
 /// after are not in a row.
 pub fn exited(home: &Home, pid_file: &File) -> io::Result<()> {
     pid_file.set_len(0)?;
-    reset(home)
+    Breaker::note(home, Ended::Clean).map(drop)
 }
 
 /// Notes a daemon that died holding the lock, if the record says one did:
@@ -175,14 +237,8 @@ pub fn reap(home: &Home, pid_file: &mut File) -> io::Result<Option<Record>> {
             ),
         )?;
     }
-    let young = now().saturating_sub(dead.started) < YOUNG.as_secs();
-    let count = if young {
-        Crashes::of(home).young + 1
-    } else {
-        0
-    };
-    fs::create_dir_all(home.run_dir())?;
-    fs::write(breaker_file(home), format!("{count}\n"))?;
+    let lived = Duration::from_secs(now().saturating_sub(dead.started));
+    Breaker::note(home, Ended::Crashed { lived })?;
     Ok(Some(dead))
 }
 
@@ -377,12 +433,12 @@ mod tests {
             build: "b1".into(),
         };
         for n in 1..=LIMIT {
-            assert!(!Crashes::of(&home).tripped(LIMIT));
+            assert!(!Breaker::of(&home).tripped(LIMIT));
             assert_eq!(died(&home, &young).as_ref(), Some(&young));
-            assert_eq!(Crashes::of(&home).young, n);
+            assert_eq!(Breaker::of(&home).young(), n);
         }
         let crashes = Crashes::of(&home);
-        assert!(crashes.tripped(LIMIT) && !crashes.tripped(0));
+        assert!(crashes.breaker.tripped(LIMIT) && !crashes.breaker.tripped(0));
         let report = fs::read_to_string(crashes.last.unwrap()).unwrap();
         assert!(report.contains("pid 999999") && report.contains("without shutting down"));
         assert_eq!(fs::read_to_string(home.daemon_pid_file()).unwrap(), "");
@@ -393,10 +449,10 @@ mod tests {
             ..young.clone()
         };
         died(&home, &old);
-        assert_eq!(Crashes::of(&home).young, 0);
+        assert_eq!(Breaker::of(&home).young(), 0);
         died(&home, &young);
         reset(&home).unwrap();
-        assert_eq!(Crashes::of(&home).young, 0);
+        assert_eq!(Breaker::of(&home).young(), 0);
         fs::remove_dir_all(home.crash_dir().parent().unwrap()).unwrap();
     }
 
@@ -419,10 +475,87 @@ mod tests {
             .unwrap();
         exited(&home, &record).unwrap();
         died(&home, &young);
-        let crashes = Crashes::of(&home);
+        let breaker = Breaker::of(&home);
         fs::remove_dir_all(home.crash_dir().parent().unwrap()).unwrap();
-        assert_eq!(crashes.young, 1);
-        assert!(!crashes.tripped(LIMIT));
+        assert_eq!(breaker.young(), 1);
+        assert!(!breaker.tripped(LIMIT));
+    }
+
+    #[test]
+    fn the_breaker_moves_as_its_table_says() {
+        let young = Ended::Crashed {
+            lived: YOUNG.saturating_sub(Duration::from_millis(1)),
+        };
+        let healthy = Ended::Crashed { lived: YOUNG };
+        let at = |young| Breaker { young };
+        // (from, event, to)
+        let table = [
+            (0, Ended::Clean, 0),
+            (0, Ended::Reset, 0),
+            (0, young, 1),
+            (0, healthy, 0),
+            (2, young, 3),
+            (2, Ended::Clean, 0),
+            (2, Ended::Reset, 0),
+            (2, healthy, 0),
+            (LIMIT, young, LIMIT + 1),
+            (u32::MAX, young, u32::MAX),
+        ];
+        for (from, event, to) in table {
+            assert_eq!(at(from).on(event), at(to), "{from} on {event:?}");
+        }
+        assert!(!at(LIMIT - 1).tripped(LIMIT) && at(LIMIT).tripped(LIMIT));
+        assert!(!at(u32::MAX).tripped(0), "a limit of 0 is no breaker");
+    }
+
+    /// However long young deaths go on, the breaker trips by the limit and
+    /// stays tripped: a daemon that refuses to serve writes no record, so
+    /// the next one has no death to count and nothing to clear. Only a
+    /// clean exit or a reset closes it.
+    #[test]
+    fn a_crash_loop_cannot_retry_forever() {
+        let young = Ended::Crashed {
+            lived: Duration::ZERO,
+        };
+        for limit in 1..=5 {
+            let mut breaker = Breaker::default();
+            let tripped_at = (1..=limit * 10).find(|_| {
+                breaker = breaker.on(young);
+                breaker.tripped(limit)
+            });
+            assert_eq!(tripped_at, Some(limit));
+            for _ in 0..100 {
+                breaker = breaker.on(young);
+                assert!(breaker.tripped(limit));
+            }
+            assert!(!breaker.on(Ended::Reset).tripped(limit));
+        }
+
+        let home = home("loop");
+        let dead = Record {
+            pid: 999_997,
+            started: now(),
+            token: None,
+            build: "b1".into(),
+        };
+        for _ in 0..LIMIT {
+            died(&home, &dead);
+        }
+        assert!(Breaker::of(&home).tripped(LIMIT));
+        // Refusing daemons, each reaping what the last left: nothing.
+        let mut file = File::options()
+            .read(true)
+            .write(true)
+            .open(home.daemon_pid_file())
+            .unwrap();
+        for _ in 0..10 {
+            assert_eq!(reap(&home, &mut file).unwrap(), None);
+            assert!(Breaker::of(&home).tripped(LIMIT));
+        }
+        reset(&home).unwrap();
+        let breaker = Breaker::of(&home);
+        fs::remove_dir_all(home.crash_dir().parent().unwrap()).unwrap();
+        assert_eq!(breaker, Breaker::default());
     }
 
     /// A daemon that reaps its predecessor records itself in its place.

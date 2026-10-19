@@ -29,7 +29,7 @@ use std::time::{Duration, Instant};
 
 pub use events::{Event, EventSink, Noop, Stderr};
 pub use notify::Notify;
-#[cfg(unix)]
+#[cfg(any(unix, windows))]
 pub use reactor::Async;
 pub use reactor::{Timer, wakes};
 #[cfg(feature = "threads")]

@@ -712,7 +712,7 @@ fn a_daemon_after_a_crash_loop_refuses_to_serve_until_reset() {
         claim(&home, "b1", None, true, 3).unwrap(),
         Claim::Serve(_)
     ));
-    assert_eq!(sys::crash::Crashes::of(&home).young, 0);
+    assert_eq!(sys::crash::Breaker::of(&home).young(), 0);
     std::fs::remove_dir_all(root).unwrap();
 }
 

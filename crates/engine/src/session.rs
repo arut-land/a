@@ -501,7 +501,7 @@ impl Session {
     /// Whether any background process the session owns still runs.
     pub fn has_jobs(&self) -> bool {
         let mut jobs = lock(&self.jobs);
-        jobs.retain(|&pgid| sys::group_alive(pgid));
+        jobs.retain(|&pgid| sys::Group(pgid).alive());
         !jobs.is_empty()
     }
 
@@ -642,7 +642,7 @@ impl Session {
     }
 
     fn kill(&self, pgid: u32) {
-        if let Err(e) = sys::kill_process_group(pgid) {
+        if let Err(e) = sys::Group(pgid).kill() {
             self.warn(format_args!("killing process group {pgid}: {e}"));
         }
     }
@@ -1542,7 +1542,7 @@ impl Session {
         // Owned by the session under a daemon that died without ending it:
         // ended now. Later loads in this daemon find them ended by `stop`.
         if lock(&self.shared.loaded).insert(self.id) {
-            for pgid in jobs.into_iter().filter(|&pgid| sys::group_alive(pgid)) {
+            for pgid in jobs.into_iter().filter(|&pgid| sys::Group(pgid).alive()) {
                 self.kill(pgid);
             }
         }

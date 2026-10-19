@@ -8,9 +8,8 @@ use std::thread;
 
 use rustix::event::{PollFd, PollFlags, poll};
 use rustix::io::Errno;
-use rustix::process::Signal;
 use rustix::termios::{OptionalActions, Termios, tcgetattr, tcgetwinsize, tcsetattr};
-use sys::Signals;
+use sys::{Signal, Signals};
 
 use super::Event;
 use super::Viewport;
@@ -18,7 +17,7 @@ use super::keys::Decoder;
 
 /// The signals the input thread handles: a resize, and the two that end
 /// the client after the terminal is restored.
-pub const SIGNALS: [Signal; 3] = [Signal::WINCH, Signal::TERM, Signal::HUP];
+pub const SIGNALS: [Signal; 3] = [Signal::Resize, Signal::Terminate, Signal::Hangup];
 
 /// Bracketed paste on; on the full screen also the alternate buffer and
 /// click and wheel reports (SGR) only, not every motion, which would wake
@@ -109,7 +108,7 @@ pub fn spawn_input(tx: client::Post<Event>, signals: Signals) {
             let mut resized = false;
             if signalled {
                 for signal in signals.take() {
-                    if signal == Signal::WINCH {
+                    if signal == Signal::Resize {
                         resized = true;
                     } else {
                         restore();

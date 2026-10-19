@@ -315,10 +315,7 @@ impl Spill {
 /// can enter, never opening one that exists: at `path`, or at `path` with
 /// a number added when that is taken.
 pub fn create_private(path: &Path) -> io::Result<(File, PathBuf)> {
-    let mut open = std::fs::OpenOptions::new();
-    open.write(true).create_new(true);
-    #[cfg(unix)]
-    std::os::unix::fs::OpenOptionsExt::mode(&mut open, 0o600);
+    let open = sys::fs::private_file();
     if let Some(parent) = path.parent() {
         private_dir(parent)?;
     }
@@ -343,11 +340,7 @@ pub fn create_private(path: &Path) -> io::Result<(File, PathBuf)> {
 
 /// Creates `dir` and its parents, entered only by their owner.
 pub fn private_dir(dir: &Path) -> io::Result<()> {
-    let mut builder = std::fs::DirBuilder::new();
-    builder.recursive(true);
-    #[cfg(unix)]
-    std::os::unix::fs::DirBuilderExt::mode(&mut builder, 0o700);
-    builder.create(dir)
+    sys::fs::private_dir(dir)
 }
 
 /// The most output a call reports as it runs: its log holds this much of

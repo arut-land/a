@@ -1,18 +1,16 @@
 //! The environment the user's login shell sets up. An app opened from Finder
 //! or the Dock inherits launchd's, whose `PATH` is only
 //! `/usr/bin:/bin:/usr/sbin:/sbin`; the commands a session runs for it need
-//! the user's own, the one their terminal has.
+//! the user's own, the one their terminal has. Windows apps inherit the
+//! user's environment as it is, so there is nothing to capture there.
 
 use std::ffi::OsString;
-use std::io::{self, Read};
-use std::os::unix::ffi::OsStringExt;
-use std::process::{Command, Stdio};
-use std::sync::mpsc;
-use std::thread;
+use std::io;
 use std::time::Duration;
 
 /// Brackets the variables in the shell's output, which may also carry
 /// whatever its startup files print.
+#[cfg(unix)]
 const MARK: &str = "A-LOGIN-ENV-7f3d";
 
 /// Runs `shell` as an interactive login shell (`-l -i`, as editors do: on
@@ -20,7 +18,13 @@ const MARK: &str = "A-LOGIN-ENV-7f3d";
 /// shells read) and returns the variables it exports. The shell gets a
 /// session of its own and no terminal, so it can never stop for one, and
 /// is killed with everything it started if it takes longer than `timeout`.
+#[cfg(unix)]
 pub fn login_env(shell: &OsString, timeout: Duration) -> io::Result<Vec<(OsString, OsString)>> {
+    use std::io::Read;
+    use std::process::{Command, Stdio};
+    use std::sync::mpsc;
+    use std::thread;
+
     let script = format!("printf %s {MARK}; /usr/bin/env -0; printf %s {MARK}");
     let mut command = Command::new(shell);
     command
@@ -28,7 +32,7 @@ pub fn login_env(shell: &OsString, timeout: Duration) -> io::Result<Vec<(OsStrin
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::null());
-    crate::new_session(&mut command);
+    crate::Group::lead(&mut command);
     let mut child = command.spawn()?;
     let mut stdout = child.stdout.take().expect("stdout is piped");
     let (tx, rx) = mpsc::channel();
@@ -38,7 +42,7 @@ pub fn login_env(shell: &OsString, timeout: Duration) -> io::Result<Vec<(OsStrin
     });
     let out = rx.recv_timeout(timeout);
     if out.is_err() {
-        let _ = crate::kill_process_group(child.id());
+        let _ = crate::Group(child.id()).kill();
     }
     let _ = child.wait();
     let out = out.map_err(|_| {
@@ -55,7 +59,14 @@ pub fn login_env(shell: &OsString, timeout: Duration) -> io::Result<Vec<(OsStrin
     })
 }
 
+/// Nothing to capture: see the module's documentation.
+#[cfg(windows)]
+pub fn login_env(_shell: &OsString, _timeout: Duration) -> io::Result<Vec<(OsString, OsString)>> {
+    Err(io::ErrorKind::Unsupported.into())
+}
+
 /// The `NAME=value` records between the first two marks.
+#[cfg(unix)]
 fn parse(out: &[u8]) -> Option<Vec<(OsString, OsString)>> {
     let mark = MARK.as_bytes();
     let start = out.windows(mark.len()).position(|w| w == mark)? + mark.len();
@@ -67,6 +78,7 @@ fn parse(out: &[u8]) -> Option<Vec<(OsString, OsString)>> {
                 let eq = record.iter().position(|&b| b == b'=')?;
                 let (name, value) = (&record[..eq], &record[eq + 1..]);
                 (!name.is_empty()).then(|| {
+                    use std::os::unix::ffi::OsStringExt;
                     (
                         OsString::from_vec(name.to_vec()),
                         OsString::from_vec(value.to_vec()),
@@ -77,7 +89,7 @@ fn parse(out: &[u8]) -> Option<Vec<(OsString, OsString)>> {
     )
 }
 
-#[cfg(test)]
+#[cfg(all(test, unix))]
 mod tests {
     use super::*;
 
