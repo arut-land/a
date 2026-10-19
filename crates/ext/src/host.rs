@@ -9,12 +9,11 @@ use std::sync::{Arc, Mutex, OnceLock, PoisonError};
 use protocol::{Audience, Environment, Outcome, SessionId};
 use serde_json::Value;
 
-use crate::agent::Idle;
 use crate::ext::MakeAgent;
 use crate::state::States;
 use crate::{
-    Agent, BoxFuture, Cancel, CwdOf, Cx, DynExtension, DynTool, Extension, Facts, Name, Place,
-    Refused, Registrar, Text, Tier,
+    Agent, BoxFuture, Cancel, CwdOf, Cx, DynExtension, DynTool, Extension, Facts, Loop, Name,
+    Place, Refused, Registrar, Text, Tier,
 };
 
 pub use crate::point::{Decided, Hooks};
@@ -244,26 +243,27 @@ impl Registry {
             .filter(|t| t.audience() == Audience::User)
     }
 
-    /// A new loop of the agent named `name`, or of the first registered
-    /// with no name given. A name no extension registers is reported, and
-    /// the first agent runs instead; with none, a loop that does nothing.
+    /// A new loop of the agent named `name`: with none named, or the
+    /// default's name, the default [`Loop`]. A name no extension registers
+    /// is reported, and the default runs instead.
     pub fn agent(&self, name: Option<&str>) -> Box<dyn Agent> {
-        let named = name.and_then(|name| {
+        let named = name.filter(|&n| n != crate::LOOP).and_then(|name| {
             let named = self.agents.iter().find(|(n, _)| &**n == name);
             if named.is_none() {
                 eprintln!("warning: no agent named {name} is registered");
             }
             named
         });
-        match named.or(self.agents.first()) {
+        match named {
             Some((_, make)) => make(),
-            None => Box::new(Idle),
+            None => Box::new(Loop::default()),
         }
     }
 
-    /// The names of the agents sessions can run.
+    /// The names of the agents sessions can run: the default loop's, then
+    /// the extensions'.
     pub fn agents(&self) -> impl Iterator<Item = &str> + '_ {
-        self.agents.iter().map(|(name, _)| &**name)
+        std::iter::once(crate::LOOP).chain(self.agents.iter().map(|(name, _)| &**name))
     }
 
     /// Service `S`, if an extension provides it.

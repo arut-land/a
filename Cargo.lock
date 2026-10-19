@@ -622,9 +622,6 @@ name = "ext-chat"
 version = "0.0.0"
 dependencies = [
  "ext",
- "llm",
- "protocol",
- "serde_json",
 ]
 
 [[package]]

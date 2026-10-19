@@ -223,7 +223,7 @@ impl Extension for Agents {
     const VERSION: u32 = 1;
 
     fn contribute(&self, r: &mut Registrar) {
-        r.agent(ext_chat::CHAT, || Box::new(ext_chat::Loop::default()))
+        r.agent(ext_chat::CHAT, || Box::new(ext::Loop::default()))
             .agent(ext_fixtures::ECHO, || Box::new(ext_fixtures::Echo));
     }
 }
@@ -1780,7 +1780,7 @@ struct Panicky;
 static BOOMED: AtomicBool = AtomicBool::new(false);
 
 impl ext::Agent for Panicky {
-    fn step(&mut self, input: ext::Input) -> ext::Actions {
+    fn step(&mut self, input: ext::Input, _: &dyn ext::LoopPoints) -> ext::Actions {
         match input {
             ext::Input::User { text } => {
                 let first = text == "boom" && !BOOMED.swap(true, Ordering::SeqCst);

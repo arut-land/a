@@ -13,6 +13,13 @@
 //! | [`PostTool`] | replacement chain over the outcome |
 //! | [`OnStop`] | the first continuation wins |
 //! | [`Observe`], [`SessionStart`], [`SessionEnd`] | every handler is told, and changes nothing |
+//! | [`Turn`], [`Reply`] | replacement chain over what the loop does next |
+//! | [`Resume`] | the first answer wins; with none, the loop goes on |
+//!
+//! The loop points ([`Turn`], [`Reply`], [`Resume`]) run inside the fold
+//! of the session's log, rerun as it loads: their handlers are given their
+//! arguments and nothing of the session (a `()` for its context), so what
+//! a replay asks of them is what the live run did.
 //!
 //! The four rules are [`Merge`]'s, each implemented once, by the
 //! [`Rule`] that carries it, for every point. Handlers run in
@@ -34,7 +41,7 @@ use protocol::{Entry, Json, Outcome, SessionId, Verdict};
 use serde::de::DeserializeOwned;
 use serde_json::{Value, json};
 
-use crate::{Fold, Name, States};
+use crate::{Actions, Fold, Name, States};
 
 /// How a point merges its handlers' answers, in registration order.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -55,6 +62,9 @@ pub enum Merge {
 pub trait Point: Sized + 'static {
     /// The point's name, as an [`ErasedHandler`] gives it.
     const NAME: &'static str;
+    /// What a handler is given of the session: a [`PointCx`], or `()` at
+    /// a loop point.
+    type Cx<'c>;
     /// What the engine knows of the occasion.
     type Facts<'a>: Copy;
     /// What each handler reads: the facts, and under [`Merge::Chain`] the
@@ -76,8 +86,9 @@ pub type Merged<P> = <<P as Point>::Out as Rule>::Merged;
 pub type Replaced<'r, T> = dyn FnMut(&Name, T, &T) + 'r;
 
 /// A handler at point `P`.
-pub type Handler<P> =
-    Arc<dyn for<'a> Fn(&PointCx<'_>, <P as Point>::In<'a>) -> <P as Point>::Out + Send + Sync>;
+pub type Handler<P> = Arc<
+    dyn for<'a> Fn(&<P as Point>::Cx<'_>, <P as Point>::In<'a>) -> <P as Point>::Out + Send + Sync,
+>;
 
 /// The kinds of answer, one per [`Merge`] rule:
 ///
@@ -95,7 +106,7 @@ pub trait Rule: Sized + 'static {
     #[doc(hidden)]
     fn merge<P: Point<Out = Self>>(
         handlers: &[(Name, Handler<P>)],
-        cx: &PointCx<'_>,
+        cx: &P::Cx<'_>,
         facts: P::Facts<'_>,
         subject: &mut Self::Subject,
         replaced: &mut Replaced<'_, Self::Subject>,
@@ -120,7 +131,7 @@ impl<T: 'static, S: 'static> Rule for Rewrite<T, S> {
 
     fn merge<P: Point<Out = Self>>(
         handlers: &[(Name, Handler<P>)],
-        cx: &PointCx<'_>,
+        cx: &P::Cx<'_>,
         facts: P::Facts<'_>,
         subject: &mut T,
         replaced: &mut Replaced<'_, T>,
@@ -147,7 +158,7 @@ impl<T: 'static> Rule for Option<T> {
 
     fn merge<P: Point<Out = Self>>(
         handlers: &[(Name, Handler<P>)],
-        cx: &PointCx<'_>,
+        cx: &P::Cx<'_>,
         facts: P::Facts<'_>,
         (): &mut (),
         _: &mut Replaced<'_, ()>,
@@ -167,7 +178,7 @@ impl Rule for protocol::Permission {
 
     fn merge<P: Point<Out = Self>>(
         handlers: &[(Name, Handler<P>)],
-        cx: &PointCx<'_>,
+        cx: &P::Cx<'_>,
         facts: P::Facts<'_>,
         (): &mut (),
         _: &mut Replaced<'_, ()>,
@@ -188,7 +199,7 @@ impl Rule for () {
 
     fn merge<P: Point<Out = Self>>(
         handlers: &[(Name, Handler<P>)],
-        cx: &PointCx<'_>,
+        cx: &P::Cx<'_>,
         facts: P::Facts<'_>,
         (): &mut (),
         _: &mut Replaced<'_, ()>,
@@ -274,6 +285,7 @@ macro_rules! point {
 
         impl Point for $point {
             const NAME: &'static str = $name;
+            type Cx<'c> = PointCx<'c>;
             type Facts<'a> = $facts;
             type In<'a> = $facts;
             type Out = $out;
@@ -291,6 +303,7 @@ pub struct Input;
 
 impl Point for Input {
     const NAME: &'static str = "input";
+    type Cx<'c> = PointCx<'c>;
     type Facts<'a> = ();
     type In<'a> = &'a str;
     type Out = Rewrite<String, String>;
@@ -314,6 +327,7 @@ pub struct PreTool;
 
 impl Point for PreTool {
     const NAME: &'static str = "pre_tool";
+    type Cx<'c> = PointCx<'c>;
     type Facts<'a> = &'a str;
     type In<'a> = ToolUse<'a>;
     type Out = Rewrite<Value, String>;
@@ -342,6 +356,7 @@ pub struct Spawn;
 
 impl Point for Spawn {
     const NAME: &'static str = "spawn";
+    type Cx<'c> = PointCx<'c>;
     type Facts<'a> = ();
     type In<'a> = &'a crate::SpawnSpec;
     type Out = Rewrite<crate::SpawnSpec>;
@@ -356,6 +371,7 @@ pub struct PostTool;
 
 impl Point for PostTool {
     const NAME: &'static str = "post_tool";
+    type Cx<'c> = PointCx<'c>;
     type Facts<'a> = ToolUse<'a>;
     type In<'a> = Finished<'a>;
     type Out = Rewrite<Outcome>;
@@ -395,6 +411,73 @@ point!(
     ()
 );
 
+/// What an input starts, as the default loop asks: one model call unless
+/// a handler says otherwise (a planner, a plan mode, a command answered
+/// without the model).
+pub struct Turn;
+
+impl Point for Turn {
+    const NAME: &'static str = "turn";
+    type Cx<'c> = ();
+    type Facts<'a> = &'a crate::Input;
+    type In<'a> = (&'a crate::Input, &'a Actions);
+    type Out = Rewrite<Actions>;
+
+    fn input<'a, 'b: 'a>(input: &'b crate::Input, actions: &'a Actions) -> Self::In<'a> {
+        (input, actions)
+    }
+}
+
+/// What the model's reply becomes, as the default loop asks: a call per
+/// tool call unless a handler says otherwise (sequential calls only, a
+/// dedupe, a refusal).
+pub struct Reply;
+
+/// A model's reply at a step of the loop, as [`Reply`] handlers see it.
+#[derive(Clone, Copy, Debug)]
+pub struct Replied<'a> {
+    /// The model calls of the turn so far, this one included.
+    pub step: u16,
+    pub reply: &'a llm::Response,
+    /// What the loop does with it, as the handlers before left it.
+    pub actions: &'a Actions,
+}
+
+impl Point for Reply {
+    const NAME: &'static str = "reply";
+    type Cx<'c> = ();
+    type Facts<'a> = (u16, &'a llm::Response);
+    type In<'a> = Replied<'a>;
+    type Out = Rewrite<Actions>;
+
+    fn input<'a, 'b: 'a>(
+        (step, reply): (u16, &'b llm::Response),
+        actions: &'a Actions,
+    ) -> Replied<'a> {
+        Replied {
+            step,
+            reply,
+            actions,
+        }
+    }
+}
+
+/// What follows once every call of a step's reply is answered, as the
+/// default loop asks: with no answer, another model call.
+pub struct Resume;
+
+impl Point for Resume {
+    const NAME: &'static str = "resume";
+    type Cx<'c> = ();
+    type Facts<'a> = u16;
+    type In<'a> = u16;
+    type Out = Option<crate::Resume>;
+
+    fn input<'a, 'b: 'a>(step: u16, (): &'a ()) -> u16 {
+        step
+    }
+}
+
 /// A handler over JSON: what a Lua mod, a WASM component or an extension
 /// process registers. It is given the point's input as JSON, and answers
 /// as the point's [`Rule`] reads JSON: `null` passes, a chain takes
@@ -404,7 +487,7 @@ pub trait ErasedHandler: Send + Sync {
 }
 
 /// A point that takes [`ErasedHandler`]s.
-trait Wire: Point {
+trait Wire: for<'c> Point<Cx<'c> = PointCx<'c>> {
     fn to_json(input: &Self::In<'_>) -> Value;
     fn from_json(answer: Value) -> Self::Out;
 }
@@ -634,7 +717,7 @@ impl Hooks {
     /// Merges what the handlers at `P` answer, by `P`'s rule.
     pub fn run<P: Point>(
         &self,
-        cx: &PointCx<'_>,
+        cx: &P::Cx<'_>,
         facts: P::Facts<'_>,
         subject: &mut Subject<P>,
         replaced: &mut Replaced<'_, Subject<P>>,
@@ -645,7 +728,7 @@ impl Hooks {
     /// The answer at a point that rewrites nothing.
     fn ask<P: Point<Out: Rule<Subject = ()>>>(
         &self,
-        cx: &PointCx<'_>,
+        cx: &P::Cx<'_>,
         facts: P::Facts<'_>,
     ) -> Merged<P> {
         self.run::<P>(cx, facts, &mut (), &mut |_, (), ()| {})

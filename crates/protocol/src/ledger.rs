@@ -9,7 +9,7 @@ use std::collections::VecDeque;
 
 use crate::{
     Activity, Audience, Author, Body, ClientId, ClientSeq, Entry, Environment, Installed, Json,
-    Mode, Outcome, Overrides, Permission, SessionId, Verdict, WaitOn,
+    Mode, Outcome, Overrides, Permission, SessionId, ToolChoice, Verdict, WaitOn,
 };
 
 #[derive(Clone, Debug, Default)]
@@ -55,6 +55,7 @@ pub struct Open {
 pub enum Call {
     Model {
         attempt: u16,
+        choice: ToolChoice,
     },
     Tool {
         tool: String,
@@ -208,8 +209,14 @@ impl Ledger {
                     Phase::Gating { at: 0 },
                 );
             }
-            Body::ModelCall { attempt, .. } => {
-                self.open(seq, Call::Model { attempt: *attempt }, Phase::Running);
+            Body::ModelCall {
+                attempt, choice, ..
+            } => {
+                let call = Call::Model {
+                    attempt: *attempt,
+                    choice: *choice,
+                };
+                self.open(seq, call, Phase::Running);
             }
             Body::ToolProcess {
                 call,
@@ -281,7 +288,9 @@ impl Ledger {
         };
         // A retried model call's attempts are counted here, so a restart
         // does not start the count again.
-        if let (Verdict::Retry { attempt, .. }, Call::Model { attempt: at }) = (d, &mut open.call) {
+        if let (Verdict::Retry { attempt, .. }, Call::Model { attempt: at, .. }) =
+            (d, &mut open.call)
+        {
             *at = (*at).max(*attempt);
             return;
         }

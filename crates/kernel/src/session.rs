@@ -6,7 +6,8 @@ use std::sync::Arc;
 
 use protocol::ledger::{Call, Ledger, OutcomeKind, Phase};
 use protocol::{
-    Audience, Author, Body, CallId, Entry, Json, Mode, Outcome, Seq, SessionId, Verdict, WaitOn,
+    Audience, Author, Body, CallId, Entry, Json, Mode, Outcome, Seq, SessionId, ToolChoice,
+    Verdict, WaitOn,
 };
 use serde_json::json;
 use smallvec::SmallVec;
@@ -373,9 +374,14 @@ impl Core {
         request: Option<Box<llm::Request>>,
         fx: &mut Effects,
     ) {
+        let choice = match self.fold.ledger.call(call.get()).map(|open| &open.call) {
+            Some(&Call::Model { choice, .. }) => choice,
+            _ => ToolChoice::Auto,
+        };
         fx.push(Effect::CallModel {
             call,
             attempt,
+            choice,
             request,
         });
         self.turn = Turn::Model {
@@ -584,7 +590,7 @@ impl Core {
             Next::Agent(Action::Say(text)) => {
                 self.append(fx, Body::Assistant { text });
             }
-            Next::Agent(Action::CallModel) => {
+            Next::Agent(Action::CallModel { choice }) => {
                 // Steering input reaches the turn before the model is
                 // next asked.
                 let steers: SmallVec<[Seq; 2]> = (self.fold.ledger.untaken().iter())
@@ -600,7 +606,12 @@ impl Core {
                     self.append(fx, Body::Context { text });
                 }
                 let model = self.registry.model();
-                let call = self.append(fx, Body::ModelCall { model, attempt: 0 });
+                let body = Body::ModelCall {
+                    model,
+                    attempt: 0,
+                    choice,
+                };
+                let call = self.append(fx, body);
                 self.again(call, 0, None, fx);
             }
             Next::Agent(Action::Call { tool, input, id }) => {
@@ -754,7 +765,7 @@ impl Core {
                     None,
                     Audience::User,
                 ),
-                Next::Agent(Action::Say(_) | Action::CallModel) => {
+                Next::Agent(Action::Say(_) | Action::CallModel { .. }) => {
                     self.fold.asked.pop_front();
                     continue;
                 }
@@ -861,7 +872,7 @@ impl Core {
                 continue;
             }
             match kind {
-                Call::Model { attempt } => self.restart(call, attempt, fx),
+                Call::Model { attempt, .. } => self.restart(call, attempt, fx),
                 Call::Tool { tool, input, .. } => self.reopen(call, &tool, &input, &phase, fx),
             }
         }
@@ -906,8 +917,16 @@ impl Core {
         }
     }
 
-    /// Picks tool call `call` up as its phase says.
+    /// Picks tool call `call` up as its phase says: one the agent refused
+    /// is answered so, whatever of it committed.
     fn reopen(&mut self, call: CallId, tool: &str, input: &Json, phase: &Phase, fx: &mut Effects) {
+        if let Some(why) = self.fold.refused(call).map(str::to_owned) {
+            if *phase == (Phase::Gating { at: 0 }) {
+                let reason = why.clone();
+                self.decide(Some(call), AGENT, Verdict::Block { reason }, fx);
+            }
+            return self.settle(call, Outcome::Failed { error: why }, fx);
+        }
         match *phase {
             Phase::Gating { at } => match self.registry.gate(call, tool, input) {
                 Answer::Now(gated) => self.gated(call, gated, at, true, fx),

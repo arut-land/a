@@ -100,6 +100,15 @@ extension!(Guide, "guide", 1, |r| r
     )))));
 extension!(Agents, "agents", 1, |r| r.agent("idle", || Box::new(Idle)));
 
+/// An agent that does nothing.
+struct Idle;
+
+impl Agent for Idle {
+    fn step(&mut self, _: crate::Input, _: &dyn crate::LoopPoints) -> crate::Actions {
+        crate::Actions::new()
+    }
+}
+
 /// A session no handler reads.
 struct Bare;
 
@@ -350,10 +359,11 @@ fn commands_and_agents_are_found_by_name() {
         registry.tools().specs().is_empty(),
         "a command is not the model's"
     );
-    assert_eq!(registry.agents().collect::<Vec<_>>(), ["idle"]);
-    // An unknown name runs the first agent registered.
-    let said = registry
-        .agent(Some("nope"))
-        .step(crate::Input::User { text: "hi".into() });
+    assert_eq!(registry.agents().collect::<Vec<_>>(), [crate::LOOP, "idle"]);
+    let hi = || crate::Input::User { text: "hi".into() };
+    let said = registry.agent(Some("idle")).step(hi(), registry.hooks());
     assert!(said.is_empty());
+    // An unknown name runs the default loop.
+    let said = registry.agent(Some("nope")).step(hi(), registry.hooks());
+    assert!(matches!(&said[..], [crate::Action::CallModel { .. }]));
 }

@@ -11,11 +11,11 @@ use std::time::Duration;
 
 use kernel::{
     Action, Actions, Agent, Answer, Callable, Chained, Core, Effect, Effects, Event, Gate, Gated,
-    Input, Later, Load, Name, Recover, Registry, Replay, Replied,
+    Input, Later, Load, LoopPoints, Name, Recover, Registry, Replay, Replied,
 };
 use protocol::{
     Audience, Author, Body, CallId, ClientId, ClientSeq, Entry, Installed, Json, Mode, Outcome,
-    Permission, Seq, SessionId, Verdict, WaitOn,
+    Permission, Seq, SessionId, ToolChoice, Verdict, WaitOn,
 };
 use serde_json::{Value, json};
 use uuid::Uuid;
@@ -48,6 +48,8 @@ pub struct Reg {
     pub on_stop: Option<&'static str>,
     pub stopped: AtomicBool,
     pub extensions: &'static [&'static str],
+    /// The handlers at the loop points.
+    pub points: Option<ext::host::Registry>,
 }
 
 impl Reg {
@@ -59,6 +61,15 @@ impl Reg {
             on_stop: None,
             stopped: AtomicBool::new(false),
             extensions: &["fixtures"],
+            points: None,
+        }
+    }
+
+    /// The default loop, asking `points`' handlers.
+    pub fn looping(points: ext::host::Registry) -> Self {
+        Self {
+            points: Some(points),
+            ..Self::new(|| Box::new(ext::Loop::default()))
         }
     }
 
@@ -102,6 +113,13 @@ fn name(n: &str) -> Name {
 impl Registry for Reg {
     fn agent(&self) -> Box<dyn Agent> {
         (self.agent)()
+    }
+
+    fn loop_points(&self) -> &dyn LoopPoints {
+        match &self.points {
+            Some(points) => points.hooks(),
+            None => &ext::Defaults,
+        }
     }
 
     fn installed(&self) -> Vec<Installed> {
@@ -205,7 +223,7 @@ impl Registry for Reg {
 pub struct Echo;
 
 impl Agent for Echo {
-    fn step(&mut self, input: Input) -> Actions {
+    fn step(&mut self, input: Input, _: &dyn LoopPoints) -> Actions {
         let text = match input {
             Input::User { text } => text,
             Input::ChildDone { outcome, .. } => {
@@ -250,11 +268,13 @@ pub struct Chat {
 }
 
 impl Agent for Chat {
-    fn step(&mut self, input: Input) -> Actions {
+    fn step(&mut self, input: Input, _: &dyn LoopPoints) -> Actions {
         match input {
             Input::User { .. } | Input::ChildDone { .. } => {
                 self.pending = 0;
-                Actions::from_iter([Action::CallModel])
+                Actions::from_iter([Action::CallModel {
+                    choice: ToolChoice::Auto,
+                }])
             }
             Input::ModelDone {
                 outcome: Outcome::Done { output },
@@ -279,7 +299,9 @@ impl Agent for Chat {
                 if self.pending > 0 {
                     return Actions::new();
                 }
-                Actions::from_iter([Action::CallModel])
+                Actions::from_iter([Action::CallModel {
+                    choice: ToolChoice::Auto,
+                }])
             }
             Input::ToolDone { .. } | Input::ModelDone { .. } => Actions::new(),
         }
@@ -406,6 +428,35 @@ pub fn model_failed(call: u64) -> Event {
     }
 }
 
+/// A model's reply calling `calls`, as the model call stores it and the
+/// default loop reads it.
+pub fn response(calls: &[(&str, Value)]) -> Json {
+    let content = (calls.iter().enumerate())
+        .map(|(i, (tool, input))| {
+            llm::AssistantPart::ToolCall(llm::ToolCall {
+                id: format!("c{i}").into(),
+                name: (*tool).into(),
+                input: input.as_object().cloned().unwrap_or_default(),
+                invalid: None,
+                provider_executed: false,
+                meta: llm::Meta::new(),
+            })
+        })
+        .collect();
+    let response = llm::Response {
+        message: llm::Assistant {
+            content,
+            origin: None,
+        },
+        finish: llm::Finish::new(llm::Reason::Stop, None),
+        usage: llm::Usage::default(),
+        id: None,
+        model: None,
+        meta: llm::Meta::new(),
+    };
+    Json::encode(&response).unwrap()
+}
+
 /// A model reply calling `calls`, as the chat agent reads it.
 pub fn reply(calls: &[(&str, Value)]) -> Json {
     let calls: Vec<Value> = (calls.iter().enumerate())
@@ -509,6 +560,7 @@ pub fn model_call(attempt: u16) -> Body {
     Body::ModelCall {
         model: "test:model".to_owned(),
         attempt,
+        choice: ToolChoice::Auto,
     }
 }
 
@@ -558,6 +610,7 @@ pub fn call_model(call: u64, attempt: u16) -> Effect {
     Effect::CallModel {
         call: id(call),
         attempt,
+        choice: ToolChoice::Auto,
         request: None,
     }
 }

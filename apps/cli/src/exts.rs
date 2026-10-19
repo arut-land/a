@@ -10,11 +10,22 @@ use engine::Config;
 use ext::host::Registry;
 use ext::{DynExtension, Refused, Tier};
 
-/// The extensions this build links, in their install order, with the
-/// policy as `config` sets it and guarded. The fixtures come only with the
-/// `echo` agent they serve, in a build that has them.
-pub fn extensions(config: &Config) -> Vec<(Tier, Box<dyn DynExtension>)> {
-    let mut all: Vec<(Tier, Box<dyn DynExtension>)> = vec![
+/// The extensions this build links, in their install order, each as its
+/// `[ext.<name>]` table sets it, with the policy guarded. The fixtures
+/// come only with the `echo` agent they serve, in a build that has them.
+pub fn extensions(config: &Config) -> Result<Vec<Installed>, Refused> {
+    let setting = |e: sys::config::ParseError| Refused(e.to_string());
+    let max_steps = config.ext.table(ext::LOOP).whole("max_steps");
+    let step_limit = ext::StepLimit {
+        max: match max_steps.map_err(setting)? {
+            Some(max) => {
+                u16::try_from(max).map_err(|_| Refused("ext.loop.max_steps is too large".into()))?
+            }
+            None => ext::StepLimit::default().max,
+        },
+    };
+    let mut all: Vec<Installed> = vec![
+        (Tier::Pre, Box::new(step_limit)),
         #[cfg(feature = "policy")]
         (
             Tier::Guarded,
@@ -42,12 +53,15 @@ pub fn extensions(config: &Config) -> Vec<(Tier, Box<dyn DynExtension>)> {
     {
         all.push((Tier::User, fixtures));
     }
-    all
+    Ok(all)
 }
+
+/// An extension to install, and where.
+pub type Installed = (Tier, Box<dyn DynExtension>);
 
 /// The registry of [`extensions`].
 pub fn registry(config: &Config) -> Result<Registry, Refused> {
-    extensions(config)
+    extensions(config)?
         .iter()
         .try_fold(Registry::default(), |r, (tier, ext)| {
             r.with_dyn(*tier, &**ext)
@@ -110,6 +124,7 @@ mod tests {
             extensions,
             [
                 ("policy", 1),
+                ("loop", 1),
                 ("prompt", 1),
                 ("shell", 1),
                 ("edit", 1),
@@ -119,7 +134,10 @@ mod tests {
                 ("subagent", 1)
             ]
         );
-        assert_eq!(registry.agents().collect::<Vec<_>>(), [ext_chat::CHAT]);
+        assert_eq!(
+            registry.agents().collect::<Vec<_>>(),
+            [ext::LOOP, ext_chat::CHAT]
+        );
 
         let mut decided = Decided::new();
         assert_eq!(gate(&registry, "bash", &mut decided), Gate::Ask);
@@ -144,8 +162,9 @@ mod tests {
             r.system_prompt().split("\n\n").map(str::to_owned).collect()
         };
         // What each contributes that the others do not.
-        let own: [(&str, &[&str], usize, bool); 8] = [
+        let own: [(&str, &[&str], usize, bool); 9] = [
             ("policy", &[], 0, false),
+            ("loop", &[], 0, false),
             ("prompt", &[], 1, false),
             ("shell", &["bash"], 1, false),
             ("edit", &["edit"], 1, false),
@@ -156,6 +175,7 @@ mod tests {
         ];
         for (name, tools_of, texts_of, agent_of) in own {
             let rest = extensions(&config)
+                .unwrap()
                 .into_iter()
                 .filter(|(_, ext)| *ext.name() != *name)
                 .try_fold(Registry::default(), |r, (tier, ext)| {
@@ -183,7 +203,8 @@ mod tests {
             let (before, after) = (paragraphs(&all), paragraphs(&rest));
             assert!(after.iter().all(|p| before.contains(p)), "{name}");
             assert_eq!(before.len() - after.len(), texts_of, "{name}");
-            assert_eq!(rest.agents().count(), usize::from(!agent_of), "{name}");
+            // The default loop is always there.
+            assert_eq!(rest.agents().count(), 1 + usize::from(!agent_of), "{name}");
             let facts = Facts {
                 workspace: Path::new("/w"),
                 dir: Path::new("/w"),
@@ -205,7 +226,10 @@ mod tests {
         // Only the echo agent brings the fixtures.
         let chat = super::registry(&config(&[], None)).unwrap();
         assert!(chat.tools().get("sleep").is_none());
-        assert_eq!(chat.agents().collect::<Vec<_>>(), [ext_chat::CHAT]);
+        assert_eq!(
+            chat.agents().collect::<Vec<_>>(),
+            [ext::LOOP, ext_chat::CHAT]
+        );
     }
 
     #[test]

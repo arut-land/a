@@ -41,6 +41,7 @@ fn files_parse_the_contract() {
             agent: Some("chat".into()),
             env: BTreeMap::from([("OPENAI_API_KEY".into(), "sk-test".into())]),
             daemon: sys::config::Daemon::default(),
+            ext: sys::config::Exts::default(),
         }
     );
 }

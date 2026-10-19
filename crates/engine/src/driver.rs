@@ -27,7 +27,7 @@ use kernel::{Answer, Core, Effect, Effects, Event, Load, Note, Owner, Replied, T
 use protocol::view::SessionView;
 use protocol::{
     Author, Body, CallId, Card, DaemonMsg, Entry, Environment, Frame, Installed, Json, Mode,
-    Outcome, Overrides, Residency, SessionId, SessionSummary, Verdict,
+    Outcome, Overrides, Residency, SessionId, SessionSummary, ToolChoice, Verdict,
 };
 use rt::{channel, oneshot};
 
@@ -704,8 +704,9 @@ impl Actor {
             Effect::CallModel {
                 call,
                 attempt,
+                choice,
                 request,
-            } => self.call_model(call, attempt, request),
+            } => self.call_model(call, attempt, choice, request),
             Effect::RunTool { call, tool, input } => self.run_tool(call, tool, input),
             Effect::Resume {
                 call,
@@ -829,11 +830,22 @@ impl Actor {
         }));
     }
 
-    /// Asks the model to reply to the transcript before `call`, its text
-    /// streaming to followers under `attempt`.
-    fn call_model(&mut self, call: CallId, attempt: u16, request: Option<Box<llm::Request>>) {
+    /// Asks the model to reply to the transcript before `call`, with the
+    /// tools `choice` lets it call, its text streaming to followers under
+    /// `attempt`.
+    fn call_model(
+        &mut self,
+        call: CallId,
+        attempt: u16,
+        choice: ToolChoice,
+        request: Option<Box<llm::Request>>,
+    ) {
         let work = self.live.session.model().map(|model| {
-            let request = request.map_or_else(|| self.request(call, &model), |r| *r);
+            let mut request = request.map_or_else(|| self.request(call, &model), |r| *r);
+            request.tool_choice = match choice {
+                ToolChoice::Auto => llm::ToolChoice::Auto,
+                ToolChoice::None => llm::ToolChoice::None,
+            };
             (model, request)
         });
         let cancel = Cancel::default();
@@ -1124,6 +1136,10 @@ impl kernel::Registry for Bound {
         self.registry.agent(self.agent.as_deref())
     }
 
+    fn loop_points(&self) -> &dyn ext::LoopPoints {
+        self
+    }
+
     fn installed(&self) -> Vec<Installed> {
         installed(&self.registry)
     }
@@ -1211,6 +1227,27 @@ impl kernel::Registry for Bound {
 
     fn on_stop(&self) -> Option<(Name, String)> {
         guarded(|| self.registry.hooks().on_stop(&self.point()), |_| None)
+    }
+}
+
+/// The loop points fail open: a handler that panics leaves what the loop
+/// would do by default.
+impl ext::LoopPoints for Bound {
+    fn turn(&self, input: &kernel::Input, default: kernel::Actions) -> kernel::Actions {
+        let points = self.registry.hooks();
+        let shown = default.clone();
+        guarded(|| points.turn(input, default), |_| shown)
+    }
+
+    fn reply(&self, step: u16, reply: &llm::Response, default: kernel::Actions) -> kernel::Actions {
+        let points = self.registry.hooks();
+        let shown = default.clone();
+        guarded(|| points.reply(step, reply, default), |_| shown)
+    }
+
+    fn resume(&self, step: u16) -> ext::Resume {
+        let points = self.registry.hooks();
+        guarded(|| points.resume(step), |_| ext::Resume::Continue)
     }
 }
 

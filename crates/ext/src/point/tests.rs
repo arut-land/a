@@ -64,7 +64,10 @@ macro_rules! every_point {
             OnStop,
             Observe,
             SessionStart,
-            SessionEnd
+            SessionEnd,
+            Turn,
+            Reply,
+            Resume
         )
     };
 }
@@ -82,19 +85,20 @@ const TABLE: &[(&str, Merge)] = &[
     ("observe", Merge::Observe),
     ("session_start", Merge::Observe),
     ("session_end", Merge::Observe),
+    ("turn", Merge::Chain),
+    ("reply", Merge::Chain),
+    ("resume", Merge::FirstSome),
 ];
 
 /// A chain point merges as a chain: each handler sees what the last left,
 /// every replacement is reported with what it replaced, and the first stop
 /// ends it.
-fn chains<P, T, S>(facts: P::Facts<'_>, [start, a, b]: [T; 3], stop: Option<S>)
+fn chains<P, T, S>(cx: &P::Cx<'_>, facts: P::Facts<'_>, [start, a, b]: [T; 3], stop: Option<S>)
 where
     P: Point<Out = Rewrite<T, S>>,
     T: Clone + PartialEq + Debug + Send + Sync + 'static,
     S: Clone + PartialEq + Debug + Send + Sync + 'static,
 {
-    let view = Counted::default();
-    let cx = point_cx(&view);
     let (ra, rb) = (a.clone(), b.clone());
     let set = hooks(vec![
         one("pass", |r| {
@@ -109,7 +113,7 @@ where
     ]);
     let mut subject = start.clone();
     let mut replaced = Vec::new();
-    let merged = set.run::<P>(&cx, facts, &mut subject, &mut |name, before, after| {
+    let merged = set.run::<P>(cx, facts, &mut subject, &mut |name, before, after| {
         replaced.push((name.to_string(), before, after.clone()));
     });
     assert!(merged.is_ok(), "{}", P::NAME);
@@ -139,7 +143,7 @@ where
         }),
     ]);
     let mut subject = start;
-    let merged = set.run::<P>(&cx, facts, &mut subject, &mut |_, _, _| {});
+    let merged = set.run::<P>(cx, facts, &mut subject, &mut |_, _, _| {});
     let Err((who, why)) = merged else {
         panic!("{} did not stop", P::NAME)
     };
@@ -148,12 +152,11 @@ where
 }
 
 /// A first-answer point takes the first answer, and asks no one after.
-fn first<P, T>(facts: P::Facts<'_>, [a, b]: [T; 2])
+fn first<P, T>(cx: &P::Cx<'_>, facts: P::Facts<'_>, [a, b]: [T; 2])
 where
     P: Point<Out = Option<T>>,
     T: Clone + PartialEq + Debug + Send + Sync + 'static,
 {
-    let view = Counted::default();
     let asked = Arc::new(AtomicUsize::new(0));
     let after = Arc::clone(&asked);
     let set = hooks(vec![
@@ -170,7 +173,7 @@ where
             });
         }),
     ]);
-    let merged = set.run::<P>(&point_cx(&view), facts, &mut (), &mut |_, (), ()| {});
+    let merged = set.run::<P>(cx, facts, &mut (), &mut |_, (), ()| {});
     assert_eq!(
         merged.map(|(name, _)| name.to_string()),
         Some("a".into()),
@@ -181,8 +184,7 @@ where
 }
 
 /// An observed point tells every handler, in order.
-fn observes<P: Point<Out = ()>>(facts: P::Facts<'_>) {
-    let view = Counted::default();
+fn observes<P: Point<Out = ()>>(cx: &P::Cx<'_>, facts: P::Facts<'_>) {
     let told = Arc::new(Mutex::new(Vec::new()));
     let by = ["a", "b", "c"].map(|name| {
         let told = Arc::clone(&told);
@@ -190,7 +192,7 @@ fn observes<P: Point<Out = ()>>(facts: P::Facts<'_>) {
             r.on::<P>(move |_, _| told.lock().unwrap().push(name));
         })
     });
-    hooks(by.into()).run::<P>(&point_cx(&view), facts, &mut (), &mut |_, (), ()| {});
+    hooks(by.into()).run::<P>(cx, facts, &mut (), &mut |_, (), ()| {});
     assert_eq!(*told.lock().unwrap(), ["a", "b", "c"], "{}", P::NAME);
 }
 
@@ -222,10 +224,28 @@ fn merge_rules_are_applied_identically_for_every_point() {
     };
     let texts = ["0", "a", "b"].map(str::to_owned);
     let stop = Some("no".to_owned());
-    chains::<Input, _, _>((), texts, stop.clone());
-    chains::<PreTool, _, _>("t", [json!(0), json!(1), json!(2)], stop);
-    chains::<Spawn, _, _>((), ["0", "a", "b"].map(spawn), None);
-    chains::<PostTool, _, _>(call, ["0", "a", "b"].map(failed), None);
+    let view = Counted::default();
+    let cx = &point_cx(&view);
+    chains::<Input, _, _>(cx, (), texts, stop.clone());
+    chains::<PreTool, _, _>(cx, "t", [json!(0), json!(1), json!(2)], stop);
+    chains::<Spawn, _, _>(cx, (), ["0", "a", "b"].map(spawn), None);
+    chains::<PostTool, _, _>(cx, call, ["0", "a", "b"].map(failed), None);
+    let say = |text: &str| Actions::from_elem(crate::Action::Say(text.into()), 1);
+    let user = crate::Input::User { text: "hi".into() };
+    chains::<Turn, _, _>(&(), &user, ["0", "a", "b"].map(say), None);
+    let reply = llm::Response {
+        message: llm::Assistant {
+            content: Vec::new(),
+            origin: None,
+        },
+        finish: llm::Finish::new(llm::Reason::Stop, None),
+        usage: llm::Usage::default(),
+        id: None,
+        model: None,
+        meta: llm::Meta::new(),
+    };
+    chains::<Reply, _, _>(&(), (1, &reply), ["0", "a", "b"].map(say), None);
+    first::<Resume, _>(&(), 1, [crate::Resume::Final, crate::Resume::Stop]);
 
     let overflow = llm::Error::new(llm::Kind::ContextOverflow, "overflow");
     let error = Failed {
@@ -233,19 +253,20 @@ fn merge_rules_are_applied_identically_for_every_point() {
         attempt: 0,
     };
     first::<RequestError, _>(
+        cx,
         error,
         [
             Recover::Replace(Box::new(request("a"))),
             Recover::Replace(Box::new(request("b"))),
         ],
     );
-    first::<Approve, _>(call, [true, false]);
-    first::<OnStop, _>((), ["a", "b"].map(str::to_owned));
+    first::<Approve, _>(cx, call, [true, false]);
+    first::<OnStop, _>(cx, (), ["a", "b"].map(str::to_owned));
 
     let entry = Entry::new(1, 0, protocol::Body::INTERRUPT);
-    observes::<Observe>(&entry);
-    observes::<SessionStart>(());
-    observes::<SessionEnd>(());
+    observes::<Observe>(cx, &entry);
+    observes::<SessionStart>(cx, ());
+    observes::<SessionEnd>(cx, ());
 
     // The one most-restrictive point: the strictest wins, the earliest of
     // equals, and all allowing is no answer.

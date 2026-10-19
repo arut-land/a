@@ -351,6 +351,7 @@ mod tests {
             Body::ModelCall {
                 model: "m".into(),
                 attempt: 0,
+                choice: protocol::ToolChoice::Auto,
             },
         )]);
         let added = events(&mut page);

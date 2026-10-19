@@ -174,6 +174,7 @@ impl Session {
         let call = self.commit(Body::ModelCall {
             model: "m".into(),
             attempt: 0,
+            choice: protocol::ToolChoice::Auto,
         });
         let text = format!("reply {}", rng.below(1000));
         let mut rest = text.as_str();
@@ -483,6 +484,7 @@ fn scenarios() -> Vec<(&'static str, Vec<Value>)> {
                     Body::ModelCall {
                         model: "m".into(),
                         attempt: 0,
+                        choice: protocol::ToolChoice::Auto,
                     },
                 ),
                 msg(DaemonMsg::Delta {
@@ -707,6 +709,7 @@ fn scenarios() -> Vec<(&'static str, Vec<Value>)> {
                 Body::ModelCall {
                     model: "m".into(),
                     attempt: 0,
+                    choice: protocol::ToolChoice::Auto,
                 },
                 asked,
                 ask(3),
@@ -724,6 +727,7 @@ fn scenarios() -> Vec<(&'static str, Vec<Value>)> {
                     Body::ModelCall {
                         model: "m".into(),
                         attempt: 0,
+                        choice: protocol::ToolChoice::Auto,
                     },
                 ),
                 msg(DaemonMsg::Synced { seq: 2 }),

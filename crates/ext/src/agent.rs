@@ -1,17 +1,20 @@
 //! Agents: what a session does with its inputs, as a fold over its log.
 
-use protocol::{CallId, Json, Outcome, Seq};
+use protocol::{CallId, Json, Outcome, Seq, ToolChoice};
 use smallvec::SmallVec;
+
+use crate::LoopPoints;
 
 /// What an agent asks for, in order.
 pub type Actions = SmallVec<[Action; 2]>;
 
 /// A session's agent: turns each input into what it asks for next, and
 /// performs no I/O. Its inputs are logged facts, so it is a fold over its
-/// session's log. An extension registers one with
+/// session's log. The default is [`Loop`](crate::Loop), which asks
+/// `points` at each of its decisions; an extension registers another with
 /// [`Registrar::agent`](crate::Registrar::agent).
 pub trait Agent: Send {
-    fn step(&mut self, input: Input) -> Actions;
+    fn step(&mut self, input: Input, points: &dyn LoopPoints) -> Actions;
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -53,15 +56,7 @@ pub enum Action {
         id: Option<String>,
         why: String,
     },
-    /// Ask the model to reply to the conversation so far.
-    CallModel,
-}
-
-/// The agent of a registry with none.
-pub(crate) struct Idle;
-
-impl Agent for Idle {
-    fn step(&mut self, _: Input) -> Actions {
-        Actions::new()
-    }
+    /// Ask the model to reply to the conversation so far, with the tools
+    /// `choice` lets it call.
+    CallModel { choice: ToolChoice },
 }

@@ -28,8 +28,8 @@ use crate::view::{Approval, Item, SessionView, Status, Usage};
 use crate::{
     Audience, Author, Body, CallId, Caps, Card, ClientDecl, ClientId, ClientMsg, CommandInfo,
     DaemonMsg, Decode, Entry, Environment, HomeSettings, Installed, Json, Mode, Origin, Outcome,
-    Permission, Rejection, Role, Seq, SessionId, SessionSummary, SettingsChange, Target, Verdict,
-    WaitOn,
+    Permission, Rejection, Role, Seq, SessionId, SessionSummary, SettingsChange, Target,
+    ToolChoice, Verdict, WaitOn,
 };
 
 /// Declares a tagged union of the wire, one line per kind:
@@ -258,6 +258,7 @@ same!(
     Outcome,
     Permission,
     Mode,
+    ToolChoice,
     Seq,
     Author,
     SessionId,
@@ -389,6 +390,7 @@ pub(crate) struct EntryFields {
     pub(crate) outcome: Option<Outcome>,
     pub(crate) model: Option<String>,
     pub(crate) attempt: Option<u16>,
+    pub(crate) choice: Option<ToolChoice>,
     pub(crate) on: Option<Tag>,
     #[serde(default, deserialize_with = "present")]
     pub(crate) ui: Option<Json>,

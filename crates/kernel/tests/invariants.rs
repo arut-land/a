@@ -125,6 +125,103 @@ fn recovery_is_just_resume() {
     crash_everywhere(|| Reg::chat().retry(Duration::ZERO), &["go", "again"]);
 }
 
+/// Refuses every call of a reply but its first: a `reply` handler.
+struct OneAtATime;
+
+impl ext::Extension for OneAtATime {
+    const NAME: &'static str = "one";
+    const VERSION: u32 = 1;
+
+    fn contribute(&self, r: &mut ext::Registrar) {
+        r.on::<ext::point::Reply>(|(), replied| {
+            let mut actions = replied.actions.clone();
+            for action in actions.iter_mut().skip(1) {
+                if let kernel::Action::Call { tool, input, id } = action {
+                    *action = kernel::Action::Refuse {
+                        tool: tool.clone(),
+                        input: input.clone(),
+                        id: id.clone(),
+                        why: "one at a time".into(),
+                    };
+                }
+            }
+            ext::Rewrite::Replace(actions)
+        });
+    }
+}
+
+/// Carries out effects for the default loop: the session's `k`th reply
+/// calls `sleep` as many times as `script` says for `k`, so a run is a
+/// function of the conversation, however a crash renumbered its entries.
+fn drive_loop(s: &mut Session, fx: Effects, script: u64) {
+    let mut todo: VecDeque<Effect> = fx.into_iter().collect();
+    while let Some(effect) = todo.pop_front() {
+        let event = match effect {
+            Effect::RunTool { call, tool, .. } => tool_done(call.get(), done(json!(tool))),
+            Effect::CallModel { call, .. } => {
+                let k = (s.log.iter())
+                    .filter(|e| matches!(e.body, Body::ModelResult { .. }))
+                    .count() as u64;
+                let n = ((k + 1).wrapping_mul(script) >> 7) % 3;
+                let calls: Vec<_> = (0..n).map(|s| ("sleep", json!({ "seconds": s }))).collect();
+                Event::ModelDone {
+                    call,
+                    replied: Replied::Done(response(&calls)),
+                }
+            }
+            Effect::Sleep { call, .. } => Event::Woke { call },
+            _ => continue,
+        };
+        todo.extend(s.step(event));
+    }
+}
+
+/// The default loop is a fold, and so are its points: for scripts of
+/// replies, step limits and a `reply` handler, a log cut anywhere and
+/// resumed asks for what the live run asked, so it ends as the live run
+/// did; and the whole log resumed asks for nothing more.
+#[test]
+fn loop_points_are_folds() {
+    let reg = |script: u64| {
+        let max = u16::try_from(script % 4).unwrap() + 1;
+        let points = ext::host::Registry::default()
+            .with_in(ext::Tier::Pre, &ext::StepLimit { max })
+            .and_then(|r| r.with(&OneAtATime))
+            .unwrap();
+        Reg::looping(points).retry(Duration::ZERO)
+    };
+    let inputs = ["a", "b"];
+    for script in 1..24u64 {
+        let script = script.wrapping_mul(0x9e37_79b9_7f4a_7c15) | 1;
+        let mut s = Session::new(reg(script).arc());
+        for text in inputs {
+            let fx = s.step(user(text));
+            drive_loop(&mut s, fx, script);
+        }
+        let whole = s.log.clone();
+        let (_, fx) = Session::resume(reg(script).arc(), whole.clone(), &Load::default());
+        assert!(!fx.iter().any(|e| matches!(e, Effect::Append(_))), "{fx:?}");
+        for cut in 0..=whole.len() {
+            let log = whole[..cut].to_vec();
+            let (mut s, fx) = Session::resume(reg(script).arc(), log, &Load::default());
+            drive_loop(&mut s, fx, script);
+            let given = whole[..cut]
+                .iter()
+                .filter(|e| matches!(e.body, Body::Input { .. }))
+                .count();
+            for text in &inputs[given..] {
+                let fx = s.step(user(text));
+                drive_loop(&mut s, fx, script);
+            }
+            assert_eq!(
+                conversation(&s.log),
+                conversation(&whole),
+                "script {script}, cut after {cut}"
+            );
+        }
+    }
+}
+
 /// A session in each state a turn can be in, with what it logged last.
 fn states() -> Vec<(&'static str, Session)> {
     let mut states = Vec::new();

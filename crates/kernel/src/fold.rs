@@ -34,6 +34,9 @@ pub struct Fold {
     owners: Vec<(Seq, CallId)>,
     /// Results of children that calls wait on, not yet handed to them.
     fired: Vec<(CallId, Outcome)>,
+    /// The calls the agent refused, with why, until answered: a crash
+    /// before the answer commits must not run them.
+    refused: Vec<(CallId, String)>,
 }
 
 impl Fold {
@@ -46,24 +49,26 @@ impl Fold {
             inputs: Vec::new(),
             owners: Vec::new(),
             fired: Vec::new(),
+            refused: Vec::new(),
         }
     }
 
     /// Folds entry `e`, the one after the last folded: the agent is given
     /// the input it records, if any.
     pub fn apply(&mut self, e: &Entry, registry: &dyn Registry) {
-        let input = self.input(&e.body, registry);
+        let input = self.input(e, registry);
         self.ledger.apply(e);
         if let Some(input) = input {
             self.stepped = true;
-            let actions = self.agent.step(input);
+            let actions = self.agent.step(input, registry.loop_points());
             self.asked.extend(actions.into_iter().map(Next::Agent));
         }
     }
 
     /// The agent's input `body` records, read against the log before it;
     /// and what else of it the kernel keeps.
-    fn input(&mut self, body: &Body, registry: &dyn Registry) -> Option<Input> {
+    fn input(&mut self, e: &Entry, registry: &dyn Registry) -> Option<Input> {
+        let body = &e.body;
         match body {
             Body::Input {
                 text, taken: true, ..
@@ -76,8 +81,11 @@ impl Fold {
                     .find(|q| q.seq == input.get())?;
                 // A steer taken just before a model call is the model's to
                 // read; one left when the turn ended starts the next.
-                let steers =
-                    queued.steer && self.asked.front() == Some(&Next::Agent(Action::CallModel));
+                let steers = queued.steer
+                    && matches!(
+                        self.asked.front(),
+                        Some(Next::Agent(Action::CallModel { .. }))
+                    );
                 let text = queued.text.clone();
                 if steers {
                     None
@@ -99,7 +107,7 @@ impl Fold {
                 None
             }
             Body::Assistant { .. } | Body::ModelCall { .. } | Body::ToolCall { .. } => {
-                self.intent(body);
+                self.intent(e);
                 None
             }
             Body::ModelResult { call, outcome } => {
@@ -116,6 +124,7 @@ impl Fold {
                 self.inputs.retain(|(c, _)| *c != call);
                 self.fired.retain(|(c, _)| *c != call);
                 self.owners.retain(|(_, c)| *c != call);
+                self.refused.retain(|(c, _)| *c != call);
                 let by_user = matches!(
                     open.call,
                     Call::Tool {
@@ -157,15 +166,15 @@ impl Fold {
     }
 
     /// An intent folded: it carries out what was asked for next.
-    fn intent(&mut self, body: &Body) {
-        match body {
+    fn intent(&mut self, e: &Entry) {
+        match &e.body {
             Body::Assistant { text } => {
                 self.carried(|next| matches!(next, Next::Agent(Action::Say(said)) if said == text));
             }
             Body::ModelCall { attempt, .. } => {
                 // A retry is not the agent's to ask for.
                 if *attempt == 0 {
-                    self.carried(|next| *next == Next::Agent(Action::CallModel));
+                    self.carried(|next| matches!(next, Next::Agent(Action::CallModel { .. })));
                 }
             }
             Body::ToolCall {
@@ -173,9 +182,18 @@ impl Fold {
                 by: Audience::Model,
                 ..
             } => {
+                let refused = match self.asked.front() {
+                    Some(Next::Agent(Action::Refuse { tool: t, why, .. })) if t == tool => {
+                        Some(why.clone())
+                    }
+                    _ => None,
+                };
                 self.carried(|next| {
                     matches!(next, Next::Agent(Action::Call { tool: t, .. } | Action::Refuse { tool: t, .. }) if t == tool)
                 });
+                if let (Some(why), Some(call)) = (refused, CallId::new(e.seq)) {
+                    self.refused.push((call, why));
+                }
             }
             Body::ToolCall {
                 tool,
@@ -243,6 +261,13 @@ impl Fold {
         self.inputs
             .iter()
             .find_map(|(c, input)| (*c == call).then_some(input))
+    }
+
+    /// Why the agent refused call `call`, if it did and it is unanswered.
+    pub fn refused(&self, call: CallId) -> Option<&str> {
+        self.refused
+            .iter()
+            .find_map(|(c, why)| (*c == call).then_some(why.as_str()))
     }
 
     /// The result of the child call `call` waits on, once it fired.

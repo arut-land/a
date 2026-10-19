@@ -1,6 +1,6 @@
 use std::time::Duration;
 
-use ext::{Action, Actions, Agent, Cx, Extension, Input, Registrar, Replay, Tool};
+use ext::{Action, Actions, Agent, Cx, Extension, Input, LoopPoints, Registrar, Replay, Tool};
 use protocol::Json;
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
@@ -24,7 +24,7 @@ impl Extension for Fixtures {
 pub struct Echo;
 
 impl Agent for Echo {
-    fn step(&mut self, input: Input) -> Actions {
+    fn step(&mut self, input: Input, _: &dyn LoopPoints) -> Actions {
         let text = match input {
             Input::User { text } => text,
             Input::ChildDone { outcome, .. } => {
@@ -115,11 +115,25 @@ mod tests {
     #[test]
     fn echo_routes_messages_and_tools() {
         let mut echo = Echo;
-        assert!(matches!(&echo.step(user("hi"))[..], [Action::Say(text)] if text == "hi"));
-        assert_eq!(tool_named(&echo.step(user("$ ls"))), Some("bash"));
-        assert_eq!(tool_named(&echo.step(user("sleep 2"))), Some("sleep"));
-        assert!(matches!(&echo.step(user("sleep x"))[..], [Action::Say(_)]));
-        assert_eq!(tool_named(&echo.step(user("spawn sleep 1"))), Some("task"));
+        assert!(
+            matches!(&echo.step(user("hi"), &ext::Defaults)[..], [Action::Say(text)] if text == "hi")
+        );
+        assert_eq!(
+            tool_named(&echo.step(user("$ ls"), &ext::Defaults)),
+            Some("bash")
+        );
+        assert_eq!(
+            tool_named(&echo.step(user("sleep 2"), &ext::Defaults)),
+            Some("sleep")
+        );
+        assert!(matches!(
+            &echo.step(user("sleep x"), &ext::Defaults)[..],
+            [Action::Say(_)]
+        ));
+        assert_eq!(
+            tool_named(&echo.step(user("spawn sleep 1"), &ext::Defaults)),
+            Some("task")
+        );
     }
 
     #[test]
@@ -131,7 +145,7 @@ mod tests {
             },
         };
         assert_eq!(
-            &Echo.step(done)[..],
+            &Echo.step(done, &ext::Defaults)[..],
             [Action::Say("The child session finished:\nhi".into())]
         );
     }

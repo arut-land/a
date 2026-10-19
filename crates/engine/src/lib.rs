@@ -52,6 +52,8 @@ pub struct Config {
     /// Young deaths in a row after which a daemon refuses to serve (0 for
     /// never); see [`sys::crash`].
     pub crash_limit: u32,
+    /// `[ext]`: the extensions left out, and each one's own table.
+    pub ext: sys::config::Exts,
     /// The registry of the extensions this build links, assembled for this
     /// configuration. The engine itself offers the model nothing.
     pub extensions: fn(&Config) -> Result<ext::host::Registry, ext::Refused>,
@@ -67,6 +69,7 @@ impl Default for Config {
             ask: Vec::new(),
             system_prompt: None,
             crash_limit: sys::crash::LIMIT,
+            ext: sys::config::Exts::default(),
             #[cfg(not(test))]
             extensions: |_| Ok(ext::host::Registry::default()),
             #[cfg(test)]
@@ -83,7 +86,10 @@ impl Config {
             eprintln!("{e}; running with the default [daemon] settings");
             sys::Config::default()
         });
-        Self::from(file.daemon)
+        Self {
+            ext: file.ext,
+            ..Self::from(file.daemon)
+        }
     }
 
     /// The extensions' registry; an agent configured by name must be one
@@ -115,6 +121,7 @@ impl From<sys::config::Daemon> for Config {
             crash_limit: file.crash_limit.map_or(defaults.crash_limit, |n| {
                 u32::try_from(n).unwrap_or(u32::MAX)
             }),
+            ext: defaults.ext,
             extensions: defaults.extensions,
         }
     }

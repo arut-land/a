@@ -241,6 +241,7 @@ fn input_samples() -> Vec<Sample<DaemonMsg>> {
                 Body::ModelCall {
                     model: "openai:m".into(),
                     attempt: 1,
+                    choice: protocol::ToolChoice::Auto,
                 },
             ),
         ),
@@ -507,6 +508,7 @@ fn daemon_samples() -> Vec<Sample<DaemonMsg>> {
                 Body::ModelCall {
                     model: "openai:m".into(),
                     attempt: 0,
+                    choice: protocol::ToolChoice::Auto,
                 },
             ),
         ),

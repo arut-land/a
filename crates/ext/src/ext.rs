@@ -19,7 +19,7 @@ use std::fmt;
 use std::path::Path;
 use std::sync::Arc;
 
-use crate::point::{ERASED, ErasedHandler, Handler, Hooked, Point, PointCx};
+use crate::point::{ERASED, ErasedHandler, Handler, Hooked, Point};
 use crate::state::Decl;
 use crate::{Agent, DynTool, Fold, Name};
 
@@ -175,7 +175,7 @@ impl Registrar {
     /// Adds a handler at point `P`.
     pub fn on<P: Point>(
         &mut self,
-        handler: impl for<'a> Fn(&PointCx<'_>, P::In<'a>) -> P::Out + Send + Sync + 'static,
+        handler: impl for<'a> Fn(&P::Cx<'_>, P::In<'a>) -> P::Out + Send + Sync + 'static,
     ) -> &mut Self {
         let handler: Handler<P> = Arc::new(handler);
         self.hooks.push(Hooked::of::<P>(handler));

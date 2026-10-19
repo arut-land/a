@@ -17,6 +17,12 @@
 //! ask = ["bash"]                # tools whose calls wait for approval
 //! system_prompt = "..."         # in place of the extensions' prompt
 //! crash_limit = 3               # young deaths in a row before refusing
+//!
+//! [ext]                         # the extensions, read when the daemon starts
+//! disable = ["subagent"]        # extensions left out, by name
+//!
+//! [ext.loop]                    # each extension's own table, by its name
+//! max_steps = 20
 //! ```
 //!
 //! The file is edited in place: writing changes only the schema's keys, so
@@ -43,6 +49,84 @@ pub struct Config {
     /// `[daemon]`: how the daemon runs. Its own table, so the daemon never
     /// takes a setting from the environment of whichever client started it.
     pub daemon: Daemon,
+    pub ext: Exts,
+}
+
+/// The `[ext]` table: the extensions left out, and each one's own table,
+/// `[ext.<name>]`, which only that extension reads.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct Exts {
+    pub disable: Vec<String>,
+    pub tables: BTreeMap<String, Table>,
+}
+
+impl Exts {
+    /// Extension `name`'s table; empty when the file has none.
+    pub fn table(&self, name: &str) -> Table {
+        self.tables.get(name).cloned().unwrap_or_else(|| Table {
+            name: name.to_owned(),
+            values: BTreeMap::new(),
+        })
+    }
+}
+
+/// One extension's `[ext.<name>]` table: its settings, of the few shapes
+/// an extension takes.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct Table {
+    name: String,
+    values: BTreeMap<String, Setting>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+enum Setting {
+    Text(String),
+    Whole(u64),
+    Flag(bool),
+    List(Vec<String>),
+}
+
+impl Table {
+    pub fn text(&self, key: &str) -> Result<Option<&str>, ParseError> {
+        self.get(key, "a string", |v| match v {
+            Setting::Text(text) => Some(text.as_str()),
+            _ => None,
+        })
+    }
+
+    pub fn whole(&self, key: &str) -> Result<Option<u64>, ParseError> {
+        self.get(key, "a whole number", |v| match v {
+            Setting::Whole(n) => Some(*n),
+            _ => None,
+        })
+    }
+
+    pub fn flag(&self, key: &str) -> Result<Option<bool>, ParseError> {
+        self.get(key, "true or false", |v| match v {
+            Setting::Flag(b) => Some(*b),
+            _ => None,
+        })
+    }
+
+    pub fn list(&self, key: &str) -> Result<Option<&[String]>, ParseError> {
+        self.get(key, "a list of strings", |v| match v {
+            Setting::List(list) => Some(list.as_slice()),
+            _ => None,
+        })
+    }
+
+    fn get<'a, T>(
+        &'a self,
+        key: &str,
+        shape: &str,
+        read: impl FnOnce(&'a Setting) -> Option<T>,
+    ) -> Result<Option<T>, ParseError> {
+        self.values.get(key).map_or(Ok(None), |value| {
+            read(value)
+                .map(Some)
+                .ok_or_else(|| ParseError(format!("ext.{}.{key} must be {shape}", self.name)))
+        })
+    }
 }
 
 /// The `[daemon]` table; every key is optional.
@@ -149,7 +233,11 @@ impl FromStr for Config {
             agent: string(doc.as_table(), "agent", "")?,
             env: BTreeMap::new(),
             daemon: Daemon::default(),
+            ext: Exts::default(),
         };
+        if let Some(ext) = doc.get("ext") {
+            config.ext = exts(ext)?;
+        }
         if let Some(env) = doc.get("env") {
             let env = env
                 .as_table_like()
@@ -194,6 +282,49 @@ impl FromStr for Config {
         }
         Ok(config)
     }
+}
+
+/// The `[ext]` table.
+fn exts(item: &Item) -> Result<Exts, ParseError> {
+    let t = item
+        .as_table_like()
+        .ok_or_else(|| ParseError("ext must be a table".into()))?;
+    let mut exts = Exts::default();
+    for (key, item) in t.iter() {
+        if key == "disable" {
+            exts.disable = strings(item)
+                .ok_or_else(|| ParseError("ext.disable must be a list of names".into()))?;
+            continue;
+        }
+        let table = item
+            .as_table_like()
+            .ok_or_else(|| ParseError(format!("ext.{key} must be a table")))?;
+        let mut values = BTreeMap::new();
+        for (setting, item) in table.iter() {
+            let value = if let Some(text) = item.as_str() {
+                Setting::Text(text.to_owned())
+            } else if let Some(n) = item.as_integer().and_then(|n| u64::try_from(n).ok()) {
+                Setting::Whole(n)
+            } else if let Some(b) = item.as_bool() {
+                Setting::Flag(b)
+            } else if let Some(list) = strings(item) {
+                Setting::List(list)
+            } else {
+                let why = "must be a string, a whole number, true or false, or a list of strings";
+                return Err(ParseError(format!("ext.{key}.{setting} {why}")));
+            };
+            values.insert(setting.to_owned(), value);
+        }
+        let name = key.to_owned();
+        exts.tables.insert(name.clone(), Table { name, values });
+    }
+    Ok(exts)
+}
+
+/// The list of strings `item` is, if it is one.
+fn strings(item: &Item) -> Option<Vec<String>> {
+    let list = item.as_array()?;
+    list.iter().map(|v| v.as_str().map(str::to_owned)).collect()
 }
 
 /// The string at `key`, if there is one; anything else there is an error.
@@ -267,6 +398,7 @@ mod tests {
             model: model.map(str::to_owned),
             agent: None,
             daemon: Daemon::default(),
+            ext: Exts::default(),
             env: env
                 .iter()
                 .map(|(k, v)| ((*k).to_owned(), (*v).to_owned()))
@@ -329,6 +461,35 @@ model = "not this one"
         // The pane's writes leave the table as it was.
         let new = config(Some("m"), &[]);
         assert_eq!(new.render(text).unwrap(), format!("model = \"m\"\n{text}"));
+    }
+
+    #[test]
+    fn reads_each_extensions_table() {
+        let text = "[ext]\ndisable = [\"subagent\"]\n\n[ext.loop]\nmax_steps = 5\n\n[ext.policy]\nask = [\"bash\"]\nmode = \"auto\"\njudge = true\n";
+        let ext = text.parse::<Config>().unwrap().ext;
+        assert_eq!(ext.disable, ["subagent"]);
+        assert_eq!(ext.table("loop").whole("max_steps"), Ok(Some(5)));
+        let policy = ext.table("policy");
+        assert_eq!(policy.list("ask"), Ok(Some(&["bash".to_owned()][..])));
+        assert_eq!(policy.text("mode"), Ok(Some("auto")));
+        assert_eq!(policy.flag("judge"), Ok(Some(true)));
+        assert_eq!(policy.whole("missing"), Ok(None));
+        assert_eq!(
+            policy.whole("mode").unwrap_err().to_string(),
+            "ext.policy.mode must be a whole number"
+        );
+        // A table no file names is empty.
+        assert_eq!(ext.table("retry").whole("attempts"), Ok(None));
+        for (bad, why) in [
+            ("ext = 1\n", "ext must be a table"),
+            (
+                "[ext]\ndisable = \"x\"\n",
+                "ext.disable must be a list of names",
+            ),
+            ("[ext]\nloop = 3\n", "ext.loop must be a table"),
+        ] {
+            assert_eq!(bad.parse::<Config>().unwrap_err().to_string(), why);
+        }
     }
 
     #[test]

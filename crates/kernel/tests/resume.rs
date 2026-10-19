@@ -35,6 +35,42 @@ fn progress(call: u64, text: &str) -> Body {
     }
 }
 
+/// A call the agent refused is answered so after a crash cut it off
+/// before its answer committed: never run, whatever of it committed.
+#[test]
+fn a_refused_call_is_never_run_after_a_crash() {
+    let whole = {
+        let mut s = Session::new(Reg::echo().arc());
+        s.step(user("refuse bash"));
+        s.log.clone()
+    };
+    let refused = |e: &&protocol::Entry| matches!(&e.body, Body::ToolCall { .. });
+    let at = whole.iter().position(|e| refused(&e)).unwrap();
+    for cut in at + 1..whole.len() {
+        let (s, fx) = Session::resume(Reg::echo().arc(), whole[..cut].to_vec(), &Load::default());
+        assert!(
+            !fx.iter().any(|e| matches!(e, Effect::RunTool { .. })),
+            "cut after {cut}: {fx:?}"
+        );
+        let failed = Outcome::Failed {
+            error: "not now".into(),
+        };
+        assert_eq!(s.log.last().map(|e| &e.body), Some(&tool_result(2, failed)));
+        let blocks = (s.log.iter())
+            .filter(|e| {
+                matches!(
+                    e.body,
+                    Body::Decision {
+                        d: Verdict::Block { .. },
+                        ..
+                    }
+                )
+            })
+            .count();
+        assert_eq!(blocks, 1, "cut after {cut}: {:#?}", s.log);
+    }
+}
+
 /// A safe call whose gate a crash cut off is gated and run again; an
 /// interrupt before it runs stops it.
 #[test]

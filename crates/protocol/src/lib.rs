@@ -220,8 +220,9 @@ kinds! {
         Context "context" { text: String } = Durable;
         // ── calls: each intent is logged before the effect it names ────
         /// The committed intent to ask a model for a reply; a retry is an
-        /// intent of its own, its `attempt` one more.
-        ModelCall "model_call" { model: String, attempt: u16 = default } = Durable;
+        /// intent of its own, its `attempt` one more. With `choice` none the
+        /// model is offered the tools but may call none: a turn's last call.
+        ModelCall "model_call" { model: String, attempt: u16 = default, choice: ToolChoice = default } = Durable;
         /// The reply; `Done` carries the whole `llm::Response`.
         ModelResult "model_result" { call: u64, outcome: Outcome } = Durable;
         /// The committed intent to run a tool. Its seq is the call's id and
@@ -307,6 +308,18 @@ pub enum Mode {
     #[default]
     Queue,
     Steer,
+}
+
+/// What a model call may do with the tools it is offered.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ToolChoice {
+    /// Call any, or none.
+    #[default]
+    Auto,
+    /// Call none: the tools stay offered, so the request's prefix, and the
+    /// provider's cache of it, stay as they were.
+    None,
 }
 
 /// Who called a tool.
@@ -1428,6 +1441,7 @@ mod tests {
             Body::ModelCall {
                 model: "m".into(),
                 attempt: 1,
+                choice: ToolChoice::None,
             },
             Body::Decision {
                 by: "policy".into(),
@@ -1478,7 +1492,7 @@ mod tests {
                 format!(r#"{head}"input","text":"hi","taken":true,{who}}}"#),
                 format!(r#"{head}"input","text":"also","mode":"steer"}}"#),
                 format!(r#"{head}"take","input":2}}"#),
-                format!(r#"{head}"model_call","model":"m","attempt":1}}"#),
+                format!(r#"{head}"model_call","model":"m","attempt":1,"choice":"none"}}"#),
                 format!(
                     r#"{head}"decision","by":"policy","call":4,"d":"permission","permission":"ask"}}"#
                 ),

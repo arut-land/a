@@ -25,12 +25,12 @@ use std::sync::Arc;
 use std::time::Duration;
 
 pub use ext::{
-    Action, Actions, Agent, Answer, Callable, Chained, Gate, Gated, Input, Later, Name, Recover,
-    Replay,
+    Action, Actions, Agent, Answer, Callable, Chained, Gate, Gated, Input, Later, LoopPoints, Name,
+    Recover, Replay,
 };
 use protocol::{
     Author, CallId, Card, Entry, Environment, Installed, Json, Mode, Outcome, Seq, SessionId,
-    WaitOn,
+    ToolChoice, WaitOn,
 };
 use smallvec::SmallVec;
 
@@ -145,11 +145,13 @@ pub enum Effect {
         result: Result<(), String>,
     },
     /// Ask the model to reply to the transcript before `call`, as attempt
-    /// `attempt` (from 0), streaming under it; with `request`, send that
-    /// instead, as the `request_error` point replaced it.
+    /// `attempt` (from 0), streaming under it, with the tools `choice`
+    /// lets it call; with `request`, send that instead, as the
+    /// `request_error` point replaced it.
     CallModel {
         call: CallId,
         attempt: u16,
+        choice: ToolChoice,
         request: Option<Box<llm::Request>>,
     },
     /// Run tool call `call`.
@@ -241,6 +243,12 @@ pub enum Step {
 pub trait Registry: Send + Sync {
     /// A new agent, of the kind the session runs.
     fn agent(&self) -> Box<dyn Agent>;
+
+    /// What the agent asks at its decisions: the handlers at the loop
+    /// points. Pure, as the agent is: a load asks them again.
+    fn loop_points(&self) -> &dyn LoopPoints {
+        &ext::Defaults
+    }
 
     /// The extensions it runs, in install order, as a log records them.
     fn installed(&self) -> Vec<Installed>;

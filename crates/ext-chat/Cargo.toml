@@ -6,9 +6,6 @@ publish.workspace = true
 
 [dependencies]
 ext.workspace = true
-llm.workspace = true
-protocol.workspace = true
-serde_json.workspace = true
 
 [lints]
 workspace = true
