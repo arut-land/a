@@ -49,7 +49,7 @@ struct List {
     /// with the same mark is still the prefix's.
     marks: Vec<u64>,
     /// The encodings kept, shared with every copy of this list.
-    encodings: Arc<Mutex<Vec<Box<dyn Any + Send>>>>,
+    encodings: Arc<Mutex<Vec<Encoding>>>,
 }
 
 impl Messages {
@@ -153,32 +153,133 @@ pub(crate) trait Fold: Clone + Send + 'static {
     fn settle(&mut self, out: &mut Vec<Value>);
 }
 
-/// One encoding kept: `fold` after the first `len` messages, the last of
-/// them marked `mark`.
-struct Kept<F: Fold> {
+/// A fold's steps, past its type: the pass and the code that keeps
+/// encodings drive every protocol's fold through one copy.
+pub(crate) trait Step {
+    fn push(&mut self, at: usize, message: &Message) -> Result<(), Error>;
+
+    fn settle(&mut self, out: &mut Vec<Value>);
+}
+
+impl<F: Fold> Step for F {
+    fn push(&mut self, at: usize, message: &Message) -> Result<(), Error> {
+        Fold::push(self, at, message)
+    }
+
+    fn settle(&mut self, out: &mut Vec<Value>) {
+        Fold::settle(self, out);
+    }
+}
+
+/// One encoding kept, beside its fold: the first `len` messages folded,
+/// the last of them marked `mark`.
+struct Kept {
     provider: SmolStr,
     model: SmolStr,
     len: usize,
     mark: u64,
     pass: Prepare,
-    fold: F,
     settled: Vec<Bytes>,
 }
 
+/// An encoding kept and its fold, a [`Fold`] of some protocol.
+type Encoding = (Kept, Box<dyn Any + Send>);
+
+#[cfg(test)]
+thread_local! {
+    /// How many messages this thread's encodings folded.
+    pub(crate) static FOLDED: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
+impl Kept {
+    /// The encoding of `messages` kept for `target` whose fold `fits`, or
+    /// a new one.
+    fn take(
+        messages: &Messages,
+        target: &Target<'_>,
+        fits: &dyn Fn(&(dyn Any + Send)) -> bool,
+    ) -> (Self, Option<Box<dyn Any + Send>>) {
+        let mut kept = (messages.0.encodings.lock()).unwrap_or_else(PoisonError::into_inner);
+        let at = kept.iter().position(|(kept, fold)| {
+            kept.provider == target.provider.id
+                && kept.model == target.model
+                && fits(&**fold)
+                && messages.holds(kept.len, kept.mark)
+        });
+        if let Some(at) = at {
+            let (kept, fold) = kept.remove(at);
+            return (kept, Some(fold));
+        }
+        let new = Self {
+            provider: target.provider.id.clone(),
+            model: target.model.into(),
+            len: 0,
+            mark: 0,
+            pass: Prepare::default(),
+            settled: Vec::new(),
+        };
+        (new, None)
+    }
+
+    /// Folds the messages of `messages` past those this encoding folded,
+    /// into `fold`; what settles is written to one buffer.
+    fn grow(
+        &mut self,
+        messages: &Messages,
+        target: &Target<'_>,
+        fold: &mut dyn Step,
+    ) -> Result<(), Error> {
+        let (mut items, mut bytes) = (Vec::new(), Vec::new());
+        for message in &messages[self.len..] {
+            #[cfg(test)]
+            FOLDED.with(|folded| folded.set(folded.get() + 1));
+            self.pass.push(target, message, fold)?;
+            written(fold, &mut items, &mut bytes);
+        }
+        if !bytes.is_empty() {
+            self.settled.push(bytes.into());
+        }
+        Ok(())
+    }
+
+    /// Keeps this encoding, with its `fold`, first among those of
+    /// `messages`; what the request goes on with is a copy.
+    fn keep(mut self, messages: &Messages, fold: Box<dyn Any + Send>) -> (Prepare, Vec<Bytes>) {
+        let copy = (self.pass.clone(), self.settled.clone());
+        if let Some(&mark) = messages.0.marks.last() {
+            (self.len, self.mark) = (messages.len(), mark);
+            let mut kept = (messages.0.encodings.lock()).unwrap_or_else(PoisonError::into_inner);
+            kept.truncate(KEPT - 1);
+            kept.insert(0, (self, fold));
+        }
+        copy
+    }
+}
+
+/// The conversation's end, for this request only: what `pass` held goes
+/// to `fold`, and the bytes of what then settles join `settled`.
+fn end(
+    mut pass: Prepare,
+    mut settled: Vec<Bytes>,
+    fold: &mut dyn Step,
+) -> Result<Vec<Bytes>, Error> {
+    pass.finish(fold)?;
+    let (mut items, mut bytes) = (Vec::new(), Vec::new());
+    written(fold, &mut items, &mut bytes);
+    if !bytes.is_empty() {
+        settled.push(bytes.into());
+    }
+    Ok(settled)
+}
+
 /// Writes the items `fold` settled to `bytes`, each followed by a comma.
-fn settle<F: Fold>(fold: &mut F, items: &mut Vec<Value>, bytes: &mut Vec<u8>) {
+fn written(fold: &mut dyn Step, items: &mut Vec<Value>, bytes: &mut Vec<u8>) {
     fold.settle(items);
     for item in items.drain(..) {
         // Writing a value to memory cannot fail.
         let _ = serde_json::to_writer(&mut *bytes, &item);
         bytes.push(b',');
     }
-}
-
-#[cfg(test)]
-thread_local! {
-    /// How many messages this thread's encodings folded.
-    pub(crate) static FOLDED: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
 }
 
 /// `messages` folded by `fold` for `target`, from what was kept of them
@@ -189,64 +290,19 @@ pub(crate) fn fold<F: Fold>(
     target: &Target<'_>,
     fold: F,
 ) -> Result<(F, Vec<Bytes>), Error> {
-    let provider = &target.provider.id;
-    let mine = |kept: &Kept<F>| {
-        kept.provider == *provider && kept.model == target.model && kept.fold.cx() == fold.cx()
+    let fits = |kept: &(dyn Any + Send)| {
+        kept.downcast_ref::<F>()
+            .is_some_and(|kept| kept.cx() == fold.cx())
     };
-    let encodings = &messages.0.encodings;
-    let found = {
-        let mut kept = encodings.lock().unwrap_or_else(PoisonError::into_inner);
-        let at = kept.iter().position(|kept| {
-            kept.downcast_ref::<Kept<F>>()
-                .is_some_and(|kept| mine(kept) && messages.holds(kept.len, kept.mark))
-        });
-        at.map(|at| kept.remove(at))
+    let (mut kept, found) = Kept::take(messages, target, &fits);
+    let mut state = match found.map(<Box<dyn Any + Send>>::downcast::<F>) {
+        Some(Ok(found)) => *found,
+        _ => fold,
     };
-    let (mut kept, from) = match found.and_then(|kept| kept.downcast::<Kept<F>>().ok()) {
-        Some(kept) => {
-            let from = kept.len;
-            (*kept, from)
-        }
-        None => (
-            Kept {
-                provider: provider.clone(),
-                model: target.model.into(),
-                len: 0,
-                mark: 0,
-                pass: Prepare::default(),
-                fold,
-                settled: Vec::new(),
-            },
-            0,
-        ),
-    };
-    // What this request settles is written to one buffer.
-    let (mut items, mut bytes) = (Vec::new(), Vec::new());
-    for message in &messages[from..] {
-        #[cfg(test)]
-        FOLDED.with(|folded| folded.set(folded.get() + 1));
-        kept.pass.push(target, message, &mut kept.fold)?;
-        settle(&mut kept.fold, &mut items, &mut bytes);
-    }
-    if !bytes.is_empty() {
-        kept.settled.push(std::mem::take(&mut bytes).into());
-    }
-    let (mut pass, mut fold, mut settled) =
-        (kept.pass.clone(), kept.fold.clone(), kept.settled.clone());
-    if let Some(&mark) = messages.0.marks.last() {
-        kept.len = messages.len();
-        kept.mark = mark;
-        let mut kept_all = encodings.lock().unwrap_or_else(PoisonError::into_inner);
-        kept_all.truncate(KEPT - 1);
-        kept_all.insert(0, Box::new(kept));
-    }
-    // What the conversation's end implies goes with this request only.
-    pass.finish(&mut fold)?;
-    settle(&mut fold, &mut items, &mut bytes);
-    if !bytes.is_empty() {
-        settled.push(bytes.into());
-    }
-    Ok((fold, settled))
+    kept.grow(messages, target, &mut state)?;
+    let (pass, settled) = kept.keep(messages, Box::new(state.clone()));
+    let settled = end(pass, settled, &mut state)?;
+    Ok((state, settled))
 }
 
 /// A conversation encoded for one request: the items its fold makes only
