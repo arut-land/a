@@ -44,9 +44,9 @@ fn client() -> (Ureq, mpsc::Receiver<()>) {
     (Ureq::new(Arc::new(rt)), returned)
 }
 
-fn request(port: u16) -> http::Request<Bytes> {
+fn request(port: u16) -> http::Request<Payload> {
     http::Request::post(format!("http://127.0.0.1:{port}/v1/responses"))
-        .body(Bytes::from_static(b"{}"))
+        .body(Bytes::from_static(b"{}").into())
         .unwrap()
 }
 

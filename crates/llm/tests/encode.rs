@@ -2,14 +2,15 @@
 //! every protocol, sending conversations made of the replies recorded in
 //! `fixtures/rig/cassettes` (its own and other protocols'), grown a message
 //! at a time as a session grows them. The bodies are pinned by digest in
-//! `tests/encode.golden`; `UPDATE_GOLDEN=1` rewrites it.
+//! `tests/encode.golden`, made by the encoder before it kept encoded
+//! messages; `UPDATE_GOLDEN=1` rewrites it.
 
 use std::fmt::Write as _;
 use std::io;
 use std::path::{Path, PathBuf};
 
 use bytes::Bytes;
-use llm::http::{BoxFuture, Http, Response, body};
+use llm::http::{BoxFuture, Http, Payload, Response, body};
 use llm::protocols::{chat, gemini, messages, responses};
 use llm::{
     AssistantPart, Media, Message, Origin, Output, Provider, Request, Source, Text, Tool,
@@ -20,7 +21,7 @@ use serde_json::json;
 struct Recorded(String);
 
 impl Http for Recorded {
-    fn send(&self, _: http::Request<Bytes>) -> BoxFuture<'static, io::Result<Response>> {
+    fn send(&self, _: http::Request<Payload>) -> BoxFuture<'static, io::Result<Response>> {
         let chunks: Vec<Bytes> = self
             .0
             .as_bytes()
@@ -108,7 +109,7 @@ fn replies() -> Vec<(&'static str, llm::Response)> {
             let body = doc["then"]["body"].as_str().unwrap_or_default();
             let request = Request {
                 model: "recorded".into(),
-                messages: vec![Message::user("hi")],
+                messages: vec![Message::user("hi")].into(),
                 ..Request::default()
             };
             let decoded = rt::block_on(llm::generate(
@@ -269,10 +270,10 @@ fn bash() -> Tool {
 }
 
 /// A request for `messages`, as variant `variant` asks.
-fn request(model: &str, key: &str, variant: usize, messages: Vec<Message>) -> Request {
+fn request(model: &str, key: &str, variant: usize, messages: impl Into<llm::Messages>) -> Request {
     let mut request = Request {
         model: model.into(),
-        messages,
+        messages: messages.into(),
         generation: llm::Generation {
             max_output_tokens: std::num::NonZeroU32::new(1024),
             ..llm::Generation::default()
@@ -369,15 +370,9 @@ fn cases() -> Vec<Case> {
     out
 }
 
-/// What today's encoder sends for `request`: the prepared request's body,
-/// or its error.
+/// The body sent for `request`, or its error.
 fn sent(provider: &Provider, request: &Request) -> Vec<u8> {
-    let target = llm::Target {
-        provider,
-        model: &request.model,
-    };
-    let prepared = llm::prepare(request, &target);
-    match provider.request(&request.model, &prepared) {
+    match provider.request(&request.model, request) {
         Ok(http) => http.body().to_vec(),
         Err(error) => format!("error: {error}").into_bytes(),
     }
@@ -387,15 +382,43 @@ fn golden() -> PathBuf {
     Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/encode.golden")
 }
 
+/// Every body is the one pinned, whether its conversation was encoded
+/// whole or grew from what earlier requests encoded of it: a tool message
+/// a result at a time, as a session's grows.
 #[test]
 fn every_body_is_the_one_pinned() {
     let mut lines = String::new();
     for case in cases() {
         let key = case.provider.protocol.key();
+        let send = |messages: llm::Messages| {
+            sent(
+                &case.provider,
+                &request(case.model, key, case.variant, messages),
+            )
+        };
         let mut hash = Fnv(0xcbf2_9ce4_8422_2325);
-        for len in 1..=case.messages.len() {
-            let request = request(case.model, key, case.variant, case.messages[..len].to_vec());
-            let body = sent(&case.provider, &request);
+        let mut grown = llm::Messages::new();
+        for (at, message) in case.messages.iter().enumerate() {
+            match message {
+                Message::Tool(tool) if tool.results.len() > 1 => {
+                    let first = tool.results[..1].to_vec();
+                    grown.push(Message::Tool(ToolMessage { results: first }));
+                    send(grown.clone());
+                    if let Some(Message::Tool(last)) = grown.last_mut() {
+                        last.results.extend_from_slice(&tool.results[1..]);
+                    }
+                }
+                message => grown.push(message.clone()),
+            }
+            let whole = send(case.messages[..=at].to_vec().into());
+            let body = send(grown.clone());
+            assert!(
+                body == whole,
+                "{} at {at}:\n grown: {}\n whole: {}",
+                case.label,
+                String::from_utf8_lossy(&body),
+                String::from_utf8_lossy(&whole)
+            );
             hash.write(&(body.len() as u64).to_le_bytes());
             hash.write(&body);
         }

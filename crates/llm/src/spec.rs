@@ -18,6 +18,8 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 pub use smol_str::SmolStr;
 
+pub use crate::conversation::Messages;
+
 /// Protocol-keyed provider state on a part or a reply.
 pub type Meta = BTreeMap<String, Value>;
 
@@ -27,7 +29,7 @@ pub struct Request {
     pub model: SmolStr,
     /// The conversation. Leading system messages are the system prompt;
     /// later ones are instructions given mid-conversation.
-    pub messages: Vec<Message>,
+    pub messages: Messages,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub tools: Vec<Tool>,
     #[serde(default, skip_serializing_if = "ToolChoice::is_auto")]

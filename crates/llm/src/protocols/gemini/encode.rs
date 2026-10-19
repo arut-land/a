@@ -13,6 +13,7 @@ use serde::Serialize;
 use serde_json::{Map, Value, json};
 
 use super::{Gemini, KEY, ThoughtReplay};
+use crate::conversation::{self, Fold, History};
 use crate::error::Error;
 use crate::json::{Lenient, obj};
 use crate::models::Reasoning;
@@ -20,8 +21,8 @@ use crate::models::google as model;
 use crate::protocol::Target;
 use crate::replay::{Replay, replay, replays};
 use crate::spec::{
-    AssistantPart, Effort, Format, Generation, Media, Message, Output, Request, Source, Tool,
-    ToolChoice, ToolResult, UserPart,
+    AssistantPart, Effort, Format, Generation, Media, Message, Output, Request, SmolStr, Source,
+    Tool, ToolChoice, ToolResult, UserPart,
 };
 
 /// What leads the user content a tool result's images move to, for a model
@@ -103,44 +104,113 @@ fn is_response(part: &Value) -> bool {
     part.get("functionResponse").is_some()
 }
 
-/// The contents being built. Adjacent user messages are one content, but
-/// function responses and other user parts go in contents of their own:
-/// Gemini answers text that shares a content with responses poorly.
-#[derive(Default)]
-struct Contents(Vec<(Role, Vec<Value>)>);
+/// What a conversation's contents read besides its messages.
+#[derive(Clone, PartialEq, Eq)]
+pub(super) struct Cx {
+    model: SmolStr,
+    thought_replay: ThoughtReplay,
+}
+
+/// The contents of a conversation, a message at a time, and its system
+/// text. Adjacent user messages are one content, but function responses
+/// and other user parts go in contents of their own: Gemini answers text
+/// that shares a content with responses poorly.
+#[derive(Clone)]
+pub(super) struct Contents {
+    cx: Cx,
+    /// The contents not settled: one a user message may still join, and,
+    /// where only the current turn keeps its signatures, the turn since the
+    /// newest user text.
+    open: Vec<(Role, Vec<Value>)>,
+    /// Gemini takes system text only in its instruction, so a later system
+    /// message joins the leading one.
+    system: Vec<Value>,
+}
 
 impl Contents {
-    fn push(&mut self, role: Role, parts: Vec<Value>) {
+    pub(super) fn new(model: &str, thought_replay: ThoughtReplay) -> Self {
+        Self {
+            cx: Cx {
+                model: model.into(),
+                thought_replay,
+            },
+            open: Vec::new(),
+            system: Vec::new(),
+        }
+    }
+
+    fn add(&mut self, role: Role, parts: Vec<Value>) {
         // Gemini rejects a content with no parts.
         if parts.is_empty() {
             return;
         }
         if role == Role::User
-            && let Some((Role::User, held)) = self.0.last_mut()
+            && let Some((Role::User, held)) = self.open.last_mut()
             && held.last().map(is_response) == parts.first().map(is_response)
         {
             held.extend(parts);
         } else {
-            self.0.push((role, parts));
+            self.open.push((role, parts));
         }
+    }
+
+    /// The contents not settled, and the system instruction's parts.
+    pub(super) fn finish(self) -> (Vec<Value>, Vec<Value>) {
+        let mut contents: Vec<Value> = self.open.into_iter().map(content).collect();
+        if self.cx.thought_replay == ThoughtReplay::CurrentTurn {
+            drop_finished_signatures(&mut contents);
+        }
+        (contents, self.system)
     }
 }
 
-/// The contents and system instruction parts of `messages` for `model`.
-pub(super) fn contents(
-    messages: &[Message],
-    model: &str,
-) -> Result<(Vec<Value>, Vec<Value>), Error> {
-    let ids = model::takes_call_ids(model);
-    let (mut system, mut contents) = (Vec::new(), Contents::default());
-    for message in messages {
+fn content((role, parts): (Role, Vec<Value>)) -> Value {
+    obj!({"parts": parts, "role": role.as_str()})
+}
+
+/// Whether a content is a user's text, which starts a turn.
+fn user_text((role, parts): &(Role, Vec<Value>)) -> bool {
+    *role == Role::User
+        && parts.iter().any(|part| part.get("text").is_some())
+        && !parts.iter().any(is_response)
+}
+
+impl Fold for Contents {
+    type Cx = Cx;
+
+    fn cx(&self) -> &Cx {
+        &self.cx
+    }
+
+    /// Every content but the last when that is a user's, which the next may
+    /// join; where only the current turn keeps its signatures, those before
+    /// the newest user text, without theirs.
+    fn settle(&mut self, out: &mut Vec<Value>) {
+        let settled = match self.cx.thought_replay {
+            ThoughtReplay::All => {
+                let user = self
+                    .open
+                    .last()
+                    .is_some_and(|(role, _)| *role == Role::User);
+                self.open.len() - usize::from(user)
+            }
+            ThoughtReplay::CurrentTurn => self.open.iter().rposition(user_text).unwrap_or(0),
+        };
+        let mut settled: Vec<Value> = self.open.drain(..settled).map(content).collect();
+        if self.cx.thought_replay == ThoughtReplay::CurrentTurn {
+            drop_signatures(&mut settled);
+        }
+        out.append(&mut settled);
+    }
+
+    fn push(&mut self, _: usize, message: &Message) -> Result<(), Error> {
+        let model = &*self.cx.model;
+        let ids = model::takes_call_ids(model);
         match message {
-            // Gemini takes system text only in its instruction, so a later
-            // system message joins the leading one.
             Message::System(text) => {
                 let text = text.text();
                 if !text.trim().is_empty() {
-                    system.push(text_part(&text));
+                    self.system.push(text_part(&text));
                 }
             }
             Message::User(user) => {
@@ -150,27 +220,41 @@ pub(super) fn contents(
                     UserPart::Text(text) => Some(Ok(text_part(&text.text))),
                     UserPart::Media(part) => Some(media(part, true)),
                 });
-                contents.push(Role::User, parts.collect::<Result<_, _>>()?);
+                let parts = parts.collect::<Result<_, _>>()?;
+                self.add(Role::User, parts);
             }
             Message::Tool(tool) => {
                 let mut moved = vec![text_part(RESULT_IMAGES)];
                 let parts = tool.results.iter();
                 let parts = parts.map(|result| function_response(result, model, ids, &mut moved));
-                contents.push(Role::User, parts.collect::<Result<_, _>>()?);
+                let parts = parts.collect::<Result<_, _>>()?;
+                self.add(Role::User, parts);
                 if moved.len() > 1 {
-                    contents.push(Role::User, moved);
+                    self.add(Role::User, moved);
                 }
             }
             Message::Assistant(assistant) => {
                 let parts = assistant.content.iter();
                 let parts = parts.filter_map(|part| assistant_part(part, model, ids).transpose());
-                contents.push(Role::Model, parts.collect::<Result<_, _>>()?);
+                let parts = parts.collect::<Result<_, _>>()?;
+                self.add(Role::Model, parts);
             }
         }
+        Ok(())
     }
-    let contents = contents.0.into_iter();
-    let contents = contents.map(|(role, parts)| obj!({"parts": parts, "role": role.as_str()}));
-    Ok((contents.collect(), system))
+}
+
+/// The contents and system instruction parts of `messages` for `model`.
+#[cfg(test)]
+pub(super) fn contents(
+    messages: &[Message],
+    model: &str,
+) -> Result<(Vec<Value>, Vec<Value>), Error> {
+    let mut contents = Contents::new(model, ThoughtReplay::All);
+    for (at, message) in messages.iter().enumerate() {
+        contents.push(at, message)?;
+    }
+    Ok(contents.finish())
 }
 
 /// A tool result as a function response. Its error says so under the
@@ -299,7 +383,12 @@ pub(crate) fn drop_finished_signatures(contents: &mut [Value]) {
             && parts.iter().any(|part| part.get("text").is_some())
             && !parts.iter().any(is_response)
     });
-    for content in &mut contents[..current.unwrap_or(0)] {
+    drop_signatures(&mut contents[..current.unwrap_or(0)]);
+}
+
+/// Drop the thought signatures of every part of `contents`.
+fn drop_signatures(contents: &mut [Value]) {
+    for content in contents {
         let parts = content.get_mut("parts").and_then(Value::as_array_mut);
         for part in parts.into_iter().flatten().filter_map(Value::as_object_mut) {
             part.remove("thoughtSignature");
@@ -392,12 +481,11 @@ pub(crate) fn body(
     gemini: &Gemini,
     target: &Target<'_>,
     request: &Request,
-) -> Result<Value, Error> {
+) -> Result<(Value, Option<History>), Error> {
     let model = target.model;
-    let (mut contents, system) = contents(&request.messages, model)?;
-    if gemini.quirks.thought_replay == ThoughtReplay::CurrentTurn {
-        drop_finished_signatures(&mut contents);
-    }
+    let contents = Contents::new(model, gemini.quirks.thought_replay);
+    let (contents, settled) = conversation::fold(&request.messages, target, contents)?;
+    let (tail, system) = contents.finish();
     let mut options = request.options_for(KEY);
     let declared = some(request.tools.iter().map(declaration).collect());
     let mut tools = Vec::from_iter(declared.map(|tools| obj!({"functionDeclarations": tools})));
@@ -405,13 +493,18 @@ pub(crate) fn body(
         tools.extend(hosted);
     }
     let choice = &request.tool_choice;
+    let history = (!options.contains_key("contents")).then(|| History {
+        key: "contents",
+        head: Vec::new(),
+        settled,
+        tail,
+    });
     let mut body = set(obj!({
-        "contents": contents,
         "systemInstruction": some(system.into()).map(|parts| obj!({"parts": parts})),
         "generationConfig": some(generation_config(model, request)),
         "tools": some(tools.into()),
         "toolConfig": (*choice != ToolChoice::Auto).then(|| tool_config(choice)),
     }));
     crate::json::overlay(&mut body, &options);
-    Ok(body)
+    Ok((body, history))
 }

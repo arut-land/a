@@ -8,7 +8,10 @@
 use serde_json::{Map, Value, json};
 
 use super::merge::merge_fields;
-use super::{KEY, LaterSystem, PartKind, Quirks, ReasoningField, Routing, Vendor as V, rules};
+use super::{
+    KEY, LaterSystem, PartKind, Quirks, ReasoningField, Routing, Vendor as V, rewrite, rules,
+};
+use crate::conversation::{self, Fold, History};
 use crate::error::Error;
 use crate::json::{Lenient, obj};
 use crate::models::openai;
@@ -84,18 +87,19 @@ fn identity(item: &Value) -> Map<String, Value> {
 }
 
 /// What the encoder knows about the target.
-struct Context<'a> {
-    quirks: &'a Quirks,
+#[derive(Clone, PartialEq, Eq)]
+pub(super) struct Context {
+    quirks: Quirks,
     /// Whether the model reads user images.
     images: bool,
     reasoning_field: Option<ReasoningField>,
     /// The custom tools the request declares, whose calls are custom calls.
-    custom: Vec<&'a str>,
+    custom: Vec<String>,
 }
 
 /// What media a host takes: content parts at all, media beyond images, and
 /// video.
-impl Context<'_> {
+impl Context {
     fn parts(&self) -> bool {
         !matches!(self.quirks.vendor, V::DeepSeek | V::Mira)
     }
@@ -125,7 +129,7 @@ fn data_url(media: &Media, data: &str) -> String {
 
 /// The `image_url` part an image goes as, when the host takes it in its
 /// form; a user image names a detail level, `auto`.
-fn image_url(media: &Media, ctx: &Context<'_>, user: bool) -> Option<Value> {
+fn image_url(media: &Media, ctx: &Context, user: bool) -> Option<Value> {
     let url = match &media.source {
         Source::Data { data } if ctx.parts() => data_url(media, data),
         // Ollama reads an image as data and never fetches a URL.
@@ -149,7 +153,7 @@ fn audio_format(media_type: &str) -> &str {
 }
 
 /// One user media part as the host takes it, or the note that replaces it.
-fn media_part(media: &Media, ctx: &Context<'_>) -> Result<Value, &'static str> {
+fn media_part(media: &Media, ctx: &Context) -> Result<Value, &'static str> {
     let pdf = |file_data: String| obj!({"file_data": file_data, "filename": "document.pdf"});
     let kind = media.media_type.split('/').next().unwrap_or_default();
     match (kind, &media.source) {
@@ -189,7 +193,7 @@ fn note(parts: &mut Vec<Value>, note: &str) {
 
 /// A user message's parts: blank text says nothing, and several hosts
 /// reject it.
-fn user_parts(content: &[UserPart], ctx: &Context<'_>) -> Vec<Value> {
+fn user_parts(content: &[UserPart], ctx: &Context) -> Vec<Value> {
     let mut parts = Vec::new();
     for part in content {
         match part {
@@ -231,7 +235,7 @@ fn push_user(messages: &mut Vec<Value>, mut parts: Vec<Value>) {
 
 /// A result's parts: text, and the images the `tool` message can carry.
 /// One the model reads only from a user goes to `attached`, leaving a note.
-fn result_parts(result: &ToolResult, ctx: &Context<'_>, attached: &mut Vec<Value>) -> Vec<Value> {
+fn result_parts(result: &ToolResult, ctx: &Context, attached: &mut Vec<Value>) -> Vec<Value> {
     let content = match &result.output {
         Output::Text(text) => return vec![text_part(text)],
         Output::Json(value) => return vec![text_part(&value.to_string())],
@@ -264,7 +268,7 @@ fn result_parts(result: &ToolResult, ctx: &Context<'_>, attached: &mut Vec<Value
 /// The `tool` message that answers a call: its text joined into one
 /// string, or its parts when the host asks for them or one is an image. A
 /// result that says nothing says so.
-fn tool_message(result: &ToolResult, ctx: &Context<'_>, attached: &mut Vec<Value>) -> Value {
+fn tool_message(result: &ToolResult, ctx: &Context, attached: &mut Vec<Value>) -> Value {
     let mut parts = result_parts(result, ctx, attached);
     let image = |part: &Value| PartKind::of(part) == Some(PartKind::ImageUrl);
     let blank = parts
@@ -301,58 +305,122 @@ fn result_text(result: &ToolResult) -> String {
     format!("[tool {} {kind}] {text}", result.name)
 }
 
-fn messages(history: &[Message], ctx: &Context<'_>) -> Result<Vec<Value>, Error> {
-    let system = |message: &&Message| matches!(message, Message::System(_));
-    let system_text = |message: &Message| match message {
-        Message::System(system) => Some(system.text()).filter(|text| !text.trim().is_empty()),
-        _ => None,
-    };
-    let system_message = |text: String| Role::System.message(vec![text_part(&text)].into());
-    // A host that takes system text only where the conversation begins gets
-    // it all there, once a system message comes later.
-    let join = ctx.quirks.later_system == LaterSystem::Leading
-        && history
-            .iter()
-            .skip_while(system)
-            .any(|message| system(&message));
-    let mut messages = Vec::new();
-    if join {
-        let prompt: Vec<String> = history.iter().filter_map(system_text).collect();
-        if !prompt.is_empty() {
-            messages.push(system_message(prompt.join("\n\n")));
+/// The messages of a conversation, a message at a time.
+#[derive(Clone)]
+pub(super) struct Wire {
+    ctx: Context,
+    /// The messages not settled: a trailing user message, which the next
+    /// user message joins.
+    open: Vec<Value>,
+    /// Under a host that takes system text only where the conversation
+    /// begins, the system texts: they go at its head, joined once a system
+    /// message comes later.
+    prompt: Vec<String>,
+    /// Whether a message other than a system message came, and a system
+    /// message after one.
+    begun: bool,
+    later: bool,
+    /// Whether a tool message went.
+    answered: bool,
+    settled: usize,
+}
+
+impl Wire {
+    fn new(ctx: Context) -> Self {
+        Self {
+            ctx,
+            open: Vec::new(),
+            prompt: Vec::new(),
+            begun: false,
+            later: false,
+            answered: false,
+            settled: 0,
         }
     }
-    for message in history {
+
+    /// The messages sent only with this request: the head and the open
+    /// tail, as the host takes them.
+    fn finish(self) -> Result<(Vec<Value>, Vec<Value>), Error> {
+        let system = |text: &str| Role::System.message(vec![text_part(text)].into());
+        let mut head: Vec<Value> = if self.later {
+            let joined = (!self.prompt.is_empty()).then(|| system(&self.prompt.join("\n\n")));
+            joined.into_iter().collect()
+        } else {
+            self.prompt.iter().map(|text| system(text)).collect()
+        };
+        let mut tail = self.open;
+        if head.is_empty() && tail.is_empty() && self.settled == 0 {
+            return Err(Error::unsupported(
+                "a Chat Completions request needs at least one message the host takes",
+            ));
+        }
+        for message in head.iter_mut().chain(&mut tail) {
+            rewrite::message(self.ctx.quirks.vendor, message);
+        }
+        Ok((head, tail))
+    }
+}
+
+impl Fold for Wire {
+    type Cx = Context;
+
+    fn cx(&self) -> &Context {
+        &self.ctx
+    }
+
+    fn settle(&mut self, out: &mut Vec<Value>) {
+        let user = self
+            .open
+            .last()
+            .is_some_and(|message| Role::User.sent(message));
+        let settled = self.open.len() - usize::from(user);
+        for mut message in self.open.drain(..settled) {
+            rewrite::message(self.ctx.quirks.vendor, &mut message);
+            out.push(message);
+        }
+        self.settled += settled;
+    }
+
+    fn push(&mut self, _: usize, message: &Message) -> Result<(), Error> {
+        let ctx = &self.ctx;
+        let messages = &mut self.open;
+        if let Message::System(system) = message {
+            let text = Some(system.text()).filter(|text| !text.trim().is_empty());
+            if ctx.quirks.later_system == LaterSystem::Leading {
+                self.prompt.extend(text);
+                self.later |= self.begun;
+            } else {
+                let system = |text: String| Role::System.message(vec![text_part(&text)].into());
+                messages.extend(text.map(system));
+            }
+            return Ok(());
+        }
+        self.begun = true;
         match message {
-            Message::System(_) if join => {}
-            Message::System(_) => messages.extend(system_text(message).map(system_message)),
-            Message::User(user) => push_user(&mut messages, user_parts(&user.content, ctx)),
+            Message::System(_) => {}
+            Message::User(user) => push_user(messages, user_parts(&user.content, ctx)),
             Message::Tool(tool) if !ctx.quirks.supports_tools => {
                 let parts = tool
                     .results
                     .iter()
                     .map(|result| text_part(&result_text(result)));
-                push_user(&mut messages, parts.collect());
+                push_user(messages, parts.collect());
             }
             Message::Tool(tool) => {
                 let mut attached = Vec::new();
                 for result in &tool.results {
                     messages.push(tool_message(result, ctx, &mut attached));
+                    self.answered = true;
                 }
                 if !attached.is_empty() {
                     attached.insert(0, text_part(TOOL_IMAGES_HEADING));
-                    push_user(&mut messages, attached);
+                    push_user(messages, attached);
                 }
             }
             Message::Assistant(assistant) => messages.extend(assistant_message(assistant, ctx)),
         }
+        Ok(())
     }
-    if messages.is_empty() {
-        return Err(Error::unsupported(
-            "a Chat Completions request needs at least one message the host takes",
-        ));
-    }
-    Ok(messages)
 }
 
 /// One assistant message rebuilt from its parts: text joined into a
@@ -361,7 +429,7 @@ fn messages(history: &[Message], ctx: &Context<'_>) -> Result<Vec<Value>, Error>
 /// host's, beside its item's other fields (`reasoning_details`); and each
 /// call with its name and arguments. A message with neither content nor
 /// calls is not sent.
-fn assistant_message(assistant: &Assistant, ctx: &Context<'_>) -> Option<Value> {
+fn assistant_message(assistant: &Assistant, ctx: &Context) -> Option<Value> {
     const NO_ITEM: &Value = &Value::Null;
     let (mut parts, mut has_parts) = (Vec::new(), false);
     // The reasoning texts by the field they go under; a message has few.
@@ -469,7 +537,7 @@ fn assistant_message(assistant: &Assistant, ctx: &Context<'_>) -> Option<Value> 
 /// kind, or nothing. A call is custom when its item says so, or when it is
 /// rebuilt and the request declares a custom tool by its name; its input is
 /// then its arguments' `input`.
-fn call_item(call: &ToolCall, sent: Replay<'_>, custom: &[&str]) -> Value {
+fn call_item(call: &ToolCall, sent: Replay<'_>, custom: &[String]) -> Value {
     let mut item = match sent {
         Replay::Item(Value::Object(item)) => item.clone(),
         Replay::Identity(identity) => identity,
@@ -478,7 +546,7 @@ fn call_item(call: &ToolCall, sent: Replay<'_>, custom: &[&str]) -> Value {
     let custom = if let Some(kind) = item.get("type").and_then(Value::as_str) {
         kind == "custom"
     } else {
-        let declared = custom.contains(&call.name.as_str());
+        let declared = custom.iter().any(|tool| *tool == call.name);
         let kind = if declared { "custom" } else { "function" };
         item.insert("type".to_owned(), Value::from(kind));
         declared
@@ -555,7 +623,7 @@ pub(super) fn body(
     quirks: &Quirks,
     target: &Target<'_>,
     request: &Request,
-) -> Result<Value, Error> {
+) -> Result<(Value, Option<History>), Error> {
     let model = target.model;
     let mut options = request.options_for(KEY);
     // The request's own tools, function or native (Groq's
@@ -565,16 +633,21 @@ pub(super) fn body(
         _ => Vec::new(),
     };
     let ctx = Context {
-        quirks,
+        quirks: *quirks,
         images: rules::reads_images(quirks.vendor, model),
         reasoning_field: rules::reasoning_field(quirks, &target.provider.base_url, model),
         custom: passthrough
             .iter()
             .filter(|tool| tool.str("type") == Some("custom"))
             .filter_map(|tool| tool.at("/custom/name").and_then(Value::as_str))
+            .map(str::to_owned)
             .collect(),
     };
-    let messages = messages(&request.messages, &ctx)?;
+    let (wire, settled) = conversation::fold(&request.messages, target, Wire::new(ctx))?;
+    // A format waits for the first tool result unless the host takes both
+    // at once, so the model can still call a tool.
+    let answered = wire.answered;
+    let (head, tail) = wire.finish()?;
     let typed = request.tools.iter().filter(|_| quirks.supports_tools);
     let mut tools: Vec<Value> = typed
         .map(|tool| function_tool(tool, quirks.strict_tools))
@@ -589,9 +662,6 @@ pub(super) fn body(
             "the model cannot call tools through Chat Completions; use the Responses API",
         ));
     }
-    // A format waits for the first tool result unless the host takes both
-    // at once, so the model can still call a tool.
-    let answered = messages.iter().any(|message| Role::Tool.sent(message));
     let format = request
         .format
         .as_ref()
@@ -614,7 +684,6 @@ pub(super) fn body(
     let mut body = obj!({
         "model": (quirks.routing == Routing::Path).then_some(model),
         "response_format": format,
-        "messages": messages,
         "tool_choice": choice,
         "tools": (!tools.is_empty()).then_some(tools),
         "prompt_cache_key": cache_key.map(String::as_str),
@@ -625,9 +694,15 @@ pub(super) fn body(
         fields.retain(|_, value| !value.is_null());
         fields.extend(generation);
     }
+    let mut history = (!options.contains_key("messages")).then(|| History {
+        key: "messages",
+        head,
+        settled,
+        tail,
+    });
     crate::json::overlay(&mut body, &options);
     if let Some(fields) = body.as_object_mut() {
-        super::rewrite::finish(quirks, fields)?;
+        rewrite::finish(quirks, fields, history.as_mut())?;
     }
-    Ok(body)
+    Ok((body, history))
 }

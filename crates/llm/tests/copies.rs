@@ -8,7 +8,7 @@ use std::io;
 use std::path::Path;
 
 use bytes::Bytes;
-use llm::http::{BoxFuture, Http, Response, body};
+use llm::http::{BoxFuture, Http, Payload, Response, body};
 use llm::protocols::responses;
 use llm::{Accumulator, AssistantPart, Event, Message, Provider, Request};
 
@@ -58,7 +58,7 @@ fn allocated<T>(f: impl FnOnce() -> T) -> (T, usize) {
 struct Recorded(Bytes);
 
 impl Http for Recorded {
-    fn send(&self, _: http::Request<Bytes>) -> BoxFuture<'static, io::Result<Response>> {
+    fn send(&self, _: http::Request<Payload>) -> BoxFuture<'static, io::Result<Response>> {
         let chunks = self.0.chunks(1024).map(|chunk| self.0.slice_ref(chunk));
         let response = http::Response::builder()
             .status(200)
@@ -89,7 +89,7 @@ fn a_streamed_token_is_copied_once() {
     );
     let request = Request {
         model: "gpt-4o".into(),
-        messages: vec![Message::user("hi")],
+        messages: vec![Message::user("hi")].into(),
         ..Request::default()
     };
     let mut events = llm::stream(&recorded(), &provider, &request);

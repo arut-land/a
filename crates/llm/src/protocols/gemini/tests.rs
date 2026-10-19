@@ -82,17 +82,17 @@ fn sent(model: &str, request: Request) -> Value {
         provider: &provider,
         model,
     };
-    let request = crate::prepare(&request, &target);
+    let request = crate::prepare::prepare(&request, &target);
     provider
         .protocol
         .encode(&target, &request)
         .expect("the request encodes")
-        .body
+        .json()
 }
 
 fn asking(messages: Vec<Message>) -> Request {
     Request {
-        messages,
+        messages: messages.into(),
         ..Request::default()
     }
 }

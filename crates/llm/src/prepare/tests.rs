@@ -3,7 +3,7 @@ use serde_json::json;
 use super::*;
 use crate::Error;
 use crate::protocol::{Auth, Decoder, Encoded, Protocol, Provider};
-use crate::spec::{Assistant, Meta, Origin, Reasoning, Text, ToolCall, User, UserPart};
+use crate::spec::{Assistant, Meta, Origin, Reasoning, Request, Text, ToolCall, User, UserPart};
 
 struct Short;
 
@@ -70,19 +70,14 @@ fn run(messages: Vec<Message>) -> Vec<Message> {
     let provider = provider();
     let request = Request {
         model: "m".into(),
-        messages,
+        messages: messages.into(),
         ..Request::default()
     };
     let target = Target {
         provider: &provider,
         model: "m",
     };
-    let prepared = prepare(&request, &target);
-    // The request is copied only when the pass changes it.
-    let rebuilt = rebuild(request.clone(), &target);
-    assert_eq!(*prepared, rebuilt);
-    assert_eq!(matches!(prepared, Cow::Borrowed(_)), rebuilt == request);
-    prepared.into_owned().messages
+    prepare(&request, &target).messages.to_vec()
 }
 
 #[test]

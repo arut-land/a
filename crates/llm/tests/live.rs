@@ -35,7 +35,8 @@ fn responses_streams_text_and_usage() {
         messages: vec![
             Message::system("Answer in one word."),
             Message::user("Capital of France?"),
-        ],
+        ]
+        .into(),
         ..Request::default()
     };
     let reply = rt::block_on(llm::generate(&http(), &openai(), &request)).expect("a reply");
@@ -58,7 +59,8 @@ fn responses_tool_round_trip_replays_its_items() {
         model: model(),
         messages: vec![Message::user(
             "Call lookup_harbor_label for harbor 7, then tell me the label in one sentence.",
-        )],
+        )]
+        .into(),
         tools: vec![tool],
         ..Request::default()
     };
@@ -115,7 +117,8 @@ fn messages_streams_text_and_usage() {
         messages: vec![
             Message::system("Answer in one word."),
             Message::user("Capital of France?"),
-        ],
+        ]
+        .into(),
         ..Request::default()
     };
     let reply = rt::block_on(llm::generate(&http(), &anthropic(), &request)).expect("a reply");
@@ -137,7 +140,8 @@ fn messages_thinking_tool_round_trip_replays_its_signature() {
         model: claude(),
         messages: vec![Message::user(
             "Call lookup_harbor_label for harbor 7, then tell me the label in one sentence.",
-        )],
+        )]
+        .into(),
         tools: vec![tool],
         ..Request::default()
     };
@@ -198,7 +202,8 @@ fn tool_round_trip(provider: &Provider, model: &str) {
         model: model.into(),
         messages: vec![Message::user(
             "Call lookup_harbor_label for harbor 7, then tell me the label in one sentence.",
-        )],
+        )]
+        .into(),
         tools: vec![tool],
         ..Request::default()
     };

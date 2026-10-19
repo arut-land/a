@@ -1314,38 +1314,34 @@ impl Session {
     /// The request for model call `call`: the system prompt, the transcript
     /// before it, and the tools.
     fn request(&self, call: u64, model: &Model, registry: &Arc<Registry>) -> llm::Request {
-        let mut history = self.history(call, registry);
-        let system = self
-            .shared
-            .system
-            .clone()
-            .unwrap_or_else(|| registry.system_prompt().to_owned());
-        if !system.is_empty() {
-            history.insert(0, llm::Message::system(system));
-        }
-        model.request(history, registry.specs().to_vec())
+        let system = self.shared.system.as_deref();
+        let system = system.unwrap_or_else(|| registry.system_prompt());
+        model.request(
+            self.history(call, registry, system),
+            registry.specs().to_vec(),
+        )
     }
 
-    /// The conversation before model call `call`, as the tools of
-    /// `registry` present results: the transcript kept as entries commit,
-    /// made again only for other tools, or for a call that recovery runs
-    /// after entries it does not see.
-    fn history(&self, call: u64, registry: &Arc<Registry>) -> Vec<llm::Message> {
+    /// The conversation before model call `call` that `system` prompts, as
+    /// the tools of `registry` present results: the transcript kept as
+    /// entries commit, shared, made again only for other tools, or for a
+    /// call that recovery runs after entries it does not see.
+    fn history(&self, call: u64, registry: &Arc<Registry>, system: &str) -> llm::Messages {
         let mut st = self.lock();
         st.transcript = st.transcript.take().filter(|t| t.is_on(registry));
-        let transcript = st
-            .transcript
-            .get_or_insert_with(|| Transcript::of(self.frames.entries(), Arc::clone(registry)));
+        let transcript = st.transcript.get_or_insert_with(|| {
+            Transcript::of(self.frames.entries(), Arc::clone(registry), system)
+        });
         let history = if let Some(messages) = transcript.before(call) {
-            messages.to_vec()
+            messages.clone()
         } else {
             let before = self.frames.entries().take_while(|e| e.seq < call);
-            Transcript::of(before, Arc::clone(registry)).into_messages()
+            Transcript::of(before, Arc::clone(registry), system).into_messages()
         };
         #[cfg(test)]
         assert_eq!(
-            history,
-            oracle::transcript(&st.entries, call, registry.tools()),
+            history[usize::from(!system.is_empty())..],
+            oracle::transcript(&st.entries, call, registry.tools())[..],
             "the transcript kept"
         );
         history

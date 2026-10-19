@@ -4,7 +4,7 @@
 use std::path::Path;
 use std::sync::Arc;
 
-use llm::{Block, Event, Events, Http, Message, Provider, Request};
+use llm::{Block, Event, Events, Http, Messages, Provider, Request};
 use protocol::{Environment, Overrides};
 
 use crate::config::Settings;
@@ -56,7 +56,7 @@ impl Model {
     }
 
     /// A request to this model for a reply to `messages`, offering `tools`.
-    pub fn request(&self, messages: Vec<Message>, tools: Vec<llm::Tool>) -> Request {
+    pub fn request(&self, messages: Messages, tools: Vec<llm::Tool>) -> Request {
         Request {
             model: self.id.clone(),
             messages,

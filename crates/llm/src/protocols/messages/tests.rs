@@ -41,7 +41,7 @@ fn target<'a>(provider: &'a Provider, model: &'a str) -> Target<'a> {
 fn request(model: &str, messages: Vec<Message>) -> Request {
     Request {
         model: model.into(),
-        messages,
+        messages: messages.into(),
         generation: crate::Generation {
             max_output_tokens: std::num::NonZeroU32::new(64),
             ..crate::Generation::default()
@@ -56,9 +56,9 @@ type Sent = (Value, Vec<(&'static str, String)>);
 /// `request` prepared and encoded for `provider`.
 fn encoded(provider: &Provider, request: &Request) -> Result<Sent, Error> {
     let target = target(provider, &request.model);
-    let prepared = crate::prepare(request, &target);
+    let prepared = crate::prepare::prepare(request, &target);
     let encoded = provider.protocol.encode(&target, &prepared)?;
-    Ok((encoded.body, encoded.headers))
+    Ok((encoded.json(), encoded.headers))
 }
 
 /// The body `request` sends to `provider`.

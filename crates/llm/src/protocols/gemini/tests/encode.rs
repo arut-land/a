@@ -580,7 +580,7 @@ fn the_request_goes_to_the_models_stream() {
 #[test]
 fn tools_choice_and_format_take_gemini_spellings() {
     let request = Request {
-        messages: vec![Message::user("hi")],
+        messages: vec![Message::user("hi")].into(),
         tools: vec![
             Tool {
                 name: "add".into(),

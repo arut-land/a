@@ -6,6 +6,7 @@
 
 mod accumulate;
 mod client;
+mod conversation;
 mod error;
 pub mod hosts;
 pub mod http;
@@ -23,10 +24,11 @@ mod writer;
 
 pub use accumulate::Accumulator;
 pub use client::{Events, generate, origin, stream};
+pub use conversation::History;
 pub use error::{Error, Kind};
 pub use http::Http;
 pub use json::parse_partial_arguments;
-pub use prepare::{NO_RESULT, prepare};
+pub use prepare::NO_RESULT;
 pub use protocol::{Auth, Decoder, Encoded, Flow, Frame, Protocol, Provider, Secret, Target};
 pub use spec::*;
 #[cfg(feature = "ureq")]

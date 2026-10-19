@@ -6,11 +6,19 @@ use serde_json::{Map, Value, json};
 
 use super::encode::{Role, joined_text};
 use super::{OutputCap, PartKind, Quirks, Vendor};
+use crate::conversation::History;
 use crate::error::Error;
 use crate::json::Lenient;
 use crate::models::openai;
 
-pub(super) fn finish(quirks: &Quirks, body: &mut Map<String, Value>) -> Result<(), Error> {
+/// `history` is the conversation, when the body leaves it to be spliced;
+/// its messages took their host's shapes as they were encoded
+/// ([`message`]).
+pub(super) fn finish(
+    quirks: &Quirks,
+    body: &mut Map<String, Value>,
+    history: Option<&mut History>,
+) -> Result<(), Error> {
     // A `vendor/model` id (a proxy behind the base URL) keeps `max_tokens`.
     let reasoning = body
         .get("model")
@@ -31,22 +39,49 @@ pub(super) fn finish(quirks: &Quirks, body: &mut Map<String, Value>) -> Result<(
     {
         options.entry("include_usage").or_insert(Value::Bool(true));
     }
-    rewrite(quirks.vendor, body)
+    if history.is_none() {
+        let messages = body.get_mut("messages").and_then(Value::as_array_mut);
+        for message in messages.into_iter().flatten() {
+            self::message(quirks.vendor, message);
+        }
+    }
+    rewrite(quirks.vendor, body, history)
 }
 
-/// Each message's content.
-fn contents(body: &mut Map<String, Value>) -> impl Iterator<Item = &mut Value> {
-    body.get_mut("messages")
-        .and_then(Value::as_array_mut)
-        .into_iter()
-        .flatten()
-        .filter_map(|message| message.get_mut("content"))
+/// One message's content as the host takes it. Mira takes every content as
+/// one string. Perplexity spends output on a text-part array (a short cap
+/// comes back empty at `length`), so text-only arrays go as one string.
+/// Mistral's parts go as its chunks.
+pub(super) fn message(vendor: Vendor, message: &mut Value) {
+    let Some(Value::Array(parts)) = message.get_mut("content") else {
+        return;
+    };
+    match vendor {
+        Vendor::Perplexity | Vendor::Mira
+            if vendor == Vendor::Mira
+                || parts
+                    .iter()
+                    .all(|part| PartKind::of(part) == Some(PartKind::Text)) =>
+        {
+            message["content"] = Value::String(joined_text(parts));
+        }
+        Vendor::Mistral => {
+            for part in parts {
+                *part = mistral_chunk(part);
+            }
+        }
+        _ => {}
+    }
 }
 
 /// The host's rewrite of the finished body: a refusal where the host would
 /// answer with an error or silently do something else, and each host's
 /// spellings and content shapes.
-fn rewrite(vendor: Vendor, body: &mut Map<String, Value>) -> Result<(), Error> {
+fn rewrite(
+    vendor: Vendor,
+    body: &mut Map<String, Value>,
+    history: Option<&mut History>,
+) -> Result<(), Error> {
     let choice = body.get("tool_choice");
     let forced = choice.and_then(|choice| choice.at("/function/name")?.as_str());
     match vendor {
@@ -66,24 +101,12 @@ fn rewrite(vendor: Vendor, body: &mut Map<String, Value>) -> Result<(), Error> {
             }
             if choice.and_then(Value::as_str) == Some("required") {
                 body.insert("tool_choice".to_owned(), Value::from("auto"));
-                if let Some(Value::Array(messages)) = body.get_mut("messages") {
-                    let steer = "Please select a tool to handle the current issue.";
-                    messages.push(Role::User.message(steer.into()));
-                }
-            }
-        }
-        // Mira takes every content as one string. Perplexity spends output
-        // on a text-part array (a short cap comes back empty at `length`),
-        // so text-only arrays go as one string.
-        Vendor::Perplexity | Vendor::Mira => {
-            for content in contents(body) {
-                if let Value::Array(parts) = content
-                    && (vendor == Vendor::Mira
-                        || parts
-                            .iter()
-                            .all(|part| PartKind::of(part) == Some(PartKind::Text)))
-                {
-                    *content = Value::String(joined_text(parts));
+                let steer = "Please select a tool to handle the current issue.";
+                let steer = Role::User.message(steer.into());
+                if let Some(history) = history {
+                    history.tail.push(steer);
+                } else if let Some(Value::Array(messages)) = body.get_mut("messages") {
+                    messages.push(steer);
                 }
             }
         }
@@ -119,7 +142,7 @@ fn rewrite(vendor: Vendor, body: &mut Map<String, Value>) -> Result<(), Error> {
 }
 
 /// Mistral rejects a forced tool call beside a JSON format, so the choice
-/// is relaxed rather than the format dropped; and its content chunks.
+/// is relaxed rather than the format dropped.
 fn mistral(body: &mut Map<String, Value>) {
     let forces = body
         .get("tool_choice")
@@ -134,9 +157,6 @@ fn mistral(body: &mut Map<String, Value>) {
         .is_some_and(|kind| matches!(kind, "json_schema" | "json_object"));
     if forces && has_tools && structured {
         body.insert("tool_choice".to_owned(), Value::from("auto"));
-    }
-    for part in contents(body).filter_map(Value::as_array_mut).flatten() {
-        *part = mistral_chunk(part);
     }
 }
 

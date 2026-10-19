@@ -15,7 +15,6 @@ use std::task::{Context, Poll, ready};
 use crate::accumulate::Accumulator;
 use crate::error::{Error, Kind};
 use crate::http::{Body, BoxFuture, Http};
-use crate::prepare::prepare;
 use crate::protocol::{Decoder, Flow, Provider, Target};
 use crate::spec::{Event, Origin, Request, Response, SmolStr};
 use crate::sse::SseFramer;
@@ -26,11 +25,10 @@ pub fn stream(http: &dyn Http, provider: &Provider, request: &Request) -> Events
         provider,
         model: &request.model,
     };
-    let request = prepare(request, &target);
-    let state = match provider.request(&request.model, &request) {
+    let state = match provider.request(&request.model, request) {
         Ok(http_request) => State::Sending {
             reply: http.send(http_request),
-            decoder: provider.protocol.decoder(&target, &request),
+            decoder: provider.protocol.decoder(&target, request),
         },
         Err(error) => State::Failed(Some(error)),
     };

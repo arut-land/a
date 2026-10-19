@@ -260,9 +260,11 @@ impl Protocol for Chat {
                 self.quirks.path,
             ),
         };
+        let (body, history) = encode::body(&self.quirks, target, request)?;
         Ok(Encoded {
             path,
-            body: encode::body(&self.quirks, target, request)?,
+            body,
+            history,
             headers: Vec::new(),
         })
     }

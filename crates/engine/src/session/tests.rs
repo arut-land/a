@@ -39,7 +39,9 @@ fn recap_of(entries: &[Entry], since: u64) -> Option<protocol::Recap> {
 /// The conversation before `before`, as `registry`'s tools present it.
 fn transcript(entries: &[Entry], before: u64, registry: Arc<Registry>) -> Vec<llm::Message> {
     let before = entries.iter().take_while(|e| e.seq < before);
-    Transcript::of(before, registry).into_messages()
+    Transcript::of(before, registry, "")
+        .into_messages()
+        .to_vec()
 }
 
 /// What entries say, whichever lease wrote them.
@@ -183,9 +185,10 @@ impl Script {
 impl Http for Script {
     fn send(
         &self,
-        request: http::Request<Bytes>,
+        request: http::Request<llm::http::Payload>,
     ) -> BoxFuture<'static, io::Result<llm::http::Response>> {
-        lock(&self.sent).push(serde_json::from_slice(request.body()).unwrap_or_default());
+        let body = request.body().to_vec();
+        lock(&self.sent).push(serde_json::from_slice(&body).unwrap_or_default());
         let key = request.headers().get("authorization");
         lock(&self.keys).push(key.and_then(|k| k.to_str().ok()).unwrap_or("").to_owned());
         let reply = lock(&self.replies).pop_front().map(|body| {
@@ -1495,7 +1498,10 @@ impl Extension for HeldHarbor {
 struct Silent;
 
 impl Http for Silent {
-    fn send(&self, _: http::Request<Bytes>) -> BoxFuture<'static, io::Result<llm::http::Response>> {
+    fn send(
+        &self,
+        _: http::Request<llm::http::Payload>,
+    ) -> BoxFuture<'static, io::Result<llm::http::Response>> {
         Box::pin(std::future::pending())
     }
 }

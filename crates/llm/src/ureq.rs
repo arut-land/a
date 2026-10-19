@@ -22,7 +22,7 @@ use ureq::unversioned::transport::{
     Transport,
 };
 
-use crate::http::{BoxFuture, Http, Response};
+use crate::http::{BoxFuture, Http, Payload, Response};
 
 /// How long to wait for a reply's head: a reasoning model may think for
 /// minutes before its first byte.
@@ -74,7 +74,7 @@ impl Ureq {
 }
 
 impl Http for Ureq {
-    fn send(&self, request: http::Request<Bytes>) -> BoxFuture<'static, io::Result<Response>> {
+    fn send(&self, request: http::Request<Payload>) -> BoxFuture<'static, io::Result<Response>> {
         let (tx, rx) = rt::channel::bounded::<io::Result<Piece>>(AHEAD);
         let agent = self.agent.clone();
         let abort = Arc::new(Abort::default());
@@ -105,11 +105,17 @@ impl Http for Ureq {
 /// until the body ends or the receiver goes away.
 fn run(
     agent: &ureq::Agent,
-    request: http::Request<Bytes>,
+    request: http::Request<Payload>,
     tx: &rt::channel::Sender<io::Result<Piece>>,
 ) {
-    let (parts, body) = request.into_parts();
-    let reply = match agent.run(http::Request::from_parts(parts, &*body)) {
+    let (mut parts, body) = request.into_parts();
+    // Read from its pieces as it goes out, at the length they make.
+    parts
+        .headers
+        .insert(http::header::CONTENT_LENGTH, body.len().into());
+    let mut reader = body.reader();
+    let body = ureq::SendBody::from_reader(&mut reader);
+    let reply = match agent.run(http::Request::from_parts(parts, body)) {
         Ok(reply) => reply,
         Err(error) => {
             let _ = tx.send(Err(io::Error::other(error)));

@@ -804,7 +804,7 @@ pub(super) fn request(model: &str, messages: Vec<Message>) -> Request {
     }
     Request {
         model: model.into(),
-        messages,
+        messages: messages.into(),
         tools,
         ..Request::default()
     }
@@ -817,9 +817,9 @@ pub(super) fn sent_to(provider: &Provider, request: &Request) -> Result<(String,
         provider,
         model: &request.model,
     };
-    let prepared = crate::prepare(request, &target);
+    let prepared = crate::prepare::prepare(request, &target);
     let http = provider.request(&request.model, &prepared)?;
-    let body = serde_json::from_slice(http.body()).expect("a JSON body");
+    let body = serde_json::from_slice(&http.body().to_vec()).expect("a JSON body");
     Ok((http.uri().to_string(), body))
 }
 
