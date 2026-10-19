@@ -13,6 +13,9 @@ debug = false
 [profile.dev.package.syn]
 opt-level = 0
 
+[profile.dev.package.usage-derive]
+opt-level = 0
+
 # panic stays unwind so a panicking session actor cannot take the daemon down.
 [profile.release]
 lto = "fat"
@@ -23,7 +26,7 @@ strip = "symbols"
 
 # Cold paths (one request encode per model turn, argv parsed once): size over
 # speed. Network time dominates these; hot paths such as serde_json stay at 3.
-# ureq is smaller at z; http is not.
+# ureq and usage-argv are smaller at z; http is not.
 [profile.release.package.ureq]
 opt-level = "z"
 
@@ -35,6 +38,9 @@ opt-level = "s"
 
 [profile.release.package.http]
 opt-level = "s"
+
+[profile.release.package.usage-argv]
+opt-level = "z"
 
 # The daemon's control flow (sessions, tools, the log, the runtime, OS
 # calls) and the clients' connection: syscalls and the model dominate, and

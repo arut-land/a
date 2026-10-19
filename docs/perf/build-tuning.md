@@ -24,7 +24,7 @@ Researched 2026-10-18 on macOS arm64, `nightly-2026-10-17`, ld-prime.
 | --- | --- | --- |
 | Cranelift for workspace crates in dev | `.cargo/profiles.toml` | Fast codegen for code we edit |
 | Deps at LLVM opt-level 1, no debug info, in dev | `.cargo/profiles.toml` | Usable dev runtime; compiled once and shared through mbx |
-| `syn` at opt-level 0 in dev | `.cargo/profiles.toml` | Clean dev build 10.7 s → 4.4 s. `package."*"` outranks `build-override`, so proc-macros must be named |
+| `syn`, `usage-derive` at opt-level 0 in dev | `.cargo/profiles.toml` | Clean dev build 10.7 s → 4.4 s. `package."*"` outranks `build-override`, so proc-macros must be named |
 | `-Zthreads=8` | `.cargo/config.toml` | Parallel rustc frontend |
 | Release: fat LTO, `codegen-units = 1`, `strip = "symbols"`, packed split debuginfo | `.cargo/profiles.toml` | Matches uv, ruff, mise, Deno. Thin LTO measured +14% size |
 | `panic = "unwind"` in release | `.cargo/profiles.toml` | A panicking session actor must not kill the daemon |

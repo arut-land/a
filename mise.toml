@@ -50,8 +50,10 @@ size = { depends = ["release"], run = 'f=target/release/a; [[ -e $f.exe ]] && f+
 startup = { depends = ["release"], run = 'hyperfine -N --warmup 50 -r 500 "target/release/a --version"' }
 bloat = "cargo bloat --release --crates -n 20"
 "bloat:lines" = "cargo llvm-lines --release -p a | head -30"
-# Shell completions (bash, zsh, fish) and the man page, written from the
-# command table in apps/cli/src/args.rs by a test, into target/generated.
+# Shell completions (bash, zsh, fish, nu, PowerShell, elvish: usage's
+# scripts, which ask `a __complete_word__` on each Tab) and the man page,
+# written from the derive in apps/cli/src/args.rs by a test, into
+# target/generated.
 "generate:completions" = "A_GENERATE=$PWD/target/generated cargo test -q -p a --bin a completions_and_the_man_page -- --nocapture | grep completions/"
 "generate:man" = "A_GENERATE=$PWD/target/generated cargo test -q -p a --bin a completions_and_the_man_page -- --nocapture | grep man/"
 deny = "cargo deny check"
