@@ -91,7 +91,7 @@ fn asked_command() -> Vec<DaemonMsg> {
             3,
             Body::ToolCall {
                 tool: "bash".into(),
-                input: json!({"command": "ls"}),
+                input: json!({"command": "ls"}).into(),
                 id: None,
                 card: Some(Card {
                     title: "$ ls".into(),
@@ -104,7 +104,7 @@ fn asked_command() -> Vec<DaemonMsg> {
         DaemonMsg::Ask {
             call: 3,
             tool: "bash".into(),
-            input: json!({"command": "ls"}),
+            input: json!({"command": "ls"}).into(),
         },
     ]
 }
@@ -187,7 +187,8 @@ fn a_streamed_reply_shows_live_then_its_committed_text() {
             call: 3,
             outcome: Outcome::Done {
                 output: json!({"message": {"content": [{"type": "text", "text": "Hello you!"}]},
-                               "usage": {"input": 12, "output": 3}}),
+                               "usage": {"input": 12, "output": 3}})
+                .into(),
             },
         },
     ));
@@ -206,7 +207,7 @@ fn a_card_folds_on_click_and_ctrl_o_shows_all_output() {
         Body::ToolResult {
             call: 3,
             outcome: Outcome::Done {
-                output: json!({"output": stdout, "exit": 0, "cwd": "/w", "duration_ms": 1}),
+                output: json!({"output": stdout, "exit": 0, "cwd": "/w", "duration_ms": 1}).into(),
             },
             card: Some(Card {
                 title: "$ ls".into(),
@@ -314,7 +315,8 @@ fn ctrl_c_interrupts_a_running_call_and_shows_how_it_ended() {
         Body::ToolResult {
             call: 3,
             outcome: Outcome::Done {
-                output: json!({"output": "", "exit": null, "signal": "SIGTERM", "aborted": true}),
+                output: json!({"output": "", "exit": null, "signal": "SIGTERM", "aborted": true})
+                    .into(),
             },
             card: Some(Card {
                 title: "$ ls".into(),
@@ -473,7 +475,7 @@ fn inline_prints_settled_items_once_and_keeps_the_rest_live() {
             call: 3,
             // As older logs hold a command's result.
             outcome: Outcome::Done {
-                output: json!({"stdout": "a\n", "stderr": "", "exit": 0}),
+                output: json!({"stdout": "a\n", "stderr": "", "exit": 0}).into(),
             },
             card: None,
         },
@@ -533,7 +535,7 @@ fn render_cost() {
             seq + 2,
             Body::ToolCall {
                 tool: "bash".into(),
-                input: json!({"command": "ls"}),
+                input: json!({"command": "ls"}).into(),
                 id: None,
                 card: None,
             },

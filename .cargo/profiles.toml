@@ -69,9 +69,9 @@ opt-level = "s"
 opt-level = "s"
 strip = "symbols"
 
-# The wire codec: s costs a small entry's decode ~6% and its encode ~30%
-# (still over 300 and 1000 MB/s; a frame is encoded once for every peer)
-# and saves 92 KiB. std (build-std) saves 13 KiB more at no measured cost;
+# The wire codec: payloads stay raw JSON and records decode in one pass,
+# so s costs decode and encode under 5% (over 1000 MB/s on a 15k-entry
+# log) and saves 92 KiB. std (build-std) saves 13 KiB more at no measured cost;
 # alloc stays at 3, as s costs the terminal client's frame ~15%.
 [profile.release.package.protocol]
 opt-level = "s"

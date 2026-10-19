@@ -11,7 +11,6 @@ use std::sync::atomic::Ordering;
 
 use agent::{Agent, Input};
 use protocol::{Body, Entry, Environment, Outcome, SessionId};
-use serde_json::Value;
 use store::{Header, Loaded, Parent};
 
 use super::{Msg, Session, installed};
@@ -47,7 +46,7 @@ fn result(entries: &[Entry]) -> Outcome {
         .rev()
         .find_map(|e| match &e.body {
             Body::Assistant { text } => Some(Outcome::Done {
-                output: Value::String(text.clone()),
+                output: text.as_str().into(),
             }),
             Body::ToolResult { outcome, .. }
             | Body::ModelResult { outcome, .. }
@@ -342,7 +341,7 @@ mod tests {
     fn a_child_hands_back_its_last_answer_or_outcome() {
         let said = |text: &str| Body::Assistant { text: text.into() };
         let done = Outcome::Done {
-            output: serde_json::json!({ "slept": 1 }),
+            output: serde_json::json!({ "slept": 1 }).into(),
         };
         let ran = Body::ToolResult {
             call: 1,

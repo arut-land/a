@@ -36,14 +36,17 @@ pub fn transcript(entries: &[Entry], before: u64, tools: &Toolset) -> Vec<Messag
             Body::ModelResult {
                 outcome: Outcome::Done { output },
                 ..
-            } => match llm::Response::from_value(output) {
-                Ok(reply) => messages.push(Message::Assistant(reply.message)),
-                Err(_) => {
-                    if let Some(text) = output["text"].as_str() {
-                        messages.push(Message::assistant(text));
+            } => {
+                let output = output.value();
+                match llm::Response::from_value(&output) {
+                    Ok(reply) => messages.push(Message::Assistant(reply.message)),
+                    Err(_) => {
+                        if let Some(text) = output["text"].as_str() {
+                            messages.push(Message::assistant(text));
+                        }
                     }
                 }
-            },
+            }
             Body::ToolCall {
                 tool, id: Some(id), ..
             } => {
@@ -266,7 +269,7 @@ pub fn recap(entries: &[Entry], since: u64) -> Option<Recap> {
                 outcome: Outcome::Done { output },
                 ..
             } => {
-                let text = llm::Response::from_value(output).map(|r| r.message.text());
+                let text = llm::Response::from_value(&output.value()).map(|r| r.message.text());
                 if let Ok(text) = text.as_deref()
                     && !text.is_empty()
                 {

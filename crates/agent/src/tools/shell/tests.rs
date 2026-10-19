@@ -20,7 +20,8 @@ fn run(rig: &Rig, command: &str) -> Ran {
 }
 
 fn model(ran: &Ran) -> String {
-    let llm::Output::Text(text) = DynTool::to_model(&Bash, &serde_json::to_value(ran).unwrap())
+    let llm::Output::Text(text) =
+        DynTool::to_model(&Bash, &serde_json::to_value(ran).unwrap().into())
     else {
         panic!("bash answers in text")
     };

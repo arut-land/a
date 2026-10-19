@@ -392,12 +392,12 @@ mod tests {
         let rig = Rig::new("edit", builtins(&Policy::default()).unwrap());
         let file = rig.workspace().join("notes.txt");
         let created = change(&rig, "notes.txt", &[("", "one\ntwo\n")]);
-        assert!(matches!(&created, Outcome::Done { output } if output["created"] == true));
+        assert!(matches!(&created, Outcome::Done { output } if output.value()["created"] == true));
         assert_eq!(std::fs::read_to_string(&file).unwrap(), "one\ntwo\n");
         let Outcome::Done { output } = change(&rig, "notes.txt", &[("two", "2")]) else {
             panic!()
         };
-        assert_eq!(output["diff"], "@@ -2,1 +2,1 @@\n-two\n+2\n");
+        assert_eq!(output.value()["diff"], "@@ -2,1 +2,1 @@\n-two\n+2\n");
         let card =
             DynTool::present_result(&Edit, &json!({ "path": "notes.txt", "edits": [] }), &output);
         assert_eq!(card.unwrap().note, "+1 -1");

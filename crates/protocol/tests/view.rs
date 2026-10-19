@@ -7,7 +7,7 @@ use std::path::PathBuf;
 
 use protocol::view::{Change, SessionView, Update};
 use protocol::{
-    Body, Card, DaemonMsg, Decision, Decode, Entry, Environment, Outcome, Recap, SessionId,
+    Body, Card, DaemonMsg, Decision, Decode, Entry, Environment, Json, Outcome, Recap, SessionId,
 };
 use serde_json::{Value, json};
 use uuid::Uuid;
@@ -102,7 +102,7 @@ impl Session {
     }
 
     fn tool(&mut self, rng: &mut Rng) {
-        let input = json!({ "command": format!("echo {}", rng.below(10)) });
+        let input: Json = json!({ "command": format!("echo {}", rng.below(10)) }).into();
         let call = self.commit(Body::ToolCall {
             tool: "run_command".into(),
             input: input.clone(),
@@ -260,7 +260,9 @@ fn outcome(rng: &mut Rng, output: Value) -> Outcome {
     match rng.below(5) {
         0 => Outcome::Failed { error: "f".into() },
         1 => Outcome::Interrupted { output: None },
-        _ => Outcome::Done { output },
+        _ => Outcome::Done {
+            output: output.into(),
+        },
     }
 }
 
@@ -471,7 +473,8 @@ fn scenarios() -> Vec<(&'static str, Vec<Value>)> {
                             output: json!({
                                 "message": { "content": [{ "type": "text", "text": "hello" }] },
                                 "usage": { "input": 4, "output": 2 },
-                            }),
+                            })
+                            .into(),
                         },
                     },
                 ),
@@ -485,7 +488,7 @@ fn scenarios() -> Vec<(&'static str, Vec<Value>)> {
                     1,
                     Body::ToolCall {
                         tool: "run_command".into(),
-                        input: command.clone(),
+                        input: command.clone().into(),
                         id: None,
                         card: None,
                     },
@@ -500,12 +503,12 @@ fn scenarios() -> Vec<(&'static str, Vec<Value>)> {
                 msg(DaemonMsg::Ask {
                     call: 1,
                     tool: "run_command".into(),
-                    input: command.clone(),
+                    input: command.clone().into(),
                 }),
                 msg(DaemonMsg::Ask {
                     call: 1,
                     tool: "run_command".into(),
-                    input: command,
+                    input: command.into(),
                 }),
                 entry(
                     3,
@@ -523,7 +526,7 @@ fn scenarios() -> Vec<(&'static str, Vec<Value>)> {
                     Body::ToolResult {
                         call: 1,
                         outcome: Outcome::Done {
-                            output: json!({ "stdout": "hi\n", "stderr": "", "exit": 0 }),
+                            output: json!({ "stdout": "hi\n", "stderr": "", "exit": 0 }).into(),
                         },
                         card: None,
                     },
@@ -552,7 +555,7 @@ fn scenarios() -> Vec<(&'static str, Vec<Value>)> {
                     Body::Fired {
                         watch: 2,
                         outcome: Outcome::Done {
-                            output: json!({ "slept": 1 }),
+                            output: json!({ "slept": 1 }).into(),
                         },
                     },
                 ),
@@ -597,7 +600,7 @@ fn scenarios() -> Vec<(&'static str, Vec<Value>)> {
                     1,
                     Body::ToolCall {
                         tool: "bash".into(),
-                        input: json!({ "command": "echo hi" }),
+                        input: json!({ "command": "echo hi" }).into(),
                         id: None,
                         card: Some(Card {
                             title: "$ echo hi".into(),
@@ -610,7 +613,7 @@ fn scenarios() -> Vec<(&'static str, Vec<Value>)> {
                     Body::ToolResult {
                         call: 1,
                         outcome: Outcome::Done {
-                            output: json!({ "exit": 0, "output": "hi\n" }),
+                            output: json!({ "exit": 0, "output": "hi\n" }).into(),
                         },
                         card: Some(Card {
                             title: "$ echo hi".into(),
@@ -624,7 +627,7 @@ fn scenarios() -> Vec<(&'static str, Vec<Value>)> {
                     Body::Ext {
                         ext: "shell".into(),
                         state: "cwd".into(),
-                        data: json!({ "cwd": "/w/src" }),
+                        data: json!({ "cwd": "/w/src" }).into(),
                     },
                 ),
                 entry(
@@ -649,7 +652,7 @@ fn scenarios() -> Vec<(&'static str, Vec<Value>)> {
         ("a client that fell behind is caught up with a snapshot", {
             let asked = Body::ToolCall {
                 tool: "bash".into(),
-                input: json!({ "command": "echo hi" }),
+                input: json!({ "command": "echo hi" }).into(),
                 id: None,
                 card: None,
             };
@@ -679,7 +682,7 @@ fn scenarios() -> Vec<(&'static str, Vec<Value>)> {
                 msg(DaemonMsg::Ask {
                     call: 3,
                     tool: "bash".into(),
-                    input: json!({ "command": "echo hi" }),
+                    input: json!({ "command": "echo hi" }).into(),
                 }),
                 entry(
                     5,
@@ -747,7 +750,7 @@ fn vectors() {
 fn clients_describe_calls_and_recaps_alike() {
     use protocol::view::{call_title, decision_line, output_text, recap_line};
 
-    let ls = json!({"command": "ls"});
+    let ls: Json = json!({"command": "ls"}).into();
     let card = Card {
         title: "$ ls -a".into(),
         body: "a\n".into(),
@@ -756,10 +759,10 @@ fn clients_describe_calls_and_recaps_alike() {
     assert_eq!(call_title("bash", &ls, Some(&card)), "$ ls -a");
     assert_eq!(call_title("bash", &ls, None), "$ ls");
     assert_eq!(
-        call_title("edit", &json!({"path": "a"}), None),
+        call_title("edit", &json!({"path": "a"}).into(), None),
         r#"edit {"path":"a"}"#
     );
-    let shown = |output: &Value, card| output_text(output, card);
+    let shown = |output: &Value, card| output_text(&Json::new(output), card);
     assert_eq!(
         shown(&json!({}), Some(&card)),
         Some(("a\n".into(), "exit 0".into()))

@@ -304,7 +304,7 @@ impl Conn {
             Body::ToolResult {
                 outcome: Outcome::Done { output },
                 ..
-            } => output.clone(),
+            } => output.value(),
             other => panic!("{command} did not run: {other:?}"),
         }
     }

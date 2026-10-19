@@ -1,7 +1,7 @@
 //! Transcript items as rows: messages, replies, and tool call cards.
 
-use protocol::Outcome;
 use protocol::view::{Approval, Item, Status, call_title, decision_line, output_text};
+use protocol::{Json, Outcome};
 use serde_json::Value;
 
 use ratatui_core::style::{Color, Modifier, Style};
@@ -74,7 +74,7 @@ pub fn rows(item: &Item, width: usize, look: Look) -> Vec<Line> {
             &Card {
                 call: *call,
                 title: call_title(tool, input, shown.as_ref()),
-                input: input.get("command").is_none().then_some(input),
+                input: input.value().get("command").is_none().then_some(input),
                 approval: *approval,
                 outcome: outcome.as_ref(),
                 shown: shown.as_ref(),
@@ -211,7 +211,7 @@ struct Card<'a> {
     call: u64,
     title: String,
     /// Input the title does not show, for verbose mode.
-    input: Option<&'a Value>,
+    input: Option<&'a Json>,
     approval: Option<Approval>,
     outcome: Option<&'a Outcome>,
     /// How the tool presents it.
@@ -229,7 +229,7 @@ fn card(c: &Card, width: usize, look: Look) -> Vec<Line> {
                 .map(|(_, note)| note)
                 .filter(|note| !note.is_empty())
                 .unwrap_or_else(|| "done".to_owned());
-            if failed(output) {
+            if failed(&output.value()) {
                 (format!("✗ {note}"), BAD)
             } else {
                 (format!("✓ {note}"), OK)
@@ -330,13 +330,15 @@ fn output_rows(c: &Card, width: usize, verbose: bool) -> Vec<Line> {
                     add(text, Style::new(), text.starts_with("@@ "));
                 }
             }
-            None if output.is_null() => {}
-            None => {
-                let text = output
-                    .as_str()
-                    .map_or_else(|| output.to_string(), str::to_owned);
-                add(&text, Style::new(), false);
-            }
+            None => match output.value() {
+                Value::Null => {}
+                output => {
+                    let text = output
+                        .as_str()
+                        .map_or_else(|| output.to_string(), str::to_owned);
+                    add(&text, Style::new(), false);
+                }
+            },
         },
         Some(Outcome::Failed { error }) => add(error, BAD, false),
         Some(Outcome::Interrupted { output }) => {
@@ -364,7 +366,7 @@ mod tests {
         Item::Tool {
             call: 7,
             tool: "bash".into(),
-            input: json!({"command": "ls"}),
+            input: json!({"command": "ls"}).into(),
             approval,
             outcome,
             card: None,
@@ -376,7 +378,7 @@ mod tests {
     fn a_finished_card_shows_its_exit_and_output_tail() {
         let stdout = (1..=15).fold(String::new(), |s, n| s + &format!("line {n}\n"));
         let done = Outcome::Done {
-            output: json!({"stdout": stdout, "stderr": "", "exit": 0}),
+            output: json!({"stdout": stdout, "stderr": "", "exit": 0}).into(),
         };
         let rows = texts(&rows(
             &tool(Some(done.clone()), None, false),
@@ -456,7 +458,7 @@ mod tests {
     #[test]
     fn command_output_escapes_are_stripped() {
         let done = Outcome::Done {
-            output: json!({"stdout": "\x1b[31mred\x1b[0m\n", "stderr": "", "exit": 1}),
+            output: json!({"stdout": "\x1b[31mred\x1b[0m\n", "stderr": "", "exit": 1}).into(),
         };
         let rows = rows_of(&tool(Some(done), None, false), Look::default());
         assert_eq!(rows[1..], ["▾ $ ls  ✗ exit 1", "  │ red"]);
@@ -467,10 +469,10 @@ mod tests {
         let item = Item::Tool {
             call: 7,
             tool: "edit".into(),
-            input: json!({"path": "a.txt", "edits": []}),
+            input: json!({"path": "a.txt", "edits": []}).into(),
             approval: None,
             outcome: Some(Outcome::Done {
-                output: json!({"path": "a.txt"}),
+                output: json!({"path": "a.txt"}).into(),
             }),
             card: Some(protocol::Card {
                 title: "edit a.txt".into(),

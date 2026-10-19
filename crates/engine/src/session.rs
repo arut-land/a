@@ -16,8 +16,8 @@ use agent::{
 };
 use protocol::view::SessionView;
 use protocol::{
-    Activity, Body, Cap, Card, DaemonMsg, Decision, Entry, Environment, Frame, Installed, Outcome,
-    Overrides, Residency, SessionId, SessionSummary,
+    Activity, Body, Cap, Card, DaemonMsg, Decision, Entry, Environment, Frame, Installed, Json,
+    Outcome, Overrides, Residency, SessionId, SessionSummary,
 };
 use rt::BoxFuture;
 use serde_json::{Value, json};
@@ -859,7 +859,7 @@ impl Session {
                 let call = self.record(Body::ToolCall {
                     card: card(&registry, &tool, &input),
                     tool,
-                    input,
+                    input: input.into(),
                     id,
                 });
                 let outcome = Outcome::Interrupted { output: None };
@@ -916,7 +916,7 @@ impl Session {
                     .append(Body::ToolCall {
                         card: card(&registry, &tool, &input),
                         tool: tool.clone(),
-                        input: input.clone(),
+                        input: Json::new(&input),
                         id,
                     })
                     .await?;
@@ -1100,7 +1100,7 @@ impl Session {
         };
         match self.shared.models.settings.model_in(&self.workspace, set) {
             Ok((model, from)) => Outcome::Done {
-                output: json!({ "model": model, "from": from.to_string() }),
+                output: json!({ "model": model, "from": from.to_string() }).into(),
             },
             Err(error) => Outcome::Failed { error },
         }
@@ -1302,7 +1302,9 @@ impl Session {
             let error = match reply {
                 Ok(reply) => {
                     return match serde_json::to_value(&reply) {
-                        Ok(output) => Outcome::Done { output },
+                        Ok(output) => Outcome::Done {
+                            output: output.into(),
+                        },
                         Err(error) => Outcome::Failed {
                             error: error.to_string(),
                         },
@@ -1521,7 +1523,7 @@ impl Host for Effect {
         self.session.record(Body::Ext {
             ext: ext.to_owned(),
             state: state.to_owned(),
-            data,
+            data: data.into(),
         });
         self.session.kick();
     }
@@ -1711,7 +1713,7 @@ fn dangling_calls(entries: &[Entry]) -> Vec<Dangling> {
             _ if finished.contains(&e.seq) => continue,
             Body::ToolCall { tool, input, .. } => Call::Tool {
                 tool: tool.clone(),
-                input: input.clone(),
+                input: input.value(),
             },
             Body::ModelCall { .. } => Call::Model,
             _ => continue,

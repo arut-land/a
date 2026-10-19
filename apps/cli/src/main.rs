@@ -492,9 +492,9 @@ fn added(item: &Item) {
 fn print_outcome(outcome: &Outcome, card: Option<&Card>) {
     match outcome {
         Outcome::Done { output } => {
-            let (text, note) = match (output_text(output, card), output) {
+            let (text, note) = match (output_text(output, card), output.value()) {
                 (Some(shown), _) => shown,
-                (None, serde_json::Value::String(text)) => (text.clone(), String::new()),
+                (None, serde_json::Value::String(text)) => (text, String::new()),
                 (None, output) => (String::new(), output.to_string()),
             };
             for line in text.lines() {
