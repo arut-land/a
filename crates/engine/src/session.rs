@@ -919,12 +919,17 @@ impl Session {
     }
 
     /// Waits for the user's answer to the ask for call `seq`, logs it, and
-    /// runs the call if approved.
+    /// runs the call if approved. An interrupt answers it: the call is
+    /// interrupted without running, whatever the user says.
     async fn ask(&self, seq: u64, tool: &str, input: &Value) -> io::Result<Outcome> {
         self.flush().await?;
-        let approved = self.answer_to(seq).await?;
+        let turn = self.turn();
+        let (hook, approved) = match self.answer_to(seq, &turn).await? {
+            Some(approved) => ("user", approved),
+            None => ("interrupt", false),
+        };
         self.append(Body::Hook {
-            hook: "user".to_owned(),
+            hook: hook.to_owned(),
             decision: Decision::Approval {
                 tool: tool.to_owned(),
                 approved,
@@ -932,26 +937,34 @@ impl Session {
             },
         })
         .await?;
-        Ok(if approved {
+        Ok(if turn.is_cancelled() {
+            Outcome::Interrupted { output: None }
+        } else if approved {
             self.run_tool(seq, tool, input).await
         } else {
             not_approved()
         })
     }
 
-    /// Waits until call `call` is answered. Waiting is not work: the session
-    /// may hibernate, and the daemon exit, with the ask in its inbox;
-    /// recovery asks again. A stop while waiting is an `Interrupted` error.
-    async fn answer_to(&self, call: u64) -> io::Result<bool> {
+    /// Waits until call `call` is answered, or `None` once `turn` is
+    /// interrupted first. Waiting is not work: the session may hibernate,
+    /// and the daemon exit, with the ask in its inbox; recovery asks again.
+    /// A stop while waiting is an `Interrupted` error.
+    async fn answer_to(&self, call: u64, turn: &Cancel) -> io::Result<Option<bool>> {
         self.queued.fetch_sub(1, Ordering::SeqCst);
         self.touch();
+        let mut interrupted = pin!(turn.cancelled());
         let answer = poll_fn(|cx| {
             let mut answers = lock(&self.answers);
             if let Some(approved) = answers.given.remove(&call) {
-                return Poll::Ready(Some(approved));
+                return Poll::Ready(Some(Some(approved)));
             }
+            // A stop interrupts the turn too: it is checked first.
             if answers.stopped {
                 return Poll::Ready(None);
+            }
+            if interrupted.as_mut().poll(cx).is_ready() {
+                return Poll::Ready(Some(None));
             }
             answers.waiting = Some(cx.waker().clone());
             Poll::Pending

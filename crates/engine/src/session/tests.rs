@@ -903,6 +903,38 @@ fn a_refused_ask_answers_the_call_without_running_it() {
     );
 }
 
+/// An interrupt settles a call waiting for approval: approving it after
+/// runs nothing.
+#[test]
+fn an_interrupt_while_asked_settles_the_call_without_running_it() {
+    let fixture = asking();
+    let session = fixture.start(&[]);
+    session.submit("$ echo ran".into()).unwrap();
+    settle(&session);
+    session.interrupt();
+    // Too late: it may be settled already.
+    let _ = session.answer(3, true);
+    finished(&session, 3);
+    settle(&session);
+    let log = log_of(&session);
+    session.stop();
+    assert!(
+        !log.iter()
+            .any(|e| matches!(e.body, Body::ToolProcess { .. })),
+        "{log:#?}"
+    );
+    assert!(
+        log.iter().any(|e| e.body
+            == Body::ToolResult {
+                call: 3,
+                outcome: Outcome::Interrupted { output: None },
+                card: None,
+            }),
+        "{log:#?}"
+    );
+    assert_eq!(inbox(&log), Vec::<u64>::new());
+}
+
 #[test]
 fn a_recap_tells_the_last_prompt_and_what_followed() {
     let call = |tool: &str| Body::ToolCall {

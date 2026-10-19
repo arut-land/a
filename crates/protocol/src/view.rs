@@ -282,7 +282,7 @@ impl SessionView {
 
     /// Whether a model call, tool call or slash command is running: what
     /// an interrupt stops, with the rest of its turn. A call waiting for
-    /// approval is not running.
+    /// approval counts: an interrupt settles it without running it.
     pub fn running(&self) -> bool {
         self.items.iter().rev().any(|item| match item {
             Item::Reply { status, .. } => *status == Status::Running,
@@ -290,7 +290,7 @@ impl SessionView {
                 outcome: None,
                 approval,
                 ..
-            } => !matches!(approval, Some(Approval::Pending | Approval::Denied)),
+            } => *approval != Some(Approval::Denied),
             Item::Command { outcome, .. } => outcome.is_none(),
             _ => false,
         })
