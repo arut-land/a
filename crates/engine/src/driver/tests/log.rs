@@ -170,7 +170,10 @@ fn a_committed_entry_is_encoded_exactly_once() {
     let near = 300 - SNAPSHOT_GAP;
     let replayed = entries(sent(&session, near));
     assert_eq!(replayed.len() as u64, SNAPSHOT_GAP);
-    for (frame, line) in replayed.iter().zip(&lines[usize::try_from(near).unwrap()..]) {
+    for (frame, line) in replayed
+        .iter()
+        .zip(&lines[usize::try_from(near).unwrap()..])
+    {
         let seq = frame.seq.unwrap();
         let read = Frame::from_line(seq, line).unwrap();
         assert_eq!(frame.as_bytes(), read.as_bytes(), "entry {seq}");

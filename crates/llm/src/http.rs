@@ -11,13 +11,12 @@ use std::pin::Pin;
 use std::sync::Arc;
 use std::task::{Context, Poll};
 
-use bytes::Bytes;
 use futures_core::Stream;
 
 pub type BoxFuture<'a, T> = Pin<Box<dyn Future<Output = T> + Send + 'a>>;
 
 /// A response body: its bytes as they arrive.
-pub type Body = Pin<Box<dyn Stream<Item = io::Result<Bytes>> + Send>>;
+pub type Body = Pin<Box<dyn Stream<Item = io::Result<Vec<u8>>> + Send>>;
 
 pub type Response = http::Response<Body>;
 
@@ -33,20 +32,21 @@ impl<H: Http + ?Sized> Http for Arc<H> {
     }
 }
 
-/// A request body: its bytes in the pieces it was spliced from.
+/// A request body: its bytes in the pieces it was spliced from, shared
+/// with the encodings a conversation keeps.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
-pub struct Payload(Vec<Bytes>);
+pub struct Payload(Vec<Arc<[u8]>>);
 
 impl Payload {
     pub fn len(&self) -> usize {
-        self.0.iter().map(Bytes::len).sum()
+        self.0.iter().map(|piece| piece.len()).sum()
     }
 
     pub fn is_empty(&self) -> bool {
-        self.0.iter().all(Bytes::is_empty)
+        self.0.iter().all(|piece| piece.is_empty())
     }
 
-    pub fn pieces(&self) -> &[Bytes] {
+    pub fn pieces(&self) -> &[Arc<[u8]>] {
         &self.0
     }
 
@@ -61,20 +61,20 @@ impl Payload {
     }
 }
 
-impl From<Vec<Bytes>> for Payload {
-    fn from(pieces: Vec<Bytes>) -> Self {
+impl From<Vec<Arc<[u8]>>> for Payload {
+    fn from(pieces: Vec<Arc<[u8]>>) -> Self {
         Self(pieces)
     }
 }
 
-impl From<Bytes> for Payload {
-    fn from(bytes: Bytes) -> Self {
-        Self(vec![bytes])
+impl From<Vec<u8>> for Payload {
+    fn from(bytes: Vec<u8>) -> Self {
+        Self(vec![bytes.into()])
     }
 }
 
 /// The pieces left and how far into the first.
-struct Reader<'a>(&'a [Bytes], usize);
+struct Reader<'a>(&'a [Arc<[u8]>], usize);
 
 impl io::Read for Reader<'_> {
     fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
@@ -94,11 +94,11 @@ impl io::Read for Reader<'_> {
 }
 
 /// A body of bytes already in hand.
-pub fn body(chunks: impl IntoIterator<Item = Bytes>) -> Body {
-    struct Ready(std::vec::IntoIter<Bytes>);
+pub fn body(chunks: impl IntoIterator<Item = Vec<u8>>) -> Body {
+    struct Ready(std::vec::IntoIter<Vec<u8>>);
 
     impl Stream for Ready {
-        type Item = io::Result<Bytes>;
+        type Item = io::Result<Vec<u8>>;
 
         fn poll_next(mut self: Pin<&mut Self>, _: &mut Context<'_>) -> Poll<Option<Self::Item>> {
             Poll::Ready(self.0.next().map(Ok))

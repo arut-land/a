@@ -9,7 +9,6 @@ use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicUsize, Ordering::Relaxed};
 use std::time::Instant;
 
-use bytes::Bytes;
 use llm::http::{BoxFuture, Http, Payload, Response, body};
 use llm::protocols::{chat, gemini, messages, responses};
 use llm::{
@@ -81,15 +80,12 @@ fn measure(label: &str, runs: usize, mut f: impl FnMut()) {
 
 struct Recorded {
     status: u16,
-    body: Bytes,
+    body: Vec<u8>,
 }
 
 impl Http for Recorded {
     fn send(&self, _: http::Request<Payload>) -> BoxFuture<'static, io::Result<Response>> {
-        let chunks: Vec<Bytes> = (0..self.body.len())
-            .step_by(1024)
-            .map(|at| self.body.slice(at..self.body.len().min(at + 1024)))
-            .collect();
+        let chunks: Vec<_> = self.body.chunks(1024).map(<[u8]>::to_vec).collect();
         let response = http::Response::builder()
             .status(self.status)
             .body(body(chunks))
@@ -176,7 +172,7 @@ fn exchanges() -> Vec<(Provider, Recorded)> {
                 provider,
                 Recorded {
                     status: status.unwrap_or(200),
-                    body: Bytes::copy_from_slice(body.as_bytes()),
+                    body: body.as_bytes().to_vec(),
                 },
             ));
         }
@@ -211,7 +207,7 @@ fn decode_recorded() {
 
 /// A chat completions stream of `deltas` reasoning deltas and as many text
 /// deltas.
-fn long_chat(deltas: usize) -> Bytes {
+fn long_chat(deltas: usize) -> Vec<u8> {
     let mut body = String::new();
     for n in 0..deltas {
         let _ = write!(
@@ -230,7 +226,7 @@ fn long_chat(deltas: usize) -> Bytes {
 }
 
 /// A messages stream of `deltas` thinking deltas and as many text deltas.
-fn long_messages(deltas: usize) -> Bytes {
+fn long_messages(deltas: usize) -> Vec<u8> {
     let mut body = String::from(
         "event: message_start\ndata: {\"type\":\"message_start\",\"message\":{\"id\":\"m1\",\"model\":\"claude\",\"usage\":{\"input_tokens\":10,\"output_tokens\":1}}}\n\n\
          event: content_block_start\ndata: {\"type\":\"content_block_start\",\"index\":0,\"content_block\":{\"type\":\"thinking\",\"thinking\":\"\"}}\n\n",

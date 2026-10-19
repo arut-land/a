@@ -18,6 +18,7 @@ dependencies = [
  "ext-settings",
  "ext-shell",
  "ext-subagent",
+ "lexopt",
  "libc",
  "protocol",
  "rustix",
@@ -25,7 +26,6 @@ dependencies = [
  "sys",
  "tui",
  "unicode-width",
- "usage-rs",
  "web",
 ]
 
@@ -545,7 +545,6 @@ checksum = "0e9c71c2167ca323c882b99918929403426e2373ea17242ff5653e0d5e1058be"
 name = "engine"
 version = "0.0.0"
 dependencies = [
- "bytes",
  "ext",
  "ext-chat",
  "ext-edit",
@@ -1128,6 +1127,12 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "20870f649af7073d53e38067b2a84312175d56ea15217e1b15bc83506ec50afb"
 
 [[package]]
+name = "lexopt"
+version = "0.3.2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "803ec87c9cfb29b9d2633f20cba1f488db3fd53f2158b1024cbefb47ba05d413"
+
+[[package]]
 name = "libc"
 version = "0.2.191"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1155,7 +1160,6 @@ checksum = "47d9d19d1d6efa0109d2f65ff4c85cddd50bd572e5a00127ab10987290bcefae"
 name = "llm"
 version = "0.0.0"
 dependencies = [
- "bytes",
  "futures-core",
  "http",
  "rt",
@@ -2151,33 +2155,6 @@ dependencies = [
  "idna",
  "percent-encoding",
  "serde",
-]
-
-[[package]]
-name = "usage-argv"
-version = "7.0.2"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "109c9b2a781d3293e82f7c2705769ecfe5c25d59ca70d9d879e6d06a5f3cd628"
-
-[[package]]
-name = "usage-derive"
-version = "7.0.2"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "9b47f75a84077c869ada1c01bcb3bc44afab7f8e1bdded2aa3a0c4e9d9c096a4"
-dependencies = [
- "proc-macro2",
- "quote",
- "syn 3.0.9",
-]
-
-[[package]]
-name = "usage-rs"
-version = "7.0.2"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "250714497081cfed3babb8e9d99ea58d5cae1af7334fb52b22a571e2f4b87ce6"
-dependencies = [
- "usage-argv",
- "usage-derive",
 ]
 
 [[package]]

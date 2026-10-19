@@ -691,7 +691,7 @@ pub(super) fn body(
         fields.retain(|_, value| !value.is_null());
         fields.extend(generation);
     }
-    let mut history = (!options.contains_key("messages")).then(|| History {
+    let mut history = (!options.contains_key("messages")).then_some(History {
         key: "messages",
         head,
         settled,

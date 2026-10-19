@@ -14,7 +14,6 @@ use std::sync::{Arc, Mutex, PoisonError};
 use std::task::Poll;
 use std::time::Duration;
 
-use bytes::Bytes;
 use ureq::tls::{RootCerts, TlsConfig, TlsProvider};
 use ureq::unversioned::resolver::DefaultResolver;
 use ureq::unversioned::transport::{
@@ -40,7 +39,7 @@ pub struct Ureq {
 
 enum Piece {
     Head(http::response::Parts),
-    Chunk(Bytes),
+    Chunk(Vec<u8>),
 }
 
 impl Ureq {
@@ -133,7 +132,7 @@ fn run(
     loop {
         let piece = match reader.read(&mut buf) {
             Ok(0) => return,
-            Ok(n) => Ok(Piece::Chunk(Bytes::copy_from_slice(&buf[..n]))),
+            Ok(n) => Ok(Piece::Chunk(buf[..n].to_vec())),
             Err(error) => Err(error),
         };
         let failed = piece.is_err();
@@ -152,7 +151,7 @@ fn chunks(rx: rt::channel::Receiver<io::Result<Piece>>, guard: Guard) -> crate::
     }
 
     impl futures_core::Stream for Chunks {
-        type Item = io::Result<Bytes>;
+        type Item = io::Result<Vec<u8>>;
 
         fn poll_next(
             self: std::pin::Pin<&mut Self>,

@@ -17,7 +17,6 @@ use std::fmt;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, PoisonError};
 
-use bytes::Bytes;
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
 use serde_json::Value;
 
@@ -179,7 +178,7 @@ struct Kept {
     len: usize,
     mark: u64,
     pass: Prepare,
-    settled: Vec<Bytes>,
+    settled: Vec<Shared>,
 }
 
 /// An encoding kept and its fold, a [`Fold`] of some protocol.
@@ -244,7 +243,7 @@ impl Kept {
 
     /// Keeps this encoding, with its `fold`, first among those of
     /// `messages`; what the request goes on with is a copy.
-    fn keep(mut self, messages: &Messages, fold: Box<dyn Any + Send>) -> (Prepare, Vec<Bytes>) {
+    fn keep(mut self, messages: &Messages, fold: Box<dyn Any + Send>) -> (Prepare, Vec<Shared>) {
         let copy = (self.pass.clone(), self.settled.clone());
         if let Some(&mark) = messages.0.marks.last() {
             (self.len, self.mark) = (messages.len(), mark);
@@ -260,9 +259,9 @@ impl Kept {
 /// to `fold`, and the bytes of what then settles join `settled`.
 fn end(
     mut pass: Prepare,
-    mut settled: Vec<Bytes>,
+    mut settled: Vec<Shared>,
     fold: &mut dyn Step,
-) -> Result<Vec<Bytes>, Error> {
+) -> Result<Vec<Shared>, Error> {
     pass.finish(fold)?;
     let (mut items, mut bytes) = (Vec::new(), Vec::new());
     written(fold, &mut items, &mut bytes);
@@ -272,13 +271,15 @@ fn end(
     Ok(settled)
 }
 
-/// Writes the items `fold` settled to `bytes`, each followed by a comma.
+/// Writes the items `fold` settled to `bytes`, separated by commas.
 fn written(fold: &mut dyn Step, items: &mut Vec<Value>, bytes: &mut Vec<u8>) {
     fold.settle(items);
     for item in items.drain(..) {
+        if !bytes.is_empty() {
+            bytes.push(b',');
+        }
         // Writing a value to memory cannot fail.
         let _ = serde_json::to_writer(&mut *bytes, &item);
-        bytes.push(b',');
     }
 }
 
@@ -289,7 +290,7 @@ pub(crate) fn fold<F: Fold>(
     messages: &Messages,
     target: &Target<'_>,
     fold: F,
-) -> Result<(F, Vec<Bytes>), Error> {
+) -> Result<(F, Vec<Shared>), Error> {
     let fits = |kept: &(dyn Any + Send)| {
         kept.downcast_ref::<F>()
             .is_some_and(|kept| kept.cx() == fold.cx())
@@ -312,8 +313,8 @@ pub struct History {
     /// The body field the items are.
     pub key: &'static str,
     pub head: Vec<Value>,
-    /// Items, each followed by a comma.
-    pub settled: Vec<Bytes>,
+    /// Runs of items, separated by commas; none is empty.
+    pub settled: Vec<Shared>,
     pub tail: Vec<Value>,
 }
 
@@ -322,44 +323,36 @@ impl History {
     /// are.
     pub(crate) fn write(&self, out: &mut Pieces) {
         out.byte(b'[');
-        for (n, item) in self.head.iter().enumerate() {
-            if n > 0 {
+        let mut first = true;
+        let mut comma = |out: &mut Pieces| {
+            if !std::mem::take(&mut first) {
                 out.byte(b',');
             }
+        };
+        for item in &self.head {
+            comma(out);
             out.json(item);
         }
-        let mut first = self.head.is_empty();
-        let settled: Vec<&Bytes> = self.settled.iter().filter(|b| !b.is_empty()).collect();
-        if let Some((last, rest)) = settled.split_last() {
-            if !std::mem::take(&mut first) {
-                out.byte(b',');
-            }
-            for bytes in rest {
-                out.bytes((*bytes).clone());
-            }
-            // The last item's comma stays only to lead the tail.
-            out.bytes(if self.tail.is_empty() {
-                last.slice(..last.len() - 1)
-            } else {
-                (*last).clone()
-            });
-            first = true;
+        for bytes in &self.settled {
+            comma(out);
+            out.shared(Arc::clone(bytes));
         }
         for item in &self.tail {
-            if !std::mem::take(&mut first) {
-                out.byte(b',');
-            }
+            comma(out);
             out.json(item);
         }
         out.byte(b']');
     }
 }
 
+/// Bytes a kept encoding and the requests that carry it share.
+pub(crate) type Shared = Arc<[u8]>;
+
 /// A body being written: what is written now, and the shared bytes it
 /// takes as they are.
 #[derive(Default)]
 pub(crate) struct Pieces {
-    done: Vec<Bytes>,
+    done: Vec<Shared>,
     buf: Vec<u8>,
 }
 
@@ -373,14 +366,14 @@ impl Pieces {
         let _ = serde_json::to_writer(&mut self.buf, value);
     }
 
-    pub(crate) fn bytes(&mut self, bytes: Bytes) {
+    pub(crate) fn shared(&mut self, bytes: Shared) {
         if !self.buf.is_empty() {
             self.done.push(std::mem::take(&mut self.buf).into());
         }
         self.done.push(bytes);
     }
 
-    pub(crate) fn finish(mut self) -> Vec<Bytes> {
+    pub(crate) fn finish(mut self) -> Vec<Shared> {
         if !self.buf.is_empty() {
             self.done.push(self.buf.into());
         }

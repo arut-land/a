@@ -9,7 +9,6 @@ use std::thread;
 use std::time::Duration;
 
 use crate::store::{Loaded, Log, LogStore, Memory};
-use bytes::Bytes;
 use ext::{Extension, Registrar, Replay, Rewrite, Tool, point};
 use ext_policy::Policy;
 use llm::http::Http;
@@ -160,7 +159,7 @@ impl Http for Script {
             http::Response::builder()
                 .status(200)
                 .header("content-type", "text/event-stream")
-                .body(llm::http::body([Bytes::from(body)]))
+                .body(llm::http::body([body.into()]))
                 .expect("scripted response")
         });
         Box::pin(std::future::ready(reply.ok_or_else(|| {
