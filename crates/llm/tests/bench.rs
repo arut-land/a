@@ -514,4 +514,31 @@ fn transcript_memory() {
         text.len() / 1024,
         (LIVE.load(Relaxed) - base) / 1024
     );
+    // A request for it, as the session's model takes it: encoded whole,
+    // then grown by a turn.
+    let (host, quirks) = responses::HOSTS[0];
+    let provider = Provider::new(
+        host.id,
+        "http://x",
+        llm::Auth::None,
+        responses::Responses::new(quirks),
+    );
+    let reply = Recorded {
+        status: 200,
+        body: long_chat(1),
+    };
+    let request = |messages: llm::Messages| Request {
+        model: "gpt-6-luna".into(),
+        messages,
+        ..Request::default()
+    };
+    let mut fresh: Vec<llm::Messages> = (0..=5).map(|_| messages.to_vec().into()).collect();
+    measure("session request, whole", 5, || {
+        let _ = llm::stream(&reply, &provider, &request(fresh.pop().expect("a copy")));
+    });
+    let _ = llm::stream(&reply, &provider, &request(messages.clone()));
+    measure("session request, grown by a turn", 20, || {
+        messages.push(Message::user("and then?"));
+        let _ = llm::stream(&reply, &provider, &request(messages.clone()));
+    });
 }
