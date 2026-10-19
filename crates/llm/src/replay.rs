@@ -4,9 +4,11 @@
 //! edited since keeps only the item's identity (its id, its ciphertext), and
 //! anything else is rebuilt from the shared fields.
 
+use serde::{Deserialize, Serialize};
+use serde_json::value::RawValue;
 use serde_json::{Map, Value};
 
-use crate::spec::AssistantPart;
+use crate::spec::{AssistantPart, Meta};
 
 /// What an encoder sends for one part.
 #[derive(Clone, Debug, PartialEq)]
@@ -74,6 +76,36 @@ pub fn fingerprint(canon: Canon<'_>) -> String {
     format!("{:016x}", hash.0)
 }
 
+/// A part's state under its protocol's key, as the writer keeps it: the
+/// provider item, with the fingerprint of the shared fields it was decoded
+/// to or, for an opaque part, whether it goes back. Its fields are in key
+/// order, as a tree of it would write them.
+#[derive(Serialize)]
+pub(crate) struct Written<'a> {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub fp: Option<&'a str>,
+    pub item: &'a Value,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub replay: Option<bool>,
+}
+
+/// [`Written`] state as an encoder reads it, the item left as its text.
+#[derive(Deserialize)]
+struct Kept<'a> {
+    #[serde(default, borrow)]
+    fp: Option<&'a str>,
+    #[serde(default, borrow)]
+    item: Option<&'a RawValue>,
+    #[serde(default)]
+    replay: Option<bool>,
+}
+
+/// The provider item `meta` keeps under `key`; `None` when it keeps none.
+pub(crate) fn item(meta: &Meta, key: &str) -> Option<Value> {
+    let item = meta.parse::<Kept<'_>>(key)?.item?;
+    serde_json::from_str(item.get()).ok()
+}
+
 /// What to send for `part` under protocol `key`. `identity` picks the keys
 /// of a stale item that a rebuilt part keeps.
 pub fn replay(
@@ -81,16 +113,18 @@ pub fn replay(
     key: &str,
     identity: impl FnOnce(&Value) -> Map<String, Value>,
 ) -> Replay {
-    let Some(mut state) = part.meta().get(key) else {
+    let Some(state) = part.meta().parse::<Kept<'_>>(key) else {
         return Replay::Rebuild;
     };
-    let item = state.get_mut("item").map(Value::take);
-    let Some(item) = item.filter(|item| !item.is_null()) else {
+    let Some(item) = state
+        .item
+        .and_then(|item| serde_json::from_str(item.get()).ok())
+    else {
         return Replay::Rebuild;
     };
     let current = match Canon::of(part) {
         Canon::Other => true,
-        canon => state.get("fp").and_then(Value::as_str) == Some(fingerprint(canon).as_str()),
+        canon => state.fp == Some(fingerprint(canon).as_str()),
     };
     if current {
         return Replay::Item(item);
@@ -105,10 +139,8 @@ pub fn replay(
 
 /// Whether the opaque `part` goes back under `key`.
 pub fn replays(part: &AssistantPart, key: &str) -> bool {
-    part.meta()
-        .field(key, "replay")
-        .and_then(|replay| replay.as_bool())
-        .unwrap_or(false)
+    let state = part.meta().parse::<Kept<'_>>(key);
+    state.and_then(|state| state.replay).unwrap_or(false)
 }
 
 #[cfg(test)]

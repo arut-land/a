@@ -110,13 +110,17 @@ fn collect(value: &Value, at: &mut String, paths: &mut Vec<String>) {
 #[test]
 fn reads_what_the_derived_deserializer_reads() {
     let whole = every_part();
-    let read = Response::from_value(&whole).expect("a reply");
+    let read = Response::from_json(&whole.to_string()).expect("a reply");
     assert_eq!(Response::deserialize(&whole).ok(), Some(read.clone()));
     assert_eq!(serde_json::to_value(&read).expect("a value"), whole);
     let mut checked = 0;
     for (mutation, value) in mutations(&whole) {
         let derived = Response::deserialize(&value).ok();
-        assert_eq!(Response::from_value(&value).ok(), derived, "{mutation}");
+        assert_eq!(
+            Response::from_json(&value.to_string()).ok(),
+            derived,
+            "{mutation}"
+        );
         checked += 1;
     }
     assert!(checked > 1000, "{checked}");
@@ -129,7 +133,7 @@ fn reads_a_minimal_reply() {
         "finish": {"reason": "stop"},
         "usage": {},
     });
-    let read = Response::from_value(&value).expect("a reply");
+    let read = Response::from_json(&value.to_string()).expect("a reply");
     assert_eq!(Response::deserialize(&value).ok(), Some(read));
 }
 
@@ -137,11 +141,11 @@ fn reads_a_minimal_reply() {
 /// string per protocol, and is a tree only when its protocol reads it.
 #[test]
 fn provider_state_is_parsed_only_where_read() {
-    let reply = Response::from_value(&every_part()).expect("a reply");
+    let reply = Response::from_json(&every_part().to_string()).expect("a reply");
     let state = r#"{"fp":"00","item":{"type":"thinking"}}"#;
     let part = &reply.message.content[0];
     assert_eq!(part.meta().raw("messages"), Some(state));
-    assert_eq!(part.meta().field("messages", "fp"), Some(json!("00")));
+    assert_eq!(part.meta().get("messages").unwrap()["fp"], json!("00"));
     // Written out again as that text.
     let written = serde_json::to_value(&reply).expect("a reply writes");
     assert_eq!(

@@ -19,7 +19,7 @@ use serde_json::{Map, Value};
 
 use crate::error::{Error, Kind};
 use crate::protocol::{Decoder, Flow, Frame};
-use crate::replay::{Canon, fingerprint};
+use crate::replay::{Canon, Written, fingerprint};
 use crate::spec::{
     AssistantPart, Block, CallEnd, Event, Finish, Media, Meta, Opaque, Reason, SmolStr, Usage,
 };
@@ -830,24 +830,21 @@ impl Writer {
             if part >= canonical_from && replay.is_none() {
                 continue;
             }
-            let mut state = crate::json::object([("item".to_owned(), item)]);
-            match replay {
-                Some(replay) => {
-                    state.insert("replay".into(), (replay && part < canonical_from).into())
-                }
-                None => state.insert("fp".into(), fp.into()),
+            let state = Written {
+                fp: replay.is_none().then_some(fp.as_str()),
+                item: &item,
+                replay: replay.map(|replay| replay && part < canonical_from),
             };
-            let meta = self.meta(state);
+            let meta = self.meta(&state);
             self.out.push(Event::Meta { index: part, meta });
         }
         let reason = match reason {
             Reason::Stop if !self.call_ids.is_empty() => Reason::ToolCalls,
             reason => reason,
         };
-        let meta = end
-            .raw_usage
-            .filter(Value::is_object)
-            .map_or_default(|usage| self.meta(crate::json::object([("usage".to_owned(), usage)])));
+        let meta = (end.raw_usage.as_ref())
+            .filter(|usage| usage.is_object())
+            .map_or_default(|usage| self.meta(&Reply { usage }));
         let order = self.order();
         self.out.push(Event::Finish {
             finish: Finish {
@@ -863,9 +860,9 @@ impl Writer {
     }
 
     /// `state` as the meta of this protocol.
-    fn meta(&self, state: Map<String, Value>) -> Meta {
+    fn meta(&self, state: &impl serde::Serialize) -> Meta {
         let mut meta = Meta::new();
-        meta.insert(self.key, &Value::Object(state));
+        meta.insert(self.key, state);
         meta
     }
 
@@ -930,6 +927,12 @@ pub fn merge(item: &mut Value, delta: &Map<String, Value>) {
             }
         }
     }
+}
+
+/// A reply's state: the provider's usage object.
+#[derive(serde::Serialize)]
+struct Reply<'a> {
+    usage: &'a Value,
 }
 
 /// A per-process seed for writer-issued call ids.

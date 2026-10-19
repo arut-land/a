@@ -330,7 +330,7 @@ fn is_base64(text: &str) -> bool {
 /// else rebuilt from its shared fields; `None` when it has nothing to send.
 fn assistant_part(part: &AssistantPart, model: &str, ids: bool) -> Result<Option<Value>, Error> {
     if let AssistantPart::Opaque(opaque) = part {
-        let item = opaque.meta.field(KEY, "item");
+        let item = crate::replay::item(&opaque.meta, KEY);
         return Ok(item.filter(|_| replays(part, KEY)));
     }
     if let Replay::Item(mut item) = replay(part, KEY, |_| Map::new()) {

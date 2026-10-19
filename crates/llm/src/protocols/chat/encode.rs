@@ -489,8 +489,8 @@ fn assistant_message(assistant: &Assistant, ctx: &Context) -> Option<Value> {
             AssistantPart::ToolCall(call) => calls.push(call_item(call, sent, &ctx.custom)),
             // An opaque item is a content part; one with no `type` is not.
             AssistantPart::Opaque(opaque) if replays(part, KEY) => {
-                if let Some(item) =
-                    (opaque.meta.field(KEY, "item")).filter(|item| item.get("type").is_some())
+                if let Some(item) = (crate::replay::item(&opaque.meta, KEY))
+                    .filter(|item| item.get("type").is_some())
                 {
                     has_parts = true;
                     parts.push(item);

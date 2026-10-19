@@ -86,7 +86,7 @@ impl Transcript {
             } => {
                 let reply = match fresh {
                     Some(message) => Ok(message),
-                    None => llm::Response::from_value(&output.value()).map(|r| r.message),
+                    None => llm::Response::from_json(output.raw()).map(|r| r.message),
                 };
                 match reply {
                     Ok(message) => Message::Assistant(message),

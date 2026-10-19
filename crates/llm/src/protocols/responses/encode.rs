@@ -445,7 +445,7 @@ fn rebuilt(
             item
         }
         AssistantPart::Opaque(opaque) if replays(part, KEY) => {
-            return Ok(opaque.meta.field(KEY, "item"));
+            return Ok(crate::replay::item(&opaque.meta, KEY));
         }
         AssistantPart::Opaque(_) | AssistantPart::ToolResult(_) => return Ok(None),
         AssistantPart::Media(_) => return Err(unsendable("assistant image")),

@@ -392,7 +392,7 @@ impl Fold for Turns {
 /// The provider item of an opaque part this protocol kept.
 fn opaque_item(part: &AssistantPart) -> Option<Value> {
     match part {
-        AssistantPart::Opaque(opaque) => opaque.meta.field(KEY, "item"),
+        AssistantPart::Opaque(opaque) => crate::replay::item(&opaque.meta, KEY),
         _ => None,
     }
 }
