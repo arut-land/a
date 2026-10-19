@@ -366,13 +366,15 @@ fn the_kernel_does_no_io() {
         .lines()
         .filter_map(|l| l.split_whitespace().next())
         .collect();
-    assert!(crates.contains(&"protocol"), "{tree}");
+    assert!(
+        crates.contains(&"protocol") && crates.contains(&"ext"),
+        "{tree}"
+    );
     for io in [
         "rt",
         "sys",
         "store",
         "engine",
-        "ext",
         "ureq",
         "mio",
         "rustix",

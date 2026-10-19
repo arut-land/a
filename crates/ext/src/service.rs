@@ -8,8 +8,8 @@ use std::io;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
+use crate::BoxFuture;
 use protocol::{Environment, Outcome, Overrides};
-use rt::BoxFuture;
 
 use crate::{Cx, SpawnSpec, States};
 

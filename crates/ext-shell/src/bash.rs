@@ -34,9 +34,18 @@ use sys::Signal;
 pub use crate::output::OUTPUT_CAP;
 use crate::output::{Live, Output, Rendered, create_private, private_dir};
 use crate::state::Cwd;
-use ext::{Cx, Kill, SpawnSpec as Spawn, Tool};
+use ext::{Cx, SpawnSpec as Spawn, Tool};
 
 pub struct Bash;
+
+/// How long a stopped command's group has between SIGTERM and SIGKILL.
+pub const GRACE: Duration = Duration::from_secs(3);
+
+/// The runtime the engine runs the call on: its clock and its timers.
+fn runtime(cx: &Cx) -> io::Result<&dyn rt::Runtime> {
+    cx.service::<dyn rt::Runtime>()
+        .ok_or_else(|| io::Error::other("the engine provides no runtime"))
+}
 
 /// Seconds a command may run when the call does not say.
 pub const TIMEOUT: u64 = 120;
@@ -514,7 +523,7 @@ impl Run {
                     kill: KillPhase::Term { at },
                 },
                 None,
-            ) if now >= at + Kill::GRACE => {
+            ) if now >= at + GRACE => {
                 let kill = KillPhase::Killed;
                 (Self::Stopping { why, kill }, Some(Signal::Kill))
             }
@@ -530,7 +539,7 @@ impl Run {
             Self::Stopping {
                 kill: KillPhase::Term { at },
                 ..
-            } => Some(at + Kill::GRACE),
+            } => Some(at + GRACE),
             Self::Stopping { .. } => None,
             Self::Exited { at, .. } => Some((heard.max(at) + IDLE).min(at + LINGER)),
         }
@@ -561,14 +570,15 @@ async fn supervise(mut child: Child, log: &Path, limit: Duration, cx: &Cx) -> io
     let exit = sys::exit_watch(pgid).and_then(rt::Async::for_reading).ok();
     let mut buf = vec![0; 64 * 1024];
     let (mut output, mut live) = (Output::default(), Live::default());
-    let start = cx.rt.now();
+    let rt = runtime(cx)?;
+    let start = rt.now();
     let mut run = Run::Running {
         deadline: start + limit,
     };
     let (mut heard, mut reported) = (start, start);
     let (mut unreported, mut behind, mut exit_seen) = (false, false, false);
     loop {
-        let now = cx.rt.now();
+        let now = rt.now();
         let exited = matches!(run, Run::Exited { .. });
         let unwatched = written.is_none() || (!exited && (exit.is_none() || exit_seen));
         let next = [
@@ -594,7 +604,7 @@ async fn supervise(mut child: Child, log: &Path, limit: Duration, cx: &Cx) -> io
             });
             let running = matches!(run, Run::Running { .. });
             let cancelled = when(running, cx.cancel.cancelled());
-            let sleep = when(wait.is_some(), cx.rt.sleep(wait.unwrap_or_default()));
+            let sleep = when(wait.is_some(), rt.sleep(wait.unwrap_or_default()));
             let woke = first([pin!(writes), pin!(exits), pin!(cancelled), pin!(sleep)]).await;
             exit_seen |= woke == 1;
         }
@@ -607,7 +617,7 @@ async fn supervise(mut child: Child, log: &Path, limit: Duration, cx: &Cx) -> io
             live.push(chunk);
         })?;
         behind = read == READ;
-        let now = cx.rt.now();
+        let now = rt.now();
         if read > 0 {
             heard = now;
             unreported = true;

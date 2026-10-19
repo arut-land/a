@@ -7,22 +7,25 @@ use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex, OnceLock, PoisonError};
 
 use protocol::{Environment, Outcome, SessionId};
-use rt::BoxFuture;
 use serde_json::Value;
 
+use crate::agent::Idle;
 use crate::ext::{DynCommand, MakeAgent};
 use crate::state::States;
 use crate::{
-    Agent, Cancel, CwdOf, Cx, DynExtension, DynTool, Extension, Facts, Name, Place, Refused,
-    Registrar, Text, Tier,
+    Agent, BoxFuture, Cancel, CwdOf, Cx, DynExtension, DynTool, Extension, Facts, Name, Place,
+    Refused, Registrar, Text, Tier,
 };
 
-pub use crate::point::{Decided, Gate, History, Hooks};
+pub use crate::point::{Decided, History, Hooks};
 
 /// The engine, as a running call reaches it.
 pub trait Host: Send + Sync {
     /// See [`Cx::spawned`].
     fn spawned(&self, pgid: u32, background: bool);
+    /// See [`Cx::own`]: the engine runs `ended`, and the session owns
+    /// `pgid` until it resolves.
+    fn own(&self, pgid: u32, ended: BoxFuture<'static, ()>);
     /// See [`Cx::progress`].
     fn progress(&self, text: &str);
     /// Commits `data` as a change to extension `ext`'s state `state`, and
@@ -48,7 +51,6 @@ pub struct Parts {
     pub model: Arc<str>,
     pub spill: Arc<Path>,
     pub cancel: Cancel,
-    pub rt: rt::Rt,
 }
 
 impl Parts {
@@ -374,15 +376,6 @@ fn replace<T>(items: &mut Vec<(bool, T)>, new: (bool, T), name: impl Fn(&(bool, 
         Some(slot) if slot.0 && !new.0 => {}
         Some(slot) => *slot = new,
         None => items.push(new),
-    }
-}
-
-/// The agent of a registry with none.
-struct Idle;
-
-impl Agent for Idle {
-    fn step(&mut self, _: crate::Input) -> Vec<crate::Action> {
-        Vec::new()
     }
 }
 

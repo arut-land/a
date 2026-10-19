@@ -1,6 +1,7 @@
 //! A stand-in engine for an extension's tests: calls run against a
 //! registry, with state folded and processes recorded in memory.
 
+use std::any::{Any, TypeId};
 use std::ops::Deref;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -10,8 +11,9 @@ use protocol::{Body, Entry, Environment, Outcome, SessionId};
 use serde_json::Value;
 
 use crate::host::{Host, Parts, Registry};
-use crate::{Cancel, Cx, States};
+use crate::{BoxFuture, Cancel, Cx, States};
 
+/// The runtime the calls run on, as the engine provides it.
 static RT: LazyLock<rt::Rt> = LazyLock::new(|| Arc::new(rt::Threads::default()));
 
 fn lock<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
@@ -36,6 +38,8 @@ pub struct Recorder {
     pub spawned: Mutex<Vec<(u32, bool)>>,
     /// The output the calls reported as they ran.
     pub progress: Mutex<String>,
+    /// Notified each time a group the session owns ends.
+    pub ends: Arc<rt::Notify>,
 }
 
 impl Deref for Rig {
@@ -64,6 +68,7 @@ impl Rig {
                 log: Mutex::default(),
                 spawned: Mutex::default(),
                 progress: Mutex::default(),
+                ends: Arc::default(),
             }),
             calls: AtomicU64::new(0),
         }
@@ -87,7 +92,6 @@ impl Rig {
             model: "test:model".into(),
             spill: self.spill().into(),
             cancel: self.cancel.clone(),
-            rt: Arc::clone(&RT),
         }
         .cx(Arc::clone(&self.host) as _)
     }
@@ -128,6 +132,15 @@ impl Host for Recorder {
         lock(&self.spawned).push((pgid, background));
     }
 
+    fn own(&self, pgid: u32, ended: BoxFuture<'static, ()>) {
+        self.spawned(pgid, true);
+        let ends = Arc::clone(&self.ends);
+        RT.spawn(Box::pin(async move {
+            ended.await;
+            ends.notify();
+        }));
+    }
+
     fn progress(&self, text: &str) {
         lock(&self.progress).push_str(text);
     }
@@ -153,5 +166,9 @@ impl Host for Recorder {
 
     fn registry(&self) -> &Registry {
         &self.registry
+    }
+
+    fn service(&self, ty: TypeId) -> Option<&(dyn Any + Send + Sync)> {
+        (ty == TypeId::of::<dyn rt::Runtime>()).then_some(&*RT as _)
     }
 }

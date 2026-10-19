@@ -4,17 +4,21 @@ version.workspace = true
 edition.workspace = true
 publish.workspace = true
 
+# The contract between extensions, the kernel and the engine: I/O-free, as
+# the kernel builds on it (`tests/io.rs` checks what it pulls in). What a
+# call needs from the OS or a runtime it asks the engine for, as a service.
 [features]
 # `testing::Rig`, a stand-in engine for an extension's tests.
-testing = []
+testing = ["dep:rt", "dep:sys"]
 
 [dependencies]
 llm.workspace = true
 protocol.workspace = true
-rt.workspace = true
 serde.workspace = true
 serde_json.workspace = true
-sys.workspace = true
+smallvec = { version = "1.13", default-features = false }
+rt = { workspace = true, optional = true }
+sys = { workspace = true, optional = true }
 
 [lints]
 workspace = true

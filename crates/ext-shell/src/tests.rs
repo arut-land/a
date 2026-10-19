@@ -1,5 +1,5 @@
 use std::path::Path;
-use std::sync::{Arc, mpsc};
+use std::sync::mpsc;
 use std::time::Duration;
 
 use ext::host::Registry;
@@ -21,9 +21,8 @@ fn an_extension_cannot_hold_session_state_across_an_await() {
             // What a read yields is owned: no lock outlives the closure.
             let before = reader.state(|cwd: &Cwd| cwd.after(None).map(Path::to_path_buf));
             paused.0.send(()).unwrap();
-            let rt = Arc::clone(&reader.rt);
             while resume.1.try_recv().is_err() {
-                rt.sleep(Duration::from_millis(5)).await;
+                rt::Timer::after(Duration::from_millis(5)).await;
             }
             let after = reader.state(|cwd: &Cwd| cwd.after(None).map(Path::to_path_buf));
             (before, after)

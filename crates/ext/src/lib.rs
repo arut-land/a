@@ -16,14 +16,15 @@
 //!
 //! [`host`] is the engine's side of all this.
 
+use std::future::Future;
+use std::pin::Pin;
 use std::sync::Arc;
 
-use protocol::{Body, Outcome};
-use serde_json::Value;
+use protocol::Outcome;
 
+mod agent;
 mod ext;
 pub mod host;
-pub mod job;
 pub mod point;
 mod service;
 mod state;
@@ -31,37 +32,21 @@ mod state;
 pub mod testing;
 mod tool;
 
+pub use agent::{Action, Actions, Agent, Input};
 pub use ext::{Command, DynExtension, Extension, Facts, Place, Refused, Registrar, Text, Tier};
-pub use point::{History, PointCx, Rewrite};
+pub use point::{Answer, Chained, Gate, Gated, History, Later, PointCx, Recover, Rewrite};
 pub use service::{CwdOf, Sessions, Settings, Spawner};
 pub use state::{Fold, States};
-pub use tool::{Cancel, Cx, DynTool, Kill, Replay, Route, SpawnSpec, Tool};
+pub use tool::{Callable, Cancel, Cx, DynTool, Replay, Route, SpawnSpec, Tool};
 
 /// A runtime name: of an extension, a tool, an agent. Typed Rust items
 /// name themselves with a `&'static str`, converted once as they register;
 /// others (a Lua mod, a client's tools) are named only at run time.
 pub type Name = Arc<str>;
 
-pub enum Input {
-    User {
-        text: String,
-    },
-    ToolDone {
-        call: u64,
-        outcome: Outcome,
-    },
-    ModelDone {
-        call: u64,
-        outcome: Outcome,
-    },
-    /// Watch `watch` fired: the child it watched settled with `outcome`.
-    /// Only a log an earlier build wrote has watches an agent asked for;
-    /// children are a tool's now.
-    ChildDone {
-        watch: u64,
-        outcome: Outcome,
-    },
-}
+/// A future that can be sent across threads: what the engine runs for an
+/// extension, on whichever runtime it has.
+pub type BoxFuture<'a, T> = Pin<Box<dyn Future<Output = T> + Send + 'a>>;
 
 /// The most of a child's result a parent's model sees, in bytes: about 8k
 /// tokens.
@@ -84,27 +69,6 @@ pub fn child_result(outcome: &Outcome) -> String {
         return format!("{}\n[{left} more bytes not shown]", &text[..cut]);
     }
     text
-}
-
-#[derive(Debug, PartialEq)]
-pub enum Action {
-    Emit(Body),
-    RunTool {
-        tool: String,
-        input: Value,
-        /// The model's id for the call.
-        id: Option<String>,
-        /// Answers the call with this error instead of running it.
-        refuse: Option<String>,
-    },
-    /// Ask the model to reply to the conversation so far.
-    CallModel,
-}
-
-/// A session's agent loop, as an extension registers it with
-/// [`Registrar::agent`].
-pub trait Agent: Send {
-    fn step(&mut self, input: Input) -> Vec<Action>;
 }
 
 #[cfg(test)]

@@ -24,7 +24,10 @@
 
 use std::any::{Any, TypeId};
 use std::convert::Infallible;
+use std::fmt;
+use std::future::Future;
 use std::path::Path;
+use std::pin::Pin;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -556,13 +559,79 @@ impl Hooked {
 /// Decisions to log, with the extension whose handler made each.
 pub type Decided = Vec<(Name, Decision)>;
 
-/// What the hooks make of a tool call they do not refuse.
-#[derive(Debug, PartialEq, Eq)]
+/// A point's answer: now, or later as a future the call owns, so a slow
+/// handler holds its call rather than the session.
+pub enum Answer<T> {
+    Now(T),
+    Later(Later<T>),
+}
+
+/// An answer to come.
+pub struct Later<T>(pub Pin<Box<dyn Future<Output = T> + Send>>);
+
+impl<T> Later<T> {
+    pub fn new(future: impl Future<Output = T> + Send + 'static) -> Self {
+        Self(Box::pin(future))
+    }
+}
+
+impl<T> fmt::Debug for Later<T> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str("Later")
+    }
+}
+
+/// A future has no identity of its own: the call that awaits it names it.
+impl<T> PartialEq for Later<T> {
+    fn eq(&self, _: &Self) -> bool {
+        true
+    }
+}
+
+/// A chain's result, with what each extension decided on the way.
+#[derive(Debug, PartialEq)]
+pub struct Chained<T> {
+    pub value: T,
+    pub decisions: Vec<(Name, protocol::Verdict)>,
+}
+
+impl<T> Chained<T> {
+    pub const fn new(value: T) -> Self {
+        Self {
+            value,
+            decisions: Vec::new(),
+        }
+    }
+}
+
+/// What a call's gate decided: logged after the call's intent, then it
+/// runs with `input`, waits for an approval, or is answered with why not.
+#[derive(Debug, PartialEq)]
+pub struct Gated {
+    pub input: Json,
+    pub decisions: Vec<(Name, protocol::Verdict)>,
+    pub gate: Gate,
+}
+
+impl Gated {
+    pub const fn run(input: Json) -> Self {
+        Self {
+            input,
+            decisions: Vec::new(),
+            gate: Gate::Run,
+        }
+    }
+}
+
+/// What the gate makes of a tool call.
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub enum Gate {
     Run,
     /// No handler answered a permission `ask`: the call runs once the user
     /// approves it.
     Ask,
+    /// It is answered with why not, without running.
+    Refuse(String),
 }
 
 /// The handlers at each point, in the order they run, each with its
@@ -669,14 +738,14 @@ impl Hooks {
     }
 
     /// Whether a call may run, with `input` as the `pre_tool` chain leaves
-    /// it. `Err` is why not, which answers the call.
+    /// it.
     pub fn gate(
         &self,
         cx: &PointCx<'_>,
         tool: &str,
         input: &mut Value,
         decided: &mut Decided,
-    ) -> Result<Gate, String> {
+    ) -> Gate {
         let chained = self.run::<PreTool>(cx, tool, input, &mut |name, _, input| {
             let input = Json::new(input);
             let tool = tool.to_owned();
@@ -689,14 +758,14 @@ impl Hooks {
                 reason: reason.clone(),
             };
             decided.push((name, decision));
-            return Err(reason);
+            return Gate::Refuse(reason);
         }
         let call = ToolUse {
             tool,
             input: &*input,
         };
         let Some((by, permission)) = self.ask::<Permission>(cx, call) else {
-            return Ok(Gate::Run);
+            return Gate::Run;
         };
         let tool = tool.to_owned();
         let decision = Decision::Permission {
@@ -705,10 +774,10 @@ impl Hooks {
         };
         decided.push((Name::clone(&by), decision));
         match permission {
-            protocol::Permission::Allow => Ok(Gate::Run),
+            protocol::Permission::Allow => Gate::Run,
             protocol::Permission::Ask => {
                 let Some((who, approved)) = self.ask::<Approve>(cx, call) else {
-                    return Ok(Gate::Ask);
+                    return Gate::Ask;
                 };
                 let why = (!approved).then(|| format!("{who} did not approve this call"));
                 let decision = Decision::Approval {
@@ -717,10 +786,10 @@ impl Hooks {
                     call: None,
                 };
                 decided.push((who, decision));
-                why.map_or(Ok(Gate::Run), Err)
+                why.map_or(Gate::Run, Gate::Refuse)
             }
-            protocol::Permission::Defer => Err(format!("{by} deferred this call")),
-            protocol::Permission::Deny => Err(format!("{by} denied this call")),
+            protocol::Permission::Defer => Gate::Refuse(format!("{by} deferred this call")),
+            protocol::Permission::Deny => Gate::Refuse(format!("{by} denied this call")),
         }
     }
 

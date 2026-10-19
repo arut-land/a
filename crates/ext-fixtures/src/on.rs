@@ -1,7 +1,7 @@
 use std::time::Duration;
 
-use ext::{Action, Agent, Cx, Extension, Input, Registrar, Replay, Tool};
-use protocol::Body;
+use ext::{Action, Actions, Agent, Cx, Extension, Input, Registrar, Replay, Tool};
+use protocol::Json;
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 
@@ -24,14 +24,14 @@ impl Extension for Fixtures {
 pub struct Echo;
 
 impl Agent for Echo {
-    fn step(&mut self, input: Input) -> Vec<Action> {
+    fn step(&mut self, input: Input) -> Actions {
         let text = match input {
             Input::User { text } => text,
             Input::ChildDone { outcome, .. } => {
                 let text = ext::child_result(&outcome);
-                return vec![Action::Emit(Body::Assistant { text })];
+                return Actions::from_elem(Action::Say(text), 1);
             }
-            Input::ToolDone { .. } | Input::ModelDone { .. } => return Vec::new(),
+            Input::ToolDone { .. } | Input::ModelDone { .. } => return Actions::new(),
         };
         let (tool, input) = if let Some(prompt) = text.strip_prefix("spawn ") {
             ("task", json!({ "prompt": prompt }))
@@ -40,14 +40,17 @@ impl Agent for Echo {
         } else if let Some(Ok(seconds)) = text.strip_prefix("sleep ").map(str::parse::<u64>) {
             (Sleep::NAME, json!({ "seconds": seconds }))
         } else {
-            return vec![Action::Emit(Body::Assistant { text })];
+            return Actions::from_elem(Action::Say(text), 1);
         };
-        vec![Action::RunTool {
-            tool: tool.to_owned(),
-            input,
-            id: None,
-            refuse: None,
-        }]
+        let input = Json::new(&input);
+        Actions::from_elem(
+            Action::Call {
+                tool: tool.to_owned(),
+                input,
+                id: None,
+            },
+            1,
+        )
     }
 }
 
@@ -84,8 +87,8 @@ impl Tool for Sleep {
         .expect("a tool schema is valid JSON")
     }
 
-    async fn call(&self, input: Seconds, cx: &Cx) -> Result<Slept, String> {
-        cx.rt.sleep(Duration::from_secs(input.seconds)).await;
+    async fn call(&self, input: Seconds, _: &Cx) -> Result<Slept, String> {
+        rt::Timer::after(Duration::from_secs(input.seconds)).await;
         Ok(Slept {
             slept: input.seconds,
         })
@@ -104,7 +107,7 @@ mod tests {
 
     fn tool_named(actions: &[Action]) -> Option<&str> {
         match actions {
-            [Action::RunTool { tool, .. }] => Some(tool),
+            [Action::Call { tool, .. }] => Some(tool),
             _ => None,
         }
     }
@@ -112,28 +115,24 @@ mod tests {
     #[test]
     fn echo_routes_messages_and_tools() {
         let mut echo = Echo;
-        assert!(
-            matches!(&echo.step(user("hi"))[..], [Action::Emit(Body::Assistant { text })] if text == "hi")
-        );
+        assert!(matches!(&echo.step(user("hi"))[..], [Action::Say(text)] if text == "hi"));
         assert_eq!(tool_named(&echo.step(user("$ ls"))), Some("bash"));
         assert_eq!(tool_named(&echo.step(user("sleep 2"))), Some("sleep"));
-        assert!(matches!(&echo.step(user("sleep x"))[..], [Action::Emit(_)]));
+        assert!(matches!(&echo.step(user("sleep x"))[..], [Action::Say(_)]));
         assert_eq!(tool_named(&echo.step(user("spawn sleep 1"))), Some("task"));
     }
 
     #[test]
     fn echo_hears_a_childs_result() {
         let done = Input::ChildDone {
-            watch: 3,
+            watch: protocol::Seq::new(3).unwrap(),
             outcome: Outcome::Done {
                 output: Value::from("hi").into(),
             },
         };
         assert_eq!(
-            Echo.step(done),
-            [Action::Emit(Body::Assistant {
-                text: "The child session finished:\nhi".into()
-            })]
+            &Echo.step(done)[..],
+            [Action::Say("The child session finished:\nhi".into())]
         );
     }
 }

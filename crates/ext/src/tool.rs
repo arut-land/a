@@ -3,31 +3,38 @@
 
 use std::any::TypeId;
 use std::collections::BTreeMap;
-use std::future::Future;
+use std::future::{Future, poll_fn};
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::time::{Duration, Instant};
+use std::sync::{Arc, Mutex, PoisonError};
+use std::task::{Poll, Waker};
 
-use protocol::{Card, Environment, Json, Outcome, SessionId};
-use rt::BoxFuture;
+use protocol::{Audience, Card, Environment, Json, Outcome, SessionId};
 use serde::Serialize;
 use serde::de::{Deserialize, DeserializeOwned};
 use serde_json::Value;
-use sys::Signal;
 
+use crate::BoxFuture;
 #[cfg(doc)]
 use crate::CwdOf;
 use crate::host::Host;
-use crate::job;
 use crate::point::{PointCx, View};
 use crate::state::{self, Fold, States};
 
 /// Whether a call interrupted by a crash may run again.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub enum Replay {
     Safe,
+    #[default]
     Unsafe,
+}
+
+/// What the kernel knows of a callable: who may call it, and whether a
+/// call a crash cut off runs again.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Callable {
+    pub audience: Audience,
+    pub replay: Replay,
 }
 
 /// Where a call runs: tools run in the daemon, and later ones may run in
@@ -53,13 +60,15 @@ pub struct Cancel(Arc<Flag>);
 #[derive(Debug, Default)]
 struct Flag {
     set: AtomicBool,
-    notify: rt::Notify,
+    /// The tasks awaiting it.
+    waiting: Mutex<Vec<Waker>>,
 }
 
 impl Cancel {
     pub fn cancel(&self) {
         self.0.set.store(true, Ordering::SeqCst);
-        self.0.notify.notify();
+        let waiting = std::mem::take(&mut *self.waiting());
+        waiting.into_iter().for_each(Waker::wake);
     }
 
     pub fn is_cancelled(&self) -> bool {
@@ -68,45 +77,27 @@ impl Cancel {
 
     /// Resolves once cancelled.
     pub fn cancelled(&self) -> impl Future<Output = ()> + Send + '_ {
-        self.0.notify.until(|| self.is_cancelled())
-    }
-}
-
-/// Stops a process group the way every tool should: SIGTERM, then SIGKILL
-/// once [`Kill::GRACE`] has passed without the group's leader exiting.
-pub struct Kill {
-    pgid: u32,
-    asked: Option<Instant>,
-}
-
-impl Kill {
-    pub const GRACE: Duration = Duration::from_secs(3);
-
-    pub fn new(pgid: u32) -> Self {
-        Self { pgid, asked: None }
-    }
-
-    /// Moves the stop along; call it again by the time it returns, until
-    /// the leader has exited. `None` once it is down to SIGKILL.
-    pub fn tick(&mut self) -> Option<Instant> {
-        match self.asked {
-            None => {
-                let now = Instant::now();
-                self.asked = Some(now);
-                let _ = sys::Group(self.pgid).signal(Signal::Terminate);
-                Some(now + Self::GRACE)
+        poll_fn(|cx| {
+            if self.is_cancelled() {
+                return Poll::Ready(());
             }
-            Some(at) if at.elapsed() >= Self::GRACE => {
-                self.now();
-                None
+            let mut waiting = self.waiting();
+            // Checked again under the lock `cancel` takes to wake.
+            if self.is_cancelled() {
+                return Poll::Ready(());
             }
-            Some(at) => Some(at + Self::GRACE),
-        }
+            if !waiting.iter().any(|w| w.will_wake(cx.waker())) {
+                waiting.push(cx.waker().clone());
+            }
+            Poll::Pending
+        })
     }
 
-    /// SIGKILL, at once.
-    pub fn now(&mut self) {
-        let _ = sys::Group(self.pgid).signal(Signal::Kill);
+    fn waiting(&self) -> std::sync::MutexGuard<'_, Vec<Waker>> {
+        self.0
+            .waiting
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
     }
 }
 
@@ -138,9 +129,6 @@ pub struct Cx {
     /// on first use.
     pub spill: Arc<Path>,
     pub cancel: Cancel,
-    /// Where a tool sleeps and runs blocking work, so it never holds up a
-    /// runtime worker.
-    pub rt: rt::Rt,
     host: Arc<dyn Host>,
 }
 
@@ -154,7 +142,6 @@ impl Cx {
             model,
             spill,
             cancel,
-            rt,
         } = call;
         Self {
             workspace,
@@ -164,7 +151,6 @@ impl Cx {
             model,
             spill,
             cancel,
-            rt,
             host,
         }
     }
@@ -195,14 +181,10 @@ impl Cx {
     }
 
     /// Hands process group `pgid` to the session, past this call: it is
-    /// recorded, and [`job::ENDED`] is notified once `ended`, which watches
-    /// it, resolves.
+    /// recorded, and the session owns it until `ended`, which watches it,
+    /// resolves.
     pub fn own(&self, pgid: u32, ended: impl Future<Output = ()> + Send + 'static) {
-        self.host.spawned(pgid, true);
-        self.rt.spawn(Box::pin(async move {
-            ended.await;
-            job::ENDED.notify();
-        }));
+        self.host.own(pgid, Box::pin(ended));
     }
 
     /// Commits `text` as more of the call's output, for clients to show as
@@ -360,21 +342,35 @@ impl<T: Tool> DynTool for T {
 
 #[cfg(test)]
 mod tests {
-    use std::time::Duration;
+    use std::future::Future;
+    use std::pin::pin;
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::task::{Context, Wake, Waker};
 
     use super::Cancel;
+
+    #[derive(Default)]
+    struct Count(AtomicUsize);
+
+    impl Wake for Count {
+        fn wake(self: Arc<Self>) {
+            self.0.fetch_add(1, Ordering::SeqCst);
+        }
+    }
 
     #[test]
     fn cancelled_wakes_whoever_waits() {
         let cancel = Cancel::default();
-        let other = cancel.clone();
-        let canceller = std::thread::spawn(move || {
-            std::thread::sleep(Duration::from_millis(20));
-            other.cancel();
-        });
-        rt::block_on(cancel.cancelled());
-        canceller.join().unwrap();
-        assert!(cancel.is_cancelled());
-        rt::block_on(cancel.cancelled());
+        let count = Arc::new(Count::default());
+        let waker = Waker::from(Arc::clone(&count));
+        let mut cx = Context::from_waker(&waker);
+        let mut waiting = pin!(cancel.cancelled());
+        assert!(waiting.as_mut().poll(&mut cx).is_pending());
+        assert!(waiting.as_mut().poll(&mut cx).is_pending());
+        cancel.clone().cancel();
+        assert!(count.0.load(Ordering::SeqCst) > 0);
+        assert!(waiting.as_mut().poll(&mut cx).is_ready());
+        assert!(pin!(cancel.cancelled()).poll(&mut cx).is_ready());
     }
 }

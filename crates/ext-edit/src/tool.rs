@@ -20,6 +20,13 @@ use ext::Fold;
 
 use ext::{Cx, Tool};
 
+/// The runtime the engine runs the call on, whose blocking pool file work
+/// goes to.
+fn runtime(cx: &Cx) -> Result<&dyn rt::Runtime, String> {
+    cx.service::<dyn rt::Runtime>()
+        .ok_or_else(|| "the engine provides no runtime".to_owned())
+}
+
 pub struct Edit;
 
 /// The most of a diff an outcome keeps.
@@ -118,7 +125,7 @@ impl Tool for Edit {
         let path = cx.dir().join(&input.path);
         let shown = input.path.clone();
         let read = path.clone();
-        let original = rt::unblock(&*cx.rt, move || match std::fs::read(&read) {
+        let original = rt::unblock(runtime(cx)?, move || match std::fs::read(&read) {
             Ok(bytes) => Ok(Some(bytes)),
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
             Err(e) => Err(e),
@@ -144,7 +151,7 @@ impl Tool for Edit {
         let (content, diff) = apply(text, &input.edits).map_err(|e| format!("{shown}: {e}"))?;
 
         let write = (path.clone(), content.clone());
-        rt::unblock(&*cx.rt, move || {
+        rt::unblock(runtime(cx)?, move || {
             if let Some(parent) = write.0.parent() {
                 std::fs::create_dir_all(parent)?;
             }

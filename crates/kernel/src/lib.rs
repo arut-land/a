@@ -21,14 +21,15 @@
 //! [`Registry`] and [`Agent`].
 
 use std::fmt;
-use std::future::Future;
-use std::pin::Pin;
 use std::sync::Arc;
 use std::time::Duration;
 
+pub use ext::{
+    Action, Actions, Agent, Answer, Callable, Chained, Gate, Gated, Input, Later, Name, Recover,
+    Replay,
+};
 use protocol::{
-    Audience, Author, CallId, Card, Entry, Installed, Json, Mode, Outcome, Seq, SessionId, Verdict,
-    WaitOn,
+    Author, CallId, Card, Entry, Installed, Json, Mode, Outcome, Seq, SessionId, WaitOn,
 };
 use smallvec::SmallVec;
 
@@ -37,18 +38,12 @@ mod session;
 
 pub use crate::session::Core;
 
-/// A runtime name: of an extension, a tool, an agent.
-pub type Name = Arc<str>;
-
 /// What a step returns, in order. The driver commits each run of
 /// [`Effect::Append`]s before the effect after it starts, and the last run
 /// at the end, so an intent is durable before the work it names (and one
 /// step's entries share an fsync). If a commit fails, the effects after it
 /// are dropped and the driver resumes from the log ([`Core::resume`]).
 pub type Effects = SmallVec<[Effect; 4]>;
-
-/// What an agent asks for, in order.
-pub type Actions = SmallVec<[Action; 2]>;
 
 /// What happened, as the driver tells the kernel.
 #[derive(Debug)]
@@ -235,54 +230,6 @@ pub enum Step {
     Running,
 }
 
-/// A session's agent: turns each input into what it asks for next, and
-/// performs no I/O. Its inputs are logged facts, so it is a fold over its
-/// session's log.
-pub trait Agent: Send {
-    fn step(&mut self, input: Input) -> Actions;
-}
-
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub enum Input {
-    User {
-        text: String,
-    },
-    ToolDone {
-        call: CallId,
-        outcome: Outcome,
-    },
-    ModelDone {
-        call: CallId,
-        outcome: Outcome,
-    },
-    /// Watch `watch` fired: the child it watched settled with `outcome`.
-    ChildDone {
-        watch: Seq,
-        outcome: Outcome,
-    },
-}
-
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub enum Action {
-    /// An answer of its own, not a model's.
-    Say(String),
-    /// Call `tool`; `id` is the model's id for the call.
-    Call {
-        tool: String,
-        input: Json,
-        id: Option<String>,
-    },
-    /// Answer a call the model made with `why`, without running it.
-    Refuse {
-        tool: String,
-        input: Json,
-        id: Option<String>,
-        why: String,
-    },
-    /// Ask the model to reply to the conversation so far.
-    CallModel,
-}
-
 /// One registry generation, as the driver binds it to a session: the
 /// extensions' callables, decision points and agent. Points answer from
 /// what they are given and the session's committed state; each method is
@@ -359,103 +306,6 @@ pub trait Registry: Send + Sync {
 impl fmt::Debug for dyn Registry {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.write_str("Registry")
-    }
-}
-
-/// What the kernel knows of a callable.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct Callable {
-    pub audience: Audience,
-    pub replay: Replay,
-}
-
-/// Whether a call cut off by a crash may run again.
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
-pub enum Replay {
-    Safe,
-    #[default]
-    Unsafe,
-}
-
-/// A chain's result, with what each extension decided on the way.
-#[derive(Debug, PartialEq)]
-pub struct Chained<T> {
-    pub value: T,
-    pub decisions: Vec<(Name, Verdict)>,
-}
-
-impl<T> Chained<T> {
-    pub const fn new(value: T) -> Self {
-        Self {
-            value,
-            decisions: Vec::new(),
-        }
-    }
-}
-
-/// What a call's gate decided: logged after the call's intent, then it
-/// runs with `input`, waits for an approval, or is answered with why not.
-#[derive(Debug, PartialEq)]
-pub struct Gated {
-    pub input: Json,
-    pub decisions: Vec<(Name, Verdict)>,
-    pub gate: Gate,
-}
-
-impl Gated {
-    pub const fn run(input: Json) -> Self {
-        Self {
-            input,
-            decisions: Vec::new(),
-            gate: Gate::Run,
-        }
-    }
-}
-
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub enum Gate {
-    Run,
-    /// It runs once someone approves it.
-    Ask,
-    Refuse(String),
-}
-
-/// What to do about a failed model call.
-#[derive(Clone, Debug, PartialEq)]
-pub enum Recover {
-    /// Send it again once `after` has passed; an interrupt meanwhile ends
-    /// it with nothing sent.
-    Retry { after: Duration },
-    /// Send this instead, at once: a compacted request, say.
-    Replace(Box<llm::Request>),
-}
-
-/// A point's answer: now, or later as a future the call owns, so a slow
-/// handler holds its call rather than the session.
-pub enum Answer<T> {
-    Now(T),
-    Later(Later<T>),
-}
-
-/// An answer to come.
-pub struct Later<T>(pub Pin<Box<dyn Future<Output = T> + Send>>);
-
-impl<T> Later<T> {
-    pub fn new(future: impl Future<Output = T> + Send + 'static) -> Self {
-        Self(Box::pin(future))
-    }
-}
-
-impl<T> fmt::Debug for Later<T> {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.write_str("Later")
-    }
-}
-
-/// A future has no identity of its own: the call that awaits it names it.
-impl<T> PartialEq for Later<T> {
-    fn eq(&self, _: &Self) -> bool {
-        true
     }
 }
 

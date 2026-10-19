@@ -104,7 +104,7 @@ impl View for Bare {
     }
 }
 
-fn gate(registry: &Registry, tool: &str, decided: &mut Decided) -> Result<Gate, String> {
+fn gate(registry: &Registry, tool: &str, decided: &mut Decided) -> point::Gate {
     let view = Bare;
     let cx = PointCx::new(SessionId::new(), Path::new("/w"), &view);
     registry.hooks().gate(&cx, tool, &mut json!({}), decided)
@@ -244,12 +244,12 @@ fn a_later_extension_of_the_same_name_replaces_the_earlier_in_place() {
     let mut decided = Decided::new();
     assert_eq!(
         gate(&registry, "b", &mut decided),
-        Err("policy denied this call".into())
+        point::Gate::Refuse("policy denied this call".into())
     );
     assert!(matches!(&decided[..], [(name, Decision::Permission { .. })] if &**name == "policy"));
     assert_eq!(
         gate(&registry, "a", &mut decided),
-        Err("other denied this call".into())
+        point::Gate::Refuse("other denied this call".into())
     );
 }
 
@@ -262,7 +262,7 @@ fn handlers_merge_in_registration_order() {
     let mut decided = Decided::new();
     assert_eq!(
         gate(&registry, "a", &mut decided),
-        Err("other denied this call".into())
+        point::Gate::Refuse("other denied this call".into())
     );
     let registry = Registry::default()
         .with(&DenyA)
@@ -270,7 +270,7 @@ fn handlers_merge_in_registration_order() {
         .unwrap();
     assert_eq!(
         gate(&registry, "a", &mut decided),
-        Err("policy denied this call".into())
+        point::Gate::Refuse("policy denied this call".into())
     );
 }
 
@@ -338,5 +338,5 @@ fn commands_and_agents_are_found_by_name() {
     let said = registry
         .agent(Some("nope"))
         .step(crate::Input::User { text: "hi".into() });
-    assert_eq!(said, []);
+    assert!(said.is_empty());
 }

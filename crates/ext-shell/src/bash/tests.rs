@@ -393,11 +393,11 @@ fn a_background_command_returns_at_once_with_its_log() {
 fn a_job_end_is_seen_at_once() {
     let rig = rig("job-ends");
     for command in ["sleep 1", "(sleep 1 &); exit 0"] {
-        let mut seen = ext::job::ENDED.count();
+        let mut seen = rig.ends.count();
         let ran = bash(&rig, &json!({ "command": command, "background": true }));
         let pgid = ran.background.unwrap().pgid;
         let started = Instant::now();
-        rt::block_on(ext::job::ENDED.changed(&mut seen));
+        rt::block_on(rig.ends.changed(&mut seen));
         let took = started.elapsed();
         assert!(!sys::Group(pgid).alive(), "{command}");
         // Re-checking on a backoff would first look again at 1.55 s.
@@ -536,7 +536,7 @@ fn the_supervisor_moves_only_as_its_states_allow() {
         (term(Stop::TimedOut), t, cancel, term(Stop::TimedOut), None),
         (
             term(Stop::Aborted),
-            t + Kill::GRACE,
+            t + GRACE,
             seen,
             killed,
             Some(Signal::Kill),
@@ -561,7 +561,7 @@ fn the_supervisor_moves_only_as_its_states_allow() {
         );
     }
     assert_eq!(running.deadline(t), Some(later));
-    assert_eq!(term(Stop::Aborted).deadline(t), Some(t + Kill::GRACE));
+    assert_eq!(term(Stop::Aborted).deadline(t), Some(t + GRACE));
     assert_eq!(killed.deadline(t), None);
     assert_eq!(exited(None).deadline(t), Some(t + IDLE));
 }

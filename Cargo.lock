@@ -614,6 +614,7 @@ dependencies = [
  "rt",
  "serde",
  "serde_json",
+ "smallvec",
  "sys",
 ]
 
@@ -646,6 +647,7 @@ version = "0.0.0"
 dependencies = [
  "ext",
  "protocol",
+ "rt",
  "serde",
  "serde_json",
 ]
@@ -1111,6 +1113,7 @@ dependencies = [
 name = "kernel"
 version = "0.0.0"
 dependencies = [
+ "ext",
  "llm",
  "protocol",
  "serde_json",

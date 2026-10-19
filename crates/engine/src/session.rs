@@ -11,14 +11,14 @@ use std::sync::{Arc, Condvar, Mutex, MutexGuard, OnceLock, PoisonError, Weak};
 use std::task::{Poll, Waker};
 use std::time::{Duration, Instant};
 
-use ext::host::{Decided, Gate, Host, Parts, Registry};
+use ext::host::{Decided, Host, Parts, Registry};
 use ext::point::{Failed, Recover};
-use ext::{Action, Agent, Cancel, Cx, DynTool, Facts, Input, Replay, Route, States};
+use ext::{Action, Agent, Cancel, Cx, DynTool, Facts, Gate, Input, Replay, Route, States};
 use protocol::ledger::{self, Ledger, OutcomeKind, Phase};
 use protocol::view::SessionView;
 use protocol::{
-    Activity, Audience, Body, Cap, Card, DaemonMsg, Decision, Entry, Environment, Frame, Installed,
-    Json, Outcome, Overrides, Residency, SessionId, SessionSummary, WaitOn,
+    Activity, Audience, Body, CallId, Cap, Card, DaemonMsg, Decision, Entry, Environment, Frame,
+    Installed, Json, Outcome, Overrides, Residency, SessionId, SessionSummary, WaitOn,
 };
 use rt::BoxFuture;
 use serde_json::Value;
@@ -1008,14 +1008,17 @@ impl Session {
         }
         let registry = self.registry();
         for action in actions {
-            if let Action::RunTool {
+            if let Action::Call {
+                tool, input, id, ..
+            }
+            | Action::Refuse {
                 tool, input, id, ..
             } = action
             {
                 let call = self.record(Body::ToolCall {
-                    card: card(&registry, &tool, &input),
+                    card: card(&registry, &tool, &input.value()),
                     tool,
-                    input: input.into(),
+                    input,
                     id,
                     by: Audience::Model,
                 });
@@ -1025,6 +1028,7 @@ impl Session {
                     outcome: outcome.clone(),
                     card: None,
                 });
+                let call = id_of(call);
                 drop(agent.step(Input::ToolDone { call, outcome }));
             }
         }
@@ -1036,8 +1040,8 @@ impl Session {
     /// outcome.
     async fn act(&self, action: Action) -> io::Result<Option<Input>> {
         let (call, seq, outcome) = match action {
-            Action::Emit(body) => {
-                self.record(body);
+            Action::Say(text) => {
+                self.record(Body::Assistant { text });
                 return Ok(None);
             }
             Action::CallModel => {
@@ -1055,45 +1059,54 @@ impl Session {
                     .await?;
                 (Call::Model, seq, self.run_model(seq, model, false).await)
             }
-            Action::RunTool {
+            Action::Call { tool, input, id } => self.call(tool, input.value(), id, None).await?,
+            Action::Refuse {
                 tool,
-                mut input,
+                input,
                 id,
-                refuse,
-            } => {
-                let registry = self.registry();
-                let gate = if let Some(error) = refuse {
-                    Err(error)
-                } else {
-                    let mut decided = Decided::new();
-                    let verdict =
-                        registry
-                            .hooks()
-                            .gate(&self.point(), &tool, &mut input, &mut decided);
-                    self.decide(decided).await?;
-                    verdict
-                };
-                let seq = self
-                    .append(Body::ToolCall {
-                        card: card(&registry, &tool, &input),
-                        tool: tool.clone(),
-                        input: Json::new(&input),
-                        id,
-                        by: Audience::Model,
-                    })
-                    .await?;
-                let outcome = match gate {
-                    Ok(Gate::Run) => self.run_tool(seq, &tool, &input).await,
-                    Ok(Gate::Ask) => {
-                        self.append(Body::Ask { call: seq }).await?;
-                        self.ask(seq, &tool, &input).await?
-                    }
-                    Err(error) => Outcome::Failed { error },
-                };
-                (Call::Tool { tool, input }, seq, outcome)
-            }
+                why,
+            } => self.call(tool, input.value(), id, Some(why)).await?,
         };
         self.finish(&call, seq, outcome).await.map(Some)
+    }
+
+    /// Calls `tool` as the gate says, or answers it with `refuse`.
+    async fn call(
+        &self,
+        tool: String,
+        mut input: Value,
+        id: Option<String>,
+        refuse: Option<String>,
+    ) -> io::Result<(Call, u64, Outcome)> {
+        let registry = self.registry();
+        let gate = if let Some(error) = refuse {
+            Gate::Refuse(error)
+        } else {
+            let mut decided = Decided::new();
+            let verdict = registry
+                .hooks()
+                .gate(&self.point(), &tool, &mut input, &mut decided);
+            self.decide(decided).await?;
+            verdict
+        };
+        let seq = self
+            .append(Body::ToolCall {
+                card: card(&registry, &tool, &input),
+                tool: tool.clone(),
+                input: Json::new(&input),
+                id,
+                by: Audience::Model,
+            })
+            .await?;
+        let outcome = match gate {
+            Gate::Run => self.run_tool(seq, &tool, &input).await,
+            Gate::Ask => {
+                self.append(Body::Ask { call: seq }).await?;
+                self.ask(seq, &tool, &input).await?
+            }
+            Gate::Refuse(error) => Outcome::Failed { error },
+        };
+        Ok((Call::Tool { tool, input }, seq, outcome))
     }
 
     /// Waits for the user's answer to the ask for call `seq`, logs it, and
@@ -1174,7 +1187,10 @@ impl Session {
                     call: seq,
                     outcome: outcome.clone(),
                 },
-                Input::ModelDone { call: seq, outcome },
+                Input::ModelDone {
+                    call: id_of(seq),
+                    outcome,
+                },
             ),
             Call::Tool { tool, input } => {
                 let mut decided = Decided::new();
@@ -1201,7 +1217,10 @@ impl Session {
                         outcome: outcome.clone(),
                         card,
                     },
-                    Input::ToolDone { call: seq, outcome },
+                    Input::ToolDone {
+                        call: id_of(seq),
+                        outcome,
+                    },
                 )
             }
         };
@@ -1284,7 +1303,6 @@ impl Session {
             model: self.model_spec().into(),
             spill: Arc::from(self.shared.spill.join(self.id.to_string())),
             cancel: self.turn(),
-            rt: Arc::clone(&self.shared.rt),
         }
         .cx(Arc::new(Effect {
             session,
@@ -1777,6 +1795,17 @@ impl ext::Sessions for Own {
 /// Entries a call records are not waited for: they still commit before
 /// its result.
 impl Host for Effect {
+    fn own(&self, pgid: u32, ended: BoxFuture<'static, ()>) {
+        self.spawned(pgid, true);
+        let daemon = self.session.shared.daemon.clone();
+        self.session.shared.rt.spawn(Box::pin(async move {
+            ended.await;
+            if let Some(daemon) = daemon.upgrade() {
+                daemon.jobs.notify();
+            }
+        }));
+    }
+
     fn spawned(&self, pgid: u32, background: bool) {
         if background {
             lock(&self.session.jobs).push(pgid);
@@ -1825,8 +1854,16 @@ impl Host for Effect {
         if ty == TypeId::of::<dyn ext::Sessions>() {
             return Some(self.sessions.get_or_init(|| own()));
         }
+        if ty == TypeId::of::<dyn rt::Runtime>() {
+            return Some(&self.session.shared.rt);
+        }
         None
     }
+}
+
+/// The call id of entry `seq`.
+fn id_of(seq: u64) -> CallId {
+    CallId::new(seq).expect("an entry's seq is not 0")
 }
 
 /// How clients show a call of `tool` with `input`.

@@ -9,7 +9,7 @@ use ext::host::Registry;
 use ext::{Action, Agent, Input};
 use llm::{Assistant, Message, Messages, ToolMessage, ToolResult};
 use protocol::ledger::Ledger;
-use protocol::{Body, DaemonMsg, Decision, Entry, Outcome, Recap};
+use protocol::{Body, CallId, DaemonMsg, Decision, Entry, Outcome, Recap, Seq};
 
 /// The conversation the model sees, folded from the log's facts as they
 /// commit, so that a model call reads it rather than the log. A model
@@ -162,17 +162,26 @@ impl Replayer {
                 decision: Decision::OnStop { text },
                 ..
             } => Input::User { text: text.clone() },
-            Body::ToolResult { call, outcome, .. } => Input::ToolDone {
-                call: *call,
-                outcome: outcome.clone(),
+            Body::ToolResult { call, outcome, .. } => match CallId::new(*call) {
+                Some(call) => Input::ToolDone {
+                    call,
+                    outcome: outcome.clone(),
+                },
+                None => return,
             },
-            Body::ModelResult { call, outcome } => Input::ModelDone {
-                call: *call,
-                outcome: outcome.clone(),
+            Body::ModelResult { call, outcome } => match CallId::new(*call) {
+                Some(call) => Input::ModelDone {
+                    call,
+                    outcome: outcome.clone(),
+                },
+                None => return,
             },
-            Body::Fired { watch, outcome } => Input::ChildDone {
-                watch: *watch,
-                outcome: outcome.clone(),
+            Body::Fired { watch, outcome } => match Seq::new(*watch) {
+                Some(watch) => Input::ChildDone {
+                    watch,
+                    outcome: outcome.clone(),
+                },
+                None => return,
             },
             Body::Assistant { .. }
             | Body::ToolCall { .. }
@@ -239,8 +248,11 @@ pub fn replay(
 /// Whether `body` is the entry carrying out `action`.
 fn commits(action: &Action, body: &Body) -> bool {
     match (action, body) {
-        (Action::Emit(emitted), body) => emitted == body,
-        (Action::RunTool { tool, .. }, Body::ToolCall { tool: called, .. }) => tool == called,
+        (Action::Say(said), Body::Assistant { text }) => said == text,
+        (
+            Action::Call { tool, .. } | Action::Refuse { tool, .. },
+            Body::ToolCall { tool: called, .. },
+        ) => tool == called,
         (Action::CallModel, Body::ModelCall { .. }) => true,
         _ => false,
     }

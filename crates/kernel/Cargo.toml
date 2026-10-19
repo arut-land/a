@@ -6,8 +6,10 @@ publish.workspace = true
 
 # Sans-IO: nothing here may reach a runtime, the OS or the network, which
 # `tests/invariants.rs` checks of this list and of all it pulls in. `llm`
-# is here for its types (a model call's typed error), not its HTTP client.
+# is here for its types (a model call's typed error), not its HTTP client;
+# `ext` for the contract every extension and agent is written against.
 [dependencies]
+ext.workspace = true
 llm.workspace = true
 protocol.workspace = true
 serde_json.workspace = true

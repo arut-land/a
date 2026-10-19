@@ -1552,7 +1552,7 @@ impl Tool for Held {
             if cx.cancel.is_cancelled() {
                 return Err("stopped".into());
             }
-            cx.rt.sleep(Duration::from_millis(5)).await;
+            rt::Timer::after(Duration::from_millis(5)).await;
         }
         Ok("crimson-harbor".into())
     }

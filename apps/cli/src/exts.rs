@@ -58,7 +58,8 @@ pub fn registry(config: &Config) -> Result<Registry, Refused> {
 mod tests {
     use std::path::Path;
 
-    use ext::host::{Decided, Gate};
+    use ext::Gate;
+    use ext::host::Decided;
     use ext::point::View;
     use ext::{Facts, PointCx, Replay, States};
     use protocol::{Decision, SessionId};
@@ -87,7 +88,7 @@ mod tests {
         }
     }
 
-    fn gate(registry: &Registry, tool: &str, decided: &mut Decided) -> Result<Gate, String> {
+    fn gate(registry: &Registry, tool: &str, decided: &mut Decided) -> Gate {
         let view = Bare;
         let cx = PointCx::new(SessionId::new(), Path::new("/w"), &view);
         registry.hooks().gate(&cx, tool, &mut json!({}), decided)
@@ -119,7 +120,7 @@ mod tests {
         assert_eq!(registry.agents().collect::<Vec<_>>(), [ext_chat::CHAT]);
 
         let mut decided = Decided::new();
-        assert_eq!(gate(&registry, "bash", &mut decided), Ok(Gate::Ask));
+        assert_eq!(gate(&registry, "bash", &mut decided), Gate::Ask);
         assert!(
             matches!(&decided[..], [(name, Decision::Permission { .. })] if &**name == "policy")
         );
@@ -187,7 +188,7 @@ mod tests {
             };
             assert_eq!(rest.context(&facts).is_some(), name != "prompt", "{name}");
             // Only the policy asks.
-            let asks = gate(&rest, "bash", &mut Decided::new()) == Ok(Gate::Ask);
+            let asks = gate(&rest, "bash", &mut Decided::new()) == Gate::Ask;
             assert_eq!(asks, name != "policy", "{name}");
         }
     }

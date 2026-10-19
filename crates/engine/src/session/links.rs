@@ -25,7 +25,7 @@ use crate::{Daemon, Slot, lock};
 
 /// How long an interrupted call waits for its child, interrupted first, to
 /// settle: it hears the child's own account of where it stopped.
-const SETTLING: Duration = ext::Kill::GRACE.saturating_mul(2);
+const SETTLING: Duration = crate::KILL_GRACE.saturating_mul(2);
 
 /// The child call `call` waits on, by its link: the child and its input.
 fn waited_on(ledger: &Ledger, call: u64) -> Option<(u64, SessionId, String)> {
@@ -220,6 +220,9 @@ impl Session {
                         outcome: outcome.clone(),
                     };
                     self.record(fired);
+                    let Some(watch) = Seq::new(watch) else {
+                        return Ok(());
+                    };
                     let inputs = VecDeque::from([Input::ChildDone { watch, outcome }]);
                     self.drive(agent, VecDeque::new(), inputs).await
                 }))

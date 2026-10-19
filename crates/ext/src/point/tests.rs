@@ -293,10 +293,7 @@ fn a_point_with_no_handler_costs_nothing() {
         let mut outcome = Outcome::Interrupted { output: None };
         let mut request = llm::Request::default();
         assert_eq!(hooks.input(&cx, &mut text, &mut decided), Ok(()));
-        assert_eq!(
-            hooks.gate(&cx, "t", &mut subject, &mut decided),
-            Ok(Gate::Run)
-        );
+        assert_eq!(hooks.gate(&cx, "t", &mut subject, &mut decided), Gate::Run);
         hooks.prepare_step(&cx, 1, &mut request, &mut decided);
         let error = llm::Error::new(llm::Kind::Server, "e");
         let failed = Failed {
@@ -339,7 +336,7 @@ fn gate_logs_what_the_chain_and_the_policy_decided() {
         (verdict, input, decided)
     };
     let (verdict, input, decided) = gate(&hooks(vec![one("a", bump), one("b", bump)]));
-    assert_eq!((verdict, input), (Ok(Gate::Run), json!({ "n": 2 })));
+    assert_eq!((verdict, input), (Gate::Run, json!({ "n": 2 })));
     assert_eq!(names(&decided), ["a", "b"]);
     assert!(
         matches!(&decided[1].1, Decision::PreTool { input, .. } if input.value() == json!({ "n": 2 }))
@@ -352,7 +349,7 @@ fn gate_logs_what_the_chain_and_the_policy_decided() {
         }),
     ]);
     let (verdict, _, decided) = gate(&blocked);
-    assert_eq!(verdict, Err("no".into()));
+    assert_eq!(verdict, Gate::Refuse("no".into()));
     assert!(
         matches!(&decided[..], [(_, Decision::PreTool { .. }), (b, Decision::Block { .. })] if &**b == "b")
     );
@@ -368,7 +365,7 @@ fn gate_logs_what_the_chain_and_the_policy_decided() {
         ])
     };
     let (approved, _, decided) = gate(&asks(Some(true)));
-    assert_eq!(approved, Ok(Gate::Run));
+    assert_eq!(approved, Gate::Run);
     assert!(matches!(
         &decided[..],
         [
@@ -378,14 +375,20 @@ fn gate_logs_what_the_chain_and_the_policy_decided() {
     ));
     assert_eq!(names(&decided), ["policy", "approver"]);
     let (refused, _, _) = gate(&asks(Some(false)));
-    assert_eq!(refused, Err("approver did not approve this call".into()));
+    assert_eq!(
+        refused,
+        Gate::Refuse("approver did not approve this call".into())
+    );
     let (unanswered, _, decided) = gate(&asks(None));
-    assert_eq!(unanswered, Ok(Gate::Ask));
+    assert_eq!(unanswered, Gate::Ask);
     assert_eq!(names(&decided), ["policy"]);
     let denies = hooks(vec![one("strict", |r| {
         r.on::<Permission>(|_, _| Level::Deny);
     })]);
-    assert_eq!(gate(&denies).0, Err("strict denied this call".into()));
+    assert_eq!(
+        gate(&denies).0,
+        Gate::Refuse("strict denied this call".into())
+    );
 }
 
 #[test]
@@ -461,10 +464,10 @@ fn erased_handlers_answer_in_json_and_a_policy_that_cannot_be_read_denies() {
     let mut input = json!({});
     let mut decided = Decided::new();
     let gate = set.gate(&cx, "bash", &mut input, &mut decided);
-    assert_eq!((gate, input), (Ok(Gate::Ask), json!({ "tool": "bash" })));
+    assert_eq!((gate, input), (Gate::Ask, json!({ "tool": "bash" })));
     let mut input = json!({});
     let gate = set.gate(&cx, "edit", &mut input, &mut decided);
-    assert_eq!(gate, Err("lua denied this call".into()));
+    assert_eq!(gate, Gate::Refuse("lua denied this call".into()));
 
     let mut r = Registrar::default();
     r.on_erased("spawn", Arc::new(Json(|_| Value::Null)));

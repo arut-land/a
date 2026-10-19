@@ -173,6 +173,8 @@ struct Daemon {
     clients: AtomicUsize,
     /// Wakes the supervisor when what it decides on may have changed.
     pulse: Pulse,
+    /// Notified each time a process group a session owns ends.
+    jobs: rt::Notify,
     /// The connections watching the session list, and the list as they
     /// were last sent it.
     watchers: Mutex<(Vec<Outbox>, Vec<SessionSummary>)>,
@@ -322,6 +324,7 @@ impl Daemon {
             slots: Mutex::new(slots),
             clients: AtomicUsize::new(0),
             pulse: Pulse::default(),
+            jobs: rt::Notify::default(),
             watchers: Mutex::default(),
             stopping: AtomicBool::new(false),
             started: std::time::SystemTime::now()
@@ -567,7 +570,7 @@ impl Daemon {
         let mut stopped: Option<Instant> = None;
         let mut awake: Option<Option<sys::Awake>> = None;
         let mut pulsed = self.pulse.0.count();
-        let mut jobs = ext::job::ENDED.count();
+        let mut jobs = self.jobs.count();
         loop {
             let now = Instant::now();
             event(|| rt::Event {
@@ -600,7 +603,7 @@ impl Daemon {
                 }
                 // A stopped call gets the time its processes have to go
                 // and its outcome to commit.
-                let settled = stopped.map(|at| at + ext::Kill::GRACE * 2);
+                let settled = stopped.map(|at| at + KILL_GRACE * 2);
                 if !self.has_work() || settled.is_some_and(|at| now >= at) {
                     exit.now(self, "drained for a newer build").await;
                 }
@@ -623,7 +626,7 @@ impl Daemon {
                     .sleep(at.saturating_duration_since(Instant::now()))
             });
             let mut pulse = pin!(self.pulse.0.changed(&mut pulsed));
-            let mut ended = pin!(ext::job::ENDED.changed(&mut jobs));
+            let mut ended = pin!(self.jobs.changed(&mut jobs));
             let woken = poll_fn(|cx| {
                 if pulse.as_mut().poll(cx).is_ready() {
                     return Poll::Ready(true);
@@ -651,7 +654,11 @@ fn earliest(a: Option<Instant>, b: Instant) -> Instant {
 
 /// How long stopping the daemon waits for its sessions' actors to end:
 /// time for a stopped call's processes to go and its outcome to commit.
-const STOP_GRACE: Duration = ext::Kill::GRACE.saturating_mul(2);
+const STOP_GRACE: Duration = KILL_GRACE.saturating_mul(2);
+
+/// How long a stopped call's processes have between SIGTERM and SIGKILL,
+/// as the shell gives them.
+const KILL_GRACE: Duration = Duration::from_secs(3);
 
 /// The daemon, as its owner holds it: dropping it stops every session and
 /// waits for their actors, so no writer outlives it. Every other holder

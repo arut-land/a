@@ -20,8 +20,8 @@ use std::future::Future;
 use std::path::Path;
 use std::sync::Arc;
 
+use crate::BoxFuture;
 use protocol::Outcome;
-use rt::BoxFuture;
 use serde_json::Value;
 
 use crate::point::{ERASED, ErasedHandler, Handler, Hooked, Point, PointCx};

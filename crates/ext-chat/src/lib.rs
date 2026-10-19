@@ -1,7 +1,7 @@
 //! `chat`: the model-backed agent loop.
 
-use ext::{Action, Agent, Extension, Input, Registrar};
-use protocol::Outcome;
+use ext::{Action, Actions, Agent, Extension, Input, Registrar};
+use protocol::{Json, Outcome};
 use serde_json::Value;
 
 /// The agent's name.
@@ -34,35 +34,42 @@ pub struct Loop {
 }
 
 impl Agent for Loop {
-    fn step(&mut self, input: Input) -> Vec<Action> {
+    fn step(&mut self, input: Input) -> Actions {
         match input {
             // A child interrupted with its owner hands back nothing to go
             // on with.
             Input::ChildDone {
                 outcome: Outcome::Interrupted { .. },
                 ..
-            } => Vec::new(),
+            } => Actions::new(),
             // A child's result arrives between turns, so it starts one.
             Input::User { .. } | Input::ChildDone { .. } => {
                 (self.steps, self.pending) = (1, 0);
-                vec![Action::CallModel]
+                Actions::from_elem(Action::CallModel, 1)
             }
             Input::ModelDone {
                 outcome: Outcome::Done { output },
                 ..
             } => {
                 let Ok(reply) = llm::Response::from_value(&output.value()) else {
-                    return Vec::new();
+                    return Actions::new();
                 };
                 let limited = self.steps >= MAX_STEPS;
-                let actions: Vec<Action> = reply
+                let actions: Actions = reply
                     .message
                     .tool_calls()
-                    .map(|call| Action::RunTool {
-                        tool: call.name.to_string(),
-                        input: Value::Object(call.input.clone()),
-                        id: Some(call.id.to_string()),
-                        refuse: refusal(call, limited),
+                    .map(|call| {
+                        let (tool, id) = (call.name.to_string(), Some(call.id.to_string()));
+                        let input = Json::new(&Value::Object(call.input.clone()));
+                        match refusal(call, limited) {
+                            Some(why) => Action::Refuse {
+                                tool,
+                                input,
+                                id,
+                                why,
+                            },
+                            None => Action::Call { tool, input, id },
+                        }
                     })
                     .collect();
                 self.pending = actions.len();
@@ -71,12 +78,12 @@ impl Agent for Loop {
             Input::ToolDone { .. } if self.pending > 0 => {
                 self.pending -= 1;
                 if self.pending > 0 || self.steps >= MAX_STEPS {
-                    return Vec::new();
+                    return Actions::new();
                 }
                 self.steps += 1;
-                vec![Action::CallModel]
+                Actions::from_elem(Action::CallModel, 1)
             }
-            Input::ToolDone { .. } | Input::ModelDone { .. } => Vec::new(),
+            Input::ToolDone { .. } | Input::ModelDone { .. } => Actions::new(),
         }
     }
 }
@@ -106,14 +113,14 @@ mod tests {
     #[test]
     fn chat_hears_a_childs_result() {
         let done = |output: Value| Input::ChildDone {
-            watch: 3,
+            watch: protocol::Seq::new(3).unwrap(),
             outcome: Outcome::Done {
                 output: output.into(),
             },
         };
         let mut chat = Loop::default();
-        assert_eq!(chat.step(done("hi".into())), [Action::CallModel]);
-        assert_eq!(chat.step(reply(&[])), NOTHING);
+        assert_eq!(chat.step(done("hi".into()))[..], [Action::CallModel]);
+        assert_eq!(chat.step(reply(&[]))[..], NOTHING);
     }
 
     /// A model reply holding `calls`, as the engine stores it.
@@ -144,16 +151,20 @@ mod tests {
             meta: llm::Meta::new(),
         };
         Input::ModelDone {
-            call: 0,
+            call: call(),
             outcome: Outcome::Done {
                 output: serde_json::to_value(response).unwrap().into(),
             },
         }
     }
 
+    fn call() -> protocol::CallId {
+        protocol::CallId::new(1).unwrap()
+    }
+
     fn done() -> Input {
         Input::ToolDone {
-            call: 0,
+            call: call(),
             outcome: Outcome::Interrupted { output: None },
         }
     }
@@ -163,21 +174,22 @@ mod tests {
     #[test]
     fn chat_calls_the_model_again_once_every_call_is_answered() {
         let mut chat = Loop::default();
-        assert_eq!(chat.step(user("hi")), [Action::CallModel]);
+        assert_eq!(chat.step(user("hi"))[..], [Action::CallModel]);
         let calls = chat.step(reply(&[("a", None), ("b", Some("{\"sec"))]));
         let ids: Vec<_> = calls
             .iter()
             .map(|action| match action {
-                Action::RunTool { id, refuse, .. } => (id.as_deref(), refuse.is_some()),
+                Action::Call { id, .. } => (id.as_deref(), false),
+                Action::Refuse { id, .. } => (id.as_deref(), true),
                 other => panic!("{other:?}"),
             })
             .collect();
         assert_eq!(ids, [(Some("a"), false), (Some("b"), true)]);
-        assert_eq!(chat.step(done()), NOTHING);
-        assert_eq!(chat.step(done()), [Action::CallModel]);
-        assert_eq!(chat.step(reply(&[])), NOTHING);
+        assert_eq!(chat.step(done())[..], NOTHING);
+        assert_eq!(chat.step(done())[..], [Action::CallModel]);
+        assert_eq!(chat.step(reply(&[]))[..], NOTHING);
         // A stray result, as an odd log might hold, changes nothing.
-        assert_eq!(chat.step(done()), NOTHING);
+        assert_eq!(chat.step(done())[..], NOTHING);
     }
 
     #[test]
@@ -186,12 +198,10 @@ mod tests {
         chat.step(user("hi"));
         for _ in 1..MAX_STEPS {
             assert_eq!(chat.step(reply(&[("a", None)])).len(), 1);
-            assert_eq!(chat.step(done()), [Action::CallModel]);
+            assert_eq!(chat.step(done())[..], [Action::CallModel]);
         }
         let last = chat.step(reply(&[("a", None)]));
-        assert!(
-            matches!(&last[..], [Action::RunTool { refuse: Some(why), .. }] if why.contains("limit"))
-        );
-        assert_eq!(chat.step(done()), NOTHING);
+        assert!(matches!(&last[..], [Action::Refuse { why, .. }] if why.contains("limit")));
+        assert_eq!(chat.step(done())[..], NOTHING);
     }
 }
