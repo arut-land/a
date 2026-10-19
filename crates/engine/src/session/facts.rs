@@ -26,8 +26,6 @@ pub struct Transcript {
     calls: HashMap<u64, (String, String)>,
     /// The seq of the last entry that changed the messages.
     last: u64,
-    /// The answer of the current turn's last reply, as a recap tells it.
-    reply: Option<String>,
     registry: Arc<Registry>,
 }
 
@@ -38,7 +36,6 @@ impl Transcript {
             context: 0,
             calls: HashMap::new(),
             last: 0,
-            reply: None,
             registry,
         }
     }
@@ -59,19 +56,13 @@ impl Transcript {
     /// just had, which `e` stores: taken as it is rather than read again.
     pub fn apply(&mut self, e: &Entry, fresh: Option<Assistant>) {
         let message = match &e.body {
-            Body::User { text } => {
-                self.reply = None;
-                Message::user(text.clone())
-            }
-            Body::Steer { text, .. }
+            Body::User { text }
+            | Body::Steer { text, .. }
             | Body::Hook {
                 decision: Decision::OnStop { text },
                 ..
             } => Message::user(text.clone()),
-            Body::Assistant { text } => {
-                self.reply = Some(text.clone());
-                Message::assistant(text.clone())
-            }
+            Body::Assistant { text } => Message::assistant(text.clone()),
             Body::Context { text } => {
                 self.messages
                     .insert(self.context, Message::user(text.clone()));
@@ -89,13 +80,7 @@ impl Transcript {
                     None => llm::Response::from_value(&output.value()).map(|r| r.message),
                 };
                 match reply {
-                    Ok(message) => {
-                        let text = message.text();
-                        if !text.is_empty() {
-                            self.reply = Some(text);
-                        }
-                        Message::Assistant(message)
-                    }
+                    Ok(message) => Message::Assistant(message),
                     // A reply an earlier version logged as bare text.
                     Err(_) => match output.value()["text"].as_str() {
                         Some(text) => Message::assistant(text),
@@ -149,20 +134,18 @@ impl Transcript {
     pub fn into_messages(self) -> Vec<Message> {
         self.messages
     }
-
-    /// The answer of the current turn's last reply.
-    pub fn reply(&self) -> Option<&str> {
-        self.reply.as_deref()
-    }
 }
 
-/// Steps a fresh `agent` through every input the log records, so it is in
-/// the state it was in when the log was written. Returns what it asked for
-/// that the log does not show: the daemon stopped between an outcome and the
-/// intents it led to.
-pub fn replay(agent: &mut dyn Agent, entries: &[Entry]) -> VecDeque<Action> {
-    let mut asked = VecDeque::new();
-    for e in entries {
+/// Steps a fresh agent through every input the log records, an entry at a
+/// time, so it is in the state it was in when the log was written. What it
+/// asked for that the log does not show is left over: the daemon stopped
+/// between an outcome and the intents it led to.
+#[derive(Default)]
+pub struct Replayer(VecDeque<Action>);
+
+impl Replayer {
+    pub fn apply(&mut self, agent: &mut dyn Agent, e: &Entry) {
+        let asked = &mut self.0;
         let input = match &e.body {
             Body::User { text }
             | Body::Hook {
@@ -192,12 +175,12 @@ pub fn replay(agent: &mut dyn Agent, entries: &[Entry]) -> VecDeque<Action> {
                 } else {
                     asked.clear();
                 }
-                continue;
+                return;
             }
             // The turn was cut short: what it asked for is not done.
             Body::Interrupt => {
                 asked.clear();
-                continue;
+                return;
             }
             // Read by the model, not stepped through the agent.
             Body::Steer { .. }
@@ -213,11 +196,27 @@ pub fn replay(agent: &mut dyn Agent, entries: &[Entry]) -> VecDeque<Action> {
             | Body::Ext { .. }
             | Body::Context { .. }
             | Body::Command { .. }
-            | Body::CommandResult { .. } => continue,
+            | Body::CommandResult { .. } => return,
         };
         asked.extend(agent.step(input));
     }
-    asked
+
+    /// What the agent asked for that the log does not show.
+    pub fn into_actions(self) -> VecDeque<Action> {
+        self.0
+    }
+}
+
+/// [`Replayer`] over `entries`.
+pub fn replay(
+    agent: &mut dyn Agent,
+    entries: impl IntoIterator<Item = impl Borrow<Entry>>,
+) -> VecDeque<Action> {
+    let mut replay = Replayer::default();
+    for e in entries {
+        replay.apply(agent, e.borrow());
+    }
+    replay.into_actions()
 }
 
 /// Whether `body` is the entry carrying out `action`.
@@ -258,6 +257,30 @@ pub fn recap(ledger: &Ledger, reply: Option<&str>, since: u64) -> Option<Recap> 
         asks: u32::try_from(ledger.inbox().len()).unwrap_or(u32::MAX),
     };
     (recap != Recap::default()).then_some(recap)
+}
+
+/// The answer of the last reply among `entries`, as a recap tells it: an
+/// assistant message, or a model reply with text.
+pub fn reply(entries: impl IntoIterator<Item = impl Borrow<Entry>>) -> Option<String> {
+    let mut reply = None;
+    for e in entries {
+        match &e.borrow().body {
+            Body::Assistant { text } => reply = Some(text.clone()),
+            Body::ModelResult {
+                outcome: Outcome::Done { output },
+                ..
+            } => {
+                let text = llm::Response::from_value(&output.value()).map(|r| r.message.text());
+                if let Ok(text) = text
+                    && !text.is_empty()
+                {
+                    reply = Some(text);
+                }
+            }
+            _ => {}
+        }
+    }
+    reply
 }
 
 /// The first line of `text`, cut to a recap's width.

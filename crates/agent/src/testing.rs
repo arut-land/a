@@ -108,7 +108,7 @@ impl Rig {
     /// As after a restart: state rebuilt from the log alone.
     pub fn restart(&self) {
         let mut states = self.registry.states();
-        states.replay(&lock(&self.log));
+        states.replay(lock(&self.log).iter());
         *lock(&self.states) = states;
     }
 }

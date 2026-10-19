@@ -8,7 +8,7 @@
 use std::collections::VecDeque;
 use std::sync::{Arc, Condvar, Mutex, PoisonError, RwLock};
 
-use protocol::{Caps, Class, Frame};
+use protocol::{Caps, Class, Decode, Entry, Frame};
 
 use crate::lock;
 
@@ -36,6 +36,19 @@ impl FrameLog {
             .push(frame);
     }
 
+    /// The entries after `seq`, decoded again from their frames, in order:
+    /// for what reads the log rarely, such as recovery after a failure.
+    pub fn entries_after(&self, seq: u64) -> impl Iterator<Item = Entry> + '_ {
+        (seq + 1..=self.seq()).filter_map(|seq| {
+            let frame = self.get(seq)?.ok()?;
+            Entry::from_json(&frame.as_bytes()[4..]).ok()
+        })
+    }
+
+    pub fn entries(&self) -> impl Iterator<Item = Entry> + '_ {
+        self.entries_after(0)
+    }
+
     /// Entry `seq`'s frame, if it is committed.
     fn get(&self, seq: u64) -> Option<Result<Frame, TooLarge>> {
         let at = usize::try_from(seq.checked_sub(1)?).ok()?;
@@ -46,6 +59,12 @@ impl FrameLog {
 
     fn read(&self) -> std::sync::RwLockReadGuard<'_, Vec<Option<Frame>>> {
         self.0.read().unwrap_or_else(PoisonError::into_inner)
+    }
+}
+
+impl agent::History for FrameLog {
+    fn entries(&self) -> Box<dyn Iterator<Item = Entry> + '_> {
+        Box::new(self.entries_after(0))
     }
 }
 
@@ -255,7 +274,7 @@ impl Queue {
 
 #[cfg(test)]
 mod tests {
-    use protocol::{Body, DaemonMsg, Entry};
+    use protocol::{Body, DaemonMsg};
 
     use super::*;
 

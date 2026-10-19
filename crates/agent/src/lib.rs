@@ -24,7 +24,7 @@ pub use ext::{
     Command, Current, DynCommand, Extension, Facts, Refused, Registrar, Registry, Section, Slot,
     Tier,
 };
-pub use hooks::{AskFor, Decided, Gate, Hook, Hooks, Pre, Said, Spawn};
+pub use hooks::{AskFor, Decided, Gate, History, Hook, Hooks, Pre, Said, Spawn};
 pub use state::{Cwd, State, States};
 pub use tool::{Cancel, Cx, DynTool, Host, Kill, Replay, Route, Tool, Toolset, session_dir};
 

@@ -2,6 +2,7 @@
 //! survives a restart as the rest of the log does.
 
 use std::any::{Any, TypeId};
+use std::borrow::Borrow;
 use std::path::{Path, PathBuf};
 
 use protocol::{Body, Entry};
@@ -82,12 +83,17 @@ impl States {
         }
     }
 
+    /// Folds the change `e` records, if any.
+    pub fn apply(&mut self, e: &Entry) {
+        if let Body::Ext { ext, state, data } = &e.body {
+            self.fold(ext, state, &data.value());
+        }
+    }
+
     /// Folds every change `entries` record.
-    pub fn replay(&mut self, entries: &[Entry]) {
+    pub fn replay(&mut self, entries: impl IntoIterator<Item = impl Borrow<Entry>>) {
         for e in entries {
-            if let Body::Ext { ext, state, data } = &e.body {
-                self.fold(ext, state, &data.value());
-            }
+            self.apply(e.borrow());
         }
     }
 }

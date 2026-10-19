@@ -100,7 +100,7 @@ pub fn check(entries: &[Entry], ledger: &Ledger) {
     assert_eq!(hooks, trailing_hooks(entries), "trailing hooks");
     for since in [0, ledger.seq().saturating_sub(1), ledger.seq()] {
         let after = entries.partition_point(|e| e.seq <= ledger.turn_start());
-        let reply = reply(&entries[after..]);
+        let reply = facts::reply(&entries[after..]);
         assert_eq!(
             facts::recap(ledger, reply.as_deref(), since),
             recap(entries, since),
@@ -501,28 +501,4 @@ pub fn transcript(entries: &[Entry], before: u64, tools: &Toolset) -> Vec<Messag
         }
     }
     messages
-}
-
-/// The answer of the last reply among `entries`, as a recap tells it: an
-/// assistant message, or a model reply with text.
-pub fn reply(entries: &[Entry]) -> Option<String> {
-    let mut reply = None;
-    for e in entries {
-        match &e.body {
-            Body::Assistant { text } => reply = Some(text.clone()),
-            Body::ModelResult {
-                outcome: Outcome::Done { output },
-                ..
-            } => {
-                let text = llm::Response::from_value(&output.value()).map(|r| r.message.text());
-                if let Ok(text) = text
-                    && !text.is_empty()
-                {
-                    reply = Some(text);
-                }
-            }
-            _ => {}
-        }
-    }
-    reply
 }

@@ -33,7 +33,7 @@ fn untaken(entries: &[Entry]) -> Vec<ledger::Queued> {
 fn recap_of(entries: &[Entry], since: u64) -> Option<protocol::Recap> {
     let ledger = Ledger::of(entries);
     let after = entries.partition_point(|e| e.seq <= ledger.turn_start());
-    recap(&ledger, oracle::reply(&entries[after..]).as_deref(), since)
+    recap(&ledger, facts::reply(&entries[after..]).as_deref(), since)
 }
 
 /// The conversation before `before`, as `registry`'s tools present it.
@@ -368,7 +368,7 @@ fn settle(session: &Session) {
 }
 
 fn log_of(session: &Session) -> Vec<Entry> {
-    session.lock().entries.clone()
+    session.frames.entries().collect()
 }
 
 #[test]
@@ -654,8 +654,8 @@ impl Hook for Strict {
         }
     }
 
-    fn on_stop(&self, entries: &[Entry]) -> Option<String> {
-        let continued = entries.iter().any(|e| {
+    fn on_stop(&self, history: &dyn agent::History) -> Option<String> {
+        let continued = history.entries().any(|e| {
             matches!(
                 e.body,
                 Body::Hook {

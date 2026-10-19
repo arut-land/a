@@ -35,7 +35,7 @@ mod oracle;
 #[cfg(test)]
 mod tests;
 
-use facts::{Transcript, ask, recap, replay};
+use facts::{Replayer, Transcript, ask, recap, replay};
 
 /// What every session runs with.
 pub struct Shared {
@@ -103,7 +103,7 @@ pub struct Session {
     cancel: Mutex<Cancel>,
     /// The message of the reply model call `.0` just had, until its result
     /// commits.
-    fresh: Mutex<Option<(u64, llm::Assistant)>>,
+    replied: Mutex<Option<(u64, llm::Assistant)>>,
     /// Background process groups the session owns, until it ends.
     jobs: Mutex<Vec<u32>>,
     shared: Arc<Shared>,
@@ -122,11 +122,14 @@ enum Msg {
 }
 
 struct State {
+    /// The entries, for the oracles that check what is folded from them.
+    #[cfg(test)]
     entries: Vec<Entry>,
     /// What the entries say, folded as each commits.
     ledger: Ledger,
-    /// The conversation the model sees, folded as each entry commits.
-    transcript: Transcript,
+    /// The conversation the model sees, made at the first model call and
+    /// folded as each entry commits from then on.
+    transcript: Option<Transcript>,
     /// The clients following the session.
     clients: Vec<Outbox>,
     /// The last snapshot made, and the seq it is at; `None` for one too
@@ -210,44 +213,69 @@ impl Session {
     /// one logged: a child runs in its parent's, secrets included.
     fn start_in(
         header: Header,
-        mut loaded: Loaded,
+        loaded: Loaded,
         shared: Arc<Shared>,
         env: Option<Environment>,
     ) -> Arc<Self> {
         let registry = shared.registry.get();
-        let mut ledger = Ledger::of(&loaded.entries);
-        if let Err(e) = note_extensions(&header, &mut loaded, &mut ledger, &registry) {
-            eprintln!("session {}: recording extensions: {e}", header.id.short());
+        let Loaded {
+            entries,
+            mut log,
+            epoch,
+        } = loaded;
+        let kind = shared.models.settings.agent(&header.workspace);
+        let mut load = Load {
+            ledger: Ledger::default(),
+            frames: FrameLog::default(),
+            states: registry.states(),
+            replay: Replayer::default(),
+            agent: kind.agent(),
+            #[cfg(test)]
+            entries: Vec::new(),
+        };
+        for e in entries {
+            load.fold(&e);
         }
+        if let Some(body) = note_extensions(&header, &load.ledger, &registry) {
+            let e = Entry::new(load.frames.seq() + 1, epoch, body);
+            match log.append(&e) {
+                Ok(()) => load.fold(&e),
+                Err(e) => eprintln!("session {}: recording extensions: {e}", header.id.short()),
+            }
+        }
+        let Load {
+            ledger,
+            frames,
+            states,
+            replay,
+            agent,
+            #[cfg(test)]
+                entries: all,
+        } = load;
+        let seq = frames.seq();
+        // A new session has nothing to recover.
+        let recover = (seq > 0).then(|| replay.into_actions());
+        let fresh = recover.is_none();
         let (mailbox, rx) = rt::channel::unbounded();
         let armed = ledger.armed().count();
-        // A new session has nothing to recover.
-        let fresh = loaded.entries.is_empty();
         let env = env.or_else(|| ledger.env().cloned());
-        let seq = loaded.entries.len() as u64;
-        let frames = FrameLog::default();
-        for e in &loaded.entries {
-            frames.push(Frame::entry(e).ok());
-        }
-        let transcript = Transcript::of(&loaded.entries, Arc::clone(&registry));
-        let mut states = registry.states();
-        states.replay(&loaded.entries);
         let session = Arc::new_cyclic(|this| Self {
             this: this.clone(),
             id: header.id,
             workspace: header.workspace,
             parent: header.parent,
-            epoch: loaded.epoch,
+            epoch,
             step: Mutex::new(Arc::clone(&registry)),
             state: Mutex::new(State {
-                entries: loaded.entries,
+                #[cfg(test)]
+                entries: all,
                 ledger,
-                transcript,
+                transcript: None,
                 clients: Vec::new(),
                 snapshot: None,
             }),
             frames: Arc::new(frames),
-            log: Mutex::new(loaded.log),
+            log: Mutex::new(log),
             queue: Mutex::new(Queue {
                 next: seq,
                 ..Queue::default()
@@ -264,16 +292,15 @@ impl Session {
             env: Mutex::new(env),
             states: Mutex::new(states),
             cancel: Mutex::default(),
-            fresh: Mutex::default(),
+            replied: Mutex::default(),
             jobs: Mutex::default(),
             shared,
         });
         registry.hooks().session_start(session.id);
         let actor = Arc::clone(&session);
-        session
-            .shared
-            .rt
-            .spawn(Box::pin(async move { actor.run(&rx, fresh).await }));
+        session.shared.rt.spawn(Box::pin(async move {
+            actor.run(&rx, kind, agent, recover).await;
+        }));
         session
     }
 
@@ -453,7 +480,8 @@ impl Session {
         frames.extend(snapshot.map(|frame| (seq, frame)));
         let mut push = |msg: &DaemonMsg| frames.extend(Frame::new(msg).ok().map(|f| (seq, f)));
         push(&DaemonMsg::Synced { seq });
-        if let Some(recap) = recap(&st.ledger, st.transcript.reply(), since) {
+        let reply = facts::reply(self.frames.entries_after(st.ledger.turn_start()));
+        if let Some(recap) = recap(&st.ledger, reply.as_deref(), since) {
             push(&DaemonMsg::Recap(recap));
         }
         for &call in st.ledger.inbox() {
@@ -474,7 +502,7 @@ impl Session {
         {
             return frame.clone();
         }
-        let view = SessionView::from_log(self.id, self.workspace.clone(), &st.entries);
+        let view = SessionView::from_log(self.id, self.workspace.clone(), self.frames.entries());
         let frame = Frame::new(&DaemonMsg::Snapshot(Box::new(view))).ok();
         st.snapshot = Some((seq, frame.clone()));
         frame
@@ -605,7 +633,7 @@ impl Session {
             let result = catch_unwind(AssertUnwindSafe(|| self.commit(&mut batch)))
                 .unwrap_or_else(|_| Err(io::Error::other("committing entries panicked")));
             batch.clear();
-            let committed = self.lock().entries.len() as u64;
+            let committed = self.frames.seq();
             if let Err(e) = &result {
                 let mut queue = lock(&self.queue);
                 queue.pending.clear();
@@ -634,21 +662,22 @@ impl Session {
         let registry = self.registry();
         let hooks = registry.hooks();
         let mut st = self.lock();
+        // Made again, when next asked for, on other tools.
+        st.transcript = st.transcript.take().filter(|t| t.is_on(&registry));
         for (entry, frame) in batch.drain(..).zip(frames) {
             debug_assert_eq!(entry.seq, self.frames.seq() + 1);
             self.frames.push(frame);
             hooks.observe(&entry);
             st.ledger.apply(&entry);
-            let fresh = match &entry.body {
-                Body::ModelResult { call, .. } => lock(&self.fresh)
+            let replied = match &entry.body {
+                Body::ModelResult { call, .. } => lock(&self.replied)
                     .take_if(|(of, _)| of == call)
                     .map(|(_, message)| message),
                 _ => None,
             };
-            if !st.transcript.is_on(&registry) {
-                st.transcript = Transcript::of(&st.entries, Arc::clone(&registry));
+            if let Some(transcript) = &mut st.transcript {
+                transcript.apply(&entry, replied);
             }
-            st.transcript.apply(&entry, fresh);
             // Under the same lock as the entry, so a client attaching
             // meanwhile gets the ask exactly once.
             if let Body::Ask { call } = entry.body
@@ -657,6 +686,7 @@ impl Session {
                 st.clients
                     .retain(|c| c.send_after(entry.seq, frame.clone()).is_ok());
             }
+            #[cfg(test)]
             st.entries.push(entry);
         }
         st.clients.retain(|c| c.wake().is_ok());
@@ -707,17 +737,25 @@ impl Session {
     /// An agent may step past entries that then fail to commit; after a
     /// failed unit of work it is rebuilt from the log. Each unit's future is
     /// boxed, so an idle session's actor holds only what waiting takes.
-    async fn run(&self, mailbox: &rt::channel::Receiver<Msg>, fresh: bool) {
-        let kind = self.shared.models.settings.agent(&self.workspace);
-        let mut agent = kind.agent();
-        let mut ok = fresh || Box::pin(self.work(Box::pin(self.recover(agent.as_mut())))).await;
+    /// `recover` is what `agent`, stepped through the log, asked for that
+    /// the log does not show; `None` for a new session.
+    async fn run(
+        &self,
+        mailbox: &rt::channel::Receiver<Msg>,
+        kind: agent::Kind,
+        mut agent: Box<dyn Agent>,
+        recover: Option<VecDeque<Action>>,
+    ) {
+        let mut ok = match recover {
+            Some(asked) => Box::pin(self.work(Box::pin(self.recover(agent.as_mut(), asked)))).await,
+            None => true,
+        };
         loop {
             if !ok {
                 agent = kind.agent();
-                let st = self.lock();
-                replay(agent.as_mut(), &st.entries);
+                replay(agent.as_mut(), self.frames.entries());
                 let mut states = self.registry().states();
-                states.replay(&st.entries);
+                states.replay(self.frames.entries());
                 *lock(&self.states) = states;
             }
             ok = match mailbox.recv().await {
@@ -853,10 +891,7 @@ impl Session {
             }
             self.flush().await?;
             let mut decided = Decided::new();
-            let next = self
-                .registry()
-                .hooks()
-                .on_stop(&self.lock().entries, &mut decided);
+            let next = self.registry().hooks().on_stop(&*self.frames, &mut decided);
             self.decide(decided).await?;
             match next {
                 Some(text) => inputs.push_back(Input::User { text }),
@@ -1306,13 +1341,14 @@ impl Session {
     /// after entries it does not see.
     fn history(&self, call: u64, registry: &Arc<Registry>) -> Vec<llm::Message> {
         let mut st = self.lock();
-        if !st.transcript.is_on(registry) {
-            st.transcript = Transcript::of(&st.entries, Arc::clone(registry));
-        }
-        let history = if let Some(messages) = st.transcript.before(call) {
+        st.transcript = st.transcript.take().filter(|t| t.is_on(registry));
+        let transcript = st
+            .transcript
+            .get_or_insert_with(|| Transcript::of(self.frames.entries(), Arc::clone(registry)));
+        let history = if let Some(messages) = transcript.before(call) {
             messages.to_vec()
         } else {
-            let before = st.entries.iter().take_while(|e| e.seq < call);
+            let before = self.frames.entries().take_while(|e| e.seq < call);
             Transcript::of(before, Arc::clone(registry)).into_messages()
         };
         #[cfg(test)]
@@ -1345,7 +1381,7 @@ impl Session {
                 Ok(reply) => {
                     return match serde_json::to_value(&reply) {
                         Ok(output) => {
-                            *lock(&self.fresh) = Some((call, reply.message));
+                            *lock(&self.replied) = Some((call, reply.message));
                             Outcome::Done {
                                 output: output.into(),
                             }
@@ -1386,14 +1422,13 @@ impl Session {
     /// waiting asked again); then whatever the agent asked for that the log
     /// does not show runs, and the input still queued is taken up. A child
     /// whose owner is gone is an orphan: nothing of its turn runs again.
-    async fn recover(&self, agent: &mut dyn Agent) -> io::Result<()> {
+    async fn recover(&self, agent: &mut dyn Agent, actions: VecDeque<Action>) -> io::Result<()> {
         self.relink().await?;
-        let (dangling, actions, commands, jobs) = {
+        let (dangling, commands, jobs) = {
             let st = self.lock();
             let boot = sys::boot_id();
             (
                 dangling_calls(&st.ledger),
-                replay(agent, &st.entries),
                 st.ledger.open_commands().collect::<Vec<_>>(),
                 st.ledger
                     .background()
@@ -1516,6 +1551,30 @@ impl Session {
     }
 }
 
+/// What loading a session keeps of its log, folded an entry at a time as
+/// it is read, so the entries themselves are not kept.
+struct Load {
+    ledger: Ledger,
+    frames: FrameLog,
+    states: States,
+    replay: Replayer,
+    /// The agent, stepped through the log.
+    agent: Box<dyn Agent>,
+    #[cfg(test)]
+    entries: Vec<Entry>,
+}
+
+impl Load {
+    fn fold(&mut self, e: &Entry) {
+        self.ledger.apply(e);
+        self.frames.push(Frame::entry(e).ok());
+        self.states.apply(e);
+        self.replay.apply(self.agent.as_mut(), e);
+        #[cfg(test)]
+        self.entries.push(e.clone());
+    }
+}
+
 /// The native command that sets the session's model.
 const MODEL: &str = "model";
 
@@ -1608,14 +1667,9 @@ fn slash(text: &str) -> Option<(&str, &str)> {
     Some((name, args.trim()))
 }
 
-/// Logs the registry's extensions before the session's first step, unless
-/// they are the ones its log records last.
-fn note_extensions(
-    header: &Header,
-    loaded: &mut Loaded,
-    ledger: &mut Ledger,
-    registry: &Registry,
-) -> io::Result<()> {
+/// The entry logging the registry's extensions before the session's first
+/// step, unless they are the ones its log records last.
+fn note_extensions(header: &Header, ledger: &Ledger, registry: &Registry) -> Option<Body> {
     let recorded = ledger.extensions().unwrap_or(&header.extensions);
     let same = recorded
         .iter()
@@ -1623,14 +1677,9 @@ fn note_extensions(
         .eq(registry
             .extensions()
             .map(|(name, version)| (name as &str, version)));
-    if same {
-        return Ok(());
-    }
-    loaded.append(Body::Extensions {
+    (!same).then(|| Body::Extensions {
         installed: installed(registry),
-    })?;
-    ledger.apply(loaded.entries.last().expect("an entry was appended"));
-    Ok(())
+    })
 }
 
 /// The registry's extensions as a log records them.
