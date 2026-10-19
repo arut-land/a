@@ -139,6 +139,8 @@ pub fn reap(home: &Home, pid_file: &mut File) -> io::Result<Option<Record>> {
         return Ok(None);
     }
     pid_file.set_len(0)?;
+    // The caller writes its own record next, from the start.
+    pid_file.rewind()?;
     let Ok(dead) = text.parse::<Record>() else {
         return Ok(None);
     };
@@ -280,9 +282,17 @@ mod tests {
         Home::from(root)
     }
 
+    /// Reaps `record` as a client that took the daemon lock would. Not
+    /// through [`reap_unlocked`]: a process the other tests fork holds this
+    /// process's open files, and so their locks, until it execs.
     fn died(home: &Home, record: &Record) -> Option<Record> {
         fs::write(home.daemon_pid_file(), record.to_string()).unwrap();
-        reap_unlocked(home).unwrap()
+        let mut file = File::options()
+            .read(true)
+            .write(true)
+            .open(home.daemon_pid_file())
+            .unwrap();
+        reap(home, &mut file).unwrap()
     }
 
     #[test]
@@ -335,6 +345,25 @@ mod tests {
         reset(&home).unwrap();
         assert_eq!(Crashes::of(&home).young, 0);
         fs::remove_dir_all(home.crash_dir().parent().unwrap()).unwrap();
+    }
+
+    /// A daemon that reaps its predecessor records itself in its place.
+    #[test]
+    fn the_reaper_writes_its_record_from_the_start() {
+        let home = home("reaper");
+        let dead = Record::current("b1");
+        fs::write(home.daemon_pid_file(), dead.to_string()).unwrap();
+        let mut file = File::options()
+            .read(true)
+            .write(true)
+            .open(home.daemon_pid_file())
+            .unwrap();
+        assert_eq!(reap(&home, &mut file).unwrap(), Some(dead));
+        let me = Record::current("b2");
+        write!(file, "{me}").unwrap();
+        let text = fs::read_to_string(home.daemon_pid_file()).unwrap();
+        fs::remove_dir_all(home.crash_dir().parent().unwrap()).unwrap();
+        assert_eq!(text.parse::<Record>().unwrap(), me);
     }
 
     #[test]
