@@ -10,8 +10,6 @@ pub mod channel;
 mod events;
 #[cfg(feature = "threads")]
 mod threads;
-#[cfg(feature = "threads")]
-mod timer;
 
 #[cfg(feature = "smol")]
 mod smol;

@@ -7,13 +7,14 @@ publish.workspace = true
 [features]
 default = ["threads"]
 # The built-in runtime.
-threads = ["dep:async-task"]
+threads = ["dep:async-task", "dep:futures-timer"]
 smol = ["dep:smol"]
 tokio = ["dep:tokio"]
 
 [dependencies]
 async-task = { version = "4", optional = true }
 futures-core = { version = "0.3", default-features = false, features = ["std"] }
+futures-timer = { version = "3", optional = true }
 smol = { version = "2", optional = true }
 tokio = { version = "1", default-features = false, features = ["rt", "time"], optional = true }
 
