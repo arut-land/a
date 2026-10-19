@@ -13,7 +13,10 @@
 
 use std::borrow::Cow;
 
-use serde::de::{IgnoredAny, MapAccess};
+use std::fmt;
+use std::marker::PhantomData;
+
+use serde::de::{IgnoredAny, MapAccess, SeqAccess, Visitor};
 use serde::{Deserialize, Deserializer};
 use serde_json::{Map, Value, json};
 
@@ -94,9 +97,80 @@ struct Frame<'a> {
     id: Json<'a>,
     model: Json<'a>,
     object: Json<'a>,
-    choices: List<'a, Choice<'a>>,
+    choices: Choices<'a>,
     usage: Value,
     error: Value,
+}
+
+/// A frame's `choices`, of which only the primary one is kept: `n > 1`
+/// streams interleave candidates told apart only by their `index`, and
+/// candidate 0 is the turn. Any value that is no list holds none.
+#[derive(Default)]
+struct Choices<'a> {
+    /// Whether the frame has the field at all.
+    stated: bool,
+    count: usize,
+    /// Whether any choice is a whole message.
+    whole: bool,
+    primary: Option<Json<'a, Choice<'a>>>,
+}
+
+impl<'de: 'a, 'a> Deserialize<'de> for Choices<'a> {
+    fn deserialize<D: Deserializer<'de>>(json: D) -> Result<Self, D::Error> {
+        struct Read<'a>(PhantomData<Choices<'a>>);
+        impl<'de: 'a, 'a> Visitor<'de> for Read<'a> {
+            type Value = Choices<'a>;
+            fn expecting(&self, f: &mut fmt::Formatter) -> fmt::Result {
+                f.write_str("JSON")
+            }
+            fn visit_seq<A: SeqAccess<'de>>(self, mut list: A) -> Result<Choices<'a>, A::Error> {
+                let mut choices = Choices::none();
+                while let Some(choice) = list.next_element::<Json<'a, Choice<'a>>>()? {
+                    choices.count += 1;
+                    let object = choice.object();
+                    choices.whole |= object.is_some_and(|choice| choice.message.object().is_some());
+                    let index = object.map(|choice| choice.index.as_u64());
+                    let primary = index.is_none_or(|index| index.is_none_or(|index| index == 0));
+                    if primary && choices.primary.is_none() {
+                        choices.primary = Some(choice);
+                    }
+                }
+                Ok(choices)
+            }
+            fn visit_map<A: MapAccess<'de>>(self, map: A) -> Result<Choices<'a>, A::Error> {
+                IgnoredAny.visit_map(map).map(|_| Choices::none())
+            }
+            fn visit_unit<E>(self) -> Result<Choices<'a>, E> {
+                Ok(Choices::none())
+            }
+            fn visit_bool<E>(self, _: bool) -> Result<Choices<'a>, E> {
+                Ok(Choices::none())
+            }
+            fn visit_i64<E>(self, _: i64) -> Result<Choices<'a>, E> {
+                Ok(Choices::none())
+            }
+            fn visit_u64<E>(self, _: u64) -> Result<Choices<'a>, E> {
+                Ok(Choices::none())
+            }
+            fn visit_f64<E>(self, _: f64) -> Result<Choices<'a>, E> {
+                Ok(Choices::none())
+            }
+            fn visit_str<E>(self, _: &str) -> Result<Choices<'a>, E> {
+                Ok(Choices::none())
+            }
+        }
+        json.deserialize_any(Read(PhantomData))
+    }
+}
+
+impl Choices<'_> {
+    /// A stated field holding no choices.
+    fn none() -> Self {
+        Self {
+            stated: true,
+            ..Self::default()
+        }
+    }
 }
 
 impl<'de: 'a, 'a> Fields<'de> for Frame<'a> {
@@ -340,9 +414,8 @@ impl ChatDecoder {
         }
     }
 
-    /// Absorb what every frame carries, and take its primary choice: `n >
-    /// 1` streams interleave candidates told apart only by their `index`,
-    /// and candidate 0 is the turn. Usage is the frame's, or its choice's
+    /// Absorb what every frame carries, and take its primary choice. Usage
+    /// is the frame's, or its choice's
     /// where Moonshot reports it. A gateway's upstream-native reason stands
     /// in only when the normalized one is absent or empty.
     fn absorb<'a>(&mut self, frame: Frame<'a>) -> Option<Json<'a, Choice<'a>>> {
@@ -355,14 +428,7 @@ impl ChatDecoder {
                 *slot = Some(value.into());
             }
         }
-        let primary = |choice: &Json<'_, Choice<'_>>| {
-            let index = choice.object().map(|choice| choice.index.as_u64());
-            index.is_none_or(|index| index.is_none_or(|index| index == 0))
-        };
-        let mut choice = match frame.choices {
-            Json::List(choices) => choices.into_iter().find(primary),
-            _ => None,
-        };
+        let mut choice = frame.choices.primary;
         let usage = match (frame.usage, &mut choice) {
             (Value::Null, Some(Json::Object(choice))) => choice.usage.take(),
             (usage, _) => usage,
@@ -764,16 +830,10 @@ impl Writes for ChatDecoder {
         // `object` tag decides when the host sends one: a stream chunk may
         // carry a whole message.
         let object = frame.object.str();
-        if object != Some("chat.completion.chunk") && matches!(frame.choices, Json::Absent) {
+        if object != Some("chat.completion.chunk") && !frame.choices.stated {
             return Ok(Flow::More);
         }
-        let whole = object.map_or_else(
-            || {
-                let mut choices = frame.choices.items().iter().filter_map(Json::object);
-                choices.any(|choice| choice.message.object().is_some())
-            },
-            |object| object == "chat.completion",
-        );
+        let whole = object.map_or(frame.choices.whole, |object| object == "chat.completion");
         let choice = self.absorb(frame);
         if whole {
             let Some(choice) = choice else {
@@ -820,7 +880,7 @@ impl Writes for ChatDecoder {
 fn failure(frame: &Frame<'_>, data: &str) -> Option<Error> {
     let error = &frame.error;
     if !(error.is_object() || error.as_str().is_some_and(|text| !text.is_empty()))
-        || !frame.choices.items().is_empty()
+        || frame.choices.count > 0
     {
         return None;
     }
