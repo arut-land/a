@@ -573,17 +573,21 @@ pub enum Cap {
     /// The daemon takes [`ClientMsg::Declare`]. (The `decl` an attach
     /// carries needs no capability: a daemon older than it ignores it.)
     Declare,
+    /// The daemon takes [`ClientMsg::Steer`]; the first ones drop a
+    /// connection that sends it.
+    Steer,
 }
 
 impl Cap {
     /// Every capability this build knows.
-    pub const ALL: [Self; 3] = [Self::Snapshot, Self::Ack, Self::Declare];
+    pub const ALL: [Self; 4] = [Self::Snapshot, Self::Ack, Self::Declare, Self::Steer];
 
     pub const fn name(self) -> &'static str {
         match self {
             Self::Snapshot => "snapshot",
             Self::Ack => "ack",
             Self::Declare => "declare",
+            Self::Steer => "steer",
         }
     }
 
@@ -819,7 +823,8 @@ pub enum ClientMsg {
         client_seq: Option<u64>,
     },
     /// Input for the running turn, given to it at its next step boundary;
-    /// with no turn running it is plain input.
+    /// with no turn running it is plain input. Only sent with
+    /// [`Cap::Steer`].
     Steer {
         text: String,
         #[serde(default, skip_serializing_if = "Option::is_none")]

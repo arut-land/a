@@ -6,7 +6,7 @@ use std::io::{self, Write};
 use std::sync::mpsc::{self, Receiver, Sender};
 use std::thread;
 
-use client::{Connection, Endpoint, Writer};
+use client::{Connection, Endpoint, Welcome, Writer};
 use protocol::view::Link;
 use protocol::{ClientMsg, Target};
 
@@ -39,6 +39,7 @@ pub fn run(daemon: &Daemon, target: Target, viewport: Viewport) -> io::Result<()
         tx,
         id: 0,
         writer: None,
+        welcome: Welcome::default(),
         app: App::new(viewport, workspace, &target),
         screen: Screen::new(viewport),
         out: io::stdout().lock(),
@@ -84,6 +85,8 @@ struct Client<'a> {
     /// dropped.
     id: u64,
     writer: Option<Writer>,
+    /// What the current connection's hello settled.
+    welcome: Welcome,
     app: App,
     screen: Screen,
     out: io::StdoutLock<'static>,
@@ -114,8 +117,9 @@ impl Client<'_> {
             Event::Input(input) => return self.app.input(input),
             Event::Resized => self.screen.invalidate(),
             Event::InputClosed => return Some(Effect::Detach),
-            Event::Connected(id, writer, remote) if id == self.id => {
+            Event::Connected(id, writer, welcome, remote) if id == self.id => {
                 self.writer = Some(writer);
+                self.welcome = welcome;
                 self.app.conn = Conn::Open { remote };
             }
             Event::Daemon(id, msg) if id == self.id => return self.app.fold(&msg),
@@ -149,6 +153,7 @@ impl Client<'_> {
     fn effect(&mut self, effect: Effect) -> Option<Exit> {
         let result = match effect {
             Effect::Send(msg) => self.send(&msg),
+            Effect::Steer(text) => self.send(&self.welcome.steer(text)),
             Effect::List => self.send(&ClientMsg::List),
             Effect::RefreshEnv => match client::capture() {
                 Ok(env) => self
@@ -261,10 +266,10 @@ fn read(conn: Connection, id: u64, tx: &Sender<Event>) {
         mut reader,
         writer,
         remote,
-        ..
+        welcome,
     } = conn;
     if tx
-        .send(Event::Connected(id, writer, remote.is_some()))
+        .send(Event::Connected(id, writer, welcome, remote.is_some()))
         .is_err()
     {
         return;

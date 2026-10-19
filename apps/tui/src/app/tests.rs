@@ -351,6 +351,10 @@ fn slash_commands() {
         Some(Effect::Send(ClientMsg::Interrupt { .. }))
     ));
     assert!(matches!(
+        typed(&mut app, "/steer and tests"),
+        Some(Effect::Steer(text)) if text == "and tests"
+    ));
+    assert!(matches!(
         typed(&mut app, "hello there"),
         Some(Effect::Send(ClientMsg::Input { text, .. })) if text == "hello there"
     ));

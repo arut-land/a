@@ -13,7 +13,7 @@ use std::time::{Duration, Instant};
 
 use protocol::view::SessionList;
 use protocol::{
-    Caps, ClientDecl, ClientMsg, DaemonMsg, Environment, SessionSummary, Target, read_frame,
+    Cap, Caps, ClientDecl, ClientMsg, DaemonMsg, Environment, SessionSummary, Target, read_frame,
     write_frame,
 };
 use sys::crash::{Crashes, Record};
@@ -55,6 +55,23 @@ pub struct Welcome {
     /// This connection's id, as origins name it; 0 from a daemon older
     /// than them.
     pub client: u32,
+}
+
+impl Welcome {
+    /// `text` for the running turn: a steer where the daemon takes them,
+    /// else plain input, which waits for the turn to end. The first
+    /// daemons drop a connection that sends them a steer.
+    pub fn steer(&self, text: impl Into<String>) -> ClientMsg {
+        let text = text.into();
+        if self.caps.has(Cap::Steer) {
+            ClientMsg::Steer {
+                text,
+                client_seq: None,
+            }
+        } else {
+            ClientMsg::input(text)
+        }
+    }
 }
 
 impl Connection {
@@ -598,6 +615,17 @@ fn connect_or_spawn(home: &Home) -> io::Result<(UnixStream, bool)> {
 #[cfg(all(test, unix))]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_steer_is_sent_only_to_a_daemon_that_takes_it() {
+        let steers = Welcome {
+            caps: Caps::ALL,
+            ..Welcome::default()
+        };
+        assert!(matches!(steers.steer("also"), ClientMsg::Steer { text, .. } if text == "also"));
+        let first = Welcome::default();
+        assert!(matches!(first.steer("also"), ClientMsg::Input { text, .. } if text == "also"));
+    }
 
     #[test]
     fn an_older_client_is_pointed_at_the_newer_build_not_at_a_restart() {

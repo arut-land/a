@@ -62,9 +62,9 @@ enum Event {
     Resized,
     /// stdin closed: the terminal is gone.
     InputClosed,
-    /// Connection `id`'s writer, once it sent its attach; and whether the
-    /// daemon is a remote host's.
-    Connected(u64, client::Writer, bool),
+    /// Connection `id`'s writer, once it sent its attach; what its hello
+    /// settled; and whether the daemon is a remote host's.
+    Connected(u64, client::Writer, client::Welcome, bool),
     Daemon(u64, DaemonMsg),
     Closed(u64, String),
     /// Connection `id` could not be opened.

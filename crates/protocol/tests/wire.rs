@@ -33,6 +33,13 @@ fn first_caps() -> Caps {
         .collect()
 }
 
+/// [`first_caps`] and [`Cap::Steer`].
+fn steer_caps() -> Caps {
+    [Cap::Snapshot, Cap::Ack, Cap::Declare, Cap::Steer]
+        .into_iter()
+        .collect()
+}
+
 /// A sample: its file name, the message, and the capability without which
 /// it is never sent (so peers older than it never see it).
 struct Sample<M> {
@@ -86,6 +93,15 @@ fn client_samples() -> Vec<Sample<ClientMsg>> {
                 build: "0.0.0+0123456789abcdef".into(),
                 min: None,
                 caps: first_caps(),
+            },
+        ),
+        sample(
+            "hello_caps_steer",
+            ClientMsg::Hello {
+                proto: PROTO,
+                build: "0.0.0+0123456789abcdef".into(),
+                min: None,
+                caps: steer_caps(),
             },
         ),
         sample(
@@ -150,19 +166,21 @@ fn client_samples() -> Vec<Sample<ClientMsg>> {
                 client_seq: Some(2),
             },
         ),
-        sample(
+        gated(
             "steer",
             ClientMsg::Steer {
                 text: "also this".into(),
                 client_seq: None,
             },
+            Cap::Steer,
         ),
-        sample(
+        gated(
             "steer_numbered",
             ClientMsg::Steer {
                 text: "also this".into(),
                 client_seq: Some(4),
             },
+            Cap::Steer,
         ),
         sample("interrupt", ClientMsg::INTERRUPT),
         sample(
@@ -212,6 +230,15 @@ fn daemon_samples() -> Vec<Sample<DaemonMsg>> {
                 proto: PROTO,
                 build: "0.0.0+0123456789abcdef".into(),
                 caps: first_caps(),
+                client: 1,
+            },
+        ),
+        sample(
+            "welcome_caps_steer",
+            DaemonMsg::Welcome {
+                proto: PROTO,
+                build: "0.0.0+0123456789abcdef".into(),
+                caps: steer_caps(),
                 client: 1,
             },
         ),
@@ -632,10 +659,11 @@ fn this_build_reads_the_whole_corpus() {
     }
 }
 
-/// Ungated messages the first daemons cannot read: no client sends them
-/// yet, and one that does must gate them behind a capability first, since
-/// those daemons drop a connection on a message they cannot decode.
-const UNREAD_BY_THE_FIRST: &[&str] = &["steer", "steer_numbered"];
+/// Ungated messages the first daemons cannot read, which no client may
+/// send until a capability gates them: those daemons drop a connection on
+/// a message they cannot decode. None now; `steer` waits for
+/// [`Cap::Steer`].
+const UNREAD_BY_THE_FIRST: &[&str] = &[];
 
 /// The first protocol 1 builds read every message sent to them: anything
 /// not gated by a capability, which they never ask for.

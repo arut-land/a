@@ -24,6 +24,9 @@ use super::view::MUTED;
 #[derive(Debug)]
 pub enum Effect {
     Send(ClientMsg),
+    /// `/steer text`: input for the running turn, sent as a steer where the
+    /// daemon takes them.
+    Steer(String),
     /// `/env refresh`: capture this shell's environment and send it.
     RefreshEnv,
     /// Asks the daemon for its sessions (the picker).
@@ -123,6 +126,7 @@ const HELP: &[(&str, &str)] = &[
     ("/sessions", "switch session"),
     ("/new", "start a new session"),
     ("/interrupt", "stop the running turn"),
+    ("/steer text", "tell the running turn, before its next step"),
     ("/env refresh", "send this shell's environment again"),
     ("/detach", "leave; the session keeps running"),
 ];
@@ -342,6 +346,11 @@ impl App {
             "/help" => {
                 self.overlay = Some(Overlay::Help);
                 return None;
+            }
+            // With no turn running, a steer is plain input.
+            _ if let Some(steer) = text.strip_prefix("/steer ") => {
+                self.anchor = None;
+                Effect::Steer(steer.to_owned())
             }
             _ => {
                 self.anchor = None;
