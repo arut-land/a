@@ -183,10 +183,12 @@ impl Page {
             return;
         };
         let view = self.client.view();
+        // Shown whole when it started streaming, or started again (a
+        // retry) and so has none of this text.
         let started = view
             .streaming
             .as_ref()
-            .is_some_and(|s| s.call == call && s.text.len() == text.len());
+            .is_none_or(|s| s.call != call || s.text.len() == text.len());
         if started {
             let Some(item) = view.items.iter().find(|i| i.key() == call) else {
                 return;

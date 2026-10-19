@@ -8,7 +8,7 @@ use client::{Attach, Driver, Effect, End, Endpoint, Env, Event, Link, SessionCli
 use protocol::view::{
     Approval, Change, Item, Part, Status, Usage, call_title, decision_line, output_text, recap_line,
 };
-use protocol::{Card, ClientMsg, DaemonMsg, Outcome, SessionSummary, Target};
+use protocol::{Card, ClientMsg, DaemonMsg, Decision, Outcome, SessionSummary, Target};
 use sys::{Home, Staged};
 use usage_rs::{Cli, Subcommands};
 
@@ -407,7 +407,18 @@ impl Screen {
                 print!("{text}");
                 let _ = io::stdout().flush();
             }
-            Change::Added { item, .. } => added(item),
+            Change::Added { item, .. } => {
+                // A retry streams its reply anew, on a line of its own.
+                if let Item::Hook {
+                    decision: Decision::Retry { call, .. },
+                    ..
+                } = item
+                    && self.streaming.take_if(|s| s == call).is_some()
+                {
+                    println!();
+                }
+                added(item);
+            }
             // Sent in place of a long replay: shown as the replay would be.
             Change::Snapshot { items } => {
                 for item in items {

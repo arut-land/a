@@ -1,12 +1,15 @@
 //! Services: typed capabilities one extension provides and others build
 //! on, by type rather than by knowing each other. Each has at most one
 //! provider per registry, and an extension that needs one no extension
-//! provides is refused as it installs.
+//! provides is refused as it installs. The engine provides the ones only
+//! it can, such as [`Settings`], to every call.
 
+use std::io;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
-use protocol::Environment;
+use protocol::{Environment, Outcome, Overrides};
+use rt::BoxFuture;
 
 use crate::{Cx, SpawnSpec, States};
 
@@ -23,4 +26,26 @@ pub trait Spawner: Send + Sync {
     /// The process `spawn` describes, as the `spawn` point leaves it,
     /// ready to start.
     fn process(&self, cx: &Cx, spawn: SpawnSpec) -> Result<Command, String>;
+}
+
+/// A session's settings over the layers the engine reads them from: the
+/// session's own, then its workspace's and the home config file. The
+/// engine provides it.
+pub trait Settings: Send + Sync {
+    /// The model the call's session talks to, as `host:model`, and which
+    /// layer names it.
+    fn model(&self, cx: &Cx) -> Result<(String, String), String>;
+    /// Makes `set` the session's own settings, over every layer; logged
+    /// once it resolves.
+    fn set<'a>(&'a self, cx: &'a Cx, set: Overrides) -> BoxFuture<'a, io::Result<()>>;
+}
+
+/// Child sessions: a call starts one it owns and waits for what it settles
+/// with. The engine provides it.
+pub trait Sessions: Send + Sync {
+    /// What a child session started on `input` settles with. The child is
+    /// the call's own: started once however often the call runs again (as
+    /// recovery runs it), and heard from once. An interrupt of the call's
+    /// turn reaches the child first.
+    fn child<'a>(&'a self, cx: &'a Cx, input: String) -> BoxFuture<'a, Outcome>;
 }

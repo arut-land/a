@@ -24,6 +24,7 @@ workspace = true
 
 [dev-dependencies]
 bytes.workspace = true
+futures-core = { version = "0.3", default-features = false, features = ["std"] }
 http.workspace = true
 serde_yaml_ng = "0.10"
 # The extensions sessions under test run.
@@ -32,4 +33,7 @@ ext-edit.workspace = true
 ext-fixtures = { workspace = true, features = ["on"] }
 ext-policy.workspace = true
 ext-prompt.workspace = true
+ext-retry.workspace = true
+ext-settings.workspace = true
 ext-shell.workspace = true
+ext-subagent.workspace = true

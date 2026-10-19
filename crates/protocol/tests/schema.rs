@@ -388,7 +388,6 @@ fn the_log_knows_each_clients_last_mutation() {
 
 /// A retry's text replaces the failed attempt's in the view.
 #[test]
-#[ignore = "v2: wave 4e"]
 fn a_retry_streams_one_attempt() {
     let mut view = SessionView::default();
     for (attempt, text) in [(0, "par"), (1, "whole")] {

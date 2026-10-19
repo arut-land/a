@@ -30,6 +30,12 @@ pub fn extensions(config: &Config) -> Vec<(Tier, Box<dyn DynExtension>)> {
         (Tier::Pre, Box::new(ext_edit::Edit)),
         #[cfg(feature = "chat")]
         (Tier::Pre, Box::new(ext_chat::Chat)),
+        #[cfg(feature = "retry")]
+        (Tier::Pre, Box::new(ext_retry::Retry::default())),
+        #[cfg(feature = "settings")]
+        (Tier::Pre, Box::new(ext_settings::Settings)),
+        #[cfg(feature = "subagent")]
+        (Tier::Pre, Box::new(ext_subagent::Subagent)),
     ];
     if config.agent.as_deref() == Some(ext_fixtures::ECHO)
         && let Some(fixtures) = ext_fixtures::extension()
@@ -95,7 +101,7 @@ mod tests {
     #[test]
     fn every_extension_registers_as_any_other() {
         let registry = registry(&config(&["bash"], None)).unwrap();
-        assert_eq!(tools(&registry), ["bash", "edit"]);
+        assert_eq!(tools(&registry), ["bash", "edit", "task"]);
         let extensions: Vec<_> = registry.extensions().collect();
         assert_eq!(
             extensions,
@@ -104,7 +110,10 @@ mod tests {
                 ("prompt", 1),
                 ("shell", 1),
                 ("edit", 1),
-                ("chat", 1)
+                ("chat", 1),
+                ("retry", 1),
+                ("settings", 1),
+                ("subagent", 1)
             ]
         );
         assert_eq!(registry.agents().collect::<Vec<_>>(), [ext_chat::CHAT]);
@@ -132,12 +141,15 @@ mod tests {
             r.system_prompt().split("\n\n").map(str::to_owned).collect()
         };
         // What each contributes that the others do not.
-        let own: [(&str, &[&str], usize, bool); 5] = [
+        let own: [(&str, &[&str], usize, bool); 8] = [
             ("policy", &[], 0, false),
             ("prompt", &[], 1, false),
             ("shell", &["bash"], 1, false),
             ("edit", &["edit"], 1, false),
             ("chat", &[], 0, true),
+            ("retry", &[], 0, false),
+            ("settings", &[], 0, false),
+            ("subagent", &["task"], 1, false),
         ];
         for (name, tools_of, texts_of, agent_of) in own {
             let rest = extensions(&config)

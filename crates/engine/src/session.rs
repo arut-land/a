@@ -1,3 +1,4 @@
+use std::any::{Any, TypeId};
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::fmt::Display;
 use std::future::{Future, poll_fn};
@@ -6,11 +7,12 @@ use std::panic::{AssertUnwindSafe, catch_unwind};
 use std::path::PathBuf;
 use std::pin::pin;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
-use std::sync::{Arc, Condvar, Mutex, MutexGuard, PoisonError, Weak};
+use std::sync::{Arc, Condvar, Mutex, MutexGuard, OnceLock, PoisonError, Weak};
 use std::task::{Poll, Waker};
 use std::time::{Duration, Instant};
 
 use ext::host::{Decided, Gate, Host, Parts, Registry};
+use ext::point::{Failed, Recover};
 use ext::{Action, Agent, Cancel, Cx, DynTool, Facts, Input, Replay, Route, States};
 use protocol::ledger::{self, Ledger, OutcomeKind, Phase};
 use protocol::view::SessionView;
@@ -19,7 +21,7 @@ use protocol::{
     Json, Outcome, Overrides, Residency, SessionId, SessionSummary, WaitOn,
 };
 use rt::BoxFuture;
-use serde_json::{Value, json};
+use serde_json::Value;
 use store::{Header, Loaded, Log, LogStore, Parent};
 
 use crate::model::{Model, Models};
@@ -106,6 +108,9 @@ pub struct Session {
     replied: Mutex<Option<(u64, llm::Assistant)>>,
     /// Background process groups the session owns, until it ends.
     jobs: Mutex<Vec<u32>>,
+    /// What the children calls wait on settled with, until each call hears.
+    reported: Mutex<HashMap<SessionId, Outcome>>,
+    reports: rt::Notify,
     /// Over once the actor has returned and the log is closed.
     ended: Ended,
     shared: Arc<Shared>,
@@ -368,6 +373,8 @@ impl Session {
             cancel: Mutex::default(),
             replied: Mutex::default(),
             jobs: Mutex::default(),
+            reported: Mutex::default(),
+            reports: rt::Notify::default(),
             ended: Ended::default(),
             shared,
         });
@@ -1033,10 +1040,6 @@ impl Session {
                 self.record(body);
                 return Ok(None);
             }
-            Action::Spawn { input } => {
-                self.spawn(input).await?;
-                return Ok(None);
-            }
             Action::CallModel => {
                 self.steer_in();
                 self.note_context();
@@ -1050,7 +1053,7 @@ impl Session {
                         attempt: 0,
                     })
                     .await?;
-                (Call::Model, seq, self.run_model(seq, model).await)
+                (Call::Model, seq, self.run_model(seq, model, false).await)
             }
             Action::RunTool {
                 tool,
@@ -1154,9 +1157,10 @@ impl Session {
         })
     }
 
-    async fn run_call(&self, call: &Call, seq: u64) -> Outcome {
+    /// Runs again call `seq`, which a crash cut off.
+    async fn rerun(&self, call: &Call, seq: u64) -> Outcome {
         match call {
-            Call::Model => self.run_model(seq, self.model()).await,
+            Call::Model => self.run_model(seq, self.model(), true).await,
             Call::Tool { tool, input } => self.run_tool(seq, tool, input).await,
         }
     }
@@ -1242,33 +1246,12 @@ impl Session {
                 let cx = self.cx(call, &registry);
                 contain(command.run(args, &cx)).await
             }
-            None if name == MODEL => self.set_model(args),
             None => Outcome::Failed {
                 error: format!("no command /{name}"),
             },
         };
         self.record(Body::CommandResult { call, outcome });
         Ok(())
-    }
-
-    /// `/model`: reports the model the session calls and the layer that
-    /// names it; `/model <host:model>` sets it for this session, over every
-    /// config layer, and `/model reset` leaves it to them again.
-    fn set_model(&self, args: &str) -> Outcome {
-        let set = if args.is_empty() {
-            self.overrides()
-        } else {
-            let model = (args != "reset").then(|| args.to_owned());
-            let set = Overrides { model };
-            let seq = self.record(Body::Settings(set.clone()));
-            (set, Some(seq))
-        };
-        match self.shared.models.settings.model_in(&self.workspace, set) {
-            Ok((model, from)) => Outcome::Done {
-                output: json!({ "model": model, "from": from.to_string() }).into(),
-            },
-            Err(error) => Outcome::Failed { error },
-        }
     }
 
     /// The session's own settings, and the seq of the entry that set them.
@@ -1307,6 +1290,8 @@ impl Session {
             session,
             call,
             registry: Arc::clone(registry),
+            settings: OnceLock::new(),
+            sessions: OnceLock::new(),
         }))
     }
 
@@ -1385,8 +1370,9 @@ impl Session {
 
     /// Asks `model` to reply to the transcript before `call`, offering the
     /// tools. Text streams to clients as it arrives; only the finished reply
-    /// is committed, or on an interrupt the text so far.
-    async fn run_model(&self, call: u64, model: Result<Model, String>) -> Outcome {
+    /// is committed, or on an interrupt the text so far. A call recovery
+    /// runs again had an attempt cut off by a crash: it counts as failed.
+    async fn run_model(&self, call: u64, model: Result<Model, String>, resumed: bool) -> Outcome {
         let model = match model {
             Ok(model) => model,
             Err(error) => return Outcome::Failed { error },
@@ -1402,14 +1388,9 @@ impl Session {
                 error: e.to_string(),
             };
         }
-        let mut on_text = |text: &str| {
-            self.broadcast(&DaemonMsg::Delta {
-                call,
-                text: text.to_owned(),
-                attempt: 0,
-            });
-        };
-        contain(self.reply(call, &model, &registry, request, &mut on_text)).await
+        let cut = resumed
+            .then(|| llm::Error::new(llm::Kind::Incomplete, "the daemon stopped during the call"));
+        contain(self.reply(call, &model, &registry, request, cut)).await
     }
 
     /// The request for model call `call`: the system prompt, the transcript
@@ -1452,73 +1433,118 @@ impl Session {
         history
     }
 
-    /// `model`'s reply to `request`, retried as the `request_error` hooks
-    /// ask. The whole reply is the fact: replaying it later sends the
-    /// provider's own items (signatures, encrypted reasoning) back. An
-    /// interrupt keeps the text so far, which the reply held.
+    /// `model`'s reply to `request`, recovered from failures as the
+    /// `request_error` hooks say. Each attempt streams on its own: what an
+    /// interrupt keeps is the text of the attempt it cut off. The whole
+    /// reply is the fact: replaying it later sends the provider's own items
+    /// (signatures, encrypted reasoning) back. `failed` is an attempt that
+    /// failed before this was called.
     async fn reply(
         &self,
         call: u64,
         model: &Model,
         registry: &Registry,
         mut request: llm::Request,
-        on_text: &mut (dyn FnMut(&str) + Send),
+        mut failed: Option<llm::Error>,
     ) -> Outcome {
         let cancel = self.turn();
-        let mut retries = 0;
+        // Counted in the log, so a crash does not start the count again.
+        let mut attempt = match self.lock().ledger.call(call).map(|open| &open.call) {
+            Some(ledger::Call::Model { attempt }) => *attempt,
+            _ => 0,
+        };
         loop {
-            // Sent once polled, as an interrupt meanwhile finds it.
-            let mut events = None;
-            let reading = async {
-                let events = events.insert(model.send(&request));
-                crate::model::read(events, on_text).await
+            let error = match failed.take() {
+                Some(error) => error,
+                None => match self
+                    .attempt((call, attempt), model, &request, &cancel)
+                    .await
+                {
+                    Ok(outcome) => return outcome,
+                    Err(error) => error,
+                },
             };
-            let Some(read) = unless(&cancel, reading).await else {
-                return Outcome::Interrupted {
-                    output: events.and_then(llm::Events::interrupted),
+            // An interrupted turn asks for no retry.
+            if cancel.is_cancelled() {
+                return Outcome::Failed {
+                    error: error.to_string(),
+                };
+            }
+            let mut decided = Decided::new();
+            let failure = Failed {
+                request: &request,
+                error: &error,
+                attempt: attempt.into(),
+            };
+            let recover =
+                registry
+                    .hooks()
+                    .request_error(&self.point(), call, failure, &mut decided);
+            let Some(recover) = recover else {
+                return Outcome::Failed {
+                    error: error.to_string(),
                 };
             };
-            let replied = read.and_then(|()| {
-                let events = events.ok_or_else(llm::Error::incomplete)?;
-                events.finish(Some(model.origin(&request)))
-            });
-            let error = match replied {
-                Ok(reply) => {
-                    return match serde_json::to_value(&reply) {
-                        Ok(output) => {
-                            *lock(&self.replied) = Some((call, reply.message));
-                            Outcome::Done {
-                                output: output.into(),
-                            }
-                        }
-                        Err(error) => Outcome::Failed {
-                            error: error.to_string(),
-                        },
-                    };
+            if self.decide(decided).await.is_err() {
+                return Outcome::Failed {
+                    error: error.to_string(),
+                };
+            }
+            attempt = attempt.saturating_add(1);
+            match recover {
+                Recover::Retry { after } => {
+                    if unless(&cancel, self.shared.rt.sleep(after)).await.is_none() {
+                        return Outcome::Interrupted { output: None };
+                    }
                 }
-                Err(error) => error.to_string(),
-            };
-            let mut decided = Decided::new();
-            // An interrupted turn asks for no retry.
-            let retry = (retries < MAX_RETRIES && !cancel.is_cancelled())
-                .then(|| {
-                    registry.hooks().request_error(
-                        &self.point(),
-                        (call, retries + 1),
-                        &request,
-                        &error,
-                        &mut decided,
-                    )
-                })
-                .flatten();
-            match retry {
-                Some(next) if self.decide(decided).await.is_ok() => {
-                    request = next;
-                    retries += 1;
-                }
-                _ => return Outcome::Failed { error },
+                Recover::Replace(next) => request = *next,
             }
         }
+    }
+
+    /// Attempt `attempt` at `model`'s reply to `request`, its text
+    /// streaming to clients as it arrives under that attempt: the outcome,
+    /// unless it failed.
+    async fn attempt(
+        &self,
+        (call, attempt): (u64, u16),
+        model: &Model,
+        request: &llm::Request,
+        cancel: &Cancel,
+    ) -> Result<Outcome, llm::Error> {
+        let mut on_text = |text: &str| {
+            self.broadcast(&DaemonMsg::Delta {
+                call,
+                text: text.to_owned(),
+                attempt,
+            });
+        };
+        // Sent once polled, as an interrupt meanwhile finds it.
+        let mut events = None;
+        let reading = async {
+            let events = events.insert(model.send(request));
+            crate::model::read(events, &mut on_text).await
+        };
+        let Some(read) = unless(cancel, reading).await else {
+            return Ok(Outcome::Interrupted {
+                output: events.and_then(llm::Events::interrupted),
+            });
+        };
+        let reply = read.and_then(|()| {
+            let events = events.ok_or_else(llm::Error::incomplete)?;
+            events.finish(Some(model.origin(request)))
+        })?;
+        Ok(match serde_json::to_value(&reply) {
+            Ok(output) => {
+                *lock(&self.replied) = Some((call, reply.message));
+                Outcome::Done {
+                    output: output.into(),
+                }
+            }
+            Err(error) => Outcome::Failed {
+                error: error.to_string(),
+            },
+        })
     }
 
     /// Picks up where the log leaves off. Links are re-armed; the agent is
@@ -1642,7 +1668,7 @@ impl Session {
             }
             _ => {
                 self.flush().await?;
-                self.run_call(&call, seq).await
+                self.rerun(&call, seq).await
             }
         };
         self.finish(&call, seq, outcome).await
@@ -1675,29 +1701,21 @@ impl Load {
     }
 }
 
-/// The native command that sets the session's model.
-const MODEL: &str = "model";
-
-/// The slash commands a session runs, as a welcome advertises them.
+/// The slash commands a session runs, as a welcome advertises them: the
+/// extensions', as the engine has none of its own.
 pub fn commands(registry: &Registry) -> Vec<protocol::CommandInfo> {
-    let native = protocol::CommandInfo {
-        name: MODEL.to_owned(),
-        description: "set the session's model".to_owned(),
-    };
     registry
         .commands()
         .map(|c| protocol::CommandInfo {
             name: c.name().to_owned(),
             description: c.description().to_owned(),
         })
-        .chain([native])
         .collect()
 }
 
-/// `text` as a command's name and arguments, if it names one: an
-/// extension's, or a native one.
+/// `text` as a command's name and arguments, if it names one.
 fn as_command<'a>(registry: &Registry, text: &'a str) -> Option<(&'a str, &'a str)> {
-    slash(text).filter(|&(name, _)| registry.command(name).is_some() || name == MODEL)
+    slash(text).filter(|&(name, _)| registry.command(name).is_some())
 }
 
 /// `work`'s output, or `None` once `cancel` is cancelled first; `work` is
@@ -1716,15 +1734,44 @@ async fn unless<T>(cancel: &Cancel, work: impl Future<Output = T>) -> Option<T> 
     .await
 }
 
-/// Model calls one request may be retried, as `request_error` hooks ask.
-const MAX_RETRIES: u32 = 2;
-
 /// The engine as tool or command call `call` reaches it, on the registry
 /// generation it started with.
 struct Effect {
     session: Arc<Session>,
     call: u64,
     registry: Arc<Registry>,
+    /// The session's settings and children, made when a call first asks.
+    settings: OnceLock<Arc<dyn ext::Settings>>,
+    sessions: OnceLock<Arc<dyn ext::Sessions>>,
+}
+
+/// A session's settings, as its calls reach them.
+struct Own(Arc<Session>);
+
+impl ext::Settings for Own {
+    fn model(&self, _: &Cx) -> Result<(String, String), String> {
+        let session = &self.0;
+        let settings = &session.shared.models.settings;
+        let (model, from) = settings.model_in(&session.workspace, session.overrides())?;
+        Ok((model, from.to_string()))
+    }
+
+    fn set<'a>(&'a self, _: &'a Cx, set: Overrides) -> BoxFuture<'a, io::Result<()>> {
+        Box::pin(async move { self.0.append(Body::Settings(set)).await.map(drop) })
+    }
+}
+
+impl ext::Sessions for Own {
+    fn child<'a>(&'a self, cx: &'a Cx, input: String) -> BoxFuture<'a, Outcome> {
+        Box::pin(async move {
+            self.0
+                .child(cx.call, input)
+                .await
+                .unwrap_or_else(|e| Outcome::Failed {
+                    error: e.to_string(),
+                })
+        })
+    }
 }
 
 /// Entries a call records are not waited for: they still commit before
@@ -1768,6 +1815,17 @@ impl Host for Effect {
 
     fn registry(&self) -> &Registry {
         &self.registry
+    }
+
+    fn service(&self, ty: TypeId) -> Option<&(dyn Any + Send + Sync)> {
+        let own = || Arc::new(Own(Arc::clone(&self.session)));
+        if ty == TypeId::of::<dyn ext::Settings>() {
+            return Some(self.settings.get_or_init(|| own()));
+        }
+        if ty == TypeId::of::<dyn ext::Sessions>() {
+            return Some(self.sessions.get_or_init(|| own()));
+        }
+        None
     }
 }
 

@@ -1,0 +1,12 @@
+[package]
+name = "ext-retry"
+version.workspace = true
+edition.workspace = true
+publish.workspace = true
+
+[dependencies]
+ext.workspace = true
+llm.workspace = true
+
+[lints]
+workspace = true

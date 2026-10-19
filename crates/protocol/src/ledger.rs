@@ -350,6 +350,12 @@ impl Ledger {
         let Some(open) = self.open.get_mut(call) else {
             return;
         };
+        // A retried model call's attempts are counted here, so a restart
+        // does not start the count again.
+        if let (Verdict::Retry { attempt, .. }, Call::Model { attempt: at }) = (d, &mut open.call) {
+            *at = (*at).max(*attempt);
+            return;
+        }
         match open.phase {
             Phase::Waiting(WaitOn::Approval) => {
                 if let Verdict::Approval { approved } = d {
@@ -601,8 +607,9 @@ impl Open {
         )
     }
 
+    /// It waits on someone: not on a child, whose work is the call's.
     fn waits(&self) -> bool {
-        matches!(self.phase, Phase::Waiting(_))
+        matches!(&self.phase, Phase::Waiting(on) if !matches!(on, WaitOn::Child { .. }))
     }
 
     /// It is seen running: a process or progress of a gated call says its

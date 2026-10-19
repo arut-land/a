@@ -1,3 +1,5 @@
+use std::alloc::{GlobalAlloc, Layout, System};
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::{Duration, Instant};
 
 use protocol::Outcome;
@@ -7,6 +9,48 @@ use super::*;
 use ext::host::Registry;
 use ext::testing::Rig;
 use ext::{DynTool, Extension, Registrar, Rewrite};
+
+/// Counts the heap the tests hold, and its peak.
+pub struct Counting {
+    now: AtomicUsize,
+    peak: AtomicUsize,
+}
+
+#[global_allocator]
+pub static ALLOC: Counting = Counting {
+    now: AtomicUsize::new(0),
+    peak: AtomicUsize::new(0),
+};
+
+impl Counting {
+    /// Starts the peak over from what is held now, which it returns.
+    pub fn reset(&self) -> usize {
+        let now = self.now.load(Ordering::SeqCst);
+        self.peak.store(now, Ordering::SeqCst);
+        now
+    }
+
+    pub fn peak(&self) -> usize {
+        self.peak.load(Ordering::SeqCst)
+    }
+}
+
+// SAFETY: every call goes to the system allocator as it came.
+#[allow(unsafe_code)]
+unsafe impl GlobalAlloc for Counting {
+    unsafe fn alloc(&self, layout: Layout) -> *mut u8 {
+        let now = self.now.fetch_add(layout.size(), Ordering::SeqCst) + layout.size();
+        self.peak.fetch_max(now, Ordering::SeqCst);
+        // SAFETY: as the caller asked.
+        unsafe { System.alloc(layout) }
+    }
+
+    unsafe fn dealloc(&self, ptr: *mut u8, layout: Layout) {
+        self.now.fetch_sub(layout.size(), Ordering::SeqCst);
+        // SAFETY: as the caller asked.
+        unsafe { System.dealloc(ptr, layout) }
+    }
+}
 
 fn rig(name: &str) -> Rig {
     Rig::new(name, Registry::default().with(&crate::Shell).unwrap())
@@ -398,4 +442,126 @@ fn invalid_input_fails_the_call() {
     let rig = rig("invalid");
     let outcome = rig.call("bash", &json!({ "cmd": "true" }));
     assert!(matches!(outcome, Outcome::Failed { error } if error.starts_with("invalid input")));
+}
+
+#[test]
+fn a_running_commands_output_is_on_disk() {
+    let rig = rig("on-disk");
+    let log = rig.spill().join("1.log");
+    let ran = std::thread::scope(|s| {
+        let call = s.spawn(|| run(&rig, "echo started; sleep 100"));
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while std::fs::read_to_string(&log).unwrap_or_default() != "started\n" {
+            assert!(
+                Instant::now() < deadline,
+                "the output never reached its file"
+            );
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        rig.cancel.cancel();
+        call.join().unwrap()
+    });
+    assert!(ran.aborted, "{ran:?}");
+    assert_eq!(ran.output, "started\n");
+    // Shown whole, so not kept.
+    assert!(!log.exists());
+}
+
+#[test]
+fn big_output_never_sits_in_memory() {
+    let rig = rig("memory");
+    run(&rig, "true");
+    let before = ALLOC.reset();
+    let ran = run(&rig, "yes 'a line of output' | head -c 16000000");
+    let peak = ALLOC.peak() - before;
+    assert!(ran.truncated && ran.exit == Some(0), "{ran:?}");
+    let full = ran.full.unwrap();
+    assert_eq!(std::fs::metadata(full).unwrap().len(), 16_000_000);
+    assert!(peak < 4 << 20, "{peak} bytes at most while 16 MB ran");
+}
+
+#[test]
+fn a_command_that_floods_its_output_is_stopped() {
+    let rig = rig("flood");
+    let ran = run(&rig, "cat /dev/zero");
+    assert_eq!(ran.flooded, Some(OUTPUT_CAP), "{ran:?}");
+    let size = std::fs::metadata(ran.full.as_ref().unwrap()).unwrap().len();
+    assert!(size >= OUTPUT_CAP, "{size}");
+    assert!(model(&ran).contains("[stopped: its output passed 64 MiB]"));
+}
+
+/// The supervisor's transitions.
+#[test]
+fn the_supervisor_moves_only_as_its_states_allow() {
+    use std::os::unix::process::ExitStatusExt;
+
+    let t = Instant::now();
+    let later = t + Duration::from_secs(1);
+    let status = ExitStatus::from_raw(0);
+    let running = Run::Running { deadline: later };
+    let term = |why| Run::Stopping {
+        why,
+        kill: KillPhase::Term { at: t },
+    };
+    let exited = |why| Run::Exited { status, why, at: t };
+    let seen = Seen::default();
+    let exit = Seen {
+        exited: Some(status),
+        ..seen
+    };
+    let cancel = Seen {
+        cancelled: true,
+        ..seen
+    };
+    let flood = Seen {
+        flooded: true,
+        ..seen
+    };
+    let killed = Run::Stopping {
+        why: Stop::Aborted,
+        kill: KillPhase::Killed,
+    };
+    let term_signal = Some(Signal::Terminate);
+    let timed_out = Run::Stopping {
+        why: Stop::TimedOut,
+        kill: KillPhase::Term { at: later },
+    };
+    let table = [
+        (running, t, seen, running, None),
+        (running, later, seen, timed_out, term_signal),
+        (running, t, cancel, term(Stop::Aborted), term_signal),
+        (running, t, flood, term(Stop::Flooded), term_signal),
+        (running, t, exit, exited(None), None),
+        // Stopping: a cancel changes nothing; the grace runs out.
+        (term(Stop::TimedOut), t, cancel, term(Stop::TimedOut), None),
+        (
+            term(Stop::Aborted),
+            t + Kill::GRACE,
+            seen,
+            killed,
+            Some(Signal::Kill),
+        ),
+        (killed, later, seen, killed, None),
+        (
+            term(Stop::Aborted),
+            t,
+            exit,
+            exited(Some(Stop::Aborted)),
+            None,
+        ),
+        // Exited absorbs everything.
+        (exited(None), later, cancel, exited(None), None),
+        (exited(None), later, flood, exited(None), None),
+    ];
+    for (from, now, seen, to, signal) in table {
+        assert_eq!(
+            from.step(now, seen),
+            (to, signal),
+            "{from:?} seeing {seen:?}"
+        );
+    }
+    assert_eq!(running.deadline(t), Some(later));
+    assert_eq!(term(Stop::Aborted).deadline(t), Some(t + Kill::GRACE));
+    assert_eq!(killed.deadline(t), None);
+    assert_eq!(exited(None).deadline(t), Some(t + IDLE));
 }

@@ -2,6 +2,7 @@
 //! it resolves for sessions, and how a running call reaches the engine.
 //! Extensions need none of it.
 
+use std::any::{Any, TypeId};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex, OnceLock, PoisonError};
 
@@ -31,6 +32,11 @@ pub trait Host: Send + Sync {
     fn states(&self, read: &mut dyn FnMut(&States));
     /// The registry generation the call started on.
     fn registry(&self) -> &Registry;
+    /// A service the engine provides, by the type of its trait object: an
+    /// `Arc<S>` for `TypeId::of::<S>()`, as [`Cx::service`] asks.
+    fn service(&self, _ty: TypeId) -> Option<&(dyn Any + Send + Sync)> {
+        None
+    }
 }
 
 /// What a [`Cx`] is made of, but its host.

@@ -33,7 +33,7 @@ mod tool;
 
 pub use ext::{Command, DynExtension, Extension, Facts, Place, Refused, Registrar, Text, Tier};
 pub use point::{History, PointCx, Rewrite};
-pub use service::{CwdOf, Spawner};
+pub use service::{CwdOf, Sessions, Settings, Spawner};
 pub use state::{Fold, States};
 pub use tool::{Cancel, Cx, DynTool, Kill, Replay, Route, SpawnSpec, Tool};
 
@@ -55,6 +55,8 @@ pub enum Input {
         outcome: Outcome,
     },
     /// Watch `watch` fired: the child it watched settled with `outcome`.
+    /// Only a log an earlier build wrote has watches an agent asked for;
+    /// children are a tool's now.
     ChildDone {
         watch: u64,
         outcome: Outcome,
@@ -97,11 +99,6 @@ pub enum Action {
     },
     /// Ask the model to reply to the conversation so far.
     CallModel,
-    /// Start a child session on `input` and watch it; its result comes back
-    /// into this session's log when it settles.
-    Spawn {
-        input: String,
-    },
 }
 
 /// A session's agent loop, as an extension registers it with

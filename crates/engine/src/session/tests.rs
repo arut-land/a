@@ -497,18 +497,36 @@ fn the_model_calls_a_tool_and_answers_from_its_result() {
     );
 
     // Stopped after any fact, a session picks up from its log and ends the
-    // same way, sending the model the same second request.
+    // same way, sending the model the same second request. A model call
+    // cut off is an attempt that failed: its retry is logged.
     for cut in 3..=6 {
         let script = Script::new(&replies[1..]);
+        let registry = Registry::default().with(&Harbor).unwrap();
+        let retry = ext_retry::Retry {
+            base: Duration::ZERO,
+            ..ext_retry::Retry::default()
+        };
         let fixture = Fixture::new(
             ext_chat::CHAT,
-            Registry::default().with(&Harbor).unwrap(),
+            registry.with(&retry).unwrap(),
             openai(&script),
         );
         let resumed = fixture.start(&log[..cut]);
         let got = log_of(&resumed);
         resumed.stop();
-        assert_eq!(facts(&got), facts(&log), "cut after {cut}");
+        let mut want = bodies(&log);
+        let retried = Body::Hook {
+            hook: "retry".into(),
+            decision: Decision::Retry {
+                call: 6,
+                attempt: 1,
+                error: "the daemon stopped during the call".into(),
+            },
+        };
+        if cut == 6 {
+            want.insert(6, &retried);
+        }
+        assert_eq!(bodies(&got), want, "cut after {cut}");
         assert_eq!(script.sent(), sent[1..], "cut after {cut}");
     }
 }
@@ -1038,7 +1056,7 @@ fn an_interrupt_while_asked_settles_the_call_without_running_it() {
 /// Allows every call, interrupting the session as it gates one: an
 /// interrupt that lands while the gate's decisions commit.
 #[derive(Clone, Default)]
-struct Interrupter(Arc<std::sync::OnceLock<Weak<Session>>>);
+struct Interrupter(Arc<OnceLock<Weak<Session>>>);
 
 impl Extension for Interrupter {
     const NAME: &'static str = "policy";
@@ -1261,9 +1279,11 @@ impl Extension for Extras {
                 Rewrite::Replace(input)
             })
             .on::<point::RequestError>(|_, failed| {
-                Some(llm::Request {
-                    model: "retried".into(),
-                    ..failed.request.clone()
+                (failed.attempt < 2).then(|| {
+                    Recover::Replace(Box::new(llm::Request {
+                        model: "retried".into(),
+                        ..failed.request.clone()
+                    }))
                 })
             });
     }
@@ -1387,7 +1407,7 @@ fn the_model_gets_the_prompt_and_the_logged_context_first() {
         .iter()
         .map(|t| t["name"].as_str().unwrap())
         .collect();
-    assert_eq!(tools, ["bash", "edit", "sleep"]);
+    assert_eq!(tools, ["bash", "edit", "task", "sleep"]);
     assert_eq!(
         transcript(&log, u64::MAX, fixture.0.registry.get())[0],
         llm::Message::user(text.clone())
@@ -1732,7 +1752,7 @@ fn an_unsafe_call_cut_off_reports_the_output_it_committed() {
 fn the_model_is_set_per_session_and_says_where_it_comes_from() {
     let fixture = Fixture::new(
         ext_fixtures::ECHO,
-        Registry::default(),
+        Registry::default().with(&ext_settings::Settings).unwrap(),
         openai(&Script::new(&[])),
     );
     let session = fixture.start(&[]);
@@ -1777,6 +1797,25 @@ fn the_model_is_set_per_session_and_says_where_it_comes_from() {
     let again = fixture.start(&log[..5]);
     assert_eq!(again.model_spec(), "anthropic:claude-x");
     again.stop();
+}
+
+/// Every command is an extension's: without one, `/model` is input like
+/// any other, and a session advertises no commands.
+#[test]
+fn the_kernel_knows_no_command_names() {
+    let registry = Registry::default();
+    assert_eq!(commands(&registry), []);
+    let fixture = Fixture::new(ext_fixtures::ECHO, registry, openai(&Script::new(&[])));
+    let session = fixture.start(&[]);
+    session.submit("/model gpt".into()).unwrap();
+    settle(&session);
+    let log = log_of(&session);
+    session.stop();
+    assert_eq!(bodies(&log), [&user("/model gpt"), &echo("/model gpt")]);
+
+    let with = Registry::default().with(&ext_settings::Settings).unwrap();
+    let names: Vec<_> = commands(&with).into_iter().map(|c| c.name).collect();
+    assert_eq!(names, ["model"]);
 }
 
 #[test]
@@ -1872,3 +1911,4 @@ fn input_taken_in_during_recovery_runs_once() {
 }
 mod interrupt;
 mod log;
+mod retry;

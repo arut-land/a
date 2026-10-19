@@ -19,8 +19,8 @@ impl Extension for Fixtures {
 
 /// Echoes messages back. `$ <command>` runs it with `bash`,
 /// `sleep <seconds>` calls the `sleep` fixture and `spawn <message>` hands
-/// the message to a child session, so tool calls and links can be exercised
-/// without a model.
+/// the message to a child session with `task`, so tool calls and links can
+/// be exercised without a model.
 pub struct Echo;
 
 impl Agent for Echo {
@@ -33,12 +33,9 @@ impl Agent for Echo {
             }
             Input::ToolDone { .. } | Input::ModelDone { .. } => return Vec::new(),
         };
-        if let Some(input) = text.strip_prefix("spawn ") {
-            return vec![Action::Spawn {
-                input: input.to_owned(),
-            }];
-        }
-        let (tool, input) = if let Some(command) = text.strip_prefix("$ ") {
+        let (tool, input) = if let Some(prompt) = text.strip_prefix("spawn ") {
+            ("task", json!({ "prompt": prompt }))
+        } else if let Some(command) = text.strip_prefix("$ ") {
             ("bash", json!({ "command": command }))
         } else if let Some(Ok(seconds)) = text.strip_prefix("sleep ").map(str::parse::<u64>) {
             (Sleep::NAME, json!({ "seconds": seconds }))
@@ -121,12 +118,7 @@ mod tests {
         assert_eq!(tool_named(&echo.step(user("$ ls"))), Some("bash"));
         assert_eq!(tool_named(&echo.step(user("sleep 2"))), Some("sleep"));
         assert!(matches!(&echo.step(user("sleep x"))[..], [Action::Emit(_)]));
-        assert_eq!(
-            echo.step(user("spawn sleep 1")),
-            [Action::Spawn {
-                input: "sleep 1".into()
-            }]
-        );
+        assert_eq!(tool_named(&echo.step(user("spawn sleep 1"))), Some("task"));
     }
 
     #[test]

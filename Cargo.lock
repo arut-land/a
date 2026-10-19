@@ -14,7 +14,10 @@ dependencies = [
  "ext-fixtures",
  "ext-policy",
  "ext-prompt",
+ "ext-retry",
+ "ext-settings",
  "ext-shell",
+ "ext-subagent",
  "libc",
  "protocol",
  "rustix",
@@ -549,7 +552,11 @@ dependencies = [
  "ext-fixtures",
  "ext-policy",
  "ext-prompt",
+ "ext-retry",
+ "ext-settings",
  "ext-shell",
+ "ext-subagent",
+ "futures-core",
  "http",
  "llm",
  "memchr",
@@ -659,6 +666,23 @@ dependencies = [
 ]
 
 [[package]]
+name = "ext-retry"
+version = "0.0.0"
+dependencies = [
+ "ext",
+ "llm",
+]
+
+[[package]]
+name = "ext-settings"
+version = "0.0.0"
+dependencies = [
+ "ext",
+ "protocol",
+ "serde_json",
+]
+
+[[package]]
 name = "ext-shell"
 version = "0.0.0"
 dependencies = [
@@ -670,6 +694,16 @@ dependencies = [
  "serde_json",
  "sys",
  "vte",
+]
+
+[[package]]
+name = "ext-subagent"
+version = "0.0.0"
+dependencies = [
+ "ext",
+ "llm",
+ "serde",
+ "serde_json",
 ]
 
 [[package]]

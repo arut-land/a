@@ -50,6 +50,8 @@ pub struct SessionView {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Stream {
     pub call: u64,
+    /// The attempt the text is of: a retry streams anew.
+    pub attempt: u16,
     pub text: String,
 }
 
@@ -397,12 +399,17 @@ impl SessionView {
                 })
             }
             DaemonMsg::Entry(e) => self.entry(e),
-            DaemonMsg::Delta { call, text, .. } => {
+            DaemonMsg::Delta {
+                call,
+                text,
+                attempt,
+            } => {
                 match &mut self.streaming {
-                    Some(s) if s.call == *call => s.text.push_str(text),
+                    Some(s) if s.call == *call && s.attempt == *attempt => s.text.push_str(text),
                     s => {
                         *s = Some(Stream {
                             call: *call,
+                            attempt: *attempt,
                             text: text.clone(),
                         });
                     }

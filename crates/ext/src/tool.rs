@@ -1,6 +1,7 @@
 //! Typed tools, the erased form a toolset holds, and what a call runs
 //! with.
 
+use std::any::TypeId;
 use std::collections::BTreeMap;
 use std::future::Future;
 use std::path::{Path, PathBuf};
@@ -210,9 +211,12 @@ impl Cx {
         self.host.progress(text);
     }
 
-    /// Service `S`, if an extension provides it.
+    /// Service `S`, if an extension or the engine provides it.
     pub fn service<S: ?Sized + 'static>(&self) -> Option<&S> {
-        self.host.registry().service::<S>()
+        self.host.registry().service::<S>().or_else(|| {
+            let service = self.host.service(TypeId::of::<S>())?;
+            service.downcast_ref::<Arc<S>>().map(|s| &**s)
+        })
     }
 
     /// The call's session, as handlers at decision points see it.
