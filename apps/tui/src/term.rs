@@ -111,6 +111,55 @@ fn restore_on_signal() {
     });
 }
 
+/// The cursor's row, as the terminal says. One that never answers costs
+/// half a second (crossterm's own query waits 2 s); an answer later than
+/// that is read and dropped with the input. Typed input that arrives
+/// before the answer is dropped.
+#[cfg(unix)]
+pub fn cursor_row() -> Option<u16> {
+    use std::time::{Duration, Instant};
+
+    use rustix::event::{PollFd, PollFlags, Timespec, poll};
+
+    let deadline = Instant::now() + Duration::from_millis(500);
+    let mut out = io::stdout();
+    out.write_all(b"\x1b[6n").and_then(|()| out.flush()).ok()?;
+    let stdin = rustix::stdio::stdin();
+    let mut got = Vec::new();
+    loop {
+        let left = Timespec::try_from(deadline.checked_duration_since(Instant::now())?).ok()?;
+        if poll(&mut [PollFd::new(&stdin, PollFlags::IN)], Some(&left)).ok()? == 0 {
+            return None;
+        }
+        let mut buf = [0; 64];
+        let n = rustix::io::read(stdin, &mut buf).ok()?;
+        if n == 0 {
+            return None;
+        }
+        got.extend_from_slice(&buf[..n]);
+        if let Some(row) = position_report(&got) {
+            return Some(row);
+        }
+    }
+}
+
+#[cfg(not(unix))]
+pub fn cursor_row() -> Option<u16> {
+    cursor::position().ok().map(|(_, row)| row)
+}
+
+/// The 0-based row of the first `ESC [ row ; col R` in `bytes`.
+fn position_report(bytes: &[u8]) -> Option<u16> {
+    (0..bytes.len()).find_map(|at| {
+        let rest = bytes[at..].strip_prefix(b"\x1b[")?;
+        let end = rest.iter().position(|&b| !matches!(b, b'0'..=b'9' | b';'))?;
+        let (row, col) = std::str::from_utf8(&rest[..end]).ok()?.split_once(';')?;
+        (rest[end] == b'R' && col.parse::<u16>().is_ok())
+            .then(|| row.parse::<u16>().ok()?.checked_sub(1))
+            .flatten()
+    })
+}
+
 /// Reads the terminal on its own thread until it is gone. It blocks with
 /// no timeout: an idle client never wakes.
 pub fn spawn_input(tx: Sender<Event>, viewport: Viewport) {
@@ -121,7 +170,7 @@ pub fn spawn_input(tx: Sender<Event>, viewport: Viewport) {
                     // Inline: the terminal reflowed its lines, so ask where
                     // the cursor (and with it the viewport) ended up.
                     let row = (viewport == Viewport::Inline)
-                        .then(|| cursor::position().ok().map(|(_, row)| row))
+                        .then(cursor_row)
                         .flatten();
                     tx.send(Event::Resized(row))
                 }
@@ -139,4 +188,16 @@ pub fn spawn_input(tx: Sender<Event>, viewport: Viewport) {
             }
         }
     });
+}
+
+#[cfg(test)]
+mod tests {
+    #[test]
+    fn finds_the_position_report_among_other_input() {
+        use super::position_report;
+        assert_eq!(position_report(b"\x1b[12;40R"), Some(11));
+        assert_eq!(position_report(b"ab\x1b[A\x1b[3;1Rxy"), Some(2));
+        assert_eq!(position_report(b"\x1b[3;1"), None);
+        assert_eq!(position_report(b"\x1b[0;1R"), None);
+    }
 }

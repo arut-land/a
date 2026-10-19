@@ -3126,6 +3126,7 @@ dependencies = [
  "protocol",
  "ratatui-core",
  "ratatui-crossterm",
+ "rustix",
  "serde_json",
  "signal-hook",
  "sys",

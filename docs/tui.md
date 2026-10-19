@@ -172,8 +172,9 @@ far under a millisecond; at opt-level 3 the client's delta frame is 146 µs.
 - SIGKILL leaves the terminal in raw mode (`reset` fixes it).
 - Ctrl-Z is not handled (raw mode receives it as a key).
 - Inline asks the terminal where the cursor is at start and after a
-  resize; a terminal that never answers costs crossterm's 2 s timeout, and
-  the viewport then sits at the bottom.
+  resize; a terminal that never answers costs half a second (crossterm's
+  own query waits 2 s), and the viewport then sits at the bottom. Keys
+  typed before the answer are dropped.
 - The full screen reports the mouse, so selecting text takes the terminal's
   override (Shift-drag in most, Option-drag in iTerm2 and Terminal.app);
   the inline mode leaves the mouse to the terminal.
