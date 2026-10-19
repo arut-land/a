@@ -545,7 +545,6 @@ checksum = "0e9c71c2167ca323c882b99918929403426e2373ea17242ff5653e0d5e1058be"
 name = "engine"
 version = "0.0.0"
 dependencies = [
- "bytes",
  "ext",
  "ext-chat",
  "ext-edit",
@@ -1161,7 +1160,6 @@ checksum = "47d9d19d1d6efa0109d2f65ff4c85cddd50bd572e5a00127ab10987290bcefae"
 name = "llm"
 version = "0.0.0"
 dependencies = [
- "bytes",
  "futures-core",
  "http",
  "rt",

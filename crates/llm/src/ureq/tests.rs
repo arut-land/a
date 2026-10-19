@@ -46,7 +46,7 @@ fn client() -> (Ureq, mpsc::Receiver<()>) {
 
 fn request(port: u16) -> http::Request<Payload> {
     http::Request::post(format!("http://127.0.0.1:{port}/v1/responses"))
-        .body(Bytes::from_static(b"{}").into())
+        .body(b"{}".to_vec().into())
         .unwrap()
 }
 
@@ -87,7 +87,7 @@ fn server(reply: &'static [u8]) -> (u16, mpsc::Receiver<()>, mpsc::Receiver<()>)
     (port, got_rx, closed_rx)
 }
 
-fn next_chunk(body: &mut crate::http::Body) -> Option<io::Result<Bytes>> {
+fn next_chunk(body: &mut crate::http::Body) -> Option<io::Result<Vec<u8>>> {
     rt::block_on(std::future::poll_fn(|cx| {
         futures_core::Stream::poll_next(Pin::as_mut(body), cx)
     }))

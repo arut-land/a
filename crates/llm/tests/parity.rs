@@ -5,7 +5,6 @@ use std::collections::BTreeMap;
 use std::io;
 use std::path::{Path, PathBuf};
 
-use bytes::Bytes;
 use llm::http::{BoxFuture, Http, Payload, Response, body};
 use llm::protocols::{chat, gemini, messages, responses};
 use llm::{AssistantPart, Kind, Provider, Reason, Request};
@@ -24,11 +23,11 @@ impl Http for Recorded {
             builder = builder.header(name, value);
         }
         // Small chunks, so frames split across reads as on a network.
-        let chunks: Vec<Bytes> = self
+        let chunks: Vec<Vec<u8>> = self
             .body
             .as_bytes()
             .chunks(97)
-            .map(Bytes::copy_from_slice)
+            .map(<[u8]>::to_vec)
             .collect();
         let response = builder.body(body(chunks)).expect("recorded response");
         Box::pin(std::future::ready(Ok(response)))

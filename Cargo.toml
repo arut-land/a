@@ -32,7 +32,6 @@ sys = { path = "crates/sys" }
 tui = { path = "apps/tui" }
 web = { path = "apps/web" }
 
-bytes = { version = "1", default-features = false, features = ["std"] }
 http = { version = "1", default-features = false, features = ["std"] }
 memchr = { version = "2", default-features = false, features = ["std"] }
 libc = { version = "0.2.191", default-features = false }

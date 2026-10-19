@@ -9,7 +9,6 @@ use std::fmt::Write as _;
 use std::io;
 use std::path::{Path, PathBuf};
 
-use bytes::Bytes;
 use llm::http::{BoxFuture, Http, Payload, Response, body};
 use llm::protocols::{chat, gemini, messages, responses};
 use llm::{
@@ -22,12 +21,7 @@ struct Recorded(String);
 
 impl Http for Recorded {
     fn send(&self, _: http::Request<Payload>) -> BoxFuture<'static, io::Result<Response>> {
-        let chunks: Vec<Bytes> = self
-            .0
-            .as_bytes()
-            .chunks(97)
-            .map(Bytes::copy_from_slice)
-            .collect();
+        let chunks: Vec<Vec<u8>> = self.0.as_bytes().chunks(97).map(<[u8]>::to_vec).collect();
         let response = http::Response::builder()
             .status(200)
             .body(body(chunks))

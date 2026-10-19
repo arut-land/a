@@ -9,7 +9,6 @@ publish.workspace = true
 ureq = ["dep:ureq", "dep:rt"]
 
 [dependencies]
-bytes.workspace = true
 futures-core = { version = "0.3", default-features = false, features = ["std"] }
 http.workspace = true
 serde.workspace = true

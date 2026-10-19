@@ -40,10 +40,10 @@ impl Flaky {
 }
 
 /// A body that yields its bytes, then never ends.
-struct Hanging(Option<Bytes>);
+struct Hanging(Option<Vec<u8>>);
 
 impl futures_core::Stream for Hanging {
-    type Item = io::Result<Bytes>;
+    type Item = io::Result<Vec<u8>>;
 
     fn poll_next(mut self: Pin<&mut Self>, _: &mut Context<'_>) -> Poll<Option<Self::Item>> {
         self.0
@@ -68,7 +68,7 @@ impl Http for Flaky {
         };
         let response = match reply {
             Some(Reply::Status(status, headers)) => {
-                let mut r = response(status, llm::http::body([Bytes::from_static(b"{}")]));
+                let mut r = response(status, llm::http::body([b"{}".to_vec()]));
                 for (name, value) in headers {
                     r.headers_mut().insert(*name, value.parse().unwrap());
                 }

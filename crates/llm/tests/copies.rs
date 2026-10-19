@@ -7,7 +7,6 @@ use std::cell::Cell;
 use std::io;
 use std::path::Path;
 
-use bytes::Bytes;
 use llm::http::{BoxFuture, Http, Payload, Response, body};
 use llm::protocols::responses;
 use llm::{Accumulator, AssistantPart, Event, Message, Provider, Request};
@@ -55,11 +54,11 @@ fn allocated<T>(f: impl FnOnce() -> T) -> (T, usize) {
     (out, BYTES.with(Cell::get) - before)
 }
 
-struct Recorded(Bytes);
+struct Recorded(Vec<u8>);
 
 impl Http for Recorded {
     fn send(&self, _: http::Request<Payload>) -> BoxFuture<'static, io::Result<Response>> {
-        let chunks = self.0.chunks(1024).map(|chunk| self.0.slice_ref(chunk));
+        let chunks = self.0.chunks(1024).map(<[u8]>::to_vec);
         let response = http::Response::builder()
             .status(200)
             .body(body(chunks.collect::<Vec<_>>()))
@@ -75,7 +74,7 @@ fn recorded() -> Recorded {
     let text = std::fs::read_to_string(path).expect("cassette");
     let doc: serde_yaml_ng::Value = serde_yaml_ng::from_str(&text).expect("yaml");
     let body = doc["then"]["body"].as_str().expect("a body");
-    Recorded(Bytes::copy_from_slice(body.as_bytes()))
+    Recorded(body.as_bytes().to_vec())
 }
 
 #[test]
