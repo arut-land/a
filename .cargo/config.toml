@@ -3,13 +3,16 @@ include = [{ path = "profiles.toml" }]
 [unstable]
 codegen-backend = true
 
+# Unwind tables valid at calls only, which is where a panic unwinds from:
+# without epilogue CFI, ld64 encodes most frames compactly instead of
+# keeping DWARF for them (-161 KiB of __eh_frame on macOS).
 [build]
-rustflags = ["-Zthreads=8"]
+rustflags = ["-Zthreads=8", "-Zuse-sync-unwind=yes"]
 
-# Target rustflags replace build.rustflags, so -Zthreads is repeated here.
+# Target rustflags replace build.rustflags, so they are repeated here.
 [target.'cfg(target_os = "linux")']
 linker = "clang"
-rustflags = ["-Zthreads=8", "-Clink-arg=-fuse-ld=mold"]
+rustflags = ["-Zthreads=8", "-Zuse-sync-unwind=yes", "-Clink-arg=-fuse-ld=mold"]
 
 [target.'cfg(all(windows, target_env = "msvc"))']
 rustflags = ["-Zthreads=8", "-Ctarget-feature=+crt-static", "-Clink-arg=/STACK:8388608"]
@@ -17,5 +20,7 @@ rustflags = ["-Zthreads=8", "-Ctarget-feature=+crt-static", "-Clink-arg=/STACK:8
 [alias]
 # [unstable] build-std would also rebuild std for dev builds. Without std's
 # `backtrace` feature, panic backtraces print addresses, symbolicated offline
-# from the dSYM (-179 KiB).
-build-release = "build --release -Zbuild-std=std,panic_unwind -Zbuild-std-features=panic-unwind"
+# from the dSYM (-179 KiB). `optimize_for_size` picks core's and alloc's
+# smaller sorts and formatting (-65 KiB, no measured cost in the daemon or
+# the terminal client).
+build-release = "build --release -Zbuild-std=std,panic_unwind -Zbuild-std-features=panic-unwind,optimize_for_size"

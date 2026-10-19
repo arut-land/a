@@ -22,8 +22,11 @@ rt = { workspace = true, optional = true }
 [target.'cfg(any(target_vendor = "apple", windows))'.dependencies]
 ureq = { workspace = true, optional = true, features = ["native-tls"] }
 
+# Not `rustls`, which adds webpki-roots: Mozilla's roots, linked because
+# ureq matches on `RootCerts` at run time though the platform verifier
+# never reads them (on macOS the same roots cost 129 KiB).
 [target.'cfg(not(any(target_vendor = "apple", windows)))'.dependencies]
-ureq = { workspace = true, optional = true, features = ["rustls", "platform-verifier"] }
+ureq = { workspace = true, optional = true, features = ["rustls-no-provider", "_ring", "platform-verifier"] }
 
 [dev-dependencies]
 rt.workspace = true

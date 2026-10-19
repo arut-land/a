@@ -26,8 +26,9 @@ strip = "symbols"
 
 # Cold paths (one request encode per model turn, argv parsed once): size over
 # speed. Network time dominates these; hot paths such as serde_json stay at 3.
+# ureq and usage-argv are smaller at z (-38 KiB); http is not.
 [profile.release.package.ureq]
-opt-level = "s"
+opt-level = "z"
 
 [profile.release.package.ureq-proto]
 opt-level = "s"
@@ -39,6 +40,43 @@ opt-level = "s"
 opt-level = "s"
 
 [profile.release.package.usage-argv]
+opt-level = "z"
+
+# The daemon's control flow (sessions, tools, the log, the runtime, OS
+# calls) and the clients' connection: syscalls and the model dominate, and
+# s saves about 160 KiB with no measured change in daemon CPU.
+[profile.release.package.engine]
+opt-level = "s"
+
+[profile.release.package.agent]
+opt-level = "s"
+
+[profile.release.package.store]
+opt-level = "s"
+
+[profile.release.package.client]
+opt-level = "s"
+
+[profile.release.package.sys]
+opt-level = "s"
+
+[profile.release.package.rt]
+opt-level = "s"
+
+# The command line's dispatch, run once a process (-32 KiB). An override
+# on the binary's own package loses the profile's strip, so it is repeated.
+[profile.release.package.a]
+opt-level = "s"
+strip = "symbols"
+
+# The wire codec: s costs a small entry's decode ~6% and its encode ~30%
+# (still over 300 and 1000 MB/s; a frame is encoded once for every peer)
+# and saves 92 KiB. std (build-std) saves 13 KiB more at no measured cost;
+# alloc stays at 3, as s costs the terminal client's frame ~15%.
+[profile.release.package.protocol]
+opt-level = "s"
+
+[profile.release.package.std]
 opt-level = "s"
 
 # Network time dominates the provider layer: s costs its decoders ~6% per
@@ -95,11 +133,11 @@ opt-level = "z"
 [profile.release.package.http-body-util]
 opt-level = "z"
 
-# The terminal client redraws once per streamed token at most: s saves
-# 32 KiB over 3 for ~40 µs a frame (90 µs on a 6000-item session); z would
-# save 48 KiB more at twice the frame time (docs/tui.md).
+# The terminal client redraws once per streamed token: through ratatui, s
+# costs a 6000-item session's delta frame 175 µs against 125 µs at 3, for
+# 36 KiB (docs/tui.md).
 [profile.release.package.tui]
-opt-level = "s"
+opt-level = 3
 
 # cargo-bolero (`mise run fuzz`): optimized, and LLVM throughout for
 # libFuzzer's coverage instrumentation.
