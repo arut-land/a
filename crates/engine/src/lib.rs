@@ -14,9 +14,9 @@ use std::path::PathBuf;
 use std::pin::pin;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
-use std::task::{Poll, Waker};
+use std::task::Poll;
+use std::thread;
 use std::time::{Duration, Instant};
-use std::{mem, thread};
 
 use outbox::{Next, Outbox};
 use protocol::{
@@ -178,34 +178,14 @@ struct Daemon {
     started: u64,
 }
 
-/// A wake-up for one waiting task, remembered until it waits.
+/// Wakes the supervisor. A wake while it is busy is seen when it next
+/// waits.
 #[derive(Default)]
-struct Pulse(Mutex<(bool, Option<Waker>)>);
+struct Pulse(rt::Notify);
 
 impl Pulse {
     fn wake(&self) {
-        let mut pulse = lock(&self.0);
-        pulse.0 = true;
-        if let Some(waker) = pulse.1.take() {
-            waker.wake();
-        }
-    }
-
-    /// Waits for a wake, or until `deadline`; `true` if woken.
-    fn wait(&self, rt: &dyn rt::Runtime, deadline: Option<Instant>) -> impl Future<Output = bool> {
-        let mut sleep = deadline.map(|at| rt.sleep(at.saturating_duration_since(Instant::now())));
-        poll_fn(move |cx| {
-            let mut pulse = lock(&self.0);
-            if mem::take(&mut pulse.0) {
-                return Poll::Ready(true);
-            }
-            pulse.1 = Some(cx.waker().clone());
-            drop(pulse);
-            match sleep.as_mut().map(|sleep| sleep.as_mut().poll(cx)) {
-                Some(Poll::Ready(())) => Poll::Ready(false),
-                _ => Poll::Pending,
-            }
-        })
+        self.0.notify();
     }
 }
 
@@ -494,6 +474,7 @@ impl Daemon {
         // When a drain out of grace stopped the calls still running.
         let mut stopped: Option<Instant> = None;
         let mut awake: Option<Option<sys::Awake>> = None;
+        let mut pulsed = self.pulse.0.count();
         let mut jobs = agent::job::ENDED.count();
         loop {
             let now = Instant::now();
@@ -550,11 +531,26 @@ impl Daemon {
             }
             // Whatever woke us counts as activity, and idleness starts
             // again; a background job ending is only looked at.
-            let mut pulse = pin!(self.pulse.wait(&*self.shared.rt, next));
+            let mut sleep = next.map(|at| {
+                self.shared
+                    .rt
+                    .sleep(at.saturating_duration_since(Instant::now()))
+            });
+            let mut pulse = pin!(self.pulse.0.changed(&mut pulsed));
             let mut ended = pin!(agent::job::ENDED.changed(&mut jobs));
-            let woken = poll_fn(|cx| match pulse.as_mut().poll(cx) {
-                Poll::Pending => ended.as_mut().poll(cx).map(|()| false),
-                woken @ Poll::Ready(_) => woken,
+            let woken = poll_fn(|cx| {
+                if pulse.as_mut().poll(cx).is_ready() {
+                    return Poll::Ready(true);
+                }
+                let ended = ended.as_mut().poll(cx).is_ready();
+                let slept = sleep
+                    .as_mut()
+                    .is_some_and(|s| s.as_mut().poll(cx).is_ready());
+                if ended || slept {
+                    Poll::Ready(false)
+                } else {
+                    Poll::Pending
+                }
             });
             if woken.await {
                 since = None;

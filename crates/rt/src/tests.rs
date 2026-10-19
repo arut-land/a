@@ -35,7 +35,7 @@ fn blocking_pool_runs_work_concurrently() {
             unblock(&rt, move || {
                 let now = running.fetch_add(1, Ordering::SeqCst) + 1;
                 peak.fetch_max(now, Ordering::SeqCst);
-                std::thread::sleep(Duration::from_millis(30));
+                thread::sleep(Duration::from_millis(30));
                 running.fetch_sub(1, Ordering::SeqCst);
             })
         })
@@ -71,8 +71,8 @@ fn a_bounded_channel_streams_and_ends() {
 fn a_dropped_receiver_releases_a_waiting_sender() {
     let (tx, rx) = channel::bounded(1);
     tx.send(1).unwrap();
-    let waiting = std::thread::spawn(move || tx.send(2));
-    std::thread::sleep(Duration::from_millis(20));
+    let waiting = thread::spawn(move || tx.send(2));
+    thread::sleep(Duration::from_millis(20));
     drop(rx);
     assert_eq!(waiting.join().unwrap(), Err(2));
 }
@@ -124,12 +124,12 @@ fn an_idle_reactor_never_wakes() {
     block_on(Timer::after(Duration::from_millis(5)));
     // A dropped timer is forgotten, not woken for.
     let pending = std::pin::pin!(Timer::after(Duration::from_millis(50)))
-        .poll(&mut std::task::Context::from_waker(std::task::Waker::noop()));
+        .poll(&mut Context::from_waker(Waker::noop()));
     assert!(pending.is_pending());
     // Setting it woke the reactor to wait for it.
-    std::thread::sleep(Duration::from_millis(10));
+    thread::sleep(Duration::from_millis(10));
     let before = wakes();
-    std::thread::sleep(Duration::from_millis(500));
+    thread::sleep(Duration::from_millis(500));
     assert_eq!(wakes(), before);
 }
 
@@ -144,7 +144,7 @@ fn a_timer_wakes_at_its_deadline_not_before() {
     // on time.
     let rt = Threads::new(1);
     let late = spawn(&rt, Timer::after(Duration::from_secs(30)));
-    std::thread::sleep(Duration::from_millis(10));
+    thread::sleep(Duration::from_millis(10));
     let started = Instant::now();
     block_on(Timer::after(Duration::from_millis(10)));
     assert!(started.elapsed() < Duration::from_millis(500));
@@ -160,7 +160,7 @@ fn a_registered_pipe_reads_when_written_without_a_thread_per_read() {
     let rt = Threads::new(1);
     let wrote = unblock(&rt, move || {
         for chunk in [&b"one"[..], b"two"] {
-            std::thread::sleep(Duration::from_millis(20));
+            thread::sleep(Duration::from_millis(20));
             writer.write_all(chunk).unwrap();
         }
     });

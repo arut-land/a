@@ -1,12 +1,11 @@
 //! Typed tools, the erased form a [`Toolset`] holds, and what a call runs
 //! with.
 
-use std::future::{Future, poll_fn};
+use std::future::Future;
 use std::path::{Path, PathBuf};
 use std::process::Child;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
-use std::task::{Poll, Waker};
+use std::sync::{Arc, MutexGuard};
 use std::time::{Duration, Instant};
 
 use protocol::{Card, Environment, Json, Outcome, SessionId};
@@ -49,14 +48,13 @@ pub struct Cancel(Arc<Flag>);
 #[derive(Debug, Default)]
 struct Flag {
     set: AtomicBool,
-    wakers: Mutex<Vec<Waker>>,
+    notify: rt::Notify,
 }
 
 impl Cancel {
     pub fn cancel(&self) {
         self.0.set.store(true, Ordering::SeqCst);
-        let wakers = std::mem::take(&mut *self.wakers());
-        wakers.into_iter().for_each(Waker::wake);
+        self.0.notify.notify();
     }
 
     pub fn is_cancelled(&self) -> bool {
@@ -65,27 +63,7 @@ impl Cancel {
 
     /// Resolves once cancelled.
     pub fn cancelled(&self) -> impl Future<Output = ()> + Send + '_ {
-        poll_fn(|cx| {
-            if self.is_cancelled() {
-                return Poll::Ready(());
-            }
-            let mut wakers = self.wakers();
-            if !wakers.iter().any(|w| w.will_wake(cx.waker())) {
-                wakers.push(cx.waker().clone());
-            }
-            drop(wakers);
-            // Cancelled between the check and the registration: its wake
-            // may have missed this waker.
-            if self.is_cancelled() {
-                Poll::Ready(())
-            } else {
-                Poll::Pending
-            }
-        })
-    }
-
-    fn wakers(&self) -> MutexGuard<'_, Vec<Waker>> {
-        self.0.wakers.lock().unwrap_or_else(PoisonError::into_inner)
+        self.0.notify.until(|| self.is_cancelled())
     }
 }
 

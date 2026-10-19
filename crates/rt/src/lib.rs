@@ -20,13 +20,14 @@ mod smol;
 mod tokio;
 
 use std::future::Future;
-use std::pin::Pin;
+use std::pin::{Pin, pin};
 use std::sync::{Arc, Condvar, Mutex, MutexGuard, PoisonError};
-use std::time::Duration;
+use std::task::{Context, Poll, Wake, Waker};
+use std::thread::{self, Thread};
+use std::time::{Duration, Instant};
 
 pub use events::{Event, EventSink, Noop, Stderr};
 pub use notify::Notify;
-pub use pollster::block_on;
 #[cfg(unix)]
 pub use reactor::Async;
 pub use reactor::{Timer, wakes};
@@ -48,10 +49,42 @@ pub trait Runtime: Send + Sync + 'static {
     fn spawn_blocking(&self, work: Box<dyn FnOnce() + Send>);
 
     fn sleep(&self, duration: Duration) -> BoxFuture<'static, ()>;
+
+    /// The runtime's clock: a simulated runtime runs its own.
+    fn now(&self) -> Instant {
+        Instant::now()
+    }
 }
 
 /// A shared handle to the runtime a component was given.
 pub type Rt = Arc<dyn Runtime>;
+
+/// Drives `future` to completion on the calling thread, which sleeps
+/// between its wakes.
+pub fn block_on<F: Future>(future: F) -> F::Output {
+    struct Unpark(Thread);
+
+    impl Wake for Unpark {
+        fn wake(self: Arc<Self>) {
+            self.0.unpark();
+        }
+
+        fn wake_by_ref(self: &Arc<Self>) {
+            self.0.unpark();
+        }
+    }
+
+    let waker = Waker::from(Arc::new(Unpark(thread::current())));
+    let mut cx = Context::from_waker(&waker);
+    let mut future = pin!(future);
+    loop {
+        if let Poll::Ready(out) = future.as_mut().poll(&mut cx) {
+            return out;
+        }
+        // A stray unpark only polls once more.
+        thread::park();
+    }
+}
 
 /// The result of blocking `work`, run through `rt` without blocking the
 /// caller's task.
