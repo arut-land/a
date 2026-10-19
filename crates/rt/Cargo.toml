@@ -6,18 +6,20 @@ publish.workspace = true
 
 [features]
 default = ["threads"]
-# The built-in runtime.
-threads = ["dep:async-task"]
+# The built-in runtime: async-executor's workers and a blocking pool of
+# our own (the `blocking` crate's polls every 500 ms while idle).
+threads = ["dep:async-executor"]
 smol = ["dep:smol"]
 tokio = ["dep:tokio"]
 
 [dependencies]
-async-task = { version = "4", optional = true }
+async-executor = { version = "1", optional = true }
+# The reactor and timers of every runtime but tokio's: one thread waiting
+# in kqueue, epoll or IOCP (through polling) until something is due.
+async-io = "2"
 futures-core = { version = "0.3", default-features = false, features = ["std"] }
-# The reactor's poller: kqueue, epoll, or IOCP on Windows.
-mio = { version = "1", default-features = false, features = ["os-poll", "os-ext"] }
 smol = { version = "2", optional = true }
-tokio = { version = "1", default-features = false, features = ["rt", "time"], optional = true }
+tokio = { version = "1", default-features = false, features = ["rt", "time", "net"], optional = true }
 
 [target.'cfg(unix)'.dependencies]
 rustix.workspace = true
