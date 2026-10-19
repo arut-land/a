@@ -17,13 +17,13 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
 use crate::{
-    Audience, Body, Card, DaemonMsg, Decode, Entry, Environment, Json, Outcome, Permission,
-    SessionId, SessionSummary, Verdict, WaitOn,
+    Audience, Body, Card, DaemonMsg, Entry, Environment, Json, Outcome, Permission, SessionId,
+    SessionSummary, Verdict, WaitOn,
 };
 
 /// One session as a client shows it. Its serialized form is also what a
 /// [`DaemonMsg::Snapshot`] carries.
-#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
+#[derive(Clone, Debug, Default, PartialEq, Serialize)]
 pub struct SessionView {
     pub session: Option<SessionId>,
     pub workspace: PathBuf,
@@ -917,12 +917,6 @@ impl SessionList {
             }
             _ => false,
         }
-    }
-}
-
-impl Decode for SessionView {
-    fn from_json(bytes: &[u8]) -> serde_json::Result<Self> {
-        serde_json::from_slice(bytes)
     }
 }
 

@@ -816,12 +816,6 @@ pub struct ClientDecl {
     pub sites: Vec<String>,
 }
 
-impl ClientDecl {
-    pub fn is_default(&self) -> bool {
-        *self == Self::default()
-    }
-}
-
 /// What a client may do to a session.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]

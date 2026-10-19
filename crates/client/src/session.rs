@@ -151,16 +151,6 @@ pub enum Effect {
     Notice(String),
 }
 
-impl Effect {
-    /// Whether the driver carries it out, rather than the app.
-    pub const fn is_io(&self) -> bool {
-        matches!(
-            self,
-            Self::Connect { .. } | Self::Send(_) | Self::SendEnvironment | Self::Hangup
-        )
-    }
-}
-
 /// What a client's controls offer for the session's turn: computed here,
 /// so no app derives it.
 // Flags, as the apps' controls read them.
