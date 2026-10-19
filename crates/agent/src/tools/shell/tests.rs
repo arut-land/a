@@ -328,6 +328,25 @@ fn a_background_command_returns_at_once_with_its_log() {
     assert!(model(&ran).starts_with(&format!("[running in the background: pgid {}", job.pgid)));
 }
 
+/// Its end is an event, not something a poll finds: noticed within
+/// moments, whether the shell itself or a process it left behind ends
+/// last, and the leader is reaped (a zombie would keep the group alive).
+#[test]
+fn a_job_end_is_seen_at_once() {
+    let rig = rig("job-ends");
+    for command in ["sleep 0.3", "(sleep 0.3 &); exit 0"] {
+        let mut seen = crate::job::ENDED.count();
+        let ran = bash(&rig, &json!({ "command": command, "background": true }));
+        let pgid = ran.background.unwrap().pgid;
+        let started = Instant::now();
+        rt::block_on(crate::job::ENDED.changed(&mut seen));
+        let took = started.elapsed();
+        assert!(!sys::group_alive(pgid), "{command}");
+        assert!(took >= Duration::from_millis(250), "{command}: {took:?}");
+        assert!(took < Duration::from_millis(1000), "{command}: {took:?}");
+    }
+}
+
 /// Wraps every process in `env`, adding a variable.
 struct Wrap;
 

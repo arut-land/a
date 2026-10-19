@@ -271,7 +271,7 @@ async fn run(input: Command, cx: &Cx) -> io::Result<Ran> {
         cx.update::<Cwd>(Cwd::change(&cwd, base));
     }
     if done.lingering {
-        cx.spawned(pgid, true);
+        cx.own(pgid, None);
     }
     let Rendered {
         text,
@@ -300,12 +300,10 @@ fn background(cx: &Cx, spawn: Spawn, log: &Path) -> io::Result<Ran> {
     let (file, log) = create_private(log)?;
     let mut cmd = process(&spawn);
     cmd.stdout(file.try_clone()?).stderr(file);
-    let mut child = cmd.spawn()?;
+    let child = cmd.spawn()?;
     drop(cmd);
     let pgid = child.id();
-    cx.spawned(pgid, true);
-    // Reaped aside, so it never lingers as a zombie.
-    std::thread::spawn(move || child.wait());
+    cx.own(pgid, Some(child));
     Ok(Ran {
         cwd: spawn.cwd,
         duration_ms: duration_ms(started),

@@ -9,6 +9,7 @@
 
 pub mod channel;
 mod events;
+mod notify;
 mod reactor;
 #[cfg(feature = "threads")]
 mod threads;
@@ -24,6 +25,7 @@ use std::sync::{Arc, Condvar, Mutex, MutexGuard, PoisonError};
 use std::time::Duration;
 
 pub use events::{Event, EventSink, Noop, Stderr};
+pub use notify::Notify;
 pub use pollster::block_on;
 #[cfg(unix)]
 pub use reactor::Async;

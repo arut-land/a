@@ -8,6 +8,7 @@ version = "0.0.0"
 dependencies = [
  "client",
  "engine",
+ "libc",
  "protocol",
  "rustix",
  "serde_json",

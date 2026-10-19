@@ -448,3 +448,51 @@ fn processes(column: &str) -> Vec<(u32, String)> {
         })
         .collect()
 }
+
+/// Process `pid`'s threads now, and its threads' context switches so far:
+/// how often anything in it woke.
+pub fn threads_and_switches(pid: u32) -> (u64, u64) {
+    #[cfg(target_os = "linux")]
+    {
+        let field = |status: &str, name: &str| -> u64 {
+            status
+                .lines()
+                .find_map(|l| l.strip_prefix(name)?.trim().parse().ok())
+                .unwrap_or(0)
+        };
+        let (mut threads, mut switches) = (0, 0);
+        for task in fs::read_dir(format!("/proc/{pid}/task")).unwrap().flatten() {
+            let Ok(status) = fs::read_to_string(task.path().join("status")) else {
+                continue;
+            };
+            threads += 1;
+            switches += field(&status, "voluntary_ctxt_switches:")
+                + field(&status, "nonvoluntary_ctxt_switches:");
+        }
+        (threads, switches)
+    }
+    #[cfg(target_vendor = "apple")]
+    {
+        let mut info = std::mem::MaybeUninit::<libc::proc_taskinfo>::zeroed();
+        let size = i32::try_from(size_of::<libc::proc_taskinfo>()).unwrap();
+        #[allow(unsafe_code)]
+        // SAFETY: `info` is a writable buffer of exactly `size` bytes, as
+        // the flavor requires; the call writes at most that, and all of it
+        // when it returns `size`.
+        let info = unsafe {
+            let written = libc::proc_pidinfo(
+                pid.cast_signed(),
+                libc::PROC_PIDTASKINFO,
+                0,
+                info.as_mut_ptr().cast(),
+                size,
+            );
+            assert_eq!(written, size, "no task info for {pid}");
+            info.assume_init()
+        };
+        (
+            u64::try_from(info.pti_threadnum).unwrap(),
+            u64::try_from(info.pti_csw).unwrap(),
+        )
+    }
+}

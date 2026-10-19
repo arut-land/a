@@ -3,6 +3,7 @@
 
 use std::future::{Future, poll_fn};
 use std::path::{Path, PathBuf};
+use std::process::Child;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 use std::task::{Poll, Waker};
@@ -16,7 +17,7 @@ use serde_json::Value;
 use sys::Signal;
 
 use crate::state::{Cwd, State, States};
-use crate::{Hooks, Spawn};
+use crate::{Hooks, Spawn, job};
 
 /// Whether a call interrupted by a crash may run again.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -182,6 +183,17 @@ impl Cx {
 
     pub fn spawned(&self, pgid: u32, background: bool) {
         self.host.spawned(pgid, background);
+    }
+
+    /// Hands process group `pgid` to the session, past this call: it is
+    /// recorded, then watched until it ends (reaping `leader`, the child
+    /// that leads it, when it exits), when [`job::ENDED`] is notified.
+    pub fn own(&self, pgid: u32, leader: Option<Child>) {
+        self.host.spawned(pgid, true);
+        self.rt.spawn(Box::pin(async move {
+            job::ended(pgid, leader).await;
+            job::ENDED.notify();
+        }));
     }
 
     /// See [`Host::progress`].

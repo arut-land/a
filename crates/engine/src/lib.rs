@@ -11,6 +11,7 @@ use std::fs::{File, OpenOptions};
 use std::future::{Future, poll_fn};
 use std::io::{self, BufReader, Write};
 use std::path::PathBuf;
+use std::pin::pin;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 use std::task::{Poll, Waker};
@@ -207,10 +208,6 @@ impl Pulse {
         })
     }
 }
-
-/// How often the supervisor checks whether background processes have
-/// ended, while any run: nothing tells it when they do.
-const JOBS_CHECK: Duration = Duration::from_secs(5);
 
 /// A session the daemon knows about. Its log is loaded, and its actor runs,
 /// only while `live` is set; otherwise it is hibernated and costs nothing.
@@ -497,6 +494,7 @@ impl Daemon {
         // When a drain out of grace stopped the calls still running.
         let mut stopped: Option<Instant> = None;
         let mut awake: Option<Option<sys::Awake>> = None;
+        let mut jobs = agent::job::ENDED.count();
         loop {
             let now = Instant::now();
             event(|| rt::Event {
@@ -524,9 +522,6 @@ impl Daemon {
                 awake = busy.then(|| sys::Awake::hold("a: an agent is at work"));
             }
             let mut next = self.next_hibernation(config.hibernate, now);
-            if self.live().iter().any(|s| s.has_jobs()) {
-                next = Some(earliest(next, now + JOBS_CHECK));
-            }
             if let Some(began) = draining {
                 if now >= began + config.drain && stopped.is_none() {
                     for session in self.live() {
@@ -553,8 +548,15 @@ impl Daemon {
             } else {
                 since = None;
             }
-            // Whatever woke us counts as activity: idleness starts again.
-            if self.pulse.wait(&*self.shared.rt, next).await {
+            // Whatever woke us counts as activity, and idleness starts
+            // again; a background job ending is only looked at.
+            let mut pulse = pin!(self.pulse.wait(&*self.shared.rt, next));
+            let mut ended = pin!(agent::job::ENDED.changed(&mut jobs));
+            let woken = poll_fn(|cx| match pulse.as_mut().poll(cx) {
+                Poll::Pending => ended.as_mut().poll(cx).map(|()| false),
+                woken @ Poll::Ready(_) => woken,
+            });
+            if woken.await {
                 since = None;
             }
         }
