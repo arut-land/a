@@ -11,52 +11,105 @@
 use std::borrow::Cow;
 use std::fmt::Write as _;
 
-use serde::de::MapAccess;
+use serde::de::{IgnoredAny, MapAccess};
 use serde::{Deserialize, Deserializer};
 use serde_json::{Map, Value, json};
 use smol_str::format_smolstr;
 
 use super::KEY;
 use crate::error::{Error, Kind};
-use crate::json::{Fields, Json, Lenient, fields, first, present};
+use crate::json::{Fields, First, Json, Lenient, fields};
 use crate::protocol::Flow;
 use crate::spec::{Media, Meta, Reason, SmolStr, Source, Usage};
 use crate::writer::{End, Open, Writer, Writes};
 
-#[derive(Deserialize)]
-#[serde(rename_all = "camelCase")]
+#[derive(Default)]
 struct Chunk<'a> {
-    #[serde(borrow, default)]
     response_id: Json<'a>,
-    #[serde(borrow, default)]
     model_version: Json<'a>,
-    #[serde(default, deserialize_with = "present")]
     usage_metadata: bool,
     error: Option<Value>,
     prompt_feedback: Option<Value>,
     /// The first: it holds every part and the finish, so one of the wrong
     /// type, or with content or parts of the wrong type, fails the reply.
-    #[serde(borrow, default, deserialize_with = "first")]
     candidates: Option<Candidate<'a>>,
 }
 
-#[derive(Deserialize)]
-#[serde(rename_all = "camelCase")]
+impl<'de: 'a, 'a> Fields<'de> for Chunk<'a> {
+    fn field<A: MapAccess<'de>>(&mut self, key: &str, map: &mut A) -> Result<bool, A::Error> {
+        match key {
+            "responseId" => self.response_id = map.next_value()?,
+            "modelVersion" => self.model_version = map.next_value()?,
+            "usageMetadata" => {
+                map.next_value::<IgnoredAny>()?;
+                self.usage_metadata = true;
+            }
+            "error" => self.error = map.next_value()?,
+            "promptFeedback" => self.prompt_feedback = map.next_value()?,
+            "candidates" => self.candidates = map.next_value::<First<_>>()?.0,
+            _ => return Ok(false),
+        }
+        Ok(true)
+    }
+}
+
+impl<'de: 'a, 'a> Deserialize<'de> for Chunk<'a> {
+    fn deserialize<D: Deserializer<'de>>(json: D) -> Result<Self, D::Error> {
+        fields(json)
+    }
+}
+
+#[derive(Default)]
 struct Candidate<'a> {
     /// A name, or as proto3 JSON spells one its schema does not know, a
     /// number.
-    #[serde(borrow, default)]
     finish_reason: Json<'a>,
-    #[serde(borrow, default)]
     finish_message: Json<'a>,
-    #[serde(borrow)]
-    content: Option<Content<'a>>,
+    /// Its parts; content of the wrong type, or with parts of the wrong
+    /// type, fails the chunk.
+    parts: Option<Vec<Json<'a, Part<'a>>>>,
 }
 
-#[derive(Deserialize)]
+impl<'de: 'a, 'a> Fields<'de> for Candidate<'a> {
+    fn field<A: MapAccess<'de>>(&mut self, key: &str, map: &mut A) -> Result<bool, A::Error> {
+        match key {
+            "finishReason" => self.finish_reason = map.next_value()?,
+            "finishMessage" => self.finish_message = map.next_value()?,
+            "content" => {
+                let content = map.next_value::<Option<Content<'a>>>()?;
+                self.parts = content.and_then(|content| content.parts);
+            }
+            _ => return Ok(false),
+        }
+        Ok(true)
+    }
+}
+
+impl<'de: 'a, 'a> Deserialize<'de> for Candidate<'a> {
+    fn deserialize<D: Deserializer<'de>>(json: D) -> Result<Self, D::Error> {
+        fields(json)
+    }
+}
+
+#[derive(Default)]
 struct Content<'a> {
-    #[serde(borrow)]
     parts: Option<Vec<Json<'a, Part<'a>>>>,
+}
+
+impl<'de: 'a, 'a> Fields<'de> for Content<'a> {
+    fn field<A: MapAccess<'de>>(&mut self, key: &str, map: &mut A) -> Result<bool, A::Error> {
+        if key != "parts" {
+            return Ok(false);
+        }
+        self.parts = map.next_value()?;
+        Ok(true)
+    }
+}
+
+impl<'de: 'a, 'a> Deserialize<'de> for Content<'a> {
+    fn deserialize<D: Deserializer<'de>>(json: D) -> Result<Self, D::Error> {
+        fields(json)
+    }
 }
 
 /// An object part: its text, borrowed unless it holds escapes, when that
@@ -91,13 +144,6 @@ impl<'de: 'a, 'a> Deserialize<'de> for Part<'a> {
     fn deserialize<D: Deserializer<'de>>(json: D) -> Result<Self, D::Error> {
         fields(json)
     }
-}
-
-/// A chunk's usage, the rest unread.
-#[derive(Deserialize)]
-#[serde(rename_all = "camelCase")]
-struct UsageOf {
-    usage_metadata: Value,
 }
 
 /// Whether a finish or block reason is a content filter's verdict, final.
@@ -257,8 +303,8 @@ impl GeminiDecoder {
             return Err(Error::incomplete());
         };
         self.close()?;
-        let chunk = serde_json::from_str::<UsageOf>(&self.usage).ok();
-        end.raw_usage = chunk.map(|chunk| chunk.usage_metadata);
+        let chunk = serde_json::from_str::<Value>(&self.usage).ok();
+        end.raw_usage = chunk.and_then(|mut chunk| Some(chunk.get_mut("usageMetadata")?.take()));
         end.usage = end.raw_usage.as_ref().map_or_default(usage_of);
         end.message = end.message.filter(|_| reason != Reason::Stop);
         self.w.end(end)
@@ -435,8 +481,7 @@ impl Writes for GeminiDecoder {
             self.end.reason = Some((reason_of(&name), Some(name)));
             self.end.message = candidate.finish_message.str().map(str::to_owned);
         }
-        let parts = candidate.content.and_then(|content| content.parts);
-        for part in parts.into_iter().flatten() {
+        for part in candidate.parts.into_iter().flatten() {
             self.part(part)?;
         }
         // A failure is final: nothing after it is read. A stop waits for the

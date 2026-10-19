@@ -162,11 +162,6 @@ impl<'de: 'a, 'a, T: Deserialize<'de>, E: Deserialize<'de>> Deserialize<'de> for
 #[derive(Deserialize)]
 pub(crate) struct Str<'a>(#[serde(borrow)] pub(crate) Cow<'a, str>);
 
-/// Whether the field is present, whatever it holds (`null` included).
-pub(crate) fn present<'de, D: Deserializer<'de>>(field: D) -> Result<bool, D::Error> {
-    IgnoredAny::deserialize(field).map(|_| true)
-}
-
 /// An object read field by field: [`Fields::field`] takes the fields it
 /// names, and the rest gather in [`Fields::rest`] or are skipped. A field
 /// stated twice reads as its last value, as in a `Value`. serde's `flatten`
@@ -210,27 +205,27 @@ pub(crate) fn fields<'de, D: Deserializer<'de>, T: Fields<'de>>(json: D) -> Resu
 }
 
 /// The first element of a list, or `None` for `null`; any other value fails.
-pub(crate) fn first<'de, D, T>(list: D) -> Result<Option<T>, D::Error>
-where
-    D: Deserializer<'de>,
-    T: Deserialize<'de>,
-{
-    struct First<T>(PhantomData<T>);
-    impl<'de, T: Deserialize<'de>> Visitor<'de> for First<T> {
-        type Value = Option<T>;
-        fn expecting(&self, f: &mut fmt::Formatter) -> fmt::Result {
-            f.write_str("a list")
+pub(crate) struct First<T>(pub(crate) Option<T>);
+
+impl<'de, T: Deserialize<'de>> Deserialize<'de> for First<T> {
+    fn deserialize<D: Deserializer<'de>>(list: D) -> Result<Self, D::Error> {
+        struct Read<T>(PhantomData<T>);
+        impl<'de, T: Deserialize<'de>> Visitor<'de> for Read<T> {
+            type Value = First<T>;
+            fn expecting(&self, f: &mut fmt::Formatter) -> fmt::Result {
+                f.write_str("a list")
+            }
+            fn visit_unit<E>(self) -> Result<First<T>, E> {
+                Ok(First(None))
+            }
+            fn visit_seq<A: SeqAccess<'de>>(self, mut list: A) -> Result<First<T>, A::Error> {
+                let first = list.next_element()?;
+                while list.next_element::<IgnoredAny>()?.is_some() {}
+                Ok(First(first))
+            }
         }
-        fn visit_unit<E>(self) -> Result<Option<T>, E> {
-            Ok(None)
-        }
-        fn visit_seq<A: SeqAccess<'de>>(self, mut list: A) -> Result<Option<T>, A::Error> {
-            let first = list.next_element()?;
-            while list.next_element::<IgnoredAny>()?.is_some() {}
-            Ok(first)
-        }
+        list.deserialize_any(Read(PhantomData))
     }
-    list.deserialize_any(First(PhantomData))
 }
 
 /// The word of a wire vocabulary `name` is; `None` for one it lacks.
