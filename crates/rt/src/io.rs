@@ -98,11 +98,10 @@ impl<T: std::os::fd::AsFd> Async<T> {
                     Interest::READABLE
                 };
                 let _entered = handle.enter();
-                #[allow(unsafe_code, reason = "tokio takes on trust that the fd stays open")]
-                // SAFETY: `Fd` owns `io`, so its descriptor stays open and
-                // the same for as long as the `AsyncFd` that owns it.
-                let fd =
-                    unsafe { tokio::io::unix::AsyncFd::register_with_interest(Fd(io), interest) };
+                // The safe registration; its replacement is `unsafe`, and
+                // unsafe code lives in `sys` only.
+                #[expect(deprecated)]
+                let fd = tokio::io::unix::AsyncFd::with_interest(Fd(io), interest);
                 Inner::Tokio(fd?)
             }
         };
