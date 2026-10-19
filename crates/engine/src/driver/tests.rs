@@ -8,6 +8,7 @@ use std::sync::{Mutex, Weak};
 use std::thread;
 use std::time::Duration;
 
+use crate::store::{Loaded, Log, LogStore, Memory};
 use bytes::Bytes;
 use ext::{Extension, Registrar, Replay, Rewrite, Tool, point};
 use ext_policy::Policy;
@@ -15,7 +16,6 @@ use llm::http::Http;
 use protocol::{CallId, Caps, Card, Permission, Seq, WaitOn};
 use serde::Deserialize as _;
 use serde_json::{Value, json};
-use store::{Loaded, LogStore, Memory};
 
 use super::*;
 
@@ -282,8 +282,12 @@ impl Fixture {
         let header = self.header();
         let mut created = self.0.store.create(&header).unwrap();
         for e in entries {
-            let e = Entry::new(e.seq, created.epoch, e.body.clone());
-            created.log.append(&e).unwrap();
+            let e = Entry::new(e.seq, created.writer.epoch(), e.body.clone());
+            created
+                .writer
+                .log
+                .append_all(std::slice::from_ref(&e))
+                .unwrap();
         }
         drop(created);
         Live::start(&header, &self.0, Open::Load, Owner::None).unwrap()
@@ -389,7 +393,7 @@ impl Log for Probed {
 impl LogStore for Probe {
     fn create(&self, header: &Header) -> io::Result<Loaded> {
         let mut loaded = self.store.create(header)?;
-        loaded.log = Box::new(Probed(loaded.log, self.clone()));
+        loaded.writer.log = Box::new(Probed(loaded.writer.log, self.clone()));
         Ok(loaded)
     }
 

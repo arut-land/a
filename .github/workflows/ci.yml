@@ -134,7 +134,7 @@ jobs:
     # platform seams live in `sys` and `rt`, whose Windows halves the daemon
     # still lacks report that they are unsupported. `a` runs its line REPL.
     env:
-      PORTABLE: -p sys -p rt -p protocol -p store -p ext -p ext-chat -p ext-edit -p ext-fixtures -p ext-policy -p ext-prompt -p ext-shell -p llm -p client -p tui
+      PORTABLE: -p sys -p rt -p protocol -p ext -p ext-chat -p ext-edit -p ext-fixtures -p ext-policy -p ext-prompt -p ext-shell -p llm -p client -p tui
     steps:
       - uses: actions/checkout@v7
       - *mbx-dir

@@ -1,11 +1,11 @@
 use std::path::PathBuf;
 use std::time::{Duration, Instant};
 
+use crate::store::{Header, Jsonl, LogStore};
 use protocol::{
     Activity, Audience, Body, Entry, Environment, Outcome, Residency, SessionId, Target,
 };
 use serde_json::json;
-use store::{Header, Jsonl, LogStore};
 use sys::Home;
 
 use ext::host::Registry;
@@ -172,8 +172,9 @@ fn busy_sessions_recover_at_startup() {
             by: Audience::Model,
         };
         created
+            .writer
             .log
-            .append(&Entry::new(seq, created.epoch, body))
+            .append_all(&[Entry::new(seq, created.writer.epoch(), body)])
             .unwrap();
     }
     store.mark_busy(id, true).unwrap();
@@ -445,15 +446,19 @@ fn watches_rearm_after_a_crash_and_fire_once() {
     let write = |header: &Header, bodies: Vec<Body>, busy: bool| {
         let mut created = store.create(header).unwrap();
         for (seq, body) in (1..).zip(bodies) {
-            let entry = Entry::new(seq, created.epoch, body);
-            created.log.append(&entry).unwrap();
+            let entry = Entry::new(seq, created.writer.epoch(), body);
+            created
+                .writer
+                .log
+                .append_all(std::slice::from_ref(&entry))
+                .unwrap();
         }
         store.mark_busy(header.id, busy).unwrap();
     };
     let session = |parent: Option<SessionId>| Header {
         id: SessionId::new(),
         workspace: "/w".into(),
-        parent: parent.map(|session| store::Parent { session, call: 3 }),
+        parent: parent.map(|session| crate::store::Parent { session, call: 3 }),
         extensions: Vec::new(),
     };
     // The `task` call, its link, its wait on the child and the watch commit
@@ -608,7 +613,7 @@ fn an_orphan_does_not_resume_what_it_was_doing() {
     let header = Header {
         id: SessionId::new(),
         workspace: "/w".into(),
-        parent: Some(store::Parent {
+        parent: Some(crate::store::Parent {
             session: SessionId::new(),
             call: 2,
         }),
@@ -628,8 +633,12 @@ fn an_orphan_does_not_resume_what_it_was_doing() {
         },
     ];
     for (seq, body) in (1..).zip(bodies_written) {
-        let entry = Entry::new(seq, created.epoch, body);
-        created.log.append(&entry).unwrap();
+        let entry = Entry::new(seq, created.writer.epoch(), body);
+        created
+            .writer
+            .log
+            .append_all(std::slice::from_ref(&entry))
+            .unwrap();
     }
     store.mark_busy(header.id, true).unwrap();
     drop(created);

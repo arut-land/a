@@ -429,10 +429,12 @@ fn a_tab_streams_replies_and_answers_asks_until_it_closes() {
         let shown = shown(p);
         !end(p).contains(">Stop<")
             // Stop shows before the process starts, so the interrupt may
-            // also land before the spawn: then nothing ran.
+            // also land before the spawn: then nothing ran, and the call
+            // ends aborted.
             && (shown.contains("interrupted before it finished")
                 || shown.contains("killed by")
-                || shown.contains("[aborted]"))
+                || shown.contains("[aborted]")
+                || shown.contains(">aborted<"))
     });
 
     // Closing the tab detaches its client; stopping `a web` leaves the

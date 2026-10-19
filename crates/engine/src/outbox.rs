@@ -10,8 +10,8 @@ use std::io;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Condvar, Mutex, PoisonError};
 
+use crate::store::Lines;
 use protocol::{Caps, Class, Decode, Entry, Frame};
-use store::Lines;
 
 use crate::lock;
 
@@ -347,7 +347,7 @@ mod tests {
     }
 
     /// A session's log, and the frame log that shows it.
-    struct Shown(store::Loaded, Arc<FrameLog>);
+    struct Shown(crate::store::Loaded, Arc<FrameLog>);
 
     impl Shown {
         fn push(&mut self, text: &str) {
@@ -361,13 +361,14 @@ mod tests {
     }
 
     fn log(texts: &[&str]) -> Shown {
-        let header = store::Header {
+        let header = crate::store::Header {
             id: protocol::SessionId::new(),
             workspace: "/w".into(),
             parent: None,
             extensions: Vec::new(),
         };
-        let loaded = store::LogStore::create(&store::Memory::default(), &header).unwrap();
+        let loaded =
+            crate::store::LogStore::create(&crate::store::Memory::default(), &header).unwrap();
         let frames = Arc::new(FrameLog::new(Arc::clone(&loaded.lines), 0));
         let mut log = Shown(loaded, frames);
         for text in texts {

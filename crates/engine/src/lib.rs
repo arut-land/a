@@ -4,6 +4,7 @@ pub mod config;
 mod driver;
 mod model;
 mod outbox;
+mod store;
 mod transcript;
 mod upgrade;
 
@@ -19,6 +20,7 @@ use std::task::Poll;
 use std::thread;
 use std::time::{Duration, Instant};
 
+use crate::store::{Header, Jsonl, LogStore};
 use driver::{Attachment, Ended, Live, Open, Request, Shared};
 use outbox::Outbox;
 use protocol::{
@@ -27,7 +29,6 @@ use protocol::{
     SessionSummary, SettingsChange, Target, Versions, read_frame,
 };
 use rt::oneshot;
-use store::{Header, Jsonl, LogStore};
 use sys::{Home, Listener, Stream};
 use upgrade::{Lifecycle, Verdict};
 

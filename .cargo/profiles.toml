@@ -78,9 +78,6 @@ opt-level = "s"
 [profile.release.package.ext-subagent]
 opt-level = "s"
 
-[profile.release.package.store]
-opt-level = "s"
-
 [profile.release.package.client]
 opt-level = "s"
 

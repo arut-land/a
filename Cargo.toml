@@ -28,7 +28,6 @@ engine = { path = "crates/engine" }
 llm = { path = "crates/llm" }
 protocol = { path = "crates/protocol" }
 rt = { path = "crates/rt" }
-store = { path = "crates/store" }
 sys = { path = "crates/sys" }
 tui = { path = "apps/tui" }
 web = { path = "apps/web" }

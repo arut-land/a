@@ -17,7 +17,6 @@ rt.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 protocol.workspace = true
-store.workspace = true
 sys.workspace = true
 
 [lints]

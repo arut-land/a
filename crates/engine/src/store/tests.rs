@@ -84,7 +84,7 @@ macro_rules! conformance {
             concurrent_sessions_do_not_interfere,
             ids_are_unique_and_missing_ones_not_found,
             each_load_leases_a_newer_epoch,
-            a_superseded_or_mismatched_writer_cannot_append,
+            reading_entries_leaves_the_writer_alone,
         );)*
     };
 }
@@ -117,8 +117,12 @@ fn entry(seq: u64, epoch: u32) -> Entry {
 fn append(loaded: &mut Loaded, seqs: impl IntoIterator<Item = u64>) -> Vec<Entry> {
     seqs.into_iter()
         .map(|seq| {
-            let e = entry(seq, loaded.epoch);
-            loaded.log.append(&e).unwrap();
+            let e = entry(seq, loaded.writer.epoch());
+            loaded
+                .writer
+                .log
+                .append_all(std::slice::from_ref(&e))
+                .unwrap();
             e
         })
         .collect()
@@ -163,9 +167,9 @@ fn batches_append_in_order(store: &dyn LogStore) {
     let h = header("/w");
     let mut log = store.create(&h).unwrap();
     let mut written = append(&mut log, 1..=2);
-    let batch: Vec<Entry> = (3..=6).map(|seq| entry(seq, log.epoch)).collect();
-    log.log.append_all(&batch).unwrap();
-    log.log.append_all(&[]).unwrap();
+    let batch: Vec<Entry> = (3..=6).map(|seq| entry(seq, log.writer.epoch())).collect();
+    log.writer.log.append_all(&batch).unwrap();
+    log.writer.log.append_all(&[]).unwrap();
     written.extend(batch);
     written.extend(append(&mut log, 7..=7));
     assert_eq!(entries_of(store, h.id), written);
@@ -211,8 +215,6 @@ fn lines_read_back_as_appended(store: &dyn LogStore) {
     let (mut loaded, _) = load(store, h.id);
     assert_eq!(loaded.seq, 3);
     written.extend(append(&mut loaded, 4..=5));
-    let refused = created.log.append(&entry(6, created.epoch)).unwrap_err();
-    assert_eq!(refused.kind(), ErrorKind::ResourceBusy);
     let again = load(store, h.id).0;
     for (lines, upto) in [(&created.lines, 3), (&loaded.lines, 5), (&again.lines, 5)] {
         for e in &written[..upto] {
@@ -335,7 +337,7 @@ fn each_load_leases_a_newer_epoch(store: &dyn LogStore) {
     let mut epochs = Vec::new();
     for seq in 3..=5 {
         let mut loaded = load(store, h.id).0;
-        epochs.push(loaded.epoch);
+        epochs.push(loaded.writer.epoch());
         append(&mut loaded, [seq]);
     }
     assert!(epochs[0] > 0, "{epochs:?}");
@@ -343,24 +345,17 @@ fn each_load_leases_a_newer_epoch(store: &dyn LogStore) {
     let (loaded, entries) = load(store, h.id);
     let logged: Vec<u32> = entries.iter().map(|e| e.epoch).collect();
     assert_eq!(logged[2..], epochs);
-    assert!(loaded.epoch > epochs[2]);
+    assert!(loaded.writer.epoch() > epochs[2]);
 }
 
-/// Reading entries leaves the writer's lease alone; loading supersedes it.
-fn a_superseded_or_mismatched_writer_cannot_append(store: &dyn LogStore) {
+/// Reading entries takes no lease: the writer goes on appending.
+fn reading_entries_leaves_the_writer_alone(store: &dyn LogStore) {
     let h = header("/w");
-    let mut stale = store.create(&h).unwrap();
-    let written = append(&mut stale, 1..=2);
+    let mut writing = store.create(&h).unwrap();
+    let written = append(&mut writing, 1..=2);
     assert_eq!(store.entries(h.id).unwrap(), written);
-    append(&mut stale, [3]);
-    let (mut current, entries) = load(store, h.id);
-    let refused = stale.log.append(&entry(4, stale.epoch)).unwrap_err();
-    assert_eq!(refused.kind(), ErrorKind::ResourceBusy);
-    let batch = [entry(4, current.epoch), entry(5, current.epoch - 1)];
-    let mismatched = current.log.append_all(&batch).unwrap_err();
-    assert_eq!(mismatched.kind(), ErrorKind::ResourceBusy);
-    assert_eq!(store.entries(h.id).unwrap(), entries);
-    assert_eq!(entries.len(), 3);
+    let more = append(&mut writing, [3]);
+    assert_eq!(store.entries(h.id).unwrap()[2..], more);
 }
 
 /// A JSONL session file with `tail` written after its entries, as a crash
@@ -472,5 +467,5 @@ fn jsonl_leases_past_the_epochs_its_files_hold() {
     append(&mut created, 1..=2);
     // As a later daemon, with no leases of its own yet.
     let later = Jsonl::open(store.dir.as_ref().unwrap()).unwrap();
-    assert!(later.load(h.id, &mut drop).unwrap().epoch > created.epoch);
+    assert!(later.load(h.id, &mut drop).unwrap().writer.epoch() > created.writer.epoch());
 }

@@ -5,7 +5,7 @@ use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 
 use protocol::{Decode, Entry, SessionId};
 
-use crate::{Header, Lease, LeaseAuthority, Lines, Loaded, Local, Log, LogStore, not_found, span};
+use super::{Header, LeaseAuthority, Lines, Loaded, Local, Log, LogStore, Writer, not_found, span};
 
 /// Sessions held in this process, for tests: durable until it exits. Each
 /// keeps its entries as the lines a file would, so it is read back as one.
@@ -33,12 +33,11 @@ impl Memory {
     }
 
     fn loaded(&self, id: SessionId, lines: Arc<Shared>, floor: u32) -> Loaded {
-        let lease = self.leases.acquire(id, floor);
+        let epoch = self.leases.acquire(id, floor);
         let seq = lock(&lines.0).len() as u64;
         Loaded {
             seq,
-            epoch: lease.epoch,
-            log: Box::new(MemoryLog(Arc::clone(&lines), lease)),
+            writer: Writer::new(Box::new(MemoryLog(Arc::clone(&lines))), epoch),
             lines,
         }
     }
@@ -132,11 +131,10 @@ impl Lines for Shared {
     }
 }
 
-struct MemoryLog(Arc<Shared>, Lease);
+struct MemoryLog(Arc<Shared>);
 
 impl Log for MemoryLog {
     fn append_all(&mut self, entries: &[Entry]) -> io::Result<()> {
-        self.1.admit(entries)?;
         let mut encoded = Vec::with_capacity(entries.len());
         for entry in entries {
             let mut line = Vec::new();

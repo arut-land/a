@@ -68,7 +68,7 @@ impl Drop for OnDisk {
 fn on_disk(name: &str) -> OnDisk {
     let dir = std::env::temp_dir().join(format!("a-engine-log-{}-{name}", std::process::id()));
     let _ = fs::remove_dir_all(&dir);
-    let store = Arc::new(store::Jsonl::open(&dir).unwrap());
+    let store = Arc::new(crate::store::Jsonl::open(&dir).unwrap());
     let fixture = Fixture::on(
         store,
         ext_fixtures::ECHO,

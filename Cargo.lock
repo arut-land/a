@@ -566,7 +566,6 @@ dependencies = [
  "serde",
  "serde_json",
  "serde_yaml_ng",
- "store",
  "sys",
 ]
 
@@ -1859,17 +1858,6 @@ name = "static_assertions"
 version = "1.1.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "a2eb9349b6444b326872e140eb1cf5e7c522154d69e7a0ffb0fb81c06b37543f"
-
-[[package]]
-name = "store"
-version = "0.0.0"
-dependencies = [
- "memchr",
- "protocol",
- "serde",
- "serde_json",
- "sys",
-]
 
 [[package]]
 name = "strum"

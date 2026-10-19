@@ -8,7 +8,7 @@ use std::path::{Path, PathBuf};
 /// SDK and every extension, the protocol, the client SDK and the store.
 fn kernel_crates() -> Vec<PathBuf> {
     let crates = Path::new(env!("CARGO_MANIFEST_DIR")).join("..");
-    let mut dirs: Vec<PathBuf> = ["engine", "ext", "protocol", "client", "store"]
+    let mut dirs: Vec<PathBuf> = ["engine", "ext", "kernel", "protocol", "client"]
         .iter()
         .map(|name| crates.join(name))
         .collect();

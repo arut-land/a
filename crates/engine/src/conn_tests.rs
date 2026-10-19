@@ -7,12 +7,12 @@ use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
+use crate::store::{Header, Jsonl, LogStore};
 use protocol::view::SessionView;
 use protocol::{
     Body, Caps, ClientDecl, ClientId, ClientMsg, DaemonMsg, Entry, Environment, Origin, PROTO,
     Rejection, Role, SessionId, SettingsChange, Target, read_frame, write_frame,
 };
-use store::{Header, Jsonl, LogStore};
 use sys::Home;
 
 use super::outbox::Outbox;
@@ -408,7 +408,7 @@ fn far_behind_a_client_gets_a_snapshot_if_it_takes_them() {
                 extensions: Vec::new(),
             })
             .unwrap();
-        let (epoch, mut log) = (created.epoch, created.log);
+        let (epoch, mut log) = (created.writer.epoch(), created.writer.log);
         let entries: Vec<Entry> = (1..=300)
             .map(|seq| {
                 let text = format!("m{seq}");

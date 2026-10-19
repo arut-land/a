@@ -5,6 +5,7 @@
 
 mod jsonl;
 mod lease;
+#[cfg(test)]
 mod memory;
 #[cfg(test)]
 mod tests;
@@ -14,11 +15,12 @@ use std::ops::RangeInclusive;
 use std::path::PathBuf;
 use std::sync::Arc;
 
-use protocol::{Body, Entry, Installed, SessionId};
+use protocol::{Entry, Installed, SessionId};
 use serde::{Deserialize, Serialize};
 
 pub use jsonl::Jsonl;
-pub use lease::{Lease, LeaseAuthority, Local};
+pub use lease::{LeaseAuthority, Local};
+#[cfg(test)]
 pub use memory::Memory;
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -42,32 +44,57 @@ pub struct Parent {
     pub call: u64,
 }
 
-/// A session's appender, and the entries it continues as their lines.
+/// A session's writer, and the entries it continues as their lines.
 pub struct Loaded {
-    pub log: Box<dyn Log>,
+    pub writer: Writer,
     /// The committed entries' lines, read back by seq from where the log
     /// keeps them rather than held in memory; appends add to them.
     pub lines: Arc<dyn Lines>,
     /// The seq of the last entry committed.
     pub seq: u64,
-    /// The epoch of the appender's lease, which every entry it appends
-    /// carries.
-    pub epoch: u32,
 }
 
 impl Loaded {
     /// Appends `body` as the next entry, durably, and returns it.
-    pub fn append(&mut self, body: Body) -> io::Result<Entry> {
-        let entry = Entry::new(self.seq + 1, self.epoch, body);
-        self.log.append(&entry)?;
+    #[cfg(test)]
+    pub fn append(&mut self, body: protocol::Body) -> io::Result<Entry> {
+        let mut entry = [Entry::new(self.seq + 1, 0, body)];
+        self.writer.append(&mut entry)?;
+        let [entry] = entry;
         self.seq = entry.seq;
         Ok(entry)
     }
 }
 
-/// Where session logs live. Each `create` or `load` leases the appender it
-/// returns, superseding any earlier one for the session: that one's appends
-/// fail from then on.
+/// The one appender of a session's log, with the epoch of its lease: only
+/// a store makes one, as it creates or loads the log, and it is moved, never
+/// shared, so a session has one writer for as long as it lives.
+pub struct Writer {
+    pub(crate) log: Box<dyn Log>,
+    epoch: u32,
+}
+
+impl Writer {
+    pub(crate) fn new(log: Box<dyn Log>, epoch: u32) -> Self {
+        Self { log, epoch }
+    }
+
+    #[cfg(test)]
+    pub const fn epoch(&self) -> u32 {
+        self.epoch
+    }
+
+    /// Appends `entries`, each stamped with the lease's epoch, durably.
+    pub fn append(&mut self, entries: &mut [Entry]) -> io::Result<()> {
+        for e in &mut *entries {
+            e.epoch = self.epoch;
+        }
+        self.log.append_all(entries)
+    }
+}
+
+/// Where session logs live. Each `create` or `load` hands out the log's
+/// writer under a lease newer than every one before.
 pub trait LogStore: Send + Sync {
     /// A new, empty session log; fails with `AlreadyExists` if the id is taken.
     fn create(&self, header: &Header) -> io::Result<Loaded>;
@@ -97,17 +124,10 @@ pub trait LogStore: Send + Sync {
 
 /// One session's appender.
 pub trait Log: Send {
-    /// Returns once the entry is as durable as the backend makes anything: a
-    /// crash afterwards never loses it. Fails with `ResourceBusy` and writes
-    /// nothing if the appender's lease was superseded or the entry carries
-    /// another epoch.
-    fn append(&mut self, entry: &Entry) -> io::Result<()> {
-        self.append_all(std::slice::from_ref(entry))
-    }
-
-    /// Appends `entries` in order, as durably as [`Log::append`]; a backend
-    /// may make them durable together. After a crash the log holds a prefix
-    /// of them, and after a failure none.
+    /// Appends `entries` in order, returning once they are as durable as the
+    /// backend makes anything: a crash afterwards never loses them. A
+    /// backend may make them durable together. After a crash the log holds
+    /// a prefix of them, and after a failure none.
     fn append_all(&mut self, entries: &[Entry]) -> io::Result<()>;
 }
 
@@ -120,6 +140,7 @@ pub trait Lines: Send + Sync {
     fn read(&self, seqs: RangeInclusive<u64>, limit: usize, out: &mut Vec<u8>) -> io::Result<u64>;
 }
 
+#[cfg(test)]
 fn not_found(id: SessionId) -> io::Error {
     io::Error::new(io::ErrorKind::NotFound, format!("no session {id}"))
 }

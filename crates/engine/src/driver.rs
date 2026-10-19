@@ -18,6 +18,7 @@ use std::sync::{Arc, Mutex, OnceLock};
 use std::task::Poll;
 use std::time::Instant;
 
+use crate::store::{Header, Parent, Writer};
 use ext::host::{Host, Parts, Registry};
 use ext::point::{Failed, View};
 use ext::{
@@ -31,7 +32,6 @@ use protocol::{
     Json, Mode, Outcome, Overrides, Residency, SessionId, SessionSummary, Verdict,
 };
 use rt::{channel, oneshot};
-use store::{Header, Log, Parent};
 
 use crate::model::{Model, Models};
 use crate::outbox::{FrameLog, Outbox};
@@ -42,7 +42,7 @@ use crate::{Daemon, lock};
 pub struct Shared {
     /// Where actors and effects run, sleep and block.
     pub rt: rt::Rt,
-    pub store: Arc<dyn store::LogStore>,
+    pub store: Arc<dyn crate::store::LogStore>,
     /// The extensions, as each session takes them up at its next step.
     pub registry: ext::host::Current,
     pub models: Models,
@@ -244,10 +244,7 @@ impl Live {
         let actor = Actor {
             live: Arc::clone(&live),
             core,
-            writer: Some(Writer {
-                log: loaded.log,
-                epoch: loaded.epoch,
-            }),
+            writer: Some(loaded.writer),
             registry,
             transcript: None,
             replied: None,
@@ -369,13 +366,6 @@ fn summary(header: &Header, ledger: &protocol::ledger::Ledger) -> SessionSummary
         activity: ledger.activity(),
         residency: Residency::Loaded,
     }
-}
-
-/// The one appender of a session's log: only the store makes one, it is
-/// moved into the actor, and it is closed as the actor ends.
-struct Writer {
-    log: Box<dyn Log>,
-    epoch: u32,
 }
 
 struct Actor {
@@ -595,12 +585,9 @@ impl Actor {
             .take()
             .ok_or_else(|| io::Error::other("no writer"))?;
         let mut entries = std::mem::take(batch);
-        for e in &mut entries {
-            e.epoch = writer.epoch;
-        }
         let rt = Arc::clone(&self.live.session.shared.rt);
         let (writer, entries, written) = rt::unblock(&*rt, move || {
-            let written = catch_unwind(AssertUnwindSafe(|| writer.log.append_all(&entries)))
+            let written = catch_unwind(AssertUnwindSafe(|| writer.append(&mut entries)))
                 .unwrap_or_else(|_| Err(io::Error::other("committing entries panicked")));
             (writer, entries, written)
         })

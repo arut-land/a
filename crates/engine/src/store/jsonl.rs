@@ -6,7 +6,7 @@ use std::sync::{Arc, PoisonError, RwLock};
 
 use protocol::{Decode, Entry, SessionId};
 
-use crate::{Header, Lease, LeaseAuthority, Lines, Loaded, Local, Log, LogStore, span};
+use super::{Header, LeaseAuthority, Lines, Loaded, Local, Log, LogStore, Writer, span};
 
 /// One append-only JSONL file per session in a directory: the header on the
 /// first line, one entry per line after it, and an empty `.busy` file beside
@@ -49,8 +49,8 @@ impl LogStore for Jsonl {
         line.push(b'\n');
         file.write_all(&line)?;
         let index = Index::new(file, line.len() as u64);
-        let lease = self.leases.acquire(header.id, 0);
-        Ok(index.loaded(0, lease, Some(self.dir.clone())))
+        let epoch = self.leases.acquire(header.id, 0);
+        Ok(index.loaded(0, epoch, Some(self.dir.clone())))
     }
 
     /// A file whose header did not survive a crash holds no entries either,
@@ -91,8 +91,8 @@ impl LogStore for Jsonl {
             index.file.set_len(index.end())?;
             sys::sync_data(&index.file)?;
         }
-        let lease = self.leases.acquire(id, floor);
-        Ok(index.loaded(seq, lease, None))
+        let epoch = self.leases.acquire(id, floor);
+        Ok(index.loaded(seq, epoch, None))
     }
 
     fn entries(&self, id: SessionId) -> io::Result<Vec<Entry>> {
@@ -154,18 +154,17 @@ impl Index {
 
     /// The lines indexed and an appender continuing them, whose entries up
     /// to `seq` are committed.
-    fn loaded(self, seq: u64, lease: Lease, new_in: Option<PathBuf>) -> Loaded {
+    fn loaded(self, seq: u64, epoch: u32, new_in: Option<PathBuf>) -> Loaded {
         let index = Arc::new(self);
+        let log = JsonlLog {
+            index: Arc::clone(&index),
+            new_in,
+            torn: false,
+        };
         Loaded {
-            lines: Arc::clone(&index) as Arc<dyn Lines>,
+            lines: index,
             seq,
-            epoch: lease.epoch,
-            log: Box::new(JsonlLog {
-                index,
-                new_in,
-                lease,
-                torn: false,
-            }),
+            writer: Writer::new(Box::new(log), epoch),
         }
     }
 
@@ -234,7 +233,6 @@ struct JsonlLog {
     /// The directory of a file not yet synced since it was created: its
     /// name is only durable once the directory is.
     new_in: Option<PathBuf>,
-    lease: Lease,
     /// A failed append may have left part of its lines past the last one
     /// indexed, and cutting them off failed too: the next append cuts them
     /// first.
@@ -244,7 +242,6 @@ struct JsonlLog {
 impl Log for JsonlLog {
     /// One write and one sync for the lot.
     fn append_all(&mut self, entries: &[Entry]) -> io::Result<()> {
-        self.lease.admit(entries)?;
         let mut lines = Vec::new();
         for entry in entries {
             entry.encode(&mut lines)?;
