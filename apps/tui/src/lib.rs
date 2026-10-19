@@ -1,6 +1,7 @@
 //! `a`'s terminal client: full screen on the alternate buffer with the
 //! mouse, or (`A_TUI=inline`) a viewport under the shell's scrollback. Both
-//! draw the shared reducer's view through one renderer; see `docs/tui.md`.
+//! draw the shared reducer's view through ratatui on crossterm; see
+//! `docs/tui.md`.
 //! Its own crate so it builds for size, like the web UI: it draws at the
 //! pace of one person's typing.
 //!
@@ -8,17 +9,12 @@
 //! terminal and the daemon each feed it from their own thread, so an idle
 //! client never wakes.
 
-// The terminal is driven through Unix termios; elsewhere `a` runs the line
-// REPL and only the renderer's tests use the rest.
-#![cfg_attr(not(unix), allow(dead_code))]
-
 mod app;
 mod editor;
 mod keys;
 mod render;
-#[cfg(unix)]
 mod run;
-#[cfg(unix)]
+mod screen;
 mod term;
 mod text;
 mod view;
@@ -43,6 +39,7 @@ pub struct Daemon {
 /// and stdout are both terminals; `A_TUI=plain` asks for lines anyway,
 /// `A_TUI=inline` for the inline viewport.
 pub fn viewport() -> Option<Viewport> {
+    // The daemon is Unix only for now: elsewhere the REPL says so.
     if !cfg!(unix) || !io::stdin().is_terminal() || !io::stdout().is_terminal() {
         return None;
     }
@@ -59,7 +56,8 @@ pub fn viewport() -> Option<Viewport> {
 /// What wakes the event loop.
 enum Event {
     Input(keys::Input),
-    Resized,
+    /// Inline, the cursor's row after it, if the terminal said.
+    Resized(Option<u16>),
     /// stdin closed: the terminal is gone.
     InputClosed,
     /// Connection `id`'s writer, once it sent its attach; what its hello
@@ -72,10 +70,4 @@ enum Event {
     Notice(String),
 }
 
-#[cfg(unix)]
 pub use run::run;
-
-#[cfg(not(unix))]
-pub fn run(_daemon: &Daemon, _target: protocol::Target, _viewport: Viewport) -> io::Result<()> {
-    Err(io::Error::from(io::ErrorKind::Unsupported))
-}

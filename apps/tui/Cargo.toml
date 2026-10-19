@@ -10,6 +10,15 @@ protocol.workspace = true
 sys.workspace = true
 serde_json.workspace = true
 unicode-width = { version = "0.2", default-features = false }
+# ratatui's core (cell buffer, diffing terminal, styles), without widgets or
+# the layout cache: the client wraps and lays out its own rows.
+ratatui-core = { version = "0.1.2", default-features = false, features = ["std"] }
+ratatui-crossterm = { version = "0.1.2", default-features = false, features = ["crossterm_0_29"] }
+crossterm = { version = "0.29", default-features = false, features = ["bracketed-paste", "events", "windows"] }
+
+[target.'cfg(unix)'.dependencies]
+# Restores the terminal on SIGTERM or SIGHUP; crossterm links it already.
+signal-hook = { version = "0.3", default-features = false, features = ["iterator"] }
 
 [lints]
 workspace = true

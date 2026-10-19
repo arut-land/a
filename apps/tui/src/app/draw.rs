@@ -4,7 +4,10 @@ use std::path::Path;
 
 use protocol::view::{Item, Link, Usage, call_title, recap_line};
 
-use super::super::render::{Buf, Color, Style, Viewport, ellipsize, fit};
+use ratatui_core::buffer::Buffer;
+use ratatui_core::style::{Color, Style};
+
+use super::super::render::{Viewport, ellipsize, fit, put};
 use super::super::text::{Action, Line, Span, width_of, wrap};
 use super::super::view::{self, ASK, MUTED, USER};
 use super::{App, Conn, HELP, Hit, Overlay};
@@ -41,7 +44,7 @@ impl App {
     fn bottom(&self, width: usize) -> (Vec<Line>, Option<(u16, u16)>) {
         let mut out = Vec::new();
         if let Some(recap) = self.view.recap.as_ref().filter(|_| !self.recap_hidden) {
-            let cyan = Style::fg(Color::Cyan);
+            let cyan = Style::new().fg(Color::Cyan);
             let banner = [Span::new(recap_line(recap), cyan)];
             let first = [Span::new("↺ ", cyan)];
             let mut rows = wrap(
@@ -52,7 +55,7 @@ impl App {
             );
             rows.truncate(3);
             if let Some(first) = rows.first_mut() {
-                first.spans.push(Span::new(" ", Style::PLAIN));
+                first.spans.push(Span::new(" ", Style::new()));
                 first.spans.push(Span::button("×", MUTED, Action::Dismiss));
             }
             out.extend(rows);
@@ -79,13 +82,13 @@ impl App {
                 Span::new(format!("? approve {}  ", ellipsize(&call_text, room)), ASK),
                 Span::button(
                     "[ y  yes ]",
-                    Style::fg(Color::Green).bold(),
+                    Style::new().fg(Color::Green).bold(),
                     Action::Approve(*call, true),
                 ),
-                Span::new("  ", Style::PLAIN),
+                Span::new("  ", Style::new()),
                 Span::button(
                     "[ n  no ]",
-                    Style::fg(Color::Red).bold(),
+                    Style::new().fg(Color::Red).bold(),
                     Action::Approve(*call, false),
                 ),
             ]));
@@ -126,21 +129,24 @@ impl App {
 
     fn status(&self, width: usize) -> Line {
         let (state, style) = match (&self.conn, self.view.link) {
-            (Conn::Lost(why), _) => (format!("✗ disconnected: {why}"), Style::fg(Color::Red)),
+            (Conn::Lost(why), _) => (
+                format!("✗ disconnected: {why}"),
+                Style::new().fg(Color::Red),
+            ),
             (Conn::Reconnecting, _) | (_, Link::Draining) => (
                 "↻ daemon upgrading; reconnecting".to_owned(),
-                Style::fg(Color::Yellow),
+                Style::new().fg(Color::Yellow),
             ),
             (Conn::Connecting, _) => ("◌ connecting".to_owned(), MUTED),
             (_, Link::Connecting) => ("○ not attached".to_owned(), MUTED),
-            (_, Link::Replaying) => ("↻ replaying".to_owned(), Style::fg(Color::Blue)),
-            (_, Link::Live) => ("● live".to_owned(), Style::fg(Color::Green)),
+            (_, Link::Replaying) => ("↻ replaying".to_owned(), Style::new().fg(Color::Blue)),
+            (_, Link::Live) => ("● live".to_owned(), Style::new().fg(Color::Green)),
         };
         let mut left = vec![Span::new(state, style)];
         if let Some(session) = self.view.session {
             left.push(Span::new(
                 format!("  {}", session.short()),
-                Style::PLAIN.bold(),
+                Style::new().bold(),
             ));
         }
         let model = self.view.items.iter().rev().find_map(|item| match item {
@@ -169,7 +175,7 @@ impl App {
         if used + width_of(&right) < width {
             line.spans.push(Span::new(
                 " ".repeat(width - used - width_of(&right)),
-                Style::PLAIN,
+                Style::new(),
             ));
             line.spans.push(Span::new(right, MUTED));
         }
@@ -181,7 +187,7 @@ impl App {
         let mut out = Vec::new();
         match self.overlay.as_ref()? {
             Overlay::Picker { selected } => {
-                out.push(Line::plain("sessions", Style::PLAIN.bold()));
+                out.push(Line::plain("sessions", Style::new().bold()));
                 if self.sessions.sessions.is_empty() {
                     out.push(Line::plain("  none yet", MUTED));
                 }
@@ -204,9 +210,9 @@ impl App {
                         tilde(&s.workspace)
                     );
                     let style = if n == *selected {
-                        Style::PLAIN.reverse()
+                        Style::new().reversed()
                     } else {
-                        Style::PLAIN
+                        Style::new()
                     };
                     out.push(Line::from(vec![Span::button(
                         fit(&text, width),
@@ -219,7 +225,7 @@ impl App {
                     Span::new("enter opens  ", MUTED),
                     Span::button(
                         "[ n  new session ]",
-                        Style::PLAIN.bold(),
+                        Style::new().bold(),
                         Action::NewSession,
                     ),
                     Span::new("  ", MUTED),
@@ -227,11 +233,11 @@ impl App {
                 ]));
             }
             Overlay::Help => {
-                out.push(Line::plain("keys and commands", Style::PLAIN.bold()));
+                out.push(Line::plain("keys and commands", Style::new().bold()));
                 for (key, what) in HELP {
                     out.push(Line::from(vec![
-                        Span::new(fit(key, 22), Style::fg(Color::Cyan)),
-                        Span::new(*what, Style::PLAIN),
+                        Span::new(fit(key, 22), Style::new().fg(Color::Cyan)),
+                        Span::new(*what, Style::new()),
                     ]));
                 }
                 out.push(Line::default());
@@ -244,7 +250,7 @@ impl App {
             Overlay::Unresponsive { who, log } => {
                 out.push(Line::plain(
                     format!("{who} is not responding"),
-                    Style::fg(Color::Red).bold(),
+                    Style::new().fg(Color::Red).bold(),
                 ));
                 for line in log {
                     out.push(Line::plain(ellipsize(&format!("│ {line}"), width), MUTED));
@@ -253,10 +259,10 @@ impl App {
                 out.push(Line::from(vec![
                     Span::button(
                         "[ r  restart the daemon ]",
-                        Style::PLAIN.bold(),
+                        Style::new().bold(),
                         Action::Restart,
                     ),
-                    Span::new("  ", Style::PLAIN),
+                    Span::new("  ", Style::new()),
                     Span::button("[ q  quit ]", MUTED, Action::Quit),
                 ]));
             }
@@ -283,14 +289,14 @@ impl App {
             .min(h)
     }
 
-    /// Draws a frame and remembers where its buttons are.
-    pub fn draw(&mut self, buf: &mut Buf) {
+    /// Draws a frame and remembers where its buttons are; returns where
+    /// the caret goes, if it shows.
+    pub fn draw(&mut self, buf: &mut Buffer) -> Option<(u16, u16)> {
         self.hits.clear();
-        let width = usize::from(buf.w);
+        let (w, h) = (buf.area.width, buf.area.height);
+        let width = usize::from(w);
         let (bottom, caret) = self.bottom(width);
-        let body = buf
-            .h
-            .saturating_sub(u16::try_from(bottom.len()).unwrap_or(u16::MAX));
+        let body = h.saturating_sub(u16::try_from(bottom.len()).unwrap_or(u16::MAX));
         (self.width, self.body) = (width, body);
         match (self.viewport, self.overlay_lines(width.saturating_sub(4))) {
             (Viewport::Inline, Some(lines)) => {
@@ -311,11 +317,11 @@ impl App {
         for (y, line) in (body..).zip(&bottom) {
             self.put(buf, 0, y, line);
         }
-        buf.cursor = caret.map(|(x, y)| (x, body + y));
+        caret.map(|(x, y)| (x, body + y))
     }
 
-    fn transcript(&mut self, buf: &mut Buf, body: u16, viewport: Viewport) {
-        let (width, rows) = (usize::from(buf.w), usize::from(body));
+    fn transcript(&mut self, buf: &mut Buffer, body: u16, viewport: Viewport) {
+        let (width, rows) = (usize::from(buf.area.width), usize::from(body));
         let lines = match viewport {
             Viewport::Full => self.window(width, rows),
             Viewport::Inline => {
@@ -331,27 +337,28 @@ impl App {
         if self.anchor.is_some() && body > 0 {
             let more = Line::from(vec![Span::button(
                 " ↓ newer below · esc ",
-                Style::fg(Color::Cyan).reverse(),
+                Style::new().fg(Color::Cyan).reversed(),
                 Action::Bottom,
             )]);
             let x = buf
-                .w
+                .area
+                .width
                 .saturating_sub(u16::try_from(more.width()).unwrap_or(0));
             self.put(buf, x, body - 1, &more);
         }
     }
 
     /// Draws `lines` in a bordered box centered over the top `body` rows.
-    fn boxed(&mut self, buf: &mut Buf, body: u16, lines: &[Line]) {
-        let w = buf.w.min(84);
+    fn boxed(&mut self, buf: &mut Buffer, body: u16, lines: &[Line]) {
+        let w = buf.area.width.min(84);
         let h = u16::try_from(lines.len() + 2).unwrap_or(u16::MAX).min(body);
         if w < 8 || h < 3 {
             return;
         }
-        let (x, y) = ((buf.w - w) / 2, (body - h) / 2);
+        let (x, y) = ((buf.area.width - w) / 2, (body - h) / 2);
         let edge = "─".repeat(usize::from(w) - 2);
-        buf.put(x, y, &format!("╭{edge}╮"), MUTED);
-        buf.put(x, y + h - 1, &format!("╰{edge}╯"), MUTED);
+        put(buf, x, y, &format!("╭{edge}╮"), MUTED);
+        put(buf, x, y + h - 1, &format!("╰{edge}╯"), MUTED);
         let shown = usize::from(h - 2);
         // A picker's selection stays in view.
         let skip = match self.overlay {
@@ -361,16 +368,16 @@ impl App {
         .min(lines.len().saturating_sub(shown));
         let blank = " ".repeat(usize::from(w) - 2);
         for (row, line) in (y + 1..y + h - 1).zip(lines.iter().skip(skip)) {
-            buf.put(x, row, &format!("│{blank}│"), MUTED);
+            put(buf, x, row, &format!("│{blank}│"), MUTED);
             self.put(buf, x + 2, row, &clip(line, usize::from(w) - 4));
         }
     }
 
     /// Draws a line and records its buttons.
-    fn put(&mut self, buf: &mut Buf, x: u16, y: u16, line: &Line) {
+    fn put(&mut self, buf: &mut Buffer, x: u16, y: u16, line: &Line) {
         let mut at = x;
         for span in &line.spans {
-            let end = buf.put(at, y, &span.text, span.style);
+            let end = put(buf, at, y, &span.text, span.style);
             if let Some(action) = span.action {
                 self.hits.push(Hit {
                     y,

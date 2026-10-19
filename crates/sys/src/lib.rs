@@ -14,8 +14,6 @@ mod runtime;
 #[cfg(not(unix))]
 #[path = "unstaged.rs"]
 mod runtime;
-#[cfg(unix)]
-pub mod tty;
 mod workspace;
 
 use std::fs::File;

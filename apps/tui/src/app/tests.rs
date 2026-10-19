@@ -4,11 +4,15 @@ use protocol::{
     Activity, Body, Card, ClientMsg, DaemonMsg, Entry, Outcome, Recap, Residency, SessionId,
     SessionSummary, Target,
 };
+use ratatui_core::backend::{Backend, TestBackend};
+use ratatui_core::buffer::Buffer;
+use ratatui_core::style::Modifier;
+use ratatui_core::terminal::Terminal;
 use serde_json::json;
 
 use super::{App, Effect};
 use crate::keys::{Input, Key, Mouse};
-use crate::render::{Buf, Viewport};
+use crate::render::{Viewport, rows};
 use crate::text::Line;
 
 fn ws() -> PathBuf {
@@ -34,11 +38,31 @@ fn app(viewport: Viewport, msgs: &[DaemonMsg]) -> (App, SessionId) {
     (app, session)
 }
 
-fn frame(app: &mut App, w: u16, h: u16) -> (Buf, Vec<String>) {
-    let mut buf = Buf::new(w, h);
-    app.draw(&mut buf);
-    let rows = buf.rows();
-    (buf, rows)
+/// A frame drawn through ratatui's test backend: the screen, where the
+/// caret shows (if it does), and its rows.
+struct Screen {
+    buf: Buffer,
+    caret: Option<(u16, u16)>,
+}
+
+fn frame(app: &mut App, w: u16, h: u16) -> (Screen, Vec<String>) {
+    let mut term = Terminal::new(TestBackend::new(w, h)).unwrap();
+    let mut caret = None;
+    term.draw(|f| {
+        caret = app.draw(f.buffer_mut());
+        if let Some(at) = caret {
+            f.set_cursor_position(at);
+        }
+    })
+    .unwrap();
+    let backend = term.backend_mut();
+    if caret.is_some() {
+        let at = backend.get_cursor_position().unwrap();
+        assert_eq!(caret, Some((at.x, at.y)), "the caret shows where drawn");
+    }
+    let buf = backend.buffer().clone();
+    let rows = rows(&buf);
+    (Screen { buf, caret }, rows)
 }
 
 fn find(rows: &[String], text: &str) -> (u16, u16) {
@@ -148,9 +172,12 @@ fn a_streamed_reply_shows_live_then_its_committed_text() {
             },
         ],
     );
-    let (buf, rows) = frame(&mut app, 50, 12);
+    let (screen, rows) = frame(&mut app, 50, 12);
     let (x, y) = find(&rows, "Hello you▍");
-    assert!(buf.style_at(x + 6, y).bold, "markdown bold");
+    assert!(
+        screen.buf[(x + 6, y)].modifier.contains(Modifier::BOLD),
+        "markdown bold"
+    );
     find(&rows, "● live");
     app.fold(&entry(
         4,
@@ -237,9 +264,9 @@ fn the_wheel_scrolls_and_new_rows_keep_a_scrolled_view_still() {
 #[test]
 fn the_empty_input_hint_starts_after_the_caret() {
     let (mut app, _) = app(Viewport::Full, &[]);
-    let (buf, rows) = frame(&mut app, 60, 10);
+    let (screen, rows) = frame(&mut app, 60, 10);
     let (x, y) = find(&rows, "message the agent");
-    assert_eq!(buf.cursor, Some((x - 1, y)));
+    assert_eq!(screen.caret, Some((x - 1, y)));
 }
 
 #[test]
@@ -473,8 +500,6 @@ fn draws_at_tiny_sizes_without_panicking() {
 fn render_cost() {
     use std::time::Instant;
 
-    use crate::render::Screen;
-
     const WORDS: &[&str] = &[
         "the",
         "daemon",
@@ -515,11 +540,19 @@ fn render_cost() {
     let model = 2 + 2000 * 3;
     msgs.push(entry(model, Body::ModelCall { model: "m".into() }));
     let (mut app, _) = app(Viewport::Full, &msgs);
-    let mut screen = Screen::new(Viewport::Full);
+    // What a frame writes, through the backend the client uses.
+    let count = Count::default();
+    let mut term = count.terminal(120);
     let mut frame = |app: &mut App, w: u16| {
-        let mut buf = screen.frame(w, 40);
-        app.draw(&mut buf);
-        screen.render(buf).len()
+        if term.get_frame().area().width != w {
+            term = count.terminal(w);
+        }
+        let before = count.0.get();
+        term.draw(|f| {
+            app.draw(f.buffer_mut());
+        })
+        .unwrap();
+        count.0.get() - before
     };
     let t = Instant::now();
     frame(&mut app, 120);
@@ -555,4 +588,32 @@ fn render_cost() {
         scroll[250],
         scroll[495],
     );
+}
+
+/// Counts the bytes a terminal writes.
+#[derive(Clone, Default)]
+struct Count(std::rc::Rc<std::cell::Cell<usize>>);
+
+impl Count {
+    fn terminal(&self, w: u16) -> Terminal<ratatui_crossterm::CrosstermBackend<Self>> {
+        let area = ratatui_core::layout::Rect::new(0, 0, w, 40);
+        let viewport = ratatui_core::terminal::Viewport::Fixed(area);
+        let options = ratatui_core::terminal::TerminalOptions { viewport };
+        Terminal::with_options(
+            ratatui_crossterm::CrosstermBackend::new(self.clone()),
+            options,
+        )
+        .unwrap()
+    }
+}
+
+impl std::io::Write for Count {
+    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        self.0.set(self.0.get() + buf.len());
+        Ok(buf.len())
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
 }

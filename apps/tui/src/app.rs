@@ -13,10 +13,11 @@ use std::path::PathBuf;
 
 use protocol::view::{Change, Item, SessionList, SessionView, Usage};
 use protocol::{ClientMsg, DaemonMsg, SessionSummary, Target};
+use ratatui_core::style::{Color, Style};
 
 use super::editor::{Edit, Editor};
 use super::keys::{Input, Key, Mouse};
-use super::render::{Color, Style, Viewport};
+use super::render::Viewport;
 use super::text::{Action, Line};
 use super::view::MUTED;
 
@@ -214,12 +215,12 @@ impl App {
                     self.overlay = Some(Overlay::Picker { selected: 0 });
                     return Some(Effect::List);
                 }
-                self.flash = Some((message, Style::fg(Color::Red)));
+                self.flash = Some((message, Style::new().fg(Color::Red)));
             }
             Change::Mismatch { supported } => {
                 self.flash = Some((
                     format!("the daemon speaks protocol {supported}; restart it"),
-                    Style::fg(Color::Red),
+                    Style::new().fg(Color::Red),
                 ));
             }
             Change::Snapshot { .. } => {
@@ -242,7 +243,11 @@ impl App {
     }
 
     pub fn notice(&mut self, text: impl Into<String>, error: bool) {
-        let style = if error { Style::fg(Color::Red) } else { MUTED };
+        let style = if error {
+            Style::new().fg(Color::Red)
+        } else {
+            MUTED
+        };
         self.flash = Some((text.into(), style));
     }
 

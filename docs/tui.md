@@ -58,120 +58,122 @@ terminal thread ──Input──┐
                           ├─> channel ─> event loop: App::fold / App::input
 daemon reader(s) ─Daemon─┘                           │
                                                      ▼
-                                     App::draw ─> Buf ─> Screen::render ─> stdout
+                     App::draw ─> ratatui Buffer ─> ratatui Terminal (diff) ─> crossterm ─> stdout
 ```
 
+The terminal layer is ratatui's core (`ratatui-core`: cell buffer, diffing
+`Terminal`, styles) on crossterm (`ratatui-crossterm`), with no widgets and
+no layout cache. What stays ours is what a chat transcript needs and no
+widget gives: wrapping cached per item, virtualized scrolling from an
+anchor, clickable spans, and the input editor.
+
 - One thread owns the app and blocks on an `mpsc` channel. The terminal
-  thread blocks in `poll(2)` on stdin and a self-pipe the SIGWINCH handler
-  writes to (`sys::tty`); each connection has a reader thread. Nothing
-  polls on a timer: the only timeout is 30 ms while half an escape sequence
-  is pending (a lone Esc). Everything queued is folded before one frame.
-- `render::Screen` diffs a cell buffer against the last frame and writes
-  only changed cells, inside a synchronized update (`?2026`). The same code
-  draws the full screen (absolute moves) and the inline viewport (relative
-  moves; `Screen::scrollback` prints settled items above it). That is the
-  "inline viewport" both modes share: the app draws a frame of a height it
-  chooses, the screen places it.
+  thread blocks in `crossterm::event::read` with no timeout; each
+  connection has a reader thread. Nothing polls on a timer. Everything
+  queued is folded before one frame.
+- `App::draw` writes rows into the frame's `Buffer` (coordinates relative
+  to its area) and returns the caret; ratatui writes only the cells that
+  changed, inside a synchronized update (`?2026`).
+- Full screen: ratatui's full-screen viewport on the alternate buffer, with
+  click and wheel reports (SGR) only: crossterm's `EnableMouseCapture` also
+  asks for every motion, which would wake the client as the pointer moves.
+- Inline (`screen.rs`), as Codex does it: a fixed viewport this client
+  places itself, because ratatui's `Viewport::Inline` has a fixed height.
+  Its row comes from one cursor position query at start; after that it is
+  tracked. It grows by scrolling the screen when it would pass the bottom;
+  settled items are printed from its top with `\r\n`, so they scroll into
+  the terminal's own scrollback, and the viewport is drawn whole under
+  them. After a resize the terminal thread asks where the cursor is (the
+  terminal reflowed its lines) and the viewport is placed from that.
+  Narrowing gets a new `Terminal`, since ratatui's `resize` clears the
+  whole screen when the width shrinks.
 - Rows are wrapped lazily and cached per item and width: a frame wraps only
   what it shows, counted from the bottom or from the scroll anchor (an item
   and a row, which stays put as output arrives below). A 6000-item session
   costs about what a short one does to draw, resize or resume.
 - The terminal is restored on exit, on a panic (a hook), when stdin
-  closes, and on SIGTERM or SIGHUP (a handler in `sys::tty` restores it,
-  then lets the signal end the process).
+  closes, and on SIGTERM or SIGHUP (a signal-hook thread restores it, then
+  lets the signal end the process as it would have).
 - The first frame is painted before the daemon is reached; connecting (and
   spawning the daemon) happens on the reader thread. An ssh endpoint
   connects first, since ssh may prompt on the terminal.
+- crossterm also drives the Windows console, so the client builds there;
+  it stays off (the line REPL) until the daemon runs on Windows.
 
 ## Choosing a library: measurements
 
-Prototypes of the same app (a 2000-message transcript, a status bar, an
-input line, wheel scrolling, a simulated daemon stream, blocking input plus
-a channel) were built with the release profile (fat LTO, one codegen unit,
-`build-std`, stripped) on an Apple M3, macOS 27, `nightly-2026-10-17`, and
-driven on a pseudo-terminal at 120×40. "Base" is the same program printing
-lines. Frame costs include writing to the pty.
+October 2026, release profile (fat LTO, one codegen unit, `build-std`,
+stripped), Apple M3, `nightly-2026-10-17`.
 
-| | Binary | vs base | RSS (idle) | First frame, empty / 2000 msgs | Delta frame avg (p99) | Scroll frame | Bytes per delta frame |
-| --- | --- | --- | --- | --- | --- | --- | --- |
-| base (lines) | 182 KiB | | 4144 KiB | 3.6 / 8.9 ms | | | |
-| ratatui 0.30 + crossterm 0.29 | 476 KiB | +294 KiB | +832 KiB | 4.0 / 9.2 ms | 209 µs (413) | 300 µs | 400 |
-| ratatui 0.30 + termion 4 | 442 KiB | +259 KiB | +752 KiB | 3.2 / 9.2 ms | 169 µs (248) | 220 µs | 391 |
-| own renderer + crossterm input | 298 KiB | +116 KiB | +176 KiB | 3.5 / 8.9 ms | 45 µs (105) | 55 µs | 350 |
-| own renderer, rustix termios, own input | 215 KiB | +33 KiB | +96 KiB | 3.4 / 8.6 ms | 48 µs (116) | 57 µs | 350 |
+A prototype chat client (2000-message transcript, status, input, wheel
+scroll, a stream of 1000 deltas, blocking input plus a channel; tui at
+opt-level s) on a 120×40 pty, against the same program printing lines:
 
-Idle CPU was zero for all of them (no change in `ps` CPU time over 10 s):
-each blocks on input and a channel. First frames are dominated by process
-start and building the transcript; every option paints within the 16 ms
-budget.
+| | Binary | vs base | Idle RSS | Idle CPU | CPU, 1000 deltas | First frame (in process) |
+| --- | --- | --- | --- | --- | --- | --- |
+| base (lines) | 256 KiB | | 2.5 MB | 0 | 0.19 s | 1.7 ms |
+| ratatui-core + crossterm 0.29 | 457 KiB | +201 KiB | 3.0 MB | 0 | 0.22 s | 1.9 ms |
+| ratatui-core + termion 4 | 413 KiB | +157 KiB | 3.0 MB | 0 | 0.21 s | 1.3 ms |
+| ratatui-core + termina 0.3 | 428 KiB | +172 KiB | 3.0 MB | 0 | 0.16 s | 0.7 ms |
 
-Maintenance and platforms (October 2026):
+(CPU is dominated by the prototype re-wrapping its streamed text; the
+backends are within noise of each other.)
 
-- ratatui 0.30.2 (June 2026), active. Its value is widgets and layout; a
-  chat transcript needs its own wrapping and virtualized scrolling either
-  way, so we would use little of it.
-- crossterm 0.29.0 (April 2025), the de facto backend, Windows included
-  (console API and VT). It brings mio, signal-hook and derive_more: about
-  85 KiB here.
-- termion 4.0.6 (November 2025, Redox): Unix only, no Windows at all, and
-  no resize event (SIGWINCH is ours to handle).
+- crossterm 0.29.0 (April 2025): the de facto backend, used by Codex;
+  Windows console and VT; brings mio and signal-hook on Unix.
+- termion 4: Unix only, no resize event. Ruled out for Windows.
+- termina (helix): about 30 KiB smaller, no mio, Windows via VT; but
+  `ratatui-termina` 0.1.0 pins termina 0.3 while termina is at 0.4, and it
+  has a fraction of crossterm's users. A swap later is a small change
+  (the backend type, the event mapping in `keys.rs`, `term.rs`).
+- Frameworks (iocraft, cursive, tui-realm, r3bl_tui, rat-salsa) bring
+  layout engines, async runtimes or no inline mode; ratatui-textarea does
+  not soft-wrap, which the input needs.
 
-Decision: our own renderer and input. It is the smallest by 80 to 260 KiB,
-about 4× cheaper per frame than ratatui, and the parts it needs are small
-(`render.rs`, `keys.rs`, `sys::tty`). On Windows the same renderer works on
-any console with VT processing (Windows 10 1809+, Windows Terminal), and
-with `ENABLE_VIRTUAL_TERMINAL_INPUT` the console sends the same xterm key
-and SGR mouse sequences `keys.rs` parses; `sys::tty` would need a Windows
-backend (console modes, `ReadConsoleInputW` for resize events). Until then
-(the client does not run on Windows yet) `a` there uses the line REPL.
+In `a` (`mise run size`, `mise run budgets`, before → after the move):
 
-## The client as built
-
-`apps/tui` is its own crate so it can build for size, like the web UI;
-measured on the release build (`cargo build-release -p a`, default
-features) with the client stubbed out and not:
-
-| tui opt-level | Binary | Client's share | Delta frame p50 / p99 (6000 items) | Scroll frame | Resize (re-wrap) |
-| --- | --- | --- | --- | --- | --- |
-| 3 | 3428 KiB | +194 KiB | 50 / 80 µs | 47 µs | 0.10 ms |
-| s (chosen) | 3396 KiB | +162 KiB | 89 / 158 µs | 62 µs | 0.16 ms |
-| z | 3348 KiB | +114 KiB | 162 / 214 µs | 98 µs | 0.20 ms |
+| | Own renderer (7a38b37) | ratatui-core + crossterm |
+| --- | --- | --- |
+| Release binary | 3768 KiB | 3898 KiB (+130) |
+| Idle client RSS | 7.6 MB | 7.8 MB |
+| Idle client CPU (3 s) | 0 | 0 |
+| Spawn to first frame (median of 5) | 5.7 ms | 5.0 ms |
+| Delta frame p50 / p99, 6000 items | 78 / 143 µs | 210 / 259 µs |
+| Scroll frame p50 | 55 µs | 162 µs |
+| Bytes per delta frame | 299 | 286 |
 
 (`cargo test --release -p tui -- --ignored --nocapture render_cost`; frame
-times there exclude the terminal write.) `s` keeps a streamed token's frame
-under 0.1 ms; `z` would save 48 KiB more at twice the cost per frame.
-`mise run size`: 3234 → 3380 KiB of 4096; without the web feature the
-client adds the same 162 KiB.
-
-With the release build (`mise run budgets`): spawn to the end of the first
-frame 6.6–8.3 ms (median 7.3 ms) with no daemon running; no CPU over 3 s
-idle; about 6.8 MB RSS attached (7.1 MB on the run that stages a new
-build, as in the budget test), 7.6 MB after 300 turns. Staging used to
-read the 3.8 MB binary whole, twice; macOS malloc kept both freed buffers
-resident, so that run sat at 15 MB until the hash and copy read it in
-blocks.
+times exclude the terminal write.) A frame costs more through ratatui
+(grapheme segmentation, a buffer reset and a full diff per frame) but stays
+far under a millisecond; at opt-level 3 the client's delta frame is 146 µs.
 
 ## Tests
 
-- Unit tests render the app into a `Buf` and read its rows (`app/tests.rs`,
-  `view.rs`, `text.rs`, `editor.rs`, `keys.rs`, `render.rs`): approvals by
-  key and click, streaming, folding, scrolling with an anchor, slash
-  commands, the picker, the recap, the inline scrollback, tiny sizes.
+- Unit tests draw the app through ratatui's `TestBackend` and read the
+  buffer's rows (`app/tests.rs`, `view.rs`, `text.rs`, `editor.rs`,
+  `keys.rs`, `render.rs`): approvals by key and click, streaming, folding,
+  scrolling with an anchor, slash commands, the picker, the recap, the
+  inline scrollback, tiny sizes; `keys.rs` checks how crossterm's events
+  map to the app's keys.
 - `apps/cli/tests/tui.rs` runs `a` on a pseudo-terminal against an echo
   agent daemon in its own `A_HOME`, reads the screen through a small
-  terminal model (`tests/common/pty.rs`), and checks a reply, an approval
-  answered by a click, the command's result, detaching, an inline
-  `a resume` that prints the replay into the scrollback, and a SIGTERM
-  that leaves the terminal cooked.
+  terminal model (`tests/common/pty.rs`, which also answers cursor
+  position queries), and checks a reply, an approval answered by a click,
+  the command's result, detaching, an inline `a resume` that prints the
+  replay into the scrollback, and a SIGTERM that leaves the terminal
+  cooked.
 - `apps/cli/tests/budgets.rs` holds the first frame to 16 ms and an idle
   client to no CPU.
 
 ## Limits
 
-- Grapheme clusters are drawn per character: an emoji ZWJ sequence or a
-  combining mark may not line up with what the terminal draws.
+- Wrapping counts columns per character while ratatui draws per grapheme,
+  so an emoji ZWJ sequence may wrap a little early.
 - SIGKILL leaves the terminal in raw mode (`reset` fixes it).
 - Ctrl-Z is not handled (raw mode receives it as a key).
+- Inline asks the terminal where the cursor is at start and after a
+  resize; a terminal that never answers costs crossterm's 2 s timeout, and
+  the viewport then sits at the bottom.
 - The full screen reports the mouse, so selecting text takes the terminal's
   override (Shift-drag in most, Option-drag in iTerm2 and Terminal.app);
   the inline mode leaves the mouse to the terminal.

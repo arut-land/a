@@ -26,6 +26,8 @@ allow = [
     "MIT",
     "Unicode-3.0",
     "Unlicense",
+    # foldhash, hashbrown's default hasher (ratatui-core's caches).
+    "Zlib",
 ]
 confidence-threshold = 0.9
 
