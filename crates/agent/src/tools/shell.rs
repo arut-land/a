@@ -11,10 +11,15 @@
 
 use std::collections::BTreeMap;
 use std::fmt::Write as _;
+use std::future::Future;
 use std::io::{self, Read};
 use std::path::{Path, PathBuf};
+use std::pin::pin;
 use std::process::{Child, Command as Process, ExitStatus, Stdio};
+use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{self, RecvTimeoutError};
+use std::task::{Context, Wake, Waker};
 use std::time::{Duration, Instant};
 
 use protocol::{Card, Environment};
@@ -421,57 +426,117 @@ struct Finished {
     output: Rendered,
 }
 
+/// What the supervisor of a command hears about.
+enum Event {
+    Output(Vec<u8>),
+    /// Every holder of the pipe closed it.
+    Eof,
+    /// The shell exited, or waiting for it failed: either way its status
+    /// is looked at.
+    Exited,
+    /// The call was cancelled.
+    Cancelled,
+}
+
+/// Wakes the supervisor when the call is cancelled.
+struct Notify(mpsc::SyncSender<Event>);
+
+impl Wake for Notify {
+    fn wake(self: Arc<Self>) {
+        // A full channel is read at once anyway, and every read checks the
+        // flag.
+        let _ = self.0.try_send(Event::Cancelled);
+    }
+}
+
+/// The events of a command whose shell is `pgid`, as the threads reading its
+/// output and awaiting its exit, and a cancel of the call, send them; and
+/// whether its exit has to be polled for instead, where nothing reports it.
+fn listen(
+    mut reader: io::PipeReader,
+    pgid: u32,
+    cancel: &Cancel,
+) -> (mpsc::Receiver<Event>, Arc<AtomicBool>) {
+    let (tx, rx) = mpsc::sync_channel::<Event>(16);
+    // A reader of its own, so waiting for output never hides an exit. It
+    // ends at EOF, or at the first chunk after this call stopped
+    // listening; a process that escaped the group and holds the pipe
+    // silently keeps it parked until that process exits.
+    let out = tx.clone();
+    std::thread::spawn(move || {
+        let mut buf = vec![0; 64 * 1024];
+        while let Ok(n @ 1..) = reader.read(&mut buf) {
+            if out.send(Event::Output(buf[..n].to_vec())).is_err() {
+                return;
+            }
+        }
+        let _ = out.send(Event::Eof);
+    });
+    let poll = Arc::new(AtomicBool::new(cfg!(not(unix))));
+    if cfg!(unix) {
+        let (exited, poll) = (tx.clone(), Arc::clone(&poll));
+        std::thread::spawn(move || {
+            if sys::await_exit(pgid).is_err() {
+                poll.store(true, Ordering::Relaxed);
+            }
+            let _ = exited.send(Event::Exited);
+        });
+    }
+    let waker = Waker::from(Arc::new(Notify(tx)));
+    let _ = pin!(cancel.cancelled()).poll(&mut Context::from_waker(&waker));
+    (rx, poll)
+}
+
 /// Reads the command's output until it ends, reporting it as it comes and
 /// stopping the command when it runs out of time or the call is cancelled.
-/// Blocks.
+/// Blocks, waking only for output, the shell's exit, a cancel or a
+/// deadline: a quiet command costs nothing while it runs.
 fn supervise(
     mut child: Child,
-    mut reader: io::PipeReader,
+    reader: io::PipeReader,
     limit: Duration,
     cx: &Cx,
     mut output: Output,
 ) -> io::Result<Finished> {
     let cancel: &Cancel = &cx.cancel;
     let mut live = Live::default();
-    let mut reported = Instant::now();
-    // A reader of its own, so waiting for output never hides an exit. It
-    // ends at EOF, or at the first chunk after this call stopped
-    // listening; a process that escaped the group and holds the pipe
-    // silently keeps it parked until that process exits.
-    let (tx, rx) = mpsc::sync_channel::<Vec<u8>>(16);
-    std::thread::spawn(move || {
-        let mut buf = vec![0; 64 * 1024];
-        while let Ok(n @ 1..) = reader.read(&mut buf) {
-            if tx.send(buf[..n].to_vec()).is_err() {
-                break;
-            }
-        }
-    });
     let pgid = child.id();
+    let (rx, poll) = listen(reader, pgid, cancel);
     let started = Instant::now();
     let mut kill = Kill::new(pgid);
     let (mut status, mut stopped, mut eof) = (None, None, false);
     let mut exited: Option<Instant> = None;
     let mut heard = Instant::now();
+    let mut reported = Instant::now();
+    let mut unreported = false;
     loop {
-        if eof {
-            std::thread::sleep(TICK);
+        let next = match exited {
+            Some(at) => (heard.max(at) + IDLE).min(at + LINGER),
+            None if stopped.is_some() || poll.load(Ordering::Relaxed) => Instant::now() + TICK,
+            None => started + limit,
+        };
+        let next = if unreported {
+            next.min(reported + REPORT)
         } else {
-            match rx.recv_timeout(TICK) {
-                Ok(chunk) => {
-                    output.push(&chunk);
-                    live.push(&chunk);
-                    heard = Instant::now();
-                }
-                Err(RecvTimeoutError::Timeout) => {}
-                Err(RecvTimeoutError::Disconnected) => eof = true,
+            next
+        };
+        let event = rx.recv_timeout(next.saturating_duration_since(Instant::now()));
+        match event {
+            Ok(Event::Output(chunk)) => {
+                output.push(&chunk);
+                live.push(&chunk);
+                heard = Instant::now();
+                unreported = true;
             }
+            Ok(Event::Eof) | Err(RecvTimeoutError::Disconnected) => eof = true,
+            Ok(Event::Exited | Event::Cancelled) | Err(RecvTimeoutError::Timeout) => {}
         }
-        if reported.elapsed() >= REPORT
-            && let Some(text) = live.take()
-        {
-            cx.progress(&text);
-            reported = Instant::now();
+        if unreported && reported.elapsed() >= REPORT {
+            unreported = false;
+            if let Some(text) = live.take() {
+                cx.progress(&text);
+                reported = Instant::now();
+            }
         }
         if status.is_none() {
             status = child.try_wait()?;
@@ -503,8 +568,10 @@ fn supervise(
             }
         }
     }
-    while let Ok(chunk) = rx.try_recv() {
-        output.push(&chunk);
+    while let Ok(event) = rx.try_recv() {
+        if let Event::Output(chunk) = event {
+            output.push(&chunk);
+        }
     }
     let mut lingering = sys::group_alive(pgid);
     // A command that was stopped leaves nothing behind.
