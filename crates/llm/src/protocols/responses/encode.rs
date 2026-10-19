@@ -2,8 +2,6 @@
 //! provider items verbatim, an edited part keeps its item's identity, and
 //! everything else is rebuilt from the shared fields.
 
-use std::collections::HashSet;
-
 use serde::Serialize;
 use serde_json::{Map, Value, json};
 
@@ -15,8 +13,7 @@ use crate::protocol::Target;
 use crate::protocols::schema;
 use crate::replay::{Replay, replay, replays};
 use crate::spec::{
-    AssistantPart, Effort, Format, Message, Output, Request, SmolStr, Source, Tool, ToolChoice,
-    UserPart,
+    AssistantPart, Effort, Format, Message, Output, Request, Source, Tool, ToolChoice, UserPart,
 };
 
 /// The request body but its `input` and `tools`, which move in after
@@ -180,9 +177,8 @@ fn result_output(output: &Output) -> Result<Value, Error> {
 /// item, so reasoning without its ciphertext is left out, and the part after
 /// it is rebuilt with no item id, as another model's turn is.
 fn input(messages: &[Message], stateless: bool) -> Result<Vec<Value>, Error> {
-    // The call ids the request sends as custom calls: a set, as prepare
-    // keeps one, so the two share their code.
-    let mut custom = HashSet::<SmolStr>::new();
+    // The call ids the request sends as custom calls, which are rare.
+    let mut custom = Vec::<&str>::new();
     let mut items = Vec::new();
     let message = |role: &str, part: Value| {
         let mut message = json!({"type": ItemType::Message, "role": role});
@@ -213,7 +209,7 @@ fn input(messages: &[Message], stateless: bool) -> Result<Vec<Value>, Error> {
             Message::Tool(tool) => {
                 for result in &tool.results {
                     let (id, output) = (&result.id, result_output(&result.output)?);
-                    let mut item = if custom.contains(id) {
+                    let mut item = if custom.contains(&id.as_str()) {
                         json!({"type": ItemType::CustomToolCallOutput, "call_id": id})
                     } else {
                         json!({"type": ItemType::FunctionCallOutput, "call_id": id, "status": Status::Completed})
@@ -248,10 +244,9 @@ fn input(messages: &[Message], stateless: bool) -> Result<Vec<Value>, Error> {
                 continue;
             }
             if let AssistantPart::ToolCall(call) = part {
+                custom.retain(|custom| *custom != call.id);
                 if kind == Some(ItemType::CustomToolCall) {
-                    custom.insert(call.id.clone());
-                } else {
-                    custom.remove(&call.id);
+                    custom.push(&call.id);
                 }
             }
             let kept = match sent {

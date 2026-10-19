@@ -13,7 +13,6 @@
 //! - A system message between a call and its results waits until after them.
 
 use std::borrow::Cow;
-use std::collections::{HashMap, HashSet};
 
 use crate::protocol::Target;
 use crate::spec::{
@@ -114,8 +113,8 @@ fn rebuild(mut request: Request, target: &Target<'_>) -> Request {
             }
             Message::Tool(mut tool) => {
                 for result in &mut tool.results {
-                    if let Some(id) = ids.renamed.get(&result.id) {
-                        result.id.clone_from(id);
+                    if let Some(id) = ids.renamed(&result.id) {
+                        result.id = id;
                     }
                 }
                 Some(Message::Tool(tool))
@@ -129,33 +128,55 @@ fn rebuild(mut request: Request, target: &Target<'_>) -> Request {
 
 #[derive(Default)]
 struct Ids {
-    renamed: HashMap<SmolStr, SmolStr>,
-    taken: HashSet<SmolStr>,
+    /// Sorted by the id renamed, as `taken` is sorted: sets this small
+    /// cost less code sorted than hashed.
+    renamed: Vec<(SmolStr, SmolStr)>,
+    taken: Vec<SmolStr>,
 }
 
 impl Ids {
     fn rename(&mut self, id: &SmolStr, fit: impl Fn(&str) -> Option<String>) -> SmolStr {
-        if let Some(renamed) = self.renamed.get(id) {
-            return renamed.clone();
+        if let Some(renamed) = self.renamed(id) {
+            return renamed;
         }
         let Some(mut fitted) = fit(id) else {
-            self.taken.insert(id.clone());
+            self.take(id.clone());
             return id.clone();
         };
         // Two ids that fit to the same one stay distinct: refit with a
         // suffix, and if the fit swallows it, keep the suffix raw.
         let base = fitted.clone();
         let mut n = 1;
-        while self.taken.contains(fitted.as_str()) {
+        while self.taken(&fitted) {
             n += 1;
             fitted = fit(&format!("{id}_{n}"))
-                .filter(|refit| !self.taken.contains(refit.as_str()))
+                .filter(|refit| !self.taken(refit))
                 .unwrap_or_else(|| format!("{base}_{n}"));
         }
         let fitted = SmolStr::from(fitted);
-        self.taken.insert(fitted.clone());
-        self.renamed.insert(id.clone(), fitted.clone());
+        self.take(fitted.clone());
+        let at = self.renamed.partition_point(|(held, _)| held < id);
+        self.renamed.insert(at, (id.clone(), fitted.clone()));
         fitted
+    }
+
+    fn renamed(&self, id: &str) -> Option<SmolStr> {
+        let at = self
+            .renamed
+            .binary_search_by(|(held, _)| held.as_str().cmp(id));
+        at.ok().map(|at| self.renamed[at].1.clone())
+    }
+
+    fn taken(&self, id: &str) -> bool {
+        self.taken
+            .binary_search_by(|held| held.as_str().cmp(id))
+            .is_ok()
+    }
+
+    fn take(&mut self, id: SmolStr) {
+        if let Err(at) = self.taken.binary_search(&id) {
+            self.taken.insert(at, id);
+        }
     }
 }
 
