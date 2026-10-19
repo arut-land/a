@@ -51,7 +51,22 @@ opt-level = "s"
 [profile.release.package.ext]
 opt-level = "s"
 
-[profile.release.package.ext-builtin]
+[profile.release.package.ext-chat]
+opt-level = "s"
+
+[profile.release.package.ext-edit]
+opt-level = "s"
+
+[profile.release.package.ext-fixtures]
+opt-level = "s"
+
+[profile.release.package.ext-policy]
+opt-level = "s"
+
+[profile.release.package.ext-prompt]
+opt-level = "s"
+
+[profile.release.package.ext-shell]
 opt-level = "s"
 
 [profile.release.package.store]

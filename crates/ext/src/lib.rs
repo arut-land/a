@@ -1,4 +1,5 @@
-//! The extension SDK: what every feature, built-in or not, is made of.
+//! The extension SDK, which every `ext-*` crate builds on: what every
+//! feature, compiled in or loaded, is made of.
 //!
 //! An extension contributes through one [`Registrar`]: tools and commands,
 //! handlers at the engine's decision [`point`]s, text the model reads,

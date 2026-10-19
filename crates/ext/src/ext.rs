@@ -1,4 +1,4 @@
-//! Extensions: every feature, built-in or not, contributes its tools,
+//! Extensions: every feature, compiled in or loaded, contributes its tools,
 //! commands, handlers, text, state, services and agents through one
 //! [`Registrar`] with the same verbs.
 //!
@@ -7,7 +7,7 @@
 //! already taken replaces the earlier one in its install position: an
 //! extension of the same name replaces all it contributed, and a tool,
 //! command, text or agent of the same name, from another extension,
-//! replaces that one. So a user's `bash` overrides the built-in one without
+//! replaces that one. So a user's `bash` overrides the shell's without
 //! reordering anything. Nothing replaces what a [`Tier::Guarded`] extension
 //! contributes, except another guarded one. Within one extension a name
 //! taken twice is an error, as is a second extension providing a service
@@ -66,7 +66,7 @@ pub enum Tier {
     /// What later tiers cannot replace or remove, such as the permission
     /// policy: repository config never loosens it.
     Guarded,
-    /// The built-ins the user's extensions may replace.
+    /// What a binary links, which the user's extensions may replace.
     Pre,
     #[default]
     User,

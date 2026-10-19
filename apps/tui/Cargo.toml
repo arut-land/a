@@ -16,7 +16,7 @@ unicode-width = { version = "0.2", default-features = false }
 # ratatui's core (cell buffer, styles) without widgets or its terminal: the
 # client wraps and lays out its own rows and writes the cells that changed.
 ratatui-core = { version = "0.1.2", default-features = false, features = ["std"] }
-# Input decoding (keys, mouse reports, pastes); `ext-builtin` links it already.
+# Input decoding (keys, mouse reports, pastes); `ext-shell` links it already.
 vte = { version = "0.15", default-features = false }
 # Raw mode, the window size and polling stdin with the signal pipe.
 rustix = { workspace = true, features = ["event", "stdio", "termios"] }
