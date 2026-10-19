@@ -9,7 +9,7 @@
 
 use std::fmt;
 
-use serde::de::{Error as _, MapAccess, Visitor};
+use serde::de::{Error as _, MapAccess, SeqAccess, Visitor};
 use serde::{Deserialize, Deserializer};
 use serde_json::value::RawValue;
 use serde_json::{Error, Map, Value};
@@ -35,9 +35,7 @@ impl Response {
         } = serde_json::from_str(text)?;
         Ok(Self {
             message: Assistant {
-                content: (message.content.into_iter())
-                    .map(Part::build)
-                    .collect::<Result<_>>()?,
+                content: message.content.0,
                 origin: message.origin,
             },
             finish,
@@ -50,9 +48,8 @@ impl Response {
 }
 
 #[derive(Deserialize)]
-struct Reply<'a> {
-    #[serde(borrow)]
-    message: Message<'a>,
+struct Reply {
+    message: Message,
     finish: Finish,
     usage: Usage,
     id: Option<SmolStr>,
@@ -62,10 +59,36 @@ struct Reply<'a> {
 }
 
 #[derive(Deserialize)]
-struct Message<'a> {
-    #[serde(borrow)]
-    content: Vec<Part<'a>>,
+struct Message {
+    content: Content,
     origin: Option<Origin>,
+}
+
+/// A message's parts, each built as it is read, in a list of their number.
+struct Content(Vec<AssistantPart>);
+
+impl<'de> Deserialize<'de> for Content {
+    fn deserialize<D: Deserializer<'de>>(d: D) -> std::result::Result<Self, D::Error> {
+        struct Read;
+        impl<'de> Visitor<'de> for Read {
+            type Value = Content;
+            fn expecting(&self, f: &mut fmt::Formatter) -> fmt::Result {
+                f.write_str("a sequence")
+            }
+            fn visit_seq<A: SeqAccess<'de>>(
+                self,
+                mut seq: A,
+            ) -> std::result::Result<Content, A::Error> {
+                let mut parts = Vec::new();
+                while let Some(part) = seq.next_element::<Part<'de>>()? {
+                    parts.push(part.build().map_err(A::Error::custom)?);
+                }
+                parts.shrink_to_fit();
+                Ok(Content(parts))
+            }
+        }
+        d.deserialize_seq(Read)
+    }
 }
 
 /// Provider state, each key's value kept as its text.
@@ -206,7 +229,9 @@ impl OutputFields<'_> {
             OutputKind::Content => {
                 let parts: Vec<UserFields> = serde_json::from_str(value)?;
                 let parts = parts.into_iter().map(UserFields::build);
-                Output::Content(parts.collect::<Result<_>>()?)
+                let mut parts = parts.collect::<Result<Vec<_>>>()?;
+                parts.shrink_to_fit();
+                Output::Content(parts)
             }
         })
     }
