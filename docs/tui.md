@@ -90,7 +90,14 @@ anchor, clickable spans, and the input editor.
 - Rows are wrapped lazily and cached per item and width: a frame wraps only
   what it shows, counted from the bottom or from the scroll anchor (an item
   and a row, which stays put as output arrives below). A 6000-item session
-  costs about what a short one does to draw, resize or resume.
+  costs about what a short one does to draw, resize or resume. A reply
+  streaming in keeps the rows of its finished lines; a delta wraps only the
+  line still open. What the bottom rows need of the whole transcript (the
+  oldest ask, whether a turn runs, the latest model) is found once per
+  change, not per frame.
+- Text of characters that are graphemes on their own (most of it) goes
+  into the buffer a cell a character; only the rest goes through ratatui's
+  grapheme segmentation.
 - The terminal is restored on exit, on a panic (a hook), when stdin
   closes, and on SIGTERM or SIGHUP (a signal-hook thread restores it, then
   lets the signal end the process as it would have).
@@ -146,6 +153,11 @@ In `a` (`mise run size`, `mise run budgets`, before → after the move):
 times exclude the terminal write.) A frame costs more through ratatui
 (grapheme segmentation, a buffer reset and a full diff per frame) but stays
 far under a millisecond; at opt-level 3 the client's delta frame is 146 µs.
+Writing plain text into cells directly, and scanning the transcript once
+per change instead of per frame, took the delta frame from 360 to 207 µs
+and the scroll frame from 340 to 205 µs (both builds measured in turns on a
+loaded machine; the full diff is now about half of what is left), and a
+delta at the end of a 28 KB reply from 784 to 89 µs.
 
 ## Tests
 
