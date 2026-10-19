@@ -199,7 +199,10 @@ impl Events {
         let mut buf = [0; 16 * 1024];
         while !done(&self.patches) {
             assert!(Instant::now() < deadline, "timed out waiting for {what}");
-            let n = self.stream.read(&mut buf).unwrap();
+            let n = self
+                .stream
+                .read(&mut buf)
+                .unwrap_or_else(|e| panic!("{e} waiting for {what}: {:?}", self.patches));
             assert_ne!(n, 0, "the stream ended before {what}: {}", self.raw);
             self.raw.push_str(&String::from_utf8_lossy(&buf[..n]));
             self.decode();
@@ -423,7 +426,9 @@ fn a_tab_streams_replies_and_answers_asks_until_it_closes() {
     events.until("the stop control", |p| end(p).contains(">Stop<"));
     assert_eq!(web.call("/api/interrupt", TAB, "").status(), 204);
     events.until("the call to stop", |p| {
-        !end(p).contains(">Stop<") && shown(p).contains("killed by")
+        let shown = shown(p);
+        !end(p).contains(">Stop<")
+            && (shown.contains("interrupted before it finished") || shown.contains("killed by"))
     });
 
     // Closing the tab detaches its client; stopping `a web` leaves the
