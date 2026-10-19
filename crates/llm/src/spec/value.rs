@@ -82,7 +82,10 @@ impl<'a> Fields<'a> {
             return Ok(Meta::new());
         };
         let map = value.as_object().ok_or_else(|| invalid(value, "a map"))?;
-        Ok(map.iter().map(|(k, v)| (k.clone(), v.clone())).collect())
+        // Inserted, not collected: collecting sorts first, in ~5 KiB of code.
+        let mut meta = Meta::new();
+        meta.extend(map.iter().map(|(key, value)| (key.clone(), value.clone())));
+        Ok(meta)
     }
 
     fn list<T>(self, key: &'static str, item: fn(&Value) -> Result<T>) -> Result<Vec<T>> {
