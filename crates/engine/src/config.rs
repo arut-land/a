@@ -1,8 +1,9 @@
 //! The settings a session runs with, layered: built-in defaults <
-//! `$A_HOME/config.toml` < the workspace's `.a/config.toml` < `A_MODEL` and
-//! `A_AGENT`. Provider variables (keys, base URLs) come from the session's
-//! client first, then the home file's `[env]`, then the daemon's own
-//! environment; a workspace, being anyone's checkout, never sets them.
+//! `$A_HOME/config.toml` < the workspace's `.a/config.toml` < the session's
+//! own. Provider variables (keys, base URLs) come from the session's client
+//! first, then the home file's `[env]`; never from the daemon's own
+//! environment, which is whichever client's started it, and never from a
+//! workspace, which is anyone's checkout.
 
 use std::fmt;
 use std::path::{Path, PathBuf};
@@ -76,8 +77,6 @@ pub enum Source {
     Default,
     Home,
     Workspace,
-    /// `A_MODEL` or `A_AGENT`.
-    Env,
     /// The session's own, set by its entry `seq`.
     Session(u64),
 }
@@ -88,7 +87,6 @@ impl fmt::Display for Source {
             Self::Default => f.write_str("the built-in default"),
             Self::Home => f.write_str("the home config.toml"),
             Self::Workspace => f.write_str("the workspace's .a/config.toml"),
-            Self::Env => f.write_str("the daemon's environment"),
             Self::Session(seq) => write!(f, "this session, at entry {seq}"),
         }
     }
@@ -98,23 +96,15 @@ impl fmt::Display for Source {
 pub struct Settings {
     /// `$A_HOME/config.toml`.
     pub home: Watched,
-    /// `A_MODEL`: wins over both files.
-    pub model: Option<String>,
-    /// `A_AGENT`: wins over both files.
+    /// `[daemon] agent`: wins over both files.
     pub agent: Option<agent::Kind>,
-    /// The daemon's own environment, the last place a variable is looked
-    /// up.
-    pub process: fn(&str) -> Option<String>,
 }
 
 impl Settings {
-    /// Settings from `home` and this process's environment.
-    pub fn new(home: PathBuf, model: Option<String>, agent: Option<agent::Kind>) -> Self {
+    pub fn new(home: PathBuf, agent: Option<agent::Kind>) -> Self {
         Self {
             home: Watched::new(home),
-            model,
             agent,
-            process: llm::protocol::env,
         }
     }
 
@@ -157,9 +147,6 @@ impl Settings {
         if let (Overrides { model: Some(model) }, seq) = session {
             return Ok((model, Source::Session(seq.unwrap_or_default())));
         }
-        if let Some(model) = &self.model {
-            return Ok((model.clone(), Source::Env));
-        }
         let local = Self::workspace(workspace)?;
         if let Some(model) = local.model {
             return Ok((model, Source::Workspace));
@@ -173,18 +160,15 @@ impl Settings {
     }
 
     /// Variable `name` for a session whose client environment is `client`:
-    /// the client's, else the home file's `[env]`, else the daemon's.
+    /// the client's, else the home file's `[env]`.
     pub fn var(&self, client: Option<&Environment>, name: &str) -> Option<String> {
         let set = |value: &String| !value.trim().is_empty();
         if let Some(value) = client.and_then(|env| env.vars.get(name)).filter(|v| set(v)) {
             return Some(value.clone());
         }
-        if let Ok(home) = &*self.home.get()
-            && let Some(value) = home.env.get(name).filter(|v| set(v))
-        {
-            return Some(value.clone());
-        }
-        (self.process)(name)
+        let home = self.home.get();
+        let home = home.as_ref().as_ref().ok()?;
+        home.env.get(name).filter(|v| set(v)).cloned()
     }
 }
 

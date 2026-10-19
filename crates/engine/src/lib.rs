@@ -11,7 +11,6 @@ use std::fs::{File, OpenOptions};
 use std::future::{Future, poll_fn};
 use std::io::{self, BufReader, Write};
 use std::path::PathBuf;
-use std::str::FromStr;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 use std::task::{Poll, Waker};
@@ -31,26 +30,23 @@ use upgrade::{Lifecycle, Verdict};
 #[cfg(unix)]
 use std::os::unix::net::{UnixListener, UnixStream};
 
-/// How the daemon runs, from `A_*` environment variables.
+/// How the daemon runs: the `[daemon]` table of `$A_HOME/config.toml`,
+/// read as it starts. Never its environment, which is whichever client's
+/// started it.
 #[derive(Clone, Debug)]
 pub struct Config {
-    /// `A_IDLE_SECS`: exit after this long with no clients and no work.
+    /// Exit after this long with no clients and no work.
     pub idle: Duration,
-    /// `A_HIBERNATE_SECS`: unload a session after this long unused.
+    /// Unload a session after this long unused.
     pub hibernate: Duration,
-    /// `A_DRAIN_SECS`: how long an upgrade waits for in-flight work.
+    /// How long an upgrade waits for in-flight work.
     pub drain: Duration,
-    /// `A_AGENT` (`chat` or `echo`, which needs no model): overrides the
-    /// config files.
+    /// `chat` or `echo` (which needs no model): overrides the config files'
+    /// `agent`.
     pub agent: Option<agent::Kind>,
-    /// `A_MODEL` (`host:model`, or a bare model on `OpenAI`): overrides the
-    /// config files.
-    pub model: Option<String>,
-    /// `A_ASK`: comma-separated tools whose calls wait for the user's
-    /// approval.
+    /// Tools whose calls wait for the user's approval.
     pub ask: Vec<String>,
-    /// `A_SYSTEM_PROMPT`: the system prompt, in place of the one the
-    /// extensions make.
+    /// The system prompt, in place of the one the extensions make.
     pub system_prompt: Option<String>,
 }
 
@@ -61,7 +57,6 @@ impl Default for Config {
             hibernate: Duration::from_secs(300),
             drain: Duration::from_secs(60),
             agent: None,
-            model: None,
             ask: Vec::new(),
             system_prompt: None,
         }
@@ -69,30 +64,14 @@ impl Default for Config {
 }
 
 impl Config {
-    /// The defaults, overridden by whichever variables are set and valid.
-    pub fn from_env() -> Self {
-        fn var<T: FromStr>(name: &str) -> Option<T> {
-            std::env::var(name).ok()?.parse().ok()
-        }
-        let defaults = Self::default();
-        Self {
-            idle: var("A_IDLE_SECS").map_or(defaults.idle, Duration::from_secs),
-            hibernate: var("A_HIBERNATE_SECS").map_or(defaults.hibernate, Duration::from_secs),
-            drain: var("A_DRAIN_SECS").map_or(defaults.drain, Duration::from_secs),
-            agent: var("A_AGENT").or(defaults.agent),
-            model: var("A_MODEL").or(defaults.model),
-            ask: std::env::var("A_ASK").map_or(defaults.ask, |tools| {
-                tools
-                    .split(',')
-                    .map(str::trim)
-                    .filter(|tool| !tool.is_empty())
-                    .map(str::to_owned)
-                    .collect()
-            }),
-            system_prompt: std::env::var("A_SYSTEM_PROMPT")
-                .ok()
-                .filter(|prompt| !prompt.is_empty()),
-        }
+    /// The defaults, overridden by what `home`'s file sets; a file that
+    /// cannot be read is reported and passed over.
+    pub fn load(home: &Home) -> Self {
+        let file = sys::Config::read(&home.config_file()).unwrap_or_else(|e| {
+            eprintln!("{e}; running with the default [daemon] settings");
+            sys::Config::default()
+        });
+        Self::from(file.daemon)
     }
 
     /// The built-in extensions, registered as any other. The echo agent's
@@ -104,6 +83,25 @@ impl Config {
         match self.agent {
             Some(agent::Kind::Echo) => registry.with(&agent::Fixtures),
             _ => Ok(registry),
+        }
+    }
+}
+
+impl From<sys::config::Daemon> for Config {
+    fn from(file: sys::config::Daemon) -> Self {
+        let defaults = Self::default();
+        let secs = |set: Option<u64>, default| set.map_or(default, Duration::from_secs);
+        Self {
+            idle: secs(file.idle_secs, defaults.idle),
+            hibernate: secs(file.hibernate_secs, defaults.hibernate),
+            drain: secs(file.drain_secs, defaults.drain),
+            agent: file.agent.and_then(|name| {
+                name.parse()
+                    .map_err(|e| eprintln!("agent `{name}` in [daemon]: {e}"))
+                    .ok()
+            }),
+            ask: file.ask,
+            system_prompt: file.system_prompt.filter(|prompt| !prompt.is_empty()),
         }
     }
 }
@@ -235,7 +233,7 @@ impl Daemon {
             .collect();
         let rt: rt::Rt = Arc::new(rt::Threads::default());
         let models = model::Models {
-            settings: config::Settings::new(home.config_file(), config.model.clone(), config.agent),
+            settings: config::Settings::new(home.config_file(), config.agent),
             http: Arc::new(llm::Ureq::new(Arc::clone(&rt))),
         };
         let registry = agent::Current::new(config.registry().map_err(io::Error::other)?);

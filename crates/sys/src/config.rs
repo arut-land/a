@@ -8,6 +8,14 @@
 //! [env]
 //! OPENAI_API_KEY = "sk-..."
 //! OPENAI_BASE_URL = "https://.../v1"
+//!
+//! [daemon]                      # read when the daemon starts
+//! idle_secs = 600               # exit after this long unused
+//! hibernate_secs = 300          # unload a session after this long unused
+//! drain_secs = 60               # how long an upgrade waits for work
+//! agent = "echo"                # every session's agent, over both files
+//! ask = ["bash"]                # tools whose calls wait for approval
+//! system_prompt = "..."         # in place of the extensions' prompt
 //! ```
 //!
 //! The file is edited in place: writing changes only the schema's keys, so
@@ -31,6 +39,22 @@ pub struct Config {
     pub agent: Option<String>,
     /// `[env]`: provider variables, such as `OPENAI_API_KEY`.
     pub env: BTreeMap<String, String>,
+    /// `[daemon]`: how the daemon runs. Its own table, so the daemon never
+    /// takes a setting from the environment of whichever client started it.
+    pub daemon: Daemon,
+}
+
+/// The `[daemon]` table; every key is optional.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct Daemon {
+    pub idle_secs: Option<u64>,
+    pub hibernate_secs: Option<u64>,
+    pub drain_secs: Option<u64>,
+    /// `chat` or `echo` (which needs no model, and offers the test
+    /// fixtures).
+    pub agent: Option<String>,
+    pub ask: Vec<String>,
+    pub system_prompt: Option<String>,
 }
 
 impl Config {
@@ -122,6 +146,7 @@ impl FromStr for Config {
             model: string(doc.as_table(), "model", "")?,
             agent: string(doc.as_table(), "agent", "")?,
             env: BTreeMap::new(),
+            daemon: Daemon::default(),
         };
         if let Some(env) = doc.get("env") {
             let env = env
@@ -132,6 +157,37 @@ impl FromStr for Config {
                     config.env.insert(key.to_owned(), value);
                 }
             }
+        }
+        if let Some(daemon) = doc.get("daemon") {
+            let t = daemon
+                .as_table_like()
+                .ok_or_else(|| ParseError("daemon must be a table".into()))?;
+            let secs = |key| {
+                t.get(key).map_or(Ok(None), |item| {
+                    item.as_integer()
+                        .and_then(|n| u64::try_from(n).ok())
+                        .map(Some)
+                        .ok_or_else(|| ParseError(format!("daemon.{key} must be a whole number")))
+                })
+            };
+            let ask = t.get("ask").map_or(Ok(Vec::new()), |item| {
+                item.as_array()
+                    .and_then(|tools| {
+                        tools
+                            .iter()
+                            .map(|t| t.as_str().map(str::to_owned))
+                            .collect()
+                    })
+                    .ok_or_else(|| ParseError("daemon.ask must be a list of tool names".into()))
+            })?;
+            config.daemon = Daemon {
+                idle_secs: secs("idle_secs")?,
+                hibernate_secs: secs("hibernate_secs")?,
+                drain_secs: secs("drain_secs")?,
+                agent: string(t, "agent", "daemon.")?,
+                ask,
+                system_prompt: string(t, "system_prompt", "daemon.")?,
+            };
         }
         Ok(config)
     }
@@ -211,6 +267,7 @@ mod tests {
         Config {
             model: model.map(str::to_owned),
             agent: None,
+            daemon: Daemon::default(),
             env: env
                 .iter()
                 .map(|(k, v)| ((*k).to_owned(), (*v).to_owned()))
@@ -247,6 +304,32 @@ model = "not this one"
         let bad = "model = \"open\n".parse::<Config>().unwrap_err();
         assert!(bad.to_string().contains("line 1"), "{bad}");
         assert_eq!("".parse::<Config>().unwrap(), Config::default());
+    }
+
+    #[test]
+    fn reads_the_daemon_table() {
+        let text = "[daemon]\nidle_secs = 15\nagent = \"echo\"\nask = [\"bash\", \"edit\"]\n";
+        let daemon = text.parse::<Config>().unwrap().daemon;
+        assert_eq!(daemon.idle_secs, Some(15));
+        assert_eq!(daemon.hibernate_secs, None);
+        assert_eq!(daemon.agent.as_deref(), Some("echo"));
+        assert_eq!(daemon.ask, ["bash", "edit"]);
+        for (bad, why) in [
+            (
+                "[daemon]\nidle_secs = -1\n",
+                "daemon.idle_secs must be a whole number",
+            ),
+            (
+                "[daemon]\nask = \"bash\"\n",
+                "daemon.ask must be a list of tool names",
+            ),
+            ("daemon = 1\n", "daemon must be a table"),
+        ] {
+            assert_eq!(bad.parse::<Config>().unwrap_err().to_string(), why);
+        }
+        // The pane's writes leave the table as it was.
+        let new = config(Some("m"), &[]);
+        assert_eq!(new.render(text).unwrap(), format!("model = \"m\"\n{text}"));
     }
 
     #[test]

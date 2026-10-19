@@ -19,10 +19,7 @@ fn dirs(name: &str, home: Option<&str>, workspace: Option<&str>) -> (PathBuf, Pa
 }
 
 fn settings(root: &Path) -> Settings {
-    Settings {
-        process: |name| (name == "FROM_DAEMON").then(|| "daemon".to_owned()),
-        ..Settings::new(root.join("config.toml"), None, None)
-    }
+    Settings::new(root.join("config.toml"), None)
 }
 
 #[test]
@@ -43,6 +40,7 @@ fn files_parse_the_contract() {
             model: Some("openai:gpt-6-luna".into()),
             agent: Some("chat".into()),
             env: BTreeMap::from([("OPENAI_API_KEY".into(), "sk-test".into())]),
+            daemon: sys::config::Daemon::default(),
         }
     );
 }
@@ -59,12 +57,7 @@ fn later_layers_win() {
     assert_eq!(s.agent(&ws), agent::Kind::Echo);
     assert_eq!(s.model(&root).unwrap(), "home:m");
 
-    let overridden = Settings::new(
-        root.join("config.toml"),
-        Some("env:m".into()),
-        Some(agent::Kind::Chat),
-    );
-    assert_eq!(overridden.model(&ws).unwrap(), "env:m");
+    let overridden = Settings::new(root.join("config.toml"), Some(agent::Kind::Chat));
     assert_eq!(overridden.agent(&ws), agent::Kind::Chat);
 
     let (bare, ws) = dirs("defaults", None, None);
@@ -76,7 +69,7 @@ fn later_layers_win() {
 }
 
 #[test]
-fn variables_come_from_the_client_then_the_home_file_then_the_daemon() {
+fn variables_come_from_the_client_then_the_home_file_never_the_daemon() {
     let (root, _) = dirs(
         "vars",
         Some("[env]\nFROM_FILE = \"file\"\nSHADOWED = \"file\"\nBLANK = \"file\""),
@@ -95,7 +88,9 @@ fn variables_come_from_the_client_then_the_home_file_then_the_daemon() {
     assert_eq!(var("SHADOWED").as_deref(), Some("client"));
     assert_eq!(var("BLANK").as_deref(), Some("file"));
     assert_eq!(var("FROM_FILE").as_deref(), Some("file"));
-    assert_eq!(var("FROM_DAEMON").as_deref(), Some("daemon"));
+    // The daemon's own environment is whichever client's started it.
+    assert!(std::env::var_os("PATH").is_some());
+    assert_eq!(var("PATH"), None);
     assert_eq!(var("FROM_WORKSPACE"), None);
     assert_eq!(s.var(None, "SHADOWED").as_deref(), Some("file"));
     std::fs::remove_dir_all(root).unwrap();

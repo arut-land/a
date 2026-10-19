@@ -549,6 +549,17 @@ fn pump(mut from: impl Read, mut to: impl Write) -> io::Result<()> {
     }
 }
 
+/// All a daemon takes of the environment of the client that starts it:
+/// enough for its own processes to find their tools and a temporary
+/// directory. It serves every client, so nothing of one client's (keys,
+/// `A_*` settings) may reach the others: what a session runs with comes
+/// from its own client's attach, and the daemon's settings from
+/// `config.toml`.
+#[cfg(unix)]
+const DAEMON_ENV: &[&str] = &[
+    "HOME", "USER", "LOGNAME", "SHELL", "PATH", "TMPDIR", "LANG", "LC_ALL", "LC_CTYPE", "TZ",
+];
+
 /// Zero-lag start: when no daemon is listening, bind the socket here, hand the
 /// listening fd to a detached daemon running `runtime/current`, and connect
 /// straight into its backlog. Says whether it started that daemon.
@@ -601,8 +612,14 @@ fn connect_or_spawn(home: &Home) -> io::Result<(UnixStream, bool)> {
     // The daemon leaves this process's session (`setsid`) as it starts, so
     // it outlives this client, its terminal and its app. Reaped here should
     // it exit first, so a long-lived client (the app) collects no zombies.
+    let inherited = DAEMON_ENV
+        .iter()
+        .filter_map(|&name| Some((name, std::env::var_os(name)?)));
     let mut daemon = Command::new(home.runtime().current_exe())
         .args(["__daemon", "--listen-fd", &fd.to_string()])
+        .env_clear()
+        .envs(inherited)
+        .env("A_HOME", home.root())
         .stdin(Stdio::null())
         .stdout(Stdio::null())
         .stderr(log)

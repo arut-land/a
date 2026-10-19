@@ -195,26 +195,26 @@ fn cassette(path: &str) -> Vec<String> {
         .collect()
 }
 
-/// The daemon's environment in these tests: a key, and no home file.
-fn daemon_env(name: &str) -> Option<String> {
-    (name == "OPENAI_API_KEY").then(|| "daemon".to_owned())
+/// The home config file of these tests: `gpt-5.6` on `OpenAI`, with a key.
+fn gpt_home() -> PathBuf {
+    let path = std::env::temp_dir().join(format!("a-engine-gpt-{}.toml", std::process::id()));
+    std::fs::write(
+        &path,
+        "model = \"gpt-5.6\"\n[env]\nOPENAI_API_KEY = \"daemon\"\n",
+    )
+    .unwrap();
+    path
 }
 
 /// `gpt-5.6` on `OpenAI`, answered by `script`.
 fn openai(script: &Arc<Script>) -> Models {
-    with_home(
-        script,
-        &std::env::temp_dir().join("a-engine-no-config.toml"),
-    )
+    with_home(script, &gpt_home())
 }
 
 /// [`openai`], with the home config file at `path`.
 fn with_home(script: &Arc<Script>, path: &Path) -> Models {
     Models {
-        settings: crate::config::Settings {
-            process: daemon_env,
-            ..crate::config::Settings::new(path.to_owned(), Some("gpt-5.6".into()), None)
-        },
+        settings: crate::config::Settings::new(path.to_owned(), None),
         http: Arc::clone(script) as Arc<dyn Http>,
     }
 }
@@ -414,14 +414,14 @@ fn the_model_calls_a_tool_and_answers_from_its_result() {
 }
 
 #[test]
-fn model_calls_take_credentials_from_the_client_then_the_config_then_the_daemon() {
+fn model_calls_take_credentials_from_the_client_then_the_config() {
     let replies = cassette("openai/streaming_grammar/tool_then_followup_text.yaml");
     let dir = std::env::temp_dir().join(format!("a-engine-credentials-{}", std::process::id()));
     std::fs::create_dir_all(&dir).unwrap();
     let config = dir.join("config.toml");
     let key_sent = |client: Option<&str>, file: Option<&str>| {
         let text = file.map_or_else(String::new, |key| {
-            format!("[env]\nOPENAI_API_KEY = \"{key}\"\n")
+            format!("model = \"gpt-5.6\"\n[env]\nOPENAI_API_KEY = \"{key}\"\n")
         });
         std::fs::write(&config, text).unwrap();
         let script = Script::new(&replies);
@@ -449,7 +449,6 @@ fn model_calls_take_credentials_from_the_client_then_the_config_then_the_daemon(
     };
     assert_eq!(key_sent(Some("client"), Some("file")), "Bearer client");
     assert_eq!(key_sent(None, Some("file")), "Bearer file");
-    assert_eq!(key_sent(None, None), "Bearer daemon");
     std::fs::remove_dir_all(dir).unwrap();
 }
 
@@ -457,8 +456,7 @@ fn model_calls_take_credentials_from_the_client_then_the_config_then_the_daemon(
 fn a_missing_credential_fails_the_model_call_saying_where_to_set_it() {
     let script = Script::new(&[]);
     let config = std::env::temp_dir().join("a-engine-no-config.toml");
-    let mut models = with_home(&script, &config);
-    models.settings.process = |_| None;
+    let models = with_home(&script, &config);
     let fixture = Fixture::new(agent::Kind::Chat, Registry::default(), models);
     let session = fixture.start(&[]);
     session.submit("hi".into()).unwrap();
@@ -484,14 +482,24 @@ fn a_missing_credential_fails_the_model_call_saying_where_to_set_it() {
 
 /// The engine's model path against a real endpoint: `mise exec -- cargo
 /// nextest run -p engine --run-ignored only live`. Keys, base URL and
-/// `A_MODEL` come from the environment, as a daemon's would.
+/// `A_MODEL` come from this test's environment, as a client's would.
 #[test]
 #[ignore = "calls a real endpoint"]
 fn live_the_model_calls_a_tool_and_answers_from_its_result() {
     let rt: rt::Rt = Arc::new(rt::Threads::new(2));
-    let home = std::env::temp_dir().join("a-engine-no-config.toml");
+    let home = std::env::temp_dir().join(format!("a-engine-live-{}.toml", std::process::id()));
+    let mut file = sys::Config {
+        model: std::env::var("A_MODEL").ok(),
+        ..sys::Config::default()
+    };
+    for name in ["OPENAI_API_KEY", "OPENAI_BASE_URL"] {
+        if let Ok(value) = std::env::var(name) {
+            file.env.insert(name.to_owned(), value);
+        }
+    }
+    file.write(&home).unwrap();
     let models = Models {
-        settings: crate::config::Settings::new(home, std::env::var("A_MODEL").ok(), None),
+        settings: crate::config::Settings::new(home, None),
         http: Arc::new(llm::Ureq::new(rt)),
     };
     let fixture = Fixture::new(
@@ -1380,14 +1388,7 @@ fn a_steer_reaches_the_running_turn_before_the_model_is_next_asked() {
 #[test]
 fn an_interrupt_stops_the_model_call_and_ends_the_turn() {
     let models = Models {
-        settings: crate::config::Settings {
-            process: daemon_env,
-            ..crate::config::Settings::new(
-                std::env::temp_dir().join("a-engine-no-config.toml"),
-                Some("gpt-5.6".into()),
-                None,
-            )
-        },
+        settings: crate::config::Settings::new(gpt_home(), None),
         http: Arc::new(Silent),
     };
     let fixture = Fixture::new(agent::Kind::Chat, Registry::default(), models);
@@ -1528,10 +1529,10 @@ fn the_model_is_set_per_session_and_says_where_it_comes_from() {
     assert_eq!(
         results,
         [
-            &set("the daemon's environment", "gpt-5.6"),
+            &set("the home config.toml", "gpt-5.6"),
             &set("this session, at entry 4", "anthropic:claude-x"),
             &set("this session, at entry 4", "anthropic:claude-x"),
-            &set("the daemon's environment", "gpt-5.6"),
+            &set("the home config.toml", "gpt-5.6"),
         ]
     );
     let chosen = Body::Settings(Overrides {

@@ -18,7 +18,7 @@ mod workspace;
 
 use std::fs::File;
 use std::io;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 pub use awake::Awake;
 pub use config::Config;
@@ -48,6 +48,11 @@ impl Home {
                 .join(".a"),
         };
         Ok(root.into())
+    }
+
+    /// `$A_HOME`, else `~/.a`.
+    pub fn root(&self) -> &Path {
+        &self.root
     }
 
     pub fn run_dir(&self) -> PathBuf {

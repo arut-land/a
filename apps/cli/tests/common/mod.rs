@@ -57,7 +57,8 @@ pub struct Env {
     pub exe: PathBuf,
     pub ws: PathBuf,
     pub home: Home,
-    /// More environment for every `a` this test runs, and so its daemons.
+    /// More environment for every `a` this test runs (never its daemons,
+    /// which take theirs from [`Env::daemon`]).
     pub vars: Vec<(&'static str, &'static str)>,
 }
 
@@ -80,7 +81,19 @@ impl Env {
             vars: Vec::new(),
         };
         warm_up(&env.exe);
+        env.daemon("agent = \"echo\"\nidle_secs = 15");
         env
+    }
+
+    /// Adds `lines` to the `[daemon]` table of this home's `config.toml`,
+    /// for the daemons started after.
+    pub fn daemon(&self, lines: &str) {
+        let path = self.home.config_file();
+        let mut text = fs::read_to_string(&path).unwrap_or_else(|_| "[daemon]\n".into());
+        text.push_str(lines);
+        text.push('\n');
+        fs::create_dir_all(path.parent().unwrap()).unwrap();
+        fs::write(path, text).unwrap();
     }
 
     pub fn cmd(&self, args: &[&str]) -> Command {
@@ -111,8 +124,6 @@ impl Env {
     fn configure(&self, mut cmd: Command) -> Command {
         cmd.current_dir(&self.ws)
             .env("A_HOME", self.root.join("home"))
-            .env("A_AGENT", "echo")
-            .env("A_IDLE_SECS", "15")
             .envs(self.vars.iter().copied());
         cmd
     }

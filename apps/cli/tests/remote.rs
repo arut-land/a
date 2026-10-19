@@ -32,8 +32,11 @@ impl Scratch {
         }
     }
 
-    /// An `A_HOME` whose daemon is stopped at the end.
+    /// An `A_HOME` whose daemon, running the echo agent, is stopped at
+    /// the end.
     fn home(&mut self, path: PathBuf) -> PathBuf {
+        fs::create_dir_all(&path).unwrap();
+        fs::write(path.join("config.toml"), "[daemon]\nagent = \"echo\"\n").unwrap();
         self.homes.push(path.clone());
         path
     }
@@ -65,9 +68,7 @@ impl Drop for Scratch {
 
 fn a(home: &Path) -> Command {
     let mut cmd = Command::new(A);
-    cmd.env("A_HOME", home)
-        .env("A_AGENT", "echo")
-        .env_remove("A_HOST");
+    cmd.env("A_HOME", home).env_remove("A_HOST");
     cmd
 }
 
@@ -234,7 +235,6 @@ fn a_newer_build_drains_the_old_daemon() {
     let output = Command::new(&newer)
         .arg("ls")
         .env("A_HOME", &home)
-        .env("A_AGENT", "echo")
         .output()
         .unwrap();
     assert_eq!(ok(&output).lines().count(), 1);

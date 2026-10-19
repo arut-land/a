@@ -185,6 +185,7 @@ impl Client {
             model: given(settings.model),
             agent: given(settings.agent),
             env,
+            ..sys::Config::default()
         };
         config.write(&self.daemon.home.config_file())?;
         Ok(())

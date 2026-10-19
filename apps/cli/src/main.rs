@@ -578,7 +578,7 @@ fn daemon(ctx: &Ctx, listen_fd: Option<i32>) -> io::Result<()> {
     } else {
         home.bind()?
     };
-    engine::serve(&listener, home, &engine::Config::from_env(), &ctx.staged.id)
+    engine::serve(&listener, home, &engine::Config::load(home), &ctx.staged.id)
 }
 
 #[cfg(not(unix))]
