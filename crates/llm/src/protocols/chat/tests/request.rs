@@ -29,7 +29,7 @@ pub(super) fn tool(name: &str) -> Tool {
 pub(super) fn hello(model: &str) -> Request {
     Request {
         model: model.into(),
-        messages: vec![Message::user("Hello")],
+        messages: vec![Message::user("Hello")].into(),
         ..Request::default()
     }
 }
@@ -105,7 +105,7 @@ fn a_recorded_request_is_what_we_send() {
     let openai = provider("openai");
     let prompt = |text: &str, max: u32| Request {
         model: "gpt-4.1-nano".into(),
-        messages: vec![Message::user(text)],
+        messages: vec![Message::user(text)].into(),
         generation: Generation {
             temperature: Some(0.0),
             max_output_tokens: NonZeroU32::new(max),
@@ -227,7 +227,7 @@ fn user_parts_take_their_wire_shapes() {
     ];
     let user = |content| Request {
         model: "google/gemini-2.5-flash".into(),
-        messages: vec![Message::User(User { content })],
+        messages: vec![Message::User(User { content })].into(),
         ..Request::default()
     };
     let openrouter = sent(&provider("openrouter"), &user(content));
@@ -501,7 +501,8 @@ fn hosts_reshape_content() {
                     UserPart::Text(Text::new("b")),
                 ],
             }),
-        ],
+        ]
+        .into(),
         ..Request::default()
     };
     let perplexity = sent(&provider("perplexity"), &parts("sonar"));
@@ -515,7 +516,8 @@ fn hosts_reshape_content() {
     let mut audio = parts("voxtral-small-latest");
     audio.messages = vec![Message::User(User {
         content: vec![media("audio/wav", data("UklG"))],
-    })];
+    })]
+    .into();
     let mistral = sent(&provider("mistral"), &audio);
     assert_eq!(
         mistral["messages"][0]["content"],
@@ -534,7 +536,8 @@ fn mistral_joins_later_system_messages() {
             Message::user("q"),
             Message::system("second"),
             Message::user("r"),
-        ],
+        ]
+        .into(),
         ..Request::default()
     };
     let body = sent(&provider("mistral"), &request);

@@ -82,17 +82,17 @@ fn sent(model: &str, request: Request) -> Value {
         provider: &provider,
         model,
     };
-    let request = crate::prepare(&request, &target);
+    let request = crate::prepare::prepare(&request, &target);
     provider
         .protocol
         .encode(&target, &request)
         .expect("the request encodes")
-        .body
+        .json()
 }
 
 fn asking(messages: Vec<Message>) -> Request {
     Request {
-        messages,
+        messages: messages.into(),
         ..Request::default()
     }
 }
@@ -158,12 +158,12 @@ fn native(text: &str, item: Value) -> AssistantPart {
     let mut part = Text::new(text);
     let mut state = json!({ "fp": fp });
     state["item"] = item;
-    part.meta.insert(KEY.to_owned(), state);
+    part.meta.insert(KEY.to_owned(), &state);
     AssistantPart::Text(part)
 }
 
-fn item(part: &AssistantPart) -> Option<&Value> {
-    part.meta().get(KEY).and_then(|state| state.get("item"))
+fn item(part: &AssistantPart) -> Option<Value> {
+    part.meta().field(KEY, "item")
 }
 
 fn the_function_response(contents: &[Value]) -> &Value {

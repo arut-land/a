@@ -11,27 +11,23 @@
 //! - A call nothing answered gets an error result before the conversation
 //!   moves on; a result nothing asked for is dropped.
 //! - A system message between a call and its results waits until after them.
+//!
+//! The pass is a fold, a message at a time, as the encoding it feeds is
+//! ([`Fold`](crate::conversation::Fold)). It holds back only what a later message may still change: a
+//! tool message whose calls are not all answered, and the system messages
+//! waiting behind it. A message it does not change goes on as it is.
 
 use std::borrow::Cow;
 
+use crate::conversation::Step;
+use crate::error::Error;
 use crate::protocol::Target;
 use crate::spec::{
-    Assistant, AssistantPart, Message, Meta, Output, Request, SmolStr, ToolMessage, ToolResult,
+    Assistant, AssistantPart, Message, Meta, Output, SmolStr, ToolMessage, ToolResult,
 };
 
 /// The text an unanswered call is answered with.
 pub const NO_RESULT: &str = "No result provided";
-
-/// `request` as `target` takes it; borrowed when the pass would change
-/// nothing, as for a conversation with one model, so a long transcript is
-/// not copied on every call.
-pub fn prepare<'a>(request: &'a Request, target: &Target<'_>) -> Cow<'a, Request> {
-    if ready(request, target) {
-        Cow::Borrowed(request)
-    } else {
-        Cow::Owned(rebuild(request.clone(), target))
-    }
-}
 
 /// Whether `assistant` goes back to the protocol, provider and model that
 /// produced it.
@@ -43,90 +39,185 @@ fn native(assistant: &Assistant, target: &Target<'_>) -> bool {
     })
 }
 
-/// Whether [`rebuild`] would return `request` as it is: every part fits
-/// the target and every call is answered right after it.
-fn ready(request: &Request, target: &Target<'_>) -> bool {
-    let protocol = &target.provider.protocol;
-    let mut pending: Vec<&SmolStr> = Vec::new();
-    for message in &request.messages {
-        match message {
-            Message::Tool(tool) => {
-                for result in &tool.results {
-                    let Some(at) = pending.iter().position(|id| **id == result.id) else {
-                        return false;
-                    };
-                    pending.remove(at);
-                }
-                if tool.results.is_empty() {
-                    return false;
-                }
+/// The pass over a conversation, as far as it got.
+#[derive(Clone, Default)]
+pub(crate) struct Prepare {
+    ids: Ids,
+    /// Calls awaiting results, in call order: (id, name).
+    pending: Vec<(SmolStr, SmolStr)>,
+    /// The last tool message, held while calls wait whose error results
+    /// would join it.
+    answers: Option<ToolMessage>,
+    /// System messages between a call and its results.
+    held: Vec<Message>,
+    /// How many messages went on.
+    sent: usize,
+}
+
+impl Prepare {
+    /// Passes `message` on to `fold` as `target` takes it, with what it
+    /// releases.
+    pub(crate) fn push(
+        &mut self,
+        target: &Target<'_>,
+        message: &Message,
+        fold: &mut dyn Step,
+    ) -> Result<(), Error> {
+        let Some(message) = self.fit(message, target) else {
+            return Ok(());
+        };
+        match &*message {
+            Message::Tool(_) => self.results(message, fold),
+            Message::System(_) if !self.pending.is_empty() => {
+                self.held.push(message.into_owned());
+                Ok(())
             }
-            _ if !pending.is_empty() => return false,
-            Message::Assistant(assistant) => {
+            Message::System(_) | Message::User(_) | Message::Assistant(_) => {
+                self.answer(fold)?;
+                self.release(fold)?;
+                if let Message::Assistant(assistant) = &*message {
+                    let calls = assistant.tool_calls();
+                    let calls = calls.map(|call| (call.id.clone(), call.name.clone()));
+                    self.pending.extend(calls);
+                }
+                self.send(&message, fold)
+            }
+        }
+    }
+
+    /// The conversation ends here: the calls still waiting are answered,
+    /// and what waited goes on.
+    pub(crate) fn finish(&mut self, fold: &mut dyn Step) -> Result<(), Error> {
+        self.answer(fold)?;
+        self.release(fold)
+    }
+
+    fn send(&mut self, message: &Message, fold: &mut dyn Step) -> Result<(), Error> {
+        self.sent += 1;
+        fold.push(self.sent - 1, message)
+    }
+
+    /// The system messages held, once no call waits.
+    fn release(&mut self, fold: &mut dyn Step) -> Result<(), Error> {
+        for message in std::mem::take(&mut self.held) {
+            self.send(&message, fold)?;
+        }
+        Ok(())
+    }
+
+    /// A tool message: the results that waiting calls asked for. It waits
+    /// itself while calls still do.
+    fn results(&mut self, mut message: Cow<'_, Message>, fold: &mut dyn Step) -> Result<(), Error> {
+        let Message::Tool(tool) = &*message else {
+            return Ok(());
+        };
+        let pending = &mut self.pending;
+        let kept: Vec<bool> = (tool.results.iter())
+            .map(|result| {
+                let waiting = pending.iter().position(|(id, _)| *id == result.id);
+                waiting.map(|at| pending.remove(at)).is_some()
+            })
+            .collect();
+        if kept.contains(&false)
+            && let Message::Tool(tool) = message.to_mut()
+        {
+            let mut kept = kept.iter();
+            tool.results.retain(|_| kept.next() == Some(&true));
+        }
+        if kept.contains(&true) {
+            if let Some(answers) = self.answers.take() {
+                self.send(&Message::Tool(answers), fold)?;
+            }
+            if self.pending.is_empty() {
+                self.send(&message, fold)?;
+            } else if let Message::Tool(tool) = message.into_owned() {
+                self.answers = Some(tool);
+            }
+        }
+        if self.pending.is_empty() {
+            if let Some(answers) = self.answers.take() {
+                self.send(&Message::Tool(answers), fold)?;
+            }
+            self.release(fold)?;
+        }
+        Ok(())
+    }
+
+    /// Every call still waiting gets an error result before the
+    /// conversation moves on, joining the results it began.
+    fn answer(&mut self, fold: &mut dyn Step) -> Result<(), Error> {
+        if self.pending.is_empty() {
+            return Ok(());
+        }
+        let results = self.pending.drain(..).map(|(id, name)| ToolResult {
+            id,
+            name,
+            output: Output::Text(NO_RESULT.to_owned()),
+            error: true,
+            meta: Meta::new(),
+        });
+        let mut answers = self.answers.take().unwrap_or_default();
+        answers.results.extend(results);
+        self.send(&Message::Tool(answers), fold)
+    }
+
+    /// `message` cut down to what `target` takes; `None` for a turn left
+    /// with nothing.
+    fn fit<'m>(&mut self, message: &'m Message, target: &Target<'_>) -> Option<Cow<'m, Message>> {
+        let protocol = &target.provider.protocol;
+        let fit = |id: &str| protocol.tool_id(id);
+        match message {
+            Message::Assistant(assistant) if !native(assistant, target) => {
                 let fits = |part: &AssistantPart| match part {
                     AssistantPart::Text(_) | AssistantPart::Media(_) => part.meta().is_empty(),
                     AssistantPart::ToolCall(call) => {
-                        !call.provider_executed
-                            && call.meta.is_empty()
-                            && protocol.tool_id(&call.id).is_none()
+                        !call.provider_executed && call.meta.is_empty() && fit(&call.id).is_none()
                     }
                     _ => false,
                 };
-                if assistant.content.is_empty()
-                    || !native(assistant, target) && !assistant.content.iter().all(fits)
-                {
-                    return false;
+                if assistant.content.iter().all(fits) {
+                    // Each id is its own, and now taken.
+                    for call in assistant.tool_calls() {
+                        self.ids.rename(&call.id, fit);
+                    }
+                    return (!assistant.content.is_empty()).then_some(Cow::Borrowed(message));
                 }
-                pending.extend(assistant.tool_calls().map(|call| &call.id));
-            }
-            Message::System(_) | Message::User(_) => {}
-        }
-    }
-    pending.is_empty()
-}
-
-/// The pass itself, on a request of its own.
-fn rebuild(mut request: Request, target: &Target<'_>) -> Request {
-    let protocol = &target.provider.protocol;
-    let native = |assistant: &Assistant| native(assistant, target);
-    let mut ids = Ids::default();
-    let messages: Vec<Message> = std::mem::take(&mut request.messages)
-        .into_iter()
-        .filter_map(|message| match message {
-            Message::Assistant(mut assistant) => {
-                if !native(&assistant) {
-                    assistant.content.retain(|part| match part {
-                        AssistantPart::Text(_) | AssistantPart::Media(_) => true,
-                        AssistantPart::ToolCall(call) => !call.provider_executed,
-                        AssistantPart::Reasoning(_)
-                        | AssistantPart::ToolResult(_)
-                        | AssistantPart::Opaque(_) => false,
-                    });
-                    for part in &mut assistant.content {
-                        part.meta_mut().clear();
-                        if let AssistantPart::ToolCall(call) = part {
-                            call.id = ids.rename(&call.id, |id| protocol.tool_id(id));
-                        }
+                let mut assistant = assistant.clone();
+                assistant.content.retain(|part| match part {
+                    AssistantPart::Text(_) | AssistantPart::Media(_) => true,
+                    AssistantPart::ToolCall(call) => !call.provider_executed,
+                    AssistantPart::Reasoning(_)
+                    | AssistantPart::ToolResult(_)
+                    | AssistantPart::Opaque(_) => false,
+                });
+                for part in &mut assistant.content {
+                    part.meta_mut().clear();
+                    if let AssistantPart::ToolCall(call) = part {
+                        call.id = self.ids.rename(&call.id, fit);
                     }
                 }
-                (!assistant.content.is_empty()).then_some(Message::Assistant(assistant))
+                (!assistant.content.is_empty()).then_some(Cow::Owned(Message::Assistant(assistant)))
             }
-            Message::Tool(mut tool) => {
+            Message::Tool(tool)
+                if tool
+                    .results
+                    .iter()
+                    .any(|r| self.ids.renamed(&r.id).is_some()) =>
+            {
+                let mut tool = tool.clone();
                 for result in &mut tool.results {
-                    if let Some(id) = ids.renamed(&result.id) {
+                    if let Some(id) = self.ids.renamed(&result.id) {
                         result.id = id;
                     }
                 }
-                Some(Message::Tool(tool))
+                Some(Cow::Owned(Message::Tool(tool)))
             }
-            other => Some(other),
-        })
-        .collect();
-    request.messages = repair(messages);
-    request
+            message => Some(Cow::Borrowed(message)),
+        }
+    }
 }
 
-#[derive(Default)]
+#[derive(Clone, Default)]
 struct Ids {
     /// Sorted by the id renamed, as `taken` is sorted: sets this small
     /// cost less code sorted than hashed.
@@ -180,64 +271,29 @@ impl Ids {
     }
 }
 
-/// Pairs every call with a result, in place.
-fn repair(messages: Vec<Message>) -> Vec<Message> {
-    let mut out = Vec::with_capacity(messages.len());
-    // Calls awaiting results, in call order: (id, name).
-    let mut pending: Vec<(SmolStr, SmolStr)> = Vec::new();
-    let mut held: Vec<Message> = Vec::new();
-    for message in messages {
-        match message {
-            Message::Tool(mut tool) => {
-                tool.results.retain(|result| {
-                    let waiting = pending.iter().position(|(id, _)| *id == result.id);
-                    waiting.map(|at| pending.remove(at)).is_some()
-                });
-                if !tool.results.is_empty() {
-                    out.push(Message::Tool(tool));
-                }
-                if pending.is_empty() {
-                    out.append(&mut held);
-                }
-            }
-            Message::System(_) if !pending.is_empty() => held.push(message),
-            other => {
-                answer(&mut out, &mut pending);
-                out.append(&mut held);
-                if let Message::Assistant(assistant) = &other {
-                    pending.extend(
-                        assistant
-                            .tool_calls()
-                            .map(|call| (call.id.clone(), call.name.clone())),
-                    );
-                }
-                out.push(other);
-            }
-        }
-    }
-    answer(&mut out, &mut pending);
-    out.append(&mut held);
-    out
-}
+/// `request` as `target` takes it, whole: the messages the pass sends.
+#[cfg(test)]
+pub(crate) fn prepare(request: &crate::spec::Request, target: &Target<'_>) -> crate::spec::Request {
+    /// The messages a pass sends, as they are.
+    struct Sent(Vec<Message>);
 
-fn answer(out: &mut Vec<Message>, pending: &mut Vec<(SmolStr, SmolStr)>) {
-    if pending.is_empty() {
-        return;
+    impl Step for Sent {
+        fn push(&mut self, _: usize, message: &Message) -> Result<(), Error> {
+            self.0.push(message.clone());
+            Ok(())
+        }
+
+        fn settle(&mut self, _: &mut Vec<serde_json::Value>) {}
     }
-    let results = pending.drain(..).map(|(id, name)| ToolResult {
-        id,
-        name,
-        output: Output::Text(NO_RESULT.to_owned()),
-        error: true,
-        meta: Meta::new(),
-    });
-    // Results the conversation already began join the synthetic ones.
-    if let Some(Message::Tool(tool)) = out.last_mut() {
-        tool.results.extend(results);
-    } else {
-        out.push(Message::Tool(ToolMessage {
-            results: results.collect(),
-        }));
+
+    let (mut pass, mut sent) = (Prepare::default(), Sent(Vec::new()));
+    for message in request.messages.iter() {
+        let _ = pass.push(target, message, &mut sent);
+    }
+    let _ = pass.finish(&mut sent);
+    crate::spec::Request {
+        messages: sent.0.into(),
+        ..request.clone()
     }
 }
 

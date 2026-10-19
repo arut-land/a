@@ -137,7 +137,10 @@ struct Interrupting {
 }
 
 impl Http for Interrupting {
-    fn send(&self, _: http::Request<Bytes>) -> BoxFuture<'static, io::Result<llm::http::Response>> {
+    fn send(
+        &self,
+        _: http::Request<llm::http::Payload>,
+    ) -> BoxFuture<'static, io::Result<llm::http::Response>> {
         self.sent.fetch_add(1, Ordering::SeqCst);
         if let Some(session) = self.session.get().and_then(Weak::upgrade) {
             session.interrupt();

@@ -6,7 +6,7 @@ use std::io;
 use std::path::{Path, PathBuf};
 
 use bytes::Bytes;
-use llm::http::{BoxFuture, Http, Response, body};
+use llm::http::{BoxFuture, Http, Payload, Response, body};
 use llm::protocols::{chat, gemini, messages, responses};
 use llm::{AssistantPart, Kind, Provider, Reason, Request};
 use serde_json::{Value, json};
@@ -18,7 +18,7 @@ struct Recorded {
 }
 
 impl Http for Recorded {
-    fn send(&self, _: http::Request<Bytes>) -> BoxFuture<'static, io::Result<Response>> {
+    fn send(&self, _: http::Request<Payload>) -> BoxFuture<'static, io::Result<Response>> {
         let mut builder = http::Response::builder().status(self.status);
         for (name, value) in &self.headers {
             builder = builder.header(name, value);
@@ -140,7 +140,7 @@ fn decode(dir: &str, doc: &serde_yaml_ng::Value) -> Option<Value> {
     };
     let request = Request {
         model: model.into(),
-        messages: vec![llm::Message::user("hi")],
+        messages: vec![llm::Message::user("hi")].into(),
         // What the oracle asked for.
         generation: llm::Generation {
             max_output_tokens: std::num::NonZeroU32::new(1024),
@@ -193,8 +193,8 @@ fn part_of(part: &AssistantPart, key: &str) -> Value {
             let state = opaque.meta.get(key);
             json!({
                 "type": "opaque",
-                "kind": state.and_then(|state| state.pointer("/item/type")),
-                "replay": state.and_then(|state| state.get("replay")).and_then(Value::as_bool).unwrap_or(false),
+                "kind": state.as_ref().and_then(|state| state.pointer("/item/type")),
+                "replay": state.as_ref().and_then(|state| state.get("replay")).and_then(Value::as_bool).unwrap_or(false),
             })
         }
         AssistantPart::ToolResult(_) => json!({"type": "tool_result"}),

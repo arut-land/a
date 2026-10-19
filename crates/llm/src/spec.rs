@@ -18,8 +18,11 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 pub use smol_str::SmolStr;
 
-/// Protocol-keyed provider state on a part or a reply.
-pub type Meta = BTreeMap<String, Value>;
+pub use self::meta::Meta;
+pub use crate::conversation::Messages;
+
+/// Typed per-protocol options, keyed by protocol.
+pub type Options = BTreeMap<String, Value>;
 
 /// One model call.
 #[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
@@ -27,7 +30,7 @@ pub struct Request {
     pub model: SmolStr,
     /// The conversation. Leading system messages are the system prompt;
     /// later ones are instructions given mid-conversation.
-    pub messages: Vec<Message>,
+    pub messages: Messages,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub tools: Vec<Tool>,
     #[serde(default, skip_serializing_if = "ToolChoice::is_auto")]
@@ -44,8 +47,8 @@ pub struct Request {
     pub cache_key: Option<String>,
     /// Typed per-protocol options, keyed like [`Meta`]; each protocol reads
     /// only its own key.
-    #[serde(default, skip_serializing_if = "Meta::is_empty")]
-    pub options: Meta,
+    #[serde(default, skip_serializing_if = "Options::is_empty")]
+    pub options: Options,
     /// Deep-merged over the encoded body last: the escape hatch for any
     /// field no option models.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -562,8 +565,10 @@ pub enum Event {
     },
     /// Text, reasoning text, or a fragment of a call's argument JSON.
     Delta { index: u32, text: String },
-    /// A part ends. `text` replaces what streamed when the provider
-    /// restated it; a call ends with its id and arguments.
+    /// A part ends. Text and reasoning end with their whole `text` (what
+    /// streamed, or what the provider restated), moved rather than copied:
+    /// deltas carry pieces, and only the end the whole. A call ends with its
+    /// id and arguments.
     End {
         index: u32,
         #[serde(default, skip_serializing_if = "std::ops::Not::not")]
@@ -613,4 +618,5 @@ pub struct Response {
     pub meta: Meta,
 }
 
+mod meta;
 mod value;

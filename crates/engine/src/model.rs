@@ -1,13 +1,10 @@
 //! The model a session calls: a provider and model id from its settings
 //! (`host:model`, or a bare model on `OpenAI`), sent over ureq.
 
-use std::collections::HashMap;
 use std::path::Path;
-use std::pin::Pin;
 use std::sync::Arc;
 
-use futures_core::Stream;
-use llm::{Accumulator, Block, Event, Http, Message, Provider, Request, Response};
+use llm::{Block, Event, Events, Http, Messages, Provider, Request};
 use protocol::{Environment, Overrides};
 
 use crate::config::Settings;
@@ -59,7 +56,7 @@ impl Model {
     }
 
     /// A request to this model for a reply to `messages`, offering `tools`.
-    pub fn request(&self, messages: Vec<Message>, tools: Vec<llm::Tool>) -> Request {
+    pub fn request(&self, messages: Messages, tools: Vec<llm::Tool>) -> Request {
         Request {
             model: self.id.clone(),
             messages,
@@ -68,30 +65,35 @@ impl Model {
         }
     }
 
-    /// The reply to `request`. Answer text streams to `on_text` as it
-    /// arrives.
-    pub async fn reply(
-        &self,
-        request: &Request,
-        on_text: &mut (dyn FnMut(&str) + Send),
-    ) -> Result<Response, llm::Error> {
-        let mut events = llm::stream(&*self.http, &self.provider, request);
-        let mut acc = Accumulator::new();
-        let mut blocks = HashMap::new();
-        while let Some(event) = std::future::poll_fn(|cx| Pin::new(&mut events).poll_next(cx)).await
-        {
-            let event = event?;
-            match &event {
-                Event::Start { index, block, .. } => {
-                    blocks.insert(*index, *block);
-                }
-                Event::Delta { index, text } if blocks.get(index) == Some(&Block::Text) => {
-                    on_text(text);
-                }
-                _ => {}
-            }
-            acc.push(event)?;
-        }
-        acc.finish(Some(llm::origin(&self.provider, &request.model)))
+    /// The reply to `request`, as it streams.
+    pub fn send(&self, request: &Request) -> Events {
+        llm::stream(&*self.http, &self.provider, request)
     }
+
+    /// What a reply to `request` names as its producer.
+    pub fn origin(&self, request: &Request) -> llm::Origin {
+        llm::origin(&self.provider, &request.model)
+    }
+}
+
+/// Reads `events` to their end, the answer text streaming to `on_text` as
+/// it arrives.
+pub async fn read(
+    events: &mut Events,
+    on_text: &mut (dyn FnMut(&str) + Send),
+) -> Result<(), llm::Error> {
+    // The text parts' indices: a reply has few.
+    let mut texts = Vec::new();
+    while let Some(event) = events.next().await {
+        match event? {
+            Event::Start {
+                index,
+                block: Block::Text,
+                ..
+            } => texts.push(*index),
+            Event::Delta { index, text } if texts.contains(index) => on_text(text),
+            _ => {}
+        }
+    }
+    Ok(())
 }

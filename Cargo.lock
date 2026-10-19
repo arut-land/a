@@ -550,7 +550,6 @@ dependencies = [
  "ext-policy",
  "ext-prompt",
  "ext-shell",
- "futures-core",
  "http",
  "llm",
  "memchr",

@@ -362,7 +362,10 @@ fn an_answers_audio_transcript_is_text() {
             );
         };
         assert_eq!(text.text, "hello there");
-        assert_eq!(item(part), Some(&json!({"audio": {"id": "audio_1"}})));
+        assert_eq!(
+            item(part).as_ref(),
+            Some(&json!({"audio": {"id": "audio_1"}}))
+        );
         let history = vec![Message::user("hi"), turn(&response)];
         assert_eq!(
             replayed("openai", model, history.clone()),

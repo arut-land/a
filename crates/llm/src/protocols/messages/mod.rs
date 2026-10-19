@@ -156,12 +156,13 @@ impl Protocol for Messages {
     }
 
     fn encode(&self, target: &Target<'_>, request: &Request) -> Result<Encoded, Error> {
-        let (body, betas) = encode::body(self.quirks, target.model, request)?;
+        let (body, history, betas) = encode::body(self.quirks, target, request)?;
         let mut headers = vec![("anthropic-version", VERSION.to_owned())];
         headers.extend(betas.map(|betas| ("anthropic-beta", betas)));
         Ok(Encoded {
             path: path(&target.provider.base_url).to_owned(),
             body,
+            history,
             headers,
         })
     }

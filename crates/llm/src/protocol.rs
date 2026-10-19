@@ -9,7 +9,9 @@ use std::sync::Arc;
 
 use serde_json::Value;
 
+use crate::conversation::{History, Pieces};
 use crate::error::{Error, Kind};
+use crate::http::Payload;
 use crate::spec::{Event, Request, SmolStr};
 
 pub trait Protocol: Send + Sync + 'static {
@@ -58,8 +60,59 @@ pub struct Target<'a> {
 pub struct Encoded {
     /// Appended to the provider's base URL; may carry a query.
     pub path: String,
+    /// The body but the conversation.
     pub body: Value,
+    /// The conversation, written into the body at its key; `None` when
+    /// options set that field themselves.
+    pub history: Option<History>,
     pub headers: Vec<(&'static str, String)>,
+}
+
+impl Encoded {
+    /// The body's bytes: its fields in order, the conversation's settled
+    /// items spliced in as they are.
+    pub fn payload(&self) -> Payload {
+        let mut out = Pieces::default();
+        let Value::Object(fields) = &self.body else {
+            out.json(&self.body);
+            return out.finish().into();
+        };
+        out.byte(b'{');
+        let mut history = self.history.as_ref();
+        let mut first = true;
+        let mut comma = |out: &mut Pieces| {
+            if !std::mem::take(&mut first) {
+                out.byte(b',');
+            }
+        };
+        for (key, value) in fields {
+            if let Some(spliced) = history.filter(|history| history.key < key.as_str()) {
+                comma(&mut out);
+                out.json(spliced.key);
+                out.byte(b':');
+                spliced.write(&mut out);
+                history = None;
+            }
+            comma(&mut out);
+            out.json(key);
+            out.byte(b':');
+            out.json(value);
+        }
+        if let Some(spliced) = history {
+            comma(&mut out);
+            out.json(spliced.key);
+            out.byte(b':');
+            spliced.write(&mut out);
+        }
+        out.byte(b'}');
+        out.finish().into()
+    }
+
+    /// The body as one value, the conversation in it.
+    #[cfg(test)]
+    pub fn json(&self) -> Value {
+        serde_json::from_slice(&self.payload().to_vec()).unwrap_or_default()
+    }
 }
 
 /// One event of a reply's server-sent event stream.
@@ -85,6 +138,12 @@ pub trait Decoder: Send {
     fn end(&mut self, out: &mut Vec<Event>) -> Result<(), Error> {
         let _ = out;
         Err(Error::incomplete())
+    }
+
+    /// The reader stopped reading (an interrupt): what is open ends as far
+    /// as it got, so the reply's text so far reaches the consumer.
+    fn cut(&mut self, out: &mut Vec<Event>) {
+        let _ = out;
     }
 }
 
@@ -165,18 +224,17 @@ impl Provider {
         self
     }
 
-    /// The HTTP request `request` becomes, encoded for `model`.
-    pub fn request(
-        &self,
-        model: &str,
-        request: &Request,
-    ) -> Result<http::Request<bytes::Bytes>, Error> {
+    /// The HTTP request `request` becomes, prepared and encoded for
+    /// `model`.
+    pub fn request(&self, model: &str, request: &Request) -> Result<http::Request<Payload>, Error> {
         let target = Target {
             provider: self,
             model,
         };
         let mut encoded = self.protocol.encode(&target, request)?;
         if let Some(overlay) = &request.body {
+            // A conversation the escape hatch states is the one sent.
+            encoded.history = encoded.history.filter(|h| !overlay.contains_key(h.key));
             crate::json::overlay(&mut encoded.body, overlay);
         }
         let mut uri = format!("{}{}", self.base_url, encoded.path);
@@ -204,10 +262,8 @@ impl Provider {
         for (name, value) in self.headers.iter().chain(&request.headers) {
             builder = builder.header(name.as_str(), value.as_str());
         }
-        let body = serde_json::to_vec(&encoded.body)
-            .map_err(|error| Error::unsupported(error.to_string()))?;
         builder
-            .body(bytes::Bytes::from(body))
+            .body(encoded.payload())
             .map_err(|error| Error::unsupported(format!("invalid request: {error}")))
     }
 }

@@ -10,9 +10,9 @@ use crate::spec::AssistantPart;
 
 /// What an encoder sends for one part.
 #[derive(Clone, Debug, PartialEq)]
-pub enum Replay<'a> {
+pub enum Replay {
     /// The provider item, unchanged.
-    Item(&'a Value),
+    Item(Value),
     /// The part was edited: rebuild it, keeping these keys of its item.
     Identity(Map<String, Value>),
     Rebuild,
@@ -76,15 +76,16 @@ pub fn fingerprint(canon: Canon<'_>) -> String {
 
 /// What to send for `part` under protocol `key`. `identity` picks the keys
 /// of a stale item that a rebuilt part keeps.
-pub fn replay<'a>(
-    part: &'a AssistantPart,
+pub fn replay(
+    part: &AssistantPart,
     key: &str,
     identity: impl FnOnce(&Value) -> Map<String, Value>,
-) -> Replay<'a> {
-    let Some(state) = part.meta().get(key) else {
+) -> Replay {
+    let Some(mut state) = part.meta().get(key) else {
         return Replay::Rebuild;
     };
-    let Some(item) = state.get("item").filter(|item| !item.is_null()) else {
+    let item = state.get_mut("item").map(Value::take);
+    let Some(item) = item.filter(|item| !item.is_null()) else {
         return Replay::Rebuild;
     };
     let current = match Canon::of(part) {
@@ -94,7 +95,7 @@ pub fn replay<'a>(
     if current {
         return Replay::Item(item);
     }
-    let kept = identity(item);
+    let kept = identity(&item);
     if kept.is_empty() {
         Replay::Rebuild
     } else {
@@ -105,9 +106,8 @@ pub fn replay<'a>(
 /// Whether the opaque `part` goes back under `key`.
 pub fn replays(part: &AssistantPart, key: &str) -> bool {
     part.meta()
-        .get(key)
-        .and_then(|state| state.get("replay"))
-        .and_then(Value::as_bool)
+        .field(key, "replay")
+        .and_then(|replay| replay.as_bool())
         .unwrap_or(false)
 }
 

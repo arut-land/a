@@ -10,7 +10,7 @@ use std::sync::atomic::{AtomicUsize, Ordering::Relaxed};
 use std::time::Instant;
 
 use bytes::Bytes;
-use llm::http::{BoxFuture, Http, Response, body};
+use llm::http::{BoxFuture, Http, Payload, Response, body};
 use llm::protocols::{chat, gemini, messages, responses};
 use llm::{
     Assistant, AssistantPart, Message, Origin, Output, Provider, Request, Text, ToolCall,
@@ -85,7 +85,7 @@ struct Recorded {
 }
 
 impl Http for Recorded {
-    fn send(&self, _: http::Request<Bytes>) -> BoxFuture<'static, io::Result<Response>> {
+    fn send(&self, _: http::Request<Payload>) -> BoxFuture<'static, io::Result<Response>> {
         let chunks: Vec<Bytes> = (0..self.body.len())
             .step_by(1024)
             .map(|at| self.body.slice(at..self.body.len().min(at + 1024)))
@@ -187,7 +187,7 @@ fn exchanges() -> Vec<(Provider, Recorded)> {
 fn ask() -> Request {
     Request {
         model: "recorded-model".into(),
-        messages: vec![Message::user("hi")],
+        messages: vec![Message::user("hi")].into(),
         generation: llm::Generation {
             max_output_tokens: std::num::NonZeroU32::new(1024),
             ..llm::Generation::default()
@@ -297,13 +297,11 @@ fn decode_long_streams() {
     });
 }
 
-/// A session of `turns` tool rounds, each result `size` bytes, produced by
-/// `origin`.
-fn transcript(turns: usize, size: usize, origin: &Origin) -> Request {
-    let mut messages = vec![Message::system("You are terse."), Message::user("go")];
-    for turn in 0..turns {
-        let id: llm::SmolStr = format!("call_{turn}").into();
-        messages.push(Message::Assistant(Assistant {
+/// Tool round `turn`, its result `size` bytes, produced by `origin`.
+fn round(turn: usize, size: usize, origin: &Origin) -> [Message; 2] {
+    let id: llm::SmolStr = format!("call_{turn}").into();
+    [
+        Message::Assistant(Assistant {
             content: vec![
                 AssistantPart::Text(Text::new("Let me look.")),
                 AssistantPart::ToolCall(ToolCall {
@@ -319,8 +317,8 @@ fn transcript(turns: usize, size: usize, origin: &Origin) -> Request {
                 }),
             ],
             origin: Some(origin.clone()),
-        }));
-        messages.push(Message::Tool(ToolMessage {
+        }),
+        Message::Tool(ToolMessage {
             results: vec![ToolResult {
                 id,
                 name: "bash".into(),
@@ -328,11 +326,20 @@ fn transcript(turns: usize, size: usize, origin: &Origin) -> Request {
                 error: false,
                 meta: llm::Meta::new(),
             }],
-        }));
+        }),
+    ]
+}
+
+/// A session of `turns` tool rounds, each result `size` bytes, produced by
+/// `origin`.
+fn transcript(turns: usize, size: usize, origin: &Origin) -> Request {
+    let mut messages = vec![Message::system("You are terse."), Message::user("go")];
+    for turn in 0..turns {
+        messages.extend(round(turn, size, origin));
     }
     Request {
         model: origin.model.clone(),
-        messages,
+        messages: messages.into(),
         generation: llm::Generation {
             max_output_tokens: std::num::NonZeroU32::new(1024),
             ..llm::Generation::default()
@@ -387,10 +394,48 @@ fn encode_long_transcript() {
         }),
     ] {
         let origin = llm::origin(&provider, "m");
-        let request = transcript(200, 8 * 1024, &origin);
-        measure(&format!("{label} encode 200 turns x 8 KiB"), 20, || {
-            let _ = llm::stream(&reply, &provider, &request);
-        });
+        let mut request = transcript(200, 8 * 1024, &origin);
+        // Conversations no request encoded before.
+        let mut fresh: Vec<Request> = (0..=20)
+            .map(|_| Request {
+                messages: request.messages.to_vec().into(),
+                ..request.clone()
+            })
+            .collect();
+        measure(
+            &format!("{label} encode 200 turns x 8 KiB, whole"),
+            20,
+            || {
+                let request = fresh.pop().expect("a fresh conversation");
+                let _ = llm::stream(&reply, &provider, &request);
+            },
+        );
+        // One conversation, grown a round per request as a session's grows.
+        let mut grown = std::mem::take(&mut request.messages);
+        let _ = llm::stream(
+            &reply,
+            &provider,
+            &Request {
+                messages: grown.clone(),
+                ..request.clone()
+            },
+        );
+        let mut turn = 200;
+        measure(
+            &format!("{label} encode 200 turns x 8 KiB, grown"),
+            20,
+            || {
+                for message in round(turn, 8 * 1024, &origin) {
+                    grown.push(message);
+                }
+                turn += 1;
+                let sent = Request {
+                    messages: grown.clone(),
+                    ..request.clone()
+                };
+                let _ = llm::stream(&reply, &provider, &sent);
+            },
+        );
     }
 }
 
@@ -403,7 +448,7 @@ fn read_logged_reply() {
         provider: "anthropic".into(),
         model: "claude".into(),
     };
-    let Message::Assistant(message) = transcript(1, 0, &origin).messages.swap_remove(2) else {
+    let Message::Assistant(message) = transcript(1, 0, &origin).messages[2].clone() else {
         unreachable!("the assistant turn");
     };
     let mut content = Vec::new();
@@ -428,5 +473,72 @@ fn read_logged_reply() {
     });
     measure("derived Deserialize 150 parts", 200, || {
         let _ = std::hint::black_box(llm::Response::deserialize(&value));
+    });
+}
+
+/// The heap a session's typed transcript holds: the log at `A_SESSION_LOG`
+/// read as the engine reads it (replies, tool outputs, user text).
+#[test]
+#[ignore = "a benchmark"]
+fn transcript_memory() {
+    let Some(path) = std::env::var_os("A_SESSION_LOG") else {
+        return;
+    };
+    let text = std::fs::read_to_string(path).expect("a log");
+    let base = LIVE.load(Relaxed);
+    let mut messages = llm::Messages::new();
+    for line in text.lines().skip(1) {
+        let entry: serde_json::Value = serde_json::from_str(line).expect("an entry");
+        let message = match entry["kind"].as_str() {
+            Some("user" | "context") => Message::user(entry["text"].as_str().unwrap_or_default()),
+            Some("model_result") => match llm::Response::from_value(&entry["outcome"]["output"]) {
+                Ok(reply) => Message::Assistant(reply.message),
+                Err(_) => continue,
+            },
+            Some("tool_result") => Message::Tool(ToolMessage {
+                results: vec![ToolResult {
+                    id: "call".into(),
+                    name: "bash".into(),
+                    output: Output::Text(entry["outcome"]["output"]["output"].to_string()),
+                    error: false,
+                    meta: llm::Meta::new(),
+                }],
+            }),
+            _ => continue,
+        };
+        messages.push(message);
+    }
+    eprintln!(
+        "{} messages from {} KiB of log: {} KiB held",
+        messages.len(),
+        text.len() / 1024,
+        (LIVE.load(Relaxed) - base) / 1024
+    );
+    // A request for it, as the session's model takes it: encoded whole,
+    // then grown by a turn.
+    let (host, quirks) = responses::HOSTS[0];
+    let provider = Provider::new(
+        host.id,
+        "http://x",
+        llm::Auth::None,
+        responses::Responses::new(quirks),
+    );
+    let reply = Recorded {
+        status: 200,
+        body: long_chat(1),
+    };
+    let request = |messages: llm::Messages| Request {
+        model: "gpt-6-luna".into(),
+        messages,
+        ..Request::default()
+    };
+    let mut fresh: Vec<llm::Messages> = (0..=5).map(|_| messages.to_vec().into()).collect();
+    measure("session request, whole", 5, || {
+        let _ = llm::stream(&reply, &provider, &request(fresh.pop().expect("a copy")));
+    });
+    let _ = llm::stream(&reply, &provider, &request(messages.clone()));
+    measure("session request, grown by a turn", 20, || {
+        messages.push(Message::user("and then?"));
+        let _ = llm::stream(&reply, &provider, &request(messages.clone()));
     });
 }

@@ -41,8 +41,8 @@ fn parts(outcome: Result<Response, Error>) -> Vec<AssistantPart> {
     outcome.expect("the reply ends").message.content
 }
 
-fn item(part: &AssistantPart) -> Option<&Value> {
-    part.meta().get("test").and_then(|state| state.get("item"))
+fn item(part: &AssistantPart) -> Option<Value> {
+    part.meta().field("test", "item")
 }
 
 fn call(id: &str, name: &str) -> Open {
@@ -136,7 +136,7 @@ fn deltas_merge_into_the_item_signatures_concatenate_and_unknown_fields_survive(
     });
     let parts = parts(outcome);
     assert_eq!(
-        item(&parts[0]),
+        item(&parts[0]).as_ref(),
         Some(&json!({
             "type": "thinking",
             "thinking": "hm",
@@ -515,7 +515,7 @@ fn restating_an_opaque_item_keeps_it() {
         "{parts:?}"
     );
     assert_eq!(item(&parts[0]).unwrap()["summary"], "kept");
-    assert_eq!(parts[0].meta()["test"]["replay"], true);
+    assert_eq!(parts[0].meta().get("test").unwrap()["replay"], true);
 }
 
 #[test]

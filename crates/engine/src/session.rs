@@ -1396,62 +1396,50 @@ impl Session {
                 error: e.to_string(),
             };
         }
-        let mut said = String::new();
         let mut on_text = |text: &str| {
-            said.push_str(text);
             self.broadcast(&DaemonMsg::Delta {
                 call,
                 text: text.to_owned(),
             });
         };
-        let replied = self.reply(call, &model, &registry, request, &mut on_text);
-        match contain(replied).await {
-            Outcome::Interrupted { .. } => Outcome::Interrupted {
-                output: (!said.is_empty()).then_some(said),
-            },
-            outcome => outcome,
-        }
+        contain(self.reply(call, &model, &registry, request, &mut on_text)).await
     }
 
     /// The request for model call `call`: the system prompt, the transcript
     /// before it, and the tools.
     fn request(&self, call: u64, model: &Model, registry: &Arc<Registry>) -> llm::Request {
-        let mut history = self.history(call, registry);
-        let system = self
-            .shared
-            .system
-            .clone()
-            .unwrap_or_else(|| registry.system_prompt().to_owned());
-        if !system.is_empty() {
-            history.insert(0, llm::Message::system(system));
-        }
-        model.request(history, registry.specs().to_vec())
+        let system = self.shared.system.as_deref();
+        let system = system.unwrap_or_else(|| registry.system_prompt());
+        model.request(
+            self.history(call, registry, system),
+            registry.specs().to_vec(),
+        )
     }
 
-    /// The conversation before model call `call`, as the tools of
-    /// `registry` present results: the transcript kept as entries commit,
-    /// made again only for other tools, or for a call that recovery runs
-    /// after entries it does not see.
-    fn history(&self, call: u64, registry: &Arc<Registry>) -> Vec<llm::Message> {
+    /// The conversation before model call `call` that `system` prompts, as
+    /// the tools of `registry` present results: the transcript kept as
+    /// entries commit, shared, made again only for other tools, or for a
+    /// call that recovery runs after entries it does not see.
+    fn history(&self, call: u64, registry: &Arc<Registry>, system: &str) -> llm::Messages {
         let mut st = self.lock();
         st.transcript = st.transcript.take().filter(|t| t.is_on(registry));
-        let transcript = st
-            .transcript
-            .get_or_insert_with(|| Transcript::of(self.frames.entries(), Arc::clone(registry)));
+        let transcript = st.transcript.get_or_insert_with(|| {
+            Transcript::of(self.frames.entries(), Arc::clone(registry), system)
+        });
         let history = if let Some(messages) = transcript.before(call) {
-            messages.to_vec()
+            messages.clone()
         } else {
             let before = self.frames.entries().take_while(|e| e.seq < call);
-            Transcript::of(before, Arc::clone(registry)).into_messages()
+            Transcript::of(before, Arc::clone(registry), system).into_messages()
         };
         #[cfg(test)]
         assert_eq!(
-            history,
+            history[usize::from(!system.is_empty())..],
             oracle::transcript(
                 &self.frames.entries().collect::<Vec<_>>(),
                 call,
                 registry.tools()
-            ),
+            )[..],
             "the transcript kept"
         );
         history
@@ -1459,7 +1447,8 @@ impl Session {
 
     /// `model`'s reply to `request`, retried as the `request_error` hooks
     /// ask. The whole reply is the fact: replaying it later sends the
-    /// provider's own items (signatures, encrypted reasoning) back.
+    /// provider's own items (signatures, encrypted reasoning) back. An
+    /// interrupt keeps the text so far, which the reply held.
     async fn reply(
         &self,
         call: u64,
@@ -1471,10 +1460,22 @@ impl Session {
         let cancel = self.turn();
         let mut retries = 0;
         loop {
-            let Some(reply) = unless(&cancel, model.reply(&request, on_text)).await else {
-                return Outcome::Interrupted { output: None };
+            // Sent once polled, as an interrupt meanwhile finds it.
+            let mut events = None;
+            let reading = async {
+                let events = events.insert(model.send(&request));
+                crate::model::read(events, on_text).await
             };
-            let error = match reply {
+            let Some(read) = unless(&cancel, reading).await else {
+                return Outcome::Interrupted {
+                    output: events.and_then(llm::Events::interrupted),
+                };
+            };
+            let replied = read.and_then(|()| {
+                let events = events.ok_or_else(llm::Error::incomplete)?;
+                events.finish(Some(model.origin(&request)))
+            });
+            let error = match replied {
                 Ok(reply) => {
                     return match serde_json::to_value(&reply) {
                         Ok(output) => {

@@ -28,7 +28,7 @@ fn thinking_assembles_its_text_and_signature_into_its_item() {
     assert_eq!(reasoning.text, "Let me think.");
     assert!(!reasoning.redacted);
     assert_eq!(
-        item(&response.message.content[0]),
+        item(&response.message.content[0]).as_ref(),
         Some(
             &json!({"type": "thinking", "thinking": "Let me think.", "signature": "open-sig_end"})
         )
@@ -51,7 +51,7 @@ fn redacted_thinking_is_a_redacted_part_holding_its_payload() {
     };
     assert!(reasoning.text.is_empty() && reasoning.redacted);
     assert_eq!(
-        item(&response.message.content[0]),
+        item(&response.message.content[0]).as_ref(),
         Some(&json!({"type": "redacted_thinking", "data": "redacted_blob"}))
     );
 }
@@ -82,7 +82,7 @@ fn a_call_assembles_its_input_into_its_item() {
         json!({"location": "Paris"})
     );
     assert_eq!(
-        item(&response.message.content[0]),
+        item(&response.message.content[0]).as_ref(),
         Some(
             &json!({"type": "tool_use", "id": "toolu_1", "name": "lookup",
             "input": {"location": "Paris"}, "caller": {"type": "direct"}})
@@ -145,7 +145,9 @@ fn citation_deltas_land_on_the_text_item() {
         };
         assert_eq!(text.text, "the grass is green");
         assert_eq!(
-            item(&response.message.content[0]).and_then(|item| item.get("citations")),
+            item(&response.message.content[0])
+                .as_ref()
+                .and_then(|item| item.get("citations")),
             Some(&json!([citation]))
         );
     }
@@ -438,11 +440,11 @@ fn a_stop_reason_states_every_open_block_complete() {
     assert_eq!(response.finish.reason, Reason::ToolCalls);
     let content = &response.message.content;
     assert_eq!(
-        item(&content[0]),
+        item(&content[0]).as_ref(),
         Some(&json!({"type": "thinking", "thinking": "plan", "signature": "sig"}))
     );
     assert_eq!(
-        item(&content[1]),
+        item(&content[1]).as_ref(),
         Some(&json!({"type": "tool_use", "id": "toolu_a", "name": "f", "input": {"x": 1}}))
     );
 
@@ -562,7 +564,7 @@ fn a_kept_tool_use_item_always_states_an_object_input() {
             "glm-4.6",
             json!({"stop_reason": "tool_use", "content": [call]}),
         );
-        assert_eq!(item(&turn.content[0]), kept.as_ref());
+        assert_eq!(item(&turn.content[0]).as_ref(), kept.as_ref());
         let body = sent_with(
             &provider,
             "glm-4.6",
@@ -670,13 +672,7 @@ fn progress_update_blocks_survive_decoding_and_replay() {
         frames.push(json!({"type": "message_stop"}));
         let stream = decode_on(&provider, OPUS_5_5, &frames).expect("the stream decodes");
         for response in [whole, stream] {
-            let items: Vec<Value> = response
-                .message
-                .content
-                .iter()
-                .filter_map(item)
-                .cloned()
-                .collect();
+            let items: Vec<Value> = response.message.content.iter().filter_map(item).collect();
             assert_eq!(Value::Array(items), progress_update_content(update));
             let mut edit_file = tool("edit_file");
             edit_file.description = "Edit a file.".to_owned();
@@ -710,7 +706,7 @@ fn the_container_is_kept_as_a_last_opaque_part() {
     .expect("the reply decodes");
     let last = response.message.content.last().expect("a part");
     assert_eq!(
-        item(last),
+        item(last).as_ref(),
         Some(&json!({"type": "container",
             "container": {"id": "container_1", "expires_at": "2026-10-03T00:00:00Z"}}))
     );

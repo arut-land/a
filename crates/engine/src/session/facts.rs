@@ -7,7 +7,7 @@ use std::sync::Arc;
 
 use ext::host::Registry;
 use ext::{Action, Agent, Input};
-use llm::{Assistant, Message, ToolMessage, ToolResult};
+use llm::{Assistant, Message, Messages, ToolMessage, ToolResult};
 use protocol::ledger::Ledger;
 use protocol::{Body, DaemonMsg, Decision, Entry, Outcome, Recap};
 
@@ -17,10 +17,12 @@ use protocol::{Body, DaemonMsg, Decision, Entry, Outcome, Recap};
 /// reply logged as bare text (by an earlier version) reads back as text. A
 /// tool call the model made is answered under the model's id for it, as
 /// the tools of the registry it was folded on present the result. The
-/// session's context comes first, wherever it was logged.
+/// system prompt leads, then the session's context, wherever it was logged.
+/// Requests share the messages, which keep what each encoded of them.
 pub struct Transcript {
-    messages: Vec<Message>,
-    /// How many context messages lead `messages`.
+    messages: Messages,
+    /// Where the next context message goes: after the system prompt and
+    /// the context before it.
     context: usize,
     /// The model's id and the tool of each call the model made and that is
     /// not yet answered, by seq.
@@ -31,22 +33,25 @@ pub struct Transcript {
 }
 
 impl Transcript {
-    pub fn new(registry: Arc<Registry>) -> Self {
+    /// A transcript on `registry` that `system` prompts.
+    pub fn new(registry: Arc<Registry>, system: &str) -> Self {
+        let messages = Messages::from_iter((!system.is_empty()).then(|| Message::system(system)));
         Self {
-            messages: Vec::new(),
-            context: 0,
+            context: messages.len(),
+            messages,
             calls: HashMap::new(),
             last: 0,
             registry,
         }
     }
 
-    /// The transcript of `entries`, on `registry`.
+    /// The transcript of `entries`, on `registry`, that `system` prompts.
     pub fn of(
         entries: impl IntoIterator<Item = impl Borrow<Entry>>,
         registry: Arc<Registry>,
+        system: &str,
     ) -> Self {
-        let mut transcript = Self::new(registry);
+        let mut transcript = Self::new(registry, system);
         for e in entries {
             transcript.apply(e.borrow(), None);
         }
@@ -108,11 +113,15 @@ impl Transcript {
                     meta: llm::Meta::new(),
                 };
                 self.last = e.seq;
-                match self.messages.last_mut() {
-                    Some(Message::Tool(answers)) => answers.results.push(result),
-                    _ => self.messages.push(Message::Tool(ToolMessage {
+                // Only a tool message changes to take the result.
+                if let Some(Message::Tool(_)) = self.messages.last()
+                    && let Some(Message::Tool(answers)) = self.messages.last_mut()
+                {
+                    answers.results.push(result);
+                } else {
+                    self.messages.push(Message::Tool(ToolMessage {
                         results: vec![result],
-                    })),
+                    }));
                 }
                 return;
             }
@@ -128,11 +137,11 @@ impl Transcript {
     }
 
     /// The conversation before entry `before`, if it is all of it.
-    pub fn before(&self, before: u64) -> Option<&[Message]> {
-        (self.last < before).then_some(&self.messages[..])
+    pub fn before(&self, before: u64) -> Option<&Messages> {
+        (self.last < before).then_some(&self.messages)
     }
 
-    pub fn into_messages(self) -> Vec<Message> {
+    pub fn into_messages(self) -> Messages {
         self.messages
     }
 }

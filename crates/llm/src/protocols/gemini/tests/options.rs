@@ -140,7 +140,7 @@ fn a_raw_generation_config_beats_the_typed_fields_and_keeps_the_rest() {
                 stop: vec!["END".into()],
                 ..Generation::default()
             },
-            options: Meta::from([(
+            options: crate::spec::Options::from([(
                 KEY.to_owned(),
                 json!({"generationConfig": {"temperature": 0.9, "topK": 3}, "serviceTier": "flex"}),
             )]),

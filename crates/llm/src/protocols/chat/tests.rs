@@ -135,8 +135,8 @@ pub(super) fn decode(provider: &Provider, model: &str, frames: &[String]) -> Res
 }
 
 /// The provider item a part holds.
-pub(super) fn item(part: &AssistantPart) -> Option<&Value> {
-    part.meta().get(KEY).and_then(|state| state.get("item"))
+pub(super) fn item(part: &AssistantPart) -> Option<Value> {
+    part.meta().field(KEY, "item")
 }
 
 fn kinds(response: &Response) -> Vec<&'static str> {
@@ -317,7 +317,10 @@ fn malformed_and_unknown_calls_are_never_dropped_silently() {
     };
     assert_eq!(call.name, "grep");
     assert_eq!(Value::Object(call.input.clone()), json!({"input": "x"}));
-    assert_eq!(item(part).map(|item| &item["type"]), Some(&json!("custom")));
+    assert_eq!(
+        item(part).as_ref().map(|item| &item["type"]),
+        Some(&json!("custom"))
+    );
 
     let invented = chunk(
         json!({"tool_calls": [{"index": 0, "id": "call_1", "type": "x_rig_invented",
@@ -332,7 +335,7 @@ fn malformed_and_unknown_calls_are_never_dropped_silently() {
         );
     };
     assert_eq!(
-        item(part).map(|item| &item["type"]),
+        item(part).as_ref().map(|item| &item["type"]),
         Some(&json!("x_rig_invented"))
     );
     assert!(!crate::replay::replays(part, KEY));
@@ -380,7 +383,9 @@ fn a_late_signature_joins_the_reasoning_before_the_answer() {
     let signed =
         json!([{"type": "reasoning.text", "text": "", "signature": "sig-late", "index": 0}]);
     assert_eq!(
-        item(reasoning).map(|item| &item["reasoning_details"]),
+        item(reasoning)
+            .as_ref()
+            .map(|item| &item["reasoning_details"]),
         Some(&signed)
     );
 
@@ -403,6 +408,7 @@ fn a_late_signature_joins_the_reasoning_before_the_answer() {
             .content
             .first()
             .and_then(item)
+            .as_ref()
             .map(|item| &item["reasoning_details"]),
         Some(&json!([{"type": "reasoning.text", "text": "", "signature": "sig-1", "index": 0}]))
     );
@@ -804,7 +810,7 @@ pub(super) fn request(model: &str, messages: Vec<Message>) -> Request {
     }
     Request {
         model: model.into(),
-        messages,
+        messages: messages.into(),
         tools,
         ..Request::default()
     }
@@ -817,9 +823,9 @@ pub(super) fn sent_to(provider: &Provider, request: &Request) -> Result<(String,
         provider,
         model: &request.model,
     };
-    let prepared = crate::prepare(request, &target);
+    let prepared = crate::prepare::prepare(request, &target);
     let http = provider.request(&request.model, &prepared)?;
-    let body = serde_json::from_slice(http.body()).expect("a JSON body");
+    let body = serde_json::from_slice(&http.body().to_vec()).expect("a JSON body");
     Ok((http.uri().to_string(), body))
 }
 

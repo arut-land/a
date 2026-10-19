@@ -13,15 +13,15 @@ fn body(messages: Vec<Message>) -> Value {
     );
     let request = Request {
         model: "gpt-6-luna".into(),
-        messages,
+        messages: messages.into(),
         ..Request::default()
     };
     let target = Target {
         provider: &provider,
         model: "gpt-6-luna",
     };
-    let request = crate::prepare(&request, &target);
-    encode::body(&Responses::default(), &target, &request).unwrap()
+    let encoded = Responses::default().encode(&target, &request);
+    encoded.expect("the request encodes").json()
 }
 
 fn origin() -> Origin {
@@ -130,7 +130,7 @@ fn reasoning_models_drop_sampling_and_ask_for_summaries() {
     );
     let mut request = Request {
         model: "gpt-6-luna".into(),
-        messages: vec![Message::user("hi")],
+        messages: vec![Message::user("hi")].into(),
         ..Request::default()
     };
     request.generation.temperature = Some(0.2);
@@ -139,7 +139,10 @@ fn reasoning_models_drop_sampling_and_ask_for_summaries() {
         provider: &provider,
         model: "gpt-6-luna",
     };
-    let body = encode::body(&Responses::default(), &target, &request).unwrap();
+    let body = Responses::default()
+        .encode(&target, &request)
+        .unwrap()
+        .json();
     assert!(body.get("temperature").is_none());
     assert_eq!(
         body["reasoning"],
@@ -150,7 +153,10 @@ fn reasoning_models_drop_sampling_and_ask_for_summaries() {
         provider: &provider,
         model: "gpt-4.1",
     };
-    let body = encode::body(&Responses::default(), &target, &request).unwrap();
+    let body = Responses::default()
+        .encode(&target, &request)
+        .unwrap()
+        .json();
     assert_eq!(body["temperature"], 0.2);
     assert!(body.get("reasoning").is_none());
 }

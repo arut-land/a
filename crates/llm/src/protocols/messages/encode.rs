@@ -10,16 +10,18 @@ use serde_json::{Map, Value, json};
 
 use crate::json::obj;
 
-use super::cache::Caching;
+use super::cache::{Caching, Markers};
 use super::{
     Dialect, FINE_GRAINED_TOOL_STREAMING_BETA, KEY, Quirks, THINKING_BINDING_BETA,
     ToolInputStreaming, options, strict,
 };
+use crate::conversation::{self, Fold, History};
 use crate::error::Error;
 use crate::json::Lenient;
 use crate::models::anthropic::{
     binds_context, rejects_forced_tool_choice, takes_mid_conversation_system,
 };
+use crate::protocol::Target;
 use crate::replay::{Replay, replay, replays};
 use crate::spec::{
     Assistant, AssistantPart, Format, Media, Message, Output, Request, Source, System, Tool,
@@ -35,9 +37,10 @@ pub(super) const ASSISTANT_IMAGE_OMITTED: &str = "(image omitted: model does not
 /// then the rewrites the API requires.
 pub(super) fn body(
     quirks: Quirks,
-    model: &str,
+    target: &Target<'_>,
     request: &Request,
-) -> Result<(Value, Option<String>), Error> {
+) -> Result<(Value, Option<History>, Option<String>), Error> {
+    let model = target.model;
     let mut options = request.options_for(KEY);
     let max_tokens = request.generation.max_output_tokens.map(NonZeroU32::get);
     let Some(max_tokens) = max_tokens.or_else(|| quirks.default_max_tokens(model)) else {
@@ -57,9 +60,15 @@ pub(super) fn body(
         Some(_) => return Err(Error::unsupported("the `tools` option must be an array")),
     }
     let mid = takes_mid_conversation_system(model);
-    let (mut system, mut messages) = conversation(&request.messages, mid)?;
-    caching.place(&mut system, &mut messages, &mut tools)?;
-    let mut body = obj!({"model": model, "messages": messages, "max_tokens": max_tokens});
+    let (turns, settled) = conversation::fold(&request.messages, target, Turns::new(mid))?;
+    let Ended {
+        mut system,
+        mut messages,
+        container,
+        markers,
+    } = turns.finish()?;
+    caching.place(&mut system, &mut messages, &mut tools, markers)?;
+    let mut body = obj!({"model": model, "max_tokens": max_tokens});
     if !system.is_empty() {
         body["system"] = system.into();
     }
@@ -77,10 +86,16 @@ pub(super) fn body(
         body["output_config"] = obj!({"format": obj!({"type": "json_schema", "schema": schema})});
     }
     if !options.contains_key("container")
-        && let Some(container) = container(&request.messages)
+        && let Some(container) = container
     {
         body["container"] = container.into();
     }
+    let history = (!options.contains_key("messages")).then(|| History {
+        key: "messages",
+        head: Vec::new(),
+        settled,
+        tail: messages,
+    });
     let mapped = options::generation(quirks, model, &request.generation, max_tokens);
     crate::json::overlay(&mut body, &mapped);
     crate::json::overlay(&mut body, &options);
@@ -111,7 +126,8 @@ pub(super) fn body(
         .filter(|beta| !betas.contains(beta))
         .collect();
     betas.extend(missing);
-    Ok((body, (!betas.is_empty()).then(|| betas.join(","))))
+    let betas = (!betas.is_empty()).then(|| betas.join(","));
+    Ok((body, history, betas))
 }
 
 /// Ask Anthropic to drop a thinking block bound to another context rather
@@ -177,7 +193,15 @@ enum Turn<'a> {
     Assistant(&'a Assistant),
 }
 
-/// The top-level `system` blocks and the conversation's messages.
+/// What turns add to the request: top-level `system` blocks, messages, and
+/// whether a system message may follow them.
+struct Placed {
+    system: Vec<Value>,
+    sent: Vec<Value>,
+    follows: Option<bool>,
+}
+
+/// The turns of `messages`, placed after turns that left `follows`.
 ///
 /// On a model that takes mid-conversation system messages (`mid`), one in
 /// a position Anthropic rejects moves to the next valid slot: right after
@@ -186,7 +210,7 @@ enum Turn<'a> {
 /// missing the cache and, on models that bind thinking to their context,
 /// turning every earlier thinking block into an error. It is hoisted only
 /// when no slot exists.
-fn conversation(messages: &[Message], mid: bool) -> Result<(Vec<Value>, Vec<Value>), Error> {
+fn place(messages: &[Message], mid: bool, mut follows: Option<bool>) -> Result<Placed, Error> {
     let user = |message: &Message| matches!(message, Message::User(_) | Message::Tool(_));
     let turns: Vec<Turn<'_>> = messages
         .chunk_by(|earlier, later| user(earlier) && user(later))
@@ -217,7 +241,6 @@ fn conversation(messages: &[Message], mid: bool) -> Result<(Vec<Value>, Vec<Valu
     // Whether a system message may follow the last turn that is not one: a
     // user turn, or an assistant turn ending in a server tool's result.
     // `None` while system messages lead the conversation: the prompt.
-    let mut follows = None;
     for (at, turn) in turns.iter().enumerate() {
         match *turn {
             Turn::System(prompt) => {
@@ -234,8 +257,10 @@ fn conversation(messages: &[Message], mid: bool) -> Result<(Vec<Value>, Vec<Valu
             Turn::Assistant(assistant) => {
                 // The `container` block goes to the request's top level.
                 let kinds = assistant.content.iter().rev();
-                let mut kinds = kinds.map(|part| opaque_item(part)?.str("type"));
-                let last = kinds.find(|kind| *kind != Some("container")).flatten();
+                let mut kinds = kinds.map(|part| opaque_item(part)?.str("type").map(str::to_owned));
+                let last = kinds
+                    .find(|kind| kind.as_deref() != Some("container"))
+                    .flatten();
                 follows = Some(last.is_some_and(|kind| kind.ends_with("_tool_result")));
                 sent.extend(message("assistant", assistant_blocks(assistant)));
             }
@@ -250,13 +275,124 @@ fn conversation(messages: &[Message], mid: bool) -> Result<(Vec<Value>, Vec<Valu
             }
         }
     }
-    Ok((system, sent))
+    Ok(Placed {
+        system,
+        sent,
+        follows,
+    })
+}
+
+/// The conversation, a message at a time. The turns up to an assistant
+/// message settle with it; those after it wait for the request, which
+/// places its breakpoints on the last. A system message mid-conversation,
+/// on a model that takes one there, goes where every turn after it says,
+/// so from it on nothing settles.
+#[derive(Clone)]
+pub(super) struct Turns {
+    /// Whether the model takes mid-conversation system messages.
+    mid: bool,
+    /// The top-level system blocks.
+    system: Vec<Value>,
+    follows: Option<bool>,
+    /// The messages since the turns that settled.
+    open: Vec<Message>,
+    /// Messages placed, to settle.
+    placed: Vec<Value>,
+    /// Whether a message other than a system message came.
+    begun: bool,
+    /// Whether a system message came mid-conversation on `mid`.
+    pinned: bool,
+    /// The id of the container the last turn holding one ran in.
+    container: Option<String>,
+    /// The markers of the messages settled.
+    markers: Markers,
+}
+
+/// The system blocks, the messages the request makes, the container and
+/// the markers settled.
+pub(super) struct Ended {
+    pub system: Vec<Value>,
+    pub messages: Vec<Value>,
+    pub container: Option<String>,
+    pub markers: Markers,
+}
+
+impl Turns {
+    pub(super) fn new(mid: bool) -> Self {
+        Self {
+            mid,
+            system: Vec::new(),
+            follows: None,
+            open: Vec::new(),
+            placed: Vec::new(),
+            begun: false,
+            pinned: false,
+            container: None,
+            markers: Markers::default(),
+        }
+    }
+
+    /// The turns open, placed for this request.
+    pub(super) fn finish(mut self) -> Result<Ended, Error> {
+        let placed = place(&self.open, self.mid, self.follows)?;
+        self.system.extend(placed.system);
+        Ok(Ended {
+            system: self.system,
+            messages: placed.sent,
+            container: container(&self.open).or(self.container),
+            markers: self.markers,
+        })
+    }
+}
+
+impl Fold for Turns {
+    type Cx = bool;
+
+    fn cx(&self) -> &bool {
+        &self.mid
+    }
+
+    fn push(&mut self, _: usize, message: &Message) -> Result<(), Error> {
+        match message {
+            Message::System(system) => {
+                self.pinned |= self.mid && self.begun && !system.text().is_empty();
+            }
+            _ => self.begun = true,
+        }
+        self.open.push(message.clone());
+        if self.pinned || !matches!(message, Message::Assistant(_)) {
+            return Ok(());
+        }
+        let placed = place(&self.open, self.mid, self.follows)?;
+        // A turn that sends nothing leaves the last message the one
+        // before, which takes the request's breakpoint.
+        let last = placed.sent.last();
+        if last.and_then(|message| message.str("role")) == Some("assistant") {
+            self.system.extend(placed.system);
+            self.follows = placed.follows;
+            self.placed.extend(placed.sent);
+            if let Some(id) = container(&self.open) {
+                self.container = Some(id);
+            }
+            self.open.clear();
+        }
+        Ok(())
+    }
+
+    fn settle(&mut self, out: &mut Vec<Value>) {
+        let content = self
+            .placed
+            .iter()
+            .flat_map(|message| message.arr("content"));
+        self.markers = self.markers.then(Markers::of(content));
+        out.append(&mut self.placed);
+    }
 }
 
 /// The provider item of an opaque part this protocol kept.
-fn opaque_item(part: &AssistantPart) -> Option<&Value> {
+fn opaque_item(part: &AssistantPart) -> Option<Value> {
     match part {
-        AssistantPart::Opaque(opaque) => opaque.meta.get(KEY)?.get("item"),
+        AssistantPart::Opaque(opaque) => opaque.meta.field(KEY, "item"),
         _ => None,
     }
 }
@@ -264,14 +400,14 @@ fn opaque_item(part: &AssistantPart) -> Option<&Value> {
 /// The id of the container the last turn holding one ran in. Anthropic
 /// requires it on a request that answers a programmatic tool call, and it
 /// keeps a code-execution session's state.
-fn container(messages: &[Message]) -> Option<&str> {
+fn container(messages: &[Message]) -> Option<String> {
     let parts = messages.iter().rev().flat_map(|message| match message {
         Message::Assistant(assistant) => assistant.content.iter().rev(),
         _ => [].iter().rev(),
     });
     let items = parts.filter_map(opaque_item);
     let mut containers = items.filter(|item| item.str("type") == Some("container"));
-    containers.find_map(|item| item.at("/container/id")?.as_str())
+    containers.find_map(|item| Some(item.at("/container/id")?.as_str()?.to_owned()))
 }
 
 fn text_block(text: &str) -> Value {
@@ -299,7 +435,7 @@ fn user_blocks(run: &[Message]) -> Result<Vec<Value>, Error> {
                         UserPart::Media(media) => (media_block(media)?, &media.meta),
                     };
                     if let Some(Value::Object(fields)) = meta.get(KEY) {
-                        crate::json::overlay(&mut block, fields);
+                        crate::json::overlay(&mut block, &fields);
                     }
                     parts.push(block);
                 }
@@ -403,7 +539,7 @@ fn identity(item: &Value) -> Map<String, Value> {
 /// current, else the part rebuilt. A server tool's result goes only with
 /// its use, and the reply's container goes as the request's `container`.
 fn assistant_blocks(assistant: &Assistant) -> Vec<Value> {
-    let mut uses: Vec<&str> = Vec::new();
+    let mut uses: Vec<String> = Vec::new();
     let mut blocks = Vec::new();
     for part in &assistant.content {
         if let AssistantPart::Opaque(_) = part {
@@ -411,21 +547,23 @@ fn assistant_blocks(assistant: &Assistant) -> Vec<Value> {
                 continue;
             };
             let kind = item.str("type").unwrap_or_default();
-            let answered = item.str("tool_use_id").is_some_and(|id| uses.contains(&id));
+            let answered = item
+                .str("tool_use_id")
+                .is_some_and(|id| uses.iter().any(|u| u == id));
             if kind == "container" || kind.ends_with("_tool_result") && !answered {
                 continue;
             }
             if kind.ends_with("_tool_use")
                 && let Some(id) = item.str("id")
             {
-                uses.push(id);
+                uses.push(id.to_owned());
             }
-            blocks.push(sendable(item));
+            blocks.push(sendable(&item));
             continue;
         }
         let identity = match replay(part, KEY, identity) {
             Replay::Item(item) => {
-                let mut item = sendable(item);
+                let mut item = sendable(&item);
                 if let AssistantPart::ToolCall(call) = part {
                     // The call takes the id its result answers.
                     item["id"] = call.id.as_str().into();

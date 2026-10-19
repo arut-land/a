@@ -10,7 +10,6 @@ events = []
 
 [dependencies]
 ext.workspace = true
-futures-core = { version = "0.3", default-features = false, features = ["std"] }
 llm = { workspace = true, features = ["ureq"] }
 memchr.workspace = true
 rt.workspace = true

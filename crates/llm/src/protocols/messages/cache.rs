@@ -28,6 +28,46 @@ fn ephemeral(ttl: Option<Ttl>) -> Value {
     marker
 }
 
+/// Where the lifetimes of `cache_control` markers stand, as far as their
+/// order goes: whether one-hour and five-minute ones came, and whether a
+/// one-hour one came after a five-minute one, which Anthropic rejects.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub(super) struct Markers {
+    long: bool,
+    short: bool,
+    misplaced: bool,
+}
+
+impl Markers {
+    /// The markers `blocks` carry, in order.
+    pub(super) fn of<'a>(blocks: impl IntoIterator<Item = &'a Value>) -> Self {
+        let markers = blocks
+            .into_iter()
+            .filter_map(|block| block.get("cache_control"));
+        markers.fold(Self::default(), |markers, marker| {
+            markers.then(Self::one(marker))
+        })
+    }
+
+    fn one(marker: &Value) -> Self {
+        let long = tag(marker.get("ttl")) == Some(Ttl::OneHour);
+        Self {
+            long,
+            short: !long,
+            misplaced: false,
+        }
+    }
+
+    /// These markers, then `later`.
+    pub(super) fn then(self, later: Self) -> Self {
+        Self {
+            long: self.long || later.long,
+            short: self.short || later.short,
+            misplaced: self.misplaced || later.misplaced || self.short && later.long,
+        }
+    }
+}
+
 /// The caching the request's options ask for: a top-level marker sent as
 /// written, `prompt_caching` and `static_prefix_cache_ttl`.
 pub(super) struct Caching {
@@ -62,7 +102,8 @@ impl Caching {
         })
     }
 
-    /// Place the breakpoints, one fewer with a top-level marker. Markers a
+    /// Place the breakpoints, one fewer with a top-level marker, in
+    /// `messages`, which follow messages settled with `settled`. Markers a
     /// tool already carries are kept and count toward the budget, and every
     /// one-hour marker must precede the five-minute ones.
     pub(super) fn place(
@@ -70,6 +111,7 @@ impl Caching {
         system: &mut [Value],
         messages: &mut [Value],
         tools: &mut [Value],
+        settled: Markers,
     ) -> Result<(), Error> {
         for tool in tools.iter_mut().filter_map(Value::as_object_mut) {
             tool.retain(|key, value| key != "cache_control" || !value.is_null());
@@ -127,12 +169,11 @@ impl Caching {
             }
         }
         let content = messages.iter().flat_map(|message| message.arr("content"));
-        let markers = tools.iter().chain(&*system).chain(content);
-        let markers = markers.filter_map(|block| block.get("cache_control"));
-        let long = markers
-            .chain(top)
-            .map(|marker| tag(marker.get("ttl")) == Some(Ttl::OneHour));
-        if !long.is_sorted_by(|earlier, later| earlier >= later) {
+        let markers = Markers::of(tools.iter().chain(&*system))
+            .then(settled)
+            .then(Markers::of(content))
+            .then(top.map_or_default(Markers::one));
+        if markers.misplaced {
             return Err(Error::unsupported(
                 "Anthropic cache_control markers with ttl `1h` must appear before markers with \
                  the default 5-minute TTL",

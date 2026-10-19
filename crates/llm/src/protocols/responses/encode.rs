@@ -6,6 +6,7 @@ use serde::Serialize;
 use serde_json::{Map, Value, json};
 
 use super::{Instructions, ItemType, KEY, PartType, Responses, Status};
+use crate::conversation::{self, Fold, History};
 use crate::error::Error;
 use crate::json::Lenient;
 use crate::models::openai;
@@ -13,7 +14,8 @@ use crate::protocol::Target;
 use crate::protocols::schema;
 use crate::replay::{Replay, replay, replays};
 use crate::spec::{
-    AssistantPart, Effort, Format, Message, Output, Request, Source, Tool, ToolChoice, UserPart,
+    AssistantPart, Effort, Format, Message, Output, Request, SmolStr, Source, Tool, ToolChoice,
+    UserPart,
 };
 
 /// The request body but its `input` and `tools`, which move in after
@@ -51,7 +53,7 @@ pub(crate) fn body(
     responses: &Responses,
     target: &Target<'_>,
     request: &Request,
-) -> Result<Value, Error> {
+) -> Result<(Value, Option<History>), Error> {
     let (model, generation) = (target.model, &request.generation);
     let mut options = request.options_for(KEY);
     // Stateless unless the caller keeps the conversation on the provider:
@@ -59,8 +61,12 @@ pub(crate) fn body(
     let stateless = options.get("store").and_then(Value::as_bool) != Some(true)
         && !options.contains_key("previous_response_id")
         && !options.contains_key("conversation");
-    let mut input = input(&request.messages, stateless)?;
-    let instructions = lift_instructions(&mut input, responses.quirks.instructions)?;
+    let cx = Cx {
+        stateless,
+        instructions: responses.quirks.instructions,
+    };
+    let (input, settled) = conversation::fold(&request.messages, target, Input::new(cx))?;
+    let (instructions, tail) = input.finish()?;
     let strict = responses.quirks.strict_tools;
     let mut tools: Vec<Value> = request
         .tools
@@ -100,14 +106,19 @@ pub(crate) fn body(
     };
     let mut body =
         serde_json::to_value(body).map_err(|error| Error::unsupported(error.to_string()))?;
+    let history = (!options.contains_key("input")).then(|| History {
+        key: "input",
+        head: Vec::new(),
+        settled,
+        tail,
+    });
     if let Some(fields) = body.as_object_mut() {
-        fields.insert("input".to_owned(), input.into());
         if tooled {
             fields.insert("tools".to_owned(), tools.into());
         }
         fields.extend(options);
     }
-    Ok(body)
+    Ok((body, history))
 }
 
 /// The keys of a stale item a rebuilt part keeps.
@@ -173,24 +184,116 @@ fn result_output(output: &Output) -> Result<Value, Error> {
     })
 }
 
-/// The input items of `messages`. A `stateless` request resolves no stored
-/// item, so reasoning without its ciphertext is left out, and the part after
-/// it is rebuilt with no item id, as another model's turn is.
-fn input(messages: &[Message], stateless: bool) -> Result<Vec<Value>, Error> {
-    // The call ids the request sends as custom calls, which are rare.
-    let mut custom = Vec::<&str>::new();
-    let mut items = Vec::new();
-    let message = |role: &str, part: Value| {
-        let mut message = json!({"type": ItemType::Message, "role": role});
-        message["content"] = vec![part].into();
-        message
-    };
-    for (position, turn) in messages.iter().enumerate() {
+/// What a Responses conversation's items read besides its messages.
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub(crate) struct Cx {
+    /// A stateless request resolves no stored item, so reasoning without
+    /// its ciphertext is left out, and the part after it is rebuilt with no
+    /// item id, as another model's turn is.
+    stateless: bool,
+    instructions: Instructions,
+}
+
+/// The input items of a conversation, a message at a time. System messages
+/// that go to `instructions` are lifted out as they come; a leading one
+/// waits for the first item that is not one to know whether it goes.
+#[derive(Clone)]
+pub(crate) struct Input {
+    cx: Cx,
+    /// The call ids the request sends as custom calls, which are rare.
+    custom: Vec<SmolStr>,
+    /// Items not settled: the leading system messages, while nothing else
+    /// came.
+    open: Vec<Value>,
+    /// The system texts lifted to `instructions`.
+    lifted: Vec<String>,
+    /// How many items settled.
+    settled: usize,
+    /// Whether an item that is not a system message came.
+    begun: bool,
+}
+
+impl Input {
+    fn new(cx: Cx) -> Self {
+        Self {
+            cx,
+            custom: Vec::new(),
+            open: Vec::new(),
+            lifted: Vec::new(),
+            settled: 0,
+            begun: false,
+        }
+    }
+
+    /// An item that is not a system message; the leading ones before it go
+    /// to `instructions` where they lead.
+    fn item(&mut self, item: Value) {
+        if !std::mem::replace(&mut self.begun, true)
+            && self.cx.instructions == Instructions::Leading
+        {
+            let leading = self
+                .open
+                .drain(..)
+                .map(|item| system_text(&item).to_owned());
+            self.lifted.extend(leading);
+        }
+        self.open.push(item);
+    }
+
+    /// The instructions lifted, and the items left open: a request of only
+    /// system messages keeps them as input, which must not be empty.
+    fn finish(self) -> Result<(String, Vec<Value>), Error> {
+        if self.settled + self.open.len() == 0 {
+            let what = if self.lifted.is_empty() {
+                "input item"
+            } else {
+                "non-system input item"
+            };
+            let message = format!("a Responses request needs at least one {what}");
+            return Err(Error::unsupported(message));
+        }
+        let mut lifted = self.lifted;
+        lifted.retain(|text| !text.is_empty());
+        Ok((lifted.join("\n\n"), self.open))
+    }
+}
+
+/// The text of a system message's item, trimmed.
+fn system_text(item: &Value) -> &str {
+    let text = item.at("/content/0/text").and_then(Value::as_str);
+    text.unwrap_or_default().trim()
+}
+
+impl Fold for Input {
+    type Cx = Cx;
+
+    fn cx(&self) -> &Cx {
+        &self.cx
+    }
+
+    fn settle(&mut self, out: &mut Vec<Value>) {
+        if self.begun || self.cx.instructions != Instructions::Leading {
+            self.settled += self.open.len();
+            out.append(&mut self.open);
+        }
+    }
+
+    fn push(&mut self, position: usize, turn: &Message) -> Result<(), Error> {
+        let message = |role: &str, part: Value| {
+            let mut message = json!({"type": ItemType::Message, "role": role});
+            message["content"] = vec![part].into();
+            message
+        };
         let parts = match turn {
             Message::System(system) => {
-                let text = json!({"type": PartType::InputText, "text": system.text()});
-                items.push(message("system", text));
-                continue;
+                let text = system.text();
+                if self.cx.instructions == Instructions::All {
+                    self.lifted.push(text.trim().to_owned());
+                } else {
+                    let text = json!({"type": PartType::InputText, "text": text});
+                    self.open.push(message("system", text));
+                }
+                return Ok(());
             }
             Message::User(user) => {
                 for part in &user.content {
@@ -200,27 +303,28 @@ fn input(messages: &[Message], stateless: bool) -> Result<Vec<Value>, Error> {
                     {
                         continue;
                     }
-                    items.push(message("user", user_part(part)?));
+                    self.item(message("user", user_part(part)?));
                 }
-                continue;
+                return Ok(());
             }
             // A function output has no error field: a failed result says so
             // in its text.
             Message::Tool(tool) => {
                 for result in &tool.results {
                     let (id, output) = (&result.id, result_output(&result.output)?);
-                    let mut item = if custom.contains(&id.as_str()) {
+                    let mut item = if self.custom.contains(id) {
                         json!({"type": ItemType::CustomToolCallOutput, "call_id": id})
                     } else {
                         json!({"type": ItemType::FunctionCallOutput, "call_id": id, "status": Status::Completed})
                     };
                     item["output"] = output;
-                    items.push(item);
+                    self.item(item);
                 }
-                continue;
+                return Ok(());
             }
             Message::Assistant(assistant) => &assistant.content,
         };
+        let stateless = self.cx.stateless;
         let (mut texts, mut unpaired) = (0, false);
         for part in parts {
             let reasoning = matches!(part, AssistantPart::Reasoning(_));
@@ -244,14 +348,13 @@ fn input(messages: &[Message], stateless: bool) -> Result<Vec<Value>, Error> {
                 continue;
             }
             if let AssistantPart::ToolCall(call) = part {
-                custom.retain(|custom| *custom != call.id);
+                self.custom.retain(|custom| *custom != call.id);
                 if kind == Some(ItemType::CustomToolCall) {
-                    custom.push(&call.id);
+                    self.custom.push(call.id.clone());
                 }
             }
             let kept = match sent {
-                Replay::Item(item) => {
-                    let mut item = item.clone();
+                Replay::Item(mut item) => {
                     // A streamed item states unset fields as `null` (a
                     // reasoning item's `status`), which the input side
                     // rejects as unknown.
@@ -262,17 +365,19 @@ fn input(messages: &[Message], stateless: bool) -> Result<Vec<Value>, Error> {
                         // The call takes the id its result answers.
                         item["call_id"] = call.id.as_str().into();
                     }
-                    items.push(item);
+                    self.item(item);
                     continue;
                 }
                 Replay::Identity(kept) => kept,
                 Replay::Rebuild => Map::new(),
             };
-            items.extend(rebuilt(part, &kept, kind, position, texts)?);
+            if let Some(item) = rebuilt(part, &kept, kind, position, texts)? {
+                self.item(item);
+            }
             texts += usize::from(matches!(part, AssistantPart::Text(_)));
         }
+        Ok(())
     }
-    Ok(items)
 }
 
 /// A part rebuilt from its shared fields, keeping `identity` of its stale
@@ -340,47 +445,11 @@ fn rebuilt(
             item
         }
         AssistantPart::Opaque(opaque) if replays(part, KEY) => {
-            let state = opaque.meta.get(KEY);
-            return Ok(state.and_then(|state| state.get("item")).cloned());
+            return Ok(opaque.meta.field(KEY, "item"));
         }
         AssistantPart::Opaque(_) | AssistantPart::ToolResult(_) => return Ok(None),
         AssistantPart::Media(_) => return Err(unsendable("assistant image")),
     }))
-}
-
-/// The system instructions `items` lifts out of `input` by `placement`.
-fn lift_instructions(items: &mut Vec<Value>, placement: Instructions) -> Result<String, Error> {
-    let system = |item: &Value| {
-        let text = item.at("/content/0/text").and_then(Value::as_str);
-        (item.str("role") == Some("system")).then(|| text.unwrap_or_default().trim().to_owned())
-    };
-    let before = items.len();
-    let leading = items.iter().map_while(system).count();
-    let mut lifted: Vec<String> = match placement {
-        // The leading run of system messages, unless it is the whole
-        // request, which then keeps them in `input` so it is not empty.
-        Instructions::Leading if leading < before => items
-            .drain(..leading)
-            .filter_map(|item| system(&item))
-            .collect(),
-        Instructions::All => {
-            let lifted = items.iter().filter_map(system).collect();
-            items.retain(|item| system(item).is_none());
-            lifted
-        }
-        Instructions::Leading | Instructions::Input => Vec::new(),
-    };
-    if items.is_empty() {
-        let what = if before > 0 {
-            "non-system input item"
-        } else {
-            "input item"
-        };
-        let message = format!("a Responses request needs at least one {what}");
-        return Err(Error::unsupported(message));
-    }
-    lifted.retain(|text| !text.is_empty());
-    Ok(lifted.join("\n\n"))
 }
 
 fn function_tool(tool: &Tool, strict_by_default: bool) -> Value {

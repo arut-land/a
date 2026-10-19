@@ -79,9 +79,11 @@ impl Protocol for Responses {
     }
 
     fn encode(&self, target: &Target<'_>, request: &Request) -> Result<Encoded, Error> {
+        let (body, history) = encode::body(self, target, request)?;
         Ok(Encoded {
             path: self.quirks.path.to_owned(),
-            body: encode::body(self, target, request)?,
+            body,
+            history,
             headers: Vec::new(),
         })
     }
