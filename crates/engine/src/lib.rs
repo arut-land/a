@@ -11,7 +11,6 @@ use std::fs::{File, OpenOptions};
 use std::future::{Future, poll_fn};
 use std::io::{self, BufReader, Write};
 use std::path::PathBuf;
-use std::str::FromStr;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 use std::task::{Poll, Waker};
@@ -20,8 +19,9 @@ use std::{mem, thread};
 
 use outbox::Outbox;
 use protocol::{
-    Activity, Cap, Caps, ClientDecl, ClientMsg, DaemonMsg, Environment, Frame, Origin, PROTO,
-    Rejection, Residency, Role, SessionId, SessionSummary, Target, Versions, read_frame,
+    Activity, Cap, Caps, ClientDecl, ClientMsg, DaemonMsg, Environment, Frame, HomeSettings,
+    Origin, PROTO, Rejection, Residency, Role, SessionId, SessionSummary, SettingsChange, Target,
+    Versions, read_frame,
 };
 use session::{Attachment, Session, Shared};
 use store::{Header, Jsonl, LogStore};
@@ -31,27 +31,27 @@ use upgrade::{Lifecycle, Verdict};
 #[cfg(unix)]
 use std::os::unix::net::{UnixListener, UnixStream};
 
-/// How the daemon runs, from `A_*` environment variables.
+/// How the daemon runs: the `[daemon]` table of `$A_HOME/config.toml`,
+/// read as it starts. Never its environment, which is whichever client's
+/// started it.
 #[derive(Clone, Debug)]
 pub struct Config {
-    /// `A_IDLE_SECS`: exit after this long with no clients and no work.
+    /// Exit after this long with no clients and no work.
     pub idle: Duration,
-    /// `A_HIBERNATE_SECS`: unload a session after this long unused.
+    /// Unload a session after this long unused.
     pub hibernate: Duration,
-    /// `A_DRAIN_SECS`: how long an upgrade waits for in-flight work.
+    /// How long an upgrade waits for in-flight work.
     pub drain: Duration,
-    /// `A_AGENT` (`chat` or `echo`, which needs no model): overrides the
-    /// config files.
+    /// `chat` or `echo` (which needs no model): overrides the config files'
+    /// `agent`.
     pub agent: Option<agent::Kind>,
-    /// `A_MODEL` (`host:model`, or a bare model on `OpenAI`): overrides the
-    /// config files.
-    pub model: Option<String>,
-    /// `A_ASK`: comma-separated tools whose calls wait for the user's
-    /// approval.
+    /// Tools whose calls wait for the user's approval.
     pub ask: Vec<String>,
-    /// `A_SYSTEM_PROMPT`: the system prompt, in place of the one the
-    /// extensions make.
+    /// The system prompt, in place of the one the extensions make.
     pub system_prompt: Option<String>,
+    /// Young deaths in a row after which a daemon refuses to serve (0 for
+    /// never); see [`sys::crash`].
+    pub crash_limit: u32,
 }
 
 impl Default for Config {
@@ -61,38 +61,22 @@ impl Default for Config {
             hibernate: Duration::from_secs(300),
             drain: Duration::from_secs(60),
             agent: None,
-            model: None,
             ask: Vec::new(),
             system_prompt: None,
+            crash_limit: sys::crash::LIMIT,
         }
     }
 }
 
 impl Config {
-    /// The defaults, overridden by whichever variables are set and valid.
-    pub fn from_env() -> Self {
-        fn var<T: FromStr>(name: &str) -> Option<T> {
-            std::env::var(name).ok()?.parse().ok()
-        }
-        let defaults = Self::default();
-        Self {
-            idle: var("A_IDLE_SECS").map_or(defaults.idle, Duration::from_secs),
-            hibernate: var("A_HIBERNATE_SECS").map_or(defaults.hibernate, Duration::from_secs),
-            drain: var("A_DRAIN_SECS").map_or(defaults.drain, Duration::from_secs),
-            agent: var("A_AGENT").or(defaults.agent),
-            model: var("A_MODEL").or(defaults.model),
-            ask: std::env::var("A_ASK").map_or(defaults.ask, |tools| {
-                tools
-                    .split(',')
-                    .map(str::trim)
-                    .filter(|tool| !tool.is_empty())
-                    .map(str::to_owned)
-                    .collect()
-            }),
-            system_prompt: std::env::var("A_SYSTEM_PROMPT")
-                .ok()
-                .filter(|prompt| !prompt.is_empty()),
-        }
+    /// The defaults, overridden by what `home`'s file sets; a file that
+    /// cannot be read is reported and passed over.
+    pub fn load(home: &Home) -> Self {
+        let file = sys::Config::read(&home.config_file()).unwrap_or_else(|e| {
+            eprintln!("{e}; running with the default [daemon] settings");
+            sys::Config::default()
+        });
+        Self::from(file.daemon)
     }
 
     /// The built-in extensions, registered as any other. The echo agent's
@@ -104,6 +88,28 @@ impl Config {
         match self.agent {
             Some(agent::Kind::Echo) => registry.with(&agent::Fixtures),
             _ => Ok(registry),
+        }
+    }
+}
+
+impl From<sys::config::Daemon> for Config {
+    fn from(file: sys::config::Daemon) -> Self {
+        let defaults = Self::default();
+        let secs = |set: Option<u64>, default| set.map_or(default, Duration::from_secs);
+        Self {
+            idle: secs(file.idle_secs, defaults.idle),
+            hibernate: secs(file.hibernate_secs, defaults.hibernate),
+            drain: secs(file.drain_secs, defaults.drain),
+            agent: file.agent.and_then(|name| {
+                name.parse()
+                    .map_err(|e| eprintln!("agent `{name}` in [daemon]: {e}"))
+                    .ok()
+            }),
+            ask: file.ask,
+            system_prompt: file.system_prompt.filter(|prompt| !prompt.is_empty()),
+            crash_limit: file.crash_limit.map_or(defaults.crash_limit, |n| {
+                u32::try_from(n).unwrap_or(u32::MAX)
+            }),
         }
     }
 }
@@ -162,6 +168,13 @@ struct Daemon {
     clients: AtomicUsize,
     /// Wakes the supervisor when what it decides on may have changed.
     pulse: Pulse,
+    /// The connections watching the session list, and the list as they
+    /// were last sent it.
+    watchers: Mutex<(Vec<Outbox>, Vec<SessionSummary>)>,
+    /// A client asked the daemon to stop.
+    stopping: AtomicBool,
+    /// When it started, in seconds since the Unix epoch.
+    started: u64,
 }
 
 /// A wake-up for one waiting task, remembered until it waits.
@@ -236,7 +249,7 @@ impl Daemon {
             .collect();
         let rt: rt::Rt = Arc::new(rt::Threads::default());
         let models = model::Models {
-            settings: config::Settings::new(home.config_file(), config.model.clone(), config.agent),
+            settings: config::Settings::new(home.config_file(), config.agent),
             http: Arc::new(llm::Ureq::new(Arc::clone(&rt))),
         };
         let registry = agent::Current::new(config.registry().map_err(io::Error::other)?);
@@ -254,6 +267,11 @@ impl Daemon {
             slots: Mutex::new(slots),
             clients: AtomicUsize::new(0),
             pulse: Pulse::default(),
+            watchers: Mutex::default(),
+            stopping: AtomicBool::new(false),
+            started: std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map_or(0, |d| d.as_secs()),
         });
         for slot in daemon.slots() {
             if daemon.shared.store.is_busy(slot.header.id)
@@ -297,18 +315,50 @@ impl Daemon {
         Ok(f(session))
     }
 
-    fn resolve(&self, target: &Target, workspace: PathBuf) -> io::Result<Attachment> {
+    /// The session `target` names, attached. `workspace` is only worked
+    /// out for a target that needs it: an attach by id never looks.
+    fn resolve(
+        &self,
+        target: &Target,
+        workspace: impl FnOnce() -> PathBuf,
+    ) -> io::Result<Attachment> {
         let found = match target {
-            Target::New => return self.create(workspace),
+            Target::New => return self.create(workspace()),
             Target::Id(id) => self.slot(*id),
+            Target::Prefix(prefix) => {
+                let slots = lock(&self.slots);
+                let mut matching = slots.iter().filter(|s| {
+                    let id = s.header.id;
+                    id.to_string().starts_with(prefix.as_str())
+                        || id.short().to_string().starts_with(prefix.as_str())
+                });
+                match (matching.next(), matching.next()) {
+                    (Some(one), None) => Some(Arc::clone(one)),
+                    (Some(_), Some(_)) => {
+                        return Err(io::Error::other(format!(
+                            "{prefix} matches several sessions"
+                        )));
+                    }
+                    (None, _) => {
+                        return Err(io::Error::new(
+                            io::ErrorKind::NotFound,
+                            format!("no session matches {prefix}"),
+                        ));
+                    }
+                }
+            }
             // A child is reached through its parent, not resumed as latest.
-            Target::Latest { any_workspace } => lock(&self.slots)
-                .iter()
-                .rev()
-                .find(|s| {
-                    s.header.parent.is_none() && (*any_workspace || s.header.workspace == workspace)
-                })
-                .cloned(),
+            Target::Latest { any_workspace } => {
+                let workspace = (!any_workspace).then(workspace);
+                lock(&self.slots)
+                    .iter()
+                    .rev()
+                    .find(|s| {
+                        s.header.parent.is_none()
+                            && workspace.as_ref().is_none_or(|w| s.header.workspace == *w)
+                    })
+                    .cloned()
+            }
         };
         let slot =
             found.ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, "no matching session"))?;
@@ -369,6 +419,41 @@ impl Daemon {
         }
     }
 
+    /// Starts sending `outbox` the session list, now and on each change.
+    fn watch_list(&self, outbox: &Outbox) {
+        let sessions = self.list();
+        let mut watchers = lock(&self.watchers);
+        reply(
+            outbox,
+            &DaemonMsg::Sessions {
+                sessions: sessions.clone(),
+            },
+        );
+        watchers.0.push(outbox.clone());
+        watchers.1 = sessions;
+    }
+
+    /// Sends the watchers the session list, if it changed. Whatever changes
+    /// a summary (a client coming or going, work beginning or ending, a
+    /// session loading or unloading) wakes the supervisor, which calls
+    /// this.
+    fn publish_list(&self) {
+        let mut watchers = lock(&self.watchers);
+        if watchers.0.is_empty() {
+            return;
+        }
+        let sessions = self.list();
+        if sessions == watchers.1 {
+            return;
+        }
+        if let Ok(frame) = Frame::new(&DaemonMsg::Sessions {
+            sessions: sessions.clone(),
+        }) {
+            watchers.0.retain(|w| w.send(frame.clone()).is_ok());
+        }
+        watchers.1 = sessions;
+    }
+
     /// When the next loaded session is due to hibernate, if one is idle.
     fn next_hibernation(&self, after: Duration, now: Instant) -> Option<Instant> {
         self.live()
@@ -420,10 +505,19 @@ impl Daemon {
                 detail: String::new(),
             });
             #[cfg(unix)]
-            if let Err(e) = sys::log::rotate_stderr(&exit.log) {
+            if let Some(log) = &exit.log
+                && let Err(e) = sys::log::rotate_stderr(log)
+            {
                 eprintln!("rotating the log: {e}");
             }
             self.hibernate(config.hibernate);
+            self.publish_list();
+            if self.stopping.load(Ordering::SeqCst) {
+                for session in self.live() {
+                    session.stop();
+                }
+                exit.now("asked to stop");
+            }
             let draining = life.draining();
             let busy = draining.is_some() || self.has_work();
             if busy != awake.is_some() {
@@ -476,7 +570,8 @@ struct Exit {
     home: Home,
     /// The locked pid file; see [`claim`].
     pid: File,
-    log: PathBuf,
+    /// The log that is our stderr, to rotate.
+    log: Option<PathBuf>,
 }
 
 impl Exit {
@@ -520,20 +615,52 @@ impl Drop for Client<'_> {
     }
 }
 
+/// How a daemon was started.
+#[derive(Debug, Default)]
+pub struct Start {
+    /// The daemon lock, taken by the client that started it; without one
+    /// the daemon takes it.
+    pub lock: Option<File>,
+    /// Serve even after a crash loop, for `a daemon restart`.
+    pub reset_breaker: bool,
+    /// Its stderr is `logs/daemon.log`, which it then rotates.
+    pub logs: bool,
+}
+
 /// Runs the daemon, as staged build `build`, until it has been idle for
 /// `config.idle` (no attached clients and no unfinished work) or has drained
 /// for a newer build. Sessions live in their logs, so the next client
-/// starts a new daemon.
+/// starts a new daemon. After a crash loop it serves no one: it tells the
+/// clients waiting why, and exits.
 #[cfg(unix)]
-pub fn serve(listener: &UnixListener, home: &Home, config: &Config, build: &str) -> io::Result<()> {
-    let pid = claim(home, build)?;
+pub fn serve(
+    listener: &UnixListener,
+    home: &Home,
+    config: &Config,
+    build: &str,
+    start: Start,
+) -> io::Result<()> {
+    let pid = match claim(
+        home,
+        build,
+        start.lock,
+        start.reset_breaker,
+        config.crash_limit,
+    )? {
+        Claim::Serve(pid) => pid,
+        Claim::Tripped(why) => {
+            refuse(listener, &why);
+            let _ = std::fs::remove_file(home.socket());
+            return Err(io::Error::other(why));
+        }
+    };
     let daemon = Daemon::load(home, config)?;
     let life = Arc::new(Lifecycle::new(build.to_owned(), home.runtime()));
     let (monitor, watch, config) = (Arc::clone(&daemon), Arc::clone(&life), config.clone());
     let exit = Exit {
         home: home.clone(),
         pid,
-        log: home.daemon_log(),
+        log: start.logs.then(|| home.daemon_log()),
     };
     daemon.shared.rt.spawn(Box::pin(async move {
         monitor.supervise(&watch, &config, exit).await;
@@ -553,22 +680,47 @@ pub fn serve(listener: &UnixListener, home: &Home, config: &Config, build: &str)
     Ok(())
 }
 
-/// Takes the daemon lock for this process's lifetime and records us in it
+/// Whether a daemon may serve.
+enum Claim {
+    /// Yes, holding the locked pid file.
+    Serve(File),
+    /// No, for this reason: its predecessors died young too often.
+    Tripped(String),
+}
+
+/// Keeps the daemon lock (`lock`, handed down by the client that started
+/// us, or else taken here) for this process's lifetime and records us in it
 /// ([`sys::crash::Record`]), noting first a previous daemon that died
 /// holding it. While the lock is held the pid is guaranteed to be ours,
-/// which is what lets clients kill a wedged daemon safely.
-fn claim(home: &Home, build: &str) -> io::Result<File> {
-    let mut file = OpenOptions::new()
-        .create(true)
-        .truncate(false)
-        .read(true)
-        .write(true)
-        .open(home.daemon_pid_file())?;
-    if file.try_lock().is_err() {
-        return Err(io::Error::new(
-            io::ErrorKind::AddrInUse,
-            "another daemon is running",
-        ));
+/// which is what lets clients kill a wedged daemon safely. Holding it, we
+/// are the only one that counts crashes, so the breaker is ours to check:
+/// after `limit` young deaths in a row, unless `reset`, we do not serve.
+fn claim(
+    home: &Home,
+    build: &str,
+    lock: Option<File>,
+    reset: bool,
+    limit: u32,
+) -> io::Result<Claim> {
+    let mut file = if let Some(file) = lock {
+        file
+    } else {
+        let file = OpenOptions::new()
+            .create(true)
+            .truncate(false)
+            .read(true)
+            .write(true)
+            .open(home.daemon_pid_file())?;
+        if file.try_lock().is_err() {
+            return Err(io::Error::new(
+                io::ErrorKind::AddrInUse,
+                "another daemon is running",
+            ));
+        }
+        file
+    };
+    if reset {
+        sys::crash::reset(home)?;
     }
     if let Some(dead) = sys::crash::reap(home, &mut file)? {
         eprintln!(
@@ -576,10 +728,58 @@ fn claim(home: &Home, build: &str) -> io::Result<File> {
             dead.pid
         );
     }
+    let crashes = sys::crash::Crashes::of(home);
+    if crashes.tripped(limit) {
+        let report = crashes
+            .last
+            .map_or_else(String::new, |p| format!("; see {}", p.display()));
+        return Ok(Claim::Tripped(format!(
+            "the daemon crashed {} times in a row soon after starting{report}; \
+             `a daemon restart` tries again",
+            crashes.young
+        )));
+    }
     // Not synced: clients read it while we hold the lock, and after a crash
     // there is no lock to vouch for it.
     write!(file, "{}", sys::crash::Record::current(build))?;
-    Ok(file)
+    Ok(Claim::Serve(file))
+}
+
+/// Answers every client that connects, until none waits (or, if none
+/// came, for [`REFUSED_GRACE`]), with `why` in place of a welcome: for a
+/// daemon that must not serve.
+#[cfg(unix)]
+fn refuse(listener: &UnixListener, why: &str) {
+    let Ok(frame) = Frame::new(&DaemonMsg::Error {
+        message: why.to_owned(),
+    }) else {
+        return;
+    };
+    if listener.set_nonblocking(true).is_err() {
+        return;
+    }
+    let deadline = Instant::now() + REFUSED_GRACE;
+    let mut answered = false;
+    loop {
+        match listener.accept() {
+            Ok((mut conn, _)) => {
+                answered = true;
+                let _ = conn.set_nonblocking(false);
+                let _ = conn.set_read_timeout(Some(REFUSED_GRACE));
+                let _ = conn.write_all(frame.as_bytes());
+                // What it sent is read and dropped until it hangs up.
+                let _ = io::copy(&mut conn, &mut io::sink());
+            }
+            Err(e)
+                if e.kind() == io::ErrorKind::WouldBlock
+                    && !answered
+                    && Instant::now() < deadline =>
+            {
+                thread::sleep(Duration::from_millis(10));
+            }
+            Err(_) => return,
+        }
+    }
 }
 
 /// How long a client refused at its hello has to read the answer and hang
@@ -713,6 +913,14 @@ fn handle(daemon: &Daemon, life: &Lifecycle, conn: &UnixStream) -> io::Result<()
     result
 }
 
+/// The workspace a client in `dir` works in: the git working tree `dir` is
+/// in, found with the client's git variables (`GIT_DIR`, ceilings), not the
+/// daemon's, so every client, local or bridged, gets the same rule.
+fn workspace_of(dir: &std::path::Path, env: Option<&Environment>) -> PathBuf {
+    let var = |name: &str| env?.vars.get(name).map(Into::into);
+    sys::workspace_in(dir, &sys::GitEnv::from_vars(var))
+}
+
 fn reply(outbox: &Outbox, msg: &DaemonMsg) {
     // The writer ends with the connection; a lost reply needs no handling.
     if let Ok(frame) = Frame::new(msg) {
@@ -759,7 +967,10 @@ impl Conn<'_> {
                     since,
                     env,
                     decl,
-                } => match self.daemon.resolve(&target, workspace) {
+                } => match self
+                    .daemon
+                    .resolve(&target, || workspace_of(&workspace, env.as_ref()))
+                {
                     Ok(s) => {
                         self.decl = decl;
                         // Before the replay, so a client that saw itself
@@ -781,6 +992,23 @@ impl Conn<'_> {
                 ClientMsg::List => self.reply(&DaemonMsg::Sessions {
                     sessions: self.daemon.list(),
                 }),
+                ClientMsg::Settings { change } => self.reply(&self.settings(change.as_ref())),
+                ClientMsg::WatchSessions => self.daemon.watch_list(self.outbox),
+                ClientMsg::Status => self.reply(&DaemonMsg::Status {
+                    pid: std::process::id(),
+                    build: self.life.build.clone(),
+                    started: self.daemon.started,
+                    clients: u32::try_from(self.daemon.clients.load(Ordering::SeqCst))
+                        .unwrap_or(u32::MAX),
+                    known: u32::try_from(lock(&self.daemon.slots).len()).unwrap_or(u32::MAX),
+                }),
+                ClientMsg::Shutdown if self.decl.role == Role::Viewer => {
+                    self.error("this client is a viewer".into());
+                }
+                ClientMsg::Shutdown => {
+                    self.daemon.stopping.store(true, Ordering::SeqCst);
+                    self.daemon.pulse.wake();
+                }
                 ClientMsg::Detach => break,
                 ClientMsg::Hello { .. }
                 | ClientMsg::Input { .. }
@@ -791,6 +1019,25 @@ impl Conn<'_> {
         }
         self.outbox.unfollow();
         Ok(())
+    }
+
+    /// The home settings, after `change` if this client may make it.
+    fn settings(&self, change: Option<&SettingsChange>) -> DaemonMsg {
+        let home = &self.daemon.shared.models.settings.home;
+        let (file, refused) = match change {
+            None => (home.get(), None),
+            Some(_) if self.decl.role == Role::Viewer => {
+                (home.get(), Some("this client is a viewer".to_owned()))
+            }
+            Some(change) => home
+                .change(change)
+                .map_or_else(|e| (home.get(), Some(e)), |file| (file, None)),
+        };
+        let (settings, error) = match &*file {
+            Ok(file) => (config::shown(file), refused),
+            Err(e) => (HomeSettings::default(), refused.or_else(|| Some(e.clone()))),
+        };
+        DaemonMsg::Settings { settings, error }
     }
 
     fn set_env(&self, s: &Attachment, env: Environment) {

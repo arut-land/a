@@ -15,7 +15,7 @@
 use std::fmt;
 use std::future::Future;
 use std::path::Path;
-use std::sync::{Arc, Mutex, PoisonError};
+use std::sync::{Arc, Mutex, OnceLock, PoisonError};
 
 use protocol::Outcome;
 use rt::BoxFuture;
@@ -220,6 +220,10 @@ pub struct Registry {
     commands: Vec<Arc<dyn DynCommand>>,
     hooks: Hooks,
     sections: Vec<Section>,
+    /// What every model call on this generation sends, made on first use:
+    /// a registry never changes once built, so neither do they.
+    prompt: OnceLock<String>,
+    specs: OnceLock<Vec<llm::Tool>>,
 }
 
 impl Registry {
@@ -295,6 +299,8 @@ impl Registry {
         self.commands = commands.into_iter().map(|c| c.1).collect();
         self.sections = sections.into_iter().map(|s| s.1).collect();
         self.hooks = Hooks(hooks);
+        self.prompt = OnceLock::new();
+        self.specs = OnceLock::new();
         Ok(self)
     }
 
@@ -314,15 +320,22 @@ impl Registry {
     }
 
     /// The system prompt the sections make with the tools offered.
-    pub fn system_prompt(&self) -> String {
-        let offered = |s: &&Section| s.tool.is_none_or(|tool| self.tools.get(tool).is_some());
-        let texts: Vec<&str> = self
-            .sections
-            .iter()
-            .filter(offered)
-            .map(|s| s.text.as_str())
-            .collect();
-        texts.join("\n\n")
+    pub fn system_prompt(&self) -> &str {
+        self.prompt.get_or_init(|| {
+            let offered = |s: &&Section| s.tool.is_none_or(|tool| self.tools.get(tool).is_some());
+            let texts: Vec<&str> = self
+                .sections
+                .iter()
+                .filter(offered)
+                .map(|s| s.text.as_str())
+                .collect();
+            texts.join("\n\n")
+        })
+    }
+
+    /// Every tool, as offered to the model: each schema parsed once.
+    pub fn specs(&self) -> &[llm::Tool] {
+        self.specs.get_or_init(|| self.tools.specs())
     }
 
     /// The context every extension gives for `facts`, if any.
@@ -557,6 +570,10 @@ mod tests {
         assert_eq!(with.system_prompt(), "Use bash well.");
         let builtins = crate::builtins(&Policy::default()).unwrap();
         let prompt = builtins.system_prompt();
+        // Made once per registry, as are the tool specs.
+        assert!(std::ptr::eq(prompt, builtins.system_prompt()));
+        assert!(std::ptr::eq(builtins.specs(), builtins.specs()));
+        assert_eq!(builtins.specs().len(), builtins.tools().specs().len());
         assert!(prompt.starts_with("You are `a`"), "{prompt}");
         assert!(
             prompt.contains("`bash`") && prompt.contains("`edit`"),

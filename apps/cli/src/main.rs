@@ -59,6 +59,12 @@ enum Cmd {
     Serve {
         #[usage(long)]
         listen_fd: Option<i32>,
+        /// The daemon lock, held for it by the client that started it
+        #[usage(long)]
+        lock_fd: Option<i32>,
+        /// Serve even after a crash loop
+        #[usage(long)]
+        reset_breaker: bool,
     },
 }
 
@@ -78,7 +84,7 @@ fn main() -> ExitCode {
         None => session(ctx, Target::New),
         Some(Cmd::Resume { id: None, any }) => session(ctx, Target::Latest { any_workspace: any }),
         Some(Cmd::Resume { id: Some(id), .. } | Cmd::Attach { id }) => {
-            find(&ctx, &id).and_then(|id| session(ctx, Target::Id(id)))
+            target(&ctx, id).and_then(|target| session(ctx, target))
         }
         Some(Cmd::Ls) => ls(&ctx),
         Some(Cmd::New) => new(&ctx),
@@ -88,7 +94,11 @@ fn main() -> ExitCode {
         }
         Some(Cmd::Web { no_open }) => web(ctx, !no_open),
         Some(Cmd::Daemon { action }) => daemon_cmd(&ctx, &action),
-        Some(Cmd::Serve { listen_fd }) => daemon(&ctx, listen_fd),
+        Some(Cmd::Serve {
+            listen_fd,
+            lock_fd,
+            reset_breaker,
+        }) => daemon(&ctx, listen_fd, lock_fd, reset_breaker),
     });
     match result {
         Ok(()) => ExitCode::SUCCESS,
@@ -203,16 +213,16 @@ fn daemon_cmd(ctx: &Ctx, action: &DaemonCmd) -> io::Result<()> {
     match action {
         DaemonCmd::Status => {
             let d = client::diagnose(home);
-            match d.pid {
-                None => println!("not running"),
-                Some(pid) => {
-                    match client::connect(&ctx.endpoint, &ctx.staged, &|| {})
-                        .and_then(client::Connection::sessions)
-                    {
-                        Ok(s) => println!("running (pid {pid}), {} sessions", s.len()),
-                        Err(e) => println!("running (pid {pid}) but not responding: {e}"),
-                    }
-                }
+            match (d.pid, client::status(home)) {
+                (None, _) | (_, Ok(None)) => println!("not running"),
+                (_, Ok(Some(s))) => println!(
+                    "running (pid {}, {}), {} sessions, {} other clients",
+                    s.pid,
+                    s.build,
+                    s.sessions,
+                    s.clients.saturating_sub(1)
+                ),
+                (Some(pid), Err(e)) => println!("running (pid {pid}) but not responding: {e}"),
             }
             println!("log: {}", d.log.display());
             if let Some(note) = d.crash_note() {
@@ -277,7 +287,13 @@ fn repl(ctx: Ctx, target: Target) -> io::Result<()> {
         let lock = || folding.lock().unwrap_or_else(PoisonError::into_inner);
         loop {
             while let Ok(Some(msg)) = reader.recv() {
-                if let Some(update) = lock().fold(&msg) {
+                let mut view = lock();
+                // Nothing to attach to: no such session.
+                if let (None, DaemonMsg::Error { message }) = (view.session, &msg) {
+                    eprintln!("a: {message}");
+                    std::process::exit(1);
+                }
+                if let Some(update) = view.fold(&msg) {
                     screen.show(&update.change);
                 }
             }
@@ -526,6 +542,16 @@ fn ls(ctx: &Ctx) -> io::Result<()> {
     Ok(())
 }
 
+/// The session `id` names, in full or as a prefix: this machine's daemon
+/// resolves it as it attaches; another machine's, which may be older, is
+/// asked for its list first.
+fn target(ctx: &Ctx, id: String) -> io::Result<Target> {
+    match ctx.endpoint {
+        Endpoint::Local(_) => Ok(Target::Prefix(id)),
+        Endpoint::Ssh(_) => find(ctx, &id).map(Target::Id),
+    }
+}
+
 fn find(ctx: &Ctx, prefix: &str) -> io::Result<SessionId> {
     let matches: Vec<_> = ctx
         .connect()?
@@ -568,21 +594,46 @@ fn web(_ctx: Ctx, _open: bool) -> io::Result<()> {
     Err(io::Error::other("this build of a has no web UI"))
 }
 
+/// The daemon. Started by a client (`listen_fd`), it leaves the client's
+/// session and logs to `logs/daemon.log`; by hand, it stays at the
+/// terminal.
 #[cfg(unix)]
-fn daemon(ctx: &Ctx, listen_fd: Option<i32>) -> io::Result<()> {
+fn daemon(
+    ctx: &Ctx,
+    listen_fd: Option<i32>,
+    lock_fd: Option<i32>,
+    reset_breaker: bool,
+) -> io::Result<()> {
     let home = &ctx.home;
     sys::crash::install(home.crash_dir(), ctx.staged.id.clone());
     let listener = if let Some(fd) = listen_fd {
         sys::detach_session()?;
+        sys::log::redirect_stderr(&home.daemon_log())?;
         sys::adopt_listener(fd)?
     } else {
         home.bind()?
     };
-    engine::serve(&listener, home, &engine::Config::from_env(), &ctx.staged.id)
+    let start = engine::Start {
+        lock: lock_fd.map(sys::adopt_lock).transpose()?,
+        reset_breaker,
+        logs: listen_fd.is_some(),
+    };
+    engine::serve(
+        &listener,
+        home,
+        &engine::Config::load(home),
+        &ctx.staged.id,
+        start,
+    )
 }
 
 #[cfg(not(unix))]
-fn daemon(_ctx: &Ctx, _listen_fd: Option<i32>) -> io::Result<()> {
+fn daemon(
+    _ctx: &Ctx,
+    _listen_fd: Option<i32>,
+    _lock_fd: Option<i32>,
+    _reset_breaker: bool,
+) -> io::Result<()> {
     Err(io::Error::other(
         "the daemon is not implemented on this platform yet",
     ))

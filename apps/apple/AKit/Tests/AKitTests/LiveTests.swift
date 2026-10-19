@@ -51,9 +51,12 @@ func aLiveSessionChatsRunsAnApprovedToolAndIsListed() async throws {
         }
     }
 
+    // The daemon pushes the list; nothing polls it.
     let list = SessionListStore(client: client)
-    await list.refresh()
-    #expect(list.sessions.contains { $0.id == id && $0.clients >= 1 })
+    let following = Task { await list.follow() }
+    try await eventually("the session listed") {
+        list.sessions.contains { $0.id == id && $0.clients >= 1 }
+    }
 
     // A second client of the same session folds to the same state.
     let other = SessionStore(session: Session(client: client))
@@ -78,6 +81,10 @@ func aLiveSessionChatsRunsAnApprovedToolAndIsListed() async throws {
     await store.detach()
     await other.detach()
     #expect(store.problem == nil && other.problem == nil)
+    try await eventually("the list to show them gone") {
+        list.sessions.contains { $0.id == id && $0.clients == 0 }
+    }
+    following.cancel()
 }
 
 /// `item` as a client that was not asked sees it.

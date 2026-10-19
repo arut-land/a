@@ -102,8 +102,9 @@ done
 # The black-box M1 acceptance tests (apps/cli/tests) on the dev build.
 acceptance = "cargo nextest run -p a --test acceptance --no-tests=fail"
 # `a web` on the dev build against an isolated home (target/web-home) and
-# the model-backed agent, with the keys .env.local gives (A_AGENT=echo for
-# none); its daemon stops with it.
+# the model-backed agent, with the keys .env.local gives its sessions
+# (`[daemon]` `agent = "echo"` in its config.toml for none); its daemon
+# stops with it.
 web = '''
 cargo build -p a
 export A_HOME=$PWD/target/web-home
@@ -126,7 +127,8 @@ budgets = { depends = ["size"], run = 'A_BIN=$PWD/target/release/a A_STRICT_BUDG
 # live session on a daemon of its own (a throwaway A_HOME, the echo agent).
 "apple:test" = { depends = ["apple:ffi"], run = '''
 cargo build -p a
-export A_HOME=$(mktemp -d) A_AGENT=echo A_ASK=bash A_TEST_HELPER=$PWD/target/debug/a
+export A_HOME=$(mktemp -d) A_TEST_HELPER=$PWD/target/debug/a
+printf '[daemon]\nagent = "echo"\nask = ["bash"]\n' > "$A_HOME/config.toml"
 trap 'target/debug/a daemon stop >/dev/null; rm -rf "$A_HOME"' EXIT
 swift test --package-path apps/apple/AKit
 ''' }

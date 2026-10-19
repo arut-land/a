@@ -32,8 +32,11 @@ impl Scratch {
         }
     }
 
-    /// An `A_HOME` whose daemon is stopped at the end.
+    /// An `A_HOME` whose daemon, running the echo agent, is stopped at
+    /// the end.
     fn home(&mut self, path: PathBuf) -> PathBuf {
+        fs::create_dir_all(&path).unwrap();
+        fs::write(path.join("config.toml"), "[daemon]\nagent = \"echo\"\n").unwrap();
         self.homes.push(path.clone());
         path
     }
@@ -65,9 +68,7 @@ impl Drop for Scratch {
 
 fn a(home: &Path) -> Command {
     let mut cmd = Command::new(A);
-    cmd.env("A_HOME", home)
-        .env("A_AGENT", "echo")
-        .env_remove("A_HOST");
+    cmd.env("A_HOME", home).env_remove("A_HOST");
     cmd
 }
 
@@ -206,6 +207,34 @@ fn a_remote_session_runs_in_the_hosts_directory_and_environment() {
     assert_eq!(env.vars["PATH"], "/usr/bin:/bin");
 }
 
+/// The daemon finds a remote session's workspace from where it started,
+/// with the host's git variables, as it does for a local one.
+#[test]
+fn a_remote_session_started_in_a_subdirectory_works_in_its_git_root() {
+    let mut scratch = Scratch::new("remote-git");
+    // The host's home, where ssh lands, is in a checkout.
+    fs::create_dir_all(scratch.root.join(".git")).unwrap();
+    let (mut new, remote) = fake_remote(&mut scratch, "");
+    let host = remote.parent().unwrap();
+    ok(&new.arg("new").output().unwrap());
+
+    let log = fs::read_dir(remote.join("sessions"))
+        .unwrap()
+        .next()
+        .unwrap()
+        .unwrap()
+        .path();
+    let text = fs::read_to_string(log).unwrap();
+    let mut lines = text.lines();
+    let header: serde_json::Value = serde_json::from_str(lines.next().unwrap()).unwrap();
+    assert_eq!(header["workspace"], scratch.root.to_str().unwrap());
+    let entry: protocol::Entry = serde_json::from_str(lines.next().expect(&text)).unwrap();
+    let Body::Environment(env) = entry.body else {
+        panic!("{entry:?}")
+    };
+    assert_eq!(env.cwd, host);
+}
+
 #[test]
 fn a_host_of_another_platform_is_refused() {
     let mut scratch = Scratch::new("refuse");
@@ -234,7 +263,6 @@ fn a_newer_build_drains_the_old_daemon() {
     let output = Command::new(&newer)
         .arg("ls")
         .env("A_HOME", &home)
-        .env("A_AGENT", "echo")
         .output()
         .unwrap();
     assert_eq!(ok(&output).lines().count(), 1);

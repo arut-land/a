@@ -19,10 +19,7 @@ fn dirs(name: &str, home: Option<&str>, workspace: Option<&str>) -> (PathBuf, Pa
 }
 
 fn settings(root: &Path) -> Settings {
-    Settings {
-        process: |name| (name == "FROM_DAEMON").then(|| "daemon".to_owned()),
-        ..Settings::new(root.join("config.toml"), None, None)
-    }
+    Settings::new(root.join("config.toml"), None)
 }
 
 #[test]
@@ -43,6 +40,7 @@ fn files_parse_the_contract() {
             model: Some("openai:gpt-6-luna".into()),
             agent: Some("chat".into()),
             env: BTreeMap::from([("OPENAI_API_KEY".into(), "sk-test".into())]),
+            daemon: sys::config::Daemon::default(),
         }
     );
 }
@@ -59,12 +57,7 @@ fn later_layers_win() {
     assert_eq!(s.agent(&ws), agent::Kind::Echo);
     assert_eq!(s.model(&root).unwrap(), "home:m");
 
-    let overridden = Settings::new(
-        root.join("config.toml"),
-        Some("env:m".into()),
-        Some(agent::Kind::Chat),
-    );
-    assert_eq!(overridden.model(&ws).unwrap(), "env:m");
+    let overridden = Settings::new(root.join("config.toml"), Some(agent::Kind::Chat));
     assert_eq!(overridden.agent(&ws), agent::Kind::Chat);
 
     let (bare, ws) = dirs("defaults", None, None);
@@ -76,7 +69,7 @@ fn later_layers_win() {
 }
 
 #[test]
-fn variables_come_from_the_client_then_the_home_file_then_the_daemon() {
+fn variables_come_from_the_client_then_the_home_file_never_the_daemon() {
     let (root, _) = dirs(
         "vars",
         Some("[env]\nFROM_FILE = \"file\"\nSHADOWED = \"file\"\nBLANK = \"file\""),
@@ -95,7 +88,9 @@ fn variables_come_from_the_client_then_the_home_file_then_the_daemon() {
     assert_eq!(var("SHADOWED").as_deref(), Some("client"));
     assert_eq!(var("BLANK").as_deref(), Some("file"));
     assert_eq!(var("FROM_FILE").as_deref(), Some("file"));
-    assert_eq!(var("FROM_DAEMON").as_deref(), Some("daemon"));
+    // The daemon's own environment is whichever client's started it.
+    assert!(std::env::var_os("PATH").is_some());
+    assert_eq!(var("PATH"), None);
     assert_eq!(var("FROM_WORKSPACE"), None);
     assert_eq!(s.var(None, "SHADOWED").as_deref(), Some("file"));
     std::fs::remove_dir_all(root).unwrap();
@@ -113,5 +108,48 @@ fn an_edited_home_file_applies_without_a_restart() {
     let error = s.model(&ws).unwrap_err();
     assert!(error.contains("config.toml"), "{error}");
     assert_eq!(s.agent(&ws), agent::Kind::Chat);
+    std::fs::remove_dir_all(root).unwrap();
+}
+
+#[test]
+fn a_change_made_through_the_daemon_applies_at_once() {
+    let (root, ws) = dirs("change", Some("model = \"aa:m\"\n"), None);
+    let s = settings(&root);
+    assert_eq!(s.model(&ws).unwrap(), "aa:m");
+    let path = root.join("config.toml");
+    let before = std::fs::metadata(&path).unwrap().modified().unwrap();
+    let change = SettingsChange {
+        model: Some("bb:m".into()),
+        ..SettingsChange::default()
+    };
+    s.home.change(&change).unwrap();
+    // As a coarse clock leaves it: the same size and time as before.
+    std::fs::File::options()
+        .write(true)
+        .open(&path)
+        .unwrap()
+        .set_modified(before)
+        .unwrap();
+    assert_eq!(s.model(&ws).unwrap(), "bb:m");
+    std::fs::remove_dir_all(root).unwrap();
+}
+
+#[test]
+fn a_workspace_file_is_parsed_once_per_change_for_all_its_sessions() {
+    let (root, ws) = dirs("ws-cache", None, Some("model = \"ws:aa\"\n"));
+    let s = settings(&root);
+    assert_eq!(s.model(&ws).unwrap(), "ws:aa");
+    // The same size and time: what was parsed is used, not read again.
+    let path = ws.join(".a/config.toml");
+    let before = std::fs::metadata(&path).unwrap().modified().unwrap();
+    std::fs::write(&path, "model = \"ws:bb\"\n").unwrap();
+    let file = std::fs::File::options().write(true).open(&path).unwrap();
+    file.set_modified(before).unwrap();
+    for _ in 0..3 {
+        assert_eq!(s.model(&ws).unwrap(), "ws:aa");
+    }
+    // A change is read.
+    std::fs::write(&path, "model = \"ws:longer\"\n").unwrap();
+    assert_eq!(s.model(&ws).unwrap(), "ws:longer");
     std::fs::remove_dir_all(root).unwrap();
 }

@@ -1,23 +1,24 @@
 //! The settings a session runs with, layered: built-in defaults <
-//! `$A_HOME/config.toml` < the workspace's `.a/config.toml` < `A_MODEL` and
-//! `A_AGENT`. Provider variables (keys, base URLs) come from the session's
-//! client first, then the home file's `[env]`, then the daemon's own
-//! environment; a workspace, being anyone's checkout, never sets them.
+//! `$A_HOME/config.toml` < the workspace's `.a/config.toml` < the session's
+//! own. Provider variables (keys, base URLs) come from the session's client
+//! first, then the home file's `[env]`; never from the daemon's own
+//! environment, which is whichever client's started it, and never from a
+//! workspace, which is anyone's checkout.
 
+use std::collections::HashMap;
 use std::fmt;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 use std::time::SystemTime;
 
-use protocol::{Environment, Overrides};
+use protocol::{Environment, HomeSettings, Overrides, SettingsChange};
 
 use crate::lock;
 
 /// The model a session calls when no layer names one.
 pub const DEFAULT_MODEL: &str = "gpt-6-luna";
 
-/// A `config.toml`, read by [`sys::config`], which the app's settings pane
-/// also writes.
+/// A `config.toml`, read and edited by [`sys::config`].
 pub use sys::config::Config as File;
 
 /// The file at `path`; a missing one is empty.
@@ -36,8 +37,9 @@ fn stamp(path: &Path) -> Stamp {
 /// A file as last read, or why it could not be.
 pub type Loaded = Arc<Result<File, String>>;
 
-/// A file read again only once it changes, so edits apply without a
-/// daemon restart.
+/// A file read again only once it changes, so hand edits apply without a
+/// daemon restart. Clients change it through the daemon ([`Watched::change`]),
+/// which is then its one writer.
 pub struct Watched {
     path: PathBuf,
     read: Mutex<Option<(Stamp, Loaded)>>,
@@ -68,6 +70,41 @@ impl Watched {
             }
         }
     }
+
+    /// Makes `change` to the file as it is on disk, and keeps what it
+    /// wrote as read: changes are made one at a time, so none undoes
+    /// another, and the next read sees this one even when the rewrite left
+    /// the file's size and time as they were.
+    pub fn change(&self, change: &SettingsChange) -> Result<Loaded, String> {
+        let mut read = lock(&self.read);
+        let mut file = load(&self.path)?;
+        let given = |value: &str| Some(value.trim().to_owned()).filter(|v| !v.is_empty());
+        if let Some(model) = &change.model {
+            file.model = given(model);
+        }
+        if let Some(agent) = &change.agent {
+            file.agent = given(agent);
+        }
+        for (name, value) in &change.env {
+            match value {
+                Some(value) => file.env.insert(name.clone(), value.clone()),
+                None => file.env.remove(name),
+            };
+        }
+        file.write(&self.path).map_err(|e| e.to_string())?;
+        let file = Arc::new(Ok(file));
+        *read = Some((stamp(&self.path), Arc::clone(&file)));
+        Ok(file)
+    }
+}
+
+/// What a settings pane shows of `file`.
+pub fn shown(file: &File) -> HomeSettings {
+    HomeSettings {
+        model: file.model.clone(),
+        agent: file.agent.clone(),
+        env: file.env.clone(),
+    }
 }
 
 /// The layer a setting came from.
@@ -76,8 +113,6 @@ pub enum Source {
     Default,
     Home,
     Workspace,
-    /// `A_MODEL` or `A_AGENT`.
-    Env,
     /// The session's own, set by its entry `seq`.
     Session(u64),
 }
@@ -88,7 +123,6 @@ impl fmt::Display for Source {
             Self::Default => f.write_str("the built-in default"),
             Self::Home => f.write_str("the home config.toml"),
             Self::Workspace => f.write_str("the workspace's .a/config.toml"),
-            Self::Env => f.write_str("the daemon's environment"),
             Self::Session(seq) => write!(f, "this session, at entry {seq}"),
         }
     }
@@ -98,30 +132,32 @@ impl fmt::Display for Source {
 pub struct Settings {
     /// `$A_HOME/config.toml`.
     pub home: Watched,
-    /// `A_MODEL`: wins over both files.
-    pub model: Option<String>,
-    /// `A_AGENT`: wins over both files.
+    /// `[daemon] agent`: wins over both files.
     pub agent: Option<agent::Kind>,
-    /// The daemon's own environment, the last place a variable is looked
-    /// up.
-    pub process: fn(&str) -> Option<String>,
+    /// Each workspace's `.a/config.toml`, shared by all its sessions.
+    workspaces: Mutex<HashMap<PathBuf, Arc<Watched>>>,
 }
 
 impl Settings {
-    /// Settings from `home` and this process's environment.
-    pub fn new(home: PathBuf, model: Option<String>, agent: Option<agent::Kind>) -> Self {
+    pub fn new(home: PathBuf, agent: Option<agent::Kind>) -> Self {
         Self {
             home: Watched::new(home),
-            model,
             agent,
-            process: llm::protocol::env,
+            workspaces: Mutex::default(),
         }
     }
 
-    /// The workspace's file, read afresh: it is only consulted when a
-    /// session starts or calls the model.
-    fn workspace(workspace: &Path) -> Result<File, String> {
-        load(&workspace.join(".a").join("config.toml"))
+    /// The workspace's file: parsed once per change for every session in
+    /// the workspace, as the home file is.
+    fn workspace(&self, workspace: &Path) -> Loaded {
+        let watched = Arc::clone(
+            lock(&self.workspaces)
+                .entry(workspace.to_path_buf())
+                .or_insert_with(|| {
+                    Arc::new(Watched::new(workspace.join(".a").join("config.toml")))
+                }),
+        );
+        watched.get()
     }
 
     /// The agent a session in `workspace` runs. A file that cannot be read
@@ -131,7 +167,7 @@ impl Settings {
             return kind;
         }
         let named = |file: &Result<File, String>| file.as_ref().ok()?.agent.clone();
-        let name = named(&Self::workspace(workspace)).or_else(|| named(&self.home.get()));
+        let name = named(&self.workspace(workspace)).or_else(|| named(&self.home.get()));
         name.and_then(|name| {
             name.parse()
                 .map_err(|e| eprintln!("agent `{name}` in config.toml: {e}"))
@@ -157,12 +193,9 @@ impl Settings {
         if let (Overrides { model: Some(model) }, seq) = session {
             return Ok((model, Source::Session(seq.unwrap_or_default())));
         }
-        if let Some(model) = &self.model {
-            return Ok((model.clone(), Source::Env));
-        }
-        let local = Self::workspace(workspace)?;
-        if let Some(model) = local.model {
-            return Ok((model, Source::Workspace));
+        let local = self.workspace(workspace);
+        if let Some(model) = &local.as_ref().as_ref().map_err(Clone::clone)?.model {
+            return Ok((model.clone(), Source::Workspace));
         }
         let home = self.home.get();
         let home = home.as_ref().as_ref().map_err(Clone::clone)?;
@@ -173,18 +206,15 @@ impl Settings {
     }
 
     /// Variable `name` for a session whose client environment is `client`:
-    /// the client's, else the home file's `[env]`, else the daemon's.
+    /// the client's, else the home file's `[env]`.
     pub fn var(&self, client: Option<&Environment>, name: &str) -> Option<String> {
         let set = |value: &String| !value.trim().is_empty();
         if let Some(value) = client.and_then(|env| env.vars.get(name)).filter(|v| set(v)) {
             return Some(value.clone());
         }
-        if let Ok(home) = &*self.home.get()
-            && let Some(value) = home.env.get(name).filter(|v| set(v))
-        {
-            return Some(value.clone());
-        }
-        (self.process)(name)
+        let home = self.home.get();
+        let home = home.as_ref().as_ref().ok()?;
+        home.env.get(name).filter(|v| set(v)).cloned()
     }
 }
 

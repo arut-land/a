@@ -1328,11 +1328,11 @@ impl Session {
             .shared
             .system
             .clone()
-            .unwrap_or_else(|| registry.system_prompt());
+            .unwrap_or_else(|| registry.system_prompt().to_owned());
         if !system.is_empty() {
             history.insert(0, llm::Message::system(system));
         }
-        model.request(history, tools.specs())
+        model.request(history, registry.specs().to_vec())
     }
 
     /// The conversation before model call `call`, as the tools of

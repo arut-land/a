@@ -12,35 +12,42 @@ func scratch(_ name: String) throws -> URL {
     return dir
 }
 
-/// The settings pane's round trip through `$A_HOME/config.toml`, on the
-/// throwaway home `mise run apple:test` gives (never the default one).
+/// The settings pane's round trip through the daemon, the one writer of
+/// `$A_HOME/config.toml`, on the throwaway home `mise run apple:test` gives
+/// (never the default one).
 @Test(.enabled(if: live != nil))
-func settingsRoundTripThroughAPrivateConfigFile() throws {
+func settingsRoundTripThroughTheDaemon() async throws {
     let client = try Client(helper: live!)
     let home = ProcessInfo.processInfo.environment["A_HOME"]!
-    let before = try client.settings()
-    #expect(before.path == URL(filePath: home).appending(path: "config.toml").path)
+    #expect(client.configFile() == URL(filePath: home).appending(path: "config.toml").path)
+    let before = try await client.settings()
 
     let wanted = Settings(
-        model: "openai:gpt-test", agent: nil,
+        model: "openai:gpt-test", agent: before.agent,
         env: [
             EnvVar(name: "OPENAI_API_KEY", value: "sk-\"quoted\"\nline"),
             EnvVar(name: "OPENAI_BASE_URL", value: "http://127.0.0.1:9/v1"),
-        ],
-        path: "")
-    try client.saveSettings(settings: wanted)
-    var read = try client.settings()
-    read.path = ""
-    #expect(read == wanted)
-    let attributes = try FileManager.default.attributesOfItem(atPath: before.path)
+        ])
+    #expect(try await client.saveSettings(from: before, to: wanted) == wanted)
+    #expect(try await client.settings() == wanted)
+    let attributes = try FileManager.default.attributesOfItem(atPath: client.configFile())
     #expect((attributes[.posixPermissions] as? Int) == 0o600)
 
-    #expect(throws: ClientError.self) {
-        try client.saveSettings(
-            settings: Settings(model: nil, agent: nil, env: [EnvVar(name: "NOT A NAME", value: "")], path: ""))
+    // Another pane's save, from what it loaded before this one saved: only
+    // its own edit lands, so neither undoes the other.
+    var other = before
+    other.env.append(EnvVar(name: "SECOND", value: "2"))
+    let merged = try await client.saveSettings(from: before, to: other)
+    #expect(merged.model == "openai:gpt-test")
+    #expect(Set(merged.env.map(\.name)) == ["OPENAI_API_KEY", "OPENAI_BASE_URL", "SECOND"])
+
+    await #expect(throws: ClientError.self) {
+        try await client.saveSettings(
+            from: merged,
+            to: Settings(model: nil, agent: nil, env: [EnvVar(name: "NOT A NAME", value: "")]))
     }
     // Back to how it was, so other tests see their defaults.
-    try client.saveSettings(settings: before)
+    _ = try await client.saveSettings(from: merged, to: before)
 }
 
 @Test(.enabled(if: live != nil))

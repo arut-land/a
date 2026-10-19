@@ -184,24 +184,31 @@ public final class SessionStore {
     }
 }
 
-/// The daemon's sessions.
+/// The daemon's sessions, newest first, as the daemon pushes them over one
+/// connection whenever one changes.
 @Observable
 public final class SessionListStore {
     public private(set) var sessions: [SessionInfo] = []
     public var problem: String?
 
-    @ObservationIgnored private let client: Client
+    @ObservationIgnored private let watch: SessionWatch
 
     public init(client: Client) {
-        self.client = client
+        self.watch = SessionWatch(client: client)
     }
 
-    public func refresh() async {
-        do {
-            sessions = try await client.sessions().reversed()
-            problem = nil
-        } catch {
-            problem = error.localizedDescription
+    /// Follows the list until the task is cancelled, calling `changed`
+    /// after each update.
+    public func follow(_ changed: () -> Void = {}) async {
+        let updates = watch.updates()
+        watch.start()
+        for await update in updates {
+            if let problem = update.problem {
+                self.problem = problem
+            } else {
+                (sessions, problem) = (update.sessions.reversed(), nil)
+            }
+            changed()
         }
     }
 }

@@ -1,14 +1,16 @@
 //! What a dying daemon leaves behind: a report per crash under `crash/`,
-//! and a breaker that stops clients respawning a daemon that keeps dying
-//! soon after it starts.
+//! and a breaker that stops a daemon that keeps dying soon after it starts
+//! from serving again.
 //!
 //! The running daemon locks `run/daemon.pid` and records itself in it
-//! ([`Record`]); a clean exit empties it. A record found unlocked is a
+//! ([`Record`]); a clean exit empties it. The lock is taken by the client
+//! that starts the daemon and handed to it, so it is never free while one
+//! runs, and only the daemon holding it reaps or counts crashes. A record found unlocked is a
 //! daemon that died without exiting: killed, aborted, or crashed by a
 //! signal. A panic hook also writes the reason, when there is one.
 
 use std::fmt;
-use std::fs::{self, File, OpenOptions};
+use std::fs::{self, File};
 use std::io::{self, Write};
 use std::panic::{self, PanicHookInfo};
 use std::path::{Path, PathBuf};
@@ -24,9 +26,9 @@ const KEEP: usize = 20;
 /// breaker; one that lived longer starts the count again.
 pub const YOUNG: Duration = Duration::from_secs(60);
 
-/// Consecutive young deaths after which clients stop respawning the daemon
-/// until `a daemon restart`. `A_CRASH_LIMIT` overrides it; 0 turns the
-/// breaker off.
+/// Consecutive young deaths after which a starting daemon refuses to serve
+/// until `a daemon restart`. `[daemon] crash_limit` overrides it; 0 turns
+/// the breaker off.
 pub const LIMIT: u32 = 3;
 
 /// Who holds the daemon lock: what `run/daemon.pid` says.
@@ -108,12 +110,9 @@ impl Crashes {
         }
     }
 
-    /// Whether clients should stop respawning the daemon.
-    pub fn tripped(&self) -> bool {
-        let limit = std::env::var("A_CRASH_LIMIT")
-            .ok()
-            .and_then(|v| v.parse().ok())
-            .unwrap_or(LIMIT);
+    /// Whether a daemon should refuse to serve, after `limit` young deaths
+    /// in a row (0 for never).
+    pub const fn tripped(&self, limit: u32) -> bool {
         limit > 0 && self.young >= limit
     }
 }
@@ -185,24 +184,6 @@ pub fn reap(home: &Home, pid_file: &mut File) -> io::Result<Option<Record>> {
     fs::create_dir_all(home.run_dir())?;
     fs::write(breaker_file(home), format!("{count}\n"))?;
     Ok(Some(dead))
-}
-
-/// Opens the daemon's record and, if no daemon holds it, notes one that
-/// died holding it; see [`reap`]. For clients about to start a daemon.
-pub fn reap_unlocked(home: &Home) -> io::Result<Option<Record>> {
-    let mut file = match OpenOptions::new()
-        .read(true)
-        .write(true)
-        .open(home.daemon_pid_file())
-    {
-        Ok(file) => file,
-        Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(None),
-        Err(e) => return Err(e),
-    };
-    if file.try_lock().is_err() {
-        return Ok(None);
-    }
-    reap(home, &mut file)
 }
 
 /// Writes a report on every panic to `dir`, then runs the hook that was
@@ -295,9 +276,9 @@ mod tests {
         Home::from(root)
     }
 
-    /// Reaps `record` as a client that took the daemon lock would. Not
-    /// through [`reap_unlocked`]: a process the other tests fork holds this
-    /// process's open files, and so their locks, until it execs.
+    /// Reaps `record` as a daemon holding the lock would, without taking
+    /// it: a process the other tests fork holds this process's open files,
+    /// and so their locks, until it execs.
     fn died(home: &Home, record: &Record) -> Option<Record> {
         fs::write(home.daemon_pid_file(), record.to_string()).unwrap();
         let mut file = File::options()
@@ -334,18 +315,16 @@ mod tests {
             token: None,
             build: "b1".into(),
         };
-        assert_eq!(reap_unlocked(&home).unwrap(), None, "no record");
         for n in 1..=LIMIT {
-            assert!(!Crashes::of(&home).tripped());
+            assert!(!Crashes::of(&home).tripped(LIMIT));
             assert_eq!(died(&home, &young).as_ref(), Some(&young));
             assert_eq!(Crashes::of(&home).young, n);
         }
         let crashes = Crashes::of(&home);
-        assert!(crashes.tripped());
+        assert!(crashes.tripped(LIMIT) && !crashes.tripped(0));
         let report = fs::read_to_string(crashes.last.unwrap()).unwrap();
         assert!(report.contains("pid 999999") && report.contains("without shutting down"));
         assert_eq!(fs::read_to_string(home.daemon_pid_file()).unwrap(), "");
-        assert_eq!(reap_unlocked(&home).unwrap(), None, "already reaped");
 
         // One that ran a while is not a loop.
         let old = Record {
@@ -382,7 +361,7 @@ mod tests {
         let crashes = Crashes::of(&home);
         fs::remove_dir_all(home.crash_dir().parent().unwrap()).unwrap();
         assert_eq!(crashes.young, 1);
-        assert!(!crashes.tripped());
+        assert!(!crashes.tripped(LIMIT));
     }
 
     /// A daemon that reaps its predecessor records itself in its place.
