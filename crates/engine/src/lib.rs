@@ -621,16 +621,29 @@ impl Answers {
     }
 }
 
-/// Writes what `outbox` hands out until it closes.
+/// Writes what `outbox` hands out until it closes, as many frames as are
+/// ready at a time, up to [`WRITE_BATCH`] bytes.
 #[cfg(unix)]
 fn write_out(mut conn: UnixStream, outbox: &Outbox) {
+    let mut batch = Vec::new();
     while let Some(frame) = outbox.next() {
-        if conn.write_all(frame.as_bytes()).is_err() {
+        batch.extend_from_slice(frame.as_bytes());
+        while batch.len() < WRITE_BATCH
+            && let Some(frame) = outbox.try_next()
+        {
+            batch.extend_from_slice(frame.as_bytes());
+        }
+        if conn.write_all(&batch).is_err() {
             outbox.abandon();
             return;
         }
+        batch.clear();
     }
 }
+
+/// How many bytes of ready frames go to a client in one write.
+#[cfg(unix)]
+const WRITE_BATCH: usize = 64 << 10;
 
 #[cfg(unix)]
 fn handle(daemon: &Daemon, life: &Lifecycle, conn: &UnixStream) -> io::Result<()> {

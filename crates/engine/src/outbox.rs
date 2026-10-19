@@ -195,7 +195,6 @@ impl Outbox {
     }
 
     /// The next frame to write if there is one now.
-    #[cfg(test)]
     pub fn try_next(&self) -> Option<Frame> {
         self.queue().step()
     }
