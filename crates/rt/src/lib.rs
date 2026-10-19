@@ -5,13 +5,10 @@
 //! drives a future to completion on the calling thread. [`EventSink`] is
 //! the observability seam, free when off.
 
-mod block;
 pub mod channel;
 mod events;
 #[cfg(feature = "threads")]
 mod threads;
-#[cfg(feature = "threads")]
-mod timer;
 
 #[cfg(feature = "smol")]
 mod smol;
@@ -23,8 +20,8 @@ use std::pin::Pin;
 use std::sync::{Arc, Condvar, Mutex, MutexGuard, PoisonError};
 use std::time::Duration;
 
-pub use block::block_on;
 pub use events::{Event, EventSink, Noop, Stderr};
+pub use pollster::block_on;
 #[cfg(feature = "threads")]
 pub use threads::Threads;
 

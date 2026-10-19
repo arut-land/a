@@ -406,132 +406,77 @@ impl Live {
 /// newline, and lines a carriage return overwrote. Passes on whole lines.
 #[derive(Default)]
 struct Clean {
-    /// The start of a character split across chunks.
-    partial: Vec<u8>,
-    esc: Esc,
-    line: String,
+    parser: vte::Parser,
+    line: Line,
+}
+
+#[derive(Default)]
+struct Line {
+    text: String,
     /// A carriage return ended the text so far: the next character starts
     /// the line over, unless it is the newline of a CRLF.
     cr: bool,
 }
 
-#[derive(Clone, Copy, Default, PartialEq, Eq)]
-enum Esc {
-    #[default]
-    No,
-    Started,
-    /// `ESC` and intermediate bytes, as in `ESC ( B`.
-    Intermediate,
-    /// `ESC [`: up to a final byte.
-    Csi,
-    /// `ESC ]`: up to BEL or `ESC \`.
-    Osc,
-    OscTail,
-}
-
 impl Clean {
     fn feed(&mut self, bytes: &[u8], out: &mut impl FnMut(&str)) {
-        let mut joined;
-        let mut rest = if self.partial.is_empty() {
-            bytes
-        } else {
-            joined = std::mem::take(&mut self.partial);
-            joined.extend_from_slice(bytes);
-            &joined[..]
+        let mut sink = Sink {
+            line: &mut self.line,
+            out,
         };
-        loop {
-            match std::str::from_utf8(rest) {
-                Ok(text) => {
-                    self.chars(text, out);
-                    return;
-                }
-                Err(e) => {
-                    let (valid, after) = rest.split_at(e.valid_up_to());
-                    self.chars(std::str::from_utf8(valid).unwrap_or_default(), out);
-                    let Some(bad) = e.error_len() else {
-                        self.partial = after.to_vec();
-                        return;
-                    };
-                    self.char('\u{FFFD}', out);
-                    rest = &after[bad..];
-                }
-            }
-        }
-    }
-
-    fn chars(&mut self, text: &str, out: &mut impl FnMut(&str)) {
-        for c in text.chars() {
-            self.char(c, out);
-        }
-    }
-
-    fn char(&mut self, c: char, out: &mut impl FnMut(&str)) {
-        match self.esc {
-            Esc::No => {}
-            Esc::Started => {
-                self.esc = match c {
-                    '[' => Esc::Csi,
-                    ']' => Esc::Osc,
-                    ' '..='/' => Esc::Intermediate,
-                    _ => Esc::No,
-                };
-                return;
-            }
-            Esc::Intermediate => {
-                if !(' '..='/').contains(&c) {
-                    self.esc = Esc::No;
-                }
-                return;
-            }
-            Esc::Csi => {
-                if ('@'..='~').contains(&c) {
-                    self.esc = Esc::No;
-                }
-                return;
-            }
-            Esc::Osc => {
-                match c {
-                    '\x07' => self.esc = Esc::No,
-                    '\x1b' => self.esc = Esc::OscTail,
-                    _ => {}
-                }
-                return;
-            }
-            Esc::OscTail => {
-                self.esc = if c == '\\' { Esc::No } else { Esc::Osc };
-                return;
-            }
-        }
-        match c {
-            '\x1b' => self.esc = Esc::Started,
-            '\n' => {
-                self.cr = false;
-                self.line.push('\n');
-                out(&self.line);
-                self.line.clear();
-            }
-            '\r' => self.cr = true,
-            c if c.is_control() && c != '\t' => {}
-            c => {
-                if std::mem::take(&mut self.cr) {
-                    self.line.clear();
-                }
-                self.line.push(c);
-                if self.line.len() >= LONG_LINE {
-                    out(&self.line);
-                    self.line.clear();
-                }
-            }
-        }
+        self.parser.advance(&mut sink, bytes);
     }
 
     fn finish(&mut self, out: &mut impl FnMut(&str)) {
-        if !std::mem::take(&mut self.partial).is_empty() {
-            self.char('\u{FFFD}', out);
+        // CAN ends whatever is incomplete: a split character becomes U+FFFD,
+        // an unterminated sequence is dropped.
+        self.feed(b"\x18", out);
+        if !self.line.text.is_empty() {
+            out(&self.line.text);
+            self.line.text.clear();
         }
-        if !self.line.is_empty() {
-            out(&self.line);
-            self.line.clear();
+    }
+}
+
+/// What the parser finds, folded into the line.
+struct Sink<'a, F> {
+    line: &'a mut Line,
+    out: &'a mut F,
+}
+
+impl<F: FnMut(&str)> Sink<'_, F> {
+    fn push(&mut self, c: char) {
+        let line = &mut *self.line;
+        if std::mem::take(&mut line.cr) {
+            line.text.clear();
+        }
+        line.text.push(c);
+        if line.text.len() >= LONG_LINE {
+            (self.out)(&line.text);
+            line.text.clear();
+        }
+    }
+}
+
+impl<F: FnMut(&str)> vte::Perform for Sink<'_, F> {
+    fn print(&mut self, c: char) {
+        if !c.is_control() {
+            self.push(c);
+        }
+    }
+
+    fn execute(&mut self, byte: u8) {
+        match byte {
+            b'\n' => {
+                let line = &mut *self.line;
+                line.cr = false;
+                line.text.push('\n');
+                (self.out)(&line.text);
+                line.text.clear();
+            }
+            b'\r' => self.line.cr = true,
+            b'\t' => self.push('\t'),
+            _ => {}
         }
     }
 }
