@@ -14,7 +14,7 @@ use std::time::Duration;
 use boltffi::{EventSubscription, export};
 use client::{Connection, Endpoint, Reader, Writer};
 use protocol::view::Link;
-use protocol::{ClientDecl, ClientMsg, Environment, SessionId, Target};
+use protocol::{ClientDecl, ClientMsg, Environment, SessionId, SettingsChange, Target};
 use rt::{Runtime, Threads};
 use sys::install::CliLink;
 use sys::{Home, Staged};
@@ -147,48 +147,29 @@ impl Client {
         client::diagnose(&self.daemon.home).pid
     }
 
-    /// `$A_HOME/config.toml`, as the settings pane shows it.
-    pub fn settings(&self) -> Result<Settings, ClientError> {
-        let path = self.daemon.home.config_file();
-        let config = sys::Config::read(&path)?;
-        Ok(Settings {
-            model: config.model,
-            agent: config.agent,
-            env: config
-                .env
-                .into_iter()
-                .map(|(name, value)| EnvVar { name, value })
-                .collect(),
-            path: path.display().to_string(),
-        })
+    /// `$A_HOME/config.toml`, where the settings are kept.
+    pub fn config_file(&self) -> String {
+        self.daemon.home.config_file().display().to_string()
     }
 
-    /// Writes `settings` to `$A_HOME/config.toml` (0600, replaced whole),
-    /// keeping comments and keys the pane does not show. The daemon reads
-    /// the file again when it changes.
-    pub fn save_settings(&self, settings: Settings) -> Result<(), ClientError> {
-        let given = |s: Option<String>| s.map(|s| s.trim().to_owned()).filter(|s| !s.is_empty());
-        let mut env = BTreeMap::new();
-        for EnvVar { name, value } in settings.env {
-            let name = name.trim().to_owned();
-            if name.is_empty() {
-                continue;
-            }
-            if !sys::config::is_var_name(&name) {
-                return Err(ClientError::InvalidArgument {
-                    message: format!("not a variable name: {name}"),
-                });
-            }
-            env.insert(name, value);
-        }
-        let config = sys::Config {
-            model: given(settings.model),
-            agent: given(settings.agent),
-            env,
-            ..sys::Config::default()
-        };
-        config.write(&self.daemon.home.config_file())?;
-        Ok(())
+    /// The model and provider variables sessions fall back on, as the
+    /// daemon has them.
+    pub async fn settings(&self) -> Result<Settings, ClientError> {
+        let daemon = self.daemon.clone();
+        blocking(move || Ok(daemon.connect()?.settings(None)?.into())).await
+    }
+
+    /// Saves the user's edit of the settings `from` into `to`. Only what
+    /// changed is sent, so the daemon, the file's one writer, keeps what
+    /// another client saved meanwhile. Returns the settings as saved.
+    pub async fn save_settings(
+        &self,
+        from: Settings,
+        to: Settings,
+    ) -> Result<Settings, ClientError> {
+        let change = change(from, to)?;
+        let daemon = self.daemon.clone();
+        blocking(move || Ok(daemon.connect()?.settings(Some(change))?.into())).await
     }
 
     /// What `a` resolves to with `dir` in front of `search` (a `PATH`;
@@ -371,6 +352,43 @@ impl Drop for Session {
             let _ = writer.send(&ClientMsg::Detach);
         }
     }
+}
+
+/// What the user changed going from `from` to `to`, with names and values
+/// trimmed as the pane shows them and blank names skipped.
+fn change(from: Settings, to: Settings) -> Result<SettingsChange, ClientError> {
+    let vars = |vars: Vec<EnvVar>| -> BTreeMap<String, String> {
+        vars.into_iter()
+            .map(|EnvVar { name, value }| (name.trim().to_owned(), value))
+            .filter(|(name, _)| !name.is_empty())
+            .collect()
+    };
+    let (old, new) = (vars(from.env), vars(to.env));
+    if let Some(bad) = new.keys().find(|name| !sys::config::is_var_name(name)) {
+        return Err(ClientError::InvalidArgument {
+            message: format!("not a variable name: {bad}"),
+        });
+    }
+    let mut env: BTreeMap<String, Option<String>> = old
+        .keys()
+        .filter(|name| !new.contains_key(*name))
+        .map(|name| (name.clone(), None))
+        .collect();
+    env.extend(
+        new.into_iter()
+            .filter(|(name, value)| old.get(name) != Some(value))
+            .map(|(name, value)| (name, Some(value))),
+    );
+    let given = |s: Option<String>| s.map_or_else(String::new, |s| s.trim().to_owned());
+    let changed = |old: Option<String>, new: Option<String>| {
+        let (old, new) = (given(old), given(new));
+        (old != new).then_some(new)
+    };
+    Ok(SettingsChange {
+        model: changed(from.model, to.model),
+        agent: changed(from.agent, to.agent),
+        env,
+    })
 }
 
 fn parse_id(id: &str) -> Result<SessionId, ClientError> {

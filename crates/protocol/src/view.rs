@@ -377,6 +377,7 @@ impl SessionView {
             }
             DaemonMsg::Welcome { .. }
             | DaemonMsg::Sessions { .. }
+            | DaemonMsg::Settings { .. }
             | DaemonMsg::Ack { .. }
             | DaemonMsg::Unknown { .. } => None,
         }

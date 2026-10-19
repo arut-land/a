@@ -110,3 +110,26 @@ fn an_edited_home_file_applies_without_a_restart() {
     assert_eq!(s.agent(&ws), agent::Kind::Chat);
     std::fs::remove_dir_all(root).unwrap();
 }
+
+#[test]
+fn a_change_made_through_the_daemon_applies_at_once() {
+    let (root, ws) = dirs("change", Some("model = \"aa:m\"\n"), None);
+    let s = settings(&root);
+    assert_eq!(s.model(&ws).unwrap(), "aa:m");
+    let path = root.join("config.toml");
+    let before = std::fs::metadata(&path).unwrap().modified().unwrap();
+    let change = SettingsChange {
+        model: Some("bb:m".into()),
+        ..SettingsChange::default()
+    };
+    s.home.change(&change).unwrap();
+    // As a coarse clock leaves it: the same size and time as before.
+    std::fs::File::options()
+        .write(true)
+        .open(&path)
+        .unwrap()
+        .set_modified(before)
+        .unwrap();
+    assert_eq!(s.model(&ws).unwrap(), "bb:m");
+    std::fs::remove_dir_all(root).unwrap();
+}

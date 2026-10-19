@@ -13,8 +13,8 @@ use std::time::{Duration, Instant};
 
 use protocol::view::SessionList;
 use protocol::{
-    Cap, Caps, ClientDecl, ClientMsg, DaemonMsg, Environment, SessionSummary, Target, read_frame,
-    write_frame,
+    Cap, Caps, ClientDecl, ClientMsg, DaemonMsg, Environment, HomeSettings, SessionSummary,
+    SettingsChange, Target, read_frame, write_frame,
 };
 use sys::crash::{Crashes, Record};
 use sys::{Home, Signal, Staged};
@@ -105,6 +105,27 @@ impl Connection {
     /// Sends each of `msgs`.
     pub fn send_all(&mut self, msgs: &[ClientMsg]) -> io::Result<()> {
         msgs.iter().try_for_each(|msg| self.writer.send(msg))
+    }
+
+    /// The home settings, after making `change` to them. The daemon is
+    /// their one writer; a change it refuses (a bad variable name, a file
+    /// it cannot parse) is `InvalidInput`, saying why.
+    pub fn settings(mut self, change: Option<SettingsChange>) -> io::Result<HomeSettings> {
+        if !self.welcome.caps.has(Cap::Settings) {
+            return Err(io::Error::new(
+                io::ErrorKind::Unsupported,
+                "the daemon is older than this a; restart it to edit settings",
+            ));
+        }
+        self.writer.send(&ClientMsg::Settings { change })?;
+        let (settings, error) = self.reader.until(|msg| match msg {
+            DaemonMsg::Settings { settings, error } => Some((settings, error)),
+            _ => None,
+        })?;
+        match error {
+            Some(error) => Err(io::Error::new(io::ErrorKind::InvalidInput, error)),
+            None => Ok(settings),
+        }
     }
 
     /// The daemon's sessions.

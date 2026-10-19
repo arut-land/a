@@ -19,8 +19,9 @@ use std::{mem, thread};
 
 use outbox::{Next, Outbox};
 use protocol::{
-    Activity, Cap, Caps, ClientDecl, ClientMsg, DaemonMsg, Environment, Frame, Origin, PROTO,
-    Rejection, Residency, Role, SessionId, SessionSummary, Target, Versions, read_frame,
+    Activity, Cap, Caps, ClientDecl, ClientMsg, DaemonMsg, Environment, Frame, HomeSettings,
+    Origin, PROTO, Rejection, Residency, Role, SessionId, SessionSummary, SettingsChange, Target,
+    Versions, read_frame,
 };
 use session::{Attachment, Session, Shared};
 use store::{Header, Jsonl, LogStore};
@@ -770,6 +771,7 @@ impl Conn<'_> {
                 ClientMsg::List => self.reply(&DaemonMsg::Sessions {
                     sessions: self.daemon.list(),
                 }),
+                ClientMsg::Settings { change } => self.reply(&self.settings(change.as_ref())),
                 ClientMsg::Detach => break,
                 ClientMsg::Hello { .. }
                 | ClientMsg::Input { .. }
@@ -780,6 +782,25 @@ impl Conn<'_> {
         }
         self.outbox.unfollow();
         Ok(())
+    }
+
+    /// The home settings, after `change` if this client may make it.
+    fn settings(&self, change: Option<&SettingsChange>) -> DaemonMsg {
+        let home = &self.daemon.shared.models.settings.home;
+        let (file, refused) = match change {
+            None => (home.get(), None),
+            Some(_) if self.decl.role == Role::Viewer => {
+                (home.get(), Some("this client is a viewer".to_owned()))
+            }
+            Some(change) => home
+                .change(change)
+                .map_or_else(|e| (home.get(), Some(e)), |file| (file, None)),
+        };
+        let (settings, error) = match &*file {
+            Ok(file) => (config::shown(file), refused),
+            Err(e) => (HomeSettings::default(), refused.or_else(|| Some(e.clone()))),
+        };
+        DaemonMsg::Settings { settings, error }
     }
 
     fn set_env(&self, s: &Attachment, env: Environment) {

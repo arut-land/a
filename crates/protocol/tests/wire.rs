@@ -17,8 +17,8 @@ use std::path::{Path, PathBuf};
 use protocol::view::SessionView;
 use protocol::{
     Activity, Body, Cap, Caps, Card, ClientDecl, ClientMsg, DaemonMsg, Decision, Decode, Entry,
-    Environment, Installed, Origin, Outcome, Overrides, PROTO, Permission, Recap, Rejection,
-    Residency, Role, SessionId, SessionSummary, Target,
+    Environment, HomeSettings, Installed, Origin, Outcome, Overrides, PROTO, Permission, Recap,
+    Rejection, Residency, Role, SessionId, SessionSummary, SettingsChange, Target,
 };
 use serde_json::json;
 use uuid::Uuid;
@@ -188,6 +188,25 @@ fn client_samples() -> Vec<Sample<ClientMsg>> {
             ClientMsg::Interrupt {
                 client_seq: Some(3),
             },
+        ),
+        gated(
+            "settings",
+            ClientMsg::Settings { change: None },
+            Cap::Settings,
+        ),
+        gated(
+            "settings_change",
+            ClientMsg::Settings {
+                change: Some(SettingsChange {
+                    model: Some("openai:gpt-6-luna".into()),
+                    agent: Some(String::new()),
+                    env: BTreeMap::from([
+                        ("OPENAI_API_KEY".into(), Some("sk-x".into())),
+                        ("OLD".into(), None),
+                    ]),
+                }),
+            },
+            Cap::Settings,
         ),
     ]
 }
@@ -586,6 +605,26 @@ fn daemon_samples() -> Vec<Sample<DaemonMsg>> {
                 message: "call 9 is not waiting for approval".into(),
             },
             Cap::Ack,
+        ),
+        gated(
+            "settings",
+            DaemonMsg::Settings {
+                settings: HomeSettings {
+                    model: Some("openai:gpt-6-luna".into()),
+                    agent: None,
+                    env: BTreeMap::from([("OPENAI_API_KEY".into(), "sk-x".into())]),
+                },
+                error: None,
+            },
+            Cap::Settings,
+        ),
+        gated(
+            "settings_refused",
+            DaemonMsg::Settings {
+                settings: HomeSettings::default(),
+                error: Some("not a variable name: \"A B\"".into()),
+            },
+            Cap::Settings,
         ),
     ]
 }

@@ -9,8 +9,8 @@ use std::time::{Duration, Instant};
 
 use protocol::view::SessionView;
 use protocol::{
-    Body, Caps, ClientDecl, ClientMsg, DaemonMsg, Entry, Origin, PROTO, Rejection, Role, Target,
-    read_frame, write_frame,
+    Body, Caps, ClientDecl, ClientMsg, DaemonMsg, Entry, Origin, PROTO, Rejection, Role,
+    SettingsChange, Target, read_frame, write_frame,
 };
 use store::{Header, Jsonl, LogStore};
 use sys::Home;
@@ -430,4 +430,70 @@ fn a_client_that_falls_behind_is_caught_up_from_the_log() {
     let whole = SessionView::from_log(session.id, "/w".into(), &log);
     assert_eq!(caught_up, 1);
     assert_eq!(view.state_hash(), whole.state_hash());
+}
+
+/// Sends `change` on a fresh connection and returns the answer.
+fn change_settings(fixture: &Fixture, change: Option<SettingsChange>) -> DaemonMsg {
+    let mut peer = fixture.connect();
+    peer.send(&hello(Caps::ALL));
+    peer.send(&ClientMsg::Settings { change });
+    assert!(matches!(peer.recv(), DaemonMsg::Welcome { .. }));
+    peer.recv()
+}
+
+#[test]
+fn settings_saved_at_once_by_many_clients_all_land() {
+    let fixture = Arc::new(Fixture::new("settings"));
+    std::fs::write(
+        fixture.root.join("config.toml"),
+        "# mine\nmodel = \"a:b\"\n[env]\nKEPT = \"1\"\n",
+    )
+    .unwrap();
+    let savers: Vec<_> = (0..4)
+        .map(|client| {
+            let fixture = Arc::clone(&fixture);
+            std::thread::spawn(move || {
+                for n in 0..10 {
+                    let change = SettingsChange {
+                        env: [(format!("K{client}_{n}"), Some(n.to_string()))].into(),
+                        ..SettingsChange::default()
+                    };
+                    let answer = change_settings(&fixture, Some(change));
+                    assert!(
+                        matches!(answer, DaemonMsg::Settings { error: None, .. }),
+                        "{answer:?}"
+                    );
+                }
+            })
+        })
+        .collect();
+    for saver in savers {
+        saver.join().unwrap();
+    }
+    let DaemonMsg::Settings {
+        settings,
+        error: None,
+    } = change_settings(&fixture, None)
+    else {
+        panic!("no settings");
+    };
+    assert_eq!(settings.model.as_deref(), Some("a:b"));
+    assert_eq!(settings.env.len(), 41, "{:?}", settings.env);
+    let text = std::fs::read_to_string(fixture.root.join("config.toml")).unwrap();
+    assert!(text.starts_with("# mine\n"), "{text}");
+
+    // A change the file cannot take is refused, and says why.
+    let bad = SettingsChange {
+        env: [("NOT A NAME".into(), Some("x".into()))].into(),
+        ..SettingsChange::default()
+    };
+    let DaemonMsg::Settings {
+        settings: unchanged,
+        error: Some(error),
+    } = change_settings(&fixture, Some(bad))
+    else {
+        panic!("not refused");
+    };
+    assert!(error.contains("not a variable name"), "{error}");
+    assert_eq!(unchanged, settings);
 }

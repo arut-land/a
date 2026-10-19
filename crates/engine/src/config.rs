@@ -10,15 +10,14 @@ use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 use std::time::SystemTime;
 
-use protocol::{Environment, Overrides};
+use protocol::{Environment, HomeSettings, Overrides, SettingsChange};
 
 use crate::lock;
 
 /// The model a session calls when no layer names one.
 pub const DEFAULT_MODEL: &str = "gpt-6-luna";
 
-/// A `config.toml`, read by [`sys::config`], which the app's settings pane
-/// also writes.
+/// A `config.toml`, read and edited by [`sys::config`].
 pub use sys::config::Config as File;
 
 /// The file at `path`; a missing one is empty.
@@ -37,8 +36,9 @@ fn stamp(path: &Path) -> Stamp {
 /// A file as last read, or why it could not be.
 pub type Loaded = Arc<Result<File, String>>;
 
-/// A file read again only once it changes, so edits apply without a
-/// daemon restart.
+/// A file read again only once it changes, so hand edits apply without a
+/// daemon restart. Clients change it through the daemon ([`Watched::change`]),
+/// which is then its one writer.
 pub struct Watched {
     path: PathBuf,
     read: Mutex<Option<(Stamp, Loaded)>>,
@@ -68,6 +68,41 @@ impl Watched {
                 file
             }
         }
+    }
+
+    /// Makes `change` to the file as it is on disk, and keeps what it
+    /// wrote as read: changes are made one at a time, so none undoes
+    /// another, and the next read sees this one even when the rewrite left
+    /// the file's size and time as they were.
+    pub fn change(&self, change: &SettingsChange) -> Result<Loaded, String> {
+        let mut read = lock(&self.read);
+        let mut file = load(&self.path)?;
+        let given = |value: &str| Some(value.trim().to_owned()).filter(|v| !v.is_empty());
+        if let Some(model) = &change.model {
+            file.model = given(model);
+        }
+        if let Some(agent) = &change.agent {
+            file.agent = given(agent);
+        }
+        for (name, value) in &change.env {
+            match value {
+                Some(value) => file.env.insert(name.clone(), value.clone()),
+                None => file.env.remove(name),
+            };
+        }
+        file.write(&self.path).map_err(|e| e.to_string())?;
+        let file = Arc::new(Ok(file));
+        *read = Some((stamp(&self.path), Arc::clone(&file)));
+        Ok(file)
+    }
+}
+
+/// What a settings pane shows of `file`.
+pub fn shown(file: &File) -> HomeSettings {
+    HomeSettings {
+        model: file.model.clone(),
+        agent: file.agent.clone(),
+        env: file.env.clone(),
     }
 }
 

@@ -581,11 +581,20 @@ pub enum Cap {
     /// The daemon takes [`ClientMsg::Steer`]; the first ones drop a
     /// connection that sends it.
     Steer,
+    /// The daemon takes [`ClientMsg::Settings`]: it is the one writer of
+    /// `$A_HOME/config.toml`.
+    Settings,
 }
 
 impl Cap {
     /// Every capability this build knows.
-    pub const ALL: [Self; 4] = [Self::Snapshot, Self::Ack, Self::Declare, Self::Steer];
+    pub const ALL: [Self; 5] = [
+        Self::Snapshot,
+        Self::Ack,
+        Self::Declare,
+        Self::Steer,
+        Self::Settings,
+    ];
 
     pub const fn name(self) -> &'static str {
         match self {
@@ -593,6 +602,7 @@ impl Cap {
             Self::Ack => "ack",
             Self::Declare => "declare",
             Self::Steer => "steer",
+            Self::Settings => "settings",
         }
     }
 
@@ -664,6 +674,35 @@ impl<'de> Deserialize<'de> for Caps {
             .filter(|c| names.iter().any(|n| n == c.name()))
             .collect())
     }
+}
+
+/// The defaults in `$A_HOME/config.toml` a settings pane edits: what a
+/// model call uses when its session does not say.
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct HomeSettings {
+    /// `host[@protocol]:model`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub model: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub agent: Option<String>,
+    /// Provider variables, such as `OPENAI_API_KEY`.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub env: BTreeMap<String, String>,
+}
+
+/// A change to the [`HomeSettings`]: only what it names changes, so two
+/// clients saving at once never undo each other's change.
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SettingsChange {
+    /// The new model; empty removes it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub model: Option<String>,
+    /// The new agent; empty removes it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub agent: Option<String>,
+    /// Variables to set, or with `null`, remove.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub env: BTreeMap<String, Option<String>>,
 }
 
 /// The protocol versions a peer speaks, `min..=max`.
@@ -837,6 +876,13 @@ tagged! {
         },
         List,
         Detach,
+        /// Asks for the [`HomeSettings`], after making `change` to them if
+        /// there is one; answered with [`DaemonMsg::Settings`]. Only sent
+        /// with [`Cap::Settings`].
+        Settings {
+            #[serde(default, skip_serializing_if = "Option::is_none")]
+            change: Option<SettingsChange>,
+        },
         /// Answers the [`DaemonMsg::Ask`] for tool call `call`.
         Approve {
             call: u64,
@@ -884,7 +930,8 @@ impl ClientMsg {
             | Self::Declare(_)
             | Self::Environment(_)
             | Self::List
-            | Self::Detach => None,
+            | Self::Detach
+            | Self::Settings { .. } => None,
         }
     }
 }
@@ -933,6 +980,13 @@ tagged! {
         },
         Sessions {
             sessions: Vec<SessionSummary>,
+        },
+        /// The answer to [`ClientMsg::Settings`]: the settings as they are
+        /// now, and why its change was not made, if it was not.
+        Settings {
+            settings: HomeSettings,
+            #[serde(default, skip_serializing_if = "Option::is_none")]
+            error: Option<String>,
         },
         /// Sent after `Synced` when the replay held entries.
         Recap(Recap),
@@ -1044,6 +1098,7 @@ impl DaemonMsg {
             | Self::Mismatch { .. }
             | Self::Draining
             | Self::Sessions { .. }
+            | Self::Settings { .. }
             | Self::Error { .. }
             | Self::Ack { .. }
             | Self::Rejected { .. }
@@ -1225,6 +1280,7 @@ fn known_msg(t: &str) -> bool {
             | "delta"
             | "synced"
             | "sessions"
+            | "settings"
             | "recap"
             | "ask"
             | "error"
@@ -1599,6 +1655,10 @@ mod tests {
             },
             DaemonMsg::Synced { seq: 1 },
             DaemonMsg::Sessions { sessions: vec![] },
+            DaemonMsg::Settings {
+                settings: HomeSettings::default(),
+                error: None,
+            },
             DaemonMsg::Recap(Recap::default()),
             DaemonMsg::Ask {
                 call: 1,
@@ -1635,6 +1695,7 @@ mod tests {
                 | DaemonMsg::Delta { .. }
                 | DaemonMsg::Synced { .. }
                 | DaemonMsg::Sessions { .. }
+                | DaemonMsg::Settings { .. }
                 | DaemonMsg::Recap(_)
                 | DaemonMsg::Ask { .. }
                 | DaemonMsg::Error { .. }

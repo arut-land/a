@@ -88,6 +88,7 @@ impl From<io::Error> for ClientError {
             | io::ErrorKind::BrokenPipe
             | io::ErrorKind::ConnectionReset => Self::Closed,
             io::ErrorKind::InvalidData => Self::Protocol { message },
+            io::ErrorKind::InvalidInput => Self::InvalidArgument { message },
             _ => Self::Unavailable { message },
         }
     }
@@ -127,8 +128,8 @@ impl From<&SessionSummary> for SessionInfo {
     }
 }
 
-/// `$A_HOME/config.toml`: what a model call uses when its session does not
-/// say; see `sys::Config`.
+/// The defaults in `$A_HOME/config.toml`: what a model call uses when its
+/// session does not say. The daemon keeps them; see `protocol::HomeSettings`.
 #[data]
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Settings {
@@ -138,8 +139,20 @@ pub struct Settings {
     pub agent: Option<String>,
     /// Provider variables, such as `OPENAI_API_KEY` and `OPENAI_BASE_URL`.
     pub env: Vec<EnvVar>,
-    /// The file, for display; ignored when saving.
-    pub path: String,
+}
+
+impl From<protocol::HomeSettings> for Settings {
+    fn from(s: protocol::HomeSettings) -> Self {
+        Self {
+            model: s.model,
+            agent: s.agent,
+            env: s
+                .env
+                .into_iter()
+                .map(|(name, value)| EnvVar { name, value })
+                .collect(),
+        }
+    }
 }
 
 #[data]
