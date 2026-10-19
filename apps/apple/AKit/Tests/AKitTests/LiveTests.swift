@@ -29,7 +29,7 @@ func aLiveSessionChatsRunsAnApprovedToolAndIsListed() async throws {
     try FileManager.default.createDirectory(at: workspace, withIntermediateDirectories: true)
 
     let store = SessionStore(session: Session(client: client))
-    await store.open(.new(workspace: workspace.path))
+    store.open(.new(workspace: workspace.path))
     try await eventually("live") { store.link == .live }
     let id = try #require(store.sessionId)
 
@@ -39,8 +39,9 @@ func aLiveSessionChatsRunsAnApprovedToolAndIsListed() async throws {
     }
 
     await store.send("$ echo hello")
-    try await eventually("the ask") { !store.pendingAsks.isEmpty }
-    guard case .tool(let call, _, _, _, _, _, _, _) = store.pendingAsks[0] else { return }
+    try await eventually("the ask") { store.turn.asking != nil }
+    let call = store.turn.asking!
+    #expect(store.items.contains { if case .tool(call, _, _, _, _, _, _, .asking) = $0 { true } else { false } })
     await store.approve(call: call, approved: true)
     try await eventually("the outcome") {
         store.items.contains {
@@ -60,7 +61,7 @@ func aLiveSessionChatsRunsAnApprovedToolAndIsListed() async throws {
 
     // A second client of the same session folds to the same state.
     let other = SessionStore(session: Session(client: client))
-    await other.open(.id(id: id))
+    other.open(.id(id: id))
     try await eventually("the replay and recap") {
         other.link == .live && other.seq == store.seq && other.recap != nil
     }
@@ -69,18 +70,23 @@ func aLiveSessionChatsRunsAnApprovedToolAndIsListed() async throws {
     #expect(other.recap?.line.hasPrefix("recap · you: $ echo hello · ran bash") == true)
 
     // A running call stops on an interrupt.
-    #expect(!store.running)
+    #expect(!store.turn.running && !store.turn.canInterrupt)
+    // Typed lines go through the commands every client shares.
+    #expect(await store.submit("/help") == .help)
+    #expect(store.commands.contains { $0.usage == "/interrupt" })
     await store.send("$ sleep 30")
-    try await eventually("the second ask") { !store.pendingAsks.isEmpty }
-    guard case .tool(let sleep, _, _, _, _, _, _, _) = store.pendingAsks[0] else { return }
-    await store.approve(call: sleep, approved: true)
-    try await eventually("the call to run") { store.running }
-    await store.interrupt()
-    try await eventually("the call to stop") { !store.running }
+    try await eventually("the second ask") { store.turn.asking != nil }
+    await store.approve(call: store.turn.asking!, approved: true)
+    try await eventually("the call to run") { store.turn.running && store.turn.asking == nil }
+    #expect(store.turn.canInterrupt)
+    #expect(await store.submit("/interrupt") == nil)
+    try await eventually("the call to stop") { !store.turn.running }
 
     await store.detach()
     await other.detach()
     #expect(store.problem == nil && other.problem == nil)
+    // A detach is never a lost daemon.
+    #expect(store.link == .detached && other.link == .detached)
     try await eventually("the list to show them gone") {
         list.sessions.contains { $0.id == id && $0.clients == 0 }
     }
@@ -89,9 +95,9 @@ func aLiveSessionChatsRunsAnApprovedToolAndIsListed() async throws {
 
 /// `item` as a client that was not asked sees it.
 func unasked(_ item: ViewItem) -> ViewItem {
-    guard case .tool(let call, let tool, let input, let title, let approval, let outcome, let card, _) = item
+    guard case .tool(let call, let tool, let input, let title, let approval, let outcome, let card, let phase) = item
     else { return item }
     return .tool(
         call: call, tool: tool, inputJson: input, title: title, approval: approval, outcome: outcome,
-        card: card, asked: false)
+        card: card, phase: phase == .asking ? .waiting : phase)
 }

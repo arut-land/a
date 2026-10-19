@@ -1,139 +1,197 @@
-//! What a tab's chat page shows, folded from the daemon's messages, and the
-//! patches that bring the page up to date: the transcript whole once an
-//! attach is synced, then each change alone.
+//! What a tab's chat page shows of its session client, and the patches
+//! that bring the page up to date: the transcript whole once an attach is
+//! synced, then each change alone.
 
-use protocol::DaemonMsg;
-use protocol::view::{Change, Link, SessionView};
+use client::{Attach, Cmd, Effect, Env, Event, Link, SessionClient};
+use protocol::view::{Change, Update};
+use protocol::{SessionId, Target};
 
 use crate::patch::Patch;
 use crate::view::{self, End, EndRow, ItemRow, Transcript, html};
 
-#[derive(Default)]
 pub struct Page {
-    pub view: SessionView,
+    pub client: SessionClient,
     /// The daemon's latest complaint, until the transcript moves on.
     error: Option<String>,
-    /// The daemon is gone for good.
-    ended: bool,
     /// The end the page shows, once it shows the transcript.
     shown: Option<End>,
+    /// How many items the page knew of.
+    known: usize,
+    /// Text streamed since the last patch, for one reply.
+    streamed: Option<(u64, String)>,
     /// Events not yet sent.
     out: Vec<u8>,
 }
 
 impl Page {
+    /// A page for `session`, which keeps the environment it has; and the
+    /// attach it asks the driver for.
+    pub fn new(session: SessionId) -> (Self, Vec<Effect>) {
+        let mut client = SessionClient::new(Env::Keep);
+        let open = client.attach(Attach::new(Target::Id(session), Env::Keep));
+        let page = Self {
+            client,
+            error: None,
+            shown: None,
+            known: 0,
+            streamed: None,
+            out: Vec::new(),
+        };
+        (page, open)
+    }
+
     /// The events not yet sent.
     pub fn take(&mut self) -> Vec<u8> {
         std::mem::take(&mut self.out)
     }
 
-    /// The daemon went away, as `error` says if it says why.
-    pub fn end(&mut self, error: Option<String>) {
-        if error.is_some() {
-            self.error = error;
+    /// Whether the transcript will not change again.
+    pub const fn ended(&self) -> bool {
+        matches!(self.client.link(), Link::Ended(_) | Link::Wedged(_))
+    }
+
+    /// Takes in what the driver reports; returns what the driver is to do.
+    pub fn event(&mut self, event: Event) -> Vec<Effect> {
+        let effects = self.client.step(event);
+        self.absorb(effects)
+    }
+
+    /// A line typed in the composer, parsed as every client parses it.
+    pub fn line(&mut self, text: &str) -> Vec<Effect> {
+        match client::parse(text, self.client.turn().asking) {
+            None => Vec::new(),
+            Some(cmd) => self.command(cmd),
         }
-        self.ended = true;
-        self.show_end();
+    }
+
+    pub fn command(&mut self, cmd: Cmd) -> Vec<Effect> {
+        let effects = match cmd {
+            // This page's own controls do these, or nothing does.
+            Cmd::Help | Cmd::Sessions | Cmd::Open(_) | Cmd::Detach | Cmd::RefreshEnv => {
+                vec![Effect::Notice("not available on the web page".to_owned())]
+            }
+            cmd => self.client.run(cmd),
+        };
+        self.absorb(effects)
+    }
+
+    /// Patches in what the client's effects change and hands back the
+    /// driver's.
+    pub fn absorb(&mut self, effects: Vec<Effect>) -> Vec<Effect> {
+        let mut io = Vec::new();
+        for effect in effects {
+            match effect {
+                Effect::View(update) => self.update(update),
+                Effect::Notice(text) => self.error = Some(text),
+                Effect::Link if self.ended() => {
+                    if let Link::Ended(client::End::Lost(why)) = self.client.link()
+                        && self.shown.is_none()
+                    {
+                        self.error = Some(format!("Could not attach: {why}"));
+                    }
+                    self.flush();
+                    self.show_end();
+                }
+                Effect::Link | Effect::Sessions => {}
+                effect => io.push(effect),
+            }
+        }
+        io
+    }
+
+    fn synced(&self) -> bool {
+        matches!(self.client.link(), Link::Live { synced: true, .. })
     }
 
     fn end_row(&self) -> End {
+        let ended = self.ended();
         End {
-            running: !self.ended && self.view.running(),
+            running: !ended && self.client.turn().running,
             error: self.error.clone(),
-            ended: self.ended,
+            ended,
         }
     }
 
-    /// Folds a batch in and adds what it changed to the events to send.
-    /// Until the attach is synced (again, after an upgrade) the page is
-    /// left as it is; then it is shown whole.
-    pub fn fold(&mut self, batch: &[DaemonMsg]) {
-        // Consecutive deltas of one reply go out as one.
-        let mut streamed: Option<(u64, String)> = None;
-        for msg in batch {
-            let before = self.view.items.len();
-            let Some(update) = self.view.fold(msg) else {
-                continue;
-            };
-            match &update.change {
-                Change::Error { message } => self.error = Some(message.clone()),
-                Change::Added { .. } => self.error = None,
-                _ => {}
-            }
-            let change = match update.change {
-                Change::Synced => {
-                    self.flush(&mut streamed);
-                    self.shown = Some(self.end_row());
-                    self.show_all();
-                    continue;
-                }
-                change if self.view.link == Link::Live && self.shown.is_some() => change,
-                _ => continue,
-            };
-            if let Change::Delta { call, text } = change {
-                match &mut streamed {
-                    Some((c, t)) if *c == call => t.push_str(&text),
-                    _ => {
-                        self.flush(&mut streamed);
-                        streamed = Some((call, text));
-                    }
-                }
-                continue;
-            }
-            self.flush(&mut streamed);
-            match change {
-                // The first item takes the place of the note that there is
-                // none; a call asked about may not have been shown yet.
-                Change::Added { index: 0, .. }
-                | Change::Snapshot { .. }
-                | Change::Recap(_)
-                | Change::Attached { reset: true, .. } => self.show_all(),
-                Change::Asked { .. } if self.view.items.len() > before => self.show_all(),
-                Change::Added { item, .. } => {
-                    let item = html(ItemRow {
-                        item: &item,
-                        view: &self.view,
-                    });
-                    self.patch(&Patch::Before {
-                        selector: "#end",
-                        html: &item,
-                    });
-                }
-                Change::Updated { item, .. } | Change::Asked { item, .. } => {
-                    let item = html(ItemRow {
-                        item: &item,
-                        view: &self.view,
-                    });
-                    self.patch(&Patch::Replace(&item));
-                }
-                _ => {}
-            }
+    /// Patches in what `update` changed, after a batch of them is shown by
+    /// [`Page::settle`]. Until the attach is synced (again, after an
+    /// upgrade) the page is left as it is; then it is shown whole.
+    fn update(&mut self, update: Update) {
+        let before = std::mem::replace(&mut self.known, self.client.view().items.len());
+        match &update.change {
+            Change::Error { message } => self.error = Some(message.clone()),
+            Change::Added { .. } => self.error = None,
+            _ => {}
         }
-        self.flush(&mut streamed);
-        if self.view.link == Link::Live {
+        let change = match update.change {
+            Change::Synced => {
+                self.flush();
+                self.shown = Some(self.end_row());
+                self.show_all();
+                return;
+            }
+            change if self.synced() && self.shown.is_some() => change,
+            _ => return,
+        };
+        if let Change::Delta { call, text } = change {
+            match &mut self.streamed {
+                Some((c, t)) if *c == call => t.push_str(&text),
+                _ => {
+                    self.flush();
+                    self.streamed = Some((call, text));
+                }
+            }
+            return;
+        }
+        self.flush();
+        let view = self.client.view();
+        match change {
+            // The first item takes the place of the note that there is
+            // none; a call asked about may not have been shown yet.
+            Change::Added { index: 0, .. }
+            | Change::Snapshot { .. }
+            | Change::Recap(_)
+            | Change::Attached { reset: true, .. } => self.show_all(),
+            Change::Asked { .. } if view.items.len() > before => self.show_all(),
+            Change::Added { item, .. } => {
+                let item = html(ItemRow { item: &item, view });
+                self.patch(&Patch::Before {
+                    selector: "#end",
+                    html: &item,
+                });
+            }
+            Change::Updated { item, .. } | Change::Asked { item, .. } => {
+                let item = html(ItemRow { item: &item, view });
+                self.patch(&Patch::Replace(&item));
+            }
+            _ => {}
+        }
+    }
+
+    /// Ends a batch of updates: what streamed goes out, and the end shows
+    /// again if it changed.
+    pub fn settle(&mut self) {
+        self.flush();
+        if self.synced() {
             self.show_end();
         }
     }
 
     /// Adds the text streamed into reply `call` to its element; the first
     /// text replaces the reply's "thinking…".
-    fn flush(&mut self, streamed: &mut Option<(u64, String)>) {
-        let Some((call, text)) = streamed.take() else {
+    fn flush(&mut self) {
+        let Some((call, text)) = self.streamed.take() else {
             return;
         };
-        let started = self
-            .view
+        let view = self.client.view();
+        let started = view
             .streaming
             .as_ref()
             .is_some_and(|s| s.call == call && s.text.len() == text.len());
         if started {
-            let Some(item) = self.view.items.iter().find(|i| i.key() == call) else {
+            let Some(item) = view.items.iter().find(|i| i.key() == call) else {
                 return;
             };
-            let item = html(ItemRow {
-                item,
-                view: &self.view,
-            });
+            let item = html(ItemRow { item, view });
             self.patch(&Patch::Replace(&item));
         } else {
             let selector = view::reply_id(call);
@@ -147,7 +205,7 @@ impl Page {
     fn show_all(&mut self) {
         let end = self.shown.clone().unwrap_or_default();
         let transcript = html(Transcript {
-            view: &self.view,
+            view: self.client.view(),
             end: &end,
         });
         self.patch(&Patch::Replace(&transcript));
@@ -180,9 +238,44 @@ impl Page {
 mod tests {
     use std::path::PathBuf;
 
-    use protocol::{Body, DaemonMsg, Entry, Json, Outcome, SessionId};
+    use client::{Event, Welcome};
+    use protocol::{Body, Caps, DaemonMsg, Entry, Json, Outcome, SessionId};
 
     use super::Page;
+
+    fn connected(id: u64) -> Event {
+        Event::Connected {
+            id,
+            welcome: Welcome {
+                proto: 1,
+                caps: Caps::ALL,
+                client: 1,
+            },
+            remote: false,
+            commands: Vec::new(),
+        }
+    }
+
+    /// A page whose connection is up.
+    fn page() -> Page {
+        let (mut page, _) = Page::new(SessionId::new());
+        page.event(connected(1));
+        page
+    }
+
+    impl Page {
+        /// Folds `msgs` in as one batch from the open connection.
+        fn fold(&mut self, msgs: &[DaemonMsg]) {
+            for msg in msgs {
+                let id = self.client.connection();
+                self.event(Event::Msg {
+                    id,
+                    msg: msg.clone(),
+                });
+            }
+            self.settle();
+        }
+    }
 
     fn entry(seq: u64, body: Body) -> DaemonMsg {
         DaemonMsg::Entry(Entry::new(seq, 1, body))
@@ -203,7 +296,7 @@ mod tests {
 
     /// A page synced to a session holding one message, and shown.
     fn synced() -> Page {
-        let mut page = Page::default();
+        let mut page = page();
         page.fold(&[
             DaemonMsg::Attached {
                 session: SessionId::new(),
@@ -224,7 +317,7 @@ mod tests {
 
     #[test]
     fn the_transcript_shows_whole_once_synced() {
-        let mut page = Page::default();
+        let mut page = page();
         page.fold(&[
             DaemonMsg::Attached {
                 session: SessionId::new(),
@@ -303,10 +396,16 @@ mod tests {
         let mut page = synced();
         page.fold(&[DaemonMsg::Draining]);
         assert_eq!(events(&mut page), NONE);
+        let session = page.client.view().session.unwrap();
+        page.event(Event::Closed {
+            id: 1,
+            why: "drained".into(),
+        });
+        page.event(connected(2));
         // The new daemon replays what was missed, then syncs.
         page.fold(&[
             DaemonMsg::Attached {
-                session: page.view.session.unwrap(),
+                session,
                 workspace: PathBuf::from("/w"),
             },
             user(2, "again"),
@@ -321,14 +420,20 @@ mod tests {
     #[test]
     fn the_end_says_the_daemon_went_away() {
         let mut page = synced();
-        page.end(None);
+        page.event(Event::Closed {
+            id: 1,
+            why: "gone".into(),
+        });
         let ended = events(&mut page);
         assert_eq!(ended.len(), 1, "{ended:?}");
         assert!(ended[0].contains("reload to reconnect"), "{ended:?}");
 
         // Before the transcript showed, the end comes with it.
-        let mut page = Page::default();
-        page.end(Some("Could not attach: refused".into()));
+        let (mut page, _) = Page::new(SessionId::new());
+        page.event(Event::Failed {
+            id: 1,
+            why: "refused".into(),
+        });
         let failed = events(&mut page);
         assert!(
             failed[0].contains("<div id=\"transcript\"") && failed[0].contains("refused"),

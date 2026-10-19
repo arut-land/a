@@ -1,6 +1,6 @@
 //! Transcript items as rows: messages, replies, and tool call cards.
 
-use protocol::view::{Approval, Item, Status, call_title, decision_line, output_text};
+use protocol::view::{Item, Phase, Status, call_title, decision_line, output_text};
 use protocol::{Json, Outcome};
 use serde_json::Value;
 
@@ -32,11 +32,7 @@ pub struct Look {
 /// Whether an item will not change any more: an inline viewport prints
 /// those into the scrollback.
 pub fn settled(item: &Item) -> bool {
-    match item {
-        Item::Reply { status, .. } => *status != Status::Running,
-        Item::Tool { outcome, .. } | Item::Command { outcome, .. } => outcome.is_some(),
-        _ => true,
-    }
+    item.phase().is_none_or(Phase::settled)
 }
 
 pub fn rows(item: &Item, width: usize, look: Look) -> Vec<Line> {
@@ -66,19 +62,17 @@ pub fn rows(item: &Item, width: usize, look: Look) -> Vec<Line> {
             call,
             tool,
             input,
-            approval,
             outcome,
             card: shown,
-            asked,
+            ..
         } => card(
             &Card {
                 call: *call,
                 title: call_title(tool, input, shown.as_ref()),
                 input: input.value().get("command").is_none().then_some(input),
-                approval: *approval,
+                phase: item.phase().unwrap_or(Phase::Running),
                 outcome: outcome.as_ref(),
                 shown: shown.as_ref(),
-                asked: *asked,
             },
             width,
             look,
@@ -93,10 +87,9 @@ pub fn rows(item: &Item, width: usize, look: Look) -> Vec<Line> {
                 call: *call,
                 title: format!("/{name} {args}").trim_end().to_owned(),
                 input: None,
-                approval: None,
+                phase: item.phase().unwrap_or(Phase::Running),
                 outcome: outcome.as_ref(),
                 shown: None,
-                asked: false,
             },
             width,
             look,
@@ -212,18 +205,17 @@ struct Card<'a> {
     title: String,
     /// Input the title does not show, for verbose mode.
     input: Option<&'a Json>,
-    approval: Option<Approval>,
+    phase: Phase,
     outcome: Option<&'a Outcome>,
     /// How the tool presents it.
     shown: Option<&'a protocol::Card>,
-    asked: bool,
 }
 
 /// A tool call: a header with its state (a click folds it), its output's
 /// tail, and while it waits for this client, the approval buttons.
 fn card(c: &Card, width: usize, look: Look) -> Vec<Line> {
     let toggle = Action::Toggle(c.call);
-    let (status, style) = match (c.outcome, c.approval) {
+    let (status, style) = match (c.outcome, c.phase) {
         (Some(Outcome::Done { output }), _) => {
             let note = output_text(output, c.shown)
                 .map(|(_, note)| note)
@@ -237,8 +229,8 @@ fn card(c: &Card, width: usize, look: Look) -> Vec<Line> {
         }
         (Some(Outcome::Failed { .. }), _) => ("✗ failed".to_owned(), BAD),
         (Some(Outcome::Interrupted { .. }), _) => ("⚠ interrupted".to_owned(), WARN),
-        (None, Some(Approval::Pending)) => ("? waiting for approval".to_owned(), ASK),
-        (None, Some(Approval::Denied)) => ("⊘ not approved".to_owned(), BAD),
+        (None, Phase::Asking | Phase::Waiting) => ("? waiting for approval".to_owned(), ASK),
+        (None, Phase::Denied) => ("⊘ not approved".to_owned(), BAD),
         (None, _) => ("running…".to_owned(), BUSY),
     };
     let body = output_rows(c, width, look.verbose);
@@ -280,8 +272,8 @@ fn card(c: &Card, width: usize, look: Look) -> Vec<Line> {
         }
         out.extend(body.into_iter().skip(hidden));
     }
-    if c.outcome.is_none() && c.approval == Some(Approval::Pending) {
-        out.push(if c.asked {
+    if matches!(c.phase, Phase::Asking | Phase::Waiting) {
+        out.push(if c.phase == Phase::Asking {
             Line::from(vec![
                 Span::new("  allow this call?  ", ASK),
                 Span::button("[ y  yes ]", OK.bold(), Action::Approve(c.call, true)),
@@ -354,6 +346,7 @@ fn output_rows(c: &Card, width: usize, verbose: bool) -> Vec<Line> {
 
 #[cfg(test)]
 mod tests {
+    use protocol::view::Approval;
     use serde_json::json;
 
     use super::*;

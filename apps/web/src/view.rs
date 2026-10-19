@@ -4,7 +4,8 @@
 //! end (`#end`) follows the items, and new items go in before it.
 use hypertext::prelude::*;
 use protocol::view::{
-    Approval, Item, SessionView, Status, Usage, call_title, decision_line, output_text, recap_line,
+    Approval, Item, Phase, SessionView, Status, Usage, call_title, decision_line, output_text,
+    recap_line,
 };
 use protocol::{Card, Json, Outcome, SessionId, SessionSummary};
 
@@ -168,9 +169,9 @@ pub fn item_row<'a>(item: &'a Item, view: &'a SessionView) -> impl Renderable {
                     ReplyRow call=(*call) text=(text) status=(status) usage=(usage.as_ref())
                         live=(view.streaming.as_ref().filter(|s| s.call == *call).map(|s| s.text.as_str()));
                 }
-                Item::Tool { call, tool, input, approval, outcome, card, asked } => {
+                Item::Tool { call, tool, input, approval, outcome, card, .. } => {
                     ToolCard call=(*call) line=(&call_title(tool, input, card.as_ref())) approval=(*approval)
-                        asked=(*asked) outcome=(outcome.as_ref()) card=(card.as_ref());
+                        phase=(item.phase().unwrap_or(Phase::Running)) outcome=(outcome.as_ref()) card=(card.as_ref());
                 }
                 Item::Command { name, args, outcome, .. } => {
                     div style=(style::NOTE) {
@@ -257,11 +258,10 @@ fn tool_card<'a>(
     call: u64,
     line: &'a str,
     approval: Option<Approval>,
-    asked: bool,
+    phase: Phase,
     outcome: Option<&'a Outcome>,
     card: Option<&'a Card>,
 ) -> impl Renderable {
-    let waiting = approval == Some(Approval::Pending);
     maud! {
         div style=(style::TOOL) {
             div style=(style::TOOL_HEAD) {
@@ -271,11 +271,11 @@ fn tool_card<'a>(
                     Some(Approval::Denied) => { span style=(style::BAD) { "not approved" } }
                     _ => {}
                 }
-                @if outcome.is_none() && !waiting {
+                @if phase == Phase::Running {
                     span style=(style::DIM) { "running…" }
                 }
             }
-            @if waiting && asked {
+            @if phase == Phase::Asking {
                 div style=(style::ASK) {
                     span { "Run this?" }
                     button style=(style::BUTTON)
@@ -284,7 +284,7 @@ fn tool_card<'a>(
                         data-on:click={ "@post('/api/approve?call=" (call) "&ok=0')" } { "Deny" }
                 }
             }
-            @if waiting && !asked {
+            @if phase == Phase::Waiting {
                 div style=(style::ASK) { span style=(style::DIM) { "waiting for approval" } }
             }
             @match outcome {

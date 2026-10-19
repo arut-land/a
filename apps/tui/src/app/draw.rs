@@ -2,14 +2,15 @@
 
 use std::path::Path;
 
-use protocol::view::{Item, Link, Usage, call_title, recap_line};
+use client::{End, Link};
+use protocol::view::{Item, Usage, call_title, recap_line};
 
 use ratatui_core::style::{Color, Style};
 
 use super::super::render::{Canvas, Viewport, ellipsize, fit};
 use super::super::text::{Action, Line, Span, width_of, wrap};
 use super::super::view::{self, ASK, MUTED, USER};
-use super::{App, Conn, HELP, Overlay};
+use super::{App, HELP, Overlay};
 
 /// The input shows at most this many rows; it scrolls past them.
 const INPUT_ROWS: usize = 8;
@@ -20,7 +21,8 @@ impl App {
     pub fn scrollback(&mut self, width: u16) -> Vec<Line> {
         let mut out = Vec::new();
         while self
-            .view
+            .client
+            .view()
             .items
             .get(self.committed)
             .is_some_and(view::settled)
@@ -35,7 +37,7 @@ impl App {
     /// row within it).
     fn live(&mut self, width: usize, n: usize) -> Vec<(usize, usize)> {
         let mut out = Vec::new();
-        for i in (self.committed..self.view.items.len()).rev() {
+        for i in (self.committed..self.client.view().items.len()).rev() {
             if out.len() == n {
                 break;
             }
@@ -51,7 +53,13 @@ impl App {
     fn bottom(&mut self, width: usize) -> (Vec<Line>, Option<(u16, u16)>) {
         let summary = self.summary();
         let mut out = Vec::new();
-        if let Some(recap) = self.view.recap.as_ref().filter(|_| !self.recap_hidden) {
+        if let Some(recap) = self
+            .client
+            .view()
+            .recap
+            .as_ref()
+            .filter(|_| !self.recap_hidden)
+        {
             let cyan = Style::new().fg(Color::Cyan);
             let banner = [Span::new(recap_line(recap), cyan)];
             let first = [Span::new("↺ ", cyan)];
@@ -68,7 +76,7 @@ impl App {
             }
             out.extend(rows);
         }
-        let asked = summary.asked.map(|i| &self.view.items[i]);
+        let asked = summary.asked.map(|i| &self.client.view().items[i]);
         if let Some(Item::Tool {
             call,
             tool,
@@ -104,9 +112,9 @@ impl App {
             // letter under it.
             let hint = if asked.is_some() {
                 " y approves · n denies"
-            } else if self.view.session.is_none() {
+            } else if self.client.view().session.is_none() {
                 ""
-            } else if summary.running {
+            } else if self.client.turn().running {
                 " ctrl-c stops the tool · /help"
             } else {
                 " message the agent · /help"
@@ -129,28 +137,36 @@ impl App {
     }
 
     fn status(&self, width: usize, reply: Option<usize>) -> Line {
-        let (state, style) = match (&self.conn, self.view.link) {
-            (Conn::Lost(why), _) => (
+        let attached = self.client.view().session.is_some();
+        let (state, style) = match self.client.link() {
+            Link::Ended(End::Lost(why)) => (
                 format!("✗ disconnected: {why}"),
                 Style::new().fg(Color::Red),
             ),
-            (Conn::Reconnecting, _) | (_, Link::Draining) => (
+            Link::Ended(End::Detached) => ("○ detached".to_owned(), MUTED),
+            Link::Wedged(_) => (
+                "✗ the daemon is not responding".to_owned(),
+                Style::new().fg(Color::Red),
+            ),
+            Link::Reconnecting { .. } | Link::Draining => (
                 "↻ daemon upgrading; reconnecting".to_owned(),
                 Style::new().fg(Color::Yellow),
             ),
-            (Conn::Connecting, _) => ("◌ connecting".to_owned(), MUTED),
-            (_, Link::Connecting) => ("○ not attached".to_owned(), MUTED),
-            (_, Link::Replaying) => ("↻ replaying".to_owned(), Style::new().fg(Color::Blue)),
-            (_, Link::Live) => ("● live".to_owned(), Style::new().fg(Color::Green)),
+            Link::Connecting => ("◌ connecting".to_owned(), MUTED),
+            Link::Live { .. } if !attached => ("○ not attached".to_owned(), MUTED),
+            Link::Live { synced: false, .. } => {
+                ("↻ replaying".to_owned(), Style::new().fg(Color::Blue))
+            }
+            Link::Live { .. } => ("● live".to_owned(), Style::new().fg(Color::Green)),
         };
         let mut left = vec![Span::new(state, style)];
-        if let Some(session) = self.view.session {
+        if let Some(session) = self.client.view().session {
             left.push(Span::new(
                 format!("  {}", session.short()),
                 Style::new().bold(),
             ));
         }
-        let model = reply.and_then(|i| match &self.view.items[i] {
+        let model = reply.and_then(|i| match &self.client.view().items[i] {
             Item::Reply { model, .. } => Some(model.clone()),
             _ => None,
         });
@@ -165,9 +181,12 @@ impl App {
         let used: usize = left.iter().map(|s| width_of(&s.text)).sum();
         // The workspace gets what room is left.
         let room = width.saturating_sub(used + width_of(&right) + 4);
-        if self.view.session.is_some() && room > 8 {
+        if self.client.view().session.is_some() && room > 8 {
             left.push(Span::new(
-                format!("  {}", ellipsize(&tilde(&self.view.workspace), room)),
+                format!(
+                    "  {}",
+                    ellipsize(&tilde(&self.client.view().workspace), room)
+                ),
                 MUTED,
             ));
         }
@@ -189,11 +208,11 @@ impl App {
         match self.overlay.as_ref()? {
             Overlay::Picker { selected } => {
                 out.push(Line::plain("sessions", Style::new().bold()));
-                if self.sessions.sessions.is_empty() {
+                if self.client.sessions().is_empty() {
                     out.push(Line::plain("  none yet", MUTED));
                 }
                 for (n, s) in self.listed().enumerate() {
-                    let here = if Some(s.id) == self.view.session {
+                    let here = if Some(s.id) == self.client.view().session {
                         "•"
                     } else {
                         " "
@@ -235,10 +254,11 @@ impl App {
             }
             Overlay::Help => {
                 out.push(Line::plain("keys and commands", Style::new().bold()));
-                for (key, what) in HELP {
+                let keys = HELP.iter().map(|&(key, what)| (key.to_owned(), what));
+                for (key, what) in keys.chain(client::help(self.client.commands())) {
                     out.push(Line::from(vec![
-                        Span::new(fit(key, 22), Style::new().fg(Color::Cyan)),
-                        Span::new(*what, Style::new()),
+                        Span::new(fit(&key, 22), Style::new().fg(Color::Cyan)),
+                        Span::new(what.to_owned(), Style::new()),
                     ]));
                 }
                 out.push(Line::default());

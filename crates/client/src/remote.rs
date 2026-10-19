@@ -83,6 +83,7 @@ fn bridge(host: &str, script: &str, token: &str) -> io::Result<Option<Connection
         writer: Writer::new(Box::new(stdin)),
         remote: Some(remote),
         welcome: Welcome::default(),
+        commands: Vec::new(),
     }))
 }
 
