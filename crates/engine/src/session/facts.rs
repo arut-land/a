@@ -1,10 +1,11 @@
 //! What a session's log says, read back: the conversation the model sees,
 //! the agent's state, what waits for the user or the agent, and a recap.
 
-use std::collections::{HashMap, HashSet, VecDeque};
+use std::collections::{HashMap, VecDeque};
 
 use agent::{Action, Agent, Input, Toolset};
 use llm::{Message, ToolMessage, ToolResult};
+use protocol::ledger::Ledger;
 use protocol::{Body, DaemonMsg, Decision, Entry, Outcome, Recap};
 
 /// The conversation before `before`, derived from the log's facts. A model
@@ -152,138 +153,61 @@ fn commits(action: &Action, body: &Body) -> bool {
     }
 }
 
-/// The input queued and not yet taken up, in order, as `(seq, text,
-/// steer)`. Each `user` or `command` entry takes up the oldest waiting, and
-/// a `steer` entry the one it names.
-pub fn untaken(entries: &[Entry]) -> VecDeque<(u64, String, bool)> {
-    let mut waiting = VecDeque::new();
-    for e in entries {
-        match &e.body {
-            Body::Queued { text, steer } => waiting.push_back((e.seq, text.clone(), *steer)),
-            Body::User { .. } | Body::Command { .. } => drop(waiting.pop_front()),
-            Body::Steer { queued, .. } => waiting.retain(|(seq, ..)| seq != queued),
-            _ => {}
-        }
-    }
-    waiting
-}
-
-/// The model and tool calls in `entries` that have an outcome.
-pub fn finished(entries: &[Entry]) -> HashSet<u64> {
-    entries
-        .iter()
-        .filter_map(|e| match e.body {
-            Body::ToolResult { call, .. } | Body::ModelResult { call, .. } => Some(call),
-            _ => None,
-        })
-        .collect()
-}
-
-/// The output tool call `call` committed as it ran, if any.
-pub fn partial(entries: &[Entry], call: u64) -> Option<String> {
-    let mut output: Option<String> = None;
-    for e in entries.iter().filter(|e| e.seq > call) {
-        if let Body::Progress { call: of, text } = &e.body
-            && *of == call
-        {
-            output.get_or_insert_default().push_str(text);
-        }
-    }
-    output
-}
-
-/// The session's inbox: the tool calls asked and not yet answered, in the
-/// order they were asked.
-pub fn inbox(entries: &[Entry]) -> Vec<u64> {
-    let answered: HashSet<u64> = entries
-        .iter()
-        .filter_map(|e| match e.body {
-            Body::Hook {
-                decision:
-                    Decision::Approval {
-                        call: Some(call), ..
-                    },
-                ..
-            } => Some(call),
-            _ => None,
-        })
-        .collect();
-    entries
-        .iter()
-        .filter_map(|e| match e.body {
-            Body::Ask { call } if !answered.contains(&call) => Some(call),
-            _ => None,
-        })
-        .collect()
-}
-
-/// What a client is sent for the ask about tool call `call`.
-pub fn ask(entries: &[Entry], call: u64) -> Option<DaemonMsg> {
-    let at = entries.binary_search_by_key(&call, |e| e.seq).ok()?;
-    match &entries[at].body {
-        Body::ToolCall { tool, input, .. } => Some(DaemonMsg::Ask {
-            call,
-            tool: tool.clone(),
-            input: input.clone(),
-        }),
-        _ => None,
-    }
+/// What a client is sent for the ask about tool call `call`, while it
+/// waits.
+pub fn ask(ledger: &Ledger, call: u64) -> Option<DaemonMsg> {
+    let (tool, input) = ledger.asked(call)?;
+    Some(DaemonMsg::Ask {
+        call,
+        tool: tool.to_owned(),
+        input: input.clone(),
+    })
 }
 
 /// What a client attaching after `since` is told: the user's last message
-/// and what the agent did since. `None` when nothing worth telling is new,
-/// such as only an environment.
-pub fn recap(entries: &[Entry], since: u64) -> Option<Recap> {
-    if entries.last().is_none_or(|e| e.seq <= since) {
+/// and what the agent did since, `reply` its last answer. `None` when
+/// nothing worth telling is new, such as only an environment.
+pub fn recap(ledger: &Ledger, reply: Option<&str>, since: u64) -> Option<Recap> {
+    if ledger.seq() <= since {
         return None;
     }
-    let asks = inbox(entries);
-    let start = entries
-        .iter()
-        .rposition(|e| matches!(e.body, Body::User { .. }));
-    let mut recap = Recap {
-        prompt: start.and_then(|at| match &entries[at].body {
-            Body::User { text } => Some(short(text)),
-            _ => None,
-        }),
-        asks: u32::try_from(asks.len()).unwrap_or(u32::MAX),
-        ..Recap::default()
+    let recap = Recap {
+        prompt: ledger.prompt().map(short),
+        tools: ledger.turn_tools().to_vec(),
+        failed: ledger.turn_failed(),
+        running: ledger.turn_running(),
+        reply: reply.map(short),
+        asks: u32::try_from(ledger.inbox().len()).unwrap_or(u32::MAX),
     };
-    let after = &entries[start.map_or(0, |at| at + 1)..];
-    let finished = finished(after);
-    for e in after {
-        let open = !finished.contains(&e.seq) && !asks.contains(&e.seq);
+    (recap != Recap::default()).then_some(recap)
+}
+
+/// The answer of the last reply among `entries`, as a recap tells it: an
+/// assistant message, or a model reply with text.
+pub fn reply(entries: &[Entry]) -> Option<String> {
+    let mut reply = None;
+    for e in entries {
         match &e.body {
-            Body::ToolCall { tool, .. } => {
-                recap.tools.push(tool.clone());
-                recap.running += u32::from(open);
-            }
-            Body::ModelCall { .. } => recap.running += u32::from(open),
-            Body::ToolResult { outcome, .. } | Body::ModelResult { outcome, .. }
-                if !matches!(outcome, Outcome::Done { .. }) =>
-            {
-                recap.failed += 1;
-            }
-            Body::Assistant { text } => recap.reply = Some(short(text)),
+            Body::Assistant { text } => reply = Some(text.clone()),
             Body::ModelResult {
                 outcome: Outcome::Done { output },
                 ..
             } => {
                 let text = llm::Response::from_value(&output.value()).map(|r| r.message.text());
-                if let Ok(text) = text.as_deref()
+                if let Ok(text) = text
                     && !text.is_empty()
                 {
-                    recap.reply = Some(short(text));
+                    reply = Some(text);
                 }
             }
             _ => {}
         }
     }
-    (recap != Recap::default()).then_some(recap)
+    reply
 }
 
 /// The first line of `text`, cut to a recap's width.
-fn short(text: &str) -> String {
+pub(super) fn short(text: &str) -> String {
     const WIDTH: usize = 60;
     let text = text.trim();
     let line = text.lines().next().unwrap_or_default();

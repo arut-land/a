@@ -21,6 +21,7 @@ const MAX_FRAME: u32 = 16 * 1024 * 1024;
 
 mod decode;
 mod json;
+pub mod ledger;
 pub mod view;
 
 pub use json::Json;

@@ -19,6 +19,23 @@ fn bodies(entries: &[Entry]) -> Vec<&Body> {
     entries.iter().map(|e| &e.body).collect()
 }
 
+/// The calls asked about and not yet answered.
+fn inbox(entries: &[Entry]) -> Vec<u64> {
+    Ledger::of(entries).inbox().to_vec()
+}
+
+/// Whether input waits to be taken up.
+fn untaken(entries: &[Entry]) -> Vec<ledger::Queued> {
+    Ledger::of(entries).untaken().iter().cloned().collect()
+}
+
+/// What an attach after `since` is told of `entries`.
+fn recap_of(entries: &[Entry], since: u64) -> Option<protocol::Recap> {
+    let ledger = Ledger::of(entries);
+    let after = entries.partition_point(|e| e.seq <= ledger.turn_start());
+    recap(&ledger, facts::reply(&entries[after..]).as_deref(), since)
+}
+
 /// What entries say, whichever lease wrote them.
 fn facts(entries: &[Entry]) -> Vec<(u64, &Body)> {
     entries.iter().map(|e| (e.seq, &e.body)).collect()
@@ -54,7 +71,7 @@ fn finds_calls_without_outcomes() {
         ),
         entry(5, Body::ModelCall { model: "m".into() }),
     ];
-    let dangling = dangling_calls(&entries);
+    let dangling = dangling_calls(&Ledger::of(&entries));
     assert_eq!(dangling.len(), 2);
     assert_eq!(dangling[0].seq, 3);
     assert_eq!(dangling[0].processes, [(42, "boot".to_owned())]);
@@ -1090,9 +1107,9 @@ fn a_recap_tells_the_last_prompt_and_what_followed() {
         entry(7, Body::Ask { call: 6 }),
         entry(8, call("sleep")),
     ];
-    assert_eq!(recap(&entries, 8), None);
+    assert_eq!(recap_of(&entries, 8), None);
     assert_eq!(
-        recap(&entries, 0),
+        recap_of(&entries, 0),
         Some(protocol::Recap {
             prompt: Some("go on…".into()),
             tools: vec!["sleep".into(), "bash".into(), "sleep".into()],
@@ -1102,11 +1119,11 @@ fn a_recap_tells_the_last_prompt_and_what_followed() {
             asks: 1,
         })
     );
-    let replied = recap(&entries[..2], 1).unwrap();
+    let replied = recap_of(&entries[..2], 1).unwrap();
     assert_eq!(replied.reply.as_deref(), Some("first"));
     let env = entry(1, Body::Environment(Environment::default()));
     assert_eq!(
-        recap(&[env], 0),
+        recap_of(&[env], 0),
         None,
         "an environment alone is nothing to tell"
     );
@@ -1228,7 +1245,7 @@ fn slash_commands_run_without_a_turn_and_input_hooks_rewrite_or_refuse() {
         ]
     );
     assert!(replay(agent::Kind::Echo.agent().as_mut(), &log).is_empty());
-    assert!(untaken(&log).is_empty());
+    assert_eq!(untaken(&log), []);
 
     // A command cut off by a crash is not run again; the input queued
     // behind it is taken up in order.
@@ -1521,7 +1538,7 @@ fn a_steer_reaches_the_running_turn_before_the_model_is_next_asked() {
     assert!(matches!(&log[4].body, Body::Queued { steer: true, .. }));
     let input = script.sent()[1]["input"].to_string();
     assert!(input.contains("Say it twice."), "{input}");
-    assert!(untaken(&log).is_empty());
+    assert_eq!(untaken(&log), []);
 }
 
 #[test]

@@ -14,6 +14,7 @@ use agent::{
     Action, Agent, Cancel, Cx, Decided, DynTool, Facts, Gate, Hooks, Host, Input, Registry, Replay,
     Route, States,
 };
+use protocol::ledger::{self, Ledger, Phase};
 use protocol::view::SessionView;
 use protocol::{
     Activity, Body, Cap, Card, DaemonMsg, Decision, Entry, Environment, Frame, Installed, Json,
@@ -30,9 +31,11 @@ use crate::{Daemon, lock};
 mod facts;
 mod links;
 #[cfg(test)]
+mod oracle;
+#[cfg(test)]
 mod tests;
 
-use facts::{ask, finished, inbox, partial, recap, replay, transcript, untaken};
+use facts::{ask, recap, replay, transcript};
 
 /// What every session runs with.
 pub struct Shared {
@@ -114,6 +117,8 @@ enum Msg {
 
 struct State {
     entries: Vec<Entry>,
+    /// What the entries say, folded as each commits.
+    ledger: Ledger,
     clients: Vec<Outbox>,
 }
 
@@ -198,14 +203,15 @@ impl Session {
         env: Option<Environment>,
     ) -> Arc<Self> {
         let registry = shared.registry.get();
-        if let Err(e) = note_extensions(&header, &mut loaded, &registry) {
+        let mut ledger = Ledger::of(&loaded.entries);
+        if let Err(e) = note_extensions(&header, &mut loaded, &mut ledger, &registry) {
             eprintln!("session {}: recording extensions: {e}", header.id.short());
         }
         let (mailbox, rx) = rt::channel::unbounded();
-        let armed = links::armed(&loaded.entries).count();
+        let armed = ledger.armed().count();
         // A new session has nothing to recover.
         let fresh = loaded.entries.is_empty();
-        let env = env.or_else(|| logged_env(&loaded.entries).cloned());
+        let env = env.or_else(|| ledger.env().cloned());
         let seq = loaded.entries.len() as u64;
         let mut states = registry.states();
         states.replay(&loaded.entries);
@@ -218,6 +224,7 @@ impl Session {
             step: Mutex::new(Arc::clone(&registry)),
             state: Mutex::new(State {
                 entries: loaded.entries,
+                ledger,
                 clients: Vec::new(),
             }),
             log: Mutex::new(loaded.log),
@@ -333,7 +340,7 @@ impl Session {
     /// Answers the ask for tool call `call`; the actor logs the answer and
     /// runs or refuses the call. The first answer wins.
     pub fn answer(&self, call: u64, approved: bool) -> Result<(), String> {
-        if !inbox(&self.lock().entries).contains(&call) {
+        if !self.lock().ledger.inbox().contains(&call) {
             return Err(format!("call {call} is not waiting for approval"));
         }
         let mut answers = lock(&self.answers);
@@ -400,7 +407,7 @@ impl Session {
     /// what it missed, then everything live.
     pub fn attach(&self, client: &Outbox, since: u64) {
         let mut st = self.lock();
-        let frames = self.catch_up_frames(&st.entries, client, since, true);
+        let frames = self.catch_up_frames(&st, client, since, true);
         let follower = client.follow(self.this.clone(), since, frames);
         st.clients.push(follower);
     }
@@ -409,7 +416,7 @@ impl Session {
     /// followed this session as its `following`th.
     pub fn catch_up(&self, client: &Outbox, following: u64, since: u64) {
         let st = self.lock();
-        let frames = self.catch_up_frames(&st.entries, client, since, false);
+        let frames = self.catch_up_frames(&st, client, since, false);
         client.caught_up(following, frames);
     }
 
@@ -418,7 +425,7 @@ impl Session {
     /// and its end, optionally a recap, and the asks still waiting.
     fn catch_up_frames(
         &self,
-        entries: &[Entry],
+        st: &State,
         client: &Outbox,
         since: u64,
         with_recap: bool,
@@ -429,6 +436,7 @@ impl Session {
         })
         .into_iter()
         .collect();
+        let entries = &st.entries;
         let missed = entries.iter().filter(|e| e.seq > since);
         let snapshot = (client.caps().has(Cap::Snapshot) && missed.clone().count() > SNAPSHOT_GAP)
             .then(|| {
@@ -443,11 +451,15 @@ impl Session {
         let mut push = |msg: &DaemonMsg| frames.extend(Frame::new(msg));
         let seq = entries.last().map_or(0, |e| e.seq);
         push(&DaemonMsg::Synced { seq });
-        if with_recap && let Some(recap) = recap(entries, since) {
-            push(&DaemonMsg::Recap(recap));
+        if with_recap {
+            let after = entries.partition_point(|e| e.seq <= st.ledger.turn_start());
+            let reply = facts::reply(&entries[after..]);
+            if let Some(recap) = recap(&st.ledger, reply.as_deref(), since) {
+                push(&DaemonMsg::Recap(recap));
+            }
         }
-        for call in inbox(entries) {
-            if let Some(msg) = ask(entries, call) {
+        for &call in st.ledger.inbox() {
+            if let Some(msg) = ask(&st.ledger, call) {
                 push(&msg);
             }
         }
@@ -460,7 +472,7 @@ impl Session {
     pub fn set_env(&self, env: Environment) -> io::Result<()> {
         let logged = env.redacted();
         *lock(&self.env) = Some(env);
-        if logged_env(&self.lock().entries) == Some(&logged) {
+        if self.lock().ledger.env() == Some(&logged) {
             return Ok(());
         }
         rt::block_on(self.append(Body::Environment(logged))).map(drop)
@@ -468,7 +480,7 @@ impl Session {
 
     pub fn summary(&self) -> SessionSummary {
         let st = self.lock();
-        let activity = if !inbox(&st.entries).is_empty() {
+        let activity = if !st.ledger.inbox().is_empty() {
             Activity::Approval
         } else if self.has_work() {
             Activity::Running
@@ -478,7 +490,7 @@ impl Session {
         SessionSummary {
             id: self.id,
             workspace: self.workspace.clone(),
-            entries: st.entries.len() as u64,
+            entries: st.ledger.seq(),
             clients: u32::try_from(self.attached.load(Ordering::SeqCst)).unwrap_or(u32::MAX),
             activity,
             residency: Residency::Loaded,
@@ -613,6 +625,7 @@ impl Session {
                 Err(_) => st.clients.clear(),
             }
             hooks.observe(&entry);
+            st.ledger.apply(&entry);
             let asked = match entry.body {
                 Body::Ask { call } => Some(call),
                 _ => None,
@@ -620,11 +633,13 @@ impl Session {
             st.entries.push(entry);
             // Under the same lock as the entry, so a client attaching
             // meanwhile gets the ask exactly once.
-            let msg = asked.and_then(|call| ask(&st.entries, call));
+            let msg = asked.and_then(|call| ask(&st.ledger, call));
             if let Some(Ok(frame)) = msg.as_ref().map(Frame::new) {
                 st.clients.retain(|c| c.send(frame.clone()).is_ok());
             }
         }
+        #[cfg(test)]
+        oracle::check(&st.entries, &st.ledger);
         Ok(())
     }
 
@@ -636,30 +651,23 @@ impl Session {
             return Ok(());
         }
         self.flush().await?;
-        let decided: Vec<Body> = decided
-            .into_iter()
-            .map(|(hook, decision)| Body::Hook {
-                hook: hook.to_owned(),
-                decision,
-            })
-            .collect();
         {
             let st = self.lock();
             // What a restart logs before recovery runs is not part of it.
-            let logged: Vec<&Body> = st
-                .entries
+            let logged = st.ledger.trailing_hooks();
+            let same = logged
                 .iter()
-                .rev()
-                .map(|e| &e.body)
-                .filter(|b| !matches!(b, Body::Extensions { .. } | Body::Environment(_)))
-                .take_while(|b| matches!(b, Body::Hook { .. }))
-                .collect();
-            if !logged.is_empty() && logged.into_iter().rev().eq(&decided) {
+                .map(|(hook, decision)| (hook.as_str(), decision))
+                .eq(decided.iter().map(|(hook, decision)| (*hook, decision)));
+            if !logged.is_empty() && same {
                 return Ok(());
             }
         }
-        for body in decided {
-            self.record(body);
+        for (hook, decision) in decided {
+            self.record(Body::Hook {
+                hook: hook.to_owned(),
+                decision,
+            });
         }
         self.flush().await
     }
@@ -773,7 +781,7 @@ impl Session {
         // Stopped while it waits for approval, it stays marked: the next
         // daemon loads it at once and asks again.
         let stopped = lock(&self.answers).stopped;
-        let asking = stopped && !inbox(&self.lock().entries).is_empty();
+        let asking = stopped && !self.lock().ledger.inbox().is_empty();
         if settled
             && !asking
             && let Err(e) = self.mark_busy(false).await
@@ -1108,15 +1116,7 @@ impl Session {
 
     /// The session's own settings, and the seq of the entry that set them.
     fn overrides(&self) -> (Overrides, Option<u64>) {
-        self.lock()
-            .entries
-            .iter()
-            .rev()
-            .find_map(|e| match &e.body {
-                Body::Settings(set) => Some((set.clone(), Some(e.seq))),
-                _ => None,
-            })
-            .unwrap_or_default()
+        self.lock().ledger.settings()
     }
 
     /// The model spec the settings name now.
@@ -1204,12 +1204,7 @@ impl Session {
     /// Logs the context the extensions give, before the session's first
     /// model call.
     fn note_context(&self) {
-        let noted = self
-            .lock()
-            .entries
-            .iter()
-            .any(|e| matches!(e.body, Body::Context { .. }));
-        if noted {
+        if self.lock().ledger.has_context() {
             return;
         }
         let dir = self.dir();
@@ -1345,11 +1340,17 @@ impl Session {
         self.relink().await?;
         let (dangling, actions, commands, jobs) = {
             let st = self.lock();
+            let boot = sys::boot_id();
             (
-                dangling_calls(&st.entries),
+                dangling_calls(&st.ledger),
                 replay(agent, &st.entries),
-                dangling_commands(&st.entries),
-                background_groups(&st.entries),
+                st.ledger.open_commands().collect::<Vec<_>>(),
+                st.ledger
+                    .background()
+                    .iter()
+                    .filter(|(_, b)| Some(b.as_str()) == boot)
+                    .map(|&(pgid, _)| pgid)
+                    .collect::<Vec<_>>(),
             )
         };
         let orphan = self.orphaned();
@@ -1386,12 +1387,16 @@ impl Session {
     /// until its entry commits, so under that lock the two agree.
     fn requeue(&self, registry: &Registry) {
         let mut waiting = lock(&self.waiting);
-        let queued: Vec<_> = untaken(&self.lock().entries)
-            .into_iter()
-            .filter(|(seq, ..)| waiting.iter().all(|w| w.seq != *seq))
+        let queued: Vec<_> = self
+            .lock()
+            .ledger
+            .untaken()
+            .iter()
+            .filter(|q| waiting.iter().all(|w| w.seq != q.seq))
+            .cloned()
             .collect();
         let count = queued.len();
-        for (seq, text, steer) in queued.into_iter().rev() {
+        for ledger::Queued { seq, text, steer } in queued.into_iter().rev() {
             waiting.push_front(Waiting {
                 command: as_command(registry, &text).is_some(),
                 seq,
@@ -1419,7 +1424,7 @@ impl Session {
             seq,
             call,
             processes,
-            asked,
+            phase,
         } = dangling;
         for (pgid, boot) in processes {
             if Some(boot.as_str()) == sys::boot_id() {
@@ -1427,14 +1432,18 @@ impl Session {
             }
         }
         let interrupted = || Outcome::Interrupted {
-            output: partial(&self.lock().entries, seq),
+            output: self
+                .lock()
+                .ledger
+                .call(seq)
+                .and_then(|open| open.progress.clone()),
         };
         let outcome = match &call {
             _ if orphan => interrupted(),
-            Call::Tool { tool, input } if asked == Asked::Waiting => {
+            Call::Tool { tool, input } if phase == Phase::Asked => {
                 self.ask(seq, tool, input).await?
             }
-            Call::Tool { .. } if asked == Asked::Answered(false) => not_approved(),
+            Call::Tool { .. } if phase == (Phase::Answered { approved: false }) => not_approved(),
             Call::Tool { tool, .. }
                 if registry.tools().get(tool).map(DynTool::replay) != Some(Replay::Safe) =>
             {
@@ -1549,50 +1558,15 @@ fn slash(text: &str) -> Option<(&str, &str)> {
     Some((name, args.trim()))
 }
 
-/// Commands with an intent but no outcome.
-fn dangling_commands(entries: &[Entry]) -> Vec<u64> {
-    let done: HashSet<u64> = entries
-        .iter()
-        .filter_map(|e| match e.body {
-            Body::CommandResult { call, .. } => Some(call),
-            _ => None,
-        })
-        .collect();
-    entries
-        .iter()
-        .filter(|e| matches!(e.body, Body::Command { .. }) && !done.contains(&e.seq))
-        .map(|e| e.seq)
-        .collect()
-}
-
-/// The background process groups the session started in this boot.
-fn background_groups(entries: &[Entry]) -> Vec<u32> {
-    entries
-        .iter()
-        .filter_map(|e| match &e.body {
-            Body::ToolProcess {
-                pgid,
-                boot,
-                background: true,
-                ..
-            } if Some(boot.as_str()) == sys::boot_id() => Some(*pgid),
-            _ => None,
-        })
-        .collect()
-}
-
 /// Logs the registry's extensions before the session's first step, unless
 /// they are the ones its log records last.
-fn note_extensions(header: &Header, loaded: &mut Loaded, registry: &Registry) -> io::Result<()> {
-    let recorded = loaded
-        .entries
-        .iter()
-        .rev()
-        .find_map(|e| match &e.body {
-            Body::Extensions { installed } => Some(installed),
-            _ => None,
-        })
-        .unwrap_or(&header.extensions);
+fn note_extensions(
+    header: &Header,
+    loaded: &mut Loaded,
+    ledger: &mut Ledger,
+    registry: &Registry,
+) -> io::Result<()> {
+    let recorded = ledger.extensions().unwrap_or(&header.extensions);
     let same = recorded
         .iter()
         .map(|i| (i.name.as_str(), i.version))
@@ -1604,7 +1578,9 @@ fn note_extensions(header: &Header, loaded: &mut Loaded, registry: &Registry) ->
     }
     loaded.append(Body::Extensions {
         installed: installed(registry),
-    })
+    })?;
+    ledger.apply(loaded.entries.last().expect("an entry was appended"));
+    Ok(())
 }
 
 /// The registry's extensions as a log records them.
@@ -1616,14 +1592,6 @@ pub fn installed(registry: &Registry) -> Vec<Installed> {
             version,
         })
         .collect()
-}
-
-/// The environment most recently logged.
-fn logged_env(entries: &[Entry]) -> Option<&Environment> {
-    entries.iter().rev().find_map(|e| match &e.body {
-        Body::Environment(env) => Some(env),
-        _ => None,
-    })
 }
 
 /// Runs an effect so that a panic inside it fails the call instead of taking
@@ -1658,72 +1626,29 @@ enum Call {
 }
 
 /// A call with an intent but no outcome, the process groups it started, and
-/// whether the user was asked to approve it.
+/// where it stands.
 struct Dangling {
     seq: u64,
     call: Call,
     processes: Vec<(u32, String)>,
-    asked: Asked,
+    phase: Phase,
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum Asked {
-    No,
-    Waiting,
-    Answered(bool),
-}
-
-fn find_call(dangling: &mut [Dangling], call: u64) -> Option<&mut Dangling> {
-    dangling.iter_mut().rev().find(|d| d.seq == call)
-}
-
-fn dangling_calls(entries: &[Entry]) -> Vec<Dangling> {
-    let finished = finished(entries);
-    let mut dangling: Vec<Dangling> = Vec::new();
-    for e in entries {
-        let call = match &e.body {
-            Body::ToolProcess {
-                call, pgid, boot, ..
-            } => {
-                if let Some(d) = find_call(&mut dangling, *call) {
-                    d.processes.push((*pgid, boot.clone()));
-                }
-                continue;
-            }
-            Body::Ask { call } => {
-                if let Some(d) = find_call(&mut dangling, *call) {
-                    d.asked = Asked::Waiting;
-                }
-                continue;
-            }
-            Body::Hook {
-                decision:
-                    Decision::Approval {
-                        call: Some(call),
-                        approved,
-                        ..
-                    },
-                ..
-            } => {
-                if let Some(d) = find_call(&mut dangling, *call) {
-                    d.asked = Asked::Answered(*approved);
-                }
-                continue;
-            }
-            _ if finished.contains(&e.seq) => continue,
-            Body::ToolCall { tool, input, .. } => Call::Tool {
-                tool: tool.clone(),
-                input: input.value(),
+/// The calls a crash left with an intent and no outcome, in order.
+fn dangling_calls(ledger: &Ledger) -> Vec<Dangling> {
+    ledger
+        .open_calls()
+        .map(|(seq, open)| Dangling {
+            seq,
+            call: match &open.call {
+                ledger::Call::Model => Call::Model,
+                ledger::Call::Tool { tool, input } => Call::Tool {
+                    tool: tool.clone(),
+                    input: input.value(),
+                },
             },
-            Body::ModelCall { .. } => Call::Model,
-            _ => continue,
-        };
-        dangling.push(Dangling {
-            seq: e.seq,
-            call,
-            processes: Vec::new(),
-            asked: Asked::No,
-        });
-    }
-    dangling
+            processes: open.processes.clone(),
+            phase: open.phase,
+        })
+        .collect()
 }
