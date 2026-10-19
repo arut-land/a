@@ -73,14 +73,13 @@ echo target/generated/man/a.1
 deny = "cargo deny check"
 # Unused dependencies.
 machete = "cargo machete"
-# No core crate links the crate named exactly `tokio` (slab, bytes and the
-# rest of the tokio-rs org are fine). apps/web does, for topcoat's sync
-# primitives, and so does the default `a` build, which includes it.
+# No crate links the crate named exactly `tokio` (slab, bytes and the rest
+# of the tokio-rs org are fine): not the workspace's, nor `a` as built by
+# default, web UI included.
 "check:no-tokio" = '''
-cargo tree -e normal --target all --workspace --exclude web --exclude a --prefix none -f '{p}' > target/no-tokio.txt
-cargo tree -e normal --target all -p a --no-default-features --prefix none -f '{p}' >> target/no-tokio.txt
+cargo tree -e normal --target all --workspace --prefix none -f '{p}' > target/no-tokio.txt
 if grep -E '^tokio v' target/no-tokio.txt; then
-  echo "a core crate depends on tokio: cargo tree -i tokio shows which"
+  echo "a crate depends on tokio: cargo tree -i tokio shows which"
   exit 1
 fi
 '''

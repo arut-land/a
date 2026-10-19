@@ -16,7 +16,7 @@ web = { workspace = true, optional = true }
 
 [features]
 default = ["web"]
-# `a web`; about 0.8 MB of the release binary.
+# `a web`; about 110 KiB of the release binary.
 web = ["dep:web"]
 
 [dev-dependencies]

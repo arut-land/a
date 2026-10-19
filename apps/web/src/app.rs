@@ -1,12 +1,9 @@
 //! The pages, the live transcript and the calls the browser makes.
 //!
-//! A chat page renders right away; once the browser runtime is running, the
-//! transcript shard asks again with `live` set and its response becomes a
-//! long stream: it attaches as a daemon client of its own, folds what the
-//! daemon sends through the shared reducer and emits after each batch what
-//! changed: items that will not change are sent once, in regions nested
-//! as the transcript grows (see [`segment`]). Input and approvals go out
-//! on that tab's connection.
+//! A chat page renders at once, without its transcript. Its tab then opens
+//! an event stream: it attaches as a daemon client of its own and sends
+//! what the [`Page`] folded from the daemon's messages makes of them. Input
+//! and approvals go out on that tab's connection.
 
 use std::collections::HashMap;
 use std::future::{Future, poll_fn};
@@ -15,61 +12,25 @@ use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 use std::task::Poll;
 
 use client::{Connection, Writer};
-use protocol::view::{Change, Item, Link, SessionView, Status};
+use http::header::HOST;
+use http::{Method, Request, StatusCode};
+use protocol::view::Link;
 use protocol::{ClientMsg, DaemonMsg, SessionId, SessionSummary, Target};
 use rt::Rt;
 use rt::channel::Receiver;
-use topcoat::Result;
-use topcoat::asset::{AssetConfig, Manifest, ManifestEntry, RouterBuilderAssetExt};
-use topcoat::context::{Cx, app_context};
-use topcoat::router::error::{RouterErrorExt, SeeOther, see_other};
-use topcoat::router::{Router, page, path_param, route};
-use topcoat::runtime::{Event, RouterBuilderRuntimeExt, procedure, shard, signal};
-use topcoat::view::{BoxView, Child, Unescaped, View, ViewExt, component, emit, live, view};
+use serde::Deserialize;
 
-use crate::view::{End, Part, transcript_part};
-use crate::{Daemon, http, style};
-
-/// Loaded by the chat page to learn when the runtime is running: the
-/// runtime sets `src` again as it binds the image, and the second load
-/// arrives after its `load` handler is attached.
-const PIXEL: &str = "data:image/gif;base64,R0lGODlhAQABAAAAACH5BAEKAAEALAAAAAABAAEAAAICTAEAOw==";
-
-pub fn router(daemon: Daemon, rt: Rt) -> Router {
-    let script = ManifestEntry {
-        id: topcoat::runtime::SCRIPT.id(),
-        file: http::SCRIPT_PATH.trim_start_matches("/assets/").to_owned(),
-        hash: String::new(),
-        content_type: "text/javascript".to_owned(),
-    };
-    let manifest = Manifest {
-        version: 1,
-        assets: vec![script],
-    };
-    Router::builder()
-        .assets(AssetConfig::hosted_at("/assets", manifest))
-        .app_context(App {
-            daemon,
-            rt,
-            tabs: Arc::default(),
-        })
-        .page(sessions_page)
-        .page(chat_page)
-        .route(create)
-        .route(live_transcript)
-        .route(send)
-        .route(approve)
-        .route(interrupt)
-        .runtime()
-        .build()
-}
+use crate::http::{Gate, Host, Reply, see_other, text, whole};
+use crate::page::Page;
+use crate::{Daemon, view};
 
 /// The writers of the tabs whose transcripts are live, by tab id.
 type Tabs = Mutex<HashMap<String, Arc<Mutex<Writer>>>>;
 
-struct App {
+pub struct App {
     daemon: Daemon,
     rt: Rt,
+    pub gate: Gate,
     tabs: Arc<Tabs>,
 }
 
@@ -78,7 +39,24 @@ fn lock<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
     mutex.lock().unwrap_or_else(PoisonError::into_inner)
 }
 
+/// What a tab's calls carry: Datastar sends the page's signals.
+#[derive(Deserialize)]
+struct Signals {
+    tab: String,
+    #[serde(default)]
+    draft: String,
+}
+
 impl App {
+    pub fn new(daemon: Daemon, rt: Rt, gate: Gate) -> Self {
+        Self {
+            daemon,
+            rt,
+            gate,
+            tabs: Arc::default(),
+        }
+    }
+
     /// Runs blocking daemon work off the async workers.
     fn blocking<T, F>(&self, work: F) -> impl Future<Output = T>
     where
@@ -96,6 +74,113 @@ impl App {
         };
         rt::unblock(&*self.rt, move || lock(&writer).send(&msg).is_ok()).await
     }
+
+    /// Answers a request the gate let through.
+    pub async fn handle(self: &Arc<Self>, request: Request<Vec<u8>>) -> Reply {
+        let (parts, body) = request.into_parts();
+        let path = parts.uri.path();
+        let query = parts.uri.query().unwrap_or_default();
+        let host = parts
+            .headers
+            .get(HOST)
+            .and_then(|h| self.gate.host(h.as_bytes()));
+        let session = path.strip_prefix("/s/").map(|rest| {
+            let (id, events) = rest
+                .strip_suffix("/events")
+                .map_or((rest, false), |id| (id, true));
+            (parse_session(id), events)
+        });
+        let response = match (&parts.method, path, session) {
+            (&Method::GET, "/", _) => {
+                let listed = self.blocking(list).await.map_err(|e| e.to_string());
+                page(view::sessions_page(&listed))
+            }
+            (&Method::POST, "/new", _) => match self.blocking(new_session).await {
+                Ok(session) => see_other(&format!("/s/{session}"), None),
+                Err(e) => text(
+                    StatusCode::BAD_GATEWAY,
+                    &format!("Could not reach the daemon: {e}"),
+                ),
+            },
+            // On the main host, a chat would share its six connections
+            // with every other tab's: it moves to a host of its own.
+            (&Method::GET, _, Some((Some(_), false))) if host == Some(Host::Main) => {
+                see_other(&self.gate.handoff(path), None)
+            }
+            (&Method::GET, _, Some((Some(session), false))) => page(view::chat_page(
+                session,
+                &uuid::Uuid::new_v4().simple().to_string(),
+            )),
+            (&Method::GET, _, Some((Some(session), true))) => {
+                let Some(tab) = param(query, "tab").filter(|t| valid_tab(t)) else {
+                    return Reply::Whole(text(StatusCode::NOT_FOUND, "no such tab"));
+                };
+                return Reply::Events(Box::new(Live::open(Arc::clone(self), tab, session).await));
+            }
+            (&Method::POST, "/api/send", _) => match signals(&body) {
+                Some(Signals { draft, .. }) if draft.trim().is_empty() => done(true),
+                Some(Signals { tab, draft }) => {
+                    if self.tell(&tab, ClientMsg::input(draft)).await {
+                        // Empties the composer.
+                        whole(
+                            StatusCode::OK,
+                            "application/json",
+                            br#"{"draft":""}"#.to_vec(),
+                        )
+                    } else {
+                        done(false)
+                    }
+                }
+                None => done(false),
+            },
+            (&Method::POST, "/api/approve", _) => {
+                let call = param(query, "call").and_then(|c| c.parse().ok());
+                let approved = param(query, "ok") == Some("1");
+                match (signals(&body), call) {
+                    (Some(Signals { tab, .. }), Some(call)) => {
+                        done(self.tell(&tab, ClientMsg::approve(call, approved)).await)
+                    }
+                    _ => done(false),
+                }
+            }
+            // Stops the running turn: its model or tool call, and the rest
+            // of it.
+            (&Method::POST, "/api/interrupt", _) => match signals(&body) {
+                Some(Signals { tab, .. }) => done(self.tell(&tab, ClientMsg::INTERRUPT).await),
+                None => done(false),
+            },
+            _ => text(StatusCode::NOT_FOUND, "not found"),
+        };
+        Reply::Whole(response)
+    }
+}
+
+fn page(html: String) -> http::Response<Vec<u8>> {
+    whole(
+        StatusCode::OK,
+        "text/html; charset=utf-8",
+        html.into_bytes(),
+    )
+}
+
+/// A call's answer: nothing, or that the tab it names is not live.
+fn done(told: bool) -> http::Response<Vec<u8>> {
+    if told {
+        whole(StatusCode::NO_CONTENT, "text/plain", Vec::new())
+    } else {
+        text(StatusCode::NOT_FOUND, "this tab is not live; reload it")
+    }
+}
+
+fn signals(body: &[u8]) -> Option<Signals> {
+    serde_json::from_slice(body).ok()
+}
+
+fn param<'a>(query: &'a str, name: &str) -> Option<&'a str> {
+    query.split('&').find_map(|kv| {
+        kv.strip_prefix(name)
+            .and_then(|rest| rest.strip_prefix('='))
+    })
 }
 
 fn connect(daemon: &Daemon) -> io::Result<Connection> {
@@ -135,13 +220,13 @@ fn parse_session(id: &str) -> Option<SessionId> {
     uuid::Uuid::try_parse(id).ok().map(SessionId)
 }
 
-/// A tab id is 32 hex digits, as [`chat_page`] makes them.
+/// A tab id is 32 hex digits, as the chat page makes them.
 fn valid_tab(tab: &str) -> bool {
     tab.len() == 32 && tab.bytes().all(|b| b.is_ascii_hexdigit())
 }
 
-/// One browser tab's live transcript: a daemon connection of its own, whose
-/// writer the tab's calls use while it lasts.
+/// One browser tab's daemon connection, whose writer the tab's calls use
+/// while it lasts.
 struct Tab {
     id: String,
     messages: Receiver<DaemonMsg>,
@@ -195,7 +280,7 @@ impl Tab {
     }
 }
 
-/// The tab closed (its response was dropped) or reconnected: detach.
+/// The tab closed (its stream was dropped) or reconnected: detach.
 impl Drop for Tab {
     fn drop(&mut self) {
         let mut tabs = lock(&self.tabs);
@@ -212,360 +297,60 @@ impl Drop for Tab {
     }
 }
 
-#[component]
-async fn document(title: String, #[default] child: Child<'_>) -> Result<impl View> {
-    Ok(view! {
-        <!DOCTYPE html>
-        <html lang="en" style=(style::ROOT)>
-            <head>
-                <meta charset="utf-8">
-                <meta name="viewport" content="width=device-width, initial-scale=1">
-                <title>(title)</title>
-                topcoat::runtime::script()
-            </head>
-            <body style=(style::BODY)>(child)</body>
-        </html>
-    })
-}
-
-#[page("/")]
-async fn sessions_page(cx: &Cx) -> Result<impl View> {
-    let listed = app_context::<App>(cx).blocking(list).await;
-    Ok(view! {
-        document(title: "a · sessions".to_owned(),
-            <header style=(style::BAR)>
-                <span style=(style::BRAND)>"a"</span>
-                <span style=(style::DIM)>"sessions"</span>
-                <form method="post" action="/new" style="margin: 0 0 0 auto;">
-                    <button type="submit" style=(style::BUTTON)>"New session"</button>
-                </form>
-            </header>
-            <main style=(style::MAIN)>
-                <div style=(style::COLUMN)>
-                    match listed {
-                        Ok(sessions) => {
-                            if sessions.is_empty() {
-                                <p style=(style::NOTE)>"No sessions yet."</p>
-                            }
-                            #[key(summary.id.0.as_u128())]
-                            for summary in sessions {
-                                <a style=(style::CARD) href=(format!("/s/{}", summary.id))>
-                                    <span style=(style::MONO)>(summary.id.short().to_string())</span>
-                                    <span style="flex: 1; min-width: 12rem; overflow-wrap: anywhere;">(summary.workspace.display().to_string())</span>
-                                    <span style=(style::DIM)>
-                                        (summary.entries) " entries"
-                                        if summary.clients > 0 {
-                                            " · " (summary.clients) " attached"
-                                        }
-                                    </span>
-                                </a>
-                            }
-                        }
-                        Err(e) => {
-                            <p style=(style::BAD)>"Could not reach the daemon: " (e.to_string())</p>
-                        }
-                    }
-                </div>
-            </main>
-        )
-    })
-}
-
-#[route(POST "/new")]
-async fn create(cx: &Cx) -> Result<SeeOther> {
-    let session = app_context::<App>(cx).blocking(new_session).await?;
-    Ok(see_other(format!("/s/{session}")))
-}
-
-path_param!(session);
-
-#[page("/s/{session}")]
-async fn chat_page(cx: &Cx) -> Result<impl View> {
-    let session = parse_session(path_param::<Session>(cx)).ok_or_not_found()?;
-    let tab = uuid::Uuid::new_v4().simple().to_string();
-    let live = signal(cx, || false);
-    let pixel = signal(cx, || PIXEL.to_owned());
-    let draft = signal(cx, String::new);
-    Ok(view! {
-        document(title: format!("a · {}", session.short()),
-            <header style=(style::BAR)>
-                <a style=(style::BRAND) href="/">"← a"</a>
-                <span style=(style::MONO)>(session.short().to_string())</span>
-            </header>
-            <img hidden=(true) alt="" :src=$(pixel.get()) @load=$(|_e: Event| live.set(true))>
-            <main style=(style::SCROLLER)>
-                live_transcript(tab: tab.clone(), session: session.to_string(), live: $(live.get()))
-            </main>
-            <div style=(style::COMPOSER_BAR)>
-                <form style=(style::COMPOSER) @submit=$(async |e: Event| {
-                    e.prevent_default();
-                    let text = draft.get();
-                    if !text.trim().is_empty() {
-                        if send(tab, text).await {
-                            draft.set("".to_owned());
-                        }
-                    }
-                })>
-                    <input style=(style::INPUT) name="text" placeholder="Message" autocomplete="off" autofocus=(true)
-                        :value=$(draft.get()) @input=$(|e: Event| draft.set(e.target.value))>
-                    <button type="submit" style=(style::BUTTON)>"Send"</button>
-                </form>
-            </div>
-        )
-    })
-}
-
-/// The live transcript of `session` in browser tab `tab`. Rendered inline
-/// with the page while `live` is false; the request with `live` set streams
-/// for as long as the tab stays open.
-#[shard("/api/transcript")]
-async fn live_transcript(cx: &Cx, tab: String, session: String, live: bool) -> Result<impl View> {
-    let session = parse_session(&session).ok_or_not_found()?;
-    let tab = Some(tab).filter(|t| valid_tab(t)).ok_or_not_found()?;
-    Ok(live! {
-        if !live {
-            return emit! { <p style=(style::NOTE)>"Connecting…"</p> };
-        }
-        let app = app_context::<App>(cx);
-        let feed = match Tab::open(app, &tab, session, 0).await {
-            Ok(conn) => Arc::new(Feed::new(tab, session, conn)),
-            Err(e) => return emit! { <p style=(style::BAD)>"Could not attach: " (e.to_string())</p> },
-        };
-        // Shown once the attach's replay is in.
-        feed.next(app, 0).await;
-        loop {
-            let token = emit! { <div style=(style::COLUMN)>(segment(cx, Arc::clone(&feed), 0, 0))</div> }?;
-            let (failed, ended) = {
-                let state = feed.state();
-                (state.failed.clone(), state.ended)
-            };
-            if let Some(e) = failed {
-                break emit! { <p style=(style::BAD)>"Could not attach: " (e)</p> };
-            }
-            if ended {
-                break Ok(token);
-            }
-        }
-    })
-}
-
-/// How many settled items a region shows before it hands what follows to a
-/// region of its own: an update renders at most about this many settled
-/// items, however long the transcript.
-const SETTLED: usize = 16;
-
-/// How deep regions nest (each costs stack as the response is polled).
-/// The deepest starts over from the top instead: the outermost region then
-/// shows every settled item at once, so that happens once every
-/// `SETTLED * DEPTH` items.
-const DEPTH: usize = 32;
-
-/// Items `from..` of a tab's transcript and its end, kept up to date, at
-/// nesting `depth`. Once its first [`SETTLED`] items will not change, it
-/// shows them for good and hands the rest to a nested region. It ends when
-/// the transcript must be shown again from the top (an item before `from`
-/// changed, or the regions are nested [`DEPTH`] deep), or the daemon went
-/// away; the regions around it then end too.
-fn segment(cx: &Cx, feed: Arc<Feed>, from: usize, depth: usize) -> BoxView<'static> {
-    let cx = cx.keyed(from);
-    let inner = cx.clone();
-    live! { cx =>
-        let app = app_context::<App>(&inner);
-        let mut shown = None;
-        loop {
-            let (part, settled) = feed.part(from, depth < DEPTH);
-            if settled >= SETTLED {
-                if depth < DEPTH {
-                    let html = settled_html(&inner, part, &feed.id).await?;
-                    return emit! {
-                        (Unescaped::new_unchecked(html))
-                        (segment(&inner, Arc::clone(&feed), from + settled, depth + 1))
-                    };
-                }
-                if let Some(token) = shown {
-                    return Ok(token);
-                }
-            }
-            let ended = part.end.as_ref().is_some_and(|end| end.ended);
-            let token = emit! { transcript_part(part: part, tab: feed.id.clone()) }?;
-            // Once the daemon went away, this region shows that last.
-            if ended || !feed.next(app, from).await && !feed.state().ended {
-                return Ok(token);
-            }
-            shown = Some(token);
-        }
-    }
-    .boxed()
-}
-
-/// A part's settled items as HTML, rendered a few at a time: a view holds a
-/// buffer (4 KiB) an item until it is rendered, and here would hold them
-/// for as long as the nested region after them lives.
-async fn settled_html(cx: &Cx, part: Part, tab: &str) -> Result<String> {
-    let mut recap = part.recap;
-    let mut html = String::new();
-    for items in part.items.chunks(64) {
-        let part = Part {
-            recap: recap.take(),
-            empty: false,
-            items: items.to_vec(),
-            streaming: None,
-            end: None,
-        };
-        let tab = tab.to_owned();
-        let view = view! { cx => transcript_part(part: part, tab: tab) };
-        html.push_str(&view.first().await?.render(cx));
-    }
-    Ok(html)
-}
-
-/// A tab's live transcript: its connection and the view folded from it,
-/// shared by the regions that show it.
-struct Feed {
+/// A tab's live transcript: its daemon connection and the page folded
+/// from it.
+pub struct Live {
+    app: Arc<App>,
     id: String,
     session: SessionId,
-    tab: Mutex<Arc<Tab>>,
-    state: Mutex<State>,
+    /// `None` once the daemon is gone for good.
+    tab: Option<Tab>,
+    page: Page,
 }
 
-#[derive(Default)]
-struct State {
-    view: SessionView,
-    /// The daemon's latest complaint, until the transcript moves on.
-    error: Option<String>,
-    /// The daemon closed the connection, or (`failed`) could not be
-    /// reached again after an upgrade.
-    ended: bool,
-    failed: Option<String>,
-}
-
-impl Feed {
-    fn new(id: String, session: SessionId, tab: Tab) -> Self {
+impl Live {
+    async fn open(app: Arc<App>, id: &str, session: SessionId) -> Self {
+        let tab = Tab::open(&app, id, session, 0).await;
+        let mut page = Page::default();
+        let tab = tab
+            .map_err(|e| page.end(Some(format!("Could not attach: {e}"))))
+            .ok();
         Self {
-            id,
+            app,
+            id: id.to_owned(),
             session,
-            tab: Mutex::new(Arc::new(tab)),
-            state: Mutex::default(),
+            tab,
+            page,
         }
     }
 
-    fn state(&self) -> MutexGuard<'_, State> {
-        lock(&self.state)
-    }
-
-    /// What the region from item `from` shows, and how many of its first
-    /// items are settled: those alone once there are [`SETTLED`] of them
-    /// and it may `freeze` them; else every item and the end.
-    fn part(&self, from: usize, freeze: bool) -> (Part, usize) {
-        let state = self.state();
-        let view = &state.view;
-        let items = view.items.get(from..).unwrap_or_default();
-        let settled = if state.ended || state.failed.is_some() {
-            0
-        } else {
-            items.iter().take_while(|item| settled(item)).count()
-        };
-        let (items, end) = if freeze && settled >= SETTLED {
-            (&items[..settled], None)
-        } else {
-            let end = End {
-                running: view.running(),
-                error: state.error.clone(),
-                ended: state.ended,
-            };
-            (items, Some(end))
-        };
-        let part = Part {
-            recap: view.recap.clone().filter(|_| from == 0),
-            empty: view.items.is_empty(),
-            items: items.to_vec(),
-            streaming: view.streaming.clone().filter(|_| end.is_some()),
-            end,
-        };
-        (part, settled)
-    }
-
-    /// Folds what arrives next, reconnecting after an upgrade. `false`
-    /// when the region from item `from` must end: an item before it
-    /// changed, or the daemon went away.
-    async fn next(&self, app: &App, from: usize) -> bool {
+    /// The events to send next, waiting for the daemon; `None` once the
+    /// transcript will not change again.
+    pub async fn next(&mut self) -> Option<Vec<u8>> {
         loop {
-            let tab = Arc::clone(&lock(&self.tab));
-            let Some(batch) = tab.next().await else {
-                let seq = {
-                    let mut state = self.state();
-                    if state.view.link != Link::Draining {
-                        state.ended = true;
-                        return false;
-                    }
-                    state.view.seq
-                };
-                // Upgraded: the new daemon replays what this tab missed.
-                match Tab::open(app, &self.id, self.session, seq).await {
-                    Ok(tab) => *lock(&self.tab) = Arc::new(tab),
-                    Err(e) => {
-                        self.state().failed = Some(e.to_string());
-                        return false;
-                    }
-                }
-                continue;
-            };
-            let mut state = self.state();
-            let mut kept = true;
-            for msg in &batch {
-                match state.view.fold(msg).map(|update| update.change) {
-                    Some(Change::Error { message }) => state.error = Some(message),
-                    Some(Change::Added { index, .. }) => {
-                        state.error = None;
-                        kept &= index >= from;
-                    }
-                    Some(Change::Updated { index, .. } | Change::Asked { index, .. }) => {
-                        kept &= index >= from;
-                    }
-                    Some(Change::Recap(_)) => kept &= from == 0,
-                    Some(Change::Snapshot { .. } | Change::Attached { reset: true, .. }) => {
-                        kept = false;
-                    }
-                    _ => {}
-                }
+            let events = self.page.take();
+            if !events.is_empty() {
+                return Some(events);
             }
-            return kept;
+            let batch = self.tab.as_ref()?.next().await;
+            match batch {
+                Some(batch) => self.page.fold(&batch),
+                None => self.lost().await,
+            }
         }
     }
-}
 
-/// Whether an item will not change any more, so a region can show it for
-/// good.
-fn settled(item: &Item) -> bool {
-    match item {
-        Item::Reply { status, .. } => *status != Status::Running,
-        Item::Tool { outcome, .. } | Item::Command { outcome, .. } => outcome.is_some(),
-        Item::Child { fired, .. } => fired.is_some(),
-        _ => true,
+    /// The daemon closed the connection: after an upgrade, the new daemon
+    /// replays what this tab missed.
+    async fn lost(&mut self) {
+        self.tab = None;
+        if self.page.view.link != Link::Draining {
+            return self.page.end(None);
+        }
+        let since = self.page.view.seq;
+        match Tab::open(&self.app, &self.id, self.session, since).await {
+            Ok(tab) => self.tab = Some(tab),
+            Err(e) => self.page.end(Some(format!("Could not attach: {e}"))),
+        }
     }
-}
-
-#[procedure("/api/send")]
-async fn send(cx: &Cx, tab: String, text: String) -> Result<bool> {
-    if text.trim().is_empty() {
-        return Ok(false);
-    }
-    Ok(app_context::<App>(cx)
-        .tell(&tab, ClientMsg::input(text))
-        .await)
-}
-
-#[procedure("/api/approve")]
-pub async fn approve(cx: &Cx, tab: String, call: u64, approved: bool) -> Result<bool> {
-    Ok(app_context::<App>(cx)
-        .tell(&tab, ClientMsg::approve(call, approved))
-        .await)
-}
-
-/// Stops the running turn: its model or tool call, and the rest of it.
-#[procedure("/api/interrupt")]
-pub async fn interrupt(cx: &Cx, tab: String) -> Result<bool> {
-    Ok(app_context::<App>(cx)
-        .tell(&tab, ClientMsg::INTERRUPT)
-        .await)
 }

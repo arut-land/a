@@ -1,7 +1,7 @@
 //! `a web` against an echo-agent daemon, driven over HTTP as a browser and
-//! its topcoat runtime would: the link's token for a cookie, the gate, the
-//! pages, and a live transcript that streams the replies to what the tab
-//! sends.
+//! Datastar would: the link's token for a cookie, the gate, a chat's move
+//! to a host of its own, the pages, and a tab's event stream patching in
+//! the replies to what the tab sends.
 #![cfg(all(unix, feature = "web"))]
 
 mod common;
@@ -9,7 +9,7 @@ mod common;
 use std::fmt::Write as _;
 use std::io::{BufRead, BufReader, Read, Write};
 use std::net::TcpStream;
-use std::process::{Child, Stdio};
+use std::process::{Child, Command, Stdio};
 use std::time::{Duration, Instant};
 
 use common::{Env, wait_for};
@@ -27,8 +27,11 @@ struct Web {
 
 impl Web {
     fn start(env: &Env) -> Self {
-        let mut child = env
-            .cmd(&["web", "--no-open"])
+        Self::spawn(env.cmd(&["web", "--no-open"]))
+    }
+
+    fn spawn(mut cmd: Command) -> Self {
+        let mut child = cmd
             .stdin(Stdio::null())
             .stdout(Stdio::piped())
             .spawn()
@@ -50,8 +53,8 @@ impl Web {
         }
     }
 
-    fn origin(&self) -> String {
-        format!("http://127.0.0.1:{}", self.port)
+    fn host(&self) -> String {
+        format!("127.0.0.1:{}", self.port)
     }
 
     fn redeem(&self) -> Response {
@@ -64,7 +67,7 @@ impl Web {
         set.split(';').next().unwrap().clone_into(&mut self.cookie);
     }
 
-    /// Sends a request with `headers`, the right Host unless one is given,
+    /// Sends a request with `headers`, the main Host unless one is given,
     /// and a JSON `body`; returns the open connection.
     fn send(&self, method: &str, path: &str, headers: &[(&str, &str)], body: &str) -> TcpStream {
         let mut stream = TcpStream::connect(("127.0.0.1", self.port)).unwrap();
@@ -73,7 +76,7 @@ impl Web {
             .unwrap();
         let mut request = format!("{method} {path} HTTP/1.1\r\n");
         if !headers.iter().any(|(k, _)| k.eq_ignore_ascii_case("host")) {
-            let _ = write!(request, "Host: 127.0.0.1:{}\r\n", self.port);
+            let _ = write!(request, "Host: {}\r\n", self.host());
         }
         for (name, value) in headers {
             let _ = write!(request, "{name}: {value}\r\n");
@@ -96,16 +99,48 @@ impl Web {
         Response(String::from_utf8_lossy(&bytes).into_owned())
     }
 
-    /// A same-origin request of the signed-in browser.
-    fn ours(&self, method: &str, path: &str, body: &str) -> Response {
-        let origin = self.origin();
-        let headers = [("Cookie", self.cookie.as_str()), ("Origin", &origin)];
+    /// A same-origin request of the signed-in browser, on `host`.
+    fn ours_on(&self, host: &str, method: &str, path: &str, body: &str) -> Response {
+        let origin = format!("http://{host}");
+        let headers = [
+            ("Host", host),
+            ("Cookie", self.cookie.as_str()),
+            ("Origin", &origin),
+        ];
         self.fetch(method, path, &headers, body)
     }
 
-    /// Calls procedure `path` with `args`, returning its JSON result.
-    fn call(&self, path: &str, args: &str) -> String {
-        self.ours("POST", path, args).body()
+    fn ours(&self, method: &str, path: &str, body: &str) -> Response {
+        self.ours_on(&self.host(), method, path, body)
+    }
+
+    /// A tab's call, as Datastar makes it: the page's signals as the body.
+    fn call(&self, path: &str, tab: &str, draft: &str) -> Response {
+        let signals = serde_json::json!({ "tab": tab, "draft": draft }).to_string();
+        self.ours("POST", path, &signals)
+    }
+
+    /// Opens a live transcript for tab `tab` of `session`.
+    fn events(&self, session: &str, tab: &str) -> Events {
+        let headers = [
+            ("Cookie", self.cookie.as_str()),
+            ("Accept", "text/event-stream"),
+            ("Datastar-Request", "true"),
+        ];
+        let path = format!("/s/{session}/events?tab={tab}");
+        Events {
+            stream: self.send("GET", &path, &headers, ""),
+            raw: String::new(),
+            patches: Vec::new(),
+        }
+    }
+
+    /// Starts a session from the list page; its id.
+    fn new_session(&self) -> String {
+        let created = self.ours("POST", "/new", "");
+        assert_eq!(created.status(), 303, "{}", created.0);
+        let path = created.header("location").unwrap();
+        path.strip_prefix("/s/").unwrap().to_owned()
     }
 }
 
@@ -131,19 +166,8 @@ impl Response {
         })
     }
 
-    /// The body, unchunked.
-    fn body(&self) -> String {
-        let (_, mut rest) = self.0.split_once("\r\n\r\n").unwrap();
-        if self.header("transfer-encoding") != Some("chunked") {
-            return rest.to_owned();
-        }
-        let mut body = String::new();
-        while let Some((size, tail)) = rest.split_once("\r\n") {
-            let size = usize::from_str_radix(size, 16).unwrap();
-            body.push_str(&tail[..size]);
-            rest = &tail[size + 2..];
-        }
-        body
+    fn body(&self) -> &str {
+        self.0.split_once("\r\n\r\n").unwrap().1
     }
 }
 
@@ -153,30 +177,88 @@ fn between<'a>(text: &'a str, start: &str, end: &str) -> Option<&'a str> {
     Some(&text[from..from + text[from..].find(end)?])
 }
 
-/// A live transcript: the streamed response of the transcript shard.
-struct Transcript {
-    stream: TcpStream,
-    seen: String,
+/// One `datastar-patch-elements` event.
+#[derive(Debug)]
+struct Patch {
+    selector: Option<String>,
+    mode: Option<String>,
+    html: String,
 }
 
-impl Transcript {
-    /// Reads until the latest emission satisfies `done`.
-    fn until(&mut self, what: &str, done: impl Fn(&str) -> bool) {
-        // Each emission is one NDJSON frame.
-        self.until_seen(what, |seen| done(seen.rsplit("\n{").next().unwrap()));
-    }
+/// A tab's event stream, decoded as Datastar decodes it.
+struct Events {
+    stream: TcpStream,
+    raw: String,
+    patches: Vec<Patch>,
+}
 
-    /// Reads until everything streamed so far satisfies `done`.
-    fn until_seen(&mut self, what: &str, done: impl Fn(&str) -> bool) {
+impl Events {
+    /// Reads until the patches so far satisfy `done`.
+    fn until(&mut self, what: &str, done: impl Fn(&[Patch]) -> bool) {
         let deadline = Instant::now() + Duration::from_secs(20);
         let mut buf = [0; 16 * 1024];
-        while !done(&self.seen) {
+        while !done(&self.patches) {
             assert!(Instant::now() < deadline, "timed out waiting for {what}");
             let n = self.stream.read(&mut buf).unwrap();
-            assert_ne!(n, 0, "the stream ended before {what}: {}", self.seen);
-            self.seen.push_str(&String::from_utf8_lossy(&buf[..n]));
+            assert_ne!(n, 0, "the stream ended before {what}: {}", self.raw);
+            self.raw.push_str(&String::from_utf8_lossy(&buf[..n]));
+            self.decode();
         }
     }
+
+    fn decode(&mut self) {
+        // The head first, once.
+        if self.patches.is_empty()
+            && let Some((head, _)) = self.raw.split_once("\r\n\r\n")
+            && head.starts_with("HTTP/")
+        {
+            assert!(head.starts_with("HTTP/1.1 200"), "{head}");
+            assert!(head.contains("content-type: text/event-stream"), "{head}");
+            let skip = head.len() + 4;
+            self.raw.drain(..skip);
+        }
+        while let Some(at) = self.raw.find("\n\n") {
+            let event: String = self.raw.drain(..at + 2).collect();
+            let mut patch = Patch {
+                selector: None,
+                mode: None,
+                html: String::new(),
+            };
+            let mut lines = Vec::new();
+            for line in event.lines() {
+                let Some(data) = line.strip_prefix("data: ") else {
+                    assert!(
+                        line == "event: datastar-patch-elements" || line.is_empty(),
+                        "{line:?}"
+                    );
+                    continue;
+                };
+                let (key, value) = data.split_once(' ').unwrap_or((data, ""));
+                match key {
+                    "selector" => patch.selector = Some(value.to_owned()),
+                    "mode" => patch.mode = Some(value.to_owned()),
+                    "elements" => lines.push(value),
+                    _ => panic!("{line:?}"),
+                }
+            }
+            patch.html = lines.join("\n");
+            self.patches.push(patch);
+        }
+    }
+}
+
+/// Everything the patches carried.
+fn shown(patches: &[Patch]) -> String {
+    patches.iter().map(|p| p.html.as_str()).collect()
+}
+
+/// The transcript's end as the latest patch that carried it shows it.
+fn end(patches: &[Patch]) -> &str {
+    patches
+        .iter()
+        .rev()
+        .find_map(|p| p.html.find("<div id=\"end\"").map(|at| &p.html[at..]))
+        .unwrap_or_default()
 }
 
 /// Clients the daemon counts on each session.
@@ -188,6 +270,8 @@ fn clients(env: &Env) -> Vec<u32> {
     list.sessions.iter().map(|s| s.clients).collect()
 }
 
+const TAB: &str = "0123456789abcdef0123456789abcdef";
+
 #[test]
 fn the_link_signs_in_once_and_foreign_requests_are_refused() {
     let env = Env::new("web-gate");
@@ -195,8 +279,17 @@ fn the_link_signs_in_once_and_foreign_requests_are_refused() {
     assert_eq!(web.fetch("GET", "/", &[], "").status(), 403);
     assert_eq!(web.fetch("GET", "/?token=0123", &[], "").status(), 403);
     let link = format!("/?token={}", web.token);
-    let rebound = web.fetch("GET", &link, &[("Host", "evil.test")], "");
-    assert_eq!(rebound.status(), 421, "a foreign Host spent the link");
+    let other_port = format!("t1.localhost:{}", web.port + 1);
+    for host in [
+        "evil.test",
+        "localhost.evil.test",
+        &format!("a.b.localhost:{}", web.port),
+        &format!("evil.test:{}", web.port),
+        &other_port,
+    ] {
+        let rebound = web.fetch("GET", &link, &[("Host", host)], "");
+        assert_eq!(rebound.status(), 421, "{host} spent the link");
+    }
 
     let redeemed = web.redeem();
     assert_eq!(redeemed.status(), 303, "{}", redeemed.0);
@@ -210,18 +303,73 @@ fn the_link_signs_in_once_and_foreign_requests_are_refused() {
 
     set.split(';').next().unwrap().clone_into(&mut web.cookie);
     let cookie = ("Cookie", web.cookie.as_str());
-    for origin in ["http://evil.test", "null", "http://127.0.0.1:1"] {
+    for origin in [
+        "http://evil.test",
+        "null",
+        "http://127.0.0.1:1",
+        "http://t1.localhost.evil.test",
+    ] {
         let response = web.fetch("POST", "/new", &[cookie, ("Origin", origin)], "");
         assert_eq!(response.status(), 403, "{origin}");
     }
     let list = web.ours("GET", "/", "");
     assert_eq!(list.status(), 200);
     assert!(list.0.contains("No sessions yet."), "{}", list.0);
-    let path = between(&list.0, "src=\"/assets/", "\"").expect("the runtime's script");
+    let path = between(&list.0, "src=\"/assets/", "\"").expect("the browser script");
     let script = web.ours("GET", &format!("/assets/{path}"), "");
     assert_eq!(script.status(), 200, "{path}");
     assert_eq!(script.header("content-type"), Some("text/javascript"));
     assert_eq!(script.header("content-encoding"), Some("deflate"));
+}
+
+/// Browsers open six connections to a host, and each chat tab holds one
+/// for its event stream: a chat opened on the main host moves to a host of
+/// its own, signed in by a token good once.
+#[test]
+fn a_chat_moves_to_a_host_of_its_own() {
+    let env = Env::new("web-hosts");
+    let mut web = Web::start(&env);
+    web.sign_in();
+    let session = web.new_session();
+    let chat = format!("/s/{session}");
+
+    let mut hosts = Vec::new();
+    for _ in 0..2 {
+        let moved = web.ours("GET", &chat, "");
+        assert_eq!(moved.status(), 303, "{}", moved.0);
+        let location = moved.header("location").unwrap();
+        let rest = location.strip_prefix("http://").unwrap();
+        let (host, path) = rest.split_once('/').unwrap();
+        assert!(
+            host.ends_with(&format!(".localhost:{}", web.port)),
+            "{location}"
+        );
+        let (path, token) = path.split_once("?token=").unwrap();
+        assert_eq!(format!("/{path}"), chat);
+        hosts.push((host.to_owned(), token.to_owned()));
+    }
+    assert_ne!(hosts[0].0, hosts[1].0, "two tabs on one host");
+
+    // The first visit signs the new host in and is the page itself.
+    let (host, token) = &hosts[0];
+    let handed = format!("{chat}?token={token}");
+    let page = web.fetch("GET", &handed, &[("Host", host)], "");
+    assert_eq!(page.status(), 200, "{}", page.0);
+    let set = page.header("set-cookie").unwrap();
+    assert!(set.contains("; SameSite=Strict"), "{set}");
+    assert!(page.body().contains("Connecting…"), "{}", page.0);
+    assert!(page.body().contains("/events?tab="), "{}", page.0);
+    assert_eq!(
+        web.fetch("GET", &handed, &[("Host", host)], "").status(),
+        403,
+        "the token worked twice"
+    );
+    // A reload, signed in: the page again, without the spent token.
+    let reload = web.ours_on(host, "GET", &handed, "");
+    assert_eq!(reload.status(), 303);
+    assert_eq!(reload.header("location"), Some(chat.as_str()));
+    let again = web.ours_on(host, "GET", &chat, "");
+    assert_eq!(again.status(), 200, "{}", again.0);
 }
 
 #[test]
@@ -230,72 +378,59 @@ fn a_tab_streams_replies_and_answers_asks_until_it_closes() {
     env.vars.push(("A_ASK", "bash"));
     let mut web = Web::start(&env);
     web.sign_in();
-    let created = web.ours("POST", "/new", "");
-    assert_eq!(created.status(), 303, "{}", created.0);
-    let page_path = created.header("location").unwrap().to_owned();
-    let session = page_path.strip_prefix("/s/").unwrap();
+    let session = web.new_session();
 
-    // The page renders at once; its transcript is a shard that streams when
-    // asked again with `live` set, as the runtime does once it runs.
-    let page = web.ours("GET", &page_path, "");
-    assert_eq!(page.status(), 200);
-    assert!(page.0.contains("Connecting…"), "{}", page.0);
-    let identity = between(&page.0, "shard::start(\"/api/transcript\", \"", "\"").unwrap();
-    let tab = "0123456789abcdef0123456789abcdef";
-    let headers = [
-        ("Cookie", web.cookie.as_str()),
-        ("Accept", "application/x-ndjson"),
-        ("X-Topcoat-Identity", identity),
-    ];
-    let rerun = format!(r#"{{"args":["{tab}","{session}",true],"signals":{{}}}}"#);
-    let mut transcript = Transcript {
-        stream: web.send("POST", "/api/transcript", &headers, &rerun),
-        seen: String::new(),
-    };
-    transcript.until("the attach", |s| s.contains("environment"));
+    let mut events = web.events(&session, TAB);
+    events.until("the attach", |p| shown(p).contains("environment"));
     assert!(
-        transcript.seen.starts_with("HTTP/1.1 200"),
-        "{}",
-        transcript.seen
+        events.patches[0].html.starts_with("<div id=\"transcript\""),
+        "{:?}",
+        events.patches[0]
     );
     wait_for("the tab to attach", || clients(&env) == [1]);
 
-    let send = |text: &str| web.call("/api/send", &serde_json::to_string(&(tab, text)).unwrap());
-    assert_eq!(send("hello web"), "true");
-    transcript.until("the line and its echo", |s| {
-        s.matches(">hello web<").count() == 2
+    let sent = web.call("/api/send", TAB, "hello web");
+    assert_eq!(sent.status(), 200, "{}", sent.0);
+    // Datastar takes it as a patch of the page's signals.
+    assert_eq!(sent.header("content-type"), Some("application/json"));
+    assert_eq!(sent.body(), r#"{"draft":""}"#);
+    events.until("the line and its echo", |p| {
+        shown(p).matches(">hello web<").count() == 2
     });
 
-    send("$ echo web-ok");
-    transcript.until("the ask", |s| s.contains("Run this?"));
-    let call = between(&transcript.seen, "id=\\\"call-", "\\\"").unwrap();
-    let answer = format!(r#"["{tab}",{{"t":"u64","bits":64,"v":"{call}"}},true]"#);
-    assert_eq!(web.call("/api/approve", &answer), "true");
-    transcript.until("the output", |s| {
-        s.contains("approved") && s.contains("web-ok\\n") && s.contains("exit ")
+    web.call("/api/send", TAB, "$ echo web-ok");
+    events.until("the ask", |p| shown(p).contains("Run this?"));
+    let html = shown(&events.patches);
+    let ask = &html[..html.find("Run this?").unwrap()];
+    let call = between(&ask[ask.rfind("id=\"i").unwrap()..], "id=\"i", "\"").unwrap();
+    let approve = format!("/api/approve?call={call}&ok=1");
+    assert_eq!(web.call(&approve, TAB, "").status(), 204);
+    events.until("the output", |p| {
+        p.iter().any(|p| {
+            let html = &p.html;
+            html.contains("approved") && html.contains("web-ok\n") && html.contains("exit ")
+        })
     });
 
     // A running call offers Stop, which interrupts the turn.
-    send("$ sleep 30");
-    transcript.until("the second ask", |s| {
-        s.matches("Run this?").count() == 1 && s.contains("sleep 30")
-    });
-    let newest = transcript.seen.rfind("id=\\\"call-").unwrap();
-    let call = between(&transcript.seen[newest..], "id=\\\"call-", "\\\"").unwrap();
-    let answer = format!(r#"["{tab}",{{"t":"u64","bits":64,"v":"{call}"}},true]"#);
-    assert_eq!(web.call("/api/approve", &answer), "true");
-    transcript.until("the stop control", |s| s.contains(">Stop<"));
-    let stop = serde_json::to_string(&(tab,)).unwrap();
-    assert_eq!(web.call("/api/interrupt", &stop), "true");
-    transcript.until("the call to stop", |s| {
-        !s.contains(">Stop<") && s.contains("sleep 30")
+    web.call("/api/send", TAB, "$ sleep 30");
+    let asked = |p: &Patch| p.html.contains("Run this?") && p.html.contains("sleep 30");
+    events.until("the second ask", |p| p.iter().any(asked));
+    let html = &events.patches.iter().find(|p| asked(p)).unwrap().html;
+    let call = between(html, "id=\"i", "\"").unwrap();
+    let approve = format!("/api/approve?call={call}&ok=1");
+    assert_eq!(web.call(&approve, TAB, "").status(), 204);
+    events.until("the stop control", |p| end(p).contains(">Stop<"));
+    assert_eq!(web.call("/api/interrupt", TAB, "").status(), 204);
+    events.until("the call to stop", |p| {
+        !end(p).contains(">Stop<") && shown(p).contains("killed by")
     });
 
     // Closing the tab detaches its client; stopping `a web` leaves the
     // daemon and its session running.
-    drop(transcript);
+    drop(events);
     wait_for("the tab to detach", || clients(&env) == [0]);
-    assert_eq!(send("anyone there?"), "false");
+    assert_eq!(web.call("/api/send", TAB, "anyone there?").status(), 404);
     let pid = env.pid();
     drop(web);
     assert!(pid.is_some());
@@ -303,45 +438,65 @@ fn a_tab_streams_replies_and_answers_asks_until_it_closes() {
     assert_eq!(env.pid(), pid);
 }
 
-/// Items that will not change are sent once: later emissions carry only
-/// what follows them, however long the transcript grows.
+/// Each change goes out alone: a new item is added before the end, and
+/// nothing shown is sent again, however long the transcript grows.
 #[test]
-fn a_long_transcript_streams_only_its_tail() {
+fn a_long_transcript_sends_each_item_once() {
     let env = Env::new("web-long");
     let mut web = Web::start(&env);
     web.sign_in();
-    let created = web.ours("POST", "/new", "");
-    let page_path = created.header("location").unwrap().to_owned();
-    let session = page_path.strip_prefix("/s/").unwrap();
-    let page = web.ours("GET", &page_path, "");
-    let identity = between(&page.0, "shard::start(\"/api/transcript\", \"", "\"").unwrap();
-    let tab = "0123456789abcdef0123456789abcdef";
-    let headers = [
-        ("Cookie", web.cookie.as_str()),
-        ("Accept", "application/x-ndjson"),
-        ("X-Topcoat-Identity", identity),
-    ];
-    let rerun = format!(r#"{{"args":["{tab}","{session}",true],"signals":{{}}}}"#);
-    let mut transcript = Transcript {
-        stream: web.send("POST", "/api/transcript", &headers, &rerun),
-        seen: String::new(),
-    };
-    transcript.until("the attach", |s| s.contains("environment"));
+    let session = web.new_session();
+    let mut events = web.events(&session, TAB);
+    events.until("the attach", |p| shown(p).contains("environment"));
+    let shown_whole = events.patches.len();
     for n in 0..40 {
         let text = format!("note {n}.");
-        web.call("/api/send", &serde_json::to_string(&(tab, &text)).unwrap());
-        // The note, then its echo, each in some emission.
-        let shown = format!(">{text}<");
-        transcript.until_seen(&text, |seen| seen.matches(&shown).count() >= 2);
+        web.call("/api/send", TAB, &text);
+        // The note, then its echo.
+        let line = format!(">{text}<");
+        events.until(&text, |p| shown(p).matches(&line).count() >= 2);
     }
-    let last = transcript.seen.rsplit("\n{").next().unwrap();
-    assert!(last.contains(">note 39.<"), "{last}");
-    assert!(
-        !last.contains(">note 0.<"),
-        "the whole transcript again: {last}"
-    );
+    for patch in &events.patches[shown_whole..] {
+        let added =
+            patch.selector.as_deref() == Some("#end") && patch.mode.as_deref() == Some("before");
+        let end = patch.selector.is_none() && patch.html.starts_with("<div id=\"end\"");
+        assert!(added || end, "{patch:?}");
+    }
+    let html = shown(&events.patches);
     for n in 0..40 {
-        let shown = transcript.seen.matches(&format!(">note {n}.<")).count();
-        assert!(shown >= 2, "note {n} shown {shown} times");
+        let count = html.matches(&format!(">note {n}.<")).count();
+        assert_eq!(count, 2, "note {n} shown {count} times");
     }
+}
+
+/// A daemon upgrade does not end a tab: it attaches to the new daemon from
+/// where it was, and goes on.
+#[test]
+fn a_tab_rides_out_a_daemon_upgrade() {
+    let env = Env::new("web-drain");
+    let old = env.older_build();
+    let mut web = Web::spawn(env.cmd_as(&old, &["web", "--no-open"]));
+    web.sign_in();
+    let session = web.new_session();
+    let mut events = web.events(&session, TAB);
+    events.until("the attach", |p| shown(p).contains("environment"));
+    web.call("/api/send", TAB, "before");
+    events.until("the echo", |p| shown(p).matches(">before<").count() == 2);
+    let first = env.pid().unwrap();
+
+    // The newer build drains the older one's daemon and starts its own.
+    env.run(&["ls"]);
+    let second = env.pid().unwrap();
+    assert_ne!(second, first);
+    wait_for("the tab to attach again", || clients(&env) == [1]);
+    let shown_before = events.patches.len();
+    assert_eq!(web.call("/api/send", TAB, "after").status(), 200);
+    events.until("the echo after", |p| {
+        shown(p).matches(">after<").count() >= 2
+    });
+    let since = shown(&events.patches[shown_before..]);
+    assert!(!since.contains("reload to reconnect"), "{since}");
+    // Shown whole again once the new daemon synced, then patched.
+    assert!(since.contains(">before<"), "{since}");
+    assert_eq!(env.daemons(), [second]);
 }

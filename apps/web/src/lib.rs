@@ -1,10 +1,14 @@
-//! `a web`: the web UI, a client process like the CLI. topcoat renders the
-//! pages; our own small HTTP server hosts them on the `rt` runtime, so no
-//! tokio runtime runs. Each live transcript in a browser tab is its own
-//! daemon client; closing `a web` stops only the UI.
+//! `a web`: the web UI, a client process like the CLI. The server renders
+//! every page and patch from Rust (hypertext's typed markup) and hosts them
+//! on its own small HTTP server over the `rt` runtime; in the browser,
+//! Datastar applies the patches each tab's event stream sends. Each live
+//! transcript in a browser tab is its own daemon client; closing `a web`
+//! stops only the UI.
 
 mod app;
 mod http;
+mod page;
+mod patch;
 mod style;
 mod view;
 
@@ -31,10 +35,10 @@ pub struct Daemon {
 pub fn run(daemon: Daemon, open: bool) -> io::Result<()> {
     let listener = TcpListener::bind(("127.0.0.1", 0))?;
     let port = listener.local_addr()?.port();
-    let gate = Arc::new(http::Gate::new(port));
+    let gate = http::Gate::new(port);
     let link = gate.link();
     let rt: Rt = Arc::new(rt::Threads::default());
-    let router = app::router(daemon, Arc::clone(&rt));
+    let app = Arc::new(app::App::new(daemon, Arc::clone(&rt), gate));
 
     // Whoever reads the link may stop reading (`a web | head -1`): the
     // server keeps going without its stdout.
@@ -51,7 +55,7 @@ pub fn run(daemon: Daemon, open: bool) -> io::Result<()> {
     }
     for stream in listener.incoming() {
         let Ok(stream) = stream else { continue };
-        let task = http::serve(Arc::clone(&rt), router.clone(), Arc::clone(&gate), stream);
+        let task = http::serve(Arc::clone(&rt), Arc::clone(&app), stream);
         rt.spawn(Box::pin(task));
     }
     Ok(())
