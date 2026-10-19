@@ -231,7 +231,7 @@ fn log(rng: &mut Rng, len: usize) -> Vec<Entry> {
 }
 
 #[test]
-fn the_ledger_reads_generated_logs_as_the_scans_do() {
+fn facts_agree_with_the_log_after_any_prefix() {
     let mut rng = Rng(0x9e37_79b9_7f4a_7c15);
     for _ in 0..300 {
         let len = 1 + rng.below(80);

@@ -1810,7 +1810,7 @@ fn input_taken_in_during_recovery_runs_once() {
 mod interrupt;
 
 #[test]
-fn clients_attaching_at_one_seq_share_one_snapshot_and_the_log_frames() {
+fn a_committed_entry_is_encoded_exactly_once() {
     let fixture = Fixture::new(
         agent::Kind::Echo,
         Registry::default(),
@@ -1838,7 +1838,16 @@ fn clients_attaching_at_one_seq_share_one_snapshot_and_the_log_frames() {
     assert_eq!(first.len(), 4, "attached, snapshot, synced, recap");
     assert!(shared(&first[1], &second[1]), "one snapshot for both");
     let (first, second) = (sent(Caps::NONE), sent(Caps::NONE));
-    session.stop();
     assert_eq!(first.len(), 303);
     assert!(shared(&first[1], &second[1]), "one frame of each entry");
+    // Live, then replayed: the frame committed is the one sent both times.
+    let live = Outbox::new(Caps::NONE);
+    session.attach(&live, 300);
+    session.submit("again".into()).unwrap();
+    settle(&session);
+    let of = |frames: Vec<Frame>| frames.into_iter().find(|f| f.seq == Some(301)).unwrap();
+    let sent_live = of(std::iter::from_fn(|| live.try_next()).collect());
+    let replayed = of(sent(Caps::NONE));
+    session.stop();
+    assert!(shared(&sent_live, &replayed), "encoded once, at commit");
 }

@@ -319,19 +319,25 @@ mod tests {
     }
 
     #[test]
-    fn a_slow_client_costs_no_copy_and_loses_only_deltas() {
+    fn a_slow_viewer_never_grows_daemon_memory_beyond_its_cursor() {
         let log = log([]);
         let outbox = Outbox::new(Caps::NONE);
         let session = outbox.follow(Arc::clone(&log), 0, Vec::new());
-        let big = "x".repeat(BUDGET / 4);
-        for seq in 1..=8 {
+        let big = "x".repeat(BUDGET);
+        for seq in 1..=64 {
             log.push(Some(entry(seq, &big)));
+            session.wake().unwrap();
             session.send_after(seq, delta()).unwrap();
         }
-        let delta_len = delta().as_bytes().len();
-        assert!(outbox.queue().ephemeral <= 8 * delta_len);
+        // Entries stay in the shared log: what waits for this viewer is
+        // its cursor and the bounded deltas, however far it lags.
+        let q = outbox.queue();
+        assert!(q.frames.iter().all(|(_, f)| f.class == Class::Ephemeral));
+        assert!(q.ephemeral <= BUDGET);
+        assert_eq!(q.follow.as_ref().map(|f| f.cursor), Some(0));
+        drop(q);
         let seqs = written(&outbox);
-        assert_eq!(seqs.iter().filter(|s| s.is_some()).count(), 8);
+        assert_eq!(seqs.iter().filter(|s| s.is_some()).count(), 64);
     }
 
     #[test]
