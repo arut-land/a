@@ -179,21 +179,30 @@ impl Runtime {
             .filter(|id| id.contains('+') && Some(id) != current.as_ref())
             .filter_map(|id| Some((self.order(&id)?, id)))
             .collect();
-        others.sort_by(|a, b| b.cmp(a));
-        for (_, id) in others.into_iter().skip(1) {
+        if let Some(newest) = others.iter().max().cloned() {
+            others.retain(|other| *other != newest);
+        }
+        for (_, id) in others {
             fs::remove_dir_all(self.dir.join(id))?;
         }
         let Ok(stamps) = fs::read_dir(self.dir.join("stamps")) else {
             return Ok(());
         };
-        let mut dangling: Vec<(SystemTime, PathBuf)> = stamps
+        // Keyed as crash reports are, so both share one sort.
+        let mut dangling: Vec<(u128, PathBuf)> = stamps
             .flatten()
             .map(|stamp| stamp.path())
             .filter(|path| fs::read_link(path).is_ok_and(|id| !self.dir.join(id).exists()))
-            .filter_map(|path| Some((fs::symlink_metadata(&path).ok()?.modified().ok()?, path)))
+            .filter_map(|path| {
+                let modified = fs::symlink_metadata(&path).ok()?.modified().ok()?;
+                let since = modified
+                    .duration_since(SystemTime::UNIX_EPOCH)
+                    .unwrap_or_default();
+                Some((since.as_nanos(), path))
+            })
             .collect();
-        dangling.sort_by(|a, b| b.cmp(a));
-        for (_, path) in dangling.into_iter().skip(OUTRANKED) {
+        dangling.sort();
+        for (_, path) in dangling.into_iter().rev().skip(OUTRANKED) {
             fs::remove_file(path)?;
         }
         Ok(())

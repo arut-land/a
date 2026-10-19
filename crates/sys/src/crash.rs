@@ -148,7 +148,10 @@ pub fn reap(home: &Home, pid_file: &mut File) -> io::Result<Option<Record>> {
     let explained = reports(&dir)
         .iter()
         .filter_map(|p| report_key(p))
-        .any(|(ms, pid)| pid == dead.pid && ms >= u128::from(dead.started) * 1000);
+        .any(|key| {
+            key & 0xffff_ffff == u128::from(dead.pid)
+                && key >> 32 >= u128::from(dead.started) * 1000
+        });
     if !explained {
         write_report(
             &dir,
@@ -254,11 +257,13 @@ pub fn reports(dir: &Path) -> Vec<PathBuf> {
     reports.into_iter().map(|(_, p)| p).collect()
 }
 
-/// A report's time in Unix milliseconds and the pid it is about.
-fn report_key(path: &Path) -> Option<(u128, u32)> {
+/// A report's time in Unix milliseconds and the pid it is about, as
+/// `ms << 32 | pid`: ordered as the pair is.
+fn report_key(path: &Path) -> Option<u128> {
     let stem = path.file_name()?.to_str()?.strip_suffix(".txt")?;
     let (ms, pid) = stem.split_once('-')?;
-    Some((ms.parse().ok()?, pid.parse().ok()?))
+    let (ms, pid): (u128, u32) = (ms.parse().ok()?, pid.parse().ok()?);
+    Some(ms << 32 | u128::from(pid))
 }
 
 fn breaker_file(home: &Home) -> PathBuf {
