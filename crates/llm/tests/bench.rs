@@ -57,20 +57,22 @@ unsafe impl GlobalAlloc for Counting {
 #[global_allocator]
 static GLOBAL: Counting = Counting;
 
-/// Runs `f` `runs` times and prints its time and allocations per run.
+/// Runs `f` `runs` times and prints its fastest time, which a busy machine
+/// disturbs least, and its allocations per run.
 fn measure(label: &str, runs: usize, mut f: impl FnMut()) {
     f();
     let (allocs, bytes) = (ALLOCS.load(Relaxed), BYTES.load(Relaxed));
     let base = LIVE.load(Relaxed);
     PEAK.store(base, Relaxed);
-    let start = Instant::now();
+    let mut fastest = std::time::Duration::MAX;
     for _ in 0..runs {
+        let start = Instant::now();
         f();
+        fastest = fastest.min(start.elapsed());
     }
-    let elapsed = start.elapsed() / u32::try_from(runs).expect("runs");
     let runs = runs.max(1);
     eprintln!(
-        "{label}: {elapsed:?}/run, {} allocs/run, {} KiB allocated/run, peak {} KiB",
+        "{label}: {fastest:?}/run, {} allocs/run, {} KiB allocated/run, peak {} KiB",
         (ALLOCS.load(Relaxed) - allocs) / runs,
         (BYTES.load(Relaxed) - bytes) / runs / 1024,
         (PEAK.load(Relaxed) - base) / 1024,
@@ -284,11 +286,11 @@ fn decode_long_streams() {
         status: 200,
         body: long_messages(20_000),
     };
-    measure("chat 40k deltas", 5, || {
+    measure("chat 40k deltas", 20, || {
         let reply = rt::block_on(llm::generate(&chat_body, &chat, &request)).expect("reply");
         assert_eq!(reply.message.content.len(), 2);
     });
-    measure("messages 40k deltas", 5, || {
+    measure("messages 40k deltas", 20, || {
         let reply =
             rt::block_on(llm::generate(&messages_body, &messages, &request)).expect("reply");
         assert_eq!(reply.message.content.len(), 2);
