@@ -65,13 +65,6 @@ fn bridge(host: &str, script: &str, token: &str) -> io::Result<Option<Connection
                 Some(ClientMsg::Environment(env)) => break env,
                 _ => return Err(io::Error::other(format!("ssh {host}: no environment"))),
             },
-            // Without the host's environment, commands would run with this
-            // machine's paths there.
-            Some([]) => {
-                return Err(io::Error::other(format!(
-                    "the `a` on {host} is too old to report its environment; update it"
-                )));
-            }
             _ => {}
         }
     };
