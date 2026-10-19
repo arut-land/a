@@ -18,7 +18,7 @@ use smol_str::format_smolstr;
 
 use super::KEY;
 use crate::error::{Error, Kind};
-use crate::json::{Fields, First, Json, Lenient, fields};
+use crate::json::{Fields, First, Json, Lenient, fields, next};
 use crate::protocol::Flow;
 use crate::spec::{Media, Meta, Reason, SmolStr, Source, Usage};
 use crate::writer::{End, Open, Writer, Writes};
@@ -38,14 +38,14 @@ struct Chunk<'a> {
 impl<'de: 'a, 'a> Fields<'de> for Chunk<'a> {
     fn field<A: MapAccess<'de>>(&mut self, key: &str, map: &mut A) -> Result<bool, A::Error> {
         match key {
-            "responseId" => self.response_id = map.next_value()?,
-            "modelVersion" => self.model_version = map.next_value()?,
+            "responseId" => self.response_id = next(map)?,
+            "modelVersion" => self.model_version = next(map)?,
             "usageMetadata" => {
                 map.next_value::<IgnoredAny>()?;
                 self.usage_metadata = true;
             }
-            "error" => self.error = map.next_value()?,
-            "promptFeedback" => self.prompt_feedback = map.next_value()?,
+            "error" => self.error = next(map)?,
+            "promptFeedback" => self.prompt_feedback = next(map)?,
             "candidates" => self.candidates = map.next_value::<First<_>>()?.0,
             _ => return Ok(false),
         }
@@ -73,8 +73,8 @@ struct Candidate<'a> {
 impl<'de: 'a, 'a> Fields<'de> for Candidate<'a> {
     fn field<A: MapAccess<'de>>(&mut self, key: &str, map: &mut A) -> Result<bool, A::Error> {
         match key {
-            "finishReason" => self.finish_reason = map.next_value()?,
-            "finishMessage" => self.finish_message = map.next_value()?,
+            "finishReason" => self.finish_reason = next(map)?,
+            "finishMessage" => self.finish_message = next(map)?,
             "content" => {
                 let content = map.next_value::<Option<Content<'a>>>()?;
                 self.parts = content.and_then(|content| content.parts);
@@ -125,7 +125,7 @@ impl<'de: 'a, 'a> Fields<'de> for Part<'a> {
         if key != "text" {
             return Ok(false);
         }
-        match map.next_value::<Json<'a>>()? {
+        match next::<_, Json<'a>>(map)? {
             Json::Str(text) => self.text = Some(text),
             other => {
                 let value = other.into_value().unwrap_or_default();

@@ -177,6 +177,15 @@ pub(crate) trait Fields<'de>: Default {
     }
 }
 
+/// The next value of `map`, compiled once a type rather than at each field
+/// that reads one.
+#[inline(never)]
+pub(crate) fn next<'de, A: MapAccess<'de>, T: Deserialize<'de>>(
+    map: &mut A,
+) -> Result<T, A::Error> {
+    map.next_value()
+}
+
 /// The object `json` holds, read as `T`'s [`Fields`].
 pub(crate) fn fields<'de, D: Deserializer<'de>, T: Fields<'de>>(json: D) -> Result<T, D::Error> {
     struct Read<T>(PhantomData<T>);
@@ -192,7 +201,7 @@ pub(crate) fn fields<'de, D: Deserializer<'de>, T: Fields<'de>>(json: D) -> Resu
                     continue;
                 }
                 if let Some(rest) = out.rest() {
-                    let value = map.next_value()?;
+                    let value = next(&mut map)?;
                     rest.insert(key.into_owned(), value);
                 } else {
                     map.next_value::<IgnoredAny>()?;

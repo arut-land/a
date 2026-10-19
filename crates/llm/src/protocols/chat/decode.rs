@@ -23,7 +23,7 @@ use serde_json::{Map, Value, json};
 use super::merge::{merge_details, merge_fields, merge_object, merge_str};
 use super::{KEY, PartKind, Quirks, ReasoningField};
 use crate::error::Error;
-use crate::json::{Fields, Json, Lenient, fields, whole_object};
+use crate::json::{Fields, Json, Lenient, fields, next, whole_object};
 use crate::protocol::Flow;
 use crate::spec::{Media, Meta, Reason, SmolStr, Source, Usage};
 use crate::writer::{AUTO_INDEX, CallFragment, End, Open, Writer, Writes};
@@ -176,12 +176,12 @@ impl Choices<'_> {
 impl<'de: 'a, 'a> Fields<'de> for Frame<'a> {
     fn field<A: MapAccess<'de>>(&mut self, key: &str, map: &mut A) -> Result<bool, A::Error> {
         match key {
-            "id" => self.id = map.next_value()?,
-            "model" => self.model = map.next_value()?,
-            "object" => self.object = map.next_value()?,
-            "choices" => self.choices = map.next_value()?,
-            "usage" => self.usage = map.next_value()?,
-            "error" => self.error = map.next_value()?,
+            "id" => self.id = next(map)?,
+            "model" => self.model = next(map)?,
+            "object" => self.object = next(map)?,
+            "choices" => self.choices = next(map)?,
+            "usage" => self.usage = next(map)?,
+            "error" => self.error = next(map)?,
             _ => return Ok(false),
         }
         Ok(true)
@@ -207,12 +207,12 @@ struct Choice<'a> {
 impl<'de: 'a, 'a> Fields<'de> for Choice<'a> {
     fn field<A: MapAccess<'de>>(&mut self, key: &str, map: &mut A) -> Result<bool, A::Error> {
         match key {
-            "index" => self.index = map.next_value()?,
-            "finish_reason" => self.finish_reason = map.next_value()?,
-            "native_finish_reason" => self.native_finish_reason = map.next_value()?,
-            "usage" => self.usage = map.next_value()?,
-            "delta" => self.delta = map.next_value()?,
-            "message" => self.message = map.next_value()?,
+            "index" => self.index = next(map)?,
+            "finish_reason" => self.finish_reason = next(map)?,
+            "native_finish_reason" => self.native_finish_reason = next(map)?,
+            "usage" => self.usage = next(map)?,
+            "delta" => self.delta = next(map)?,
+            "message" => self.message = next(map)?,
             _ => return Ok(false),
         }
         Ok(true)
@@ -242,15 +242,15 @@ struct Delta<'a> {
 impl<'de: 'a, 'a> Fields<'de> for Delta<'a> {
     fn field<A: MapAccess<'de>>(&mut self, key: &str, map: &mut A) -> Result<bool, A::Error> {
         match key {
-            "reasoning_content" => self.reasoning_content = map.next_value()?,
-            "reasoning" => self.reasoning = map.next_value()?,
-            "reasoning_text" => self.reasoning_text = map.next_value()?,
-            "reasoning_details" => self.reasoning_details = map.next_value()?,
-            "audio" => self.audio = map.next_value()?,
-            "content" => self.content = map.next_value()?,
-            "refusal" => self.refusal = map.next_value()?,
-            "images" => self.images = map.next_value()?,
-            "tool_calls" => self.tool_calls = map.next_value()?,
+            "reasoning_content" => self.reasoning_content = next(map)?,
+            "reasoning" => self.reasoning = next(map)?,
+            "reasoning_text" => self.reasoning_text = next(map)?,
+            "reasoning_details" => self.reasoning_details = next(map)?,
+            "audio" => self.audio = next(map)?,
+            "content" => self.content = next(map)?,
+            "refusal" => self.refusal = next(map)?,
+            "images" => self.images = next(map)?,
+            "tool_calls" => self.tool_calls = next(map)?,
             _ => return Ok(false),
         }
         Ok(true)
@@ -276,10 +276,10 @@ struct Call<'a> {
 impl<'de: 'a, 'a> Fields<'de> for Call<'a> {
     fn field<A: MapAccess<'de>>(&mut self, key: &str, map: &mut A) -> Result<bool, A::Error> {
         match key {
-            "index" => self.index = map.next_value()?,
-            "id" => self.id = map.next_value()?,
-            "type" => self.kind = map.next_value()?,
-            "function" => self.function = map.next_value()?,
+            "index" => self.index = next(map)?,
+            "id" => self.id = next(map)?,
+            "type" => self.kind = next(map)?,
+            "function" => self.function = next(map)?,
             _ => return Ok(false),
         }
         Ok(true)
@@ -306,8 +306,8 @@ struct Function<'a> {
 impl<'de: 'a, 'a> Fields<'de> for Function<'a> {
     fn field<A: MapAccess<'de>>(&mut self, key: &str, map: &mut A) -> Result<bool, A::Error> {
         match key {
-            "name" => self.name = map.next_value()?,
-            "arguments" => self.arguments = map.next_value()?,
+            "name" => self.name = next(map)?,
+            "arguments" => self.arguments = next(map)?,
             _ => return Ok(false),
         }
         Ok(true)
