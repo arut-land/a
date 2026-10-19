@@ -8,7 +8,9 @@ use std::os::unix::fs::PermissionsExt;
 use std::process::Command;
 
 use common::{Env, Repl, assert_contiguous, group_alive, is_tool_call, result_of, wait_for};
-use protocol::{Audience, Body, ClientMsg, DaemonMsg, Decision, Outcome, Recap, Target};
+use protocol::{
+    Audience, Body, ClientMsg, DaemonMsg, Mode, Outcome, Permission, Recap, Target, Verdict,
+};
 use serde_json::json;
 
 const ANY: Target = Target::Latest {
@@ -69,12 +71,18 @@ fn resume_after_the_terminal_closes_mid_turn_replays_every_entry() {
     }
     assert_contiguous(&entries);
     assert_eq!(entries, env.log(id));
-    // Input typed while a turn runs is logged as queued first.
+    // Input typed while a turn runs is logged as waiting first.
     let mut bodies: Vec<_> = entries
         .into_iter()
         .map(|e| e.body)
-        .filter(|b| !matches!(b, Body::Queued { .. }))
+        .filter(|b| !matches!(b, Body::Input { taken: false, .. } | Body::Take { .. }))
         .collect();
+    let taken = |text: &str| Body::Input {
+        text: text.into(),
+        mode: Mode::Queue,
+        taken: true,
+        origin: None,
+    };
     let attached = bodies.remove(0);
     assert!(
         matches!(&attached, Body::Environment(shell) if shell.cwd == env.ws),
@@ -83,15 +91,11 @@ fn resume_after_the_terminal_closes_mid_turn_replays_every_entry() {
     assert_eq!(
         bodies,
         [
-            Body::User {
-                text: "hello".into()
-            },
+            taken("hello"),
             Body::Assistant {
                 text: "hello".into()
             },
-            Body::User {
-                text: "sleep 1".into()
-            },
+            taken("sleep 1"),
             Body::ToolCall {
                 tool: "sleep".into(),
                 input: json!({ "seconds": 1 }).into(),
@@ -345,7 +349,9 @@ fn entries_after_a_torn_tail_survive_a_restart() {
 
     env.start();
     let (_, entries) = env.connect().attach(Target::Id(id), &env.ws);
-    let queued = |e: &&protocol::Entry| matches!(e.body, Body::Queued { .. });
+    let queued = |e: &&protocol::Entry| {
+        matches!(e.body, Body::Input { taken: false, .. } | Body::Take { .. })
+    };
     assert_eq!(entries.iter().filter(|e| !queued(e)).count(), 4);
     assert_contiguous(&entries);
     assert_eq!(entries, env.log(id));
@@ -428,10 +434,25 @@ fn a_pending_approval_survives_detach_and_is_re_delivered_on_attach() {
     let mut conn = env.connect();
     let (id, _) = conn.attach(Target::New, &env.ws);
     conn.input("$ echo ran > ran.txt");
-    let asked = conn.until(|e| matches!(e.body, Body::Ask { .. }));
-    let Body::Ask { call } = asked.last().unwrap().body else {
+    let asks = |body: &Body| {
+        matches!(
+            body,
+            Body::Decision {
+                d: Verdict::Permission {
+                    permission: Permission::Ask
+                },
+                ..
+            }
+        )
+    };
+    let asked = conn.until(|e| asks(&e.body)).pop().unwrap();
+    let Body::Decision {
+        call: Some(call), ..
+    } = asked.body
+    else {
         unreachable!()
     };
+    let call = call.get();
     let ask = |msg: DaemonMsg| matches!(msg, DaemonMsg::Ask { call: c, tool, .. } if c == call && tool == "bash");
     assert!(ask(conn.recv()));
     let listed = env.run(&["ls"]);
@@ -440,7 +461,7 @@ fn a_pending_approval_survives_detach_and_is_re_delivered_on_attach() {
 
     let mut conn = env.connect();
     let (_, replayed) = conn.attach(Target::Id(id), &env.ws);
-    assert!(replayed.iter().any(|e| e.body == Body::Ask { call }));
+    assert!(replayed.iter().any(|e| e.seq == asked.seq && asks(&e.body)));
     let recap = Recap {
         prompt: Some("$ echo ran > ran.txt".into()),
         tools: vec!["bash".into()],
@@ -473,20 +494,11 @@ fn a_pending_approval_survives_detach_and_is_re_delivered_on_attach() {
     assert_contiguous(&log);
     let answers: Vec<_> = log
         .iter()
-        .filter(|e| {
-            matches!(
-                e.body,
-                Body::Hook {
-                    decision: Decision::Approval { .. },
-                    ..
-                }
-            )
-        })
+        .filter(|e| matches!(e.body, Body::Answer { .. }))
         .collect();
     assert!(
-        matches!(&answers[..], [e] if matches!(&e.body, Body::Hook {
-            decision: Decision::Approval { approved: true, call: Some(c), .. }, ..
-        } if *c == call)),
+        matches!(&answers[..], [e] if matches!(&e.body, Body::Answer { call: c, value, .. }
+            if c.get() == call && value.parse::<bool>().is_ok_and(|yes| yes))),
         "{log:#?}"
     );
 }

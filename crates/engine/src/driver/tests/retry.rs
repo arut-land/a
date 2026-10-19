@@ -56,7 +56,7 @@ impl Http for Flaky {
     fn send(
         &self,
         _: http::Request<llm::http::Payload>,
-    ) -> BoxFuture<'static, io::Result<llm::http::Response>> {
+    ) -> llm::http::BoxFuture<'static, io::Result<llm::http::Response>> {
         self.sent.fetch_add(1, Ordering::SeqCst);
         let reply = lock(&self.replies).pop_front();
         let response = |status, body: llm::http::Body| {
@@ -110,13 +110,14 @@ fn fixture(registry: Registry, http: &Arc<Flaky>) -> Fixture {
 }
 
 /// The attempts each retry decision starts, by call.
-fn retries(log: &[Entry]) -> Vec<(u64, u32)> {
+fn retries(log: &[Entry]) -> Vec<(u64, u16)> {
     log.iter()
         .filter_map(|e| match &e.body {
-            Body::Hook {
-                decision: Decision::Retry { call, attempt, .. },
+            Body::Decision {
+                call: Some(call),
+                d: Verdict::Retry { attempt, .. },
                 ..
-            } => Some((*call, *attempt)),
+            } => Some((call.get(), *attempt)),
             _ => None,
         })
         .collect()
@@ -138,10 +139,10 @@ fn a_transient_error_is_retried_then_succeeds() {
     ]);
     let session = fixture(quick(), &http).start(&[]);
     let began = Instant::now();
-    session.submit("hi".into()).unwrap();
+    session.submit("hi").unwrap();
     settle(&session);
     let log = log_of(&session);
-    session.stop();
+    session.halt();
 
     assert!(
         began.elapsed() >= Duration::from_millis(30),
@@ -160,24 +161,24 @@ fn a_transient_error_is_retried_then_succeeds() {
 fn what_cannot_pass_is_not_retried() {
     let http = Flaky::new([Reply::Status(401, &[])]);
     let session = fixture(quick(), &http).start(&[]);
-    session.submit("hi".into()).unwrap();
+    session.submit("hi").unwrap();
     settle(&session);
     let log = log_of(&session);
-    session.stop();
+    session.halt();
     assert_eq!(http.sent(), 1);
     assert_eq!(retries(&log), []);
     assert!(matches!(model_result(&log), Some(Outcome::Failed { .. })));
 }
 
-/// Each restart mid-call is an attempt that failed, logged as the retry
-/// it starts; once the extension's attempts are spent, the call fails
-/// with nothing sent, however often the daemon comes back.
+/// #42: each restart mid-call is an attempt that failed, logged as the
+/// retry it starts; once the extension's attempts are spent, the call
+/// fails with nothing sent, however often the daemon comes back.
 #[test]
 fn a_crash_loop_cannot_retry_forever() {
     let cap = Retry::default().attempts;
     for logged in 0..=cap {
         let mut entries = vec![
-            entry(1, Body::User { text: "hi".into() }),
+            entry(1, user("hi")),
             entry(
                 2,
                 Body::ModelCall {
@@ -187,23 +188,19 @@ fn a_crash_loop_cannot_retry_forever() {
             ),
         ];
         for attempt in 1..=logged {
-            let decision = Decision::Retry {
-                call: 2,
+            let retried = Verdict::Retry {
                 attempt,
                 error: "the daemon stopped during the call".into(),
             };
             entries.push(entry(
                 u64::from(attempt) + 2,
-                Body::Hook {
-                    hook: "retry".into(),
-                    decision,
-                },
+                decision("retry", Some(2), retried),
             ));
         }
         let http = Flaky::new([Reply::Events(text_reply())]);
         let session = fixture(quick(), &http).start(&entries);
         let log = log_of(&session);
-        session.stop();
+        session.halt();
         let new = &log[entries.len()..];
         if logged < cap {
             assert_eq!(http.sent(), 1, "{logged}");
@@ -227,13 +224,13 @@ fn an_interrupt_cancels_a_pending_retry() {
         Reply::Events(text_reply()),
     ]);
     let session = fixture(quick(), &http).start(&[]);
-    session.submit("hi".into()).unwrap();
+    session.submit("hi").unwrap();
     until(&session, "decided to retry", |log| !retries(log).is_empty());
     let began = Instant::now();
-    session.interrupt();
+    session.interrupt_now();
     settle(&session);
     let log = log_of(&session);
-    session.stop();
+    session.halt();
 
     assert!(
         began.elapsed() < Duration::from_secs(5),
@@ -246,8 +243,9 @@ fn an_interrupt_cancels_a_pending_retry() {
     );
 }
 
-/// An attempt cut off streams nothing into the next: interrupted, the
-/// call keeps only the text of the attempt it cut off.
+/// #25 `a_retry_streams_one_attempt`: an attempt cut off streams nothing
+/// into the next: interrupted, the call keeps only the text of the attempt
+/// it cut off.
 #[test]
 fn an_interrupted_retry_keeps_only_its_own_text() {
     let full = "The harbor label is crimson-harbor.";
@@ -258,16 +256,16 @@ fn an_interrupted_retry_keeps_only_its_own_text() {
         Reply::Hang(cut(&reply, events - 2)),
     ]);
     let session = fixture(quick(), &http).start(&[]);
-    session.submit("hi".into()).unwrap();
+    session.submit("hi").unwrap();
     until(&session, "retried", |log| !retries(log).is_empty());
     while http.sent() < 2 {
         thread::sleep(Duration::from_millis(5));
     }
     thread::sleep(Duration::from_millis(50));
-    session.interrupt();
+    session.interrupt_now();
     settle(&session);
     let log = log_of(&session);
-    session.stop();
+    session.halt();
 
     let Some(Outcome::Interrupted {
         output: Some(output),

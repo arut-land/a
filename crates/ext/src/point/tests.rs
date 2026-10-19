@@ -55,7 +55,6 @@ macro_rules! every_point {
     ($m:ident) => {
         $m!(
             Input,
-            PrepareStep,
             RequestError,
             PreTool,
             Permission,
@@ -73,7 +72,6 @@ macro_rules! every_point {
 /// The design's merge table ("Hooks intercept only at decision points").
 const TABLE: &[(&str, Merge)] = &[
     ("input", Merge::Chain),
-    ("prepare_step", Merge::Chain),
     ("request_error", Merge::FirstSome),
     ("pre_tool", Merge::Chain),
     ("permission", Merge::MostRestrictive),
@@ -225,14 +223,12 @@ fn merge_rules_are_applied_identically_for_every_point() {
     let texts = ["0", "a", "b"].map(str::to_owned);
     let stop = Some("no".to_owned());
     chains::<Input, _, _>((), texts, stop.clone());
-    chains::<PrepareStep, _, _>((), ["0", "a", "b"].map(request), None);
     chains::<PreTool, _, _>("t", [json!(0), json!(1), json!(2)], stop);
     chains::<Spawn, _, _>((), ["0", "a", "b"].map(spawn), None);
     chains::<PostTool, _, _>(call, ["0", "a", "b"].map(failed), None);
 
     let overflow = llm::Error::new(llm::Kind::ContextOverflow, "overflow");
     let error = Failed {
-        request: &llm::Request::default(),
         error: &overflow,
         attempt: 0,
     };
@@ -287,36 +283,30 @@ fn a_point_with_no_handler_costs_nothing() {
         r.on::<OnStop>(|cx, _| Some(cx.model()));
     })]);
     for hooks in [Hooks::default(), elsewhere] {
-        let mut decided = Decided::new();
-        let mut text = "hi".to_owned();
-        let mut subject = input.clone();
-        let mut outcome = Outcome::Interrupted { output: None };
-        let mut request = llm::Request::default();
-        assert_eq!(hooks.input(&cx, &mut text, &mut decided), Ok(()));
-        assert_eq!(hooks.gate(&cx, "t", &mut subject, &mut decided), Gate::Run);
-        hooks.prepare_step(&cx, 1, &mut request, &mut decided);
+        let outcome = Outcome::Interrupted { output: None };
+        let text = hooks.input(&cx, "hi".to_owned());
+        assert_eq!(text, Ok(Chained::new("hi".to_owned())));
+        let subject = Json::new(&input);
+        assert_eq!(hooks.gate(&cx, "t", &subject), Gated::run(subject));
         let error = llm::Error::new(llm::Kind::Server, "e");
         let failed = Failed {
-            request: &request,
             error: &error,
             attempt: 0,
         };
-        let retry = hooks.request_error(&cx, 1, failed, &mut decided);
-        assert!(retry.is_none());
-        hooks.post_tool(&cx, 1, ("t", &input), &mut outcome, &mut decided);
+        assert!(hooks.request_error(&cx, failed).is_none());
+        let after = hooks.post_tool(&cx, ("t", &input), outcome.clone());
+        assert_eq!(after, Chained::new(outcome));
         hooks.observe(&cx, &Entry::new(1, 0, protocol::Body::INTERRUPT));
         hooks.session_start(&cx);
         hooks.session_end(&cx);
-        assert_eq!((text.as_str(), &subject), ("hi", &input));
-        assert_eq!(decided, Decided::new());
     }
     assert_eq!(view.0.load(Ordering::SeqCst), 0);
     // A handler that reads its context reads it then.
     let reads = hooks(vec![one("reader", |r| {
         r.on::<OnStop>(|cx, _| Some(cx.model()));
     })]);
-    let said = reads.on_stop(&cx, &Vec::new(), &mut Decided::new());
-    assert_eq!(said.as_deref(), Some("test:model"));
+    let said = reads.on_stop(&cx, &Vec::new());
+    assert_eq!(said.map(|(_, text)| text).as_deref(), Some("test:model"));
     assert_eq!(view.0.load(Ordering::SeqCst), 1);
 }
 
@@ -330,16 +320,14 @@ fn gate_logs_what_the_chain_and_the_policy_decided() {
         });
     };
     let gate = |hooks: &Hooks| {
-        let mut input = json!({ "n": 0 });
-        let mut decided = Decided::new();
-        let verdict = hooks.gate(&cx, "t", &mut input, &mut decided);
-        (verdict, input, decided)
+        let gated = hooks.gate(&cx, "t", &Json::new(&json!({ "n": 0 })));
+        (gated.gate, gated.input.value(), gated.decisions)
     };
     let (verdict, input, decided) = gate(&hooks(vec![one("a", bump), one("b", bump)]));
     assert_eq!((verdict, input), (Gate::Run, json!({ "n": 2 })));
     assert_eq!(names(&decided), ["a", "b"]);
     assert!(
-        matches!(&decided[1].1, Decision::PreTool { input, .. } if input.value() == json!({ "n": 2 }))
+        matches!(&decided[1].1, Verdict::PreTool { input } if input.value() == json!({ "n": 2 }))
     );
 
     let blocked = hooks(vec![
@@ -351,7 +339,7 @@ fn gate_logs_what_the_chain_and_the_policy_decided() {
     let (verdict, _, decided) = gate(&blocked);
     assert_eq!(verdict, Gate::Refuse("no".into()));
     assert!(
-        matches!(&decided[..], [(_, Decision::PreTool { .. }), (b, Decision::Block { .. })] if &**b == "b")
+        matches!(&decided[..], [(_, Verdict::PreTool { .. }), (b, Verdict::Block { .. })] if &**b == "b")
     );
 
     let asks = |approve: Option<bool>| {
@@ -369,8 +357,8 @@ fn gate_logs_what_the_chain_and_the_policy_decided() {
     assert!(matches!(
         &decided[..],
         [
-            (_, Decision::Permission { .. }),
-            (_, Decision::Approval { approved: true, .. })
+            (_, Verdict::Permission { .. }),
+            (_, Verdict::Approval { approved: true })
         ]
     ));
     assert_eq!(names(&decided), ["policy", "approver"]);
@@ -407,27 +395,19 @@ fn input_rejections_name_who_and_post_tool_logs_the_original() {
             })
         });
     })]);
-    let mut decided = Decided::new();
-    let mut text = "hi".to_owned();
-    set.input(&cx, &mut text, &mut decided).unwrap();
-    assert_eq!(text, "hi1");
-    assert!(matches!(&decided[..], [(_, Decision::Input { original })] if original == "hi"));
-    let mut refused = "no".to_owned();
-    assert_eq!(
-        set.input(&cx, &mut refused, &mut decided),
-        Err("a: not that".into())
-    );
+    let Chained { value, decisions } = set.input(&cx, "hi".to_owned()).unwrap();
+    assert_eq!(value, "hi1");
+    assert!(matches!(&decisions[..], [(_, Verdict::Input { original })] if original == "hi"));
+    assert_eq!(set.input(&cx, "no".to_owned()), Err("a: not that".into()));
 
-    decided.clear();
-    let mut outcome = Outcome::Interrupted { output: None };
-    set.post_tool(&cx, 7, ("t", &json!({})), &mut outcome, &mut decided);
-    assert_eq!(outcome, Outcome::Failed { error: "t".into() });
+    let outcome = Outcome::Interrupted { output: None };
+    let Chained { value, decisions } = set.post_tool(&cx, ("t", &json!({})), outcome);
+    assert_eq!(value, Outcome::Failed { error: "t".into() });
     assert!(matches!(
-        &decided[..],
+        &decisions[..],
         [(
             _,
-            Decision::PostTool {
-                call: 7,
+            Verdict::PostTool {
                 original: Outcome::Interrupted { output: None }
             }
         )]
@@ -435,9 +415,9 @@ fn input_rejections_name_who_and_post_tool_logs_the_original() {
 }
 
 /// Answers over JSON, as a Lua mod or an extension process would.
-struct Json(fn(&Value) -> Value);
+struct Erased(fn(&Value) -> Value);
 
-impl ErasedHandler for Json {
+impl ErasedHandler for Erased {
     fn on(&self, _: &PointCx<'_>, args: &Value) -> Value {
         (self.0)(args)
     }
@@ -450,26 +430,28 @@ fn erased_handlers_answer_in_json_and_a_policy_that_cannot_be_read_denies() {
     let set = hooks(vec![one("lua", |r| {
         r.on_erased(
             "pre_tool",
-            Arc::new(Json(|args| json!({ "replace": { "tool": args["tool"] } }))),
+            Arc::new(Erased(
+                |args| json!({ "replace": { "tool": args["tool"] } }),
+            )),
         )
         .on_erased(
             "permission",
-            Arc::new(Json(|args| match args["input"]["tool"].as_str() {
+            Arc::new(Erased(|args| match args["input"]["tool"].as_str() {
                 Some("bash") => json!("ask"),
                 _ => json!("maybe"),
             })),
         );
         assert_eq!(r.errors, Vec::<String>::new());
     })]);
-    let mut input = json!({});
-    let mut decided = Decided::new();
-    let gate = set.gate(&cx, "bash", &mut input, &mut decided);
-    assert_eq!((gate, input), (Gate::Ask, json!({ "tool": "bash" })));
-    let mut input = json!({});
-    let gate = set.gate(&cx, "edit", &mut input, &mut decided);
-    assert_eq!(gate, Gate::Refuse("lua denied this call".into()));
+    let gated = set.gate(&cx, "bash", &Json::new(&json!({})));
+    assert_eq!(
+        (gated.gate, gated.input.value()),
+        (Gate::Ask, json!({ "tool": "bash" }))
+    );
+    let gated = set.gate(&cx, "edit", &Json::new(&json!({})));
+    assert_eq!(gated.gate, Gate::Refuse("lua denied this call".into()));
 
     let mut r = Registrar::default();
-    r.on_erased("spawn", Arc::new(Json(|_| Value::Null)));
+    r.on_erased("spawn", Arc::new(Erased(|_| Value::Null)));
     assert_eq!(r.errors, ["point spawn takes no erased handlers"]);
 }

@@ -558,6 +558,7 @@ dependencies = [
  "ext-subagent",
  "futures-core",
  "http",
+ "kernel",
  "llm",
  "memchr",
  "protocol",

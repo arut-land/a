@@ -25,6 +25,12 @@ impl Json {
         Self(serde_json::value::to_raw_value(value).expect("a value always encodes"))
     }
 
+    /// `value` encoded straight to text, with no tree between: what a
+    /// model's reply is stored as.
+    pub fn encode<T: Serialize + ?Sized>(value: &T) -> serde_json::Result<Self> {
+        serde_json::value::to_raw_value(value).map(Self)
+    }
+
     pub fn null() -> Self {
         Self::new(&Value::Null)
     }

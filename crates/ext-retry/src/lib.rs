@@ -13,7 +13,7 @@ use ext::{Extension, Registrar};
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Retry {
     /// Retries per model call; the call fails after the last.
-    pub attempts: u32,
+    pub attempts: u16,
     /// The first wait, doubled for each retry after it.
     pub base: Duration,
     /// The longest wait, the provider's own included.
@@ -58,13 +58,8 @@ mod tests {
 
     use super::*;
 
-    fn after(retry: &Retry, error: &Error, attempt: u32) -> Option<Duration> {
-        let request = llm::Request::default();
-        let failed = Failed {
-            request: &request,
-            error,
-            attempt,
-        };
+    fn after(retry: &Retry, error: &Error, attempt: u16) -> Option<Duration> {
+        let failed = Failed { error, attempt };
         retry.recover(&failed).map(|r| match r {
             Recover::Retry { after } => after,
             Recover::Replace(_) => panic!("a retry sends the same request"),

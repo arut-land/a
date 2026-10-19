@@ -663,14 +663,16 @@ fn a_new_registry_generation_applies_from_the_next_step() {
         ),
         (
             user("hi"),
+            // A turn starts on the newest generation: the input is read
+            // with it.
             vec![
-                append(4, input("hi")),
                 append(
-                    5,
+                    4,
                     Body::Extensions {
                         installed: installed.to_vec(),
                     },
                 ),
+                append(5, input("hi")),
                 append(6, said("hi")),
             ],
         ),

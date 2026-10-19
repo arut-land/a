@@ -29,7 +29,8 @@ pub use ext::{
     Replay,
 };
 use protocol::{
-    Author, CallId, Card, Entry, Installed, Json, Mode, Outcome, Seq, SessionId, WaitOn,
+    Author, CallId, Card, Entry, Environment, Installed, Json, Mode, Outcome, Seq, SessionId,
+    WaitOn,
 };
 use smallvec::SmallVec;
 
@@ -94,6 +95,9 @@ pub enum Event {
     ChildSettled { child: SessionId, outcome: Outcome },
     /// A new registry generation, taken up at the next step boundary.
     Registry(Arc<dyn Registry>),
+    /// The environment the session's commands run in from now on, as
+    /// logged (secrets redacted): logged unless it is the one last logged.
+    Environment(Environment),
 }
 
 /// How a model call ended.
@@ -297,8 +301,9 @@ pub trait Registry: Send + Sync {
     }
 
     /// The `on_stop` point: text for the agent to go on with once it
-    /// stopped.
-    fn on_stop(&self) -> Option<(Name, String)> {
+    /// stopped. `pending` are the entries this step appended, which the
+    /// log the driver commits does not hold yet.
+    fn on_stop(&self, _pending: &[&Entry]) -> Option<(Name, String)> {
         None
     }
 }
@@ -333,4 +338,7 @@ pub struct Load<'a> {
     pub owner: Owner,
     /// Whether the session was marked busy.
     pub busy: bool,
+    /// The extensions the session's header records, if known, which its
+    /// log's `extensions` entries supersede.
+    pub extensions: Option<&'a [Installed]>,
 }

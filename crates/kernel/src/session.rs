@@ -57,26 +57,50 @@ impl Core {
         log: impl IntoIterator<Item = &'e Entry>,
         load: &Load<'_>,
     ) -> (Self, Effects) {
-        let mut fold = Fold::new(registry.agent());
+        let mut core = Self::new(registry);
         for e in log {
-            fold.apply(e, &*registry);
+            core.load(e);
         }
-        // What the log shows the agent stepped through is done.
-        fold.stepped = false;
-        let mut core = Self {
+        let fx = core.resumed(load);
+        (core, fx)
+    }
+
+    /// A session with nothing folded yet: its log is folded in an entry at
+    /// a time with [`Core::load`], as it is read, then it is resumed with
+    /// [`Core::resumed`]. [`Core::resume`] does all three.
+    pub fn new(registry: Arc<dyn Registry>) -> Self {
+        Self {
+            fold: Fold::new(registry.agent()),
             registry,
             next: None,
-            fold,
             turn: Turn::Idle,
-            child: load.owner == Owner::Present,
-            busy: load.busy,
+            child: false,
+            busy: false,
             reported: 0,
             deferred: VecDeque::new(),
-        };
+        }
+    }
+
+    /// Folds entry `e` of the log being loaded, the one after the last.
+    pub fn load(&mut self, e: &Entry) {
+        self.fold.apply(e, &*self.registry);
+    }
+
+    /// Picks the loaded log up where it leaves off: see [`Core::resume`].
+    pub fn resumed(&mut self, load: &Load<'_>) -> Effects {
+        // What the log shows the agent stepped through is done.
+        self.fold.stepped = false;
+        self.child = load.owner == Owner::Present;
+        self.busy = load.busy;
         let mut fx = Effects::new();
-        core.recover(load, &mut fx);
-        core.finish(&mut fx);
-        (core, fx)
+        let installed = self.registry.installed();
+        let logged = self.fold.ledger.extensions().or(load.extensions);
+        if logged.is_some_and(|logged| logged != installed) {
+            self.append(&mut fx, Body::Extensions { installed });
+        }
+        self.recover(load, &mut fx);
+        self.finish(&mut fx);
+        fx
     }
 
     /// What follows `event`.
@@ -136,6 +160,11 @@ impl Core {
             }
             Event::ChildSettled { child, outcome } => self.child_settled(child, outcome, &mut fx),
             Event::Registry(registry) => self.next = Some(registry),
+            Event::Environment(env) => {
+                if self.fold.ledger.env() != Some(&env) {
+                    self.append(&mut fx, Body::Environment(env));
+                }
+            }
         }
         self.finish(&mut fx);
         fx
@@ -168,6 +197,14 @@ impl Core {
         if self.resent(origin) {
             return reply(fx, ticket, Ok(()));
         }
+        // Nothing runs or waits, so nothing comes between: it starts now, a
+        // turn on the newest registry generation.
+        let taken = self.turn == Turn::Idle
+            && self.fold.asked.is_empty()
+            && self.fold.ledger.untaken().is_empty();
+        if taken {
+            self.resolve(fx);
+        }
         let Chained {
             value: text,
             decisions,
@@ -178,10 +215,6 @@ impl Core {
         for (by, d) in decisions {
             self.decide(None, &by, d, fx);
         }
-        // Nothing runs or waits, so nothing comes between: it starts now.
-        let taken = self.turn == Turn::Idle
-            && self.fold.asked.is_empty()
-            && self.fold.ledger.untaken().is_empty();
         self.append(
             fx,
             Body::Input {
@@ -515,9 +548,10 @@ impl Core {
                 self.act(next, fx);
                 continue;
             }
-            if mem::take(&mut self.fold.stepped)
-                && let Some((by, text)) = self.registry.on_stop()
-            {
+            let stopped = mem::take(&mut self.fold.stepped)
+                .then(|| self.registry.on_stop(&appended(fx)))
+                .flatten();
+            if let Some((by, text)) = stopped {
                 self.decide(None, &by, Verdict::OnStop { text }, fx);
                 continue;
             }
@@ -1014,6 +1048,16 @@ impl Core {
             Turn::Idle | Turn::Model { .. } => {}
         }
     }
+}
+
+/// The entries `fx` appends.
+fn appended(fx: &Effects) -> SmallVec<[&Entry; 8]> {
+    (fx.iter())
+        .filter_map(|e| match e {
+            Effect::Append(e) => Some(e),
+            _ => None,
+        })
+        .collect()
 }
 
 fn reply(fx: &mut Effects, ticket: Option<Ticket>, result: Result<(), String>) {

@@ -10,7 +10,26 @@ use sys::Home;
 
 use ext::host::Registry;
 
-use super::{Config, Daemon};
+use super::{Attachment, Config, Daemon, Live};
+
+impl Daemon {
+    /// [`Daemon::resolve`], from a test's thread.
+    pub(crate) fn attach_to(
+        &self,
+        target: &Target,
+        workspace: impl FnOnce() -> PathBuf,
+    ) -> std::io::Result<Attachment> {
+        rt::block_on(self.resolve(target, workspace))
+    }
+
+    /// The loaded sessions `parent` owns.
+    fn children(&self, parent: SessionId) -> Vec<std::sync::Arc<Live>> {
+        (self.slots().into_iter())
+            .filter(|s| s.header.parent.is_some_and(|p| p.session == parent))
+            .filter_map(|s| s.live())
+            .collect()
+    }
+}
 
 fn home(name: &str) -> (PathBuf, Home) {
     let root = std::env::temp_dir().join(format!("a-engine-{name}-{}", std::process::id()));
@@ -45,16 +64,22 @@ fn echo() -> Config {
     }
 }
 
+/// Waits until every loaded session has taken what it was sent and has no
+/// work.
 fn settle(daemon: &Daemon) {
     let deadline = Instant::now() + Duration::from_secs(10);
+    for live in daemon.loaded() {
+        live.barrier();
+    }
     while !daemon.idle() {
         assert!(Instant::now() < deadline, "work never finished");
         std::thread::sleep(Duration::from_millis(5));
     }
 }
 
+/// Session `id`'s log; none if it is not made yet.
 fn bodies(store: &dyn LogStore, id: SessionId) -> Vec<Body> {
-    let entries = store.entries(id).unwrap();
+    let entries = store.entries(id).unwrap_or_default();
     entries.into_iter().map(|e| e.body).collect()
 }
 
@@ -62,24 +87,24 @@ fn bodies(store: &dyn LogStore, id: SessionId) -> Vec<Body> {
 fn idle_sessions_hibernate_and_reload_on_attach() {
     let (root, home) = home("hibernate");
     let daemon = Daemon::load(&home, &echo()).unwrap();
-    let attachment = daemon.resolve(&Target::New, || "/w".into()).unwrap();
+    let attachment = daemon.attach_to(&Target::New, || "/w".into()).unwrap();
     let id = attachment.session().id;
-    attachment.session().submit("hi".into()).unwrap();
+    attachment.session().submit("hi").unwrap();
     settle(&daemon);
     drop(attachment);
 
     daemon.hibernate(Duration::ZERO);
-    let hibernated = daemon.slots()[0].residence.lock().unwrap().live().is_none();
+    let hibernated = daemon.slots()[0].live().is_none();
     let listed = daemon.list();
     let again = daemon
-        .resolve(&Target::Id(id), || "/elsewhere".into())
+        .attach_to(&Target::Id(id), || "/elsewhere".into())
         .unwrap();
     let reloaded = again.session().summary().entries;
     let mine = Target::Latest {
         any_workspace: false,
     };
-    let latest = daemon.resolve(&mine, || "/w".into());
-    let missing = daemon.resolve(&mine, || "/x".into());
+    let latest = daemon.attach_to(&mine, || "/w".into());
+    let missing = daemon.attach_to(&mine, || "/x".into());
     // The reloaded session's recovery pass touches its busy marker.
     settle(&daemon);
     std::fs::remove_dir_all(&root).unwrap();
@@ -100,9 +125,9 @@ fn a_hibernated_session_lists_the_entries_it_has_now() {
     let mut counts = Vec::new();
     let mut target = Target::New;
     for text in ["one", "two"] {
-        let attachment = daemon.resolve(&target, || "/w".into()).unwrap();
+        let attachment = daemon.attach_to(&target, || "/w".into()).unwrap();
         target = Target::Id(attachment.session().id);
-        attachment.session().submit(text.into()).unwrap();
+        attachment.session().submit(text).unwrap();
         settle(&daemon);
         drop(attachment);
         daemon.hibernate(Duration::ZERO);
@@ -164,18 +189,19 @@ fn busy_sessions_recover_at_startup() {
     // The log's header predates extension records, so recovery notes them
     // first. The safe sleep runs again; the shell command is not rerun.
     assert!(matches!(&got[2], Body::Extensions { installed } if installed.len() == 7));
-    assert!(matches!(
-        &got[3],
-        Body::ToolResult { call: 1, outcome: Outcome::Done { output }, card: None } if output.value()["slept"] == 0
-    ));
-    assert!(matches!(
-        &got[4],
-        Body::ToolResult {
-            call: 2,
-            outcome: Outcome::Interrupted { output: None },
-            card: None,
-        }
-    ));
+    let result = |call| {
+        got.iter().find_map(|b| match b {
+            Body::ToolResult {
+                call: c, outcome, ..
+            } if *c == call => Some(outcome),
+            _ => None,
+        })
+    };
+    assert!(
+        matches!(result(1), Some(Outcome::Done { output }) if output.value()["slept"] == 0),
+        "{got:#?}"
+    );
+    assert_eq!(result(2), Some(&Outcome::Interrupted { output: None }));
     assert_eq!(got.len(), 5);
     assert!(!still_busy);
 }
@@ -190,9 +216,9 @@ fn a_session_waiting_for_approval_stays_waiting_through_hibernation_and_a_restar
         ..echo()
     };
     let daemon = Daemon::load(&home, &config).unwrap();
-    let attachment = daemon.resolve(&Target::New, || "/w".into()).unwrap();
+    let attachment = daemon.attach_to(&Target::New, || "/w".into()).unwrap();
     let id = attachment.session().id;
-    attachment.session().submit("$ echo hi".into()).unwrap();
+    attachment.session().submit("$ echo hi").unwrap();
     settle(&daemon);
     drop(attachment);
     daemon.hibernate(Duration::ZERO);
@@ -202,12 +228,7 @@ fn a_session_waiting_for_approval_stays_waiting_through_hibernation_and_a_restar
 
     let restarted = Daemon::load(&home, &config).unwrap();
     let listed = restarted.list().remove(0);
-    let asked = restarted.slots()[0]
-        .residence
-        .lock()
-        .unwrap()
-        .live()
-        .map(|s| s.summary().activity);
+    let asked = restarted.slots()[0].live().map(|s| s.summary().activity);
     drop(restarted);
     std::fs::remove_dir_all(&root).unwrap();
 
@@ -237,9 +258,9 @@ fn asking(name: &str) -> (PathBuf, Home, super::Owner) {
 #[test]
 fn no_writer_outlives_its_daemon() {
     let (root, home, daemon) = asking("outlives");
-    let waiting = daemon.resolve(&Target::New, || "/w".into()).unwrap();
-    waiting.session().submit("$ echo hi".into()).unwrap();
-    let idle = daemon.resolve(&Target::New, || "/w".into()).unwrap();
+    let waiting = daemon.attach_to(&Target::New, || "/w".into()).unwrap();
+    waiting.session().submit("$ echo hi").unwrap();
+    let idle = daemon.attach_to(&Target::New, || "/w".into()).unwrap();
     settle(&daemon);
     let ended = [waiting.session().ended(), idle.session().ended()];
     let id = waiting.session().id;
@@ -249,7 +270,7 @@ fn no_writer_outlives_its_daemon() {
     let store = Jsonl::open(home.sessions_dir()).unwrap();
     let at_exit = store.count(id).unwrap();
     // A client still holding on cannot write either: the log is closed.
-    let refused = waiting.session().submit("more".into());
+    let refused = waiting.session().submit("more");
     let after = store.count(id).unwrap();
     drop((waiting, idle));
     std::fs::remove_dir_all(&root).unwrap();
@@ -262,9 +283,9 @@ fn no_writer_outlives_its_daemon() {
 #[test]
 fn a_hibernated_session_reloads_only_after_its_actor_has_exited() {
     let (root, _, daemon) = asking("reload");
-    let attachment = daemon.resolve(&Target::New, || "/w".into()).unwrap();
+    let attachment = daemon.attach_to(&Target::New, || "/w".into()).unwrap();
     let id = attachment.session().id;
-    attachment.session().submit("$ echo hi".into()).unwrap();
+    attachment.session().submit("$ echo hi").unwrap();
     settle(&daemon);
     let first = attachment.session().ended();
     drop(attachment);
@@ -272,7 +293,7 @@ fn a_hibernated_session_reloads_only_after_its_actor_has_exited() {
     // Hibernated while its actor still waits for the answer, then wanted
     // at once.
     daemon.hibernate(Duration::ZERO);
-    let again = daemon.resolve(&Target::Id(id), || "/w".into()).unwrap();
+    let again = daemon.attach_to(&Target::Id(id), || "/w".into()).unwrap();
     let over = first.is_over();
     let asks = again.session().summary().activity;
     drop(again);
@@ -297,9 +318,9 @@ fn fired(bodies: &[Body]) -> Vec<&Outcome> {
 fn a_parent_hears_from_its_child_exactly_once() {
     let (root, home) = home("links");
     let daemon = Daemon::load(&home, &echo()).unwrap();
-    let parent = daemon.resolve(&Target::New, || "/w".into()).unwrap();
+    let parent = daemon.attach_to(&Target::New, || "/w".into()).unwrap();
     let id = parent.session().id;
-    parent.session().submit("spawn hi".into()).unwrap();
+    parent.session().submit("spawn hi").unwrap();
     settle(&daemon);
     drop(parent);
     let store = &*daemon.shared.store;
@@ -313,7 +334,7 @@ fn a_parent_hears_from_its_child_exactly_once() {
         any_workspace: false,
     };
     let resumed = daemon
-        .resolve(&latest, || "/w".into())
+        .attach_to(&latest, || "/w".into())
         .unwrap()
         .session()
         .id;
@@ -321,18 +342,14 @@ fn a_parent_hears_from_its_child_exactly_once() {
     // The child working again reports nothing: the parent's watch fired,
     // so the hibernated parent stays unloaded.
     daemon.hibernate(Duration::ZERO);
-    let again = daemon.resolve(&Target::Id(child), || "/w".into()).unwrap();
-    again.session().submit("more".into()).unwrap();
+    let again = daemon
+        .attach_to(&Target::Id(child), || "/w".into())
+        .unwrap();
+    again.session().submit("more").unwrap();
     settle(&daemon);
     drop(again);
     let parent_slot = daemon.slots().into_iter().find(|s| s.header.id == id);
-    let parent_loaded = parent_slot
-        .unwrap()
-        .residence
-        .lock()
-        .unwrap()
-        .live()
-        .is_some();
+    let parent_loaded = parent_slot.unwrap().live().is_some();
     drop(daemon);
 
     // A restart finds nothing left to fire.
@@ -379,7 +396,12 @@ fn a_parent_hears_from_its_child_exactly_once() {
     assert_eq!(
         child_log,
         [
-            Body::User { text: "hi".into() },
+            Body::Input {
+                text: "hi".into(),
+                mode: protocol::Mode::Queue,
+                taken: true,
+                origin: None,
+            },
             Body::Assistant { text: "hi".into() },
         ]
     );
@@ -390,7 +412,7 @@ fn a_parent_hears_from_its_child_exactly_once() {
 fn a_child_runs_in_its_parents_environment() {
     let (root, home) = home("child-env");
     let daemon = Daemon::load(&home, &echo()).unwrap();
-    let parent = daemon.resolve(&Target::New, || "/w".into()).unwrap();
+    let parent = daemon.attach_to(&Target::New, || "/w".into()).unwrap();
     let id = parent.session().id;
     let vars = [("PATH", "/venv/bin"), ("API_TOKEN", "s3cret")];
     let env = Environment {
@@ -398,8 +420,8 @@ fn a_child_runs_in_its_parents_environment() {
         vars: vars.map(|(k, v)| (k.into(), v.into())).into(),
         ..Environment::default()
     };
-    parent.session().set_env(env.clone()).unwrap();
-    parent.session().submit("spawn hi".into()).unwrap();
+    parent.session().set_env(env.clone());
+    parent.session().submit("spawn hi").unwrap();
     settle(&daemon);
     drop(parent);
     let store = &*daemon.shared.store;
@@ -535,19 +557,12 @@ fn an_owner_idles_with_its_children_and_an_interrupt_stops_them_first() {
     let (root, home) = home("owned");
     std::fs::create_dir_all(&root).unwrap();
     let daemon = Daemon::load(&home, &echo()).unwrap();
-    let parent = daemon.resolve(&Target::New, || root.clone()).unwrap();
+    let parent = daemon.attach_to(&Target::New, || root.clone()).unwrap();
     let id = parent.session().id;
-    parent.session().submit("spawn $ sleep 100".into()).unwrap();
+    parent.session().submit("spawn $ sleep 100").unwrap();
     drop(parent);
     let slot = daemon.slots().into_iter().find(|s| s.header.id == id);
-    let session = slot
-        .unwrap()
-        .residence
-        .lock()
-        .unwrap()
-        .live()
-        .cloned()
-        .unwrap();
+    let session = slot.unwrap().live().unwrap();
     let log = until(&daemon, id, |log| {
         log.iter().any(|b| matches!(b, Body::Watch { .. }))
     });
@@ -572,11 +587,15 @@ fn an_owner_idles_with_its_children_and_an_interrupt_stops_them_first() {
     assert_eq!(busy, Duration::ZERO);
     let aborted = |b: &Body| matches!(b, Body::ToolResult { outcome: Outcome::Done { output }, .. } if output.value()["aborted"] == true);
     assert!(child_log.iter().any(aborted), "{child_log:#?}");
-    // The child settles first, and its parent's call hears how.
-    let heard = |b: &Body| matches!(b, Body::ToolResult { outcome: Outcome::Done { output }, .. } if output.value().as_str().is_some_and(|t| t.contains("aborted")));
-    let tail: Vec<_> = parent_log.iter().rev().take(2).collect();
+    // The child settles first, then its parent's call, then the turn.
+    let interrupted = Outcome::Interrupted { output: None };
+    let tail: Vec<_> = parent_log.iter().rev().take(3).collect();
     assert!(
-        matches!(tail[..], [result, Body::Fired { .. }] if heard(result)),
+        matches!(tail[..], [
+            Body::Interrupt { .. },
+            Body::ToolResult { outcome, .. },
+            Body::Fired { .. },
+        ] if *outcome == interrupted),
         "{parent_log:#?}"
     );
     assert!(unloaded);
@@ -632,6 +651,7 @@ fn an_orphan_does_not_resume_what_it_was_doing() {
                     outcome: Outcome::Interrupted { output: None },
                     ..
                 },
+                Body::Interrupt { origin: None },
             ]
         ),
         "{got:#?}"
@@ -703,13 +723,13 @@ fn the_supervisor_sleeps_until_a_deadline_and_never_polls() {
     }));
     wait_until("the first look", || EVENTS.count("wake") > 0);
 
-    let attachment = daemon.resolve(&Target::New, || "/w".into()).unwrap();
+    let attachment = daemon.attach_to(&Target::New, || "/w".into()).unwrap();
     let id = attachment.session().id;
-    attachment.session().submit("$ true".into()).unwrap();
+    attachment.session().submit("$ true").unwrap();
     settle(&daemon);
     let detached = Instant::now();
     drop(attachment);
-    let hibernated = || daemon.slots()[0].residence.lock().unwrap().live().is_none();
+    let hibernated = || daemon.slots()[0].live().is_none();
     wait_until("hibernation", hibernated);
     let after = detached.elapsed();
 
@@ -726,7 +746,7 @@ fn the_supervisor_sleeps_until_a_deadline_and_never_polls() {
     );
     assert_eq!(idle_wakes, 0);
     assert!(wakes < 20, "{wakes} wakes for one turn");
-    assert_eq!(names, ["effect", "step", "hibernate"]);
+    assert_eq!(names, ["load", "busy", "effect", "settled", "hibernate"]);
 }
 
 #[test]
@@ -800,7 +820,7 @@ fn watchers_are_sent_the_session_list_as_it_changes() {
         "the list as it is, at once"
     );
 
-    let attachment = daemon.resolve(&Target::New, || "/w".into()).unwrap();
+    let attachment = daemon.attach_to(&Target::New, || "/w".into()).unwrap();
     wait_until("the new session listed", || {
         latest(&|list| list.len() == 1 && list[0].clients == 1)
     });
@@ -824,7 +844,7 @@ fn a_session_is_found_by_any_unambiguous_prefix_of_its_id() {
     let ids: Vec<SessionId> = (0..2)
         .map(|_| {
             daemon
-                .resolve(&Target::New, || "/w".into())
+                .attach_to(&Target::New, || "/w".into())
                 .unwrap()
                 .session()
                 .id
@@ -832,7 +852,7 @@ fn a_session_is_found_by_any_unambiguous_prefix_of_its_id() {
         .collect();
     let found = |prefix: String| {
         daemon
-            .resolve(&Target::Prefix(prefix), || "/w".into())
+            .attach_to(&Target::Prefix(prefix), || "/w".into())
             .map(|a| a.session().id)
     };
     assert_eq!(found(ids[0].to_string()).unwrap(), ids[0]);

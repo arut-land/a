@@ -10,6 +10,7 @@ events = []
 
 [dependencies]
 ext.workspace = true
+kernel.workspace = true
 llm = { workspace = true, features = ["ureq"] }
 memchr.workspace = true
 rt.workspace = true

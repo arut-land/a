@@ -62,7 +62,7 @@ mod tests {
     use ext::host::Decided;
     use ext::point::View;
     use ext::{Facts, PointCx, Replay, States};
-    use protocol::{Decision, SessionId};
+    use protocol::{Json, SessionId, Verdict};
     use serde_json::json;
 
     use super::*;
@@ -91,7 +91,9 @@ mod tests {
     fn gate(registry: &Registry, tool: &str, decided: &mut Decided) -> Gate {
         let view = Bare;
         let cx = PointCx::new(SessionId::new(), Path::new("/w"), &view);
-        registry.hooks().gate(&cx, tool, &mut json!({}), decided)
+        let gated = registry.hooks().gate(&cx, tool, &Json::new(&json!({})));
+        *decided = gated.decisions;
+        gated.gate
     }
 
     fn tools(registry: &Registry) -> Vec<String> {
@@ -122,7 +124,7 @@ mod tests {
         let mut decided = Decided::new();
         assert_eq!(gate(&registry, "bash", &mut decided), Gate::Ask);
         assert!(
-            matches!(&decided[..], [(name, Decision::Permission { .. })] if &**name == "policy")
+            matches!(&decided[..], [(name, Verdict::Permission { .. })] if &**name == "policy")
         );
 
         let prompt = registry.system_prompt();

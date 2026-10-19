@@ -1,6 +1,6 @@
 use std::future::Future;
 
-use protocol::{Card, Decision, Json, Permission};
+use protocol::{Card, Json, Permission, Verdict};
 use serde_json::json;
 
 use super::*;
@@ -107,7 +107,9 @@ impl View for Bare {
 fn gate(registry: &Registry, tool: &str, decided: &mut Decided) -> point::Gate {
     let view = Bare;
     let cx = PointCx::new(SessionId::new(), Path::new("/w"), &view);
-    registry.hooks().gate(&cx, tool, &mut json!({}), decided)
+    let gated = registry.hooks().gate(&cx, tool, &Json::new(&json!({})));
+    *decided = gated.decisions;
+    gated.gate
 }
 
 fn names(tools: &Toolset) -> Vec<String> {
@@ -246,7 +248,7 @@ fn a_later_extension_of_the_same_name_replaces_the_earlier_in_place() {
         gate(&registry, "b", &mut decided),
         point::Gate::Refuse("policy denied this call".into())
     );
-    assert!(matches!(&decided[..], [(name, Decision::Permission { .. })] if &**name == "policy"));
+    assert!(matches!(&decided[..], [(name, Verdict::Permission { .. })] if &**name == "policy"));
     assert_eq!(
         gate(&registry, "a", &mut decided),
         point::Gate::Refuse("other denied this call".into())

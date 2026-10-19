@@ -61,6 +61,9 @@ impl Fixture {
 impl Fixture {
     fn settle(&self) {
         let deadline = Instant::now() + Duration::from_secs(10);
+        for live in self.daemon.loaded() {
+            live.barrier();
+        }
         while self.daemon.has_work() {
             assert!(Instant::now() < deadline, "work never finished");
             std::thread::sleep(Duration::from_millis(5));
@@ -146,17 +149,14 @@ fn origin(client: u32, client_seq: u64) -> Origin {
     Origin { client, client_seq }
 }
 
+/// Whether `body` is a client's input.
+fn is_input(body: &Body) -> bool {
+    matches!(body, Body::User { .. } | Body::Input { .. })
+}
+
 fn users(msgs: &[DaemonMsg]) -> usize {
     msgs.iter()
-        .filter(|m| {
-            matches!(
-                m,
-                DaemonMsg::Entry(Entry {
-                    body: Body::User { .. },
-                    ..
-                })
-            )
-        })
+        .filter(|m| matches!(m, DaemonMsg::Entry(Entry { body, .. }) if is_input(body)))
         .count()
 }
 
@@ -176,7 +176,7 @@ fn a_pipelined_hello_attach_and_input_are_answered_in_order() {
     // The input is logged before it is acknowledged.
     let logged = peer.recv();
     assert!(
-        matches!(&logged, DaemonMsg::Entry(e) if matches!(e.body, Body::User { .. })),
+        matches!(&logged, DaemonMsg::Entry(e) if is_input(&e.body)),
         "{logged:?}"
     );
     assert!(matches!(peer.recv(), DaemonMsg::Ack { origin: o } if o == origin(1, 1)));
@@ -229,10 +229,7 @@ fn a_repeated_mutation_is_answered_again_but_not_done_again() {
     };
     fixture.settle();
     let entries = fixture.daemon.shared.store.entries(sessions[0].id).unwrap();
-    let inputs = entries
-        .iter()
-        .filter(|e| matches!(e.body, Body::User { .. }))
-        .count();
+    let inputs = entries.iter().filter(|e| is_input(&e.body)).count();
     assert_eq!(inputs, 1);
 }
 
@@ -369,7 +366,8 @@ fn far_behind_a_client_gets_a_snapshot_if_it_takes_them() {
     let Some(DaemonMsg::Snapshot(view)) = snapshotted.get(2) else {
         panic!("no snapshot: {snapshotted:?}");
     };
-    assert_eq!((view.items.len(), view.seq), (300, 301));
+    // Each was answered as the session recovered, before the attach.
+    assert_eq!((view.items.len(), view.seq), (600, 601));
     assert_eq!(users(&snapshotted), 0);
     let replayed = replay(Caps::NONE);
     assert!(
@@ -388,14 +386,14 @@ fn a_client_that_falls_behind_is_caught_up_from_the_log() {
     let fixture = Fixture::new("behind");
     let attachment = fixture
         .daemon
-        .resolve(&Target::New, || "/w".into())
+        .attach_to(&Target::New, || "/w".into())
         .unwrap();
     let session = attachment.session();
     let outbox = Outbox::new(Caps::NONE);
-    session.attach(&outbox, 0);
+    rt::block_on(session.attach(outbox.clone(), 0));
     let big = "x".repeat(1 << 20);
     for _ in 0..6 {
-        session.submit(big.clone()).unwrap();
+        session.submit(&big).unwrap();
     }
     fixture.settle();
 

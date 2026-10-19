@@ -114,7 +114,7 @@ fn bridge_speaks_the_protocol_over_stdio() {
     assert!(matches!(recv(), DaemonMsg::Synced { seq: 0 }));
     assert!(matches!(
         recv(),
-        DaemonMsg::Entry(e) if e.body == Body::User { text: "hi".into() }
+        DaemonMsg::Entry(e) if matches!(&e.body, Body::Input { text, taken: true, .. } if text == "hi")
     ));
 
     // Closing stdin ends the connection, and with it the bridge.

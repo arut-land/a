@@ -16,6 +16,7 @@ const BUSY_LOAD: Load<'static> = Load {
     fresh: true,
     owner: Owner::None,
     busy: true,
+    extensions: None,
 };
 
 fn resume(

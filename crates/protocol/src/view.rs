@@ -17,8 +17,8 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
 use crate::{
-    Body, Card, DaemonMsg, Decision, Decode, Entry, Environment, Json, Outcome, Permission, Recap,
-    SessionId, SessionSummary,
+    Audience, Body, Card, DaemonMsg, Decision, Decode, Entry, Environment, Json, Outcome,
+    Permission, Recap, SessionId, SessionSummary, Verdict, WaitOn,
 };
 
 /// One session as a client shows it. Its serialized form is also what a
@@ -33,6 +33,10 @@ pub struct SessionView {
     pub items: Vec<Item>,
     /// The environment the session's commands run in.
     pub environment: Option<Environment>,
+    /// Input waiting to be taken up, by the seq of its entry: shown once
+    /// it is.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub queued: Vec<(u64, String)>,
     /// The recap the daemon sent on the latest attach.
     #[serde(skip)]
     pub recap: Option<Recap>,
@@ -506,9 +510,40 @@ impl SessionView {
         self.seq = e.seq;
         let seq = e.seq;
         let item = match &e.body {
-            Body::User { text } => Item::User {
+            Body::User { text }
+            | Body::Input {
+                text, taken: true, ..
+            } => Item::User {
                 seq,
                 text: text.clone(),
+            },
+            Body::Input { text, .. } => {
+                self.queued.push((seq, text.clone()));
+                return None;
+            }
+            Body::Take { input } => {
+                let at = self.queued.iter().position(|(s, _)| *s == input.get())?;
+                let (_, text) = self.queued.remove(at);
+                Item::User { seq, text }
+            }
+            Body::ToolCall {
+                tool,
+                input,
+                by: Audience::User,
+                ..
+            } => return Some(self.command(seq, tool, input)),
+            Body::Decision {
+                call: Some(call),
+                d:
+                    Verdict::Permission {
+                        permission: Permission::Ask,
+                    },
+                ..
+            } => return self.approval(call.get(), Approval::Pending),
+            Body::Decision { by, call, d } => Item::Hook {
+                seq,
+                hook: by.clone(),
+                decision: self.decision(call.map(crate::CallId::get), d),
             },
             Body::Assistant { text } => Item::Assistant {
                 seq,
@@ -579,6 +614,9 @@ impl SessionView {
                 card,
             } => {
                 let at = self.call(*call)?;
+                if let Item::Command { .. } = self.items[at] {
+                    return self.command_result(*call, outcome);
+                }
                 let Item::Tool {
                     outcome: o,
                     card: shown,
@@ -593,16 +631,22 @@ impl SessionView {
                 }
                 Some(self.updated(at, Part::Outcome))
             }
-            Body::CommandResult { call, outcome } => {
-                let at = self.call(*call)?;
-                let Item::Command { outcome: o, .. } = &mut self.items[at] else {
-                    return None;
-                };
-                *o = Some(outcome.clone());
-                Some(self.updated(at, Part::Outcome))
-            }
+            Body::CommandResult { call, outcome } => self.command_result(*call, outcome),
             Body::ModelResult { call, outcome } => self.replied(*call, outcome),
             Body::Ask { call } => self.approval(*call, Approval::Pending),
+            Body::Wait {
+                call,
+                on: WaitOn::Approval,
+            } => self.approval(call.get(), Approval::Pending),
+            Body::Answer { call, value, .. } => {
+                let approved = value.parse::<bool>().ok()?;
+                let to = if approved {
+                    Approval::Approved
+                } else {
+                    Approval::Denied
+                };
+                self.approval(call.get(), to)
+            }
             Body::Hook {
                 decision:
                     Decision::Approval {
@@ -638,6 +682,93 @@ impl SessionView {
                 Some(self.updated(at, Part::Outcome))
             }
             _ => None,
+        }
+    }
+
+    fn command_result(&mut self, call: u64, outcome: &Outcome) -> Option<Change> {
+        let at = self.call(call)?;
+        let Item::Command { outcome: o, .. } = &mut self.items[at] else {
+            return None;
+        };
+        *o = Some(outcome.clone());
+        Some(self.updated(at, Part::Outcome))
+    }
+
+    /// A command the user ran, called `seq`. The input that ran it is
+    /// shown as the command it is.
+    fn command(&mut self, seq: u64, tool: &str, input: &Json) -> Change {
+        let args = input.value()["args"]
+            .as_str()
+            .unwrap_or_default()
+            .to_owned();
+        let item = Item::Command {
+            call: seq,
+            name: tool.to_owned(),
+            args,
+            outcome: None,
+        };
+        let typed = |text: &str| {
+            let rest = text.strip_prefix('/').unwrap_or_default();
+            rest.split_whitespace().next() == Some(tool)
+        };
+        if let Some(Item::User { text, .. }) = self.items.last()
+            && typed(text)
+        {
+            let at = self.items.len() - 1;
+            self.items[at] = item;
+            return self.updated(at, Part::Outcome);
+        }
+        self.items.push(item.clone());
+        Change::Added {
+            index: self.items.len() - 1,
+            item,
+        }
+    }
+
+    /// Verdict `d` about call `call`, as a hook item shows it: the call
+    /// names the tool.
+    fn decision(&self, call: Option<u64>, d: &Verdict) -> Decision {
+        let tool = || match call
+            .and_then(|call| self.call(call))
+            .map(|at| &self.items[at])
+        {
+            Some(Item::Tool { tool, .. }) => tool.clone(),
+            Some(Item::Command { name, .. }) => name.clone(),
+            _ => String::new(),
+        };
+        let call = call.unwrap_or_default();
+        match d {
+            Verdict::PrepareStep => Decision::PrepareStep { call },
+            Verdict::PreTool { input } => Decision::PreTool {
+                tool: tool(),
+                input: input.clone(),
+            },
+            Verdict::Block { reason } => Decision::Block {
+                tool: tool(),
+                reason: reason.clone(),
+            },
+            Verdict::Permission { permission } => Decision::Permission {
+                tool: tool(),
+                permission: *permission,
+            },
+            Verdict::Approval { approved } => Decision::Approval {
+                tool: tool(),
+                approved: *approved,
+                call: None,
+            },
+            Verdict::PostTool { original } => Decision::PostTool {
+                call,
+                original: original.clone(),
+            },
+            Verdict::OnStop { text } => Decision::OnStop { text: text.clone() },
+            Verdict::Input { original } => Decision::Input {
+                original: original.clone(),
+            },
+            Verdict::Retry { attempt, error } => Decision::Retry {
+                call,
+                attempt: (*attempt).into(),
+                error: error.clone(),
+            },
         }
     }
 

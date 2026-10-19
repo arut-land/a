@@ -1,15 +1,15 @@
-//! What a session's log says, read back: the conversation the model sees,
-//! the agent's state, what waits for the user or the agent, and a recap.
+//! What a session's log says, read back for the model and for clients that
+//! fold no ledger: the conversation the model sees, the asks still
+//! waiting, and a recap.
 
 use std::borrow::Borrow;
-use std::collections::{HashMap, VecDeque};
+use std::collections::HashMap;
 use std::sync::Arc;
 
 use ext::host::Registry;
-use ext::{Action, Agent, Input};
 use llm::{Assistant, Message, Messages, ToolMessage, ToolResult};
 use protocol::ledger::Ledger;
-use protocol::{Body, CallId, DaemonMsg, Decision, Entry, Outcome, Recap, Seq};
+use protocol::{Body, DaemonMsg, Entry, Outcome, Recap, Verdict};
 
 /// The conversation the model sees, folded from the log's facts as they
 /// commit, so that a model call reads it rather than the log. A model
@@ -18,7 +18,7 @@ use protocol::{Body, CallId, DaemonMsg, Decision, Entry, Outcome, Recap, Seq};
 /// tool call the model made is answered under the model's id for it, as
 /// the tools of the registry it was folded on present the result. The
 /// system prompt leads, then the session's context, wherever it was logged.
-/// Requests share the messages, which keep what each encoded of them.
+/// It folds each entry as the v2 kinds say it, so old logs read the same.
 pub struct Transcript {
     messages: Messages,
     /// Where the next context message goes: after the system prompt and
@@ -27,31 +27,29 @@ pub struct Transcript {
     /// The model's id and the tool of each call the model made and that is
     /// not yet answered, by seq.
     calls: HashMap<u64, (String, String)>,
+    /// Input waiting to be taken up, by seq: the user's once it is.
+    waiting: HashMap<u64, String>,
     /// The seq of the last entry that changed the messages.
     last: u64,
     registry: Arc<Registry>,
 }
 
 impl Transcript {
-    /// A transcript on `registry` that `system` prompts.
-    pub fn new(registry: Arc<Registry>, system: &str) -> Self {
-        let messages = Messages::from_iter((!system.is_empty()).then(|| Message::system(system)));
-        Self {
-            context: messages.len(),
-            messages,
-            calls: HashMap::new(),
-            last: 0,
-            registry,
-        }
-    }
-
     /// The transcript of `entries`, on `registry`, that `system` prompts.
     pub fn of(
         entries: impl IntoIterator<Item = impl Borrow<Entry>>,
         registry: Arc<Registry>,
         system: &str,
     ) -> Self {
-        let mut transcript = Self::new(registry, system);
+        let messages = Messages::from_iter((!system.is_empty()).then(|| Message::system(system)));
+        let mut transcript = Self {
+            context: messages.len(),
+            messages,
+            calls: HashMap::new(),
+            waiting: HashMap::new(),
+            last: 0,
+            registry,
+        };
         for e in entries {
             transcript.apply(e.borrow(), None);
         }
@@ -61,13 +59,23 @@ impl Transcript {
     /// Folds entry `e`. `fresh` is the message of the reply this daemon
     /// just had, which `e` stores: taken as it is rather than read again.
     pub fn apply(&mut self, e: &Entry, fresh: Option<Assistant>) {
-        let message = match &e.body {
-            Body::User { text }
-            | Body::Steer { text, .. }
-            | Body::Hook {
-                decision: Decision::OnStop { text },
+        let Some(body) = e.body.shim() else { return };
+        let message = match &*body {
+            Body::Input {
+                text, taken: true, ..
+            }
+            | Body::Decision {
+                d: Verdict::OnStop { text },
                 ..
             } => Message::user(text.clone()),
+            Body::Input { text, .. } => {
+                self.waiting.insert(e.seq, text.clone());
+                return;
+            }
+            Body::Take { input } => match self.waiting.remove(&input.get()) {
+                Some(text) => Message::user(text),
+                None => return,
+            },
             Body::Assistant { text } => Message::assistant(text.clone()),
             Body::Context { text } => {
                 self.messages
@@ -114,9 +122,7 @@ impl Transcript {
                 };
                 self.last = e.seq;
                 // Only a tool message changes to take the result.
-                if let Some(Message::Tool(_)) = self.messages.last()
-                    && let Some(Message::Tool(answers)) = self.messages.last_mut()
-                {
+                if let Some(Message::Tool(answers)) = self.messages.last_mut() {
                     answers.results.push(result);
                 } else {
                     self.messages.push(Message::Tool(ToolMessage {
@@ -143,118 +149,6 @@ impl Transcript {
 
     pub fn into_messages(self) -> Messages {
         self.messages
-    }
-}
-
-/// Steps a fresh agent through every input the log records, an entry at a
-/// time, so it is in the state it was in when the log was written. What it
-/// asked for that the log does not show is left over: the daemon stopped
-/// between an outcome and the intents it led to.
-#[derive(Default)]
-pub struct Replayer(VecDeque<Action>);
-
-impl Replayer {
-    pub fn apply(&mut self, agent: &mut dyn Agent, e: &Entry) {
-        let asked = &mut self.0;
-        let input = match &e.body {
-            Body::User { text }
-            | Body::Hook {
-                decision: Decision::OnStop { text },
-                ..
-            } => Input::User { text: text.clone() },
-            Body::ToolResult { call, outcome, .. } => match CallId::new(*call) {
-                Some(call) => Input::ToolDone {
-                    call,
-                    outcome: outcome.clone(),
-                },
-                None => return,
-            },
-            Body::ModelResult { call, outcome } => match CallId::new(*call) {
-                Some(call) => Input::ModelDone {
-                    call,
-                    outcome: outcome.clone(),
-                },
-                None => return,
-            },
-            Body::Fired { watch, outcome } => match Seq::new(*watch) {
-                Some(watch) => Input::ChildDone {
-                    watch,
-                    outcome: outcome.clone(),
-                },
-                None => return,
-            },
-            Body::Assistant { .. }
-            | Body::ToolCall { .. }
-            | Body::ModelCall { .. }
-            | Body::Link { .. } => {
-                // A log that disagrees with the agent (an earlier version
-                // wrote it) leaves nothing to redo.
-                if asked.front().is_some_and(|action| commits(action, &e.body)) {
-                    asked.pop_front();
-                } else {
-                    asked.clear();
-                }
-                return;
-            }
-            // The turn was cut short: what it asked for is not done.
-            Body::Interrupt { .. } => {
-                asked.clear();
-                return;
-            }
-            // Read by the model, not stepped through the agent; and v2's
-            // kinds, which only the v2 engine writes and replays.
-            Body::Steer { .. }
-            | Body::Queued { .. }
-            | Body::Progress { .. }
-            | Body::Settings(_)
-            | Body::ToolProcess { .. }
-            | Body::Hook { .. }
-            | Body::Ask { .. }
-            | Body::Watch { .. }
-            | Body::Environment(_)
-            | Body::Extensions { .. }
-            | Body::Ext { .. }
-            | Body::Context { .. }
-            | Body::Command { .. }
-            | Body::CommandResult { .. }
-            | Body::Input { .. }
-            | Body::Take { .. }
-            | Body::Decision { .. }
-            | Body::Wait { .. }
-            | Body::Answer { .. }
-            | Body::Edit { .. } => return,
-        };
-        asked.extend(agent.step(input));
-    }
-
-    /// What the agent asked for that the log does not show.
-    pub fn into_actions(self) -> VecDeque<Action> {
-        self.0
-    }
-}
-
-/// [`Replayer`] over `entries`.
-pub fn replay(
-    agent: &mut dyn Agent,
-    entries: impl IntoIterator<Item = impl Borrow<Entry>>,
-) -> VecDeque<Action> {
-    let mut replay = Replayer::default();
-    for e in entries {
-        replay.apply(agent, e.borrow());
-    }
-    replay.into_actions()
-}
-
-/// Whether `body` is the entry carrying out `action`.
-fn commits(action: &Action, body: &Body) -> bool {
-    match (action, body) {
-        (Action::Say(said), Body::Assistant { text }) => said == text,
-        (
-            Action::Call { tool, .. } | Action::Refuse { tool, .. },
-            Body::ToolCall { tool: called, .. },
-        ) => tool == called,
-        (Action::CallModel, Body::ModelCall { .. }) => true,
-        _ => false,
     }
 }
 
@@ -312,7 +206,7 @@ pub fn reply(entries: impl IntoIterator<Item = impl Borrow<Entry>>) -> Option<St
 }
 
 /// The first line of `text`, cut to a recap's width.
-pub(super) fn short(text: &str) -> String {
+fn short(text: &str) -> String {
     const WIDTH: usize = 60;
     let text = text.trim();
     let line = text.lines().next().unwrap_or_default();

@@ -5,7 +5,6 @@
 //! | Point | Merge |
 //! | --- | --- |
 //! | [`Input`] | replacement chain over the user's text; the first rejection wins |
-//! | [`PrepareStep`] | replacement chain: each handler sees the request the last left |
 //! | [`RequestError`] | the first recovery wins |
 //! | [`PreTool`] | replacement chain over the input; the first block wins |
 //! | [`Permission`] | the most restrictive wins: deny > defer > ask > allow |
@@ -18,7 +17,7 @@
 //! The four rules are [`Merge`]'s, each implemented once, by the
 //! [`Rule`] that carries it, for every point. Handlers run in
 //! registration order, each given a [`PointCx`]. What changed is reported
-//! as [`Decision`]s, which the engine logs under the extension's name;
+//! as [`Verdict`]s, which the engine logs under the extension's name;
 //! `spawn` rewrites are not logged, as they follow from configuration
 //! rather than from what happened.
 
@@ -31,7 +30,7 @@ use std::pin::Pin;
 use std::sync::Arc;
 use std::time::Duration;
 
-use protocol::{Decision, Entry, Json, Outcome, SessionId};
+use protocol::{Entry, Json, Outcome, SessionId, Verdict};
 use serde::de::DeserializeOwned;
 use serde_json::{Value, json};
 
@@ -251,11 +250,10 @@ pub struct Finished<'a> {
 /// A failed model request, as `request_error` handlers see it.
 #[derive(Clone, Copy, Debug)]
 pub struct Failed<'a> {
-    pub request: &'a llm::Request,
     pub error: &'a llm::Error,
     /// Which attempt failed: 0 for the first request, and counted in the
     /// log, so a restart does not start the count again.
-    pub attempt: u32,
+    pub attempt: u16,
 }
 
 /// What to do about a failed model request.
@@ -299,20 +297,6 @@ impl Point for Input {
 
     fn input<'a, 'b: 'a>((): (), text: &'a String) -> &'a str {
         text
-    }
-}
-
-/// A replacement for the next model request.
-pub struct PrepareStep;
-
-impl Point for PrepareStep {
-    const NAME: &'static str = "prepare_step";
-    type Facts<'a> = ();
-    type In<'a> = &'a llm::Request;
-    type Out = Rewrite<llm::Request>;
-
-    fn input<'a, 'b: 'a>((): (), request: &'a llm::Request) -> &'a llm::Request {
-        request
     }
 }
 
@@ -557,7 +541,7 @@ impl Hooked {
 }
 
 /// Decisions to log, with the extension whose handler made each.
-pub type Decided = Vec<(Name, Decision)>;
+pub type Decided = Vec<(Name, Verdict)>;
 
 /// A point's answer: now, or later as a future the call owns, so a slow
 /// handler holds its call rather than the session.
@@ -592,7 +576,7 @@ impl<T> PartialEq for Later<T> {
 #[derive(Debug, PartialEq)]
 pub struct Chained<T> {
     pub value: T,
-    pub decisions: Vec<(Name, protocol::Verdict)>,
+    pub decisions: Decided,
 }
 
 impl<T> Chained<T> {
@@ -609,7 +593,7 @@ impl<T> Chained<T> {
 #[derive(Debug, PartialEq)]
 pub struct Gated {
     pub input: Json,
-    pub decisions: Vec<(Name, protocol::Verdict)>,
+    pub decisions: Decided,
     pub gate: Gate,
 }
 
@@ -682,35 +666,22 @@ impl Hooks {
 
     /// The user's text as the `input` chain leaves it; `Err` is why it was
     /// refused.
-    pub fn input(
-        &self,
-        cx: &PointCx<'_>,
-        text: &mut String,
-        decided: &mut Decided,
-    ) -> Result<(), String> {
-        self.run::<Input>(cx, (), text, &mut |name, original, _| {
-            decided.push((Name::clone(name), Decision::Input { original }));
+    pub fn input(&self, cx: &PointCx<'_>, mut text: String) -> Result<Chained<String>, String> {
+        let mut decisions = Decided::new();
+        self.run::<Input>(cx, (), &mut text, &mut |name, original, _| {
+            decisions.push((Name::clone(name), Verdict::Input { original }));
         })
-        .map_err(|(name, reason)| format!("{name}: {reason}"))
+        .map_err(|(name, reason)| format!("{name}: {reason}"))?;
+        Ok(Chained {
+            value: text,
+            decisions,
+        })
     }
 
-    /// How to recover model call `call` from `failed`, if any handler
-    /// says; logged as the attempt it starts.
-    pub fn request_error(
-        &self,
-        cx: &PointCx<'_>,
-        call: u64,
-        failed: Failed<'_>,
-        decided: &mut Decided,
-    ) -> Option<Recover> {
-        let (name, recover) = self.ask::<RequestError>(cx, failed)?;
-        let decision = Decision::Retry {
-            call,
-            attempt: failed.attempt + 1,
-            error: failed.error.to_string(),
-        };
-        decided.push((name, decision));
-        Some(recover)
+    /// How to recover a model call from `failed`, if any handler says, and
+    /// who said: the kernel logs it as the attempt it starts.
+    pub fn request_error(&self, cx: &PointCx<'_>, failed: Failed<'_>) -> Option<(Name, Recover)> {
+        self.ask::<RequestError>(cx, failed)
     }
 
     pub fn spawn(&self, cx: &PointCx<'_>, spawn: &mut crate::SpawnSpec) {
@@ -725,54 +696,44 @@ impl Hooks {
         self.ask::<SessionEnd>(cx, ());
     }
 
-    pub fn prepare_step(
-        &self,
-        cx: &PointCx<'_>,
-        call: u64,
-        request: &mut llm::Request,
-        decided: &mut Decided,
-    ) {
-        let Ok(()) = self.run::<PrepareStep>(cx, (), request, &mut |name, _, _| {
-            decided.push((Name::clone(name), Decision::PrepareStep { call }));
+    /// Whether a call of `tool` on `input` may run, with the input as the
+    /// `pre_tool` chain leaves it, and what each handler decided.
+    pub fn gate(&self, cx: &PointCx<'_>, tool: &str, input: &Json) -> Gated {
+        let mut value = input.value();
+        let mut decisions = Decided::new();
+        let chained = self.run::<PreTool>(cx, tool, &mut value, &mut |name, _, input| {
+            let input = Json::new(input);
+            decisions.push((Name::clone(name), Verdict::PreTool { input }));
         });
+        let input = if decisions.is_empty() {
+            input.clone()
+        } else {
+            Json::new(&value)
+        };
+        let gate = match chained {
+            Err((name, reason)) => {
+                let block = Verdict::Block {
+                    reason: reason.clone(),
+                };
+                decisions.push((name, block));
+                Gate::Refuse(reason)
+            }
+            Ok(()) => self.permit(cx, tool, &value, &mut decisions),
+        };
+        Gated {
+            input,
+            decisions,
+            gate,
+        }
     }
 
-    /// Whether a call may run, with `input` as the `pre_tool` chain leaves
-    /// it.
-    pub fn gate(
-        &self,
-        cx: &PointCx<'_>,
-        tool: &str,
-        input: &mut Value,
-        decided: &mut Decided,
-    ) -> Gate {
-        let chained = self.run::<PreTool>(cx, tool, input, &mut |name, _, input| {
-            let input = Json::new(input);
-            let tool = tool.to_owned();
-            decided.push((Name::clone(name), Decision::PreTool { tool, input }));
-        });
-        if let Err((name, reason)) = chained {
-            let tool = tool.to_owned();
-            let decision = Decision::Block {
-                tool,
-                reason: reason.clone(),
-            };
-            decided.push((name, decision));
-            return Gate::Refuse(reason);
-        }
-        let call = ToolUse {
-            tool,
-            input: &*input,
-        };
+    /// The `permission` and `approve` points over a call let through.
+    fn permit(&self, cx: &PointCx<'_>, tool: &str, input: &Value, decided: &mut Decided) -> Gate {
+        let call = ToolUse { tool, input };
         let Some((by, permission)) = self.ask::<Permission>(cx, call) else {
             return Gate::Run;
         };
-        let tool = tool.to_owned();
-        let decision = Decision::Permission {
-            tool: tool.clone(),
-            permission,
-        };
-        decided.push((Name::clone(&by), decision));
+        decided.push((Name::clone(&by), Verdict::Permission { permission }));
         match permission {
             protocol::Permission::Allow => Gate::Run,
             protocol::Permission::Ask => {
@@ -780,12 +741,7 @@ impl Hooks {
                     return Gate::Ask;
                 };
                 let why = (!approved).then(|| format!("{who} did not approve this call"));
-                let decision = Decision::Approval {
-                    tool,
-                    approved,
-                    call: None,
-                };
-                decided.push((who, decision));
+                decided.push((who, Verdict::Approval { approved }));
                 why.map_or(Gate::Run, Gate::Refuse)
             }
             protocol::Permission::Defer => Gate::Refuse(format!("{by} deferred this call")),
@@ -793,29 +749,27 @@ impl Hooks {
         }
     }
 
+    /// A call's outcome as the `post_tool` chain leaves it.
     pub fn post_tool(
         &self,
         cx: &PointCx<'_>,
-        call: u64,
         (tool, input): (&str, &Value),
-        outcome: &mut Outcome,
-        decided: &mut Decided,
-    ) {
+        mut outcome: Outcome,
+    ) -> Chained<Outcome> {
+        let mut decisions = Decided::new();
         let facts = ToolUse { tool, input };
-        let Ok(()) = self.run::<PostTool>(cx, facts, outcome, &mut |name, original, _| {
-            decided.push((Name::clone(name), Decision::PostTool { call, original }));
+        let Ok(()) = self.run::<PostTool>(cx, facts, &mut outcome, &mut |name, original, _| {
+            decisions.push((Name::clone(name), Verdict::PostTool { original }));
         });
+        Chained {
+            value: outcome,
+            decisions,
+        }
     }
 
-    pub fn on_stop(
-        &self,
-        cx: &PointCx<'_>,
-        history: &dyn History,
-        decided: &mut Decided,
-    ) -> Option<String> {
-        let (name, text) = self.ask::<OnStop>(cx, history)?;
-        decided.push((name, Decision::OnStop { text: text.clone() }));
-        Some(text)
+    /// Text for the agent to go on with once it stopped, and who gave it.
+    pub fn on_stop(&self, cx: &PointCx<'_>, history: &dyn History) -> Option<(Name, String)> {
+        self.ask::<OnStop>(cx, history)
     }
 
     pub fn observe(&self, cx: &PointCx<'_>, entry: &Entry) {

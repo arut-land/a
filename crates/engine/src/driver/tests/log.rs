@@ -97,8 +97,8 @@ impl OnDisk {
         header
     }
 
-    fn load(&self, header: Header) -> Arc<Session> {
-        Session::start(header, Arc::clone(&self.fixture.0), Open::Load).unwrap()
+    fn load(&self, header: &Header) -> Arc<Live> {
+        Live::start(header, &self.fixture.0, Open::Load, Owner::None).unwrap()
     }
 
     fn path(&self, id: SessionId) -> PathBuf {
@@ -122,7 +122,7 @@ fn turns(n: u64, len: usize) -> Vec<Entry> {
         .map(|seq| {
             let text = format!("{seq:0len$}");
             let body = if seq % 2 == 1 {
-                Body::User { text }
+                user(&text)
             } else {
                 Body::Assistant { text }
             };
@@ -138,9 +138,9 @@ fn line(e: &Entry) -> Vec<u8> {
 }
 
 /// The frames a client attaching after `since` is sent.
-fn sent(session: &Session, caps: Caps, since: u64) -> Vec<Frame> {
+fn sent(session: &Live, caps: Caps, since: u64) -> Vec<Frame> {
     let outbox = Outbox::new(caps);
-    session.attach(&outbox, since);
+    session.follow(&outbox, since);
     std::iter::from_fn(|| outbox.try_next()).collect()
 }
 
@@ -162,11 +162,11 @@ fn a_committed_entry_is_encoded_exactly_once() {
             line
         })
         .collect();
-    let session = disk.load(disk.write(&lines));
+    let session = disk.load(&disk.write(&lines));
     settle(&session);
     let shared = |a: &Frame, b: &Frame| std::ptr::eq(a.as_bytes(), b.as_bytes());
     let (first, second) = (sent(&session, Caps::ALL, 0), sent(&session, Caps::ALL, 0));
-    assert_eq!(first.len(), 4, "attached, snapshot, synced, recap");
+    assert_eq!(first.len(), 3, "attached, snapshot, synced");
     assert!(shared(&first[1], &second[1]), "one snapshot for both");
     let replayed = entries(sent(&session, Caps::NONE, 0));
     assert_eq!(replayed.len(), 300);
@@ -177,12 +177,12 @@ fn a_committed_entry_is_encoded_exactly_once() {
     }
     // Live, then replayed: committed once, and read back as written.
     let live = Outbox::new(Caps::NONE);
-    session.attach(&live, 300);
-    session.submit("again".into()).unwrap();
+    session.follow(&live, 300);
+    session.submit("again").unwrap();
     settle(&session);
     let live = entries(std::iter::from_fn(|| live.try_next()));
     let replayed = entries(sent(&session, Caps::NONE, 300));
-    session.stop();
+    session.halt();
     let written = disk.lines(session.id);
     assert_eq!(live.len(), 2, "the input and its answer");
     for (live, replayed) in live.iter().zip(&replayed) {
@@ -201,20 +201,20 @@ fn a_committed_entry_is_encoded_exactly_once() {
 fn replay_from_the_index_equals_the_live_frames() {
     let disk = on_disk("replay");
     let header = disk.write(&[]);
-    let session = disk.load(header.clone());
+    let session = disk.load(&header);
     let live = Outbox::new(Caps::NONE);
-    session.attach(&live, 0);
+    session.follow(&live, 0);
     for turn in 0..20 {
-        session.submit(format!("turn {turn}")).unwrap();
+        session.submit(&format!("turn {turn}")).unwrap();
         settle(&session);
     }
     let live = entries(std::iter::from_fn(|| live.try_next()));
     let replayed = entries(sent(&session, Caps::NONE, 0));
-    session.stop();
-    let reloaded = disk.load(header);
+    session.halt();
+    let reloaded = disk.load(&header);
     settle(&reloaded);
     let after_reload = entries(sent(&reloaded, Caps::NONE, 0));
-    reloaded.stop();
+    reloaded.halt();
     assert_eq!(live.len(), 40);
     for frames in [&replayed, &after_reload] {
         assert_eq!(frames.len(), live.len());
@@ -233,10 +233,10 @@ fn held_by_loading(disk: &OnDisk, n: u64) -> (isize, isize) {
     drop(lines);
     let before = HELD.get();
     PEAK.set(before);
-    let session = disk.load(header);
+    let session = disk.load(&header);
     let held = (HELD.get() - before, PEAK.get() - before);
     settle(&session);
-    session.stop();
+    session.halt();
     held
 }
 

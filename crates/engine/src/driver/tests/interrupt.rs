@@ -3,7 +3,6 @@
 
 use std::io::{BufRead, BufReader, Read, Write};
 use std::net::{TcpListener, TcpStream};
-use std::sync::OnceLock;
 use std::sync::mpsc;
 
 use super::*;
@@ -74,15 +73,15 @@ fn an_interrupt_while_the_model_thinks_closes_its_connection() {
     let (port, got, closed) = provider(String::new());
     let (fixture, home) = over_ureq(port);
     let session = fixture.start(&[]);
-    session.submit("hi".into()).unwrap();
+    session.submit("hi").unwrap();
     got.recv().unwrap();
-    session.interrupt();
+    session.interrupt_now();
     closed
         .recv_timeout(PROMPT)
         .expect("the connection stays open");
     settle(&session);
     let log = log_of(&session);
-    session.stop();
+    session.halt();
     std::fs::remove_file(home).unwrap();
     assert_eq!(
         model_result(&log),
@@ -103,8 +102,8 @@ fn an_interrupt_mid_reply_closes_its_connection_and_keeps_the_text_so_far() {
     let (fixture, home) = over_ureq(port);
     let session = fixture.start(&[]);
     let outbox = Outbox::new(Caps::NONE);
-    session.attach(&outbox, 0);
-    session.submit("hi".into()).unwrap();
+    session.follow(&outbox, 0);
+    session.submit("hi").unwrap();
     got.recv().unwrap();
     // Interrupted once the delta reached clients, so it is the text so far.
     while let Some(frame) = outbox.next() {
@@ -113,13 +112,13 @@ fn an_interrupt_mid_reply_closes_its_connection_and_keeps_the_text_so_far() {
             break;
         }
     }
-    session.interrupt();
+    session.interrupt_now();
     closed
         .recv_timeout(PROMPT)
         .expect("the connection stays open");
     settle(&session);
     let log = log_of(&session);
-    session.stop();
+    session.halt();
     std::fs::remove_file(home).unwrap();
     assert_eq!(
         model_result(&log),
@@ -132,7 +131,7 @@ fn an_interrupt_mid_reply_closes_its_connection_and_keeps_the_text_so_far() {
 /// Fails each request, interrupting `session` first.
 #[derive(Default)]
 struct Interrupting {
-    session: OnceLock<Weak<Session>>,
+    session: OnceLock<Weak<Live>>,
     sent: AtomicUsize,
 }
 
@@ -140,12 +139,27 @@ impl Http for Interrupting {
     fn send(
         &self,
         _: http::Request<llm::http::Payload>,
-    ) -> BoxFuture<'static, io::Result<llm::http::Response>> {
+    ) -> llm::http::BoxFuture<'static, io::Result<llm::http::Response>> {
         self.sent.fetch_add(1, Ordering::SeqCst);
         if let Some(session) = self.session.get().and_then(Weak::upgrade) {
             session.interrupt();
         }
         Box::pin(std::future::ready(Err(io::Error::other("unreachable"))))
+    }
+}
+
+/// Retries every failed request: only an interrupt stops it.
+struct Again;
+
+impl Extension for Again {
+    const NAME: &'static str = "again";
+    const VERSION: u32 = 1;
+
+    fn contribute(&self, r: &mut Registrar) {
+        r.on::<point::RequestError>(|_, _| {
+            let after = Duration::ZERO;
+            Some(Recover::Retry { after })
+        });
     }
 }
 
@@ -156,20 +170,20 @@ fn a_request_failing_after_an_interrupt_is_not_retried() {
         http: Arc::clone(&http) as Arc<dyn Http>,
         ..openai(&Script::new(&[]))
     };
-    let registry = Registry::default().with(&Extras).unwrap();
+    let registry = Registry::default().with(&Again).unwrap();
     let fixture = Fixture::new(ext_chat::CHAT, registry, models);
     let session = fixture.start(&[]);
     http.session.set(Arc::downgrade(&session)).unwrap();
-    session.submit("hi".into()).unwrap();
+    session.submit("hi").unwrap();
     settle(&session);
     let log = log_of(&session);
-    session.stop();
+    session.halt();
     assert_eq!(http.sent.load(Ordering::SeqCst), 1, "{log:#?}");
     assert!(
         !log.iter().any(|e| matches!(
             e.body,
-            Body::Hook {
-                decision: Decision::Retry { .. },
+            Body::Decision {
+                d: Verdict::Retry { .. },
                 ..
             }
         )),
