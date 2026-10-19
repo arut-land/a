@@ -1,48 +1,37 @@
 //! Taking over the terminal and giving it back, on exit, on a panic and on
-//! SIGTERM or SIGHUP; and the thread that turns its events into the app's.
+//! SIGTERM or SIGHUP; and the thread that turns its input and resizes into
+//! the app's events.
 
-use std::fmt;
 use std::io::{self, Write};
 use std::sync::mpsc::Sender;
 use std::sync::{Mutex, Once, PoisonError};
 use std::thread;
 
-use crossterm::event::{self, DisableBracketedPaste, EnableBracketedPaste};
-use crossterm::terminal::{self, EnterAlternateScreen, LeaveAlternateScreen};
-use crossterm::{Command, cursor, queue, style};
+use rustix::event::{PollFd, PollFlags, poll};
+use rustix::io::Errno;
+use rustix::process::Signal;
+use rustix::termios::{OptionalActions, Termios, tcgetattr, tcgetwinsize, tcsetattr};
+use sys::Signals;
 
 use super::Event;
-use super::keys::Input;
-use super::render::Viewport;
+use super::Viewport;
+use super::keys::Decoder;
 
-/// Click and wheel reports only (SGR encoding): crossterm's
-/// `EnableMouseCapture` also asks for every motion, which would wake the
-/// client whenever the pointer moves.
-struct ClickAndWheel(bool);
+/// The signals the input thread handles: a resize, and the two that end
+/// the client after the terminal is restored.
+pub const SIGNALS: [Signal; 3] = [Signal::WINCH, Signal::TERM, Signal::HUP];
 
-impl Command for ClickAndWheel {
-    fn write_ansi(&self, f: &mut impl fmt::Write) -> fmt::Result {
-        f.write_str(if self.0 {
-            "\x1b[?1000h\x1b[?1006h"
-        } else {
-            "\x1b[?1006l\x1b[?1000l"
-        })
-    }
+/// Bracketed paste on; on the full screen also the alternate buffer and
+/// click and wheel reports (SGR) only, not every motion, which would wake
+/// the client whenever the pointer moves.
+const ENTER: &[u8] = b"\x1b[?2004h";
+const ENTER_FULL: &[u8] = b"\x1b[?1049h\x1b[?1000h\x1b[?1006h";
+const LEAVE: &[u8] = b"\x1b[0m\x1b[?2004l";
+const LEAVE_FULL: &[u8] = b"\x1b[?1006l\x1b[?1000l\x1b[?1049l";
 
-    #[cfg(windows)]
-    fn execute_winapi(&self) -> io::Result<()> {
-        use crossterm::event::{DisableMouseCapture, EnableMouseCapture};
-        if self.0 {
-            EnableMouseCapture.execute_winapi()
-        } else {
-            DisableMouseCapture.execute_winapi()
-        }
-    }
-}
-
-/// The viewport we hold the terminal for: a panic hook and the signal
-/// thread restore it too.
-static HELD: Mutex<Option<Viewport>> = Mutex::new(None);
+/// The viewport we hold the terminal for and its mode before: a panic hook
+/// and the input thread restore it too.
+static HELD: Mutex<Option<(Viewport, Termios)>> = Mutex::new(None);
 
 pub struct Terminal(());
 
@@ -58,16 +47,18 @@ impl Terminal {
                 restore();
                 previous(info);
             }));
-            #[cfg(unix)]
-            restore_on_signal();
         });
-        terminal::enable_raw_mode()?;
-        *HELD.lock().unwrap_or_else(PoisonError::into_inner) = Some(viewport);
-        let mut out = io::stdout();
+        let stdin = rustix::stdio::stdin();
+        let cooked = tcgetattr(stdin)?;
+        let mut raw = cooked.clone();
+        raw.make_raw();
+        tcsetattr(stdin, OptionalActions::Now, &raw)?;
+        *HELD.lock().unwrap_or_else(PoisonError::into_inner) = Some((viewport, cooked));
+        let mut out = io::stdout().lock();
         if viewport == Viewport::Full {
-            queue!(out, EnterAlternateScreen, ClickAndWheel(true))?;
+            out.write_all(ENTER_FULL)?;
         }
-        queue!(out, EnableBracketedPaste)?;
+        out.write_all(ENTER)?;
         out.flush()?;
         Ok(Self(()))
     }
@@ -81,123 +72,71 @@ impl Drop for Terminal {
 
 fn restore() {
     let held = HELD.lock().unwrap_or_else(PoisonError::into_inner).take();
-    if let Some(viewport) = held {
-        let mut out = io::stdout();
-        let _ = queue!(out, style::ResetColor, DisableBracketedPaste);
+    if let Some((viewport, cooked)) = held {
+        let mut out = io::stdout().lock();
+        let _ = out.write_all(LEAVE);
         if viewport == Viewport::Full {
-            let _ = queue!(out, ClickAndWheel(false), LeaveAlternateScreen);
+            let _ = out.write_all(LEAVE_FULL);
         }
-        let _ = queue!(out, cursor::Show);
+        let _ = out.write_all(b"\x1b[?25h");
         let _ = out.flush();
-        let _ = terminal::disable_raw_mode();
+        let _ = tcsetattr(rustix::stdio::stdin(), OptionalActions::Now, &cooked);
     }
 }
 
-/// A SIGTERM or SIGHUP restores the terminal on a thread of its own, then
-/// ends the process as the signal would have.
-#[cfg(unix)]
-fn restore_on_signal() {
-    use signal_hook::consts::{SIGHUP, SIGTERM};
-    use signal_hook::iterator::Signals;
+/// The terminal's columns and rows.
+pub fn size() -> io::Result<(u16, u16)> {
+    let size = tcgetwinsize(rustix::stdio::stdout())?;
+    Ok((size.ws_col, size.ws_row))
+}
 
-    let Ok(mut signals) = Signals::new([SIGTERM, SIGHUP]) else {
-        return;
-    };
+/// Reads the terminal and `signals` on a thread of its own until stdin is
+/// gone. It blocks in `poll` with no timeout: an idle client never wakes.
+pub fn spawn_input(tx: Sender<Event>, signals: Signals) {
     thread::spawn(move || {
-        if let Some(signal) = signals.forever().next() {
-            restore();
-            let _ = signal_hook::low_level::emulate_default_handler(signal);
-        }
-    });
-}
-
-/// The cursor's row, as the terminal says. One that never answers costs
-/// half a second (crossterm's own query waits 2 s); an answer later than
-/// that is read and dropped with the input. Typed input that arrives
-/// before the answer is dropped.
-#[cfg(unix)]
-pub fn cursor_row() -> Option<u16> {
-    use std::time::{Duration, Instant};
-
-    use rustix::event::{PollFd, PollFlags, Timespec, poll};
-
-    let deadline = Instant::now() + Duration::from_millis(500);
-    let mut out = io::stdout();
-    out.write_all(b"\x1b[6n").and_then(|()| out.flush()).ok()?;
-    let stdin = rustix::stdio::stdin();
-    let mut got = Vec::new();
-    loop {
-        let left = Timespec::try_from(deadline.checked_duration_since(Instant::now())?).ok()?;
-        if poll(&mut [PollFd::new(&stdin, PollFlags::IN)], Some(&left)).ok()? == 0 {
-            return None;
-        }
-        let mut buf = [0; 64];
-        let n = rustix::io::read(stdin, &mut buf).ok()?;
-        if n == 0 {
-            return None;
-        }
-        got.extend_from_slice(&buf[..n]);
-        if let Some(row) = position_report(&got) {
-            return Some(row);
-        }
-    }
-}
-
-#[cfg(not(unix))]
-pub fn cursor_row() -> Option<u16> {
-    cursor::position().ok().map(|(_, row)| row)
-}
-
-/// The 0-based row of the first `ESC [ row ; col R` in `bytes`.
-fn position_report(bytes: &[u8]) -> Option<u16> {
-    (0..bytes.len()).find_map(|at| {
-        let rest = bytes[at..].strip_prefix(b"\x1b[")?;
-        let end = rest
-            .iter()
-            .position(|&b| !matches!(b, b'0'..=b'9' | b';'))?;
-        let (row, col) = std::str::from_utf8(&rest[..end]).ok()?.split_once(';')?;
-        (rest[end] == b'R' && col.parse::<u16>().is_ok())
-            .then(|| row.parse::<u16>().ok()?.checked_sub(1))
-            .flatten()
-    })
-}
-
-/// Reads the terminal on its own thread until it is gone. It blocks with
-/// no timeout: an idle client never wakes.
-pub fn spawn_input(tx: Sender<Event>, viewport: Viewport) {
-    thread::spawn(move || {
+        let stdin = rustix::stdio::stdin();
+        let mut decoder = Decoder::default();
+        let mut buf = [0; 4096];
         loop {
-            let sent = match event::read() {
-                Ok(event::Event::Resize(..)) => {
-                    // Inline: the terminal reflowed its lines, so ask where
-                    // the cursor (and with it the viewport) ended up.
-                    let row = (viewport == Viewport::Inline).then(cursor_row).flatten();
-                    tx.send(Event::Resized(row))
+            let mut fds = [
+                PollFd::new(&stdin, PollFlags::IN),
+                PollFd::new(&signals, PollFlags::IN),
+            ];
+            match poll(&mut fds, None) {
+                Ok(_) | Err(Errno::INTR) => {}
+                Err(_) => break,
+            }
+            let (input, signalled) = (!fds[0].revents().is_empty(), !fds[1].revents().is_empty());
+            let mut resized = false;
+            if signalled {
+                for signal in signals.take() {
+                    if signal == Signal::WINCH {
+                        resized = true;
+                    } else {
+                        restore();
+                        sys::reraise(signal);
+                    }
                 }
-                Ok(event) => match Input::from_event(event) {
-                    Some(input) => tx.send(Event::Input(input)),
-                    None => continue,
-                },
-                Err(_) => {
-                    let _ = tx.send(Event::InputClosed);
-                    return;
-                }
-            };
-            if sent.is_err() {
+            }
+            if resized && tx.send(Event::Resized).is_err() {
                 return;
             }
+            if input {
+                let n = match rustix::io::read(stdin, &mut buf) {
+                    Ok(0) => break,
+                    Ok(n) => n,
+                    Err(Errno::INTR | Errno::AGAIN) => continue,
+                    Err(_) => break,
+                };
+                // A full buffer says more is waiting: an ESC it ends with
+                // may start a sequence.
+                for input in decoder.feed(&buf[..n], n == buf.len()) {
+                    if tx.send(Event::Input(input)).is_err() {
+                        return;
+                    }
+                }
+            }
         }
+        let _ = tx.send(Event::InputClosed);
     });
-}
-
-#[cfg(test)]
-mod tests {
-    #[test]
-    fn finds_the_position_report_among_other_input() {
-        use super::position_report;
-        assert_eq!(position_report(b"\x1b[12;40R"), Some(11));
-        assert_eq!(position_report(b"ab\x1b[A\x1b[3;1Rxy"), Some(2));
-        assert_eq!(position_report(b"\x1b[3;1"), None);
-        assert_eq!(position_report(b"\x1b[0;1R"), None);
-    }
 }

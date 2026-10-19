@@ -176,31 +176,28 @@ pub fn wrap(spans: &[Span], width: usize, first: &[Span], rest: &[Span]) -> Vec<
         }
     };
     for span in spans {
+        // Pieces of `span`, styled as it is (not a clone of its text).
+        let piece = |text: String| Span {
+            text,
+            style: span.style,
+            action: span.action,
+        };
         let mut run = String::new();
         for ch in span.text.chars() {
             if ch == ' ' {
                 if !run.is_empty() {
-                    word.push(Span {
-                        text: std::mem::take(&mut run),
-                        ..span.clone()
-                    });
+                    word.push(piece(std::mem::take(&mut run)));
                 }
                 if !word.is_empty() {
                     place(&mut lines, &mut spaces, &mut word);
                 }
-                spaces.push(Span {
-                    text: String::new(),
-                    ..span.clone()
-                });
+                spaces.push(piece(String::new()));
             } else {
                 run.push(ch);
             }
         }
         if !run.is_empty() {
-            word.push(Span {
-                text: run,
-                ..span.clone()
-            });
+            word.push(piece(run));
         }
     }
     if !word.is_empty() {

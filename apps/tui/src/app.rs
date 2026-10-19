@@ -17,7 +17,7 @@ use ratatui_core::style::{Color, Style};
 
 use super::editor::{Edit, Editor};
 use super::keys::{Input, Key, Mouse};
-use super::render::Viewport;
+use super::render::{Canvas, Viewport};
 use super::text::{Action, Line};
 use super::view::{Live, MUTED};
 
@@ -65,13 +65,6 @@ enum Overlay {
     },
 }
 
-/// A clickable region of the last frame.
-struct Hit {
-    y: u16,
-    x: (u16, u16),
-    action: Action,
-}
-
 /// What frames show of the whole transcript: found by one scan once it
 /// changed, not per frame or per streamed token.
 #[derive(Clone, Copy, Default)]
@@ -114,7 +107,8 @@ pub struct App {
     /// A one-line notice (an error, a refused command) until the next key.
     flash: Option<(String, Style)>,
     recap_hidden: bool,
-    hits: Vec<Hit>,
+    /// The last frame, and where its buttons are.
+    canvas: Canvas,
     /// `None` once the transcript changed.
     summary: Option<Summary>,
     /// Tokens the session's model calls used, summed as replies arrive.
@@ -166,7 +160,7 @@ impl App {
             overlay: None,
             flash: None,
             recap_hidden: false,
-            hits: Vec::new(),
+            canvas: Canvas::default(),
             summary: None,
             tokens: Usage::default(),
             committed: 0,
@@ -424,12 +418,7 @@ impl App {
             Mouse::WheelUp => self.wheel(-1),
             Mouse::WheelDown => self.wheel(1),
             Mouse::Press { x, y } => {
-                let action = self
-                    .hits
-                    .iter()
-                    .find(|h| h.y == y && (h.x.0..h.x.1).contains(&x))
-                    .map(|h| h.action);
-                return action.and_then(|a| self.act(a));
+                return self.canvas.hit(x, y).and_then(|a| self.act(a));
             }
         }
         None
