@@ -64,7 +64,7 @@ final class AppModel {
         guard stores[id] == nil, let client else { return }
         let store = SessionStore(session: Session(client: client))
         stores[id] = store
-        Task { await store.open(.id(id: id)) }
+        store.open(.id(id: id))
     }
 
     func newSession(in workspace: URL) {
@@ -72,7 +72,7 @@ final class AppModel {
         let store = SessionStore(session: Session(client: client))
         draft = store
         selection = nil
-        Task { await store.open(.new(workspace: workspace.path)) }
+        store.open(.new(workspace: workspace.path))
     }
 
     /// Files the draft under its id once it is attached.
@@ -143,9 +143,14 @@ final class AppModel {
         guard selection == nil, let wanted = UserDefaults.standard.string(forKey: "AOpen"),
             let sessions = list?.sessions, !sessions.isEmpty
         else { return }
-        let found =
-            wanted == "latest"
-            ? sessions.first : sessions.first { $0.id.hasPrefix(wanted) || $0.short == wanted }
-        selection = found?.id
+        selection = findSession(sessions: sessions, wanted: wanted)
+    }
+
+    /// What a line typed in a chat asks of the app.
+    func perform(_ action: AppAction) {
+        switch action {
+        case .newSession: chooseWorkspace()
+        case .help, .sessions: break
+        }
     }
 }

@@ -1,9 +1,21 @@
-//! Client side: reach a daemon and complete the hello. This machine's daemon
-//! is reached over its Unix socket and spawned if needed; another machine's
-//! through `ssh <host> a bridge`, whose stdio carries the same frames.
+//! The client SDK every app is a renderer over. Below, the transport:
+//! reach a daemon and complete the hello (this machine's over its Unix
+//! socket, spawned if needed; another machine's through `ssh <host> a
+//! bridge`, whose stdio carries the same frames). Above it, without I/O, a
+//! session's link, view and intents ([`SessionClient`]) and the one slash
+//! command table ([`COMMANDS`]); a thin [`Driver`] runs them on threads.
 
+mod command;
+mod drive;
 #[cfg(unix)]
 mod remote;
+mod session;
+mod watch;
+
+pub use command::{COMMANDS, Cmd, Command, help, parse};
+pub use drive::Driver;
+pub use session::{Attach, Effect, End, Env, Event, Link, SessionClient, TurnView};
+pub use watch::SessionWatch;
 
 use std::fs::{self, File};
 use std::io::{self, BufReader, IsTerminal, Read, Write};
@@ -13,8 +25,8 @@ use std::time::{Duration, Instant};
 
 use protocol::view::SessionList;
 use protocol::{
-    Cap, Caps, ClientDecl, ClientMsg, DaemonMsg, Environment, HomeSettings, SessionSummary,
-    SettingsChange, Target, read_frame, write_frame,
+    Cap, Caps, ClientDecl, ClientMsg, CommandInfo, DaemonMsg, Environment, HomeSettings,
+    SessionSummary, SettingsChange, Target, read_frame, write_frame,
 };
 use sys::crash::{Crashes, Record};
 use sys::{Home, Signal, Staged};
@@ -44,6 +56,8 @@ pub struct Connection {
     pub remote: Option<Environment>,
     /// What the hello settled.
     pub welcome: Welcome,
+    /// The slash commands the daemon advertised.
+    pub commands: Vec<CommandInfo>,
 }
 
 /// What the daemon's welcome settled for a connection.
@@ -57,23 +71,6 @@ pub struct Welcome {
     pub client: u32,
 }
 
-impl Welcome {
-    /// `text` for the running turn: a steer where the daemon takes them,
-    /// else plain input, which waits for the turn to end. The first
-    /// daemons drop a connection that sends them a steer.
-    pub fn steer(&self, text: impl Into<String>) -> ClientMsg {
-        let text = text.into();
-        if self.caps.has(Cap::Steer) {
-            ClientMsg::Steer {
-                text,
-                client_seq: None,
-            }
-        } else {
-            ClientMsg::input(text)
-        }
-    }
-}
-
 impl Connection {
     /// The environment a session attached over this connection runs its
     /// commands with: this process's, or a remote daemon's bridge's, never
@@ -85,19 +82,31 @@ impl Connection {
         }
     }
 
-    /// The attach to `target` from this connection's [`origin`], replaying
-    /// the entries after `since`; with the origin's environment when
-    /// `with_env`, else the session keeps the one it has. The daemon finds
-    /// the workspace from the origin's directory.
-    ///
-    /// [`origin`]: Connection::origin
-    pub fn attach(&self, target: Target, since: u64, with_env: bool) -> io::Result<ClientMsg> {
-        let env = self.origin()?;
+    /// The message making `attach`. The daemon finds the workspace from
+    /// the directory given, else from the origin's.
+    pub fn attach(&self, attach: &Attach) -> io::Result<ClientMsg> {
+        let (workspace, env) = match &attach.env {
+            Env::Keep => {
+                let dir = attach.workspace.clone();
+                (dir.map_or_else(|| self.origin().map(|e| e.cwd), Ok)?, None)
+            }
+            Env::Origin => {
+                let env = self.origin()?;
+                (
+                    attach.workspace.clone().unwrap_or_else(|| env.cwd.clone()),
+                    Some(env),
+                )
+            }
+            Env::Given(env) => (
+                attach.workspace.clone().unwrap_or_else(|| env.cwd.clone()),
+                Some(env.clone()),
+            ),
+        };
         Ok(ClientMsg::Attach {
-            target,
-            workspace: env.cwd.clone(),
-            since,
-            env: with_env.then_some(env),
+            target: attach.target.clone(),
+            workspace,
+            since: attach.since,
+            env,
             decl: ClientDecl::default(),
         })
     }
@@ -146,6 +155,39 @@ impl Connection {
         let mut list = SessionList::default();
         self.reader
             .until(|msg| list.fold(&msg).then(|| std::mem::take(&mut list.sessions)))
+    }
+}
+
+/// The session `id` names, in full or as a prefix: this machine's daemon
+/// resolves it as it attaches; another machine's, which may be older, is
+/// asked for its list first.
+pub fn target(endpoint: &Endpoint, staged: &Staged, id: &str) -> io::Result<Target> {
+    match endpoint {
+        Endpoint::Local(_) => Ok(Target::Prefix(id.to_owned())),
+        Endpoint::Ssh(_) => {
+            let sessions = connect(endpoint, staged, &|| {})?.sessions()?;
+            let found = matching(&sessions, |s| Some(s.id), id).map_err(io::Error::other)?;
+            Ok(Target::Id(found.id))
+        }
+    }
+}
+
+/// The one of `sessions` whose id (as `id` finds it), in full or short
+/// form, starts with `prefix`.
+pub fn matching<'a, T>(
+    sessions: &'a [T],
+    id: impl Fn(&T) -> Option<protocol::SessionId>,
+    prefix: &str,
+) -> Result<&'a T, String> {
+    let mut found = sessions.iter().filter(|s| {
+        id(s).is_some_and(|id| {
+            id.short().to_string().starts_with(prefix) || id.to_string().starts_with(prefix)
+        })
+    });
+    match (found.next(), found.next()) {
+        (Some(one), None) => Ok(one),
+        (None, _) => Err(format!("no session matches {prefix}")),
+        (Some(_), Some(_)) => Err(format!("{prefix} matches several sessions")),
     }
 }
 
@@ -340,6 +382,7 @@ fn split(stream: &UnixStream) -> io::Result<Connection> {
         writer: Writer::new(Box::new(stream.try_clone()?)),
         remote: None,
         welcome: Welcome::default(),
+        commands: Vec::new(),
     })
 }
 
@@ -399,6 +442,7 @@ fn hello(conn: &mut Connection, build: &str, first: &[ClientMsg]) -> io::Result<
             proto,
             caps,
             client,
+            commands,
             ..
         }) => {
             sent?;
@@ -407,6 +451,7 @@ fn hello(conn: &mut Connection, build: &str, first: &[ClientMsg]) -> io::Result<
                 caps,
                 client,
             };
+            conn.commands = commands;
             Ok(Greeting::Welcome)
         }
         Some(DaemonMsg::Draining) => Ok(Greeting::Draining),
@@ -420,6 +465,7 @@ fn hello(conn: &mut Connection, build: &str, first: &[ClientMsg]) -> io::Result<
 }
 
 /// What a client can tell about the daemon without talking to it.
+#[derive(Clone, Debug, Default)]
 pub struct Diagnosis {
     /// The pid recorded by a daemon that still holds its lock.
     pub pid: Option<u32>,
@@ -493,14 +539,8 @@ pub fn stop(home: &Home) -> io::Result<bool> {
         return Ok(false);
     };
     #[cfg(unix)]
-    if ask_to_stop(home, &daemon.build).is_ok() {
-        let deadline = Instant::now() + HELLO_TIMEOUT;
-        while live_daemon(home).is_some_and(|d| d.pid == daemon.pid) && Instant::now() < deadline {
-            thread::sleep(Duration::from_millis(5));
-        }
-        if live_daemon(home).is_none_or(|d| d.pid != daemon.pid) {
-            return Ok(true);
-        }
+    if ask_to_stop(home, &daemon.build).is_ok() && exited(home, Some(HELLO_TIMEOUT)) {
+        return Ok(true);
     }
     let signal = |signal| {
         if !daemon.is_live() {
@@ -512,14 +552,9 @@ pub fn stop(home: &Home) -> io::Result<bool> {
         sys::signal_process(daemon.pid, signal)
     };
     signal(Signal::Terminate)?;
-    let deadline = Instant::now() + HELLO_TIMEOUT;
-    let mut killed = false;
-    while live_daemon(home).is_some_and(|d| d.pid == daemon.pid) {
-        if Instant::now() >= deadline && !killed {
-            signal(Signal::Kill)?;
-            killed = true;
-        }
-        thread::sleep(Duration::from_millis(20));
+    if !exited(home, Some(HELLO_TIMEOUT)) {
+        signal(Signal::Kill)?;
+        exited(home, None);
     }
     #[cfg(unix)]
     let _ = fs::remove_file(home.socket());
@@ -530,6 +565,23 @@ pub fn stop(home: &Home) -> io::Result<bool> {
         file.set_len(0)?;
     }
     Ok(true)
+}
+
+/// Whether the daemon let go of its lock, as it does when it exits, within
+/// `within` (or ever): the lock is waited on, not polled.
+fn exited(home: &Home, within: Option<Duration>) -> bool {
+    let Ok(file) = File::open(home.daemon_pid_file()) else {
+        return true;
+    };
+    let (tx, rx) = std::sync::mpsc::channel();
+    thread::spawn(move || {
+        // Taken only to learn that it is free.
+        let _ = tx.send(file.lock().is_ok());
+    });
+    match within {
+        Some(within) => rx.recv_timeout(within).unwrap_or(false),
+        None => rx.recv().unwrap_or(false),
+    }
 }
 
 /// Connects to the running daemon, as its own build `build` so as not to
@@ -745,17 +797,6 @@ fn connect_or_spawn(home: &Home, reset: bool) -> io::Result<(UnixStream, bool)> 
 #[cfg(all(test, unix))]
 mod tests {
     use super::*;
-
-    #[test]
-    fn a_steer_is_sent_only_to_a_daemon_that_takes_it() {
-        let steers = Welcome {
-            caps: Caps::ALL,
-            ..Welcome::default()
-        };
-        assert!(matches!(steers.steer("also"), ClientMsg::Steer { text, .. } if text == "also"));
-        let first = Welcome::default();
-        assert!(matches!(first.steer("also"), ClientMsg::Input { text, .. } if text == "also"));
-    }
 
     #[test]
     fn an_older_client_is_pointed_at_the_newer_build_not_at_a_restart() {

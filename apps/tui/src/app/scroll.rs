@@ -11,13 +11,14 @@ use super::{App, Rows};
 impl App {
     /// Item `i`'s rows at `width`, wrapped now if out of date.
     pub(super) fn rows(&mut self, i: usize, width: usize) -> &[Line] {
-        let len = self.view.items.len();
+        let len = self.client.view().items.len();
         if self.cache.len() != len {
             self.cache.resize_with(len, || None);
         }
-        let item = &self.view.items[i];
+        let item = &self.client.view().items[i];
         let streaming = self
-            .view
+            .client
+            .view()
             .streaming
             .as_ref()
             .filter(|s| matches!(item, Item::Reply { call, .. } if *call == s.call));
@@ -54,7 +55,7 @@ impl App {
     /// Where the bottom-most `body` rows start: (item, row within it).
     fn bottom_start(&mut self, width: usize, body: usize) -> (usize, usize) {
         let mut need = body;
-        for i in (0..self.view.items.len()).rev() {
+        for i in (0..self.client.view().items.len()).rev() {
             let n = self.rows(i, width).len();
             if n >= need {
                 return (i, n - need);
@@ -81,7 +82,7 @@ impl App {
             None => self.bottom_start(width, body),
         };
         let mut out = Vec::with_capacity(body);
-        while out.len() < body && i < self.view.items.len() {
+        while out.len() < body && i < self.client.view().items.len() {
             let len = self.rows(i, width).len();
             let take = (body - out.len()).min(len.saturating_sub(row));
             out.extend((row..row + take).map(|row| (i, row)));
@@ -121,7 +122,7 @@ impl App {
         } else {
             row += n;
             loop {
-                if i >= self.view.items.len() {
+                if i >= self.client.view().items.len() {
                     self.anchor = None;
                     return;
                 }

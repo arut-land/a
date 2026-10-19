@@ -1,37 +1,47 @@
 //! The pages, the live transcript and the calls the browser makes.
 //!
 //! A chat page renders at once, without its transcript. Its tab then opens
-//! an event stream: it attaches as a daemon client of its own and sends
-//! what the [`Page`] folded from the daemon's messages makes of them. Input
-//! and approvals go out on that tab's connection.
+//! an event stream: a session client of its own (the SDK's, as every app
+//! has), whose updates the [`Page`] renders as patches. What the tab's
+//! calls ask for goes to that client.
 
 use std::collections::HashMap;
 use std::future::{Future, poll_fn};
 use std::io;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 use std::task::Poll;
 
-use client::{Connection, Writer};
+use client::{Attach, Cmd, Connection, Driver, Effect, Env, Event};
 use http::header::HOST;
 use http::{Method, Request, StatusCode};
-use protocol::view::Link;
 use protocol::{ClientMsg, DaemonMsg, SessionId, SessionSummary, Target};
 use rt::Rt;
-use rt::channel::Receiver;
+use rt::channel::{Receiver, Sender};
 use serde::Deserialize;
 
 use crate::http::{Gate, Host, Reply, see_other, text, whole};
 use crate::page::Page;
 use crate::{Daemon, view};
 
-/// The writers of the tabs whose transcripts are live, by tab id.
-type Tabs = Mutex<HashMap<String, Arc<Mutex<Writer>>>>;
+/// Where the calls of the tabs whose transcripts are live go, by tab id,
+/// with the number of the stream that opened it.
+type Tabs = Mutex<HashMap<String, (u64, Arc<Sender<TabIn>>)>>;
+
+/// What a live tab's client takes in.
+enum TabIn {
+    Client(Event),
+    /// A line typed in the composer.
+    Line(String),
+    Cmd(Cmd),
+}
 
 pub struct App {
     daemon: Daemon,
     rt: Rt,
     pub gate: Gate,
     tabs: Arc<Tabs>,
+    streams: AtomicU64,
 }
 
 // Nothing behind these locks is left half-updated by a panic.
@@ -54,6 +64,7 @@ impl App {
             rt,
             gate,
             tabs: Arc::default(),
+            streams: AtomicU64::new(0),
         }
     }
 
@@ -67,12 +78,12 @@ impl App {
         rt::unblock(&*self.rt, move || work(&daemon))
     }
 
-    /// Sends `msg` on tab `tab`'s connection; `false` if it has none.
-    async fn tell(&self, tab: &str, msg: ClientMsg) -> bool {
-        let Some(writer) = lock(&self.tabs).get(tab).cloned() else {
+    /// Hands `what` to tab `tab`'s client; `false` if it has none.
+    fn tell(&self, tab: &str, what: TabIn) -> bool {
+        let Some((_, tx)) = lock(&self.tabs).get(tab).cloned() else {
             return false;
         };
-        rt::unblock(&*self.rt, move || lock(&writer).send(&msg).is_ok()).await
+        tx.send(what).is_ok()
     }
 
     /// Answers a request the gate let through.
@@ -115,12 +126,12 @@ impl App {
                 let Some(tab) = param(query, "tab").filter(|t| valid_tab(t)) else {
                     return Reply::Whole(text(StatusCode::NOT_FOUND, "no such tab"));
                 };
-                return Reply::Events(Box::new(Live::open(Arc::clone(self), tab, session).await));
+                return Reply::Events(Box::new(Live::open(Arc::clone(self), tab, session)));
             }
             (&Method::POST, "/api/send", _) => match signals(&body) {
                 Some(Signals { draft, .. }) if draft.trim().is_empty() => done(true),
                 Some(Signals { tab, draft }) => {
-                    if self.tell(&tab, ClientMsg::input(draft)).await {
+                    if self.tell(&tab, TabIn::Line(draft)) {
                         // Empties the composer.
                         whole(
                             StatusCode::OK,
@@ -138,7 +149,7 @@ impl App {
                 let approved = param(query, "ok") == Some("1");
                 match (signals(&body), call) {
                     (Some(Signals { tab, .. }), Some(call)) => {
-                        done(self.tell(&tab, ClientMsg::approve(call, approved)).await)
+                        done(self.tell(&tab, TabIn::Cmd(Cmd::Approve { call, approved })))
                     }
                     _ => done(false),
                 }
@@ -146,7 +157,7 @@ impl App {
             // Stops the running turn: its model or tool call, and the rest
             // of it.
             (&Method::POST, "/api/interrupt", _) => match signals(&body) {
-                Some(Signals { tab, .. }) => done(self.tell(&tab, ClientMsg::INTERRUPT).await),
+                Some(Signals { tab, .. }) => done(self.tell(&tab, TabIn::Cmd(Cmd::Interrupt))),
                 None => done(false),
             },
             _ => text(StatusCode::NOT_FOUND, "not found"),
@@ -197,8 +208,9 @@ fn list(daemon: &Daemon) -> io::Result<Vec<SessionSummary>> {
 /// Starts a session in the workspace `a web` runs in, with its environment
 /// (or a remote daemon's bridge's), as `a new` does.
 fn new_session(daemon: &Daemon) -> io::Result<SessionId> {
+    let new = Attach::new(Target::New, Env::Origin);
     let mut conn = client::connect_with(&daemon.endpoint, &daemon.staged, &|| {}, &|conn| {
-        Ok(vec![conn.attach(Target::New, 0, true)?])
+        Ok(vec![conn.attach(&new)?])
     })?;
     let session = conn.reader.until(|msg| match msg {
         DaemonMsg::Attached { session, .. } => Some(session),
@@ -206,14 +218,6 @@ fn new_session(daemon: &Daemon) -> io::Result<SessionId> {
     })?;
     conn.writer.send(&ClientMsg::Detach)?;
     Ok(session)
-}
-
-/// Attaches to `session` without an environment, so it keeps the one it
-/// has, replaying the entries after `since`.
-fn attach(daemon: &Daemon, session: SessionId, since: u64) -> io::Result<Connection> {
-    client::connect_with(&daemon.endpoint, &daemon.staged, &|| {}, &|conn| {
-        Ok(vec![conn.attach(Target::Id(session), since, false)?])
-    })
 }
 
 fn parse_session(id: &str) -> Option<SessionId> {
@@ -225,51 +229,83 @@ fn valid_tab(tab: &str) -> bool {
     tab.len() == 32 && tab.bytes().all(|b| b.is_ascii_hexdigit())
 }
 
-/// One browser tab's daemon connection, whose writer the tab's calls use
-/// while it lasts.
-struct Tab {
+/// A tab's live transcript: its session client, the page rendered from it,
+/// and the driver under it.
+pub struct Live {
+    app: Arc<App>,
     id: String,
-    messages: Receiver<DaemonMsg>,
-    writer: Arc<Mutex<Writer>>,
-    tabs: Arc<Tabs>,
-    rt: Rt,
+    /// This stream's number: a reload's stream replaces it.
+    stream: u64,
+    inbox: Receiver<TabIn>,
+    driver: Driver,
+    page: Page,
 }
 
-impl Tab {
-    async fn open(app: &App, id: &str, session: SessionId, since: u64) -> io::Result<Self> {
-        let Connection {
-            mut reader, writer, ..
-        } = app
-            .blocking(move |daemon| attach(daemon, session, since))
-            .await?;
-        let (tx, messages) = rt::channel::bounded(256);
-        // Ends when the daemon closes the connection, as it does on detach.
-        app.rt.spawn_blocking(Box::new(move || {
-            while let Ok(Some(msg)) = reader.recv() {
-                if tx.send(msg).is_err() {
-                    break;
-                }
-            }
-        }));
-        let writer = Arc::new(Mutex::new(writer));
-        lock(&app.tabs).insert(id.to_owned(), Arc::clone(&writer));
-        Ok(Self {
+impl Live {
+    fn open(app: Arc<App>, id: &str, session: SessionId) -> Self {
+        let (tx, inbox) = rt::channel::bounded(256);
+        let tx = Arc::new(tx);
+        let events = Arc::clone(&tx);
+        let daemon = app.daemon.clone();
+        let driver = Driver::new(daemon.endpoint, daemon.staged, move |_, event| {
+            let _ = events.send(TabIn::Client(event));
+        });
+        let stream = app.streams.fetch_add(1, Ordering::Relaxed);
+        lock(&app.tabs).insert(id.to_owned(), (stream, tx));
+        let (page, open) = Page::new(session);
+        let mut live = Self {
+            app,
             id: id.to_owned(),
-            messages,
-            writer,
-            tabs: Arc::clone(&app.tabs),
-            rt: Arc::clone(&app.rt),
-        })
+            stream,
+            inbox,
+            driver,
+            page,
+        };
+        live.apply(open);
+        live
     }
 
-    /// Every message that has arrived, waiting for at least one; `None`
-    /// once the daemon closed the connection.
-    async fn next(&self) -> Option<Vec<DaemonMsg>> {
+    /// Has the driver carry out the client's effects.
+    fn apply(&mut self, mut effects: Vec<Effect>) {
+        while !effects.is_empty() {
+            let shown = effects
+                .into_iter()
+                .filter_map(|effect| self.driver.apply(effect))
+                .collect();
+            effects = self.page.absorb(shown);
+        }
+    }
+
+    /// The events to send next, waiting for the client; `None` once the
+    /// transcript will not change again.
+    pub async fn next(&mut self) -> Option<Vec<u8>> {
+        loop {
+            let events = self.page.take();
+            if !events.is_empty() {
+                return Some(events);
+            }
+            if self.page.ended() {
+                return None;
+            }
+            for input in self.batch().await? {
+                let effects = match input {
+                    TabIn::Client(event) => self.page.event(event),
+                    TabIn::Line(text) => self.page.line(&text),
+                    TabIn::Cmd(cmd) => self.page.command(cmd),
+                };
+                self.apply(effects);
+            }
+            self.page.settle();
+        }
+    }
+
+    /// Everything that has arrived, waiting for at least one.
+    async fn batch(&self) -> Option<Vec<TabIn>> {
         poll_fn(|cx| {
             let mut batch = Vec::new();
             loop {
-                match self.messages.poll_recv(cx) {
-                    Poll::Ready(Some(msg)) => batch.push(msg),
+                match self.inbox.poll_recv(cx) {
+                    Poll::Ready(Some(input)) => batch.push(input),
                     Poll::Ready(None) => return Poll::Ready((!batch.is_empty()).then_some(batch)),
                     Poll::Pending if batch.is_empty() => return Poll::Pending,
                     Poll::Pending => return Poll::Ready(Some(batch)),
@@ -280,77 +316,19 @@ impl Tab {
     }
 }
 
-/// The tab closed (its stream was dropped) or reconnected: detach.
-impl Drop for Tab {
+/// The tab closed (its stream was dropped) or reloaded: detach.
+impl Drop for Live {
     fn drop(&mut self) {
-        let mut tabs = lock(&self.tabs);
-        if tabs
-            .get(&self.id)
-            .is_some_and(|w| Arc::ptr_eq(w, &self.writer))
-        {
+        let mut tabs = lock(&self.app.tabs);
+        if tabs.get(&self.id).is_some_and(|(s, _)| *s == self.stream) {
             tabs.remove(&self.id);
         }
-        let writer = Arc::clone(&self.writer);
-        self.rt.spawn_blocking(Box::new(move || {
-            let _ = lock(&writer).send(&ClientMsg::Detach);
+        drop(tabs);
+        let (driver, effects) = (self.driver.clone(), self.page.client.detach());
+        self.app.rt.spawn_blocking(Box::new(move || {
+            for effect in effects {
+                driver.apply(effect);
+            }
         }));
-    }
-}
-
-/// A tab's live transcript: its daemon connection and the page folded
-/// from it.
-pub struct Live {
-    app: Arc<App>,
-    id: String,
-    session: SessionId,
-    /// `None` once the daemon is gone for good.
-    tab: Option<Tab>,
-    page: Page,
-}
-
-impl Live {
-    async fn open(app: Arc<App>, id: &str, session: SessionId) -> Self {
-        let tab = Tab::open(&app, id, session, 0).await;
-        let mut page = Page::default();
-        let tab = tab
-            .map_err(|e| page.end(Some(format!("Could not attach: {e}"))))
-            .ok();
-        Self {
-            app,
-            id: id.to_owned(),
-            session,
-            tab,
-            page,
-        }
-    }
-
-    /// The events to send next, waiting for the daemon; `None` once the
-    /// transcript will not change again.
-    pub async fn next(&mut self) -> Option<Vec<u8>> {
-        loop {
-            let events = self.page.take();
-            if !events.is_empty() {
-                return Some(events);
-            }
-            let batch = self.tab.as_ref()?.next().await;
-            match batch {
-                Some(batch) => self.page.fold(&batch),
-                None => self.lost().await,
-            }
-        }
-    }
-
-    /// The daemon closed the connection: after an upgrade, the new daemon
-    /// replays what this tab missed.
-    async fn lost(&mut self) {
-        self.tab = None;
-        if self.page.view.link != Link::Draining {
-            return self.page.end(None);
-        }
-        let since = self.page.view.seq;
-        match Tab::open(&self.app, &self.id, self.session, since).await {
-            Ok(tab) => self.tab = Some(tab),
-            Err(e) => self.page.end(Some(format!("Could not attach: {e}"))),
-        }
     }
 }

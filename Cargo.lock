@@ -457,6 +457,7 @@ name = "client"
 version = "0.0.0"
 dependencies = [
  "protocol",
+ "serde_json",
  "sys",
 ]
 

@@ -1,6 +1,6 @@
-//! The client's state: the shared reducer's [`SessionView`] plus what only
-//! this screen has (scroll, folds, the input, overlays). It turns input
-//! into [`Effect`]s and draws frames; it does no I/O, so tests drive it
+//! The client's state: the shared [`SessionClient`] plus what only this
+//! screen has (scroll, folds, the input, overlays). It turns input into
+//! [`Effect`]s and draws frames; it does no I/O, so tests drive it
 //! directly.
 
 mod draw;
@@ -11,8 +11,9 @@ mod tests;
 use std::collections::HashSet;
 use std::path::PathBuf;
 
-use protocol::view::{Change, Item, SessionList, SessionView, Usage};
-use protocol::{ClientMsg, DaemonMsg, SessionSummary, Target};
+use client::{Cmd, Env, Event, Link, SessionClient};
+use protocol::view::{Change, Item, SessionView, Update, Usage};
+use protocol::{SessionSummary, Target};
 use ratatui_core::style::{Color, Style};
 
 use super::editor::{Edit, Editor};
@@ -22,35 +23,15 @@ use super::text::{Action, Line};
 use super::view::{Live, MUTED};
 
 /// What the event loop does for the app.
-#[derive(Debug)]
+#[derive(Debug, PartialEq, Eq)]
 pub enum Effect {
-    Send(ClientMsg),
-    /// `/steer text`: input for the running turn, sent as a steer where the
-    /// daemon takes them.
-    Steer(String),
-    /// `/env refresh`: capture this shell's environment and send it.
-    RefreshEnv,
-    /// Asks the daemon for its sessions (the picker).
-    List,
-    /// Attach to another session on a new connection.
-    Open(Target),
+    /// The session client's to carry out.
+    Cmd(Cmd),
     /// Replace an unresponsive daemon.
     Restart,
     Redraw,
     Detach,
     Quit,
-}
-
-/// The connection, as the event loop reports it.
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub enum Conn {
-    Connecting,
-    /// Connected; `remote` when the daemon is another host's.
-    Open {
-        remote: bool,
-    },
-    Reconnecting,
-    Lost(String),
 }
 
 enum Overlay {
@@ -71,8 +52,6 @@ enum Overlay {
 struct Summary {
     /// The oldest call asked of this client still waiting, by index.
     asked: Option<usize>,
-    /// What [`SessionView::running`] says.
-    running: bool,
     /// The latest reply, by index (the status line shows its model).
     reply: Option<usize>,
 }
@@ -86,12 +65,10 @@ struct Rows {
 }
 
 pub struct App {
-    pub view: SessionView,
-    pub conn: Conn,
+    pub client: SessionClient,
     viewport: Viewport,
     /// This shell's workspace: the picker starts on its latest session.
     workspace: PathBuf,
-    sessions: SessionList,
     /// Per item, its rows when last drawn; `None` is out of date.
     cache: Vec<Option<Rows>>,
     collapsed: HashSet<u64>,
@@ -120,6 +97,7 @@ pub struct App {
     resuming: bool,
 }
 
+/// The keys; help lists the slash commands after them.
 const HELP: &[(&str, &str)] = &[
     ("enter", "send"),
     ("ctrl-j / alt-enter", "new line"),
@@ -134,22 +112,14 @@ const HELP: &[(&str, &str)] = &[
         "interrupt the running turn; else clear the input, or detach",
     ),
     ("ctrl-l", "redraw"),
-    ("/sessions", "switch session"),
-    ("/new", "start a new session"),
-    ("/interrupt", "stop the running turn"),
-    ("/steer text", "tell the running turn, before its next step"),
-    ("/env refresh", "send this shell's environment again"),
-    ("/detach", "leave; the session keeps running"),
 ];
 
 impl App {
     pub fn new(viewport: Viewport, workspace: PathBuf, target: &Target) -> Self {
         Self {
-            view: SessionView::default(),
-            conn: Conn::Connecting,
+            client: SessionClient::new(Env::Origin),
             viewport,
             workspace,
-            sessions: SessionList::default(),
             cache: Vec::new(),
             collapsed: HashSet::new(),
             verbose: false,
@@ -168,15 +138,62 @@ impl App {
         }
     }
 
-    /// Folds a daemon message into the view and keeps the screen's state in
-    /// step with what changed.
-    pub fn fold(&mut self, msg: &DaemonMsg) -> Option<Effect> {
-        if self.sessions.fold(msg) {
-            self.pick_default();
-            return None;
+    pub fn view(&self) -> &SessionView {
+        self.client.view()
+    }
+
+    /// Takes in what the driver reports; returns what the driver is to do.
+    pub fn event(&mut self, event: Event) -> Vec<client::Effect> {
+        let effects = self.client.step(event);
+        self.absorb(effects)
+    }
+
+    /// Has the session client carry out `cmd`; returns what the driver is
+    /// to do.
+    pub fn command(&mut self, cmd: Cmd) -> Vec<client::Effect> {
+        if let Cmd::Sessions = cmd {
+            self.overlay = Some(Overlay::Picker { selected: 0 });
         }
-        let update = self.view.fold(msg)?;
-        let len = self.view.items.len();
+        let effects = self.client.run(cmd);
+        self.absorb(effects)
+    }
+
+    /// Shows what the client's effects tell this screen and hands back the
+    /// driver's.
+    pub fn absorb(&mut self, effects: Vec<client::Effect>) -> Vec<client::Effect> {
+        let mut io = Vec::new();
+        for effect in effects {
+            match effect {
+                client::Effect::View(update) => io.extend(self.changed(update)),
+                client::Effect::Sessions => self.pick_default(),
+                client::Effect::Notice(text) => self.notice(text, true),
+                client::Effect::Link => {
+                    if let Link::Wedged(d) = self.client.link() {
+                        self.overlay = Some(Overlay::Unresponsive {
+                            who: d.who(),
+                            log: d.log_tail(),
+                        });
+                    }
+                }
+                effect => io.push(effect),
+            }
+        }
+        io
+    }
+
+    /// Folds a daemon message in, as if from the open connection.
+    #[cfg(test)]
+    pub fn fold(&mut self, msg: &protocol::DaemonMsg) -> Vec<client::Effect> {
+        let id = self.client.connection();
+        self.event(Event::Msg {
+            id,
+            msg: msg.clone(),
+        })
+    }
+
+    /// Keeps the screen's state in step with what changed in the view.
+    fn changed(&mut self, update: Update) -> Vec<client::Effect> {
+        let len = self.view().items.len();
         if !matches!(update.change, Change::Delta { .. }) {
             self.summary = None;
         }
@@ -217,14 +234,13 @@ impl App {
             Change::Recap(_) => self.recap_hidden = false,
             Change::Error { message } => {
                 // `a resume` where this workspace has no session: pick one.
-                if self.resuming && self.view.session.is_none() {
+                if self.resuming && self.view().session.is_none() {
                     self.resuming = false;
                     self.notice(
                         "no session in this workspace yet: pick one, or n for a new one",
                         false,
                     );
-                    self.overlay = Some(Overlay::Picker { selected: 0 });
-                    return Some(Effect::List);
+                    return self.command(Cmd::Sessions);
                 }
                 self.flash = Some((message, Style::new().fg(Color::Red)));
             }
@@ -239,19 +255,14 @@ impl App {
                 self.anchor = None;
                 self.committed = self.committed.min(len);
                 self.tokens = Usage::default();
-                for item in &self.view.items {
+                for item in &self.client.view().items {
                     spend(&mut self.tokens, item);
                 }
             }
             // A streaming reply's rows catch up with its text when drawn.
             Change::Delta { .. } | Change::Synced | Change::Draining => {}
         }
-        None
-    }
-
-    /// The daemon did not answer: offer to restart it.
-    pub fn unresponsive(&mut self, who: String, log: Vec<String>) {
-        self.overlay = Some(Overlay::Unresponsive { who, log });
+        Vec::new()
     }
 
     pub fn notice(&mut self, text: impl Into<String>, error: bool) {
@@ -281,10 +292,10 @@ impl App {
         if self.overlay.is_some() {
             return self.overlay_key(key);
         }
-        let asked = self.summary().asked.map(|i| self.view.items[i].key());
+        let asked = self.client.turn().asking;
         let page = self.page();
         match key {
-            Key::Ctrl('c') if self.running() => return Some(self.interrupt()),
+            Key::Ctrl('c') if self.client.turn().can_interrupt => return Some(self.interrupt()),
             Key::Ctrl('c') if !self.editor.is_empty() => self.editor.clear(),
             Key::Ctrl('c') => return Some(self.leave()),
             Key::Ctrl('d') if self.editor.is_empty() => return Some(self.leave()),
@@ -300,14 +311,14 @@ impl App {
             Key::Esc => self.recap_hidden = true,
             Key::Char(c @ ('y' | 'n' | 'Y' | 'N')) if self.editor.is_empty() && asked.is_some() => {
                 let call = asked?;
-                return Some(Effect::Send(ClientMsg::approve(
+                return Some(Effect::Cmd(Cmd::Approve {
                     call,
-                    c.eq_ignore_ascii_case(&'y'),
-                )));
+                    approved: c.eq_ignore_ascii_case(&'y'),
+                }));
             }
             key => {
                 if let Edit::Submit(text) = self.editor.key(key) {
-                    return self.submit(text);
+                    return self.submit(&text);
                 }
             }
         }
@@ -315,7 +326,7 @@ impl App {
     }
 
     fn overlay_key(&mut self, key: Key) -> Option<Effect> {
-        let last = self.sessions.sessions.len().saturating_sub(1);
+        let last = self.client.sessions().len().saturating_sub(1);
         match (&mut self.overlay, key) {
             (Some(Overlay::Picker { selected }), Key::Up | Key::Ctrl('p')) => {
                 *selected = selected.saturating_sub(1);
@@ -343,54 +354,31 @@ impl App {
         None
     }
 
-    fn submit(&mut self, text: String) -> Option<Effect> {
-        Some(match text.as_str() {
-            "/detach" | "/quit" | "/exit" => Effect::Detach,
-            "/env refresh" if matches!(self.conn, Conn::Open { remote: true }) => {
-                self.notice(
-                    "the host's environment is captured when `a` connects; reattach to refresh it",
-                    false,
-                );
-                return None;
-            }
-            "/env refresh" => Effect::RefreshEnv,
-            "/sessions" => {
-                self.overlay = Some(Overlay::Picker { selected: 0 });
-                Effect::List
-            }
-            "/new" => Effect::Open(Target::New),
-            "/interrupt" => self.interrupt(),
-            "/help" => {
+    fn submit(&mut self, text: &str) -> Option<Effect> {
+        let cmd = client::parse(text, self.client.turn().asking)?;
+        match &cmd {
+            Cmd::Detach => return Some(Effect::Detach),
+            Cmd::Interrupt => return Some(self.interrupt()),
+            Cmd::Help => {
                 self.overlay = Some(Overlay::Help);
                 return None;
             }
-            // With no turn running, a steer is plain input.
-            _ if let Some(steer) = text.strip_prefix("/steer ") => {
-                self.anchor = None;
-                Effect::Steer(steer.to_owned())
-            }
-            _ => {
+            Cmd::Input(_) => {
                 self.anchor = None;
                 self.recap_hidden = true;
-                Effect::Send(ClientMsg::input(text))
             }
-        })
-    }
-
-    /// Whether a model call, tool call or slash command is running: what
-    /// an interrupt stops, with the rest of its turn.
-    pub fn running(&mut self) -> bool {
-        self.summary().running
+            Cmd::Steer(_) => self.anchor = None,
+            Cmd::Sessions => self.overlay = Some(Overlay::Picker { selected: 0 }),
+            _ => {}
+        }
+        Some(Effect::Cmd(cmd))
     }
 
     fn summary(&mut self) -> Summary {
-        let view = &self.view;
+        let view = self.client.view();
+        let asking = self.client.turn().asking;
         *self.summary.get_or_insert_with(|| Summary {
-            asked: view
-                .asked()
-                .next()
-                .and_then(|call| view.items.binary_search_by_key(&call, Item::key).ok()),
-            running: view.running(),
+            asked: asking.and_then(|call| view.items.binary_search_by_key(&call, Item::key).ok()),
             reply: view
                 .items
                 .iter()
@@ -400,13 +388,13 @@ impl App {
 
     fn interrupt(&mut self) -> Effect {
         self.notice("stopping the turn (ctrl-d detaches)", false);
-        Effect::Send(ClientMsg::INTERRUPT)
+        Effect::Cmd(Cmd::Interrupt)
     }
 
     /// Ctrl-C when nothing runs: detaches; the session (and the daemon)
     /// keep running.
     fn leave(&self) -> Effect {
-        if self.view.session.is_some() {
+        if self.view().session.is_some() {
             Effect::Detach
         } else {
             Effect::Quit
@@ -427,7 +415,7 @@ impl App {
     fn wheel(&mut self, dir: i32) {
         match &mut self.overlay {
             Some(Overlay::Picker { selected }) => {
-                let last = self.sessions.sessions.len().saturating_sub(1);
+                let last = self.client.sessions().len().saturating_sub(1);
                 *selected = selected.saturating_add_signed(dir as isize).min(last);
             }
             Some(_) => {}
@@ -444,18 +432,18 @@ impl App {
                 self.stale(call);
             }
             Action::Approve(call, approved) => {
-                return Some(Effect::Send(ClientMsg::approve(call, approved)));
+                return Some(Effect::Cmd(Cmd::Approve { call, approved }));
             }
             Action::Pick(n) => {
                 let id = self.listed().nth(n)?.id;
                 self.overlay = None;
-                if Some(id) != self.view.session {
-                    return Some(Effect::Open(Target::Id(id)));
+                if Some(id) != self.view().session {
+                    return Some(Effect::Cmd(Cmd::Open(Target::Id(id))));
                 }
             }
             Action::NewSession => {
                 self.overlay = None;
-                return Some(Effect::Open(Target::New));
+                return Some(Effect::Cmd(Cmd::Open(Target::New)));
             }
             Action::Dismiss if self.overlay.is_some() => self.overlay = None,
             Action::Dismiss => self.recap_hidden = true,
@@ -471,7 +459,11 @@ impl App {
 
     /// Item `key`'s rows are out of date.
     fn stale(&mut self, key: u64) {
-        if let Ok(at) = self.view.items.binary_search_by_key(&key, Item::key)
+        if let Ok(at) = self
+            .client
+            .view()
+            .items
+            .binary_search_by_key(&key, Item::key)
             && let Some(slot) = self.cache.get_mut(at)
         {
             *slot = None;
@@ -480,7 +472,7 @@ impl App {
 
     /// Sessions as the picker lists them: newest first.
     fn listed(&self) -> impl Iterator<Item = &SessionSummary> {
-        self.sessions.sessions.iter().rev()
+        self.client.sessions().iter().rev()
     }
 
     fn pick_default(&mut self) {

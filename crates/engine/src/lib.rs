@@ -903,6 +903,7 @@ fn handle(daemon: &Daemon, life: &Lifecycle, conn: &UnixStream) -> io::Result<()
                 build: life.build.clone(),
                 caps,
                 client: conn.client,
+                commands: session::commands(&daemon.shared.registry.get()),
             });
             conn.serve(&mut reader)
         }

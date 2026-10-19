@@ -3,9 +3,12 @@
 //! and `&self` objects, with no generics or lifetimes to cross the boundary.
 //! JSON values (tool input and output, hook decisions) cross as JSON text.
 //!
-//! Session updates arrive as a stream that drops items when its buffer is
-//! full, so each carries the reducer's `rev`: a client that sees a gap asks
-//! [`Session::resync`] for what it missed, or a fresh snapshot.
+//! A session is the client SDK's [`client::SessionClient`]: the app only
+//! renders it. Its updates arrive as a stream that drops items when its
+//! buffer is full, so each carries a `rev`: a client that sees a gap asks
+//! [`Session::resync`] for what it missed, or a fresh snapshot. Each update
+//! also carries the turn as the SDK computes it ([`TurnInfo`]), and each
+//! tool call its [`CallPhase`], so no rule is copied into Swift.
 
 mod feed;
 mod live;
@@ -14,14 +17,14 @@ use std::fmt;
 use std::io;
 
 use boltffi::{data, error};
+use client::{End, Link, SessionClient, TurnView};
 use protocol::view::{
-    self, Approval, Change, Item, Link, Part, SessionView, Status, call_title, decision_line,
-    output_text, recap_line,
+    Approval, Change, Item, Part, Phase, Status, call_title, decision_line, output_text, recap_line,
 };
-use protocol::{Card, Outcome, Recap, SessionSummary};
+use protocol::{Card, CommandInfo, Outcome, Recap, SessionSummary};
 
 pub use feed::Reducer;
-pub use live::{Client, Session, SessionWatch};
+pub use live::{Client, Session, SessionWatch, find_session};
 
 /// What went wrong, by kind. [`ClientError::code`] is stable across builds,
 /// for clients that branch on it or localize it.
@@ -232,6 +235,97 @@ pub struct ViewUpdate {
     /// The last log entry folded, after this update.
     pub seq: u64,
     pub change: ViewChange,
+    /// The turn after this update.
+    pub turn: TurnInfo,
+}
+
+/// What the session's turn is doing, and what the controls offer for it;
+/// see [`client::TurnView`].
+#[data]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+// Flags, as the controls read them.
+#[allow(clippy::struct_excessive_bools)]
+pub struct TurnInfo {
+    /// A call is unsettled.
+    pub running: bool,
+    /// The oldest call waiting for this client's approval.
+    pub asking: Option<u64>,
+    pub asks: u32,
+    pub can_interrupt: bool,
+    pub can_steer: bool,
+    pub can_send: bool,
+}
+
+impl From<TurnView> for TurnInfo {
+    fn from(t: TurnView) -> Self {
+        Self {
+            running: t.running,
+            asking: t.asking,
+            asks: t.asks,
+            can_interrupt: t.can_interrupt,
+            can_steer: t.can_steer,
+            can_send: t.can_send,
+        }
+    }
+}
+
+/// Where a model call, tool call or command stands; see
+/// [`protocol::view::Phase`].
+#[data]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum CallPhase {
+    Running,
+    /// Waits for this client's approval: show the buttons.
+    Asking,
+    /// Waits for an approval asked of another client.
+    Waiting,
+    Denied,
+    Done,
+    Failed,
+    Interrupted,
+}
+
+impl From<Phase> for CallPhase {
+    fn from(p: Phase) -> Self {
+        match p {
+            Phase::Running => Self::Running,
+            Phase::Asking => Self::Asking,
+            Phase::Waiting => Self::Waiting,
+            Phase::Denied => Self::Denied,
+            Phase::Done => Self::Done,
+            Phase::Failed => Self::Failed,
+            Phase::Interrupted => Self::Interrupted,
+        }
+    }
+}
+
+/// A slash command, as help and completion list it.
+#[data]
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct CommandHelp {
+    /// `/name args`.
+    pub usage: String,
+    pub help: String,
+}
+
+/// What a typed line asks of the app itself, rather than of the session.
+#[data]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum AppAction {
+    Help,
+    /// Show the session list.
+    Sessions,
+    NewSession,
+}
+
+/// The slash commands every client takes, then those the daemon runs.
+pub(crate) fn commands(daemon: &[CommandInfo]) -> Vec<CommandHelp> {
+    client::help(daemon)
+        .map(|(usage, help)| CommandHelp {
+            usage,
+            help: help.to_owned(),
+        })
+        .collect()
 }
 
 /// See [`protocol::view::Change`]; items are upserted whole by index.
@@ -281,12 +375,10 @@ pub enum ViewChange {
     Error {
         message: String,
     },
-    /// The connection ended for good; open the session anew to go on.
-    Closed {
-        message: String,
+    /// The link to the daemon changed.
+    Link {
+        state: LinkState,
     },
-    /// This client detached.
-    Detached,
 }
 
 /// A transcript item; see [`protocol::view::Item`].
@@ -320,8 +412,7 @@ pub enum ViewItem {
         outcome: Option<ToolOutcome>,
         /// How the tool presents the call, or once it has one, its outcome.
         card: Option<ToolCard>,
-        /// Whether this client was asked to approve it.
-        asked: bool,
+        phase: CallPhase,
     },
     /// A slash command and its outcome.
     Command {
@@ -450,14 +541,56 @@ pub struct RecapInfo {
     pub asks: u32,
 }
 
+/// Where the link to the daemon stands; see [`client::Link`].
 #[data]
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub enum LinkState {
     Connecting,
+    /// Attached; the replay of what was missed is arriving.
     Replaying,
     Live,
+    /// The daemon finishes its work for an upgrade; the session reconnects.
     Draining,
-    Closed,
+    Reconnecting,
+    /// The daemon does not answer: `restart_daemon` replaces it.
+    NotResponding {
+        who: String,
+        log: Vec<String>,
+        crash: Option<String>,
+    },
+    Detached,
+    /// The daemon is gone; open the session anew to go on.
+    Lost {
+        message: String,
+    },
+}
+
+impl LinkState {
+    /// Whether the link is over: nothing more will arrive.
+    pub const fn ended(&self) -> bool {
+        matches!(self, Self::Detached | Self::Lost { .. })
+    }
+}
+
+impl From<&Link> for LinkState {
+    fn from(link: &Link) -> Self {
+        match link {
+            Link::Connecting => Self::Connecting,
+            Link::Live { synced: false, .. } => Self::Replaying,
+            Link::Live { .. } => Self::Live,
+            Link::Draining => Self::Draining,
+            Link::Reconnecting { .. } => Self::Reconnecting,
+            Link::Wedged(d) => Self::NotResponding {
+                who: d.who(),
+                log: d.log_tail(),
+                crash: d.crash_note(),
+            },
+            Link::Ended(End::Detached) => Self::Detached,
+            Link::Ended(End::Lost(message)) => Self::Lost {
+                message: message.clone(),
+            },
+        }
+    }
 }
 
 #[data]
@@ -480,8 +613,9 @@ pub struct SessionSnapshot {
     pub link: LinkState,
     pub recap: Option<RecapInfo>,
     pub streaming: Option<StreamingText>,
-    /// [`SessionView::state_hash`] as 16 hex digits: equal on every client
-    /// that folded the same session to the same seq.
+    pub turn: TurnInfo,
+    /// [`protocol::view::SessionView::state_hash`] as 16 hex digits: equal
+    /// on every client that folded the same session to the same seq.
     pub state_hash: String,
 }
 
@@ -498,16 +632,6 @@ pub enum Resync {
 
 fn index(i: usize) -> u32 {
     u32::try_from(i).unwrap_or(u32::MAX)
-}
-
-impl From<&view::Update> for ViewUpdate {
-    fn from(u: &view::Update) -> Self {
-        Self {
-            rev: u.rev,
-            seq: u.seq,
-            change: (&u.change).into(),
-        }
-    }
 }
 
 impl From<&Change> for ViewChange {
@@ -606,7 +730,7 @@ impl From<&Item> for ViewItem {
                 approval,
                 outcome,
                 card,
-                asked,
+                ..
             } => Self::Tool {
                 call: *call,
                 tool: tool.clone(),
@@ -623,7 +747,7 @@ impl From<&Item> for ViewItem {
                     body: c.body.clone(),
                     note: c.note.clone(),
                 }),
-                asked: *asked,
+                phase: item.phase().map_or(CallPhase::Running, Into::into),
             },
             Item::Command {
                 call,
@@ -695,25 +819,21 @@ impl From<&Recap> for RecapInfo {
 }
 
 impl SessionSnapshot {
-    fn of(view: &SessionView, closed: bool) -> Self {
+    fn of(client: &SessionClient, rev: u64) -> Self {
+        let view = client.view();
         Self {
-            rev: view.rev,
+            rev,
             seq: view.seq,
             session: view.session.map(|s| s.to_string()),
             workspace: view.workspace.display().to_string(),
             items: view.items.iter().map(Into::into).collect(),
-            link: match view.link {
-                _ if closed => LinkState::Closed,
-                Link::Connecting => LinkState::Connecting,
-                Link::Replaying => LinkState::Replaying,
-                Link::Live => LinkState::Live,
-                Link::Draining => LinkState::Draining,
-            },
+            link: client.link().into(),
             recap: view.recap.as_ref().map(Into::into),
             streaming: view.streaming.as_ref().map(|s| StreamingText {
                 call: s.call,
                 text: s.text.clone(),
             }),
+            turn: client.turn().into(),
             state_hash: format!("{:016x}", view.state_hash()),
         }
     }

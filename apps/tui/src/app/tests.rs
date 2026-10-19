@@ -8,6 +8,9 @@ use ratatui_core::buffer::Buffer;
 use ratatui_core::style::Modifier;
 use serde_json::json;
 
+use client::{Cmd, Event, Welcome};
+use protocol::Caps;
+
 use super::{App, Effect};
 use crate::keys::{Input, Key, Mouse};
 use crate::render::{Viewport, rows};
@@ -25,7 +28,7 @@ fn entry(seq: u64, body: Body) -> DaemonMsg {
 fn app(viewport: Viewport, msgs: &[DaemonMsg]) -> (App, SessionId) {
     let session = SessionId::new();
     let mut app = App::new(viewport, ws(), &Target::New);
-    app.conn = super::Conn::Open { remote: false };
+    connect(&mut app, false);
     app.fold(&DaemonMsg::Attached {
         session,
         workspace: ws(),
@@ -34,6 +37,23 @@ fn app(viewport: Viewport, msgs: &[DaemonMsg]) -> (App, SessionId) {
         app.fold(msg);
     }
     (app, session)
+}
+
+/// Opens a connection for `app` (to a `remote` host's daemon).
+fn connect(app: &mut App, remote: bool) {
+    let effects = app.client.open(Target::New);
+    app.absorb(effects);
+    let id = app.client.connection();
+    app.event(Event::Connected {
+        id,
+        welcome: Welcome {
+            proto: 1,
+            caps: Caps::ALL,
+            client: 1,
+        },
+        remote,
+        commands: Vec::new(),
+    });
 }
 
 /// A frame: its cells, where the caret shows (if it does), and its rows.
@@ -119,19 +139,17 @@ fn an_approval_shows_buttons_and_y_or_a_click_answers_it() {
     assert_eq!(bar.1, 16, "above the input: {rows:#?}");
     assert!(matches!(
         press(&mut app, Key::Char('y')),
-        Some(Effect::Send(ClientMsg::Approve {
+        Some(Effect::Cmd(Cmd::Approve {
             call: 3,
             approved: true,
-            ..
         }))
     ));
     let (x, y) = find(&rows, "[ n  no ]");
     assert!(matches!(
         app.input(Input::Mouse(Mouse::Press { x: x + 2, y })),
-        Some(Effect::Send(ClientMsg::Approve {
+        Some(Effect::Cmd(Cmd::Approve {
             call: 3,
             approved: false,
-            ..
         }))
     ));
     // With text in the input, y is typed.
@@ -144,10 +162,10 @@ fn an_approval_shows_buttons_and_y_or_a_click_answers_it() {
 #[test]
 fn ctrl_c_interrupts_a_call_waiting_for_approval() {
     let (mut app, _) = app(Viewport::Full, &asked_command());
-    assert!(app.running());
+    assert!(app.client.turn().running);
     assert!(matches!(
         press(&mut app, Key::Ctrl('c')),
-        Some(Effect::Send(ClientMsg::Interrupt { client_seq: None }))
+        Some(Effect::Cmd(Cmd::Interrupt))
     ));
 }
 
@@ -307,7 +325,7 @@ fn ctrl_c_interrupts_a_running_call_and_shows_how_it_ended() {
     press(&mut app, Key::Char('x'));
     assert!(matches!(
         press(&mut app, Key::Ctrl('c')),
-        Some(Effect::Send(ClientMsg::Interrupt { .. }))
+        Some(Effect::Cmd(Cmd::Interrupt))
     ));
     assert!(!app.editor.is_empty(), "the draft stays");
     app.fold(&entry(
@@ -346,7 +364,7 @@ fn ctrl_c_interrupts_a_running_model_call_too() {
     let (mut app, _) = app(Viewport::Full, &msgs);
     assert!(matches!(
         press(&mut app, Key::Ctrl('c')),
-        Some(Effect::Send(ClientMsg::Interrupt { client_seq: None }))
+        Some(Effect::Cmd(Cmd::Interrupt))
     ));
     app.fold(&entry(
         3,
@@ -357,7 +375,7 @@ fn ctrl_c_interrupts_a_running_model_call_too() {
             },
         },
     ));
-    assert!(!app.running());
+    assert!(!app.client.turn().running);
 }
 
 #[test]
@@ -366,33 +384,44 @@ fn slash_commands() {
     assert!(matches!(typed(&mut app, "/detach"), Some(Effect::Detach)));
     assert!(matches!(
         typed(&mut app, "/env refresh"),
-        Some(Effect::RefreshEnv)
+        Some(Effect::Cmd(Cmd::RefreshEnv))
     ));
     assert!(matches!(
         typed(&mut app, "/new"),
-        Some(Effect::Open(Target::New))
+        Some(Effect::Cmd(Cmd::Open(Target::New)))
     ));
     // The daemon runs the rest, or says there is no such command.
     assert!(matches!(
         typed(&mut app, "/nope"),
-        Some(Effect::Send(ClientMsg::Input { text, .. })) if text == "/nope"
+        Some(Effect::Cmd(Cmd::Input(text))) if text == "/nope"
     ));
     assert!(matches!(
         typed(&mut app, "/interrupt"),
-        Some(Effect::Send(ClientMsg::Interrupt { .. }))
+        Some(Effect::Cmd(Cmd::Interrupt))
     ));
     assert!(matches!(
         typed(&mut app, "/steer and tests"),
-        Some(Effect::Steer(text)) if text == "and tests"
+        Some(Effect::Cmd(Cmd::Steer(text))) if text == "and tests"
     ));
     assert!(matches!(
         typed(&mut app, "hello there"),
-        Some(Effect::Send(ClientMsg::Input { text, .. })) if text == "hello there"
+        Some(Effect::Cmd(Cmd::Input(text))) if text == "hello there"
     ));
-    app.conn = super::Conn::Open { remote: true };
-    assert!(typed(&mut app, "/env refresh").is_none());
+    // A remote host's environment is not this shell's to send.
+    connect(&mut app, true);
+    assert!(app.command(Cmd::RefreshEnv).is_empty());
+    let (_, rows) = frame(&mut app, 80, 14);
+    find(&rows, "reattach to refresh it");
+    connect(&mut app, false);
+    app.fold(&DaemonMsg::Attached {
+        session: current,
+        workspace: ws(),
+    });
 
-    assert!(matches!(typed(&mut app, "/sessions"), Some(Effect::List)));
+    assert!(matches!(
+        typed(&mut app, "/sessions"),
+        Some(Effect::Cmd(Cmd::Sessions))
+    ));
     let other = SessionId::new();
     let summary = |id, workspace: &str, activity| SessionSummary {
         id,
@@ -414,7 +443,7 @@ fn slash_commands() {
     assert!(here < there, "newest first");
     assert!(matches!(
         app.input(Input::Mouse(Mouse::Press { x, y: there })),
-        Some(Effect::Open(Target::Id(id))) if id == other
+        Some(Effect::Cmd(Cmd::Open(Target::Id(id)))) if id == other
     ));
 }
 
@@ -427,15 +456,19 @@ fn resuming_where_there_is_no_session_opens_the_picker() {
             any_workspace: false,
         },
     );
-    let effect = app.fold(&DaemonMsg::Error {
+    connect(&mut app, false);
+    let effects = app.fold(&DaemonMsg::Error {
         message: "no matching session".into(),
     });
-    assert!(matches!(effect, Some(Effect::List)));
+    assert!(
+        matches!(&effects[..], [client::Effect::Send(ClientMsg::List)]),
+        "{effects:?}"
+    );
     let (_, rows) = frame(&mut app, 60, 12);
     find(&rows, "sessions");
     assert!(matches!(
         press(&mut app, Key::Char('n')),
-        Some(Effect::Open(Target::New))
+        Some(Effect::Cmd(Cmd::Open(Target::New)))
     ));
 }
 

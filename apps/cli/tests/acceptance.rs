@@ -538,3 +538,47 @@ fn an_older_and_a_newer_build_share_one_daemon_and_never_fight() {
     assert_eq!(runtime.current().unwrap(), new_id);
     term.finish();
 }
+
+/// A client reattaching after a drain picks the session up as it is: the
+/// environment another client gave it meanwhile stands.
+#[test]
+fn a_reattach_after_drain_never_resends_the_environment() {
+    let env = Env::new("drain-env");
+    let old = env.older_build();
+    let id = String::from_utf8(env.cmd_as(&old, &["new"]).output().unwrap().stdout).unwrap();
+    let id = id.trim();
+    let mut term = Repl::spawn({
+        let mut cmd = env.cmd_as(&old, &["attach", id]);
+        cmd.env("MARK", "the line client's");
+        cmd
+    });
+    term.lines_until("[session");
+
+    let mut other = env.connect();
+    let (session, _) = other.attach(ANY, &env.ws);
+    let mut theirs = protocol::Environment {
+        cwd: env.ws.clone(),
+        ..Default::default()
+    };
+    theirs.vars.insert("MARK".into(), "another client's".into());
+    other.send(&ClientMsg::Environment(theirs));
+    other.until(|e| matches!(e.body, Body::Environment(_)));
+
+    env.run(&["ls"]);
+    term.type_line("still here");
+    term.lines_until("a    still here");
+    let marks: Vec<_> = env
+        .log(session)
+        .into_iter()
+        .filter_map(|e| match e.body {
+            Body::Environment(env) => env.vars.get("MARK").cloned(),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(
+        marks.last().map(String::as_str),
+        Some("another client's"),
+        "{marks:?}"
+    );
+    term.finish();
+}
