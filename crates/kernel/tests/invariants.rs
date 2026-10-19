@@ -1,0 +1,457 @@
+//! What holds of the kernel by construction, each kept by a test named
+//! after it.
+
+mod common;
+
+use std::collections::VecDeque;
+use std::path::Path;
+use std::process::Command;
+use std::time::Duration;
+
+use common::*;
+use kernel::{Effect, Effects, Event, Load, Note, Owner, Replied, Turn};
+use protocol::ledger::Call;
+use protocol::{Body, Entry, Json, Outcome, WaitOn};
+use serde_json::json;
+
+/// Carries effects out as a driver would, at once and always the same way:
+/// a tool is done with its name, a model's first reply of a turn calls
+/// `sleep` and the next calls nothing, a backoff is over, an answer comes.
+fn drive(s: &mut Session, fx: Effects) {
+    let mut todo: VecDeque<Effect> = fx.into_iter().collect();
+    while let Some(effect) = todo.pop_front() {
+        let event = match effect {
+            Effect::RunTool { call, tool, .. } | Effect::Resume { call, tool, .. } => {
+                Event::ToolDone {
+                    call,
+                    outcome: done(json!(tool)),
+                }
+            }
+            Effect::CallModel { call, .. } => {
+                let before = &s.log[usize::try_from(call.get()).unwrap() - 2].body;
+                let first = matches!(before, Body::Input { .. } | Body::Take { .. });
+                let calls = if first {
+                    vec![("sleep", json!({ "seconds": 1 }))]
+                } else {
+                    vec![]
+                };
+                Event::ModelDone {
+                    call,
+                    replied: Replied::Done(reply(&calls)),
+                }
+            }
+            Effect::Sleep { call, .. } => Event::Woke { call },
+            _ => continue,
+        };
+        todo.extend(s.step(event));
+    }
+}
+
+/// The log as the conversation it holds: what the user said, the replies
+/// and the calls, and how each call ended. Retries, intents of model calls
+/// and how input waited are left out.
+fn conversation(log: &[Entry]) -> Vec<String> {
+    let text_of = |seq: u64| match &log[usize::try_from(seq).unwrap() - 1].body {
+        Body::Input { text, .. } => text.clone(),
+        _ => unreachable!(),
+    };
+    log.iter()
+        .filter_map(|e| match &e.body {
+            Body::Input {
+                text, taken: true, ..
+            } => Some(format!("user {text}")),
+            Body::Take { input } => Some(format!("user {}", text_of(input.get()))),
+            Body::Assistant { text } => Some(format!("said {text}")),
+            Body::ToolCall { tool, input, .. } => Some(format!("call {tool} {input}")),
+            Body::ToolResult { outcome, .. } => Some(format!("result {outcome:?}")),
+            Body::ModelResult {
+                outcome: Outcome::Done { output },
+                ..
+            } => Some(format!("reply {output}")),
+            _ => None,
+        })
+        .collect()
+}
+
+/// Runs `inputs` to the end, all given at once, with a crash after each
+/// entry of an uninterrupted run: the session resumed from what committed,
+/// and given the input that was not, ends with the same conversation.
+fn crash_everywhere(reg: impl Fn() -> Reg, inputs: &[&str]) {
+    let mut s = Session::new(reg().arc());
+    for text in inputs {
+        let fx = s.step(user(text));
+        drive(&mut s, fx);
+    }
+    let whole = s.log.clone();
+    assert_eq!(*s.core.turn(), Turn::Idle, "{whole:#?}");
+    for cut in 0..=whole.len() {
+        let (mut s, fx) = Session::resume(reg().arc(), whole[..cut].to_vec(), &Load::default());
+        drive(&mut s, fx);
+        let given = whole[..cut]
+            .iter()
+            .filter(|e| matches!(e.body, Body::Input { .. }))
+            .count();
+        for text in &inputs[given..] {
+            let fx = s.step(user(text));
+            drive(&mut s, fx);
+        }
+        assert_eq!(
+            conversation(&s.log),
+            conversation(&whole),
+            "cut after {cut}: {:#?}",
+            s.log
+        );
+        let calls = s
+            .log
+            .iter()
+            .filter(|e| matches!(e.body, Body::ToolCall { .. }))
+            .count();
+        let results = s
+            .log
+            .iter()
+            .filter(|e| matches!(e.body, Body::ToolResult { .. }))
+            .count();
+        assert_eq!(calls, results, "every call answered once, cut after {cut}");
+        assert_eq!(*s.core.turn(), Turn::Idle);
+    }
+}
+
+/// #8: whatever entry a crash comes after, resuming the log is all the
+/// recovery there is, and the session goes on as if there had been none
+/// (its calls being safe to run again).
+#[test]
+fn recovery_is_just_resume() {
+    crash_everywhere(Reg::echo, &["sleep 1", "hi", "sleep 2", "bye"]);
+    crash_everywhere(|| Reg::chat().retry(Duration::ZERO), &["go", "again"]);
+}
+
+/// A session in each state a turn can be in, with what it logged last.
+fn states() -> Vec<(&'static str, Session)> {
+    let mut states = Vec::new();
+    let mut state = |name, reg: Reg, events: Vec<Event>| {
+        let mut s = Session::new(reg.arc());
+        for event in events {
+            s.step(event);
+        }
+        states.push((name, s));
+    };
+    state("idle", Reg::echo(), vec![user("hi")]);
+    state("model streaming", Reg::chat(), vec![user("hi")]);
+    let retrying = Reg::chat().retry(Duration::from_secs(1));
+    state("model backoff", retrying, vec![user("hi"), model_failed(2)]);
+    state("tool running", Reg::echo(), vec![user("sleep 1")]);
+    state(
+        "gate awaiting",
+        Reg::echo().policy(Policy::Later),
+        vec![user("$ x")],
+    );
+    let asking = Reg::echo().policy(Policy::Ask(&["bash"]));
+    state("waiting approval", asking, vec![user("$ x")]);
+    let dialog = Event::Waits {
+        call: id(2),
+        on: WaitOn::Dialog { ui: Json::null() },
+    };
+    state("waiting dialog", Reg::echo(), vec![user("$ x"), dialog]);
+    let spawn = Event::Spawn {
+        call: id(2),
+        child: child(),
+        input: "go".into(),
+        wait: true,
+    };
+    state("waiting child", Reg::echo(), vec![user("task go"), spawn]);
+    state("stopping", Reg::echo(), vec![user("sleep 1"), interrupt()]);
+    state(
+        "queued behind",
+        Reg::echo(),
+        vec![user("sleep 1"), user("sleep 2")],
+    );
+    states
+}
+
+fn starts_work(effect: &Effect, open_at_interrupt: u64) -> bool {
+    match effect {
+        Effect::RunTool { call, .. }
+        | Effect::Resume { call, .. }
+        | Effect::CallModel { call, .. }
+        | Effect::Await { call, .. } => call.get() <= open_at_interrupt,
+        Effect::StartChild { .. } => true,
+        _ => false,
+    }
+}
+
+/// #10 (B1): in no state does an interrupt start work for what was open
+/// when it landed, nor while what it cancelled reports; with nothing
+/// running it does nothing at all.
+#[test]
+fn an_interrupt_never_starts_work() {
+    for (name, mut s) in states() {
+        let mark = s.log.len() as u64;
+        let mut todo: VecDeque<Effect> = s.step(interrupt()).into_iter().collect();
+        if name == "stopping" {
+            // What the first interrupt cancelled reports now.
+            todo.push_back(cancel(2));
+        }
+        if name == "idle" {
+            assert!(todo.is_empty(), "{todo:?}");
+            continue;
+        }
+        while let Some(effect) = todo.pop_front() {
+            assert!(!starts_work(&effect, mark), "{name}: {effect:?}");
+            let event = match effect {
+                Effect::Cancel { call } => match &s.core.ledger().call(call.get()).map(|o| &o.call)
+                {
+                    Some(Call::Model { .. }) => Event::ModelDone {
+                        call,
+                        replied: Replied::Interrupted(None),
+                    },
+                    Some(Call::Tool { .. }) => tool_done(call.get(), INTERRUPTED),
+                    None => continue,
+                },
+                Effect::Interrupt { child } => Event::ChildSettled {
+                    child,
+                    outcome: INTERRUPTED,
+                },
+                _ => continue,
+            };
+            todo.extend(s.step(event));
+        }
+        let interrupted = s.log.iter().filter(|e| e.body == Body::INTERRUPT).count();
+        assert_eq!(interrupted, 1, "{name}: {:#?}", s.log);
+        if name != "queued behind" {
+            assert_eq!(*s.core.turn(), Turn::Idle, "{name}");
+        }
+    }
+}
+
+/// #11 (B2): an interrupt stops the turn it lands in, and only it.
+#[test]
+fn an_interrupt_stops_only_its_turn() {
+    let mut s = Session::new(Reg::echo().arc());
+    s.step(user("sleep 1"));
+    s.step(tool_done(2, done(json!(1))));
+    // Lands between turns: nothing to stop, and nothing kept.
+    assert!(s.step(interrupt()).is_empty());
+    let fx = s.step(user("sleep 2"));
+    assert!(
+        fx.iter().any(|e| matches!(e, Effect::RunTool { .. })),
+        "{fx:?}"
+    );
+}
+
+/// #66: the kernel holds no clock, randomness or hash order, so the same
+/// events give the same log; and a log resumed gives the state it was
+/// written in (#5: replay equals live).
+#[test]
+fn the_same_events_give_the_same_log() {
+    // The open call of the turn, whatever its number.
+    let open = |s: &Session| match s.core.turn() {
+        Turn::Acting { open } => open[0].0,
+        turn => panic!("no call open: {turn:?}"),
+    };
+    let run = || {
+        let mut s = Session::new(Reg::echo().on_stop("more").arc());
+        s.step(user("sleep 1"));
+        s.step(user("queued"));
+        let note = Note::Progress("half\n".into());
+        s.step(Event::Note {
+            call: open(&s),
+            note,
+        });
+        s.step(tool_done(open(&s).get(), done(json!(1))));
+        s.step(user("/jobs"));
+        s.step(tool_done(open(&s).get(), done(json!([]))));
+        s.step(user("task go"));
+        let (call, input) = (open(&s), "go".into());
+        s.step(Event::Spawn {
+            call,
+            child: child(),
+            input,
+            wait: true,
+        });
+        s.step(Event::ChildSettled {
+            child: child(),
+            outcome: done(json!("ok")),
+        });
+        s.step(tool_done(call.get(), done(json!("ok"))));
+        s
+    };
+    let (a, b) = (run(), run());
+    assert_eq!(a.log, b.log);
+    assert_eq!(*a.core.turn(), Turn::Idle, "{:#?}", a.log);
+    let reg = Reg::echo().on_stop("more");
+    reg.stopped.store(true, std::sync::atomic::Ordering::SeqCst);
+    let (resumed, fx) = Session::resume(reg.arc(), a.log.clone(), &Load::default());
+    assert!(fx.is_empty(), "{fx:?}");
+    assert_eq!(resumed.core.turn(), a.core.turn());
+    assert_eq!(resumed.core.ledger().activity(), a.core.ledger().activity());
+}
+
+/// Whether `f` panics, run as a session actor runs: in a process of its
+/// own here, which takes its state with it. (Dev builds' codegen cannot
+/// unwind this crate's frames, so a panic aborts, as it would a slot.)
+#[allow(clippy::disallowed_methods)]
+fn panics(name: &str, f: impl FnOnce()) -> bool {
+    const IN_CHILD: &str = "KERNEL_TEST_PANIC";
+    if std::env::var_os(IN_CHILD).is_some_and(|n| n == name) {
+        f();
+        std::process::exit(0);
+    }
+    let status = Command::new(std::env::current_exe().unwrap())
+        .args([name, "--exact", "--nocapture", "--test-threads=1"])
+        .env(IN_CHILD, name)
+        .output()
+        .unwrap()
+        .status;
+    !status.success()
+}
+
+/// #63: a panic in a step loses only what it had not handed the driver;
+/// the session is resumed from what committed, on a fixed registry.
+#[test]
+fn a_kernel_panic_is_a_resume() {
+    let panicking = || {
+        let mut s = Session::new(Reg::echo().policy(Policy::Panic).arc());
+        s.step(user("hi"));
+        s
+    };
+    let committed = panicking().log;
+    assert!(panics("a_kernel_panic_is_a_resume", || {
+        panicking().step(user("$ ls"));
+    }));
+    let (mut s, fx) = Session::resume(Reg::echo().arc(), committed, &Load::default());
+    assert!(fx.is_empty(), "{fx:?}");
+    s.table(vec![(
+        user("$ ls"),
+        vec![
+            BUSY,
+            append(3, input("$ ls")),
+            append(4, bash("ls")),
+            run_bash(4, "ls"),
+        ],
+    )]);
+    let (_, fx) = Session::resume(Reg::echo().arc(), s.log, &Load::default());
+    assert_eq!(fx.as_slice(), [append(5, tool_result(4, INTERRUPTED))]);
+}
+
+/// #32: the kernel cannot do I/O. Nothing it is built from reaches a
+/// runtime, the OS or the network, and its source names no file, socket,
+/// process, thread or clock.
+#[test]
+#[allow(clippy::disallowed_methods)]
+fn the_kernel_does_no_io() {
+    let manifest = Path::new(env!("CARGO_MANIFEST_DIR"));
+    let tree = Command::new(env!("CARGO"))
+        .args([
+            "tree",
+            "-p",
+            "kernel",
+            "-e",
+            "normal",
+            "--prefix",
+            "none",
+            "-f",
+            "{p}",
+            "--offline",
+        ])
+        .current_dir(manifest)
+        .output()
+        .unwrap();
+    assert!(
+        tree.status.success(),
+        "{}",
+        String::from_utf8_lossy(&tree.stderr)
+    );
+    let tree = String::from_utf8(tree.stdout).unwrap();
+    let crates: Vec<&str> = tree
+        .lines()
+        .filter_map(|l| l.split_whitespace().next())
+        .collect();
+    assert!(crates.contains(&"protocol"), "{tree}");
+    for io in [
+        "rt",
+        "sys",
+        "store",
+        "engine",
+        "ext",
+        "ureq",
+        "mio",
+        "rustix",
+        "tokio",
+        "smol",
+        "async-task",
+        "native-tls",
+        "rustls",
+        "socket2",
+        "windows-sys",
+    ] {
+        assert!(!crates.contains(&io), "the kernel pulls in {io}:\n{tree}");
+    }
+    for file in std::fs::read_dir(manifest.join("src")).unwrap() {
+        let path = file.unwrap().path();
+        let source = std::fs::read_to_string(&path).unwrap();
+        // `protocol` makes ids from the clock and the OS's randomness
+        // (getrandom, over libc): the kernel is given its ids instead.
+        let ids = ["SessionId::new", "ClientId::new", "now_v7", "Uuid::"];
+        for io in [
+            "std::fs",
+            "std::net",
+            "std::process",
+            "std::thread",
+            "std::io",
+            "std::env",
+        ]
+        .into_iter()
+        .chain(ids)
+        {
+            assert!(!source.contains(io), "{} names {io}", path.display());
+        }
+    }
+}
+
+/// #64: time comes in as events; the kernel's source reads no clock (and
+/// its clippy.toml disallows it).
+#[test]
+fn the_kernel_never_reads_a_clock() {
+    let manifest = Path::new(env!("CARGO_MANIFEST_DIR"));
+    for file in std::fs::read_dir(manifest.join("src")).unwrap() {
+        let path = file.unwrap().path();
+        let source = std::fs::read_to_string(&path).unwrap();
+        for clock in ["Instant", "SystemTime", "now()", "UNIX_EPOCH"] {
+            assert!(!source.contains(clock), "{} names {clock}", path.display());
+        }
+    }
+    let lint = std::fs::read_to_string(manifest.join("clippy.toml")).unwrap();
+    assert!(
+        lint.contains("std::time::Instant::now") && lint.contains("std::time::SystemTime::now")
+    );
+}
+
+/// A child's watch fires once, however often it reports.
+#[test]
+fn a_watch_fires_once() {
+    let load = Load {
+        owner: Owner::None,
+        ..Load::default()
+    };
+    let (mut s, _) = Session::resume(Reg::echo().arc(), Vec::new(), &load);
+    s.step(user("task go"));
+    s.step(Event::Spawn {
+        call: id(2),
+        child: child(),
+        input: "go".into(),
+        wait: false,
+    });
+    for _ in 0..3 {
+        s.step(Event::ChildSettled {
+            child: child(),
+            outcome: done(json!("ok")),
+        });
+    }
+    s.step(tool_done(2, done(json!(null))));
+    let fired = s
+        .log
+        .iter()
+        .filter(|e| matches!(e.body, Body::Fired { .. }))
+        .count();
+    assert_eq!(fired, 1, "{:#?}", s.log);
+}

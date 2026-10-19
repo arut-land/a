@@ -19,10 +19,10 @@ fn chat() -> Session {
 }
 
 /// A call the model made, under its id.
-fn model_tool_call(tool: &str, input: serde_json::Value, id: &str) -> Body {
+fn model_tool_call(tool: &str, input: &serde_json::Value, id: &str) -> Body {
     Body::ToolCall {
         tool: tool.to_owned(),
-        input: Json::new(&input),
+        input: Json::new(input),
         id: Some(id.to_owned()),
         card: None,
         by: Audience::Model,
@@ -31,7 +31,10 @@ fn model_tool_call(tool: &str, input: serde_json::Value, id: &str) -> Body {
 
 #[test]
 fn input_with_nothing_running_starts_a_turn_at_once() {
-    echo().table(vec![(user("hi"), vec![append(1, input("hi")), append(2, said("hi"))])]);
+    echo().table(vec![(
+        user("hi"),
+        vec![append(1, input("hi")), append(2, said("hi"))],
+    )]);
 }
 
 #[test]
@@ -39,7 +42,12 @@ fn a_tool_runs_after_its_intent_and_its_result_ends_the_turn() {
     echo().table(vec![
         (
             user("$ ls"),
-            vec![BUSY, append(1, input("$ ls")), append(2, bash("ls")), run_bash(2, "ls")],
+            vec![
+                BUSY,
+                append(1, input("$ ls")),
+                append(2, bash("ls")),
+                run_bash(2, "ls"),
+            ],
         ),
         (
             tool_done(2, done(json!("a\n"))),
@@ -109,7 +117,12 @@ fn an_ask_waits_and_runs_once_approved() {
         ),
         (
             answer(2, true, 7),
-            vec![BUSY, append(4, answered(2, true)), run_bash(2, "echo"), ok(7)],
+            vec![
+                BUSY,
+                append(4, answered(2, true)),
+                run_bash(2, "echo"),
+                ok(7),
+            ],
         ),
         (
             answer(2, false, 8),
@@ -133,7 +146,10 @@ fn a_refused_ask_answers_the_call_without_running_it() {
             approve(2, false),
             vec![
                 append(4, answered(2, false)),
-                append(5, tool_result(2, failed("the user did not approve this call"))),
+                append(
+                    5,
+                    tool_result(2, failed("the user did not approve this call")),
+                ),
             ],
         ),
     ]);
@@ -199,10 +215,7 @@ fn a_gate_answering_later_runs_the_call_when_it_answers() {
     s.step(user("$ x"));
     let gated = Gated::run(Json::new(&json!({ "command": "x" })));
     s.table(vec![(
-        Event::Gated {
-            call: id(2),
-            gated,
-        },
+        Event::Gated { call: id(2), gated },
         vec![run_bash(2, "x")],
     )]);
 }
@@ -212,7 +225,10 @@ fn a_gate_answering_later_runs_the_call_when_it_answers() {
 fn an_interrupt_between_turns_is_not_kept_for_the_next() {
     echo().table(vec![
         (interrupt(), vec![]),
-        (user("hi"), vec![append(1, input("hi")), append(2, said("hi"))]),
+        (
+            user("hi"),
+            vec![append(1, input("hi")), append(2, said("hi"))],
+        ),
     ]);
 }
 
@@ -221,7 +237,12 @@ fn an_interrupt_stops_the_model_call_and_ends_the_turn() {
     chat().table(vec![
         (
             user("hi"),
-            vec![BUSY, append(1, input("hi")), append(2, model_call(0)), call_model(2, 0)],
+            vec![
+                BUSY,
+                append(1, input("hi")),
+                append(2, model_call(0)),
+                call_model(2, 0),
+            ],
         ),
         (interrupt(), vec![cancel(2)]),
         // Interrupting again, before the call reports, does nothing more.
@@ -257,13 +278,26 @@ fn an_interrupted_turn_answers_the_calls_it_leaves_and_goes_no_further() {
     chat().table(vec![
         (
             user("go"),
-            vec![BUSY, append(1, input("go")), append(2, model_call(0)), call_model(2, 0)],
+            vec![
+                BUSY,
+                append(1, input("go")),
+                append(2, model_call(0)),
+                call_model(2, 0),
+            ],
         ),
         (
             model_done(2, &[("bash", a.clone()), ("bash", b.clone())]),
             vec![
-                append(3, model_result(2, Outcome::Done { output: reply(&[("bash", a.clone()), ("bash", b.clone())]) })),
-                append(4, model_tool_call("bash", a, "c0")),
+                append(
+                    3,
+                    model_result(
+                        2,
+                        Outcome::Done {
+                            output: reply(&[("bash", a.clone()), ("bash", b.clone())]),
+                        },
+                    ),
+                ),
+                append(4, model_tool_call("bash", &a, "c0")),
                 run_bash(4, "a"),
             ],
         ),
@@ -272,7 +306,7 @@ fn an_interrupted_turn_answers_the_calls_it_leaves_and_goes_no_further() {
             tool_done(4, failed("cut")),
             vec![
                 append(5, tool_result(4, failed("cut"))),
-                append(6, model_tool_call("bash", b, "c1")),
+                append(6, model_tool_call("bash", &b, "c1")),
                 append(7, tool_result(6, INTERRUPTED)),
                 append(8, Body::INTERRUPT),
                 IDLE,
@@ -293,13 +327,26 @@ fn a_steer_reaches_the_running_turn_before_the_model_is_next_asked() {
     chat().table(vec![
         (
             user("go"),
-            vec![BUSY, append(1, input("go")), append(2, model_call(0)), call_model(2, 0)],
+            vec![
+                BUSY,
+                append(1, input("go")),
+                append(2, model_call(0)),
+                call_model(2, 0),
+            ],
         ),
         (
             model_done(2, &[("sleep", sleep.clone())]),
             vec![
-                append(3, model_result(2, Outcome::Done { output: reply(&[("sleep", sleep.clone())]) })),
-                append(4, model_tool_call("sleep", sleep.clone(), "c0")),
+                append(
+                    3,
+                    model_result(
+                        2,
+                        Outcome::Done {
+                            output: reply(&[("sleep", sleep.clone())]),
+                        },
+                    ),
+                ),
+                append(4, model_tool_call("sleep", &sleep, "c0")),
                 run_tool(4, "sleep", sleep),
             ],
         ),
@@ -332,7 +379,12 @@ fn queued_input_is_taken_up_in_order_once_the_turn_ends() {
     echo().table(vec![
         (
             user("sleep 1"),
-            vec![BUSY, append(1, input("sleep 1")), append(2, sleep_call(1)), run_tool(2, "sleep", sleep)],
+            vec![
+                BUSY,
+                append(1, input("sleep 1")),
+                append(2, sleep_call(1)),
+                run_tool(2, "sleep", sleep),
+            ],
         ),
         (user("a"), vec![append(3, queued("a"))]),
         (user("b"), vec![append(4, queued("b"))]),
@@ -355,7 +407,10 @@ fn input_waits_its_turn_behind_a_call_waiting_for_approval() {
     asking().table(vec![
         (user("$ echo"), asked()),
         (user("next"), vec![BUSY, append(4, queued("next"))]),
-        (approve(2, true), vec![append(5, answered(2, true)), run_bash(2, "echo")]),
+        (
+            approve(2, true),
+            vec![append(5, answered(2, true)), run_bash(2, "echo")],
+        ),
         (
             tool_done(2, done(json!("echo\n"))),
             vec![
@@ -373,19 +428,12 @@ fn retrying() -> Session {
 }
 
 fn retried() -> Vec<Effect> {
+    let retry = Verdict::Retry {
+        attempt: 1,
+        error: "slow down".into(),
+    };
     vec![
-        append(
-            3,
-            decision(
-                "retry",
-                Some(2),
-                Verdict::Retry {
-                    attempt: 1,
-                    error: "slow down".into(),
-                },
-            ),
-        ),
-        append(4, model_result(2, failed("slow down"))),
+        append(3, decision("retry", Some(2), retry)),
         Effect::Sleep {
             call: id(2),
             after: Duration::from_secs(1),
@@ -393,25 +441,52 @@ fn retried() -> Vec<Effect> {
     ]
 }
 
-/// The `request_error` point retries; the failed attempt is logged, the
-/// agent never hears of it, and the retry is a model call of its own.
+/// The `request_error` point retries: the next attempt is logged on the
+/// call, which is sent again once the backoff is over and streams as that
+/// attempt; the agent hears only of the reply.
 #[test]
 fn a_failed_model_call_is_retried_as_the_request_error_point_asks() {
-    retrying().table(vec![
+    let mut s = retrying();
+    s.table(vec![
         (
             user("hi"),
-            vec![BUSY, append(1, input("hi")), append(2, model_call(0)), call_model(2, 0)],
+            vec![
+                BUSY,
+                append(1, input("hi")),
+                append(2, model_call(0)),
+                call_model(2, 0),
+            ],
         ),
         (model_failed(2), retried()),
+        (Event::Woke { call: id(2) }, vec![call_model(2, 1)]),
         (
-            Event::Woke { call: id(2) },
-            vec![append(5, model_call(1)), call_model(5, 1)],
-        ),
-        (
-            model_done(5, &[]),
-            vec![append(6, model_result(5, Outcome::Done { output: reply(&[]) })), IDLE],
+            model_done(2, &[]),
+            vec![
+                append(4, model_result(2, Outcome::Done { output: reply(&[]) })),
+                IDLE,
+            ],
         ),
     ]);
+}
+
+/// The point's attempts run out: the call fails.
+#[test]
+fn a_call_fails_once_the_retries_run_out() {
+    let mut s = retrying();
+    s.step(user("hi"));
+    for attempt in 1..=RETRIES {
+        s.step(model_failed(2));
+        assert_eq!(
+            s.step(Event::Woke { call: id(2) }).as_slice(),
+            [call_model(2, attempt)]
+        );
+    }
+    let fx = s.step(model_failed(2));
+    let seq = s.log.len() as u64;
+    assert_eq!(
+        fx.as_slice(),
+        [append(seq, model_result(2, failed("slow down"))), IDLE]
+    );
 }
 
 #[test]
@@ -419,10 +494,23 @@ fn an_interrupt_in_backoff_sends_nothing_again() {
     retrying().table(vec![
         (
             user("hi"),
-            vec![BUSY, append(1, input("hi")), append(2, model_call(0)), call_model(2, 0)],
+            vec![
+                BUSY,
+                append(1, input("hi")),
+                append(2, model_call(0)),
+                call_model(2, 0),
+            ],
         ),
         (model_failed(2), retried()),
-        (interrupt(), vec![cancel(2), append(5, Body::INTERRUPT), IDLE]),
+        (
+            interrupt(),
+            vec![
+                cancel(2),
+                append(4, model_result(2, INTERRUPTED)),
+                append(5, Body::INTERRUPT),
+                IDLE,
+            ],
+        ),
         (Event::Woke { call: id(2) }, vec![]),
     ]);
 }
@@ -432,9 +520,17 @@ fn a_failure_no_extension_retries_fails_the_turn() {
     chat().table(vec![
         (
             user("hi"),
-            vec![BUSY, append(1, input("hi")), append(2, model_call(0)), call_model(2, 0)],
+            vec![
+                BUSY,
+                append(1, input("hi")),
+                append(2, model_call(0)),
+                call_model(2, 0),
+            ],
         ),
-        (model_failed(2), vec![append(3, model_result(2, failed("slow down"))), IDLE]),
+        (
+            model_failed(2),
+            vec![append(3, model_result(2, failed("slow down"))), IDLE],
+        ),
     ]);
 }
 
@@ -500,7 +596,16 @@ fn the_input_point_rewrites_or_refuses_input_before_it_is_logged() {
         (
             user("shout hi"),
             vec![
-                append(1, decision("input", None, Verdict::Input { original: "shout hi".into() })),
+                append(
+                    1,
+                    decision(
+                        "input",
+                        None,
+                        Verdict::Input {
+                            original: "shout hi".into(),
+                        },
+                    ),
+                ),
                 append(2, input("HI")),
                 append(3, said("HI")),
             ],
@@ -516,7 +621,16 @@ fn the_on_stop_point_has_the_agent_go_on() {
         vec![
             append(1, input("hi")),
             append(2, said("hi")),
-            append(3, decision("policy", None, Verdict::OnStop { text: "and again".into() })),
+            append(
+                3,
+                decision(
+                    "policy",
+                    None,
+                    Verdict::OnStop {
+                        text: "and again".into(),
+                    },
+                ),
+            ),
             append(4, said("and again")),
         ],
     )]);
@@ -535,7 +649,12 @@ fn a_new_registry_generation_applies_from_the_next_step() {
     echo().table(vec![
         (
             user("sleep 1"),
-            vec![BUSY, append(1, input("sleep 1")), append(2, sleep_call(1)), run_tool(2, "sleep", sleep)],
+            vec![
+                BUSY,
+                append(1, input("sleep 1")),
+                append(2, sleep_call(1)),
+                run_tool(2, "sleep", sleep),
+            ],
         ),
         (Event::Registry(newer), vec![]),
         (
@@ -546,7 +665,12 @@ fn a_new_registry_generation_applies_from_the_next_step() {
             user("hi"),
             vec![
                 append(4, input("hi")),
-                append(5, Body::Extensions { installed: installed.to_vec() }),
+                append(
+                    5,
+                    Body::Extensions {
+                        installed: installed.to_vec(),
+                    },
+                ),
                 append(6, said("hi")),
             ],
         ),
@@ -563,26 +687,31 @@ fn spawn(wait: bool) -> Event {
 }
 
 fn spawned() -> Vec<Effect> {
-    vec![
-        append(
-            3,
-            Body::Link {
-                child: child(),
-                input: "go".into(),
-            },
-        ),
-        append(4, Body::Watch { child: child() }),
-        Effect::StartChild {
-            link: seq(3),
+    vec![append(
+        3,
+        Body::Link {
             child: child(),
             input: "go".into(),
         },
-    ]
+    )]
+}
+
+fn started() -> Effect {
+    Effect::StartChild {
+        link: seq(3),
+        child: child(),
+        input: "go".into(),
+    }
 }
 
 fn tasked() -> Vec<Effect> {
     let task = json!({ "input": "go" });
-    vec![BUSY, append(1, input("task go")), append(2, tool_call("task", task.clone())), run_tool(2, "task", task)]
+    vec![
+        BUSY,
+        append(1, input("task go")),
+        append(2, tool_call("task", task.clone())),
+        run_tool(2, "task", task),
+    ]
 }
 
 fn fired(seq: u64, watch: u64, outcome: Outcome) -> Effect {
@@ -593,7 +722,11 @@ fn fired(seq: u64, watch: u64, outcome: Outcome) -> Effect {
 #[test]
 fn a_call_waits_on_the_child_it_links_and_resumes_with_its_result() {
     let mut waits = spawned();
-    waits.push(append(5, wait_child(2, 3)));
+    waits.extend([
+        append(4, wait_child(2, 3)),
+        append(5, Body::Watch { child: child() }),
+        started(),
+    ]);
     let ok = done(json!("ok"));
     echo().table(vec![
         (user("task go"), tasked()),
@@ -604,7 +737,7 @@ fn a_call_waits_on_the_child_it_links_and_resumes_with_its_result() {
                 outcome: ok.clone(),
             },
             vec![
-                fired(6, 4, ok.clone()),
+                fired(6, 5, ok.clone()),
                 Effect::Resume {
                     call: id(2),
                     tool: "task".into(),
@@ -633,7 +766,11 @@ fn a_call_waits_on_the_child_it_links_and_resumes_with_its_result() {
 #[test]
 fn an_interrupt_stops_the_child_first() {
     let mut waits = spawned();
-    waits.push(append(5, wait_child(2, 3)));
+    waits.extend([
+        append(4, wait_child(2, 3)),
+        append(5, Body::Watch { child: child() }),
+        started(),
+    ]);
     echo().table(vec![
         (user("task go"), tasked()),
         (spawn(true), waits),
@@ -644,7 +781,7 @@ fn an_interrupt_stops_the_child_first() {
                 outcome: INTERRUPTED,
             },
             vec![
-                fired(6, 4, INTERRUPTED),
+                fired(6, 5, INTERRUPTED),
                 append(7, tool_result(2, INTERRUPTED)),
                 append(8, Body::INTERRUPT),
                 IDLE,
@@ -659,7 +796,11 @@ fn a_background_childs_result_starts_a_turn_of_its_own() {
     let ok = done(json!("ok"));
     echo().table(vec![
         (user("task go"), tasked()),
-        (spawn(false), spawned()),
+        (spawn(false), {
+            let mut fx = spawned();
+            fx.extend([append(4, Body::Watch { child: child() }), started()]);
+            fx
+        }),
         // The turn runs: the result waits for it to end.
         (
             Event::ChildSettled {
@@ -688,10 +829,19 @@ fn a_child_reports_each_time_it_settles() {
     };
     let (mut s, fx) = Session::resume(Reg::echo().arc(), log([input("hi")]), &load);
     let report = |text: &str| Effect::Report {
-        outcome: Outcome::Done { output: text.into() },
+        outcome: Outcome::Done {
+            output: text.into(),
+        },
     };
     assert_eq!(fx.as_slice(), [append(2, said("hi")), report("hi")]);
-    s.table(vec![(user("again"), vec![append(3, input("again")), append(4, said("again")), report("again")])]);
+    s.table(vec![(
+        user("again"),
+        vec![
+            append(3, input("again")),
+            append(4, said("again")),
+            report("again"),
+        ],
+    )]);
 }
 
 #[test]
@@ -703,7 +853,12 @@ fn a_settled_call_cannot_write_and_stray_reports_change_nothing() {
     echo().table(vec![
         (
             user("$ make"),
-            vec![BUSY, append(1, input("$ make")), append(2, bash("make")), run_bash(2, "make")],
+            vec![
+                BUSY,
+                append(1, input("$ make")),
+                append(2, bash("make")),
+                run_bash(2, "make"),
+            ],
         ),
         (
             progress(),
@@ -761,7 +916,16 @@ fn an_agents_refusal_is_logged_as_a_block() {
         vec![
             append(1, input("refuse bash")),
             append(2, tool_call("bash", json!(null))),
-            append(3, decision("agent", Some(2), Verdict::Block { reason: "not now".into() })),
+            append(
+                3,
+                decision(
+                    "agent",
+                    Some(2),
+                    Verdict::Block {
+                        reason: "not now".into(),
+                    },
+                ),
+            ),
             append(4, tool_result(2, failed("not now"))),
         ],
     )]);
@@ -775,7 +939,12 @@ fn a_call_waits_on_a_dialog_and_resumes_with_its_answer() {
     echo().table(vec![
         (
             user("$ ask"),
-            vec![BUSY, append(1, input("$ ask")), append(2, bash("ask")), run_bash(2, "ask")],
+            vec![
+                BUSY,
+                append(1, input("$ ask")),
+                append(2, bash("ask")),
+                run_bash(2, "ask"),
+            ],
         ),
         (
             Event::Waits {

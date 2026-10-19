@@ -3,8 +3,10 @@
 
 mod common;
 
+use std::time::Duration;
+
 use common::*;
-use kernel::{Effect, Load, MAX_ATTEMPTS, Owner};
+use kernel::{Effect, Load, Owner};
 use protocol::{Body, Decision, Json, Outcome, Permission, Verdict};
 use serde_json::json;
 
@@ -16,7 +18,11 @@ const BUSY_LOAD: Load<'static> = Load {
     busy: true,
 };
 
-fn resume(reg: Reg, bodies: impl IntoIterator<Item = Body>, load: &Load<'_>) -> (Session, Vec<Effect>) {
+fn resume(
+    reg: Reg,
+    bodies: impl IntoIterator<Item = Body>,
+    load: &Load<'_>,
+) -> (Session, Vec<Effect>) {
     let (s, fx) = Session::resume(reg.arc(), log(bodies), load);
     (s, fx.into_vec())
 }
@@ -32,20 +38,33 @@ fn progress(call: u64, text: &str) -> Body {
 /// interrupt before it runs stops it.
 #[test]
 fn a_safe_call_cut_off_runs_again_and_an_interrupt_before_it_stops_it() {
-    let (mut s, fx) = resume(Reg::echo(), [input("sleep 1"), sleep_call(1)], &Load::default());
+    let (mut s, fx) = resume(
+        Reg::echo(),
+        [input("sleep 1"), sleep_call(1)],
+        &Load::default(),
+    );
     assert_eq!(fx, [BUSY, run_tool(2, "sleep", json!({ "seconds": 1 }))]);
     s.table(vec![
         (interrupt(), vec![cancel(2)]),
         (
             tool_done(2, INTERRUPTED),
-            vec![append(3, tool_result(2, INTERRUPTED)), append(4, Body::INTERRUPT), IDLE],
+            vec![
+                append(3, tool_result(2, INTERRUPTED)),
+                append(4, Body::INTERRUPT),
+                IDLE,
+            ],
         ),
     ]);
 }
 
 #[test]
 fn an_unsafe_call_cut_off_reports_the_output_it_committed() {
-    let bodies = [input("$ make"), bash("make"), progress(2, "one\n"), progress(2, "two\n")];
+    let bodies = [
+        input("$ make"),
+        bash("make"),
+        progress(2, "one\n"),
+        progress(2, "two\n"),
+    ];
     let (_, fx) = resume(Reg::echo(), bodies, &BUSY_LOAD);
     let cut = Outcome::Interrupted {
         output: Some("one\ntwo\n".into()),
@@ -83,7 +102,11 @@ fn a_gate_cut_off_by_a_crash_logs_its_decisions_once() {
 #[test]
 fn a_wait_survives_a_restart_and_runs_once_answered() {
     let reg = Reg::echo().policy(Policy::Ask(&["bash"]));
-    let bodies = [input("$ echo"), bash("echo"), permission(2, Permission::Ask)];
+    let bodies = [
+        input("$ echo"),
+        bash("echo"),
+        permission(2, Permission::Ask),
+    ];
     let (mut s, fx) = resume(reg, bodies, &BUSY_LOAD);
     assert_eq!(fx, [IDLE], "waiting is not work");
     let answered = Body::Answer {
@@ -108,7 +131,14 @@ fn an_old_logs_ask_waits_as_a_new_one_does() {
             permission: Permission::Ask,
         },
     };
-    let old = [Body::User { text: "$ echo".into() }, hook, bash("echo"), Body::Ask { call: 3 }];
+    let old = [
+        Body::User {
+            text: "$ echo".into(),
+        },
+        hook,
+        bash("echo"),
+        Body::Ask { call: 3 },
+    ];
     let reg = Reg::echo().policy(Policy::Ask(&["bash"]));
     let (mut s, fx) = resume(reg, old, &Load::default());
     assert_eq!(fx, []);
@@ -124,11 +154,12 @@ fn an_old_logs_ask_waits_as_a_new_one_does() {
     )]);
 }
 
-/// A model call a restart cut off is a retry of its own, so restarts count
-/// as attempts.
+/// A model call a restart cut off: the attempt it was on failed, and the
+/// `request_error` point retries it as it would any failure.
 #[test]
-fn a_model_call_cut_off_is_sent_again_as_a_retry() {
-    let (_, fx) = resume(Reg::chat(), [input("hi"), model_call(0)], &BUSY_LOAD);
+fn a_model_call_cut_off_is_retried_as_a_failed_attempt() {
+    let reg = Reg::chat().retry(Duration::ZERO);
+    let (_, fx) = resume(reg, [input("hi"), model_call(0)], &BUSY_LOAD);
     let retry = Verdict::Retry {
         attempt: 1,
         error: "the daemon stopped during the call".into(),
@@ -136,45 +167,37 @@ fn a_model_call_cut_off_is_sent_again_as_a_retry() {
     assert_eq!(
         fx,
         [
-            append(3, decision("kernel", Some(2), retry)),
-            append(4, model_result(2, INTERRUPTED)),
-            append(5, model_call(1)),
-            call_model(5, 1),
+            append(3, decision("retry", Some(2), retry)),
+            Effect::Sleep {
+                call: id(2),
+                after: Duration::ZERO,
+            },
         ]
+    );
+    let (_, fx) = resume(Reg::chat(), [input("hi"), model_call(0)], &BUSY_LOAD);
+    let cut = failed("the daemon stopped during the call");
+    assert_eq!(
+        fx,
+        [append(3, model_result(2, cut)), IDLE],
+        "with no retry, it fails"
     );
 }
 
-/// Restarts count as attempts: a session that crashes during every model
-/// call settles it failed at the cap.
+/// Restarts count as attempts, in the log: a session that crashes during
+/// every attempt fails the call once the retries run out.
 #[test]
 fn a_crash_loop_cannot_retry_forever() {
+    let reg = || Reg::chat().retry(Duration::ZERO).arc();
     let mut log = log([input("hi"), model_call(0)]);
-    for _ in 1..MAX_ATTEMPTS {
-        let (s, fx) = Session::resume(Reg::chat().arc(), log, &BUSY_LOAD);
-        assert!(matches!(fx.last(), Some(Effect::CallModel { .. })), "{fx:?}");
+    for _ in 0..RETRIES {
+        let (s, fx) = Session::resume(reg(), log, &BUSY_LOAD);
+        assert!(matches!(fx.last(), Some(Effect::Sleep { .. })), "{fx:?}");
         log = s.log;
     }
-    let (_, fx) = Session::resume(Reg::chat().arc(), log.clone(), &BUSY_LOAD);
-    let gave_up = failed(&format!("gave up after {MAX_ATTEMPTS} attempts"));
-    let call = log.len() as u64;
-    assert_eq!(fx.as_slice(), [append(call + 1, model_result(call, gave_up)), IDLE]);
-}
-
-/// A retry that was to be sent after its backoff is sent on resume.
-#[test]
-fn a_retry_in_backoff_is_sent_on_resume() {
-    let retry = Verdict::Retry {
-        attempt: 1,
-        error: "slow down".into(),
-    };
-    let bodies = [
-        input("hi"),
-        model_call(0),
-        decision("retry", Some(2), retry),
-        model_result(2, failed("slow down")),
-    ];
-    let (_, fx) = resume(Reg::chat(), bodies, &BUSY_LOAD);
-    assert_eq!(fx, [append(5, model_call(1)), call_model(5, 1)]);
+    let (_, fx) = Session::resume(reg(), log.clone(), &BUSY_LOAD);
+    let seq = log.len() as u64 + 1;
+    let cut = failed("the daemon stopped during the call");
+    assert_eq!(fx.as_slice(), [append(seq, model_result(2, cut)), IDLE]);
 }
 
 /// What the agent asked for that the log does not show is carried out.
@@ -191,7 +214,10 @@ fn input_queued_before_a_restart_runs_once_in_order() {
     let bodies = [input("one"), said("one"), queued("left")];
     let (mut s, fx) = resume(Reg::echo(), bodies, &BUSY_LOAD);
     assert_eq!(fx, [append(4, take(3)), append(5, said("left")), IDLE]);
-    s.table(vec![(user("two"), vec![append(6, input("two")), append(7, said("two"))])]);
+    s.table(vec![(
+        user("two"),
+        vec![append(6, input("two")), append(7, said("two"))],
+    )]);
 }
 
 #[test]
@@ -203,7 +229,11 @@ fn an_orphan_does_not_resume_what_it_was_doing() {
     let (_, fx) = resume(Reg::echo(), [input("sleep 1"), sleep_call(1)], &load);
     assert_eq!(
         fx,
-        [append(3, tool_result(2, INTERRUPTED)), append(4, Body::INTERRUPT), IDLE]
+        [
+            append(3, tool_result(2, INTERRUPTED)),
+            append(4, Body::INTERRUPT),
+            IDLE
+        ]
     );
 }
 
@@ -268,7 +298,10 @@ fn links_are_rearmed() {
         input: "go".into(),
     };
     let (_, fx) = resume(Reg::echo(), [link()], &Load::default());
-    assert_eq!(fx, [BUSY, append(2, Body::Watch { child: child() }), start()]);
+    assert_eq!(
+        fx,
+        [BUSY, append(2, Body::Watch { child: child() }), start()]
+    );
     let watch = Body::Watch { child: child() };
     let (_, fx) = resume(Reg::echo(), [link(), watch.clone()], &Load::default());
     assert_eq!(fx, [BUSY, start()]);
@@ -294,10 +327,10 @@ fn a_call_whose_child_settled_before_a_crash_resumes_with_its_result() {
             child: child(),
             input: "go".into(),
         },
-        Body::Watch { child: child() },
         wait_child(2, 3),
+        Body::Watch { child: child() },
         Body::Fired {
-            watch: 4,
+            watch: 5,
             outcome: ok.clone(),
         },
     ];
@@ -336,9 +369,16 @@ fn a_failed_commit_is_resume() {
     // The result's commit fails: the driver resumes from what committed.
     s.step(tool_done(2, done(json!({ "slept": 1 }))));
     let (mut s, fx) = Session::resume(Reg::echo().arc(), committed, &BUSY_LOAD);
-    assert_eq!(fx.as_slice(), [run_tool(2, "sleep", json!({ "seconds": 1 }))]);
+    assert_eq!(
+        fx.as_slice(),
+        [run_tool(2, "sleep", json!({ "seconds": 1 }))]
+    );
     s.step(tool_done(2, done(json!({ "slept": 1 }))));
-    let calls = s.bodies().into_iter().filter(|b| matches!(b, Body::ToolCall { .. })).count();
+    let calls = s
+        .bodies()
+        .into_iter()
+        .filter(|b| matches!(b, Body::ToolCall { .. }))
+        .count();
     assert_eq!(calls, 1, "{:#?}", s.log);
     assert_eq!(*s.core.turn(), kernel::Turn::Idle);
 }

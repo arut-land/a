@@ -17,13 +17,6 @@ use crate::{
     Recover, Registry, Replay, Replied, Step, Ticket, Turn,
 };
 
-/// The most times one model call is sent, retries and restarts alike: past
-/// it the call fails, so a crash loop cannot retry forever.
-pub const MAX_ATTEMPTS: u16 = 10;
-
-/// Who logs what the kernel decides itself: a restart's retry.
-const KERNEL: &str = "kernel";
-
 /// Who refused a call the agent would not run.
 const AGENT: &str = "agent";
 
@@ -56,7 +49,7 @@ impl Core {
     /// killed; a command cut off is interrupted; each open call goes on as
     /// its phase says (a gate is asked again, a wait stays, a safe call
     /// runs again, an unsafe one is interrupted with the output it logged,
-    /// a model call is retried while attempts last); then what the agent
+    /// a model call counts the attempt it cut off as failed); then what the agent
     /// asked for that the log does not show is carried out, and queued
     /// input taken up.
     pub fn resume<'e>(
@@ -138,7 +131,7 @@ impl Core {
                 } = self.turn
                     && failed == call
                 {
-                    self.send(attempt + 1, &mut fx);
+                    self.again(call, attempt, None, &mut fx);
                 }
             }
             Event::ChildSettled { child, outcome } => self.child_settled(child, outcome, &mut fx),
@@ -216,8 +209,11 @@ impl Core {
                 fx.push(Effect::Cancel { call });
                 match phase {
                     ModelPhase::Streaming => SmallVec::from_elem(call, 1),
-                    // Its failed attempt is logged already.
-                    ModelPhase::Backoff => SmallVec::new(),
+                    // Nothing is out to report.
+                    ModelPhase::Backoff => {
+                        self.settle(call, Outcome::Interrupted { output: None }, fx);
+                        SmallVec::new()
+                    }
                 }
             }
             Turn::Acting { open } => {
@@ -309,31 +305,51 @@ impl Core {
         }
     }
 
-    /// Whether the `request_error` point has failed model call `call` sent
-    /// again; if so, it is logged as failed, and sent once the backoff the
-    /// point asks for is over.
+    /// Whether the `request_error` point recovers model call `call` from
+    /// the failure of attempt `attempt`: if so, the next attempt is logged,
+    /// and sent at once or once the backoff the point asks for is over.
     fn retry(&mut self, call: CallId, attempt: u16, error: &llm::Error, fx: &mut Effects) -> bool {
-        let next = attempt + 1;
-        let retry = (next < MAX_ATTEMPTS)
-            .then(|| self.registry.request_error(call, next, error))
-            .flatten();
-        let Some((by, Recover::Retry { after })) = retry else {
+        let Some((by, recover)) = self.registry.request_error(call, attempt, error) else {
             return false;
         };
-        let error = error.to_string();
+        let next = attempt.saturating_add(1);
         let d = Verdict::Retry {
             attempt: next,
-            error: error.clone(),
+            error: error.to_string(),
         };
         self.decide(Some(call), &by, d, fx);
-        self.settle(call, Outcome::Failed { error }, fx);
-        fx.push(Effect::Sleep { call, after });
+        match recover {
+            Recover::Retry { after } => {
+                fx.push(Effect::Sleep { call, after });
+                self.turn = Turn::Model {
+                    call,
+                    attempt: next,
+                    phase: ModelPhase::Backoff,
+                };
+            }
+            Recover::Replace(request) => self.again(call, next, Some(request), fx),
+        }
+        true
+    }
+
+    /// Sends model call `call` again, as attempt `attempt`.
+    fn again(
+        &mut self,
+        call: CallId,
+        attempt: u16,
+        request: Option<Box<llm::Request>>,
+        fx: &mut Effects,
+    ) {
+        fx.push(Effect::CallModel {
+            call,
+            attempt,
+            request,
+        });
         self.turn = Turn::Model {
             call,
             attempt,
-            phase: ModelPhase::Backoff,
+            phase: ModelPhase::Streaming,
         };
-        true
     }
 
     fn tool_done(&mut self, call: CallId, outcome: Outcome, fx: &mut Effects) {
@@ -425,22 +441,17 @@ impl Core {
                 input: input.clone(),
             },
         );
+        if wait {
+            let on = WaitOn::Child { link: link.0 };
+            self.append(fx, Body::Wait { call, on });
+            self.set_step(call, Step::Waiting);
+        }
         self.append(fx, Body::Watch { child });
         fx.push(Effect::StartChild {
             link: link.0,
             child,
             input,
         });
-        if wait {
-            self.append(
-                fx,
-                Body::Wait {
-                    call,
-                    on: WaitOn::Child { link: link.0 },
-                },
-            );
-            self.set_step(call, Step::Waiting);
-        }
     }
 
     /// Fires the watches on `child`. A call waiting on it goes on with its
@@ -554,7 +565,9 @@ impl Core {
                 {
                     self.append(fx, Body::Context { text });
                 }
-                self.send(0, fx);
+                let model = self.registry.model();
+                let call = self.append(fx, Body::ModelCall { model, attempt: 0 });
+                self.again(call, 0, None, fx);
             }
             Next::Agent(Action::Call { tool, input, id }) => {
                 let call = self.call(&tool, &input, id, Audience::Model, fx);
@@ -597,18 +610,6 @@ impl Core {
             by,
         };
         self.append(fx, body)
-    }
-
-    /// Sends a model call, for the `attempt`th time.
-    fn send(&mut self, attempt: u16, fx: &mut Effects) {
-        let model = self.registry.model();
-        let call = self.append(fx, Body::ModelCall { model, attempt });
-        fx.push(Effect::CallModel { call, attempt });
-        self.turn = Turn::Model {
-            call,
-            attempt,
-            phase: ModelPhase::Streaming,
-        };
     }
 
     fn gate(&mut self, call: CallId, tool: &str, input: &Json, fx: &mut Effects) {
@@ -753,7 +754,9 @@ impl Core {
         let queued = !ledger.untaken().is_empty();
         let working = match &self.turn {
             Turn::Idle => false,
-            Turn::Acting { open } => open.iter().any(|&(_, step)| step != Step::Waiting),
+            // A call waiting on its child waits on work of its own.
+            Turn::Acting { open } => (open.iter())
+                .any(|&(call, step)| step != Step::Waiting || self.child_of(call).is_some()),
             Turn::Model { .. } | Turn::Stopping { .. } => true,
         };
         let busy = working || queued || armed;
@@ -811,7 +814,7 @@ impl Core {
                 Some((CallId::new(seq)?, open.call.clone(), open.phase.clone()))
             })
             .collect();
-        if !open.is_empty() || !self.fold.asked.is_empty() || self.fold.retry.is_some() {
+        if !open.is_empty() || !self.fold.asked.is_empty() {
             self.turn = Turn::Acting {
                 open: SmallVec::new(),
             };
@@ -827,21 +830,11 @@ impl Core {
                 Call::Tool { tool, input, .. } => self.reopen(call, &tool, &input, &phase, fx),
             }
         }
-        if orphan {
-            self.fold.retry = None;
-            if self.turn != Turn::Idle {
-                self.turn = Turn::Stopping {
-                    open: SmallVec::new(),
-                    origin: None,
-                };
-            }
-            return;
-        }
-        // A retry that was to be sent after its backoff is sent now.
-        if let Some((_, attempt)) = self.fold.retry
-            && !matches!(self.turn, Turn::Model { .. })
-        {
-            self.send(attempt, fx);
+        if orphan && self.turn != Turn::Idle {
+            self.turn = Turn::Stopping {
+                open: SmallVec::new(),
+                origin: None,
+            };
         }
     }
 
@@ -867,22 +860,15 @@ impl Core {
         }
     }
 
-    /// A model call a restart cut off is sent again, as a retry of its own
-    /// (so restarts count as attempts), while attempts last.
+    /// A model call a restart cut off: the attempt it was on failed, and the
+    /// `request_error` point says whether there is another, so restarts
+    /// count as attempts and a crash loop cannot retry forever.
     fn restart(&mut self, call: CallId, attempt: u16, fx: &mut Effects) {
-        let next = attempt + 1;
-        if next >= MAX_ATTEMPTS {
-            let error = format!("gave up after {next} attempts");
-            return self.settle(call, Outcome::Failed { error }, fx);
+        let error = llm::Error::new(llm::Kind::Incomplete, "the daemon stopped during the call");
+        if !self.retry(call, attempt, &error, fx) {
+            let error = error.to_string();
+            self.settle(call, Outcome::Failed { error }, fx);
         }
-        let error = "the daemon stopped during the call".to_owned();
-        let d = Verdict::Retry {
-            attempt: next,
-            error,
-        };
-        self.decide(Some(call), KERNEL, d, fx);
-        self.settle(call, Outcome::Interrupted { output: None }, fx);
-        self.send(next, fx);
     }
 
     /// Picks tool call `call` up as its phase says.

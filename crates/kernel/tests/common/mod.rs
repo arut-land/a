@@ -2,6 +2,8 @@
 //! kernel's table tests.
 
 #![allow(dead_code)]
+// Helpers take `json!` values as they are written in a table.
+#![allow(clippy::needless_pass_by_value)]
 
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -33,6 +35,9 @@ pub enum Policy {
     /// Panics.
     Panic,
 }
+
+/// How often the stand-in retry policy retries a call.
+pub const RETRIES: u16 = 3;
 
 pub struct Reg {
     pub agent: fn() -> Box<dyn Agent>,
@@ -129,7 +134,12 @@ impl Registry for Reg {
         let Some(loud) = text.strip_prefix("shout ") else {
             return Ok(Chained::new(text));
         };
-        let decisions = vec![(name("input"), Verdict::Input { original: text.clone() })];
+        let decisions = vec![(
+            name("input"),
+            Verdict::Input {
+                original: text.clone(),
+            },
+        )];
         Ok(Chained {
             value: loud.to_uppercase(),
             decisions,
@@ -139,7 +149,6 @@ impl Registry for Reg {
     fn gate(&self, _: CallId, tool: &str, input: &Json) -> Answer<Gated> {
         let permission = |permission| (name("policy"), Verdict::Permission { permission });
         let gated = match self.policy {
-            Policy::Allow => Gated::run(input.clone()),
             Policy::Ask(tools) if tools.contains(&tool) => Gated {
                 input: input.clone(),
                 decisions: vec![permission(Permission::Ask)],
@@ -150,7 +159,7 @@ impl Registry for Reg {
                 decisions: vec![permission(Permission::Deny)],
                 gate: Gate::Refuse("policy denied this call".to_owned()),
             },
-            Policy::Ask(_) | Policy::Deny(_) => Gated::run(input.clone()),
+            Policy::Allow | Policy::Ask(_) | Policy::Deny(_) => Gated::run(input.clone()),
             Policy::RewriteThenDeny => {
                 let rewritten = Json::new(&json!({ "rewritten": true }));
                 Gated {
@@ -171,13 +180,16 @@ impl Registry for Reg {
         Answer::Now(gated)
     }
 
+    /// Retries what may pass, three times.
     fn request_error(
         &self,
         _: CallId,
-        _: u16,
+        attempt: u16,
         error: &llm::Error,
     ) -> Option<(Name, Recover)> {
-        let after = self.retry.filter(|_| error.is_retryable())?;
+        let after = self
+            .retry
+            .filter(|_| error.is_retryable() && attempt < RETRIES)?;
         Some((name("retry"), Recover::Retry { after }))
     }
 
@@ -209,7 +221,10 @@ impl Agent for Echo {
         let action = if let Some(command) = text.strip_prefix("$ ") {
             call("bash", json!({ "command": command }))
         } else if let Some(seconds) = text.strip_prefix("sleep ") {
-            call("sleep", json!({ "seconds": seconds.parse::<u64>().unwrap() }))
+            call(
+                "sleep",
+                json!({ "seconds": seconds.parse::<u64>().unwrap() }),
+            )
         } else if let Some(input) = text.strip_prefix("task ") {
             call("task", json!({ "input": input }))
         } else if let Some(tool) = text.strip_prefix("refuse ") {
@@ -292,7 +307,11 @@ impl Session {
     }
 
     /// Resumes `log`, returning what the resume did.
-    pub fn resume(registry: Arc<dyn Registry>, mut log: Vec<Entry>, load: &Load<'_>) -> (Self, Effects) {
+    pub fn resume(
+        registry: Arc<dyn Registry>,
+        mut log: Vec<Entry>,
+        load: &Load<'_>,
+    ) -> (Self, Effects) {
         let (core, fx) = Core::resume(registry, &log, load);
         log.extend(appended(&fx));
         (Self { core, log }, fx)
@@ -309,7 +328,12 @@ impl Session {
         for (i, (event, want)) in rows.into_iter().enumerate() {
             let shown = format!("{event:?}");
             let got = self.step(event);
-            assert_eq!(got.as_slice(), want.as_slice(), "row {i}: {shown}\nlog: {:#?}", self.log);
+            assert_eq!(
+                got.as_slice(),
+                want.as_slice(),
+                "row {i}: {shown}\nlog: {:#?}",
+                self.log
+            );
         }
     }
 
@@ -421,7 +445,10 @@ pub fn entry(seq: u64, body: Body) -> Entry {
 
 /// Entries numbered from 1.
 pub fn log(bodies: impl IntoIterator<Item = Body>) -> Vec<Entry> {
-    (1..).zip(bodies).map(|(seq, body)| entry(seq, body)).collect()
+    (1..)
+        .zip(bodies)
+        .map(|(seq, body)| entry(seq, body))
+        .collect()
 }
 
 pub fn input(text: &str) -> Body {
@@ -527,13 +554,11 @@ pub fn run_bash(call: u64, command: &str) -> Effect {
     run_tool(call, "bash", json!({ "command": command }))
 }
 
-pub const fn call_model(call: u64, attempt: u16) -> Effect {
+pub fn call_model(call: u64, attempt: u16) -> Effect {
     Effect::CallModel {
-        call: match CallId::new(call) {
-            Some(call) => call,
-            None => panic!("no call 0"),
-        },
+        call: id(call),
         attempt,
+        request: None,
     }
 }
 

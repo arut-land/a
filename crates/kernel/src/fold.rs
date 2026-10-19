@@ -28,8 +28,6 @@ pub struct Fold {
     /// Whether the agent was given an input since the `on_stop` point was
     /// last asked.
     pub stepped: bool,
-    /// A failed model call to send again: the call, and the attempt next.
-    pub retry: Option<(CallId, u16)>,
     /// The inputs the `pre_tool` chain left open calls with.
     inputs: Vec<(CallId, Json)>,
     /// The tool calls waiting on a child, by the child's link.
@@ -45,7 +43,6 @@ impl Fold {
             agent,
             asked: VecDeque::new(),
             stepped: false,
-            retry: None,
             inputs: Vec::new(),
             owners: Vec::new(),
             fired: Vec::new(),
@@ -94,14 +91,6 @@ impl Fold {
             } => Some(Input::User { text: text.clone() }),
             Body::Decision {
                 call: Some(call),
-                d: Verdict::Retry { attempt, .. },
-                ..
-            } => {
-                self.retry = Some((*call, *attempt));
-                None
-            }
-            Body::Decision {
-                call: Some(call),
                 d: Verdict::PreTool { input },
                 ..
             } => {
@@ -116,8 +105,7 @@ impl Fold {
             Body::ModelResult { call, outcome } => {
                 let call = CallId::new(*call)?;
                 self.ledger.call(call.get())?;
-                let retried = self.retry.is_some_and(|(failed, _)| failed == call);
-                (!retried).then(|| Input::ModelDone {
+                Some(Input::ModelDone {
                     call,
                     outcome: outcome.clone(),
                 })
@@ -162,7 +150,6 @@ impl Fold {
             // What the turn asked for and had not started is dropped.
             Body::Interrupt { .. } => {
                 self.asked.clear();
-                self.retry = None;
                 None
             }
             _ => None,
@@ -176,7 +163,6 @@ impl Fold {
                 self.carried(|next| matches!(next, Next::Agent(Action::Say(said)) if said == text));
             }
             Body::ModelCall { attempt, .. } => {
-                self.retry = None;
                 // A retry is not the agent's to ask for.
                 if *attempt == 0 {
                     self.carried(|next| *next == Next::Agent(Action::CallModel));

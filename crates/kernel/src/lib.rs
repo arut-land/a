@@ -35,7 +35,7 @@ use smallvec::SmallVec;
 mod fold;
 mod session;
 
-pub use crate::session::{Core, MAX_ATTEMPTS};
+pub use crate::session::Core;
 
 /// A runtime name: of an extension, a tool, an agent.
 pub type Name = Arc<str>;
@@ -145,9 +145,14 @@ pub enum Effect {
         ticket: Ticket,
         result: Result<(), String>,
     },
-    /// Ask the model, for the `attempt`th time, to reply to the transcript
-    /// before `call`.
-    CallModel { call: CallId, attempt: u16 },
+    /// Ask the model to reply to the transcript before `call`, as attempt
+    /// `attempt` (from 0), streaming under it; with `request`, send that
+    /// instead, as the `request_error` point replaced it.
+    CallModel {
+        call: CallId,
+        attempt: u16,
+        request: Option<Box<llm::Request>>,
+    },
     /// Run tool call `call`.
     RunTool {
         call: CallId,
@@ -191,7 +196,8 @@ pub enum Turn {
     /// Nothing runs: input starts a turn at once.
     #[default]
     Idle,
-    /// A model call is out, or waits to be sent again.
+    /// A model call is out, as attempt `attempt`, or waits to be sent
+    /// again as it.
     Model {
         call: CallId,
         attempt: u16,
@@ -210,7 +216,7 @@ pub enum Turn {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum ModelPhase {
     Streaming,
-    /// It failed and is to be sent again once [`Event::Woke`].
+    /// Its last attempt failed; it is sent again once [`Event::Woke`].
     Backoff,
 }
 
@@ -320,8 +326,9 @@ pub trait Registry: Send + Sync {
         Answer::Now(Gated::run(input.clone()))
     }
 
-    /// The `request_error` point: whether, and after how long, to send
-    /// failed model call `call` again for the `attempt`th time.
+    /// The `request_error` point: how to recover model call `call` from
+    /// the failure of its attempt `attempt` (from 0, counted in the log, so
+    /// a restart does not start again). With no answer the call fails.
     fn request_error(
         &self,
         _call: CallId,
@@ -413,9 +420,14 @@ pub enum Gate {
     Refuse(String),
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+/// What to do about a failed model call.
+#[derive(Clone, Debug, PartialEq)]
 pub enum Recover {
+    /// Send it again once `after` has passed; an interrupt meanwhile ends
+    /// it with nothing sent.
     Retry { after: Duration },
+    /// Send this instead, at once: a compacted request, say.
+    Replace(Box<llm::Request>),
 }
 
 /// A point's answer: now, or later as a future the call owns, so a slow
