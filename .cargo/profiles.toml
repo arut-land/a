@@ -63,6 +63,18 @@ opt-level = "s"
 [profile.release.package.rt]
 opt-level = "s"
 
+# The wire codec: s costs a small entry's decode ~6% and its encode ~30%
+# (still over 300 and 1000 MB/s; a frame is encoded once for every peer)
+# and saves 92 KiB. std and alloc (build-std) save 38 KiB more.
+[profile.release.package.protocol]
+opt-level = "s"
+
+[profile.release.package.std]
+opt-level = "s"
+
+[profile.release.package.alloc]
+opt-level = "s"
+
 # Network time dominates the provider layer: s costs its decoders ~6% per
 # frame and saves ~160 KiB.
 [profile.release.package.llm]
