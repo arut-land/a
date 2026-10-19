@@ -57,6 +57,7 @@ pub fn router(daemon: Daemon, rt: Rt) -> Router {
         .route(live_transcript)
         .route(send)
         .route(approve)
+        .route(interrupt)
         .runtime()
         .build()
 }
@@ -370,5 +371,13 @@ async fn send(cx: &Cx, tab: String, text: String) -> Result<bool> {
 pub async fn approve(cx: &Cx, tab: String, call: u64, approved: bool) -> Result<bool> {
     Ok(app_context::<App>(cx)
         .tell(&tab, ClientMsg::approve(call, approved))
+        .await)
+}
+
+/// Stops the running turn: its model or tool call, and the rest of it.
+#[procedure("/api/interrupt")]
+pub async fn interrupt(cx: &Cx, tab: String) -> Result<bool> {
+    Ok(app_context::<App>(cx)
+        .tell(&tab, ClientMsg::INTERRUPT)
         .await)
 }

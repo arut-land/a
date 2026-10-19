@@ -277,6 +277,22 @@ impl SessionView {
         })
     }
 
+    /// Whether a model call, tool call or slash command is running: what
+    /// an interrupt stops, with the rest of its turn. A call waiting for
+    /// approval is not running.
+    pub fn running(&self) -> bool {
+        self.items.iter().rev().any(|item| match item {
+            Item::Reply { status, .. } => *status == Status::Running,
+            Item::Tool {
+                outcome: None,
+                approval,
+                ..
+            } => !matches!(approval, Some(Approval::Pending | Approval::Denied)),
+            Item::Command { outcome, .. } => outcome.is_none(),
+            _ => false,
+        })
+    }
+
     /// A hash of the log-derived state (the serialized view): equal on every
     /// client that folded the same session to the same seq. FNV-1a, so it is
     /// the same on every platform and build.

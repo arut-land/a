@@ -266,6 +266,22 @@ fn a_tab_streams_replies_and_answers_asks_until_it_closes() {
         s.contains("approved") && s.contains("web-ok\\n") && s.contains("exit ")
     });
 
+    // A running call offers Stop, which interrupts the turn.
+    send("$ sleep 30");
+    transcript.until("the second ask", |s| {
+        s.matches("Run this?").count() == 1 && s.contains("sleep 30")
+    });
+    let newest = transcript.seen.rfind("id=\\\"call-").unwrap();
+    let call = between(&transcript.seen[newest..], "id=\\\"call-", "\\\"").unwrap();
+    let answer = format!(r#"["{tab}",{{"t":"u64","bits":64,"v":"{call}"}},true]"#);
+    assert_eq!(web.call("/api/approve", &answer), "true");
+    transcript.until("the stop control", |s| s.contains(">Stop<"));
+    let stop = serde_json::to_string(&(tab,)).unwrap();
+    assert_eq!(web.call("/api/interrupt", &stop), "true");
+    transcript.until("the call to stop", |s| {
+        !s.contains(">Stop<") && s.contains("sleep 30")
+    });
+
     // Closing the tab detaches its client; stopping `a web` leaves the
     // daemon and its session running.
     drop(transcript);

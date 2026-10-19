@@ -332,6 +332,11 @@ impl Session {
         self.write(ClientMsg::approve(call, approved)).await
     }
 
+    /// Stops the running turn: its model or tool call, and the rest of it.
+    pub async fn interrupt(&self) -> Result<(), ClientError> {
+        self.write(ClientMsg::INTERRUPT).await
+    }
+
     /// Detaches; the session keeps running in the daemon.
     pub async fn detach(&self) -> Result<(), ClientError> {
         let shared = Arc::clone(&self.shared);

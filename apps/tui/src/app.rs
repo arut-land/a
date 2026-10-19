@@ -11,7 +11,7 @@ mod tests;
 use std::collections::HashSet;
 use std::path::PathBuf;
 
-use protocol::view::{Approval, Change, Item, SessionList, SessionView, Status, Usage};
+use protocol::view::{Change, Item, SessionList, SessionView, Usage};
 use protocol::{ClientMsg, DaemonMsg, SessionSummary, Target};
 
 use super::editor::{Edit, Editor};
@@ -363,16 +363,7 @@ impl App {
     /// Whether a model call, tool call or slash command is running: what
     /// an interrupt stops, with the rest of its turn.
     pub fn running(&self) -> bool {
-        self.view.items.iter().rev().any(|item| match item {
-            Item::Reply { status, .. } => *status == Status::Running,
-            Item::Tool {
-                outcome: None,
-                approval,
-                ..
-            } => !matches!(approval, Some(Approval::Pending | Approval::Denied)),
-            Item::Command { outcome, .. } => outcome.is_none(),
-            _ => false,
-        })
+        self.view.running()
     }
 
     fn interrupt(&mut self) -> Effect {

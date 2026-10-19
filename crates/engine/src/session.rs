@@ -1277,7 +1277,8 @@ impl Session {
                 Err(error) => error.to_string(),
             };
             let mut decided = Decided::new();
-            let retry = (retries < MAX_RETRIES)
+            // An interrupted turn asks for no retry.
+            let retry = (retries < MAX_RETRIES && !cancel.is_cancelled())
                 .then(|| {
                     registry.hooks().request_error(
                         (call, retries + 1),
@@ -1430,8 +1431,11 @@ fn as_command<'a>(registry: &Registry, text: &'a str) -> Option<(&'a str, &'a st
 }
 
 /// `work`'s output, or `None` once `cancel` is cancelled first; `work` is
-/// then dropped.
+/// then dropped, and not started at all if cancelled already.
 async fn unless<T>(cancel: &Cancel, work: impl Future<Output = T>) -> Option<T> {
+    if cancel.is_cancelled() {
+        return None;
+    }
     let (mut work, mut stop) = (pin!(work), pin!(cancel.cancelled()));
     poll_fn(|cx| {
         if let Poll::Ready(done) = work.as_mut().poll(cx) {
