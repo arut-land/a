@@ -1,8 +1,6 @@
-use std::time::Duration;
+use crate::{BoxFuture, Reactor, Runtime};
 
-use crate::{BoxFuture, Runtime};
-
-/// A tokio runtime, by handle.
+/// A tokio runtime, by handle, on its own reactor and timers.
 #[derive(Clone, Debug)]
 pub struct Tokio(pub tokio::runtime::Handle);
 
@@ -22,8 +20,7 @@ impl Runtime for Tokio {
         drop(self.0.spawn_blocking(work));
     }
 
-    fn sleep(&self, duration: Duration) -> BoxFuture<'static, ()> {
-        let _entered = self.0.enter();
-        Box::pin(tokio::time::sleep(duration))
+    fn reactor(&self) -> Reactor {
+        Reactor::Tokio(self.0.clone())
     }
 }

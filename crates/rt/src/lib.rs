@@ -1,17 +1,17 @@
 //! The async runtime seam. Library code is plain async Rust over [`Runtime`]:
-//! it spawns, sleeps and runs blocking work through whichever runtime the
-//! host plugs in, and never names one itself. [`Threads`] is the built-in
-//! runtime; `smol` and `tokio` adapters sit behind features; [`block_on`]
-//! drives a future to completion on the calling thread. Waiting on the OS
-//! ([`Async`] descriptors, [`Timer`]s) goes through one reactor thread that
-//! every runtime shares. [`EventSink`] is the observability seam, free when
-//! off.
+//! it spawns, sleeps, runs blocking work and waits on the OS through
+//! whichever runtime the host plugs in, and never names one itself.
+//! [`Threads`] is the built-in runtime; `smol` and `tokio` adapters sit
+//! behind features. A runtime brings its own reactor ([`Reactor`]), which
+//! [`Async`] descriptors register with, so a host never runs two.
+//! [`block_on`] drives a future to completion on the calling thread.
+//! [`EventSink`] is the observability seam, free when off.
 
 pub mod channel;
 mod events;
+mod io;
 mod notify;
 pub mod oneshot;
-mod reactor;
 #[cfg(feature = "threads")]
 mod threads;
 
@@ -22,16 +22,15 @@ mod tokio;
 
 use std::future::Future;
 use std::pin::{Pin, pin};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Condvar, Mutex, MutexGuard, PoisonError};
 use std::task::{Context, Poll, Wake, Waker};
 use std::thread::{self, Thread};
 use std::time::{Duration, Instant};
 
 pub use events::{Event, EventSink, Noop, Stderr};
+pub use io::{Async, Reactor, Source};
 pub use notify::Notify;
-#[cfg(any(unix, windows))]
-pub use reactor::Async;
-pub use reactor::{Timer, wakes};
 #[cfg(feature = "threads")]
 pub use threads::Threads;
 
@@ -49,7 +48,13 @@ pub trait Runtime: Send + Sync + 'static {
     /// Runs `work`, which may block, off the async workers.
     fn spawn_blocking(&self, work: Box<dyn FnOnce() + Send>);
 
-    fn sleep(&self, duration: Duration) -> BoxFuture<'static, ()>;
+    /// The reactor this runtime's tasks wait on the OS through: its timers
+    /// and the descriptors registered with it ([`Async`]).
+    fn reactor(&self) -> Reactor;
+
+    fn sleep(&self, duration: Duration) -> BoxFuture<'static, ()> {
+        self.reactor().sleep(duration)
+    }
 
     /// The runtime's clock: a simulated runtime runs its own.
     fn now(&self) -> Instant {
@@ -59,6 +64,9 @@ pub trait Runtime: Send + Sync + 'static {
 
 /// A shared handle to the runtime a component was given.
 pub type Rt = Arc<dyn Runtime>;
+
+/// How many times a thread waiting in [`block_on`] has woken.
+static WAKES: AtomicU64 = AtomicU64::new(0);
 
 /// Drives `future` to completion on the calling thread, which sleeps
 /// between its wakes.
@@ -84,7 +92,15 @@ pub fn block_on<F: Future>(future: F) -> F::Output {
         }
         // A stray unpark only polls once more.
         thread::park();
+        WAKES.fetch_add(1, Ordering::Relaxed);
     }
+}
+
+/// How many times, since the process started, a thread waiting in
+/// [`block_on`] (an async worker of [`Threads`] among them) has woken: how
+/// an idle process shows it stays asleep.
+pub fn wakes() -> u64 {
+    WAKES.load(Ordering::Relaxed)
 }
 
 /// The result of blocking `work`, run through `rt` without blocking the

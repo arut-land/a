@@ -32,6 +32,10 @@ impl rt::Runtime for Watched {
     fn sleep(&self, duration: Duration) -> rt::BoxFuture<'static, ()> {
         self.inner.sleep(duration)
     }
+
+    fn reactor(&self) -> rt::Reactor {
+        self.inner.reactor()
+    }
 }
 
 /// A client, and the channel its blocking jobs report returning on.

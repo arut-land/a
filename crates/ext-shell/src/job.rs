@@ -10,8 +10,9 @@ use std::time::Duration;
 const RECHECK: (Duration, Duration) = (Duration::from_millis(50), Duration::from_secs(5));
 
 /// Resolves once no process of group `pgid` is left, reaping `leader` (the
-/// child of ours that leads it, if it is one) once it exits.
-pub(crate) async fn ended(pgid: u32, mut leader: Option<Child>) {
+/// child of ours that leads it, if it is one) once it exits, waiting on
+/// `reactor`.
+pub(crate) async fn ended(reactor: rt::Reactor, pgid: u32, mut leader: Option<Child>) {
     let mut recheck = RECHECK.0;
     loop {
         if let Some(child) = &mut leader
@@ -22,10 +23,10 @@ pub(crate) async fn ended(pgid: u32, mut leader: Option<Child>) {
         if !sys::Group(pgid).alive() {
             return;
         }
-        if any_exit(pgid).await {
+        if any_exit(&reactor, pgid).await {
             recheck = RECHECK.0;
         } else {
-            rt::Timer::after(recheck).await;
+            reactor.sleep(recheck).await;
             recheck = (recheck * 2).min(RECHECK.1);
         }
     }
@@ -33,14 +34,14 @@ pub(crate) async fn ended(pgid: u32, mut leader: Option<Child>) {
 
 /// Waits for any live process of group `pgid` to exit; `false`, at once,
 /// when none can be watched.
-async fn any_exit(pgid: u32) -> bool {
+async fn any_exit(reactor: &rt::Reactor, pgid: u32) -> bool {
     use std::future::poll_fn;
     use std::task::Poll;
 
     let watches: Vec<_> = sys::Group(pgid)
         .members()
         .into_iter()
-        .filter_map(|pid| rt::Async::for_reading(sys::exit_watch(pid).ok()?).ok())
+        .filter_map(|pid| rt::Async::for_reading(reactor, sys::exit_watch(pid).ok()?).ok())
         .collect();
     if watches.is_empty() {
         return false;
