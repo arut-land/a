@@ -1306,19 +1306,18 @@ impl Session {
     /// whose owner is gone is an orphan: nothing of its turn runs again.
     async fn recover(&self, agent: &mut dyn Agent) -> io::Result<()> {
         self.relink().await?;
-        let (dangling, actions, commands, jobs, queued) = {
+        let (dangling, actions, commands, jobs) = {
             let st = self.lock();
             (
                 dangling_calls(&st.entries),
                 replay(agent, &st.entries),
                 dangling_commands(&st.entries),
                 background_groups(&st.entries),
-                untaken(&st.entries),
             )
         };
         let orphan = self.orphaned();
         let registry = self.registry();
-        self.requeue(queued, &registry);
+        self.requeue(&registry);
         // Owned by the session under a daemon that died without ending it:
         // ended now. Later loads in this daemon find them ended by `stop`.
         if lock(&self.shared.loaded).insert(self.id) {
@@ -1344,16 +1343,27 @@ impl Session {
         self.drive(agent, actions, inputs).await
     }
 
-    /// Queues again the input the log shows queued and not taken up.
-    fn requeue(&self, queued: VecDeque<(u64, String, bool)>, registry: &Registry) {
+    /// Queues again the input the log shows queued and not taken up, ahead
+    /// of what was taken in since the session loaded. That input is in the
+    /// log as well, and waiting already: taking input in holds `waiting`
+    /// until its entry commits, so under that lock the two agree.
+    fn requeue(&self, registry: &Registry) {
+        let mut waiting = lock(&self.waiting);
+        let queued: Vec<_> = untaken(&self.lock().entries)
+            .into_iter()
+            .filter(|(seq, ..)| waiting.iter().all(|w| w.seq != *seq))
+            .collect();
         let count = queued.len();
-        lock(&self.waiting).extend(queued.into_iter().map(|(seq, text, steer)| Waiting {
-            command: as_command(registry, &text).is_some(),
-            seq,
-            text,
-            steer,
-            started: false,
-        }));
+        for (seq, text, steer) in queued.into_iter().rev() {
+            waiting.push_front(Waiting {
+                command: as_command(registry, &text).is_some(),
+                seq,
+                text,
+                steer,
+                started: false,
+            });
+        }
+        drop(waiting);
         self.queued.fetch_add(count, Ordering::SeqCst);
         for _ in 0..count {
             let _ = self.mailbox.send(Msg::Queued);

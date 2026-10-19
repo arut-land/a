@@ -1599,3 +1599,42 @@ fn input_waits_its_turn_behind_a_call_waiting_for_approval() {
         .collect();
     assert_eq!(after, [&user("next"), &echo("next")]);
 }
+
+/// Input that arrives while a loaded session recovers is in the log as
+/// queued when recovery looks for the input still queued there: it is
+/// taken up once, after what was queued before the load.
+#[test]
+fn input_taken_in_during_recovery_runs_once() {
+    let fixture = Fixture::new(
+        agent::Kind::Echo,
+        Registry::default(),
+        openai(&Script::new(&[])),
+    );
+    let before = [
+        entry(1, user("one")),
+        entry(2, echo("one")),
+        entry(3, queued("left")),
+    ];
+    for _ in 0..20 {
+        let session = fixture.load(&before);
+        session.submit("two".into()).unwrap();
+        settle(&session);
+        let log = log_of(&session);
+        session.stop();
+        let said: Vec<_> = bodies(&log)
+            .into_iter()
+            .filter(|b| !matches!(b, Body::Queued { .. }))
+            .collect();
+        assert_eq!(
+            said,
+            [
+                &user("one"),
+                &echo("one"),
+                &user("left"),
+                &echo("left"),
+                &user("two"),
+                &echo("two"),
+            ]
+        );
+    }
+}
