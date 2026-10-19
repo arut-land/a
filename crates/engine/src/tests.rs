@@ -74,6 +74,35 @@ fn idle_sessions_hibernate_and_reload_on_attach() {
     assert!(missing.is_err());
 }
 
+/// A hibernated session's log is counted once, and counted again after it
+/// was loaded and grew.
+#[test]
+fn a_hibernated_session_lists_the_entries_it_has_now() {
+    let (root, home) = home("count");
+    let daemon = Daemon::load(&home, &echo()).unwrap();
+    let mut counts = Vec::new();
+    let mut target = Target::New;
+    for text in ["one", "two"] {
+        let attachment = daemon.resolve(&target, "/w".into()).unwrap();
+        target = Target::Id(attachment.session().id);
+        attachment.session().submit(text.into()).unwrap();
+        settle(&daemon);
+        drop(attachment);
+        daemon.hibernate(Duration::ZERO);
+        let Target::Id(id) = target else {
+            unreachable!()
+        };
+        let stored = daemon.shared.store.count(id).unwrap();
+        counts.push([daemon.list()[0].entries, daemon.list()[0].entries, stored]);
+    }
+    std::fs::remove_dir_all(&root).unwrap();
+    assert_eq!(counts[0], [2; 3]);
+    assert!(
+        counts[1][2] > 2 && counts[1] == [counts[1][2]; 3],
+        "{counts:?}"
+    );
+}
+
 #[test]
 fn busy_sessions_recover_at_startup() {
     let (root, home) = home("recover");

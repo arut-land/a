@@ -207,6 +207,9 @@ struct Slot {
     /// The parent has fired its watch on this child, so reports are moot.
     /// Known only since this daemon started.
     heard: AtomicBool,
+    /// How many entries its log holds while hibernated, once counted:
+    /// only a loaded session appends, so listing reads each log once.
+    entries: Mutex<Option<u64>>,
 }
 
 impl Slot {
@@ -215,6 +218,7 @@ impl Slot {
             header,
             live: Mutex::new(live),
             heard: AtomicBool::new(false),
+            entries: Mutex::new(None),
         })
     }
 }
@@ -281,6 +285,7 @@ impl Daemon {
             Some(session) => session,
             empty @ None => {
                 let loaded = self.shared.store.load(slot.header.id)?;
+                *lock(&slot.entries) = None;
                 empty.insert(Session::start(
                     slot.header.clone(),
                     loaded,
@@ -331,7 +336,9 @@ impl Daemon {
                 None => SessionSummary {
                     id: slot.header.id,
                     workspace: slot.header.workspace.clone(),
-                    entries: self.shared.store.count(slot.header.id).unwrap_or(0),
+                    entries: *lock(&slot.entries).get_or_insert_with(|| {
+                        self.shared.store.count(slot.header.id).unwrap_or(0)
+                    }),
                     clients: 0,
                     // Only a session with no work is unloaded.
                     activity: Activity::Idle,
@@ -349,6 +356,7 @@ impl Daemon {
             if live.as_ref().is_some_and(|s| s.idle_for() >= after)
                 && let Some(session) = live.take()
             {
+                *lock(&slot.entries) = Some(session.summary().entries);
                 session_event("hibernate", session.id, String::new);
                 session.stop();
             }
