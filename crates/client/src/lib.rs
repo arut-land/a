@@ -75,27 +75,27 @@ impl Welcome {
 }
 
 impl Connection {
-    /// The workspace a session attached over this connection works in and
-    /// the environment its commands run with: this process's, or a remote
-    /// daemon's bridge's, never this machine's paths on another.
-    pub fn origin(&self) -> io::Result<(PathBuf, Environment)> {
-        if let Some(env) = &self.remote {
-            return Ok((env.cwd.clone(), env.clone()));
+    /// The environment a session attached over this connection runs its
+    /// commands with: this process's, or a remote daemon's bridge's, never
+    /// this machine's paths on another.
+    pub fn origin(&self) -> io::Result<Environment> {
+        match &self.remote {
+            Some(env) => Ok(env.clone()),
+            None => capture(),
         }
-        let env = capture()?;
-        Ok((sys::workspace_of(&env.cwd), env))
     }
 
     /// The attach to `target` from this connection's [`origin`], replaying
     /// the entries after `since`; with the origin's environment when
-    /// `with_env`, else the session keeps the one it has.
+    /// `with_env`, else the session keeps the one it has. The daemon finds
+    /// the workspace from the origin's directory.
     ///
     /// [`origin`]: Connection::origin
     pub fn attach(&self, target: Target, since: u64, with_env: bool) -> io::Result<ClientMsg> {
-        let (workspace, env) = self.origin()?;
+        let env = self.origin()?;
         Ok(ClientMsg::Attach {
             target,
-            workspace,
+            workspace: env.cwd.clone(),
             since,
             env: with_env.then_some(env),
             decl: ClientDecl::default(),

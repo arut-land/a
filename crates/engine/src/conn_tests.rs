@@ -9,8 +9,8 @@ use std::time::{Duration, Instant};
 
 use protocol::view::SessionView;
 use protocol::{
-    Body, Caps, ClientDecl, ClientMsg, DaemonMsg, Entry, Origin, PROTO, Rejection, Role,
-    SettingsChange, Target, read_frame, write_frame,
+    Body, Caps, ClientDecl, ClientMsg, DaemonMsg, Entry, Environment, Origin, PROTO, Rejection,
+    Role, SettingsChange, Target, read_frame, write_frame,
 };
 use store::{Header, Jsonl, LogStore};
 use sys::Home;
@@ -389,7 +389,10 @@ fn far_behind_a_client_gets_a_snapshot_if_it_takes_them() {
 #[test]
 fn a_client_that_falls_behind_is_caught_up_from_the_log() {
     let fixture = Fixture::new("behind");
-    let attachment = fixture.daemon.resolve(&Target::New, "/w".into()).unwrap();
+    let attachment = fixture
+        .daemon
+        .resolve(&Target::New, || "/w".into())
+        .unwrap();
     let session = attachment.session();
     let outbox = Outbox::new(Caps::NONE);
     session.attach(&outbox, 0);
@@ -496,4 +499,36 @@ fn settings_saved_at_once_by_many_clients_all_land() {
     };
     assert!(error.contains("not a variable name"), "{error}");
     assert_eq!(unchanged, settings);
+}
+
+#[test]
+fn the_daemon_finds_the_workspace_from_the_clients_directory_and_git_variables() {
+    let fixture = Fixture::new("workspace");
+    let repo = std::fs::canonicalize(&fixture.root).unwrap().join("repo");
+    std::fs::create_dir_all(repo.join(".git")).unwrap();
+    std::fs::create_dir_all(repo.join("src/deep")).unwrap();
+    std::fs::create_dir_all(repo.join("other")).unwrap();
+    let attached = |env: Option<Environment>| {
+        let mut peer = fixture.connect();
+        peer.send(&hello(Caps::NONE));
+        peer.send(&ClientMsg::Attach {
+            target: Target::New,
+            workspace: repo.join("src/deep"),
+            since: 0,
+            env,
+            decl: ClientDecl::default(),
+        });
+        assert!(matches!(peer.recv(), DaemonMsg::Welcome { .. }));
+        let DaemonMsg::Attached { workspace, .. } = peer.recv() else {
+            panic!("not attached");
+        };
+        workspace
+    };
+    assert_eq!(attached(None), repo);
+    let work_tree = Environment::new(
+        repo.join("src/deep"),
+        [("GIT_WORK_TREE".into(), repo.join("other").into_os_string())],
+        false,
+    );
+    assert_eq!(attached(Some(work_tree)), repo.join("other"));
 }

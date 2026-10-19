@@ -847,7 +847,10 @@ tagged! {
             caps: Caps,
         },
         /// `env` is the client's, for the commands the session runs; without
-        /// one the session keeps the environment it had.
+        /// one the session keeps the environment it had. `workspace` is the
+        /// directory the client is in: the daemon takes the git working tree
+        /// it is in (with `env`'s git variables) as the workspace. (Daemons
+        /// before that take it as it is.)
         Attach {
             target: Target,
             workspace: PathBuf,

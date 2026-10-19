@@ -302,18 +302,28 @@ impl Daemon {
         Ok(f(session))
     }
 
-    fn resolve(&self, target: &Target, workspace: PathBuf) -> io::Result<Attachment> {
+    /// The session `target` names, attached. `workspace` is only worked
+    /// out for a target that needs it: an attach by id never looks.
+    fn resolve(
+        &self,
+        target: &Target,
+        workspace: impl FnOnce() -> PathBuf,
+    ) -> io::Result<Attachment> {
         let found = match target {
-            Target::New => return self.create(workspace),
+            Target::New => return self.create(workspace()),
             Target::Id(id) => self.slot(*id),
             // A child is reached through its parent, not resumed as latest.
-            Target::Latest { any_workspace } => lock(&self.slots)
-                .iter()
-                .rev()
-                .find(|s| {
-                    s.header.parent.is_none() && (*any_workspace || s.header.workspace == workspace)
-                })
-                .cloned(),
+            Target::Latest { any_workspace } => {
+                let workspace = (!any_workspace).then(workspace);
+                lock(&self.slots)
+                    .iter()
+                    .rev()
+                    .find(|s| {
+                        s.header.parent.is_none()
+                            && workspace.as_ref().is_none_or(|w| s.header.workspace == *w)
+                    })
+                    .cloned()
+            }
         };
         let slot =
             found.ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, "no matching session"))?;
@@ -818,6 +828,14 @@ fn handle(daemon: &Daemon, life: &Lifecycle, conn: &UnixStream) -> io::Result<()
     result
 }
 
+/// The workspace a client in `dir` works in: the git working tree `dir` is
+/// in, found with the client's git variables (`GIT_DIR`, ceilings), not the
+/// daemon's, so every client, local or bridged, gets the same rule.
+fn workspace_of(dir: &std::path::Path, env: Option<&Environment>) -> PathBuf {
+    let var = |name: &str| env?.vars.get(name).map(Into::into);
+    sys::workspace_in(dir, &sys::GitEnv::from_vars(var))
+}
+
 fn reply(outbox: &Outbox, msg: &DaemonMsg) {
     // The writer ends with the connection; a lost reply needs no handling.
     if let Ok(frame) = Frame::new(msg) {
@@ -864,7 +882,10 @@ impl Conn<'_> {
                     since,
                     env,
                     decl,
-                } => match self.daemon.resolve(&target, workspace) {
+                } => match self
+                    .daemon
+                    .resolve(&target, || workspace_of(&workspace, env.as_ref()))
+                {
                     Ok(s) => {
                         self.decl = decl;
                         // Before the replay, so a client that saw itself

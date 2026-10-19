@@ -273,14 +273,14 @@ impl Session {
         let (target, workspace, env) = match target {
             OpenTarget::New { workspace } => {
                 let dir = PathBuf::from(workspace);
-                (Target::New, sys::workspace_of(&dir), Some(dir))
+                (Target::New, dir.clone(), Some(dir))
             }
             OpenTarget::Latest {
                 workspace,
                 any_workspace,
             } => (
                 Target::Latest { any_workspace },
-                sys::workspace_of(Path::new(&workspace)),
+                PathBuf::from(workspace),
                 None,
             ),
             OpenTarget::Id { id } => (Target::Id(parse_id(&id)?), PathBuf::new(), None),
