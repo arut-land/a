@@ -154,10 +154,12 @@ times exclude the terminal write.) A frame costs more through ratatui
 (grapheme segmentation, a buffer reset and a full diff per frame) but stays
 far under a millisecond; at opt-level 3 the client's delta frame is 146 µs.
 Writing plain text into cells directly, and scanning the transcript once
-per change instead of per frame, took the delta frame from 360 to 207 µs
-and the scroll frame from 340 to 205 µs (both builds measured in turns on a
-loaded machine; the full diff is now about half of what is left), and a
-delta at the end of a 28 KB reply from 784 to 89 µs.
+per change instead of per frame, took the delta frame from 246 to 140 µs
+(p99 738 to 244) and the scroll frame from 213 to 151 µs (medians of five
+runs of each build in turns, on a loaded machine; ratatui's full diff is
+about half of what is left), and a delta at the end of a 28 KB reply from
+784 to 89 µs. Streaming 1000 deltas costs the client 0.25 s of CPU, from
+0.5 to 0.9 s.
 
 ## Tests
 
