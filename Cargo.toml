@@ -21,6 +21,7 @@ ext-prompt = { path = "crates/ext-prompt" }
 ext-retry = { path = "crates/ext-retry" }
 ext-settings = { path = "crates/ext-settings" }
 ext-shell = { path = "crates/ext-shell" }
+ext-subagent = { path = "crates/ext-subagent" }
 client = { path = "crates/client" }
 engine = { path = "crates/engine" }
 llm = { path = "crates/llm" }

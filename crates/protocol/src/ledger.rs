@@ -607,8 +607,9 @@ impl Open {
         )
     }
 
+    /// It waits on someone: not on a child, whose work is the call's.
     fn waits(&self) -> bool {
-        matches!(self.phase, Phase::Waiting(_))
+        matches!(&self.phase, Phase::Waiting(on) if !matches!(on, WaitOn::Child { .. }))
     }
 
     /// It is seen running: a process or progress of a gated call says its

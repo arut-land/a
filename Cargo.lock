@@ -17,6 +17,7 @@ dependencies = [
  "ext-retry",
  "ext-settings",
  "ext-shell",
+ "ext-subagent",
  "libc",
  "protocol",
  "rustix",
@@ -554,6 +555,7 @@ dependencies = [
  "ext-retry",
  "ext-settings",
  "ext-shell",
+ "ext-subagent",
  "futures-core",
  "http",
  "llm",
@@ -692,6 +694,16 @@ dependencies = [
  "serde_json",
  "sys",
  "vte",
+]
+
+[[package]]
+name = "ext-subagent"
+version = "0.0.0"
+dependencies = [
+ "ext",
+ "llm",
+ "serde",
+ "serde_json",
 ]
 
 [[package]]

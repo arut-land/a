@@ -242,7 +242,6 @@ fn commits(action: &Action, body: &Body) -> bool {
         (Action::Emit(emitted), body) => emitted == body,
         (Action::RunTool { tool, .. }, Body::ToolCall { tool: called, .. }) => tool == called,
         (Action::CallModel, Body::ModelCall { .. }) => true,
-        (Action::Spawn { input }, Body::Link { input: linked, .. }) => input == linked,
         _ => false,
     }
 }

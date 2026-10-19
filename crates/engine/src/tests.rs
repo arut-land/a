@@ -27,6 +27,7 @@ pub(crate) fn extensions(policy: &ext_policy::Policy) -> Result<Registry, ext::R
         .with_in(ext::Tier::Pre, &ext_shell::Shell)?
         .with_in(ext::Tier::Pre, &ext_edit::Edit)?
         .with_in(ext::Tier::Pre, &ext_chat::Chat)?
+        .with_in(ext::Tier::Pre, &ext_subagent::Subagent)?
         .with_in(ext::Tier::Pre, &ext_fixtures::Fixtures)
 }
 
@@ -162,7 +163,7 @@ fn busy_sessions_recover_at_startup() {
 
     // The log's header predates extension records, so recovery notes them
     // first. The safe sleep runs again; the shell command is not rerun.
-    assert!(matches!(&got[2], Body::Extensions { installed } if installed.len() == 6));
+    assert!(matches!(&got[2], Body::Extensions { installed } if installed.len() == 7));
     assert!(matches!(
         &got[3],
         Body::ToolResult { call: 1, outcome: Outcome::Done { output }, card: None } if output.value()["slept"] == 0
@@ -303,7 +304,7 @@ fn a_parent_hears_from_its_child_exactly_once() {
     drop(parent);
     let store = &*daemon.shared.store;
     let got = bodies(store, id);
-    let Body::Link { child, .. } = got[1] else {
+    let Body::Link { child, .. } = got[2] else {
         panic!("{got:?}")
     };
     let child_header = store.headers().unwrap().into_iter().find(|h| h.id == child);
@@ -340,27 +341,40 @@ fn a_parent_hears_from_its_child_exactly_once() {
     let after = bodies(&*again.shared.store, id);
     std::fs::remove_dir_all(&root).unwrap();
 
+    // The `task` call waits on the child it linked, and answers with what
+    // the child settled with.
     assert_eq!(
-        got[1..],
+        got[2..],
         [
             Body::Link {
                 child,
                 input: "hi".into()
             },
+            Body::Wait {
+                call: protocol::CallId::new(2).unwrap(),
+                on: protocol::WaitOn::Child {
+                    link: protocol::Seq::new(3).unwrap()
+                }
+            },
             Body::Watch { child },
             Body::Fired {
-                watch: 3,
+                watch: 5,
                 outcome: Outcome::Done {
                     output: "hi".into()
                 }
             },
-            Body::Assistant {
-                text: "The child session finished:\nhi".into()
+            Body::ToolResult {
+                call: 2,
+                outcome: Outcome::Done {
+                    output: "The child session finished:\nhi".into()
+                },
+                card: None
             },
         ]
     );
+    assert!(matches!(&got[1], Body::ToolCall { tool, .. } if tool == "task"));
     assert!(!parent_loaded, "a moot report loaded the parent");
-    assert_eq!(child_header.unwrap().parent.unwrap().call, 2);
+    assert_eq!(child_header.unwrap().parent.unwrap().call, 3);
     assert_eq!(resumed, id, "resuming picks the parent, not its child");
     assert_eq!(
         child_log,
@@ -417,23 +431,35 @@ fn watches_rearm_after_a_crash_and_fire_once() {
     let session = |parent: Option<SessionId>| Header {
         id: SessionId::new(),
         workspace: "/w".into(),
-        parent: parent.map(|session| store::Parent { session, call: 2 }),
+        parent: parent.map(|session| store::Parent { session, call: 3 }),
         extensions: Vec::new(),
     };
-    let spawned = |child: SessionId, watched: bool| {
-        let mut bodies = vec![
+    // The `task` call, its link, its wait on the child and the watch commit
+    // in one batch.
+    let spawned = |child: SessionId| {
+        vec![
             Body::User {
                 text: "spawn sleep 0".into(),
+            },
+            Body::ToolCall {
+                tool: "task".into(),
+                input: json!({ "prompt": "sleep 0" }).into(),
+                id: None,
+                card: None,
+                by: Audience::Model,
             },
             Body::Link {
                 child,
                 input: "sleep 0".into(),
             },
-        ];
-        if watched {
-            bodies.push(Body::Watch { child });
-        }
-        bodies
+            Body::Wait {
+                call: protocol::CallId::new(2).unwrap(),
+                on: protocol::WaitOn::Child {
+                    link: protocol::Seq::new(3).unwrap(),
+                },
+            },
+            Body::Watch { child },
+        ]
     };
     let opened = || Body::User {
         text: "sleep 0".into(),
@@ -453,13 +479,13 @@ fn watches_rearm_after_a_crash_and_fire_once() {
     // Killed while the child ran.
     let parent = session(None);
     let child = session(Some(parent.id));
-    write(&parent, spawned(child.id, true), true);
+    write(&parent, spawned(child.id), true);
     write(&child, vec![opened(), sleep()], true);
     parents.push(parent.id);
     // Killed after the child finished, before the parent heard.
     let parent = session(None);
     let child = session(Some(parent.id));
-    write(&parent, spawned(child.id, true), true);
+    write(&parent, spawned(child.id), true);
     let done = Body::ToolResult {
         call: 2,
         outcome: slept.clone(),
@@ -467,9 +493,9 @@ fn watches_rearm_after_a_crash_and_fire_once() {
     };
     write(&child, vec![opened(), sleep(), done], false);
     parents.push(parent.id);
-    // Killed between the link and the child's creation.
+    // Killed before the child was created.
     let parent = session(None);
-    write(&parent, spawned(SessionId::new(), false), true);
+    write(&parent, spawned(SessionId::new()), true);
     parents.push(parent.id);
 
     for _ in 0..2 {
@@ -481,6 +507,13 @@ fn watches_rearm_after_a_crash_and_fire_once() {
 
     for log in &got {
         assert_eq!(fired(log), [&slept], "{log:#?}");
+        // Run again, the call waited on the child it had, starting no other.
+        let links = log.iter().filter(|b| matches!(b, Body::Link { .. }));
+        assert_eq!(links.count(), 1, "{log:#?}");
+        assert!(
+            matches!(log.last(), Some(Body::ToolResult { call: 2, .. })),
+            "{log:#?}"
+        );
     }
 }
 
@@ -518,7 +551,7 @@ fn an_owner_idles_with_its_children_and_an_interrupt_stops_them_first() {
     let log = until(&daemon, id, |log| {
         log.iter().any(|b| matches!(b, Body::Watch { .. }))
     });
-    let Some(Body::Link { child, .. }) = log.get(1) else {
+    let Some(Body::Link { child, .. }) = log.get(2) else {
         panic!("{log:#?}")
     };
     until(&daemon, *child, |log| {
@@ -539,8 +572,11 @@ fn an_owner_idles_with_its_children_and_an_interrupt_stops_them_first() {
     assert_eq!(busy, Duration::ZERO);
     let aborted = |b: &Body| matches!(b, Body::ToolResult { outcome: Outcome::Done { output }, .. } if output.value()["aborted"] == true);
     assert!(child_log.iter().any(aborted), "{child_log:#?}");
+    // The child settles first, and its parent's call hears how.
+    let heard = |b: &Body| matches!(b, Body::ToolResult { outcome: Outcome::Done { output }, .. } if output.value().as_str().is_some_and(|t| t.contains("aborted")));
+    let tail: Vec<_> = parent_log.iter().rev().take(2).collect();
     assert!(
-        matches!(parent_log.last(), Some(Body::Assistant { text }) if text.contains("aborted")),
+        matches!(tail[..], [result, Body::Fired { .. }] if heard(result)),
         "{parent_log:#?}"
     );
     assert!(unloaded);

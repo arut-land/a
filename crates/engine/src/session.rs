@@ -108,6 +108,9 @@ pub struct Session {
     replied: Mutex<Option<(u64, llm::Assistant)>>,
     /// Background process groups the session owns, until it ends.
     jobs: Mutex<Vec<u32>>,
+    /// What the children calls wait on settled with, until each call hears.
+    reported: Mutex<HashMap<SessionId, Outcome>>,
+    reports: rt::Notify,
     /// Over once the actor has returned and the log is closed.
     ended: Ended,
     shared: Arc<Shared>,
@@ -370,6 +373,8 @@ impl Session {
             cancel: Mutex::default(),
             replied: Mutex::default(),
             jobs: Mutex::default(),
+            reported: Mutex::default(),
+            reports: rt::Notify::default(),
             ended: Ended::default(),
             shared,
         });
@@ -1035,10 +1040,6 @@ impl Session {
                 self.record(body);
                 return Ok(None);
             }
-            Action::Spawn { input } => {
-                self.spawn(input).await?;
-                return Ok(None);
-            }
             Action::CallModel => {
                 self.steer_in();
                 self.note_context();
@@ -1290,6 +1291,7 @@ impl Session {
             call,
             registry: Arc::clone(registry),
             settings: OnceLock::new(),
+            sessions: OnceLock::new(),
         }))
     }
 
@@ -1738,8 +1740,9 @@ struct Effect {
     session: Arc<Session>,
     call: u64,
     registry: Arc<Registry>,
-    /// The session's settings, made when a call first asks.
+    /// The session's settings and children, made when a call first asks.
     settings: OnceLock<Arc<dyn ext::Settings>>,
+    sessions: OnceLock<Arc<dyn ext::Sessions>>,
 }
 
 /// A session's settings, as its calls reach them.
@@ -1755,6 +1758,19 @@ impl ext::Settings for Own {
 
     fn set<'a>(&'a self, _: &'a Cx, set: Overrides) -> BoxFuture<'a, io::Result<()>> {
         Box::pin(async move { self.0.append(Body::Settings(set)).await.map(drop) })
+    }
+}
+
+impl ext::Sessions for Own {
+    fn child<'a>(&'a self, cx: &'a Cx, input: String) -> BoxFuture<'a, Outcome> {
+        Box::pin(async move {
+            self.0
+                .child(cx.call, input)
+                .await
+                .unwrap_or_else(|e| Outcome::Failed {
+                    error: e.to_string(),
+                })
+        })
     }
 }
 
@@ -1802,9 +1818,12 @@ impl Host for Effect {
     }
 
     fn service(&self, ty: TypeId) -> Option<&(dyn Any + Send + Sync)> {
+        let own = || Arc::new(Own(Arc::clone(&self.session)));
         if ty == TypeId::of::<dyn ext::Settings>() {
-            let own = || Arc::new(Own(Arc::clone(&self.session))) as Arc<dyn ext::Settings>;
-            return Some(self.settings.get_or_init(own));
+            return Some(self.settings.get_or_init(|| own()));
+        }
+        if ty == TypeId::of::<dyn ext::Sessions>() {
+            return Some(self.sessions.get_or_init(|| own()));
         }
         None
     }

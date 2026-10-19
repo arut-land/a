@@ -1,21 +1,48 @@
-//! Session links: a session starts a child it owns and durably watches it.
-//! The link, the watch and its firing are entries in the parent's log, so a
-//! watch outlives the daemon: recovery re-arms every watch that has not
-//! fired, and a watch fires at most once because only the parent's actor
-//! logs it, after checking the log.
+//! Session links: a call starts a child session it owns and durably
+//! watches it. The link, what the call waits on, the watch and its firing
+//! are entries in the parent's log, so a watch outlives the daemon: the
+//! call, run again by recovery, finds its child by what it waits on, and a
+//! watch fires at most once because only the parent's actor logs it, after
+//! checking the log. Watches an earlier build armed for its agent are
+//! re-armed by recovery, and their firing goes to the agent.
 
 use std::collections::VecDeque;
+use std::future::{Future, poll_fn};
 use std::io;
+use std::pin::pin;
 use std::sync::Arc;
 use std::sync::atomic::Ordering;
+use std::task::Poll;
+use std::time::Duration;
 
 use ext::{Agent, Input};
-use protocol::ledger::Ledger;
-use protocol::{Body, Environment, Outcome, SessionId};
+use protocol::ledger::{Ledger, Phase};
+use protocol::{Body, CallId, Environment, Outcome, Seq, SessionId, WaitOn};
 use store::{Header, Parent};
 
-use super::{Msg, Open, Session, installed};
+use super::{Msg, Open, Session, installed, unless};
 use crate::{Daemon, Slot, lock};
+
+/// How long an interrupted call waits for its child, interrupted first, to
+/// settle: it hears the child's own account of where it stopped.
+const SETTLING: Duration = ext::Kill::GRACE.saturating_mul(2);
+
+/// The child call `call` waits on, by its link: the child and its input.
+fn waited_on(ledger: &Ledger, call: u64) -> Option<(u64, SessionId, String)> {
+    let Phase::Waiting(WaitOn::Child { link }) = &ledger.call(call)?.phase else {
+        return None;
+    };
+    let link = ledger.links().iter().find(|l| l.seq == link.get())?;
+    Some((link.seq, link.child, link.input.clone()))
+}
+
+/// Whether a call waits on `child`: its result goes to the call, not to the
+/// agent.
+fn owned(ledger: &Ledger, child: SessionId) -> bool {
+    ledger
+        .open_calls()
+        .any(|(call, _)| waited_on(ledger, call).is_some_and(|(_, c, _)| c == child))
+}
 
 /// Where a link stands, by its watch. A link not yet watched or armed
 /// carries the child's input, to start it with.
@@ -33,19 +60,47 @@ fn result(ledger: &Ledger) -> Outcome {
 }
 
 impl Session {
-    /// Starts a child on `input` and watches it. The link commits first, so
-    /// a crash before the child exists, or before the watch, leaves the rest
-    /// to recovery.
-    pub(super) async fn spawn(&self, input: String) -> io::Result<()> {
-        let child = SessionId::new();
-        let call = self
-            .append(Body::Link {
-                child,
-                input: input.clone(),
+    /// What a child session started on `input` for call `call` settles
+    /// with. Its link, the call's wait on it and the watch commit before
+    /// it starts, so a call run again after a crash finds the child it
+    /// started and waits for it again. The watch counts as work until it
+    /// fires. An interrupt reaches the child first: the call waits a while
+    /// for it to settle.
+    pub(super) async fn child(&self, call: u64, input: String) -> io::Result<Outcome> {
+        let turn = self.turn();
+        let linked = waited_on(&self.lock().ledger, call);
+        let (link, child, input) = if let Some(linked) = linked {
+            linked
+        } else {
+            self.link(call, input).await?
+        };
+        let watch = (self.lock().ledger.armed()).find_map(|(w, c)| (c == child).then_some(w));
+        let Some(watch) = watch else {
+            return Err(io::Error::other("the child's watch has fired"));
+        };
+        self.start_child(child, link, input).await?;
+        let reported = || lock(&self.reported).contains_key(&child);
+        if unless(&turn, self.reports.until(reported)).await.is_none() {
+            let settled = self.reports.until(reported);
+            let late = self.shared.rt.sleep(SETTLING);
+            let (mut settled, mut late) = (pin!(settled), pin!(late));
+            poll_fn(|cx| {
+                if settled.as_mut().poll(cx).is_ready() {
+                    return Poll::Ready(());
+                }
+                late.as_mut().poll(cx)
             })
-            .await?;
-        self.start_child(child, call, input).await?;
-        self.watch(child).await
+            .await;
+        }
+        let outcome = lock(&self.reported).remove(&child);
+        let outcome = outcome.unwrap_or(Outcome::Interrupted { output: None });
+        self.record(Body::Fired {
+            watch,
+            outcome: outcome.clone(),
+        });
+        self.queued.fetch_sub(1, Ordering::SeqCst);
+        self.heard(child);
+        Ok(outcome)
     }
 
     /// Commits a watch on `child`; it counts as work until it fires.
@@ -116,8 +171,31 @@ impl Session {
         Ok(())
     }
 
-    /// Queues child `child`'s result for this session's actor.
+    /// Links a new child on `input` for call `call`, which waits on it,
+    /// and watches it: its link, the child and its input.
+    async fn link(&self, call: u64, input: String) -> io::Result<(u64, SessionId, String)> {
+        let child = SessionId::new();
+        let link = self.record(Body::Link {
+            child,
+            input: input.clone(),
+        });
+        let (Some(call), Some(on)) = (CallId::new(call), Seq::new(link)) else {
+            return Err(io::Error::other("a call has a seq"));
+        };
+        let on = WaitOn::Child { link: on };
+        self.record(Body::Wait { call, on });
+        self.watch(child).await?;
+        Ok((link, child, input))
+    }
+
+    /// Hands child `child`'s result to the call waiting on it, or else
+    /// queues it for this session's actor.
     pub(super) fn settle(&self, child: SessionId, outcome: Outcome) {
+        if owned(&self.lock().ledger, child) {
+            lock(&self.reported).insert(child, outcome);
+            self.reports.notify();
+            return;
+        }
         let _ = self.mailbox.send(Msg::Settled { child, outcome });
     }
 
