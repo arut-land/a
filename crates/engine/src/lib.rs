@@ -473,7 +473,7 @@ fn earliest(a: Option<Instant>, b: Instant) -> Instant {
 
 /// What the daemon lets go of when it exits.
 struct Exit {
-    socket: PathBuf,
+    home: Home,
     /// The locked pid file; see [`claim`].
     pid: File,
     log: PathBuf,
@@ -482,12 +482,15 @@ struct Exit {
 impl Exit {
     /// Unlinks the socket first so new clients spawn a fresh daemon (one
     /// that raced into our backlog sees EOF and retries), then empties the
-    /// record (a clean exit is no crash) and releases the pid lock before
+    /// record and clears the crash breaker (a clean exit is no crash, and
+    /// ends any run of them) and releases the pid lock before
     /// the process closes its connections: a client reconnecting on EOF
     /// finds the lock free for the daemon it spawns.
     fn now(self, why: &str) -> ! {
-        let _ = std::fs::remove_file(&self.socket);
-        let _ = self.pid.set_len(0);
+        let _ = std::fs::remove_file(self.home.socket());
+        if let Err(e) = sys::crash::exited(&self.home, &self.pid) {
+            eprintln!("noting a clean exit: {e}");
+        }
         drop(self.pid);
         event(|| rt::Event {
             name: "exit",
@@ -528,7 +531,7 @@ pub fn serve(listener: &UnixListener, home: &Home, config: &Config, build: &str)
     let life = Arc::new(Lifecycle::new(build.to_owned(), home.runtime()));
     let (monitor, watch, config) = (Arc::clone(&daemon), Arc::clone(&life), config.clone());
     let exit = Exit {
-        socket: home.socket(),
+        home: home.clone(),
         pid,
         log: home.daemon_log(),
     };
