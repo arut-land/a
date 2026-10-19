@@ -2,7 +2,7 @@
 //! provider items verbatim, an edited part keeps its item's identity, and
 //! everything else is rebuilt from the shared fields.
 
-use std::collections::HashMap;
+use std::collections::HashSet;
 
 use serde::Serialize;
 use serde_json::{Map, Value, json};
@@ -180,8 +180,9 @@ fn result_output(output: &Output) -> Result<Value, Error> {
 /// item, so reasoning without its ciphertext is left out, and the part after
 /// it is rebuilt with no item id, as another model's turn is.
 fn input(messages: &[Message], stateless: bool) -> Result<Vec<Value>, Error> {
-    // Whether each call id the request sends is a custom call.
-    let mut custom = HashMap::<SmolStr, bool>::new();
+    // The call ids the request sends as custom calls: a set, as prepare
+    // keeps one, so the two share their code.
+    let mut custom = HashSet::<SmolStr>::new();
     let mut items = Vec::new();
     let message = |role: &str, part: Value| {
         let mut message = json!({"type": ItemType::Message, "role": role});
@@ -212,13 +213,10 @@ fn input(messages: &[Message], stateless: bool) -> Result<Vec<Value>, Error> {
             Message::Tool(tool) => {
                 for result in &tool.results {
                     let (id, output) = (&result.id, result_output(&result.output)?);
-                    let mut item = match custom.get(id) {
-                        Some(true) => {
-                            json!({"type": ItemType::CustomToolCallOutput, "call_id": id})
-                        }
-                        _ => {
-                            json!({"type": ItemType::FunctionCallOutput, "call_id": id, "status": Status::Completed})
-                        }
+                    let mut item = if custom.contains(id) {
+                        json!({"type": ItemType::CustomToolCallOutput, "call_id": id})
+                    } else {
+                        json!({"type": ItemType::FunctionCallOutput, "call_id": id, "status": Status::Completed})
                     };
                     item["output"] = output;
                     items.push(item);
@@ -250,7 +248,11 @@ fn input(messages: &[Message], stateless: bool) -> Result<Vec<Value>, Error> {
                 continue;
             }
             if let AssistantPart::ToolCall(call) = part {
-                custom.insert(call.id.clone(), kind == Some(ItemType::CustomToolCall));
+                if kind == Some(ItemType::CustomToolCall) {
+                    custom.insert(call.id.clone());
+                } else {
+                    custom.remove(&call.id);
+                }
             }
             let kept = match sent {
                 Replay::Item(item) => {
