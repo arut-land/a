@@ -222,7 +222,7 @@ struct Queue {
     next: u64,
     pending: Vec<Entry>,
     /// Flushes waiting for every entry up to a seq to commit.
-    flushes: Vec<(u64, rt::channel::Sender<io::Result<()>>)>,
+    flushes: Vec<(u64, rt::oneshot::Sender<io::Result<()>>)>,
     draining: bool,
 }
 
@@ -673,14 +673,13 @@ impl Session {
             if queue.pending.is_empty() && !queue.draining {
                 return Ok(());
             }
-            let (tx, rx) = rt::channel::bounded(1);
+            let (tx, rx) = rt::oneshot::channel();
             let upto = queue.next;
             queue.flushes.push((upto, tx));
             self.drain_in(&mut queue);
             rx
         };
-        rx.recv()
-            .await
+        rx.await
             .unwrap_or_else(|| Err(io::Error::other("the log writer stopped")))
     }
 
@@ -731,7 +730,7 @@ impl Session {
                     Err(e) => Err(io::Error::new(e.kind(), e.to_string())),
                     Ok(()) => Err(io::Error::other("an earlier entry failed to commit")),
                 };
-                drop(tx.send(done));
+                tx.send(done);
             }
         }
     }

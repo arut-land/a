@@ -6,7 +6,7 @@
 use std::future::poll_fn;
 use std::io::{self, Read, Write};
 use std::net::{Shutdown, TcpStream};
-use std::pin::pin;
+use std::pin::{Pin, pin};
 use std::sync::{Arc, Mutex, PoisonError};
 use std::task::Poll;
 use std::time::{Duration, Instant};
@@ -17,7 +17,7 @@ use http::header::{
 };
 use http::{HeaderMap, HeaderValue, Request, Response, StatusCode};
 use rt::Rt;
-use rt::channel::Receiver;
+use rt::oneshot::{self, Receiver};
 
 use crate::app::{App, Live};
 
@@ -363,7 +363,7 @@ fn read_request(mut stream: &TcpStream) -> io::Result<Request<Vec<u8>>> {
 /// on its next write.
 fn closed(rt: &Rt, stream: &TcpStream) -> io::Result<Receiver<()>> {
     let mut probe = stream.try_clone()?;
-    let (tx, rx) = rt::channel::bounded(1);
+    let (tx, rx) = oneshot::channel();
     rt.spawn_blocking(Box::new(move || {
         // One request per connection: anything read now is the end.
         let _ = probe.read(&mut [0; 1]);
@@ -412,7 +412,7 @@ async fn send_whole(
 /// Writes each batch of events as soon as `live` has it, until it ends or
 /// the browser goes away. The body runs to the end of the connection.
 async fn send_events(rt: &Rt, stream: &Arc<TcpStream>, mut live: Box<Live>) -> io::Result<()> {
-    let closed = closed(rt, stream)?;
+    let mut closed = closed(rt, stream)?;
     let mut headers = HeaderMap::new();
     headers.insert(CONTENT_TYPE, HeaderValue::from_static("text/event-stream"));
     let mut bytes = head(StatusCode::OK, &headers);
@@ -422,7 +422,7 @@ async fn send_events(rt: &Rt, stream: &Arc<TcpStream>, mut live: Box<Live>) -> i
         let next = {
             let mut events = pin!(live.next());
             poll_fn(|cx| {
-                if closed.poll_recv(cx).is_ready() {
+                if Pin::new(&mut closed).poll(cx).is_ready() {
                     return Poll::Ready(None);
                 }
                 events.as_mut().poll(cx)
