@@ -14,7 +14,6 @@
 //!   never finished, is incomplete.
 
 use std::borrow::Cow;
-use std::collections::BTreeMap;
 
 use serde_json::{Map, Value};
 
@@ -107,22 +106,22 @@ pub struct End {
 pub struct Writer {
     key: &'static str,
     out: Vec<Event>,
-    open: BTreeMap<usize, Draft>,
+    /// The open items by wire index. A reply holds few at once, and a list
+    /// costs less code than a map, as for the lists below.
+    open: Vec<(usize, Draft)>,
     /// The part each wire index last closed, whose item may still be edited.
     /// A reply holds few, and a list costs less code than a map.
     ended: Vec<(usize, u32)>,
-    /// Provider items of parts that closed, by part, with the fingerprint of
-    /// the shared fields they were decoded to.
-    items: BTreeMap<u32, (Value, String)>,
-    /// Opaque parts and whether they replay.
-    opaque: BTreeMap<u32, bool>,
+    /// Provider items of parts that closed, in part order.
+    items: Vec<Kept>,
     /// Every part emitted, in emission order.
     parts: Vec<u32>,
     next_part: u32,
     /// The ids calls ended with, each once.
     call_ids: Vec<SmolStr>,
     next_auto: usize,
-    by_index: Option<BTreeMap<u32, usize>>,
+    /// Each part's wire index, in part order.
+    by_index: Option<Vec<(u32, usize)>>,
     lead: Option<u32>,
     first_incomplete: Option<u32>,
     /// Whether a call item holds its id in a slot replay can fill, so a call
@@ -130,6 +129,16 @@ pub struct Writer {
     call_id_slot: bool,
     /// Seeds the ids the writer issues.
     ids: u64,
+}
+
+/// The provider item a closed part keeps, with the fingerprint of the
+/// shared fields it was decoded to and, for an opaque part, whether it
+/// replays.
+struct Kept {
+    part: u32,
+    item: Value,
+    fp: String,
+    replay: Option<bool>,
 }
 
 struct Draft {
@@ -254,10 +263,9 @@ impl Writer {
         Self {
             key,
             out: Vec::new(),
-            open: BTreeMap::new(),
+            open: Vec::new(),
             ended: Vec::new(),
-            items: BTreeMap::new(),
-            opaque: BTreeMap::new(),
+            items: Vec::new(),
             parts: Vec::new(),
             next_part: 0,
             call_ids: Vec::new(),
@@ -290,7 +298,7 @@ impl Writer {
     /// Order the message's parts by wire index rather than by when they
     /// opened, for a wire whose end may state items it never streamed.
     pub fn order_by_index(&mut self) {
-        self.by_index.get_or_insert_with(BTreeMap::new);
+        self.by_index.get_or_insert_with(Vec::new);
     }
 
     /// Hold the open item at `index` first in the message.
@@ -301,12 +309,37 @@ impl Writer {
     }
 
     fn draft(&mut self, index: usize) -> Result<&mut Draft, Error> {
-        self.open.get_mut(&index).ok_or_else(|| not_open(index))
+        find(&mut self.open, index).ok_or_else(|| not_open(index))
+    }
+
+    fn get(&self, index: usize) -> Option<&Draft> {
+        let mut open = self.open.iter();
+        open.find(|(at, _)| *at == index).map(|(_, draft)| draft)
+    }
+
+    fn take(&mut self, index: usize) -> Option<Draft> {
+        let at = self.open.iter().position(|(at, _)| *at == index)?;
+        Some(self.open.swap_remove(at).1)
+    }
+
+    /// Keep `item` for `part`, in part order.
+    fn keep(&mut self, part: u32, item: Value, fp: String, replay: Option<bool>) {
+        let at = self.items.partition_point(|kept| kept.part < part);
+        let kept = Kept {
+            part,
+            item,
+            fp,
+            replay,
+        };
+        match self.items.get_mut(at) {
+            Some(held) if held.part == part => *held = kept,
+            _ => self.items.insert(at, kept),
+        }
     }
 
     /// Whether an item opened at `index`, closed since or not.
     pub fn opened(&self, index: usize) -> bool {
-        self.open.contains_key(&index) || self.closed(index).is_some()
+        self.get(index).is_some() || self.closed(index).is_some()
     }
 
     /// The part wire `index` last closed.
@@ -318,7 +351,7 @@ impl Writer {
     /// The text, reasoning or argument JSON the open item at `index` holds
     /// so far; `None` for an item of none.
     pub fn text(&self, index: usize) -> Option<&str> {
-        match &self.open.get(&index)?.body {
+        match &self.get(index)?.body {
             Body::Text(text) | Body::Reasoning { text, .. } => Some(text),
             Body::Call { arguments, .. } => Some(&arguments.text),
             Body::Opaque { .. } | Body::Media(_) => None,
@@ -328,7 +361,7 @@ impl Writer {
     /// What the open call at `index` holds so far: its id and tool name
     /// once stated, and its argument JSON.
     pub fn call(&self, index: usize) -> Option<CallFragment<'_>> {
-        match &self.open.get(&index)?.body {
+        match &self.get(index)?.body {
             Body::Call {
                 id,
                 name,
@@ -346,7 +379,7 @@ impl Writer {
     /// first event states it, the base its deltas merge into; `Null` when
     /// the part keeps no provider item.
     pub fn open(&mut self, index: usize, block: Open, item: Value) -> Result<(), Error> {
-        if self.open.contains_key(&index) {
+        if self.get(index).is_some() {
             return Err(Error::decode(
                 format!("the reply opened item {index} twice"),
                 "",
@@ -362,7 +395,7 @@ impl Writer {
         let part = self.next_part;
         self.next_part += 1;
         if let Some(by_index) = &mut self.by_index {
-            by_index.insert(part, index);
+            by_index.push((part, index));
         }
         let draft = Draft {
             part,
@@ -371,7 +404,7 @@ impl Writer {
             body,
             restated: false,
         };
-        self.open.insert(index, draft);
+        self.open.push((index, draft));
     }
 
     /// A part joins the message and opens to the consumer.
@@ -435,13 +468,13 @@ impl Writer {
     /// whole item the provider restates when it finishes. An index whose
     /// part already closed edits that part's item until the reply ends.
     pub fn edit(&mut self, index: usize, edit: impl FnOnce(&mut Value)) -> Result<(), Error> {
-        if let Some(draft) = self.open.get_mut(&index) {
+        if let Some(draft) = find(&mut self.open, index) {
             edit(&mut draft.item);
             return Ok(());
         }
         let part = self.closed(index).ok_or_else(|| not_open(index))?;
-        if let Some((item, _)) = self.items.get_mut(&part) {
-            edit(item);
+        if let Some(kept) = self.items.iter_mut().find(|kept| kept.part == part) {
+            edit(&mut kept.item);
         }
         Ok(())
     }
@@ -511,7 +544,7 @@ impl Writer {
     pub fn fragment(&mut self, index: usize, fragment: CallFragment<'_>) -> Result<(), Error> {
         let new_id = fragment.id.filter(|id| stated(id));
         self.take_over(index, new_id, fragment.name)?;
-        if !self.open.contains_key(&index) {
+        if self.get(index).is_none() {
             let body = Body::Call {
                 id: None,
                 name: SmolStr::default(),
@@ -553,7 +586,7 @@ impl Writer {
         name: Option<&str>,
     ) -> Result<(), Error> {
         let names = name.is_some_and(|name| !name.is_empty());
-        let held = self.open.get(&index).and_then(|draft| match &draft.body {
+        let held = self.get(index).and_then(|draft| match &draft.body {
             Body::Call {
                 id: Some(id),
                 arguments,
@@ -563,8 +596,8 @@ impl Writer {
         });
         if let Some(complete) = held.filter(|complete| *complete || names) {
             let moved = self.fresh_index();
-            if let Some(draft) = self.open.remove(&index) {
-                self.open.insert(moved, draft);
+            if let Some(slot) = self.open.iter_mut().find(|(at, _)| *at == index) {
+                slot.0 = moved;
             }
             self.close_item(moved, complete)?;
         }
@@ -581,7 +614,7 @@ impl Writer {
                 name, arguments, ..
             },
             ..
-        }) = self.open.get_mut(&index)
+        }) = find(&mut self.open, index)
         else {
             return;
         };
@@ -658,7 +691,7 @@ impl Writer {
         let (id, item) = self.distinct_call_id(id, item);
         if !item.is_null() {
             let fp = fingerprint(Canon::Call(name, &input));
-            self.items.insert(part, (item, fp));
+            self.keep(part, item, fp, None);
         }
         self.out.push(Event::End {
             index: part,
@@ -681,7 +714,7 @@ impl Writer {
             item,
             body,
             restated,
-        } = self.open.remove(&index).ok_or_else(|| not_open(index))?;
+        } = self.take(index).ok_or_else(|| not_open(index))?;
         self.ended.retain(|(at, _)| *at != index);
         self.ended.push((index, part));
         let item = match (complete, &body) {
@@ -702,8 +735,7 @@ impl Writer {
             }
             Body::Reasoning { text, redacted } => (Block::Reasoning, redacted, text),
             Body::Opaque { replay } => {
-                self.opaque.insert(part, replay && complete);
-                self.items.insert(part, (item, String::new()));
+                self.keep(part, item, String::new(), Some(replay && complete));
                 self.whole_part(part, AssistantPart::Opaque(Opaque::default()));
                 return Ok(());
             }
@@ -711,7 +743,7 @@ impl Writer {
                 // An image may carry state its producer replays (Gemini's
                 // thought signature); nothing else about it can go stale.
                 if !item.is_null() {
-                    self.items.insert(part, (item, String::new()));
+                    self.keep(part, item, String::new(), None);
                 }
                 self.whole_part(part, AssistantPart::Media(media));
                 return Ok(());
@@ -730,7 +762,7 @@ impl Writer {
                 Block::Reasoning => Canon::Reasoning(&text, redacted),
                 _ => Canon::Text(&text),
             };
-            self.items.insert(part, (item, fingerprint(canon)));
+            self.keep(part, item, fingerprint(canon), None);
         }
         if !started {
             self.start(part, block, None);
@@ -752,10 +784,10 @@ impl Writer {
     pub fn end(&mut self, end: End) -> Result<Flow, Error> {
         let unfinished_call = self
             .open
-            .values()
-            .any(|draft| matches!(draft.body, Body::Call { .. }));
+            .iter()
+            .any(|(_, draft)| matches!(draft.body, Body::Call { .. }));
         // What is still open closes in the order it opened.
-        let first_open = |open: &BTreeMap<usize, Draft>| {
+        let first_open = |open: &[(usize, Draft)]| {
             let first = open.iter().min_by_key(|(_, draft)| draft.part);
             first.map(|(index, _)| *index)
         };
@@ -781,8 +813,13 @@ impl Writer {
             });
         }
         let canonical_from = self.first_incomplete.unwrap_or(u32::MAX);
-        for (part, (item, fp)) in std::mem::take(&mut self.items) {
-            let replay = self.opaque.get(&part).copied();
+        for Kept {
+            part,
+            item,
+            fp,
+            replay,
+        } in std::mem::take(&mut self.items)
+        {
             if part >= canonical_from && replay.is_none() {
                 continue;
             }
@@ -834,7 +871,10 @@ impl Writer {
         if let Some(by_index) = &self.by_index {
             // Sorting keys in their natural order compiles to a fraction of
             // a sort by a key function.
-            let index = |part: &u32| by_index.get(part).copied().unwrap_or(usize::MAX);
+            let index = |part: &u32| {
+                let at = by_index.binary_search_by_key(part, |(part, _)| *part);
+                at.map_or(usize::MAX, |at| by_index[at].1)
+            };
             let mut keyed: Vec<(usize, u32)> =
                 parts.iter().map(|part| (index(part), *part)).collect();
             keyed.sort_unstable();
@@ -848,6 +888,12 @@ impl Writer {
         }
         (!parts.is_sorted()).then_some(parts)
     }
+}
+
+/// The open item at wire `index` in `open`.
+fn find(open: &mut [(usize, Draft)], index: usize) -> Option<&mut Draft> {
+    let mut open = open.iter_mut();
+    open.find(|(at, _)| *at == index).map(|(_, draft)| draft)
 }
 
 /// `delta` merged into `item`: each string field but `type` appends to the
