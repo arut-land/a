@@ -93,6 +93,105 @@ pub fn read_exact_at(file: &File, buf: &mut [u8], offset: u64) -> io::Result<()>
     }
 }
 
+/// A handle that turns readable when the file it watches is written to,
+/// so a reader following the file learns of new bytes without polling: an
+/// inotify instance on Linux, a kqueue of its own elsewhere on Unix.
+/// Readiness is an edge; [`WriteWatch::clear`] takes what was seen, before
+/// the file is read, so a write meanwhile is the next edge.
+#[cfg(unix)]
+pub struct WriteWatch {
+    fd: std::os::fd::OwnedFd,
+    /// What a kqueue watches: the file itself, open for as long as the
+    /// watch is.
+    #[cfg(not(target_os = "linux"))]
+    _file: File,
+}
+
+#[cfg(unix)]
+impl std::os::fd::AsFd for WriteWatch {
+    fn as_fd(&self) -> std::os::fd::BorrowedFd<'_> {
+        self.fd.as_fd()
+    }
+}
+
+/// Watches `path` for writes.
+#[cfg(target_os = "linux")]
+pub fn write_watch(path: &Path) -> io::Result<WriteWatch> {
+    use rustix::fs::inotify;
+    let fd = inotify::init(inotify::CreateFlags::CLOEXEC | inotify::CreateFlags::NONBLOCK)?;
+    inotify::add_watch(&fd, path, inotify::WatchFlags::MODIFY)?;
+    Ok(WriteWatch { fd })
+}
+
+/// Watches `path` for writes.
+#[cfg(all(unix, not(target_os = "linux")))]
+pub fn write_watch(path: &Path) -> io::Result<WriteWatch> {
+    use std::os::fd::AsRawFd;
+
+    use rustix::event::kqueue::{Event, EventFilter, EventFlags, VnodeEvents, kevent, kqueue};
+    let file = File::open(path)?;
+    let fd = kqueue()?;
+    let watch = [Event::new(
+        EventFilter::Vnode {
+            vnode: file.as_raw_fd(),
+            flags: VnodeEvents::WRITE | VnodeEvents::EXTEND,
+        },
+        EventFlags::ADD | EventFlags::CLEAR,
+        std::ptr::null_mut(),
+    )];
+    // SAFETY: the change names `file`, which the watch keeps open for as
+    // long as the queue is.
+    unsafe {
+        kevent(
+            &fd,
+            &watch,
+            &mut [] as &mut [Event],
+            Some(std::time::Duration::ZERO),
+        )
+    }?;
+    Ok(WriteWatch { fd, _file: file })
+}
+
+/// Not on Windows yet, where a reader polls.
+#[cfg(windows)]
+pub struct WriteWatch(std::convert::Infallible);
+
+/// Watches `path` for writes: not on Windows yet, where a reader polls.
+#[cfg(windows)]
+impl std::os::windows::io::AsHandle for WriteWatch {
+    fn as_handle(&self) -> std::os::windows::io::BorrowedHandle<'_> {
+        match self.0 {}
+    }
+}
+
+#[cfg(windows)]
+pub fn write_watch(_path: &Path) -> io::Result<WriteWatch> {
+    Err(io::ErrorKind::Unsupported.into())
+}
+
+impl WriteWatch {
+    /// Takes the writes seen so far, without waiting.
+    pub fn clear(&self) {
+        #[cfg(windows)]
+        match self.0 {}
+        #[cfg(target_os = "linux")]
+        {
+            let mut buf = [0; 1024];
+            while matches!(rustix::io::read(&self.fd, &mut buf), Ok(n) if n > 0) {}
+        }
+        #[cfg(all(unix, not(target_os = "linux")))]
+        {
+            use std::mem::MaybeUninit;
+
+            use rustix::event::kqueue::{Event, kevent};
+            let mut events = [const { MaybeUninit::<Event>::uninit() }; 4];
+            // SAFETY: nothing is changed; the one event watched names the
+            // file this watch keeps open.
+            let _ = unsafe { kevent(&self.fd, &[], &mut events, Some(std::time::Duration::ZERO)) };
+        }
+    }
+}
+
 #[cfg(all(test, unix))]
 mod tests {
     use std::os::unix::fs::PermissionsExt;
@@ -125,5 +224,31 @@ mod tests {
         );
         sync_dir(&dir).unwrap();
         fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn a_write_watch_turns_readable_on_each_write() {
+        use std::io::Write;
+
+        use rustix::event::{PollFd, PollFlags, Timespec, poll};
+        let path = std::env::temp_dir().join(format!("a-sys-watch-{}", std::process::id()));
+        let mut file = File::create(&path).unwrap();
+        let watch = write_watch(&path).unwrap();
+        let readable = |ms: i64| {
+            let timeout = Timespec {
+                tv_sec: 0,
+                tv_nsec: ms * 1_000_000,
+            };
+            let mut fds = [PollFd::new(&watch, PollFlags::IN)];
+            poll(&mut fds, Some(&timeout)).unwrap() == 1
+        };
+        assert!(!readable(20), "nothing written yet");
+        for _ in 0..2 {
+            file.write_all(b"more\n").unwrap();
+            assert!(readable(1000), "a write is seen");
+            watch.clear();
+            assert!(!readable(20), "what was seen is taken");
+        }
+        fs::remove_file(&path).unwrap();
     }
 }

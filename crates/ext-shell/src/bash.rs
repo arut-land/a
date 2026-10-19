@@ -8,9 +8,16 @@
 //! kept as the `shell` extension's `cwd` state, so `cd` persists across
 //! calls and restarts. A session runs its calls one at a time, so commands
 //! never race each other for that directory.
+//!
+//! Its output goes to a file in the session's spill directory as it runs,
+//! never through the daemon's memory: the supervisor follows the file,
+//! woken by its writes, keeping only what the model is shown, and the file
+//! is kept as the whole output when that was cut. A command whose output
+//! passes [`OUTPUT_CAP`] is stopped.
 
 use std::collections::BTreeMap;
 use std::fmt::Write as _;
+use std::fs::File;
 use std::future::{Future, poll_fn};
 use std::io::{self, Read};
 use std::path::{Path, PathBuf};
@@ -22,8 +29,10 @@ use std::time::{Duration, Instant};
 use protocol::{Card, Environment};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
+use sys::Signal;
 
-use crate::output::{Live, Output, Rendered, Spill, create_private, private_dir};
+pub use crate::output::OUTPUT_CAP;
+use crate::output::{Live, Output, Rendered, create_private, private_dir};
 use crate::state::Cwd;
 use ext::{Cx, Kill, SpawnSpec as Spawn, Tool};
 
@@ -38,6 +47,8 @@ const IDLE: Duration = Duration::from_millis(100);
 /// After the shell exits, the most the call waits for its output to end.
 const LINGER: Duration = Duration::from_secs(2);
 const TICK: Duration = Duration::from_millis(20);
+/// The most output read in one go, so a flood shares the reactor.
+const READ: u64 = 1 << 20;
 /// How often output is reported as it arrives: each report is committed,
 /// so this bounds how often a busy command syncs the log.
 const REPORT: Duration = Duration::from_millis(100);
@@ -73,6 +84,9 @@ pub struct Ran {
     pub timed_out: Option<u64>,
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub aborted: bool,
+    /// The limit, in bytes, its output ran past: it was stopped.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub flooded: Option<u64>,
     /// Where the command left off.
     pub cwd: PathBuf,
     pub duration_ms: u64,
@@ -173,6 +187,9 @@ fn note(ran: &Ran) -> String {
     if ran.aborted {
         note.push("aborted".to_owned());
     }
+    if let Some(limit) = ran.flooded {
+        note.push(format!("stopped past {} MiB of output", limit >> 20));
+    }
     match (&ran.background, &ran.signal, ran.exit) {
         (Some(job), ..) => note.push(format!("in the background, pgid {}", job.pgid)),
         (_, Some(signal), _) => note.push(format!("killed by {signal}")),
@@ -212,6 +229,9 @@ fn model_text(ran: &Ran) -> String {
     if let Some(limit) = ran.timed_out {
         trailer(format!("[timed out after {limit}s]"));
     }
+    if let Some(limit) = ran.flooded {
+        trailer(format!("[stopped: its output passed {} MiB]", limit >> 20));
+    }
     match (&ran.signal, ran.exit) {
         (Some(signal), _) => trailer(format!("[killed by signal: {signal}]")),
         (None, Some(code)) => trailer(format!("[exit code: {code}]")),
@@ -238,19 +258,21 @@ async fn run(input: Command, cx: &Cx) -> io::Result<Ran> {
     }
     let report = cx.spill.join(format!("{}.cwd", cx.call));
     let spawn = spawn(cx, &input.command, &dir, env, Some(&report))?;
-    let (reader, writer) = io::pipe()?;
+    // Both streams share the one file, and its offset: in the order written.
+    let (file, log) = create_private(&log)?;
     let child = {
         let mut cmd = process(&spawn);
-        cmd.stdout(writer.try_clone()?).stderr(writer);
-        // Dropping `cmd` closes our copies of the write end, so the pipe
-        // ends when the command's processes close theirs.
+        cmd.stdout(file.try_clone()?).stderr(file);
         cmd.spawn()?
     };
     let pgid = child.id();
     cx.spawned(pgid, false);
     let limit = input.timeout.unwrap_or(TIMEOUT).clamp(1, MAX_TIMEOUT);
-    let output = Output::new(Spill::new(log));
-    let done = supervise(child, reader, Duration::from_secs(limit), cx, output).await?;
+    let done = supervise(child, &log, Duration::from_secs(limit), cx).await?;
+    // The file is kept as the whole output only when the model saw less.
+    if done.output.full.is_none() {
+        let _ = std::fs::remove_file(&log);
+    }
 
     let ended = std::fs::read_to_string(&report).ok();
     let _ = std::fs::remove_file(&report);
@@ -272,10 +294,11 @@ async fn run(input: Command, cx: &Cx) -> io::Result<Ran> {
         full,
     } = done.output;
     Ok(Ran {
-        exit: done.status.and_then(|s| s.code()),
-        signal: done.status.and_then(sys::exit_signal),
+        exit: done.status.code(),
+        signal: sys::exit_signal(done.status),
         timed_out: (done.stopped == Some(Stop::TimedOut)).then_some(limit),
         aborted: done.stopped == Some(Stop::Aborted),
+        flooded: (done.stopped == Some(Stop::Flooded)).then_some(OUTPUT_CAP),
         cwd,
         duration_ms: duration_ms(started),
         output: text,
@@ -403,144 +426,254 @@ fn duration_ms(started: Instant) -> u64 {
     u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX)
 }
 
+/// Why a command was stopped.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum Stop {
     TimedOut,
     Aborted,
+    /// Its output passed [`OUTPUT_CAP`].
+    Flooded,
+}
+
+/// Where a command stands, as its supervisor drives it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Run {
+    /// The shell runs, until `deadline`.
+    Running { deadline: Instant },
+    /// It is being stopped, for `why`.
+    Stopping { why: Stop, kill: KillPhase },
+    /// The shell exited `at`; what it left running may still write.
+    Exited {
+        status: ExitStatus,
+        why: Option<Stop>,
+        at: Instant,
+    },
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum KillPhase {
+    /// SIGTERM went to the group `at`; SIGKILL follows a grace later.
+    Term {
+        at: Instant,
+    },
+    Killed,
+}
+
+/// What the supervisor saw since its last step.
+#[derive(Clone, Copy, Debug, Default)]
+struct Seen {
+    exited: Option<ExitStatus>,
+    cancelled: bool,
+    flooded: bool,
+}
+
+impl Run {
+    /// The next state at `now`, and the signal to send the group to get
+    /// there. The shell's exit ends any state but its own; a stop starts
+    /// only while it runs.
+    fn step(self, now: Instant, seen: Seen) -> (Self, Option<Signal>) {
+        match (self, seen.exited) {
+            (Self::Running { .. }, Some(status)) => {
+                let why = None;
+                (
+                    Self::Exited {
+                        status,
+                        why,
+                        at: now,
+                    },
+                    None,
+                )
+            }
+            (Self::Stopping { why, .. }, Some(status)) => {
+                let why = Some(why);
+                (
+                    Self::Exited {
+                        status,
+                        why,
+                        at: now,
+                    },
+                    None,
+                )
+            }
+            (Self::Running { deadline }, None) => {
+                let why = if seen.cancelled {
+                    Stop::Aborted
+                } else if seen.flooded {
+                    Stop::Flooded
+                } else if now >= deadline {
+                    Stop::TimedOut
+                } else {
+                    return (self, None);
+                };
+                let kill = KillPhase::Term { at: now };
+                (Self::Stopping { why, kill }, Some(Signal::Terminate))
+            }
+            (
+                Self::Stopping {
+                    why,
+                    kill: KillPhase::Term { at },
+                },
+                None,
+            ) if now >= at + Kill::GRACE => {
+                let kill = KillPhase::Killed;
+                (Self::Stopping { why, kill }, Some(Signal::Kill))
+            }
+            (Self::Exited { .. }, _) | (Self::Stopping { .. }, None) => (self, None),
+        }
+    }
+
+    /// When it must step next if nothing happens first, given that the
+    /// output was last heard `heard`; `None` for never.
+    fn deadline(self, heard: Instant) -> Option<Instant> {
+        match self {
+            Self::Running { deadline } => Some(deadline),
+            Self::Stopping {
+                kill: KillPhase::Term { at },
+                ..
+            } => Some(at + Kill::GRACE),
+            Self::Stopping { .. } => None,
+            Self::Exited { at, .. } => Some((heard.max(at) + IDLE).min(at + LINGER)),
+        }
+    }
 }
 
 struct Finished {
-    status: Option<ExitStatus>,
+    status: ExitStatus,
     stopped: Option<Stop>,
     lingering: bool,
     output: Rendered,
 }
 
-/// Reads the command's output until it ends, reporting it as it comes and
-/// stopping the command when it runs out of time or the call is cancelled.
-/// It waits, as a task on the reactor, for whichever comes first of
-/// output, the shell's exit, a cancel and the next deadline: a quiet
-/// command costs no thread and no wake-up while it runs.
-async fn supervise(
-    mut child: Child,
-    reader: io::PipeReader,
-    limit: Duration,
-    cx: &Cx,
-    mut output: Output,
-) -> io::Result<Finished> {
+/// Follows the command's output in `log` until it ends, reporting it as it
+/// comes and stopping the command when it runs out of time, writes too
+/// much or the call is cancelled. It waits, as a task on the reactor, for
+/// whichever comes first of a write, the shell's exit, a cancel and the
+/// next deadline: a quiet command costs no thread and no wake-up while it
+/// runs. Once the shell has exited, the output has ended when nothing of
+/// its group is left to write, or it has paused [`IDLE`], or after
+/// [`LINGER`].
+async fn supervise(mut child: Child, log: &Path, limit: Duration, cx: &Cx) -> io::Result<Finished> {
     let pgid = child.id();
-    let pipe = rt::Async::for_reading(reader)?;
-    // Where the exit cannot be watched (a kernel without pidfds), it is
-    // looked for every tick.
+    let mut file = File::open(log)?;
+    // Where writes or the exit cannot be watched, they are looked for
+    // every tick.
+    let written = sys::write_watch(log).and_then(rt::Async::for_reading).ok();
     let exit = sys::exit_watch(pgid).and_then(rt::Async::for_reading).ok();
     let mut buf = vec![0; 64 * 1024];
-    let mut live = Live::default();
-    let started = Instant::now();
-    let mut kill = Kill::new(pgid);
-    let mut killing: Option<Instant> = None;
-    let (mut status, mut stopped, mut eof, mut exit_seen) = (None, None, false, false);
-    let mut exited: Option<Instant> = None;
-    let mut heard = Instant::now();
-    let mut reported = Instant::now();
-    let mut unreported = false;
+    let (mut output, mut live) = (Output::default(), Live::default());
+    let start = cx.rt.now();
+    let mut run = Run::Running {
+        deadline: start + limit,
+    };
+    let (mut heard, mut reported) = (start, start);
+    let (mut unreported, mut behind, mut exit_seen) = (false, false, false);
     loop {
-        let next = match exited {
-            Some(at) => (heard.max(at) + IDLE).min(at + LINGER),
-            None if exit.is_none() || exit_seen => Instant::now() + TICK,
-            None => match stopped {
-                Some(_) => killing.unwrap_or(started + Duration::from_secs(MAX_TIMEOUT * 2)),
-                None => started + limit,
-            },
-        };
-        let next = if unreported {
-            next.min(reported + REPORT)
-        } else {
-            next
-        };
-        let wait = next.saturating_duration_since(Instant::now());
-        if !wait.is_zero() {
-            let readable = when(!eof, pipe.readable());
-            let watched = exit.as_ref().filter(|_| status.is_none() && !exit_seen);
+        let now = cx.rt.now();
+        let exited = matches!(run, Run::Exited { .. });
+        let unwatched = written.is_none() || (!exited && (exit.is_none() || exit_seen));
+        let next = [
+            run.deadline(heard),
+            unwatched.then_some(now + TICK),
+            unreported.then_some(reported + REPORT),
+        ]
+        .into_iter()
+        .flatten()
+        .min();
+        let wait = next.map(|at| at.saturating_duration_since(now));
+        if !behind && wait.is_none_or(|wait| !wait.is_zero()) {
+            let writes = when(written.is_some(), async {
+                if let Some(written) = &written {
+                    written.readable().await;
+                }
+            });
+            let watched = exit.as_ref().filter(|_| !exited && !exit_seen);
             let exits = when(watched.is_some(), async {
                 if let Some(exit) = watched {
                     exit.readable().await;
                 }
             });
-            let cancelled = when(stopped.is_none(), cx.cancel.cancelled());
-            let woke = first([
-                pin!(readable),
-                pin!(exits),
-                pin!(cancelled),
-                pin!(cx.rt.sleep(wait)),
-            ])
-            .await;
+            let running = matches!(run, Run::Running { .. });
+            let cancelled = when(running, cx.cancel.cancelled());
+            let sleep = when(wait.is_some(), cx.rt.sleep(wait.unwrap_or_default()));
+            let woke = first([pin!(writes), pin!(exits), pin!(cancelled), pin!(sleep)]).await;
             exit_seen |= woke == 1;
         }
-        eof |= drain(&pipe, &mut buf, |chunk| {
+        // Taken before reading, so a write meanwhile is the next edge.
+        if let Some(written) = &written {
+            written.get_ref().clear();
+        }
+        let read = follow(&mut file, &mut buf, READ, |chunk| {
             output.push(chunk);
             live.push(chunk);
-            heard = Instant::now();
+        })?;
+        behind = read == READ;
+        let now = cx.rt.now();
+        if read > 0 {
+            heard = now;
             unreported = true;
-        });
-        if unreported && reported.elapsed() >= REPORT {
+        }
+        if unreported && now >= reported + REPORT {
             unreported = false;
             if let Some(text) = live.take() {
                 cx.progress(&text);
-                reported = Instant::now();
+                reported = now;
             }
         }
-        if status.is_none() {
-            status = child.try_wait()?;
-            if status.is_some() {
-                exited = Some(Instant::now());
+        let seen = Seen {
+            exited: if exited { None } else { child.try_wait()? },
+            cancelled: cx.cancel.is_cancelled(),
+            flooded: output.bytes() > OUTPUT_CAP,
+        };
+        let signal;
+        (run, signal) = run.step(now, seen);
+        if let Some(signal) = signal {
+            let _ = sys::Group(pgid).signal(signal);
+        }
+        if let Run::Exited { status, why, at } = run {
+            let quiet = now >= heard.max(at) + IDLE;
+            if !behind && (!sys::Group(pgid).alive() || quiet || now >= at + LINGER) {
+                // What was written meanwhile, up to the cap.
+                let rest = OUTPUT_CAP.saturating_sub(output.bytes());
+                follow(&mut file, &mut buf, rest, |chunk| output.push(chunk))?;
+                let mut lingering = sys::Group(pgid).alive();
+                // A command that was stopped leaves nothing behind.
+                if lingering && why.is_some() {
+                    let _ = sys::Group(pgid).kill();
+                    lingering = false;
+                }
+                return Ok(Finished {
+                    status,
+                    stopped: why,
+                    lingering,
+                    output: output.finish(log),
+                });
             }
-        }
-        if let Some(at) = exited {
-            let quiet = heard.max(at).elapsed() >= IDLE;
-            if eof || quiet || at.elapsed() >= LINGER {
-                break;
-            }
-            continue;
-        }
-        if stopped.is_none() {
-            stopped = if cx.cancel.is_cancelled() {
-                Some(Stop::Aborted)
-            } else if started.elapsed() >= limit {
-                Some(Stop::TimedOut)
-            } else {
-                None
-            };
-        }
-        if stopped.is_some() && killing.is_none_or(|at| Instant::now() >= at) {
-            killing = kill.tick();
         }
     }
-    drain(&pipe, &mut buf, |chunk| output.push(chunk));
-    let mut lingering = sys::Group(pgid).alive();
-    // A command that was stopped leaves nothing behind.
-    if lingering && stopped.is_some() {
-        kill.now();
-        lingering = false;
-    }
-    Ok(Finished {
-        status,
-        stopped,
-        lingering,
-        output: output.finish(),
-    })
 }
 
-/// Reads what the pipe has without waiting, handing each chunk to
-/// `chunk`; whether it ended.
-fn drain(pipe: &rt::Async<io::PipeReader>, buf: &mut [u8], mut chunk: impl FnMut(&[u8])) -> bool {
-    loop {
-        match { pipe.get_ref() }.read(buf) {
-            Ok(0) => return true,
-            Ok(n) => chunk(&buf[..n]),
+/// Reads what `file` has past where it was last read, up to `most` bytes,
+/// handing each chunk to `chunk`; how many bytes it read.
+fn follow(
+    file: &mut File,
+    buf: &mut [u8],
+    most: u64,
+    mut chunk: impl FnMut(&[u8]),
+) -> io::Result<u64> {
+    let mut read = 0;
+    while read < most {
+        let room = usize::try_from(most - read).map_or(buf.len(), |left| left.min(buf.len()));
+        match file.read(&mut buf[..room]) {
+            Ok(0) => break,
+            Ok(n) => {
+                chunk(&buf[..n]);
+                read += n as u64;
+            }
             Err(e) if e.kind() == io::ErrorKind::Interrupted => {}
-            Err(e) => return e.kind() != io::ErrorKind::WouldBlock,
+            Err(e) => return Err(e),
         }
     }
+    Ok(read)
 }
 
 /// `future`, or one that never resolves when `cond` does not hold.

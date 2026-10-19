@@ -30,7 +30,7 @@ use std::path::{Path, PathBuf};
 pub use awake::Awake;
 pub use config::Config;
 pub use endpoint::{Endpoint, Listener, Stream};
-pub use fs::{read_exact_at, sync_data};
+pub use fs::{read_exact_at, sync_data, write_watch};
 pub use login::login_env;
 pub use proc::{
     ExitWatch, Group, Pass, Passed, adopt_lock, boot_id, detach_session, exit_signal, exit_watch,
