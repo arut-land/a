@@ -99,6 +99,10 @@ impl Toolset {
 pub struct Command<'a>(&'a dyn DynCommand);
 
 impl Command<'_> {
+    pub fn name(&self) -> &str {
+        self.0.name()
+    }
+
     pub fn description(&self) -> &str {
         self.0.description()
     }
@@ -245,6 +249,11 @@ impl Registry {
 
     pub fn hooks(&self) -> &Hooks {
         &self.hooks
+    }
+
+    /// Every command, in registration order.
+    pub fn commands(&self) -> impl Iterator<Item = Command<'_>> {
+        self.commands.iter().map(|c| Command(&**c))
     }
 
     pub fn command(&self, name: &str) -> Option<Command<'_>> {

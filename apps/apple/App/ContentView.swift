@@ -10,10 +10,10 @@ struct ContentView: View {
                 .navigationSplitViewColumnWidth(min: 220, ideal: 260)
         } detail: {
             if let draft = model.draft {
-                ChatView(store: draft)
+                ChatView(store: draft, perform: model.perform)
                     .onChange(of: draft.sessionId) { model.adoptDraft() }
             } else if let id = model.selection, let store = model.stores[id] {
-                ChatView(store: store).id(id)
+                ChatView(store: store, perform: model.perform).id(id)
             } else if let problem = model.problem {
                 ContentUnavailableView(
                     "Cannot reach the daemon", systemImage: "exclamationmark.triangle",

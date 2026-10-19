@@ -3,7 +3,11 @@
 
 #[cfg(feature = "edit")]
 pub mod edit;
+// Commands are only supervised where processes have groups to stop (a
+// daemon runs nowhere else), so elsewhere most of this is unused.
+#[cfg_attr(not(unix), allow(dead_code))]
 mod output;
+#[cfg_attr(not(unix), allow(dead_code))]
 pub mod shell;
 
 #[cfg(any(test, feature = "fixtures"))]

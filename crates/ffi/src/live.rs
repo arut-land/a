@@ -1,5 +1,6 @@
-//! The daemon connection: staging the bundled `a`, listing sessions, and a
-//! session's attachment, folded through a [`Feed`]. The connection is
+//! The daemon connection: staging the bundled `a`, settings, the session
+//! list, and sessions, each the client SDK's (a [`client::SessionClient`]
+//! on a [`Driver`], published through a [`Feed`]). The connection is
 //! blocking I/O, so it runs on the `rt` runtime's blocking pool and the
 //! exported async methods only await it.
 
@@ -7,22 +8,20 @@ use std::collections::BTreeMap;
 use std::ffi::OsString;
 use std::io;
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
 use std::time::Duration;
 
 use boltffi::{EventSubscription, StreamProducer, export};
-use client::{Connection, Endpoint, Reader, Writer};
-use protocol::view::Link;
-use protocol::{ClientDecl, ClientMsg, DaemonMsg, Environment, SessionId, SettingsChange, Target};
-use rt::{Runtime, Threads};
+use client::{Attach, Cmd, Connection, Driver, Effect, Endpoint, Env, SessionClient};
+use protocol::{Environment, SessionId, SettingsChange, Target};
+use rt::Threads;
 use sys::install::CliLink;
 use sys::{Home, Staged};
 
 use crate::feed::{Feed, lock};
 use crate::{
-    CliStatus, ClientError, EnvVar, OpenTarget, Resync, SessionListUpdate, SessionSnapshot,
-    Settings, ViewChange, ViewUpdate,
+    AppAction, CliStatus, ClientError, CommandHelp, EnvVar, OpenTarget, Resync, SessionInfo,
+    SessionListUpdate, SessionSnapshot, Settings, TurnInfo, ViewUpdate,
 };
 
 fn runtime() -> &'static Threads {
@@ -79,30 +78,12 @@ struct Daemon {
 }
 
 impl Daemon {
-    fn connect(&self) -> io::Result<Connection> {
-        client::connect(&Endpoint::Local(self.home.clone()), &self.staged, &|| {})
+    fn endpoint(&self) -> Endpoint {
+        Endpoint::Local(self.home.clone())
     }
 
-    fn attach(
-        &self,
-        target: Target,
-        workspace: PathBuf,
-        env: Option<Environment>,
-        since: u64,
-    ) -> io::Result<Connection> {
-        let attach = ClientMsg::Attach {
-            target,
-            workspace,
-            since,
-            env,
-            decl: ClientDecl::default(),
-        };
-        client::connect_with(
-            &Endpoint::Local(self.home.clone()),
-            &self.staged,
-            &|| {},
-            &|_| Ok(vec![attach.clone()]),
-        )
+    fn connect(&self) -> io::Result<Connection> {
+        client::connect(&self.endpoint(), &self.staged, &|| {})
     }
 }
 
@@ -206,19 +187,13 @@ impl Client {
     }
 }
 
-/// How long a session watch waits to reconnect after losing the daemon.
-const REWATCH: Duration = Duration::from_secs(1);
-
 /// The daemon's session list as it changes, pushed by the daemon over one
 /// connection: subscribe to `updates`, then `start`.
 pub struct SessionWatch {
     daemon: Daemon,
     producer: Arc<StreamProducer<SessionListUpdate>>,
-    /// The open connection's write half, for the detach that ends it.
-    writer: Arc<Mutex<Option<Writer>>>,
-    /// Set when the watch is dropped: its reader stops reconnecting.
-    done: Arc<AtomicBool>,
-    started: AtomicBool,
+    /// Watches until dropped.
+    watch: Mutex<Option<client::SessionWatch>>,
 }
 
 #[export]
@@ -227,13 +202,11 @@ impl SessionWatch {
         Self {
             daemon: client.daemon.clone(),
             producer: Arc::new(StreamProducer::new(64)),
-            writer: Arc::default(),
-            done: Arc::default(),
-            started: AtomicBool::new(false),
+            watch: Mutex::new(None),
         }
     }
 
-    /// The list now and after each change.
+    /// The list now and after each change, newest first.
     #[ffi_stream(item = SessionListUpdate)]
     pub fn updates(&self) -> Arc<EventSubscription<SessionListUpdate>> {
         self.producer.subscribe()
@@ -243,89 +216,84 @@ impl SessionWatch {
     /// after it restarts (an upgrade, say); while it cannot be reached an
     /// update says why. Starts once.
     pub fn start(&self) {
-        if self.started.swap(true, Ordering::AcqRel) {
+        let mut watch = lock(&self.watch);
+        if watch.is_some() {
             return;
         }
-        let (daemon, producer) = (self.daemon.clone(), Arc::clone(&self.producer));
-        let (writer, done) = (Arc::clone(&self.writer), Arc::clone(&self.done));
-        runtime().spawn_blocking(Box::new(move || {
-            while !done.load(Ordering::Acquire) {
-                let problem = match daemon.connect().and_then(|mut conn| {
-                    conn.watch_sessions()?;
-                    Ok(conn)
-                }) {
-                    Ok(Connection {
-                        mut reader,
-                        writer: w,
-                        ..
-                    }) => {
-                        *lock(&writer) = Some(w);
-                        loop {
-                            match reader.recv() {
-                                Ok(Some(DaemonMsg::Sessions { sessions })) => {
-                                    producer.push(SessionListUpdate {
-                                        sessions: sessions.iter().map(Into::into).collect(),
-                                        problem: None,
-                                    });
-                                }
-                                Ok(Some(_)) => {}
-                                Ok(None) => break "the daemon closed the connection".to_owned(),
-                                Err(e) => break e.to_string(),
-                            }
-                        }
-                    }
-                    Err(e) => e.to_string(),
-                };
-                lock(&writer).take();
-                if done.load(Ordering::Acquire) {
-                    return;
-                }
-                producer.push(SessionListUpdate {
-                    sessions: Vec::new(),
-                    problem: Some(problem),
+        let producer = Arc::clone(&self.producer);
+        *watch = Some(client::SessionWatch::start(
+            self.daemon.endpoint(),
+            self.daemon.staged.clone(),
+            move |list| {
+                producer.push(match list {
+                    Ok(sessions) => SessionListUpdate {
+                        sessions: sessions.iter().rev().map(Into::into).collect(),
+                        problem: None,
+                    },
+                    Err(problem) => SessionListUpdate {
+                        sessions: Vec::new(),
+                        problem: Some(problem),
+                    },
                 });
-                std::thread::sleep(REWATCH);
-            }
-        }));
+            },
+        ));
     }
 }
 
-/// Released by the app: the daemon is told, and the reader then ends.
-impl Drop for SessionWatch {
-    fn drop(&mut self) {
-        self.done.store(true, Ordering::Release);
-        if let Some(mut writer) = lock(&self.writer).take() {
-            let _ = writer.send(&ClientMsg::Detach);
-        }
+/// The session `wanted` names among `sessions`: `latest` is the first, else
+/// one whose id starts with it, in full or short form.
+#[export]
+pub fn find_session(sessions: Vec<SessionInfo>, wanted: &str) -> Option<String> {
+    if wanted == "latest" {
+        return sessions.into_iter().next().map(|s| s.id);
     }
+    let id = |s: &SessionInfo| s.id.parse().ok().map(SessionId);
+    client::matching(&sessions, id, wanted)
+        .ok()
+        .map(|s| s.id.clone())
 }
 
-struct Shared {
-    feed: Mutex<Feed>,
-    /// The open connection's write half; `None` before `open` and once it
-    /// ends. Taken before `feed` when both are held.
-    writer: Mutex<Option<Writer>>,
-    /// A session attaches once: its reader owns the connection from then on.
-    opened: AtomicBool,
-}
-
-/// One session as this client shows it: open it, then read `updates`.
+/// One session as this client shows it: subscribe to `updates`, then
+/// `open` it.
 pub struct Session {
-    daemon: Daemon,
-    shared: Arc<Shared>,
+    feed: Arc<Mutex<Feed>>,
+    driver: Driver,
+}
+
+/// Has `driver` carry out the client's effects, publishing what comes
+/// back for the app.
+fn run(driver: &Driver, feed: &Mutex<Feed>, mut effects: Vec<Effect>) {
+    while !effects.is_empty() {
+        let shown = effects
+            .into_iter()
+            .filter_map(|effect| driver.apply(effect))
+            .collect();
+        effects = lock(feed).absorb(shown);
+    }
 }
 
 #[export]
 impl Session {
     pub fn new(client: &Client) -> Self {
-        Self {
-            daemon: client.daemon.clone(),
-            shared: Arc::new(Shared {
-                feed: Mutex::new(Feed::new()),
-                writer: Mutex::new(None),
-                opened: AtomicBool::new(false),
-            }),
-        }
+        let feed = Arc::new(Mutex::new(Feed::new(SessionClient::new(Env::Keep))));
+        let shared = Arc::clone(&feed);
+        let daemon = &client.daemon;
+        let driver = Driver::with_origin(
+            daemon.endpoint(),
+            daemon.staged.clone(),
+            || {
+                Ok(Environment::new(
+                    std::env::current_dir()?,
+                    session_vars(),
+                    false,
+                ))
+            },
+            move |driver, event| {
+                let effects = lock(&shared).step(event);
+                run(driver, &shared, effects);
+            },
+        );
+        Self { feed, driver }
     }
 
     /// Every update from here on. Subscribe before `open` to see the
@@ -333,84 +301,121 @@ impl Session {
     /// `resync`.
     #[ffi_stream(item = ViewUpdate)]
     pub fn updates(&self) -> Arc<EventSubscription<ViewUpdate>> {
-        lock(&self.shared.feed).subscribe()
+        lock(&self.feed).subscribe()
     }
 
     pub fn snapshot(&self) -> SessionSnapshot {
-        lock(&self.shared.feed).snapshot()
+        lock(&self.feed).snapshot()
     }
 
     /// What came after update `from`: the updates, or a snapshot when too
     /// many were missed.
     pub fn resync(&self, from: u64) -> Resync {
-        lock(&self.shared.feed).resync(from)
+        lock(&self.feed).resync(from)
+    }
+
+    /// What the controls offer for the turn now.
+    pub fn turn(&self) -> TurnInfo {
+        lock(&self.feed).client.turn().into()
+    }
+
+    /// Every slash command, for help and completion.
+    pub fn commands(&self) -> Vec<CommandHelp> {
+        crate::commands(lock(&self.feed).client.commands())
     }
 
     /// Attaches to `target`. A new session works in the git root of its
     /// directory with this process's environment; an existing one keeps the
     /// environment its last client gave it. When the daemon drains for an
     /// upgrade the session reattaches on its own and replays what it
-    /// missed; any other end of the connection is a `closed` update. A
-    /// session opens once (until an attempt succeeds): make another to
-    /// attach again.
-    pub async fn open(&self, target: OpenTarget) -> Result<(), ClientError> {
-        let (target, workspace, env) = match target {
+    /// missed; how the link stands arrives as `link` updates. A session
+    /// opens once: make another to attach again.
+    pub fn open(&self, target: OpenTarget) -> Result<(), ClientError> {
+        let attach = match target {
             OpenTarget::New { workspace } => {
                 let dir = PathBuf::from(workspace);
-                (Target::New, dir.clone(), Some(dir))
+                let env = Environment::new(dir.clone(), session_vars(), false);
+                Attach {
+                    workspace: Some(dir),
+                    ..Attach::new(Target::New, Env::Given(env))
+                }
             }
             OpenTarget::Latest {
                 workspace,
                 any_workspace,
-            } => (
-                Target::Latest { any_workspace },
-                PathBuf::from(workspace),
-                None,
-            ),
-            OpenTarget::Id { id } => (Target::Id(parse_id(&id)?), PathBuf::new(), None),
+            } => Attach {
+                workspace: Some(PathBuf::from(workspace)),
+                ..Attach::new(Target::Latest { any_workspace }, Env::Keep)
+            },
+            OpenTarget::Id { id } => Attach {
+                workspace: Some(PathBuf::new()),
+                ..Attach::new(Target::Id(parse_id(&id)?), Env::Keep)
+            },
         };
-        let (daemon, shared) = (self.daemon.clone(), Arc::clone(&self.shared));
-        blocking(move || {
-            if shared.opened.swap(true, Ordering::AcqRel) {
+        let effects = {
+            let mut feed = lock(&self.feed);
+            if feed.client.connection() > 0 {
                 return Err(ClientError::InvalidArgument {
                     message: "the session was opened already".into(),
                 });
             }
-            let env = env.map(|dir| Environment::new(dir, session_vars(), false));
-            let conn = daemon
-                .attach(target, workspace, env, 0)
-                .inspect_err(|_| shared.opened.store(false, Ordering::Release))?;
-            *lock(&shared.writer) = Some(conn.writer);
-            let reader = conn.reader;
-            runtime().spawn_blocking(Box::new(move || read(&daemon, &shared, reader)));
-            Ok(())
-        })
-        .await
+            let effects = feed.client.attach(attach);
+            feed.absorb(effects)
+        };
+        run(&self.driver, &self.feed, effects);
+        Ok(())
     }
 
-    /// Sends the user's input.
+    /// Sends the user's input as it is.
     pub async fn send(&self, text: String) -> Result<(), ClientError> {
-        self.write(ClientMsg::input(text)).await
+        self.run(Cmd::Input(text)).await
+    }
+
+    /// A line the user typed, parsed as every client parses it: what it
+    /// asks of the session is done, and what it asks of the app comes
+    /// back.
+    pub async fn submit(&self, line: String) -> Result<Option<AppAction>, ClientError> {
+        let asking = lock(&self.feed).client.turn().asking;
+        let action = match client::parse(&line, asking) {
+            None => return Ok(None),
+            Some(Cmd::Help) => AppAction::Help,
+            Some(Cmd::Sessions) => AppAction::Sessions,
+            Some(Cmd::Open(_)) => AppAction::NewSession,
+            Some(cmd) => return self.run(cmd).await.map(|()| None),
+        };
+        Ok(Some(action))
+    }
+
+    /// Input for the running turn, before its next step.
+    pub async fn steer(&self, text: String) -> Result<(), ClientError> {
+        self.run(Cmd::Steer(text)).await
     }
 
     /// Answers the ask for tool call `call`.
     pub async fn approve(&self, call: u64, approved: bool) -> Result<(), ClientError> {
-        self.write(ClientMsg::approve(call, approved)).await
+        self.run(Cmd::Approve { call, approved }).await
     }
 
     /// Stops the running turn: its model or tool call, and the rest of it.
     pub async fn interrupt(&self) -> Result<(), ClientError> {
-        self.write(ClientMsg::INTERRUPT).await
+        self.run(Cmd::Interrupt).await
     }
 
     /// Detaches; the session keeps running in the daemon.
     pub async fn detach(&self) -> Result<(), ClientError> {
-        let shared = Arc::clone(&self.shared);
+        self.run(Cmd::Detach).await
+    }
+
+    /// Replaces a daemon that stopped answering, and attaches again.
+    pub async fn restart(&self) -> Result<(), ClientError> {
+        let (feed, driver) = (Arc::clone(&self.feed), self.driver.clone());
         blocking(move || {
-            let writer = lock(&shared.writer).take();
-            writer
-                .ok_or(ClientError::NotOpen)?
-                .send(&ClientMsg::Detach)?;
+            let effects = {
+                let mut feed = lock(&feed);
+                let effects = feed.client.restart();
+                feed.absorb(effects)
+            };
+            run(&driver, &feed, effects);
             Ok(())
         })
         .await
@@ -418,11 +423,18 @@ impl Session {
 }
 
 impl Session {
-    async fn write(&self, msg: ClientMsg) -> Result<(), ClientError> {
-        let shared = Arc::clone(&self.shared);
+    async fn run(&self, cmd: Cmd) -> Result<(), ClientError> {
+        let (feed, driver) = (Arc::clone(&self.feed), self.driver.clone());
         blocking(move || {
-            let mut writer = lock(&shared.writer);
-            writer.as_mut().ok_or(ClientError::NotOpen)?.send(&msg)?;
+            let effects = {
+                let mut feed = lock(&feed);
+                if !feed.client.link().attached() {
+                    return Err(ClientError::NotOpen);
+                }
+                let effects = feed.client.run(cmd);
+                feed.absorb(effects)
+            };
+            run(&driver, &feed, effects);
             Ok(())
         })
         .await
@@ -432,8 +444,13 @@ impl Session {
 /// Released by the app: the daemon is told, and the reader then ends.
 impl Drop for Session {
     fn drop(&mut self) {
-        if let Some(mut writer) = lock(&self.shared.writer).take() {
-            let _ = writer.send(&ClientMsg::Detach);
+        let effects = {
+            let mut feed = lock(&self.feed);
+            let effects = feed.client.detach();
+            feed.absorb(effects)
+        };
+        for effect in effects {
+            self.driver.apply(effect);
         }
     }
 }
@@ -481,49 +498,4 @@ fn parse_id(id: &str) -> Result<SessionId, ClientError> {
         .map_err(|_| ClientError::InvalidArgument {
             message: format!("not a session id: {id}"),
         })
-}
-
-/// Folds what the daemon sends until the connection ends, reattaching
-/// across a drain.
-fn read(daemon: &Daemon, shared: &Shared, mut reader: Reader) {
-    loop {
-        let ended = loop {
-            match reader.recv() {
-                Ok(Some(msg)) => {
-                    lock(&shared.feed).fold(&msg);
-                }
-                Ok(None) => break "the daemon closed the connection".to_owned(),
-                Err(e) => break e.to_string(),
-            }
-        };
-        let mut writer = lock(&shared.writer);
-        let (draining, since, workspace) = {
-            let feed = lock(&shared.feed);
-            let view = &feed.view;
-            let draining = view.session.filter(|_| view.link == Link::Draining);
-            (draining, view.seq, view.workspace.clone())
-        };
-        // Detached on purpose, or reconnected for the new build.
-        let end = match (writer.is_some(), draining) {
-            (false, _) => ViewChange::Detached,
-            (true, Some(session)) => {
-                match daemon.attach(Target::Id(session), workspace, None, since) {
-                    Ok(conn) => {
-                        *writer = Some(conn.writer);
-                        reader = conn.reader;
-                        continue;
-                    }
-                    Err(e) => ViewChange::Closed {
-                        message: e.to_string(),
-                    },
-                }
-            }
-            (true, None) => ViewChange::Closed { message: ended },
-        };
-        *writer = None;
-        let mut feed = lock(&shared.feed);
-        feed.closed = true;
-        feed.local(end);
-        return;
-    }
 }

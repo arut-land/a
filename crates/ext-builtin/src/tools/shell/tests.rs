@@ -309,6 +309,19 @@ fn a_call_cancelled_before_it_starts_spawns_nothing() {
     assert_eq!(model(&ran), "(no output)\n[aborted]");
 }
 
+/// Waiting on a command costs the reactor a wake for its exit and its
+/// output, not one per tick.
+#[test]
+fn a_quiet_command_wakes_nothing_while_it_runs() {
+    let rig = rig("quiet");
+    run(&rig, "true");
+    let before = rt::wakes();
+    let ran = run(&rig, "sleep 1");
+    let woke = rt::wakes() - before;
+    assert_eq!(ran.exit, Some(0));
+    assert!(woke < 10, "{woke} wakes");
+}
+
 #[test]
 fn a_background_command_returns_at_once_with_its_log() {
     let rig = rig("background");
@@ -327,6 +340,26 @@ fn a_background_command_returns_at_once_with_its_log() {
     }
     assert!(sys::group_alive(job.pgid));
     assert!(model(&ran).starts_with(&format!("[running in the background: pgid {}", job.pgid)));
+}
+
+/// Its end is an event, not something a poll finds: noticed within
+/// moments, whether the shell itself or a process it left behind ends
+/// last, and the leader is reaped (a zombie would keep the group alive).
+#[test]
+fn a_job_end_is_seen_at_once() {
+    let rig = rig("job-ends");
+    for command in ["sleep 1", "(sleep 1 &); exit 0"] {
+        let mut seen = ext::job::ENDED.count();
+        let ran = bash(&rig, &json!({ "command": command, "background": true }));
+        let pgid = ran.background.unwrap().pgid;
+        let started = Instant::now();
+        rt::block_on(ext::job::ENDED.changed(&mut seen));
+        let took = started.elapsed();
+        assert!(!sys::group_alive(pgid), "{command}");
+        // Re-checking on a backoff would first look again at 1.55 s.
+        assert!(took >= Duration::from_millis(900), "{command}: {took:?}");
+        assert!(took < Duration::from_millis(1300), "{command}: {took:?}");
+    }
 }
 
 /// Wraps every process in `env`, adding a variable.

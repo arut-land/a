@@ -26,7 +26,7 @@ use ext::Text;
 use ext::Tool;
 use ext::host::Registry;
 #[cfg(feature = "shell")]
-use ext::{Cancel, CwdOf, Cx, Kill, SpawnSpec as Spawn, Spawner, States};
+use ext::{CwdOf, Cx, Kill, SpawnSpec as Spawn, Spawner, States};
 use ext::{DynExtension, Refused, Tier};
 #[cfg(any(
     feature = "policy",

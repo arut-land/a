@@ -31,6 +31,7 @@ usage-rs = { workspace = true, features = ["spec"] }
 # A pseudo-terminal for the black-box tests of the terminal client.
 rustix = { workspace = true, features = ["pty", "termios"] }
 unicode-width = { version = "0.2", default-features = false }
+libc.workspace = true
 
 [package.metadata.cargo-machete]
 # Chosen for its features: the engine runs whichever built-ins it has.

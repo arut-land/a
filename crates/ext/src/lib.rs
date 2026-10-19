@@ -22,6 +22,7 @@ use serde_json::Value;
 
 mod ext;
 pub mod host;
+pub mod job;
 pub mod point;
 mod service;
 mod state;

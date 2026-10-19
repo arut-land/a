@@ -12,11 +12,12 @@ use std::future::{Future, poll_fn};
 use std::io::{self, BufReader, Write};
 use std::ops::Deref;
 use std::path::PathBuf;
+use std::pin::pin;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
-use std::task::{Poll, Waker};
+use std::task::Poll;
+use std::thread;
 use std::time::{Duration, Instant};
-use std::{mem, thread};
 
 use outbox::Outbox;
 use protocol::{
@@ -179,40 +180,16 @@ struct Daemon {
     started: u64,
 }
 
-/// A wake-up for one waiting task, remembered until it waits.
+/// Wakes the supervisor. A wake while it is busy is seen when it next
+/// waits.
 #[derive(Default)]
-struct Pulse(Mutex<(bool, Option<Waker>)>);
+struct Pulse(rt::Notify);
 
 impl Pulse {
     fn wake(&self) {
-        let mut pulse = lock(&self.0);
-        pulse.0 = true;
-        if let Some(waker) = pulse.1.take() {
-            waker.wake();
-        }
-    }
-
-    /// Waits for a wake, or until `deadline`; `true` if woken.
-    fn wait(&self, rt: &dyn rt::Runtime, deadline: Option<Instant>) -> impl Future<Output = bool> {
-        let mut sleep = deadline.map(|at| rt.sleep(at.saturating_duration_since(Instant::now())));
-        poll_fn(move |cx| {
-            let mut pulse = lock(&self.0);
-            if mem::take(&mut pulse.0) {
-                return Poll::Ready(true);
-            }
-            pulse.1 = Some(cx.waker().clone());
-            drop(pulse);
-            match sleep.as_mut().map(|sleep| sleep.as_mut().poll(cx)) {
-                Some(Poll::Ready(())) => Poll::Ready(false),
-                _ => Poll::Pending,
-            }
-        })
+        self.0.notify();
     }
 }
-
-/// How often the supervisor checks whether background processes have
-/// ended, while any run: nothing tells it when they do.
-const JOBS_CHECK: Duration = Duration::from_secs(5);
 
 /// A session the daemon knows about.
 struct Slot {
@@ -589,6 +566,8 @@ impl Daemon {
         // When a drain out of grace stopped the calls still running.
         let mut stopped: Option<Instant> = None;
         let mut awake: Option<Option<sys::Awake>> = None;
+        let mut pulsed = self.pulse.0.count();
+        let mut jobs = ext::job::ENDED.count();
         loop {
             let now = Instant::now();
             event(|| rt::Event {
@@ -613,9 +592,6 @@ impl Daemon {
                 awake = busy.then(|| sys::Awake::hold("a: an agent is at work"));
             }
             let mut next = self.next_hibernation(config.hibernate, now);
-            if self.live().iter().any(|s| s.has_jobs()) {
-                next = Some(earliest(next, now + JOBS_CHECK));
-            }
             if let Some(began) = draining {
                 if now >= began + config.drain && stopped.is_none() {
                     for session in self.live() {
@@ -640,8 +616,30 @@ impl Daemon {
             } else {
                 since = None;
             }
-            // Whatever woke us counts as activity: idleness starts again.
-            if self.pulse.wait(&*self.shared.rt, next).await {
+            // Whatever woke us counts as activity, and idleness starts
+            // again; a background job ending is only looked at.
+            let mut sleep = next.map(|at| {
+                self.shared
+                    .rt
+                    .sleep(at.saturating_duration_since(Instant::now()))
+            });
+            let mut pulse = pin!(self.pulse.0.changed(&mut pulsed));
+            let mut ended = pin!(ext::job::ENDED.changed(&mut jobs));
+            let woken = poll_fn(|cx| {
+                if pulse.as_mut().poll(cx).is_ready() {
+                    return Poll::Ready(true);
+                }
+                let ended = ended.as_mut().poll(cx).is_ready();
+                let slept = sleep
+                    .as_mut()
+                    .is_some_and(|s| s.as_mut().poll(cx).is_ready());
+                if ended || slept {
+                    Poll::Ready(false)
+                } else {
+                    Poll::Pending
+                }
+            });
+            if woken.await {
                 since = None;
             }
         }
@@ -999,6 +997,7 @@ fn handle(daemon: &Daemon, life: &Lifecycle, conn: &UnixStream) -> io::Result<()
                 build: life.build.clone(),
                 caps,
                 client: conn.client,
+                commands: session::commands(&daemon.shared.registry.get()),
             });
             conn.serve(&mut reader)
         }

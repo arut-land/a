@@ -1674,6 +1674,22 @@ impl Load {
 /// The native command that sets the session's model.
 const MODEL: &str = "model";
 
+/// The slash commands a session runs, as a welcome advertises them.
+pub fn commands(registry: &Registry) -> Vec<protocol::CommandInfo> {
+    let native = protocol::CommandInfo {
+        name: MODEL.to_owned(),
+        description: "set the session's model".to_owned(),
+    };
+    registry
+        .commands()
+        .map(|c| protocol::CommandInfo {
+            name: c.name().to_owned(),
+            description: c.description().to_owned(),
+        })
+        .chain([native])
+        .collect()
+}
+
 /// `text` as a command's name and arguments, if it names one: an
 /// extension's, or a native one.
 fn as_command<'a>(registry: &Registry, text: &'a str) -> Option<(&'a str, &'a str)> {

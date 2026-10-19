@@ -255,6 +255,7 @@ fn daemon_samples() -> Vec<Sample<DaemonMsg>> {
                 build: "0.0.0+0123456789abcdef".into(),
                 caps: Caps::NONE,
                 client: 0,
+                commands: Vec::new(),
             },
         ),
         sample(
@@ -264,6 +265,7 @@ fn daemon_samples() -> Vec<Sample<DaemonMsg>> {
                 build: "0.0.0+0123456789abcdef".into(),
                 caps: first_caps(),
                 client: 1,
+                commands: Vec::new(),
             },
         ),
         sample(
@@ -273,6 +275,7 @@ fn daemon_samples() -> Vec<Sample<DaemonMsg>> {
                 build: "0.0.0+0123456789abcdef".into(),
                 caps: steer_caps(),
                 client: 1,
+                commands: Vec::new(),
             },
         ),
         sample(
