@@ -143,7 +143,7 @@ fn attach(env: &Env, session: Option<SessionId>) -> (UnixStream, SessionId, Vec<
             DaemonMsg::Attached { session, .. } => id = Some(session),
             DaemonMsg::Entry(entry) => replay.push(entry),
             DaemonMsg::Synced { .. } => return (stream, id.unwrap(), replay),
-            DaemonMsg::Welcome { .. } | DaemonMsg::Recap(_) | DaemonMsg::Ask { .. } => {}
+            DaemonMsg::Welcome { .. } => {}
             msg => panic!("unexpected during attach: {msg:?}"),
         }
     }

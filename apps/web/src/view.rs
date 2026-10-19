@@ -181,8 +181,8 @@ pub fn item_row<'a>(item: &'a Item, view: &'a SessionView) -> impl Renderable {
                         }
                     }
                 }
-                Item::Hook { hook, decision, .. } => {
-                    p style=(style::NOTE) { "hook " (hook) " · " (decision_line(decision)) }
+                Item::Hook { hook, call, tool, decision, .. } => {
+                    p style=(style::NOTE) { "hook " (hook) " · " (decision_line(tool, *call, decision)) }
                 }
                 Item::Child { child, input, fired, .. } => {
                     div style=(style::NOTE) {
@@ -284,9 +284,6 @@ fn tool_card<'a>(
                         data-on:click={ "@post('/api/approve?call=" (call) "&ok=0')" } { "Deny" }
                 }
             }
-            @if phase == Phase::Waiting {
-                div style=(style::ASK) { span style=(style::DIM) { "waiting for approval" } }
-            }
             @match outcome {
                 Some(Outcome::Done { output }) => {
                     OutputBlock output=(output) card=(card);
@@ -303,11 +300,11 @@ fn tool_card<'a>(
     }
 }
 
-/// A finished call's output: as its tool presents it, a command's streams
-/// and exit status as older logs hold them, anything else as JSON.
+/// A finished call's output: as its tool presents it, anything else as
+/// JSON.
 #[component]
 fn output_block<'a>(output: &'a Json, card: Option<&'a Card>) -> impl Renderable {
-    let command = output_text(output, card);
+    let command = output_text(card);
     maud! {
         @if let Some((text, note)) = &command {
             pre style=(style::OUTPUT) { (text) span style=(style::DIM) { (note) } }

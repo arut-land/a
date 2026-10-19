@@ -101,7 +101,7 @@ fn an_interrupt_mid_reply_closes_its_connection_and_keeps_the_text_so_far() {
     let (port, got, closed) = provider(format!("{head}{}", &recorded[..cut]));
     let (fixture, home) = over_ureq(port);
     let session = fixture.start(&[]);
-    let outbox = Outbox::new(Caps::NONE);
+    let outbox = Outbox::new();
     session.follow(&outbox, 0);
     session.submit("hi").unwrap();
     got.recv().unwrap();

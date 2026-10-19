@@ -1,5 +1,5 @@
-//! The v2 schema's invariants: old logs read forever and as they were
-//! written, and fold to what a v2 log of the same session folds to.
+//! The log schema's invariants: a line reads back as it was written, and a
+//! log folds to what its session did.
 
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -20,7 +20,7 @@ fn root() -> PathBuf {
 /// view vectors'.
 fn recorded_lines() -> Vec<Vec<u8>> {
     let mut lines = Vec::new();
-    let corpus = root().join("fixtures/wire/v1/daemon");
+    let corpus = root().join(format!("fixtures/wire/v{}/daemon", protocol::PROTO));
     for file in fs::read_dir(corpus).unwrap() {
         let bytes = fs::read(file.unwrap().path()).unwrap();
         let msg: Value = serde_json::from_slice(&bytes).unwrap();
@@ -57,14 +57,13 @@ fn line_of(frame: &[u8]) -> Vec<u8> {
     line
 }
 
-/// A line of an old log decodes to the kind it was written as, so the
-/// entry encodes to the very line again: a replay sends old clients what
-/// they were sent, and a v2 build reads the same bytes through the shims.
+/// A log's line decodes to its entry, which encodes to the very line
+/// again: a replay sends what live clients were sent.
 #[test]
-fn old_logs_replay_byte_identically() {
+fn a_log_replays_byte_identically() {
     let lines = recorded_lines();
     assert!(lines.len() > 30, "{}", lines.len());
-    for line in [&lines[..], &old_log()[..]].concat() {
+    for line in [&lines[..], &log()[..]].concat() {
         let entry = Entry::from_json(&line).unwrap();
         let mut again = Vec::new();
         entry.encode(&mut again).unwrap();
@@ -81,21 +80,12 @@ fn old_logs_replay_byte_identically() {
     }
 }
 
-/// Every recorded log folds, each entry as its shim says it, and its shim
-/// is a kind v2 writes.
+/// Every recorded line folds, and what waits in the inbox is asked.
 #[test]
-fn every_old_log_folds() {
-    let lines = recorded_lines();
+fn every_recorded_log_folds() {
     let mut ledger = Ledger::default();
-    for line in &lines {
-        let entry = Entry::from_json(line).unwrap();
-        if let Some(shim) = entry.body.shim() {
-            assert!(
-                matches!(shim.shim(), Some(std::borrow::Cow::Borrowed(_))),
-                "{shim:?}"
-            );
-        }
-        ledger.apply(&entry);
+    for line in recorded_lines() {
+        ledger.apply(&Entry::from_json(&line).unwrap());
     }
     assert!(ledger.inbox().iter().all(|&c| ledger.asked(c).is_some()));
 }
@@ -130,42 +120,10 @@ fn a_payload_is_never_parsed_on_the_wire_path() {
     }
 }
 
-/// A session as builds before v2 log it: the gate's decision ahead of its
-/// call, an `ask`, the user's approval as a hook decision, a `steer` that
-/// repeats its text, a slash command (run as it arrived) and `settings`.
-fn old_log() -> Vec<Vec<u8>> {
-    [
-        r#"{"seq":1,"epoch":0,"kind":"context","text":"cwd: /w"}"#,
-        r#"{"seq":2,"epoch":0,"kind":"user","text":"list files"}"#,
-        r#"{"seq":3,"epoch":0,"kind":"model_call","model":"openai:m"}"#,
-        r#"{"seq":4,"epoch":0,"kind":"model_result","call":3,"outcome":{"status":"done","output":{"text":"ok"}}}"#,
-        r#"{"seq":5,"epoch":0,"kind":"hook","hook":"policy","decision":{"permission":{"tool":"bash","permission":"ask"}}}"#,
-        r#"{"seq":6,"epoch":0,"kind":"tool_call","tool":"bash","input":{"command":"ls"}}"#,
-        r#"{"seq":7,"epoch":0,"kind":"ask","call":6}"#,
-        r#"{"seq":8,"epoch":0,"kind":"queued","text":"and sizes","steer":true}"#,
-        r#"{"seq":9,"epoch":0,"kind":"hook","hook":"user","decision":{"approval":{"tool":"bash","approved":true,"call":6}}}"#,
-        r#"{"seq":10,"epoch":0,"kind":"tool_process","call":6,"pgid":42,"boot":"b"}"#,
-        r#"{"seq":11,"epoch":0,"kind":"progress","call":6,"text":"src\n"}"#,
-        r#"{"seq":12,"epoch":0,"kind":"steer","text":"and sizes","queued":8}"#,
-        r#"{"seq":13,"epoch":0,"kind":"tool_result","call":6,"outcome":{"status":"done","output":{"exit":0}}}"#,
-        r#"{"seq":14,"epoch":0,"kind":"model_call","model":"openai:m"}"#,
-        r#"{"seq":15,"epoch":0,"kind":"model_result","call":14,"outcome":{"status":"done","output":{"text":"done"}}}"#,
-        r#"{"seq":16,"epoch":0,"kind":"command","name":"model","args":"openai:n"}"#,
-        r#"{"seq":17,"epoch":0,"kind":"settings","model":"openai:n"}"#,
-        r#"{"seq":18,"epoch":0,"kind":"command_result","call":16,"outcome":{"status":"done","output":null}}"#,
-        r#"{"seq":19,"epoch":0,"kind":"queued","text":"later"}"#,
-        r#"{"seq":20,"epoch":0,"kind":"hook","hook":"policy","decision":{"permission":{"tool":"bash","permission":"ask"}}}"#,
-        r#"{"seq":21,"epoch":0,"kind":"tool_call","tool":"bash","input":{"command":"rm x"}}"#,
-        r#"{"seq":22,"epoch":0,"kind":"ask","call":21}"#,
-    ]
-    .map(|l| l.as_bytes().to_vec())
-    .to_vec()
-}
-
-/// The same session as v2 logs it: one `input` for each, the decision
-/// after its call (which implies the wait), the answer as an `answer`, a
-/// `take` naming the input it takes.
-fn new_log() -> Vec<Vec<u8>> {
+/// A session as its log holds it: an `input` for each message, a gate's
+/// decision after its call (an `ask` implies the wait), the user's answer,
+/// a `take` naming the input it takes, a slash command and its settings.
+fn log() -> Vec<Vec<u8>> {
     [
         r#"{"seq":1,"epoch":0,"kind":"context","text":"cwd: /w"}"#,
         r#"{"seq":2,"epoch":0,"kind":"input","text":"list files","taken":true}"#,
@@ -245,40 +203,35 @@ fn said(ledger: &Ledger) -> Said {
     }
 }
 
-/// An old log and a new log of the same session fold to the same ledger,
-/// at every point the two have reached alike.
+/// The ledger of a log says where each of its calls and inputs stands,
+/// at every point.
 #[test]
-fn an_old_and_a_new_log_of_the_same_session_fold_to_the_same_ledger() {
-    let entries = |lines: Vec<Vec<u8>>| -> Vec<Entry> {
-        lines.iter().map(|l| Entry::from_json(l).unwrap()).collect()
-    };
-    let (old, new) = (entries(old_log()), entries(new_log()));
-    // Where the two logs stand alike: (old seq, new seq).
-    let alike = [
-        (2, 2),
-        (4, 4),
-        (7, 6),
-        (8, 7),
-        (9, 8),
-        (11, 10),
-        (12, 11),
-        (13, 12),
-        (14, 13),
-        (15, 14),
-        (16, 15),
-        (17, 16),
-        (18, 17),
-        (19, 18),
-        (22, 20),
-    ];
-    for (o, n) in alike {
-        let at = |entries: &[Entry], seq| Ledger::of(entries.iter().take_while(|e| e.seq <= seq));
-        assert_eq!(said(&at(&old, o)), said(&at(&new, n)), "old {o}, new {n}");
-    }
-    let end = Ledger::of(&new);
+fn a_log_folds_to_what_its_session_did() {
+    let entries: Vec<Entry> = log().iter().map(|l| Entry::from_json(l).unwrap()).collect();
+    let at = |seq| Ledger::of(entries.iter().take_while(|e| e.seq <= seq));
+    let asked = said(&at(6));
+    assert_eq!(asked.activity, Activity::Approval);
+    assert_eq!(asked.inbox, [Some(r#"{"command":"ls"}"#.to_owned())]);
+    assert_eq!(asked.tools, ["bash"]);
+    let steered = said(&at(7));
+    assert_eq!(steered.untaken, [("and sizes".to_owned(), true)]);
+    let running = said(&at(10));
+    assert_eq!(running.activity, Activity::Running);
+    assert_eq!(running.inbox, [None; 0]);
+    assert_eq!(running.open[0].1, Phase::Running);
+    assert_eq!(
+        (running.open[0].2, running.open[0].3.as_deref()),
+        (1, Some("src\n"))
+    );
+    assert_eq!(said(&at(11)).untaken, []);
+    let command = said(&at(15));
+    assert_eq!((command.commands, command.open.len()), (1, 0));
+    let end = Ledger::of(&entries);
     assert_eq!(end.activity(), Activity::Approval);
     assert_eq!(end.untaken().len(), 1);
     assert_eq!(end.settings().0.model.as_deref(), Some("openai:n"));
+    assert_eq!(end.prompt(), Some("list files"));
+    assert!(end.has_context());
 }
 
 fn line(json: &str) -> Entry {

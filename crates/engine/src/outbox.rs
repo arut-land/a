@@ -11,7 +11,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 
 use crate::store::Lines;
-use protocol::{Caps, Class, Decode, Entry, Frame};
+use protocol::{Class, Decode, Entry, Frame};
 
 use crate::lock;
 
@@ -124,7 +124,6 @@ struct Shared {
     queue: Mutex<Queue>,
     /// Notified as there may be more to write: the writer's one wake.
     ready: rt::Notify,
-    caps: Caps,
 }
 
 #[derive(Default)]
@@ -156,20 +155,14 @@ struct Follow {
 pub struct Closed;
 
 impl Outbox {
-    pub fn new(caps: Caps) -> Self {
+    pub fn new() -> Self {
         Self {
             shared: Arc::new(Shared {
                 queue: Mutex::default(),
                 ready: rt::Notify::new(),
-                caps,
             }),
             following: 0,
         }
-    }
-
-    /// The capabilities the client took up.
-    pub fn caps(&self) -> Caps {
-        self.shared.caps
     }
 
     fn queue(&self) -> std::sync::MutexGuard<'_, Queue> {
@@ -328,7 +321,17 @@ mod tests {
     use super::*;
 
     fn entry(seq: u64, text: &str) -> Frame {
-        Frame::entry(&Entry::new(seq, 0, Body::User { text: text.into() })).unwrap()
+        Frame::entry(&Entry::new(
+            seq,
+            0,
+            Body::Input {
+                text: text.into(),
+                mode: protocol::Mode::Queue,
+                taken: true,
+                origin: None,
+            },
+        ))
+        .unwrap()
     }
 
     fn delta() -> Frame {
@@ -345,7 +348,15 @@ mod tests {
 
     impl Shown {
         fn push(&mut self, text: &str) {
-            let e = self.0.append(Body::User { text: text.into() }).unwrap();
+            let e = self
+                .0
+                .append(Body::Input {
+                    text: text.into(),
+                    mode: protocol::Mode::Queue,
+                    taken: true,
+                    origin: None,
+                })
+                .unwrap();
             self.1.push(e.seq);
         }
 
@@ -359,7 +370,6 @@ mod tests {
             id: protocol::SessionId::new(),
             workspace: "/w".into(),
             parent: None,
-            extensions: Vec::new(),
         };
         let loaded =
             crate::store::LogStore::create(&crate::store::Memory::default(), &header).unwrap();
@@ -381,7 +391,7 @@ mod tests {
     #[test]
     fn a_follower_reads_the_shared_log_from_its_cursor_and_frames_wait_for_their_entry() {
         let mut log = log(&["a", "b"]);
-        let outbox = Outbox::new(Caps::NONE);
+        let outbox = Outbox::new();
         let synced = Frame::new(&DaemonMsg::Synced { seq: 2 }).unwrap();
         let session = outbox.follow(log.frames(), 1, vec![(2, synced)]);
         outbox.send(delta()).unwrap();
@@ -394,7 +404,7 @@ mod tests {
     #[test]
     fn a_slow_viewer_never_grows_daemon_memory_beyond_its_cursor() {
         let mut log = log(&[]);
-        let outbox = Outbox::new(Caps::NONE);
+        let outbox = Outbox::new();
         let session = outbox.follow(log.frames(), 0, Vec::new());
         let big = "x".repeat(BUDGET);
         for seq in 1..=64 {
@@ -415,7 +425,7 @@ mod tests {
 
     #[test]
     fn deltas_past_the_budget_are_dropped() {
-        let outbox = Outbox::new(Caps::NONE);
+        let outbox = Outbox::new();
         let big = Frame::new(&DaemonMsg::Delta {
             call: 1,
             text: "x".repeat(BUDGET / 2),
@@ -433,7 +443,7 @@ mod tests {
         let mut log = log(&["a"]);
         log.push(&"x".repeat(16 << 20));
         log.push("c");
-        let outbox = Outbox::new(Caps::NONE);
+        let outbox = Outbox::new();
         let session = outbox.follow(log.frames(), 0, Vec::new());
         assert_eq!(written(&outbox), [Some(1)]);
         assert!(session.send(delta()).is_err());
@@ -441,7 +451,7 @@ mod tests {
 
     #[test]
     fn a_session_no_longer_followed_is_refused() {
-        let outbox = Outbox::new(Caps::NONE);
+        let outbox = Outbox::new();
         let first = outbox.follow(log(&[]).frames(), 0, Vec::new());
         let second = outbox.follow(log(&[]).frames(), 0, Vec::new());
         assert!(first.send(entry(1, "a")).is_err());
@@ -453,7 +463,7 @@ mod tests {
 
     #[test]
     fn a_closed_outbox_refuses_frames_and_writes_out_what_it_has() {
-        let outbox = Outbox::new(Caps::NONE);
+        let outbox = Outbox::new();
         outbox.send(delta()).unwrap();
         outbox.close();
         assert!(outbox.send(entry(1, "a")).is_err());

@@ -85,7 +85,6 @@ impl OnDisk {
             id: SessionId::new(),
             workspace: std::env::temp_dir(),
             parent: None,
-            extensions: installed(&self.fixture.0.registry.get()),
         };
         let mut file = serde_json::to_vec(&header).unwrap();
         file.push(b'\n');
@@ -138,8 +137,8 @@ fn line(e: &Entry) -> Vec<u8> {
 }
 
 /// The frames a client attaching after `since` is sent.
-fn sent(session: &Live, caps: Caps, since: u64) -> Vec<Frame> {
-    let outbox = Outbox::new(caps);
+fn sent(session: &Live, since: u64) -> Vec<Frame> {
+    let outbox = Outbox::new();
     session.follow(&outbox, since);
     std::iter::from_fn(|| outbox.try_next()).collect()
 }
@@ -165,23 +164,24 @@ fn a_committed_entry_is_encoded_exactly_once() {
     let session = disk.load(&disk.write(&lines));
     settle(&session);
     let shared = |a: &Frame, b: &Frame| std::ptr::eq(a.as_bytes(), b.as_bytes());
-    let (first, second) = (sent(&session, Caps::ALL, 0), sent(&session, Caps::ALL, 0));
+    let (first, second) = (sent(&session, 0), sent(&session, 0));
     assert_eq!(first.len(), 3, "attached, snapshot, synced");
     assert!(shared(&first[1], &second[1]), "one snapshot for both");
-    let replayed = entries(sent(&session, Caps::NONE, 0));
-    assert_eq!(replayed.len(), 300);
-    for (frame, line) in replayed.iter().zip(&lines) {
+    let near = 300 - SNAPSHOT_GAP;
+    let replayed = entries(sent(&session, near));
+    assert_eq!(replayed.len() as u64, SNAPSHOT_GAP);
+    for (frame, line) in replayed.iter().zip(&lines[usize::try_from(near).unwrap()..]) {
         let seq = frame.seq.unwrap();
         let read = Frame::from_line(seq, line).unwrap();
         assert_eq!(frame.as_bytes(), read.as_bytes(), "entry {seq}");
     }
     // Live, then replayed: committed once, and read back as written.
-    let live = Outbox::new(Caps::NONE);
+    let live = Outbox::new();
     session.follow(&live, 300);
     session.submit("again").unwrap();
     settle(&session);
     let live = entries(std::iter::from_fn(|| live.try_next()));
-    let replayed = entries(sent(&session, Caps::NONE, 300));
+    let replayed = entries(sent(&session, 300));
     session.halt();
     let written = disk.lines(session.id);
     assert_eq!(live.len(), 2, "the input and its answer");
@@ -202,18 +202,18 @@ fn replay_from_the_index_equals_the_live_frames() {
     let disk = on_disk("replay");
     let header = disk.write(&[]);
     let session = disk.load(&header);
-    let live = Outbox::new(Caps::NONE);
+    let live = Outbox::new();
     session.follow(&live, 0);
     for turn in 0..20 {
         session.submit(&format!("turn {turn}")).unwrap();
         settle(&session);
     }
     let live = entries(std::iter::from_fn(|| live.try_next()));
-    let replayed = entries(sent(&session, Caps::NONE, 0));
+    let replayed = entries(sent(&session, 0));
     session.halt();
     let reloaded = disk.load(&header);
     settle(&reloaded);
-    let after_reload = entries(sent(&reloaded, Caps::NONE, 0));
+    let after_reload = entries(sent(&reloaded, 0));
     reloaded.halt();
     assert_eq!(live.len(), 40);
     for frames in [&replayed, &after_reload] {

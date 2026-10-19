@@ -337,7 +337,7 @@ pub struct Load<'a> {
     pub owner: Owner,
     /// Whether the session was marked busy.
     pub busy: bool,
-    /// The extensions the session's header records, if known, which its
-    /// log's `extensions` entries supersede.
-    pub extensions: Option<&'a [Installed]>,
+    /// The log was just created: its first entry records the extensions
+    /// the session runs with, as a later one does when they change.
+    pub created: bool,
 }

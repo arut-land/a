@@ -26,8 +26,8 @@ use std::time::{Duration, Instant};
 
 use protocol::view::SessionList;
 use protocol::{
-    Cap, Caps, ClientDecl, ClientId, ClientMsg, CommandInfo, DaemonMsg, Environment, HomeSettings,
-    PROTO, SessionSummary, SettingsChange, Target, Versions, read_frame, write_frame,
+    Caps, ClientDecl, ClientId, ClientMsg, CommandInfo, DaemonMsg, Environment, HomeSettings,
+    PROTO, SessionSummary, SettingsChange, Versions, read_frame, write_frame,
 };
 use sys::crash::{Crashes, Record};
 use sys::{Home, Signal, Staged, Stream};
@@ -60,10 +60,9 @@ pub struct Connection {
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct Welcome {
     pub proto: u32,
-    /// The capabilities taken up: none from a daemon older than them.
+    /// The capabilities taken up.
     pub caps: Caps,
-    /// This connection's id, as origins name it; 0 from a daemon older
-    /// than them.
+    /// This connection's id, as origins name it.
     pub client: u32,
 }
 
@@ -116,12 +115,6 @@ impl Connection {
     /// their one writer; a change it refuses (a bad variable name, a file
     /// it cannot parse) is `InvalidInput`, saying why.
     pub fn settings(mut self, change: Option<SettingsChange>) -> io::Result<HomeSettings> {
-        if !self.welcome.caps.has(Cap::Settings) {
-            return Err(io::Error::new(
-                io::ErrorKind::Unsupported,
-                "the daemon is older than this a; restart it to edit settings",
-            ));
-        }
         self.writer.send(&ClientMsg::Settings { change })?;
         let (settings, error) = self.reader.until(|msg| match msg {
             DaemonMsg::Settings { settings, error } => Some((settings, error)),
@@ -136,12 +129,6 @@ impl Connection {
     /// Asks for the session list now and on every change, as
     /// [`DaemonMsg::Sessions`].
     pub fn watch_sessions(&mut self) -> io::Result<()> {
-        if !self.welcome.caps.has(Cap::Sessions) {
-            return Err(io::Error::new(
-                io::ErrorKind::Unsupported,
-                "the daemon is older than this a; restart it to watch sessions",
-            ));
-        }
         self.writer.send(&ClientMsg::WatchSessions)
     }
 
@@ -151,20 +138,6 @@ impl Connection {
         let mut list = SessionList::default();
         self.reader
             .until(|msg| list.fold(&msg).then(|| std::mem::take(&mut list.sessions)))
-    }
-}
-
-/// The session `id` names, in full or as a prefix: this machine's daemon
-/// resolves it as it attaches; another machine's, which may be older, is
-/// asked for its list first.
-pub fn target(endpoint: &Endpoint, staged: &Staged, id: &str) -> io::Result<Target> {
-    match endpoint {
-        Endpoint::Local(_) => Ok(Target::Prefix(id.to_owned())),
-        Endpoint::Ssh(_) => {
-            let sessions = connect(endpoint, staged, &|| {})?.sessions()?;
-            let found = matching(&sessions, |s| Some(s.id), id).map_err(io::Error::other)?;
-            Ok(Target::Id(found.id))
-        }
     }
 }
 
@@ -231,8 +204,8 @@ impl Writer {
     }
 
     /// Sends `msg`, numbering it first if it is a mutation without a
-    /// number: a daemon that takes up [`protocol::Cap::Ack`] answers it by
-    /// that number, which [`Writer::last_seq`] gives.
+    /// number: the daemon answers it by that number, which
+    /// [`Writer::last_seq`] gives.
     pub fn send(&mut self, msg: &ClientMsg) -> io::Result<()> {
         let mut numbered = msg.clone();
         match numbered.client_seq_mut() {
@@ -377,10 +350,6 @@ fn mismatch(endpoint: &Endpoint, staged: &Staged, supported: Versions) -> io::Er
     io::Error::new(io::ErrorKind::Unsupported, message)
 }
 
-/// What a client takes up: all but [`Cap::Ledger`], as clients still take
-/// what waits and the recap from the daemon.
-const OFFERED: Caps = Caps::ALL.without(Cap::Ledger);
-
 /// Sends the hello and `first` back to back, then reads the answer.
 fn hello(
     conn: &mut Connection,
@@ -392,7 +361,7 @@ fn hello(
         proto: PROTO,
         build: build.to_owned(),
         min: Versions::OURS.min_field(),
-        caps: OFFERED,
+        caps: Caps::ALL,
         client,
     })?;
     // A daemon that refuses the hello may hang up before reading these, so
@@ -498,7 +467,7 @@ fn live_daemon(home: &Home) -> Option<Record> {
 }
 
 /// Stops the daemon: asked over its socket, as an idle one stops; else, as
-/// for one too old to be asked or too wedged to answer, SIGTERM, then
+/// for one too wedged to answer, SIGTERM, then
 /// SIGKILL if it still holds its lock after `HELLO_TIMEOUT`. Each signal
 /// goes only to the process the daemon recorded, checked by its start time
 /// as well as its pid. Returns whether a daemon was running.
@@ -558,7 +527,7 @@ fn reach(home: &Home, build: &str) -> io::Result<(Stream, Connection)> {
     stream.set_read_timeout(Some(HELLO_TIMEOUT))?;
     let mut conn = split(&stream)?;
     match hello(&mut conn, build, None, &[])? {
-        Greeting::Welcome if conn.welcome.caps.has(Cap::Daemon) => Ok((stream, conn)),
+        Greeting::Welcome => Ok((stream, conn)),
         _ => Err(io::Error::new(
             io::ErrorKind::Unsupported,
             "the daemon cannot be asked",

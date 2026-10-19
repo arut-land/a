@@ -7,7 +7,7 @@ use std::time::Duration;
 
 use common::*;
 use kernel::{Effect, Load, Owner};
-use protocol::{Body, Decision, Json, Outcome, Permission, Verdict};
+use protocol::{Body, Json, Outcome, Permission, Verdict};
 use serde_json::json;
 
 /// A session the daemon was running when it stopped.
@@ -16,7 +16,7 @@ const BUSY_LOAD: Load<'static> = Load {
     fresh: true,
     owner: Owner::None,
     busy: true,
-    extensions: None,
+    created: false,
 };
 
 fn resume(
@@ -118,40 +118,6 @@ fn a_wait_survives_a_restart_and_runs_once_answered() {
     s.table(vec![(
         approve(2, true),
         vec![BUSY, append(4, answered), run_bash(2, "echo")],
-    )]);
-}
-
-/// The same, from a log an earlier build wrote: the gate's decision before
-/// the call, and an `ask`.
-#[test]
-fn an_old_logs_ask_waits_as_a_new_one_does() {
-    let hook = Body::Hook {
-        hook: "policy".into(),
-        decision: Decision::Permission {
-            tool: "bash".into(),
-            permission: Permission::Ask,
-        },
-    };
-    let old = [
-        Body::User {
-            text: "$ echo".into(),
-        },
-        hook,
-        bash("echo"),
-        Body::Ask { call: 3 },
-    ];
-    let reg = Reg::echo().policy(Policy::Ask(&["bash"]));
-    let (mut s, fx) = resume(reg, old, &Load::default());
-    assert_eq!(fx, []);
-    assert_eq!(s.core.ledger().inbox(), [3]);
-    let answered = Body::Answer {
-        call: id(3),
-        value: true.into(),
-        origin: None,
-    };
-    s.table(vec![(
-        approve(3, true),
-        vec![BUSY, append(5, answered), run_bash(3, "echo")],
     )]);
 }
 

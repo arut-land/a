@@ -6,8 +6,8 @@
 //! [`SessionView`]'s serialized form is its log-derived state: identical for
 //! any two clients that have folded the same session up to the same seq,
 //! which [`SessionView::state_hash`] checks. What only this connection saw
-//! (streamed text, the recap, which asks were delivered, the link state) is
-//! kept beside it and left out.
+//! (streamed text, the recap of what it missed) is kept beside it and left
+//! out.
 
 use std::borrow::Borrow;
 use std::io;
@@ -17,8 +17,8 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
 use crate::{
-    Audience, Body, Card, DaemonMsg, Decision, Decode, Entry, Environment, Json, Outcome,
-    Permission, Recap, SessionId, SessionSummary, Verdict, WaitOn,
+    Audience, Body, Card, DaemonMsg, Decode, Entry, Environment, Json, Outcome, Permission,
+    SessionId, SessionSummary, Verdict, WaitOn,
 };
 
 /// One session as a client shows it. Its serialized form is also what a
@@ -37,9 +37,13 @@ pub struct SessionView {
     /// it is.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub queued: Vec<(u64, String)>,
-    /// The recap the daemon sent on the latest attach.
+    /// What happened since the seq the latest attach started from, once
+    /// its replay is in.
     #[serde(skip)]
     pub recap: Option<Recap>,
+    /// The seq the latest attach started from.
+    #[serde(skip)]
+    pub(crate) since: u64,
     /// Live text of the model call in flight; the committed reply replaces
     /// it.
     #[serde(skip)]
@@ -49,6 +53,25 @@ pub struct SessionView {
     /// FFI stream's buffer was full): take a fresh snapshot of the view.
     #[serde(skip)]
     pub rev: u64,
+}
+
+/// What happened in a session, for a client that attaches: what its turn
+/// did since the user's last message, as [`SessionView::recap_since`]
+/// reads it.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct Recap {
+    /// The user's last message, shortened.
+    pub prompt: Option<String>,
+    /// The tools called since, in order.
+    pub tools: Vec<String>,
+    /// Calls since that failed or were interrupted.
+    pub failed: u32,
+    /// Calls since with no outcome yet.
+    pub running: u32,
+    /// The agent's last reply since, shortened.
+    pub reply: Option<String>,
+    /// Calls waiting for the user's approval.
+    pub asks: u32,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -89,9 +112,6 @@ pub enum Item {
         /// How the tool presents the call, or once it has one, its outcome.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         card: Option<Card>,
-        /// Whether this client was asked to approve it.
-        #[serde(skip)]
-        asked: bool,
     },
     /// A slash command and its outcome.
     Command {
@@ -100,12 +120,16 @@ pub enum Item {
         args: String,
         outcome: Option<Outcome>,
     },
-    /// A hook decision, other than a user's answer to an ask (which is the
-    /// call's [`Approval`]).
+    /// What extension `hook` decided, about call `call` (of tool `tool`)
+    /// when it is about one; an approval asked is the call's [`Approval`].
     Hook {
         seq: u64,
         hook: String,
-        decision: Decision,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        call: Option<u64>,
+        #[serde(default, skip_serializing_if = "String::is_empty")]
+        tool: String,
+        decision: Verdict,
     },
     /// A child session started by call `call`, and its watch.
     Child {
@@ -142,15 +166,8 @@ impl Item {
             } => Phase::of(outcome),
             Self::Tool {
                 approval: Some(Approval::Pending),
-                asked,
                 ..
-            } => {
-                if *asked {
-                    Phase::Asking
-                } else {
-                    Phase::Waiting
-                }
-            }
+            } => Phase::Asking,
             Self::Tool {
                 approval: Some(Approval::Denied),
                 ..
@@ -206,10 +223,8 @@ pub enum Approval {
 pub enum Phase {
     /// It runs, or is about to.
     Running,
-    /// It waits for this client's approval.
+    /// It waits for an approval, which every client attached is asked for.
     Asking,
-    /// It waits for an approval asked of another client.
-    Waiting,
     /// Not approved; it will not run.
     Denied,
     Done,
@@ -221,7 +236,7 @@ impl Phase {
     /// Whether it is unsettled: what an interrupt stops. A call waiting for
     /// approval counts, since an interrupt settles it without running it.
     pub const fn open(self) -> bool {
-        matches!(self, Self::Running | Self::Asking | Self::Waiting)
+        matches!(self, Self::Running | Self::Asking)
     }
 
     /// Whether it has its outcome: nothing about it changes any more.
@@ -243,9 +258,9 @@ impl Phase {
 pub struct Turn {
     /// A call is unsettled: an interrupt has something to stop.
     pub running: bool,
-    /// The oldest call waiting for this client's approval.
+    /// The oldest call waiting for an approval.
     pub asking: Option<u64>,
-    /// How many calls wait for this client's approval.
+    /// How many calls wait for an approval.
     pub asks: u32,
 }
 
@@ -284,17 +299,12 @@ pub enum Change {
         call: u64,
         text: String,
     },
-    /// This client is asked to approve the tool call at `index`.
-    Asked {
-        index: usize,
-        item: Item,
-    },
+    /// The replay is in; [`SessionView::recap`] tells what it held.
     Synced,
     /// The daemon sent the whole view: the items are these now.
     Snapshot {
         items: Vec<Item>,
     },
-    Recap(Recap),
     Draining,
     Mismatch {
         supported: u32,
@@ -335,8 +345,8 @@ impl SessionView {
     }
 
     /// Folds one daemon message in. `None` when it changed nothing, such as
-    /// an entry replayed again after a reconnect, a repeated ask, or a kind
-    /// this build does not know.
+    /// an entry replayed again after a reconnect, or a kind this build does
+    /// not know.
     pub fn fold(&mut self, msg: &DaemonMsg) -> Option<Update> {
         let change = self.apply(msg)?;
         self.rev += 1;
@@ -347,8 +357,7 @@ impl SessionView {
         })
     }
 
-    /// Tool calls this client was asked to approve that are still waiting,
-    /// oldest first.
+    /// Tool calls waiting for an approval, oldest first.
     pub fn asked(&self) -> impl Iterator<Item = u64> + '_ {
         self.items
             .iter()
@@ -395,6 +404,8 @@ impl SessionView {
                         ..Self::default()
                     };
                 }
+                self.since = self.seq;
+                self.recap = None;
                 self.workspace.clone_from(workspace);
                 Some(Change::Attached {
                     session: *session,
@@ -425,13 +436,9 @@ impl SessionView {
             }
             DaemonMsg::Synced { seq } => {
                 self.seq = self.seq.max(*seq);
+                self.recap = self.recap_since(self.since);
                 Some(Change::Synced)
             }
-            DaemonMsg::Recap(recap) => {
-                self.recap = Some(recap.clone());
-                Some(Change::Recap(recap.clone()))
-            }
-            DaemonMsg::Ask { call, tool, input } => self.ask(*call, tool, input),
             DaemonMsg::Draining => Some(Change::Draining),
             DaemonMsg::Mismatch { supported, .. } => Some(Change::Mismatch {
                 supported: *supported,
@@ -464,26 +471,9 @@ impl SessionView {
     }
 
     /// Takes the log-derived state of `snapshot`, keeping what only this
-    /// connection saw where it still holds: which waiting calls it was asked
-    /// about, and the reply streaming in.
+    /// connection saw where it still holds: the reply streaming in.
     fn adopt(&mut self, snapshot: &Self) -> Change {
-        let asked: Vec<u64> = if self.session == snapshot.session {
-            self.asked().collect()
-        } else {
-            Vec::new()
-        };
-        let mut items = snapshot.items.clone();
-        for item in &mut items {
-            if let Item::Tool {
-                call,
-                approval: Some(Approval::Pending),
-                asked: a,
-                ..
-            } = item
-            {
-                *a = asked.contains(call);
-            }
-        }
+        let items = snapshot.items.clone();
         let running = |call| {
             items.iter().any(
                 |i| matches!(i, Item::Reply { call: c, status: Status::Running, .. } if *c == call),
@@ -496,6 +486,7 @@ impl SessionView {
         self.workspace.clone_from(&snapshot.workspace);
         self.seq = snapshot.seq;
         self.environment.clone_from(&snapshot.environment);
+        self.queued.clone_from(&snapshot.queued);
         self.items = items;
         Change::Snapshot {
             items: self.items.clone(),
@@ -510,8 +501,7 @@ impl SessionView {
         self.seq = e.seq;
         let seq = e.seq;
         let item = match &e.body {
-            Body::User { text }
-            | Body::Input {
+            Body::Input {
                 text, taken: true, ..
             } => Item::User {
                 seq,
@@ -540,11 +530,16 @@ impl SessionView {
                     },
                 ..
             } => return self.approval(call.get(), Approval::Pending),
-            Body::Decision { by, call, d } => Item::Hook {
-                seq,
-                hook: by.clone(),
-                decision: self.decision(call.map(crate::CallId::get), d),
-            },
+            Body::Decision { by, call, d } => {
+                let call = call.map(crate::CallId::get);
+                Item::Hook {
+                    seq,
+                    hook: by.clone(),
+                    call,
+                    tool: self.tool_of(call),
+                    decision: d.clone(),
+                }
+            }
             Body::Assistant { text } => Item::Assistant {
                 seq,
                 text: text.clone(),
@@ -558,13 +553,6 @@ impl SessionView {
                 approval: None,
                 outcome: None,
                 card: card.clone(),
-                asked: false,
-            },
-            Body::Command { name, args } => Item::Command {
-                call: seq,
-                name: name.clone(),
-                args: args.clone(),
-                outcome: None,
             },
             Body::ModelCall { model, .. } => Item::Reply {
                 call: seq,
@@ -572,15 +560,6 @@ impl SessionView {
                 text: String::new(),
                 status: Status::Running,
                 usage: None,
-            },
-            Body::Hook {
-                decision: Decision::Approval { call: Some(_), .. },
-                ..
-            } => return self.change(seq, &e.body),
-            Body::Hook { hook, decision } => Item::Hook {
-                seq,
-                hook: hook.clone(),
-                decision: decision.clone(),
             },
             Body::Link { child, input } => Item::Child {
                 call: seq,
@@ -631,9 +610,7 @@ impl SessionView {
                 }
                 Some(self.updated(at, Part::Outcome))
             }
-            Body::CommandResult { call, outcome } => self.command_result(*call, outcome),
             Body::ModelResult { call, outcome } => self.replied(*call, outcome),
-            Body::Ask { call } => self.approval(*call, Approval::Pending),
             Body::Wait {
                 call,
                 on: WaitOn::Approval,
@@ -647,22 +624,6 @@ impl SessionView {
                 };
                 self.approval(call.get(), to)
             }
-            Body::Hook {
-                decision:
-                    Decision::Approval {
-                        approved,
-                        call: Some(call),
-                        ..
-                    },
-                ..
-            } => self.approval(
-                *call,
-                if *approved {
-                    Approval::Approved
-                } else {
-                    Approval::Denied
-                },
-            ),
             Body::Watch { child } => {
                 let at = self.items.iter().rposition(
                     |item| matches!(item, Item::Child { child: c, watch: None, .. } if c == child),
@@ -725,51 +686,57 @@ impl SessionView {
         }
     }
 
-    /// Verdict `d` about call `call`, as a hook item shows it: the call
-    /// names the tool.
-    fn decision(&self, call: Option<u64>, d: &Verdict) -> Decision {
-        let tool = || match call
+    /// The tool of call `call`, as a hook item names it.
+    fn tool_of(&self, call: Option<u64>) -> String {
+        match call
             .and_then(|call| self.call(call))
             .map(|at| &self.items[at])
         {
             Some(Item::Tool { tool, .. }) => tool.clone(),
             Some(Item::Command { name, .. }) => name.clone(),
             _ => String::new(),
-        };
-        let call = call.unwrap_or_default();
-        match d {
-            Verdict::PrepareStep => Decision::PrepareStep { call },
-            Verdict::PreTool { input } => Decision::PreTool {
-                tool: tool(),
-                input: input.clone(),
-            },
-            Verdict::Block { reason } => Decision::Block {
-                tool: tool(),
-                reason: reason.clone(),
-            },
-            Verdict::Permission { permission } => Decision::Permission {
-                tool: tool(),
-                permission: *permission,
-            },
-            Verdict::Approval { approved } => Decision::Approval {
-                tool: tool(),
-                approved: *approved,
-                call: None,
-            },
-            Verdict::PostTool { original } => Decision::PostTool {
-                call,
-                original: original.clone(),
-            },
-            Verdict::OnStop { text } => Decision::OnStop { text: text.clone() },
-            Verdict::Input { original } => Decision::Input {
-                original: original.clone(),
-            },
-            Verdict::Retry { attempt, error } => Decision::Retry {
-                call,
-                attempt: (*attempt).into(),
-                error: error.clone(),
-            },
         }
+    }
+
+    /// What the replay after `since` held, as a recap tells it: the user's
+    /// last message and what the turn did since, `None` when nothing worth
+    /// telling is new (an environment, say).
+    pub fn recap_since(&self, since: u64) -> Option<Recap> {
+        if self.seq <= since {
+            return None;
+        }
+        let prompt = self
+            .items
+            .iter()
+            .rposition(|i| matches!(i, Item::User { .. }));
+        let mut recap = Recap {
+            prompt: prompt.and_then(|at| match &self.items[at] {
+                Item::User { text, .. } => Some(short(text)),
+                _ => None,
+            }),
+            asks: u32::try_from(self.asked().count()).unwrap_or(u32::MAX),
+            ..Recap::default()
+        };
+        for item in &self.items[prompt.map_or(0, |at| at + 1)..] {
+            match item {
+                Item::Tool { tool, .. } => recap.tools.push(tool.clone()),
+                Item::Assistant { text, .. } => recap.reply = Some(short(text)),
+                Item::Reply {
+                    text,
+                    status: Status::Done,
+                    ..
+                } if !text.is_empty() => recap.reply = Some(short(text)),
+                _ => {}
+            }
+            if let Item::Tool { .. } | Item::Reply { .. } = item {
+                match item.phase() {
+                    Some(Phase::Failed | Phase::Interrupted) => recap.failed += 1,
+                    Some(Phase::Running) => recap.running += 1,
+                    _ => {}
+                }
+            }
+        }
+        (recap != Recap::default()).then_some(recap)
     }
 
     fn replied(&mut self, call: u64, outcome: &Outcome) -> Option<Change> {
@@ -801,44 +768,6 @@ impl SessionView {
         Some(self.updated(at, Part::Outcome))
     }
 
-    /// The daemon asks this client to approve `call`: on the call's ask
-    /// entry, and again on every attach while it waits.
-    fn ask(&mut self, call: u64, tool: &str, input: &Json) -> Option<Change> {
-        let at = match self.items.binary_search_by_key(&call, Item::key) {
-            Ok(at) => at,
-            // Attached after the call: show it from the ask.
-            Err(at) => {
-                let item = Item::Tool {
-                    call,
-                    tool: tool.to_owned(),
-                    input: input.clone(),
-                    approval: Some(Approval::Pending),
-                    outcome: None,
-                    card: None,
-                    asked: false,
-                };
-                self.items.insert(at, item);
-                at
-            }
-        };
-        let Item::Tool {
-            approval, asked, ..
-        } = &mut self.items[at]
-        else {
-            return None;
-        };
-        // An answer already logged wins over a stale re-delivery.
-        if *asked || approval.is_some_and(|a| a != Approval::Pending) {
-            return None;
-        }
-        *approval = Some(Approval::Pending);
-        *asked = true;
-        Some(Change::Asked {
-            index: at,
-            item: self.items[at].clone(),
-        })
-    }
-
     fn approval(&mut self, call: u64, to: Approval) -> Option<Change> {
         let at = self.call(call)?;
         match &mut self.items[at] {
@@ -862,16 +791,27 @@ impl SessionView {
     }
 }
 
-/// The answer text of a stored model reply: its message's text parts, or
-/// the bare text an earlier version logged.
+/// The answer text of a stored model reply: its message's text parts.
 fn reply_text(output: &Value) -> String {
-    match output.pointer("/message/content").and_then(Value::as_array) {
-        Some(parts) => parts
-            .iter()
-            .filter(|part| part["type"] == "text")
-            .filter_map(|part| part["text"].as_str())
-            .collect(),
-        None => output["text"].as_str().unwrap_or_default().to_owned(),
+    output
+        .pointer("/message/content")
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+        .filter(|part| part["type"] == "text")
+        .filter_map(|part| part["text"].as_str())
+        .collect()
+}
+
+/// The first line of `text`, cut to a recap's width.
+fn short(text: &str) -> String {
+    const WIDTH: usize = 60;
+    let text = text.trim();
+    let line = text.lines().next().unwrap_or_default();
+    match line.char_indices().nth(WIDTH) {
+        Some((cut, _)) => format!("{}…", &line[..cut]),
+        None if line.len() < text.len() => format!("{line}…"),
+        None => line.to_owned(),
     }
 }
 
@@ -895,20 +835,11 @@ pub fn call_title(tool: &str, input: &Json, card: Option<&Card>) -> String {
     }
 }
 
-/// A finished call's output as text and a short note on it: as its tool's
-/// card presents it, else a command's streams and exit status as older logs
-/// hold them. `None` for any other output.
-pub fn output_text(output: &Json, card: Option<&Card>) -> Option<(String, String)> {
-    if let Some(card) = card.filter(|c| !c.body.is_empty() || !c.note.is_empty()) {
-        return Some((card.body.clone(), card.note.clone()));
-    }
-    let output = output.value();
-    let stdout = output["stdout"].as_str()?;
-    let stderr = output["stderr"].as_str().unwrap_or_default();
-    Some((
-        format!("{stdout}{stderr}"),
-        format!("exit {}", output["exit"]),
-    ))
+/// A finished call's output as text and a short note on it, as its tool's
+/// card presents it; `None` when it presents neither.
+pub fn output_text(card: Option<&Card>) -> Option<(String, String)> {
+    card.filter(|c| !c.body.is_empty() || !c.note.is_empty())
+        .map(|card| (card.body.clone(), card.note.clone()))
 }
 
 /// One line on what a session did, shown after an attach's replay.
@@ -936,13 +867,15 @@ pub fn recap_line(recap: &Recap) -> String {
     parts.join(" · ")
 }
 
-/// What a hook decided, in one line.
-pub fn decision_line(decision: &Decision) -> String {
+/// What extension decision `decision` about call `call` (of tool `tool`)
+/// was, in one line.
+pub fn decision_line(tool: &str, call: Option<u64>, decision: &Verdict) -> String {
+    let call = call.unwrap_or_default();
     match decision {
-        Decision::PrepareStep { call } => format!("rewrote the request of call {call}"),
-        Decision::PreTool { tool, .. } => format!("rewrote the input of {tool}"),
-        Decision::Block { tool, reason } => format!("blocked {tool}: {reason}"),
-        Decision::Permission { tool, permission } => {
+        Verdict::PrepareStep => format!("rewrote the request of call {call}"),
+        Verdict::PreTool { .. } => format!("rewrote the input of {tool}"),
+        Verdict::Block { reason } => format!("blocked {tool}: {reason}"),
+        Verdict::Permission { permission } => {
             let permission = match permission {
                 Permission::Allow => "allow",
                 Permission::Ask => "ask",
@@ -951,7 +884,7 @@ pub fn decision_line(decision: &Decision) -> String {
             };
             format!("{tool}: {permission}")
         }
-        Decision::Approval { tool, approved, .. } => {
+        Verdict::Approval { approved } => {
             let answer = if *approved {
                 "approved"
             } else {
@@ -959,14 +892,12 @@ pub fn decision_line(decision: &Decision) -> String {
             };
             format!("{tool} {answer}")
         }
-        Decision::PostTool { call, .. } => format!("rewrote the outcome of call {call}"),
-        Decision::OnStop { text } => format!("continued with: {text}"),
-        Decision::Input { original } => format!("rewrote your input: {original}"),
-        Decision::Retry {
-            call,
-            attempt,
-            error,
-        } => format!("retried call {call} (attempt {attempt}): {error}"),
+        Verdict::PostTool { .. } => format!("rewrote the outcome of call {call}"),
+        Verdict::OnStop { text } => format!("continued with: {text}"),
+        Verdict::Input { original } => format!("rewrote your input: {original}"),
+        Verdict::Retry { attempt, error } => {
+            format!("retried call {call} (attempt {attempt}): {error}")
+        }
     }
 }
 

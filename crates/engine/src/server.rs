@@ -14,7 +14,7 @@ use std::task::Poll;
 use std::time::Duration;
 
 use protocol::{
-    Author, Cap, Caps, ClientDecl, ClientId, ClientMsg, ClientSeq, DaemonMsg, Decode, Environment,
+    Author, Caps, ClientDecl, ClientId, ClientMsg, ClientSeq, DaemonMsg, Decode, Environment,
     Frame, HomeSettings, Mode, Origin, PROTO, Rejection, Role, SettingsChange, Versions,
 };
 use rt::Async;
@@ -200,7 +200,7 @@ pub(crate) async fn handle(
         }
         _ => (Verdict::Mismatch, Versions::from(0), Caps::NONE, None),
     };
-    let outbox = Outbox::new(caps);
+    let outbox = Outbox::new();
     daemon
         .shared
         .rt
@@ -430,11 +430,11 @@ impl Conn<'_> {
         answer.map_err(|message| (refused, message))
     }
 
-    /// Tells the client the answer to its mutation `client_seq`: an ack
-    /// or rejection where it takes them, else an error for a refusal.
+    /// Tells the client the answer to its mutation `client_seq`: an ack or
+    /// rejection for a numbered one, else an error for a refusal.
     fn answered(&self, client_seq: Option<u64>, answer: Answer) {
         match (client_seq, answer) {
-            (Some(client_seq), answer) if self.outbox.caps().has(Cap::Ack) => {
+            (Some(client_seq), answer) => {
                 let origin = Origin {
                     client: self.number,
                     client_seq,

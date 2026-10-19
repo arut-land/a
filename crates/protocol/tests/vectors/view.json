@@ -13,9 +13,10 @@
       },
       {
         "epoch": 0,
-        "kind": "user",
+        "kind": "input",
         "seq": 1,
         "t": "entry",
+        "taken": true,
         "text": "hi"
       },
       {
@@ -179,7 +180,7 @@
     ]
   },
   {
-    "hash": "d8ec515c69444324",
+    "hash": "bba7adb8f96cad00",
     "messages": [
       {
         "session": "00000000-0000-0000-0000-00000000000a",
@@ -194,12 +195,15 @@
         "kind": "tool_call",
         "seq": 1,
         "t": "entry",
-        "tool": "run_command"
+        "tool": "bash"
       },
       {
+        "by": "policy",
         "call": 1,
+        "d": "permission",
         "epoch": 0,
-        "kind": "ask",
+        "kind": "decision",
+        "permission": "ask",
         "seq": 2,
         "t": "entry"
       },
@@ -208,55 +212,26 @@
         "t": "synced"
       },
       {
-        "asks": 1,
-        "failed": 0,
-        "prompt": null,
-        "reply": null,
-        "running": 0,
-        "t": "recap",
-        "tools": [
-          "run_command"
-        ]
-      },
-      {
         "call": 1,
-        "input": {
-          "command": "echo hi"
-        },
-        "t": "ask",
-        "tool": "run_command"
-      },
-      {
-        "call": 1,
-        "input": {
-          "command": "echo hi"
-        },
-        "t": "ask",
-        "tool": "run_command"
-      },
-      {
-        "decision": {
-          "approval": {
-            "approved": true,
-            "call": 1,
-            "tool": "run_command"
-          }
-        },
         "epoch": 0,
-        "hook": "user",
-        "kind": "hook",
+        "kind": "answer",
         "seq": 3,
-        "t": "entry"
+        "t": "entry",
+        "value": true
       },
       {
         "call": 1,
+        "card": {
+          "body": "hi\n",
+          "note": "exit 0",
+          "title": "$ echo hi"
+        },
         "epoch": 0,
         "kind": "tool_result",
         "outcome": {
           "output": {
             "exit": 0,
-            "stderr": "",
-            "stdout": "hi\n"
+            "output": "hi\n"
           },
           "status": "done"
         },
@@ -264,25 +239,29 @@
         "t": "entry"
       }
     ],
-    "name": "an approval asked, re-delivered on attach, and answered",
+    "name": "an approval asked, then answered",
     "state": {
       "environment": null,
       "items": [
         {
           "approval": "approved",
           "call": 1,
+          "card": {
+            "body": "hi\n",
+            "note": "exit 0",
+            "title": "$ echo hi"
+          },
           "input": {
             "command": "echo hi"
           },
           "outcome": {
             "output": {
               "exit": 0,
-              "stderr": "",
-              "stdout": "hi\n"
+              "output": "hi\n"
             },
             "status": "done"
           },
-          "tool": "run_command",
+          "tool": "bash",
           "type": "tool"
         }
       ],
@@ -312,7 +291,7 @@
               "command": "echo hi"
             },
             "outcome": null,
-            "tool": "run_command",
+            "tool": "bash",
             "type": "tool"
           }
         },
@@ -330,7 +309,7 @@
               "command": "echo hi"
             },
             "outcome": null,
-            "tool": "run_command",
+            "tool": "bash",
             "type": "tool"
           },
           "part": "approval"
@@ -347,39 +326,6 @@
       },
       {
         "change": {
-          "asks": 1,
-          "change": "recap",
-          "failed": 0,
-          "prompt": null,
-          "reply": null,
-          "running": 0,
-          "tools": [
-            "run_command"
-          ]
-        },
-        "rev": 5,
-        "seq": 2
-      },
-      {
-        "change": {
-          "change": "asked",
-          "index": 0,
-          "item": {
-            "approval": "pending",
-            "call": 1,
-            "input": {
-              "command": "echo hi"
-            },
-            "outcome": null,
-            "tool": "run_command",
-            "type": "tool"
-          }
-        },
-        "rev": 6,
-        "seq": 2
-      },
-      {
-        "change": {
           "change": "updated",
           "index": 0,
           "item": {
@@ -389,12 +335,12 @@
               "command": "echo hi"
             },
             "outcome": null,
-            "tool": "run_command",
+            "tool": "bash",
             "type": "tool"
           },
           "part": "approval"
         },
-        "rev": 7,
+        "rev": 5,
         "seq": 3
       },
       {
@@ -404,23 +350,169 @@
           "item": {
             "approval": "approved",
             "call": 1,
+            "card": {
+              "body": "hi\n",
+              "note": "exit 0",
+              "title": "$ echo hi"
+            },
             "input": {
               "command": "echo hi"
             },
             "outcome": {
               "output": {
                 "exit": 0,
-                "stderr": "",
-                "stdout": "hi\n"
+                "output": "hi\n"
               },
               "status": "done"
             },
-            "tool": "run_command",
+            "tool": "bash",
             "type": "tool"
           },
           "part": "outcome"
         },
-        "rev": 8,
+        "rev": 6,
+        "seq": 4
+      }
+    ]
+  },
+  {
+    "hash": "0ffceb3c60b2162a",
+    "messages": [
+      {
+        "session": "00000000-0000-0000-0000-00000000000a",
+        "t": "attached",
+        "workspace": "/w"
+      },
+      {
+        "epoch": 0,
+        "kind": "input",
+        "seq": 1,
+        "t": "entry",
+        "taken": true,
+        "text": "one"
+      },
+      {
+        "epoch": 0,
+        "kind": "input",
+        "mode": "steer",
+        "seq": 2,
+        "t": "entry",
+        "text": "two"
+      },
+      {
+        "attempt": 1,
+        "by": "retry",
+        "call": 1,
+        "d": "retry",
+        "epoch": 0,
+        "error": "rate limited",
+        "kind": "decision",
+        "seq": 3,
+        "t": "entry"
+      },
+      {
+        "epoch": 0,
+        "input": 2,
+        "kind": "take",
+        "seq": 4,
+        "t": "entry"
+      },
+      {
+        "seq": 4,
+        "t": "synced"
+      }
+    ],
+    "name": "input queued, steered and taken up",
+    "state": {
+      "environment": null,
+      "items": [
+        {
+          "seq": 1,
+          "text": "one",
+          "type": "user"
+        },
+        {
+          "call": 1,
+          "decision": {
+            "attempt": 1,
+            "d": "retry",
+            "error": "rate limited"
+          },
+          "hook": "retry",
+          "seq": 3,
+          "type": "hook"
+        },
+        {
+          "seq": 4,
+          "text": "two",
+          "type": "user"
+        }
+      ],
+      "seq": 4,
+      "session": "00000000-0000-0000-0000-00000000000a",
+      "workspace": "/w"
+    },
+    "updates": [
+      {
+        "change": {
+          "change": "attached",
+          "reset": true,
+          "session": "00000000-0000-0000-0000-00000000000a",
+          "workspace": "/w"
+        },
+        "rev": 1,
+        "seq": 0
+      },
+      {
+        "change": {
+          "change": "added",
+          "index": 0,
+          "item": {
+            "seq": 1,
+            "text": "one",
+            "type": "user"
+          }
+        },
+        "rev": 2,
+        "seq": 1
+      },
+      {
+        "change": {
+          "change": "added",
+          "index": 1,
+          "item": {
+            "call": 1,
+            "decision": {
+              "attempt": 1,
+              "d": "retry",
+              "error": "rate limited"
+            },
+            "hook": "retry",
+            "seq": 3,
+            "type": "hook"
+          }
+        },
+        "rev": 3,
+        "seq": 3
+      },
+      {
+        "change": {
+          "change": "added",
+          "index": 2,
+          "item": {
+            "seq": 4,
+            "text": "two",
+            "type": "user"
+          }
+        },
+        "rev": 4,
+        "seq": 4
+      },
+      {
+        "change": {
+          "change": "synced"
+        },
+        "rev": 5,
         "seq": 4
       }
     ]
@@ -573,9 +665,10 @@
       },
       {
         "epoch": 0,
-        "kind": "user",
+        "kind": "input",
         "seq": 1,
         "t": "entry",
+        "taken": true,
         "text": "one"
       },
       {
@@ -606,9 +699,10 @@
       },
       {
         "epoch": 0,
-        "kind": "user",
+        "kind": "input",
         "seq": 3,
         "t": "entry",
+        "taken": true,
         "text": "two"
       },
       {
@@ -808,7 +902,7 @@
     ]
   },
   {
-    "hash": "dcf01e037d7052a0",
+    "hash": "f4b4a384fdd00046",
     "messages": [
       {
         "session": "00000000-0000-0000-0000-00000000000a",
@@ -860,24 +954,36 @@
       },
       {
         "epoch": 0,
-        "kind": "command",
-        "name": "jobs",
+        "kind": "input",
         "seq": 4,
-        "t": "entry"
+        "t": "entry",
+        "taken": true,
+        "text": "/jobs"
       },
       {
-        "call": 4,
+        "by": "user",
         "epoch": 0,
-        "kind": "command_result",
+        "input": {
+          "args": ""
+        },
+        "kind": "tool_call",
+        "seq": 5,
+        "t": "entry",
+        "tool": "jobs"
+      },
+      {
+        "call": 5,
+        "epoch": 0,
+        "kind": "tool_result",
         "outcome": {
           "output": "no jobs",
           "status": "done"
         },
-        "seq": 5,
+        "seq": 6,
         "t": "entry"
       },
       {
-        "seq": 5,
+        "seq": 6,
         "t": "synced"
       }
     ],
@@ -908,7 +1014,7 @@
         },
         {
           "args": "",
-          "call": 4,
+          "call": 5,
           "name": "jobs",
           "outcome": {
             "output": "no jobs",
@@ -917,7 +1023,7 @@
           "type": "command"
         }
       ],
-      "seq": 5,
+      "seq": 6,
       "session": "00000000-0000-0000-0000-00000000000a",
       "workspace": "/w"
     },
@@ -988,11 +1094,9 @@
           "change": "added",
           "index": 1,
           "item": {
-            "args": "",
-            "call": 4,
-            "name": "jobs",
-            "outcome": null,
-            "type": "command"
+            "seq": 4,
+            "text": "/jobs",
+            "type": "user"
           }
         },
         "rev": 4,
@@ -1004,12 +1108,9 @@
           "index": 1,
           "item": {
             "args": "",
-            "call": 4,
+            "call": 5,
             "name": "jobs",
-            "outcome": {
-              "output": "no jobs",
-              "status": "done"
-            },
+            "outcome": null,
             "type": "command"
           },
           "part": "outcome"
@@ -1019,10 +1120,29 @@
       },
       {
         "change": {
-          "change": "synced"
+          "change": "updated",
+          "index": 1,
+          "item": {
+            "args": "",
+            "call": 5,
+            "name": "jobs",
+            "outcome": {
+              "output": "no jobs",
+              "status": "done"
+            },
+            "type": "command"
+          },
+          "part": "outcome"
         },
         "rev": 6,
-        "seq": 5
+        "seq": 6
+      },
+      {
+        "change": {
+          "change": "synced"
+        },
+        "rev": 7,
+        "seq": 6
       }
     ]
   },
@@ -1036,9 +1156,10 @@
       },
       {
         "epoch": 0,
-        "kind": "user",
+        "kind": "input",
         "seq": 1,
         "t": "entry",
+        "taken": true,
         "text": "one"
       },
       {
@@ -1099,14 +1220,6 @@
       {
         "seq": 4,
         "t": "synced"
-      },
-      {
-        "call": 3,
-        "input": {
-          "command": "echo hi"
-        },
-        "t": "ask",
-        "tool": "bash"
       },
       {
         "epoch": 0,
@@ -1266,24 +1379,6 @@
       },
       {
         "change": {
-          "change": "asked",
-          "index": 2,
-          "item": {
-            "approval": "pending",
-            "call": 3,
-            "input": {
-              "command": "echo hi"
-            },
-            "outcome": null,
-            "tool": "bash",
-            "type": "tool"
-          }
-        },
-        "rev": 9,
-        "seq": 4
-      },
-      {
-        "change": {
           "change": "added",
           "index": 3,
           "item": {
@@ -1292,13 +1387,13 @@
             "type": "assistant"
           }
         },
-        "rev": 10,
+        "rev": 9,
         "seq": 5
       }
     ]
   },
   {
-    "hash": "bf08f5b5f14d1541",
+    "hash": "7176f654e707cb04",
     "messages": [
       {
         "session": "00000000-0000-0000-0000-00000000000a",
@@ -1308,15 +1403,6 @@
       {
         "seq": 0,
         "t": "synced"
-      },
-      {
-        "asks": 0,
-        "failed": 0,
-        "prompt": null,
-        "reply": null,
-        "running": 0,
-        "t": "recap",
-        "tools": []
       },
       {
         "child": "00000000-0000-0000-16df-9d6ac76bd322",
@@ -1354,17 +1440,13 @@
         "t": "entry"
       },
       {
-        "decision": {
-          "block": {
-            "reason": "no",
-            "tool": "t"
-          }
-        },
+        "by": "policy",
+        "d": "on_stop",
         "epoch": 0,
-        "hook": "policy",
-        "kind": "hook",
+        "kind": "decision",
         "seq": 5,
-        "t": "entry"
+        "t": "entry",
+        "text": "go on"
       },
       {
         "message": "e",
@@ -1431,36 +1513,25 @@
         "kind": "tool_call",
         "seq": 9,
         "t": "entry",
-        "tool": "run_command"
+        "tool": "bash"
       },
       {
+        "by": "policy",
         "call": 9,
+        "d": "permission",
         "epoch": 0,
-        "kind": "ask",
+        "kind": "decision",
+        "permission": "ask",
         "seq": 10,
         "t": "entry"
       },
       {
         "call": 9,
-        "input": {
-          "command": "echo 7"
-        },
-        "t": "ask",
-        "tool": "run_command"
-      },
-      {
-        "decision": {
-          "approval": {
-            "approved": false,
-            "call": 9,
-            "tool": "run_command"
-          }
-        },
         "epoch": 0,
-        "hook": "user",
-        "kind": "hook",
+        "kind": "answer",
         "seq": 11,
-        "t": "entry"
+        "t": "entry",
+        "value": false
       },
       {
         "boot": "b",
@@ -1473,13 +1544,17 @@
       },
       {
         "call": 9,
+        "card": {
+          "body": "x\n",
+          "note": "exit 0",
+          "title": "$ echo"
+        },
         "epoch": 0,
         "kind": "tool_result",
         "outcome": {
           "output": {
             "exit": 0,
-            "stderr": "",
-            "stdout": "x\n"
+            "output": "x\n"
           },
           "status": "done"
         },
@@ -1576,17 +1651,13 @@
         "watch": 17
       },
       {
-        "decision": {
-          "block": {
-            "reason": "no",
-            "tool": "t"
-          }
-        },
+        "by": "policy",
+        "d": "on_stop",
         "epoch": 0,
-        "hook": "policy",
-        "kind": "hook",
+        "kind": "decision",
         "seq": 19,
-        "t": "entry"
+        "t": "entry",
+        "text": "go on"
       },
       {
         "message": "e",
@@ -1645,22 +1716,17 @@
       },
       {
         "epoch": 0,
-        "kind": "user",
+        "kind": "input",
+        "mode": "steer",
         "seq": 22,
         "t": "entry",
+        "taken": true,
         "text": "u47"
       },
       {
         "epoch": 0,
-        "kind": "user",
-        "seq": 23,
-        "t": "entry",
-        "text": "u13"
-      },
-      {
-        "epoch": 0,
         "kind": "from_a_newer_build",
-        "seq": 24,
+        "seq": 23,
         "t": "entry"
       },
       {
@@ -1668,14 +1734,14 @@
         "epoch": 0,
         "input": "go",
         "kind": "link",
-        "seq": 25,
+        "seq": 24,
         "t": "entry"
       },
       {
         "child": "00000000-0000-0000-0ceb-9e68e19650bf",
         "epoch": 0,
         "kind": "watch",
-        "seq": 26,
+        "seq": 25,
         "t": "entry"
       },
       {
@@ -1685,9 +1751,9 @@
           "error": "f",
           "status": "failed"
         },
-        "seq": 27,
+        "seq": 26,
         "t": "entry",
-        "watch": 26
+        "watch": 25
       },
       {
         "epoch": 0,
@@ -1695,36 +1761,44 @@
           "command": "echo 3"
         },
         "kind": "tool_call",
-        "seq": 28,
+        "seq": 27,
         "t": "entry",
-        "tool": "run_command"
+        "tool": "bash"
       },
       {
-        "call": 28,
+        "by": "policy",
+        "call": 27,
+        "d": "permission",
         "epoch": 0,
-        "kind": "ask",
-        "seq": 29,
+        "kind": "decision",
+        "permission": "ask",
+        "seq": 28,
         "t": "entry"
-      },
-      {
-        "call": 28,
-        "input": {
-          "command": "echo 3"
-        },
-        "t": "ask",
-        "tool": "run_command"
       },
       {
         "epoch": 0,
         "kind": "assistant",
-        "seq": 30,
+        "seq": 29,
         "t": "entry",
         "text": "a38"
+      },
+      {
+        "cwd": "/w1",
+        "epoch": 0,
+        "kind": "environment",
+        "seq": 30,
+        "t": "entry",
+        "tty": false,
+        "vars": {}
       }
     ],
     "name": "generated session 7",
     "state": {
-      "environment": null,
+      "environment": {
+        "cwd": "/w1",
+        "tty": false,
+        "vars": {}
+      },
       "items": [
         {
           "call": 1,
@@ -1738,10 +1812,8 @@
         },
         {
           "decision": {
-            "block": {
-              "reason": "no",
-              "tool": "t"
-            }
+            "d": "on_stop",
+            "text": "go on"
           },
           "hook": "policy",
           "seq": 5,
@@ -1765,18 +1837,22 @@
         {
           "approval": "denied",
           "call": 9,
+          "card": {
+            "body": "x\n",
+            "note": "exit 0",
+            "title": "$ echo"
+          },
           "input": {
             "command": "echo 7"
           },
           "outcome": {
             "output": {
               "exit": 0,
-              "stderr": "",
-              "stdout": "x\n"
+              "output": "x\n"
             },
             "status": "done"
           },
-          "tool": "run_command",
+          "tool": "bash",
           "type": "tool"
         },
         {
@@ -1807,10 +1883,8 @@
         },
         {
           "decision": {
-            "block": {
-              "reason": "no",
-              "tool": "t"
-            }
+            "d": "on_stop",
+            "text": "go on"
           },
           "hook": "policy",
           "seq": 19,
@@ -1835,12 +1909,7 @@
           "type": "user"
         },
         {
-          "seq": 23,
-          "text": "u13",
-          "type": "user"
-        },
-        {
-          "call": 25,
+          "call": 24,
           "child": "00000000-0000-0000-0ceb-9e68e19650bf",
           "fired": {
             "error": "f",
@@ -1848,22 +1917,27 @@
           },
           "input": "go",
           "type": "child",
-          "watch": 26
+          "watch": 25
         },
         {
           "approval": "pending",
-          "call": 28,
+          "call": 27,
           "input": {
             "command": "echo 3"
           },
           "outcome": null,
-          "tool": "run_command",
+          "tool": "bash",
           "type": "tool"
         },
         {
-          "seq": 30,
+          "seq": 29,
           "text": "a38",
           "type": "assistant"
+        },
+        {
+          "cwd": "/w1",
+          "seq": 30,
+          "type": "environment"
         }
       ],
       "seq": 30,
@@ -1890,19 +1964,6 @@
       },
       {
         "change": {
-          "asks": 0,
-          "change": "recap",
-          "failed": 0,
-          "prompt": null,
-          "reply": null,
-          "running": 0,
-          "tools": []
-        },
-        "rev": 3,
-        "seq": 0
-      },
-      {
-        "change": {
           "change": "added",
           "index": 0,
           "item": {
@@ -1914,7 +1975,7 @@
             "watch": null
           }
         },
-        "rev": 4,
+        "rev": 3,
         "seq": 1
       },
       {
@@ -1931,7 +1992,7 @@
           },
           "part": "watch"
         },
-        "rev": 5,
+        "rev": 4,
         "seq": 2
       },
       {
@@ -1950,7 +2011,7 @@
           },
           "part": "outcome"
         },
-        "rev": 6,
+        "rev": 5,
         "seq": 3
       },
       {
@@ -1958,7 +2019,7 @@
           "change": "error",
           "message": "e"
         },
-        "rev": 7,
+        "rev": 6,
         "seq": 3
       },
       {
@@ -1967,15 +2028,21 @@
           "index": 1,
           "item": {
             "decision": {
-              "block": {
-                "reason": "no",
-                "tool": "t"
-              }
+              "d": "on_stop",
+              "text": "go on"
             },
             "hook": "policy",
             "seq": 5,
             "type": "hook"
           }
+        },
+        "rev": 7,
+        "seq": 5
+      },
+      {
+        "change": {
+          "change": "error",
+          "message": "e"
         },
         "rev": 8,
         "seq": 5
@@ -1998,14 +2065,6 @@
       },
       {
         "change": {
-          "change": "error",
-          "message": "e"
-        },
-        "rev": 11,
-        "seq": 5
-      },
-      {
-        "change": {
           "change": "added",
           "index": 2,
           "item": {
@@ -2019,7 +2078,7 @@
             "usage": null
           }
         },
-        "rev": 12,
+        "rev": 11,
         "seq": 6
       },
       {
@@ -2028,7 +2087,7 @@
           "change": "delta",
           "text": "r"
         },
-        "rev": 13,
+        "rev": 12,
         "seq": 6
       },
       {
@@ -2037,7 +2096,7 @@
           "change": "delta",
           "text": "ep"
         },
-        "rev": 14,
+        "rev": 13,
         "seq": 6
       },
       {
@@ -2046,7 +2105,7 @@
           "change": "delta",
           "text": "ly "
         },
-        "rev": 15,
+        "rev": 14,
         "seq": 6
       },
       {
@@ -2055,7 +2114,7 @@
           "change": "delta",
           "text": "3"
         },
-        "rev": 16,
+        "rev": 15,
         "seq": 6
       },
       {
@@ -2064,7 +2123,7 @@
           "change": "delta",
           "text": "2"
         },
-        "rev": 17,
+        "rev": 16,
         "seq": 6
       },
       {
@@ -2077,7 +2136,7 @@
             "type": "assistant"
           }
         },
-        "rev": 18,
+        "rev": 17,
         "seq": 8
       },
       {
@@ -2091,11 +2150,11 @@
               "command": "echo 7"
             },
             "outcome": null,
-            "tool": "run_command",
+            "tool": "bash",
             "type": "tool"
           }
         },
-        "rev": 19,
+        "rev": 18,
         "seq": 9
       },
       {
@@ -2109,30 +2168,12 @@
               "command": "echo 7"
             },
             "outcome": null,
-            "tool": "run_command",
+            "tool": "bash",
             "type": "tool"
           },
           "part": "approval"
         },
-        "rev": 20,
-        "seq": 10
-      },
-      {
-        "change": {
-          "change": "asked",
-          "index": 4,
-          "item": {
-            "approval": "pending",
-            "call": 9,
-            "input": {
-              "command": "echo 7"
-            },
-            "outcome": null,
-            "tool": "run_command",
-            "type": "tool"
-          }
-        },
-        "rev": 21,
+        "rev": 19,
         "seq": 10
       },
       {
@@ -2146,12 +2187,12 @@
               "command": "echo 7"
             },
             "outcome": null,
-            "tool": "run_command",
+            "tool": "bash",
             "type": "tool"
           },
           "part": "approval"
         },
-        "rev": 22,
+        "rev": 20,
         "seq": 11
       },
       {
@@ -2161,23 +2202,27 @@
           "item": {
             "approval": "denied",
             "call": 9,
+            "card": {
+              "body": "x\n",
+              "note": "exit 0",
+              "title": "$ echo"
+            },
             "input": {
               "command": "echo 7"
             },
             "outcome": {
               "output": {
                 "exit": 0,
-                "stderr": "",
-                "stdout": "x\n"
+                "output": "x\n"
               },
               "status": "done"
             },
-            "tool": "run_command",
+            "tool": "bash",
             "type": "tool"
           },
           "part": "outcome"
         },
-        "rev": 23,
+        "rev": 21,
         "seq": 13
       },
       {
@@ -2195,7 +2240,7 @@
             "usage": null
           }
         },
-        "rev": 24,
+        "rev": 22,
         "seq": 14
       },
       {
@@ -2204,7 +2249,7 @@
           "change": "delta",
           "text": "r"
         },
-        "rev": 25,
+        "rev": 23,
         "seq": 14
       },
       {
@@ -2213,7 +2258,7 @@
           "change": "delta",
           "text": "ep"
         },
-        "rev": 26,
+        "rev": 24,
         "seq": 14
       },
       {
@@ -2222,7 +2267,7 @@
           "change": "delta",
           "text": "l"
         },
-        "rev": 27,
+        "rev": 25,
         "seq": 14
       },
       {
@@ -2231,7 +2276,7 @@
           "change": "delta",
           "text": "y "
         },
-        "rev": 28,
+        "rev": 26,
         "seq": 14
       },
       {
@@ -2240,7 +2285,7 @@
           "change": "delta",
           "text": "48"
         },
-        "rev": 29,
+        "rev": 27,
         "seq": 14
       },
       {
@@ -2249,7 +2294,7 @@
           "change": "delta",
           "text": "2"
         },
-        "rev": 30,
+        "rev": 28,
         "seq": 14
       },
       {
@@ -2271,7 +2316,7 @@
           },
           "part": "outcome"
         },
-        "rev": 31,
+        "rev": 29,
         "seq": 15
       },
       {
@@ -2287,7 +2332,7 @@
             "watch": null
           }
         },
-        "rev": 32,
+        "rev": 30,
         "seq": 16
       },
       {
@@ -2304,7 +2349,7 @@
           },
           "part": "watch"
         },
-        "rev": 33,
+        "rev": 31,
         "seq": 17
       },
       {
@@ -2326,7 +2371,7 @@
           },
           "part": "outcome"
         },
-        "rev": 34,
+        "rev": 32,
         "seq": 18
       },
       {
@@ -2335,17 +2380,15 @@
           "index": 7,
           "item": {
             "decision": {
-              "block": {
-                "reason": "no",
-                "tool": "t"
-              }
+              "d": "on_stop",
+              "text": "go on"
             },
             "hook": "policy",
             "seq": 19,
             "type": "hook"
           }
         },
-        "rev": 35,
+        "rev": 33,
         "seq": 19
       },
       {
@@ -2353,7 +2396,7 @@
           "change": "error",
           "message": "e"
         },
-        "rev": 36,
+        "rev": 34,
         "seq": 19
       },
       {
@@ -2371,7 +2414,7 @@
             "usage": null
           }
         },
-        "rev": 37,
+        "rev": 35,
         "seq": 20
       },
       {
@@ -2380,7 +2423,7 @@
           "change": "delta",
           "text": "r"
         },
-        "rev": 38,
+        "rev": 36,
         "seq": 20
       },
       {
@@ -2389,7 +2432,7 @@
           "change": "delta",
           "text": "e"
         },
-        "rev": 39,
+        "rev": 37,
         "seq": 20
       },
       {
@@ -2398,7 +2441,7 @@
           "change": "delta",
           "text": "ply "
         },
-        "rev": 40,
+        "rev": 38,
         "seq": 20
       },
       {
@@ -2407,7 +2450,7 @@
           "change": "delta",
           "text": "467"
         },
-        "rev": 41,
+        "rev": 39,
         "seq": 20
       },
       {
@@ -2429,7 +2472,7 @@
           },
           "part": "outcome"
         },
-        "rev": 42,
+        "rev": 40,
         "seq": 21
       },
       {
@@ -2442,7 +2485,7 @@
             "type": "user"
           }
         },
-        "rev": 43,
+        "rev": 41,
         "seq": 22
       },
       {
@@ -2450,20 +2493,7 @@
           "change": "added",
           "index": 10,
           "item": {
-            "seq": 23,
-            "text": "u13",
-            "type": "user"
-          }
-        },
-        "rev": 44,
-        "seq": 23
-      },
-      {
-        "change": {
-          "change": "added",
-          "index": 11,
-          "item": {
-            "call": 25,
+            "call": 24,
             "child": "00000000-0000-0000-0ceb-9e68e19650bf",
             "fired": null,
             "input": "go",
@@ -2471,32 +2501,32 @@
             "watch": null
           }
         },
-        "rev": 45,
+        "rev": 42,
+        "seq": 24
+      },
+      {
+        "change": {
+          "change": "updated",
+          "index": 10,
+          "item": {
+            "call": 24,
+            "child": "00000000-0000-0000-0ceb-9e68e19650bf",
+            "fired": null,
+            "input": "go",
+            "type": "child",
+            "watch": 25
+          },
+          "part": "watch"
+        },
+        "rev": 43,
         "seq": 25
       },
       {
         "change": {
           "change": "updated",
-          "index": 11,
+          "index": 10,
           "item": {
-            "call": 25,
-            "child": "00000000-0000-0000-0ceb-9e68e19650bf",
-            "fired": null,
-            "input": "go",
-            "type": "child",
-            "watch": 26
-          },
-          "part": "watch"
-        },
-        "rev": 46,
-        "seq": 26
-      },
-      {
-        "change": {
-          "change": "updated",
-          "index": 11,
-          "item": {
-            "call": 25,
+            "call": 24,
             "child": "00000000-0000-0000-0ceb-9e68e19650bf",
             "fired": {
               "error": "f",
@@ -2504,66 +2534,61 @@
             },
             "input": "go",
             "type": "child",
-            "watch": 26
+            "watch": 25
           },
           "part": "outcome"
         },
-        "rev": 47,
+        "rev": 44,
+        "seq": 26
+      },
+      {
+        "change": {
+          "change": "added",
+          "index": 11,
+          "item": {
+            "approval": null,
+            "call": 27,
+            "input": {
+              "command": "echo 3"
+            },
+            "outcome": null,
+            "tool": "bash",
+            "type": "tool"
+          }
+        },
+        "rev": 45,
         "seq": 27
+      },
+      {
+        "change": {
+          "change": "updated",
+          "index": 11,
+          "item": {
+            "approval": "pending",
+            "call": 27,
+            "input": {
+              "command": "echo 3"
+            },
+            "outcome": null,
+            "tool": "bash",
+            "type": "tool"
+          },
+          "part": "approval"
+        },
+        "rev": 46,
+        "seq": 28
       },
       {
         "change": {
           "change": "added",
           "index": 12,
           "item": {
-            "approval": null,
-            "call": 28,
-            "input": {
-              "command": "echo 3"
-            },
-            "outcome": null,
-            "tool": "run_command",
-            "type": "tool"
+            "seq": 29,
+            "text": "a38",
+            "type": "assistant"
           }
         },
-        "rev": 48,
-        "seq": 28
-      },
-      {
-        "change": {
-          "change": "updated",
-          "index": 12,
-          "item": {
-            "approval": "pending",
-            "call": 28,
-            "input": {
-              "command": "echo 3"
-            },
-            "outcome": null,
-            "tool": "run_command",
-            "type": "tool"
-          },
-          "part": "approval"
-        },
-        "rev": 49,
-        "seq": 29
-      },
-      {
-        "change": {
-          "change": "asked",
-          "index": 12,
-          "item": {
-            "approval": "pending",
-            "call": 28,
-            "input": {
-              "command": "echo 3"
-            },
-            "outcome": null,
-            "tool": "run_command",
-            "type": "tool"
-          }
-        },
-        "rev": 50,
+        "rev": 47,
         "seq": 29
       },
       {
@@ -2571,18 +2596,18 @@
           "change": "added",
           "index": 13,
           "item": {
+            "cwd": "/w1",
             "seq": 30,
-            "text": "a38",
-            "type": "assistant"
+            "type": "environment"
           }
         },
-        "rev": 51,
+        "rev": 48,
         "seq": 30
       }
     ]
   },
   {
-    "hash": "0e6018bfe9d70435",
+    "hash": "5c2e1132945c262b",
     "messages": [
       {
         "session": "00000000-0000-0000-0000-00000000000a",
@@ -2594,15 +2619,6 @@
         "t": "synced"
       },
       {
-        "asks": 0,
-        "failed": 0,
-        "prompt": null,
-        "reply": null,
-        "running": 0,
-        "t": "recap",
-        "tools": []
-      },
-      {
         "epoch": 0,
         "input": {
           "command": "echo 1"
@@ -2610,46 +2626,39 @@
         "kind": "tool_call",
         "seq": 1,
         "t": "entry",
-        "tool": "run_command"
+        "tool": "bash"
       },
       {
+        "by": "policy",
         "call": 1,
+        "d": "permission",
         "epoch": 0,
-        "kind": "ask",
+        "kind": "decision",
+        "permission": "ask",
         "seq": 2,
         "t": "entry"
       },
       {
         "call": 1,
-        "input": {
-          "command": "echo 1"
-        },
-        "t": "ask",
-        "tool": "run_command"
-      },
-      {
-        "decision": {
-          "approval": {
-            "approved": false,
-            "call": 1,
-            "tool": "run_command"
-          }
-        },
         "epoch": 0,
-        "hook": "user",
-        "kind": "hook",
+        "kind": "answer",
         "seq": 3,
-        "t": "entry"
+        "t": "entry",
+        "value": false
       },
       {
         "call": 1,
+        "card": {
+          "body": "x\n",
+          "note": "exit 0",
+          "title": "$ echo"
+        },
         "epoch": 0,
         "kind": "tool_result",
         "outcome": {
           "output": {
             "exit": 0,
-            "stderr": "",
-            "stdout": "x\n"
+            "output": "x\n"
           },
           "status": "done"
         },
@@ -2707,18 +2716,22 @@
         {
           "approval": "denied",
           "call": 1,
+          "card": {
+            "body": "x\n",
+            "note": "exit 0",
+            "title": "$ echo"
+          },
           "input": {
             "command": "echo 1"
           },
           "outcome": {
             "output": {
               "exit": 0,
-              "stderr": "",
-              "stdout": "x\n"
+              "output": "x\n"
             },
             "status": "done"
           },
-          "tool": "run_command",
+          "tool": "bash",
           "type": "tool"
         },
         {
@@ -2764,19 +2777,6 @@
       },
       {
         "change": {
-          "asks": 0,
-          "change": "recap",
-          "failed": 0,
-          "prompt": null,
-          "reply": null,
-          "running": 0,
-          "tools": []
-        },
-        "rev": 3,
-        "seq": 0
-      },
-      {
-        "change": {
           "change": "added",
           "index": 0,
           "item": {
@@ -2786,11 +2786,11 @@
               "command": "echo 1"
             },
             "outcome": null,
-            "tool": "run_command",
+            "tool": "bash",
             "type": "tool"
           }
         },
-        "rev": 4,
+        "rev": 3,
         "seq": 1
       },
       {
@@ -2804,30 +2804,12 @@
               "command": "echo 1"
             },
             "outcome": null,
-            "tool": "run_command",
+            "tool": "bash",
             "type": "tool"
           },
           "part": "approval"
         },
-        "rev": 5,
-        "seq": 2
-      },
-      {
-        "change": {
-          "change": "asked",
-          "index": 0,
-          "item": {
-            "approval": "pending",
-            "call": 1,
-            "input": {
-              "command": "echo 1"
-            },
-            "outcome": null,
-            "tool": "run_command",
-            "type": "tool"
-          }
-        },
-        "rev": 6,
+        "rev": 4,
         "seq": 2
       },
       {
@@ -2841,12 +2823,12 @@
               "command": "echo 1"
             },
             "outcome": null,
-            "tool": "run_command",
+            "tool": "bash",
             "type": "tool"
           },
           "part": "approval"
         },
-        "rev": 7,
+        "rev": 5,
         "seq": 3
       },
       {
@@ -2856,23 +2838,27 @@
           "item": {
             "approval": "denied",
             "call": 1,
+            "card": {
+              "body": "x\n",
+              "note": "exit 0",
+              "title": "$ echo"
+            },
             "input": {
               "command": "echo 1"
             },
             "outcome": {
               "output": {
                 "exit": 0,
-                "stderr": "",
-                "stdout": "x\n"
+                "output": "x\n"
               },
               "status": "done"
             },
-            "tool": "run_command",
+            "tool": "bash",
             "type": "tool"
           },
           "part": "outcome"
         },
-        "rev": 8,
+        "rev": 6,
         "seq": 4
       },
       {
@@ -2888,7 +2874,7 @@
             "watch": null
           }
         },
-        "rev": 9,
+        "rev": 7,
         "seq": 5
       },
       {
@@ -2905,7 +2891,7 @@
           },
           "part": "watch"
         },
-        "rev": 10,
+        "rev": 8,
         "seq": 6
       },
       {
@@ -2927,23 +2913,23 @@
           },
           "part": "outcome"
         },
+        "rev": 9,
+        "seq": 7
+      },
+      {
+        "change": {
+          "change": "error",
+          "message": "e"
+        },
+        "rev": 10,
+        "seq": 7
+      },
+      {
+        "change": {
+          "change": "error",
+          "message": "e"
+        },
         "rev": 11,
-        "seq": 7
-      },
-      {
-        "change": {
-          "change": "error",
-          "message": "e"
-        },
-        "rev": 12,
-        "seq": 7
-      },
-      {
-        "change": {
-          "change": "error",
-          "message": "e"
-        },
-        "rev": 13,
         "seq": 7
       },
       {
@@ -2956,7 +2942,7 @@
             "type": "assistant"
           }
         },
-        "rev": 14,
+        "rev": 12,
         "seq": 8
       }
     ]

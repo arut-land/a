@@ -8,9 +8,7 @@ use std::os::unix::fs::PermissionsExt;
 use std::process::Command;
 
 use common::{Env, Repl, assert_contiguous, group_alive, is_tool_call, result_of, wait_for};
-use protocol::{
-    Audience, Body, ClientMsg, DaemonMsg, Mode, Outcome, Permission, Recap, Target, Verdict,
-};
+use protocol::{Audience, Body, ClientMsg, Mode, Outcome, Permission, Target, Verdict};
 use serde_json::json;
 
 const ANY: Target = Target::Latest {
@@ -89,6 +87,8 @@ fn resume_after_the_terminal_closes_mid_turn_replays_every_entry() {
         taken: true,
         origin: None,
     };
+    let opened = bodies.remove(0);
+    assert!(matches!(opened, Body::Extensions { .. }), "{opened:?}");
     let attached = bodies.remove(0);
     assert!(
         matches!(&attached, Body::Environment(shell) if shell.cwd == env.ws),
@@ -142,9 +142,9 @@ fn two_terminals_on_one_session_see_identical_state() {
     let env = Env::new("two-terminals");
     env.start();
     let mut first = env.connect();
-    let (id, _) = first.attach(Target::New, &env.ws);
+    let (id, opened) = first.attach(Target::New, &env.ws);
     let mut second = env.connect();
-    second.attach(Target::Id(id), &env.ws);
+    assert_eq!(second.attach(Target::Id(id), &env.ws).1, opened);
 
     for text in ["one", "$ echo two", "sleep 0"] {
         first.input(text);
@@ -156,7 +156,7 @@ fn two_terminals_on_one_session_see_identical_state() {
         } => output.value()["slept"] == 0,
         _ => false,
     };
-    let seen = [first.until(done), second.until(done)];
+    let seen = [first.until(done), second.until(done)].map(|live| [opened.clone(), live].concat());
     let mut third = env.connect();
     let (_, replayed) = third.attach(Target::Id(id), &env.ws);
 
@@ -187,7 +187,8 @@ fn a_safe_tool_reruns_after_the_daemon_is_killed() {
         entries.extend(conn.until(|e| result_of(e, call).is_some()));
     }
 
-    assert_eq!(torn.len(), 2);
+    // Its extensions, the input and the call.
+    assert_eq!(torn.len(), 3);
     assert_contiguous(&entries);
     assert_eq!(entries, env.log(id));
     let results: Vec<_> = entries.iter().filter_map(|e| result_of(e, call)).collect();
@@ -342,7 +343,7 @@ fn entries_after_a_torn_tail_survive_a_restart() {
     env.run(&["daemon", "stop"]);
     let log = env.home.sessions_dir().join(format!("{id}.jsonl"));
     let mut text = fs::read_to_string(&log).unwrap();
-    text.push_str(r#"{"seq":3,"ep"#);
+    text.push_str(r#"{"seq":4,"ep"#);
     fs::write(&log, text).unwrap();
 
     env.start();
@@ -358,7 +359,7 @@ fn entries_after_a_torn_tail_survive_a_restart() {
     let queued = |e: &&protocol::Entry| {
         matches!(e.body, Body::Input { taken: false, .. } | Body::Take { .. })
     };
-    assert_eq!(entries.iter().filter(|e| !queued(e)).count(), 4);
+    assert_eq!(entries.iter().filter(|e| !queued(e)).count(), 5);
     assert_contiguous(&entries);
     assert_eq!(entries, env.log(id));
 }
@@ -402,7 +403,8 @@ fn a_parents_watch_fires_exactly_once_after_the_daemon_is_killed_mid_child() {
     let (_, replayed) = env.connect().attach(Target::Id(id), &env.ws);
 
     assert!(!torn.0.iter().any(is_fired), "fired before the kill");
-    assert!(!torn.1.iter().any(|e| result_of(e, 2).is_some()));
+    let call = torn.1.iter().find(|e| is_tool_call(e)).unwrap().seq;
+    assert!(!torn.1.iter().any(|e| result_of(e, call).is_some()));
     assert_contiguous(&replayed);
     assert_eq!(replayed, env.log(id));
     let fired: Vec<_> = replayed
@@ -418,7 +420,10 @@ fn a_parents_watch_fires_exactly_once_after_the_daemon_is_killed_mid_child() {
     assert_eq!(fired, [&slept]);
     let child_log = env.log(child);
     assert_contiguous(&child_log);
-    let results: Vec<_> = child_log.iter().filter_map(|e| result_of(e, 2)).collect();
+    let results: Vec<_> = child_log
+        .iter()
+        .filter_map(|e| result_of(e, call))
+        .collect();
     assert_eq!(results, [&slept]);
 }
 
@@ -459,8 +464,7 @@ fn a_pending_approval_survives_detach_and_is_re_delivered_on_attach() {
         unreachable!()
     };
     let call = call.get();
-    let ask = |msg: DaemonMsg| matches!(msg, DaemonMsg::Ask { call: c, tool, .. } if c == call && tool == "bash");
-    assert!(ask(conn.recv()));
+    assert_eq!(conn.view.turn().asking, Some(call));
     let listed = env.run(&["ls"]);
     assert!(listed.contains("  approval   loaded  "), "{listed}");
     drop(conn);
@@ -468,14 +472,14 @@ fn a_pending_approval_survives_detach_and_is_re_delivered_on_attach() {
     let mut conn = env.connect();
     let (_, replayed) = conn.attach(Target::Id(id), &env.ws);
     assert!(replayed.iter().any(|e| e.seq == asked.seq && asks(&e.body)));
-    let recap = Recap {
+    let recap = protocol::view::Recap {
         prompt: Some("$ echo ran > ran.txt".into()),
         tools: vec!["bash".into()],
         asks: 1,
-        ..Recap::default()
+        ..protocol::view::Recap::default()
     };
-    assert!(matches!(conn.recv(), DaemonMsg::Recap(r) if r == recap));
-    assert!(ask(conn.recv()));
+    assert_eq!(conn.view.recap, Some(recap));
+    assert_eq!(conn.view.turn().asking, Some(call));
     drop(conn);
 
     env.kill_daemon();

@@ -5,10 +5,13 @@ use std::process::ExitCode;
 use std::thread;
 
 use client::{Attach, Driver, Effect, End, Endpoint, Env, Event, Link, SessionClient};
+use protocol::Verdict;
+use protocol::view::SessionView;
 use protocol::view::{
-    Approval, Change, Item, Part, Status, Usage, call_title, decision_line, output_text, recap_line,
+    Approval, Change, Item, Part, Phase, Status, Usage, call_title, decision_line, output_text,
+    recap_line,
 };
-use protocol::{Card, ClientMsg, DaemonMsg, Decision, Outcome, SessionSummary, Target};
+use protocol::{Card, ClientMsg, DaemonMsg, Outcome, SessionSummary, Target};
 use sys::{Home, Staged};
 use usage_rs::{Cli, Subcommands};
 
@@ -83,7 +86,7 @@ fn main() -> ExitCode {
         None => session(ctx, Target::New),
         Some(Cmd::Resume { id: None, any }) => session(ctx, Target::Latest { any_workspace: any }),
         Some(Cmd::Resume { id: Some(id), .. } | Cmd::Attach { id }) => {
-            client::target(&ctx.endpoint, &ctx.staged, &id).and_then(|target| session(ctx, target))
+            session(ctx, Target::Prefix(id))
         }
         Some(Cmd::Ls) => ls(&ctx),
         Some(Cmd::New) => new(&ctx),
@@ -303,7 +306,7 @@ impl Repl {
                 if let (None, Change::Error { message }) = (client.view().session, &update.change) {
                     return Some(Err(io::Error::other(message.clone())));
                 }
-                self.screen.show(&update.change);
+                self.screen.show(&update.change, client.view());
             }
             Effect::Notice(text) => eprintln!("[{text}]"),
             Effect::Sessions => {
@@ -386,19 +389,25 @@ fn report(d: &client::Diagnosis) {
 
 /// Prints the shared view's updates as transcript lines. A model reply
 /// streams in as deltas; on replay there are none, so the committed text is
-/// printed instead.
+/// printed instead. What waits for an approval is asked once the replay is
+/// in, after its recap, and as it begins to wait from then on.
 #[derive(Default)]
 struct Screen {
     /// The call whose streamed reply is on the current line.
     streaming: Option<u64>,
+    /// The replay of the latest attach is in.
+    synced: bool,
 }
 
 impl Screen {
-    fn show(&mut self, change: &Change) {
+    fn show(&mut self, change: &Change, view: &SessionView) {
         match change {
             Change::Attached {
                 session, workspace, ..
-            } => println!("[session {} · {}]", session.short(), workspace.display()),
+            } => {
+                self.synced = false;
+                println!("[session {} · {}]", session.short(), workspace.display());
+            }
             Change::Delta { call, text } => {
                 if self.streaming != Some(*call) {
                     self.streaming = Some(*call);
@@ -410,7 +419,8 @@ impl Screen {
             Change::Added { item, .. } => {
                 // A retry streams its reply anew, on a line of its own.
                 if let Item::Hook {
-                    decision: Decision::Retry { call, .. },
+                    call: Some(call),
+                    decision: Verdict::Retry { .. },
                     ..
                 } = item
                     && self.streaming.take_if(|s| s == call).is_some()
@@ -429,19 +439,22 @@ impl Screen {
                 }
             }
             Change::Updated { item, part, .. } => self.updated(item, *part),
-            Change::Asked {
-                item: Item::Tool {
-                    tool, input, card, ..
-                },
-                ..
-            } => println!(
-                "? approve {}  [y/n]",
-                call_title(tool, input, card.as_ref())
-            ),
-            Change::Recap(recap) => println!("[{}]", recap_line(recap)),
+            Change::Synced => {
+                self.synced = true;
+                if let Some(recap) = &view.recap {
+                    println!("[{}]", recap_line(recap));
+                }
+                for item in view
+                    .items
+                    .iter()
+                    .filter(|i| i.phase() == Some(Phase::Asking))
+                {
+                    ask(item);
+                }
+            }
             Change::Mismatch { supported } => eprintln!("[daemon speaks protocol {supported}]"),
             Change::Error { message } => eprintln!("[error: {message}]"),
-            Change::Asked { .. } | Change::Synced | Change::Draining => {}
+            Change::Draining => {}
         }
     }
 
@@ -466,6 +479,11 @@ impl Screen {
                 },
                 Part::Outcome,
             ) => print_outcome(outcome, None),
+            (Item::Tool { .. }, Part::Approval)
+                if self.synced && item.phase() == Some(Phase::Asking) =>
+            {
+                ask(item);
+            }
             (
                 Item::Tool {
                     approval: Some(answer @ (Approval::Approved | Approval::Denied)),
@@ -512,6 +530,18 @@ impl Screen {
     }
 }
 
+fn ask(item: &Item) {
+    if let Item::Tool {
+        tool, input, card, ..
+    } = item
+    {
+        println!(
+            "? approve {}  [y/n]",
+            call_title(tool, input, card.as_ref())
+        );
+    }
+}
+
 fn added(item: &Item) {
     match item {
         Item::User { text, .. } => println!("you  {text}"),
@@ -520,9 +550,13 @@ fn added(item: &Item) {
             tool, input, card, ..
         } => println!("tool {}", call_title(tool, input, card.as_ref())),
         Item::Command { name, args, .. } => println!("cmd  /{name} {args}"),
-        Item::Hook { hook, decision, .. } => {
-            println!("  · hook {hook}: {}", decision_line(decision));
-        }
+        Item::Hook {
+            hook,
+            call,
+            tool,
+            decision,
+            ..
+        } => println!("  · hook {hook}: {}", decision_line(tool, *call, decision)),
         Item::Child { child, input, .. } => println!("child {} {input}", child.short()),
         Item::Environment { cwd, .. } => println!("  · env {}", cwd.display()),
         Item::Reply { .. } => {}
@@ -534,7 +568,7 @@ fn added(item: &Item) {
 fn print_outcome(outcome: &Outcome, card: Option<&Card>) {
     match outcome {
         Outcome::Done { output } => {
-            let (text, note) = match (output_text(output, card), output.value()) {
+            let (text, note) = match (output_text(card), output.value()) {
                 (Some(shown), _) => shown,
                 (None, serde_json::Value::String(text)) => (text, String::new()),
                 (None, output) => (String::new(), output.to_string()),

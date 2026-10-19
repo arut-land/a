@@ -75,14 +75,16 @@ static TEMPLATES: LazyLock<Vec<Value>> = LazyLock::new(|| {
 });
 
 const KINDS: &[&str] = &[
-    "user",
+    "input",
+    "take",
     "tool_call",
     "tool_result",
     "model_call",
     "model_result",
-    "ask",
+    "decision",
+    "wait",
+    "answer",
     "fired",
-    "command_result",
     "from_the_future",
 ];
 

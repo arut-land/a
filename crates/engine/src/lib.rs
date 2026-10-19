@@ -463,7 +463,6 @@ impl Daemon {
             id: SessionId::new(),
             workspace,
             parent: None,
-            extensions: driver::installed(&self.shared.registry.get()),
         };
         let slot = self.new_slot(header);
         Ok(self.start(&slot, Open::Create).await?.open())
@@ -479,7 +478,7 @@ impl Daemon {
 
     /// Starts child session `header.id` on `input`, in `env` (its parent's,
     /// secrets included), unless it runs already: made if missing, given
-    /// `input` if its log is empty, loaded if hibernated. Doing it again is
+    /// `input` if its log has none, loaded if hibernated. Doing it again is
     /// harmless, which recovery relies on.
     async fn start_child(
         &self,
@@ -493,7 +492,7 @@ impl Daemon {
             let slot = self.new_slot(header);
             self.start(&slot, Open::Create).await?
         };
-        if live.summary().entries == 0 {
+        if !live.has_input() {
             if let Some(env) = env {
                 live.set_env(env);
             }

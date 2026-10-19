@@ -5,10 +5,10 @@
 
 use std::path::PathBuf;
 
-use protocol::view::{Change, SessionView, Update};
+use protocol::view::{Change, Recap, SessionView, Update};
 use protocol::{
-    Audience, Body, Card, DaemonMsg, Decision, Decode, Entry, Environment, Json, Outcome, Recap,
-    SessionId,
+    Audience, Body, CallId, Card, DaemonMsg, Decode, Entry, Environment, Json, Mode, Outcome,
+    Permission, SessionId, Verdict,
 };
 use serde_json::{Value, json};
 use uuid::Uuid;
@@ -37,7 +37,7 @@ const SESSION: SessionId = SessionId(Uuid::from_u128(0xa));
 
 /// A session as the daemon has it: its log (entries, and entries of kinds
 /// this build does not know as `Unknown`), and what a client attached from
-/// the start saw live, deltas and asks included.
+/// the start saw live, deltas included.
 #[derive(Default)]
 struct Session {
     log: Vec<DaemonMsg>,
@@ -58,11 +58,7 @@ impl Session {
         let mut s = Self::default();
         for _ in 0..rng.below(24) {
             match rng.below(9) {
-                0 => {
-                    s.commit(Body::User {
-                        text: format!("u{}", rng.below(100)),
-                    });
-                }
+                0 => s.input(rng),
                 1 => {
                     s.commit(Body::Assistant {
                         text: format!("a{}", rng.below(100)),
@@ -71,11 +67,11 @@ impl Session {
                 2 => s.tool(rng),
                 3 => s.model(rng),
                 4 => {
-                    s.commit(Body::Hook {
-                        hook: "policy".into(),
-                        decision: Decision::Block {
-                            tool: "t".into(),
-                            reason: "no".into(),
+                    s.commit(Body::Decision {
+                        by: "policy".into(),
+                        call: None,
+                        d: Verdict::OnStop {
+                            text: "go on".into(),
                         },
                     });
                 }
@@ -102,32 +98,54 @@ impl Session {
         s
     }
 
+    /// Input the user typed: taken as it arrives, or queued and, mostly,
+    /// taken later.
+    fn input(&mut self, rng: &mut Rng) {
+        let text = format!("u{}", rng.below(100));
+        let taken = rng.chance(60);
+        let mode = if rng.chance(50) {
+            Mode::Steer
+        } else {
+            Mode::Queue
+        };
+        let input = self.commit(Body::Input {
+            text,
+            mode,
+            taken,
+            origin: None,
+        });
+        if !taken && rng.chance(70) {
+            self.commit(Body::Take {
+                input: protocol::Seq::new(input).unwrap(),
+            });
+        }
+    }
+
     fn tool(&mut self, rng: &mut Rng) {
         let input: Json = json!({ "command": format!("echo {}", rng.below(10)) }).into();
         let call = self.commit(Body::ToolCall {
-            tool: "run_command".into(),
-            input: input.clone(),
+            tool: "bash".into(),
+            input,
             id: None,
             card: None,
             by: Audience::Model,
         });
+        let id = CallId::new(call).unwrap();
         if rng.chance(50) {
-            self.commit(Body::Ask { call });
-            self.live.push(DaemonMsg::Ask {
-                call,
-                tool: "run_command".into(),
-                input,
+            self.commit(Body::Decision {
+                by: "policy".into(),
+                call: Some(id),
+                d: Verdict::Permission {
+                    permission: Permission::Ask,
+                },
             });
             if rng.chance(30) {
                 return;
             }
-            self.commit(Body::Hook {
-                hook: "user".into(),
-                decision: Decision::Approval {
-                    tool: "run_command".into(),
-                    approved: rng.chance(50),
-                    call: Some(call),
-                },
+            self.commit(Body::Answer {
+                call: id,
+                value: rng.chance(50).into(),
+                origin: None,
             });
         }
         if rng.chance(50) {
@@ -139,11 +157,15 @@ impl Session {
             });
         }
         if rng.chance(80) {
-            let outcome = outcome(rng, json!({ "stdout": "x\n", "stderr": "", "exit": 0 }));
+            let outcome = outcome(rng, json!({ "output": "x\n", "exit": 0 }));
             self.commit(Body::ToolResult {
                 call,
                 outcome,
-                card: None,
+                card: Some(Card {
+                    title: "$ echo".into(),
+                    body: "x\n".into(),
+                    note: "exit 0".into(),
+                }),
             });
         }
     }
@@ -192,7 +214,7 @@ impl Session {
     }
 
     /// What an attach after `since` is sent, as the daemon sends it: the
-    /// entries after it, `Synced`, a recap, and every ask still waiting.
+    /// entries after it, then `Synced`.
     fn attach(&self, since: u64, upto: u64) -> Vec<DaemonMsg> {
         let mut msgs = vec![DaemonMsg::Attached {
             session: SESSION,
@@ -206,38 +228,11 @@ impl Session {
         let log: Vec<_> = self.log.iter().filter(|m| seq(m) <= upto).collect();
         msgs.extend(log.iter().filter(|m| seq(m) > since).map(|&m| m.clone()));
         msgs.push(DaemonMsg::Synced { seq: upto });
-        msgs.push(DaemonMsg::Recap(Recap::default()));
-        let entries = || {
-            log.iter().filter_map(|m| match m {
-                DaemonMsg::Entry(e) => Some(e),
-                _ => None,
-            })
-        };
-        for e in entries() {
-            if let Body::Ask { call } = e.body {
-                let answered = entries().any(|a| {
-                    matches!(a.body, Body::Hook { decision: Decision::Approval { call: Some(c), .. }, .. } if c == call)
-                });
-                let Some(Body::ToolCall { tool, input, .. }) =
-                    entries().find(|t| t.seq == call).map(|t| &t.body)
-                else {
-                    unreachable!()
-                };
-                if !answered {
-                    msgs.push(DaemonMsg::Ask {
-                        call,
-                        tool: tool.clone(),
-                        input: input.clone(),
-                    });
-                }
-            }
-        }
         msgs
     }
 
-    /// [`Session::attach`] as a client that takes snapshots gets it from
-    /// far behind: the entries up to `upto` as one view, through its wire
-    /// form, in place of their replay.
+    /// [`Session::attach`] from far behind: the entries up to `upto` as one
+    /// view, through its wire form, in place of their replay.
     fn attach_snapshot(&self, upto: u64) -> Vec<DaemonMsg> {
         let entries: Vec<Entry> = self
             .log
@@ -404,7 +399,7 @@ fn folding_a_message_twice_changes_nothing_the_second_time() {
         let mut view = SessionView::default();
         for msg in s.watched() {
             view.fold(&msg);
-            if matches!(msg, DaemonMsg::Entry(_) | DaemonMsg::Ask { .. }) {
+            if matches!(msg, DaemonMsg::Entry(_)) {
                 assert_eq!(view.fold(&msg), None, "seed {seed}: {msg:?}");
             }
         }
@@ -442,7 +437,28 @@ fn scenarios() -> Vec<(&'static str, Vec<Value>)> {
             workspace: "/w".into(),
         })
     };
-    let command = json!({ "command": "echo hi" });
+    let input = |text: &str| Body::Input {
+        text: text.into(),
+        mode: Mode::Queue,
+        taken: true,
+        origin: None,
+    };
+    let call = |seq| CallId::new(seq).unwrap();
+    let ask = |seq| Body::Decision {
+        by: "policy".into(),
+        call: Some(call(seq)),
+        d: Verdict::Permission {
+            permission: Permission::Ask,
+        },
+    };
+    let echoed = || Outcome::Done {
+        output: json!({ "exit": 0, "output": "hi\n" }).into(),
+    };
+    let card = || Card {
+        title: "$ echo hi".into(),
+        body: "hi\n".into(),
+        note: "exit 0".into(),
+    };
     let generated = |seed| {
         let s = Session::generate(&mut Rng(seed));
         s.watched()
@@ -461,7 +477,7 @@ fn scenarios() -> Vec<(&'static str, Vec<Value>)> {
             vec![
                 attached(),
                 msg(DaemonMsg::Synced { seq: 0 }),
-                entry(1, Body::User { text: "hi".into() }),
+                entry(1, input("hi")),
                 entry(
                     2,
                     Body::ModelCall {
@@ -495,57 +511,71 @@ fn scenarios() -> Vec<(&'static str, Vec<Value>)> {
             ],
         ),
         (
-            "an approval asked, re-delivered on attach, and answered",
+            "an approval asked, then answered",
             vec![
                 attached(),
                 entry(
                     1,
                     Body::ToolCall {
-                        tool: "run_command".into(),
-                        input: command.clone().into(),
+                        tool: "bash".into(),
+                        input: json!({ "command": "echo hi" }).into(),
                         id: None,
                         card: None,
                         by: Audience::Model,
                     },
                 ),
-                entry(2, Body::Ask { call: 1 }),
+                entry(2, ask(1)),
                 msg(DaemonMsg::Synced { seq: 2 }),
-                msg(DaemonMsg::Recap(Recap {
-                    tools: vec!["run_command".into()],
-                    asks: 1,
-                    ..Recap::default()
-                })),
-                msg(DaemonMsg::Ask {
-                    call: 1,
-                    tool: "run_command".into(),
-                    input: command.clone().into(),
-                }),
-                msg(DaemonMsg::Ask {
-                    call: 1,
-                    tool: "run_command".into(),
-                    input: command.into(),
-                }),
                 entry(
                     3,
-                    Body::Hook {
-                        hook: "user".into(),
-                        decision: Decision::Approval {
-                            tool: "run_command".into(),
-                            approved: true,
-                            call: Some(1),
-                        },
+                    Body::Answer {
+                        call: call(1),
+                        value: true.into(),
+                        origin: None,
                     },
                 ),
                 entry(
                     4,
                     Body::ToolResult {
                         call: 1,
-                        outcome: Outcome::Done {
-                            output: json!({ "stdout": "hi\n", "stderr": "", "exit": 0 }).into(),
-                        },
-                        card: None,
+                        outcome: echoed(),
+                        card: Some(card()),
                     },
                 ),
+            ],
+        ),
+        (
+            "input queued, steered and taken up",
+            vec![
+                attached(),
+                entry(1, input("one")),
+                entry(
+                    2,
+                    Body::Input {
+                        text: "two".into(),
+                        mode: Mode::Steer,
+                        taken: false,
+                        origin: None,
+                    },
+                ),
+                entry(
+                    3,
+                    Body::Decision {
+                        by: "retry".into(),
+                        call: Some(call(1)),
+                        d: Verdict::Retry {
+                            attempt: 1,
+                            error: "rate limited".into(),
+                        },
+                    },
+                ),
+                entry(
+                    4,
+                    Body::Take {
+                        input: protocol::Seq::new(2).unwrap(),
+                    },
+                ),
+                msg(DaemonMsg::Synced { seq: 4 }),
             ],
         ),
         (
@@ -581,13 +611,13 @@ fn scenarios() -> Vec<(&'static str, Vec<Value>)> {
             "a drain, then a reconnect replaying entries already seen",
             vec![
                 attached(),
-                entry(1, Body::User { text: "one".into() }),
+                entry(1, input("one")),
                 entry(2, Body::Assistant { text: "one".into() }),
                 msg(DaemonMsg::Synced { seq: 2 }),
                 msg(DaemonMsg::Draining),
                 attached(),
                 entry(2, Body::Assistant { text: "one".into() }),
-                entry(3, Body::User { text: "two".into() }),
+                entry(3, input("two")),
                 msg(DaemonMsg::Synced { seq: 3 }),
             ],
         ),
@@ -628,14 +658,8 @@ fn scenarios() -> Vec<(&'static str, Vec<Value>)> {
                     2,
                     Body::ToolResult {
                         call: 1,
-                        outcome: Outcome::Done {
-                            output: json!({ "exit": 0, "output": "hi\n" }).into(),
-                        },
-                        card: Some(Card {
-                            title: "$ echo hi".into(),
-                            body: "hi\n".into(),
-                            note: "exit 0".into(),
-                        }),
+                        outcome: echoed(),
+                        card: Some(card()),
                     },
                 ),
                 entry(
@@ -646,23 +670,28 @@ fn scenarios() -> Vec<(&'static str, Vec<Value>)> {
                         data: json!({ "cwd": "/w/src" }).into(),
                     },
                 ),
+                entry(4, input("/jobs")),
                 entry(
-                    4,
-                    Body::Command {
-                        name: "jobs".into(),
-                        args: String::new(),
+                    5,
+                    Body::ToolCall {
+                        tool: "jobs".into(),
+                        input: json!({ "args": "" }).into(),
+                        id: None,
+                        card: None,
+                        by: Audience::User,
                     },
                 ),
                 entry(
-                    5,
-                    Body::CommandResult {
-                        call: 4,
+                    6,
+                    Body::ToolResult {
+                        call: 5,
                         outcome: Outcome::Done {
                             output: "no jobs".into(),
                         },
+                        card: None,
                     },
                 ),
-                msg(DaemonMsg::Synced { seq: 5 }),
+                msg(DaemonMsg::Synced { seq: 6 }),
             ],
         ),
         ("a client that fell behind is caught up with a snapshot", {
@@ -674,13 +703,13 @@ fn scenarios() -> Vec<(&'static str, Vec<Value>)> {
                 by: Audience::Model,
             };
             let log = [
-                Body::User { text: "one".into() },
+                input("one"),
                 Body::ModelCall {
                     model: "m".into(),
                     attempt: 0,
                 },
                 asked,
-                Body::Ask { call: 3 },
+                ask(3),
             ]
             .into_iter()
             .zip(1..)
@@ -689,7 +718,7 @@ fn scenarios() -> Vec<(&'static str, Vec<Value>)> {
             let view = SessionView::from_log(SESSION, "/w".into(), &log);
             vec![
                 attached(),
-                entry(1, Body::User { text: "one".into() }),
+                entry(1, input("one")),
                 entry(
                     2,
                     Body::ModelCall {
@@ -706,11 +735,6 @@ fn scenarios() -> Vec<(&'static str, Vec<Value>)> {
                 attached(),
                 msg(DaemonMsg::Snapshot(Box::new(view))),
                 msg(DaemonMsg::Synced { seq: 4 }),
-                msg(DaemonMsg::Ask {
-                    call: 3,
-                    tool: "bash".into(),
-                    input: json!({ "command": "echo hi" }).into(),
-                }),
                 entry(
                     5,
                     Body::Assistant {
@@ -773,6 +797,63 @@ fn vectors() {
     }
 }
 
+/// The recap an attach shows is read from what its replay held: the
+/// user's last message, what the turn did since, and what waits.
+#[test]
+fn a_recap_tells_what_the_replay_held() {
+    let entry = |seq, body| DaemonMsg::Entry(Entry::new(seq, 0, body));
+    let mut view = SessionView::default();
+    let attached = DaemonMsg::Attached {
+        session: SESSION,
+        workspace: "/w".into(),
+    };
+    let log = [
+        entry(
+            1,
+            Body::Input {
+                text: "list files\nand more".into(),
+                mode: Mode::Queue,
+                taken: true,
+                origin: None,
+            },
+        ),
+        entry(
+            2,
+            Body::ToolCall {
+                tool: "bash".into(),
+                input: json!({ "command": "ls" }).into(),
+                id: None,
+                card: None,
+                by: Audience::Model,
+            },
+        ),
+        entry(
+            3,
+            Body::Decision {
+                by: "policy".into(),
+                call: CallId::new(2),
+                d: Verdict::Permission {
+                    permission: Permission::Ask,
+                },
+            },
+        ),
+        DaemonMsg::Synced { seq: 3 },
+    ];
+    fold(&mut view, std::slice::from_ref(&attached));
+    fold(&mut view, &log);
+    let recap = Recap {
+        prompt: Some("list files…".into()),
+        tools: vec!["bash".into()],
+        asks: 1,
+        ..Recap::default()
+    };
+    assert_eq!(view.recap, Some(recap));
+    assert_eq!(view.turn().asking, Some(2));
+    // Attached again with nothing new: nothing to tell.
+    fold(&mut view, &[attached, DaemonMsg::Synced { seq: 3 }]);
+    assert_eq!(view.recap, None);
+}
+
 #[test]
 fn clients_describe_calls_and_recaps_alike() {
     use protocol::view::{call_title, decision_line, output_text, recap_line};
@@ -789,16 +870,12 @@ fn clients_describe_calls_and_recaps_alike() {
         call_title("edit", &json!({"path": "a"}).into(), None),
         r#"edit {"path":"a"}"#
     );
-    let shown = |output: &Value, card| output_text(&Json::new(output), card);
     assert_eq!(
-        shown(&json!({}), Some(&card)),
+        output_text(Some(&card)),
         Some(("a\n".into(), "exit 0".into()))
     );
-    assert_eq!(
-        shown(&json!({"stdout": "o\n", "stderr": "e\n", "exit": 2}), None),
-        Some(("o\ne\n".into(), "exit 2".into()))
-    );
-    assert_eq!(shown(&json!("text"), Some(&Card::default())), None);
+    assert_eq!(output_text(Some(&Card::default())), None);
+    assert_eq!(output_text(None), None);
     let recap = Recap {
         prompt: Some("hi".into()),
         tools: vec!["bash".into(); 4],
@@ -811,14 +888,23 @@ fn clients_describe_calls_and_recaps_alike() {
         "recap · you: hi · ran 4 tools · a: done · 1 waiting for approval"
     );
     assert_eq!(recap_line(&Recap::default()), "recap");
-    let blocked = Decision::Block {
-        tool: "bash".into(),
+    let blocked = Verdict::Block {
         reason: "no network".into(),
     };
-    assert_eq!(decision_line(&blocked), "blocked bash: no network");
-    let asked = Decision::Permission {
-        tool: "bash".into(),
-        permission: protocol::Permission::Ask,
+    assert_eq!(
+        decision_line("bash", Some(2), &blocked),
+        "blocked bash: no network"
+    );
+    let asked = Verdict::Permission {
+        permission: Permission::Ask,
     };
-    assert_eq!(decision_line(&asked), "bash: ask");
+    assert_eq!(decision_line("bash", Some(2), &asked), "bash: ask");
+    let retried = Verdict::Retry {
+        attempt: 2,
+        error: "e".into(),
+    };
+    assert_eq!(
+        decision_line("", Some(3), &retried),
+        "retried call 3 (attempt 2): e"
+    );
 }

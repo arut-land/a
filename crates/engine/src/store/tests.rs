@@ -96,10 +96,6 @@ fn header(workspace: &str) -> Header {
         id: SessionId::new(),
         workspace: workspace.into(),
         parent: None,
-        extensions: vec![Installed {
-            name: "builtin".into(),
-            version: 1,
-        }],
     }
 }
 
@@ -107,8 +103,11 @@ fn entry(seq: u64, epoch: u32) -> Entry {
     Entry::new(
         seq,
         epoch,
-        Body::User {
+        Body::Input {
             text: format!("m{seq}"),
+            mode: protocol::Mode::Queue,
+            taken: true,
+            origin: None,
         },
     )
 }
@@ -416,21 +415,6 @@ fn a_torn_tail_is_never_indexed() {
             .collect();
         assert_eq!(file[usize::try_from(cut).unwrap()..], after);
     }
-}
-
-#[test]
-fn jsonl_headers_from_before_extension_records_load() {
-    let store = jsonl();
-    let id = SessionId::new();
-    let path = store.dir.as_ref().unwrap().join(format!("{id}.jsonl"));
-    fs::write(
-        &path,
-        format!("{{\"id\":\"{}\",\"workspace\":\"/w\"}}\n", id.0),
-    )
-    .unwrap();
-    let headers = store.headers().unwrap();
-    assert_eq!(headers.len(), 1);
-    assert_eq!(headers[0].extensions, []);
 }
 
 #[test]

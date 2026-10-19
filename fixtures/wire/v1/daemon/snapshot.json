@@ -1,1 +1,0 @@
-{"t":"snapshot","session":"00000000-0000-0000-0000-00000000000a","workspace":"/w","seq":3,"items":[{"type":"user","seq":1,"text":"hi"},{"type":"tool","call":2,"tool":"bash","input":{"command":"ls"},"approval":"pending","outcome":null}],"environment":null}

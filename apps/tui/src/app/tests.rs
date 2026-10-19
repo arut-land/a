@@ -1,7 +1,7 @@
 use std::path::PathBuf;
 
 use protocol::{
-    Activity, Body, Card, ClientMsg, DaemonMsg, Entry, Outcome, Recap, Residency, SessionId,
+    Activity, Body, Card, ClientMsg, DaemonMsg, Entry, Outcome, Residency, SessionId,
     SessionSummary, Target,
 };
 use ratatui_core::buffer::Buffer;
@@ -103,8 +103,11 @@ fn asked_command() -> Vec<DaemonMsg> {
     vec![
         entry(
             2,
-            Body::User {
+            Body::Input {
                 text: "$ ls".into(),
+                mode: protocol::Mode::Queue,
+                taken: true,
+                origin: None,
             },
         ),
         entry(
@@ -120,13 +123,17 @@ fn asked_command() -> Vec<DaemonMsg> {
                 by: Audience::Model,
             },
         ),
-        entry(4, Body::Ask { call: 3 }),
+        entry(
+            4,
+            Body::Decision {
+                by: "policy".into(),
+                call: protocol::CallId::new(3),
+                d: protocol::Verdict::Permission {
+                    permission: protocol::Permission::Ask,
+                },
+            },
+        ),
         DaemonMsg::Synced { seq: 4 },
-        DaemonMsg::Ask {
-            call: 3,
-            tool: "bash".into(),
-            input: json!({"command": "ls"}).into(),
-        },
     ]
 }
 
@@ -175,7 +182,15 @@ fn a_streamed_reply_shows_live_then_its_committed_text() {
     let (mut app, _) = app(
         Viewport::Full,
         &[
-            entry(2, Body::User { text: "hi".into() }),
+            entry(
+                2,
+                Body::Input {
+                    text: "hi".into(),
+                    mode: protocol::Mode::Queue,
+                    taken: true,
+                    origin: None,
+                },
+            ),
             entry(
                 3,
                 Body::ModelCall {
@@ -259,8 +274,11 @@ fn the_wheel_scrolls_and_new_rows_keep_a_scrolled_view_still() {
         .map(|seq| {
             entry(
                 seq,
-                Body::User {
+                Body::Input {
                     text: format!("message {seq}"),
+                    mode: protocol::Mode::Queue,
+                    taken: true,
+                    origin: None,
                 },
             )
         })
@@ -275,8 +293,11 @@ fn the_wheel_scrolls_and_new_rows_keep_a_scrolled_view_still() {
     find(&rows, "newer below");
     app.fold(&entry(
         40,
-        Body::User {
+        Body::Input {
             text: "message 40".into(),
+            mode: protocol::Mode::Queue,
+            taken: true,
+            origin: None,
         },
     ));
     let (_, rows) = frame(&mut app, 40, 12);
@@ -316,13 +337,10 @@ fn ctrl_c_interrupts_a_running_call_and_shows_how_it_ended() {
     let mut msgs = asked_command();
     msgs.push(entry(
         5,
-        Body::Hook {
-            hook: "user".into(),
-            decision: protocol::Decision::Approval {
-                tool: "bash".into(),
-                approved: true,
-                call: Some(3),
-            },
+        Body::Answer {
+            call: protocol::CallId::new(3).unwrap(),
+            value: true.into(),
+            origin: None,
         },
     ));
     let (mut app, _) = app(Viewport::Full, &msgs);
@@ -362,7 +380,15 @@ fn ctrl_c_interrupts_a_running_call_and_shows_how_it_ended() {
 #[test]
 fn ctrl_c_interrupts_a_running_model_call_too() {
     let msgs = [
-        entry(1, Body::User { text: "hi".into() }),
+        entry(
+            1,
+            Body::Input {
+                text: "hi".into(),
+                mode: protocol::Mode::Queue,
+                taken: true,
+                origin: None,
+            },
+        ),
         entry(
             2,
             Body::ModelCall {
@@ -484,13 +510,7 @@ fn resuming_where_there_is_no_session_opens_the_picker() {
 
 #[test]
 fn the_recap_shows_until_dismissed() {
-    let recap = Recap {
-        prompt: Some("$ ls".into()),
-        tools: vec!["bash".into()],
-        asks: 1,
-        ..Recap::default()
-    };
-    let (mut app, _) = app(Viewport::Full, &[DaemonMsg::Recap(recap)]);
+    let (mut app, _) = app(Viewport::Full, &asked_command());
     let (_, rows) = frame(&mut app, 80, 10);
     let (x, y) = find(&rows, "×");
     find(
@@ -516,11 +536,14 @@ fn inline_prints_settled_items_once_and_keeps_the_rest_live() {
         5,
         Body::ToolResult {
             call: 3,
-            // As older logs hold a command's result.
             outcome: Outcome::Done {
-                output: json!({"stdout": "a\n", "stderr": "", "exit": 0}).into(),
+                output: json!({"output": "a\n", "exit": 0}).into(),
             },
-            card: None,
+            card: Some(Card {
+                title: "$ ls".into(),
+                body: "a\n".into(),
+                note: "exit 0".into(),
+            }),
         },
     ));
     let printed: Vec<String> = app.scrollback(60).iter().map(Line::text).collect();
@@ -564,8 +587,11 @@ fn render_cost() {
             .collect();
         msgs.push(entry(
             seq,
-            Body::User {
+            Body::Input {
                 text: text.join(" "),
+                mode: protocol::Mode::Queue,
+                taken: true,
+                origin: None,
             },
         ));
         msgs.push(entry(

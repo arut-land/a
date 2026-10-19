@@ -1,11 +1,12 @@
 //! The golden wire corpus: every message shape this build sends, one per
-//! file under `fixtures/wire/v<PROTO>`, as old and new peers must read it.
+//! file under `fixtures/wire/v<PROTO>`, as every peer of the protocol must
+//! read it.
 //!
 //! The files are written by this test (`UPDATE_WIRE=1 cargo test -p
 //! protocol --test wire`), never by hand, and only when missing: a file
-//! that exists is what an earlier build sent, so it is never rewritten. A
-//! change to how a message encodes fails here; a new field or shape gets a
-//! new sample (and file) beside the old one, which must keep decoding.
+//! that exists is what a build of this protocol sent, so it is never
+//! rewritten. A change to how a message encodes fails here: it is a new
+//! protocol, with a corpus of its own.
 
 // The sample lists are long, one message after another.
 #![allow(clippy::too_many_lines)]
@@ -16,53 +17,24 @@ use std::path::{Path, PathBuf};
 
 use protocol::view::SessionView;
 use protocol::{
-    Activity, Audience, Author, Body, CallId, Cap, Caps, Card, ClientDecl, ClientId, ClientMsg,
-    ClientSeq, DaemonMsg, Decision, Decode, Entry, Environment, HomeSettings, Installed, Mode,
-    Origin, Outcome, Overrides, PROTO, Permission, Recap, Rejection, Residency, Role, Seq,
-    SessionId, SessionSummary, SettingsChange, Target, Verdict, WaitOn,
+    Activity, Audience, Author, Body, CallId, Caps, Card, ClientDecl, ClientId, ClientMsg,
+    ClientSeq, DaemonMsg, Decode, Entry, Environment, HomeSettings, Installed, Mode, Origin,
+    Outcome, PROTO, Permission, Rejection, Residency, Role, Seq, SessionId, SessionSummary,
+    SettingsChange, Target, Verdict, WaitOn,
 };
 use serde_json::json;
 use uuid::Uuid;
 
 const SESSION: SessionId = SessionId(Uuid::from_u128(0xa));
 
-/// The capabilities of the first build that had any, named rather than
-/// `Caps::ALL`, which grows.
-fn first_caps() -> Caps {
-    [Cap::Snapshot, Cap::Ack, Cap::Declare]
-        .into_iter()
-        .collect()
-}
-
-/// [`first_caps`] and [`Cap::Steer`].
-fn steer_caps() -> Caps {
-    [Cap::Snapshot, Cap::Ack, Cap::Declare, Cap::Steer]
-        .into_iter()
-        .collect()
-}
-
-/// A sample: its file name, the message, and the capability without which
-/// it is never sent (so peers older than it never see it).
+/// A sample: its file name and the message.
 struct Sample<M> {
     name: &'static str,
     msg: M,
-    gate: Option<Cap>,
 }
 
 const fn sample<M>(name: &'static str, msg: M) -> Sample<M> {
-    Sample {
-        name,
-        msg,
-        gate: None,
-    }
-}
-
-const fn gated<M>(name: &'static str, msg: M, cap: Cap) -> Sample<M> {
-    Sample {
-        name,
-        msg,
-        gate: Some(cap),
-    }
+    Sample { name, msg }
 }
 
 fn client_samples() -> Vec<Sample<ClientMsg>> {
@@ -89,33 +61,13 @@ fn client_samples() -> Vec<Sample<ClientMsg>> {
             },
         ),
         sample(
-            "hello_caps",
-            ClientMsg::Hello {
-                proto: PROTO,
-                build: "0.0.0+0123456789abcdef".into(),
-                min: None,
-                caps: first_caps(),
-                client: None,
-            },
-        ),
-        sample(
-            "hello_caps_steer",
-            ClientMsg::Hello {
-                proto: PROTO,
-                build: "0.0.0+0123456789abcdef".into(),
-                min: None,
-                caps: steer_caps(),
-                client: None,
-            },
-        ),
-        sample(
             "hello_range",
             ClientMsg::Hello {
                 proto: PROTO + 1,
                 build: "0.0.1+0123456789abcdef".into(),
                 min: Some(PROTO),
-                caps: first_caps(),
-                client: None,
+                caps: Caps::NONE,
+                client: Some(CLIENT),
             },
         ),
         sample(
@@ -150,7 +102,7 @@ fn client_samples() -> Vec<Sample<ClientMsg>> {
                 decl: decl.clone(),
             },
         ),
-        gated("declare", ClientMsg::Declare(decl), Cap::Declare),
+        sample("declare", ClientMsg::Declare(decl)),
         sample("environment", ClientMsg::Environment(env)),
         sample("input", ClientMsg::input("hi")),
         sample(
@@ -171,21 +123,19 @@ fn client_samples() -> Vec<Sample<ClientMsg>> {
                 client_seq: Some(2),
             },
         ),
-        gated(
+        sample(
             "steer",
             ClientMsg::Steer {
                 text: "also this".into(),
                 client_seq: None,
             },
-            Cap::Steer,
         ),
-        gated(
+        sample(
             "steer_numbered",
             ClientMsg::Steer {
                 text: "also this".into(),
                 client_seq: Some(4),
             },
-            Cap::Steer,
         ),
         sample("interrupt", ClientMsg::INTERRUPT),
         sample(
@@ -194,13 +144,9 @@ fn client_samples() -> Vec<Sample<ClientMsg>> {
                 client_seq: Some(3),
             },
         ),
-        gated(
-            "settings",
-            ClientMsg::Settings { change: None },
-            Cap::Settings,
-        ),
-        gated("watch_sessions", ClientMsg::WatchSessions, Cap::Sessions),
-        gated(
+        sample("settings", ClientMsg::Settings { change: None }),
+        sample("watch_sessions", ClientMsg::WatchSessions),
+        sample(
             "attach_prefix",
             ClientMsg::Attach {
                 target: Target::Prefix("0190a".into()),
@@ -209,11 +155,10 @@ fn client_samples() -> Vec<Sample<ClientMsg>> {
                 env: None,
                 decl: ClientDecl::default(),
             },
-            Cap::Sessions,
         ),
-        gated("status", ClientMsg::Status, Cap::Daemon),
-        gated("shutdown", ClientMsg::Shutdown, Cap::Daemon),
-        gated(
+        sample("status", ClientMsg::Status),
+        sample("shutdown", ClientMsg::Shutdown),
+        sample(
             "settings_change",
             ClientMsg::Settings {
                 change: Some(SettingsChange {
@@ -225,7 +170,6 @@ fn client_samples() -> Vec<Sample<ClientMsg>> {
                     ]),
                 }),
             },
-            Cap::Settings,
         ),
         sample(
             "hello_client",
@@ -233,7 +177,7 @@ fn client_samples() -> Vec<Sample<ClientMsg>> {
                 proto: PROTO,
                 build: "0.0.0+0123456789abcdef".into(),
                 min: None,
-                caps: [Cap::Ack, Cap::Origin].into_iter().collect(),
+                caps: Caps::NONE,
                 client: Some(CLIENT),
             },
         ),
@@ -243,9 +187,8 @@ fn client_samples() -> Vec<Sample<ClientMsg>> {
 /// A client, as it names itself across its connections.
 const CLIENT: ClientId = ClientId(Uuid::from_u128(0xc));
 
-/// The v2 entry kinds and fields, which no build sends a client that does
-/// not read them.
-fn v2_samples() -> Vec<Sample<DaemonMsg>> {
+/// The entries about input, decisions, waits and answers.
+fn input_samples() -> Vec<Sample<DaemonMsg>> {
     let entry = |seq, body| DaemonMsg::Entry(Entry::new(seq, 0, body));
     let call = |seq| CallId::new(seq).unwrap();
     let seq = |seq| Seq::new(seq).unwrap();
@@ -253,9 +196,8 @@ fn v2_samples() -> Vec<Sample<DaemonMsg>> {
         client: CLIENT,
         seq: ClientSeq::new(4).unwrap(),
     };
-    let v2 = |name, msg| gated(name, msg, Cap::Ledger);
     vec![
-        v2(
+        sample(
             "entry_input",
             entry(
                 1,
@@ -267,7 +209,7 @@ fn v2_samples() -> Vec<Sample<DaemonMsg>> {
                 },
             ),
         ),
-        v2(
+        sample(
             "entry_input_steer",
             entry(
                 3,
@@ -279,7 +221,7 @@ fn v2_samples() -> Vec<Sample<DaemonMsg>> {
                 },
             ),
         ),
-        gated(
+        sample(
             "entry_input_origin",
             entry(
                 3,
@@ -290,10 +232,9 @@ fn v2_samples() -> Vec<Sample<DaemonMsg>> {
                     origin: Some(author),
                 },
             ),
-            Cap::Origin,
         ),
-        v2("entry_take", entry(4, Body::Take { input: seq(3) })),
-        v2(
+        sample("entry_take", entry(4, Body::Take { input: seq(3) })),
+        sample(
             "entry_model_call_attempt",
             entry(
                 8,
@@ -303,7 +244,7 @@ fn v2_samples() -> Vec<Sample<DaemonMsg>> {
                 },
             ),
         ),
-        v2(
+        sample(
             "entry_tool_call_by_user",
             entry(
                 22,
@@ -316,7 +257,7 @@ fn v2_samples() -> Vec<Sample<DaemonMsg>> {
                 },
             ),
         ),
-        v2(
+        sample(
             "entry_decision",
             entry(
                 12,
@@ -329,7 +270,7 @@ fn v2_samples() -> Vec<Sample<DaemonMsg>> {
                 },
             ),
         ),
-        v2(
+        sample(
             "entry_decision_retry",
             entry(
                 10,
@@ -343,7 +284,7 @@ fn v2_samples() -> Vec<Sample<DaemonMsg>> {
                 },
             ),
         ),
-        v2(
+        sample(
             "entry_wait_dialog",
             entry(
                 13,
@@ -355,7 +296,7 @@ fn v2_samples() -> Vec<Sample<DaemonMsg>> {
                 },
             ),
         ),
-        v2(
+        sample(
             "entry_answer",
             entry(
                 14,
@@ -366,7 +307,7 @@ fn v2_samples() -> Vec<Sample<DaemonMsg>> {
                 },
             ),
         ),
-        gated(
+        sample(
             "entry_answer_origin",
             entry(
                 14,
@@ -376,9 +317,8 @@ fn v2_samples() -> Vec<Sample<DaemonMsg>> {
                     origin: Some(author),
                 },
             ),
-            Cap::Origin,
         ),
-        gated(
+        sample(
             "entry_interrupt_origin",
             entry(
                 25,
@@ -386,9 +326,8 @@ fn v2_samples() -> Vec<Sample<DaemonMsg>> {
                     origin: Some(author),
                 },
             ),
-            Cap::Origin,
         ),
-        v2(
+        sample(
             "entry_edit",
             entry(
                 26,
@@ -399,14 +338,13 @@ fn v2_samples() -> Vec<Sample<DaemonMsg>> {
                 },
             ),
         ),
-        gated(
+        sample(
             "delta_attempt",
             DaemonMsg::Delta {
                 call: 8,
                 text: "hel".into(),
                 attempt: 1,
             },
-            Cap::Attempts,
         ),
     ]
 }
@@ -414,7 +352,16 @@ fn v2_samples() -> Vec<Sample<DaemonMsg>> {
 fn daemon_samples() -> Vec<Sample<DaemonMsg>> {
     let entry = |seq, body| DaemonMsg::Entry(Entry::new(seq, 0, body));
     let log = [
-        Entry::new(1, 0, Body::User { text: "hi".into() }),
+        Entry::new(
+            1,
+            0,
+            Body::Input {
+                text: "hi".into(),
+                mode: Mode::Queue,
+                taken: true,
+                origin: None,
+            },
+        ),
         Entry {
             seq: 2,
             epoch: 0,
@@ -426,7 +373,27 @@ fn daemon_samples() -> Vec<Sample<DaemonMsg>> {
                 by: Audience::Model,
             },
         },
-        Entry::new(3, 0, Body::Ask { call: 2 }),
+        Entry::new(
+            3,
+            0,
+            Body::Decision {
+                by: "policy".into(),
+                call: CallId::new(2),
+                d: Verdict::Permission {
+                    permission: Permission::Ask,
+                },
+            },
+        ),
+        Entry::new(
+            4,
+            0,
+            Body::Input {
+                text: "and sizes".into(),
+                mode: Mode::Steer,
+                taken: false,
+                origin: None,
+            },
+        ),
     ];
     let origin = Origin {
         client: 1,
@@ -444,23 +411,16 @@ fn daemon_samples() -> Vec<Sample<DaemonMsg>> {
             },
         ),
         sample(
-            "welcome_caps",
+            "welcome_commands",
             DaemonMsg::Welcome {
                 proto: PROTO,
                 build: "0.0.0+0123456789abcdef".into(),
-                caps: first_caps(),
+                caps: Caps::NONE,
                 client: 1,
-                commands: Vec::new(),
-            },
-        ),
-        sample(
-            "welcome_caps_steer",
-            DaemonMsg::Welcome {
-                proto: PROTO,
-                build: "0.0.0+0123456789abcdef".into(),
-                caps: steer_caps(),
-                client: 1,
-                commands: Vec::new(),
+                commands: vec![protocol::CommandInfo {
+                    name: "model".into(),
+                    description: "show or set the model".into(),
+                }],
             },
         ),
         sample(
@@ -485,7 +445,6 @@ fn daemon_samples() -> Vec<Sample<DaemonMsg>> {
                 workspace: "/w".into(),
             },
         ),
-        sample("entry_user", entry(1, Body::User { text: "hi".into() })),
         sample(
             "entry_tool_call",
             entry(
@@ -499,26 +458,6 @@ fn daemon_samples() -> Vec<Sample<DaemonMsg>> {
                         ..Card::default()
                     }),
                     by: Audience::Model,
-                },
-            ),
-        ),
-        sample(
-            "entry_queued",
-            entry(
-                3,
-                Body::Queued {
-                    text: "also this".into(),
-                    steer: true,
-                },
-            ),
-        ),
-        sample(
-            "entry_steer",
-            entry(
-                4,
-                Body::Steer {
-                    text: "also this".into(),
-                    queued: 3,
                 },
             ),
         ),
@@ -605,34 +544,6 @@ fn daemon_samples() -> Vec<Sample<DaemonMsg>> {
             ),
         ),
         sample(
-            "entry_hook",
-            entry(
-                12,
-                Body::Hook {
-                    hook: "policy".into(),
-                    decision: Decision::Permission {
-                        tool: "bash".into(),
-                        permission: Permission::Ask,
-                    },
-                },
-            ),
-        ),
-        sample("entry_ask", entry(13, Body::Ask { call: 2 })),
-        sample(
-            "entry_approval",
-            entry(
-                14,
-                Body::Hook {
-                    hook: "user".into(),
-                    decision: Decision::Approval {
-                        tool: "bash".into(),
-                        approved: true,
-                        call: Some(2),
-                    },
-                },
-            ),
-        ),
-        sample(
             "entry_link",
             entry(
                 15,
@@ -707,37 +618,6 @@ fn daemon_samples() -> Vec<Sample<DaemonMsg>> {
                 },
             ),
         ),
-        sample(
-            "entry_command",
-            entry(
-                22,
-                Body::Command {
-                    name: "model".into(),
-                    args: "openai:m".into(),
-                },
-            ),
-        ),
-        sample(
-            "entry_command_result",
-            entry(
-                23,
-                Body::CommandResult {
-                    call: 22,
-                    outcome: Outcome::Done {
-                        output: json!(null).into(),
-                    },
-                },
-            ),
-        ),
-        sample(
-            "entry_settings",
-            entry(
-                24,
-                Body::Settings(Overrides {
-                    model: Some("openai:m".into()),
-                }),
-            ),
-        ),
         sample("entry_interrupt", entry(25, Body::INTERRUPT)),
         sample(
             "delta",
@@ -772,46 +652,25 @@ fn daemon_samples() -> Vec<Sample<DaemonMsg>> {
             },
         ),
         sample(
-            "recap",
-            DaemonMsg::Recap(Recap {
-                prompt: Some("hi".into()),
-                tools: vec!["bash".into()],
-                failed: 0,
-                running: 1,
-                reply: None,
-                asks: 1,
-            }),
-        ),
-        sample(
-            "ask",
-            DaemonMsg::Ask {
-                call: 2,
-                tool: "bash".into(),
-                input: json!({ "command": "ls" }).into(),
-            },
-        ),
-        sample(
             "error",
             DaemonMsg::Error {
                 message: "not attached".into(),
             },
         ),
-        gated(
+        sample(
             "snapshot",
             DaemonMsg::Snapshot(Box::new(SessionView::from_log(SESSION, "/w".into(), &log))),
-            Cap::Snapshot,
         ),
-        gated("ack", DaemonMsg::Ack { origin }, Cap::Ack),
-        gated(
+        sample("ack", DaemonMsg::Ack { origin }),
+        sample(
             "rejected",
             DaemonMsg::Rejected {
                 origin,
                 reason: Rejection::NotWaiting,
                 message: "call 9 is not waiting for approval".into(),
             },
-            Cap::Ack,
         ),
-        gated(
+        sample(
             "settings",
             DaemonMsg::Settings {
                 settings: HomeSettings {
@@ -821,9 +680,8 @@ fn daemon_samples() -> Vec<Sample<DaemonMsg>> {
                 },
                 error: None,
             },
-            Cap::Settings,
         ),
-        gated(
+        sample(
             "status",
             DaemonMsg::Status {
                 pid: 4242,
@@ -832,19 +690,17 @@ fn daemon_samples() -> Vec<Sample<DaemonMsg>> {
                 clients: 2,
                 known: 7,
             },
-            Cap::Daemon,
         ),
-        gated(
+        sample(
             "settings_refused",
             DaemonMsg::Settings {
                 settings: HomeSettings::default(),
                 error: Some("not a variable name: \"A B\"".into()),
             },
-            Cap::Settings,
         ),
     ]
     .into_iter()
-    .chain(v2_samples())
+    .chain(input_samples())
     .collect()
 }
 
@@ -902,7 +758,7 @@ fn every_message_this_build_sends_is_in_the_corpus() {
     check("daemon", &daemon_samples());
 }
 
-/// Whatever any build ever sent, this one reads.
+/// Whatever a build of this protocol sent, this one reads.
 #[test]
 fn this_build_reads_the_whole_corpus() {
     for (name, bytes) in files("client") {
@@ -935,131 +791,24 @@ fn an_entry_frame_is_its_log_line_tagged() {
     }
 }
 
-/// Ungated messages the first daemons cannot read, which no client may
-/// send until a capability gates them: those daemons drop a connection on
-/// a message they cannot decode. None now; `steer` waits for
-/// [`Cap::Steer`].
-const UNREAD_BY_THE_FIRST: &[&str] = &[];
-
-/// The first protocol 1 builds read every message sent to them: anything
-/// not gated by a capability, which they never ask for.
-#[test]
-fn the_first_builds_read_what_is_sent_to_them() {
-    let gate = |samples: &[(&str, Option<Cap>)], name: &str| {
-        samples
-            .iter()
-            .find(|(n, _)| *n == name)
-            .and_then(|(_, gate)| *gate)
-    };
-    let client: Vec<_> = client_samples().iter().map(|s| (s.name, s.gate)).collect();
-    let daemon: Vec<_> = daemon_samples().iter().map(|s| (s.name, s.gate)).collect();
-    for (name, bytes) in files("client") {
-        if gate(&client, &name).is_none() && !UNREAD_BY_THE_FIRST.contains(&name.as_str()) {
-            serde_json::from_slice::<first::ClientMsg>(&bytes)
-                .unwrap_or_else(|e| panic!("client/{name}: {e}"));
-        }
-    }
-    for (name, bytes) in files("daemon") {
-        if gate(&daemon, &name).is_none() {
-            serde_json::from_slice::<first::DaemonMsg>(&bytes)
-                .unwrap_or_else(|e| panic!("daemon/{name}: {e}"));
-        }
-    }
-}
-
-/// The messages as the first protocol 1 builds (up to 5d37d48) declared
-/// them, without the fields and kinds added since.
-#[allow(dead_code)]
-mod first {
-    use std::path::PathBuf;
-
-    use protocol::{Entry, Environment, Recap, SessionId, Target};
-    use serde::Deserialize;
-    use serde_json::Value;
-
-    #[derive(Deserialize)]
-    #[serde(tag = "t", rename_all = "snake_case")]
-    pub enum ClientMsg {
-        Hello {
-            proto: u32,
-            build: String,
-        },
-        Attach {
-            target: Target,
-            workspace: PathBuf,
-            since: u64,
-            #[serde(default)]
-            env: Option<Environment>,
-        },
-        Environment(Environment),
-        Input {
-            text: String,
-        },
-        List,
-        Detach,
-        Approve {
-            call: u64,
-            approved: bool,
-        },
-        Interrupt,
-    }
-
-    #[derive(Deserialize)]
-    pub struct SessionSummary {
-        pub id: SessionId,
-        pub workspace: PathBuf,
-        pub entries: u64,
-        pub clients: u32,
-    }
-
-    #[derive(Deserialize)]
-    #[serde(tag = "t", rename_all = "snake_case")]
-    pub enum DaemonMsg {
-        Welcome {
-            proto: u32,
-            build: String,
-        },
-        Mismatch {
-            supported: u32,
-        },
-        Draining,
-        Attached {
-            session: SessionId,
-            workspace: PathBuf,
-        },
-        Entry(Entry),
-        Delta {
-            call: u64,
-            text: String,
-        },
-        Synced {
-            seq: u64,
-        },
-        Sessions {
-            sessions: Vec<SessionSummary>,
-        },
-        Recap(Recap),
-        Ask {
-            call: u64,
-            tool: String,
-            input: Value,
-        },
-        Error {
-            message: String,
-        },
-    }
-}
-
+/// Capabilities this build does not know are dropped, and a hello says
+/// none when it has none.
 #[test]
 fn capabilities_and_versions_negotiate() {
-    let caps: Caps = serde_json::from_str(r#"["ack","from_a_newer_build","snapshot"]"#).unwrap();
-    assert!(caps.has(Cap::Ack) && caps.has(Cap::Snapshot) && !caps.has(Cap::Declare));
+    let caps: Caps = serde_json::from_str(r#"["from_a_newer_build"]"#).unwrap();
+    assert_eq!(caps, Caps::NONE);
+    assert_eq!(serde_json::to_string(&caps).unwrap(), "[]");
+    let hello = ClientMsg::Hello {
+        proto: PROTO,
+        build: "b".into(),
+        min: None,
+        caps,
+        client: None,
+    };
     assert_eq!(
-        serde_json::to_string(&caps).unwrap(),
-        r#"["snapshot","ack"]"#
+        serde_json::to_string(&hello).unwrap(),
+        format!(r#"{{"t":"hello","proto":{PROTO},"build":"b"}}"#)
     );
-    let theirs: Caps = [Cap::Ack].into_iter().collect();
-    assert_eq!((caps & theirs).iter().collect::<Vec<_>>(), [Cap::Ack]);
 
     let v = protocol::Versions::new;
     assert_eq!(v(None, 1).common(v(None, 1)), Some(1));
@@ -1077,11 +826,11 @@ fn values_from_a_newer_build_read_as_their_safest() {
     let reason: Rejection = serde_json::from_str(r#""quota""#).unwrap();
     assert_eq!(reason, Rejection::Other);
     let summary: SessionSummary = serde_json::from_str(
-        r#"{"id":"00000000-0000-0000-0000-00000000000a","workspace":"/w","entries":1,"clients":0}"#,
+        r#"{"id":"00000000-0000-0000-0000-00000000000a","workspace":"/w","entries":1,"clients":0,"activity":"soon","residency":"elsewhere"}"#,
     )
     .unwrap();
     assert_eq!(
         (summary.activity, summary.residency),
-        (Activity::Idle, Residency::Hibernated)
+        (Activity::Other, Residency::Other)
     );
 }

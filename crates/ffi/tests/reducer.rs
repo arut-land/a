@@ -39,7 +39,7 @@ fn the_shared_vectors_fold_the_same_through_the_facade() {
 }
 
 fn user(seq: u64) -> String {
-    json!({ "t": "entry", "seq": seq, "epoch": 0, "kind": "user", "text": format!("m{seq}") })
+    json!({ "t": "entry", "seq": seq, "epoch": 0, "kind": "input", "text": format!("m{seq}"), "taken": true })
         .to_string()
 }
 

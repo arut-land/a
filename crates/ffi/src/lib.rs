@@ -19,9 +19,10 @@ use std::io;
 use boltffi::{data, error};
 use client::{End, Link, SessionClient, TurnView};
 use protocol::view::{
-    Approval, Change, Item, Part, Phase, Status, call_title, decision_line, output_text, recap_line,
+    Approval, Change, Item, Part, Phase, Recap, SessionView, Status, call_title, decision_line,
+    output_text, recap_line,
 };
-use protocol::{Card, CommandInfo, Outcome, Recap, SessionSummary};
+use protocol::{Card, CommandInfo, Outcome, SessionSummary};
 
 pub use feed::Reducer;
 pub use live::{Client, Session, SessionWatch, find_session};
@@ -275,10 +276,8 @@ impl From<TurnView> for TurnInfo {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum CallPhase {
     Running,
-    /// Waits for this client's approval: show the buttons.
+    /// Waits for an approval: show the buttons.
     Asking,
-    /// Waits for an approval asked of another client.
-    Waiting,
     Denied,
     Done,
     Failed,
@@ -290,7 +289,6 @@ impl From<Phase> for CallPhase {
         match p {
             Phase::Running => Self::Running,
             Phase::Asking => Self::Asking,
-            Phase::Waiting => Self::Waiting,
             Phase::Denied => Self::Denied,
             Phase::Done => Self::Done,
             Phase::Failed => Self::Failed,
@@ -352,20 +350,14 @@ pub enum ViewChange {
         call: u64,
         text: String,
     },
-    /// This client is asked to approve the tool call `item`, at `index`
-    /// (inserted there if the view did not show it yet).
-    Asked {
-        index: u32,
-        item: ViewItem,
+    /// The replay is complete, and `recap` tells what it held; what
+    /// follows is live.
+    Synced {
+        recap: Option<RecapInfo>,
     },
-    /// The replay is complete; what follows is live.
-    Synced,
     /// The daemon sent the whole view: the items are these now.
     Snapshot {
         items: Vec<ViewItem>,
-    },
-    Recap {
-        recap: RecapInfo,
     },
     /// The daemon is restarting for an upgrade; the session reconnects.
     Draining,
@@ -527,7 +519,7 @@ pub struct OutputText {
     pub note: String,
 }
 
-/// What happened in a session, sent on attach.
+/// What happened in a session, told on attach.
 #[data]
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct RecapInfo {
@@ -634,8 +626,9 @@ fn index(i: usize) -> u32 {
     u32::try_from(i).unwrap_or(u32::MAX)
 }
 
-impl From<&Change> for ViewChange {
-    fn from(change: &Change) -> Self {
+impl ViewChange {
+    /// `change`, which `view` holds now.
+    fn of(change: &Change, view: &SessionView) -> Self {
         match change {
             Change::Attached {
                 session,
@@ -667,16 +660,11 @@ impl From<&Change> for ViewChange {
                 call: *call,
                 text: text.clone(),
             },
-            Change::Asked { index: i, item } => Self::Asked {
-                index: index(*i),
-                item: item.into(),
+            Change::Synced => Self::Synced {
+                recap: view.recap.as_ref().map(Into::into),
             },
-            Change::Synced => Self::Synced,
             Change::Snapshot { items } => Self::Snapshot {
                 items: items.iter().map(Into::into).collect(),
-            },
-            Change::Recap(recap) => Self::Recap {
-                recap: recap.into(),
             },
             Change::Draining => Self::Draining,
             Change::Mismatch { supported } => Self::Mismatch {
@@ -763,12 +751,14 @@ impl From<&Item> for ViewItem {
             Item::Hook {
                 seq,
                 hook,
+                call,
+                tool,
                 decision,
             } => Self::Hook {
                 seq: *seq,
                 hook: hook.clone(),
                 decision_json: serde_json::to_string(decision).unwrap_or_default(),
-                line: decision_line(decision),
+                line: decision_line(tool, *call, decision),
             },
             Item::Child {
                 call,
@@ -795,7 +785,7 @@ fn tool_outcome(outcome: &Outcome, card: Option<&Card>) -> ToolOutcome {
     match outcome {
         Outcome::Done { output } => ToolOutcome::Done {
             output_json: output.to_string(),
-            shown: output_text(output, card).map(|(text, note)| OutputText { text, note }),
+            shown: output_text(card).map(|(text, note)| OutputText { text, note }),
         },
         Outcome::Failed { error } => ToolOutcome::Failed {
             error: error.clone(),

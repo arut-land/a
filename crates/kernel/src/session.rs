@@ -94,8 +94,8 @@ impl Core {
         self.busy = load.busy;
         let mut fx = Effects::new();
         let installed = self.registry.installed();
-        let logged = self.fold.ledger.extensions().or(load.extensions);
-        if logged.is_some_and(|logged| logged != installed) {
+        let logged = self.fold.ledger.extensions();
+        if load.created || logged.is_some_and(|logged| logged != installed) {
             self.append(&mut fx, Body::Extensions { installed });
         }
         self.recover(load, &mut fx);
@@ -803,10 +803,11 @@ impl Core {
                 fx.push(Effect::MarkBusy(false));
             }
         }
-        // Settled with something new since it last reported (a log with
-        // nothing in it has not run yet).
+        // Settled with something new since it last reported (one given no
+        // input yet has not run).
         let settled = self.turn == Turn::Idle && !queued && !armed;
-        if settled && self.child && ledger.seq() > self.reported {
+        let ran = ledger.turn_start() > 0;
+        if settled && self.child && ran && ledger.seq() > self.reported {
             self.reported = ledger.seq();
             let outcome = ledger.result().cloned().unwrap_or_else(|| Outcome::Failed {
                 error: "the child settled without a result".to_owned(),

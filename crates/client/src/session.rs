@@ -14,9 +14,7 @@ use std::collections::VecDeque;
 use std::path::PathBuf;
 
 use protocol::view::{Change, SessionList, SessionView, Turn, Update};
-use protocol::{
-    Cap, ClientMsg, CommandInfo, DaemonMsg, Environment, Rejection, SessionSummary, Target,
-};
+use protocol::{ClientMsg, CommandInfo, DaemonMsg, Environment, Rejection, SessionSummary, Target};
 
 use crate::{Cmd, Diagnosis, Welcome};
 
@@ -171,7 +169,7 @@ impl Effect {
 pub struct TurnView {
     /// A call is unsettled.
     pub running: bool,
-    /// The oldest call waiting for this client's approval.
+    /// The oldest call waiting for an approval.
     pub asking: Option<u64>,
     pub asks: u32,
     /// An interrupt has something to stop.
@@ -203,9 +201,8 @@ pub struct SessionClient {
     seq: u64,
     /// Messages given while not live, sent once live.
     queued: Vec<ClientMsg>,
-    /// Mutations sent and not yet answered (with [`Cap::Ack`]): one refused
-    /// because the daemon was draining is sent again, once, after the
-    /// reattach.
+    /// Mutations sent and not yet answered: one refused because the daemon
+    /// was draining is sent again, once, after the reattach.
     unanswered: VecDeque<ClientMsg>,
     turn: Turn,
 }
@@ -265,14 +262,12 @@ impl SessionClient {
             asking,
             asks,
         } = self.turn;
-        let steers =
-            matches!(&self.link, Link::Live { welcome, .. } if welcome.caps.has(Cap::Steer));
         TurnView {
             running,
             asking,
             asks,
             can_interrupt: running && self.link.attached(),
-            can_steer: running && steers,
+            can_steer: running && self.link.attached(),
             can_send: self.link.attached(),
         }
     }
@@ -343,8 +338,7 @@ impl SessionClient {
         }
     }
 
-    /// Sends `msg` once live, numbered if it is a mutation; a steer goes
-    /// as plain input to a daemon that does not take steers.
+    /// Sends `msg` once live, numbered if it is a mutation.
     pub fn send(&mut self, msg: ClientMsg) -> Vec<Effect> {
         let mut out = Vec::new();
         self.put(msg, &mut out);
@@ -352,29 +346,21 @@ impl SessionClient {
     }
 
     fn put(&mut self, mut msg: ClientMsg, out: &mut Vec<Effect>) {
-        let Link::Live { welcome, .. } = &self.link else {
+        if !matches!(self.link, Link::Live { .. }) {
             if self.link.attached() {
                 self.queued.push(msg);
             } else {
                 out.push(Effect::Notice(NOT_CONNECTED.to_owned()));
             }
             return;
-        };
-        if let ClientMsg::Steer { text, .. } = &mut msg
-            && !welcome.caps.has(Cap::Steer)
-        {
-            msg = ClientMsg::input(std::mem::take(text));
         }
-        let acked = welcome.caps.has(Cap::Ack);
         if let Some(seq @ None) = msg.client_seq_mut() {
             self.seq += 1;
             *seq = Some(self.seq);
-            if acked {
-                if self.unanswered.len() == UNANSWERED {
-                    self.unanswered.pop_front();
-                }
-                self.unanswered.push_back(msg.clone());
+            if self.unanswered.len() == UNANSWERED {
+                self.unanswered.pop_front();
             }
+            self.unanswered.push_back(msg.clone());
         }
         out.push(Effect::Send(msg));
     }
@@ -407,16 +393,10 @@ impl SessionClient {
                     synced: false,
                 };
                 self.commands = commands;
-                // Neither answered nor refused on the last connection: a
-                // daemon that keeps who sent what is sent them again, and
-                // does each once; to any other, whether it was done is in
-                // the replay.
-                let resent = std::mem::take(&mut self.unanswered);
-                if matches!(&self.link, Link::Live { welcome, .. } if welcome.caps.has(Cap::Origin))
-                {
-                    out.extend(resent.iter().cloned().map(Effect::Send));
-                    self.unanswered = resent;
-                }
+                // Neither answered nor refused on the last connection: sent
+                // again, and the daemon, which logs who sent what, does each
+                // once.
+                out.extend(self.unanswered.iter().cloned().map(Effect::Send));
                 out.push(Effect::Link);
                 for msg in std::mem::take(&mut self.queued) {
                     self.put(msg, &mut out);
@@ -534,7 +514,9 @@ const fn numbered(msg: &ClientMsg, seq: u64) -> bool {
 mod tests {
     use std::path::PathBuf;
 
-    use protocol::{Audience, Body, Caps, Entry, Origin, SessionId};
+    use protocol::{
+        Audience, Body, CallId, Caps, Entry, Mode, Origin, Permission, SessionId, Verdict,
+    };
 
     use super::*;
 
@@ -542,7 +524,7 @@ mod tests {
         Event::Connected {
             id: 1,
             welcome: Welcome {
-                proto: 1,
+                proto: protocol::PROTO,
                 caps,
                 client: 1,
             },
@@ -582,7 +564,16 @@ mod tests {
         ));
         client.step(msg(
             1,
-            DaemonMsg::Entry(Entry::new(1, 1, Body::User { text: "hi".into() })),
+            DaemonMsg::Entry(Entry::new(
+                1,
+                1,
+                Body::Input {
+                    text: "hi".into(),
+                    mode: Mode::Queue,
+                    taken: true,
+                    origin: None,
+                },
+            )),
         ));
         client.step(msg(1, DaemonMsg::Synced { seq: 1 }));
         (client, session)
@@ -695,23 +686,6 @@ mod tests {
     }
 
     #[test]
-    fn an_unanswered_intent_is_not_resent_to_a_daemon_that_cannot_tell() {
-        let (mut client, _) = attached(Env::Origin);
-        client.run(Cmd::Input("one".into()));
-        client.step(msg(1, DaemonMsg::Draining));
-        client.step(Event::Closed {
-            id: 1,
-            why: String::new(),
-        });
-        let mut reconnected = live(Caps::ALL.without(Cap::Origin));
-        if let Event::Connected { id, .. } = &mut reconnected {
-            *id = 2;
-        }
-        // Whether it was done is in the replay.
-        assert!(sends(&client.step(reconnected)).is_empty());
-    }
-
-    #[test]
     fn a_resend_after_reconnect_runs_once() {
         let (mut client, _) = attached(Env::Origin);
         client.run(Cmd::Input("late".into()));
@@ -762,16 +736,6 @@ mod tests {
     }
 
     #[test]
-    fn a_steer_goes_as_input_to_a_daemon_without_steers() {
-        let mut client = SessionClient::new(Env::Keep);
-        client.open(Target::New);
-        client.step(live(Caps::NONE));
-        let out = client.run(Cmd::Steer("also".into()));
-        assert!(matches!(sends(&out)[..], [ClientMsg::Input { text, .. }] if text == "also"));
-        assert!(!client.turn().can_steer);
-    }
-
-    #[test]
     fn the_turn_says_what_runs_and_what_waits_on_this_client() {
         let (mut client, _) = attached(Env::Origin);
         assert!(!client.turn().running);
@@ -793,11 +757,17 @@ mod tests {
         assert!(turn.running && turn.can_interrupt && turn.can_steer);
         client.step(msg(
             1,
-            DaemonMsg::Ask {
-                call: 2,
-                tool: "bash".into(),
-                input: serde_json::json!({ "command": "ls" }).into(),
-            },
+            DaemonMsg::Entry(Entry::new(
+                3,
+                1,
+                Body::Decision {
+                    by: "policy".into(),
+                    call: CallId::new(2),
+                    d: Verdict::Permission {
+                        permission: Permission::Ask,
+                    },
+                },
+            )),
         ));
         assert_eq!(client.turn().asking, Some(2));
         assert_eq!(client.turn().asks, 1);

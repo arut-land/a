@@ -49,10 +49,10 @@ impl Fold {
         }
     }
 
-    /// Folds entry `e`, the one after the last folded, as the v2 kinds say
-    /// it: the agent is given the input it records, if any.
+    /// Folds entry `e`, the one after the last folded: the agent is given
+    /// the input it records, if any.
     pub fn apply(&mut self, e: &Entry, registry: &dyn Registry) {
-        let input = e.body.shim().and_then(|body| self.input(&body, registry));
+        let input = self.input(&e.body, registry);
         self.ledger.apply(e);
         if let Some(input) = input {
             self.stepped = true;
@@ -182,8 +182,7 @@ impl Fold {
                 by: Audience::User,
                 ..
             } => {
-                // A command taken up; one in an old log was its own
-                // intent, with nothing asked.
+                // A command taken up.
                 if matches!(self.asked.front(), Some(Next::Command { name, .. }) if name == tool) {
                     self.asked.pop_front();
                 }

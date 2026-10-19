@@ -26,14 +26,14 @@ use ext::{
 use kernel::{Answer, Core, Effect, Effects, Event, Load, Note, Owner, Replied, Ticket};
 use protocol::view::SessionView;
 use protocol::{
-    Author, Body, CallId, Cap, Card, DaemonMsg, Entry, Environment, Frame, Installed, Json, Mode,
+    Author, Body, CallId, Card, DaemonMsg, Entry, Environment, Frame, Installed, Json, Mode,
     Outcome, Overrides, Residency, SessionId, SessionSummary, Verdict,
 };
 use rt::{channel, oneshot};
 
 use crate::model::{Model, Models};
 use crate::outbox::{FrameLog, Outbox};
-use crate::transcript::{self, Transcript};
+use crate::transcript::Transcript;
 use crate::{Daemon, lock};
 
 /// What every session runs with.
@@ -222,7 +222,7 @@ impl Live {
             fresh,
             owner,
             busy,
-            extensions: Some(&header.extensions),
+            created: matches!(open, Open::Create),
         };
         let first = core.resumed(&load);
         let live = Arc::new(Self {
@@ -321,6 +321,15 @@ impl Live {
 
     fn send(&self, msg: Msg) {
         let _ = self.session.mail.send(msg);
+    }
+
+    /// Whether the log holds any input: a child's first comes from its
+    /// parent, once. Read from the log's start, where the input of a
+    /// child is.
+    pub fn has_input(&self) -> bool {
+        self.frames
+            .entries()
+            .any(|e| matches!(e.body, Body::Input { .. }))
     }
 
     pub fn summary(&self) -> SessionSummary {
@@ -643,7 +652,6 @@ impl Actor {
         let session = &self.live.session;
         let hooks = self.registry.hooks();
         self.transcript = self.transcript.take().filter(|t| t.is_on(&self.registry));
-        let mut followers = lock(&self.live.followers);
         for e in entries {
             self.live.frames.push(e.seq);
             lock(&session.states).apply(e);
@@ -661,18 +669,8 @@ impl Actor {
                 // Settled: what still runs of it is let go.
                 self.waiting.remove(&call);
             }
-            // Old clients are asked, once, as a call begins to wait.
-            if let Some(Ok(frame)) = asked(&e.body)
-                .and_then(|call| transcript::ask(self.core.ledger(), call))
-                .as_ref()
-                .map(Frame::new)
-            {
-                followers.retain(|c| {
-                    c.caps().has(Cap::Ledger) || c.send_after(e.seq, frame.clone()).is_ok()
-                });
-            }
         }
-        followers.retain(|c| c.wake().is_ok());
+        lock(&self.live.followers).retain(|c| c.wake().is_ok());
         *lock(&session.overrides) = self.core.ledger().settings();
     }
 
@@ -774,7 +772,6 @@ impl Actor {
                 session: self.live.id,
                 call: link.get(),
             }),
-            extensions: installed(&self.registry),
         };
         let env = lock(&self.live.session.env).clone();
         if let Some(daemon) = shared.daemon.upgrade() {
@@ -923,11 +920,11 @@ impl Actor {
     }
 
     /// Sends `client`, which has the entries up to `since`, the attach,
-    /// what it missed (or a snapshot, far behind) and its end; an old
-    /// client a recap and the asks still waiting; then everything live.
+    /// what it missed (or a snapshot, far behind) and its end; then
+    /// everything live.
     fn attach(&mut self, client: &Outbox, since: u64) {
         let seq = self.live.frames.seq();
-        let far = client.caps().has(Cap::Snapshot) && seq.saturating_sub(since) > SNAPSHOT_GAP;
+        let far = seq.saturating_sub(since) > SNAPSHOT_GAP;
         let snapshot = far.then(|| self.snapshot(seq)).flatten();
         let cursor = if snapshot.is_some() {
             seq
@@ -942,20 +939,11 @@ impl Actor {
         };
         frames.extend(Frame::new(&attached).ok().map(|f| (cursor, f)));
         frames.extend(snapshot.map(|frame| (seq, frame)));
-        let mut push = |msg: &DaemonMsg| frames.extend(Frame::new(msg).ok().map(|f| (seq, f)));
-        push(&DaemonMsg::Synced { seq });
-        if !client.caps().has(Cap::Ledger) {
-            let ledger = self.core.ledger();
-            let reply = transcript::reply(live.frames.entries_after(ledger.turn_start()));
-            if let Some(recap) = transcript::recap(ledger, reply.as_deref(), since) {
-                push(&DaemonMsg::Recap(recap));
-            }
-            for &call in ledger.inbox() {
-                if let Some(msg) = transcript::ask(ledger, call) {
-                    push(&msg);
-                }
-            }
-        }
+        frames.extend(
+            Frame::new(&DaemonMsg::Synced { seq })
+                .ok()
+                .map(|f| (seq, f)),
+        );
         let follower = client.follow(Arc::clone(&live.frames), cursor, frames);
         lock(&live.followers).push(follower);
     }
@@ -1006,27 +994,8 @@ impl<K: PartialEq, V> Keyed<K, V> {
 }
 
 /// How many entries behind a client must be to get a snapshot rather than
-/// a replay, when it takes them.
+/// a replay.
 const SNAPSHOT_GAP: u64 = 256;
-
-/// The call an entry has begin to wait for an approval.
-fn asked(body: &Body) -> Option<u64> {
-    match body {
-        Body::Wait {
-            call,
-            on: protocol::WaitOn::Approval,
-        }
-        | Body::Decision {
-            call: Some(call),
-            d:
-                Verdict::Permission {
-                    permission: protocol::Permission::Ask,
-                },
-            ..
-        } => Some(call.get()),
-        _ => None,
-    }
-}
 
 #[cfg(test)]
 impl Live {

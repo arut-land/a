@@ -1,7 +1,7 @@
 //! Connections as clients make them: the hello, pipelining, numbered
-//! mutations, capabilities, and the old clients a daemon keeps serving.
+//! mutations and the hello's versions.
 
-use std::io::{BufReader, Write};
+use std::io::BufReader;
 use std::os::unix::net::UnixStream;
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -222,7 +222,7 @@ fn origin(client: u32, client_seq: u64) -> Origin {
 
 /// Whether `body` is a client's input.
 fn is_input(body: &Body) -> bool {
-    matches!(body, Body::User { .. } | Body::Input { .. })
+    matches!(body, Body::Input { .. })
 }
 
 fn users(msgs: &[DaemonMsg]) -> usize {
@@ -243,7 +243,13 @@ fn a_pipelined_hello_attach_and_input_are_answered_in_order() {
     };
     assert_eq!((caps, client), (Caps::SERVED, 1));
     assert!(matches!(peer.recv(), DaemonMsg::Attached { .. }));
-    assert!(matches!(peer.recv(), DaemonMsg::Synced { seq: 0 }));
+    // A new session's first entry records its extensions.
+    let first = peer.recv();
+    assert!(
+        matches!(&first, DaemonMsg::Entry(e) if matches!(e.body, Body::Extensions { .. })),
+        "{first:?}"
+    );
+    assert!(matches!(peer.recv(), DaemonMsg::Synced { seq: 1 }));
     // The input is logged before it is acknowledged.
     let logged = peer.recv();
     assert!(
@@ -323,42 +329,6 @@ fn a_viewer_cannot_change_the_session() {
     assert!(matches!(peer.answer(), DaemonMsg::Ack { origin: o } if o == origin(1, 2)));
 }
 
-/// What a client of the first protocol 1 builds sends: no capabilities, no
-/// numbers, a bare interrupt. It gets only what such a client knows.
-#[test]
-fn an_old_client_is_served_as_before() {
-    let fixture = Fixture::new("old");
-    let mut peer = fixture.connect();
-    let raw = |peer: &mut Peer, json: &str| {
-        let len = u32::try_from(json.len()).unwrap();
-        peer.writer.write_all(&len.to_le_bytes()).unwrap();
-        peer.writer.write_all(json.as_bytes()).unwrap();
-    };
-    raw(&mut peer, r#"{"t":"hello","proto":1,"build":"old"}"#);
-    raw(&mut peer, r#"{"t":"input","text":"too early"}"#);
-    raw(
-        &mut peer,
-        r#"{"t":"attach","target":"new","workspace":"/w","since":0}"#,
-    );
-    raw(&mut peer, r#"{"t":"interrupt"}"#);
-    raw(&mut peer, r#"{"t":"input","text":"hi"}"#);
-    let DaemonMsg::Welcome { caps, .. } = peer.recv() else {
-        panic!("no welcome");
-    };
-    assert_eq!(caps, Caps::NONE);
-    assert!(matches!(peer.recv(), DaemonMsg::Error { message } if message == "not attached"));
-    let seen = peer
-        .until(|m| matches!(m, DaemonMsg::Entry(e) if matches!(e.body, Body::Assistant { .. })));
-    assert!(
-        seen.iter().all(|m| !matches!(
-            m,
-            DaemonMsg::Ack { .. } | DaemonMsg::Rejected { .. } | DaemonMsg::Snapshot(_)
-        )),
-        "{seen:?}"
-    );
-    assert_eq!(users(&seen), 1);
-}
-
 #[test]
 fn a_mismatched_hello_gets_the_range_and_nothing_behind_it_is_done() {
     let fixture = Fixture::new("mismatch");
@@ -397,10 +367,10 @@ fn a_mismatched_hello_gets_the_range_and_nothing_behind_it_is_done() {
     ));
 }
 
-/// A session longer than a snapshot is worth: a client that takes them gets
-/// one, an old client the replay.
+/// A session longer than a snapshot is worth: a client far behind gets
+/// one, a client near the end the replay.
 #[test]
-fn far_behind_a_client_gets_a_snapshot_if_it_takes_them() {
+fn far_behind_a_client_gets_a_snapshot() {
     let id = SessionId::new();
     let fixture = Fixture::with("snapshot", |home| {
         let store = Jsonl::open(home.sessions_dir()).unwrap();
@@ -409,38 +379,44 @@ fn far_behind_a_client_gets_a_snapshot_if_it_takes_them() {
                 id,
                 workspace: "/w".into(),
                 parent: None,
-                extensions: Vec::new(),
             })
             .unwrap();
         let (epoch, mut log) = (created.writer.epoch(), created.writer.log);
         let entries: Vec<Entry> = (1..=300)
             .map(|seq| {
                 let text = format!("m{seq}");
-                Entry::new(seq, epoch, Body::User { text })
+                let body = Body::Input {
+                    text,
+                    mode: protocol::Mode::Queue,
+                    taken: true,
+                    origin: None,
+                };
+                Entry::new(seq, epoch, body)
             })
             .collect();
         log.append_all(&entries).unwrap();
     });
-    let replay = |caps| {
+    let replay = |since| {
         let mut peer = fixture.connect();
-        peer.send(&hello(caps));
-        peer.send(&attach(Target::Id(id), 10, ClientDecl::default()));
+        peer.send(&hello(Caps::ALL));
+        peer.send(&attach(Target::Id(id), since, ClientDecl::default()));
         peer.until(|m| matches!(m, DaemonMsg::Synced { .. }))
     };
-    let snapshotted = replay(Caps::ALL);
+    let snapshotted = replay(10);
     let Some(DaemonMsg::Snapshot(view)) = snapshotted.get(2) else {
         panic!("no snapshot: {snapshotted:?}");
     };
     // Each was answered as the session recovered, before the attach.
-    assert_eq!((view.items.len(), view.seq), (600, 601));
+    assert_eq!((view.items.len(), view.seq), (600, 600));
     assert_eq!(users(&snapshotted), 0);
-    let replayed = replay(Caps::NONE);
+    let replayed = replay(400);
     assert!(
         replayed
             .iter()
             .all(|m| !matches!(m, DaemonMsg::Snapshot(_)))
     );
-    assert_eq!(users(&replayed), 290);
+    let entries = replayed.iter().filter(|m| matches!(m, DaemonMsg::Entry(_)));
+    assert_eq!(entries.count(), 200);
 }
 
 /// A client that stops reading only lags: it reads what it missed from the
@@ -454,7 +430,7 @@ fn a_client_that_falls_behind_is_caught_up_from_the_log() {
         .attach_to(&Target::New, || "/w".into())
         .unwrap();
     let session = attachment.session();
-    let outbox = Outbox::new(Caps::NONE);
+    let outbox = Outbox::new();
     rt::block_on(session.attach(outbox.clone(), 0));
     let big = "x".repeat(1 << 20);
     for _ in 0..6 {

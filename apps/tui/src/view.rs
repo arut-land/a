@@ -94,12 +94,16 @@ pub fn rows(item: &Item, width: usize, look: Look) -> Vec<Line> {
             width,
             look,
         ),
-        Item::Hook { hook, decision, .. } => {
+        Item::Hook {
+            hook,
+            call,
+            tool,
+            decision,
+            ..
+        } => {
+            let line = decision_line(tool, *call, decision);
             vec![Line::plain(
-                ellipsize(
-                    &sanitize(&format!("  · hook {hook}: {}", decision_line(decision))),
-                    width,
-                ),
+                ellipsize(&sanitize(&format!("  · hook {hook}: {line}")), width),
                 MUTED,
             )]
         }
@@ -217,7 +221,7 @@ fn card(c: &Card, width: usize, look: Look) -> Vec<Line> {
     let toggle = Action::Toggle(c.call);
     let (status, style) = match (c.outcome, c.phase) {
         (Some(Outcome::Done { output }), _) => {
-            let note = output_text(output, c.shown)
+            let note = output_text(c.shown)
                 .map(|(_, note)| note)
                 .filter(|note| !note.is_empty())
                 .unwrap_or_else(|| "done".to_owned());
@@ -229,7 +233,7 @@ fn card(c: &Card, width: usize, look: Look) -> Vec<Line> {
         }
         (Some(Outcome::Failed { .. }), _) => ("✗ failed".to_owned(), BAD),
         (Some(Outcome::Interrupted { .. }), _) => ("⚠ interrupted".to_owned(), WARN),
-        (None, Phase::Asking | Phase::Waiting) => ("? waiting for approval".to_owned(), ASK),
+        (None, Phase::Asking) => ("? waiting for approval".to_owned(), ASK),
         (None, Phase::Denied) => ("⊘ not approved".to_owned(), BAD),
         (None, _) => ("running…".to_owned(), BUSY),
     };
@@ -272,17 +276,13 @@ fn card(c: &Card, width: usize, look: Look) -> Vec<Line> {
         }
         out.extend(body.into_iter().skip(hidden));
     }
-    if matches!(c.phase, Phase::Asking | Phase::Waiting) {
-        out.push(if c.phase == Phase::Asking {
-            Line::from(vec![
-                Span::new("  allow this call?  ", ASK),
-                Span::button("[ y  yes ]", OK.bold(), Action::Approve(c.call, true)),
-                Span::new("  ", Style::new()),
-                Span::button("[ n  no ]", BAD.bold(), Action::Approve(c.call, false)),
-            ])
-        } else {
-            Line::plain("  waiting for an answer from another client", MUTED)
-        });
+    if c.phase == Phase::Asking {
+        out.push(Line::from(vec![
+            Span::new("  allow this call?  ", ASK),
+            Span::button("[ y  yes ]", OK.bold(), Action::Approve(c.call, true)),
+            Span::new("  ", Style::new()),
+            Span::button("[ n  no ]", BAD.bold(), Action::Approve(c.call, false)),
+        ]));
     }
     out
 }
@@ -315,7 +315,7 @@ fn output_rows(c: &Card, width: usize, verbose: bool) -> Vec<Line> {
         add(&input.to_string(), MUTED, false);
     }
     match c.outcome {
-        Some(Outcome::Done { output }) => match output_text(output, c.shown) {
+        Some(Outcome::Done { output }) => match output_text(c.shown) {
             Some((text, _)) => {
                 let text = text.strip_suffix('\n').unwrap_or(&text);
                 if !text.is_empty() {
@@ -355,7 +355,7 @@ mod tests {
         lines.iter().map(Line::text).collect()
     }
 
-    fn tool(outcome: Option<Outcome>, approval: Option<Approval>, asked: bool) -> Item {
+    fn tool(outcome: Option<Outcome>, approval: Option<Approval>) -> Item {
         Item::Tool {
             call: 7,
             tool: "bash".into(),
@@ -363,7 +363,6 @@ mod tests {
             approval,
             outcome,
             card: None,
-            asked,
         }
     }
 
@@ -371,18 +370,22 @@ mod tests {
     fn a_finished_card_shows_its_exit_and_output_tail() {
         let stdout = (1..=15).fold(String::new(), |s, n| s + &format!("line {n}\n"));
         let done = Outcome::Done {
-            output: json!({"stdout": stdout, "stderr": "", "exit": 0}).into(),
+            output: json!({"output": stdout, "exit": 0}).into(),
         };
-        let rows = texts(&rows(
-            &tool(Some(done.clone()), None, false),
-            40,
-            Look::default(),
-        ));
+        let mut finished = tool(Some(done.clone()), None);
+        if let Item::Tool { card, .. } = &mut finished {
+            *card = Some(protocol::Card {
+                title: "$ ls".into(),
+                body: stdout.clone(),
+                note: "exit 0".into(),
+            });
+        }
+        let rows = texts(&rows(&finished, 40, Look::default()));
         assert_eq!(rows[1], "▾ $ ls  ✓ exit 0");
         assert_eq!(rows[2], "  │ ⋯ 5 earlier lines (ctrl-o shows all)");
         assert_eq!(rows.last().unwrap(), "  │ line 15");
         let all = rows_of(
-            &tool(Some(done.clone()), None, false),
+            &finished,
             Look {
                 verbose: true,
                 ..Look::default()
@@ -390,7 +393,7 @@ mod tests {
         );
         assert_eq!(all.len(), 2 + 15);
         let folded = rows_of(
-            &tool(Some(done), None, false),
+            &finished,
             Look {
                 collapsed: true,
                 ..Look::default()
@@ -404,8 +407,8 @@ mod tests {
     }
 
     #[test]
-    fn a_card_asked_of_this_client_has_buttons() {
-        let item = tool(None, Some(Approval::Pending), true);
+    fn a_card_waiting_for_approval_has_buttons() {
+        let item = tool(None, Some(Approval::Pending));
         let lines = rows(&item, 60, Look::default());
         assert_eq!(texts(&lines)[1], "• $ ls  ? waiting for approval");
         let buttons: Vec<_> = lines[2].spans.iter().filter_map(|s| s.action).collect();
@@ -413,8 +416,6 @@ mod tests {
             buttons,
             [Action::Approve(7, true), Action::Approve(7, false)]
         );
-        let elsewhere = rows_of(&tool(None, Some(Approval::Pending), false), Look::default());
-        assert_eq!(elsewhere[2], "  waiting for an answer from another client");
     }
 
     #[test]
@@ -451,9 +452,17 @@ mod tests {
     #[test]
     fn command_output_escapes_are_stripped() {
         let done = Outcome::Done {
-            output: json!({"stdout": "\x1b[31mred\x1b[0m\n", "stderr": "", "exit": 1}).into(),
+            output: json!({"output": "\x1b[31mred\x1b[0m\n", "exit": 1}).into(),
         };
-        let rows = rows_of(&tool(Some(done), None, false), Look::default());
+        let mut ran = tool(Some(done), None);
+        if let Item::Tool { card, .. } = &mut ran {
+            *card = Some(protocol::Card {
+                title: "$ ls".into(),
+                body: "\x1b[31mred\x1b[0m\n".into(),
+                note: "exit 1".into(),
+            });
+        }
+        let rows = rows_of(&ran, Look::default());
         assert_eq!(rows[1..], ["▾ $ ls  ✗ exit 1", "  │ red"]);
     }
 
@@ -472,7 +481,6 @@ mod tests {
                 body: "@@ -2,1 +2,1 @@\n-two\n+2\n".into(),
                 note: "+1 -1".into(),
             }),
-            asked: false,
         };
         let lines = rows(&item, 40, Look::default());
         assert_eq!(

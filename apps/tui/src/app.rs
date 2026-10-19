@@ -223,7 +223,7 @@ impl App {
                     self.cache.clear();
                 }
             }
-            Change::Updated { index, item, .. } | Change::Asked { index, item } => {
+            Change::Updated { index, item, .. } => {
                 spend(&mut self.tokens, &item);
                 if self.cache.len() == len {
                     self.cache[index] = None;
@@ -231,7 +231,7 @@ impl App {
                     self.cache.clear();
                 }
             }
-            Change::Recap(_) => self.recap_hidden = false,
+            Change::Synced => self.recap_hidden = false,
             Change::Error { message } => {
                 // `a resume` where this workspace has no session: pick one.
                 if self.resuming && self.view().session.is_none() {
@@ -260,7 +260,7 @@ impl App {
                 }
             }
             // A streaming reply's rows catch up with its text when drawn.
-            Change::Delta { .. } | Change::Synced | Change::Draining => {}
+            Change::Delta { .. } | Change::Draining => {}
         }
         Vec::new()
     }

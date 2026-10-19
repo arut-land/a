@@ -61,7 +61,7 @@ impl Feed {
         let mut io = Vec::new();
         for effect in effects {
             let change = match effect {
-                Effect::View(update) => (&update.change).into(),
+                Effect::View(update) => ViewChange::of(&update.change, self.client.view()),
                 Effect::Link => ViewChange::Link {
                     state: self.client.link().into(),
                 },
@@ -125,9 +125,7 @@ impl Feed {
 /// About how many bytes of text `change` holds.
 fn weight(change: &ViewChange) -> usize {
     match change {
-        ViewChange::Added { item, .. }
-        | ViewChange::Updated { item, .. }
-        | ViewChange::Asked { item, .. } => item_weight(item),
+        ViewChange::Added { item, .. } | ViewChange::Updated { item, .. } => item_weight(item),
         ViewChange::Snapshot { items } => items.iter().map(item_weight).sum(),
         ViewChange::Delta { text, .. } => text.len(),
         _ => 0,

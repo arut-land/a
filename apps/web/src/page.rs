@@ -15,8 +15,6 @@ pub struct Page {
     error: Option<String>,
     /// The end the page shows, once it shows the transcript.
     shown: Option<End>,
-    /// How many items the page knew of.
-    known: usize,
     /// Text streamed since the last patch, for one reply.
     streamed: Option<(u64, String)>,
     /// Events not yet sent.
@@ -33,7 +31,6 @@ impl Page {
             client,
             error: None,
             shown: None,
-            known: 0,
             streamed: None,
             out: Vec::new(),
         };
@@ -116,7 +113,6 @@ impl Page {
     /// [`Page::settle`]. Until the attach is synced (again, after an
     /// upgrade) the page is left as it is; then it is shown whole.
     fn update(&mut self, update: Update) {
-        let before = std::mem::replace(&mut self.known, self.client.view().items.len());
         match &update.change {
             Change::Error { message } => self.error = Some(message.clone()),
             Change::Added { .. } => self.error = None,
@@ -146,12 +142,11 @@ impl Page {
         let view = self.client.view();
         match change {
             // The first item takes the place of the note that there is
-            // none; a call asked about may not have been shown yet.
+            // none; a sync brings the recap.
             Change::Added { index: 0, .. }
             | Change::Snapshot { .. }
-            | Change::Recap(_)
+            | Change::Synced
             | Change::Attached { reset: true, .. } => self.show_all(),
-            Change::Asked { .. } if view.items.len() > before => self.show_all(),
             Change::Added { item, .. } => {
                 let item = html(ItemRow { item: &item, view });
                 self.patch(&Patch::Before {
@@ -159,7 +154,7 @@ impl Page {
                     html: &item,
                 });
             }
-            Change::Updated { item, .. } | Change::Asked { item, .. } => {
+            Change::Updated { item, .. } => {
                 let item = html(ItemRow { item: &item, view });
                 self.patch(&Patch::Replace(&item));
             }
@@ -284,7 +279,15 @@ mod tests {
     }
 
     fn user(seq: u64, text: &str) -> DaemonMsg {
-        entry(seq, Body::User { text: text.into() })
+        entry(
+            seq,
+            Body::Input {
+                text: text.into(),
+                mode: protocol::Mode::Queue,
+                taken: true,
+                origin: None,
+            },
+        )
     }
 
     fn delta(call: u64, text: &str) -> DaemonMsg {

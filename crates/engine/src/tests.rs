@@ -110,8 +110,9 @@ fn idle_sessions_hibernate_and_reload_on_attach() {
     std::fs::remove_dir_all(&root).unwrap();
 
     assert!(hibernated);
-    assert_eq!((listed.len(), listed[0].entries), (1, 2));
-    assert_eq!(reloaded, 2);
+    // Its extensions, the input and the answer.
+    assert_eq!((listed.len(), listed[0].entries), (1, 3));
+    assert_eq!(reloaded, 3);
     assert_eq!(latest.unwrap().session().id, id);
     assert!(missing.is_err());
 }
@@ -138,9 +139,9 @@ fn a_hibernated_session_lists_the_entries_it_has_now() {
         counts.push([daemon.list()[0].entries, daemon.list()[0].entries, stored]);
     }
     std::fs::remove_dir_all(&root).unwrap();
-    assert_eq!(counts[0], [2; 3]);
+    assert_eq!(counts[0], [3; 3]);
     assert!(
-        counts[1][2] > 2 && counts[1] == [counts[1][2]; 3],
+        counts[1][2] > 3 && counts[1] == [counts[1][2]; 3],
         "{counts:?}"
     );
 }
@@ -155,8 +156,6 @@ fn busy_sessions_recover_at_startup() {
             id,
             workspace: "/w".into(),
             parent: None,
-            // As an earlier version wrote it.
-            extensions: Vec::new(),
         })
         .unwrap();
     let calls = [
@@ -187,9 +186,7 @@ fn busy_sessions_recover_at_startup() {
     let still_busy = store.is_busy(id);
     std::fs::remove_dir_all(&root).unwrap();
 
-    // The log's header predates extension records, so recovery notes them
-    // first. The safe sleep runs again; the shell command is not rerun.
-    assert!(matches!(&got[2], Body::Extensions { installed } if installed.len() == 7));
+    // The safe sleep runs again; the shell command is not rerun.
     let result = |call| {
         got.iter().find_map(|b| match b {
             Body::ToolResult {
@@ -203,7 +200,7 @@ fn busy_sessions_recover_at_startup() {
         "{got:#?}"
     );
     assert_eq!(result(2), Some(&Outcome::Interrupted { output: None }));
-    assert_eq!(got.len(), 5);
+    assert_eq!(got.len(), 4);
     assert!(!still_busy);
 }
 
@@ -326,7 +323,7 @@ fn a_parent_hears_from_its_child_exactly_once() {
     drop(parent);
     let store = &*daemon.shared.store;
     let got = bodies(store, id);
-    let Body::Link { child, .. } = got[2] else {
+    let Body::Link { child, .. } = got[3] else {
         panic!("{got:?}")
     };
     let child_header = store.headers().unwrap().into_iter().find(|h| h.id == child);
@@ -362,27 +359,27 @@ fn a_parent_hears_from_its_child_exactly_once() {
     // The `task` call waits on the child it linked, and answers with what
     // the child settled with.
     assert_eq!(
-        got[2..],
+        got[3..],
         [
             Body::Link {
                 child,
                 input: "hi".into()
             },
             Body::Wait {
-                call: protocol::CallId::new(2).unwrap(),
+                call: protocol::CallId::new(3).unwrap(),
                 on: protocol::WaitOn::Child {
-                    link: protocol::Seq::new(3).unwrap()
+                    link: protocol::Seq::new(4).unwrap()
                 }
             },
             Body::Watch { child },
             Body::Fired {
-                watch: 5,
+                watch: 6,
                 outcome: Outcome::Done {
                     output: "hi".into()
                 }
             },
             Body::ToolResult {
-                call: 2,
+                call: 3,
                 outcome: Outcome::Done {
                     output: "The child session finished:\nhi".into()
                 },
@@ -390,12 +387,12 @@ fn a_parent_hears_from_its_child_exactly_once() {
             },
         ]
     );
-    assert!(matches!(&got[1], Body::ToolCall { tool, .. } if tool == "task"));
+    assert!(matches!(&got[2], Body::ToolCall { tool, .. } if tool == "task"));
     assert!(!parent_loaded, "a moot report loaded the parent");
-    assert_eq!(child_header.unwrap().parent.unwrap().call, 3);
+    assert_eq!(child_header.unwrap().parent.unwrap().call, 4);
     assert_eq!(resumed, id, "resuming picks the parent, not its child");
     assert_eq!(
-        child_log,
+        child_log[1..],
         [
             Body::Input {
                 text: "hi".into(),
@@ -430,7 +427,7 @@ fn a_child_runs_in_its_parents_environment() {
         Body::Link { child, .. } => Some(child),
         _ => None,
     });
-    let opening = bodies(store, child.unwrap()).into_iter().next();
+    let opening = bodies(store, child.unwrap()).into_iter().nth(1);
     drop(daemon);
     std::fs::remove_dir_all(&root).unwrap();
 
@@ -459,14 +456,16 @@ fn watches_rearm_after_a_crash_and_fire_once() {
         id: SessionId::new(),
         workspace: "/w".into(),
         parent: parent.map(|session| crate::store::Parent { session, call: 3 }),
-        extensions: Vec::new(),
     };
     // The `task` call, its link, its wait on the child and the watch commit
     // in one batch.
     let spawned = |child: SessionId| {
         vec![
-            Body::User {
+            Body::Input {
                 text: "spawn sleep 0".into(),
+                mode: protocol::Mode::Queue,
+                taken: true,
+                origin: None,
             },
             Body::ToolCall {
                 tool: "task".into(),
@@ -488,8 +487,11 @@ fn watches_rearm_after_a_crash_and_fire_once() {
             Body::Watch { child },
         ]
     };
-    let opened = || Body::User {
+    let opened = || Body::Input {
         text: "sleep 0".into(),
+        mode: protocol::Mode::Queue,
+        taken: true,
+        origin: None,
     };
     let sleep = || Body::ToolCall {
         tool: "sleep".into(),
@@ -571,7 +573,7 @@ fn an_owner_idles_with_its_children_and_an_interrupt_stops_them_first() {
     let log = until(&daemon, id, |log| {
         log.iter().any(|b| matches!(b, Body::Watch { .. }))
     });
-    let Some(Body::Link { child, .. }) = log.get(2) else {
+    let Some(Body::Link { child, .. }) = log.get(3) else {
         panic!("{log:#?}")
     };
     until(&daemon, *child, |log| {
@@ -617,12 +619,14 @@ fn an_orphan_does_not_resume_what_it_was_doing() {
             session: SessionId::new(),
             call: 2,
         }),
-        extensions: Vec::new(),
     };
     let mut created = store.create(&header).unwrap();
     let bodies_written = [
-        Body::User {
+        Body::Input {
             text: "sleep 0".into(),
+            mode: protocol::Mode::Queue,
+            taken: true,
+            origin: None,
         },
         Body::ToolCall {
             tool: "sleep".into(),
@@ -654,7 +658,6 @@ fn an_orphan_does_not_resume_what_it_was_doing() {
         matches!(
             &got[2..],
             [
-                Body::Extensions { .. },
                 Body::ToolResult {
                     call: 2,
                     outcome: Outcome::Interrupted { output: None },
@@ -790,7 +793,7 @@ fn a_daemon_after_a_crash_loop_refuses_to_serve_until_reset() {
 fn watchers_are_sent_the_session_list_as_it_changes() {
     use super::outbox::Outbox;
     use super::{Exit, Lifecycle};
-    use protocol::{Caps, DaemonMsg, SessionSummary};
+    use protocol::{DaemonMsg, SessionSummary};
 
     let (root, home) = home("watch");
     std::fs::create_dir_all(&root).unwrap();
@@ -810,7 +813,7 @@ fn watchers_are_sent_the_session_list_as_it_changes() {
         supervisor.supervise(&life, &config, exit).await;
     }));
 
-    let watcher = Outbox::new(Caps::ALL);
+    let watcher = Outbox::new();
     daemon.watch_list(&watcher);
     let seen = std::sync::Mutex::new(Vec::<Vec<SessionSummary>>::new());
     let latest = |pick: &dyn Fn(&[SessionSummary]) -> bool| {
@@ -899,7 +902,8 @@ fn one_writer_per_session() {
     std::fs::remove_dir_all(&root).unwrap();
 
     let seqs: Vec<u64> = entries.iter().map(|e| e.seq).collect();
-    assert_eq!(seqs, (1..=40).collect::<Vec<_>>());
+    // Its extensions first, then each input and its answer.
+    assert_eq!(seqs, (1..=41).collect::<Vec<_>>());
     assert!(
         entries.windows(2).all(|w| w[0].epoch <= w[1].epoch),
         "{entries:#?}"

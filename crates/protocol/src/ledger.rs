@@ -4,19 +4,12 @@
 //! watches are armed, and the settings, environment and context last
 //! logged. Pure: the daemon and any client fold the same entries to the
 //! same ledger.
-//!
-//! It folds the v2 kinds only: an entry of a kind earlier builds write is
-//! folded as [`Body::shim`] says it, so an old log and a new one of the same
-//! session fold to the same ledger. What only an old log's order says (a
-//! `user` entry took up the oldest input waiting; a gate's decisions came
-//! before their call) is read in [`Ledger::legacy`], which nothing a v2
-//! build writes reaches.
 
 use std::collections::VecDeque;
 
 use crate::{
-    Activity, Audience, Author, Body, ClientId, ClientSeq, Decision, Entry, Environment, Installed,
-    Json, Mode, Outcome, Overrides, Permission, SessionId, Verdict, WaitOn,
+    Activity, Audience, Author, Body, ClientId, ClientSeq, Entry, Environment, Installed, Json,
+    Mode, Outcome, Overrides, Permission, SessionId, Verdict, WaitOn,
 };
 
 #[derive(Clone, Debug, Default)]
@@ -43,10 +36,6 @@ pub struct Ledger {
     context: bool,
     /// The last mutation logged of each client that named itself.
     clients: Vec<(ClientId, ClientSeq)>,
-    /// The hook decisions ending the log, but for environments and
-    /// extensions logged between them: in an old log, those of a gate whose
-    /// call is next.
-    hooks: Vec<(String, Decision)>,
     /// What the session last settled with, as a child hands it back.
     result: Option<Outcome>,
     turn: Turn,
@@ -139,17 +128,10 @@ impl Ledger {
 
     /// Folds entry `e`, the one after the last folded. An entry that does
     /// not fit what came before (an outcome for no open call, an answer for
-    /// no wait) changes nothing, as when an earlier version wrote it.
+    /// no wait) changes nothing.
     pub fn apply(&mut self, e: &Entry) {
-        self.seq = e.seq;
-        if let Some(body) = e.body.shim() {
-            self.fold(e.seq, &body);
-        }
-        self.legacy(&e.body);
-    }
-
-    /// Folds an entry as v2 kinds say it.
-    fn fold(&mut self, seq: u64, body: &Body) {
+        let (seq, body) = (e.seq, &e.body);
+        self.seq = seq;
         match body {
             Body::Input {
                 text,
@@ -217,17 +199,7 @@ impl Ledger {
                 let model = data.parse().unwrap_or_default();
                 self.settings = Some((seq, Overrides { model }));
             }
-            // The rest folded as their shims.
-            Body::Ext { .. }
-            | Body::Edit { .. }
-            | Body::User { .. }
-            | Body::Queued { .. }
-            | Body::Steer { .. }
-            | Body::Hook { .. }
-            | Body::Ask { .. }
-            | Body::Command { .. }
-            | Body::CommandResult { .. }
-            | Body::Settings(_) => {}
+            Body::Ext { .. } | Body::Edit { .. } => {}
         }
     }
 
@@ -241,8 +213,6 @@ impl Ledger {
                 if *by != Audience::User {
                     self.turn.tools.push(tool.clone());
                 }
-                // In an old log, the gate's decisions came first.
-                let at = self.hooks.iter().filter(|(_, d)| d.gates()).count();
                 self.open(
                     seq,
                     Call::Tool {
@@ -250,9 +220,7 @@ impl Ledger {
                         input: input.clone(),
                         by: *by,
                     },
-                    Phase::Gating {
-                        at: u16::try_from(at).unwrap_or(u16::MAX),
-                    },
+                    Phase::Gating { at: 0 },
                 );
             }
             Body::ModelCall { attempt, .. } => {
@@ -296,19 +264,6 @@ impl Ledger {
                 self.answer(call.get(), value);
             }
             _ => {}
-        }
-    }
-
-    /// Folds what only the order of an old log says.
-    fn legacy(&mut self, body: &Body) {
-        match body {
-            Body::Hook { hook, decision } => self.hooks.push((hook.clone(), decision.clone())),
-            Body::Extensions { .. } | Body::Environment(_) => {}
-            _ => self.hooks.clear(),
-        }
-        // Each took up the oldest input waiting, if any.
-        if let Body::User { .. } | Body::Command { .. } = body {
-            self.untaken.pop_front();
         }
     }
 
@@ -520,12 +475,6 @@ impl Ledger {
     /// Whether the session's context is logged.
     pub const fn has_context(&self) -> bool {
         self.context
-    }
-
-    /// The hook decisions ending the log, environments and extensions
-    /// logged between them aside.
-    pub fn trailing_hooks(&self) -> &[(String, Decision)] {
-        &self.hooks
     }
 
     /// The number of client `client`'s last mutation logged: a mutation of

@@ -13,7 +13,7 @@ use bytes::Bytes;
 use ext::{Extension, Registrar, Replay, Rewrite, Tool, point};
 use ext_policy::Policy;
 use llm::http::Http;
-use protocol::{Audience, CallId, Caps, Card, Permission, Seq, WaitOn};
+use protocol::{Audience, CallId, Card, Permission, Seq};
 use serde::Deserialize as _;
 use serde_json::{Value, json};
 
@@ -255,18 +255,17 @@ impl Fixture {
         }))
     }
 
-    fn header(&self) -> Header {
+    fn header() -> Header {
         Header {
             id: SessionId::new(),
             workspace: std::env::temp_dir(),
             parent: None,
-            extensions: installed(&self.0.registry.get()),
         }
     }
 
     /// A new session.
     fn create(&self) -> Arc<Live> {
-        Live::start(&self.header(), &self.0, Open::Create, Owner::None).unwrap()
+        Live::start(&Self::header(), &self.0, Open::Create, Owner::None).unwrap()
     }
 
     /// A session whose log holds `entries`, started as after a crash, once
@@ -279,7 +278,7 @@ impl Fixture {
 
     /// [`Fixture::start`], without waiting for recovery.
     fn load(&self, entries: &[Entry]) -> Arc<Live> {
-        let header = self.header();
+        let header = Self::header();
         let mut created = self.0.store.create(&header).unwrap();
         for e in entries {
             let e = Entry::new(e.seq, created.writer.epoch(), e.body.clone());
@@ -424,39 +423,6 @@ impl LogStore for Probe {
     }
 }
 
-#[test]
-fn transcripts_of_earlier_logs_read_replies_as_text() {
-    let done = Outcome::Done {
-        output: json!({ "text": "hello", "usage": { "input": 1, "output": 1 } }).into(),
-    };
-    let model_call = || Body::ModelCall {
-        model: "m".into(),
-        attempt: 0,
-    };
-    let entries = [
-        entry(1, Body::User { text: "hi".into() }),
-        entry(2, model_call()),
-        entry(
-            3,
-            Body::ModelResult {
-                call: 2,
-                outcome: done,
-            },
-        ),
-        entry(4, user("again")),
-        entry(5, model_call()),
-    ];
-    let turns = transcript(&entries, 5, Arc::default());
-    assert_eq!(
-        turns,
-        [
-            llm::Message::user("hi"),
-            llm::Message::assistant("hello"),
-            llm::Message::user("again"),
-        ]
-    );
-}
-
 /// #9 `a_failed_commit_is_resume`: input commits on arrival, before the
 /// turn it starts; input that cannot be logged is refused and gone, seq
 /// and all, and the session goes on from its log.
@@ -482,14 +448,16 @@ fn input_commits_on_arrival_and_a_failed_commit_leaves_no_trace() {
     session.halt();
 
     assert_eq!(lost, Err("logging: disk full".into()));
-    assert_eq!(*lock(&probe.batches), [1, 1, 1, 1]);
+    // The extensions it was created with, then a batch a step.
+    assert_eq!(*lock(&probe.batches), [1, 1, 1, 1, 1]);
+    assert!(matches!(log[0].body, Body::Extensions { .. }));
     assert_eq!(
-        facts(&log),
+        facts(&log[1..]),
         [
-            (1, &user("hi")),
-            (2, &echo("hi")),
-            (3, &user("again")),
-            (4, &echo("again"))
+            (2, &user("hi")),
+            (3, &echo("hi")),
+            (4, &user("again")),
+            (5, &echo("again"))
         ]
     );
 }
@@ -946,8 +914,8 @@ fn asking() -> Fixture {
 }
 
 /// #18 `a_wait_survives_anything`: an ask waits in the inbox through a
-/// stop, is delivered to each client that attaches, and runs once
-/// approved.
+/// stop, every client that attaches folds it from the log, and it runs
+/// once approved.
 #[test]
 fn an_ask_waits_in_the_inbox_through_a_stop_and_runs_once_approved() {
     let fixture = asking();
@@ -964,28 +932,21 @@ fn an_ask_waits_in_the_inbox_through_a_stop_and_runs_once_approved() {
     session.halt();
 
     let resumed = fixture.start(&asked);
-    let outbox = Outbox::new(Caps::NONE);
-    resumed.follow(&outbox, asked.len() as u64);
+    let outbox = Outbox::new();
+    resumed.follow(&outbox, 0);
+    let mut view = SessionView::default();
+    for frame in std::iter::from_fn(|| outbox.try_next()) {
+        let msg: DaemonMsg = protocol::read_frame(&mut frame.as_bytes())
+            .unwrap()
+            .unwrap();
+        view.fold(&msg);
+    }
+    assert_eq!(view.turn().asking, Some(2));
+    assert!(view.recap.is_some_and(|r| r.asks == 1));
     resumed.answer(2, true).unwrap();
     let log = finished(&resumed, 2);
     resumed.halt();
 
-    let sent: Vec<DaemonMsg> = std::iter::from_fn(|| outbox.try_next())
-        .map(|frame: Frame| {
-            protocol::read_frame(&mut frame.as_bytes())
-                .unwrap()
-                .unwrap()
-        })
-        .collect();
-    assert!(
-        matches!(&sent[..], [
-            DaemonMsg::Attached { .. },
-            DaemonMsg::Synced { seq: 3 },
-            DaemonMsg::Ask { call: 2, tool, .. },
-            ..
-        ] if tool == "bash"),
-        "{sent:#?}"
-    );
     assert!(
         matches!(
             &bodies(&log)[..],
@@ -1083,69 +1044,6 @@ fn an_interrupt_between_turns_is_not_kept_for_the_next() {
     let log = log_of(&session);
     session.halt();
     assert_eq!(bodies(&log), [&user("hi"), &echo("hi")]);
-}
-
-#[test]
-fn a_recap_tells_the_last_prompt_and_what_followed() {
-    let call = |tool: &str| Body::ToolCall {
-        tool: tool.into(),
-        input: json!({}).into(),
-        id: None,
-        card: None,
-        by: Audience::Model,
-    };
-    let entries = [
-        entry(1, user("first")),
-        entry(2, echo("first")),
-        entry(3, user("go on\nwith detail")),
-        entry(4, call("sleep")),
-        entry(
-            5,
-            Body::ToolResult {
-                call: 4,
-                outcome: Outcome::Interrupted { output: None },
-                card: None,
-            },
-        ),
-        entry(6, call("bash")),
-        entry(
-            7,
-            Body::Wait {
-                call: id(6),
-                on: WaitOn::Approval,
-            },
-        ),
-        entry(8, call("sleep")),
-    ];
-    let recap_of = |entries: &[Entry], since| {
-        let ledger = protocol::ledger::Ledger::of(entries);
-        let after = entries.partition_point(|e| e.seq <= ledger.turn_start());
-        transcript::recap(
-            &ledger,
-            transcript::reply(&entries[after..]).as_deref(),
-            since,
-        )
-    };
-    assert_eq!(recap_of(&entries, 8), None);
-    assert_eq!(
-        recap_of(&entries, 0),
-        Some(protocol::Recap {
-            prompt: Some("go on…".into()),
-            tools: vec!["sleep".into(), "bash".into(), "sleep".into()],
-            failed: 1,
-            running: 1,
-            reply: None,
-            asks: 1,
-        })
-    );
-    let replied = recap_of(&entries[..2], 1).unwrap();
-    assert_eq!(replied.reply.as_deref(), Some("first"));
-    let env = entry(1, Body::Environment(Environment::default()));
-    assert_eq!(
-        recap_of(&[env], 0),
-        None,
-        "an environment alone is nothing to tell"
-    );
 }
 
 /// `/jobs` answers without a model turn; `shout` rewrites input and
@@ -1962,7 +1860,7 @@ fn one_fsync_per_step() {
         by: Audience::Model,
     };
     let entries = [entry(1, older), entry(2, user("$ make")), entry(3, bash)];
-    let header = fixture.header();
+    let header = Fixture::header();
     let mut created = probe.store.create(&header).unwrap();
     for e in &entries {
         let e = Entry::new(e.seq, created.writer.epoch(), e.body.clone());

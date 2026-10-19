@@ -12,10 +12,9 @@
 //! absent, but for a [`Json`] field, where it is the value.
 //!
 //! Each union is declared once, with [`kinds!`]: its variants, their tags,
-//! their [`Class`](crate::Class), how each decodes and, for kinds no longer
-//! written, what each means now. What it declares is what the enum, its
-//! serializer, its decoder and its tag table are made of, so a kind cannot
-//! be in one and not the others.
+//! their [`Class`](crate::Class) and how each decodes. What it declares is
+//! what the enum, its serializer, its decoder and its tag table are made
+//! of, so a kind cannot be in one and not the others.
 
 use std::collections::BTreeMap;
 use std::fmt;
@@ -28,16 +27,16 @@ use serde_json::{Error, Result};
 use crate::view::{Approval, Item, SessionView, Status, Usage};
 use crate::{
     Audience, Author, Body, CallId, Caps, Card, ClientDecl, ClientId, ClientMsg, CommandInfo,
-    DaemonMsg, Decision, Decode, Entry, Environment, HomeSettings, Installed, Json, Mode, Origin,
-    Outcome, Overrides, Permission, Recap, Rejection, Role, Seq, SessionId, SessionSummary,
-    SettingsChange, Target, Verdict, WaitOn,
+    DaemonMsg, Decode, Entry, Environment, HomeSettings, Installed, Json, Mode, Origin, Outcome,
+    Permission, Rejection, Role, Seq, SessionId, SessionSummary, SettingsChange, Target, Verdict,
+    WaitOn,
 };
 
 /// Declares a tagged union of the wire, one line per kind:
 ///
 /// ```text
 /// /// docs
-/// Name "tag" { field: Type, field: Type = default } = Class, read path, was { field } => v2;
+/// Name "tag" { field: Type, field: Type = default } = Class, read path;
 /// ```
 ///
 /// - a field without `= default` is required; one with it reads as its
@@ -45,58 +44,16 @@ use crate::{
 /// - `( Type )` is a newtype variant, which `read path` decodes;
 /// - `read path` decodes the kind with `path(&mut F)` instead, `F` the
 ///   union's flat fields (`in F`);
-/// - `= Class` (in a union declared `class`) classifies it;
-/// - `was { fields } => expr` (in a union declared `shims`) marks a kind
-///   only earlier builds write: `expr` is what it means in today's kinds,
-///   `None` when it names nothing (a call 0).
+/// - `= Class` (in a union declared `class`) classifies it, by name or
+///   by a `(function)` of the value;
 ///
-/// A union declared `class` alone (the daemon's messages) also names the
-/// variant decoding yields for a message of a kind it does not know:
-/// `unknown Name { fields } = Class;`.
+/// A union declared `class` may also name the variant decoding yields for
+/// a message of a kind it does not know: `unknown Name { fields } = Class;`.
 ///
 /// It makes the enum (tag and kind names as given, so the encoder writes
 /// what the decoder reads), `TAGS` (checked distinct at compile time),
-/// `knows`, the one-pass decoder `read`, and `class` and `shim` when asked.
+/// `knows`, the one-pass decoder `read`, and `class` when asked.
 macro_rules! kinds {
-    (
-        $(#[$meta:meta])*
-        $vis:vis enum $E:ident: $slot:ident = $tag:literal in $F:ident, class, shims {
-            $(
-                $(#[$vmeta:meta])*
-                $V:ident $vtag:literal
-                $({ $( $(#[$fmeta:meta])* $f:ident : $fty:ty $(= $m:ident)? ),* $(,)? })?
-                $(( $nty:ty ))?
-                = $class:ident
-                $(, read $dec:path)?
-                $(, was $was:tt => $shim:expr)?
-            ;)*
-        }
-        else $fallback:expr
-    ) => {
-        kinds! { @union [$(#[$meta])*] $vis $E $F $slot $tag [$fallback] [] [$(
-            [$(#[$vmeta])*] $V $vtag [$({ $( [$(#[$fmeta])*] $f : $fty $(= $m)? ),* })?] [$(( $nty ))?] [$($dec)?]
-        )*] }
-
-        impl $E {
-            /// How an entry of this kind stands to the log.
-            pub const fn class(&self) -> $crate::Class {
-                match self {
-                    $(Self::$V { .. } => $crate::Class::$class,)*
-                }
-            }
-
-            /// This entry as today's kinds say it: itself, unless it is of a
-            /// kind only earlier builds write (which still decode as they
-            /// were written, so their lines stay what was sent); `None` for
-            /// one that names nothing.
-            pub fn shim(&self) -> Option<::std::borrow::Cow<'_, Self>> {
-                match self {
-                    $($(Self::$V $was => $shim.map(::std::borrow::Cow::Owned),)?)*
-                    _ => Some(::std::borrow::Cow::Borrowed(self)),
-                }
-            }
-        }
-    };
     (
         $(#[$meta:meta])*
         $vis:vis enum $E:ident: $slot:ident = $tag:literal in $F:ident, class {
@@ -109,24 +66,26 @@ macro_rules! kinds {
                 $(, read $dec:path)?
             ;)*
         }
-        $(#[$umeta:meta])*
-        unknown $U:ident { $( $uf:ident : $uty:ty ),* } = $uclass:ident;
+        $(
+            $(#[$umeta:meta])*
+            unknown $U:ident { $( $uf:ident : $uty:ty ),* } = $uclass:ident;
+        )?
         else $fallback:expr
     ) => {
         kinds! { @union [$(#[$meta])*] $vis $E $F $slot $tag [$fallback]
-            [$(#[$umeta])* #[serde(skip)] $U { $( $uf: $uty ),* },]
+            [$( $(#[$umeta])* #[serde(skip)] $U { $( $uf: $uty ),* }, )?]
             [$(
                 [$(#[$vmeta])*] $V $vtag [$({ $( [$(#[$fmeta])*] $f : $fty $(= $m)? ),* })?] [$(( $nty ))?] [$($dec)?]
             )*]
         }
 
         impl $E {
-            /// How the message stands to the session's log.
+            /// How it stands to the session's log.
             pub const fn class(&self) -> $crate::Class {
                 let this = self;
                 match this {
                     $(Self::$V { .. } => kinds!(@class this $class),)*
-                    Self::$U { .. } => $crate::Class::$uclass,
+                    $(Self::$U { .. } => $crate::Class::$uclass,)?
                 }
             }
         }
@@ -297,7 +256,6 @@ same!(
     Json,
     Card,
     Outcome,
-    Decision,
     Permission,
     Mode,
     Seq,
@@ -418,8 +376,6 @@ pub(crate) struct EntryFields {
     pub(crate) text: Option<String>,
     pub(crate) mode: Option<Mode>,
     pub(crate) taken: Option<bool>,
-    pub(crate) steer: Option<bool>,
-    pub(crate) queued: Option<u64>,
     pub(crate) tool: Option<String>,
     #[serde(default, deserialize_with = "present")]
     pub(crate) input: Option<Json>,
@@ -433,8 +389,6 @@ pub(crate) struct EntryFields {
     pub(crate) outcome: Option<Outcome>,
     pub(crate) model: Option<String>,
     pub(crate) attempt: Option<u16>,
-    pub(crate) hook: Option<String>,
-    pub(crate) decision: Option<Decision>,
     pub(crate) on: Option<Tag>,
     #[serde(default, deserialize_with = "present")]
     pub(crate) ui: Option<Json>,
@@ -453,8 +407,6 @@ pub(crate) struct EntryFields {
     pub(crate) state: Option<String>,
     #[serde(default, deserialize_with = "present")]
     pub(crate) data: Option<Json>,
-    pub(crate) name: Option<String>,
-    pub(crate) args: Option<String>,
     pub(crate) target: Option<Seq>,
     pub(crate) upto: Option<Seq>,
     #[serde(default, deserialize_with = "present")]
@@ -477,9 +429,6 @@ pub(crate) struct MsgFields {
     pub(crate) call: Option<u64>,
     pub(crate) text: Option<String>,
     pub(crate) attempt: Option<u16>,
-    pub(crate) tool: Option<String>,
-    #[serde(default, deserialize_with = "present")]
-    pub(crate) input: Option<Json>,
     pub(crate) proto: Option<u32>,
     pub(crate) build: Option<String>,
     pub(crate) caps: Option<Caps>,
@@ -490,16 +439,12 @@ pub(crate) struct MsgFields {
     pub(crate) session: Option<SessionId>,
     pub(crate) workspace: Option<PathBuf>,
     pub(crate) sessions: Option<Json>,
-    pub(crate) prompt: Option<String>,
     pub(crate) tools: Option<Vec<String>>,
-    pub(crate) failed: Option<u32>,
-    pub(crate) running: Option<u32>,
-    pub(crate) reply: Option<String>,
-    pub(crate) asks: Option<u32>,
     pub(crate) message: Option<String>,
     pub(crate) origin: Option<Origin>,
     pub(crate) reason: Option<Rejection>,
     pub(crate) items: Option<Json>,
+    pub(crate) queued: Option<Vec<(u64, String)>>,
     pub(crate) environment: Option<Environment>,
     pub(crate) pid: Option<u32>,
     pub(crate) started: Option<u64>,
@@ -543,7 +488,8 @@ struct ItemFields {
     name: Option<String>,
     args: Option<String>,
     hook: Option<String>,
-    decision: Option<Decision>,
+    #[serde(default, deserialize_with = "present")]
+    decision: Option<Json>,
     child: Option<SessionId>,
     watch: Option<u64>,
     fired: Option<Outcome>,
@@ -592,13 +538,6 @@ pub(crate) fn environment_entry(f: &mut EntryFields) -> Result<Body> {
     environment(f.cwd.take(), f.vars.take(), f.redacted.take(), f.tty.take()).map(Body::Environment)
 }
 
-#[allow(clippy::unnecessary_wraps, reason = "as `kinds!` calls it")]
-pub(crate) fn settings_entry(f: &mut EntryFields) -> Result<Body> {
-    Ok(Body::Settings(Overrides {
-        model: f.model.take(),
-    }))
-}
-
 pub(crate) fn wait_entry(f: &mut EntryFields) -> Result<Body> {
     Ok(Body::Wait {
         call: need(f.call.take(), "call")?,
@@ -620,17 +559,6 @@ pub(crate) fn entry_msg(_: &mut MsgFields) -> Result<DaemonMsg> {
     Err(Error::custom("an entry reads as an entry"))
 }
 
-pub(crate) fn recap_msg(f: &mut MsgFields) -> Result<DaemonMsg> {
-    Ok(DaemonMsg::Recap(Recap {
-        prompt: f.prompt.take(),
-        tools: req(f.tools.take(), "tools")?,
-        failed: req(f.failed.take(), "failed")?,
-        running: req(f.running.take(), "running")?,
-        reply: f.reply.take(),
-        asks: req(f.asks.take(), "asks")?,
-    }))
-}
-
 pub(crate) fn snapshot_msg(f: &mut MsgFields) -> Result<DaemonMsg> {
     Ok(DaemonMsg::Snapshot(Box::new(SessionView {
         session: f.session.take(),
@@ -638,6 +566,7 @@ pub(crate) fn snapshot_msg(f: &mut MsgFields) -> Result<DaemonMsg> {
         seq: req(f.seq.take(), "seq")?,
         items: need(f.items.take(), "items")?,
         environment: def(f.environment.take())?,
+        queued: f.queued.take().unwrap_or_default(),
         ..SessionView::default()
     })))
 }
@@ -692,7 +621,6 @@ impl ItemFields {
                 approval: f.approval.take(),
                 outcome: f.outcome.take(),
                 card: f.card.take(),
-                asked: false,
             },
             Type::Command => Item::Command {
                 call: req(f.call.take(), "call")?,
@@ -703,7 +631,9 @@ impl ItemFields {
             Type::Hook => Item::Hook {
                 seq: req(f.seq.take(), "seq")?,
                 hook: req(f.hook.take(), "hook")?,
-                decision: need(f.decision.take(), "decision")?,
+                call: f.call.take(),
+                tool: f.tool.take().unwrap_or_default(),
+                decision: verdict(&req(f.decision.take(), "decision")?)?,
             },
             Type::Child => Item::Child {
                 call: req(f.call.take(), "call")?,
@@ -718,6 +648,11 @@ impl ItemFields {
             },
         })
     }
+}
+
+/// A [`Verdict`] as an item nests it, read by the decoder an entry's is.
+fn verdict(json: &Json) -> Result<Verdict> {
+    Verdict::read(&mut read::<EntryFields>(json.raw().as_bytes())?)
 }
 
 impl Decode for Entry {

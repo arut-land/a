@@ -111,7 +111,8 @@ fn bridge_speaks_the_protocol_over_stdio() {
     let mut recv = || read_frame::<DaemonMsg>(&mut stdout).unwrap().unwrap();
     assert!(matches!(recv(), DaemonMsg::Welcome { proto: PROTO, .. }));
     assert!(matches!(recv(), DaemonMsg::Attached { .. }));
-    assert!(matches!(recv(), DaemonMsg::Synced { seq: 0 }));
+    assert!(matches!(recv(), DaemonMsg::Entry(e) if matches!(e.body, Body::Extensions { .. })));
+    assert!(matches!(recv(), DaemonMsg::Synced { seq: 1 }));
     assert!(matches!(
         recv(),
         DaemonMsg::Entry(e) if matches!(&e.body, Body::Input { text, taken: true, .. } if text == "hi")
@@ -200,7 +201,8 @@ fn a_remote_session_runs_in_the_hosts_directory_and_environment() {
     let header: serde_json::Value = serde_json::from_str(lines.next().unwrap()).unwrap();
     let host = remote.parent().unwrap();
     assert_eq!(header["workspace"], host.to_str().unwrap());
-    let entry: protocol::Entry = serde_json::from_str(lines.next().expect(&text)).unwrap();
+    // After the extensions it runs with.
+    let entry: protocol::Entry = serde_json::from_str(lines.nth(1).expect(&text)).unwrap();
     let Body::Environment(env) = entry.body else {
         panic!("{entry:?}")
     };
@@ -229,7 +231,8 @@ fn a_remote_session_started_in_a_subdirectory_works_in_its_git_root() {
     let mut lines = text.lines();
     let header: serde_json::Value = serde_json::from_str(lines.next().unwrap()).unwrap();
     assert_eq!(header["workspace"], scratch.root.to_str().unwrap());
-    let entry: protocol::Entry = serde_json::from_str(lines.next().expect(&text)).unwrap();
+    // After the extensions it runs with.
+    let entry: protocol::Entry = serde_json::from_str(lines.nth(1).expect(&text)).unwrap();
     let Body::Environment(env) = entry.body else {
         panic!("{entry:?}")
     };
