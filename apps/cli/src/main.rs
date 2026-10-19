@@ -1,15 +1,13 @@
 use std::io::{self, BufRead, IsTerminal, Write};
 use std::process::ExitCode;
-use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, Mutex, PoisonError};
+use std::sync::mpsc;
 use std::thread;
 
-use client::Endpoint;
+use client::{Attach, Driver, Effect, End, Endpoint, Env, Event, Link, SessionClient};
 use protocol::view::{
-    Approval, Change, Item, Link, Part, SessionView, Status, Usage, call_title, decision_line,
-    output_text, recap_line,
+    Approval, Change, Item, Part, Status, Usage, call_title, decision_line, output_text, recap_line,
 };
-use protocol::{Card, ClientMsg, DaemonMsg, Outcome, SessionId, Target};
+use protocol::{Card, ClientMsg, DaemonMsg, Outcome, SessionSummary, Target};
 use sys::{Home, Staged};
 use usage_rs::{Cli, Subcommands};
 
@@ -84,7 +82,7 @@ fn main() -> ExitCode {
         None => session(ctx, Target::New),
         Some(Cmd::Resume { id: None, any }) => session(ctx, Target::Latest { any_workspace: any }),
         Some(Cmd::Resume { id: Some(id), .. } | Cmd::Attach { id }) => {
-            target(&ctx, id).and_then(|target| session(ctx, target))
+            client::target(&ctx.endpoint, &ctx.staged, &id).and_then(|target| session(ctx, target))
         }
         Some(Cmd::Ls) => ls(&ctx),
         Some(Cmd::New) => new(&ctx),
@@ -141,9 +139,9 @@ impl Ctx {
         }
     }
 
-    /// Connects to the daemon. A wedged local daemon is diagnosed; at a
-    /// terminal the user can restart it on the spot, elsewhere `a daemon
-    /// restart` is suggested.
+    /// Connects to the daemon. A wedged local daemon is diagnosed, and
+    /// `a daemon restart` suggested; a session at a terminal offers the
+    /// restart itself.
     fn connect(&self) -> io::Result<client::Connection> {
         self.connect_with(&|_| Ok(Vec::new()))
     }
@@ -154,59 +152,19 @@ impl Ctx {
         first: &dyn Fn(&client::Connection) -> io::Result<Vec<ClientMsg>>,
     ) -> io::Result<client::Connection> {
         let on_drain = || eprintln!("[waiting for the previous daemon to finish its work]");
-        match client::connect_with(&self.endpoint, &self.staged, &on_drain, first) {
-            Err(e)
-                if e.kind() == io::ErrorKind::TimedOut
-                    && matches!(self.endpoint, Endpoint::Local(_)) =>
-            {
-                let mut conn = recover(&self.home, &self.staged)?;
-                conn.send_all(&first(&conn)?)?;
-                Ok(conn)
-            }
-            result => result,
-        }
+        client::connect_with(&self.endpoint, &self.staged, &on_drain, first).map_err(
+            |e| match &self.endpoint {
+                Endpoint::Local(home) if e.kind() == io::ErrorKind::TimedOut => {
+                    report(&client::diagnose(home));
+                    io::Error::new(e.kind(), RESTART)
+                }
+                _ => e,
+            },
+        )
     }
 }
 
-fn recover(home: &Home, staged: &Staged) -> io::Result<client::Connection> {
-    let d = client::diagnose(home);
-    eprintln!(
-        "! {} is not responding after {}s",
-        d.who(),
-        client::HELLO_TIMEOUT.as_secs()
-    );
-    eprintln!("  log: {}", d.log.display());
-    if let Some(note) = d.crash_note() {
-        eprintln!("  {note}");
-    }
-    if !io::stdin().is_terminal() {
-        return Err(io::Error::new(
-            io::ErrorKind::TimedOut,
-            "run `a daemon restart` to replace it",
-        ));
-    }
-    loop {
-        eprint!("  [r] restart daemon  [l] show log  [q] quit: ");
-        io::stderr().flush()?;
-        let mut answer = String::new();
-        io::stdin().read_line(&mut answer)?;
-        match answer.trim() {
-            "r" => return client::restart(home, staged),
-            "l" => {
-                for line in d.log_tail() {
-                    eprintln!("  | {line}");
-                }
-            }
-            "q" | "" => {
-                return Err(io::Error::new(
-                    io::ErrorKind::TimedOut,
-                    "daemon not responding",
-                ));
-            }
-            _ => {}
-        }
-    }
-}
+const RESTART: &str = "run `a daemon restart` to replace it";
 
 fn daemon_cmd(ctx: &Ctx, action: &DaemonCmd) -> io::Result<()> {
     let home = ctx.local()?;
@@ -252,121 +210,177 @@ fn session(ctx: Ctx, target: Target) -> io::Result<()> {
             };
             tui::run(&daemon, target, viewport)
         }
-        None => repl(ctx, target),
+        None => repl(&ctx, target),
     }
 }
 
-/// Connects and asks to attach to `target` from this directory's workspace
-/// (or a remote daemon's), with this shell's environment (or the remote
-/// bridge's), replaying entries after `since`.
-fn attach(ctx: &Ctx, target: Target, since: u64) -> io::Result<client::Connection> {
-    ctx.connect_with(&move |conn| Ok(vec![conn.attach(target.clone(), since, true)?]))
+/// Connects and makes `attach` right behind the hello.
+fn attach(ctx: &Ctx, attach: Attach) -> io::Result<client::Connection> {
+    ctx.connect_with(&move |conn| Ok(vec![conn.attach(&attach)?]))
 }
 
-/// The line-mode client. When the daemon drains for an upgrade, it
-/// reconnects (starting the new build) and replays what it missed.
-fn repl(ctx: Ctx, target: Target) -> io::Result<()> {
-    let client::Connection {
-        mut reader,
-        writer,
-        remote,
-        ..
-    } = attach(&ctx, target, 0)?;
-    let remote = remote.is_some();
-    let writer = Arc::new(Mutex::new(writer));
-    let swap = Arc::clone(&writer);
-    // Set before the detach goes out: the daemon closing the connection
-    // then is the answer, not a lost daemon.
-    let detaching = Arc::new(AtomicBool::new(false));
-    let detached = Arc::clone(&detaching);
-    // Shared with the input loop, which answers the first call asked.
-    let view = Arc::new(Mutex::new(SessionView::default()));
-    let folding = Arc::clone(&view);
-    thread::spawn(move || {
-        let mut screen = Screen::default();
-        let lock = || folding.lock().unwrap_or_else(PoisonError::into_inner);
-        loop {
-            while let Ok(Some(msg)) = reader.recv() {
-                let mut view = lock();
-                // Nothing to attach to: no such session.
-                if let (None, DaemonMsg::Error { message }) = (view.session, &msg) {
-                    eprintln!("a: {message}");
-                    std::process::exit(1);
-                }
-                if let Some(update) = view.fold(&msg) {
-                    screen.show(&update.change);
-                }
-            }
-            let (session, since) = {
-                let view = lock();
-                (
-                    view.session.filter(|_| view.link == Link::Draining),
-                    view.seq,
-                )
-            };
-            if detached.load(Ordering::SeqCst) {
-                return;
-            }
-            let Some(session) = session else {
-                eprintln!("[daemon disconnected]");
-                std::process::exit(1);
-            };
-            eprintln!("[daemon upgraded; reconnecting]");
-            let mut writer = swap.lock().unwrap_or_else(PoisonError::into_inner);
-            match attach(&ctx, Target::Id(session), since) {
-                Ok(conn) => (reader, *writer) = (conn.reader, conn.writer),
-                Err(e) => {
-                    eprintln!("[reconnect failed: {e}]");
-                    std::process::exit(1);
-                }
-            }
-        }
+/// What wakes the line client.
+enum Input {
+    /// A line typed; `None` once stdin closed.
+    Line(Option<String>),
+    Client(Event),
+}
+
+/// The line-mode client: the shared session client, its updates printed
+/// as lines and its intents typed. When the daemon drains for an upgrade,
+/// it reconnects (starting the new build) and replays what it missed.
+fn repl(ctx: &Ctx, target: Target) -> io::Result<()> {
+    let (tx, rx) = mpsc::channel();
+    let events = tx.clone();
+    let driver = Driver::new(ctx.endpoint.clone(), ctx.staged.clone(), move |_, event| {
+        let _ = events.send(Input::Client(event));
     });
-
-    let send = |msg: &ClientMsg| {
-        writer
-            .lock()
-            .unwrap_or_else(PoisonError::into_inner)
-            .send(msg)
+    let mut client = SessionClient::new(Env::Origin);
+    let mut repl = Repl {
+        screen: Screen::default(),
+        input: Some(tx),
+        live: false,
     };
-    for line in io::stdin().lock().lines() {
-        let line = line?;
-        let asked = view
-            .lock()
-            .unwrap_or_else(PoisonError::into_inner)
-            .asked()
-            .next();
-        let msg = match (line.trim(), asked) {
-            ("", _) => continue,
-            ("/detach", _) => break,
-            ("/interrupt", _) => ClientMsg::INTERRUPT,
-            // A remote host's environment is the one its bridge started
-            // with; reattaching captures it again.
-            ("/env refresh", _) if remote => {
-                eprintln!(
-                    "[the host's environment is captured when `a` connects; reattach to refresh it]"
-                );
-                continue;
+    let mut effects = client.open(target);
+    loop {
+        for effect in effects {
+            if let Some(effect) = driver.apply(effect)
+                && let Some(exit) = repl.show(&client, effect)
+            {
+                return exit;
             }
-            ("/env refresh", _) => match client::capture() {
-                Ok(env) => ClientMsg::Environment(env),
-                Err(e) => {
-                    eprintln!("[not refreshed: {e}]");
-                    continue;
-                }
-            },
-            ("y" | "yes", Some(call)) => ClientMsg::approve(call, true),
-            ("n" | "no", Some(call)) => ClientMsg::approve(call, false),
-            (text, _) => ClientMsg::input(text),
-        };
-        if let Err(e) = send(&msg) {
-            eprintln!("[not sent: {e}]");
         }
+        let Ok(input) = rx.recv() else {
+            return Ok(());
+        };
+        effects = match input {
+            Input::Client(event) => client.step(event),
+            Input::Line(None) => client.detach(),
+            Input::Line(Some(line)) => match client.link() {
+                Link::Wedged(d) => match line.trim() {
+                    "r" => client.restart(),
+                    "l" => {
+                        for line in d.log_tail() {
+                            eprintln!("  | {line}");
+                        }
+                        prompt();
+                        Vec::new()
+                    }
+                    _ => return Err(io::Error::new(io::ErrorKind::TimedOut, NOT_RESPONDING)),
+                },
+                _ => match client::parse(&line, client.turn().asking) {
+                    None => Vec::new(),
+                    Some(client::Cmd::Help) => {
+                        for (usage, help) in client::help(client.commands()) {
+                            println!("  {usage:<16} {help}");
+                        }
+                        Vec::new()
+                    }
+                    Some(cmd) => client.run(cmd),
+                },
+            },
+        };
     }
-    detaching.store(true, Ordering::SeqCst);
-    send(&ClientMsg::Detach)?;
-    println!("[detached; the session keeps running. `a resume` to reattach]");
-    Ok(())
+}
+
+const NOT_RESPONDING: &str = "daemon not responding";
+
+struct Repl {
+    screen: Screen,
+    /// Taken by the thread reading stdin, once attached.
+    input: Option<mpsc::Sender<Input>>,
+    /// Attached once at least.
+    live: bool,
+}
+
+impl Repl {
+    /// Shows what the client's `effect` tells; `Some` ends the client.
+    fn show(&mut self, client: &SessionClient, effect: Effect) -> Option<io::Result<()>> {
+        match effect {
+            Effect::View(update) => {
+                // Nothing to attach to: no such session.
+                if let (None, Change::Error { message }) = (client.view().session, &update.change) {
+                    return Some(Err(io::Error::other(message.clone())));
+                }
+                self.screen.show(&update.change);
+            }
+            Effect::Notice(text) => eprintln!("[{text}]"),
+            Effect::Sessions => {
+                for s in client.sessions() {
+                    println!("  {}", listed(s));
+                }
+            }
+            Effect::Link => return self.link(client.link()),
+            _ => {}
+        }
+        None
+    }
+
+    fn link(&mut self, link: &Link) -> Option<io::Result<()>> {
+        match link {
+            Link::Live { .. } => {
+                self.live = true;
+                self.read_stdin();
+            }
+            Link::Draining if !self.live => {
+                eprintln!("[waiting for the previous daemon to finish its work]");
+            }
+            Link::Reconnecting { .. } => eprintln!("[daemon upgraded; reconnecting]"),
+            Link::Wedged(d) => {
+                report(d);
+                if !io::stdin().is_terminal() {
+                    return Some(Err(io::Error::new(io::ErrorKind::TimedOut, RESTART)));
+                }
+                prompt();
+                self.read_stdin();
+            }
+            Link::Ended(End::Detached) => {
+                println!("[detached; the session keeps running. `a resume` to reattach]");
+                return Some(Ok(()));
+            }
+            Link::Ended(End::Lost(why)) if self.live => {
+                return Some(Err(io::Error::other(format!("daemon disconnected: {why}"))));
+            }
+            Link::Ended(End::Lost(why)) => return Some(Err(io::Error::other(why.clone()))),
+            Link::Connecting | Link::Draining => {}
+        }
+        None
+    }
+
+    /// Reads typed lines from here on, which a first attach is waited for:
+    /// piped input then goes to the session it attached.
+    fn read_stdin(&mut self) {
+        let Some(tx) = self.input.take() else {
+            return;
+        };
+        thread::spawn(move || {
+            for line in io::stdin().lock().lines() {
+                let Ok(line) = line else { break };
+                if tx.send(Input::Line(Some(line))).is_err() {
+                    return;
+                }
+            }
+            let _ = tx.send(Input::Line(None));
+        });
+    }
+}
+
+fn prompt() {
+    eprint!("  [r] restart daemon  [l] show log  [q] quit: ");
+    let _ = io::stderr().flush();
+}
+
+/// What a client can tell of a daemon that does not answer.
+fn report(d: &client::Diagnosis) {
+    eprintln!(
+        "! {} is not responding after {}s",
+        d.who(),
+        client::HELLO_TIMEOUT.as_secs()
+    );
+    eprintln!("  log: {}", d.log.display());
+    if let Some(note) = d.crash_note() {
+        eprintln!("  {note}");
+    }
 }
 
 /// Prints the shared view's updates as transcript lines. A model reply
@@ -530,48 +544,25 @@ fn print_outcome(outcome: &Outcome, card: Option<&Card>) {
 
 fn ls(ctx: &Ctx) -> io::Result<()> {
     for s in ctx.connect()?.sessions()? {
-        println!(
-            "{}  {:<9}  {:<10}  {:>4} entries  {}",
-            s.id.short(),
-            s.activity.name(),
-            s.residency.name(),
-            s.entries,
-            s.workspace.display()
-        );
+        println!("{}", listed(&s));
     }
     Ok(())
 }
 
-/// The session `id` names, in full or as a prefix: this machine's daemon
-/// resolves it as it attaches; another machine's, which may be older, is
-/// asked for its list first.
-fn target(ctx: &Ctx, id: String) -> io::Result<Target> {
-    match ctx.endpoint {
-        Endpoint::Local(_) => Ok(Target::Prefix(id)),
-        Endpoint::Ssh(_) => find(ctx, &id).map(Target::Id),
-    }
-}
-
-fn find(ctx: &Ctx, prefix: &str) -> io::Result<SessionId> {
-    let matches: Vec<_> = ctx
-        .connect()?
-        .sessions()?
-        .into_iter()
-        .filter(|s| {
-            s.id.short().to_string().starts_with(prefix) || s.id.to_string().starts_with(prefix)
-        })
-        .collect();
-    match matches.as_slice() {
-        [one] => Ok(one.id),
-        [] => Err(io::Error::other(format!("no session matches {prefix}"))),
-        _ => Err(io::Error::other(format!(
-            "{prefix} matches several sessions"
-        ))),
-    }
+/// A session as `a ls` lists it.
+fn listed(s: &SessionSummary) -> String {
+    format!(
+        "{}  {:<9}  {:<10}  {:>4} entries  {}",
+        s.id.short(),
+        s.activity.name(),
+        s.residency.name(),
+        s.entries,
+        s.workspace.display()
+    )
 }
 
 fn new(ctx: &Ctx) -> io::Result<()> {
-    let mut conn = attach(ctx, Target::New, 0)?;
+    let mut conn = attach(ctx, Attach::new(Target::New, Env::Origin))?;
     let session = conn.reader.until(|msg| match msg {
         DaemonMsg::Attached { session, .. } => Some(session),
         _ => None,

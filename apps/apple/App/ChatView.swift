@@ -3,7 +3,10 @@ import SwiftUI
 
 struct ChatView: View {
     @Bindable var store: SessionStore
+    /// What a typed line asks of the app, rather than of the session.
+    var perform: (AppAction) -> Void = { _ in }
     @State private var input = ""
+    @State private var showsHelp = false
 
     var body: some View {
         VStack(spacing: 0) {
@@ -33,13 +36,13 @@ struct ChatView: View {
                 TextField("Message, or $ command", text: $input)
                     .textFieldStyle(.plain)
                     .onSubmit(send)
-                if store.running {
+                if store.turn.canInterrupt {
                     Button("Stop", systemImage: "stop.circle") { Task { await store.interrupt() } }
                         .keyboardShortcut(".", modifiers: .command)
                 }
                 Button("Send", action: send)
                     .keyboardShortcut(.return, modifiers: .command)
-                    .disabled(input.trimmingCharacters(in: .whitespaces).isEmpty || store.link == .closed)
+                    .disabled(input.trimmingCharacters(in: .whitespaces).isEmpty || !store.turn.canSend)
             }
             .padding(10)
         }
@@ -47,6 +50,21 @@ struct ChatView: View {
         .navigationSubtitle(store.workspace)
         .toolbar {
             LinkBadge(link: store.link)
+            if case .notResponding = store.link {
+                Button("Restart Daemon", systemImage: "arrow.clockwise") { Task { await store.restart() } }
+            }
+        }
+        .popover(isPresented: $showsHelp) {
+            VStack(alignment: .leading, spacing: 4) {
+                ForEach(store.commands, id: \.usage) { command in
+                    HStack {
+                        Text(command.usage).font(.body.monospaced())
+                        Spacer(minLength: 16)
+                        Text(command.help).foregroundStyle(.secondary)
+                    }
+                }
+            }
+            .padding()
         }
     }
 
@@ -54,7 +72,13 @@ struct ChatView: View {
         let text = input.trimmingCharacters(in: .whitespaces)
         guard !text.isEmpty else { return }
         input = ""
-        Task { await store.send(text) }
+        Task {
+            switch await store.submit(text) {
+            case .help?: showsHelp = true
+            case let action?: perform(action)
+            case nil: break
+            }
+        }
     }
 }
 
@@ -78,8 +102,10 @@ struct LinkBadge: View {
             case .connecting: ("connecting", .secondary)
             case .replaying: ("replaying", .orange)
             case .live: ("live", .green)
-            case .draining: ("reconnecting", .orange)
-            case .closed: ("closed", .red)
+            case .draining, .reconnecting: ("reconnecting", .orange)
+            case .notResponding: ("not responding", .red)
+            case .detached: ("detached", .secondary)
+            case .lost: ("closed", .red)
             }
         Label(label, systemImage: "circle.fill")
             .labelStyle(.titleAndIcon)
@@ -121,9 +147,9 @@ struct ItemView: View {
             ReplyView(
                 call: call, model: model, text: text, status: status, usage: usage,
                 streaming: live(call, status))
-        case .tool(let call, _, _, let title, let approval, let outcome, _, let asked):
+        case .tool(let call, _, _, let title, let approval, let outcome, _, let phase):
             ToolView(
-                call: call, title: title, approval: approval, outcome: outcome, asked: asked,
+                call: call, title: title, approval: approval, outcome: outcome, phase: phase,
                 store: store)
         case .command(_, let name, let args, let outcome):
             VStack(alignment: .leading) {
@@ -198,7 +224,7 @@ struct ToolView: View {
     let title: String
     let approval: ApprovalState?
     let outcome: ToolOutcome?
-    let asked: Bool
+    let phase: CallPhase
     let store: SessionStore
 
     var body: some View {
@@ -207,14 +233,15 @@ struct ToolView: View {
                 Image(systemName: "terminal")
                 Text(title).font(.body.monospaced())
                 Spacer()
-                switch approval {
-                case .approved?: Text("approved").font(.caption).foregroundStyle(.green)
-                case .denied?: Text("denied").font(.caption).foregroundStyle(.red)
-                case .pending?: Text("waiting for approval").font(.caption).foregroundStyle(.orange)
-                case nil: EmptyView()
+                switch (phase, approval) {
+                case (.asking, _), (.waiting, _):
+                    Text("waiting for approval").font(.caption).foregroundStyle(.orange)
+                case (.denied, _), (_, .denied?): Text("denied").font(.caption).foregroundStyle(.red)
+                case (_, .approved?): Text("approved").font(.caption).foregroundStyle(.green)
+                default: EmptyView()
                 }
             }
-            if approval == .pending, asked {
+            if phase == .asking {
                 HStack {
                     Button("Approve") { Task { await store.approve(call: call, approved: true) } }
                         .buttonStyle(.borderedProminent)
@@ -225,7 +252,7 @@ struct ToolView: View {
             }
             if let outcome {
                 OutcomeView(outcome: outcome)
-            } else if approval != .pending {
+            } else if phase == .running {
                 ProgressView().controlSize(.small)
             }
         }

@@ -148,8 +148,12 @@ mod other {
         None
     }
 
-    pub fn await_exit(_pid: u32) -> io::Result<()> {
+    pub fn exit_watch(_pid: u32) -> io::Result<std::convert::Infallible> {
         Err(io::ErrorKind::Unsupported.into())
+    }
+
+    pub fn group_members(_pgid: u32) -> Vec<u32> {
+        Vec::new()
     }
 
     pub fn kill_process_group(_pgid: u32) -> io::Result<()> {
@@ -183,7 +187,7 @@ mod other {
 mod unix {
     use std::fs;
     use std::io;
-    use std::os::fd::{AsFd, FromRawFd, RawFd};
+    use std::os::fd::{AsFd, FromRawFd, OwnedFd, RawFd};
     use std::os::unix::fs::{DirBuilderExt, MetadataExt};
     use std::os::unix::net::UnixListener;
     use std::path::PathBuf;
@@ -330,17 +334,102 @@ mod unix {
         None
     }
 
-    /// Blocks until child `pid` has exited, leaving it to be reaped: its
-    /// `Child` still collects the status.
-    pub fn await_exit(pid: u32) -> io::Result<()> {
+    /// A descriptor that turns readable once process `pid` has exited
+    /// (reaped or not): a pidfd. `NotFound` when it is already gone.
+    #[cfg(target_os = "linux")]
+    pub fn exit_watch(pid: u32) -> io::Result<OwnedFd> {
         let pid = self::pid(pid)?;
-        let options = process::WaitIdOptions::EXITED | process::WaitIdOptions::NOWAIT;
-        loop {
-            match process::waitid(process::WaitId::Pid(pid), options) {
-                Err(rustix::io::Errno::INTR) => {}
-                result => return result.map(drop).map_err(io::Error::from),
-            }
+        process::pidfd_open(pid, process::PidfdFlags::empty()).map_err(gone)
+    }
+
+    /// A descriptor that turns readable once process `pid` has exited
+    /// (reaped or not): a kqueue of its own watching it, as a pidfd does on
+    /// Linux. `NotFound` when it is already gone, or a zombie.
+    #[cfg(not(target_os = "linux"))]
+    pub fn exit_watch(pid: u32) -> io::Result<OwnedFd> {
+        use rustix::event::kqueue::{
+            Event, EventFilter, EventFlags, ProcessEvents, kevent, kqueue,
+        };
+        let pid = self::pid(pid)?;
+        let queue = kqueue()?;
+        let watch = [Event::new(
+            EventFilter::Proc {
+                pid,
+                flags: ProcessEvents::EXIT,
+            },
+            EventFlags::ADD | EventFlags::ONESHOT,
+            std::ptr::null_mut(),
+        )];
+        // SAFETY: the change names a process, not a descriptor, so no
+        // event it yields can refer to a closed one.
+        unsafe {
+            kevent(
+                &queue,
+                &watch,
+                &mut [] as &mut [Event],
+                Some(std::time::Duration::ZERO),
+            )
         }
+        .map_err(gone)?;
+        Ok(queue)
+    }
+
+    fn gone(errno: rustix::io::Errno) -> io::Error {
+        if errno == rustix::io::Errno::SRCH {
+            io::ErrorKind::NotFound.into()
+        } else {
+            errno.into()
+        }
+    }
+
+    /// The live processes of group `pgid`, zombies left out.
+    #[cfg(target_os = "linux")]
+    pub fn group_members(pgid: u32) -> Vec<u32> {
+        let Ok(dir) = fs::read_dir("/proc") else {
+            return Vec::new();
+        };
+        let member = |pid: &u32| {
+            let stat = fs::read_to_string(format!("/proc/{pid}/stat")).ok()?;
+            // After the command name, in parentheses: state, ppid, pgrp.
+            let (_, rest) = stat.rsplit_once(')')?;
+            let mut fields = rest.split_whitespace();
+            let state = fields.next()?;
+            Some(state != "Z" && fields.nth(1)?.parse() == Ok(pgid))
+        };
+        dir.filter_map(|entry| entry.ok()?.file_name().to_str()?.parse().ok())
+            .filter(|pid| member(pid) == Some(true))
+            .collect()
+    }
+
+    /// The processes of group `pgid`, zombies included.
+    #[cfg(target_vendor = "apple")]
+    pub fn group_members(pgid: u32) -> Vec<u32> {
+        let Ok(pgid) = i32::try_from(pgid) else {
+            return Vec::new();
+        };
+        let mut pids: Vec<libc::pid_t> = vec![0; 64];
+        loop {
+            let Ok(size) = i32::try_from(size_of_val(pids.as_slice())) else {
+                return Vec::new();
+            };
+            // SAFETY: `pids` is a writable buffer of `size` bytes; the call
+            // fills at most that and returns how many pids it wrote (or -1).
+            let written = unsafe { libc::proc_listpgrppids(pgid, pids.as_mut_ptr().cast(), size) };
+            let Ok(count) = usize::try_from(written) else {
+                return Vec::new();
+            };
+            // A full buffer may have cut the list short.
+            if count < pids.len() {
+                pids.truncate(count);
+                return pids.into_iter().filter_map(|p| p.try_into().ok()).collect();
+            }
+            pids.resize(pids.len() * 2, 0);
+        }
+    }
+
+    #[cfg(not(any(target_os = "linux", target_vendor = "apple")))]
+    pub fn group_members(_pgid: u32) -> Vec<u32> {
+        Vec::new()
     }
 
     /// Sends SIGKILL to a whole process group.
@@ -508,6 +597,33 @@ pub fn sync_data(file: &File) -> io::Result<()> {
     file.sync_data()
 }
 
+/// Fills `buf` from `file` at `offset`, as one positioned read where the
+/// platform has it, without the cursor other readers share. On Windows the
+/// cursor moves, which appends ignore.
+pub fn read_exact_at(file: &File, buf: &mut [u8], offset: u64) -> io::Result<()> {
+    #[cfg(unix)]
+    {
+        std::os::unix::fs::FileExt::read_exact_at(file, buf, offset)
+    }
+    #[cfg(windows)]
+    {
+        use std::os::windows::fs::FileExt;
+        let (mut buf, mut offset) = (buf, offset);
+        while !buf.is_empty() {
+            match file.seek_read(buf, offset) {
+                Ok(0) => return Err(io::ErrorKind::UnexpectedEof.into()),
+                Ok(n) => {
+                    buf = &mut buf[n..];
+                    offset += n as u64;
+                }
+                Err(e) if e.kind() == io::ErrorKind::Interrupted => {}
+                Err(e) => return Err(e),
+            }
+        }
+        Ok(())
+    }
+}
+
 #[cfg(all(test, unix))]
 mod tests {
     use super::*;
@@ -527,14 +643,51 @@ mod tests {
     }
 
     #[test]
-    fn an_exit_is_awaited_and_left_for_the_child_to_reap() {
-        let mut child = std::process::Command::new("sh")
-            .args(["-c", "exit 3"])
-            .spawn()
-            .unwrap();
-        await_exit(child.id()).unwrap();
-        await_exit(child.id()).unwrap();
-        assert_eq!(child.try_wait().unwrap().and_then(|s| s.code()), Some(3));
+    fn an_exit_watch_turns_readable_when_its_process_exits() {
+        use rustix::event::{PollFd, PollFlags, Timespec, poll};
+        let readable = |fd: &std::os::fd::OwnedFd, ms: i64| {
+            let mut fds = [PollFd::new(fd, PollFlags::IN)];
+            let timeout = Timespec {
+                tv_sec: 0,
+                tv_nsec: ms * 1_000_000,
+            };
+            poll(&mut fds, Some(&timeout)).unwrap() == 1
+        };
+        let mut cmd = std::process::Command::new("sh");
+        cmd.args(["-c", "sleep 30 & read _"])
+            .stdin(std::process::Stdio::piped());
+        new_session(&mut cmd);
+        let mut child = cmd.spawn().unwrap();
+        let watch = exit_watch(child.id()).unwrap();
+        assert!(!readable(&watch, 50));
+        // The shell and its background sleep.
+        let pgid = child.id();
+        let mut members = Vec::new();
+        for _ in 0..100 {
+            members = group_members(pgid);
+            if members.len() == 2 {
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        assert_eq!(members.len(), 2, "{members:?}");
+        assert!(members.contains(&pgid));
+        drop(child.stdin.take());
+        assert!(readable(&watch, 5000));
+        child.wait().unwrap();
+        assert_eq!(
+            exit_watch(pgid).unwrap_err().kind(),
+            io::ErrorKind::NotFound
+        );
+        assert!(group_alive(pgid));
+        kill_process_group(pgid).unwrap();
+        for _ in 0..100 {
+            if group_members(pgid).is_empty() {
+                return;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        panic!("the group outlived its kill");
     }
 
     #[test]

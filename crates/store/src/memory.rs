@@ -1,12 +1,14 @@
 use std::collections::{HashMap, HashSet};
 use std::io;
+use std::ops::RangeInclusive;
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 
-use protocol::{Entry, SessionId};
+use protocol::{Decode, Entry, SessionId};
 
-use crate::{Header, Lease, LeaseAuthority, Loaded, Local, Log, LogStore, floor, not_found};
+use crate::{Header, Lease, LeaseAuthority, Lines, Loaded, Local, Log, LogStore, not_found, span};
 
-/// Sessions held in this process, for tests: durable until it exits.
+/// Sessions held in this process, for tests: durable until it exits. Each
+/// keeps its entries as the lines a file would, so it is read back as one.
 #[derive(Default)]
 pub struct Memory {
     sessions: Mutex<HashMap<SessionId, Stored>>,
@@ -16,14 +18,29 @@ pub struct Memory {
 
 struct Stored {
     header: Header,
-    entries: Arc<Mutex<Vec<Entry>>>,
+    lines: Arc<Shared>,
 }
 
+/// One session's lines, newline excluded.
+#[derive(Default)]
+struct Shared(Mutex<Vec<Box<[u8]>>>);
+
 impl Memory {
-    fn shared(&self, id: SessionId) -> io::Result<Arc<Mutex<Vec<Entry>>>> {
+    fn shared(&self, id: SessionId) -> io::Result<Arc<Shared>> {
         let sessions = lock(&self.sessions);
         let stored = sessions.get(&id).ok_or_else(|| not_found(id))?;
-        Ok(Arc::clone(&stored.entries))
+        Ok(Arc::clone(&stored.lines))
+    }
+
+    fn loaded(&self, id: SessionId, lines: Arc<Shared>, floor: u32) -> Loaded {
+        let lease = self.leases.acquire(id, floor);
+        let seq = lock(&lines.0).len() as u64;
+        Loaded {
+            seq,
+            epoch: lease.epoch,
+            log: Box::new(MemoryLog(Arc::clone(&lines), lease)),
+            lines,
+        }
     }
 }
 
@@ -34,17 +51,13 @@ impl LogStore for Memory {
             let taken = format!("session {} exists", header.id);
             return Err(io::Error::new(io::ErrorKind::AlreadyExists, taken));
         }
-        let entries = Arc::default();
-        let lease = self.leases.acquire(header.id, 0);
-        let epoch = lease.epoch;
-        let log = Box::new(MemoryLog(Arc::clone(&entries), lease));
-        let header = header.clone();
-        sessions.insert(header.id, Stored { header, entries });
-        Ok(Loaded {
-            entries: Vec::new(),
-            log,
-            epoch,
-        })
+        let lines = Arc::<Shared>::default();
+        let stored = Stored {
+            header: header.clone(),
+            lines: Arc::clone(&lines),
+        };
+        sessions.insert(header.id, stored);
+        Ok(self.loaded(header.id, lines, 0))
     }
 
     fn headers(&self) -> io::Result<Vec<Header>> {
@@ -56,24 +69,22 @@ impl LogStore for Memory {
         Ok(headers)
     }
 
-    fn load(&self, id: SessionId) -> io::Result<Loaded> {
-        let shared = self.shared(id)?;
-        let entries = lock(&shared).clone();
-        let lease = self.leases.acquire(id, floor(&entries));
-        Ok(Loaded {
-            entries,
-            epoch: lease.epoch,
-            log: Box::new(MemoryLog(shared, lease)),
-        })
+    fn load(&self, id: SessionId, each: &mut dyn FnMut(Entry)) -> io::Result<Loaded> {
+        let lines = self.shared(id)?;
+        let mut floor = 0;
+        for entry in lines.entries()? {
+            floor = entry.epoch;
+            each(entry);
+        }
+        Ok(self.loaded(id, lines, floor))
     }
 
     fn entries(&self, id: SessionId) -> io::Result<Vec<Entry>> {
-        Ok(lock(&*self.shared(id)?).clone())
+        self.shared(id)?.entries()
     }
 
     fn count(&self, id: SessionId) -> io::Result<u64> {
-        let entries = self.shared(id)?;
-        Ok(lock(&entries).len() as u64)
+        Ok(lock(&self.shared(id)?.0).len() as u64)
     }
 
     fn mark_busy(&self, id: SessionId, busy: bool) -> io::Result<()> {
@@ -91,12 +102,48 @@ impl LogStore for Memory {
     }
 }
 
-struct MemoryLog(Arc<Mutex<Vec<Entry>>>, Lease);
+impl Shared {
+    /// The entries, decoded from a copy of the lines taken at once.
+    fn entries(&self) -> io::Result<Vec<Entry>> {
+        let lines = lock(&self.0).clone();
+        lines
+            .iter()
+            .map(|line| Entry::from_json(line).map_err(io::Error::from))
+            .collect()
+    }
+}
+
+impl Lines for Shared {
+    fn read(&self, seqs: RangeInclusive<u64>, limit: usize, out: &mut Vec<u8>) -> io::Result<u64> {
+        let lines = lock(&self.0);
+        let (first, last) = span(&seqs, lines.len())?;
+        let mut count = 0;
+        let mut room = limit;
+        for line in &lines[first..=last] {
+            if count > 0 && line.len() + 1 > room {
+                break;
+            }
+            room = room.saturating_sub(line.len() + 1);
+            out.extend_from_slice(line);
+            out.push(b'\n');
+            count += 1;
+        }
+        Ok(count)
+    }
+}
+
+struct MemoryLog(Arc<Shared>, Lease);
 
 impl Log for MemoryLog {
     fn append_all(&mut self, entries: &[Entry]) -> io::Result<()> {
         self.1.admit(entries)?;
-        lock(&self.0).extend_from_slice(entries);
+        let mut encoded = Vec::with_capacity(entries.len());
+        for entry in entries {
+            let mut line = Vec::new();
+            entry.encode(&mut line)?;
+            encoded.push(line.into_boxed_slice());
+        }
+        lock(&self.0.0).extend(encoded);
         Ok(())
     }
 }

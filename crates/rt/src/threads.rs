@@ -1,7 +1,6 @@
 //! The built-in runtime: a few async workers, a pool of blocking threads
-//! that grows on demand and shrinks when idle, and futures-timer's timer
-//! thread, which forgets a sleep once it is dropped. Threads start on first
-//! use, so an idle process pays for none.
+//! that grows on demand and shrinks when idle, and the reactor's timers.
+//! Threads start on first use, so an idle process pays for none.
 
 use std::collections::VecDeque;
 use std::panic::{self, AssertUnwindSafe};
@@ -126,7 +125,7 @@ impl Runtime for Threads {
     }
 
     fn sleep(&self, duration: Duration) -> BoxFuture<'static, ()> {
-        Box::pin(futures_timer::Delay::new(duration))
+        Box::pin(crate::Timer::after(duration))
     }
 }
 

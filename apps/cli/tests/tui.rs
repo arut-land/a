@@ -99,3 +99,30 @@ fn sigterm_gives_the_terminal_back_before_it_ends_the_client() {
     let out = String::from_utf8_lossy(&term.bytes()).into_owned();
     assert!(out.contains("\x1b[?1049l"), "left the alternate screen");
 }
+
+/// A daemon upgrade under the terminal client: it reattaches to the new
+/// daemon, sends what was typed meanwhile, and never reads the drain as a
+/// lost daemon.
+#[test]
+fn the_full_screen_client_rides_out_a_daemon_upgrade() {
+    let env = Env::new("tui-drain");
+    let old = env.older_build();
+    let mut term = Env::tty_of(env.cmd_as(&old, &[]), 100, 30);
+    term.wait_for("● live");
+    term.send(b"before\r");
+    term.wait_for("  before");
+    let first = env.pid().unwrap();
+
+    // The newer build drains the older one's daemon and starts its own.
+    env.run(&["ls"]);
+    assert_ne!(env.pid().unwrap(), first);
+    term.send(b"after the upgrade\r");
+    let screen = term.wait_for("  after the upgrade");
+    assert!(!screen.text().contains("disconnected"), "{}", screen.text());
+    assert_eq!(screen.text().matches("› after the upgrade").count(), 1);
+
+    term.send(b"\x03");
+    assert!(term.wait().success());
+    let out = String::from_utf8_lossy(&term.bytes()).into_owned();
+    assert!(out.contains("[detached; the session keeps running"));
+}

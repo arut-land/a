@@ -60,6 +60,7 @@ func expectInStep(_ store: SessionStore, _ reducer: Reducer, _ name: String) {
     #expect(store.recap == snapshot.recap, "\(name)")
     #expect((store.rev, store.seq) == (snapshot.rev, snapshot.seq), "\(name)")
     #expect(store.sessionId == snapshot.session, "\(name)")
+    #expect(store.turn == snapshot.turn, "\(name)")
 }
 
 @Test func aStoreAppliesTheUpdatesToTheSameView() throws {
@@ -113,7 +114,8 @@ func expectInStep(_ store: SessionStore, _ reducer: Reducer, _ name: String) {
         if let update = try reducer.fold(message: message) { store.apply(update) }
     }
     #expect(store.items.count == 1)
-    #expect(store.running)
+    #expect(store.turn.running && store.turn.canInterrupt)
+    #expect(store.turn == reducer.turn())
 }
 
 @Test func errorsCarryStableCodes() {

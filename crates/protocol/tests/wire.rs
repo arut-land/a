@@ -255,6 +255,7 @@ fn daemon_samples() -> Vec<Sample<DaemonMsg>> {
                 build: "0.0.0+0123456789abcdef".into(),
                 caps: Caps::NONE,
                 client: 0,
+                commands: Vec::new(),
             },
         ),
         sample(
@@ -264,6 +265,7 @@ fn daemon_samples() -> Vec<Sample<DaemonMsg>> {
                 build: "0.0.0+0123456789abcdef".into(),
                 caps: first_caps(),
                 client: 1,
+                commands: Vec::new(),
             },
         ),
         sample(
@@ -273,6 +275,7 @@ fn daemon_samples() -> Vec<Sample<DaemonMsg>> {
                 build: "0.0.0+0123456789abcdef".into(),
                 caps: steer_caps(),
                 client: 1,
+                commands: Vec::new(),
             },
         ),
         sample(
@@ -733,11 +736,10 @@ fn an_entry_frame_is_its_log_line_tagged() {
         };
         let frame = protocol::Frame::entry(entry).unwrap();
         let mut line = Vec::new();
-        frame.line_into(&mut line);
-        let mut encoded = Vec::new();
-        entry.encode(&mut encoded).unwrap();
-        encoded.push(b'\n');
-        assert_eq!(line, encoded, "{}", sample.name);
+        entry.encode(&mut line).unwrap();
+        let read = protocol::Frame::from_line(entry.seq, &line).unwrap();
+        assert_eq!(read.as_bytes(), frame.as_bytes(), "{}", sample.name);
+        assert_eq!((read.seq, read.class), (frame.seq, frame.class));
         assert_eq!(&Entry::from_json(&frame.as_bytes()[4..]).unwrap(), entry);
     }
 }

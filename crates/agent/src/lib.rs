@@ -13,6 +13,7 @@ use serde_json::{Value, json};
 pub mod builtin;
 mod ext;
 mod hooks;
+pub mod job;
 mod state;
 #[cfg(test)]
 mod testing;

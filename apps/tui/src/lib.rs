@@ -78,14 +78,8 @@ enum Event {
     Resized,
     /// stdin closed: the terminal is gone.
     InputClosed,
-    /// Connection `id`'s writer, once it sent its attach; what its hello
-    /// settled; and whether the daemon is a remote host's.
-    Connected(u64, client::Writer, client::Welcome, bool),
-    Daemon(u64, protocol::DaemonMsg),
-    Closed(u64, String),
-    /// Connection `id` could not be opened.
-    Failed(u64, io::Error),
-    Notice(String),
+    /// From the session client's driver.
+    Client(client::Event),
 }
 
 #[cfg(unix)]

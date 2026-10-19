@@ -438,7 +438,7 @@ pub enum Outcome {
     },
 }
 
-#[derive(Clone, Debug, Serialize, Deserialize)]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum Target {
     New,
@@ -815,6 +815,13 @@ impl Role {
     }
 }
 
+/// A slash command the daemon runs: input `/name args`.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CommandInfo {
+    pub name: String,
+    pub description: String,
+}
+
 /// Who caused something: connection `client`'s mutation `client_seq`.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Origin {
@@ -941,6 +948,17 @@ impl ClientMsg {
         }
     }
 
+    /// The number of a numbered mutation.
+    pub const fn client_seq(&self) -> Option<u64> {
+        match self {
+            Self::Input { client_seq, .. }
+            | Self::Steer { client_seq, .. }
+            | Self::Approve { client_seq, .. }
+            | Self::Interrupt { client_seq } => *client_seq,
+            _ => None,
+        }
+    }
+
     /// The idempotency key of a mutation (a message that changes the
     /// session), which the client numbers; `None` for any other message.
     pub const fn client_seq_mut(&mut self) -> Option<&mut Option<u64>> {
@@ -976,6 +994,10 @@ pub enum DaemonMsg {
         caps: Caps,
         #[serde(default, skip_serializing_if = "is_zero")]
         client: u32,
+        /// The slash commands the daemon runs, for help and completion;
+        /// none from a daemon older than them.
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        commands: Vec<CommandInfo>,
     },
     /// The daemon speaks protocols `min..=supported` (just `supported`
     /// without `min`), none of the client's.
@@ -1212,14 +1234,19 @@ impl Frame {
         &self.bytes
     }
 
-    /// An entry's frame as the line a log stores, appended to `out`: the
-    /// entry's JSON without the tag, and a newline.
-    pub fn line_into(&self, out: &mut Vec<u8>) {
-        const TAGGED: usize = 4 + br#"{"t":"entry","#.len();
-        debug_assert!(self.seq.is_some(), "only an entry's frame is a line");
-        out.push(b'{');
-        out.extend_from_slice(&self.bytes[TAGGED..]);
-        out.push(b'\n');
+    /// Entry `seq`'s frame from the line a log stores for it, newline
+    /// excluded: the bytes encoded at commit, tagged, not encoded again.
+    pub fn from_line(seq: u64, line: &[u8]) -> io::Result<Self> {
+        const TAG: &[u8] = br#"{"t":"entry","#;
+        let fields = line
+            .strip_prefix(b"{")
+            .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "not an entry's line"))?;
+        let mut bytes = Vec::with_capacity(4 + TAG.len() + fields.len());
+        bytes.extend_from_slice(&[0; 4]);
+        bytes.extend_from_slice(TAG);
+        bytes.extend_from_slice(fields);
+        // Every entry kind is durable so far; see `Body::class`.
+        Self::finish(bytes, Some(seq), Class::Durable)
     }
 }
 
@@ -1559,6 +1586,10 @@ mod tests {
                 build: "b".into(),
                 caps: Caps::ALL,
                 client: 1,
+                commands: vec![CommandInfo {
+                    name: "model".into(),
+                    description: "switch model".into(),
+                }],
             },
             DaemonMsg::Mismatch {
                 supported: PROTO,

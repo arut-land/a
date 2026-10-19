@@ -16,11 +16,11 @@ use store::{Header, Jsonl, LogStore};
 use sys::Home;
 
 use super::outbox::Outbox;
-use super::{Config, Daemon, Lifecycle, handle};
+use super::{Config, Daemon, Lifecycle, Owner, handle};
 
 struct Fixture {
     root: PathBuf,
-    daemon: Arc<Daemon>,
+    daemon: Owner,
     life: Arc<Lifecycle>,
 }
 
@@ -227,13 +227,7 @@ fn a_repeated_mutation_is_answered_again_but_not_done_again() {
         panic!("no list");
     };
     fixture.settle();
-    let entries = fixture
-        .daemon
-        .shared
-        .store
-        .load(sessions[0].id)
-        .unwrap()
-        .entries;
+    let entries = fixture.daemon.shared.store.entries(sessions[0].id).unwrap();
     let inputs = entries
         .iter()
         .filter(|e| matches!(e.body, Body::User { .. }))
@@ -407,13 +401,7 @@ fn a_client_that_falls_behind_is_caught_up_from_the_log() {
         let msg: DaemonMsg = read_frame(&mut frame.as_bytes()).unwrap().unwrap();
         view.fold(&msg);
     }
-    let log = fixture
-        .daemon
-        .shared
-        .store
-        .load(session.id)
-        .unwrap()
-        .entries;
+    let log = fixture.daemon.shared.store.entries(session.id).unwrap();
     let whole = SessionView::from_log(session.id, "/w".into(), &log);
     assert_eq!(view.state_hash(), whole.state_hash());
 }
