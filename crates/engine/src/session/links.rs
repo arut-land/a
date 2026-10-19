@@ -4,32 +4,18 @@
 //! fired, and a watch fires at most once because only the parent's actor
 //! logs it, after checking the log.
 
-use std::collections::{HashSet, VecDeque};
+use std::collections::VecDeque;
 use std::io;
 use std::sync::Arc;
 use std::sync::atomic::Ordering;
 
 use agent::{Agent, Input};
-use protocol::{Body, Entry, Environment, Outcome, SessionId};
+use protocol::ledger::Ledger;
+use protocol::{Body, Environment, Outcome, SessionId};
 use store::{Header, Loaded, Parent};
 
 use super::{Msg, Session, installed};
 use crate::{Daemon, Slot, lock};
-
-/// The watches in `entries` that have not fired, as `(seq, child)`.
-pub fn armed(entries: &[Entry]) -> impl Iterator<Item = (u64, SessionId)> {
-    let fired: HashSet<u64> = entries
-        .iter()
-        .filter_map(|e| match e.body {
-            Body::Fired { watch, .. } => Some(watch),
-            _ => None,
-        })
-        .collect();
-    entries.iter().filter_map(move |e| match e.body {
-        Body::Watch { child } if !fired.contains(&e.seq) => Some((e.seq, child)),
-        _ => None,
-    })
-}
 
 /// Where a link stands, by its watch. A link not yet watched or armed
 /// carries the child's input, to start it with.
@@ -40,23 +26,10 @@ enum Linked {
 }
 
 /// What a settled child hands back: its last answer or outcome.
-fn result(entries: &[Entry]) -> Outcome {
-    entries
-        .iter()
-        .rev()
-        .find_map(|e| match &e.body {
-            Body::Assistant { text } => Some(Outcome::Done {
-                output: text.as_str().into(),
-            }),
-            Body::ToolResult { outcome, .. }
-            | Body::ModelResult { outcome, .. }
-            | Body::Fired { outcome, .. } => Some(outcome.clone()),
-            Body::Interrupt => Some(Outcome::Interrupted { output: None }),
-            _ => None,
-        })
-        .unwrap_or_else(|| Outcome::Failed {
-            error: "the child settled without a result".to_owned(),
-        })
+fn result(ledger: &Ledger) -> Outcome {
+    ledger.result().cloned().unwrap_or_else(|| Outcome::Failed {
+        error: "the child settled without a result".to_owned(),
+    })
 }
 
 impl Session {
@@ -113,29 +86,20 @@ impl Session {
     pub(super) async fn relink(&self) -> io::Result<()> {
         let links: Vec<(u64, SessionId, Linked)> = {
             let st = self.lock();
-            let armed: HashSet<SessionId> = armed(&st.entries).map(|(_, child)| child).collect();
-            let watched: HashSet<SessionId> = st
-                .entries
+            let ledger = &st.ledger;
+            ledger
+                .links()
                 .iter()
-                .filter_map(|e| match e.body {
-                    Body::Watch { child } => Some(child),
-                    _ => None,
-                })
-                .collect();
-            st.entries
-                .iter()
-                .filter_map(|e| match &e.body {
-                    Body::Link { child, input } => {
-                        let linked = if !watched.contains(child) {
-                            Linked::Unwatched(input.clone())
-                        } else if armed.contains(child) {
-                            Linked::Armed(input.clone())
-                        } else {
-                            Linked::Fired
-                        };
-                        Some((e.seq, *child, linked))
-                    }
-                    _ => None,
+                .map(|link| {
+                    let input = link.input.clone();
+                    let linked = if !ledger.watched(link.child) {
+                        Linked::Unwatched(input)
+                    } else if ledger.armed().any(|(_, child)| child == link.child) {
+                        Linked::Armed(input)
+                    } else {
+                        Linked::Fired
+                    };
+                    (link.seq, link.child, linked)
                 })
                 .collect()
         };
@@ -165,7 +129,7 @@ impl Session {
         child: SessionId,
         outcome: Outcome,
     ) -> bool {
-        let watches: Vec<u64> = armed(&self.lock().entries)
+        let watches: Vec<u64> = (self.lock().ledger.armed())
             .filter_map(|(watch, watched)| (watched == child).then_some(watch))
             .collect();
         let mut ok = true;
@@ -202,7 +166,7 @@ impl Session {
         let (Some(parent), Some(daemon)) = (self.parent, self.shared.daemon.upgrade()) else {
             return;
         };
-        let (child, outcome) = (self.id, result(&self.lock().entries));
+        let (child, outcome) = (self.id, result(&self.lock().ledger));
         let reported = rt::unblock(&*self.shared.rt, move || {
             daemon.settled(parent.session, child, outcome)
         });
@@ -223,17 +187,14 @@ impl Daemon {
     /// The loaded sessions `parent` owns.
     pub(crate) fn children(&self, parent: SessionId) -> Vec<Arc<Session>> {
         self.owned(parent)
-            .filter_map(|s| lock(&s.live).clone())
+            .filter_map(|s| lock(&s.residence).live().cloned())
             .collect()
     }
 
     /// Unloads the sessions `parent` owns, each after its own children.
     pub(crate) fn unload_children(&self, parent: SessionId) {
         for slot in self.owned(parent) {
-            let live = lock(&slot.live).take();
-            if let Some(child) = live {
-                child.stop();
-            }
+            lock(&slot.residence).unload();
         }
     }
 
@@ -255,12 +216,8 @@ impl Daemon {
             return Ok(());
         };
         drop(slots);
-        let mut live = lock(&slot.live);
-        if live.is_none() {
-            let loaded = self.shared.store.load(slot.header.id)?;
-            *live = Some(self.seed(slot.header.clone(), loaded, input, env)?);
-        }
-        Ok(())
+        let start = |loaded| self.seed(slot.header.clone(), loaded, input, env);
+        self.live_or(&slot, start, |_| ())
     }
 
     /// Starts a child, first committing `env` (redacted) and `input` as its
@@ -314,27 +271,12 @@ impl Daemon {
 
 #[cfg(test)]
 mod tests {
+    use protocol::Entry;
+
     use super::*;
 
     fn entry(seq: u64, body: Body) -> Entry {
         Entry::new(seq, 0, body)
-    }
-
-    #[test]
-    fn only_unfired_watches_are_armed() {
-        let (a, b) = (SessionId::new(), SessionId::new());
-        let entries = [
-            entry(1, Body::Watch { child: a }),
-            entry(2, Body::Watch { child: b }),
-            entry(
-                3,
-                Body::Fired {
-                    watch: 1,
-                    outcome: Outcome::Interrupted { output: None },
-                },
-            ),
-        ];
-        assert_eq!(armed(&entries).collect::<Vec<_>>(), [(2, b)]);
     }
 
     #[test]
@@ -348,11 +290,12 @@ mod tests {
             outcome: done.clone(),
             card: None,
         };
-        assert_eq!(result(&[entry(1, said("a")), entry(2, ran)]), done);
+        let of = |entries: &[Entry]| result(&Ledger::of(entries));
+        assert_eq!(of(&[entry(1, said("a")), entry(2, ran)]), done);
         assert_eq!(
-            result(&[entry(1, said("a")), entry(2, said("b"))]),
+            of(&[entry(1, said("a")), entry(2, said("b"))]),
             Outcome::Done { output: "b".into() }
         );
-        assert!(matches!(result(&[]), Outcome::Failed { .. }));
+        assert!(matches!(of(&[]), Outcome::Failed { .. }));
     }
 }

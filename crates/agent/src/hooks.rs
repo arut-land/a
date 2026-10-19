@@ -24,6 +24,18 @@ use std::sync::Arc;
 use protocol::{Decision, Entry, Json, Outcome, Permission, SessionId};
 use serde_json::Value;
 
+/// A session's log as a hook reads it: decoded on demand, each time
+/// [`History::entries`] is called, as only a hook that reads it needs it.
+pub trait History {
+    fn entries(&self) -> Box<dyn Iterator<Item = Entry> + '_>;
+}
+
+impl History for Vec<Entry> {
+    fn entries(&self) -> Box<dyn Iterator<Item = Entry> + '_> {
+        Box::new(self.iter().cloned())
+    }
+}
+
 /// One hook. Every method defaults to changing nothing. Its decisions are
 /// logged under the name of the [`Extension`](crate::Extension) that
 /// registered it.
@@ -68,8 +80,9 @@ pub trait Hook: Send + Sync {
         None
     }
 
-    /// Text to continue with once the agent stopped.
-    fn on_stop(&self, _entries: &[Entry]) -> Option<String> {
+    /// Text to continue with once the agent stopped, given the session's
+    /// log so far.
+    fn on_stop(&self, _history: &dyn History) -> Option<String> {
         None
     }
 
@@ -299,11 +312,11 @@ impl Hooks {
         }
     }
 
-    pub fn on_stop(&self, entries: &[Entry], decided: &mut Decided) -> Option<String> {
+    pub fn on_stop(&self, history: &dyn History, decided: &mut Decided) -> Option<String> {
         let (hook, text) = self
             .0
             .iter()
-            .find_map(|(name, hook)| Some((*name, hook.on_stop(entries)?)))?;
+            .find_map(|(name, hook)| Some((*name, hook.on_stop(history)?)))?;
         decided.push((hook, Decision::OnStop { text: text.clone() }));
         Some(text)
     }
@@ -360,7 +373,7 @@ mod tests {
             })
         }
 
-        fn on_stop(&self, _: &[Entry]) -> Option<String> {
+        fn on_stop(&self, _: &dyn History) -> Option<String> {
             self.stop.map(str::to_owned)
         }
     }
@@ -536,7 +549,8 @@ mod tests {
         ));
 
         decided.clear();
-        assert_eq!(set.on_stop(&[], &mut decided).as_deref(), Some("go on"));
+        let none: &Vec<Entry> = &Vec::new();
+        assert_eq!(set.on_stop(none, &mut decided).as_deref(), Some("go on"));
         assert_eq!(names(&decided), ["b"]);
     }
 

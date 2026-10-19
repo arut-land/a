@@ -15,12 +15,12 @@ use protocol::{
 use store::{Header, Jsonl, LogStore};
 use sys::Home;
 
-use super::outbox::{Next, Outbox};
-use super::{Config, Daemon, Lifecycle, handle};
+use super::outbox::Outbox;
+use super::{Config, Daemon, Lifecycle, Owner, handle};
 
 struct Fixture {
     root: PathBuf,
-    daemon: Arc<Daemon>,
+    daemon: Owner,
     life: Arc<Lifecycle>,
 }
 
@@ -383,9 +383,9 @@ fn far_behind_a_client_gets_a_snapshot_if_it_takes_them() {
     assert_eq!(users(&replayed), 290);
 }
 
-/// A client that stops reading falls behind and is caught up from the log:
-/// the daemon holds a bounded backlog for it, and the client still ends up
-/// with every entry.
+/// A client that stops reading only lags: it reads what it missed from the
+/// session's shared frames once it reads again, and ends up with every
+/// entry.
 #[test]
 fn a_client_that_falls_behind_is_caught_up_from_the_log() {
     let fixture = Fixture::new("behind");
@@ -403,25 +403,9 @@ fn a_client_that_falls_behind_is_caught_up_from_the_log() {
     fixture.settle();
 
     let mut view = SessionView::default();
-    let mut caught_up = 0;
-    while let Some(next) = outbox.try_next() {
-        match next {
-            Next::Write(frame) => {
-                let msg: DaemonMsg = read_frame(&mut frame.as_bytes()).unwrap().unwrap();
-                view.fold(&msg);
-            }
-            Next::CatchUp {
-                session: behind,
-                following,
-                since,
-            } => {
-                caught_up += 1;
-                behind
-                    .upgrade()
-                    .unwrap()
-                    .catch_up(&outbox, following, since);
-            }
-        }
+    while let Some(frame) = outbox.try_next() {
+        let msg: DaemonMsg = read_frame(&mut frame.as_bytes()).unwrap().unwrap();
+        view.fold(&msg);
     }
     let log = fixture
         .daemon
@@ -431,7 +415,6 @@ fn a_client_that_falls_behind_is_caught_up_from_the_log() {
         .unwrap()
         .entries;
     let whole = SessionView::from_log(session.id, "/w".into(), &log);
-    assert_eq!(caught_up, 1);
     assert_eq!(view.state_hash(), whole.state_hash());
 }
 
