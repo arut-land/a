@@ -4,10 +4,8 @@ use protocol::{
     Activity, Body, Card, ClientMsg, DaemonMsg, Entry, Outcome, Recap, Residency, SessionId,
     SessionSummary, Target,
 };
-use ratatui_core::backend::{Backend, TestBackend};
 use ratatui_core::buffer::Buffer;
 use ratatui_core::style::Modifier;
-use ratatui_core::terminal::Terminal;
 use serde_json::json;
 
 use super::{App, Effect};
@@ -38,29 +36,21 @@ fn app(viewport: Viewport, msgs: &[DaemonMsg]) -> (App, SessionId) {
     (app, session)
 }
 
-/// A frame drawn through ratatui's test backend: the screen, where the
-/// caret shows (if it does), and its rows.
+/// A frame: its cells, where the caret shows (if it does), and its rows.
 struct Screen {
     buf: Buffer,
     caret: Option<(u16, u16)>,
 }
 
+/// Draws a frame, and checks it is what drawing it on a blank canvas gives:
+/// the rows kept from the frame before are the ones it would draw.
 fn frame(app: &mut App, w: u16, h: u16) -> (Screen, Vec<String>) {
-    let mut term = Terminal::new(TestBackend::new(w, h)).unwrap();
-    let mut caret = None;
-    term.draw(|f| {
-        caret = app.draw(f.buffer_mut());
-        if let Some(at) = caret {
-            f.set_cursor_position(at);
-        }
-    })
-    .unwrap();
-    let backend = term.backend_mut();
-    if caret.is_some() {
-        let at = backend.get_cursor_position().unwrap();
-        assert_eq!(caret, Some((at.x, at.y)), "the caret shows where drawn");
-    }
-    let buf = backend.buffer().clone();
+    let caret = app.draw(w, h);
+    let buf = app.canvas().buffer().clone();
+    let kept = std::mem::take(&mut app.canvas);
+    assert_eq!(app.draw(w, h), caret);
+    assert_eq!(app.canvas().buffer(), &buf, "kept rows are stale");
+    app.canvas = kept;
     let rows = rows(&buf);
     (Screen { buf, caret }, rows)
 }
@@ -552,18 +542,12 @@ fn render_cost() {
     let model = 2 + 2000 * 3;
     msgs.push(entry(model, Body::ModelCall { model: "m".into() }));
     let (mut app, _) = app(Viewport::Full, &msgs);
-    // What a frame writes, through the backend the client uses.
+    // What a frame writes, as the client writes it.
     let count = Count::default();
-    let mut term = count.terminal(120);
+    let mut screen = crate::screen::Screen::new(Viewport::Full, count.clone());
     let mut frame = |app: &mut App, w: u16| {
-        if term.get_frame().area().width != w {
-            term = count.terminal(w);
-        }
         let before = count.0.get();
-        term.draw(|f| {
-            app.draw(f.buffer_mut());
-        })
-        .unwrap();
+        screen.draw(app, (w, 40)).unwrap();
         count.0.get() - before
     };
     let t = Instant::now();
@@ -602,22 +586,9 @@ fn render_cost() {
     );
 }
 
-/// Counts the bytes a terminal writes.
+/// Counts the bytes a terminal is sent.
 #[derive(Clone, Default)]
 struct Count(std::rc::Rc<std::cell::Cell<usize>>);
-
-impl Count {
-    fn terminal(&self, w: u16) -> Terminal<ratatui_crossterm::CrosstermBackend<Self>> {
-        let area = ratatui_core::layout::Rect::new(0, 0, w, 40);
-        let viewport = ratatui_core::terminal::Viewport::Fixed(area);
-        let options = ratatui_core::terminal::TerminalOptions { viewport };
-        Terminal::with_options(
-            ratatui_crossterm::CrosstermBackend::new(self.clone()),
-            options,
-        )
-        .unwrap()
-    }
-}
 
 impl std::io::Write for Count {
     fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {

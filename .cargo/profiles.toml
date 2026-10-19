@@ -133,11 +133,11 @@ opt-level = "z"
 [profile.release.package.http-body-util]
 opt-level = "z"
 
-# The terminal client redraws once per streamed token: through ratatui, s
-# costs a 6000-item session's delta frame 175 µs against 125 µs at 3, for
-# 36 KiB (docs/tui.md).
+# The terminal client redraws once per streamed token, but only the rows a
+# token changed: a 6000-item session's delta frame is ~45 µs at s and at 3
+# alike (docs/tui.md).
 [profile.release.package.tui]
-opt-level = 3
+opt-level = "s"
 
 # cargo-bolero (`mise run fuzz`): optimized, and LLVM throughout for
 # libFuzzer's coverage instrumentation.

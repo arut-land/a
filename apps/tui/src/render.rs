@@ -1,19 +1,182 @@
-//! Drawing into a ratatui [`Buffer`] in coordinates relative to its area,
-//! so a frame draws the same at the top of the alternate screen and in an
-//! inline viewport further down; and fitting text to columns.
+//! The [`Canvas`] a frame is drawn on, which redraws only the rows that
+//! changed; drawing text into a ratatui [`Buffer`]; and fitting text to
+//! columns. Frames are drawn from row 0, so one draws the same on the
+//! alternate screen and in an inline viewport further down.
 
-use ratatui_core::buffer::Buffer;
+use std::ops::Range;
+
+use ratatui_core::buffer::{Buffer, Cell};
+use ratatui_core::layout::Rect;
 use ratatui_core::style::Style;
+use unicode_width::UnicodeWidthStr;
 
-use super::text::{char_width, width_of};
+use super::text::{Action, Line, char_width, width_of};
 
-/// Where frames go.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum Viewport {
-    /// The whole alternate screen.
-    Full,
-    /// The last rows of the normal buffer, under the scrollback.
-    Inline,
+pub use crate::Viewport;
+
+/// A frame's cells, drawn by the line and redrawn by the row: a row drawn
+/// with the same lines as the frame before keeps its cells, so a streamed
+/// token costs the rows it changed rather than the screen, and only those
+/// rows are compared to find what the terminal is sent.
+#[derive(Default)]
+pub struct Canvas {
+    buf: Buffer,
+    rows: Vec<Row>,
+    /// Lines drawn now are under an overlay: they show, but a click on
+    /// them does nothing.
+    pub inert: bool,
+    /// What the last frame changed: rows and their columns, top down.
+    changed: Vec<(u16, Range<u16>)>,
+    /// A row's cells before it is redrawn.
+    before: Vec<Cell>,
+}
+
+/// One row's lines in the order drawn, and how many of them this frame has
+/// drawn again so far.
+#[derive(Default)]
+struct Row {
+    ops: Vec<Op>,
+    kept: usize,
+    dirty: bool,
+}
+
+struct Op {
+    x: u16,
+    line: Line,
+    live: bool,
+    /// Where its clickable spans landed.
+    hits: Vec<(Range<u16>, Action)>,
+}
+
+impl Canvas {
+    /// Starts a `w` × `h` frame; a new size starts from blank.
+    pub fn begin(&mut self, w: u16, h: u16) {
+        let area = Rect::new(0, 0, w, h);
+        if self.buf.area != area {
+            self.buf = Buffer::empty(area);
+            self.rows.clear();
+            self.rows.resize_with(usize::from(h), Row::default);
+        }
+        for row in &mut self.rows {
+            row.kept = 0;
+            row.dirty = false;
+        }
+        self.inert = false;
+        self.changed.clear();
+    }
+
+    pub fn area(&self) -> Rect {
+        self.buf.area
+    }
+
+    /// Draws `line` from column `x` of row `y`, clipped at the right edge;
+    /// later lines draw over earlier ones.
+    pub fn line(&mut self, x: u16, y: u16, line: &Line) {
+        let clickable = !self.inert;
+        let Some(row) = self.rows.get_mut(usize::from(y)) else {
+            return;
+        };
+        let same = |op: &Op| op.x == x && op.live == clickable && op.line == *line;
+        if !row.dirty && row.ops.get(row.kept).is_some_and(same) {
+            row.kept += 1;
+            return;
+        }
+        row.dirty = true;
+        row.ops.truncate(row.kept);
+        row.ops.push(Op {
+            x,
+            line: line.clone(),
+            live: clickable,
+            hits: Vec::new(),
+        });
+        row.kept += 1;
+    }
+
+    /// Ends the frame: redraws the rows whose lines changed, and notes
+    /// which of their cells did.
+    pub fn finish(&mut self) {
+        let width = usize::from(self.buf.area.width);
+        for (y, row) in (0..).zip(&mut self.rows) {
+            if row.kept < row.ops.len() {
+                row.ops.truncate(row.kept);
+                row.dirty = true;
+            }
+            if !row.dirty {
+                continue;
+            }
+            let start = usize::from(y) * width;
+            let cells = &mut self.buf.content[start..start + width];
+            self.before.clear();
+            self.before.extend_from_slice(cells);
+            cells.iter_mut().for_each(Cell::reset);
+            for op in &mut row.ops {
+                op.hits = draw(&mut self.buf, op.x, y, &op.line);
+            }
+            if let Some(cols) = changed(&self.before, &self.buf.content[start..start + width]) {
+                self.changed.push((y, cols));
+            }
+        }
+    }
+
+    /// The frame's cells.
+    pub fn buffer(&self) -> &Buffer {
+        &self.buf
+    }
+
+    /// The cells the last frame changed, by row.
+    pub fn changed(&self) -> &[(u16, Range<u16>)] {
+        &self.changed
+    }
+
+    /// What a click at (`x`, `y`) on the last frame does: the topmost
+    /// clickable span there, if any.
+    pub fn hit(&self, x: u16, y: u16) -> Option<Action> {
+        let row = self.rows.get(usize::from(y))?;
+        row.ops
+            .iter()
+            .rev()
+            .filter(|op| op.live)
+            .flat_map(|op| &op.hits)
+            .find(|(cols, _)| cols.contains(&x))
+            .map(|&(_, action)| action)
+    }
+}
+
+/// Draws `line`'s spans from column `x` of row `y`; returns where its
+/// clickable ones landed.
+fn draw(buf: &mut Buffer, x: u16, y: u16, line: &Line) -> Vec<(Range<u16>, Action)> {
+    let mut hits = Vec::new();
+    let mut at = x;
+    for span in &line.spans {
+        let end = put(buf, at, y, &span.text, span.style);
+        if let Some(action) = span.action {
+            hits.push((at..end, action));
+        }
+        at = end;
+    }
+    hits
+}
+
+/// The columns from the first to the last cell that differ, starting at a
+/// wide character rather than at the column it covers.
+fn changed(before: &[Cell], after: &[Cell]) -> Option<Range<u16>> {
+    let differs = |(a, b): (&Cell, &Cell)| a != b;
+    let mut first = before.iter().zip(after).position(differs)?;
+    let last = before.iter().zip(after).rposition(differs)?;
+    if first > 0 && cell_width(&after[first - 1]) > 1 {
+        first -= 1;
+    }
+    Some(u16::try_from(first).ok()?..u16::try_from(last + 1).ok()?)
+}
+
+/// The columns a cell's symbol takes, as ratatui counts them when placing
+/// it (the next ones it covers are blank).
+pub fn cell_width(cell: &Cell) -> u16 {
+    let symbol = cell.symbol();
+    if symbol.len() == 1 {
+        return 1;
+    }
+    u16::try_from(symbol.width()).map_or(1, |w| w.max(1))
 }
 
 /// Writes `text` from column `x` of row `y` of `buf`'s area, clipped at its
