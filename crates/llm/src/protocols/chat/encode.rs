@@ -11,7 +11,7 @@ use super::merge::merge_fields;
 use super::{
     KEY, LaterSystem, PartKind, Quirks, ReasoningField, Routing, Vendor as V, rewrite, rules,
 };
-use crate::conversation::{self, Fold, History};
+use crate::conversation::{self, Fold, History, Settled};
 use crate::error::Error;
 use crate::json::{Lenient, obj};
 use crate::models::openai;
@@ -368,7 +368,7 @@ impl Fold for Wire {
         &self.ctx
     }
 
-    fn settle(&mut self, out: &mut Vec<Value>) {
+    fn settle(&mut self, out: &mut Settled) {
         let user = self
             .open
             .last()
@@ -376,7 +376,7 @@ impl Fold for Wire {
         let settled = self.open.len() - usize::from(user);
         for mut message in self.open.drain(..settled) {
             rewrite::message(self.ctx.quirks.vendor, &mut message);
-            out.push(message);
+            out.item(&message);
         }
         self.settled += settled;
     }

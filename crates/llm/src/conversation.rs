@@ -148,8 +148,8 @@ pub(crate) trait Fold: Clone + Send + 'static {
     /// Folds message `at` of the prepared conversation.
     fn push(&mut self, at: usize, message: &Message) -> Result<(), Error>;
 
-    /// Moves the items no later message can change to `out`, in order.
-    fn settle(&mut self, out: &mut Vec<Value>);
+    /// Writes the items no later message can change to `out`, in order.
+    fn settle(&mut self, out: &mut Settled);
 }
 
 /// A fold's steps, past its type: the pass and the code that keeps
@@ -157,7 +157,7 @@ pub(crate) trait Fold: Clone + Send + 'static {
 pub(crate) trait Step {
     fn push(&mut self, at: usize, message: &Message) -> Result<(), Error>;
 
-    fn settle(&mut self, out: &mut Vec<Value>);
+    fn settle(&mut self, out: &mut Settled);
 }
 
 impl<F: Fold> Step for F {
@@ -165,7 +165,7 @@ impl<F: Fold> Step for F {
         Fold::push(self, at, message)
     }
 
-    fn settle(&mut self, out: &mut Vec<Value>) {
+    fn settle(&mut self, out: &mut Settled) {
         Fold::settle(self, out);
     }
 }
@@ -228,15 +228,15 @@ impl Kept {
         target: &Target<'_>,
         fold: &mut dyn Step,
     ) -> Result<(), Error> {
-        let (mut items, mut bytes) = (Vec::new(), Vec::new());
+        let mut bytes = Settled::default();
         for message in &messages[self.len..] {
             #[cfg(test)]
             FOLDED.with(|folded| folded.set(folded.get() + 1));
             self.pass.push(target, message, fold)?;
-            written(fold, &mut items, &mut bytes);
+            fold.settle(&mut bytes);
         }
-        if !bytes.is_empty() {
-            self.settled.push(bytes.into());
+        if !bytes.0.is_empty() {
+            self.settled.push(bytes.0.into());
         }
         Ok(())
     }
@@ -263,23 +263,38 @@ fn end(
     fold: &mut dyn Step,
 ) -> Result<Vec<Shared>, Error> {
     pass.finish(fold)?;
-    let (mut items, mut bytes) = (Vec::new(), Vec::new());
-    written(fold, &mut items, &mut bytes);
-    if !bytes.is_empty() {
-        settled.push(bytes.into());
+    let mut bytes = Settled::default();
+    fold.settle(&mut bytes);
+    if !bytes.0.is_empty() {
+        settled.push(bytes.0.into());
     }
     Ok(settled)
 }
 
-/// Writes the items `fold` settled to `bytes`, separated by commas.
-fn written(fold: &mut dyn Step, items: &mut Vec<Value>, bytes: &mut Vec<u8>) {
-    fold.settle(items);
-    for item in items.drain(..) {
-        if !bytes.is_empty() {
-            bytes.push(b',');
+/// Items that settled, as JSON separated by commas: each written once,
+/// from whatever the protocol holds it as.
+#[derive(Default)]
+pub(crate) struct Settled(Vec<u8>);
+
+impl Settled {
+    pub(crate) fn item(&mut self, item: &(impl Serialize + ?Sized)) {
+        self.comma();
+        // Writing to memory cannot fail.
+        let _ = serde_json::to_writer(&mut self.0, item);
+    }
+
+    /// Items already written, separated by commas.
+    pub(crate) fn written(&mut self, items: &[u8]) {
+        if !items.is_empty() {
+            self.comma();
+            self.0.extend_from_slice(items);
         }
-        // Writing a value to memory cannot fail.
-        let _ = serde_json::to_writer(&mut *bytes, &item);
+    }
+
+    fn comma(&mut self) {
+        if !self.0.is_empty() {
+            self.0.push(b',');
+        }
     }
 }
 

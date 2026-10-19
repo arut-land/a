@@ -6,7 +6,7 @@ use serde::Serialize;
 use serde_json::{Map, Value, json};
 
 use super::{Instructions, ItemType, KEY, PartType, Responses, Status};
-use crate::conversation::{self, Fold, History};
+use crate::conversation::{self, Fold, History, Settled};
 use crate::error::Error;
 use crate::json::Lenient;
 use crate::models::openai;
@@ -271,10 +271,12 @@ impl Fold for Input {
         &self.cx
     }
 
-    fn settle(&mut self, out: &mut Vec<Value>) {
+    fn settle(&mut self, out: &mut Settled) {
         if self.begun || self.cx.instructions != Instructions::Leading {
             self.settled += self.open.len();
-            out.append(&mut self.open);
+            for item in self.open.drain(..) {
+                out.item(&item);
+            }
         }
     }
 

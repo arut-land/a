@@ -13,7 +13,7 @@ use serde::Serialize;
 use serde_json::{Map, Value, json};
 
 use super::{Gemini, KEY, ThoughtReplay};
-use crate::conversation::{self, Fold, History};
+use crate::conversation::{self, Fold, History, Settled};
 use crate::error::Error;
 use crate::json::{Lenient, obj};
 use crate::models::Reasoning;
@@ -185,7 +185,7 @@ impl Fold for Contents {
     /// Every content but the last when that is a user's, which the next may
     /// join; where only the current turn keeps its signatures, those before
     /// the newest user text, without theirs.
-    fn settle(&mut self, out: &mut Vec<Value>) {
+    fn settle(&mut self, out: &mut Settled) {
         let settled = match self.cx.thought_replay {
             ThoughtReplay::All => {
                 let user = self
@@ -200,7 +200,9 @@ impl Fold for Contents {
         if self.cx.thought_replay == ThoughtReplay::CurrentTurn {
             drop_signatures(&mut settled);
         }
-        out.append(&mut settled);
+        for content in &settled {
+            out.item(content);
+        }
     }
 
     fn push(&mut self, _: usize, message: &Message) -> Result<(), Error> {
