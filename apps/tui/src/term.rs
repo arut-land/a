@@ -152,7 +152,9 @@ pub fn cursor_row() -> Option<u16> {
 fn position_report(bytes: &[u8]) -> Option<u16> {
     (0..bytes.len()).find_map(|at| {
         let rest = bytes[at..].strip_prefix(b"\x1b[")?;
-        let end = rest.iter().position(|&b| !matches!(b, b'0'..=b'9' | b';'))?;
+        let end = rest
+            .iter()
+            .position(|&b| !matches!(b, b'0'..=b'9' | b';'))?;
         let (row, col) = std::str::from_utf8(&rest[..end]).ok()?.split_once(';')?;
         (rest[end] == b'R' && col.parse::<u16>().is_ok())
             .then(|| row.parse::<u16>().ok()?.checked_sub(1))
@@ -169,9 +171,7 @@ pub fn spawn_input(tx: Sender<Event>, viewport: Viewport) {
                 Ok(event::Event::Resize(..)) => {
                     // Inline: the terminal reflowed its lines, so ask where
                     // the cursor (and with it the viewport) ended up.
-                    let row = (viewport == Viewport::Inline)
-                        .then(cursor_row)
-                        .flatten();
+                    let row = (viewport == Viewport::Inline).then(cursor_row).flatten();
                     tx.send(Event::Resized(row))
                 }
                 Ok(event) => match Input::from_event(event) {
