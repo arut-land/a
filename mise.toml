@@ -122,7 +122,7 @@ A_SHIPPED=$PWD/target/release/a A_BIN=$PWD/target/fixtures/release/a A_STRICT_BU
 "apple:test" = { depends = ["apple:ffi"], run = '''
 cargo build -p a --features fixtures
 export A_HOME=$(mktemp -d) A_TEST_HELPER=$PWD/target/debug/a
-printf '[daemon]\nagent = "echo"\nask = ["bash"]\n' > "$A_HOME/config.toml"
+printf '[daemon]\nagent = "echo"\n\n[ext.policy]\nask = ["bash"]\n' > "$A_HOME/config.toml"
 trap 'target/debug/a daemon stop >/dev/null; rm -rf "$A_HOME"' EXIT
 swift test --package-path apps/apple/AKit
 ''' }

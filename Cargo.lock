@@ -664,7 +664,11 @@ name = "ext-policy"
 version = "0.0.0"
 dependencies = [
  "ext",
+ "llm",
  "protocol",
+ "rt",
+ "serde",
+ "serde_json",
 ]
 
 [[package]]

@@ -117,6 +117,12 @@ impl Home {
         self.root.join("config.toml")
     }
 
+    /// The operator's permission rules, which only tighten; see
+    /// [`config::rules`].
+    pub fn policy_file(&self) -> PathBuf {
+        self.root.join("policy.toml")
+    }
+
     pub fn runtime(&self) -> Runtime {
         Runtime::new(self.root.join("runtime"))
     }

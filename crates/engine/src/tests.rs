@@ -41,8 +41,8 @@ fn home(name: &str) -> (PathBuf, Home) {
 /// and the fixtures.
 pub(crate) fn extensions(policy: &ext_policy::Policy) -> Result<Registry, ext::Refused> {
     Registry::default()
-        .with_in(ext::Tier::Guarded, policy)?
-        .with_in(ext::Tier::Pre, &ext_prompt::Prompt)?
+        .with_in(ext::Tier::Pre, policy)?
+        .with_in(ext::Tier::Pre, &ext_prompt::Prompt::default())?
         .with_in(ext::Tier::Pre, &ext_shell::Shell)?
         .with_in(ext::Tier::Pre, &ext_edit::Edit)?
         .with_in(ext::Tier::Pre, &ext_chat::Chat)?
@@ -50,11 +50,19 @@ pub(crate) fn extensions(policy: &ext_policy::Policy) -> Result<Registry, ext::R
         .with_in(ext::Tier::Pre, &ext_fixtures::Fixtures)
 }
 
-/// [`extensions`], configured as `config` says.
+/// [`extensions`], with the tools `config`'s `[ext.policy]` asks about.
 pub(crate) fn configured(config: &Config) -> Result<Registry, ext::Refused> {
+    let policy = config.ext.table("policy");
+    let ask = policy.list("ask").ok().flatten().unwrap_or_default();
     extensions(&ext_policy::Policy {
-        ask: config.ask.clone(),
+        ask: ask.to_vec(),
+        ..ext_policy::Policy::default()
     })
+}
+
+/// The `[ext]` tables of `text`.
+fn exts(text: &str) -> sys::config::Exts {
+    text.parse::<sys::Config>().unwrap().ext
 }
 
 fn echo() -> Config {
@@ -210,7 +218,7 @@ fn busy_sessions_recover_at_startup() {
 fn a_session_waiting_for_approval_stays_waiting_through_hibernation_and_a_restart() {
     let (root, home) = home("asked");
     let config = Config {
-        ask: vec!["bash".into()],
+        ext: exts("[ext.policy]\nask = [\"bash\"]"),
         ..echo()
     };
     let daemon = Daemon::load(&home, &config).unwrap();
@@ -246,7 +254,7 @@ fn a_session_waiting_for_approval_stays_waiting_through_hibernation_and_a_restar
 fn asking(name: &str) -> (PathBuf, Home, super::Owner) {
     let (root, home) = home(name);
     let config = Config {
-        ask: vec!["bash".into()],
+        ext: exts("[ext.policy]\nask = [\"bash\"]"),
         ..echo()
     };
     let daemon = Daemon::load(&home, &config).unwrap();

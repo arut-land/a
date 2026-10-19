@@ -45,15 +45,16 @@ pub struct Config {
     /// The agent sessions run, by name: overrides the config files'
     /// `agent`.
     pub agent: Option<String>,
-    /// Tools whose calls wait for the user's approval.
-    pub ask: Vec<String>,
-    /// The system prompt, in place of the one the extensions make.
-    pub system_prompt: Option<String>,
+
     /// Young deaths in a row after which a daemon refuses to serve (0 for
     /// never); see [`sys::crash`].
     pub crash_limit: u32,
     /// `[ext]`: the extensions left out, and each one's own table.
     pub ext: sys::config::Exts,
+    /// The operator's permission rules (`$A_HOME`'s `policy.toml`), as
+    /// `(tool, input, effect)`, or why they could not be read: a daemon
+    /// whose floor is unreadable does not start.
+    pub floor: Result<Vec<(String, Option<String>, String)>, String>,
     /// The registry of the extensions this build links, assembled for this
     /// configuration. The engine itself offers the model nothing.
     pub extensions: fn(&Config) -> Result<ext::host::Registry, ext::Refused>,
@@ -66,10 +67,9 @@ impl Default for Config {
             hibernate: Duration::from_secs(300),
             drain: Duration::from_secs(60),
             agent: None,
-            ask: Vec::new(),
-            system_prompt: None,
             crash_limit: sys::crash::LIMIT,
             ext: sys::config::Exts::default(),
+            floor: Ok(Vec::new()),
             #[cfg(not(test))]
             extensions: |_| Ok(ext::host::Registry::default()),
             #[cfg(test)]
@@ -86,8 +86,15 @@ impl Config {
             eprintln!("{e}; running with the default [daemon] settings");
             sys::Config::default()
         });
+        let floor = match std::fs::read_to_string(home.policy_file()) {
+            Ok(text) => sys::config::rules(&text)
+                .map_err(|e| format!("{}: {e}", home.policy_file().display())),
+            Err(e) if e.kind() == io::ErrorKind::NotFound => Ok(Vec::new()),
+            Err(e) => Err(format!("{}: {e}", home.policy_file().display())),
+        };
         Self {
             ext: file.ext,
+            floor,
             ..Self::from(file.daemon)
         }
     }
@@ -116,12 +123,11 @@ impl From<sys::config::Daemon> for Config {
             hibernate: secs(file.hibernate_secs, defaults.hibernate),
             drain: secs(file.drain_secs, defaults.drain),
             agent: file.agent,
-            ask: file.ask,
-            system_prompt: file.system_prompt.filter(|prompt| !prompt.is_empty()),
             crash_limit: file.crash_limit.map_or(defaults.crash_limit, |n| {
                 u32::try_from(n).unwrap_or(u32::MAX)
             }),
             ext: defaults.ext,
+            floor: defaults.floor,
             extensions: defaults.extensions,
         }
     }
@@ -283,7 +289,7 @@ impl Daemon {
                 store,
                 registry,
                 models,
-                system: config.system_prompt.clone(),
+
                 spill: home.spill_dir(),
                 loaded: Mutex::default(),
                 daemon: daemon.clone(),

@@ -96,6 +96,16 @@ impl Env {
         fs::write(path, text).unwrap();
     }
 
+    /// Sets `lines` in extension `ext`'s table, `[ext.<ext>]`: after any
+    /// `[daemon]` lines, as a table ends where the next begins.
+    pub fn ext(&self, ext: &str, lines: &str) {
+        let path = self.home.config_file();
+        let text = fs::read_to_string(&path).unwrap_or_default();
+        let text = text + &format!("\n[ext.{ext}]\n{lines}\n");
+        fs::create_dir_all(path.parent().unwrap()).unwrap();
+        fs::write(path, text).unwrap();
+    }
+
     pub fn cmd(&self, args: &[&str]) -> Command {
         self.cmd_under(&[], args)
     }

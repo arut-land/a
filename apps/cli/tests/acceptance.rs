@@ -440,7 +440,7 @@ fn sessions_outlive_their_daemon() {
 #[test]
 fn a_pending_approval_survives_detach_and_is_re_delivered_on_attach() {
     let env = Env::new("approval");
-    env.daemon("ask = [\"bash\"]");
+    env.ext("policy", "ask = [\"bash\"]");
     env.start();
     let mut conn = env.connect();
     let (id, _) = conn.attach(Target::New, &env.ws);

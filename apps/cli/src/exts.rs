@@ -1,60 +1,79 @@
 //! The extensions `a` links. Each is a crate, and a cargo feature of this
 //! one, so leaving one out of a build leaves it out of the registry; each
-//! registers through the same verbs as any other, and can be replaced by
-//! one of the same name.
+//! registers through the same verbs as any other, can be replaced by one
+//! of the same name, and is configured by its own `[ext.<name>]` table.
+//! `[ext] disable` leaves one out: it is replaced by an extension of its
+//! name that contributes nothing.
 
 // Only the daemon, which runs on Unix alone, assembles them.
 #![cfg_attr(not(unix), allow(dead_code))]
 
 use engine::Config;
 use ext::host::Registry;
-use ext::{DynExtension, Refused, Tier};
+use ext::{DynExtension, Name, Refused, Registrar, Tier};
 
 /// The extensions this build links, in their install order, each as its
-/// `[ext.<name>]` table sets it, with the policy guarded. The fixtures
-/// come only with the `echo` agent they serve, in a build that has them.
+/// `[ext.<name>]` table sets it. The fixtures come only with the `echo`
+/// agent they serve, in a build that has them.
 pub fn extensions(config: &Config) -> Result<Vec<Installed>, Refused> {
     let step_limit = ext::StepLimit {
         max: whole(config, ext::LOOP, "max_steps")?.unwrap_or(ext::StepLimit::default().max),
     };
+    let mut all: Vec<Installed> = vec![(Tier::Pre, Box::new(step_limit))];
+    #[cfg(feature = "policy")]
+    {
+        let floor = config.floor.clone().map_err(Refused)?;
+        let floor = ext_policy::Floor::new(floor).map_err(Refused)?;
+        let default = ext_policy::Policy::ask(&[]);
+        let mode = match text(config, "policy", "mode")? {
+            Some(name) => ext_policy::Mode::named(&name)
+                .ok_or_else(|| Refused(format!("ext.policy.mode: no mode {name}")))?,
+            None => default.mode,
+        };
+        let policy = ext_policy::Policy {
+            ask: list(config, "policy", "ask")?.unwrap_or(default.ask),
+            edits: list(config, "policy", "edits")?.unwrap_or(default.edits),
+            mode,
+        };
+        all.push((Tier::Guarded, Box::new(floor)));
+        all.push((Tier::Pre, Box::new(policy)));
+    }
+    #[cfg(feature = "prompt")]
+    all.push((
+        Tier::Pre,
+        Box::new(ext_prompt::Prompt {
+            system: text(config, "prompt", "system")?.filter(|s| !s.is_empty()),
+        }),
+    ));
+    #[cfg(feature = "shell")]
+    all.push((Tier::Pre, Box::new(ext_shell::Shell)));
+    #[cfg(feature = "edit")]
+    all.push((Tier::Pre, Box::new(ext_edit::Edit)));
+    #[cfg(feature = "chat")]
+    all.push((Tier::Pre, Box::new(ext_chat::Chat)));
+    #[cfg(feature = "settings")]
+    all.push((Tier::Pre, Box::new(ext_settings::Settings)));
+    #[cfg(feature = "subagent")]
+    all.push((Tier::Pre, Box::new(ext_subagent::Subagent)));
+    // After every other: what another extension owns it is not asked.
     #[cfg(feature = "retry")]
-    let retry = {
+    {
         let default = ext_retry::Retry::default();
-        ext_retry::Retry {
+        let retry = ext_retry::Retry {
             attempts: whole(config, "retry", "attempts")?.unwrap_or(default.attempts),
             transport: whole(config, "retry", "transport")?.unwrap_or(default.transport),
             ..default
-        }
-    };
-    let mut all: Vec<Installed> = vec![
-        (Tier::Pre, Box::new(step_limit)),
-        #[cfg(feature = "policy")]
-        (
-            Tier::Guarded,
-            Box::new(ext_policy::Policy {
-                ask: config.ask.clone(),
-            }),
-        ),
-        #[cfg(feature = "prompt")]
-        (Tier::Pre, Box::new(ext_prompt::Prompt)),
-        #[cfg(feature = "shell")]
-        (Tier::Pre, Box::new(ext_shell::Shell)),
-        #[cfg(feature = "edit")]
-        (Tier::Pre, Box::new(ext_edit::Edit)),
-        #[cfg(feature = "chat")]
-        (Tier::Pre, Box::new(ext_chat::Chat)),
-        #[cfg(feature = "settings")]
-        (Tier::Pre, Box::new(ext_settings::Settings)),
-        #[cfg(feature = "subagent")]
-        (Tier::Pre, Box::new(ext_subagent::Subagent)),
-        // After every other: what another extension owns it is not asked.
-        #[cfg(feature = "retry")]
-        (Tier::Post, Box::new(retry)),
-    ];
+        };
+        all.push((Tier::Post, Box::new(retry)));
+    }
     if config.agent.as_deref() == Some(ext_fixtures::ECHO)
         && let Some(fixtures) = ext_fixtures::extension()
     {
         all.push((Tier::User, fixtures));
+    }
+    // Disabled: replaced by nothing of the same name.
+    for name in &config.ext.disable {
+        all.push((Tier::User, Box::new(Disabled(Name::from(name.as_str())))));
     }
     Ok(all)
 }
@@ -62,11 +81,41 @@ pub fn extensions(config: &Config) -> Result<Vec<Installed>, Refused> {
 /// An extension to install, and where.
 pub type Installed = (Tier, Box<dyn DynExtension>);
 
+/// What a disabled extension is replaced by: one of its name that
+/// contributes nothing.
+struct Disabled(Name);
+
+impl DynExtension for Disabled {
+    fn name(&self) -> Name {
+        Name::clone(&self.0)
+    }
+
+    fn version(&self) -> u32 {
+        0
+    }
+
+    fn contribute(&self, _: &mut Registrar) {}
+}
+
+fn setting<T>(read: Result<T, sys::config::ParseError>) -> Result<T, Refused> {
+    read.map_err(|e| Refused(e.to_string()))
+}
+
 /// Whole number `key` of extension `ext`'s table, if it sets one.
 fn whole<T: TryFrom<u64>>(config: &Config, ext: &str, key: &str) -> Result<Option<T>, Refused> {
-    let n = (config.ext.table(ext).whole(key)).map_err(|e| Refused(e.to_string()))?;
+    let n = setting(config.ext.table(ext).whole(key))?;
     n.map(|n| T::try_from(n).map_err(|_| Refused(format!("ext.{ext}.{key} is too large"))))
         .transpose()
+}
+
+/// String `key` of extension `ext`'s table, if it sets one.
+fn text(config: &Config, ext: &str, key: &str) -> Result<Option<String>, Refused> {
+    Ok(setting(config.ext.table(ext).text(key))?.map(str::to_owned))
+}
+
+/// List `key` of extension `ext`'s table, if it sets one.
+fn list(config: &Config, ext: &str, key: &str) -> Result<Option<Vec<String>>, Refused> {
+    Ok(setting(config.ext.table(ext).list(key))?.map(<[String]>::to_vec))
 }
 
 /// The registry of [`extensions`].
@@ -104,12 +153,19 @@ mod tests {
         }
     }
 
-    fn config(ask: &[&str], agent: Option<&str>) -> Config {
+    /// A daemon's settings that ask about `ask`, with `extra` in its file.
+    fn configured(ask: &[&str], agent: Option<&str>, extra: &str) -> Config {
+        let ask: Vec<_> = ask.iter().map(|t| format!("{t:?}")).collect();
+        let text = format!("[ext.policy]\nask = [{}]\n{extra}", ask.join(", "));
         Config {
-            ask: ask.iter().map(|&t| t.to_owned()).collect(),
             agent: agent.map(str::to_owned),
+            ext: text.parse::<sys::Config>().unwrap().ext,
             ..Config::default()
         }
+    }
+
+    fn config(ask: &[&str], agent: Option<&str>) -> Config {
+        configured(ask, agent, "")
     }
 
     fn gate(registry: &Registry, tool: &str, decided: &mut Decided) -> Gate {
@@ -137,8 +193,9 @@ mod tests {
         assert_eq!(
             extensions,
             [
-                ("policy", 1),
+                ("policy-floor", 1),
                 ("loop", 1),
+                ("policy", 2),
                 ("prompt", 1),
                 ("shell", 1),
                 ("edit", 1),
@@ -176,7 +233,8 @@ mod tests {
             r.system_prompt().split("\n\n").map(str::to_owned).collect()
         };
         // What each contributes that the others do not.
-        let own: [(&str, &[&str], usize, bool); 9] = [
+        let own: [(&str, &[&str], usize, bool); 10] = [
+            ("policy-floor", &[], 0, false),
             ("policy", &[], 0, false),
             ("loop", &[], 0, false),
             ("prompt", &[], 1, false),
@@ -228,6 +286,50 @@ mod tests {
             let asks = gate(&rest, "bash", &mut Decided::new()) == Gate::Ask;
             assert_eq!(asks, name != "policy", "{name}");
         }
+    }
+
+    /// `[ext] disable` leaves an extension out by replacing it with nothing
+    /// of its name; one another needs is refused at startup, naming both.
+    #[test]
+    fn a_disabled_need_is_refused_loudly() {
+        let config = configured(&[], None, "[ext]\ndisable = [\"subagent\"]\n");
+        let registry = registry(&config).unwrap();
+        assert_eq!(tools(&registry), ["bash", "edit"]);
+        assert!(!registry.system_prompt().contains("`task`"));
+        let config = configured(&[], None, "[ext]\ndisable = [\"shell\"]\n");
+        let refused = registry_refused(&config);
+        assert!(
+            refused.contains("edit needs dyn ext::service::CwdOf"),
+            "{refused}"
+        );
+    }
+
+    fn registry_refused(config: &Config) -> String {
+        match registry(config) {
+            Ok(_) => panic!("installed"),
+            Err(refused) => refused.0,
+        }
+    }
+
+    /// Each extension's settings are its table's, and the daemon's own
+    /// table holds none of them.
+    #[test]
+    fn extensions_are_configured_by_their_tables() {
+        let config = configured(
+            &["bash"],
+            None,
+            "mode = \"auto\"\n[ext.prompt]\nsystem = \"Be terse.\"\n[ext.loop]\nmax_steps = 3\n",
+        );
+        let registry = registry(&config).unwrap();
+        assert!(registry.system_prompt().starts_with("Be terse."));
+        assert_eq!(gate(&registry, "bash", &mut Decided::new()), Gate::Run);
+        let bad = configured(&[], None, "mode = \"sometimes\"\n");
+        assert_eq!(registry_refused(&bad), "ext.policy.mode: no mode sometimes");
+        let floor = Config {
+            floor: Ok(vec![("bash".into(), None, "allow".into())]),
+            ..config.clone()
+        };
+        assert!(registry_refused(&floor).contains("may only ask or deny"));
     }
 
     #[test]
@@ -321,7 +423,7 @@ mod tests {
         const NAME: &'static str = "fallback";
         const VERSION: u32 = 1;
 
-        fn contribute(&self, r: &mut ext::Registrar) {
+        fn contribute(&self, r: &mut Registrar) {
             r.on::<ext::point::RequestError>(|_, failed| {
                 let mine = failed.error.kind == llm::Kind::RateLimit;
                 ext::Answer::Now(mine.then_some(ext::Recover::Resend))

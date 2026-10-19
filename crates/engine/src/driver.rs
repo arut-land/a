@@ -45,8 +45,6 @@ pub struct Shared {
     /// The extensions, as each session takes them up at its next step.
     pub registry: ext::host::Current,
     pub models: Models,
-    /// The system prompt, in place of the one the extensions make.
-    pub system: Option<String>,
     /// Where sessions keep output too large for their logs.
     pub spill: PathBuf,
     /// Sessions loaded since the daemon started.
@@ -884,9 +882,7 @@ impl Actor {
     /// The request for model call `call`: the system prompt, the
     /// transcript before it, and the tools.
     fn request(&mut self, call: CallId, model: &Model) -> llm::Request {
-        let shared = &self.live.session.shared;
-        let system = shared.system.as_deref();
-        let system = system.unwrap_or_else(|| self.registry.system_prompt());
+        let system = self.registry.system_prompt();
         let frames = &self.live.frames;
         let registry = &self.registry;
         let transcript = self

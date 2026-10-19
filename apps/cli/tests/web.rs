@@ -378,7 +378,7 @@ fn a_chat_moves_to_a_host_of_its_own() {
 #[test]
 fn a_tab_streams_replies_and_answers_asks_until_it_closes() {
     let env = Env::new("web-chat");
-    env.daemon("ask = [\"bash\"]");
+    env.ext("policy", "ask = [\"bash\"]");
     let mut web = Web::start(&env);
     web.sign_in();
     let session = web.new_session();

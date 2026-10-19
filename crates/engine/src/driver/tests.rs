@@ -256,7 +256,7 @@ impl Fixture {
             store,
             registry: ext::host::Current::new(registry),
             models,
-            system: None,
+
             spill: std::env::temp_dir().join(format!("a-spill-{}", std::process::id())),
             loaded: Mutex::default(),
             daemon: Weak::new(),

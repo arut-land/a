@@ -7,8 +7,14 @@ use std::io::Read;
 
 use ext::{Extension, Facts, Registrar, Text};
 
-/// The `prompt` extension.
-pub struct Prompt;
+/// The `prompt` extension: `system`, when set, in place of its line of
+/// identity (`[ext.prompt] system`).
+#[derive(Clone, Debug, Default)]
+pub struct Prompt {
+    pub system: Option<String>,
+}
+
+const IDENTITY: &str = "You are `a`, a coding agent working in the user's workspace through the tools you are given. Do the work rather than describe it, and keep replies short.";
 
 /// The most of `AGENTS.md` the model is given.
 const AGENTS_LIMIT: u64 = 32 * 1024;
@@ -18,8 +24,14 @@ impl Extension for Prompt {
     const VERSION: u32 = 1;
 
     fn contribute(&self, r: &mut Registrar) {
-        r.text(Text::system("identity", 0, "You are `a`, a coding agent working in the user's workspace through the tools you are given. Do the work rather than describe it, and keep replies short."))
-            .text(Text::context("environment", 0, |facts| Some(context(facts))));
+        let identity = match &self.system {
+            Some(system) => Text::system("identity", 0, system.clone()),
+            None => Text::system("identity", 0, IDENTITY),
+        };
+        r.text(identity)
+            .text(Text::context("environment", 0, |facts| {
+                Some(context(facts))
+            }));
     }
 }
 

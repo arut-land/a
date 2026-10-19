@@ -14,8 +14,6 @@
 //! hibernate_secs = 300          # unload a session after this long unused
 //! drain_secs = 60               # how long an upgrade waits for work
 //! agent = "echo"                # every session's agent, over both files
-//! ask = ["bash"]                # tools whose calls wait for approval
-//! system_prompt = "..."         # in place of the extensions' prompt
 //! crash_limit = 3               # young deaths in a row before refusing
 //!
 //! [ext]                         # the extensions, read when the daemon starts
@@ -23,6 +21,13 @@
 //!
 //! [ext.loop]                    # each extension's own table, by its name
 //! max_steps = 20
+//!
+//! [ext.policy]
+//! ask = ["bash", "edit"]        # tools whose calls are asked about
+//! mode = "ask"                  # ask | accept-edits | auto | judge
+//!
+//! [ext.prompt]
+//! system = "..."                # in place of the prompt's identity line
 //! ```
 //!
 //! The file is edited in place: writing changes only the schema's keys, so
@@ -138,9 +143,41 @@ pub struct Daemon {
     /// `chat` or `echo` (which needs no model, and offers the test
     /// fixtures).
     pub agent: Option<String>,
-    pub ask: Vec<String>,
-    pub system_prompt: Option<String>,
     pub crash_limit: Option<u64>,
+}
+
+/// The rules of a `policy.toml`, as `(tool, input, effect)`: each table of
+/// its `rule` array names a `tool` (`*` for any), the `input` text a call
+/// must hold if any, and its `effect`.
+///
+/// ```toml
+/// [[rule]]
+/// tool = "bash"
+/// input = "rm -rf /"
+/// effect = "deny"
+/// ```
+pub fn rules(text: &str) -> Result<Vec<(String, Option<String>, String)>, ParseError> {
+    let doc: DocumentMut = text.parse()?;
+    let Some(rules) = doc.get("rule") else {
+        return Ok(Vec::new());
+    };
+    let rules = rules
+        .as_array_of_tables()
+        .ok_or_else(|| ParseError("rule must be an array of tables".into()))?;
+    rules
+        .iter()
+        .map(|rule| {
+            let need = |key| {
+                string(rule, key, "rule.")?
+                    .ok_or_else(|| ParseError(format!("a rule needs its {key}")))
+            };
+            Ok((
+                need("tool")?,
+                string(rule, "input", "rule.")?,
+                need("effect")?,
+            ))
+        })
+        .collect()
 }
 
 impl Config {
@@ -260,23 +297,11 @@ impl FromStr for Config {
                         .ok_or_else(|| ParseError(format!("daemon.{key} must be a whole number")))
                 })
             };
-            let ask = t.get("ask").map_or(Ok(Vec::new()), |item| {
-                item.as_array()
-                    .and_then(|tools| {
-                        tools
-                            .iter()
-                            .map(|t| t.as_str().map(str::to_owned))
-                            .collect()
-                    })
-                    .ok_or_else(|| ParseError("daemon.ask must be a list of tool names".into()))
-            })?;
             config.daemon = Daemon {
                 idle_secs: whole("idle_secs")?,
                 hibernate_secs: whole("hibernate_secs")?,
                 drain_secs: whole("drain_secs")?,
                 agent: string(t, "agent", "daemon.")?,
-                ask,
-                system_prompt: string(t, "system_prompt", "daemon.")?,
                 crash_limit: whole("crash_limit")?,
             };
         }
@@ -439,20 +464,15 @@ model = "not this one"
 
     #[test]
     fn reads_the_daemon_table() {
-        let text = "[daemon]\nidle_secs = 15\nagent = \"echo\"\nask = [\"bash\", \"edit\"]\n";
+        let text = "[daemon]\nidle_secs = 15\nagent = \"echo\"\n";
         let daemon = text.parse::<Config>().unwrap().daemon;
         assert_eq!(daemon.idle_secs, Some(15));
         assert_eq!(daemon.hibernate_secs, None);
         assert_eq!(daemon.agent.as_deref(), Some("echo"));
-        assert_eq!(daemon.ask, ["bash", "edit"]);
         for (bad, why) in [
             (
                 "[daemon]\nidle_secs = -1\n",
                 "daemon.idle_secs must be a whole number",
-            ),
-            (
-                "[daemon]\nask = \"bash\"\n",
-                "daemon.ask must be a list of tool names",
             ),
             ("daemon = 1\n", "daemon must be a table"),
         ] {
@@ -490,6 +510,22 @@ model = "not this one"
         ] {
             assert_eq!(bad.parse::<Config>().unwrap_err().to_string(), why);
         }
+    }
+
+    #[test]
+    fn reads_the_floors_rules() {
+        let text = "[[rule]]\ntool = \"bash\"\ninput = \"rm -rf\"\neffect = \"deny\"\n\n[[rule]]\ntool = \"*\"\neffect = \"ask\"\n";
+        let read = rules(text).unwrap();
+        assert_eq!(
+            read,
+            [
+                ("bash".into(), Some("rm -rf".into()), "deny".into()),
+                ("*".into(), None, "ask".into())
+            ]
+        );
+        assert_eq!(rules("").unwrap(), []);
+        let bad = rules("[[rule]]\ntool = \"x\"\n").unwrap_err();
+        assert_eq!(bad.to_string(), "a rule needs its effect");
     }
 
     #[test]
