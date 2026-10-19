@@ -89,7 +89,7 @@ jobs:
       - *mise
       - run: mise run machete
 
-  # No core crate depends on tokio; only the web UI does, through topcoat.
+  # Nothing `a` builds depends on tokio.
   no-tokio:
     runs-on: ubuntu-latest
     steps:

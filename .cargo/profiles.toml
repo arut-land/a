@@ -84,55 +84,6 @@ opt-level = "s"
 [profile.release.package.llm]
 opt-level = "s"
 
-# The web UI renders at the pace of one person's clicks, and its views
-# monomorphize into a lot of code: z saves ~480 KiB over 3.
-[profile.release.package.web]
-opt-level = "z"
-
-[profile.release.package.topcoat-view]
-opt-level = "z"
-
-[profile.release.package.topcoat-router]
-opt-level = "z"
-
-[profile.release.package.topcoat-runtime]
-opt-level = "z"
-
-[profile.release.package.topcoat-core]
-opt-level = "z"
-
-# What only topcoat links (its sync primitives, and the websocket stack its
-# router brings and no request reaches): z saves 16 KiB over 3.
-[profile.release.package.topcoat-asset]
-opt-level = "z"
-
-[profile.release.package.tokio]
-opt-level = "z"
-
-[profile.release.package.tokio-tungstenite]
-opt-level = "z"
-
-[profile.release.package.tungstenite]
-opt-level = "z"
-
-[profile.release.package.hyper]
-opt-level = "z"
-
-[profile.release.package.hyper-util]
-opt-level = "z"
-
-[profile.release.package.h2]
-opt-level = "z"
-
-[profile.release.package.futures-util]
-opt-level = "z"
-
-[profile.release.package.matchit]
-opt-level = "z"
-
-[profile.release.package.http-body-util]
-opt-level = "z"
-
 # The terminal client redraws once per streamed token, but only the rows a
 # token changed: a 6000-item session's delta frame is ~45 µs at s and at 3
 # alike (docs/tui.md).
