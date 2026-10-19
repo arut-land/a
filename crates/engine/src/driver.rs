@@ -427,8 +427,7 @@ impl Actor {
         if !Arc::ptr_eq(&newest, &self.registry) {
             self.registry = Arc::clone(&newest);
             let bound = Bound::bind(&newest, &self.live.session);
-            let fx = self.core.step(Event::Registry(bound));
-            self.carry(fx).await;
+            self.step(Event::Registry(bound)).await;
         }
         let event = match msg {
             Msg::Request {
@@ -469,8 +468,7 @@ impl Actor {
                 Event::Environment(logged)
             }
             Msg::Note { call, note, done } => {
-                let fx = self.core.step(Event::Note { call, note });
-                self.carry(fx).await;
+                self.step(Event::Note { call, note }).await;
                 if let Some(done) = done {
                     done.send(());
                 }
@@ -512,8 +510,21 @@ impl Actor {
             self.reporting -= 1;
             self.cancels.remove(call);
         }
-        let fx = self.core.step(event);
-        self.carry(fx).await;
+        self.step(event).await;
+    }
+
+    /// Steps the kernel and carries out what follows. A step that panics
+    /// is a bug the session survives: what the step did is dropped, as a
+    /// commit that failed drops it, and the session resumes from its log.
+    async fn step(&mut self, event: Event) {
+        match catch_unwind(AssertUnwindSafe(|| self.core.step(event))) {
+            Ok(fx) => self.carry(fx).await,
+            Err(panic) => {
+                let why = panicked(&*panic);
+                eprintln!("session {}: the kernel {why}", self.live.id.short());
+                Box::pin(self.resume()).await;
+            }
+        }
     }
 
     /// Carries out `fx` in order, committing each run of appends before
@@ -547,12 +558,15 @@ impl Actor {
         }
     }
 
-    /// After a failed commit: what runs is cancelled and the kernel is
-    /// rebuilt from the committed log, as a load rebuilds it.
+    /// After a failed commit or a step that panicked: what runs is
+    /// cancelled, what was asked is answered that the session stopped, and
+    /// the kernel is rebuilt from the committed log, as a load rebuilds it.
     async fn resume(&mut self) {
         for cancel in self.cancels.values() {
             cancel.cancel();
         }
+        self.replies.clear();
+        self.waiting.clear();
         let bound = Bound::bind(&self.registry, &self.live.session);
         let load = Load {
             boot: sys::boot_id(),
@@ -560,13 +574,20 @@ impl Actor {
             owner: self.owner(),
             ..Load::default()
         };
-        let (core, fx) = Core::resume(
-            bound,
-            &self.live.frames.entries().collect::<Vec<_>>(),
-            &load,
-        );
-        self.core = core;
-        self.carry(fx).await;
+        let log: Vec<Entry> = self.live.frames.entries().collect();
+        match catch_unwind(AssertUnwindSafe(|| Core::resume(bound, &log, &load))) {
+            Ok((core, fx)) => {
+                self.core = core;
+                self.carry(fx).await;
+            }
+            // Its log is what it is: the session stops, and loads again
+            // when next wanted.
+            Err(panic) => {
+                let why = panicked(&*panic);
+                eprintln!("session {}: resuming {why}", self.live.id.short());
+                self.stopping = true;
+            }
+        }
     }
 
     fn owner(&self) -> Owner {
@@ -1127,26 +1148,48 @@ impl kernel::Registry for Bound {
     fn context(&self) -> Option<String> {
         let dir = self.session.dir(&self.registry);
         let workspace = &self.session.workspace;
-        self.registry.context(&Facts {
+        let facts = Facts {
             workspace,
             dir: &dir,
-        })
+        };
+        guarded(|| self.registry.context(&facts), |_| None)
     }
 
     fn card(&self, tool: &str, input: &Json) -> Option<Card> {
-        self.registry.tools().get(tool)?.present(&input.value())
+        let tool = self.registry.tools().get(tool)?;
+        guarded(|| tool.present(&input.value()), |_| None)
     }
 
     fn result_card(&self, tool: &str, input: &Json, output: &Json) -> Option<Card> {
-        (self.registry.tools().get(tool)?).present_result(&input.value(), output)
+        let tool = self.registry.tools().get(tool)?;
+        guarded(|| tool.present_result(&input.value(), output), |_| None)
     }
 
+    /// A transform fails open: the text goes on as it was.
     fn input(&self, text: String) -> Result<Chained<String>, String> {
-        self.registry.hooks().input(&self.point(), text)
+        let original = text.clone();
+        guarded(
+            || self.registry.hooks().input(&self.point(), text),
+            |_| Ok(Chained::new(original)),
+        )
     }
 
+    /// #43 `a_failing_gate_fails_closed`: a gate that cannot decide denies
+    /// the call, and says why.
     fn gate(&self, _: CallId, tool: &str, input: &Json) -> Answer<Gated> {
-        Answer::Now(self.registry.hooks().gate(&self.point(), tool, input))
+        Answer::Now(guarded(
+            || self.registry.hooks().gate(&self.point(), tool, input),
+            |why| Gated {
+                input: input.clone(),
+                decisions: vec![(
+                    Name::from("gate"),
+                    Verdict::Block {
+                        reason: why.clone(),
+                    },
+                )],
+                gate: ext::Gate::Refuse(format!("the gate {why}")),
+            },
+        ))
     }
 
     fn request_error(
@@ -1156,18 +1199,44 @@ impl kernel::Registry for Bound {
         error: &llm::Error,
     ) -> Option<(Name, Recover)> {
         let failed = Failed { error, attempt };
-        self.registry.hooks().request_error(&self.point(), failed)
+        guarded(
+            || self.registry.hooks().request_error(&self.point(), failed),
+            |_| None,
+        )
     }
 
+    /// A transform fails open: the outcome goes on as it was.
     fn post_tool(&self, _: CallId, tool: &str, input: &Json, outcome: Outcome) -> Chained<Outcome> {
-        let input = input.value();
-        (self.registry.hooks()).post_tool(&self.point(), (tool, &input), outcome)
+        let (input, original) = (input.value(), outcome.clone());
+        guarded(
+            || (self.registry.hooks()).post_tool(&self.point(), (tool, &input), outcome),
+            |_| Chained::new(original),
+        )
     }
 
     fn on_stop(&self, pending: &[&Entry]) -> Option<(Name, String)> {
         let history = Committed(&self.session, pending);
-        self.registry.hooks().on_stop(&self.point(), &history)
+        guarded(
+            || self.registry.hooks().on_stop(&self.point(), &history),
+            |_| None,
+        )
     }
+}
+
+/// What `point` answers, or what `failed` makes of the panic of a handler
+/// in it: an extension's failure is never the session's.
+fn guarded<T>(point: impl FnOnce() -> T, failed: impl FnOnce(String) -> T) -> T {
+    catch_unwind(AssertUnwindSafe(point)).unwrap_or_else(|panic| failed(panicked(&*panic)))
+}
+
+/// What a panic says.
+fn panicked(panic: &(dyn Any + Send)) -> String {
+    let message = panic
+        .downcast_ref::<String>()
+        .map(String::as_str)
+        .or_else(|| panic.downcast_ref::<&str>().copied())
+        .unwrap_or("unknown panic");
+    format!("panicked: {message}")
 }
 
 /// A session's log as committed, read back from the store when a handler
@@ -1394,14 +1463,8 @@ async fn unless<T>(cancel: &Cancel, work: impl Future<Output = T>) -> Option<T> 
 async fn contain<T: Failure>(effect: impl Future<Output = T>) -> T {
     let mut effect = pin!(effect);
     poll_fn(|cx| {
-        catch_unwind(AssertUnwindSafe(|| effect.as_mut().poll(cx))).unwrap_or_else(|panic| {
-            let message = panic
-                .downcast_ref::<String>()
-                .map(String::as_str)
-                .or_else(|| panic.downcast_ref::<&str>().copied())
-                .unwrap_or("unknown panic");
-            Poll::Ready(T::failed(format!("panicked: {message}")))
-        })
+        catch_unwind(AssertUnwindSafe(|| effect.as_mut().poll(cx)))
+            .unwrap_or_else(|panic| Poll::Ready(T::failed(panicked(&*panic))))
     })
     .await
 }

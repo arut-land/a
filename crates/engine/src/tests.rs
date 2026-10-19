@@ -874,3 +874,62 @@ fn a_session_is_found_by_any_unambiguous_prefix_of_its_id() {
     settle(&daemon);
     std::fs::remove_dir_all(&root).unwrap();
 }
+
+/// #1: a session is hibernated and loaded again over and over while
+/// input arrives: its seqs run on unbroken, and each load writes under a
+/// newer lease than the last, never two at once.
+#[test]
+fn one_writer_per_session() {
+    let (root, home) = home("one-writer");
+    let daemon = Daemon::load(&home, &echo()).unwrap();
+    let mut target = Target::New;
+    for n in 0..20 {
+        let attachment = daemon.attach_to(&target, || "/w".into()).unwrap();
+        target = Target::Id(attachment.session().id);
+        attachment.session().submit(&format!("turn {n}")).unwrap();
+        drop(attachment);
+        // Unloaded as soon as it is idle, maybe while it still answers.
+        daemon.hibernate(Duration::ZERO);
+    }
+    settle(&daemon);
+    let Target::Id(id) = target else {
+        unreachable!()
+    };
+    let entries = daemon.shared.store.entries(id).unwrap();
+    std::fs::remove_dir_all(&root).unwrap();
+
+    let seqs: Vec<u64> = entries.iter().map(|e| e.seq).collect();
+    assert_eq!(seqs, (1..=40).collect::<Vec<_>>());
+    assert!(
+        entries.windows(2).all(|w| w[0].epoch <= w[1].epoch),
+        "{entries:#?}"
+    );
+    let inputs = entries
+        .iter()
+        .filter(|e| matches!(e.body, Body::Input { .. }));
+    assert_eq!(inputs.count(), 20);
+}
+
+/// #16: once hibernated, nothing of a loaded session is held: its frames,
+/// transcript and actor go with it.
+#[test]
+fn hibernating_frees_the_session() {
+    let (root, home) = home("frees");
+    let daemon = Daemon::load(&home, &echo()).unwrap();
+    let attachment = daemon.attach_to(&Target::New, || "/w".into()).unwrap();
+    attachment.session().submit("hi").unwrap();
+    settle(&daemon);
+    let live = std::sync::Arc::downgrade(attachment.session());
+    let ended = attachment.session().ended();
+    drop(attachment);
+    daemon.hibernate(Duration::ZERO);
+    rt::block_on(ended.over());
+    // What lists it lets the stopped session go.
+    let listed = daemon.list().remove(0);
+    let freed = live.upgrade().is_none();
+    drop(daemon);
+    std::fs::remove_dir_all(&root).unwrap();
+
+    assert_eq!(listed.residency, Residency::Hibernated);
+    assert!(freed, "a hibernated session is still held");
+}

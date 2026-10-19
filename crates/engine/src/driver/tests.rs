@@ -402,7 +402,9 @@ impl LogStore for Probe {
     }
 
     fn load(&self, id: SessionId, each: &mut dyn FnMut(Entry)) -> io::Result<Loaded> {
-        self.store.load(id, each)
+        let mut loaded = self.store.load(id, each)?;
+        loaded.writer.log = Box::new(Probed(loaded.writer.log, self.clone()));
+        Ok(loaded)
     }
 
     fn entries(&self, id: SessionId) -> io::Result<Vec<Entry>> {
@@ -1785,4 +1787,198 @@ fn input_taken_in_during_recovery_runs_once() {
             .collect();
         assert_eq!(said, ["one", "left", "two"], "{log:#?}");
     }
+}
+
+/// #13: two clients answer one ask at once: the first answer wins, the
+/// other is told the call waits no more, and one answer is logged.
+#[test]
+fn the_first_answer_wins() {
+    let fixture = asking();
+    let session = fixture.start(&[]);
+    session.submit("$ echo once").unwrap();
+    settle(&session);
+    let answers: Vec<_> = [true, false]
+        .map(|approved| {
+            let session = Arc::clone(&session);
+            thread::spawn(move || session.answer(2, approved))
+        })
+        .into_iter()
+        .map(|t| t.join().unwrap())
+        .collect();
+    let log = finished(&session, 2);
+    session.halt();
+    assert_eq!(
+        answers.iter().filter(|a| a.is_ok()).count(),
+        1,
+        "{answers:?}"
+    );
+    let logged = log
+        .iter()
+        .filter(|e| matches!(e.body, Body::Answer { .. }))
+        .count();
+    assert_eq!(logged, 1, "{log:#?}");
+}
+
+/// Denies `bash` by panicking.
+struct Broken;
+
+impl Extension for Broken {
+    const NAME: &'static str = "policy";
+    const VERSION: u32 = 1;
+
+    fn contribute(&self, r: &mut Registrar) {
+        r.on::<point::Permission>(|_, call| {
+            assert!(
+                call.tool != ext_shell::Bash::NAME,
+                "no policy for {}",
+                call.tool
+            );
+            Permission::Allow
+        });
+    }
+}
+
+/// #43: a gate whose handler panics denies the call, logged with why;
+/// the session goes on.
+#[test]
+#[cfg_attr(
+    debug_assertions,
+    ignore = "dev builds' cranelift backend cannot unwind through these frames: \
+              CARGO_PROFILE_DEV_CODEGEN_BACKEND=llvm cargo nextest run -p engine --run-ignored all"
+)]
+fn a_failing_gate_fails_closed() {
+    let fixture = Fixture::new(
+        ext_fixtures::ECHO,
+        echoing(&Policy::default())
+            .with_in(ext::Tier::Guarded, &Broken)
+            .unwrap(),
+        openai(&Script::new(&[])),
+    );
+    let session = fixture.start(&[]);
+    session.submit("$ echo ran").unwrap();
+    let log = finished(&session, 2);
+    session.submit("still here").unwrap();
+    settle(&session);
+    let after = log_of(&session);
+    session.halt();
+    assert!(
+        matches!(&log[2].body, Body::Decision { d: Verdict::Block { reason }, .. } if reason.contains("panicked")),
+        "{log:#?}"
+    );
+    assert!(
+        matches!(&log[3].body, Body::ToolResult { outcome: Outcome::Failed { error }, .. } if error.contains("no policy for bash")),
+        "{log:#?}"
+    );
+    assert!(
+        !log.iter()
+            .any(|e| matches!(e.body, Body::ToolProcess { .. }))
+    );
+    assert_eq!(after.last().map(|e| &e.body), Some(&echo("still here")));
+}
+
+/// Panics on `boom`, the first time it is given it.
+struct Panicky;
+
+static BOOMED: AtomicBool = AtomicBool::new(false);
+
+impl ext::Agent for Panicky {
+    fn step(&mut self, input: ext::Input) -> ext::Actions {
+        match input {
+            ext::Input::User { text } => {
+                let first = text == "boom" && !BOOMED.swap(true, Ordering::SeqCst);
+                assert!(!first, "boom");
+                ext::Actions::from_elem(ext::Action::Say(text), 1)
+            }
+            _ => ext::Actions::new(),
+        }
+    }
+}
+
+struct Panics;
+
+impl Extension for Panics {
+    const NAME: &'static str = "panics";
+    const VERSION: u32 = 1;
+
+    fn contribute(&self, r: &mut Registrar) {
+        r.agent("panicky", || Box::new(Panicky));
+    }
+}
+
+/// #63: a step that panics is a bug the session survives: what it did is
+/// dropped, the asker told, and the session resumes from its log.
+#[test]
+#[cfg_attr(
+    debug_assertions,
+    ignore = "dev builds' cranelift backend cannot unwind through these frames: \
+              CARGO_PROFILE_DEV_CODEGEN_BACKEND=llvm cargo nextest run -p engine --run-ignored all"
+)]
+fn a_kernel_panic_is_a_resume() {
+    let registry = Registry::default().with(&Panics).unwrap();
+    let fixture = Fixture::new("panicky", registry, openai(&Script::new(&[])));
+    let session = fixture.start(&[]);
+    session.submit("hi").unwrap();
+    settle(&session);
+    let boom = session.submit("boom");
+    session.submit("again").unwrap();
+    settle(&session);
+    let log = log_of(&session);
+    session.halt();
+    assert!(boom.is_err(), "{boom:?}");
+    assert_eq!(
+        facts(&log),
+        [
+            (1, &user("hi")),
+            (2, &echo("hi")),
+            (3, &user("again")),
+            (4, &echo("again"))
+        ]
+    );
+}
+
+/// #57: the entries of one step are committed together: one write and
+/// one fsync, however many.
+#[test]
+fn one_fsync_per_step() {
+    let probe = Probe::default();
+    let fixture = Fixture::on(
+        Arc::new(probe.clone()),
+        ext_fixtures::ECHO,
+        echoing(&Policy::default()),
+        openai(&Script::new(&[])),
+    );
+    let older = Body::Extensions {
+        installed: vec![Installed {
+            name: "shell".into(),
+            version: 0,
+        }],
+    };
+    let bash = Body::ToolCall {
+        tool: "bash".into(),
+        input: json!({ "command": "make" }).into(),
+        id: None,
+        card: None,
+        by: Audience::Model,
+    };
+    let entries = [entry(1, older), entry(2, user("$ make")), entry(3, bash)];
+    let header = fixture.header();
+    let mut created = probe.store.create(&header).unwrap();
+    for e in &entries {
+        let e = Entry::new(e.seq, created.writer.epoch(), e.body.clone());
+        created.writer.log.append_all(&[e]).unwrap();
+    }
+    drop(created);
+    let session = Live::start(&header, &fixture.0, Open::Load, Owner::None).unwrap();
+    settle(&session);
+    let log = log_of(&session);
+    session.halt();
+    // The recovered step: the extensions noted, the call cut off answered.
+    assert!(
+        matches!(
+            &bodies(&log)[3..],
+            [Body::Extensions { .. }, Body::ToolResult { call: 3, .. }]
+        ),
+        "{log:#?}"
+    );
+    assert_eq!(*lock(&probe.batches), [2]);
 }
