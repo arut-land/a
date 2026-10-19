@@ -66,6 +66,9 @@ opt-level = "s"
 [profile.release.package.ext-prompt]
 opt-level = "s"
 
+[profile.release.package.ext-retry]
+opt-level = "s"
+
 [profile.release.package.ext-shell]
 opt-level = "s"
 
