@@ -225,6 +225,25 @@ fn long_chat(deltas: usize) -> Vec<u8> {
     body.into()
 }
 
+/// A chat completions stream of one tool call in `fragments` argument
+/// fragments that name neither the call's index nor its id, as some
+/// compatible servers stream them: each is judged against the arguments
+/// so far.
+fn long_chat_call(fragments: usize) -> Vec<u8> {
+    let mut body = String::from(
+        "data: {\"id\":\"c1\",\"model\":\"m\",\"choices\":[{\"index\":0,\"delta\":{\"tool_calls\":[{\"id\":\"call_1\",\"type\":\"function\",\"function\":{\"name\":\"write\",\"arguments\":\"{\\\"content\\\":\\\"\"}}]}}]}\n\n",
+    );
+    for n in 0..fragments {
+        let _ = write!(
+            body,
+            "data: {{\"id\":\"c1\",\"model\":\"m\",\"choices\":[{{\"index\":0,\"delta\":{{\"tool_calls\":[{{\"function\":{{\"arguments\":\"line {n} of the file \"}}}}]}}}}]}}\n\n"
+        );
+    }
+    body.push_str("data: {\"id\":\"c1\",\"model\":\"m\",\"choices\":[{\"index\":0,\"delta\":{\"tool_calls\":[{\"function\":{\"arguments\":\"\\\"}\"}}]}}]}\n\n");
+    body.push_str("data: {\"id\":\"c1\",\"model\":\"m\",\"choices\":[{\"index\":0,\"delta\":{},\"finish_reason\":\"tool_calls\"}],\"usage\":{\"prompt_tokens\":10,\"completion_tokens\":20}}\n\ndata: [DONE]\n\n");
+    body.into()
+}
+
 /// A messages stream of `deltas` thinking deltas and as many text deltas.
 fn long_messages(deltas: usize) -> Vec<u8> {
     let mut body = String::from(
@@ -290,6 +309,14 @@ fn decode_long_streams() {
         let reply =
             rt::block_on(llm::generate(&messages_body, &messages, &request)).expect("reply");
         assert_eq!(reply.message.content.len(), 2);
+    });
+    let call_body = Recorded {
+        status: 200,
+        body: long_chat_call(4_000),
+    };
+    measure("chat call in 4k unindexed fragments", 5, || {
+        let reply = rt::block_on(llm::generate(&call_body, &chat, &request)).expect("reply");
+        assert_eq!(reply.message.tool_calls().count(), 1);
     });
 }
 

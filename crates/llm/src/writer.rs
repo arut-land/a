@@ -242,7 +242,7 @@ impl Arguments {
 
     /// Whether the text is a complete JSON object.
     fn complete(&self) -> bool {
-        !self.overflowed && matches!(serde_json::from_str(&self.text), Ok(Value::Object(_)))
+        !self.overflowed && crate::json::is_object(&self.text)
     }
 }
 

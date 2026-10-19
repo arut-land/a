@@ -166,7 +166,17 @@ pub fn arguments(text: &str) -> (Map<String, Value>, Option<String>) {
 
 /// Whether `text` is a whole JSON object; nothing at all is one.
 pub(crate) fn whole_object(text: &str) -> bool {
-    text.trim().is_empty() || matches!(serde_json::from_str(text), Ok(Value::Object(_)))
+    text.trim().is_empty() || is_object(text)
+}
+
+/// Whether `text` is one JSON object. Text that braces do not bracket is
+/// none, so arguments judged at each fragment of a call are parsed only
+/// when they may be whole, and the parse builds nothing.
+pub(crate) fn is_object(text: &str) -> bool {
+    let json = text.trim_matches([' ', '\t', '\n', '\r']);
+    json.starts_with('{')
+        && json.ends_with('}')
+        && serde_json::from_str::<serde::de::IgnoredAny>(text).is_ok()
 }
 
 pub fn parse_partial_object(text: &str) -> Option<Map<String, Value>> {
