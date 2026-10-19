@@ -247,15 +247,11 @@ pub fn write_private(path: &Path, bytes: &[u8]) -> io::Result<()> {
     let name = path.file_name().unwrap_or_default().to_string_lossy();
     let tmp = dir.join(format!(".{name}.{}", std::process::id()));
     let _ = fs::remove_file(&tmp);
-    let mut options = fs::OpenOptions::new();
-    options.write(true).create_new(true);
-    #[cfg(unix)]
-    std::os::unix::fs::OpenOptionsExt::mode(&mut options, 0o600);
-    let mut file = options.open(&tmp)?;
+    let mut file = crate::fs::private_file().open(&tmp)?;
     let written = file
         .write_all(bytes)
         .and_then(|()| file.sync_all())
-        .and_then(|()| fs::rename(&tmp, path));
+        .and_then(|()| crate::fs::replace(&tmp, path));
     if written.is_err() {
         let _ = fs::remove_file(&tmp);
     }

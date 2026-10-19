@@ -7,13 +7,14 @@
 
 mod command;
 mod drive;
-#[cfg(unix)]
+mod inbox;
 mod remote;
 mod session;
 mod watch;
 
 pub use command::{COMMANDS, Cmd, Command, help, parse};
 pub use drive::Driver;
+pub use inbox::{Inbox, Post, inbox};
 pub use session::{Attach, Effect, End, Env, Event, Link, SessionClient, TurnView};
 pub use watch::SessionWatch;
 
@@ -25,16 +26,11 @@ use std::time::{Duration, Instant};
 
 use protocol::view::SessionList;
 use protocol::{
-    Cap, Caps, ClientDecl, ClientMsg, CommandInfo, DaemonMsg, Environment, HomeSettings,
-    SessionSummary, SettingsChange, Target, read_frame, write_frame,
+    Cap, Caps, ClientDecl, ClientMsg, CommandInfo, DaemonMsg, Environment, HomeSettings, PROTO,
+    SessionSummary, SettingsChange, Target, Versions, read_frame, write_frame,
 };
 use sys::crash::{Crashes, Record};
-use sys::{Home, Signal, Staged};
-
-#[cfg(unix)]
-use protocol::{PROTO, Versions};
-#[cfg(unix)]
-use std::os::unix::net::UnixStream;
+use sys::{Home, Signal, Staged, Stream};
 
 /// The read half of a connection, over any byte stream.
 pub struct Reader(BufReader<Box<dyn Read + Send>>);
@@ -216,7 +212,6 @@ impl Reader {
     }
 
     /// Waits for a draining daemon to close the connection as it exits.
-    #[cfg(unix)]
     fn drained(&mut self) -> io::Result<()> {
         loop {
             match self.recv() {
@@ -231,7 +226,6 @@ impl Reader {
 }
 
 impl Writer {
-    #[cfg(unix)]
     pub(crate) fn new(out: Box<dyn Write + Send>) -> Self {
         Self { out, seq: 0 }
     }
@@ -272,11 +266,9 @@ pub const HELLO_TIMEOUT: Duration = Duration::from_secs(2);
 /// [`HELLO_TIMEOUT`] for a daemon this client just started: the first run
 /// of a newly staged build is scanned by macOS first, which takes half a
 /// second on an idle machine and seconds on a busy one.
-#[cfg(unix)]
 const START_TIMEOUT: Duration = Duration::from_secs(30);
 
 /// How long to wait for a draining daemon: its grace plus a margin.
-#[cfg(unix)]
 const DRAIN_TIMEOUT: Duration = Duration::from_secs(75);
 
 /// Connects as build `staged` and completes the hello. A daemon draining for
@@ -295,7 +287,6 @@ pub fn connect(
 /// attach, say) right behind the hello rather than after the welcome, which
 /// saves a round trip. A daemon that does not welcome the client acts on
 /// none of them, so each retry sends them again.
-#[cfg(unix)]
 pub fn connect_with(
     endpoint: &Endpoint,
     staged: &Staged,
@@ -313,7 +304,7 @@ pub fn connect_with(
                 } else {
                     HELLO_TIMEOUT
                 };
-                read_timeout(&stream, Some(timeout))?;
+                stream.set_read_timeout(Some(timeout))?;
                 let conn = split(&stream)?;
                 (Some(stream), conn)
             }
@@ -326,14 +317,14 @@ pub fn connect_with(
             }
             Ok(Greeting::Welcome) => {
                 if let Some(stream) = &stream {
-                    read_timeout(stream, None)?;
+                    stream.set_read_timeout(None)?;
                 }
                 return Ok(conn);
             }
             Ok(Greeting::Draining) => {
                 on_drain();
                 if let Some(stream) = &stream {
-                    read_timeout(stream, Some(DRAIN_TIMEOUT))?;
+                    stream.set_read_timeout(Some(DRAIN_TIMEOUT))?;
                 }
                 conn.reader.drained()?;
             }
@@ -344,39 +335,7 @@ pub fn connect_with(
     Err(io::Error::other("the daemon kept closing the connection"))
 }
 
-/// The daemon and its transports are Unix only until the named pipe
-/// transport lands.
-#[cfg(not(unix))]
-pub fn connect_with(
-    _endpoint: &Endpoint,
-    _staged: &Staged,
-    _on_drain: &dyn Fn(),
-    _first: &dyn Fn(&Connection) -> io::Result<Vec<ClientMsg>>,
-) -> io::Result<Connection> {
-    Err(unsupported())
-}
-
-#[cfg(not(unix))]
-fn unsupported() -> io::Error {
-    io::Error::new(
-        io::ErrorKind::Unsupported,
-        "a's daemon does not run on this platform yet",
-    )
-}
-
-/// Sets how long reads on `stream` wait. macOS refuses (`EINVAL`) once the
-/// daemon has hung up, as a draining one does when it exits; the next read
-/// says so.
-#[cfg(unix)]
-fn read_timeout(stream: &UnixStream, timeout: Option<Duration>) -> io::Result<()> {
-    match stream.set_read_timeout(timeout) {
-        Err(e) if e.kind() == io::ErrorKind::InvalidInput => Ok(()),
-        done => done,
-    }
-}
-
-#[cfg(unix)]
-fn split(stream: &UnixStream) -> io::Result<Connection> {
+fn split(stream: &Stream) -> io::Result<Connection> {
     Ok(Connection {
         reader: Reader(BufReader::new(Box::new(stream.try_clone()?))),
         writer: Writer::new(Box::new(stream.try_clone()?)),
@@ -386,7 +345,6 @@ fn split(stream: &UnixStream) -> io::Result<Connection> {
     })
 }
 
-#[cfg(unix)]
 enum Greeting {
     Welcome,
     Draining,
@@ -398,7 +356,6 @@ enum Greeting {
 /// the fix. Staging never downgrades, so when a newer build is `current`,
 /// restarting the daemon would only start that build again: this `a` is
 /// the one to replace.
-#[cfg(unix)]
 fn mismatch(endpoint: &Endpoint, staged: &Staged, supported: Versions) -> io::Error {
     let ours = &staged.id;
     let mine = Versions::OURS;
@@ -419,7 +376,6 @@ fn mismatch(endpoint: &Endpoint, staged: &Staged, supported: Versions) -> io::Er
 }
 
 /// Sends the hello and `first` back to back, then reads the answer.
-#[cfg(unix)]
 fn hello(conn: &mut Connection, build: &str, first: &[ClientMsg]) -> io::Result<Greeting> {
     conn.writer.send(&ClientMsg::Hello {
         proto: PROTO,
@@ -539,7 +495,6 @@ pub fn stop(home: &Home) -> io::Result<bool> {
     let Some(daemon) = live_daemon(home) else {
         return Ok(false);
     };
-    #[cfg(unix)]
     if ask_to_stop(home, &daemon.build).is_ok() && exited(home, Some(HELLO_TIMEOUT)) {
         return Ok(true);
     }
@@ -557,8 +512,7 @@ pub fn stop(home: &Home) -> io::Result<bool> {
         signal(Signal::Kill)?;
         exited(home, None);
     }
-    #[cfg(unix)]
-    let _ = fs::remove_file(home.socket());
+    home.endpoint().remove();
     // Stopped on purpose: the record it left is not a crash.
     if let Ok(file) = File::options().write(true).open(home.daemon_pid_file())
         && file.try_lock().is_ok()
@@ -574,23 +528,23 @@ fn exited(home: &Home, within: Option<Duration>) -> bool {
     let Ok(file) = File::open(home.daemon_pid_file()) else {
         return true;
     };
-    let (tx, rx) = std::sync::mpsc::channel();
+    let (tx, rx) = inbox();
     thread::spawn(move || {
         // Taken only to learn that it is free.
         let _ = tx.send(file.lock().is_ok());
     });
     match within {
-        Some(within) => rx.recv_timeout(within).unwrap_or(false),
-        None => rx.recv().unwrap_or(false),
+        Some(within) => rx.recv_timeout(within),
+        None => rx.recv(),
     }
+    .unwrap_or(false)
 }
 
 /// Connects to the running daemon, as its own build `build` so as not to
 /// set off a drain, without starting one.
-#[cfg(unix)]
-fn reach(home: &Home, build: &str) -> io::Result<(UnixStream, Connection)> {
-    let stream = UnixStream::connect(home.socket())?;
-    read_timeout(&stream, Some(HELLO_TIMEOUT))?;
+fn reach(home: &Home, build: &str) -> io::Result<(Stream, Connection)> {
+    let stream = home.endpoint().connect()?;
+    stream.set_read_timeout(Some(HELLO_TIMEOUT))?;
     let mut conn = split(&stream)?;
     match hello(&mut conn, build, &[])? {
         Greeting::Welcome if conn.welcome.caps.has(Cap::Daemon) => Ok((stream, conn)),
@@ -603,17 +557,15 @@ fn reach(home: &Home, build: &str) -> io::Result<(UnixStream, Connection)> {
 
 /// Asks the daemon to stop, and waits for it to close the connection as
 /// it exits.
-#[cfg(unix)]
 fn ask_to_stop(home: &Home, build: &str) -> io::Result<()> {
     let (stream, mut conn) = reach(home, build)?;
     conn.writer.send(&ClientMsg::Shutdown)?;
-    read_timeout(&stream, Some(DRAIN_TIMEOUT))?;
+    stream.set_read_timeout(Some(DRAIN_TIMEOUT))?;
     conn.reader.drained()
 }
 
 /// What the running daemon says of itself, if one runs and answers; never
 /// starts one.
-#[cfg(unix)]
 pub fn status(home: &Home) -> io::Result<Option<Status>> {
     let Some(daemon) = live_daemon(home) else {
         return Ok(None);
@@ -640,11 +592,6 @@ pub fn status(home: &Home) -> io::Result<Option<Status>> {
         .map(Some)
 }
 
-#[cfg(not(unix))]
-pub fn status(_home: &Home) -> io::Result<Option<Status>> {
-    Err(unsupported())
-}
-
 /// What a daemon says of itself; see [`status`].
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Status {
@@ -661,7 +608,6 @@ pub struct Status {
 /// after the crash-loop breaker stopped the last ones.
 pub fn restart(home: &Home, staged: &Staged) -> io::Result<Connection> {
     stop(home)?;
-    #[cfg(unix)]
     drop(connect_or_spawn(home, true)?);
     connect(&Endpoint::Local(home.clone()), staged, &|| {})
 }
@@ -674,7 +620,6 @@ pub fn restart(home: &Home, staged: &Staged) -> io::Result<Connection> {
 /// host's directories. The far client does its own hello. Ends when either
 /// side closes: the daemon may keep a connection open after its client is
 /// done.
-#[cfg(unix)]
 pub fn bridge(home: &Home, token: &str) -> io::Result<()> {
     let (stream, _) = connect_or_spawn(home, false)?;
     let env = ClientMsg::Environment(capture()?);
@@ -689,14 +634,8 @@ pub fn bridge(home: &Home, token: &str) -> io::Result<()> {
     pump(&stream, stdout)
 }
 
-#[cfg(not(unix))]
-pub fn bridge(_home: &Home, _token: &str) -> io::Result<()> {
-    Err(unsupported())
-}
-
 /// Copies until EOF, flushing each read: stdout is line-buffered and frames
 /// are not lines.
-#[cfg(unix)]
 fn pump(mut from: impl Read, mut to: impl Write) -> io::Result<()> {
     let mut buf = vec![0; 64 * 1024];
     loop {
@@ -715,7 +654,6 @@ fn pump(mut from: impl Read, mut to: impl Write) -> io::Result<()> {
 /// `A_*` settings) may reach the others: what a session runs with comes
 /// from its own client's attach, and the daemon's settings from
 /// `config.toml`.
-#[cfg(unix)]
 const DAEMON_ENV: &[&str] = &[
     "HOME", "USER", "LOGNAME", "SHELL", "PATH", "TMPDIR", "LANG", "LC_ALL", "LC_CTYPE", "TZ",
 ];
@@ -727,23 +665,16 @@ const DAEMON_ENV: &[&str] = &[
 /// that daemon reaps a dead predecessor or refuses to serve after a crash
 /// loop (`reset` clears the loop first). Says whether it started that
 /// daemon.
-#[cfg(unix)]
-fn connect_or_spawn(home: &Home, reset: bool) -> io::Result<(UnixStream, bool)> {
-    use std::os::fd::AsRawFd;
-    use std::os::unix::fs::{DirBuilderExt, PermissionsExt};
+fn connect_or_spawn(home: &Home, reset: bool) -> io::Result<(Stream, bool)> {
     use std::process::{Command, Stdio};
+    use sys::Pass;
 
-    let socket = home.socket();
-    if let Ok(stream) = UnixStream::connect(&socket) {
+    let endpoint = home.endpoint();
+    if let Ok(stream) = endpoint.connect() {
         return Ok((stream, false));
     }
 
-    let run = home.run_dir();
-    fs::DirBuilder::new()
-        .recursive(true)
-        .mode(0o700)
-        .create(&run)?;
-    fs::set_permissions(&run, fs::Permissions::from_mode(0o700))?;
+    sys::fs::private_dir(&home.run_dir())?;
     let lock = File::options()
         .create(true)
         .truncate(false)
@@ -757,7 +688,7 @@ fn connect_or_spawn(home: &Home, reset: bool) -> io::Result<(UnixStream, bool)> 
         if let fs::TryLockError::Error(e) = held {
             return Err(e);
         }
-        if let Ok(stream) = UnixStream::connect(&socket) {
+        if let Ok(stream) = endpoint.connect() {
             return Ok((stream, false));
         }
         if Instant::now() >= deadline {
@@ -770,7 +701,7 @@ fn connect_or_spawn(home: &Home, reset: bool) -> io::Result<(UnixStream, bool)> 
     }
 
     let listener = home.bind()?;
-    let (listen_fd, lock_fd) = (listener.as_raw_fd(), lock.as_raw_fd());
+    let (listen_fd, lock_fd) = (listener.passed(), lock.passed());
     // The daemon leaves this process's session (`setsid`) as it starts, so
     // it outlives this client, its terminal and its app, and opens its own
     // log. Reaped here should it exit first, so a long-lived client (the
@@ -788,11 +719,11 @@ fn connect_or_spawn(home: &Home, reset: bool) -> io::Result<(UnixStream, bool)> 
         .stdin(Stdio::null())
         .stdout(Stdio::null())
         .stderr(Stdio::null());
-    sys::pass_fds(&mut cmd, [listen_fd, lock_fd]);
+    sys::pass(&mut cmd, [listen_fd, lock_fd])?;
     let mut daemon = cmd.spawn()?;
     thread::spawn(move || daemon.wait());
     drop((listener, lock));
-    Ok((UnixStream::connect(&socket)?, true))
+    Ok((endpoint.connect()?, true))
 }
 
 #[cfg(all(test, unix))]

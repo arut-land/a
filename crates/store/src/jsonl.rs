@@ -268,9 +268,8 @@ impl JsonlLog {
         let written = (|| {
             (&*file).write_all(lines)?;
             sys::sync_data(file)?;
-            #[cfg(unix)]
             if let Some(dir) = &self.new_in {
-                File::open(dir)?.sync_all()?;
+                sys::fs::sync_dir(dir)?;
             }
             io::Result::Ok(())
         })();

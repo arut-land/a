@@ -9,13 +9,8 @@ use ext::{CwdOf, Cx, Extension, Registrar, SpawnSpec, Spawner, States, Text, Too
 use protocol::Environment;
 use serde_json::Value;
 
-// Commands are only supervised where processes have groups to stop (a
-// daemon runs nowhere else), so elsewhere most of this is unused.
-#[cfg_attr(not(unix), allow(dead_code))]
 pub mod bash;
-#[cfg_attr(not(unix), allow(dead_code))]
 mod job;
-#[cfg_attr(not(unix), allow(dead_code))]
 mod output;
 pub mod state;
 

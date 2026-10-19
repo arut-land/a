@@ -27,11 +27,8 @@ use protocol::{
 };
 use session::{Attachment, Ended, Open, Session, Shared};
 use store::{Header, Jsonl, LogStore};
-use sys::Home;
+use sys::{Home, Listener, Stream};
 use upgrade::{Lifecycle, Verdict};
-
-#[cfg(unix)]
-use std::os::unix::net::{UnixListener, UnixStream};
 
 /// How the daemon runs: the `[daemon]` table of `$A_HOME/config.toml`,
 /// read as it starts. Never its environment, which is whichever client's
@@ -578,7 +575,6 @@ impl Daemon {
                 session: None,
                 detail: String::new(),
             });
-            #[cfg(unix)]
             if let Some(log) = &exit.log
                 && let Err(e) = sys::log::rotate_stderr(log)
             {
@@ -696,7 +692,7 @@ impl Exit {
     /// closes its connections: a client reconnecting on EOF finds the lock
     /// free for the daemon it spawns.
     async fn now(self, daemon: &Daemon, why: &str) -> ! {
-        let _ = std::fs::remove_file(self.home.socket());
+        self.home.endpoint().remove();
         daemon.shutdown().await;
         if let Err(e) = sys::crash::exited(&self.home, &self.pid) {
             eprintln!("noting a clean exit: {e}");
@@ -747,9 +743,8 @@ pub struct Start {
 /// for a newer build. Sessions live in their logs, so the next client
 /// starts a new daemon. After a crash loop it serves no one: it tells the
 /// clients waiting why, and exits.
-#[cfg(unix)]
 pub fn serve(
-    listener: &UnixListener,
+    listener: &Listener,
     home: &Home,
     config: &Config,
     build: &str,
@@ -765,7 +760,7 @@ pub fn serve(
         Claim::Serve(pid) => pid,
         Claim::Tripped(why) => {
             refuse(listener, &why);
-            let _ = std::fs::remove_file(home.socket());
+            home.endpoint().remove();
             return Err(io::Error::other(why));
         }
     };
@@ -782,8 +777,8 @@ pub fn serve(
     }));
     // Connections block on their sockets, so each gets a thread of its own
     // and reaches the sessions' tasks through their mailboxes.
-    for conn in listener.incoming() {
-        let conn = conn?;
+    loop {
+        let conn = listener.accept()?;
         let (daemon, life) = (Arc::clone(&daemon), Arc::clone(&life));
         thread::spawn(move || {
             let _client = Client::new(&daemon);
@@ -792,7 +787,6 @@ pub fn serve(
             }
         });
     }
-    Ok(())
 }
 
 /// Whether a daemon may serve.
@@ -844,14 +838,14 @@ fn claim(
         );
     }
     let crashes = sys::crash::Crashes::of(home);
-    if crashes.tripped(limit) {
+    if crashes.breaker.tripped(limit) {
         let report = crashes
             .last
             .map_or_else(String::new, |p| format!("; see {}", p.display()));
         return Ok(Claim::Tripped(format!(
             "the daemon crashed {} times in a row soon after starting{report}; \
              `a daemon restart` tries again",
-            crashes.young
+            crashes.breaker.young()
         )));
     }
     // Not synced: clients read it while we hold the lock, and after a crash
@@ -863,8 +857,7 @@ fn claim(
 /// Answers every client that connects, until none waits (or, if none
 /// came, for [`REFUSED_GRACE`]), with `why` in place of a welcome: for a
 /// daemon that must not serve.
-#[cfg(unix)]
-fn refuse(listener: &UnixListener, why: &str) {
+fn refuse(listener: &Listener, why: &str) {
     let Ok(frame) = Frame::new(&DaemonMsg::Error {
         message: why.to_owned(),
     }) else {
@@ -877,7 +870,7 @@ fn refuse(listener: &UnixListener, why: &str) {
     let mut answered = false;
     loop {
         match listener.accept() {
-            Ok((mut conn, _)) => {
+            Ok(mut conn) => {
                 answered = true;
                 let _ = conn.set_nonblocking(false);
                 let _ = conn.set_read_timeout(Some(REFUSED_GRACE));
@@ -938,8 +931,7 @@ impl Answers {
 
 /// Writes what `outbox` hands out until it closes, as many frames as are
 /// ready at a time, up to [`WRITE_BATCH`] bytes.
-#[cfg(unix)]
-fn write_out(mut conn: UnixStream, outbox: &Outbox) {
+fn write_out(mut conn: Stream, outbox: &Outbox) {
     let mut batch = Vec::new();
     while let Some(frame) = outbox.next() {
         batch.extend_from_slice(frame.as_bytes());
@@ -957,11 +949,9 @@ fn write_out(mut conn: UnixStream, outbox: &Outbox) {
 }
 
 /// How many bytes of ready frames go to a client in one write.
-#[cfg(unix)]
 const WRITE_BATCH: usize = 64 << 10;
 
-#[cfg(unix)]
-fn handle(daemon: &Daemon, life: &Lifecycle, conn: &UnixStream) -> io::Result<()> {
+fn handle(daemon: &Daemon, life: &Lifecycle, conn: &Stream) -> io::Result<()> {
     let mut reader = BufReader::new(conn.try_clone()?);
     let (verdict, theirs, caps) = match read_frame(&mut reader)? {
         Some(ClientMsg::Hello {
@@ -982,7 +972,7 @@ fn handle(daemon: &Daemon, life: &Lifecycle, conn: &UnixStream) -> io::Result<()
     thread::spawn(move || write_out(stream, &writer));
     // Whatever the client sent behind a hello that is not welcomed is read
     // and dropped, never acted on.
-    let refuse = |reader: &mut BufReader<UnixStream>| {
+    let refuse = |reader: &mut BufReader<Stream>| {
         let _ = io::copy(reader, &mut io::sink());
     };
     let result = match (verdict, Versions::OURS.common(theirs)) {
@@ -1065,8 +1055,7 @@ impl Conn<'_> {
         self.reply(&DaemonMsg::Error { message });
     }
 
-    #[cfg(unix)]
-    fn serve(&mut self, reader: &mut BufReader<UnixStream>) -> io::Result<()> {
+    fn serve(&mut self, reader: &mut BufReader<Stream>) -> io::Result<()> {
         let mut answers = Answers::default();
         while let Some(mut msg) = read_frame::<ClientMsg>(reader)? {
             if let Some(&mut client_seq) = msg.client_seq_mut() {

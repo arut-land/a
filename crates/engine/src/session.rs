@@ -222,7 +222,7 @@ struct Queue {
     next: u64,
     pending: Vec<Entry>,
     /// Flushes waiting for every entry up to a seq to commit.
-    flushes: Vec<(u64, rt::channel::Sender<io::Result<()>>)>,
+    flushes: Vec<(u64, rt::oneshot::Sender<io::Result<()>>)>,
     draining: bool,
 }
 
@@ -501,7 +501,7 @@ impl Session {
     /// Whether any background process the session owns still runs.
     pub fn has_jobs(&self) -> bool {
         let mut jobs = lock(&self.jobs);
-        jobs.retain(|&pgid| sys::group_alive(pgid));
+        jobs.retain(|&pgid| sys::Group(pgid).alive());
         !jobs.is_empty()
     }
 
@@ -642,7 +642,7 @@ impl Session {
     }
 
     fn kill(&self, pgid: u32) {
-        if let Err(e) = sys::kill_process_group(pgid) {
+        if let Err(e) = sys::Group(pgid).kill() {
             self.warn(format_args!("killing process group {pgid}: {e}"));
         }
     }
@@ -673,14 +673,13 @@ impl Session {
             if queue.pending.is_empty() && !queue.draining {
                 return Ok(());
             }
-            let (tx, rx) = rt::channel::bounded(1);
+            let (tx, rx) = rt::oneshot::channel();
             let upto = queue.next;
             queue.flushes.push((upto, tx));
             self.drain_in(&mut queue);
             rx
         };
-        rx.recv()
-            .await
+        rx.await
             .unwrap_or_else(|| Err(io::Error::other("the log writer stopped")))
     }
 
@@ -731,7 +730,7 @@ impl Session {
                     Err(e) => Err(io::Error::new(e.kind(), e.to_string())),
                     Ok(()) => Err(io::Error::other("an earlier entry failed to commit")),
                 };
-                drop(tx.send(done));
+                tx.send(done);
             }
         }
     }
@@ -1551,7 +1550,7 @@ impl Session {
         // Owned by the session under a daemon that died without ending it:
         // ended now. Later loads in this daemon find them ended by `stop`.
         if lock(&self.shared.loaded).insert(self.id) {
-            for pgid in jobs.into_iter().filter(|&pgid| sys::group_alive(pgid)) {
+            for pgid in jobs.into_iter().filter(|&pgid| sys::Group(pgid).alive()) {
                 self.kill(pgid);
             }
         }

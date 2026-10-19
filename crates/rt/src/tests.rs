@@ -68,6 +68,16 @@ fn a_bounded_channel_streams_and_ends() {
 }
 
 #[test]
+fn a_oneshot_hands_over_its_value_or_ends_with_none_unsent() {
+    let (tx, rx) = oneshot::channel();
+    thread::spawn(move || tx.send(String::from("done")));
+    assert_eq!(block_on(rx).as_deref(), Some("done"));
+    let (tx, rx) = oneshot::channel::<u8>();
+    thread::spawn(move || drop(tx));
+    assert_eq!(block_on(rx), None);
+}
+
+#[test]
 fn a_dropped_receiver_releases_a_waiting_sender() {
     let (tx, rx) = channel::bounded(1);
     tx.send(1).unwrap();

@@ -4,7 +4,6 @@
 //! every runtime, starts on first use, and with nothing due it sleeps until
 //! something is: an idle process never wakes.
 
-use std::collections::BTreeMap;
 use std::future::Future;
 use std::pin::Pin;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -18,13 +17,17 @@ use crate::lock;
 /// The token of the reactor's own wake-up.
 const WAKE: mio::Token = mio::Token(usize::MAX);
 
+/// A timer's key: its deadline, and an id that tells equal ones apart.
+type Timed = (Instant, u64);
+
 pub(crate) struct Reactor {
     #[cfg(unix)]
     registry: mio::Registry,
     waker: mio::Waker,
-    /// Pending timers by deadline, then by id, so equal deadlines stay
-    /// apart and fire in the order they were set.
-    timers: Mutex<BTreeMap<(Instant, u64), Waker>>,
+    /// Pending timers sorted by deadline, then by id, so equal deadlines
+    /// stay apart and fire in the order they were set. A process has a few
+    /// at a time, which a sorted list keeps in less code than a B-tree.
+    timers: Mutex<Vec<(Timed, Waker)>>,
     #[cfg(unix)]
     sources: Mutex<std::collections::HashMap<usize, std::sync::Arc<io::Source>>>,
     next: AtomicU64,
@@ -63,27 +66,25 @@ impl Reactor {
     fn fire(&self) -> Option<Duration> {
         let now = Instant::now();
         let mut timers = lock(&self.timers);
-        while let Some(entry) = timers.first_entry() {
-            let at = entry.key().0;
-            if at > now {
-                return Some(at - now);
-            }
-            entry.remove().wake();
-        }
-        None
+        let due = timers.partition_point(|((at, _), _)| *at <= now);
+        timers.drain(..due).for_each(|(_, waker)| waker.wake());
+        timers.first().map(|((at, _), _)| *at - now)
     }
 
     /// Sets (or re-sets, under the same key) the timer `key`.
-    fn set(&self, key: (Instant, u64), waker: &Waker) {
+    fn set(&self, key: Timed, waker: &Waker) {
         let mut timers = lock(&self.timers);
-        let earliest = timers
-            .first_key_value()
-            .is_none_or(|(first, _)| key < *first);
-        match timers.get_mut(&key) {
-            Some(set) if set.will_wake(waker) => return,
-            Some(set) => set.clone_from(waker),
-            None => drop(timers.insert(key, waker.clone())),
-        }
+        let earliest = match timers.binary_search_by(|(set, _)| set.cmp(&key)) {
+            Ok(at) if timers[at].1.will_wake(waker) => return,
+            Ok(at) => {
+                timers[at].1.clone_from(waker);
+                at == 0
+            }
+            Err(at) => {
+                timers.insert(at, (key, waker.clone()));
+                at == 0
+            }
+        };
         drop(timers);
         // The reactor waits for an earlier deadline than it knew of.
         if earliest {
@@ -91,8 +92,11 @@ impl Reactor {
         }
     }
 
-    fn unset(&self, key: (Instant, u64)) {
-        lock(&self.timers).remove(&key);
+    fn unset(&self, key: Timed) {
+        let mut timers = lock(&self.timers);
+        if let Ok(at) = timers.binary_search_by(|(set, _)| set.cmp(&key)) {
+            timers.remove(at);
+        }
     }
 
     fn wake(&self) {
@@ -131,7 +135,7 @@ fn run(mut poll: mio::Poll, reactor: &Reactor) {
 /// deadline.
 #[derive(Debug)]
 pub struct Timer {
-    key: (Instant, u64),
+    key: Timed,
     set: bool,
 }
 
@@ -174,6 +178,43 @@ impl Drop for Timer {
 
 #[cfg(unix)]
 pub use io::Async;
+#[cfg(windows)]
+pub use iocp::Async;
+
+/// Windows waits for handles through completions (IOCP), which take
+/// overlapped I/O rather than readiness; until the Windows daemon brings
+/// that, no handle can be registered, so nothing ever waits on one.
+#[cfg(windows)]
+mod iocp {
+    use std::io;
+    use std::os::windows::io::AsHandle;
+
+    pub struct Async<T: AsHandle> {
+        io: T,
+    }
+
+    impl<T: AsHandle> Async<T> {
+        pub fn new(_io: T) -> io::Result<Self> {
+            Err(io::ErrorKind::Unsupported.into())
+        }
+
+        pub fn for_reading(io: T) -> io::Result<Self> {
+            Self::new(io)
+        }
+
+        pub fn get_ref(&self) -> &T {
+            &self.io
+        }
+
+        pub async fn readable(&self) {
+            std::future::pending::<()>().await;
+        }
+
+        pub async fn writable(&self) {
+            std::future::pending::<()>().await;
+        }
+    }
+}
 
 #[cfg(unix)]
 mod io {

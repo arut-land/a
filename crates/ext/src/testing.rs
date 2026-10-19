@@ -117,7 +117,7 @@ impl Rig {
 impl Drop for Rig {
     fn drop(&mut self) {
         for &(pgid, _) in lock(&self.spawned).iter() {
-            let _ = sys::kill_process_group(pgid);
+            let _ = sys::Group(pgid).kill();
         }
         let _ = std::fs::remove_dir_all(&self.dir);
     }

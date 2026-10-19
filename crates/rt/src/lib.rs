@@ -10,6 +10,7 @@
 pub mod channel;
 mod events;
 mod notify;
+pub mod oneshot;
 mod reactor;
 #[cfg(feature = "threads")]
 mod threads;
@@ -28,7 +29,7 @@ use std::time::{Duration, Instant};
 
 pub use events::{Event, EventSink, Noop, Stderr};
 pub use notify::Notify;
-#[cfg(unix)]
+#[cfg(any(unix, windows))]
 pub use reactor::Async;
 pub use reactor::{Timer, wakes};
 #[cfg(feature = "threads")]
@@ -93,9 +94,9 @@ where
     T: Send + 'static,
     F: FnOnce() -> T + Send + 'static,
 {
-    let (tx, rx) = channel::bounded(1);
-    rt.spawn_blocking(Box::new(move || drop(tx.send(work()))));
-    async move { rx.recv().await.expect("blocking work panicked") }
+    let (tx, rx) = oneshot::channel();
+    rt.spawn_blocking(Box::new(move || tx.send(work())));
+    async move { rx.await.expect("blocking work panicked") }
 }
 
 /// Spawns `task` and returns a future of its output.
@@ -104,9 +105,9 @@ where
     T: Send + 'static,
     F: Future<Output = T> + Send + 'static,
 {
-    let (tx, rx) = channel::bounded(1);
-    rt.spawn(Box::pin(async move { drop(tx.send(task.await)) }));
-    async move { rx.recv().await.expect("spawned task panicked") }
+    let (tx, rx) = oneshot::channel();
+    rt.spawn(Box::pin(async move { tx.send(task.await) }));
+    async move { rx.await.expect("spawned task panicked") }
 }
 
 // Every lock here guards plain queues that a panicking holder cannot leave

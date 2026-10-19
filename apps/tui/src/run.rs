@@ -2,9 +2,8 @@
 //! thread, which folds what they send into the app and draws.
 
 use std::io::{self, Write};
-use std::sync::mpsc::{self, Receiver};
 
-use client::{Cmd, Driver, End, Endpoint, Link};
+use client::{Cmd, Driver, End, Endpoint, Inbox, Link};
 use protocol::Target;
 use sys::Signals;
 
@@ -17,7 +16,7 @@ use crate::Daemon;
 
 pub fn run(daemon: &Daemon, target: Target, viewport: Viewport) -> io::Result<()> {
     let workspace = sys::workspace_of(&std::env::current_dir()?);
-    let (tx, rx) = mpsc::channel();
+    let (tx, rx) = client::inbox();
     let events = tx.clone();
     let driver = Driver::new(
         daemon.endpoint.clone(),
@@ -91,10 +90,10 @@ struct Client {
 impl Client {
     /// Blocks for the next event, folds in everything else already queued,
     /// applies what it asks for, then draws one frame.
-    fn run(&mut self, rx: &Receiver<Event>) -> io::Result<Exit> {
-        while let Ok(first) = rx.recv() {
+    fn run(&mut self, rx: &Inbox<Event>) -> io::Result<Exit> {
+        while let Some(first) = rx.recv() {
             let mut effects = Vec::new();
-            for event in std::iter::once(first).chain(rx.try_iter()) {
+            for event in std::iter::once(first).chain(std::iter::from_fn(|| rx.try_recv())) {
                 match event {
                     Event::Input(input) => effects.extend(self.app.input(input)),
                     Event::Resized => self.screen.invalidate(),

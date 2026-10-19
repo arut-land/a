@@ -11,16 +11,11 @@
 
 use std::collections::BTreeMap;
 use std::fmt::Write as _;
-#[cfg(unix)]
 use std::future::{Future, poll_fn};
-use std::io;
-#[cfg(unix)]
-use std::io::Read;
+use std::io::{self, Read};
 use std::path::{Path, PathBuf};
-#[cfg(unix)]
 use std::pin::{Pin, pin};
 use std::process::{Child, Command as Process, ExitStatus, Stdio};
-#[cfg(unix)]
 use std::task::Poll;
 use std::time::{Duration, Instant};
 
@@ -28,13 +23,9 @@ use protocol::{Card, Environment};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
-#[cfg(unix)]
-use crate::output::Live;
-use crate::output::{Output, Rendered, Spill, create_private, private_dir};
+use crate::output::{Live, Output, Rendered, Spill, create_private, private_dir};
 use crate::state::Cwd;
-#[cfg(unix)]
-use ext::Kill;
-use ext::{Cx, SpawnSpec as Spawn, Tool};
+use ext::{Cx, Kill, SpawnSpec as Spawn, Tool};
 
 pub struct Bash;
 
@@ -282,7 +273,7 @@ async fn run(input: Command, cx: &Cx) -> io::Result<Ran> {
     } = done.output;
     Ok(Ran {
         exit: done.status.and_then(|s| s.code()),
-        signal: done.status.and_then(signal_of),
+        signal: done.status.and_then(sys::exit_signal),
         timed_out: (done.stopped == Some(Stop::TimedOut)).then_some(limit),
         aborted: done.stopped == Some(Stop::Aborted),
         cwd,
@@ -366,7 +357,7 @@ pub(crate) fn process(spawn: &Spawn) -> Process {
         .envs(&spawn.env)
         .current_dir(&spawn.cwd)
         .stdin(Stdio::null());
-    sys::new_session(&mut cmd);
+    sys::Group::lead(&mut cmd);
     cmd
 }
 
@@ -396,9 +387,9 @@ fn find_bash(env: &BTreeMap<String, String>) -> Option<String> {
     if system.is_file() {
         return Some(system.display().to_string());
     }
-    let name = if cfg!(windows) { "bash.exe" } else { "bash" };
+    let name = format!("bash{}", std::env::consts::EXE_SUFFIX);
     std::env::split_paths(env.get("PATH")?)
-        .map(|dir| dir.join(name))
+        .map(|dir| dir.join(&name))
         .find(|path| path.is_file())
         .map(|path| path.display().to_string())
 }
@@ -410,16 +401,6 @@ fn quote(text: &str) -> String {
 
 fn duration_ms(started: Instant) -> u64 {
     u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX)
-}
-
-#[cfg(unix)]
-fn signal_of(status: ExitStatus) -> Option<String> {
-    std::os::unix::process::ExitStatusExt::signal(&status).map(sys::signal_name)
-}
-
-#[cfg(not(unix))]
-fn signal_of(_status: ExitStatus) -> Option<String> {
-    None
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -440,7 +421,6 @@ struct Finished {
 /// It waits, as a task on the reactor, for whichever comes first of
 /// output, the shell's exit, a cancel and the next deadline: a quiet
 /// command costs no thread and no wake-up while it runs.
-#[cfg(unix)]
 async fn supervise(
     mut child: Child,
     reader: io::PipeReader,
@@ -536,7 +516,7 @@ async fn supervise(
         }
     }
     drain(&pipe, &mut buf, |chunk| output.push(chunk));
-    let mut lingering = sys::group_alive(pgid);
+    let mut lingering = sys::Group(pgid).alive();
     // A command that was stopped leaves nothing behind.
     if lingering && stopped.is_some() {
         kill.now();
@@ -550,22 +530,8 @@ async fn supervise(
     })
 }
 
-/// No daemon runs where processes have no groups to stop.
-#[cfg(not(unix))]
-#[allow(clippy::unused_async)]
-async fn supervise(
-    _child: Child,
-    _reader: io::PipeReader,
-    _limit: Duration,
-    _cx: &Cx,
-    _output: Output,
-) -> io::Result<Finished> {
-    Err(io::ErrorKind::Unsupported.into())
-}
-
 /// Reads what the pipe has without waiting, handing each chunk to
 /// `chunk`; whether it ended.
-#[cfg(unix)]
 fn drain(pipe: &rt::Async<io::PipeReader>, buf: &mut [u8], mut chunk: impl FnMut(&[u8])) -> bool {
     loop {
         match { pipe.get_ref() }.read(buf) {
@@ -578,7 +544,6 @@ fn drain(pipe: &rt::Async<io::PipeReader>, buf: &mut [u8], mut chunk: impl FnMut
 }
 
 /// `future`, or one that never resolves when `cond` does not hold.
-#[cfg(unix)]
 async fn when(cond: bool, future: impl Future<Output = ()>) {
     if cond {
         future.await;
@@ -588,7 +553,6 @@ async fn when(cond: bool, future: impl Future<Output = ()>) {
 }
 
 /// Which of `futures` resolved first.
-#[cfg(unix)]
 fn first<const N: usize>(
     mut futures: [Pin<&mut (dyn Future<Output = ()> + Send)>; N],
 ) -> impl Future<Output = usize> {

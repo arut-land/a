@@ -190,7 +190,7 @@ impl Env {
     }
 
     pub fn connect(&self) -> Conn {
-        let stream = UnixStream::connect(self.home.socket()).unwrap();
+        let stream = UnixStream::connect(self.home.endpoint().path()).unwrap();
         stream
             .set_read_timeout(Some(Duration::from_secs(30)))
             .unwrap();
@@ -247,7 +247,7 @@ impl Drop for Env {
         for pid in self.daemons() {
             let _ = sys::signal_process(pid, Signal::Kill);
         }
-        let _ = fs::remove_file(self.home.socket());
+        let _ = fs::remove_file(self.home.endpoint().path());
         // A failed test's home, with the daemon's log, is kept to look at.
         if std::thread::panicking() {
             eprintln!("kept {}", self.root.display());
@@ -398,8 +398,12 @@ impl Drop for Repl {
     }
 }
 
-pub fn wait_for(what: &str, mut done: impl FnMut() -> bool) {
-    let deadline = Instant::now() + Duration::from_secs(10);
+pub fn wait_for(what: &str, done: impl FnMut() -> bool) {
+    wait_within(what, Duration::from_secs(10), done);
+}
+
+pub fn wait_within(what: &str, within: Duration, mut done: impl FnMut() -> bool) {
+    let deadline = Instant::now() + within;
     while !done() {
         assert!(Instant::now() < deadline, "timed out waiting for {what}");
         std::thread::sleep(Duration::from_millis(10));
@@ -448,6 +452,63 @@ fn processes(column: &str) -> Vec<(u32, String)> {
             live.then(|| (id, fields.collect::<Vec<_>>().join(" ")))
         })
         .collect()
+}
+
+/// The names of process `pid`'s threads now.
+pub fn thread_names(pid: u32) -> Vec<String> {
+    #[cfg(target_os = "linux")]
+    {
+        fs::read_dir(format!("/proc/{pid}/task"))
+            .unwrap()
+            .flatten()
+            .filter_map(|task| fs::read_to_string(task.path().join("comm")).ok())
+            .map(|name| name.trim_end().to_owned())
+            .collect()
+    }
+    #[cfg(target_vendor = "apple")]
+    #[allow(unsafe_code)]
+    {
+        use std::ffi::CStr;
+        /// `<sys/proc_info.h>`: the flavor listing a task's thread handles.
+        const PROC_PIDLISTTHREADS: i32 = 6;
+        let mut handles = vec![0_u64; 4096];
+        let size = i32::try_from(handles.len() * 8).unwrap();
+        // SAFETY: `handles` is a writable buffer of `size` bytes; the call
+        // writes at most that, returning how many it wrote.
+        let written = unsafe {
+            libc::proc_pidinfo(
+                pid.cast_signed(),
+                PROC_PIDLISTTHREADS,
+                0,
+                handles.as_mut_ptr().cast(),
+                size,
+            )
+        };
+        handles.truncate(usize::try_from(written).unwrap() / 8);
+        let size = i32::try_from(size_of::<libc::proc_threadinfo>()).unwrap();
+        handles
+            .into_iter()
+            .filter_map(|handle| {
+                let mut info = std::mem::MaybeUninit::<libc::proc_threadinfo>::zeroed();
+                // SAFETY: as above, for one `proc_threadinfo`, all written
+                // when the call returns `size`; a thread that ended since
+                // the listing returns less.
+                let info = unsafe {
+                    let written = libc::proc_pidinfo(
+                        pid.cast_signed(),
+                        libc::PROC_PIDTHREADINFO,
+                        handle,
+                        info.as_mut_ptr().cast(),
+                        size,
+                    );
+                    (written == size).then(|| info.assume_init())?
+                };
+                // SAFETY: the kernel NUL-terminates the name.
+                let name = unsafe { CStr::from_ptr(info.pth_name.as_ptr()) };
+                Some(name.to_string_lossy().into_owned())
+            })
+            .collect()
+    }
 }
 
 /// Process `pid`'s threads now, and its threads' context switches so far:

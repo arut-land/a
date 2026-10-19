@@ -2,7 +2,6 @@ mod exts;
 
 use std::io::{self, BufRead, IsTerminal, Write};
 use std::process::ExitCode;
-use std::sync::mpsc;
 use std::thread;
 
 use client::{Attach, Driver, Effect, End, Endpoint, Env, Event, Link, SessionClient};
@@ -232,7 +231,7 @@ enum Input {
 /// as lines and its intents typed. When the daemon drains for an upgrade,
 /// it reconnects (starting the new build) and replays what it missed.
 fn repl(ctx: &Ctx, target: Target) -> io::Result<()> {
-    let (tx, rx) = mpsc::channel();
+    let (tx, rx) = client::inbox();
     let events = tx.clone();
     let driver = Driver::new(ctx.endpoint.clone(), ctx.staged.clone(), move |_, event| {
         let _ = events.send(Input::Client(event));
@@ -252,7 +251,7 @@ fn repl(ctx: &Ctx, target: Target) -> io::Result<()> {
                 return exit;
             }
         }
-        let Ok(input) = rx.recv() else {
+        let Some(input) = rx.recv() else {
             return Ok(());
         };
         effects = match input {
@@ -290,7 +289,7 @@ const NOT_RESPONDING: &str = "daemon not responding";
 struct Repl {
     screen: Screen,
     /// Taken by the thread reading stdin, once attached.
-    input: Option<mpsc::Sender<Input>>,
+    input: Option<client::Post<Input>>,
     /// Attached once at least.
     live: bool,
 }
@@ -573,7 +572,7 @@ fn new(ctx: &Ctx) -> io::Result<()> {
     conn.writer.send(&ClientMsg::Detach)
 }
 
-#[cfg(all(unix, feature = "web"))]
+#[cfg(feature = "web")]
 fn web(ctx: Ctx, open: bool) -> io::Result<()> {
     let daemon = web::Daemon {
         endpoint: ctx.endpoint,
@@ -582,7 +581,7 @@ fn web(ctx: Ctx, open: bool) -> io::Result<()> {
     web::run(daemon, open)
 }
 
-#[cfg(not(all(unix, feature = "web")))]
+#[cfg(not(feature = "web"))]
 fn web(_ctx: Ctx, _open: bool) -> io::Result<()> {
     Err(io::Error::other("this build of a has no web UI"))
 }
@@ -590,7 +589,6 @@ fn web(_ctx: Ctx, _open: bool) -> io::Result<()> {
 /// The daemon. Started by a client (`listen_fd`), it leaves the client's
 /// session and logs to `logs/daemon.log`; by hand, it stays at the
 /// terminal.
-#[cfg(unix)]
 fn daemon(
     ctx: &Ctx,
     listen_fd: Option<i32>,
@@ -602,12 +600,12 @@ fn daemon(
     let listener = if let Some(fd) = listen_fd {
         sys::detach_session()?;
         sys::log::redirect_stderr(&home.daemon_log())?;
-        sys::adopt_listener(fd)?
+        sys::Listener::adopt(fd.into())?
     } else {
         home.bind()?
     };
     let start = engine::Start {
-        lock: lock_fd.map(sys::adopt_lock).transpose()?,
+        lock: lock_fd.map(|fd| sys::adopt_lock(fd.into())).transpose()?,
         reset_breaker,
         logs: listen_fd.is_some(),
     };
@@ -621,18 +619,6 @@ fn daemon(
         &ctx.staged.id,
         start,
     )
-}
-
-#[cfg(not(unix))]
-fn daemon(
-    _ctx: &Ctx,
-    _listen_fd: Option<i32>,
-    _lock_fd: Option<i32>,
-    _reset_breaker: bool,
-) -> io::Result<()> {
-    Err(io::Error::other(
-        "the daemon is not implemented on this platform yet",
-    ))
 }
 
 #[cfg(test)]

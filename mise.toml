@@ -83,9 +83,13 @@ if grep -E '^tokio v' target/no-tokio.txt; then
   exit 1
 fi
 '''
+# The Windows build, linted from any host: nothing above `sys` and `rt`
+# names a platform, so all of it, `a` included, builds there (what the
+# daemon still lacks on Windows says it is unsupported).
+"check:windows" = "cargo clippy --workspace --all-targets --target x86_64-pc-windows-msvc -- -D warnings"
 # Miri over sys, the one crate with unsafe code. Miri runs no processes and
-# (on macOS) sets no file times, so the tests that need either are skipped.
-"test:miri" = "MIRIFLAGS=-Zmiri-disable-isolation cargo miri test -p sys --lib -- --skip install:: --skip asks_a_shell --skip stages_newest --skip a_higher_version --skip tests::a_new_session --skip tests::kills"
+# (on macOS) sets no file times, nor modes, so the tests that need those are skipped.
+"test:miri" = "MIRIFLAGS=-Zmiri-disable-isolation cargo miri test -p sys --lib -- --skip install:: --skip asks_a_shell --skip stages_newest --skip a_higher_version --skip tests::a_group_leader --skip tests::kills --skip fs::tests"
 # Coverage-guided fuzzing (libFuzzer) of crates/protocol/tests/fuzz.rs:
 # each target, or the one named, for TIME. Crashes land in
 # crates/protocol/tests/__fuzz__/<target>/crashes, which every test run

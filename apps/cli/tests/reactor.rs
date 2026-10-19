@@ -8,7 +8,7 @@ mod common;
 
 use std::time::{Duration, Instant};
 
-use common::{Env, threads_and_switches, wait_for};
+use common::{Env, thread_names, threads_and_switches, wait_for, wait_within};
 use protocol::{Body, Target};
 
 #[test]
@@ -33,6 +33,9 @@ fn an_idle_daemon_never_wakes() {
     assert_eq!(after - before, 0, "an idle daemon woke");
 }
 
+/// What `rt::Threads` names its blocking threads.
+const BLOCKING: &str = "rt-blocking";
+
 #[test]
 fn a_running_quiet_command_costs_no_threads() {
     const CALLS: usize = 30;
@@ -45,22 +48,34 @@ fn a_running_quiet_command_costs_no_threads() {
             conn
         })
         .collect();
-    // Warm: one call each first, so pools are as big as they get.
+    // Warm: one call each first, so what starts on first use has started.
     for conn in &mut conns {
         conn.input("$ true");
     }
     for conn in &mut conns {
         conn.until(|e| matches!(e.body, Body::ToolResult { .. }));
     }
-    let (idle, _) = threads_and_switches(pid);
+    // Less the blocking threads the log's writes woke, as many as happened
+    // to overlap.
+    let idle = thread_names(pid)
+        .iter()
+        .filter(|name| *name != BLOCKING)
+        .count();
     for conn in &mut conns {
         conn.input("$ sleep 30");
     }
     for conn in &mut conns {
         conn.until(|e| matches!(e.body, Body::ToolProcess { .. }));
     }
-    std::thread::sleep(Duration::from_millis(300));
+    // An idle blocking thread retires after 10 s; one that a command holds
+    // while it runs never does.
+    wait_within(
+        "the blocking threads to retire",
+        Duration::from_secs(20),
+        || !thread_names(pid).iter().any(|name| name == BLOCKING),
+    );
     let (running, before) = threads_and_switches(pid);
+    let running = usize::try_from(running).unwrap();
     std::thread::sleep(Duration::from_secs(2));
     let (_, after) = threads_and_switches(pid);
     eprintln!(

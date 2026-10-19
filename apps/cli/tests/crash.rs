@@ -112,7 +112,7 @@ fn check(shown: &[Entry], replay: &[Entry], round: usize, seed: u64) {
 /// A raw connection attached to `session` (a new one if `None`), and the
 /// replay up to `Synced`.
 fn attach(env: &Env, session: Option<SessionId>) -> (UnixStream, SessionId, Vec<Entry>) {
-    let mut stream = UnixStream::connect(env.home.socket()).unwrap();
+    let mut stream = UnixStream::connect(env.home.endpoint().path()).unwrap();
     stream
         .set_read_timeout(Some(Duration::from_secs(30)))
         .unwrap();
