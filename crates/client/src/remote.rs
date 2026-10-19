@@ -60,12 +60,11 @@ fn bridge(host: &str, script: &str, token: &str) -> io::Result<Option<Connection
                 ))),
             };
         }
-        match line.trim_ascii_end().strip_prefix(sync.as_bytes()) {
-            Some(WITH_ENV) => match read_frame(&mut out)? {
+        if line.trim_ascii_end().strip_prefix(sync.as_bytes()) == Some(WITH_ENV) {
+            match read_frame(&mut out)? {
                 Some(ClientMsg::Environment(env)) => break env,
                 _ => return Err(io::Error::other(format!("ssh {host}: no environment"))),
-            },
-            _ => {}
+            }
         }
     };
     let stdin = child.stdin.take().expect("piped");

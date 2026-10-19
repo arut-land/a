@@ -19,11 +19,11 @@ ext-retry = { workspace = true, optional = true }
 ext-settings = { workspace = true, optional = true }
 ext-shell = { workspace = true, optional = true }
 ext-subagent = { workspace = true, optional = true }
-lexopt = { version = "0.3", default-features = false }
 protocol.workspace = true
 sys.workspace = true
 serde_json.workspace = true
 tui.workspace = true
+usage-rs.workspace = true
 web = { workspace = true, optional = true }
 
 [features]

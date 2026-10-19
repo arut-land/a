@@ -15,50 +15,30 @@ use protocol::view::{
 use protocol::{Card, ClientMsg, DaemonMsg, Outcome, SessionSummary, Target};
 use sys::{Home, Staged};
 
-use crate::args::{Daemon, Exit, Op};
+use crate::args::{Args, Cmd, Daemon};
 
 fn main() -> ExitCode {
-    let args = match args::parse(std::env::args_os().skip(1), |key| std::env::var_os(key)) {
-        Ok(args) => args,
-        Err(Exit::Help(text)) => {
-            print!("{text}");
-            return ExitCode::SUCCESS;
+    // Help, the version, completion requests and usage errors (status 2)
+    // end the process here.
+    let args = Args::parse();
+    let result = Ctx::new(args.host).and_then(|ctx| match args.cmd {
+        None => session(ctx, Target::New),
+        Some(Cmd::Resume { id: None, any }) => session(ctx, Target::Latest { any_workspace: any }),
+        Some(Cmd::Resume { id: Some(id), .. } | Cmd::Attach { id }) => {
+            session(ctx, Target::Prefix(id))
         }
-        Err(Exit::Usage(text)) => {
-            eprint!("{text}");
-            return ExitCode::from(2);
+        Some(Cmd::Ls) => ls(&ctx),
+        Some(Cmd::New) => new(&ctx),
+        Some(Cmd::Bridge { token }) => {
+            client::bridge(&ctx.home, token.as_deref().unwrap_or(&ctx.staged.id))
         }
-    };
-    let host = args.value(&args::HOST).map(str::to_owned);
-    let result = Ctx::new(host).and_then(|ctx| match (args.op, args.arg(0)) {
-        (Op::Session, _) => session(ctx, Target::New),
-        (Op::Resume, None) => session(
-            ctx,
-            Target::Latest {
-                any_workspace: args.on(&args::ANY),
-            },
-        ),
-        (Op::Resume | Op::Attach, Some(id)) => session(ctx, Target::Prefix(id.to_owned())),
-        (Op::Attach, None) => unreachable!("attach requires an id"),
-        (Op::Ls, _) => ls(&ctx),
-        (Op::New, _) => new(&ctx),
-        (Op::Bridge, token) => client::bridge(&ctx.home, token.unwrap_or(&ctx.staged.id)),
-        (Op::Web, _) => web(ctx, !args.on(&args::NO_OPEN)),
-        (Op::Daemon(action), _) => daemon_cmd(&ctx, action),
-        (Op::Serve, _) => {
-            let fd = |flag| {
-                args.value(flag)
-                    .map(str::parse)
-                    .transpose()
-                    .map_err(io::Error::other)
-            };
-            daemon(
-                &ctx,
-                fd(&args::LISTEN_FD)?,
-                fd(&args::LOCK_FD)?,
-                args.on(&args::RESET_BREAKER),
-            )
-        }
+        Some(Cmd::Web { no_open }) => web(ctx, !no_open),
+        Some(Cmd::Daemon { action }) => daemon_cmd(&ctx, action),
+        Some(Cmd::Serve {
+            listen_fd,
+            lock_fd,
+            reset_breaker,
+        }) => daemon(&ctx, listen_fd, lock_fd, reset_breaker),
     });
     match result {
         Ok(()) => ExitCode::SUCCESS,
