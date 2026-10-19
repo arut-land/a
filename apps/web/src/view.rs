@@ -1,11 +1,10 @@
-//! How a session's transcript renders: the shared [`SessionView`] as
-//! markup, emitted again whole on every update.
+//! How a session's transcript renders: the shared [`SessionView`]'s items
+//! as markup, in parts that each live region of a tab emits.
 
 use protocol::view::{
-    Approval, Item, SessionView, Status, Stream, Usage, call_title, decision_line, output_text,
-    recap_line,
+    Approval, Item, Status, Stream, Usage, call_title, decision_line, output_text, recap_line,
 };
-use protocol::{Card, Outcome};
+use protocol::{Card, Outcome, Recap};
 use serde_json::Value;
 use topcoat::Result;
 use topcoat::runtime::Event;
@@ -14,35 +13,48 @@ use topcoat::view::{View, component, view};
 use crate::app::{approve, interrupt};
 use crate::style;
 
-/// The transcript of `view`, as the browser tab `tab` shows it.
+/// What one region of a transcript shows: at the top, the recap (or that
+/// there is nothing yet); its items; and, unless a later region shows what
+/// follows, how the transcript ends.
+pub struct Part {
+    pub recap: Option<Recap>,
+    pub empty: bool,
+    pub items: Vec<Item>,
+    pub streaming: Option<Stream>,
+    pub end: Option<End>,
+}
+
+/// The transcript's end: Stop while a turn runs, the daemon's latest
+/// complaint, and whether it went away.
+pub struct End {
+    pub running: bool,
+    pub error: Option<String>,
+    pub ended: bool,
+}
+
+/// `part` of a transcript, as the browser tab `tab` shows it.
 #[component]
-pub async fn transcript_column(
-    view: SessionView,
-    tab: String,
-    error: Option<String>,
-    ended: bool,
-) -> Result<impl View> {
-    let running = view.running();
-    let SessionView {
-        items,
+pub async fn transcript_part(part: Part, tab: String) -> Result<impl View> {
+    let Part {
         recap,
+        empty,
+        items,
         streaming,
-        ..
-    } = view;
+        end,
+    } = part;
     let stop = tab.clone();
-    let empty = items.is_empty();
     Ok(view! {
-        <div style=(style::COLUMN)>
-            if empty {
-                <p style=(style::NOTE)>"No messages yet."</p>
-            }
-            if let Some(recap) = recap {
-                <div style=(style::RECAP)>(recap_line(&recap))</div>
-            }
-            #[key(item.key())]
-            for item in items {
-                item_row(item: item, tab: tab.clone(), streaming: streaming.clone())
-            }
+        if empty {
+            <p style=(style::NOTE)>"No messages yet."</p>
+        }
+        if let Some(recap) = recap {
+            <div style=(style::RECAP)>(recap_line(&recap))</div>
+        }
+        #[key(item.key())]
+        for item in items {
+            item_row(item: item, tab: tab.clone(), streaming: streaming.clone())
+        }
+        if let Some(End { running, error, ended }) = end {
             if running {
                 <div style=(style::ASK)>
                     <button style=(style::BUTTON_QUIET) @click=$(async |_e: Event| { interrupt(stop).await; })>"Stop"</button>
@@ -54,7 +66,7 @@ pub async fn transcript_column(
             if ended {
                 <p style=(style::WARN)>"The daemon closed the connection; reload to reconnect."</p>
             }
-        </div>
+        }
     })
 }
 

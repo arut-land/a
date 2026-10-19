@@ -38,7 +38,7 @@ impl Screen {
             Viewport::Inline => {
                 // Asked before the input thread reads the terminal.
                 let (w, h) = terminal::size()?;
-                let row = cursor::position().map_or(h.saturating_sub(1), |(_, row)| row);
+                let row = super::term::cursor_row().unwrap_or(h.saturating_sub(1));
                 let area = Rect::new(0, row.min(h.saturating_sub(1)), w, 1);
                 (fixed(backend(), area)?, area)
             }

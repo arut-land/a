@@ -5,7 +5,7 @@
 use protocol::view::Item;
 
 use super::super::text::Line;
-use super::super::view::{self, Look};
+use super::super::view::{self, Live, Look};
 use super::{App, Rows};
 
 impl App {
@@ -15,21 +15,37 @@ impl App {
         if self.cache.len() != len {
             self.cache.resize_with(len, || None);
         }
-        if self.cache[i].as_ref().is_none_or(|r| r.width != width) {
-            let item = &self.view.items[i];
-            let streaming = self
-                .view
-                .streaming
-                .as_ref()
-                .filter(|s| matches!(item, Item::Reply { call, .. } if *call == s.call));
+        let item = &self.view.items[i];
+        let streaming = self
+            .view
+            .streaming
+            .as_ref()
+            .filter(|s| matches!(item, Item::Reply { call, .. } if *call == s.call));
+        let slot = &mut self.cache[i];
+        if let Some(live) = streaming {
+            let rows = match slot {
+                Some(rows) if rows.width == width && rows.live.is_some() => rows,
+                _ => slot.insert(Rows {
+                    width,
+                    lines: Vec::new(),
+                    live: Some(Live::default()),
+                }),
+            };
+            if let Some(state) = &mut rows.live {
+                state.update(&mut rows.lines, &live.text, width);
+            }
+        } else if slot
+            .as_ref()
+            .is_none_or(|r| r.width != width || r.live.is_some())
+        {
             let look = Look {
-                streaming: streaming.map(|s| s.text.as_str()),
                 collapsed: self.collapsed.contains(&item.key()),
                 verbose: self.verbose,
             };
-            self.cache[i] = Some(Rows {
+            *slot = Some(Rows {
                 width,
                 lines: view::rows(item, width, look),
+                live: None,
             });
         }
         self.cache[i].as_ref().map_or(&[], |r| &r.lines)

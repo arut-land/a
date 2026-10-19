@@ -23,8 +23,44 @@ pub fn put(buf: &mut Buffer, x: u16, y: u16, text: &str, style: Style) -> u16 {
     if y >= area.height || x >= area.width {
         return x;
     }
-    let (end, _) = buf.set_stringn(area.x + x, area.y + y, text, usize::MAX, style);
-    end - area.x
+    if !text.chars().all(alone) {
+        let (end, _) = buf.set_stringn(area.x + x, area.y + y, text, usize::MAX, style);
+        return end - area.x;
+    }
+    // A cell a character, as `set_stringn` would place them, without its
+    // grapheme segmentation.
+    let row = buf.index_of(area.x, area.y + y);
+    let cells = &mut buf.content[row..row + usize::from(area.width)];
+    let mut at = usize::from(x);
+    for ch in text.chars() {
+        let w = usize::from(char_width(ch));
+        if at + w > cells.len() {
+            break;
+        }
+        cells[at].set_char(ch).set_style(style);
+        // The column a wide character covers.
+        for cell in &mut cells[at + 1..at + w] {
+            cell.reset();
+        }
+        at += w;
+    }
+    u16::try_from(at).unwrap_or(area.width)
+}
+
+/// Whether `ch` is a grapheme of its own whatever is around it (no mark,
+/// joiner, jamo, regional indicator or control): what most text is made of.
+fn alone(ch: char) -> bool {
+    matches!(ch, ' '..='~')
+        || matches!(
+            ch,
+            '\u{a0}'..='\u{5ff}'
+                | '\u{2010}'..='\u{2027}'
+                | '\u{2030}'..='\u{205f}'
+                | '\u{2070}'..='\u{2bff}'
+                | '\u{3000}'..='\u{9fff}'
+                | '\u{ac00}'..='\u{d7a3}'
+                | '\u{ff01}'..='\u{ff9d}'
+        ) && char_width(ch) > 0
 }
 
 /// Pads or clips `text` to exactly `cols` columns.
@@ -99,6 +135,28 @@ mod tests {
         assert_eq!(rows(&buf), ["日本語"]);
         let mut buf = Buffer::empty(Rect::new(0, 0, 5, 1));
         assert_eq!(put(&mut buf, 0, 0, "日本語", Style::new()), 4);
+    }
+
+    #[test]
+    fn cells_are_what_ratatui_would_write() {
+        let red = Style::new().fg(ratatui_core::style::Color::Red);
+        for text in [
+            "plain ascii",
+            "日本語 and ─│•▍…",
+            "e\u{301}e",
+            "👨‍👩‍👧",
+            "🇯🇵",
+            "ab日",
+            "ｶﾞ",
+        ] {
+            for x in [0, 3, 6] {
+                let area = Rect::new(2, 1, 7, 2);
+                let (mut ours, mut theirs) = (Buffer::empty(area), Buffer::empty(area));
+                let end = put(&mut ours, x, 1, text, red);
+                let (to, _) = theirs.set_stringn(2 + x, 2, text, usize::MAX, red);
+                assert_eq!((end + 2, &ours), (to, &theirs), "{text:?} at {x}");
+            }
+        }
     }
 
     #[test]

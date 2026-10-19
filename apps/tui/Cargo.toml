@@ -19,6 +19,8 @@ crossterm = { version = "0.29", default-features = false, features = ["bracketed
 [target.'cfg(unix)'.dependencies]
 # Restores the terminal on SIGTERM or SIGHUP; crossterm links it already.
 signal-hook = { version = "0.3", default-features = false, features = ["iterator"] }
+# Asks where the cursor is with a shorter wait than crossterm's 2 s.
+rustix = { workspace = true, features = ["event", "stdio"] }
 
 [lints]
 workspace = true

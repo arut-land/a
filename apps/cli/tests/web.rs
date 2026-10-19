@@ -88,11 +88,12 @@ impl Web {
     }
 
     fn fetch(&self, method: &str, path: &str, headers: &[(&str, &str)], body: &str) -> Response {
-        let mut text = String::new();
+        let mut bytes = Vec::new();
         self.send(method, path, headers, body)
-            .read_to_string(&mut text)
+            .read_to_end(&mut bytes)
             .unwrap();
-        Response(text)
+        // A compressed body is not text; its head is.
+        Response(String::from_utf8_lossy(&bytes).into_owned())
     }
 
     /// A same-origin request of the signed-in browser.
@@ -161,10 +162,15 @@ struct Transcript {
 impl Transcript {
     /// Reads until the latest emission satisfies `done`.
     fn until(&mut self, what: &str, done: impl Fn(&str) -> bool) {
+        // Each emission is one NDJSON frame.
+        self.until_seen(what, |seen| done(seen.rsplit("\n{").next().unwrap()));
+    }
+
+    /// Reads until everything streamed so far satisfies `done`.
+    fn until_seen(&mut self, what: &str, done: impl Fn(&str) -> bool) {
         let deadline = Instant::now() + Duration::from_secs(20);
         let mut buf = [0; 16 * 1024];
-        // Each emission is one NDJSON frame.
-        while !done(self.seen.rsplit("\n{").next().unwrap()) {
+        while !done(&self.seen) {
             assert!(Instant::now() < deadline, "timed out waiting for {what}");
             let n = self.stream.read(&mut buf).unwrap();
             assert_ne!(n, 0, "the stream ended before {what}: {}", self.seen);
@@ -211,8 +217,11 @@ fn the_link_signs_in_once_and_foreign_requests_are_refused() {
     let list = web.ours("GET", "/", "");
     assert_eq!(list.status(), 200);
     assert!(list.0.contains("No sessions yet."), "{}", list.0);
-    let script = web.ours("GET", "/assets/topcoat.js", "");
+    let path = between(&list.0, "src=\"/assets/", "\"").expect("the runtime's script");
+    let script = web.ours("GET", &format!("/assets/{path}"), "");
+    assert_eq!(script.status(), 200, "{path}");
     assert_eq!(script.header("content-type"), Some("text/javascript"));
+    assert_eq!(script.header("content-encoding"), Some("deflate"));
 }
 
 #[test]
@@ -292,4 +301,47 @@ fn a_tab_streams_replies_and_answers_asks_until_it_closes() {
     assert!(pid.is_some());
     assert_eq!(clients(&env), [0]);
     assert_eq!(env.pid(), pid);
+}
+
+/// Items that will not change are sent once: later emissions carry only
+/// what follows them, however long the transcript grows.
+#[test]
+fn a_long_transcript_streams_only_its_tail() {
+    let env = Env::new("web-long");
+    let mut web = Web::start(&env);
+    web.sign_in();
+    let created = web.ours("POST", "/new", "");
+    let page_path = created.header("location").unwrap().to_owned();
+    let session = page_path.strip_prefix("/s/").unwrap();
+    let page = web.ours("GET", &page_path, "");
+    let identity = between(&page.0, "shard::start(\"/api/transcript\", \"", "\"").unwrap();
+    let tab = "0123456789abcdef0123456789abcdef";
+    let headers = [
+        ("Cookie", web.cookie.as_str()),
+        ("Accept", "application/x-ndjson"),
+        ("X-Topcoat-Identity", identity),
+    ];
+    let rerun = format!(r#"{{"args":["{tab}","{session}",true],"signals":{{}}}}"#);
+    let mut transcript = Transcript {
+        stream: web.send("POST", "/api/transcript", &headers, &rerun),
+        seen: String::new(),
+    };
+    transcript.until("the attach", |s| s.contains("environment"));
+    for n in 0..40 {
+        let text = format!("note {n}.");
+        web.call("/api/send", &serde_json::to_string(&(tab, &text)).unwrap());
+        // The note, then its echo, each in some emission.
+        let shown = format!(">{text}<");
+        transcript.until_seen(&text, |seen| seen.matches(&shown).count() >= 2);
+    }
+    let last = transcript.seen.rsplit("\n{").next().unwrap();
+    assert!(last.contains(">note 39.<"), "{last}");
+    assert!(
+        !last.contains(">note 0.<"),
+        "the whole transcript again: {last}"
+    );
+    for n in 0..40 {
+        let shown = transcript.seen.matches(&format!(">note {n}.<")).count();
+        assert!(shown >= 2, "note {n} shown {shown} times");
+    }
 }

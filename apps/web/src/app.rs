@@ -3,8 +3,10 @@
 //! A chat page renders right away; once the browser runtime is running, the
 //! transcript shard asks again with `live` set and its response becomes a
 //! long stream: it attaches as a daemon client of its own, folds what the
-//! daemon sends through the shared reducer and emits the transcript again
-//! after each batch. Input and approvals go out on that tab's connection.
+//! daemon sends through the shared reducer and emits after each batch what
+//! changed: items that will not change are sent once, in regions nested
+//! as the transcript grows (see [`segment`]). Input and approvals go out
+//! on that tab's connection.
 
 use std::collections::HashMap;
 use std::future::{Future, poll_fn};
@@ -13,7 +15,7 @@ use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 use std::task::Poll;
 
 use client::{Connection, Writer};
-use protocol::view::{Change, Link, SessionView};
+use protocol::view::{Change, Item, Link, SessionView, Status};
 use protocol::{ClientMsg, DaemonMsg, SessionId, SessionSummary, Target};
 use rt::Rt;
 use rt::channel::Receiver;
@@ -23,9 +25,9 @@ use topcoat::context::{Cx, app_context};
 use topcoat::router::error::{RouterErrorExt, SeeOther, see_other};
 use topcoat::router::{Router, page, path_param, route};
 use topcoat::runtime::{Event, RouterBuilderRuntimeExt, procedure, shard, signal};
-use topcoat::view::{Child, View, component, emit, live, view};
+use topcoat::view::{BoxView, Child, Unescaped, View, ViewExt, component, emit, live, view};
 
-use crate::view::transcript_column;
+use crate::view::{End, Part, transcript_part};
 use crate::{Daemon, http, style};
 
 /// Loaded by the chat page to learn when the runtime is running: the
@@ -325,36 +327,222 @@ async fn live_transcript(cx: &Cx, tab: String, session: String, live: bool) -> R
             return emit! { <p style=(style::NOTE)>"Connecting…"</p> };
         }
         let app = app_context::<App>(cx);
-        let mut view = SessionView::default();
-        // The daemon's latest complaint, until the transcript moves on.
-        let mut error = None;
-        let mut conn = Tab::open(app, &tab, session, 0).await;
+        let feed = match Tab::open(app, &tab, session, 0).await {
+            Ok(conn) => Arc::new(Feed::new(tab, session, conn)),
+            Err(e) => return emit! { <p style=(style::BAD)>"Could not attach: " (e.to_string())</p> },
+        };
+        // Shown once the attach's replay is in.
+        feed.next(app, 0).await;
         loop {
-            let connection = match &conn {
-                Ok(connection) => connection,
-                Err(e) => {
-                    break emit! { <p style=(style::BAD)>"Could not attach: " (e.to_string())</p> };
-                }
+            let token = emit! { <div style=(style::COLUMN)>(segment(cx, Arc::clone(&feed), 0, 0))</div> }?;
+            let (failed, ended) = {
+                let state = feed.state();
+                (state.failed.clone(), state.ended)
             };
-            match connection.next().await {
-                Some(batch) => {
-                    for msg in &batch {
-                        match view.fold(msg).map(|update| update.change) {
-                            Some(Change::Error { message }) => error = Some(message),
-                            Some(Change::Added { .. }) => error = None,
-                            _ => {}
-                        }
-                    }
-                    emit! { transcript_column(view: view.clone(), tab: tab.clone(), error: error.clone(), ended: false) }?;
-                }
-                // Upgraded: the new daemon replays what this tab missed.
-                None if view.link == Link::Draining => {
-                    conn = Tab::open(app, &tab, session, view.seq).await;
-                }
-                None => break emit! { transcript_column(view: view.clone(), tab: tab.clone(), error: error.clone(), ended: true) },
+            if let Some(e) = failed {
+                break emit! { <p style=(style::BAD)>"Could not attach: " (e)</p> };
+            }
+            if ended {
+                break Ok(token);
             }
         }
     })
+}
+
+/// How many settled items a region shows before it hands what follows to a
+/// region of its own: an update renders at most about this many settled
+/// items, however long the transcript.
+const SETTLED: usize = 16;
+
+/// How deep regions nest (each costs stack as the response is polled).
+/// The deepest starts over from the top instead: the outermost region then
+/// shows every settled item at once, so that happens once every
+/// `SETTLED * DEPTH` items.
+const DEPTH: usize = 32;
+
+/// Items `from..` of a tab's transcript and its end, kept up to date, at
+/// nesting `depth`. Once its first [`SETTLED`] items will not change, it
+/// shows them for good and hands the rest to a nested region. It ends when
+/// the transcript must be shown again from the top (an item before `from`
+/// changed, or the regions are nested [`DEPTH`] deep), or the daemon went
+/// away; the regions around it then end too.
+fn segment(cx: &Cx, feed: Arc<Feed>, from: usize, depth: usize) -> BoxView<'static> {
+    let cx = cx.keyed(from);
+    let inner = cx.clone();
+    live! { cx =>
+        let app = app_context::<App>(&inner);
+        let mut shown = None;
+        loop {
+            let (part, settled) = feed.part(from, depth < DEPTH);
+            if settled >= SETTLED {
+                if depth < DEPTH {
+                    let html = settled_html(&inner, part, &feed.id).await?;
+                    return emit! {
+                        (Unescaped::new_unchecked(html))
+                        (segment(&inner, Arc::clone(&feed), from + settled, depth + 1))
+                    };
+                }
+                if let Some(token) = shown {
+                    return Ok(token);
+                }
+            }
+            let ended = part.end.as_ref().is_some_and(|end| end.ended);
+            let token = emit! { transcript_part(part: part, tab: feed.id.clone()) }?;
+            // Once the daemon went away, this region shows that last.
+            if ended || !feed.next(app, from).await && !feed.state().ended {
+                return Ok(token);
+            }
+            shown = Some(token);
+        }
+    }
+    .boxed()
+}
+
+/// A part's settled items as HTML, rendered a few at a time: a view holds a
+/// buffer (4 KiB) an item until it is rendered, and here would hold them
+/// for as long as the nested region after them lives.
+async fn settled_html(cx: &Cx, part: Part, tab: &str) -> Result<String> {
+    let mut recap = part.recap;
+    let mut html = String::new();
+    for items in part.items.chunks(64) {
+        let part = Part {
+            recap: recap.take(),
+            empty: false,
+            items: items.to_vec(),
+            streaming: None,
+            end: None,
+        };
+        let tab = tab.to_owned();
+        let view = view! { cx => transcript_part(part: part, tab: tab) };
+        html.push_str(&view.first().await?.render(cx));
+    }
+    Ok(html)
+}
+
+/// A tab's live transcript: its connection and the view folded from it,
+/// shared by the regions that show it.
+struct Feed {
+    id: String,
+    session: SessionId,
+    tab: Mutex<Arc<Tab>>,
+    state: Mutex<State>,
+}
+
+#[derive(Default)]
+struct State {
+    view: SessionView,
+    /// The daemon's latest complaint, until the transcript moves on.
+    error: Option<String>,
+    /// The daemon closed the connection, or (`failed`) could not be
+    /// reached again after an upgrade.
+    ended: bool,
+    failed: Option<String>,
+}
+
+impl Feed {
+    fn new(id: String, session: SessionId, tab: Tab) -> Self {
+        Self {
+            id,
+            session,
+            tab: Mutex::new(Arc::new(tab)),
+            state: Mutex::default(),
+        }
+    }
+
+    fn state(&self) -> MutexGuard<'_, State> {
+        lock(&self.state)
+    }
+
+    /// What the region from item `from` shows, and how many of its first
+    /// items are settled: those alone once there are [`SETTLED`] of them
+    /// and it may `freeze` them; else every item and the end.
+    fn part(&self, from: usize, freeze: bool) -> (Part, usize) {
+        let state = self.state();
+        let view = &state.view;
+        let items = view.items.get(from..).unwrap_or_default();
+        let settled = if state.ended || state.failed.is_some() {
+            0
+        } else {
+            items.iter().take_while(|item| settled(item)).count()
+        };
+        let (items, end) = if freeze && settled >= SETTLED {
+            (&items[..settled], None)
+        } else {
+            let end = End {
+                running: view.running(),
+                error: state.error.clone(),
+                ended: state.ended,
+            };
+            (items, Some(end))
+        };
+        let part = Part {
+            recap: view.recap.clone().filter(|_| from == 0),
+            empty: view.items.is_empty(),
+            items: items.to_vec(),
+            streaming: view.streaming.clone().filter(|_| end.is_some()),
+            end,
+        };
+        (part, settled)
+    }
+
+    /// Folds what arrives next, reconnecting after an upgrade. `false`
+    /// when the region from item `from` must end: an item before it
+    /// changed, or the daemon went away.
+    async fn next(&self, app: &App, from: usize) -> bool {
+        loop {
+            let tab = Arc::clone(&lock(&self.tab));
+            let Some(batch) = tab.next().await else {
+                let seq = {
+                    let mut state = self.state();
+                    if state.view.link != Link::Draining {
+                        state.ended = true;
+                        return false;
+                    }
+                    state.view.seq
+                };
+                // Upgraded: the new daemon replays what this tab missed.
+                match Tab::open(app, &self.id, self.session, seq).await {
+                    Ok(tab) => *lock(&self.tab) = Arc::new(tab),
+                    Err(e) => {
+                        self.state().failed = Some(e.to_string());
+                        return false;
+                    }
+                }
+                continue;
+            };
+            let mut state = self.state();
+            let mut kept = true;
+            for msg in &batch {
+                match state.view.fold(msg).map(|update| update.change) {
+                    Some(Change::Error { message }) => state.error = Some(message),
+                    Some(Change::Added { index, .. }) => {
+                        state.error = None;
+                        kept &= index >= from;
+                    }
+                    Some(Change::Updated { index, .. } | Change::Asked { index, .. }) => {
+                        kept &= index >= from;
+                    }
+                    Some(Change::Recap(_)) => kept &= from == 0,
+                    Some(Change::Snapshot { .. } | Change::Attached { reset: true, .. }) => {
+                        kept = false;
+                    }
+                    _ => {}
+                }
+            }
+            return kept;
+        }
+    }
+}
+
+/// Whether an item will not change any more, so a region can show it for
+/// good.
+fn settled(item: &Item) -> bool {
+    match item {
+        Item::Reply { status, .. } => *status != Status::Running,
+        Item::Tool { outcome, .. } | Item::Command { outcome, .. } => outcome.is_some(),
+        Item::Child { fired, .. } => fired.is_some(),
+        _ => true,
+    }
 }
 
 #[procedure("/api/send")]

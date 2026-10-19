@@ -20,7 +20,7 @@ struct ChatView: View {
                     }
                     .padding()
                 }
-                .onChange(of: store.rev) { proxy.scrollTo("end", anchor: .bottom) }
+                .background(FollowEnd(store: store, proxy: proxy))
             }
             if let problem = store.problem {
                 Label(problem, systemImage: "exclamationmark.triangle")
@@ -55,6 +55,17 @@ struct ChatView: View {
         guard !text.isEmpty else { return }
         input = ""
         Task { await store.send(text) }
+    }
+}
+
+/// Scrolls to the newest output as updates arrive. A view of its own, so a
+/// streamed token re-evaluates it rather than the whole transcript.
+struct FollowEnd: View {
+    let store: SessionStore
+    let proxy: ScrollViewProxy
+
+    var body: some View {
+        Color.clear.onChange(of: store.rev) { proxy.scrollTo("end", anchor: .bottom) }
     }
 }
 
@@ -109,7 +120,7 @@ struct ItemView: View {
         case .reply(let call, let model, let text, let status, let usage):
             ReplyView(
                 call: call, model: model, text: text, status: status, usage: usage,
-                streaming: store.streaming?.call == call ? store.streaming?.text : nil)
+                streaming: live(call, status))
         case .tool(let call, _, _, let title, let approval, let outcome, _, let asked):
             ToolView(
                 call: call, title: title, approval: approval, outcome: outcome, asked: asked,
@@ -129,6 +140,16 @@ struct ItemView: View {
         case .environment(_, let cwd):
             Note(icon: "folder", text: "environment: \(cwd)")
         }
+    }
+}
+
+extension ItemView {
+    /// The streamed text of a reply still running. Only such a reply reads
+    /// it, so a token re-evaluates that reply alone.
+    private func live(_ call: UInt64, _ status: ReplyStatus) -> String? {
+        guard case .running = status, let streaming = store.streaming, streaming.call == call
+        else { return nil }
+        return streaming.text
     }
 }
 

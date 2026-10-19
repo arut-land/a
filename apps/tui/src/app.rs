@@ -19,7 +19,7 @@ use super::editor::{Edit, Editor};
 use super::keys::{Input, Key, Mouse};
 use super::render::Viewport;
 use super::text::{Action, Line};
-use super::view::MUTED;
+use super::view::{Live, MUTED};
 
 /// What the event loop does for the app.
 #[derive(Debug)]
@@ -72,10 +72,24 @@ struct Hit {
     action: Action,
 }
 
+/// What frames show of the whole transcript: found by one scan once it
+/// changed, not per frame or per streamed token.
+#[derive(Clone, Copy, Default)]
+struct Summary {
+    /// The oldest call asked of this client still waiting, by index.
+    asked: Option<usize>,
+    /// What [`SessionView::running`] says.
+    running: bool,
+    /// The latest reply, by index (the status line shows its model).
+    reply: Option<usize>,
+}
+
 /// One item's rows at a width.
 struct Rows {
     width: usize,
     lines: Vec<Line>,
+    /// A reply streaming in: how far its text was wrapped.
+    live: Option<Live>,
 }
 
 pub struct App {
@@ -101,6 +115,8 @@ pub struct App {
     flash: Option<(String, Style)>,
     recap_hidden: bool,
     hits: Vec<Hit>,
+    /// `None` once the transcript changed.
+    summary: Option<Summary>,
     /// Tokens the session's model calls used, summed as replies arrive.
     tokens: Usage,
     /// Inline: the items already printed into the scrollback.
@@ -151,6 +167,7 @@ impl App {
             flash: None,
             recap_hidden: false,
             hits: Vec::new(),
+            summary: None,
             tokens: Usage::default(),
             committed: 0,
             resuming: matches!(target, Target::Latest { .. }),
@@ -166,6 +183,9 @@ impl App {
         }
         let update = self.view.fold(msg)?;
         let len = self.view.items.len();
+        if !matches!(update.change, Change::Delta { .. }) {
+            self.summary = None;
+        }
         match update.change {
             Change::Attached { reset, .. } => {
                 self.resuming = false;
@@ -200,9 +220,6 @@ impl App {
                     self.cache.clear();
                 }
             }
-            Change::Delta { call, .. } => {
-                self.stale(call);
-            }
             Change::Recap(_) => self.recap_hidden = false,
             Change::Error { message } => {
                 // `a resume` where this workspace has no session: pick one.
@@ -232,7 +249,8 @@ impl App {
                     spend(&mut self.tokens, item);
                 }
             }
-            Change::Synced | Change::Draining => {}
+            // A streaming reply's rows catch up with its text when drawn.
+            Change::Delta { .. } | Change::Synced | Change::Draining => {}
         }
         None
     }
@@ -269,7 +287,7 @@ impl App {
         if self.overlay.is_some() {
             return self.overlay_key(key);
         }
-        let asked = self.view.asked().next();
+        let asked = self.summary().asked.map(|i| self.view.items[i].key());
         let page = self.page();
         match key {
             Key::Ctrl('c') if self.running() => return Some(self.interrupt()),
@@ -367,8 +385,23 @@ impl App {
 
     /// Whether a model call, tool call or slash command is running: what
     /// an interrupt stops, with the rest of its turn.
-    pub fn running(&self) -> bool {
-        self.view.running()
+    pub fn running(&mut self) -> bool {
+        self.summary().running
+    }
+
+    fn summary(&mut self) -> Summary {
+        let view = &self.view;
+        *self.summary.get_or_insert_with(|| Summary {
+            asked: view
+                .asked()
+                .next()
+                .and_then(|call| view.items.binary_search_by_key(&call, Item::key).ok()),
+            running: view.running(),
+            reply: view
+                .items
+                .iter()
+                .rposition(|item| matches!(item, Item::Reply { .. })),
+        })
     }
 
     fn interrupt(&mut self) -> Effect {

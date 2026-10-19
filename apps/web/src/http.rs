@@ -10,20 +10,25 @@ use std::pin::pin;
 use std::sync::{Arc, Mutex, PoisonError};
 use std::task::Poll;
 
-use http::header::{CONTENT_LENGTH, CONTENT_TYPE, COOKIE, HOST, LOCATION, ORIGIN, SET_COOKIE};
+use http::header::{
+    CACHE_CONTROL, CONTENT_ENCODING, CONTENT_LENGTH, CONTENT_TYPE, COOKIE, HOST, LOCATION, ORIGIN,
+    SET_COOKIE,
+};
 use http::{HeaderMap, HeaderValue, Request, Response, StatusCode};
 use http_body_util::BodyExt;
 use rt::Rt;
 use rt::channel::Receiver;
 use topcoat::router::{Body, Router};
 
-/// Where the browser runtime is served; see [`crate::app::router`].
-pub const SCRIPT_PATH: &str = "/assets/topcoat.js";
+/// Where the browser runtime is served; see [`crate::app::router`]. The
+/// version in the path lets browsers keep it.
+pub const SCRIPT_PATH: &str = "/assets/topcoat-runtime-0.10.0.js";
 
 /// topcoat's browser runtime, as published in `topcoat-runtime` 0.10.0
-/// (`browser/dist/index.js`, MIT). Bump it with the `topcoat` dependency;
-/// a test checks they match.
-pub const SCRIPT: &[u8] = include_bytes!("../assets/topcoat-runtime-0.10.0.js");
+/// (`browser/dist/index.js`, MIT), zlib-deflated by the build script
+/// (49 KB to 15). Bump it with the `topcoat` dependency; a test checks
+/// they match.
+pub const SCRIPT: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/topcoat-runtime.js.zz"));
 
 const COOKIE_NAME: &str = "a-web";
 const MAX_HEAD: usize = 64 * 1024;
@@ -171,10 +176,15 @@ async fn respond(rt: &Rt, router: &Router, gate: &Gate, stream: &Arc<TcpStream>)
         return send_whole(rt, stream, response).await;
     }
     if request.uri().path() == SCRIPT_PATH {
+        // Every browser takes deflate; only browsers load the script.
         let mut response = Response::new(SCRIPT.to_vec());
-        response
-            .headers_mut()
-            .insert(CONTENT_TYPE, HeaderValue::from_static("text/javascript"));
+        let headers = response.headers_mut();
+        headers.insert(CONTENT_TYPE, HeaderValue::from_static("text/javascript"));
+        headers.insert(CONTENT_ENCODING, HeaderValue::from_static("deflate"));
+        headers.insert(
+            CACHE_CONTROL,
+            HeaderValue::from_static("private, max-age=31536000, immutable"),
+        );
         return send_whole(rt, stream, response).await;
     }
     let closed = closed(rt, stream)?;
@@ -252,7 +262,7 @@ fn head(status: StatusCode, headers: &HeaderMap, framing: &str) -> Vec<u8> {
         head.extend_from_slice(value.as_bytes());
         head.extend_from_slice(b"\r\n");
     }
-    if !headers.contains_key(http::header::CACHE_CONTROL) {
+    if !headers.contains_key(CACHE_CONTROL) {
         head.extend_from_slice(b"cache-control: no-store\r\n");
     }
     head.extend_from_slice(
@@ -347,8 +357,9 @@ mod tests {
             .find(|asset| asset.id() == id)
             .expect("topcoat's runtime script is declared in this binary");
         let published = std::fs::read(declared.resolved_path()).unwrap();
+        let embedded = miniz_oxide::inflate::decompress_to_vec_zlib(SCRIPT).unwrap();
         assert!(
-            published == SCRIPT,
+            published == embedded,
             "update assets/ from {}",
             declared.resolved_path().display()
         );

@@ -90,7 +90,14 @@ anchor, clickable spans, and the input editor.
 - Rows are wrapped lazily and cached per item and width: a frame wraps only
   what it shows, counted from the bottom or from the scroll anchor (an item
   and a row, which stays put as output arrives below). A 6000-item session
-  costs about what a short one does to draw, resize or resume.
+  costs about what a short one does to draw, resize or resume. A reply
+  streaming in keeps the rows of its finished lines; a delta wraps only the
+  line still open. What the bottom rows need of the whole transcript (the
+  oldest ask, whether a turn runs, the latest model) is found once per
+  change, not per frame.
+- Text of characters that are graphemes on their own (most of it) goes
+  into the buffer a cell a character; only the rest goes through ratatui's
+  grapheme segmentation.
 - The terminal is restored on exit, on a panic (a hook), when stdin
   closes, and on SIGTERM or SIGHUP (a signal-hook thread restores it, then
   lets the signal end the process as it would have).
@@ -146,6 +153,13 @@ In `a` (`mise run size`, `mise run budgets`, before → after the move):
 times exclude the terminal write.) A frame costs more through ratatui
 (grapheme segmentation, a buffer reset and a full diff per frame) but stays
 far under a millisecond; at opt-level 3 the client's delta frame is 146 µs.
+Writing plain text into cells directly, and scanning the transcript once
+per change instead of per frame, took the delta frame from 246 to 140 µs
+(p99 738 to 244) and the scroll frame from 213 to 151 µs (medians of five
+runs of each build in turns, on a loaded machine; ratatui's full diff is
+about half of what is left), and a delta at the end of a 28 KB reply from
+784 to 89 µs. Streaming 1000 deltas costs the client 0.25 s of CPU, from
+0.5 to 0.9 s.
 
 ## Tests
 
@@ -172,8 +186,9 @@ far under a millisecond; at opt-level 3 the client's delta frame is 146 µs.
 - SIGKILL leaves the terminal in raw mode (`reset` fixes it).
 - Ctrl-Z is not handled (raw mode receives it as a key).
 - Inline asks the terminal where the cursor is at start and after a
-  resize; a terminal that never answers costs crossterm's 2 s timeout, and
-  the viewport then sits at the bottom.
+  resize; a terminal that never answers costs half a second (crossterm's
+  own query waits 2 s), and the viewport then sits at the bottom. Keys
+  typed before the answer are dropped.
 - The full screen reports the mouse, so selecting text takes the terminal's
   override (Shift-drag in most, Option-drag in iTerm2 and Terminal.app);
   the inline mode leaves the mouse to the terminal.
