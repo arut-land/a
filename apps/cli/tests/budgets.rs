@@ -52,12 +52,15 @@ fn attaching_takes_under_2ms_at_p99() {
         conn.until(|e| matches!(e.body, Body::Assistant { .. }));
     }
     drop(conn);
+    // Twenty entries, and a `queued` one for each message sent before the
+    // turn ahead of it had ended.
+    let logged = env.log(id).len();
     let mut times: Vec<Duration> = (0..500)
         .map(|_| {
             let start = Instant::now();
             let (_, replay) = env.connect().attach(Target::Id(id), &env.ws);
             let elapsed = start.elapsed();
-            assert_eq!(replay.len(), 20);
+            assert_eq!(replay.len(), logged);
             elapsed
         })
         .collect();

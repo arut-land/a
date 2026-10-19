@@ -36,6 +36,22 @@ fn built() -> PathBuf {
     std::env::var_os("A_BIN").map_or_else(|| env!("CARGO_BIN_EXE_a").into(), PathBuf::from)
 }
 
+/// Runs `exe` once. A binary's first exec can be slow (macOS scans new
+/// files), and an exec that waits on another's scan of the same file may be
+/// refused, killed: the tests' first runs of a build go one at a time,
+/// across test processes.
+pub fn warm_up(exe: &Path) {
+    let lock = fs::File::create(std::env::temp_dir().join("a-acc-first-exec.lock")).unwrap();
+    lock.lock().unwrap();
+    let out = Command::new(exe).arg("--version").output().unwrap();
+    assert!(
+        out.status.success(),
+        "{} --version: {}",
+        exe.display(),
+        out.status
+    );
+}
+
 pub struct Env {
     pub root: PathBuf,
     pub exe: PathBuf,
@@ -63,8 +79,7 @@ impl Env {
             exe,
             vars: Vec::new(),
         };
-        // A binary's first exec can be slow (macOS scans new files).
-        env.run(&["--version"]);
+        warm_up(&env.exe);
         env
     }
 
@@ -129,7 +144,7 @@ impl Env {
             stderr,
         } = self.cmd(args).stdin(Stdio::null()).output().unwrap();
         let stderr = String::from_utf8_lossy(&stderr);
-        assert!(status.success(), "a {args:?} failed: {stderr}");
+        assert!(status.success(), "a {args:?} failed ({status}): {stderr}");
         String::from_utf8(stdout).unwrap()
     }
 
@@ -221,7 +236,12 @@ impl Drop for Env {
             let _ = sys::signal_process(pid, Signal::Kill);
         }
         let _ = fs::remove_file(self.home.socket());
-        let _ = fs::remove_dir_all(&self.root);
+        // A failed test's home, with the daemon's log, is kept to look at.
+        if std::thread::panicking() {
+            eprintln!("kept {}", self.root.display());
+        } else {
+            let _ = fs::remove_dir_all(&self.root);
+        }
     }
 }
 

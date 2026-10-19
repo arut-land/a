@@ -2,6 +2,8 @@
 //! the "remote" command locally under a home of its own.
 #![cfg(unix)]
 
+mod common;
+
 use std::fs;
 use std::io::{BufRead, BufReader};
 use std::os::unix::fs::PermissionsExt;
@@ -23,6 +25,7 @@ impl Scratch {
         let root = std::env::temp_dir().join(format!("a-cli-{name}-{}", std::process::id()));
         let _ = fs::remove_dir_all(&root);
         fs::create_dir_all(&root).unwrap();
+        common::warm_up(Path::new(A));
         Self {
             root: fs::canonicalize(root).unwrap(),
             homes: Vec::new(),
@@ -51,7 +54,12 @@ impl Drop for Scratch {
                 .env("A_HOME", home)
                 .output();
         }
-        let _ = fs::remove_dir_all(&self.root);
+        // A failed test's homes, with their daemons' logs, are kept.
+        if std::thread::panicking() {
+            eprintln!("kept {}", self.root.display());
+        } else {
+            let _ = fs::remove_dir_all(&self.root);
+        }
     }
 }
 
