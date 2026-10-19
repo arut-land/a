@@ -1,3 +1,4 @@
+mod args;
 mod exts;
 
 use std::io::{self, BufRead, IsTerminal, Write};
@@ -10,94 +11,53 @@ use protocol::view::{
 };
 use protocol::{Card, ClientMsg, DaemonMsg, Decision, Outcome, SessionSummary, Target};
 use sys::{Home, Staged};
-use usage_rs::{Cli, Subcommands};
 
-/// Agent engine: attach to durable sessions run by a per-user daemon.
-#[derive(Cli)]
-#[usage(bin = "a", version = "0.0.0", spec_endpoint_file = "a.usage.kdl")]
-struct Args {
-    /// Use the daemon on HOST, reached with `ssh HOST a bridge`
-    #[usage(long, global, env = "A_HOST", value_name = "HOST")]
-    host: Option<String>,
-    #[usage(subcommand)]
-    cmd: Option<Cmd>,
-}
-
-#[derive(Subcommands)]
-enum Cmd {
-    /// Resume the latest session in this workspace, or pick one
-    Resume {
-        id: Option<String>,
-        /// Take the latest session across all workspaces
-        #[usage(long)]
-        any: bool,
-    },
-    /// Attach to a session by id
-    Attach { id: String },
-    /// List sessions
-    Ls,
-    /// Start a new session without attaching
-    New,
-    /// Pipe stdio to the local daemon (for `ssh host a bridge`)
-    Bridge {
-        /// Printed in the `A-BRIDGE` line that marks the start of the stream
-        token: Option<String>,
-    },
-    /// Serve the web UI and open the browser
-    Web {
-        /// Only print the link; do not open a browser
-        #[usage(long)]
-        no_open: bool,
-    },
-    /// Inspect or control the background daemon
-    Daemon {
-        #[usage(subcommand)]
-        action: DaemonCmd,
-    },
-    #[usage(name = "__daemon", hide)]
-    Serve {
-        #[usage(long)]
-        listen_fd: Option<i32>,
-        /// The daemon lock, held for it by the client that started it
-        #[usage(long)]
-        lock_fd: Option<i32>,
-        /// Serve even after a crash loop
-        #[usage(long)]
-        reset_breaker: bool,
-    },
-}
-
-#[derive(Subcommands)]
-enum DaemonCmd {
-    /// Show whether the daemon is running and responding
-    Status,
-    /// Stop the daemon; sessions resume when it next starts
-    Stop,
-    /// Stop the daemon and start a fresh one
-    Restart,
-}
+use crate::args::{Daemon, Exit, Op};
 
 fn main() -> ExitCode {
-    let args = Args::parse();
-    let result = Ctx::new(args.host).and_then(|ctx| match args.cmd {
-        None => session(ctx, Target::New),
-        Some(Cmd::Resume { id: None, any }) => session(ctx, Target::Latest { any_workspace: any }),
-        Some(Cmd::Resume { id: Some(id), .. } | Cmd::Attach { id }) => {
-            client::target(&ctx.endpoint, &ctx.staged, &id).and_then(|target| session(ctx, target))
+    let args = match args::parse(std::env::args_os().skip(1), |key| std::env::var_os(key)) {
+        Ok(args) => args,
+        Err(Exit::Help(text)) => {
+            print!("{text}");
+            return ExitCode::SUCCESS;
         }
-        Some(Cmd::Ls) => ls(&ctx),
-        Some(Cmd::New) => new(&ctx),
-        Some(Cmd::Bridge { token }) => {
-            let token = token.as_deref().unwrap_or(&ctx.staged.id);
-            client::bridge(&ctx.home, token)
+        Err(Exit::Usage(text)) => {
+            eprint!("{text}");
+            return ExitCode::from(2);
         }
-        Some(Cmd::Web { no_open }) => web(ctx, !no_open),
-        Some(Cmd::Daemon { action }) => daemon_cmd(&ctx, &action),
-        Some(Cmd::Serve {
-            listen_fd,
-            lock_fd,
-            reset_breaker,
-        }) => daemon(&ctx, listen_fd, lock_fd, reset_breaker),
+    };
+    let host = args.value(&args::HOST).map(str::to_owned);
+    let result = Ctx::new(host).and_then(|ctx| match (args.op, args.arg(0)) {
+        (Op::Session, _) => session(ctx, Target::New),
+        (Op::Resume, None) => session(
+            ctx,
+            Target::Latest {
+                any_workspace: args.on(&args::ANY),
+            },
+        ),
+        (Op::Resume | Op::Attach, Some(id)) => {
+            client::target(&ctx.endpoint, &ctx.staged, id).and_then(|target| session(ctx, target))
+        }
+        (Op::Attach, None) => unreachable!("attach requires an id"),
+        (Op::Ls, _) => ls(&ctx),
+        (Op::New, _) => new(&ctx),
+        (Op::Bridge, token) => client::bridge(&ctx.home, token.unwrap_or(&ctx.staged.id)),
+        (Op::Web, _) => web(ctx, !args.on(&args::NO_OPEN)),
+        (Op::Daemon(action), _) => daemon_cmd(&ctx, action),
+        (Op::Serve, _) => {
+            let fd = |flag| {
+                args.value(flag)
+                    .map(str::parse)
+                    .transpose()
+                    .map_err(io::Error::other)
+            };
+            daemon(
+                &ctx,
+                fd(&args::LISTEN_FD)?,
+                fd(&args::LOCK_FD)?,
+                args.on(&args::RESET_BREAKER),
+            )
+        }
     });
     match result {
         Ok(()) => ExitCode::SUCCESS,
@@ -167,10 +127,10 @@ impl Ctx {
 
 const RESTART: &str = "run `a daemon restart` to replace it";
 
-fn daemon_cmd(ctx: &Ctx, action: &DaemonCmd) -> io::Result<()> {
+fn daemon_cmd(ctx: &Ctx, action: Daemon) -> io::Result<()> {
     let home = ctx.local()?;
     match action {
-        DaemonCmd::Status => {
+        Daemon::Status => {
             let d = client::diagnose(home);
             match (d.pid, client::status(home)) {
                 (None, _) | (_, Ok(None)) => println!("not running"),
@@ -188,11 +148,11 @@ fn daemon_cmd(ctx: &Ctx, action: &DaemonCmd) -> io::Result<()> {
                 println!("{note}");
             }
         }
-        DaemonCmd::Stop => {
+        Daemon::Stop => {
             let stopped = client::stop(home)?;
             println!("{}", if stopped { "stopped" } else { "not running" });
         }
-        DaemonCmd::Restart => {
+        Daemon::Restart => {
             client::restart(home, &ctx.staged, None)?;
             println!("restarted");
         }
@@ -630,27 +590,4 @@ fn daemon(
         &ctx.staged.id,
         start,
     )
-}
-
-#[cfg(test)]
-mod tests {
-    use std::ffi::OsStr;
-
-    use super::Args;
-
-    /// `a.usage.kdl` is checked in so the binary does not link the spec
-    /// writer; `mise run generate:usage` rewrites it (`UPDATE_USAGE=1`).
-    #[test]
-    fn embedded_spec_matches_the_cli() {
-        if std::env::var_os("UPDATE_USAGE").is_some() {
-            let path = concat!(env!("CARGO_MANIFEST_DIR"), "/a.usage.kdl");
-            std::fs::write(path, Args::to_kdl()).unwrap();
-            return;
-        }
-        let request = [OsStr::new(usage_rs::SPEC_REQUEST)];
-        assert_eq!(
-            Args::spec_request(&request).as_deref(),
-            Some(Args::to_kdl().as_str())
-        );
-    }
 }

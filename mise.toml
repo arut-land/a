@@ -28,9 +28,6 @@ mold = { version = "3.0.0", os = ["linux"] }
 hyperfine = "2.0.0"
 "cargo:cargo-bloat" = "0.12.1"
 "cargo:cargo-llvm-lines" = "0.4.48"
-# The usage CLI at the version of the usage-rs dependency, for completions
-# and the man page from apps/cli/a.usage.kdl.
-"aqua:jdx/usage" = "7.0.2"
 # The macOS app (apps/apple): the BoltFFI CLI at exactly the version of the
 # crates/ffi dependency, and XcodeGen for its project.
 "github:boltffi/boltffi" = { version = "0.31.1", os = ["macos"] }
@@ -52,24 +49,11 @@ check = { depends = ["check:fmt", "check:clippy"], run = "mise run test" }
 size = { depends = ["release"], run = 'f=target/release/a; [[ -e $f.exe ]] && f+=.exe; b=$(wc -c < "$f"); echo "a: $((b / 1024)) KiB of 4096 KiB"; ((b <= 4194304))' }
 startup = { depends = ["release"], run = 'hyperfine -N --warmup 50 -r 500 "target/release/a --version"' }
 bloat = "cargo bloat --release --crates -n 20"
-# The binary embeds the checked-in file, so the test (which links the spec
-# writer) is what rewrites it.
-"generate:usage" = "UPDATE_USAGE=1 cargo test -q -p a --bin a embedded_spec"
 "bloat:lines" = "cargo llvm-lines --release -p a | head -30"
-# Shell completions and the man page, from the checked-in spec, into
-# target/generated. The completion scripts call `usage` on each Tab.
-"generate:completions" = '''
-mkdir -p target/generated/completions
-for shell in bash fish zsh nu powershell; do
-  usage generate completion "$shell" a -f apps/cli/a.usage.kdl > "target/generated/completions/a.$shell"
-done
-echo target/generated/completions
-'''
-"generate:man" = '''
-mkdir -p target/generated/man
-usage generate manpage -f apps/cli/a.usage.kdl -o target/generated/man/a.1
-echo target/generated/man/a.1
-'''
+# Shell completions (bash, zsh, fish) and the man page, written from the
+# command table in apps/cli/src/args.rs by a test, into target/generated.
+"generate:completions" = "A_GENERATE=$PWD/target/generated cargo test -q -p a --bin a completions_and_the_man_page -- --nocapture | grep completions/"
+"generate:man" = "A_GENERATE=$PWD/target/generated cargo test -q -p a --bin a completions_and_the_man_page -- --nocapture | grep man/"
 deny = "cargo deny check"
 # Unused dependencies.
 machete = "cargo machete"

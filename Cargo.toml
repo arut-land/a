@@ -40,7 +40,6 @@ rustix = { version = "1", default-features = false, features = ["std", "fs", "pr
 serde = { version = "1", default-features = false, features = ["std", "derive"] }
 serde_json = { version = "1", default-features = false, features = ["std"] }
 ureq = { version = "3", default-features = false }
-usage-rs = { version = "=7.0.2", default-features = false, features = ["help", "diagnostics"] }
 uuid = { version = "1", default-features = false, features = ["std", "v7", "serde"] }
 
 [workspace.lints.rust]
