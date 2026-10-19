@@ -5,7 +5,7 @@
 //! logged. Pure: the daemon and any client fold the same entries to the
 //! same ledger.
 
-use std::collections::{BTreeMap, BTreeSet, VecDeque};
+use std::collections::VecDeque;
 
 use crate::{Body, Decision, Entry, Environment, Installed, Json, Outcome, Overrides, SessionId};
 
@@ -14,16 +14,16 @@ pub struct Ledger {
     /// The seq of the last entry folded.
     seq: u64,
     /// Model and tool calls with an intent and no outcome, by seq.
-    open: BTreeMap<u64, Open>,
+    open: BySeq<Open>,
     /// The open tool calls asked about and not yet answered, in the order
     /// they were asked: the session's inbox.
     inbox: Vec<u64>,
     /// Input queued and not yet taken up, in order.
     untaken: VecDeque<Queued>,
     /// Slash commands with an intent and no outcome.
-    commands: BTreeSet<u64>,
+    commands: BySeq<()>,
     /// Watches that have not fired, by seq.
-    armed: BTreeMap<u64, SessionId>,
+    armed: BySeq<SessionId>,
     /// Every child linked, in order, and the children ever watched.
     links: Vec<Link>,
     watched: Vec<SessionId>,
@@ -134,10 +134,10 @@ impl Ledger {
             Body::Steer { queued, .. } => self.untaken.retain(|q| q.seq != *queued),
             Body::Command { .. } => {
                 self.taken();
-                self.commands.insert(seq);
+                self.commands.insert(seq, ());
             }
             Body::CommandResult { call, .. } => {
-                self.commands.remove(call);
+                self.commands.remove(*call);
             }
             Body::ToolCall { .. }
             | Body::ModelCall { .. }
@@ -159,7 +159,7 @@ impl Ledger {
                 }
             }
             Body::Fired { watch, outcome } => {
-                self.armed.remove(watch);
+                self.armed.remove(*watch);
                 self.result = Some(outcome.clone());
             }
             Body::Assistant { text } => {
@@ -197,7 +197,7 @@ impl Ledger {
                 boot,
                 background,
             } => {
-                if let Some(open) = self.open.get_mut(call) {
+                if let Some(open) = self.open.get_mut(*call) {
                     open.processes.push((*pgid, boot.clone()));
                 }
                 if *background {
@@ -205,7 +205,7 @@ impl Ledger {
                 }
             }
             Body::Progress { call, text } => {
-                if let Some(open) = self.open.get_mut(call) {
+                if let Some(open) = self.open.get_mut(*call) {
                     open.progress.get_or_insert_default().push_str(text);
                 }
             }
@@ -214,13 +214,13 @@ impl Ledger {
                     self.turn.failed += 1;
                 }
                 self.result = Some(outcome.clone());
-                if self.open.remove(call).is_some() {
+                if self.open.remove(*call).is_some() {
                     self.inbox.retain(|c| c != call);
                 }
             }
             // The first answer wins: an answered call is not asked again.
             Body::Ask { call } => {
-                if let Some(open) = self.open.get_mut(call)
+                if let Some(open) = self.open.get_mut(*call)
                     && matches!(open.call, Call::Tool { .. })
                     && open.phase == Phase::Called
                 {
@@ -234,7 +234,7 @@ impl Ledger {
                     approved,
                     ..
                 } = decision
-                    && let Some(open) = self.open.get_mut(call)
+                    && let Some(open) = self.open.get_mut(*call)
                 {
                     open.phase = Phase::Answered {
                         approved: *approved,
@@ -271,11 +271,11 @@ impl Ledger {
 
     /// The open calls, by seq.
     pub fn open_calls(&self) -> impl Iterator<Item = (u64, &Open)> {
-        self.open.iter().map(|(&seq, open)| (seq, open))
+        self.open.iter()
     }
 
     pub fn call(&self, seq: u64) -> Option<&Open> {
-        self.open.get(&seq)
+        self.open.get(seq)
     }
 
     /// The tool calls waiting for the user's approval, in the order asked.
@@ -285,7 +285,7 @@ impl Ledger {
 
     /// The tool and input of call `call`, while it waits in the inbox.
     pub fn asked(&self, call: u64) -> Option<(&str, &Json)> {
-        match self.open.get(&call) {
+        match self.open.get(call) {
             Some(Open {
                 call: Call::Tool { tool, input },
                 phase: Phase::Asked,
@@ -301,12 +301,12 @@ impl Ledger {
 
     /// Slash commands with an intent and no outcome, by seq.
     pub fn open_commands(&self) -> impl Iterator<Item = u64> + '_ {
-        self.commands.iter().copied()
+        self.commands.iter().map(|(seq, ())| seq)
     }
 
     /// The watches that have not fired, as `(seq, child)`, by seq.
     pub fn armed(&self) -> impl Iterator<Item = (u64, SessionId)> + '_ {
-        self.armed.iter().map(|(&seq, &child)| (seq, child))
+        self.armed.iter().map(|(seq, &child)| (seq, child))
     }
 
     pub fn links(&self) -> &[Link] {
@@ -381,9 +381,50 @@ impl Ledger {
     pub fn turn_running(&self) -> u32 {
         let running = self
             .open
-            .range(self.turn.start + 1..)
-            .filter(|(_, open)| open.phase != Phase::Asked)
+            .iter()
+            .filter(|&(seq, open)| seq > self.turn.start && open.phase != Phase::Asked)
             .count();
         u32::try_from(running).unwrap_or(u32::MAX)
+    }
+}
+
+/// Values by seq, in seq order. A session has few of each open at a time,
+/// so a vector.
+#[derive(Clone, Debug)]
+struct BySeq<V>(Vec<(u64, V)>);
+
+impl<V> Default for BySeq<V> {
+    fn default() -> Self {
+        Self(Vec::new())
+    }
+}
+
+impl<V> BySeq<V> {
+    fn insert(&mut self, seq: u64, value: V) {
+        let at = self.0.partition_point(|&(s, _)| s < seq);
+        match self.0.get_mut(at) {
+            Some((s, held)) if *s == seq => *held = value,
+            _ => self.0.insert(at, (seq, value)),
+        }
+    }
+
+    fn at(&self, seq: u64) -> Option<usize> {
+        self.0.iter().position(|&(s, _)| s == seq)
+    }
+
+    fn get(&self, seq: u64) -> Option<&V> {
+        self.at(seq).map(|at| &self.0[at].1)
+    }
+
+    fn get_mut(&mut self, seq: u64) -> Option<&mut V> {
+        self.at(seq).map(|at| &mut self.0[at].1)
+    }
+
+    fn remove(&mut self, seq: u64) -> Option<V> {
+        self.at(seq).map(|at| self.0.remove(at).1)
+    }
+
+    fn iter(&self) -> impl Iterator<Item = (u64, &V)> {
+        self.0.iter().map(|(seq, value)| (*seq, value))
     }
 }
