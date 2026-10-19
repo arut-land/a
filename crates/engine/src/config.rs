@@ -5,6 +5,7 @@
 //! environment, which is whichever client's started it, and never from a
 //! workspace, which is anyone's checkout.
 
+use std::collections::HashMap;
 use std::fmt;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
@@ -133,6 +134,8 @@ pub struct Settings {
     pub home: Watched,
     /// `[daemon] agent`: wins over both files.
     pub agent: Option<agent::Kind>,
+    /// Each workspace's `.a/config.toml`, shared by all its sessions.
+    workspaces: Mutex<HashMap<PathBuf, Arc<Watched>>>,
 }
 
 impl Settings {
@@ -140,13 +143,21 @@ impl Settings {
         Self {
             home: Watched::new(home),
             agent,
+            workspaces: Mutex::default(),
         }
     }
 
-    /// The workspace's file, read afresh: it is only consulted when a
-    /// session starts or calls the model.
-    fn workspace(workspace: &Path) -> Result<File, String> {
-        load(&workspace.join(".a").join("config.toml"))
+    /// The workspace's file: parsed once per change for every session in
+    /// the workspace, as the home file is.
+    fn workspace(&self, workspace: &Path) -> Loaded {
+        let watched = Arc::clone(
+            lock(&self.workspaces)
+                .entry(workspace.to_path_buf())
+                .or_insert_with(|| {
+                    Arc::new(Watched::new(workspace.join(".a").join("config.toml")))
+                }),
+        );
+        watched.get()
     }
 
     /// The agent a session in `workspace` runs. A file that cannot be read
@@ -156,7 +167,7 @@ impl Settings {
             return kind;
         }
         let named = |file: &Result<File, String>| file.as_ref().ok()?.agent.clone();
-        let name = named(&Self::workspace(workspace)).or_else(|| named(&self.home.get()));
+        let name = named(&self.workspace(workspace)).or_else(|| named(&self.home.get()));
         name.and_then(|name| {
             name.parse()
                 .map_err(|e| eprintln!("agent `{name}` in config.toml: {e}"))
@@ -182,9 +193,9 @@ impl Settings {
         if let (Overrides { model: Some(model) }, seq) = session {
             return Ok((model, Source::Session(seq.unwrap_or_default())));
         }
-        let local = Self::workspace(workspace)?;
-        if let Some(model) = local.model {
-            return Ok((model, Source::Workspace));
+        let local = self.workspace(workspace);
+        if let Some(model) = &local.as_ref().as_ref().map_err(Clone::clone)?.model {
+            return Ok((model.clone(), Source::Workspace));
         }
         let home = self.home.get();
         let home = home.as_ref().as_ref().map_err(Clone::clone)?;

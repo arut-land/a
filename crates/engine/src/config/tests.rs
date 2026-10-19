@@ -133,3 +133,23 @@ fn a_change_made_through_the_daemon_applies_at_once() {
     assert_eq!(s.model(&ws).unwrap(), "bb:m");
     std::fs::remove_dir_all(root).unwrap();
 }
+
+#[test]
+fn a_workspace_file_is_parsed_once_per_change_for_all_its_sessions() {
+    let (root, ws) = dirs("ws-cache", None, Some("model = \"ws:aa\"\n"));
+    let s = settings(&root);
+    assert_eq!(s.model(&ws).unwrap(), "ws:aa");
+    // The same size and time: what was parsed is used, not read again.
+    let path = ws.join(".a/config.toml");
+    let before = std::fs::metadata(&path).unwrap().modified().unwrap();
+    std::fs::write(&path, "model = \"ws:bb\"\n").unwrap();
+    let file = std::fs::File::options().write(true).open(&path).unwrap();
+    file.set_modified(before).unwrap();
+    for _ in 0..3 {
+        assert_eq!(s.model(&ws).unwrap(), "ws:aa");
+    }
+    // A change is read.
+    std::fs::write(&path, "model = \"ws:longer\"\n").unwrap();
+    assert_eq!(s.model(&ws).unwrap(), "ws:longer");
+    std::fs::remove_dir_all(root).unwrap();
+}
