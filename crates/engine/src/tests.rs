@@ -124,7 +124,7 @@ fn busy_sessions_recover_at_startup() {
     for (seq, (tool, input)) in (1..).zip(calls) {
         let body = Body::ToolCall {
             tool: tool.into(),
-            input,
+            input: input.into(),
             id: None,
             card: None,
         };
@@ -146,7 +146,7 @@ fn busy_sessions_recover_at_startup() {
     assert!(matches!(&got[2], Body::Extensions { installed } if installed.len() == 5));
     assert!(matches!(
         &got[3],
-        Body::ToolResult { call: 1, outcome: Outcome::Done { output }, card: None } if output["slept"] == 0
+        Body::ToolResult { call: 1, outcome: Outcome::Done { output }, card: None } if output.value()["slept"] == 0
     ));
     assert!(matches!(
         &got[4],
@@ -308,12 +308,12 @@ fn watches_rearm_after_a_crash_and_fire_once() {
     };
     let sleep = || Body::ToolCall {
         tool: "sleep".into(),
-        input: json!({ "seconds": 0 }),
+        input: json!({ "seconds": 0 }).into(),
         id: None,
         card: None,
     };
     let slept = Outcome::Done {
-        output: json!({ "slept": 0 }),
+        output: json!({ "slept": 0 }).into(),
     };
     let mut parents = Vec::new();
 
@@ -397,7 +397,7 @@ fn an_owner_idles_with_its_children_and_an_interrupt_stops_them_first() {
 
     assert_eq!(owned.len(), 1);
     assert_eq!(busy, Duration::ZERO);
-    let aborted = |b: &Body| matches!(b, Body::ToolResult { outcome: Outcome::Done { output }, .. } if output["aborted"] == true);
+    let aborted = |b: &Body| matches!(b, Body::ToolResult { outcome: Outcome::Done { output }, .. } if output.value()["aborted"] == true);
     assert!(child_log.iter().any(aborted), "{child_log:#?}");
     assert!(
         matches!(parent_log.last(), Some(Body::Assistant { text }) if text.contains("aborted")),
@@ -426,7 +426,7 @@ fn an_orphan_does_not_resume_what_it_was_doing() {
         },
         Body::ToolCall {
             tool: "sleep".into(),
-            input: json!({ "seconds": 0 }),
+            input: json!({ "seconds": 0 }).into(),
             id: None,
             card: None,
         },

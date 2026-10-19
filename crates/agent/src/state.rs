@@ -86,7 +86,7 @@ impl States {
     pub fn replay(&mut self, entries: &[Entry]) {
         for e in entries {
             if let Body::Ext { ext, state, data } = &e.body {
-                self.fold(ext, state, data);
+                self.fold(ext, state, &data.value());
             }
         }
     }

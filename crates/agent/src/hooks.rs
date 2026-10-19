@@ -21,7 +21,7 @@ use std::collections::BTreeMap;
 use std::path::PathBuf;
 use std::sync::Arc;
 
-use protocol::{Decision, Entry, Outcome, Permission, SessionId};
+use protocol::{Decision, Entry, Json, Outcome, Permission, SessionId};
 use serde_json::Value;
 
 /// One hook. Every method defaults to changing nothing. Its decisions are
@@ -224,7 +224,7 @@ impl Hooks {
                     *input = next;
                     let decision = Decision::PreTool {
                         tool: tool.to_owned(),
-                        input: input.clone(),
+                        input: Json::new(input),
                     };
                     decided.push((name, decision));
                 }

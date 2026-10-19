@@ -55,10 +55,10 @@ pub const CHILD_RESULT_LIMIT: usize = 32 * 1024;
 /// [`CHILD_RESULT_LIMIT`].
 pub fn child_result(outcome: &Outcome) -> String {
     let text = match outcome {
-        Outcome::Done {
-            output: Value::String(text),
-        } => format!("The child session finished:\n{text}"),
-        Outcome::Done { output } => format!("The child session finished:\n{output}"),
+        Outcome::Done { output } => match output.parse::<String>() {
+            Ok(text) => format!("The child session finished:\n{text}"),
+            Err(_) => format!("The child session finished:\n{output}"),
+        },
         Outcome::Failed { error } => format!("The child session failed: {error}"),
         Outcome::Interrupted { .. } => "The child session was interrupted.".to_owned(),
     };
@@ -155,7 +155,7 @@ impl Agent for Chat {
                 outcome: Outcome::Done { output },
                 ..
             } => {
-                let Ok(reply) = llm::Response::from_value(&output) else {
+                let Ok(reply) = llm::Response::from_value(&output.value()) else {
                     return Vec::new();
                 };
                 let limited = self.steps >= MAX_STEPS;
@@ -272,7 +272,9 @@ mod tests {
     fn agents_hear_a_childs_result() {
         let done = |output: Value| Input::ChildDone {
             watch: 3,
-            outcome: Outcome::Done { output },
+            outcome: Outcome::Done {
+                output: output.into(),
+            },
         };
         assert_eq!(
             Echo.step(done("hi".into())),
@@ -348,7 +350,7 @@ mod tests {
         Input::ModelDone {
             call: 0,
             outcome: Outcome::Done {
-                output: serde_json::to_value(response).unwrap(),
+                output: serde_json::to_value(response).unwrap().into(),
             },
         }
     }

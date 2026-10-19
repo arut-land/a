@@ -28,7 +28,7 @@ fn facts(entries: &[Entry]) -> Vec<(u64, &Body)> {
 fn finds_calls_without_outcomes() {
     let tool_call = |tool: &str| Body::ToolCall {
         tool: tool.into(),
-        input: json!({}),
+        input: json!({}).into(),
         id: None,
         card: None,
     };
@@ -64,7 +64,7 @@ fn finds_calls_without_outcomes() {
 #[test]
 fn transcripts_of_earlier_logs_read_replies_as_text() {
     let done = Outcome::Done {
-        output: json!({ "text": "hello", "usage": { "input": 1, "output": 1 } }),
+        output: json!({ "text": "hello", "usage": { "input": 1, "output": 1 } }).into(),
     };
     let entries = [
         entry(1, Body::User { text: "hi".into() }),
@@ -375,8 +375,8 @@ fn the_model_calls_a_tool_and_answers_from_its_result() {
                 Body::ToolResult { call: 4, outcome: Outcome::Done { output }, card: None },
                 Body::ModelCall { .. },
                 Body::ModelResult { call: 6, outcome: Outcome::Done { output: answer } },
-            ] if tool == "lookup_harbor_label" && id == call_id && output == "crimson-harbor"
-                && answer["message"]["content"][1]["text"] == "The harbor label is crimson-harbor."
+            ] if tool == "lookup_harbor_label" && id == call_id && output.value() == "crimson-harbor"
+                && answer.value()["message"]["content"][1]["text"] == "The harbor label is crimson-harbor."
         ),
         "{log:#?}"
     );
@@ -513,7 +513,7 @@ fn live_the_model_calls_a_tool_and_answers_from_its_result() {
     assert!(
         log.iter().any(|e| matches!(
             &e.body,
-            Body::ToolResult { outcome: Outcome::Done { output }, .. } if output == "crimson-harbor"
+            Body::ToolResult { outcome: Outcome::Done { output }, .. } if output.value() == "crimson-harbor"
         )),
         "{log:#?}"
     );
@@ -676,7 +676,7 @@ fn hook_decisions_are_logged_and_replay_to_the_same_state() {
             }),
             &Body::ToolCall {
                 tool: "bash".into(),
-                input: json!({ "command": "echo hi" }),
+                input: json!({ "command": "echo hi" }).into(),
                 id: None,
                 card: Some(Card {
                     title: "$ echo hi".into(),
@@ -865,7 +865,7 @@ fn an_ask_waits_in_the_inbox_through_a_stop_and_runs_once_approved() {
                     outcome: Outcome::Done { output },
                     card: Some(card),
                 },
-            ] if output["output"] == "approved\n" && card.note == "exit 0"
+            ] if output.value()["output"] == "approved\n" && card.note == "exit 0"
         ),
         "{log:#?}"
     );
@@ -907,7 +907,7 @@ fn a_refused_ask_answers_the_call_without_running_it() {
 fn a_recap_tells_the_last_prompt_and_what_followed() {
     let call = |tool: &str| Body::ToolCall {
         tool: tool.into(),
-        input: json!({}),
+        input: json!({}).into(),
         id: None,
         card: None,
     };
@@ -1219,7 +1219,7 @@ fn the_shell_directory_survives_a_restart_and_an_interrupt_stops_a_call() {
         panic!("{ran:#?}")
     };
     assert!(
-        output["output"]
+        output.value()["output"]
             .as_str()
             .unwrap()
             .ends_with(&format!("/{dir}\n")),
@@ -1245,7 +1245,7 @@ fn the_shell_directory_survives_a_restart_and_an_interrupt_stops_a_call() {
     else {
         panic!("{log:#?}")
     };
-    assert_eq!(output["aborted"], true, "{output}");
+    assert_eq!(output.value()["aborted"], true, "{output}");
 }
 
 #[test]
@@ -1457,7 +1457,7 @@ fn an_unsafe_call_cut_off_reports_the_output_it_committed() {
     );
     let bash = Body::ToolCall {
         tool: "bash".into(),
-        input: json!({ "command": "make" }),
+        input: json!({ "command": "make" }).into(),
         id: None,
         card: None,
     };
@@ -1514,13 +1514,13 @@ fn the_model_is_set_per_session_and_says_where_it_comes_from() {
         settle(&session);
     }
     let log = log_of(&session);
-    let results: Vec<&Value> = log
+    let results: Vec<Value> = log
         .iter()
         .filter_map(|e| match &e.body {
             Body::CommandResult {
                 outcome: Outcome::Done { output },
                 ..
-            } => Some(output),
+            } => Some(output.value()),
             _ => None,
         })
         .collect();
@@ -1528,10 +1528,10 @@ fn the_model_is_set_per_session_and_says_where_it_comes_from() {
     assert_eq!(
         results,
         [
-            &set("the daemon's environment", "gpt-5.6"),
-            &set("this session, at entry 4", "anthropic:claude-x"),
-            &set("this session, at entry 4", "anthropic:claude-x"),
-            &set("the daemon's environment", "gpt-5.6"),
+            set("the daemon's environment", "gpt-5.6"),
+            set("this session, at entry 4", "anthropic:claude-x"),
+            set("this session, at entry 4", "anthropic:claude-x"),
+            set("the daemon's environment", "gpt-5.6"),
         ]
     );
     let chosen = Body::Settings(Overrides {

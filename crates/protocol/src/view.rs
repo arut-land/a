@@ -15,9 +15,8 @@ use std::path::PathBuf;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
-use crate::tagged::tagged;
 use crate::{
-    Body, Card, DaemonMsg, Decision, Decode, Entry, Environment, Outcome, Permission, Recap,
+    Body, Card, DaemonMsg, Decision, Decode, Entry, Environment, Json, Outcome, Permission, Recap,
     SessionId, SessionSummary,
 };
 
@@ -69,67 +68,66 @@ pub struct Stream {
     pub text: String,
 }
 
-tagged! {
-    /// A transcript item, keyed by the seq of the entry that started it (for a
-    /// call, its call id).
-    #[derive(Clone, Debug, PartialEq)]
-    pub enum Item in "type" {
-        User {
-            seq: u64,
-            text: String,
-        },
-        Assistant {
-            seq: u64,
-            text: String,
-        },
-        /// A model call and the reply it got.
-        Reply {
-            call: u64,
-            model: String,
-            text: String,
-            status: Status,
-            usage: Option<Usage>,
-        },
-        Tool {
-            call: u64,
-            tool: String,
-            input: Value,
-            approval: Option<Approval>,
-            outcome: Option<Outcome>,
-            /// How the tool presents the call, or once it has one, its outcome.
-            #[serde(default, skip_serializing_if = "Option::is_none")]
-            card: Option<Card>,
-            /// Whether this client was asked to approve it.
-            #[serde(skip)]
-            asked: bool,
-        },
-        /// A slash command and its outcome.
-        Command {
-            call: u64,
-            name: String,
-            args: String,
-            outcome: Option<Outcome>,
-        },
-        /// A hook decision, other than a user's answer to an ask (which is the
-        /// call's [`Approval`]).
-        Hook {
-            seq: u64,
-            hook: String,
-            decision: Decision,
-        },
-        /// A child session started by call `call`, and its watch.
-        Child {
-            call: u64,
-            child: SessionId,
-            input: String,
-            watch: Option<u64>,
-            fired: Option<Outcome>,
-        },
-        Environment {
-            seq: u64,
-            cwd: PathBuf,
-        },
-    }
+/// A transcript item, keyed by the seq of the entry that started it (for a
+/// call, its call id).
+#[derive(Clone, Debug, PartialEq, Serialize)]
+#[serde(tag = "type", rename_all = "snake_case")]
+pub enum Item {
+    User {
+        seq: u64,
+        text: String,
+    },
+    Assistant {
+        seq: u64,
+        text: String,
+    },
+    /// A model call and the reply it got.
+    Reply {
+        call: u64,
+        model: String,
+        text: String,
+        status: Status,
+        usage: Option<Usage>,
+    },
+    Tool {
+        call: u64,
+        tool: String,
+        input: Json,
+        approval: Option<Approval>,
+        outcome: Option<Outcome>,
+        /// How the tool presents the call, or once it has one, its outcome.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        card: Option<Card>,
+        /// Whether this client was asked to approve it.
+        #[serde(skip)]
+        asked: bool,
+    },
+    /// A slash command and its outcome.
+    Command {
+        call: u64,
+        name: String,
+        args: String,
+        outcome: Option<Outcome>,
+    },
+    /// A hook decision, other than a user's answer to an ask (which is the
+    /// call's [`Approval`]).
+    Hook {
+        seq: u64,
+        hook: String,
+        decision: Decision,
+    },
+    /// A child session started by call `call`, and its watch.
+    Child {
+        call: u64,
+        child: SessionId,
+        input: String,
+        watch: Option<u64>,
+        fired: Option<Outcome>,
+    },
+    Environment {
+        seq: u64,
+        cwd: PathBuf,
+    },
 }
 
 impl Item {
@@ -148,14 +146,13 @@ impl Item {
     }
 }
 
-tagged! {
-    #[derive(Clone, Debug, PartialEq, Eq)]
-    pub enum Status in "status" {
-        Running,
-        Done,
-        Failed { error: String },
-        Interrupted,
-    }
+#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
+#[serde(tag = "status", rename_all = "snake_case")]
+pub enum Status {
+    Running,
+    Done,
+    Failed { error: String },
+    Interrupted,
 }
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -580,8 +577,9 @@ impl SessionView {
         };
         *status = match outcome {
             Outcome::Done { output } => {
-                *text = reply_text(output);
-                *usage = usage_of(output);
+                let output = output.value();
+                *text = reply_text(&output);
+                *usage = usage_of(&output);
                 Status::Done
             }
             Outcome::Failed { error } => Status::Failed {
@@ -594,7 +592,7 @@ impl SessionView {
 
     /// The daemon asks this client to approve `call`: on the call's ask
     /// entry, and again on every attach while it waits.
-    fn ask(&mut self, call: u64, tool: &str, input: &Value) -> Option<Change> {
+    fn ask(&mut self, call: u64, tool: &str, input: &Json) -> Option<Change> {
         let at = match self.items.binary_search_by_key(&call, Item::key) {
             Ok(at) => at,
             // Attached after the call: show it from the ask.
@@ -676,21 +674,24 @@ fn usage_of(output: &Value) -> Option<Usage> {
 
 /// A tool call in one line: as its tool presents it, else a command as
 /// `$ command` and anything else as the tool and its input.
-pub fn call_title(tool: &str, input: &Value, card: Option<&Card>) -> String {
-    match (card, input["command"].as_str()) {
-        (Some(card), _) => card.title.clone(),
-        (None, Some(command)) => format!("$ {command}"),
-        (None, None) => format!("{tool} {input}"),
+pub fn call_title(tool: &str, input: &Json, card: Option<&Card>) -> String {
+    if let Some(card) = card {
+        return card.title.clone();
+    }
+    match input.value()["command"].as_str() {
+        Some(command) => format!("$ {command}"),
+        None => format!("{tool} {input}"),
     }
 }
 
 /// A finished call's output as text and a short note on it: as its tool's
 /// card presents it, else a command's streams and exit status as older logs
 /// hold them. `None` for any other output.
-pub fn output_text(output: &Value, card: Option<&Card>) -> Option<(String, String)> {
+pub fn output_text(output: &Json, card: Option<&Card>) -> Option<(String, String)> {
     if let Some(card) = card.filter(|c| !c.body.is_empty() || !c.note.is_empty()) {
         return Some((card.body.clone(), card.note.clone()));
     }
+    let output = output.value();
     let stdout = output["stdout"].as_str()?;
     let stderr = output["stderr"].as_str().unwrap_or_default();
     Some((
@@ -779,7 +780,7 @@ impl SessionList {
 
 impl Decode for SessionView {
     fn from_json(bytes: &[u8]) -> serde_json::Result<Self> {
-        Self::deserialize(crate::value(bytes)?)
+        serde_json::from_slice(bytes)
     }
 }
 
