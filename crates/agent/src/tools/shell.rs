@@ -226,6 +226,14 @@ fn model_text(ran: &Ran) -> String {
 async fn run(input: Command, cx: &Cx) -> io::Result<Ran> {
     let started = Instant::now();
     let dir = cx.dir();
+    // An interrupted turn's call starts nothing.
+    if cx.cancel.is_cancelled() {
+        return Ok(Ran {
+            aborted: true,
+            cwd: dir,
+            ..Ran::default()
+        });
+    }
     let env = environment(cx, std::env::vars());
     let log = cx.spill.join(format!("{}.log", cx.call));
     if input.background {
