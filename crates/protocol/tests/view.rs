@@ -422,6 +422,36 @@ fn attaching_to_another_session_starts_over() {
     assert_eq!(view.seq, 0);
 }
 
+#[test]
+fn a_retry_streams_one_attempt() {
+    let delta = |text: &str| DaemonMsg::Delta {
+        call: 2,
+        text: text.into(),
+    };
+    let retry = Body::Hook {
+        hook: "retry".into(),
+        decision: Decision::Retry {
+            call: 2,
+            attempt: 1,
+            error: "overloaded".into(),
+        },
+    };
+    let msgs = [
+        DaemonMsg::Attached {
+            session: SESSION,
+            workspace: "/w".into(),
+        },
+        DaemonMsg::Entry(Entry::new(1, 0, Body::ModelCall { model: "m".into() })),
+        delta("The har"),
+        DaemonMsg::Entry(Entry::new(2, 0, retry)),
+        delta("The harbor"),
+    ];
+    let mut view = folded(&msgs[..3]);
+    fold(&mut view, &msgs[3..]);
+    let streaming = view.streaming.unwrap();
+    assert_eq!((streaming.call, streaming.text.as_str()), (2, "The harbor"));
+}
+
 fn vectors_path() -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/vectors/view.json")
 }

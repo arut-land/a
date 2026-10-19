@@ -535,11 +535,20 @@ impl SessionView {
                 decision: Decision::Approval { call: Some(_), .. },
                 ..
             } => return self.change(seq, &e.body),
-            Body::Hook { hook, decision } => Item::Hook {
-                seq,
-                hook: hook.clone(),
-                decision: decision.clone(),
-            },
+            Body::Hook { hook, decision } => {
+                // A retry streams anew: the failed attempt's text is not
+                // part of the reply.
+                if let Decision::Retry { call, .. } = decision
+                    && self.streaming.as_ref().is_some_and(|s| s.call == *call)
+                {
+                    self.streaming = None;
+                }
+                Item::Hook {
+                    seq,
+                    hook: hook.clone(),
+                    decision: decision.clone(),
+                }
+            }
             Body::Link { child, input } => Item::Child {
                 call: seq,
                 child: *child,

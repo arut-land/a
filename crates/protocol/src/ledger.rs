@@ -50,6 +50,8 @@ pub struct Open {
     pub processes: Vec<(u32, String)>,
     /// The output it committed as it ran.
     pub progress: Option<String>,
+    /// The retries logged for it: a model call's attempt is one more.
+    pub retries: u32,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -241,6 +243,11 @@ impl Ledger {
                     };
                     self.inbox.retain(|c| c != call);
                 }
+                if let Decision::Retry { call, .. } = decision
+                    && let Some(open) = self.open.get_mut(*call)
+                {
+                    open.retries += 1;
+                }
                 self.hooks.push((hook.clone(), decision.clone()));
             }
             _ => {}
@@ -255,6 +262,7 @@ impl Ledger {
                 phase: Phase::Called,
                 processes: Vec::new(),
                 progress: None,
+                retries: 0,
             },
         );
     }

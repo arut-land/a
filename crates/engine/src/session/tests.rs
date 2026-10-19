@@ -478,18 +478,36 @@ fn the_model_calls_a_tool_and_answers_from_its_result() {
     );
 
     // Stopped after any fact, a session picks up from its log and ends the
-    // same way, sending the model the same second request.
+    // same way, sending the model the same second request. A model call
+    // cut off is an attempt that failed: its retry is logged.
     for cut in 3..=6 {
         let script = Script::new(&replies[1..]);
+        let registry = Registry::default().with(&Harbor).unwrap();
+        let retry = ext_retry::Retry {
+            base: Duration::ZERO,
+            ..ext_retry::Retry::default()
+        };
         let fixture = Fixture::new(
             ext_chat::CHAT,
-            Registry::default().with(&Harbor).unwrap(),
+            registry.with(&retry).unwrap(),
             openai(&script),
         );
         let resumed = fixture.start(&log[..cut]);
         let got = log_of(&resumed);
         resumed.stop();
-        assert_eq!(facts(&got), facts(&log), "cut after {cut}");
+        let mut want = bodies(&log);
+        let retried = Body::Hook {
+            hook: "retry".into(),
+            decision: Decision::Retry {
+                call: 6,
+                attempt: 1,
+                error: "the daemon stopped during the call".into(),
+            },
+        };
+        if cut == 6 {
+            want.insert(6, &retried);
+        }
+        assert_eq!(bodies(&got), want, "cut after {cut}");
         assert_eq!(script.sent(), sent[1..], "cut after {cut}");
     }
 }
@@ -1239,9 +1257,11 @@ impl Extension for Extras {
                 Rewrite::Replace(input)
             })
             .on::<point::RequestError>(|_, failed| {
-                Some(llm::Request {
-                    model: "retried".into(),
-                    ..failed.request.clone()
+                (failed.attempt < 2).then(|| {
+                    Recover::Replace(Box::new(llm::Request {
+                        model: "retried".into(),
+                        ..failed.request.clone()
+                    }))
                 })
             });
     }
@@ -1849,3 +1869,4 @@ fn input_taken_in_during_recovery_runs_once() {
 }
 mod interrupt;
 mod log;
+mod retry;

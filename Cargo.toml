@@ -18,6 +18,7 @@ ext-edit = { path = "crates/ext-edit" }
 ext-fixtures = { path = "crates/ext-fixtures" }
 ext-policy = { path = "crates/ext-policy" }
 ext-prompt = { path = "crates/ext-prompt" }
+ext-retry = { path = "crates/ext-retry" }
 ext-shell = { path = "crates/ext-shell" }
 client = { path = "crates/client" }
 engine = { path = "crates/engine" }

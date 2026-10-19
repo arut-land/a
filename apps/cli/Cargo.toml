@@ -15,6 +15,7 @@ ext-edit = { workspace = true, optional = true }
 ext-fixtures.workspace = true
 ext-policy = { workspace = true, optional = true }
 ext-prompt = { workspace = true, optional = true }
+ext-retry = { workspace = true, optional = true }
 ext-shell = { workspace = true, optional = true }
 protocol.workspace = true
 sys.workspace = true
@@ -24,7 +25,7 @@ usage-rs.workspace = true
 web = { workspace = true, optional = true }
 
 [features]
-default = ["web", "policy", "prompt", "shell", "edit", "chat"]
+default = ["web", "policy", "prompt", "shell", "edit", "chat", "retry"]
 # `a web`; about 110 KiB of the release binary.
 web = ["dep:web"]
 # Which calls wait for the user's approval.
@@ -37,6 +38,8 @@ shell = ["dep:ext-shell"]
 edit = ["shell", "dep:ext-edit"]
 # The model-backed `chat` agent.
 chat = ["dep:ext-chat"]
+# Model requests that failed for a reason that may pass are sent again.
+retry = ["dep:ext-retry"]
 # The `echo` agent and `sleep` tool; the tests build them in, as the
 # dev-dependency below turns them on.
 fixtures = ["ext-fixtures/on"]

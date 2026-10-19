@@ -11,6 +11,7 @@ use std::task::{Poll, Waker};
 use std::time::{Duration, Instant};
 
 use ext::host::{Decided, Gate, Host, Parts, Registry};
+use ext::point::{Failed, Recover};
 use ext::{Action, Agent, Cancel, Cx, DynTool, Facts, Input, Replay, Route, States};
 use protocol::ledger::{self, Ledger, Phase};
 use protocol::view::SessionView;
@@ -1045,7 +1046,7 @@ impl Session {
                     .as_ref()
                     .map_or_else(|_| "none".to_owned(), Model::name);
                 let seq = self.append(Body::ModelCall { model: name }).await?;
-                (Call::Model, seq, self.run_model(seq, model).await)
+                (Call::Model, seq, self.run_model(seq, model, false).await)
             }
             Action::RunTool {
                 tool,
@@ -1148,9 +1149,10 @@ impl Session {
         })
     }
 
-    async fn run_call(&self, call: &Call, seq: u64) -> Outcome {
+    /// Runs again call `seq`, which a crash cut off.
+    async fn rerun(&self, call: &Call, seq: u64) -> Outcome {
         match call {
-            Call::Model => self.run_model(seq, self.model()).await,
+            Call::Model => self.run_model(seq, self.model(), true).await,
             Call::Tool { tool, input } => self.run_tool(seq, tool, input).await,
         }
     }
@@ -1379,8 +1381,9 @@ impl Session {
 
     /// Asks `model` to reply to the transcript before `call`, offering the
     /// tools. Text streams to clients as it arrives; only the finished reply
-    /// is committed, or on an interrupt the text so far.
-    async fn run_model(&self, call: u64, model: Result<Model, String>) -> Outcome {
+    /// is committed, or on an interrupt the text so far. A call recovery
+    /// runs again had an attempt cut off by a crash: it counts as failed.
+    async fn run_model(&self, call: u64, model: Result<Model, String>, resumed: bool) -> Outcome {
         let model = match model {
             Ok(model) => model,
             Err(error) => return Outcome::Failed { error },
@@ -1396,13 +1399,9 @@ impl Session {
                 error: e.to_string(),
             };
         }
-        let mut on_text = |text: &str| {
-            self.broadcast(&DaemonMsg::Delta {
-                call,
-                text: text.to_owned(),
-            });
-        };
-        contain(self.reply(call, &model, &registry, request, &mut on_text)).await
+        let cut = resumed
+            .then(|| llm::Error::new(llm::Kind::Incomplete, "the daemon stopped during the call"));
+        contain(self.reply(call, &model, &registry, request, cut)).await
     }
 
     /// The request for model call `call`: the system prompt, the transcript
@@ -1445,73 +1444,110 @@ impl Session {
         history
     }
 
-    /// `model`'s reply to `request`, retried as the `request_error` hooks
-    /// ask. The whole reply is the fact: replaying it later sends the
-    /// provider's own items (signatures, encrypted reasoning) back. An
-    /// interrupt keeps the text so far, which the reply held.
+    /// `model`'s reply to `request`, recovered from failures as the
+    /// `request_error` hooks say. Each attempt streams on its own: what an
+    /// interrupt keeps is the text of the attempt it cut off. The whole
+    /// reply is the fact: replaying it later sends the provider's own items
+    /// (signatures, encrypted reasoning) back. `failed` is an attempt that
+    /// failed before this was called.
     async fn reply(
         &self,
         call: u64,
         model: &Model,
         registry: &Registry,
         mut request: llm::Request,
-        on_text: &mut (dyn FnMut(&str) + Send),
+        mut failed: Option<llm::Error>,
     ) -> Outcome {
         let cancel = self.turn();
-        let mut retries = 0;
+        // Counted in the log, so a crash does not start the count again.
+        let mut attempt = self.lock().ledger.call(call).map_or(0, |open| open.retries);
         loop {
-            // Sent once polled, as an interrupt meanwhile finds it.
-            let mut events = None;
-            let reading = async {
-                let events = events.insert(model.send(&request));
-                crate::model::read(events, on_text).await
+            let error = match failed.take() {
+                Some(error) => error,
+                None => match self.attempt(call, model, &request, &cancel).await {
+                    Ok(outcome) => return outcome,
+                    Err(error) => error,
+                },
             };
-            let Some(read) = unless(&cancel, reading).await else {
-                return Outcome::Interrupted {
-                    output: events.and_then(llm::Events::interrupted),
+            // An interrupted turn asks for no retry.
+            if cancel.is_cancelled() {
+                return Outcome::Failed {
+                    error: error.to_string(),
+                };
+            }
+            let mut decided = Decided::new();
+            let failure = Failed {
+                request: &request,
+                error: &error,
+                attempt,
+            };
+            let recover =
+                registry
+                    .hooks()
+                    .request_error(&self.point(), call, failure, &mut decided);
+            let Some(recover) = recover else {
+                return Outcome::Failed {
+                    error: error.to_string(),
                 };
             };
-            let replied = read.and_then(|()| {
-                let events = events.ok_or_else(llm::Error::incomplete)?;
-                events.finish(Some(model.origin(&request)))
-            });
-            let error = match replied {
-                Ok(reply) => {
-                    return match serde_json::to_value(&reply) {
-                        Ok(output) => {
-                            *lock(&self.replied) = Some((call, reply.message));
-                            Outcome::Done {
-                                output: output.into(),
-                            }
-                        }
-                        Err(error) => Outcome::Failed {
-                            error: error.to_string(),
-                        },
-                    };
+            if self.decide(decided).await.is_err() {
+                return Outcome::Failed {
+                    error: error.to_string(),
+                };
+            }
+            attempt += 1;
+            match recover {
+                Recover::Retry { after } => {
+                    if unless(&cancel, self.shared.rt.sleep(after)).await.is_none() {
+                        return Outcome::Interrupted { output: None };
+                    }
                 }
-                Err(error) => error.to_string(),
-            };
-            let mut decided = Decided::new();
-            // An interrupted turn asks for no retry.
-            let retry = (retries < MAX_RETRIES && !cancel.is_cancelled())
-                .then(|| {
-                    registry.hooks().request_error(
-                        &self.point(),
-                        (call, retries + 1),
-                        &request,
-                        &error,
-                        &mut decided,
-                    )
-                })
-                .flatten();
-            match retry {
-                Some(next) if self.decide(decided).await.is_ok() => {
-                    request = next;
-                    retries += 1;
-                }
-                _ => return Outcome::Failed { error },
+                Recover::Replace(next) => request = *next,
             }
         }
+    }
+
+    /// One attempt at `model`'s reply to `request`, its text streaming to
+    /// clients as it arrives: the outcome, unless it failed.
+    async fn attempt(
+        &self,
+        call: u64,
+        model: &Model,
+        request: &llm::Request,
+        cancel: &Cancel,
+    ) -> Result<Outcome, llm::Error> {
+        let mut on_text = |text: &str| {
+            self.broadcast(&DaemonMsg::Delta {
+                call,
+                text: text.to_owned(),
+            });
+        };
+        // Sent once polled, as an interrupt meanwhile finds it.
+        let mut events = None;
+        let reading = async {
+            let events = events.insert(model.send(request));
+            crate::model::read(events, &mut on_text).await
+        };
+        let Some(read) = unless(cancel, reading).await else {
+            return Ok(Outcome::Interrupted {
+                output: events.and_then(llm::Events::interrupted),
+            });
+        };
+        let reply = read.and_then(|()| {
+            let events = events.ok_or_else(llm::Error::incomplete)?;
+            events.finish(Some(model.origin(request)))
+        })?;
+        Ok(match serde_json::to_value(&reply) {
+            Ok(output) => {
+                *lock(&self.replied) = Some((call, reply.message));
+                Outcome::Done {
+                    output: output.into(),
+                }
+            }
+            Err(error) => Outcome::Failed {
+                error: error.to_string(),
+            },
+        })
     }
 
     /// Picks up where the log leaves off. Links are re-armed; the agent is
@@ -1635,7 +1671,7 @@ impl Session {
             }
             _ => {
                 self.flush().await?;
-                self.run_call(&call, seq).await
+                self.rerun(&call, seq).await
             }
         };
         self.finish(&call, seq, outcome).await
@@ -1708,9 +1744,6 @@ async fn unless<T>(cancel: &Cancel, work: impl Future<Output = T>) -> Option<T> 
     })
     .await
 }
-
-/// Model calls one request may be retried, as `request_error` hooks ask.
-const MAX_RETRIES: u32 = 2;
 
 /// The engine as tool or command call `call` reaches it, on the registry
 /// generation it started with.

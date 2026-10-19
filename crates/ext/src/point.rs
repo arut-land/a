@@ -6,7 +6,7 @@
 //! | --- | --- |
 //! | [`Input`] | replacement chain over the user's text; the first rejection wins |
 //! | [`PrepareStep`] | replacement chain: each handler sees the request the last left |
-//! | [`RequestError`] | the first retry wins |
+//! | [`RequestError`] | the first recovery wins |
 //! | [`PreTool`] | replacement chain over the input; the first block wins |
 //! | [`Permission`] | the most restrictive wins: deny > defer > ask > allow |
 //! | [`Approve`] | the first answer wins |
@@ -26,6 +26,7 @@ use std::any::{Any, TypeId};
 use std::convert::Infallible;
 use std::path::Path;
 use std::sync::Arc;
+use std::time::Duration;
 
 use protocol::{Decision, Entry, Json, Outcome, SessionId};
 use serde::de::DeserializeOwned;
@@ -248,7 +249,20 @@ pub struct Finished<'a> {
 #[derive(Clone, Copy, Debug)]
 pub struct Failed<'a> {
     pub request: &'a llm::Request,
-    pub error: &'a str,
+    pub error: &'a llm::Error,
+    /// Which attempt failed: 0 for the first request, and counted in the
+    /// log, so a restart does not start the count again.
+    pub attempt: u32,
+}
+
+/// What to do about a failed model request.
+#[derive(Clone, Debug, PartialEq)]
+pub enum Recover {
+    /// Sends the same request again once `after` has passed; an interrupt
+    /// meanwhile ends the call with nothing sent.
+    Retry { after: Duration },
+    /// Sends `request` instead, at once: a compacted one, say.
+    Replace(Box<llm::Request>),
 }
 
 /// Declares a point whose handlers read its facts as they are.
@@ -300,11 +314,11 @@ impl Point for PrepareStep {
 }
 
 point!(
-    /// A request to send instead of one that failed, such as a compacted
-    /// one after a context overflow.
+    /// How to recover from a failed model request: send it again later, or
+    /// another in its place. With no answer the call fails.
     RequestError = "request_error",
     Failed<'a>,
-    Option<llm::Request>
+    Option<Recover>
 );
 
 /// What a tool call runs with: a replacement input, or a block that
@@ -611,25 +625,23 @@ impl Hooks {
         .map_err(|(name, reason)| format!("{name}: {reason}"))
     }
 
-    /// The request to retry model call `call` with after `error`, for the
-    /// `attempt`th time, if any handler offers one.
+    /// How to recover model call `call` from `failed`, if any handler
+    /// says; logged as the attempt it starts.
     pub fn request_error(
         &self,
         cx: &PointCx<'_>,
-        (call, attempt): (u64, u32),
-        request: &llm::Request,
-        error: &str,
+        call: u64,
+        failed: Failed<'_>,
         decided: &mut Decided,
-    ) -> Option<llm::Request> {
-        let (name, retry) = self.ask::<RequestError>(cx, Failed { request, error })?;
-        let error = error.to_owned();
+    ) -> Option<Recover> {
+        let (name, recover) = self.ask::<RequestError>(cx, failed)?;
         let decision = Decision::Retry {
             call,
-            attempt,
-            error,
+            attempt: failed.attempt + 1,
+            error: failed.error.to_string(),
         };
         decided.push((name, decision));
-        Some(retry)
+        Some(recover)
     }
 
     pub fn spawn(&self, cx: &PointCx<'_>, spawn: &mut crate::SpawnSpec) {

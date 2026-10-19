@@ -14,6 +14,7 @@ dependencies = [
  "ext-fixtures",
  "ext-policy",
  "ext-prompt",
+ "ext-retry",
  "ext-shell",
  "libc",
  "protocol",
@@ -549,7 +550,9 @@ dependencies = [
  "ext-fixtures",
  "ext-policy",
  "ext-prompt",
+ "ext-retry",
  "ext-shell",
+ "futures-core",
  "http",
  "llm",
  "memchr",
@@ -656,6 +659,14 @@ name = "ext-prompt"
 version = "0.0.0"
 dependencies = [
  "ext",
+]
+
+[[package]]
+name = "ext-retry"
+version = "0.0.0"
+dependencies = [
+ "ext",
+ "llm",
 ]
 
 [[package]]

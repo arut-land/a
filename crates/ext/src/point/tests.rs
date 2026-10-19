@@ -230,11 +230,19 @@ fn merge_rules_are_applied_identically_for_every_point() {
     chains::<Spawn, _, _>((), ["0", "a", "b"].map(spawn), None);
     chains::<PostTool, _, _>(call, ["0", "a", "b"].map(failed), None);
 
+    let overflow = llm::Error::new(llm::Kind::ContextOverflow, "overflow");
     let error = Failed {
         request: &llm::Request::default(),
-        error: "overflow",
+        error: &overflow,
+        attempt: 0,
     };
-    first::<RequestError, _>(error, [request("a"), request("b")]);
+    first::<RequestError, _>(
+        error,
+        [
+            Recover::Replace(Box::new(request("a"))),
+            Recover::Replace(Box::new(request("b"))),
+        ],
+    );
     first::<Approve, _>(call, [true, false]);
     first::<OnStop, _>(&Vec::new(), ["a", "b"].map(str::to_owned));
 
@@ -290,7 +298,13 @@ fn a_point_with_no_handler_costs_nothing() {
             Ok(Gate::Run)
         );
         hooks.prepare_step(&cx, 1, &mut request, &mut decided);
-        let retry = hooks.request_error(&cx, (1, 1), &request, "e", &mut decided);
+        let error = llm::Error::new(llm::Kind::Server, "e");
+        let failed = Failed {
+            request: &request,
+            error: &error,
+            attempt: 0,
+        };
+        let retry = hooks.request_error(&cx, 1, failed, &mut decided);
         assert!(retry.is_none());
         hooks.post_tool(&cx, 1, ("t", &input), &mut outcome, &mut decided);
         hooks.observe(&cx, &Entry::new(1, 0, protocol::Body::Interrupt));
