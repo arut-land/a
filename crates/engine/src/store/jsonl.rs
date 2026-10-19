@@ -95,6 +95,7 @@ impl LogStore for Jsonl {
         Ok(index.loaded(seq, epoch, None))
     }
 
+    #[cfg(test)]
     fn entries(&self, id: SessionId) -> io::Result<Vec<Entry>> {
         let mut entries = Vec::new();
         Index::new(File::open(self.path(id))?, 0).scan(|e| entries.push(e))?;

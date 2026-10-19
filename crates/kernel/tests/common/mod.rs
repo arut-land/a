@@ -193,7 +193,7 @@ impl Registry for Reg {
         Some((name("retry"), Recover::Retry { after }))
     }
 
-    fn on_stop(&self, _: &[&Entry]) -> Option<(Name, String)> {
+    fn on_stop(&self) -> Option<(Name, String)> {
         let text = self.on_stop?;
         (!self.stopped.swap(true, Ordering::SeqCst)).then(|| (name("policy"), text.to_owned()))
     }

@@ -301,9 +301,8 @@ pub trait Registry: Send + Sync {
     }
 
     /// The `on_stop` point: text for the agent to go on with once it
-    /// stopped. `pending` are the entries this step appended, which the
-    /// log the driver commits does not hold yet.
-    fn on_stop(&self, _pending: &[&Entry]) -> Option<(Name, String)> {
+    /// stopped.
+    fn on_stop(&self) -> Option<(Name, String)> {
         None
     }
 }

@@ -549,7 +549,7 @@ impl Core {
                 continue;
             }
             let stopped = mem::take(&mut self.fold.stepped)
-                .then(|| self.registry.on_stop(&appended(fx)))
+                .then(|| self.registry.on_stop())
                 .flatten();
             if let Some((by, text)) = stopped {
                 self.decide(None, &by, Verdict::OnStop { text }, fx);
@@ -1048,16 +1048,6 @@ impl Core {
             Turn::Idle | Turn::Model { .. } => {}
         }
     }
-}
-
-/// The entries `fx` appends.
-fn appended(fx: &Effects) -> SmallVec<[&Entry; 8]> {
-    (fx.iter())
-        .filter_map(|e| match e {
-            Effect::Append(e) => Some(e),
-            _ => None,
-        })
-        .collect()
 }
 
 fn reply(fx: &mut Effects, ticket: Option<Ticket>, result: Result<(), String>) {

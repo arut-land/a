@@ -109,6 +109,7 @@ pub trait LogStore: Send + Sync {
 
     /// One session's committed entries, read without taking its lease: its
     /// writer goes on appending.
+    #[cfg(test)]
     fn entries(&self, id: SessionId) -> io::Result<Vec<Entry>>;
 
     /// The number of committed entries, without loading them.

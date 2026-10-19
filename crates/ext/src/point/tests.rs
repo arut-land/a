@@ -240,7 +240,7 @@ fn merge_rules_are_applied_identically_for_every_point() {
         ],
     );
     first::<Approve, _>(call, [true, false]);
-    first::<OnStop, _>(&Vec::new(), ["a", "b"].map(str::to_owned));
+    first::<OnStop, _>((), ["a", "b"].map(str::to_owned));
 
     let entry = Entry::new(1, 0, protocol::Body::INTERRUPT);
     observes::<Observe>(&entry);
@@ -280,7 +280,7 @@ fn a_point_with_no_handler_costs_nothing() {
     let input = json!({ "n": 0 });
     // Handlers elsewhere are not asked, nor is the context read.
     let elsewhere = hooks(vec![one("other", |r| {
-        r.on::<OnStop>(|cx, _| Some(cx.model()));
+        r.on::<OnStop>(|cx, ()| Some(cx.model()));
     })]);
     for hooks in [Hooks::default(), elsewhere] {
         let outcome = Outcome::Interrupted { output: None };
@@ -303,9 +303,9 @@ fn a_point_with_no_handler_costs_nothing() {
     assert_eq!(view.0.load(Ordering::SeqCst), 0);
     // A handler that reads its context reads it then.
     let reads = hooks(vec![one("reader", |r| {
-        r.on::<OnStop>(|cx, _| Some(cx.model()));
+        r.on::<OnStop>(|cx, ()| Some(cx.model()));
     })]);
-    let said = reads.on_stop(&cx, &Vec::new());
+    let said = reads.on_stop(&cx);
     assert_eq!(said.map(|(_, text)| text).as_deref(), Some("test:model"));
     assert_eq!(view.0.load(Ordering::SeqCst), 1);
 }

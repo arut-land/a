@@ -6,18 +6,18 @@ use std::any::{Any, TypeId};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex, OnceLock, PoisonError};
 
-use protocol::{Environment, Outcome, SessionId};
+use protocol::{Audience, Environment, Outcome, SessionId};
 use serde_json::Value;
 
 use crate::agent::Idle;
-use crate::ext::{DynCommand, MakeAgent};
+use crate::ext::MakeAgent;
 use crate::state::States;
 use crate::{
     Agent, BoxFuture, Cancel, CwdOf, Cx, DynExtension, DynTool, Extension, Facts, Name, Place,
     Refused, Registrar, Text, Tier,
 };
 
-pub use crate::point::{Decided, History, Hooks};
+pub use crate::point::{Decided, Hooks};
 
 /// The engine, as a running call reaches it.
 pub trait Host: Send + Sync {
@@ -69,9 +69,12 @@ impl Toolset {
         self.0.iter().map(|t| &**t).find(|t| t.name() == name)
     }
 
-    /// Every tool, as offered to the model.
+    /// Every tool the model may call, as offered to it.
     pub fn specs(&self) -> Vec<llm::Tool> {
-        self.0.iter().map(|t| t.spec()).collect()
+        (self.0.iter())
+            .filter(|t| t.audience() == Audience::Model)
+            .map(|t| t.spec())
+            .collect()
     }
 
     pub fn run<'a>(&'a self, name: &str, input: &Value, cx: &'a Cx) -> BoxFuture<'a, Outcome> {
@@ -103,23 +106,6 @@ impl Toolset {
     }
 }
 
-/// A slash command, as the engine runs it.
-pub struct Command<'a>(&'a dyn DynCommand);
-
-impl Command<'_> {
-    pub fn name(&self) -> &str {
-        self.0.name()
-    }
-
-    pub fn description(&self) -> &str {
-        self.0.description()
-    }
-
-    pub fn run<'a>(&'a self, args: &'a str, cx: &'a Cx) -> BoxFuture<'a, Outcome> {
-        self.0.run(args, cx)
-    }
-}
-
 struct Installed {
     name: Name,
     version: u32,
@@ -132,7 +118,6 @@ struct Installed {
 pub struct Registry {
     installed: Vec<Installed>,
     tools: Toolset,
-    commands: Vec<Arc<dyn DynCommand>>,
     hooks: Hooks,
     texts: Vec<Text>,
     agents: Vec<(Name, Arc<MakeAgent>)>,
@@ -214,7 +199,6 @@ impl Registry {
 
     fn rebuild(&mut self) {
         let mut tools = Vec::new();
-        let mut commands = Vec::new();
         let mut texts = Vec::new();
         let mut agents = Vec::new();
         let mut hooks = Hooks::default();
@@ -225,11 +209,6 @@ impl Registry {
             let guarded = *tier == Tier::Guarded;
             for tool in &made.tools {
                 replace(&mut tools, (guarded, Arc::clone(tool)), |t| t.1.name());
-            }
-            for command in &made.commands {
-                replace(&mut commands, (guarded, Arc::clone(command)), |c| {
-                    c.1.name()
-                });
             }
             for text in &made.texts {
                 replace(&mut texts, (guarded, text.clone()), |t| &t.1.name);
@@ -243,7 +222,6 @@ impl Registry {
         }
         texts.sort_by_key(|t| t.1.order);
         self.tools = Toolset(tools.into_iter().map(|t| t.1).collect());
-        self.commands = commands.into_iter().map(|c| c.1).collect();
         self.texts = texts.into_iter().map(|t| t.1).collect();
         self.agents = agents.into_iter().map(|a| a.1).collect();
         self.hooks = hooks;
@@ -259,16 +237,11 @@ impl Registry {
         &self.hooks
     }
 
-    /// Every command, in registration order.
-    pub fn commands(&self) -> impl Iterator<Item = Command<'_>> {
-        self.commands.iter().map(|c| Command(&**c))
-    }
-
-    pub fn command(&self, name: &str) -> Option<Command<'_>> {
-        self.commands
-            .iter()
-            .find(|c| c.name() == name)
-            .map(|c| Command(&**c))
+    /// The callables the user runs as `/name args`, in registration order.
+    pub fn commands(&self) -> impl Iterator<Item = &dyn DynTool> {
+        (self.tools.0.iter())
+            .map(|t| &**t)
+            .filter(|t| t.audience() == Audience::User)
     }
 
     /// A new loop of the agent named `name`, or of the first registered

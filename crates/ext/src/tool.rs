@@ -29,6 +29,13 @@ pub enum Replay {
     Unsafe,
 }
 
+/// What a user's command is given: the text after its name.
+#[derive(Clone, Debug, Default, PartialEq, Eq, serde::Deserialize)]
+pub struct Args {
+    #[serde(default)]
+    pub args: String,
+}
+
 /// What the kernel knows of a callable: who may call it, and whether a
 /// call a crash cut off runs again.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -242,6 +249,9 @@ pub trait Tool: Send + Sync + 'static {
 
     const NAME: &'static str;
     const DESCRIPTION: &'static str;
+    /// Who calls it: the model, or the user, as a command `/name args`
+    /// given [`Args`].
+    const AUDIENCE: Audience = Audience::Model;
     /// How a call left dangling by a crash is finished.
     const REPLAY: Replay = Replay::Unsafe;
     const ROUTE: Route = Route::Local;
@@ -274,6 +284,8 @@ pub trait Tool: Send + Sync + 'static {
 /// time, fit one toolset.
 pub trait DynTool: Send + Sync {
     fn name(&self) -> &str;
+    fn description(&self) -> &str;
+    fn audience(&self) -> Audience;
     fn replay(&self) -> Replay;
     fn route(&self) -> Route;
     /// How the tool is offered to the model.
@@ -288,6 +300,14 @@ pub trait DynTool: Send + Sync {
 impl<T: Tool> DynTool for T {
     fn name(&self) -> &str {
         T::NAME
+    }
+
+    fn description(&self) -> &str {
+        T::DESCRIPTION
+    }
+
+    fn audience(&self) -> Audience {
+        T::AUDIENCE
     }
 
     fn replay(&self) -> Replay {

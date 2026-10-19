@@ -110,12 +110,6 @@ fn lines(run: &[u8]) -> impl Iterator<Item = &[u8]> {
     })
 }
 
-impl ext::History for FrameLog {
-    fn entries(&self) -> Box<dyn Iterator<Item = Entry> + '_> {
-        Box::new(self.entries_after(0))
-    }
-}
-
 /// The sending side. The connection's own is for its replies; the one
 /// [`Outbox::follow`] returns is a session's, which stops taking frames
 /// once the connection follows another session or none.

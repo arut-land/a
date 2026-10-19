@@ -16,17 +16,12 @@
 use std::any::{Any, TypeId, type_name};
 use std::borrow::Cow;
 use std::fmt;
-use std::future::Future;
 use std::path::Path;
 use std::sync::Arc;
 
-use crate::BoxFuture;
-use protocol::Outcome;
-use serde_json::Value;
-
 use crate::point::{ERASED, ErasedHandler, Handler, Hooked, Point, PointCx};
 use crate::state::Decl;
-use crate::{Agent, Cx, DynTool, Fold, Name};
+use crate::{Agent, DynTool, Fold, Name};
 
 /// A unit of features, named so decisions can say who made them.
 pub trait Extension: Send + Sync {
@@ -72,43 +67,6 @@ pub enum Tier {
     User,
     /// After the user's, to see what they did.
     Post,
-}
-
-/// A slash command: `/name args` runs it without a model turn.
-pub trait Command: Send + Sync + 'static {
-    const NAME: &'static str;
-    const DESCRIPTION: &'static str;
-
-    /// The output, shown to the user and logged; never sent to the model.
-    fn run(&self, args: &str, cx: &Cx) -> impl Future<Output = Result<Value, String>> + Send;
-}
-
-/// A [`Command`] behind a pointer.
-pub(crate) trait DynCommand: Send + Sync {
-    fn name(&self) -> &str;
-    fn description(&self) -> &str;
-    fn run<'a>(&'a self, args: &'a str, cx: &'a Cx) -> BoxFuture<'a, Outcome>;
-}
-
-impl<C: Command> DynCommand for C {
-    fn name(&self) -> &str {
-        C::NAME
-    }
-
-    fn description(&self) -> &str {
-        C::DESCRIPTION
-    }
-
-    fn run<'a>(&'a self, args: &'a str, cx: &'a Cx) -> BoxFuture<'a, Outcome> {
-        Box::pin(async move {
-            match Command::run(self, args, cx).await {
-                Ok(output) => Outcome::Done {
-                    output: output.into(),
-                },
-                Err(error) => Outcome::Failed { error },
-            }
-        })
-    }
 }
 
 /// Where a session runs, for the context the model is first given.
@@ -192,7 +150,6 @@ pub(crate) struct Provided {
 #[derive(Default)]
 pub struct Registrar {
     pub(crate) tools: Vec<Arc<dyn DynTool>>,
-    pub(crate) commands: Vec<Arc<dyn DynCommand>>,
     pub(crate) hooks: Vec<Hooked>,
     pub(crate) texts: Vec<Text>,
     pub(crate) states: Vec<Decl>,
@@ -212,14 +169,6 @@ impl Registrar {
         let names = self.tools.iter().map(|t| t.name());
         self.errors.extend(twice("tool", tool.name(), names));
         self.tools.push(tool);
-        self
-    }
-
-    pub fn command(&mut self, command: impl Command) -> &mut Self {
-        let name = DynCommand::name(&command);
-        let taken = twice("command", name, self.commands.iter().map(|c| c.name()));
-        self.errors.extend(taken);
-        self.commands.push(Arc::new(command));
         self
     }
 

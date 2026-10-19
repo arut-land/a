@@ -5,7 +5,7 @@ use serde_json::json;
 
 use super::*;
 use crate::point::{self, PointCx, View};
-use crate::{Command, Replay, Route, Tool};
+use crate::{Args, Replay, Route, Tool};
 
 /// A tool named `bash`, described as `mine`.
 struct Named(&'static str);
@@ -38,11 +38,19 @@ fn deny(r: &mut Registrar, tool: &'static str) {
 
 struct Jobs;
 
-impl Command for Jobs {
+impl Tool for Jobs {
+    type In = Args;
+    type Out = Value;
+
     const NAME: &'static str = "jobs";
     const DESCRIPTION: &'static str = "Lists jobs.";
+    const AUDIENCE: Audience = Audience::User;
 
-    fn run(&self, _: &str, _: &Cx) -> impl Future<Output = Result<Value, String>> + Send {
+    fn schema() -> Value {
+        json!({ "type": "object" })
+    }
+
+    fn call(&self, _: Args, _: &Cx) -> impl Future<Output = Result<Value, String>> + Send {
         std::future::ready(Ok("none".into()))
     }
 }
@@ -76,7 +84,7 @@ extension!(Other, "other", 1, |r| {
     deny(r, "b");
 });
 extension!(Twice, "twice", 1, |r| r.tool(Named("1")).tool(Named("2")));
-extension!(Commands, "commands", 1, |r| r.command(Jobs));
+extension!(Commands, "commands", 1, |r| r.tool(Jobs));
 extension!(Shell, "shell", 1, |r| r
     .provide::<dyn CwdOf>(Arc::new(Here)));
 extension!(Rival, "rival", 1, |r| r
@@ -171,6 +179,12 @@ struct Declared(String);
 impl DynTool for Declared {
     fn name(&self) -> &str {
         &self.0
+    }
+    fn description(&self) -> &'static str {
+        "declared"
+    }
+    fn audience(&self) -> Audience {
+        Audience::Model
     }
     fn replay(&self) -> Replay {
         Replay::Safe
@@ -294,7 +308,7 @@ fn texts_follow_the_tools_offered_in_their_place() {
 
 extension!(Loose, "policy", 9, |r| deny(r, "nothing"));
 extension!(Watcher, "watcher", 1, |r| deny(r, "c"));
-extension!(Shadow, "shadow", 1, |r| r.command(Jobs));
+extension!(Shadow, "shadow", 1, |r| r.tool(Jobs));
 
 #[test]
 fn tiers_order_extensions_and_guarded_ones_stay() {
@@ -317,10 +331,10 @@ fn tiers_order_extensions_and_guarded_ones_stay() {
         .with_in(Tier::Guarded, &Commands)
         .and_then(|r| r.with(&Shadow))
         .unwrap();
-    assert_eq!(registry.commands.len(), 1);
+    assert_eq!(registry.tools.0.len(), 1);
     assert!(Arc::ptr_eq(
-        &registry.commands[0],
-        &registry.installed[0].made.commands[0]
+        &registry.tools.0[0],
+        &registry.installed[0].made.tools[0]
     ));
 }
 
@@ -330,11 +344,9 @@ fn commands_and_agents_are_found_by_name() {
         .with(&Commands)
         .and_then(|r| r.with(&Agents))
         .unwrap();
-    assert_eq!(
-        registry.command("jobs").unwrap().description(),
-        "Lists jobs."
-    );
-    assert!(registry.command("bash").is_none());
+    let commands: Vec<_> = registry.commands().map(DynTool::description).collect();
+    assert_eq!(commands, ["Lists jobs."]);
+    assert!(registry.tools().specs().is_empty(), "a command is not the model's");
     assert_eq!(registry.agents().collect::<Vec<_>>(), ["idle"]);
     // An unknown name runs the first agent registered.
     let said = registry

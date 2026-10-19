@@ -33,11 +33,11 @@ pub mod testing;
 mod tool;
 
 pub use agent::{Action, Actions, Agent, Input};
-pub use ext::{Command, DynExtension, Extension, Facts, Place, Refused, Registrar, Text, Tier};
-pub use point::{Answer, Chained, Gate, Gated, History, Later, PointCx, Recover, Rewrite};
+pub use ext::{DynExtension, Extension, Facts, Place, Refused, Registrar, Text, Tier};
+pub use point::{Answer, Chained, Gate, Gated, Later, PointCx, Recover, Rewrite};
 pub use service::{CwdOf, Sessions, Settings, Spawner};
 pub use state::{Fold, States};
-pub use tool::{Callable, Cancel, Cx, DynTool, Replay, Route, SpawnSpec, Tool};
+pub use tool::{Args, Callable, Cancel, Cx, DynTool, Replay, Route, SpawnSpec, Tool};
 
 /// A runtime name: of an extension, a tool, an agent. Typed Rust items
 /// name themselves with a `&'static str`, converted once as they register;

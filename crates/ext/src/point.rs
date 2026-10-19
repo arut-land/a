@@ -369,23 +369,11 @@ impl Point for PostTool {
     }
 }
 
-/// A session's log as a handler reads it: decoded on demand, each time
-/// [`History::entries`] is called, as only a handler that reads it needs it.
-pub trait History {
-    fn entries(&self) -> Box<dyn Iterator<Item = Entry> + '_>;
-}
-
-impl History for Vec<Entry> {
-    fn entries(&self) -> Box<dyn Iterator<Item = Entry> + '_> {
-        Box::new(self.iter().cloned())
-    }
-}
-
 point!(
-    /// Text to continue with once the agent stopped, given the session's
-    /// log so far.
+    /// Text to continue with once the agent stopped. A handler that reads
+    /// the session's log folds what it needs of it as typed state.
     OnStop = "on_stop",
-    &'a dyn History,
+    (),
     Option<String>
 );
 point!(
@@ -463,9 +451,8 @@ impl Wire for Approve {
 }
 
 impl Wire for OnStop {
-    fn to_json(history: &&dyn History) -> Value {
-        let entries: Vec<Entry> = history.entries().collect();
-        serde_json::to_value(entries).unwrap_or_default()
+    fn to_json((): &()) -> Value {
+        Value::Null
     }
 
     fn from_json(answer: Value) -> Self::Out {
@@ -768,8 +755,8 @@ impl Hooks {
     }
 
     /// Text for the agent to go on with once it stopped, and who gave it.
-    pub fn on_stop(&self, cx: &PointCx<'_>, history: &dyn History) -> Option<(Name, String)> {
-        self.ask::<OnStop>(cx, history)
+    pub fn on_stop(&self, cx: &PointCx<'_>) -> Option<(Name, String)> {
+        self.ask::<OnStop>(cx, ())
     }
 
     pub fn observe(&self, cx: &PointCx<'_>, entry: &Entry) {

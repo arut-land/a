@@ -7,7 +7,6 @@
 //! decides what.
 
 use std::any::{Any, TypeId};
-use std::collections::HashMap;
 use std::future::{Future, poll_fn};
 use std::io;
 use std::panic::{AssertUnwindSafe, catch_unwind};
@@ -25,10 +24,9 @@ use ext::{
     BoxFuture, Callable, Cancel, Chained, Cx, Facts, Gated, Name, PointCx, Recover, Route, States,
 };
 use kernel::{Answer, Core, Effect, Effects, Event, Load, Note, Owner, Replied, Ticket};
-use protocol::ledger::Call;
 use protocol::view::SessionView;
 use protocol::{
-    Audience, Author, Body, CallId, Cap, Card, DaemonMsg, Entry, Environment, Frame, Installed,
+    Author, Body, CallId, Cap, Card, DaemonMsg, Entry, Environment, Frame, Installed,
     Json, Mode, Outcome, Overrides, Residency, SessionId, SessionSummary, Verdict,
 };
 use rt::{channel, oneshot};
@@ -249,10 +247,10 @@ impl Live {
             transcript: None,
             replied: None,
             snapshot: None,
-            cancels: HashMap::new(),
-            waiting: HashMap::new(),
-            answers: HashMap::new(),
-            replies: HashMap::new(),
+            cancels: Keyed::default(),
+            waiting: Keyed::default(),
+            answers: Keyed::default(),
+            replies: Keyed::default(),
             tickets: 0,
             reporting: 0,
             stopping: false,
@@ -383,12 +381,12 @@ struct Actor {
     /// The last snapshot made, and its seq; `None` for one too large.
     snapshot: Option<(u64, Option<Frame>)>,
     /// What stops each effect in flight.
-    cancels: HashMap<CallId, Cancel>,
+    cancels: Keyed<CallId, Cancel>,
     /// Calls waiting on a child, for its result.
-    waiting: HashMap<CallId, oneshot::Sender<Json>>,
+    waiting: Keyed<CallId, oneshot::Sender<Json>>,
     /// What calls run again are handed: the answer they waited on.
-    answers: HashMap<CallId, Json>,
-    replies: HashMap<Ticket, oneshot::Sender<Result<(), String>>>,
+    answers: Keyed<CallId, Json>,
+    replies: Keyed<Ticket, oneshot::Sender<Result<(), String>>>,
     tickets: u64,
     /// Tool and model calls in flight, each of which reports once.
     reporting: usize,
@@ -406,29 +404,37 @@ impl Actor {
         while !(self.stopping && self.reporting == 0)
             && let Some(msg) = mail.recv().await
         {
-            self.take(msg).await;
+            if let Some((event, done)) = self.take(msg) {
+                // A new registry generation is taken up at the next step.
+                let newest = self.live.session.shared.registry.get();
+                let generation = (!Arc::ptr_eq(&newest, &self.registry)).then(|| {
+                    self.registry = Arc::clone(&newest);
+                    Event::Registry(Bound::bind(&newest, &self.live.session))
+                });
+                self.step(generation.into_iter().chain([event])).await;
+                if let Some(done) = done {
+                    done.send(());
+                }
+            }
             // A call may begin to wait without the work marked ending.
             self.mark().await;
             self.publish();
         }
         let registry = &self.registry;
         registry.hooks().session_end(&self.live.session.point());
-        // Closed before the end is told: a reload never makes a second.
-        self.writer = None;
-        self.live.ended.end();
-        if let Some(daemon) = self.live.session.shared.daemon.upgrade() {
+        // Closed and let go before the end is told: a reload never makes
+        // a second writer, and what is told the end holds the last of it.
+        let (ended, daemon) = (self.live.ended.clone(), self.live.session.shared.daemon.clone());
+        drop((self, mail));
+        ended.end();
+        if let Some(daemon) = daemon.upgrade() {
             daemon.pulse.notify();
         }
     }
 
-    async fn take(&mut self, msg: Msg) {
-        // A new registry generation is taken up at the next step.
-        let newest = self.live.session.shared.registry.get();
-        if !Arc::ptr_eq(&newest, &self.registry) {
-            self.registry = Arc::clone(&newest);
-            let bound = Bound::bind(&newest, &self.live.session);
-            self.step(Event::Registry(bound)).await;
-        }
+    /// What `msg` asks the kernel, and whom to tell once it is carried
+    /// out; `None` for what the actor answers itself.
+    fn take(&mut self, msg: Msg) -> Option<(Event, Option<oneshot::Sender<()>>)> {
         let event = match msg {
             Msg::Request {
                 request,
@@ -446,37 +452,36 @@ impl Actor {
                         ticket,
                     },
                     Request::Interrupt => Event::Interrupt { origin, ticket },
-                    Request::Answer { call, value } => match CallId::new(call) {
-                        Some(call) => Event::Answer {
+                    Request::Answer { call, value } => {
+                        let Some(call) = CallId::new(call) else {
+                            self.reply(Ticket(self.tickets), Err("no call 0".into()));
+                            return None;
+                        };
+                        Event::Answer {
                             call,
                             value,
                             origin,
                             ticket,
-                        },
-                        None => return self.reply(Ticket(self.tickets), Err("no call 0".into())),
-                    },
+                        }
+                    }
                 }
             }
             Msg::Step(event) => event,
             Msg::Attach(client, since, done) => {
                 self.attach(&client, since);
-                return done.send(());
+                done.send(());
+                return None;
             }
             Msg::Env(env) => {
                 let logged = env.redacted();
                 *lock(&self.live.session.env) = Some(env);
                 Event::Environment(logged)
             }
-            Msg::Note { call, note, done } => {
-                self.step(Event::Note { call, note }).await;
-                if let Some(done) = done {
-                    done.send(());
-                }
-                return;
-            }
+            Msg::Note { call, note, done } => return Some((Event::Note { call, note }, done)),
             Msg::Child { call, input, reply } => {
                 if let Some(value) = self.answers.remove(&call) {
-                    return reply.send(value);
+                    reply.send(value);
+                    return None;
                 }
                 self.waiting.insert(call, reply);
                 Event::Spawn {
@@ -497,27 +502,38 @@ impl Actor {
                 Event::ModelDone { call, replied }
             }
             #[cfg(test)]
-            Msg::Barrier(done) => return done.send(()),
+            Msg::Barrier(done) => {
+                done.send(());
+                return None;
+            }
             Msg::Stop => {
                 self.stopping = true;
                 for cancel in self.cancels.values() {
                     cancel.cancel();
                 }
-                return;
+                return None;
             }
         };
         if let Event::ToolDone { call, .. } = &event {
             self.reporting -= 1;
             self.cancels.remove(call);
         }
-        self.step(event).await;
+        Some((event, None))
     }
 
-    /// Steps the kernel and carries out what follows. A step that panics
-    /// is a bug the session survives: what the step did is dropped, as a
-    /// commit that failed drops it, and the session resumes from its log.
-    async fn step(&mut self, event: Event) {
-        match catch_unwind(AssertUnwindSafe(|| self.core.step(event))) {
+    /// Steps the kernel through `events` and carries out what follows. A
+    /// step that panics is a bug the session survives: what the steps did
+    /// is dropped, as a commit that failed drops it, and the session
+    /// resumes from its log.
+    async fn step(&mut self, events: impl IntoIterator<Item = Event>) {
+        let stepped = catch_unwind(AssertUnwindSafe(|| {
+            let mut fx = Effects::new();
+            for event in events {
+                fx.extend(self.core.step(event));
+            }
+            fx
+        }));
+        match stepped {
             Ok(fx) => self.carry(fx).await,
             Err(panic) => {
                 let why = panicked(&*panic);
@@ -828,7 +844,9 @@ impl Actor {
             let (replied, message) = match work {
                 Ok((model, request)) => {
                     let deltas = |text: &str| live.delta(call, attempt, text);
-                    contain(reply(&model, &request, &cancel, deltas)).await
+                    let replying: BoxFuture<'_, _> =
+                        Box::pin(reply(&model, &request, &cancel, deltas));
+                    contain(replying).await
                 }
                 // Said so the user can fix it; sending again would not.
                 Err(error) => {
@@ -865,15 +883,9 @@ impl Actor {
         model.request(messages, registry.specs().to_vec())
     }
 
-    /// Runs tool or command call `call`, reporting its outcome.
+    /// Runs tool call `call`, the model's or a user's command, reporting
+    /// its outcome.
     fn run_tool(&mut self, call: CallId, tool: String, input: Json) {
-        let by_user = matches!(
-            self.core.ledger().call(call.get()).map(|open| &open.call),
-            Some(Call::Tool {
-                by: Audience::User,
-                ..
-            })
-        );
         let cancel = Cancel::default();
         self.cancels.insert(call, cancel.clone());
         self.reporting += 1;
@@ -883,20 +895,7 @@ impl Actor {
         let id = self.live.id;
         self.live.session.shared.rt.spawn(Box::pin(async move {
             let began = crate::stamp();
-            let outcome = if by_user {
-                match registry.command(&tool) {
-                    Some(command) => {
-                        let args = input.value()["args"]
-                            .as_str()
-                            .unwrap_or_default()
-                            .to_owned();
-                        contain(command.run(&args, &cx)).await
-                    }
-                    None => Outcome::Failed {
-                        error: format!("no command /{tool}"),
-                    },
-                }
-            } else if registry
+            let outcome = if registry
                 .tools()
                 .get(&tool)
                 .is_some_and(|t| t.route() != Route::Local)
@@ -971,6 +970,35 @@ impl Actor {
         let frame = Frame::new(&DaemonMsg::Snapshot(Box::new(view))).ok();
         self.snapshot = Some((seq, frame.clone()));
         frame
+    }
+}
+
+/// Values by key, in a vector: a session has few of each in flight.
+struct Keyed<K, V>(Vec<(K, V)>);
+
+impl<K, V> Default for Keyed<K, V> {
+    fn default() -> Self {
+        Self(Vec::new())
+    }
+}
+
+impl<K: PartialEq, V> Keyed<K, V> {
+    fn insert(&mut self, key: K, value: V) {
+        self.remove(&key);
+        self.0.push((key, value));
+    }
+
+    fn remove(&mut self, key: &K) -> Option<V> {
+        let at = self.0.iter().position(|(k, _)| k == key)?;
+        Some(self.0.swap_remove(at).1)
+    }
+
+    fn values(&self) -> impl Iterator<Item = &V> {
+        self.0.iter().map(|(_, v)| v)
+    }
+
+    fn clear(&mut self) {
+        self.0.clear();
     }
 }
 
@@ -1129,14 +1157,9 @@ impl kernel::Registry for Bound {
     }
 
     fn callable(&self, name: &str) -> Option<Callable> {
-        if let Some(tool) = self.registry.tools().get(name) {
-            let (audience, replay) = (Audience::Model, tool.replay());
-            return Some(Callable { audience, replay });
-        }
-        self.registry.command(name).map(|_| Callable {
-            audience: Audience::User,
-            replay: ext::Replay::Unsafe,
-        })
+        let tool = self.registry.tools().get(name)?;
+        let (audience, replay) = (tool.audience(), tool.replay());
+        Some(Callable { audience, replay })
     }
 
     fn model(&self) -> String {
@@ -1214,12 +1237,8 @@ impl kernel::Registry for Bound {
         )
     }
 
-    fn on_stop(&self, pending: &[&Entry]) -> Option<(Name, String)> {
-        let history = Committed(&self.session, pending);
-        guarded(
-            || self.registry.hooks().on_stop(&self.point(), &history),
-            |_| None,
-        )
+    fn on_stop(&self) -> Option<(Name, String)> {
+        guarded(|| self.registry.hooks().on_stop(&self.point()), |_| None)
     }
 }
 
@@ -1237,18 +1256,6 @@ fn panicked(panic: &(dyn Any + Send)) -> String {
         .or_else(|| panic.downcast_ref::<&str>().copied())
         .unwrap_or("unknown panic");
     format!("panicked: {message}")
-}
-
-/// A session's log as committed, read back from the store when a handler
-/// asks, and the entries the step appended after it.
-struct Committed<'a>(&'a Session, &'a [&'a Entry]);
-
-impl ext::History for Committed<'_> {
-    fn entries(&self) -> Box<dyn Iterator<Item = Entry> + '_> {
-        let entries = self.0.shared.store.entries(self.0.id).unwrap_or_default();
-        let pending = self.1.iter().map(|&e| e.clone());
-        Box::new(entries.into_iter().chain(pending))
-    }
 }
 
 /// The registry's extensions as a log records them.
@@ -1422,6 +1429,7 @@ async fn reply(
         let events = events.insert(model.send(request));
         crate::model::read(events, &mut deltas).await
     };
+    let reading: BoxFuture<'_, _> = Box::pin(reading);
     let Some(read) = unless(cancel, reading).await else {
         let text = events.and_then(llm::Events::interrupted);
         return (Replied::Interrupted(text), None);

@@ -13,7 +13,7 @@ use bytes::Bytes;
 use ext::{Extension, Registrar, Replay, Rewrite, Tool, point};
 use ext_policy::Policy;
 use llm::http::Http;
-use protocol::{CallId, Caps, Card, Permission, Seq, WaitOn};
+use protocol::{Audience, CallId, Caps, Card, Permission, Seq, WaitOn};
 use serde::Deserialize as _;
 use serde_json::{Value, json};
 
@@ -767,14 +767,16 @@ fn echoing(policy: &Policy) -> Registry {
 }
 
 /// In place of the `policy` extension: denies shell commands, and has the
-/// agent go on once after it stops.
-struct Strict;
+/// agent go on once after it first stops.
+#[derive(Default)]
+struct Strict(Arc<AtomicBool>);
 
 impl Extension for Strict {
     const NAME: &'static str = "policy";
     const VERSION: u32 = 1;
 
     fn contribute(&self, r: &mut Registrar) {
+        let continued = Arc::clone(&self.0);
         r.on::<point::Permission>(|_, call| {
             if call.tool == ext_shell::Bash::NAME {
                 Permission::Deny
@@ -782,17 +784,8 @@ impl Extension for Strict {
                 Permission::Allow
             }
         })
-        .on::<point::OnStop>(|_, history| {
-            let continued = history.entries().any(|e| {
-                matches!(
-                    e.body,
-                    Body::Decision {
-                        d: Verdict::OnStop { .. },
-                        ..
-                    }
-                )
-            });
-            (!continued).then(|| "and again".to_owned())
+        .on::<point::OnStop>(move |_, ()| {
+            (!continued.swap(true, Ordering::SeqCst)).then(|| "and again".to_owned())
         });
     }
 }
@@ -802,7 +795,7 @@ fn hook_decisions_are_logged_after_their_call_and_replay_to_the_same_state() {
     let fixture = Fixture::new(
         ext_fixtures::ECHO,
         echoing(&Policy::default())
-            .with_in(ext::Tier::Guarded, &Strict)
+            .with_in(ext::Tier::Guarded, &Strict::default())
             .unwrap(),
         openai(&Script::new(&[])),
     );
@@ -869,7 +862,7 @@ fn a_gate_cut_off_by_a_crash_logs_its_decisions_once() {
     let fixture = Fixture::new(
         ext_fixtures::ECHO,
         echoing(&Policy::default())
-            .with_in(ext::Tier::Guarded, &Strict)
+            .with_in(ext::Tier::Guarded, &Strict::default())
             .unwrap(),
         openai(&Script::new(&[])),
     );
@@ -1161,12 +1154,20 @@ struct Extras;
 
 struct Jobs;
 
-impl ext::Command for Jobs {
+impl Tool for Jobs {
+    type In = ext::Args;
+    type Out = Value;
+
     const NAME: &'static str = "jobs";
     const DESCRIPTION: &'static str = "Lists jobs.";
+    const AUDIENCE: Audience = Audience::User;
 
-    fn run(&self, args: &str, cx: &Cx) -> impl Future<Output = Result<Value, String>> + Send {
-        let said = format!("{args} in {}", cx.call);
+    fn schema() -> Value {
+        json!({ "type": "object" })
+    }
+
+    fn call(&self, i: ext::Args, cx: &Cx) -> impl Future<Output = Result<Value, String>> + Send {
+        let said = format!("{} in {}", i.args, cx.call);
         std::future::ready(Ok(said.into()))
     }
 }
@@ -1176,7 +1177,7 @@ impl Extension for Extras {
     const VERSION: u32 = 1;
 
     fn contribute(&self, r: &mut Registrar) {
-        r.command(Jobs)
+        r.tool(Jobs)
             .on::<point::Input>(|_, text| match text {
                 "no" => Rewrite::Stop("not that".into()),
                 text if text.starts_with("shout ") => Rewrite::Replace(text.to_uppercase()),

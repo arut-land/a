@@ -1,8 +1,8 @@
 //! `settings`: the commands that show and change what a session runs with,
 //! over the [`ext::Settings`] the engine keeps.
 
-use ext::{Command, Cx, Extension, Registrar};
-use protocol::Overrides;
+use ext::{Args, Cx, Extension, Registrar, Tool};
+use protocol::{Audience, Overrides};
 use serde_json::{Value, json};
 
 /// The `settings` extension.
@@ -13,7 +13,7 @@ impl Extension for Settings {
     const VERSION: u32 = 1;
 
     fn contribute(&self, r: &mut Registrar) {
-        r.command(Model);
+        r.tool(Model);
     }
 }
 
@@ -22,11 +22,20 @@ impl Extension for Settings {
 /// layer, and `/model reset` leaves it to them again.
 struct Model;
 
-impl Command for Model {
+impl Tool for Model {
+    type In = Args;
+    type Out = Value;
+
     const NAME: &'static str = "model";
     const DESCRIPTION: &'static str = "set the session's model";
+    const AUDIENCE: Audience = Audience::User;
 
-    async fn run(&self, args: &str, cx: &Cx) -> Result<Value, String> {
+    fn schema() -> Value {
+        json!({ "type": "object", "properties": { "args": { "type": "string" } } })
+    }
+
+    async fn call(&self, Args { args }: Args, cx: &Cx) -> Result<Value, String> {
+        let args = args.as_str();
         let settings = cx
             .service::<dyn ext::Settings>()
             .ok_or("this engine keeps no settings")?;
