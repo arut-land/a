@@ -69,6 +69,19 @@ impl<T> Json<'_, T> {
     }
 }
 
+impl<T> Json<'_, T> {
+    /// The value, `T` aside: `None` for an object.
+    pub(crate) fn into_value(self) -> Option<Value> {
+        match self {
+            Self::Absent => Some(Value::Null),
+            Self::Str(text) => Some(text.into_owned().into()),
+            Self::Object(_) => None,
+            Self::List(items) => Some(Value::Array(items)),
+            Self::Other(value) => Some(value),
+        }
+    }
+}
+
 impl Json<'_> {
     /// The value as text: a string as it is, anything else but `null` as
     /// JSON.
@@ -154,22 +167,37 @@ pub(crate) fn present<'de, D: Deserializer<'de>>(field: D) -> Result<bool, D::Er
     IgnoredAny::deserialize(field).map(|_| true)
 }
 
-/// A field of another type is absent.
-pub(crate) fn lax<'de, D, T>(field: D) -> Result<Option<T>, D::Error>
-where
-    D: Deserializer<'de>,
-    T: Deserialize<'de>,
-{
-    #[derive(Deserialize)]
-    #[serde(untagged)]
-    enum Lax<T> {
-        Is(T),
-        Not(IgnoredAny),
+/// An object read field by field: [`Fields::field`] takes the fields it
+/// names and the rest gather in a map. serde's `flatten` would buffer every
+/// field first, and its code costs several kilobytes a type.
+pub(crate) trait Fields<'de>: Default {
+    /// Read the value of `key` when it is a field of `Self`; `false` leaves
+    /// it to the rest.
+    fn field<A: MapAccess<'de>>(&mut self, key: &str, map: &mut A) -> Result<bool, A::Error>;
+
+    fn rest(&mut self) -> &mut serde_json::Map<String, Value>;
+}
+
+/// The object `json` holds, read as `T`'s [`Fields`].
+pub(crate) fn fields<'de, D: Deserializer<'de>, T: Fields<'de>>(json: D) -> Result<T, D::Error> {
+    struct Read<T>(PhantomData<T>);
+    impl<'de, T: Fields<'de>> Visitor<'de> for Read<T> {
+        type Value = T;
+        fn expecting(&self, f: &mut fmt::Formatter) -> fmt::Result {
+            f.write_str("an object")
+        }
+        fn visit_map<A: MapAccess<'de>>(self, mut map: A) -> Result<T, A::Error> {
+            let mut out = T::default();
+            while let Some(Str(key)) = map.next_key()? {
+                if !out.field(&key, &mut map)? {
+                    let value = map.next_value()?;
+                    out.rest().insert(key.into_owned(), value);
+                }
+            }
+            Ok(out)
+        }
     }
-    Ok(match Option::deserialize(field)? {
-        Some(Lax::Is(value)) => Some(value),
-        Some(Lax::Not(_)) | None => None,
-    })
+    json.deserialize_map(Read(PhantomData))
 }
 
 /// The first element of a list, or `None` for `null`; any other value fails.

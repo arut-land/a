@@ -11,13 +11,14 @@
 use std::borrow::Cow;
 use std::fmt::Write as _;
 
-use serde::Deserialize;
+use serde::de::MapAccess;
+use serde::{Deserialize, Deserializer};
 use serde_json::{Map, Value, json};
 use smol_str::format_smolstr;
 
 use super::KEY;
 use crate::error::{Error, Kind};
-use crate::json::{Lenient, first, lax, present};
+use crate::json::{Fields, Json, Lenient, fields, first, present};
 use crate::protocol::Flow;
 use crate::spec::{Media, Meta, Reason, SmolStr, Source, Usage};
 use crate::writer::{End, Open, Writer, Writes};
@@ -25,10 +26,10 @@ use crate::writer::{End, Open, Writer, Writes};
 #[derive(Deserialize)]
 #[serde(rename_all = "camelCase")]
 struct Chunk<'a> {
-    #[serde(default, deserialize_with = "lax")]
-    response_id: Option<SmolStr>,
-    #[serde(default, deserialize_with = "lax")]
-    model_version: Option<SmolStr>,
+    #[serde(borrow, default)]
+    response_id: Json<'a>,
+    #[serde(borrow, default)]
+    model_version: Json<'a>,
     #[serde(default, deserialize_with = "present")]
     usage_metadata: bool,
     error: Option<Value>,
@@ -42,10 +43,12 @@ struct Chunk<'a> {
 #[derive(Deserialize)]
 #[serde(rename_all = "camelCase")]
 struct Candidate<'a> {
-    #[serde(default, deserialize_with = "lax")]
-    finish_reason: Option<FinishReason>,
-    #[serde(default, deserialize_with = "lax")]
-    finish_message: Option<String>,
+    /// A name, or as proto3 JSON spells one its schema does not know, a
+    /// number.
+    #[serde(borrow, default)]
+    finish_reason: Json<'a>,
+    #[serde(borrow, default)]
+    finish_message: Json<'a>,
     #[serde(borrow)]
     content: Option<Content<'a>>,
 }
@@ -53,29 +56,41 @@ struct Candidate<'a> {
 #[derive(Deserialize)]
 struct Content<'a> {
     #[serde(borrow)]
-    parts: Option<Vec<Part<'a>>>,
+    parts: Option<Vec<Json<'a, Part<'a>>>>,
 }
 
-/// Proto3 JSON spells an enum value its schema does not know as its number.
-#[derive(Deserialize)]
-#[serde(untagged)]
-enum FinishReason {
-    Name(SmolStr),
-    Number(serde_json::Number),
+/// An object part: its text, borrowed unless it holds escapes, when that
+/// is a string, and its other fields as sent.
+#[derive(Default)]
+struct Part<'a> {
+    text: Option<Cow<'a, str>>,
+    rest: Map<String, Value>,
 }
 
-/// A text part, its text borrowed unless it holds escapes, or any other
-/// part as sent.
-#[derive(Deserialize)]
-#[serde(untagged)]
-enum Part<'a> {
-    Text {
-        #[serde(borrow)]
-        text: Cow<'a, str>,
-        #[serde(flatten)]
-        rest: Map<String, Value>,
-    },
-    Other(Value),
+impl<'de: 'a, 'a> Fields<'de> for Part<'a> {
+    fn field<A: MapAccess<'de>>(&mut self, key: &str, map: &mut A) -> Result<bool, A::Error> {
+        if key != "text" {
+            return Ok(false);
+        }
+        match map.next_value::<Json<'a>>()? {
+            Json::Str(text) => self.text = Some(text),
+            other => {
+                let value = other.into_value().unwrap_or_default();
+                self.rest.insert(key.to_owned(), value);
+            }
+        }
+        Ok(true)
+    }
+
+    fn rest(&mut self) -> &mut Map<String, Value> {
+        &mut self.rest
+    }
+}
+
+impl<'de: 'a, 'a> Deserialize<'de> for Part<'a> {
+    fn deserialize<D: Deserializer<'de>>(json: D) -> Result<Self, D::Error> {
+        fields(json)
+    }
 }
 
 /// A chunk's usage, the rest unread.
@@ -295,11 +310,13 @@ impl GeminiDecoder {
     /// (code and its result, a kind Gemini adds later) is an opaque part
     /// that replays; one with no data, or that is not an object, is kept
     /// as one that does not.
-    fn part(&mut self, part: Part<'_>) -> Result<(), Error> {
-        let (text, mut rest) = match part {
-            Part::Text { text, rest } => (Some(text), rest),
-            Part::Other(Value::Object(rest)) => (None, rest),
-            Part::Other(stray) => return self.open(Open::Opaque { replay: false }, stray, ""),
+    fn part(&mut self, part: Json<'_, Part<'_>>) -> Result<(), Error> {
+        let Part { text, mut rest } = match part {
+            Json::Object(part) => part,
+            stray => {
+                let stray = stray.into_value().unwrap_or_default();
+                return self.open(Open::Opaque { replay: false }, stray, "");
+            }
         };
         let thought = rest.get("thought").and_then(Value::as_bool) == Some(true);
         let signature = rest.get("thoughtSignature").and_then(Value::as_str);
@@ -389,11 +406,11 @@ impl Writes for GeminiDecoder {
                 return Err(blocked.unwrap_or_else(shape));
             }
         };
-        if let Some(id) = chunk.response_id.filter(|id| !id.is_empty()) {
-            self.end.response_id = Some(id);
+        if let Some(id) = chunk.response_id.str().filter(|id| !id.is_empty()) {
+            self.end.response_id = Some(id.into());
         }
-        if let Some(model) = chunk.model_version.filter(|model| !model.is_empty()) {
-            self.end.model = Some(model);
+        if let Some(model) = chunk.model_version.str().filter(|model| !model.is_empty()) {
+            self.end.model = Some(model.into());
         }
         if chunk.usage_metadata {
             data.clone_into(&mut self.usage);
@@ -409,13 +426,14 @@ impl Writes for GeminiDecoder {
         };
         // The last reason wins: a hosted-tool round can report one before
         // the turn goes on.
-        let name = candidate.finish_reason.map(|reason| match reason {
-            FinishReason::Name(name) => name,
-            FinishReason::Number(number) => format_smolstr!("FINISH_REASON_{number}"),
-        });
+        let name = match candidate.finish_reason {
+            Json::Str(name) => Some(SmolStr::from(name)),
+            Json::Other(Value::Number(number)) => Some(format_smolstr!("FINISH_REASON_{number}")),
+            _ => None,
+        };
         if let Some(name) = name {
             self.end.reason = Some((reason_of(&name), Some(name)));
-            self.end.message = candidate.finish_message;
+            self.end.message = candidate.finish_message.str().map(str::to_owned);
         }
         let parts = candidate.content.and_then(|content| content.parts);
         for part in parts.into_iter().flatten() {

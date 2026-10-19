@@ -13,14 +13,14 @@
 
 use std::borrow::Cow;
 
-use serde::Deserialize;
-use serde::de::IgnoredAny;
+use serde::de::{IgnoredAny, MapAccess};
+use serde::{Deserialize, Deserializer};
 use serde_json::{Map, Value, json};
 
 use super::merge::{merge_details, merge_fields, merge_object, merge_str};
 use super::{KEY, PartKind, Quirks, ReasoningField};
 use crate::error::Error;
-use crate::json::{Json, Lenient, whole_object};
+use crate::json::{Fields, Json, Lenient, fields, whole_object};
 use crate::protocol::Flow;
 use crate::spec::{Media, Meta, Reason, SmolStr, Source, Usage};
 use crate::writer::{AUTO_INDEX, CallFragment, End, Open, Writer, Writes};
@@ -127,25 +127,64 @@ struct Delta<'a> {
 }
 
 /// A tool-call fragment. Every field but `index` joins the call's item.
-#[derive(Default, Deserialize)]
-#[serde(default, bound = "'de: 'a")]
+#[derive(Default)]
 struct Call<'a> {
     index: Value,
     id: Json<'a>,
-    #[serde(rename = "type")]
     kind: Json<'a>,
     function: Json<'a, Function<'a>>,
-    #[serde(flatten)]
     rest: Map<String, Value>,
 }
 
-#[derive(Default, Deserialize)]
-#[serde(default, bound = "'de: 'a")]
+impl<'de: 'a, 'a> Fields<'de> for Call<'a> {
+    fn field<A: MapAccess<'de>>(&mut self, key: &str, map: &mut A) -> Result<bool, A::Error> {
+        match key {
+            "index" => self.index = map.next_value()?,
+            "id" => self.id = map.next_value()?,
+            "type" => self.kind = map.next_value()?,
+            "function" => self.function = map.next_value()?,
+            _ => return Ok(false),
+        }
+        Ok(true)
+    }
+
+    fn rest(&mut self) -> &mut Map<String, Value> {
+        &mut self.rest
+    }
+}
+
+impl<'de: 'a, 'a> Deserialize<'de> for Call<'a> {
+    fn deserialize<D: Deserializer<'de>>(json: D) -> Result<Self, D::Error> {
+        fields(json)
+    }
+}
+
+#[derive(Default)]
 struct Function<'a> {
     name: Json<'a>,
     arguments: Json<'a>,
-    #[serde(flatten)]
     rest: Map<String, Value>,
+}
+
+impl<'de: 'a, 'a> Fields<'de> for Function<'a> {
+    fn field<A: MapAccess<'de>>(&mut self, key: &str, map: &mut A) -> Result<bool, A::Error> {
+        match key {
+            "name" => self.name = map.next_value()?,
+            "arguments" => self.arguments = map.next_value()?,
+            _ => return Ok(false),
+        }
+        Ok(true)
+    }
+
+    fn rest(&mut self) -> &mut Map<String, Value> {
+        &mut self.rest
+    }
+}
+
+impl<'de: 'a, 'a> Deserialize<'de> for Function<'a> {
+    fn deserialize<D: Deserializer<'de>>(json: D) -> Result<Self, D::Error> {
+        fields(json)
+    }
 }
 
 impl Call<'_> {
