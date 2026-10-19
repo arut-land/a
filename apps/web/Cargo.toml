@@ -21,5 +21,11 @@ http-body-util = "0.1"
 # about 40 KiB of that stack; no tokio runtime is ever started.
 topcoat = { version = "=0.10.0", default-features = false, features = ["router", "view", "runtime", "asset"] }
 
+[build-dependencies]
+miniz_oxide = "0.8"
+
+[dev-dependencies]
+miniz_oxide = "0.8"
+
 [lints]
 workspace = true

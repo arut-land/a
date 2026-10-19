@@ -88,11 +88,12 @@ impl Web {
     }
 
     fn fetch(&self, method: &str, path: &str, headers: &[(&str, &str)], body: &str) -> Response {
-        let mut text = String::new();
+        let mut bytes = Vec::new();
         self.send(method, path, headers, body)
-            .read_to_string(&mut text)
+            .read_to_end(&mut bytes)
             .unwrap();
-        Response(text)
+        // A compressed body is not text; its head is.
+        Response(String::from_utf8_lossy(&bytes).into_owned())
     }
 
     /// A same-origin request of the signed-in browser.
@@ -216,8 +217,11 @@ fn the_link_signs_in_once_and_foreign_requests_are_refused() {
     let list = web.ours("GET", "/", "");
     assert_eq!(list.status(), 200);
     assert!(list.0.contains("No sessions yet."), "{}", list.0);
-    let script = web.ours("GET", "/assets/topcoat.js", "");
+    let path = between(&list.0, "src=\"/assets/", "\"").expect("the runtime's script");
+    let script = web.ours("GET", &format!("/assets/{path}"), "");
+    assert_eq!(script.status(), 200, "{path}");
     assert_eq!(script.header("content-type"), Some("text/javascript"));
+    assert_eq!(script.header("content-encoding"), Some("deflate"));
 }
 
 #[test]
