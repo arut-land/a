@@ -100,7 +100,7 @@ impl Rig {
     /// The output of a call that must succeed.
     pub fn done(&self, tool: &str, input: &Value) -> Value {
         match self.call(tool, input) {
-            Outcome::Done { output } => output,
+            Outcome::Done { output } => output.value(),
             other => panic!("{tool} {input}: {other:?}"),
         }
     }
@@ -141,7 +141,7 @@ impl Host for Recorder {
             Body::Ext {
                 ext: ext.to_owned(),
                 state: state.to_owned(),
-                data,
+                data: data.into(),
             },
         ));
     }

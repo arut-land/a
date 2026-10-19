@@ -14,6 +14,8 @@ mod runtime;
 #[cfg(not(unix))]
 #[path = "unstaged.rs"]
 mod runtime;
+#[cfg(unix)]
+mod signals;
 mod workspace;
 
 use std::fs::File;
@@ -25,6 +27,8 @@ pub use config::Config;
 #[cfg(unix)]
 pub use login::login_env;
 pub use runtime::{Runtime, Staged, VERSION};
+#[cfg(unix)]
+pub use signals::{Signals, reraise};
 pub use workspace::{GitEnv, workspace_in, workspace_of};
 
 /// Locations under the per-user home (`$A_HOME`, default `~/.a`).

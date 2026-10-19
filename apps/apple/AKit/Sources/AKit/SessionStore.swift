@@ -51,7 +51,7 @@ public final class SessionStore {
         items.contains {
             switch $0 {
             case .reply(_, _, _, .running, _): true
-            case .tool(_, _, _, _, let approval, nil, _, _): approval != .pending && approval != .denied
+            case .tool(_, _, _, _, let approval, nil, _, _): approval != .denied
             case .command(_, _, _, nil): true
             default: false
             }

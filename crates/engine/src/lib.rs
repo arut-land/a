@@ -220,9 +220,10 @@ struct Slot {
     /// The parent has fired its watch on this child, so reports are moot.
     /// Known only since this daemon started.
     heard: AtomicBool,
-    /// How many entries its log holds while hibernated, once counted:
-    /// only a loaded session appends, so listing reads each log once.
-    entries: Mutex<Option<u64>>,
+    /// How it lists while hibernated: as it was when it hibernated, or
+    /// once counted from its log. Only a loaded session appends, so listing
+    /// reads each log once.
+    last: Mutex<Option<SessionSummary>>,
 }
 
 impl Slot {
@@ -231,7 +232,7 @@ impl Slot {
             header,
             live: Mutex::new(live),
             heard: AtomicBool::new(false),
-            entries: Mutex::new(None),
+            last: Mutex::new(None),
         })
     }
 }
@@ -303,7 +304,7 @@ impl Daemon {
             Some(session) => session,
             empty @ None => {
                 let loaded = self.shared.store.load(slot.header.id)?;
-                *lock(&slot.entries) = None;
+                *lock(&slot.last) = None;
                 empty.insert(Session::start(
                     slot.header.clone(),
                     loaded,
@@ -383,17 +384,18 @@ impl Daemon {
             .iter()
             .map(|slot| match &*lock(&slot.live) {
                 Some(session) => session.summary(),
-                None => SessionSummary {
-                    id: slot.header.id,
-                    workspace: slot.header.workspace.clone(),
-                    entries: *lock(&slot.entries).get_or_insert_with(|| {
-                        self.shared.store.count(slot.header.id).unwrap_or(0)
-                    }),
-                    clients: 0,
-                    // Only a session with no work is unloaded.
-                    activity: Activity::Idle,
-                    residency: Residency::Hibernated,
-                },
+                None => lock(&slot.last)
+                    .get_or_insert_with(|| SessionSummary {
+                        id: slot.header.id,
+                        workspace: slot.header.workspace.clone(),
+                        entries: self.shared.store.count(slot.header.id).unwrap_or(0),
+                        clients: 0,
+                        // Not loaded since the daemon started, so idle: one
+                        // with work or an ask has a busy marker, and loads.
+                        activity: Activity::Idle,
+                        residency: Residency::Hibernated,
+                    })
+                    .clone(),
             })
             .collect()
     }
@@ -406,7 +408,11 @@ impl Daemon {
             if live.as_ref().is_some_and(|s| s.idle_for() >= after)
                 && let Some(session) = live.take()
             {
-                *lock(&slot.entries) = Some(session.summary().entries);
+                *lock(&slot.last) = Some(SessionSummary {
+                    clients: 0,
+                    residency: Residency::Hibernated,
+                    ..session.summary()
+                });
                 session_event("hibernate", session.id, String::new);
                 session.stop();
             }
@@ -561,7 +567,7 @@ fn earliest(a: Option<Instant>, b: Instant) -> Instant {
 
 /// What the daemon lets go of when it exits.
 struct Exit {
-    socket: PathBuf,
+    home: Home,
     /// The locked pid file; see [`claim`].
     pid: File,
     /// The log that is our stderr, to rotate.
@@ -571,12 +577,15 @@ struct Exit {
 impl Exit {
     /// Unlinks the socket first so new clients spawn a fresh daemon (one
     /// that raced into our backlog sees EOF and retries), then empties the
-    /// record (a clean exit is no crash) and releases the pid lock before
+    /// record and clears the crash breaker (a clean exit is no crash, and
+    /// ends any run of them) and releases the pid lock before
     /// the process closes its connections: a client reconnecting on EOF
     /// finds the lock free for the daemon it spawns.
     fn now(self, why: &str) -> ! {
-        let _ = std::fs::remove_file(&self.socket);
-        let _ = self.pid.set_len(0);
+        let _ = std::fs::remove_file(self.home.socket());
+        if let Err(e) = sys::crash::exited(&self.home, &self.pid) {
+            eprintln!("noting a clean exit: {e}");
+        }
         drop(self.pid);
         event(|| rt::Event {
             name: "exit",
@@ -649,7 +658,7 @@ pub fn serve(
     let life = Arc::new(Lifecycle::new(build.to_owned(), home.runtime()));
     let (monitor, watch, config) = (Arc::clone(&daemon), Arc::clone(&life), config.clone());
     let exit = Exit {
-        socket: home.socket(),
+        home: home.clone(),
         pid,
         log: start.logs.then(|| home.daemon_log()),
     };
@@ -991,7 +1000,7 @@ impl Conn<'_> {
                     started: self.daemon.started,
                     clients: u32::try_from(self.daemon.clients.load(Ordering::SeqCst))
                         .unwrap_or(u32::MAX),
-                    sessions: u32::try_from(lock(&self.daemon.slots).len()).unwrap_or(u32::MAX),
+                    known: u32::try_from(lock(&self.daemon.slots).len()).unwrap_or(u32::MAX),
                 }),
                 ClientMsg::Shutdown if self.decl.role == Role::Viewer => {
                     self.error("this client is a viewer".into());

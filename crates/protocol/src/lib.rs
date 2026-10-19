@@ -8,7 +8,6 @@ use std::path::PathBuf;
 use std::sync::Arc;
 
 use serde::{Deserialize, Serialize};
-use serde_json::Value;
 use uuid::Uuid;
 
 /// The protocol this build speaks best.
@@ -20,10 +19,11 @@ pub const PROTO_MIN: u32 = 1;
 
 const MAX_FRAME: u32 = 16 * 1024 * 1024;
 
-mod tagged;
+mod decode;
+mod json;
 pub mod view;
 
-use tagged::tagged;
+pub use json::Json;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(transparent)]
@@ -95,149 +95,148 @@ impl Entry {
     }
 }
 
-tagged! {
-    #[derive(Clone, Debug, PartialEq, Eq)]
-    pub enum Body in "kind" {
-        /// The user's message, starting a turn.
-        User {
-            text: String,
-        },
-        /// Input taken in, logged on arrival so that it survives a crash and
-        /// every client sees it waiting. Queued input is taken in order: each
-        /// `user` or `command` entry takes the oldest still waiting, and a
-        /// `steer` entry the one it names. A `steer` goes to the running turn
-        /// at its next step boundary rather than after it.
-        Queued {
-            text: String,
-            #[serde(default, skip_serializing_if = "std::ops::Not::not")]
-            steer: bool,
-        },
-        /// Steering input `queued`, given to the running turn: the model reads
-        /// it as the user's before its next reply.
-        Steer {
-            text: String,
-            queued: u64,
-        },
-        Assistant {
-            text: String,
-        },
-        /// The committed intent to run a tool. Its seq is the call's id and
-        /// idempotency key; `id` is the model's own id for the call, under which
-        /// its result goes back.
-        ToolCall {
-            tool: String,
-            input: Value,
-            #[serde(default, skip_serializing_if = "Option::is_none")]
-            id: Option<String>,
-            /// How clients show the call, as the tool presents it.
-            #[serde(default, skip_serializing_if = "Option::is_none")]
-            card: Option<Card>,
-        },
-        /// The process group running a call, so recovery can kill it. Only
-        /// meaningful within the same `boot`: pgids are reused across reboots.
-        /// A `background` group outlives its call: the session owns it until
-        /// the session ends.
-        ToolProcess {
-            call: u64,
-            pgid: u32,
-            boot: String,
-            #[serde(default, skip_serializing_if = "std::ops::Not::not")]
-            background: bool,
-        },
-        /// Output tool call `call` produced since its last progress entry,
-        /// committed as it runs: what an interrupted call reports, and what
-        /// clients show meanwhile.
-        Progress {
-            call: u64,
-            text: String,
-        },
-        ToolResult {
-            call: u64,
-            outcome: Outcome,
-            /// How clients show the outcome, as the tool presents it.
-            #[serde(default, skip_serializing_if = "Option::is_none")]
-            card: Option<Card>,
-        },
-        /// The committed intent to ask a model for a reply.
-        ModelCall {
-            model: String,
-        },
-        /// The reply; `Done` carries the whole `llm::Response`, or
-        /// `{"text": ...}` in logs older than that.
-        ModelResult {
-            call: u64,
-            outcome: Outcome,
-        },
-        /// A hook changed what happens at a decision point.
-        Hook {
-            hook: String,
-            decision: Decision,
-        },
-        /// Tool call `call` waits for the user's approval. Until a
-        /// [`Decision::Approval`] for it is logged it is in the session's inbox:
-        /// delivered to every client, and again to each that attaches.
-        Ask {
-            call: u64,
-        },
-        /// The committed intent to start session `child` with `input`. Its seq
-        /// is the call that owns the child; the child's id is chosen before the
-        /// commit, so recovery finds the child instead of making another.
-        Link {
-            child: SessionId,
-            input: String,
-        },
-        /// A durable watch on `child`: when it settles, its result comes back
-        /// as a `fired` under this entry's seq, which is the idempotency key.
-        Watch {
-            child: SessionId,
-        },
-        /// Watch `watch` fired, with its child's result. Logged at most once
-        /// per watch.
-        Fired {
-            watch: u64,
-            outcome: Outcome,
-        },
-        /// The environment the session's commands run in from here on, as the
-        /// attaching client captured it, secrets redacted.
-        Environment(Environment),
-        /// The extensions the session runs with from here on, in install order,
-        /// logged when they differ from those its header or an earlier entry
-        /// records.
-        Extensions {
-            installed: Vec<Installed>,
-        },
-        /// A change to extension `ext`'s durable state `state`: folding these
-        /// in log order rebuilds it.
-        Ext {
-            ext: String,
-            state: String,
-            data: Value,
-        },
-        /// Facts about where the session runs (its directory, the workspace's
-        /// agent notes), which the model reads as a user message ahead of the
-        /// conversation. Logged once, before the first model call, so the
-        /// system prompt stays the same across sessions and cacheable.
-        Context {
-            text: String,
-        },
-        /// The committed intent to run slash command `/name args`, which takes
-        /// no model turn. Its seq is the command's id.
-        Command {
-            name: String,
-            #[serde(default, skip_serializing_if = "String::is_empty")]
-            args: String,
-        },
-        CommandResult {
-            call: u64,
-            outcome: Outcome,
-        },
-        /// The user interrupted the turn: what the agent asked for and had not
-        /// started is dropped.
-        Interrupt,
-        /// The session's own settings from here on, over every config layer;
-        /// each entry replaces the one before.
-        Settings(Overrides),
-    }
+#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum Body {
+    /// The user's message, starting a turn.
+    User {
+        text: String,
+    },
+    /// Input taken in, logged on arrival so that it survives a crash and
+    /// every client sees it waiting. Queued input is taken in order: each
+    /// `user` or `command` entry takes the oldest still waiting, and a
+    /// `steer` entry the one it names. A `steer` goes to the running turn
+    /// at its next step boundary rather than after it.
+    Queued {
+        text: String,
+        #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+        steer: bool,
+    },
+    /// Steering input `queued`, given to the running turn: the model reads
+    /// it as the user's before its next reply.
+    Steer {
+        text: String,
+        queued: u64,
+    },
+    Assistant {
+        text: String,
+    },
+    /// The committed intent to run a tool. Its seq is the call's id and
+    /// idempotency key; `id` is the model's own id for the call, under which
+    /// its result goes back.
+    ToolCall {
+        tool: String,
+        input: Json,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        id: Option<String>,
+        /// How clients show the call, as the tool presents it.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        card: Option<Card>,
+    },
+    /// The process group running a call, so recovery can kill it. Only
+    /// meaningful within the same `boot`: pgids are reused across reboots.
+    /// A `background` group outlives its call: the session owns it until
+    /// the session ends.
+    ToolProcess {
+        call: u64,
+        pgid: u32,
+        boot: String,
+        #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+        background: bool,
+    },
+    /// Output tool call `call` produced since its last progress entry,
+    /// committed as it runs: what an interrupted call reports, and what
+    /// clients show meanwhile.
+    Progress {
+        call: u64,
+        text: String,
+    },
+    ToolResult {
+        call: u64,
+        outcome: Outcome,
+        /// How clients show the outcome, as the tool presents it.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        card: Option<Card>,
+    },
+    /// The committed intent to ask a model for a reply.
+    ModelCall {
+        model: String,
+    },
+    /// The reply; `Done` carries the whole `llm::Response`, or
+    /// `{"text": ...}` in logs older than that.
+    ModelResult {
+        call: u64,
+        outcome: Outcome,
+    },
+    /// A hook changed what happens at a decision point.
+    Hook {
+        hook: String,
+        decision: Decision,
+    },
+    /// Tool call `call` waits for the user's approval. Until a
+    /// [`Decision::Approval`] for it is logged it is in the session's inbox:
+    /// delivered to every client, and again to each that attaches.
+    Ask {
+        call: u64,
+    },
+    /// The committed intent to start session `child` with `input`. Its seq
+    /// is the call that owns the child; the child's id is chosen before the
+    /// commit, so recovery finds the child instead of making another.
+    Link {
+        child: SessionId,
+        input: String,
+    },
+    /// A durable watch on `child`: when it settles, its result comes back
+    /// as a `fired` under this entry's seq, which is the idempotency key.
+    Watch {
+        child: SessionId,
+    },
+    /// Watch `watch` fired, with its child's result. Logged at most once
+    /// per watch.
+    Fired {
+        watch: u64,
+        outcome: Outcome,
+    },
+    /// The environment the session's commands run in from here on, as the
+    /// attaching client captured it, secrets redacted.
+    Environment(Environment),
+    /// The extensions the session runs with from here on, in install order,
+    /// logged when they differ from those its header or an earlier entry
+    /// records.
+    Extensions {
+        installed: Vec<Installed>,
+    },
+    /// A change to extension `ext`'s durable state `state`: folding these
+    /// in log order rebuilds it.
+    Ext {
+        ext: String,
+        state: String,
+        data: Json,
+    },
+    /// Facts about where the session runs (its directory, the workspace's
+    /// agent notes), which the model reads as a user message ahead of the
+    /// conversation. Logged once, before the first model call, so the
+    /// system prompt stays the same across sessions and cacheable.
+    Context {
+        text: String,
+    },
+    /// The committed intent to run slash command `/name args`, which takes
+    /// no model turn. Its seq is the command's id.
+    Command {
+        name: String,
+        #[serde(default, skip_serializing_if = "String::is_empty")]
+        args: String,
+    },
+    CommandResult {
+        call: u64,
+        outcome: Outcome,
+    },
+    /// The user interrupted the turn: what the agent asked for and had not
+    /// started is dropped.
+    Interrupt,
+    /// The session's own settings from here on, over every config layer;
+    /// each entry replaces the one before.
+    Settings(Overrides),
 }
 
 /// Settings a session sets for itself; those unset come from the config
@@ -374,7 +373,7 @@ pub enum Decision {
     /// The request of model call `call` was replaced before it was sent.
     PrepareStep { call: u64 },
     /// A tool call's input was replaced by `input`.
-    PreTool { tool: String, input: Value },
+    PreTool { tool: String, input: Json },
     /// A tool call was blocked before it ran.
     Block { tool: String, reason: String },
     /// The most restrictive permission the hooks gave a tool call.
@@ -420,23 +419,22 @@ pub enum Permission {
     Deny,
 }
 
-tagged! {
-    #[derive(Clone, Debug, PartialEq, Eq)]
-    pub enum Outcome in "status" {
-        Done {
-            output: Value,
-        },
-        Failed {
-            error: String,
-        },
-        /// The call stopped before it finished: the user interrupted the turn,
-        /// or the daemon stopped and the tool is not safe to rerun. `output` is
-        /// what it had produced by then.
-        Interrupted {
-            #[serde(default, skip_serializing_if = "Option::is_none")]
-            output: Option<String>,
-        },
-    }
+#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
+#[serde(tag = "status", rename_all = "snake_case")]
+pub enum Outcome {
+    Done {
+        output: Json,
+    },
+    Failed {
+        error: String,
+    },
+    /// The call stopped before it finished: the user interrupted the turn,
+    /// or the daemon stopped and the tool is not safe to rerun. `output` is
+    /// what it had produced by then.
+    Interrupted {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        output: Option<String>,
+    },
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -844,85 +842,84 @@ pub enum Rejection {
     Other,
 }
 
-tagged! {
-    #[derive(Clone, Debug)]
-    pub enum ClientMsg in "t" {
-        /// `build` is the client's staged build id (`<version>+<hash>`); it
-        /// speaks protocols `min..=proto`, or just `proto` without `min`, with
-        /// capabilities `caps`. Its first messages (attach, input) may follow
-        /// right behind, without waiting for the answer: unless that is a
-        /// welcome, the daemon acts on none of them.
-        Hello {
-            proto: u32,
-            build: String,
-            #[serde(default, skip_serializing_if = "Option::is_none")]
-            min: Option<u32>,
-            #[serde(default, skip_serializing_if = "Caps::is_empty")]
-            caps: Caps,
-        },
-        /// `env` is the client's, for the commands the session runs; without
-        /// one the session keeps the environment it had. `workspace` is the
-        /// directory the client is in: the daemon takes the git working tree
-        /// it is in (with `env`'s git variables) as the workspace. (Daemons
-        /// before that take it as it is.)
-        Attach {
-            target: Target,
-            workspace: PathBuf,
-            since: u64,
-            #[serde(default, skip_serializing_if = "Option::is_none")]
-            env: Option<Environment>,
-            #[serde(default, skip_serializing_if = "ClientDecl::is_default")]
-            decl: ClientDecl,
-        },
-        /// Replaces this client's declaration. Only sent with [`Cap::Declare`].
-        Declare(ClientDecl),
-        /// Replaces the attached session's environment (`/env refresh`).
-        Environment(Environment),
-        Input {
-            text: String,
-            #[serde(default, skip_serializing_if = "Option::is_none")]
-            client_seq: Option<u64>,
-        },
-        /// Input for the running turn, given to it at its next step boundary;
-        /// with no turn running it is plain input. Only sent with
-        /// [`Cap::Steer`].
-        Steer {
-            text: String,
-            #[serde(default, skip_serializing_if = "Option::is_none")]
-            client_seq: Option<u64>,
-        },
-        List,
-        Detach,
-        /// Asks for [`DaemonMsg::Sessions`] now and whenever a session's
-        /// summary changes, for as long as the connection lasts. Only sent
-        /// with [`Cap::Sessions`].
-        WatchSessions,
-        /// Asks for [`DaemonMsg::Status`]. Only sent with [`Cap::Daemon`].
-        Status,
-        /// Stops the daemon, as an idle one stops; the connection closes as
-        /// it exits. Only sent with [`Cap::Daemon`].
-        Shutdown,
-        /// Asks for the [`HomeSettings`], after making `change` to them if
-        /// there is one; answered with [`DaemonMsg::Settings`]. Only sent
-        /// with [`Cap::Settings`].
-        Settings {
-            #[serde(default, skip_serializing_if = "Option::is_none")]
-            change: Option<SettingsChange>,
-        },
-        /// Answers the [`DaemonMsg::Ask`] for tool call `call`.
-        Approve {
-            call: u64,
-            approved: bool,
-            #[serde(default, skip_serializing_if = "Option::is_none")]
-            client_seq: Option<u64>,
-        },
-        /// Stops the attached session's turn: its running model or tool call
-        /// and, bottom-up, the turns of the sessions it started.
-        Interrupt {
-            #[serde(default, skip_serializing_if = "Option::is_none")]
-            client_seq: Option<u64>,
-        },
-    }
+#[derive(Clone, Debug, Serialize)]
+#[serde(tag = "t", rename_all = "snake_case")]
+pub enum ClientMsg {
+    /// `build` is the client's staged build id (`<version>+<hash>`); it
+    /// speaks protocols `min..=proto`, or just `proto` without `min`, with
+    /// capabilities `caps`. Its first messages (attach, input) may follow
+    /// right behind, without waiting for the answer: unless that is a
+    /// welcome, the daemon acts on none of them.
+    Hello {
+        proto: u32,
+        build: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        min: Option<u32>,
+        #[serde(default, skip_serializing_if = "Caps::is_empty")]
+        caps: Caps,
+    },
+    /// `env` is the client's, for the commands the session runs; without
+    /// one the session keeps the environment it had. `workspace` is the
+    /// directory the client is in: the daemon takes the git working tree it
+    /// is in (with `env`'s git variables) as the workspace. (Daemons before
+    /// that take it as it is.)
+    Attach {
+        target: Target,
+        workspace: PathBuf,
+        since: u64,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        env: Option<Environment>,
+        #[serde(default, skip_serializing_if = "ClientDecl::is_default")]
+        decl: ClientDecl,
+    },
+    /// Replaces this client's declaration. Only sent with [`Cap::Declare`].
+    Declare(ClientDecl),
+    /// Replaces the attached session's environment (`/env refresh`).
+    Environment(Environment),
+    Input {
+        text: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        client_seq: Option<u64>,
+    },
+    /// Input for the running turn, given to it at its next step boundary;
+    /// with no turn running it is plain input. Only sent with
+    /// [`Cap::Steer`].
+    Steer {
+        text: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        client_seq: Option<u64>,
+    },
+    List,
+    Detach,
+    /// Asks for [`DaemonMsg::Sessions`] now and whenever a session's
+    /// summary changes, for as long as the connection lasts. Only sent with
+    /// [`Cap::Sessions`].
+    WatchSessions,
+    /// Asks for [`DaemonMsg::Status`]. Only sent with [`Cap::Daemon`].
+    Status,
+    /// Stops the daemon, as an idle one stops; the connection closes as it
+    /// exits. Only sent with [`Cap::Daemon`].
+    Shutdown,
+    /// Asks for the [`HomeSettings`], after making `change` to them if
+    /// there is one; answered with [`DaemonMsg::Settings`]. Only sent with
+    /// [`Cap::Settings`].
+    Settings {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        change: Option<SettingsChange>,
+    },
+    /// Answers the [`DaemonMsg::Ask`] for tool call `call`.
+    Approve {
+        call: u64,
+        approved: bool,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        client_seq: Option<u64>,
+    },
+    /// Stops the attached session's turn: its running model or tool call
+    /// and, bottom-up, the turns of the sessions it started.
+    Interrupt {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        client_seq: Option<u64>,
+    },
 }
 
 impl ClientMsg {
@@ -965,106 +962,105 @@ impl ClientMsg {
     }
 }
 
-tagged! {
-    #[derive(Clone, Debug)]
-    pub enum DaemonMsg in "t" {
-        /// The hello is accepted at protocol `proto`. `caps` are the client's
-        /// capabilities the daemon takes up, and `client` this connection's id,
-        /// as [`Origin`]s name it.
-        Welcome {
-            proto: u32,
-            build: String,
-            #[serde(default, skip_serializing_if = "Caps::is_empty")]
-            caps: Caps,
-            #[serde(default, skip_serializing_if = "is_zero")]
-            client: u32,
-        },
-        /// The daemon speaks protocols `min..=supported` (just `supported`
-        /// without `min`), none of the client's.
-        Mismatch {
-            supported: u32,
-            #[serde(default, skip_serializing_if = "Option::is_none")]
-            min: Option<u32>,
-        },
-        /// A newer build was staged: the daemon finishes in-flight work, exits,
-        /// and closes every connection. Clients then reconnect, which starts the
-        /// new build, and re-attach to replay what they missed. Sent as the reply
-        /// to a hello, or to connections already open when the drain began.
-        Draining,
-        Attached {
-            session: SessionId,
-            workspace: PathBuf,
-        },
-        #[serde(skip_deserializing)]
-        Entry(Entry),
-        /// Live text of an unfinished model call. Never logged: the committed
-        /// `model_result` is the fact.
-        Delta {
-            call: u64,
-            text: String,
-        },
-        /// Replay is complete; everything after this is live.
-        Synced {
-            seq: u64,
-        },
-        Sessions {
-            sessions: Vec<SessionSummary>,
-        },
-        /// The answer to [`ClientMsg::Status`].
-        Status {
-            pid: u32,
-            build: String,
-            /// Seconds since the Unix epoch at start.
-            started: u64,
-            clients: u32,
-            sessions: u32,
-        },
-        /// The answer to [`ClientMsg::Settings`]: the settings as they are
-        /// now, and why its change was not made, if it was not.
-        Settings {
-            settings: HomeSettings,
-            #[serde(default, skip_serializing_if = "Option::is_none")]
-            error: Option<String>,
-        },
-        /// Sent after `Synced` when the replay held entries.
-        Recap(Recap),
-        /// Tool call `call` waits for approval: sent when it is asked, and
-        /// after `Synced` for every call still waiting.
-        Ask {
-            call: u64,
-            tool: String,
-            input: Value,
-        },
-        Error {
-            message: String,
-        },
-        /// The whole log-derived view at `view.seq`, in place of the replay up
-        /// to it: for an attach from far behind, or a client that fell too far
-        /// behind live. Folding it and what follows equals folding the entries
-        /// it stands for. Only sent with [`Cap::Snapshot`].
-        #[serde(skip_deserializing)]
-        Snapshot(Box<view::SessionView>),
-        /// Mutation `origin` was taken; what it causes follows as entries. Only
-        /// sent with [`Cap::Ack`].
-        Ack {
-            origin: Origin,
-        },
-        /// Mutation `origin` was refused. Only sent with [`Cap::Ack`].
-        Rejected {
-            origin: Origin,
-            reason: Rejection,
-            #[serde(default, skip_serializing_if = "String::is_empty")]
-            message: String,
-        },
-        /// A message, or an entry, of a kind this build does not know: a newer
-        /// daemon's. Never sent; decoding yields it so a client skips what it
-        /// cannot show instead of dropping the connection. `seq` is the
-        /// entry's.
-        #[serde(skip)]
-        Unknown {
-            seq: Option<u64>,
-        },
-    }
+#[derive(Clone, Debug, Serialize)]
+#[serde(tag = "t", rename_all = "snake_case")]
+pub enum DaemonMsg {
+    /// The hello is accepted at protocol `proto`. `caps` are the client's
+    /// capabilities the daemon takes up, and `client` this connection's id,
+    /// as [`Origin`]s name it.
+    Welcome {
+        proto: u32,
+        build: String,
+        #[serde(default, skip_serializing_if = "Caps::is_empty")]
+        caps: Caps,
+        #[serde(default, skip_serializing_if = "is_zero")]
+        client: u32,
+    },
+    /// The daemon speaks protocols `min..=supported` (just `supported`
+    /// without `min`), none of the client's.
+    Mismatch {
+        supported: u32,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        min: Option<u32>,
+    },
+    /// A newer build was staged: the daemon finishes in-flight work, exits,
+    /// and closes every connection. Clients then reconnect, which starts the
+    /// new build, and re-attach to replay what they missed. Sent as the reply
+    /// to a hello, or to connections already open when the drain began.
+    Draining,
+    Attached {
+        session: SessionId,
+        workspace: PathBuf,
+    },
+    Entry(Entry),
+    /// Live text of an unfinished model call. Never logged: the committed
+    /// `model_result` is the fact.
+    Delta {
+        call: u64,
+        text: String,
+    },
+    /// Replay is complete; everything after this is live.
+    Synced {
+        seq: u64,
+    },
+    Sessions {
+        sessions: Vec<SessionSummary>,
+    },
+    /// The answer to [`ClientMsg::Status`].
+    Status {
+        pid: u32,
+        build: String,
+        /// Seconds since the Unix epoch at start.
+        started: u64,
+        /// Open connections, the asking one included.
+        clients: u32,
+        /// Sessions the daemon knows, loaded or not.
+        known: u32,
+    },
+    /// The answer to [`ClientMsg::Settings`]: the settings as they are now,
+    /// and why its change was not made, if it was not.
+    Settings {
+        settings: HomeSettings,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        error: Option<String>,
+    },
+    /// Sent after `Synced` when the replay held entries.
+    Recap(Recap),
+    /// Tool call `call` waits for approval: sent when it is asked, and
+    /// after `Synced` for every call still waiting.
+    Ask {
+        call: u64,
+        tool: String,
+        input: Json,
+    },
+    Error {
+        message: String,
+    },
+    /// The whole log-derived view at `view.seq`, in place of the replay up
+    /// to it: for an attach from far behind, or a client that fell too far
+    /// behind live. Folding it and what follows equals folding the entries
+    /// it stands for. Only sent with [`Cap::Snapshot`].
+    Snapshot(Box<view::SessionView>),
+    /// Mutation `origin` was taken; what it causes follows as entries. Only
+    /// sent with [`Cap::Ack`].
+    Ack {
+        origin: Origin,
+    },
+    /// Mutation `origin` was refused. Only sent with [`Cap::Ack`].
+    Rejected {
+        origin: Origin,
+        reason: Rejection,
+        #[serde(default, skip_serializing_if = "String::is_empty")]
+        message: String,
+    },
+    /// A message, or an entry, of a kind this build does not know: a newer
+    /// daemon's. Never sent; decoding yields it so a client skips what it
+    /// cannot show instead of dropping the connection. `seq` is the
+    /// entry's.
+    #[serde(skip)]
+    Unknown {
+        seq: Option<u64>,
+    },
 }
 
 // A reference, as `skip_serializing_if` passes it.
@@ -1231,135 +1227,6 @@ pub trait Decode: Sized {
     fn from_json(bytes: &[u8]) -> serde_json::Result<Self>;
 }
 
-/// Everything is decoded from a [`Value`], for the reason [`tagged`]
-/// gives.
-fn value(bytes: &[u8]) -> serde_json::Result<Value> {
-    serde_json::from_slice(bytes)
-}
-
-impl Decode for ClientMsg {
-    fn from_json(bytes: &[u8]) -> serde_json::Result<Self> {
-        Self::from_value(value(bytes)?)
-    }
-}
-
-impl Decode for Entry {
-    fn from_json(bytes: &[u8]) -> serde_json::Result<Self> {
-        Self::from_value(value(bytes)?)
-    }
-}
-
-impl Entry {
-    /// Its header fields, then its body from the same object: no body has
-    /// fields of their names.
-    fn from_value(value: Value) -> serde_json::Result<Self> {
-        #[derive(Deserialize)]
-        struct Head {
-            seq: u64,
-            epoch: u32,
-            #[serde(default)]
-            uuid: Option<Uuid>,
-            #[serde(default)]
-            parent: Option<Uuid>,
-        }
-        let Head {
-            seq,
-            epoch,
-            uuid,
-            parent,
-        } = Head::deserialize(&value)?;
-        Ok(Self {
-            seq,
-            epoch,
-            uuid,
-            parent,
-            body: Body::from_value(value)?,
-        })
-    }
-}
-
-/// Through [`Decode`]'s decoder, whatever the input.
-impl<'de> Deserialize<'de> for Entry {
-    fn deserialize<D: serde::Deserializer<'de>>(d: D) -> Result<Self, D::Error> {
-        Self::from_value(Value::deserialize(d)?).map_err(serde::de::Error::custom)
-    }
-}
-
-/// Unknown kinds never abort a client; a known one that is malformed does.
-impl Decode for DaemonMsg {
-    fn from_json(bytes: &[u8]) -> serde_json::Result<Self> {
-        let value = value(bytes)?;
-        match value.get("t").and_then(Value::as_str) {
-            Some("entry") => {
-                let kind = value.get("kind").and_then(Value::as_str);
-                if kind.is_some_and(|kind| !known_kind(kind)) {
-                    let seq = value.get("seq").and_then(Value::as_u64);
-                    return Ok(Self::Unknown { seq });
-                }
-                Entry::from_value(value).map(Self::Entry)
-            }
-            Some("snapshot") => {
-                view::SessionView::deserialize(value).map(|v| Self::Snapshot(Box::new(v)))
-            }
-            Some(t) if !known_msg(t) => Ok(Self::Unknown { seq: None }),
-            _ => Self::from_value(value),
-        }
-    }
-}
-
-/// The `t` of every [`DaemonMsg`] this build sends.
-fn known_msg(t: &str) -> bool {
-    matches!(
-        t,
-        "welcome"
-            | "mismatch"
-            | "draining"
-            | "attached"
-            | "entry"
-            | "delta"
-            | "synced"
-            | "sessions"
-            | "settings"
-            | "status"
-            | "recap"
-            | "ask"
-            | "error"
-            | "snapshot"
-            | "ack"
-            | "rejected"
-    )
-}
-
-/// The `kind` of every [`Body`] this build logs.
-fn known_kind(kind: &str) -> bool {
-    matches!(
-        kind,
-        "user"
-            | "queued"
-            | "steer"
-            | "progress"
-            | "interrupt"
-            | "settings"
-            | "assistant"
-            | "tool_call"
-            | "tool_process"
-            | "tool_result"
-            | "model_call"
-            | "model_result"
-            | "hook"
-            | "ask"
-            | "link"
-            | "watch"
-            | "fired"
-            | "environment"
-            | "extensions"
-            | "ext"
-            | "context"
-            | "command"
-            | "command_result"
-    )
-}
-
 /// Reads one frame; `Ok(None)` means the peer closed the stream cleanly.
 pub fn read_frame<T: Decode>(r: &mut impl Read) -> io::Result<Option<T>> {
     match read_body(r)? {
@@ -1395,6 +1262,9 @@ fn read_body(r: &mut dyn Read) -> io::Result<Option<Vec<u8>>> {
 
 #[cfg(test)]
 mod tests {
+    use serde_json::Value;
+
+    use super::decode::{known_kind, known_msg};
     use super::*;
 
     #[test]
@@ -1584,7 +1454,7 @@ mod tests {
             Body::Assistant { text: "a".into() },
             Body::ToolCall {
                 tool: "t".into(),
-                input: Value::Null,
+                input: Json::null(),
                 id: None,
                 card: None,
             },
@@ -1629,7 +1499,7 @@ mod tests {
             Body::Ext {
                 ext: "e".into(),
                 state: "s".into(),
-                data: Value::Null,
+                data: Json::null(),
             },
             Body::Context { text: "c".into() },
             Body::Command {
@@ -1704,13 +1574,13 @@ mod tests {
                 build: "b".into(),
                 started: 0,
                 clients: 1,
-                sessions: 0,
+                known: 0,
             },
             DaemonMsg::Recap(Recap::default()),
             DaemonMsg::Ask {
                 call: 1,
                 tool: "t".into(),
-                input: Value::Null,
+                input: Json::null(),
             },
             DaemonMsg::Error {
                 message: "m".into(),
@@ -1769,7 +1639,7 @@ mod tests {
         assert_eq!(serde_json::to_string(&e).unwrap(), old);
         let carded = Body::ToolCall {
             tool: "bash".into(),
-            input: serde_json::json!({ "command": "ls" }),
+            input: serde_json::json!({ "command": "ls" }).into(),
             id: None,
             card: Some(Card {
                 title: "$ ls".into(),
@@ -1783,7 +1653,7 @@ mod tests {
         let ext = Body::Ext {
             ext: "shell".into(),
             state: "cwd".into(),
-            data: "/w".into(),
+            data: serde_json::json!("/w").into(),
         };
         assert_eq!(
             serde_json::to_string(&ext).unwrap(),
@@ -1847,7 +1717,7 @@ mod tests {
         }
         let call = Body::ToolCall {
             tool: "t".into(),
-            input: Value::Null,
+            input: Json::null(),
             id: Some("call_1".into()),
             card: None,
         };

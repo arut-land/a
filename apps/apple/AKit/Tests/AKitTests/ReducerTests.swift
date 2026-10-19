@@ -101,6 +101,21 @@ func expectInStep(_ store: SessionStore, _ reducer: Reducer, _ name: String) {
     #expect(store.items.count == 1000 && store.resyncs == 1)
 }
 
+/// An interrupt settles a call waiting for approval, so Stop shows for one.
+@Test func aCallWaitingForApprovalCanBeStopped() throws {
+    let reducer = Reducer()
+    let store = SessionStore(source: reducer)
+    for message in [
+        #"{"t":"attached","session":"00000000-0000-0000-0000-00000000000a","workspace":"/w"}"#,
+        #"{"t":"entry","seq":1,"epoch":0,"kind":"tool_call","tool":"bash","input":{"command":"ls"}}"#,
+        #"{"t":"entry","seq":2,"epoch":0,"kind":"ask","call":1}"#,
+    ] {
+        if let update = try reducer.fold(message: message) { store.apply(update) }
+    }
+    #expect(store.items.count == 1)
+    #expect(store.running)
+}
+
 @Test func errorsCarryStableCodes() {
     #expect(throws: ClientError.self) { try Reducer().fold(message: "{") }
     do {

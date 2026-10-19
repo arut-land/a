@@ -4,13 +4,12 @@ use std::path::Path;
 
 use protocol::view::{Item, Link, Usage, call_title, recap_line};
 
-use ratatui_core::buffer::Buffer;
 use ratatui_core::style::{Color, Style};
 
-use super::super::render::{Viewport, ellipsize, fit, put};
+use super::super::render::{Canvas, Viewport, ellipsize, fit};
 use super::super::text::{Action, Line, Span, width_of, wrap};
 use super::super::view::{self, ASK, MUTED, USER};
-use super::{App, Conn, HELP, Hit, Overlay};
+use super::{App, Conn, HELP, Overlay};
 
 /// The input shows at most this many rows; it scrolls past them.
 const INPUT_ROWS: usize = 8;
@@ -32,16 +31,17 @@ impl App {
         out
     }
 
-    /// Inline: the last `n` rows of the items not yet printed.
-    fn live(&mut self, width: usize, n: usize) -> Vec<Line> {
+    /// Inline: the last `n` rows of the items not yet printed, as (item,
+    /// row within it).
+    fn live(&mut self, width: usize, n: usize) -> Vec<(usize, usize)> {
         let mut out = Vec::new();
         for i in (self.committed..self.view.items.len()).rev() {
             if out.len() == n {
                 break;
             }
-            let rows = self.rows(i, width);
-            let take = rows.len().min(n - out.len());
-            out.splice(0..0, rows[rows.len() - take..].iter().cloned());
+            let len = self.rows(i, width).len();
+            let take = len.min(n - out.len());
+            out.splice(0..0, (len - take..len).map(|row| (i, row)));
         }
         out
     }
@@ -290,47 +290,66 @@ impl App {
             .min(h)
     }
 
-    /// Draws a frame and remembers where its buttons are; returns where
-    /// the caret goes, if it shows.
-    pub fn draw(&mut self, buf: &mut Buffer) -> Option<(u16, u16)> {
-        self.hits.clear();
-        let (w, h) = (buf.area.width, buf.area.height);
-        let width = usize::from(w);
+    /// Draws a `w` × `h` frame on the app's canvas, which keeps the rows
+    /// drawn as before and notes where buttons are; returns where the
+    /// caret goes, if it shows.
+    pub fn draw(&mut self, w: u16, h: u16) -> Option<(u16, u16)> {
+        let mut canvas = std::mem::take(&mut self.canvas);
+        canvas.begin(w, h);
+        let caret = self.frame(&mut canvas);
+        canvas.finish();
+        self.canvas = canvas;
+        caret
+    }
+
+    /// The last frame drawn.
+    pub fn canvas(&self) -> &Canvas {
+        &self.canvas
+    }
+
+    fn frame(&mut self, canvas: &mut Canvas) -> Option<(u16, u16)> {
+        let area = canvas.area();
+        let width = usize::from(area.width);
         let (bottom, caret) = self.bottom(width);
-        let body = h.saturating_sub(u16::try_from(bottom.len()).unwrap_or(u16::MAX));
+        let body = area
+            .height
+            .saturating_sub(u16::try_from(bottom.len()).unwrap_or(u16::MAX));
         (self.width, self.body) = (width, body);
         match (self.viewport, self.overlay_lines(width.saturating_sub(4))) {
             (Viewport::Inline, Some(lines)) => {
                 let skip = lines.len().saturating_sub(usize::from(body));
                 for (y, line) in (0..body).zip(lines.iter().skip(skip)) {
-                    self.put(buf, 0, y, line);
+                    canvas.line(0, y, line);
                 }
             }
             (viewport, overlay) => {
-                self.transcript(buf, body, viewport);
+                // An overlay covers the transcript's buttons.
+                canvas.inert = overlay.is_some();
+                self.transcript(canvas, body, viewport);
+                canvas.inert = false;
                 if let Some(lines) = overlay {
-                    // The transcript's buttons are covered.
-                    self.hits.clear();
-                    self.boxed(buf, body, &lines);
+                    self.boxed(canvas, body, &lines);
                 }
             }
         }
         for (y, line) in (body..).zip(&bottom) {
-            self.put(buf, 0, y, line);
+            canvas.line(0, y, line);
         }
         caret.map(|(x, y)| (x, body + y))
     }
 
-    fn transcript(&mut self, buf: &mut Buffer, body: u16, viewport: Viewport) {
-        let (width, rows) = (usize::from(buf.area.width), usize::from(body));
-        let lines = match viewport {
+    fn transcript(&mut self, canvas: &mut Canvas, body: u16, viewport: Viewport) {
+        let (width, rows) = (usize::from(canvas.area().width), usize::from(body));
+        let shown = match viewport {
             Viewport::Full => self.window(width, rows),
             Viewport::Inline => self.live(width, rows),
         };
         // A short transcript sits at the bottom, by the input.
-        let top = u16::try_from(rows - lines.len()).unwrap_or(0);
-        for (y, line) in (top..).zip(&lines) {
-            self.put(buf, 0, y, line);
+        let top = u16::try_from(rows - shown.len()).unwrap_or(0);
+        for (y, &(i, row)) in (top..).zip(&shown) {
+            if let Some(line) = self.cached(i).get(row) {
+                canvas.line(0, y, line);
+            }
         }
         if self.anchor.is_some() && body > 0 {
             let more = Line::from(vec![Span::button(
@@ -338,25 +357,26 @@ impl App {
                 Style::new().fg(Color::Cyan).reversed(),
                 Action::Bottom,
             )]);
-            let x = buf
-                .area
+            let x = canvas
+                .area()
                 .width
                 .saturating_sub(u16::try_from(more.width()).unwrap_or(0));
-            self.put(buf, x, body - 1, &more);
+            canvas.line(x, body - 1, &more);
         }
     }
 
     /// Draws `lines` in a bordered box centered over the top `body` rows.
-    fn boxed(&mut self, buf: &mut Buffer, body: u16, lines: &[Line]) {
-        let w = buf.area.width.min(84);
+    fn boxed(&self, canvas: &mut Canvas, body: u16, lines: &[Line]) {
+        let width = canvas.area().width;
+        let w = width.min(84);
         let h = u16::try_from(lines.len() + 2).unwrap_or(u16::MAX).min(body);
         if w < 8 || h < 3 {
             return;
         }
-        let (x, y) = ((buf.area.width - w) / 2, (body - h) / 2);
+        let (x, y) = ((width - w) / 2, (body - h) / 2);
         let edge = "─".repeat(usize::from(w) - 2);
-        put(buf, x, y, &format!("╭{edge}╮"), MUTED);
-        put(buf, x, y + h - 1, &format!("╰{edge}╯"), MUTED);
+        canvas.line(x, y, &Line::plain(format!("╭{edge}╮"), MUTED));
+        canvas.line(x, y + h - 1, &Line::plain(format!("╰{edge}╯"), MUTED));
         let shown = usize::from(h - 2);
         // A picker's selection stays in view.
         let skip = match self.overlay {
@@ -364,26 +384,10 @@ impl App {
             _ => 0,
         }
         .min(lines.len().saturating_sub(shown));
-        let blank = " ".repeat(usize::from(w) - 2);
+        let side = Line::plain(format!("│{}│", " ".repeat(usize::from(w) - 2)), MUTED);
         for (row, line) in (y + 1..y + h - 1).zip(lines.iter().skip(skip)) {
-            put(buf, x, row, &format!("│{blank}│"), MUTED);
-            self.put(buf, x + 2, row, &clip(line, usize::from(w) - 4));
-        }
-    }
-
-    /// Draws a line and records its buttons.
-    fn put(&mut self, buf: &mut Buffer, x: u16, y: u16, line: &Line) {
-        let mut at = x;
-        for span in &line.spans {
-            let end = put(buf, at, y, &span.text, span.style);
-            if let Some(action) = span.action {
-                self.hits.push(Hit {
-                    y,
-                    x: (at, end),
-                    action,
-                });
-            }
-            at = end;
+            canvas.line(x, row, &side);
+            canvas.line(x + 2, row, &clip(line, usize::from(w) - 4));
         }
     }
 }

@@ -8,7 +8,7 @@ use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 use std::task::{Poll, Waker};
 use std::time::{Duration, Instant};
 
-use protocol::{Card, Environment, Outcome, SessionId};
+use protocol::{Card, Environment, Json, Outcome, SessionId};
 use rt::BoxFuture;
 use serde::Serialize;
 use serde::de::{Deserialize, DeserializeOwned};
@@ -260,9 +260,9 @@ pub trait DynTool: Send + Sync {
     fn spec(&self) -> llm::Tool;
     fn call<'a>(&'a self, input: &Value, cx: &'a Cx) -> BoxFuture<'a, Outcome>;
     /// What the model sees of a stored output.
-    fn to_model(&self, output: &Value) -> llm::Output;
+    fn to_model(&self, output: &Json) -> llm::Output;
     fn present(&self, input: &Value) -> Option<Card>;
-    fn present_result(&self, input: &Value, output: &Value) -> Option<Card>;
+    fn present_result(&self, input: &Value, output: &Json) -> Option<Card>;
 }
 
 impl<T: Tool> DynTool for T {
@@ -296,24 +296,27 @@ impl<T: Tool> DynTool for T {
             }
             .and_then(|output| serde_json::to_value(output).map_err(|e| e.to_string()));
             match result {
-                Ok(output) => Outcome::Done { output },
+                Ok(output) => Outcome::Done {
+                    output: output.into(),
+                },
                 Err(error) => Outcome::Failed { error },
             }
         })
     }
 
-    fn to_model(&self, output: &Value) -> llm::Output {
-        T::Out::deserialize(output)
-            .map_or_else(|_| llm::Output::Json(output.clone()), |o| T::to_model(&o))
+    fn to_model(&self, output: &Json) -> llm::Output {
+        output
+            .parse::<T::Out>()
+            .map_or_else(|_| llm::Output::Json(output.value()), |o| T::to_model(&o))
     }
 
     fn present(&self, input: &Value) -> Option<Card> {
         T::present(&T::In::deserialize(input).ok()?)
     }
 
-    fn present_result(&self, input: &Value, output: &Value) -> Option<Card> {
+    fn present_result(&self, input: &Value, output: &Json) -> Option<Card> {
         let input = T::In::deserialize(input).ok()?;
-        T::present_result(&input, &T::Out::deserialize(output).ok()?)
+        T::present_result(&input, &output.parse().ok()?)
     }
 }
 
@@ -346,7 +349,7 @@ impl Toolset {
         match outcome {
             Outcome::Done { output } => (
                 self.get(name)
-                    .map_or_else(|| llm::Output::Json(output.clone()), |t| t.to_model(output)),
+                    .map_or_else(|| llm::Output::Json(output.value()), |t| t.to_model(output)),
                 false,
             ),
             Outcome::Failed { error } => (llm::Output::Text(error.clone()), true),

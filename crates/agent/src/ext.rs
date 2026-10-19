@@ -87,7 +87,9 @@ impl<C: Command> DynCommand for C {
     fn run<'a>(&'a self, args: &'a str, cx: &'a Cx) -> BoxFuture<'a, Outcome> {
         Box::pin(async move {
             match Command::run(self, args, cx).await {
-                Ok(output) => Outcome::Done { output },
+                Ok(output) => Outcome::Done {
+                    output: output.into(),
+                },
                 Err(error) => Outcome::Failed { error },
             }
         })

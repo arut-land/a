@@ -4,8 +4,7 @@
 use protocol::view::{
     Approval, Item, Status, Stream, Usage, call_title, decision_line, output_text, recap_line,
 };
-use protocol::{Card, Outcome, Recap};
-use serde_json::Value;
+use protocol::{Card, Json, Outcome, Recap};
 use topcoat::Result;
 use topcoat::runtime::Event;
 use topcoat::view::{View, component, view};
@@ -202,7 +201,7 @@ async fn tool_card(
 /// A finished call's output: as its tool presents it, a command's streams
 /// and exit status as older logs hold them, anything else as JSON.
 #[component]
-async fn output_block(output: Value, card: Option<Card>) -> Result<impl View> {
+async fn output_block(output: Json, card: Option<Card>) -> Result<impl View> {
     let command = output_text(&output, card.as_ref());
     Ok(view! {
         match command {
@@ -210,7 +209,7 @@ async fn output_block(output: Value, card: Option<Card>) -> Result<impl View> {
                 <pre style=(style::OUTPUT)>(text) <span style=(style::DIM)>(note)</span></pre>
             }
             None => {
-                <pre style=(style::OUTPUT)>(serde_json::to_string_pretty(&output).unwrap_or_default())</pre>
+                <pre style=(style::OUTPUT)>(serde_json::to_string_pretty(&output.value()).unwrap_or_default())</pre>
             }
         }
     })

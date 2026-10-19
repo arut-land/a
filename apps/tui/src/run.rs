@@ -9,11 +9,12 @@ use std::thread;
 use client::{Connection, Endpoint, Welcome, Writer};
 use protocol::view::Link;
 use protocol::{ClientMsg, Target};
+use sys::Signals;
 
 use super::Event;
 use super::app::{App, Conn, Effect};
 use super::render::Viewport;
-use super::screen::Screen;
+use super::screen::{Screen, Stdout};
 use super::term::{self, Terminal};
 use crate::Daemon;
 
@@ -34,6 +35,9 @@ pub fn run(daemon: &Daemon, target: Target, viewport: Viewport) -> io::Result<()
         }
         Endpoint::Local(_) => None,
     };
+    // Caught before the terminal is ours, so none ends the client with it
+    // raw; the input thread reads them.
+    let signals = Signals::catch(&term::SIGNALS)?;
     let terminal = Terminal::enter(viewport)?;
     let mut client = Client {
         daemon,
@@ -42,11 +46,11 @@ pub fn run(daemon: &Daemon, target: Target, viewport: Viewport) -> io::Result<()
         writer: None,
         welcome: Welcome::default(),
         app: App::new(viewport, workspace, &target),
-        screen: Screen::new(viewport)?,
+        screen: Screen::new(viewport, Stdout::default()),
     };
     // The first frame goes out before the daemon is even reached.
     client.draw()?;
-    term::spawn_input(client.tx.clone(), viewport);
+    term::spawn_input(client.tx.clone(), signals);
     match early {
         Some(conn) => {
             let tx = client.tx.clone();
@@ -111,11 +115,7 @@ impl Client<'_> {
     fn event(&mut self, event: Event) -> Option<Effect> {
         match event {
             Event::Input(input) => return self.app.input(input),
-            Event::Resized(row) => {
-                if let Err(e) = self.screen.invalidate(row) {
-                    self.app.notice(format!("not redrawn: {e}"), true);
-                }
-            }
+            Event::Resized => self.screen.invalidate(),
             Event::InputClosed => return Some(Effect::Detach),
             Event::Connected(id, writer, welcome, remote) if id == self.id => {
                 self.writer = Some(writer);
@@ -173,7 +173,10 @@ impl Client<'_> {
                 self.open(target, 0, true);
                 Ok(())
             }
-            Effect::Redraw => self.screen.invalidate(None).map_err(|e| e.to_string()),
+            Effect::Redraw => {
+                self.screen.invalidate();
+                Ok(())
+            }
             Effect::Detach => {
                 return Some(match (self.writer.take(), &self.app.conn) {
                     (Some(mut writer), _) => {
@@ -233,7 +236,7 @@ impl Client<'_> {
     }
 
     fn draw(&mut self) -> io::Result<()> {
-        self.screen.draw(&mut self.app)
+        self.screen.draw(&mut self.app, term::size()?)
     }
 }
 

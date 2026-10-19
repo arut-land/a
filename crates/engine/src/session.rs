@@ -16,8 +16,8 @@ use agent::{
 };
 use protocol::view::SessionView;
 use protocol::{
-    Activity, Body, Cap, Card, DaemonMsg, Decision, Entry, Environment, Frame, Installed, Outcome,
-    Overrides, Residency, SessionId, SessionSummary,
+    Activity, Body, Cap, Card, DaemonMsg, Decision, Entry, Environment, Frame, Installed, Json,
+    Outcome, Overrides, Residency, SessionId, SessionSummary,
 };
 use rt::BoxFuture;
 use serde_json::{Value, json};
@@ -83,7 +83,7 @@ pub struct Session {
     /// keep the session loaded, as do watches not yet fired.
     queued: AtomicUsize,
     /// Whether the actor is in a unit of work, even one that waits for an
-    /// answer and so is not counted in `queued`.
+    /// answer and so is not counted in `queued`. Recovery is from the start.
     running: AtomicBool,
     /// Open client attachments; a session with any stays loaded.
     attached: AtomicUsize,
@@ -231,7 +231,7 @@ impl Session {
             // Recovery counts as queued work until it has run, and every
             // armed watch until it fires.
             queued: AtomicUsize::new(usize::from(!fresh) + armed),
-            running: AtomicBool::new(false),
+            running: AtomicBool::new(!fresh),
             attached: AtomicUsize::new(0),
             last_active: Mutex::new(Instant::now()),
             env: Mutex::new(env),
@@ -318,12 +318,16 @@ impl Session {
 
     /// Stops the running turn: its model or tool call, and what the agent
     /// would have done next. The turns of the sessions it started stop
-    /// first, bottom-up.
+    /// first, bottom-up. With no unit of work running there is nothing to
+    /// stop.
     pub fn interrupt(&self) {
         for child in self.children() {
             child.interrupt();
         }
-        lock(&self.cancel).cancel();
+        let cancel = lock(&self.cancel);
+        if self.running.load(Ordering::SeqCst) {
+            cancel.cancel();
+        }
     }
 
     /// Answers the ask for tool call `call`; the actor logs the answer and
@@ -742,7 +746,6 @@ impl Session {
     async fn work(&self, job: BoxFuture<'_, io::Result<()>>) -> bool {
         let began = crate::stamp();
         self.touch();
-        *lock(&self.cancel) = Cancel::default();
         self.running.store(true, Ordering::SeqCst);
         if let Err(e) = self.mark_busy(true).await {
             self.warn(format_args!("busy marker: {e}"));
@@ -759,9 +762,22 @@ impl Session {
             let how = if done.is_ok() { "done" } else { "failed" };
             format!("{how} in {elapsed:?}")
         });
-        self.running.store(false, Ordering::SeqCst);
+        {
+            // Under the lock an interrupt takes: it stops this unit, or
+            // finds nothing running and stops nothing, never the next.
+            let mut cancel = lock(&self.cancel);
+            *cancel = Cancel::default();
+            self.running.store(false, Ordering::SeqCst);
+        }
         let settled = self.queued.fetch_sub(1, Ordering::SeqCst) == 1;
-        if settled && let Err(e) = self.mark_busy(false).await {
+        // Stopped while it waits for approval, it stays marked: the next
+        // daemon loads it at once and asks again.
+        let stopped = lock(&self.answers).stopped;
+        let asking = stopped && !inbox(&self.lock().entries).is_empty();
+        if settled
+            && !asking
+            && let Err(e) = self.mark_busy(false).await
+        {
             self.warn(format_args!("busy marker: {e}"));
         }
         self.touch();
@@ -843,7 +859,7 @@ impl Session {
                 let call = self.record(Body::ToolCall {
                     card: card(&registry, &tool, &input),
                     tool,
-                    input,
+                    input: input.into(),
                     id,
                 });
                 let outcome = Outcome::Interrupted { output: None };
@@ -900,7 +916,7 @@ impl Session {
                     .append(Body::ToolCall {
                         card: card(&registry, &tool, &input),
                         tool: tool.clone(),
-                        input: input.clone(),
+                        input: Json::new(&input),
                         id,
                     })
                     .await?;
@@ -919,12 +935,17 @@ impl Session {
     }
 
     /// Waits for the user's answer to the ask for call `seq`, logs it, and
-    /// runs the call if approved.
+    /// runs the call if approved. An interrupt answers it: the call is
+    /// interrupted without running, whatever the user says.
     async fn ask(&self, seq: u64, tool: &str, input: &Value) -> io::Result<Outcome> {
         self.flush().await?;
-        let approved = self.answer_to(seq).await?;
+        let turn = self.turn();
+        let (hook, approved) = match self.answer_to(seq, &turn).await? {
+            Some(approved) => ("user", approved),
+            None => ("interrupt", false),
+        };
         self.append(Body::Hook {
-            hook: "user".to_owned(),
+            hook: hook.to_owned(),
             decision: Decision::Approval {
                 tool: tool.to_owned(),
                 approved,
@@ -932,26 +953,34 @@ impl Session {
             },
         })
         .await?;
-        Ok(if approved {
+        Ok(if turn.is_cancelled() {
+            Outcome::Interrupted { output: None }
+        } else if approved {
             self.run_tool(seq, tool, input).await
         } else {
             not_approved()
         })
     }
 
-    /// Waits until call `call` is answered. Waiting is not work: the session
-    /// may hibernate, and the daemon exit, with the ask in its inbox;
-    /// recovery asks again. A stop while waiting is an `Interrupted` error.
-    async fn answer_to(&self, call: u64) -> io::Result<bool> {
+    /// Waits until call `call` is answered, or `None` once `turn` is
+    /// interrupted first. Waiting is not work: the session may hibernate,
+    /// and the daemon exit, with the ask in its inbox; recovery asks again.
+    /// A stop while waiting is an `Interrupted` error.
+    async fn answer_to(&self, call: u64, turn: &Cancel) -> io::Result<Option<bool>> {
         self.queued.fetch_sub(1, Ordering::SeqCst);
         self.touch();
+        let mut interrupted = pin!(turn.cancelled());
         let answer = poll_fn(|cx| {
             let mut answers = lock(&self.answers);
             if let Some(approved) = answers.given.remove(&call) {
-                return Poll::Ready(Some(approved));
+                return Poll::Ready(Some(Some(approved)));
             }
+            // A stop interrupts the turn too: it is checked first.
             if answers.stopped {
                 return Poll::Ready(None);
+            }
+            if interrupted.as_mut().poll(cx).is_ready() {
+                return Poll::Ready(Some(None));
             }
             answers.waiting = Some(cx.waker().clone());
             Poll::Pending
@@ -1011,7 +1040,12 @@ impl Session {
         Ok(input)
     }
 
+    /// Runs tool call `call`, unless the turn was interrupted already, as
+    /// it may be while the call's gate and intent commit.
     async fn run_tool(&self, call: u64, tool: &str, input: &Value) -> Outcome {
+        if self.turn().is_cancelled() {
+            return Outcome::Interrupted { output: None };
+        }
         let registry = self.registry();
         let route = registry.tools().get(tool).map(DynTool::route);
         if route.is_some_and(|route| route != Route::Local) {
@@ -1066,7 +1100,7 @@ impl Session {
         };
         match self.shared.models.settings.model_in(&self.workspace, set) {
             Ok((model, from)) => Outcome::Done {
-                output: json!({ "model": model, "from": from.to_string() }),
+                output: json!({ "model": model, "from": from.to_string() }).into(),
             },
             Err(error) => Outcome::Failed { error },
         }
@@ -1268,7 +1302,9 @@ impl Session {
             let error = match reply {
                 Ok(reply) => {
                     return match serde_json::to_value(&reply) {
-                        Ok(output) => Outcome::Done { output },
+                        Ok(output) => Outcome::Done {
+                            output: output.into(),
+                        },
                         Err(error) => Outcome::Failed {
                             error: error.to_string(),
                         },
@@ -1487,7 +1523,7 @@ impl Host for Effect {
         self.session.record(Body::Ext {
             ext: ext.to_owned(),
             state: state.to_owned(),
-            data,
+            data: data.into(),
         });
         self.session.kick();
     }
@@ -1677,7 +1713,7 @@ fn dangling_calls(entries: &[Entry]) -> Vec<Dangling> {
             _ if finished.contains(&e.seq) => continue,
             Body::ToolCall { tool, input, .. } => Call::Tool {
                 tool: tool.clone(),
-                input: input.clone(),
+                input: input.value(),
             },
             Body::ModelCall { .. } => Call::Model,
             _ => continue,

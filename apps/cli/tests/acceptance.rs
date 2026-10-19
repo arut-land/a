@@ -94,14 +94,14 @@ fn resume_after_the_terminal_closes_mid_turn_replays_every_entry() {
             },
             Body::ToolCall {
                 tool: "sleep".into(),
-                input: json!({ "seconds": 1 }),
+                input: json!({ "seconds": 1 }).into(),
                 id: None,
                 card: None,
             },
             Body::ToolResult {
                 call,
                 outcome: Outcome::Done {
-                    output: json!({ "slept": 1 })
+                    output: json!({ "slept": 1 }).into()
                 },
                 card: None,
             },
@@ -142,7 +142,7 @@ fn two_terminals_on_one_session_see_identical_state() {
         Body::ToolResult {
             outcome: Outcome::Done { output },
             ..
-        } => output["slept"] == 0,
+        } => output.value()["slept"] == 0,
         _ => false,
     };
     let seen = [first.until(done), second.until(done)];
@@ -183,7 +183,7 @@ fn a_safe_tool_reruns_after_the_daemon_is_killed() {
     assert_eq!(
         results,
         [&Outcome::Done {
-            output: json!({ "slept": 2 })
+            output: json!({ "slept": 2 }).into()
         }]
     );
 }
@@ -400,7 +400,7 @@ fn a_parents_watch_fires_exactly_once_after_the_daemon_is_killed_mid_child() {
         })
         .collect();
     let slept = Outcome::Done {
-        output: json!({ "slept": 2 }),
+        output: json!({ "slept": 2 }).into(),
     };
     assert_eq!(fired, [&slept]);
     let child_log = env.log(child);

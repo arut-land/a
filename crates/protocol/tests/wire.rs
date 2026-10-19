@@ -236,7 +236,7 @@ fn daemon_samples() -> Vec<Sample<DaemonMsg>> {
             parent: None,
             body: Body::ToolCall {
                 tool: "bash".into(),
-                input: json!({ "command": "ls" }),
+                input: json!({ "command": "ls" }).into(),
                 id: None,
                 card: None,
             },
@@ -304,7 +304,7 @@ fn daemon_samples() -> Vec<Sample<DaemonMsg>> {
                 2,
                 Body::ToolCall {
                     tool: "bash".into(),
-                    input: json!({ "command": "ls" }),
+                    input: json!({ "command": "ls" }).into(),
                     id: Some("call_1".into()),
                     card: Some(Card {
                         title: "$ ls".into(),
@@ -362,7 +362,7 @@ fn daemon_samples() -> Vec<Sample<DaemonMsg>> {
                 Body::ToolResult {
                     call: 2,
                     outcome: Outcome::Done {
-                        output: json!({ "exit": 0, "stdout": "src\n", "stderr": "" }),
+                        output: json!({ "exit": 0, "stdout": "src\n", "stderr": "" }).into(),
                     },
                     card: Some(Card {
                         title: "$ ls".into(),
@@ -468,7 +468,7 @@ fn daemon_samples() -> Vec<Sample<DaemonMsg>> {
                 Body::Fired {
                     watch: 16,
                     outcome: Outcome::Done {
-                        output: json!({ "text": "found it" }),
+                        output: json!({ "text": "found it" }).into(),
                     },
                 },
             ),
@@ -504,7 +504,7 @@ fn daemon_samples() -> Vec<Sample<DaemonMsg>> {
                 Body::Ext {
                     ext: "shell".into(),
                     state: "cwd".into(),
-                    data: json!("/w"),
+                    data: json!("/w").into(),
                 },
             ),
         ),
@@ -534,7 +534,7 @@ fn daemon_samples() -> Vec<Sample<DaemonMsg>> {
                 Body::CommandResult {
                     call: 22,
                     outcome: Outcome::Done {
-                        output: json!(null),
+                        output: json!(null).into(),
                     },
                 },
             ),
@@ -596,7 +596,7 @@ fn daemon_samples() -> Vec<Sample<DaemonMsg>> {
             DaemonMsg::Ask {
                 call: 2,
                 tool: "bash".into(),
-                input: json!({ "command": "ls" }),
+                input: json!({ "command": "ls" }).into(),
             },
         ),
         sample(
@@ -639,7 +639,7 @@ fn daemon_samples() -> Vec<Sample<DaemonMsg>> {
                 build: "0.0.0+0123456789abcdef".into(),
                 started: 1_760_000_000,
                 clients: 2,
-                sessions: 7,
+                known: 7,
             },
             Cap::Daemon,
         ),

@@ -1,7 +1,7 @@
 use std::path::PathBuf;
 use std::time::{Duration, Instant};
 
-use protocol::{Body, Entry, Environment, Outcome, SessionId, Target};
+use protocol::{Activity, Body, Entry, Environment, Outcome, Residency, SessionId, Target};
 use serde_json::json;
 use store::{Header, Jsonl, LogStore};
 use sys::Home;
@@ -117,7 +117,7 @@ fn busy_sessions_recover_at_startup() {
     for (seq, (tool, input)) in (1..).zip(calls) {
         let body = Body::ToolCall {
             tool: tool.into(),
-            input,
+            input: input.into(),
             id: None,
             card: None,
         };
@@ -139,7 +139,7 @@ fn busy_sessions_recover_at_startup() {
     assert!(matches!(&got[2], Body::Extensions { installed } if installed.len() == 5));
     assert!(matches!(
         &got[3],
-        Body::ToolResult { call: 1, outcome: Outcome::Done { output }, card: None } if output["slept"] == 0
+        Body::ToolResult { call: 1, outcome: Outcome::Done { output }, card: None } if output.value()["slept"] == 0
     ));
     assert!(matches!(
         &got[4],
@@ -151,6 +151,52 @@ fn busy_sessions_recover_at_startup() {
     ));
     assert_eq!(got.len(), 5);
     assert!(!still_busy);
+}
+
+/// A session waiting for approval is listed as such once hibernated, and
+/// a restarted daemon loads it at once to ask again.
+#[test]
+fn a_session_waiting_for_approval_stays_waiting_through_hibernation_and_a_restart() {
+    let (root, home) = home("asked");
+    let config = Config {
+        ask: vec!["bash".into()],
+        ..echo()
+    };
+    let daemon = Daemon::load(&home, &config).unwrap();
+    let attachment = daemon.resolve(&Target::New, || "/w".into()).unwrap();
+    let id = attachment.session().id;
+    attachment.session().submit("$ echo hi".into()).unwrap();
+    settle(&daemon);
+    drop(attachment);
+    daemon.hibernate(Duration::ZERO);
+    let hibernated = daemon.list().remove(0);
+    // The stopped actor ends its unit of work.
+    let deadline = Instant::now() + Duration::from_millis(300);
+    while daemon.shared.store.is_busy(id) && Instant::now() < deadline {
+        std::thread::sleep(Duration::from_millis(5));
+    }
+    drop(daemon);
+
+    let restarted = Daemon::load(&home, &config).unwrap();
+    let listed = restarted.list().remove(0);
+    let asked = restarted.slots()[0]
+        .live
+        .lock()
+        .unwrap()
+        .as_ref()
+        .map(|s| s.summary().activity);
+    drop(restarted);
+    std::fs::remove_dir_all(&root).unwrap();
+
+    assert_eq!(
+        (hibernated.activity, hibernated.residency),
+        (Activity::Approval, Residency::Hibernated)
+    );
+    assert_eq!(
+        (listed.activity, listed.residency),
+        (Activity::Approval, Residency::Loaded)
+    );
+    assert_eq!(asked, Some(Activity::Approval));
 }
 
 fn fired(bodies: &[Body]) -> Vec<&Outcome> {
@@ -305,12 +351,12 @@ fn watches_rearm_after_a_crash_and_fire_once() {
     };
     let sleep = || Body::ToolCall {
         tool: "sleep".into(),
-        input: json!({ "seconds": 0 }),
+        input: json!({ "seconds": 0 }).into(),
         id: None,
         card: None,
     };
     let slept = Outcome::Done {
-        output: json!({ "slept": 0 }),
+        output: json!({ "slept": 0 }).into(),
     };
     let mut parents = Vec::new();
 
@@ -394,7 +440,7 @@ fn an_owner_idles_with_its_children_and_an_interrupt_stops_them_first() {
 
     assert_eq!(owned.len(), 1);
     assert_eq!(busy, Duration::ZERO);
-    let aborted = |b: &Body| matches!(b, Body::ToolResult { outcome: Outcome::Done { output }, .. } if output["aborted"] == true);
+    let aborted = |b: &Body| matches!(b, Body::ToolResult { outcome: Outcome::Done { output }, .. } if output.value()["aborted"] == true);
     assert!(child_log.iter().any(aborted), "{child_log:#?}");
     assert!(
         matches!(parent_log.last(), Some(Body::Assistant { text }) if text.contains("aborted")),
@@ -423,7 +469,7 @@ fn an_orphan_does_not_resume_what_it_was_doing() {
         },
         Body::ToolCall {
             tool: "sleep".into(),
-            input: json!({ "seconds": 0 }),
+            input: json!({ "seconds": 0 }).into(),
             id: None,
             card: None,
         },
@@ -512,7 +558,7 @@ fn the_supervisor_sleeps_until_a_deadline_and_never_polls() {
     };
     let daemon = Daemon::load(&home, &config).unwrap();
     let exit = Exit {
-        socket: root.join("socket"),
+        home: home.clone(),
         pid: std::fs::File::create(root.join("pid")).unwrap(),
         log: None,
     };
@@ -591,7 +637,7 @@ fn watchers_are_sent_the_session_list_as_it_changes() {
     };
     let daemon = Daemon::load(&home, &config).unwrap();
     let exit = Exit {
-        socket: root.join("socket"),
+        home: home.clone(),
         pid: std::fs::File::create(root.join("pid")).unwrap(),
         log: None,
     };

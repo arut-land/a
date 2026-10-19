@@ -28,7 +28,7 @@ fn facts(entries: &[Entry]) -> Vec<(u64, &Body)> {
 fn finds_calls_without_outcomes() {
     let tool_call = |tool: &str| Body::ToolCall {
         tool: tool.into(),
-        input: json!({}),
+        input: json!({}).into(),
         id: None,
         card: None,
     };
@@ -64,7 +64,7 @@ fn finds_calls_without_outcomes() {
 #[test]
 fn transcripts_of_earlier_logs_read_replies_as_text() {
     let done = Outcome::Done {
-        output: json!({ "text": "hello", "usage": { "input": 1, "output": 1 } }),
+        output: json!({ "text": "hello", "usage": { "input": 1, "output": 1 } }).into(),
     };
     let entries = [
         entry(1, Body::User { text: "hi".into() }),
@@ -375,8 +375,8 @@ fn the_model_calls_a_tool_and_answers_from_its_result() {
                 Body::ToolResult { call: 4, outcome: Outcome::Done { output }, card: None },
                 Body::ModelCall { .. },
                 Body::ModelResult { call: 6, outcome: Outcome::Done { output: answer } },
-            ] if tool == "lookup_harbor_label" && id == call_id && output == "crimson-harbor"
-                && answer["message"]["content"][1]["text"] == "The harbor label is crimson-harbor."
+            ] if tool == "lookup_harbor_label" && id == call_id && output.value() == "crimson-harbor"
+                && answer.value()["message"]["content"][1]["text"] == "The harbor label is crimson-harbor."
         ),
         "{log:#?}"
     );
@@ -521,7 +521,7 @@ fn live_the_model_calls_a_tool_and_answers_from_its_result() {
     assert!(
         log.iter().any(|e| matches!(
             &e.body,
-            Body::ToolResult { outcome: Outcome::Done { output }, .. } if output == "crimson-harbor"
+            Body::ToolResult { outcome: Outcome::Done { output }, .. } if output.value() == "crimson-harbor"
         )),
         "{log:#?}"
     );
@@ -684,7 +684,7 @@ fn hook_decisions_are_logged_and_replay_to_the_same_state() {
             }),
             &Body::ToolCall {
                 tool: "bash".into(),
-                input: json!({ "command": "echo hi" }),
+                input: json!({ "command": "echo hi" }).into(),
                 id: None,
                 card: Some(Card {
                     title: "$ echo hi".into(),
@@ -873,7 +873,7 @@ fn an_ask_waits_in_the_inbox_through_a_stop_and_runs_once_approved() {
                     outcome: Outcome::Done { output },
                     card: Some(card),
                 },
-            ] if output["output"] == "approved\n" && card.note == "exit 0"
+            ] if output.value()["output"] == "approved\n" && card.note == "exit 0"
         ),
         "{log:#?}"
     );
@@ -911,11 +911,158 @@ fn a_refused_ask_answers_the_call_without_running_it() {
     );
 }
 
+/// An interrupt settles a call waiting for approval: approving it after
+/// runs nothing.
+#[test]
+fn an_interrupt_while_asked_settles_the_call_without_running_it() {
+    let fixture = asking();
+    let session = fixture.start(&[]);
+    session.submit("$ echo ran".into()).unwrap();
+    settle(&session);
+    session.interrupt();
+    // Too late: it may be settled already.
+    let _ = session.answer(3, true);
+    finished(&session, 3);
+    settle(&session);
+    let log = log_of(&session);
+    session.stop();
+    assert!(
+        !log.iter()
+            .any(|e| matches!(e.body, Body::ToolProcess { .. })),
+        "{log:#?}"
+    );
+    assert!(
+        log.iter().any(|e| e.body
+            == Body::ToolResult {
+                call: 3,
+                outcome: Outcome::Interrupted { output: None },
+                card: None,
+            }),
+        "{log:#?}"
+    );
+    assert_eq!(inbox(&log), Vec::<u64>::new());
+}
+
+/// Allows every call, interrupting the session as it gates one: an
+/// interrupt that lands while the gate's decisions commit.
+#[derive(Clone, Default)]
+struct Interrupter(Arc<std::sync::OnceLock<Weak<Session>>>);
+
+impl Extension for Interrupter {
+    const NAME: &'static str = "policy";
+    const VERSION: u32 = 1;
+
+    fn contribute(&self, r: &mut Registrar) {
+        r.on(self.clone());
+    }
+}
+
+impl Hook for Interrupter {
+    fn permission(&self, _: &str, _: &Value) -> Permission {
+        if let Some(session) = self.0.get().and_then(Weak::upgrade) {
+            session.interrupt();
+        }
+        Permission::Allow
+    }
+}
+
+#[test]
+fn an_interrupt_while_a_call_is_gated_starts_nothing() {
+    let interrupter = Interrupter::default();
+    let fixture = Fixture::new(
+        agent::Kind::Echo,
+        echoing(&Policy::default())
+            .with_in(agent::Tier::Guarded, &interrupter)
+            .unwrap(),
+        openai(&Script::new(&[])),
+    );
+    let session = fixture.start(&[]);
+    interrupter.0.set(Arc::downgrade(&session)).unwrap();
+    session.submit("$ echo ran".into()).unwrap();
+    finished(&session, 2);
+    settle(&session);
+    let log = log_of(&session);
+    session.stop();
+    assert!(
+        !log.iter()
+            .any(|e| matches!(e.body, Body::ToolProcess { .. })),
+        "{log:#?}"
+    );
+    assert!(
+        log.iter().any(|e| e.body
+            == Body::ToolResult {
+                call: 2,
+                outcome: Outcome::Interrupted { output: None },
+                card: None,
+            }),
+        "{log:#?}"
+    );
+}
+
+/// A client sees a call a crash left running as soon as the session loads:
+/// an interrupt before recovery starts stops it, rather than going to work
+/// that already ended.
+#[test]
+fn an_interrupt_before_recovery_starts_stops_it() {
+    let fixture = Fixture::new(
+        agent::Kind::Echo,
+        echoing(&Policy::default()),
+        openai(&Script::new(&[])),
+    );
+    // Holds the one worker, so the actor has not started yet.
+    let (release, held) = std::sync::mpsc::channel::<()>();
+    fixture.0.rt.spawn(Box::pin(async move {
+        let _ = held.recv();
+    }));
+    let session = fixture.load(&[entry(
+        1,
+        Body::ToolCall {
+            tool: "sleep".into(),
+            input: json!({ "seconds": 1 }).into(),
+            id: None,
+            card: None,
+        },
+    )]);
+    session.interrupt();
+    drop(release);
+    let log = finished(&session, 1);
+    settle(&session);
+    session.stop();
+    assert_eq!(
+        log[1].body,
+        Body::ToolResult {
+            call: 1,
+            outcome: Outcome::Interrupted { output: None },
+            card: None,
+        },
+        "{log:#?}"
+    );
+}
+
+/// An interrupt with nothing running stops nothing: not the next turn.
+#[test]
+fn an_interrupt_between_turns_is_not_kept_for_the_next() {
+    let fixture = asking();
+    let session = fixture.start(&[]);
+    session.interrupt();
+    session.submit("hi".into()).unwrap();
+    settle(&session);
+    let log = log_of(&session);
+    session.stop();
+    assert!(
+        matches!(
+            &bodies(&log)[..],
+            [Body::User { .. }, Body::Assistant { .. }]
+        ),
+        "{log:#?}"
+    );
+}
+
 #[test]
 fn a_recap_tells_the_last_prompt_and_what_followed() {
     let call = |tool: &str| Body::ToolCall {
         tool: tool.into(),
-        input: json!({}),
+        input: json!({}).into(),
         id: None,
         card: None,
     };
@@ -1227,7 +1374,7 @@ fn the_shell_directory_survives_a_restart_and_an_interrupt_stops_a_call() {
         panic!("{ran:#?}")
     };
     assert!(
-        output["output"]
+        output.value()["output"]
             .as_str()
             .unwrap()
             .ends_with(&format!("/{dir}\n")),
@@ -1253,7 +1400,7 @@ fn the_shell_directory_survives_a_restart_and_an_interrupt_stops_a_call() {
     else {
         panic!("{log:#?}")
     };
-    assert_eq!(output["aborted"], true, "{output}");
+    assert_eq!(output.value()["aborted"], true, "{output}");
 }
 
 #[test]
@@ -1458,7 +1605,7 @@ fn an_unsafe_call_cut_off_reports_the_output_it_committed() {
     );
     let bash = Body::ToolCall {
         tool: "bash".into(),
-        input: json!({ "command": "make" }),
+        input: json!({ "command": "make" }).into(),
         id: None,
         card: None,
     };
@@ -1515,13 +1662,13 @@ fn the_model_is_set_per_session_and_says_where_it_comes_from() {
         settle(&session);
     }
     let log = log_of(&session);
-    let results: Vec<&Value> = log
+    let results: Vec<Value> = log
         .iter()
         .filter_map(|e| match &e.body {
             Body::CommandResult {
                 outcome: Outcome::Done { output },
                 ..
-            } => Some(output),
+            } => Some(output.value()),
             _ => None,
         })
         .collect();
@@ -1529,10 +1676,10 @@ fn the_model_is_set_per_session_and_says_where_it_comes_from() {
     assert_eq!(
         results,
         [
-            &set("the home config.toml", "gpt-5.6"),
-            &set("this session, at entry 4", "anthropic:claude-x"),
-            &set("this session, at entry 4", "anthropic:claude-x"),
-            &set("the home config.toml", "gpt-5.6"),
+            set("the home config.toml", "gpt-5.6"),
+            set("this session, at entry 4", "anthropic:claude-x"),
+            set("this session, at entry 4", "anthropic:claude-x"),
+            set("the home config.toml", "gpt-5.6"),
         ]
     );
     let chosen = Body::Settings(Overrides {

@@ -574,13 +574,13 @@ pub fn status(home: &Home) -> io::Result<Option<Status>> {
                 build,
                 started,
                 clients,
-                sessions,
+                known,
             } => Some(Status {
                 pid,
                 build,
                 started,
                 clients,
-                sessions,
+                sessions: known,
             }),
             _ => None,
         })

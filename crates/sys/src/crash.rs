@@ -125,6 +125,14 @@ pub fn reset(home: &Home) -> io::Result<()> {
     }
 }
 
+/// Notes a clean exit in the daemon's record, `pid_file`: emptied, so no
+/// one reaps it as a death, and the breaker cleared, so deaths before it and
+/// after are not in a row.
+pub fn exited(home: &Home, pid_file: &File) -> io::Result<()> {
+    pid_file.set_len(0)?;
+    reset(home)
+}
+
 /// Notes a daemon that died holding the lock, if the record says one did:
 /// a report (unless its panic hook wrote one), the breaker's count, and the
 /// record emptied. Callers hold the daemon lock, so the record's daemon is
@@ -329,6 +337,31 @@ mod tests {
         reset(&home).unwrap();
         assert_eq!(Crashes::of(&home).young, 0);
         fs::remove_dir_all(home.crash_dir().parent().unwrap()).unwrap();
+    }
+
+    /// Deaths with a clean exit between them are not in a row.
+    #[test]
+    fn a_clean_exit_resets_the_breaker() {
+        let home = home("clean");
+        let young = Record {
+            pid: 999_998,
+            started: now(),
+            token: None,
+            build: "b1".into(),
+        };
+        for _ in 1..LIMIT {
+            died(&home, &young);
+        }
+        let record = File::options()
+            .write(true)
+            .open(home.daemon_pid_file())
+            .unwrap();
+        exited(&home, &record).unwrap();
+        died(&home, &young);
+        let crashes = Crashes::of(&home);
+        fs::remove_dir_all(home.crash_dir().parent().unwrap()).unwrap();
+        assert_eq!(crashes.young, 1);
+        assert!(!crashes.tripped(LIMIT));
     }
 
     /// A daemon that reaps its predecessor records itself in its place.

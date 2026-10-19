@@ -48,7 +48,7 @@ impl App {
                 live: None,
             });
         }
-        self.cache[i].as_ref().map_or(&[], |r| &r.lines)
+        self.cached(i)
     }
 
     /// Where the bottom-most `body` rows start: (item, row within it).
@@ -64,18 +64,27 @@ impl App {
         (0, 0)
     }
 
-    /// The rows a `body`-tall transcript shows: from the anchor when
-    /// scrolled, else the latest; reaching the end follows it again.
-    pub(super) fn window(&mut self, width: usize, body: usize) -> Vec<Line> {
+    /// Item `i`'s rows as last wrapped by [`Self::rows`].
+    pub(super) fn cached(&self, i: usize) -> &[Line] {
+        self.cache
+            .get(i)
+            .and_then(Option::as_ref)
+            .map_or(&[], |r| &r.lines)
+    }
+
+    /// The rows a `body`-tall transcript shows, as (item, row within it):
+    /// from the anchor when scrolled, else the latest; reaching the end
+    /// follows it again.
+    pub(super) fn window(&mut self, width: usize, body: usize) -> Vec<(usize, usize)> {
         let (mut i, mut row) = match self.anchor {
             Some(at) => at,
             None => self.bottom_start(width, body),
         };
         let mut out = Vec::with_capacity(body);
         while out.len() < body && i < self.view.items.len() {
-            let rows = self.rows(i, width);
-            let take = body - out.len();
-            out.extend(rows.iter().skip(row).take(take).cloned());
+            let len = self.rows(i, width).len();
+            let take = (body - out.len()).min(len.saturating_sub(row));
+            out.extend((row..row + take).map(|row| (i, row)));
             (i, row) = (i + 1, 0);
         }
         if self.anchor.is_some() && out.len() < body {
