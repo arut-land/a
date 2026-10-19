@@ -74,7 +74,7 @@ fn builds_parts_in_index_order_with_state_and_calls() {
         panic!("{:?}", response.message.content)
     };
     assert_eq!(reasoning.text, "think");
-    assert_eq!(reasoning.meta["p"]["sig"], "s");
+    assert_eq!(reasoning.meta.get("p").unwrap()["sig"], "s");
     assert_eq!((call.id.as_str(), call.name.as_str()), ("c1", "f"));
     assert_eq!(call.input["a"], 1);
 }

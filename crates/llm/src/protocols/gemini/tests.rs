@@ -158,12 +158,12 @@ fn native(text: &str, item: Value) -> AssistantPart {
     let mut part = Text::new(text);
     let mut state = json!({ "fp": fp });
     state["item"] = item;
-    part.meta.insert(KEY.to_owned(), state);
+    part.meta.insert(KEY.to_owned(), &state);
     AssistantPart::Text(part)
 }
 
-fn item(part: &AssistantPart) -> Option<&Value> {
-    part.meta().get(KEY).and_then(|state| state.get("item"))
+fn item(part: &AssistantPart) -> Option<Value> {
+    part.meta().field(KEY, "item")
 }
 
 fn the_function_response(contents: &[Value]) -> &Value {

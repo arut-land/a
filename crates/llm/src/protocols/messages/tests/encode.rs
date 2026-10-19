@@ -70,7 +70,7 @@ fn with_item(mut part: AssistantPart, item: &Value) -> AssistantPart {
     };
     let fp = crate::replay::fingerprint(canon);
     part.meta_mut()
-        .insert(KEY.to_owned(), json!({"item": item, "fp": fp}));
+        .insert(KEY.to_owned(), &json!({"item": item, "fp": fp}));
     part
 }
 
@@ -311,7 +311,7 @@ fn a_document_carries_the_fields_its_state_names() {
     let mut document = media("text/plain", data("aGVsbG8="));
     document.meta.insert(
         KEY.to_owned(),
-        json!({"title": "My Doc", "citations": {"enabled": true}}),
+        &json!({"title": "My Doc", "citations": {"enabled": true}}),
     );
     let message = user_media(document).expect("the document converts");
     let block = &message["content"][0];
@@ -784,7 +784,7 @@ fn an_opaque_part_replays_only_where_it_may() {
     let mut opaque = AssistantPart::Opaque(Opaque::default());
     opaque.meta_mut().insert(
         KEY.to_owned(),
-        json!({"item": {"type": "frobnicate"}, "replay": false}),
+        &json!({"item": {"type": "frobnicate"}, "replay": false}),
     );
     let content = replayed(vec![opaque, AssistantPart::Text(Text::new("hi"))]);
     assert_eq!(content, json!([{"type": "text", "text": "hi"}]));

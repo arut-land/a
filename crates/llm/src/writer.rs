@@ -865,7 +865,7 @@ impl Writer {
     /// `state` as the meta of this protocol.
     fn meta(&self, state: Map<String, Value>) -> Meta {
         let mut meta = Meta::new();
-        meta.insert(self.key.to_owned(), state.into());
+        meta.insert(self.key, &Value::Object(state));
         meta
     }
 

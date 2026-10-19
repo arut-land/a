@@ -18,10 +18,11 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 pub use smol_str::SmolStr;
 
+pub use self::meta::Meta;
 pub use crate::conversation::Messages;
 
-/// Protocol-keyed provider state on a part or a reply.
-pub type Meta = BTreeMap<String, Value>;
+/// Typed per-protocol options, keyed by protocol.
+pub type Options = BTreeMap<String, Value>;
 
 /// One model call.
 #[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
@@ -46,8 +47,8 @@ pub struct Request {
     pub cache_key: Option<String>,
     /// Typed per-protocol options, keyed like [`Meta`]; each protocol reads
     /// only its own key.
-    #[serde(default, skip_serializing_if = "Meta::is_empty")]
-    pub options: Meta,
+    #[serde(default, skip_serializing_if = "Options::is_empty")]
+    pub options: Options,
     /// Deep-merged over the encoded body last: the escape hatch for any
     /// field no option models.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -617,4 +618,5 @@ pub struct Response {
     pub meta: Meta,
 }
 
+mod meta;
 mod value;

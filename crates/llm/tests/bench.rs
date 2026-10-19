@@ -475,3 +475,43 @@ fn read_logged_reply() {
         let _ = std::hint::black_box(llm::Response::deserialize(&value));
     });
 }
+
+/// The heap a session's typed transcript holds: the log at `A_SESSION_LOG`
+/// read as the engine reads it (replies, tool outputs, user text).
+#[test]
+#[ignore = "a benchmark"]
+fn transcript_memory() {
+    let Some(path) = std::env::var_os("A_SESSION_LOG") else {
+        return;
+    };
+    let text = std::fs::read_to_string(path).expect("a log");
+    let base = LIVE.load(Relaxed);
+    let mut messages = llm::Messages::new();
+    for line in text.lines().skip(1) {
+        let entry: serde_json::Value = serde_json::from_str(line).expect("an entry");
+        let message = match entry["kind"].as_str() {
+            Some("user" | "context") => Message::user(entry["text"].as_str().unwrap_or_default()),
+            Some("model_result") => match llm::Response::from_value(&entry["outcome"]["output"]) {
+                Ok(reply) => Message::Assistant(reply.message),
+                Err(_) => continue,
+            },
+            Some("tool_result") => Message::Tool(ToolMessage {
+                results: vec![ToolResult {
+                    id: "call".into(),
+                    name: "bash".into(),
+                    output: Output::Text(entry["outcome"]["output"]["output"].to_string()),
+                    error: false,
+                    meta: llm::Meta::new(),
+                }],
+            }),
+            _ => continue,
+        };
+        messages.push(message);
+    }
+    eprintln!(
+        "{} messages from {} KiB of log: {} KiB held",
+        messages.len(),
+        text.len() / 1024,
+        (LIVE.load(Relaxed) - base) / 1024
+    );
+}

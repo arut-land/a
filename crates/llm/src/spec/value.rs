@@ -82,9 +82,10 @@ impl<'a> Fields<'a> {
             return Ok(Meta::new());
         };
         let map = value.as_object().ok_or_else(|| invalid(value, "a map"))?;
-        // Inserted, not collected: collecting sorts first, in ~5 KiB of code.
         let mut meta = Meta::new();
-        meta.extend(map.iter().map(|(key, value)| (key.clone(), value.clone())));
+        for (key, value) in map {
+            meta.insert(key.as_str(), value);
+        }
         Ok(meta)
     }
 

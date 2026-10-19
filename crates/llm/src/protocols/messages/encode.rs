@@ -257,8 +257,10 @@ fn place(messages: &[Message], mid: bool, mut follows: Option<bool>) -> Result<P
             Turn::Assistant(assistant) => {
                 // The `container` block goes to the request's top level.
                 let kinds = assistant.content.iter().rev();
-                let mut kinds = kinds.map(|part| opaque_item(part)?.str("type"));
-                let last = kinds.find(|kind| *kind != Some("container")).flatten();
+                let mut kinds = kinds.map(|part| opaque_item(part)?.str("type").map(str::to_owned));
+                let last = kinds
+                    .find(|kind| kind.as_deref() != Some("container"))
+                    .flatten();
                 follows = Some(last.is_some_and(|kind| kind.ends_with("_tool_result")));
                 sent.extend(message("assistant", assistant_blocks(assistant)));
             }
@@ -337,7 +339,7 @@ impl Turns {
         Ok(Ended {
             system: self.system,
             messages: placed.sent,
-            container: container(&self.open).map(str::to_owned).or(self.container),
+            container: container(&self.open).or(self.container),
             markers: self.markers,
         })
     }
@@ -370,7 +372,7 @@ impl Fold for Turns {
             self.follows = placed.follows;
             self.placed.extend(placed.sent);
             if let Some(id) = container(&self.open) {
-                self.container = Some(id.to_owned());
+                self.container = Some(id);
             }
             self.open.clear();
         }
@@ -388,9 +390,9 @@ impl Fold for Turns {
 }
 
 /// The provider item of an opaque part this protocol kept.
-fn opaque_item(part: &AssistantPart) -> Option<&Value> {
+fn opaque_item(part: &AssistantPart) -> Option<Value> {
     match part {
-        AssistantPart::Opaque(opaque) => opaque.meta.get(KEY)?.get("item"),
+        AssistantPart::Opaque(opaque) => opaque.meta.field(KEY, "item"),
         _ => None,
     }
 }
@@ -398,14 +400,14 @@ fn opaque_item(part: &AssistantPart) -> Option<&Value> {
 /// The id of the container the last turn holding one ran in. Anthropic
 /// requires it on a request that answers a programmatic tool call, and it
 /// keeps a code-execution session's state.
-fn container(messages: &[Message]) -> Option<&str> {
+fn container(messages: &[Message]) -> Option<String> {
     let parts = messages.iter().rev().flat_map(|message| match message {
         Message::Assistant(assistant) => assistant.content.iter().rev(),
         _ => [].iter().rev(),
     });
     let items = parts.filter_map(opaque_item);
     let mut containers = items.filter(|item| item.str("type") == Some("container"));
-    containers.find_map(|item| item.at("/container/id")?.as_str())
+    containers.find_map(|item| Some(item.at("/container/id")?.as_str()?.to_owned()))
 }
 
 fn text_block(text: &str) -> Value {
@@ -433,7 +435,7 @@ fn user_blocks(run: &[Message]) -> Result<Vec<Value>, Error> {
                         UserPart::Media(media) => (media_block(media)?, &media.meta),
                     };
                     if let Some(Value::Object(fields)) = meta.get(KEY) {
-                        crate::json::overlay(&mut block, fields);
+                        crate::json::overlay(&mut block, &fields);
                     }
                     parts.push(block);
                 }
@@ -537,7 +539,7 @@ fn identity(item: &Value) -> Map<String, Value> {
 /// current, else the part rebuilt. A server tool's result goes only with
 /// its use, and the reply's container goes as the request's `container`.
 fn assistant_blocks(assistant: &Assistant) -> Vec<Value> {
-    let mut uses: Vec<&str> = Vec::new();
+    let mut uses: Vec<String> = Vec::new();
     let mut blocks = Vec::new();
     for part in &assistant.content {
         if let AssistantPart::Opaque(_) = part {
@@ -545,21 +547,23 @@ fn assistant_blocks(assistant: &Assistant) -> Vec<Value> {
                 continue;
             };
             let kind = item.str("type").unwrap_or_default();
-            let answered = item.str("tool_use_id").is_some_and(|id| uses.contains(&id));
+            let answered = item
+                .str("tool_use_id")
+                .is_some_and(|id| uses.iter().any(|u| u == id));
             if kind == "container" || kind.ends_with("_tool_result") && !answered {
                 continue;
             }
             if kind.ends_with("_tool_use")
                 && let Some(id) = item.str("id")
             {
-                uses.push(id);
+                uses.push(id.to_owned());
             }
-            blocks.push(sendable(item));
+            blocks.push(sendable(&item));
             continue;
         }
         let identity = match replay(part, KEY, identity) {
             Replay::Item(item) => {
-                let mut item = sendable(item);
+                let mut item = sendable(&item);
                 if let AssistantPart::ToolCall(call) = part {
                     // The call takes the id its result answers.
                     item["id"] = call.id.as_str().into();

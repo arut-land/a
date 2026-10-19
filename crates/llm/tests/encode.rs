@@ -286,14 +286,14 @@ fn request(model: &str, key: &str, variant: usize, messages: impl Into<llm::Mess
     match (key, variant) {
         (_, 3) => request.tool_choice = ToolChoice::Required,
         (messages::KEY, 1) => {
-            request.options = llm::Meta::from([(key.into(), json!({"prompt_caching": true}))]);
+            request.options = llm::Options::from([(key.into(), json!({"prompt_caching": true}))]);
         }
         (messages::KEY, 5) => {
             let ttl = json!({"static_prefix_cache_ttl": "1h", "cache_control": {"type": "ephemeral", "ttl": "1h"}});
-            request.options = llm::Meta::from([(key.into(), ttl)]);
+            request.options = llm::Options::from([(key.into(), ttl)]);
         }
         (responses::KEY, 1) => {
-            request.options = llm::Meta::from([(key.into(), json!({"store": true}))]);
+            request.options = llm::Options::from([(key.into(), json!({"store": true}))]);
         }
         (_, 5) => {
             request.body = json!({"temperature": 0.5}).as_object().cloned();

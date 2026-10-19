@@ -205,7 +205,7 @@ fn consecutive_text_parts_are_one_part() {
     };
     assert_eq!(text.text, "Hello, world! How are you?");
     assert_eq!(
-        item(part),
+        item(part).as_ref(),
         Some(&json!({"text": "Hello, world! How are you?"}))
     );
 }
@@ -368,7 +368,7 @@ fn two_signed_thoughts_keep_both_signatures() {
         .content
         .iter()
         .filter_map(item)
-        .filter_map(|item| item.str("thoughtSignature"))
+        .filter_map(|item| item.str("thoughtSignature").map(str::to_owned))
         .collect();
     assert_eq!(signatures, ["b25l", "dHdv"]);
 }
@@ -398,9 +398,12 @@ fn an_inline_image_decodes_as_media_and_keeps_its_signature() {
             data: "iVBORw0KGgo=".into()
         }
     );
-    assert_eq!(media.meta[KEY]["item"]["thoughtSignature"], "c2ln");
+    assert_eq!(
+        media.meta.get(KEY).unwrap()["item"]["thoughtSignature"],
+        "c2ln"
+    );
     assert_eq!(reply.usage.input, Some(7));
     assert_eq!(reply.usage.tool_input, Some(2));
     assert_eq!(reply.usage.audio_input, Some(2));
-    assert_eq!(reply.meta[KEY]["usage"]["promptTokenCount"], 5);
+    assert_eq!(reply.meta.get(KEY).unwrap()["usage"]["promptTokenCount"], 5);
 }

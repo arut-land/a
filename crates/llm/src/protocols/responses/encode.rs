@@ -354,8 +354,7 @@ impl Fold for Input {
                 }
             }
             let kept = match sent {
-                Replay::Item(item) => {
-                    let mut item = item.clone();
+                Replay::Item(mut item) => {
                     // A streamed item states unset fields as `null` (a
                     // reasoning item's `status`), which the input side
                     // rejects as unknown.
@@ -446,8 +445,7 @@ fn rebuilt(
             item
         }
         AssistantPart::Opaque(opaque) if replays(part, KEY) => {
-            let state = opaque.meta.get(KEY);
-            return Ok(state.and_then(|state| state.get("item")).cloned());
+            return Ok(opaque.meta.field(KEY, "item"));
         }
         AssistantPart::Opaque(_) | AssistantPart::ToolResult(_) => return Ok(None),
         AssistantPart::Media(_) => return Err(unsendable("assistant image")),

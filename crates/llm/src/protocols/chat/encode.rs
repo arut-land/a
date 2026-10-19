@@ -430,7 +430,6 @@ impl Fold for Wire {
 /// call with its name and arguments. A message with neither content nor
 /// calls is not sent.
 fn assistant_message(assistant: &Assistant, ctx: &Context) -> Option<Value> {
-    const NO_ITEM: &Value = &Value::Null;
     let (mut parts, mut has_parts) = (Vec::new(), false);
     // The reasoning texts by the field they go under; a message has few.
     let mut reasoning: Vec<(String, Vec<&str>)> = Vec::new();
@@ -442,14 +441,14 @@ fn assistant_message(assistant: &Assistant, ctx: &Context) -> Option<Value> {
                 parts.push(text_part(&block.text));
                 // A text item is message fields: an answer's audio.
                 if let Replay::Item(Value::Object(item)) = sent {
-                    fields.extend(item.clone());
+                    fields.extend(item);
                 }
             }
             AssistantPart::Reasoning(block) => {
                 let (field, item) = match sent {
                     Replay::Item(item) if item.get("type").is_some() => {
                         has_parts = true;
-                        parts.push(item.clone());
+                        parts.push(item);
                         continue;
                     }
                     Replay::Identity(identity)
@@ -464,9 +463,10 @@ fn assistant_message(assistant: &Assistant, ctx: &Context) -> Option<Value> {
                         let field = strings.find(|(_, value)| value.is_string());
                         (field.map(|(key, _)| key.clone()), item)
                     }
-                    Replay::Identity(identity) => (identity.keys().next().cloned(), NO_ITEM),
+                    Replay::Identity(identity) => (identity.keys().next().cloned(), Value::Null),
                     Replay::Rebuild => {
-                        (ctx.reasoning_field.map(|f| f.as_str().to_owned()), NO_ITEM)
+                        let field = ctx.reasoning_field.map(|f| f.as_str().to_owned());
+                        (field, Value::Null)
                     }
                 };
                 let others = item.as_object().into_iter().flatten();
@@ -489,14 +489,11 @@ fn assistant_message(assistant: &Assistant, ctx: &Context) -> Option<Value> {
             AssistantPart::ToolCall(call) => calls.push(call_item(call, sent, &ctx.custom)),
             // An opaque item is a content part; one with no `type` is not.
             AssistantPart::Opaque(opaque) if replays(part, KEY) => {
-                if let Some(item) = opaque
-                    .meta
-                    .get(KEY)
-                    .and_then(|state| state.get("item"))
-                    .filter(|item| item.get("type").is_some())
+                if let Some(item) =
+                    (opaque.meta.field(KEY, "item")).filter(|item| item.get("type").is_some())
                 {
                     has_parts = true;
-                    parts.push(item.clone());
+                    parts.push(item);
                 }
             }
             AssistantPart::Opaque(_) | AssistantPart::Media(_) | AssistantPart::ToolResult(_) => {}
@@ -537,9 +534,9 @@ fn assistant_message(assistant: &Assistant, ctx: &Context) -> Option<Value> {
 /// kind, or nothing. A call is custom when its item says so, or when it is
 /// rebuilt and the request declares a custom tool by its name; its input is
 /// then its arguments' `input`.
-fn call_item(call: &ToolCall, sent: Replay<'_>, custom: &[String]) -> Value {
+fn call_item(call: &ToolCall, sent: Replay, custom: &[String]) -> Value {
     let mut item = match sent {
-        Replay::Item(Value::Object(item)) => item.clone(),
+        Replay::Item(Value::Object(item)) => item,
         Replay::Identity(identity) => identity,
         Replay::Item(_) | Replay::Rebuild => Map::new(),
     };

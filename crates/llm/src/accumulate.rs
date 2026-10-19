@@ -3,8 +3,6 @@
 //! It keeps no copy of the text that streams: a part's text arrives whole,
 //! moved, with its end.
 
-use serde_json::Value;
-
 use crate::error::{Error, Kind};
 use crate::spec::{
     Assistant, AssistantPart, Block, CallEnd, Event, Finish, Meta, Opaque, Origin, Reasoning,
@@ -127,8 +125,8 @@ impl Accumulator {
                 }
             }
             Event::Meta { index, meta: more } => match self.part(index) {
-                Some(Building::Open { meta, .. }) => merge_meta(meta, more),
-                Some(Building::Done(part)) => merge_meta(part.meta_mut(), more),
+                Some(Building::Open { meta, .. }) => meta.merge(more),
+                Some(Building::Done(part)) => part.meta_mut().merge(more),
                 None => return Err(order(format!("state for part {index}, which never opened"))),
             },
             Event::End {
@@ -220,19 +218,6 @@ impl Accumulator {
 
 fn order(message: impl Into<String>) -> Error {
     Error::new(Kind::Decode, message)
-}
-
-/// `more` over `meta`, key by key; object values merge one level down so
-/// state that arrives in pieces (a signature after the text) accumulates.
-pub(crate) fn merge_meta(meta: &mut Meta, more: Meta) {
-    for (key, value) in more {
-        match (meta.get_mut(&key), value) {
-            (Some(Value::Object(have)), Value::Object(add)) => have.extend(add),
-            (_, value) => {
-                meta.insert(key, value);
-            }
-        }
-    }
 }
 
 #[cfg(test)]

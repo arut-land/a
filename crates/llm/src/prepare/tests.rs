@@ -93,7 +93,10 @@ fn native_turns_keep_reasoning_and_state() {
         panic!()
     };
     assert_eq!(assistant.content.len(), 2);
-    assert_eq!(assistant.content[0].meta()["short"]["signature"], "s");
+    assert_eq!(
+        assistant.content[0].meta().get("short").unwrap()["signature"],
+        "s"
+    );
 }
 
 #[test]

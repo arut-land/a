@@ -132,3 +132,20 @@ fn reads_a_minimal_reply() {
     let read = Response::from_value(&value).expect("a reply");
     assert_eq!(Response::deserialize(&value).ok(), Some(read));
 }
+
+/// A logged reply's provider state is kept as the text the log wrote, one
+/// string per protocol, and is a tree only when its protocol reads it.
+#[test]
+fn provider_state_is_parsed_only_where_read() {
+    let reply = Response::from_value(&every_part()).expect("a reply");
+    let state = r#"{"fp":"00","item":{"type":"thinking"}}"#;
+    let part = &reply.message.content[0];
+    assert_eq!(part.meta().raw("messages"), Some(state));
+    assert_eq!(part.meta().field("messages", "fp"), Some(json!("00")));
+    // Written out again as that text.
+    let written = serde_json::to_value(&reply).expect("a reply writes");
+    assert_eq!(
+        written["message"]["content"][0]["meta"],
+        every_part()["message"]["content"][0]["meta"]
+    );
+}

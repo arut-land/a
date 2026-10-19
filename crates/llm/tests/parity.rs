@@ -193,8 +193,8 @@ fn part_of(part: &AssistantPart, key: &str) -> Value {
             let state = opaque.meta.get(key);
             json!({
                 "type": "opaque",
-                "kind": state.and_then(|state| state.pointer("/item/type")),
-                "replay": state.and_then(|state| state.get("replay")).and_then(Value::as_bool).unwrap_or(false),
+                "kind": state.as_ref().and_then(|state| state.pointer("/item/type")),
+                "replay": state.as_ref().and_then(|state| state.get("replay")).and_then(Value::as_bool).unwrap_or(false),
             })
         }
         AssistantPart::ToolResult(_) => json!({"type": "tool_result"}),

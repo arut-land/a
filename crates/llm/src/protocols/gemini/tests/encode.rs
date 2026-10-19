@@ -26,7 +26,7 @@ fn a_trailing_signature_joins_the_text_it_follows() {
         panic!("one answer text: {:?}", response.message.content);
     };
     assert_eq!(text.text, "289");
-    assert_eq!(item(part), Some(&signed));
+    assert_eq!(item(part).as_ref(), Some(&signed));
     let body = replayed("gemini-3-flash-preview", &response);
     assert_eq!(body["contents"][1]["parts"], json!([signed]));
 }
@@ -601,7 +601,10 @@ fn tools_choice_and_format_take_gemini_spellings() {
             name: None,
             description: None,
         }),
-        options: Meta::from([(KEY.to_owned(), json!({"tools": [{"codeExecution": {}}]}))]),
+        options: crate::spec::Options::from([(
+            KEY.to_owned(),
+            json!({"tools": [{"codeExecution": {}}]}),
+        )]),
         ..Request::default()
     };
     let body = sent("gemini-2.0-flash", request);

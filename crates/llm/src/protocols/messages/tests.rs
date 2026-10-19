@@ -181,10 +181,9 @@ fn reply(blocks: Vec<Vec<Value>>, stop_reason: &str) -> Vec<Value> {
 }
 
 /// The provider item a decoded part holds.
-fn item(part: &AssistantPart) -> Option<&Value> {
+fn item(part: &AssistantPart) -> Option<Value> {
     part.meta()
-        .get(KEY)
-        .and_then(|state| state.get("item"))
+        .field(KEY, "item")
         .filter(|item| !item.is_null())
 }
 
