@@ -131,7 +131,7 @@ jobs:
     # the `a` CLI (which links it) are built rather than linted: their
     # serving code is dead here. `a` runs its line REPL, which reports that.
     env:
-      PORTABLE: -p sys -p rt -p protocol -p store -p agent -p llm -p client -p tui
+      PORTABLE: -p sys -p rt -p protocol -p store -p ext -p ext-builtin -p llm -p client -p tui
     steps:
       - uses: actions/checkout@v7
       - *mbx-dir

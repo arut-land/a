@@ -48,7 +48,10 @@ opt-level = "z"
 [profile.release.package.engine]
 opt-level = "s"
 
-[profile.release.package.agent]
+[profile.release.package.ext]
+opt-level = "s"
+
+[profile.release.package.ext-builtin]
 opt-level = "s"
 
 [profile.release.package.store]
