@@ -168,14 +168,18 @@ pub(crate) fn present<'de, D: Deserializer<'de>>(field: D) -> Result<bool, D::Er
 }
 
 /// An object read field by field: [`Fields::field`] takes the fields it
-/// names and the rest gather in a map. serde's `flatten` would buffer every
-/// field first, and its code costs several kilobytes a type.
+/// names, and the rest gather in [`Fields::rest`] or are skipped. A field
+/// stated twice reads as its last value, as in a `Value`. serde's `flatten`
+/// would buffer every field first, and a derive costs more code a type.
 pub(crate) trait Fields<'de>: Default {
     /// Read the value of `key` when it is a field of `Self`; `false` leaves
     /// it to the rest.
     fn field<A: MapAccess<'de>>(&mut self, key: &str, map: &mut A) -> Result<bool, A::Error>;
 
-    fn rest(&mut self) -> &mut serde_json::Map<String, Value>;
+    /// Where the other fields go; `None` skips them.
+    fn rest(&mut self) -> Option<&mut serde_json::Map<String, Value>> {
+        None
+    }
 }
 
 /// The object `json` holds, read as `T`'s [`Fields`].
@@ -189,9 +193,14 @@ pub(crate) fn fields<'de, D: Deserializer<'de>, T: Fields<'de>>(json: D) -> Resu
         fn visit_map<A: MapAccess<'de>>(self, mut map: A) -> Result<T, A::Error> {
             let mut out = T::default();
             while let Some(Str(key)) = map.next_key()? {
-                if !out.field(&key, &mut map)? {
+                if out.field(&key, &mut map)? {
+                    continue;
+                }
+                if let Some(rest) = out.rest() {
                     let value = map.next_value()?;
-                    out.rest().insert(key.into_owned(), value);
+                    rest.insert(key.into_owned(), value);
+                } else {
+                    map.next_value::<IgnoredAny>()?;
                 }
             }
             Ok(out)

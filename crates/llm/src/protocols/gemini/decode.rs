@@ -82,8 +82,8 @@ impl<'de: 'a, 'a> Fields<'de> for Part<'a> {
         Ok(true)
     }
 
-    fn rest(&mut self) -> &mut Map<String, Value> {
-        &mut self.rest
+    fn rest(&mut self) -> Option<&mut Map<String, Value>> {
+        Some(&mut self.rest)
     }
 }
 

@@ -89,8 +89,7 @@ impl Json<'_> {
 /// An array of `T` objects, or any other value.
 type List<'a, T> = Json<'a, IgnoredAny, Json<'a, T>>;
 
-#[derive(Default, Deserialize)]
-#[serde(default, bound = "'de: 'a")]
+#[derive(Default)]
 struct Frame<'a> {
     id: Json<'a>,
     model: Json<'a>,
@@ -100,8 +99,28 @@ struct Frame<'a> {
     error: Value,
 }
 
-#[derive(Default, Deserialize)]
-#[serde(default, bound = "'de: 'a")]
+impl<'de: 'a, 'a> Fields<'de> for Frame<'a> {
+    fn field<A: MapAccess<'de>>(&mut self, key: &str, map: &mut A) -> Result<bool, A::Error> {
+        match key {
+            "id" => self.id = map.next_value()?,
+            "model" => self.model = map.next_value()?,
+            "object" => self.object = map.next_value()?,
+            "choices" => self.choices = map.next_value()?,
+            "usage" => self.usage = map.next_value()?,
+            "error" => self.error = map.next_value()?,
+            _ => return Ok(false),
+        }
+        Ok(true)
+    }
+}
+
+impl<'de: 'a, 'a> Deserialize<'de> for Frame<'a> {
+    fn deserialize<D: Deserializer<'de>>(json: D) -> Result<Self, D::Error> {
+        fields(json)
+    }
+}
+
+#[derive(Default)]
 struct Choice<'a> {
     index: Value,
     finish_reason: Json<'a>,
@@ -111,9 +130,29 @@ struct Choice<'a> {
     message: Json<'a, Delta<'a>>,
 }
 
+impl<'de: 'a, 'a> Fields<'de> for Choice<'a> {
+    fn field<A: MapAccess<'de>>(&mut self, key: &str, map: &mut A) -> Result<bool, A::Error> {
+        match key {
+            "index" => self.index = map.next_value()?,
+            "finish_reason" => self.finish_reason = map.next_value()?,
+            "native_finish_reason" => self.native_finish_reason = map.next_value()?,
+            "usage" => self.usage = map.next_value()?,
+            "delta" => self.delta = map.next_value()?,
+            "message" => self.message = map.next_value()?,
+            _ => return Ok(false),
+        }
+        Ok(true)
+    }
+}
+
+impl<'de: 'a, 'a> Deserialize<'de> for Choice<'a> {
+    fn deserialize<D: Deserializer<'de>>(json: D) -> Result<Self, D::Error> {
+        fields(json)
+    }
+}
+
 /// A delta of the assistant message, or a whole message.
-#[derive(Default, Deserialize)]
-#[serde(default, bound = "'de: 'a")]
+#[derive(Default)]
 struct Delta<'a> {
     reasoning_content: Json<'a>,
     reasoning: Json<'a>,
@@ -124,6 +163,30 @@ struct Delta<'a> {
     refusal: Json<'a>,
     images: Value,
     tool_calls: List<'a, Call<'a>>,
+}
+
+impl<'de: 'a, 'a> Fields<'de> for Delta<'a> {
+    fn field<A: MapAccess<'de>>(&mut self, key: &str, map: &mut A) -> Result<bool, A::Error> {
+        match key {
+            "reasoning_content" => self.reasoning_content = map.next_value()?,
+            "reasoning" => self.reasoning = map.next_value()?,
+            "reasoning_text" => self.reasoning_text = map.next_value()?,
+            "reasoning_details" => self.reasoning_details = map.next_value()?,
+            "audio" => self.audio = map.next_value()?,
+            "content" => self.content = map.next_value()?,
+            "refusal" => self.refusal = map.next_value()?,
+            "images" => self.images = map.next_value()?,
+            "tool_calls" => self.tool_calls = map.next_value()?,
+            _ => return Ok(false),
+        }
+        Ok(true)
+    }
+}
+
+impl<'de: 'a, 'a> Deserialize<'de> for Delta<'a> {
+    fn deserialize<D: Deserializer<'de>>(json: D) -> Result<Self, D::Error> {
+        fields(json)
+    }
 }
 
 /// A tool-call fragment. Every field but `index` joins the call's item.
@@ -148,8 +211,8 @@ impl<'de: 'a, 'a> Fields<'de> for Call<'a> {
         Ok(true)
     }
 
-    fn rest(&mut self) -> &mut Map<String, Value> {
-        &mut self.rest
+    fn rest(&mut self) -> Option<&mut Map<String, Value>> {
+        Some(&mut self.rest)
     }
 }
 
@@ -176,8 +239,8 @@ impl<'de: 'a, 'a> Fields<'de> for Function<'a> {
         Ok(true)
     }
 
-    fn rest(&mut self) -> &mut Map<String, Value> {
-        &mut self.rest
+    fn rest(&mut self) -> Option<&mut Map<String, Value>> {
+        Some(&mut self.rest)
     }
 }
 
@@ -679,18 +742,9 @@ impl Writes for ChatDecoder {
             }
             return self.finish();
         }
-        let decode = |error| Error::decode(error, data);
-        let rewritten: String;
-        let frame: Json<'_, Frame<'_>, IgnoredAny> = if let Ok(frame) = serde_json::from_str(data) {
-            frame
-        } else {
-            // A frame that repeats a key: as a `Value` the last one stands,
-            // and written back out it reads through the same deserializer
-            // (one instantiation of the typed frame, not two).
-            let value: Value = serde_json::from_str(data).map_err(decode)?;
-            rewritten = value.to_string();
-            serde_json::from_str(&rewritten).map_err(decode)?
-        };
+        // Any JSON reads as a frame; a repeated key's last value stands.
+        let frame: Json<'_, Frame<'_>, IgnoredAny> =
+            serde_json::from_str(data).map_err(|error| Error::decode(error, data))?;
         let frame = match frame {
             Json::Object(frame) => frame,
             // A bare string is the whole answer, ended as a stop.
