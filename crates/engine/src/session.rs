@@ -1322,7 +1322,6 @@ impl Session {
     /// The request for model call `call`: the system prompt, the transcript
     /// before it, and the tools.
     fn request(&self, call: u64, model: &Model, registry: &Arc<Registry>) -> llm::Request {
-        let tools = registry.tools();
         let mut history = self.history(call, registry);
         let system = self
             .shared

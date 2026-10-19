@@ -15,7 +15,7 @@ use protocol::{Body, Environment, Outcome, SessionId};
 use store::{Header, Loaded, Parent};
 
 use super::{Msg, Session, installed};
-use crate::{Daemon, Slot, lock};
+use crate::{Daemon, Residence, Slot, lock};
 
 /// Where a link stands, by its watch. A link not yet watched or armed
 /// carries the child's input, to start it with.
@@ -187,15 +187,15 @@ impl Daemon {
     /// The loaded sessions `parent` owns.
     pub(crate) fn children(&self, parent: SessionId) -> Vec<Arc<Session>> {
         self.owned(parent)
-            .filter_map(|s| lock(&s.live).clone())
+            .filter_map(|s| lock(&s.residence).live().cloned())
             .collect()
     }
 
     /// Unloads the sessions `parent` owns, each after its own children.
     pub(crate) fn unload_children(&self, parent: SessionId) {
         for slot in self.owned(parent) {
-            let live = lock(&slot.live).take();
-            if let Some(child) = live {
+            let unloaded = lock(&slot.residence).unload();
+            if let Some(child) = unloaded {
                 child.stop();
             }
         }
@@ -219,10 +219,10 @@ impl Daemon {
             return Ok(());
         };
         drop(slots);
-        let mut live = lock(&slot.live);
-        if live.is_none() {
+        let mut residence = lock(&slot.residence);
+        if residence.live().is_none() {
             let loaded = self.shared.store.load(slot.header.id)?;
-            *live = Some(self.seed(slot.header.clone(), loaded, input, env)?);
+            *residence = Residence::Live(self.seed(slot.header.clone(), loaded, input, env)?);
         }
         Ok(())
     }

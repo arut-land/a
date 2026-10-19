@@ -212,28 +212,56 @@ impl Pulse {
 /// ended, while any run: nothing tells it when they do.
 const JOBS_CHECK: Duration = Duration::from_secs(5);
 
-/// A session the daemon knows about. Its log is loaded, and its actor runs,
-/// only while `live` is set; otherwise it is hibernated and costs nothing.
+/// A session the daemon knows about.
 struct Slot {
     header: Header,
-    live: Mutex<Option<Arc<Session>>>,
+    residence: Mutex<Residence>,
     /// The parent has fired its watch on this child, so reports are moot.
     /// Known only since this daemon started.
     heard: AtomicBool,
-    /// How it lists while hibernated: as it was when it hibernated, or
-    /// once counted from its log. Only a loaded session appends, so listing
-    /// reads each log once.
-    last: Mutex<Option<SessionSummary>>,
 }
 
 impl Slot {
     fn new(header: Header, live: Option<Arc<Session>>) -> Arc<Self> {
+        let residence = live.map_or(Residence::Hibernated { last: None }, Residence::Live);
         Arc::new(Self {
             header,
-            live: Mutex::new(live),
+            residence: Mutex::new(residence),
             heard: AtomicBool::new(false),
-            last: Mutex::new(None),
         })
+    }
+}
+
+/// Whether a session's log is loaded and its actor runs.
+enum Residence {
+    /// Unloaded, costing nothing. `last` is how it lists: as it was when it
+    /// was unloaded, or once counted from its log. Only a loaded session
+    /// appends, so listing reads each log once.
+    Hibernated {
+        last: Option<SessionSummary>,
+    },
+    Live(Arc<Session>),
+}
+
+impl Residence {
+    const fn live(&self) -> Option<&Arc<Session>> {
+        match self {
+            Self::Live(session) => Some(session),
+            Self::Hibernated { .. } => None,
+        }
+    }
+
+    /// Unloads the session, keeping how it lists; the caller stops it.
+    fn unload(&mut self) -> Option<Arc<Session>> {
+        let last = SessionSummary {
+            clients: 0,
+            residency: Residency::Hibernated,
+            ..self.live()?.summary()
+        };
+        match mem::replace(self, Self::Hibernated { last: Some(last) }) {
+            Self::Live(session) => Some(session),
+            Self::Hibernated { .. } => None,
+        }
     }
 }
 
@@ -299,20 +327,15 @@ impl Daemon {
 
     /// Runs `f` on the slot's live session, loading it first if hibernated.
     fn with_live<T>(&self, slot: &Slot, f: impl FnOnce(&Arc<Session>) -> T) -> io::Result<T> {
-        let mut live = lock(&slot.live);
-        let session = match &mut *live {
-            Some(session) => session,
-            empty @ None => {
-                let loaded = self.shared.store.load(slot.header.id)?;
-                *lock(&slot.last) = None;
-                empty.insert(Session::start(
-                    slot.header.clone(),
-                    loaded,
-                    Arc::clone(&self.shared),
-                ))
-            }
-        };
-        Ok(f(session))
+        let mut residence = lock(&slot.residence);
+        if let Some(session) = residence.live() {
+            return Ok(f(session));
+        }
+        let loaded = self.shared.store.load(slot.header.id)?;
+        let session = Session::start(slot.header.clone(), loaded, Arc::clone(&self.shared));
+        let done = f(&session);
+        *residence = Residence::Live(session);
+        Ok(done)
     }
 
     /// The session `target` names, attached. `workspace` is only worked
@@ -382,9 +405,9 @@ impl Daemon {
     fn list(&self) -> Vec<SessionSummary> {
         self.slots()
             .iter()
-            .map(|slot| match &*lock(&slot.live) {
-                Some(session) => session.summary(),
-                None => lock(&slot.last)
+            .map(|slot| match &mut *lock(&slot.residence) {
+                Residence::Live(session) => session.summary(),
+                Residence::Hibernated { last } => last
                     .get_or_insert_with(|| SessionSummary {
                         id: slot.header.id,
                         workspace: slot.header.workspace.clone(),
@@ -404,15 +427,10 @@ impl Daemon {
     /// under the slot lock, which `resolve` also holds while attaching.
     fn hibernate(&self, after: Duration) {
         for slot in self.slots() {
-            let mut live = lock(&slot.live);
-            if live.as_ref().is_some_and(|s| s.idle_for() >= after)
-                && let Some(session) = live.take()
+            let mut residence = lock(&slot.residence);
+            if residence.live().is_some_and(|s| s.idle_for() >= after)
+                && let Some(session) = residence.unload()
             {
-                *lock(&slot.last) = Some(SessionSummary {
-                    clients: 0,
-                    residency: Residency::Hibernated,
-                    ..session.summary()
-                });
                 session_event("hibernate", session.id, String::new);
                 session.stop();
             }
@@ -471,7 +489,7 @@ impl Daemon {
     fn live(&self) -> Vec<Arc<Session>> {
         self.slots()
             .iter()
-            .filter_map(|slot| lock(&slot.live).clone())
+            .filter_map(|slot| lock(&slot.residence).live().cloned())
             .collect()
     }
 
