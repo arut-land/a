@@ -7,7 +7,7 @@ use serde_json::Value;
 use ratatui_core::style::{Color, Modifier, Style};
 
 use super::render::ellipsize;
-use super::text::{Action, Line, Span, markdown, sanitize, wrap};
+use super::text::{Action, Line, Span, markdown, markdown_into, sanitize, wrap};
 
 /// How much of a card's output shows unless everything is expanded.
 const TAIL: usize = 10;
@@ -22,9 +22,7 @@ pub const ASK: Style = Style::new().fg(Color::Yellow).add_modifier(Modifier::BOL
 
 /// How an item is shown.
 #[derive(Clone, Copy, Debug, Default)]
-pub struct Look<'a> {
-    /// The reply text streaming in for this item, if it is that call's.
-    pub streaming: Option<&'a str>,
+pub struct Look {
     /// The card is folded to its header.
     pub collapsed: bool,
     /// Every card's whole output and input (Ctrl-O).
@@ -63,7 +61,7 @@ pub fn rows(item: &Item, width: usize, look: Look) -> Vec<Line> {
             text,
             status,
             ..
-        } => reply(model, text, status, width, look.streaming),
+        } => reply(model, text, status, width),
         Item::Tool {
             call,
             tool,
@@ -143,25 +141,13 @@ pub fn rows(item: &Item, width: usize, look: Look) -> Vec<Line> {
     }
 }
 
-fn reply(
-    model: &str,
-    text: &str,
-    status: &Status,
-    width: usize,
-    streaming: Option<&str>,
-) -> Vec<Line> {
+fn reply(model: &str, text: &str, status: &Status, width: usize) -> Vec<Line> {
     let mut out = vec![Line::default()];
-    match (status, streaming) {
-        (Status::Running, Some(live)) => {
-            out.extend(markdown(live, width, Style::new()));
-            if let Some(last) = out.last_mut() {
-                last.spans.push(Span::new("▍", MUTED));
-            }
-        }
-        (Status::Running, None) => out.push(Line::plain(format!("  … {model}"), MUTED)),
-        (Status::Done, _) if text.is_empty() => return Vec::new(),
-        (Status::Done, _) => out.extend(markdown(text, width, Style::new())),
-        (Status::Failed { error }, _) => {
+    match status {
+        Status::Running => out.push(Line::plain(format!("  … {model}"), MUTED)),
+        Status::Done if text.is_empty() => return Vec::new(),
+        Status::Done => out.extend(markdown(text, width, Style::new())),
+        Status::Failed { error } => {
             let body = [Span::new(
                 format!("✗ model failed: {}", sanitize(error)),
                 BAD,
@@ -173,9 +159,51 @@ fn reply(
                 &[Span::new("    ", BAD)],
             ));
         }
-        (Status::Interrupted, _) => out.push(Line::plain("  ⚠ model call interrupted", WARN)),
+        Status::Interrupted => out.push(Line::plain("  ⚠ model call interrupted", WARN)),
     }
     out
+}
+
+/// Where a reply streaming in was wrapped to: the lines that ended are
+/// wrapped once and kept; each delta wraps only the open last line again,
+/// so a long reply costs no more per delta than a short one.
+#[derive(Clone, Copy, Debug, Default)]
+pub struct Live {
+    /// The text's bytes wrapped for good (up to a newline), whether they
+    /// end inside a code fence, and the rows they made.
+    done: usize,
+    fenced: bool,
+    kept: usize,
+    /// The text's length when last wrapped.
+    seen: usize,
+}
+
+impl Live {
+    /// Brings `rows` (empty, or as this left them) up to `text`, the
+    /// reply's live text so far.
+    pub fn update(&mut self, rows: &mut Vec<Line>, text: &str, width: usize) {
+        if rows.is_empty() || text.len() < self.seen {
+            *self = Self::default();
+            rows.clear();
+            rows.push(Line::default());
+            self.kept = 1;
+        } else if text.len() == self.seen {
+            return;
+        }
+        rows.truncate(self.kept);
+        if let Some(nl) = text[self.done..].rfind('\n') {
+            let end = self.done + nl;
+            let ended = sanitize(&text[self.done..end]);
+            markdown_into(rows, &ended, width, Style::new(), &mut self.fenced);
+            (self.done, self.kept) = (end + 1, rows.len());
+        }
+        let open = sanitize(&text[self.done..]);
+        markdown_into(rows, &open, width, Style::new(), &mut self.fenced.clone());
+        if let Some(last) = rows.last_mut() {
+            last.spans.push(Span::new("▍", MUTED));
+        }
+        self.seen = text.len();
+    }
 }
 
 /// A tool call or a slash command, as a card.
@@ -403,12 +431,26 @@ mod tests {
             status: Status::Running,
             usage: None,
         };
-        let look = Look {
-            streaming: Some("hello **world**"),
-            ..Look::default()
-        };
-        assert_eq!(rows_of(&item, look)[1], "  hello world▍");
         assert_eq!(rows_of(&item, Look::default())[1], "  … echo");
+        let mut live = Live::default();
+        let mut lines = Vec::new();
+        live.update(&mut lines, "hello **world**", 40);
+        assert_eq!(texts(&lines)[1], "  hello world▍");
+    }
+
+    #[test]
+    fn a_streaming_reply_wraps_as_its_whole_text_would() {
+        let text =
+            "# Plan\n\nsome **bold** words that wrap past the width\n```\nfn a() {}\n```\n- done";
+        let mut live = Live::default();
+        let mut lines = Vec::new();
+        for end in (0..=text.len()).filter(|&i| text.is_char_boundary(i)) {
+            live.update(&mut lines, &text[..end], 20);
+            let mut whole = vec![Line::default()];
+            whole.extend(markdown(&text[..end], 20, Style::new()));
+            whole.last_mut().unwrap().spans.push(Span::new("▍", MUTED));
+            assert_eq!(lines, whole, "at {end}");
+        }
     }
 
     #[test]

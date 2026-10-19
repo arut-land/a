@@ -231,17 +231,28 @@ pub const CODE: Style = Style::new().fg(Color::Cyan);
 /// A reply's markdown as rows: `#` headings bold, `-`/`*` bullets as `•`,
 /// `>` quotes, fenced code verbatim, and `**bold**` and `` `code` `` inline.
 pub fn markdown(text: &str, width: usize, base: Style) -> Vec<Line> {
-    let text = sanitize(text);
     let mut out = Vec::new();
-    let mut fenced = false;
+    markdown_into(&mut out, &sanitize(text), width, base, &mut false);
+    out
+}
+
+/// [`markdown`] of sanitized `text`, appended to `out`; `fenced` says
+/// whether it starts inside a code fence, and is left as it ends.
+pub fn markdown_into(
+    out: &mut Vec<Line>,
+    text: &str,
+    width: usize,
+    base: Style,
+    fenced: &mut bool,
+) {
     for raw in text.split('\n') {
         let trimmed = raw.trim_start();
         if trimmed.starts_with("```") {
-            fenced = !fenced;
+            *fenced = !*fenced;
             out.push(Line::plain(format!("  {trimmed}"), CODE.dim()));
             continue;
         }
-        if fenced {
+        if *fenced {
             // Code is not reflowed; long lines are cut by the screen.
             out.push(Line::plain(format!("  {raw}"), CODE));
             continue;
@@ -282,7 +293,6 @@ pub fn markdown(text: &str, width: usize, base: Style) -> Vec<Line> {
         };
         out.extend(wrap(&inline(body, style), width, &first, &rest));
     }
-    out
 }
 
 fn heading(line: &str) -> Option<&str> {

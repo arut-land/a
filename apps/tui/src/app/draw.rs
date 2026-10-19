@@ -32,16 +32,24 @@ impl App {
         out
     }
 
-    /// Inline: the rows of the items not yet printed.
-    fn live(&mut self, width: usize) -> Vec<Line> {
-        (self.committed..self.view.items.len())
-            .flat_map(|i| self.rows(i, width).to_vec())
-            .collect()
+    /// Inline: the last `n` rows of the items not yet printed.
+    fn live(&mut self, width: usize, n: usize) -> Vec<Line> {
+        let mut out = Vec::new();
+        for i in (self.committed..self.view.items.len()).rev() {
+            if out.len() == n {
+                break;
+            }
+            let rows = self.rows(i, width);
+            let take = rows.len().min(n - out.len());
+            out.splice(0..0, rows[rows.len() - take..].iter().cloned());
+        }
+        out
     }
 
     /// The rows under the transcript (the recap, the oldest approval, a
     /// notice, the input, the status line) and the caret's (x, row).
-    fn bottom(&self, width: usize) -> (Vec<Line>, Option<(u16, u16)>) {
+    fn bottom(&mut self, width: usize) -> (Vec<Line>, Option<(u16, u16)>) {
+        let summary = self.summary();
         let mut out = Vec::new();
         if let Some(recap) = self.view.recap.as_ref().filter(|_| !self.recap_hidden) {
             let cyan = Style::new().fg(Color::Cyan);
@@ -60,14 +68,7 @@ impl App {
             }
             out.extend(rows);
         }
-        let asked = self.view.asked().next().and_then(|call| {
-            let at = self
-                .view
-                .items
-                .binary_search_by_key(&call, Item::key)
-                .ok()?;
-            Some(&self.view.items[at])
-        });
+        let asked = summary.asked.map(|i| &self.view.items[i]);
         if let Some(Item::Tool {
             call,
             tool,
@@ -105,7 +106,7 @@ impl App {
                 " y approves · n denies"
             } else if self.view.session.is_none() {
                 ""
-            } else if self.running() {
+            } else if summary.running {
                 " ctrl-c stops the tool · /help"
             } else {
                 " message the agent · /help"
@@ -116,7 +117,7 @@ impl App {
         let skip = usize::from(cy).saturating_sub(INPUT_ROWS - 1);
         let caret_row = out.len() + usize::from(cy) - skip;
         out.extend(rows.into_iter().skip(skip).take(INPUT_ROWS));
-        out.push(self.status(width));
+        out.push(self.status(width, summary.reply));
         let last_col = u16::try_from(width.saturating_sub(1)).unwrap_or(u16::MAX);
         let caret = self.overlay.is_none().then(|| {
             (
@@ -127,7 +128,7 @@ impl App {
         (out, caret)
     }
 
-    fn status(&self, width: usize) -> Line {
+    fn status(&self, width: usize, reply: Option<usize>) -> Line {
         let (state, style) = match (&self.conn, self.view.link) {
             (Conn::Lost(why), _) => (
                 format!("✗ disconnected: {why}"),
@@ -149,7 +150,7 @@ impl App {
                 Style::new().bold(),
             ));
         }
-        let model = self.view.items.iter().rev().find_map(|item| match item {
+        let model = reply.and_then(|i| match &self.view.items[i] {
             Item::Reply { model, .. } => Some(model.clone()),
             _ => None,
         });
@@ -279,11 +280,11 @@ impl App {
         }
         let width = usize::from(w);
         let (bottom, _) = self.bottom(width);
+        let cap = usize::from(h / 2).max(3);
         let live = match self.overlay_lines(width) {
             Some(lines) => lines.len(),
-            None => self.live(width).len(),
+            None => self.live(width, cap).len(),
         };
-        let cap = usize::from(h / 2).max(3);
         u16::try_from(bottom.len() + live.min(cap))
             .unwrap_or(h)
             .min(h)
@@ -324,10 +325,7 @@ impl App {
         let (width, rows) = (usize::from(buf.area.width), usize::from(body));
         let lines = match viewport {
             Viewport::Full => self.window(width, rows),
-            Viewport::Inline => {
-                let live = self.live(width);
-                live[live.len().saturating_sub(rows)..].to_vec()
-            }
+            Viewport::Inline => self.live(width, rows),
         };
         // A short transcript sits at the bottom, by the input.
         let top = u16::try_from(rows - lines.len()).unwrap_or(0);
