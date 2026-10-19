@@ -134,7 +134,12 @@ fn run(command: &mut Command) -> io::Result<()> {
     if status.success() {
         Ok(())
     } else {
-        Err(io::Error::other(format!("{command:?} failed: {status}")))
+        // The command line as typed, not std's Debug of a whole Command.
+        let line: Vec<_> = std::iter::once(command.get_program())
+            .chain(command.get_args())
+            .map(|word| word.to_string_lossy())
+            .collect();
+        Err(io::Error::other(format!("`{}` failed: {status}", line.join(" "))))
     }
 }
 
