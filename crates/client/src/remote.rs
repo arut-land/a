@@ -139,7 +139,10 @@ fn run(command: &mut Command) -> io::Result<()> {
             .chain(command.get_args())
             .map(|word| word.to_string_lossy())
             .collect();
-        Err(io::Error::other(format!("`{}` failed: {status}", line.join(" "))))
+        Err(io::Error::other(format!(
+            "`{}` failed: {status}",
+            line.join(" ")
+        )))
     }
 }
 
