@@ -1010,7 +1010,7 @@ fn an_interrupt_before_recovery_starts_stops_it() {
         1,
         Body::ToolCall {
             tool: "sleep".into(),
-            input: json!({ "seconds": 1 }),
+            input: json!({ "seconds": 1 }).into(),
             id: None,
             card: None,
         },
