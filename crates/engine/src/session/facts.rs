@@ -3,7 +3,8 @@
 
 use std::collections::{HashMap, HashSet, VecDeque};
 
-use agent::{Action, Agent, Input, Toolset};
+use ext::host::Toolset;
+use ext::{Action, Agent, Input};
 use llm::{Message, ToolMessage, ToolResult};
 use protocol::{Body, DaemonMsg, Decision, Entry, Outcome, Recap};
 
@@ -31,7 +32,7 @@ pub fn transcript(entries: &[Entry], before: u64, tools: &Toolset) -> Vec<Messag
                 context += 1;
             }
             Body::Fired { outcome, .. } => {
-                messages.push(Message::user(agent::child_result(outcome)));
+                messages.push(Message::user(ext::child_result(outcome)));
             }
             Body::ModelResult {
                 outcome: Outcome::Done { output },

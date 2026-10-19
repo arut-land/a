@@ -7,6 +7,8 @@ publish.workspace = true
 [dependencies]
 client.workspace = true
 engine.workspace = true
+# The built-in extensions this build has: every one but the fixtures.
+ext-builtin = { workspace = true, features = ["default"] }
 protocol.workspace = true
 sys.workspace = true
 serde_json.workspace = true
@@ -18,14 +20,21 @@ web = { workspace = true, optional = true }
 default = ["web"]
 # `a web`; about 110 KiB of the release binary.
 web = ["dep:web"]
+# The `echo` agent and `sleep` tool; the tests build them in.
+fixtures = ["ext-builtin/fixtures"]
 
 [dev-dependencies]
+ext-builtin = { workspace = true, features = ["default", "fixtures"] }
 usage-rs = { workspace = true, features = ["spec"] }
 
 [target.'cfg(unix)'.dev-dependencies]
 # A pseudo-terminal for the black-box tests of the terminal client.
 rustix = { workspace = true, features = ["pty", "termios"] }
 unicode-width = { version = "0.2", default-features = false }
+
+[package.metadata.cargo-machete]
+# Chosen for its features: the engine runs whichever built-ins it has.
+ignored = ["ext-builtin"]
 
 [lints]
 workspace = true

@@ -5,7 +5,8 @@ use serde_json::{Value, json};
 
 use super::*;
 use crate::testing::Rig;
-use crate::{DynTool, Extension, Hook, Policy, Registrar, builtins};
+use crate::{DynTool, Extension, Policy, Registrar, builtins};
+use ext::Rewrite;
 
 fn rig(name: &str) -> Rig {
     Rig::new(name, builtins(&Policy::default()).unwrap())
@@ -329,19 +330,6 @@ fn a_background_command_returns_at_once_with_its_log() {
 }
 
 /// Wraps every process in `env`, adding a variable.
-struct Wrap;
-
-impl Hook for Wrap {
-    fn spawn(&self, spawn: &Spawn) -> Option<Spawn> {
-        let mut argv = vec!["/usr/bin/env".to_owned(), "WRAPPED=1".to_owned()];
-        argv.extend(spawn.argv.iter().cloned());
-        Some(Spawn {
-            argv,
-            ..spawn.clone()
-        })
-    }
-}
-
 struct Wrapper;
 
 impl Extension for Wrapper {
@@ -349,7 +337,14 @@ impl Extension for Wrapper {
     const VERSION: u32 = 1;
 
     fn contribute(&self, r: &mut Registrar) {
-        r.on(Wrap);
+        r.on::<ext::point::Spawn>(|_, spawn| {
+            let mut argv = vec!["/usr/bin/env".to_owned(), "WRAPPED=1".to_owned()];
+            argv.extend(spawn.argv.iter().cloned());
+            Rewrite::Replace(Spawn {
+                argv,
+                ..spawn.clone()
+            })
+        });
     }
 }
 

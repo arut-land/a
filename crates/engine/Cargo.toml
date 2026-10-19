@@ -9,7 +9,8 @@ publish.workspace = true
 events = []
 
 [dependencies]
-agent.workspace = true
+ext.workspace = true
+ext-builtin.workspace = true
 futures-core = { version = "0.3", default-features = false, features = ["std"] }
 llm = { workspace = true, features = ["ureq"] }
 rt.workspace = true
@@ -26,3 +27,4 @@ workspace = true
 bytes.workspace = true
 http.workspace = true
 serde_yaml_ng = "0.10"
+ext-builtin = { workspace = true, features = ["default", "fixtures"] }

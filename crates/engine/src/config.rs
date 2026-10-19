@@ -133,13 +133,13 @@ pub struct Settings {
     /// `$A_HOME/config.toml`.
     pub home: Watched,
     /// `[daemon] agent`: wins over both files.
-    pub agent: Option<agent::Kind>,
+    pub agent: Option<String>,
     /// Each workspace's `.a/config.toml`, shared by all its sessions.
     workspaces: Mutex<HashMap<PathBuf, Arc<Watched>>>,
 }
 
 impl Settings {
-    pub fn new(home: PathBuf, agent: Option<agent::Kind>) -> Self {
+    pub fn new(home: PathBuf, agent: Option<String>) -> Self {
         Self {
             home: Watched::new(home),
             agent,
@@ -160,20 +160,17 @@ impl Settings {
         watched.get()
     }
 
-    /// The agent a session in `workspace` runs. A file that cannot be read
-    /// is passed over here; the model call reports it.
-    pub fn agent(&self, workspace: &Path) -> agent::Kind {
-        if let Some(kind) = self.agent {
-            return kind;
+    /// The name of the agent a session in `workspace` runs, `chat` unless
+    /// configured otherwise. A file that cannot be read is passed over
+    /// here; the model call reports it.
+    pub fn agent(&self, workspace: &Path) -> String {
+        if let Some(name) = &self.agent {
+            return name.clone();
         }
         let named = |file: &Result<File, String>| file.as_ref().ok()?.agent.clone();
-        let name = named(&self.workspace(workspace)).or_else(|| named(&self.home.get()));
-        name.and_then(|name| {
-            name.parse()
-                .map_err(|e| eprintln!("agent `{name}` in config.toml: {e}"))
-                .ok()
-        })
-        .unwrap_or_default()
+        named(&self.workspace(workspace))
+            .or_else(|| named(&self.home.get()))
+            .unwrap_or_else(|| ext_builtin::agents::CHAT.to_owned())
     }
 
     /// The model spec for a session in `workspace` that sets none itself.

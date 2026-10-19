@@ -1,6 +1,7 @@
-//! Typed tools, the erased form a [`Toolset`] holds, and what a call runs
+//! Typed tools, the erased form a toolset holds, and what a call runs
 //! with.
 
+use std::collections::BTreeMap;
 use std::future::{Future, poll_fn};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -15,8 +16,11 @@ use serde::de::{Deserialize, DeserializeOwned};
 use serde_json::Value;
 use sys::Signal;
 
-use crate::state::{Cwd, State, States};
-use crate::{Hooks, Spawn};
+#[cfg(doc)]
+use crate::CwdOf;
+use crate::host::Host;
+use crate::point::{PointCx, View};
+use crate::state::{self, Fold, States};
 
 /// Whether a call interrupted by a crash may run again.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -120,25 +124,18 @@ impl Kill {
     }
 }
 
-/// The engine, as a running call reaches it.
-pub trait Host: Send + Sync {
-    /// Records a process group the call started, durably, so it is killed
-    /// if the daemon dies mid-call; a `background` group the session owns
-    /// past the call, until it ends.
-    fn spawned(&self, pgid: u32, background: bool);
-    /// Commits `text` as more of the call's output, for clients to show as
-    /// it runs and for the call's outcome should it be interrupted.
-    fn progress(&self, text: &str);
-    /// Commits `data` as a change to extension `ext`'s state `state`, and
-    /// folds it in.
-    fn note(&self, ext: &'static str, state: &'static str, data: Value);
-    fn states(&self) -> MutexGuard<'_, States>;
-    fn hooks(&self) -> &Hooks;
+/// A process a tool starts: `argv[0]` is the program.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct SpawnSpec {
+    pub argv: Vec<String>,
+    /// Exactly the variables it runs with.
+    pub env: BTreeMap<String, String>,
+    pub cwd: PathBuf,
 }
 
 /// What a tool or command call runs with. Cheap to clone, and owned, so
 /// work the call hands off (to a blocking thread, a background task) can
-/// take it along.
+/// take it along. Only the engine makes one: see [`host::Parts`](crate::host::Parts).
 #[derive(Clone)]
 pub struct Cx {
     /// The session's workspace.
@@ -158,60 +155,100 @@ pub struct Cx {
     /// Where a tool sleeps and runs blocking work, so it never holds up a
     /// runtime worker.
     pub rt: rt::Rt,
-    pub host: Arc<dyn Host>,
+    host: Arc<dyn Host>,
 }
 
 impl Cx {
+    pub(crate) fn new(call: crate::host::Parts, host: Arc<dyn Host>) -> Self {
+        let crate::host::Parts {
+            workspace,
+            env,
+            session,
+            call,
+            model,
+            spill,
+            cancel,
+            rt,
+        } = call;
+        Self {
+            workspace,
+            env,
+            session,
+            call,
+            model,
+            spill,
+            cancel,
+            rt,
+            host,
+        }
+    }
+
     /// Reads state `S`, or its default when no extension registered it.
-    pub fn state<S: State, R>(&self, read: impl FnOnce(&S) -> R) -> R {
-        let states = self.host.states();
-        match states.get::<S>() {
-            Some(state) => read(state),
-            None => read(&S::default()),
+    pub fn state<S: Fold, R>(&self, read: impl FnOnce(&S) -> R) -> R {
+        state::read(|f| self.host.states(f), read)
+    }
+
+    /// Commits `change` to state `S`; nothing when no extension registered
+    /// it.
+    pub fn update<S: Fold>(&self, change: S::Change) {
+        let mut ext = None;
+        self.host
+            .states(&mut |states| ext = states.ext_of::<S>().cloned());
+        let Some(ext) = ext else { return };
+        match serde_json::to_value(change) {
+            Ok(data) => self.host.note(&ext, S::NAME, data),
+            Err(e) => eprintln!("warning: extension {ext}: a {} change: {e}", S::NAME),
         }
     }
 
-    /// Commits `data` as a change to state `S`; nothing when no extension
-    /// registered it.
-    pub fn update<S: State>(&self, data: Value) {
-        let ext = self.host.states().ext_of::<S>();
-        if let Some(ext) = ext {
-            self.host.note(ext, S::NAME, data);
-        }
-    }
-
+    /// Records a process group the call started, durably, so it is killed
+    /// if the daemon dies mid-call; a `background` group the session owns
+    /// past the call, until it ends.
     pub fn spawned(&self, pgid: u32, background: bool) {
         self.host.spawned(pgid, background);
     }
 
-    /// See [`Host::progress`].
+    /// Commits `text` as more of the call's output, for clients to show as
+    /// it runs and for the call's outcome should it be interrupted.
     pub fn progress(&self, text: &str) {
         self.host.progress(text);
     }
 
-    /// `spawn` as the `spawn` hooks leave it: every process a tool starts
-    /// goes through them, so a sandbox or a remote runner can wrap it.
-    pub fn spawn_hooks(&self, spawn: &mut Spawn) {
-        self.host.hooks().spawn(spawn);
+    /// Service `S`, if an extension provides it.
+    pub fn service<S: ?Sized + 'static>(&self) -> Option<&S> {
+        self.host.registry().service::<S>()
     }
 
-    /// The directory the session's commands run in: see [`session_dir`].
+    /// The call's session, as handlers at decision points see it.
+    pub fn point(&self) -> PointCx<'_> {
+        PointCx::new(self.session, &self.workspace, self)
+    }
+
+    /// `spawn` as the `spawn` point leaves it: every process a tool starts
+    /// goes through it, so a sandbox or a remote runner can wrap it.
+    pub fn spawn_hooks(&self, spawn: &mut SpawnSpec) {
+        self.host.registry().hooks().spawn(&self.point(), spawn);
+    }
+
+    /// The directory the session's commands run in: see [`CwdOf`].
     pub fn dir(&self) -> PathBuf {
-        session_dir(&self.workspace, self.env.as_deref(), &self.host.states())
+        let mut dir = None;
+        let registry = self.host.registry();
+        self.host.states(&mut |states| {
+            dir = Some(registry.dir(&self.workspace, self.env.as_deref(), states));
+        });
+        dir.unwrap_or_else(|| self.workspace.to_path_buf())
     }
 }
 
-/// The directory a session's commands run in: where its last command left
-/// off, unless the client has since moved, else the client's directory,
-/// else the workspace. One that was removed since is skipped.
-pub fn session_dir(workspace: &Path, env: Option<&Environment>, states: &States) -> PathBuf {
-    let base = env.map(|env| env.cwd.as_path());
-    let last = states.get::<Cwd>().and_then(|cwd| cwd.after(base));
-    last.into_iter()
-        .chain(base)
-        .find(|dir| dir.is_dir())
-        .unwrap_or(workspace)
-        .to_path_buf()
+impl View for Cx {
+    fn model(&self) -> String {
+        self.model.to_string()
+    }
+
+    fn states(&self, read: &mut dyn FnMut(&States)) {
+        self.host.states(read);
+    }
 }
 
 /// A tool the model can call. Its output is the stored fact; what the model
@@ -251,9 +288,10 @@ pub trait Tool: Send + Sync + 'static {
     }
 }
 
-/// A [`Tool`] over JSON, so tools of every type fit one [`Toolset`].
+/// A tool over JSON, so tools of every type, and tools named only at run
+/// time, fit one toolset.
 pub trait DynTool: Send + Sync {
-    fn name(&self) -> &'static str;
+    fn name(&self) -> &str;
     fn replay(&self) -> Replay;
     fn route(&self) -> Route;
     /// How the tool is offered to the model.
@@ -266,7 +304,7 @@ pub trait DynTool: Send + Sync {
 }
 
 impl<T: Tool> DynTool for T {
-    fn name(&self) -> &'static str {
+    fn name(&self) -> &str {
         T::NAME
     }
 
@@ -317,50 +355,6 @@ impl<T: Tool> DynTool for T {
     fn present_result(&self, input: &Value, output: &Json) -> Option<Card> {
         let input = T::In::deserialize(input).ok()?;
         T::present_result(&input, &output.parse().ok()?)
-    }
-}
-
-/// The tools an agent may call, by name, as a [`Registry`](crate::Registry)
-/// resolves them.
-#[derive(Default)]
-pub struct Toolset(pub(crate) Vec<Arc<dyn DynTool>>);
-
-impl Toolset {
-    pub fn get(&self, name: &str) -> Option<&dyn DynTool> {
-        self.0.iter().map(|t| &**t).find(|t| t.name() == name)
-    }
-
-    /// Every tool, as offered to the model.
-    pub fn specs(&self) -> Vec<llm::Tool> {
-        self.0.iter().map(|t| t.spec()).collect()
-    }
-
-    pub fn run<'a>(&'a self, name: &str, input: &Value, cx: &'a Cx) -> BoxFuture<'a, Outcome> {
-        match self.get(name) {
-            Some(tool) => tool.call(input, cx),
-            None => Box::pin(std::future::ready(Outcome::Failed {
-                error: format!("unknown tool {name}"),
-            })),
-        }
-    }
-
-    /// What the model sees of a call's outcome.
-    pub fn to_model(&self, name: &str, outcome: &Outcome) -> (llm::Output, bool) {
-        match outcome {
-            Outcome::Done { output } => (
-                self.get(name)
-                    .map_or_else(|| llm::Output::Json(output.value()), |t| t.to_model(output)),
-                false,
-            ),
-            Outcome::Failed { error } => (llm::Output::Text(error.clone()), true),
-            Outcome::Interrupted { output } => {
-                let mut text = "interrupted before it finished".to_owned();
-                if let Some(output) = output.as_deref().filter(|o| !o.is_empty()) {
-                    text = format!("{output}\n[{text}]");
-                }
-                (llm::Output::Text(text), true)
-            }
-        }
     }
 }
 

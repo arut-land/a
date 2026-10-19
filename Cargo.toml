@@ -10,7 +10,9 @@ edition = "2024"
 publish = false
 
 [workspace.dependencies]
-agent = { path = "crates/agent" }
+ext = { path = "crates/ext" }
+# Each user picks the built-ins it runs; `a` takes them all.
+ext-builtin = { path = "crates/ext-builtin", default-features = false }
 client = { path = "crates/client" }
 engine = { path = "crates/engine" }
 llm = { path = "crates/llm" }

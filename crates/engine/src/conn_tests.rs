@@ -36,7 +36,7 @@ impl Fixture {
         let home = Home::from(root.clone());
         seed(&home);
         let config = Config {
-            agent: Some(agent::Kind::Echo),
+            agent: Some(ext_builtin::agents::ECHO.into()),
             ..Config::default()
         };
         let daemon = Daemon::load(&home, &config).unwrap();

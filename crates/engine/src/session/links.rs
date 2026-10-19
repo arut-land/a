@@ -9,7 +9,7 @@ use std::io;
 use std::sync::Arc;
 use std::sync::atomic::Ordering;
 
-use agent::{Agent, Input};
+use ext::{Agent, Input};
 use protocol::{Body, Entry, Environment, Outcome, SessionId};
 use store::{Header, Loaded, Parent};
 

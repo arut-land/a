@@ -105,7 +105,7 @@ acceptance = "cargo nextest run -p a --test acceptance --no-tests=fail"
 # (`[daemon]` `agent = "echo"` in its config.toml for none); its daemon
 # stops with it.
 web = '''
-cargo build -p a
+cargo build -p a --features fixtures
 export A_HOME=$PWD/target/web-home
 trap 'target/debug/a daemon stop >/dev/null' EXIT
 target/debug/a web
@@ -113,9 +113,14 @@ target/debug/a web
 # The black-box web UI test (apps/cli/tests/web.rs) on the dev build.
 "test:web" = "cargo nextest run -p a --test web --no-tests=fail"
 # Release binary size, then cold start, attach latency and idle daemon RSS
-# on it. Latency is held to its budget off CI, and on CI where the job sets
+# on a release build that differs only by the test fixtures (built aside,
+# in target/fixtures), which the shipped one is checked to lack. Latency is
+# held to its budget off CI, and on CI where the job sets
 # A_STRICT_BUDGETS=1; elsewhere shared runners get slack.
-budgets = { depends = ["size"], run = 'A_BIN=$PWD/target/release/a A_STRICT_BUDGETS=${A_STRICT_BUDGETS:-$([[ -n ${CI:-} ]] && echo 0 || echo 1)} cargo nextest run -p a --test budgets --test-threads 1 --no-capture' }
+budgets = { depends = ["size"], run = '''
+CARGO_TARGET_DIR=target/fixtures cargo build-release -p a --features fixtures
+A_SHIPPED=$PWD/target/release/a A_BIN=$PWD/target/fixtures/release/a A_STRICT_BUDGETS=${A_STRICT_BUDGETS:-$([[ -n ${CI:-} ]] && echo 0 || echo 1)} cargo nextest run -p a --test budgets --test-threads 1 --no-capture
+''' }
 
 # The macOS app (apps/apple). The FFI package: crates/ffi for macOS arm64
 # plus its Swift bindings, in apps/apple/Generated (pass --release for an
@@ -125,7 +130,7 @@ budgets = { depends = ["size"], run = 'A_BIN=$PWD/target/release/a A_STRICT_BUDG
 # The shared reducer vectors and the session store through the FFI, then a
 # live session on a daemon of its own (a throwaway A_HOME, the echo agent).
 "apple:test" = { depends = ["apple:ffi"], run = '''
-cargo build -p a
+cargo build -p a --features fixtures
 export A_HOME=$(mktemp -d) A_TEST_HELPER=$PWD/target/debug/a
 printf '[daemon]\nagent = "echo"\nask = ["bash"]\n' > "$A_HOME/config.toml"
 trap 'target/debug/a daemon stop >/dev/null; rm -rf "$A_HOME"' EXIT

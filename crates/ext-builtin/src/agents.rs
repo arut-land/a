@@ -1,127 +1,20 @@
-//! Agents as sans-IO step machines, the tools they call, and the hooks that
-//! intercept them, as extensions contribute them.
-//!
-//! An agent never performs I/O: it turns an [`Input`] into [`Action`]s, and the
-//! engine commits entries, runs tools and feeds results back in. Every input
-//! is a logged fact, so an agent's state is a fold over its session's log.
+//! The agent loops the built-ins register.
 
-use std::str::FromStr;
+#[cfg(any(test, feature = "fixtures"))]
+use ext::Tool;
+use ext::{Action, Agent, Input};
+#[cfg(any(test, feature = "fixtures"))]
+use protocol::Body;
+use protocol::Outcome;
+use serde_json::Value;
+#[cfg(any(test, feature = "fixtures"))]
+use serde_json::json;
 
-use protocol::{Body, Outcome};
-use serde_json::{Value, json};
-
-pub mod builtin;
-mod ext;
-mod hooks;
-mod state;
-#[cfg(test)]
-mod testing;
-mod tool;
-pub mod tools;
-
-pub use builtin::{Fixtures, Policy, builtins};
-pub use ext::{
-    Command, Current, DynCommand, Extension, Facts, Refused, Registrar, Registry, Section, Slot,
-    Tier,
-};
-pub use hooks::{AskFor, Decided, Gate, Hook, Hooks, Pre, Said, Spawn};
-pub use state::{Cwd, State, States};
-pub use tool::{Cancel, Cx, DynTool, Host, Kill, Replay, Route, Tool, Toolset, session_dir};
-
-pub enum Input {
-    User {
-        text: String,
-    },
-    ToolDone {
-        call: u64,
-        outcome: Outcome,
-    },
-    ModelDone {
-        call: u64,
-        outcome: Outcome,
-    },
-    /// Watch `watch` fired: the child it watched settled with `outcome`.
-    ChildDone {
-        watch: u64,
-        outcome: Outcome,
-    },
-}
-
-/// The most of a child's result a parent's model sees, in bytes: about 8k
-/// tokens.
-pub const CHILD_RESULT_LIMIT: usize = 32 * 1024;
-
-/// A child's result as its parent's agent reads it, cut to
-/// [`CHILD_RESULT_LIMIT`].
-pub fn child_result(outcome: &Outcome) -> String {
-    let text = match outcome {
-        Outcome::Done { output } => match output.parse::<String>() {
-            Ok(text) => format!("The child session finished:\n{text}"),
-            Err(_) => format!("The child session finished:\n{output}"),
-        },
-        Outcome::Failed { error } => format!("The child session failed: {error}"),
-        Outcome::Interrupted { .. } => "The child session was interrupted.".to_owned(),
-    };
-    if text.len() > CHILD_RESULT_LIMIT {
-        let cut = text.floor_char_boundary(CHILD_RESULT_LIMIT);
-        let left = text.len() - cut;
-        return format!("{}\n[{left} more bytes not shown]", &text[..cut]);
-    }
-    text
-}
-
-#[derive(Debug, PartialEq)]
-pub enum Action {
-    Emit(Body),
-    RunTool {
-        tool: String,
-        input: Value,
-        /// The model's id for the call.
-        id: Option<String>,
-        /// Answers the call with this error instead of running it.
-        refuse: Option<String>,
-    },
-    /// Ask the model to reply to the conversation so far.
-    CallModel,
-    /// Start a child session on `input` and watch it; its result comes back
-    /// into this session's log when it settles.
-    Spawn {
-        input: String,
-    },
-}
-
-pub trait Agent: Send {
-    fn step(&mut self, input: Input) -> Vec<Action>;
-}
-
-/// The agents a session can run.
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
-pub enum Kind {
-    Echo,
-    #[default]
-    Chat,
-}
-
-impl Kind {
-    pub fn agent(self) -> Box<dyn Agent> {
-        match self {
-            Self::Echo => Box::new(Echo),
-            Self::Chat => Box::new(Chat::default()),
-        }
-    }
-}
-
-impl FromStr for Kind {
-    type Err = String;
-
-    fn from_str(name: &str) -> Result<Self, String> {
-        match name {
-            "echo" => Ok(Self::Echo),
-            "chat" => Ok(Self::Chat),
-            _ => Err(format!("unknown agent {name}")),
-        }
-    }
-}
+/// The model-backed agent's name, which sessions run unless configured
+/// otherwise.
+pub const CHAT: &str = "chat";
+/// The test agent's name.
+pub const ECHO: &str = "echo";
 
 /// Model calls one user message may lead to; the calls of the last reply
 /// are answered with an error instead of run.
@@ -203,14 +96,16 @@ fn refusal(call: &llm::ToolCall, limited: bool) -> Option<String> {
 /// `sleep <seconds>` calls the `sleep` fixture and `spawn <message>` hands
 /// the message to a child session, so tool calls and links can be exercised
 /// without a model.
+#[cfg(any(test, feature = "fixtures"))]
 pub struct Echo;
 
+#[cfg(any(test, feature = "fixtures"))]
 impl Agent for Echo {
     fn step(&mut self, input: Input) -> Vec<Action> {
         let text = match input {
             Input::User { text } => text,
             Input::ChildDone { outcome, .. } => {
-                let text = child_result(&outcome);
+                let text = ext::child_result(&outcome);
                 return vec![Action::Emit(Body::Assistant { text })];
             }
             Input::ToolDone { .. } | Input::ModelDone { .. } => return Vec::new(),
@@ -221,9 +116,9 @@ impl Agent for Echo {
             }];
         }
         let (tool, input) = if let Some(command) = text.strip_prefix("$ ") {
-            (tools::Bash::NAME, json!({ "command": command }))
+            (crate::tools::Bash::NAME, json!({ "command": command }))
         } else if let Some(Ok(seconds)) = text.strip_prefix("sleep ").map(str::parse::<u64>) {
-            (tools::Sleep::NAME, json!({ "seconds": seconds }))
+            (crate::tools::Sleep::NAME, json!({ "seconds": seconds }))
         } else {
             return vec![Action::Emit(Body::Assistant { text })];
         };
@@ -285,39 +180,6 @@ mod tests {
         let mut chat = Chat::default();
         assert_eq!(chat.step(done("hi".into())), [Action::CallModel]);
         assert_eq!(chat.step(reply(&[])), NOTHING);
-    }
-
-    #[test]
-    fn a_childs_result_is_cut_for_the_model() {
-        let long = "é".repeat(CHILD_RESULT_LIMIT);
-        let text = child_result(&Outcome::Done {
-            output: long.into(),
-        });
-        let (shown, note) = text.rsplit_once('\n').unwrap();
-        assert!(shown.len() <= CHILD_RESULT_LIMIT);
-        assert!(note.starts_with('[') && note.ends_with("more bytes not shown]"));
-        let failed = Outcome::Failed {
-            error: "boom".into(),
-        };
-        assert_eq!(child_result(&failed), "The child session failed: boom");
-    }
-
-    #[test]
-    fn replay_policy_is_per_tool() {
-        let registry = builtins(&Policy::default())
-            .and_then(|r| r.with(&Fixtures))
-            .unwrap();
-        let tools = registry.tools();
-        assert_eq!(tools.get("bash").unwrap().replay(), Replay::Unsafe);
-        assert_eq!(tools.get("edit").unwrap().replay(), Replay::Unsafe);
-        assert_eq!(tools.get("sleep").unwrap().replay(), Replay::Safe);
-    }
-
-    #[test]
-    fn agents_parse_by_name() {
-        assert_eq!("echo".parse(), Ok(Kind::Echo));
-        assert_eq!("chat".parse(), Ok(Kind::Chat));
-        assert!("other".parse::<Kind>().is_err());
     }
 
     /// A model reply holding `calls`, as the engine stores it.

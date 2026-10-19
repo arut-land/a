@@ -1,5 +1,5 @@
 [package]
-name = "agent"
+name = "ext"
 version.workspace = true
 edition.workspace = true
 publish.workspace = true
@@ -11,8 +11,6 @@ rt.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 sys.workspace = true
-# Terminal escape sequences, dropped from command output.
-vte = { version = "0.15", default-features = false }
 
 [lints]
 workspace = true

@@ -14,9 +14,11 @@ use std::path::{Path, PathBuf};
 
 use protocol::Card;
 use serde::{Deserialize, Serialize};
-use serde_json::{Value, json};
+use serde_json::Value;
 
-use crate::{Cx, State, Tool};
+use ext::Fold;
+
+use crate::{Cx, Tool};
 
 pub struct Edit;
 
@@ -51,19 +53,28 @@ pub struct Edited {
 #[derive(Debug, Default)]
 pub struct Seen(HashMap<PathBuf, u64>);
 
+/// A file this session wrote, and the hash of what it wrote.
+#[derive(Debug, Serialize, Deserialize)]
+pub struct Wrote {
+    path: PathBuf,
+    hash: u64,
+}
+
 impl Seen {
-    fn change(path: &Path, content: &[u8]) -> Value {
-        json!({ "path": path, "hash": hash(content) })
+    fn change(path: &Path, content: &[u8]) -> Wrote {
+        Wrote {
+            path: path.to_path_buf(),
+            hash: hash(content),
+        }
     }
 }
 
-impl State for Seen {
+impl Fold for Seen {
     const NAME: &'static str = "seen";
+    type Change = Wrote;
 
-    fn fold(&mut self, data: &Value) {
-        if let (Some(path), Some(hash)) = (data["path"].as_str(), data["hash"].as_u64()) {
-            self.0.insert(path.into(), hash);
-        }
+    fn apply(&mut self, wrote: &Wrote) {
+        self.0.insert(wrote.path.clone(), wrote.hash);
     }
 }
 
@@ -317,6 +328,7 @@ mod tests {
     use crate::testing::Rig;
     use crate::{DynTool, Policy, builtins};
     use protocol::Outcome;
+    use serde_json::json;
 
     fn edits(pairs: &[(&str, &str)]) -> Vec<Replace> {
         pairs

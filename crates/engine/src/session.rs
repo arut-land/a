@@ -10,10 +10,8 @@ use std::sync::{Arc, Mutex, MutexGuard, Weak};
 use std::task::{Poll, Waker};
 use std::time::{Duration, Instant};
 
-use agent::{
-    Action, Agent, Cancel, Cx, Decided, DynTool, Facts, Gate, Hooks, Host, Input, Registry, Replay,
-    Route, States,
-};
+use ext::host::{Decided, Gate, Host, Parts, Registry};
+use ext::{Action, Agent, Cancel, Cx, DynTool, Facts, Input, Replay, Route, States};
 use protocol::view::SessionView;
 use protocol::{
     Activity, Body, Cap, Card, DaemonMsg, Decision, Entry, Environment, Frame, Installed, Json,
@@ -29,6 +27,7 @@ use crate::{Daemon, lock};
 
 mod facts;
 mod links;
+mod points;
 #[cfg(test)]
 mod tests;
 
@@ -41,7 +40,7 @@ pub struct Shared {
     pub store: Arc<dyn LogStore>,
     /// The extensions' tools and hooks, as each session resolves them at
     /// its step boundaries.
-    pub registry: agent::Current,
+    pub registry: ext::host::Current,
     /// The settings, and the model they name.
     pub models: Models,
     /// The system prompt, in place of the one the extensions make.
@@ -240,7 +239,7 @@ impl Session {
             jobs: Mutex::default(),
             shared,
         });
-        registry.hooks().session_start(session.id);
+        registry.hooks().session_start(&session.point());
         let actor = Arc::clone(&session);
         session
             .shared
@@ -276,13 +275,15 @@ impl Session {
     fn take_in(&self, mut text: String, steer: bool) -> Result<(), String> {
         let registry = self.shared.registry.get();
         let mut decided = Decided::new();
-        registry.hooks().input(&mut text, &mut decided)?;
+        registry
+            .hooks()
+            .input(&self.point(), &mut text, &mut decided)?;
         let parsed = as_command(&registry, &text);
         let command = parsed.is_some();
         let mut waiting = lock(&self.waiting);
         for (hook, decision) in decided {
             self.record(Body::Hook {
-                hook: hook.to_owned(),
+                hook: hook.to_string(),
                 decision,
             });
         }
@@ -393,7 +394,7 @@ impl Session {
         for pgid in lock(&self.jobs).drain(..) {
             self.kill(pgid);
         }
-        self.registry().hooks().session_end(self.id);
+        self.registry().hooks().session_end(&self.point());
     }
 
     /// Attaches `client`, which has the entries up to `since`: it is sent
@@ -612,7 +613,7 @@ impl Session {
                 Ok(frame) => st.clients.retain(|c| c.send(frame.clone()).is_ok()),
                 Err(_) => st.clients.clear(),
             }
-            hooks.observe(&entry);
+            hooks.observe(&self.point(), &entry);
             let asked = match entry.body {
                 Body::Ask { call } => Some(call),
                 _ => None,
@@ -639,7 +640,7 @@ impl Session {
         let decided: Vec<Body> = decided
             .into_iter()
             .map(|(hook, decision)| Body::Hook {
-                hook: hook.to_owned(),
+                hook: hook.to_string(),
                 decision,
             })
             .collect();
@@ -678,11 +679,11 @@ impl Session {
     /// boxed, so an idle session's actor holds only what waiting takes.
     async fn run(&self, mailbox: &rt::channel::Receiver<Msg>, fresh: bool) {
         let kind = self.shared.models.settings.agent(&self.workspace);
-        let mut agent = kind.agent();
+        let mut agent = self.registry().agent(&kind);
         let mut ok = fresh || Box::pin(self.work(Box::pin(self.recover(agent.as_mut())))).await;
         loop {
             if !ok {
-                agent = kind.agent();
+                agent = self.registry().agent(&kind);
                 let st = self.lock();
                 replay(agent.as_mut(), &st.entries);
                 let mut states = self.registry().states();
@@ -822,10 +823,10 @@ impl Session {
             }
             self.flush().await?;
             let mut decided = Decided::new();
-            let next = self
-                .registry()
-                .hooks()
-                .on_stop(&self.lock().entries, &mut decided);
+            let next =
+                self.registry()
+                    .hooks()
+                    .on_stop(&self.point(), &self.lock().entries, &mut decided);
             self.decide(decided).await?;
             match next {
                 Some(text) => inputs.push_back(Input::User { text }),
@@ -908,7 +909,10 @@ impl Session {
                     Err(error)
                 } else {
                     let mut decided = Decided::new();
-                    let verdict = registry.hooks().gate(&tool, &mut input, &mut decided);
+                    let verdict =
+                        registry
+                            .hooks()
+                            .gate(&self.point(), &tool, &mut input, &mut decided);
                     self.decide(decided).await?;
                     verdict
                 };
@@ -1017,7 +1021,13 @@ impl Session {
                 let mut decided = Decided::new();
                 let registry = self.registry();
                 let hooks = registry.hooks();
-                hooks.post_tool(seq, (tool, input), &mut outcome, &mut decided);
+                hooks.post_tool(
+                    &self.point(),
+                    seq,
+                    (tool, input),
+                    &mut outcome,
+                    &mut decided,
+                );
                 self.decide(decided).await?;
                 let card = match &outcome {
                     Outcome::Done { output } => registry
@@ -1136,7 +1146,7 @@ impl Session {
             .this
             .upgrade()
             .expect("a session that runs a call is alive");
-        Cx {
+        Parts {
             workspace: Arc::from(self.workspace.as_path()),
             env: lock(&self.env).clone().map(Arc::new),
             session: self.id,
@@ -1145,12 +1155,12 @@ impl Session {
             spill: Arc::from(self.shared.spill.join(self.id.to_string())),
             cancel: self.turn(),
             rt: Arc::clone(&self.shared.rt),
-            host: Arc::new(Effect {
-                session,
-                call,
-                registry: Arc::clone(registry),
-            }),
         }
+        .cx(Arc::new(Effect {
+            session,
+            call,
+            registry: Arc::clone(registry),
+        }))
     }
 
     /// What stops the running turn.
@@ -1198,7 +1208,8 @@ impl Session {
     /// The directory the session's commands run in now.
     fn dir(&self) -> PathBuf {
         let env = lock(&self.env);
-        agent::session_dir(&self.workspace, env.as_ref(), &lock(&self.states))
+        self.registry()
+            .dir(&self.workspace, env.as_ref(), &lock(&self.states))
     }
 
     /// Logs the context the extensions give, before the session's first
@@ -1243,7 +1254,7 @@ impl Session {
         let mut decided = Decided::new();
         registry
             .hooks()
-            .prepare_step(call, &mut request, &mut decided);
+            .prepare_step(&self.point(), call, &mut request, &mut decided);
         if let Err(e) = self.decide(decided).await {
             return Outcome::Failed {
                 error: e.to_string(),
@@ -1317,6 +1328,7 @@ impl Session {
             let retry = (retries < MAX_RETRIES && !cancel.is_cancelled())
                 .then(|| {
                     registry.hooks().request_error(
+                        &self.point(),
                         (call, retries + 1),
                         &request,
                         &error,
@@ -1518,7 +1530,7 @@ impl Host for Effect {
         self.session.kick();
     }
 
-    fn note(&self, ext: &'static str, state: &'static str, data: Value) {
+    fn note(&self, ext: &str, state: &str, data: Value) {
         lock(&self.session.states).fold(ext, state, &data);
         self.session.record(Body::Ext {
             ext: ext.to_owned(),
@@ -1528,12 +1540,12 @@ impl Host for Effect {
         self.session.kick();
     }
 
-    fn states(&self) -> MutexGuard<'_, States> {
-        lock(&self.session.states)
+    fn states(&self, read: &mut dyn FnMut(&States)) {
+        read(&lock(&self.session.states));
     }
 
-    fn hooks(&self) -> &Hooks {
-        self.registry.hooks()
+    fn registry(&self) -> &Registry {
+        &self.registry
     }
 }
 

@@ -9,7 +9,8 @@ use std::sync::{Arc, LazyLock, Mutex, MutexGuard, PoisonError};
 use protocol::{Body, Entry, Environment, Outcome, SessionId};
 use serde_json::Value;
 
-use crate::{Cancel, Cx, Hooks, Host, Registry, States};
+use ext::host::{Host, Parts, Registry};
+use ext::{Cancel, Cx, States};
 
 static RT: LazyLock<rt::Rt> = LazyLock::new(|| Arc::new(rt::Threads::default()));
 
@@ -78,7 +79,7 @@ impl Rig {
 
     /// What the next call runs with.
     pub fn cx(&self) -> Cx {
-        Cx {
+        Parts {
             workspace: self.workspace().into(),
             env: self.env.clone().map(Arc::new),
             session: self.session,
@@ -87,8 +88,8 @@ impl Rig {
             spill: self.spill().into(),
             cancel: self.cancel.clone(),
             rt: Arc::clone(&RT),
-            host: Arc::clone(&self.host) as _,
         }
+        .cx(Arc::clone(&self.host) as _)
     }
 
     /// Runs tool `tool` on `input`.
@@ -131,7 +132,7 @@ impl Host for Recorder {
         lock(&self.progress).push_str(text);
     }
 
-    fn note(&self, ext: &'static str, state: &'static str, data: Value) {
+    fn note(&self, ext: &str, state: &str, data: Value) {
         lock(&self.states).fold(ext, state, &data);
         let mut log = lock(&self.log);
         let seq = log.len() as u64 + 1;
@@ -146,11 +147,11 @@ impl Host for Recorder {
         ));
     }
 
-    fn states(&self) -> MutexGuard<'_, States> {
-        lock(&self.states)
+    fn states(&self, read: &mut dyn FnMut(&States)) {
+        read(&lock(&self.states));
     }
 
-    fn hooks(&self) -> &Hooks {
-        self.registry.hooks()
+    fn registry(&self) -> &Registry {
+        &self.registry
     }
 }

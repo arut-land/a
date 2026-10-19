@@ -2,8 +2,10 @@ use std::path::Path;
 use std::sync::atomic::AtomicBool;
 use std::thread;
 
-use agent::{Extension, Hook, Policy, Registrar, Registry, Tool};
 use bytes::Bytes;
+use ext::host::Registry;
+use ext::{Extension, Registrar, Rewrite, Tool, point};
+use ext_builtin::Policy;
 use llm::http::{BoxFuture, Http};
 use protocol::{Caps, Card, Decision, Permission};
 use serde::Deserialize as _;
@@ -84,7 +86,7 @@ fn transcripts_of_earlier_logs_read_replies_as_text() {
         ),
         entry(5, Body::ModelCall { model: "m".into() }),
     ];
-    let turns = transcript(&entries, 5, &agent::Toolset::default());
+    let turns = transcript(&entries, 5, &ext::host::Toolset::default());
     assert_eq!(
         turns,
         [
@@ -221,14 +223,37 @@ fn with_home(script: &Arc<Script>, path: &Path) -> Models {
 
 struct Fixture(Arc<Shared>);
 
+/// The agents sessions under test run.
+struct Agents;
+
+impl Extension for Agents {
+    const NAME: &'static str = "agents";
+    const VERSION: u32 = 1;
+
+    fn contribute(&self, r: &mut Registrar) {
+        r.agent(ext_builtin::agents::CHAT, || {
+            Box::new(ext_builtin::agents::Chat::default())
+        })
+        .agent(ext_builtin::agents::ECHO, || {
+            Box::new(ext_builtin::agents::Echo)
+        });
+    }
+}
+
 impl Fixture {
-    fn new(agent: agent::Kind, registry: Registry, mut models: Models) -> Self {
-        models.settings.agent = Some(agent);
+    fn new(agent: &str, registry: Registry, mut models: Models) -> Self {
+        models.settings.agent = Some(agent.to_owned());
+        // The agent, for a registry under test that has none.
+        let registry = if registry.agents().any(|a| a == agent) {
+            registry
+        } else {
+            registry.with_in(ext::Tier::Post, &Agents).unwrap()
+        };
         Self(Arc::new(Shared {
             // One worker: no effect may hold it.
             rt: Arc::new(rt::Threads::new(1)),
             store: Arc::new(store::Memory::default()),
-            registry: agent::Current::new(registry),
+            registry: ext::host::Current::new(registry),
             models,
             system: None,
             spill: std::env::temp_dir().join(format!("a-spill-{}", std::process::id())),
@@ -288,7 +313,7 @@ impl Log for Probe {
 #[test]
 fn input_commits_on_arrival_and_a_failed_commit_leaves_no_trace() {
     let fixture = Fixture::new(
-        agent::Kind::Echo,
+        ext_builtin::agents::ECHO,
         Registry::default(),
         openai(&Script::new(&[])),
     );
@@ -297,7 +322,7 @@ fn input_commits_on_arrival_and_a_failed_commit_leaves_no_trace() {
         id: SessionId::new(),
         workspace: std::env::temp_dir(),
         parent: None,
-        extensions: Vec::new(),
+        extensions: installed(&fixture.0.registry.get()),
     };
     let loaded = Loaded {
         entries: Vec::new(),
@@ -353,7 +378,7 @@ fn the_model_calls_a_tool_and_answers_from_its_result() {
     let replies = cassette("openai/streaming_grammar/tool_then_followup_text.yaml");
     let script = Script::new(&replies);
     let tools = Registry::default().with(&Harbor).unwrap();
-    let fixture = Fixture::new(agent::Kind::Chat, tools, openai(&script));
+    let fixture = Fixture::new(ext_builtin::agents::CHAT, tools, openai(&script));
     let session = fixture.start(&[]);
     session
         .submit("Call the tool, then answer.".into())
@@ -401,7 +426,7 @@ fn the_model_calls_a_tool_and_answers_from_its_result() {
     for cut in 3..=6 {
         let script = Script::new(&replies[1..]);
         let fixture = Fixture::new(
-            agent::Kind::Chat,
+            ext_builtin::agents::CHAT,
             Registry::default().with(&Harbor).unwrap(),
             openai(&script),
         );
@@ -426,7 +451,7 @@ fn model_calls_take_credentials_from_the_client_then_the_config() {
         std::fs::write(&config, text).unwrap();
         let script = Script::new(&replies);
         let fixture = Fixture::new(
-            agent::Kind::Chat,
+            ext_builtin::agents::CHAT,
             Registry::default().with(&Harbor).unwrap(),
             with_home(&script, &config),
         );
@@ -457,7 +482,7 @@ fn a_missing_credential_fails_the_model_call_saying_where_to_set_it() {
     let script = Script::new(&[]);
     let config = std::env::temp_dir().join("a-engine-no-config.toml");
     let models = with_home(&script, &config);
-    let fixture = Fixture::new(agent::Kind::Chat, Registry::default(), models);
+    let fixture = Fixture::new(ext_builtin::agents::CHAT, Registry::default(), models);
     let session = fixture.start(&[]);
     session.submit("hi".into()).unwrap();
     settle(&session);
@@ -503,7 +528,7 @@ fn live_the_model_calls_a_tool_and_answers_from_its_result() {
         http: Arc::new(llm::Ureq::new(rt)),
     };
     let fixture = Fixture::new(
-        agent::Kind::Chat,
+        ext_builtin::agents::CHAT,
         Registry::default().with(&Harbor).unwrap(),
         models,
     );
@@ -538,8 +563,13 @@ fn live_the_model_calls_a_tool_and_answers_from_its_result() {
 #[test]
 fn a_fired_watch_wakes_the_model_with_the_childs_result() {
     let replies = cassette("openai/streaming_grammar/tool_then_followup_text.yaml");
-    let fixture =
-        |script: &Arc<Script>| Fixture::new(agent::Kind::Chat, Registry::default(), openai(script));
+    let fixture = |script: &Arc<Script>| {
+        Fixture::new(
+            ext_builtin::agents::CHAT,
+            Registry::default(),
+            openai(script),
+        )
+    };
     let child = SessionId::new();
     let script = Script::new(&replies[1..]);
     let session = fixture(&script).load(&[entry(1, Body::Watch { child })]);
@@ -583,9 +613,9 @@ fn extensions_are_logged_when_they_change() {
     let script = Script::new(&[]);
     let registry = Registry::default()
         .with(&Harbor)
-        .and_then(|r| r.with(&agent::builtin::Shell))
+        .and_then(|r| r.with(&ext_builtin::Shell))
         .unwrap();
-    let fixture = Fixture::new(agent::Kind::Echo, registry, openai(&script));
+    let fixture = Fixture::new(ext_builtin::agents::ECHO, registry, openai(&script));
     // Created with these extensions: nothing to log.
     let same = fixture.start(&[]);
     let unchanged = log_of(&same);
@@ -612,8 +642,8 @@ fn extensions_are_logged_when_they_change() {
 
 /// The built-ins and the `sleep` fixture, with `policy` as given.
 fn echoing(policy: &Policy) -> Registry {
-    agent::builtins(policy)
-        .and_then(|r| r.with(&agent::Fixtures))
+    ext_builtin::builtins(policy)
+        .and_then(|r| r.with(&ext_builtin::Fixtures))
         .unwrap()
 }
 
@@ -626,39 +656,34 @@ impl Extension for Strict {
     const VERSION: u32 = 1;
 
     fn contribute(&self, r: &mut Registrar) {
-        r.on(Strict);
-    }
-}
-
-impl Hook for Strict {
-    fn permission(&self, tool: &str, _: &Value) -> Permission {
-        if tool == agent::tools::Bash::NAME {
-            Permission::Deny
-        } else {
-            Permission::Allow
-        }
-    }
-
-    fn on_stop(&self, entries: &[Entry]) -> Option<String> {
-        let continued = entries.iter().any(|e| {
-            matches!(
-                e.body,
-                Body::Hook {
-                    decision: Decision::OnStop { .. },
-                    ..
-                }
-            )
+        r.on::<point::Permission>(|_, call| {
+            if call.tool == ext_builtin::tools::Bash::NAME {
+                Permission::Deny
+            } else {
+                Permission::Allow
+            }
+        })
+        .on::<point::OnStop>(|_, entries| {
+            let continued = entries.iter().any(|e| {
+                matches!(
+                    e.body,
+                    Body::Hook {
+                        decision: Decision::OnStop { .. },
+                        ..
+                    }
+                )
+            });
+            (!continued).then(|| "and again".to_owned())
         });
-        (!continued).then(|| "and again".to_owned())
     }
 }
 
 #[test]
 fn hook_decisions_are_logged_and_replay_to_the_same_state() {
     let fixture = Fixture::new(
-        agent::Kind::Echo,
+        ext_builtin::agents::ECHO,
         echoing(&Policy::default())
-            .with_in(agent::Tier::Guarded, &Strict)
+            .with_in(ext::Tier::Guarded, &Strict)
             .unwrap(),
         openai(&Script::new(&[])),
     );
@@ -706,9 +731,9 @@ fn hook_decisions_are_logged_and_replay_to_the_same_state() {
             },
         ]
     );
-    assert!(replay(agent::Kind::Echo.agent().as_mut(), &log).is_empty());
+    assert!(replay(&mut ext_builtin::agents::Echo, &log).is_empty());
     assert_eq!(
-        transcript(&log, u64::MAX, &agent::Toolset::default()),
+        transcript(&log, u64::MAX, &ext::host::Toolset::default()),
         [
             llm::Message::user("$ echo hi"),
             llm::Message::user("and again"),
@@ -722,9 +747,9 @@ fn hook_decisions_are_logged_and_replay_to_the_same_state() {
 #[test]
 fn a_gate_cut_off_by_a_crash_logs_its_decisions_once() {
     let fixture = Fixture::new(
-        agent::Kind::Echo,
+        ext_builtin::agents::ECHO,
         echoing(&Policy::default())
-            .with_in(agent::Tier::Guarded, &Strict)
+            .with_in(ext::Tier::Guarded, &Strict)
             .unwrap(),
         openai(&Script::new(&[])),
     );
@@ -752,7 +777,7 @@ fn a_gate_cut_off_by_a_crash_logs_its_decisions_once() {
 #[test]
 fn sessions_wait_on_effects_without_holding_the_worker() {
     let fixture = Fixture::new(
-        agent::Kind::Echo,
+        ext_builtin::agents::ECHO,
         echoing(&Policy::ask(&["sleep"])),
         openai(&Script::new(&[])),
     );
@@ -783,7 +808,7 @@ fn sessions_wait_on_effects_without_holding_the_worker() {
 
 fn asking() -> Fixture {
     Fixture::new(
-        agent::Kind::Echo,
+        ext_builtin::agents::ECHO,
         echoing(&Policy::ask(&["bash"])),
         openai(&Script::new(&[])),
     )
@@ -953,16 +978,13 @@ impl Extension for Interrupter {
     const VERSION: u32 = 1;
 
     fn contribute(&self, r: &mut Registrar) {
-        r.on(self.clone());
-    }
-}
-
-impl Hook for Interrupter {
-    fn permission(&self, _: &str, _: &Value) -> Permission {
-        if let Some(session) = self.0.get().and_then(Weak::upgrade) {
-            session.interrupt();
-        }
-        Permission::Allow
+        let this = self.clone();
+        r.on::<point::Permission>(move |_, _| {
+            if let Some(session) = this.0.get().and_then(Weak::upgrade) {
+                session.interrupt();
+            }
+            Permission::Allow
+        });
     }
 }
 
@@ -970,9 +992,9 @@ impl Hook for Interrupter {
 fn an_interrupt_while_a_call_is_gated_starts_nothing() {
     let interrupter = Interrupter::default();
     let fixture = Fixture::new(
-        agent::Kind::Echo,
+        ext_builtin::agents::ECHO,
         echoing(&Policy::default())
-            .with_in(agent::Tier::Guarded, &interrupter)
+            .with_in(ext::Tier::Guarded, &interrupter)
             .unwrap(),
         openai(&Script::new(&[])),
     );
@@ -1005,7 +1027,7 @@ fn an_interrupt_while_a_call_is_gated_starts_nothing() {
 #[test]
 fn an_interrupt_before_recovery_starts_stops_it() {
     let fixture = Fixture::new(
-        agent::Kind::Echo,
+        ext_builtin::agents::ECHO,
         echoing(&Policy::default()),
         openai(&Script::new(&[])),
     );
@@ -1140,7 +1162,7 @@ struct Extras;
 
 struct Jobs;
 
-impl agent::Command for Jobs {
+impl ext::Command for Jobs {
     const NAME: &'static str = "jobs";
     const DESCRIPTION: &'static str = "Lists jobs.";
 
@@ -1155,40 +1177,37 @@ impl Extension for Extras {
     const VERSION: u32 = 1;
 
     fn contribute(&self, r: &mut Registrar) {
-        r.command(Jobs).on(Extras);
-    }
-}
-
-impl Hook for Extras {
-    fn input(&self, text: &str) -> agent::Said {
-        match text {
-            "no" => agent::Said::Reject("not that".into()),
-            text if text.starts_with("shout ") => agent::Said::Replace(text.to_uppercase()),
-            _ => agent::Said::Pass,
-        }
-    }
-
-    fn pre_tool(&self, tool: &str, input: &Value) -> agent::Pre {
-        if tool != "bash" || input["background"] == true {
-            return agent::Pre::Pass;
-        }
-        let mut input = input.clone();
-        input["background"] = true.into();
-        agent::Pre::Replace(input)
-    }
-
-    fn request_error(&self, request: &llm::Request, _: &str) -> Option<llm::Request> {
-        Some(llm::Request {
-            model: "retried".into(),
-            ..request.clone()
-        })
+        r.command(Jobs)
+            .on::<point::Input>(|_, text| match text {
+                "no" => Rewrite::Stop("not that".into()),
+                text if text.starts_with("shout ") => Rewrite::Replace(text.to_uppercase()),
+                _ => Rewrite::Pass,
+            })
+            .on::<point::PreTool>(|_, call| {
+                if call.tool != "bash" || call.input["background"] == true {
+                    return Rewrite::Pass;
+                }
+                let mut input = call.input.clone();
+                input["background"] = true.into();
+                Rewrite::Replace(input)
+            })
+            .on::<point::RequestError>(|_, failed| {
+                Some(llm::Request {
+                    model: "retried".into(),
+                    ..failed.request.clone()
+                })
+            });
     }
 }
 
 #[test]
 fn slash_commands_run_without_a_turn_and_input_hooks_rewrite_or_refuse() {
     let registry = Registry::default().with(&Extras).unwrap();
-    let fixture = Fixture::new(agent::Kind::Echo, registry, openai(&Script::new(&[])));
+    let fixture = Fixture::new(
+        ext_builtin::agents::ECHO,
+        registry,
+        openai(&Script::new(&[])),
+    );
     let session = fixture.start(&[]);
     session.submit("/jobs all of them".into()).unwrap();
     session.submit("/nope".into()).unwrap();
@@ -1235,7 +1254,7 @@ fn slash_commands_run_without_a_turn_and_input_hooks_rewrite_or_refuse() {
             &echo("SHOUT HI"),
         ]
     );
-    assert!(replay(agent::Kind::Echo.agent().as_mut(), &log).is_empty());
+    assert!(replay(&mut ext_builtin::agents::Echo, &log).is_empty());
     assert!(untaken(&log).is_empty());
 
     // A command cut off by a crash is not run again; the input queued
@@ -1278,7 +1297,7 @@ fn the_model_gets_the_prompt_and_the_logged_context_first() {
     let replies = cassette("openai/streaming_grammar/tool_then_followup_text.yaml");
     let script = Script::new(&replies[1..]);
     let fixture = Fixture::new(
-        agent::Kind::Chat,
+        ext_builtin::agents::CHAT,
         echoing(&Policy::default()),
         openai(&script),
     );
@@ -1318,7 +1337,7 @@ fn the_model_gets_the_prompt_and_the_logged_context_first() {
 fn a_failed_request_is_retried_as_a_hook_asks() {
     let registry = Registry::default().with(&Extras).unwrap();
     let script = Script::new(&[]);
-    let fixture = Fixture::new(agent::Kind::Chat, registry, openai(&script));
+    let fixture = Fixture::new(ext_builtin::agents::CHAT, registry, openai(&script));
     let session = fixture.start(&[]);
     session.submit("hi".into()).unwrap();
     settle(&session);
@@ -1350,7 +1369,7 @@ fn a_failed_request_is_retried_as_a_hook_asks() {
 #[test]
 fn the_shell_directory_survives_a_restart_and_an_interrupt_stops_a_call() {
     let fixture = Fixture::new(
-        agent::Kind::Echo,
+        ext_builtin::agents::ECHO,
         echoing(&Policy::default()),
         openai(&Script::new(&[])),
     );
@@ -1406,7 +1425,11 @@ fn the_shell_directory_survives_a_restart_and_an_interrupt_stops_a_call() {
 #[test]
 fn background_processes_keep_the_session_and_end_with_it() {
     let registry = echoing(&Policy::default()).with(&Extras).unwrap();
-    let fixture = Fixture::new(agent::Kind::Echo, registry, openai(&Script::new(&[])));
+    let fixture = Fixture::new(
+        ext_builtin::agents::ECHO,
+        registry,
+        openai(&Script::new(&[])),
+    );
     let session = fixture.start(&[]);
     session.submit("$ sleep 100".into()).unwrap();
     settle(&session);
@@ -1491,7 +1514,7 @@ fn a_steer_reaches_the_running_turn_before_the_model_is_next_asked() {
     let tools = Registry::default()
         .with(&HeldHarbor(Arc::clone(&release)))
         .unwrap();
-    let fixture = Fixture::new(agent::Kind::Chat, tools, openai(&script));
+    let fixture = Fixture::new(ext_builtin::agents::CHAT, tools, openai(&script));
     let session = fixture.start(&[]);
     session
         .submit("Call the tool, then answer.".into())
@@ -1538,7 +1561,7 @@ fn an_interrupt_stops_the_model_call_and_ends_the_turn() {
         settings: crate::config::Settings::new(gpt_home(), None),
         http: Arc::new(Silent),
     };
-    let fixture = Fixture::new(agent::Kind::Chat, Registry::default(), models);
+    let fixture = Fixture::new(ext_builtin::agents::CHAT, Registry::default(), models);
     let session = fixture.start(&[]);
     session.submit("hi".into()).unwrap();
     until(&session, "called the model", |log| {
@@ -1564,7 +1587,7 @@ fn an_interrupted_turn_answers_the_calls_it_leaves_and_goes_no_further() {
     let tools = Registry::default()
         .with(&HeldHarbor(Arc::default()))
         .unwrap();
-    let fixture = Fixture::new(agent::Kind::Chat, tools, openai(&script));
+    let fixture = Fixture::new(ext_builtin::agents::CHAT, tools, openai(&script));
     let session = fixture.start(&[]);
     session
         .submit("Call the tool, then answer.".into())
@@ -1592,14 +1615,14 @@ fn an_interrupted_turn_answers_the_calls_it_leaves_and_goes_no_further() {
     );
     assert_eq!(script.sent().len(), 1, "no model call after the interrupt");
     // Recovery finds nothing left to do.
-    let mut chat = agent::Kind::Chat.agent();
+    let mut chat: Box<dyn Agent> = Box::new(ext_builtin::agents::Chat::default());
     assert_eq!(replay(chat.as_mut(), &log), []);
 }
 
 #[test]
 fn an_unsafe_call_cut_off_reports_the_output_it_committed() {
     let fixture = Fixture::new(
-        agent::Kind::Echo,
+        ext_builtin::agents::ECHO,
         echoing(&Policy::default()),
         openai(&Script::new(&[])),
     );
@@ -1631,7 +1654,7 @@ fn an_unsafe_call_cut_off_reports_the_output_it_committed() {
             card: None,
         }]
     );
-    let (output, error) = agent::Toolset::default().to_model(
+    let (output, error) = ext::host::Toolset::default().to_model(
         "bash",
         &Outcome::Interrupted {
             output: Some("one\n".into()),
@@ -1647,7 +1670,7 @@ fn an_unsafe_call_cut_off_reports_the_output_it_committed() {
 #[test]
 fn the_model_is_set_per_session_and_says_where_it_comes_from() {
     let fixture = Fixture::new(
-        agent::Kind::Echo,
+        ext_builtin::agents::ECHO,
         Registry::default(),
         openai(&Script::new(&[])),
     );
@@ -1698,7 +1721,7 @@ fn the_model_is_set_per_session_and_says_where_it_comes_from() {
 #[test]
 fn a_new_registry_generation_applies_from_the_next_step() {
     let fixture = Fixture::new(
-        agent::Kind::Echo,
+        ext_builtin::agents::ECHO,
         echoing(&Policy::default()),
         openai(&Script::new(&[])),
     );
@@ -1754,7 +1777,7 @@ fn input_waits_its_turn_behind_a_call_waiting_for_approval() {
 #[test]
 fn input_taken_in_during_recovery_runs_once() {
     let fixture = Fixture::new(
-        agent::Kind::Echo,
+        ext_builtin::agents::ECHO,
         Registry::default(),
         openai(&Script::new(&[])),
     );

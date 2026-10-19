@@ -359,7 +359,7 @@ fn spawn(
     Ok(spawn)
 }
 
-fn process(spawn: &Spawn) -> Process {
+pub(crate) fn process(spawn: &Spawn) -> Process {
     let mut cmd = Process::new(&spawn.argv[0]);
     cmd.args(&spawn.argv[1..])
         .env_clear()

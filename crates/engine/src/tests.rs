@@ -16,7 +16,7 @@ fn home(name: &str) -> (PathBuf, Home) {
 
 fn echo() -> Config {
     Config {
-        agent: Some(agent::Kind::Echo),
+        agent: Some(ext_builtin::agents::ECHO.into()),
         ..Config::default()
     }
 }
@@ -136,7 +136,7 @@ fn busy_sessions_recover_at_startup() {
 
     // The log's header predates extension records, so recovery notes them
     // first. The safe sleep runs again; the shell command is not rerun.
-    assert!(matches!(&got[2], Body::Extensions { installed } if installed.len() == 5));
+    assert!(matches!(&got[2], Body::Extensions { installed } if installed.len() == 6));
     assert!(matches!(
         &got[3],
         Body::ToolResult { call: 1, outcome: Outcome::Done { output }, card: None } if output.value()["slept"] == 0

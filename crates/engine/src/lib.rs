@@ -44,7 +44,7 @@ pub struct Config {
     pub drain: Duration,
     /// `chat` or `echo` (which needs no model): overrides the config files'
     /// `agent`.
-    pub agent: Option<agent::Kind>,
+    pub agent: Option<String>,
     /// Tools whose calls wait for the user's approval.
     pub ask: Vec<String>,
     /// The system prompt, in place of the one the extensions make.
@@ -81,14 +81,19 @@ impl Config {
 
     /// The built-in extensions, registered as any other. The echo agent's
     /// `sleep` is a test fixture: no model is offered it.
-    fn registry(&self) -> Result<agent::Registry, agent::Refused> {
-        let registry = agent::builtins(&agent::Policy {
+    fn registry(&self) -> Result<ext::host::Registry, ext::Refused> {
+        let policy = ext_builtin::Policy {
             ask: self.ask.clone(),
-        })?;
-        match self.agent {
-            Some(agent::Kind::Echo) => registry.with(&agent::Fixtures),
-            _ => Ok(registry),
+        };
+        let registry = ext_builtin::registry(&policy, self.agent.as_deref())?;
+        if let Some(name) = self
+            .agent
+            .as_deref()
+            .filter(|&n| !registry.agents().any(|a| a == n))
+        {
+            return Err(ext::Refused(format!("no agent named {name} is registered")));
         }
+        Ok(registry)
     }
 }
 
@@ -100,11 +105,7 @@ impl From<sys::config::Daemon> for Config {
             idle: secs(file.idle_secs, defaults.idle),
             hibernate: secs(file.hibernate_secs, defaults.hibernate),
             drain: secs(file.drain_secs, defaults.drain),
-            agent: file.agent.and_then(|name| {
-                name.parse()
-                    .map_err(|e| eprintln!("agent `{name}` in [daemon]: {e}"))
-                    .ok()
-            }),
+            agent: file.agent,
             ask: file.ask,
             system_prompt: file.system_prompt.filter(|prompt| !prompt.is_empty()),
             crash_limit: file.crash_limit.map_or(defaults.crash_limit, |n| {
@@ -249,10 +250,10 @@ impl Daemon {
             .collect();
         let rt: rt::Rt = Arc::new(rt::Threads::default());
         let models = model::Models {
-            settings: config::Settings::new(home.config_file(), config.agent),
+            settings: config::Settings::new(home.config_file(), config.agent.clone()),
             http: Arc::new(llm::Ureq::new(Arc::clone(&rt))),
         };
-        let registry = agent::Current::new(config.registry().map_err(io::Error::other)?);
+        let registry = ext::host::Current::new(config.registry().map_err(io::Error::other)?);
         let daemon = Arc::new_cyclic(|daemon| Self {
             shared: Arc::new(Shared {
                 rt,
@@ -536,7 +537,7 @@ impl Daemon {
                 }
                 // A stopped call gets the time its processes have to go
                 // and its outcome to commit.
-                let settled = stopped.map(|at| at + agent::Kill::GRACE * 2);
+                let settled = stopped.map(|at| at + ext::Kill::GRACE * 2);
                 if !self.has_work() || settled.is_some_and(|at| now >= at) {
                     for session in self.live() {
                         session.stop();

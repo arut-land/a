@@ -1,0 +1,34 @@
+[package]
+name = "ext-builtin"
+version.workspace = true
+edition.workspace = true
+publish.workspace = true
+
+[features]
+default = ["policy", "prompt", "shell", "edit", "chat"]
+# Which calls wait for the user's approval.
+policy = []
+# The identity line and the facts the model is first given.
+prompt = []
+# `bash`, and the working directory and process spawner it provides.
+shell = ["dep:vte"]
+# `edit`, which needs the working directory the shell provides.
+edit = ["shell"]
+# The model-backed `chat` agent.
+chat = []
+# The `echo` agent and the `sleep` tool, for tests; never in a release.
+fixtures = ["shell"]
+
+[dependencies]
+ext.workspace = true
+llm.workspace = true
+protocol.workspace = true
+rt.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+sys.workspace = true
+# Terminal escape sequences, dropped from command output.
+vte = { version = "0.15", default-features = false, optional = true }
+
+[lints]
+workspace = true

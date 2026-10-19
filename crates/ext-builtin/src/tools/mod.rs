@@ -1,17 +1,22 @@
 //! The tools the built-in extensions offer: `bash` and `edit`, and a
 //! `sleep` for tests.
 
+#[cfg(feature = "edit")]
 pub mod edit;
 mod output;
 pub mod shell;
 
+#[cfg(any(test, feature = "fixtures"))]
 use std::time::Duration;
 
+#[cfg(any(test, feature = "fixtures"))]
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
+#[cfg(any(test, feature = "fixtures"))]
 use crate::{Cx, Replay, Tool};
 
+#[cfg(feature = "edit")]
 pub use edit::Edit;
 pub use shell::Bash;
 
@@ -22,18 +27,22 @@ fn schema(text: &str) -> Value {
 
 /// Waits: a safe tool, so tests can watch a call that recovery reruns. Only
 /// the `fixtures` extension offers it.
+#[cfg(any(test, feature = "fixtures"))]
 pub struct Sleep;
 
+#[cfg(any(test, feature = "fixtures"))]
 #[derive(Deserialize)]
 pub struct Seconds {
     pub seconds: u64,
 }
 
+#[cfg(any(test, feature = "fixtures"))]
 #[derive(Serialize, Deserialize)]
 pub struct Slept {
     pub slept: u64,
 }
 
+#[cfg(any(test, feature = "fixtures"))]
 impl Tool for Sleep {
     type In = Seconds;
     type Out = Slept;
