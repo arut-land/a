@@ -12,8 +12,8 @@ use rustix::process::{Pid, Signal, kill_process};
 
 #[test]
 fn the_full_screen_client_shows_replies_and_answers_approvals_by_click() {
-    let mut env = Env::new("tui-full");
-    env.vars.push(("A_ASK", "bash"));
+    let env = Env::new("tui-full");
+    env.daemon("ask = [\"bash\"]");
     let mut term = env.tty(&[], 100, 30);
     // The first frame does not wait for the daemon.
     term.wait_for("F1 help");
@@ -55,7 +55,7 @@ fn the_full_screen_client_shows_replies_and_answers_approvals_by_click() {
 #[test]
 fn the_inline_client_prints_the_transcript_into_the_scrollback() {
     let mut env = Env::new("tui-inline");
-    env.vars.push(("A_ASK", "bash"));
+    env.daemon("ask = [\"bash\"]");
     let mut term = env.tty(&[], 80, 24);
     term.wait_for("● live");
     term.send(b"$ echo first\r");

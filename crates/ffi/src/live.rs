@@ -11,18 +11,18 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
 use std::time::Duration;
 
-use boltffi::{EventSubscription, export};
+use boltffi::{EventSubscription, StreamProducer, export};
 use client::{Connection, Endpoint, Reader, Writer};
 use protocol::view::Link;
-use protocol::{ClientDecl, ClientMsg, Environment, SessionId, Target};
+use protocol::{ClientDecl, ClientMsg, DaemonMsg, Environment, SessionId, SettingsChange, Target};
 use rt::{Runtime, Threads};
 use sys::install::CliLink;
 use sys::{Home, Staged};
 
 use crate::feed::{Feed, lock};
 use crate::{
-    CliStatus, ClientError, EnvVar, OpenTarget, Resync, SessionInfo, SessionSnapshot, Settings,
-    ViewChange, ViewUpdate,
+    CliStatus, ClientError, EnvVar, OpenTarget, Resync, SessionListUpdate, SessionSnapshot,
+    Settings, ViewChange, ViewUpdate,
 };
 
 fn runtime() -> &'static Threads {
@@ -132,62 +132,34 @@ impl Client {
         self.daemon.home.daemon_log().display().to_string()
     }
 
-    /// The daemon's sessions, starting it if needed.
-    pub async fn sessions(&self) -> Result<Vec<SessionInfo>, ClientError> {
-        let daemon = self.daemon.clone();
-        blocking(move || {
-            let sessions = daemon.connect()?.sessions()?;
-            Ok(sessions.iter().map(Into::into).collect())
-        })
-        .await
-    }
-
     /// The pid of the running daemon, if one is.
     pub fn daemon_pid(&self) -> Option<u32> {
         client::diagnose(&self.daemon.home).pid
     }
 
-    /// `$A_HOME/config.toml`, as the settings pane shows it.
-    pub fn settings(&self) -> Result<Settings, ClientError> {
-        let path = self.daemon.home.config_file();
-        let config = sys::Config::read(&path)?;
-        Ok(Settings {
-            model: config.model,
-            agent: config.agent,
-            env: config
-                .env
-                .into_iter()
-                .map(|(name, value)| EnvVar { name, value })
-                .collect(),
-            path: path.display().to_string(),
-        })
+    /// `$A_HOME/config.toml`, where the settings are kept.
+    pub fn config_file(&self) -> String {
+        self.daemon.home.config_file().display().to_string()
     }
 
-    /// Writes `settings` to `$A_HOME/config.toml` (0600, replaced whole),
-    /// keeping comments and keys the pane does not show. The daemon reads
-    /// the file again when it changes.
-    pub fn save_settings(&self, settings: Settings) -> Result<(), ClientError> {
-        let given = |s: Option<String>| s.map(|s| s.trim().to_owned()).filter(|s| !s.is_empty());
-        let mut env = BTreeMap::new();
-        for EnvVar { name, value } in settings.env {
-            let name = name.trim().to_owned();
-            if name.is_empty() {
-                continue;
-            }
-            if !sys::config::is_var_name(&name) {
-                return Err(ClientError::InvalidArgument {
-                    message: format!("not a variable name: {name}"),
-                });
-            }
-            env.insert(name, value);
-        }
-        let config = sys::Config {
-            model: given(settings.model),
-            agent: given(settings.agent),
-            env,
-        };
-        config.write(&self.daemon.home.config_file())?;
-        Ok(())
+    /// The model and provider variables sessions fall back on, as the
+    /// daemon has them.
+    pub async fn settings(&self) -> Result<Settings, ClientError> {
+        let daemon = self.daemon.clone();
+        blocking(move || Ok(daemon.connect()?.settings(None)?.into())).await
+    }
+
+    /// Saves the user's edit of the settings `from` into `to`. Only what
+    /// changed is sent, so the daemon, the file's one writer, keeps what
+    /// another client saved meanwhile. Returns the settings as saved.
+    pub async fn save_settings(
+        &self,
+        from: Settings,
+        to: Settings,
+    ) -> Result<Settings, ClientError> {
+        let change = change(from, to)?;
+        let daemon = self.daemon.clone();
+        blocking(move || Ok(daemon.connect()?.settings(Some(change))?.into())).await
     }
 
     /// What `a` resolves to with `dir` in front of `search` (a `PATH`;
@@ -231,6 +203,100 @@ impl Client {
             Ok(())
         })
         .await
+    }
+}
+
+/// How long a session watch waits to reconnect after losing the daemon.
+const REWATCH: Duration = Duration::from_secs(1);
+
+/// The daemon's session list as it changes, pushed by the daemon over one
+/// connection: subscribe to `updates`, then `start`.
+pub struct SessionWatch {
+    daemon: Daemon,
+    producer: Arc<StreamProducer<SessionListUpdate>>,
+    /// The open connection's write half, for the detach that ends it.
+    writer: Arc<Mutex<Option<Writer>>>,
+    /// Set when the watch is dropped: its reader stops reconnecting.
+    done: Arc<AtomicBool>,
+    started: AtomicBool,
+}
+
+#[export]
+impl SessionWatch {
+    pub fn new(client: &Client) -> Self {
+        Self {
+            daemon: client.daemon.clone(),
+            producer: Arc::new(StreamProducer::new(64)),
+            writer: Arc::default(),
+            done: Arc::default(),
+            started: AtomicBool::new(false),
+        }
+    }
+
+    /// The list now and after each change.
+    #[ffi_stream(item = SessionListUpdate)]
+    pub fn updates(&self) -> Arc<EventSubscription<SessionListUpdate>> {
+        self.producer.subscribe()
+    }
+
+    /// Watches until dropped, starting the daemon if needed and again
+    /// after it restarts (an upgrade, say); while it cannot be reached an
+    /// update says why. Starts once.
+    pub fn start(&self) {
+        if self.started.swap(true, Ordering::AcqRel) {
+            return;
+        }
+        let (daemon, producer) = (self.daemon.clone(), Arc::clone(&self.producer));
+        let (writer, done) = (Arc::clone(&self.writer), Arc::clone(&self.done));
+        runtime().spawn_blocking(Box::new(move || {
+            while !done.load(Ordering::Acquire) {
+                let problem = match daemon.connect().and_then(|mut conn| {
+                    conn.watch_sessions()?;
+                    Ok(conn)
+                }) {
+                    Ok(Connection {
+                        mut reader,
+                        writer: w,
+                        ..
+                    }) => {
+                        *lock(&writer) = Some(w);
+                        loop {
+                            match reader.recv() {
+                                Ok(Some(DaemonMsg::Sessions { sessions })) => {
+                                    producer.push(SessionListUpdate {
+                                        sessions: sessions.iter().map(Into::into).collect(),
+                                        problem: None,
+                                    });
+                                }
+                                Ok(Some(_)) => {}
+                                Ok(None) => break "the daemon closed the connection".to_owned(),
+                                Err(e) => break e.to_string(),
+                            }
+                        }
+                    }
+                    Err(e) => e.to_string(),
+                };
+                lock(&writer).take();
+                if done.load(Ordering::Acquire) {
+                    return;
+                }
+                producer.push(SessionListUpdate {
+                    sessions: Vec::new(),
+                    problem: Some(problem),
+                });
+                std::thread::sleep(REWATCH);
+            }
+        }));
+    }
+}
+
+/// Released by the app: the daemon is told, and the reader then ends.
+impl Drop for SessionWatch {
+    fn drop(&mut self) {
+        self.done.store(true, Ordering::Release);
+        if let Some(mut writer) = lock(&self.writer).take() {
+            let _ = writer.send(&ClientMsg::Detach);
+        }
     }
 }
 
@@ -291,14 +357,14 @@ impl Session {
         let (target, workspace, env) = match target {
             OpenTarget::New { workspace } => {
                 let dir = PathBuf::from(workspace);
-                (Target::New, sys::workspace_of(&dir), Some(dir))
+                (Target::New, dir.clone(), Some(dir))
             }
             OpenTarget::Latest {
                 workspace,
                 any_workspace,
             } => (
                 Target::Latest { any_workspace },
-                sys::workspace_of(Path::new(&workspace)),
+                PathBuf::from(workspace),
                 None,
             ),
             OpenTarget::Id { id } => (Target::Id(parse_id(&id)?), PathBuf::new(), None),
@@ -370,6 +436,43 @@ impl Drop for Session {
             let _ = writer.send(&ClientMsg::Detach);
         }
     }
+}
+
+/// What the user changed going from `from` to `to`, with names and values
+/// trimmed as the pane shows them and blank names skipped.
+fn change(from: Settings, to: Settings) -> Result<SettingsChange, ClientError> {
+    let vars = |vars: Vec<EnvVar>| -> BTreeMap<String, String> {
+        vars.into_iter()
+            .map(|EnvVar { name, value }| (name.trim().to_owned(), value))
+            .filter(|(name, _)| !name.is_empty())
+            .collect()
+    };
+    let (old, new) = (vars(from.env), vars(to.env));
+    if let Some(bad) = new.keys().find(|name| !sys::config::is_var_name(name)) {
+        return Err(ClientError::InvalidArgument {
+            message: format!("not a variable name: {bad}"),
+        });
+    }
+    let mut env: BTreeMap<String, Option<String>> = old
+        .keys()
+        .filter(|name| !new.contains_key(*name))
+        .map(|name| (name.clone(), None))
+        .collect();
+    env.extend(
+        new.into_iter()
+            .filter(|(name, value)| old.get(name) != Some(value))
+            .map(|(name, value)| (name, Some(value))),
+    );
+    let given = |s: Option<String>| s.map_or_else(String::new, |s| s.trim().to_owned());
+    let changed = |old: Option<String>, new: Option<String>| {
+        let (old, new) = (given(old), given(new));
+        (old != new).then_some(new)
+    };
+    Ok(SettingsChange {
+        model: changed(from.model, to.model),
+        agent: changed(from.agent, to.agent),
+        env,
+    })
 }
 
 fn parse_id(id: &str) -> Result<SessionId, ClientError> {

@@ -50,13 +50,12 @@ fn read_request(reader: &mut BufReader<TcpStream>) {
 /// A session on `gpt-5.6` at the provider on `port`, over ureq.
 fn over_ureq(port: u16) -> (Fixture, PathBuf) {
     let home = std::env::temp_dir().join(format!("a-engine-port-{port}.toml"));
-    let env = format!("[env]\nOPENAI_BASE_URL = \"http://127.0.0.1:{port}/v1\"\n");
+    let env = format!(
+        "model = \"gpt-5.6\"\n[env]\nOPENAI_API_KEY = \"daemon\"\nOPENAI_BASE_URL = \"http://127.0.0.1:{port}/v1\"\n"
+    );
     std::fs::write(&home, env).unwrap();
     let models = Models {
-        settings: crate::config::Settings {
-            process: daemon_env,
-            ..crate::config::Settings::new(home.clone(), Some("gpt-5.6".into()), None)
-        },
+        settings: crate::config::Settings::new(home.clone(), None),
         http: Arc::new(llm::Ureq::new(Arc::new(rt::Threads::new(1)))),
     };
     let fixture = Fixture::new(agent::Kind::Chat, Registry::default(), models);

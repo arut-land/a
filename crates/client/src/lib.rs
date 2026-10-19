@@ -13,8 +13,8 @@ use std::time::{Duration, Instant};
 
 use protocol::view::SessionList;
 use protocol::{
-    Cap, Caps, ClientDecl, ClientMsg, DaemonMsg, Environment, SessionSummary, Target, read_frame,
-    write_frame,
+    Cap, Caps, ClientDecl, ClientMsg, DaemonMsg, Environment, HomeSettings, SessionSummary,
+    SettingsChange, Target, read_frame, write_frame,
 };
 use sys::crash::{Crashes, Record};
 use sys::{Home, Signal, Staged};
@@ -75,27 +75,27 @@ impl Welcome {
 }
 
 impl Connection {
-    /// The workspace a session attached over this connection works in and
-    /// the environment its commands run with: this process's, or a remote
-    /// daemon's bridge's, never this machine's paths on another.
-    pub fn origin(&self) -> io::Result<(PathBuf, Environment)> {
-        if let Some(env) = &self.remote {
-            return Ok((env.cwd.clone(), env.clone()));
+    /// The environment a session attached over this connection runs its
+    /// commands with: this process's, or a remote daemon's bridge's, never
+    /// this machine's paths on another.
+    pub fn origin(&self) -> io::Result<Environment> {
+        match &self.remote {
+            Some(env) => Ok(env.clone()),
+            None => capture(),
         }
-        let env = capture()?;
-        Ok((sys::workspace_of(&env.cwd), env))
     }
 
     /// The attach to `target` from this connection's [`origin`], replaying
     /// the entries after `since`; with the origin's environment when
-    /// `with_env`, else the session keeps the one it has.
+    /// `with_env`, else the session keeps the one it has. The daemon finds
+    /// the workspace from the origin's directory.
     ///
     /// [`origin`]: Connection::origin
     pub fn attach(&self, target: Target, since: u64, with_env: bool) -> io::Result<ClientMsg> {
-        let (workspace, env) = self.origin()?;
+        let env = self.origin()?;
         Ok(ClientMsg::Attach {
             target,
-            workspace,
+            workspace: env.cwd.clone(),
             since,
             env: with_env.then_some(env),
             decl: ClientDecl::default(),
@@ -105,6 +105,39 @@ impl Connection {
     /// Sends each of `msgs`.
     pub fn send_all(&mut self, msgs: &[ClientMsg]) -> io::Result<()> {
         msgs.iter().try_for_each(|msg| self.writer.send(msg))
+    }
+
+    /// The home settings, after making `change` to them. The daemon is
+    /// their one writer; a change it refuses (a bad variable name, a file
+    /// it cannot parse) is `InvalidInput`, saying why.
+    pub fn settings(mut self, change: Option<SettingsChange>) -> io::Result<HomeSettings> {
+        if !self.welcome.caps.has(Cap::Settings) {
+            return Err(io::Error::new(
+                io::ErrorKind::Unsupported,
+                "the daemon is older than this a; restart it to edit settings",
+            ));
+        }
+        self.writer.send(&ClientMsg::Settings { change })?;
+        let (settings, error) = self.reader.until(|msg| match msg {
+            DaemonMsg::Settings { settings, error } => Some((settings, error)),
+            _ => None,
+        })?;
+        match error {
+            Some(error) => Err(io::Error::new(io::ErrorKind::InvalidInput, error)),
+            None => Ok(settings),
+        }
+    }
+
+    /// Asks for the session list now and on every change, as
+    /// [`DaemonMsg::Sessions`].
+    pub fn watch_sessions(&mut self) -> io::Result<()> {
+        if !self.welcome.caps.has(Cap::Sessions) {
+            return Err(io::Error::new(
+                io::ErrorKind::Unsupported,
+                "the daemon is older than this a; restart it to watch sessions",
+            ));
+        }
+        self.writer.send(&ClientMsg::WatchSessions)
     }
 
     /// The daemon's sessions.
@@ -232,7 +265,7 @@ pub fn connect_with(
     for _ in 0..3 {
         let (stream, mut conn) = match endpoint {
             Endpoint::Local(home) => {
-                let (stream, started) = connect_or_spawn(home)?;
+                let (stream, started) = connect_or_spawn(home, false)?;
                 let timeout = if started {
                     START_TIMEOUT
                 } else {
@@ -380,6 +413,8 @@ fn hello(conn: &mut Connection, build: &str, first: &[ClientMsg]) -> io::Result<
         Some(DaemonMsg::Mismatch { supported, min }) => {
             Ok(Greeting::Mismatch(Versions::new(min, supported)))
         }
+        // A daemon refusing to serve at all, after a crash loop.
+        Some(DaemonMsg::Error { message }) => Err(io::Error::other(message)),
         _ => Err(io::ErrorKind::UnexpectedEof.into()),
     }
 }
@@ -391,7 +426,7 @@ pub struct Diagnosis {
     /// What that daemon recorded about itself.
     pub record: Option<Record>,
     pub log: PathBuf,
-    /// Recent crashes, and whether clients have stopped respawning.
+    /// The last crash.
     pub crashes: Crashes,
 }
 
@@ -413,26 +448,14 @@ impl Diagnosis {
         tail
     }
 
-    /// What to tell a person about recent crashes, if anything.
+    /// What to tell a person about the last crash, if any.
     pub fn crash_note(&self) -> Option<String> {
         let last = self.crashes.last.as_ref()?;
         let summary = fs::read_to_string(last)
             .ok()
             .and_then(|text| text.lines().next().map(str::to_owned))
             .unwrap_or_default();
-        let breaker = if self.crashes.tripped() {
-            format!(
-                "; it crashed {} times in a row soon after starting, so it is not restarted \
-                 automatically (`a daemon restart` tries again)",
-                self.crashes.young
-            )
-        } else {
-            String::new()
-        };
-        Some(format!(
-            "last crash: {summary} ({}){breaker}",
-            last.display()
-        ))
+        Some(format!("last crash: {summary} ({})", last.display()))
     }
 }
 
@@ -460,14 +483,25 @@ fn live_daemon(home: &Home) -> Option<Record> {
         .ok()
 }
 
-/// Stops the daemon: SIGTERM, then SIGKILL if it still holds its lock after
-/// `HELLO_TIMEOUT`. Each signal goes only to the process the daemon
-/// recorded, checked by its start time as well as its pid. Returns whether
-/// a daemon was running.
+/// Stops the daemon: asked over its socket, as an idle one stops; else, as
+/// for one too old to be asked or too wedged to answer, SIGTERM, then
+/// SIGKILL if it still holds its lock after `HELLO_TIMEOUT`. Each signal
+/// goes only to the process the daemon recorded, checked by its start time
+/// as well as its pid. Returns whether a daemon was running.
 pub fn stop(home: &Home) -> io::Result<bool> {
     let Some(daemon) = live_daemon(home) else {
         return Ok(false);
     };
+    #[cfg(unix)]
+    if ask_to_stop(home, &daemon.build).is_ok() {
+        let deadline = Instant::now() + HELLO_TIMEOUT;
+        while live_daemon(home).is_some_and(|d| d.pid == daemon.pid) && Instant::now() < deadline {
+            thread::sleep(Duration::from_millis(5));
+        }
+        if live_daemon(home).is_none_or(|d| d.pid != daemon.pid) {
+            return Ok(true);
+        }
+    }
     let signal = |signal| {
         if !daemon.is_live() {
             return Err(io::Error::other(format!(
@@ -498,11 +532,84 @@ pub fn stop(home: &Home) -> io::Result<bool> {
     Ok(true)
 }
 
-/// Stops any running daemon and connects to a fresh one, even after the
-/// crash-loop breaker stopped respawning it.
+/// Connects to the running daemon, as its own build `build` so as not to
+/// set off a drain, without starting one.
+#[cfg(unix)]
+fn reach(home: &Home, build: &str) -> io::Result<(UnixStream, Connection)> {
+    let stream = UnixStream::connect(home.socket())?;
+    read_timeout(&stream, Some(HELLO_TIMEOUT))?;
+    let mut conn = split(&stream)?;
+    match hello(&mut conn, build, &[])? {
+        Greeting::Welcome if conn.welcome.caps.has(Cap::Daemon) => Ok((stream, conn)),
+        _ => Err(io::Error::new(
+            io::ErrorKind::Unsupported,
+            "the daemon cannot be asked",
+        )),
+    }
+}
+
+/// Asks the daemon to stop, and waits for it to close the connection as
+/// it exits.
+#[cfg(unix)]
+fn ask_to_stop(home: &Home, build: &str) -> io::Result<()> {
+    let (stream, mut conn) = reach(home, build)?;
+    conn.writer.send(&ClientMsg::Shutdown)?;
+    read_timeout(&stream, Some(DRAIN_TIMEOUT))?;
+    conn.reader.drained()
+}
+
+/// What the running daemon says of itself, if one runs and answers; never
+/// starts one.
+#[cfg(unix)]
+pub fn status(home: &Home) -> io::Result<Option<Status>> {
+    let Some(daemon) = live_daemon(home) else {
+        return Ok(None);
+    };
+    let (_, mut conn) = reach(home, &daemon.build)?;
+    conn.writer.send(&ClientMsg::Status)?;
+    conn.reader
+        .until(|msg| match msg {
+            DaemonMsg::Status {
+                pid,
+                build,
+                started,
+                clients,
+                known,
+            } => Some(Status {
+                pid,
+                build,
+                started,
+                clients,
+                sessions: known,
+            }),
+            _ => None,
+        })
+        .map(Some)
+}
+
+#[cfg(not(unix))]
+pub fn status(_home: &Home) -> io::Result<Option<Status>> {
+    Err(unsupported())
+}
+
+/// What a daemon says of itself; see [`status`].
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Status {
+    pub pid: u32,
+    pub build: String,
+    /// Seconds since the Unix epoch at start.
+    pub started: u64,
+    /// Connections open, this one included.
+    pub clients: u32,
+    pub sessions: u32,
+}
+
+/// Stops any running daemon and connects to a fresh one, which serves even
+/// after the crash-loop breaker stopped the last ones.
 pub fn restart(home: &Home, staged: &Staged) -> io::Result<Connection> {
     stop(home)?;
-    sys::crash::reset(home)?;
+    #[cfg(unix)]
+    drop(connect_or_spawn(home, true)?);
     connect(&Endpoint::Local(home.clone()), staged, &|| {})
 }
 
@@ -516,7 +623,7 @@ pub fn restart(home: &Home, staged: &Staged) -> io::Result<Connection> {
 /// done.
 #[cfg(unix)]
 pub fn bridge(home: &Home, token: &str) -> io::Result<()> {
-    let (stream, _) = connect_or_spawn(home)?;
+    let (stream, _) = connect_or_spawn(home, false)?;
     let env = ClientMsg::Environment(capture()?);
     let mut stdout = io::stdout().lock();
     writeln!(stdout, "{} {token} env", remote::SYNC)?;
@@ -549,12 +656,27 @@ fn pump(mut from: impl Read, mut to: impl Write) -> io::Result<()> {
     }
 }
 
-/// Zero-lag start: when no daemon is listening, bind the socket here, hand the
-/// listening fd to a detached daemon running `runtime/current`, and connect
-/// straight into its backlog. Says whether it started that daemon.
+/// All a daemon takes of the environment of the client that starts it:
+/// enough for its own processes to find their tools and a temporary
+/// directory. It serves every client, so nothing of one client's (keys,
+/// `A_*` settings) may reach the others: what a session runs with comes
+/// from its own client's attach, and the daemon's settings from
+/// `config.toml`.
 #[cfg(unix)]
-fn connect_or_spawn(home: &Home) -> io::Result<(UnixStream, bool)> {
-    use std::fs::OpenOptions;
+const DAEMON_ENV: &[&str] = &[
+    "HOME", "USER", "LOGNAME", "SHELL", "PATH", "TMPDIR", "LANG", "LC_ALL", "LC_CTYPE", "TZ",
+];
+
+/// Zero-lag start: when no daemon is listening, take the daemon lock, bind
+/// the socket here, hand both to a detached daemon running
+/// `runtime/current`, and connect straight into its backlog. The lock goes
+/// with the fd, so it is held from here until the daemon exits, and only
+/// that daemon reaps a dead predecessor or refuses to serve after a crash
+/// loop (`reset` clears the loop first). Says whether it started that
+/// daemon.
+#[cfg(unix)]
+fn connect_or_spawn(home: &Home, reset: bool) -> io::Result<(UnixStream, bool)> {
+    use std::os::fd::AsRawFd;
     use std::os::unix::fs::{DirBuilderExt, PermissionsExt};
     use std::process::{Command, Stdio};
 
@@ -569,46 +691,54 @@ fn connect_or_spawn(home: &Home) -> io::Result<(UnixStream, bool)> {
         .mode(0o700)
         .create(&run)?;
     fs::set_permissions(&run, fs::Permissions::from_mode(0o700))?;
-    let lock = File::create(home.spawn_lock())?;
-    lock.lock()?;
-    if let Ok(stream) = UnixStream::connect(&socket) {
-        return Ok((stream, false));
-    }
-    sys::crash::reap_unlocked(home)?;
-    let crashes = Crashes::of(home);
-    if crashes.tripped() {
-        let report = crashes
-            .last
-            .map_or_else(String::new, |p| format!("; see {}", p.display()));
-        return Err(io::Error::other(format!(
-            "the daemon crashed {} times in a row soon after starting{report}; \
-             `a daemon restart` tries again",
-            crashes.young
-        )));
+    let lock = File::options()
+        .create(true)
+        .truncate(false)
+        .read(true)
+        .write(true)
+        .open(home.daemon_pid_file())?;
+    // Held: a daemon is starting, and binds before it does, or exiting, and
+    // unlinks the socket first. Only one wedged between the two keeps it.
+    let deadline = Instant::now() + HELLO_TIMEOUT;
+    while let Err(held) = lock.try_lock() {
+        if let fs::TryLockError::Error(e) = held {
+            return Err(e);
+        }
+        if let Ok(stream) = UnixStream::connect(&socket) {
+            return Ok((stream, false));
+        }
+        if Instant::now() >= deadline {
+            return Err(io::Error::new(
+                io::ErrorKind::TimedOut,
+                "the daemon holds its lock but is not listening",
+            ));
+        }
+        thread::sleep(Duration::from_millis(5));
     }
 
     let listener = home.bind()?;
-    let fd = sys::make_inheritable(&listener)?;
-
-    let log_path = home.daemon_log();
-    if let Some(dir) = log_path.parent() {
-        fs::create_dir_all(dir)?;
-    }
-    let log = OpenOptions::new()
-        .create(true)
-        .append(true)
-        .open(log_path)?;
+    let (listen_fd, lock_fd) = (listener.as_raw_fd(), lock.as_raw_fd());
     // The daemon leaves this process's session (`setsid`) as it starts, so
-    // it outlives this client, its terminal and its app. Reaped here should
-    // it exit first, so a long-lived client (the app) collects no zombies.
-    let mut daemon = Command::new(home.runtime().current_exe())
-        .args(["__daemon", "--listen-fd", &fd.to_string()])
+    // it outlives this client, its terminal and its app, and opens its own
+    // log. Reaped here should it exit first, so a long-lived client (the
+    // app) collects no zombies.
+    let inherited = DAEMON_ENV
+        .iter()
+        .filter_map(|&name| Some((name, std::env::var_os(name)?)));
+    let mut cmd = Command::new(home.runtime().current_exe());
+    cmd.args(["__daemon", "--listen-fd", &listen_fd.to_string()])
+        .args(["--lock-fd", &lock_fd.to_string()])
+        .args(reset.then_some("--reset-breaker"))
+        .env_clear()
+        .envs(inherited)
+        .env("A_HOME", home.root())
         .stdin(Stdio::null())
         .stdout(Stdio::null())
-        .stderr(log)
-        .spawn()?;
+        .stderr(Stdio::null());
+    sys::pass_fds(&mut cmd, [listen_fd, lock_fd]);
+    let mut daemon = cmd.spawn()?;
     thread::spawn(move || daemon.wait());
-    drop(listener);
+    drop((listener, lock));
     Ok((UnixStream::connect(&socket)?, true))
 }
 
@@ -661,30 +791,6 @@ mod tests {
         let _ = fs::remove_dir_all(&root);
         fs::create_dir_all(root.join("run")).unwrap();
         (root.clone(), Home::from(root))
-    }
-
-    #[test]
-    fn a_tripped_breaker_stops_the_respawning() {
-        let (root, home) = scratch("breaker");
-        let dead = Record {
-            pid: 999_997,
-            ..Record::current("b1")
-        };
-        for _ in 0..sys::crash::LIMIT {
-            fs::write(home.daemon_pid_file(), dead.to_string()).unwrap();
-            sys::crash::reap_unlocked(&home).unwrap();
-        }
-        let told = connect_or_spawn(&home).unwrap_err().to_string();
-        let note = diagnose(&home).crash_note().unwrap();
-        fs::remove_dir_all(&root).unwrap();
-        assert!(
-            told.contains("crashed 3 times") && told.contains("a daemon restart"),
-            "{told}"
-        );
-        assert!(
-            note.contains("pid 999997") && note.contains("not restarted"),
-            "{note}"
-        );
     }
 
     #[test]

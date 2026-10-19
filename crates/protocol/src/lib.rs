@@ -441,8 +441,13 @@ pub enum Outcome {
 #[serde(rename_all = "snake_case")]
 pub enum Target {
     New,
-    Latest { any_workspace: bool },
+    Latest {
+        any_workspace: bool,
+    },
     Id(SessionId),
+    /// The one session whose id starts with this, in full or short form.
+    /// Only sent with [`Cap::Sessions`].
+    Prefix(String),
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -579,11 +584,27 @@ pub enum Cap {
     /// The daemon takes [`ClientMsg::Steer`]; the first ones drop a
     /// connection that sends it.
     Steer,
+    /// The daemon takes [`ClientMsg::Settings`]: it is the one writer of
+    /// `$A_HOME/config.toml`.
+    Settings,
+    /// The daemon takes [`ClientMsg::WatchSessions`] and attaches to a
+    /// [`Target::Prefix`].
+    Sessions,
+    /// The daemon takes [`ClientMsg::Status`] and [`ClientMsg::Shutdown`].
+    Daemon,
 }
 
 impl Cap {
     /// Every capability this build knows.
-    pub const ALL: [Self; 4] = [Self::Snapshot, Self::Ack, Self::Declare, Self::Steer];
+    pub const ALL: [Self; 7] = [
+        Self::Snapshot,
+        Self::Ack,
+        Self::Declare,
+        Self::Steer,
+        Self::Settings,
+        Self::Sessions,
+        Self::Daemon,
+    ];
 
     pub const fn name(self) -> &'static str {
         match self {
@@ -591,6 +612,9 @@ impl Cap {
             Self::Ack => "ack",
             Self::Declare => "declare",
             Self::Steer => "steer",
+            Self::Settings => "settings",
+            Self::Sessions => "sessions",
+            Self::Daemon => "daemon",
         }
     }
 
@@ -662,6 +686,35 @@ impl<'de> Deserialize<'de> for Caps {
             .filter(|c| names.iter().any(|n| n == c.name()))
             .collect())
     }
+}
+
+/// The defaults in `$A_HOME/config.toml` a settings pane edits: what a
+/// model call uses when its session does not say.
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct HomeSettings {
+    /// `host[@protocol]:model`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub model: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub agent: Option<String>,
+    /// Provider variables, such as `OPENAI_API_KEY`.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub env: BTreeMap<String, String>,
+}
+
+/// A change to the [`HomeSettings`]: only what it names changes, so two
+/// clients saving at once never undo each other's change.
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SettingsChange {
+    /// The new model; empty removes it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub model: Option<String>,
+    /// The new agent; empty removes it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub agent: Option<String>,
+    /// Variables to set, or with `null`, remove.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub env: BTreeMap<String, Option<String>>,
 }
 
 /// The protocol versions a peer speaks, `min..=max`.
@@ -806,7 +859,10 @@ pub enum ClientMsg {
         caps: Caps,
     },
     /// `env` is the client's, for the commands the session runs; without
-    /// one the session keeps the environment it had.
+    /// one the session keeps the environment it had. `workspace` is the
+    /// directory the client is in: the daemon takes the git working tree it
+    /// is in (with `env`'s git variables) as the workspace. (Daemons before
+    /// that take it as it is.)
     Attach {
         target: Target,
         workspace: PathBuf,
@@ -835,6 +891,22 @@ pub enum ClientMsg {
     },
     List,
     Detach,
+    /// Asks for [`DaemonMsg::Sessions`] now and whenever a session's
+    /// summary changes, for as long as the connection lasts. Only sent with
+    /// [`Cap::Sessions`].
+    WatchSessions,
+    /// Asks for [`DaemonMsg::Status`]. Only sent with [`Cap::Daemon`].
+    Status,
+    /// Stops the daemon, as an idle one stops; the connection closes as it
+    /// exits. Only sent with [`Cap::Daemon`].
+    Shutdown,
+    /// Asks for the [`HomeSettings`], after making `change` to them if
+    /// there is one; answered with [`DaemonMsg::Settings`]. Only sent with
+    /// [`Cap::Settings`].
+    Settings {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        change: Option<SettingsChange>,
+    },
     /// Answers the [`DaemonMsg::Ask`] for tool call `call`.
     Approve {
         call: u64,
@@ -881,7 +953,11 @@ impl ClientMsg {
             | Self::Declare(_)
             | Self::Environment(_)
             | Self::List
-            | Self::Detach => None,
+            | Self::Detach
+            | Self::WatchSessions
+            | Self::Status
+            | Self::Shutdown
+            | Self::Settings { .. } => None,
         }
     }
 }
@@ -929,6 +1005,24 @@ pub enum DaemonMsg {
     },
     Sessions {
         sessions: Vec<SessionSummary>,
+    },
+    /// The answer to [`ClientMsg::Status`].
+    Status {
+        pid: u32,
+        build: String,
+        /// Seconds since the Unix epoch at start.
+        started: u64,
+        /// Open connections, the asking one included.
+        clients: u32,
+        /// Sessions the daemon knows, loaded or not.
+        known: u32,
+    },
+    /// The answer to [`ClientMsg::Settings`]: the settings as they are now,
+    /// and why its change was not made, if it was not.
+    Settings {
+        settings: HomeSettings,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        error: Option<String>,
     },
     /// Sent after `Synced` when the replay held entries.
     Recap(Recap),
@@ -1038,6 +1132,8 @@ impl DaemonMsg {
             | Self::Mismatch { .. }
             | Self::Draining
             | Self::Sessions { .. }
+            | Self::Settings { .. }
+            | Self::Status { .. }
             | Self::Error { .. }
             | Self::Ack { .. }
             | Self::Rejected { .. }
@@ -1469,6 +1565,17 @@ mod tests {
             },
             DaemonMsg::Synced { seq: 1 },
             DaemonMsg::Sessions { sessions: vec![] },
+            DaemonMsg::Settings {
+                settings: HomeSettings::default(),
+                error: None,
+            },
+            DaemonMsg::Status {
+                pid: 1,
+                build: "b".into(),
+                started: 0,
+                clients: 1,
+                known: 0,
+            },
             DaemonMsg::Recap(Recap::default()),
             DaemonMsg::Ask {
                 call: 1,
@@ -1505,6 +1612,8 @@ mod tests {
                 | DaemonMsg::Delta { .. }
                 | DaemonMsg::Synced { .. }
                 | DaemonMsg::Sessions { .. }
+                | DaemonMsg::Settings { .. }
+                | DaemonMsg::Status { .. }
                 | DaemonMsg::Recap(_)
                 | DaemonMsg::Ask { .. }
                 | DaemonMsg::Error { .. }

@@ -22,8 +22,8 @@ use uuid::Uuid;
 use crate::view::{Approval, Item, SessionView, Status, Usage};
 use crate::{
     Body, Caps, Card, ClientDecl, ClientMsg, DaemonMsg, Decision, Decode, Entry, Environment,
-    Installed, Json, Origin, Outcome, Overrides, Recap, Rejection, Role, SessionId, SessionSummary,
-    Target,
+    HomeSettings, Installed, Json, Origin, Outcome, Overrides, Recap, Rejection, Role, SessionId,
+    SessionSummary, SettingsChange, Target,
 };
 
 /// A field every variant that has it requires.
@@ -94,6 +94,10 @@ enum Tag {
     Steer,
     List,
     Detach,
+    WatchSessions,
+    Status,
+    Shutdown,
+    Settings,
     Approve,
     Interrupt,
     Welcome,
@@ -127,6 +131,8 @@ impl Tag {
             | Self::Delta
             | Self::Synced
             | Self::Sessions
+            | Self::Status
+            | Self::Settings
             | Self::Recap
             | Self::Ask
             | Self::Error
@@ -141,6 +147,8 @@ impl Tag {
             | Self::Steer
             | Self::List
             | Self::Detach
+            | Self::WatchSessions
+            | Self::Shutdown
             | Self::Approve
             | Self::Interrupt
             | Self::Unknown => false,
@@ -223,6 +231,12 @@ struct Fields {
     reason: Option<Rejection>,
     items: Option<Vec<Item>>,
     environment: Option<Environment>,
+    pid: Option<u32>,
+    started: Option<u64>,
+    clients: Option<u32>,
+    known: Option<u32>,
+    settings: Option<HomeSettings>,
+    error: Option<String>,
     // A client's.
     target: Option<Target>,
     since: Option<u64>,
@@ -232,6 +246,7 @@ struct Fields {
     sites: Option<Vec<String>>,
     client_seq: Option<u64>,
     approved: Option<bool>,
+    change: Option<SettingsChange>,
     // An item's.
     #[serde(rename = "type")]
     ty: Option<Type>,
@@ -400,6 +415,17 @@ impl Fields {
             Tag::Sessions => DaemonMsg::Sessions {
                 sessions: req(f.sessions.take(), "sessions")?,
             },
+            Tag::Status => DaemonMsg::Status {
+                pid: req(f.pid.take(), "pid")?,
+                build: req(f.build.take(), "build")?,
+                started: req(f.started.take(), "started")?,
+                clients: req(f.clients.take(), "clients")?,
+                known: req(f.known.take(), "known")?,
+            },
+            Tag::Settings => DaemonMsg::Settings {
+                settings: req(f.settings.take(), "settings")?,
+                error: f.error.take(),
+            },
             Tag::Recap => DaemonMsg::Recap(Recap {
                 prompt: f.prompt.take(),
                 tools: req(f.tools.take(), "tools")?,
@@ -440,6 +466,8 @@ impl Fields {
             | Tag::Steer
             | Tag::List
             | Tag::Detach
+            | Tag::WatchSessions
+            | Tag::Shutdown
             | Tag::Approve
             | Tag::Interrupt
             | Tag::Unknown => DaemonMsg::Unknown { seq: None },
@@ -483,6 +511,12 @@ impl Fields {
             },
             Tag::List => ClientMsg::List,
             Tag::Detach => ClientMsg::Detach,
+            Tag::WatchSessions => ClientMsg::WatchSessions,
+            Tag::Status => ClientMsg::Status,
+            Tag::Shutdown => ClientMsg::Shutdown,
+            Tag::Settings => ClientMsg::Settings {
+                change: f.change.take(),
+            },
             Tag::Approve => ClientMsg::Approve {
                 call: req(f.call.take(), "call")?,
                 approved: req(f.approved.take(), "approved")?,

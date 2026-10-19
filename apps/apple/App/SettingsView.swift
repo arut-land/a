@@ -34,7 +34,9 @@ struct ModelSettings: View {
     @State private var modelName = ""
     @State private var agent: String?
     @State private var vars: [VarRow] = []
-    @State private var path = ""
+    /// The settings as last loaded or saved: a save sends only the edit
+    /// made since, so it keeps what another client saved meanwhile.
+    @State private var loaded: AFfi.Settings?
     @State private var problem: String?
     @State private var saved = false
 
@@ -87,26 +89,30 @@ struct ModelSettings: View {
                         Label("Saved", systemImage: "checkmark").foregroundStyle(.secondary).font(.caption)
                     }
                     Spacer()
-                    Button("Revert", action: load)
-                    Button("Save", action: save).keyboardShortcut("s").buttonStyle(.borderedProminent)
+                    Button("Revert") { Task { await load() } }
+                    Button("Save") { Task { await save() } }
+                        .keyboardShortcut("s").buttonStyle(.borderedProminent)
                 }
             } footer: {
-                Text("Saved to \(path), readable only by you. Sessions use these when their shell does not set them; the daemon picks up changes on its next model call.")
+                Text("Saved by the daemon to \(model.client?.configFile() ?? "config.toml"), readable only by you. Sessions use these when their shell does not set them, from their next model call on.")
                     .font(.caption).foregroundStyle(.secondary)
             }
         }
         .formStyle(.grouped)
-        .onAppear(perform: load)
+        .task { await load() }
     }
 
-    private func load() {
+    private func show(_ settings: AFfi.Settings) {
+        loaded = settings
+        modelName = settings.model ?? ""
+        agent = settings.agent
+        vars = settings.env.map { VarRow(name: $0.name, value: $0.value) }
+    }
+
+    private func load() async {
         guard let client = model.client else { return }
         do {
-            let settings = try client.settings()
-            modelName = settings.model ?? ""
-            agent = settings.agent
-            vars = settings.env.map { VarRow(name: $0.name, value: $0.value) }
-            path = settings.path
+            show(try await client.settings())
             problem = nil
         } catch {
             problem = error.localizedDescription
@@ -114,12 +120,12 @@ struct ModelSettings: View {
         saved = false
     }
 
-    private func save() {
-        guard let client = model.client else { return }
+    private func save() async {
+        guard let client = model.client, let loaded else { return }
         let env = vars.map { EnvVar(name: $0.name, value: $0.value) }
         do {
-            try client.saveSettings(
-                settings: Settings(model: modelName, agent: agent, env: env, path: path))
+            show(try await client.saveSettings(
+                from: loaded, to: AFfi.Settings(model: modelName, agent: agent, env: env)))
             problem = nil
             saved = true
         } catch {

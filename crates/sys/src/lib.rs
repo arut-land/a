@@ -20,7 +20,7 @@ mod workspace;
 
 use std::fs::File;
 use std::io;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 pub use awake::Awake;
 pub use config::Config;
@@ -54,12 +54,13 @@ impl Home {
         Ok(root.into())
     }
 
-    pub fn run_dir(&self) -> PathBuf {
-        self.root.join("run")
+    /// `$A_HOME`, else `~/.a`.
+    pub fn root(&self) -> &Path {
+        &self.root
     }
 
-    pub fn spawn_lock(&self) -> PathBuf {
-        self.run_dir().join("daemon.lock")
+    pub fn run_dir(&self) -> PathBuf {
+        self.root.join("run")
     }
 
     /// Locked by the running daemon for its whole life, and holds its pid.
@@ -182,7 +183,7 @@ mod other {
 mod unix {
     use std::fs;
     use std::io;
-    use std::os::fd::{AsFd, AsRawFd, FromRawFd, RawFd};
+    use std::os::fd::{AsFd, FromRawFd, RawFd};
     use std::os::unix::fs::{DirBuilderExt, MetadataExt};
     use std::os::unix::net::UnixListener;
     use std::path::PathBuf;
@@ -192,11 +193,24 @@ mod unix {
 
     use super::fnv1a;
 
-    /// Lets a spawned child inherit `listener`; returns its fd number.
-    pub fn make_inheritable(listener: &UnixListener) -> io::Result<RawFd> {
-        let fd = listener.as_fd();
-        fcntl_setfd(fd, fcntl_getfd(fd)? - FdFlags::CLOEXEC)?;
-        Ok(fd.as_raw_fd())
+    /// Lets the child `cmd` starts inherit `fds`, and only it: they stay
+    /// close-on-exec in this process, so no child another thread starts
+    /// meanwhile holds the listener or the lock.
+    pub fn pass_fds<const N: usize>(cmd: &mut std::process::Command, fds: [RawFd; N]) {
+        use std::os::fd::BorrowedFd;
+        use std::os::unix::process::CommandExt;
+        // SAFETY: between fork and exec the hook only calls fcntl, which is
+        // async-signal-safe, and allocates nothing. The fds are open in the
+        // parent, so in the child too.
+        unsafe {
+            cmd.pre_exec(move || {
+                for fd in fds {
+                    let fd = BorrowedFd::borrow_raw(fd);
+                    fcntl_setfd(fd, fcntl_getfd(fd)? - FdFlags::CLOEXEC)?;
+                }
+                Ok(())
+            });
+        }
     }
 
     impl super::Home {
@@ -456,6 +470,23 @@ mod unix {
             fcntl_getfd(listener.as_fd())? | FdFlags::CLOEXEC,
         )?;
         Ok(listener)
+    }
+
+    /// Adopts the locked daemon record our parent passed down as `fd`: the
+    /// lock is the open file's, so it is ours now, and was never free.
+    pub fn adopt_lock(fd: RawFd) -> io::Result<fs::File> {
+        // SAFETY: the parent (`a` itself) passes the fd number of the file
+        // it opened and locked for us; nothing else in this process owns
+        // that fd. `metadata` below rejects anything that is not a file.
+        let file = unsafe { fs::File::from_raw_fd(fd) };
+        if !file.metadata()?.is_file() {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "the lock fd is not a file",
+            ));
+        }
+        fcntl_setfd(file.as_fd(), fcntl_getfd(file.as_fd())? | FdFlags::CLOEXEC)?;
+        Ok(file)
     }
 }
 

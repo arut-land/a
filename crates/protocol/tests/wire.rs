@@ -17,8 +17,8 @@ use std::path::{Path, PathBuf};
 use protocol::view::SessionView;
 use protocol::{
     Activity, Body, Cap, Caps, Card, ClientDecl, ClientMsg, DaemonMsg, Decision, Decode, Entry,
-    Environment, Installed, Origin, Outcome, Overrides, PROTO, Permission, Recap, Rejection,
-    Residency, Role, SessionId, SessionSummary, Target,
+    Environment, HomeSettings, Installed, Origin, Outcome, Overrides, PROTO, Permission, Recap,
+    Rejection, Residency, Role, SessionId, SessionSummary, SettingsChange, Target,
 };
 use serde_json::json;
 use uuid::Uuid;
@@ -188,6 +188,39 @@ fn client_samples() -> Vec<Sample<ClientMsg>> {
             ClientMsg::Interrupt {
                 client_seq: Some(3),
             },
+        ),
+        gated(
+            "settings",
+            ClientMsg::Settings { change: None },
+            Cap::Settings,
+        ),
+        gated("watch_sessions", ClientMsg::WatchSessions, Cap::Sessions),
+        gated(
+            "attach_prefix",
+            ClientMsg::Attach {
+                target: Target::Prefix("0190a".into()),
+                workspace: "/w".into(),
+                since: 0,
+                env: None,
+                decl: ClientDecl::default(),
+            },
+            Cap::Sessions,
+        ),
+        gated("status", ClientMsg::Status, Cap::Daemon),
+        gated("shutdown", ClientMsg::Shutdown, Cap::Daemon),
+        gated(
+            "settings_change",
+            ClientMsg::Settings {
+                change: Some(SettingsChange {
+                    model: Some("openai:gpt-6-luna".into()),
+                    agent: Some(String::new()),
+                    env: BTreeMap::from([
+                        ("OPENAI_API_KEY".into(), Some("sk-x".into())),
+                        ("OLD".into(), None),
+                    ]),
+                }),
+            },
+            Cap::Settings,
         ),
     ]
 }
@@ -586,6 +619,37 @@ fn daemon_samples() -> Vec<Sample<DaemonMsg>> {
                 message: "call 9 is not waiting for approval".into(),
             },
             Cap::Ack,
+        ),
+        gated(
+            "settings",
+            DaemonMsg::Settings {
+                settings: HomeSettings {
+                    model: Some("openai:gpt-6-luna".into()),
+                    agent: None,
+                    env: BTreeMap::from([("OPENAI_API_KEY".into(), "sk-x".into())]),
+                },
+                error: None,
+            },
+            Cap::Settings,
+        ),
+        gated(
+            "status",
+            DaemonMsg::Status {
+                pid: 4242,
+                build: "0.0.0+0123456789abcdef".into(),
+                started: 1_760_000_000,
+                clients: 2,
+                known: 7,
+            },
+            Cap::Daemon,
+        ),
+        gated(
+            "settings_refused",
+            DaemonMsg::Settings {
+                settings: HomeSettings::default(),
+                error: Some("not a variable name: \"A B\"".into()),
+            },
+            Cap::Settings,
         ),
     ]
 }

@@ -1275,11 +1275,11 @@ impl Session {
             .shared
             .system
             .clone()
-            .unwrap_or_else(|| registry.system_prompt());
+            .unwrap_or_else(|| registry.system_prompt().to_owned());
         if !system.is_empty() {
             history.insert(0, llm::Message::system(system));
         }
-        model.request(history, tools.specs())
+        model.request(history, registry.specs().to_vec())
     }
 
     /// `model`'s reply to `request`, retried as the `request_error` hooks
