@@ -1,33 +1,210 @@
 //! The internally tagged enums, decoded in one pass. Serde's derive for
 //! one buffers the object to find its tag, then decodes the variant from
 //! the buffer, in code of its own for every variant. Here every record on
-//! the wire (a client's message, the daemon's, an entry, a transcript item)
-//! is read into one flat struct holding the tags and the fields of all of
-//! them, each optional; a match on the tag then builds the variant and
+//! the wire is read into one flat struct of its family (an entry, a
+//! message, a snapshot's item) holding the tags and the fields of all its
+//! kinds, each optional; a match on the tag then builds the variant and
 //! names a required field that is missing.
 //!
-//! So a field name means one type across all of them: where two differ
+//! So a field name means one type across a family: where two differ
 //! (`input`, a tool call's JSON and a link's text), the field is [`Json`]
-//! and the variant reads its type from it. A `null` reads as absent, but
-//! for a [`Json`] field, where it is the value.
+//! and the variant reads its type from it ([`Field`]). A `null` reads as
+//! absent, but for a [`Json`] field, where it is the value.
+//!
+//! Each union is declared once, with [`kinds!`]: its variants, their tags,
+//! their [`Class`](crate::Class), how each decodes and, for kinds no longer
+//! written, what each means now. What it declares is what the enum, its
+//! serializer, its decoder and its tag table are made of, so a kind cannot
+//! be in one and not the others.
 
 use std::collections::BTreeMap;
+use std::fmt;
 use std::path::PathBuf;
 
 use serde::de::{Deserializer, Error as _, Visitor};
 use serde::{Deserialize, forward_to_deserialize_any};
 use serde_json::{Error, Result};
-use uuid::Uuid;
 
 use crate::view::{Approval, Item, SessionView, Status, Usage};
 use crate::{
-    Body, Caps, Card, ClientDecl, ClientMsg, CommandInfo, DaemonMsg, Decision, Decode, Entry,
-    Environment, HomeSettings, Installed, Json, Origin, Outcome, Overrides, Recap, Rejection, Role,
-    SessionId, SessionSummary, SettingsChange, Target,
+    Audience, Author, Body, CallId, Caps, Card, ClientDecl, ClientId, ClientMsg, CommandInfo,
+    DaemonMsg, Decision, Decode, Entry, Environment, HomeSettings, Installed, Json, Mode, Origin,
+    Outcome, Overrides, Permission, Recap, Rejection, Role, Seq, SessionId, SessionSummary,
+    SettingsChange, Target, Verdict, WaitOn,
 };
 
+/// Declares a tagged union of the wire, one line per kind:
+///
+/// ```text
+/// /// docs
+/// Name "tag" { field: Type, field: Type = default } = Class, read path, was { field } => v2;
+/// ```
+///
+/// - a field without `= default` is required; one with it reads as its
+///   default when absent and is left out when it is the default;
+/// - `( Type )` is a newtype variant, which `read path` decodes;
+/// - `read path` decodes the kind with `path(&mut F)` instead, `F` the
+///   union's flat fields (`in F`);
+/// - `= Class` (in a union declared `class`) classifies it;
+/// - `was { fields } => expr` (in a union declared `shims`) marks a kind
+///   only earlier builds write: `expr` is what it means in today's kinds,
+///   `None` when it names nothing (a call 0).
+///
+/// A union declared `class` alone (the daemon's messages) also names the
+/// variant decoding yields for a message of a kind it does not know:
+/// `unknown Name { fields } = Class;`.
+///
+/// It makes the enum (tag and kind names as given, so the encoder writes
+/// what the decoder reads), `TAGS` (checked distinct at compile time),
+/// `knows`, the one-pass decoder `read`, and `class` and `shim` when asked.
+macro_rules! kinds {
+    (
+        $(#[$meta:meta])*
+        $vis:vis enum $E:ident: $slot:ident = $tag:literal in $F:ident, class, shims {
+            $(
+                $(#[$vmeta:meta])*
+                $V:ident $vtag:literal
+                $({ $( $(#[$fmeta:meta])* $f:ident : $fty:ty $(= $m:ident)? ),* $(,)? })?
+                $(( $nty:ty ))?
+                = $class:ident
+                $(, read $dec:path)?
+                $(, was $was:tt => $shim:expr)?
+            ;)*
+        }
+        else $fallback:expr
+    ) => {
+        kinds! { @union [$(#[$meta])*] $vis $E $F $slot $tag [$fallback] [] [$(
+            [$(#[$vmeta])*] $V $vtag [$({ $( [$(#[$fmeta])*] $f : $fty $(= $m)? ),* })?] [$(( $nty ))?] [$($dec)?]
+        )*] }
+
+        impl $E {
+            /// How an entry of this kind stands to the log.
+            pub const fn class(&self) -> $crate::Class {
+                match self {
+                    $(Self::$V { .. } => $crate::Class::$class,)*
+                }
+            }
+
+            /// This entry as today's kinds say it: itself, unless it is of a
+            /// kind only earlier builds write (which still decode as they
+            /// were written, so their lines stay what was sent); `None` for
+            /// one that names nothing.
+            pub fn shim(&self) -> Option<::std::borrow::Cow<'_, Self>> {
+                match self {
+                    $($(Self::$V $was => $shim.map(::std::borrow::Cow::Owned),)?)*
+                    _ => Some(::std::borrow::Cow::Borrowed(self)),
+                }
+            }
+        }
+    };
+    (
+        $(#[$meta:meta])*
+        $vis:vis enum $E:ident: $slot:ident = $tag:literal in $F:ident, class {
+            $(
+                $(#[$vmeta:meta])*
+                $V:ident $vtag:literal
+                $({ $( $(#[$fmeta:meta])* $f:ident : $fty:ty $(= $m:ident)? ),* $(,)? })?
+                $(( $nty:ty ))?
+                = $class:tt
+                $(, read $dec:path)?
+            ;)*
+        }
+        $(#[$umeta:meta])*
+        unknown $U:ident { $( $uf:ident : $uty:ty ),* } = $uclass:ident;
+        else $fallback:expr
+    ) => {
+        kinds! { @union [$(#[$meta])*] $vis $E $F $slot $tag [$fallback]
+            [$(#[$umeta])* #[serde(skip)] $U { $( $uf: $uty ),* },]
+            [$(
+                [$(#[$vmeta])*] $V $vtag [$({ $( [$(#[$fmeta])*] $f : $fty $(= $m)? ),* })?] [$(( $nty ))?] [$($dec)?]
+            )*]
+        }
+
+        impl $E {
+            /// How the message stands to the session's log.
+            pub const fn class(&self) -> $crate::Class {
+                let this = self;
+                match this {
+                    $(Self::$V { .. } => kinds!(@class this $class),)*
+                    Self::$U { .. } => $crate::Class::$uclass,
+                }
+            }
+        }
+    };
+    (
+        $(#[$meta:meta])*
+        $vis:vis enum $E:ident: $slot:ident = $tag:literal in $F:ident {
+            $(
+                $(#[$vmeta:meta])*
+                $V:ident $vtag:literal
+                $({ $( $(#[$fmeta:meta])* $f:ident : $fty:ty $(= $m:ident)? ),* $(,)? })?
+                $(( $nty:ty ))?
+                $(, read $dec:path)?
+            ;)*
+        }
+        else $fallback:expr
+    ) => {
+        kinds! { @union [$(#[$meta])*] $vis $E $F $slot $tag [$fallback] [] [$(
+            [$(#[$vmeta])*] $V $vtag [$({ $( [$(#[$fmeta])*] $f : $fty $(= $m)? ),* })?] [$(( $nty ))?] [$($dec)?]
+        )*] }
+    };
+
+    (@union [$(#[$meta:meta])*] $vis:vis $E:ident $F:ident $slot:ident $tag:literal [$fallback:expr] [$($extra:tt)*] [$(
+        [$(#[$vmeta:meta])*] $V:ident $vtag:literal
+        [$({ $( [$(#[$fmeta:meta])*] $f:ident : $fty:ty $(= $m:ident)? ),* })?]
+        [$(( $nty:ty ))?]
+        [$($dec:path)?]
+    )*]) => {
+        $(#[$meta])*
+        #[serde(tag = $tag)]
+        $vis enum $E {
+            $(
+                $(#[$vmeta])*
+                #[serde(rename = $vtag)]
+                $V $({ $(
+                    $(#[$fmeta])*
+                    $(#[serde($m, skip_serializing_if = "crate::decode::skip")])?
+                    $f: $fty,
+                )* })? $(($nty))?,
+            )*
+            $($extra)*
+        }
+
+        impl $E {
+            /// The tag of every kind this build reads.
+            pub const TAGS: &'static [&'static str] = &[$($vtag),*];
+
+            /// Whether this build reads kind `tag`.
+            pub fn knows(tag: &str) -> bool {
+                Self::TAGS.contains(&tag)
+            }
+
+            /// Builds the kind its tag names from the fields read.
+            pub(crate) fn read(f: &mut $crate::decode::$F) -> ::serde_json::Result<Self> {
+                let tag = $crate::decode::req(f.$slot.take(), $tag)?;
+                Ok(match tag.as_str() {
+                    $($vtag => kinds!(@build $E $V f [$($dec)?] $({ $( $f $(= $m)? ),* })?),)*
+                    _ => return $fallback,
+                })
+            }
+        }
+
+        const _: () = assert!($crate::decode::distinct($E::TAGS), "two kinds share a tag");
+    };
+
+    (@build $E:ident $V:ident $f:ident [$dec:path] $($fields:tt)?) => { return $dec($f) };
+    (@build $E:ident $V:ident $f:ident []) => { $E::$V };
+    (@build $E:ident $V:ident $f:ident [] { $( $fld:ident $(= $m:ident)? ),* }) => {
+        $E::$V { $( $fld: kinds!(@read $f $fld $(= $m)?), )* }
+    };
+    (@read $f:ident $fld:ident) => { $crate::decode::need($f.$fld.take(), stringify!($fld))? };
+    (@read $f:ident $fld:ident = default) => { $crate::decode::def($f.$fld.take())? };
+    (@class $this:ident $class:ident) => { $crate::Class::$class };
+    (@class $this:ident ($by:path)) => { $by($this) };
+}
+
 /// A field every variant that has it requires.
-fn req<T>(field: Option<T>, name: &'static str) -> Result<T> {
+pub(crate) fn req<T>(field: Option<T>, name: &'static str) -> Result<T> {
     match field {
         Some(field) => Ok(field),
         None => Err(missing(name)),
@@ -41,9 +218,185 @@ fn missing(name: &'static str) -> Error {
     Error::missing_field(name)
 }
 
-/// A text field that shares its name with a [`Json`] one.
-fn text(field: Option<Json>, name: &'static str) -> Result<String> {
-    req(field, name)?.parse()
+/// A required field, as its variant has it.
+#[inline]
+pub(crate) fn need<S, T: Field<S>>(field: Option<S>, name: &'static str) -> Result<T> {
+    T::read(req(field, name)?)
+}
+
+/// A field that reads as its default when absent.
+#[inline]
+pub(crate) fn def<S, T: Field<S> + Default>(field: Option<S>) -> Result<T> {
+    field.map_or_else(|| Ok(T::default()), T::read)
+}
+
+/// Whether a field that reads as its default when absent is left out.
+pub(crate) fn skip<T: Default + PartialEq>(field: &T) -> bool {
+    *field == T::default()
+}
+
+/// Whether no two of `tags` are the same, at compile time.
+pub(crate) const fn distinct(tags: &[&str]) -> bool {
+    const fn same(a: &[u8], b: &[u8]) -> bool {
+        if a.len() != b.len() {
+            return false;
+        }
+        let mut i = 0;
+        while i < a.len() {
+            if a[i] != b[i] {
+                return false;
+            }
+            i += 1;
+        }
+        true
+    }
+    let mut i = 0;
+    while i < tags.len() {
+        let mut j = i + 1;
+        while j < tags.len() {
+            if same(tags[i].as_bytes(), tags[j].as_bytes()) {
+                return false;
+            }
+            j += 1;
+        }
+        i += 1;
+    }
+    true
+}
+
+/// A variant's field from the flat field of its name: the same value, or
+/// for a name two variants give different types, read from the [`Json`].
+pub(crate) trait Field<S>: Sized {
+    fn read(field: S) -> Result<Self>;
+}
+
+impl<S, T: Field<S>> Field<S> for Option<T> {
+    #[inline]
+    fn read(field: S) -> Result<Self> {
+        T::read(field).map(Some)
+    }
+}
+
+macro_rules! same {
+    ($($t:ty),* $(,)?) => {$(
+        impl Field<$t> for $t {
+            #[inline]
+            fn read(field: $t) -> Result<Self> {
+                Ok(field)
+            }
+        }
+    )*};
+}
+
+same!(
+    String,
+    bool,
+    u16,
+    u32,
+    u64,
+    Json,
+    Card,
+    Outcome,
+    Decision,
+    Permission,
+    Mode,
+    Seq,
+    Author,
+    SessionId,
+    PathBuf,
+    Caps,
+    Origin,
+    Rejection,
+    Target,
+    Environment,
+    ClientDecl,
+    HomeSettings,
+    SettingsChange,
+    Vec<String>,
+    Vec<Installed>,
+    Vec<CommandInfo>,
+    Vec<SessionSummary>,
+    Vec<Item>,
+);
+
+macro_rules! parsed {
+    ($($t:ty),* $(,)?) => {$(
+        impl Field<Json> for $t {
+            fn read(field: Json) -> Result<Self> {
+                field.parse()
+            }
+        }
+    )*};
+}
+
+parsed!(
+    String,
+    u32,
+    Seq,
+    Outcome,
+    ClientId,
+    Vec<Item>,
+    Vec<SessionSummary>
+);
+
+/// A call is an entry's seq, never 0.
+impl Field<u64> for CallId {
+    fn read(field: u64) -> Result<Self> {
+        Self::new(field).ok_or_else(|| Error::custom("call 0 names no entry"))
+    }
+}
+
+/// A caller a newer build has counts as neither the model nor the user.
+impl Field<String> for Audience {
+    fn read(field: String) -> Result<Self> {
+        Ok(match field.as_str() {
+            "model" => Self::Model,
+            "user" => Self::User,
+            _ => Self::Plugin,
+        })
+    }
+}
+
+/// A record's tag (`kind`, `t`, `d`) as read, kept inline: every record has
+/// one, and none is long. One longer than any reads as no tag of any kind.
+#[derive(Clone, Copy)]
+pub(crate) struct Tag {
+    len: u8,
+    bytes: [u8; Self::MAX],
+}
+
+impl Tag {
+    const MAX: usize = 22;
+
+    pub(crate) fn as_str(&self) -> &str {
+        std::str::from_utf8(&self.bytes[..usize::from(self.len)]).unwrap_or_default()
+    }
+}
+
+impl<'de> Deserialize<'de> for Tag {
+    fn deserialize<D: Deserializer<'de>>(d: D) -> std::result::Result<Self, D::Error> {
+        struct Read;
+        impl Visitor<'_> for Read {
+            type Value = Tag;
+
+            fn expecting(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+                f.write_str("a tag")
+            }
+
+            fn visit_str<E: serde::de::Error>(self, s: &str) -> std::result::Result<Tag, E> {
+                let mut tag = Tag {
+                    len: 0,
+                    bytes: [0; Tag::MAX],
+                };
+                if let Some(to) = tag.bytes.get_mut(..s.len()) {
+                    to.copy_from_slice(s.as_bytes());
+                    tag.len = u8::try_from(s.len()).unwrap_or_default();
+                }
+                Ok(tag)
+            }
+        }
+        d.deserialize_str(Read)
+    }
 }
 
 /// A [`Json`] field, `null` included: `None` only when absent, with
@@ -52,108 +405,149 @@ fn present<'de, D: Deserializer<'de>>(d: D) -> std::result::Result<Option<Json>,
     Json::deserialize(d).map(Some)
 }
 
-#[derive(Clone, Copy, PartialEq, Eq, Deserialize)]
-#[serde(rename_all = "snake_case")]
-enum Kind {
-    User,
-    Queued,
-    Steer,
-    Assistant,
-    ToolCall,
-    ToolProcess,
-    Progress,
-    ToolResult,
-    ModelCall,
-    ModelResult,
-    Hook,
-    Ask,
-    Link,
-    Watch,
-    Fired,
-    Environment,
-    Extensions,
-    Ext,
-    Context,
-    Command,
-    CommandResult,
-    Interrupt,
-    Settings,
-    #[serde(other)]
-    Unknown,
+// One set of flat fields per family of records (an entry, a message, a
+// snapshot's item), so each visitor holds the decoders of its own fields
+// only.
+
+/// An [`Entry`], or a [`Verdict`] within one.
+#[derive(Deserialize)]
+pub(crate) struct EntryFields {
+    pub(crate) seq: Option<u64>,
+    pub(crate) epoch: Option<u32>,
+    pub(crate) kind: Option<Tag>,
+    pub(crate) text: Option<String>,
+    pub(crate) mode: Option<Mode>,
+    pub(crate) taken: Option<bool>,
+    pub(crate) steer: Option<bool>,
+    pub(crate) queued: Option<u64>,
+    pub(crate) tool: Option<String>,
+    #[serde(default, deserialize_with = "present")]
+    pub(crate) input: Option<Json>,
+    pub(crate) id: Option<String>,
+    pub(crate) card: Option<Card>,
+    pub(crate) by: Option<String>,
+    pub(crate) call: Option<u64>,
+    pub(crate) pgid: Option<u32>,
+    pub(crate) boot: Option<String>,
+    pub(crate) background: Option<bool>,
+    pub(crate) outcome: Option<Outcome>,
+    pub(crate) model: Option<String>,
+    pub(crate) attempt: Option<u16>,
+    pub(crate) hook: Option<String>,
+    pub(crate) decision: Option<Decision>,
+    pub(crate) on: Option<Tag>,
+    #[serde(default, deserialize_with = "present")]
+    pub(crate) ui: Option<Json>,
+    pub(crate) link: Option<Seq>,
+    #[serde(default, deserialize_with = "present")]
+    pub(crate) value: Option<Json>,
+    pub(crate) origin: Option<Author>,
+    pub(crate) child: Option<SessionId>,
+    pub(crate) watch: Option<u64>,
+    pub(crate) cwd: Option<PathBuf>,
+    pub(crate) vars: Option<BTreeMap<String, String>>,
+    pub(crate) redacted: Option<Vec<String>>,
+    pub(crate) tty: Option<bool>,
+    pub(crate) installed: Option<Vec<Installed>>,
+    pub(crate) ext: Option<String>,
+    pub(crate) state: Option<String>,
+    #[serde(default, deserialize_with = "present")]
+    pub(crate) data: Option<Json>,
+    pub(crate) name: Option<String>,
+    pub(crate) args: Option<String>,
+    pub(crate) target: Option<Seq>,
+    pub(crate) upto: Option<Seq>,
+    #[serde(default, deserialize_with = "present")]
+    pub(crate) replace: Option<Json>,
+    // A decision's.
+    pub(crate) d: Option<Tag>,
+    pub(crate) permission: Option<Permission>,
+    pub(crate) reason: Option<String>,
+    pub(crate) approved: Option<bool>,
+    #[serde(default, deserialize_with = "present")]
+    pub(crate) original: Option<Json>,
+    pub(crate) error: Option<String>,
 }
 
-/// A message's `t`, the client's or the daemon's.
-#[derive(Clone, Copy, PartialEq, Eq, Deserialize)]
-#[serde(rename_all = "snake_case")]
-enum Tag {
-    Hello,
-    Attach,
-    Declare,
-    Environment,
-    Input,
-    Steer,
-    List,
-    Detach,
-    WatchSessions,
-    Status,
-    Shutdown,
-    Settings,
-    Approve,
-    Interrupt,
-    Welcome,
-    Mismatch,
-    Draining,
-    Attached,
-    Entry,
-    Delta,
-    Synced,
-    Sessions,
-    Recap,
-    Ask,
-    Error,
-    Snapshot,
-    Ack,
-    Rejected,
-    #[serde(other)]
-    Unknown,
+/// A [`ClientMsg`] or a [`DaemonMsg`] other than an entry.
+#[derive(Deserialize)]
+pub(crate) struct MsgFields {
+    pub(crate) t: Option<Tag>,
+    pub(crate) seq: Option<u64>,
+    pub(crate) call: Option<u64>,
+    pub(crate) text: Option<String>,
+    pub(crate) attempt: Option<u16>,
+    pub(crate) tool: Option<String>,
+    #[serde(default, deserialize_with = "present")]
+    pub(crate) input: Option<Json>,
+    pub(crate) proto: Option<u32>,
+    pub(crate) build: Option<String>,
+    pub(crate) caps: Option<Caps>,
+    pub(crate) client: Option<Json>,
+    pub(crate) commands: Option<Vec<CommandInfo>>,
+    pub(crate) supported: Option<u32>,
+    pub(crate) min: Option<u32>,
+    pub(crate) session: Option<SessionId>,
+    pub(crate) workspace: Option<PathBuf>,
+    pub(crate) sessions: Option<Json>,
+    pub(crate) prompt: Option<String>,
+    pub(crate) tools: Option<Vec<String>>,
+    pub(crate) failed: Option<u32>,
+    pub(crate) running: Option<u32>,
+    pub(crate) reply: Option<String>,
+    pub(crate) asks: Option<u32>,
+    pub(crate) message: Option<String>,
+    pub(crate) origin: Option<Origin>,
+    pub(crate) reason: Option<Rejection>,
+    pub(crate) items: Option<Json>,
+    pub(crate) environment: Option<Environment>,
+    pub(crate) pid: Option<u32>,
+    pub(crate) started: Option<u64>,
+    pub(crate) clients: Option<u32>,
+    pub(crate) known: Option<u32>,
+    pub(crate) settings: Option<HomeSettings>,
+    pub(crate) error: Option<String>,
+    pub(crate) cwd: Option<PathBuf>,
+    pub(crate) vars: Option<BTreeMap<String, String>>,
+    pub(crate) redacted: Option<Vec<String>>,
+    pub(crate) tty: Option<bool>,
+    // A client's.
+    pub(crate) target: Option<Target>,
+    pub(crate) since: Option<u64>,
+    pub(crate) env: Option<Environment>,
+    pub(crate) decl: Option<ClientDecl>,
+    pub(crate) role: Option<Role>,
+    pub(crate) sites: Option<Vec<String>>,
+    pub(crate) client_seq: Option<u64>,
+    pub(crate) approved: Option<bool>,
+    pub(crate) change: Option<SettingsChange>,
 }
 
-impl Tag {
-    /// Whether the daemon sends it: a daemon message tagged otherwise is of
-    /// a kind this build does not know.
-    const fn of_daemon(self) -> bool {
-        match self {
-            Self::Welcome
-            | Self::Mismatch
-            | Self::Draining
-            | Self::Attached
-            | Self::Entry
-            | Self::Delta
-            | Self::Synced
-            | Self::Sessions
-            | Self::Status
-            | Self::Settings
-            | Self::Recap
-            | Self::Ask
-            | Self::Error
-            | Self::Snapshot
-            | Self::Ack
-            | Self::Rejected => true,
-            Self::Hello
-            | Self::Attach
-            | Self::Declare
-            | Self::Environment
-            | Self::Input
-            | Self::Steer
-            | Self::List
-            | Self::Detach
-            | Self::WatchSessions
-            | Self::Shutdown
-            | Self::Approve
-            | Self::Interrupt
-            | Self::Unknown => false,
-        }
-    }
+/// An [`Item`] of a snapshot.
+#[derive(Deserialize)]
+struct ItemFields {
+    #[serde(rename = "type")]
+    ty: Option<Type>,
+    seq: Option<u64>,
+    text: Option<String>,
+    call: Option<u64>,
+    model: Option<String>,
+    status: Option<Status>,
+    usage: Option<Usage>,
+    tool: Option<String>,
+    #[serde(default, deserialize_with = "present")]
+    input: Option<Json>,
+    approval: Option<Approval>,
+    outcome: Option<Outcome>,
+    card: Option<Card>,
+    name: Option<String>,
+    args: Option<String>,
+    hook: Option<String>,
+    decision: Option<Decision>,
+    child: Option<SessionId>,
+    watch: Option<u64>,
+    fired: Option<Outcome>,
+    cwd: Option<PathBuf>,
 }
 
 #[derive(Clone, Copy, Deserialize)]
@@ -167,94 +561,6 @@ enum Type {
     Hook,
     Child,
     Environment,
-}
-
-/// An [`Entry`], a [`DaemonMsg`] (an entry among them), a [`ClientMsg`] or
-/// an [`Item`].
-#[derive(Deserialize)]
-struct Fields {
-    t: Option<Tag>,
-    // The entry's head.
-    seq: Option<u64>,
-    epoch: Option<u32>,
-    uuid: Option<Uuid>,
-    parent: Option<Uuid>,
-    // Its body.
-    kind: Option<Kind>,
-    text: Option<String>,
-    steer: Option<bool>,
-    queued: Option<u64>,
-    tool: Option<String>,
-    #[serde(default, deserialize_with = "present")]
-    input: Option<Json>,
-    id: Option<String>,
-    card: Option<Card>,
-    call: Option<u64>,
-    pgid: Option<u32>,
-    boot: Option<String>,
-    background: Option<bool>,
-    outcome: Option<Outcome>,
-    model: Option<String>,
-    hook: Option<String>,
-    decision: Option<Decision>,
-    child: Option<SessionId>,
-    watch: Option<u64>,
-    cwd: Option<PathBuf>,
-    vars: Option<BTreeMap<String, String>>,
-    redacted: Option<Vec<String>>,
-    tty: Option<bool>,
-    installed: Option<Vec<Installed>>,
-    ext: Option<String>,
-    state: Option<String>,
-    #[serde(default, deserialize_with = "present")]
-    data: Option<Json>,
-    name: Option<String>,
-    args: Option<String>,
-    // The other messages'.
-    proto: Option<u32>,
-    build: Option<String>,
-    caps: Option<Caps>,
-    client: Option<u32>,
-    commands: Option<Vec<CommandInfo>>,
-    supported: Option<u32>,
-    min: Option<u32>,
-    session: Option<SessionId>,
-    workspace: Option<PathBuf>,
-    sessions: Option<Vec<SessionSummary>>,
-    prompt: Option<String>,
-    tools: Option<Vec<String>>,
-    failed: Option<u32>,
-    running: Option<u32>,
-    reply: Option<String>,
-    asks: Option<u32>,
-    message: Option<String>,
-    origin: Option<Origin>,
-    reason: Option<Rejection>,
-    items: Option<Vec<Item>>,
-    environment: Option<Environment>,
-    pid: Option<u32>,
-    started: Option<u64>,
-    clients: Option<u32>,
-    known: Option<u32>,
-    settings: Option<HomeSettings>,
-    error: Option<String>,
-    // A client's.
-    target: Option<Target>,
-    since: Option<u64>,
-    env: Option<Environment>,
-    decl: Option<ClientDecl>,
-    role: Option<Role>,
-    sites: Option<Vec<String>>,
-    client_seq: Option<u64>,
-    approved: Option<bool>,
-    change: Option<SettingsChange>,
-    // An item's.
-    #[serde(rename = "type")]
-    ty: Option<Type>,
-    status: Option<Status>,
-    usage: Option<Usage>,
-    approval: Option<Approval>,
-    fired: Option<Outcome>,
 }
 
 /// An [`Environment`]'s fields, wherever they are.
@@ -272,265 +578,95 @@ fn environment(
     })
 }
 
-impl Fields {
-    fn read(bytes: &[u8]) -> Result<Self> {
-        let mut json = serde_json::Deserializer::from_slice(bytes);
-        let fields = Self::deserialize(MapOnly(&mut json))?;
-        json.end()?;
-        Ok(fields)
-    }
+/// Reads a record's fields from `bytes`, which hold one JSON object.
+fn read<T: serde::de::DeserializeOwned>(bytes: &[u8]) -> Result<T> {
+    let mut json = serde_json::Deserializer::from_slice(bytes);
+    let fields = T::deserialize(MapOnly(&mut json))?;
+    json.end()?;
+    Ok(fields)
+}
 
+// How the kinds that are not a plain set of fields read.
+
+pub(crate) fn environment_entry(f: &mut EntryFields) -> Result<Body> {
+    environment(f.cwd.take(), f.vars.take(), f.redacted.take(), f.tty.take()).map(Body::Environment)
+}
+
+#[allow(clippy::unnecessary_wraps, reason = "as `kinds!` calls it")]
+pub(crate) fn settings_entry(f: &mut EntryFields) -> Result<Body> {
+    Ok(Body::Settings(Overrides {
+        model: f.model.take(),
+    }))
+}
+
+pub(crate) fn wait_entry(f: &mut EntryFields) -> Result<Body> {
+    Ok(Body::Wait {
+        call: need(f.call.take(), "call")?,
+        on: WaitOn::read(f)?,
+    })
+}
+
+pub(crate) fn decision_entry(f: &mut EntryFields) -> Result<Body> {
+    Ok(Body::Decision {
+        by: need(f.by.take(), "by")?,
+        call: def(f.call.take())?,
+        d: Verdict::read(f)?,
+    })
+}
+
+/// Entries have fields of their own: [`DaemonMsg`]'s decoder reads them
+/// with [`EntryFields`] before it gets here.
+pub(crate) fn entry_msg(_: &mut MsgFields) -> Result<DaemonMsg> {
+    Err(Error::custom("an entry reads as an entry"))
+}
+
+pub(crate) fn recap_msg(f: &mut MsgFields) -> Result<DaemonMsg> {
+    Ok(DaemonMsg::Recap(Recap {
+        prompt: f.prompt.take(),
+        tools: req(f.tools.take(), "tools")?,
+        failed: req(f.failed.take(), "failed")?,
+        running: req(f.running.take(), "running")?,
+        reply: f.reply.take(),
+        asks: req(f.asks.take(), "asks")?,
+    }))
+}
+
+pub(crate) fn snapshot_msg(f: &mut MsgFields) -> Result<DaemonMsg> {
+    Ok(DaemonMsg::Snapshot(Box::new(SessionView {
+        session: f.session.take(),
+        workspace: req(f.workspace.take(), "workspace")?,
+        seq: req(f.seq.take(), "seq")?,
+        items: need(f.items.take(), "items")?,
+        environment: def(f.environment.take())?,
+        ..SessionView::default()
+    })))
+}
+
+#[allow(clippy::unnecessary_wraps, reason = "as `kinds!` calls it")]
+pub(crate) fn declare_msg(f: &mut MsgFields) -> Result<ClientMsg> {
+    Ok(ClientMsg::Declare(ClientDecl {
+        role: f.role.take().unwrap_or_default(),
+        tools: f.tools.take().unwrap_or_default(),
+        sites: f.sites.take().unwrap_or_default(),
+    }))
+}
+
+pub(crate) fn environment_msg(f: &mut MsgFields) -> Result<ClientMsg> {
+    environment(f.cwd.take(), f.vars.take(), f.redacted.take(), f.tty.take())
+        .map(ClientMsg::Environment)
+}
+
+impl EntryFields {
     fn entry(&mut self) -> Result<Entry> {
         Ok(Entry {
             seq: req(self.seq.take(), "seq")?,
             epoch: req(self.epoch.take(), "epoch")?,
-            uuid: self.uuid.take(),
-            parent: self.parent.take(),
-            body: self.body()?,
+            body: Body::read(self)?,
         })
     }
+}
 
-    fn body(&mut self) -> Result<Body> {
-        let f = self;
-        Ok(match req(f.kind, "kind")? {
-            Kind::User => Body::User {
-                text: req(f.text.take(), "text")?,
-            },
-            Kind::Queued => Body::Queued {
-                text: req(f.text.take(), "text")?,
-                steer: f.steer.take().unwrap_or_default(),
-            },
-            Kind::Steer => Body::Steer {
-                text: req(f.text.take(), "text")?,
-                queued: req(f.queued.take(), "queued")?,
-            },
-            Kind::Assistant => Body::Assistant {
-                text: req(f.text.take(), "text")?,
-            },
-            Kind::ToolCall => Body::ToolCall {
-                tool: req(f.tool.take(), "tool")?,
-                input: req(f.input.take(), "input")?,
-                id: f.id.take(),
-                card: f.card.take(),
-            },
-            Kind::ToolProcess => Body::ToolProcess {
-                call: req(f.call.take(), "call")?,
-                pgid: req(f.pgid.take(), "pgid")?,
-                boot: req(f.boot.take(), "boot")?,
-                background: f.background.take().unwrap_or_default(),
-            },
-            Kind::Progress => Body::Progress {
-                call: req(f.call.take(), "call")?,
-                text: req(f.text.take(), "text")?,
-            },
-            Kind::ToolResult => Body::ToolResult {
-                call: req(f.call.take(), "call")?,
-                outcome: req(f.outcome.take(), "outcome")?,
-                card: f.card.take(),
-            },
-            Kind::ModelCall => Body::ModelCall {
-                model: req(f.model.take(), "model")?,
-            },
-            Kind::ModelResult => Body::ModelResult {
-                call: req(f.call.take(), "call")?,
-                outcome: req(f.outcome.take(), "outcome")?,
-            },
-            Kind::Hook => Body::Hook {
-                hook: req(f.hook.take(), "hook")?,
-                decision: req(f.decision.take(), "decision")?,
-            },
-            Kind::Ask => Body::Ask {
-                call: req(f.call.take(), "call")?,
-            },
-            Kind::Link => Body::Link {
-                child: req(f.child.take(), "child")?,
-                input: text(f.input.take(), "input")?,
-            },
-            Kind::Watch => Body::Watch {
-                child: req(f.child.take(), "child")?,
-            },
-            Kind::Fired => Body::Fired {
-                watch: req(f.watch.take(), "watch")?,
-                outcome: req(f.outcome.take(), "outcome")?,
-            },
-            Kind::Environment => Body::Environment(environment(
-                f.cwd.take(),
-                f.vars.take(),
-                f.redacted.take(),
-                f.tty.take(),
-            )?),
-            Kind::Extensions => Body::Extensions {
-                installed: req(f.installed.take(), "installed")?,
-            },
-            Kind::Ext => Body::Ext {
-                ext: req(f.ext.take(), "ext")?,
-                state: req(f.state.take(), "state")?,
-                data: req(f.data.take(), "data")?,
-            },
-            Kind::Context => Body::Context {
-                text: req(f.text.take(), "text")?,
-            },
-            Kind::Command => Body::Command {
-                name: req(f.name.take(), "name")?,
-                args: f.args.take().unwrap_or_default(),
-            },
-            Kind::CommandResult => Body::CommandResult {
-                call: req(f.call.take(), "call")?,
-                outcome: req(f.outcome.take(), "outcome")?,
-            },
-            Kind::Interrupt => Body::Interrupt,
-            Kind::Settings => Body::Settings(Overrides {
-                model: f.model.take(),
-            }),
-            Kind::Unknown => return Err(Error::custom("unknown entry kind")),
-        })
-    }
-
-    fn daemon_msg(&mut self) -> Result<DaemonMsg> {
-        let f = self;
-        Ok(match req(f.t.take(), "t")? {
-            Tag::Welcome => DaemonMsg::Welcome {
-                proto: req(f.proto.take(), "proto")?,
-                build: req(f.build.take(), "build")?,
-                caps: f.caps.take().unwrap_or_default(),
-                client: f.client.take().unwrap_or_default(),
-                commands: f.commands.take().unwrap_or_default(),
-            },
-            Tag::Mismatch => DaemonMsg::Mismatch {
-                supported: req(f.supported.take(), "supported")?,
-                min: f.min.take(),
-            },
-            Tag::Draining => DaemonMsg::Draining,
-            Tag::Attached => DaemonMsg::Attached {
-                session: req(f.session.take(), "session")?,
-                workspace: req(f.workspace.take(), "workspace")?,
-            },
-            Tag::Entry if f.kind == Some(Kind::Unknown) => DaemonMsg::Unknown { seq: f.seq.take() },
-            Tag::Entry => DaemonMsg::Entry(f.entry()?),
-            Tag::Delta => DaemonMsg::Delta {
-                call: req(f.call.take(), "call")?,
-                text: req(f.text.take(), "text")?,
-            },
-            Tag::Synced => DaemonMsg::Synced {
-                seq: req(f.seq.take(), "seq")?,
-            },
-            Tag::Sessions => DaemonMsg::Sessions {
-                sessions: req(f.sessions.take(), "sessions")?,
-            },
-            Tag::Status => DaemonMsg::Status {
-                pid: req(f.pid.take(), "pid")?,
-                build: req(f.build.take(), "build")?,
-                started: req(f.started.take(), "started")?,
-                clients: req(f.clients.take(), "clients")?,
-                known: req(f.known.take(), "known")?,
-            },
-            Tag::Settings => DaemonMsg::Settings {
-                settings: req(f.settings.take(), "settings")?,
-                error: f.error.take(),
-            },
-            Tag::Recap => DaemonMsg::Recap(Recap {
-                prompt: f.prompt.take(),
-                tools: req(f.tools.take(), "tools")?,
-                failed: req(f.failed.take(), "failed")?,
-                running: req(f.running.take(), "running")?,
-                reply: f.reply.take(),
-                asks: req(f.asks.take(), "asks")?,
-            }),
-            Tag::Ask => DaemonMsg::Ask {
-                call: req(f.call.take(), "call")?,
-                tool: req(f.tool.take(), "tool")?,
-                input: req(f.input.take(), "input")?,
-            },
-            Tag::Error => DaemonMsg::Error {
-                message: req(f.message.take(), "message")?,
-            },
-            Tag::Snapshot => DaemonMsg::Snapshot(Box::new(SessionView {
-                session: f.session.take(),
-                workspace: req(f.workspace.take(), "workspace")?,
-                seq: req(f.seq.take(), "seq")?,
-                items: req(f.items.take(), "items")?,
-                environment: f.environment.take(),
-                ..SessionView::default()
-            })),
-            Tag::Ack => DaemonMsg::Ack {
-                origin: req(f.origin.take(), "origin")?,
-            },
-            Tag::Rejected => DaemonMsg::Rejected {
-                origin: req(f.origin.take(), "origin")?,
-                reason: req(f.reason.take(), "reason")?,
-                message: f.message.take().unwrap_or_default(),
-            },
-            Tag::Hello
-            | Tag::Attach
-            | Tag::Declare
-            | Tag::Environment
-            | Tag::Input
-            | Tag::Steer
-            | Tag::List
-            | Tag::Detach
-            | Tag::WatchSessions
-            | Tag::Shutdown
-            | Tag::Approve
-            | Tag::Interrupt
-            | Tag::Unknown => DaemonMsg::Unknown { seq: None },
-        })
-    }
-
-    fn client_msg(&mut self) -> Result<ClientMsg> {
-        let f = self;
-        Ok(match req(f.t.take(), "t")? {
-            Tag::Hello => ClientMsg::Hello {
-                proto: req(f.proto.take(), "proto")?,
-                build: req(f.build.take(), "build")?,
-                min: f.min.take(),
-                caps: f.caps.take().unwrap_or_default(),
-            },
-            Tag::Attach => ClientMsg::Attach {
-                target: req(f.target.take(), "target")?,
-                workspace: req(f.workspace.take(), "workspace")?,
-                since: req(f.since.take(), "since")?,
-                env: f.env.take(),
-                decl: f.decl.take().unwrap_or_default(),
-            },
-            Tag::Declare => ClientMsg::Declare(ClientDecl {
-                role: f.role.take().unwrap_or_default(),
-                tools: f.tools.take().unwrap_or_default(),
-                sites: f.sites.take().unwrap_or_default(),
-            }),
-            Tag::Environment => ClientMsg::Environment(environment(
-                f.cwd.take(),
-                f.vars.take(),
-                f.redacted.take(),
-                f.tty.take(),
-            )?),
-            Tag::Input => ClientMsg::Input {
-                text: req(f.text.take(), "text")?,
-                client_seq: f.client_seq.take(),
-            },
-            Tag::Steer => ClientMsg::Steer {
-                text: req(f.text.take(), "text")?,
-                client_seq: f.client_seq.take(),
-            },
-            Tag::List => ClientMsg::List,
-            Tag::Detach => ClientMsg::Detach,
-            Tag::WatchSessions => ClientMsg::WatchSessions,
-            Tag::Status => ClientMsg::Status,
-            Tag::Shutdown => ClientMsg::Shutdown,
-            Tag::Settings => ClientMsg::Settings {
-                change: f.change.take(),
-            },
-            Tag::Approve => ClientMsg::Approve {
-                call: req(f.call.take(), "call")?,
-                approved: req(f.approved.take(), "approved")?,
-                client_seq: f.client_seq.take(),
-            },
-            Tag::Interrupt => ClientMsg::Interrupt {
-                client_seq: f.client_seq.take(),
-            },
-            _ => return Err(Error::custom("unknown client message")),
-        })
-    }
-
+impl ItemFields {
     fn item(&mut self) -> Result<Item> {
         let f = self;
         Ok(match req(f.ty.take(), "type")? {
@@ -567,12 +703,12 @@ impl Fields {
             Type::Hook => Item::Hook {
                 seq: req(f.seq.take(), "seq")?,
                 hook: req(f.hook.take(), "hook")?,
-                decision: req(f.decision.take(), "decision")?,
+                decision: need(f.decision.take(), "decision")?,
             },
             Type::Child => Item::Child {
                 call: req(f.call.take(), "call")?,
                 child: req(f.child.take(), "child")?,
-                input: text(f.input.take(), "input")?,
+                input: need(f.input.take(), "input")?,
                 watch: f.watch.take(),
                 fired: f.fired.take(),
             },
@@ -586,7 +722,7 @@ impl Fields {
 
 impl Decode for Entry {
     fn from_json(bytes: &[u8]) -> Result<Self> {
-        Fields::read(bytes)?.entry()
+        read::<EntryFields>(bytes)?.entry()
     }
 }
 
@@ -600,6 +736,15 @@ impl<'de> Deserialize<'de> for Entry {
     }
 }
 
+/// An entry's frame, its kind known or not.
+fn entry_frame(bytes: &[u8]) -> Result<DaemonMsg> {
+    let mut f = read::<EntryFields>(bytes)?;
+    if f.kind.is_some_and(|k| !Body::knows(k.as_str())) {
+        return Ok(DaemonMsg::Unknown { seq: f.seq.take() });
+    }
+    f.entry().map(DaemonMsg::Entry)
+}
+
 /// Unknown kinds never abort a client; a known one that is malformed does.
 impl Decode for DaemonMsg {
     fn from_json(bytes: &[u8]) -> Result<Self> {
@@ -609,37 +754,45 @@ impl Decode for DaemonMsg {
         #[derive(Deserialize)]
         struct Tags {
             t: Option<Tag>,
-            kind: Option<Kind>,
+            kind: Option<Tag>,
             seq: Option<serde_json::Value>,
         }
-        Fields::read(bytes)
-            .and_then(|mut f| f.daemon_msg())
-            .or_else(|e| match serde_json::from_slice::<Tags>(bytes) {
-                Ok(Tags { t: Some(t), .. }) if !t.of_daemon() => {
-                    Ok(DaemonMsg::Unknown { seq: None })
-                }
-                Ok(Tags {
-                    t: Some(Tag::Entry),
-                    kind: Some(Kind::Unknown),
-                    seq,
-                }) => Ok(DaemonMsg::Unknown {
-                    seq: seq.as_ref().and_then(serde_json::Value::as_u64),
-                }),
-                _ => Err(e),
+        // A daemon tags an entry's frame first; another peer's order needs
+        // a look at the tag.
+        let decoded = if bytes.starts_with(br#"{"t":"entry","#) {
+            entry_frame(bytes)
+        } else {
+            read::<MsgFields>(bytes).and_then(|mut f| match f.t {
+                Some(t) if t.as_str() == "entry" => entry_frame(bytes),
+                _ => DaemonMsg::read(&mut f),
             })
+        };
+        decoded.or_else(|e| match serde_json::from_slice::<Tags>(bytes) {
+            Ok(Tags { t: Some(t), .. }) if !DaemonMsg::knows(t.as_str()) => {
+                Ok(DaemonMsg::Unknown { seq: None })
+            }
+            Ok(Tags {
+                t: Some(t),
+                kind: Some(kind),
+                seq,
+            }) if t.as_str() == "entry" && !Body::knows(kind.as_str()) => Ok(DaemonMsg::Unknown {
+                seq: seq.as_ref().and_then(serde_json::Value::as_u64),
+            }),
+            _ => Err(e),
+        })
     }
 }
 
 impl Decode for ClientMsg {
     fn from_json(bytes: &[u8]) -> Result<Self> {
-        Fields::read(bytes)?.client_msg()
+        read::<MsgFields>(bytes).and_then(|mut f| ClientMsg::read(&mut f))
     }
 }
 
 /// Decoded in one pass, as the wire's messages are.
 impl<'de> Deserialize<'de> for Item {
     fn deserialize<D: Deserializer<'de>>(d: D) -> std::result::Result<Self, D::Error> {
-        Fields::deserialize(MapOnly(d))?
+        ItemFields::deserialize(MapOnly(d))?
             .item()
             .map_err(D::Error::custom)
     }
@@ -705,18 +858,6 @@ impl<'de> Deserialize<'de> for Outcome {
             .outcome()
             .map_err(D::Error::custom)
     }
-}
-
-/// Whether this build knows entry kind `kind`.
-#[cfg(test)]
-pub(crate) fn known_kind(kind: &str) -> bool {
-    matches!(serde_json::from_value::<Kind>(kind.into()), Ok(k) if k != Kind::Unknown)
-}
-
-/// Whether this build knows message tag `t`.
-#[cfg(test)]
-pub(crate) fn known_msg(t: &str) -> bool {
-    serde_json::from_value::<Tag>(t.into()).is_ok_and(Tag::of_daemon)
 }
 
 /// Reads a struct as a map only. A JSON decoder also reads one from an

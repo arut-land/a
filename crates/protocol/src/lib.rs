@@ -4,9 +4,11 @@ use std::collections::BTreeMap;
 use std::ffi::OsString;
 use std::fmt;
 use std::io::{self, Read, Write};
+use std::num::NonZeroU64;
 use std::path::PathBuf;
 use std::sync::Arc;
 
+use serde::de::Error as _;
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
@@ -19,6 +21,7 @@ pub const PROTO_MIN: u32 = 1;
 
 const MAX_FRAME: u32 = 16 * 1024 * 1024;
 
+#[macro_use]
 mod decode;
 mod json;
 pub mod ledger;
@@ -65,179 +68,446 @@ impl fmt::Display for Short {
     }
 }
 
+/// An entry's number in its session's log, from 1: where a fact is, and
+/// for an intent, its call's id. `0` names no entry, so `Option<Seq>` is
+/// as small as a seq.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+#[serde(transparent)]
+#[repr(transparent)]
+pub struct Seq(NonZeroU64);
+
+impl Seq {
+    pub const fn new(seq: u64) -> Option<Self> {
+        match NonZeroU64::new(seq) {
+            Some(seq) => Some(Self(seq)),
+            None => None,
+        }
+    }
+
+    pub const fn get(self) -> u64 {
+        self.0.get()
+    }
+}
+
+impl fmt::Display for Seq {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        self.0.fmt(f)
+    }
+}
+
+/// A call's id: the seq of its intent, which no other kind of number can
+/// be mistaken for.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+#[serde(transparent)]
+#[repr(transparent)]
+pub struct CallId(pub Seq);
+
+impl CallId {
+    pub const fn new(seq: u64) -> Option<Self> {
+        match Seq::new(seq) {
+            Some(seq) => Some(Self(seq)),
+            None => None,
+        }
+    }
+
+    pub const fn get(self) -> u64 {
+        self.0.get()
+    }
+}
+
+impl fmt::Display for CallId {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        self.0.fmt(f)
+    }
+}
+
+/// The generation of the lease a log's writer holds: a store refuses the
+/// appends of a writer whose lease was superseded.
+#[derive(
+    Clone, Copy, Debug, Default, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize,
+)]
+#[serde(transparent)]
+#[repr(transparent)]
+pub struct Epoch(pub u32);
+
+/// A client, as it names itself in its hello: the same across its
+/// connections and the daemon's restarts, so that what it asked for once
+/// is done once (with [`ClientSeq`], an [`Author`]).
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+#[serde(transparent)]
+#[repr(transparent)]
+pub struct ClientId(pub Uuid);
+
+impl ClientId {
+    pub fn new() -> Self {
+        Self(Uuid::now_v7())
+    }
+}
+
+impl Default for ClientId {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+/// A client's number for one of its mutations, from 1, rising.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+#[serde(transparent)]
+#[repr(transparent)]
+pub struct ClientSeq(NonZeroU64);
+
+impl ClientSeq {
+    pub const fn new(seq: u64) -> Option<Self> {
+        match NonZeroU64::new(seq) {
+            Some(seq) => Some(Self(seq)),
+            None => None,
+        }
+    }
+
+    pub const fn get(self) -> u64 {
+        self.0.get()
+    }
+}
+
+/// Who a fact came from: a client's mutation, named durably. Logged with
+/// the fact, so a resend after a reconnect or a restart is known for what
+/// it is from the log alone.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub struct Author {
+    pub client: ClientId,
+    pub seq: ClientSeq,
+}
+
+/// What a JSONL line of a session's log holds and, tagged `"t":"entry"`,
+/// what the wire carries.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize)]
 pub struct Entry {
     pub seq: u64,
     /// The lease its writer held: a store refuses the appends of a writer
     /// whose lease was superseded.
     pub epoch: u32,
-    /// Reserved for entries addressed across sessions, as forks and
-    /// migration will need: a global id, and the entry this one follows
-    /// when that is not the one before it. They share the entry's object
-    /// with its body's fields, so no body has fields of these names (a tool
-    /// call's `id` is the model's).
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub uuid: Option<Uuid>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub parent: Option<Uuid>,
     #[serde(flatten)]
     pub body: Body,
 }
 
 impl Entry {
     pub const fn new(seq: u64, epoch: u32, body: Body) -> Self {
-        Self {
-            seq,
-            epoch,
-            uuid: None,
-            parent: None,
-            body,
-        }
+        Self { seq, epoch, body }
     }
 }
 
-#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
-#[serde(tag = "kind", rename_all = "snake_case")]
-pub enum Body {
-    /// The user's message, starting a turn.
-    User {
-        text: String,
-    },
-    /// Input taken in, logged on arrival so that it survives a crash and
-    /// every client sees it waiting. Queued input is taken in order: each
-    /// `user` or `command` entry takes the oldest still waiting, and a
-    /// `steer` entry the one it names. A `steer` goes to the running turn
-    /// at its next step boundary rather than after it.
-    Queued {
-        text: String,
-        #[serde(default, skip_serializing_if = "std::ops::Not::not")]
-        steer: bool,
-    },
-    /// Steering input `queued`, given to the running turn: the model reads
-    /// it as the user's before its next reply.
-    Steer {
-        text: String,
-        queued: u64,
-    },
-    Assistant {
-        text: String,
-    },
-    /// The committed intent to run a tool. Its seq is the call's id and
-    /// idempotency key; `id` is the model's own id for the call, under which
-    /// its result goes back.
-    ToolCall {
-        tool: String,
-        input: Json,
-        #[serde(default, skip_serializing_if = "Option::is_none")]
-        id: Option<String>,
-        /// How clients show the call, as the tool presents it.
-        #[serde(default, skip_serializing_if = "Option::is_none")]
-        card: Option<Card>,
-    },
-    /// The process group running a call, so recovery can kill it. Only
-    /// meaningful within the same `boot`: pgids are reused across reboots.
-    /// A `background` group outlives its call: the session owns it until
-    /// the session ends.
-    ToolProcess {
-        call: u64,
-        pgid: u32,
-        boot: String,
-        #[serde(default, skip_serializing_if = "std::ops::Not::not")]
-        background: bool,
-    },
-    /// Output tool call `call` produced since its last progress entry,
-    /// committed as it runs: what an interrupted call reports, and what
-    /// clients show meanwhile.
-    Progress {
-        call: u64,
-        text: String,
-    },
-    ToolResult {
-        call: u64,
-        outcome: Outcome,
-        /// How clients show the outcome, as the tool presents it.
-        #[serde(default, skip_serializing_if = "Option::is_none")]
-        card: Option<Card>,
-    },
-    /// The committed intent to ask a model for a reply.
-    ModelCall {
-        model: String,
-    },
-    /// The reply; `Done` carries the whole `llm::Response`, or
-    /// `{"text": ...}` in logs older than that.
-    ModelResult {
-        call: u64,
-        outcome: Outcome,
-    },
-    /// A hook changed what happens at a decision point.
-    Hook {
-        hook: String,
-        decision: Decision,
-    },
-    /// Tool call `call` waits for the user's approval. Until a
-    /// [`Decision::Approval`] for it is logged it is in the session's inbox:
-    /// delivered to every client, and again to each that attaches.
-    Ask {
-        call: u64,
-    },
-    /// The committed intent to start session `child` with `input`. Its seq
-    /// is the call that owns the child; the child's id is chosen before the
-    /// commit, so recovery finds the child instead of making another.
-    Link {
-        child: SessionId,
-        input: String,
-    },
-    /// A durable watch on `child`: when it settles, its result comes back
-    /// as a `fired` under this entry's seq, which is the idempotency key.
-    Watch {
-        child: SessionId,
-    },
-    /// Watch `watch` fired, with its child's result. Logged at most once
-    /// per watch.
-    Fired {
-        watch: u64,
-        outcome: Outcome,
-    },
-    /// The environment the session's commands run in from here on, as the
-    /// attaching client captured it, secrets redacted.
-    Environment(Environment),
-    /// The extensions the session runs with from here on, in install order,
-    /// logged when they differ from those its header or an earlier entry
-    /// records.
-    Extensions {
-        installed: Vec<Installed>,
-    },
-    /// A change to extension `ext`'s durable state `state`: folding these
-    /// in log order rebuilds it.
-    Ext {
-        ext: String,
-        state: String,
-        data: Json,
-    },
-    /// Facts about where the session runs (its directory, the workspace's
-    /// agent notes), which the model reads as a user message ahead of the
-    /// conversation. Logged once, before the first model call, so the
-    /// system prompt stays the same across sessions and cacheable.
-    Context {
-        text: String,
-    },
-    /// The committed intent to run slash command `/name args`, which takes
-    /// no model turn. Its seq is the command's id.
-    Command {
-        name: String,
-        #[serde(default, skip_serializing_if = "String::is_empty")]
-        args: String,
-    },
-    CommandResult {
-        call: u64,
-        outcome: Outcome,
-    },
-    /// The user interrupted the turn: what the agent asked for and had not
-    /// started is dropped.
-    Interrupt,
-    /// The session's own settings from here on, over every config layer;
-    /// each entry replaces the one before.
-    Settings(Overrides),
+kinds! {
+    /// What an entry records. Each fact is logged once, and anything that
+    /// can be computed from facts is a fold over them
+    /// ([`ledger::Ledger`], [`view::SessionView`]).
+    ///
+    /// The kinds in the second group are those builds before v2 write
+    /// (the engine still does): they decode as they were written, so a
+    /// log's lines stay the frames old clients were sent, and
+    /// [`Body::shim`] says each in the v2 kinds, which is all a fold reads.
+    #[derive(Clone, Debug, PartialEq, Eq, Serialize)]
+    pub enum Body: kind = "kind" in EntryFields, class, shims {
+        // ── conversation ───────────────────────────────────────────────
+        /// Input, logged on arrival so that it survives a crash and every
+        /// client sees it. `taken` when it started work as it arrived;
+        /// otherwise it waits, in order, for a `take`. A `steer` goes to
+        /// the running turn at its next step boundary rather than after it.
+        Input "input" { text: String, mode: Mode = default, taken: bool = default, origin: Option<Author> = default } = Durable;
+        /// Waiting input `input` was taken up: it starts a turn, or a
+        /// `steer` is given to the running one.
+        Take "take" { input: Seq } = Durable;
+        /// The reply of an agent that is not a model's.
+        Assistant "assistant" { text: String } = Durable;
+        /// Facts about where the session runs (its directory, the workspace's
+        /// agent notes), which the model reads as a user message ahead of the
+        /// conversation. Logged once, before the first model call, so the
+        /// system prompt stays the same across sessions and cacheable.
+        Context "context" { text: String } = Durable;
+        // ── calls: each intent is logged before the effect it names ────
+        /// The committed intent to ask a model for a reply; a retry is an
+        /// intent of its own, its `attempt` one more.
+        ModelCall "model_call" { model: String, attempt: u16 = default } = Durable;
+        /// The reply; `Done` carries the whole `llm::Response`, or
+        /// `{"text": ...}` in logs older than that.
+        ModelResult "model_result" { call: u64, outcome: Outcome } = Durable;
+        /// The committed intent to run a tool. Its seq is the call's id and
+        /// idempotency key; `id` is the model's own id for the call, under which
+        /// its result goes back. `by` is who called it: the model, unless the
+        /// user ran it as a command or an extension did.
+        ToolCall "tool_call" {
+            tool: String,
+            input: Json,
+            id: Option<String> = default,
+            /// How clients show the call, as the tool presents it.
+            card: Option<Card> = default,
+            by: Audience = default,
+        } = Durable;
+        /// The process group running a call, so recovery can kill it. Only
+        /// meaningful within the same `boot`: pgids are reused across reboots.
+        /// A `background` group outlives its call: the session owns it until
+        /// the session ends.
+        ToolProcess "tool_process" { call: u64, pgid: u32, boot: String, background: bool = default } = Durable;
+        /// Output tool call `call` produced since its last progress entry,
+        /// committed as it runs: what an interrupted call reports, and what
+        /// clients show meanwhile.
+        Progress "progress" { call: u64, text: String } = Durable;
+        ToolResult "tool_result" {
+            call: u64,
+            outcome: Outcome,
+            /// How clients show the outcome, as the tool presents it.
+            card: Option<Card> = default,
+        } = Durable;
+        /// What extension `by` decided at a decision point, about call
+        /// `call` when it is about one; logged after the call's intent. Only
+        /// decisions that change something are logged.
+        Decision "decision" { by: String, call: Option<CallId> = default, #[serde(flatten)] d: Verdict } = Durable, read decode::decision_entry;
+        /// Call `call` waits on `on`: until it is answered it is in the
+        /// session's inbox, delivered to every client. Logged only for a wait
+        /// no decision implies (an `ask` permission implies an approval).
+        Wait "wait" { call: CallId, #[serde(flatten)] on: WaitOn } = Durable, read decode::wait_entry;
+        /// The answer to call `call`'s wait, from outside the session (a user's
+        /// approval is `true` or `false`). The first one wins.
+        Answer "answer" { call: CallId, value: Json, origin: Option<Author> = default } = Durable;
+        /// The turn was interrupted: what the agent asked for and had not
+        /// started is dropped.
+        Interrupt "interrupt" { origin: Option<Author> = default } = Durable;
+        // ── topology ───────────────────────────────────────────────────
+        /// The committed intent to start session `child` with `input`. Its seq
+        /// is the call that owns the child; the child's id is chosen before the
+        /// commit, so recovery finds the child instead of making another.
+        Link "link" { child: SessionId, input: String } = Durable;
+        /// A durable watch on `child`: when it settles, its result comes back
+        /// as a `fired` under this entry's seq, which is the idempotency key.
+        Watch "watch" { child: SessionId } = Durable;
+        /// Watch `watch` fired, with its child's result. Logged at most once
+        /// per watch.
+        Fired "fired" { watch: u64, outcome: Outcome } = Durable;
+        // ── environment and extensions ─────────────────────────────────
+        /// The environment the session's commands run in from here on, as the
+        /// attaching client captured it, secrets redacted.
+        Environment "environment" (Environment) = Durable, read decode::environment_entry;
+        /// The extensions the session runs with from here on, in install order,
+        /// logged when they differ from those its header or an earlier entry
+        /// records.
+        Extensions "extensions" { installed: Vec<Installed> } = Durable;
+        /// A change to extension `ext`'s durable state `state`: folding these
+        /// in log order rebuilds it.
+        Ext "ext" { ext: String, state: String, data: Json } = Durable;
+        /// What the model sees from here on: the entries `target..=upto`
+        /// (or just `target`) are left out of its context, or stand as
+        /// `replace`. The log itself is never rewritten.
+        Edit "edit" { target: Seq, upto: Option<Seq> = default, replace: Option<Json> = default } = Durable;
+
+        // ── written only by builds before v2 ───────────────────────────
+        /// The user's message, starting a turn; it takes up the oldest input
+        /// waiting, if any.
+        User "user" { text: String } = Durable,
+            was { text } => Some(Self::Input { text: text.clone(), mode: Mode::Queue, taken: true, origin: None });
+        /// Input that waits to be taken up: each `user` or `command` entry
+        /// takes the oldest still waiting, and a `steer` entry the one it
+        /// names.
+        Queued "queued" { text: String, steer: bool = default } = Durable,
+            was { text, steer } => Some(Self::Input {
+                text: text.clone(),
+                mode: if *steer { Mode::Steer } else { Mode::Queue },
+                taken: false,
+                origin: None,
+            });
+        /// Steering input `queued`, given to the running turn: the model reads
+        /// it as the user's before its next reply.
+        Steer "steer" { text: String, queued: u64 } = Durable,
+            was { queued, .. } => Seq::new(*queued).map(|input| Self::Take { input });
+        /// A hook changed what happens at a decision point.
+        Hook "hook" { hook: String, decision: Decision } = Durable,
+            was { hook, decision } => decision.shim(hook);
+        /// Tool call `call` waits for the user's approval. Until a
+        /// [`Decision::Approval`] for it is logged it is in the session's inbox:
+        /// delivered to every client, and again to each that attaches.
+        Ask "ask" { call: u64 } = Durable,
+            was { call } => CallId::new(*call).map(|call| Self::Wait { call, on: WaitOn::Approval });
+        /// The committed intent to run slash command `/name args`, which takes
+        /// no model turn; it takes up the oldest input waiting, if any. Its seq
+        /// is the command's id.
+        Command "command" { name: String, args: String = default } = Durable,
+            was { name, args } => Some(Self::ToolCall {
+                tool: name.clone(),
+                input: serde_json::json!({ "args": args }).into(),
+                id: None,
+                card: None,
+                by: Audience::User,
+            });
+        CommandResult "command_result" { call: u64, outcome: Outcome } = Durable,
+            was { call, outcome } => Some(Self::ToolResult { call: *call, outcome: outcome.clone(), card: None });
+        /// The session's own settings from here on, over every config layer;
+        /// each entry replaces the one before. Now the `settings`
+        /// extension's state `model`.
+        Settings "settings" (Overrides) = Durable, read decode::settings_entry,
+            was (set) => Some(Self::Ext {
+                ext: "settings".into(),
+                state: "model".into(),
+                data: set.model.as_deref().into(),
+            });
+    }
+    else Err(serde_json::Error::custom("unknown entry kind"))
+}
+
+impl Body {
+    /// An interrupt no client asked for.
+    pub const INTERRUPT: Self = Self::Interrupt { origin: None };
+}
+
+/// How input waits: for the turn running to end, or for its next step.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum Mode {
+    #[default]
+    Queue,
+    Steer,
+}
+
+/// Who called a tool.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum Audience {
+    #[default]
+    Model,
+    /// The user, by a command.
+    User,
+    /// An extension.
+    Plugin,
+}
+
+kinds! {
+    /// What a call waits on, as a `wait` entry holds it beside the call.
+    #[derive(Clone, Debug, PartialEq, Eq, Serialize)]
+    pub enum WaitOn: on = "on" in EntryFields {
+        /// A user's approval.
+        Approval "approval";
+        /// A user's input in a dialog the call shows.
+        Dialog "dialog" { ui: Json };
+        /// A client that runs tool `tool`, of which none is attached.
+        Client "client" { tool: String };
+        /// The child session linked at `link`.
+        Child "child" { link: Seq };
+    }
+    else Err(serde_json::Error::custom("unknown wait"))
+}
+
+kinds! {
+    /// What an extension decided, by decision point, as a `decision` entry
+    /// holds it beside its call: the call names the tool.
+    #[derive(Clone, Debug, PartialEq, Eq, Serialize)]
+    pub enum Verdict: d = "d" in EntryFields {
+        /// The request of the model call was replaced before it was sent.
+        PrepareStep "prepare_step";
+        /// The tool call's input was replaced by `input`.
+        PreTool "pre_tool" { input: Json };
+        /// The tool call was blocked before it ran.
+        Block "block" { reason: String };
+        /// The most restrictive permission the extensions gave the call.
+        Permission "permission" { permission: Permission };
+        /// An extension answered the call's permission `ask` itself.
+        Approval "approval" { approved: bool };
+        /// The call's outcome was replaced; `original` is what it replaced.
+        PostTool "post_tool" { original: Outcome };
+        /// The agent stopped and was given `text` to continue with.
+        OnStop "on_stop" { text: String };
+        /// The user's input was rewritten: the input entry that follows holds
+        /// the new text, `original` what it replaced.
+        Input "input" { original: String };
+        /// The model call failed with `error` and is sent again, for the
+        /// `attempt`th time, with the request as the extension left it.
+        Retry "retry" { attempt: u16, error: String };
+    }
+    else Err(serde_json::Error::custom("unknown decision"))
+}
+
+impl Decision {
+    /// This decision as v2 logs it: a `decision` naming its call, or for a
+    /// user's approval, the `answer` it is. Decisions logged before their
+    /// call (as the gate did before v2) name none; the ledger gives them to
+    /// the call that follows.
+    fn shim(&self, hook: &str) -> Option<Body> {
+        let (call, d) = match self {
+            Self::PrepareStep { call } => (CallId::new(*call)?.into(), Verdict::PrepareStep),
+            Self::PreTool { input, .. } => (
+                None,
+                Verdict::PreTool {
+                    input: input.clone(),
+                },
+            ),
+            Self::Block { reason, .. } => (
+                None,
+                Verdict::Block {
+                    reason: reason.clone(),
+                },
+            ),
+            Self::Permission { permission, .. } => (
+                None,
+                Verdict::Permission {
+                    permission: *permission,
+                },
+            ),
+            Self::Approval {
+                approved,
+                call: Some(call),
+                ..
+            } => {
+                return Some(Body::Answer {
+                    call: CallId::new(*call)?,
+                    value: (*approved).into(),
+                    origin: None,
+                });
+            }
+            Self::Approval { approved, .. } => (
+                None,
+                Verdict::Approval {
+                    approved: *approved,
+                },
+            ),
+            Self::PostTool { call, original } => (
+                CallId::new(*call)?.into(),
+                Verdict::PostTool {
+                    original: original.clone(),
+                },
+            ),
+            Self::OnStop { text } => (None, Verdict::OnStop { text: text.clone() }),
+            Self::Input { original } => (
+                None,
+                Verdict::Input {
+                    original: original.clone(),
+                },
+            ),
+            Self::Retry {
+                call,
+                attempt,
+                error,
+            } => (
+                CallId::new(*call)?.into(),
+                Verdict::Retry {
+                    attempt: u16::try_from(*attempt).unwrap_or(u16::MAX),
+                    error: error.clone(),
+                },
+            ),
+        };
+        Some(Body::Decision {
+            by: hook.to_owned(),
+            call,
+            d,
+        })
+    }
+
+    /// Whether the gate before a tool call made it, which logs it ahead of
+    /// the call in logs before v2.
+    pub const fn gates(&self) -> bool {
+        matches!(
+            self,
+            Self::PreTool { .. }
+                | Self::Block { .. }
+                | Self::Permission { .. }
+                | Self::Approval { call: None, .. }
+        )
+    }
 }
 
 /// Settings a session sets for itself; those unset come from the config
@@ -593,11 +863,22 @@ pub enum Cap {
     Sessions,
     /// The daemon takes [`ClientMsg::Status`] and [`ClientMsg::Shutdown`].
     Daemon,
+    /// The client reads the v2 entry kinds (`input`, `take`, `decision`,
+    /// `wait`, `answer`, `edit`) and folds what waits from them, so the
+    /// daemon sends it no [`DaemonMsg::Ask`] or [`DaemonMsg::Recap`].
+    Ledger,
+    /// A [`DaemonMsg::Delta`] names its call's attempt, and a client shows
+    /// the text of the latest only.
+    Attempts,
+    /// The client's hello names it ([`ClientId`]) and its numbered
+    /// mutations are logged with their [`Author`]: a resend, after a
+    /// reconnect or a daemon restart, is answered as the first was.
+    Origin,
 }
 
 impl Cap {
     /// Every capability this build knows.
-    pub const ALL: [Self; 7] = [
+    pub const ALL: [Self; 10] = [
         Self::Snapshot,
         Self::Ack,
         Self::Declare,
@@ -605,6 +886,9 @@ impl Cap {
         Self::Settings,
         Self::Sessions,
         Self::Daemon,
+        Self::Ledger,
+        Self::Attempts,
+        Self::Origin,
     ];
 
     pub const fn name(self) -> &'static str {
@@ -616,6 +900,9 @@ impl Cap {
             Self::Settings => "settings",
             Self::Sessions => "sessions",
             Self::Daemon => "daemon",
+            Self::Ledger => "ledger",
+            Self::Attempts => "attempts",
+            Self::Origin => "origin",
         }
     }
 
@@ -642,6 +929,10 @@ impl Caps {
         }
         Self(bits)
     };
+
+    /// What this build's daemon takes up: all but what only the v2 engine
+    /// will serve, which a client may already offer.
+    pub const SERVED: Self = Self(Self::ALL.0 & !(Cap::Ledger.bit() | Cap::Origin.bit()));
 
     pub const fn has(self, cap: Cap) -> bool {
         self.0 & cap.bit() != 0
@@ -850,84 +1141,65 @@ pub enum Rejection {
     Other,
 }
 
-#[derive(Clone, Debug, Serialize)]
-#[serde(tag = "t", rename_all = "snake_case")]
-pub enum ClientMsg {
-    /// `build` is the client's staged build id (`<version>+<hash>`); it
-    /// speaks protocols `min..=proto`, or just `proto` without `min`, with
-    /// capabilities `caps`. Its first messages (attach, input) may follow
-    /// right behind, without waiting for the answer: unless that is a
-    /// welcome, the daemon acts on none of them.
-    Hello {
-        proto: u32,
-        build: String,
-        #[serde(default, skip_serializing_if = "Option::is_none")]
-        min: Option<u32>,
-        #[serde(default, skip_serializing_if = "Caps::is_empty")]
-        caps: Caps,
-    },
-    /// `env` is the client's, for the commands the session runs; without
-    /// one the session keeps the environment it had. `workspace` is the
-    /// directory the client is in: the daemon takes the git working tree it
-    /// is in (with `env`'s git variables) as the workspace. (Daemons before
-    /// that take it as it is.)
-    Attach {
-        target: Target,
-        workspace: PathBuf,
-        since: u64,
-        #[serde(default, skip_serializing_if = "Option::is_none")]
-        env: Option<Environment>,
-        #[serde(default, skip_serializing_if = "ClientDecl::is_default")]
-        decl: ClientDecl,
-    },
-    /// Replaces this client's declaration. Only sent with [`Cap::Declare`].
-    Declare(ClientDecl),
-    /// Replaces the attached session's environment (`/env refresh`).
-    Environment(Environment),
-    Input {
-        text: String,
-        #[serde(default, skip_serializing_if = "Option::is_none")]
-        client_seq: Option<u64>,
-    },
-    /// Input for the running turn, given to it at its next step boundary;
-    /// with no turn running it is plain input. Only sent with
-    /// [`Cap::Steer`].
-    Steer {
-        text: String,
-        #[serde(default, skip_serializing_if = "Option::is_none")]
-        client_seq: Option<u64>,
-    },
-    List,
-    Detach,
-    /// Asks for [`DaemonMsg::Sessions`] now and whenever a session's
-    /// summary changes, for as long as the connection lasts. Only sent with
-    /// [`Cap::Sessions`].
-    WatchSessions,
-    /// Asks for [`DaemonMsg::Status`]. Only sent with [`Cap::Daemon`].
-    Status,
-    /// Stops the daemon, as an idle one stops; the connection closes as it
-    /// exits. Only sent with [`Cap::Daemon`].
-    Shutdown,
-    /// Asks for the [`HomeSettings`], after making `change` to them if
-    /// there is one; answered with [`DaemonMsg::Settings`]. Only sent with
-    /// [`Cap::Settings`].
-    Settings {
-        #[serde(default, skip_serializing_if = "Option::is_none")]
-        change: Option<SettingsChange>,
-    },
-    /// Answers the [`DaemonMsg::Ask`] for tool call `call`.
-    Approve {
-        call: u64,
-        approved: bool,
-        #[serde(default, skip_serializing_if = "Option::is_none")]
-        client_seq: Option<u64>,
-    },
-    /// Stops the attached session's turn: its running model or tool call
-    /// and, bottom-up, the turns of the sessions it started.
-    Interrupt {
-        #[serde(default, skip_serializing_if = "Option::is_none")]
-        client_seq: Option<u64>,
-    },
+kinds! {
+    #[derive(Clone, Debug, Serialize)]
+    pub enum ClientMsg: t = "t" in MsgFields {
+        /// `build` is the client's staged build id (`<version>+<hash>`); it
+        /// speaks protocols `min..=proto`, or just `proto` without `min`, with
+        /// capabilities `caps`. Its first messages (attach, input) may follow
+        /// right behind, without waiting for the answer: unless that is a
+        /// welcome, the daemon acts on none of them. `client` names it across
+        /// connections, for [`Cap::Origin`] (a daemon without it ignores it).
+        Hello "hello" {
+            proto: u32,
+            build: String,
+            min: Option<u32> = default,
+            caps: Caps = default,
+            client: Option<ClientId> = default,
+        };
+        /// `env` is the client's, for the commands the session runs; without
+        /// one the session keeps the environment it had. `workspace` is the
+        /// directory the client is in: the daemon takes the git working tree it
+        /// is in (with `env`'s git variables) as the workspace. (Daemons before
+        /// that take it as it is.)
+        Attach "attach" {
+            target: Target,
+            workspace: PathBuf,
+            since: u64,
+            env: Option<Environment> = default,
+            decl: ClientDecl = default,
+        };
+        /// Replaces this client's declaration. Only sent with [`Cap::Declare`].
+        Declare "declare" (ClientDecl), read decode::declare_msg;
+        /// Replaces the attached session's environment (`/env refresh`).
+        Environment "environment" (Environment), read decode::environment_msg;
+        Input "input" { text: String, client_seq: Option<u64> = default };
+        /// Input for the running turn, given to it at its next step boundary;
+        /// with no turn running it is plain input. Only sent with
+        /// [`Cap::Steer`].
+        Steer "steer" { text: String, client_seq: Option<u64> = default };
+        List "list";
+        Detach "detach";
+        /// Asks for [`DaemonMsg::Sessions`] now and whenever a session's
+        /// summary changes, for as long as the connection lasts. Only sent with
+        /// [`Cap::Sessions`].
+        WatchSessions "watch_sessions";
+        /// Asks for [`DaemonMsg::Status`]. Only sent with [`Cap::Daemon`].
+        Status "status";
+        /// Stops the daemon, as an idle one stops; the connection closes as it
+        /// exits. Only sent with [`Cap::Daemon`].
+        Shutdown "shutdown";
+        /// Asks for the [`HomeSettings`], after making `change` to them if
+        /// there is one; answered with [`DaemonMsg::Settings`]. Only sent with
+        /// [`Cap::Settings`].
+        Settings "settings" { change: Option<SettingsChange> = default };
+        /// Answers the [`DaemonMsg::Ask`] for tool call `call`.
+        Approve "approve" { call: u64, approved: bool, client_seq: Option<u64> = default };
+        /// Stops the attached session's turn: its running model or tool call
+        /// and, bottom-up, the turns of the sessions it started.
+        Interrupt "interrupt" { client_seq: Option<u64> = default };
+    }
+    else Err(serde_json::Error::custom("unknown client message"))
 }
 
 impl ClientMsg {
@@ -981,115 +1253,85 @@ impl ClientMsg {
     }
 }
 
-#[derive(Clone, Debug, Serialize)]
-#[serde(tag = "t", rename_all = "snake_case")]
-pub enum DaemonMsg {
-    /// The hello is accepted at protocol `proto`. `caps` are the client's
-    /// capabilities the daemon takes up, and `client` this connection's id,
-    /// as [`Origin`]s name it.
-    Welcome {
-        proto: u32,
-        build: String,
-        #[serde(default, skip_serializing_if = "Caps::is_empty")]
-        caps: Caps,
-        #[serde(default, skip_serializing_if = "is_zero")]
-        client: u32,
-        /// The slash commands the daemon runs, for help and completion;
-        /// none from a daemon older than them.
-        #[serde(default, skip_serializing_if = "Vec::is_empty")]
-        commands: Vec<CommandInfo>,
-    },
-    /// The daemon speaks protocols `min..=supported` (just `supported`
-    /// without `min`), none of the client's.
-    Mismatch {
-        supported: u32,
-        #[serde(default, skip_serializing_if = "Option::is_none")]
-        min: Option<u32>,
-    },
-    /// A newer build was staged: the daemon finishes in-flight work, exits,
-    /// and closes every connection. Clients then reconnect, which starts the
-    /// new build, and re-attach to replay what they missed. Sent as the reply
-    /// to a hello, or to connections already open when the drain began.
-    Draining,
-    Attached {
-        session: SessionId,
-        workspace: PathBuf,
-    },
-    Entry(Entry),
-    /// Live text of an unfinished model call. Never logged: the committed
-    /// `model_result` is the fact.
-    Delta {
-        call: u64,
-        text: String,
-    },
-    /// Replay is complete; everything after this is live.
-    Synced {
-        seq: u64,
-    },
-    Sessions {
-        sessions: Vec<SessionSummary>,
-    },
-    /// The answer to [`ClientMsg::Status`].
-    Status {
-        pid: u32,
-        build: String,
-        /// Seconds since the Unix epoch at start.
-        started: u64,
-        /// Open connections, the asking one included.
-        clients: u32,
-        /// Sessions the daemon knows, loaded or not.
-        known: u32,
-    },
-    /// The answer to [`ClientMsg::Settings`]: the settings as they are now,
-    /// and why its change was not made, if it was not.
-    Settings {
-        settings: HomeSettings,
-        #[serde(default, skip_serializing_if = "Option::is_none")]
-        error: Option<String>,
-    },
-    /// Sent after `Synced` when the replay held entries.
-    Recap(Recap),
-    /// Tool call `call` waits for approval: sent when it is asked, and
-    /// after `Synced` for every call still waiting.
-    Ask {
-        call: u64,
-        tool: String,
-        input: Json,
-    },
-    Error {
-        message: String,
-    },
-    /// The whole log-derived view at `view.seq`, in place of the replay up
-    /// to it: for an attach from far behind, or a client that fell too far
-    /// behind live. Folding it and what follows equals folding the entries
-    /// it stands for. Only sent with [`Cap::Snapshot`].
-    Snapshot(Box<view::SessionView>),
-    /// Mutation `origin` was taken; what it causes follows as entries. Only
-    /// sent with [`Cap::Ack`].
-    Ack {
-        origin: Origin,
-    },
-    /// Mutation `origin` was refused. Only sent with [`Cap::Ack`].
-    Rejected {
-        origin: Origin,
-        reason: Rejection,
-        #[serde(default, skip_serializing_if = "String::is_empty")]
-        message: String,
-    },
+kinds! {
+    #[derive(Clone, Debug, Serialize)]
+    pub enum DaemonMsg: t = "t" in MsgFields, class {
+        /// The hello is accepted at protocol `proto`. `caps` are the client's
+        /// capabilities the daemon takes up, and `client` this connection's id,
+        /// as [`Origin`]s name it. `commands` are the slash commands the daemon
+        /// runs, for help and completion; none from a daemon older than them.
+        Welcome "welcome" {
+            proto: u32,
+            build: String,
+            caps: Caps = default,
+            client: u32 = default,
+            commands: Vec<CommandInfo> = default,
+        } = Control;
+        /// The daemon speaks protocols `min..=supported` (just `supported`
+        /// without `min`), none of the client's.
+        Mismatch "mismatch" { supported: u32, min: Option<u32> = default } = Control;
+        /// A newer build was staged: the daemon finishes in-flight work, exits,
+        /// and closes every connection. Clients then reconnect, which starts the
+        /// new build, and re-attach to replay what they missed. Sent as the reply
+        /// to a hello, or to connections already open when the drain began.
+        Draining "draining" = Control;
+        Attached "attached" { session: SessionId, workspace: PathBuf } = Durable;
+        Entry "entry" (Entry) = (entry_class), read decode::entry_msg;
+        /// Live text of an unfinished model call, of its `attempt`th try.
+        /// Never logged: the committed `model_result` is the fact. A nonzero
+        /// `attempt` is only sent with [`Cap::Attempts`].
+        Delta "delta" { call: u64, text: String, attempt: u16 = default } = Ephemeral;
+        /// Replay is complete; everything after this is live.
+        Synced "synced" { seq: u64 } = Durable;
+        Sessions "sessions" { sessions: Vec<SessionSummary> } = Control;
+        /// The answer to [`ClientMsg::Status`].
+        Status "status" {
+            pid: u32,
+            build: String,
+            /// Seconds since the Unix epoch at start.
+            started: u64,
+            /// Open connections, the asking one included.
+            clients: u32,
+            /// Sessions the daemon knows, loaded or not.
+            known: u32,
+        } = Control;
+        /// The answer to [`ClientMsg::Settings`]: the settings as they are now,
+        /// and why its change was not made, if it was not.
+        Settings "settings" { settings: HomeSettings, error: Option<String> = default } = Control;
+        /// Sent after `Synced` when the replay held entries.
+        Recap "recap" (Recap) = Durable, read decode::recap_msg;
+        /// Tool call `call` waits for approval: sent when it is asked, and
+        /// after `Synced` for every call still waiting.
+        Ask "ask" { call: u64, tool: String, input: Json } = Durable;
+        Error "error" { message: String } = Control;
+        /// The whole log-derived view at `view.seq`, in place of the replay up
+        /// to it: for an attach from far behind, or a client that fell too far
+        /// behind live. Folding it and what follows equals folding the entries
+        /// it stands for. Only sent with [`Cap::Snapshot`].
+        Snapshot "snapshot" (Box<view::SessionView>) = Durable, read decode::snapshot_msg;
+        /// Mutation `origin` was taken; what it causes follows as entries. Only
+        /// sent with [`Cap::Ack`].
+        Ack "ack" { origin: Origin } = Control;
+        /// Mutation `origin` was refused. Only sent with [`Cap::Ack`].
+        Rejected "rejected" { origin: Origin, reason: Rejection, message: String = default } = Control;
+    }
     /// A message, or an entry, of a kind this build does not know: a newer
     /// daemon's. Never sent; decoding yields it so a client skips what it
     /// cannot show instead of dropping the connection. `seq` is the
     /// entry's.
-    #[serde(skip)]
-    Unknown {
-        seq: Option<u64>,
-    },
+    unknown Unknown { seq: Option<u64> } = Control;
+    else Ok(Self::Unknown { seq: None })
 }
 
-// A reference, as `skip_serializing_if` passes it.
-#[allow(clippy::trivially_copy_pass_by_ref)]
-const fn is_zero(n: &u32) -> bool {
-    *n == 0
+/// An entry's frame is as its kind is: every one so far is durable (bash
+/// progress included: it is the partial output recovery reports). An
+/// ephemeral kind (usage ticks, presence) would go to live clients and never
+/// be replayed.
+const fn entry_class(msg: &DaemonMsg) -> Class {
+    match msg {
+        DaemonMsg::Entry(e) => e.body.class(),
+        _ => Class::Durable,
+    }
 }
 
 /// How a message stands to the session's log.
@@ -1105,64 +1347,6 @@ pub enum Class {
     /// About the connection rather than the session: always delivered, in
     /// order.
     Control,
-}
-
-impl Body {
-    /// Every entry kind is durable so far (bash progress included: it is
-    /// the partial output recovery reports). An ephemeral kind (usage ticks,
-    /// presence) would go to live clients and never be replayed. The match
-    /// fails to compile when a kind is added, so that it is classified.
-    pub const fn class(&self) -> Class {
-        match self {
-            Self::User { .. }
-            | Self::Assistant { .. }
-            | Self::ToolCall { .. }
-            | Self::ToolProcess { .. }
-            | Self::ToolResult { .. }
-            | Self::ModelCall { .. }
-            | Self::ModelResult { .. }
-            | Self::Hook { .. }
-            | Self::Ask { .. }
-            | Self::Link { .. }
-            | Self::Watch { .. }
-            | Self::Fired { .. }
-            | Self::Environment(_)
-            | Self::Extensions { .. }
-            | Self::Ext { .. }
-            | Self::Context { .. }
-            | Self::Command { .. }
-            | Self::CommandResult { .. }
-            | Self::Queued { .. }
-            | Self::Steer { .. }
-            | Self::Progress { .. }
-            | Self::Interrupt
-            | Self::Settings(_) => Class::Durable,
-        }
-    }
-}
-
-impl DaemonMsg {
-    pub const fn class(&self) -> Class {
-        match self {
-            Self::Entry(e) => e.body.class(),
-            Self::Attached { .. }
-            | Self::Synced { .. }
-            | Self::Recap(_)
-            | Self::Ask { .. }
-            | Self::Snapshot(_) => Class::Durable,
-            Self::Delta { .. } => Class::Ephemeral,
-            Self::Welcome { .. }
-            | Self::Mismatch { .. }
-            | Self::Draining
-            | Self::Sessions { .. }
-            | Self::Settings { .. }
-            | Self::Status { .. }
-            | Self::Error { .. }
-            | Self::Ack { .. }
-            | Self::Rejected { .. }
-            | Self::Unknown { .. } => Class::Control,
-        }
-    }
 }
 
 /// Writes one frame: a little-endian u32 length followed by a JSON body,
@@ -1245,7 +1429,7 @@ impl Frame {
         bytes.extend_from_slice(&[0; 4]);
         bytes.extend_from_slice(TAG);
         bytes.extend_from_slice(fields);
-        // Every entry kind is durable so far; see `Body::class`.
+        // Every entry kind is durable so far; see `entry_class`.
         Self::finish(bytes, Some(seq), Class::Durable)
     }
 }
@@ -1300,9 +1484,6 @@ fn read_body(r: &mut dyn Read) -> io::Result<Option<Vec<u8>>> {
 
 #[cfg(test)]
 mod tests {
-    use serde_json::Value;
-
-    use super::decode::{known_kind, known_msg};
     use super::*;
 
     #[test]
@@ -1473,203 +1654,277 @@ mod tests {
         assert!(msg(r#"{"seq":1}"#).is_err());
     }
 
-    /// The matches fail to compile when a variant is added, so that it is
-    /// added to the known tags as well.
+    /// What `kinds!` declares is all there is: every tag a union's encoder
+    /// writes is one its decoder reads, and back.
+    #[test]
+    fn every_kind_is_registered_by_construction() {
+        for tag in Body::TAGS {
+            let line = format!(r#"{{"seq":1,"epoch":0,"kind":"{tag}"}}"#);
+            match Entry::from_json(line.as_bytes()) {
+                Ok(e) => assert_eq!(serde_json::to_value(&e).unwrap()["kind"], *tag),
+                Err(e) => assert!(e.to_string().starts_with("missing field"), "{tag}: {e}"),
+            }
+        }
+        for tag in DaemonMsg::TAGS {
+            let msg = DaemonMsg::from_json(format!(r#"{{"t":"{tag}"}}"#).as_bytes());
+            assert!(!matches!(msg, Ok(DaemonMsg::Unknown { .. })), "{tag}");
+        }
+        for tag in ClientMsg::TAGS {
+            let msg = ClientMsg::from_json(format!(r#"{{"t":"{tag}"}}"#).as_bytes());
+            assert!(
+                msg.as_ref().map_or_else(
+                    |e| e.to_string().starts_with("missing field"),
+                    |m| serde_json::to_value(m).unwrap()["t"] == *tag
+                ),
+                "{tag}: {msg:?}"
+            );
+        }
+        let entry = DaemonMsg::Entry(Entry::new(1, 0, Body::INTERRUPT));
+        assert_eq!(serde_json::to_value(&entry).unwrap()["t"], "entry");
+        assert!(DaemonMsg::knows("entry") && !DaemonMsg::knows("hello"));
+        assert!(Verdict::knows("retry") && !Body::knows("retry"));
+    }
+
+    /// Each kind earlier builds wrote says itself in today's, which say
+    /// themselves.
     #[test]
     #[allow(clippy::too_many_lines)]
-    fn every_tag_this_build_sends_is_known() {
-        let child = SessionId(Uuid::from_u128(1));
-        let bodies = [
-            Body::User { text: "u".into() },
-            Body::Queued {
-                text: "q".into(),
-                steer: true,
-            },
-            Body::Steer {
-                text: "s".into(),
-                queued: 1,
-            },
-            Body::Assistant { text: "a".into() },
-            Body::ToolCall {
-                tool: "t".into(),
-                input: Json::null(),
-                id: None,
-                card: None,
-            },
-            Body::ToolProcess {
-                call: 1,
-                pgid: 1,
-                boot: "b".into(),
-                background: false,
-            },
-            Body::Progress {
-                call: 1,
-                text: "p".into(),
-            },
-            Body::ToolResult {
-                call: 1,
-                outcome: Outcome::Interrupted { output: None },
-                card: None,
-            },
-            Body::ModelCall { model: "m".into() },
-            Body::ModelResult {
-                call: 1,
-                outcome: Outcome::Interrupted { output: None },
-            },
-            Body::Hook {
-                hook: "h".into(),
-                decision: Decision::OnStop { text: "t".into() },
-            },
-            Body::Ask { call: 1 },
-            Body::Link {
-                child,
-                input: "i".into(),
-            },
-            Body::Watch { child },
-            Body::Fired {
-                watch: 1,
-                outcome: Outcome::Interrupted { output: None },
-            },
-            Body::Environment(Environment::default()),
-            Body::Extensions {
-                installed: Vec::new(),
-            },
-            Body::Ext {
-                ext: "e".into(),
-                state: "s".into(),
-                data: Json::null(),
-            },
-            Body::Context { text: "c".into() },
-            Body::Command {
-                name: "n".into(),
-                args: String::new(),
-            },
-            Body::CommandResult {
-                call: 1,
-                outcome: Outcome::Interrupted { output: None },
-            },
-            Body::Interrupt,
-            Body::Settings(Overrides::default()),
-        ];
-        for body in &bodies {
-            match body {
-                Body::User { .. }
-                | Body::Queued { .. }
-                | Body::Steer { .. }
-                | Body::Progress { .. }
-                | Body::Interrupt
-                | Body::Settings(_)
-                | Body::Assistant { .. }
-                | Body::ToolCall { .. }
-                | Body::ToolProcess { .. }
-                | Body::ToolResult { .. }
-                | Body::ModelCall { .. }
-                | Body::ModelResult { .. }
-                | Body::Hook { .. }
-                | Body::Ask { .. }
-                | Body::Link { .. }
-                | Body::Watch { .. }
-                | Body::Fired { .. }
-                | Body::Environment(_)
-                | Body::Extensions { .. }
-                | Body::Ext { .. }
-                | Body::Context { .. }
-                | Body::Command { .. }
-                | Body::CommandResult { .. } => {}
-            }
-            let json = serde_json::to_value(body).unwrap();
-            assert!(known_kind(json["kind"].as_str().unwrap()), "{json}");
-        }
-        let msgs = [
-            DaemonMsg::Welcome {
-                proto: PROTO,
-                build: "b".into(),
-                caps: Caps::ALL,
-                client: 1,
-                commands: vec![CommandInfo {
+    fn every_old_kind_has_a_v2_shim() {
+        let call = |n| CallId::new(n).unwrap();
+        let old = [
+            (
+                Body::User { text: "u".into() },
+                Body::Input {
+                    text: "u".into(),
+                    mode: Mode::Queue,
+                    taken: true,
+                    origin: None,
+                },
+            ),
+            (
+                Body::Queued {
+                    text: "q".into(),
+                    steer: true,
+                },
+                Body::Input {
+                    text: "q".into(),
+                    mode: Mode::Steer,
+                    taken: false,
+                    origin: None,
+                },
+            ),
+            (
+                Body::Steer {
+                    text: "s".into(),
+                    queued: 2,
+                },
+                Body::Take {
+                    input: Seq::new(2).unwrap(),
+                },
+            ),
+            (
+                Body::Ask { call: 3 },
+                Body::Wait {
+                    call: call(3),
+                    on: WaitOn::Approval,
+                },
+            ),
+            (
+                Body::Hook {
+                    hook: "user".into(),
+                    decision: Decision::Approval {
+                        tool: "t".into(),
+                        approved: false,
+                        call: Some(3),
+                    },
+                },
+                Body::Answer {
+                    call: call(3),
+                    value: false.into(),
+                    origin: None,
+                },
+            ),
+            (
+                Body::Hook {
+                    hook: "policy".into(),
+                    decision: Decision::Permission {
+                        tool: "t".into(),
+                        permission: Permission::Ask,
+                    },
+                },
+                Body::Decision {
+                    by: "policy".into(),
+                    call: None,
+                    d: Verdict::Permission {
+                        permission: Permission::Ask,
+                    },
+                },
+            ),
+            (
+                Body::Hook {
+                    hook: "retry".into(),
+                    decision: Decision::Retry {
+                        call: 4,
+                        attempt: 2,
+                        error: "e".into(),
+                    },
+                },
+                Body::Decision {
+                    by: "retry".into(),
+                    call: Some(call(4)),
+                    d: Verdict::Retry {
+                        attempt: 2,
+                        error: "e".into(),
+                    },
+                },
+            ),
+            (
+                Body::Command {
                     name: "model".into(),
-                    description: "switch model".into(),
-                }],
+                    args: "m".into(),
+                },
+                Body::ToolCall {
+                    tool: "model".into(),
+                    input: serde_json::json!({ "args": "m" }).into(),
+                    id: None,
+                    card: None,
+                    by: Audience::User,
+                },
+            ),
+            (
+                Body::CommandResult {
+                    call: 5,
+                    outcome: Outcome::Interrupted { output: None },
+                },
+                Body::ToolResult {
+                    call: 5,
+                    outcome: Outcome::Interrupted { output: None },
+                    card: None,
+                },
+            ),
+            (
+                Body::Settings(Overrides {
+                    model: Some("m".into()),
+                }),
+                Body::Ext {
+                    ext: "settings".into(),
+                    state: "model".into(),
+                    data: "m".into(),
+                },
+            ),
+        ];
+        for (old, new) in old {
+            let shim = old.shim().unwrap();
+            assert!(matches!(shim, std::borrow::Cow::Owned(_)), "{old:?}");
+            assert_eq!(*shim, new);
+            assert!(matches!(new.shim(), Some(std::borrow::Cow::Borrowed(_))));
+        }
+        assert_eq!(Body::Ask { call: 0 }.shim(), None);
+    }
+
+    /// v2's kinds, as a log line holds them.
+    #[test]
+    #[allow(clippy::too_many_lines)]
+    fn v2_entries_are_flat_and_read_back() {
+        let author = Author {
+            client: ClientId(Uuid::from_u128(0xc)),
+            seq: ClientSeq::new(7).unwrap(),
+        };
+        let seq = |n| Seq::new(n).unwrap();
+        let bodies = [
+            Body::Input {
+                text: "hi".into(),
+                mode: Mode::Queue,
+                taken: true,
+                origin: Some(author),
             },
-            DaemonMsg::Mismatch {
-                supported: PROTO,
-                min: None,
+            Body::Input {
+                text: "also".into(),
+                mode: Mode::Steer,
+                taken: false,
+                origin: None,
             },
-            DaemonMsg::Draining,
-            DaemonMsg::Attached {
-                session: child,
-                workspace: "/w".into(),
+            Body::Take { input: seq(2) },
+            Body::ModelCall {
+                model: "m".into(),
+                attempt: 1,
             },
-            DaemonMsg::Entry(Entry::new(1, 0, Body::Ask { call: 1 })),
-            DaemonMsg::Delta {
-                call: 1,
-                text: "t".into(),
-            },
-            DaemonMsg::Synced { seq: 1 },
-            DaemonMsg::Sessions { sessions: vec![] },
-            DaemonMsg::Settings {
-                settings: HomeSettings::default(),
-                error: None,
-            },
-            DaemonMsg::Status {
-                pid: 1,
-                build: "b".into(),
-                started: 0,
-                clients: 1,
-                known: 0,
-            },
-            DaemonMsg::Recap(Recap::default()),
-            DaemonMsg::Ask {
-                call: 1,
-                tool: "t".into(),
-                input: Json::null(),
-            },
-            DaemonMsg::Error {
-                message: "m".into(),
-            },
-            DaemonMsg::Snapshot(Box::default()),
-            DaemonMsg::Ack {
-                origin: Origin {
-                    client: 1,
-                    client_seq: 1,
+            Body::Decision {
+                by: "policy".into(),
+                call: CallId::new(4),
+                d: Verdict::Permission {
+                    permission: Permission::Ask,
                 },
             },
-            DaemonMsg::Rejected {
-                origin: Origin {
-                    client: 1,
-                    client_seq: 1,
+            Body::Decision {
+                by: "hook".into(),
+                call: CallId::new(3),
+                d: Verdict::PrepareStep,
+            },
+            Body::Decision {
+                by: "hook".into(),
+                call: CallId::new(4),
+                d: Verdict::PostTool {
+                    original: Outcome::Failed { error: "e".into() },
                 },
-                reason: Rejection::Stale,
-                message: String::new(),
+            },
+            Body::Wait {
+                call: CallId::new(4).unwrap(),
+                on: WaitOn::Child { link: seq(3) },
+            },
+            Body::Answer {
+                call: CallId::new(4).unwrap(),
+                value: true.into(),
+                origin: Some(author),
+            },
+            Body::Interrupt {
+                origin: Some(author),
+            },
+            Body::Edit {
+                target: seq(2),
+                upto: Some(seq(4)),
+                replace: None,
             },
         ];
-        for msg in &msgs {
-            match msg {
-                DaemonMsg::Unknown { .. } => unreachable!(),
-                DaemonMsg::Welcome { .. }
-                | DaemonMsg::Mismatch { .. }
-                | DaemonMsg::Draining
-                | DaemonMsg::Attached { .. }
-                | DaemonMsg::Entry(_)
-                | DaemonMsg::Delta { .. }
-                | DaemonMsg::Synced { .. }
-                | DaemonMsg::Sessions { .. }
-                | DaemonMsg::Settings { .. }
-                | DaemonMsg::Status { .. }
-                | DaemonMsg::Recap(_)
-                | DaemonMsg::Ask { .. }
-                | DaemonMsg::Error { .. }
-                | DaemonMsg::Snapshot(_)
-                | DaemonMsg::Ack { .. }
-                | DaemonMsg::Rejected { .. } => {}
-            }
-            let json = serde_json::to_vec(msg).unwrap();
-            let tags: Value = serde_json::from_slice(&json).unwrap();
-            assert!(known_msg(tags["t"].as_str().unwrap()), "{tags}");
-            assert!(!matches!(
-                DaemonMsg::from_json(&json),
-                Ok(DaemonMsg::Unknown { .. })
-            ));
+        let json: Vec<_> = bodies
+            .iter()
+            .map(|b| serde_json::to_string(&Entry::new(5, 1, b.clone())).unwrap())
+            .collect();
+        let who = r#""origin":{"client":"00000000-0000-0000-0000-00000000000c","seq":7}"#;
+        let head = r#"{"seq":5,"epoch":1,"kind":"#;
+        assert_eq!(
+            json,
+            [
+                format!(r#"{head}"input","text":"hi","taken":true,{who}}}"#),
+                format!(r#"{head}"input","text":"also","mode":"steer"}}"#),
+                format!(r#"{head}"take","input":2}}"#),
+                format!(r#"{head}"model_call","model":"m","attempt":1}}"#),
+                format!(
+                    r#"{head}"decision","by":"policy","call":4,"d":"permission","permission":"ask"}}"#
+                ),
+                format!(r#"{head}"decision","by":"hook","call":3,"d":"prepare_step"}}"#),
+                format!(
+                    r#"{head}"decision","by":"hook","call":4,"d":"post_tool","original":{{"status":"failed","error":"e"}}}}"#
+                ),
+                format!(r#"{head}"wait","call":4,"on":"child","link":3}}"#),
+                format!(r#"{head}"answer","call":4,"value":true,{who}}}"#),
+                format!(r#"{head}"interrupt",{who}}}"#),
+                format!(r#"{head}"edit","target":2,"upto":4}}"#),
+            ]
+        );
+        for (body, json) in bodies.iter().zip(&json) {
+            assert_eq!(
+                &Entry::from_json(json.as_bytes()).unwrap().body,
+                body,
+                "{json}"
+            );
+        }
+        for bad in [
+            r#"{"seq":1,"epoch":0,"kind":"wait","call":0,"on":"approval"}"#,
+            r#"{"seq":1,"epoch":0,"kind":"take","input":0}"#,
+            r#"{"seq":1,"epoch":0,"kind":"decision","by":"h","d":"later"}"#,
+        ] {
+            assert!(Entry::from_json(bad.as_bytes()).is_err(), "{bad}");
         }
     }
 
@@ -1683,6 +1938,7 @@ mod tests {
             tool: "bash".into(),
             input: serde_json::json!({ "command": "ls" }).into(),
             id: None,
+            by: Audience::Model,
             card: Some(Card {
                 title: "$ ls".into(),
                 ..Card::default()
@@ -1734,7 +1990,7 @@ mod tests {
                     output: Some("so far".into()),
                 },
             },
-            Body::Interrupt,
+            Body::INTERRUPT,
             Body::Settings(Overrides {
                 model: Some("m".into()),
             }),
@@ -1757,19 +2013,13 @@ mod tests {
         for (body, json) in bodies.iter().zip(&json) {
             assert_eq!(&Entry::from_json(json.as_bytes()).unwrap().body, body);
         }
-        let call = Body::ToolCall {
-            tool: "t".into(),
-            input: Json::null(),
-            id: Some("call_1".into()),
-            card: None,
-        };
-        let reserved = Entry {
-            uuid: Some(Uuid::from_u128(7)),
-            parent: Some(Uuid::from_u128(6)),
-            ..Entry::new(1, 1, call)
-        };
-        let json = serde_json::to_string(&reserved).unwrap();
-        assert_eq!(Entry::from_json(json.as_bytes()).unwrap(), reserved);
+        // Fields once reserved for entries addressed across sessions were
+        // never written; a line with them reads as one without.
+        let reserved = r#"{"seq":1,"epoch":1,"uuid":"00000000-0000-0000-0000-000000000007","parent":"00000000-0000-0000-0000-000000000006","kind":"interrupt"}"#;
+        assert_eq!(
+            Entry::from_json(reserved.as_bytes()).unwrap(),
+            Entry::new(1, 1, Body::INTERRUPT)
+        );
     }
 
     #[test]

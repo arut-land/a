@@ -1,6 +1,6 @@
 use std::path::{Path, PathBuf};
 
-use protocol::{DaemonMsg, Decode, Json, Permission};
+use protocol::{Audience, DaemonMsg, Decode, Json, Permission};
 
 use super::*;
 
@@ -90,7 +90,7 @@ impl Rng {
 
 /// A log as the engine could write it: outcomes only for open calls, asks
 /// only for open tool calls not asked yet, answers only for asks, steers
-/// only for queued input, fires only for armed watches.
+/// only for input queued to steer, fires only for armed watches.
 #[allow(clippy::too_many_lines)]
 fn log(rng: &mut Rng, len: usize) -> Vec<Entry> {
     let mut entries: Vec<Entry> = Vec::new();
@@ -100,15 +100,25 @@ fn log(rng: &mut Rng, len: usize) -> Vec<Entry> {
         // A call waiting for its answer settles only once answered.
         let open: Vec<u64> = ledger
             .open_calls()
-            .filter(|(_, o)| o.phase != Phase::Asked)
+            .filter(|(_, o)| !matches!(o.phase, Phase::Waiting(_)))
             .map(|(s, _)| s)
             .collect();
+        // Asked while its gate decides: a running or answered call is not
+        // asked again.
         let calls: Vec<u64> = ledger
             .open_calls()
-            .filter(|(_, o)| matches!(o.call, Call::Tool { .. }) && o.phase == Phase::Called)
+            .filter(|(_, o)| {
+                matches!(o.call, Call::Tool { .. }) && matches!(o.phase, Phase::Gating { .. })
+            })
             .map(|(s, _)| s)
             .collect();
-        let queued: Vec<u64> = ledger.untaken().iter().map(|q| q.seq).collect();
+        // The engine steers in only input queued to steer.
+        let steers: Vec<u64> = ledger
+            .untaken()
+            .iter()
+            .filter(|q| q.steer)
+            .map(|q| q.seq)
+            .collect();
         let commands: Vec<u64> = ledger.open_commands().collect();
         let armed: Vec<u64> = ledger.armed().map(|(s, _)| s).collect();
         let text = format!("t{}", rng.below(4));
@@ -118,9 +128,9 @@ fn log(rng: &mut Rng, len: usize) -> Vec<Entry> {
                 text,
                 steer: rng.below(2) == 0,
             },
-            3 => match rng.pick(&queued) {
+            3 => match rng.pick(&steers) {
                 Some(queued) => Body::Steer { text, queued },
-                None => Body::Interrupt,
+                None => Body::INTERRUPT,
             },
             4 => Body::Assistant { text },
             5 | 6 => Body::ToolCall {
@@ -128,8 +138,12 @@ fn log(rng: &mut Rng, len: usize) -> Vec<Entry> {
                 input: Json::from(rng.below(3)),
                 id: None,
                 card: None,
+                by: Audience::Model,
             },
-            7 => Body::ModelCall { model: "m".into() },
+            7 => Body::ModelCall {
+                model: "m".into(),
+                attempt: 0,
+            },
             8 | 9 => match rng.pick(&open) {
                 Some(call) if rng.below(2) == 0 => Body::ToolResult {
                     call,
@@ -140,7 +154,7 @@ fn log(rng: &mut Rng, len: usize) -> Vec<Entry> {
                     call,
                     outcome: rng.outcome(),
                 },
-                None => Body::Interrupt,
+                None => Body::INTERRUPT,
             },
             10 => match rng.pick(&open) {
                 Some(call) => Body::ToolProcess {
@@ -149,15 +163,15 @@ fn log(rng: &mut Rng, len: usize) -> Vec<Entry> {
                     boot: ["b1", "b2"][rng.below(2)].into(),
                     background: rng.below(2) == 0,
                 },
-                None => Body::Interrupt,
+                None => Body::INTERRUPT,
             },
             11 => match rng.pick(&open) {
                 Some(call) => Body::Progress { call, text },
-                None => Body::Interrupt,
+                None => Body::INTERRUPT,
             },
             12 => match rng.pick(&calls) {
                 Some(call) => Body::Ask { call },
-                None => Body::Interrupt,
+                None => Body::INTERRUPT,
             },
             13 | 14 => {
                 let decision = match rng.below(4) {
@@ -197,7 +211,7 @@ fn log(rng: &mut Rng, len: usize) -> Vec<Entry> {
                     watch,
                     outcome: rng.outcome(),
                 },
-                None => Body::Interrupt,
+                None => Body::INTERRUPT,
             },
             18 => Body::Environment(Environment {
                 cwd: format!("/{}", rng.below(3)).into(),
@@ -219,7 +233,7 @@ fn log(rng: &mut Rng, len: usize) -> Vec<Entry> {
                     call,
                     outcome: rng.outcome(),
                 },
-                None => Body::Interrupt,
+                None => Body::INTERRUPT,
             },
             _ => Body::Settings(Overrides {
                 model: (rng.below(2) == 0).then(|| text.clone()),
@@ -271,7 +285,10 @@ fn any_log_folds() {
                     text: "s".into(),
                     queued: call,
                 },
-                5 => Body::ModelCall { model: "m".into() },
+                5 => Body::ModelCall {
+                    model: "m".into(),
+                    attempt: 0,
+                },
                 6 => Body::CommandResult {
                     call,
                     outcome: rng.outcome(),
@@ -300,6 +317,7 @@ fn a_call_settled_unanswered_leaves_the_inbox() {
                 input: Json::null(),
                 id: None,
                 card: None,
+                by: Audience::Model,
             },
         ),
         Entry::new(2, 0, Body::Ask { call: 1 }),

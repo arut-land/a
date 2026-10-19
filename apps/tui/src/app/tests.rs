@@ -9,7 +9,7 @@ use ratatui_core::style::Modifier;
 use serde_json::json;
 
 use client::{Cmd, Event, Welcome};
-use protocol::Caps;
+use protocol::{Audience, Caps};
 
 use super::{App, Effect};
 use crate::keys::{Input, Key, Mouse};
@@ -117,6 +117,7 @@ fn asked_command() -> Vec<DaemonMsg> {
                     title: "$ ls".into(),
                     ..Card::default()
                 }),
+                by: Audience::Model,
             },
         ),
         entry(4, Body::Ask { call: 3 }),
@@ -179,16 +180,19 @@ fn a_streamed_reply_shows_live_then_its_committed_text() {
                 3,
                 Body::ModelCall {
                     model: "gpt".into(),
+                    attempt: 0,
                 },
             ),
             DaemonMsg::Synced { seq: 3 },
             DaemonMsg::Delta {
                 call: 3,
                 text: "Hel".into(),
+                attempt: 0,
             },
             DaemonMsg::Delta {
                 call: 3,
                 text: "lo **you**".into(),
+                attempt: 0,
             },
         ],
     );
@@ -359,7 +363,13 @@ fn ctrl_c_interrupts_a_running_call_and_shows_how_it_ended() {
 fn ctrl_c_interrupts_a_running_model_call_too() {
     let msgs = [
         entry(1, Body::User { text: "hi".into() }),
-        entry(2, Body::ModelCall { model: "m".into() }),
+        entry(
+            2,
+            Body::ModelCall {
+                model: "m".into(),
+                attempt: 0,
+            },
+        ),
     ];
     let (mut app, _) = app(Viewport::Full, &msgs);
     assert!(matches!(
@@ -571,11 +581,18 @@ fn render_cost() {
                 input: json!({"command": "ls"}).into(),
                 id: None,
                 card: None,
+                by: Audience::Model,
             },
         ));
     }
     let model = 2 + 2000 * 3;
-    msgs.push(entry(model, Body::ModelCall { model: "m".into() }));
+    msgs.push(entry(
+        model,
+        Body::ModelCall {
+            model: "m".into(),
+            attempt: 0,
+        },
+    ));
     let (mut app, _) = app(Viewport::Full, &msgs);
     // What a frame writes, as the client writes it.
     let count = Count::default();
@@ -594,6 +611,7 @@ fn render_cost() {
         app.fold(&DaemonMsg::Delta {
             call: model,
             text: format!("tok{i} "),
+            attempt: 0,
         });
         bytes += frame(&mut app, 120);
         delta.push(t.elapsed());

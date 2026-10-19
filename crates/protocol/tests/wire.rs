@@ -16,9 +16,10 @@ use std::path::{Path, PathBuf};
 
 use protocol::view::SessionView;
 use protocol::{
-    Activity, Body, Cap, Caps, Card, ClientDecl, ClientMsg, DaemonMsg, Decision, Decode, Entry,
-    Environment, HomeSettings, Installed, Origin, Outcome, Overrides, PROTO, Permission, Recap,
-    Rejection, Residency, Role, SessionId, SessionSummary, SettingsChange, Target,
+    Activity, Audience, Author, Body, CallId, Cap, Caps, Card, ClientDecl, ClientId, ClientMsg,
+    ClientSeq, DaemonMsg, Decision, Decode, Entry, Environment, HomeSettings, Installed, Mode,
+    Origin, Outcome, Overrides, PROTO, Permission, Recap, Rejection, Residency, Role, Seq,
+    SessionId, SessionSummary, SettingsChange, Target, Verdict, WaitOn,
 };
 use serde_json::json;
 use uuid::Uuid;
@@ -84,6 +85,7 @@ fn client_samples() -> Vec<Sample<ClientMsg>> {
                 build: "0.0.0+0123456789abcdef".into(),
                 min: None,
                 caps: Caps::NONE,
+                client: None,
             },
         ),
         sample(
@@ -93,6 +95,7 @@ fn client_samples() -> Vec<Sample<ClientMsg>> {
                 build: "0.0.0+0123456789abcdef".into(),
                 min: None,
                 caps: first_caps(),
+                client: None,
             },
         ),
         sample(
@@ -102,6 +105,7 @@ fn client_samples() -> Vec<Sample<ClientMsg>> {
                 build: "0.0.0+0123456789abcdef".into(),
                 min: None,
                 caps: steer_caps(),
+                client: None,
             },
         ),
         sample(
@@ -111,6 +115,7 @@ fn client_samples() -> Vec<Sample<ClientMsg>> {
                 build: "0.0.1+0123456789abcdef".into(),
                 min: Some(PROTO),
                 caps: first_caps(),
+                client: None,
             },
         ),
         sample(
@@ -222,6 +227,187 @@ fn client_samples() -> Vec<Sample<ClientMsg>> {
             },
             Cap::Settings,
         ),
+        sample(
+            "hello_client",
+            ClientMsg::Hello {
+                proto: PROTO,
+                build: "0.0.0+0123456789abcdef".into(),
+                min: None,
+                caps: [Cap::Ack, Cap::Origin].into_iter().collect(),
+                client: Some(CLIENT),
+            },
+        ),
+    ]
+}
+
+/// A client, as it names itself across its connections.
+const CLIENT: ClientId = ClientId(Uuid::from_u128(0xc));
+
+/// The v2 entry kinds and fields, which no build sends a client that does
+/// not read them.
+fn v2_samples() -> Vec<Sample<DaemonMsg>> {
+    let entry = |seq, body| DaemonMsg::Entry(Entry::new(seq, 0, body));
+    let call = |seq| CallId::new(seq).unwrap();
+    let seq = |seq| Seq::new(seq).unwrap();
+    let author = Author {
+        client: CLIENT,
+        seq: ClientSeq::new(4).unwrap(),
+    };
+    let v2 = |name, msg| gated(name, msg, Cap::Ledger);
+    vec![
+        v2(
+            "entry_input",
+            entry(
+                1,
+                Body::Input {
+                    text: "hi".into(),
+                    mode: Mode::Queue,
+                    taken: true,
+                    origin: None,
+                },
+            ),
+        ),
+        v2(
+            "entry_input_steer",
+            entry(
+                3,
+                Body::Input {
+                    text: "also this".into(),
+                    mode: Mode::Steer,
+                    taken: false,
+                    origin: None,
+                },
+            ),
+        ),
+        gated(
+            "entry_input_origin",
+            entry(
+                3,
+                Body::Input {
+                    text: "also this".into(),
+                    mode: Mode::Queue,
+                    taken: false,
+                    origin: Some(author),
+                },
+            ),
+            Cap::Origin,
+        ),
+        v2("entry_take", entry(4, Body::Take { input: seq(3) })),
+        v2(
+            "entry_model_call_attempt",
+            entry(
+                8,
+                Body::ModelCall {
+                    model: "openai:m".into(),
+                    attempt: 1,
+                },
+            ),
+        ),
+        v2(
+            "entry_tool_call_by_user",
+            entry(
+                22,
+                Body::ToolCall {
+                    tool: "model".into(),
+                    input: json!({ "args": "openai:m" }).into(),
+                    id: None,
+                    card: None,
+                    by: Audience::User,
+                },
+            ),
+        ),
+        v2(
+            "entry_decision",
+            entry(
+                12,
+                Body::Decision {
+                    by: "policy".into(),
+                    call: Some(call(2)),
+                    d: Verdict::Permission {
+                        permission: Permission::Ask,
+                    },
+                },
+            ),
+        ),
+        v2(
+            "entry_decision_retry",
+            entry(
+                10,
+                Body::Decision {
+                    by: "retry".into(),
+                    call: Some(call(8)),
+                    d: Verdict::Retry {
+                        attempt: 1,
+                        error: "rate limited".into(),
+                    },
+                },
+            ),
+        ),
+        v2(
+            "entry_wait_dialog",
+            entry(
+                13,
+                Body::Wait {
+                    call: call(2),
+                    on: WaitOn::Dialog {
+                        ui: json!({ "title": "pick a file" }).into(),
+                    },
+                },
+            ),
+        ),
+        v2(
+            "entry_answer",
+            entry(
+                14,
+                Body::Answer {
+                    call: call(2),
+                    value: true.into(),
+                    origin: None,
+                },
+            ),
+        ),
+        gated(
+            "entry_answer_origin",
+            entry(
+                14,
+                Body::Answer {
+                    call: call(2),
+                    value: false.into(),
+                    origin: Some(author),
+                },
+            ),
+            Cap::Origin,
+        ),
+        gated(
+            "entry_interrupt_origin",
+            entry(
+                25,
+                Body::Interrupt {
+                    origin: Some(author),
+                },
+            ),
+            Cap::Origin,
+        ),
+        v2(
+            "entry_edit",
+            entry(
+                26,
+                Body::Edit {
+                    target: seq(6),
+                    upto: Some(seq(7)),
+                    replace: Some(json!("[output elided]").into()),
+                },
+            ),
+        ),
+        gated(
+            "delta_attempt",
+            DaemonMsg::Delta {
+                call: 8,
+                text: "hel".into(),
+                attempt: 1,
+            },
+            Cap::Attempts,
+        ),
     ]
 }
 
@@ -232,13 +418,12 @@ fn daemon_samples() -> Vec<Sample<DaemonMsg>> {
         Entry {
             seq: 2,
             epoch: 0,
-            uuid: None,
-            parent: None,
             body: Body::ToolCall {
                 tool: "bash".into(),
                 input: json!({ "command": "ls" }).into(),
                 id: None,
                 card: None,
+                by: Audience::Model,
             },
         },
         Entry::new(3, 0, Body::Ask { call: 2 }),
@@ -313,6 +498,7 @@ fn daemon_samples() -> Vec<Sample<DaemonMsg>> {
                         title: "$ ls".into(),
                         ..Card::default()
                     }),
+                    by: Audience::Model,
                 },
             ),
         ),
@@ -381,6 +567,7 @@ fn daemon_samples() -> Vec<Sample<DaemonMsg>> {
                 8,
                 Body::ModelCall {
                     model: "openai:m".into(),
+                    attempt: 0,
                 },
             ),
         ),
@@ -551,12 +738,13 @@ fn daemon_samples() -> Vec<Sample<DaemonMsg>> {
                 }),
             ),
         ),
-        sample("entry_interrupt", entry(25, Body::Interrupt)),
+        sample("entry_interrupt", entry(25, Body::INTERRUPT)),
         sample(
             "delta",
             DaemonMsg::Delta {
                 call: 4,
                 text: "hel".into(),
+                attempt: 0,
             },
         ),
         sample("synced", DaemonMsg::Synced { seq: 3 }),
@@ -655,6 +843,9 @@ fn daemon_samples() -> Vec<Sample<DaemonMsg>> {
             Cap::Settings,
         ),
     ]
+    .into_iter()
+    .chain(v2_samples())
+    .collect()
 }
 
 fn corpus() -> PathBuf {

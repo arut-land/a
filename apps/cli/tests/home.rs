@@ -65,6 +65,7 @@ fn a_crash_loop_is_the_daemons_to_refuse() {
             build: "acceptance".into(),
             min: None,
             caps: Caps::NONE,
+            client: None,
         },
     )
     .unwrap();

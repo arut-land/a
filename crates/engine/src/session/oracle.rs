@@ -3,9 +3,9 @@
 
 use std::collections::{HashMap, HashSet, VecDeque};
 
-use protocol::ledger::{Call, Ledger, Phase};
+use protocol::ledger::{Call, Ledger, OutcomeKind, Phase};
 use protocol::{
-    Body, Decision, Entry, Environment, Installed, Outcome, Overrides, Recap, SessionId,
+    Body, Decision, Entry, Environment, Installed, Outcome, Overrides, Recap, SessionId, WaitOn,
 };
 
 use ext::host::Toolset;
@@ -30,13 +30,13 @@ pub fn check(entries: &[Entry], ledger: &Ledger) {
         .open_calls()
         .map(|(seq, open)| {
             let asked = match open.phase {
-                Phase::Called => Asked::No,
-                Phase::Asked => Asked::Waiting,
-                Phase::Answered { approved } => Asked::Answered(approved),
+                Phase::Waiting(WaitOn::Approval) => Asked::Waiting,
+                Phase::Settled(OutcomeKind::Failed) => Asked::Denied,
+                _ => Asked::No,
             };
             let call = match &open.call {
-                Call::Model => None,
-                Call::Tool { tool, input } => Some((tool.clone(), input.raw().to_owned())),
+                Call::Model { .. } => None,
+                Call::Tool { tool, input, .. } => Some((tool.clone(), input.raw().to_owned())),
             };
             (
                 seq,
@@ -242,9 +242,10 @@ fn recap(entries: &[Entry], since: u64) -> Option<Recap> {
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum Asked {
+    /// Not asked, or approved.
     No,
     Waiting,
-    Answered(bool),
+    Denied,
 }
 
 type Dangling = (
@@ -287,7 +288,7 @@ fn dangling_calls(entries: &[Entry]) -> Vec<Dangling> {
                 ..
             } => {
                 if let Some(at) = find(&mut dangling, *call) {
-                    dangling[at].3 = Asked::Answered(*approved);
+                    dangling[at].3 = if *approved { Asked::No } else { Asked::Denied };
                 }
                 continue;
             }
@@ -390,7 +391,7 @@ fn result(entries: &[Entry]) -> Option<Outcome> {
         Body::ToolResult { outcome, .. }
         | Body::ModelResult { outcome, .. }
         | Body::Fired { outcome, .. } => Some(outcome.clone()),
-        Body::Interrupt => Some(Outcome::Interrupted { output: None }),
+        Body::Interrupt { .. } => Some(Outcome::Interrupted { output: None }),
         _ => None,
     })
 }

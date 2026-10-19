@@ -208,6 +208,7 @@ impl Env {
             // did, which it must keep serving.
             min: None,
             caps: protocol::Caps::NONE,
+            client: None,
         });
         assert!(matches!(conn.recv(), DaemonMsg::Welcome { .. }));
         conn

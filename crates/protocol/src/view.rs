@@ -50,6 +50,8 @@ pub struct SessionView {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Stream {
     pub call: u64,
+    /// The attempt the text is of: a retry streams anew.
+    pub attempt: u16,
     pub text: String,
 }
 
@@ -397,12 +399,17 @@ impl SessionView {
                 })
             }
             DaemonMsg::Entry(e) => self.entry(e),
-            DaemonMsg::Delta { call, text } => {
+            DaemonMsg::Delta {
+                call,
+                text,
+                attempt,
+            } => {
                 match &mut self.streaming {
-                    Some(s) if s.call == *call => s.text.push_str(text),
+                    Some(s) if s.call == *call && s.attempt == *attempt => s.text.push_str(text),
                     s => {
                         *s = Some(Stream {
                             call: *call,
+                            attempt: *attempt,
                             text: text.clone(),
                         });
                     }
@@ -524,7 +531,7 @@ impl SessionView {
                 args: args.clone(),
                 outcome: None,
             },
-            Body::ModelCall { model } => Item::Reply {
+            Body::ModelCall { model, .. } => Item::Reply {
                 call: seq,
                 model: model.clone(),
                 text: String::new(),
@@ -535,20 +542,11 @@ impl SessionView {
                 decision: Decision::Approval { call: Some(_), .. },
                 ..
             } => return self.change(seq, &e.body),
-            Body::Hook { hook, decision } => {
-                // A retry streams anew: the failed attempt's text is not
-                // part of the reply.
-                if let Decision::Retry { call, .. } = decision
-                    && self.streaming.as_ref().is_some_and(|s| s.call == *call)
-                {
-                    self.streaming = None;
-                }
-                Item::Hook {
-                    seq,
-                    hook: hook.clone(),
-                    decision: decision.clone(),
-                }
-            }
+            Body::Hook { hook, decision } => Item::Hook {
+                seq,
+                hook: hook.clone(),
+                decision: decision.clone(),
+            },
             Body::Link { child, input } => Item::Child {
                 call: seq,
                 child: *child,

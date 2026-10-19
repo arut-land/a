@@ -123,6 +123,7 @@ fn attach(env: &Env, session: Option<SessionId>) -> (UnixStream, SessionId, Vec<
             build: "crash".into(),
             min: None,
             caps: protocol::Caps::NONE,
+            client: None,
         },
     );
     send(

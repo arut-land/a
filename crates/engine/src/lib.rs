@@ -959,9 +959,10 @@ fn handle(daemon: &Daemon, life: &Lifecycle, conn: &Stream) -> io::Result<()> {
             build,
             min,
             caps,
+            ..
         }) => {
             let theirs = Versions::new(min, proto);
-            (life.verdict(theirs, &build), theirs, caps & Caps::ALL)
+            (life.verdict(theirs, &build), theirs, caps & Caps::SERVED)
         }
         _ => (Verdict::Mismatch, Versions::from(0), Caps::NONE),
     };

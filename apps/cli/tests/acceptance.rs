@@ -8,7 +8,7 @@ use std::os::unix::fs::PermissionsExt;
 use std::process::Command;
 
 use common::{Env, Repl, assert_contiguous, group_alive, is_tool_call, result_of, wait_for};
-use protocol::{Body, ClientMsg, DaemonMsg, Decision, Outcome, Recap, Target};
+use protocol::{Audience, Body, ClientMsg, DaemonMsg, Decision, Outcome, Recap, Target};
 use serde_json::json;
 
 const ANY: Target = Target::Latest {
@@ -97,6 +97,7 @@ fn resume_after_the_terminal_closes_mid_turn_replays_every_entry() {
                 input: json!({ "seconds": 1 }).into(),
                 id: None,
                 card: None,
+                by: Audience::Model,
             },
             Body::ToolResult {
                 call,

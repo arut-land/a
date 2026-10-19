@@ -14,11 +14,11 @@ use std::time::{Duration, Instant};
 use ext::host::{Decided, Gate, Host, Parts, Registry};
 use ext::point::{Failed, Recover};
 use ext::{Action, Agent, Cancel, Cx, DynTool, Facts, Input, Replay, Route, States};
-use protocol::ledger::{self, Ledger, Phase};
+use protocol::ledger::{self, Ledger, OutcomeKind, Phase};
 use protocol::view::SessionView;
 use protocol::{
-    Activity, Body, Cap, Card, DaemonMsg, Decision, Entry, Environment, Frame, Installed, Json,
-    Outcome, Overrides, Residency, SessionId, SessionSummary,
+    Activity, Audience, Body, Cap, Card, DaemonMsg, Decision, Entry, Environment, Frame, Installed,
+    Json, Outcome, Overrides, Residency, SessionId, SessionSummary, WaitOn,
 };
 use rt::BoxFuture;
 use serde_json::Value;
@@ -224,7 +224,7 @@ struct Queue {
     next: u64,
     pending: Vec<Entry>,
     /// Flushes waiting for every entry up to a seq to commit.
-    flushes: Vec<(u64, rt::channel::Sender<io::Result<()>>)>,
+    flushes: Vec<(u64, rt::oneshot::Sender<io::Result<()>>)>,
     draining: bool,
 }
 
@@ -675,14 +675,13 @@ impl Session {
             if queue.pending.is_empty() && !queue.draining {
                 return Ok(());
             }
-            let (tx, rx) = rt::channel::bounded(1);
+            let (tx, rx) = rt::oneshot::channel();
             let upto = queue.next;
             queue.flushes.push((upto, tx));
             self.drain_in(&mut queue);
             rx
         };
-        rx.recv()
-            .await
+        rx.await
             .unwrap_or_else(|| Err(io::Error::other("the log writer stopped")))
     }
 
@@ -733,7 +732,7 @@ impl Session {
                     Err(e) => Err(io::Error::new(e.kind(), e.to_string())),
                     Ok(()) => Err(io::Error::other("an earlier entry failed to commit")),
                 };
-                drop(tx.send(done));
+                tx.send(done);
             }
         }
     }
@@ -1013,6 +1012,7 @@ impl Session {
                     tool,
                     input: input.into(),
                     id,
+                    by: Audience::Model,
                 });
                 let outcome = Outcome::Interrupted { output: None };
                 self.record(Body::ToolResult {
@@ -1023,7 +1023,7 @@ impl Session {
                 drop(agent.step(Input::ToolDone { call, outcome }));
             }
         }
-        self.record(Body::Interrupt);
+        self.record(Body::INTERRUPT);
         self.flush().await
     }
 
@@ -1046,7 +1046,12 @@ impl Session {
                 let name = model
                     .as_ref()
                     .map_or_else(|_| "none".to_owned(), Model::name);
-                let seq = self.append(Body::ModelCall { model: name }).await?;
+                let seq = self
+                    .append(Body::ModelCall {
+                        model: name,
+                        attempt: 0,
+                    })
+                    .await?;
                 (Call::Model, seq, self.run_model(seq, model, false).await)
             }
             Action::RunTool {
@@ -1073,6 +1078,7 @@ impl Session {
                         tool: tool.clone(),
                         input: Json::new(&input),
                         id,
+                        by: Audience::Model,
                     })
                     .await?;
                 let outcome = match gate {
@@ -1441,11 +1447,17 @@ impl Session {
     ) -> Outcome {
         let cancel = self.turn();
         // Counted in the log, so a crash does not start the count again.
-        let mut attempt = self.lock().ledger.call(call).map_or(0, |open| open.retries);
+        let mut attempt = match self.lock().ledger.call(call).map(|open| &open.call) {
+            Some(ledger::Call::Model { attempt }) => *attempt,
+            _ => 0,
+        };
         loop {
             let error = match failed.take() {
                 Some(error) => error,
-                None => match self.attempt(call, model, &request, &cancel).await {
+                None => match self
+                    .attempt((call, attempt), model, &request, &cancel)
+                    .await
+                {
                     Ok(outcome) => return outcome,
                     Err(error) => error,
                 },
@@ -1460,7 +1472,7 @@ impl Session {
             let failure = Failed {
                 request: &request,
                 error: &error,
-                attempt,
+                attempt: attempt.into(),
             };
             let recover =
                 registry
@@ -1476,7 +1488,7 @@ impl Session {
                     error: error.to_string(),
                 };
             }
-            attempt += 1;
+            attempt = attempt.saturating_add(1);
             match recover {
                 Recover::Retry { after } => {
                     if unless(&cancel, self.shared.rt.sleep(after)).await.is_none() {
@@ -1488,11 +1500,12 @@ impl Session {
         }
     }
 
-    /// One attempt at `model`'s reply to `request`, its text streaming to
-    /// clients as it arrives: the outcome, unless it failed.
+    /// Attempt `attempt` at `model`'s reply to `request`, its text
+    /// streaming to clients as it arrives under that attempt: the outcome,
+    /// unless it failed.
     async fn attempt(
         &self,
-        call: u64,
+        (call, attempt): (u64, u16),
         model: &Model,
         request: &llm::Request,
         cancel: &Cancel,
@@ -1501,6 +1514,7 @@ impl Session {
             self.broadcast(&DaemonMsg::Delta {
                 call,
                 text: text.to_owned(),
+                attempt,
             });
         };
         // Sent once polled, as an interrupt meanwhile finds it.
@@ -1641,10 +1655,10 @@ impl Session {
         };
         let outcome = match &call {
             _ if orphan => interrupted(),
-            Call::Tool { tool, input } if phase == Phase::Asked => {
+            Call::Tool { tool, input } if phase == Phase::Waiting(WaitOn::Approval) => {
                 self.ask(seq, tool, input).await?
             }
-            Call::Tool { .. } if phase == (Phase::Answered { approved: false }) => not_approved(),
+            Call::Tool { .. } if phase == Phase::Settled(OutcomeKind::Failed) => not_approved(),
             Call::Tool { tool, .. }
                 if registry.tools().get(tool).map(DynTool::replay) != Some(Replay::Safe) =>
             {
@@ -1881,14 +1895,14 @@ fn dangling_calls(ledger: &Ledger) -> Vec<Dangling> {
         .map(|(seq, open)| Dangling {
             seq,
             call: match &open.call {
-                ledger::Call::Model => Call::Model,
-                ledger::Call::Tool { tool, input } => Call::Tool {
+                ledger::Call::Model { .. } => Call::Model,
+                ledger::Call::Tool { tool, input, .. } => Call::Tool {
                     tool: tool.clone(),
                     input: input.value(),
                 },
             },
             processes: open.processes.clone(),
-            phase: open.phase,
+            phase: open.phase.clone(),
         })
         .collect()
 }

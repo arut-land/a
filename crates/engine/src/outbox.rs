@@ -341,6 +341,7 @@ mod tests {
         Frame::new(&DaemonMsg::Delta {
             call: 1,
             text: "t".into(),
+            attempt: 0,
         })
         .unwrap()
     }
@@ -423,6 +424,7 @@ mod tests {
         let big = Frame::new(&DaemonMsg::Delta {
             call: 1,
             text: "x".repeat(BUDGET / 2),
+            attempt: 0,
         })
         .unwrap();
         for _ in 0..4 {

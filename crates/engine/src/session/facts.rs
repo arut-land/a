@@ -188,11 +188,12 @@ impl Replayer {
                 return;
             }
             // The turn was cut short: what it asked for is not done.
-            Body::Interrupt => {
+            Body::Interrupt { .. } => {
                 asked.clear();
                 return;
             }
-            // Read by the model, not stepped through the agent.
+            // Read by the model, not stepped through the agent; and v2's
+            // kinds, which only the v2 engine writes and replays.
             Body::Steer { .. }
             | Body::Queued { .. }
             | Body::Progress { .. }
@@ -206,7 +207,13 @@ impl Replayer {
             | Body::Ext { .. }
             | Body::Context { .. }
             | Body::Command { .. }
-            | Body::CommandResult { .. } => return,
+            | Body::CommandResult { .. }
+            | Body::Input { .. }
+            | Body::Take { .. }
+            | Body::Decision { .. }
+            | Body::Wait { .. }
+            | Body::Answer { .. }
+            | Body::Edit { .. } => return,
         };
         asked.extend(agent.step(input));
     }

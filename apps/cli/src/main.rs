@@ -2,7 +2,6 @@ mod exts;
 
 use std::io::{self, BufRead, IsTerminal, Write};
 use std::process::ExitCode;
-use std::sync::mpsc;
 use std::thread;
 
 use client::{Attach, Driver, Effect, End, Endpoint, Env, Event, Link, SessionClient};
@@ -232,7 +231,7 @@ enum Input {
 /// as lines and its intents typed. When the daemon drains for an upgrade,
 /// it reconnects (starting the new build) and replays what it missed.
 fn repl(ctx: &Ctx, target: Target) -> io::Result<()> {
-    let (tx, rx) = mpsc::channel();
+    let (tx, rx) = client::inbox();
     let events = tx.clone();
     let driver = Driver::new(ctx.endpoint.clone(), ctx.staged.clone(), move |_, event| {
         let _ = events.send(Input::Client(event));
@@ -252,7 +251,7 @@ fn repl(ctx: &Ctx, target: Target) -> io::Result<()> {
                 return exit;
             }
         }
-        let Ok(input) = rx.recv() else {
+        let Some(input) = rx.recv() else {
             return Ok(());
         };
         effects = match input {
@@ -290,7 +289,7 @@ const NOT_RESPONDING: &str = "daemon not responding";
 struct Repl {
     screen: Screen,
     /// Taken by the thread reading stdin, once attached.
-    input: Option<mpsc::Sender<Input>>,
+    input: Option<client::Post<Input>>,
     /// Attached once at least.
     live: bool,
 }

@@ -4,10 +4,20 @@
 //! watches are armed, and the settings, environment and context last
 //! logged. Pure: the daemon and any client fold the same entries to the
 //! same ledger.
+//!
+//! It folds the v2 kinds only: an entry of a kind earlier builds write is
+//! folded as [`Body::shim`] says it, so an old log and a new one of the same
+//! session fold to the same ledger. What only an old log's order says (a
+//! `user` entry took up the oldest input waiting; a gate's decisions came
+//! before their call) is read in [`Ledger::legacy`], which nothing a v2
+//! build writes reaches.
 
 use std::collections::VecDeque;
 
-use crate::{Body, Decision, Entry, Environment, Installed, Json, Outcome, Overrides, SessionId};
+use crate::{
+    Activity, Audience, Author, Body, ClientId, ClientSeq, Decision, Entry, Environment, Installed,
+    Json, Mode, Outcome, Overrides, Permission, SessionId, Verdict, WaitOn,
+};
 
 #[derive(Clone, Debug, Default)]
 pub struct Ledger {
@@ -15,13 +25,11 @@ pub struct Ledger {
     seq: u64,
     /// Model and tool calls with an intent and no outcome, by seq.
     open: BySeq<Open>,
-    /// The open tool calls asked about and not yet answered, in the order
-    /// they were asked: the session's inbox.
+    /// The open calls waiting for an approval, in the order they began to:
+    /// the session's inbox.
     inbox: Vec<u64>,
     /// Input queued and not yet taken up, in order.
     untaken: VecDeque<Queued>,
-    /// Slash commands with an intent and no outcome.
-    commands: BySeq<()>,
     /// Watches that have not fired, by seq.
     armed: BySeq<SessionId>,
     /// Every child linked, in order, and the children ever watched.
@@ -33,8 +41,11 @@ pub struct Ledger {
     env: Option<Environment>,
     extensions: Option<Vec<Installed>>,
     context: bool,
+    /// The last mutation logged of each client that named itself.
+    clients: Vec<(ClientId, ClientSeq)>,
     /// The hook decisions ending the log, but for environments and
-    /// extensions logged between them.
+    /// extensions logged between them: in an old log, those of a gate whose
+    /// call is next.
     hooks: Vec<(String, Decision)>,
     /// What the session last settled with, as a child hands it back.
     result: Option<Outcome>,
@@ -50,25 +61,43 @@ pub struct Open {
     pub processes: Vec<(u32, String)>,
     /// The output it committed as it ran.
     pub progress: Option<String>,
-    /// The retries logged for it: a model call's attempt is one more.
-    pub retries: u32,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum Call {
-    Model,
-    Tool { tool: String, input: Json },
+    Model {
+        attempt: u16,
+    },
+    Tool {
+        tool: String,
+        input: Json,
+        by: Audience,
+    },
 }
 
-/// Where an open call stands.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+/// Where an open call stands. The one lifecycle of everything that waits
+/// (an approval, a dialog, a client, a child): what is running, and what
+/// waits on whom, is read from it rather than kept beside it.
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub enum Phase {
-    /// Its intent is committed; it runs, or is about to.
-    Called,
-    /// It waits for the user's approval: it is in the inbox.
-    Asked,
-    /// The user answered.
-    Answered { approved: bool },
+    /// Its intent is committed and its gate's decisions are being made,
+    /// `at` of them so far; it runs once they are.
+    Gating { at: u16 },
+    /// It waits, and runs (or settles) once answered.
+    Waiting(WaitOn),
+    /// It runs: it started a process, reported progress or was approved.
+    Running,
+    /// It has an outcome its result entry is yet to log, such as a call
+    /// denied or blocked.
+    Settled(OutcomeKind),
+}
+
+/// What an outcome was, without what it carries.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum OutcomeKind {
+    Done,
+    Failed,
+    Interrupted,
 }
 
 /// Input taken in and not yet taken up.
@@ -87,11 +116,11 @@ pub struct Link {
     pub input: String,
 }
 
-/// What the current turn did, from its user message on: what a recap
-/// tells but the reply, which only a model's reply format can read.
+/// What the current turn did, from the input that started it on: what a
+/// recap tells but the reply, which only a model's reply format can read.
 #[derive(Clone, Debug, Default)]
 struct Turn {
-    /// The seq of its user message; 0 before the first.
+    /// The seq of its input; 0 before the first.
     start: u64,
     prompt: Option<String>,
     tools: Vec<String>,
@@ -110,36 +139,42 @@ impl Ledger {
 
     /// Folds entry `e`, the one after the last folded. An entry that does
     /// not fit what came before (an outcome for no open call, an answer for
-    /// no ask) changes nothing it cannot apply to, as when an earlier
-    /// version wrote it.
+    /// no wait) changes nothing, as when an earlier version wrote it.
     pub fn apply(&mut self, e: &Entry) {
         self.seq = e.seq;
-        let seq = e.seq;
-        match &e.body {
-            Body::Hook { .. } | Body::Extensions { .. } | Body::Environment(_) => {}
-            _ => self.hooks.clear(),
+        if let Some(body) = e.body.shim() {
+            self.fold(e.seq, &body);
         }
-        match &e.body {
-            Body::User { text } => {
-                self.taken();
-                self.turn = Turn {
-                    start: seq,
-                    prompt: Some(text.clone()),
-                    ..Turn::default()
-                };
+        self.legacy(&e.body);
+    }
+
+    /// Folds an entry as v2 kinds say it.
+    fn fold(&mut self, seq: u64, body: &Body) {
+        match body {
+            Body::Input {
+                text,
+                mode,
+                taken,
+                origin,
+            } => {
+                self.author(*origin);
+                if *taken {
+                    self.turn = Turn::start(seq, text);
+                } else {
+                    self.untaken.push_back(Queued {
+                        seq,
+                        text: text.clone(),
+                        steer: *mode == Mode::Steer,
+                    });
+                }
             }
-            Body::Queued { text, steer } => self.untaken.push_back(Queued {
-                seq,
-                text: text.clone(),
-                steer: *steer,
-            }),
-            Body::Steer { queued, .. } => self.untaken.retain(|q| q.seq != *queued),
-            Body::Command { .. } => {
-                self.taken();
-                self.commands.insert(seq, ());
-            }
-            Body::CommandResult { call, .. } => {
-                self.commands.remove(*call);
+            Body::Take { input } => {
+                if let Some(at) = self.untaken.iter().position(|q| q.seq == input.get())
+                    && let Some(q) = self.untaken.remove(at)
+                    && !q.steer
+                {
+                    self.turn = Turn::start(seq, &q.text);
+                }
             }
             Body::ToolCall { .. }
             | Body::ModelCall { .. }
@@ -147,8 +182,13 @@ impl Ledger {
             | Body::Progress { .. }
             | Body::ToolResult { .. }
             | Body::ModelResult { .. }
-            | Body::Ask { .. }
-            | Body::Hook { .. } => self.track(seq, &e.body),
+            | Body::Decision { .. }
+            | Body::Wait { .. }
+            | Body::Answer { .. } => self.track(seq, body),
+            Body::Interrupt { origin } => {
+                self.author(*origin);
+                self.result = Some(Outcome::Interrupted { output: None });
+            }
             Body::Link { child, input } => self.links.push(Link {
                 seq,
                 child: *child,
@@ -169,30 +209,55 @@ impl Ledger {
                     output: text.as_str().into(),
                 });
             }
-            Body::Interrupt => self.result = Some(Outcome::Interrupted { output: None }),
             Body::Environment(env) => self.env = Some(env.clone()),
             Body::Extensions { installed } => self.extensions = Some(installed.clone()),
             Body::Context { .. } => self.context = true,
-            Body::Settings(set) => self.settings = Some((seq, set.clone())),
-            Body::Ext { .. } => {}
+            // The settings extension's model, until it folds its own state.
+            Body::Ext { ext, state, data } if ext == "settings" && state == "model" => {
+                let model = data.parse().unwrap_or_default();
+                self.settings = Some((seq, Overrides { model }));
+            }
+            // The rest folded as their shims.
+            Body::Ext { .. }
+            | Body::Edit { .. }
+            | Body::User { .. }
+            | Body::Queued { .. }
+            | Body::Steer { .. }
+            | Body::Hook { .. }
+            | Body::Ask { .. }
+            | Body::Command { .. }
+            | Body::CommandResult { .. }
+            | Body::Settings(_) => {}
         }
     }
 
     /// Folds an entry about a call: its intent, processes, progress,
-    /// outcome, ask or a hook's decision on it.
+    /// outcome, a decision on it, what it waits on and the answer.
     fn track(&mut self, seq: u64, body: &Body) {
         match body {
-            Body::ToolCall { tool, input, .. } => {
-                self.turn.tools.push(tool.clone());
+            Body::ToolCall {
+                tool, input, by, ..
+            } => {
+                if *by != Audience::User {
+                    self.turn.tools.push(tool.clone());
+                }
+                // In an old log, the gate's decisions came first.
+                let at = self.hooks.iter().filter(|(_, d)| d.gates()).count();
                 self.open(
                     seq,
                     Call::Tool {
                         tool: tool.clone(),
                         input: input.clone(),
+                        by: *by,
+                    },
+                    Phase::Gating {
+                        at: u16::try_from(at).unwrap_or(u16::MAX),
                     },
                 );
             }
-            Body::ModelCall { .. } => self.open(seq, Call::Model),
+            Body::ModelCall { attempt, .. } => {
+                self.open(seq, Call::Model { attempt: *attempt }, Phase::Running);
+            }
             Body::ToolProcess {
                 call,
                 pgid,
@@ -201,6 +266,7 @@ impl Ledger {
             } => {
                 if let Some(open) = self.open.get_mut(*call) {
                     open.processes.push((*pgid, boot.clone()));
+                    open.ran();
                 }
                 if *background {
                     self.background.push((*pgid, boot.clone()));
@@ -209,67 +275,166 @@ impl Ledger {
             Body::Progress { call, text } => {
                 if let Some(open) = self.open.get_mut(*call) {
                     open.progress.get_or_insert_default().push_str(text);
+                    open.ran();
                 }
             }
             Body::ToolResult { call, outcome, .. } | Body::ModelResult { call, outcome } => {
-                if !matches!(outcome, Outcome::Done { .. }) {
-                    self.turn.failed += 1;
-                }
-                self.result = Some(outcome.clone());
-                if self.open.remove(*call).is_some() {
-                    self.inbox.retain(|c| c != call);
-                }
+                self.settle(*call, outcome);
             }
-            // The first answer wins: an answered call is not asked again.
-            Body::Ask { call } => {
-                if let Some(open) = self.open.get_mut(*call)
-                    && matches!(open.call, Call::Tool { .. })
-                    && open.phase == Phase::Called
-                {
-                    open.phase = Phase::Asked;
-                    self.inbox.push(*call);
-                }
-            }
-            Body::Hook { hook, decision } => {
-                if let Decision::Approval {
-                    call: Some(call),
-                    approved,
-                    ..
-                } = decision
-                    && let Some(open) = self.open.get_mut(*call)
-                {
-                    open.phase = Phase::Answered {
-                        approved: *approved,
-                    };
-                    self.inbox.retain(|c| c != call);
-                }
-                if let Decision::Retry { call, .. } = decision
-                    && let Some(open) = self.open.get_mut(*call)
-                {
-                    open.retries += 1;
-                }
-                self.hooks.push((hook.clone(), decision.clone()));
+            Body::Decision {
+                call: Some(call),
+                d,
+                ..
+            } => self.decide(call.get(), d),
+            Body::Wait { call, on } => self.wait(call.get(), on),
+            Body::Answer {
+                call,
+                value,
+                origin,
+            } => {
+                self.author(*origin);
+                self.answer(call.get(), value);
             }
             _ => {}
         }
     }
 
-    fn open(&mut self, seq: u64, call: Call) {
+    /// Folds what only the order of an old log says.
+    fn legacy(&mut self, body: &Body) {
+        match body {
+            Body::Hook { hook, decision } => self.hooks.push((hook.clone(), decision.clone())),
+            Body::Extensions { .. } | Body::Environment(_) => {}
+            _ => self.hooks.clear(),
+        }
+        // Each took up the oldest input waiting, if any.
+        if let Body::User { .. } | Body::Command { .. } = body {
+            self.untaken.pop_front();
+        }
+    }
+
+    fn open(&mut self, seq: u64, call: Call, phase: Phase) {
         self.open.insert(
             seq,
             Open {
                 call,
-                phase: Phase::Called,
+                phase,
                 processes: Vec::new(),
                 progress: None,
-                retries: 0,
             },
         );
     }
 
-    /// A `user` or `command` entry takes up the oldest input waiting.
-    fn taken(&mut self) {
-        self.untaken.pop_front();
+    fn settle(&mut self, call: u64, outcome: &Outcome) {
+        let Some(open) = self.open.remove(call) else {
+            return;
+        };
+        self.inbox.retain(|&c| c != call);
+        // A command the user ran is not the agent's work.
+        if matches!(
+            open.call,
+            Call::Tool {
+                by: Audience::User,
+                ..
+            }
+        ) {
+            return;
+        }
+        if !matches!(outcome, Outcome::Done { .. }) {
+            self.turn.failed += 1;
+        }
+        self.result = Some(outcome.clone());
+    }
+
+    /// A decision about call `call`, made at its gate.
+    fn decide(&mut self, call: u64, d: &Verdict) {
+        let Some(open) = self.open.get_mut(call) else {
+            return;
+        };
+        // A retried model call's attempts are counted here, so a restart
+        // does not start the count again.
+        if let (Verdict::Retry { attempt, .. }, Call::Model { attempt: at }) = (d, &mut open.call) {
+            *at = (*at).max(*attempt);
+            return;
+        }
+        match open.phase {
+            Phase::Waiting(WaitOn::Approval) => {
+                if let Verdict::Approval { approved } = d {
+                    self.answered(call, *approved);
+                }
+            }
+            Phase::Gating { at } => {
+                open.phase = match d {
+                    Verdict::Permission {
+                        permission: Permission::Ask,
+                    } => Phase::Waiting(WaitOn::Approval),
+                    Verdict::Permission {
+                        permission: Permission::Deny,
+                    }
+                    | Verdict::Block { .. }
+                    | Verdict::Approval { approved: false } => Phase::Settled(OutcomeKind::Failed),
+                    _ => Phase::Gating {
+                        at: at.saturating_add(1),
+                    },
+                };
+                if open.waits() {
+                    self.inbox.push(call);
+                }
+            }
+            _ => {}
+        }
+    }
+
+    /// Call `call` waits on `on`. A tool call waits for an approval only
+    /// while gated, so an answered one is not asked again.
+    fn wait(&mut self, call: u64, on: &WaitOn) {
+        let Some(open) = self.open.get_mut(call) else {
+            return;
+        };
+        let may = match on {
+            WaitOn::Approval => matches!(open.phase, Phase::Gating { .. }),
+            _ => matches!(open.phase, Phase::Gating { .. } | Phase::Running),
+        };
+        if may && matches!(open.call, Call::Tool { .. }) {
+            open.phase = Phase::Waiting(on.clone());
+            if *on == WaitOn::Approval {
+                self.inbox.push(call);
+            }
+        }
+    }
+
+    /// The first answer to what call `call` waits on wins.
+    fn answer(&mut self, call: u64, value: &Json) {
+        let Some(open) = self.open.get_mut(call) else {
+            return;
+        };
+        match open.phase {
+            Phase::Waiting(WaitOn::Approval) => {
+                self.answered(call, value.parse().unwrap_or_default());
+            }
+            Phase::Waiting(_) => open.phase = Phase::Running,
+            _ => {}
+        }
+    }
+
+    fn answered(&mut self, call: u64, approved: bool) {
+        if let Some(open) = self.open.get_mut(call) {
+            open.phase = if approved {
+                Phase::Running
+            } else {
+                Phase::Settled(OutcomeKind::Failed)
+            };
+        }
+        self.inbox.retain(|&c| c != call);
+    }
+
+    fn author(&mut self, origin: Option<Author>) {
+        let Some(Author { client, seq }) = origin else {
+            return;
+        };
+        match self.clients.iter_mut().find(|(c, _)| *c == client) {
+            Some((_, last)) => *last = (*last).max(seq),
+            None => self.clients.push((client, seq)),
+        }
     }
 
     /// The seq of the last entry folded: how many the log has.
@@ -277,16 +442,17 @@ impl Ledger {
         self.seq
     }
 
-    /// The open calls, by seq.
+    /// The open model and tool calls the agent made, by seq: commands the
+    /// user ran aside ([`Ledger::open_commands`]).
     pub fn open_calls(&self) -> impl Iterator<Item = (u64, &Open)> {
-        self.open.iter()
+        self.open.iter().filter(|(_, open)| !open.by_user())
     }
 
     pub fn call(&self, seq: u64) -> Option<&Open> {
         self.open.get(seq)
     }
 
-    /// The tool calls waiting for the user's approval, in the order asked.
+    /// The tool calls waiting for an approval, in the order they began to.
     pub fn inbox(&self) -> &[u64] {
         &self.inbox
     }
@@ -295,8 +461,8 @@ impl Ledger {
     pub fn asked(&self, call: u64) -> Option<(&str, &Json)> {
         match self.open.get(call) {
             Some(Open {
-                call: Call::Tool { tool, input },
-                phase: Phase::Asked,
+                call: Call::Tool { tool, input, .. },
+                phase: Phase::Waiting(WaitOn::Approval),
                 ..
             }) => Some((tool, input)),
             _ => None,
@@ -307,9 +473,12 @@ impl Ledger {
         &self.untaken
     }
 
-    /// Slash commands with an intent and no outcome, by seq.
+    /// Commands the user ran with an intent and no outcome, by seq.
     pub fn open_commands(&self) -> impl Iterator<Item = u64> + '_ {
-        self.commands.iter().map(|(seq, ())| seq)
+        self.open
+            .iter()
+            .filter(|(_, open)| open.by_user())
+            .map(|(seq, _)| seq)
     }
 
     /// The watches that have not fired, as `(seq, child)`, by seq.
@@ -359,17 +528,26 @@ impl Ledger {
         &self.hooks
     }
 
+    /// The number of client `client`'s last mutation logged: a mutation of
+    /// its numbered no higher is a resend.
+    pub fn last_of(&self, client: ClientId) -> Option<ClientSeq> {
+        self.clients
+            .iter()
+            .find(|(c, _)| *c == client)
+            .map(|&(_, seq)| seq)
+    }
+
     /// What the session last settled with: its last answer or outcome.
     pub const fn result(&self) -> Option<&Outcome> {
         self.result.as_ref()
     }
 
-    /// The seq of the current turn's user message; 0 before the first.
+    /// The seq of the current turn's input; 0 before the first.
     pub const fn turn_start(&self) -> u64 {
         self.turn.start
     }
 
-    /// The current turn's user message.
+    /// The current turn's input.
     pub fn prompt(&self) -> Option<&str> {
         self.turn.prompt.as_deref()
     }
@@ -384,15 +562,71 @@ impl Ledger {
         self.turn.failed
     }
 
-    /// How many of the current turn's calls are open and not waiting for
-    /// the user.
+    /// How many of the current turn's calls are open and not waiting.
     pub fn turn_running(&self) -> u32 {
         let running = self
-            .open
-            .iter()
-            .filter(|&(seq, open)| seq > self.turn.start && open.phase != Phase::Asked)
+            .open_calls()
+            .filter(|&(seq, open)| seq > self.turn.start && !open.waits())
             .count();
         u32::try_from(running).unwrap_or(u32::MAX)
+    }
+
+    /// What the session is doing, as its log says: what waits on someone
+    /// first, then whether anything runs or waits to.
+    pub fn activity(&self) -> Activity {
+        let waits = |on: fn(&WaitOn) -> bool| {
+            self.open
+                .iter()
+                .any(|(_, open)| matches!(&open.phase, Phase::Waiting(w) if on(w)))
+        };
+        if waits(|w| *w == WaitOn::Approval) {
+            Activity::Approval
+        } else if waits(|w| matches!(w, WaitOn::Dialog { .. })) {
+            Activity::Input
+        } else if waits(|w| matches!(w, WaitOn::Client { .. })) {
+            Activity::Client
+        } else if self.open.iter().next().is_some()
+            || !self.untaken.is_empty()
+            || self.armed.iter().next().is_some()
+        {
+            Activity::Running
+        } else {
+            Activity::Idle
+        }
+    }
+}
+
+impl Open {
+    fn by_user(&self) -> bool {
+        matches!(
+            self.call,
+            Call::Tool {
+                by: Audience::User,
+                ..
+            }
+        )
+    }
+
+    fn waits(&self) -> bool {
+        matches!(self.phase, Phase::Waiting(_))
+    }
+
+    /// It is seen running: a process or progress of a gated call says its
+    /// gate let it through.
+    fn ran(&mut self) {
+        if let Phase::Gating { .. } = self.phase {
+            self.phase = Phase::Running;
+        }
+    }
+}
+
+impl Turn {
+    fn start(seq: u64, text: &str) -> Self {
+        Self {
+            start: seq,
+            prompt: Some(text.to_owned()),
+            ..Self::default()
+        }
     }
 }
 

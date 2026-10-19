@@ -178,7 +178,13 @@ fn a_crash_loop_cannot_retry_forever() {
     for logged in 0..=cap {
         let mut entries = vec![
             entry(1, Body::User { text: "hi".into() }),
-            entry(2, Body::ModelCall { model: "m".into() }),
+            entry(
+                2,
+                Body::ModelCall {
+                    model: "m".into(),
+                    attempt: 0,
+                },
+            ),
         ];
         for attempt in 1..=logged {
             let decision = Decision::Retry {

@@ -291,6 +291,7 @@ mod tests {
         DaemonMsg::Delta {
             call,
             text: text.into(),
+            attempt: 0,
         }
     }
 
@@ -342,7 +343,13 @@ mod tests {
     #[test]
     fn a_reply_streams_in_by_appends() {
         let mut page = synced();
-        page.fold(&[entry(2, Body::ModelCall { model: "m".into() })]);
+        page.fold(&[entry(
+            2,
+            Body::ModelCall {
+                model: "m".into(),
+                attempt: 0,
+            },
+        )]);
         let added = events(&mut page);
         assert!(
             added[0].contains("data: selector #end\ndata: mode before\n"),

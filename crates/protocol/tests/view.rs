@@ -7,7 +7,8 @@ use std::path::PathBuf;
 
 use protocol::view::{Change, SessionView, Update};
 use protocol::{
-    Body, Card, DaemonMsg, Decision, Decode, Entry, Environment, Json, Outcome, Recap, SessionId,
+    Audience, Body, Card, DaemonMsg, Decision, Decode, Entry, Environment, Json, Outcome, Recap,
+    SessionId,
 };
 use serde_json::{Value, json};
 use uuid::Uuid;
@@ -108,6 +109,7 @@ impl Session {
             input: input.clone(),
             id: None,
             card: None,
+            by: Audience::Model,
         });
         if rng.chance(50) {
             self.commit(Body::Ask { call });
@@ -147,7 +149,10 @@ impl Session {
     }
 
     fn model(&mut self, rng: &mut Rng) {
-        let call = self.commit(Body::ModelCall { model: "m".into() });
+        let call = self.commit(Body::ModelCall {
+            model: "m".into(),
+            attempt: 0,
+        });
         let text = format!("reply {}", rng.below(1000));
         let mut rest = text.as_str();
         while !rest.is_empty() {
@@ -157,6 +162,7 @@ impl Session {
             self.live.push(DaemonMsg::Delta {
                 call,
                 text: chunk.into(),
+                attempt: 0,
             });
             rest = tail;
         }
@@ -422,36 +428,6 @@ fn attaching_to_another_session_starts_over() {
     assert_eq!(view.seq, 0);
 }
 
-#[test]
-fn a_retry_streams_one_attempt() {
-    let delta = |text: &str| DaemonMsg::Delta {
-        call: 2,
-        text: text.into(),
-    };
-    let retry = Body::Hook {
-        hook: "retry".into(),
-        decision: Decision::Retry {
-            call: 2,
-            attempt: 1,
-            error: "overloaded".into(),
-        },
-    };
-    let msgs = [
-        DaemonMsg::Attached {
-            session: SESSION,
-            workspace: "/w".into(),
-        },
-        DaemonMsg::Entry(Entry::new(1, 0, Body::ModelCall { model: "m".into() })),
-        delta("The har"),
-        DaemonMsg::Entry(Entry::new(2, 0, retry)),
-        delta("The harbor"),
-    ];
-    let mut view = folded(&msgs[..3]);
-    fold(&mut view, &msgs[3..]);
-    let streaming = view.streaming.unwrap();
-    assert_eq!((streaming.call, streaming.text.as_str()), (2, "The harbor"));
-}
-
 fn vectors_path() -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/vectors/view.json")
 }
@@ -486,14 +462,22 @@ fn scenarios() -> Vec<(&'static str, Vec<Value>)> {
                 attached(),
                 msg(DaemonMsg::Synced { seq: 0 }),
                 entry(1, Body::User { text: "hi".into() }),
-                entry(2, Body::ModelCall { model: "m".into() }),
+                entry(
+                    2,
+                    Body::ModelCall {
+                        model: "m".into(),
+                        attempt: 0,
+                    },
+                ),
                 msg(DaemonMsg::Delta {
                     call: 2,
                     text: "hel".into(),
+                    attempt: 0,
                 }),
                 msg(DaemonMsg::Delta {
                     call: 2,
                     text: "lo".into(),
+                    attempt: 0,
                 }),
                 entry(
                     3,
@@ -521,6 +505,7 @@ fn scenarios() -> Vec<(&'static str, Vec<Value>)> {
                         input: command.clone().into(),
                         id: None,
                         card: None,
+                        by: Audience::Model,
                     },
                 ),
                 entry(2, Body::Ask { call: 1 }),
@@ -636,6 +621,7 @@ fn scenarios() -> Vec<(&'static str, Vec<Value>)> {
                             title: "$ echo hi".into(),
                             ..Card::default()
                         }),
+                        by: Audience::Model,
                     },
                 ),
                 entry(
@@ -685,10 +671,14 @@ fn scenarios() -> Vec<(&'static str, Vec<Value>)> {
                 input: json!({ "command": "echo hi" }).into(),
                 id: None,
                 card: None,
+                by: Audience::Model,
             };
             let log = [
                 Body::User { text: "one".into() },
-                Body::ModelCall { model: "m".into() },
+                Body::ModelCall {
+                    model: "m".into(),
+                    attempt: 0,
+                },
                 asked,
                 Body::Ask { call: 3 },
             ]
@@ -700,11 +690,18 @@ fn scenarios() -> Vec<(&'static str, Vec<Value>)> {
             vec![
                 attached(),
                 entry(1, Body::User { text: "one".into() }),
-                entry(2, Body::ModelCall { model: "m".into() }),
+                entry(
+                    2,
+                    Body::ModelCall {
+                        model: "m".into(),
+                        attempt: 0,
+                    },
+                ),
                 msg(DaemonMsg::Synced { seq: 2 }),
                 msg(DaemonMsg::Delta {
                     call: 2,
                     text: "thinking".into(),
+                    attempt: 0,
                 }),
                 attached(),
                 msg(DaemonMsg::Snapshot(Box::new(view))),
