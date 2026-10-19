@@ -561,7 +561,7 @@ fn the_supervisor_sleeps_until_a_deadline_and_never_polls() {
     };
     let daemon = Daemon::load(&home, &config).unwrap();
     let exit = Exit {
-        socket: root.join("socket"),
+        home: home.clone(),
         pid: std::fs::File::create(root.join("pid")).unwrap(),
         log: root.join("log"),
     };
