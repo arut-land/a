@@ -16,6 +16,7 @@
 //! agent = "echo"                # every session's agent, over both files
 //! ask = ["bash"]                # tools whose calls wait for approval
 //! system_prompt = "..."         # in place of the extensions' prompt
+//! crash_limit = 3               # young deaths in a row before refusing
 //! ```
 //!
 //! The file is edited in place: writing changes only the schema's keys, so
@@ -55,6 +56,7 @@ pub struct Daemon {
     pub agent: Option<String>,
     pub ask: Vec<String>,
     pub system_prompt: Option<String>,
+    pub crash_limit: Option<u64>,
 }
 
 impl Config {
@@ -162,7 +164,7 @@ impl FromStr for Config {
             let t = daemon
                 .as_table_like()
                 .ok_or_else(|| ParseError("daemon must be a table".into()))?;
-            let secs = |key| {
+            let whole = |key| {
                 t.get(key).map_or(Ok(None), |item| {
                     item.as_integer()
                         .and_then(|n| u64::try_from(n).ok())
@@ -181,12 +183,13 @@ impl FromStr for Config {
                     .ok_or_else(|| ParseError("daemon.ask must be a list of tool names".into()))
             })?;
             config.daemon = Daemon {
-                idle_secs: secs("idle_secs")?,
-                hibernate_secs: secs("hibernate_secs")?,
-                drain_secs: secs("drain_secs")?,
+                idle_secs: whole("idle_secs")?,
+                hibernate_secs: whole("hibernate_secs")?,
+                drain_secs: whole("drain_secs")?,
                 agent: string(t, "agent", "daemon.")?,
                 ask,
                 system_prompt: string(t, "system_prompt", "daemon.")?,
+                crash_limit: whole("crash_limit")?,
             };
         }
         Ok(config)

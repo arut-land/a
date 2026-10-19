@@ -40,31 +40,29 @@ fn numbered(path: &Path, n: usize) -> PathBuf {
     PathBuf::from(name)
 }
 
-/// Rotates `path` when this process's stderr is that file, then points
-/// stderr at a fresh one. A daemon started by hand, whose stderr is a
-/// terminal, is left alone.
+/// Points this process's stderr at the log `path`, appending.
 #[cfg(unix)]
-pub fn rotate_stderr(path: &Path) -> io::Result<bool> {
-    use std::os::fd::AsFd;
-
-    let ours = rustix::fs::fstat(io::stderr().as_fd())?;
-    let file = match rustix::fs::stat(path) {
-        Ok(stat) => stat,
-        Err(rustix::io::Errno::NOENT) => return Ok(false),
-        Err(e) => return Err(e.into()),
-    };
-    if (ours.st_dev, ours.st_ino) != (file.st_dev, file.st_ino) {
-        return Ok(false);
+pub fn redirect_stderr(path: &Path) -> io::Result<()> {
+    if let Some(dir) = path.parent() {
+        fs::create_dir_all(dir)?;
     }
-    if !rotate(path, MAX, KEEP)? {
-        return Ok(false);
-    }
-    let fresh = fs::OpenOptions::new()
+    let log = fs::OpenOptions::new()
         .create(true)
         .append(true)
         .open(path)?;
-    rustix::stdio::dup2_stderr(&fresh)?;
-    Ok(true)
+    rustix::stdio::dup2_stderr(&log)?;
+    Ok(())
+}
+
+/// Rotates `path`, the log [`redirect_stderr`] pointed stderr at, and
+/// points stderr at a fresh one.
+#[cfg(unix)]
+pub fn rotate_stderr(path: &Path) -> io::Result<bool> {
+    let rotated = rotate(path, MAX, KEEP)?;
+    if rotated {
+        redirect_stderr(path)?;
+    }
+    Ok(rotated)
 }
 
 #[cfg(test)]

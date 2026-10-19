@@ -59,6 +59,12 @@ enum Cmd {
     Serve {
         #[usage(long)]
         listen_fd: Option<i32>,
+        /// The daemon lock, held for it by the client that started it
+        #[usage(long)]
+        lock_fd: Option<i32>,
+        /// Serve even after a crash loop
+        #[usage(long)]
+        reset_breaker: bool,
     },
 }
 
@@ -88,7 +94,11 @@ fn main() -> ExitCode {
         }
         Some(Cmd::Web { no_open }) => web(ctx, !no_open),
         Some(Cmd::Daemon { action }) => daemon_cmd(&ctx, &action),
-        Some(Cmd::Serve { listen_fd }) => daemon(&ctx, listen_fd),
+        Some(Cmd::Serve {
+            listen_fd,
+            lock_fd,
+            reset_breaker,
+        }) => daemon(&ctx, listen_fd, lock_fd, reset_breaker),
     });
     match result {
         Ok(()) => ExitCode::SUCCESS,
@@ -568,21 +578,46 @@ fn web(_ctx: Ctx, _open: bool) -> io::Result<()> {
     Err(io::Error::other("this build of a has no web UI"))
 }
 
+/// The daemon. Started by a client (`listen_fd`), it leaves the client's
+/// session and logs to `logs/daemon.log`; by hand, it stays at the
+/// terminal.
 #[cfg(unix)]
-fn daemon(ctx: &Ctx, listen_fd: Option<i32>) -> io::Result<()> {
+fn daemon(
+    ctx: &Ctx,
+    listen_fd: Option<i32>,
+    lock_fd: Option<i32>,
+    reset_breaker: bool,
+) -> io::Result<()> {
     let home = &ctx.home;
     sys::crash::install(home.crash_dir(), ctx.staged.id.clone());
     let listener = if let Some(fd) = listen_fd {
         sys::detach_session()?;
+        sys::log::redirect_stderr(&home.daemon_log())?;
         sys::adopt_listener(fd)?
     } else {
         home.bind()?
     };
-    engine::serve(&listener, home, &engine::Config::load(home), &ctx.staged.id)
+    let start = engine::Start {
+        lock: lock_fd.map(sys::adopt_lock).transpose()?,
+        reset_breaker,
+        logs: listen_fd.is_some(),
+    };
+    engine::serve(
+        &listener,
+        home,
+        &engine::Config::load(home),
+        &ctx.staged.id,
+        start,
+    )
 }
 
 #[cfg(not(unix))]
-fn daemon(_ctx: &Ctx, _listen_fd: Option<i32>) -> io::Result<()> {
+fn daemon(
+    _ctx: &Ctx,
+    _listen_fd: Option<i32>,
+    _lock_fd: Option<i32>,
+    _reset_breaker: bool,
+) -> io::Result<()> {
     Err(io::Error::other(
         "the daemon is not implemented on this platform yet",
     ))

@@ -517,7 +517,7 @@ fn the_supervisor_sleeps_until_a_deadline_and_never_polls() {
     let exit = Exit {
         socket: root.join("socket"),
         pid: std::fs::File::create(root.join("pid")).unwrap(),
-        log: root.join("log"),
+        log: None,
     };
     let life = Lifecycle::new("test".into(), home.runtime());
     let supervisor = std::sync::Arc::clone(&daemon);
@@ -550,4 +550,32 @@ fn the_supervisor_sleeps_until_a_deadline_and_never_polls() {
     assert_eq!(idle_wakes, 0);
     assert!(wakes < 20, "{wakes} wakes for one turn");
     assert_eq!(names, ["effect", "step", "hibernate"]);
+}
+
+#[test]
+fn a_daemon_after_a_crash_loop_refuses_to_serve_until_reset() {
+    use super::{Claim, claim};
+
+    let (root, home) = home("breaker");
+    std::fs::create_dir_all(home.run_dir()).unwrap();
+    std::fs::write(home.run_dir().join("crashes"), "3\n").unwrap();
+    let Claim::Tripped(why) = claim(&home, "b1", None, false, 3).unwrap() else {
+        panic!("served after a crash loop");
+    };
+    assert!(
+        why.contains("crashed 3 times") && why.contains("a daemon restart"),
+        "{why}"
+    );
+    assert!(matches!(
+        claim(&home, "b1", None, false, 0).unwrap(),
+        Claim::Serve(_)
+    ));
+    // That daemon exited cleanly.
+    std::fs::write(home.daemon_pid_file(), "").unwrap();
+    assert!(matches!(
+        claim(&home, "b1", None, true, 3).unwrap(),
+        Claim::Serve(_)
+    ));
+    assert_eq!(sys::crash::Crashes::of(&home).young, 0);
+    std::fs::remove_dir_all(root).unwrap();
 }

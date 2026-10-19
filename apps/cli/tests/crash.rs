@@ -50,9 +50,9 @@ fn every_entry_shown_survives_kill_9_at_random_points() {
     let seed = seed.max(1);
     eprintln!("A_CRASH_SEED={seed}");
     let mut rng = Rng(seed);
-    let mut env = Env::new("crash");
+    let env = Env::new("crash");
     // Every kill here is deliberate, not a crash loop.
-    env.vars.push(("A_CRASH_LIMIT", "0"));
+    env.daemon("crash_limit = 0");
     let mut session = None;
     let mut shown: Vec<Entry> = Vec::new();
 

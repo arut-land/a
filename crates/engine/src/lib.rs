@@ -49,6 +49,9 @@ pub struct Config {
     pub ask: Vec<String>,
     /// The system prompt, in place of the one the extensions make.
     pub system_prompt: Option<String>,
+    /// Young deaths in a row after which a daemon refuses to serve (0 for
+    /// never); see [`sys::crash`].
+    pub crash_limit: u32,
 }
 
 impl Default for Config {
@@ -60,6 +63,7 @@ impl Default for Config {
             agent: None,
             ask: Vec::new(),
             system_prompt: None,
+            crash_limit: sys::crash::LIMIT,
         }
     }
 }
@@ -103,6 +107,9 @@ impl From<sys::config::Daemon> for Config {
             }),
             ask: file.ask,
             system_prompt: file.system_prompt.filter(|prompt| !prompt.is_empty()),
+            crash_limit: file.crash_limit.map_or(defaults.crash_limit, |n| {
+                u32::try_from(n).unwrap_or(u32::MAX)
+            }),
         }
     }
 }
@@ -413,7 +420,9 @@ impl Daemon {
                 detail: String::new(),
             });
             #[cfg(unix)]
-            if let Err(e) = sys::log::rotate_stderr(&exit.log) {
+            if let Some(log) = &exit.log
+                && let Err(e) = sys::log::rotate_stderr(log)
+            {
                 eprintln!("rotating the log: {e}");
             }
             self.hibernate(config.hibernate);
@@ -469,7 +478,8 @@ struct Exit {
     socket: PathBuf,
     /// The locked pid file; see [`claim`].
     pid: File,
-    log: PathBuf,
+    /// The log that is our stderr, to rotate.
+    log: Option<PathBuf>,
 }
 
 impl Exit {
@@ -510,20 +520,52 @@ impl Drop for Client<'_> {
     }
 }
 
+/// How a daemon was started.
+#[derive(Debug, Default)]
+pub struct Start {
+    /// The daemon lock, taken by the client that started it; without one
+    /// the daemon takes it.
+    pub lock: Option<File>,
+    /// Serve even after a crash loop, for `a daemon restart`.
+    pub reset_breaker: bool,
+    /// Its stderr is `logs/daemon.log`, which it then rotates.
+    pub logs: bool,
+}
+
 /// Runs the daemon, as staged build `build`, until it has been idle for
 /// `config.idle` (no attached clients and no unfinished work) or has drained
 /// for a newer build. Sessions live in their logs, so the next client
-/// starts a new daemon.
+/// starts a new daemon. After a crash loop it serves no one: it tells the
+/// clients waiting why, and exits.
 #[cfg(unix)]
-pub fn serve(listener: &UnixListener, home: &Home, config: &Config, build: &str) -> io::Result<()> {
-    let pid = claim(home, build)?;
+pub fn serve(
+    listener: &UnixListener,
+    home: &Home,
+    config: &Config,
+    build: &str,
+    start: Start,
+) -> io::Result<()> {
+    let pid = match claim(
+        home,
+        build,
+        start.lock,
+        start.reset_breaker,
+        config.crash_limit,
+    )? {
+        Claim::Serve(pid) => pid,
+        Claim::Tripped(why) => {
+            refuse(listener, &why);
+            let _ = std::fs::remove_file(home.socket());
+            return Err(io::Error::other(why));
+        }
+    };
     let daemon = Daemon::load(home, config)?;
     let life = Arc::new(Lifecycle::new(build.to_owned(), home.runtime()));
     let (monitor, watch, config) = (Arc::clone(&daemon), Arc::clone(&life), config.clone());
     let exit = Exit {
         socket: home.socket(),
         pid,
-        log: home.daemon_log(),
+        log: start.logs.then(|| home.daemon_log()),
     };
     daemon.shared.rt.spawn(Box::pin(async move {
         monitor.supervise(&watch, &config, exit).await;
@@ -543,22 +585,47 @@ pub fn serve(listener: &UnixListener, home: &Home, config: &Config, build: &str)
     Ok(())
 }
 
-/// Takes the daemon lock for this process's lifetime and records us in it
+/// Whether a daemon may serve.
+enum Claim {
+    /// Yes, holding the locked pid file.
+    Serve(File),
+    /// No, for this reason: its predecessors died young too often.
+    Tripped(String),
+}
+
+/// Keeps the daemon lock (`lock`, handed down by the client that started
+/// us, or else taken here) for this process's lifetime and records us in it
 /// ([`sys::crash::Record`]), noting first a previous daemon that died
 /// holding it. While the lock is held the pid is guaranteed to be ours,
-/// which is what lets clients kill a wedged daemon safely.
-fn claim(home: &Home, build: &str) -> io::Result<File> {
-    let mut file = OpenOptions::new()
-        .create(true)
-        .truncate(false)
-        .read(true)
-        .write(true)
-        .open(home.daemon_pid_file())?;
-    if file.try_lock().is_err() {
-        return Err(io::Error::new(
-            io::ErrorKind::AddrInUse,
-            "another daemon is running",
-        ));
+/// which is what lets clients kill a wedged daemon safely. Holding it, we
+/// are the only one that counts crashes, so the breaker is ours to check:
+/// after `limit` young deaths in a row, unless `reset`, we do not serve.
+fn claim(
+    home: &Home,
+    build: &str,
+    lock: Option<File>,
+    reset: bool,
+    limit: u32,
+) -> io::Result<Claim> {
+    let mut file = if let Some(file) = lock {
+        file
+    } else {
+        let file = OpenOptions::new()
+            .create(true)
+            .truncate(false)
+            .read(true)
+            .write(true)
+            .open(home.daemon_pid_file())?;
+        if file.try_lock().is_err() {
+            return Err(io::Error::new(
+                io::ErrorKind::AddrInUse,
+                "another daemon is running",
+            ));
+        }
+        file
+    };
+    if reset {
+        sys::crash::reset(home)?;
     }
     if let Some(dead) = sys::crash::reap(home, &mut file)? {
         eprintln!(
@@ -566,10 +633,58 @@ fn claim(home: &Home, build: &str) -> io::Result<File> {
             dead.pid
         );
     }
+    let crashes = sys::crash::Crashes::of(home);
+    if crashes.tripped(limit) {
+        let report = crashes
+            .last
+            .map_or_else(String::new, |p| format!("; see {}", p.display()));
+        return Ok(Claim::Tripped(format!(
+            "the daemon crashed {} times in a row soon after starting{report}; \
+             `a daemon restart` tries again",
+            crashes.young
+        )));
+    }
     // Not synced: clients read it while we hold the lock, and after a crash
     // there is no lock to vouch for it.
     write!(file, "{}", sys::crash::Record::current(build))?;
-    Ok(file)
+    Ok(Claim::Serve(file))
+}
+
+/// Answers every client that connects, until none waits (or, if none
+/// came, for [`REFUSED_GRACE`]), with `why` in place of a welcome: for a
+/// daemon that must not serve.
+#[cfg(unix)]
+fn refuse(listener: &UnixListener, why: &str) {
+    let Ok(frame) = Frame::new(&DaemonMsg::Error {
+        message: why.to_owned(),
+    }) else {
+        return;
+    };
+    if listener.set_nonblocking(true).is_err() {
+        return;
+    }
+    let deadline = Instant::now() + REFUSED_GRACE;
+    let mut answered = false;
+    loop {
+        match listener.accept() {
+            Ok((mut conn, _)) => {
+                answered = true;
+                let _ = conn.set_nonblocking(false);
+                let _ = conn.set_read_timeout(Some(REFUSED_GRACE));
+                let _ = conn.write_all(frame.as_bytes());
+                // What it sent is read and dropped until it hangs up.
+                let _ = io::copy(&mut conn, &mut io::sink());
+            }
+            Err(e)
+                if e.kind() == io::ErrorKind::WouldBlock
+                    && !answered
+                    && Instant::now() < deadline =>
+            {
+                thread::sleep(Duration::from_millis(10));
+            }
+            Err(_) => return,
+        }
+    }
 }
 
 /// How long a client refused at its hello has to read the answer and hang
