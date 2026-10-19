@@ -3,7 +3,6 @@
 //! the app's events.
 
 use std::io::{self, Write};
-use std::sync::mpsc::Sender;
 use std::sync::{Mutex, Once, PoisonError};
 use std::thread;
 
@@ -92,7 +91,7 @@ pub fn size() -> io::Result<(u16, u16)> {
 
 /// Reads the terminal and `signals` on a thread of its own until stdin is
 /// gone. It blocks in `poll` with no timeout: an idle client never wakes.
-pub fn spawn_input(tx: Sender<Event>, signals: Signals) {
+pub fn spawn_input(tx: client::Post<Event>, signals: Signals) {
     thread::spawn(move || {
         let stdin = rustix::stdio::stdin();
         let mut decoder = Decoder::default();

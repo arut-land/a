@@ -7,6 +7,7 @@
 
 mod command;
 mod drive;
+mod inbox;
 #[cfg(unix)]
 mod remote;
 mod session;
@@ -14,6 +15,7 @@ mod watch;
 
 pub use command::{COMMANDS, Cmd, Command, help, parse};
 pub use drive::Driver;
+pub use inbox::{Inbox, Post, inbox};
 pub use session::{Attach, Effect, End, Env, Event, Link, SessionClient, TurnView};
 pub use watch::SessionWatch;
 
@@ -573,15 +575,16 @@ fn exited(home: &Home, within: Option<Duration>) -> bool {
     let Ok(file) = File::open(home.daemon_pid_file()) else {
         return true;
     };
-    let (tx, rx) = std::sync::mpsc::channel();
+    let (tx, rx) = inbox();
     thread::spawn(move || {
         // Taken only to learn that it is free.
         let _ = tx.send(file.lock().is_ok());
     });
     match within {
-        Some(within) => rx.recv_timeout(within).unwrap_or(false),
-        None => rx.recv().unwrap_or(false),
+        Some(within) => rx.recv_timeout(within),
+        None => rx.recv(),
     }
+    .unwrap_or(false)
 }
 
 /// Connects to the running daemon, as its own build `build` so as not to
