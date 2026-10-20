@@ -1,6 +1,7 @@
 //! Calls against real endpoints, ignored by default: `mise exec -- cargo
-//! nextest run -p llm --features ureq --run-ignored only --test live`. They read
-//! keys and base URLs from the environment.
+//! nextest run -p llm --features tls-native --run-ignored only --test live`
+//! (the TLS the platform gives). They read keys and base URLs from the
+//! environment.
 
 #![cfg(feature = "ureq")]
 
