@@ -2,7 +2,6 @@
 //! read from frames, and (in the modules below) the bodies requests and
 //! replayed turns become.
 
-mod bench;
 mod history;
 mod merge;
 mod options;

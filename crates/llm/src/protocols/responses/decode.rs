@@ -756,6 +756,3 @@ impl Writes for ResponsesDecoder {
 
 #[cfg(test)]
 mod tests;
-
-#[cfg(test)]
-mod oracle;
