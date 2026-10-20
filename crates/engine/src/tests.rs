@@ -74,17 +74,58 @@ fn echo() -> Config {
     }
 }
 
+/// How long a test waits for the daemon before giving up.
+const PATIENCE: Duration = Duration::from_secs(10);
+
 /// Waits until every loaded session has taken what it was sent and has no
 /// work.
 fn settle(daemon: &Daemon) {
-    let deadline = Instant::now() + Duration::from_secs(10);
     for live in daemon.loaded() {
         live.barrier();
     }
-    while !daemon.idle() {
-        assert!(Instant::now() < deadline, "work never finished");
-        std::thread::sleep(Duration::from_millis(5));
+    daemon.wait("settled", PATIENCE, || daemon.idle());
+}
+
+impl Daemon {
+    /// Returns once `ready` holds, checked as the daemon's sessions change,
+    /// as jobs end and as events are emitted; panics with `what` if it
+    /// does not within `within`.
+    pub(crate) fn wait(&self, what: &str, within: Duration, ready: impl Fn() -> bool + Sync) {
+        let timeout = rt::Reactor::AsyncIo.sleep(within);
+        let held = rt::block_on(rt::or(
+            async {
+                let news = rt::or(self.pulse.until(&ready), self.jobs.until(&ready));
+                rt::or(news, super::EVENTS.1.until(&ready)).await;
+                true
+            },
+            async {
+                timeout.await;
+                false
+            },
+        ));
+        assert!(held, "never {what}");
     }
+}
+
+/// Whether anything happened in the daemon within `within`: an event
+/// emitted, a session changed.
+fn anything_within(daemon: &Daemon, within: Duration) -> bool {
+    let (mut pulsed, mut events) = (daemon.pulse.count(), super::EVENTS.1.count());
+    let timeout = rt::Reactor::AsyncIo.sleep(within);
+    rt::block_on(rt::or(
+        async {
+            rt::or(
+                daemon.pulse.changed(&mut pulsed),
+                super::EVENTS.1.changed(&mut events),
+            )
+            .await;
+            true
+        },
+        async {
+            timeout.await;
+            false
+        },
+    ))
 }
 
 /// Whether the catalog marks session `id` busy, as the next daemon reads it.
@@ -625,16 +666,14 @@ fn watches_rearm_after_a_crash_and_fire_once() {
 }
 
 /// Waits until `done` holds for session `id`'s committed log.
-fn until(daemon: &Daemon, id: SessionId, done: impl Fn(&[Body]) -> bool) -> Vec<Body> {
-    let deadline = Instant::now() + Duration::from_secs(10);
-    loop {
-        let log = bodies(&*daemon.shared.store, id);
-        if done(&log) {
-            return log;
-        }
-        assert!(Instant::now() < deadline, "never happened: {log:#?}");
-        std::thread::sleep(Duration::from_millis(5));
-    }
+fn until(daemon: &Daemon, id: SessionId, done: impl Fn(&[Body]) -> bool + Sync) -> Vec<Body> {
+    let log = std::sync::Mutex::new(Vec::new());
+    daemon.wait("the log as expected", PATIENCE, || {
+        let mut log = crate::lock(&log);
+        *log = bodies(&*daemon.shared.store, id);
+        done(&log)
+    });
+    log.into_inner().unwrap()
 }
 
 #[test]
@@ -746,12 +785,12 @@ fn an_orphan_does_not_resume_what_it_was_doing() {
     );
 }
 
-/// Keeps every event the daemon emits in tests.
-pub struct Recorder(std::sync::Mutex<Vec<rt::Event>>);
+/// Keeps every event the daemon emits in tests, and says when one comes.
+pub struct Recorder(std::sync::Mutex<Vec<rt::Event>>, rt::Notify);
 
 impl Recorder {
     pub const fn new() -> Self {
-        Self(std::sync::Mutex::new(Vec::new()))
+        Self(std::sync::Mutex::new(Vec::new()), rt::Notify::new())
     }
 
     fn count(&self, name: &str) -> usize {
@@ -776,14 +815,7 @@ impl rt::EventSink for Recorder {
 
     fn emit(&self, event: impl FnOnce() -> rt::Event) {
         crate::lock(&self.0).push(event());
-    }
-}
-
-fn wait_until(what: &str, done: impl Fn() -> bool) {
-    let deadline = Instant::now() + Duration::from_secs(10);
-    while !done() {
-        assert!(Instant::now() < deadline, "{what} never happened");
-        std::thread::sleep(Duration::from_millis(5));
+        self.1.notify();
     }
 }
 
@@ -809,7 +841,7 @@ fn the_supervisor_sleeps_until_a_deadline_and_never_polls() {
     daemon.shared.rt.spawn(Box::pin(async move {
         supervisor.supervise(&life, &config, exit).await;
     }));
-    wait_until("the first look", || EVENTS.count("wake") > 0);
+    daemon.wait("the first look", PATIENCE, || EVENTS.count("wake") > 0);
 
     let attachment = daemon.attach_to(&Target::New, || "/w".into()).unwrap();
     let id = attachment.session().id;
@@ -819,22 +851,15 @@ fn the_supervisor_sleeps_until_a_deadline_and_never_polls() {
     let detached = Instant::now();
     drop(attachment);
     let hibernated = || daemon.slots()[0].live().is_none();
-    wait_until("hibernation", hibernated);
+    daemon.wait("hibernation", PATIENCE, hibernated);
     let after = detached.elapsed();
     // The actor's end, which it tells the supervisor, is the last news.
     rt::block_on(ended.wait());
-    let mut wakes = EVENTS.count("wake");
-    loop {
-        std::thread::sleep(Duration::from_millis(100));
-        let now = EVENTS.count("wake");
-        if now == wakes {
-            break;
-        }
-        wakes = now;
-    }
+    while anything_within(&daemon, Duration::from_millis(100)) {}
+    let wakes = EVENTS.count("wake");
 
     // Nothing is due for an hour: nothing wakes the supervisor.
-    std::thread::sleep(Duration::from_secs(1));
+    assert!(!anything_within(&daemon, Duration::from_millis(500)));
     let idle_wakes = EVENTS.count("wake") - wakes;
     let names: Vec<_> = (EVENTS.of(id).iter().map(|e| e.name))
         .filter(|&name| name != "commit")
@@ -922,16 +947,16 @@ fn watchers_are_sent_the_session_list_as_it_changes() {
     );
 
     let attachment = daemon.attach_to(&Target::New, || "/w".into()).unwrap();
-    wait_until("the new session listed", || {
+    daemon.wait("the new session listed", PATIENCE, || {
         latest(&|list| list.len() == 1 && list[0].clients == 1)
     });
     drop(attachment);
-    wait_until("its client gone", || {
+    daemon.wait("its client gone", PATIENCE, || {
         latest(&|list| list.len() == 1 && list[0].clients == 0)
     });
     // Only changes are sent.
     let sent = seen.lock().unwrap().len();
-    std::thread::sleep(Duration::from_millis(100));
+    while anything_within(&daemon, Duration::from_millis(100)) {}
     latest(&|_| true);
     assert_eq!(seen.lock().unwrap().len(), sent);
     settle(&daemon);

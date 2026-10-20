@@ -79,6 +79,10 @@ struct Session {
     /// is open: its run, its gate, and whatever a handler deciding about
     /// it took its context along to, all end with it.
     cancels: Mutex<Keyed<CallId, Cancel>>,
+    /// Notified as the session changes: a commit, work beginning or
+    /// ending, a job ending, the actor ending. What waits on the session
+    /// waits here, never by polling.
+    changed: rt::Notify,
     /// What the engine provides the session's calls, made when one first
     /// asks.
     services: OnceLock<Arc<Services>>,
@@ -215,6 +219,7 @@ impl Live {
             env: Mutex::default(),
             jobs: Mutex::default(),
             cancels: Mutex::default(),
+            changed: rt::Notify::new(),
             services: OnceLock::new(),
             shared: Arc::clone(shared),
         });
@@ -546,6 +551,7 @@ impl Actor {
             // A call may begin to wait without the work marked ending.
             self.mark().await;
             self.publish();
+            self.live.session.changed.notify();
         }
         // Listed as it ends, with all it logged.
         let listing = self.listing(self.live.has_work());
@@ -561,8 +567,10 @@ impl Actor {
             self.live.ended.clone(),
             self.live.session.shared.daemon.clone(),
         );
+        let changed = Arc::clone(&self.live.session);
         drop((self, mail));
         ended.set();
+        changed.changed.notify();
         if let Some(daemon) = daemon.upgrade() {
             daemon.pulse.notify();
         }
@@ -1358,6 +1366,29 @@ impl Live {
         self.send(Msg::Barrier(done));
         rt::block_on(taken);
     }
+
+    /// Returns once `ready` holds, checked as the session changes; panics
+    /// with `what` if it does not within `within`.
+    pub fn wait(
+        &self,
+        what: &str,
+        within: std::time::Duration,
+        ready: impl FnMut() -> bool + Send,
+    ) {
+        let changed = &self.session.changed;
+        let timeout = rt::Reactor::AsyncIo.sleep(within);
+        let held = rt::block_on(or(
+            async {
+                changed.until(ready).await;
+                true
+            },
+            async {
+                timeout.await;
+                false
+            },
+        ));
+        assert!(held, "never {what}");
+    }
 }
 
 impl Live {
@@ -1583,6 +1614,7 @@ impl Host for Calling {
         self.session.shared.rt.spawn(Box::pin(async move {
             ended.await;
             lock(&session.jobs).retain(|&p| p != pgid);
+            session.changed.notify();
             if let Some(daemon) = session.shared.daemon.upgrade() {
                 daemon.jobs.notify();
             }

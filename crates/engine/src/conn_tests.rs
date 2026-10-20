@@ -5,7 +5,7 @@ use std::io::BufReader;
 use std::os::unix::net::UnixStream;
 use std::path::PathBuf;
 use std::sync::Arc;
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
 use crate::store::{Header, Jsonl, LogStore};
 use protocol::view::SessionView;
@@ -76,14 +76,12 @@ impl Fixture {
 
 impl Fixture {
     fn settle(&self) {
-        let deadline = Instant::now() + Duration::from_secs(10);
         for live in self.daemon.loaded() {
             live.barrier();
         }
-        while self.daemon.has_work() {
-            assert!(Instant::now() < deadline, "work never finished");
-            std::thread::sleep(Duration::from_millis(5));
-        }
+        self.daemon.wait("settled", Duration::from_secs(10), || {
+            !self.daemon.has_work()
+        });
     }
 }
 

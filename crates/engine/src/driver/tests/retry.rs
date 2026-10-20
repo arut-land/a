@@ -270,11 +270,23 @@ fn an_interrupted_retry_keeps_only_its_own_text() {
     ]);
     let session = fixture(quick(), &http).start(&[]);
     session.submit("hi").unwrap();
-    until(&session, "retried", |log| !retries(log).is_empty());
-    while http.sent() < 2 {
-        thread::sleep(Duration::from_millis(5));
-    }
-    thread::sleep(Duration::from_millis(50));
+    // The next attempt is out and streaming: a follower has a delta of it.
+    let outbox = Outbox::new();
+    session.follow(&outbox, 0);
+    let streaming = async {
+        loop {
+            let frame = outbox.next().await.expect("the follower is open");
+            if let Ok(Some(DaemonMsg::Delta { attempt: 1, .. })) =
+                protocol::read_frame::<DaemonMsg>(&mut frame.as_bytes())
+            {
+                return;
+            }
+        }
+    };
+    rt::block_on(or(streaming, async {
+        rt::Reactor::AsyncIo.sleep(PATIENCE).await;
+        panic!("the retry never streamed");
+    }));
     session.interrupt_now();
     settle(&session);
     let log = log_of(&session);

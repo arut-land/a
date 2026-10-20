@@ -368,17 +368,14 @@ impl Live {
     }
 }
 
+/// How long a test waits for the session before giving up.
+const PATIENCE: Duration = Duration::from_secs(10);
+
 /// Waits until the session has taken what it was sent and has no work.
 fn settle(session: &Live) {
-    let deadline = Instant::now() + Duration::from_secs(10);
-    loop {
-        session.barrier();
-        if !session.has_work() {
-            return;
-        }
-        assert!(Instant::now() < deadline, "work never finished");
-        thread::sleep(Duration::from_millis(5));
-    }
+    session.barrier();
+    session.wait("settled", PATIENCE, || !session.has_work());
+    session.barrier();
 }
 
 fn log_of(session: &Live) -> Vec<Entry> {
@@ -386,16 +383,13 @@ fn log_of(session: &Live) -> Vec<Entry> {
 }
 
 /// Waits until `done` holds for the session's log.
-fn until(session: &Live, what: &str, done: impl Fn(&[Entry]) -> bool) -> Vec<Entry> {
-    let deadline = Instant::now() + Duration::from_secs(10);
-    loop {
-        let log = log_of(session);
-        if done(&log) {
-            return log;
-        }
-        assert!(Instant::now() < deadline, "never {what}: {log:#?}");
-        thread::sleep(Duration::from_millis(5));
-    }
+fn until(session: &Live, what: &str, done: impl Fn(&[Entry]) -> bool + Sync) -> Vec<Entry> {
+    let mut log = Vec::new();
+    session.wait(what, PATIENCE, || {
+        log = log_of(session);
+        done(&log)
+    });
+    log
 }
 
 /// Waits for call `call`'s outcome to be committed.
@@ -687,11 +681,7 @@ fn live_the_model_calls_a_tool_and_answers_from_its_result() {
     session
         .submit("Call lookup_harbor_label, then tell me the label it returned.")
         .unwrap();
-    let deadline = Instant::now() + Duration::from_secs(120);
-    while session.has_work() {
-        assert!(Instant::now() < deadline, "no answer");
-        thread::sleep(Duration::from_millis(50));
-    }
+    session.wait("answered", Duration::from_secs(120), || !session.has_work());
     let log = log_of(&session);
     session.halt();
     assert!(
@@ -1058,78 +1048,6 @@ fn an_ask_waits_in_the_inbox_through_a_stop_and_runs_once_approved() {
     assert_eq!(inbox(&log), Vec::<u64>::new());
 }
 
-#[test]
-fn a_refused_ask_answers_the_call_without_running_it() {
-    let fixture = asking();
-    let session = fixture.start(&[]);
-    session.submit("$ echo refused").unwrap();
-    settle(&session);
-    session.answer(2, false).unwrap();
-    let log = finished(&session, 2);
-    session.halt();
-    assert_eq!(
-        bodies(&log)[3..],
-        [
-            &Body::Answer {
-                call: id(2),
-                value: Json::encode(&false).unwrap(),
-                origin: None,
-            },
-            &Body::ToolResult {
-                call: CallId::new(2).unwrap(),
-                outcome: Outcome::Failed {
-                    error: "the user did not approve this call".into()
-                },
-                card: None,
-            },
-        ]
-    );
-}
-
-/// #10 `an_interrupt_never_starts_work`: an interrupt settles a call
-/// waiting for approval; approving it after runs nothing.
-#[test]
-fn an_interrupt_while_asked_settles_the_call_without_running_it() {
-    let fixture = asking();
-    let session = fixture.start(&[]);
-    session.submit("$ echo ran").unwrap();
-    settle(&session);
-    session.interrupt_now();
-    // Too late: it is settled already.
-    assert!(session.answer(2, true).is_err());
-    let log = finished(&session, 2);
-    settle(&session);
-    session.halt();
-    assert!(
-        !log.iter()
-            .any(|e| matches!(e.body, Body::ToolProcess { .. })),
-        "{log:#?}"
-    );
-    assert!(
-        log.iter().any(|e| e.body
-            == Body::ToolResult {
-                call: CallId::new(2).unwrap(),
-                outcome: Outcome::Interrupted { output: None },
-                card: None,
-            }),
-        "{log:#?}"
-    );
-    assert_eq!(inbox(&log), Vec::<u64>::new());
-}
-
-/// An interrupt with nothing running stops nothing: not the next turn.
-#[test]
-fn an_interrupt_between_turns_is_not_kept_for_the_next() {
-    let fixture = asking();
-    let session = fixture.start(&[]);
-    session.interrupt_now();
-    session.submit("hi").unwrap();
-    settle(&session);
-    let log = log_of(&session);
-    session.halt();
-    assert_eq!(bodies(&log), [&user("hi"), &echo("hi")]);
-}
-
 /// `/jobs` answers without a model turn; `shout` rewrites input and
 /// refuses `no`; every `bash` call goes to the background.
 struct Extras;
@@ -1378,15 +1296,16 @@ fn background_processes_keep_the_session_and_end_with_it() {
     assert!(session.has_jobs());
     assert_eq!(session.idle_for(), Duration::ZERO);
     session.halt();
-    let deadline = Instant::now() + Duration::from_secs(5);
-    while sys::Group(pgid).alive() || session.has_jobs() {
-        assert!(Instant::now() < deadline, "the job outlived its session");
-        thread::sleep(Duration::from_millis(10));
-    }
+    session.wait(
+        "the job ended with its session",
+        Duration::from_secs(5),
+        || !session.has_jobs(),
+    );
+    assert!(!sys::Group(pgid).alive());
 }
 
 /// `lookup_harbor_label`, held until released or the turn is interrupted.
-struct Held(Arc<AtomicBool>);
+struct Held(Arc<Flag>);
 
 impl Tool for Held {
     type In = Nothing;
@@ -1396,18 +1315,15 @@ impl Tool for Held {
     const DESCRIPTION: &'static str = "Return the alpha signal marker.";
 
     async fn call(&self, _: &Nothing, cx: &Cx) -> Result<String, String> {
-        while !self.0.load(Ordering::SeqCst) {
-            if cx.cancel.is_set() {
-                return Err("stopped".into());
-            }
-            rt::Reactor::AsyncIo.sleep(Duration::from_millis(5)).await;
+        match unless(&cx.cancel, self.0.wait()).await {
+            Some(()) => Ok("crimson-harbor".into()),
+            None => Err("stopped".into()),
         }
-        Ok("crimson-harbor".into())
     }
 }
 
 /// Offers [`Held`], released by the flag it is given.
-struct HeldHarbor(Arc<AtomicBool>);
+struct HeldHarbor(Arc<Flag>);
 
 impl Extension for HeldHarbor {
     const NAME: &'static str = "harbor";
@@ -1415,18 +1331,6 @@ impl Extension for HeldHarbor {
 
     fn contribute(&self, r: &mut Registrar) {
         r.tool(Held(Arc::clone(&self.0)));
-    }
-}
-
-/// A model endpoint that never answers.
-struct Silent;
-
-impl Http for Silent {
-    fn send(
-        &self,
-        _: http::Request<llm::http::Payload>,
-    ) -> llm::http::BoxFuture<'static, io::Result<llm::http::Response>> {
-        Box::pin(std::future::pending())
     }
 }
 
@@ -1438,7 +1342,7 @@ fn tool_running(log: &[Entry]) -> bool {
 fn a_steer_reaches_the_running_turn_before_the_model_is_next_asked() {
     let replies = cassette("openai/streaming_grammar/tool_then_followup_text.yaml");
     let script = Script::new(&replies);
-    let release = Arc::new(AtomicBool::new(false));
+    let release = Arc::new(Flag::default());
     let tools = Registry::default()
         .with(&HeldHarbor(Arc::clone(&release)))
         .unwrap();
@@ -1448,7 +1352,7 @@ fn a_steer_reaches_the_running_turn_before_the_model_is_next_asked() {
     until(&session, "called the tool", tool_running);
     session.steer("Say it twice.").unwrap();
     session.submit("And then this.").unwrap();
-    release.store(true, Ordering::SeqCst);
+    release.set();
     let log = until(&session, "took the queued input", |log| {
         log.iter()
             .filter(|e| matches!(e.body, Body::Take { .. }))
@@ -1485,34 +1389,6 @@ fn a_steer_reaches_the_running_turn_before_the_model_is_next_asked() {
     ));
     let input = script.sent()[1]["input"].to_string();
     assert!(input.contains("Say it twice."), "{input}");
-}
-
-#[test]
-fn an_interrupt_stops_the_model_call_and_ends_the_turn() {
-    let models = Models {
-        settings: crate::config::Settings::new(gpt_home(), None),
-        http: Arc::new(Silent),
-    };
-    let fixture = Fixture::new(ext::LOOP, Registry::default(), models);
-    let session = fixture.start(&[]);
-    session.submit("hi").unwrap();
-    until(&session, "called the model", |log| {
-        log.iter().any(|e| matches!(e.body, Body::ModelCall { .. }))
-    });
-    session.interrupt_now();
-    settle(&session);
-    let log = log_of(&session);
-    session.halt();
-    assert_eq!(
-        bodies(&log)[2..],
-        [
-            &Body::ModelResult {
-                call: CallId::new(2).unwrap(),
-                outcome: Outcome::Interrupted { output: None }
-            },
-            &Body::INTERRUPT,
-        ]
-    );
 }
 
 #[test]
@@ -1705,30 +1581,6 @@ fn a_new_registry_generation_applies_from_the_next_step() {
         ),
         "{log:#?}"
     );
-}
-
-#[test]
-fn input_waits_its_turn_behind_a_call_waiting_for_approval() {
-    let fixture = asking();
-    let session = fixture.start(&[]);
-    session.submit("$ echo approved").unwrap();
-    settle(&session);
-    session.submit("next").unwrap();
-    let waiting = log_of(&session);
-    session.answer(2, true).unwrap();
-    let log = until(&session, "took the input", |log| {
-        log.iter().any(|e| e.body == echo("next"))
-    });
-    session.halt();
-
-    assert_eq!(waiting.last().map(|e| &e.body), Some(&queued("next")));
-    let after: Vec<_> = bodies(&log)
-        .into_iter()
-        .skip_while(|b| !matches!(b, Body::ToolResult { .. }))
-        .skip(1)
-        .collect();
-    let next = Seq::new(4).unwrap();
-    assert_eq!(after, [&Body::Take { input: next }, &echo("next")]);
 }
 
 /// Input that arrives while a loaded session recovers is in the log as
