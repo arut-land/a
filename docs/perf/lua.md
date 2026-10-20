@@ -134,7 +134,11 @@ Final validation after merging main:
   plain cross check failed on missing `errno.h`; the successful check used
   `mise exec cargo:cargo-xwin@latest` (0.23.1), its clang backend/sysroot and
   rustup's LLVM tools (`llvm-lib` driver via `llvm-ar`). No platform cfg was
-  added above sys/rt. This checks compilation, not Windows execution.
+  added above sys/rt. `check:windows` now sets this up itself on cross hosts,
+  including a temporary archiver driver directory that it removes on exit;
+  native Windows keeps its normal compiler. The pinned cargo-xwin tool adds
+  no runtime dependency or binary bytes. This checks compilation, not Windows
+  execution.
 - `mise run budgets`: all four strict checks passed. The final Lua release
   with no mods also passed all four strict checks, one test at a time.
 

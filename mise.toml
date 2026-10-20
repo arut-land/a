@@ -79,7 +79,20 @@ fi
 # The Windows build, linted from any host: nothing above `sys` and `rt`
 # names a platform, so all of it, `a` included, builds there (what the
 # daemon still lacks on Windows says it is unsupported).
-"check:windows" = "cargo clippy --workspace --all-targets --target x86_64-pc-windows-msvc -- -D warnings"
+"check:windows" = '''
+lua_windows_host=$(rustc -vV | sed -n 's/^host: //p')
+if [[ $lua_windows_host == *-pc-windows-msvc ]]; then
+  cargo clippy --workspace --all-targets --target x86_64-pc-windows-msvc -- -D warnings
+else
+  # Vendored C needs the MSVC headers even when Rust only emits metadata.
+  rustup component add llvm-tools-preview
+  lua_windows_tools=$(mktemp -d)
+  trap 'unlink "$lua_windows_tools/llvm-lib"; rmdir "$lua_windows_tools"' EXIT
+  ln -s "$(rustc --print sysroot)/lib/rustlib/$lua_windows_host/bin/llvm-ar" "$lua_windows_tools/llvm-lib"
+  export PATH="$lua_windows_tools:$PATH"
+  mise exec cargo:cargo-xwin@0.23.1 -- cargo-xwin clippy --cross-compiler clang --workspace --all-targets --target x86_64-pc-windows-msvc -- -D warnings
+fi
+'''
 # Miri over sys, the one crate with unsafe code. Miri runs no processes and
 # (on macOS) sets no file times, nor modes, so the tests that need those are skipped.
 "test:miri" = "MIRIFLAGS=-Zmiri-disable-isolation cargo miri test -p sys --lib -- --skip install:: --skip asks_a_shell --skip stages_newest --skip a_higher_version --skip tests::a_group_leader --skip tests::kills --skip fs::tests"
