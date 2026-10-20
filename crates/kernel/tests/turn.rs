@@ -828,10 +828,9 @@ fn the_on_stop_point_has_the_agent_go_on() {
     )]);
 }
 
-/// A step runs on one registry generation: a new one is taken up at the
-/// next step boundary, not by the call running.
+/// A registry offered while busy is discarded; the driver retries at rest.
 #[test]
-fn a_new_registry_generation_applies_from_the_next_step() {
+fn a_generation_is_adopted_only_at_rest() {
     let sleep = json!({ "seconds": 1 });
     let newer = Reg::echo().extensions(&["fixtures", "extras"]).arc();
     let installed = ["fixtures", "extras"].map(|name| Installed {
@@ -848,25 +847,27 @@ fn a_new_registry_generation_applies_from_the_next_step() {
                 run_tool(2, "sleep", sleep),
             ],
         ),
-        (Event::Registry(newer), vec![]),
+        (Event::Registry(newer.clone()), vec![]),
         (
             tool_done(2, done(json!(1))),
             vec![append(3, tool_result(2, done(json!(1)))), IDLE],
         ),
         (
-            user("hi"),
-            // A turn starts on the newest generation: the input is read
-            // with it.
-            vec![
-                append(
-                    4,
-                    Body::Extensions {
-                        installed: installed.to_vec(),
-                    },
-                ),
-                append(5, input("hi")),
-                append(6, said("hi")),
-            ],
+            user("old"),
+            vec![append(4, input("old")), append(5, said("old"))],
+        ),
+        (
+            Event::Registry(newer),
+            vec![append(
+                6,
+                Body::Extensions {
+                    installed: installed.to_vec(),
+                },
+            )],
+        ),
+        (
+            user("new"),
+            vec![append(7, input("new")), append(8, said("new"))],
         ),
     ]);
 }

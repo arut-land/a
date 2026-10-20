@@ -390,3 +390,155 @@ fn pending_fold_changes_survive_reload_and_the_old_view_lives_until_adoption() {
     );
     harness.finish();
 }
+
+struct ReloadFold {
+    version: u32,
+    multiplier: u64,
+    reject_second: bool,
+}
+impl ext::DynExtension for ReloadFold {
+    fn name(&self) -> ext::Name {
+        "test".into()
+    }
+    fn version(&self) -> u32 {
+        self.version
+    }
+    fn contribute(&self, r: &mut Registrar) {
+        r.dyn_fold(Arc::new(Self { ..*self }));
+    }
+}
+impl ext::DynFold for ReloadFold {
+    fn name(&self) -> ext::Name {
+        "value".into()
+    }
+    fn initial(&self) -> Json {
+        Json::encode(&0_u64).unwrap()
+    }
+    fn apply(&self, state: &Json, _: &Json) -> Result<Json, String> {
+        let value = state.parse::<u64>().unwrap();
+        if self.reject_second && value > 0 {
+            return Err("second change rejected".into());
+        }
+        Ok(Json::encode(&(value + self.multiplier)).unwrap())
+    }
+}
+fn reload_registry(version: u32, multiplier: u64, reject_second: bool) -> Registry {
+    Registry::default()
+        .with(&Agents)
+        .unwrap()
+        .with_dyn(
+            ext::Tier::User,
+            &ReloadFold {
+                version,
+                multiplier,
+                reject_second,
+            },
+        )
+        .unwrap()
+}
+impl ManualSession {
+    fn replace(&self, registry: Registry) {
+        self.session.session.shared.registry.replace(registry);
+    }
+    fn complete(&self) {
+        self.session.send(Msg::Step(Event::ToolDone {
+            call: self.call,
+            outcome: Outcome::Done {
+                output: Json::default(),
+            },
+            card: None,
+        }));
+    }
+    fn value(&self) -> u64 {
+        lock(&self.session.session.state_view())
+            .erased("test", "value")
+            .unwrap()
+            .parse()
+            .unwrap()
+    }
+    fn snapshot(&mut self) {
+        self.request(&"x".repeat(usize::try_from(SNAPSHOT_EVERY).unwrap()));
+    }
+    fn assert_replay(&self, registry: &Registry) {
+        let mut states = registry.states();
+        states.replay(log_of(&self.session));
+        assert_eq!(
+            self.value(),
+            states
+                .erased("test", "value")
+                .unwrap()
+                .parse::<u64>()
+                .unwrap()
+        );
+    }
+}
+
+#[test]
+fn a_restored_fold_replays_changes_missing_from_the_checkpoint() {
+    let mut h = ManualSession::with_registry(reload_registry(1, 1, false));
+    let _ack = h.note();
+    h.complete();
+    h.snapshot();
+    h.replace(Registry::default().with(&Agents).unwrap());
+    h.snapshot();
+    h.replace(reload_registry(1, 1, false));
+    h.request("adopt");
+    h.assert_replay(&reload_registry(1, 1, false));
+    h.finish();
+}
+
+#[test]
+fn a_changed_reducer_replays_the_checkpoint_prefix() {
+    let mut h = ManualSession::with_registry(reload_registry(1, 1, false));
+    let _ack = h.note();
+    h.complete();
+    h.snapshot();
+    h.replace(reload_registry(2, 2, false));
+    h.request("adopt");
+    h.assert_replay(&reload_registry(2, 2, false));
+    h.finish();
+}
+
+#[test]
+fn a_candidate_rejecting_a_later_change_is_never_adopted() {
+    let mut h = ManualSession::with_registry(reload_registry(1, 1, false));
+    let _first = h.note();
+    h.poll();
+    h.replace(reload_registry(2, 1, true));
+    h.session
+        .send(Msg::Step(Event::Environment(Environment::default())));
+    h.poll();
+    let _second = h.note();
+    h.poll();
+    h.complete();
+    h.request("adopt");
+    assert_eq!(h.value(), 2);
+    h.request("still valid");
+    assert_eq!(h.value(), 2, "a failed candidate cannot remain pending");
+    h.finish();
+}
+
+#[test]
+fn the_old_view_receives_its_final_note_before_adoption() {
+    let mut h = ManualSession::with_registry(reload_registry(1, 1, false));
+    let _first = h.note();
+    h.poll();
+    let old = h.session.session.state_view();
+    h.replace(reload_registry(2, 1, false));
+    h.session
+        .send(Msg::Step(Event::Environment(Environment::default())));
+    h.poll();
+    let _last = h.note();
+    h.complete();
+    h.request("adopt");
+    assert_eq!(h.value(), 2);
+    assert_eq!(
+        lock(&old)
+            .erased("test", "value")
+            .unwrap()
+            .parse::<u64>()
+            .unwrap(),
+        2
+    );
+    h.finish();
+}
