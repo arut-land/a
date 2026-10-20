@@ -216,11 +216,14 @@ impl States {
             .collect()
     }
 
-    /// The states as `images` left them: each registered state from its
-    /// image, or its default with none. One with an image its state
+    /// The states as `images` left them: exactly one image per registered
+    /// state. One missing, extra, or with an image its state
     /// cannot read fails the lot, the states left as they were: the
     /// snapshot is of another build, and the log is folded instead.
     pub fn restore(&mut self, images: &[Image]) -> Result<(), String> {
+        if images.len() != self.0.len() {
+            return Err("checkpoint fold coverage differs".into());
+        }
         let restored = (self.0.iter())
             .map(|h| {
                 let image = images
@@ -229,7 +232,10 @@ impl States {
                 match image {
                     Some(i) => (h.decl.restore)(&i.image)
                         .map_err(|e| format!("extension {}: reading {}: {e}", h.ext, h.decl.name)),
-                    None => Ok((h.decl.make)()),
+                    None => Err(format!(
+                        "extension {}: missing {} image",
+                        h.ext, h.decl.name
+                    )),
                 }
             })
             .collect::<Result<Vec<_>, _>>()?;
@@ -306,6 +312,21 @@ mod tests {
                 .contains("reading count")
         );
         assert_eq!(restored.get::<Count>().unwrap().0, 5, "left as it was");
+    }
+
+    #[test]
+    fn a_checkpoint_covers_exactly_the_registered_folds() {
+        let mut states = States::new([(Name::from("counter"), Decl::of::<Count>())]);
+        states.fold("counter", "count", &Json::encode(&2).unwrap());
+        assert!(states.restore(&[]).is_err());
+        let mut extra = states.image().unwrap();
+        extra.push(Image {
+            ext: "other".into(),
+            state: "count".into(),
+            image: Json::default(),
+        });
+        assert!(states.restore(&extra).is_err());
+        assert_eq!(states.get::<Count>().unwrap().0, 2);
     }
 
     #[test]

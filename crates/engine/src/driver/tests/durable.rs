@@ -154,6 +154,7 @@ struct ManualSession {
     actor: rt::BoxFuture<'static, ()>,
     faulty: Arc<Faulty>,
     release: oneshot::Sender<()>,
+    starts: channel::Receiver<oneshot::Sender<()>>,
     call: CallId,
 }
 
@@ -203,6 +204,7 @@ impl ManualSession {
             actor,
             faulty,
             release,
+            starts,
             call,
         }
     }
@@ -331,7 +333,7 @@ impl Extension for CountingState {
 }
 
 #[test]
-fn pending_fold_changes_survive_reload_and_the_old_view_lives_until_adoption() {
+fn pending_fold_changes_survive_reload_exactly_once() {
     let make = || Registry::default().with(&CountingState).unwrap();
     let mut harness = ManualSession::with_registry(make());
     let registry = harness.session.session.shared.registry.get();
@@ -380,13 +382,6 @@ fn pending_fold_changes_survive_reload_and_the_old_view_lives_until_adoption() {
         lock(&adopted).get::<Updates>().unwrap().0,
         2,
         "the prepared generation includes each pending change exactly once"
-    );
-    lock(&adopted).fold("test", "value", &Json::encode(&"after adoption").unwrap());
-    assert_eq!(lock(&adopted).get::<Updates>().unwrap().0, 3);
-    assert_eq!(
-        cx.state(|s: &Updates| s.0),
-        2,
-        "later changes cannot replace the original call's state view"
     );
     harness.finish();
 }
@@ -540,5 +535,81 @@ fn the_old_view_receives_its_final_note_before_adoption() {
             .unwrap(),
         2
     );
+    h.finish();
+}
+
+#[test]
+fn a_busy_burst_keeps_one_generation_across_completed_calls() {
+    let mut h = ManualSession::with_registry(reload_registry(1, 1, false));
+    let old = h.session.session.state_view();
+    let (started, starts) = channel::unbounded();
+    h.replace(
+        reload_registry(2, 1, false)
+            .with(&ControlledSleep(Arc::new(started)))
+            .unwrap(),
+    );
+    h.request("sleep 0");
+    h.complete();
+    h.poll();
+    let unchanged = Arc::ptr_eq(&old, &h.session.session.state_view());
+    let second = rt::block_on(or(h.starts.recv(), starts.recv())).unwrap();
+    h.finish();
+    drop(second);
+    assert!(
+        unchanged,
+        "queued work prevents adoption even between calls in one burst"
+    );
+}
+
+struct Superseding(Weak<Shared>);
+impl ext::DynExtension for Superseding {
+    fn name(&self) -> ext::Name {
+        "test".into()
+    }
+    fn version(&self) -> u32 {
+        2
+    }
+    fn contribute(&self, r: &mut Registrar) {
+        r.dyn_fold(Arc::new(Self(self.0.clone())));
+    }
+}
+impl ext::DynFold for Superseding {
+    fn name(&self) -> ext::Name {
+        "value".into()
+    }
+    fn initial(&self) -> Json {
+        Json::encode(&0_u64).unwrap()
+    }
+    fn apply(&self, state: &Json, _: &Json) -> Result<Json, String> {
+        self.0
+            .upgrade()
+            .unwrap()
+            .registry
+            .replace(reload_registry(3, 3, false));
+        Ok(Json::encode(&(state.parse::<u64>().unwrap() + 2)).unwrap())
+    }
+}
+
+#[test]
+fn a_candidate_superseded_during_rebuild_is_never_published() {
+    let mut h = ManualSession::with_registry(reload_registry(1, 1, false));
+    let _note = h.note();
+    h.complete();
+    h.request("rest");
+    h.replace(
+        Registry::default()
+            .with(&Agents)
+            .unwrap()
+            .with_dyn(
+                ext::Tier::User,
+                &Superseding(Arc::downgrade(&h.session.session.shared)),
+            )
+            .unwrap(),
+    );
+    h.request("adopt");
+    assert!(!log_of(&h.session).iter().any(|e| matches!(&e.body,
+        Body::Extensions { installed } if installed.iter().any(|i| i.name == "test" && i.version == 2))),
+        "superseded candidates cannot reach the kernel");
+    assert_eq!(h.value(), 3);
     h.finish();
 }

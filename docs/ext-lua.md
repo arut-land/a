@@ -11,9 +11,12 @@ same name. Tools and text replace earlier contributions of the same name using
 the SDK's normal tier rules. Guarded extensions cannot be replaced.
 
 File events prepare changes, additions and removals off the async worker.
-The kernel adopts a ready generation when no calls are open. Running calls
-retain their original functions and state view. New folds rebuild from a
-consistent snapshot and suffix, including pending changes. A broken edit keeps
+A reload takes effect at the next rest: no calls, asks, children or recovering
+model call. A session that stays busy keeps its current generation until it
+rests. Between bursts, folds rebuild through the same path as session loading:
+a snapshot with matching build, extensions and fold versions plus its suffix,
+including pending changes, or bounded full replay when incompatible. Registry,
+handlers and fold state are published together. A broken edit keeps
 the last working generation and reports an error; invalid mods at first load
 are warned about and omitted. `/lua-reload` prepares edits explicitly and
 acknowledges completion. Workspace subscriptions end with their last session.
@@ -151,6 +154,6 @@ contributions.
 
 Workspace preparation also limits combined source to 1 MiB and directory scans
 to 4096 entries per root, with an aggregate compilation budget of one second.
-Fold rebuilds use a snapshot plus at most 100,000 suffix entries within a
-one-second budget. A rejected rebuild keeps the current generation and reports
-why; no partial state is installed.
+Fold rebuilds use a compatible snapshot plus its suffix, or full replay, with
+at most 100,000 entries and a one-second budget. A rejected rebuild keeps the
+current generation and reports why; no partial state is installed.

@@ -466,8 +466,7 @@ pub trait Sources: Send + Sync {
 }
 
 /// The registry sessions run with. Replacing it (a reload) takes effect at
-/// each session's next step boundary: work already running finishes on the
-/// generation it started with.
+/// each session's next rest, between bursts of events.
 pub struct Current(Mutex<Arc<Registry>>, AtomicU64);
 
 impl Current {
@@ -497,9 +496,6 @@ impl Current {
 /// kernel never sees a model request: the `step` point is the engine's
 /// to ask, on [`Bound`].
 pub trait Binding: Send + Sync {
-    /// Publishes a prepared view at the kernel's safe adoption boundary.
-    fn activate(&self) {}
-
     /// A new agent, of the kind the session runs.
     fn agent(&self) -> Box<dyn Agent>;
 
@@ -719,10 +715,6 @@ impl<V: View + Send + Sync + 'static> Bound<V> {
 }
 
 impl<V: View + Send + Sync + 'static> Binding for Bound<V> {
-    fn activate(&self) {
-        self.view.activate();
-    }
-
     fn agent(&self) -> Box<dyn Agent> {
         self.registry.agent(self.agent.as_deref())
     }
