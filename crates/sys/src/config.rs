@@ -92,6 +92,11 @@ enum Setting {
 }
 
 impl Table {
+    /// The extension's name: the table is `[ext.<name>]`.
+    pub fn name(&self) -> &str {
+        &self.name
+    }
+
     pub fn text(&self, key: &str) -> Result<Option<&str>, ParseError> {
         self.get(key, "a string", |v| match v {
             Setting::Text(text) => Some(text.as_str()),
