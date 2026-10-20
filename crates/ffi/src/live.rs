@@ -474,89 +474,135 @@ fn parse_id(id: &str) -> Result<SessionId, ClientError> {
 
 #[cfg(test)]
 mod tests {
-    use std::sync::Barrier;
+    use std::sync::mpsc;
     use std::thread;
-    use std::time::Instant;
 
     use protocol::{Caps, ClientMsg, DaemonMsg, read_frame, write_frame};
 
     use super::*;
 
     #[test]
-    fn concurrent_mutations_arrive_in_sequence_order() {
-        for _ in 0..10 {
-            let root = std::env::temp_dir().join(format!("a-ffi-order-{}", SessionId::new()));
-            std::fs::create_dir_all(&root).unwrap();
-            let home = Home::from(root.join("home"));
-            let exe = root.join("a");
-            std::fs::write(&exe, "never run").unwrap();
-            let staged = home.runtime().stage(&exe).unwrap();
-            let listener = home.bind().unwrap();
-            let peer = thread::spawn(move || {
-                let mut peer = listener.accept().unwrap();
-                assert!(matches!(
-                    read_frame::<ClientMsg>(&mut peer).unwrap(),
-                    Some(ClientMsg::Hello { .. })
-                ));
-                assert!(matches!(
-                    read_frame::<ClientMsg>(&mut peer).unwrap(),
-                    Some(ClientMsg::Attach { .. })
-                ));
-                write_frame(
-                    &mut peer,
-                    &DaemonMsg::Welcome {
-                        proto: protocol::PROTO,
-                        build: "test".into(),
-                        caps: Caps::ALL,
-                        commands: Vec::new(),
-                    },
-                )
-                .unwrap();
-                let mut received = Vec::new();
-                while let Some(msg) = read_frame::<ClientMsg>(&mut peer).unwrap() {
-                    if let Some(seq) = msg.client_seq() {
-                        received.push(seq);
-                    }
-                    if matches!(msg, ClientMsg::Detach) {
-                        break;
-                    }
-                }
-                received
+    fn numbered_input_and_reconnect_replay_cannot_overtake_a_paused_send() {
+        let root = std::env::temp_dir().join(format!("a-ffi-order-{}", SessionId::new()));
+        std::fs::create_dir_all(&root).unwrap();
+        let home = Home::from(root.join("home"));
+        let exe = root.join("a");
+        std::fs::write(&exe, "never run").unwrap();
+        let staged = home.runtime().stage(&exe).unwrap();
+        let listener = home.bind().unwrap();
+        let session = Session::new(&Client {
+            daemon: Daemon::local(home.clone(), staged),
+            home: home.clone(),
+        });
+        session
+            .open(OpenTarget::Id {
+                id: SessionId::new().to_string(),
+            })
+            .unwrap();
+        let mut peer = listener.accept().unwrap();
+        let welcome = DaemonMsg::Welcome {
+            proto: protocol::PROTO,
+            build: "test".into(),
+            caps: Caps::ALL,
+            commands: Vec::new(),
+        };
+        read_frame::<ClientMsg>(&mut peer).unwrap().unwrap();
+        read_frame::<ClientMsg>(&mut peer).unwrap().unwrap();
+        // Receiving queued input proves Connected was processed, without polling.
+        rt::block_on(session.send("ready".into())).unwrap();
+        write_frame(&mut peer, &welcome).unwrap();
+        assert_eq!(
+            read_frame::<ClientMsg>(&mut peer)
+                .unwrap()
+                .unwrap()
+                .client_seq(),
+            Some(1)
+        );
+        let id = SessionId::new();
+        write_frame(
+            &mut peer,
+            &DaemonMsg::Attached {
+                session: id,
+                workspace: root.clone(),
+            },
+        )
+        .unwrap();
+        let (numbered, numbering) = mpsc::channel();
+        let (release, released) = mpsc::channel();
+        thread::scope(|scope| {
+            let session = &session;
+            let first = scope.spawn(move || {
+                rt::block_on(session.intend(move |client| {
+                    let effects = client.offer()?.input("first".into());
+                    numbered.send(()).unwrap();
+                    released.recv().unwrap();
+                    Ok(effects)
+                }))
+                .unwrap()
             });
-            let session = Session::new(&Client {
-                daemon: Daemon::local(home.clone(), staged),
-                home: home.clone(),
+            numbering.recv().unwrap();
+            assert!(session.sending.try_lock().is_err());
+            let (started, starting) = mpsc::channel();
+            let second = scope.spawn(move || {
+                started.send(()).unwrap();
+                rt::block_on(session.run(Cmd::Input("second".into()))).unwrap();
             });
-            session
-                .open(OpenTarget::Id {
-                    id: SessionId::new().to_string(),
-                })
-                .unwrap();
-            let deadline = Instant::now() + Duration::from_secs(5);
-            while !lock(&session.feed).client.link().up() {
-                assert!(Instant::now() < deadline);
-                thread::yield_now();
-            }
-            let start = Barrier::new(64);
-            thread::scope(|scope| {
-                for n in 0..64 {
-                    let (session, start) = (&session, &start);
-                    scope.spawn(move || {
-                        start.wait();
-                        let text = "x".repeat(64 * 1024);
-                        if n % 2 == 0 {
-                            rt::block_on(session.send(text)).unwrap();
-                        } else {
-                            rt::block_on(session.run(Cmd::Input(text))).unwrap();
-                        }
-                    });
-                }
-            });
-            drop(session);
-            let received = peer.join().unwrap();
-            home.endpoint().remove();
-            std::fs::remove_dir_all(root).unwrap();
-            assert_eq!(received, (1..=64).collect::<Vec<_>>());
+            starting.recv().unwrap();
+            release.send(()).unwrap();
+            first.join().unwrap();
+            second.join().unwrap();
+        });
+        for seq in [2, 3] {
+            assert_eq!(
+                read_frame::<ClientMsg>(&mut peer)
+                    .unwrap()
+                    .unwrap()
+                    .client_seq(),
+                Some(seq)
+            );
         }
+        write_frame(&mut peer, &DaemonMsg::Draining).unwrap();
+        drop(peer);
+        let mut peer = listener.accept().unwrap();
+        read_frame::<ClientMsg>(&mut peer).unwrap().unwrap();
+        read_frame::<ClientMsg>(&mut peer).unwrap().unwrap();
+        let (queued, queueing) = mpsc::channel();
+        let (release, released) = mpsc::channel();
+        thread::scope(|scope| {
+            let session = &session;
+            let input = scope.spawn(move || {
+                rt::block_on(session.intend(move |client| {
+                    let effects = client.offer()?.input("during reconnect".into());
+                    queued.send(()).unwrap();
+                    released.recv().unwrap();
+                    Ok(effects)
+                }))
+                .unwrap()
+            });
+            queueing.recv().unwrap();
+            // Connected competes with the input while its numbering/pump lock is held.
+            write_frame(&mut peer, &welcome).unwrap();
+            assert!(session.sending.try_lock().is_err());
+            release.send(()).unwrap();
+            input.join().unwrap();
+        });
+        for seq in [1, 2, 3, 4] {
+            assert_eq!(
+                read_frame::<ClientMsg>(&mut peer)
+                    .unwrap()
+                    .unwrap()
+                    .client_seq(),
+                Some(seq)
+            );
+        }
+        drop(session);
+        assert!(matches!(
+            read_frame::<ClientMsg>(&mut peer).unwrap(),
+            Some(ClientMsg::Detach)
+        ));
+        drop(peer);
+        drop(listener);
+        home.endpoint().remove();
+        std::fs::remove_dir_all(root).unwrap();
     }
 }
