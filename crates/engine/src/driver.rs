@@ -7,6 +7,7 @@
 //! decides what.
 
 use std::any::Any;
+use std::cell::RefCell;
 use std::future::{Future, poll_fn};
 use std::io;
 use std::panic::{AssertUnwindSafe, catch_unwind};
@@ -18,17 +19,19 @@ use std::task::Poll;
 use std::time::Instant;
 
 use crate::catalog::Record;
-use crate::store::{Encoded, Header, Parent, Writer};
+use crate::store::{Encoded, Header, Loaded, Parent, Snapshot, Writer};
 use ext::host::{Binding, Bound, Host, Parts, Registry, Services};
 use ext::point::View;
 use ext::{BoxFuture, Called, Cancel, Cx, Flag, States};
 use kernel::{Core, Durability, Effect, Effects, Event, Load, Note, Owner, Replied, Ticket};
+use protocol::ledger::Ledger;
 use protocol::view::SessionView;
 use protocol::{
     Author, Body, CallId, DaemonMsg, Entry, Environment, Frame, Json, Mode, Outcome, ReadOnly,
     Residency, SessionId, SessionSummary, ToolChoice,
 };
 use rt::{channel, oneshot, or};
+use serde::{Deserialize, Serialize};
 
 use crate::model::{Model, Models};
 use crate::outbox::{FrameLog, Outbox};
@@ -45,6 +48,10 @@ pub struct Shared {
     /// The extensions, as each session takes them up at its next step.
     pub registry: ext::host::Current,
     pub models: Models,
+    /// Where every session's commits are barriers.
+    pub barriers: kernel::Barriers,
+    /// This build: what a snapshot must be of to be restored.
+    pub build: String,
     /// Where sessions keep output too large for their logs.
     pub spill: PathBuf,
     /// Sessions loaded since the daemon started.
@@ -227,22 +234,13 @@ impl Live {
             shared: Arc::clone(shared),
         });
         let bound = bind(&registry, &session);
-        let mut core = Core::new(Arc::clone(&bound) as Arc<dyn Binding>);
-        // Each entry is folded as it is read and dropped.
-        let mut states = registry.states();
-        let mut has_input = false;
-        let loaded = match open {
-            Open::Create => {
-                let created = shared.store.create(header)?;
-                shared.catalog.record(Record::new(header.clone()));
-                created
-            }
-            Open::Load => shared.store.load(header.id, &mut |e| {
-                has_input |= matches!(e.body, Body::Input { .. });
-                states.apply(&e);
-                core.load(&e);
-            })?,
-        };
+        let binding = Arc::clone(&bound) as Arc<dyn Binding>;
+        let (loaded, folding) = Folding::open(header, shared, open, &binding, &registry)?;
+        let Folding {
+            mut core,
+            states,
+            has_input,
+        } = folding;
         *lock(&session.states) = states;
         *lock(&session.env) = core.ledger().env().cloned().map(Arc::new);
         let fresh = lock(&shared.loaded).insert(header.id);
@@ -300,6 +298,7 @@ impl Live {
             waiting_sync: Vec::new(),
             sync_armed: false,
             resuming: false,
+            since_snapshot: loaded.read,
         };
         shared.rt.spawn(Box::pin(actor.run(rx, first)));
         Ok(live)
@@ -418,7 +417,110 @@ impl Live {
     }
 }
 
-fn summary(header: &Header, ledger: &protocol::ledger::Ledger) -> SessionSummary {
+/// A session's log being folded as it loads: the kernel and the
+/// extensions' states, from a snapshot or from nothing, then an entry at a
+/// time.
+struct Folding {
+    core: Core,
+    states: States,
+    /// Whether the log holds any input.
+    has_input: bool,
+}
+
+impl Folding {
+    /// Creates session `header`'s log, or loads it: from the newest
+    /// snapshot if it is of this build and these extensions, else from
+    /// nothing; then each entry read after it is folded and dropped.
+    fn open(
+        header: &Header,
+        shared: &Shared,
+        open: Open,
+        binding: &Arc<dyn Binding>,
+        registry: &Registry,
+    ) -> io::Result<(Loaded, Self)> {
+        let folding = RefCell::new(Self {
+            core: Core::new(Arc::clone(binding)).with_barriers(shared.barriers),
+            states: registry.states(),
+            has_input: false,
+        });
+        let loaded = match open {
+            Open::Create => {
+                let created = shared.store.create(header)?;
+                shared.catalog.record(Record::new(header.clone()));
+                created
+            }
+            Open::Load => shared.store.load(
+                header.id,
+                &mut |snapshot| {
+                    let restored =
+                        (folding.borrow_mut()).restore(&snapshot, binding, registry, shared);
+                    restored
+                        .inspect_err(|e| {
+                            crate::session_event("snapshot", header.id, || {
+                                format!("not restored: {e}")
+                            });
+                        })
+                        .is_ok()
+                },
+                &mut |e| folding.borrow_mut().fold(&e),
+            )?,
+        };
+        Ok((loaded, folding.into_inner()))
+    }
+
+    /// Starts from `snapshot`, if it is an [`Image`] this build made with
+    /// the extensions installed now: else nothing changes, and the log is
+    /// folded from its first entry.
+    fn restore(
+        &mut self,
+        snapshot: &Snapshot,
+        binding: &Arc<dyn Binding>,
+        registry: &Registry,
+        shared: &Shared,
+    ) -> Result<(), String> {
+        let image: Image = snapshot.image.parse().map_err(|e| e.to_string())?;
+        if image.build != shared.build {
+            return Err(format!("of build {}", image.build));
+        }
+        if image.extensions != registry.installed() {
+            return Err("of other extensions".to_owned());
+        }
+        self.states.restore(&image.states)?;
+        let core = Core::restore(Arc::clone(binding), image.ledger);
+        self.core = core.with_barriers(shared.barriers);
+        self.has_input = image.has_input;
+        Ok(())
+    }
+
+    fn fold(&mut self, e: &Entry) {
+        self.has_input |= matches!(e.body, Body::Input { .. });
+        self.states.apply(e);
+        self.core.load(e);
+    }
+}
+
+/// What a snapshot of a session keeps: the ledger and the extensions'
+/// states as they stood at rest, which is all a session at rest is
+/// ([`Core::restore`]), under what made them. A load that cannot read
+/// one, or one of another build or other extensions, folds the log
+/// instead: the snapshot is derived, and only ever spares the fold.
+#[derive(Serialize, Deserialize)]
+struct Image {
+    /// The build that took it: the ledger's shape, and what a fold makes
+    /// of an entry, are a build's own.
+    build: String,
+    extensions: Vec<protocol::Installed>,
+    has_input: bool,
+    ledger: Ledger,
+    states: Vec<ext::Image>,
+}
+
+/// How much log, in bytes, a load may read past the newest snapshot: at
+/// rest with more, a session takes one. Folding this much costs about as
+/// much as taking one.
+const SNAPSHOT_EVERY: u64 = 64 << 10;
+
+fn summary(header: &Header, ledger: &Ledger) -> SessionSummary {
     SessionSummary {
         id: header.id,
         workspace: header.workspace.clone(),
@@ -471,6 +573,9 @@ struct Actor {
     /// Carrying out what a resume asked for: a commit that fails now does
     /// not resume again, the session stops.
     resuming: bool,
+    /// The bytes of log the next load would read past the newest
+    /// snapshot: once [`SNAPSHOT_EVERY`], the next rest is snapshotted.
+    since_snapshot: u64,
 }
 
 /// How long written entries may stay unsynced, and so unseen: a sync is
@@ -586,8 +691,14 @@ impl Actor {
             self.mark().await;
             self.publish();
             self.live.session.changed.notify();
+            if self.since_snapshot >= SNAPSHOT_EVERY {
+                self.keep_snapshot().await;
+            }
         }
         self.sync().await;
+        if self.since_snapshot >= SNAPSHOT_EVERY {
+            self.keep_snapshot().await;
+        }
         // Listed as it ends, with all it logged.
         let listing = self.listing(self.live.has_work());
         let shared = Arc::clone(&self.live.session.shared);
@@ -765,42 +876,40 @@ impl Actor {
         self.carry(fx).await;
     }
 
-    /// Carries out `fx`: its appends are committed together, before the
-    /// effects among them, which then run in order. Whatever the steps
-    /// `fx` came from, a burst costs one commit, and each intent is still
-    /// durable before the work it names. Only a kill, of a process group
-    /// whose call the entries after it settle, a cancel, which the kernel
-    /// orders before the outcome it then logs, and a busy mark, set before
-    /// the work it marks, go before what was appended ahead of them is
-    /// committed; a cancel of work `fx` has yet to start goes after that
-    /// start, as before it there is nothing of the call's to stop. A commit that fails drops the rest and resumes from what
-    /// the log holds.
+    /// Carries out `fx`: its appends are committed together, as durably
+    /// as its commit says, before the effects among them, which then run
+    /// in order. Whatever the steps `fx` came from, a burst costs one
+    /// commit, as durable as the most durable step asked, and each intent
+    /// is still durable before the work it names. Only a cancel, which the
+    /// kernel orders before the outcome it then logs, a busy mark set
+    /// before the work it marks, and a kill of a process group left over,
+    /// which nothing logged waits on, go before what was appended ahead of
+    /// them is committed; a cancel of work `fx` has yet to start goes after
+    /// that start, as before it there is nothing of the call's to stop. A
+    /// commit that fails drops the rest and resumes from what the log
+    /// holds.
     async fn carry(&mut self, fx: Effects) {
         let mut batch = Vec::new();
-        let mut after = Vec::new();
+        let mut durability = None;
+        let mut after: Vec<Effect> = Vec::new();
         for effect in fx {
             match effect {
                 Effect::Append(e) => batch.push(e),
-                Effect::Kill { .. } => {
-                    if !self.flush(&mut batch, &mut after).await {
-                        return;
-                    }
-                    self.effect(effect);
-                }
+                Effect::Commit(d) => durability = durability.max(Some(d)),
                 Effect::Cancel { call } if after.iter().any(|e| e.starts_call() == Some(call)) => {
                     after.push(effect);
                 }
-                Effect::MarkBusy(true) | Effect::Cancel { .. } => self.effect(effect),
+                Effect::MarkBusy(true) | Effect::Cancel { .. } | Effect::Kill { .. } => {
+                    self.effect(effect);
+                }
                 effect => after.push(effect),
             }
         }
-        self.flush(&mut batch, &mut after).await;
-    }
-
-    /// Commits `batch`, then carries out the effects `after` it; `false`
-    /// if the commit failed, and the session resumed. Notes with nothing
-    /// after them are durable with the next commit that is.
-    async fn flush(&mut self, batch: &mut Vec<Entry>, after: &mut Vec<Effect>) -> bool {
+        debug_assert_eq!(
+            batch.is_empty(),
+            durability.is_none(),
+            "a step commits once"
+        );
         // The session as it stands once `after` is carried out.
         let busy = (after.iter().rev())
             .find_map(|e| match e {
@@ -808,31 +917,48 @@ impl Actor {
                 _ => None,
             })
             .unwrap_or_else(|| self.live.has_work());
-        let listing = self.listing(busy);
-        if !batch.is_empty()
-            && let Err(e) = self.commit(batch, !after.is_empty(), listing).await
+        if let Some(durability) = durability
+            && let Err(why) = self.flush(&mut batch, durability, busy).await
         {
-            let why = format!("logging: {e}");
-            eprintln!("session {}: {why}", self.live.id.short());
-            for effect in after.drain(..) {
-                if let Effect::Reply { ticket, .. } = effect {
-                    self.reply(ticket, Err(why.clone()));
-                }
-            }
-            // Its log takes nothing: the session stops, and loads again
-            // when next wanted.
-            if self.resuming {
-                self.phase = Phase::Draining;
-                self.live.session.cancel_all();
-                return false;
-            }
-            Box::pin(self.resume()).await;
-            return false;
+            return self.failed(why, after).await;
         }
-        for effect in after.drain(..) {
+        for effect in after {
             self.effect(effect);
         }
-        true
+    }
+
+    /// Commits `batch` as `durability` says, listed `busy`.
+    async fn flush(
+        &mut self,
+        batch: &mut Vec<Entry>,
+        durability: Durability,
+        busy: bool,
+    ) -> Result<(), String> {
+        let listing = self.listing(busy);
+        let durable = durability == Durability::Barrier;
+        self.commit(batch, durable, listing)
+            .await
+            .map_err(|e| format!("logging: {e}"))
+    }
+
+    /// A commit failed for `why`: the effects `rest` after it are dropped,
+    /// whoever they would have answered told why, and the session resumes
+    /// from what the log holds.
+    async fn failed(&mut self, why: String, rest: Vec<Effect>) {
+        eprintln!("session {}: {why}", self.live.id.short());
+        for effect in rest {
+            if let Effect::Reply { ticket, .. } = effect {
+                self.reply(ticket, Err(why.clone()));
+            }
+        }
+        // Its log takes nothing: the session stops, and loads again when
+        // next wanted.
+        if self.resuming {
+            self.phase = Phase::Draining;
+            self.live.session.cancel_all();
+            return;
+        }
+        Box::pin(self.resume()).await;
     }
 
     /// After a failed commit or a step that panicked: what runs is
@@ -856,8 +982,9 @@ impl Actor {
         };
         // Folded an entry at a time, as a load folds it.
         let frames = &self.live.frames;
+        let barriers = self.live.session.shared.barriers;
         let resumed = catch_unwind(AssertUnwindSafe(|| {
-            let mut core = Core::new(bound);
+            let mut core = Core::new(bound).with_barriers(barriers);
             for e in frames.entries() {
                 core.load(&e);
             }
@@ -891,8 +1018,8 @@ impl Actor {
     }
 
     /// Writes `batch`, then shows it: the writer stamps its lease. It is
-    /// made durable at once unless it holds only notes and `durable` is
-    /// not asked for ([`kernel::Durability`]).
+    /// made durable at once if `durable`, else with the next commit that
+    /// is ([`kernel::Durability`]).
     ///
     /// The catalog takes `listing`, if it changed, in the same blocking
     /// hop: before the entries when it is busy, as the mark is set before
@@ -904,10 +1031,6 @@ impl Actor {
         durable: bool,
         listing: Record,
     ) -> io::Result<()> {
-        let durable = durable
-            || batch
-                .iter()
-                .any(|e| Durability::of(&e.body) == Durability::Now);
         let mut writer = self
             .writer
             .take()
@@ -944,6 +1067,7 @@ impl Actor {
             format!("{} entries {how}", entries.len())
         });
         self.folded(&entries);
+        self.since_snapshot += lines.lines().map(|l| l.len() as u64 + 1).sum::<u64>();
         if durable {
             // The sync made what was written before durable too.
             self.show_synced();
@@ -953,6 +1077,51 @@ impl Actor {
             self.arm_sync();
         }
         Ok(())
+    }
+
+    /// Keeps a snapshot of the session beside its log, if it is at rest
+    /// and all it logged is durable: what the next load starts from. A
+    /// child's is not kept: what it settled with is the daemon's to read
+    /// from its log, not the ledger's to carry. One that cannot be taken
+    /// is reported and not tried again until as much log follows.
+    async fn keep_snapshot(&mut self) {
+        let covers = self.core.ledger().seq();
+        let rest =
+            self.core.at_rest() && self.unsynced.is_empty() && covers == self.live.frames.seq();
+        if !rest || self.live.parent.is_some() || self.writer.is_none() {
+            return;
+        }
+        self.since_snapshot = 0;
+        let states = match lock(&self.live.session.states).image() {
+            Ok(states) => states,
+            Err(e) => {
+                eprintln!("session {}: snapshot: {e}", self.live.id.short());
+                return;
+            }
+        };
+        let image = Image {
+            build: self.live.session.shared.build.clone(),
+            extensions: self.registry.installed(),
+            has_input: self.live.has_input(),
+            ledger: self.core.ledger().clone(),
+            states,
+        };
+        let Some(mut writer) = self.writer.take() else {
+            return;
+        };
+        let rt = Arc::clone(&self.live.session.shared.rt);
+        let (writer, taken) = rt::unblock(&*rt, move || {
+            let taken = Json::encode(&image)
+                .map_err(io::Error::other)
+                .and_then(|image| writer.snapshot(&Snapshot { covers, image }));
+            (writer, taken)
+        })
+        .await;
+        self.writer = Some(writer);
+        match taken {
+            Ok(()) => crate::session_event("snapshot", self.live.id, || format!("at {covers}")),
+            Err(e) => eprintln!("session {}: snapshot: {e}", self.live.id.short()),
+        }
     }
 
     /// Asks for a sync [`SYNC_LAG`] from now, unless one is on its way.
@@ -1078,7 +1247,7 @@ impl Actor {
             return;
         }
         match effect {
-            Effect::Append(_) => unreachable!("appends are committed in runs"),
+            Effect::Append(_) | Effect::Commit(_) => unreachable!("appends commit in runs"),
             Effect::Reply { ticket, result } => self.reply(ticket, result),
             Effect::Side { ticket, side } => {
                 if let Some((reply, conversation)) = self.sides.remove(&ticket) {

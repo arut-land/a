@@ -15,8 +15,8 @@ use protocol::Card;
 
 use crate::fold::{Fold, Next};
 use crate::{
-    Action, Answer, Binding, Chained, Concurrency, Effect, Effects, Event, Gate, Gated, Load,
-    ModelPhase, Name, Note, Owner, Recover, Replay, Replied, Step, Ticket, Turn,
+    Action, Answer, Barriers, Binding, Chained, Concurrency, Durability, Effect, Effects, Event,
+    Gate, Gated, Load, ModelPhase, Name, Note, Owner, Recover, Replay, Replied, Step, Ticket, Turn,
 };
 
 /// Who refused a call the agent would not run.
@@ -46,6 +46,7 @@ pub struct Core {
     deferred: VecDeque<(SessionId, Outcome)>,
     /// Why the model call being recovered failed, while a handler decides.
     failed: Option<String>,
+    barriers: Barriers,
 }
 
 impl Core {
@@ -78,8 +79,17 @@ impl Core {
     /// a time with [`Core::load`], as it is read, then it is resumed with
     /// [`Core::resumed`]. [`Core::resume`] does all three.
     pub fn new(registry: Arc<dyn Binding>) -> Self {
+        Self::restore(registry, Ledger::default())
+    }
+
+    /// A session folded up to a point at which it was at rest
+    /// ([`Core::at_rest`]), from the ledger it had there: the rest of the
+    /// fold is empty between turns, and the agent starts each turn afresh,
+    /// so a snapshot keeps only the ledger, and the log after it is folded
+    /// with [`Core::load`] as a load folds it.
+    pub fn restore(registry: Arc<dyn Binding>, ledger: Ledger) -> Self {
         Self {
-            fold: Fold::new(registry.agent()),
+            fold: Fold::restore(registry.agent(), ledger),
             registry,
             next: None,
             turn: Turn::Idle,
@@ -88,7 +98,15 @@ impl Core {
             reported: 0,
             deferred: VecDeque::new(),
             failed: None,
+            barriers: Barriers::default(),
         }
+    }
+
+    /// The same, with its barriers falling as `barriers` says.
+    #[must_use]
+    pub const fn with_barriers(mut self, barriers: Barriers) -> Self {
+        self.barriers = barriers;
+        self
     }
 
     /// Folds entry `e` of the log being loaded, the one after the last.
@@ -204,6 +222,18 @@ impl Core {
         &self.turn
     }
 
+    /// Whether nothing is in flight, asked for, queued or deferred: the
+    /// ledger alone says where the session stands, so a snapshot of it
+    /// restores the session ([`Core::restore`]).
+    pub fn at_rest(&self) -> bool {
+        self.turn == Turn::Idle
+            && self.failed.is_none()
+            && self.fold.at_rest()
+            && self.deferred.is_empty()
+            && self.fold.ledger.untaken().is_empty()
+            && self.fold.ledger.open_calls().next().is_none()
+    }
+
     /// What the log says now, through the last entry appended.
     pub const fn ledger(&self) -> &Ledger {
         &self.fold.ledger
@@ -212,6 +242,39 @@ impl Core {
     fn finish(&mut self, fx: &mut Effects) {
         self.advance(fx);
         self.marks(fx);
+        self.commits(fx);
+    }
+
+    /// Ends the entries `fx` appends with their commit, after the last of
+    /// them: a barrier if anything in `fx` is external, whatever the
+    /// barriers setting; otherwise as it says. The driver commits them
+    /// together, before any effect among them but a cancel, a busy mark
+    /// set or a kill runs.
+    fn commits(&self, fx: &mut Effects) {
+        let Some(last) = fx.iter().rposition(|e| matches!(e, Effect::Append(_))) else {
+            return;
+        };
+        let fact = fx.iter().any(|e| {
+            matches!(e, Effect::Append(e) if !matches!(e.body, Body::Progress { .. } | Body::Ext { .. }))
+        });
+        let before = fx.iter().any(Effect::external);
+        fx.insert(last + 1, Effect::Commit(self.commit(fact, before)));
+    }
+
+    /// How durable a step's entries are to be: holding `fact`s beyond
+    /// notes or not, `before` an external effect or not, with the turn as
+    /// it stands.
+    fn commit(&self, fact: bool, before: bool) -> Durability {
+        let barrier = before
+            || match self.barriers {
+                Barriers::Step => fact,
+                Barriers::Effects => self.turn == Turn::Idle,
+            };
+        if barrier {
+            Durability::Barrier
+        } else {
+            Durability::Lazy
+        }
     }
 
     // ── events ────────────────────────────────────────────────────────

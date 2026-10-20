@@ -7,6 +7,7 @@
 use ext::point::Observe;
 use ext::{Budget, Configured, Extension, Fold, Reaction, Refused, Registrar, Side, Table};
 use protocol::Body;
+use serde::{Deserialize, Serialize};
 
 /// The purpose the side request is logged with: what a client asks the
 /// view for.
@@ -19,7 +20,7 @@ const TITLE: &str = "Name this conversation in at most six words, for a list of 
 pub struct Title;
 
 /// Whether the session was titled, or is being.
-#[derive(Debug, Default)]
+#[derive(Debug, Default, Serialize, Deserialize)]
 pub struct Titled(pub bool);
 
 impl Fold for Titled {

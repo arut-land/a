@@ -19,7 +19,7 @@ use std::sync::Arc;
 
 #[cfg(test)]
 use protocol::Seq;
-use protocol::{Entry, Epoch, ReadOnly, SessionId};
+use protocol::{Entry, Epoch, Json, ReadOnly, SessionId};
 use serde::{Deserialize, Serialize};
 
 #[cfg(test)]
@@ -48,6 +48,16 @@ pub struct Parent {
     pub call: u64,
 }
 
+/// What a session's log folds to at entry `covers`, as whoever loads it
+/// reads it back: derived, so a load that cannot use it folds the log
+/// instead, and a store keeps it as it can, beside the log and never
+/// ahead of it.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Snapshot {
+    pub covers: u64,
+    pub image: Json,
+}
+
 /// A session's writer, and the entries it continues as their lines.
 pub struct Loaded {
     pub writer: Writer,
@@ -56,6 +66,9 @@ pub struct Loaded {
     pub lines: Arc<dyn Lines>,
     /// The seq of the last entry committed.
     pub seq: u64,
+    /// The bytes of log read to load it: those after the snapshot taken,
+    /// or all of them.
+    pub read: u64,
 }
 
 impl Loaded {
@@ -143,6 +156,12 @@ impl Writer {
         self.log.sync()
     }
 
+    /// Keeps `snapshot` beside the log, for the next load to start from:
+    /// it covers entries committed already.
+    pub fn snapshot(&mut self, snapshot: &Snapshot) -> io::Result<()> {
+        self.log.snapshot(snapshot)
+    }
+
     /// Appends `entries` durably as they are, epochs included: a log laid
     /// down for a test.
     #[cfg(test)]
@@ -162,10 +181,18 @@ pub trait LogStore: Send + Sync {
 
     /// One session's appender, handing `each` the committed entries in
     /// order as they are read, one at a time: loading keeps none that
-    /// `each` does not. `NotFound` if there is none. A log the store cannot
-    /// continue without changing what it holds is handed out kept as it is
-    /// ([`Writer::read_only`]), with the entries it reads.
-    fn load(&self, id: SessionId, each: &mut dyn FnMut(Entry)) -> io::Result<Loaded>;
+    /// `each` does not. The newest snapshot the store holds of the log,
+    /// if it has one it can place, is handed to `restore` first: taken,
+    /// only the entries after it are read. `NotFound` if there is no log.
+    /// A log the store cannot continue without changing what it holds is
+    /// handed out kept as it is ([`Writer::read_only`]), with the entries
+    /// it reads.
+    fn load(
+        &self,
+        id: SessionId,
+        restore: &mut dyn FnMut(Snapshot) -> bool,
+        each: &mut dyn FnMut(Entry),
+    ) -> io::Result<Loaded>;
 
     /// One session's committed entries, read without taking its lease: its
     /// writer goes on appending.
@@ -196,6 +223,12 @@ pub trait Log: Send {
     /// Makes what [`Log::write_all`] wrote durable, as the next
     /// [`Log::append_all`] would.
     fn sync(&mut self) -> io::Result<()> {
+        Ok(())
+    }
+
+    /// Keeps `snapshot` for the next load, as it can: a backend that
+    /// keeps none has every load fold the log.
+    fn snapshot(&mut self, _: &Snapshot) -> io::Result<()> {
         Ok(())
     }
 

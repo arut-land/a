@@ -126,6 +126,106 @@ fn recovery_is_just_resume() {
     crash_everywhere(|| Reg::modeled().retry(Duration::ZERO), &["go", "again"]);
 }
 
+/// Runs `inputs` as `go` carries effects out, each given once the one
+/// before it is done, or with the next if it is `+`-marked; then, from
+/// every point it rested at, holds that a session restored from a
+/// snapshot taken there and handed the log after it resumes as one
+/// handed the whole log, whatever entry a crash came after: the same
+/// work, turn and ledger, and from there the same log.
+fn snapshot_everywhere(reg: &dyn Fn() -> Reg, inputs: &[&str], go: &dyn Fn(&mut Session, Effects)) {
+    let ledger = |s: &Session| serde_json::to_value(s.core.ledger()).unwrap();
+    let mut s = Session::new(reg().arc());
+    let mut rests = Vec::new();
+    let mut pending = Effects::new();
+    for text in inputs {
+        if s.core.at_rest() {
+            rests.push((s.log.len(), s.core.ledger().clone()));
+        }
+        if let Some(text) = text.strip_prefix('+') {
+            pending.extend(s.step(user(text)));
+        } else {
+            let mut fx = std::mem::take(&mut pending);
+            fx.extend(s.step(user(text)));
+            go(&mut s, fx);
+        }
+    }
+    go(&mut s, pending);
+    assert!(s.core.at_rest(), "{:#?}", s.log);
+    rests.push((s.log.len(), s.core.ledger().clone()));
+    let whole = s.log.clone();
+    for (at, snapshot) in &rests {
+        for cut in *at..=whole.len() {
+            let log = whole[..cut].to_vec();
+            let (mut a, fx) = Session::resume(reg().arc(), log.clone(), &Load::default());
+            let (mut b, restored) =
+                Session::restore(reg().arc(), snapshot, log, *at, &Load::default());
+            let at = format!("snapshot at {at}, cut after {cut}");
+            assert_eq!(restored, fx, "{at}");
+            assert_eq!(b.core.turn(), a.core.turn(), "{at}");
+            assert_eq!(ledger(&b), ledger(&a), "{at}");
+            go(&mut a, fx);
+            go(&mut b, restored);
+            let given = whole[..cut]
+                .iter()
+                .filter(|e| matches!(e.body, Body::Input { .. }))
+                .count();
+            for text in &inputs[given.min(inputs.len())..] {
+                let text = text.trim_start_matches('+');
+                for s in [&mut a, &mut b] {
+                    let fx = s.step(user(text));
+                    go(s, fx);
+                }
+            }
+            assert_eq!(b.log, a.log, "{at}");
+        }
+    }
+}
+
+/// A snapshot is taken only where the session rests, and keeps only its
+/// ledger: restoring one and folding the log after it is resuming the
+/// whole log, for the echo and modeled agents and the default loop, on
+/// scripted runs and generated ones.
+#[test]
+fn resume_from_a_snapshot_equals_resume_from_the_log() {
+    let echo = &|s: &mut Session, fx| drive(s, fx);
+    snapshot_everywhere(&Reg::echo, &["sleep 1", "hi", "+sleep 2", "bye"], echo);
+    snapshot_everywhere(
+        &|| Reg::modeled().retry(Duration::ZERO),
+        &["go", "+again", "/jobs", "more"],
+        echo,
+    );
+    let words = [
+        "hi",
+        "sleep 1",
+        "$ ls",
+        "refuse bash",
+        "/jobs",
+        "+hi",
+        "+sleep 2",
+    ];
+    let mut seed = 0x9e37_79b9_7f4a_7c15_u64;
+    for _ in 0..12 {
+        let inputs: Vec<&str> = (0..6)
+            .map(|_| {
+                seed ^= seed << 13;
+                seed ^= seed >> 7;
+                seed ^= seed << 17;
+                words[usize::try_from(seed % words.len() as u64).unwrap()]
+            })
+            .collect();
+        snapshot_everywhere(&Reg::echo, &inputs, echo);
+    }
+    for script in [1u64, 7, 12] {
+        let script = script.wrapping_mul(0x9e37_79b9_7f4a_7c15) | 1;
+        let reg = move || {
+            Reg::looping(|r| r.with_in(ext::Tier::Pre, &ext::StepLimit { max: 2 }))
+                .retry(Duration::ZERO)
+        };
+        let go = move |s: &mut Session, fx| drive_loop(s, fx, script);
+        snapshot_everywhere(&reg, &["a", "+b", "c"], &go);
+    }
+}
+
 /// Refuses every call of a reply but its first: a `reply` handler.
 struct OneAtATime;
 
@@ -647,38 +747,72 @@ fn a_watch_fires_once() {
     assert_eq!(fired, 1, "{:#?}", s.log);
 }
 
-/// Only what a running call reports as it goes waits for the next commit
-/// to be durable; what the session decided or learned never does.
+/// The commit ending a run says how durable it must be: a barrier before
+/// anything external, whichever setting; a note alone waits for the next
+/// barrier under either; what the session learned mid-turn (a call
+/// beginning to wait) waits only under `effects`; and a turn's end is a
+/// barrier under either.
 #[test]
-fn only_notes_wait_for_the_next_commit() {
-    use kernel::Durability;
-    let later = [
-        Body::Progress {
-            call: CallId::new(2).unwrap(),
-            text: "half".into(),
-        },
-        Body::Ext {
-            ext: "shell".into(),
-            state: "cwd".into(),
-            data: Json::encode(&json!("/")).unwrap(),
-        },
+fn a_run_commits_as_the_barriers_setting_says() {
+    use kernel::{Barriers, Durability};
+    let last = |fx: &Effects| match fx.iter().rev().find(|e| matches!(e, Effect::Commit(_))) {
+        Some(Effect::Commit(d)) => *d,
+        _ => panic!("no commit in {fx:?}"),
+    };
+    let both = [
+        (Barriers::Step, Durability::Barrier),
+        (Barriers::Effects, Durability::Lazy),
     ];
-    for body in &later {
-        assert_eq!(Durability::of(body), Durability::WithNext, "{body:?}");
+    for (barriers, mid_turn) in both {
+        let mut s = Session::with_barriers(Reg::modeled().arc(), barriers);
+        // Input, then its model call sent: external, so barriers.
+        assert_eq!(last(&s.step_committing(user("hi"))), Durability::Barrier);
+        s.step_committing(prepared(2));
+        let fx = s.step_committing(model_done(2, &[("bash", json!({ "command": "ls" }))]));
+        assert!(fx.iter().any(|e| matches!(e, Effect::RunTool { .. })));
+        assert_eq!(last(&fx), Durability::Barrier);
+        let fx = s.step_committing(Event::Note {
+            call: id(4),
+            note: Note::Progress("half".into()),
+        });
+        assert_eq!(last(&fx), Durability::Lazy, "{barriers:?}");
+        let fx = s.step_committing(Event::Waits {
+            call: id(4),
+            on: WaitOn::Client { tool: "ls".into() },
+        });
+        assert_eq!(last(&fx), mid_turn, "{barriers:?}");
+        // The call's result, and the turn's end.
+        s.step_committing(Event::Answer {
+            call: id(4),
+            value: Json::null(),
+            origin: None,
+            ticket: None,
+        });
+        assert_eq!(
+            last(&s.step_committing(tool_done(4, done(json!(1))))),
+            Durability::Barrier
+        );
+        s.step_committing(prepared(9));
+        let fx = s.step_committing(model_done(9, &[]));
+        assert_eq!(*s.core.turn(), Turn::Idle);
+        assert_eq!(last(&fx), Durability::Barrier, "{barriers:?}");
     }
-    let now = [
-        input("hi"),
-        bash("ls"),
-        model_call(0),
-        tool_result(2, done(json!(1))),
-        model_result(2, done(json!(1))),
-        decision("policy", Some(2), protocol::Verdict::Answered),
-        said("hi"),
-        Body::INTERRUPT,
-        wait_child(2, 3),
-    ];
-    for body in &now {
-        assert_eq!(Durability::of(body), Durability::Now, "{body:?}");
+}
+
+/// Nothing reaches outside the session (work started, a client answered)
+/// before the entries ahead of it are a barrier, under either setting:
+/// what every step of every test here holds too ([`common::barriered`]).
+#[test]
+fn no_external_effect_before_its_barrier() {
+    for barriers in [kernel::Barriers::Step, kernel::Barriers::Effects] {
+        let mut s = Session::with_barriers(Reg::modeled().arc(), barriers);
+        let fx = s.step(user("hi"));
+        drive(&mut s, fx);
+        let fx = s.step(user("/jobs"));
+        drive(&mut s, fx);
+        let fx = s.step(interrupt());
+        drive(&mut s, fx);
+        assert_eq!(*s.core.turn(), Turn::Idle, "{:#?}", s.log);
     }
 }
 

@@ -34,8 +34,8 @@ pub use ext::{
 #[cfg(doc)]
 use protocol::ledger::Ledger;
 use protocol::{
-    Author, Body, CallId, Card, Entry, Environment, Json, Mode, Outcome, Seq, SessionId,
-    ToolChoice, WaitOn,
+    Author, CallId, Card, Entry, Environment, Json, Mode, Outcome, Seq, SessionId, ToolChoice,
+    WaitOn,
 };
 use smallvec::SmallVec;
 
@@ -44,30 +44,51 @@ mod session;
 
 pub use crate::session::{Core, RESTART_CAP};
 
-/// What a step returns, in order. The driver commits each run of
-/// [`Effect::Append`]s before the effect after it starts, and the last run
-/// at the end, so an intent is durable before the work it names (and one
-/// step's entries share an fsync). If a commit fails, the effects after it
-/// are dropped and the driver resumes from the log ([`Core::resume`]).
+/// What a step returns, in order. One [`Effect::Commit`] follows the
+/// last [`Effect::Append`], saying how soon the step's entries must be
+/// durable: a barrier whenever one of its effects is external, so an
+/// intent is durable before the work it names, and one step's entries
+/// share an fsync. The driver commits them before it carries out the
+/// rest. If the commit fails, the effects are dropped and the driver
+/// resumes from the log ([`Core::resume`]).
 pub type Effects = SmallVec<[Effect; 4]>;
 
-/// How soon an entry must be durable once appended: the one place that
-/// says. Everything the session decided or learned (input, intents,
-/// decisions, results) is durable before anything follows it. A note a
-/// running call reports (its progress, an extension's state) has nothing
-/// waiting on it: it is written at once, for clients to see, and made
-/// durable by the next commit that is, so a crash loses at most notes.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+/// How soon a step's entries must be durable: the one place that says,
+/// so the driver never reads an entry to decide.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
 pub enum Durability {
-    Now,
-    WithNext,
+    /// Written at once, for clients to see, and made durable by the next
+    /// barrier: nothing waits on it, so a crash loses at most what it
+    /// holds, which recovery treats as never logged.
+    Lazy,
+    /// Durable before anything follows it.
+    Barrier,
 }
 
-impl Durability {
-    pub const fn of(body: &Body) -> Self {
-        match body {
-            Body::Progress { .. } | Body::Ext { .. } => Self::WithNext,
-            _ => Self::Now,
+/// Where the barriers fall: a step's entries are a barrier before an
+/// external effect (a call sent or run, a child started, a client
+/// answered) whichever is chosen; what else is.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum Barriers {
+    /// Every step but one of notes alone (progress, an extension's
+    /// state): everything the session decided or learned is durable
+    /// before anything follows it.
+    #[default]
+    Step,
+    /// Only a step that ends the turn: what the session learned between
+    /// (a result a shared call settled with, a decision, a wait) rides on
+    /// the next barrier, and recovery takes an intent without its outcome
+    /// as work that may have run.
+    Effects,
+}
+
+impl Barriers {
+    /// The setting's name in a config, if `name` is one.
+    pub fn named(name: &str) -> Option<Self> {
+        match name {
+            "step" => Some(Self::Step),
+            "effects" => Some(Self::Effects),
+            _ => None,
         }
     }
 }
@@ -203,6 +224,9 @@ pub struct Ticket(pub u64);
 pub enum Effect {
     /// Commit this entry, numbered next.
     Append(Entry),
+    /// Commit the entries appended, as durably as said: once per step,
+    /// after the last of them.
+    Commit(Durability),
     /// Answer request `ticket`, once what it logged is committed.
     Reply {
         ticket: Ticket,
@@ -299,6 +323,21 @@ impl Effect {
             | Self::Sleep { call, .. } => Some(call),
             _ => None,
         }
+    }
+
+    /// Whether it reaches outside the session (work started, a client or
+    /// an owner answered, a child told, a process killed): what the entries
+    /// before it must be durable ahead of.
+    pub const fn external(&self) -> bool {
+        self.starts()
+            || matches!(
+                self,
+                Self::Reply { .. }
+                    | Self::Side { .. }
+                    | Self::Interrupt { .. }
+                    | Self::Report { .. }
+                    | Self::Kill { .. }
+            )
     }
 }
 

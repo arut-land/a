@@ -1,13 +1,15 @@
 use std::fs::{self, File, OpenOptions};
-use std::io::{self, BufRead, BufReader, Write};
+use std::io::{self, BufRead, BufReader, Seek, SeekFrom, Write};
 use std::ops::RangeInclusive;
-use std::path::PathBuf;
-use std::sync::{Arc, PoisonError, RwLock};
+use std::path::{Path, PathBuf};
+use std::sync::{Arc, PoisonError, RwLock, RwLockReadGuard};
 
-use protocol::{Decode, Entry, ReadOnly, SessionId};
+use protocol::{Decode, Entry, Json, ReadOnly, SessionId};
+use serde::{Deserialize, Serialize};
 
 use super::{
-    Encoded, Header, Kept, LeaseAuthority, Lines, Loaded, Local, Log, LogStore, Writer, span,
+    Encoded, Header, Kept, LeaseAuthority, Lines, Loaded, Local, Log, LogStore, Snapshot, Writer,
+    span,
 };
 
 /// The format of the files this build writes, which the header line names:
@@ -23,6 +25,14 @@ pub(crate) const FORMAT: u32 = 1;
 /// build understands it: a sealed line is never cut, a last line that is not
 /// is the tail a crash tore and is cut, and one before the last means the
 /// file was damaged otherwise, so it is kept as it is.
+///
+/// Derived from each log and never synced, two files in `derived/` spare
+/// the next load its length: `<id>.idx`, where each line ends, and
+/// `<id>.snap`, the newest snapshot. Either is used only as far as it
+/// agrees with the log, and a load without them reads the log whole, so
+/// the directory may be deleted at any time. Being apart, writing them
+/// leaves the logs' directory as it was, which the catalog reads the age
+/// of.
 pub struct Jsonl {
     dir: PathBuf,
     leases: Local,
@@ -31,7 +41,7 @@ pub struct Jsonl {
 impl Jsonl {
     pub fn open(dir: impl Into<PathBuf>) -> io::Result<Self> {
         let dir = dir.into();
-        fs::create_dir_all(&dir)?;
+        fs::create_dir_all(dir.join(DERIVED))?;
         Ok(Self {
             dir,
             leases: Local::default(),
@@ -43,24 +53,35 @@ impl Jsonl {
     }
 }
 
+/// Where the files derived from the logs are kept, in their directory.
+const DERIVED: &str = "derived";
+
+/// `<id>.jsonl`'s derived file of extension `ext`.
+fn beside(log: &Path, ext: &str) -> PathBuf {
+    let name = Path::new(log.file_name().unwrap_or_default()).with_extension(ext);
+    log.with_file_name(DERIVED).join(name)
+}
+
 impl LogStore for Jsonl {
     /// The file, header included, becomes durable with its first entry: a
     /// session with none has nothing to lose, and creating one costs no sync.
     fn create(&self, header: &Header) -> io::Result<Loaded> {
+        let path = self.path(header.id);
         let mut file = OpenOptions::new()
             .create_new(true)
             .read(true)
             .append(true)
-            .open(self.path(header.id))?;
+            .open(&path)?;
         let mut line = format!(r#"{{"format":{FORMAT},"#).into_bytes();
         let at = line.len();
         serde_json::to_writer(&mut line, header)?;
         line.remove(at);
         seal(&mut line, 0);
         file.write_all(&line)?;
-        let index = Index::new(file, line.len() as u64);
+        let index = Index::new(file, path, line.len() as u64);
+        index.persist(0);
         let epoch = self.leases.acquire(header.id, 0);
-        Ok(index.loaded(0, epoch, Ok(Some(self.dir.clone()))))
+        Ok(index.loaded(0, 0, epoch, Ok(Some(self.dir.clone()))))
     }
 
     /// A file whose header did not survive a crash holds no entries either,
@@ -87,30 +108,60 @@ impl LogStore for Jsonl {
     /// mid-append never acknowledged, is cut off before any line is indexed
     /// past it, so the next append starts on a fresh line and no read lands
     /// in what was cut; a file kept as it is is not touched.
-    fn load(&self, id: SessionId, each: &mut dyn FnMut(Entry)) -> io::Result<Loaded> {
-        let file = OpenOptions::new()
-            .read(true)
-            .append(true)
-            .open(self.path(id))?;
-        let mut index = Index::new(file, 0);
-        let mut floor = 0;
-        let kept = index.scan(|entry| {
+    ///
+    /// The scan starts after the snapshot if `restore` takes it, else at
+    /// the first entry; the lines before where it starts are placed by
+    /// `<id>.idx`, checked against the log where they end. What the scan
+    /// indexes that the file lacks is added to it.
+    fn load(
+        &self,
+        id: SessionId,
+        restore: &mut dyn FnMut(Snapshot) -> bool,
+        each: &mut dyn FnMut(Entry),
+    ) -> io::Result<Loaded> {
+        let path = self.path(id);
+        let file = OpenOptions::new().read(true).append(true).open(&path)?;
+        let mut index = Index::new(file, path, 0);
+        let other = index.header()?;
+        let mut floor = index.recall()?;
+        let covered = match Snap::read(&index.path) {
+            Some(snap) if index.places(&snap) => {
+                let covers = snap.covers;
+                let taken = restore(Snapshot {
+                    covers,
+                    image: snap.image,
+                });
+                taken.then_some(covers)
+            }
+            _ => None,
+        };
+        if covered.is_none() {
+            floor = 0;
+        }
+        let placed = index.resume(covered.unwrap_or(0));
+        let from = index.end();
+        let kept = index.scan(other, |entry| {
             floor = entry.epoch.0;
             each(entry);
         })?;
-        let seq = index.read().len() as u64;
+        let (seq, read) = (index.read().ends.len() as u64, index.end() - from);
         if kept.is_none() && index.end() < index.file.metadata()?.len() {
             index.file.set_len(index.end())?;
             sys::sync_data(&index.file)?;
         }
+        let agreed = placed.agreed(&index.read().ends);
+        index.persist(agreed);
         let epoch = self.leases.acquire(id, floor);
-        Ok(index.loaded(seq, epoch, kept.map_or(Ok(None), Err)))
+        Ok(index.loaded(seq, read, epoch, kept.map_or(Ok(None), Err)))
     }
 
     #[cfg(test)]
     fn entries(&self, id: SessionId) -> io::Result<Vec<Entry>> {
         let mut entries = Vec::new();
-        Index::new(File::open(self.path(id))?, 0).scan(|e| entries.push(e))?;
+        let path = self.path(id);
+        let mut index = Index::new(File::open(&path)?, path, 0);
+        let other = index.header()?;
+        index.scan(other, |e| entries.push(e))?;
         Ok(entries)
     }
 
@@ -133,28 +184,50 @@ impl LogStore for Jsonl {
 /// back with one positioned read when asked for, from the OS's page cache
 /// rather than the daemon's memory: 8 bytes an entry. Only lines read whole
 /// and terminated are indexed, and only those appended in full after them.
+/// The same 8 bytes an entry go to `<id>.idx` as they are indexed, never
+/// synced, so the next load places the lines it does not read.
 struct Index {
     file: File,
+    /// The log's path: its sidecars are named after it.
+    path: PathBuf,
     /// Where the header line ends.
     start: u64,
+    ends: RwLock<Ends>,
+}
+
+struct Ends {
     /// Where each entry's line ends, newline included: entry `seq`'s at
     /// `seq - 1`.
-    ends: RwLock<Vec<u64>>,
+    ends: Vec<u64>,
+    /// `<id>.idx`, open for appending the ends of lines appended; `None`
+    /// once a write to it failed, and the next load scans the lines it
+    /// lacks.
+    idx: Option<File>,
 }
 
 impl Index {
-    fn new(file: File, start: u64) -> Self {
+    fn new(file: File, path: PathBuf, start: u64) -> Self {
         Self {
             file,
+            path,
             start,
-            ends: RwLock::default(),
+            ends: RwLock::new(Ends {
+                ends: Vec::new(),
+                idx: None,
+            }),
         }
     }
 
     /// The lines indexed and an appender continuing them, whose entries up
     /// to `seq` are committed: one that refuses to, for a file kept as it
     /// is.
-    fn loaded(self, seq: u64, epoch: u32, kept: Result<Option<PathBuf>, ReadOnly>) -> Loaded {
+    fn loaded(
+        self,
+        seq: u64,
+        read: u64,
+        epoch: u32,
+        kept: Result<Option<PathBuf>, ReadOnly>,
+    ) -> Loaded {
         let index = Arc::new(self);
         let log: Box<dyn Log> = match kept {
             Ok(new_in) => Box::new(JsonlLog {
@@ -167,46 +240,167 @@ impl Index {
         Loaded {
             lines: index,
             seq,
+            read,
             writer: Writer::new(log, epoch),
         }
     }
 
-    fn read(&self) -> std::sync::RwLockReadGuard<'_, Vec<u64>> {
+    fn read(&self) -> RwLockReadGuard<'_, Ends> {
         self.ends.read().unwrap_or_else(PoisonError::into_inner)
+    }
+
+    fn ends_mut(&mut self) -> &mut Ends {
+        self.ends.get_mut().unwrap_or_else(PoisonError::into_inner)
     }
 
     /// Where the last line indexed ends: where the next is appended.
     fn end(&self) -> u64 {
-        self.read().last().copied().unwrap_or(self.start)
+        self.read().ends.last().copied().unwrap_or(self.start)
     }
 
-    /// Indexes the lines of `lines`, appended at the end.
+    /// Indexes the lines of `lines`, appended at the end, in memory and in
+    /// `<id>.idx`.
     fn extend(&self, lines: &[u8]) {
         let at = self.end();
         let mut ends = self.ends.write().unwrap_or_else(PoisonError::into_inner);
-        ends.extend(memchr::memchr_iter(b'\n', lines).map(|i| at + i as u64 + 1));
+        let from = ends.ends.len();
+        (ends.ends).extend(memchr::memchr_iter(b'\n', lines).map(|i| at + i as u64 + 1));
+        let bytes = little_endian(&ends.ends[from..]);
+        if let Some(idx) = &mut ends.idx
+            && idx.write_all(&bytes).is_err()
+        {
+            ends.idx = None;
+        }
     }
 
-    /// Reads the file from the start, line by line, indexing and handing
-    /// `each` every entry up to the first line that is not a sealed entry
-    /// this build reads. Stopping at the last line, unsealed, is cutting a
-    /// torn tail; stopping anywhere else, or in a file of another format,
-    /// is keeping the file as it is, for the reason returned.
-    fn scan(&mut self, mut each: impl FnMut(Entry)) -> io::Result<Option<ReadOnly>> {
-        #[derive(serde::Deserialize)]
+    /// Reads the header line, the first: where the entries start, and why
+    /// the file is kept as it is if its format is another.
+    fn header(&mut self) -> io::Result<Option<ReadOnly>> {
+        #[derive(Deserialize)]
         struct Format {
             format: u32,
         }
-        let mut reader = BufReader::with_capacity(64 * 1024, &self.file);
+        let mut reader = BufReader::new(&self.file);
         let mut line = Vec::new();
         self.start = reader.read_until(b'\n', &mut line)? as u64;
         let format = unseal(&mut line)
             .then(|| serde_json::from_slice::<Format>(&line).ok())
             .flatten()
             .map_or(0, |f| f.format);
-        let other = (format != FORMAT).then_some(ReadOnly::Format { version: format });
+        Ok((format != FORMAT).then_some(ReadOnly::Format { version: format }))
+    }
+
+    /// Takes up `<id>.idx` as far as the file bears it out: its ends must
+    /// rise from after the header to no further than the file goes, and
+    /// the last line it places must be a sealed entry numbered as it says;
+    /// else none of it is used. Returns the epoch of that last line, the
+    /// floor of the lease when nothing after it is read.
+    fn recall(&mut self) -> io::Result<u32> {
+        let path = beside(&self.path, "idx");
+        let mut ends: Vec<u64> = fs::read(&path).map_or_else(
+            |_| Vec::new(),
+            |bytes| {
+                bytes
+                    .as_chunks()
+                    .0
+                    .iter()
+                    .map(|b| u64::from_le_bytes(*b))
+                    .collect()
+            },
+        );
+        let len = self.file.metadata()?.len();
+        let rising = ends.first().is_none_or(|&first| first > self.start)
+            && ends.windows(2).all(|w| w[0] < w[1])
+            && ends.last().is_none_or(|&last| last <= len);
+        let mut floor = 0;
+        let placed = rising
+            && ends.len().checked_sub(1).is_none_or(|last| {
+                self.entry(&ends, last).is_some_and(|e| {
+                    floor = e.epoch.0;
+                    e.seq.get() == ends.len() as u64
+                })
+            });
+        if !placed {
+            ends.clear();
+        }
+        self.ends_mut().ends = ends;
+        Ok(floor)
+    }
+
+    /// Entry `at + 1`, read where `ends` places its line, if it is there.
+    fn entry(&self, ends: &[u64], at: usize) -> Option<Entry> {
+        let from = at.checked_sub(1).map_or(self.start, |i| ends[i]);
+        let mut line = vec![0; usize::try_from(ends[at].checked_sub(from)?).ok()?];
+        sys::read_exact_at(&self.file, &mut line, from).ok()?;
+        unseal(&mut line).then(|| Entry::from_json(&line).ok())?
+    }
+
+    /// Whether the index places `snap`: its line ends where the snapshot
+    /// says, and holds the entry it covers.
+    fn places(&self, snap: &Snap) -> bool {
+        let ends = &self.read().ends;
+        let at = usize::try_from(snap.covers)
+            .ok()
+            .and_then(|c| c.checked_sub(1));
+        at.is_some_and(|at| {
+            ends.get(at) == Some(&snap.offset)
+                && self
+                    .entry(ends, at)
+                    .is_some_and(|e| e.seq.get() == snap.covers)
+        })
+    }
+
+    /// Keeps the lines up to entry `covers`, the snapshot's, as placed, so
+    /// the scan starts after them (at the first entry for 0), and hands
+    /// back the rest of what the index placed, for the scan to bear out.
+    fn resume(&mut self, covers: u64) -> Placed {
+        let ends = &mut self.ends_mut().ends;
+        let at = usize::try_from(covers)
+            .unwrap_or(usize::MAX)
+            .min(ends.len());
+        Placed {
+            at,
+            after: ends.split_off(at),
+        }
+    }
+
+    /// Writes to `<id>.idx` what it lacks of the lines indexed now, the
+    /// first `agreed` of which it holds already, and keeps it open to go
+    /// on appending.
+    fn persist(&self, agreed: usize) {
+        let path = beside(&self.path, "idx");
+        let mut ends = self.ends.write().unwrap_or_else(PoisonError::into_inner);
+        let rest = little_endian(&ends.ends[agreed..]);
+        let written = OpenOptions::new()
+            .create(true)
+            .write(true)
+            .truncate(false)
+            .open(&path)
+            .and_then(|mut idx| {
+                idx.set_len(agreed as u64 * 8)?;
+                idx.seek(SeekFrom::End(0))?;
+                idx.write_all(&rest)?;
+                Ok(idx)
+            });
+        ends.idx = written.ok();
+    }
+
+    /// Reads the file from where the last line indexed ends, line by line,
+    /// indexing and handing `each` every entry up to the first line that
+    /// is not a sealed entry this build reads. Stopping at the last line,
+    /// unsealed, is cutting a torn tail; stopping anywhere else, or in a
+    /// file of another format (`other`), is keeping the file as it is,
+    /// for the reason returned.
+    fn scan(
+        &mut self,
+        other: Option<ReadOnly>,
+        mut each: impl FnMut(Entry),
+    ) -> io::Result<Option<ReadOnly>> {
+        let mut end = self.end();
+        (&self.file).seek(SeekFrom::Start(end))?;
+        let mut reader = BufReader::with_capacity(64 * 1024, &self.file);
         let ends = self.ends.get_mut().unwrap_or_else(PoisonError::into_inner);
-        let mut end = self.start;
+        let mut line = Vec::new();
         loop {
             line.clear();
             let n = reader.read_until(b'\n', &mut line)?;
@@ -216,17 +410,40 @@ impl Index {
             let sealed = unseal(&mut line);
             if let Some(entry) = sealed.then(|| Entry::from_json(&line).ok()).flatten() {
                 end += n as u64;
-                ends.push(end);
+                ends.ends.push(end);
                 each(entry);
                 continue;
             }
             let torn = !sealed && reader.fill_buf()?.is_empty();
             let damaged = ReadOnly::Damaged {
-                seq: ends.len() as u64 + 1,
+                seq: ends.ends.len() as u64 + 1,
             };
             return Ok(other.or((!torn).then_some(damaged)));
         }
     }
+}
+
+/// What `<id>.idx` placed past where a load's scan starts.
+struct Placed {
+    at: usize,
+    after: Vec<u64>,
+}
+
+impl Placed {
+    /// How many of `ends`, as the scan left them, the file holds already:
+    /// the lines before the scan, and those after it that it bore out.
+    fn agreed(&self, ends: &[u64]) -> usize {
+        let scanned = ends.get(self.at..).unwrap_or_default();
+        let same = (scanned.iter().zip(&self.after))
+            .take_while(|(a, b)| a == b)
+            .count();
+        self.at + same
+    }
+}
+
+/// `ends`, 8 bytes each, as `<id>.idx` holds them.
+fn little_endian(ends: &[u64]) -> Vec<u8> {
+    ends.iter().flat_map(|end| end.to_le_bytes()).collect()
 }
 
 impl Lines for Index {
@@ -234,7 +451,7 @@ impl Lines for Index {
     /// unsealed as it is handed over.
     fn read(&self, seqs: RangeInclusive<u64>, limit: usize, out: &mut Vec<u8>) -> io::Result<u64> {
         let (from, to, count) = {
-            let ends = self.read();
+            let ends = &self.read().ends;
             let (first, last) = span(&seqs, ends.len())?;
             let from = first.checked_sub(1).map_or(self.start, |i| ends[i]);
             let unsealed = |(end, lines): (&u64, u64)| end - from - lines * SEAL as u64;
@@ -250,6 +467,33 @@ impl Lines for Index {
         sys::read_exact_at(&self.file, &mut out[at..], from)?;
         unseal_run(out, at);
         Ok(count as u64)
+    }
+}
+
+/// `<id>.snap`: a [`Snapshot`] and where in the log the line of the entry
+/// it covers ends, one sealed line.
+#[derive(Serialize, Deserialize)]
+struct Snap {
+    covers: u64,
+    offset: u64,
+    image: Json,
+}
+
+impl Snap {
+    /// The snapshot beside `log`, if there is one and it is whole.
+    fn read(log: &Path) -> Option<Self> {
+        let mut line = fs::read(beside(log, "snap")).ok()?;
+        unseal(&mut line).then(|| serde_json::from_slice(&line).ok())?
+    }
+
+    /// Written beside `log` whole or not at all: into a file of its own,
+    /// renamed into place.
+    fn write(&self, log: &Path) -> io::Result<()> {
+        let mut line = serde_json::to_vec(self)?;
+        seal(&mut line, 0);
+        let fresh = beside(log, "snap.new");
+        fs::write(&fresh, line)?;
+        fs::rename(fresh, beside(log, "snap"))
     }
 }
 
@@ -283,6 +527,27 @@ impl Log for JsonlLog {
             sys::fs::sync_dir(&dir)?;
         }
         Ok(())
+    }
+
+    /// Placed where the line of the entry it covers ends, which must be
+    /// indexed: one it does not is not committed.
+    fn snapshot(&mut self, snapshot: &Snapshot) -> io::Result<()> {
+        let offset = {
+            let ends = &self.index.read().ends;
+            let at = usize::try_from(snapshot.covers)
+                .ok()
+                .and_then(|c| c.checked_sub(1));
+            at.and_then(|at| ends.get(at)).copied().ok_or_else(|| {
+                let why = format!("entry {} is not committed", snapshot.covers);
+                io::Error::new(io::ErrorKind::InvalidInput, why)
+            })?
+        };
+        let snap = Snap {
+            covers: snapshot.covers,
+            offset,
+            image: snapshot.image.clone(),
+        };
+        snap.write(&self.index.path)
     }
 }
 

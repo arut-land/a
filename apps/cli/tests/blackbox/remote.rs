@@ -89,10 +89,15 @@ fn ok(output: &Output) -> String {
     String::from_utf8(output.stdout.clone()).unwrap()
 }
 
-/// The first session log in `home`, as text.
-fn first_log(home: &Home) -> String {
-    let dir = home.sessions_dir();
-    let log = fs::read_dir(&dir).unwrap().next().unwrap().unwrap().path();
+/// The one session log in `home`, beside what is derived from it, as
+/// text.
+fn only_log(home: &Home) -> String {
+    let mut logs = fs::read_dir(home.sessions_dir())
+        .unwrap()
+        .map(|item| item.unwrap().path())
+        .filter(|path| path.extension().is_some_and(|e| e == "jsonl"));
+    let log = logs.next().unwrap();
+    assert!(logs.next().is_none());
     fs::read_to_string(log).unwrap()
 }
 
@@ -141,7 +146,7 @@ fn a_remote_session_runs_in_the_hosts_directory_and_environment() {
         .output()
         .unwrap());
 
-    let text = first_log(&host);
+    let text = only_log(&host);
     assert!(text.contains(session.trim()), "{text}");
     let (workspace, shell) = workspace_and_env(&text);
     let remote = host.root().parent().unwrap();
@@ -160,7 +165,7 @@ fn a_remote_session_started_in_a_subdirectory_works_in_its_git_root() {
     let (mut new, host) = fake_remote(&mut env, "");
     ok(&new.arg("new").output().unwrap());
 
-    let (workspace, shell) = workspace_and_env(&first_log(&host));
+    let (workspace, shell) = workspace_and_env(&only_log(&host));
     assert_eq!(workspace, env.root.to_str().unwrap());
     assert_eq!(shell.cwd, host.root().parent().unwrap());
 }

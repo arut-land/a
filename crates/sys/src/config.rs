@@ -15,6 +15,7 @@
 //! drain_secs = 60               # how long an upgrade waits for work
 //! agent = "echo"                # every session's agent, over both files
 //! crash_limit = 3               # young deaths in a row before refusing
+//! durability = "step"           # fsync every step, or "effects": only before one
 //!
 //! [ext]                         # the extensions, read when the daemon starts
 //! disable = ["subagent"]        # extensions left out, by name
@@ -149,6 +150,8 @@ pub struct Daemon {
     /// fixtures).
     pub agent: Option<String>,
     pub crash_limit: Option<u64>,
+    /// `step` or `effects`: where a session's commits are made durable.
+    pub durability: Option<String>,
 }
 
 /// The rules of a `policy.toml`, as `(tool, input, effect)`: each table of
@@ -340,6 +343,7 @@ impl FromStr for Config {
                 drain_secs: whole("drain_secs")?,
                 agent: string(t, "agent", "daemon.")?,
                 crash_limit: whole("crash_limit")?,
+                durability: string(t, "durability", "daemon.")?,
             };
         }
         Ok(config)
@@ -501,11 +505,12 @@ model = "not this one"
 
     #[test]
     fn reads_the_daemon_table() {
-        let text = "[daemon]\nidle_secs = 15\nagent = \"echo\"\n";
+        let text = "[daemon]\nidle_secs = 15\nagent = \"echo\"\ndurability = \"effects\"\n";
         let daemon = text.parse::<Config>().unwrap().daemon;
         assert_eq!(daemon.idle_secs, Some(15));
         assert_eq!(daemon.hibernate_secs, None);
         assert_eq!(daemon.agent.as_deref(), Some("echo"));
+        assert_eq!(daemon.durability.as_deref(), Some("effects"));
         for (bad, why) in [
             (
                 "[daemon]\nidle_secs = -1\n",

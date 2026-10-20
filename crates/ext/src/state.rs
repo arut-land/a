@@ -1,12 +1,14 @@
 //! Durable extension state: a fold over the session's `ext` entries, so it
-//! survives a restart as the rest of the log does.
+//! survives a restart as the rest of the log does. A fold is its own
+//! image: a snapshot of the session keeps each as it stands, and a load
+//! from one folds only the entries after it.
 
 use std::any::{Any, TypeId};
 use std::borrow::Borrow;
 
 use protocol::{Body, Entry, Json};
-use serde::Serialize;
 use serde::de::DeserializeOwned;
+use serde::{Deserialize, Serialize};
 
 use crate::Name;
 
@@ -18,7 +20,7 @@ use crate::Name;
 ///
 /// ```compile_fail
 /// # use ext::{Cx, Fold};
-/// # #[derive(Default)] struct Count(u64);
+/// # #[derive(Default, serde::Serialize, serde::Deserialize)] struct Count(u64);
 /// # impl Fold for Count {
 /// #     const NAME: &'static str = "count";
 /// #     type Change = u64;
@@ -30,7 +32,7 @@ use crate::Name;
 ///     let _ = count.0;
 /// }
 /// ```
-pub trait Fold: Default + Send + 'static {
+pub trait Fold: Default + Serialize + DeserializeOwned + Send + 'static {
     const NAME: &'static str;
     /// What one change records.
     type Change: Serialize + DeserializeOwned;
@@ -45,6 +47,8 @@ pub(crate) struct Decl {
     pub ty: TypeId,
     make: fn() -> Box<dyn Any + Send>,
     fold: fn(&mut dyn Any, &Json) -> Result<(), String>,
+    image: fn(&dyn Any) -> Result<Json, String>,
+    restore: fn(&Json) -> Result<Box<dyn Any + Send>, String>,
 }
 
 impl Decl {
@@ -59,6 +63,14 @@ impl Decl {
                     state.apply(&change);
                 }
                 Ok(())
+            },
+            image: |state| {
+                let state = state.downcast_ref::<S>().ok_or("another state")?;
+                Json::encode(state).map_err(|e| e.to_string())
+            },
+            restore: |image| {
+                let state = image.parse::<S>().map_err(|e| e.to_string())?;
+                Ok(Box::new(state))
             },
         }
     }
@@ -129,6 +141,55 @@ impl States {
             self.apply(e.borrow());
         }
     }
+
+    /// Every state as it stands, by the extension that registered it and
+    /// its name: what a snapshot keeps. A state that cannot be encoded
+    /// fails the lot: a snapshot is whole or not taken.
+    pub fn image(&self) -> Result<Vec<Image>, String> {
+        self.0
+            .iter()
+            .map(|h| {
+                let image = (h.decl.image)(&*h.value)
+                    .map_err(|e| format!("extension {}: encoding {}: {e}", h.ext, h.decl.name))?;
+                Ok(Image {
+                    ext: h.ext.to_string(),
+                    state: h.decl.name.to_owned(),
+                    image,
+                })
+            })
+            .collect()
+    }
+
+    /// The states as `images` left them: each registered state from its
+    /// image, or its default with none. One with an image its state
+    /// cannot read fails the lot, the states left as they were: the
+    /// snapshot is of another build, and the log is folded instead.
+    pub fn restore(&mut self, images: &[Image]) -> Result<(), String> {
+        let restored = (self.0.iter())
+            .map(|h| {
+                let image = images
+                    .iter()
+                    .find(|i| i.ext == *h.ext && i.state == h.decl.name);
+                match image {
+                    Some(i) => (h.decl.restore)(&i.image)
+                        .map_err(|e| format!("extension {}: reading {}: {e}", h.ext, h.decl.name)),
+                    None => Ok((h.decl.make)()),
+                }
+            })
+            .collect::<Result<Vec<_>, _>>()?;
+        for (held, value) in self.0.iter_mut().zip(restored) {
+            held.value = value;
+        }
+        Ok(())
+    }
+}
+
+/// One state as a snapshot keeps it.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Image {
+    pub ext: String,
+    pub state: String,
+    pub image: Json,
 }
 
 /// Reads state `S` from the states `with` lends, or its default when no
@@ -154,7 +215,7 @@ pub(crate) fn read<S: Fold, R>(
 mod tests {
     use super::*;
 
-    #[derive(Default)]
+    #[derive(Default, Serialize, Deserialize)]
     struct Count(u64);
 
     impl Fold for Count {
@@ -164,6 +225,31 @@ mod tests {
         fn apply(&mut self, n: &u64) {
             self.0 += n;
         }
+    }
+
+    /// A state restored from its image folds on as the one imaged did;
+    /// an image a state cannot read restores nothing.
+    #[test]
+    fn a_state_restored_from_its_image_is_the_state_imaged() {
+        let mut states = States::new([(Name::from("counter"), Decl::of::<Count>())]);
+        states.fold("counter", "count", &Json::encode(&2).unwrap());
+        let image = states.image().unwrap();
+        let mut restored = States::new([(Name::from("counter"), Decl::of::<Count>())]);
+        restored.restore(&image).unwrap();
+        restored.fold("counter", "count", &Json::encode(&3).unwrap());
+        assert_eq!(restored.get::<Count>().unwrap().0, 5);
+        let bad = vec![Image {
+            ext: "counter".into(),
+            state: "count".into(),
+            image: Json::encode("two").unwrap(),
+        }];
+        assert!(
+            restored
+                .restore(&bad)
+                .unwrap_err()
+                .contains("reading count")
+        );
+        assert_eq!(restored.get::<Count>().unwrap().0, 5, "left as it was");
     }
 
     #[test]

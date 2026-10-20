@@ -207,7 +207,8 @@ fn rebuild(store: &dyn LogStore) -> io::Result<State> {
     let mut state = State::default();
     for header in store.headers()? {
         let mut ledger = Ledger::default();
-        let (entries, read_only) = match store.load(header.id, &mut |e| ledger.apply(&e)) {
+        let loaded = store.load(header.id, &mut |_| false, &mut |e| ledger.apply(&e));
+        let (entries, read_only) = match loaded {
             Ok(loaded) => (loaded.seq, loaded.writer.read_only()),
             Err(e) => {
                 eprintln!("session {}: cataloguing: {e}", header.id.short());

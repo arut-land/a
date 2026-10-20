@@ -10,16 +10,16 @@ use std::time::Duration;
 
 use std::task::Poll;
 
-use crate::store::{Encoded, Loaded, Log, LogStore, Memory};
+use crate::store::{Encoded, Loaded, Log, LogStore, Memory, Snapshot};
 use ext::{Answer, Extension, Recover, Registrar, Replay, Rewrite, Tool, point};
 use ext_policy::Policy;
 use llm::http::Http;
 use protocol::{Audience, CallId, Card, Epoch, Installed, Permission, Seq, Verdict};
-use serde::Deserialize as _;
 use serde_json::{Value, json};
 
 use super::*;
 
+mod bench;
 mod durable;
 mod interrupt;
 mod later;
@@ -75,9 +75,7 @@ fn decision(by: &str, call: Option<u64>, d: Verdict) -> Body {
 
 /// The calls asked about and not yet answered.
 fn inbox(entries: &[Entry]) -> Vec<u64> {
-    (protocol::ledger::Ledger::of(entries).inbox())
-        .map(CallId::get)
-        .collect()
+    (Ledger::of(entries).inbox()).map(CallId::get).collect()
 }
 
 /// The conversation before `before`, as `registry`'s tools present it.
@@ -284,7 +282,8 @@ impl Fixture {
                 catalog: crate::catalog::Catalog::memory(),
                 registry: ext::host::Current::new(registry),
                 models,
-
+                barriers: kernel::Barriers::default(),
+                build: "test".to_owned(),
                 spill: std::env::temp_dir().join(format!("a-spill-{}", std::process::id())),
                 loaded: Mutex::default(),
                 daemon: Weak::new(),
@@ -413,6 +412,9 @@ struct Probe {
     waiting: Arc<AtomicUsize>,
     /// Each batch, and whether it was made durable.
     written: Arc<Mutex<Vec<Written>>>,
+    /// The entries loads read, and the snapshots kept, by what they cover.
+    read: Arc<AtomicUsize>,
+    snapshots: Arc<Mutex<Vec<u64>>>,
 }
 
 /// A batch handed to a log, and whether it was made durable.
@@ -448,6 +450,11 @@ impl Log for Probed {
         lock(&self.1.written).push((Vec::new(), true));
         self.0.sync()
     }
+
+    fn snapshot(&mut self, snapshot: &Snapshot) -> io::Result<()> {
+        lock(&self.1.snapshots).push(snapshot.covers);
+        self.0.snapshot(snapshot)
+    }
 }
 
 impl LogStore for Probe {
@@ -461,8 +468,17 @@ impl LogStore for Probe {
         self.store.headers()
     }
 
-    fn load(&self, id: SessionId, each: &mut dyn FnMut(Entry)) -> io::Result<Loaded> {
-        let mut loaded = self.store.load(id, each)?;
+    fn load(
+        &self,
+        id: SessionId,
+        restore: &mut dyn FnMut(Snapshot) -> bool,
+        each: &mut dyn FnMut(Entry),
+    ) -> io::Result<Loaded> {
+        let read = |e| {
+            self.read.fetch_add(1, Ordering::SeqCst);
+            each(e);
+        };
+        let mut loaded = self.store.load(id, restore, &mut { read })?;
         loaded.writer.log = Box::new(Probed(loaded.writer.log, self.clone()));
         Ok(loaded)
     }
@@ -1711,7 +1727,7 @@ fn the_first_answer_wins() {
 }
 
 /// Counts, as a tool's own state.
-#[derive(Default)]
+#[derive(Default, serde::Serialize, serde::Deserialize)]
 struct Count(u64);
 
 impl ext::Fold for Count {
@@ -1948,6 +1964,56 @@ fn a_crash_loses_at_most_notes() {
         }
     }
     assert!(written.last().is_some_and(|(_, durable)| *durable));
+}
+
+/// A session at rest with enough log past its snapshot takes one, and
+/// the next load starts from it: it reads only the log after it, with the
+/// extensions' states as they were, and goes on from there.
+#[test]
+fn a_session_loads_from_its_snapshot_and_reads_only_the_suffix() {
+    let probe = Probe::default();
+    let fixture = Fixture::on(
+        Arc::new(probe.clone()),
+        ext_fixtures::ECHO,
+        echoing(&Policy::default()),
+        openai(&Script::new(&[])),
+    );
+    let header = Fixture::header();
+    let session = Live::start(&header, &fixture.0, Open::Create, Owner::None).unwrap();
+    session.submit("$ cd /").unwrap();
+    finished(&session, 3);
+    settle(&session);
+    assert!(lock(&probe.snapshots).is_empty(), "too little log for one");
+    let text = "x".repeat(usize::try_from(SNAPSHOT_EVERY).unwrap());
+    session.submit(&text).unwrap();
+    settle(&session);
+    let covers = log_of(&session).len() as u64;
+    assert_eq!(*lock(&probe.snapshots), [covers]);
+    session.submit("after").unwrap();
+    settle(&session);
+    let states = lock(&session.session.states).image().unwrap();
+    let log = log_of(&session);
+    session.halt();
+    assert_eq!(*lock(&probe.snapshots), [covers], "none for a short suffix");
+
+    probe.read.store(0, Ordering::SeqCst);
+    let loaded = Live::start(&header, &fixture.0, Open::Load, Owner::None).unwrap();
+    settle(&loaded);
+    let read = probe.read.load(Ordering::SeqCst);
+    assert_eq!(read as u64, log.len() as u64 - covers);
+    assert_eq!(lock(&loaded.session.states).image().unwrap(), states);
+    assert_eq!(log_of(&loaded), log);
+    loaded.submit("again").unwrap();
+    settle(&loaded);
+    let more = log_of(&loaded);
+    loaded.halt();
+    assert_eq!(
+        facts(&more[log.len()..]),
+        [
+            (log.len() as u64 + 1, &user("again")),
+            (log.len() as u64 + 2, &echo("again")),
+        ]
+    );
 }
 
 /// #57: the entries of one step are committed together: one write and

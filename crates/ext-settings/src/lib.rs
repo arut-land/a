@@ -11,14 +11,14 @@ use ext::{
     Table, Tool,
 };
 use protocol::Audience;
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 
 /// The `settings` extension.
 pub struct Settings;
 
 /// The model the session chose for itself, over every config layer, if it
 /// did.
-#[derive(Debug, Default)]
+#[derive(Debug, Default, Serialize, Deserialize)]
 pub struct ModelChoice(pub Option<String>);
 
 impl Fold for ModelChoice {

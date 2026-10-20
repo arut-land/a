@@ -19,6 +19,7 @@ use ext::{
     Rewrite, Side, Table, Tool,
 };
 use protocol::{Audience, CallId, Seq};
+use serde::{Deserialize, Serialize};
 
 /// What the model is asked to write.
 const SUMMARY: &str = "The conversation above no longer fits the model's context. Write a summary of it to continue from: the user's goal and every request they made (the latest word for word), what was done and found (files, commands, results, decisions), and what is left to do. Leave out nothing a continuation needs; nothing else.";
@@ -32,7 +33,7 @@ pub struct Compact {
 }
 
 /// The calls compacted, which are not compacted again.
-#[derive(Debug, Default)]
+#[derive(Debug, Default, Serialize, Deserialize)]
 pub struct Compacted(pub Vec<u64>);
 
 impl Fold for Compacted {

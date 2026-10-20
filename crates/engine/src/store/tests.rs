@@ -86,6 +86,8 @@ macro_rules! conformance {
             ids_are_unique_and_missing_ones_not_found,
             each_load_leases_a_newer_epoch,
             reading_entries_leaves_the_writer_alone,
+            load_reads_only_the_suffix,
+            a_stale_or_corrupt_snapshot_is_ignored,
         );)*
     };
 }
@@ -124,12 +126,36 @@ fn append(loaded: &mut Loaded, seqs: impl IntoIterator<Item = u64>) -> Vec<Entry
         .collect()
 }
 
-/// Loads session `id`, and the entries the load handed over.
+/// Loads session `id` from its log alone, and the entries the load handed
+/// over.
 fn load(store: &dyn LogStore, id: SessionId) -> (Loaded, Vec<Entry>) {
     let mut entries = Vec::new();
-    let loaded = store.load(id, &mut |e| entries.push(e)).unwrap();
+    let loaded = store
+        .load(id, &mut |_| false, &mut |e| entries.push(e))
+        .unwrap();
     assert_eq!(loaded.seq, entries.len() as u64);
     (loaded, entries)
+}
+
+/// Loads session `id`, taking the snapshot it is offered: the snapshot,
+/// and the entries the load handed over after it.
+fn restore(store: &dyn LogStore, id: SessionId) -> (Loaded, Option<Snapshot>, Vec<Entry>) {
+    let (mut snapshot, mut entries) = (None, Vec::new());
+    let loaded = store
+        .load(
+            id,
+            &mut |s| {
+                snapshot = Some(s);
+                true
+            },
+            &mut |e| entries.push(e),
+        )
+        .unwrap();
+    (loaded, snapshot, entries)
+}
+
+fn image(text: &str) -> Json {
+    Json::encode(&text).unwrap()
 }
 
 fn entries_of(store: &dyn LogStore, id: SessionId) -> Vec<Entry> {
@@ -262,6 +288,79 @@ fn counts_follow_appends(store: &dyn LogStore) {
     assert_eq!(store.count(h.id).unwrap(), 6);
 }
 
+/// A load starts from the newest snapshot the store can place: it reads
+/// only the entries after it, and every line before it still reads back.
+fn load_reads_only_the_suffix(store: &dyn LogStore) {
+    let h = header("/w");
+    let mut log = store.create(&h).unwrap();
+    let written = append(&mut log, 1..=5);
+    let snapshot = Snapshot {
+        covers: 3,
+        image: image("at three"),
+    };
+    let ahead = log.writer.snapshot(&Snapshot {
+        covers: 6,
+        image: image("ahead"),
+    });
+    assert_eq!(ahead.unwrap_err().kind(), ErrorKind::InvalidInput);
+    log.writer.snapshot(&snapshot).unwrap();
+    let mut written = [written, append(&mut log, 6..=8)].concat();
+    drop(log);
+
+    let (mut loaded, offered, suffix) = restore(store, h.id);
+    assert_eq!(offered.as_ref(), Some(&snapshot));
+    assert_eq!(suffix, written[3..]);
+    assert_eq!(loaded.seq, 8);
+    for e in &written {
+        assert_eq!(line(&*loaded.lines, e.seq.get()).unwrap(), encoded(e));
+    }
+    let after = loaded.read;
+    // Appends go on after it, and a load declining it reads the log whole.
+    written.extend(append(&mut loaded, 9..=9));
+    drop(loaded);
+    let (mut whole, entries) = load(store, h.id);
+    assert_eq!(entries, written);
+    assert_eq!(store.count(h.id).unwrap(), 9);
+    assert!(0 < after && after < whole.read, "{after} of {}", whole.read);
+    // One of the last entry leaves nothing to read.
+    let last = Snapshot {
+        covers: 9,
+        image: image("all"),
+    };
+    whole.writer.snapshot(&last).unwrap();
+    drop(whole);
+    let (loaded, offered, suffix) = restore(store, h.id);
+    assert_eq!((offered, suffix, loaded.read), (Some(last), Vec::new(), 0));
+}
+
+/// A snapshot the log does not bear out (one ahead of its entries, one
+/// whose bytes changed) is never offered; one declined is not used; the
+/// log is read whole instead, and a snapshot taken later stands.
+fn a_stale_or_corrupt_snapshot_is_ignored(store: &dyn LogStore) {
+    let h = header("/w");
+    let mut log = store.create(&h).unwrap();
+    let written = append(&mut log, 1..=4);
+    let snapshot = Snapshot {
+        covers: 2,
+        image: image("two"),
+    };
+    log.writer.snapshot(&snapshot).unwrap();
+    drop(log);
+    // Declined.
+    assert_eq!(load(store, h.id).1, written);
+    // Taken, then taken again once a newer one is kept.
+    assert_eq!(restore(store, h.id).2, written[2..]);
+    let (mut loaded, _, _) = restore(store, h.id);
+    let newer = Snapshot {
+        covers: 4,
+        image: image("four"),
+    };
+    loaded.writer.snapshot(&newer).unwrap();
+    drop(loaded);
+    let (_, offered, suffix) = restore(store, h.id);
+    assert_eq!((offered, suffix), (Some(newer), Vec::new()));
+}
+
 fn sessions_are_isolated(store: &dyn LogStore) {
     let (a, b) = (header("/a"), header("/b"));
     let mut log_a = store.create(&a).unwrap();
@@ -302,7 +401,11 @@ fn ids_are_unique_and_missing_ones_not_found(store: &dyn LogStore) {
     assert_eq!(again.kind(), ErrorKind::AlreadyExists);
     let missing = SessionId::new();
     assert_eq!(
-        store.load(missing, &mut drop).map(drop).unwrap_err().kind(),
+        store
+            .load(missing, &mut |_| false, &mut drop)
+            .map(drop)
+            .unwrap_err()
+            .kind(),
         ErrorKind::NotFound
     );
     assert_eq!(
@@ -452,7 +555,14 @@ fn jsonl_leases_past_the_epochs_its_files_hold() {
     append(&mut created, 1..=2);
     // As a later daemon, with no leases of its own yet.
     let later = Jsonl::open(store.dir.as_ref().unwrap()).unwrap();
-    assert!(later.load(h.id, &mut drop).unwrap().writer.epoch() > created.writer.epoch());
+    assert!(
+        later
+            .load(h.id, &mut |_| false, &mut drop)
+            .unwrap()
+            .writer
+            .epoch()
+            > created.writer.epoch()
+    );
 }
 
 /// A JSONL session of entries 1 to 4, and its file as written.
@@ -633,6 +743,89 @@ fn a_newer_log_is_never_written_by_an_older_daemon() {
         ReadOnly::Format { version: newer },
         &written,
     );
+}
+
+/// The sidecars beside a JSONL log are derived: `<id>.snap` is checked
+/// against the log and the offsets `<id>.idx` places it with, and either
+/// missing, short or changed means the log is read whole and both are
+/// written again.
+#[test]
+fn a_sidecar_the_log_does_not_bear_out_is_rebuilt_from_it() {
+    let store = jsonl();
+    let h = header("/w");
+    let mut log = store.create(&h).unwrap();
+    let written = append(&mut log, 1..=6);
+    let snapshot = Snapshot {
+        covers: 4,
+        image: image("four"),
+    };
+    log.writer.snapshot(&snapshot).unwrap();
+    drop(log);
+    let dir = store.dir.as_ref().unwrap();
+    let idx = dir.join(format!("derived/{}.idx", h.id));
+    let snap = dir.join(format!("derived/{}.snap", h.id));
+    let whole_idx = fs::read(&idx).unwrap();
+    let whole_snap = fs::read(&snap).unwrap();
+    assert_eq!(whole_idx.len(), 6 * 8);
+
+    // A snapshot ahead of the log, one whose bytes changed, or one the
+    // index is too short to place is not offered; a log read whole writes
+    // its index again.
+    let mut flipped = whole_snap.clone();
+    flipped[whole_snap.len() / 2] ^= 1;
+    let ahead = {
+        let o = header("/w");
+        let mut log = store.create(&o).unwrap();
+        append(&mut log, 1..=8);
+        log.writer
+            .snapshot(&Snapshot {
+                covers: 8,
+                image: image("eight"),
+            })
+            .unwrap();
+        fs::read(dir.join(format!("derived/{}.snap", o.id))).unwrap()
+    };
+    for (stale, short) in [(flipped, false), (ahead, false), (whole_snap.clone(), true)] {
+        fs::write(&snap, &stale).unwrap();
+        if short {
+            fs::write(&idx, &whole_idx[..3 * 8]).unwrap();
+        }
+        let (loaded, offered, suffix) = restore(&*store, h.id);
+        assert_eq!(offered, None, "short: {short}");
+        assert_eq!(suffix, written);
+        assert_eq!(fs::read(&idx).unwrap(), whole_idx);
+        for e in &written {
+            assert_eq!(line(&*loaded.lines, e.seq.get()).unwrap(), encoded(e));
+        }
+    }
+
+    // An index short of the log places what it has: the snapshot within
+    // it is taken, and the lines after it are read and indexed again.
+    fs::write(&snap, &whole_snap).unwrap();
+    fs::write(&idx, &whole_idx[..5 * 8]).unwrap();
+    let (loaded, offered, suffix) = restore(&*store, h.id);
+    assert_eq!(offered, Some(snapshot.clone()));
+    assert_eq!(suffix, written[4..]);
+    assert_eq!(fs::read(&idx).unwrap(), whole_idx);
+    assert_eq!(line(&*loaded.lines, 6).unwrap(), encoded(&written[5]));
+    drop(loaded);
+
+    // One with ends the log does not reach, or whose last line is not the
+    // entry it says, is dropped whole.
+    let mut beyond = whole_idx.clone();
+    beyond.extend(u64::MAX.to_le_bytes());
+    let mut shifted = whole_idx.clone();
+    shifted[5 * 8] -= 1;
+    for wrong in [beyond, shifted] {
+        fs::write(&idx, &wrong).unwrap();
+        let (_, offered, suffix) = restore(&*store, h.id);
+        assert_eq!(offered, None);
+        assert_eq!(suffix, written);
+        assert_eq!(fs::read(&idx).unwrap(), whole_idx);
+    }
+    fs::remove_file(&idx).unwrap();
+    assert_eq!(restore(&*store, h.id).2, written);
+    assert_eq!(restore(&*store, h.id).2, written[4..]);
 }
 
 /// Every flip of a bit of a sealed line, the seal's own included, is

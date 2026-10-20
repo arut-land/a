@@ -40,9 +40,12 @@ pub struct Fold {
 }
 
 impl Fold {
-    pub fn new(agent: Box<dyn Agent>) -> Self {
+    /// The fold of a log whose ledger is `ledger`, at rest
+    /// ([`Fold::at_rest`]): everything else here is empty between turns,
+    /// and each turn makes its own agent, so nothing else is kept.
+    pub fn restore(agent: Box<dyn Agent>, ledger: Ledger) -> Self {
         Self {
-            ledger: Ledger::default(),
+            ledger,
             agent,
             asked: VecDeque::new(),
             stepped: false,
@@ -53,12 +56,28 @@ impl Fold {
         }
     }
 
+    /// Whether the ledger is all there is: nothing asked for and not
+    /// logged, and nothing kept of a call (its rewritten input, the child
+    /// it waits on, a result fired for it, why it was refused).
+    pub fn at_rest(&self) -> bool {
+        self.asked.is_empty()
+            && self.inputs.is_empty()
+            && self.owners.is_empty()
+            && self.fired.is_empty()
+            && self.refused.is_empty()
+    }
+
     /// Folds entry `e`, the one after the last folded: the agent is given
     /// the input it records, if any.
     pub fn apply(&mut self, e: &Entry, registry: &dyn Binding) {
         let input = self.input(e, registry);
         self.ledger.apply(e);
         if let Some(input) = input {
+            // A turn's agent is made for it: nothing carries over from the
+            // last, so a session restored at rest lacks none of it.
+            if matches!(input, Input::User { .. } | Input::ChildDone { .. }) {
+                self.agent = registry.agent();
+            }
             self.stepped = true;
             let actions = self.agent.step(input, registry.loop_points());
             self.asked.extend(actions.into_iter().map(Next::Agent));

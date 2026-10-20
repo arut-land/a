@@ -6,7 +6,8 @@ use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 use protocol::{Decode, Entry, SessionId};
 
 use super::{
-    Encoded, Header, LeaseAuthority, Lines, Loaded, Local, Log, LogStore, Writer, not_found, span,
+    Encoded, Header, LeaseAuthority, Lines, Loaded, Local, Log, LogStore, Snapshot, Writer,
+    not_found, span,
 };
 
 /// Sessions held in this process, for tests: durable until it exits. Each
@@ -23,9 +24,12 @@ struct Stored {
     lines: Arc<Shared>,
 }
 
-/// One session's lines, newline excluded.
+/// One session's lines, newline excluded, and its newest snapshot.
 #[derive(Default)]
-struct Shared(Mutex<Vec<Box<[u8]>>>);
+struct Shared {
+    lines: Mutex<Vec<Box<[u8]>>>,
+    snapshot: Mutex<Option<Snapshot>>,
+}
 
 impl Memory {
     fn shared(&self, id: SessionId) -> io::Result<Arc<Shared>> {
@@ -34,11 +38,12 @@ impl Memory {
         Ok(Arc::clone(&stored.lines))
     }
 
-    fn loaded(&self, id: SessionId, lines: Arc<Shared>, floor: u32) -> Loaded {
+    fn loaded(&self, id: SessionId, lines: Arc<Shared>, floor: u32, read: u64) -> Loaded {
         let epoch = self.leases.acquire(id, floor);
-        let seq = lock(&lines.0).len() as u64;
+        let seq = lock(&lines.lines).len() as u64;
         Loaded {
             seq,
+            read,
             writer: Writer::new(Box::new(MemoryLog(Arc::clone(&lines))), epoch),
             lines,
         }
@@ -58,7 +63,7 @@ impl LogStore for Memory {
             lines: Arc::clone(&lines),
         };
         sessions.insert(header.id, stored);
-        Ok(self.loaded(header.id, lines, 0))
+        Ok(self.loaded(header.id, lines, 0, 0))
     }
 
     fn headers(&self) -> io::Result<Vec<Header>> {
@@ -70,14 +75,31 @@ impl LogStore for Memory {
         Ok(headers)
     }
 
-    fn load(&self, id: SessionId, each: &mut dyn FnMut(Entry)) -> io::Result<Loaded> {
+    fn load(
+        &self,
+        id: SessionId,
+        restore: &mut dyn FnMut(Snapshot) -> bool,
+        each: &mut dyn FnMut(Entry),
+    ) -> io::Result<Loaded> {
         let lines = self.shared(id)?;
-        let mut floor = 0;
-        for entry in lines.entries()? {
-            floor = entry.epoch.0;
+        let entries = lines.entries()?;
+        let snapshot = lock(&lines.snapshot).clone();
+        let covered = match snapshot {
+            Some(snapshot) if snapshot.covers <= entries.len() as u64 => {
+                let covers = snapshot.covers;
+                restore(snapshot).then_some(covers)
+            }
+            _ => None,
+        };
+        let floor = entries.last().map_or(0, |e| e.epoch.0);
+        let skip = usize::try_from(covered.unwrap_or(0)).unwrap_or(usize::MAX);
+        let read = (lock(&lines.lines).iter().skip(skip))
+            .map(|line| line.len() as u64 + 1)
+            .sum();
+        for entry in entries.into_iter().skip(skip) {
             each(entry);
         }
-        Ok(self.loaded(id, lines, floor))
+        Ok(self.loaded(id, lines, floor, read))
     }
 
     fn entries(&self, id: SessionId) -> io::Result<Vec<Entry>> {
@@ -86,14 +108,14 @@ impl LogStore for Memory {
 
     #[cfg(test)]
     fn count(&self, id: SessionId) -> io::Result<u64> {
-        Ok(lock(&self.shared(id)?.0).len() as u64)
+        Ok(lock(&self.shared(id)?.lines).len() as u64)
     }
 }
 
 impl Shared {
     /// The entries, decoded from a copy of the lines taken at once.
     fn entries(&self) -> io::Result<Vec<Entry>> {
-        let lines = lock(&self.0).clone();
+        let lines = lock(&self.lines).clone();
         lines
             .iter()
             .map(|line| Entry::from_json(line).map_err(io::Error::from))
@@ -103,7 +125,7 @@ impl Shared {
 
 impl Lines for Shared {
     fn read(&self, seqs: RangeInclusive<u64>, limit: usize, out: &mut Vec<u8>) -> io::Result<u64> {
-        let lines = lock(&self.0);
+        let lines = lock(&self.lines);
         let (first, last) = span(&seqs, lines.len())?;
         let mut count = 0;
         let mut room = limit;
@@ -124,7 +146,16 @@ struct MemoryLog(Arc<Shared>);
 
 impl Log for MemoryLog {
     fn append_all(&mut self, _: &[Entry], lines: &Encoded) -> io::Result<()> {
-        lock(&self.0.0).extend(lines.lines().map(Box::from));
+        lock(&self.0.lines).extend(lines.lines().map(Box::from));
+        Ok(())
+    }
+
+    fn snapshot(&mut self, snapshot: &Snapshot) -> io::Result<()> {
+        if snapshot.covers > lock(&self.0.lines).len() as u64 {
+            let why = format!("entry {} is not committed", snapshot.covers);
+            return Err(io::Error::new(io::ErrorKind::InvalidInput, why));
+        }
+        *lock(&self.0.snapshot) = Some(snapshot.clone());
         Ok(())
     }
 }

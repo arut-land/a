@@ -8,7 +8,7 @@ use std::sync::{Arc, Mutex};
 
 use protocol::{Entry, SessionId};
 
-use super::{Encoded, Header, Loaded, Log, LogStore};
+use super::{Encoded, Header, Loaded, Log, LogStore, Snapshot};
 use crate::lock;
 
 /// `inner`, whose logs keep what is only written apart from what is
@@ -65,8 +65,13 @@ impl LogStore for Faulty {
         self.inner.headers()
     }
 
-    fn load(&self, id: SessionId, each: &mut dyn FnMut(Entry)) -> io::Result<Loaded> {
-        let loaded = self.inner.load(id, each)?;
+    fn load(
+        &self,
+        id: SessionId,
+        restore: &mut dyn FnMut(Snapshot) -> bool,
+        each: &mut dyn FnMut(Entry),
+    ) -> io::Result<Loaded> {
+        let loaded = self.inner.load(id, restore, each)?;
         Ok(self.wrap(id, loaded))
     }
 
@@ -124,6 +129,12 @@ impl Log for FaultyLog {
     fn sync(&mut self) -> io::Result<()> {
         self.on()?;
         self.flush()
+    }
+
+    /// Kept at once: it covers only what is durable.
+    fn snapshot(&mut self, snapshot: &Snapshot) -> io::Result<()> {
+        self.on()?;
+        self.inner.snapshot(snapshot)
     }
 }
 
