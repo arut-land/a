@@ -25,6 +25,7 @@ use kernel::{
     Action, Actions, Agent, Answer, Barriers, Core, Durability, Effect, Effects, Event, Gated,
     Input, Load, LoopPoints, Recover, Replied,
 };
+use protocol::ledger::Ledger;
 use protocol::{
     Audience, Author, Body, CallId, ClientId, ClientSeq, Entry, Epoch, Installed, Json, Mode,
     Outcome, Permission, Seq, SessionId, ToolChoice, Verdict, WaitOn,
@@ -619,6 +620,28 @@ impl Session {
         load: &Load<'_>,
     ) -> (Self, Effects) {
         let (core, fx) = Core::resume(registry, &log, load);
+        barriered(&fx);
+        log.extend(appended(&fx));
+        (Self { core, log }, uncommitted(fx))
+    }
+
+    /// Restores the session a snapshot of `ledger` was taken of, after
+    /// the first `at` entries of `log`, where it rested; then resumes the
+    /// rest of `log`, as [`Session::resume`] resumes the whole. The ledger
+    /// goes through JSON, as a snapshot keeps it.
+    pub fn restore(
+        registry: Arc<dyn Binding>,
+        ledger: &Ledger,
+        mut log: Vec<Entry>,
+        at: usize,
+        load: &Load<'_>,
+    ) -> (Self, Effects) {
+        let image = serde_json::to_vec(ledger).unwrap();
+        let mut core = Core::restore(registry, serde_json::from_slice(&image).unwrap());
+        for e in &log[at..] {
+            core.load(e);
+        }
+        let fx = core.resumed(load);
         barriered(&fx);
         log.extend(appended(&fx));
         (Self { core, log }, uncommitted(fx))

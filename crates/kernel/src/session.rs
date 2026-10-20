@@ -227,7 +227,8 @@ impl Core {
     /// restores the session ([`Core::restore`]).
     pub fn at_rest(&self) -> bool {
         self.turn == Turn::Idle
-            && self.fold.asked.is_empty()
+            && self.failed.is_none()
+            && self.fold.at_rest()
             && self.deferred.is_empty()
             && self.fold.ledger.untaken().is_empty()
             && self.fold.ledger.open_calls().next().is_none()

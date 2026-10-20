@@ -12,7 +12,9 @@ pub type Actions = SmallVec<[Action; 2]>;
 /// performs no I/O. Its inputs are logged facts, so it is a fold over its
 /// session's log. The default is [`Loop`](crate::Loop), which asks
 /// `points` at each of its decisions; an extension registers another with
-/// [`Registrar::agent`](crate::Registrar::agent).
+/// [`Registrar::agent`](crate::Registrar::agent). Each turn is stepped by
+/// one made for it, from the input that starts it (a user's, a child's
+/// result), so nothing an agent holds outlives its turn.
 pub trait Agent: Send {
     fn step(&mut self, input: Input, points: &dyn LoopPoints) -> Actions;
 }
