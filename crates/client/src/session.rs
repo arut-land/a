@@ -239,6 +239,7 @@ const UNANSWERED: usize = 64;
 pub struct SessionClient {
     link: Link,
     view: SessionView,
+    view_current: bool,
     sessions: SessionList,
     /// The daemon's slash commands.
     commands: Vec<CommandInfo>,
@@ -263,6 +264,7 @@ impl SessionClient {
         Self {
             link: Link::Connecting,
             view: SessionView::default(),
+            view_current: false,
             sessions: SessionList::default(),
             commands: Vec::new(),
             conn: ConnId::default(),
@@ -297,6 +299,12 @@ impl SessionClient {
     }
 
     pub fn turn(&self) -> TurnView {
+        if !self.view_current {
+            return TurnView {
+                can_send: self.link.attached(),
+                ..TurnView::default()
+            };
+        }
         let ledger = &self.view.ledger;
         let running = ledger.activity() != Activity::Idle;
         let asking = ledger.inbox().next();
@@ -336,6 +344,7 @@ impl SessionClient {
         {
             self.unanswered.clear();
             self.queued.clear();
+            self.view_current = false;
         }
         self.opened = attach.clone();
         self.connect(attach, false, Link::Connecting, &mut out);
@@ -462,6 +471,7 @@ impl SessionClient {
         match msg {
             DaemonMsg::Attached { session, .. } => {
                 self.opened.target = Target::Id(*session);
+                self.view_current = true;
             }
             DaemonMsg::Sessions { .. } => {
                 self.sessions.fold(msg);
@@ -582,6 +592,7 @@ impl Offer<'_> {
 
     /// Answers the approval call `call` waits for.
     pub fn approve(self, call: CallId, approved: bool) -> Result<Vec<Effect>, Notice> {
+        self.view()?;
         if !self.0.view.ledger.inbox().any(|c| c == call) {
             return Err(Notice::NotAsking(call));
         }
@@ -599,7 +610,15 @@ impl Offer<'_> {
         Ok(vec![Effect::Io(Io::SendEnvironment)])
     }
 
+    fn view(&self) -> Result<(), Notice> {
+        self.0
+            .view_current
+            .then_some(())
+            .ok_or(Notice::NotConnected)
+    }
+
     fn running(&self) -> Result<(), Notice> {
+        self.view()?;
         if self.0.turn().running {
             Ok(())
         } else {
@@ -895,6 +914,57 @@ mod tests {
         assert_eq!(attach.since, 0);
         let out = client.step(live(2, Caps::ALL));
         assert_eq!(sends(&out).len(), 1);
+    }
+
+    #[test]
+    fn view_dependent_offers_never_cross_an_attachment_change() {
+        let (mut client, _) = attached(Env::Keep);
+        client.step(msg(1, bash_call(2)));
+        client.step(msg(1, ask(3, 2)));
+        let call = CallId::new(2).unwrap();
+        assert_eq!(client.turn().asking, Some(call));
+        let b = SessionId::new();
+        client.open(Target::Id(b));
+        for connected in [false, true] {
+            if connected {
+                client.step(live(2, Caps::ALL));
+            }
+            for cmd in [
+                Cmd::Approve {
+                    call,
+                    approved: true,
+                },
+                Cmd::Steer("stale".into()),
+                Cmd::Interrupt,
+            ] {
+                let out = client.run(cmd);
+                assert_eq!(notices(&out), vec![&Notice::NotConnected], "{out:?}");
+                assert!(sends(&out).is_empty(), "{out:?}");
+            }
+            assert!(!client.turn().running);
+            assert_eq!(client.turn().asking, None);
+            assert!(!client.turn().can_interrupt);
+        }
+        client.open(Target::Id(b));
+        assert!(client.run(Cmd::Input("for B".into())).is_empty());
+        let out = client.step(live(3, Caps::ALL));
+        assert!(matches!(sends(&out)[..], [ClientMsg::Input { text, .. }] if text == "for B"));
+        client.step(msg(
+            3,
+            DaemonMsg::Attached {
+                session: b,
+                workspace: PathBuf::from("/b"),
+            },
+        ));
+        client.step(msg(3, bash_call(2)));
+        client.step(msg(3, ask(3, 2)));
+        let out = client.run(Cmd::Approve {
+            call,
+            approved: true,
+        });
+        assert!(
+            matches!(sends(&out)[..], [ClientMsg::Approve { call: approved, .. }] if *approved == call)
+        );
     }
 
     #[test]
