@@ -239,19 +239,18 @@ impl Ids {
         if let Some(renamed) = self.renamed(id) {
             return renamed;
         }
-        let Some(mut fitted) = fit(id) else {
-            self.take(id.clone());
-            return id.clone();
-        };
-        // Two ids that fit to the same one stay distinct: refit with a
-        // suffix, and if the fit swallows it, keep the suffix raw.
+        let mut fitted = fit(id).unwrap_or_else(|| id.to_string());
+        // Prefix the counter when a target truncates away the suffix.
         let base = fitted.clone();
         let mut n = 1;
         while self.taken(&fitted) {
             n += 1;
-            fitted = fit(&format!("{id}_{n}"))
-                .filter(|refit| !self.taken(refit))
-                .unwrap_or_else(|| format!("{base}_{n}"));
+            let suffixed = format!("{base}_{n}");
+            fitted = fit(&suffixed).unwrap_or(suffixed);
+            if self.taken(&fitted) {
+                let prefixed = format!("{n}_{base}");
+                fitted = fit(&prefixed).unwrap_or(prefixed);
+            }
         }
         let fitted = SmolStr::from(fitted);
         self.take(fitted.clone());
