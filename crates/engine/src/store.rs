@@ -97,6 +97,11 @@ impl Encoded {
         let mut encoded = Self::default();
         for entry in entries {
             entry.encode(&mut encoded.bytes)?;
+            debug_assert!(
+                !encoded.bytes[encoded.ends.last().copied().unwrap_or(0)..]
+                    .iter()
+                    .any(|b| matches!(b, b'\n' | b'\r'))
+            );
             encoded.ends.push(encoded.bytes.len());
         }
         Ok(encoded)
