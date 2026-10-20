@@ -269,6 +269,27 @@ fn a_failed_sync_drops_acknowledgements_from_the_same_burst() {
     }
 }
 
+#[test]
+fn a_failed_write_drops_acknowledgements_from_the_same_burst() {
+    let mut harness = ManualSession::new();
+    harness.faulty.fail_next_write();
+    let waited = harness.note();
+    harness.session.send(Msg::Sync);
+    harness.poll();
+    let acknowledged = rt::block_on(waited);
+    harness.request("after");
+    let kept = harness.finish();
+    assert_retained(&kept, SyncFailure::Discard);
+    assert!(
+        kept.iter()
+            .any(|e| matches!(&e.body, Body::Assistant { text } if text == "after"))
+    );
+    assert!(
+        acknowledged.is_none(),
+        "a failed write cannot acknowledge the burst's lost note"
+    );
+}
+
 fn assert_retained(kept: &[Entry], failure: SyncFailure) {
     let notes: Vec<_> = kept
         .iter()

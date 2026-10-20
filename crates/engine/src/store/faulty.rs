@@ -28,6 +28,7 @@ struct State {
     /// The power is off: nothing more is written or synced.
     cut: AtomicBool,
     fail_sync: Mutex<Option<SyncFailure>>,
+    fail_write: AtomicBool,
 }
 
 #[derive(Clone, Copy)]
@@ -54,6 +55,11 @@ impl Faulty {
     /// Fails the next sync after losing or retaining its readable bytes.
     pub fn fail_next_sync(&self, failure: SyncFailure) {
         *lock(&self.state.fail_sync) = Some(failure);
+    }
+
+    /// Rejects the next deferred write before storing any of its bytes.
+    pub fn fail_next_write(&self) {
+        self.state.fail_write.store(true, Ordering::SeqCst);
     }
 
     fn wrap(&self, id: SessionId, mut loaded: Loaded) -> Loaded {
@@ -136,6 +142,9 @@ impl Log for FaultyLog {
     /// Kept aside: `inner` never sees it unless a sync follows.
     fn write_all(&mut self, entries: &[Entry], lines: &Encoded) -> io::Result<()> {
         self.on()?;
+        if self.state.fail_write.swap(false, Ordering::SeqCst) {
+            return Err(io::Error::other("deferred write failed"));
+        }
         let copy = Encoded::of(entries)?;
         (lock(&self.state.unsynced).entry(self.id).or_default()).push((entries.to_vec(), copy));
         let _ = lines;

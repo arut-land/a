@@ -622,7 +622,7 @@ impl Actor {
     }
 
     async fn run(mut self, mail: channel::Receiver<Msg>, first: Effects) {
-        self.carry(first).await;
+        let _ = self.carry(first).await;
         let mut next = None;
         while !(self.phase == Phase::Draining && self.reporting() == 0)
             && let Some(msg) = match next.take() {
@@ -666,26 +666,15 @@ impl Actor {
                     dones.extend(done);
                 }
             }
-            if !events.is_empty() {
-                // A new registry generation is taken up at the next step.
-                let newest = self.live.session.shared.registry.get();
-                let generation = (!Arc::ptr_eq(&newest, &self.registry)).then(|| {
-                    self.registry = Arc::clone(&newest);
-                    self.bound = bind(&newest, &self.live.session);
-                    Event::Registry(Arc::clone(&self.bound) as Arc<dyn Binding>)
-                });
-                self.step(generation.into_iter().chain(events)).await;
-            }
-            if sync && !self.sync().await {
-                dones.clear();
-            }
-            // Answered once what they waited for is durable.
-            if self.unsynced.is_empty() {
-                for done in dones {
-                    done.send(());
+            // Recovery does not commit the burst that failed.
+            match self.burst(events, sync).await {
+                Ok(()) if self.unsynced.is_empty() => {
+                    for done in dones {
+                        done.send(());
+                    }
                 }
-            } else {
-                self.waiting_sync.extend(dones);
+                Ok(()) => self.waiting_sync.extend(dones),
+                Err(()) => drop(dones),
             }
             // A call may begin to wait without the work marked ending.
             self.mark().await;
@@ -695,7 +684,7 @@ impl Actor {
                 self.keep_snapshot().await;
             }
         }
-        self.sync().await;
+        let _ = self.sync().await;
         if self.since_snapshot >= SNAPSHOT_EVERY {
             self.keep_snapshot().await;
         }
@@ -856,11 +845,29 @@ impl Actor {
         }
     }
 
+    /// Recovery cannot turn a failed burst into an acknowledgement.
+    async fn burst(&mut self, events: Vec<Event>, sync: bool) -> Result<(), ()> {
+        if !events.is_empty() {
+            // A new registry generation is taken up at the next step.
+            let newest = self.live.session.shared.registry.get();
+            let generation = (!Arc::ptr_eq(&newest, &self.registry)).then(|| {
+                self.registry = Arc::clone(&newest);
+                self.bound = bind(&newest, &self.live.session);
+                Event::Registry(Arc::clone(&self.bound) as Arc<dyn Binding>)
+            });
+            self.step(generation.into_iter().chain(events)).await?;
+        }
+        if sync {
+            self.sync().await?;
+        }
+        Ok(())
+    }
+
     /// Steps the kernel through `events` and carries out what follows. A
     /// step that panics is a bug the session survives: what it did is
     /// dropped, as a commit that failed drops it, what the steps before it
     /// did is carried out, and the session resumes from its log.
-    async fn step(&mut self, events: impl IntoIterator<Item = Event>) {
+    async fn step(&mut self, events: impl IntoIterator<Item = Event>) -> Result<(), ()> {
         let mut fx = Effects::new();
         for event in events {
             match catch_unwind(AssertUnwindSafe(|| self.core.step(event))) {
@@ -868,12 +875,14 @@ impl Actor {
                 Err(panic) => {
                     let why = panicked(&*panic);
                     eprintln!("session {}: the kernel {why}", self.live.id.short());
-                    self.carry(fx).await;
-                    return Box::pin(self.resume()).await;
+                    if self.carry(fx).await.is_ok() {
+                        Box::pin(self.resume()).await;
+                    }
+                    return Err(());
                 }
             }
         }
-        self.carry(fx).await;
+        self.carry(fx).await
     }
 
     /// Carries out `fx`: its appends are committed together, as durably
@@ -888,7 +897,7 @@ impl Actor {
     /// that start, as before it there is nothing of the call's to stop. A
     /// commit that fails drops the rest and resumes from what the log
     /// holds.
-    async fn carry(&mut self, fx: Effects) {
+    async fn carry(&mut self, fx: Effects) -> Result<(), ()> {
         let mut batch = Vec::new();
         let mut durability = None;
         let mut after: Vec<Effect> = Vec::new();
@@ -920,11 +929,13 @@ impl Actor {
         if let Some(durability) = durability
             && let Err(why) = self.flush(&mut batch, durability, busy).await
         {
-            return self.failed(why, after).await;
+            self.failed(why, after).await;
+            return Err(());
         }
         for effect in after {
             self.effect(effect);
         }
+        Ok(())
     }
 
     /// Commits `batch` as `durability` says, listed `busy`.
@@ -1027,7 +1038,7 @@ impl Actor {
         match resumed {
             Ok(fx) => {
                 self.resuming = true;
-                self.carry(fx).await;
+                let _ = self.carry(fx).await;
                 self.resuming = false;
             }
             // Its log is what it is: the session stops, and loads again
@@ -1174,13 +1185,13 @@ impl Actor {
 
     /// Makes what was only written durable, and shows it. A sync that
     /// fails leaves the session as a failed commit does.
-    async fn sync(&mut self) -> bool {
+    async fn sync(&mut self) -> Result<(), ()> {
         self.sync_armed = false;
         if self.unsynced.is_empty() {
-            return true;
+            return Ok(());
         }
         let Some(mut writer) = self.writer.take() else {
-            return false;
+            return Err(());
         };
         let rt = Arc::clone(&self.live.session.shared.rt);
         let (writer, synced) = rt::unblock(&*rt, move || {
@@ -1192,13 +1203,13 @@ impl Actor {
         match synced {
             Ok(()) => {
                 self.show_synced();
-                true
+                Ok(())
             }
             Err(e) => {
                 self.unsynced.clear();
                 self.waiting_sync.clear();
                 Box::pin(self.failed(format!("syncing: {e}"), Vec::new())).await;
-                false
+                Err(())
             }
         }
     }
