@@ -95,8 +95,9 @@ for target in ${usage_target:-framer json_decode view_reducer}; do
   cargo bolero test -p protocol "$target" -T "$usage_time" --corpus-dir "target/fuzz/$target/corpus"
 done
 ''' }
-# The black-box M1 acceptance tests (apps/cli/tests) on the dev build.
-acceptance = "cargo nextest run -p a --test acceptance --no-tests=fail"
+# The black-box tests (apps/cli/tests/blackbox) are one binary; a task
+# picks its module by name. The M1 acceptance tests on the dev build:
+acceptance = "cargo nextest run -p a --test blackbox -E 'test(/^acceptance::/)' --no-tests=fail"
 # `a web` on the dev build against an isolated home (target/web-home) and
 # the model-backed agent, with the keys .env.local gives its sessions
 # (`[daemon]` `agent = "echo"` in its config.toml for none); its daemon
@@ -107,22 +108,24 @@ export A_HOME=$PWD/target/web-home
 trap 'target/debug/a daemon stop >/dev/null' EXIT
 target/debug/a web
 '''
-# The black-box web UI test (apps/cli/tests/web.rs) on the dev build.
-"test:web" = "cargo nextest run -p a --test web --no-tests=fail"
+# The black-box web UI tests (apps/cli/tests/blackbox/web.rs) on the dev build.
+"test:web" = "cargo nextest run -p a --test blackbox -E 'test(/^web::/)' --no-tests=fail"
 # Cold start, attach latency and idle daemon RSS on a release build that
 # differs from the shipped one only by the test fixtures (built aside, in
 # target/fixtures; its size bounds the shipped one's). That `a` as shipped
 # lacks them is read off the dependency graph, not a second release
 # build: `mise run size` scans the shipped bytes. Latency is held to its
 # budget off CI, and on CI where the job sets A_STRICT_BUDGETS=1;
-# elsewhere shared runners get slack.
+# elsewhere shared runners get slack. The budgets are #[ignore]d: a
+# latency is a wall time, meaningful only on this build, one at a time,
+# on a machine doing nothing else, so the dev-build suite never runs them.
 budgets = '''
 if cargo tree -e normal,features -p a -f '{p} {f}' | grep 'ext-fixtures v' | grep -qw on; then
   echo "a as built by default turns the fixtures on"; exit 1
 fi
 CARGO_TARGET_DIR=target/fixtures cargo build-release -p a --features fixtures
 b=$(wc -c < target/fixtures/release/a); echo "a (fixtures): $((b / 1024)) KiB of 4096 KiB"; ((b <= 4194304))
-A_BIN=$PWD/target/fixtures/release/a A_STRICT_BUDGETS=${A_STRICT_BUDGETS:-$([[ -n ${CI:-} ]] && echo 0 || echo 1)} cargo nextest run -p a --test budgets --test-threads 1 --no-capture
+A_BIN=$PWD/target/fixtures/release/a A_STRICT_BUDGETS=${A_STRICT_BUDGETS:-$([[ -n ${CI:-} ]] && echo 0 || echo 1)} cargo nextest run -p a --test blackbox -E 'test(/^budgets::/)' --run-ignored ignored-only --test-threads 1 --no-capture --no-tests=fail
 '''
 
 # The macOS app (apps/apple). The FFI package: crates/ffi for macOS arm64
