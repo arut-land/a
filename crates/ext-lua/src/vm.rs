@@ -217,7 +217,7 @@ fn readonly(lua: &Lua, table: Table) -> mlua::Result<Table> {
     meta.set("__index", table)?;
     meta.set(
         "__newindex",
-        lua.create_function(|_, _: (Value, Value, Value)| -> mlua::Result<()> {
+        lua.create_function(|_, _: ()| -> mlua::Result<()> {
             Err(mlua::Error::runtime("read-only table"))
         })?,
     )?;
@@ -484,7 +484,10 @@ impl ext::Agent for LuaAgent {
             let output = sync(
                 &self.lua,
                 &self.run,
-                decode(&self.lua, &input).map_err(|e| e.to_string())?,
+                (
+                    decode(&self.lua, &input).map_err(|e| e.to_string())?,
+                    Value::Nil,
+                ),
                 self.limits,
             )
             .map_err(|e| e.to_string())?;
@@ -509,12 +512,7 @@ impl ext::Agent for LuaAgent {
     }
 }
 
-fn sync(
-    lua: &Lua,
-    run: &Function,
-    args: impl mlua::IntoLuaMulti,
-    limits: Limits,
-) -> mlua::Result<Json> {
+fn sync(lua: &Lua, run: &Function, args: (Value, Value), limits: Limits) -> mlua::Result<Json> {
     let budget = Budget::new(limits);
     let thread = lua.create_thread(run.clone())?;
     thread.set_hook(
@@ -546,7 +544,7 @@ impl ErasedHandler for Hook {
                 sync(
                     &self.lua,
                     &self.run,
-                    (decode(&self.lua, args)?, context),
+                    (decode(&self.lua, args)?, Value::Table(context)),
                     self.limits,
                 )
             })
@@ -738,7 +736,8 @@ impl LuaTool {
             HookTriggers::new().every_nth_instruction(1000),
             move |_, _| hook.check(),
         )?;
-        let mut work = pin!(thread.into_async::<Value>((decode(&self.lua, input)?, context))?);
+        let mut work =
+            pin!(thread.into_async::<Value>((decode(&self.lua, input)?, Value::Table(context)))?);
         let value = poll_fn(|cx| {
             budget.reset_slice();
             work.as_mut().poll(cx)

@@ -186,3 +186,8 @@ the kernel's existing safe boundary. The driver then adopts its registry and
 observers; old contexts retain their own state view. State preparation uses the
 last session snapshot plus the complete suffix, including unsynced changes,
 with contiguous sequence and end-boundary checks. Workspace indexes are weak.
+
+Size tuning, same release flags: sharing the `(Value, Value)` invocation
+adapter across agents, hooks, reducers and tool coroutines, and narrowing the
+read-only rejection callback to `()`, reduced 3,638,864 to 3,622,368 bytes
+(-16,496). Retained.
