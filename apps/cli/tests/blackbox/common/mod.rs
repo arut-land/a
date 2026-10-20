@@ -331,7 +331,7 @@ impl Env {
         conn
     }
 
-    /// An interactive `a` with piped stdio, as a terminal would run it.
+    /// The line REPL over piped stdio, as a plain terminal would run it.
     pub fn repl(&self, args: &[&str]) -> Repl {
         self.repl_from(args, |_| {})
     }
@@ -539,9 +539,11 @@ pub struct Repl {
 }
 
 impl Repl {
-    /// Runs `cmd` with piped stdio.
+    /// Runs `cmd` with piped stdio, as the line REPL: `A_TUI=plain` asks
+    /// for it where a pipe on stdin would run one turn.
     pub fn spawn(mut cmd: Command) -> Self {
         let mut child = cmd
+            .env("A_TUI", "plain")
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .spawn()

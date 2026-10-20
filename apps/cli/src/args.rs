@@ -21,6 +21,16 @@ pub struct Args {
     /// Use the daemon on HOST, reached with `ssh HOST a bridge`
     #[usage(long, global, env = "A_HOST", value_name = "HOST")]
     pub host: Option<String>,
+    /// Run one turn on PROMPT (and stdin, if piped), print the reply, exit
+    #[usage(short = 'p', long, value_name = "PROMPT")]
+    pub prompt: Option<String>,
+    /// How a piped run's calls are approved: ask, accept-edits, auto or judge
+    ///
+    /// Set as the session's mode (the policy's `/mode`) before the prompt is
+    /// sent. A run with no terminal never waits for an approval: a call that
+    /// needs one ends it with status 3, the question left open in the session.
+    #[usage(long, env = "A_MODE", value_name = "MODE")]
+    pub mode: Option<String>,
     #[usage(subcommand)]
     pub cmd: Option<Cmd>,
 }

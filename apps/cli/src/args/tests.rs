@@ -108,6 +108,12 @@ fn flags_and_arguments_reach_their_command() {
     };
     assert_eq!(parse("resume").cmd, Some(resume));
     assert_eq!(parse("").cmd, None);
+    let args = parse("-p hi --mode auto resume");
+    assert_eq!(
+        (args.prompt.as_deref(), args.mode.as_deref()),
+        (Some("hi"), Some("auto"))
+    );
+    assert!(args.cmd.is_some());
 }
 
 #[test]

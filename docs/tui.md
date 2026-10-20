@@ -4,8 +4,11 @@ At a terminal, `a`, `a resume` and `a attach` open a full-screen client on
 the alternate screen, with the mouse. `A_TUI=inline` draws the same view in a
 viewport at the bottom of the normal screen instead, printing finished
 output into the terminal's own scrollback (no mouse; the terminal keeps its
-own scrolling and selection). `A_TUI=plain`, a pipe on stdin or stdout, or
-`TERM=dumb` keep the line REPL, which the acceptance tests drive.
+own scrolling and selection). `A_TUI=plain`, a pipe on stdout, or
+`TERM=dumb` keep the line REPL, which the acceptance tests drive (with
+`A_TUI=plain`, over pipes). A pipe on stdin, or `-p`, runs one turn and
+exits instead: see [cli.md](cli.md). `NO_COLOR` draws attributes without
+colours.
 
 ## What it shows
 
