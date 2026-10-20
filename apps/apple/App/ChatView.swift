@@ -46,7 +46,7 @@ struct ChatView: View {
             }
             .padding(10)
         }
-        .navigationTitle(store.sessionId.map { String($0.suffix(8)) } ?? "New session")
+        .navigationTitle(store.title ?? store.sessionId.map { String($0.suffix(8)) } ?? "New session")
         .navigationSubtitle(store.workspace)
         .toolbar {
             LinkBadge(link: store.link)
@@ -143,7 +143,11 @@ struct ItemView: View {
             }
         case .assistant(_, let text):
             Text(text).textSelection(.enabled)
-        case .reply(let call, let model, let text, let status, let usage):
+        // A side request's reply is its extension's: a title is the
+        // window's.
+        case .reply(_, _, _, _, _, .some):
+            EmptyView()
+        case .reply(let call, let model, let text, let status, let usage, nil):
             ReplyView(
                 call: call, model: model, text: text, status: status, usage: usage,
                 streaming: live(call, status))

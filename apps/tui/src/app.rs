@@ -382,7 +382,7 @@ impl App {
             reply: view
                 .items
                 .iter()
-                .rposition(|item| matches!(item, Item::Reply { .. })),
+                .rposition(|item| matches!(item, Item::Reply { purpose: None, .. })),
         })
     }
 

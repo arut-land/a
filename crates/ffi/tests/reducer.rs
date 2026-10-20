@@ -103,3 +103,20 @@ fn a_malformed_message_is_a_protocol_error_with_a_stable_code() {
     // A newer daemon's kind is skipped, not an error.
     assert_eq!(reducer.fold(r#"{"t": "future_thing"}"#).unwrap(), None);
 }
+
+#[test]
+fn a_titling_reply_is_the_sessions_title() {
+    let reducer = Reducer::new();
+    let call = json!({ "t": "entry", "seq": 1, "epoch": 0, "kind": "model_call", "model": "m", "purpose": "title" });
+    let reply = json!({ "t": "entry", "seq": 2, "epoch": 0, "kind": "model_result", "call": 1,
+        "outcome": { "status": "done", "output": { "message": { "content": [{ "type": "text", "text": "Fix the parser" }] } } } });
+    let started = reducer.fold(&call.to_string()).unwrap().unwrap();
+    assert_eq!(started.title, None);
+    let titled = reducer.fold(&reply.to_string()).unwrap().unwrap();
+    assert_eq!(titled.title.as_deref(), Some("Fix the parser"));
+    assert!(matches!(
+        titled.change,
+        ViewChange::Updated { item: a_ffi::ViewItem::Reply { purpose: Some(ref p), .. }, .. } if p == "title"
+    ));
+    assert_eq!(reducer.snapshot().title.as_deref(), Some("Fix the parser"));
+}

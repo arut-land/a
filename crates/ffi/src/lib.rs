@@ -238,6 +238,8 @@ pub struct ViewUpdate {
     pub change: ViewChange,
     /// The turn after this update.
     pub turn: TurnInfo,
+    /// The session's title after this update, once its model named it.
+    pub title: Option<String>,
 }
 
 /// What the session's turn is doing, and what the controls offer for it;
@@ -385,13 +387,16 @@ pub enum ViewItem {
         seq: u64,
         text: String,
     },
-    /// A model call and the reply it got.
+    /// A model call and the reply it got. A side request an extension
+    /// made names its `purpose`: its reply is the extension's (a title is
+    /// the session's [`SessionSnapshot::title`]), not the conversation's.
     Reply {
         call: u64,
         model: String,
         text: String,
         status: ReplyStatus,
         usage: Option<TokenUsage>,
+        purpose: Option<String>,
     },
     Tool {
         call: u64,
@@ -606,6 +611,8 @@ pub struct SessionSnapshot {
     pub recap: Option<RecapInfo>,
     pub streaming: Option<StreamingText>,
     pub turn: TurnInfo,
+    /// The session's title, once its model named it.
+    pub title: Option<String>,
     /// [`protocol::view::SessionView::state_hash`] as 16 hex digits: equal
     /// on every client that folded the same session to the same seq.
     pub state_hash: String,
@@ -704,7 +711,7 @@ impl From<&Item> for ViewItem {
                 text,
                 status,
                 usage,
-                ..
+                purpose,
             } => Self::Reply {
                 call: *call,
                 model: model.clone(),
@@ -721,6 +728,7 @@ impl From<&Item> for ViewItem {
                     input: u.input,
                     output: u.output,
                 }),
+                purpose: purpose.clone(),
             },
             // The app shows a slash command apart from a tool.
             Item::Tool {
@@ -834,6 +842,7 @@ impl SessionSnapshot {
                 text: s.text.clone(),
             }),
             turn: client.turn().into(),
+            title: view.title.clone(),
             state_hash: format!("{:016x}", view.state_hash()),
         }
     }

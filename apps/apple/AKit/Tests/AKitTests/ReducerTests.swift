@@ -118,6 +118,26 @@ func expectInStep(_ store: SessionStore, _ reducer: Reducer, _ name: String) {
     #expect(store.turn == reducer.turn())
 }
 
+/// A side request titling the session titles the store; its reply is no
+/// reply of the conversation's.
+@Test func aTitlingReplyTitlesTheStore() throws {
+    let reducer = Reducer()
+    let store = SessionStore(source: reducer)
+    for message in [
+        #"{"t":"attached","session":"00000000-0000-0000-0000-00000000000a","workspace":"/w"}"#,
+        #"{"t":"entry","seq":1,"epoch":0,"kind":"model_call","model":"m","purpose":"title"}"#,
+        #"{"t":"entry","seq":2,"epoch":0,"kind":"model_result","call":1,"outcome":{"status":"done","output":{"message":{"content":[{"type":"text","text":"Fix the parser"}]}}}}"#,
+    ] {
+        if let update = try reducer.fold(message: message) { store.apply(update) }
+    }
+    #expect(store.title == "Fix the parser")
+    guard case .reply(_, _, _, _, _, let purpose) = store.items.first else {
+        Issue.record("a reply item")
+        return
+    }
+    #expect(purpose == "title")
+}
+
 @Test func errorsCarryStableCodes() {
     #expect(throws: ClientError.self) { try Reducer().fold(message: "{") }
     do {

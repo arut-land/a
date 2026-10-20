@@ -240,6 +240,46 @@ fn a_streamed_reply_shows_live_then_its_committed_text() {
 }
 
 #[test]
+fn a_titling_reply_titles_the_session_and_is_no_reply_of_its_own() {
+    let (mut app, _) = app(
+        Viewport::Full,
+        &[
+            entry(
+                3,
+                Body::ModelCall {
+                    model: "gpt".into(),
+                    attempt: 0,
+                    choice: protocol::ToolChoice::Auto,
+                    r#for: None,
+                    purpose: Some("title".into()),
+                },
+            ),
+            entry(
+                4,
+                Body::ModelResult {
+                    call: 3,
+                    outcome: Outcome::Done {
+                        output: Json::encode(
+                            &json!({"message": {"content": [{"type": "text", "text": "\"Fix the parser\""}]},
+                                   "usage": {"input": 1, "output": 1}}),
+                        )
+                        .unwrap(),
+                    },
+                },
+            ),
+            DaemonMsg::Synced { seq: 4 },
+        ],
+    );
+    let (_, rows) = frame(&mut app, 60, 12);
+    let (_, y) = find(&rows, "● live");
+    assert!(rows[usize::from(y)].contains("Fix the parser"), "{rows:#?}");
+    assert_eq!(
+        rows.iter().filter(|r| r.contains("Fix the parser")).count(),
+        1
+    );
+}
+
+#[test]
 fn a_card_folds_on_click_and_ctrl_o_shows_all_output() {
     let stdout = (1..=30).fold(String::new(), |s, n| s + &format!("out {n}\n"));
     let mut msgs = asked_command();

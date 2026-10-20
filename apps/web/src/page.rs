@@ -7,7 +7,7 @@ use protocol::view::{Change, Update};
 use protocol::{SessionId, Target};
 
 use crate::patch::Patch;
-use crate::view::{self, End, EndRow, ItemRow, Transcript, html};
+use crate::view::{self, End, EndRow, ItemRow, TitleSpan, Transcript, html};
 
 pub struct Page {
     pub client: SessionClient,
@@ -15,6 +15,8 @@ pub struct Page {
     error: Option<String>,
     /// The end the page shows, once it shows the transcript.
     shown: Option<End>,
+    /// The title the page shows.
+    titled: Option<String>,
     /// Text streamed since the last patch, for one reply.
     streamed: Option<(u64, String)>,
     /// Events not yet sent.
@@ -31,6 +33,7 @@ impl Page {
             client,
             error: None,
             shown: None,
+            titled: None,
             streamed: None,
             out: Vec::new(),
         };
@@ -168,6 +171,19 @@ impl Page {
         self.flush();
         if self.synced() {
             self.show_end();
+            self.show_title();
+        }
+    }
+
+    /// Shows the session's title again if it changed.
+    fn show_title(&mut self) {
+        let title = &self.client.view().title;
+        if *title != self.titled {
+            let span = html(TitleSpan {
+                title: title.as_deref(),
+            });
+            self.titled.clone_from(title);
+            self.patch(&Patch::Replace(&span));
         }
     }
 
@@ -403,6 +419,44 @@ mod tests {
             settled[1].contains("<div id=\"end\"") && !settled[1].contains("Stop"),
             "{settled:?}"
         );
+    }
+
+    #[test]
+    fn a_titling_reply_titles_the_bar_and_not_the_transcript() {
+        let mut page = synced();
+        page.fold(&[entry(
+            2,
+            Body::ModelCall {
+                model: "m".into(),
+                attempt: 0,
+                choice: protocol::ToolChoice::Auto,
+                r#for: None,
+                purpose: Some("title".into()),
+            },
+        )]);
+        page.take();
+        let reply = serde_json::json!({
+            "message": { "content": [{ "type": "text", "text": "Greeting <you>" }] },
+        });
+        page.fold(&[entry(
+            3,
+            Body::ModelResult {
+                call: 2,
+                outcome: Outcome::Done {
+                    output: Json::encode(&reply).unwrap(),
+                },
+            },
+        )]);
+        let titled = events(&mut page);
+        let title = "data: elements <span id=\"title\"";
+        let shown: Vec<_> = titled.iter().filter(|e| e.contains("Greeting")).collect();
+        assert_eq!(shown.len(), 1, "{titled:?}");
+        assert!(
+            shown[0].contains(title) && shown[0].contains("Greeting &lt;you&gt;"),
+            "{titled:?}"
+        );
+        page.fold(&[]);
+        assert_eq!(events(&mut page), NONE, "the title shows once");
     }
 
     #[test]

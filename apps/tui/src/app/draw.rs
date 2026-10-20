@@ -8,7 +8,7 @@ use protocol::view::{Item, Usage, call_title, recap_line};
 use ratatui_core::style::{Color, Style};
 
 use super::super::render::{Canvas, Viewport, ellipsize, fit};
-use super::super::text::{Action, Line, Span, width_of, wrap};
+use super::super::text::{Action, Line, Span, sanitize, width_of, wrap};
 use super::super::view::{self, ASK, MUTED, USER};
 use super::{App, HELP, Overlay};
 
@@ -179,15 +179,17 @@ impl App {
         right.push("F1 help".to_owned());
         let right = right.join("  ");
         let used: usize = left.iter().map(|s| width_of(&s.text)).sum();
-        // The workspace gets what room is left.
+        // The session's title, else its workspace, gets what room is left.
         let room = width.saturating_sub(used + width_of(&right) + 4);
-        if self.client.view().session.is_some() && room > 8 {
+        let view = self.client.view();
+        if view.session.is_some() && room > 8 {
+            let place = match &view.title {
+                Some(title) => (sanitize(title).replace('\n', " "), Style::new()),
+                None => (tilde(&view.workspace), MUTED),
+            };
             left.push(Span::new(
-                format!(
-                    "  {}",
-                    ellipsize(&tilde(&self.client.view().workspace), room)
-                ),
-                MUTED,
+                format!("  {}", ellipsize(&place.0, room)),
+                place.1,
             ));
         }
         let used: usize = left.iter().map(|s| width_of(&s.text)).sum();

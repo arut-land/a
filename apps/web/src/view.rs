@@ -88,6 +88,7 @@ pub fn chat_page(session: SessionId, tab: &str) -> String {
             header style=(style::BAR) data-signals={ "{tab: '" (tab) "', draft: ''}" } {
                 a style=(style::BRAND) href="/" { "← a" }
                 span style=(style::MONO) { (format_args!("{}", session.short())) }
+                TitleSpan title=(None);
             }
             main style=(style::SCROLLER)
                 data-init={ "@get('/s/" (format_args!("{session}")) "/events?tab=" (tab) "', {openWhenHidden: true})" } {
@@ -104,6 +105,14 @@ pub fn chat_page(session: SessionId, tab: &str) -> String {
             }
         }
     })
+}
+
+/// The session's title, once its model named it.
+#[component]
+pub fn title_span<'a>(title: Option<&'a str>) -> impl Renderable {
+    maud! {
+        span #title style=(style::DIM) { (title.unwrap_or_default()) }
+    }
 }
 
 /// The transcript's end: Stop while a turn runs, the daemon's latest
@@ -165,6 +174,9 @@ pub fn item_row<'a>(item: &'a Item, view: &'a SessionView) -> impl Renderable {
                 Item::Assistant { text, .. } => {
                     div style=(style::THEIRS) { (text) }
                 }
+                // A side request's reply is its extension's: a title shows
+                // in the bar.
+                Item::Reply { purpose: Some(_), .. } => {}
                 Item::Reply { call, text, status, usage, .. } => {
                     ReplyRow call=(*call) text=(text) status=(status) usage=(usage.as_ref())
                         live=(view.streaming.as_ref().filter(|s| s.call == *call).map(|s| s.text.as_str()));

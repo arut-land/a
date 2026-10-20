@@ -84,6 +84,7 @@ impl Feed {
             seq: self.client.view().seq,
             change,
             turn: self.client.turn().into(),
+            title: self.client.view().title.clone(),
         };
         self.producer.push(update.clone());
         self.recent_bytes += weight(&update.change);

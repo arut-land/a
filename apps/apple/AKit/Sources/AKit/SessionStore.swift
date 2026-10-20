@@ -19,6 +19,8 @@ public final class SessionStore {
         running: false, asking: nil, asks: 0, canInterrupt: false, canSteer: false, canSend: false)
     public private(set) var sessionId: String?
     public private(set) var workspace = ""
+    /// The session's title, once its model named it.
+    public private(set) var title: String?
     /// The last update applied.
     public private(set) var rev: UInt64 = 0
     public private(set) var seq: UInt64 = 0
@@ -134,12 +136,12 @@ public final class SessionStore {
     }
 
     private func adopt(_ s: SessionSnapshot) {
-        (rev, seq, sessionId, workspace) = (s.rev, s.seq, s.session, s.workspace)
+        (rev, seq, sessionId, workspace, title) = (s.rev, s.seq, s.session, s.workspace, s.title)
         (items, link, recap, streaming, turn) = (s.items, s.link, s.recap, s.streaming, s.turn)
     }
 
     private func fold(_ update: ViewUpdate) {
-        (rev, seq, turn) = (update.rev, update.seq, update.turn)
+        (rev, seq, turn, title) = (update.rev, update.seq, update.turn, update.title)
         switch update.change {
         case .attached(let session, let workspace, let reset):
             if reset {
@@ -151,7 +153,7 @@ public final class SessionStore {
         case .updated(let index, let item, let part):
             guard Int(index) < items.count else { return }
             items[Int(index)] = item
-            if part == .outcome, case .reply(let call, _, _, _, _) = item, streaming?.call == call {
+            if part == .outcome, case .reply(let call, _, _, _, _, _) = item, streaming?.call == call {
                 streaming = nil
             }
         case .delta(let call, let text):
@@ -165,7 +167,7 @@ public final class SessionStore {
         case .snapshot(let snapshot):
             items = snapshot
             if let call = streaming?.call, !items.contains(where: {
-                if case .reply(call, _, _, .running, _) = $0 { true } else { false }
+                if case .reply(call, _, _, .running, _, _) = $0 { true } else { false }
             }) {
                 streaming = nil
             }
