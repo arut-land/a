@@ -69,9 +69,9 @@ is in the docs (`docs/*.md`) and in each crate's `//!` comment.
   calls. Delete or merge tests that do not earn their keep.
 - Implicit behaviour gets an invariant-named test; whole bug classes are
   removed by architecture rather than guarded case by case.
-- Black-box tests (`apps/cli/tests`) run `a` against a daemon in an
+- Black-box tests (`apps/cli/tests/blackbox`, one binary) run `a` against a daemon in an
   isolated home on the dev build with the fixtures on (`echo` agent);
-  budgets run on a release build.
+  budgets (`#[ignore]`d, `mise run budgets`) run on a release build, alone.
 - Shared vectors: `crates/protocol/tests/vectors/view.json` is folded by
   the Rust reducer, the FFI and the Swift tests alike
   (`UPDATE_VECTORS=1 cargo test -p protocol --test view` rewrites it); the

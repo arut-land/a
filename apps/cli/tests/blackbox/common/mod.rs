@@ -2,12 +2,11 @@
 //! own link to the binary (so its daemons can be told apart from everyone
 //! else's), and a raw protocol connection to inspect what the daemon sends.
 
-#![allow(dead_code)]
-
 mod pty;
 
 use std::fs;
 use std::io::{BufRead, BufReader, Read, Write};
+use std::os::unix::fs::PermissionsExt;
 use std::os::unix::net::UnixStream;
 use std::path::{Path, PathBuf};
 use std::process::{Child, ChildStdin, ChildStdout, Command, Output, Stdio};
@@ -57,6 +56,9 @@ pub struct Env {
     pub exe: PathBuf,
     pub ws: PathBuf,
     pub home: Home,
+    /// Homes other than [`Env::home`] this test gave daemons (a simulated
+    /// host's), stopped with it.
+    homes: Vec<Home>,
     /// More environment for every `a` this test runs (never its daemons,
     /// which take theirs from [`Env::daemon`]).
     pub vars: Vec<(&'static str, &'static str)>,
@@ -66,6 +68,9 @@ impl Env {
     pub fn new(name: &str) -> Self {
         let root = std::env::temp_dir().join(format!("a-acc-{name}-{}", std::process::id()));
         let _ = fs::remove_dir_all(&root);
+        fs::create_dir_all(&root).unwrap();
+        // Canonical, as the daemon's paths are: its process is found by them.
+        let root = fs::canonicalize(root).unwrap();
         let (bin, ws) = (root.join("bin"), root.join("ws"));
         fs::create_dir_all(&bin).unwrap();
         fs::create_dir_all(&ws).unwrap();
@@ -75,14 +80,33 @@ impl Env {
         }
         let env = Self {
             home: Home::from(root.join("home")),
-            ws: fs::canonicalize(ws).unwrap(),
+            ws,
             root,
             exe,
+            homes: Vec::new(),
             vars: Vec::new(),
         };
         warm_up(&env.exe);
         env.daemon("agent = \"echo\"\nidle_secs = 15");
         env
+    }
+
+    /// Another home under this test's root, at `path`, whose daemon runs
+    /// the echo agent and is stopped with the test's own.
+    pub fn other_home(&mut self, path: PathBuf) -> Home {
+        fs::create_dir_all(&path).unwrap();
+        fs::write(path.join("config.toml"), "[daemon]\nagent = \"echo\"\n").unwrap();
+        let home = Home::from(path);
+        self.homes.push(home.clone());
+        home
+    }
+
+    /// An executable shell script `name` under this test's root.
+    pub fn script(&self, name: &str, body: &str) -> PathBuf {
+        let path = self.root.join(name);
+        fs::write(&path, format!("#!/bin/sh\n{body}")).unwrap();
+        fs::set_permissions(&path, fs::Permissions::from_mode(0o755)).unwrap();
+        path
     }
 
     /// Adds `lines` to the `[daemon]` table of this home's `config.toml`,
@@ -133,7 +157,9 @@ impl Env {
 
     fn configure(&self, mut cmd: Command) -> Command {
         cmd.current_dir(&self.ws)
-            .env("A_HOME", self.root.join("home"))
+            .env("A_HOME", self.home.root())
+            // Never the developer's host.
+            .env_remove("A_HOST")
             .envs(self.vars.iter().copied());
         cmd
     }
@@ -150,7 +176,7 @@ impl Env {
         let built = fs::metadata(built()).unwrap().modified().unwrap();
         file.set_modified(built - Duration::from_secs(3600))
             .unwrap();
-        file.set_permissions(std::os::unix::fs::PermissionsExt::from_mode(0o755))
+        file.set_permissions(fs::Permissions::from_mode(0o755))
             .unwrap();
         drop(file);
         let out = Command::new(&exe).arg("--version").output().unwrap();
@@ -196,31 +222,21 @@ impl Env {
     pub fn kill_daemon(&self) {
         let pid = self.pid().expect("no daemon to kill");
         sys::signal_process(pid, Signal::Kill).unwrap();
-        wait_for("the killed daemon to go", || self.pid().is_none());
+        self.wait_exited("the killed daemon to go");
     }
 
+    /// Waits on the daemon's lock, as a client does, until it is let go.
+    pub fn wait_exited(&self, what: &str) {
+        assert!(
+            client::wait_exited(&self.home, Some(Duration::from_secs(10))),
+            "timed out waiting for {what}"
+        );
+    }
+
+    /// A connection the daemon welcomed.
     pub fn connect(&self) -> Conn {
-        let stream = UnixStream::connect(self.home.endpoint().path()).unwrap();
-        stream
-            .set_read_timeout(Some(Duration::from_secs(30)))
-            .unwrap();
-        let mut conn = Conn {
-            reader: BufReader::new(stream.try_clone().unwrap()),
-            writer: stream,
-            view: SessionView::default(),
-        };
-        conn.send(&ClientMsg::Hello {
-            proto: PROTO,
-            // Any build the daemon's staged `current` does not outrank: it
-            // answers with a welcome, never a drain.
-            build: "acceptance".to_owned(),
-            // None: these tests speak to the daemon as the first clients
-            // did, which it must keep serving.
-            min: None,
-            caps: protocol::Caps::NONE,
-            client: None,
-        });
-        assert!(matches!(conn.recv(), DaemonMsg::Welcome { .. }));
+        let mut conn = Conn::open(&self.home);
+        assert!(matches!(conn.hello(), DaemonMsg::Welcome { .. }));
         conn
     }
 
@@ -254,6 +270,12 @@ impl Env {
 impl Drop for Env {
     fn drop(&mut self) {
         let _ = self.cmd(&["daemon", "stop"]).output();
+        for home in &self.homes {
+            let _ = self
+                .cmd(&["daemon", "stop"])
+                .env("A_HOME", home.root())
+                .output();
+        }
         for pid in self.daemons() {
             let _ = sys::signal_process(pid, Signal::Kill);
         }
@@ -274,17 +296,53 @@ pub struct Conn {
     pub view: SessionView,
 }
 
+/// The hello these tests say, as the first clients did: any build the
+/// daemon's staged `current` does not outrank (it answers with a welcome,
+/// never a drain), with no `min` and no capabilities, which the daemon
+/// must keep serving.
+pub fn hello() -> ClientMsg {
+    ClientMsg::Hello {
+        proto: PROTO,
+        build: "acceptance".to_owned(),
+        min: None,
+        caps: protocol::Caps::NONE,
+        client: None,
+    }
+}
+
 impl Conn {
+    /// A connection to `home`'s socket, before any hello.
+    pub fn open(home: &Home) -> Self {
+        let stream = UnixStream::connect(home.endpoint().path()).unwrap();
+        stream
+            .set_read_timeout(Some(Duration::from_secs(30)))
+            .unwrap();
+        Self {
+            reader: BufReader::new(stream.try_clone().unwrap()),
+            writer: stream,
+            view: SessionView::default(),
+        }
+    }
+
+    /// Says [`hello`] and returns the daemon's answer.
+    pub fn hello(&mut self) -> DaemonMsg {
+        self.send(&hello());
+        self.recv()
+    }
+
     pub fn send(&mut self, msg: &ClientMsg) {
         protocol::write_frame(&mut self.writer, msg).unwrap();
     }
 
     pub fn recv(&mut self) -> DaemonMsg {
-        let msg = protocol::read_frame(&mut self.reader)
-            .unwrap()
-            .expect("daemon closed the connection");
+        self.try_recv().expect("daemon closed the connection")
+    }
+
+    /// The next message, or none once the daemon has gone.
+    pub fn try_recv(&mut self) -> Option<DaemonMsg> {
+        let msg = protocol::read_frame(&mut self.reader).ok()??;
         self.view.fold(&msg);
-        msg
+        Some(msg)
     }
 
     pub fn input(&mut self, text: &str) {

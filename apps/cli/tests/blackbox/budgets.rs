@@ -1,21 +1,53 @@
-//! Latency and memory budgets. `mise run budgets` runs them on the release
-//! build: memory is held to its budget there, latency too except on CI
-//! lanes that leave `A_STRICT_BUDGETS` unset.
-#![cfg(unix)]
-
-mod common;
+//! Latency and memory budgets: statements about the release build on a
+//! machine doing nothing else, so `mise run budgets` is what runs them
+//! (`A_BIN`, one at a time) and the dev-build suite skips them. Memory is
+//! held to its budget there, latency too except on CI lanes that leave
+//! `A_STRICT_BUDGETS` unset. A latency is a wall time across two
+//! processes (the client's wait on the daemon is the thing measured), so
+//! nothing but a quiet machine makes its tail mean anything: under a
+//! parallel suite the p99 doubles while the median does not move.
 
 use std::process::Command;
 use std::time::{Duration, Instant};
 
-use common::{Env, latency_budget, release};
+use crate::common::{Env, latency_budget, release};
 use protocol::{Body, Target};
 
+/// This test's home, on the release build these budgets are stated for.
+fn env(name: &str) -> Env {
+    assert!(
+        release(),
+        "budgets are measured on the release build: mise run budgets"
+    );
+    Env::new(name)
+}
+
+/// The sorted times' value at percentile `p`.
+fn percentile(sorted: &[Duration], p: usize) -> Duration {
+    sorted[(sorted.len() * p / 100).min(sorted.len() - 1)]
+}
+
+/// What launching any process costs on this machine: the median of a few
+/// runs of `/usr/bin/true`, below which no cold start can go.
+fn floor() -> Duration {
+    let mut times: Vec<Duration> = (0..5)
+        .map(|_| {
+            let start = Instant::now();
+            assert!(Command::new("/usr/bin/true").status().unwrap().success());
+            start.elapsed()
+        })
+        .collect();
+    times.sort();
+    percentile(&times, 50)
+}
+
 #[test]
-fn a_cold_start_hears_from_the_daemon_within_50ms() {
+#[ignore = "mise run budgets"]
+fn a_cold_start_hears_from_the_daemon_within_50ms_over_the_floor() {
+    let floor = floor();
     let mut times: Vec<Duration> = (0..5)
         .map(|run| {
-            let env = Env::new(&format!("cold-{run}"));
+            let env = env(&format!("cold-{run}"));
             // A build is staged, and macOS scans the staged copy, once per
             // build: run its daemon once, then measure a start with none.
             assert!(env.cmd(&["ls"]).status().unwrap().success());
@@ -30,20 +62,26 @@ fn a_cold_start_hears_from_the_daemon_within_50ms() {
         })
         .collect();
     times.sort();
-    let median = times[times.len() / 2];
+    let median = percentile(&times, 50);
     let limit = latency_budget(Duration::from_millis(50));
-    eprintln!("cold start to first daemon reply: {times:?}");
+    eprintln!(
+        "cold start to first daemon reply: median {median:?}, min {:?}, max {:?}; \
+         process floor {floor:?}",
+        times[0],
+        times[times.len() - 1]
+    );
     assert!(
-        median < limit,
-        "median {median:?} over {limit:?}: {times:?}"
+        median.saturating_sub(floor) < limit,
+        "median {median:?} over {limit:?} + floor {floor:?}: {times:?}"
     );
 }
 
 /// A client attaching to a warm daemon's session with some history:
 /// connect, hello, attach and the replay up to `Synced`.
 #[test]
+#[ignore = "mise run budgets"]
 fn attaching_takes_under_2ms_at_p99() {
-    let env = Env::new("attach");
+    let env = env("attach");
     env.start();
     let mut conn = env.connect();
     let (id, _) = conn.attach(Target::New, &env.ws);
@@ -65,36 +103,25 @@ fn attaching_takes_under_2ms_at_p99() {
         })
         .collect();
     times.sort();
-    let (median, p99) = (times[times.len() / 2], times[times.len() * 99 / 100]);
+    let (p50, p95, p99) = (
+        percentile(&times, 50),
+        percentile(&times, 95),
+        percentile(&times, 99),
+    );
     let limit = latency_budget(Duration::from_millis(2));
-    eprintln!("attach with a 20-entry replay: median {median:?}, p99 {p99:?}");
+    eprintln!(
+        "attach with a {logged}-entry replay: min {:?}, p50 {p50:?}, p95 {p95:?}, p99 {p99:?}",
+        times[0]
+    );
     assert!(p99 < limit, "p99 {p99:?} over {limit:?}");
 }
 
 #[test]
-fn an_idle_daemon_stays_under_10mb() {
-    let env = Env::new("idle-rss");
-    let pid = env.start();
-    std::thread::sleep(Duration::from_secs(5));
-    let out = Command::new("ps")
-        .args(["-o", "rss=", "-p", &pid.to_string()])
-        .output()
-        .unwrap();
-    let kib: u32 = String::from_utf8(out.stdout)
-        .unwrap()
-        .trim()
-        .parse()
-        .unwrap();
-    let limit = if release() { 10 * 1024 } else { 20 * 1024 };
-    eprintln!("idle daemon RSS: {kib} KiB");
-    assert!(kib < limit, "{kib} KiB over {limit} KiB");
-}
-
-#[test]
+#[ignore = "mise run budgets"]
 fn the_terminal_client_paints_its_first_frame_within_16ms() {
     let mut times: Vec<Duration> = (0..5)
         .map(|run| {
-            let env = Env::new(&format!("tui-cold-{run}"));
+            let env = env(&format!("tui-cold-{run}"));
             assert!(env.cmd(&["ls"]).status().unwrap().success());
             assert!(env.cmd(&["daemon", "stop"]).status().unwrap().success());
             let term = env.tty(&[], 100, 30);
@@ -103,7 +130,7 @@ fn the_terminal_client_paints_its_first_frame_within_16ms() {
         })
         .collect();
     times.sort();
-    let median = times[times.len() / 2];
+    let median = percentile(&times, 50);
     let limit = latency_budget(Duration::from_millis(16));
     eprintln!("terminal client, spawn to first frame: {times:?}");
     assert!(
@@ -112,26 +139,44 @@ fn the_terminal_client_paints_its_first_frame_within_16ms() {
     );
 }
 
+/// Idle, the daemon holds under 10 MiB and its terminal client runs no
+/// code: both measured over the one quiet window.
 #[test]
-fn an_idle_terminal_client_does_not_run() {
-    let env = Env::new("tui-idle");
+#[ignore = "mise run budgets"]
+fn an_idle_daemon_and_terminal_client_cost_nothing() {
+    let env = env("idle");
     let term = env.tty(&[], 100, 30);
     term.wait_for("● live");
-    std::thread::sleep(Duration::from_millis(500));
-    let pid = term.child.id();
-    let before = cpu_time(pid);
+    let (daemon, client) = (env.pid().unwrap(), term.child.id());
+    let before = cpu_time(client);
+    // The measurement: a window in which nothing happens to either.
     std::thread::sleep(Duration::from_secs(3));
-    let used = cpu_time(pid).saturating_sub(before);
-    let out = Command::new("ps")
-        .args(["-o", "rss=", "-p", &pid.to_string()])
-        .output()
-        .unwrap();
-    let rss = String::from_utf8_lossy(&out.stdout).trim().to_owned();
-    eprintln!("idle terminal client: {used:?} of CPU in 3 s, {rss} KiB RSS");
+    let used = cpu_time(client).saturating_sub(before);
+    let (daemon_rss, client_rss) = (rss_kib(daemon), rss_kib(client));
+    eprintln!(
+        "idle: daemon {daemon_rss} KiB RSS; terminal client {used:?} of CPU in 3 s, \
+         {client_rss} KiB RSS"
+    );
+    assert!(
+        daemon_rss < 10 * 1024,
+        "daemon {daemon_rss} KiB over 10 MiB"
+    );
     assert!(
         used <= Duration::from_millis(10),
         "{used:?} of CPU while idle"
     );
+}
+
+fn rss_kib(pid: u32) -> u32 {
+    let out = Command::new("ps")
+        .args(["-o", "rss=", "-p", &pid.to_string()])
+        .output()
+        .unwrap();
+    String::from_utf8(out.stdout)
+        .unwrap()
+        .trim()
+        .parse()
+        .unwrap()
 }
 
 /// A process's user and system time so far.

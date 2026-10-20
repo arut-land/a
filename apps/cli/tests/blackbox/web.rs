@@ -2,9 +2,6 @@
 //! Datastar would: the link's token for a cookie, the gate, a chat's move
 //! to a host of its own, the pages, and a tab's event stream patching in
 //! the replies to what the tab sends.
-#![cfg(all(unix, feature = "web"))]
-
-mod common;
 
 use std::fmt::Write as _;
 use std::io::{BufRead, BufReader, Read, Write};
@@ -12,7 +9,7 @@ use std::net::TcpStream;
 use std::process::{Child, Command, Stdio};
 use std::time::{Duration, Instant};
 
-use common::{Env, wait_for};
+use crate::common::{Env, thread_names, wait_for};
 use protocol::ClientMsg;
 use protocol::view::SessionList;
 
@@ -478,6 +475,36 @@ fn a_long_transcript_sends_each_item_once() {
         let count = html.matches(&format!(">note {n}.<")).count();
         assert_eq!(count, 2, "note {n} shown {count} times");
     }
+}
+
+/// A tab's event stream is a task on `a web`'s reactor, not a thread: a
+/// session open in twenty tabs, each holding its stream, costs the
+/// process no thread more than one tab does. Not yet: the stream is on
+/// the reactor, but each tab's link is a `client::Driver` connection, and
+/// the driver reads every connection on a thread of its own (D1 in the
+/// apps audit; 9 threads with one tab, 28 with twenty).
+#[test]
+#[ignore = "a tab's link is a Driver reader thread until the client reads on the reactor"]
+fn an_idle_tab_costs_no_thread() {
+    let env = Env::new("web-threads");
+    let mut web = Web::start(&env);
+    web.sign_in();
+    let session = web.new_session();
+    let tab = |n: usize| format!("{n:032x}");
+    let mut first = web.events(&session, &tab(0));
+    first.until("the attach", |p| shown(p).contains("env "));
+    let one = thread_names(web.child.id());
+    let mut tabs: Vec<_> = (1..20).map(|n| web.events(&session, &tab(n))).collect();
+    for events in &mut tabs {
+        events.until("the attach", |p| shown(p).contains("env "));
+    }
+    let twenty = thread_names(web.child.id());
+    eprintln!(
+        "a web: {} threads with 1 tab, {} with 20",
+        one.len(),
+        twenty.len()
+    );
+    assert_eq!(twenty.len(), one.len(), "{one:?} -> {twenty:?}");
 }
 
 /// A daemon upgrade does not end a tab: it attaches to the new daemon from

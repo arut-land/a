@@ -154,6 +154,8 @@ Other rules the apps keep, by convention:
 - `crates/client/src/lib.rs`: the mismatch sentence, `stop` signalling
   only the process that recorded itself, a lock let go after the wait is
   not kept.
-- `crates/client/tests/one_rule.rs`, `no_polling.rs`: the rules above.
-- Black-box: `apps/cli/tests/{acceptance,crash,home,remote}.rs` drive `a`
-  against a daemon in an isolated `A_HOME` (`mise run acceptance`).
+- `crates/client/src/one_rule.rs` (a test module), `tests/no_polling.rs`:
+  the rules above.
+- Black-box: `apps/cli/tests/blackbox/{acceptance,crash,home,remote}.rs`
+  drive `a` against a daemon in an isolated `A_HOME` (`mise run
+  acceptance` runs the first).

@@ -48,7 +48,7 @@ jobs:
       - if: runner.os == 'Linux'
         run: sudo apt-get install -y --no-install-recommends strace
       # fmt, clippy -D warnings, then every test: unit, llm parity, and the
-      # black-box M1 acceptance and budget tests in apps/cli/tests (budgets
+      # black-box M1 acceptance tests in apps/cli/tests/blackbox (budgets run
       # with CI slack). Live-model tests stay #[ignore]d; there are no secrets.
       - run: mise run check
       # The Windows build, cross-linted: no platform cfg above `sys`/`rt`.

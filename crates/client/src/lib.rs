@@ -8,6 +8,8 @@
 mod command;
 mod drive;
 mod inbox;
+#[cfg(test)]
+mod one_rule;
 mod remote;
 mod session;
 mod watch;
@@ -583,7 +585,7 @@ pub fn stop(home: &Home) -> io::Result<bool> {
     let Some(daemon) = live_daemon(home) else {
         return Ok(false);
     };
-    if ask_to_stop(home, &daemon.build).is_ok() && exited(home, Some(HELLO_TIMEOUT)) {
+    if ask_to_stop(home, &daemon.build).is_ok() && wait_exited(home, Some(HELLO_TIMEOUT)) {
         return Ok(true);
     }
     let signal = |signal| {
@@ -596,9 +598,9 @@ pub fn stop(home: &Home) -> io::Result<bool> {
         sys::signal_process(daemon.pid, signal)
     };
     signal(Signal::Terminate)?;
-    if !exited(home, Some(HELLO_TIMEOUT)) {
+    if !wait_exited(home, Some(HELLO_TIMEOUT)) {
         signal(Signal::Kill)?;
-        exited(home, None);
+        wait_exited(home, None);
     }
     home.endpoint().remove();
     // Stopped on purpose: the record it left is not a crash.
@@ -611,8 +613,9 @@ pub fn stop(home: &Home) -> io::Result<bool> {
 }
 
 /// Whether the daemon let go of its lock, as it does when it exits, within
-/// `within` (or ever): the lock is waited on, not polled.
-fn exited(home: &Home, within: Option<Duration>) -> bool {
+/// `within` (or ever): the lock is waited on, not polled. What a test or a
+/// supervisor waits on in place of polling the pid.
+pub fn wait_exited(home: &Home, within: Option<Duration>) -> bool {
     let Ok(file) = File::open(home.daemon_pid_file()) else {
         return true;
     };
@@ -842,15 +845,20 @@ mod tests {
         let _ = fs::remove_dir_all(&root);
         fs::create_dir_all(&root).unwrap();
         let home = Home::from(root.join("home"));
-        let build = |name: &str| {
+        // Built `age` seconds after the epoch: a later build is newer.
+        let build = |name: &str, age: u64| {
             let exe = root.join(name);
             fs::write(&exe, name).unwrap();
+            File::options()
+                .write(true)
+                .open(&exe)
+                .unwrap()
+                .set_modified(std::time::UNIX_EPOCH + Duration::from_secs(1_000_000 + age))
+                .unwrap();
             home.runtime().stage(&exe).unwrap()
         };
-        let old = build("old");
-        // Built later, so newer.
-        thread::sleep(Duration::from_millis(20));
-        let new = build("new");
+        let old = build("old", 1);
+        let new = build("new", 2);
 
         let theirs = Versions::from(PROTO + 1);
         let told = Daemon::local(home.clone(), old).mismatch(theirs);

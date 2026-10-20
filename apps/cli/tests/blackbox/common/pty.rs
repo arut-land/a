@@ -4,10 +4,13 @@
 
 use std::fs::File;
 use std::io::{Read, Write};
+use std::os::unix::process::ExitStatusExt;
 use std::process::{Child, Command, ExitStatus, Stdio};
-use std::sync::{Arc, Mutex, PoisonError};
+use std::sync::mpsc;
+use std::sync::{Arc, Condvar, Mutex, MutexGuard, PoisonError};
 use std::time::{Duration, Instant};
 
+use rustix::process::{Pid, WaitOptions, waitpid};
 use rustix::pty::{OpenptFlags, grantpt, openpt, ptsname, unlockpt};
 use rustix::termios::{LocalModes, Winsize, tcgetattr, tcsetwinsize};
 use unicode_width::UnicodeWidthChar;
@@ -21,11 +24,26 @@ struct Output {
     first_frame: Option<Instant>,
 }
 
+/// What the child wrote, and a wake for every read of it.
+#[derive(Default)]
+struct Sink {
+    output: Mutex<Output>,
+    wrote: Condvar,
+}
+
+impl Sink {
+    fn lock(&self) -> MutexGuard<'_, Output> {
+        self.output.lock().unwrap_or_else(PoisonError::into_inner)
+    }
+}
+
 pub struct Pty {
     master: File,
     pub child: Child,
-    output: Arc<Mutex<Output>>,
+    sink: Arc<Sink>,
     started: Instant,
+    /// Reaped by [`Pty::wait`]: nothing is signalled or waited for again.
+    reaped: bool,
     cols: u16,
     rows: u16,
 }
@@ -68,8 +86,8 @@ impl Env {
             .unwrap();
         drop(slave);
         let master = File::from(master);
-        let output = Arc::new(Mutex::new(Output::default()));
-        let (mut reader, sink) = (master.try_clone().unwrap(), Arc::clone(&output));
+        let sink = Arc::new(Sink::default());
+        let (mut reader, written) = (master.try_clone().unwrap(), Arc::clone(&sink));
         // Nothing answers the client: it never asks the terminal anything
         // (`no_terminal_queries` in the tui crate), so one that did would
         // hang here, and the test with it.
@@ -77,18 +95,21 @@ impl Env {
             let mut buf = [0; 8192];
             // EIO once the child and every copy of the slave are gone.
             while let Ok(n @ 1..) = reader.read(&mut buf) {
-                let mut out = sink.lock().unwrap_or_else(PoisonError::into_inner);
+                let mut out = written.lock();
                 out.bytes.extend_from_slice(&buf[..n]);
                 if out.first_frame.is_none() && contains(&out.bytes, b"\x1b[?2026l") {
                     out.first_frame = Some(Instant::now());
                 }
+                drop(out);
+                written.wrote.notify_all();
             }
         });
         Pty {
             master,
             child,
-            output,
+            sink,
             started,
+            reaped: false,
             cols,
             rows,
         }
@@ -101,34 +122,36 @@ fn contains(haystack: &[u8], needle: &[u8]) -> bool {
 
 impl Pty {
     pub fn bytes(&self) -> Vec<u8> {
-        let out = self.output.lock().unwrap_or_else(PoisonError::into_inner);
-        out.bytes.clone()
-    }
-
-    pub fn screen(&self) -> Screen {
-        Screen::parse(&self.bytes(), self.cols, self.rows)
+        self.sink.lock().bytes.clone()
     }
 
     /// From spawning `a` to the end of its first frame.
     pub fn first_frame(&self) -> Option<Duration> {
-        let out = self.output.lock().unwrap_or_else(PoisonError::into_inner);
-        out.first_frame.map(|t| t - self.started)
+        self.sink.lock().first_frame.map(|t| t - self.started)
     }
 
-    /// The screen once it shows `text`.
+    /// The screen once it shows `text`: looked at again as the child
+    /// writes, never on a timer.
     pub fn wait_for(&self, text: &str) -> Screen {
         let deadline = Instant::now() + Duration::from_secs(10);
+        let mut out = self.sink.lock();
         loop {
-            let screen = self.screen();
+            let screen = Screen::parse(&out.bytes, self.cols, self.rows);
             if screen.find(text).is_some() {
                 return screen;
             }
+            let left = deadline.saturating_duration_since(Instant::now());
             assert!(
-                Instant::now() < deadline,
+                left > Duration::ZERO,
                 "timed out waiting for {text:?} on\n{}",
                 screen.text()
             );
-            std::thread::sleep(Duration::from_millis(20));
+            out = self
+                .sink
+                .wrote
+                .wait_timeout(out, left)
+                .unwrap_or_else(PoisonError::into_inner)
+                .0;
         }
     }
 
@@ -149,22 +172,31 @@ impl Pty {
             .contains(LocalModes::ECHO | LocalModes::ICANON)
     }
 
+    /// The child's exit status, waited for (on a helper thread, as a wait
+    /// has no timeout) rather than polled; a child that is still running
+    /// after 10 s fails the test.
     pub fn wait(&mut self) -> ExitStatus {
-        let deadline = Instant::now() + Duration::from_secs(10);
-        loop {
-            if let Some(status) = self.child.try_wait().unwrap() {
-                return status;
-            }
-            assert!(Instant::now() < deadline, "a did not exit");
-            std::thread::sleep(Duration::from_millis(20));
-        }
+        let pid = Pid::from_child(&self.child);
+        let (tx, rx) = mpsc::channel();
+        std::thread::spawn(move || {
+            let _ = tx.send(waitpid(Some(pid), WaitOptions::empty()));
+        });
+        let (_, status) = rx
+            .recv_timeout(Duration::from_secs(10))
+            .expect("a did not exit")
+            .unwrap()
+            .expect("the child was reaped by someone else");
+        self.reaped = true;
+        ExitStatus::from_raw(status.as_raw())
     }
 }
 
 impl Drop for Pty {
     fn drop(&mut self) {
-        let _ = self.child.kill();
-        let _ = self.child.wait();
+        if !self.reaped {
+            let _ = self.child.kill();
+            let _ = self.child.wait();
+        }
     }
 }
 

@@ -268,20 +268,20 @@ encoder) is what rustix and vte, linked already, leave to write.
   `an_idle_frame_writes_nothing`, and `no_terminal_queries` (every byte
   written is a cursor move, an erase, an SGR or a mode: nothing the
   terminal would answer). `first_frame_before_the_daemon_answers`
-  (`apps/cli/tests/tui.rs`) holds the daemon's socket with a listener that
+  (`apps/cli/tests/blackbox/tui.rs`) holds the daemon's socket with a listener that
   never answers and sees the frame; the pty harness answers no query.
 - `keys.rs` decodes byte sequences (keys with modifiers, Alt, SS3, F-keys,
   `CSI u`, UTF-8 and sequences split across reads, mouse reports, pastes);
   `screen.rs` checks the SGR it writes; `sys` checks a caught signal
   arrives on the pipe.
-- `apps/cli/tests/tui.rs` runs `a` on a pseudo-terminal against an echo
+- `apps/cli/tests/blackbox/tui.rs` runs `a` on a pseudo-terminal against an echo
   agent daemon in its own `A_HOME`, reads the screen through a small
   terminal model (`tests/common/pty.rs`), and checks a reply, an approval
   answered by a click, the command's result, detaching, an inline
   `a resume` that prints the replay into the scrollback, and a SIGTERM
   that leaves the terminal cooked.
-- `apps/cli/tests/budgets.rs` holds the first frame to 16 ms and an idle
-  client to no CPU.
+- `apps/cli/tests/blackbox/budgets.rs` (`mise run budgets`, release build)
+  holds the first frame to 16 ms and an idle client to no CPU.
 
 ## Limits
 

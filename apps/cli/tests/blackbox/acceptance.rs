@@ -1,13 +1,10 @@
 //! M1 acceptance: the engine's promises, checked against the built binary.
-#![cfg(unix)]
-
-mod common;
 
 use std::fs;
 use std::os::unix::fs::PermissionsExt;
 use std::process::Command;
 
-use common::{Env, Repl, assert_contiguous, group_alive, is_tool_call, result_of, wait_for};
+use crate::common::{Env, Repl, assert_contiguous, group_alive, is_tool_call, result_of, wait_for};
 use protocol::{
     Audience, Body, CallId, ClientMsg, Json, Mode, Outcome, Permission, Target, Verdict,
 };
@@ -549,8 +546,15 @@ fn an_older_and_a_newer_build_share_one_daemon_and_never_fight() {
     assert!(env.run(&["ls"]).starts_with(&id));
     let new_id = runtime.current().unwrap();
     assert_ne!(new_id, old_id);
+    assert_eq!(
+        fs::read(runtime.current_exe()).unwrap(),
+        fs::read(&env.exe).unwrap(),
+        "current is not the newer build"
+    );
     let second = env.pid().unwrap();
     assert_ne!(second, first);
+    let log = fs::read_to_string(env.home.daemon_log()).unwrap();
+    assert!(log.contains("drained for a newer build"), "{log}");
     term.type_line("still here");
     assert_eq!(
         term.lines_until("a    still here").last().unwrap(),

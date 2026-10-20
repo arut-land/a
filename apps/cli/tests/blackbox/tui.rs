@@ -1,13 +1,10 @@
 //! The terminal client, black box: `a` on a pseudo-terminal against an echo
 //! agent daemon in its own `A_HOME`.
-#![cfg(unix)]
-
-mod common;
 
 use std::fs;
 use std::os::unix::process::ExitStatusExt;
 
-use common::Env;
+use crate::common::Env;
 use rustix::process::{Pid, Signal, kill_process};
 
 #[test]

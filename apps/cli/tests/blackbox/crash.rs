@@ -2,16 +2,12 @@
 //! is busy. Every entry a client was shown is durable, so it survives in
 //! order, and the log never keeps a torn entry. A run prints its seed;
 //! `A_CRASH_SEED=<seed>` replays it.
-#![cfg(unix)]
 
-mod common;
-
-use std::os::unix::net::UnixStream;
 use std::thread;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
-use common::{Env, assert_contiguous, wait_for};
-use protocol::{Body, ClientMsg, DaemonMsg, Entry, PROTO, SessionId, Target, read_frame};
+use crate::common::{Conn, Env, assert_contiguous};
+use protocol::{Body, DaemonMsg, Entry, SessionId, Target};
 use sys::Signal;
 
 const ROUNDS: usize = 12;
@@ -58,39 +54,40 @@ fn every_entry_shown_survives_kill_9_at_random_points() {
 
     for round in 0..ROUNDS {
         let pid = env.start();
-        let (mut stream, id, replay) = attach(&env, session);
+        let (mut conn, id, replay) = attach(&env, session);
         session = Some(id);
         check(&shown, &replay, round, seed);
         shown = replay;
 
         for _ in 0..=rng.below(3) {
-            let text = rng.pick(INPUTS).to_string();
-            send(&mut stream, &ClientMsg::input(text));
+            conn.input(rng.pick(INPUTS));
         }
+        // The kill lands at a random point of the turn: the sleep is the
+        // choice of point, not a wait.
         let delay = Duration::from_millis(rng.below(200));
         let killer = thread::spawn(move || {
             thread::sleep(delay);
             sys::signal_process(pid, Signal::Kill).unwrap();
         });
         // Live entries until the daemon dies under us.
-        while let Ok(Some(msg)) = read_frame::<DaemonMsg>(&mut stream) {
+        while let Some(msg) = conn.try_recv() {
             if let DaemonMsg::Entry(entry) = msg {
                 shown.push(entry);
             }
         }
         killer.join().unwrap();
-        wait_for("the killed daemon to go", || env.pid().is_none());
+        env.wait_exited("the killed daemon to go");
     }
 
     env.start();
-    let (mut stream, id, replay) = attach(&env, session);
+    let (mut conn, id, replay) = attach(&env, session);
     check(&shown, &replay, ROUNDS, seed);
     // One more turn, so whatever recovery repaired is written out.
-    send(&mut stream, &ClientMsg::input("done"));
+    conn.input("done");
     let mut entries = replay;
     while !matches!(entries.last(), Some(Entry { body: Body::Assistant { text }, .. }) if text == "done")
     {
-        if let Some(DaemonMsg::Entry(entry)) = read_frame(&mut stream).unwrap() {
+        if let DaemonMsg::Entry(entry) = conn.recv() {
             entries.push(entry);
         }
     }
@@ -109,46 +106,10 @@ fn check(shown: &[Entry], replay: &[Entry], round: usize, seed: u64) {
     );
 }
 
-/// A raw connection attached to `session` (a new one if `None`), and the
-/// replay up to `Synced`.
-fn attach(env: &Env, session: Option<SessionId>) -> (UnixStream, SessionId, Vec<Entry>) {
-    let mut stream = UnixStream::connect(env.home.endpoint().path()).unwrap();
-    stream
-        .set_read_timeout(Some(Duration::from_secs(30)))
-        .unwrap();
-    send(
-        &mut stream,
-        &ClientMsg::Hello {
-            proto: PROTO,
-            build: "crash".into(),
-            min: None,
-            caps: protocol::Caps::NONE,
-            client: None,
-        },
-    );
-    send(
-        &mut stream,
-        &ClientMsg::Attach {
-            target: session.map_or(Target::New, Target::Id),
-            workspace: env.ws.clone(),
-            since: 0,
-            env: None,
-            decl: protocol::ClientDecl::default(),
-        },
-    );
-    let mut id = None;
-    let mut replay = Vec::new();
-    loop {
-        match read_frame(&mut stream).unwrap().expect("daemon closed") {
-            DaemonMsg::Attached { session, .. } => id = Some(session),
-            DaemonMsg::Entry(entry) => replay.push(entry),
-            DaemonMsg::Synced { .. } => return (stream, id.unwrap(), replay),
-            DaemonMsg::Welcome { .. } => {}
-            msg => panic!("unexpected during attach: {msg:?}"),
-        }
-    }
-}
-
-fn send(stream: &mut UnixStream, msg: &ClientMsg) {
-    protocol::write_frame(stream, msg).unwrap();
+/// A connection attached to `session` (a new one if `None`), and the replay
+/// up to `Synced`.
+fn attach(env: &Env, session: Option<SessionId>) -> (Conn, SessionId, Vec<Entry>) {
+    let mut conn = env.connect();
+    let (id, replay) = conn.attach(session.map_or(Target::New, Target::Id), &env.ws);
+    (conn, id, replay)
 }

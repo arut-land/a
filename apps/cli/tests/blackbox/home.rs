@@ -1,16 +1,12 @@
 //! The daemon owns its home: its environment, its config file, its lock
 //! and crash breaker, and the session list, whichever client started it.
-#![cfg(unix)]
-
-mod common;
 
 use std::fs;
-use std::io::{BufReader, Read};
-use std::os::unix::net::UnixStream;
+use std::io::Read;
 use std::process::Stdio;
 
-use common::Env;
-use protocol::{Body, Caps, ClientMsg, DaemonMsg, Outcome, PROTO, Target, read_frame, write_frame};
+use crate::common::{Conn, Env, wait_for};
+use protocol::{Body, DaemonMsg, Outcome, Target};
 
 /// The client that starts the daemon does not lend it its environment: a
 /// key in it never serves another client's session.
@@ -56,22 +52,11 @@ fn a_crash_loop_is_the_daemons_to_refuse() {
     // Started by hand, without a client's lock: it refuses all the same.
     let mut by_hand = env.cmd(&["__daemon"]).spawn().unwrap();
     // Not by connecting: the first connection it answers is its last.
-    common::wait_for("the socket", || env.home.endpoint().path().exists());
-    let mut conn = UnixStream::connect(env.home.endpoint().path()).unwrap();
-    write_frame(
-        &mut conn,
-        &ClientMsg::Hello {
-            proto: PROTO,
-            build: "acceptance".into(),
-            min: None,
-            caps: Caps::NONE,
-            client: None,
-        },
-    )
-    .unwrap();
-    let answer = read_frame::<DaemonMsg>(&mut BufReader::new(&conn)).unwrap();
+    wait_for("the socket", || env.home.endpoint().path().exists());
+    let mut conn = Conn::open(&env.home);
+    let answer = conn.hello();
     assert!(
-        matches!(&answer, Some(DaemonMsg::Error { message }) if message.contains("crashed 3 times")),
+        matches!(&answer, DaemonMsg::Error { message } if message.contains("crashed 3 times")),
         "{answer:?}"
     );
     drop(conn);
@@ -85,7 +70,7 @@ fn a_crash_loop_is_the_daemons_to_refuse() {
         told.contains("crashed 3 times") && told.contains("`a daemon restart`"),
         "{told}"
     );
-    common::wait_for("the refusing daemon to go", || env.daemons().is_empty());
+    wait_for("the refusing daemon to go", || env.daemons().is_empty());
 
     env.run(&["daemon", "restart"]);
     env.run(&["ls"]);
