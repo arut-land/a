@@ -86,7 +86,7 @@ impl Http for Ureq {
             abort.release();
         }));
         Box::pin(async move {
-            let head = std::future::poll_fn(|cx| rx.poll_recv(cx)).await;
+            let head = rx.recv().await;
             let parts = match head {
                 Some(Ok(Piece::Head(parts))) => parts,
                 Some(Err(error)) => return Err(error),
@@ -105,7 +105,7 @@ impl Http for Ureq {
 fn run(
     agent: &ureq::Agent,
     request: http::Request<Payload>,
-    tx: &rt::channel::Sender<io::Result<Piece>>,
+    tx: &rt::channel::BlockingSender<io::Result<Piece>>,
 ) {
     let (mut parts, body) = request.into_parts();
     // Read from its pieces as it goes out, at the length they make.
