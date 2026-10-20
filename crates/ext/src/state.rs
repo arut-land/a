@@ -5,9 +5,10 @@
 
 use std::any::{Any, TypeId};
 use std::borrow::Borrow;
+use std::collections::BTreeMap;
 use std::sync::Arc;
 
-use protocol::{Body, Entry, Json};
+use protocol::{Body, Entry, Json, Seq};
 use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
 
@@ -119,13 +120,13 @@ struct Held {
     ext: Name,
     decl: Decl,
     value: Box<dyn Any + Send>,
+    rejected: BTreeMap<Seq, String>,
 }
 
 /// One session's extension states.
 #[derive(Default)]
 pub struct States {
     held: Vec<Held>,
-    rejected: Option<String>,
 }
 
 impl States {
@@ -137,9 +138,9 @@ impl States {
                     value: (decl.make)(),
                     ext,
                     decl,
+                    rejected: BTreeMap::new(),
                 })
                 .collect(),
-            rejected: None,
         }
     }
 
@@ -167,32 +168,47 @@ impl States {
     /// (one removed since) is skipped, and so, with a warning, is one its
     /// state cannot read.
     pub fn fold(&mut self, ext: &str, state: &str, data: &Json) {
-        if let Err(e) = self.try_fold(ext, state, data) {
-            eprintln!("warning: {e}");
-            self.rejected.get_or_insert(e);
-        }
+        self.reduce(ext, state, data, None);
     }
 
-    fn try_fold(&mut self, ext: &str, state: &str, data: &Json) -> Result<(), String> {
-        let held = self.held.iter_mut();
-        for held in held.filter(|h| &*h.ext == ext && &*h.decl.name == state) {
-            (held.decl.fold)(&mut *held.value, data)
-                .map_err(|e| format!("extension {ext}: a {state} change it cannot read: {e}"))?;
+    fn reduce(&mut self, ext: &str, state: &str, data: &Json, seq: Option<Seq>) {
+        for held in self
+            .held
+            .iter_mut()
+            .filter(|h| &*h.ext == ext && &*h.decl.name == state)
+        {
+            if let Err(error) = (held.decl.fold)(&mut *held.value, data) {
+                let error = format!("extension {ext}: a {state} change it cannot read: {error}");
+                eprintln!("warning: {error}");
+                if let Some(seq) = seq {
+                    held.rejected.insert(seq, error);
+                }
+            }
         }
-        Ok(())
     }
 
     /// Folds or skips the change `e` records, exactly as live execution does.
     pub fn apply(&mut self, e: &Entry) {
         if let Body::Ext { ext, state, data } = &e.body {
-            self.fold(ext, state, data);
+            self.reduce(ext, state, data, Some(e.seq));
         }
     }
 
-    /// Candidates require every reduction since creation or restore to
-    /// succeed; live sessions keep serving after a skipped reduction.
-    pub fn validate(&self) -> Result<(), String> {
-        self.rejected.as_ref().map_or(Ok(()), |e| Err(e.clone()))
+    /// A candidate may fix or share live rejections, but cannot reject an
+    /// entry the live generation accepted. Checkpoints retain these decisions.
+    pub fn validate(&self, live: &Self) -> Result<(), String> {
+        for held in &self.held {
+            let previous = live
+                .held
+                .iter()
+                .find(|h| h.ext == held.ext && h.decl.name == held.decl.name);
+            for (seq, error) in &held.rejected {
+                if !previous.is_some_and(|h| h.rejected.contains_key(seq)) {
+                    return Err(error.clone());
+                }
+            }
+        }
+        Ok(())
     }
 
     /// Folds every change `entries` record.
@@ -215,6 +231,7 @@ impl States {
                     ext: h.ext.to_string(),
                     state: h.decl.name.to_string(),
                     image,
+                    rejected: h.rejected.clone(),
                 })
             })
             .collect()
@@ -235,6 +252,7 @@ impl States {
                     .find(|i| i.ext == *h.ext && i.state == *h.decl.name);
                 match image {
                     Some(i) => (h.decl.restore)(&i.image)
+                        .map(|value| (value, i.rejected.clone()))
                         .map_err(|e| format!("extension {}: reading {}: {e}", h.ext, h.decl.name)),
                     None => Err(format!(
                         "extension {}: missing {} image",
@@ -243,10 +261,10 @@ impl States {
                 }
             })
             .collect::<Result<Vec<_>, _>>()?;
-        for (held, value) in self.held.iter_mut().zip(restored) {
+        for (held, (value, rejected)) in self.held.iter_mut().zip(restored) {
             held.value = value;
+            held.rejected = rejected;
         }
-        self.rejected = None;
         Ok(())
     }
 }
@@ -257,6 +275,8 @@ pub struct Image {
     pub ext: String,
     pub state: String,
     pub image: Json,
+    /// Skipped entries, kept so validation survives a checkpoint.
+    pub rejected: BTreeMap<Seq, String>,
 }
 
 /// Reads state `S` from the states `with` lends, or its default when no
@@ -309,6 +329,7 @@ mod tests {
             ext: "counter".into(),
             state: "count".into(),
             image: Json::encode("two").unwrap(),
+            rejected: BTreeMap::new(),
         }];
         assert!(
             restored
@@ -329,35 +350,46 @@ mod tests {
             ext: "other".into(),
             state: "count".into(),
             image: Json::default(),
+            rejected: BTreeMap::new(),
         });
         assert!(states.restore(&extra).is_err());
         assert_eq!(states.get::<Count>().unwrap().0, 2);
     }
 
     #[test]
-    fn a_skipped_change_keeps_its_value_and_rejects_candidate_validation() {
-        let mut states = States::new([(Name::from("counter"), Decl::of::<Count>())]);
-        states.fold("counter", "count", &Json::encode(&2).unwrap());
-        states.fold("counter", "count", &Json::encode("two").unwrap());
-        assert!(
-            states
-                .validate()
-                .unwrap_err()
-                .starts_with("extension counter: a count change")
-        );
-        // Another extension's state of the same name is not this one.
-        states.fold("other", "count", &Json::encode(&5).unwrap());
-        assert_eq!(states.get::<Count>().unwrap().0, 2);
-        states.fold("counter", "count", &Json::encode(&3).unwrap());
-        assert_eq!(states.get::<Count>().unwrap().0, 5);
-        assert!(
-            states.validate().is_err(),
-            "later successes cannot validate a rejected candidate"
-        );
-        states.restore(&states.image().unwrap()).unwrap();
-        assert!(
-            states.validate().is_ok(),
-            "a restore begins a new replay suffix"
-        );
+    fn candidate_validation_compares_the_same_entries_across_checkpoints() {
+        let make = || States::new([(Name::from("counter"), Decl::of::<Count>())]);
+        let change = |seq, data| {
+            Entry::new(
+                Seq::new(seq).unwrap(),
+                protocol::Epoch::default(),
+                Body::Ext {
+                    ext: "counter".into(),
+                    state: "count".into(),
+                    data,
+                },
+            )
+        };
+        let good = change(1, Json::encode(&2).unwrap());
+        let bad = change(2, Json::encode("two").unwrap());
+        let later = change(3, Json::encode(&3).unwrap());
+        let mut live = make();
+        live.apply(&good);
+        let mut candidate = make();
+        candidate.replay([&good, &bad, &later]);
+        assert_eq!(candidate.get::<Count>().unwrap().0, 5);
+        assert!(candidate.validate(&live).is_err());
+        live.apply(&bad);
+        assert!(candidate.validate(&live).is_ok());
+        let checkpoint = Json::encode(&live.image().unwrap()).unwrap();
+        let mut restored = make();
+        restored
+            .restore(&checkpoint.parse::<Vec<Image>>().unwrap())
+            .unwrap();
+        assert!(candidate.validate(&restored).is_ok());
+        // The seq identifies the decision; an equal payload at another
+        // position was never rejected by the live generation.
+        candidate.apply(&change(4, Json::encode("two").unwrap()));
+        assert!(candidate.validate(&restored).is_err());
     }
 }

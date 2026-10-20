@@ -214,13 +214,17 @@ impl ManualSession {
     }
 
     fn note(&self) -> oneshot::Receiver<()> {
+        self.change(Json::encode(&"pending").unwrap())
+    }
+
+    fn change(&self, data: Json) -> oneshot::Receiver<()> {
         let (done, waited) = oneshot::channel();
         self.session.send(Msg::Note {
             call: self.call,
             note: Note::State {
                 ext: "test".into(),
                 state: "value".into(),
-                data: Json::encode(&"pending").unwrap(),
+                data,
             },
             done: Some(done),
         });
@@ -754,4 +758,99 @@ fn a_rejected_reduction_has_the_same_outcome_at_every_snapshot_position() {
         outcomes.iter().all(|outcome| outcome == &expected),
         "snapshot position changed replay: {outcomes:?}"
     );
+}
+
+struct HistoricNotes {
+    version: u32,
+    fixes_seven: bool,
+}
+impl ext::DynExtension for HistoricNotes {
+    fn name(&self) -> ext::Name {
+        "test".into()
+    }
+    fn version(&self) -> u32 {
+        self.version
+    }
+    fn contribute(&self, r: &mut Registrar) {
+        r.dyn_fold(Arc::new(Self { ..*self }));
+    }
+}
+impl ext::DynFold for HistoricNotes {
+    fn name(&self) -> ext::Name {
+        "value".into()
+    }
+    fn initial(&self) -> Json {
+        Json::encode(&0_u64).unwrap()
+    }
+    fn apply(&self, state: &Json, change: &Json) -> Result<Json, String> {
+        let change = change.parse::<u64>().map_err(|e| e.to_string())?;
+        if change == 7 && !self.fixes_seven {
+            return Err("seven rejected".into());
+        }
+        Json::encode(&(state.parse::<u64>().unwrap() + change)).map_err(|e| e.to_string())
+    }
+}
+fn historic_registry(version: u32, fixes_seven: bool) -> Registry {
+    Registry::default()
+        .with(&Agents)
+        .unwrap()
+        .with_dyn(
+            ext::Tier::User,
+            &HistoricNotes {
+                version,
+                fixes_seven,
+            },
+        )
+        .unwrap()
+}
+
+#[test]
+fn a_reload_that_fixes_a_reducer_is_adopted_despite_a_bad_historic_note() {
+    for checkpoint in [false, true] {
+        let mut h = ManualSession::with_registry(historic_registry(1, false));
+        let _one = h.change(Json::encode(&1_u64).unwrap());
+        let _malformed = h.note();
+        let _seven = h.change(Json::encode(&7_u64).unwrap());
+        h.complete();
+        h.request("rest");
+        assert_eq!(h.value(), 1);
+        if checkpoint {
+            h.snapshot();
+        }
+        let old = h.session.session.state_view();
+        h.replace(historic_registry(2, true));
+        h.request("adopt");
+        assert!(!Arc::ptr_eq(&old, &h.session.session.state_view()));
+        assert_eq!(
+            h.value(),
+            8,
+            "the fixed reducer recovers the rejected seven"
+        );
+        let fixed = h.session.session.state_view();
+        h.replace(historic_registry(3, false));
+        h.request("reject regression");
+        assert!(Arc::ptr_eq(&fixed, &h.session.session.state_view()));
+        assert_eq!(h.value(), 8, "a repaired entry cannot regress to rejection");
+        h.finish();
+    }
+}
+
+#[test]
+fn an_entry_both_generations_reject_does_not_block_adoption() {
+    for checkpoint in [false, true] {
+        let mut h = ManualSession::with_registry(historic_registry(1, false));
+        let _one = h.change(Json::encode(&1_u64).unwrap());
+        let _malformed = h.note();
+        h.complete();
+        h.request("rest");
+        if checkpoint {
+            h.snapshot();
+        }
+        let old = h.session.session.state_view();
+        h.replace(historic_registry(2, false));
+        h.request("adopt");
+        assert!(!Arc::ptr_eq(&old, &h.session.session.state_view()));
+        assert_eq!(h.value(), 1);
+        h.finish();
+    }
 }

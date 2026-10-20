@@ -1027,6 +1027,7 @@ mod tests {
                         ext: "test".into(),
                         state: "count".into(),
                         image: json,
+                        rejected: std::collections::BTreeMap::new(),
                     }])
                     .is_err()
             );

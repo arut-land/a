@@ -687,6 +687,7 @@ impl Actor {
         let registry = Arc::clone(&newest);
         let snapshot = self.fold_snapshot.clone();
         let boundary = self.core.ledger().seq();
+        let live = self.live.session.state_view();
         let prepared = rt::unblock(&*Arc::clone(&shared.rt), move || {
             let start = Instant::now();
             let ((), folding) = Folding::rebuild(&binding, &registry, &shared, |restore, each| {
@@ -713,7 +714,10 @@ impl Actor {
                 }
                 Ok(())
             })?;
-            folding.states.validate().map_err(io::Error::other)?;
+            folding
+                .states
+                .validate(&lock(&live))
+                .map_err(io::Error::other)?;
             Ok::<_, io::Error>(folding.states)
         })
         .await;
