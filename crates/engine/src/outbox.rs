@@ -110,19 +110,22 @@ impl FrameLog {
     /// back, is an error that ends the view of a client that comes to it
     /// rather than leaving a gap in it.
     fn read_after(&self, after: u64, ahead: &mut VecDeque<io::Result<Frame>>) {
-        let last = self.seq();
-        if after >= last {
-            return;
-        }
-        {
+        let last = {
+            // The seq read under the lock it is shown under: the tail's
+            // frames end at it, where a seq read before may be behind them.
             let tail = lock(&self.tail);
+            let last = self.seq();
+            if after >= last {
+                return;
+            }
             let first = last + 1 - tail.frames.len() as u64;
             if first <= after + 1 {
                 let skip = usize::try_from(after + 1 - first).unwrap_or(usize::MAX);
                 ahead.extend(tail.frames.iter().skip(skip).cloned().map(Ok));
                 return;
             }
-        }
+            last
+        };
         let mut run = Vec::new();
         match self.lines.read(after + 1..=last, RUN, &mut run) {
             Ok(_) => ahead.extend(
@@ -513,6 +516,38 @@ mod tests {
         live.wake().unwrap();
         assert_eq!(written(&near).len(), 1);
         assert_eq!(counted.1.load(Ordering::SeqCst), reads + 1);
+    }
+
+    /// Followers reading while entries commit get each once, in order:
+    /// where a read starts in the tail is reckoned from the seq the tail's
+    /// frames end at, never from one shown before.
+    #[test]
+    fn followers_racing_the_commits_get_every_entry_once_in_order() {
+        const N: usize = 100_000;
+        let mut log = log(&[]);
+        let followers: Vec<_> = (0..4)
+            .map(|_| {
+                let outbox = Outbox::new();
+                let _ = outbox.follow(log.frames(), 0, Vec::new());
+                std::thread::spawn(move || {
+                    let mut seqs = Vec::new();
+                    while seqs.len() < N {
+                        match outbox.try_next() {
+                            Some(frame) => seqs.push(frame.seq.unwrap()),
+                            None => std::hint::spin_loop(),
+                        }
+                    }
+                    // The first entry out of place, and the seq it holds.
+                    (1..).zip(seqs).find(|&(want, seq)| seq != want)
+                })
+            })
+            .collect();
+        for _ in 0..N {
+            log.push("x");
+        }
+        for follower in followers {
+            assert_eq!(follower.join().unwrap(), None);
+        }
     }
 
     #[test]
