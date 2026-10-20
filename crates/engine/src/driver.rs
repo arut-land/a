@@ -1760,7 +1760,7 @@ impl ext::Settings for Own {
             let note = Note::State {
                 ext: "settings".to_owned(),
                 state: "model".to_owned(),
-                data: set.model.as_deref().into(),
+                data: Json::encode(&set.model).unwrap_or_default(),
             };
             let note = Msg::Note {
                 call,

@@ -8,7 +8,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::value::RawValue;
 use serde_json::{Map, Value};
 
-use crate::spec::{AssistantPart, Meta};
+use crate::spec::{AssistantPart, Json, Meta};
 
 /// What an encoder sends for one part.
 #[derive(Clone, Debug, PartialEq)]
@@ -25,7 +25,7 @@ pub enum Replay {
 pub enum Canon<'a> {
     Text(&'a str),
     Reasoning(&'a str, bool),
-    Call(&'a str, &'a Map<String, Value>),
+    Call(&'a str, &'a Json),
     Other,
 }
 
@@ -69,8 +69,7 @@ pub fn fingerprint(canon: Canon<'_>) -> String {
     let _ = match canon {
         Canon::Text(text) => write!(hash, "t\0{text}"),
         Canon::Reasoning(text, redacted) => write!(hash, "r\0{redacted}\0{text}"),
-        Canon::Call(name, input) => write!(hash, "c\0{name}\0")
-            .and_then(|()| hash.write_all(serde_json::to_string(input)?.as_bytes())),
+        Canon::Call(name, input) => write!(hash, "c\0{name}\0{input}"),
         Canon::Other => return String::new(),
     };
     format!("{:016x}", hash.0)

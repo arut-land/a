@@ -3,7 +3,7 @@ use std::time::{Duration, Instant};
 
 use crate::store::{Header, Jsonl, LogStore};
 use protocol::{
-    Activity, Audience, Body, Entry, Environment, Outcome, Residency, SessionId, Target,
+    Activity, Audience, Body, Entry, Environment, Json, Outcome, Residency, SessionId, Target,
 };
 use serde_json::json;
 use sys::Home;
@@ -172,7 +172,7 @@ fn busy_sessions_recover_at_startup() {
     for (seq, (tool, input)) in (1..).zip(calls) {
         let body = Body::ToolCall {
             tool: tool.into(),
-            input: input.into(),
+            input: Json::encode(&input).unwrap(),
             id: None,
             card: None,
             by: Audience::Model,
@@ -203,7 +203,7 @@ fn busy_sessions_recover_at_startup() {
         })
     };
     assert!(
-        matches!(result(1), Some(Outcome::Done { output }) if output.value()["slept"] == 0),
+        matches!(result(1), Some(Outcome::Done { output }) if output.parse::<serde_json::Value>().unwrap()["slept"] == 0),
         "{got:#?}"
     );
     assert_eq!(result(2), Some(&Outcome::Interrupted { output: None }));
@@ -382,13 +382,13 @@ fn a_parent_hears_from_its_child_exactly_once() {
             Body::Fired {
                 watch: 6,
                 outcome: Outcome::Done {
-                    output: "hi".into()
+                    output: Json::encode("hi").unwrap()
                 }
             },
             Body::ToolResult {
                 call: 3,
                 outcome: Outcome::Done {
-                    output: "The child session finished:\nhi".into()
+                    output: Json::encode("The child session finished:\nhi").unwrap()
                 },
                 card: None
             },
@@ -476,7 +476,7 @@ fn watches_rearm_after_a_crash_and_fire_once() {
             },
             Body::ToolCall {
                 tool: "task".into(),
-                input: json!({ "prompt": "sleep 0" }).into(),
+                input: Json::encode(&json!({ "prompt": "sleep 0" })).unwrap(),
                 id: None,
                 card: None,
                 by: Audience::Model,
@@ -502,13 +502,13 @@ fn watches_rearm_after_a_crash_and_fire_once() {
     };
     let sleep = || Body::ToolCall {
         tool: "sleep".into(),
-        input: json!({ "seconds": 0 }).into(),
+        input: Json::encode(&json!({ "seconds": 0 })).unwrap(),
         id: None,
         card: None,
         by: Audience::Model,
     };
     let slept = Outcome::Done {
-        output: json!({ "slept": 0 }).into(),
+        output: Json::encode(&json!({ "slept": 0 })).unwrap(),
     };
     let mut parents = Vec::new();
 
@@ -599,7 +599,7 @@ fn an_owner_idles_with_its_children_and_an_interrupt_stops_them_first() {
 
     assert_eq!(owned.len(), 1);
     assert_eq!(busy, Duration::ZERO);
-    let aborted = |b: &Body| matches!(b, Body::ToolResult { outcome: Outcome::Done { output }, .. } if output.value()["aborted"] == true);
+    let aborted = |b: &Body| matches!(b, Body::ToolResult { outcome: Outcome::Done { output }, .. } if output.parse::<serde_json::Value>().unwrap()["aborted"] == true);
     assert!(child_log.iter().any(aborted), "{child_log:#?}");
     // The child settles first, then its parent's call, then the turn.
     let interrupted = Outcome::Interrupted { output: None };
@@ -637,7 +637,7 @@ fn an_orphan_does_not_resume_what_it_was_doing() {
         },
         Body::ToolCall {
             tool: "sleep".into(),
-            input: json!({ "seconds": 0 }).into(),
+            input: Json::encode(&json!({ "seconds": 0 })).unwrap(),
             id: None,
             card: None,
             by: Audience::Model,

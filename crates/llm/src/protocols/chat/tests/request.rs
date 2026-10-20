@@ -70,7 +70,7 @@ fn calling(id: &str) -> Message {
         content: vec![AssistantPart::ToolCall(ToolCall {
             id: id.into(),
             name: "tool".into(),
-            input: serde_json::Map::new(),
+            input: crate::Json::encode(&serde_json::Map::new()).unwrap(),
             invalid: None,
             provider_executed: false,
             meta: Meta::new(),

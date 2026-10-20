@@ -181,7 +181,7 @@ impl Ledger {
             }
             Body::Assistant { text } => {
                 self.result = Some(Outcome::Done {
-                    output: text.as_str().into(),
+                    output: Json::encode(text.as_str()).unwrap_or_default(),
                 });
             }
             Body::Environment(env) => self.env = Some(env.clone()),

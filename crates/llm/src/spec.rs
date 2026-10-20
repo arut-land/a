@@ -16,6 +16,7 @@ use std::fmt;
 use std::num::NonZeroU32;
 use std::sync::{Arc, Mutex, PoisonError};
 
+pub use ::json::Json;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 pub use smol_str::SmolStr;
@@ -438,7 +439,11 @@ pub enum Source {
 pub struct ToolCall {
     pub id: SmolStr,
     pub name: SmolStr,
-    pub input: serde_json::Map<String, Value>,
+    /// The arguments, a JSON object as compact text with its keys in
+    /// order: what the model sent, read once, and passed on as it is to
+    /// the log, the tool and every later request.
+    #[serde(deserialize_with = "object")]
+    pub input: Json,
     /// The argument text, when it was no JSON object: `input` then holds
     /// what a cut-off object still states, and the caller answers with the
     /// parse error.
@@ -449,6 +454,26 @@ pub struct ToolCall {
     pub provider_executed: bool,
     #[serde(default, skip_serializing_if = "Meta::is_empty")]
     pub meta: Meta,
+}
+
+/// A call's arguments as a derived `Deserialize` reads them, buffered: a
+/// JSON object, through a tree. [`Response::from_json`] keeps the text.
+fn object<'de, D: serde::Deserializer<'de>>(d: D) -> Result<Json, D::Error> {
+    let object = serde_json::Map::<String, Value>::deserialize(d)?;
+    Json::encode(&object).map_err(serde::de::Error::custom)
+}
+
+impl ToolCall {
+    /// The `input` its arguments hold, as its text: a custom tool's
+    /// free-form input. Only that field is read.
+    pub(crate) fn input_field(&self) -> Option<&serde_json::value::RawValue> {
+        #[derive(Deserialize)]
+        struct Custom<'a> {
+            #[serde(borrow)]
+            input: Option<&'a serde_json::value::RawValue>,
+        }
+        self.input.parse::<Custom<'_>>().ok()?.input
+    }
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
@@ -466,7 +491,8 @@ pub struct ToolResult {
 #[serde(tag = "type", content = "value", rename_all = "snake_case")]
 pub enum Output {
     Text(String),
-    Json(Value),
+    /// A tool's output as it was stored, sent as its text.
+    Json(#[serde(deserialize_with = "Json::buffered")] Json),
     Content(Vec<UserPart>),
 }
 
@@ -681,7 +707,8 @@ pub enum Event {
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct CallEnd {
     pub id: SmolStr,
-    pub input: serde_json::Map<String, Value>,
+    #[serde(deserialize_with = "object")]
+    pub input: Json,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub invalid: Option<String>,
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]

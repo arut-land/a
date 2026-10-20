@@ -38,10 +38,7 @@ fn round(provider: &Provider, model: &str, turn: usize) -> [Message; 2] {
     let call = ToolCall {
         id: id.clone(),
         name: "bash".into(),
-        input: json!({"command": "ls"})
-            .as_object()
-            .cloned()
-            .unwrap_or_default(),
+        input: crate::Json::encode(&json!({"command": "ls"})).unwrap(),
         invalid: None,
         provider_executed: false,
         meta: crate::Meta::new(),

@@ -8,7 +8,7 @@ use std::os::unix::fs::PermissionsExt;
 use std::process::Command;
 
 use common::{Env, Repl, assert_contiguous, group_alive, is_tool_call, result_of, wait_for};
-use protocol::{Audience, Body, ClientMsg, Mode, Outcome, Permission, Target, Verdict};
+use protocol::{Audience, Body, ClientMsg, Json, Mode, Outcome, Permission, Target, Verdict};
 use serde_json::json;
 
 const ANY: Target = Target::Latest {
@@ -104,7 +104,7 @@ fn resume_after_the_terminal_closes_mid_turn_replays_every_entry() {
             taken("sleep 1"),
             Body::ToolCall {
                 tool: "sleep".into(),
-                input: json!({ "seconds": 1 }).into(),
+                input: Json::encode(&json!({ "seconds": 1 })).unwrap(),
                 id: None,
                 card: None,
                 by: Audience::Model,
@@ -112,7 +112,7 @@ fn resume_after_the_terminal_closes_mid_turn_replays_every_entry() {
             Body::ToolResult {
                 call,
                 outcome: Outcome::Done {
-                    output: json!({ "slept": 1 }).into()
+                    output: Json::encode(&json!({ "slept": 1 })).unwrap()
                 },
                 card: None,
             },
@@ -153,7 +153,7 @@ fn two_terminals_on_one_session_see_identical_state() {
         Body::ToolResult {
             outcome: Outcome::Done { output },
             ..
-        } => output.value()["slept"] == 0,
+        } => output.parse::<serde_json::Value>().unwrap()["slept"] == 0,
         _ => false,
     };
     let seen = [first.until(done), second.until(done)].map(|live| [opened.clone(), live].concat());
@@ -195,7 +195,7 @@ fn a_safe_tool_reruns_after_the_daemon_is_killed() {
     assert_eq!(
         results,
         [&Outcome::Done {
-            output: json!({ "slept": 2 }).into()
+            output: Json::encode(&json!({ "slept": 2 })).unwrap()
         }]
     );
 }
@@ -415,7 +415,7 @@ fn a_parents_watch_fires_exactly_once_after_the_daemon_is_killed_mid_child() {
         })
         .collect();
     let slept = Outcome::Done {
-        output: json!({ "slept": 2 }).into(),
+        output: Json::encode(&json!({ "slept": 2 })).unwrap(),
     };
     assert_eq!(fired, [&slept]);
     let child_log = env.log(child);

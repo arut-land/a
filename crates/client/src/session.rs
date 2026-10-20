@@ -509,7 +509,7 @@ const fn numbered(msg: &ClientMsg, seq: u64) -> bool {
 mod tests {
     use std::path::PathBuf;
 
-    use protocol::{Audience, Body, CallId, Caps, Entry, Permission, SessionId, Verdict};
+    use protocol::{Audience, Body, CallId, Caps, Entry, Json, Permission, SessionId, Verdict};
 
     use super::*;
 
@@ -727,7 +727,7 @@ mod tests {
                 1,
                 Body::ToolCall {
                     tool: "bash".into(),
-                    input: serde_json::json!({ "command": "ls" }).into(),
+                    input: Json::encode(&serde_json::json!({ "command": "ls" })).unwrap(),
                     id: None,
                     card: None,
                     by: Audience::Model,

@@ -238,7 +238,7 @@ fn push_user(messages: &mut Vec<Value>, mut parts: Vec<Value>) {
 fn result_parts(result: &ToolResult, ctx: &Context, attached: &mut Vec<Value>) -> Vec<Value> {
     let content = match &result.output {
         Output::Text(text) => return vec![text_part(text)],
-        Output::Json(value) => return vec![text_part(&value.to_string())],
+        Output::Json(value) => return vec![text_part(value.raw())],
         Output::Content(content) => content,
     };
     let mut parts = Vec::new();
@@ -291,7 +291,7 @@ fn tool_message(result: &ToolResult, ctx: &Context, attached: &mut Vec<Value>) -
 fn result_text(result: &ToolResult) -> String {
     let text = match &result.output {
         Output::Text(text) => text.clone(),
-        Output::Json(value) => value.to_string(),
+        Output::Json(value) => value.raw().to_owned(),
         Output::Content(parts) => parts
             .iter()
             .map(|part| match part {
@@ -480,10 +480,9 @@ fn assistant_message(assistant: &Assistant, ctx: &Context) -> Option<Value> {
             }
             // A host without tools reads a call as text.
             AssistantPart::ToolCall(call) if !ctx.quirks.supports_tools => {
-                let input = Value::Object(call.input.clone());
                 parts.push(text_part(&format!(
-                    "[called tool {} with {input}]",
-                    call.name
+                    "[called tool {} with {}]",
+                    call.name, call.input
                 )));
             }
             AssistantPart::ToolCall(call) => calls.push(call_item(call, sent, &ctx.custom)),
@@ -550,18 +549,12 @@ fn call_item(call: &ToolCall, sent: Replay, custom: &[String]) -> Value {
     };
     item.insert("id".to_owned(), call.id.as_str().into());
     let (slot, key, value) = if custom {
-        let input = match call.input.get("input") {
-            Some(Value::String(input)) => input.clone(),
-            Some(input) => input.to_string(),
-            None => String::new(),
-        };
+        let input = call.input_field().map_or_else(String::new, |raw| {
+            serde_json::from_str(raw.get()).unwrap_or_else(|_| raw.get().to_owned())
+        });
         ("custom", "input", input)
     } else {
-        (
-            "function",
-            "arguments",
-            Value::Object(call.input.clone()).to_string(),
-        )
+        ("function", "arguments", call.input.raw().to_owned())
     };
     let slot = item.entry(slot).or_insert_with(|| json!({}));
     if !slot.is_object() {

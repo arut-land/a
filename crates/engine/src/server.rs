@@ -411,7 +411,7 @@ impl Conn<'_> {
                 (Request::Input { text, mode }, Rejection::Refused)
             }
             ClientMsg::Approve { call, approved, .. } => {
-                let value = approved.into();
+                let value = protocol::Json::encode(&approved).unwrap_or_default();
                 (Request::Answer { call, value }, Rejection::NotWaiting)
             }
             _ => return Err((Rejection::Other, "not a mutation".into())),

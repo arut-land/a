@@ -122,7 +122,8 @@ impl Session {
     }
 
     fn tool(&mut self, rng: &mut Rng) {
-        let input: Json = json!({ "command": format!("echo {}", rng.below(10)) }).into();
+        let input: Json =
+            Json::encode(&json!({ "command": format!("echo {}", rng.below(10)) })).unwrap();
         let call = self.commit(Body::ToolCall {
             tool: "bash".into(),
             input,
@@ -144,7 +145,7 @@ impl Session {
             }
             self.commit(Body::Answer {
                 call: id,
-                value: rng.chance(50).into(),
+                value: Json::encode(&rng.chance(50)).unwrap(),
                 origin: None,
             });
         }
@@ -157,7 +158,7 @@ impl Session {
             });
         }
         if rng.chance(80) {
-            let outcome = outcome(rng, json!({ "output": "x\n", "exit": 0 }));
+            let outcome = outcome(rng, &json!({ "output": "x\n", "exit": 0 }));
             self.commit(Body::ToolResult {
                 call,
                 outcome,
@@ -196,7 +197,7 @@ impl Session {
                 "message": { "content": [{ "type": "text", "text": text }] },
                 "usage": { "input": 3, "output": 5 },
             });
-            let outcome = outcome(rng, output);
+            let outcome = outcome(rng, &output);
             self.commit(Body::ModelResult { call, outcome });
         }
     }
@@ -210,7 +211,7 @@ impl Session {
         if rng.chance(70) {
             let watch = self.commit(Body::Watch { child });
             if rng.chance(70) {
-                let outcome = outcome(rng, json!({ "slept": 1 }));
+                let outcome = outcome(rng, &json!({ "slept": 1 }));
                 self.commit(Body::Fired { watch, outcome });
             }
         }
@@ -260,12 +261,12 @@ impl Session {
     }
 }
 
-fn outcome(rng: &mut Rng, output: Value) -> Outcome {
+fn outcome(rng: &mut Rng, output: &Value) -> Outcome {
     match rng.below(5) {
         0 => Outcome::Failed { error: "f".into() },
         1 => Outcome::Interrupted { output: None },
         _ => Outcome::Done {
-            output: output.into(),
+            output: Json::encode(output).unwrap(),
         },
     }
 }
@@ -455,7 +456,7 @@ fn scenarios() -> Vec<(&'static str, Vec<Value>)> {
         },
     };
     let echoed = || Outcome::Done {
-        output: json!({ "exit": 0, "output": "hi\n" }).into(),
+        output: Json::encode(&json!({ "exit": 0, "output": "hi\n" })).unwrap(),
     };
     let card = || Card {
         title: "$ echo hi".into(),
@@ -506,11 +507,11 @@ fn scenarios() -> Vec<(&'static str, Vec<Value>)> {
                     Body::ModelResult {
                         call: 2,
                         outcome: Outcome::Done {
-                            output: json!({
+                            output: Json::encode(&json!({
                                 "message": { "content": [{ "type": "text", "text": "hello" }] },
                                 "usage": { "input": 4, "output": 2 },
-                            })
-                            .into(),
+                            }))
+                            .unwrap(),
                         },
                     },
                 ),
@@ -524,7 +525,7 @@ fn scenarios() -> Vec<(&'static str, Vec<Value>)> {
                     1,
                     Body::ToolCall {
                         tool: "bash".into(),
-                        input: json!({ "command": "echo hi" }).into(),
+                        input: Json::encode(&json!({ "command": "echo hi" })).unwrap(),
                         id: None,
                         card: None,
                         by: Audience::Model,
@@ -536,7 +537,7 @@ fn scenarios() -> Vec<(&'static str, Vec<Value>)> {
                     3,
                     Body::Answer {
                         call: call(1),
-                        value: true.into(),
+                        value: Json::encode(&true).unwrap(),
                         origin: None,
                     },
                 ),
@@ -606,7 +607,7 @@ fn scenarios() -> Vec<(&'static str, Vec<Value>)> {
                     Body::Fired {
                         watch: 2,
                         outcome: Outcome::Done {
-                            output: json!({ "slept": 1 }).into(),
+                            output: Json::encode(&json!({ "slept": 1 })).unwrap(),
                         },
                     },
                 ),
@@ -651,7 +652,7 @@ fn scenarios() -> Vec<(&'static str, Vec<Value>)> {
                     1,
                     Body::ToolCall {
                         tool: "bash".into(),
-                        input: json!({ "command": "echo hi" }).into(),
+                        input: Json::encode(&json!({ "command": "echo hi" })).unwrap(),
                         id: None,
                         card: Some(Card {
                             title: "$ echo hi".into(),
@@ -673,7 +674,7 @@ fn scenarios() -> Vec<(&'static str, Vec<Value>)> {
                     Body::Ext {
                         ext: "shell".into(),
                         state: "cwd".into(),
-                        data: json!({ "cwd": "/w/src" }).into(),
+                        data: Json::encode(&json!({ "cwd": "/w/src" })).unwrap(),
                     },
                 ),
                 entry(4, input("/jobs")),
@@ -681,7 +682,7 @@ fn scenarios() -> Vec<(&'static str, Vec<Value>)> {
                     5,
                     Body::ToolCall {
                         tool: "jobs".into(),
-                        input: json!({ "args": "" }).into(),
+                        input: Json::encode(&json!({ "args": "" })).unwrap(),
                         id: None,
                         card: None,
                         by: Audience::User,
@@ -692,7 +693,7 @@ fn scenarios() -> Vec<(&'static str, Vec<Value>)> {
                     Body::ToolResult {
                         call: 5,
                         outcome: Outcome::Done {
-                            output: "no jobs".into(),
+                            output: Json::encode("no jobs").unwrap(),
                         },
                         card: None,
                     },
@@ -703,7 +704,7 @@ fn scenarios() -> Vec<(&'static str, Vec<Value>)> {
         ("a client that fell behind is caught up with a snapshot", {
             let asked = Body::ToolCall {
                 tool: "bash".into(),
-                input: json!({ "command": "echo hi" }).into(),
+                input: Json::encode(&json!({ "command": "echo hi" })).unwrap(),
                 id: None,
                 card: None,
                 by: Audience::Model,
@@ -833,7 +834,7 @@ fn a_recap_tells_what_the_replay_held() {
             2,
             Body::ToolCall {
                 tool: "bash".into(),
-                input: json!({ "command": "ls" }).into(),
+                input: Json::encode(&json!({ "command": "ls" })).unwrap(),
                 id: None,
                 card: None,
                 by: Audience::Model,
@@ -870,7 +871,7 @@ fn a_recap_tells_what_the_replay_held() {
 fn clients_describe_calls_and_recaps_alike() {
     use protocol::view::{call_title, decision_line, output_text, recap_line};
 
-    let ls: Json = json!({"command": "ls"}).into();
+    let ls: Json = Json::encode(&json!({"command": "ls"})).unwrap();
     let card = Card {
         title: "$ ls -a".into(),
         body: "a\n".into(),
@@ -879,7 +880,7 @@ fn clients_describe_calls_and_recaps_alike() {
     assert_eq!(call_title("bash", &ls, Some(&card)), "$ ls -a");
     assert_eq!(call_title("bash", &ls, None), "$ ls");
     assert_eq!(
-        call_title("edit", &json!({"path": "a"}).into(), None),
+        call_title("edit", &Json::encode(&json!({"path": "a"})).unwrap(), None),
         r#"edit {"path":"a"}"#
     );
     assert_eq!(

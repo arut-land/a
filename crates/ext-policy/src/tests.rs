@@ -58,7 +58,7 @@ fn gate(rig: &Rig, tool: &str, input: serde_json::Value) -> Gate {
     let gating = rig
         .registry
         .hooks()
-        .gate(&cx.point(), tool, &Json::new(&input));
+        .gate(&cx.point(), tool, &Json::encode(&input).unwrap());
     match gating {
         Gating::Now(gated) => gated.gate,
         Gating::Approving(asked) => {

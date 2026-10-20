@@ -1124,6 +1124,14 @@ dependencies = [
 ]
 
 [[package]]
+name = "json"
+version = "0.0.0"
+dependencies = [
+ "serde",
+ "serde_json",
+]
+
+[[package]]
 name = "kasuari"
 version = "0.4.13"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1182,6 +1190,7 @@ version = "0.0.0"
 dependencies = [
  "futures-core",
  "http",
+ "json",
  "rt",
  "serde",
  "serde_json",
@@ -1460,6 +1469,7 @@ name = "protocol"
 version = "0.0.0"
 dependencies = [
  "bolero",
+ "json",
  "serde",
  "serde_json",
  "uuid",
@@ -2095,6 +2105,7 @@ dependencies = [
  "protocol",
  "ratatui-core",
  "rustix",
+ "serde",
  "serde_json",
  "sys",
  "unicode-width",

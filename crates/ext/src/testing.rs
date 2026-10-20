@@ -99,14 +99,14 @@ impl Rig {
     /// Runs tool `tool` on `input`.
     pub fn call(&self, tool: &str, input: &Value) -> Outcome {
         let cx = self.cx();
-        let input = Json::new(input);
+        let input = Json::encode(input).expect("JSON");
         rt::block_on(self.registry.tools().run(tool, &input, None, &cx)).outcome
     }
 
     /// The output of a call that must succeed.
     pub fn done(&self, tool: &str, input: &Value) -> Value {
         match self.call(tool, input) {
-            Outcome::Done { output } => output.value(),
+            Outcome::Done { output } => output.parse().expect("a JSON output"),
             other => panic!("{tool} {input}: {other:?}"),
         }
     }

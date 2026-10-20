@@ -9,12 +9,12 @@
 //! (streamed text, the recap of what it missed) is kept beside it and left
 //! out.
 
-use std::borrow::Borrow;
+use std::borrow::{Borrow, Cow};
 use std::io;
 use std::path::PathBuf;
 
-use serde::{Deserialize, Serialize};
-use serde_json::Value;
+use serde::de::{SeqAccess, Visitor};
+use serde::{Deserialize, Deserializer, Serialize};
 
 use crate::{
     Audience, Body, Card, DaemonMsg, Entry, Environment, Json, Outcome, Permission, SessionId,
@@ -761,17 +761,15 @@ impl SessionView {
         };
         let titles = purpose.as_deref() == Some("title");
         *status = match outcome {
-            Outcome::Done { output } if titles => {
-                let reply = reply_text(&output.value());
-                let title = reply.trim().trim_matches('"').trim();
-                self.title = (!title.is_empty()).then(|| title.to_owned());
-                *text = reply;
-                Status::Done
-            }
             Outcome::Done { output } => {
-                let output = output.value();
-                *text = reply_text(&output);
-                *usage = usage_of(&output);
+                let reply = output.parse::<Reply>().unwrap_or_default();
+                if titles {
+                    let title = reply.message.content.0.trim().trim_matches('"').trim();
+                    self.title = (!title.is_empty()).then(|| title.to_owned());
+                } else {
+                    *usage = reply.usage.and_then(ReplyUsage::counts);
+                }
+                *text = reply.message.content.0;
                 Status::Done
             }
             Outcome::Failed { error } => Status::Failed {
@@ -805,16 +803,73 @@ impl SessionView {
     }
 }
 
-/// The answer text of a stored model reply: its message's text parts.
-fn reply_text(output: &Value) -> String {
-    output
-        .pointer("/message/content")
-        .and_then(Value::as_array)
-        .into_iter()
-        .flatten()
-        .filter(|part| part["type"] == "text")
-        .filter_map(|part| part["text"].as_str())
-        .collect()
+/// What the view reads of a stored model reply, straight from its text:
+/// its message's text and its token counts. The rest is skipped unread.
+#[derive(Default, Deserialize)]
+#[serde(default)]
+struct Reply {
+    message: ReplyMessage,
+    usage: Option<ReplyUsage>,
+}
+
+#[derive(Default, Deserialize)]
+#[serde(default)]
+struct ReplyMessage {
+    content: Texts,
+}
+
+#[derive(Default, Deserialize)]
+#[serde(default)]
+struct ReplyUsage {
+    input: Option<u64>,
+    output: Option<u64>,
+}
+
+impl ReplyUsage {
+    fn counts(self) -> Option<Usage> {
+        Some(Usage {
+            input: self.input?,
+            output: self.output?,
+        })
+    }
+}
+
+/// A message's text parts, joined as they are read: no part is kept.
+#[derive(Default)]
+struct Texts(String);
+
+impl<'de> Deserialize<'de> for Texts {
+    fn deserialize<D: Deserializer<'de>>(d: D) -> Result<Self, D::Error> {
+        #[derive(Deserialize)]
+        struct Part<'a> {
+            #[serde(rename = "type", borrow)]
+            kind: Cow<'a, str>,
+            #[serde(default, borrow)]
+            text: Option<Cow<'a, str>>,
+        }
+
+        struct Join;
+
+        impl<'de> Visitor<'de> for Join {
+            type Value = Texts;
+
+            fn expecting(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+                f.write_str("a message's parts")
+            }
+
+            fn visit_seq<A: SeqAccess<'de>>(self, mut parts: A) -> Result<Texts, A::Error> {
+                let mut text = String::new();
+                while let Some(part) = parts.next_element::<Part<'de>>()? {
+                    if let ("text", Some(more)) = (&*part.kind, part.text) {
+                        text.push_str(&more);
+                    }
+                }
+                Ok(Texts(text))
+            }
+        }
+
+        d.deserialize_seq(Join)
+    }
 }
 
 /// The first line of `text`, cut to a recap's width.
@@ -829,24 +884,26 @@ fn short(text: &str) -> String {
     }
 }
 
-fn usage_of(output: &Value) -> Option<Usage> {
-    let usage = &output["usage"];
-    Some(Usage {
-        input: usage["input"].as_u64()?,
-        output: usage["output"].as_u64()?,
-    })
-}
-
 /// A tool call in one line: as its tool presents it, else a command as
 /// `$ command` and anything else as the tool and its input.
 pub fn call_title(tool: &str, input: &Json, card: Option<&Card>) -> String {
     if let Some(card) = card {
         return card.title.clone();
     }
-    match input.value()["command"].as_str() {
+    match command(input) {
         Some(command) => format!("$ {command}"),
         None => format!("{tool} {input}"),
     }
+}
+
+/// The command a call's input runs, when it runs one: its `command`.
+pub fn command(input: &Json) -> Option<Cow<'_, str>> {
+    #[derive(Deserialize)]
+    struct Command<'a> {
+        #[serde(borrow)]
+        command: Cow<'a, str>,
+    }
+    input.parse::<Command<'_>>().ok().map(|c| c.command)
 }
 
 /// A finished call's output as text and a short note on it, as its tool's

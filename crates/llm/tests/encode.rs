@@ -195,7 +195,7 @@ fn answers(message: &llm::Assistant, turn: usize) -> Option<Message> {
             name: call.name.clone(),
             output: match (turn + n) % 3 {
                 0 => Output::Text(format!("result {turn}.{n}")),
-                1 => Output::Json(json!({"ok": true, "turn": turn})),
+                1 => Output::Json(llm::Json::encode(&json!({"ok": true, "turn": turn})).unwrap()),
                 _ => Output::Content(vec![
                     UserPart::Text(Text::new("see the chart")),
                     UserPart::Media(image()),

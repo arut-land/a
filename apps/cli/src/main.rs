@@ -507,10 +507,10 @@ fn added(item: &Item) {
 fn print_outcome(outcome: &Outcome, card: Option<&Card>) {
     match outcome {
         Outcome::Done { output } => {
-            let (text, note) = match (output_text(card), output.value()) {
+            let (text, note) = match (output_text(card), output.parse::<String>()) {
                 (Some(shown), _) => shown,
-                (None, serde_json::Value::String(text)) => (text, String::new()),
-                (None, output) => (String::new(), output.to_string()),
+                (None, Ok(text)) => (text, String::new()),
+                (None, Err(_)) => (String::new(), output.to_string()),
             };
             for line in text.lines() {
                 println!("  │ {line}");

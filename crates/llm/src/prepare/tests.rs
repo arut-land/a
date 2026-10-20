@@ -41,7 +41,7 @@ fn call(id: &str) -> AssistantPart {
     AssistantPart::ToolCall(ToolCall {
         id: id.into(),
         name: "f".into(),
-        input: serde_json::Map::new(),
+        input: crate::Json::encode(&serde_json::Map::new()).unwrap(),
         invalid: None,
         provider_executed: false,
         meta: Meta::from([("short".into(), json!({"x": 1}))]),

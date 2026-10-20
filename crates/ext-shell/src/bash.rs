@@ -34,7 +34,7 @@ pub use crate::output::OUTPUT_CAP;
 use crate::output::{Live, Output, Rendered, create_private, private_dir};
 use crate::state::Cwd;
 use ext::shape::{self, Streams};
-use ext::{Cx, Partials, Schema, SpawnSpec as Spawn, Tool};
+use ext::{Cx, Json, Partials, Schema, SpawnSpec as Spawn, Tool};
 
 pub struct Bash;
 
@@ -137,8 +137,11 @@ impl Tool for Bash {
         ext::stream(|output| async move { run(input, cx, output).await.map_err(|e| e.to_string()) })
     }
 
-    fn to_model(ran: &Ran) -> llm::Output {
-        llm::Output::Text(model_text(ran))
+    fn to_model(output: &Json) -> llm::Output {
+        output.parse().map_or_else(
+            |_| llm::Output::Json(output.clone()),
+            |ran| llm::Output::Text(model_text(&ran)),
+        )
     }
 
     fn present(input: &Command) -> Option<Card> {

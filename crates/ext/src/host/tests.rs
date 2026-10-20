@@ -116,7 +116,7 @@ fn gate(registry: &Registry, tool: &str, decided: &mut Decided) -> point::Gate {
     let cx = PointCx::new(SessionId::new(), Path::new("/w"), &view);
     let gated = (registry
         .hooks()
-        .gate(&cx, tool, &Json::new(&json!({})))
+        .gate(&cx, tool, &Json::encode(&json!({})).unwrap())
         .now())
     .unwrap();
     *decided = gated.decisions;
@@ -210,13 +210,13 @@ impl DynTool for Declared {
     fn call<'a>(&'a self, _: Parsed, _: &'a Cx) -> BoxFuture<'a, Called> {
         Box::pin(std::future::ready(Called {
             outcome: Outcome::Done {
-                output: json!("declared").into(),
+                output: Json::encode(&json!("declared")).unwrap(),
             },
             card: None,
         }))
     }
     fn to_model(&self, output: &Json) -> llm::Output {
-        llm::Output::Json(output.value())
+        llm::Output::Json(output.clone())
     }
     fn present(&self, _: &Parsed) -> Option<Card> {
         None

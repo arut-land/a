@@ -11,6 +11,7 @@ ureq = ["dep:ureq", "dep:rt"]
 [dependencies]
 futures-core = { version = "0.3", default-features = false, features = ["std"] }
 http.workspace = true
+json.workspace = true
 serde.workspace = true
 serde_json = { workspace = true, features = ["raw_value"] }
 smol_str = { version = "0.3", default-features = false, features = ["serde", "std"] }

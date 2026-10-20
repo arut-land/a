@@ -227,7 +227,7 @@ fn every_call_is_a_part_with_its_id() {
             (
                 call.id.as_str(),
                 call.name.as_str(),
-                Value::Object(call.input.clone()),
+                call.input.parse::<Value>().unwrap(),
             )
         })
         .collect();

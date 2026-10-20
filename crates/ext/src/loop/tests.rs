@@ -1,4 +1,4 @@
-use protocol::{CallId, Outcome, Seq};
+use protocol::{CallId, Json, Outcome, Seq};
 
 use super::*;
 use crate::host::Registry;
@@ -16,7 +16,7 @@ fn reply(calls: &[(&str, Option<&str>)]) -> Input {
             llm::AssistantPart::ToolCall(llm::ToolCall {
                 id: (*id).into(),
                 name: "sleep".into(),
-                input: serde_json::Map::new(),
+                input: Json::encode(&serde_json::Map::new()).unwrap(),
                 invalid: invalid.map(str::to_owned),
                 provider_executed: false,
                 meta: llm::Meta::new(),
@@ -38,7 +38,7 @@ fn reply(calls: &[(&str, Option<&str>)]) -> Input {
     Input::ModelDone {
         call: call(),
         outcome: Outcome::Done {
-            output: serde_json::to_value(response).unwrap().into(),
+            output: Json::encode(&response).unwrap(),
         },
     }
 }
@@ -75,14 +75,14 @@ fn the_default_loop_is_what_runs_with_nothing_registered() {
 
 #[test]
 fn the_loop_hears_a_childs_result() {
-    let done = |output: Value| Input::ChildDone {
+    let done = |output: &str| Input::ChildDone {
         watch: Seq::new(3).unwrap(),
         outcome: Outcome::Done {
-            output: output.into(),
+            output: Json::encode(output).unwrap(),
         },
     };
     let mut agent = Loop::default();
-    assert_eq!(agent.step(done("hi".into()), &Defaults)[..], [AUTO]);
+    assert_eq!(agent.step(done("hi"), &Defaults)[..], [AUTO]);
     assert_eq!(agent.step(reply(&[]), &Defaults)[..], NOTHING);
 }
 

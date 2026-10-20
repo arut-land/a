@@ -114,8 +114,8 @@ impl Tool for HarborLabel {
         Ok("crimson-harbor".to_owned())
     }
 
-    fn to_model(label: &String) -> llm::Output {
-        llm::Output::Text(label.clone())
+    fn to_model(label: &Json) -> llm::Output {
+        llm::Output::Text(label.parse().unwrap())
     }
 }
 
@@ -315,7 +315,7 @@ impl Live {
     fn answer(&self, call: u64, approved: bool) -> Result<(), String> {
         let answer = Request::Answer {
             call,
-            value: approved.into(),
+            value: Json::encode(&approved).unwrap(),
         };
         rt::block_on(self.request(answer, None))
     }
@@ -496,8 +496,8 @@ fn the_model_calls_a_tool_and_answers_from_its_result() {
                 Body::ToolResult { call: 4, outcome: Outcome::Done { output }, card: None },
                 Body::ModelCall { .. },
                 Body::ModelResult { call: 6, outcome: Outcome::Done { output: answer } },
-            ] if tool == "lookup_harbor_label" && id == call_id && output.value() == "crimson-harbor"
-                && answer.value()["message"]["content"][1]["text"] == "The harbor label is crimson-harbor."
+            ] if tool == "lookup_harbor_label" && id == call_id && output.parse::<Value>().unwrap() == "crimson-harbor"
+                && answer.parse::<Value>().unwrap()["message"]["content"][1]["text"] == "The harbor label is crimson-harbor."
         ),
         "{log:#?}"
     );
@@ -653,7 +653,7 @@ fn live_the_model_calls_a_tool_and_answers_from_its_result() {
     assert!(
         log.iter().any(|e| matches!(
             &e.body,
-            Body::ToolResult { outcome: Outcome::Done { output }, .. } if output.value() == "crimson-harbor"
+            Body::ToolResult { outcome: Outcome::Done { output }, .. } if output.parse::<Value>().unwrap() == "crimson-harbor"
         )),
         "{log:#?}"
     );
@@ -668,7 +668,7 @@ fn a_fired_watch_wakes_the_model_with_the_childs_result() {
     let script = Script::new(&replies[1..]);
     let session = fixture(&script).load(&[entry(1, Body::Watch { child })]);
     let found = Outcome::Done {
-        output: "found it".into(),
+        output: Json::encode("found it").unwrap(),
     };
     session.settled(child, found.clone());
     settle(&session);
@@ -787,7 +787,7 @@ fn hook_decisions_are_logged_after_their_call_and_replay_to_the_same_state() {
             &user("$ echo hi"),
             &Body::ToolCall {
                 tool: "bash".into(),
-                input: json!({ "command": "echo hi" }).into(),
+                input: Json::encode(&json!({ "command": "echo hi" })).unwrap(),
                 id: None,
                 card: Some(Card {
                     title: "$ echo hi".into(),
@@ -848,7 +848,7 @@ fn a_gate_cut_off_by_a_crash_logs_its_decisions_once() {
     );
     let call = Body::ToolCall {
         tool: "bash".into(),
-        input: json!({ "command": "echo hi" }).into(),
+        input: Json::encode(&json!({ "command": "echo hi" })).unwrap(),
         id: None,
         card: None,
         by: Audience::Model,
@@ -972,7 +972,7 @@ fn an_ask_waits_in_the_inbox_through_a_stop_and_runs_once_approved() {
                     card: Some(card),
                 },
             ] if call.get() == 2 && value.raw() == "true"
-                && output.value()["output"] == "approved\n" && card.note == "exit 0"
+                && output.parse::<Value>().unwrap()["output"] == "approved\n" && card.note == "exit 0"
         ),
         "{log:#?}"
     );
@@ -993,7 +993,7 @@ fn a_refused_ask_answers_the_call_without_running_it() {
         [
             &Body::Answer {
                 call: id(2),
-                value: false.into(),
+                value: Json::encode(&false).unwrap(),
                 origin: None,
             },
             &Body::ToolResult {
@@ -1082,12 +1082,12 @@ impl Extension for Extras {
                 _ => Rewrite::Pass,
             })
             .on::<point::PreTool>(|_, call| {
-                let mut input = call.input.value();
+                let mut input = call.input.parse::<Value>().unwrap();
                 if call.tool != "bash" || input["background"] == true {
                     return Rewrite::Pass;
                 }
                 input["background"] = true.into();
-                Rewrite::Replace(Json::new(&input))
+                Rewrite::Replace(Json::encode(&input).unwrap())
             });
     }
 }
@@ -1107,7 +1107,7 @@ fn slash_commands_are_callables_and_input_hooks_rewrite_or_refuse() {
 
     let jobs = Body::ToolCall {
         tool: "jobs".into(),
-        input: json!({ "args": "all of them" }).into(),
+        input: Json::encode(&json!({ "args": "all of them" })).unwrap(),
         id: None,
         card: None,
         by: Audience::User,
@@ -1115,7 +1115,7 @@ fn slash_commands_are_callables_and_input_hooks_rewrite_or_refuse() {
     let ran = Body::ToolResult {
         call: 2,
         outcome: Outcome::Done {
-            output: "all of them in 2".into(),
+            output: Json::encode("all of them in 2").unwrap(),
         },
         card: None,
     };
@@ -1232,7 +1232,7 @@ fn the_shell_directory_survives_a_restart_and_an_interrupt_stops_a_call() {
         panic!("{ran:#?}")
     };
     assert!(
-        output.value()["output"]
+        output.parse::<Value>().unwrap()["output"]
             .as_str()
             .unwrap()
             .ends_with(&format!("/{dir}\n")),
@@ -1259,7 +1259,7 @@ fn the_shell_directory_survives_a_restart_and_an_interrupt_stops_a_call() {
         _ => None,
     });
     assert!(
-        result.is_some_and(|output| output.value()["aborted"] == true),
+        result.is_some_and(|output| output.parse::<Value>().unwrap()["aborted"] == true),
         "{log:#?}"
     );
     assert!(matches!(
@@ -1484,7 +1484,7 @@ fn an_unsafe_call_cut_off_reports_the_output_it_committed() {
     );
     let bash = Body::ToolCall {
         tool: "bash".into(),
-        input: json!({ "command": "make" }).into(),
+        input: Json::encode(&json!({ "command": "make" })).unwrap(),
         id: None,
         card: None,
         by: Audience::Model,
@@ -1548,7 +1548,7 @@ fn the_model_is_set_per_session_and_says_where_it_comes_from() {
             Body::ToolResult {
                 outcome: Outcome::Done { output },
                 ..
-            } => Some(output.value()),
+            } => Some(output.parse::<Value>().unwrap()),
             _ => None,
         })
         .collect();
@@ -1565,7 +1565,7 @@ fn the_model_is_set_per_session_and_says_where_it_comes_from() {
     let chosen = Body::Ext {
         ext: "settings".into(),
         state: "model".into(),
-        data: "anthropic:claude-x".into(),
+        data: Json::encode("anthropic:claude-x").unwrap(),
     };
     assert_eq!(log[5].body, chosen, "{log:#?}");
     assert_eq!(session.model_spec(), "gpt-5.6");
@@ -1850,7 +1850,7 @@ fn one_fsync_per_step() {
     };
     let bash = Body::ToolCall {
         tool: "bash".into(),
-        input: json!({ "command": "make" }).into(),
+        input: Json::encode(&json!({ "command": "make" })).unwrap(),
         id: None,
         card: None,
         by: Audience::Model,

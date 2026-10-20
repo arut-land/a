@@ -228,7 +228,7 @@ fn result_output(output: &Output) -> Result<ResultOutput<'_>, Error> {
     };
     Ok(match output {
         Output::Text(text) => ResultOutput::Text(text.as_str().into()),
-        Output::Json(value) => ResultOutput::Text(value.to_string().into()),
+        Output::Json(value) => ResultOutput::Text(value.raw().into()),
         Output::Content(parts) => match parts.as_slice() {
             [UserPart::Text(text)] => ResultOutput::Text(text.text.as_str().into()),
             parts => ResultOutput::Parts(parts.iter().map(part).collect::<Result<_, _>>()?),
@@ -506,10 +506,12 @@ fn rebuilt(
             item
         }
         AssistantPart::ToolCall(call) => {
-            let arguments = Value::Object(call.input.clone()).to_string();
+            let arguments = call.input.raw().to_owned();
             let (kind, key, value, prefix) = if kind == Some(ItemType::CustomToolCall) {
-                let input = call.input.get("input").and_then(Value::as_str);
-                let input = input.map_or(arguments, str::to_owned);
+                let input = call
+                    .input_field()
+                    .and_then(|raw| serde_json::from_str(raw.get()).ok());
+                let input = input.unwrap_or(arguments);
                 (ItemType::CustomToolCall, "input", input, "ctc_")
             } else {
                 (ItemType::FunctionCall, "arguments", arguments, "fc_")

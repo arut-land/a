@@ -181,7 +181,7 @@ mod tests {
         let cx = PointCx::new(SessionId::new(), Path::new("/w"), &view);
         let gated = (registry
             .hooks()
-            .gate(&cx, tool, &Json::new(&json!({})))
+            .gate(&cx, tool, &Json::encode(&json!({})).unwrap())
             .now())
         .unwrap();
         *decided = gated.decisions;

@@ -185,7 +185,7 @@ fn the_done_quirk_ends_a_turn_at_the_sentinel() {
     };
     assert_eq!(call.name, "read");
     assert_eq!(
-        Value::Object(call.input.clone()),
+        call.input.parse::<Value>().unwrap(),
         json!({"path": "README.md"})
     );
 }
@@ -316,7 +316,7 @@ fn malformed_and_unknown_calls_are_never_dropped_silently() {
         panic!("a custom call is a call: {:?}", response.message.content);
     };
     assert_eq!(call.name, "grep");
-    assert_eq!(Value::Object(call.input.clone()), json!({"input": "x"}));
+    assert_eq!(call.input.parse::<Value>().unwrap(), json!({"input": "x"}));
     assert_eq!(
         item(part).as_ref().map(|item| &item["type"]),
         Some(&json!("custom"))
@@ -538,7 +538,7 @@ fn a_mistyped_part_never_fails_a_reply() {
     };
     assert_eq!(text.text, "looking");
     assert_eq!(call.id, "42");
-    assert_eq!(Value::Object(call.input.clone()), json!({"x": 1}));
+    assert_eq!(call.input.parse::<Value>().unwrap(), json!({"x": 1}));
 }
 
 /// Two whole calls streamed with neither an index nor an id are two calls:
@@ -570,7 +570,7 @@ fn index_less_id_less_calls_split_once_whole() {
     let arguments: Vec<Value> = response
         .message
         .tool_calls()
-        .map(|call| Value::Object(call.input.clone()))
+        .map(|call| call.input.parse::<Value>().unwrap())
         .collect();
     assert_eq!(arguments, [json!({"q": "a"}), json!({"q": "b"})]);
 }

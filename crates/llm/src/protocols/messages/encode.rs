@@ -27,7 +27,7 @@ use crate::models::anthropic::{
 use crate::protocol::Target;
 use crate::replay::{Replay, replay, replays};
 use crate::spec::{
-    Assistant, AssistantPart, Format, Media, Message, Output, Request, Source, System, Tool,
+    Assistant, AssistantPart, Format, Json, Media, Message, Output, Request, Source, System, Tool,
     ToolChoice, ToolResult, UserPart,
 };
 
@@ -218,7 +218,7 @@ enum Block<'a> {
     Use {
         id: &'a str,
         name: &'a str,
-        input: &'a Map<String, Value>,
+        input: &'a Json,
     },
     Tree(Value),
 }
@@ -562,7 +562,7 @@ fn user_blocks(run: &[Message]) -> Result<Vec<Block<'_>>, Error> {
 fn result_json(result: &ToolResult) -> Result<Block<'_>, Error> {
     let content = match &result.output {
         Output::Text(text) => vec![Block::Text(text.as_str().into())],
-        Output::Json(value) => vec![Block::Text(value.to_string().into())],
+        Output::Json(value) => vec![Block::Text(value.raw().into())],
         Output::Content(parts) => parts
             .iter()
             .map(|part| match part {

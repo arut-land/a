@@ -78,7 +78,7 @@ fn a_call_assembles_its_input_into_its_item() {
     };
     assert_eq!(call.id, "toolu_1");
     assert_eq!(
-        Value::Object(call.input.clone()),
+        call.input.parse::<Value>().unwrap(),
         json!({"location": "Paris"})
     );
     assert_eq!(
@@ -489,7 +489,7 @@ fn a_tool_use_whose_input_is_not_an_object_keeps_its_call() {
     let [AssistantPart::ToolCall(call)] = response.message.content.as_slice() else {
         panic!("one call: {:?}", response.message.content);
     };
-    assert!(call.input.is_empty());
+    assert_eq!(call.input.raw(), "{}");
     assert_eq!(call.invalid.as_deref(), Some("[1]"));
     assert!(item(&response.message.content[0]).is_none());
 }

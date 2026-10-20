@@ -21,7 +21,7 @@ use crate::error::{Error, Kind};
 use crate::protocol::{Decoder, Flow, Frame};
 use crate::replay::{Canon, Written, fingerprint};
 use crate::spec::{
-    AssistantPart, Block, CallEnd, Event, Finish, Media, Meta, Opaque, Reason, SmolStr, Usage,
+    AssistantPart, Block, CallEnd, Event, Finish, Json, Media, Meta, Opaque, Reason, SmolStr, Usage,
 };
 
 /// The first index the writer hands out itself ([`Writer::fresh_index`]);
@@ -214,11 +214,11 @@ impl Arguments {
         }
     }
 
-    fn end(&mut self) -> (Map<String, Value>, Option<String>) {
+    fn end(&mut self) -> (Json, Option<String>) {
         if self.text.is_empty()
-            && let Some(Value::Object(announced)) = self.announced.take()
+            && let Some(announced @ Value::Object(_)) = self.announced.take()
         {
-            return (announced, None);
+            return (Json::encode(&announced).unwrap_or_default(), None);
         }
         let (input, invalid) = crate::json::arguments(&self.text);
         let invalid = invalid.or_else(|| self.overflowed.then(|| std::mem::take(&mut self.text)));
@@ -686,7 +686,7 @@ impl Writer {
         if arguments.streamed == 0 {
             self.out.push(Event::Delta {
                 index: part,
-                text: serde_json::to_string(&input).unwrap_or_default(),
+                text: input.raw().to_owned(),
             });
         }
         let (id, item) = self.distinct_call_id(id, item);

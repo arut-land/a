@@ -23,10 +23,9 @@ fn result(id: &str, name: &str, text: &str) -> Message {
     })
 }
 
-fn call(id: &str, name: &str, input: Value) -> ToolCall {
-    let Value::Object(input) = input else {
-        panic!("arguments are an object");
-    };
+fn call(id: &str, name: &str, input: &Value) -> ToolCall {
+    assert!(input.is_object(), "arguments are an object");
+    let input = crate::Json::encode(input).unwrap();
     ToolCall {
         id: id.into(),
         name: name.into(),
@@ -39,7 +38,7 @@ fn call(id: &str, name: &str, input: Value) -> ToolCall {
 
 fn call_turn(id: &str, name: &str) -> Message {
     Message::Assistant(Assistant {
-        content: vec![AssistantPart::ToolCall(call(id, name, json!({})))],
+        content: vec![AssistantPart::ToolCall(call(id, name, &json!({})))],
         origin: None,
     })
 }
@@ -130,7 +129,9 @@ fn a_custom_call_stays_custom() {
     let mut edited = response.message.clone();
     for part in &mut edited.content {
         if let AssistantPart::ToolCall(call) = part {
-            call.input.insert("input".into(), json!("rig2"));
+            let mut input: Value = call.input.parse().unwrap();
+            input["input"] = json!("rig2");
+            call.input = crate::Json::encode(&input).unwrap();
         }
     }
     let same = replayed(
@@ -260,7 +261,7 @@ fn perplexity_reads_a_tool_exchange_as_text() {
             content: vec![AssistantPart::ToolCall(call(
                 "call_1",
                 "lookup",
-                json!({"q": "rig"}),
+                &json!({"q": "rig"}),
             ))],
             origin: Some(Origin {
                 protocol: KEY.into(),

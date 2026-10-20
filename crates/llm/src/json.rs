@@ -149,7 +149,12 @@ pub fn overlay(body: &mut Value, overlay: &Map<String, Value>) {
 /// when it states none, the text itself. Text that is not an object keeps
 /// what a cut-off object still states, or `{}`; a string holding an object
 /// is unwrapped once; `null` is no arguments.
-pub fn arguments(text: &str) -> (Map<String, Value>, Option<String>) {
+///
+/// The object is written once, compact and its keys in order, whatever
+/// spacing and order the model wrote it in: that text is the call's input
+/// from here on, the same in the log and in every request that sends it
+/// back.
+pub fn arguments(text: &str) -> (::json::Json, Option<String>) {
     let parsed = if text.trim().is_empty() {
         Ok(Value::Object(Map::new()))
     } else {
@@ -165,7 +170,10 @@ pub fn arguments(text: &str) -> (Map<String, Value>, Option<String>) {
         Ok(_) => (Map::new(), true),
         Err(_) => (parse_partial_object(text).unwrap_or_default(), true),
     };
-    (arguments, invalid.then(|| text.to_owned()))
+    (
+        ::json::Json::encode(&arguments).unwrap_or_default(),
+        invalid.then(|| text.to_owned()),
+    )
 }
 
 /// Whether `text` is a whole JSON object; nothing at all is one.

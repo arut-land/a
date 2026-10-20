@@ -17,7 +17,7 @@ use serde::{Deserialize, Serialize};
 
 use ext::Fold;
 
-use ext::{Cx, Schema, Tool};
+use ext::{Cx, Json, Schema, Tool};
 
 /// The runtime the engine runs the call on, whose blocking pool file work
 /// goes to.
@@ -144,7 +144,10 @@ impl Tool for Edit {
         })
     }
 
-    fn to_model(edited: &Edited) -> llm::Output {
+    fn to_model(output: &Json) -> llm::Output {
+        let Ok(edited) = output.parse::<Edited>() else {
+            return llm::Output::Json(output.clone());
+        };
         let path = edited.path.display();
         llm::Output::Text(if edited.created {
             format!("created {path} ({} lines)", edited.added)
@@ -394,12 +397,17 @@ mod tests {
         let rig = Rig::new("edit", registry());
         let file = rig.workspace().join("notes.txt");
         let created = change(&rig, "notes.txt", &[("", "one\ntwo\n")]);
-        assert!(matches!(&created, Outcome::Done { output } if output.value()["created"] == true));
+        assert!(
+            matches!(&created, Outcome::Done { output } if output.parse::<Value>().unwrap()["created"] == true)
+        );
         assert_eq!(std::fs::read_to_string(&file).unwrap(), "one\ntwo\n");
         let Outcome::Done { output } = change(&rig, "notes.txt", &[("two", "2")]) else {
             panic!()
         };
-        assert_eq!(output.value()["diff"], "@@ -2,1 +2,1 @@\n-two\n+2\n");
+        assert_eq!(
+            output.parse::<Value>().unwrap()["diff"],
+            "@@ -2,1 +2,1 @@\n-two\n+2\n"
+        );
         let input = Change {
             path: "notes.txt".into(),
             edits: Vec::new(),

@@ -282,7 +282,7 @@ fn input_samples() -> Vec<Sample<DaemonMsg>> {
                 22,
                 Body::ToolCall {
                     tool: "model".into(),
-                    input: json!({ "args": "openai:m" }).into(),
+                    input: protocol::Json::encode(&json!({ "args": "openai:m" })).unwrap(),
                     id: None,
                     card: None,
                     by: Audience::User,
@@ -323,7 +323,7 @@ fn input_samples() -> Vec<Sample<DaemonMsg>> {
                 Body::Wait {
                     call: call(2),
                     on: WaitOn::Dialog {
-                        ui: json!({ "title": "pick a file" }).into(),
+                        ui: protocol::Json::encode(&json!({ "title": "pick a file" })).unwrap(),
                     },
                 },
             ),
@@ -334,7 +334,7 @@ fn input_samples() -> Vec<Sample<DaemonMsg>> {
                 14,
                 Body::Answer {
                     call: call(2),
-                    value: true.into(),
+                    value: protocol::Json::encode(&true).unwrap(),
                     origin: None,
                 },
             ),
@@ -345,7 +345,7 @@ fn input_samples() -> Vec<Sample<DaemonMsg>> {
                 14,
                 Body::Answer {
                     call: call(2),
-                    value: false.into(),
+                    value: protocol::Json::encode(&false).unwrap(),
                     origin: Some(author),
                 },
             ),
@@ -366,7 +366,7 @@ fn input_samples() -> Vec<Sample<DaemonMsg>> {
                 Body::Edit {
                     target: seq(6),
                     upto: Some(seq(7)),
-                    replace: Some(json!("[output elided]").into()),
+                    replace: Some(protocol::Json::encode(&json!("[output elided]")).unwrap()),
                 },
             ),
         ),
@@ -399,7 +399,7 @@ fn daemon_samples() -> Vec<Sample<DaemonMsg>> {
             epoch: 0,
             body: Body::ToolCall {
                 tool: "bash".into(),
-                input: json!({ "command": "ls" }).into(),
+                input: protocol::Json::encode(&json!({ "command": "ls" })).unwrap(),
                 id: None,
                 card: None,
                 by: Audience::Model,
@@ -477,7 +477,7 @@ fn daemon_samples() -> Vec<Sample<DaemonMsg>> {
                 2,
                 Body::ToolCall {
                     tool: "bash".into(),
-                    input: json!({ "command": "ls" }).into(),
+                    input: protocol::Json::encode(&json!({ "command": "ls" })).unwrap(),
                     id: Some("call_1".into()),
                     card: Some(Card {
                         title: "$ ls".into(),
@@ -516,7 +516,10 @@ fn daemon_samples() -> Vec<Sample<DaemonMsg>> {
                 Body::ToolResult {
                     call: 2,
                     outcome: Outcome::Done {
-                        output: json!({ "exit": 0, "stdout": "src\n", "stderr": "" }).into(),
+                        output: protocol::Json::encode(
+                            &json!({ "exit": 0, "stdout": "src\n", "stderr": "" }),
+                        )
+                        .unwrap(),
                     },
                     card: Some(Card {
                         title: "$ ls".into(),
@@ -598,7 +601,7 @@ fn daemon_samples() -> Vec<Sample<DaemonMsg>> {
                 Body::Fired {
                     watch: 16,
                     outcome: Outcome::Done {
-                        output: json!({ "text": "found it" }).into(),
+                        output: protocol::Json::encode(&json!({ "text": "found it" })).unwrap(),
                     },
                 },
             ),
@@ -634,7 +637,7 @@ fn daemon_samples() -> Vec<Sample<DaemonMsg>> {
                 Body::Ext {
                     ext: "shell".into(),
                     state: "cwd".into(),
-                    data: json!("/w").into(),
+                    data: protocol::Json::encode(&json!("/w")).unwrap(),
                 },
             ),
         ),

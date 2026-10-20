@@ -280,7 +280,7 @@ fn merge_rules_are_applied_identically_for_every_point() {
     let failed = |error: &str| Outcome::Failed {
         error: error.into(),
     };
-    let input = Json::new(&json!({}));
+    let input = Json::encode(&json!({})).unwrap();
     let call = ToolUse {
         tool: "t",
         input: &input,
@@ -290,7 +290,12 @@ fn merge_rules_are_applied_identically_for_every_point() {
     let view = Counted::default();
     let cx = &point_cx(&view);
     chains::<Input, _, _>(cx, (), texts, stop.clone());
-    chains::<PreTool, _, _>(cx, "t", [0, 1, 2].map(|n| Json::new(&json!(n))), stop);
+    chains::<PreTool, _, _>(
+        cx,
+        "t",
+        [0, 1, 2].map(|n| Json::encode(&json!(n)).unwrap()),
+        stop,
+    );
     chains::<Spawn, _, _>(cx, (), ["0", "a", "b"].map(spawn), None);
     chains::<PostTool, _, _>(cx, call, ["0", "a", "b"].map(failed), None);
     let say = |text: &str| Actions::from_elem(crate::Action::Say(text.into()), 1);
@@ -358,7 +363,7 @@ fn merge_rules_are_applied_identically_for_every_point() {
 fn a_point_with_no_handler_costs_nothing() {
     let view = Counted::default();
     let cx = point_cx(&view);
-    let input = Json::new(&json!({ "n": 0 }));
+    let input = Json::encode(&json!({ "n": 0 })).unwrap();
     // Handlers elsewhere are not asked, nor is the context read.
     let elsewhere = hooks(vec![one("other", |r| {
         r.on::<OnStop>(|cx, ()| Some(cx.model()));
@@ -402,19 +407,26 @@ fn gate_logs_what_the_chain_and_the_policy_decided() {
     let cx = point_cx(&view);
     let bump = |r: &mut Registrar| {
         r.on::<PreTool>(|_, call| {
-            let n = call.input.value()["n"].as_i64().unwrap();
-            Rewrite::Replace(Json::new(&json!({ "n": n + 1 })))
+            let n = call.input.parse::<Value>().unwrap()["n"].as_i64().unwrap();
+            Rewrite::Replace(Json::encode(&json!({ "n": n + 1 })).unwrap())
         });
     };
     let gate = |hooks: &Hooks| {
-        let gated = (hooks.gate(&cx, "t", &Json::new(&json!({ "n": 0 }))).now()).unwrap();
-        (gated.gate, gated.input.value(), gated.decisions)
+        let gated = (hooks
+            .gate(&cx, "t", &Json::encode(&json!({ "n": 0 })).unwrap())
+            .now())
+        .unwrap();
+        (
+            gated.gate,
+            gated.input.parse::<Value>().unwrap(),
+            gated.decisions,
+        )
     };
     let (verdict, input, decided) = gate(&hooks(vec![one("a", bump), one("b", bump)]));
     assert_eq!((verdict, input), (Gate::Run, json!({ "n": 2 })));
     assert_eq!(names(&decided), ["a", "b"]);
     assert!(
-        matches!(&decided[1].1, Verdict::PreTool { input } if input.value() == json!({ "n": 2 }))
+        matches!(&decided[1].1, Verdict::PreTool { input } if input.parse::<Value>().unwrap() == json!({ "n": 2 }))
     );
 
     let blocked = hooks(vec![
@@ -492,7 +504,8 @@ fn a_later_answer_resumes_the_merge_where_it_stopped() {
             });
         }),
     ]);
-    let Gating::Approving(approving) = set.gate(&cx, "bash", &Json::new(&json!({}))) else {
+    let Gating::Approving(approving) = set.gate(&cx, "bash", &Json::encode(&json!({})).unwrap())
+    else {
         panic!("the judge answers later")
     };
     assert_eq!(&*approving.by, "judge");
@@ -502,7 +515,7 @@ fn a_later_answer_resumes_the_merge_where_it_stopped() {
     assert_eq!(told.load(Ordering::SeqCst), 0);
     assert_eq!(rt::block_on(approving.answer.0), None);
     // Its none goes on from the next handler.
-    let input = Json::new(&json!({}));
+    let input = Json::encode(&json!({})).unwrap();
     let rest = set.approve_from(&cx, "bash", &input, approving.next);
     assert_eq!(rest, Asked::Now("last".into(), false));
     assert_eq!(told.load(Ordering::SeqCst), 1);
@@ -610,7 +623,7 @@ struct Erased(fn(&Value) -> Value);
 
 impl ErasedHandler for Erased {
     fn on(&self, _: &PointCx<'_>, args: &Json) -> Json {
-        Json::new(&(self.0)(&args.value()))
+        Json::encode(&(self.0)(&args.parse::<Value>().unwrap())).unwrap()
     }
 }
 
@@ -634,12 +647,18 @@ fn erased_handlers_answer_in_json_and_a_policy_that_cannot_be_read_denies() {
         );
         assert_eq!(r.errors, Vec::<String>::new());
     })]);
-    let gated = set.gate(&cx, "bash", &Json::new(&json!({}))).now().unwrap();
+    let gated = set
+        .gate(&cx, "bash", &Json::encode(&json!({})).unwrap())
+        .now()
+        .unwrap();
     assert_eq!(
-        (gated.gate, gated.input.value()),
+        (gated.gate, gated.input.parse::<Value>().unwrap()),
         (Gate::Ask, json!({ "tool": "bash" }))
     );
-    let gated = set.gate(&cx, "edit", &Json::new(&json!({}))).now().unwrap();
+    let gated = set
+        .gate(&cx, "edit", &Json::encode(&json!({})).unwrap())
+        .now()
+        .unwrap();
     assert_eq!(gated.gate, Gate::Refuse("lua denied this call".into()));
 
     let mut r = Registrar::default();

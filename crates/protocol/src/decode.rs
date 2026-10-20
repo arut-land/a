@@ -689,10 +689,11 @@ impl Decode for DaemonMsg {
         /// again only when the message did not decode, as a newer kind's
         /// fields may not have the types this build's do.
         #[derive(Deserialize)]
-        struct Tags {
+        struct Tags<'a> {
             t: Option<Tag>,
             kind: Option<Tag>,
-            seq: Option<serde_json::Value>,
+            #[serde(borrow)]
+            seq: Option<&'a serde_json::value::RawValue>,
         }
         // A daemon tags an entry's frame first; another peer's order needs
         // a look at the tag.
@@ -713,7 +714,7 @@ impl Decode for DaemonMsg {
                 kind: Some(kind),
                 seq,
             }) if t.as_str() == "entry" && !Body::knows(kind.as_str()) => Ok(DaemonMsg::Unknown {
-                seq: seq.as_ref().and_then(serde_json::Value::as_u64),
+                seq: seq.and_then(|seq| seq.get().parse().ok()),
             }),
             _ => Err(e),
         })

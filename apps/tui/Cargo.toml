@@ -11,6 +11,7 @@ sys.workspace = true
 
 # The client itself is Unix only, like the daemon (see lib.rs).
 [target.'cfg(unix)'.dependencies]
+serde.workspace = true
 serde_json.workspace = true
 unicode-width = { version = "0.2", default-features = false }
 # ratatui's core (cell buffer, styles) without widgets or its terminal: the

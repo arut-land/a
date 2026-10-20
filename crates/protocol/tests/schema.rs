@@ -267,7 +267,7 @@ fn every_wait_is_a_phase_of_its_call() {
         (
             r#""on":"dialog","ui":{"title":"pick"}"#,
             WaitOn::Dialog {
-                ui: serde_json::json!({ "title": "pick" }).into(),
+                ui: protocol::Json::encode(&serde_json::json!({ "title": "pick" })).unwrap(),
             },
             Activity::Input,
         ),
@@ -322,7 +322,7 @@ fn the_log_knows_each_clients_last_mutation() {
         },
         Body::Answer {
             call: CallId::new(9).unwrap(),
-            value: true.into(),
+            value: protocol::Json::encode(&true).unwrap(),
             origin: Some(author(2)),
         },
     ];

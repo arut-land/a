@@ -3,7 +3,7 @@
 //! [`Sessions`] starts the child, owned by the call: it is interrupted with
 //! the turn, survives a restart, and is heard from once.
 
-use ext::{Cx, Extension, Registrar, Replay, Schema, Sessions, Text, Tool};
+use ext::{Cx, Extension, Json, Registrar, Replay, Schema, Sessions, Text, Tool};
 use serde::Deserialize;
 
 /// The `subagent` extension.
@@ -45,7 +45,10 @@ impl Tool for Task {
         Ok(ext::child_result(&outcome))
     }
 
-    fn to_model(text: &String) -> llm::Output {
-        llm::Output::Text(text.clone())
+    /// The child's text, as text rather than a JSON string.
+    fn to_model(output: &Json) -> llm::Output {
+        output
+            .parse()
+            .map_or_else(|_| llm::Output::Json(output.clone()), llm::Output::Text)
     }
 }

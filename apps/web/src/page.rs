@@ -388,7 +388,7 @@ mod tests {
             Body::ModelResult {
                 call: 2,
                 outcome: Outcome::Done {
-                    output: Json::from(serde_json::json!({ "text": "a <b> c d" })),
+                    output: Json::encode(&serde_json::json!({ "text": "a <b> c d" })).unwrap(),
                 },
             },
         )]);

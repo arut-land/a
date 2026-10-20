@@ -44,7 +44,7 @@ impl Agent for Echo {
         } else {
             return Actions::from_elem(Action::Say(text), 1);
         };
-        let input = Json::new(&input);
+        let input = Json::encode(&input).unwrap();
         Actions::from_elem(
             Action::Call {
                 tool: tool.to_owned(),

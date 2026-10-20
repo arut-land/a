@@ -9,7 +9,7 @@ use ratatui_core::style::Modifier;
 use serde_json::json;
 
 use client::{Cmd, Event, Welcome};
-use protocol::{Audience, Caps};
+use protocol::{Audience, Caps, Json};
 
 use super::{App, Effect};
 use crate::keys::{Input, Key, Mouse};
@@ -113,7 +113,7 @@ fn asked_command() -> Vec<DaemonMsg> {
             3,
             Body::ToolCall {
                 tool: "bash".into(),
-                input: json!({"command": "ls"}).into(),
+                input: Json::encode(&json!({"command": "ls"})).unwrap(),
                 id: None,
                 card: Some(Card {
                     title: "$ ls".into(),
@@ -225,9 +225,11 @@ fn a_streamed_reply_shows_live_then_its_committed_text() {
         Body::ModelResult {
             call: 3,
             outcome: Outcome::Done {
-                output: json!({"message": {"content": [{"type": "text", "text": "Hello you!"}]},
-                               "usage": {"input": 12, "output": 3}})
-                .into(),
+                output: Json::encode(
+                    &json!({"message": {"content": [{"type": "text", "text": "Hello you!"}]},
+                               "usage": {"input": 12, "output": 3}}),
+                )
+                .unwrap(),
             },
         },
     ));
@@ -246,7 +248,10 @@ fn a_card_folds_on_click_and_ctrl_o_shows_all_output() {
         Body::ToolResult {
             call: 3,
             outcome: Outcome::Done {
-                output: json!({"output": stdout, "exit": 0, "cwd": "/w", "duration_ms": 1}).into(),
+                output: Json::encode(
+                    &json!({"output": stdout, "exit": 0, "cwd": "/w", "duration_ms": 1}),
+                )
+                .unwrap(),
             },
             card: Some(Card {
                 title: "$ ls".into(),
@@ -341,7 +346,7 @@ fn ctrl_c_interrupts_a_running_call_and_shows_how_it_ended() {
         5,
         Body::Answer {
             call: protocol::CallId::new(3).unwrap(),
-            value: true.into(),
+            value: Json::encode(&true).unwrap(),
             origin: None,
         },
     ));
@@ -357,8 +362,10 @@ fn ctrl_c_interrupts_a_running_call_and_shows_how_it_ended() {
         Body::ToolResult {
             call: 3,
             outcome: Outcome::Done {
-                output: json!({"output": "", "exit": null, "signal": "SIGTERM", "aborted": true})
-                    .into(),
+                output: Json::encode(
+                    &json!({"output": "", "exit": null, "signal": "SIGTERM", "aborted": true}),
+                )
+                .unwrap(),
             },
             card: Some(Card {
                 title: "$ ls".into(),
@@ -542,7 +549,7 @@ fn inline_prints_settled_items_once_and_keeps_the_rest_live() {
         Body::ToolResult {
             call: 3,
             outcome: Outcome::Done {
-                output: json!({"output": "a\n", "exit": 0}).into(),
+                output: Json::encode(&json!({"output": "a\n", "exit": 0})).unwrap(),
             },
             card: Some(Card {
                 title: "$ ls".into(),
@@ -609,7 +616,7 @@ fn render_cost() {
             seq + 2,
             Body::ToolCall {
                 tool: "bash".into(),
-                input: json!({"command": "ls"}).into(),
+                input: Json::encode(&json!({"command": "ls"})).unwrap(),
                 id: None,
                 card: None,
                 by: Audience::Model,

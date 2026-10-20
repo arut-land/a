@@ -326,7 +326,7 @@ impl Conn {
             Body::ToolResult {
                 outcome: Outcome::Done { output },
                 ..
-            } => output.value(),
+            } => output.parse::<serde_json::Value>().unwrap(),
             other => panic!("{command} did not run: {other:?}"),
         }
     }

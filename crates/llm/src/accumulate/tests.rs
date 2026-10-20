@@ -54,7 +54,7 @@ fn builds_parts_in_index_order_with_state_and_calls() {
             text: None,
             call: Some(CallEnd {
                 id: "c1".into(),
-                input: json!({"a": 1}).as_object().unwrap().clone(),
+                input: crate::Json::encode(&json!({"a": 1})).unwrap(),
                 invalid: None,
                 provider_executed: false,
             }),
@@ -76,7 +76,7 @@ fn builds_parts_in_index_order_with_state_and_calls() {
     assert_eq!(reasoning.text, "think");
     assert_eq!(reasoning.meta.get("p").unwrap()["sig"], "s");
     assert_eq!((call.id.as_str(), call.name.as_str()), ("c1", "f"));
-    assert_eq!(call.input["a"], 1);
+    assert_eq!(call.input.raw(), r#"{"a":1}"#);
 }
 
 #[test]

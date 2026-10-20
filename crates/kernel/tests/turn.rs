@@ -22,7 +22,7 @@ fn modeled() -> Session {
 fn model_tool_call(tool: &str, input: &serde_json::Value, id: &str) -> Body {
     Body::ToolCall {
         tool: tool.to_owned(),
-        input: Json::new(input),
+        input: Json::encode(input).unwrap(),
         id: Some(id.to_owned()),
         card: None,
         by: Audience::Model,
@@ -85,7 +85,7 @@ fn asked() -> Vec<Effect> {
 fn answer(call: u64, approved: bool, ticket: u64) -> Event {
     Event::Answer {
         call: id(call),
-        value: approved.into(),
+        value: Json::encode(&approved).unwrap(),
         origin: None,
         ticket: Some(Ticket(ticket)),
     }
@@ -94,7 +94,7 @@ fn answer(call: u64, approved: bool, ticket: u64) -> Event {
 fn answered(call: u64, approved: bool) -> Body {
     Body::Answer {
         call: id(call),
-        value: approved.into(),
+        value: Json::encode(&approved).unwrap(),
         origin: None,
     }
 }
@@ -213,7 +213,7 @@ fn an_interrupt_while_a_call_is_gated_starts_nothing() {
 fn a_gate_answering_later_runs_the_call_when_it_answers() {
     let mut s = Session::new(Reg::echo().policy(Policy::Later).arc());
     s.step(user("$ x"));
-    let gated = Gated::run(Json::new(&json!({ "command": "x" })));
+    let gated = Gated::run(Json::encode(&json!({ "command": "x" })).unwrap());
     s.table(vec![(
         Event::Gated { call: id(2), gated },
         vec![run_bash(2, "x")],
@@ -610,7 +610,7 @@ fn a_failure_no_extension_retries_fails_the_turn() {
 fn command(args: &str) -> Body {
     Body::ToolCall {
         tool: "jobs".into(),
-        input: Json::new(&json!({ "args": args })),
+        input: Json::encode(&json!({ "args": args })).unwrap(),
         id: None,
         card: None,
         by: Audience::User,
@@ -816,7 +816,7 @@ fn a_call_waits_on_the_child_it_links_and_resumes_with_its_result() {
                 Effect::Resume {
                     call: id(2),
                     tool: "task".into(),
-                    input: Json::new(&json!({ "input": "go" })),
+                    input: Json::encode(&json!({ "input": "go" })).unwrap(),
                     value: Json::encode(&done(json!("ok"))).unwrap(),
                 },
             ],
@@ -905,7 +905,7 @@ fn a_child_reports_each_time_it_settles() {
     let (mut s, fx) = Session::resume(Reg::echo().arc(), log([input("hi")]), &load);
     let report = |text: &str| Effect::Report {
         outcome: Outcome::Done {
-            output: text.into(),
+            output: Json::encode(&text).unwrap(),
         },
     };
     assert_eq!(fx.as_slice(), [append(2, said("hi")), report("hi")]);
@@ -1009,7 +1009,7 @@ fn an_agents_refusal_is_logged_as_a_block() {
 #[test]
 fn a_call_waits_on_a_dialog_and_resumes_with_its_answer() {
     let dialog = protocol::WaitOn::Dialog {
-        ui: Json::new(&json!({ "ask": "name?" })),
+        ui: Json::encode(&json!({ "ask": "name?" })).unwrap(),
     };
     echo().table(vec![
         (
@@ -1040,7 +1040,7 @@ fn a_call_waits_on_a_dialog_and_resumes_with_its_answer() {
         (
             Event::Answer {
                 call: id(2),
-                value: "ada".into(),
+                value: Json::encode("ada").unwrap(),
                 origin: None,
                 ticket: None,
             },
@@ -1050,15 +1050,15 @@ fn a_call_waits_on_a_dialog_and_resumes_with_its_answer() {
                     4,
                     Body::Answer {
                         call: id(2),
-                        value: "ada".into(),
+                        value: Json::encode("ada").unwrap(),
                         origin: None,
                     },
                 ),
                 Effect::Resume {
                     call: id(2),
                     tool: "bash".into(),
-                    input: Json::new(&json!({ "command": "ask" })),
-                    value: "ada".into(),
+                    input: Json::encode(&json!({ "command": "ask" })).unwrap(),
+                    value: Json::encode("ada").unwrap(),
                 },
             ],
         ),

@@ -65,7 +65,7 @@ fn run(rig: &Rig, command: &str) -> Ran {
 }
 
 fn model(ran: &Ran) -> String {
-    let llm::Output::Text(text) = Bash::to_model(ran) else {
+    let llm::Output::Text(text) = Bash::to_model(&Json::encode(ran).unwrap()) else {
         panic!("bash answers in text")
     };
     text

@@ -13,12 +13,12 @@ use std::fmt;
 
 use serde::de::{Error as _, MapAccess, SeqAccess, Visitor};
 use serde::{Deserialize, Deserializer};
+use serde_json::Error;
 use serde_json::value::RawValue;
-use serde_json::{Error, Map, Value};
 
 use super::meta::Raw;
 use super::{
-    Assistant, AssistantPart, Finish, Media, Meta, Opaque, Origin, Output, Reason, Reasoning,
+    Assistant, AssistantPart, Finish, Json, Media, Meta, Opaque, Origin, Output, Reason, Reasoning,
     Response, SmolStr, Source, Text, ToolCall, ToolResult, Usage, UserPart,
 };
 use crate::json::{Fields, fields, next};
@@ -39,6 +39,15 @@ impl Response {
             model: reply.model,
             meta: reply.meta.0,
         })
+    }
+}
+
+/// A call's arguments, which are an object.
+fn object(input: Json) -> Result<Json> {
+    if input.raw().starts_with('{') {
+        Ok(input)
+    } else {
+        Err(Error::custom("a call's input is a JSON object"))
     }
 }
 
@@ -320,7 +329,7 @@ struct Part {
     redacted: Option<bool>,
     id: Option<SmolStr>,
     name: Option<SmolStr>,
-    input: Option<Map<String, Value>>,
+    input: Option<Json>,
     invalid: Option<String>,
     provider_executed: Option<bool>,
     output: Option<OutputFields>,
@@ -380,7 +389,7 @@ impl Part {
             "tool_call" => AssistantPart::ToolCall(ToolCall {
                 id: required(self.id, "id")?,
                 name: required(self.name, "name")?,
-                input: required(self.input, "input")?,
+                input: object(required(self.input, "input")?)?,
                 invalid: self.invalid,
                 provider_executed: self.provider_executed.unwrap_or(false),
                 meta,
@@ -430,12 +439,11 @@ impl OutputFields {
         const KINDS: &[&str] = &["text", "json", "content"];
         let kind = required(self.kind, "type")?;
         let value = required(self.value, "value")?;
-        let value = value.get();
         Ok(match kind.as_str() {
-            "text" => Output::Text(serde_json::from_str(value)?),
-            "json" => Output::Json(serde_json::from_str(value)?),
+            "text" => Output::Text(serde_json::from_str(value.get())?),
+            "json" => Output::Json(Json::from(value)),
             "content" => {
-                let parts: Vec<UserFields> = serde_json::from_str(value)?;
+                let parts: Vec<UserFields> = serde_json::from_str(value.get())?;
                 let parts = parts.into_iter().map(UserFields::build);
                 let mut parts = parts.collect::<Result<Vec<_>>>()?;
                 parts.shrink_to_fit();

@@ -295,8 +295,11 @@ pub trait Tool: Send + Sync + 'static {
     /// partial outputs are its progress.
     fn call(&self, input: &Self::In, cx: &Cx) -> impl Send;
 
-    fn to_model(output: &Self::Out) -> llm::Output {
-        llm::Output::Json(serde_json::to_value(output).unwrap_or_default())
+    /// What the model sees of a stored output: by default the output as
+    /// it was stored, its text sent as it is. A tool that tells the model
+    /// something else reads the output it stored ([`Json::parse`]).
+    fn to_model(output: &Json) -> llm::Output {
+        llm::Output::Json(output.clone())
     }
 
     /// How clients show a call; pure, so a replay shows the same.
@@ -444,9 +447,7 @@ where
     }
 
     fn to_model(&self, output: &Json) -> llm::Output {
-        output
-            .parse::<T::Out>()
-            .map_or_else(|_| llm::Output::Json(output.value()), |o| T::to_model(&o))
+        T::to_model(output)
     }
 
     fn present(&self, input: &Parsed) -> Option<Card> {

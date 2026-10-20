@@ -1,8 +1,9 @@
 //! Transcript items as rows: messages, replies, and tool call cards.
 
-use protocol::view::{Item, Phase, Status, call_title, decision_line, output_text};
+use protocol::view::{self, Item, Phase, Status, call_title, decision_line, output_text};
 use protocol::{Audience, Json, Outcome};
-use serde_json::Value;
+use serde::Deserialize;
+use serde::de::IgnoredAny;
 
 use ratatui_core::style::{Color, Modifier, Style};
 
@@ -99,7 +100,7 @@ pub fn rows(item: &Item, width: usize, look: Look) -> Vec<Line> {
             &Card {
                 call: *call,
                 title: call_title(tool, input, shown.as_ref()),
-                input: input.value().get("command").is_none().then_some(input),
+                input: view::command(input).is_none().then_some(input),
                 phase: item.phase().unwrap_or(Phase::Running),
                 outcome: outcome.as_ref(),
                 shown: shown.as_ref(),
@@ -239,7 +240,7 @@ fn card(c: &Card, width: usize, look: Look) -> Vec<Line> {
                 .map(|(_, note)| note)
                 .filter(|note| !note.is_empty())
                 .unwrap_or_else(|| "done".to_owned());
-            if failed(&output.value()) {
+            if failed(output) {
                 (format!("✗ {note}"), BAD)
             } else {
                 (format!("✓ {note}"), OK)
@@ -303,11 +304,20 @@ fn card(c: &Card, width: usize, look: Look) -> Vec<Line> {
 
 /// Whether a finished command did not succeed: a nonzero exit, a signal,
 /// a timeout or an interrupt.
-fn failed(output: &Value) -> bool {
-    output["exit"].as_i64().is_some_and(|code| code != 0)
-        || !output["signal"].is_null()
-        || !output["timed_out"].is_null()
-        || output["aborted"] == true
+fn failed(output: &Json) -> bool {
+    #[derive(Default, Deserialize)]
+    #[serde(default)]
+    struct Ended {
+        exit: Option<i64>,
+        signal: Option<IgnoredAny>,
+        timed_out: Option<IgnoredAny>,
+        aborted: Option<bool>,
+    }
+    let ended = output.parse::<Ended>().unwrap_or_default();
+    ended.exit.is_some_and(|code| code != 0)
+        || ended.signal.is_some()
+        || ended.timed_out.is_some()
+        || ended.aborted == Some(true)
 }
 
 /// A call's output rows behind the card's `│` gutter; a diff colored as one.
@@ -336,14 +346,10 @@ fn output_rows(c: &Card, width: usize, verbose: bool) -> Vec<Line> {
                     add(text, Style::new(), text.starts_with("@@ "));
                 }
             }
-            None => match output.value() {
-                Value::Null => {}
-                output => {
-                    let text = output
-                        .as_str()
-                        .map_or_else(|| output.to_string(), str::to_owned);
-                    add(&text, Style::new(), false);
-                }
+            None if output.raw() == "null" => {}
+            None => match output.parse::<String>() {
+                Ok(text) => add(&text, Style::new(), false),
+                Err(_) => add(output.raw(), Style::new(), false),
             },
         },
         Some(Outcome::Failed { error }) => add(error, BAD, false),
@@ -373,7 +379,7 @@ mod tests {
         Item::Tool {
             call: 7,
             tool: "bash".into(),
-            input: json!({"command": "ls"}).into(),
+            input: Json::encode(&json!({"command": "ls"})).unwrap(),
             approval,
             outcome,
             card: None,
@@ -385,7 +391,7 @@ mod tests {
     fn a_finished_card_shows_its_exit_and_output_tail() {
         let stdout = (1..=15).fold(String::new(), |s, n| s + &format!("line {n}\n"));
         let done = Outcome::Done {
-            output: json!({"output": stdout, "exit": 0}).into(),
+            output: Json::encode(&json!({"output": stdout, "exit": 0})).unwrap(),
         };
         let mut finished = tool(Some(done.clone()), None);
         if let Item::Tool { card, .. } = &mut finished {
@@ -468,7 +474,7 @@ mod tests {
     #[test]
     fn command_output_escapes_are_stripped() {
         let done = Outcome::Done {
-            output: json!({"output": "\x1b[31mred\x1b[0m\n", "exit": 1}).into(),
+            output: Json::encode(&json!({"output": "\x1b[31mred\x1b[0m\n", "exit": 1})).unwrap(),
         };
         let mut ran = tool(Some(done), None);
         if let Item::Tool { card, .. } = &mut ran {
@@ -487,10 +493,10 @@ mod tests {
         let item = Item::Tool {
             call: 7,
             tool: "edit".into(),
-            input: json!({"path": "a.txt", "edits": []}).into(),
+            input: Json::encode(&json!({"path": "a.txt", "edits": []})).unwrap(),
             approval: None,
             outcome: Some(Outcome::Done {
-                output: json!({"path": "a.txt"}).into(),
+                output: Json::encode(&json!({"path": "a.txt"})).unwrap(),
             }),
             card: Some(protocol::Card {
                 title: "edit a.txt".into(),

@@ -5,6 +5,7 @@ edition.workspace = true
 publish.workspace = true
 
 [dependencies]
+json.workspace = true
 serde.workspace = true
 serde_json = { workspace = true, features = ["raw_value"] }
 uuid.workspace = true

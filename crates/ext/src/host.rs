@@ -101,7 +101,7 @@ impl Toolset {
         match outcome {
             Outcome::Done { output } => (
                 self.get(name)
-                    .map_or_else(|| llm::Output::Json(output.value()), |t| t.to_model(output)),
+                    .map_or_else(|| llm::Output::Json(output.clone()), |t| t.to_model(output)),
                 false,
             ),
             Outcome::Failed { error } => (llm::Output::Text(error.clone()), true),

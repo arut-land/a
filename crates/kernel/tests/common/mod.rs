@@ -196,7 +196,7 @@ impl Registry for Reg {
             },
             Policy::Allow | Policy::Ask(_) | Policy::Deny(_) => Gated::run(input.clone()),
             Policy::RewriteThenDeny => {
-                let rewritten = Json::new(&json!({ "rewritten": true }));
+                let rewritten = Json::encode(&json!({ "rewritten": true })).unwrap();
                 Gated {
                     input: rewritten.clone(),
                     decisions: vec![
@@ -259,7 +259,7 @@ impl Agent for Echo {
         };
         let call = |tool: &str, input: Value| Action::Call {
             tool: tool.to_owned(),
-            input: Json::new(&input),
+            input: Json::encode(&input).unwrap(),
             id: None,
         };
         let action = if let Some(command) = text.strip_prefix("$ ") {
@@ -306,7 +306,7 @@ impl Agent for Modeled {
                 outcome: Outcome::Done { output },
                 ..
             } => {
-                let calls: Vec<Value> = output.value()["calls"]
+                let calls: Vec<Value> = output.parse::<Value>().unwrap()["calls"]
                     .as_array()
                     .cloned()
                     .unwrap_or_default();
@@ -315,7 +315,7 @@ impl Agent for Modeled {
                     .into_iter()
                     .map(|c| Action::Call {
                         tool: c["tool"].as_str().unwrap().to_owned(),
-                        input: Json::new(&c["input"]),
+                        input: Json::encode(&c["input"]).unwrap(),
                         id: c["id"].as_str().map(str::to_owned),
                     })
                     .collect()
@@ -427,7 +427,7 @@ pub const fn interrupt() -> Event {
 pub fn approve(call: u64, approved: bool) -> Event {
     Event::Answer {
         call: id(call),
-        value: approved.into(),
+        value: Json::encode(&approved).unwrap(),
         origin: None,
         ticket: None,
     }
@@ -463,7 +463,7 @@ pub fn response(calls: &[(&str, Value)]) -> Json {
             llm::AssistantPart::ToolCall(llm::ToolCall {
                 id: format!("c{i}").into(),
                 name: (*tool).into(),
-                input: input.as_object().cloned().unwrap_or_default(),
+                input: Json::encode(input).unwrap(),
                 invalid: None,
                 provider_executed: false,
                 meta: llm::Meta::new(),
@@ -489,7 +489,7 @@ pub fn reply(calls: &[(&str, Value)]) -> Json {
     let calls: Vec<Value> = (calls.iter().enumerate())
         .map(|(i, (tool, input))| json!({ "tool": tool, "input": input, "id": format!("c{i}") }))
         .collect();
-    Json::new(&json!({ "calls": calls }))
+    Json::encode(&json!({ "calls": calls })).unwrap()
 }
 
 pub fn author(seq: u64) -> Author {
@@ -560,7 +560,7 @@ pub fn said(text: &str) -> Body {
 pub fn tool_call(tool: &str, input: Value) -> Body {
     Body::ToolCall {
         tool: tool.to_owned(),
-        input: Json::new(&input),
+        input: Json::encode(&input).unwrap(),
         id: None,
         card: None,
         by: Audience::Model,
@@ -611,7 +611,7 @@ pub fn permission(call: u64, permission: Permission) -> Body {
 
 pub fn done(output: Value) -> Outcome {
     Outcome::Done {
-        output: Json::new(&output),
+        output: Json::encode(&output).unwrap(),
     }
 }
 
@@ -627,7 +627,7 @@ pub fn run_tool(call: u64, tool: &str, input: Value) -> Effect {
     Effect::RunTool {
         call: id(call),
         tool: tool.to_owned(),
-        input: Json::new(&input),
+        input: Json::encode(&input).unwrap(),
         parsed: None,
     }
 }

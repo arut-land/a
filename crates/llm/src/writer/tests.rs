@@ -81,7 +81,7 @@ fn arguments(parts: &[AssistantPart]) -> Vec<(String, Value)> {
         .iter()
         .filter_map(|part| match part {
             AssistantPart::ToolCall(call) => {
-                Some((call.id.to_string(), Value::Object(call.input.clone())))
+                Some((call.id.to_string(), call.input.parse::<Value>().unwrap()))
             }
             _ => None,
         })

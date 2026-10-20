@@ -330,10 +330,8 @@ fn round(turn: usize, size: usize, origin: &Origin) -> [Message; 2] {
                 AssistantPart::ToolCall(ToolCall {
                     id: id.clone(),
                     name: "bash".into(),
-                    input: serde_json::json!({"command": "cat notes.md"})
-                        .as_object()
-                        .cloned()
-                        .unwrap_or_default(),
+                    input: llm::Json::encode(&serde_json::json!({"command": "cat notes.md"}))
+                        .unwrap(),
                     invalid: None,
                     provider_executed: false,
                     meta: llm::Meta::new(),

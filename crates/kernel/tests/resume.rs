@@ -145,7 +145,7 @@ fn an_unsafe_call_gated_before_a_crash_is_never_run_twice() {
 /// crash is not logged again.
 #[test]
 fn a_gate_cut_off_by_a_crash_logs_its_decisions_once() {
-    let rewritten = Json::new(&json!({ "rewritten": true }));
+    let rewritten = Json::encode(&json!({ "rewritten": true })).unwrap();
     let pre = decision("policy", Some(2), Verdict::PreTool { input: rewritten });
     let reg = Reg::echo().policy(Policy::RewriteThenDeny);
     let (_, fx) = resume(reg, [input("$ echo hi"), bash("echo hi"), pre], &BUSY_LOAD);
@@ -172,7 +172,7 @@ fn a_wait_survives_a_restart_and_runs_once_answered() {
     assert_eq!(fx, [IDLE], "waiting is not work");
     let answered = Body::Answer {
         call: id(2),
-        value: true.into(),
+        value: Json::encode(&true).unwrap(),
         origin: None,
     };
     s.table(vec![(
@@ -367,7 +367,7 @@ fn a_call_whose_child_settled_before_a_crash_resumes_with_its_result() {
         [Effect::Resume {
             call: id(2),
             tool: "task".into(),
-            input: Json::new(&task),
+            input: Json::encode(&task).unwrap(),
             value: Json::encode(&ok).unwrap(),
         }]
     );
@@ -377,7 +377,7 @@ fn a_call_whose_child_settled_before_a_crash_resumes_with_its_result() {
 fn a_command_cut_off_is_not_run_again() {
     let command = Body::ToolCall {
         tool: "jobs".into(),
-        input: Json::new(&json!({ "args": "" })),
+        input: Json::encode(&json!({ "args": "" })).unwrap(),
         id: None,
         card: None,
         by: protocol::Audience::User,

@@ -257,7 +257,7 @@ fn custom_tool_input_streams_as_its_json_object() {
     });
     let (id, input) = call.expect("the call ends");
     assert_eq!(id, "call_1");
-    assert_eq!(Value::Object(input), json!({"input": "say \"hi\"\n"}));
+    assert_eq!(input.raw(), r#"{"input":"say \"hi\"\n"}"#);
 }
 
 /// Without output indices, items are told apart by id and by order, and

@@ -201,7 +201,7 @@ fn shared_fields_rebuild_as_gemini_takes_them() {
             AssistantPart::ToolCall(ToolCall {
                 id: "call-1".into(),
                 name: "lookup".into(),
-                input: json!({"q": 1}).as_object().cloned().unwrap_or_default(),
+                input: crate::Json::encode(&json!({"q": 1})).unwrap(),
                 invalid: None,
                 provider_executed: false,
                 meta: Meta::new(),
@@ -409,12 +409,14 @@ fn mixed_images_and_values_keep_their_order() {
             json!({"result": "{\"status\":\"ok\"}"}),
         ),
         (
-            Output::Json(json!({"status": "ok"})),
+            Output::Json(crate::Json::encode(&json!({"status": "ok"})).unwrap()),
             json!({"result": {"status": "ok"}}),
         ),
         // A structured value stays literal, `$ref` and all.
         (
-            Output::Json(json!({"literal": {"$ref": "tool_result_image_0"}})),
+            Output::Json(
+                crate::Json::encode(&json!({"literal": {"$ref": "tool_result_image_0"}})).unwrap(),
+            ),
             json!({"result": {"literal": {"$ref": "tool_result_image_0"}}}),
         ),
     ];

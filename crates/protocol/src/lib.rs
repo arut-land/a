@@ -23,7 +23,6 @@ const MAX_FRAME: u32 = 16 * 1024 * 1024;
 
 #[macro_use]
 mod decode;
-mod json;
 pub mod ledger;
 pub mod view;
 
@@ -1474,7 +1473,7 @@ mod tests {
             },
             Body::Answer {
                 call: CallId::new(4).unwrap(),
-                value: true.into(),
+                value: Json::encode(&true).unwrap(),
                 origin: Some(author),
             },
             Body::Interrupt {
@@ -1538,7 +1537,7 @@ mod tests {
         assert_eq!(serde_json::to_string(&e).unwrap(), line);
         let carded = Body::ToolCall {
             tool: "bash".into(),
-            input: serde_json::json!({ "command": "ls" }).into(),
+            input: Json::encode(&serde_json::json!({ "command": "ls" })).unwrap(),
             id: None,
             by: Audience::Model,
             card: Some(Card {
@@ -1553,7 +1552,7 @@ mod tests {
         let ext = Body::Ext {
             ext: "shell".into(),
             state: "cwd".into(),
-            data: serde_json::json!("/w").into(),
+            data: Json::encode("/w").unwrap(),
         };
         assert_eq!(
             serde_json::to_string(&ext).unwrap(),

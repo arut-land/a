@@ -40,6 +40,7 @@ mod tool;
 
 pub use agent::{Action, Actions, Agent, Input};
 pub use ext::{DynExtension, Extension, Facts, Place, Refused, Registrar, Text, Tier};
+pub use llm::Json;
 pub use r#loop::{Defaults, LOOP, Loop, LoopPoints, Resume, StepLimit};
 pub use point::{Answer, Asked, Chained, Gate, Gated, Gating, Later, PointCx, Recover, Rewrite};
 pub use schema::Schema;
@@ -90,7 +91,7 @@ mod tests {
     fn a_childs_result_is_cut_for_the_model() {
         let long = "é".repeat(CHILD_RESULT_LIMIT);
         let text = child_result(&Outcome::Done {
-            output: long.into(),
+            output: Json::encode(&long).unwrap(),
         });
         let (shown, note) = text.rsplit_once('\n').unwrap();
         assert!(shown.len() <= CHILD_RESULT_LIMIT);

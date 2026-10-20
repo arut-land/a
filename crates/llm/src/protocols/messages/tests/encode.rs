@@ -74,10 +74,9 @@ fn with_item(mut part: AssistantPart, item: &Value) -> AssistantPart {
     part
 }
 
-fn call(id: &str, name: &str, input: Value) -> AssistantPart {
-    let Value::Object(input) = input else {
-        panic!("arguments are an object");
-    };
+fn call(id: &str, name: &str, input: &Value) -> AssistantPart {
+    assert!(input.is_object(), "arguments are an object");
+    let input = crate::Json::encode(input).unwrap();
     AssistantPart::ToolCall(ToolCall {
         id: id.into(),
         name: name.into(),
@@ -203,7 +202,7 @@ fn sonnet_5_5_defers_a_system_message_past_tool_results() {
             SONNET_5_5,
             vec![
                 Message::user("Look it up."),
-                native(vec![call("toolu_1", "add", json!({}))]),
+                native(vec![call("toolu_1", "add", &json!({}))]),
                 Message::system("Answer in Spanish."),
                 answer("toolu_1", "ok"),
             ],
@@ -251,7 +250,7 @@ fn current_provider_items_replay_verbatim() {
             }),
             &redacted,
         ),
-        with_item(call("toolu_1", "add", json!({"x": 1})), &use_),
+        with_item(call("toolu_1", "add", &json!({"x": 1})), &use_),
         with_item(AssistantPart::Text(Text::new("Two.")), &cited),
     ];
     let mut history = vec![Message::user("go"), native(content)];
@@ -343,7 +342,7 @@ fn media_goes_in_exactly_the_forms_anthropic_takes() {
         assert_eq!(user_media(image.clone()).is_ok(), carried, "{image:?}");
         let result = last(vec![
             Message::user("shoot"),
-            native(vec![call("toolu_1", "shot", json!({}))]),
+            native(vec![call("toolu_1", "shot", &json!({}))]),
             Message::Tool(crate::ToolMessage {
                 results: vec![crate::ToolResult {
                     id: "toolu_1".into(),
@@ -436,7 +435,7 @@ fn answered(turn: Assistant) -> Value {
 fn edit_calls(turn: &mut Assistant) {
     for part in &mut turn.content {
         if let AssistantPart::ToolCall(call) = part {
-            call.input = json!({"x": 5}).as_object().cloned().unwrap_or_default();
+            call.input = crate::Json::encode(&json!({"x": 5})).unwrap();
         }
     }
 }
@@ -524,7 +523,7 @@ fn tool_results_lead_a_merged_user_message() {
         SONNET_4_6,
         vec![
             Message::user("add"),
-            native(vec![call("toolu_1", "add", json!({"x": 1}))]),
+            native(vec![call("toolu_1", "add", &json!({"x": 1}))]),
             answer("toolu_1", "2"),
             Message::user("also this"),
         ],
@@ -705,7 +704,7 @@ fn adversarial_histories_encode_to_requests_anthropic_takes() {
         })
     };
     let text = |text: &str| AssistantPart::Text(Text::new(text));
-    let calls = || call("x", "lookup", json!({}));
+    let calls = || call("x", "lookup", &json!({}));
     let cases: Vec<(&str, Vec<Message>)> = vec![
         (
             "system between assistants",

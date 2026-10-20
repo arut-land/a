@@ -11,9 +11,10 @@
 //! nothing of the session, so a replay asks them what the live run did.
 
 use std::cmp::Ordering;
+use std::collections::BTreeMap;
 
-use protocol::{Json, Outcome, ToolChoice};
-use serde_json::Value;
+use protocol::{Outcome, ToolChoice};
+use serde_json::value::RawValue;
 
 use crate::point::{self, Hooks};
 use crate::{Action, Actions, Agent, Extension, Input, Registrar};
@@ -151,7 +152,7 @@ impl Loop {
         (reply.message.tool_calls())
             .map(|call| {
                 let (tool, id) = (call.name.to_string(), Some(call.id.to_string()));
-                let input = Json::encode(&call.input).unwrap_or_default();
+                let input = call.input.clone();
                 match self.refusal(call) {
                     Some(why) => Action::Refuse {
                         tool,
@@ -169,7 +170,8 @@ impl Loop {
     /// did not parse, or it came in the turn's last reply.
     fn refusal(&self, call: &llm::ToolCall) -> Option<String> {
         if let Some(text) = &call.invalid {
-            let why = serde_json::from_str::<serde_json::Map<String, Value>>(text)
+            // Why the text is no object, as reading one says.
+            let why = serde_json::from_str::<BTreeMap<String, &RawValue>>(text)
                 .err()
                 .map_or_else(|| "not an object".to_owned(), |e| e.to_string());
             return Some(format!(
