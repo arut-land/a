@@ -188,6 +188,7 @@ pub enum Show {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum Notice {
     NotConnected,
+    Backpressure,
     /// A steer or an interrupt while no turn runs.
     NothingRunning,
     /// An answer for a call that is not waiting for one.
@@ -203,6 +204,7 @@ impl fmt::Display for Notice {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Self::NotConnected => f.write_str("not connected"),
+            Self::Backpressure => f.write_str("waiting for the daemon to acknowledge pending input"),
             Self::NothingRunning => f.write_str("nothing is running"),
             Self::NotAsking(call) => write!(f, "call {call} is not waiting for an answer"),
             Self::RemoteEnv => f.write_str(
@@ -309,10 +311,12 @@ impl SessionClient {
     /// What this client may ask of the session now; nothing unless
     /// attached, now or once reconnected.
     pub fn offer(&mut self) -> Result<Offer<'_>, Notice> {
-        if self.link.attached() {
-            Ok(Offer(self))
-        } else {
+        if !self.link.attached() {
             Err(Notice::NotConnected)
+        } else if self.unanswered.len() + self.queued.len() >= UNANSWERED {
+            Err(Notice::Backpressure)
+        } else {
+            Ok(Offer(self))
         }
     }
 
@@ -399,9 +403,6 @@ impl SessionClient {
         if let Some(seq @ None) = msg.client_seq_mut() {
             self.seq += 1;
             *seq = Some(self.seq);
-            if self.unanswered.len() == UNANSWERED {
-                self.unanswered.pop_front();
-            }
             self.unanswered.push_back(msg.clone());
         }
         out.push(Effect::Io(Io::Send(msg)));
@@ -808,6 +809,26 @@ mod tests {
             ] if one == "one" && two == "two"),
             "{out:?}"
         );
+    }
+
+    #[test]
+    fn unanswered_mutations_are_never_evicted_by_new_input() {
+        let (mut client, _) = attached(Env::Keep);
+        for n in 0..UNANSWERED {
+            assert_eq!(sends(&client.run(Cmd::Input(n.to_string()))).len(), 1);
+        }
+        let out = client.run(Cmd::Input("overflow".into()));
+        assert!(sends(&out).is_empty(), "{out:?}");
+        assert_eq!(notices(&out).len(), 1, "{out:?}");
+        client.step(msg(1, DaemonMsg::Draining));
+        client.step(closed(1));
+        let out = client.step(live(2, Caps::ALL));
+        let replay = sends(&out);
+        assert_eq!(replay.len(), UNANSWERED);
+        assert_eq!(replay[0].client_seq(), Some(1));
+        client.step(msg(2, DaemonMsg::Ack { client_seq: 1 }));
+        let out = client.run(Cmd::Input("accepted".into()));
+        assert_eq!(sends(&out)[0].client_seq(), Some(65));
     }
 
     #[test]
