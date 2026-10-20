@@ -22,7 +22,6 @@ use crate::store::{Header, LogStore};
 /// A session as it lists.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Record {
-    #[serde(flatten)]
     pub header: Header,
     /// Work is in flight, or a call waits on someone: the next daemon
     /// loads the session at once, to recover it or to show what it asks.

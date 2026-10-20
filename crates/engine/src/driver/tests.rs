@@ -1949,7 +1949,7 @@ fn one_fsync_per_burst() {
     assert_eq!(*lock(&probe.batches), [1, 2, 10]);
 }
 
-/// The busy marker is set and cleared in the blocking hop of the commit
+/// The busy mark is set and cleared in the blocking hop of the commit
 /// that starts and ends the work: before its entries, and after them.
 #[test]
 fn the_busy_mark_rides_its_commit() {

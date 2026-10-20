@@ -565,7 +565,7 @@ impl Daemon {
 
     /// Hands child `child`'s result to session `parent`, unless it is
     /// unloaded: a session with a watch armed has work, so it is loaded
-    /// (at startup, by its busy marker), and one with none has heard from
+    /// (at startup, marked busy in the catalog), and one with none has heard from
     /// every child it watched.
     async fn report(&self, parent: SessionId, child: SessionId, outcome: Outcome) {
         let Some(slot) = self.slot(parent) else {

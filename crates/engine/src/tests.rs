@@ -121,7 +121,7 @@ fn idle_sessions_hibernate_and_reload_on_attach() {
     };
     let latest = daemon.attach_to(&mine, || "/w".into());
     let missing = daemon.attach_to(&mine, || "/x".into());
-    // The reloaded session's recovery pass touches its busy marker.
+    // The reloaded session's recovery pass may relist it in the catalog.
     settle(&daemon);
     std::fs::remove_dir_all(&root).unwrap();
 
