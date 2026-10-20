@@ -1,10 +1,9 @@
 //! The session catalog: what the daemon lists, and which sessions it
 //! recovers at once, without opening a log. It is derived: the daemon, the
-//! one writer, appends a line each time a session's listing changes (it is
-//! made, its work begins or ends, what it waits on changes, it unloads),
-//! never syncs it, and rewrites it whole once it is mostly old lines. A
-//! catalog that is missing, or older than the newest log, is rebuilt from
-//! the logs, which are the truth; so is a torn line, which is skipped.
+//! one writer, appends changes without syncing. A durable dirty marker
+//! precedes use; only an orderly shutdown syncs the complete catalog and
+//! removes the marker. An unclean or unreadable catalog is rebuilt from
+//! the logs, which are the truth.
 
 use std::collections::BTreeMap;
 use std::fs::{self, File, OpenOptions};
@@ -85,14 +84,17 @@ impl Catalog {
         Self::with(None, State::default())
     }
 
-    /// The catalog at `path` of the logs `store` keeps in `logs`: read, or
-    /// rebuilt from the logs when it is missing or older than the newest.
-    pub fn open(path: PathBuf, logs: &Path, store: &dyn LogStore) -> io::Result<Self> {
-        let modified = |p: &Path| fs::metadata(p).and_then(|m| m.modified()).ok();
-        let fresh = modified(&path)
-            .zip(modified(logs))
-            .is_some_and(|(catalog, logs)| catalog >= logs);
-        let read = fresh.then(|| read(&path)).transpose()?;
+    /// The catalog at `path` of the logs `store` keeps: read, or
+    /// rebuilt from the logs unless the last daemon left it clean.
+    pub fn open(path: PathBuf, store: &dyn LogStore) -> io::Result<Self> {
+        let dirty = path.with_extension("dirty");
+        let read = match fs::exists(&dirty) {
+            Ok(false) => read(&path).ok(),
+            _ => None,
+        };
+        // No log may change while a clean catalog can survive a crash.
+        File::create(&dirty)?.sync_all()?;
+        sys::fs::sync_dir(path.parent().unwrap())?;
         let rebuilt = read.is_none();
         let catalog = Self::with(Some(path), read.map_or_else(|| rebuild(store), Ok)?);
         let mut state = lock(&catalog.state);
@@ -103,6 +105,19 @@ impl Catalog {
         }
         drop(state);
         Ok(catalog)
+    }
+
+    /// Called only once all session writers have stopped. Rewriting avoids
+    /// trusting an earlier best-effort append that may have failed.
+    pub fn clean(&self) -> io::Result<()> {
+        let Some(path) = &self.path else {
+            return Ok(());
+        };
+        let mut state = lock(&self.state);
+        state.file = Some(rewrite(path, &state)?);
+        state.lines = state.records.len();
+        fs::remove_file(path.with_extension("dirty"))?;
+        sys::fs::sync_dir(path.parent().unwrap())
     }
 
     fn with(path: Option<PathBuf>, state: State) -> Self {
@@ -156,16 +171,7 @@ impl Catalog {
     /// leaves the old one or the new.
     fn compact(&self, state: &mut State) {
         let Some(path) = &self.path else { return };
-        let written = (|| {
-            let new = path.with_extension("new");
-            let mut lines = Vec::new();
-            for record in state.records.values() {
-                lines.extend(line(record)?);
-            }
-            fs::write(&new, lines)?;
-            sys::fs::replace(&new, path)?;
-            OpenOptions::new().append(true).open(path)
-        })();
+        let written = rewrite(path, state);
         match written {
             Ok(file) => {
                 state.file = Some(file);
@@ -193,9 +199,8 @@ fn line(record: &Record) -> io::Result<Vec<u8>> {
 fn read(path: &Path) -> io::Result<State> {
     let mut state = State::default();
     for line in BufReader::new(File::open(path)?).split(b'\n') {
-        if let Ok(record) = serde_json::from_slice::<Record>(&line?) {
-            state.records.insert(record.header.id.0.as_u128(), record);
-        }
+        let record: Record = serde_json::from_slice(&line?)?;
+        state.records.insert(record.header.id.0.as_u128(), record);
         state.lines += 1;
     }
     Ok(state)
@@ -226,4 +231,16 @@ fn rebuild(store: &dyn LogStore) -> io::Result<State> {
         state.records.insert(record.header.id.0.as_u128(), record);
     }
     Ok(state)
+}
+
+fn rewrite(path: &Path, state: &State) -> io::Result<File> {
+    let new = path.with_extension("new");
+    let mut file = File::create(&new)?;
+    for record in state.records.values() {
+        file.write_all(&line(record)?)?;
+    }
+    file.sync_all()?;
+    sys::fs::replace(&new, path)?;
+    sys::fs::sync_dir(path.parent().unwrap())?;
+    OpenOptions::new().append(true).open(path)
 }

@@ -321,7 +321,7 @@ impl Daemon {
     /// once, together, to recover.
     fn load(home: &Home, config: &Config) -> io::Result<Owner> {
         let store = Arc::new(Jsonl::open(home.sessions_dir())?);
-        let catalog = Catalog::open(home.catalog_file(), &home.sessions_dir(), &*store)?;
+        let catalog = Catalog::open(home.catalog_file(), &*store)?;
         let records = catalog.records();
         let busy: Vec<bool> = records.iter().map(|r| r.busy).collect();
         let slots: Vec<_> = (records.into_iter())
@@ -705,6 +705,13 @@ impl Daemon {
                 })
                 .collect();
             if ending.is_empty() {
+                let shared = Arc::clone(&self.shared);
+                rt::unblock(&*Arc::clone(&shared.rt), move || {
+                    if let Err(e) = shared.catalog.clean() {
+                        eprintln!("the session catalog: {e}");
+                    }
+                })
+                .await;
                 return;
             }
             let all = async {
