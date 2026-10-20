@@ -73,6 +73,7 @@ struct Inner {
     client: ClientId,
     /// The newest connection asked for, and its write half once it is up.
     latest: AtomicU64,
+    cancelled: AtomicU64,
     writer: Mutex<Option<(ConnId, Writer)>>,
     /// This client's environment, for `/env refresh`.
     origin: Box<Origin>,
@@ -100,6 +101,7 @@ impl Driver {
             daemon,
             client: ClientId::new(),
             latest: AtomicU64::new(0),
+            cancelled: AtomicU64::new(0),
             writer: Mutex::new(None),
             origin: Box::new(origin),
             sink: Box::new(sink),
@@ -134,7 +136,13 @@ impl Driver {
                 self.write(&ClientMsg::Environment(env))
             }
             Io::Hangup => {
-                lock(&self.0.writer).take();
+                let mut slot = lock(&self.0.writer);
+                self.0
+                    .cancelled
+                    .fetch_max(self.0.latest.load(Ordering::Acquire), Ordering::AcqRel);
+                if let Some((_, mut writer)) = slot.take() {
+                    let _ = writer.send(&ClientMsg::Detach);
+                }
                 Ok(())
             }
         }
@@ -165,13 +173,7 @@ impl Driver {
                 }),
             _ => daemon.connect_as(client, &on_drain, &first),
         };
-        let Connection {
-            mut reader,
-            mut writer,
-            remote,
-            welcome,
-            commands,
-        } = match made {
+        let connection = match made {
             Ok(c) => c,
             Err(e) => {
                 return sink(match &daemon.endpoint {
@@ -182,10 +184,24 @@ impl Driver {
                 });
             }
         };
+        self.install(conn, connection);
+    }
+
+    fn install(&self, conn: ConnId, connection: Connection) {
+        let sink = |kind| (self.0.sink)(self, Event { conn, kind });
+        let Connection {
+            mut reader,
+            mut writer,
+            remote,
+            welcome,
+            commands,
+        } = connection;
         {
             let mut slot = lock(&self.0.writer);
             // Replaced while it was being made.
-            if conn.0 < self.0.latest.load(Ordering::Acquire) {
+            if conn.0 < self.0.latest.load(Ordering::Acquire)
+                || conn.0 <= self.0.cancelled.load(Ordering::Acquire)
+            {
                 let _ = writer.send(&ClientMsg::Detach);
                 return;
             }
@@ -196,10 +212,16 @@ impl Driver {
             remote: remote.is_some(),
             commands,
         });
+        if conn.0 <= self.0.cancelled.load(Ordering::Acquire) {
+            return;
+        }
         let driver = self.clone();
         thread::spawn(move || {
             let why = loop {
                 match reader.recv() {
+                    Ok(Some(_)) if conn.0 <= driver.0.cancelled.load(Ordering::Acquire) => {
+                        break Error::Closed;
+                    }
                     Ok(Some(msg)) => (driver.0.sink)(
                         &driver,
                         Event {
@@ -211,6 +233,7 @@ impl Driver {
                     Err(e) => break e.into(),
                 }
             };
+            drop(reader);
             {
                 let mut slot = lock(&driver.0.writer);
                 if slot.as_ref().is_some_and(|(c, _)| *c == conn) {
@@ -231,6 +254,191 @@ impl Driver {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_hung_up_connection_never_installs_after_a_late_hello() {
+        use protocol::{Caps, DaemonMsg, Target, read_frame, write_frame};
+        use std::sync::mpsc;
+        use sys::Home;
+
+        let root = std::env::temp_dir().join(format!("a-late-hello-{:?}", ClientId::new()));
+        std::fs::create_dir_all(&root).unwrap();
+        let home = Home::from(root.join("home"));
+        let exe = root.join("a");
+        std::fs::write(&exe, "never run").unwrap();
+        let staged = home.runtime().stage(&exe).unwrap();
+        let listener = home.bind().unwrap();
+        let (tx, rx) = mpsc::channel();
+        let driver = Driver::new(Daemon::local(home.clone(), staged), move |_, event| {
+            tx.send(event).unwrap();
+        });
+        let opener = driver.clone();
+        let opening = thread::spawn(move || {
+            opener.connect(
+                ConnId(1),
+                &Attach::new(Target::New, crate::Env::Keep),
+                false,
+            );
+        });
+        let mut peer = listener.accept().unwrap();
+        assert!(matches!(
+            read_frame::<ClientMsg>(&mut peer).unwrap(),
+            Some(ClientMsg::Hello { .. })
+        ));
+        assert!(matches!(
+            read_frame::<ClientMsg>(&mut peer).unwrap(),
+            Some(ClientMsg::Attach { .. })
+        ));
+        driver.io(Io::Hangup).unwrap();
+        write_frame(
+            &mut peer,
+            &DaemonMsg::Welcome {
+                proto: protocol::PROTO,
+                build: "test".into(),
+                caps: Caps::ALL,
+                commands: Vec::new(),
+            },
+        )
+        .unwrap();
+        opening.join().unwrap();
+        assert!(rx.try_recv().is_err());
+        let installed = lock(&driver.0.writer).is_some();
+        drop(peer);
+        drop(listener);
+        home.endpoint().remove();
+        std::fs::remove_dir_all(root).unwrap();
+        assert!(!installed, "a cancelled opener installed its writer");
+    }
+
+    #[test]
+    fn hangup_during_connection_publication_ends_the_reader() {
+        use protocol::{Caps, DaemonMsg, Target, read_frame, write_frame};
+        use std::sync::mpsc;
+        use sys::Home;
+
+        let root = std::env::temp_dir().join(format!("a-publish-hangup-{:?}", ClientId::new()));
+        std::fs::create_dir_all(&root).unwrap();
+        let home = Home::from(root.join("home"));
+        let exe = root.join("a");
+        std::fs::write(&exe, "never run").unwrap();
+        let staged = home.runtime().stage(&exe).unwrap();
+        let listener = home.bind().unwrap();
+        let (published, ready) = mpsc::channel();
+        let (release, released) = mpsc::channel();
+        let released = Mutex::new(released);
+        let (events, received) = mpsc::channel();
+        let driver = Driver::new(Daemon::local(home.clone(), staged), move |driver, event| {
+            if matches!(event.kind, EventKind::Connected { .. }) {
+                driver.io(Io::Hangup).unwrap();
+                published.send(()).unwrap();
+                lock(&released).recv().unwrap();
+            } else {
+                events.send(event).unwrap();
+            }
+        });
+        let opener = driver.clone();
+        let opening = thread::spawn(move || {
+            opener.connect(
+                ConnId(1),
+                &Attach::new(Target::New, crate::Env::Keep),
+                false,
+            );
+        });
+        let mut peer = listener.accept().unwrap();
+        read_frame::<ClientMsg>(&mut peer).unwrap().unwrap();
+        read_frame::<ClientMsg>(&mut peer).unwrap().unwrap();
+        write_frame(
+            &mut peer,
+            &DaemonMsg::Welcome {
+                proto: protocol::PROTO,
+                build: "test".into(),
+                caps: Caps::ALL,
+                commands: Vec::new(),
+            },
+        )
+        .unwrap();
+        ready.recv().unwrap();
+        let _ = write_frame(&mut peer, &DaemonMsg::Ack { client_seq: 99 });
+        release.send(()).unwrap();
+        opening.join().unwrap();
+        drop(peer);
+        // The opener must release its reader before returning from publication.
+        assert_eq!(Arc::strong_count(&driver.0), 1);
+        assert!(received.try_recv().is_err());
+        drop(listener);
+        home.endpoint().remove();
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn hangup_releases_the_reader_without_peer_cooperation() {
+        use protocol::{DaemonMsg, read_frame, write_frame};
+        use std::io::Read;
+        use std::sync::mpsc;
+        use sys::Home;
+
+        struct Released(mpsc::Sender<()>);
+        impl Drop for Released {
+            fn drop(&mut self) {
+                let _ = self.0.send(());
+            }
+        }
+        let root = std::env::temp_dir().join(format!("a-reader-hangup-{:?}", ClientId::new()));
+        std::fs::create_dir_all(&root).unwrap();
+        let home = Home::from(root.join("home"));
+        let exe = root.join("a");
+        std::fs::write(&exe, "never run").unwrap();
+        let listener = home.bind().unwrap();
+        let staged = home.runtime().stage(&exe).unwrap();
+        let (read, reading) = mpsc::channel();
+        let (resume, resumed) = mpsc::channel();
+        let resumed = Mutex::new(resumed);
+        let (released, gone) = mpsc::channel();
+        let released = Released(released);
+        let driver = Driver::new(Daemon::local(home.clone(), staged), move |_, event| {
+            let _keep = &released;
+            if matches!(event.kind, EventKind::Msg(DaemonMsg::Ack { .. })) {
+                read.send(()).unwrap();
+                lock(&resumed).recv().unwrap();
+            }
+        });
+        let weak = Arc::downgrade(&driver.0);
+        let mut probe = home.endpoint().connect().unwrap();
+        let mut peer = listener.accept().unwrap();
+        let connection = crate::split(&probe).unwrap();
+        driver.0.latest.store(1, Ordering::Release);
+        let opener = driver.clone();
+        let opening = thread::spawn(move || opener.install(ConnId(1), connection));
+        write_frame(&mut peer, &DaemonMsg::Ack { client_seq: 99 }).unwrap();
+        reading.recv().unwrap();
+        opening.join().unwrap();
+        driver.io(Io::Hangup).unwrap();
+        assert!(matches!(
+            read_frame::<ClientMsg>(&mut peer).unwrap(),
+            Some(ClientMsg::Detach)
+        ));
+        // Inspect our read side while the installed reader is paused in its sink.
+        probe.set_nonblocking(true).unwrap();
+        let shutdown = matches!(probe.read(&mut [0]), Ok(0));
+        probe.set_nonblocking(false).unwrap();
+        drop(probe);
+        let mut peer = Some(peer);
+        if !shutdown {
+            drop(peer.take());
+        }
+        drop(driver);
+        resume.send(()).unwrap();
+        gone.recv().unwrap();
+        assert!(weak.upgrade().is_none());
+        if let Some(peer) = &mut peer {
+            assert!(read_frame::<ClientMsg>(peer).unwrap().is_none());
+        }
+        drop(peer);
+        drop(listener);
+        home.endpoint().remove();
+        std::fs::remove_dir_all(root).unwrap();
+        assert!(shutdown, "hangup left the local read half open");
+    }
 
     /// A renderer that asks for one more thing the first time it is shown
     /// anything.

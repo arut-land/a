@@ -108,6 +108,26 @@ fn sigterm_gives_the_terminal_back_before_it_ends_the_client() {
     assert!(out.contains("\x1b[?1049l"), "left the alternate screen");
 }
 
+/// A terminal nobody reads (its emulator hung, or gone with a copy of its
+/// master left open) blocks the client's every write: SIGTERM ends it all
+/// the same, the terminal's mode given back.
+#[test]
+fn sigterm_ends_a_client_whose_terminal_is_not_read() {
+    let env = Env::new("tui-unread");
+    let mut term = env.tty(&[], 400, 250);
+    term.wait_for("● live");
+    // A screen full of text: a whole frame of it is 100 KB, past what any
+    // terminal buffers.
+    term.send(&vec![b'x'; 100_000]);
+    term.send(b"\r");
+    term.wait_for(&"x".repeat(300));
+    term.go_deaf_drawing(b"\x0c");
+    let pid = Pid::from_child(&term.child);
+    kill_process(pid, Signal::TERM).unwrap();
+    assert_eq!(term.wait().signal(), Some(Signal::TERM.as_raw()));
+    assert!(term.cooked(), "raw mode outlived the client");
+}
+
 /// A daemon upgrade under the terminal client: it reattaches to the new
 /// daemon, sends what was typed meanwhile, and never reads the drain as a
 /// lost daemon.
@@ -133,4 +153,25 @@ fn the_full_screen_client_rides_out_a_daemon_upgrade() {
     assert!(term.wait().success());
     let out = String::from_utf8_lossy(&term.bytes()).into_owned();
     assert!(out.contains("[detached; the session keeps running"));
+}
+
+#[test]
+fn esc_interrupts_a_running_turn_without_leaving_either_viewport() {
+    for viewport in ["full", "inline"] {
+        let mut env = Env::new("tui-esc");
+        env.vars.push(("A_TUI", viewport));
+        let mut term = env.tty(&[], 80, 24);
+        term.wait_for("● live");
+        term.send(b"$ echo started; sleep 60\r");
+        term.wait_for("⎿  started");
+        term.wait_for("Working…");
+        term.send(b"\x1b");
+        let screen = term.wait_for("aborted");
+        assert!(!screen.text().contains("Working…"), "{}", screen.text());
+        term.send(b"still here\r");
+        term.wait_for("⏺ still here");
+        term.send(b"\x04");
+        assert!(term.wait().success());
+        assert!(term.cooked(), "detaching restores terminal input");
+    }
 }

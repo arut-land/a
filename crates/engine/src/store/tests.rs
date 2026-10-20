@@ -75,6 +75,7 @@ macro_rules! conformance {
     ($($backend:ident),*) => {
         $(cases!($backend;
             round_trip,
+            multiline_payloads_survive_reload,
             appends_keep_their_order_across_reopens,
             batches_append_in_order,
             lines_read_back_as_appended,
@@ -847,4 +848,28 @@ fn crc_detects_a_flipped_byte() {
             assert!(!unseal(&mut flipped), "byte {at}, bit {bit}");
         }
     }
+}
+
+fn multiline_payloads_survive_reload(store: &dyn LogStore) {
+    let text = "{\r\n  \"x\": [1, \"escaped\\nline\"]\n}";
+    let data: Json = serde_json::from_str(text).unwrap();
+    let h = header("/w");
+    let written = store
+        .create(&h)
+        .unwrap()
+        .append(Body::Ext {
+            ext: "test".into(),
+            state: "value".into(),
+            data,
+        })
+        .unwrap();
+    let (_, entries) = load(store, h.id);
+    assert_eq!(entries, [written]);
+    let Body::Ext { data, .. } = &entries[0].body else {
+        panic!("extension state")
+    };
+    assert_eq!(
+        data.parse::<serde_json::Value>().unwrap(),
+        serde_json::from_str::<serde_json::Value>(text).unwrap()
+    );
 }

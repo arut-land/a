@@ -10,6 +10,7 @@ use std::sync::mpsc;
 use std::sync::{Arc, Condvar, Mutex, MutexGuard, PoisonError};
 use std::time::{Duration, Instant};
 
+use rustix::io::{FdFlags, fcntl_setfd};
 use rustix::process::{Pid, WaitOptions, waitpid};
 use rustix::pty::{OpenptFlags, grantpt, openpt, ptsname, unlockpt};
 use rustix::termios::{LocalModes, Winsize, tcgetattr, tcsetwinsize};
@@ -22,6 +23,10 @@ use super::Env;
 struct Output {
     bytes: Vec<u8>,
     first_frame: Option<Instant>,
+    /// Reading stops once a frame starts past this many bytes.
+    deaf_after: Option<usize>,
+    /// Nothing more is read, as of a hung emulator.
+    deaf: bool,
 }
 
 /// What the child wrote, and a wake for every read of it.
@@ -57,6 +62,10 @@ impl Env {
     /// `cmd` on a `cols` × `rows` terminal.
     pub fn tty_of(mut cmd: Command, cols: u16, rows: u16) -> Pty {
         let master = openpt(OpenptFlags::RDWR | OpenptFlags::NOCTTY).unwrap();
+        // posix_openpt has no close-on-exec flag: a copy left in the client
+        // (or the daemon it starts) would keep the terminal from ever
+        // hanging up, and the client running past the test.
+        fcntl_setfd(&master, FdFlags::CLOEXEC).unwrap();
         grantpt(&master).unwrap();
         unlockpt(&master).unwrap();
         let name = ptsname(&master, Vec::new()).unwrap();
@@ -100,8 +109,15 @@ impl Env {
                 if out.first_frame.is_none() && contains(&out.bytes, b"\x1b[?2026l") {
                     out.first_frame = Some(Instant::now());
                 }
+                out.deaf = out
+                    .deaf_after
+                    .is_some_and(|from| contains(&out.bytes[from..], b"\x1b[?2026h"));
+                let deaf = out.deaf;
                 drop(out);
                 written.wrote.notify_all();
+                if deaf {
+                    return;
+                }
             }
         });
         Pty {
@@ -146,6 +162,28 @@ impl Pty {
                 "timed out waiting for {text:?} on\n{}",
                 screen.text()
             );
+            out = self
+                .sink
+                .wrote
+                .wait_timeout(out, left)
+                .unwrap_or_else(PoisonError::into_inner)
+                .0;
+        }
+    }
+
+    /// Sends `bytes`, and reads nothing more once the frame they draw has
+    /// begun, as a hung emulator would: a frame larger than the terminal
+    /// buffers then blocks the client in its write for good.
+    pub fn go_deaf_drawing(&mut self, bytes: &[u8]) {
+        let mut out = self.sink.lock();
+        out.deaf_after = Some(out.bytes.len());
+        drop(out);
+        self.send(bytes);
+        let mut out = self.sink.lock();
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while !out.deaf {
+            let left = deadline.saturating_duration_since(Instant::now());
+            assert!(left > Duration::ZERO, "no frame drawn");
             out = self
                 .sink
                 .wrote

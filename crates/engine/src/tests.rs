@@ -131,7 +131,7 @@ fn anything_within(daemon: &Daemon, within: Duration) -> bool {
 /// Whether the catalog marks session `id` busy, as the next daemon reads it.
 fn marked(home: &Home, id: SessionId) -> bool {
     let store = Jsonl::open(home.sessions_dir()).unwrap();
-    let catalog = Catalog::open(home.catalog_file(), &home.sessions_dir(), &store).unwrap();
+    let catalog = Catalog::open(home.catalog_file(), &store).unwrap();
     catalog.get(id).is_some_and(|r| r.busy)
 }
 
@@ -1070,7 +1070,7 @@ fn cold_start_does_not_grow_with_session_count() {
     for h in &headers {
         std::fs::write(home.sessions_dir().join(format!("{}.jsonl", h.id)), "torn").unwrap();
     }
-    let catalog = Catalog::open(home.catalog_file(), &home.sessions_dir(), &store).unwrap();
+    let catalog = Catalog::open(home.catalog_file(), &store).unwrap();
     assert!(catalog.records().is_empty(), "the logs are unreadable");
     for h in &headers {
         catalog.record(crate::catalog::Record {
@@ -1078,6 +1078,7 @@ fn cold_start_does_not_grow_with_session_count() {
             ..crate::catalog::Record::new(h.clone())
         });
     }
+    catalog.clean().unwrap();
     drop(catalog);
 
     let began = Instant::now();
@@ -1149,4 +1150,134 @@ fn sessions_are_listed_newest_first() {
     let listed: Vec<_> = daemon.list().iter().map(|s| s.id).collect();
     made.reverse();
     assert_eq!(listed, made);
+}
+
+#[test]
+fn an_unclean_stop_rebuilds_the_catalog_and_recovers_the_call() {
+    let (root, home) = home("unclean");
+    let store = Jsonl::open(home.sessions_dir()).unwrap();
+    let id = SessionId::new();
+    let mut created = store
+        .create(&Header {
+            id,
+            workspace: "/w".into(),
+            parent: None,
+        })
+        .unwrap();
+    let catalog = Catalog::open(home.catalog_file(), &store).unwrap();
+    catalog.record(crate::catalog::Record::new(Header {
+        id,
+        workspace: "/w".into(),
+        parent: None,
+    }));
+    drop(catalog);
+    let calls = [
+        ("sleep", json!({ "seconds": 0 })),
+        ("bash", json!({ "command": "true" })),
+    ];
+    for (seq, (tool, input)) in (1..).zip(calls) {
+        let body = Body::ToolCall {
+            tool: tool.into(),
+            input: Json::encode(&input).unwrap(),
+            id: None,
+            card: None,
+            by: Audience::Model,
+        };
+        created
+            .writer
+            .append_raw(&[Entry::new(
+                Seq::new(seq).unwrap(),
+                Epoch(created.writer.epoch()),
+                body,
+            )])
+            .unwrap();
+    }
+
+    let daemon = Daemon::load(&home, &echo()).unwrap();
+    settle(&daemon);
+    // Its actor clears the marker after the work it settles.
+    drop(daemon);
+    let got = bodies(&store, id);
+    let still_busy = marked(&home, id);
+    std::fs::remove_dir_all(&root).unwrap();
+
+    // The safe sleep runs again; the shell command is not rerun.
+    let result = |call| {
+        got.iter().find_map(|b| match b {
+            Body::ToolResult {
+                call: c, outcome, ..
+            } if c.get() == call => Some(outcome),
+            _ => None,
+        })
+    };
+    assert!(
+        matches!(result(1), Some(Outcome::Done { output }) if output.parse::<serde_json::Value>().unwrap()["slept"] == 0),
+        "{got:#?}"
+    );
+    assert_eq!(result(2), Some(&Outcome::Interrupted { output: None }));
+    assert_eq!(got.len(), 4);
+    assert!(!still_busy);
+}
+
+#[test]
+fn a_shutdown_deadline_leaves_the_catalog_dirty_while_a_load_can_write() {
+    let (root, home) = home("shutdown-loading-deadline");
+    let daemon = Daemon::load(&home, &echo()).unwrap();
+    let attached = daemon.attach_to(&Target::New, || "/w".into()).unwrap();
+    let slot = daemon.slot(attached.session().id).unwrap();
+    slot.unload();
+    if let Some(ended) = slot.ending() {
+        rt::block_on(ended.wait());
+    }
+    slot.ending();
+    assert!(slot.loading());
+    rt::block_on(daemon.shutdown_until(Box::pin(std::future::ready(()))));
+    let dirty = home.catalog_file().with_extension("dirty").exists();
+    let loaded = Live::start(
+        &slot.header,
+        &daemon.shared,
+        super::Open::Load,
+        kernel::Owner::None,
+    )
+    .unwrap();
+    let admitted = daemon.started(&slot, Ok(std::sync::Arc::clone(&loaded)));
+    loaded.stop();
+    rt::block_on(loaded.ended.wait());
+    drop(daemon);
+    std::fs::remove_dir_all(root).unwrap();
+    assert!(dirty, "a load can still produce a writer");
+    assert!(admitted.is_err(), "shutdown must close admission");
+}
+
+#[test]
+fn shutdown_waits_for_reserved_loads_and_stops_their_actors_before_cleaning() {
+    use std::future::{Future, poll_fn};
+    use std::task::Poll;
+
+    let (root, home) = home("shutdown-reserved-load");
+    let daemon = Daemon::load(&home, &echo()).unwrap();
+    let slot = daemon
+        .new_slot(Header {
+            id: SessionId::new(),
+            workspace: "/w".into(),
+            parent: None,
+        })
+        .unwrap();
+    rt::block_on(async {
+        let mut shutdown = Box::pin(daemon.shutdown());
+        poll_fn(|cx| {
+            assert!(shutdown.as_mut().poll(cx).is_pending());
+            Poll::Ready(())
+        })
+        .await;
+        assert!(home.catalog_file().with_extension("dirty").exists());
+        assert!(daemon.create("/new".into()).await.is_err());
+        assert!(daemon.live(&slot).await.is_err());
+        assert!(daemon.start(&slot, super::Open::Create).await.is_err());
+        shutdown.await;
+    });
+    assert!(slot.ending().is_none());
+    assert!(!home.catalog_file().with_extension("dirty").exists());
+    drop(daemon);
+    std::fs::remove_dir_all(root).unwrap();
 }

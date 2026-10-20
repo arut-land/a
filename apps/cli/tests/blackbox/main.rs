@@ -13,6 +13,9 @@ mod crash;
 mod home;
 #[cfg(feature = "lua")]
 mod lua;
+#[cfg(feature = "web")]
+mod hygiene;
+mod pipe;
 mod reactor;
 mod remote;
 mod tui;

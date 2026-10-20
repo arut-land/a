@@ -34,6 +34,8 @@ pub struct Screen<W = Stdout> {
     row: Option<u16>,
     col: Option<u16>,
     pen: Style,
+    /// Colours are drawn; `NO_COLOR` keeps only the attributes.
+    colour: bool,
     cursor_shown: bool,
     /// Draw the next frame whole: the first, after a resize, Ctrl-L, or
     /// (inline) when the viewport moved or changed size.
@@ -50,8 +52,17 @@ impl<W: Write> Screen<W> {
             row: Some(0),
             col: None,
             pen: PLAIN,
+            colour: true,
             cursor_shown: true,
             stale: true,
+        }
+    }
+
+    /// Draws bold, dim, reverse and the rest, but no colour.
+    pub fn without_colour(self) -> Self {
+        Self {
+            colour: false,
+            ..self
         }
     }
 
@@ -244,6 +255,15 @@ impl<W: Write> Screen<W> {
 
     /// Switches SGR state to `pen`, in one sequence.
     fn repen(&mut self, pen: Style) {
+        let pen = if self.colour {
+            pen
+        } else {
+            Style {
+                fg: PLAIN.fg,
+                bg: PLAIN.bg,
+                ..pen
+            }
+        };
         if pen == self.pen {
             return;
         }
@@ -347,6 +367,16 @@ mod tests {
         assert!(screen.bytes.is_empty(), "the same pen writes nothing");
         screen.repen(PLAIN);
         assert_eq!(screen.bytes, b"\x1b[0m");
+    }
+
+    #[test]
+    fn no_color_keeps_the_attributes_and_drops_the_colours() {
+        let mut screen = Screen::new(Viewport::Full, Vec::new()).without_colour();
+        screen.repen(Style::new().fg(Color::Red).bold());
+        assert_eq!(screen.bytes, b"\x1b[1m");
+        screen.bytes.clear();
+        screen.repen(Style::new().fg(Color::Green).bold());
+        assert!(screen.bytes.is_empty(), "a colour alone changes nothing");
     }
 
     #[test]

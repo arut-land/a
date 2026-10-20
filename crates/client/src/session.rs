@@ -188,6 +188,7 @@ pub enum Show {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum Notice {
     NotConnected,
+    Backpressure,
     /// A steer or an interrupt while no turn runs.
     NothingRunning,
     /// An answer for a call that is not waiting for one.
@@ -203,6 +204,9 @@ impl fmt::Display for Notice {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Self::NotConnected => f.write_str("not connected"),
+            Self::Backpressure => {
+                f.write_str("waiting for the daemon to acknowledge pending input")
+            }
             Self::NothingRunning => f.write_str("nothing is running"),
             Self::NotAsking(call) => write!(f, "call {call} is not waiting for an answer"),
             Self::RemoteEnv => f.write_str(
@@ -235,6 +239,7 @@ const UNANSWERED: usize = 64;
 pub struct SessionClient {
     link: Link,
     view: SessionView,
+    view_current: bool,
     sessions: SessionList,
     /// The daemon's slash commands.
     commands: Vec<CommandInfo>,
@@ -259,6 +264,7 @@ impl SessionClient {
         Self {
             link: Link::Connecting,
             view: SessionView::default(),
+            view_current: false,
             sessions: SessionList::default(),
             commands: Vec::new(),
             conn: ConnId::default(),
@@ -293,6 +299,12 @@ impl SessionClient {
     }
 
     pub fn turn(&self) -> TurnView {
+        if !self.view_current {
+            return TurnView {
+                can_send: self.link.attached(),
+                ..TurnView::default()
+            };
+        }
         let ledger = &self.view.ledger;
         let running = ledger.activity() != Activity::Idle;
         let asking = ledger.inbox().next();
@@ -309,10 +321,12 @@ impl SessionClient {
     /// What this client may ask of the session now; nothing unless
     /// attached, now or once reconnected.
     pub fn offer(&mut self) -> Result<Offer<'_>, Notice> {
-        if self.link.attached() {
-            Ok(Offer(self))
-        } else {
+        if !self.link.attached() {
             Err(Notice::NotConnected)
+        } else if self.unanswered.len() + self.queued.len() >= UNANSWERED {
+            Err(Notice::Backpressure)
+        } else {
+            Ok(Offer(self))
         }
     }
 
@@ -326,13 +340,19 @@ impl SessionClient {
     /// Makes `attach` on a new connection, leaving the current one.
     pub fn attach(&mut self, attach: Attach) -> Vec<Effect> {
         let mut out = self.leave();
+        if !matches!((&attach.target, &self.opened.target), (Target::Id(a), Target::Id(b)) if a == b)
+        {
+            self.unanswered.clear();
+            self.queued.clear();
+            self.view_current = false;
+        }
         self.opened = attach.clone();
         self.connect(attach, false, Link::Connecting, &mut out);
         out
     }
 
-    /// Replaces a wedged daemon and attaches again: to the session shown,
-    /// keeping its environment, or as first asked.
+    /// Replaces a wedged daemon and repeats the current attachment,
+    /// keeping a known session's environment.
     pub fn restart(&mut self) -> Vec<Effect> {
         let attach = self.reattach().unwrap_or_else(|| self.opened.clone());
         let mut out = vec![Effect::Io(Io::Hangup)];
@@ -395,9 +415,6 @@ impl SessionClient {
         if let Some(seq @ None) = msg.client_seq_mut() {
             self.seq += 1;
             *seq = Some(self.seq);
-            if self.unanswered.len() == UNANSWERED {
-                self.unanswered.pop_front();
-            }
             self.unanswered.push_back(msg.clone());
         }
         out.push(Effect::Io(Io::Send(msg)));
@@ -452,6 +469,10 @@ impl SessionClient {
 
     fn msg(&mut self, msg: &DaemonMsg, out: &mut Vec<Effect>) {
         match msg {
+            DaemonMsg::Attached { session, .. } => {
+                self.opened.target = Target::Id(*session);
+                self.view_current = true;
+            }
             DaemonMsg::Sessions { .. } => {
                 self.sessions.fold(msg);
                 out.push(Effect::Show(Show::Sessions));
@@ -502,12 +523,19 @@ impl SessionClient {
         out.push(Effect::Show(Show::View(update)));
     }
 
-    /// The attach that picks the session shown up again where the view
-    /// left it, keeping the environment it has.
+    /// Reattaches to the current target, resuming the view only when it
+    /// belongs to that session.
     fn reattach(&self) -> Option<Attach> {
+        let Target::Id(session) = self.opened.target else {
+            return None;
+        };
         Some(Attach {
-            target: Target::Id(self.view.session?),
-            since: self.view.seq,
+            target: Target::Id(session),
+            since: if self.view.session == Some(session) {
+                self.view.seq
+            } else {
+                0
+            },
             env: Env::Keep,
             workspace: self.opened.workspace.clone(),
         })
@@ -564,6 +592,7 @@ impl Offer<'_> {
 
     /// Answers the approval call `call` waits for.
     pub fn approve(self, call: CallId, approved: bool) -> Result<Vec<Effect>, Notice> {
+        self.view()?;
         if !self.0.view.ledger.inbox().any(|c| c == call) {
             return Err(Notice::NotAsking(call));
         }
@@ -581,7 +610,15 @@ impl Offer<'_> {
         Ok(vec![Effect::Io(Io::SendEnvironment)])
     }
 
+    fn view(&self) -> Result<(), Notice> {
+        self.0
+            .view_current
+            .then_some(())
+            .ok_or(Notice::NotConnected)
+    }
+
     fn running(&self) -> Result<(), Notice> {
+        self.view()?;
         if self.0.turn().running {
             Ok(())
         } else {
@@ -804,6 +841,152 @@ mod tests {
             ] if one == "one" && two == "two"),
             "{out:?}"
         );
+    }
+
+    #[test]
+    fn unanswered_mutations_are_never_evicted_by_new_input() {
+        for disconnected in [false, true] {
+            let (mut client, _) = attached(Env::Keep);
+            if disconnected {
+                client.step(msg(1, DaemonMsg::Draining));
+                client.step(closed(1));
+            }
+            for n in 0..UNANSWERED {
+                let out = client.run(Cmd::Input(n.to_string()));
+                assert_eq!(notices(&out), [] as [&Notice; 0]);
+                assert_eq!(sends(&out).len(), usize::from(!disconnected));
+            }
+            let out = client.run(Cmd::Input("overflow".into()));
+            assert!(sends(&out).is_empty(), "{out:?}");
+            assert_eq!(notices(&out), vec![&Notice::Backpressure], "{out:?}");
+            if !disconnected {
+                client.step(msg(1, DaemonMsg::Draining));
+                client.step(closed(1));
+            }
+            let out = client.step(live(2, Caps::ALL));
+            let replay = sends(&out);
+            assert_eq!(replay.len(), UNANSWERED);
+            for (n, msg) in replay.iter().enumerate() {
+                assert_eq!(msg.client_seq(), Some(n as u64 + 1));
+                assert!(matches!(msg, ClientMsg::Input { text, .. } if text == &n.to_string()));
+            }
+            client.step(msg(2, DaemonMsg::Ack { client_seq: 1 }));
+            let out = client.run(Cmd::Input("accepted".into()));
+            assert_eq!(sends(&out)[0].client_seq(), Some(65));
+        }
+    }
+
+    #[test]
+    fn pending_input_follows_the_opened_target_before_it_attaches() {
+        for reopen_same in [false, true] {
+            for restart in [false, true] {
+                let (mut client, a) = attached(Env::Keep);
+                let b = SessionId::new();
+                client.open(Target::Id(b));
+                client.run(Cmd::Input("for B only".into()));
+                if restart {
+                    let out = client.restart();
+                    assert_eq!(connects(&out)[0].1.target, Target::Id(b));
+                } else {
+                    client.open(Target::Id(if reopen_same { b } else { a }));
+                }
+                let conn = client.connection().0;
+                let out = client.step(live(conn, Caps::ALL));
+                assert_eq!(
+                    sends(&out).len(),
+                    usize::from(restart || reopen_same),
+                    "{out:?}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn restarting_a_known_pending_target_keeps_its_environment() {
+        let mut client = SessionClient::new(Env::Origin);
+        let session = SessionId::new();
+        client.open(Target::Id(session));
+        client.run(Cmd::Input("pending".into()));
+        let out = client.restart();
+        let attach = connects(&out)[0].1;
+        assert_eq!(attach.target, Target::Id(session));
+        assert_eq!(attach.env, Env::Keep);
+        assert_eq!(attach.since, 0);
+        let out = client.step(live(2, Caps::ALL));
+        assert_eq!(sends(&out).len(), 1);
+    }
+
+    #[test]
+    fn view_dependent_offers_never_cross_an_attachment_change() {
+        let (mut client, _) = attached(Env::Keep);
+        client.step(msg(1, bash_call(2)));
+        client.step(msg(1, ask(3, 2)));
+        let call = CallId::new(2).unwrap();
+        assert_eq!(client.turn().asking, Some(call));
+        let b = SessionId::new();
+        client.open(Target::Id(b));
+        for connected in [false, true] {
+            if connected {
+                client.step(live(2, Caps::ALL));
+            }
+            for cmd in [
+                Cmd::Approve {
+                    call,
+                    approved: true,
+                },
+                Cmd::Steer("stale".into()),
+                Cmd::Interrupt,
+            ] {
+                let out = client.run(cmd);
+                assert_eq!(notices(&out), vec![&Notice::NotConnected], "{out:?}");
+                assert!(sends(&out).is_empty(), "{out:?}");
+            }
+            assert!(!client.turn().running);
+            assert_eq!(client.turn().asking, None);
+            assert!(!client.turn().can_interrupt);
+        }
+        client.open(Target::Id(b));
+        assert!(client.run(Cmd::Input("for B".into())).is_empty());
+        let out = client.step(live(3, Caps::ALL));
+        assert!(matches!(sends(&out)[..], [ClientMsg::Input { text, .. }] if text == "for B"));
+        client.step(msg(
+            3,
+            DaemonMsg::Attached {
+                session: b,
+                workspace: PathBuf::from("/b"),
+            },
+        ));
+        client.step(msg(3, bash_call(2)));
+        client.step(msg(3, ask(3, 2)));
+        let out = client.run(Cmd::Approve {
+            call,
+            approved: true,
+        });
+        assert!(
+            matches!(sends(&out)[..], [ClientMsg::Approve { call: approved, .. }] if *approved == call)
+        );
+    }
+
+    #[test]
+    fn pending_input_never_crosses_an_explicit_session_change() {
+        let (mut client, _) = attached(Env::Keep);
+        client.run(Cmd::Input("unanswered".into()));
+        client.step(msg(1, DaemonMsg::Draining));
+        client.run(Cmd::Input("queued".into()));
+        client.open(Target::New);
+        let out = client.step(live(2, Caps::ALL));
+        assert!(sends(&out).is_empty(), "{out:?}");
+    }
+
+    #[test]
+    fn pending_input_survives_a_restart_of_the_same_session() {
+        let (mut client, _) = attached(Env::Keep);
+        client.run(Cmd::Input("unanswered".into()));
+        client.step(msg(1, DaemonMsg::Draining));
+        client.run(Cmd::Input("queued".into()));
+        client.restart();
+        let out = client.step(live(2, Caps::ALL));
+        assert_eq!(sends(&out).len(), 2, "{out:?}");
     }
 
     #[test]

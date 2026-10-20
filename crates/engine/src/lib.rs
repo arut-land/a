@@ -203,6 +203,8 @@ fn lock<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
 struct Daemon {
     shared: Arc<Shared>,
     slots: Mutex<Vec<Arc<Slot>>>,
+    /// Serializes admission of writers with shutdown closing it.
+    admission: Mutex<bool>,
     /// Open connections; any keeps the daemon alive.
     clients: AtomicUsize,
     /// Wakes the supervisor when what it decides on may have changed.
@@ -236,6 +238,7 @@ enum Residency {
     /// Loading on the blocking pool; whoever else wants it waits. It lists
     /// as it did before.
     Loading {
+        finished: Flag,
         waiters: Vec<oneshot::Sender<Loaded>>,
         last: SessionSummary,
     },
@@ -273,12 +276,15 @@ impl Slot {
         true
     }
 
-    /// The actor still stopping, if any; one that has ended leaves the
+    /// A load or actor still stopping, if any; an actor that has ended leaves the
     /// session hibernated, as it last listed, and nothing of it held. The
     /// actor's end makes the transition ([`Daemon::ended`]); whoever waits
     /// for it only reads it.
     fn ending(&self) -> Option<Flag> {
         let mut residency = lock(&self.residency);
+        if let Residency::Loading { finished, .. } = &*residency {
+            return Some(finished.clone());
+        }
         let Residency::Stopping(live) = &*residency else {
             return None;
         };
@@ -308,6 +314,7 @@ impl Slot {
             Residency::Live(_) | Residency::Loading { .. } => return false,
         };
         *residency = Residency::Loading {
+            finished: Flag::default(),
             waiters: Vec::new(),
             last,
         };
@@ -321,7 +328,7 @@ impl Daemon {
     /// once, together, to recover.
     fn load(home: &Home, config: &Config) -> io::Result<Owner> {
         let store = Arc::new(Jsonl::open(home.sessions_dir())?);
-        let catalog = Catalog::open(home.catalog_file(), &home.sessions_dir(), &*store)?;
+        let catalog = Catalog::open(home.catalog_file(), &*store)?;
         let records = catalog.records();
         let busy: Vec<bool> = records.iter().map(|r| r.busy).collect();
         let slots: Vec<_> = (records.into_iter())
@@ -350,6 +357,7 @@ impl Daemon {
                 daemon: daemon.clone(),
             }),
             slots: Mutex::new(slots.clone()),
+            admission: Mutex::new(true),
             clients: AtomicUsize::new(0),
             pulse: rt::Notify::new(),
             jobs: rt::Notify::new(),
@@ -417,25 +425,39 @@ impl Daemon {
     /// many ask meanwhile.
     async fn live(&self, slot: &Arc<Slot>) -> io::Result<Arc<Live>> {
         loop {
-            if let Some(ended) = slot.ending() {
+            let ending = {
+                let admission = lock(&self.admission);
+                if !*admission {
+                    return Err(io::Error::other("the daemon is shutting down"));
+                }
+                slot.ending()
+            };
+            if let Some(ended) = ending {
                 ended.wait().await;
                 continue;
             }
             let wait = {
-                let mut residency = lock(&slot.residency);
-                match &mut *residency {
-                    Residency::Live(live) => return Ok(Arc::clone(live)),
-                    Residency::Loading { waiters, .. } => {
-                        let (tx, rx) = oneshot::channel();
-                        waiters.push(tx);
-                        Some(rx)
-                    }
-                    Residency::Stopping(_) | Residency::Hibernated { .. } => None,
+                let admission = lock(&self.admission);
+                if !*admission {
+                    return Err(io::Error::other("the daemon is shutting down"));
                 }
+                let wait = {
+                    let mut residency = lock(&slot.residency);
+                    match &mut *residency {
+                        Residency::Live(live) => return Ok(Arc::clone(live)),
+                        Residency::Loading { waiters, .. } => {
+                            let (tx, rx) = oneshot::channel();
+                            waiters.push(tx);
+                            Some(rx)
+                        }
+                        Residency::Stopping(_) | Residency::Hibernated { .. } => None,
+                    }
+                };
+                if wait.is_none() && !slot.loading() {
+                    continue;
+                }
+                wait
             };
-            if wait.is_none() && !slot.loading() {
-                continue;
-            }
             return match wait {
                 Some(loaded) => loaded
                     .await
@@ -459,7 +481,29 @@ impl Daemon {
     /// The session of `slot`, which was `Loading`, as `started`: handed to
     /// whoever waits.
     fn started(&self, slot: &Slot, started: io::Result<Arc<Live>>) -> io::Result<Arc<Live>> {
+        let admission = lock(&self.admission);
         let mut residency = lock(&slot.residency);
+        let started = match started {
+            Ok(live) if !*admission => {
+                live.stop();
+                if let Residency::Loading {
+                    waiters, finished, ..
+                } = &mut *residency
+                {
+                    for waiter in std::mem::take(waiters) {
+                        waiter.send(Err((
+                            io::ErrorKind::Other,
+                            "the daemon is shutting down".into(),
+                        )));
+                    }
+                    finished.set();
+                }
+                *residency = Residency::Stopping(live);
+                self.pulse.notify();
+                return Err(io::Error::other("the daemon is shutting down"));
+            }
+            started => started,
+        };
         let next = match &started {
             Ok(live) => Residency::Live(Arc::clone(live)),
             Err(_) => Residency::Hibernated {
@@ -469,7 +513,11 @@ impl Daemon {
                 },
             },
         };
-        if let Residency::Loading { waiters, .. } = std::mem::replace(&mut *residency, next) {
+        if let Residency::Loading {
+            waiters, finished, ..
+        } = std::mem::replace(&mut *residency, next)
+        {
+            finished.set();
             for waiter in waiters {
                 waiter.send(match &started {
                     Ok(live) => Ok(Arc::clone(live)),
@@ -541,17 +589,28 @@ impl Daemon {
             workspace,
             parent: None,
         };
-        let slot = self.new_slot(header);
+        let slot = self.new_slot(header)?;
         Ok(self.start(&slot, Open::Create).await?.open())
     }
 
     /// A slot for a session to create, `Loading` until it is.
-    fn new_slot(&self, header: Header) -> Arc<Slot> {
+    fn new_slot(&self, header: Header) -> io::Result<Arc<Slot>> {
+        let admission = lock(&self.admission);
+        if !*admission {
+            return Err(io::Error::other("the daemon is shutting down"));
+        }
         let waiters = Vec::new();
         let last = fresh(&header);
-        let slot = Slot::new(header, Residency::Loading { waiters, last });
+        let slot = Slot::new(
+            header,
+            Residency::Loading {
+                finished: Flag::default(),
+                waiters,
+                last,
+            },
+        );
         lock(&self.slots).push(Arc::clone(&slot));
-        slot
+        Ok(slot)
     }
 
     /// Starts child session `header.id` on `input`, in `env` (its parent's,
@@ -567,7 +626,7 @@ impl Daemon {
         let live = if let Some(slot) = self.slot(header.id) {
             self.live(&slot).await?
         } else {
-            let slot = self.new_slot(header);
+            let slot = self.new_slot(header)?;
             self.start(&slot, Open::Create).await?
         };
         if !live.has_input() {
@@ -691,10 +750,14 @@ impl Daemon {
         self.slots().iter().filter_map(|slot| slot.live()).collect()
     }
 
-    /// Stops every loaded session and waits, up to [`STOP_GRACE`], for
-    /// their actors to end; one loaded meanwhile is stopped in turn.
+    /// Closes admission, then waits up to [`STOP_GRACE`] for every load
+    /// and actor. Only then can the catalog outlive all of its writers.
     async fn shutdown(&self) {
-        let mut grace = self.shared.rt.sleep(STOP_GRACE);
+        self.shutdown_until(self.shared.rt.sleep(STOP_GRACE)).await;
+    }
+
+    async fn shutdown_until(&self, mut grace: rt::BoxFuture<'_, ()>) {
+        *lock(&self.admission) = false;
         loop {
             let ending: Vec<Flag> = self
                 .slots()
@@ -705,6 +768,13 @@ impl Daemon {
                 })
                 .collect();
             if ending.is_empty() {
+                let shared = Arc::clone(&self.shared);
+                rt::unblock(&*Arc::clone(&shared.rt), move || {
+                    if let Err(e) = shared.catalog.clean() {
+                        eprintln!("the session catalog: {e}");
+                    }
+                })
+                .await;
                 return;
             }
             let all = async {

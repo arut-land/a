@@ -2,6 +2,7 @@
 //! thread, which folds what they send into the app and draws.
 
 use std::io::{self, Write};
+use std::time::Duration;
 
 use client::{Cmd, Daemon, Driver, End, Endpoint, Inbox, Io, Link};
 use protocol::Target;
@@ -44,10 +45,15 @@ pub fn run(daemon: &Daemon, target: Target, viewport: Viewport) -> io::Result<()
     // raw; the input thread reads them.
     let signals = Signals::catch(&term::SIGNALS)?;
     let terminal = Terminal::enter(viewport)?;
+    let mut screen = Screen::new(viewport, Stdout::default());
+    // no-color.org: set and not empty.
+    if std::env::var_os("NO_COLOR").is_some_and(|v| !v.is_empty()) {
+        screen = screen.without_colour();
+    }
     let mut client = Client {
         driver,
         app,
-        screen: Screen::new(viewport, Stdout::default()),
+        screen,
     };
     // The first frame goes out before the daemon is even reached, or the
     // git root walked up to.
@@ -79,6 +85,9 @@ enum Exit {
     Quit,
 }
 
+/// How often the working indicator turns.
+const TICK: Duration = Duration::from_millis(125);
+
 /// Ctrl-L: the next frame is drawn whole.
 struct Redraw;
 
@@ -93,13 +102,27 @@ impl Client {
     /// applies what it asks for, then draws one frame if any of it shows:
     /// an ack, or a list no picker is open for, draws nothing.
     fn run(&mut self, rx: &Inbox<Event>) -> io::Result<Exit> {
-        while let Some(first) = rx.recv() {
+        loop {
+            // The one timer: the working indicator's, armed only while a
+            // turn runs, so an idle client sleeps until something happens.
+            let first = if self.app.working() {
+                match rx.recv_timeout(TICK) {
+                    Some(event) => event,
+                    None if rx.closed() => break,
+                    None => Event::Tick,
+                }
+            } else if let Some(event) = rx.recv() {
+                event
+            } else {
+                break;
+            };
             let mut effects = Vec::new();
             let mut whole = false;
             for event in std::iter::once(first).chain(std::iter::from_fn(|| rx.try_recv())) {
                 match event {
                     Event::Input(input) => effects.extend(self.app.input(input)),
                     Event::Resized => whole = true,
+                    Event::Tick => self.app.tick(),
                     Event::InputClosed => effects.push(Effect::Detach),
                     Event::Client(event) => {
                         let stepped = self.app.client.step(event);

@@ -1,6 +1,25 @@
+/// [`out`]s a formatted line.
+macro_rules! sayln {
+    () => {
+        $crate::out(format_args!("\n"))
+    };
+    ($($arg:tt)*) => {
+        $crate::out(format_args!("{}\n", format_args!($($arg)*)))
+    };
+}
+
+/// [`out`]s formatted text.
+macro_rules! say {
+    ($($arg:tt)*) => {
+        $crate::out(format_args!($($arg)*))
+    };
+}
+
 mod args;
 mod exts;
+mod once;
 
+use std::fmt;
 use std::io::{self, BufRead, IsTerminal, Write};
 use std::process::ExitCode;
 use std::thread;
@@ -18,34 +37,58 @@ fn main() -> ExitCode {
     // Help, the version, completion requests and usage errors (status 2)
     // end the process here.
     let args = Args::parse();
-    let result = daemon_of(args.host).and_then(|daemon| match args.cmd {
-        None => session(&daemon, Target::New),
-        Some(Cmd::Resume { id: None, any }) => {
-            session(&daemon, Target::Latest { any_workspace: any })
-        }
-        Some(Cmd::Resume { id: Some(id), .. } | Cmd::Attach { id }) => {
-            session(&daemon, Target::Prefix(id))
-        }
-        Some(Cmd::Ls) => ls(&daemon),
-        Some(Cmd::New) => new(&daemon),
-        Some(Cmd::Bridge { token }) => client::bridge(
-            daemon.home()?,
-            token.as_deref().unwrap_or(&daemon.staged.id),
-        ),
-        Some(Cmd::Web { no_open }) => web(daemon, !no_open),
-        Some(Cmd::Daemon { action }) => daemon_cmd(&daemon, action),
-        Some(Cmd::Serve {
-            listen_fd,
-            lock_fd,
-            reset_breaker,
-        }) => serve(&daemon, listen_fd, lock_fd, reset_breaker),
+    let (prompt, mode) = (args.prompt, args.mode);
+    let result = daemon_of(args.host).and_then(|daemon| {
+        let done = match args.cmd {
+            None => return session(&daemon, Target::New, prompt, mode),
+            Some(Cmd::Resume { id: None, any }) => {
+                return session(&daemon, Target::Latest { any_workspace: any }, prompt, mode);
+            }
+            Some(Cmd::Resume { id: Some(id), .. } | Cmd::Attach { id }) => {
+                return session(&daemon, Target::Prefix(id), prompt, mode);
+            }
+            Some(_) if prompt.is_some() => {
+                eprintln!("a: -p runs a turn: it takes no command but `resume` or `attach`");
+                return Ok(ExitCode::from(2));
+            }
+            Some(Cmd::Ls) => ls(&daemon),
+            Some(Cmd::New) => new(&daemon),
+            Some(Cmd::Bridge { token }) => client::bridge(
+                daemon.home()?,
+                token.as_deref().unwrap_or(&daemon.staged.id),
+            ),
+            Some(Cmd::Web { no_open }) => web(daemon, !no_open),
+            Some(Cmd::Daemon { action }) => daemon_cmd(&daemon, action),
+            Some(Cmd::Serve {
+                listen_fd,
+                lock_fd,
+                reset_breaker,
+            }) => serve(&daemon, listen_fd, lock_fd, reset_breaker),
+        };
+        done.map(|()| ExitCode::SUCCESS)
     });
     match result {
-        Ok(()) => ExitCode::SUCCESS,
+        Ok(code) => code,
         Err(e) => {
             eprintln!("a: {e}");
             ExitCode::FAILURE
         }
+    }
+}
+
+/// The status `a` ends with when stdout's reader has gone: 128 + SIGPIPE,
+/// as a program SIGPIPE ended would.
+const STDOUT_GONE: i32 = 141;
+
+/// Writes `args` to stdout, at once. A reader that has gone (`a ls | head
+/// -1`) ends `a` there, quietly, as SIGPIPE ends a C program; a session it
+/// was attached to goes on in the daemon.
+fn out(args: fmt::Arguments<'_>) {
+    let mut stdout = io::stdout().lock();
+    if let Err(e) = stdout.write_fmt(args).and_then(|()| stdout.flush())
+        && e.kind() == io::ErrorKind::BrokenPipe
+    {
+        std::process::exit(STDOUT_GONE);
     }
 }
 
@@ -87,40 +130,51 @@ fn daemon_cmd(daemon: &client::Daemon, action: Daemon) -> io::Result<()> {
         Daemon::Status => {
             let d = client::diagnose(home);
             match (d.pid, client::status(home)) {
-                (None, _) | (_, Ok(None)) => println!("not running"),
-                (_, Ok(Some(s))) => println!(
+                (None, _) | (_, Ok(None)) => sayln!("not running"),
+                (_, Ok(Some(s))) => sayln!(
                     "running (pid {}, {}), {} sessions, {} other clients",
                     s.pid,
                     s.build,
                     s.sessions,
                     s.clients.saturating_sub(1)
                 ),
-                (Some(pid), Err(e)) => println!("running (pid {pid}) but not responding: {e}"),
+                (Some(pid), Err(e)) => sayln!("running (pid {pid}) but not responding: {e}"),
             }
-            println!("log: {}", d.log.display());
+            sayln!("log: {}", d.log.display());
             if let Some(note) = d.crash_note() {
-                println!("{note}");
+                sayln!("{note}");
             }
         }
         Daemon::Stop => {
             let stopped = client::stop(home)?;
-            println!("{}", if stopped { "stopped" } else { "not running" });
+            sayln!("{}", if stopped { "stopped" } else { "not running" });
         }
         Daemon::Restart => {
             daemon.restart()?;
-            println!("restarted");
+            sayln!("restarted");
         }
     }
     Ok(())
 }
 
-/// The full-screen client at a terminal, the line REPL anywhere else (or
-/// with `A_TUI=plain`).
-fn session(daemon: &client::Daemon, target: Target) -> io::Result<()> {
+/// One turn and out ([`once`]) on a prompt, or on what is piped to stdin
+/// (unless `A_TUI=plain` asks for the line REPL); otherwise the full-screen
+/// client at a terminal, the line REPL anywhere else, which leave `mode` to
+/// `/mode`.
+fn session(
+    daemon: &client::Daemon,
+    target: Target,
+    prompt: Option<String>,
+    mode: Option<String>,
+) -> io::Result<ExitCode> {
+    if prompt.is_some() || (!io::stdin().is_terminal() && !tui::plain()) {
+        return once::run(daemon, target, prompt, mode);
+    }
     match tui::viewport() {
         Some(viewport) => tui::run(daemon, target, viewport),
         None => repl(daemon, target),
     }
+    .map(|()| ExitCode::SUCCESS)
 }
 
 /// What wakes the line client.
@@ -197,7 +251,7 @@ impl Repl {
             None => Vec::new(),
             Some(client::Cmd::Help) => {
                 for (usage, help) in client::help(self.client.commands()) {
-                    println!("  {usage:<16} {help}");
+                    sayln!("  {usage:<16} {help}");
                 }
                 Vec::new()
             }
@@ -224,7 +278,7 @@ impl Repl {
                 self.read_stdin();
             }
             Link::Ended(End::Detached) => {
-                println!("[detached; the session keeps running. `a resume` to reattach]");
+                sayln!("[detached; the session keeps running. `a resume` to reattach]");
                 return Some(Ok(()));
             }
             Link::Ended(End::Lost(why)) if self.live => {
@@ -275,7 +329,7 @@ impl Renderer for Repl {
                 Show::Notice(notice) => eprintln!("[{notice}]"),
                 Show::Sessions => {
                     for s in self.client.sessions() {
-                        println!("  {s}");
+                        sayln!("  {s}");
                     }
                 }
                 Show::Link => self.exit = self.link(),
@@ -323,15 +377,14 @@ impl Screen {
                 session, workspace, ..
             } => {
                 self.synced = false;
-                println!("[session {} · {}]", session.short(), workspace.display());
+                sayln!("[session {} · {}]", session.short(), workspace.display());
             }
             Change::Delta { call, text } => {
                 if self.streaming != Some(*call) {
                     self.streaming = Some(*call);
-                    print!("a    ");
+                    say!("a    ");
                 }
-                print!("{text}");
-                let _ = io::stdout().flush();
+                say!("{text}");
             }
             Change::Added { item, .. } => {
                 // A retry streams its reply anew, on a line of its own.
@@ -342,7 +395,7 @@ impl Screen {
                 } = item
                     && self.streaming.take_if(|s| s == call).is_some()
                 {
-                    println!();
+                    sayln!();
                 }
                 print_all(&added(item));
             }
@@ -359,11 +412,11 @@ impl Screen {
             Change::Synced => {
                 self.synced = true;
                 if let Some(recap) = &view.recap {
-                    println!("[{}]", recap_line(recap));
+                    sayln!("[{}]", recap_line(recap));
                 }
                 for call in view.ledger.inbox() {
                     if let Some(item) = view.items.iter().find(|i| i.key() == call.0) {
-                        println!("{}", ask(&item.present()));
+                        sayln!("{}", ask(&item.present()));
                     }
                 }
             }
@@ -380,25 +433,25 @@ impl Screen {
                 // A streamed reply is on screen already; end its line.
                 let streamed = self.streaming.take_if(|s| s.0 == item.key()).is_some();
                 if streamed {
-                    println!();
+                    sayln!();
                 } else if let Shown::Markdown(text) = p.body
                     && !text.is_empty()
                 {
-                    println!("a    {text}");
+                    sayln!("a    {text}");
                 }
                 if let Some(usage) = p.usage {
-                    println!("     · {usage}");
+                    sayln!("     · {usage}");
                 }
                 if !p.status.is_empty() {
-                    println!("  └ {}", p.status);
+                    sayln!("  └ {}", p.status);
                 }
             }
             (Part::Outcome, Kind::Tool | Kind::Command | Kind::Child) => print_all(&outcome(&p)),
             (Part::Phase, _) if self.synced && p.buttons != protocol::view::Buttons::None => {
-                println!("{}", ask(&p));
+                sayln!("{}", ask(&p));
             }
             (Part::Answer { approved }, _) => {
-                println!("  · {}", answer_line(approved));
+                sayln!("  · {}", answer_line(approved));
             }
             _ => {}
         }
@@ -407,7 +460,7 @@ impl Screen {
 
 fn print_all(lines: &[String]) {
     for line in lines {
-        println!("{line}");
+        sayln!("{line}");
     }
 }
 
@@ -447,14 +500,14 @@ fn outcome(p: &Presented<'_>) -> Vec<String> {
 
 fn ls(daemon: &client::Daemon) -> io::Result<()> {
     for s in connect(daemon)?.sessions()? {
-        println!("{s}");
+        sayln!("{s}");
     }
     Ok(())
 }
 
 fn new(daemon: &client::Daemon) -> io::Result<()> {
     let session = daemon.new_session().map_err(|e| wedged(daemon, e))?;
-    println!("{}", session.short());
+    sayln!("{}", session.short());
     Ok(())
 }
 

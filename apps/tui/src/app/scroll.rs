@@ -45,7 +45,7 @@ impl App {
             };
             *slot = Some(Rows {
                 width,
-                lines: view::rows(item, width, look),
+                lines: view::presented_rows(item, &self.client.view().present(item), width, look),
                 live: None,
             });
         }

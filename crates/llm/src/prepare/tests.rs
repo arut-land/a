@@ -119,7 +119,7 @@ fn foreign_turns_lose_reasoning_state_and_long_ids() {
         .map(|call| (call.id.as_str(), call.meta.is_empty()))
         .collect();
     // Both fit to "call"; the second is kept distinct.
-    assert_eq!(ids, vec![("call", true), ("call_2", true)]);
+    assert_eq!(ids, vec![("call", true), ("2_ca", true)]);
     assert!(
         !assistant
             .content
@@ -134,7 +134,7 @@ fn foreign_turns_lose_reasoning_state_and_long_ids() {
         .iter()
         .map(|result| result.id.as_str())
         .collect();
-    assert_eq!(ids, vec!["call", "call_2"]);
+    assert_eq!(ids, vec!["call", "2_ca"]);
 }
 
 #[test]
@@ -185,4 +185,99 @@ fn a_foreign_turn_that_was_only_reasoning_disappears() {
         }),
     ]);
     assert_eq!(out.len(), 1);
+}
+
+#[test]
+fn legal_and_normalised_call_ids_remain_distinct_and_results_follow_them() {
+    for ids in [["a.b", "a_b"], ["a_b", "a.b"]] {
+        let mut provider = provider();
+        provider.protocol = std::sync::Arc::new(crate::protocols::gemini::Gemini::default());
+        let request = Request {
+            messages: vec![
+                Message::Assistant(Assistant {
+                    content: ids.iter().map(|id| call(id)).collect(),
+                    origin: Some(origin("foreign")),
+                }),
+                Message::Tool(ToolMessage {
+                    results: ids.iter().map(|id| result(id)).collect(),
+                }),
+            ]
+            .into(),
+            ..Request::default()
+        };
+        let target = Target {
+            provider: &provider,
+            model: "m",
+        };
+        let out = prepare(&request, &target);
+        let Message::Assistant(assistant) = &out.messages[0] else {
+            panic!()
+        };
+        let calls: Vec<_> = assistant.tool_calls().map(|c| c.id.clone()).collect();
+        assert_ne!(calls[0], calls[1]);
+        let Message::Tool(tool) = &out.messages[1] else {
+            panic!()
+        };
+        assert_eq!(
+            calls,
+            tool.results
+                .iter()
+                .map(|r| r.id.clone())
+                .collect::<Vec<_>>()
+        );
+    }
+}
+
+#[test]
+fn separate_turns_keep_distinct_ids_and_all_results_even_with_native_calls() {
+    for ids in [["a.b", "a_b"], ["a_b", "a.b"]] {
+        for native_at in [None, Some(0), Some(1)] {
+            let mut provider = provider();
+            provider.protocol = std::sync::Arc::new(crate::protocols::gemini::Gemini::default());
+            let mut messages = Vec::new();
+            for (at, id) in ids.iter().enumerate() {
+                let mut part = call(id);
+                part.meta_mut().clear();
+                messages.push(Message::Assistant(Assistant {
+                    content: vec![part],
+                    origin: (native_at == Some(at)).then(|| Origin {
+                        protocol: provider.protocol.key(),
+                        provider: provider.id.clone(),
+                        model: "m".into(),
+                    }),
+                }));
+                messages.push(Message::Tool(ToolMessage {
+                    results: vec![result(id)],
+                }));
+            }
+            let request = Request {
+                messages: messages.into(),
+                ..Request::default()
+            };
+            let out = prepare(
+                &request,
+                &Target {
+                    provider: &provider,
+                    model: "m",
+                },
+            );
+            let mut ids = Vec::new();
+            for pair in out.messages.as_chunks::<2>().0 {
+                let Message::Assistant(assistant) = &pair[0] else {
+                    panic!()
+                };
+                let id = assistant.tool_calls().next().unwrap().id.clone();
+                assert_eq!(provider.protocol.tool_id(&id), None);
+                let Message::Tool(tool) = &pair[1] else {
+                    panic!()
+                };
+                assert_eq!(tool.results.len(), 1);
+                assert_eq!(tool.results[0].id, id);
+                assert!(!tool.results[0].error);
+                assert_eq!(tool.results[0].output, Output::Text("ok".into()));
+                ids.push(id);
+            }
+            assert_ne!(ids[0], ids[1]);
+        }
+    }
 }

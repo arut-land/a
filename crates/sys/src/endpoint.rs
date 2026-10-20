@@ -3,6 +3,7 @@
 //! and one for a connection, so nothing above `sys` names a platform's.
 
 use std::io::{self, Read, Write};
+use std::net::Shutdown;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
@@ -77,6 +78,11 @@ impl Pass for Listener {
 pub struct Stream(imp::Stream);
 
 impl Stream {
+    /// Ends this direction for every clone, including a blocked reader.
+    pub fn shutdown(&self, how: Shutdown) -> io::Result<()> {
+        imp::shutdown(&self.0, how)
+    }
+
     pub fn try_clone(&self) -> io::Result<Self> {
         self.0.try_clone().map(Self)
     }
@@ -230,6 +236,10 @@ mod imp {
         Ok(listener)
     }
 
+    pub fn shutdown(stream: &UnixStream, how: std::net::Shutdown) -> io::Result<()> {
+        stream.shutdown(how)
+    }
+
     pub fn read_timeout(stream: &UnixStream, timeout: Option<Duration>) -> io::Result<()> {
         match stream.set_read_timeout(timeout) {
             Err(e) if e.kind() == io::ErrorKind::InvalidInput => Ok(()),
@@ -315,6 +325,10 @@ mod imp {
     }
 
     pub fn adopt(_passed: Passed) -> io::Result<OwnedHandle> {
+        Err(unsupported())
+    }
+
+    pub fn shutdown(_stream: &File, _how: std::net::Shutdown) -> io::Result<()> {
         Err(unsupported())
     }
 

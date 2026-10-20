@@ -114,6 +114,12 @@ impl<T> Inbox<T> {
         self.recv_by(Some(Instant::now() + within))
     }
 
+    /// Nothing is queued and nothing can post.
+    pub fn closed(&self) -> bool {
+        let queue = self.0.queue();
+        queue.posts == 0 && queue.first.is_empty() && queue.items.is_empty()
+    }
+
     /// The next item already queued.
     pub fn try_recv(&self) -> Option<T> {
         self.0.queue().pop()
