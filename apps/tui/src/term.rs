@@ -22,10 +22,10 @@ pub const SIGNALS: [Signal; 3] = [Signal::Resize, Signal::Terminate, Signal::Han
 /// Bracketed paste on; on the full screen also the alternate buffer and
 /// click and wheel reports (SGR) only, not every motion, which would wake
 /// the client whenever the pointer moves.
-const ENTER: &[u8] = b"\x1b[?2004h";
-const ENTER_FULL: &[u8] = b"\x1b[?1049h\x1b[?1000h\x1b[?1006h";
-const LEAVE: &[u8] = b"\x1b[0m\x1b[?2004l";
-const LEAVE_FULL: &[u8] = b"\x1b[?1006l\x1b[?1000l\x1b[?1049l";
+pub const ENTER: &[u8] = b"\x1b[?2004h";
+pub const ENTER_FULL: &[u8] = b"\x1b[?1049h\x1b[?1000h\x1b[?1006h";
+pub const LEAVE: &[u8] = b"\x1b[0m\x1b[?2004l";
+pub const LEAVE_FULL: &[u8] = b"\x1b[?1006l\x1b[?1000l\x1b[?1049l";
 
 /// The viewport we hold the terminal for and its mode before: a panic hook
 /// and the input thread restore it too.

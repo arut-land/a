@@ -11,16 +11,14 @@ mod tests;
 use std::collections::HashSet;
 use std::path::PathBuf;
 
-use client::{Cmd, Env, Event, Link, SessionClient};
-use protocol::view::{Change, Item, SessionView, Update, Usage};
-use protocol::{SessionSummary, Target};
-use ratatui_core::style::{Color, Style};
-
 use super::editor::{Edit, Editor};
 use super::keys::{Input, Key, Mouse};
 use super::render::{Canvas, Viewport};
-use super::text::{Action, Line};
+use super::text::{Action, Color, Line, Style};
 use super::view::{Live, MUTED};
+use client::{Cmd, Env, Event, Link, SessionClient};
+use protocol::view::{Change, Item, SessionView, Update, Usage};
+use protocol::{SessionSummary, Target};
 
 /// What the event loop does for the app.
 #[derive(Debug, PartialEq, Eq)]
@@ -86,6 +84,10 @@ pub struct App {
     recap_hidden: bool,
     /// The last frame, and where its buttons are.
     canvas: Canvas,
+    /// The rows under and over the transcript, composed once per frame.
+    composed: Option<draw::Composed>,
+    /// The rule over the input, at the last width.
+    rule: Line,
     /// `None` once the transcript changed.
     summary: Option<Summary>,
     /// Tokens the session's model calls used, summed as replies arrive.
@@ -131,6 +133,8 @@ impl App {
             flash: None,
             recap_hidden: false,
             canvas: Canvas::default(),
+            composed: None,
+            rule: Line::default(),
             summary: None,
             tokens: Usage::default(),
             committed: 0,

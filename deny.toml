@@ -26,8 +26,6 @@ allow = [
     "MIT",
     "Unicode-3.0",
     "Unlicense",
-    # foldhash, hashbrown's default hasher (indexmap under toml_edit; ratatui-core's caches).
-    "Zlib",
 ]
 confidence-threshold = 0.9
 
@@ -38,7 +36,7 @@ ignore = true
 multiple-versions = "deny"
 skip = [
     { crate = "getrandom@0.2.17", reason = "ring pins 0.2; uuid and tempfile are on 0.4" },
-    { crate = "syn@2.0.119", reason = "hypertext-macros (web) and strum_macros (ratatui-core, tui) are on syn 2; serde_derive, usage-derive, thiserror-impl and ext-derive on 3. Goes when hypertext moves" },
+    { crate = "syn@2.0.119", reason = "hypertext-macros (web) is on syn 2; serde_derive, usage-derive, thiserror-impl and ext-derive on 3. Goes when hypertext moves" },
 ]
 wildcards = "deny"
 allow-wildcard-paths = true
