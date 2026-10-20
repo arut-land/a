@@ -22,6 +22,10 @@ mod imp {
         pub fn take(&self) -> Vec<Signal> {
             Vec::new()
         }
+
+        pub fn wait(&self) -> Vec<Signal> {
+            Vec::new()
+        }
     }
 
     pub fn reraise(_signal: Signal) -> ! {
@@ -35,8 +39,9 @@ mod imp {
     use std::os::fd::{AsFd, AsRawFd, BorrowedFd, OwnedFd};
     use std::sync::atomic::{AtomicI32, Ordering};
 
+    use rustix::event::{PollFd, PollFlags, poll};
     use rustix::fs::{OFlags, fcntl_getfl, fcntl_setfl};
-    use rustix::io::{FdFlags, fcntl_setfd, read};
+    use rustix::io::{Errno, FdFlags, fcntl_setfd, read};
 
     use crate::Signal;
     use crate::proc::raw;
@@ -97,6 +102,23 @@ mod imp {
                 );
             }
             out
+        }
+
+        /// The signals that arrived since the last call, waited for if none
+        /// has: for a thread that has nothing else to wait on.
+        pub fn wait(&self) -> Vec<Signal> {
+            loop {
+                let got = self.take();
+                if !got.is_empty() {
+                    return got;
+                }
+                let mut fds = [PollFd::new(&self.read, PollFlags::IN)];
+                if let Err(e) = poll(&mut fds, None)
+                    && e != Errno::INTR
+                {
+                    return Vec::new();
+                }
+            }
         }
     }
 
@@ -205,6 +227,8 @@ mod imp {
                 std::thread::sleep(std::time::Duration::from_millis(10));
             }
             assert_eq!(got, [Signal::Resize]);
+            crate::signal_process(std::process::id(), Signal::Resize).unwrap();
+            assert_eq!(signals.wait(), [Signal::Resize]);
             drop(signals);
             assert_eq!(PIPE.load(Ordering::Relaxed), -1);
         }

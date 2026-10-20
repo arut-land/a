@@ -4,8 +4,11 @@ At a terminal, `a`, `a resume` and `a attach` open a full-screen client on
 the alternate screen, with the mouse. `A_TUI=inline` draws the same view in a
 viewport at the bottom of the normal screen instead, printing finished
 output into the terminal's own scrollback (no mouse; the terminal keeps its
-own scrolling and selection). `A_TUI=plain`, a pipe on stdin or stdout, or
-`TERM=dumb` keep the line REPL, which the acceptance tests drive.
+own scrolling and selection). `A_TUI=plain`, a pipe on stdout, or
+`TERM=dumb` keep the line REPL, which the acceptance tests drive (with
+`A_TUI=plain`, over pipes). A pipe on stdin, or `-p`, runs one turn and
+exits instead: see [cli.md](cli.md). `NO_COLOR` draws attributes without
+colours.
 
 ## What it shows
 
@@ -154,7 +157,11 @@ crates, three of them proc-macros, for `Buffer`, `Cell` and `Style`.
 - Signals (`sys::Signals`, the self-pipe trick: the handler writes one byte)
   reach that same `poll`: SIGWINCH is a resize, SIGTERM and SIGHUP restore
   the terminal and then end the process as the signal would have
-  (`sys::reraise`). They are caught before the terminal goes raw.
+  (`sys::reraise`). They are caught before the terminal goes raw, and
+  read for as long as the process lives, stdin gone or not. The mode is
+  restored first; the escapes that leave the screen are given half a
+  second, since a terminal nobody reads blocks every write, and must not
+  outlive a SIGTERM.
 - Input: vte decodes characters (UTF-8 split across reads included),
   controls and CSI sequences; `keys.rs` tells an ESC prefix (Alt, Alt-Enter)
   and SS3 apart itself, since vte would read either as the start of a
