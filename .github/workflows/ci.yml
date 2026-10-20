@@ -74,9 +74,40 @@ jobs:
       - *mbx-dir
       - *cache
       - *mise
-      # Release size (4 MiB) and idle daemon RSS (10 MiB) are held exactly;
+      # Idle daemon RSS (10 MiB) and the size cap (4 MiB) are held exactly;
       # cold start and attach latency too where strict, else with slack.
       - run: mise run budgets
+      # The shipped binary's size as a number to compare: this run's against
+      # the last one on main, warned about past 16 KiB (the cap stays the
+      # gate). Apple silicon is the reference lane; the other skips the
+      # second release link.
+      - if: runner.os == 'macOS'
+        run: mise run size | grep -o 'a:.*KiB' | tee size.txt
+      - if: runner.os == 'macOS'
+        uses: actions/cache/restore@v6
+        with:
+          path: main-size.txt
+          key: size-main-${{ github.sha }}
+          restore-keys: size-main-
+      - if: runner.os == 'macOS'
+        run: |
+          now=$(grep -o '[0-9]* KiB' size.txt | head -1 | cut -d' ' -f1)
+          if [[ -f main-size.txt ]]; then
+            was=$(grep -o '[0-9]* KiB' main-size.txt | head -1 | cut -d' ' -f1)
+            echo "a: $now KiB; main: $was KiB; delta: $((now - was)) KiB" | tee -a "$GITHUB_STEP_SUMMARY"
+            ((now - was <= 16)) || echo "::warning::a grew $((now - was)) KiB over main ($was -> $now KiB)"
+          fi
+          cp size.txt main-size.txt
+      - if: runner.os == 'macOS' && github.ref == 'refs/heads/main'
+        uses: actions/cache/save@v6
+        with:
+          path: main-size.txt
+          key: size-main-${{ github.sha }}
+      - if: runner.os == 'macOS'
+        uses: actions/upload-artifact@v5
+        with:
+          name: size
+          path: size.txt
 
   deny:
     runs-on: ubuntu-latest
@@ -133,19 +164,18 @@ jobs:
     # Everything builds and lints here, the daemon and `a` included: the
     # platform seams live in `sys` and `rt`, whose Windows halves the daemon
     # still lacks report that they are unsupported. `a` runs its line REPL.
-    env:
-      PORTABLE: -p sys -p rt -p protocol -p ext -p ext-chat -p ext-edit -p ext-fixtures -p ext-policy -p ext-prompt -p ext-shell -p llm -p client -p tui
+    # The whole workspace, as `mise run check:windows` lints it from Linux,
+    # so no list of crates goes stale.
     steps:
       - uses: actions/checkout@v7
       - *mbx-dir
       - *cache
       - *mise
-      - run: mise exec -- cargo clippy $PORTABLE -p engine -p a --all-targets -- -D warnings
-      - run: mise exec -- cargo check --target x86_64-pc-windows-msvc -p a
-      - run: mise exec -- cargo build -p engine -p a
+      - run: mise exec -- cargo clippy --workspace --all-targets -- -D warnings
+      - run: mise exec -- cargo build -p a
       - name: test (advisory until first green on Windows)
         continue-on-error: true
-        run: mise exec -- cargo nextest run $PORTABLE --no-tests=pass
+        run: mise exec -- cargo nextest run --workspace --no-tests=pass
 
   # The macOS app: the FFI package (boltffi pack apple --deny-skipped), the
   # reducer vectors and a live session through it in Swift, then the app
