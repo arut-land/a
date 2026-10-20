@@ -35,9 +35,6 @@ pub mod view;
 
 use std::io::{self, IsTerminal};
 
-use client::Endpoint;
-use sys::Staged;
-
 /// Where frames go.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Viewport {
@@ -45,14 +42,6 @@ pub enum Viewport {
     Full,
     /// The last rows of the normal buffer, under the scrollback.
     Inline,
-}
-
-/// The daemon to attach through, and this build (which a reconnect may
-/// start).
-#[derive(Clone)]
-pub struct Daemon {
-    pub endpoint: Endpoint,
-    pub staged: Staged,
 }
 
 /// The client to run at this terminal: none (the line REPL) unless stdin
@@ -90,6 +79,6 @@ pub use run::run;
 
 /// [`viewport`] never picks a client here.
 #[cfg(not(unix))]
-pub fn run(_: &Daemon, _: protocol::Target, _: Viewport) -> io::Result<()> {
+pub fn run(_: &client::Daemon, _: protocol::Target, _: Viewport) -> io::Result<()> {
     Err(io::ErrorKind::Unsupported.into())
 }

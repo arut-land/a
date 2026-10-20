@@ -1,7 +1,8 @@
 //! The I/O under a [`SessionClient`]: connections on their own threads,
 //! their messages handed to a sink as [`Event`]s, and the client's
-//! [`Effect`]s carried out. The sink decides where events go (a channel,
-//! a lock around the client), so every app drives a session the same way.
+//! [`Io`] effects carried out. The sink decides where events go (a
+//! channel, a lock around the client), and [`Driver::pump`] is the one
+//! loop every app drives a session with.
 //!
 //! [`SessionClient`]: crate::SessionClient
 
@@ -11,25 +12,68 @@ use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 use std::thread;
 
 use protocol::{ClientId, ClientMsg, Environment};
-use sys::Staged;
 
-use crate::{Attach, Connection, Effect, Endpoint, Event, Writer};
+use crate::{
+    Attach, ConnId, Connection, Daemon, Effect, Endpoint, Error, Event, EventKind, Io, Notice,
+    Show, Writer,
+};
 
 type Sink = dyn Fn(&Driver, Event) + Send + Sync;
 type Origin = dyn Fn() -> io::Result<Environment> + Send + Sync;
+
+/// What renders a session client's [`Show`] effects: an app's screen, a
+/// web page, a feed to another language. Showing may ask the client for
+/// more (a picker opening asks for the list), which comes back as effects.
+pub trait Renderer {
+    fn show(&mut self, shown: Vec<Show>) -> Vec<Effect>;
+}
+
+/// Shows nothing: for effects carried out where no one is watching, such
+/// as the detach of a dropped session.
+impl Renderer for () {
+    fn show(&mut self, _: Vec<Show>) -> Vec<Effect> {
+        Vec::new()
+    }
+}
+
+/// The fixpoint every app runs: the client's I/O is carried out by `io`,
+/// what it shows is rendered, and whatever rendering asks for goes round
+/// again. A message that could not be sent is shown as a notice.
+pub fn pump(
+    mut io: impl FnMut(Io) -> Result<(), Error>,
+    renderer: &mut impl Renderer,
+    mut effects: Vec<Effect>,
+) {
+    while !effects.is_empty() {
+        let mut shown = Vec::new();
+        for effect in effects {
+            match effect {
+                Effect::Io(what) => {
+                    if let Err(e) = io(what) {
+                        shown.push(Show::Notice(Notice::NotSent(e)));
+                    }
+                }
+                Effect::Show(show) => shown.push(show),
+            }
+        }
+        if shown.is_empty() {
+            return;
+        }
+        effects = renderer.show(shown);
+    }
+}
 
 /// Runs one session client's connections; cheap to clone.
 #[derive(Clone)]
 pub struct Driver(Arc<Inner>);
 
 struct Inner {
-    endpoint: Endpoint,
-    staged: Staged,
+    daemon: Daemon,
     /// Who the session client is, on every connection it makes.
     client: ClientId,
     /// The newest connection asked for, and its write half once it is up.
     latest: AtomicU64,
-    writer: Mutex<Option<(u64, Writer)>>,
+    writer: Mutex<Option<(ConnId, Writer)>>,
     /// This client's environment, for `/env refresh`.
     origin: Box<Origin>,
     sink: Box<Sink>,
@@ -40,27 +84,20 @@ fn lock<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
 }
 
 impl Driver {
-    /// A driver reaching the daemon at `endpoint` as build `staged`,
-    /// handing what happens to `sink`.
-    pub fn new(
-        endpoint: Endpoint,
-        staged: Staged,
-        sink: impl Fn(&Self, Event) + Send + Sync + 'static,
-    ) -> Self {
-        Self::with_origin(endpoint, staged, crate::capture, sink)
+    /// A driver reaching `daemon`, handing what happens to `sink`.
+    pub fn new(daemon: Daemon, sink: impl Fn(&Self, Event) + Send + Sync + 'static) -> Self {
+        Self::with_origin(daemon, crate::capture, sink)
     }
 
     /// [`Driver::new`], refreshing the environment from `origin` rather
     /// than this process's.
     pub fn with_origin(
-        endpoint: Endpoint,
-        staged: Staged,
+        daemon: Daemon,
         origin: impl Fn() -> io::Result<Environment> + Send + Sync + 'static,
         sink: impl Fn(&Self, Event) + Send + Sync + 'static,
     ) -> Self {
         Self(Arc::new(Inner {
-            endpoint,
-            staged,
+            daemon,
             client: ClientId::new(),
             latest: AtomicU64::new(0),
             writer: Mutex::new(None),
@@ -69,63 +106,64 @@ impl Driver {
         }))
     }
 
-    pub fn endpoint(&self) -> &Endpoint {
-        &self.0.endpoint
+    pub fn daemon(&self) -> &Daemon {
+        &self.0.daemon
     }
 
-    /// Carries out `effect` if it is the driver's, handing back the app's
-    /// effects and, for a message it could not send, a notice saying so.
-    pub fn apply(&self, effect: Effect) -> Option<Effect> {
-        let sent = match effect {
-            Effect::Connect {
-                id,
+    /// [`pump`] with this driver's I/O.
+    pub fn pump(&self, renderer: &mut impl Renderer, effects: Vec<Effect>) {
+        pump(|io| self.io(io), renderer, effects);
+    }
+
+    /// Carries out `io`.
+    pub fn io(&self, io: Io) -> Result<(), Error> {
+        match io {
+            Io::Connect {
+                conn,
                 attach,
                 restart,
             } => {
-                self.0.latest.fetch_max(id, Ordering::AcqRel);
+                self.0.latest.fetch_max(conn.0, Ordering::AcqRel);
                 let driver = self.clone();
-                thread::spawn(move || driver.connect(id, &attach, restart));
+                thread::spawn(move || driver.connect(conn, &attach, restart));
                 Ok(())
             }
-            Effect::Send(msg) => self.write(&msg),
-            Effect::SendEnvironment => {
-                (self.0.origin)().and_then(|env| self.write(&ClientMsg::Environment(env)))
+            Io::Send(msg) => self.write(&msg),
+            Io::SendEnvironment => {
+                let env = (self.0.origin)()?;
+                self.write(&ClientMsg::Environment(env))
             }
-            Effect::Hangup => {
+            Io::Hangup => {
                 lock(&self.0.writer).take();
                 Ok(())
             }
-            app => return Some(app),
-        };
-        sent.err().map(|e| Effect::Notice(format!("not sent: {e}")))
-    }
-
-    fn write(&self, msg: &ClientMsg) -> io::Result<()> {
-        match &mut *lock(&self.0.writer) {
-            Some((_, writer)) => writer.send(msg),
-            None => Err(io::Error::new(io::ErrorKind::NotConnected, "not connected")),
         }
     }
 
-    /// Opens connection `id` on this thread, attaching as `attach` says
+    fn write(&self, msg: &ClientMsg) -> Result<(), Error> {
+        match &mut *lock(&self.0.writer) {
+            Some((_, writer)) => Ok(writer.send(msg)?),
+            None => Err(Error::Closed),
+        }
+    }
+
+    /// Opens connection `conn` on this thread, attaching as `attach` says
     /// (after replacing the daemon when `restart`), then reads it on its
     /// own. A daemon that does not answer is diagnosed.
-    pub fn connect(&self, id: u64, attach: &Attach, restart: bool) {
-        self.0.latest.fetch_max(id, Ordering::AcqRel);
-        let sink = |event| (self.0.sink)(self, event);
-        let on_drain = || sink(Event::Waiting { id });
-        let first = |conn: &Connection| Ok(vec![conn.attach(attach)?]);
-        let made = match &self.0.endpoint {
-            Endpoint::Local(home) if restart => {
-                crate::restart(home, &self.0.staged, Some(self.0.client)).and_then(|mut conn| {
-                    conn.send_all(&first(&conn)?)?;
-                    Ok(conn)
-                })
-            }
-            endpoint => {
-                let client = Some(self.0.client);
-                crate::connect_with(endpoint, &self.0.staged, client, &on_drain, &first)
-            }
+    pub fn connect(&self, conn: ConnId, attach: &Attach, restart: bool) {
+        self.0.latest.fetch_max(conn.0, Ordering::AcqRel);
+        let sink = |kind| (self.0.sink)(self, Event { conn, kind });
+        let on_drain = || sink(EventKind::Waiting);
+        let first = |c: &Connection| Ok(vec![c.attach(attach)?]);
+        let daemon = &self.0.daemon;
+        let client = Some(self.0.client);
+        let made = match &daemon.endpoint {
+            Endpoint::Local(home) if restart => crate::restart(home, &daemon.staged, client)
+                .and_then(|mut c| {
+                    c.send_all(&first(&c)?)?;
+                    Ok(c)
+                }),
+            _ => daemon.connect_as(client, &on_drain, &first),
         };
         let Connection {
             mut reader,
@@ -134,31 +172,26 @@ impl Driver {
             welcome,
             commands,
         } = match made {
-            Ok(conn) => conn,
+            Ok(c) => c,
             Err(e) => {
-                return sink(match &self.0.endpoint {
-                    Endpoint::Local(home) if e.kind() == io::ErrorKind::TimedOut => Event::Wedged {
-                        id,
-                        diagnosis: crate::diagnose(home),
-                    },
-                    _ => Event::Failed {
-                        id,
-                        why: e.to_string(),
-                    },
+                return sink(match &daemon.endpoint {
+                    Endpoint::Local(home) if e == Error::NotResponding => {
+                        EventKind::Wedged(crate::diagnose(home))
+                    }
+                    _ => EventKind::Failed(e),
                 });
             }
         };
         {
             let mut slot = lock(&self.0.writer);
             // Replaced while it was being made.
-            if id < self.0.latest.load(Ordering::Acquire) {
+            if conn.0 < self.0.latest.load(Ordering::Acquire) {
                 let _ = writer.send(&ClientMsg::Detach);
                 return;
             }
-            *slot = Some((id, writer));
+            *slot = Some((conn, writer));
         }
-        sink(Event::Connected {
-            id,
+        sink(EventKind::Connected {
             welcome,
             remote: remote.is_some(),
             commands,
@@ -167,18 +200,74 @@ impl Driver {
         thread::spawn(move || {
             let why = loop {
                 match reader.recv() {
-                    Ok(Some(msg)) => (driver.0.sink)(&driver, Event::Msg { id, msg }),
-                    Ok(None) => break "the daemon closed the connection".to_owned(),
-                    Err(e) => break e.to_string(),
+                    Ok(Some(msg)) => (driver.0.sink)(
+                        &driver,
+                        Event {
+                            conn,
+                            kind: EventKind::Msg(msg),
+                        },
+                    ),
+                    Ok(None) => break Error::Closed,
+                    Err(e) => break e.into(),
                 }
             };
             {
                 let mut slot = lock(&driver.0.writer);
-                if slot.as_ref().is_some_and(|(i, _)| *i == id) {
+                if slot.as_ref().is_some_and(|(c, _)| *c == conn) {
                     slot.take();
                 }
             }
-            (driver.0.sink)(&driver, Event::Closed { id, why });
+            (driver.0.sink)(
+                &driver,
+                Event {
+                    conn,
+                    kind: EventKind::Closed(why),
+                },
+            );
         });
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A renderer that asks for one more thing the first time it is shown
+    /// anything.
+    struct Again(bool);
+
+    impl Renderer for Again {
+        fn show(&mut self, _: Vec<Show>) -> Vec<Effect> {
+            if std::mem::replace(&mut self.0, true) {
+                Vec::new()
+            } else {
+                vec![Effect::Io(Io::Hangup), Effect::Show(Show::Link)]
+            }
+        }
+    }
+
+    #[test]
+    fn the_pump_runs_until_the_renderer_asks_for_nothing_more() {
+        let mut done = Vec::new();
+        let mut renderer = Again(false);
+        pump(
+            |io| {
+                done.push(io);
+                Ok(())
+            },
+            &mut renderer,
+            vec![Effect::Show(Show::Sessions)],
+        );
+        assert!(renderer.0 && matches!(done[..], [Io::Hangup]));
+        // Nothing to render, nothing to pump; a failed send is rendered.
+        let mut renderer = Again(false);
+        pump(|_| Ok(()), &mut renderer, vec![Effect::Io(Io::Hangup)]);
+        assert!(!renderer.0);
+        pump(
+            |_| Err(Error::Closed),
+            &mut renderer,
+            vec![Effect::Io(Io::Hangup)],
+        );
+        assert!(renderer.0);
     }
 }

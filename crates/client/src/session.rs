@@ -7,10 +7,12 @@
 //! What every client used to decide on its own is decided here once:
 //! reconnecting after a drain (by id, from the last seq, never sending the
 //! environment again), a detach never reading as a lost daemon, a wedged
-//! daemon, input given while reconnecting, and whether a turn runs, waits
-//! on this client, or takes an interrupt or a steer.
+//! daemon, input given while reconnecting, and which intents the session
+//! takes now ([`Offer`]): an app cannot build a steer no turn is running
+//! for, or an approval no call waits for.
 
 use std::collections::VecDeque;
+use std::fmt;
 use std::path::PathBuf;
 
 use protocol::view::{Change, SessionList, SessionView, Update};
@@ -19,19 +21,28 @@ use protocol::{
     SessionSummary, Target,
 };
 
-use crate::{Cmd, Diagnosis, Welcome};
+use crate::{Cmd, Diagnosis, Error, Welcome};
+
+/// A connection, numbered by the client that asked for it: events from
+/// one it has since replaced are dropped.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct ConnId(pub u64);
 
 /// Where this client's link to the daemon stands.
 #[derive(Clone, Debug)]
 pub enum Link {
     /// Opening a connection and attaching.
     Connecting,
-    /// Attached; `synced` once the replay of what was missed is in.
-    Live {
+    /// Attached; the replay of what was missed is coming in.
+    Replaying {
         welcome: Welcome,
         /// The daemon is another host's.
         remote: bool,
-        synced: bool,
+    },
+    /// Attached and synced: what arrives now is live.
+    Live {
+        welcome: Welcome,
+        remote: bool,
     },
     /// The daemon finishes its work for a newer build, then closes the
     /// connection (or, while connecting, a draining daemon is waited out).
@@ -50,8 +61,8 @@ pub enum Link {
 pub enum End {
     /// This client left; the session keeps running.
     Detached,
-    /// The daemon is gone, or would not serve this client, as it says.
-    Lost(String),
+    /// The daemon is gone, or would not serve this client.
+    Lost(Error),
 }
 
 impl Link {
@@ -60,12 +71,26 @@ impl Link {
     pub const fn attached(&self) -> bool {
         !matches!(self, Self::Wedged(_) | Self::Ended(_))
     }
+
+    /// Whether the connection is up: what is sent goes out now.
+    pub const fn up(&self) -> bool {
+        matches!(self, Self::Replaying { .. } | Self::Live { .. })
+    }
+
+    /// Whether the daemon is another host's.
+    pub const fn remote(&self) -> bool {
+        matches!(
+            self,
+            Self::Replaying { remote: true, .. } | Self::Live { remote: true, .. }
+        )
+    }
 }
 
 /// Which environment an attach gives the session.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum Env {
-    /// None: the session keeps the one it has.
+    /// None: the session keeps the one it has, and nothing of this
+    /// process's is captured.
     Keep,
     /// The origin's: this process's, or a remote daemon's bridge's.
     Origin,
@@ -95,47 +120,47 @@ impl Attach {
     }
 }
 
-/// What the driver tells the client, from connection `id`.
+/// What the driver tells the client, from connection `conn`.
 #[derive(Debug)]
-pub enum Event {
+pub struct Event {
+    pub conn: ConnId,
+    pub kind: EventKind,
+}
+
+#[derive(Debug)]
+pub enum EventKind {
     Connected {
-        id: u64,
         welcome: Welcome,
         remote: bool,
         commands: Vec<CommandInfo>,
     },
-    Msg {
-        id: u64,
-        msg: DaemonMsg,
-    },
+    Msg(DaemonMsg),
     /// A daemon draining for a newer build is waited out before the
     /// connection is made.
-    Waiting {
-        id: u64,
-    },
-    Closed {
-        id: u64,
-        why: String,
-    },
+    Waiting,
+    /// The connection closed, as `Error` says.
+    Closed(Error),
     /// The daemon did not answer the hello.
-    Wedged {
-        id: u64,
-        diagnosis: Diagnosis,
-    },
+    Wedged(Diagnosis),
     /// The connection could not be made.
-    Failed {
-        id: u64,
-        why: String,
-    },
+    Failed(Error),
 }
 
-/// What the client asks of its driver, and tells its app.
+/// What the client asks of its driver ([`Io`]) and tells its app
+/// ([`Show`]).
 #[derive(Debug)]
 pub enum Effect {
-    /// Open connection `id` and make `attach` on it, replacing any other
-    /// (`restart`: replacing the daemon first).
+    Io(Io),
+    Show(Show),
+}
+
+/// What the driver does for the client.
+#[derive(Debug)]
+pub enum Io {
+    /// Open connection `conn` and make `attach` on it, replacing any
+    /// other (`restart`: replacing the daemon first).
     Connect {
-        id: u64,
+        conn: ConnId,
         attach: Attach,
         restart: bool,
     },
@@ -144,20 +169,52 @@ pub enum Effect {
     SendEnvironment,
     /// Close the connection.
     Hangup,
-    /// For the app: the view changed so.
+}
+
+/// What the app renders.
+#[derive(Debug)]
+pub enum Show {
+    /// The view changed so.
     View(Update),
-    /// For the app: [`SessionClient::link`] changed.
+    /// [`SessionClient::link`] changed.
     Link,
-    /// For the app: [`SessionClient::sessions`] changed.
+    /// [`SessionClient::sessions`] changed.
     Sessions,
-    /// For the app: something to tell the person.
-    Notice(String),
+    /// Something to tell the person.
+    Notice(Notice),
+}
+
+/// Why an intent went nowhere.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum Notice {
+    NotConnected,
+    /// A steer or an interrupt while no turn runs.
+    NothingRunning,
+    /// An answer for a call that is not waiting for one.
+    NotAsking(CallId),
+    /// `/env refresh` on a remote daemon, whose environment is its
+    /// bridge's.
+    RemoteEnv,
+    /// The driver could not send a message.
+    NotSent(Error),
+}
+
+impl fmt::Display for Notice {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::NotConnected => f.write_str("not connected"),
+            Self::NothingRunning => f.write_str("nothing is running"),
+            Self::NotAsking(call) => write!(f, "call {call} is not waiting for an answer"),
+            Self::RemoteEnv => f.write_str(
+                "the host's environment is captured when `a` connects; reattach to refresh it",
+            ),
+            Self::NotSent(e) => write!(f, "not sent: {e}"),
+        }
+    }
 }
 
 /// What a client's controls offer for the session's turn: computed here,
 /// so no app derives it.
-// Flags, as the apps' controls read them.
-#[allow(clippy::struct_excessive_bools)]
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct TurnView {
     /// A call is unsettled.
@@ -165,11 +222,8 @@ pub struct TurnView {
     /// The oldest call waiting for an approval.
     pub asking: Option<CallId>,
     pub asks: u32,
-    /// An interrupt has something to stop.
+    /// An interrupt has something to stop, and a steer a turn to reach.
     pub can_interrupt: bool,
-    /// A steer reaches the running turn before its next step, rather than
-    /// waiting for it as input.
-    pub can_steer: bool,
     /// Input reaches the daemon, now or once reconnected.
     pub can_send: bool,
 }
@@ -185,23 +239,19 @@ pub struct SessionClient {
     /// The daemon's slash commands.
     commands: Vec<CommandInfo>,
     /// The connection events are taken from; older ones are replaced.
-    id: u64,
+    conn: ConnId,
     /// The environment an [`Cmd::Open`] attaches with.
     env: Env,
     /// The attach last asked for: a restart makes it again.
     opened: Attach,
     /// The number of the last mutation sent.
     seq: u64,
-    /// Messages given while not live, sent once live.
+    /// Messages given while the connection is down, sent once it is up.
     queued: Vec<ClientMsg>,
     /// Mutations sent and not yet answered: one refused because the daemon
     /// was draining is sent again, once, after the reattach.
     unanswered: VecDeque<ClientMsg>,
 }
-
-const NOT_CONNECTED: &str = "not connected";
-const REMOTE_ENV: &str =
-    "the host's environment is captured when `a` connects; reattach to refresh it";
 
 impl SessionClient {
     /// A client whose own opens attach with `env`.
@@ -211,7 +261,7 @@ impl SessionClient {
             view: SessionView::default(),
             sessions: SessionList::default(),
             commands: Vec::new(),
-            id: 0,
+            conn: ConnId::default(),
             opened: Attach::new(Target::New, env.clone()),
             env,
             seq: 0,
@@ -238,13 +288,8 @@ impl SessionClient {
     }
 
     /// The connection events are taken from.
-    pub const fn connection(&self) -> u64 {
-        self.id
-    }
-
-    /// Whether the daemon is another host's.
-    pub const fn remote(&self) -> bool {
-        matches!(self.link, Link::Live { remote: true, .. })
+    pub const fn connection(&self) -> ConnId {
+        self.conn
     }
 
     pub fn turn(&self) -> TurnView {
@@ -257,8 +302,17 @@ impl SessionClient {
             asking,
             asks,
             can_interrupt: running && self.link.attached(),
-            can_steer: running && self.link.attached(),
             can_send: self.link.attached(),
+        }
+    }
+
+    /// What this client may ask of the session now; nothing unless
+    /// attached, now or once reconnected.
+    pub fn offer(&mut self) -> Result<Offer<'_>, Notice> {
+        if self.link.attached() {
+            Ok(Offer(self))
+        } else {
+            Err(Notice::NotConnected)
         }
     }
 
@@ -271,11 +325,7 @@ impl SessionClient {
 
     /// Makes `attach` on a new connection, leaving the current one.
     pub fn attach(&mut self, attach: Attach) -> Vec<Effect> {
-        let mut out = Vec::new();
-        if matches!(self.link, Link::Live { .. }) {
-            out.push(Effect::Send(ClientMsg::Detach));
-        }
-        out.push(Effect::Hangup);
+        let mut out = self.leave();
         self.opened = attach.clone();
         self.connect(attach, false, Link::Connecting, &mut out);
         out
@@ -285,7 +335,7 @@ impl SessionClient {
     /// keeping its environment, or as first asked.
     pub fn restart(&mut self) -> Vec<Effect> {
         let attach = self.reattach().unwrap_or_else(|| self.opened.clone());
-        let mut out = vec![Effect::Hangup];
+        let mut out = vec![Effect::Io(Io::Hangup)];
         self.connect(attach, true, Link::Connecting, &mut out);
         out
     }
@@ -296,53 +346,50 @@ impl SessionClient {
         if matches!(self.link, Link::Ended(_)) {
             return Vec::new();
         }
-        let mut out = Vec::new();
-        if matches!(self.link, Link::Live { .. }) {
-            out.push(Effect::Send(ClientMsg::Detach));
-        }
-        out.extend([Effect::Hangup, Effect::Link]);
-        self.link = Link::Ended(End::Detached);
-        self.queued.clear();
+        let mut out = self.leave();
+        self.end(End::Detached, &mut out);
         out
     }
 
-    /// Carries out `cmd`. [`Cmd::Help`] is the app's to show.
-    pub fn run(&mut self, cmd: Cmd) -> Vec<Effect> {
-        match cmd {
-            Cmd::Input(text) => self.send(ClientMsg::input(text)),
-            Cmd::Steer(text) => self.send(ClientMsg::Input {
-                text,
-                mode: Mode::Steer,
-                client_seq: None,
-            }),
-            Cmd::Approve { call, approved } => self.send(ClientMsg::approve(call, approved)),
-            Cmd::Interrupt => self.send(ClientMsg::INTERRUPT),
-            Cmd::Detach => self.detach(),
-            Cmd::RefreshEnv if self.remote() => vec![Effect::Notice(REMOTE_ENV.to_owned())],
-            Cmd::RefreshEnv if matches!(self.link, Link::Live { .. }) => {
-                vec![Effect::SendEnvironment]
-            }
-            Cmd::RefreshEnv => vec![Effect::Notice(NOT_CONNECTED.to_owned())],
-            Cmd::Sessions => self.send(ClientMsg::List),
-            Cmd::Open(target) => self.open(target),
-            Cmd::Help => Vec::new(),
+    /// The daemon is told when the connection is up; the connection goes
+    /// either way.
+    fn leave(&self) -> Vec<Effect> {
+        let mut out = Vec::new();
+        if self.link.up() {
+            out.push(Effect::Io(Io::Send(ClientMsg::Detach)));
         }
+        out.push(Effect::Io(Io::Hangup));
+        out
     }
 
-    /// Sends `msg` once live, numbered if it is a mutation.
-    pub fn send(&mut self, msg: ClientMsg) -> Vec<Effect> {
+    /// Carries out `cmd`; what the session does not offer is a
+    /// [`Notice`]. [`Cmd::Help`] is the app's to show.
+    pub fn run(&mut self, cmd: Cmd) -> Vec<Effect> {
+        let done = match cmd {
+            Cmd::Input(text) => self.offer().map(|o| o.input(text)),
+            Cmd::Steer(text) => self.offer().and_then(|o| o.steer(text)),
+            Cmd::Approve { call, approved } => self.offer().and_then(|o| o.approve(call, approved)),
+            Cmd::Interrupt => self.offer().and_then(Offer::interrupt),
+            Cmd::RefreshEnv => self.offer().and_then(Offer::refresh_env),
+            Cmd::Detach => Ok(self.detach()),
+            Cmd::Sessions => self.offer().map(|o| o.0.send(ClientMsg::List)),
+            Cmd::Open(target) => Ok(self.open(target)),
+            Cmd::Help => Ok(Vec::new()),
+        };
+        done.unwrap_or_else(|notice| vec![Effect::Show(Show::Notice(notice))])
+    }
+
+    /// Sends `msg` once the connection is up, numbered if it is a
+    /// mutation.
+    fn send(&mut self, msg: ClientMsg) -> Vec<Effect> {
         let mut out = Vec::new();
         self.put(msg, &mut out);
         out
     }
 
     fn put(&mut self, mut msg: ClientMsg, out: &mut Vec<Effect>) {
-        if !matches!(self.link, Link::Live { .. }) {
-            if self.link.attached() {
-                self.queued.push(msg);
-            } else {
-                out.push(Effect::Notice(NOT_CONNECTED.to_owned()));
-            }
+        if !self.link.up() {
+            self.queued.push(msg);
             return;
         }
         if let Some(seq @ None) = msg.client_seq_mut() {
@@ -353,65 +400,52 @@ impl SessionClient {
             }
             self.unanswered.push_back(msg.clone());
         }
-        out.push(Effect::Send(msg));
+        out.push(Effect::Io(Io::Send(msg)));
     }
 
     /// Takes in what the driver reports.
     pub fn step(&mut self, event: Event) -> Vec<Effect> {
         let mut out = Vec::new();
-        let id = match &event {
-            Event::Connected { id, .. }
-            | Event::Msg { id, .. }
-            | Event::Waiting { id }
-            | Event::Closed { id, .. }
-            | Event::Wedged { id, .. }
-            | Event::Failed { id, .. } => *id,
-        };
         // From a connection since replaced, or after the end.
-        if id != self.id || matches!(self.link, Link::Ended(_)) {
+        if event.conn != self.conn || matches!(self.link, Link::Ended(_)) {
             return out;
         }
-        match event {
-            Event::Connected {
+        match event.kind {
+            EventKind::Connected {
                 welcome,
                 remote,
                 commands,
-                ..
             } => {
-                self.link = Link::Live {
-                    welcome,
-                    remote,
-                    synced: false,
-                };
                 self.commands = commands;
                 // Neither answered nor refused on the last connection: sent
                 // again, and the daemon, which logs who sent what, does each
                 // once.
-                out.extend(self.unanswered.iter().cloned().map(Effect::Send));
-                out.push(Effect::Link);
+                out.extend(
+                    self.unanswered
+                        .iter()
+                        .cloned()
+                        .map(|msg| Effect::Io(Io::Send(msg))),
+                );
+                self.go(Link::Replaying { welcome, remote }, &mut out);
                 for msg in std::mem::take(&mut self.queued) {
                     self.put(msg, &mut out);
                 }
             }
-            Event::Msg { msg, .. } => self.msg(&msg, &mut out),
-            Event::Waiting { .. } => {
+            EventKind::Msg(msg) => self.msg(&msg, &mut out),
+            EventKind::Waiting => {
                 if matches!(self.link, Link::Connecting | Link::Reconnecting { .. }) {
-                    self.link = Link::Draining;
-                    out.push(Effect::Link);
+                    self.go(Link::Draining, &mut out);
                 }
             }
-            Event::Closed { why, .. } => match self.reattach() {
+            EventKind::Closed(why) => match self.reattach() {
                 Some(attach) if matches!(self.link, Link::Draining) => {
                     let since = attach.since;
                     self.connect(attach, false, Link::Reconnecting { since }, &mut out);
                 }
                 _ => self.end(End::Lost(why), &mut out),
             },
-            Event::Wedged { diagnosis, .. } => {
-                self.link = Link::Wedged(diagnosis);
-                out.push(Effect::Link);
-            }
-            Event::Failed { why, .. } => self.end(End::Lost(why), &mut out),
+            EventKind::Wedged(diagnosis) => self.go(Link::Wedged(diagnosis), &mut out),
+            EventKind::Failed(why) => self.end(End::Lost(why), &mut out),
         }
         out
     }
@@ -420,7 +454,7 @@ impl SessionClient {
         match msg {
             DaemonMsg::Sessions { .. } => {
                 self.sessions.fold(msg);
-                out.push(Effect::Sessions);
+                out.push(Effect::Show(Show::Sessions));
                 return;
             }
             DaemonMsg::Ack { client_seq } => {
@@ -450,22 +484,22 @@ impl SessionClient {
         };
         match &update.change {
             Change::Synced => {
-                if let Link::Live { synced, .. } = &mut self.link {
-                    *synced = true;
+                if let Link::Replaying { welcome, remote } = self.link {
+                    self.link = Link::Live { welcome, remote };
                 }
-                out.push(Effect::View(update));
-                out.push(Effect::Link);
+                out.push(Effect::Show(Show::View(update)));
+                out.push(Effect::Show(Show::Link));
                 return;
             }
             Change::Draining => {
                 self.link = Link::Draining;
-                out.push(Effect::View(update));
-                out.push(Effect::Link);
+                out.push(Effect::Show(Show::View(update)));
+                out.push(Effect::Show(Show::Link));
                 return;
             }
             _ => {}
         }
-        out.push(Effect::View(update));
+        out.push(Effect::Show(Show::View(update)));
     }
 
     /// The attach that picks the session shown up again where the view
@@ -480,20 +514,79 @@ impl SessionClient {
     }
 
     fn connect(&mut self, attach: Attach, restart: bool, link: Link, out: &mut Vec<Effect>) {
-        self.id += 1;
-        self.link = link;
-        out.push(Effect::Connect {
-            id: self.id,
+        self.conn.0 += 1;
+        out.push(Effect::Io(Io::Connect {
+            conn: self.conn,
             attach,
             restart,
-        });
-        out.push(Effect::Link);
+        }));
+        self.go(link, out);
     }
 
     fn end(&mut self, end: End, out: &mut Vec<Effect>) {
-        self.link = Link::Ended(end);
         self.queued.clear();
-        out.extend([Effect::Hangup, Effect::Link]);
+        self.go(Link::Ended(end), out);
+    }
+
+    /// Moves the link to `link`, which the app is told of.
+    fn go(&mut self, link: Link, out: &mut Vec<Effect>) {
+        self.link = link;
+        out.push(Effect::Show(Show::Link));
+    }
+}
+
+/// What the session takes from this client now: made by
+/// [`SessionClient::offer`] only while attached, and each intent only
+/// while the turn is in a state to take it.
+pub struct Offer<'a>(&'a mut SessionClient);
+
+impl Offer<'_> {
+    /// A message, or a slash command the daemon runs.
+    pub fn input(self, text: String) -> Vec<Effect> {
+        self.0.send(ClientMsg::input(text))
+    }
+
+    /// Input for the running turn, before its next step.
+    pub fn steer(self, text: String) -> Result<Vec<Effect>, Notice> {
+        self.running()?;
+        Ok(self.0.send(ClientMsg::Input {
+            text,
+            mode: Mode::Steer,
+            client_seq: None,
+        }))
+    }
+
+    /// Stops the running turn.
+    pub fn interrupt(self) -> Result<Vec<Effect>, Notice> {
+        self.running()?;
+        Ok(self.0.send(ClientMsg::INTERRUPT))
+    }
+
+    /// Answers the approval call `call` waits for.
+    pub fn approve(self, call: CallId, approved: bool) -> Result<Vec<Effect>, Notice> {
+        if !self.0.view.ledger.inbox().any(|c| c == call) {
+            return Err(Notice::NotAsking(call));
+        }
+        Ok(self.0.send(ClientMsg::approve(call, approved)))
+    }
+
+    /// Sends this client's environment again.
+    pub fn refresh_env(self) -> Result<Vec<Effect>, Notice> {
+        if self.0.link.remote() {
+            return Err(Notice::RemoteEnv);
+        }
+        if !self.0.link.up() {
+            return Err(Notice::NotConnected);
+        }
+        Ok(vec![Effect::Io(Io::SendEnvironment)])
+    }
+
+    fn running(&self) -> Result<(), Notice> {
+        if self.0.turn().running {
+            Ok(())
+        } else {
+            Err(Notice::NothingRunning)
+        }
     }
 }
 
@@ -505,33 +598,67 @@ const fn numbered(msg: &ClientMsg, seq: u64) -> bool {
 mod tests {
     use std::path::PathBuf;
 
-    use protocol::{
-        Audience, Body, CallId, Caps, Entry, Epoch, Json, Permission, Seq, SessionId, Verdict,
-    };
+    use protocol::{Audience, Body, Caps, Entry, Epoch, Json, Permission, Seq, SessionId, Verdict};
 
     use super::*;
 
-    fn live(caps: Caps) -> Event {
-        Event::Connected {
-            id: 1,
-            welcome: Welcome {
-                proto: protocol::PROTO,
-                caps,
+    fn live(conn: u64, caps: Caps) -> Event {
+        Event {
+            conn: ConnId(conn),
+            kind: EventKind::Connected {
+                welcome: Welcome {
+                    proto: protocol::PROTO,
+                    caps,
+                },
+                remote: false,
+                commands: Vec::new(),
             },
-            remote: false,
-            commands: Vec::new(),
         }
     }
 
-    fn msg(id: u64, msg: DaemonMsg) -> Event {
-        Event::Msg { id, msg }
+    fn msg(conn: u64, msg: DaemonMsg) -> Event {
+        Event {
+            conn: ConnId(conn),
+            kind: EventKind::Msg(msg),
+        }
+    }
+
+    fn closed(conn: u64) -> Event {
+        Event {
+            conn: ConnId(conn),
+            kind: EventKind::Closed(Error::Closed),
+        }
     }
 
     fn sends(effects: &[Effect]) -> Vec<&ClientMsg> {
         effects
             .iter()
             .filter_map(|e| match e {
-                Effect::Send(m) => Some(m),
+                Effect::Io(Io::Send(m)) => Some(m),
+                _ => None,
+            })
+            .collect()
+    }
+
+    fn connects(effects: &[Effect]) -> Vec<(ConnId, &Attach, bool)> {
+        effects
+            .iter()
+            .filter_map(|e| match e {
+                Effect::Io(Io::Connect {
+                    conn,
+                    attach,
+                    restart,
+                }) => Some((*conn, attach, *restart)),
+                _ => None,
+            })
+            .collect()
+    }
+
+    fn notices(effects: &[Effect]) -> Vec<&Notice> {
+        effects
+            .iter()
+            .filter_map(|e| match e {
+                Effect::Show(Show::Notice(n)) => Some(n),
                 _ => None,
             })
             .collect()
@@ -544,7 +671,7 @@ mod tests {
         client.open(Target::Latest {
             any_workspace: false,
         });
-        client.step(live(Caps::ALL));
+        client.step(live(1, Caps::ALL));
         client.step(msg(
             1,
             DaemonMsg::Attached {
@@ -569,39 +696,56 @@ mod tests {
         (client, session)
     }
 
+    fn bash_call(seq: u64) -> DaemonMsg {
+        DaemonMsg::Entry(Entry::new(
+            Seq::new(seq).unwrap(),
+            Epoch(1),
+            Body::ToolCall {
+                tool: "bash".into(),
+                input: Json::encode(&serde_json::json!({ "command": "ls" })).unwrap(),
+                id: None,
+                card: None,
+                by: Audience::Model,
+            },
+        ))
+    }
+
+    fn ask(seq: u64, call: u64) -> DaemonMsg {
+        DaemonMsg::Entry(Entry::new(
+            Seq::new(seq).unwrap(),
+            Epoch(1),
+            Body::Decision {
+                by: "policy".into(),
+                call: CallId::new(call),
+                d: Verdict::Permission {
+                    permission: Permission::Ask,
+                },
+            },
+        ))
+    }
+
     #[test]
     fn a_reattach_after_drain_never_resends_the_environment() {
         let (mut client, session) = attached(Env::Origin);
         client.step(msg(1, DaemonMsg::Draining));
         assert!(matches!(client.link(), Link::Draining));
-        let out = client.step(Event::Closed {
-            id: 1,
-            why: "closed".into(),
-        });
-        let [
-            Effect::Connect {
-                id,
-                attach,
-                restart,
-            },
-            Effect::Link,
-        ] = &out[..]
-        else {
+        let out = client.step(closed(1));
+        let [(conn, attach, restart)] = connects(&out)[..] else {
             panic!("{out:?}");
         };
-        assert_eq!((*id, *restart), (2, false));
+        assert_eq!((conn, restart), (ConnId(2), false));
         assert_eq!(attach.target, Target::Id(session));
         assert_eq!((attach.since, &attach.env), (1, &Env::Keep));
         assert!(matches!(client.link(), Link::Reconnecting { since: 1 }));
 
         // A restart of a wedged daemon picks the session up the same way.
-        client.step(Event::Wedged {
-            id: 2,
-            diagnosis: Diagnosis::default(),
+        client.step(Event {
+            conn: ConnId(2),
+            kind: EventKind::Wedged(Diagnosis::default()),
         });
         let out = client.restart();
         assert!(
-            matches!(&out[1], Effect::Connect { attach, restart: true, .. } if attach.env == Env::Keep),
+            matches!(connects(&out)[..], [(_, attach, true)] if attach.env == Env::Keep),
             "{out:?}"
         );
     }
@@ -612,21 +756,18 @@ mod tests {
         let out = client.detach();
         assert!(matches!(sends(&out)[..], [ClientMsg::Detach]));
         // The daemon closing the connection is the answer, not a loss.
-        let out = client.step(Event::Closed {
-            id: 1,
-            why: "closed".into(),
-        });
+        let out = client.step(closed(1));
         assert!(out.is_empty(), "{out:?}");
         assert!(matches!(client.link(), Link::Ended(End::Detached)));
         assert!(!client.turn().can_send);
 
         // Without a detach, it is.
         let (mut client, _) = attached(Env::Origin);
-        client.step(Event::Closed {
-            id: 1,
-            why: "gone".into(),
-        });
-        assert!(matches!(client.link(), Link::Ended(End::Lost(why)) if why == "gone"));
+        client.step(closed(1));
+        assert!(matches!(
+            client.link(),
+            Link::Ended(End::Lost(Error::Closed))
+        ));
     }
 
     #[test]
@@ -634,10 +775,7 @@ mod tests {
         let (mut client, _) = attached(Env::Origin);
         let out = client.open(Target::New);
         assert!(matches!(sends(&out)[..], [ClientMsg::Detach]));
-        let out = client.step(Event::Closed {
-            id: 1,
-            why: "detached".into(),
-        });
+        let out = client.step(closed(1));
         assert!(out.is_empty());
         assert!(matches!(client.link(), Link::Connecting));
     }
@@ -655,15 +793,8 @@ mod tests {
         ));
         client.step(msg(1, DaemonMsg::Draining));
         assert!(client.run(Cmd::Input("two".into())).is_empty());
-        client.step(Event::Closed {
-            id: 1,
-            why: String::new(),
-        });
-        let mut reconnected = live(Caps::ALL);
-        if let Event::Connected { id, .. } = &mut reconnected {
-            *id = 2;
-        }
-        let out = client.step(reconnected);
+        client.step(closed(1));
+        let out = client.step(live(2, Caps::ALL));
         // Unanswered, "one" goes again under its number: a daemon that keeps
         // who sent what does it once.
         assert!(
@@ -690,80 +821,117 @@ mod tests {
         ));
         assert!(refused.is_empty(), "no error shown: {refused:?}");
         client.step(msg(1, DaemonMsg::Draining));
-        client.step(Event::Closed {
-            id: 1,
-            why: String::new(),
-        });
-        let mut reconnected = live(Caps::ALL);
-        if let Event::Connected { id, .. } = &mut reconnected {
-            *id = 2;
-        }
-        let out = client.step(reconnected);
+        client.step(closed(1));
+        let out = client.step(live(2, Caps::ALL));
         assert_eq!(sends(&out).len(), 1, "{out:?}");
         // Taken this time: a second drain does not send it again.
         client.step(msg(2, DaemonMsg::Ack { client_seq: 2 }));
         client.step(msg(2, DaemonMsg::Draining));
-        client.step(Event::Closed {
-            id: 2,
-            why: String::new(),
-        });
-        let mut again = live(Caps::ALL);
-        if let Event::Connected { id, .. } = &mut again {
-            *id = 3;
-        }
-        assert!(sends(&client.step(again)).is_empty());
+        client.step(closed(2));
+        assert!(sends(&client.step(live(3, Caps::ALL))).is_empty());
     }
 
     #[test]
     fn the_turn_says_what_runs_and_what_waits_on_this_client() {
         let (mut client, _) = attached(Env::Origin);
         assert!(!client.turn().running);
-        client.step(msg(
-            1,
-            DaemonMsg::Entry(Entry::new(
-                Seq::new(2).unwrap(),
-                Epoch(1),
-                Body::ToolCall {
-                    tool: "bash".into(),
-                    input: Json::encode(&serde_json::json!({ "command": "ls" })).unwrap(),
-                    id: None,
-                    card: None,
-                    by: Audience::Model,
-                },
-            )),
-        ));
+        client.step(msg(1, bash_call(2)));
         let turn = client.turn();
-        assert!(turn.running && turn.can_interrupt && turn.can_steer);
-        client.step(msg(
-            1,
-            DaemonMsg::Entry(Entry::new(
-                Seq::new(3).unwrap(),
-                Epoch(1),
-                Body::Decision {
-                    by: "policy".into(),
-                    call: CallId::new(2),
-                    d: Verdict::Permission {
-                        permission: Permission::Ask,
-                    },
-                },
-            )),
-        ));
+        assert!(turn.running && turn.can_interrupt);
+        client.step(msg(1, ask(3, 2)));
         assert_eq!(client.turn().asking, CallId::new(2));
         assert_eq!(client.turn().asks, 1);
+    }
+
+    #[test]
+    fn an_offer_is_made_only_while_attached_and_each_intent_only_when_the_turn_takes_it() {
+        // Connecting counts as attached: input waits for the connection.
+        let mut client = SessionClient::new(Env::Origin);
+        client.open(Target::New);
+        assert!(client.offer().unwrap().input("hi".into()).is_empty());
+        client.step(Event {
+            conn: ConnId(1),
+            kind: EventKind::Wedged(Diagnosis::default()),
+        });
+        assert_eq!(client.offer().err(), Some(Notice::NotConnected));
+        assert_eq!(
+            notices(&client.run(Cmd::Input("hi".into()))),
+            [&Notice::NotConnected]
+        );
+
+        let (mut client, _) = attached(Env::Origin);
+        // Nothing runs: input yes, a steer or an interrupt no.
+        assert_eq!(sends(&client.offer().unwrap().input("hi".into())).len(), 1);
+        assert_eq!(
+            client.offer().unwrap().steer("more".into()).err(),
+            Some(Notice::NothingRunning)
+        );
+        let two = CallId::new(2).unwrap();
+        assert_eq!(
+            client.offer().unwrap().interrupt().err(),
+            Some(Notice::NothingRunning)
+        );
+        assert_eq!(
+            client.offer().unwrap().approve(two, true).err(),
+            Some(Notice::NotAsking(two))
+        );
+        client.step(msg(1, bash_call(2)));
+        assert!(client.offer().unwrap().interrupt().is_ok());
+        assert_eq!(
+            client.offer().unwrap().approve(two, true).err(),
+            Some(Notice::NotAsking(two))
+        );
+        client.step(msg(1, ask(3, 2)));
+        assert!(matches!(
+            sends(&client.offer().unwrap().approve(two, false).unwrap())[..],
+            [ClientMsg::Approve {
+                call,
+                approved: false,
+                ..
+            }] if *call == two
+        ));
+        // Attached but reconnecting: offered, and queued until the
+        // connection is up.
+        client.step(msg(1, DaemonMsg::Draining));
+        client.step(closed(1));
+        assert!(
+            client
+                .offer()
+                .unwrap()
+                .steer("go".into())
+                .unwrap()
+                .is_empty()
+        );
+        let out = client.step(live(2, Caps::ALL));
+        // After the unanswered ones go again.
+        assert!(
+            matches!(
+                sends(&out).last(),
+                Some(ClientMsg::Input {
+                    mode: Mode::Steer,
+                    ..
+                })
+            ),
+            "{out:?}"
+        );
+
+        // Ended: no offer.
+        client.detach();
+        assert_eq!(client.offer().err(), Some(Notice::NotConnected));
     }
 
     #[test]
     fn a_wedged_daemon_ends_nothing_until_restarted() {
         let mut client = SessionClient::new(Env::Origin);
         client.open(Target::New);
-        client.step(Event::Wedged {
-            id: 1,
-            diagnosis: Diagnosis::default(),
+        client.step(Event {
+            conn: ConnId(1),
+            kind: EventKind::Wedged(Diagnosis::default()),
         });
         assert!(matches!(client.link(), Link::Wedged(_)));
         let out = client.restart();
         assert!(
-            matches!(&out[1], Effect::Connect { id: 2, attach, restart: true } if attach.target == Target::New && attach.env == Env::Origin),
+            matches!(connects(&out)[..], [(ConnId(2), attach, true)] if attach.target == Target::New && attach.env == Env::Origin),
             "{out:?}"
         );
     }

@@ -16,8 +16,8 @@ use super::keys::{Input, Key, Mouse};
 use super::render::{Canvas, Viewport};
 use super::text::{Action, Color, Line, Style};
 use super::view::{Live, MUTED};
-use client::{Cmd, Env, Event, Link, SessionClient};
-use protocol::view::{Change, Item, SessionView, Update, Usage};
+use client::{Cmd, Env, Link, Renderer, SessionClient, Show};
+use protocol::view::{Change, Item, SessionView, Update, Usage, mismatch_line};
 use protocol::{SessionSummary, Target};
 
 /// What the event loop does for the app.
@@ -62,6 +62,8 @@ struct Rows {
     live: Option<Live>,
 }
 
+// Screen toggles and the frame owed, each read where it is set.
+#[allow(clippy::struct_excessive_bools)]
 pub struct App {
     pub client: SessionClient,
     viewport: Viewport,
@@ -97,6 +99,8 @@ pub struct App {
     /// The attach asked for the latest session: if there is none, the
     /// picker opens instead.
     resuming: bool,
+    /// A frame is owed: something a frame shows changed since the last.
+    redraw: bool,
 }
 
 /// The keys; help lists the slash commands after them.
@@ -117,11 +121,11 @@ const HELP: &[(&str, &str)] = &[
 ];
 
 impl App {
-    pub fn new(viewport: Viewport, workspace: PathBuf, target: &Target) -> Self {
+    pub fn new(viewport: Viewport, target: &Target) -> Self {
         Self {
             client: SessionClient::new(Env::Origin),
             viewport,
-            workspace,
+            workspace: PathBuf::new(),
             cache: Vec::new(),
             collapsed: HashSet::new(),
             verbose: false,
@@ -139,17 +143,24 @@ impl App {
             tokens: Usage::default(),
             committed: 0,
             resuming: matches!(target, Target::Latest { .. }),
+            redraw: true,
         }
+    }
+
+    /// The shell's workspace, which the picker starts on: found after the
+    /// first frame, as it walks up to a git root.
+    pub fn in_workspace(&mut self, workspace: PathBuf) {
+        self.workspace = workspace;
+    }
+
+    /// Whether the next frame would differ from the last: nothing is drawn
+    /// for an ack, or a list no picker shows.
+    pub const fn needs_frame(&self) -> bool {
+        self.redraw
     }
 
     pub fn view(&self) -> &SessionView {
         self.client.view()
-    }
-
-    /// Takes in what the driver reports; returns what the driver is to do.
-    pub fn event(&mut self, event: Event) -> Vec<client::Effect> {
-        let effects = self.client.step(event);
-        self.absorb(effects)
     }
 
     /// Has the session client carry out `cmd`; returns what the driver is
@@ -157,42 +168,30 @@ impl App {
     pub fn command(&mut self, cmd: Cmd) -> Vec<client::Effect> {
         if let Cmd::Sessions = cmd {
             self.overlay = Some(Overlay::Picker { selected: 0 });
+            self.redraw = true;
         }
-        let effects = self.client.run(cmd);
-        self.absorb(effects)
+        self.client.run(cmd)
     }
 
-    /// Shows what the client's effects tell this screen and hands back the
-    /// driver's.
-    pub fn absorb(&mut self, effects: Vec<client::Effect>) -> Vec<client::Effect> {
-        let mut io = Vec::new();
-        for effect in effects {
-            match effect {
-                client::Effect::View(update) => io.extend(self.changed(update)),
-                client::Effect::Sessions => self.pick_default(),
-                client::Effect::Notice(text) => self.notice(text, true),
-                client::Effect::Link => {
-                    if let Link::Wedged(d) = self.client.link() {
-                        self.overlay = Some(Overlay::Unresponsive {
-                            who: d.who(),
-                            log: d.log_tail(),
-                        });
-                    }
-                }
-                effect => io.push(effect),
-            }
-        }
-        io
-    }
-
-    /// Folds a daemon message in, as if from the open connection.
+    /// Folds a daemon message in, as if from the open connection, showing
+    /// what it changed; returns what the driver is to do.
     #[cfg(test)]
-    pub fn fold(&mut self, msg: &protocol::DaemonMsg) -> Vec<client::Effect> {
-        let id = self.client.connection();
-        self.event(Event::Msg {
-            id,
-            msg: msg.clone(),
-        })
+    pub fn fold(&mut self, msg: &protocol::DaemonMsg) -> Vec<client::Io> {
+        let conn = self.client.connection();
+        let effects = self.client.step(client::Event {
+            conn,
+            kind: client::EventKind::Msg(msg.clone()),
+        });
+        let mut io = Vec::new();
+        client::pump(
+            |what| {
+                io.push(what);
+                Ok(())
+            },
+            self,
+            effects,
+        );
+        io
     }
 
     /// Keeps the screen's state in step with what changed in the view.
@@ -249,10 +248,7 @@ impl App {
                 self.flash = Some((message, Style::new().fg(Color::Red)));
             }
             Change::Mismatch { supported } => {
-                self.flash = Some((
-                    format!("the daemon speaks protocol {supported}; restart it"),
-                    Style::new().fg(Color::Red),
-                ));
+                self.flash = Some((mismatch_line(supported), Style::new().fg(Color::Red)));
             }
             Change::Snapshot => {
                 self.cache.clear();
@@ -276,9 +272,11 @@ impl App {
             MUTED
         };
         self.flash = Some((text.into(), style));
+        self.redraw = true;
     }
 
     pub fn input(&mut self, input: Input) -> Option<Effect> {
+        self.redraw = true;
         match input {
             Input::Key(key) => self.key(key),
             Input::Mouse(mouse) => self.mouse(mouse),
@@ -475,7 +473,7 @@ impl App {
     }
 
     /// Sessions as the picker lists them: newest first, as the daemon
-    /// sends them.
+    /// lists them.
     fn listed(&self) -> impl Iterator<Item = &SessionSummary> {
         self.client.sessions().iter()
     }
@@ -484,11 +482,39 @@ impl App {
         let here = self.listed().position(|s| s.workspace == self.workspace);
         if let Some(Overlay::Picker { selected }) = &mut self.overlay {
             *selected = here.unwrap_or(0);
+            self.redraw = true;
         }
     }
 
     fn page(&self) -> i32 {
         i32::from(self.body).max(3) - 2
+    }
+}
+
+/// Shows what the client's effects tell this screen.
+impl Renderer for App {
+    fn show(&mut self, shown: Vec<Show>) -> Vec<client::Effect> {
+        let mut asked = Vec::new();
+        for show in shown {
+            match show {
+                Show::View(update) => {
+                    self.redraw = true;
+                    asked.extend(self.changed(update));
+                }
+                Show::Sessions => self.pick_default(),
+                Show::Notice(notice) => self.notice(notice.to_string(), true),
+                Show::Link => {
+                    self.redraw = true;
+                    if let Link::Wedged(d) = self.client.link() {
+                        self.overlay = Some(Overlay::Unresponsive {
+                            who: d.who(),
+                            log: d.log_tail(),
+                        });
+                    }
+                }
+            }
+        }
+        asked
     }
 }
 

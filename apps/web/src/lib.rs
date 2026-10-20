@@ -21,16 +21,8 @@ use std::process::{Command, Stdio};
 use std::sync::Arc;
 use std::thread;
 
-use client::Endpoint;
+use client::Daemon;
 use rt::Rt;
-use sys::Staged;
-
-/// The daemon `a web` is a client of, and how it is reached.
-#[derive(Clone)]
-pub struct Daemon {
-    pub endpoint: Endpoint,
-    pub staged: Staged,
-}
 
 /// Serves the UI on a random port of 127.0.0.1 until the process is
 /// stopped. The printed link carries a one-time token; `open` also opens it

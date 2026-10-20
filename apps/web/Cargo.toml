@@ -8,7 +8,6 @@ publish.workspace = true
 client.workspace = true
 protocol.workspace = true
 rt.workspace = true
-sys.workspace = true
 http.workspace = true
 serde.workspace = true
 serde_json.workspace = true

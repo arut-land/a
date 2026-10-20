@@ -1069,8 +1069,8 @@ fn cold_start_does_not_grow_with_session_count() {
     assert!(listed.iter().all(|s| s.entries == 7));
     let ids: Vec<SessionId> = listed.iter().map(|s| s.id).collect();
     let mut made: Vec<SessionId> = headers.iter().map(|h| h.id).collect();
-    made.sort_unstable_by_key(|id| id.0);
-    assert_eq!(ids, made, "oldest first");
+    made.sort_unstable_by_key(|id| std::cmp::Reverse(id.0));
+    assert_eq!(ids, made, "newest first");
     assert!(started < Duration::from_secs(2), "started in {started:?}");
 }
 

@@ -6,21 +6,20 @@
 
 use std::collections::BTreeMap;
 use std::ffi::OsString;
-use std::io;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex, OnceLock};
 use std::time::Duration;
 
 use boltffi::{EventSubscription, StreamProducer, export};
-use client::{Attach, Cmd, Connection, Driver, Effect, Endpoint, Env, SessionClient};
-use protocol::{Environment, SessionId, SettingsChange, Target};
+use client::{Attach, Cmd, Daemon, Driver, Effect, Env, Notice, Renderer, SessionClient, Show};
+use protocol::{Environment, HomeSettings, SessionId, SettingsChange, Target};
 use rt::Threads;
 use sys::install::CliLink;
 use sys::{Home, Staged};
 
 use crate::feed::{Feed, lock};
 use crate::{
-    AppAction, CliStatus, ClientError, CommandHelp, EnvVar, OpenTarget, Resync, SessionInfo,
+    AppAction, CliStatus, ClientError, CommandHelp, OpenTarget, Resync, SessionInfo,
     SessionListUpdate, SessionSnapshot, Settings, TurnInfo, ViewUpdate,
 };
 
@@ -70,25 +69,9 @@ fn session_path() -> OsString {
         .unwrap_or_default()
 }
 
-/// This build of `a`, staged in the per-user home, and the daemon it runs.
-#[derive(Clone)]
-struct Daemon {
-    home: Home,
-    staged: Staged,
-}
-
-impl Daemon {
-    fn endpoint(&self) -> Endpoint {
-        Endpoint::Local(self.home.clone())
-    }
-
-    fn connect(&self) -> io::Result<Connection> {
-        client::connect(&self.endpoint(), &self.staged, &|| {})
-    }
-}
-
 /// The per-user daemon, as the CLI reaches it: `$A_HOME`, else `~/.a`.
 pub struct Client {
+    home: Home,
     daemon: Daemon,
 }
 
@@ -98,9 +81,10 @@ impl Client {
     /// does: a daemon this client starts runs the newest build staged.
     pub fn new(helper: &str) -> Result<Self, ClientError> {
         let home = Home::from_env()?;
-        let staged = home.runtime().stage(Path::new(helper))?;
+        let staged: Staged = home.runtime().stage(Path::new(helper))?;
         Ok(Self {
-            daemon: Daemon { home, staged },
+            daemon: Daemon::local(home.clone(), staged),
+            home,
         })
     }
 
@@ -110,24 +94,24 @@ impl Client {
     }
 
     pub fn daemon_log(&self) -> String {
-        self.daemon.home.daemon_log().display().to_string()
+        self.home.daemon_log().display().to_string()
     }
 
     /// The pid of the running daemon, if one is.
     pub fn daemon_pid(&self) -> Option<u32> {
-        client::diagnose(&self.daemon.home).pid
+        client::diagnose(&self.home).pid
     }
 
     /// `$A_HOME/config.toml`, where the settings are kept.
     pub fn config_file(&self) -> String {
-        self.daemon.home.config_file().display().to_string()
+        self.home.config_file().display().to_string()
     }
 
     /// The model and provider variables sessions fall back on, as the
     /// daemon has them.
     pub async fn settings(&self) -> Result<Settings, ClientError> {
         let daemon = self.daemon.clone();
-        blocking(move || Ok(daemon.connect()?.settings(None)?.into())).await
+        blocking(move || Ok(daemon.connect(&|| {})?.settings(None)?.into())).await
     }
 
     /// Saves the user's edit of the settings `from` into `to`. Only what
@@ -138,9 +122,9 @@ impl Client {
         from: Settings,
         to: Settings,
     ) -> Result<Settings, ClientError> {
-        let change = change(from, to)?;
+        let change = SettingsChange::between(&HomeSettings::from(from), &HomeSettings::from(to));
         let daemon = self.daemon.clone();
-        blocking(move || Ok(daemon.connect()?.settings(Some(change))?.into())).await
+        blocking(move || Ok(daemon.connect(&|| {})?.settings(Some(change))?.into())).await
     }
 
     /// What `a` resolves to with `dir` in front of `search` (a `PATH`;
@@ -151,7 +135,7 @@ impl Client {
         dir: String,
         search: Option<String>,
     ) -> Result<CliStatus, ClientError> {
-        let runtime = self.daemon.home.runtime();
+        let runtime = self.home.runtime();
         blocking(move || {
             let search = search.map_or_else(session_path, OsString::from);
             Ok(CliLink::find(&runtime, Path::new(&dir), &search).into())
@@ -168,7 +152,7 @@ impl Client {
         search: Option<String>,
         replace: bool,
     ) -> Result<CliStatus, ClientError> {
-        let runtime = self.daemon.home.runtime();
+        let runtime = self.home.runtime();
         blocking(move || {
             let search = search.map_or_else(session_path, OsString::from);
             Ok(CliLink::install(&runtime, Path::new(&dir), &search, replace)?.into())
@@ -180,10 +164,16 @@ impl Client {
     pub async fn restart_daemon(&self) -> Result<(), ClientError> {
         let daemon = self.daemon.clone();
         blocking(move || {
-            client::restart(&daemon.home, &daemon.staged, None)?;
+            daemon.restart()?;
             Ok(())
         })
         .await
+    }
+
+    /// Whether variable `name` holds a secret, by the rule the daemon keeps
+    /// values out of its logs by: a pane shows such a value masked.
+    pub fn is_secret_name(&self, name: &str) -> bool {
+        Environment::is_secret(name)
     }
 }
 
@@ -222,8 +212,7 @@ impl SessionWatch {
         }
         let producer = Arc::clone(&self.producer);
         *watch = Some(client::SessionWatch::start(
-            self.daemon.endpoint(),
-            self.daemon.staged.clone(),
+            self.daemon.clone(),
             move |list| {
                 producer.push(match list {
                     Ok(sessions) => SessionListUpdate {
@@ -232,7 +221,7 @@ impl SessionWatch {
                     },
                     Err(problem) => SessionListUpdate {
                         sessions: Vec::new(),
-                        problem: Some(problem),
+                        problem: Some(problem.to_string()),
                     },
                 });
             },
@@ -260,15 +249,14 @@ pub struct Session {
     driver: Driver,
 }
 
-/// Has `driver` carry out the client's effects, publishing what comes
-/// back for the app.
-fn run(driver: &Driver, feed: &Mutex<Feed>, mut effects: Vec<Effect>) {
-    while !effects.is_empty() {
-        let shown = effects
-            .into_iter()
-            .filter_map(|effect| driver.apply(effect))
-            .collect();
-        effects = lock(feed).absorb(shown);
+/// The feed as the driver's pump renders through it: locked only while it
+/// shows, so the driver's I/O never runs under the lock the reader thread
+/// takes to step the client.
+struct Published<'a>(&'a Mutex<Feed>);
+
+impl Renderer for Published<'_> {
+    fn show(&mut self, shown: Vec<Show>) -> Vec<Effect> {
+        lock(self.0).show(shown)
     }
 }
 
@@ -277,10 +265,8 @@ impl Session {
     pub fn new(client: &Client) -> Self {
         let feed = Arc::new(Mutex::new(Feed::new(SessionClient::new(Env::Keep))));
         let shared = Arc::clone(&feed);
-        let daemon = &client.daemon;
         let driver = Driver::with_origin(
-            daemon.endpoint(),
-            daemon.staged.clone(),
+            client.daemon.clone(),
             || {
                 Ok(Environment::new(
                     std::env::current_dir()?,
@@ -289,8 +275,8 @@ impl Session {
                 ))
             },
             move |driver, event| {
-                let effects = lock(&shared).step(event);
-                run(driver, &shared, effects);
+                let effects = lock(&shared).client.step(event);
+                driver.pump(&mut Published(&shared), effects);
             },
         );
         Self { feed, driver }
@@ -347,33 +333,31 @@ impl Session {
                 workspace: Some(PathBuf::from(workspace)),
                 ..Attach::new(Target::Latest { any_workspace }, Env::Keep)
             },
-            OpenTarget::Id { id } => Attach {
-                workspace: Some(PathBuf::new()),
-                ..Attach::new(Target::Id(parse_id(&id)?), Env::Keep)
-            },
+            OpenTarget::Id { id } => Attach::new(Target::Id(parse_id(&id)?), Env::Keep),
         };
         let effects = {
             let mut feed = lock(&self.feed);
-            if feed.client.connection() > 0 {
+            if feed.client.connection().0 > 0 {
                 return Err(ClientError::InvalidArgument {
                     message: "the session was opened already".into(),
                 });
             }
-            let effects = feed.client.attach(attach);
-            feed.absorb(effects)
+            feed.client.attach(attach)
         };
-        run(&self.driver, &self.feed, effects);
+        self.driver.pump(&mut Published(&self.feed), effects);
         Ok(())
     }
 
     /// Sends the user's input as it is.
     pub async fn send(&self, text: String) -> Result<(), ClientError> {
-        self.run(Cmd::Input(text)).await
+        self.intend(move |client| Ok(client.offer()?.input(text)))
+            .await
     }
 
     /// A line the user typed, parsed as every client parses it: what it
     /// asks of the session is done, and what it asks of the app comes
-    /// back.
+    /// back. What the session does not take now is told as an error
+    /// update, as the other clients show it.
     pub async fn submit(&self, line: String) -> Result<Option<AppAction>, ClientError> {
         let asking = lock(&self.feed).client.turn().asking;
         let action = match client::parse(&line, asking) {
@@ -388,7 +372,7 @@ impl Session {
 
     /// Input for the running turn, before its next step.
     pub async fn steer(&self, text: String) -> Result<(), ClientError> {
-        self.run(Cmd::Steer(text)).await
+        self.intend(move |client| client.offer()?.steer(text)).await
     }
 
     /// Answers the ask for tool call `call`.
@@ -396,12 +380,13 @@ impl Session {
         let call = protocol::CallId::new(call).ok_or_else(|| ClientError::InvalidArgument {
             message: "call 0 names no call".to_owned(),
         })?;
-        self.run(Cmd::Approve { call, approved }).await
+        self.intend(move |client| client.offer()?.approve(call, approved))
+            .await
     }
 
     /// Stops the running turn: its model or tool call, and the rest of it.
     pub async fn interrupt(&self) -> Result<(), ClientError> {
-        self.run(Cmd::Interrupt).await
+        self.intend(|client| client.offer()?.interrupt()).await
     }
 
     /// Detaches; the session keeps running in the daemon.
@@ -413,12 +398,8 @@ impl Session {
     pub async fn restart(&self) -> Result<(), ClientError> {
         let (feed, driver) = (Arc::clone(&self.feed), self.driver.clone());
         blocking(move || {
-            let effects = {
-                let mut feed = lock(&feed);
-                let effects = feed.client.restart();
-                feed.absorb(effects)
-            };
-            run(&driver, &feed, effects);
+            let effects = lock(&feed).client.restart();
+            driver.pump(&mut Published(&feed), effects);
             Ok(())
         })
         .await
@@ -426,6 +407,21 @@ impl Session {
 }
 
 impl Session {
+    /// Carries out what `intent` asks of the session's offer; what it does
+    /// not offer is the error.
+    async fn intend(
+        &self,
+        intent: impl FnOnce(&mut SessionClient) -> Result<Vec<Effect>, Notice> + Send + 'static,
+    ) -> Result<(), ClientError> {
+        let (feed, driver) = (Arc::clone(&self.feed), self.driver.clone());
+        blocking(move || {
+            let effects = intent(&mut lock(&feed).client)?;
+            driver.pump(&mut Published(&feed), effects);
+            Ok(())
+        })
+        .await
+    }
+
     async fn run(&self, cmd: Cmd) -> Result<(), ClientError> {
         let (feed, driver) = (Arc::clone(&self.feed), self.driver.clone());
         blocking(move || {
@@ -434,10 +430,9 @@ impl Session {
                 if !feed.client.link().attached() {
                     return Err(ClientError::NotOpen);
                 }
-                let effects = feed.client.run(cmd);
-                feed.absorb(effects)
+                feed.client.run(cmd)
             };
-            run(&driver, &feed, effects);
+            driver.pump(&mut Published(&feed), effects);
             Ok(())
         })
         .await
@@ -447,52 +442,9 @@ impl Session {
 /// Released by the app: the daemon is told, and the reader then ends.
 impl Drop for Session {
     fn drop(&mut self) {
-        let effects = {
-            let mut feed = lock(&self.feed);
-            let effects = feed.client.detach();
-            feed.absorb(effects)
-        };
-        for effect in effects {
-            self.driver.apply(effect);
-        }
+        let effects = lock(&self.feed).client.detach();
+        self.driver.pump(&mut Published(&self.feed), effects);
     }
-}
-
-/// What the user changed going from `from` to `to`, with names and values
-/// trimmed as the pane shows them and blank names skipped.
-fn change(from: Settings, to: Settings) -> Result<SettingsChange, ClientError> {
-    let vars = |vars: Vec<EnvVar>| -> BTreeMap<String, String> {
-        vars.into_iter()
-            .map(|EnvVar { name, value }| (name.trim().to_owned(), value))
-            .filter(|(name, _)| !name.is_empty())
-            .collect()
-    };
-    let (old, new) = (vars(from.env), vars(to.env));
-    if let Some(bad) = new.keys().find(|name| !sys::config::is_var_name(name)) {
-        return Err(ClientError::InvalidArgument {
-            message: format!("not a variable name: {bad}"),
-        });
-    }
-    let mut env: BTreeMap<String, Option<String>> = old
-        .keys()
-        .filter(|name| !new.contains_key(*name))
-        .map(|name| (name.clone(), None))
-        .collect();
-    env.extend(
-        new.into_iter()
-            .filter(|(name, value)| old.get(name) != Some(value))
-            .map(|(name, value)| (name, Some(value))),
-    );
-    let given = |s: Option<String>| s.map_or_else(String::new, |s| s.trim().to_owned());
-    let changed = |old: Option<String>, new: Option<String>| {
-        let (old, new) = (given(old), given(new));
-        (old != new).then_some(new)
-    };
-    Ok(SettingsChange {
-        model: changed(from.model, to.model),
-        agent: changed(from.agent, to.agent),
-        env,
-    })
 }
 
 fn parse_id(id: &str) -> Result<SessionId, ClientError> {

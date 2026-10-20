@@ -195,10 +195,10 @@ impl App {
                 Style::new().fg(Color::Yellow),
             ),
             Link::Connecting => ("◌ connecting".into(), MUTED),
-            Link::Live { .. } if !attached => ("○ not attached".into(), MUTED),
-            Link::Live { synced: false, .. } => {
-                ("↻ replaying".into(), Style::new().fg(Color::Blue))
+            Link::Replaying { .. } | Link::Live { .. } if !attached => {
+                ("○ not attached".into(), MUTED)
             }
+            Link::Replaying { .. } => ("↻ replaying".into(), Style::new().fg(Color::Blue)),
             Link::Live { .. } => ("● live".into(), Style::new().fg(Color::Green)),
         };
         let mut line = Line::from([Span::new(state, style)]);
@@ -361,6 +361,7 @@ impl App {
     /// drawn as before and notes where buttons are; returns where the
     /// caret goes, if it shows.
     pub fn draw(&mut self, w: u16, h: u16) -> Option<(u16, u16)> {
+        self.redraw = false;
         let mut canvas = std::mem::take(&mut self.canvas);
         canvas.begin(w, h);
         let caret = self.frame(&mut canvas);

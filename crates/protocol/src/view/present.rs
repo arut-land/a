@@ -319,6 +319,12 @@ pub fn call_title<'a>(tool: &'a str, input: &'a Json, card: Option<&'a Card>) ->
     }
 }
 
+/// What a client says when the daemon turns out to speak protocol
+/// `supported`, not this build's.
+pub fn mismatch_line(supported: u32) -> String {
+    format!("the daemon speaks protocol {supported}; restart it")
+}
+
 /// One line on what a session did, shown after an attach's replay.
 pub fn recap_line(recap: &Recap) -> String {
     let mut parts = vec!["recap".to_owned()];

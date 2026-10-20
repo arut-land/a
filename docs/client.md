@@ -8,57 +8,73 @@ app holds screen state and draws.
 ## Layers
 
 ```
-app (tui, web, REPL, ffi)          renders Effects; turns keys, clicks, lines into Cmds
-  │ SessionClient::{attach, run, step, …} -> Vec<Effect>
+app (tui, web, REPL, ffi)          a Renderer: shows Show effects; turns keys, clicks, lines into Cmds
+  │ SessionClient::{attach, offer, run, step, …} -> Vec<Effect>
   ▼
-SessionClient (session.rs)         no I/O: Link FSM, SessionView (protocol::view), TurnView,
+SessionClient (session.rs)         no I/O: Link FSM, SessionView (protocol::view), TurnView, Offer,
   │                                numbered mutations; COMMANDS/parse (command.rs)
-  │ Effect::{Connect, Send, SendEnvironment, Hangup}      Event::{Connected, Msg, Closed, …}
+  │ Effect::Io(Connect | Send | SendEnvironment | Hangup)   Event { conn, kind: Connected | Msg | … }
+  │ Effect::Show(View | Link | Sessions | Notice)
   ▼
-Driver (drive.rs)                  threads: connect + read per connection, one writer
-  │
+Driver (drive.rs)                  pump: the one fixpoint loop; threads: connect + read per
+  │                                connection, one writer
   ▼
-transport (lib.rs, remote.rs)      Endpoint::{Local(Home), Ssh(host)}, connect_with, hello,
-                                   Connection{reader, writer}, stop/status/restart/diagnose, bridge
+transport (lib.rs, remote.rs)      Daemon { endpoint: Local(Home) | Ssh(host), staged }: connect,
+                                   connect_as, sessions, new_session; hello, Error, Connection,
+                                   stop/status/restart/diagnose, bridge
 ```
 
-- **Transport.** `connect(endpoint, staged, on_drain)` reaches this
-  machine's daemon over its Unix socket (spawning it with zero lag: the
-  client takes the daemon lock, binds the socket, hands both to a detached
-  `a __daemon` and connects into its backlog) or another machine's through
-  `ssh <host> a bridge`, whose stdio carries the same frames. It completes
-  the hello: a `Welcome` (protocol and capabilities taken up, the slash
-  commands the daemon advertises), a `Draining` daemon waited out and
-  tried again, a `Mismatch` turned into the one sentence that says which
-  side to update. `connect_with` sends the attach right behind the hello,
-  saving a round trip. `stop`, `status`, `restart` and `diagnose` are what
-  `a daemon …` runs; none starts a daemon but `restart`.
+- **Transport.** `Daemon { endpoint, staged }` is the daemon as a client
+  reaches it: this machine's over its Unix socket (spawned with zero lag:
+  the client takes the daemon lock, binds the socket, hands both to a
+  detached `a __daemon` and connects into its backlog; one client starts
+  it at a time, under `start.lock`, and the others wait on that lock, not
+  on a timer) or another machine's through `ssh <host> a bridge`, whose
+  stdio carries the same frames. `connect` completes the hello: a
+  `Welcome` (protocol and capabilities taken up, the slash commands the
+  daemon advertises), a `Draining` daemon waited out and tried again, a
+  mismatch as `Error::Mismatch { theirs, newer, host }`, whose `Display`
+  is the one sentence that says which side to update. `connect_as` sends
+  the attach right behind the hello, saving a round trip. `Error` is the
+  typed reason a daemon could not be reached or stopped serving
+  (`Mismatch`, `NotResponding`, `Refused`, `Closed`, `Io`); it converts
+  to `io::Error` for the commands that report that way. `stop`, `status`,
+  `restart` and `diagnose` are what `a daemon …` runs; none starts a
+  daemon but `restart`. The daemon lists sessions newest first; no client
+  sorts, and `SessionSummary` prints the `a ls` line.
 - **`SessionClient`.** One session as a client follows it, without I/O.
-  `Link` is the connection's state machine: `Connecting` → `Live {synced}`
-  → `Draining` → `Reconnecting {since}` → `Live`, or `Wedged(Diagnosis)`
-  (the daemon took the connection and does not answer) or `Ended(Detached
-  | Lost(why))`. The view is `protocol::view::SessionView`, folded here
-  from every `DaemonMsg`; `TurnView` (running, asking, can interrupt, can
-  steer, can send) is computed from it for the app's controls. Intents
-  (`Cmd`) become numbered `ClientMsg`s, kept until the daemon's ack; a
-  message sent while reconnecting goes out once the link is live again.
-  What used to differ between clients is decided here: reconnecting after
-  a drain by id from the last seq without sending the environment again, a
-  detach never reading as a lost daemon, input given while reconnecting.
+  `Link` is the connection's state machine: `Connecting` → `Replaying` →
+  `Live` → `Draining` → `Reconnecting {since}` → `Replaying`, or
+  `Wedged(Diagnosis)` (the daemon took the connection and does not answer)
+  or `Ended(Detached | Lost(Error))`. The view is
+  `protocol::view::SessionView`, folded here from every `DaemonMsg`;
+  `TurnView` (running, asking, can interrupt, can send) is computed from
+  it for the app's controls. Intents become numbered `ClientMsg`s, kept
+  until the daemon's ack; a message sent while reconnecting goes out once
+  the connection is up again. `offer()` is how an app asks for anything:
+  `None` unless attached, and each intent (`input`, `steer`, `interrupt`,
+  `approve(call)`, `refresh_env`) only when the turn takes it, else the
+  typed `Notice` saying why; `run(Cmd)` goes through the same offers and
+  shows the notice. What used to differ between clients is decided here:
+  reconnecting after a drain by id from the last seq without sending the
+  environment again, a detach never reading as a lost daemon, input given
+  while reconnecting.
 - **`Cmd` and `COMMANDS`.** `parse(line, asking)` turns a typed line into
   a `Cmd`: the client's own slash commands (`/sessions`, `/new`,
   `/interrupt`, `/steer`, `/env refresh`, `/detach` and its aliases,
   `/help`), `y`/`n` while a call waits on this client, else `Cmd::Input`,
   which the daemon reads (its own slash commands included). `help(daemon)`
   lists both tables for the app's help screen.
-- **`Driver`.** Carries out the I/O effects: `Connect` opens connection
-  `id` on a new thread (replacing the daemon first when `restart`), reads
-  it there and posts each message to the sink as an `Event`; `Send` writes
-  on the newest connection; `SendEnvironment` captures this process's
-  environment again (or asks the `origin` given) and sends it; `Hangup`
-  drops the writer. `apply` hands back the effects that are the app's
-  (`View`, `Link`, `Sessions`, `Notice`), and a notice when a send failed.
-  Cheap to clone; one per session client.
+- **`Driver` and `pump`.** Carries out the `Io` effects: `Connect` opens
+  connection `conn` on a new thread (replacing the daemon first when
+  `restart`), reads it there and posts each message to the sink as an
+  `Event`; `Send` writes on the newest connection (the session client
+  numbered it); `SendEnvironment` captures this process's environment
+  again (or asks the `origin` given) and sends it; `Hangup` drops the
+  writer. `pump(renderer, effects)` is the fixpoint every app runs: the
+  `Io` is done, the `Show`s go to the `Renderer`, and what showing asks
+  for goes round again; a send that failed is shown as a notice. Cheap to
+  clone; one per session client.
 - **`Inbox`.** The one queue the app's thread sleeps on, posted to by the
   driver's and the input threads: a lock around a `VecDeque` rather than
   `mpsc`, which instantiates all three channel flavours per type (7–15 KiB
@@ -69,33 +85,28 @@ transport (lib.rs, remote.rs)      Endpoint::{Local(Home), Ssh(host)}, connect_w
 ## How an app drives it
 
 ```rust
-let (post, inbox) = client::inbox();
-let driver = Driver::new(endpoint, staged, move |_, event| { let _ = post.send(Event::Daemon(event)); });
-let mut session = SessionClient::new(Env::Origin);
-pump(&driver, &mut app, session.attach(Attach::new(target, Env::Origin)));
-while let Some(event) = inbox.recv() {
-    let effects = match event {
-        Event::Daemon(event) => session.step(event),
-        Event::Line(line) => parse(&line, session.turn().asking).map_or(vec![], |cmd| session.run(cmd)),
-    };
-    pump(&driver, &mut app, effects);
-    app.draw();
+impl Renderer for App {
+    fn show(&mut self, shown: Vec<Show>) -> Vec<Effect> { /* View, Link, Sessions, Notice */ }
 }
 
-/// The fixpoint: the driver's effects are carried out, the app's are
-/// shown, and whatever showing them asks for goes round again.
-fn pump(driver: &Driver, app: &mut App, mut effects: Vec<Effect>) {
-    while !effects.is_empty() {
-        let shown = effects.into_iter().filter_map(|e| driver.apply(e)).collect();
-        effects = app.absorb(shown);
-    }
+let (post, inbox) = client::inbox();
+let driver = Driver::new(daemon, move |_, event| { let _ = post.send(Input::Daemon(event)); });
+let mut app = App { session: SessionClient::new(Env::Origin), .. };
+driver.pump(&mut app, app.session.attach(Attach::new(target, Env::Origin)));
+while let Some(input) = inbox.recv() {
+    let effects = match input {
+        Input::Daemon(event) => app.session.step(event),
+        Input::Line(line) => parse(&line, app.session.turn().asking).map_or(vec![], |cmd| app.session.run(cmd)),
+    };
+    driver.pump(&mut app, effects);
+    app.draw();
 }
 ```
 
-The terminal client (`apps/tui/src/run.rs`) and the web page
-(`apps/web/src/app.rs`) write this loop; the line REPL
-(`apps/cli/src/main.rs`) takes one pass, which is right only because its
-`show` never yields an effect.
+The terminal client (`apps/tui/src/run.rs`), the web page
+(`apps/web/src/app.rs`), the line REPL (`apps/cli/src/main.rs`) and the
+FFI feed (`crates/ffi/src/live.rs`) are `Renderer`s over this one loop;
+`client::pump` is the same loop with any I/O, which tests use with none.
 
 ## Renderer rules
 
@@ -108,6 +119,8 @@ included) for the signs of a rule copied out of the SDK and fails on any:
 - No app decides whether a turn runs (`var running`, `fn running`):
   `TurnView::running`.
 - No app parses slash commands (`"/detach"`, `"/steer"`, …): `parse`.
+- No app decides when a reply stops streaming (`part == .outcome`): the
+  FFI's every update names the call whose reply is streaming.
 
 A Rust file's own `#[cfg(test)]` module may build any state it likes.
 
@@ -133,10 +146,14 @@ Other rules the apps keep, by convention:
   environment, a detach is never reported as a lost daemon, events from a
   replaced connection are dropped, input while reconnecting is sent once
   live and numbered across connections, a resend after a reconnect runs
-  once, the turn says what runs and what waits on this client, a wedged
-  daemon ends nothing until restarted.
+  one, the turn says what runs and what waits on this client, an offer
+  is made only while attached and each intent only when the turn takes
+  it, a wedged daemon ends nothing until restarted.
+- `crates/client/src/drive.rs`: the pump runs until the renderer asks for
+  nothing more.
 - `crates/client/src/lib.rs`: the mismatch sentence, `stop` signalling
-  only the process that recorded itself.
+  only the process that recorded itself, a lock let go after the wait is
+  not kept.
 - `crates/client/tests/one_rule.rs`, `no_polling.rs`: the rules above.
 - Black-box: `apps/cli/tests/{acceptance,crash,home,remote}.rs` drive `a`
   against a daemon in an isolated `A_HOME` (`mise run acceptance`).

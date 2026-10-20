@@ -609,6 +609,27 @@ pub enum ReadOnly {
     Format { version: u32 },
 }
 
+/// The line `a ls` and a picker show: the short id, what it is doing,
+/// where it is, how long it is, where it works, and why it is read-only
+/// if it is.
+impl fmt::Display for SessionSummary {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(
+            f,
+            "{}  {:<9}  {:<10}  {:>4} entries  {}",
+            self.id.short(),
+            self.activity.name(),
+            self.residency.name(),
+            self.entries,
+            self.workspace.display()
+        )?;
+        if let Some(why) = self.read_only {
+            write!(f, "  ({why})")?;
+        }
+        Ok(())
+    }
+}
+
 impl fmt::Display for ReadOnly {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
@@ -818,6 +839,36 @@ pub struct SettingsChange {
     /// Variables to set, or with `null`, remove.
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub env: BTreeMap<String, Option<String>>,
+}
+
+impl SettingsChange {
+    /// The change that takes the settings `from` to `to`: only what
+    /// differs, so a save sends nothing another client's save would be
+    /// undone by. A blank model or agent is none.
+    pub fn between(from: &HomeSettings, to: &HomeSettings) -> Self {
+        let given = |s: &Option<String>| s.as_deref().map_or("", str::trim).to_owned();
+        let changed = |old: &Option<String>, new: &Option<String>| {
+            let (old, new) = (given(old), given(new));
+            (old != new).then_some(new)
+        };
+        let mut env: BTreeMap<String, Option<String>> = from
+            .env
+            .keys()
+            .filter(|name| !to.env.contains_key(*name))
+            .map(|name| (name.clone(), None))
+            .collect();
+        env.extend(
+            to.env
+                .iter()
+                .filter(|(name, value)| from.env.get(*name) != Some(value))
+                .map(|(name, value)| (name.clone(), Some(value.clone()))),
+        );
+        Self {
+            model: changed(&from.model, &to.model),
+            agent: changed(&from.agent, &to.agent),
+            env,
+        }
+    }
 }
 
 /// The protocol versions a peer speaks, `min..=max`.
@@ -1393,6 +1444,36 @@ mod tests {
         let e: Entry = serde_json::from_str(line).unwrap();
         assert!(matches!(&e.body, Body::ToolCall { id: None, .. }));
         assert_eq!(serde_json::to_string(&e).unwrap(), line);
+    }
+
+    #[test]
+    fn a_settings_change_carries_only_what_differs() {
+        let from = HomeSettings {
+            model: Some("openai:a".into()),
+            agent: None,
+            env: [("KEEP", "1"), ("DROP", "2"), ("EDIT", "3")]
+                .into_iter()
+                .map(|(k, v)| (k.to_owned(), v.to_owned()))
+                .collect(),
+        };
+        let to = HomeSettings {
+            model: Some(" openai:a ".into()),
+            agent: Some("echo".into()),
+            env: [("KEEP", "1"), ("EDIT", "4"), ("NEW", "5")]
+                .into_iter()
+                .map(|(k, v)| (k.to_owned(), v.to_owned()))
+                .collect(),
+        };
+        let change = SettingsChange::between(&from, &to);
+        assert_eq!((change.model, change.agent), (None, Some("echo".into())));
+        assert_eq!(
+            change.env,
+            [("DROP", None), ("EDIT", Some("4")), ("NEW", Some("5"))]
+                .into_iter()
+                .map(|(k, v)| (k.to_owned(), v.map(str::to_owned)))
+                .collect()
+        );
+        assert_eq!(SettingsChange::between(&to, &to), SettingsChange::default());
     }
 
     #[test]

@@ -5,10 +5,12 @@ use std::io::{self, BufRead, IsTerminal, Write};
 use std::process::ExitCode;
 use std::thread;
 
-use client::{Attach, Driver, Effect, End, Endpoint, Env, Event, Link, SessionClient};
-use protocol::view::{Change, Item, Kind, Part, Presented, SessionView, Shown, recap_line};
-use protocol::{CallId, ClientMsg, DaemonMsg, SessionSummary, Target, Verdict};
-use sys::{Home, Staged};
+use client::{Driver, End, Endpoint, Env, Event, Link, Renderer, SessionClient, Show};
+use protocol::view::{
+    Change, Item, Kind, Part, Presented, SessionView, Shown, mismatch_line, recap_line,
+};
+use protocol::{CallId, Target, Verdict};
+use sys::Home;
 
 use crate::args::{Args, Cmd, Daemon};
 
@@ -16,24 +18,27 @@ fn main() -> ExitCode {
     // Help, the version, completion requests and usage errors (status 2)
     // end the process here.
     let args = Args::parse();
-    let result = Ctx::new(args.host).and_then(|ctx| match args.cmd {
-        None => session(ctx, Target::New),
-        Some(Cmd::Resume { id: None, any }) => session(ctx, Target::Latest { any_workspace: any }),
+    let result = daemon_of(args.host).and_then(|daemon| match args.cmd {
+        None => session(&daemon, Target::New),
+        Some(Cmd::Resume { id: None, any }) => {
+            session(&daemon, Target::Latest { any_workspace: any })
+        }
         Some(Cmd::Resume { id: Some(id), .. } | Cmd::Attach { id }) => {
-            session(ctx, Target::Prefix(id))
+            session(&daemon, Target::Prefix(id))
         }
-        Some(Cmd::Ls) => ls(&ctx),
-        Some(Cmd::New) => new(&ctx),
-        Some(Cmd::Bridge { token }) => {
-            client::bridge(&ctx.home, token.as_deref().unwrap_or(&ctx.staged.id))
-        }
-        Some(Cmd::Web { no_open }) => web(ctx, !no_open),
-        Some(Cmd::Daemon { action }) => daemon_cmd(&ctx, action),
+        Some(Cmd::Ls) => ls(&daemon),
+        Some(Cmd::New) => new(&daemon),
+        Some(Cmd::Bridge { token }) => client::bridge(
+            daemon.home()?,
+            token.as_deref().unwrap_or(&daemon.staged.id),
+        ),
+        Some(Cmd::Web { no_open }) => web(daemon, !no_open),
+        Some(Cmd::Daemon { action }) => daemon_cmd(&daemon, action),
         Some(Cmd::Serve {
             listen_fd,
             lock_fd,
             reset_breaker,
-        }) => daemon(&ctx, listen_fd, lock_fd, reset_breaker),
+        }) => serve(&daemon, listen_fd, lock_fd, reset_breaker),
     });
     match result {
         Ok(()) => ExitCode::SUCCESS,
@@ -44,67 +49,40 @@ fn main() -> ExitCode {
     }
 }
 
-/// This build, staged, and the daemon it talks to.
-#[derive(Clone)]
-struct Ctx {
-    home: Home,
-    staged: Staged,
-    endpoint: Endpoint,
+/// The daemon to talk to, as this build: every entry point stages itself
+/// first, so the daemon it may spawn runs the newest build.
+fn daemon_of(host: Option<String>) -> io::Result<client::Daemon> {
+    let home = Home::from_env()?;
+    let staged = home.runtime().stage(&std::env::current_exe()?)?;
+    Ok(match host {
+        Some(host) => client::Daemon::ssh(host, staged),
+        None => client::Daemon::local(home, staged),
+    })
 }
 
-impl Ctx {
-    /// Every entry point stages itself first, so the daemon it may spawn
-    /// runs the newest build.
-    fn new(host: Option<String>) -> io::Result<Self> {
-        let home = Home::from_env()?;
-        let staged = home.runtime().stage(&std::env::current_exe()?)?;
-        let endpoint = host.map_or_else(|| Endpoint::Local(home.clone()), Endpoint::Ssh);
-        Ok(Self {
-            home,
-            staged,
-            endpoint,
-        })
-    }
+/// Connects to the daemon. A wedged local daemon is diagnosed, and
+/// `a daemon restart` suggested; a session at a terminal offers the
+/// restart itself.
+fn connect(daemon: &client::Daemon) -> io::Result<client::Connection> {
+    let on_drain = || eprintln!("[waiting for the previous daemon to finish its work]");
+    daemon.connect(&on_drain).map_err(|e| wedged(daemon, e))
+}
 
-    /// The home, for commands that only make sense on this machine.
-    fn local(&self) -> io::Result<&Home> {
-        match &self.endpoint {
-            Endpoint::Local(home) => Ok(home),
-            Endpoint::Ssh(host) => Err(io::Error::other(format!(
-                "this command acts on this machine; run it on {host} instead"
-            ))),
+/// `e` as reported: a local daemon that does not answer is diagnosed.
+fn wedged(daemon: &client::Daemon, e: client::Error) -> io::Error {
+    match (&daemon.endpoint, &e) {
+        (Endpoint::Local(home), client::Error::NotResponding) => {
+            report(&client::diagnose(home));
+            io::Error::new(io::ErrorKind::TimedOut, RESTART)
         }
-    }
-
-    /// Connects to the daemon. A wedged local daemon is diagnosed, and
-    /// `a daemon restart` suggested; a session at a terminal offers the
-    /// restart itself.
-    fn connect(&self) -> io::Result<client::Connection> {
-        self.connect_with(&|_| Ok(Vec::new()))
-    }
-
-    /// [`Ctx::connect`], sending what `first` makes right behind the hello.
-    fn connect_with(
-        &self,
-        first: &dyn Fn(&client::Connection) -> io::Result<Vec<ClientMsg>>,
-    ) -> io::Result<client::Connection> {
-        let on_drain = || eprintln!("[waiting for the previous daemon to finish its work]");
-        client::connect_with(&self.endpoint, &self.staged, None, &on_drain, first).map_err(|e| {
-            match &self.endpoint {
-                Endpoint::Local(home) if e.kind() == io::ErrorKind::TimedOut => {
-                    report(&client::diagnose(home));
-                    io::Error::new(e.kind(), RESTART)
-                }
-                _ => e,
-            }
-        })
+        _ => e.into(),
     }
 }
 
 const RESTART: &str = "run `a daemon restart` to replace it";
 
-fn daemon_cmd(ctx: &Ctx, action: Daemon) -> io::Result<()> {
-    let home = ctx.local()?;
+fn daemon_cmd(daemon: &client::Daemon, action: Daemon) -> io::Result<()> {
+    let home = daemon.home()?;
     match action {
         Daemon::Status => {
             let d = client::diagnose(home);
@@ -129,7 +107,7 @@ fn daemon_cmd(ctx: &Ctx, action: Daemon) -> io::Result<()> {
             println!("{}", if stopped { "stopped" } else { "not running" });
         }
         Daemon::Restart => {
-            client::restart(home, &ctx.staged, None)?;
+            daemon.restart()?;
             println!("restarted");
         }
     }
@@ -138,22 +116,11 @@ fn daemon_cmd(ctx: &Ctx, action: Daemon) -> io::Result<()> {
 
 /// The full-screen client at a terminal, the line REPL anywhere else (or
 /// with `A_TUI=plain`).
-fn session(ctx: Ctx, target: Target) -> io::Result<()> {
+fn session(daemon: &client::Daemon, target: Target) -> io::Result<()> {
     match tui::viewport() {
-        Some(viewport) => {
-            let daemon = tui::Daemon {
-                endpoint: ctx.endpoint,
-                staged: ctx.staged,
-            };
-            tui::run(&daemon, target, viewport)
-        }
-        None => repl(&ctx, target),
+        Some(viewport) => tui::run(daemon, target, viewport),
+        None => repl(daemon, target),
     }
-}
-
-/// Connects and makes `attach` right behind the hello.
-fn attach(ctx: &Ctx, attach: Attach) -> io::Result<client::Connection> {
-    ctx.connect_with(&move |conn| Ok(vec![conn.attach(&attach)?]))
 }
 
 /// What wakes the line client.
@@ -166,56 +133,32 @@ enum Input {
 /// The line-mode client: the shared session client, its updates printed
 /// as lines and its intents typed. When the daemon drains for an upgrade,
 /// it reconnects (starting the new build) and replays what it missed.
-fn repl(ctx: &Ctx, target: Target) -> io::Result<()> {
+fn repl(daemon: &client::Daemon, target: Target) -> io::Result<()> {
     let (tx, rx) = client::inbox();
     let events = tx.clone();
-    let driver = Driver::new(ctx.endpoint.clone(), ctx.staged.clone(), move |_, event| {
+    let driver = Driver::new(daemon.clone(), move |_, event| {
         let _ = events.send(Input::Client(event));
     });
-    let mut client = SessionClient::new(Env::Origin);
     let mut repl = Repl {
+        client: SessionClient::new(Env::Origin),
         screen: Screen::default(),
         input: Some(tx),
         live: false,
+        exit: None,
     };
-    let mut effects = client.open(target);
+    let mut effects = repl.client.open(target);
     loop {
-        for effect in effects {
-            if let Some(effect) = driver.apply(effect)
-                && let Some(exit) = repl.show(&client, effect)
-            {
-                return exit;
-            }
+        driver.pump(&mut repl, effects);
+        if let Some(exit) = repl.exit.take() {
+            return exit;
         }
         let Some(input) = rx.recv() else {
             return Ok(());
         };
         effects = match input {
-            Input::Client(event) => client.step(event),
-            Input::Line(None) => client.detach(),
-            Input::Line(Some(line)) => match client.link() {
-                Link::Wedged(d) => match line.trim() {
-                    "r" => client.restart(),
-                    "l" => {
-                        for line in d.log_tail() {
-                            eprintln!("  | {line}");
-                        }
-                        prompt();
-                        Vec::new()
-                    }
-                    _ => return Err(io::Error::new(io::ErrorKind::TimedOut, NOT_RESPONDING)),
-                },
-                _ => match client::parse(&line, client.turn().asking) {
-                    None => Vec::new(),
-                    Some(client::Cmd::Help) => {
-                        for (usage, help) in client::help(client.commands()) {
-                            println!("  {usage:<16} {help}");
-                        }
-                        Vec::new()
-                    }
-                    Some(cmd) => client.run(cmd),
-                },
-            },
+            Input::Client(event) => repl.client.step(event),
+            Input::Line(None) => repl.client.detach(),
+            Input::Line(Some(line)) => repl.line(&line)?,
         };
     }
 }
@@ -223,39 +166,48 @@ fn repl(ctx: &Ctx, target: Target) -> io::Result<()> {
 const NOT_RESPONDING: &str = "daemon not responding";
 
 struct Repl {
+    client: SessionClient,
     screen: Screen,
     /// Taken by the thread reading stdin, once attached.
     input: Option<client::Post<Input>>,
     /// Attached once at least.
     live: bool,
+    /// Set once something shown ends the client.
+    exit: Option<io::Result<()>>,
 }
 
 impl Repl {
-    /// Shows what the client's `effect` tells; `Some` ends the client.
-    fn show(&mut self, client: &SessionClient, effect: Effect) -> Option<io::Result<()>> {
-        match effect {
-            Effect::View(update) => {
-                // Nothing to attach to: no such session.
-                if let (None, Change::Error { message }) = (client.view().session, &update.change) {
-                    return Some(Err(io::Error::other(message.clone())));
+    /// What a typed line asks for. While the daemon does not answer, the
+    /// line answers the prompt instead.
+    fn line(&mut self, line: &str) -> io::Result<Vec<client::Effect>> {
+        if let Link::Wedged(d) = self.client.link() {
+            return match line.trim() {
+                "r" => Ok(self.client.restart()),
+                "l" => {
+                    for line in d.log_tail() {
+                        eprintln!("  | {line}");
+                    }
+                    prompt();
+                    Ok(Vec::new())
                 }
-                self.screen.show(&update.change, client.view());
-            }
-            Effect::Notice(text) => eprintln!("[{text}]"),
-            Effect::Sessions => {
-                for s in client.sessions() {
-                    println!("  {}", listed(s));
-                }
-            }
-            Effect::Link => return self.link(client.link()),
-            _ => {}
+                _ => Err(io::Error::new(io::ErrorKind::TimedOut, NOT_RESPONDING)),
+            };
         }
-        None
+        Ok(match client::parse(line, self.client.turn().asking) {
+            None => Vec::new(),
+            Some(client::Cmd::Help) => {
+                for (usage, help) in client::help(self.client.commands()) {
+                    println!("  {usage:<16} {help}");
+                }
+                Vec::new()
+            }
+            Some(cmd) => self.client.run(cmd),
+        })
     }
 
-    fn link(&mut self, link: &Link) -> Option<io::Result<()>> {
-        match link {
-            Link::Live { .. } => {
+    fn link(&mut self) -> Option<io::Result<()>> {
+        match self.client.link().clone() {
+            Link::Replaying { .. } | Link::Live { .. } => {
                 self.live = true;
                 self.read_stdin();
             }
@@ -264,7 +216,7 @@ impl Repl {
             }
             Link::Reconnecting { .. } => eprintln!("[daemon upgraded; reconnecting]"),
             Link::Wedged(d) => {
-                report(d);
+                report(&d);
                 if !io::stdin().is_terminal() {
                     return Some(Err(io::Error::new(io::ErrorKind::TimedOut, RESTART)));
                 }
@@ -278,7 +230,7 @@ impl Repl {
             Link::Ended(End::Lost(why)) if self.live => {
                 return Some(Err(io::Error::other(format!("daemon disconnected: {why}"))));
             }
-            Link::Ended(End::Lost(why)) => return Some(Err(io::Error::other(why.clone()))),
+            Link::Ended(End::Lost(why)) => return Some(Err(why.into())),
             Link::Connecting | Link::Draining => {}
         }
         None
@@ -299,6 +251,37 @@ impl Repl {
             }
             let _ = tx.send(Input::Line(None));
         });
+    }
+}
+
+/// Shows what the client tells; what ends the client is kept for the loop.
+impl Renderer for Repl {
+    fn show(&mut self, shown: Vec<Show>) -> Vec<client::Effect> {
+        for show in shown {
+            if self.exit.is_some() {
+                break;
+            }
+            match show {
+                Show::View(update) => {
+                    // Nothing to attach to: no such session.
+                    if let (None, Change::Error { message }) =
+                        (self.client.view().session, &update.change)
+                    {
+                        self.exit = Some(Err(io::Error::other(message.clone())));
+                        continue;
+                    }
+                    self.screen.show(&update.change, self.client.view());
+                }
+                Show::Notice(notice) => eprintln!("[{notice}]"),
+                Show::Sessions => {
+                    for s in self.client.sessions() {
+                        println!("  {s}");
+                    }
+                }
+                Show::Link => self.exit = self.link(),
+            }
+        }
+        Vec::new()
     }
 }
 
@@ -384,7 +367,7 @@ impl Screen {
                     }
                 }
             }
-            Change::Mismatch { supported } => eprintln!("[daemon speaks protocol {supported}]"),
+            Change::Mismatch { supported } => eprintln!("[{}]", mismatch_line(*supported)),
             Change::Error { message } => eprintln!("[error: {message}]"),
             Change::Draining => {}
         }
@@ -462,63 +445,40 @@ fn outcome(p: &Presented<'_>) -> Vec<String> {
     lines
 }
 
-fn ls(ctx: &Ctx) -> io::Result<()> {
-    for s in ctx.connect()?.sessions()? {
-        println!("{}", listed(&s));
+fn ls(daemon: &client::Daemon) -> io::Result<()> {
+    for s in connect(daemon)?.sessions()? {
+        println!("{s}");
     }
     Ok(())
 }
 
-/// A session as `a ls` lists it.
-fn listed(s: &SessionSummary) -> String {
-    let kept = s
-        .read_only
-        .map_or_else(String::new, |why| format!("  ({why})"));
-    format!(
-        "{}  {:<9}  {:<10}  {:>4} entries  {}{kept}",
-        s.id.short(),
-        s.activity.name(),
-        s.residency.name(),
-        s.entries,
-        s.workspace.display()
-    )
-}
-
-fn new(ctx: &Ctx) -> io::Result<()> {
-    let mut conn = attach(ctx, Attach::new(Target::New, Env::Origin))?;
-    let session = conn.reader.until(|msg| match msg {
-        DaemonMsg::Attached { session, .. } => Some(session),
-        _ => None,
-    })?;
+fn new(daemon: &client::Daemon) -> io::Result<()> {
+    let session = daemon.new_session().map_err(|e| wedged(daemon, e))?;
     println!("{}", session.short());
-    conn.writer.send(&ClientMsg::Detach)
+    Ok(())
 }
 
 #[cfg(feature = "web")]
-fn web(ctx: Ctx, open: bool) -> io::Result<()> {
-    let daemon = web::Daemon {
-        endpoint: ctx.endpoint,
-        staged: ctx.staged,
-    };
+fn web(daemon: client::Daemon, open: bool) -> io::Result<()> {
     web::run(daemon, open)
 }
 
 #[cfg(not(feature = "web"))]
-fn web(_ctx: Ctx, _open: bool) -> io::Result<()> {
+fn web(_daemon: client::Daemon, _open: bool) -> io::Result<()> {
     Err(io::Error::other("this build of a has no web UI"))
 }
 
 /// The daemon. Started by a client (`listen_fd`), it leaves the client's
 /// session and logs to `logs/daemon.log`; by hand, it stays at the
 /// terminal.
-fn daemon(
-    ctx: &Ctx,
+fn serve(
+    daemon: &client::Daemon,
     listen_fd: Option<i32>,
     lock_fd: Option<i32>,
     reset_breaker: bool,
 ) -> io::Result<()> {
-    let home = &ctx.home;
-    sys::crash::install(home.crash_dir(), ctx.staged.id.clone());
+    let home = daemon.home()?;
+    sys::crash::install(home.crash_dir(), daemon.staged.id.clone());
     let listener = if let Some(fd) = listen_fd {
         sys::detach_session()?;
         sys::log::redirect_stderr(&home.daemon_log())?;
@@ -538,7 +498,7 @@ fn daemon(
             extensions: exts::registry,
             ..engine::Config::load(home)
         },
-        &ctx.staged.id,
+        &daemon.staged.id,
         start,
     )
 }

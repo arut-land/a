@@ -592,10 +592,9 @@ impl Daemon {
     }
 
     /// Every session as it lists, newest first, from memory: no log is
-    /// read. The one order every client shows; ids are `UUIDv7`, so newest
-    /// is greatest.
+    /// read.
     fn list(&self) -> Vec<SessionSummary> {
-        let mut listed: Vec<_> = self
+        let mut sessions: Vec<SessionSummary> = self
             .slots()
             .iter()
             .map(|slot| {
@@ -603,8 +602,9 @@ impl Daemon {
                 slot.summary()
             })
             .collect();
-        listed.sort_by_key(|s| std::cmp::Reverse(s.id.0));
-        listed
+        // Ids are UUIDv7: they order by creation.
+        sessions.sort_by_key(|s| std::cmp::Reverse(s.id.0));
+        sessions
     }
 
     /// Unloads sessions idle for `after`: no attachments, work or jobs.

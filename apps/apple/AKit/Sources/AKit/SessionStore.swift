@@ -4,9 +4,9 @@ import Observation
 /// One session as the app shows it: a copy of the Rust session client's
 /// view, kept in step by its numbered updates. It holds no rule of its own:
 /// the turn (what runs, what waits, what the controls offer), each call's
-/// phase and the link come computed from Rust. The stream drops updates
-/// when its buffer is full, so a `rev` gap asks the source for what was
-/// missed (or a snapshot) before going on.
+/// phase, whose reply is streaming and the link come computed from Rust.
+/// The stream drops updates when its buffer is full, so a `rev` gap asks
+/// the source for what was missed (or a snapshot) before going on.
 @Observable
 public final class SessionStore {
     public private(set) var items: [ViewItem] = []
@@ -16,7 +16,7 @@ public final class SessionStore {
     public private(set) var link: LinkState = .connecting
     /// What the session's turn is doing and what the controls offer.
     public private(set) var turn = TurnInfo(
-        running: false, asking: nil, asks: 0, canInterrupt: false, canSteer: false, canSend: false)
+        running: false, asking: nil, asks: 0, canInterrupt: false, canSend: false)
     public private(set) var sessionId: String?
     public private(set) var workspace = ""
     /// The session's title, once its model named it.
@@ -26,6 +26,8 @@ public final class SessionStore {
     public private(set) var seq: UInt64 = 0
     /// The latest error the daemon reported, or the reason the link closed.
     public var problem: String?
+    /// A newer `a` the daemon runs, when this build cannot be served.
+    public private(set) var newerBuild: String?
     /// How many gaps this store has caught up on.
     public private(set) var resyncs = 0
 
@@ -142,44 +144,38 @@ public final class SessionStore {
 
     private func fold(_ update: ViewUpdate) {
         (rev, seq, turn, title) = (update.rev, update.seq, update.turn, update.title)
+        // The streamed text is the deltas since the update named its call.
+        if streaming?.call != update.streaming {
+            streaming = update.streaming.map { StreamingText(call: $0, text: "") }
+        }
         switch update.change {
         case .attached(let session, let workspace, let reset):
             if reset {
-                (items, recap, streaming) = ([], nil, nil)
+                (items, recap) = ([], nil)
             }
             (sessionId, self.workspace) = (session, workspace)
         case .added(let index, let item):
             items.insert(item, at: min(Int(index), items.count))
-        case .updated(let index, let item, let part):
+        case .updated(let index, let patch):
             guard Int(index) < items.count else { return }
-            items[Int(index)] = item
-            if part == .outcome, case .reply(let call, _, _, _, _, _) = item, streaming?.call == call {
-                streaming = nil
-            }
-        case .delta(let call, let text):
-            if streaming?.call == call {
-                streaming?.text += text
-            } else {
-                streaming = StreamingText(call: call, text: text)
-            }
+            items[Int(index)] = items[Int(index)].patched(patch)
+        case .delta(_, let text):
+            streaming?.text += text
         case .synced(let recap):
             self.recap = recap
         case .snapshot(let snapshot):
             items = snapshot
-            if let call = streaming?.call, !items.contains(where: {
-                if case .reply(call, _, _, .running, _, _) = $0 { true } else { false }
-            }) {
-                streaming = nil
-            }
         case .draining:
             break
-        case .mismatch(let supported):
-            problem = "The daemon speaks protocol \(supported); restart it."
+        case .mismatch(_, let message):
+            problem = message
         case .error(let message):
             problem = message
         case .link(let state):
             link = state
-            if case .lost(let message) = state { problem = message }
+            if case .lost(let message, let newer) = state {
+                (problem, newerBuild) = (message, newer)
+            }
         }
     }
 }
