@@ -11,6 +11,8 @@ mod acceptance;
 mod budgets;
 mod crash;
 mod home;
+#[cfg(feature = "web")]
+mod hygiene;
 mod reactor;
 mod remote;
 mod tui;

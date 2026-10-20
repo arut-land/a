@@ -1,13 +1,16 @@
 //! Drives the built `a` as a black box: each test gets its own `A_HOME`, its
 //! own link to the binary (so its daemons can be told apart from everyone
 //! else's), and a raw protocol connection to inspect what the daemon sends.
+//! Every process a test starts is in the test's process group, which ends
+//! with the test however the test ends (see [`Group`]).
 
-mod pty;
+pub mod pty;
 
 use std::fs;
 use std::io::{BufRead, BufReader, ErrorKind, Read, Write};
 use std::os::unix::fs::PermissionsExt;
 use std::os::unix::net::UnixStream;
+use std::os::unix::process::CommandExt;
 use std::path::{Path, PathBuf};
 use std::process::{Child, ChildStdin, ChildStdout, Command, Output, Stdio};
 use std::time::{Duration, Instant};
@@ -51,14 +54,76 @@ pub fn warm_up(exe: &Path) {
     );
 }
 
+/// A test's process group, led by a watchdog that blocks reading a pipe
+/// only the test holds. However the test ends (it returns, panics, or is
+/// killed and runs no destructor), the pipe closes; the watchdog then stops
+/// the daemon of every home the test listed (daemons leave the group, as
+/// they leave their client's session) and kills the group: every process
+/// the test started, and whatever those started in turn.
+struct Group {
+    watchdog: Child,
+    lifeline: Option<ChildStdin>,
+    pgid: u32,
+    /// Where the test lists its homes, one per line, for the watchdog.
+    homes: PathBuf,
+}
+
+/// The watchdog: `$1` is the `a` to stop daemons with, `$2` the homes.
+const WATCHDOG: &str = r#"read -r _
+while read -r home; do A_HOME="$home" "$1" daemon stop >/dev/null 2>&1; done < "$2"
+kill -KILL 0
+"#;
+
+impl Group {
+    fn new(exe: &Path, homes: PathBuf) -> Self {
+        let mut watchdog = Command::new("/bin/sh")
+            .args(["-c", WATCHDOG, "watchdog"])
+            .arg(exe)
+            .arg(&homes)
+            .env_remove("A_HOST")
+            .process_group(0)
+            .stdin(Stdio::piped())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .unwrap();
+        Self {
+            lifeline: watchdog.stdin.take(),
+            pgid: watchdog.id(),
+            watchdog,
+            homes,
+        }
+    }
+
+    /// Lists `home` for the watchdog to stop the daemon of.
+    fn add(&self, home: &Home) {
+        let mut file = fs::File::options()
+            .create(true)
+            .append(true)
+            .open(&self.homes)
+            .unwrap();
+        writeln!(file, "{}", home.root().display()).unwrap();
+    }
+
+    /// Ends the group as the test's end would, and waits until nothing in
+    /// it is left. Never panics: it runs as a failed test unwinds.
+    fn end(&mut self) {
+        drop(self.lifeline.take());
+        let _ = self.watchdog.wait();
+        // Killed, so gone at once; a zombie a test never reaped is not live.
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while group_alive(self.pgid) && Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(10));
+        }
+    }
+}
+
 pub struct Env {
     pub root: PathBuf,
     pub exe: PathBuf,
     pub ws: PathBuf,
     pub home: Home,
-    /// Homes other than [`Env::home`] this test gave daemons (a simulated
-    /// host's), stopped with it.
-    homes: Vec<Home>,
+    group: Group,
     /// More environment for every `a` this test runs (never its daemons,
     /// which take theirs from [`Env::daemon`]).
     pub vars: Vec<(&'static str, &'static str)>,
@@ -78,14 +143,16 @@ impl Env {
         if fs::hard_link(built(), &exe).is_err() {
             fs::copy(built(), &exe).unwrap();
         }
+        let group = Group::new(&exe, root.join("homes"));
         let env = Self {
             home: Home::from(root.join("home")),
             ws,
             root,
             exe,
-            homes: Vec::new(),
+            group,
             vars: Vec::new(),
         };
+        env.group.add(&env.home);
         warm_up(&env.exe);
         // The socket lives under /tmp by a hash of the home, which carries
         // this process's pid: a failed test of an earlier run, kept to look
@@ -101,7 +168,7 @@ impl Env {
         fs::create_dir_all(&path).unwrap();
         fs::write(path.join("config.toml"), "[daemon]\nagent = \"echo\"\n").unwrap();
         let home = Home::from(path);
-        self.homes.push(home.clone());
+        self.group.add(&home);
         home
     }
 
@@ -160,7 +227,8 @@ impl Env {
     }
 
     fn configure(&self, mut cmd: Command) -> Command {
-        cmd.current_dir(&self.ws)
+        cmd.process_group(self.group.pgid.cast_signed())
+            .current_dir(&self.ws)
             .env("A_HOME", self.home.root())
             // Never the developer's host.
             .env_remove("A_HOST")
@@ -208,6 +276,11 @@ impl Env {
     /// The pid of the daemon holding this home's lock.
     pub fn pid(&self) -> Option<u32> {
         client::diagnose(&self.home).pid
+    }
+
+    /// The process group of everything this test starts.
+    pub fn group(&self) -> u32 {
+        self.group.pgid
     }
 
     /// Every daemon process of this test: daemons run the build staged
@@ -271,22 +344,19 @@ impl Env {
     }
 }
 
+/// What the test started is gone before its home is: the watchdog stops
+/// the daemons and kills the group, as it would had the test been killed.
 impl Drop for Env {
     fn drop(&mut self) {
-        let _ = self.cmd(&["daemon", "stop"]).output();
-        for home in &self.homes {
-            let _ = self
-                .cmd(&["daemon", "stop"])
-                .env("A_HOME", home.root())
-                .output();
-        }
+        self.group.end();
+        // One that would not stop (wedged, or its home already gone).
         for pid in self.daemons() {
             let _ = sys::signal_process(pid, Signal::Kill);
         }
         let _ = fs::remove_file(self.home.endpoint().path());
         // A failed test's home, with the daemon's log, is kept to look at.
         if std::thread::panicking() {
-            eprintln!("kept {}", self.root.display());
+            let _ = writeln!(std::io::stderr(), "kept {}", self.root.display());
         } else {
             let _ = fs::remove_dir_all(&self.root);
         }
@@ -541,6 +611,15 @@ pub fn result_of(e: &Entry, call: Seq) -> Option<&Outcome> {
 
 pub fn is_tool_call(e: &Entry) -> bool {
     matches!(e.body, Body::ToolCall { .. })
+}
+
+/// Every live process whose command line names a path under `root`.
+pub fn processes_under(root: &Path) -> Vec<(u32, String)> {
+    let root = format!("{}/", root.display());
+    processes("pid=")
+        .into_iter()
+        .filter(|(_, args)| args.contains(&root))
+        .collect()
 }
 
 /// Whether any live process is in group `pgid`.
