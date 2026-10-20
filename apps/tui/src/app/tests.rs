@@ -103,6 +103,13 @@ fn typed(app: &mut App, text: &str) -> Option<Effect> {
     press(app, Key::Enter)
 }
 
+/// Types `text` without sending it.
+fn keys(app: &mut App, text: &str) {
+    for c in text.chars() {
+        press(app, Key::Char(c));
+    }
+}
+
 fn asked_command() -> Vec<DaemonMsg> {
     vec![
         entry(
@@ -145,15 +152,15 @@ fn asked_command() -> Vec<DaemonMsg> {
 fn an_approval_shows_buttons_and_y_or_a_click_answers_it() {
     let (mut app, _) = app(Viewport::Full, &asked_command());
     let (_, rows) = frame(&mut app, 70, 20);
-    assert!(rows.iter().any(|r| r == "› $ ls"), "{rows:#?}");
-    find(&rows, "• $ ls  ? waiting for approval");
-    let bar = find(&rows, "? approve $ ls");
-    assert_eq!(bar.1, 16, "above the input: {rows:#?}");
+    assert!(rows.iter().any(|r| r == "❯ $ ls"), "{rows:#?}");
+    find(&rows, "⏺ $ ls  ? waiting for approval");
+    let bar = find(&rows, "Do you want to proceed? $ ls");
+    assert_eq!(bar.1 + 3, find(&rows, &"─".repeat(70)).1);
     assert!(matches!(
         press(&mut app, Key::Char('y')),
         Some(Effect::Cmd(Cmd::Approve { call, approved: true })) if call.get() == 3
     ));
-    let (x, y) = find(&rows, "[ n  no ]");
+    let (x, y) = find(&rows, "2. No");
     assert!(matches!(
         app.input(Input::Mouse(Mouse::Press { x: x + 2, y })),
         Some(Effect::Cmd(Cmd::Approve { call, approved: false })) if call.get() == 3
@@ -233,7 +240,7 @@ fn a_streamed_reply_shows_live_then_its_committed_text() {
         },
     ));
     let (_, rows) = frame(&mut app, 50, 12);
-    find(&rows, "  Hello you!");
+    find(&rows, "⏺ Hello you!");
     assert!(!rows.iter().any(|r| r.contains('▍')));
     find(&rows, "gpt  ↑12 ↓3");
 }
@@ -302,17 +309,17 @@ fn a_card_folds_on_click_and_ctrl_o_shows_all_output() {
     ));
     let (mut app, _) = app(Viewport::Full, &msgs);
     let (_, rows) = frame(&mut app, 60, 40);
-    find(&rows, "⋯ 20 earlier lines");
-    let (x, y) = find(&rows, "▾ $ ls  ✓ exit 0");
+    find(&rows, "… +20 lines");
+    let (x, y) = find(&rows, "⏺ $ ls  ✓ exit 0");
     assert!(app.input(Input::Mouse(Mouse::Press { x, y })).is_none());
     let (_, rows) = frame(&mut app, 60, 40);
-    find(&rows, "▸ $ ls  ✓ exit 0");
-    find(&rows, "│ 30 lines");
-    let (x, y) = find(&rows, "▸ $ ls");
+    find(&rows, "⏺ $ ls  ✓ exit 0");
+    find(&rows, "⎿  30 lines");
+    let (x, y) = find(&rows, "⏺ $ ls");
     app.input(Input::Mouse(Mouse::Press { x, y }));
     press(&mut app, Key::Ctrl('o'));
     let (_, rows) = frame(&mut app, 60, 40);
-    find(&rows, "│ out 1");
+    find(&rows, "out 1");
 }
 
 #[test]
@@ -337,7 +344,7 @@ fn the_wheel_scrolls_and_new_rows_keep_a_scrolled_view_still() {
     let (_, rows) = frame(&mut app, 40, 12);
     assert!(!rows.iter().any(|r| r.contains("message 39")));
     let top = rows[0].clone();
-    find(&rows, "newer below");
+    find(&rows, "Jump to bottom");
     app.fold(&entry(
         40,
         Body::Input {
@@ -355,11 +362,12 @@ fn the_wheel_scrolls_and_new_rows_keep_a_scrolled_view_still() {
 }
 
 #[test]
-fn the_empty_input_hint_starts_after_the_caret() {
+fn hints_stay_below_the_input_and_leave_the_caret_clear() {
     let (mut app, _) = app(Viewport::Full, &[]);
     let (screen, rows) = frame(&mut app, 60, 10);
     let (x, y) = find(&rows, "message the agent");
-    assert_eq!(screen.caret, Some((x - 1, y)));
+    assert_eq!(x, 0);
+    assert_eq!(screen.caret, Some((2, y - 2)));
 }
 
 #[test]
@@ -416,7 +424,7 @@ fn ctrl_c_interrupts_a_running_call_and_shows_how_it_ended() {
         },
     ));
     let (_, rows) = frame(&mut app, 60, 12);
-    find(&rows, "• $ ls  ✗ aborted · killed by SIGTERM");
+    find(&rows, "⏺ $ ls  ✗ aborted · killed by SIGTERM");
     assert!(
         press(&mut app, Key::Ctrl('c')).is_none(),
         "clears the input"
@@ -582,12 +590,12 @@ fn the_recap_shows_until_dismissed() {
 fn inline_prints_settled_items_once_and_keeps_the_rest_live() {
     let (mut app, _) = app(Viewport::Inline, &asked_command());
     let printed: Vec<String> = app.scrollback(60).iter().map(Line::text).collect();
-    assert!(printed.contains(&"› $ ls".to_owned()), "{printed:?}");
+    assert!(printed.contains(&"❯ $ ls".to_owned()), "{printed:?}");
     assert!(app.scrollback(60).is_empty(), "printed once");
     let height = app.height(60, 40);
     let (_, rows) = frame(&mut app, 60, height);
     find(&rows, "? waiting for approval");
-    assert!(!rows.iter().any(|r| r == "› $ ls"), "{rows:#?}");
+    assert!(!rows.iter().any(|r| r == "❯ $ ls"), "{rows:#?}");
     app.fold(&entry(
         5,
         Body::ToolResult {
@@ -939,3 +947,294 @@ unsafe impl GlobalAlloc for Counting {
 
 #[global_allocator]
 static COUNTING: Counting = Counting;
+
+#[test]
+fn a_slash_lists_the_commands_it_may_become_and_tab_takes_one() {
+    let (mut app, _) = app(Viewport::Full, &[DaemonMsg::Synced { seq: 0 }]);
+    keys(&mut app, "/s");
+    let (_, rows) = frame(&mut app, 70, 20);
+    find(&rows, "❯ /sessions");
+    find(&rows, "  /steer text");
+    assert!(!rows.iter().any(|r| r.contains("/detach")), "{rows:#?}");
+    press(&mut app, Key::Down);
+    let (_, rows) = frame(&mut app, 70, 20);
+    find(&rows, "❯ /steer text");
+    assert_eq!(press(&mut app, Key::Tab), None);
+    assert_eq!(app.editor.text(), "/steer ");
+    let (_, rows) = frame(&mut app, 70, 20);
+    assert!(!rows.iter().any(|r| r.contains("/sessions")), "{rows:#?}");
+}
+
+#[test]
+fn enter_on_a_partial_command_without_arguments_runs_it() {
+    let (mut app, _) = app(Viewport::Full, &[DaemonMsg::Synced { seq: 0 }]);
+    keys(&mut app, "/deta");
+    assert_eq!(press(&mut app, Key::Enter), Some(Effect::Detach));
+}
+
+#[test]
+fn the_input_sits_between_two_rules() {
+    let (mut app, _) = app(Viewport::Full, &[DaemonMsg::Synced { seq: 0 }]);
+    let (_, rows) = frame(&mut app, 30, 10);
+    let rule = "─".repeat(30);
+    assert_eq!(
+        (rows[5].as_str(), rows[7].as_str()),
+        (rule.as_str(), rule.as_str())
+    );
+    assert!(rows[6].starts_with("❯"), "{rows:#?}");
+}
+
+#[test]
+fn esc_denies_an_approval_and_1_approves_it() {
+    let (mut app, _) = app(Viewport::Full, &asked_command());
+    assert!(matches!(
+        press(&mut app, Key::Esc),
+        Some(Effect::Cmd(Cmd::Approve {
+            approved: false,
+            ..
+        }))
+    ));
+    assert!(matches!(
+        press(&mut app, Key::Char('1')),
+        Some(Effect::Cmd(Cmd::Approve { approved: true, .. }))
+    ));
+}
+
+/// A running call that nothing waits on: the approved `asked_command`.
+fn running_command() -> Vec<DaemonMsg> {
+    let mut msgs = asked_command();
+    msgs.push(entry(
+        5,
+        Body::Answer {
+            call: CallId::new(3).unwrap(),
+            value: Json::encode(&true).unwrap(),
+            origin: None,
+        },
+    ));
+    msgs
+}
+
+#[test]
+fn esc_interrupts_a_running_turn_that_asks_nothing() {
+    for viewport in [Viewport::Full, Viewport::Inline] {
+        let (mut app, _) = app(viewport, &running_command());
+        app.anchor = Some((0, 0));
+        assert!(matches!(
+            press(&mut app, Key::Esc),
+            Some(Effect::Cmd(Cmd::Interrupt))
+        ));
+    }
+}
+
+#[test]
+fn enter_confirms_the_highlighted_approval_and_down_moves_it_to_no() {
+    let (mut app, _) = app(Viewport::Full, &asked_command());
+    let (_, rows) = frame(&mut app, 70, 20);
+    find(&rows, "❯ 1. Yes");
+    assert!(matches!(
+        press(&mut app, Key::Enter),
+        Some(Effect::Cmd(Cmd::Approve { approved: true, .. }))
+    ));
+    press(&mut app, Key::Down);
+    let (_, rows) = frame(&mut app, 70, 20);
+    find(&rows, "❯ 2. No");
+    assert!(matches!(
+        press(&mut app, Key::Enter),
+        Some(Effect::Cmd(Cmd::Approve {
+            approved: false,
+            ..
+        }))
+    ));
+}
+
+/// The one timer exists only while a turn works: no tick is asked of the
+/// event loop when idle, nor while an approval waits for the person, nor
+/// once the call has ended.
+#[test]
+fn no_timer_runs_unless_a_turn_is_working() {
+    let (mut idle, _) = app(Viewport::Full, &[DaemonMsg::Synced { seq: 0 }]);
+    assert!(!idle.working());
+    frame(&mut idle, 70, 20);
+    idle.tick();
+    assert!(!idle.needs_frame(), "an idle tick owes no frame");
+    let (asked, _) = app(Viewport::Full, &asked_command());
+    assert!(!asked.working(), "an approval waits for the person");
+    let (mut busy, _) = app(Viewport::Full, &running_command());
+    assert!(busy.working());
+    let (_, rows) = frame(&mut busy, 70, 20);
+    find(&rows, "Working… (0s · esc to interrupt)");
+    busy.tick();
+    assert!(busy.needs_frame(), "a working turn redraws its clock");
+    busy.fold(&entry(
+        6,
+        Body::ToolResult {
+            call: CallId::new(3).unwrap(),
+            outcome: Outcome::Done {
+                output: Json::encode(&json!({"output": "", "exit": 0})).unwrap(),
+            },
+            card: None,
+        },
+    ));
+    assert!(!busy.working(), "the turn ended; the timer stops with it");
+    let (_, rows) = frame(&mut busy, 70, 20);
+    assert!(!rows.iter().any(|r| r.contains("Working")), "{rows:#?}");
+    busy.tick();
+    assert!(
+        !busy.needs_frame(),
+        "a finished turn cannot schedule animation"
+    );
+    assert!(busy.clock.since.is_none());
+}
+
+#[test]
+fn a_question_mark_on_an_empty_input_opens_help_and_inside_text_is_typed() {
+    let (mut app, _) = app(Viewport::Full, &[DaemonMsg::Synced { seq: 0 }]);
+    press(&mut app, Key::Char('?'));
+    let (_, rows) = frame(&mut app, 80, 40);
+    find(&rows, "keys and commands");
+    press(&mut app, Key::Char('q'));
+    keys(&mut app, "why?");
+    assert_eq!(app.editor.text(), "why?");
+}
+
+#[test]
+fn escape_closes_the_slash_menu_without_losing_the_draft() {
+    let (mut app, _) = app(Viewport::Full, &[DaemonMsg::Synced { seq: 0 }]);
+    keys(&mut app, "/s");
+    assert_eq!(app.menu()[0].0, "/sessions");
+    press(&mut app, Key::Esc);
+    assert_eq!(app.menu(), [] as [(String, String, String); 0]);
+    assert_eq!(app.editor.text(), "/s");
+    keys(&mut app, "e");
+    assert_eq!(app.menu()[0].0, "/sessions");
+}
+
+#[test]
+fn running_tools_show_each_progress_update_and_then_the_finished_card() {
+    for viewport in [Viewport::Full, Viewport::Inline] {
+        let (mut app, _) = app(viewport, &running_command());
+        for (seq, text) in [(6, "first\n"), (7, "second\n")] {
+            app.fold(&entry(
+                seq,
+                Body::Progress {
+                    call: CallId::new(3).unwrap(),
+                    text: text.into(),
+                },
+            ));
+            assert!(app.needs_frame());
+            let (_, rows) = frame(&mut app, 80, 24);
+            find(&rows, "⎿  first");
+            if seq == 7 {
+                find(&rows, "second");
+            }
+        }
+        app.fold(&entry(
+            8,
+            Body::ToolResult {
+                call: CallId::new(3).unwrap(),
+                outcome: Outcome::Done {
+                    output: Json::encode(&json!({"output":"final", "exit":0})).unwrap(),
+                },
+                card: Some(Card {
+                    body: "final".into(),
+                    note: "exit 0".into(),
+                    ..Card::default()
+                }),
+            },
+        ));
+        let (_, rows) = frame(&mut app, 80, 24);
+        find(&rows, "⎿  final");
+        assert!(!rows.iter().any(|r| r.contains("second")));
+    }
+}
+
+#[test]
+fn inline_review_expands_finished_cards_without_printing_history_twice() {
+    let (mut app, _) = app(Viewport::Inline, &running_command());
+    app.fold(&entry(
+        6,
+        Body::ToolResult {
+            call: CallId::new(3).unwrap(),
+            outcome: Outcome::Done {
+                output: Json::encode(&json!({"output":"done", "exit":0})).unwrap(),
+            },
+            card: Some(Card {
+                body: (1..=30).fold(String::new(), |s, n| s + &format!("output {n}\n")),
+                note: "exit 0".into(),
+                ..Card::default()
+            }),
+        },
+    ));
+    assert_ne!(app.scrollback(80).len(), 0);
+    assert_eq!(app.committed, app.view().items.len());
+    press(&mut app, Key::Ctrl('o'));
+    let h = app.height(80, 24);
+    let (_, rows) = frame(&mut app, 80, h);
+    find(&rows, "output 30");
+    press(&mut app, Key::PageUp);
+    let (_, rows) = frame(&mut app, 80, h);
+    find(&rows, "output 10");
+    press(&mut app, Key::Ctrl('o'));
+    assert!(app.anchor.is_none());
+    assert_eq!(app.scrollback(80).len(), 0);
+}
+
+#[test]
+fn a_turn_keeps_its_active_time_and_tokens_across_calls_but_not_idle_time() {
+    let (mut app, _) = app(
+        Viewport::Full,
+        &[
+            entry(
+                1,
+                Body::Input {
+                    text: "hi".into(),
+                    mode: protocol::Mode::Queue,
+                    taken: true,
+                    origin: None,
+                },
+            ),
+            entry(
+                2,
+                Body::ModelCall {
+                    model: "m".into(),
+                    attempt: 0,
+                    choice: protocol::ToolChoice::Auto,
+                    r#for: None,
+                    purpose: None,
+                },
+            ),
+        ],
+    );
+    app.clock.elapsed = std::time::Duration::from_secs(3);
+    app.fold(&entry(3, Body::ModelResult {
+        call:CallId::new(2).unwrap(),
+        outcome:Outcome::Done {output:Json::encode(&json!({"message":{"content":[{"type":"text","text":"hi"}]},"usage":{"input":12,"output":3}})).unwrap()},
+    }));
+    assert!(!app.working());
+    assert!(app.clock.since.is_none());
+    let elapsed = app.clock.elapsed();
+    app.fold(&entry(
+        4,
+        Body::ToolCall {
+            tool: "bash".into(),
+            input: Json::encode(&json!({"command":"true"})).unwrap(),
+            id: None,
+            card: None,
+            by: Audience::Model,
+        },
+    ));
+    assert_eq!(app.clock.elapsed, elapsed);
+    let (_, rows) = frame(&mut app, 80, 24);
+    find(&rows, "Working… (3s · ↓ 3 tokens");
+    app.fold(&entry(
+        5,
+        Body::Input {
+            text: "next".into(),
+            mode: protocol::Mode::Queue,
+            taken: true,
+            origin: None,
+        },
+    ));
+    assert_eq!(app.clock.before, 3);
+    assert_eq!(app.clock.elapsed, std::time::Duration::ZERO);
+}

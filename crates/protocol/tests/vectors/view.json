@@ -1,5 +1,183 @@
 [
   {
+    "hash": "6c8e00eea9b68da2",
+    "messages": [
+      {
+        "session": "00000000-0000-0000-0000-00000000000a",
+        "t": "attached",
+        "workspace": "/w"
+      },
+      {
+        "epoch": 0,
+        "input": {
+          "command": "echo hi"
+        },
+        "kind": "tool_call",
+        "seq": 1,
+        "t": "entry",
+        "tool": "bash"
+      },
+      {
+        "call": 1,
+        "epoch": 0,
+        "kind": "progress",
+        "seq": 2,
+        "t": "entry",
+        "text": "h"
+      },
+      {
+        "call": 1,
+        "epoch": 0,
+        "kind": "progress",
+        "seq": 3,
+        "t": "entry",
+        "text": "i\n"
+      },
+      {
+        "call": 1,
+        "card": {
+          "body": "hi\n",
+          "note": "exit 0",
+          "title": "$ echo hi"
+        },
+        "epoch": 0,
+        "kind": "tool_result",
+        "outcome": {
+          "output": {
+            "exit": 0,
+            "output": "hi\n"
+          },
+          "status": "done"
+        },
+        "seq": 4,
+        "t": "entry"
+      },
+      {
+        "seq": 4,
+        "t": "synced"
+      }
+    ],
+    "name": "each committed tool progress chunk updates its live presentation",
+    "state": {
+      "items": [
+        {
+          "call": 1,
+          "card": {
+            "body": "hi\n",
+            "note": "exit 0",
+            "title": "$ echo hi"
+          },
+          "input": {
+            "command": "echo hi"
+          },
+          "outcome": {
+            "output": {
+              "exit": 0,
+              "output": "hi\n"
+            },
+            "status": "done"
+          },
+          "phase": {
+            "settled": "done"
+          },
+          "tool": "bash",
+          "type": "tool"
+        }
+      ],
+      "ledger": {
+        "armed": [],
+        "background": [],
+        "clients": [],
+        "context": false,
+        "env": null,
+        "extensions": null,
+        "links": [],
+        "open": [],
+        "seq": 4,
+        "turn": 0,
+        "untaken": [],
+        "watched": []
+      },
+      "seq": 4,
+      "session": "00000000-0000-0000-0000-00000000000a",
+      "workspace": "/w"
+    },
+    "updates": [
+      {
+        "change": {
+          "change": "attached",
+          "reset": true,
+          "session": "00000000-0000-0000-0000-00000000000a",
+          "workspace": "/w"
+        },
+        "rev": 1,
+        "seq": 0
+      },
+      {
+        "change": {
+          "change": "added",
+          "index": 0,
+          "item": {
+            "call": 1,
+            "input": {
+              "command": "echo hi"
+            },
+            "outcome": null,
+            "phase": {
+              "gating": {
+                "at": 0
+              }
+            },
+            "tool": "bash",
+            "type": "tool"
+          }
+        },
+        "rev": 2,
+        "seq": 1
+      },
+      {
+        "change": {
+          "change": "updated",
+          "index": 0,
+          "part": {
+            "part": "progress"
+          }
+        },
+        "rev": 3,
+        "seq": 2
+      },
+      {
+        "change": {
+          "change": "updated",
+          "index": 0,
+          "part": {
+            "part": "progress"
+          }
+        },
+        "rev": 4,
+        "seq": 3
+      },
+      {
+        "change": {
+          "change": "updated",
+          "index": 0,
+          "part": {
+            "part": "outcome"
+          }
+        },
+        "rev": 5,
+        "seq": 4
+      },
+      {
+        "change": {
+          "change": "synced"
+        },
+        "rev": 6,
+        "seq": 4
+      }
+    ]
+  },
+  {
     "hash": "214e1fb9e25e80df",
     "messages": [
       {

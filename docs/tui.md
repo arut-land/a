@@ -14,41 +14,104 @@ colours.
 
 Everything comes from the shared reducer, `protocol::view::SessionView`:
 the app folds each `DaemonMsg` with `SessionView::fold` and uses the
-returned `Update` only to know which item's rows to re-wrap. Nothing is
-re-derived; what is local is screen state (scroll anchor, folded cards, the
-input, overlays).
+returned `Update` only to know which item's rows to re-wrap. Tool progress
+comes from the ledger through `SessionView::present`, until the finished
+card replaces it. Nothing is re-derived; what is local is screen state
+(scroll anchor, folded cards, the input, overlays).
 
 - Transcript: your messages, replies streamed from `SessionView::streaming`
   with light markdown (headings, bullets, quotes, fenced code, `**bold**`,
   `` `code` ``), hooks and environment changes as muted lines.
 - Tool cards: the call as its tool presents it (the `Card` from
   `Tool::present`, else the input, as every client shows it via
-  `protocol::view`), its state (running, waiting for approval, not
-  approved, the card's note such as `exit 1` or `+3 -1`, failed,
-  interrupted) and the last 10 lines of output; an edit's diff is colored.
+  `protocol::view`) behind a `⏺` in its state's color, its state (running,
+  waiting for approval, not approved, the card's note such as `exit 1` or
+  `+3 -1`, failed, interrupted) and the last 10 lines of output hung under
+  it behind `⎿`; an edit's diff is colored.
   A click on a card folds it; Ctrl-O shows every card's whole output.
+  Inline, Ctrl-O opens transcript review; PgUp/PgDn scroll it and Ctrl-O
+  returns to the prompt without printing the history again.
   Command output has its escapes stripped. Slash commands the daemon runs
   show as cards too.
 - Approvals: the oldest call `asked()` of this client shows above the
-  input with `[ y yes ]` `[ n no ]` buttons, and on its card; `y` or `n`
-  with an empty input answers it.
+  input as `Do you want to proceed?` with `1. Yes` and `2. No`, and on its
+  card; Yes is highlighted initially, Up/Down selects, Enter confirms;
+  `1`/`y` or `2`/`n` with an empty input answers it, and Esc denies.
 - The recap after an attach, as a banner (Esc or its `×` hides it).
+- Working: `✻ Working… (3s · ↓ n tokens · esc to interrupt)` over the input.
 - Status line: link state (connecting, replaying, live, daemon upgrading,
   disconnected), session, workspace, model, tokens.
-- Input: multi-line (Ctrl-J or Alt-Enter for a new line, bracketed paste
-  keeps newlines), readline keys, Up/Down through history (seeded from the
-  session's own messages).
+- Input: between two rules, `❯ `, with hints below; typing `/` lists the
+  commands it may become over the input (Up/Down choose, Tab takes the
+  name, Enter runs one that takes no arguments); multi-line (Ctrl-J or
+  Alt-Enter for a new line, bracketed paste keeps newlines; a long one
+  shows as `[Pasted text #1 +25 lines]`), readline keys, Up/Down through
+  history (seeded from the session's own messages).
 - `/sessions` (a picker showing each session's activity and residency;
   also what `a resume` opens when this workspace has no session), `/new`,
-  `/env refresh`, `/interrupt`, `/detach`, `/help` (or F1). Any other
-  `/name` goes to the daemon, which runs the session's slash command or
+  `/env refresh`, `/interrupt`, `/detach`, `/help` (or F1 or `?` on an
+  empty input). Any other `/name` goes to the daemon, which runs the session's slash command or
   says there is none.
-- Ctrl-C while a model call, tool call or slash command runs sends
-  `ClientMsg::Interrupt`, which stops it and the rest of its turn; otherwise it
-  clears the input, or detaches when it is empty. Nothing the client does
-  stops the daemon. Ctrl-D on an empty input detaches.
+- Esc or Ctrl-C while a model call, tool call or slash command runs sends
+  `ClientMsg::Interrupt`, which stops it and the rest of its turn. Otherwise
+  Ctrl-C clears the input, or detaches when it is empty. Esc otherwise
+  dismisses the command menu, returns to the latest output or hides the recap.
+  Nothing the client does stops the daemon. Ctrl-D on an empty input detaches.
 - A daemon that drains for an upgrade is reconnected and replayed from
   `SessionView::seq`; one that does not answer the hello offers a restart.
+
+## Compared with Claude Code
+
+Verified on 21 October 2026 with tuistory 0.12.0 (Ghostty PTY model), at
+100×30 and resized to 60×24, against Claude Code 2.1.304. Both renderers
+were run, without changing the user's renderer setting:
+`CLAUDE_CODE_NO_FLICKER=1 claude --model haiku` for full screen and
+`CLAUDE_CODE_DISABLE_ALTERNATE_SCREEN=1 claude --model haiku` for the main
+buffer. These per-run switches are in the
+[fullscreen documentation](https://code.claude.com/docs/en/fullscreen).
+The runs used throwaway workspaces and `--setting-sources project,local`;
+`a` used a fixture build and an isolated echo-agent daemon.
+
+A raw PTY recording confirms alternate screen (`?1049`) and mouse
+(`?1000 ?1002 ?1003 ?1006`) in Claude's full screen, neither in its main
+buffer. Both enable bracketed paste (`?2004`), focus (`?1004`), theme
+reports (`?2031`) and synchronized output (`?2026`). `a` enables paste
+and synchronized output in both modes, alternate screen and click/wheel
+reports (`?1000 ?1006`) in full screen.
+
+Haiku resolved to `claude-haiku-5-5` and returned "may not exist or you may
+not have access" in both modes. Successful model responses, live model
+token counts and model-driven approval prompts could not be verified.
+Harmless shell commands (`!seq 1 60`, and printing a line before a sleep)
+exercised long output and streaming without a model; model failures still
+showed the reply marker and working animation. Approval behavior below
+records the earlier comparison and is covered by `a`'s unit and PTY tests,
+not a successful model-driven approval in this run.
+
+| Feature | Mode | Claude Code | `a` now | Difference and reason |
+| --- | --- | --- | --- | --- |
+| messages and replies | both | `❯`, `⏺`, continuation indented 2 | the same, streaming too | naming stays ours |
+| input and hints | both | input between rules, shortcuts below | rules, blank prompt caret, hints below, session/model/token status | `a` keeps daemon link state visible |
+| working | both | animated glyph, varying verb; duration summary after completion | animated yellow `✻ Working… (3s · ↓ 120 tokens · esc to interrupt)` | fixed verb; tokens reflect completed model calls, since providers report usage on completion; no duration summary |
+| idle | both | working animation disappears after completion | no timer idle, awaiting approval, disconnected, or after completion | `no_timer_runs_unless_a_turn_is_working` guards the timer's predicate and idle redraw |
+| approval | both | highlighted Yes by default; Up/Down, Enter, digits, Esc (earlier comparison) | the same, plus y/n and clicks | no always-allow option: no such policy feature in `a` |
+| interrupt | both | Esc interrupts; own follow-up wording | Esc or Ctrl-C; `interrupt requested · what should it do next?`, then the tool's result or interrupted reply | shell cards say `aborted` with their actual exit status |
+| tool output | both | live shell output under `⎿`, expandable result | committed progress under `⎿` while running; finished card replaces it; tail of 10 lines, Ctrl-O expands | titles, exit notes and diffs come from each tool's `Card`; `a` also keeps approval buttons on the pending card |
+| long paste | both | collapsed paste label | `[Pasted text #1 +25 lines]`, expanded only on send; history retains full text | labels are tracked as ranges so identical typed text stays literal; deleting part removes the whole paste |
+| slash menu | both | filtered suggestions above input; Esc closes | filtered above input; Up/Down, Tab, Enter; Esc closes and retains draft | commands are `a`'s own smaller set |
+| shortcuts | both | `?` toggles shortcuts below the input | `?` on empty input opens the same help as F1 or `/help` | uses the existing help overlay |
+| history and picker | both | Up recalls; `/resume` picker | Up/Down history; `/sessions`, or `a resume` with no workspace session | picker shows daemon activity/residency; Claude's child-session marker disabled transcript saving in these runs |
+| transcript scrolling | full screen | wheel, pinned prompt, clickable jump to bottom | the same, stable anchor as output arrives | selection needs the terminal's override in `a`; no transcript search, in-app drag selection or hover, so pointer motion never wakes the idle client |
+| scrollback | main buffer | output remains in terminal scrollback; Ctrl-O opens transcript review | settled output printed once into terminal scrollback; Ctrl-O reviews the whole expanded transcript in a temporary viewport | PgUp/PgDn navigate review; closing it leaves printed history unchanged |
+| resize | full screen | reflows visible transcript and preserves scroll | reflows from the item/row anchor, prompt pinned | neither writes transcript to native scrollback |
+| resize | main buffer | redraws viewport; old terminal-reflowed rows can remain above it | redraws viewport with the same terminal-reflow limitation | already printed scrollback belongs to the terminal |
+| Ctrl-C / Ctrl-D, empty input | both | first press asks to press again; second exits | one press detaches; `a resume` hint | the daemon owns the durable session, so leaving needs no confirmation |
+| screen after exit | full screen | restores previous main screen; no transcript printed | restores main screen and prints detach hint | durable daemon session replaces a process-local transcript |
+| screen after exit | main buffer | transcript and prompt remain | transcript remains; active viewport cleared, detach hint printed | completed output stays; transient controls are removed |
+
+Colors stay palette entries in `a`; Claude's accent is RGB. Focus and
+theme reports, completion summaries, hover and drag selection are not
+implemented by `a`.
 
 Colors are the terminal's palette entries (1–7 and bright black) plus bold,
 dim, italic and reverse, never RGB or a background, so light and dark themes
@@ -84,9 +147,12 @@ crates, three of them proc-macros, for `Buffer`, `Cell` and `Style`.
 
 - One thread owns the app and blocks on its `client::Inbox`. The terminal
   thread blocks in `poll` on stdin and a signal pipe with no timeout; the
-  `Driver` reads each connection on a thread of its own. Nothing polls on
-  a timer. Everything queued is folded before one frame; what the terminal
-  thread posts (`Post::send_first`) is taken before the daemon's backlog,
+  `Driver` reads each connection on a thread of its own. The only timer is
+  the working indicator's, armed while a turn works with nothing asked
+  and gone when it ends; an idle client sleeps in `poll`. Elapsed time and
+  usage stay with the turn across calls; time awaiting approval or idle
+  is excluded. Everything queued is folded before one frame; what the
+  terminal thread posts (`Post::send_first`) is taken before the daemon's backlog,
   so a keystroke or a resize is folded ahead of a replay still queued.
 - Signals (`sys::Signals`, the self-pipe trick: the handler writes one byte)
   reach that same `poll`: SIGWINCH is a resize, SIGTERM and SIGHUP restore

@@ -18,26 +18,21 @@ fn the_full_screen_client_shows_replies_and_answers_approvals_by_click() {
     term.wait_for("● live");
 
     term.send(b"hello from a tty\r");
-    let screen = term.wait_for("  hello from a tty");
+    let screen = term.wait_for("⏺ hello from a tty");
     assert!(
-        screen.find("› hello from a tty").is_some(),
+        screen.find("❯ hello from a tty").is_some(),
         "{}",
         screen.text()
     );
 
     term.send(b"$ echo ran > ran.txt\r");
-    let screen = term.wait_for("? approve $ echo ran > ran.txt");
+    let screen = term.wait_for("Do you want to proceed? $ echo ran > ran.txt");
     assert!(screen.find("? waiting for approval").is_some());
     let ran = env.ws.join("ran.txt");
     assert!(!ran.exists(), "ran before it was approved");
-    // The approval bar's own button, on the row above the input.
-    let (x, y) = screen.find("? approve").unwrap();
-    let bar = screen.row(usize::from(y));
-    let yes = bar.find("[ y  yes ]").unwrap();
-    term.click((
-        x + u16::try_from(bar[..yes].chars().count()).unwrap() + 2,
-        y,
-    ));
+    // The approval bar's own choice, on the row under its question.
+    let (x, y) = screen.find("1. Yes").unwrap();
+    term.click((x + 2, y));
     term.wait_for("✓ exit 0");
     assert_eq!(fs::read_to_string(&ran).unwrap(), "ran\n");
 
@@ -72,7 +67,7 @@ fn the_inline_client_prints_the_transcript_into_the_scrollback() {
     let mut term = env.tty(&[], 80, 24);
     term.wait_for("● live");
     term.send(b"$ echo first\r");
-    term.wait_for("? approve $ echo first");
+    term.wait_for("Do you want to proceed? $ echo first");
     term.send(b"y");
     term.wait_for("✓ exit 0");
     term.send(b"\x03");
@@ -82,7 +77,7 @@ fn the_inline_client_prints_the_transcript_into_the_scrollback() {
     let mut term = env.tty(&["resume"], 80, 24);
     let screen = term.wait_for("recap · you: $ echo first");
     assert!(
-        screen.find("› $ echo first").is_some(),
+        screen.find("❯ $ echo first").is_some(),
         "the replay is printed above the input:\n{}",
         screen.text()
     );
@@ -143,19 +138,40 @@ fn the_full_screen_client_rides_out_a_daemon_upgrade() {
     let mut term = Env::tty_of(env.cmd_as(&old, &[]), 100, 30);
     term.wait_for("● live");
     term.send(b"before\r");
-    term.wait_for("  before");
+    term.wait_for("⏺ before");
     let first = env.pid().unwrap();
 
     // The newer build drains the older one's daemon and starts its own.
     env.run(&["ls"]);
     assert_ne!(env.pid().unwrap(), first);
     term.send(b"after the upgrade\r");
-    let screen = term.wait_for("  after the upgrade");
+    let screen = term.wait_for("⏺ after the upgrade");
     assert!(!screen.text().contains("disconnected"), "{}", screen.text());
-    assert_eq!(screen.text().matches("› after the upgrade").count(), 1);
+    assert_eq!(screen.text().matches("❯ after the upgrade").count(), 1);
 
     term.send(b"\x03");
     assert!(term.wait().success());
     let out = String::from_utf8_lossy(&term.bytes()).into_owned();
     assert!(out.contains("[detached; the session keeps running"));
+}
+
+#[test]
+fn esc_interrupts_a_running_turn_without_leaving_either_viewport() {
+    for viewport in ["full", "inline"] {
+        let mut env = Env::new("tui-esc");
+        env.vars.push(("A_TUI", viewport));
+        let mut term = env.tty(&[], 80, 24);
+        term.wait_for("● live");
+        term.send(b"$ echo started; sleep 60\r");
+        term.wait_for("⎿  started");
+        term.wait_for("Working…");
+        term.send(b"\x1b");
+        let screen = term.wait_for("aborted");
+        assert!(!screen.text().contains("Working…"), "{}", screen.text());
+        term.send(b"still here\r");
+        term.wait_for("⏺ still here");
+        term.send(b"\x04");
+        assert!(term.wait().success());
+        assert!(term.cooked(), "detaching restores terminal input");
+    }
 }

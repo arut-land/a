@@ -234,7 +234,7 @@ fn replied<'a>(
         }
         Status::Interrupted => {
             p.glyph = Glyph::Warn;
-            p.status = "model call interrupted".into();
+            p.status = "interrupted · what should it do instead?".into();
         }
     }
     p
@@ -298,7 +298,7 @@ fn standing<'a>(
         }
         Outcome::Interrupted { output } => {
             p.glyph = Glyph::Warn;
-            p.status = "interrupted".into();
+            p.status = "interrupted · what should it do instead?".into();
             p.body = match output.as_deref().map(|t| t.trim_end_matches('\n')) {
                 Some(text) if !text.is_empty() => Shown::Text(text.into()),
                 _ => Shown::None,

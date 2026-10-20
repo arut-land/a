@@ -1,7 +1,11 @@
 //! The input: multi-line text with a cursor, readline keys, and history.
 
+use std::ops::Range;
+
 use super::keys::Key;
 use super::text::{Line, Span, Style, char_width};
+
+const LONG_PASTE: usize = 3;
 
 #[derive(Default)]
 pub struct Editor {
@@ -10,7 +14,15 @@ pub struct Editor {
     cursor: usize,
     history: Vec<String>,
     /// While browsing history: the entry shown, and the draft it replaced.
-    browsing: Option<(usize, String)>,
+    browsing: Option<(usize, String, Vec<Paste>)>,
+    /// Long pastes, shown in `text` as `[Pasted text #n +m lines]` and put
+    /// back when the input is sent.
+    pastes: Vec<Paste>,
+}
+
+struct Paste {
+    range: Range<usize>,
+    text: String,
 }
 
 /// What a key did to the input.
@@ -24,7 +36,6 @@ pub enum Edit {
 }
 
 impl Editor {
-    #[cfg(test)]
     pub fn text(&self) -> &str {
         &self.text
     }
@@ -34,6 +45,7 @@ impl Editor {
     }
 
     pub fn clear(&mut self) {
+        self.pastes.clear();
         self.text.clear();
         self.cursor = 0;
         self.browsing = None;
@@ -48,8 +60,59 @@ impl Editor {
     }
 
     pub fn insert(&mut self, text: &str) {
-        self.text.insert_str(self.cursor, text);
-        self.cursor += text.len();
+        self.replace(self.cursor..self.cursor, text);
+    }
+
+    /// Keep large pastes from pushing the conversation off screen.
+    pub fn paste(&mut self, text: &str) {
+        let lines = text.matches('\n').count();
+        if lines < LONG_PASTE {
+            return self.insert(text);
+        }
+        let tag = format!("[Pasted text #{} +{lines} lines]", self.pastes.len() + 1);
+        self.insert(&tag);
+        self.pastes.push(Paste {
+            range: self.cursor - tag.len()..self.cursor,
+            text: text.to_owned(),
+        });
+        self.pastes.sort_by_key(|p| p.range.start);
+    }
+
+    fn expanded(&self) -> String {
+        let mut out = self.text.clone();
+        for paste in self.pastes.iter().rev() {
+            out.replace_range(paste.range.clone(), &paste.text);
+        }
+        out.trim().to_owned()
+    }
+
+    // Placeholders are atomic: editing one removes it, and literal text
+    // that happens to match a label must never expand into a paste.
+    fn replace(&mut self, mut range: Range<usize>, text: &str) {
+        for paste in &self.pastes {
+            if range.start < paste.range.end && range.end > paste.range.start
+                || range.is_empty()
+                    && paste.range.contains(&range.start)
+                    && range.start != paste.range.start
+            {
+                range.start = range.start.min(paste.range.start);
+                range.end = range.end.max(paste.range.end);
+            }
+        }
+        self.pastes.retain_mut(|paste| {
+            if paste.range.end <= range.start {
+                true
+            } else if paste.range.start >= range.end {
+                let start = paste.range.start - range.len() + text.len();
+                let end = paste.range.end - range.len() + text.len();
+                paste.range = start..end;
+                true
+            } else {
+                false
+            }
+        });
+        self.text.replace_range(range.clone(), text);
+        self.cursor = range.start + text.len();
     }
 
     pub fn key(&mut self, key: Key) -> Edit {
@@ -60,7 +123,7 @@ impl Editor {
             }
             Key::Newline => self.insert("\n"),
             Key::Enter => {
-                let text = self.text.trim().to_owned();
+                let text = self.expanded();
                 if text.is_empty() {
                     return Edit::Ignored;
                 }
@@ -70,13 +133,12 @@ impl Editor {
             }
             Key::Backspace => {
                 if let Some(prev) = self.prev(self.cursor) {
-                    self.text.replace_range(prev..self.cursor, "");
-                    self.cursor = prev;
+                    self.replace(prev..self.cursor, "");
                 }
             }
             Key::Delete | Key::Ctrl('d') if self.cursor < self.text.len() => {
                 let next = self.next(self.cursor);
-                self.text.replace_range(self.cursor..next, "");
+                self.replace(self.cursor..next, "");
             }
             Key::Left | Key::Ctrl('b') => self.cursor = self.prev(self.cursor).unwrap_or(0),
             Key::Right | Key::Ctrl('f') => self.cursor = self.next(self.cursor),
@@ -86,17 +148,15 @@ impl Editor {
             Key::End | Key::Ctrl('e') => self.cursor = self.line_end(),
             Key::Ctrl('u') => {
                 let start = self.line_start();
-                self.text.replace_range(start..self.cursor, "");
-                self.cursor = start;
+                self.replace(start..self.cursor, "");
             }
             Key::Ctrl('k') => {
                 let end = self.line_end();
-                self.text.replace_range(self.cursor..end, "");
+                self.replace(self.cursor..end, "");
             }
             Key::Ctrl('w') => {
                 let start = self.word_start();
-                self.text.replace_range(start..self.cursor, "");
-                self.cursor = start;
+                self.replace(start..self.cursor, "");
             }
             Key::Up | Key::Ctrl('p') => {
                 if !self.vertical(-1) {
@@ -176,25 +236,30 @@ impl Editor {
         let at = match (&self.browsing, dir < 0) {
             (None, true) if len > 0 => len - 1,
             (None, _) => return,
-            (Some((i, _)), true) => i.saturating_sub(1),
-            (Some((i, _)), false) if i + 1 < len => i + 1,
+            (Some((i, _, _)), true) => i.saturating_sub(1),
+            (Some((i, _, _)), false) if i + 1 < len => i + 1,
             (Some(_), false) => {
-                let (_, draft) = self.browsing.take().unwrap_or_default();
+                let (_, draft, pastes) = self.browsing.take().unwrap_or_default();
                 self.text = draft;
+                self.pastes = pastes;
                 self.cursor = self.text.len();
                 return;
             }
         };
-        let draft = match self.browsing.take() {
-            Some((_, draft)) => draft,
-            None => std::mem::take(&mut self.text),
+        let (draft, pastes) = match self.browsing.take() {
+            Some((_, draft, pastes)) => (draft, pastes),
+            None => (
+                std::mem::take(&mut self.text),
+                std::mem::take(&mut self.pastes),
+            ),
         };
+        self.pastes.clear();
         self.text.clone_from(&self.history[at]);
         self.cursor = self.text.len();
-        self.browsing = Some((at, draft));
+        self.browsing = Some((at, draft, pastes));
     }
 
-    /// The input as rows `width` wide behind a `› ` prompt, and the
+    /// The input as rows `width` wide behind a `❯ ` prompt, and the
     /// cursor's (column, row) among them.
     pub fn lines(&self, width: usize, prompt: Style) -> (Vec<Line>, (u16, u16)) {
         let mut rows = Vec::new();
@@ -202,7 +267,7 @@ impl Editor {
         let mut offset = 0;
         for (n, logical) in self.text.split('\n').enumerate() {
             let first = if n == 0 {
-                Span::new("› ", prompt)
+                Span::new("❯ ", prompt)
             } else {
                 Span::new("  ", prompt)
             };
@@ -265,6 +330,55 @@ mod tests {
     }
 
     #[test]
+    fn a_long_paste_shows_as_a_placeholder_and_is_sent_whole() {
+        let mut e = Editor::default();
+        e.insert("see ");
+        e.paste("a\nb\nc\nd\n");
+        assert_eq!(e.text(), "see [Pasted text #1 +4 lines]");
+        e.paste("short\nbit");
+        assert_eq!(
+            e.key(Key::Enter),
+            Edit::Submit("see a\nb\nc\nd\nshort\nbit".into())
+        );
+    }
+
+    #[test]
+    fn paste_labels_are_literal_unless_they_belong_to_a_paste() {
+        let mut e = Editor::default();
+        e.paste("a\nb\nc\nd");
+        e.insert(" [Pasted text #1 +3 lines]");
+        e.key(Key::Home);
+        e.insert("prefix ");
+        assert_eq!(
+            e.key(Key::Enter),
+            Edit::Submit("prefix a\nb\nc\nd [Pasted text #1 +3 lines]".into())
+        );
+    }
+
+    #[test]
+    fn editing_a_paste_removes_its_whole_placeholder() {
+        let mut e = Editor::default();
+        e.insert("before ");
+        e.paste("a\nb\nc\nd");
+        e.key(Key::Backspace);
+        assert_eq!(e.text(), "before ");
+        assert_eq!(e.key(Key::Enter), Edit::Submit("before".into()));
+    }
+
+    #[test]
+    fn history_preserves_a_draft_with_pastes_and_sends_history_as_text() {
+        let mut e = Editor::default();
+        e.remember("old");
+        e.paste("a\nb\nc\nd");
+        e.key(Key::Up);
+        assert_eq!(e.text(), "old");
+        e.key(Key::Down);
+        assert_eq!(e.key(Key::Enter), Edit::Submit("a\nb\nc\nd".into()));
+        e.key(Key::Up);
+        assert_eq!(e.expanded(), "a\nb\nc\nd");
+    }
+
+    #[test]
     fn edits_and_submits() {
         let mut e = Editor::default();
         typed(&mut e, "hello wrld");
@@ -305,7 +419,7 @@ mod tests {
         typed(&mut e, "abcdef\nx");
         let (rows, cursor) = e.lines(6, Style::new());
         let rows: Vec<String> = rows.iter().map(Line::text).collect();
-        assert_eq!(rows, ["› abcd", "  ef", "  x"]);
+        assert_eq!(rows, ["❯ abcd", "  ef", "  x"]);
         assert_eq!(cursor, (3, 2));
         e.key(Key::Up);
         let (_, cursor) = e.lines(6, Style::new());

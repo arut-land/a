@@ -80,6 +80,10 @@ pub struct App {
     width: usize,
     body: u16,
     editor: Editor,
+    /// The slash menu's selected command.
+    menu_at: Option<usize>,
+    /// The approval list's highlight: Yes until moved to No.
+    deny: bool,
     overlay: Option<Overlay>,
     /// A one-line notice (an error, a refused command) until the next key.
     flash: Option<(String, Style)>,
@@ -94,6 +98,7 @@ pub struct App {
     summary: Option<Summary>,
     /// Tokens the session's model calls used, summed as replies arrive.
     tokens: Usage,
+    clock: WorkingClock,
     /// Inline: the items already printed into the scrollback.
     committed: usize,
     /// The attach asked for the latest session: if there is none, the
@@ -103,20 +108,62 @@ pub struct App {
     redraw: bool,
 }
 
+// Calls in one turn can settle between frames or wait for approval.
+// Preserve their active time and usage without keeping a timer alive.
+#[derive(Default)]
+struct WorkingClock {
+    turn: u64,
+    since: Option<std::time::Instant>,
+    elapsed: std::time::Duration,
+    before: u64,
+}
+
+impl WorkingClock {
+    fn sync(&mut self, turn: u64, active: bool, spent: u64) {
+        if self.turn != turn {
+            *self = Self {
+                turn,
+                before: spent,
+                ..Self::default()
+            };
+        }
+        if active {
+            self.since.get_or_insert_with(std::time::Instant::now);
+        } else if let Some(began) = self.since.take() {
+            self.elapsed += began.elapsed();
+        }
+    }
+
+    fn elapsed(&self) -> std::time::Duration {
+        self.elapsed
+            + self
+                .since
+                .map_or(std::time::Duration::ZERO, |t| t.elapsed())
+    }
+}
+
 /// The keys; help lists the slash commands after them.
 const HELP: &[(&str, &str)] = &[
     ("enter", "send"),
     ("ctrl-j / alt-enter", "new line"),
     ("↑ ↓", "move in the input, then through history"),
-    ("y / n", "answer the oldest approval (input empty)"),
+    (
+        "↑/↓ enter / 1/y / 2/n",
+        "choose or answer the oldest approval (input empty)",
+    ),
     ("pgup / pgdn / wheel", "scroll the transcript"),
-    ("esc", "back to the latest output"),
+    (
+        "esc",
+        "deny approval, interrupt the turn, or return to latest output",
+    ),
     ("ctrl-o", "show every card's whole output"),
     ("click a card", "fold or unfold it"),
     (
         "ctrl-c",
         "interrupt the running turn; else clear the input, or detach",
     ),
+    ("ctrl-d", "detach with an empty input"),
+    ("? / F1", "keys and commands"),
     ("ctrl-l", "redraw"),
 ];
 
@@ -133,6 +180,8 @@ impl App {
             width: 0,
             body: 0,
             editor: Editor::default(),
+            menu_at: Some(0),
+            deny: false,
             overlay: None,
             flash: None,
             recap_hidden: false,
@@ -141,6 +190,7 @@ impl App {
             rule: Line::default(),
             summary: None,
             tokens: Usage::default(),
+            clock: WorkingClock::default(),
             committed: 0,
             resuming: matches!(target, Target::Latest { .. }),
             redraw: true,
@@ -159,6 +209,19 @@ impl App {
         self.redraw
     }
 
+    /// A turn is working and nothing waits for the person: the indicator
+    /// turns, and the event loop wakes to turn it. At every other time the
+    /// client has no timer.
+    pub fn working(&self) -> bool {
+        let turn = self.client.turn();
+        turn.can_interrupt && turn.asking.is_none()
+    }
+
+    /// The indicator's clock ticked.
+    pub fn tick(&mut self) {
+        self.redraw |= self.working();
+    }
+
     pub fn view(&self) -> &SessionView {
         self.client.view()
     }
@@ -166,6 +229,9 @@ impl App {
     /// Has the session client carry out `cmd`; returns what the driver is
     /// to do.
     pub fn command(&mut self, cmd: Cmd) -> Vec<client::Effect> {
+        if let Cmd::Approve { .. } = cmd {
+            self.deny = false;
+        }
         if let Cmd::Sessions = cmd {
             self.overlay = Some(Overlay::Picker { selected: 0 });
             self.redraw = true;
@@ -212,6 +278,7 @@ impl App {
                     self.anchor = None;
                     self.committed = 0;
                     self.tokens = Usage::default();
+                    self.clock = WorkingClock::default();
                     self.recap_hidden = false;
                     self.flash = None;
                 }
@@ -282,7 +349,8 @@ impl App {
             Input::Mouse(mouse) => self.mouse(mouse),
             Input::Paste(text) => {
                 if self.overlay.is_none() {
-                    self.editor.insert(&text.replace('\t', "    "));
+                    self.editor.paste(&text.replace('\t', "    "));
+                    self.menu_at = Some(0);
                 }
                 None
             }
@@ -303,24 +371,85 @@ impl App {
             Key::Ctrl('d') if self.editor.is_empty() => return Some(self.leave()),
             Key::Ctrl('o') => {
                 self.verbose = !self.verbose;
+                if self.viewport == Viewport::Inline {
+                    self.anchor = None;
+                }
                 self.cache.iter_mut().for_each(|r| *r = None);
             }
             Key::Ctrl('l') => return Some(Effect::Redraw),
             Key::PageUp => self.scroll_by(page),
             Key::PageDown => self.scroll_by(-page),
             Key::F(1) => self.overlay = Some(Overlay::Help),
-            Key::Esc if self.anchor.is_some() => self.anchor = None,
-            Key::Esc => self.recap_hidden = true,
-            Key::Char(c @ ('y' | 'n' | 'Y' | 'N')) if self.editor.is_empty() && asked.is_some() => {
+            Key::Char('?') if self.editor.is_empty() && asked.is_none() => {
+                self.overlay = Some(Overlay::Help);
+            }
+            Key::Esc if !self.menu().is_empty() => self.menu_at = None,
+            Key::Char(c @ ('y' | 'n' | 'Y' | 'N' | '1' | '2'))
+                if self.editor.is_empty() && asked.is_some() =>
+            {
                 let call = asked?;
                 return Some(Effect::Cmd(Cmd::Approve {
                     call,
-                    approved: c.eq_ignore_ascii_case(&'y'),
+                    approved: matches!(c, 'y' | 'Y' | '1'),
                 }));
             }
+            Key::Up | Key::Down | Key::Tab | Key::Ctrl('p' | 'n')
+                if self.editor.is_empty() && asked.is_some() =>
+            {
+                self.deny = !self.deny;
+            }
+            Key::Enter if self.editor.is_empty() && asked.is_some() => {
+                let deny = std::mem::take(&mut self.deny);
+                return Some(Effect::Cmd(Cmd::Approve {
+                    call: asked?,
+                    approved: !deny,
+                }));
+            }
+            Key::Esc if self.editor.is_empty() && asked.is_some() => {
+                return Some(Effect::Cmd(Cmd::Approve {
+                    call: asked?,
+                    approved: false,
+                }));
+            }
+            Key::Esc if self.client.turn().can_interrupt => {
+                return Some(self.interrupt());
+            }
+            Key::Esc if self.anchor.is_some() => self.anchor = None,
+            Key::Esc => self.recap_hidden = true,
             key => {
-                if let Edit::Submit(text) = self.editor.key(key) {
-                    return self.submit(&text);
+                let menu = self.menu();
+                let last = menu.len().saturating_sub(1);
+                let at = self.menu_at.unwrap_or(0).min(last);
+                match key {
+                    Key::Up | Key::Ctrl('p') if !menu.is_empty() => {
+                        self.menu_at = Some(at.saturating_sub(1));
+                    }
+                    Key::Down | Key::Ctrl('n') if !menu.is_empty() => {
+                        self.menu_at = Some((at + 1).min(last));
+                    }
+                    // Tab takes the selected name; a command with
+                    // arguments waits for them, one without runs on Enter.
+                    Key::Tab | Key::Enter
+                        if !menu.is_empty() && self.editor.text() != menu[at].0 =>
+                    {
+                        let (name, usage, _) = &menu[at];
+                        let args = usage.len() > name.len();
+                        self.editor.clear();
+                        self.editor.insert(name);
+                        if args {
+                            self.editor.insert(" ");
+                        } else if key == Key::Enter
+                            && let Edit::Submit(text) = self.editor.key(Key::Enter)
+                        {
+                            return self.submit(&text);
+                        }
+                    }
+                    key => {
+                        self.menu_at = Some(0);
+                        if let Edit::Submit(text) = self.editor.key(key) {
+                            return self.submit(&text);
+                        }
+                    }
                 }
             }
         }
@@ -389,7 +518,7 @@ impl App {
     }
 
     fn interrupt(&mut self) -> Effect {
-        self.notice("stopping the turn (ctrl-d detaches)", false);
+        self.notice("interrupt requested · what should it do next?", false);
         Effect::Cmd(Cmd::Interrupt)
     }
 
@@ -514,6 +643,11 @@ impl Renderer for App {
                 }
             }
         }
+        self.clock.sync(
+            self.client.view().ledger.turn_start(),
+            self.working(),
+            self.tokens.output,
+        );
         asked
     }
 }

@@ -76,6 +76,9 @@ enum Event {
     InputClosed,
     /// From the session client's driver.
     Client(client::Event),
+    /// The working indicator's clock; only ever waited for while a turn
+    /// runs.
+    Tick,
 }
 
 #[cfg(unix)]

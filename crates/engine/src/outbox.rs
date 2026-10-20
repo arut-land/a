@@ -29,7 +29,7 @@ pub const TAIL: usize = 64 << 10;
 /// follower; the rest stay where the log keeps them (for a file, the OS's
 /// page cache), not in the daemon's memory.
 pub struct FrameLog {
-    lines: Arc<dyn Lines>,
+    lines: Mutex<Arc<dyn Lines>>,
     /// The seq of the last entry shown. Entries are shown under the lock
     /// they commit under, after the log holds them.
     seq: AtomicU64,
@@ -47,10 +47,15 @@ impl FrameLog {
     /// The log of `lines`, whose entries up to `seq` are committed.
     pub fn new(lines: Arc<dyn Lines>, seq: u64) -> Self {
         Self {
-            lines,
+            lines: Mutex::new(lines),
             seq: AtomicU64::new(seq),
             tail: Mutex::default(),
         }
+    }
+
+    /// A reload replaces the reader after taking a new writer lease.
+    pub fn reloaded(&self, lines: Arc<dyn Lines>) {
+        *lock(&self.lines) = lines;
     }
 
     /// The seq of the last entry committed.
@@ -94,7 +99,7 @@ impl FrameLog {
                     return None;
                 }
                 run.clear();
-                next += self.lines.read(next..=last, RUN, &mut run).ok()?;
+                next += lock(&self.lines).read(next..=last, RUN, &mut run).ok()?;
                 read.extend(lines(&run).filter_map(|line| Entry::from_json(line).ok()));
             }
         })
@@ -127,7 +132,7 @@ impl FrameLog {
             last
         };
         let mut run = Vec::new();
-        match self.lines.read(after + 1..=last, RUN, &mut run) {
+        match lock(&self.lines).read(after + 1..=last, RUN, &mut run) {
             Ok(_) => ahead.extend(
                 lines(&run)
                     .zip(after + 1..)
