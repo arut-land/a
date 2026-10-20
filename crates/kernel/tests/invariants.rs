@@ -468,7 +468,7 @@ fn no_plugin_is_named_below_the_plugin_layer() {
     for root in crates {
         sources.extend(rust_sources(&root));
     }
-    assert!(!sources.is_empty());
+    assert_ne!(sources.len(), 0);
     for path in sources {
         let text = std::fs::read_to_string(&path).unwrap();
         for name in names {
