@@ -1,20 +1,24 @@
 //! The engine's side of extensions: the registry they install into, what
-//! it resolves for sessions, and how a running call reaches the engine.
-//! Extensions need none of it.
+//! it resolves for sessions, how a running call reaches the engine, and
+//! the registry as the kernel binds it to a session. Extensions need none
+//! of it.
 
 use std::any::{Any, TypeId};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex, OnceLock, PoisonError};
 
-use protocol::{Audience, Environment, Json, Outcome, Seq, SessionId};
+use protocol::{Audience, CallId, Card, Environment, Installed, Json, Outcome, Seq, SessionId};
 
 use crate::ext::MakeAgent;
+use crate::point::{Approving, Asked, Failed, Later, Stepped, View};
 use crate::state::States;
 use crate::{
-    Agent, BoxFuture, Called, Cancel, CwdOf, Cx, DynExtension, DynTool, Extension, Facts, Loop,
-    Name, Parsed, Place, Refused, Registrar, Text, Tier,
+    Agent, Answer, BoxFuture, Callable, Called, Cancel, Chained, CwdOf, Cx, Defaults, DynExtension,
+    DynTool, Extension, Facts, Gated, Gating, Loop, LoopPoints, Name, Parsed, Place, Recover,
+    Refused, Registrar, Text, Tier,
 };
 
+pub use crate::assemble::Built;
 pub use crate::point::{Decided, Hooks};
 
 /// The engine, as a running call reaches it.
@@ -26,19 +30,37 @@ pub trait Host: Send + Sync {
     fn own(&self, pgid: u32, ended: BoxFuture<'static, ()>);
     /// See [`Cx::progress`].
     fn progress(&self, text: &str);
-    /// Commits `data` as a change to extension `ext`'s state `state`, and
-    /// folds it in.
-    fn note(&self, ext: &str, state: &str, data: Json);
+    /// Commits `data` as a change to extension `ext`'s state `state`:
+    /// resolves once it is committed and folded in.
+    fn note(&self, ext: &str, state: &str, data: Json) -> BoxFuture<'static, ()>;
     /// Commits an `edit`: see [`Cx::edit`].
     fn edit(&self, target: Seq, upto: Option<Seq>, replace: Option<Json>);
     /// Lends the session's states to `read`, which cannot keep them.
     fn states(&self, read: &mut dyn FnMut(&States));
     /// The registry generation the call started on.
     fn registry(&self) -> &Registry;
-    /// A service the engine provides, by the type of its trait object: an
-    /// `Arc<S>` for `TypeId::of::<S>()`, as [`Cx::service`] asks.
-    fn service(&self, _ty: TypeId) -> Option<&(dyn Any + Send + Sync)> {
-        None
+}
+
+/// The services the engine provides a session's calls, beside the
+/// extensions': each by the type of its trait object, as
+/// [`Cx::service`] asks. Built once per session.
+#[derive(Default)]
+pub struct Services(Vec<(TypeId, Box<dyn Any + Send + Sync>)>);
+
+impl Services {
+    /// With service `S`, as `services.with::<dyn Models>(Arc::new(..))`.
+    #[must_use]
+    pub fn with<S: ?Sized + Send + Sync + 'static>(mut self, service: Arc<S>) -> Self {
+        self.0.push((TypeId::of::<S>(), Box::new(service)));
+        self
+    }
+
+    pub(crate) fn get<S: ?Sized + 'static>(&self) -> Option<&S> {
+        let ty = TypeId::of::<S>();
+        (self.0.iter())
+            .find(|(t, _)| *t == ty)
+            .and_then(|(_, s)| s.downcast_ref::<Arc<S>>())
+            .map(|s| &**s)
     }
 }
 
@@ -47,10 +69,11 @@ pub struct Parts {
     pub workspace: Arc<Path>,
     pub env: Option<Arc<Environment>>,
     pub session: SessionId,
-    pub call: u64,
+    pub call: CallId,
     pub model: Arc<str>,
     pub spill: Arc<Path>,
     pub cancel: Cancel,
+    pub services: Arc<Services>,
 }
 
 impl Parts {
@@ -116,7 +139,7 @@ impl Toolset {
     }
 }
 
-struct Installed {
+struct Loaded {
     name: Name,
     version: u32,
     tier: Tier,
@@ -126,7 +149,7 @@ struct Installed {
 /// The extensions a daemon runs with, and what they make.
 #[derive(Default)]
 pub struct Registry {
-    installed: Vec<Installed>,
+    installed: Vec<Loaded>,
     tools: Toolset,
     hooks: Hooks,
     texts: Vec<Text>,
@@ -145,7 +168,8 @@ impl Registry {
     }
 
     /// Registers `ext` after every extension so far in `tier`, or in place
-    /// of the one of the same name.
+    /// of the one of the same name. What `ext` needs is checked as it
+    /// installs; [`Built`] checks it as the binary compiles.
     pub fn with_in<E: Extension>(self, tier: Tier, ext: &E) -> Result<Self, Refused> {
         self.with_dyn(tier, ext)
     }
@@ -154,7 +178,7 @@ impl Registry {
     pub fn with_dyn(self, tier: Tier, ext: &dyn DynExtension) -> Result<Self, Refused> {
         let mut made = Registrar::default();
         ext.contribute(&mut made);
-        self.install(Installed {
+        self.install(Loaded {
             name: ext.name(),
             version: ext.version(),
             tier,
@@ -164,13 +188,13 @@ impl Registry {
 
     /// Installs `new` unless it breaks a rule, and rebuilds what the
     /// extensions make, in install order.
-    fn install(mut self, mut new: Installed) -> Result<Self, Refused> {
+    fn install(mut self, mut new: Loaded) -> Result<Self, Refused> {
         let name = Name::clone(&new.name);
         let refuse = |why: &str| Err(Refused(format!("extension {name}: {why}")));
         if let Some(error) = new.made.errors.first() {
             return refuse(error);
         }
-        let guarded = |i: &Installed| i.name == new.name && i.tier == Tier::Guarded;
+        let guarded = |i: &Loaded| i.name == new.name && i.tier == Tier::Guarded;
         if new.tier != Tier::Guarded && self.installed.iter().any(guarded) {
             return refuse("a guarded extension of that name is loaded");
         }
@@ -214,7 +238,7 @@ impl Registry {
         let mut agents = Vec::new();
         let mut hooks = Hooks::default();
         let mut warnings = Vec::new();
-        for Installed {
+        for Loaded {
             name, made, tier, ..
         } in &self.installed
         {
@@ -382,6 +406,16 @@ impl Registry {
     pub fn extensions(&self) -> impl Iterator<Item = (&str, u32)> + '_ {
         self.installed.iter().map(|i| (&*i.name, i.version))
     }
+
+    /// The extensions, as a log records them.
+    pub fn installed(&self) -> Vec<Installed> {
+        self.extensions()
+            .map(|(name, version)| Installed {
+                name: name.to_owned(),
+                version,
+            })
+            .collect()
+    }
 }
 
 /// Puts `new` in place of the item of the same name, or last; a guarded
@@ -433,6 +467,335 @@ impl Current {
 
     pub fn replace(&self, registry: Registry) {
         *self.0.lock().unwrap_or_else(PoisonError::into_inner) = Arc::new(registry);
+    }
+}
+
+/// One registry generation, as the kernel asks it about a session: the
+/// extensions' callables, decision points and agent. Points answer from
+/// what they are given and the session's committed state; each method is
+/// sync and must not block (a slow answer is [`Answer::Later`]). The
+/// kernel never sees a model request: the `step` point is the engine's
+/// to ask, on [`Bound`].
+pub trait Binding: Send + Sync {
+    /// A new agent, of the kind the session runs.
+    fn agent(&self) -> Box<dyn Agent>;
+
+    /// What the agent asks at its decisions: the handlers at the loop
+    /// points. Pure, as the agent is: a load asks them again.
+    fn loop_points(&self) -> &dyn LoopPoints {
+        &Defaults
+    }
+
+    /// The extensions it runs, in install order, as a log records them.
+    fn installed(&self) -> Vec<Installed>;
+
+    fn callable(&self, name: &str) -> Option<Callable>;
+
+    /// The model a call goes to now, as `host:model`.
+    fn model(&self) -> String {
+        "none".to_owned()
+    }
+
+    /// What the model is told of where the session runs, logged once
+    /// before its first call.
+    fn context(&self) -> Option<String> {
+        None
+    }
+
+    /// Reads call `call`'s input as its tool reads it, once, keeping it
+    /// for the call's run: the card clients show the call with.
+    fn read(&self, _call: CallId, _tool: &str, _input: &Json) -> Option<Card> {
+        None
+    }
+
+    /// The `input` point: the text as the chain leaves it, or why it is
+    /// refused.
+    fn input(&self, text: String) -> Result<Chained<String>, String> {
+        Ok(Chained::new(text))
+    }
+
+    /// The `pre_tool`, `permission` and `approve` points, merged.
+    fn gate(&self, _call: CallId, _tool: &str, input: &Json) -> Answer<Gated> {
+        Answer::Now(Gated::run(input.clone()))
+    }
+
+    /// The `request_error` point: how to recover model call `call` from
+    /// the failure of its attempt `attempt` (from 0, counted in the log, so
+    /// a restart does not start again), and who says; now or later. With
+    /// no answer the call fails.
+    fn request_error(
+        &self,
+        _call: CallId,
+        _attempt: u16,
+        _error: &llm::Error,
+    ) -> Answer<Option<(Name, Recover)>> {
+        Answer::Now(None)
+    }
+
+    /// The `post_tool` point: the outcome as the chain leaves it.
+    fn post_tool(
+        &self,
+        _call: CallId,
+        _tool: &str,
+        _input: &Json,
+        outcome: Outcome,
+    ) -> Chained<Outcome> {
+        Chained::new(outcome)
+    }
+
+    /// The `on_stop` point: text for the agent to go on with once it
+    /// stopped.
+    fn on_stop(&self) -> Option<(Name, String)> {
+        None
+    }
+}
+
+impl std::fmt::Debug for dyn Binding {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("Binding")
+    }
+}
+
+/// A registry generation bound to a session: the [`Binding`] the kernel
+/// drives, over the session as its points read it (`V`). Pure glue: the
+/// engine supplies the view and the agent's name, and tests bind real
+/// extensions to a stub.
+pub struct Bound<V> {
+    registry: Arc<Registry>,
+    view: Arc<V>,
+    /// The agent the session runs, by name.
+    agent: Option<String>,
+    /// Each open tool call's input as its tool read it at its intent, with
+    /// the text it was read from: its run is given it rather than reading
+    /// it again, unless the gate rewrote it.
+    parsed: Arc<Mutex<Vec<(CallId, Json, Parsed)>>>,
+}
+
+impl<V> Clone for Bound<V> {
+    fn clone(&self) -> Self {
+        Self {
+            registry: Arc::clone(&self.registry),
+            view: Arc::clone(&self.view),
+            agent: self.agent.clone(),
+            parsed: Arc::clone(&self.parsed),
+        }
+    }
+}
+
+impl<V: View + Send + Sync + 'static> Bound<V> {
+    pub fn new(registry: Arc<Registry>, view: Arc<V>, agent: Option<String>) -> Self {
+        Self {
+            registry,
+            view,
+            agent,
+            parsed: Arc::default(),
+        }
+    }
+
+    pub fn registry(&self) -> &Arc<Registry> {
+        &self.registry
+    }
+
+    pub fn view(&self) -> &Arc<V> {
+        &self.view
+    }
+
+    /// The session, as handlers deciding about nothing in particular see
+    /// it.
+    pub fn point(&self) -> crate::PointCx<'_> {
+        crate::PointCx::new(&*self.view)
+    }
+
+    /// The session, as handlers deciding about call `call` see it.
+    pub fn about(&self, call: CallId) -> crate::PointCx<'_> {
+        self.point().about(call)
+    }
+
+    /// The `step` point over model call `call`'s request: the rewrites to
+    /// log and, if a handler answered it, who and with what.
+    pub fn step(
+        &self,
+        call: CallId,
+        request: &mut llm::Request,
+    ) -> (Decided, Option<(Name, Stepped)>) {
+        self.registry.hooks().step(&self.about(call), request)
+    }
+
+    /// Call `call`'s input as read at its intent, if it was and the call
+    /// runs on `input` still.
+    pub fn take_parsed(&self, call: CallId, input: &Json) -> Option<Parsed> {
+        let mut parsed = self.parsed.lock().unwrap_or_else(PoisonError::into_inner);
+        let at = parsed.iter().position(|(c, _, _)| *c == call)?;
+        let (_, read, parsed) = parsed.swap_remove(at);
+        (read == *input).then_some(parsed)
+    }
+
+    /// Forgets what was read for call `call`: it settled.
+    pub fn settled(&self, call: CallId) {
+        (self.parsed.lock().unwrap_or_else(PoisonError::into_inner)).retain(|(c, _, _)| *c != call);
+    }
+
+    /// The gate of call `call` once the `approve` handler it waits on
+    /// answers: with none, the handlers after it are asked, and with no
+    /// answer at all the user is.
+    async fn approving(self, call: CallId, tool: String, mut asked: Approving) -> Gated {
+        loop {
+            let answer = if let Some(approved) = asked.answer.0.await {
+                Some((asked.by, approved))
+            } else {
+                let rest = (self.registry.hooks()).approve_from(
+                    &self.about(call),
+                    &tool,
+                    &asked.input,
+                    asked.next,
+                );
+                match rest {
+                    Asked::None => None,
+                    Asked::Now(by, approved) => Some((by, approved)),
+                    Asked::Later { by, at, answer } => {
+                        (asked.by, asked.next, asked.answer) = (by, at + 1, answer);
+                        continue;
+                    }
+                }
+            };
+            return Gated::approved(asked.input, asked.decisions, answer);
+        }
+    }
+
+    /// How to recover model call `call` from `error` once the
+    /// `request_error` handler `by`, the `at`th, answers: with none, the
+    /// handlers after it are asked.
+    async fn recovering(
+        self,
+        call: CallId,
+        attempt: u16,
+        error: llm::Error,
+        (mut by, mut at, mut answer): (Name, usize, Later<Option<Recover>>),
+    ) -> Option<(Name, Recover)> {
+        loop {
+            if let Some(recover) = answer.0.await {
+                return Some((by, recover));
+            }
+            let failed = Failed {
+                error: &error,
+                attempt,
+            };
+            let rest =
+                (self.registry.hooks()).request_error_from(&self.about(call), failed, at + 1);
+            match rest {
+                Asked::None => return None,
+                Asked::Now(by, recover) => return Some((by, recover)),
+                Asked::Later {
+                    by: next,
+                    at: next_at,
+                    answer: next_answer,
+                } => (by, at, answer) = (next, next_at, next_answer),
+            }
+        }
+    }
+}
+
+impl<V: View + Send + Sync + 'static> Binding for Bound<V> {
+    fn agent(&self) -> Box<dyn Agent> {
+        self.registry.agent(self.agent.as_deref())
+    }
+
+    fn loop_points(&self) -> &dyn LoopPoints {
+        self.registry.hooks()
+    }
+
+    fn installed(&self) -> Vec<Installed> {
+        self.registry.installed()
+    }
+
+    fn callable(&self, name: &str) -> Option<Callable> {
+        let tool = self.registry.tools().get(name)?;
+        Some(Callable {
+            audience: tool.audience(),
+            replay: tool.replay(),
+            concurrency: tool.concurrency(),
+        })
+    }
+
+    fn model(&self) -> String {
+        self.view.model()
+    }
+
+    fn context(&self) -> Option<String> {
+        let workspace = self.view.workspace();
+        let env = self.view.env();
+        let mut dir = None;
+        self.view.states(&mut |states| {
+            dir = Some(self.registry.dir(workspace, env.as_deref(), states));
+        });
+        let dir = dir.unwrap_or_else(|| workspace.to_path_buf());
+        let facts = Facts {
+            workspace,
+            dir: &dir,
+        };
+        self.registry.context(&facts)
+    }
+
+    fn read(&self, call: CallId, tool: &str, input: &Json) -> Option<Card> {
+        let tool = self.registry.tools().get(tool)?;
+        let parsed = tool.parse(input).ok()?;
+        let card = tool.present(&parsed);
+        (self.parsed.lock().unwrap_or_else(PoisonError::into_inner)).push((
+            call,
+            input.clone(),
+            parsed,
+        ));
+        card
+    }
+
+    fn input(&self, text: String) -> Result<Chained<String>, String> {
+        self.registry.hooks().input(&self.point(), text)
+    }
+
+    fn gate(&self, call: CallId, tool: &str, input: &Json) -> Answer<Gated> {
+        match self.registry.hooks().gate(&self.about(call), tool, input) {
+            Gating::Now(gated) => Answer::Now(gated),
+            Gating::Approving(asked) => {
+                let later = self.clone().approving(call, tool.to_owned(), asked);
+                Answer::Later(Later::new(later))
+            }
+        }
+    }
+
+    fn request_error(
+        &self,
+        call: CallId,
+        attempt: u16,
+        error: &llm::Error,
+    ) -> Answer<Option<(Name, Recover)>> {
+        let failed = Failed { error, attempt };
+        match self
+            .registry
+            .hooks()
+            .request_error(&self.about(call), failed)
+        {
+            Asked::None => Answer::Now(None),
+            Asked::Now(by, recover) => Answer::Now(Some((by, recover))),
+            Asked::Later { by, at, answer } => {
+                let later =
+                    (self.clone()).recovering(call, attempt, error.clone(), (by, at, answer));
+                Answer::Later(Later::new(later))
+            }
+        }
+    }
+
+    fn post_tool(
+        &self,
+        call: CallId,
+        tool: &str,
+        input: &Json,
+        outcome: Outcome,
+    ) -> Chained<Outcome> {
+        (self.registry.hooks()).post_tool(&self.about(call), (tool, input), outcome)
+    }
+
+    fn on_stop(&self) -> Option<(Name, String)> {
+        self.registry.hooks().on_stop(&self.point())
     }
 }
 

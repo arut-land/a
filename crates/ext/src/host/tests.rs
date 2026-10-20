@@ -3,7 +3,7 @@ use serde_json::{Value, json};
 
 use super::*;
 use crate::point::{self, PointCx, View};
-use crate::{Args, Concurrency, Replay, Route, Tool};
+use crate::{Args, Concurrency, Need, Replay, Tool};
 
 /// A tool named `bash`, described as `mine`.
 struct Named(&'static str);
@@ -47,10 +47,14 @@ impl Tool for Jobs {
 
 macro_rules! extension {
     ($ty:ident, $name:literal, $version:literal, |$r:ident| $body:expr) => {
+        extension!($ty, $name, $version, needs(), |$r| $body);
+    };
+    ($ty:ident, $name:literal, $version:literal, needs $needs:ty, |$r:ident| $body:expr) => {
         struct $ty;
         impl Extension for $ty {
             const NAME: &'static str = $name;
             const VERSION: u32 = $version;
+            type Needs = $needs;
             fn contribute(&self, $r: &mut Registrar) {
                 $body;
             }
@@ -79,7 +83,10 @@ extension!(Shell, "shell", 1, |r| r
     .provide::<dyn CwdOf>(Arc::new(Here)));
 extension!(Rival, "rival", 1, |r| r
     .provide::<dyn CwdOf>(Arc::new(Here)));
-extension!(Editor, "editor", 1, |r| r.need::<dyn CwdOf>());
+extension!(Editor, "editor", 1, needs(Need<dyn CwdOf>, ()), |r| r
+    .text(Text::system("editing", 1, "Edit.")));
+
+impl crate::Provides<dyn CwdOf> for Shell {}
 extension!(Guide, "guide", 1, |r| r
     .text(Text::system("bash", 5, "Use bash well.").for_tool("bash"))
     .text(Text::system("edit", 6, "Edit carefully.").for_tool("edit"))
@@ -94,7 +101,7 @@ extension!(Agents, "agents", 1, |r| r.agent("idle", || Box::new(Idle)));
 struct Idle;
 
 impl Agent for Idle {
-    fn step(&mut self, _: crate::Input, _: &dyn crate::LoopPoints) -> crate::Actions {
+    fn step(&mut self, _: crate::Input, _: &dyn LoopPoints) -> crate::Actions {
         crate::Actions::new()
     }
 }
@@ -103,6 +110,12 @@ impl Agent for Idle {
 struct Bare;
 
 impl View for Bare {
+    fn session(&self) -> SessionId {
+        SessionId::new()
+    }
+    fn workspace(&self) -> &Path {
+        Path::new("/w")
+    }
     fn model(&self) -> String {
         String::new()
     }
@@ -113,7 +126,7 @@ impl View for Bare {
 
 fn gate(registry: &Registry, tool: &str, decided: &mut Decided) -> point::Gate {
     let view = Bare;
-    let cx = PointCx::new(SessionId::new(), Path::new("/w"), &view);
+    let cx = PointCx::new(&view);
     let gated = (registry
         .hooks()
         .gate(&cx, tool, &Json::encode(&json!({})).unwrap())
@@ -195,9 +208,6 @@ impl DynTool for Declared {
     fn concurrency(&self) -> Concurrency {
         Concurrency::Shared
     }
-    fn route(&self) -> Route {
-        Route::Owner
-    }
     fn spec(&self) -> llm::Tool {
         llm::Tool {
             name: self.0.as_str().into(),
@@ -250,10 +260,7 @@ fn an_extension_and_its_tools_may_be_named_at_run_time() {
     let extensions: Vec<_> = registry.extensions().collect();
     assert_eq!(extensions, [("mine", 1), ("lua-1", 3)]);
     let bash = registry.tools().get("bash").unwrap();
-    assert_eq!(
-        (bash.spec().description, bash.route()),
-        ("declared".into(), Route::Owner)
-    );
+    assert_eq!(bash.spec().description, "declared");
 }
 
 #[test]

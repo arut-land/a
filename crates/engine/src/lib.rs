@@ -11,19 +11,17 @@ mod transcript;
 mod upgrade;
 
 use std::fs::{File, OpenOptions};
-use std::future::{Future, poll_fn};
 use std::io::{self, Write};
 use std::ops::Deref;
 use std::path::PathBuf;
-use std::pin::pin;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
-use std::task::Poll;
 use std::time::{Duration, Instant};
 
 use crate::catalog::Catalog;
 use crate::store::{Header, Jsonl};
-use driver::{Attachment, Ended, Live, Open, Request, Shared};
+use driver::{Attachment, Live, Open, Request, Shared};
+use ext::Flag;
 use outbox::Outbox;
 use protocol::{DaemonMsg, Environment, Frame, Mode, Outcome, SessionId, SessionSummary, Target};
 use rt::oneshot;
@@ -258,12 +256,12 @@ impl Slot {
 
     /// The actor still stopping, if any; one that has ended leaves the
     /// session hibernated, as it last listed, and nothing of it held.
-    fn ending(&self) -> Option<Ended> {
+    fn ending(&self) -> Option<Flag> {
         let mut residency = lock(&self.residency);
         let Residency::Stopping(live) = &*residency else {
             return None;
         };
-        if !live.ended.is_over() {
+        if !live.ended.is_set() {
             return Some(live.ended.clone());
         }
         let last = hibernated(live.summary());
@@ -398,7 +396,7 @@ impl Daemon {
     async fn live(&self, slot: &Arc<Slot>) -> io::Result<Arc<Live>> {
         loop {
             if let Some(ended) = slot.ending() {
-                ended.over().await;
+                ended.wait().await;
                 continue;
             }
             let wait = {
@@ -671,7 +669,7 @@ impl Daemon {
     async fn shutdown(&self) {
         let mut grace = self.shared.rt.sleep(STOP_GRACE);
         loop {
-            let ending: Vec<Ended> = self
+            let ending: Vec<Flag> = self
                 .slots()
                 .iter()
                 .filter_map(|slot| {
@@ -682,14 +680,15 @@ impl Daemon {
             if ending.is_empty() {
                 return;
             }
-            let mut all = std::pin::pin!(async {
+            let all = async {
                 for ended in &ending {
-                    ended.over().await;
+                    ended.wait().await;
                 }
-            });
-            let ended = poll_fn(|cx| match all.as_mut().poll(cx) {
-                Poll::Ready(()) => Poll::Ready(true),
-                Poll::Pending => grace.as_mut().poll(cx).map(|()| false),
+                true
+            };
+            let ended = rt::or(all, async {
+                grace.as_mut().await;
+                false
             });
             if !ended.await {
                 eprintln!("{} sessions still stopping, exiting", ending.len());
@@ -771,27 +770,25 @@ impl Daemon {
             }
             // Whatever woke us counts as activity, and idleness starts
             // again; a background job ending is only looked at.
-            let mut sleep = next.map(|at| {
-                self.shared
-                    .rt
-                    .sleep(at.saturating_duration_since(Instant::now()))
-            });
-            let mut pulse = pin!(self.pulse.changed(&mut pulsed));
-            let mut ended = pin!(self.jobs.changed(&mut jobs));
-            let woken = poll_fn(|cx| {
-                if pulse.as_mut().poll(cx).is_ready() {
-                    return Poll::Ready(true);
+            let sleep = async {
+                match next {
+                    Some(at) => {
+                        let until = at.saturating_duration_since(Instant::now());
+                        self.shared.rt.sleep(until).await;
+                    }
+                    None => std::future::pending().await,
                 }
-                let ended = ended.as_mut().poll(cx).is_ready();
-                let slept = sleep
-                    .as_mut()
-                    .is_some_and(|s| s.as_mut().poll(cx).is_ready());
-                if ended || slept {
-                    Poll::Ready(false)
-                } else {
-                    Poll::Pending
-                }
-            });
+                false
+            };
+            let pulse = async {
+                self.pulse.changed(&mut pulsed).await;
+                true
+            };
+            let ended = async {
+                self.jobs.changed(&mut jobs).await;
+                false
+            };
+            let woken = rt::or(pulse, rt::or(ended, sleep));
             if woken.await {
                 since = None;
             }

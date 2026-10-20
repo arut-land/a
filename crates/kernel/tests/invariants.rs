@@ -28,7 +28,7 @@ fn drive(s: &mut Session, fx: Effects) {
                     card: None,
                 }
             }
-            Effect::CallModel { call, .. } => {
+            Effect::Prepare { call, .. } => {
                 let before = &s.log[usize::try_from(call.get()).unwrap() - 2].body;
                 let first = matches!(before, Body::Input { .. } | Body::Take { .. });
                 let calls = if first {
@@ -159,7 +159,7 @@ fn drive_loop(s: &mut Session, fx: Effects, script: u64) {
     while let Some(effect) = todo.pop_front() {
         let event = match effect {
             Effect::RunTool { call, tool, .. } => tool_done(call.get(), done(json!(tool))),
-            Effect::CallModel { call, .. } => {
+            Effect::Prepare { call, .. } => {
                 let k = (s.log.iter())
                     .filter(|e| matches!(e.body, Body::ModelResult { .. }))
                     .count() as u64;
@@ -185,11 +185,11 @@ fn drive_loop(s: &mut Session, fx: Effects, script: u64) {
 fn loop_points_are_folds() {
     let reg = |script: u64| {
         let max = u16::try_from(script % 4).unwrap() + 1;
-        let points = ext::host::Registry::default()
-            .with_in(ext::Tier::Pre, &ext::StepLimit { max })
-            .and_then(|r| r.with(&OneAtATime))
-            .unwrap();
-        Reg::looping(points).retry(Duration::ZERO)
+        Reg::looping(move |r| {
+            r.with_in(ext::Tier::Pre, &ext::StepLimit { max })
+                .and_then(|r| r.with(&OneAtATime))
+        })
+        .retry(Duration::ZERO)
     };
     let inputs = ["a", "b"];
     for script in 1..24u64 {
@@ -276,7 +276,7 @@ fn starts_work(effect: &Effect, open_at_interrupt: u64) -> bool {
     match effect {
         Effect::RunTool { call, .. }
         | Effect::Resume { call, .. }
-        | Effect::CallModel { call, .. }
+        | Effect::Prepare { call, .. }
         | Effect::Await { call, .. }
         | Effect::Recover { call, .. } => call.get() <= open_at_interrupt,
         Effect::StartChild { .. } => true,
@@ -383,8 +383,8 @@ fn the_same_events_give_the_same_log() {
     let (a, b) = (run(), run());
     assert_eq!(a.log, b.log);
     assert_eq!(*a.core.turn(), Turn::Idle, "{:#?}", a.log);
+    // A resume asks `on_stop` of nothing: the log shows the agent stopped.
     let reg = Reg::echo().on_stop("more");
-    reg.stopped.store(true, std::sync::atomic::Ordering::SeqCst);
     let (resumed, fx) = Session::resume(reg.arc(), a.log.clone(), &Load::default());
     assert!(fx.is_empty(), "{fx:?}");
     assert_eq!(resumed.core.turn(), a.core.turn());
@@ -621,7 +621,7 @@ fn running(fx: &Effects) -> impl Iterator<Item = CallId> + '_ {
 }
 
 fn asks_the_model(fx: &Effects) -> bool {
-    fx.iter().any(|e| matches!(e, Effect::CallModel { .. }))
+    fx.iter().any(|e| matches!(e, Effect::Prepare { .. }))
 }
 
 /// What call `call` asked of its tool, as its intent logged it.

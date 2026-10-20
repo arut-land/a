@@ -1,16 +1,16 @@
 //! Services: typed capabilities one extension provides and others build
 //! on, by type rather than by knowing each other. Each has at most one
 //! provider per registry, and an extension that needs one no extension
-//! provides is refused as it installs. The engine provides the ones only
-//! it can, such as [`Settings`], to every call.
+//! provides is refused as it installs (or, in a static assembly, does not
+//! compile). The engine provides the ones only it can, such as
+//! [`Layers`], to every call.
 
-use std::io;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::time::Duration;
 
 use crate::BoxFuture;
-use protocol::{Environment, Outcome, Overrides};
+use protocol::{Environment, Outcome};
 
 use crate::{Cx, Name, SpawnSpec, States};
 
@@ -29,16 +29,25 @@ pub trait Spawner: Send + Sync {
     fn process(&self, cx: &Cx, spawn: SpawnSpec) -> Result<Command, String>;
 }
 
-/// A session's settings over the layers the engine reads them from: the
-/// session's own, then its workspace's and the home config file. The
-/// engine provides it.
-pub trait Settings: Send + Sync {
-    /// The model the call's session talks to, as `host:model`, and which
-    /// layer names it.
-    fn model(&self, cx: &Cx) -> Result<(String, String), String>;
-    /// Makes `set` the session's own settings, over every layer; logged
-    /// once it resolves.
-    fn set<'a>(&'a self, cx: &'a Cx, set: Overrides) -> BoxFuture<'a, io::Result<()>>;
+/// The config layers the engine reads: a workspace's file, then the home
+/// file, then the built-in default. The engine provides it.
+pub trait Layers: Send + Sync {
+    /// The model a session in `workspace` talks to as the layers name it,
+    /// as `host:model`, and which layer names it; or why there is none.
+    fn model(&self, workspace: &Path) -> Result<(String, String), String>;
+}
+
+/// Which model a session's calls go to: the session's own choice, kept as
+/// an extension's state, over the [`Layers`]. An extension provides it
+/// (`settings`); with none, the engine reads the layers alone.
+pub trait ModelSpec: Send + Sync {
+    /// The model, as `host:model`, and what names it.
+    fn model(
+        &self,
+        states: &States,
+        layers: &dyn Layers,
+        workspace: &Path,
+    ) -> Result<(String, String), String>;
 }
 
 /// Model requests on behalf of a call, beside the session's own: what

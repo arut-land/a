@@ -4,8 +4,9 @@
 //! extension state holds it twice. The `titled` fold keeps a session from
 //! being titled again.
 
-use ext::point::Step;
-use ext::{Budget, Extension, Fold, Registrar, Rewrite, Side};
+use ext::point::Observe;
+use ext::{Budget, Configured, Extension, Fold, Reaction, Refused, Registrar, Side, Table};
+use protocol::Body;
 
 /// What the model is asked.
 const TITLE: &str = "Name this conversation in at most six words, for a list of sessions: the task, not the tools. Answer with the name alone.";
@@ -26,22 +27,40 @@ impl Fold for Titled {
     }
 }
 
+impl Configured for Title {
+    fn configure(_: &impl Table) -> Result<Self, Refused> {
+        Ok(Self)
+    }
+}
+
 impl Extension for Title {
     const NAME: &'static str = "title";
     const VERSION: u32 = 1;
 
+    /// Reacts to the first model call of the session: a side request on
+    /// its behalf, owned by the session, once the call's intent is
+    /// committed.
     fn contribute(&self, r: &mut Registrar) {
-        r.fold::<Titled>().on::<Step>(|cx, _| {
-            if cx.state(|t: &Titled| t.0) {
-                return Rewrite::Pass;
+        r.fold::<Titled>().on::<Observe>(|cx, entry| {
+            let first = matches!(
+                entry.body,
+                Body::ModelCall {
+                    attempt: 0,
+                    r#for: None,
+                    ..
+                }
+            );
+            if !first || cx.state(|t: &Titled| t.0) {
+                return Reaction::NONE;
             }
-            if let Some(cx) = cx.cx()
-                && let Some(rt) = cx.service::<dyn rt::Runtime>()
-            {
-                cx.update::<Titled>(true);
-                let cx = cx.clone();
-                rt.spawn(Box::pin(async move {
-                    let Some(models) = cx.models() else { return };
+            let Some(cx) = cx.cx() else {
+                return Reaction::NONE;
+            };
+            Reaction::later(async move {
+                // Marked and asked at once: the mark goes first, and the
+                // request goes out while the call it is asked for is open.
+                let marked = cx.update::<Titled>(&true);
+                if let Some(models) = cx.models() {
                     let ask = [llm::Message::user(TITLE)].into_iter().collect();
                     let mut side = Side::new(protocol::view::TITLE, ask).after_the_conversation();
                     side.budget = Budget {
@@ -50,9 +69,9 @@ impl Extension for Title {
                     };
                     // Its reply is logged as the side request's outcome.
                     let _ = models.call(&cx, side).await;
-                }));
-            }
-            Rewrite::Pass
+                }
+                marked.await;
+            })
         });
     }
 }

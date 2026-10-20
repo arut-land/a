@@ -324,7 +324,7 @@ fn a_cancelled_call_stops_with_its_partial_output() {
     let cancel = rig.cancel.clone();
     let canceller = std::thread::spawn(move || {
         std::thread::sleep(Duration::from_millis(300));
-        cancel.cancel();
+        cancel.set();
     });
     let started = Instant::now();
     let ran = run(&rig, "echo partial; sleep 100");
@@ -341,7 +341,7 @@ fn a_cancelled_call_stops_with_its_partial_output() {
 #[test]
 fn a_call_cancelled_before_it_starts_spawns_nothing() {
     let rig = rig("cancelled");
-    rig.cancel.cancel();
+    rig.cancel.set();
     let started = Instant::now();
     let ran = run(&rig, "sleep 100");
     let job = bash(&rig, &json!({ "command": "sleep 100", "background": true }));
@@ -457,7 +457,7 @@ fn a_running_commands_output_is_on_disk() {
             );
             std::thread::sleep(Duration::from_millis(20));
         }
-        rig.cancel.cancel();
+        rig.cancel.set();
         call.join().unwrap()
     });
     assert!(ran.aborted, "{ran:?}");

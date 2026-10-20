@@ -1,17 +1,29 @@
-//! A stand-in registry, two agents and a recording session for the
-//! kernel's table tests.
+//! The kernel's table tests run against the registry the engine binds,
+//! [`ext::host::Bound`], over real extensions written inline: a policy, a
+//! retry, an input filter, two agents and the tools' shapes. `Reg` is the
+//! builder of one such registry, and a recording session steps the kernel.
 
 #![allow(dead_code)]
 // Helpers take `json!` values as they are written in a table.
 #![allow(clippy::needless_pass_by_value)]
 
-use std::sync::Arc;
+use std::path::Path;
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
+use ext::host::{Binding, Bound, Registry};
+use ext::point::{
+    Approve, Input as InputPoint, OnStop, Permission as PermissionPoint, PreTool, RequestError,
+    View,
+};
+use ext::{
+    Concurrency, DynExtension, DynTool, Extension, Later, Name, Parsed, Refused, Registrar, Replay,
+    Rewrite, States, Tier,
+};
 use kernel::{
-    Action, Actions, Agent, Answer, Callable, Chained, Concurrency, Core, Effect, Effects, Event,
-    Gate, Gated, Input, Later, Load, LoopPoints, Name, Recover, Registry, Replay, Replied,
+    Action, Actions, Agent, Answer, Core, Effect, Effects, Event, Gated, Input, Load, LoopPoints,
+    Recover, Replied,
 };
 use protocol::{
     Audience, Author, Body, CallId, ClientId, ClientSeq, Entry, Installed, Json, Mode, Outcome,
@@ -20,7 +32,7 @@ use protocol::{
 use serde_json::{Value, json};
 use uuid::Uuid;
 
-/// What the stand-in policy does with a tool call.
+/// What the policy extension does with a tool call.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Policy {
     Allow,
@@ -30,26 +42,28 @@ pub enum Policy {
     Deny(&'static [&'static str]),
     /// Rewrites every input to `{"rewritten": true}`, then denies.
     RewriteThenDeny,
-    /// Answers later, allowing.
+    /// Asks about everything, and approves later.
     Later,
-    /// Panics.
+    /// The gate panics: a kernel bug's stand-in, not an extension's.
     Panic,
 }
 
-/// How often the stand-in retry policy retries a call.
+/// How often the retry extension retries a call.
 pub const RETRIES: u16 = 3;
 
+/// What makes the registry's extensions, beside the fixed ones.
+type Extras = Box<dyn Fn(Registry) -> Result<Registry, Refused>>;
+
 pub struct Reg {
-    pub agent: fn() -> Box<dyn Agent>,
+    pub agent: Option<fn() -> Box<dyn Agent>>,
     pub policy: Policy,
     /// Retries a failed model call after this.
     pub retry: Option<Duration>,
     /// Has the agent go on once with this after it first stops.
     pub on_stop: Option<&'static str>,
-    pub stopped: AtomicBool,
     pub extensions: &'static [&'static str],
-    /// The handlers at the loop points.
-    pub points: Option<ext::host::Registry>,
+    /// Extensions of the test's own, the loop's handlers among them.
+    pub extras: Option<Extras>,
     /// Recovers a failed model call later, by sending it again as the
     /// transcript is then (as compaction does).
     pub resend: bool,
@@ -60,13 +74,12 @@ pub struct Reg {
 impl Reg {
     pub fn new(agent: fn() -> Box<dyn Agent>) -> Self {
         Self {
-            agent,
+            agent: Some(agent),
             policy: Policy::Allow,
             retry: None,
             on_stop: None,
-            stopped: AtomicBool::new(false),
             extensions: &["fixtures"],
-            points: None,
+            extras: None,
             resend: false,
             forever: false,
         }
@@ -82,10 +95,11 @@ impl Reg {
         self
     }
 
-    /// The default loop, asking `points`' handlers.
-    pub fn looping(points: ext::host::Registry) -> Self {
+    /// The default loop, with the extensions `extras` adds.
+    pub fn looping(extras: impl Fn(Registry) -> Result<Registry, Refused> + 'static) -> Self {
         Self {
-            points: Some(points),
+            agent: None,
+            extras: Some(Box::new(extras)),
             ..Self::new(|| Box::new(ext::Loop::default()))
         }
     }
@@ -118,133 +132,363 @@ impl Reg {
         self
     }
 
-    pub fn arc(self) -> Arc<dyn Registry> {
-        Arc::new(self)
-    }
-}
-
-fn name(n: &str) -> Name {
-    Name::from(n)
-}
-
-impl Registry for Reg {
-    fn agent(&self) -> Box<dyn Agent> {
-        (self.agent)()
-    }
-
-    fn loop_points(&self) -> &dyn LoopPoints {
-        match &self.points {
-            Some(points) => points.hooks(),
-            None => &ext::Defaults,
-        }
-    }
-
-    fn installed(&self) -> Vec<Installed> {
-        (self.extensions.iter())
-            .map(|n| Installed {
-                name: (*n).to_owned(),
-                version: 1,
+    /// The registry, bound to a session as the engine binds it.
+    pub fn arc(self) -> Arc<dyn Binding> {
+        let registry = Registry::default()
+            .with_dyn(Tier::Pre, &Fixtures(self.agent))
+            .and_then(|r| r.with_in(Tier::Pre, &Filter))
+            .and_then(|r| {
+                let policed = Policed {
+                    policy: self.policy,
+                    on_stop: self.on_stop,
+                };
+                if policed.policy == Policy::Allow && policed.on_stop.is_none() {
+                    Ok(r)
+                } else {
+                    r.with_in(Tier::Pre, &policed)
+                }
             })
-            .collect()
+            .and_then(|r| {
+                let retry = Retrying {
+                    after: self.retry,
+                    forever: self.forever,
+                };
+                if retry.after.is_some() || retry.forever {
+                    r.with_in(Tier::Post, &retry)
+                } else {
+                    Ok(r)
+                }
+            })
+            .and_then(|r| {
+                if self.resend {
+                    r.with_in(Tier::Pre, &Compacting)
+                } else {
+                    Ok(r)
+                }
+            })
+            .and_then(|r| match &self.extras {
+                Some(extras) => extras(r),
+                None => Ok(r),
+            })
+            .expect("the test's extensions install");
+        let stub = Arc::new(Stub {
+            states: Mutex::new(registry.states()),
+        });
+        let agent = self.agent.map(|_| AGENT.to_owned());
+        Arc::new(Harness {
+            bound: Bound::new(Arc::new(registry), stub, agent),
+            installed: (self.extensions.iter())
+                .map(|n| Installed {
+                    name: (*n).to_owned(),
+                    version: 1,
+                })
+                .collect(),
+            panics: self.policy == Policy::Panic,
+        })
+    }
+}
+
+/// The session as the points read it: nothing, but its states.
+struct Stub {
+    states: Mutex<States>,
+}
+
+impl View for Stub {
+    fn session(&self) -> SessionId {
+        SessionId(Uuid::from_u128(0x5e5))
     }
 
-    fn callable(&self, tool: &str) -> Option<Callable> {
-        let (audience, replay, concurrency) = match tool {
-            "sleep" | "task" => (Audience::Model, Replay::Safe, Concurrency::Shared),
-            "bash" | "ask" => (Audience::Model, Replay::Unsafe, Concurrency::Exclusive),
-            "jobs" => (Audience::User, Replay::Unsafe, Concurrency::Exclusive),
-            _ => return None,
-        };
-        Some(Callable {
-            audience,
-            replay,
-            concurrency,
-        })
+    fn workspace(&self) -> &Path {
+        Path::new("/w")
     }
 
     fn model(&self) -> String {
         "test:model".to_owned()
     }
 
-    fn input(&self, text: String) -> Result<Chained<String>, String> {
-        if text == "secret" {
-            return Err("input: no secrets".to_owned());
-        }
-        let Some(loud) = text.strip_prefix("shout ") else {
-            return Ok(Chained::new(text));
-        };
-        let decisions = vec![(
-            name("input"),
-            Verdict::Input {
-                original: text.clone(),
-            },
-        )];
-        Ok(Chained {
-            value: loud.to_uppercase(),
-            decisions,
-        })
+    fn states(&self, read: &mut dyn FnMut(&States)) {
+        read(&self.states.lock().unwrap());
+    }
+}
+
+/// The bound registry, listing the extensions the test names rather than
+/// the inline ones, and with a gate that panics on request.
+struct Harness {
+    bound: Bound<Stub>,
+    installed: Vec<Installed>,
+    panics: bool,
+}
+
+impl Binding for Harness {
+    fn agent(&self) -> Box<dyn Agent> {
+        self.bound.agent()
     }
 
-    fn gate(&self, _: CallId, tool: &str, input: &Json) -> Answer<Gated> {
-        let permission = |permission| (name("policy"), Verdict::Permission { permission });
-        let gated = match self.policy {
-            Policy::Ask(tools) if tools.contains(&tool) => Gated {
-                input: input.clone(),
-                decisions: vec![permission(Permission::Ask)],
-                gate: Gate::Ask,
-            },
-            Policy::Deny(tools) if tools.contains(&tool) => Gated {
-                input: input.clone(),
-                decisions: vec![permission(Permission::Deny)],
-                gate: Gate::Refuse("policy denied this call".to_owned()),
-            },
-            Policy::Allow | Policy::Ask(_) | Policy::Deny(_) => Gated::run(input.clone()),
-            Policy::RewriteThenDeny => {
-                let rewritten = Json::encode(&json!({ "rewritten": true })).unwrap();
-                Gated {
-                    input: rewritten.clone(),
-                    decisions: vec![
-                        (name("policy"), Verdict::PreTool { input: rewritten }),
-                        permission(Permission::Deny),
-                    ],
-                    gate: Gate::Refuse("policy denied this call".to_owned()),
-                }
-            }
-            Policy::Later => {
-                let input = input.clone();
-                return Answer::Later(Later::new(async move { Gated::run(input) }));
-            }
-            Policy::Panic => panic!("the gate broke"),
-        };
-        Answer::Now(gated)
+    fn loop_points(&self) -> &dyn LoopPoints {
+        self.bound.loop_points()
     }
 
-    /// Retries what may pass, three times; or answers later to resend.
+    fn installed(&self) -> Vec<Installed> {
+        self.installed.clone()
+    }
+
+    fn callable(&self, name: &str) -> Option<kernel::Callable> {
+        self.bound.callable(name)
+    }
+
+    fn model(&self) -> String {
+        self.bound.model()
+    }
+
+    fn context(&self) -> Option<String> {
+        self.bound.context()
+    }
+
+    fn read(&self, call: CallId, tool: &str, input: &Json) -> Option<protocol::Card> {
+        self.bound.read(call, tool, input)
+    }
+
+    fn input(&self, text: String) -> Result<kernel::Chained<String>, String> {
+        self.bound.input(text)
+    }
+
+    fn gate(&self, call: CallId, tool: &str, input: &Json) -> Answer<Gated> {
+        assert!(!self.panics, "the gate broke");
+        self.bound.gate(call, tool, input)
+    }
+
     fn request_error(
         &self,
-        _: CallId,
+        call: CallId,
         attempt: u16,
         error: &llm::Error,
     ) -> Answer<Option<(Name, Recover)>> {
-        if self.forever {
-            let after = Duration::ZERO;
-            return Answer::Now(Some((name("retry"), Recover::Retry { after })));
-        }
-        if self.resend {
-            return Answer::Later(Later::new(async {
-                Some((name("compact"), Recover::Resend))
-            }));
-        }
-        let after = self
-            .retry
-            .filter(|_| error.is_retryable() && attempt < RETRIES);
-        Answer::Now(after.map(|after| (name("retry"), Recover::Retry { after })))
+        self.bound.request_error(call, attempt, error)
+    }
+
+    fn post_tool(
+        &self,
+        call: CallId,
+        tool: &str,
+        input: &Json,
+        outcome: Outcome,
+    ) -> kernel::Chained<Outcome> {
+        self.bound.post_tool(call, tool, input, outcome)
     }
 
     fn on_stop(&self) -> Option<(Name, String)> {
-        let text = self.on_stop?;
-        (!self.stopped.swap(true, Ordering::SeqCst)).then(|| (name("policy"), text.to_owned()))
+        self.bound.on_stop()
     }
+}
+
+/// The agent a test runs, by name.
+const AGENT: &str = "agent";
+
+/// The tools' shapes, and the agent: what a daemon's fixtures contribute.
+struct Fixtures(Option<fn() -> Box<dyn Agent>>);
+
+impl DynExtension for Fixtures {
+    fn name(&self) -> Name {
+        Name::from("fixtures")
+    }
+
+    fn version(&self) -> u32 {
+        1
+    }
+
+    fn contribute(&self, r: &mut Registrar) {
+        let shape = |name, audience, replay, concurrency| {
+            Arc::new(Shape {
+                name,
+                audience,
+                replay,
+                concurrency,
+            }) as Arc<dyn DynTool>
+        };
+        for name in ["sleep", "task"] {
+            r.dyn_tool(shape(
+                name,
+                Audience::Model,
+                Replay::Safe,
+                Concurrency::Shared,
+            ));
+        }
+        for name in ["bash", "ask"] {
+            r.dyn_tool(shape(
+                name,
+                Audience::Model,
+                Replay::Unsafe,
+                Concurrency::Exclusive,
+            ));
+        }
+        r.dyn_tool(shape(
+            "jobs",
+            Audience::User,
+            Replay::Unsafe,
+            Concurrency::Exclusive,
+        ));
+        if let Some(make) = self.0 {
+            r.agent(AGENT, make);
+        }
+    }
+}
+
+/// A tool as the kernel knows one: its callable shape. Never run here.
+struct Shape {
+    name: &'static str,
+    audience: Audience,
+    replay: Replay,
+    concurrency: Concurrency,
+}
+
+impl DynTool for Shape {
+    fn name(&self) -> &str {
+        self.name
+    }
+
+    fn description(&self) -> &'static str {
+        "a shape"
+    }
+
+    fn audience(&self) -> Audience {
+        self.audience
+    }
+
+    fn replay(&self) -> Replay {
+        self.replay
+    }
+
+    fn concurrency(&self) -> Concurrency {
+        self.concurrency
+    }
+
+    fn spec(&self) -> llm::Tool {
+        llm::Tool {
+            name: self.name.into(),
+            description: "a shape".into(),
+            schema: json!({ "type": "object" }),
+            strict: None,
+            encoded: llm::Encodings::default(),
+        }
+    }
+
+    fn parse(&self, _: &Json) -> Result<Parsed, String> {
+        Ok(Parsed::new(()))
+    }
+
+    fn call<'a>(&'a self, _: Parsed, _: &'a ext::Cx) -> ext::BoxFuture<'a, ext::Called> {
+        Box::pin(std::future::ready(ext::Called::failed(
+            "the kernel runs no tool".to_owned(),
+        )))
+    }
+
+    fn to_model(&self, output: &Json) -> llm::Output {
+        llm::Output::Json(output.clone())
+    }
+
+    fn present(&self, _: &Parsed) -> Option<protocol::Card> {
+        None
+    }
+}
+
+/// Refuses the input `secret`, and shouts what starts with `shout `.
+struct Filter;
+
+impl Extension for Filter {
+    const NAME: &'static str = "input";
+    const VERSION: u32 = 1;
+
+    fn contribute(&self, r: &mut Registrar) {
+        r.on::<InputPoint>(|_, text| {
+            if text == "secret" {
+                return Rewrite::Stop("no secrets".to_owned());
+            }
+            match text.strip_prefix("shout ") {
+                Some(loud) => Rewrite::Replace(loud.to_uppercase()),
+                None => Rewrite::Pass,
+            }
+        });
+    }
+}
+
+/// The policy, as [`Policy`] says; and, once the agent first stops, the
+/// text it goes on with.
+struct Policed {
+    policy: Policy,
+    on_stop: Option<&'static str>,
+}
+
+impl Extension for Policed {
+    const NAME: &'static str = "policy";
+    const VERSION: u32 = 1;
+
+    fn contribute(&self, r: &mut Registrar) {
+        let policy = self.policy;
+        if let Some(text) = self.on_stop {
+            let stopped = Arc::new(AtomicBool::new(false));
+            r.on::<OnStop>(move |_, ()| {
+                (!stopped.swap(true, Ordering::SeqCst)).then(|| text.to_owned())
+            });
+        }
+        r.on::<PermissionPoint>(move |_, call| match policy {
+            Policy::Ask(tools) if tools.contains(&call.tool) => Permission::Ask,
+            Policy::Deny(tools) if tools.contains(&call.tool) => Permission::Deny,
+            Policy::RewriteThenDeny => Permission::Deny,
+            Policy::Later => Permission::Ask,
+            _ => Permission::Allow,
+        });
+        if policy == Policy::RewriteThenDeny {
+            r.on::<PreTool>(|_, _| {
+                Rewrite::Replace(Json::encode(&json!({ "rewritten": true })).unwrap())
+            });
+        }
+        if policy == Policy::Later {
+            r.on::<Approve>(|_, _| Answer::Later(Later::new(async { Some(true) })));
+        }
+    }
+}
+
+/// Retries what may pass, [`RETRIES`] times after `after`; or forever.
+struct Retrying {
+    after: Option<Duration>,
+    forever: bool,
+}
+
+impl Extension for Retrying {
+    const NAME: &'static str = "retry";
+    const VERSION: u32 = 1;
+
+    fn contribute(&self, r: &mut Registrar) {
+        let (after, forever) = (self.after, self.forever);
+        r.on::<RequestError>(move |_, failed| {
+            if forever {
+                let after = Duration::ZERO;
+                return Answer::Now(Some(Recover::Retry { after }));
+            }
+            let retry = failed.error.is_retryable() && failed.attempt < RETRIES;
+            Answer::Now(
+                after
+                    .filter(|_| retry)
+                    .map(|after| Recover::Retry { after }),
+            )
+        });
+    }
+}
+
+/// Answers later to resend, as compaction does.
+struct Compacting;
+
+impl Extension for Compacting {
+    const NAME: &'static str = "compact";
+    const VERSION: u32 = 1;
+
+    fn contribute(&self, r: &mut Registrar) {
+        r.on::<RequestError>(|_, _| Answer::Later(Later::new(async { Some(Recover::Resend) })));
+    }
+}
+
+fn name(n: &str) -> Name {
+    Name::from(n)
 }
 
 /// Echoes messages back. `$ <command>` runs it with `bash`, `sleep <n>`
@@ -354,13 +598,13 @@ pub struct Session {
 }
 
 impl Session {
-    pub fn new(registry: Arc<dyn Registry>) -> Self {
+    pub fn new(registry: Arc<dyn Binding>) -> Self {
         Self::resume(registry, Vec::new(), &Load::default()).0
     }
 
     /// Resumes `log`, returning what the resume did.
     pub fn resume(
-        registry: Arc<dyn Registry>,
+        registry: Arc<dyn Binding>,
         mut log: Vec<Entry>,
         load: &Load<'_>,
     ) -> (Self, Effects) {
@@ -456,6 +700,15 @@ pub fn model_failed(call: u64) -> Event {
     Event::ModelDone {
         call: id(call),
         replied: Replied::Failed(llm::Error::new(llm::Kind::RateLimit, "slow down")),
+    }
+}
+
+/// The request of model call `call` prepared, with nothing decided.
+pub fn prepared(call: u64) -> Event {
+    Event::Prepared {
+        call: id(call),
+        decisions: Vec::new(),
+        answered: None,
     }
 }
 
@@ -632,7 +885,6 @@ pub fn run_tool(call: u64, tool: &str, input: Value) -> Effect {
         call: id(call),
         tool: tool.to_owned(),
         input: Json::encode(&input).unwrap(),
-        parsed: None,
     }
 }
 
@@ -640,12 +892,17 @@ pub fn run_bash(call: u64, command: &str) -> Effect {
     run_tool(call, "bash", json!({ "command": command }))
 }
 
-pub fn call_model(call: u64, attempt: u16) -> Effect {
-    Effect::CallModel {
+/// The request of model call `call` to be prepared, as attempt `attempt`.
+pub fn prepare(call: u64, attempt: u16) -> Effect {
+    Effect::Prepare {
         call: id(call),
         attempt,
         choice: ToolChoice::Auto,
     }
+}
+
+pub fn send(call: u64) -> Effect {
+    Effect::Send { call: id(call) }
 }
 
 pub fn cancel(call: u64) -> Effect {

@@ -8,7 +8,7 @@ use std::collections::VecDeque;
 use protocol::ledger::{Call, Ledger};
 use protocol::{Audience, Body, CallId, Entry, Json, Outcome, Seq, Verdict, WaitOn};
 
-use crate::{Action, Agent, Input, Registry};
+use crate::{Action, Agent, Binding, Input};
 
 /// What is asked for and not yet logged: the agent's actions, and a user's
 /// command taken up.
@@ -55,7 +55,7 @@ impl Fold {
 
     /// Folds entry `e`, the one after the last folded: the agent is given
     /// the input it records, if any.
-    pub fn apply(&mut self, e: &Entry, registry: &dyn Registry) {
+    pub fn apply(&mut self, e: &Entry, registry: &dyn Binding) {
         let input = self.input(e, registry);
         self.ledger.apply(e);
         if let Some(input) = input {
@@ -67,7 +67,7 @@ impl Fold {
 
     /// The agent's input `body` records, read against the log before it;
     /// and what else of it the kernel keeps.
-    fn input(&mut self, e: &Entry, registry: &dyn Registry) -> Option<Input> {
+    fn input(&mut self, e: &Entry, registry: &dyn Binding) -> Option<Input> {
         let body = &e.body;
         match body {
             Body::Input {
@@ -214,7 +214,7 @@ impl Fold {
     }
 
     /// Input `text` taken up: a user's command, or the agent's.
-    fn user(&mut self, text: &str, registry: &dyn Registry) -> Option<Input> {
+    fn user(&mut self, text: &str, registry: &dyn Binding) -> Option<Input> {
         match command(text, registry) {
             Some((name, args)) => {
                 self.asked.push_back(Next::Command {
@@ -284,7 +284,7 @@ impl Fold {
 
 /// `text` as a user's command and its arguments: `/name args`, for a
 /// callable the user may call.
-pub fn command<'a>(text: &'a str, registry: &dyn Registry) -> Option<(&'a str, &'a str)> {
+pub fn command<'a>(text: &'a str, registry: &dyn Binding) -> Option<(&'a str, &'a str)> {
     let rest = text.strip_prefix('/')?;
     let (name, args) = rest.split_once(char::is_whitespace).unwrap_or((rest, ""));
     registry

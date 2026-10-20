@@ -1,19 +1,75 @@
-//! `settings`: the commands that show and change what a session runs with,
-//! over the [`ext::Settings`] the engine keeps.
+//! `settings`: a session's own choice of model, kept as its state over the
+//! config layers and offered to the engine as the [`ModelSpec`] service,
+//! and `/model`, which shows and changes it. Nothing below this crate
+//! knows the choice by name: the engine asks the service.
 
-use ext::{Args, Cx, Extension, Registrar, Tool};
-use protocol::{Audience, Overrides};
+use std::path::Path;
+use std::sync::Arc;
+
+use ext::{
+    Args, Configured, Cx, Extension, Fold, Layers, ModelSpec, Provides, Refused, Registrar, States,
+    Table, Tool,
+};
+use protocol::Audience;
 use serde::Serialize;
 
 /// The `settings` extension.
 pub struct Settings;
+
+/// The model the session chose for itself, over every config layer, if it
+/// did.
+#[derive(Debug, Default)]
+pub struct ModelChoice(pub Option<String>);
+
+impl Fold for ModelChoice {
+    const NAME: &'static str = "model";
+    type Change = Option<String>;
+
+    fn apply(&mut self, choice: &Option<String>) {
+        self.0.clone_from(choice);
+    }
+}
 
 impl Extension for Settings {
     const NAME: &'static str = "settings";
     const VERSION: u32 = 1;
 
     fn contribute(&self, r: &mut Registrar) {
-        r.tool(Model);
+        r.fold::<ModelChoice>()
+            .provide::<dyn ModelSpec>(Arc::new(Settings))
+            .tool(Model);
+    }
+}
+
+impl Provides<dyn ModelSpec> for Settings {}
+
+impl Configured for Settings {
+    fn configure(_: &impl Table) -> Result<Self, Refused> {
+        Ok(Self)
+    }
+}
+
+impl ModelSpec for Settings {
+    fn model(
+        &self,
+        states: &States,
+        layers: &dyn Layers,
+        workspace: &Path,
+    ) -> Result<(String, String), String> {
+        let chosen = states.get::<ModelChoice>().and_then(|m| m.0.clone());
+        named(chosen, layers, workspace)
+    }
+}
+
+/// The model `chosen` for the session, or the layers' for `workspace`.
+fn named(
+    chosen: Option<String>,
+    layers: &dyn Layers,
+    workspace: &Path,
+) -> Result<(String, String), String> {
+    match chosen {
+        Some(model) => Ok((model, "this session".to_owned())),
+        None => layers.model(workspace),
     }
 }
 
@@ -39,17 +95,15 @@ impl Tool for Model {
 
     async fn call(&self, Args { args }: &Args, cx: &Cx) -> Result<Chosen, String> {
         let args = args.as_str();
-        let settings = cx
-            .service::<dyn ext::Settings>()
-            .ok_or("this engine keeps no settings")?;
+        let layers = cx
+            .service::<dyn Layers>()
+            .ok_or("this engine reads no config layers")?;
         if !args.is_empty() {
-            let model = (args != "reset").then(|| args.to_owned());
-            settings
-                .set(cx, Overrides { model })
-                .await
-                .map_err(|e| e.to_string())?;
+            let choice = (args != "reset").then(|| args.to_owned());
+            cx.update::<ModelChoice>(&choice).await;
         }
-        let (model, from) = settings.model(cx)?;
+        let chosen = cx.state(|m: &ModelChoice| m.0.clone());
+        let (model, from) = named(chosen, layers, &cx.workspace)?;
         Ok(Chosen { model, from })
     }
 }

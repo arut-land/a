@@ -1,93 +1,98 @@
 //! The extensions `a` links. Each is a crate, and a cargo feature of this
 //! one, so leaving one out of a build leaves it out of the registry; each
 //! registers through the same verbs as any other, can be replaced by one
-//! of the same name, and is configured by its own `[ext.<name>]` table.
-//! `[ext] disable` leaves one out: it is replaced by an extension of its
-//! name that contributes nothing.
+//! of the same name, and reads its own `[ext.<name>]` table
+//! ([`Configured`]): this file knows no key of any. What one needs of the
+//! ones before it is checked as this compiles ([`Built`]). `[ext] disable`
+//! leaves one out: it is replaced by an extension of its name that
+//! contributes nothing.
 
 // Only the daemon, which runs on Unix alone, assembles them.
 #![cfg_attr(not(unix), allow(dead_code))]
 
 use engine::Config;
-use ext::host::Registry;
-use ext::{DynExtension, Name, Refused, Registrar, Tier};
+use ext::host::{Built, Registry};
+use ext::{Configured, DynExtension, Name, Refused, Registrar, Table, Tier};
 
-/// The extensions this build links, in their install order, each as its
-/// `[ext.<name>]` table sets it. The fixtures come only with the `echo`
-/// agent they serve, in a build that has them.
-pub fn extensions(config: &Config) -> Result<Vec<Installed>, Refused> {
-    let step_limit = ext::StepLimit {
-        max: whole(config, ext::LOOP, "max_steps")?.unwrap_or(ext::StepLimit::default().max),
-    };
-    let mut all: Vec<Installed> = vec![(Tier::Pre, Box::new(step_limit))];
+/// The registry of the extensions this build links, in their install
+/// order, each as its `[ext.<name>]` table sets it. The fixtures come only
+/// with the `echo` agent they serve, in a build that has them.
+pub fn registry(config: &Config) -> Result<Registry, Refused> {
+    let built = Built::new().with(Tier::Pre, &configured::<ext::StepLimit>(config)?)?;
     #[cfg(feature = "policy")]
-    {
+    let built = {
         let floor = config.floor.clone().map_err(Refused)?;
         let floor = ext_policy::Floor::new(floor).map_err(Refused)?;
-        let default = ext_policy::Policy::ask(&[]);
-        let mode = match text(config, "policy", "mode")? {
-            Some(name) => ext_policy::Mode::named(&name)
-                .ok_or_else(|| Refused(format!("ext.policy.mode: no mode {name}")))?,
-            None => default.mode,
-        };
-        let policy = ext_policy::Policy {
-            ask: list(config, "policy", "ask")?.unwrap_or(default.ask),
-            edits: list(config, "policy", "edits")?.unwrap_or(default.edits),
-            mode,
-        };
-        all.push((Tier::Guarded, Box::new(floor)));
-        all.push((Tier::Pre, Box::new(policy)));
-    }
+        built
+            .with(Tier::Guarded, &floor)?
+            .with(Tier::Pre, &configured::<ext_policy::Policy>(config)?)?
+    };
     #[cfg(feature = "prompt")]
-    all.push((
-        Tier::Pre,
-        Box::new(ext_prompt::Prompt {
-            system: text(config, "prompt", "system")?.filter(|s| !s.is_empty()),
-        }),
-    ));
+    let built = built.with(Tier::Pre, &configured::<ext_prompt::Prompt>(config)?)?;
     #[cfg(feature = "shell")]
-    all.push((Tier::Pre, Box::new(ext_shell::Shell)));
+    let built = built.with(Tier::Pre, &configured::<ext_shell::Shell>(config)?)?;
+    // Needs the shell: without it, this does not compile.
     #[cfg(feature = "edit")]
-    all.push((Tier::Pre, Box::new(ext_edit::Edit)));
-
+    let built = built.with(Tier::Pre, &configured::<ext_edit::Edit>(config)?)?;
     #[cfg(feature = "compact")]
-    all.push((
-        Tier::Pre,
-        Box::new(ext_compact::Compact {
-            threshold: whole(config, "compact", "threshold")?,
-        }),
-    ));
+    let built = built.with(Tier::Pre, &configured::<ext_compact::Compact>(config)?)?;
     #[cfg(feature = "settings")]
-    all.push((Tier::Pre, Box::new(ext_settings::Settings)));
+    let built = built.with(Tier::Pre, &configured::<ext_settings::Settings>(config)?)?;
     #[cfg(feature = "subagent")]
-    all.push((Tier::Pre, Box::new(ext_subagent::Subagent)));
+    let built = built.with(Tier::Pre, &configured::<ext_subagent::Subagent>(config)?)?;
     // After every other: what another extension owns it is not asked.
     #[cfg(feature = "retry")]
-    {
-        let default = ext_retry::Retry::default();
-        let retry = ext_retry::Retry {
-            attempts: whole(config, "retry", "attempts")?.unwrap_or(default.attempts),
-            transport: whole(config, "retry", "transport")?.unwrap_or(default.transport),
-            ..default
-        };
-        all.push((Tier::Post, Box::new(retry)));
-    }
+    let built = built.with(Tier::Post, &configured::<ext_retry::Retry>(config)?)?;
     #[cfg(feature = "title")]
-    all.push((Tier::Post, Box::new(ext_title::Title)));
+    let built = built.with(Tier::Post, &configured::<ext_title::Title>(config)?)?;
+    let mut built = built;
     if config.agent.as_deref() == Some(ext_fixtures::ECHO)
         && let Some(fixtures) = ext_fixtures::extension()
     {
-        all.push((Tier::User, fixtures));
+        built = built.with_dyn(Tier::User, &*fixtures)?;
     }
     // Disabled: replaced by nothing of the same name.
     for name in &config.ext.disable {
-        all.push((Tier::User, Box::new(Disabled(Name::from(name.as_str())))));
+        built = built.with_dyn(Tier::User, &Disabled(Name::from(name.as_str())))?;
     }
-    Ok(all)
+    Ok(built.registry())
 }
 
-/// An extension to install, and where.
-pub type Installed = (Tier, Box<dyn DynExtension>);
+/// Extension `E`, as its `[ext.<name>]` table in `config` sets it.
+fn configured<E: Configured>(config: &Config) -> Result<E, Refused> {
+    E::configure(&Settings(config.ext.table(E::NAME)))
+}
+
+/// An extension's table of the config file, as the extension reads it.
+struct Settings(sys::config::Table);
+
+impl Settings {
+    fn read<T>(read: Result<T, sys::config::ParseError>) -> Result<T, Refused> {
+        read.map_err(|e| Refused(e.to_string()))
+    }
+}
+
+impl Table for Settings {
+    fn name(&self) -> &str {
+        self.0.name()
+    }
+
+    fn text(&self, key: &str) -> Result<Option<&str>, Refused> {
+        Self::read(self.0.text(key))
+    }
+
+    fn whole(&self, key: &str) -> Result<Option<u64>, Refused> {
+        Self::read(self.0.whole(key))
+    }
+
+    fn flag(&self, key: &str) -> Result<Option<bool>, Refused> {
+        Self::read(self.0.flag(key))
+    }
+
+    fn list(&self, key: &str) -> Result<Option<&[String]>, Refused> {
+        Self::read(self.0.list(key))
+    }
+}
 
 /// What a disabled extension is replaced by: one of its name that
 /// contributes nothing.
@@ -103,36 +108,6 @@ impl DynExtension for Disabled {
     }
 
     fn contribute(&self, _: &mut Registrar) {}
-}
-
-fn setting<T>(read: Result<T, sys::config::ParseError>) -> Result<T, Refused> {
-    read.map_err(|e| Refused(e.to_string()))
-}
-
-/// Whole number `key` of extension `ext`'s table, if it sets one.
-fn whole<T: TryFrom<u64>>(config: &Config, ext: &str, key: &str) -> Result<Option<T>, Refused> {
-    let n = setting(config.ext.table(ext).whole(key))?;
-    n.map(|n| T::try_from(n).map_err(|_| Refused(format!("ext.{ext}.{key} is too large"))))
-        .transpose()
-}
-
-/// String `key` of extension `ext`'s table, if it sets one.
-fn text(config: &Config, ext: &str, key: &str) -> Result<Option<String>, Refused> {
-    Ok(setting(config.ext.table(ext).text(key))?.map(str::to_owned))
-}
-
-/// List `key` of extension `ext`'s table, if it sets one.
-fn list(config: &Config, ext: &str, key: &str) -> Result<Option<Vec<String>>, Refused> {
-    Ok(setting(config.ext.table(ext).list(key))?.map(<[String]>::to_vec))
-}
-
-/// The registry of [`extensions`].
-pub fn registry(config: &Config) -> Result<Registry, Refused> {
-    extensions(config)?
-        .iter()
-        .try_fold(Registry::default(), |r, (tier, ext)| {
-            r.with_dyn(*tier, &**ext)
-        })
 }
 
 #[cfg(test)]
@@ -152,6 +127,14 @@ mod tests {
     struct Bare;
 
     impl View for Bare {
+        fn session(&self) -> SessionId {
+            SessionId::new()
+        }
+
+        fn workspace(&self) -> &Path {
+            Path::new("/w")
+        }
+
         fn model(&self) -> String {
             String::new()
         }
@@ -178,7 +161,7 @@ mod tests {
 
     fn gate(registry: &Registry, tool: &str, decided: &mut Decided) -> Gate {
         let view = Bare;
-        let cx = PointCx::new(SessionId::new(), Path::new("/w"), &view);
+        let cx = PointCx::new(&view);
         let gated = (registry
             .hooks()
             .gate(&cx, tool, &Json::encode(&json!({})).unwrap())
@@ -231,8 +214,12 @@ mod tests {
         assert!(prompt.len() < 2000, "{} bytes", prompt.len());
     }
 
+    /// Leaving an extension out by name (`[ext] disable`) leaves out its
+    /// tool and text and nothing else; one another needs is refused at
+    /// startup, naming both. (Leaving its crate out of the build is the
+    /// static case: `edit` without `shell` does not compile.)
     #[test]
-    fn removing_an_extension_crate_removes_its_tool_and_nothing_else() {
+    fn removing_an_extension_removes_its_tool_and_nothing_else() {
         let config = config(&["bash"], None);
         let all = registry(&config).unwrap();
         let paragraphs = |r: &Registry| -> Vec<String> {
@@ -253,13 +240,20 @@ mod tests {
             ("subagent", &["task"], 1),
         ];
         for (name, tools_of, texts_of) in own {
-            let rest = extensions(&config)
-                .unwrap()
-                .into_iter()
-                .filter(|(_, ext)| *ext.name() != *name)
-                .try_fold(Registry::default(), |r, (tier, ext)| {
-                    r.with_dyn(tier, &*ext)
-                });
+            let without = Config {
+                ext: sys::config::Exts {
+                    disable: vec![name.to_owned()],
+                    ..config.ext.clone()
+                },
+                ..config.clone()
+            };
+            let rest = registry(&without);
+            if name == "policy-floor" {
+                // The operator's floor is guarded: nothing of the user's
+                // takes it away.
+                assert!(rest.err().unwrap().0.contains("guarded"));
+                continue;
+            }
             if name == "shell" {
                 // `edit` works where commands run: without the shell it is
                 // refused, not left to guess.
@@ -267,15 +261,16 @@ mod tests {
                 assert!(
                     refused
                         .0
-                        .starts_with("extension edit: it needs dyn ext::service::CwdOf"),
+                        .starts_with("extension shell: edit needs dyn ext::service::CwdOf"),
                     "{refused}"
                 );
                 continue;
             }
             let rest = rest.unwrap();
-            let mut left: Vec<_> = all.extensions().map(|(n, _)| n).collect();
-            left.retain(|n| *n != name);
-            assert_eq!(rest.extensions().map(|(n, _)| n).collect::<Vec<_>>(), left);
+            // Replaced by nothing of its name: listed, contributing nothing.
+            let listed: Vec<_> = rest.extensions().map(|(n, _)| n).collect();
+            assert_eq!(listed, all.extensions().map(|(n, _)| n).collect::<Vec<_>>());
+            assert_eq!(rest.extensions().find(|(n, _)| *n == name).unwrap().1, 0);
             let mut kept = tools(&all);
             kept.retain(|t| !tools_of.contains(&t.as_str()));
             assert_eq!(tools(&rest), kept, "{name}");
@@ -295,22 +290,6 @@ mod tests {
         }
     }
 
-    /// `[ext] disable` leaves an extension out by replacing it with nothing
-    /// of its name; one another needs is refused at startup, naming both.
-    #[test]
-    fn a_disabled_need_is_refused_loudly() {
-        let config = configured(&[], None, "[ext]\ndisable = [\"subagent\"]\n");
-        let registry = registry(&config).unwrap();
-        assert_eq!(tools(&registry), ["bash", "edit"]);
-        assert!(!registry.system_prompt().contains("`task`"));
-        let config = configured(&[], None, "[ext]\ndisable = [\"shell\"]\n");
-        let refused = registry_refused(&config);
-        assert!(
-            refused.contains("edit needs dyn ext::service::CwdOf"),
-            "{refused}"
-        );
-    }
-
     fn registry_refused(config: &Config) -> String {
         match registry(config) {
             Ok(_) => panic!("installed"),
@@ -318,20 +297,28 @@ mod tests {
         }
     }
 
-    /// Each extension's settings are its table's, and the daemon's own
-    /// table holds none of them.
+    /// Each extension's settings are its table's, read by the extension
+    /// (this file names no key), and the daemon's own table holds none of
+    /// them.
     #[test]
     fn extensions_are_configured_by_their_tables() {
         let config = configured(
             &["bash"],
             None,
-            "mode = \"auto\"\n[ext.prompt]\nsystem = \"Be terse.\"\n[ext.loop]\nmax_steps = 3\n",
+            "mode = \"auto\"\n[ext.prompt]\nsystem = \"Be terse.\"\n[ext.loop]\nmax_steps = 3\n[ext.retry]\nattempts = 2\n",
         );
         let registry = registry(&config).unwrap();
         assert!(registry.system_prompt().starts_with("Be terse."));
         assert_eq!(gate(&registry, "bash", &mut Decided::new()), Gate::Run);
         let bad = configured(&[], None, "mode = \"sometimes\"\n");
         assert_eq!(registry_refused(&bad), "ext.policy.mode: no mode sometimes");
+        let wrong = configured(&[], None, "[ext.retry]\nattempts = \"many\"\n");
+        assert_eq!(
+            registry_refused(&wrong),
+            "ext.retry.attempts must be a whole number"
+        );
+        let large = configured(&[], None, "[ext.loop]\nmax_steps = 70000\n");
+        assert_eq!(registry_refused(&large), "ext.loop.max_steps is too large");
         let floor = Config {
             floor: Ok(vec![sys::config::Rule {
                 tool: "bash".into(),
@@ -388,7 +375,7 @@ mod tests {
     /// Who answers a failure of `kind`, in `registry`.
     fn answers(registry: &Registry, kind: llm::Kind) -> Option<String> {
         let view = Bare;
-        let cx = PointCx::new(SessionId::new(), Path::new("/w"), &view).about(2);
+        let cx = PointCx::new(&view).about(protocol::CallId::new(2).unwrap());
         let error = llm::Error::new(kind, "x");
         let failed = ext::point::Failed {
             error: &error,
@@ -406,13 +393,27 @@ mod tests {
     #[test]
     fn request_error_kinds_partition() {
         let config = config(&[], None);
-        let defaults = extensions(&config).unwrap();
+        let all = registry(&config).unwrap();
+        let names: Vec<String> = all.extensions().map(|(n, _)| n.to_owned()).collect();
         for kind in KINDS {
             assert!(listed(kind));
-            let owners: Vec<String> = defaults
+            // Each extension alone: the others disabled, but the guarded
+            // floor and the shell `edit` needs, which answer no failure.
+            let owners: Vec<String> = names
                 .iter()
-                .filter_map(|(tier, ext)| {
-                    let alone = Registry::default().with_dyn(*tier, &**ext).ok()?;
+                .filter_map(|name| {
+                    let others = (names.iter())
+                        .filter(|n| *n != name && *n != "policy-floor" && *n != "shell")
+                        .cloned()
+                        .collect();
+                    let alone = Config {
+                        ext: sys::config::Exts {
+                            disable: others,
+                            ..config.ext.clone()
+                        },
+                        ..config.clone()
+                    };
+                    let alone = registry(&alone).ok()?;
                     answers(&alone, kind)
                 })
                 .collect();

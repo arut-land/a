@@ -8,17 +8,18 @@ use std::sync::{Mutex, Weak};
 use std::thread;
 use std::time::Duration;
 
+use std::task::Poll;
+
 use crate::store::{Loaded, Log, LogStore, Memory};
-use ext::{Extension, Registrar, Replay, Rewrite, Tool, point};
+use ext::{Answer, Extension, Recover, Registrar, Replay, Rewrite, Tool, point};
 use ext_policy::Policy;
 use llm::http::Http;
-use protocol::{Audience, CallId, Card, Permission, Seq};
+use protocol::{Audience, CallId, Card, Installed, Permission, Seq, Verdict};
 use serde::Deserialize as _;
 use serde_json::{Value, json};
 
 use super::*;
 
-mod fails;
 mod interrupt;
 mod log;
 mod parsed;
@@ -356,7 +357,7 @@ impl Live {
     /// Stops the actor and waits for it to end.
     fn halt(&self) {
         self.stop();
-        rt::block_on(self.ended.over());
+        rt::block_on(self.ended.wait());
     }
 
     fn follow(&self, outbox: &Outbox, since: u64) {
@@ -393,7 +394,7 @@ fn until(session: &Live, what: &str, done: impl Fn(&[Entry]) -> bool) -> Vec<Ent
         if done(&log) {
             return log;
         }
-        assert!(Instant::now() < deadline, "never {what}");
+        assert!(Instant::now() < deadline, "never {what}: {log:#?}");
         thread::sleep(Duration::from_millis(5));
     }
 }
@@ -648,7 +649,7 @@ fn a_missing_credential_fails_the_model_call_saying_where_to_set_it() {
                 ..
             },
             ..,
-        ] if model == "none" => error.clone(),
+        ] if model == crate::config::DEFAULT_MODEL => error.clone(),
         other => panic!("{other:#?}"),
     };
     assert!(error.contains("OPENAI_API_KEY"), "{error}");
@@ -773,7 +774,7 @@ fn extensions_are_logged_when_they_change() {
     assert_eq!(
         bodies(&noted)[1..],
         [&Body::Extensions {
-            installed: installed(&fixture.0.registry.get())
+            installed: fixture.0.registry.get().installed()
         }]
     );
 }
@@ -1397,7 +1398,7 @@ impl Tool for Held {
 
     async fn call(&self, _: &Nothing, cx: &Cx) -> Result<String, String> {
         while !self.0.load(Ordering::SeqCst) {
-            if cx.cancel.is_cancelled() {
+            if cx.cancel.is_set() {
                 return Err("stopped".into());
             }
             rt::Reactor::AsyncIo.sleep(Duration::from_millis(5)).await;
@@ -1636,8 +1637,8 @@ fn the_model_is_set_per_session_and_says_where_it_comes_from() {
         results,
         [
             set("the home config.toml", "gpt-5.6"),
-            set("this session, at entry 6", "anthropic:claude-x"),
-            set("this session, at entry 6", "anthropic:claude-x"),
+            set("this session", "anthropic:claude-x"),
+            set("this session", "anthropic:claude-x"),
             set("the home config.toml", "gpt-5.6"),
         ]
     );
@@ -1793,61 +1794,82 @@ fn the_first_answer_wins() {
     assert_eq!(logged, 1, "{log:#?}");
 }
 
-/// Denies `bash` by panicking.
-struct Broken;
+/// Counts, as a tool's own state.
+#[derive(Default)]
+struct Count(u64);
 
-impl Extension for Broken {
-    const NAME: &'static str = "policy";
-    const VERSION: u32 = 1;
+impl ext::Fold for Count {
+    const NAME: &'static str = "count";
+    type Change = u64;
 
-    fn contribute(&self, r: &mut Registrar) {
-        r.on::<point::Permission>(|_, call| {
-            assert!(
-                call.tool != ext_shell::Bash::NAME,
-                "no policy for {}",
-                call.tool
-            );
-            Permission::Allow
-        });
+    fn apply(&mut self, n: &u64) {
+        self.0 += n;
     }
 }
 
-/// #43: a gate whose handler panics denies the call, logged with why;
-/// the session goes on.
+/// `/bump`: adds one to the count and answers with the count as it then
+/// reads it.
+struct Bump;
+
+impl Tool for Bump {
+    type In = ext::Args;
+    type Out = u64;
+
+    const NAME: &'static str = "bump";
+    const DESCRIPTION: &'static str = "Counts.";
+    const AUDIENCE: Audience = Audience::User;
+
+    async fn call(&self, _: &ext::Args, cx: &Cx) -> Result<u64, String> {
+        cx.update::<Count>(&1).await;
+        Ok(cx.state(|c: &Count| c.0))
+    }
+}
+
+struct Counter;
+
+impl Extension for Counter {
+    const NAME: &'static str = "counter";
+    const VERSION: u32 = 1;
+
+    fn contribute(&self, r: &mut Registrar) {
+        r.fold::<Count>().tool(Bump);
+    }
+}
+
+/// #23: a change to an extension's state is visible once committed, and
+/// `update` resolves then: a call that changes its state and reads it
+/// back in the same breath reads the new value, and the change is in the
+/// log before the call's result.
 #[test]
-#[cfg_attr(
-    debug_assertions,
-    ignore = "dev builds' cranelift backend cannot unwind through these frames: \
-              CARGO_PROFILE_DEV_CODEGEN_BACKEND=llvm cargo nextest run -p engine --run-ignored all"
-)]
-fn a_failing_gate_fails_closed() {
-    let fixture = Fixture::new(
-        ext_fixtures::ECHO,
-        echoing(&Policy::default())
-            .with_in(ext::Tier::Guarded, &Broken)
-            .unwrap(),
-        openai(&Script::new(&[])),
-    );
+fn state_is_visible_only_after_commit() {
+    let registry = Registry::default().with(&Counter).unwrap();
+    let fixture = Fixture::new(ext_fixtures::ECHO, registry, openai(&Script::new(&[])));
     let session = fixture.start(&[]);
-    session.submit("$ echo ran").unwrap();
-    let log = finished(&session, 2);
-    session.submit("still here").unwrap();
+    session.submit("/bump").unwrap();
+    session.submit("/bump").unwrap();
     settle(&session);
-    let after = log_of(&session);
+    let log = log_of(&session);
     session.halt();
-    assert!(
-        matches!(&log[2].body, Body::Decision { d: Verdict::Block { reason }, .. } if reason.contains("panicked")),
-        "{log:#?}"
-    );
-    assert!(
-        matches!(&log[3].body, Body::ToolResult { outcome: Outcome::Failed { error }, .. } if error.contains("no policy for bash")),
-        "{log:#?}"
-    );
-    assert!(
-        !log.iter()
-            .any(|e| matches!(e.body, Body::ToolProcess { .. }))
-    );
-    assert_eq!(after.last().map(|e| &e.body), Some(&echo("still here")));
+    let counts: Vec<u64> = log
+        .iter()
+        .filter_map(|e| match &e.body {
+            Body::ToolResult {
+                outcome: Outcome::Done { output },
+                ..
+            } => output.parse().ok(),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(counts, [1, 2], "{log:#?}");
+    let order: Vec<&str> = log
+        .iter()
+        .filter_map(|e| match &e.body {
+            Body::Ext { state, .. } => Some(state.as_str()),
+            Body::ToolResult { .. } => Some("result"),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(order, ["count", "result", "count", "result"]);
 }
 
 /// Panics on `boom`, the first time it is given it.

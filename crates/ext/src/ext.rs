@@ -20,6 +20,7 @@ use std::marker::PhantomData;
 use std::path::Path;
 use std::sync::Arc;
 
+use crate::assemble::Needs;
 use crate::point::{ERASED, ErasedHandler, Handler, Hooked, Point};
 use crate::shape::Output;
 use crate::state::Decl;
@@ -31,6 +32,11 @@ pub trait Extension: Send + Sync {
     /// Who the extension's handlers are, in logged decisions.
     const NAME: &'static str;
     const VERSION: u32;
+    /// The services it needs of the extensions before it, as a list of
+    /// [`Need`](crate::Need)s: `(Need<dyn CwdOf>, ())`. A static assembly
+    /// ([`Built`](crate::host::Built)) that lacks one does not compile; a
+    /// registry built at run time refuses the extension as it installs.
+    type Needs: Needs = ();
 
     fn contribute(&self, r: &mut Registrar);
 }
@@ -53,6 +59,7 @@ impl<E: Extension> DynExtension for E {
     }
 
     fn contribute(&self, r: &mut Registrar) {
+        E::Needs::declare(r);
         Extension::contribute(self, r);
     }
 }
@@ -191,11 +198,14 @@ impl Registrar {
 
     /// Adds a handler over JSON at the point named `point`.
     pub fn on_erased(&mut self, point: &str, handler: Arc<dyn ErasedHandler>) -> &mut Self {
-        if let Some((_, adapt)) = ERASED.iter().find(|(name, _)| *name == point) {
-            self.hooks.push(adapt(handler));
-        } else {
-            let error = format!("point {point} takes no erased handlers");
-            self.errors.push(error);
+        let adapt = ERASED.iter().find(|(name, _)| *name == point);
+        match adapt {
+            Some((_, Some(adapt))) => self.hooks.push(adapt(handler)),
+            Some((_, None)) => {
+                let error = format!("point {point} takes no erased handlers");
+                self.errors.push(error);
+            }
+            None => self.errors.push(format!("no point is named {point}")),
         }
         self
     }
@@ -231,10 +241,10 @@ impl Registrar {
         self
     }
 
-    /// Needs service `S`: the extension is refused unless one provides it.
-    pub fn need<S: ?Sized + 'static>(&mut self) -> &mut Self {
+    /// Needs service `S` ([`Extension::Needs`]): the extension is refused
+    /// unless one provides it.
+    pub(crate) fn need<S: ?Sized + 'static>(&mut self) {
         self.needs.push((TypeId::of::<S>(), type_name::<S>()));
-        self
     }
 
     /// Offers an agent loop, which `make` starts for each session that

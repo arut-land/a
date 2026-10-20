@@ -5,7 +5,7 @@
 use std::fmt::Write as _;
 use std::io::Read;
 
-use ext::{Extension, Facts, Registrar, Text};
+use ext::{Configured, Extension, Facts, Refused, Registrar, Table, Text};
 
 /// The `prompt` extension: `system`, when set, in place of its line of
 /// identity (`[ext.prompt] system`).
@@ -18,6 +18,16 @@ const IDENTITY: &str = "You are `a`, a coding agent working in the user's worksp
 
 /// The most of `AGENTS.md` the model is given.
 const AGENTS_LIMIT: u64 = 32 * 1024;
+
+/// `[ext.prompt] system`, in place of the identity line; empty is none.
+impl Configured for Prompt {
+    fn configure(table: &impl Table) -> Result<Self, Refused> {
+        let system = table.text("system")?.filter(|s| !s.is_empty());
+        Ok(Self {
+            system: system.map(str::to_owned),
+        })
+    }
+}
 
 impl Extension for Prompt {
     const NAME: &'static str = "prompt";

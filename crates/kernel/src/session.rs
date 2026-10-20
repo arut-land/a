@@ -11,13 +11,12 @@ use protocol::{
 };
 use smallvec::SmallVec;
 
-use ext::Parsed;
 use protocol::Card;
 
 use crate::fold::{Fold, Next};
 use crate::{
-    Action, Answer, Chained, Concurrency, Effect, Effects, Event, Gate, Gated, Load, ModelPhase,
-    Name, Note, Owner, Recover, Registry, Replay, Replied, Step, Ticket, Turn,
+    Action, Answer, Binding, Chained, Concurrency, Effect, Effects, Event, Gate, Gated, Load,
+    ModelPhase, Name, Note, Owner, Recover, Replay, Replied, Step, Ticket, Turn,
 };
 
 /// Who refused a call the agent would not run.
@@ -31,9 +30,9 @@ pub const RESTART_CAP: u16 = 10;
 /// A session's kernel: its log folded, its turn, and the registry
 /// generation its steps run on.
 pub struct Core {
-    registry: Arc<dyn Registry>,
+    registry: Arc<dyn Binding>,
     /// The generation to take up at the next step boundary.
-    next: Option<Arc<dyn Registry>>,
+    next: Option<Arc<dyn Binding>>,
     fold: Fold,
     turn: Turn,
     /// Whether the session is a child, which reports as it settles.
@@ -47,10 +46,6 @@ pub struct Core {
     deferred: VecDeque<(SessionId, Outcome)>,
     /// Why the model call being recovered failed, while a handler decides.
     failed: Option<String>,
-    /// Each open tool call's input as its tool read it at its intent, with
-    /// the text it was read from: its run is given it rather than reading
-    /// it again, unless the gate rewrote it.
-    parsed: Vec<(CallId, Json, Parsed)>,
 }
 
 impl Core {
@@ -67,7 +62,7 @@ impl Core {
     /// asked for that the log does not show is carried out, and queued
     /// input taken up.
     pub fn resume<'e>(
-        registry: Arc<dyn Registry>,
+        registry: Arc<dyn Binding>,
         log: impl IntoIterator<Item = &'e Entry>,
         load: &Load<'_>,
     ) -> (Self, Effects) {
@@ -82,7 +77,7 @@ impl Core {
     /// A session with nothing folded yet: its log is folded in an entry at
     /// a time with [`Core::load`], as it is read, then it is resumed with
     /// [`Core::resumed`]. [`Core::resume`] does all three.
-    pub fn new(registry: Arc<dyn Registry>) -> Self {
+    pub fn new(registry: Arc<dyn Binding>) -> Self {
         Self {
             fold: Fold::new(registry.agent()),
             registry,
@@ -93,7 +88,6 @@ impl Core {
             reported: 0,
             deferred: VecDeque::new(),
             failed: None,
-            parsed: Vec::new(),
         }
     }
 
@@ -188,14 +182,11 @@ impl Core {
                 let side = self.side(of, purpose, model, &mut fx);
                 fx.push(Effect::Side { ticket, side });
             }
-            Event::Prepared { call, decisions } => {
-                if matches!(self.turn, Turn::Model { call: c, phase: ModelPhase::Streaming, .. } if c == call)
-                {
-                    for (by, d) in decisions {
-                        self.decide(Some(call), &by, d, &mut fx);
-                    }
-                }
-            }
+            Event::Prepared {
+                call,
+                decisions,
+                answered,
+            } => self.prepared(call, decisions, answered, &mut fx),
             Event::SideDone { side, outcome } => self.side_done(side, outcome, &mut fx),
             Event::ChildSettled { child, outcome } => self.child_settled(child, outcome, &mut fx),
             Event::Registry(registry) => self.next = Some(registry),
@@ -494,13 +485,13 @@ impl Core {
         Some(self.append(fx, body))
     }
 
-    /// Sends model call `call` again, as attempt `attempt`.
+    /// Has model call `call` prepared again, as attempt `attempt`.
     fn again(&mut self, call: CallId, attempt: u16, fx: &mut Effects) {
         let choice = match self.fold.ledger.call(call.get()).map(|open| &open.call) {
             Some(&Call::Model { choice, .. }) => choice,
             _ => ToolChoice::Auto,
         };
-        fx.push(Effect::CallModel {
+        fx.push(Effect::Prepare {
             call,
             attempt,
             choice,
@@ -510,6 +501,40 @@ impl Core {
             attempt,
             phase: ModelPhase::Streaming,
         };
+    }
+
+    /// Model call `call`'s request is prepared: what the `step` point
+    /// decided is logged, then the request is sent, or a handler's answer
+    /// stands as the model's. One prepared for a turn interrupted
+    /// meanwhile was never sent: it ends interrupted.
+    fn prepared(
+        &mut self,
+        call: CallId,
+        decisions: ext::host::Decided,
+        answered: Option<(Name, Replied)>,
+        fx: &mut Effects,
+    ) {
+        match &self.turn {
+            Turn::Model {
+                call: c,
+                phase: ModelPhase::Streaming,
+                ..
+            } if *c == call => {}
+            Turn::Stopping { open, .. } if open.contains(&call) => {
+                return self.model_done(call, Replied::Interrupted(None), fx);
+            }
+            _ => return,
+        }
+        for (by, d) in decisions {
+            self.decide(Some(call), &by, d, fx);
+        }
+        match answered {
+            Some((by, replied)) => {
+                self.decide(Some(call), &by, Verdict::Answered, fx);
+                self.model_done(call, replied, fx);
+            }
+            None => fx.push(Effect::Send { call }),
+        }
     }
 
     /// Logs a call's outcome as the `post_tool` chain leaves it, with the
@@ -540,8 +565,6 @@ impl Core {
         );
     }
 
-    /// Logs what a running call reports; a call not running reports
-    /// nothing more.
     /// Logs what a call reports: a running tool call anything, and a call
     /// whose handler answers later (a model call recovering, a gate
     /// asking) its extension's state and edits. A call not open reports
@@ -807,7 +830,8 @@ impl Core {
         }
     }
 
-    /// Logs the intent to call `tool`.
+    /// Logs the intent to call `tool`: its input read by its tool once,
+    /// here, for the card and for the run.
     fn call(
         &mut self,
         tool: &str,
@@ -816,7 +840,8 @@ impl Core {
         by: Audience,
         fx: &mut Effects,
     ) -> CallId {
-        let (parsed, card) = self.registry.read(tool, input);
+        let next = self.next_seq();
+        let card = self.registry.read(next, tool, input);
         let body = Body::ToolCall {
             tool: tool.to_owned(),
             input: input.clone(),
@@ -824,26 +849,12 @@ impl Core {
             card,
             by,
         };
-        let call = self.append(fx, body);
-        if let Some(parsed) = parsed {
-            self.parsed.push((call, input.clone(), parsed));
-        }
-        call
+        self.append(fx, body)
     }
 
-    /// Runs tool call `call`, on its input as read at its intent if the
-    /// gate left it as it was.
     fn run_tool(&mut self, call: CallId, tool: String, input: Json, fx: &mut Effects) {
-        let parsed = (self.parsed.iter().position(|(c, _, _)| *c == call))
-            .map(|at| self.parsed.swap_remove(at))
-            .and_then(|(_, read, parsed)| (read == input).then_some(parsed));
         self.set_step(call, Step::Running);
-        fx.push(Effect::RunTool {
-            call,
-            tool,
-            input,
-            parsed,
-        });
+        fx.push(Effect::RunTool { call, tool, input });
     }
 
     fn gate(&mut self, call: CallId, tool: &str, input: &Json, fx: &mut Effects) {
@@ -1156,11 +1167,16 @@ impl Core {
 
     /// Numbers `body` next, folds it and has it appended; its seq.
     fn append(&mut self, fx: &mut Effects, body: Body) -> CallId {
-        let seq = self.fold.ledger.seq() + 1;
-        let entry = Entry::new(seq, 0, body);
+        let next = self.next_seq();
+        let entry = Entry::new(next.get(), 0, body);
         self.fold.apply(&entry, &*self.registry);
         fx.push(Effect::Append(entry));
-        CallId::new(seq).expect("an entry after the last has a seq")
+        next
+    }
+
+    /// The seq the next entry appended gets.
+    fn next_seq(&self) -> CallId {
+        CallId::new(self.fold.ledger.seq() + 1).expect("an entry after the last has a seq")
     }
 
     fn decide(&mut self, call: Option<CallId>, by: &str, d: Verdict, fx: &mut Effects) {
@@ -1268,7 +1284,6 @@ impl Core {
 
     /// Takes call `call` off the turn's open calls.
     fn close(&mut self, call: CallId) {
-        self.parsed.retain(|(c, _, _)| *c != call);
         match &mut self.turn {
             Turn::Acting { open } => open.retain(|(c, _)| *c != call),
             Turn::Stopping { open, .. } => open.retain(|c| *c != call),

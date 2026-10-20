@@ -5,7 +5,7 @@ use std::path::Path;
 use std::sync::Arc;
 
 use llm::{Block, Event, Events, Http, Messages, Provider, Request};
-use protocol::{Environment, Overrides};
+use protocol::Environment;
 
 use crate::config::Settings;
 
@@ -17,18 +17,17 @@ pub struct Models {
 }
 
 impl Models {
-    /// The model a session in `workspace` with its own settings `session`
-    /// calls, with provider variables looked up from its client environment
-    /// `env` first; or why there is none, said so the user can fix it.
+    /// The model `spec` names (`host:model`) for a session in `workspace`,
+    /// with provider variables looked up from its client environment `env`
+    /// first; or why there is none, said so the user can fix it.
     pub fn model(
         &self,
-        workspace: &Path,
+        _workspace: &Path,
         env: Option<&Environment>,
-        session: (Overrides, Option<u64>),
+        spec: &str,
     ) -> Result<Model, String> {
-        let (spec, _) = self.settings.model_in(workspace, session)?;
         let lookup = |name: &str| self.settings.var(env, name);
-        match llm::hosts::provider(&spec, &lookup) {
+        match llm::hosts::provider(spec, &lookup) {
             Ok((provider, id)) => Ok(Model {
                 provider,
                 id,

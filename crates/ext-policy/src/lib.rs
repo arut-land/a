@@ -9,7 +9,10 @@
 //! a call the floor asks about or denies run unasked.
 
 use ext::point::{Approve, Permission as PermissionPoint, ToolUse};
-use ext::{Answer, Args, Cx, Extension, Fold, Later, PointCx, Registrar, Side, Tool};
+use ext::{
+    Answer, Args, Configured, Cx, Extension, Fold, Later, PointCx, Refused, Registrar, Side, Table,
+    Tool,
+};
 use protocol::{Audience, Permission};
 use serde::{Deserialize, Serialize};
 
@@ -96,6 +99,25 @@ impl Policy {
     }
 }
 
+/// `[ext.policy]`: `mode`, `ask` and `edits`.
+impl Configured for Policy {
+    fn configure(table: &impl Table) -> Result<Self, Refused> {
+        let default = Self::ask(&[]);
+        let mode = match table.text("mode")? {
+            Some(name) => Mode::named(name)
+                .ok_or_else(|| Refused(format!("ext.policy.mode: no mode {name}")))?,
+            None => default.mode,
+        };
+        Ok(Self {
+            ask: table.list("ask")?.map_or(default.ask, <[String]>::to_vec),
+            edits: table
+                .list("edits")?
+                .map_or(default.edits, <[String]>::to_vec),
+            mode,
+        })
+    }
+}
+
 impl Extension for Policy {
     const NAME: &'static str = "policy";
     const VERSION: u32 = 2;
@@ -129,7 +151,7 @@ impl Tool for SetMode {
     const DESCRIPTION: &'static str = "show or set how calls are approved";
     const AUDIENCE: Audience = Audience::User;
 
-    fn call(&self, Args { args }: &Args, cx: &Cx) -> Result<Moded, String> {
+    async fn call(&self, Args { args }: &Args, cx: &Cx) -> Result<Moded, String> {
         let args = args.trim();
         if args.is_empty() {
             let mode = cx.state(|m: &ModeState| m.0).unwrap_or(self.0);
@@ -139,7 +161,7 @@ impl Tool for SetMode {
             let names: Vec<_> = Mode::ALL.iter().map(|m| m.name()).collect();
             format!("no mode {args}: one of {}", names.join(", "))
         })?;
-        cx.update::<ModeState>(mode);
+        cx.update::<ModeState>(&mode).await;
         Ok(Moded { mode })
     }
 }

@@ -10,10 +10,11 @@
 //! | [`PreTool`] | replacement chain over the input; the first block wins |
 //! | [`Permission`] | the most restrictive wins: deny > defer > ask > allow |
 //! | [`Approve`] | the first answer wins |
-//! | [`Spawn`] | replacement chain over every process a tool starts |
+//! | [`Spawn`] | replacement chain over every process a tool starts; the first refusal wins |
 //! | [`PostTool`] | replacement chain over the outcome |
 //! | [`OnStop`] | the first continuation wins |
-//! | [`Observe`], [`SessionStart`], [`SessionEnd`] | every handler is told, and changes nothing |
+//! | [`Observe`] | every handler is told, and may react with work of its own |
+//! | [`SessionStart`], [`SessionEnd`] | every handler is told, and changes nothing |
 //! | [`Turn`], [`Reply`] | replacement chain over what the loop does next |
 //! | [`Resume`] | the first answer wins; with none, the loop goes on |
 //!
@@ -27,21 +28,30 @@
 //! registration order, each given a [`PointCx`]. A handler at a
 //! first-answer point whose answer is an [`Answer`] may answer later: the
 //! merge stops at it, and goes on from the handler after it if what comes
-//! is no answer. What changed is reported
-//! as [`Verdict`]s, which the engine logs under the extension's name;
-//! `spawn` rewrites are not logged, as they follow from configuration
-//! rather than from what happened.
+//! is no answer. What changed is reported as [`Verdict`]s, which the
+//! engine logs under the extension's name; `spawn` rewrites are not
+//! logged, as they follow from configuration rather than from what
+//! happened.
+//!
+//! A handler that panics is an extension's failure, never the session's:
+//! the rule catches it and answers for it as the point's [`OnError`] says,
+//! so the policy a point declares is the one applied, at every call,
+//! wherever the point is asked. The points are a closed set, declared
+//! once by [`points!`], which also makes the [`Hooks`] table that holds
+//! their handlers: a point cannot be added without its slot.
 
-use std::any::{Any, TypeId};
+use std::any::Any;
 use std::convert::Infallible;
 use std::fmt;
-use std::future::Future;
+use std::future::{Future, poll_fn};
+use std::panic::{AssertUnwindSafe, catch_unwind};
 use std::path::Path;
 use std::pin::Pin;
 use std::sync::Arc;
+use std::task::Poll;
 use std::time::Duration;
 
-use protocol::{Entry, Json, Outcome, SessionId, Verdict};
+use protocol::{CallId, Entry, Json, Outcome, SessionId, Verdict};
 use serde::Serialize;
 use serde::de::DeserializeOwned;
 
@@ -63,7 +73,7 @@ pub enum Merge {
 }
 
 /// What a handler that fails (panics) at a point comes to: declared by
-/// every point, applied by the engine.
+/// every point, applied by its rule.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum OnError {
     /// It is passed over: what it would have changed stays as it was.
@@ -73,8 +83,24 @@ pub enum OnError {
     FailClosed,
 }
 
+mod sealed {
+    use super::{Handler, Hooked, Hooks, Point};
+    use crate::Name;
+
+    /// Implemented by [`points!`](super::points) alone: every point has a
+    /// slot in [`Hooks`], and nothing outside this module is a point.
+    pub trait Sealed: Sized {
+        fn hook(handler: Handler<Self>) -> Hooked
+        where
+            Self: Point;
+        fn slot(hooks: &Hooks) -> &[(Name, Handler<Self>)]
+        where
+            Self: Point;
+    }
+}
+
 /// A decision point.
-pub trait Point: Sized + 'static {
+pub trait Point: sealed::Sealed + Sized + 'static {
     /// The point's name, as an [`ErasedHandler`] gives it.
     const NAME: &'static str;
     /// What a handler that fails here comes to.
@@ -92,6 +118,32 @@ pub trait Point: Sized + 'static {
     const MERGE: Merge = <Self::Out as Rule>::MERGE;
 
     fn input<'a, 'b: 'a>(facts: Self::Facts<'b>, subject: &'a Subject<Self>) -> Self::In<'a>;
+
+    /// The answer of a handler that panicked, saying `why`: the point's
+    /// [`Point::ON_ERROR`] applied.
+    fn failed(why: String) -> Self::Out;
+
+    /// What `handler`, extension `name`'s, answers to `input`; its panic
+    /// is the point's failure answer.
+    fn call(
+        name: &Name,
+        handler: &Handler<Self>,
+        cx: &Self::Cx<'_>,
+        input: Self::In<'_>,
+    ) -> Self::Out {
+        catch_unwind(AssertUnwindSafe(|| handler(cx, input)))
+            .unwrap_or_else(|panic| Self::failed(format!("{name} {}", panicked(&*panic))))
+    }
+}
+
+/// What a panic says.
+pub(crate) fn panicked(panic: &(dyn Any + Send)) -> String {
+    let message = panic
+        .downcast_ref::<String>()
+        .map(String::as_str)
+        .or_else(|| panic.downcast_ref::<&str>().copied())
+        .unwrap_or("unknown panic");
+    format!("panicked: {message}")
 }
 
 /// What a point's handlers rewrite: `()` but under [`Merge::Chain`].
@@ -112,11 +164,15 @@ pub type Handler<P> = Arc<
 /// - [`Rewrite`] chains,
 /// - `Option` is a first answer,
 /// - a [`protocol::Permission`] is ranked,
-/// - `()` observes.
+/// - `()` and [`Reaction`] observe.
 pub trait Rule: Sized + 'static {
     const MERGE: Merge;
     type Subject;
     type Merged;
+
+    /// The answer of a handler that did not answer: what a failure at an
+    /// [`OnError::FailOpen`] point comes to.
+    fn open() -> Self;
 
     /// Merges what `handlers` answer, telling `replaced` of each
     /// replacement of the subject with what it replaced.
@@ -128,6 +184,13 @@ pub trait Rule: Sized + 'static {
         subject: &mut Self::Subject,
         replaced: &mut Replaced<'_, Self::Subject>,
     ) -> Self::Merged;
+}
+
+/// An answer that can refuse: what a failure at an [`OnError::FailClosed`]
+/// point comes to. A point declared to fail closed whose answer has no
+/// refusal does not compile.
+pub trait Closed: Rule {
+    fn closed(why: String) -> Self;
 }
 
 /// An answer in a replacement chain. A chain that cannot be stopped has
@@ -146,6 +209,10 @@ impl<T: 'static, S: 'static> Rule for Rewrite<T, S> {
     /// `Err` is who stopped the chain, and why.
     type Merged = Result<(), (Name, S)>;
 
+    fn open() -> Self {
+        Self::Pass
+    }
+
     fn merge<P: Point<Out = Self>>(
         handlers: &[(Name, Handler<P>)],
         cx: &P::Cx<'_>,
@@ -154,7 +221,7 @@ impl<T: 'static, S: 'static> Rule for Rewrite<T, S> {
         replaced: &mut Replaced<'_, T>,
     ) -> Self::Merged {
         for (name, handler) in handlers {
-            match handler(cx, P::input(facts, subject)) {
+            match P::call(name, handler, cx, P::input(facts, subject)) {
                 Rewrite::Pass => {}
                 Rewrite::Replace(next) => {
                     let before = std::mem::replace(subject, next);
@@ -167,11 +234,21 @@ impl<T: 'static, S: 'static> Rule for Rewrite<T, S> {
     }
 }
 
+impl<T: 'static> Closed for Rewrite<T, String> {
+    fn closed(why: String) -> Self {
+        Self::Stop(why)
+    }
+}
+
 impl<T: 'static> Rule for Option<T> {
     const MERGE: Merge = Merge::FirstSome;
     type Subject = ();
     /// The first answer, and who gave it.
     type Merged = Option<(Name, T)>;
+
+    fn open() -> Self {
+        None
+    }
 
     fn merge<P: Point<Out = Self>>(
         handlers: &[(Name, Handler<P>)],
@@ -181,7 +258,8 @@ impl<T: 'static> Rule for Option<T> {
         _: &mut Replaced<'_, ()>,
     ) -> Self::Merged {
         handlers.iter().find_map(|(name, handler)| {
-            Some((Name::clone(name), handler(cx, P::input(facts, &()))?))
+            let answer = P::call(name, handler, cx, P::input(facts, &()))?;
+            Some((Name::clone(name), answer))
         })
     }
 }
@@ -215,10 +293,14 @@ impl<T> Asked<T> {
     }
 }
 
-impl<T: 'static> Rule for Answer<Option<T>> {
+impl<T: Send + 'static> Rule for Answer<Option<T>> {
     const MERGE: Merge = Merge::FirstSome;
     type Subject = ();
     type Merged = Asked<T>;
+
+    fn open() -> Self {
+        Self::Now(None)
+    }
 
     fn merge<P: Point<Out = Self>>(
         handlers: &[(Name, Handler<P>)],
@@ -228,16 +310,43 @@ impl<T: 'static> Rule for Answer<Option<T>> {
         _: &mut Replaced<'_, ()>,
     ) -> Asked<T> {
         for (at, (name, handler)) in handlers.iter().enumerate() {
-            match handler(cx, P::input(facts, &())) {
+            match P::call(name, handler, cx, P::input(facts, &())) {
                 Answer::Now(None) => {}
                 Answer::Now(Some(answer)) => return Asked::Now(Name::clone(name), answer),
                 Answer::Later(answer) => {
                     let by = Name::clone(name);
+                    let answer = Later::new(guarded::<P, T>(Name::clone(&by), answer));
                     return Asked::Later { by, at, answer };
                 }
             }
         }
         Asked::None
+    }
+}
+
+/// `later`, handler `by`'s, its panic made the point's failure answer as
+/// a handler's own is.
+async fn guarded<P, T>(by: Name, mut later: Later<Option<T>>) -> Option<T>
+where
+    P: Point<Out = Answer<Option<T>>>,
+    T: Send + 'static,
+{
+    let caught = poll_fn(
+        |cx| match catch_unwind(AssertUnwindSafe(|| later.0.as_mut().poll(cx))) {
+            Ok(poll) => poll.map(Ok),
+            Err(panic) => Poll::Ready(Err(panicked(&*panic))),
+        },
+    )
+    .await;
+    caught.unwrap_or_else(|why| match P::failed(format!("{by} {why}")) {
+        Answer::Now(answer) => answer,
+        Answer::Later(_) => None,
+    })
+}
+
+impl Closed for Answer<Option<bool>> {
+    fn closed(_: String) -> Self {
+        Self::Now(Some(false))
     }
 }
 
@@ -248,6 +357,10 @@ impl Rule for protocol::Permission {
     /// allowed.
     type Merged = Option<(Name, Self)>;
 
+    fn open() -> Self {
+        Self::Allow
+    }
+
     fn merge<P: Point<Out = Self>>(
         handlers: &[(Name, Handler<P>)],
         cx: &P::Cx<'_>,
@@ -257,10 +370,16 @@ impl Rule for protocol::Permission {
     ) -> Self::Merged {
         handlers
             .iter()
-            .map(|(name, handler)| (name, handler(cx, P::input(facts, &()))))
+            .map(|(name, handler)| (name, P::call(name, handler, cx, P::input(facts, &()))))
             .filter(|(_, level)| *level > Self::Allow)
             .reduce(|most, next| if next.1 > most.1 { next } else { most })
             .map(|(name, level)| (Name::clone(name), level))
+    }
+}
+
+impl Closed for protocol::Permission {
+    fn closed(_: String) -> Self {
+        Self::Deny
     }
 }
 
@@ -269,6 +388,8 @@ impl Rule for () {
     type Subject = ();
     type Merged = ();
 
+    fn open() -> Self {}
+
     fn merge<P: Point<Out = Self>>(
         handlers: &[(Name, Handler<P>)],
         cx: &P::Cx<'_>,
@@ -276,9 +397,46 @@ impl Rule for () {
         (): &mut (),
         _: &mut Replaced<'_, ()>,
     ) {
-        for (_, handler) in handlers {
-            handler(cx, P::input(facts, &()));
+        for (name, handler) in handlers {
+            P::call(name, handler, cx, P::input(facts, &()));
         }
+    }
+}
+
+/// An observer's answer: nothing, or work to do about what it saw, which
+/// the engine runs owned by the session (a side model request, say) and
+/// ends with it. An observer changes nothing itself.
+pub struct Reaction(pub Option<Later<()>>);
+
+impl Reaction {
+    pub const NONE: Self = Self(None);
+
+    pub fn later(work: impl Future<Output = ()> + Send + 'static) -> Self {
+        Self(Some(Later::new(work)))
+    }
+}
+
+impl Rule for Reaction {
+    const MERGE: Merge = Merge::Observe;
+    type Subject = ();
+    /// What the handlers do about it, in their order.
+    type Merged = Vec<Later<()>>;
+
+    fn open() -> Self {
+        Self::NONE
+    }
+
+    fn merge<P: Point<Out = Self>>(
+        handlers: &[(Name, Handler<P>)],
+        cx: &P::Cx<'_>,
+        facts: P::Facts<'_>,
+        (): &mut (),
+        _: &mut Replaced<'_, ()>,
+    ) -> Self::Merged {
+        handlers
+            .iter()
+            .filter_map(|(name, handler)| P::call(name, handler, cx, P::input(facts, &())).0)
+            .collect()
     }
 }
 
@@ -288,27 +446,34 @@ pub struct PointCx<'a> {
     pub session: SessionId,
     pub workspace: &'a Path,
     /// The call: the seq of its intent.
-    pub call: Option<u64>,
+    pub call: Option<CallId>,
     view: &'a dyn View,
 }
 
 /// The engine's side of a [`PointCx`], read only when a handler asks.
 pub trait View: Sync {
+    fn session(&self) -> SessionId;
+    fn workspace(&self) -> &Path;
     /// The model the session talks to, as `host:model`.
     fn model(&self) -> String;
     fn states(&self, read: &mut dyn FnMut(&States));
+    /// The environment the session's commands run in, if a client gave
+    /// one.
+    fn env(&self) -> Option<Arc<protocol::Environment>> {
+        None
+    }
     /// What call `call` runs with, owned, for work its handler answers
     /// later with.
-    fn cx(&self, _call: u64) -> Option<Cx> {
+    fn cx(&self, _call: CallId) -> Option<Cx> {
         None
     }
 }
 
 impl<'a> PointCx<'a> {
-    pub fn new(session: SessionId, workspace: &'a Path, view: &'a dyn View) -> Self {
+    pub fn new(view: &'a dyn View) -> Self {
         Self {
-            session,
-            workspace,
+            session: view.session(),
+            workspace: view.workspace(),
             call: None,
             view,
         }
@@ -316,7 +481,7 @@ impl<'a> PointCx<'a> {
 
     /// The same, about call `call`.
     #[must_use]
-    pub fn about(self, call: u64) -> Self {
+    pub fn about(self, call: CallId) -> Self {
         Self {
             call: Some(call),
             ..self
@@ -377,200 +542,6 @@ pub enum Recover {
     Resend,
 }
 
-/// Declares a point whose handlers read its facts as they are.
-macro_rules! point {
-    ($(#[$doc:meta])* $point:ident = $name:literal, $on_error:ident, $facts:ty, $out:ty) => {
-        $(#[$doc])*
-        pub struct $point;
-
-        impl Point for $point {
-            const NAME: &'static str = $name;
-            const ON_ERROR: OnError = OnError::$on_error;
-            type Cx<'c> = PointCx<'c>;
-            type Facts<'a> = $facts;
-            type In<'a> = $facts;
-            type Out = $out;
-
-            fn input<'a, 'b: 'a>(facts: Self::Facts<'b>, (): &'a ()) -> Self::In<'a> {
-                facts
-            }
-        }
-    };
-}
-
-/// What becomes of the user's input before it is logged: a rejection
-/// refuses it, and its client is told why.
-pub struct Input;
-
-impl Point for Input {
-    const NAME: &'static str = "input";
-    const ON_ERROR: OnError = OnError::FailClosed;
-    type Cx<'c> = PointCx<'c>;
-    type Facts<'a> = ();
-    type In<'a> = &'a str;
-    type Out = Rewrite<String, String>;
-
-    fn input<'a, 'b: 'a>((): (), text: &'a String) -> &'a str {
-        text
-    }
-}
-
-point!(
-    /// How to recover from a failed model request: send it again later, or
-    /// a new one at once. With no answer the call fails. A handler may
-    /// answer later, after a side model request, say: the call waits
-    /// meanwhile, and an interrupt ends it.
-    RequestError = "request_error",
-    FailOpen,
-    Failed<'a>,
-    Answer<Option<Recover>>
-);
-
-/// The request of a model call, about to be sent: a handler may rewrite it
-/// (a model fallback, a reminder appended at the tail) or answer it itself
-/// (a fixture, a cache), with a reply or an error (a request too large
-/// to send fails as an overflow before it costs anything). Each rewrite
-/// is logged as `prepare_step`, and an answer as the call's outcome.
-pub struct Step;
-
-impl Point for Step {
-    const NAME: &'static str = "step";
-    const ON_ERROR: OnError = OnError::FailOpen;
-    type Cx<'c> = PointCx<'c>;
-    type Facts<'a> = ();
-    type In<'a> = &'a llm::Request;
-    type Out = Rewrite<llm::Request, Result<llm::Response, llm::Error>>;
-
-    fn input<'a, 'b: 'a>((): (), request: &'a llm::Request) -> &'a llm::Request {
-        request
-    }
-}
-
-/// What a tool call runs with: a replacement input, or a block that
-/// answers the call with why instead of running it.
-pub struct PreTool;
-
-impl Point for PreTool {
-    const NAME: &'static str = "pre_tool";
-    const ON_ERROR: OnError = OnError::FailClosed;
-    type Cx<'c> = PointCx<'c>;
-    type Facts<'a> = &'a str;
-    type In<'a> = ToolUse<'a>;
-    type Out = Rewrite<Json, String>;
-
-    fn input<'a, 'b: 'a>(tool: &'b str, input: &'a Json) -> ToolUse<'a> {
-        ToolUse { tool, input }
-    }
-}
-
-point!(
-    /// Whether a call may run.
-    Permission = "permission",
-    FailClosed,
-    ToolUse<'a>,
-    protocol::Permission
-);
-point!(
-    /// Answers a permission `ask`. An ask no handler answers goes to the
-    /// user, durably: see [`Gate::Ask`]. A handler may answer later, after
-    /// a side model request, say: the call waits meanwhile.
-    Approve = "approve",
-    FailClosed,
-    ToolUse<'a>,
-    Answer<Option<bool>>
-);
-
-/// A replacement for a process a tool is about to start.
-pub struct Spawn;
-
-/// A panicking handler refuses the process: one a sandbox would have
-/// wrapped is never started bare.
-impl Point for Spawn {
-    const NAME: &'static str = "spawn";
-    const ON_ERROR: OnError = OnError::FailClosed;
-    type Cx<'c> = PointCx<'c>;
-    type Facts<'a> = ();
-    type In<'a> = &'a crate::SpawnSpec;
-    type Out = Rewrite<crate::SpawnSpec>;
-
-    fn input<'a, 'b: 'a>((): (), spawn: &'a crate::SpawnSpec) -> &'a crate::SpawnSpec {
-        spawn
-    }
-}
-
-/// A replacement for a call's outcome, before it is committed.
-pub struct PostTool;
-
-impl Point for PostTool {
-    const NAME: &'static str = "post_tool";
-    const ON_ERROR: OnError = OnError::FailOpen;
-    type Cx<'c> = PointCx<'c>;
-    type Facts<'a> = ToolUse<'a>;
-    type In<'a> = Finished<'a>;
-    type Out = Rewrite<Outcome>;
-
-    fn input<'a, 'b: 'a>(call: ToolUse<'b>, outcome: &'a Outcome) -> Finished<'a> {
-        Finished {
-            tool: call.tool,
-            input: call.input,
-            outcome,
-        }
-    }
-}
-
-point!(
-    /// Text to continue with once the agent stopped. A handler that reads
-    /// the session's log folds what it needs of it as typed state.
-    OnStop = "on_stop",
-    FailOpen,
-    (),
-    Option<String>
-);
-point!(
-    /// Each entry, once committed.
-    Observe = "observe",
-    FailOpen,
-    &'a Entry,
-    ()
-);
-point!(
-    /// The session's actor started: it was created, or loaded again.
-    SessionStart = "session_start",
-    FailOpen,
-    (),
-    ()
-);
-point!(
-    /// The session's actor stopped: it hibernated, or the daemon drained.
-    SessionEnd = "session_end",
-    FailOpen,
-    (),
-    ()
-);
-
-/// What an input starts, as the default loop asks: one model call unless
-/// a handler says otherwise (a planner, a plan mode, a command answered
-/// without the model).
-pub struct Turn;
-
-impl Point for Turn {
-    const NAME: &'static str = "turn";
-    const ON_ERROR: OnError = OnError::FailOpen;
-    type Cx<'c> = ();
-    type Facts<'a> = &'a crate::Input;
-    type In<'a> = (&'a crate::Input, &'a Actions);
-    type Out = Rewrite<Actions>;
-
-    fn input<'a, 'b: 'a>(input: &'b crate::Input, actions: &'a Actions) -> Self::In<'a> {
-        (input, actions)
-    }
-}
-
-/// What the model's reply becomes, as the default loop asks: a call per
-/// tool call unless a handler says otherwise (sequential calls only, a
-/// dedupe, a refusal).
-pub struct Reply;
-
 /// A model's reply at a step of the loop, as [`Reply`] handlers see it.
 #[derive(Clone, Copy, Debug)]
 pub struct Replied<'a> {
@@ -581,41 +552,209 @@ pub struct Replied<'a> {
     pub actions: &'a Actions,
 }
 
-impl Point for Reply {
-    const NAME: &'static str = "reply";
-    const ON_ERROR: OnError = OnError::FailOpen;
-    type Cx<'c> = ();
-    type Facts<'a> = (u16, &'a llm::Response);
-    type In<'a> = Replied<'a>;
-    type Out = Rewrite<Actions>;
+fn pre_tool<'a, 'b: 'a>(tool: &'b str, input: &'a Json) -> ToolUse<'a> {
+    ToolUse { tool, input }
+}
 
-    fn input<'a, 'b: 'a>(
-        (step, reply): (u16, &'b llm::Response),
-        actions: &'a Actions,
-    ) -> Replied<'a> {
-        Replied {
-            step,
-            reply,
-            actions,
-        }
+fn post_tool<'a, 'b: 'a>(call: ToolUse<'b>, outcome: &'a Outcome) -> Finished<'a> {
+    Finished {
+        tool: call.tool,
+        input: call.input,
+        outcome,
     }
 }
 
-/// What follows once every call of a step's reply is answered, as the
-/// default loop asks: with no answer, another model call.
-pub struct Resume;
+fn turn<'a, 'b: 'a>(
+    input: &'b crate::Input,
+    actions: &'a Actions,
+) -> (&'a crate::Input, &'a Actions) {
+    (input, actions)
+}
 
-impl Point for Resume {
-    const NAME: &'static str = "resume";
-    const ON_ERROR: OnError = OnError::FailOpen;
-    type Cx<'c> = ();
-    type Facts<'a> = u16;
-    type In<'a> = u16;
-    type Out = Option<crate::Resume>;
-
-    fn input<'a, 'b: 'a>(step: u16, (): &'a ()) -> u16 {
-        step
+fn reply<'a, 'b: 'a>((step, reply): (u16, &'b llm::Response), actions: &'a Actions) -> Replied<'a> {
+    Replied {
+        step,
+        reply,
+        actions,
     }
+}
+
+/// Declares the points, in one table: each one's name, whether it takes
+/// erased handlers (`wire`), what a failing handler comes to, what its
+/// handlers are given (their context, the facts, what they read) and what
+/// they answer; and, for one whose handlers read the facts and the subject
+/// together, how. From the same rows come [`Hooks`], with a slot per
+/// point, and the table of erased points.
+macro_rules! points {
+    ($(
+        $(#[$doc:meta])*
+        $Point:ident($slot:ident) = $name:literal, $wire:tt, $on_error:ident,
+        $cx:ty, $facts:ty, $in:ty, $out:ty $(, $read:path)?;
+    )*) => {
+        $(
+            $(#[$doc])*
+            pub struct $Point;
+
+            impl sealed::Sealed for $Point {
+                fn hook(handler: Handler<Self>) -> Hooked {
+                    Hooked::$Point(handler)
+                }
+
+                fn slot(hooks: &Hooks) -> &[(Name, Handler<Self>)] {
+                    &hooks.$slot
+                }
+            }
+
+            impl Point for $Point {
+                const NAME: &'static str = $name;
+                const ON_ERROR: OnError = OnError::$on_error;
+                type Cx<'c> = $cx;
+                type Facts<'a> = $facts;
+                type In<'a> = $in;
+                type Out = $out;
+
+                fn input<'a, 'b: 'a>(
+                    facts: Self::Facts<'b>,
+                    subject: &'a Subject<Self>,
+                ) -> Self::In<'a> {
+                    points!(@read facts, subject $(, $read)?)
+                }
+
+                fn failed(why: String) -> Self::Out {
+                    points!(@failed $on_error, why)
+                }
+            }
+        )*
+
+        /// The handlers at each point, in the order they run, each with
+        /// its extension's name, as a [`Registry`](crate::host::Registry)
+        /// resolves them. The default, none, allows everything.
+        #[derive(Default)]
+        pub struct Hooks {
+            $( $slot: Vec<(Name, Handler<$Point>)>, )*
+        }
+
+        /// One handler as an extension registered it, waiting for its
+        /// slot.
+        #[doc(hidden)]
+        pub enum Hooked {
+            $( $Point(Handler<$Point>), )*
+        }
+
+        impl Hooks {
+            pub(crate) fn add(&mut self, name: &Name, hooked: &Hooked) {
+                match hooked {
+                    $( Hooked::$Point(handler) => {
+                        self.$slot.push((Name::clone(name), Arc::clone(handler)));
+                    } )*
+                }
+            }
+        }
+
+        /// Every point by name, and how an erased handler adapts to it,
+        /// for the points that take one.
+        pub(crate) const ERASED: &[(&str, Option<Adapt>)] = &[
+            $( ($name, points!(@wire $wire, $Point)), )*
+        ];
+    };
+    (@read $facts:ident, $subject:ident) => {{
+        let _ = $subject;
+        $facts
+    }};
+    (@read $facts:ident, $subject:ident, $read:path) => {
+        $read($facts, $subject)
+    };
+    (@failed FailOpen, $why:ident) => {{
+        let _ = $why;
+        <Self::Out as Rule>::open()
+    }};
+    (@failed FailClosed, $why:ident) => {
+        <Self::Out as Closed>::closed($why)
+    };
+    (@wire wire, $Point:ident) => {
+        Some(adapt::<$Point>)
+    };
+    (@wire -, $Point:ident) => {
+        None
+    };
+}
+
+points! {
+    /// What becomes of the user's input before it is logged: a rejection
+    /// refuses it, and its client is told why.
+    Input(input) = "input", wire, FailClosed,
+        PointCx<'c>, (), &'a str, Rewrite<String, String>, text;
+    /// The request of a model call, about to be sent: a handler may
+    /// rewrite it (a model fallback, a reminder appended at the tail) or
+    /// answer it itself (a fixture, a cache), with a reply or an error (a
+    /// request too large to send fails as an overflow before it costs
+    /// anything). Each rewrite is logged as `prepare_step`, and an answer
+    /// as the call's outcome.
+    Step(step) = "step", -, FailOpen,
+        PointCx<'c>, (), &'a llm::Request, Rewrite<llm::Request, Stepped>, same;
+    /// How to recover from a failed model request: send it again later, or
+    /// a new one at once. With no answer the call fails. A handler may
+    /// answer later, after a side model request, say: the call waits
+    /// meanwhile, and an interrupt ends it.
+    RequestError(request_error) = "request_error", -, FailOpen,
+        PointCx<'c>, Failed<'a>, Failed<'a>, Answer<Option<Recover>>;
+    /// What a tool call runs with: a replacement input, or a block that
+    /// answers the call with why instead of running it.
+    PreTool(pre_tool) = "pre_tool", wire, FailClosed,
+        PointCx<'c>, &'a str, ToolUse<'a>, Rewrite<Json, String>, pre_tool;
+    /// Whether a call may run.
+    Permission(permission) = "permission", wire, FailClosed,
+        PointCx<'c>, ToolUse<'a>, ToolUse<'a>, protocol::Permission;
+    /// Answers a permission `ask`. An ask no handler answers goes to the
+    /// user, durably: see [`Gate::Ask`]. A handler may answer later, after
+    /// a side model request, say: the call waits meanwhile.
+    Approve(approve) = "approve", wire, FailClosed,
+        PointCx<'c>, ToolUse<'a>, ToolUse<'a>, Answer<Option<bool>>;
+    /// A replacement for a process a tool is about to start, or a refusal
+    /// to start it: a sandbox that cannot wrap a process never lets it run
+    /// bare, so a handler that fails refuses it too.
+    Spawn(spawn) = "spawn", -, FailClosed,
+        PointCx<'c>, (), &'a crate::SpawnSpec, Rewrite<crate::SpawnSpec, String>, same;
+    /// A replacement for a call's outcome, before it is committed.
+    PostTool(post_tool) = "post_tool", -, FailOpen,
+        PointCx<'c>, ToolUse<'a>, Finished<'a>, Rewrite<Outcome>, post_tool;
+    /// Text to continue with once the agent stopped. A handler that reads
+    /// the session's log folds what it needs of it as typed state.
+    OnStop(on_stop) = "on_stop", wire, FailOpen,
+        PointCx<'c>, (), (), Option<String>;
+    /// Each entry, once committed; about the call an intent names. A
+    /// handler reacts with work the engine runs owned by the session.
+    Observe(observe) = "observe", wire, FailOpen,
+        PointCx<'c>, &'a Entry, &'a Entry, Reaction;
+    /// The session's actor started: it was created, or loaded again.
+    SessionStart(session_start) = "session_start", -, FailOpen,
+        PointCx<'c>, (), (), ();
+    /// The session's actor stopped: it hibernated, or the daemon drained.
+    SessionEnd(session_end) = "session_end", -, FailOpen,
+        PointCx<'c>, (), (), ();
+    /// What an input starts, as the default loop asks: one model call
+    /// unless a handler says otherwise (a planner, a plan mode, a command
+    /// answered without the model).
+    Turn(turn) = "turn", -, FailOpen,
+        (), &'a crate::Input, (&'a crate::Input, &'a Actions), Rewrite<Actions>, turn;
+    /// What the model's reply becomes, as the default loop asks: a call
+    /// per tool call unless a handler says otherwise (sequential calls
+    /// only, a dedupe, a refusal).
+    Reply(reply) = "reply", -, FailOpen,
+        (), (u16, &'a llm::Response), Replied<'a>, Rewrite<Actions>, reply;
+    /// What follows once every call of a step's reply is answered, as the
+    /// default loop asks: with no answer, another model call.
+    Resume(resume) = "resume", -, FailOpen,
+        (), u16, u16, Option<crate::Resume>;
+}
+
+/// The subject of a chain whose handlers read it alone.
+fn same<T>((): (), subject: &T) -> &T {
+    subject
+}
+
+fn text((): (), text: &String) -> &str {
+    text
 }
 
 /// A handler over JSON text: what a Lua mod, a WASM component or an
@@ -694,7 +833,9 @@ impl Wire for Observe {
         encode(entry)
     }
 
-    fn from_json(_: &Json) {}
+    fn from_json(_: &Json) -> Reaction {
+        Reaction::NONE
+    }
 }
 
 /// A chain answer from JSON; one it cannot read passes.
@@ -716,48 +857,18 @@ fn rewrite<T: DeserializeOwned>(answer: &Json) -> Rewrite<T, String> {
     }
 }
 
-/// The points that take erased handlers, and how to adapt one to each.
 /// Adapts an erased handler to its point.
 type Adapt = fn(Arc<dyn ErasedHandler>) -> Hooked;
-
-pub(crate) const ERASED: &[(&str, Adapt)] = &[
-    (Input::NAME, adapt::<Input>),
-    (PreTool::NAME, adapt::<PreTool>),
-    (Permission::NAME, adapt::<Permission>),
-    (Approve::NAME, adapt::<Approve>),
-    (OnStop::NAME, adapt::<OnStop>),
-    (Observe::NAME, adapt::<Observe>),
-];
 
 fn adapt<P: Wire>(erased: Arc<dyn ErasedHandler>) -> Hooked {
     let handler: Handler<P> =
         Arc::new(move |cx, input| P::from_json(&erased.on(cx, &P::to_json(&input))));
-    Hooked::of::<P>(handler)
-}
-
-/// One handler as an extension registered it, waiting to be grouped with
-/// the others at its point.
-pub(crate) struct Hooked {
-    point: TypeId,
-    handler: Box<dyn Any + Send + Sync>,
-    group: fn() -> Box<dyn Any + Send + Sync>,
-    add: fn(&mut (dyn Any + Send + Sync), Name, &(dyn Any + Send + Sync)),
+    P::hook(handler)
 }
 
 impl Hooked {
-    pub fn of<P: Point>(handler: Handler<P>) -> Self {
-        Self {
-            point: TypeId::of::<P>(),
-            handler: Box::new(handler),
-            group: || Box::new(Vec::<(Name, Handler<P>)>::new()),
-            add: |group, name, handler| {
-                let group = group.downcast_mut::<Vec<(Name, Handler<P>)>>();
-                let handler = handler.downcast_ref::<Handler<P>>();
-                if let (Some(group), Some(handler)) = (group, handler) {
-                    group.push((name, Arc::clone(handler)));
-                }
-            },
-        }
+    pub(crate) fn of<P: Point>(handler: Handler<P>) -> Self {
+        P::hook(handler)
     }
 }
 
@@ -898,30 +1009,9 @@ pub enum Gate {
     Refuse(String),
 }
 
-/// The handlers at each point, in the order they run, each with its
-/// extension's name, as a [`Registry`](crate::host::Registry) resolves
-/// them. Grouped by point as they install, so a point with no handler
-/// costs a lookup in a list of the points that have some. The default,
-/// none, allows everything.
-#[derive(Default)]
-pub struct Hooks(Vec<(TypeId, Box<dyn Any + Send + Sync>)>);
-
 impl Hooks {
-    pub(crate) fn add(&mut self, name: &Name, hooked: &Hooked) {
-        let found = self.0.iter().position(|(point, _)| *point == hooked.point);
-        let at = found.unwrap_or_else(|| {
-            self.0.push((hooked.point, (hooked.group)()));
-            self.0.len() - 1
-        });
-        (hooked.add)(&mut *self.0[at].1, Name::clone(name), &*hooked.handler);
-    }
-
     fn handlers<P: Point>(&self) -> &[(Name, Handler<P>)] {
-        self.0
-            .iter()
-            .find(|(point, _)| *point == TypeId::of::<P>())
-            .and_then(|(_, group)| group.downcast_ref::<Vec<(Name, Handler<P>)>>())
-            .map_or(&[], Vec::as_slice)
+        P::slot(self)
     }
 
     /// Merges what the handlers at `P` answer, by `P`'s rule.
@@ -991,11 +1081,14 @@ impl Hooks {
         (decisions, answered.err())
     }
 
-    /// `spawn` as the `spawn` chain leaves it. A handler that panics takes
-    /// the call that asked down with it, before its process starts: the
-    /// engine contains the call, which fails ([`Spawn::ON_ERROR`]).
-    pub fn spawn(&self, cx: &PointCx<'_>, spawn: &mut crate::SpawnSpec) {
-        let Ok(()) = self.run::<Spawn>(cx, (), spawn, &mut |_, _, _| {});
+    /// `spawn` as the `spawn` chain leaves it; `Err` is who refused the
+    /// process, and why.
+    pub fn spawn(
+        &self,
+        cx: &PointCx<'_>,
+        spawn: &mut crate::SpawnSpec,
+    ) -> Result<(), (Name, String)> {
+        self.run::<Spawn>(cx, (), spawn, &mut |_, _, _| {})
     }
 
     pub fn session_start(&self, cx: &PointCx<'_>) {
@@ -1085,7 +1178,7 @@ impl Hooks {
 
     /// The answer at a first-answer point whose handlers may answer later,
     /// from its `from`th handler on.
-    fn ask_from<P: Point<Out = Answer<Option<T>>>, T: 'static>(
+    fn ask_from<P: Point<Out = Answer<Option<T>>>, T: Send + 'static>(
         &self,
         cx: &P::Cx<'_>,
         facts: P::Facts<'_>,
@@ -1119,8 +1212,22 @@ impl Hooks {
         self.ask::<OnStop>(cx, ())
     }
 
-    pub fn observe(&self, cx: &PointCx<'_>, entry: &Entry) {
-        self.ask::<Observe>(cx, entry);
+    /// Tells every observer of `entry`, about the call it is the intent
+    /// of, if one: what they do about it, for the engine to run owned by
+    /// the session.
+    pub fn observe(&self, cx: PointCx<'_>, entry: &Entry) -> Vec<Later<()>> {
+        if self.observe.is_empty() {
+            return Vec::new();
+        }
+        let intent = matches!(
+            entry.body,
+            protocol::Body::ToolCall { .. } | protocol::Body::ModelCall { .. }
+        );
+        let cx = match CallId::new(entry.seq) {
+            Some(call) if intent => cx.about(call),
+            _ => cx,
+        };
+        self.ask::<Observe>(&cx, entry)
     }
 }
 

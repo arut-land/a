@@ -54,16 +54,16 @@ fn later_layers_win() {
         Some("model = \"ws:m\""),
     );
     let s = settings(&root);
-    assert_eq!(s.model(&ws).unwrap(), "ws:m");
+    assert_eq!(s.model(&ws).unwrap().0, "ws:m");
     assert_eq!(s.agent(&ws), Some(ext_fixtures::ECHO.to_owned()));
-    assert_eq!(s.model(&root).unwrap(), "home:m");
+    assert_eq!(s.model(&root).unwrap().0, "home:m");
 
     let overridden = Settings::new(root.join("config.toml"), Some(ext::LOOP.into()));
     assert_eq!(overridden.agent(&ws), Some(ext::LOOP.to_owned()));
 
     let (bare, ws) = dirs("defaults", None, None);
     let s = settings(&bare);
-    assert_eq!(s.model(&ws).unwrap(), DEFAULT_MODEL);
+    assert_eq!(s.model(&ws).unwrap().0, DEFAULT_MODEL);
     assert_eq!(s.agent(&ws), None);
     std::fs::remove_dir_all(root).unwrap();
     std::fs::remove_dir_all(bare).unwrap();
@@ -101,9 +101,9 @@ fn variables_come_from_the_client_then_the_home_file_never_the_daemon() {
 fn an_edited_home_file_applies_without_a_restart() {
     let (root, ws) = dirs("edit", Some("model = \"first:m\""), None);
     let s = settings(&root);
-    assert_eq!(s.model(&ws).unwrap(), "first:m");
+    assert_eq!(s.model(&ws).unwrap().0, "first:m");
     std::fs::write(root.join("config.toml"), "model = \"second:model\"").unwrap();
-    assert_eq!(s.model(&ws).unwrap(), "second:model");
+    assert_eq!(s.model(&ws).unwrap().0, "second:model");
 
     std::fs::write(root.join("config.toml"), "model = ").unwrap();
     let error = s.model(&ws).unwrap_err();
@@ -116,7 +116,7 @@ fn an_edited_home_file_applies_without_a_restart() {
 fn a_change_made_through_the_daemon_applies_at_once() {
     let (root, ws) = dirs("change", Some("model = \"aa:m\"\n"), None);
     let s = settings(&root);
-    assert_eq!(s.model(&ws).unwrap(), "aa:m");
+    assert_eq!(s.model(&ws).unwrap().0, "aa:m");
     let path = root.join("config.toml");
     let before = std::fs::metadata(&path).unwrap().modified().unwrap();
     let change = SettingsChange {
@@ -131,7 +131,7 @@ fn a_change_made_through_the_daemon_applies_at_once() {
         .unwrap()
         .set_modified(before)
         .unwrap();
-    assert_eq!(s.model(&ws).unwrap(), "bb:m");
+    assert_eq!(s.model(&ws).unwrap().0, "bb:m");
     std::fs::remove_dir_all(root).unwrap();
 }
 
@@ -139,7 +139,7 @@ fn a_change_made_through_the_daemon_applies_at_once() {
 fn a_workspace_file_is_parsed_once_per_change_for_all_its_sessions() {
     let (root, ws) = dirs("ws-cache", None, Some("model = \"ws:aa\"\n"));
     let s = settings(&root);
-    assert_eq!(s.model(&ws).unwrap(), "ws:aa");
+    assert_eq!(s.model(&ws).unwrap().0, "ws:aa");
     // The same size and time: what was parsed is used, not read again.
     let path = ws.join(".a/config.toml");
     let before = std::fs::metadata(&path).unwrap().modified().unwrap();
@@ -147,10 +147,10 @@ fn a_workspace_file_is_parsed_once_per_change_for_all_its_sessions() {
     let file = std::fs::File::options().write(true).open(&path).unwrap();
     file.set_modified(before).unwrap();
     for _ in 0..3 {
-        assert_eq!(s.model(&ws).unwrap(), "ws:aa");
+        assert_eq!(s.model(&ws).unwrap().0, "ws:aa");
     }
     // A change is read.
     std::fs::write(&path, "model = \"ws:longer\"\n").unwrap();
-    assert_eq!(s.model(&ws).unwrap(), "ws:longer");
+    assert_eq!(s.model(&ws).unwrap().0, "ws:longer");
     std::fs::remove_dir_all(root).unwrap();
 }
