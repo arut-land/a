@@ -15,8 +15,8 @@ use protocol::Card;
 
 use crate::fold::{Fold, Next};
 use crate::{
-    Action, Answer, Binding, Chained, Concurrency, Effect, Effects, Event, Gate, Gated, Load,
-    ModelPhase, Name, Note, Owner, Recover, Replay, Replied, Step, Ticket, Turn,
+    Action, Answer, Barriers, Binding, Chained, Concurrency, Durability, Effect, Effects, Event,
+    Gate, Gated, Load, ModelPhase, Name, Note, Owner, Recover, Replay, Replied, Step, Ticket, Turn,
 };
 
 /// Who refused a call the agent would not run.
@@ -46,6 +46,7 @@ pub struct Core {
     deferred: VecDeque<(SessionId, Outcome)>,
     /// Why the model call being recovered failed, while a handler decides.
     failed: Option<String>,
+    barriers: Barriers,
 }
 
 impl Core {
@@ -88,7 +89,15 @@ impl Core {
             reported: 0,
             deferred: VecDeque::new(),
             failed: None,
+            barriers: Barriers::default(),
         }
+    }
+
+    /// The same, with its barriers falling as `barriers` says.
+    #[must_use]
+    pub const fn with_barriers(mut self, barriers: Barriers) -> Self {
+        self.barriers = barriers;
+        self
     }
 
     /// Folds entry `e` of the log being loaded, the one after the last.
@@ -212,6 +221,39 @@ impl Core {
     fn finish(&mut self, fx: &mut Effects) {
         self.advance(fx);
         self.marks(fx);
+        self.commits(fx);
+    }
+
+    /// Ends the entries `fx` appends with their commit, after the last of
+    /// them: a barrier if anything in `fx` is external, whatever the
+    /// barriers setting; otherwise as it says. The driver commits them
+    /// together, before any effect among them but a cancel, a busy mark
+    /// set or a kill runs.
+    fn commits(&self, fx: &mut Effects) {
+        let Some(last) = fx.iter().rposition(|e| matches!(e, Effect::Append(_))) else {
+            return;
+        };
+        let fact = fx.iter().any(|e| {
+            matches!(e, Effect::Append(e) if !matches!(e.body, Body::Progress { .. } | Body::Ext { .. }))
+        });
+        let before = fx.iter().any(Effect::external);
+        fx.insert(last + 1, Effect::Commit(self.commit(fact, before)));
+    }
+
+    /// How durable a step's entries are to be: holding `fact`s beyond
+    /// notes or not, `before` an external effect or not, with the turn as
+    /// it stands.
+    fn commit(&self, fact: bool, before: bool) -> Durability {
+        let barrier = before
+            || match self.barriers {
+                Barriers::Step => fact,
+                Barriers::Effects => self.turn == Turn::Idle,
+            };
+        if barrier {
+            Durability::Barrier
+        } else {
+            Durability::Lazy
+        }
     }
 
     // ── events ────────────────────────────────────────────────────────

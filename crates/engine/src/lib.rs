@@ -47,6 +47,8 @@ pub struct Config {
     /// Young deaths in a row after which a daemon refuses to serve (0 for
     /// never); see [`sys::crash`].
     pub crash_limit: u32,
+    /// `[daemon] durability`: where a session's commits are barriers.
+    pub barriers: kernel::Barriers,
     /// `[ext]`: the extensions left out, and each one's own table.
     pub ext: sys::config::Exts,
     /// The operator's permission rules (`$A_HOME`'s `policy.toml`), or why
@@ -66,6 +68,7 @@ impl Default for Config {
             drain: Duration::from_secs(60),
             agent: None,
             crash_limit: sys::crash::LIMIT,
+            barriers: kernel::Barriers::default(),
             ext: sys::config::Exts::default(),
             floor: Ok(Vec::new()),
             #[cfg(not(test))]
@@ -127,6 +130,17 @@ impl From<sys::config::Daemon> for Config {
             crash_limit: file.crash_limit.map_or(defaults.crash_limit, |n| {
                 u32::try_from(n).unwrap_or(u32::MAX)
             }),
+            barriers: file
+                .durability
+                .as_deref()
+                .map_or(defaults.barriers, |name| {
+                    kernel::Barriers::named(name).unwrap_or_else(|| {
+                        eprintln!(
+                            "[daemon] durability = {name:?} is not step or effects; using step"
+                        );
+                        defaults.barriers
+                    })
+                }),
             ext: defaults.ext,
             floor: defaults.floor,
             extensions: defaults.extensions,
@@ -324,7 +338,7 @@ impl Daemon {
                 catalog,
                 registry,
                 models,
-
+                barriers: config.barriers,
                 spill: home.spill_dir(),
                 loaded: Mutex::default(),
                 daemon: daemon.clone(),

@@ -45,6 +45,8 @@ pub struct Shared {
     /// The extensions, as each session takes them up at its next step.
     pub registry: ext::host::Current,
     pub models: Models,
+    /// Where every session's commits are barriers.
+    pub barriers: kernel::Barriers,
     /// Where sessions keep output too large for their logs.
     pub spill: PathBuf,
     /// Sessions loaded since the daemon started.
@@ -227,7 +229,8 @@ impl Live {
             shared: Arc::clone(shared),
         });
         let bound = bind(&registry, &session);
-        let mut core = Core::new(Arc::clone(&bound) as Arc<dyn Binding>);
+        let mut core =
+            Core::new(Arc::clone(&bound) as Arc<dyn Binding>).with_barriers(shared.barriers);
         // Each entry is folded as it is read and dropped.
         let mut states = registry.states();
         let mut has_input = false;
@@ -765,38 +768,35 @@ impl Actor {
         self.carry(fx).await;
     }
 
-    /// Carries out `fx`: its appends are committed together, before the
-    /// effects among them, which then run in order. Whatever the steps
-    /// `fx` came from, a burst costs one commit, and each intent is still
-    /// durable before the work it names. Only a kill, of a process group
-    /// whose call the entries after it settle, a cancel, which the kernel
-    /// orders before the outcome it then logs, and a busy mark, set before
-    /// the work it marks, go before what was appended ahead of them is
-    /// committed. A commit that fails drops the rest and resumes from what
-    /// the log holds.
+    /// Carries out `fx`: its appends are committed together, as durably
+    /// as its commit says, before the effects among them, which then run
+    /// in order. Whatever the steps `fx` came from, a burst costs one
+    /// commit, as durable as the most durable step asked, and each intent
+    /// is still durable before the work it names. Only a cancel, which the
+    /// kernel orders before the outcome it then logs, a busy mark set
+    /// before the work it marks, and a kill of a process group left over,
+    /// which nothing logged waits on, go before what was appended ahead of
+    /// them is committed. A commit that fails drops the rest and resumes
+    /// from what the log holds.
     async fn carry(&mut self, fx: Effects) {
         let mut batch = Vec::new();
+        let mut durability = None;
         let mut after = Vec::new();
         for effect in fx {
             match effect {
                 Effect::Append(e) => batch.push(e),
-                Effect::Kill { .. } => {
-                    if !self.flush(&mut batch, &mut after).await {
-                        return;
-                    }
+                Effect::Commit(d) => durability = durability.max(Some(d)),
+                Effect::MarkBusy(true) | Effect::Cancel { .. } | Effect::Kill { .. } => {
                     self.effect(effect);
                 }
-                Effect::MarkBusy(true) | Effect::Cancel { .. } => self.effect(effect),
                 effect => after.push(effect),
             }
         }
-        self.flush(&mut batch, &mut after).await;
-    }
-
-    /// Commits `batch`, then carries out the effects `after` it; `false`
-    /// if the commit failed, and the session resumed. Notes with nothing
-    /// after them are durable with the next commit that is.
-    async fn flush(&mut self, batch: &mut Vec<Entry>, after: &mut Vec<Effect>) -> bool {
+        debug_assert_eq!(
+            batch.is_empty(),
+            durability.is_none(),
+            "a step commits once"
+        );
         // The session as it stands once `after` is carried out.
         let busy = (after.iter().rev())
             .find_map(|e| match e {
@@ -804,31 +804,48 @@ impl Actor {
                 _ => None,
             })
             .unwrap_or_else(|| self.live.has_work());
-        let listing = self.listing(busy);
-        if !batch.is_empty()
-            && let Err(e) = self.commit(batch, !after.is_empty(), listing).await
+        if let Some(durability) = durability
+            && let Err(why) = self.flush(&mut batch, durability, busy).await
         {
-            let why = format!("logging: {e}");
-            eprintln!("session {}: {why}", self.live.id.short());
-            for effect in after.drain(..) {
-                if let Effect::Reply { ticket, .. } = effect {
-                    self.reply(ticket, Err(why.clone()));
-                }
-            }
-            // Its log takes nothing: the session stops, and loads again
-            // when next wanted.
-            if self.resuming {
-                self.phase = Phase::Draining;
-                self.live.session.cancel_all();
-                return false;
-            }
-            Box::pin(self.resume()).await;
-            return false;
+            return self.failed(why, after).await;
         }
-        for effect in after.drain(..) {
+        for effect in after {
             self.effect(effect);
         }
-        true
+    }
+
+    /// Commits `batch` as `durability` says, listed `busy`.
+    async fn flush(
+        &mut self,
+        batch: &mut Vec<Entry>,
+        durability: Durability,
+        busy: bool,
+    ) -> Result<(), String> {
+        let listing = self.listing(busy);
+        let durable = durability == Durability::Barrier;
+        self.commit(batch, durable, listing)
+            .await
+            .map_err(|e| format!("logging: {e}"))
+    }
+
+    /// A commit failed for `why`: the effects `rest` after it are dropped,
+    /// whoever they would have answered told why, and the session resumes
+    /// from what the log holds.
+    async fn failed(&mut self, why: String, rest: Vec<Effect>) {
+        eprintln!("session {}: {why}", self.live.id.short());
+        for effect in rest {
+            if let Effect::Reply { ticket, .. } = effect {
+                self.reply(ticket, Err(why.clone()));
+            }
+        }
+        // Its log takes nothing: the session stops, and loads again when
+        // next wanted.
+        if self.resuming {
+            self.phase = Phase::Draining;
+            self.live.session.cancel_all();
+            return;
+        }
+        Box::pin(self.resume()).await;
     }
 
     /// After a failed commit or a step that panicked: what runs is
@@ -852,8 +869,9 @@ impl Actor {
         };
         // Folded an entry at a time, as a load folds it.
         let frames = &self.live.frames;
+        let barriers = self.live.session.shared.barriers;
         let resumed = catch_unwind(AssertUnwindSafe(|| {
-            let mut core = Core::new(bound);
+            let mut core = Core::new(bound).with_barriers(barriers);
             for e in frames.entries() {
                 core.load(&e);
             }
@@ -887,8 +905,8 @@ impl Actor {
     }
 
     /// Writes `batch`, then shows it: the writer stamps its lease. It is
-    /// made durable at once unless it holds only notes and `durable` is
-    /// not asked for ([`kernel::Durability`]).
+    /// made durable at once if `durable`, else with the next commit that
+    /// is ([`kernel::Durability`]).
     ///
     /// The catalog takes `listing`, if it changed, in the same blocking
     /// hop: before the entries when it is busy, as the mark is set before
@@ -900,10 +918,6 @@ impl Actor {
         durable: bool,
         listing: Record,
     ) -> io::Result<()> {
-        let durable = durable
-            || batch
-                .iter()
-                .any(|e| Durability::of(&e.body) == Durability::Now);
         let mut writer = self
             .writer
             .take()
@@ -1074,7 +1088,7 @@ impl Actor {
             return;
         }
         match effect {
-            Effect::Append(_) => unreachable!("appends are committed in runs"),
+            Effect::Append(_) | Effect::Commit(_) => unreachable!("appends commit in runs"),
             Effect::Reply { ticket, result } => self.reply(ticket, result),
             Effect::Side { ticket, side } => {
                 if let Some((reply, conversation)) = self.sides.remove(&ticket) {

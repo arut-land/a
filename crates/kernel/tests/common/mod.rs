@@ -22,8 +22,8 @@ use ext::{
     Rewrite, States, Tier,
 };
 use kernel::{
-    Action, Actions, Agent, Answer, Core, Effect, Effects, Event, Gated, Input, Load, LoopPoints,
-    Recover, Replied,
+    Action, Actions, Agent, Answer, Barriers, Core, Durability, Effect, Effects, Event, Gated,
+    Input, Load, LoopPoints, Recover, Replied,
 };
 use protocol::{
     Audience, Author, Body, CallId, ClientId, ClientSeq, Entry, Epoch, Installed, Json, Mode,
@@ -601,19 +601,37 @@ impl Session {
         Self::resume(registry, Vec::new(), &Load::default()).0
     }
 
-    /// Resumes `log`, returning what the resume did.
+    /// A new session whose barriers fall as `barriers` says.
+    pub fn with_barriers(registry: Arc<dyn Binding>, barriers: Barriers) -> Self {
+        let mut core = Core::new(registry).with_barriers(barriers);
+        let fx = core.resumed(&Load::default());
+        barriered(&fx);
+        let log = appended(&fx).collect();
+        Self { core, log }
+    }
+
+    /// Resumes `log`, returning what the resume did: the entries and the
+    /// work, in order. Where their commits fall has invariants of its own
+    /// ([`barriered`], held at every step), so they are left out.
     pub fn resume(
         registry: Arc<dyn Binding>,
         mut log: Vec<Entry>,
         load: &Load<'_>,
     ) -> (Self, Effects) {
         let (core, fx) = Core::resume(registry, &log, load);
+        barriered(&fx);
         log.extend(appended(&fx));
-        (Self { core, log }, fx)
+        (Self { core, log }, uncommitted(fx))
     }
 
     pub fn step(&mut self, event: Event) -> Effects {
+        uncommitted(self.step_committing(event))
+    }
+
+    /// [`Session::step`], with the commits ending each run of appends.
+    pub fn step_committing(&mut self, event: Event) -> Effects {
         let fx = self.core.step(event);
+        barriered(&fx);
         self.log.extend(appended(&fx));
         fx
     }
@@ -635,6 +653,36 @@ impl Session {
     pub fn bodies(&self) -> Vec<&Body> {
         self.log.iter().map(|e| &e.body).collect()
     }
+}
+
+/// Holds the kernel to its one durability rule, at every step of every
+/// test: a step that appends commits once, after its last append, and as
+/// a barrier whenever anything in it reaches outside the session.
+pub fn barriered(fx: &Effects) {
+    let last = fx.iter().rposition(|e| matches!(e, Effect::Append(_)));
+    let commits: Vec<usize> = (fx.iter().enumerate())
+        .filter_map(|(i, e)| matches!(e, Effect::Commit(_)).then_some(i))
+        .collect();
+    match last {
+        None => assert!(commits.is_empty(), "a commit of nothing in {fx:?}"),
+        Some(last) => assert_eq!(
+            commits,
+            [last + 1],
+            "one commit after the appends in {fx:?}"
+        ),
+    }
+    if last.is_some() && fx.iter().any(Effect::external) {
+        assert!(
+            fx.iter().any(|e| *e == Effect::Commit(Durability::Barrier)),
+            "an external effect without its barrier in {fx:?}"
+        );
+    }
+}
+
+/// `fx` without its commits.
+pub fn uncommitted(mut fx: Effects) -> Effects {
+    fx.retain(|e| !matches!(e, Effect::Commit(_)));
+    fx
 }
 
 pub fn appended(fx: &Effects) -> impl Iterator<Item = Entry> + '_ {

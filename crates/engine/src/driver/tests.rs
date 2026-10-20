@@ -284,7 +284,7 @@ impl Fixture {
                 catalog: crate::catalog::Catalog::memory(),
                 registry: ext::host::Current::new(registry),
                 models,
-
+                barriers: kernel::Barriers::default(),
                 spill: std::env::temp_dir().join(format!("a-spill-{}", std::process::id())),
                 loaded: Mutex::default(),
                 daemon: Weak::new(),

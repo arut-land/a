@@ -647,38 +647,72 @@ fn a_watch_fires_once() {
     assert_eq!(fired, 1, "{:#?}", s.log);
 }
 
-/// Only what a running call reports as it goes waits for the next commit
-/// to be durable; what the session decided or learned never does.
+/// The commit ending a run says how durable it must be: a barrier before
+/// anything external, whichever setting; a note alone waits for the next
+/// barrier under either; what the session learned mid-turn (a call
+/// beginning to wait) waits only under `effects`; and a turn's end is a
+/// barrier under either.
 #[test]
-fn only_notes_wait_for_the_next_commit() {
-    use kernel::Durability;
-    let later = [
-        Body::Progress {
-            call: CallId::new(2).unwrap(),
-            text: "half".into(),
-        },
-        Body::Ext {
-            ext: "shell".into(),
-            state: "cwd".into(),
-            data: Json::encode(&json!("/")).unwrap(),
-        },
+fn a_run_commits_as_the_barriers_setting_says() {
+    use kernel::{Barriers, Durability};
+    let last = |fx: &Effects| match fx.iter().rev().find(|e| matches!(e, Effect::Commit(_))) {
+        Some(Effect::Commit(d)) => *d,
+        _ => panic!("no commit in {fx:?}"),
+    };
+    let both = [
+        (Barriers::Step, Durability::Barrier),
+        (Barriers::Effects, Durability::Lazy),
     ];
-    for body in &later {
-        assert_eq!(Durability::of(body), Durability::WithNext, "{body:?}");
+    for (barriers, mid_turn) in both {
+        let mut s = Session::with_barriers(Reg::modeled().arc(), barriers);
+        // Input, then its model call sent: external, so barriers.
+        assert_eq!(last(&s.step_committing(user("hi"))), Durability::Barrier);
+        s.step_committing(prepared(2));
+        let fx = s.step_committing(model_done(2, &[("bash", json!({ "command": "ls" }))]));
+        assert!(fx.iter().any(|e| matches!(e, Effect::RunTool { .. })));
+        assert_eq!(last(&fx), Durability::Barrier);
+        let fx = s.step_committing(Event::Note {
+            call: id(4),
+            note: Note::Progress("half".into()),
+        });
+        assert_eq!(last(&fx), Durability::Lazy, "{barriers:?}");
+        let fx = s.step_committing(Event::Waits {
+            call: id(4),
+            on: WaitOn::Client { tool: "ls".into() },
+        });
+        assert_eq!(last(&fx), mid_turn, "{barriers:?}");
+        // The call's result, and the turn's end.
+        s.step_committing(Event::Answer {
+            call: id(4),
+            value: Json::null(),
+            origin: None,
+            ticket: None,
+        });
+        assert_eq!(
+            last(&s.step_committing(tool_done(4, done(json!(1))))),
+            Durability::Barrier
+        );
+        s.step_committing(prepared(9));
+        let fx = s.step_committing(model_done(9, &[]));
+        assert_eq!(*s.core.turn(), Turn::Idle);
+        assert_eq!(last(&fx), Durability::Barrier, "{barriers:?}");
     }
-    let now = [
-        input("hi"),
-        bash("ls"),
-        model_call(0),
-        tool_result(2, done(json!(1))),
-        model_result(2, done(json!(1))),
-        decision("policy", Some(2), protocol::Verdict::Answered),
-        said("hi"),
-        Body::INTERRUPT,
-        wait_child(2, 3),
-    ];
-    for body in &now {
-        assert_eq!(Durability::of(body), Durability::Now, "{body:?}");
+}
+
+/// Nothing reaches outside the session (work started, a client answered)
+/// before the entries ahead of it are a barrier, under either setting:
+/// what every step of every test here holds too ([`common::barriered`]).
+#[test]
+fn no_external_effect_before_its_barrier() {
+    for barriers in [kernel::Barriers::Step, kernel::Barriers::Effects] {
+        let mut s = Session::with_barriers(Reg::modeled().arc(), barriers);
+        let fx = s.step(user("hi"));
+        drive(&mut s, fx);
+        let fx = s.step(user("/jobs"));
+        drive(&mut s, fx);
+        let fx = s.step(interrupt());
+        drive(&mut s, fx);
+        assert_eq!(*s.core.turn(), Turn::Idle, "{:#?}", s.log);
     }
 }
 
