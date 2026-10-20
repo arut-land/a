@@ -1,5 +1,6 @@
 //! Time, allocations and heap of reading a session's log as a client does
-//! at attach: every entry decoded, then folded into its view. Ignored by
+//! at attach: every entry decoded, then folded into its view; and of
+//! encoding it again, as the daemon does for each entry it sends. Ignored by
 //! default: `A_SESSION_LOG=<log> cargo test -p protocol --release --test
 //! bench -- --ignored --nocapture`.
 
@@ -88,6 +89,14 @@ fn attach_to_a_logged_session() {
     measure("decode the log", 10, || {
         for line in &lines {
             let _ = std::hint::black_box(Entry::from_json(line.as_bytes()));
+        }
+    });
+    let mut out = Vec::new();
+    measure("encode the log", 10, || {
+        for entry in &entries {
+            out.clear();
+            entry.encode(&mut out).unwrap();
+            std::hint::black_box(&out);
         }
     });
     let fold = || SessionView::from_log(SessionId::new(), PathBuf::from("/w"), &entries);
