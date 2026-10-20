@@ -756,14 +756,25 @@ fn the_supervisor_sleeps_until_a_deadline_and_never_polls() {
     let id = attachment.session().id;
     attachment.session().submit("$ true").unwrap();
     settle(&daemon);
+    let ended = attachment.session().ended();
     let detached = Instant::now();
     drop(attachment);
     let hibernated = || daemon.slots()[0].live().is_none();
     wait_until("hibernation", hibernated);
     let after = detached.elapsed();
+    // The actor's end, which it tells the supervisor, is the last news.
+    rt::block_on(ended.over());
+    let mut wakes = EVENTS.count("wake");
+    loop {
+        std::thread::sleep(Duration::from_millis(100));
+        let now = EVENTS.count("wake");
+        if now == wakes {
+            break;
+        }
+        wakes = now;
+    }
 
     // Nothing is due for an hour: nothing wakes the supervisor.
-    let wakes = EVENTS.count("wake");
     std::thread::sleep(Duration::from_secs(1));
     let idle_wakes = EVENTS.count("wake") - wakes;
     let names: Vec<_> = (EVENTS.of(id).iter().map(|e| e.name))
