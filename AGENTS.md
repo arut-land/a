@@ -9,7 +9,7 @@ is in the docs (`docs/*.md`) and in each crate's `//!` comment.
 
 | Path | What |
 | --- | --- |
-| `apps/cli` | The binary `a`: argv (`args.rs`, usage-rs derive is the spec), the daemon's extension list (`exts.rs`), the line REPL, `a daemon …`, `a bridge`; the black-box tests in `tests/` |
+| `apps/cli` | The binary `a`: argv (`args.rs`, usage-rs derive is the spec), the daemon's extension list (`exts.rs`), the line REPL, one turn in a pipeline (`once.rs`, docs/cli.md), `a daemon …`, `a bridge`; the black-box tests in `tests/` |
 | `apps/tui` | The terminal client (docs/tui.md) |
 | `apps/web` | `a web`, the browser UI (docs/web.md) |
 | `apps/apple` | The macOS app (SwiftUI over `crates/ffi`; not a cargo crate) |
