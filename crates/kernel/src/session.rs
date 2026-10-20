@@ -32,8 +32,6 @@ pub const RESTART_CAP: u16 = 10;
 /// generation its steps run on.
 pub struct Core {
     registry: Arc<dyn Binding>,
-    /// The generation to take up at the next step boundary.
-    next: Option<Arc<dyn Binding>>,
     fold: Fold,
     turn: Turn,
     /// Whether the session is a child, which reports as it settles.
@@ -92,7 +90,6 @@ impl Core {
         Self {
             fold: Fold::restore(registry.agent(), ledger),
             registry,
-            next: None,
             turn: Turn::Idle,
             child: false,
             busy: false,
@@ -208,7 +205,11 @@ impl Core {
             } => self.prepared(call, decisions, answered, &mut fx),
             Event::SideDone { side, outcome } => self.side_done(side, outcome, &mut fx),
             Event::ChildSettled { child, outcome } => self.child_settled(child, outcome, &mut fx),
-            Event::Registry(registry) => self.next = Some(registry),
+            Event::Registry(registry) => {
+                if self.at_rest() {
+                    self.resolve(registry, &mut fx);
+                }
+            }
             Event::Environment(env) => {
                 if self.fold.ledger.env() != Some(&env) {
                     self.append(&mut fx, Body::Environment(env));
@@ -336,9 +337,6 @@ impl Core {
         let taken = self.turn == Turn::Idle
             && self.fold.asked.is_empty()
             && self.fold.ledger.untaken().is_empty();
-        if taken {
-            self.resolve(fx);
-        }
         let Chained {
             value: text,
             decisions,
@@ -816,9 +814,7 @@ impl Core {
                 Turn::Acting { .. } | Turn::Idle => {}
             }
             if let Some(next) = self.fold.asked.front().cloned() {
-                // A new generation is taken up only with nothing open.
                 if !matches!(&self.turn, Turn::Acting { open } if !open.is_empty()) {
-                    self.resolve(fx);
                     self.turn = Turn::Acting {
                         open: SmallVec::new(),
                     };
@@ -835,7 +831,6 @@ impl Core {
             }
             self.turn = Turn::Idle;
             if let Some(input) = self.fold.ledger.untaken().front().map(|q| q.seq) {
-                self.resolve(fx);
                 self.turn = Turn::Acting {
                     open: SmallVec::new(),
                 };
@@ -1070,12 +1065,9 @@ impl Core {
         self.fold.stepped = false;
     }
 
-    /// Takes up the newest registry generation, at a step boundary,
+    /// Takes up a registry generation at rest,
     /// logging the extensions it runs when they changed.
-    fn resolve(&mut self, fx: &mut Effects) {
-        let Some(next) = self.next.take() else {
-            return;
-        };
+    fn resolve(&mut self, next: Arc<dyn Binding>, fx: &mut Effects) {
         let installed = next.installed();
         let changed = installed != self.registry.installed();
         self.registry = next;

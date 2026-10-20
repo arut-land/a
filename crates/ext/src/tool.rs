@@ -100,6 +100,7 @@ pub struct Cx {
     pub cancel: Cancel,
     services: Arc<Services>,
     host: Arc<dyn Host>,
+    delegated: u8,
 }
 
 impl Cx {
@@ -124,6 +125,7 @@ impl Cx {
             cancel,
             services,
             host,
+            delegated: 0,
         }
     }
 
@@ -148,6 +150,54 @@ impl Cx {
                 eprintln!("warning: extension {ext}: a {} change: {e}", S::NAME);
                 Box::pin(std::future::ready(()))
             }
+        }
+    }
+
+    /// Reads a fold named at run time, as JSON.
+    pub fn state_erased(&self, ext: &str, name: &str) -> Option<Json> {
+        let mut value = None;
+        self.host
+            .states(&mut |states| value = states.erased(ext, name).cloned());
+        value
+    }
+
+    /// Commits a change to a registered fold named at run time.
+    pub fn update_erased(&self, ext: &str, name: &str, change: Json) -> BoxFuture<'static, ()> {
+        if self.state_erased(ext, name).is_some() {
+            self.host.note(ext, name, change)
+        } else {
+            Box::pin(std::future::ready(()))
+        }
+    }
+
+    /// Runs a delegated tool through this generation's policy. An ask
+    /// without an extension's approval remains refused; delegation cannot
+    /// grant itself a permission the outer call did not have.
+    pub async fn invoke(&self, tool: &str, input: &Json) -> Called {
+        use crate::{Gate, Gating};
+        if self.delegated >= 8 {
+            return Called::failed("tool delegation is too deep".into());
+        }
+        let mut child = self.clone();
+        child.delegated += 1;
+        let registry = self.host.registry();
+        let gated = match registry.hooks().gate(&self.point(), tool, input) {
+            Gating::Now(gated) => gated,
+            Gating::Approving(_) => return Called::failed("delegated tool needs approval".into()),
+        };
+        match gated.gate {
+            Gate::Run => {
+                let called = registry.tools().run(tool, &gated.input, None, &child).await;
+                Called {
+                    outcome: registry
+                        .hooks()
+                        .post_tool(&child.point(), (tool, &gated.input), called.outcome)
+                        .value,
+                    card: called.card,
+                }
+            }
+            Gate::Ask => Called::failed("delegated tool needs approval".into()),
+            Gate::Refuse(why) => Called::failed(why),
         }
     }
 

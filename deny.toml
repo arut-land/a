@@ -22,6 +22,7 @@ allow = [
     "Apache-2.0 WITH LLVM-exception",
     "BSD-3-Clause",
     "CDLA-Permissive-2.0",
+    "CC0-1.0",
     "ISC",
     "MIT",
     "Unicode-3.0",
@@ -35,6 +36,7 @@ ignore = true
 [bans]
 multiple-versions = "deny"
 skip = [
+    { crate = "windows-sys@0.60.2", reason = "notify 8 pins 0.60; sys and the async reactor use 0.61. The watcher backend does not exchange Windows types with them" },
     { crate = "getrandom@0.2.17", reason = "ring pins 0.2; uuid and tempfile are on 0.4" },
     { crate = "syn@2.0.119", reason = "hypertext-macros (web) is on syn 2; serde_derive, usage-derive, thiserror-impl and ext-derive on 3. Goes when hypertext moves" },
 ]

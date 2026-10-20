@@ -43,7 +43,7 @@ mod state;
 pub mod testing;
 mod tool;
 
-pub use agent::{Action, Actions, Agent, Input};
+pub use agent::{Action, Actions, Agent, Input, actions_from_json};
 pub use assemble::{Need, Provides};
 pub use ext::{DynExtension, Extension, Facts, Place, Refused, Registrar, Text, Tier};
 pub use flag::{Cancel, Flag};
@@ -57,7 +57,7 @@ pub use schema::Schema;
 pub use service::{Budget, CwdOf, Layers, ModelSpec, Models, Sessions, Side, Spawner};
 pub use settings::{Configured, Empty, Table};
 pub use shape::{Output, Partials, Streamed, stream};
-pub use state::{Fold, Image, States};
+pub use state::{DynFold, Fold, Image, States};
 pub use tool::{Args, Callable, Called, Concurrency, Cx, DynTool, Parsed, Replay, SpawnSpec, Tool};
 
 /// A runtime name: of an extension, a tool, an agent. Typed Rust items

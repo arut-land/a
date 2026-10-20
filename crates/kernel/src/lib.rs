@@ -166,7 +166,7 @@ pub enum Event {
     },
     /// Child session `child` settled with `outcome`.
     ChildSettled { child: SessionId, outcome: Outcome },
-    /// A new registry generation, taken up at the next step boundary.
+    /// A registry generation to adopt at rest; discarded while busy.
     Registry(Arc<dyn Binding>),
     /// The environment the session's commands run in from now on, as
     /// logged (secrets redacted): logged unless it is the one last logged.

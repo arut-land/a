@@ -19,7 +19,8 @@ pub trait Agent: Send {
     fn step(&mut self, input: Input, points: &dyn LoopPoints) -> Actions;
 }
 
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize)]
+#[serde(rename_all = "snake_case")]
 pub enum Input {
     User {
         text: String,
@@ -41,7 +42,8 @@ pub enum Input {
     },
 }
 
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq, serde::Deserialize)]
+#[serde(rename_all = "snake_case", deny_unknown_fields)]
 pub enum Action {
     /// An answer of its own, not a model's.
     Say(String),
@@ -61,4 +63,21 @@ pub enum Action {
     /// Ask the model to reply to the conversation so far, with the tools
     /// `choice` lets it call.
     CallModel { choice: ToolChoice },
+}
+
+impl Input {
+    /// The input of an agent implemented over the JSON ABI.
+    pub fn to_json(&self) -> Result<Json, String> {
+        Json::encode(self).map_err(|error| error.to_string())
+    }
+}
+
+/// Actions returned by an agent over the JSON ABI, decoded by their owner.
+pub fn actions_from_json(json: &Json) -> Result<Actions, String> {
+    if json.raw() == "null" {
+        return Ok(Actions::new());
+    }
+    json.parse::<Vec<Action>>()
+        .map(Into::into)
+        .map_err(|error| error.to_string())
 }

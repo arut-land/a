@@ -219,9 +219,20 @@ impl Registrar {
 
     /// Keeps state `S` per session, durably: see [`Fold`].
     pub fn fold<S: Fold>(&mut self) -> &mut Self {
-        let taken = twice("state", S::NAME, self.states.iter().map(|s| s.name));
+        let taken = twice("state", S::NAME, self.states.iter().map(|s| &*s.name));
         self.errors.extend(taken);
         self.states.push(Decl::of::<S>());
+        self
+    }
+
+    /// Keeps a fold whose name and representation are known at run time.
+    pub fn dyn_fold(&mut self, fold: Arc<dyn crate::DynFold>) -> &mut Self {
+        self.errors.extend(twice(
+            "state",
+            &fold.name(),
+            self.states.iter().map(|s| &*s.name),
+        ));
+        self.states.push(Decl::erased(fold));
         self
     }
 
