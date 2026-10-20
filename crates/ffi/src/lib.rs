@@ -467,7 +467,7 @@ pub struct Presentation {
 #[data]
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum StatusGlyph {
-    None,
+    Plain,
     Ok,
     Bad,
     Warn,
@@ -515,7 +515,7 @@ impl From<&Presented<'_>> for Presentation {
         };
         Self {
             glyph: match p.glyph {
-                Glyph::None => StatusGlyph::None,
+                Glyph::None => StatusGlyph::Plain,
                 Glyph::Ok => StatusGlyph::Ok,
                 Glyph::Bad => StatusGlyph::Bad,
                 Glyph::Warn => StatusGlyph::Warn,
@@ -562,7 +562,9 @@ pub enum ItemPart {
     /// Where the call stands changed.
     Phase,
     /// The approval it waited for was given, or not.
-    Answer { approved: bool },
+    Answer {
+        approved: bool,
+    },
     Watch,
 }
 
@@ -570,8 +572,12 @@ pub enum ItemPart {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum ToolOutcome {
     /// `output_json` is the tool's output as JSON.
-    Done { output_json: String },
-    Failed { error: String },
+    Done {
+        output_json: String,
+    },
+    Failed {
+        error: String,
+    },
     /// The daemon stopped mid-call and the tool is not safe to rerun.
     Interrupted,
 }
@@ -800,7 +806,10 @@ impl From<&Item> for ViewItem {
                 shown,
             },
             Item::Hook {
-                seq, hook, decision, ..
+                seq,
+                hook,
+                decision,
+                ..
             } => Self::Hook {
                 seq: seq.get(),
                 hook: hook.clone(),

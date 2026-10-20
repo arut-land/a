@@ -279,7 +279,9 @@ pub enum Part {
     /// refused.
     Phase,
     /// The approval the call waited for was given, or not.
-    Answer { approved: bool },
+    Answer {
+        approved: bool,
+    },
     Watch,
 }
 
@@ -297,10 +299,16 @@ impl SessionView {
             workspace,
             ..Self::default()
         };
-        for e in entries {
-            view.entry(e.borrow());
-        }
+        view.extend(entries);
         view
+    }
+
+    /// Folds `entries`, committed after those folded so far: how a daemon
+    /// keeps the view a far attach is sent.
+    pub fn extend(&mut self, entries: impl IntoIterator<Item = impl Borrow<Entry>>) {
+        for e in entries {
+            self.entry(e.borrow());
+        }
     }
 
     /// Folds one daemon message in. `None` when it changed nothing, such as
@@ -326,7 +334,9 @@ impl SessionView {
                 status: Status::Done,
                 purpose: Some(p),
                 ..
-            } if p == purpose => Some(text.trim().trim_matches('"').trim()).filter(|t| !t.is_empty()),
+            } if p == purpose => {
+                Some(text.trim().trim_matches('"').trim()).filter(|t| !t.is_empty())
+            }
             _ => None,
         })
     }
@@ -588,9 +598,9 @@ impl SessionView {
                     _ => self.rephase(*call),
                 }
             }
-            Body::Wait { call, .. } | Body::ToolProcess { call, .. } | Body::Progress { call, .. } => {
-                self.rephase(*call)
-            }
+            Body::Wait { call, .. }
+            | Body::ToolProcess { call, .. }
+            | Body::Progress { call, .. } => self.rephase(*call),
             Body::Watch { child } => {
                 let at = self.items.iter().rposition(
                     |item| matches!(item, Item::Child { child: c, watch: None, .. } if c == child),

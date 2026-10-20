@@ -45,11 +45,10 @@ impl Glyph {
     /// The sign a text renderer shows for it; empty for none.
     pub const fn sign(self) -> &'static str {
         match self {
-            Self::None => "",
+            Self::None | Self::Busy => "",
             Self::Ok => "✓",
             Self::Bad => "✗",
             Self::Warn => "⚠",
-            Self::Busy => "",
             Self::Ask => "?",
             Self::Denied => "⊘",
         }
@@ -115,23 +114,27 @@ pub struct Presented<'a> {
     pub buttons: Buttons,
 }
 
+/// An item with nothing to say of its state.
+fn plain<'a>(kind: Kind, title: Cow<'a, str>, body: Shown<'a>) -> Presented<'a> {
+    Presented {
+        kind,
+        glyph: Glyph::None,
+        title,
+        status: Cow::Borrowed(""),
+        body,
+        usage: None,
+        buttons: Buttons::None,
+    }
+}
+
 impl Item {
     /// How this item is shown.
     pub fn present(&self) -> Presented<'_> {
-        fn plain<'a>(kind: Kind, title: Cow<'a, str>, body: Shown<'a>) -> Presented<'a> {
-            Presented {
-                kind,
-                glyph: Glyph::None,
-                title,
-                status: Cow::Borrowed(""),
-                body,
-                usage: None,
-                buttons: Buttons::None,
-            }
-        }
         match self {
             Self::User { text, .. } => plain(Kind::User, "".into(), Shown::Text(text.into())),
-            Self::Assistant { text, .. } => plain(Kind::Assistant, "".into(), Shown::Markdown(text)),
+            Self::Assistant { text, .. } => {
+                plain(Kind::Assistant, "".into(), Shown::Markdown(text))
+            }
             Self::Reply {
                 model,
                 text,
@@ -139,29 +142,7 @@ impl Item {
                 usage,
                 purpose,
                 ..
-            } => {
-                let (kind, title) = match purpose {
-                    Some(purpose) => (Kind::Side, Cow::Borrowed(purpose.as_str())),
-                    None => (Kind::Reply, Cow::Borrowed(model.as_str())),
-                };
-                let mut p = plain(kind, title, Shown::None);
-                match status {
-                    Status::Running => p.glyph = Glyph::Busy,
-                    Status::Done => {
-                        p.body = Shown::Markdown(text);
-                        p.usage = *usage;
-                    }
-                    Status::Failed { error } => {
-                        p.glyph = Glyph::Bad;
-                        p.status = format!("model failed: {error}").into();
-                    }
-                    Status::Interrupted => {
-                        p.glyph = Glyph::Warn;
-                        p.status = "model call interrupted".into();
-                    }
-                }
-                p
-            }
+            } => replied(model, text, status, *usage, purpose.as_deref()),
             Self::Tool {
                 call,
                 tool,
@@ -174,7 +155,11 @@ impl Item {
                 let (kind, title) = match by {
                     Audience::User => (
                         Kind::Command,
-                        Cow::Owned(format!("/{tool} {}", Self::args(input)).trim_end().to_owned()),
+                        Cow::Owned(
+                            format!("/{tool} {}", Self::args(input))
+                                .trim_end()
+                                .to_owned(),
+                        ),
                     ),
                     _ => (Kind::Tool, call_title(tool, input, card.as_ref())),
                 };
@@ -190,7 +175,11 @@ impl Item {
                 ..
             } => {
                 let line = decision_line(tool, *call, decision);
-                plain(Kind::Hook, format!("hook {hook}: {line}").into(), Shown::None)
+                plain(
+                    Kind::Hook,
+                    format!("hook {hook}: {line}").into(),
+                    Shown::None,
+                )
             }
             Self::Child {
                 child,
@@ -203,7 +192,9 @@ impl Item {
                 (p.glyph, p.status) = match fired {
                     None => (Glyph::Busy, "running…".into()),
                     Some(Outcome::Done { .. }) => (Glyph::Ok, "done".into()),
-                    Some(Outcome::Failed { error }) => (Glyph::Bad, format!("failed: {error}").into()),
+                    Some(Outcome::Failed { error }) => {
+                        (Glyph::Bad, format!("failed: {error}").into())
+                    }
                     Some(Outcome::Interrupted { .. }) => (Glyph::Warn, "interrupted".into()),
                 };
                 p
@@ -215,6 +206,38 @@ impl Item {
             ),
         }
     }
+}
+
+/// A model call's reply: the conversation's, or with a `purpose`, a side
+/// request's.
+fn replied<'a>(
+    model: &'a str,
+    text: &'a str,
+    status: &'a Status,
+    usage: Option<Usage>,
+    purpose: Option<&'a str>,
+) -> Presented<'a> {
+    let (kind, title) = match purpose {
+        Some(purpose) => (Kind::Side, Cow::Borrowed(purpose)),
+        None => (Kind::Reply, Cow::Borrowed(model)),
+    };
+    let mut p = plain(kind, title, Shown::None);
+    match status {
+        Status::Running => p.glyph = Glyph::Busy,
+        Status::Done => {
+            p.body = Shown::Markdown(text);
+            p.usage = usage;
+        }
+        Status::Failed { error } => {
+            p.glyph = Glyph::Bad;
+            p.status = format!("model failed: {error}").into();
+        }
+        Status::Interrupted => {
+            p.glyph = Glyph::Warn;
+            p.status = "model call interrupted".into();
+        }
+    }
+    p
 }
 
 /// Where a tool call or command stands, and what it shows for it: the one

@@ -14,8 +14,8 @@ use kernel::{
     Gate, Gated, Input, Later, Load, LoopPoints, Name, Recover, Registry, Replay, Replied,
 };
 use protocol::{
-    Audience, Author, Body, CallId, ClientId, ClientSeq, Entry, Installed, Json, Mode, Outcome,
-    Permission, Seq, SessionId, ToolChoice, Verdict, WaitOn,
+    Audience, Author, Body, CallId, ClientId, ClientSeq, Entry, Epoch, Installed, Json, Mode,
+    Outcome, Permission, Seq, SessionId, ToolChoice, Verdict, WaitOn,
 };
 use serde_json::{Value, json};
 use uuid::Uuid;
@@ -518,11 +518,11 @@ pub fn seq(seq: u64) -> Seq {
 }
 
 pub fn append(seq: u64, body: Body) -> Effect {
-    Effect::Append(Entry::new(seq, 0, body))
+    Effect::Append(Entry::new(Seq::new(seq).unwrap(), Epoch(0), body))
 }
 
 pub fn entry(seq: u64, body: Body) -> Entry {
-    Entry::new(seq, 0, body)
+    Entry::new(Seq::new(seq).unwrap(), Epoch(0), body)
 }
 
 /// Entries numbered from 1.
@@ -581,7 +581,7 @@ pub fn sleep_call(seconds: u64) -> Body {
 
 pub fn tool_result(call: u64, outcome: Outcome) -> Body {
     Body::ToolResult {
-        call,
+        call: CallId::new(call).unwrap(),
         outcome,
         card: None,
     }
@@ -598,7 +598,10 @@ pub fn model_call(attempt: u16) -> Body {
 }
 
 pub fn model_result(call: u64, outcome: Outcome) -> Body {
-    Body::ModelResult { call, outcome }
+    Body::ModelResult {
+        call: CallId::new(call).unwrap(),
+        outcome,
+    }
 }
 
 pub fn decision(by: &str, call: Option<u64>, d: Verdict) -> Body {

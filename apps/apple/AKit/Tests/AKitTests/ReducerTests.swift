@@ -130,7 +130,7 @@ func expectInStep(_ store: SessionStore, _ reducer: Reducer, _ name: String) {
         if let update = try reducer.fold(message: message) { store.apply(update) }
     }
     #expect(store.title == "Fix the parser")
-    guard case .reply(_, _, _, _, _, let purpose) = store.items.first else {
+    guard case .reply(_, _, _, _, let purpose, _) = store.items.first else {
         Issue.record("a reply item")
         return
     }

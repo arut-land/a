@@ -147,7 +147,7 @@ impl Page {
             // The first item takes the place of the note that there is
             // none; a sync brings the recap.
             Change::Added { index: 0, .. }
-            | Change::Snapshot { .. }
+            | Change::Snapshot
             | Change::Synced
             | Change::Attached { reset: true, .. } => self.show_all(),
             Change::Added { item, .. } => {
@@ -158,7 +158,10 @@ impl Page {
                 });
             }
             Change::Updated { index, .. } => {
-                let item = html(ItemRow { item: &view.items[index], view });
+                let item = html(ItemRow {
+                    item: &view.items[index],
+                    view,
+                });
                 self.patch(&Patch::Replace(&item));
             }
             _ => {}
@@ -250,7 +253,7 @@ mod tests {
     use std::path::PathBuf;
 
     use client::{Event, Welcome};
-    use protocol::{Body, Caps, DaemonMsg, Entry, Json, Outcome, SessionId};
+    use protocol::{Body, CallId, Caps, DaemonMsg, Entry, Epoch, Json, Outcome, Seq, SessionId};
 
     use super::Page;
 
@@ -288,7 +291,7 @@ mod tests {
     }
 
     fn entry(seq: u64, body: Body) -> DaemonMsg {
-        DaemonMsg::Entry(Entry::new(seq, 1, body))
+        DaemonMsg::Entry(Entry::new(Seq::new(seq).unwrap(), Epoch(1), body))
     }
 
     fn user(seq: u64, text: &str) -> DaemonMsg {
@@ -305,7 +308,7 @@ mod tests {
 
     fn delta(call: u64, text: &str) -> DaemonMsg {
         DaemonMsg::Delta {
-            call,
+            call: CallId::new(call).unwrap(),
             text: text.into(),
             attempt: 0,
         }
@@ -400,7 +403,7 @@ mod tests {
         page.fold(&[entry(
             3,
             Body::ModelResult {
-                call: 2,
+                call: CallId::new(2).unwrap(),
                 outcome: Outcome::Done {
                     output: Json::encode(&serde_json::json!({ "text": "a <b> c d" })).unwrap(),
                 },
@@ -439,7 +442,7 @@ mod tests {
         page.fold(&[entry(
             3,
             Body::ModelResult {
-                call: 2,
+                call: CallId::new(2).unwrap(),
                 outcome: Outcome::Done {
                     output: Json::encode(&reply).unwrap(),
                 },

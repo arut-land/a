@@ -18,9 +18,9 @@ use std::path::{Path, PathBuf};
 use protocol::view::SessionView;
 use protocol::{
     Activity, Audience, Author, Body, CallId, Caps, Card, ClientDecl, ClientId, ClientMsg,
-    ClientSeq, DaemonMsg, Decode, Entry, Environment, HomeSettings, Installed, Mode, Outcome,
-    PROTO, Permission, ReadOnly, Rejection, Residency, Role, Seq, SessionId, SessionSummary,
-    SettingsChange, Target, Verdict, WaitOn,
+    ClientSeq, DaemonMsg, Decode, Entry, Environment, Epoch, HomeSettings, Installed, Mode,
+    Outcome, PROTO, Permission, ReadOnly, Rejection, Residency, Role, Seq, SessionId,
+    SessionSummary, SettingsChange, Target, Verdict, WaitOn,
 };
 use serde_json::json;
 use uuid::Uuid;
@@ -115,11 +115,11 @@ fn client_samples() -> Vec<Sample<ClientMsg>> {
         ),
         sample("list", ClientMsg::List),
         sample("detach", ClientMsg::Detach),
-        sample("approve", ClientMsg::approve(3, true)),
+        sample("approve", ClientMsg::approve(CallId::new(3).unwrap(), true)),
         sample(
             "approve_numbered",
             ClientMsg::Approve {
-                call: 3,
+                call: CallId::new(3).unwrap(),
                 approved: false,
                 client_seq: Some(2),
             },
@@ -192,7 +192,7 @@ const CLIENT: ClientId = ClientId(Uuid::from_u128(0xc));
 
 /// The entries about input, decisions, waits and answers.
 fn input_samples() -> Vec<Sample<DaemonMsg>> {
-    let entry = |seq, body| DaemonMsg::Entry(Entry::new(seq, 0, body));
+    let entry = |seq, body| DaemonMsg::Entry(Entry::new(Seq::new(seq).unwrap(), Epoch(0), body));
     let call = |seq| CallId::new(seq).unwrap();
     let seq = |seq| Seq::new(seq).unwrap();
     let author = Author {
@@ -373,7 +373,7 @@ fn input_samples() -> Vec<Sample<DaemonMsg>> {
         sample(
             "delta_attempt",
             DaemonMsg::Delta {
-                call: 8,
+                call: CallId::new(8).unwrap(),
                 text: "hel".into(),
                 attempt: 1,
             },
@@ -382,11 +382,11 @@ fn input_samples() -> Vec<Sample<DaemonMsg>> {
 }
 
 fn daemon_samples() -> Vec<Sample<DaemonMsg>> {
-    let entry = |seq, body| DaemonMsg::Entry(Entry::new(seq, 0, body));
+    let entry = |seq, body| DaemonMsg::Entry(Entry::new(Seq::new(seq).unwrap(), Epoch(0), body));
     let log = [
         Entry::new(
-            1,
-            0,
+            Seq::new(1).unwrap(),
+            Epoch(0),
             Body::Input {
                 text: "hi".into(),
                 mode: Mode::Queue,
@@ -395,8 +395,8 @@ fn daemon_samples() -> Vec<Sample<DaemonMsg>> {
             },
         ),
         Entry {
-            seq: 2,
-            epoch: 0,
+            seq: Seq::new(2).unwrap(),
+            epoch: Epoch(0),
             body: Body::ToolCall {
                 tool: "bash".into(),
                 input: protocol::Json::encode(&json!({ "command": "ls" })).unwrap(),
@@ -406,8 +406,8 @@ fn daemon_samples() -> Vec<Sample<DaemonMsg>> {
             },
         },
         Entry::new(
-            3,
-            0,
+            Seq::new(3).unwrap(),
+            Epoch(0),
             Body::Decision {
                 by: "policy".into(),
                 call: CallId::new(2),
@@ -417,8 +417,8 @@ fn daemon_samples() -> Vec<Sample<DaemonMsg>> {
             },
         ),
         Entry::new(
-            4,
-            0,
+            Seq::new(4).unwrap(),
+            Epoch(0),
             Body::Input {
                 text: "and sizes".into(),
                 mode: Mode::Steer,
@@ -492,7 +492,7 @@ fn daemon_samples() -> Vec<Sample<DaemonMsg>> {
             entry(
                 5,
                 Body::ToolProcess {
-                    call: 2,
+                    call: CallId::new(2).unwrap(),
                     pgid: 4242,
                     boot: "b".into(),
                     background: true,
@@ -504,7 +504,7 @@ fn daemon_samples() -> Vec<Sample<DaemonMsg>> {
             entry(
                 6,
                 Body::Progress {
-                    call: 2,
+                    call: CallId::new(2).unwrap(),
                     text: "src\n".into(),
                 },
             ),
@@ -514,7 +514,7 @@ fn daemon_samples() -> Vec<Sample<DaemonMsg>> {
             entry(
                 7,
                 Body::ToolResult {
-                    call: 2,
+                    call: CallId::new(2).unwrap(),
                     outcome: Outcome::Done {
                         output: protocol::Json::encode(
                             &json!({ "exit": 0, "stdout": "src\n", "stderr": "" }),
@@ -525,6 +525,7 @@ fn daemon_samples() -> Vec<Sample<DaemonMsg>> {
                         title: "$ ls".into(),
                         body: "src\n".into(),
                         note: "exit 0".into(),
+                        ..Card::default()
                     }),
                 },
             ),
@@ -547,7 +548,7 @@ fn daemon_samples() -> Vec<Sample<DaemonMsg>> {
             entry(
                 9,
                 Body::ModelResult {
-                    call: 8,
+                    call: CallId::new(8).unwrap(),
                     outcome: Outcome::Failed {
                         error: "rate limited".into(),
                     },
@@ -559,7 +560,7 @@ fn daemon_samples() -> Vec<Sample<DaemonMsg>> {
             entry(
                 10,
                 Body::ModelResult {
-                    call: 8,
+                    call: CallId::new(8).unwrap(),
                     outcome: Outcome::Interrupted {
                         output: Some("so far".into()),
                     },
@@ -599,7 +600,7 @@ fn daemon_samples() -> Vec<Sample<DaemonMsg>> {
             entry(
                 17,
                 Body::Fired {
-                    watch: 16,
+                    watch: Seq::new(16).unwrap(),
                     outcome: Outcome::Done {
                         output: protocol::Json::encode(&json!({ "text": "found it" })).unwrap(),
                     },
@@ -654,7 +655,7 @@ fn daemon_samples() -> Vec<Sample<DaemonMsg>> {
         sample(
             "delta",
             DaemonMsg::Delta {
-                call: 4,
+                call: CallId::new(4).unwrap(),
                 text: "hel".into(),
                 attempt: 0,
             },
@@ -837,7 +838,7 @@ fn an_entry_frame_is_its_log_line_tagged() {
         let frame = protocol::Frame::entry(entry).unwrap();
         let mut line = Vec::new();
         entry.encode(&mut line).unwrap();
-        let read = protocol::Frame::from_line(entry.seq, &line).unwrap();
+        let read = protocol::Frame::from_line(entry.seq.get(), &line).unwrap();
         assert_eq!(read.as_bytes(), frame.as_bytes(), "{}", sample.name);
         assert_eq!((read.seq, read.class), (frame.seq, frame.class));
         assert_eq!(&Entry::from_json(&frame.as_bytes()[4..]).unwrap(), entry);

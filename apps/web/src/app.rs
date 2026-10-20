@@ -145,7 +145,8 @@ impl App {
                 None => done(false),
             },
             (&Method::POST, "/api/approve", _) => {
-                let call = param(query, "call").and_then(|c| c.parse().ok().and_then(protocol::CallId::new));
+                let call = param(query, "call")
+                    .and_then(|c| c.parse().ok().and_then(protocol::CallId::new));
                 let approved = param(query, "ok") == Some("1");
                 match (signals(&body), call) {
                     (Some(Signals { tab, .. }), Some(call)) => {
@@ -199,10 +200,7 @@ fn connect(daemon: &Daemon) -> io::Result<Connection> {
 }
 
 fn list(daemon: &Daemon) -> io::Result<Vec<SessionSummary>> {
-    let mut sessions = connect(daemon)?.sessions()?;
-    // Newest first: ids are UUIDv7.
-    sessions.sort_by_key(|s| std::cmp::Reverse(s.id.0));
-    Ok(sessions)
+    connect(daemon)?.sessions()
 }
 
 /// Starts a session in the workspace `a web` runs in, with its environment

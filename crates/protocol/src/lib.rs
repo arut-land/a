@@ -13,11 +13,11 @@ use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
 /// The protocol this build speaks best.
-pub const PROTO: u32 = 2;
+pub const PROTO: u32 = 3;
 
 /// The oldest protocol this build still speaks: a peer whose range
 /// overlaps `PROTO_MIN..=PROTO` is served at the highest version both speak.
-pub const PROTO_MIN: u32 = 2;
+pub const PROTO_MIN: u32 = 3;
 
 const MAX_FRAME: u32 = 16 * 1024 * 1024;
 
@@ -85,13 +85,6 @@ impl Seq {
 
     pub const fn get(self) -> u64 {
         self.0.get()
-    }
-}
-
-impl Seq {
-    /// The entry after this one.
-    pub const fn next(self) -> Self {
-        Self(self.0.saturating_add(1))
     }
 }
 
@@ -1310,7 +1303,11 @@ mod tests {
 
     #[test]
     fn a_shared_frame_is_the_frame_written() {
-        let entry = Entry::new(7, 0, Body::Assistant { text: "hi".into() });
+        let entry = Entry::new(
+            Seq::new(7).unwrap(),
+            Epoch(0),
+            Body::Assistant { text: "hi".into() },
+        );
         let mut written = Vec::new();
         write_frame(&mut written, &DaemonMsg::Entry(entry.clone())).unwrap();
         assert_eq!(Frame::entry(&entry).unwrap().as_bytes(), written);
@@ -1375,8 +1372,8 @@ mod tests {
     #[test]
     fn entry_wire_shape_is_flat() {
         let e = Entry::new(
-            1,
-            0,
+            Seq::new(1).unwrap(),
+            Epoch(0),
             Body::Input {
                 text: "hi".into(),
                 mode: Mode::Queue,
@@ -1472,7 +1469,7 @@ mod tests {
                 "{tag}: {msg:?}"
             );
         }
-        let entry = DaemonMsg::Entry(Entry::new(1, 0, Body::INTERRUPT));
+        let entry = DaemonMsg::Entry(Entry::new(Seq::new(1).unwrap(), Epoch(0), Body::INTERRUPT));
         assert_eq!(serde_json::to_value(&entry).unwrap()["t"], "entry");
         assert!(DaemonMsg::knows("entry") && !DaemonMsg::knows("hello"));
         assert!(Verdict::knows("retry") && !Body::knows("retry"));
@@ -1549,7 +1546,10 @@ mod tests {
         ];
         let json: Vec<_> = bodies
             .iter()
-            .map(|b| serde_json::to_string(&Entry::new(5, 1, b.clone())).unwrap())
+            .map(|b| {
+                serde_json::to_string(&Entry::new(Seq::new(5).unwrap(), Epoch(1), b.clone()))
+                    .unwrap()
+            })
             .collect();
         let who = r#""origin":{"client":"00000000-0000-0000-0000-00000000000c","seq":7}"#;
         let head = r#"{"seq":5,"epoch":1,"kind":"#;
@@ -1602,7 +1602,10 @@ mod tests {
             r#"{"seq":4,"epoch":2,"kind":"a_kind_longer_than_any_tag_is"}"#,
         ] {
             let e = Entry::from_json(line.as_bytes()).unwrap();
-            assert_eq!((e.seq, e.epoch, e.body.class()), (4, 2, Class::Durable));
+            assert_eq!(
+                (e.seq.get(), e.epoch.0, e.body.class()),
+                (4, 2, Class::Durable)
+            );
             let Body::Unknown { kind, raw } = &e.body else {
                 panic!("{e:?}");
             };
@@ -1669,11 +1672,11 @@ mod tests {
         assert_eq!(serde_json::to_string(&e).unwrap(), line);
         let bodies = [
             Body::Progress {
-                call: 2,
+                call: CallId::new(2).unwrap(),
                 text: "p\n".into(),
             },
             Body::ModelResult {
-                call: 2,
+                call: CallId::new(2).unwrap(),
                 outcome: Outcome::Interrupted {
                     output: Some("so far".into()),
                 },
@@ -1682,7 +1685,10 @@ mod tests {
         ];
         let json: Vec<_> = bodies
             .iter()
-            .map(|b| serde_json::to_string(&Entry::new(5, 1, b.clone())).unwrap())
+            .map(|b| {
+                serde_json::to_string(&Entry::new(Seq::new(5).unwrap(), Epoch(1), b.clone()))
+                    .unwrap()
+            })
             .collect();
         assert_eq!(
             json,
@@ -1707,7 +1713,7 @@ mod tests {
             },
             Body::Watch { child },
             Body::Fired {
-                watch: 2,
+                watch: Seq::new(2).unwrap(),
                 outcome: Outcome::Interrupted { output: None },
             },
         ];

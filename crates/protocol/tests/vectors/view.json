@@ -1,6 +1,6 @@
 [
   {
-    "hash": "8cabc003e2a76195",
+    "hash": "32324c15cbeb305f",
     "messages": [
       {
         "session": "00000000-0000-0000-0000-00000000000a",
@@ -63,7 +63,6 @@
     ],
     "name": "a streamed reply, then the committed one",
     "state": {
-      "environment": null,
       "items": [
         {
           "seq": 1,
@@ -84,6 +83,37 @@
           }
         }
       ],
+      "ledger": {
+        "armed": [],
+        "background": [],
+        "clients": [],
+        "context": false,
+        "env": null,
+        "extensions": null,
+        "links": [],
+        "open": [],
+        "result": {
+          "output": {
+            "message": {
+              "content": [
+                {
+                  "text": "hello",
+                  "type": "text"
+                }
+              ]
+            },
+            "usage": {
+              "input": 4,
+              "output": 2
+            }
+          },
+          "status": "done"
+        },
+        "seq": 3,
+        "turn": 1,
+        "untaken": [],
+        "watched": []
+      },
       "seq": 3,
       "session": "00000000-0000-0000-0000-00000000000a",
       "workspace": "/w"
@@ -159,20 +189,9 @@
         "change": {
           "change": "updated",
           "index": 1,
-          "item": {
-            "call": 2,
-            "model": "m",
-            "status": {
-              "status": "done"
-            },
-            "text": "hello",
-            "type": "reply",
-            "usage": {
-              "input": 4,
-              "output": 2
-            }
-          },
-          "part": "outcome"
+          "part": {
+            "part": "outcome"
+          }
         },
         "rev": 7,
         "seq": 3
@@ -180,7 +199,7 @@
     ]
   },
   {
-    "hash": "bba7adb8f96cad00",
+    "hash": "c6b3d5eccb4ee2c0",
     "messages": [
       {
         "session": "00000000-0000-0000-0000-00000000000a",
@@ -241,10 +260,8 @@
     ],
     "name": "an approval asked, then answered",
     "state": {
-      "environment": null,
       "items": [
         {
-          "approval": "approved",
           "call": 1,
           "card": {
             "body": "hi\n",
@@ -261,10 +278,34 @@
             },
             "status": "done"
           },
+          "phase": {
+            "settled": "done"
+          },
           "tool": "bash",
           "type": "tool"
         }
       ],
+      "ledger": {
+        "armed": [],
+        "background": [],
+        "clients": [],
+        "context": false,
+        "env": null,
+        "extensions": null,
+        "links": [],
+        "open": [],
+        "result": {
+          "output": {
+            "exit": 0,
+            "output": "hi\n"
+          },
+          "status": "done"
+        },
+        "seq": 4,
+        "turn": 0,
+        "untaken": [],
+        "watched": []
+      },
       "seq": 4,
       "session": "00000000-0000-0000-0000-00000000000a",
       "workspace": "/w"
@@ -285,12 +326,16 @@
           "change": "added",
           "index": 0,
           "item": {
-            "approval": null,
             "call": 1,
             "input": {
               "command": "echo hi"
             },
             "outcome": null,
+            "phase": {
+              "gating": {
+                "at": 0
+              }
+            },
             "tool": "bash",
             "type": "tool"
           }
@@ -302,17 +347,9 @@
         "change": {
           "change": "updated",
           "index": 0,
-          "item": {
-            "approval": "pending",
-            "call": 1,
-            "input": {
-              "command": "echo hi"
-            },
-            "outcome": null,
-            "tool": "bash",
-            "type": "tool"
-          },
-          "part": "approval"
+          "part": {
+            "part": "phase"
+          }
         },
         "rev": 3,
         "seq": 2
@@ -328,17 +365,10 @@
         "change": {
           "change": "updated",
           "index": 0,
-          "item": {
-            "approval": "approved",
-            "call": 1,
-            "input": {
-              "command": "echo hi"
-            },
-            "outcome": null,
-            "tool": "bash",
-            "type": "tool"
-          },
-          "part": "approval"
+          "part": {
+            "approved": true,
+            "part": "answer"
+          }
         },
         "rev": 5,
         "seq": 3
@@ -347,28 +377,9 @@
         "change": {
           "change": "updated",
           "index": 0,
-          "item": {
-            "approval": "approved",
-            "call": 1,
-            "card": {
-              "body": "hi\n",
-              "note": "exit 0",
-              "title": "$ echo hi"
-            },
-            "input": {
-              "command": "echo hi"
-            },
-            "outcome": {
-              "output": {
-                "exit": 0,
-                "output": "hi\n"
-              },
-              "status": "done"
-            },
-            "tool": "bash",
-            "type": "tool"
-          },
-          "part": "outcome"
+          "part": {
+            "part": "outcome"
+          }
         },
         "rev": 6,
         "seq": 4
@@ -376,7 +387,7 @@
     ]
   },
   {
-    "hash": "0ffceb3c60b2162a",
+    "hash": "33aa525f9e6b6dd7",
     "messages": [
       {
         "session": "00000000-0000-0000-0000-00000000000a",
@@ -424,7 +435,6 @@
     ],
     "name": "input queued, steered and taken up",
     "state": {
-      "environment": null,
       "items": [
         {
           "seq": 1,
@@ -448,6 +458,21 @@
           "type": "user"
         }
       ],
+      "ledger": {
+        "armed": [],
+        "background": [],
+        "clients": [],
+        "context": false,
+        "env": null,
+        "extensions": null,
+        "links": [],
+        "open": [],
+        "result": null,
+        "seq": 4,
+        "turn": 1,
+        "untaken": [],
+        "watched": []
+      },
       "seq": 4,
       "session": "00000000-0000-0000-0000-00000000000a",
       "workspace": "/w"
@@ -518,7 +543,7 @@
     ]
   },
   {
-    "hash": "238ad65aea0402a6",
+    "hash": "b978b04f9d22ce2c",
     "messages": [
       {
         "session": "00000000-0000-0000-0000-00000000000a",
@@ -560,7 +585,6 @@
     ],
     "name": "a child, its watch, and the watch firing",
     "state": {
-      "environment": null,
       "items": [
         {
           "call": 1,
@@ -576,6 +600,34 @@
           "watch": 2
         }
       ],
+      "ledger": {
+        "armed": [],
+        "background": [],
+        "clients": [],
+        "context": false,
+        "env": null,
+        "extensions": null,
+        "links": [
+          {
+            "child": "00000000-0000-0000-0000-00000000000c",
+            "input": "sleep 1",
+            "seq": 1
+          }
+        ],
+        "open": [],
+        "result": {
+          "output": {
+            "slept": 1
+          },
+          "status": "done"
+        },
+        "seq": 3,
+        "turn": 0,
+        "untaken": [],
+        "watched": [
+          "00000000-0000-0000-0000-00000000000c"
+        ]
+      },
       "seq": 3,
       "session": "00000000-0000-0000-0000-00000000000a",
       "workspace": "/w"
@@ -611,15 +663,9 @@
         "change": {
           "change": "updated",
           "index": 0,
-          "item": {
-            "call": 1,
-            "child": "00000000-0000-0000-0000-00000000000c",
-            "fired": null,
-            "input": "sleep 1",
-            "type": "child",
-            "watch": 2
-          },
-          "part": "watch"
+          "part": {
+            "part": "watch"
+          }
         },
         "rev": 3,
         "seq": 2
@@ -628,20 +674,9 @@
         "change": {
           "change": "updated",
           "index": 0,
-          "item": {
-            "call": 1,
-            "child": "00000000-0000-0000-0000-00000000000c",
-            "fired": {
-              "output": {
-                "slept": 1
-              },
-              "status": "done"
-            },
-            "input": "sleep 1",
-            "type": "child",
-            "watch": 2
-          },
-          "part": "outcome"
+          "part": {
+            "part": "outcome"
+          }
         },
         "rev": 4,
         "seq": 3
@@ -656,7 +691,7 @@
     ]
   },
   {
-    "hash": "028a8c389a78a321",
+    "hash": "b8134a8f4f682ce9",
     "messages": [
       {
         "session": "00000000-0000-0000-0000-00000000000a",
@@ -712,7 +747,6 @@
     ],
     "name": "a drain, then a reconnect replaying entries already seen",
     "state": {
-      "environment": null,
       "items": [
         {
           "seq": 1,
@@ -730,6 +764,24 @@
           "type": "user"
         }
       ],
+      "ledger": {
+        "armed": [],
+        "background": [],
+        "clients": [],
+        "context": false,
+        "env": null,
+        "extensions": null,
+        "links": [],
+        "open": [],
+        "result": {
+          "output": "one",
+          "status": "done"
+        },
+        "seq": 3,
+        "turn": 3,
+        "untaken": [],
+        "watched": []
+      },
       "seq": 3,
       "session": "00000000-0000-0000-0000-00000000000a",
       "workspace": "/w"
@@ -818,7 +870,7 @@
     ]
   },
   {
-    "hash": "59d0b09c7f0d6953",
+    "hash": "8d95f4ebbe98da51",
     "messages": [
       {
         "session": "00000000-0000-0000-0000-00000000000a",
@@ -852,11 +904,6 @@
     ],
     "name": "kinds from a newer build are skipped",
     "state": {
-      "environment": {
-        "cwd": "/w",
-        "tty": false,
-        "vars": {}
-      },
       "items": [
         {
           "cwd": "/w",
@@ -864,6 +911,25 @@
           "type": "environment"
         }
       ],
+      "ledger": {
+        "armed": [],
+        "background": [],
+        "clients": [],
+        "context": false,
+        "env": {
+          "cwd": "/w",
+          "tty": false,
+          "vars": {}
+        },
+        "extensions": null,
+        "links": [],
+        "open": [],
+        "result": null,
+        "seq": 2,
+        "turn": 0,
+        "untaken": [],
+        "watched": []
+      },
       "seq": 2,
       "session": "00000000-0000-0000-0000-00000000000a",
       "workspace": "/w"
@@ -902,7 +968,7 @@
     ]
   },
   {
-    "hash": "7d68819abec4dd2e",
+    "hash": "f311292849e92ace",
     "messages": [
       {
         "session": "00000000-0000-0000-0000-00000000000a",
@@ -989,10 +1055,8 @@
     ],
     "name": "a tool's cards, then a slash command",
     "state": {
-      "environment": null,
       "items": [
         {
-          "approval": null,
           "call": 1,
           "card": {
             "body": "hi\n",
@@ -1009,11 +1073,13 @@
             },
             "status": "done"
           },
+          "phase": {
+            "settled": "done"
+          },
           "tool": "bash",
           "type": "tool"
         },
         {
-          "approval": null,
           "by": "user",
           "call": 5,
           "input": {
@@ -1023,10 +1089,34 @@
             "output": "no jobs",
             "status": "done"
           },
+          "phase": {
+            "settled": "done"
+          },
           "tool": "jobs",
           "type": "tool"
         }
       ],
+      "ledger": {
+        "armed": [],
+        "background": [],
+        "clients": [],
+        "context": false,
+        "env": null,
+        "extensions": null,
+        "links": [],
+        "open": [],
+        "result": {
+          "output": {
+            "exit": 0,
+            "output": "hi\n"
+          },
+          "status": "done"
+        },
+        "seq": 6,
+        "turn": 4,
+        "untaken": [],
+        "watched": []
+      },
       "seq": 6,
       "session": "00000000-0000-0000-0000-00000000000a",
       "workspace": "/w"
@@ -1047,7 +1137,6 @@
           "change": "added",
           "index": 0,
           "item": {
-            "approval": null,
             "call": 1,
             "card": {
               "title": "$ echo hi"
@@ -1056,6 +1145,11 @@
               "command": "echo hi"
             },
             "outcome": null,
+            "phase": {
+              "gating": {
+                "at": 0
+              }
+            },
             "tool": "bash",
             "type": "tool"
           }
@@ -1067,28 +1161,9 @@
         "change": {
           "change": "updated",
           "index": 0,
-          "item": {
-            "approval": null,
-            "call": 1,
-            "card": {
-              "body": "hi\n",
-              "note": "exit 0",
-              "title": "$ echo hi"
-            },
-            "input": {
-              "command": "echo hi"
-            },
-            "outcome": {
-              "output": {
-                "exit": 0,
-                "output": "hi\n"
-              },
-              "status": "done"
-            },
-            "tool": "bash",
-            "type": "tool"
-          },
-          "part": "outcome"
+          "part": {
+            "part": "outcome"
+          }
         },
         "rev": 3,
         "seq": 2
@@ -1110,18 +1185,9 @@
         "change": {
           "change": "updated",
           "index": 1,
-          "item": {
-            "approval": null,
-            "by": "user",
-            "call": 5,
-            "input": {
-              "args": ""
-            },
-            "outcome": null,
-            "tool": "jobs",
-            "type": "tool"
-          },
-          "part": "outcome"
+          "part": {
+            "part": "outcome"
+          }
         },
         "rev": 5,
         "seq": 5
@@ -1130,21 +1196,9 @@
         "change": {
           "change": "updated",
           "index": 1,
-          "item": {
-            "approval": null,
-            "by": "user",
-            "call": 5,
-            "input": {
-              "args": ""
-            },
-            "outcome": {
-              "output": "no jobs",
-              "status": "done"
-            },
-            "tool": "jobs",
-            "type": "tool"
-          },
-          "part": "outcome"
+          "part": {
+            "part": "outcome"
+          }
         },
         "rev": 6,
         "seq": 6
@@ -1159,7 +1213,7 @@
     ]
   },
   {
-    "hash": "18fdd01a62b848a7",
+    "hash": "df148450319289cb",
     "messages": [
       {
         "session": "00000000-0000-0000-0000-00000000000a",
@@ -1196,7 +1250,6 @@
         "workspace": "/w"
       },
       {
-        "environment": null,
         "items": [
           {
             "seq": 1,
@@ -1214,16 +1267,67 @@
             "usage": null
           },
           {
-            "approval": "pending",
             "call": 3,
             "input": {
               "command": "echo hi"
             },
             "outcome": null,
+            "phase": {
+              "waiting": {
+                "on": "approval"
+              }
+            },
             "tool": "bash",
             "type": "tool"
           }
         ],
+        "ledger": {
+          "armed": [],
+          "background": [],
+          "clients": [],
+          "context": false,
+          "env": null,
+          "extensions": null,
+          "links": [],
+          "open": [
+            [
+              2,
+              {
+                "call": {
+                  "model": {
+                    "attempt": 0,
+                    "choice": "auto"
+                  }
+                },
+                "phase": "running"
+              }
+            ],
+            [
+              3,
+              {
+                "call": {
+                  "tool": {
+                    "by": "model",
+                    "input": {
+                      "command": "echo hi"
+                    },
+                    "tool": "bash"
+                  }
+                },
+                "phase": {
+                  "waiting": {
+                    "on": "approval"
+                  }
+                }
+              }
+            ]
+          ],
+          "result": null,
+          "seq": 4,
+          "turn": 1,
+          "untaken": [],
+          "watched": []
+        },
         "seq": 4,
         "session": "00000000-0000-0000-0000-00000000000a",
         "t": "snapshot",
@@ -1243,7 +1347,6 @@
     ],
     "name": "a client that fell behind is caught up with a snapshot",
     "state": {
-      "environment": null,
       "items": [
         {
           "seq": 1,
@@ -1261,12 +1364,16 @@
           "usage": null
         },
         {
-          "approval": "pending",
           "call": 3,
           "input": {
             "command": "echo hi"
           },
           "outcome": null,
+          "phase": {
+            "waiting": {
+              "on": "approval"
+            }
+          },
           "tool": "bash",
           "type": "tool"
         },
@@ -1276,6 +1383,56 @@
           "type": "assistant"
         }
       ],
+      "ledger": {
+        "armed": [],
+        "background": [],
+        "clients": [],
+        "context": false,
+        "env": null,
+        "extensions": null,
+        "links": [],
+        "open": [
+          [
+            2,
+            {
+              "call": {
+                "model": {
+                  "attempt": 0,
+                  "choice": "auto"
+                }
+              },
+              "phase": "running"
+            }
+          ],
+          [
+            3,
+            {
+              "call": {
+                "tool": {
+                  "by": "model",
+                  "input": {
+                    "command": "echo hi"
+                  },
+                  "tool": "bash"
+                }
+              },
+              "phase": {
+                "waiting": {
+                  "on": "approval"
+                }
+              }
+            }
+          ]
+        ],
+        "result": {
+          "output": "done",
+          "status": "done"
+        },
+        "seq": 5,
+        "turn": 1,
+        "untaken": [],
+        "watched": []
+      },
       "seq": 5,
       "session": "00000000-0000-0000-0000-00000000000a",
       "workspace": "/w"
@@ -1350,34 +1507,7 @@
       },
       {
         "change": {
-          "change": "snapshot",
-          "items": [
-            {
-              "seq": 1,
-              "text": "one",
-              "type": "user"
-            },
-            {
-              "call": 2,
-              "model": "m",
-              "status": {
-                "status": "running"
-              },
-              "text": "",
-              "type": "reply",
-              "usage": null
-            },
-            {
-              "approval": "pending",
-              "call": 3,
-              "input": {
-                "command": "echo hi"
-              },
-              "outcome": null,
-              "tool": "bash",
-              "type": "tool"
-            }
-          ]
+          "change": "snapshot"
         },
         "rev": 7,
         "seq": 4
@@ -1405,7 +1535,7 @@
     ]
   },
   {
-    "hash": "7176f654e707cb04",
+    "hash": "abb555d5c0d94c8a",
     "messages": [
       {
         "session": "00000000-0000-0000-0000-00000000000a",
@@ -1806,11 +1936,6 @@
     ],
     "name": "generated session 7",
     "state": {
-      "environment": {
-        "cwd": "/w1",
-        "tty": false,
-        "vars": {}
-      },
       "items": [
         {
           "call": 1,
@@ -1847,7 +1972,6 @@
           "type": "assistant"
         },
         {
-          "approval": "denied",
           "call": 9,
           "card": {
             "body": "x\n",
@@ -1863,6 +1987,9 @@
               "output": "x\n"
             },
             "status": "done"
+          },
+          "phase": {
+            "settled": "done"
           },
           "tool": "bash",
           "type": "tool"
@@ -1932,12 +2059,16 @@
           "watch": 25
         },
         {
-          "approval": "pending",
           "call": 27,
           "input": {
             "command": "echo 3"
           },
           "outcome": null,
+          "phase": {
+            "waiting": {
+              "on": "approval"
+            }
+          },
           "tool": "bash",
           "type": "tool"
         },
@@ -1952,6 +2083,80 @@
           "type": "environment"
         }
       ],
+      "ledger": {
+        "armed": [],
+        "background": [],
+        "clients": [],
+        "context": false,
+        "env": {
+          "cwd": "/w1",
+          "tty": false,
+          "vars": {}
+        },
+        "extensions": null,
+        "links": [
+          {
+            "child": "00000000-0000-0000-16df-9d6ac76bd322",
+            "input": "go",
+            "seq": 1
+          },
+          {
+            "child": "00000000-0000-0000-8c31-dc059121ada3",
+            "input": "go",
+            "seq": 16
+          },
+          {
+            "child": "00000000-0000-0000-0ceb-9e68e19650bf",
+            "input": "go",
+            "seq": 24
+          }
+        ],
+        "open": [
+          [
+            6,
+            {
+              "call": {
+                "model": {
+                  "attempt": 0,
+                  "choice": "auto"
+                }
+              },
+              "phase": "running"
+            }
+          ],
+          [
+            27,
+            {
+              "call": {
+                "tool": {
+                  "by": "model",
+                  "input": {
+                    "command": "echo 3"
+                  },
+                  "tool": "bash"
+                }
+              },
+              "phase": {
+                "waiting": {
+                  "on": "approval"
+                }
+              }
+            }
+          ]
+        ],
+        "result": {
+          "output": "a38",
+          "status": "done"
+        },
+        "seq": 30,
+        "turn": 22,
+        "untaken": [],
+        "watched": [
+          "00000000-0000-0000-16df-9d6ac76bd322",
+          "00000000-0000-0000-8c31-dc059121ada3",
+          "00000000-0000-0000-0ceb-9e68e19650bf"
+        ]
+      },
       "seq": 30,
       "session": "00000000-0000-0000-0000-00000000000a",
       "workspace": "/w"
@@ -1994,15 +2199,9 @@
         "change": {
           "change": "updated",
           "index": 0,
-          "item": {
-            "call": 1,
-            "child": "00000000-0000-0000-16df-9d6ac76bd322",
-            "fired": null,
-            "input": "go",
-            "type": "child",
-            "watch": 2
-          },
-          "part": "watch"
+          "part": {
+            "part": "watch"
+          }
         },
         "rev": 4,
         "seq": 2
@@ -2011,17 +2210,9 @@
         "change": {
           "change": "updated",
           "index": 0,
-          "item": {
-            "call": 1,
-            "child": "00000000-0000-0000-16df-9d6ac76bd322",
-            "fired": {
-              "status": "interrupted"
-            },
-            "input": "go",
-            "type": "child",
-            "watch": 2
-          },
-          "part": "outcome"
+          "part": {
+            "part": "outcome"
+          }
         },
         "rev": 5,
         "seq": 3
@@ -2156,12 +2347,16 @@
           "change": "added",
           "index": 4,
           "item": {
-            "approval": null,
             "call": 9,
             "input": {
               "command": "echo 7"
             },
             "outcome": null,
+            "phase": {
+              "gating": {
+                "at": 0
+              }
+            },
             "tool": "bash",
             "type": "tool"
           }
@@ -2173,17 +2368,9 @@
         "change": {
           "change": "updated",
           "index": 4,
-          "item": {
-            "approval": "pending",
-            "call": 9,
-            "input": {
-              "command": "echo 7"
-            },
-            "outcome": null,
-            "tool": "bash",
-            "type": "tool"
-          },
-          "part": "approval"
+          "part": {
+            "part": "phase"
+          }
         },
         "rev": 19,
         "seq": 10
@@ -2192,17 +2379,10 @@
         "change": {
           "change": "updated",
           "index": 4,
-          "item": {
-            "approval": "denied",
-            "call": 9,
-            "input": {
-              "command": "echo 7"
-            },
-            "outcome": null,
-            "tool": "bash",
-            "type": "tool"
-          },
-          "part": "approval"
+          "part": {
+            "approved": false,
+            "part": "answer"
+          }
         },
         "rev": 20,
         "seq": 11
@@ -2211,28 +2391,9 @@
         "change": {
           "change": "updated",
           "index": 4,
-          "item": {
-            "approval": "denied",
-            "call": 9,
-            "card": {
-              "body": "x\n",
-              "note": "exit 0",
-              "title": "$ echo"
-            },
-            "input": {
-              "command": "echo 7"
-            },
-            "outcome": {
-              "output": {
-                "exit": 0,
-                "output": "x\n"
-              },
-              "status": "done"
-            },
-            "tool": "bash",
-            "type": "tool"
-          },
-          "part": "outcome"
+          "part": {
+            "part": "outcome"
+          }
         },
         "rev": 21,
         "seq": 13
@@ -2313,20 +2474,9 @@
         "change": {
           "change": "updated",
           "index": 5,
-          "item": {
-            "call": 14,
-            "model": "m",
-            "status": {
-              "status": "done"
-            },
-            "text": "reply 482",
-            "type": "reply",
-            "usage": {
-              "input": 3,
-              "output": 5
-            }
-          },
-          "part": "outcome"
+          "part": {
+            "part": "outcome"
+          }
         },
         "rev": 29,
         "seq": 15
@@ -2351,15 +2501,9 @@
         "change": {
           "change": "updated",
           "index": 6,
-          "item": {
-            "call": 16,
-            "child": "00000000-0000-0000-8c31-dc059121ada3",
-            "fired": null,
-            "input": "go",
-            "type": "child",
-            "watch": 17
-          },
-          "part": "watch"
+          "part": {
+            "part": "watch"
+          }
         },
         "rev": 31,
         "seq": 17
@@ -2368,20 +2512,9 @@
         "change": {
           "change": "updated",
           "index": 6,
-          "item": {
-            "call": 16,
-            "child": "00000000-0000-0000-8c31-dc059121ada3",
-            "fired": {
-              "output": {
-                "slept": 1
-              },
-              "status": "done"
-            },
-            "input": "go",
-            "type": "child",
-            "watch": 17
-          },
-          "part": "outcome"
+          "part": {
+            "part": "outcome"
+          }
         },
         "rev": 32,
         "seq": 18
@@ -2469,20 +2602,9 @@
         "change": {
           "change": "updated",
           "index": 8,
-          "item": {
-            "call": 20,
-            "model": "m",
-            "status": {
-              "status": "done"
-            },
-            "text": "reply 467",
-            "type": "reply",
-            "usage": {
-              "input": 3,
-              "output": 5
-            }
-          },
-          "part": "outcome"
+          "part": {
+            "part": "outcome"
+          }
         },
         "rev": 40,
         "seq": 21
@@ -2520,15 +2642,9 @@
         "change": {
           "change": "updated",
           "index": 10,
-          "item": {
-            "call": 24,
-            "child": "00000000-0000-0000-0ceb-9e68e19650bf",
-            "fired": null,
-            "input": "go",
-            "type": "child",
-            "watch": 25
-          },
-          "part": "watch"
+          "part": {
+            "part": "watch"
+          }
         },
         "rev": 43,
         "seq": 25
@@ -2537,18 +2653,9 @@
         "change": {
           "change": "updated",
           "index": 10,
-          "item": {
-            "call": 24,
-            "child": "00000000-0000-0000-0ceb-9e68e19650bf",
-            "fired": {
-              "error": "f",
-              "status": "failed"
-            },
-            "input": "go",
-            "type": "child",
-            "watch": 25
-          },
-          "part": "outcome"
+          "part": {
+            "part": "outcome"
+          }
         },
         "rev": 44,
         "seq": 26
@@ -2558,12 +2665,16 @@
           "change": "added",
           "index": 11,
           "item": {
-            "approval": null,
             "call": 27,
             "input": {
               "command": "echo 3"
             },
             "outcome": null,
+            "phase": {
+              "gating": {
+                "at": 0
+              }
+            },
             "tool": "bash",
             "type": "tool"
           }
@@ -2575,17 +2686,9 @@
         "change": {
           "change": "updated",
           "index": 11,
-          "item": {
-            "approval": "pending",
-            "call": 27,
-            "input": {
-              "command": "echo 3"
-            },
-            "outcome": null,
-            "tool": "bash",
-            "type": "tool"
-          },
-          "part": "approval"
+          "part": {
+            "part": "phase"
+          }
         },
         "rev": 46,
         "seq": 28
@@ -2619,7 +2722,7 @@
     ]
   },
   {
-    "hash": "5c2e1132945c262b",
+    "hash": "5807c0ca5ee96cc6",
     "messages": [
       {
         "session": "00000000-0000-0000-0000-00000000000a",
@@ -2723,10 +2826,8 @@
     ],
     "name": "generated session 11",
     "state": {
-      "environment": null,
       "items": [
         {
-          "approval": "denied",
           "call": 1,
           "card": {
             "body": "x\n",
@@ -2742,6 +2843,9 @@
               "output": "x\n"
             },
             "status": "done"
+          },
+          "phase": {
+            "settled": "done"
           },
           "tool": "bash",
           "type": "tool"
@@ -2765,6 +2869,32 @@
           "type": "assistant"
         }
       ],
+      "ledger": {
+        "armed": [],
+        "background": [],
+        "clients": [],
+        "context": false,
+        "env": null,
+        "extensions": null,
+        "links": [
+          {
+            "child": "00000000-0000-0000-77d3-d4856d3c62a6",
+            "input": "go",
+            "seq": 5
+          }
+        ],
+        "open": [],
+        "result": {
+          "output": "a11",
+          "status": "done"
+        },
+        "seq": 8,
+        "turn": 0,
+        "untaken": [],
+        "watched": [
+          "00000000-0000-0000-77d3-d4856d3c62a6"
+        ]
+      },
       "seq": 8,
       "session": "00000000-0000-0000-0000-00000000000a",
       "workspace": "/w"
@@ -2792,12 +2922,16 @@
           "change": "added",
           "index": 0,
           "item": {
-            "approval": null,
             "call": 1,
             "input": {
               "command": "echo 1"
             },
             "outcome": null,
+            "phase": {
+              "gating": {
+                "at": 0
+              }
+            },
             "tool": "bash",
             "type": "tool"
           }
@@ -2809,17 +2943,9 @@
         "change": {
           "change": "updated",
           "index": 0,
-          "item": {
-            "approval": "pending",
-            "call": 1,
-            "input": {
-              "command": "echo 1"
-            },
-            "outcome": null,
-            "tool": "bash",
-            "type": "tool"
-          },
-          "part": "approval"
+          "part": {
+            "part": "phase"
+          }
         },
         "rev": 4,
         "seq": 2
@@ -2828,17 +2954,10 @@
         "change": {
           "change": "updated",
           "index": 0,
-          "item": {
-            "approval": "denied",
-            "call": 1,
-            "input": {
-              "command": "echo 1"
-            },
-            "outcome": null,
-            "tool": "bash",
-            "type": "tool"
-          },
-          "part": "approval"
+          "part": {
+            "approved": false,
+            "part": "answer"
+          }
         },
         "rev": 5,
         "seq": 3
@@ -2847,28 +2966,9 @@
         "change": {
           "change": "updated",
           "index": 0,
-          "item": {
-            "approval": "denied",
-            "call": 1,
-            "card": {
-              "body": "x\n",
-              "note": "exit 0",
-              "title": "$ echo"
-            },
-            "input": {
-              "command": "echo 1"
-            },
-            "outcome": {
-              "output": {
-                "exit": 0,
-                "output": "x\n"
-              },
-              "status": "done"
-            },
-            "tool": "bash",
-            "type": "tool"
-          },
-          "part": "outcome"
+          "part": {
+            "part": "outcome"
+          }
         },
         "rev": 6,
         "seq": 4
@@ -2893,15 +2993,9 @@
         "change": {
           "change": "updated",
           "index": 1,
-          "item": {
-            "call": 5,
-            "child": "00000000-0000-0000-77d3-d4856d3c62a6",
-            "fired": null,
-            "input": "go",
-            "type": "child",
-            "watch": 6
-          },
-          "part": "watch"
+          "part": {
+            "part": "watch"
+          }
         },
         "rev": 8,
         "seq": 6
@@ -2910,20 +3004,9 @@
         "change": {
           "change": "updated",
           "index": 1,
-          "item": {
-            "call": 5,
-            "child": "00000000-0000-0000-77d3-d4856d3c62a6",
-            "fired": {
-              "output": {
-                "slept": 1
-              },
-              "status": "done"
-            },
-            "input": "go",
-            "type": "child",
-            "watch": 6
-          },
-          "part": "outcome"
+          "part": {
+            "part": "outcome"
+          }
         },
         "rev": 9,
         "seq": 7

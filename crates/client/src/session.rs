@@ -15,7 +15,8 @@ use std::path::PathBuf;
 
 use protocol::view::{Change, SessionList, SessionView, Update};
 use protocol::{
-    Activity, CallId,    ClientMsg, CommandInfo, DaemonMsg, Environment, Mode, Rejection, SessionSummary, Target,
+    Activity, CallId, ClientMsg, CommandInfo, DaemonMsg, Environment, Mode, Rejection,
+    SessionSummary, Target,
 };
 
 use crate::{Cmd, Diagnosis, Welcome};
@@ -448,7 +449,6 @@ impl SessionClient {
             return;
         };
         match &update.change {
-            Change::Delta { .. } => {}
             Change::Synced => {
                 if let Link::Live { synced, .. } = &mut self.link {
                     *synced = true;

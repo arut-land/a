@@ -227,7 +227,7 @@ impl SessionWatch {
             move |list| {
                 producer.push(match list {
                     Ok(sessions) => SessionListUpdate {
-                        sessions: sessions.iter().rev().map(Into::into).collect(),
+                        sessions: sessions.iter().map(Into::into).collect(),
                         problem: None,
                     },
                     Err(problem) => SessionListUpdate {

@@ -74,7 +74,7 @@ impl Tool for Model {
     const DESCRIPTION: &'static str = "set the session's model";
     const AUDIENCE: Audience = Audience::User;
 
-    async fn call(&self, Args { args }: &Args, cx: &Cx) -> Result<Chosen, String> {
+    fn call(&self, Args { args }: &Args, cx: &Cx) -> Result<Chosen, String> {
         let args = args.as_str();
         let layers = cx
             .service::<dyn Layers>()

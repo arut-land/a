@@ -41,13 +41,12 @@ func aLiveSessionChatsRunsAnApprovedToolAndIsListed() async throws {
     await store.send("$ echo hello")
     try await eventually("the ask") { store.turn.asking != nil }
     let call = store.turn.asking!
-    #expect(store.items.contains { if case .tool(call, _, _, _, _, _, _, .asking) = $0 { true } else { false } })
+    #expect(store.items.contains { if case .tool(call, _, _, _, let shown) = $0 { shown.approve == call } else { false } })
     await store.approve(call: call, approved: true)
     try await eventually("the outcome") {
         store.items.contains {
-            if case .tool(call, _, _, _, .approved?, .done(let output, let shown)?, let card, _) = $0 {
-                output.contains(#""output":"hello\n""#) && card?.note == "exit 0"
-                    && shown?.note == "exit 0"
+            if case .tool(call, _, _, .done(let output)?, let shown) = $0 {
+                output.contains(#""output":"hello\n""#) && shown.status == "exit 0"
             } else { false }
         }
     }

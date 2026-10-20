@@ -71,15 +71,9 @@ pub fn rows(item: &Item, width: usize, look: Look) -> Vec<Line> {
             out
         }
         Kind::Reply => reply(&p, width),
-        // A side request's reply is its extension's: one muted line.
-        Kind::Side => {
-            let text = p.body.text();
-            let line = text.lines().next().unwrap_or_default();
-            vec![Line::plain(
-                ellipsize(&sanitize(&format!("  · {}: {line}", p.title)), width),
-                MUTED,
-            )]
-        }
+        // A side request's reply is its extension's, not the conversation's:
+        // a title shows in the status line, a summary in what the model sees.
+        Kind::Side => Vec::new(),
         Kind::Tool | Kind::Command => {
             let input = match item {
                 Item::Tool { input, .. } if p.kind == Kind::Tool => {
@@ -100,7 +94,10 @@ pub fn rows(item: &Item, width: usize, look: Look) -> Vec<Line> {
                 status(&p),
             ];
             let mut out = vec![blank, Line::from(head)];
-            let body = [Span::new(sanitize(&p.body.text()).replace('\n', " "), MUTED)];
+            let body = [Span::new(
+                sanitize(&p.body.text()).replace('\n', " "),
+                MUTED,
+            )];
             let pad = [Span::new("  ", MUTED)];
             out.extend(wrap(&body, width, &pad, &pad).into_iter().take(3));
             out
@@ -197,7 +194,12 @@ fn markdown_into(out: &mut Vec<Line>, text: &str, width: usize, base: Style, fen
                 out.push(Line::plain(format!("  {line}"), CODE));
                 continue;
             }
-            Block::Heading(_, text) => (pad("  ".into(), base), pad("  ".into(), base), text, base.bold()),
+            Block::Heading(_, text) => (
+                pad("  ".into(), base),
+                pad("  ".into(), base),
+                text,
+                base.bold(),
+            ),
             Block::Bullet { indent, text } => {
                 let pad_to = " ".repeat(usize::from(indent));
                 (
@@ -231,11 +233,27 @@ fn inline(text: &str, base: Style) -> smallvec::SmallVec<[Span; 4]> {
         .collect()
 }
 
+/// The rows' text, as the test that every renderer shows an item the same
+/// way compares it.
+#[doc(hidden)]
+pub fn texts(lines: &[Line]) -> Vec<String> {
+    lines
+        .iter()
+        .map(|l| l.spans.iter().map(|s| s.text.as_str()).collect())
+        .collect()
+}
+
 /// A tool call or a slash command, as a card: a header with its state (a
 /// click folds it), its output's tail, and while it waits for this
 /// client, the approval buttons. `input` is what the title does not show,
 /// for verbose mode.
-fn card(key: protocol::Seq, p: &Presented<'_>, input: Option<&Json>, width: usize, look: Look) -> Vec<Line> {
+fn card(
+    key: protocol::Seq,
+    p: &Presented<'_>,
+    input: Option<&Json>,
+    width: usize,
+    look: Look,
+) -> Vec<Line> {
     let toggle = Action::Toggle(key);
     let status = status(p);
     let body = output_rows(p, input, width, look.verbose);
@@ -326,10 +344,6 @@ mod tests {
     use serde_json::json;
 
     use super::*;
-
-    fn texts(lines: &[Line]) -> Vec<String> {
-        lines.iter().map(Line::text).collect()
-    }
 
     fn tool(outcome: Option<Outcome>, phase: Phase) -> Item {
         Item::Tool {
@@ -431,13 +445,18 @@ mod tests {
 
     #[test]
     fn markdown_rows_are_headed_bulleted_and_fenced() {
-        let rows = markdown("# Title\n- one **two** `x`\n```\nfn a()\n```", 40, Style::new());
+        let rows = markdown(
+            "# Title\n- one **two** `x`\n```\nfn a()\n```",
+            40,
+            Style::new(),
+        );
         assert_eq!(
             texts(&rows),
             ["  Title", "  • one two x", "  ```", "  fn a()", "  ```"]
         );
         assert!(rows[0].spans[1].style.mods.contains(Modifier::BOLD));
-        assert_eq!(rows[1].spans[3].style, CODE);
+        let x = rows[1].spans.iter().find(|s| s.text == "x").unwrap();
+        assert_eq!(x.style, CODE);
     }
 
     /// The shell marks a failed command's card: no client reads its exit

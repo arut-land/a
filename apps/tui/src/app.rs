@@ -254,7 +254,7 @@ impl App {
                     Style::new().fg(Color::Red),
                 ));
             }
-            Change::Snapshot { .. } => {
+            Change::Snapshot => {
                 self.cache.clear();
                 self.anchor = None;
                 self.committed = self.committed.min(len);
@@ -474,9 +474,10 @@ impl App {
         }
     }
 
-    /// Sessions as the picker lists them: newest first.
+    /// Sessions as the picker lists them: newest first, as the daemon
+    /// sends them.
     fn listed(&self) -> impl Iterator<Item = &SessionSummary> {
-        self.client.sessions().iter().rev()
+        self.client.sessions().iter()
     }
 
     fn pick_default(&mut self) {

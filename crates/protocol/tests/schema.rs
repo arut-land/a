@@ -7,7 +7,8 @@ use std::path::{Path, PathBuf};
 use protocol::ledger::{Call, Ledger, Phase};
 use protocol::view::SessionView;
 use protocol::{
-    Activity, Author, Body, CallId, ClientId, ClientSeq, DaemonMsg, Decode, Entry, Frame, WaitOn,
+    Activity, Author, Body, CallId, ClientId, ClientSeq, DaemonMsg, Decode, Entry, Epoch, Frame,
+    Seq, WaitOn,
 };
 use serde_json::Value;
 use uuid::Uuid;
@@ -71,7 +72,7 @@ fn a_log_replays_byte_identically() {
             String::from_utf8_lossy(&again),
             String::from_utf8_lossy(&line)
         );
-        let frame = Frame::from_line(entry.seq, &line).unwrap();
+        let frame = Frame::from_line(entry.seq.get(), &line).unwrap();
         assert_eq!(frame.as_bytes(), Frame::entry(&entry).unwrap().as_bytes());
         let DaemonMsg::Entry(read) = DaemonMsg::from_json(&frame.as_bytes()[4..]).unwrap() else {
             panic!("{}", String::from_utf8_lossy(&line));
@@ -162,14 +163,13 @@ struct Said {
     commands: usize,
     inbox: Vec<Option<String>>,
     untaken: Vec<(String, bool)>,
-    model: Option<String>,
     result: Option<String>,
     activity: Activity,
     context: bool,
 }
 
 fn said(ledger: &Ledger) -> Said {
-    let input = |seq: u64| match ledger.call(seq).map(|o| &o.call) {
+    let input = |call: CallId| match ledger.call(call).map(|o| &o.call) {
         Some(Call::Tool { input, .. }) => Some(input.raw().to_owned()),
         _ => None,
     };
@@ -192,7 +192,6 @@ fn said(ledger: &Ledger) -> Said {
             .iter()
             .map(|q| (q.text.clone(), q.steer))
             .collect(),
-        model: ledger.settings().0.model,
         result: ledger.result().map(|r| format!("{r:?}")),
         activity: ledger.activity(),
         context: ledger.has_context(),
@@ -204,7 +203,7 @@ fn said(ledger: &Ledger) -> Said {
 #[test]
 fn a_log_folds_to_what_its_session_did() {
     let entries: Vec<Entry> = log().iter().map(|l| Entry::from_json(l).unwrap()).collect();
-    let at = |seq| Ledger::of(entries.iter().take_while(|e| e.seq <= seq));
+    let at = |seq| Ledger::of(entries.iter().take_while(|e| e.seq.get() <= seq));
     let asked = said(&at(6));
     assert_eq!(asked.activity, Activity::Approval);
     assert_eq!(asked.inbox, [Some(r#"{"command":"ls"}"#.to_owned())]);
@@ -224,7 +223,6 @@ fn a_log_folds_to_what_its_session_did() {
     let end = Ledger::of(&entries);
     assert_eq!(end.activity(), Activity::Approval);
     assert_eq!(end.untaken().len(), 1);
-    assert_eq!(end.settings().0.model.as_deref(), Some("openai:n"));
     assert_eq!(end.turn_start(), 2);
     assert!(end.has_context());
 }
@@ -249,7 +247,7 @@ fn the_first_answer_wins() {
     }
     assert_eq!(ledger.inbox().count(), 0);
     assert!(matches!(
-        ledger.call(1).unwrap().phase,
+        ledger.call(CallId::new(1).unwrap()).unwrap().phase,
         Phase::Settled(protocol::ledger::OutcomeKind::Failed)
     ));
 }
@@ -281,7 +279,7 @@ fn every_wait_is_a_phase_of_its_call() {
         (
             r#""on":"child","link":1"#,
             WaitOn::Child {
-                link: protocol::Seq::new(1).unwrap(),
+                link: Seq::new(1).unwrap(),
             },
             Activity::Running,
         ),
@@ -290,14 +288,20 @@ fn every_wait_is_a_phase_of_its_call() {
         ledger.apply(&line(&format!(
             r#"{{"seq":{seq},"epoch":0,"kind":"wait","call":1,{fields}}}"#
         )));
-        assert_eq!(ledger.call(1).unwrap().phase, Phase::Waiting(on));
+        assert_eq!(
+            ledger.call(CallId::new(1).unwrap()).unwrap().phase,
+            Phase::Waiting(on)
+        );
         assert_eq!(ledger.activity(), activity);
         assert_eq!(ledger.inbox().count(), 0, "only approvals are asked");
         ledger.apply(&line(&format!(
             r#"{{"seq":{},"epoch":0,"kind":"answer","call":1,"value":"a.txt"}}"#,
             seq + 1
         )));
-        assert_eq!(ledger.call(1).unwrap().phase, Phase::Running);
+        assert_eq!(
+            ledger.call(CallId::new(1).unwrap()).unwrap().phase,
+            Phase::Running
+        );
     }
 }
 
@@ -328,7 +332,7 @@ fn the_log_knows_each_clients_last_mutation() {
     ];
     let mut ledger = Ledger::default();
     for (seq, body) in (1..).zip(entries) {
-        ledger.apply(&Entry::new(seq, 0, body));
+        ledger.apply(&Entry::new(Seq::new(seq).unwrap(), Epoch(0), body));
     }
     assert_eq!(ledger.last_of(client), ClientSeq::new(3));
     assert_eq!(ledger.last_of(ClientId(Uuid::from_u128(0xd))), None);
@@ -340,7 +344,7 @@ fn a_retry_streams_one_attempt() {
     let mut view = SessionView::default();
     for (attempt, text) in [(0, "par"), (1, "whole")] {
         view.fold(&DaemonMsg::Delta {
-            call: 1,
+            call: CallId::new(1).unwrap(),
             text: text.into(),
             attempt,
         });

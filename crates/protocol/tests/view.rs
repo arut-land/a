@@ -7,8 +7,8 @@ use std::path::PathBuf;
 
 use protocol::view::{Change, Recap, SessionView, Update};
 use protocol::{
-    Audience, Body, CallId, Card, DaemonMsg, Decode, Entry, Environment, Json, Mode, Outcome,
-    Permission, SessionId, Verdict,
+    Audience, Body, CallId, Card, DaemonMsg, Decode, Entry, Environment, Epoch, Json, Mode,
+    Outcome, Permission, Seq, SessionId, Verdict,
 };
 use serde_json::{Value, json};
 use uuid::Uuid;
@@ -48,7 +48,7 @@ struct Session {
 impl Session {
     fn commit(&mut self, body: Body) -> u64 {
         self.seq += 1;
-        let msg = DaemonMsg::Entry(Entry::new(self.seq, 0, body));
+        let msg = DaemonMsg::Entry(Entry::new(Seq::new(self.seq).unwrap(), Epoch(0), body));
         self.log.push(msg.clone());
         self.live.push(msg);
         self.seq
@@ -116,7 +116,7 @@ impl Session {
         });
         if !taken && rng.chance(70) {
             self.commit(Body::Take {
-                input: protocol::Seq::new(input).unwrap(),
+                input: Seq::new(input).unwrap(),
             });
         }
     }
@@ -151,7 +151,7 @@ impl Session {
         }
         if rng.chance(50) {
             self.commit(Body::ToolProcess {
-                call,
+                call: id,
                 pgid: 7,
                 boot: "b".into(),
                 background: false,
@@ -160,12 +160,13 @@ impl Session {
         if rng.chance(80) {
             let outcome = outcome(rng, &json!({ "output": "x\n", "exit": 0 }));
             self.commit(Body::ToolResult {
-                call,
+                call: id,
                 outcome,
                 card: Some(Card {
                     title: "$ echo".into(),
                     body: "x\n".into(),
                     note: "exit 0".into(),
+                    ..Card::default()
                 }),
             });
         }
@@ -179,6 +180,7 @@ impl Session {
             r#for: None,
             purpose: None,
         });
+        let call = CallId::new(call).unwrap();
         let text = format!("reply {}", rng.below(1000));
         let mut rest = text.as_str();
         while !rest.is_empty() {
@@ -212,7 +214,10 @@ impl Session {
             let watch = self.commit(Body::Watch { child });
             if rng.chance(70) {
                 let outcome = outcome(rng, &json!({ "slept": 1 }));
-                self.commit(Body::Fired { watch, outcome });
+                self.commit(Body::Fired {
+                    watch: Seq::new(watch).unwrap(),
+                    outcome,
+                });
             }
         }
     }
@@ -226,11 +231,15 @@ impl Session {
         }];
         let seq = |m: &DaemonMsg| match m {
             DaemonMsg::Entry(e) => e.seq,
-            DaemonMsg::Unknown { seq } => seq.unwrap(),
+            DaemonMsg::Unknown { seq } => Seq::new(seq.unwrap()).unwrap(),
             _ => unreachable!(),
         };
-        let log: Vec<_> = self.log.iter().filter(|m| seq(m) <= upto).collect();
-        msgs.extend(log.iter().filter(|m| seq(m) > since).map(|&m| m.clone()));
+        let log: Vec<_> = self.log.iter().filter(|m| seq(m).get() <= upto).collect();
+        msgs.extend(
+            log.iter()
+                .filter(|m| seq(m).get() > since)
+                .map(|&m| m.clone()),
+        );
         msgs.push(DaemonMsg::Synced { seq: upto });
         msgs
     }
@@ -242,7 +251,7 @@ impl Session {
             .log
             .iter()
             .filter_map(|m| match m {
-                DaemonMsg::Entry(e) if e.seq <= upto => Some(e.clone()),
+                DaemonMsg::Entry(e) if e.seq.get() <= upto => Some(e.clone()),
                 _ => None,
             })
             .collect();
@@ -301,8 +310,8 @@ fn assert_same(a: &SessionView, b: &SessionView, seed: u64) {
     );
     assert_eq!(a.state_hash(), b.state_hash(), "seed {seed}");
     assert_eq!(
-        a.asked().collect::<Vec<_>>(),
-        b.asked().collect::<Vec<_>>(),
+        a.ledger.inbox().collect::<Vec<_>>(),
+        b.ledger.inbox().collect::<Vec<_>>(),
         "seed {seed}"
     );
 }
@@ -339,7 +348,7 @@ fn a_reconnect_replay_from_any_seq_seen_is_idempotent() {
         let upto = watched[..resume]
             .iter()
             .filter_map(|m| match m {
-                DaemonMsg::Entry(e) => Some(e.seq),
+                DaemonMsg::Entry(e) => Some(e.seq.get()),
                 DaemonMsg::Unknown { seq } => *seq,
                 _ => None,
             })
@@ -378,7 +387,7 @@ fn a_snapshot_then_what_follows_equals_the_whole_session() {
         let upto = watched[..resume]
             .iter()
             .filter_map(|m| match m {
-                DaemonMsg::Entry(e) => Some(e.seq),
+                DaemonMsg::Entry(e) => Some(e.seq.get()),
                 DaemonMsg::Unknown { seq } => *seq,
                 _ => None,
             })
@@ -386,9 +395,7 @@ fn a_snapshot_then_what_follows_equals_the_whole_session() {
             .unwrap_or(0);
         let updates = fold(&mut view, &s.attach_snapshot(upto));
         assert!(
-            updates
-                .iter()
-                .any(|u| matches!(u.change, Change::Snapshot { .. })),
+            updates.iter().any(|u| matches!(u.change, Change::Snapshot)),
             "seed {seed}"
         );
         fold(&mut view, &watched[resume..]);
@@ -434,7 +441,13 @@ fn vectors_path() -> PathBuf {
 /// Named scenarios: the daemon messages a client receives, as JSON.
 fn scenarios() -> Vec<(&'static str, Vec<Value>)> {
     let msg = |m: DaemonMsg| serde_json::to_value(m).unwrap();
-    let entry = |seq, body| msg(DaemonMsg::Entry(Entry::new(seq, 0, body)));
+    let entry = |seq, body| {
+        msg(DaemonMsg::Entry(Entry::new(
+            Seq::new(seq).unwrap(),
+            Epoch(0),
+            body,
+        )))
+    };
     let attached = || {
         msg(DaemonMsg::Attached {
             session: SESSION,
@@ -462,6 +475,7 @@ fn scenarios() -> Vec<(&'static str, Vec<Value>)> {
         title: "$ echo hi".into(),
         body: "hi\n".into(),
         note: "exit 0".into(),
+        ..Card::default()
     };
     let generated = |seed| {
         let s = Session::generate(&mut Rng(seed));
@@ -493,19 +507,19 @@ fn scenarios() -> Vec<(&'static str, Vec<Value>)> {
                     },
                 ),
                 msg(DaemonMsg::Delta {
-                    call: 2,
+                    call: CallId::new(2).unwrap(),
                     text: "hel".into(),
                     attempt: 0,
                 }),
                 msg(DaemonMsg::Delta {
-                    call: 2,
+                    call: CallId::new(2).unwrap(),
                     text: "lo".into(),
                     attempt: 0,
                 }),
                 entry(
                     3,
                     Body::ModelResult {
-                        call: 2,
+                        call: CallId::new(2).unwrap(),
                         outcome: Outcome::Done {
                             output: Json::encode(&json!({
                                 "message": { "content": [{ "type": "text", "text": "hello" }] },
@@ -544,7 +558,7 @@ fn scenarios() -> Vec<(&'static str, Vec<Value>)> {
                 entry(
                     4,
                     Body::ToolResult {
-                        call: 1,
+                        call: CallId::new(1).unwrap(),
                         outcome: echoed(),
                         card: Some(card()),
                     },
@@ -579,7 +593,7 @@ fn scenarios() -> Vec<(&'static str, Vec<Value>)> {
                 entry(
                     4,
                     Body::Take {
-                        input: protocol::Seq::new(2).unwrap(),
+                        input: Seq::new(2).unwrap(),
                     },
                 ),
                 msg(DaemonMsg::Synced { seq: 4 }),
@@ -605,7 +619,7 @@ fn scenarios() -> Vec<(&'static str, Vec<Value>)> {
                 entry(
                     3,
                     Body::Fired {
-                        watch: 2,
+                        watch: Seq::new(2).unwrap(),
                         outcome: Outcome::Done {
                             output: Json::encode(&json!({ "slept": 1 })).unwrap(),
                         },
@@ -664,7 +678,7 @@ fn scenarios() -> Vec<(&'static str, Vec<Value>)> {
                 entry(
                     2,
                     Body::ToolResult {
-                        call: 1,
+                        call: CallId::new(1).unwrap(),
                         outcome: echoed(),
                         card: Some(card()),
                     },
@@ -691,7 +705,7 @@ fn scenarios() -> Vec<(&'static str, Vec<Value>)> {
                 entry(
                     6,
                     Body::ToolResult {
-                        call: 5,
+                        call: CallId::new(5).unwrap(),
                         outcome: Outcome::Done {
                             output: Json::encode("no jobs").unwrap(),
                         },
@@ -723,7 +737,7 @@ fn scenarios() -> Vec<(&'static str, Vec<Value>)> {
             ]
             .into_iter()
             .zip(1..)
-            .map(|(body, seq)| Entry::new(seq, 0, body))
+            .map(|(body, seq)| Entry::new(Seq::new(seq).unwrap(), Epoch(0), body))
             .collect::<Vec<_>>();
             let view = SessionView::from_log(SESSION, "/w".into(), &log);
             vec![
@@ -741,7 +755,7 @@ fn scenarios() -> Vec<(&'static str, Vec<Value>)> {
                 ),
                 msg(DaemonMsg::Synced { seq: 2 }),
                 msg(DaemonMsg::Delta {
-                    call: 2,
+                    call: CallId::new(2).unwrap(),
                     text: "thinking".into(),
                     attempt: 0,
                 }),
@@ -814,7 +828,7 @@ fn vectors() {
 /// user's last message, what the turn did since, and what waits.
 #[test]
 fn a_recap_tells_what_the_replay_held() {
-    let entry = |seq, body| DaemonMsg::Entry(Entry::new(seq, 0, body));
+    let entry = |seq, body| DaemonMsg::Entry(Entry::new(Seq::new(seq).unwrap(), Epoch(0), body));
     let mut view = SessionView::default();
     let attached = DaemonMsg::Attached {
         session: SESSION,
@@ -861,7 +875,7 @@ fn a_recap_tells_what_the_replay_held() {
         ..Recap::default()
     };
     assert_eq!(view.recap, Some(recap));
-    assert_eq!(view.turn().asking, Some(2));
+    assert_eq!(view.ledger.inbox().next(), CallId::new(2));
     // Attached again with nothing new: nothing to tell.
     fold(&mut view, &[attached, DaemonMsg::Synced { seq: 3 }]);
     assert_eq!(view.recap, None);
@@ -869,13 +883,14 @@ fn a_recap_tells_what_the_replay_held() {
 
 #[test]
 fn clients_describe_calls_and_recaps_alike() {
-    use protocol::view::{call_title, decision_line, output_text, recap_line};
+    use protocol::view::{call_title, decision_line, recap_line};
 
     let ls: Json = Json::encode(&json!({"command": "ls"})).unwrap();
     let card = Card {
         title: "$ ls -a".into(),
         body: "a\n".into(),
         note: "exit 0".into(),
+        ..Card::default()
     };
     assert_eq!(call_title("bash", &ls, Some(&card)), "$ ls -a");
     assert_eq!(call_title("bash", &ls, None), "$ ls");
@@ -883,12 +898,6 @@ fn clients_describe_calls_and_recaps_alike() {
         call_title("edit", &Json::encode(&json!({"path": "a"})).unwrap(), None),
         r#"edit {"path":"a"}"#
     );
-    assert_eq!(
-        output_text(Some(&card)),
-        Some(("a\n".into(), "exit 0".into()))
-    );
-    assert_eq!(output_text(Some(&Card::default())), None);
-    assert_eq!(output_text(None), None);
     let recap = Recap {
         prompt: Some("hi".into()),
         tools: vec!["bash".into(); 4],
@@ -905,19 +914,19 @@ fn clients_describe_calls_and_recaps_alike() {
         reason: "no network".into(),
     };
     assert_eq!(
-        decision_line("bash", Some(2), &blocked),
+        decision_line("bash", CallId::new(2), &blocked),
         "blocked bash: no network"
     );
     let asked = Verdict::Permission {
         permission: Permission::Ask,
     };
-    assert_eq!(decision_line("bash", Some(2), &asked), "bash: ask");
+    assert_eq!(decision_line("bash", CallId::new(2), &asked), "bash: ask");
     let retried = Verdict::Retry {
         attempt: 2,
         error: "e".into(),
     };
     assert_eq!(
-        decision_line("", Some(3), &retried),
+        decision_line("", CallId::new(3), &retried),
         "retried call 3 (attempt 2): e"
     );
 }

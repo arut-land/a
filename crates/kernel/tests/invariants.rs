@@ -303,8 +303,7 @@ fn an_interrupt_never_starts_work() {
         while let Some(effect) = todo.pop_front() {
             assert!(!starts_work(&effect, mark), "{name}: {effect:?}");
             let event = match effect {
-                Effect::Cancel { call } => match &s.core.ledger().call(call.get()).map(|o| &o.call)
-                {
+                Effect::Cancel { call } => match &s.core.ledger().call(call).map(|o| &o.call) {
                     Some(Call::Model { .. }) => Event::ModelDone {
                         call,
                         replied: Replied::Interrupted(None),
@@ -584,7 +583,7 @@ fn only_notes_wait_for_the_next_commit() {
     use kernel::Durability;
     let later = [
         Body::Progress {
-            call: 2,
+            call: CallId::new(2).unwrap(),
             text: "half".into(),
         },
         Body::Ext {

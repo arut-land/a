@@ -74,11 +74,7 @@ impl Fold {
                 text, taken: true, ..
             } => self.user(text, registry),
             Body::Take { input } => {
-                let queued = self
-                    .ledger
-                    .untaken()
-                    .iter()
-                    .find(|q| q.seq == *input)?;
+                let queued = self.ledger.untaken().iter().find(|q| q.seq == *input)?;
                 // A steer taken just before a model call is the model's to
                 // read; one left when the turn ended starts the next.
                 let steers = queued.steer

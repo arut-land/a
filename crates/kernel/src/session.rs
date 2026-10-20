@@ -466,7 +466,13 @@ impl Core {
     fn side_done(&mut self, side: CallId, outcome: Outcome, fx: &mut Effects) {
         let open = self.fold.ledger.call(side).map(|open| &open.call);
         if matches!(open, Some(Call::Side { .. })) {
-            self.append(fx, Body::ModelResult { call: side, outcome });
+            self.append(
+                fx,
+                Body::ModelResult {
+                    call: side,
+                    outcome,
+                },
+            );
         }
     }
 
@@ -566,10 +572,7 @@ impl Core {
                 boot,
                 background,
             },
-            Note::Progress(text) => Body::Progress {
-                call,
-                text,
-            },
+            Note::Progress(text) => Body::Progress { call, text },
             Note::State { ext, state, data } => Body::Ext { ext, state, data },
             Note::Edit {
                 target,
@@ -704,13 +707,7 @@ impl Core {
                 continue;
             }
             self.turn = Turn::Idle;
-            if let Some(input) = self
-                .fold
-                .ledger
-                .untaken()
-                .front()
-                .map(|q| q.seq)
-            {
+            if let Some(input) = self.fold.ledger.untaken().front().map(|q| q.seq) {
                 self.resolve(fx);
                 self.turn = Turn::Acting {
                     open: SmallVec::new(),
@@ -1183,10 +1180,7 @@ impl Core {
             );
         }
         let body = match self.fold.ledger.call(call).map(|open| &open.call) {
-            Some(Call::Model { .. } | Call::Side { .. }) => Body::ModelResult {
-                call,
-                outcome,
-            },
+            Some(Call::Model { .. } | Call::Side { .. }) => Body::ModelResult { call, outcome },
             Some(Call::Tool { .. }) => Body::ToolResult {
                 call,
                 outcome,

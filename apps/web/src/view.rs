@@ -193,10 +193,9 @@ pub fn item_row<'a>(item: &'a Item, view: &'a SessionView) -> impl Renderable {
                 Kind::Reply => {
                     ReplyRow key=(item.key()) p=(&p) live=(live);
                 }
-                // A side request's reply is its extension's: one line.
-                Kind::Side => {
-                    p style=(style::NOTE) { (p.title) ": " (p.body.text().lines().next().unwrap_or_default()) }
-                }
+                // A side request's reply is its extension's, not the conversation's:
+                // a title shows in the bar.
+                Kind::Side => {}
                 Kind::Tool => {
                     ToolCard p=(&p);
                 }
@@ -238,7 +237,11 @@ pub fn delta(text: &str) -> String {
 
 /// A model call: its streamed text while it runs, then the committed reply.
 #[component]
-fn reply_row<'a>(key: protocol::Seq, p: &'a Presented<'a>, live: Option<&'a str>) -> impl Renderable {
+fn reply_row<'a>(
+    key: protocol::Seq,
+    p: &'a Presented<'a>,
+    live: Option<&'a str>,
+) -> impl Renderable {
     maud! {
         @match p.glyph {
             Glyph::Busy => {

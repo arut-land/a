@@ -8,7 +8,10 @@ pub enum Block<'a> {
     /// `#` to `######`, the level and the text after them.
     Heading(u8, &'a str),
     /// `- ` or `* `, with the spaces before it.
-    Bullet { indent: u8, text: &'a str },
+    Bullet {
+        indent: u8,
+        text: &'a str,
+    },
     /// `> `.
     Quote(&'a str),
     /// A ```` ``` ```` line, opening or closing a fence, as written.

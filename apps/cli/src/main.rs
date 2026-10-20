@@ -393,7 +393,7 @@ impl Screen {
     fn updated(&mut self, item: &Item, part: Part) {
         let p = item.present();
         match (part, p.kind) {
-            (Part::Outcome, Kind::Reply | Kind::Side) => {
+            (Part::Outcome, Kind::Reply) => {
                 // A streamed reply is on screen already; end its line.
                 let streamed = self.streaming.take_if(|s| s.0 == item.key()).is_some();
                 if streamed {
@@ -414,10 +414,9 @@ impl Screen {
             (Part::Phase, _) if self.synced && p.buttons != protocol::view::Buttons::None => {
                 println!("{}", ask(&p));
             }
-            (Part::Answer { approved }, _) => println!(
-                "  · {}",
-                if approved { "approved" } else { "not approved" }
-            ),
+            (Part::Answer { approved }, _) => {
+                println!("  · {}", if approved { "approved" } else { "not approved" });
+            }
             _ => {}
         }
     }
@@ -444,7 +443,8 @@ fn added(item: &Item) -> Vec<String> {
         Kind::Tool => vec![format!("tool {}", p.title)],
         Kind::Hook | Kind::Environment => vec![format!("  · {}", p.title)],
         Kind::Child => vec![format!("{} {}", p.title, p.body.text())],
-        // Printed when done: as its text streams, or whole.
+        // A reply is printed when done: as its text streams, or whole. A
+        // side request's reply is its extension's, not the conversation's.
         Kind::Reply | Kind::Side => Vec::new(),
     }
 }
@@ -541,4 +541,90 @@ fn daemon(
         &ctx.staged.id,
         start,
     )
+}
+
+/// Every renderer shows an item the same way: whatever one says of an
+/// item (its title, its status, its body), the others say too, over the
+/// shared view vectors. The layout is each renderer's; the words are not.
+#[cfg(all(test, unix, feature = "web"))]
+mod parity {
+    use protocol::view::{Kind, SessionView, Shown};
+    use protocol::{DaemonMsg, Decode};
+
+    /// Text as a renderer that cannot wrap, colour or indent would have it.
+    fn bare(text: &str) -> String {
+        text.chars().filter(|c| !c.is_whitespace()).collect()
+    }
+
+    /// The text of markup: tags dropped, entities read back.
+    fn text_of_html(html: &str) -> String {
+        let mut text = String::new();
+        let mut tag = false;
+        for c in html.chars() {
+            match c {
+                '<' => tag = true,
+                '>' => tag = false,
+                c if !tag => text.push(c),
+                _ => {}
+            }
+        }
+        text.replace("&lt;", "<")
+            .replace("&gt;", ">")
+            .replace("&quot;", "\"")
+            .replace("&#39;", "'")
+            .replace("&amp;", "&")
+    }
+
+    #[test]
+    fn every_renderer_shows_an_item_the_same_way() {
+        let path = concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../../crates/protocol/tests/vectors/view.json"
+        );
+        let vectors: Vec<serde_json::Value> =
+            serde_json::from_str(&std::fs::read_to_string(path).unwrap()).unwrap();
+        let mut items = 0;
+        for vector in vectors {
+            let mut view = SessionView::default();
+            for m in vector["messages"].as_array().unwrap() {
+                view.fold(&DaemonMsg::from_json(m.to_string().as_bytes()).unwrap());
+            }
+            for item in &view.items {
+                let p = item.present();
+                if p.kind == Kind::Side {
+                    continue;
+                }
+                items += 1;
+                let look = tui::view::Look {
+                    verbose: true,
+                    ..tui::view::Look::default()
+                };
+                let tui = tui::view::texts(&tui::view::rows(item, 200, look)).join("\n");
+                let web = text_of_html(&web::view::html(web::view::ItemRow { item, view: &view }));
+                let mut repl = super::added(item);
+                if item.settled() {
+                    repl.extend(super::outcome(&p));
+                }
+                let repl = repl.join("\n");
+                let said = [
+                    bare(&p.title),
+                    bare(&p.status),
+                    match &p.body {
+                        Shown::None => String::new(),
+                        body => bare(body.text().lines().next().unwrap_or_default()),
+                    },
+                ];
+                for (name, shown) in [("tui", &tui), ("web", &web), ("repl", &repl)] {
+                    let shown = bare(shown);
+                    for word in &said {
+                        assert!(
+                            shown.contains(word.as_str()),
+                            "{name} leaves {word:?} out of {item:?}:\n{shown}"
+                        );
+                    }
+                }
+            }
+        }
+        assert!(items > 20, "{items} items checked");
+    }
 }

@@ -10,7 +10,10 @@ mod http;
 mod page;
 mod patch;
 mod style;
-mod view;
+/// Items as markup: public for the test that every renderer shows an item
+/// the same way.
+#[doc(hidden)]
+pub mod view;
 
 use std::io::{self, Write};
 use std::net::TcpListener;

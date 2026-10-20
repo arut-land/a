@@ -10,8 +10,8 @@ use std::time::{Duration, Instant};
 use crate::store::{Header, Jsonl, LogStore};
 use protocol::view::SessionView;
 use protocol::{
-    Body, Caps, ClientDecl, ClientId, ClientMsg, DaemonMsg, Entry, Environment, PROTO, Rejection,
-    Role, SessionId, SettingsChange, Target, read_frame, write_frame,
+    Body, CallId, Caps, ClientDecl, ClientId, ClientMsg, DaemonMsg, Entry, Environment, Epoch,
+    PROTO, Rejection, Role, Seq, SessionId, SettingsChange, Target, read_frame, write_frame,
 };
 use sys::Home;
 
@@ -304,12 +304,12 @@ fn a_repeated_mutation_is_answered_again_but_not_done_again() {
     peer.send(&input("hi", 1));
     peer.send(&input("hi", 1));
     peer.send(&ClientMsg::Approve {
-        call: 9,
+        call: CallId::new(9).unwrap(),
         approved: true,
         client_seq: Some(2),
     });
     peer.send(&ClientMsg::Approve {
-        call: 9,
+        call: CallId::new(9).unwrap(),
         approved: true,
         client_seq: Some(2),
     });
@@ -424,7 +424,7 @@ fn far_behind_a_client_gets_a_snapshot() {
                     taken: true,
                     origin: None,
                 };
-                Entry::new(seq, epoch, body)
+                Entry::new(Seq::new(seq).unwrap(), Epoch(epoch), body)
             })
             .collect();
         log.append_all(&entries).unwrap();

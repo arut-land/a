@@ -14,7 +14,7 @@ use std::process::{Child, ChildStdin, ChildStdout, Command, Output, Stdio};
 use std::time::{Duration, Instant};
 
 use protocol::view::SessionView;
-use protocol::{Body, ClientMsg, DaemonMsg, Entry, Outcome, PROTO, SessionId, Target};
+use protocol::{Body, ClientMsg, DaemonMsg, Entry, Outcome, PROTO, Seq, SessionId, Target};
 use sys::{Home, Signal};
 
 /// `A_STRICT_BUDGETS=1` holds latency to the design's budget; otherwise it
@@ -310,7 +310,7 @@ impl Conn {
             match self.recv() {
                 DaemonMsg::Entry(e) => replay.push(e),
                 DaemonMsg::Synced { seq } => {
-                    assert_eq!(seq, replay.last().map_or(0, |e| e.seq));
+                    assert_eq!(seq, replay.last().map_or(0, |e| e.seq.get()));
                     return (session, replay);
                 }
                 msg => panic!("unexpected during replay: {msg:?}"),
@@ -423,16 +423,16 @@ pub fn wait_within(what: &str, within: Duration, mut done: impl FnMut() -> bool)
 /// Asserts the entries are numbered 1, 2, 3, … with nothing missing or
 /// repeated.
 pub fn assert_contiguous(entries: &[Entry]) {
-    let seqs: Vec<u64> = entries.iter().map(|e| e.seq).collect();
+    let seqs: Vec<u64> = entries.iter().map(|e| e.seq.get()).collect();
     let want: Vec<u64> = (1..=entries.len() as u64).collect();
     assert_eq!(seqs, want, "gaps or duplicates");
 }
 
-pub fn result_of(e: &Entry, call: u64) -> Option<&Outcome> {
+pub fn result_of(e: &Entry, call: Seq) -> Option<&Outcome> {
     match &e.body {
         Body::ToolResult {
             call: c, outcome, ..
-        } if *c == call => Some(outcome),
+        } if c.0 == call => Some(outcome),
         _ => None,
     }
 }

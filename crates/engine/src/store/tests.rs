@@ -8,7 +8,7 @@ use std::path::PathBuf;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::thread;
 
-use protocol::{Body, Decode, Entry, Json, ReadOnly, SessionId};
+use protocol::{Body, Decode, Entry, Epoch, Json, ReadOnly, Seq, SessionId};
 
 use super::jsonl::{FORMAT, seal, unseal};
 use super::*;
@@ -102,8 +102,8 @@ fn header(workspace: &str) -> Header {
 
 fn entry(seq: u64, epoch: u32) -> Entry {
     Entry::new(
-        seq,
-        epoch,
+        Seq::new(seq).unwrap(),
+        Epoch(epoch),
         Body::Input {
             text: format!("m{seq}"),
             mode: protocol::Mode::Queue,
@@ -218,7 +218,12 @@ fn lines_read_back_as_appended(store: &dyn LogStore) {
     let again = load(store, h.id).0;
     for (lines, upto) in [(&created.lines, 3), (&loaded.lines, 5), (&again.lines, 5)] {
         for e in &written[..upto] {
-            assert_eq!(line(&**lines, e.seq).unwrap(), encoded(e), "{}", e.seq);
+            assert_eq!(
+                line(&**lines, e.seq.get()).unwrap(),
+                encoded(e),
+                "{}",
+                e.seq
+            );
         }
         for seq in [0, 6] {
             assert_eq!(line(&**lines, seq).unwrap_err().kind(), ErrorKind::NotFound);
@@ -325,7 +330,7 @@ fn each_load_leases_a_newer_epoch(store: &dyn LogStore) {
     assert!(epochs[0] > 0, "{epochs:?}");
     assert!(epochs.windows(2).all(|w| w[0] < w[1]), "{epochs:?}");
     let (loaded, entries) = load(store, h.id);
-    let logged: Vec<u32> = entries.iter().map(|e| e.epoch).collect();
+    let logged: Vec<u32> = entries.iter().map(|e| e.epoch.0).collect();
     assert_eq!(logged[2..], epochs);
     assert!(loaded.writer.epoch() > epochs[2]);
 }
@@ -399,7 +404,12 @@ fn a_torn_tail_is_never_indexed() {
         written.extend(append(&mut loaded, 3..=4));
         for lines in [&loaded.lines, &load(&*store, h.id).0.lines] {
             for e in &written {
-                assert_eq!(line(&**lines, e.seq).unwrap(), encoded(e), "{}", e.seq);
+                assert_eq!(
+                    line(&**lines, e.seq.get()).unwrap(),
+                    encoded(e),
+                    "{}",
+                    e.seq
+                );
             }
         }
         let file = fs::read(&path).unwrap();
@@ -483,7 +493,7 @@ fn kept_as_is(
     assert_eq!(refused.to_string(), why.to_string());
     assert_eq!(fs::read(path).unwrap(), file, "the file is never touched");
     for e in entries {
-        assert_eq!(line(&*loaded.lines, e.seq).unwrap(), encoded(e));
+        assert_eq!(line(&*loaded.lines, e.seq.get()).unwrap(), encoded(e));
     }
 }
 
@@ -502,7 +512,11 @@ fn a_valid_line_is_never_cut() {
     let (mut loaded, entries) = load(&*store, h.id);
     let raw: Json = serde_json::from_slice(unknown).unwrap();
     let kind = "newer".to_owned();
-    written.push(Entry::new(5, 7, Body::Unknown { kind, raw }));
+    written.push(Entry::new(
+        Seq::new(5).unwrap(),
+        Epoch(7),
+        Body::Unknown { kind, raw },
+    ));
     assert_eq!(entries, written);
     assert_eq!(loaded.writer.read_only(), None);
     assert_eq!(line(&*loaded.lines, 5).unwrap(), unknown);

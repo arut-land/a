@@ -283,6 +283,7 @@ impl Live {
             transcript: None,
             replied: None,
             snapshot: None,
+            view: None,
             cancels: Keyed::default(),
             waiting: Keyed::default(),
             answers: Keyed::default(),
@@ -439,6 +440,9 @@ struct Actor {
     replied: Option<(CallId, llm::Assistant)>,
     /// The last snapshot made, and its seq; `None` for one too large.
     snapshot: Option<(u64, Option<Frame>)>,
+    /// The view a far attach is sent, kept in step with each commit from
+    /// the first time one is asked for: no attach folds the whole log.
+    view: Option<SessionView>,
     /// What stops each effect in flight.
     cancels: Keyed<CallId, Cancel>,
     /// Calls waiting on a child, for its result.
@@ -546,7 +550,7 @@ impl Actor {
                 request,
                 origin,
                 reply,
-            } => self.requested(request, origin, reply)?,
+            } => self.requested(request, origin, reply),
             Msg::Step(event) => event,
             Msg::Attach(client, since, done) => {
                 self.attach(&client, since);
@@ -639,11 +643,11 @@ impl Actor {
         request: Request,
         origin: Option<Author>,
         reply: oneshot::Sender<Result<(), String>>,
-    ) -> Option<Event> {
+    ) -> Event {
         self.tickets += 1;
         let ticket = Some(Ticket(self.tickets));
         self.replies.insert(Ticket(self.tickets), reply);
-        Some(match request {
+        match request {
             Request::Input { text, mode } => Event::Input {
                 text,
                 mode,
@@ -651,15 +655,13 @@ impl Actor {
                 ticket,
             },
             Request::Interrupt => Event::Interrupt { origin, ticket },
-            Request::Answer { call, value } => {
-                Event::Answer {
-                    call,
-                    value,
-                    origin,
-                    ticket,
-                }
-            }
-        })
+            Request::Answer { call, value } => Event::Answer {
+                call,
+                value,
+                origin,
+                ticket,
+            },
+        }
     }
 
     /// Steps the kernel through `events` and carries out what follows. A
@@ -846,6 +848,9 @@ impl Actor {
         // An edit changes what came before it: the transcript is made again.
         if entries.iter().any(|e| matches!(e.body, Body::Edit { .. })) {
             self.transcript = None;
+        }
+        if let Some(view) = &mut self.view {
+            view.extend(entries);
         }
         for e in entries {
             self.live.frames.push(e.seq.get());
@@ -1250,8 +1255,10 @@ impl Actor {
             return frame.clone();
         }
         let live = &self.live;
-        let view = SessionView::from_log(live.id, live.workspace.clone(), live.frames.entries());
-        let frame = Frame::new(&DaemonMsg::Snapshot(Box::new(view))).ok();
+        let view = self.view.get_or_insert_with(|| {
+            SessionView::from_log(live.id, live.workspace.clone(), live.frames.entries())
+        });
+        let frame = Frame::new(&DaemonMsg::Snapshot(Box::new(view.clone()))).ok();
         self.snapshot = Some((seq, frame.clone()));
         frame
     }

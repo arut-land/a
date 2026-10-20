@@ -7,7 +7,7 @@ use std::time::Duration;
 
 use common::*;
 use kernel::{Effect, Event, Gated, Later, Load, Note, Owner, Recover, Ticket};
-use protocol::{Audience, Body, Installed, Json, Mode, Outcome, Permission, Verdict};
+use protocol::{Audience, Body, CallId, Installed, Json, Mode, Outcome, Permission, Seq, Verdict};
 use serde_json::json;
 
 fn echo() -> Session {
@@ -842,7 +842,13 @@ fn tasked() -> Vec<Effect> {
 }
 
 fn fired(seq: u64, watch: u64, outcome: Outcome) -> Effect {
-    append(seq, Body::Fired { watch, outcome })
+    append(
+        seq,
+        Body::Fired {
+            watch: Seq::new(watch).unwrap(),
+            outcome,
+        },
+    )
 }
 
 /// A call waiting on its child goes on with the child's result.
@@ -992,7 +998,7 @@ fn a_settled_call_cannot_write_and_stray_reports_change_nothing() {
             vec![append(
                 3,
                 Body::Progress {
-                    call: 2,
+                    call: CallId::new(2).unwrap(),
                     text: "one\n".into(),
                 },
             )],
