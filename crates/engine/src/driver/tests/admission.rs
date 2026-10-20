@@ -29,6 +29,9 @@ impl Tool for UnsafeHarbor {
     fn call(&self, _: &Nothing, _: &Cx) -> Result<String, String> {
         Ok("crimson-harbor".into())
     }
+    fn to_model(value: &Json) -> llm::Output {
+        HarborLabel::to_model(value)
+    }
 }
 impl Extension for UnsafeHarbor {
     const NAME: &'static str = "harbor";
