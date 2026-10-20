@@ -134,3 +134,24 @@ fn the_full_screen_client_rides_out_a_daemon_upgrade() {
     let out = String::from_utf8_lossy(&term.bytes()).into_owned();
     assert!(out.contains("[detached; the session keeps running"));
 }
+
+#[test]
+fn esc_interrupts_a_running_turn_without_leaving_either_viewport() {
+    for viewport in ["full", "inline"] {
+        let mut env = Env::new("tui-esc");
+        env.vars.push(("A_TUI", viewport));
+        let mut term = env.tty(&[], 80, 24);
+        term.wait_for("● live");
+        term.send(b"$ echo started; sleep 60\r");
+        term.wait_for("⎿  started");
+        term.wait_for("Working…");
+        term.send(b"\x1b");
+        let screen = term.wait_for("aborted");
+        assert!(!screen.text().contains("Working…"), "{}", screen.text());
+        term.send(b"still here\r");
+        term.wait_for("⏺ still here");
+        term.send(b"\x04");
+        assert!(term.wait().success());
+        assert!(term.cooked(), "detaching restores terminal input");
+    }
+}
