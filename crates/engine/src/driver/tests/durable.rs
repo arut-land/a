@@ -309,3 +309,30 @@ fn poll_actor(actor: &mut rt::BoxFuture<'static, ()>) {
     let mut cx = std::task::Context::from_waker(std::task::Waker::noop());
     assert!(actor.as_mut().poll(&mut cx).is_pending());
 }
+
+#[test]
+fn a_barrier_without_its_flush_neither_publishes_nor_starts_an_external_effect() {
+    let faulty = Arc::new(Faulty::new(Arc::new(Memory::default())));
+    let (started, starts) = channel::unbounded();
+    let fixture = Fixture::on(
+        Arc::clone(&faulty) as _,
+        ext_fixtures::ECHO,
+        Registry::default()
+            .with(&ControlledSleep(Arc::new(started)))
+            .unwrap(),
+        openai(&Script::new(&[])),
+    );
+    let session = fixture.create();
+    settle(&session);
+    let before = log_of(&session);
+    faulty.cut_before_next_flush();
+    assert!(session.submit("sleep 0").is_err());
+    session.halt();
+    assert_eq!(faulty.entries(session.id).unwrap(), before);
+    assert_eq!(
+        log_of(&session),
+        before,
+        "a failed promise cannot publish a seq"
+    );
+    assert!(starts.try_recv().is_none());
+}

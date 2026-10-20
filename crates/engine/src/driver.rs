@@ -235,7 +235,13 @@ impl Live {
         });
         let bound = bind(&registry, &session);
         let binding = Arc::clone(&bound) as Arc<dyn Binding>;
-        let (loaded, folding) = Folding::open(header, shared, open, &binding, &registry)?;
+        let (mut loaded, folding) = Folding::open(header, shared, open, &binding, &registry)?;
+        // A process restart can read cache-resident entries that no client
+        // has seen. Replaying them makes the same promise as a live commit.
+        if loaded.seq != 0 {
+            loaded.writer.sync()?;
+            rt::block_on(loaded.writer.flushed(&*shared.rt))?;
+        }
         let Folding {
             mut core,
             states,
@@ -1003,6 +1009,14 @@ impl Actor {
             io::Result::Ok((loaded, folding))
         })
         .await;
+        let reloaded = match reloaded {
+            Ok((mut loaded, folding)) => loaded
+                .writer
+                .flushed(&*self.live.session.shared.rt)
+                .await
+                .map(|()| (loaded, folding)),
+            Err(error) => Err(error),
+        };
         let (loaded, folding) = match reloaded {
             Ok(reloaded) => reloaded,
             Err(e) => {
@@ -1083,7 +1097,7 @@ impl Actor {
         let listing = relisted(&listed, &listing).then_some(listing);
         let shared = Arc::clone(&self.live.session.shared);
         let rt = Arc::clone(&shared.rt);
-        let (writer, entries, written, listing) = rt::unblock(&*rt, move || {
+        let (mut writer, entries, mut written, listing) = rt::unblock(&*rt, move || {
             let first = listing.as_ref().is_some_and(|l| l.busy);
             if first && let Some(listing) = &listing {
                 shared.catalog.record(listing.clone());
@@ -1099,6 +1113,12 @@ impl Actor {
             (writer, entries, written, listing)
         })
         .await;
+        if durable
+            && written.is_ok()
+            && let Err(error) = writer.flushed(&*rt).await
+        {
+            written = Err(error);
+        }
         // Not cleared after entries that did not commit.
         if written.is_err() && listing.is_some_and(|l| !l.busy) {
             self.listed = listed;
@@ -1194,11 +1214,14 @@ impl Actor {
             return Err(());
         };
         let rt = Arc::clone(&self.live.session.shared.rt);
-        let (writer, synced) = rt::unblock(&*rt, move || {
+        let (mut writer, mut synced) = rt::unblock(&*rt, move || {
             let synced = writer.sync();
             (writer, synced)
         })
         .await;
+        if synced.is_ok() {
+            synced = writer.flushed(&*rt).await;
+        }
         self.writer = Some(writer);
         match synced {
             Ok(()) => {

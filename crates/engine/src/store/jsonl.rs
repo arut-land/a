@@ -8,8 +8,7 @@ use protocol::{Decode, Entry, Json, ReadOnly, SessionId};
 use serde::{Deserialize, Serialize};
 
 use super::{
-    Encoded, Header, Kept, LeaseAuthority, Lines, Loaded, Local, Log, LogStore, Snapshot, Writer,
-    span,
+    Encoded, Header, LeaseAuthority, Lines, Loaded, Local, Log, LogStore, Snapshot, Writer, span,
 };
 
 /// The format of the files this build writes, which the header line names:
@@ -17,8 +16,8 @@ use super::{
 pub(crate) const FORMAT: u32 = 1;
 
 /// One append-only JSONL file per session in a directory: the header on the
-/// first line, one entry per line after it. Sessions share nothing, so they
-/// never contend; a single writer per directory is the daemon lock's job.
+/// first line, one entry per line after it. Sessions share their drive-cache
+/// flusher; a single writer per directory is the daemon lock's job.
 ///
 /// Every line is sealed with a checksum of itself ([`seal`]), so what a load
 /// cuts depends only on whether a line is whole, never on whether this
@@ -36,6 +35,7 @@ pub(crate) const FORMAT: u32 = 1;
 pub struct Jsonl {
     dir: PathBuf,
     leases: Local,
+    flusher: Arc<rt::Flusher>,
 }
 
 impl Jsonl {
@@ -45,6 +45,7 @@ impl Jsonl {
         Ok(Self {
             dir,
             leases: Local::default(),
+            flusher: Arc::default(),
         })
     }
 
@@ -81,7 +82,13 @@ impl LogStore for Jsonl {
         let index = Index::new(file, path, line.len() as u64);
         index.persist(0);
         let epoch = self.leases.acquire(header.id, 0);
-        Ok(index.loaded(0, 0, epoch, Ok(Some(self.dir.clone()))))
+        Ok(index.loaded(
+            0,
+            0,
+            epoch,
+            Ok(Some(self.dir.clone())),
+            Arc::clone(&self.flusher),
+        ))
     }
 
     /// A file whose header did not survive a crash holds no entries either,
@@ -152,7 +159,13 @@ impl LogStore for Jsonl {
         let agreed = placed.agreed(&index.read().ends);
         index.persist(agreed);
         let epoch = self.leases.acquire(id, floor);
-        Ok(index.loaded(seq, read, epoch, kept.map_or(Ok(None), Err)))
+        Ok(index.loaded(
+            seq,
+            read,
+            epoch,
+            kept.map_or(Ok(Some(self.dir.clone())), Err),
+            Arc::clone(&self.flusher),
+        ))
     }
 
     #[cfg(test)]
@@ -227,16 +240,20 @@ impl Index {
         read: u64,
         epoch: u32,
         kept: Result<Option<PathBuf>, ReadOnly>,
+        flusher: Arc<rt::Flusher>,
     ) -> Loaded {
         let index = Arc::new(self);
-        let log: Box<dyn Log> = match kept {
-            Ok(new_in) => Box::new(JsonlLog {
-                index: Arc::clone(&index),
-                new_in,
-                torn: false,
-            }),
-            Err(why) => Box::new(Kept(why)),
+        let (new_in, read_only) = match kept {
+            Ok(new_in) => (new_in, None),
+            Err(why) => (index.path.parent().map(Path::to_path_buf), Some(why)),
         };
+        let log = Box::new(JsonlLog {
+            index: Arc::clone(&index),
+            new_in,
+            torn: false,
+            flusher,
+            read_only,
+        });
         Loaded {
             lines: index,
             seq,
@@ -497,9 +514,11 @@ impl Snap {
     }
 }
 
-/// Durable once [`sys::sync_data`] returns.
+/// Durable once the shared flusher covers its barriers.
 struct JsonlLog {
     index: Arc<Index>,
+    flusher: Arc<rt::Flusher>,
+    read_only: Option<ReadOnly>,
     /// The directory of a file not yet synced since it was created: its
     /// name is only durable once the directory is.
     new_in: Option<PathBuf>,
@@ -516,17 +535,33 @@ impl Log for JsonlLog {
         self.write(&sealed(lines), true)
     }
 
-    /// One write, and no sync.
+    /// Ordered without waiting for a drive-cache flush.
     fn write_all(&mut self, _: &[Entry], lines: &Encoded) -> io::Result<()> {
         self.write(&sealed(lines), false)
     }
 
     fn sync(&mut self) -> io::Result<()> {
         sys::sync_data(&self.index.file)?;
-        if let Some(dir) = self.new_in.take() {
-            sys::fs::sync_dir(&dir)?;
+        if let Some(dir) = &self.new_in {
+            sys::fs::order_dir(dir)?;
         }
+        self.new_in = None;
         Ok(())
+    }
+
+    fn flush(&mut self, rt: &dyn rt::Runtime) -> Option<rt::FlushEpoch> {
+        if !sys::fs::SEPARATE_CACHE_FLUSH {
+            return None;
+        }
+        let index = Arc::clone(&self.index);
+        Some(
+            self.flusher
+                .request(rt, move || sys::fs::flush_cache(&index.file)),
+        )
+    }
+
+    fn read_only(&self) -> Option<ReadOnly> {
+        self.read_only
     }
 
     /// Placed where the line of the entry it covers ends, which must be
@@ -564,6 +599,12 @@ fn sealed(lines: &Encoded) -> Vec<u8> {
 
 impl JsonlLog {
     fn write(&mut self, lines: &[u8], sync: bool) -> io::Result<()> {
+        if let Some(why) = self.read_only {
+            return Err(io::Error::new(
+                io::ErrorKind::ReadOnlyFilesystem,
+                why.to_string(),
+            ));
+        }
         if lines.is_empty() {
             return Ok(());
         }
@@ -576,11 +617,11 @@ impl JsonlLog {
         let written = (|| {
             (&*file).write_all(lines)?;
             if !sync {
-                return Ok(());
+                return sys::fs::order_data(file);
             }
             sys::sync_data(file)?;
             if let Some(dir) = &self.new_in {
-                sys::fs::sync_dir(dir)?;
+                sys::fs::order_dir(dir)?;
             }
             io::Result::Ok(())
         })();
