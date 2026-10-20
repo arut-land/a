@@ -52,6 +52,22 @@ fn the_full_screen_client_shows_replies_and_answers_approvals_by_click() {
     assert!(out.contains("[detached; the session keeps running"));
 }
 
+/// The first frame does not wait for the daemon: with the socket held by
+/// something that never answers the hello, the screen is still painted,
+/// and nothing in it asked the terminal a question.
+#[test]
+fn first_frame_before_the_daemon_answers() {
+    let env = Env::new("tui-first-frame");
+    let held = env.home.bind().unwrap();
+    let term = env.tty(&[], 80, 24);
+    let screen = term.wait_for("◌ connecting");
+    assert!(screen.find("F1 help").is_some(), "{}", screen.text());
+    let first = term.first_frame().expect("no frame");
+    eprintln!("spawn to first frame, daemon silent: {first:?}");
+    assert!(!term.bytes().windows(3).any(|w| w == b"\x1b[6n"));
+    drop(held);
+}
+
 #[test]
 fn the_inline_client_prints_the_transcript_into_the_scrollback() {
     let mut env = Env::new("tui-inline");

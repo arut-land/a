@@ -5,10 +5,10 @@ use protocol::{Audience, Json, Outcome};
 use serde::Deserialize;
 use serde::de::IgnoredAny;
 
-use ratatui_core::style::{Color, Modifier, Style};
-
 use super::render::ellipsize;
-use super::text::{Action, Line, Span, markdown, markdown_into, sanitize, wrap};
+use super::text::{
+    Action, Color, Line, Modifier, Span, Style, markdown, markdown_into, sanitize, wrap,
+};
 
 /// How much of a card's output shows unless everything is expanded.
 const TAIL: usize = 10;
