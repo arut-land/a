@@ -165,11 +165,19 @@ impl Writer {
         self.log.sync()
     }
 
+    pub fn durable_on_order(&self) -> bool {
+        self.log.durable_on_order()
+    }
+
+    pub fn enroll(&mut self) -> Option<rt::FlushRequest> {
+        self.log.enroll()
+    }
+
     /// Waits for a cache flush covering the writer's earlier barriers.
     /// Backends whose barriers already flush return without scheduling work.
     pub async fn flushed(&mut self, rt: &dyn rt::Runtime) -> io::Result<()> {
-        if let Some(epoch) = self.log.flush(rt) {
-            epoch.await?;
+        if let Some(request) = self.enroll() {
+            request.dispatch(rt).await?;
         }
         Ok(())
     }
@@ -226,7 +234,7 @@ pub trait LogStore: Send + Sync {
 /// One session's appender.
 pub trait Log: Send {
     /// Appends `entries` in order and passes their write barrier. Once
-    /// [`Log::flush`] completes, a power cut never loses them. `lines` is
+    /// [`Log::enroll`] completes, a power cut never loses them. `lines` is
     /// the entries encoded, which a backend stores as they are.
     fn append_all(&mut self, entries: &[Entry], lines: &Encoded) -> io::Result<()>;
 
@@ -243,8 +251,12 @@ pub trait Log: Send {
         Ok(())
     }
 
+    fn durable_on_order(&self) -> bool {
+        true
+    }
+
     /// The cache-flush epoch after the last barrier, where it needs one.
-    fn flush(&mut self, _: &dyn rt::Runtime) -> Option<rt::FlushEpoch> {
+    fn enroll(&mut self) -> Option<rt::FlushRequest> {
         None
     }
 

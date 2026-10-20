@@ -15,8 +15,9 @@ use protocol::Card;
 
 use crate::fold::{Fold, Next};
 use crate::{
-    Action, Answer, Barriers, Binding, Chained, Concurrency, Durability, Effect, Effects, Event,
-    Gate, Gated, Load, ModelPhase, Name, Note, Owner, Recover, Replay, Replied, Step, Ticket, Turn,
+    Action, Admission, Answer, Barriers, Binding, Chained, Concurrency, Durability, Effect,
+    Effects, Event, Gate, Gated, Load, ModelPhase, Name, Note, Owner, Recover, Replay, Replied,
+    Requirement, Step, Ticket, Turn,
 };
 
 /// Who refused a call the agent would not run.
@@ -243,6 +244,39 @@ impl Core {
         self.advance(fx);
         self.marks(fx);
         self.commits(fx);
+        let through = self.fold.ledger.seq();
+        for index in (0..fx.len()).rev() {
+            let requirement = match &fx[index] {
+                Effect::RunTool { call, .. } | Effect::Resume { call, .. } => {
+                    Some(if self.safe(*call) {
+                        Requirement::Ordered
+                    } else {
+                        Requirement::Durable
+                    })
+                }
+                Effect::Prepare { .. }
+                | Effect::Send { .. }
+                | Effect::Sleep { .. }
+                | Effect::Await { .. }
+                | Effect::Recover { .. }
+                | Effect::Kill { .. } => Some(Requirement::Ordered),
+                Effect::Reply { .. }
+                | Effect::Side { .. }
+                | Effect::StartChild { .. }
+                | Effect::Interrupt { .. }
+                | Effect::Report { .. } => Some(Requirement::Durable),
+                _ => None,
+            };
+            if let Some(requirement) = requirement {
+                fx.insert(
+                    index,
+                    Effect::Require(Admission {
+                        through,
+                        requirement,
+                    }),
+                );
+            }
+        }
     }
 
     /// Ends the entries `fx` appends with their commit, after the last of
@@ -258,7 +292,14 @@ impl Core {
             matches!(e, Effect::Append(e) if !matches!(e.body, Body::Progress { .. } | Body::Ext { .. }))
         });
         let before = fx.iter().any(Effect::external);
-        fx.insert(last + 1, Effect::Commit(self.commit(fact, before)));
+        fx.insert(
+            last + 1,
+            Effect::Commit {
+                through: self.fold.ledger.seq(),
+                durability: self.commit(fact, before),
+                publish: fact && self.turn == Turn::Idle,
+            },
+        );
     }
 
     /// How durable a step's entries are to be: holding `fact`s beyond

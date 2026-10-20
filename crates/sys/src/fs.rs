@@ -23,6 +23,45 @@ pub fn sync_data(file: &File) -> io::Result<()> {
 /// Whether an ordered write still needs a separate drive-cache flush.
 pub const SEPARATE_CACHE_FLUSH: bool = cfg!(target_vendor = "apple");
 
+/// A shared cache flush can cover only files on the store's device.
+pub struct FlushDomain {
+    #[cfg(target_vendor = "apple")]
+    device: u64,
+}
+
+impl FlushDomain {
+    pub fn of(dir: &Path) -> io::Result<Self> {
+        #[cfg(target_vendor = "apple")]
+        {
+            use std::os::unix::fs::MetadataExt;
+            Ok(Self {
+                device: fs::metadata(dir)?.dev(),
+            })
+        }
+        #[cfg(not(target_vendor = "apple"))]
+        {
+            let _ = dir;
+            Ok(Self {})
+        }
+    }
+
+    pub fn check(&self, file: &File) -> io::Result<()> {
+        #[cfg(target_vendor = "apple")]
+        {
+            use std::os::unix::fs::MetadataExt;
+            if file.metadata()?.dev() != self.device {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    "log is outside the store's flush device",
+                ));
+            }
+        }
+        #[cfg(not(target_vendor = "apple"))]
+        let _ = file;
+        Ok(())
+    }
+}
+
 /// Flushes the cache containing earlier ordered writes. Other platforms
 /// have already flushed it with `sync_data`.
 pub fn flush_cache(file: &File) -> io::Result<()> {
@@ -234,6 +273,19 @@ mod tests {
     use std::os::unix::fs::PermissionsExt;
 
     use super::*;
+
+    #[cfg(target_vendor = "apple")]
+    #[test]
+    fn a_file_on_another_device_is_never_admitted_to_a_flush_domain() {
+        let dir = std::env::temp_dir();
+        let file = File::open(&dir).unwrap();
+        let domain = FlushDomain::of(&dir).unwrap();
+        domain.check(&file).unwrap();
+        let other = FlushDomain {
+            device: domain.device ^ 1,
+        };
+        assert!(other.check(&file).is_err());
+    }
 
     #[test]
     fn private_files_and_dirs_are_the_owners_alone() {

@@ -36,16 +36,19 @@ pub struct Jsonl {
     dir: PathBuf,
     leases: Local,
     flusher: Arc<rt::Flusher>,
+    domain: sys::fs::FlushDomain,
 }
 
 impl Jsonl {
     pub fn open(dir: impl Into<PathBuf>) -> io::Result<Self> {
         let dir = dir.into();
         fs::create_dir_all(dir.join(DERIVED))?;
+        let domain = sys::fs::FlushDomain::of(&dir)?;
         Ok(Self {
             dir,
             leases: Local::default(),
             flusher: Arc::default(),
+            domain,
         })
     }
 
@@ -73,6 +76,7 @@ impl LogStore for Jsonl {
             .read(true)
             .append(true)
             .open(&path)?;
+        self.domain.check(&file)?;
         let mut line = format!(r#"{{"format":{FORMAT},"#).into_bytes();
         let at = line.len();
         serde_json::to_writer(&mut line, header)?;
@@ -128,6 +132,7 @@ impl LogStore for Jsonl {
     ) -> io::Result<Loaded> {
         let path = self.path(id);
         let file = OpenOptions::new().read(true).append(true).open(&path)?;
+        self.domain.check(&file)?;
         let mut index = Index::new(file, path, 0);
         let other = index.header()?;
         let mut floor = index.recall()?;
@@ -549,14 +554,18 @@ impl Log for JsonlLog {
         Ok(())
     }
 
-    fn flush(&mut self, rt: &dyn rt::Runtime) -> Option<rt::FlushEpoch> {
+    fn durable_on_order(&self) -> bool {
+        !sys::fs::SEPARATE_CACHE_FLUSH
+    }
+
+    fn enroll(&mut self) -> Option<rt::FlushRequest> {
         if !sys::fs::SEPARATE_CACHE_FLUSH {
             return None;
         }
         let index = Arc::clone(&self.index);
         Some(
             self.flusher
-                .request(rt, move || sys::fs::flush_cache(&index.file)),
+                .enroll(move || sys::fs::flush_cache(&index.file)),
         )
     }
 

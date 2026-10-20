@@ -10,11 +10,12 @@ use std::task::{Context, Poll};
 use crate::{Runtime, lock, oneshot};
 
 type Work = Box<dyn FnOnce() -> io::Result<()> + Send>;
+type Prepare = Box<dyn FnOnce() -> Work + Send>;
 
 #[derive(Default)]
 struct State {
     running: bool,
-    work: Option<Work>,
+    work: Option<Prepare>,
     pending: Vec<oneshot::Sender<io::Result<()>>>,
 }
 
@@ -43,6 +44,74 @@ impl Future for FlushEpoch {
     }
 }
 
+/// Registration happens after the write barrier on the appending thread.
+/// Returning the epoch first lets its actor continue while the leader flushes.
+pub struct FlushRequest {
+    pub epoch: FlushEpoch,
+    pub leader: Option<FlushLeader>,
+}
+
+pub struct FlushLeader {
+    shared: Arc<Mutex<State>>,
+    first: Option<(Work, Vec<oneshot::Sender<io::Result<()>>>)>,
+}
+
+impl FlushLeader {
+    fn seal(mut self) -> Self {
+        if self.first.is_none() {
+            let (prepare, pending) = {
+                let mut state = lock(&self.shared);
+                (
+                    state.work.take().expect("elected flush"),
+                    std::mem::take(&mut state.pending),
+                )
+            };
+            self.first = Some((prepare(), pending));
+        }
+        self
+    }
+
+    pub fn run(self) {
+        let mut leader = self.seal();
+        let (work, pending) = leader.first.take().expect("sealed flush");
+        complete(work, pending);
+        run(&leader.shared);
+    }
+}
+
+impl FlushRequest {
+    pub fn ready(result: io::Result<()>) -> Self {
+        Self {
+            epoch: FlushEpoch::ready(result),
+            leader: None,
+        }
+    }
+
+    pub fn dispatch(self, rt: &dyn Runtime) -> FlushEpoch {
+        if let Some(leader) = self.leader {
+            rt.spawn_blocking(Box::new(move || leader.run()));
+        }
+        self.epoch
+    }
+}
+
+/// Hands ordered completion back before reusing the blocking thread for its flush.
+pub fn unblock_flush<T: Send + 'static>(
+    rt: &dyn Runtime,
+    work: impl FnOnce() -> (T, Option<FlushLeader>) + Send + 'static,
+) -> impl Future<Output = T> + Send + 'static {
+    let (send, receive) = oneshot::channel();
+    rt.spawn_blocking(Box::new(move || {
+        let (ordered, leader) = work();
+        let leader = leader.map(FlushLeader::seal);
+        send.send(ordered);
+        if let Some(leader) = leader {
+            leader.run();
+        }
+    }));
+    async move { receive.await.expect("ordered write panicked") }
+}
+
 impl Flusher {
     /// `work` must flush the same cache as every other request to this
     /// flusher. Only the first operation in each epoch needs to run.
@@ -51,19 +120,38 @@ impl Flusher {
         rt: &dyn Runtime,
         work: impl FnOnce() -> io::Result<()> + Send + 'static,
     ) -> FlushEpoch {
+        self.enroll(work).dispatch(rt)
+    }
+
+    pub fn enroll(&self, work: impl FnOnce() -> io::Result<()> + Send + 'static) -> FlushRequest {
+        self.enroll_prepared(move || Box::new(work))
+    }
+
+    /// Captures the epoch's prefix before ordered completion is returned;
+    /// the returned operation can block without delaying that completion.
+    pub fn enroll_prepared(
+        &self,
+        prepare: impl FnOnce() -> Box<dyn FnOnce() -> io::Result<()> + Send> + Send + 'static,
+    ) -> FlushRequest {
         let (send, receive) = oneshot::channel();
         let mut state = lock(&self.0);
         state.pending.push(send);
         if state.work.is_none() {
-            state.work = Some(Box::new(work));
+            state.work = Some(Box::new(prepare));
         }
-        if !state.running {
+        let leader = if state.running {
+            None
+        } else {
             state.running = true;
-            let shared = Arc::clone(&self.0);
-            drop(state);
-            rt.spawn_blocking(Box::new(move || run(&shared)));
+            Some(FlushLeader {
+                shared: Arc::clone(&self.0),
+                first: None,
+            })
+        };
+        FlushRequest {
+            epoch: FlushEpoch(receive),
+            leader,
         }
-        FlushEpoch(receive)
     }
 }
 
@@ -77,16 +165,20 @@ fn run(shared: &Mutex<State>) {
             };
             (work, std::mem::take(&mut state.pending))
         };
-        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(work))
-            .unwrap_or_else(|_| Err(io::Error::other("cache flush panicked")));
-        for send in pending {
-            send.send(
-                result
-                    .as_ref()
-                    .copied()
-                    .map_err(|error| io::Error::new(error.kind(), error.to_string())),
-            );
-        }
+        complete(work(), pending);
+    }
+}
+
+fn complete(work: Work, pending: Vec<oneshot::Sender<io::Result<()>>>) {
+    let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(work))
+        .unwrap_or_else(|_| Err(io::Error::other("cache flush panicked")));
+    for send in pending {
+        send.send(
+            result
+                .as_ref()
+                .copied()
+                .map_err(|error| io::Error::new(error.kind(), error.to_string())),
+        );
     }
 }
 
@@ -112,6 +204,39 @@ mod tests {
         fn reactor(&self) -> Reactor {
             unreachable!()
         }
+    }
+
+    #[test]
+    fn ordered_completion_precedes_the_flush_on_the_same_blocking_thread() {
+        let rt = Manual::default();
+        let flusher = Flusher::default();
+        let (started, running) = std::sync::mpsc::channel();
+        let (release, released) = std::sync::mpsc::channel();
+        let ordered = unblock_flush(&rt, move || {
+            let appender = std::thread::current().id();
+            let request = flusher.enroll(move || {
+                assert_eq!(std::thread::current().id(), appender);
+                started.send(()).unwrap();
+                released.recv().unwrap();
+                Ok(())
+            });
+            ((7, request.epoch), request.leader)
+        });
+        std::thread::scope(|scope| {
+            let worker = lock(&rt.0).take().unwrap();
+            let worker = scope.spawn(worker);
+            running.recv().unwrap();
+            let mut ordered = std::pin::pin!(ordered);
+            let mut cx = Context::from_waker(std::task::Waker::noop());
+            let Poll::Ready((value, epoch)) = ordered.as_mut().poll(&mut cx) else {
+                panic!("ordering cannot wait for a blocked full flush");
+            };
+            assert_eq!(value, 7);
+            assert!(lock(&rt.0).is_none(), "no intermediate blocking job");
+            release.send(()).unwrap();
+            crate::block_on(epoch).unwrap();
+            worker.join().unwrap();
+        });
     }
 
     #[test]

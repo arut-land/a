@@ -13,7 +13,7 @@ use std::io;
 use std::panic::{AssertUnwindSafe, catch_unwind};
 use std::path::{Path, PathBuf};
 use std::pin::pin;
-use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, OnceLock, Weak};
 use std::task::Poll;
 use std::time::Instant;
@@ -23,7 +23,10 @@ use crate::store::{Encoded, Header, Loaded, Parent, Snapshot, Writer};
 use ext::host::{Binding, Bound, Host, Parts, Registry, Services};
 use ext::point::View;
 use ext::{BoxFuture, Called, Cancel, Cx, Flag, States};
-use kernel::{Core, Durability, Effect, Effects, Event, Load, Note, Owner, Replied, Ticket};
+use kernel::{
+    Admission, Core, Durability, Effect, Effects, Event, Load, Note, Owner, Replied, Requirement,
+    Ticket,
+};
 use protocol::ledger::Ledger;
 use protocol::view::SessionView;
 use protocol::{
@@ -69,6 +72,7 @@ pub enum Open {
 /// What a session's calls and decision points read: made before its log
 /// is folded, as the kernel's registry binds it.
 struct Session {
+    fence: AtomicU64,
     id: SessionId,
     workspace: Arc<Path>,
     /// The session's directory for output too large for its log.
@@ -139,6 +143,15 @@ pub enum Request {
 }
 
 enum Msg {
+    Fenced {
+        fence: u64,
+        msg: Box<Msg>,
+    },
+    Flushed {
+        fence: u64,
+        through: u64,
+        result: io::Result<()>,
+    },
     Request {
         request: Request,
         origin: Option<Author>,
@@ -182,12 +195,25 @@ enum Msg {
     /// Answered once every message before it is taken.
     #[cfg(test)]
     Barrier(oneshot::Sender<()>),
+    #[cfg(test)]
+    Position(oneshot::Sender<(u64, u64)>),
 }
 
 impl Msg {
     /// Whether taking it reads what the session committed: a client's
     /// replay, the conversation a side request asks for.
-    const fn reads_the_log(&self) -> bool {
+    fn reads_the_log(&self) -> bool {
+        if let Self::Fenced { msg, .. } = self {
+            return msg.reads_the_log();
+        }
+        if matches!(self, Self::Flushed { .. }) {
+            return true;
+        }
+
+        #[cfg(test)]
+        if matches!(self, Self::Position(_)) {
+            return true;
+        }
         matches!(self, Self::Attach(..) | Self::Side { .. })
     }
 }
@@ -221,6 +247,7 @@ impl Live {
         let registry = shared.registry.get();
         let (tx, rx) = channel::unbounded();
         let session = Arc::new(Session {
+            fence: AtomicU64::new(0),
             id: header.id,
             workspace: Arc::from(header.workspace.as_path()),
             spill: Arc::from(shared.spill.join(header.id.to_string())),
@@ -300,6 +327,11 @@ impl Live {
             tickets: 0,
             phase: Phase::Serving,
             listed,
+            ordered_seq: loaded.seq,
+            durable_seq: loaded.seq,
+            admissions: Vec::new(),
+            flushes: Vec::new(),
+            reactions_cancel: Cancel::default(),
             unsynced: Vec::new(),
             waiting_sync: Vec::new(),
             sync_armed: false,
@@ -573,7 +605,12 @@ struct Actor {
     /// for each: shown to no one until a sync. A seq a client has seen is
     /// one that survives a power cut, so it is never given out twice.
     unsynced: Vec<(Vec<Entry>, Encoded)>,
-    waiting_sync: Vec<oneshot::Sender<()>>,
+    waiting_sync: Vec<(u64, oneshot::Sender<()>)>,
+    ordered_seq: u64,
+    durable_seq: u64,
+    admissions: Vec<(Admission, Admitted)>,
+    flushes: Vec<PendingFlush>,
+    reactions_cancel: Cancel,
     /// A [`Msg::Sync`] is on its way.
     sync_armed: bool,
     /// Carrying out what a resume asked for: a commit that fails now does
@@ -582,6 +619,18 @@ struct Actor {
     /// The bytes of log the next load would read past the newest
     /// snapshot: once [`SNAPSHOT_EVERY`], the next rest is snapshotted.
     since_snapshot: u64,
+}
+
+struct PendingFlush {
+    through: u64,
+    ended: Flag,
+    result: Option<io::Result<()>>,
+}
+
+enum Admitted {
+    Effect(Effect),
+    Reaction(ext::Later<()>),
+    Attach(Outbox, u64, oneshot::Sender<()>),
 }
 
 /// How long written entries may stay unsynced, and so unseen: a sync is
@@ -636,6 +685,19 @@ impl Actor {
                 None => mail.recv().await,
             }
         {
+            if let Msg::Flushed {
+                fence,
+                through,
+                result,
+            } = msg
+            {
+                if fence == self.live.session.fence.load(Ordering::SeqCst) {
+                    self.completed(through, result).await;
+                    self.publish();
+                    self.live.session.changed.notify();
+                }
+                continue;
+            }
             // What queued meanwhile is a burst, stepped together and
             // committed once. One that reads what is committed starts a
             // burst of its own, once what came before it is carried out.
@@ -674,12 +736,14 @@ impl Actor {
             }
             // Recovery does not commit the burst that failed.
             match self.burst(events, sync).await {
-                Ok(()) if self.unsynced.is_empty() => {
+                Ok(()) if self.durable_seq >= self.ordered_seq => {
                     for done in dones {
                         done.send(());
                     }
                 }
-                Ok(()) => self.waiting_sync.extend(dones),
+                Ok(()) => self
+                    .waiting_sync
+                    .extend(dones.into_iter().map(|done| (self.ordered_seq, done))),
                 Err(()) => drop(dones),
             }
             // A call may begin to wait without the work marked ending.
@@ -690,7 +754,7 @@ impl Actor {
                 self.keep_snapshot().await;
             }
         }
-        let _ = self.sync().await;
+        self.drain_flushes(&mail).await;
         if self.since_snapshot >= SNAPSHOT_EVERY {
             self.keep_snapshot().await;
         }
@@ -717,10 +781,38 @@ impl Actor {
         }
     }
 
+    async fn drain_flushes(&mut self, mail: &channel::Receiver<Msg>) {
+        let _ = self.sync().await;
+        while !self.flushes.is_empty() {
+            let Some(msg) = mail.recv().await else { break };
+            if let Msg::Flushed {
+                fence,
+                through,
+                result,
+            } = msg
+                && fence == self.live.session.fence.load(Ordering::SeqCst)
+            {
+                self.completed(through, result).await;
+            }
+        }
+    }
+
+    fn current(&self, mut msg: Msg) -> Option<Msg> {
+        while let Msg::Fenced { fence, msg: inner } = msg {
+            if fence != self.live.session.fence.load(Ordering::SeqCst) {
+                return None;
+            }
+            msg = *inner;
+        }
+        Some(msg)
+    }
+
     /// What `msg` asks the kernel, and whom to tell once it is carried
     /// out; `None` for what the actor answers itself.
     fn take(&mut self, msg: Msg) -> Option<(Event, Option<oneshot::Sender<()>>)> {
+        let msg = self.current(msg)?;
         let event = match msg {
+            Msg::Fenced { .. } | Msg::Flushed { .. } => unreachable!("mailbox admission"),
             Msg::Request {
                 request,
                 origin,
@@ -728,8 +820,14 @@ impl Actor {
             } => self.requested(request, origin, reply),
             Msg::Step(event) => event,
             Msg::Attach(client, since, done) => {
-                self.attach(&client, since);
-                done.send(());
+                self.admissions.push((
+                    Admission {
+                        through: self.ordered_seq,
+                        requirement: Requirement::Durable,
+                    },
+                    Admitted::Attach(client, since, done),
+                ));
+                self.admit();
                 return None;
             }
             Msg::Env(env) => {
@@ -791,6 +889,11 @@ impl Actor {
             #[cfg(test)]
             Msg::Barrier(done) => {
                 done.send(());
+                return None;
+            }
+            #[cfg(test)]
+            Msg::Position(done) => {
+                done.send((self.ordered_seq, self.durable_seq));
                 return None;
             }
             Msg::Sync => return None,
@@ -891,33 +994,43 @@ impl Actor {
         self.carry(fx).await
     }
 
-    /// Carries out `fx`: its appends are committed together, as durably
-    /// as its commit says, before the effects among them, which then run
-    /// in order. Whatever the steps `fx` came from, a burst costs one
-    /// commit, as durable as the most durable step asked, and each intent
-    /// is still durable before the work it names. Only a cancel, which the
-    /// kernel orders before the outcome it then logs, a busy mark set
-    /// before the work it marks, and a kill of a process group left over,
-    /// which nothing logged waits on, go before what was appended ahead of
-    /// them is committed; a cancel of work `fx` has yet to start goes after
-    /// that start, as before it there is nothing of the call's to stop. A
-    /// commit that fails drops the rest and resumes from what the log
-    /// holds.
+    /// Appends a burst once, then admits each effect against the prefix
+    /// and requirement declared by the kernel. Publication and unsafe
+    /// effects share an epoch while ordered work keeps making progress.
     async fn carry(&mut self, fx: Effects) -> Result<(), ()> {
         let mut batch = Vec::new();
         let mut durability = None;
-        let mut after: Vec<Effect> = Vec::new();
+        let mut through = self.ordered_seq;
+        let mut publish = false;
+        let mut admission = Admission {
+            through: 0,
+            requirement: Requirement::Ordered,
+        };
+        let mut after = Vec::new();
         for effect in fx {
             match effect {
-                Effect::Append(e) => batch.push(e),
-                Effect::Commit(d) => durability = durability.max(Some(d)),
-                Effect::Cancel { call } if after.iter().any(|e| e.starts_call() == Some(call)) => {
-                    after.push(effect);
+                Effect::Append(entry) => batch.push(entry),
+                Effect::Commit {
+                    through: seq,
+                    durability: how,
+                    publish: show,
+                } => {
+                    through = through.max(seq);
+                    durability = durability.max(Some(how));
+                    publish |= show;
                 }
-                Effect::MarkBusy(true) | Effect::Cancel { .. } | Effect::Kill { .. } => {
-                    self.effect(effect);
+                Effect::Require(required) => admission = required,
+                effect => {
+                    match &effect {
+                        Effect::Cancel { call } => self.cancel_pending(*call, &mut after),
+                        Effect::MarkBusy(true) => self.effect(effect),
+                        _ => after.push((admission, effect)),
+                    }
+                    admission = Admission {
+                        through: 0,
+                        requirement: Requirement::Ordered,
+                    };
                 }
-                effect => after.push(effect),
             }
         }
         debug_assert_eq!(
@@ -925,43 +1038,231 @@ impl Actor {
             durability.is_none(),
             "a step commits once"
         );
-        // The session as it stands once `after` is carried out.
-        let busy = (after.iter().rev())
-            .find_map(|e| match e {
+        let needs = after
+            .iter()
+            .filter(|(a, _)| a.requirement == Requirement::Durable)
+            .map(|(a, _)| a.through)
+            .max()
+            .unwrap_or(0);
+        let flush = (publish || needs > self.durable_seq) && through > self.covering();
+        let busy = after
+            .iter()
+            .rev()
+            .find_map(|(_, e)| match e {
                 Effect::MarkBusy(busy) => Some(*busy),
                 _ => None,
             })
             .unwrap_or_else(|| self.live.has_work());
-        if let Some(durability) = durability
-            && let Err(why) = self.flush(&mut batch, durability, busy).await
-        {
-            self.failed(why, after).await;
+        let written = if let Some(durability) = durability {
+            self.commit(
+                &mut batch,
+                durability == Durability::Barrier,
+                flush,
+                self.listing(busy),
+            )
+            .await
+        } else if flush {
+            self.order_flush().await
+        } else {
+            Ok(())
+        };
+        if let Err(error) = written {
+            self.failed(
+                format!("logging: {error}"),
+                after.into_iter().map(|(_, effect)| effect).collect(),
+            )
+            .await;
             return Err(());
         }
-        for effect in after {
-            self.effect(effect);
-        }
+        self.admissions.extend(
+            after
+                .into_iter()
+                .map(|(a, effect)| (a, Admitted::Effect(effect))),
+        );
+        self.admit();
         Ok(())
     }
 
-    /// Commits `batch` as `durability` says, listed `busy`.
-    async fn flush(
-        &mut self,
-        batch: &mut Vec<Entry>,
-        durability: Durability,
-        busy: bool,
-    ) -> Result<(), String> {
-        let listing = self.listing(busy);
-        let durable = durability == Durability::Barrier;
-        self.commit(batch, durable, listing)
-            .await
-            .map_err(|e| format!("logging: {e}"))
+    fn cancel_pending(&mut self, call: CallId, after: &mut Vec<(Admission, Effect)>) {
+        let mut cancelled = None;
+        let mut retain = |effect: &Effect| {
+            if effect.starts_call() != Some(call) {
+                return true;
+            }
+            match effect {
+                Effect::RunTool { .. } | Effect::Resume { .. } => {
+                    cancelled = Some(true);
+                }
+                Effect::Prepare { .. } | Effect::Send { .. } => {
+                    cancelled = Some(false);
+                }
+                _ => {}
+            }
+            false
+        };
+        self.admissions.retain(|(_, work)| match work {
+            Admitted::Effect(effect) => retain(effect),
+            _ => true,
+        });
+        after.retain(|(_, effect)| retain(effect));
+        let running = matches!(
+            self.inflight.get(&call),
+            Some(InFlight::Tool(_) | InFlight::Model)
+        );
+        self.effect(Effect::Cancel { call });
+        if !running && let Some(tool) = cancelled {
+            let event = if tool {
+                Event::ToolDone {
+                    call,
+                    outcome: Outcome::Interrupted { output: None },
+                    card: None,
+                }
+            } else {
+                Event::ModelDone {
+                    call,
+                    replied: Replied::Interrupted(None),
+                }
+            };
+            self.live.session.emit(
+                self.live.session.fence.load(Ordering::SeqCst),
+                Msg::Step(event),
+            );
+        }
+    }
+
+    fn covering(&self) -> u64 {
+        self.flushes
+            .iter()
+            .map(|pending| pending.through)
+            .max()
+            .unwrap_or(self.durable_seq)
+            .max(self.durable_seq)
+    }
+
+    fn admit(&mut self) {
+        let mut waiting = Vec::new();
+        for (admission, work) in std::mem::take(&mut self.admissions) {
+            let watermark = match admission.requirement {
+                Requirement::Ordered => self.ordered_seq,
+                Requirement::Durable => self.durable_seq,
+            };
+            if admission.through > watermark {
+                waiting.push((admission, work));
+                continue;
+            }
+            match work {
+                Admitted::Effect(effect) => self.effect(effect),
+                Admitted::Attach(client, since, done) => {
+                    self.attach(&client, since);
+                    done.send(());
+                }
+                Admitted::Reaction(reaction) => {
+                    if self.phase == Phase::Draining {
+                        continue;
+                    }
+                    let cancel = self.reactions_cancel.clone();
+                    let ended = self.live.ended.clone();
+                    self.live.session.shared.rt.spawn(Box::pin(async move {
+                        unless(&ended, unless(&cancel, reaction.0)).await;
+                    }));
+                }
+            }
+        }
+        self.admissions = waiting;
+    }
+
+    fn durable(&mut self, through: u64) {
+        self.durable_seq = self.durable_seq.max(through);
+        self.show_synced();
+        self.admit();
+    }
+
+    fn track(&mut self, through: u64, mut epoch: rt::FlushEpoch) -> io::Result<()> {
+        let mut cx = std::task::Context::from_waker(std::task::Waker::noop());
+        if let Poll::Ready(result) = std::pin::Pin::new(&mut epoch).poll(&mut cx) {
+            result?;
+            if self.flushes.is_empty() {
+                self.durable(through);
+            } else {
+                let ended = Flag::default();
+                ended.set();
+                self.flushes.push(PendingFlush {
+                    through,
+                    ended,
+                    result: Some(Ok(())),
+                });
+            }
+            return Ok(());
+        }
+        let ended = Flag::default();
+        self.flushes.push(PendingFlush {
+            through,
+            ended: ended.clone(),
+            result: None,
+        });
+        let session = Arc::clone(&self.live.session);
+        let fence = session.fence.load(Ordering::SeqCst);
+        self.live.session.shared.rt.spawn(Box::pin(async move {
+            let result = epoch.await;
+            ended.set();
+            let _ = session.mail.send(Msg::Flushed {
+                fence,
+                through,
+                result,
+            });
+        }));
+        Ok(())
+    }
+
+    async fn completed(&mut self, through: u64, result: io::Result<()>) {
+        let Some(pending) = self
+            .flushes
+            .iter_mut()
+            .find(|pending| pending.through == through)
+        else {
+            return;
+        };
+        pending.result = Some(result);
+        // Notification tasks may wake out of order. An earlier failure
+        // must fence recovery before a later success can publish anything.
+        while self
+            .flushes
+            .first()
+            .is_some_and(|pending| pending.result.is_some())
+        {
+            let pending = self.flushes.remove(0);
+            match pending.result.expect("completed epoch") {
+                Ok(()) => self.durable(pending.through),
+                Err(error) => {
+                    self.failed(format!("flushing: {error}"), Vec::new()).await;
+                    break;
+                }
+            }
+        }
     }
 
     /// A commit failed for `why`: the effects `rest` after it are dropped,
     /// whoever they would have answered told why, and the session resumes
     /// from what the log holds.
-    async fn failed(&mut self, why: String, rest: Vec<Effect>) {
+    async fn failed(&mut self, why: String, mut rest: Vec<Effect>) {
+        rest.extend(
+            std::mem::take(&mut self.admissions)
+                .into_iter()
+                .filter_map(|(_, work)| match work {
+                    Admitted::Effect(effect) => Some(effect),
+                    Admitted::Reaction(_) => None,
+                    Admitted::Attach(client, _, done) => {
+                        crate::server::reply(
+                            &client,
+                            &DaemonMsg::Error {
+                                message: why.clone(),
+                            },
+                        );
+                        done.send(());
+                        None
+                    }
+                }),
+        );
         eprintln!("session {}: {why}", self.live.id.short());
         for effect in rest {
             if let Effect::Reply { ticket, .. } = effect {
@@ -982,7 +1283,15 @@ impl Actor {
     /// cancelled, what was asked is answered that the session stopped, and
     /// the kernel is rebuilt from the committed log, as a load rebuilds it.
     async fn resume(&mut self) {
+        self.live.session.fence.fetch_add(1, Ordering::SeqCst);
+        self.reactions_cancel.set();
+        self.reactions_cancel = Cancel::default();
         self.live.session.cancel_all();
+        for pending in std::mem::take(&mut self.flushes) {
+            pending.ended.wait().await;
+        }
+        self.admissions.clear();
+        self.transcript = None;
         lock(&self.live.session.cancels).clear();
         self.replies.clear();
         self.sides.clear();
@@ -1025,6 +1334,8 @@ impl Actor {
                 return;
             }
         };
+        self.ordered_seq = loaded.seq;
+        self.durable_seq = loaded.seq;
         let recovered = FrameLog::new(Arc::clone(&loaded.lines), loaded.seq);
         self.live.frames.reloaded(loaded.lines);
         for entry in recovered.entries_after(self.live.frames.seq()) {
@@ -1074,18 +1385,14 @@ impl Actor {
         }
     }
 
-    /// Writes `batch`, then shows it: the writer stamps its lease. It is
-    /// made durable at once if `durable`, else with the next commit that
-    /// is ([`kernel::Durability`]).
-    ///
-    /// The catalog takes `listing`, if it changed, in the same blocking
-    /// hop: before the entries when it is busy, as the mark is set before
-    /// the work they are the intent of, and after them when it is not, as
-    /// the mark is cleared once the work ends.
+    /// Registers the epoch after the write barriers, in the appending
+    /// job. Ordered completion returns before that thread runs its flush,
+    /// so replay-safe work can overlap the syscall.
     async fn commit(
         &mut self,
         batch: &mut Vec<Entry>,
         durable: bool,
+        flush: bool,
         listing: Record,
     ) -> io::Result<()> {
         let mut writer = self
@@ -1097,28 +1404,35 @@ impl Actor {
         let listing = relisted(&listed, &listing).then_some(listing);
         let shared = Arc::clone(&self.live.session.shared);
         let rt = Arc::clone(&shared.rt);
-        let (mut writer, entries, mut written, listing) = rt::unblock(&*rt, move || {
-            let first = listing.as_ref().is_some_and(|l| l.busy);
-            if first && let Some(listing) = &listing {
-                shared.catalog.record(listing.clone());
-            }
-            let written = catch_unwind(AssertUnwindSafe(|| writer.append(&mut entries, durable)))
-                .unwrap_or_else(|_| Err(io::Error::other("committing entries panicked")));
-            if !first
-                && written.is_ok()
-                && let Some(listing) = &listing
-            {
-                shared.catalog.record(listing.clone());
-            }
-            (writer, entries, written, listing)
-        })
-        .await;
-        if durable
-            && written.is_ok()
-            && let Err(error) = writer.flushed(&*rt).await
-        {
-            written = Err(error);
-        }
+        let (writer, entries, written, listing, epoch, durable_on_order) =
+            rt::unblock_flush(&*rt, move || {
+                let first = listing.as_ref().is_some_and(|l| l.busy);
+                if first && let Some(listing) = &listing {
+                    shared.catalog.record(listing.clone());
+                }
+                let written =
+                    catch_unwind(AssertUnwindSafe(|| writer.append(&mut entries, durable)))
+                        .unwrap_or_else(|_| Err(io::Error::other("committing entries panicked")));
+                if !first
+                    && written.is_ok()
+                    && let Some(listing) = &listing
+                {
+                    shared.catalog.record(listing.clone());
+                }
+                let durable_on_order = durable && writer.durable_on_order();
+                let request = (written.is_ok() && flush && !durable_on_order)
+                    .then(|| writer.enroll())
+                    .flatten();
+                let (epoch, leader) = match request {
+                    Some(request) => (Some(request.epoch), request.leader),
+                    None => (None, None),
+                };
+                (
+                    (writer, entries, written, listing, epoch, durable_on_order),
+                    leader,
+                )
+            })
+            .await;
         // Not cleared after entries that did not commit.
         if written.is_err() && listing.is_some_and(|l| !l.busy) {
             self.listed = listed;
@@ -1129,16 +1443,21 @@ impl Actor {
             let how = if durable { "synced" } else { "written" };
             format!("{} entries {how}", entries.len())
         });
+        self.ordered_seq = entries
+            .last()
+            .map_or(self.ordered_seq, |entry| entry.seq.get());
+        self.since_snapshot += lines.lines().map(|line| line.len() as u64 + 1).sum::<u64>();
+        self.unsynced.push((entries.clone(), lines));
         self.folded(&entries);
-        self.since_snapshot += lines.lines().map(|l| l.len() as u64 + 1).sum::<u64>();
-        if durable {
-            // The sync made what was written before durable too.
-            self.show_synced();
-            self.show(&entries, &lines);
-        } else {
-            self.unsynced.push((entries, lines));
+        if let Some(epoch) = epoch {
+            self.track(self.ordered_seq, epoch)?;
+        } else if durable_on_order || flush {
+            self.durable(self.ordered_seq);
+        }
+        if !self.unsynced.is_empty() {
             self.arm_sync();
         }
+
         Ok(())
     }
 
@@ -1207,45 +1526,67 @@ impl Actor {
     /// fails leaves the session as a failed commit does.
     async fn sync(&mut self) -> Result<(), ()> {
         self.sync_armed = false;
-        if self.unsynced.is_empty() {
+        if self.ordered_seq <= self.covering() {
             return Ok(());
         }
-        let Some(mut writer) = self.writer.take() else {
+        if let Err(error) = self.order_flush().await {
+            self.unsynced.clear();
+            self.waiting_sync.clear();
+            Box::pin(self.failed(format!("syncing: {error}"), Vec::new())).await;
             return Err(());
+        }
+        Ok(())
+    }
+
+    async fn order_flush(&mut self) -> io::Result<()> {
+        let Some(mut writer) = self.writer.take() else {
+            return Err(io::Error::other("no writer"));
         };
         let rt = Arc::clone(&self.live.session.shared.rt);
-        let (mut writer, mut synced) = rt::unblock(&*rt, move || {
-            let synced = writer.sync();
-            (writer, synced)
+        let (writer, result, epoch) = rt::unblock_flush(&*rt, move || {
+            let result = writer.sync();
+            let request = result.is_ok().then(|| writer.enroll()).flatten();
+            let (epoch, leader) = match request {
+                Some(request) => (Some(request.epoch), request.leader),
+                None => (None, None),
+            };
+            ((writer, result, epoch), leader)
         })
         .await;
-        if synced.is_ok() {
-            synced = writer.flushed(&*rt).await;
-        }
         self.writer = Some(writer);
-        match synced {
-            Ok(()) => {
-                self.show_synced();
-                Ok(())
-            }
-            Err(e) => {
-                self.unsynced.clear();
-                self.waiting_sync.clear();
-                Box::pin(self.failed(format!("syncing: {e}"), Vec::new())).await;
-                Err(())
-            }
+        result?;
+        if let Some(epoch) = epoch {
+            self.track(self.ordered_seq, epoch)?;
+        } else {
+            self.durable(self.ordered_seq);
         }
+        Ok(())
     }
 
     /// Shows what was written and is durable now, and answers whoever
     /// waited for it.
     fn show_synced(&mut self) {
+        let mut pending = Vec::new();
         for (entries, lines) in std::mem::take(&mut self.unsynced) {
-            self.show(&entries, &lines);
+            if entries
+                .last()
+                .is_some_and(|entry| entry.seq.get() <= self.durable_seq)
+            {
+                self.show(&entries, &lines);
+            } else {
+                pending.push((entries, lines));
+            }
         }
-        for done in std::mem::take(&mut self.waiting_sync) {
-            done.send(());
+        self.unsynced = pending;
+        let mut waiting = Vec::new();
+        for (through, done) in std::mem::take(&mut self.waiting_sync) {
+            if through <= self.durable_seq {
+                done.send(());
+            } else {
+                waiting.push((through, done));
+            }
         }
+        self.waiting_sync = waiting;
     }
 
     /// Entries durable, as `lines` encodes them: shown to every client.
@@ -1263,7 +1604,7 @@ impl Actor {
         lock(&self.live.followers).retain(|c| c.wake().is_ok());
     }
 
-    /// Entries committed: folded where else they are read.
+    /// Ordered entries also feed speculative transcripts and observers.
     fn folded(&mut self, entries: &[Entry]) {
         let session = &self.live.session;
         let hooks = self.registry.hooks();
@@ -1280,10 +1621,15 @@ impl Actor {
 
             // What observers do about it runs owned by the session.
             for reaction in hooks.observe(self.bound.point(), e) {
-                let ended = self.live.ended.clone();
-                session.shared.rt.spawn(Box::pin(async move {
-                    unless(&ended, reaction.0).await;
-                }));
+                if let Some(work) = reaction.work {
+                    self.admissions.push((
+                        Admission {
+                            through: e.seq.get(),
+                            requirement: reaction.requirement,
+                        },
+                        Admitted::Reaction(work),
+                    ));
+                }
             }
             let replied = match &e.body {
                 Body::ModelResult { call, .. } => self.replied.take_if(|(of, _)| of == call),
@@ -1317,7 +1663,9 @@ impl Actor {
             return;
         }
         match effect {
-            Effect::Append(_) | Effect::Commit(_) => unreachable!("appends commit in runs"),
+            Effect::Append(_) | Effect::Commit { .. } | Effect::Require(_) => {
+                unreachable!("appends commit in runs")
+            }
             Effect::Reply { ticket, result } => self.reply(ticket, result),
             Effect::Side { ticket, side } => {
                 if let Some((reply, conversation)) = self.sides.remove(&ticket) {
@@ -1472,9 +1820,13 @@ impl Actor {
         then: impl FnOnce(T) -> Event + Send + 'static,
     ) {
         let mail = Arc::clone(&self.live.session.mail);
+        let fence = self.live.session.fence.load(Ordering::SeqCst);
         self.live.session.shared.rt.spawn(Box::pin(async move {
             if let Some(done) = work.await {
-                let _ = mail.send(Msg::Step(then(done)));
+                let _ = mail.send(Msg::Fenced {
+                    fence,
+                    msg: Box::new(Msg::Step(then(done))),
+                });
             }
         }));
     }
@@ -1515,7 +1867,10 @@ impl Actor {
             decisions,
             answered,
         };
-        let _ = self.live.session.mail.send(Msg::Step(prepared));
+        self.live.session.emit(
+            self.live.session.fence.load(Ordering::SeqCst),
+            Msg::Step(prepared),
+        );
     }
 
     /// Sends the request prepared for model call `call`, its text
@@ -1527,10 +1882,11 @@ impl Actor {
         let cancel = self.live.session.cancel(call);
         self.inflight.insert(call, InFlight::Model);
         let live = Arc::clone(&self.live);
+        let fence = live.session.fence.load(Ordering::SeqCst);
         self.live.session.shared.rt.spawn(Box::pin(async move {
             let (replied, message) = match *prepared {
                 Ok((model, request, attempt)) => {
-                    let mut deltas = |text: &str| live.delta(call, attempt, text);
+                    let mut deltas = |text: &str| live.delta(call, attempt, text, fence);
                     let replying: BoxFuture<'_, _> =
                         Box::pin(reply(&model, &request, &cancel, &mut deltas));
                     contain(replying).await
@@ -1541,11 +1897,14 @@ impl Actor {
                     (Replied::Failed(error), None)
                 }
             };
-            let _ = live.session.mail.send(Msg::Replied {
-                call,
-                replied,
-                message,
-            });
+            live.session.emit(
+                fence,
+                Msg::Replied {
+                    call,
+                    replied,
+                    message,
+                },
+            );
         }));
     }
 
@@ -1561,14 +1920,29 @@ impl Actor {
         let system = self.registry.system_prompt();
         let frames = &self.live.frames;
         let registry = &self.registry;
-        let transcript = self
-            .transcript
-            .get_or_insert_with(|| Transcript::of(frames.entries(), Arc::clone(registry), system));
+        let transcript = self.transcript.get_or_insert_with(|| {
+            Transcript::of(
+                frames.entries().chain(
+                    self.unsynced
+                        .iter()
+                        .flat_map(|(entries, _)| entries.iter().cloned()),
+                ),
+                Arc::clone(registry),
+                system,
+            )
+        });
         if let Some(messages) = transcript.before(call.get()) {
             messages.clone()
         } else {
             // A call recovery runs after entries it does not see.
-            let before = frames.entries().take_while(|e| e.seq < call.0);
+            let before = frames
+                .entries()
+                .chain(
+                    self.unsynced
+                        .iter()
+                        .flat_map(|(entries, _)| entries.iter().cloned()),
+                )
+                .take_while(|e| e.seq < call.0);
             Transcript::of(before, Arc::clone(registry), system).into_messages()
         }
     }
@@ -1584,6 +1958,7 @@ impl Actor {
         let cx = self.live.session.cx(call, &registry, cancel);
         let mail = Arc::clone(&self.live.session.mail);
         let id = self.live.id;
+        let fence = self.live.session.fence.load(Ordering::SeqCst);
         self.live.session.shared.rt.spawn(Box::pin(async move {
             let began = crate::stamp();
             let Called { outcome, card } =
@@ -1602,7 +1977,10 @@ impl Actor {
                 outcome,
                 card,
             };
-            let _ = mail.send(Msg::Step(done));
+            let _ = mail.send(Msg::Fenced {
+                fence,
+                msg: Box::new(Msg::Step(done)),
+            });
         }));
     }
 
@@ -1754,7 +2132,10 @@ impl Live {
 
 impl Live {
     /// Live text of model call `call`'s attempt `attempt`, to followers.
-    fn delta(&self, call: CallId, attempt: u16, text: &str) {
+    fn delta(&self, call: CallId, attempt: u16, text: &str, fence: u64) {
+        if self.frames.seq() < call.get() || self.session.fence.load(Ordering::SeqCst) != fence {
+            return;
+        }
         let delta = DaemonMsg::Delta {
             call,
             text: text.to_owned(),
@@ -1768,6 +2149,13 @@ impl Live {
 }
 
 impl Session {
+    fn emit(&self, fence: u64, msg: Msg) {
+        let _ = self.mail.send(Msg::Fenced {
+            fence,
+            msg: Box::new(msg),
+        });
+    }
+
     /// What stops call `call`'s work: the one cancel it has while open,
     /// made as the first of its work asks for it.
     fn cancel(&self, call: CallId) -> Cancel {
@@ -1815,6 +2203,7 @@ impl Session {
             services: self.services(),
         }
         .cx(Arc::new(Calling {
+            fence: self.fence.load(Ordering::SeqCst),
             session: Arc::clone(self),
             call,
             registry: Arc::clone(registry),
@@ -1876,7 +2265,7 @@ impl ext::Layers for crate::config::Settings {
 /// The session as handlers at decision points read it: only when one
 /// asks, so a point with no handler costs nothing. A handler may take a
 /// call's context along, to work it answers later with.
-pub(crate) struct Viewed(Arc<Session>);
+pub(crate) struct Viewed(Arc<Session>, u64);
 
 impl View for Viewed {
     fn session(&self) -> SessionId {
@@ -1904,6 +2293,9 @@ impl View for Viewed {
     /// With the call's own cancel: work a handler takes it along to ends
     /// with the call.
     fn cx(&self, call: CallId) -> Option<Cx> {
+        if self.0.fence.load(Ordering::SeqCst) != self.1 {
+            return None;
+        }
         let registry = self.0.shared.registry.get();
         Some(self.0.cx(call, &registry, self.0.cancel(call)))
     }
@@ -1913,7 +2305,10 @@ impl View for Viewed {
 fn bind(registry: &Arc<Registry>, session: &Arc<Session>) -> Arc<Bound<Viewed>> {
     let settings = &session.shared.models.settings;
     let agent = settings.agent(&session.workspace);
-    let viewed = Arc::new(Viewed(Arc::clone(session)));
+    let viewed = Arc::new(Viewed(
+        Arc::clone(session),
+        session.fence.load(Ordering::SeqCst),
+    ));
     Arc::new(Bound::new(Arc::clone(registry), viewed, agent))
 }
 
@@ -1941,6 +2336,7 @@ pub fn commands(registry: &Registry) -> Vec<protocol::CommandInfo> {
 /// The engine as a running call reaches it, on the registry generation it
 /// started with: what it reports goes through the actor's mailbox.
 struct Calling {
+    fence: u64,
     session: Arc<Session>,
     call: CallId,
     registry: Arc<Registry>,
@@ -1949,11 +2345,14 @@ struct Calling {
 impl Calling {
     fn report(&self, note: Note) {
         let call = self.call;
-        let _ = (self.session.mail).send(Msg::Note {
-            call,
-            note,
-            done: None,
-        });
+        self.session.emit(
+            self.fence,
+            Msg::Note {
+                call,
+                note,
+                done: None,
+            },
+        );
     }
 }
 
@@ -1995,7 +2394,7 @@ impl Host for Calling {
             note: Note::State { ext, state, data },
             done: Some(done),
         };
-        let _ = self.session.mail.send(note);
+        self.session.emit(self.fence, note);
         Box::pin(async move {
             let _ = committed.await;
         })
@@ -2032,6 +2431,10 @@ impl ext::Models for Own {
                 .0
                 .upgrade()
                 .ok_or_else(|| invalid("the session is gone".into()))?;
+            let fence = session.fence.load(Ordering::SeqCst);
+            if cx.cancel.is_set() {
+                return Err(invalid("the call was cancelled".into()));
+            }
             let model = match &side.model {
                 Some(spec) => {
                     let env = lock(&session.env).clone();
@@ -2043,13 +2446,16 @@ impl ext::Models for Own {
             let of = cx.call;
             let (asking, opened) = oneshot::channel();
             let purpose = side.purpose.to_string();
-            let _ = session.mail.send(Msg::Side {
-                of,
-                purpose,
-                model: model.name(),
-                conversation: side.conversation,
-                reply: asking,
-            });
+            session.emit(
+                fence,
+                Msg::Side {
+                    of,
+                    purpose,
+                    model: model.name(),
+                    conversation: side.conversation,
+                    reply: asking,
+                },
+            );
             let Some(Some((id, conversation))) = opened.await else {
                 return Err(invalid(format!("call {of} is not open to ask for")));
             };
@@ -2076,7 +2482,10 @@ impl ext::Models for Own {
                 let mut quiet = |_: &str| {};
                 let asked = reply(&model, &request, &cancel, &mut quiet);
                 let (outcome, answer) = sided(first(asked, timeout).await.map(|(r, _)| r));
-                let _ = mail.send(Msg::Step(Event::SideDone { side: id, outcome }));
+                let _ = mail.send(Msg::Fenced {
+                    fence,
+                    msg: Box::new(Msg::Step(Event::SideDone { side: id, outcome })),
+                });
                 answered.send(answer);
             }));
             answer
@@ -2146,7 +2555,11 @@ impl ext::Sessions for Own {
             };
             let call = cx.call;
             let (reply, result) = oneshot::channel();
-            let _ = session.mail.send(Msg::Child { call, input, reply });
+            let fence = session.fence.load(Ordering::SeqCst);
+            if cx.cancel.is_set() {
+                return Outcome::Interrupted { output: None };
+            }
+            session.emit(fence, Msg::Child { call, input, reply });
             match result.await {
                 Some(value) => value
                     .parse()
