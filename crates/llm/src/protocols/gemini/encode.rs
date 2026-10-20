@@ -280,7 +280,7 @@ fn function_response(
         // Gemini reads a result as a value, which goes into the contents
         // tree a request edits (its signatures dropped): the one place an
         // output is read back into a tree.
-        Output::Json(value) => values.push(serde_json::from_str(value.raw()).unwrap_or_default()),
+        Output::Json(value) => values.push(value.parse().unwrap_or_default()),
         Output::Content(parts) => {
             for part in parts {
                 match part {
@@ -370,7 +370,7 @@ fn assistant_part(part: &AssistantPart, model: &str, ids: bool) -> Result<Option
         AssistantPart::ToolCall(call) => {
             let (id, name) = (ids.then_some(call.id.as_str()), call.name.as_str());
             // As a result is: a tree, in the contents a request edits.
-            let args: Value = serde_json::from_str(call.input.raw()).unwrap_or_default();
+            let args: Value = call.input.parse().unwrap_or_default();
             let function = set(obj!({"name": name, "args": args, "id": id}));
             let signature = model::validates_signatures(model).then_some(UNSIGNED_CALL);
             set(obj!({"functionCall": function, "thoughtSignature": signature}))

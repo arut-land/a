@@ -322,7 +322,7 @@ fn output_block<'a>(output: &'a Json, card: Option<&'a Card>) -> impl Renderable
         } @else {
             pre style=(style::OUTPUT) {
                 // Any tool's output, shown as a tree of it prints.
-                (serde_json::from_str::<serde_json::Value>(output.raw()).and_then(|tree| serde_json::to_string_pretty(&tree)).unwrap_or_default())
+                (output.parse::<serde_json::Value>().and_then(|tree| serde_json::to_string_pretty(&tree)).unwrap_or_default())
             }
         }
     }
