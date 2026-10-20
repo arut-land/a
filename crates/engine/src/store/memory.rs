@@ -74,7 +74,7 @@ impl LogStore for Memory {
         let lines = self.shared(id)?;
         let mut floor = 0;
         for entry in lines.entries()? {
-            floor = entry.epoch;
+            floor = entry.epoch.0;
             each(entry);
         }
         Ok(self.loaded(id, lines, floor))

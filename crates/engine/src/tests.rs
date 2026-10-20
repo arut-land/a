@@ -5,7 +5,8 @@ use crate::catalog::Catalog;
 use crate::store::{Header, Jsonl, LogStore};
 use protocol::ledger::Ledger;
 use protocol::{
-    Activity, Audience, Body, Entry, Environment, Json, Outcome, Residency, SessionId, Target,
+    Activity, Audience, Body, CallId, Entry, Environment, Epoch, Json, Outcome, Residency, Seq,
+    SessionId, Target,
 };
 use serde_json::json;
 use sys::Home;
@@ -188,7 +189,11 @@ fn busy_sessions_recover_at_startup() {
         };
         created
             .writer
-            .append_raw(&[Entry::new(seq, created.writer.epoch(), body)])
+            .append_raw(&[Entry::new(
+                Seq::new(seq).unwrap(),
+                Epoch(created.writer.epoch()),
+                body,
+            )])
             .unwrap();
     }
 
@@ -205,7 +210,7 @@ fn busy_sessions_recover_at_startup() {
         got.iter().find_map(|b| match b {
             Body::ToolResult {
                 call: c, outcome, ..
-            } if *c == call => Some(outcome),
+            } if c.get() == call => Some(outcome),
             _ => None,
         })
     };
@@ -244,7 +249,7 @@ fn a_damaged_log_is_shown_and_never_written() {
         text: format!("reply {seq}"),
     };
     for (seq, body) in (1..).zip([text(1), call, text(3)]) {
-        let entry = Entry::new(seq, created.writer.epoch(), body);
+        let entry = Entry::new(Seq::new(seq).unwrap(), Epoch(created.writer.epoch()), body);
         created.writer.append_raw(&[entry]).unwrap();
     }
     let path = home.sessions_dir().join(format!("{id}.jsonl"));
@@ -433,20 +438,20 @@ fn a_parent_hears_from_its_child_exactly_once() {
                 input: "hi".into()
             },
             Body::Wait {
-                call: protocol::CallId::new(3).unwrap(),
+                call: CallId::new(3).unwrap(),
                 on: protocol::WaitOn::Child {
-                    link: protocol::Seq::new(4).unwrap()
+                    link: Seq::new(4).unwrap()
                 }
             },
             Body::Watch { child },
             Body::Fired {
-                watch: 6,
+                watch: Seq::new(6).unwrap(),
                 outcome: Outcome::Done {
                     output: Json::encode("hi").unwrap()
                 }
             },
             Body::ToolResult {
-                call: 3,
+                call: CallId::new(3).unwrap(),
                 outcome: Outcome::Done {
                     output: Json::encode("The child session finished:\nhi").unwrap()
                 },
@@ -504,13 +509,14 @@ fn a_child_runs_in_its_parents_environment() {
 /// Logs as a daemon killed at various points leaves them: each parent's
 /// watch fires once the next daemon has recovered, and never again.
 #[test]
+#[allow(clippy::too_many_lines)]
 fn watches_rearm_after_a_crash_and_fire_once() {
     let (root, home) = home("rearm");
     let store = Jsonl::open(home.sessions_dir()).unwrap();
     let write = |header: &Header, bodies: Vec<Body>, busy: bool| {
         let mut created = store.create(header).unwrap();
         for (seq, body) in (1..).zip(bodies) {
-            let entry = Entry::new(seq, created.writer.epoch(), body);
+            let entry = Entry::new(Seq::new(seq).unwrap(), Epoch(created.writer.epoch()), body);
             created
                 .writer
                 .append_raw(std::slice::from_ref(&entry))
@@ -548,9 +554,9 @@ fn watches_rearm_after_a_crash_and_fire_once() {
                 input: "sleep 0".into(),
             },
             Body::Wait {
-                call: protocol::CallId::new(2).unwrap(),
+                call: CallId::new(2).unwrap(),
                 on: protocol::WaitOn::Child {
-                    link: protocol::Seq::new(3).unwrap(),
+                    link: Seq::new(3).unwrap(),
                 },
             },
             Body::Watch { child },
@@ -585,7 +591,7 @@ fn watches_rearm_after_a_crash_and_fire_once() {
     let child = session(Some(parent.id));
     write(&parent, spawned(child.id), true);
     let done = Body::ToolResult {
-        call: 2,
+        call: CallId::new(2).unwrap(),
         outcome: slept.clone(),
         card: None,
     };
@@ -609,7 +615,10 @@ fn watches_rearm_after_a_crash_and_fire_once() {
         let links = log.iter().filter(|b| matches!(b, Body::Link { .. }));
         assert_eq!(links.count(), 1, "{log:#?}");
         assert!(
-            matches!(log.last(), Some(Body::ToolResult { call: 2, .. })),
+            matches!(
+                log.last(),
+                Some(Body::ToolResult { call, .. }) if call.get() == 2
+            ),
             "{log:#?}"
         );
     }
@@ -706,7 +715,7 @@ fn an_orphan_does_not_resume_what_it_was_doing() {
         },
     ];
     for (seq, body) in (1..).zip(bodies_written) {
-        let entry = Entry::new(seq, created.writer.epoch(), body);
+        let entry = Entry::new(Seq::new(seq).unwrap(), Epoch(created.writer.epoch()), body);
         created
             .writer
             .append_raw(std::slice::from_ref(&entry))
@@ -726,12 +735,12 @@ fn an_orphan_does_not_resume_what_it_was_doing() {
             &got[2..],
             [
                 Body::ToolResult {
-                    call: 2,
+                    call,
                     outcome: Outcome::Interrupted { output: None },
                     ..
                 },
                 Body::Interrupt { origin: None },
-            ]
+            ] if call.get() == 2
         ),
         "{got:#?}"
     );
@@ -981,7 +990,7 @@ fn one_writer_per_session() {
     let entries = daemon.shared.store.entries(id).unwrap();
     std::fs::remove_dir_all(&root).unwrap();
 
-    let seqs: Vec<u64> = entries.iter().map(|e| e.seq).collect();
+    let seqs: Vec<u64> = entries.iter().map(|e| e.seq.get()).collect();
     // Its extensions first, then each input and its answer.
     assert_eq!(seqs, (1..=41).collect::<Vec<_>>());
     assert!(
@@ -1099,4 +1108,20 @@ fn a_lost_catalog_is_rebuilt_from_the_logs() {
     assert_eq!(shown(&relisted), shown(&listed));
     assert_eq!(loaded, Vec::from_iter(asked));
     assert!(rebuilt);
+}
+
+/// The daemon sends the list in the one order every client shows: newest
+/// first. No client sorts.
+#[test]
+fn sessions_are_listed_newest_first() {
+    let (_, home) = home("newest");
+    let daemon = Daemon::load(&home, &echo()).unwrap();
+    let mut made = Vec::new();
+    for _ in 0..3 {
+        let attachment = daemon.attach_to(&Target::New, || "/w".into()).unwrap();
+        made.push(attachment.session().id);
+    }
+    let listed: Vec<_> = daemon.list().iter().map(|s| s.id).collect();
+    made.reverse();
+    assert_eq!(listed, made);
 }

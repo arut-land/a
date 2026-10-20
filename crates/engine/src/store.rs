@@ -15,7 +15,9 @@ use std::ops::RangeInclusive;
 use std::path::PathBuf;
 use std::sync::Arc;
 
-use protocol::{Entry, ReadOnly, SessionId};
+#[cfg(test)]
+use protocol::Seq;
+use protocol::{Entry, Epoch, ReadOnly, SessionId};
 use serde::{Deserialize, Serialize};
 
 pub use jsonl::Jsonl;
@@ -56,10 +58,10 @@ impl Loaded {
     /// Appends `body` as the next entry, durably, and returns it.
     #[cfg(test)]
     pub fn append(&mut self, body: protocol::Body) -> io::Result<Entry> {
-        let mut entry = [Entry::new(self.seq + 1, 0, body)];
+        let mut entry = [Entry::new(Seq::new(self.seq + 1).unwrap(), Epoch(0), body)];
         self.writer.append(&mut entry, true)?;
         let [entry] = entry;
-        self.seq = entry.seq;
+        self.seq = entry.seq.get();
         Ok(entry)
     }
 }
@@ -121,7 +123,7 @@ impl Writer {
     /// the lines it encoded them as, for whoever shows them.
     pub fn append(&mut self, entries: &mut [Entry], durable: bool) -> io::Result<Encoded> {
         for e in &mut *entries {
-            e.epoch = self.epoch;
+            e.epoch = Epoch(self.epoch);
         }
         let lines = Encoded::of(entries)?;
         if durable {

@@ -11,7 +11,7 @@ use boltffi::{EventSubscription, StreamProducer, export};
 use client::{ConnId, Effect, Event, EventKind, Renderer, SessionClient, Show, Welcome};
 use protocol::{Caps, DaemonMsg, Decode};
 
-use crate::{ClientError, Resync, SessionSnapshot, TurnInfo, ViewChange, ViewUpdate};
+use crate::{ClientError, Resync, SessionSnapshot, TITLE, TurnInfo, ViewChange, ViewUpdate};
 
 /// How many updates a stream buffers for a slow reader before it drops.
 const BUFFER: usize = 1024;
@@ -51,8 +51,8 @@ impl Feed {
             seq: view.seq,
             change,
             turn: self.client.turn().into(),
-            streaming: view.streaming.as_ref().map(|s| s.call),
-            title: view.title.clone(),
+            streaming: view.streaming.as_ref().map(|s| s.call.get()),
+            title: view.side(TITLE).map(str::to_owned),
         };
         self.producer.push(update.clone());
         if self.recent.len() == KEPT {

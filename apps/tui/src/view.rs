@@ -1,20 +1,19 @@
-//! Transcript items as rows: messages, replies, and tool call cards.
+//! Transcript items as rows: messages, replies, and tool call cards, laid
+//! out from what [`Item::present`] says of each.
 
-use protocol::view::{self, Item, Phase, Status, call_title, decision_line, output_text};
-use protocol::{Audience, Json, Outcome};
-use serde::Deserialize;
-use serde::de::IgnoredAny;
+use protocol::view::md::{self, Block, Inline};
+use protocol::view::{Buttons, Glyph, Item, Kind, Presented, Shown};
+use protocol::{CallId, Json};
 
 use super::render::ellipsize;
-use super::text::{
-    Action, Color, Line, Modifier, Span, Style, markdown, markdown_into, sanitize, wrap,
-};
+use super::text::{Action, Color, Line, Modifier, Span, Style, sanitize, wrap};
 
 /// How much of a card's output shows unless everything is expanded.
 const TAIL: usize = 10;
 
 pub const MUTED: Style = Style::new().fg(Color::DarkGray);
 pub const USER: Style = Style::new().fg(Color::Magenta).add_modifier(Modifier::BOLD);
+pub const CODE: Style = Style::new().fg(Color::Cyan);
 const OK: Style = Style::new().fg(Color::Green);
 const BAD: Style = Style::new().fg(Color::Red);
 const WARN: Style = Style::new().fg(Color::Yellow);
@@ -30,150 +29,100 @@ pub struct Look {
     pub verbose: bool,
 }
 
-/// Whether an item will not change any more: an inline viewport prints
-/// those into the scrollback.
-pub fn settled(item: &Item) -> bool {
-    item.phase().is_none_or(Phase::settled)
+/// The colour of a status class.
+const fn style(glyph: Glyph) -> Style {
+    match glyph {
+        Glyph::None => Style::new(),
+        Glyph::Ok => OK,
+        Glyph::Bad | Glyph::Denied => BAD,
+        Glyph::Warn => WARN,
+        Glyph::Busy => BUSY,
+        Glyph::Ask => ASK,
+    }
 }
 
-/// A slash command the user ran, as a card of its own.
-fn command(item: &Item, width: usize, look: Look) -> Vec<Line> {
-    let Item::Tool {
-        call,
-        tool,
-        input,
-        outcome,
-        ..
-    } = item
-    else {
-        return Vec::new();
+/// `✓ exit 0`: the sign and the status, as one span.
+fn status(p: &Presented<'_>) -> Span {
+    let sign = p.glyph.sign();
+    let text = match (sign.is_empty(), p.status.is_empty()) {
+        (true, _) => p.status.to_string(),
+        (false, true) => sign.to_owned(),
+        (false, false) => format!("{sign} {}", p.status),
     };
-    let title = format!("/{tool} {}", Item::args(input));
-    card(
-        &Card {
-            call: *call,
-            title: title.trim_end().to_owned(),
-            input: None,
-            phase: item.phase().unwrap_or(Phase::Running),
-            outcome: outcome.as_ref(),
-            shown: None,
-        },
-        width,
-        look,
-    )
+    Span::new(text, style(p.glyph))
 }
 
 pub fn rows(item: &Item, width: usize, look: Look) -> Vec<Line> {
     let blank = Line::default();
-    match item {
-        Item::User { text, .. } => {
+    let p = item.present();
+    match p.kind {
+        Kind::User => {
             let mut out = vec![blank];
-            for (n, line) in sanitize(text).split('\n').enumerate() {
+            for (n, line) in sanitize(&p.body.text()).split('\n').enumerate() {
                 let first = Span::new(if n == 0 { "› " } else { "  " }, USER);
                 let body = [Span::new(line, Style::new().bold())];
                 out.extend(wrap(&body, width, &[first], &[Span::new("  ", USER)]));
             }
             out
         }
-        Item::Assistant { text, .. } => {
+        Kind::Assistant => {
             let mut out = vec![blank];
-            out.extend(markdown(text, width, Style::new()));
+            out.extend(markdown(&p.body.text(), width, Style::new()));
             out
         }
-        // The title shows in the status line.
-        item if item.titles() => Vec::new(),
-        Item::Reply {
-            model,
-            text,
-            status,
-            ..
-        } => reply(model, text, status, width),
-        Item::Tool {
-            by: Audience::User, ..
-        } => command(item, width, look),
-        Item::Tool {
-            call,
-            tool,
-            input,
-            outcome,
-            card: shown,
-            ..
-        } => card(
-            &Card {
-                call: *call,
-                title: call_title(tool, input, shown.as_ref()),
-                input: view::command(input).is_none().then_some(input),
-                phase: item.phase().unwrap_or(Phase::Running),
-                outcome: outcome.as_ref(),
-                shown: shown.as_ref(),
-            },
-            width,
-            look,
-        ),
-
-        Item::Hook {
-            hook,
-            call,
-            tool,
-            decision,
-            ..
-        } => {
-            let line = decision_line(tool, *call, decision);
-            vec![Line::plain(
-                ellipsize(&sanitize(&format!("  · hook {hook}: {line}")), width),
-                MUTED,
-            )]
+        Kind::Reply => reply(&p, width),
+        // A side request's reply is its extension's, not the conversation's:
+        // a title shows in the status line, a summary in what the model sees.
+        Kind::Side => Vec::new(),
+        Kind::Tool | Kind::Command => {
+            let input = match item {
+                Item::Tool { input, .. } if p.kind == Kind::Tool => {
+                    protocol::view::command(input).is_none().then_some(input)
+                }
+                _ => None,
+            };
+            card(item.key(), &p, input, width, look)
         }
-        Item::Child {
-            child,
-            input,
-            fired,
-            ..
-        } => {
-            let mut head = vec![
+        Kind::Hook | Kind::Environment => vec![Line::plain(
+            ellipsize(&sanitize(&format!("  · {}", p.title)), width),
+            MUTED,
+        )],
+        Kind::Child => {
+            let head = vec![
                 Span::new("⑂ ", BUSY),
-                Span::new(format!("child {} ", child.short()), Style::new().bold()),
+                Span::new(format!("{} ", p.title), Style::new().bold()),
+                status(&p),
             ];
-            head.push(match fired {
-                None => Span::new("running…", BUSY),
-                Some(Outcome::Done { .. }) => Span::new("✓ done", OK),
-                Some(Outcome::Failed { error }) => Span::new(format!("✗ {error}"), BAD),
-                Some(Outcome::Interrupted { .. }) => Span::new("⚠ interrupted", WARN),
-            });
             let mut out = vec![blank, Line::from(head)];
-            let body = [Span::new(sanitize(input).replace('\n', " "), MUTED)];
+            let body = [Span::new(
+                sanitize(&p.body.text()).replace('\n', " "),
+                MUTED,
+            )];
             let pad = [Span::new("  ", MUTED)];
             out.extend(wrap(&body, width, &pad, &pad).into_iter().take(3));
             out
         }
-        Item::Environment { cwd, .. } => {
-            vec![Line::plain(
-                ellipsize(&format!("  · env {}", cwd.display()), width),
-                MUTED,
-            )]
-        }
     }
 }
 
-fn reply(model: &str, text: &str, status: &Status, width: usize) -> Vec<Line> {
+fn reply(p: &Presented<'_>, width: usize) -> Vec<Line> {
     let mut out = vec![Line::default()];
-    match status {
-        Status::Running => out.push(Line::plain(format!("  … {model}"), MUTED)),
-        Status::Done if text.is_empty() => return Vec::new(),
-        Status::Done => out.extend(markdown(text, width, Style::new())),
-        Status::Failed { error } => {
+    match (p.glyph, &p.body) {
+        (Glyph::Busy, _) => out.push(Line::plain(format!("  … {}", p.title), MUTED)),
+        (Glyph::None, Shown::Markdown("")) => return Vec::new(),
+        (Glyph::None, body) => out.extend(markdown(&body.text(), width, Style::new())),
+        (glyph, _) => {
             let body = [Span::new(
-                format!("✗ model failed: {}", sanitize(error)),
-                BAD,
+                format!("{} {}", glyph.sign(), sanitize(&p.status)),
+                style(glyph),
             )];
             out.extend(wrap(
                 &body,
                 width,
-                &[Span::new("  ", BAD)],
-                &[Span::new("    ", BAD)],
+                &[Span::new("  ", style(glyph))],
+                &[Span::new("    ", style(glyph))],
             ));
         }
-        Status::Interrupted => out.push(Line::plain("  ⚠ model call interrupted", WARN)),
     }
     out
 }
@@ -208,11 +157,11 @@ impl Live {
         if let Some(nl) = text[self.done..].rfind('\n') {
             let end = self.done + nl;
             let ended = sanitize(&text[self.done..end]);
-            markdown_into(rows, &ended, width, Style::new(), &mut self.fenced);
+            self.fenced = markdown_into(rows, &ended, width, Style::new(), self.fenced);
             (self.done, self.kept) = (end + 1, rows.len());
         }
         let open = sanitize(&text[self.done..]);
-        markdown_into(rows, &open, width, Style::new(), &mut self.fenced.clone());
+        markdown_into(rows, &open, width, Style::new(), self.fenced);
         if let Some(last) = rows.last_mut() {
             last.spans.push(Span::new("▍", MUTED));
         }
@@ -220,58 +169,111 @@ impl Live {
     }
 }
 
-/// A tool call or a slash command, as a card.
-struct Card<'a> {
-    call: u64,
-    title: String,
-    /// Input the title does not show, for verbose mode.
-    input: Option<&'a Json>,
-    phase: Phase,
-    outcome: Option<&'a Outcome>,
-    /// How the tool presents it.
-    shown: Option<&'a protocol::Card>,
+/// A reply's markdown as rows: `#` headings bold, `-`/`*` bullets as `•`,
+/// `>` quotes, fenced code verbatim, and `**bold**` and `` `code` `` inline.
+pub fn markdown(text: &str, width: usize, base: Style) -> Vec<Line> {
+    let mut out = Vec::new();
+    markdown_into(&mut out, &sanitize(text), width, base, false);
+    out
 }
 
-/// A tool call: a header with its state (a click folds it), its output's
-/// tail, and while it waits for this client, the approval buttons.
-fn card(c: &Card, width: usize, look: Look) -> Vec<Line> {
-    let toggle = Action::Toggle(c.call);
-    let (status, style) = match (c.outcome, c.phase) {
-        (Some(Outcome::Done { output }), _) => {
-            let note = output_text(c.shown)
-                .map(|(_, note)| note)
-                .filter(|note| !note.is_empty())
-                .unwrap_or_else(|| "done".to_owned());
-            if failed(output) {
-                (format!("✗ {note}"), BAD)
-            } else {
-                (format!("✓ {note}"), OK)
+/// [`markdown`] of sanitized `text`, appended to `out`; `fenced` says
+/// whether it starts inside a code fence, and whether it ends in one comes
+/// back.
+fn markdown_into(out: &mut Vec<Line>, text: &str, width: usize, base: Style, fenced: bool) -> bool {
+    let pad = |s: String, style| vec![Span::new(s, style)];
+    let mut blocks = md::blocks(text).fenced(fenced);
+    for block in &mut blocks {
+        let (first, rest, body, style) = match block {
+            Block::Fence(line) => {
+                out.push(Line::plain(format!("  {line}"), CODE.dim()));
+                continue;
             }
-        }
-        (Some(Outcome::Failed { .. }), _) => ("✗ failed".to_owned(), BAD),
-        (Some(Outcome::Interrupted { .. }), _) => ("⚠ interrupted".to_owned(), WARN),
-        (None, Phase::Asking) => ("? waiting for approval".to_owned(), ASK),
-        (None, Phase::Denied) => ("⊘ not approved".to_owned(), BAD),
-        (None, _) => ("running…".to_owned(), BUSY),
-    };
-    let body = output_rows(c, width, look.verbose);
+            // Code is not reflowed; long lines are cut by the screen.
+            Block::Code(line) => {
+                out.push(Line::plain(format!("  {line}"), CODE));
+                continue;
+            }
+            Block::Heading(_, text) => (
+                pad("  ".into(), base),
+                pad("  ".into(), base),
+                text,
+                base.bold(),
+            ),
+            Block::Bullet { indent, text } => {
+                let pad_to = " ".repeat(usize::from(indent));
+                (
+                    pad(format!("  {pad_to}• "), base),
+                    pad(format!("  {pad_to}  "), base),
+                    text,
+                    base,
+                )
+            }
+            Block::Quote(text) => (
+                pad("  │ ".into(), base.dim()),
+                pad("  │ ".into(), base.dim()),
+                text,
+                base.italic(),
+            ),
+            Block::Para(text) => (pad("  ".into(), base), pad("  ".into(), base), text, base),
+        };
+        out.extend(wrap(&inline(body, style), width, &first, &rest));
+    }
+    blocks.in_fence()
+}
+
+/// Inline `**bold**` and `` `code` `` within one line.
+fn inline(text: &str, base: Style) -> smallvec::SmallVec<[Span; 4]> {
+    md::inlines(text)
+        .map(|run| match run {
+            Inline::Text(text) => Span::new(text, base),
+            Inline::Bold(text) => Span::new(text, base.bold()),
+            Inline::Code(text) => Span::new(text, CODE),
+        })
+        .collect()
+}
+
+/// The rows' text, as the test that every renderer shows an item the same
+/// way compares it.
+#[doc(hidden)]
+pub fn texts(lines: &[Line]) -> Vec<String> {
+    lines
+        .iter()
+        .map(|l| l.spans.iter().map(|s| s.text.as_str()).collect())
+        .collect()
+}
+
+/// A tool call or a slash command, as a card: a header with its state (a
+/// click folds it), its output's tail, and while it waits for this
+/// client, the approval buttons. `input` is what the title does not show,
+/// for verbose mode.
+fn card(
+    key: protocol::Seq,
+    p: &Presented<'_>,
+    input: Option<&Json>,
+    width: usize,
+    look: Look,
+) -> Vec<Line> {
+    let toggle = Action::Toggle(key);
+    let status = status(p);
+    let body = output_rows(p, input, width, look.verbose);
     let marker = match (body.is_empty(), look.collapsed) {
         (true, _) => "• ",
         (false, true) => "▸ ",
         (false, false) => "▾ ",
     };
-    let room = width.saturating_sub(2 + 2 + super::text::width_of(&status));
+    let room = width.saturating_sub(2 + 2 + super::text::width_of(&status.text));
     let mut out = vec![
         Line::default(),
-        Line::from(vec![
+        Line::from([
             Span::button(marker, MUTED, toggle),
             Span::button(
-                ellipsize(&sanitize(&c.title).replace('\n', " "), room),
+                ellipsize(&sanitize(&p.title).replace('\n', " "), room),
                 Style::new().bold(),
                 toggle,
             ),
             Span::button("  ", Style::new(), toggle),
-            Span::button(status, style, toggle),
+            Span::button(status.text, status.style, toggle),
         ]),
     ];
     if look.collapsed {
@@ -285,7 +287,7 @@ fn card(c: &Card, width: usize, look: Look) -> Vec<Line> {
             body.len().saturating_sub(TAIL)
         };
         if hidden > 0 {
-            out.push(Line::from(vec![Span::button(
+            out.push(Line::from([Span::button(
                 format!("  │ ⋯ {hidden} earlier lines (ctrl-o shows all)"),
                 MUTED,
                 toggle,
@@ -293,37 +295,24 @@ fn card(c: &Card, width: usize, look: Look) -> Vec<Line> {
         }
         out.extend(body.into_iter().skip(hidden));
     }
-    if c.phase == Phase::Asking {
-        out.push(Line::from(vec![
-            Span::new("  allow this call?  ", ASK),
-            Span::button("[ y  yes ]", OK.bold(), Action::Approve(c.call, true)),
-            Span::new("  ", Style::new()),
-            Span::button("[ n  no ]", BAD.bold(), Action::Approve(c.call, false)),
-        ]));
+    if let Buttons::Approve(call) = p.buttons {
+        out.push(approve_row(call));
     }
     out
 }
 
-/// Whether a finished command did not succeed: a nonzero exit, a signal,
-/// a timeout or an interrupt.
-fn failed(output: &Json) -> bool {
-    #[derive(Default, Deserialize)]
-    #[serde(default)]
-    struct Ended {
-        exit: Option<i64>,
-        signal: Option<IgnoredAny>,
-        timed_out: Option<IgnoredAny>,
-        aborted: Option<bool>,
-    }
-    let ended = output.parse::<Ended>().unwrap_or_default();
-    ended.exit.is_some_and(|code| code != 0)
-        || ended.signal.is_some()
-        || ended.timed_out.is_some()
-        || ended.aborted == Some(true)
+/// The row that answers call `call`'s ask.
+fn approve_row(call: CallId) -> Line {
+    Line::from([
+        Span::new("  allow this call?  ", ASK),
+        Span::button("[ y  yes ]", OK.bold(), Action::Approve(call, true)),
+        Span::new("  ", Style::new()),
+        Span::button("[ n  no ]", BAD.bold(), Action::Approve(call, false)),
+    ])
 }
 
 /// A call's output rows behind the card's `│` gutter; a diff colored as one.
-fn output_rows(c: &Card, width: usize, verbose: bool) -> Vec<Line> {
+fn output_rows(p: &Presented<'_>, input: Option<&Json>, width: usize, verbose: bool) -> Vec<Line> {
     let bar = [Span::new("  │ ", MUTED)];
     let mut rows = Vec::new();
     let mut add = |text: &str, style: Style, diff: bool| {
@@ -337,52 +326,31 @@ fn output_rows(c: &Card, width: usize, verbose: bool) -> Vec<Line> {
             rows.extend(wrap(&[Span::new(line, style)], width, &bar, &bar));
         }
     };
-    if verbose && let Some(input) = c.input {
+    if verbose && let Some(input) = input {
         add(&input.to_string(), MUTED, false);
     }
-    match c.outcome {
-        Some(Outcome::Done { output }) => match output_text(c.shown) {
-            Some((text, _)) => {
-                let text = text.strip_suffix('\n').unwrap_or(&text);
-                if !text.is_empty() {
-                    add(text, Style::new(), text.starts_with("@@ "));
-                }
-            }
-            None if output.raw() == "null" => {}
-            None => match output.parse::<String>() {
-                Ok(text) => add(&text, Style::new(), false),
-                Err(_) => add(output.raw(), Style::new(), false),
-            },
-        },
-        Some(Outcome::Failed { error }) => add(error, BAD, false),
-        Some(Outcome::Interrupted { output }) => {
-            if let Some(text) = output.as_deref().map(|t| t.trim_end_matches('\n')) {
-                add(text, Style::new(), false);
-            }
-            add("stopped before it finished", WARN, false);
-        }
-        None => {}
+    match &p.body {
+        Shown::None => {}
+        Shown::Diff(text) => add(text, Style::new(), true),
+        body => add(&body.text(), Style::new(), false),
     }
     rows
 }
 
 #[cfg(test)]
 mod tests {
-    use protocol::view::Approval;
+    use protocol::ledger::Phase;
+    use protocol::{Audience, Outcome, WaitOn};
     use serde_json::json;
 
     use super::*;
 
-    fn texts(lines: &[Line]) -> Vec<String> {
-        lines.iter().map(Line::text).collect()
-    }
-
-    fn tool(outcome: Option<Outcome>, approval: Option<Approval>) -> Item {
+    fn tool(outcome: Option<Outcome>, phase: Phase) -> Item {
         Item::Tool {
-            call: 7,
+            call: CallId::new(7).unwrap(),
             tool: "bash".into(),
             input: Json::encode(&json!({"command": "ls"})).unwrap(),
-            approval,
+            phase,
             outcome,
             card: None,
             by: Audience::Model,
@@ -395,12 +363,13 @@ mod tests {
         let done = Outcome::Done {
             output: Json::encode(&json!({"output": stdout, "exit": 0})).unwrap(),
         };
-        let mut finished = tool(Some(done.clone()), None);
+        let mut finished = tool(Some(done.clone()), Phase::Running);
         if let Item::Tool { card, .. } = &mut finished {
             *card = Some(protocol::Card {
                 title: "$ ls".into(),
                 body: stdout.clone(),
                 note: "exit 0".into(),
+                ..protocol::Card::default()
             });
         }
         let rows = texts(&rows(&finished, 40, Look::default()));
@@ -431,23 +400,24 @@ mod tests {
 
     #[test]
     fn a_card_waiting_for_approval_has_buttons() {
-        let item = tool(None, Some(Approval::Pending));
+        let item = tool(None, Phase::Waiting(WaitOn::Approval));
         let lines = rows(&item, 60, Look::default());
         assert_eq!(texts(&lines)[1], "• $ ls  ? waiting for approval");
         let buttons: Vec<_> = lines[2].spans.iter().filter_map(|s| s.action).collect();
+        let call = CallId::new(7).unwrap();
         assert_eq!(
             buttons,
-            [Action::Approve(7, true), Action::Approve(7, false)]
+            [Action::Approve(call, true), Action::Approve(call, false)]
         );
     }
 
     #[test]
     fn a_streaming_reply_shows_its_live_text() {
         let item = Item::Reply {
-            call: 3,
+            call: CallId::new(3).unwrap(),
             model: "echo".into(),
             text: String::new(),
-            status: Status::Running,
+            status: protocol::view::Status::Running,
             usage: None,
             purpose: None,
         };
@@ -474,29 +444,49 @@ mod tests {
     }
 
     #[test]
-    fn command_output_escapes_are_stripped() {
+    fn markdown_rows_are_headed_bulleted_and_fenced() {
+        let rows = markdown(
+            "# Title\n- one **two** `x`\n```\nfn a()\n```",
+            40,
+            Style::new(),
+        );
+        assert_eq!(
+            texts(&rows),
+            ["  Title", "  • one two x", "  ```", "  fn a()", "  ```"]
+        );
+        assert!(rows[0].spans[1].style.mods.contains(Modifier::BOLD));
+        let x = rows[1].spans.iter().find(|s| s.text == "x").unwrap();
+        assert_eq!(x.style, CODE);
+    }
+
+    /// The shell marks a failed command's card: no client reads its exit
+    /// code out of the output.
+    #[test]
+    fn command_output_escapes_are_stripped_and_a_bad_mark_shows_red() {
         let done = Outcome::Done {
             output: Json::encode(&json!({"output": "\x1b[31mred\x1b[0m\n", "exit": 1})).unwrap(),
         };
-        let mut ran = tool(Some(done), None);
+        let mut ran = tool(Some(done), Phase::Running);
         if let Item::Tool { card, .. } = &mut ran {
             *card = Some(protocol::Card {
                 title: "$ ls".into(),
                 body: "\x1b[31mred\x1b[0m\n".into(),
                 note: "exit 1".into(),
+                mark: protocol::Mark::Bad,
             });
         }
-        let rows = rows_of(&ran, Look::default());
-        assert_eq!(rows[1..], ["▾ $ ls  ✗ exit 1", "  │ red"]);
+        let lines = rows(&ran, 40, Look::default());
+        assert_eq!(texts(&lines)[1..], ["▾ $ ls  ✗ exit 1", "  │ red"]);
+        assert_eq!(lines[1].spans[3].style, BAD);
     }
 
     #[test]
     fn an_edit_card_shows_its_diff() {
         let item = Item::Tool {
-            call: 7,
+            call: CallId::new(7).unwrap(),
             tool: "edit".into(),
             input: Json::encode(&json!({"path": "a.txt", "edits": []})).unwrap(),
-            approval: None,
+            phase: Phase::Running,
             outcome: Some(Outcome::Done {
                 output: Json::encode(&json!({"path": "a.txt"})).unwrap(),
             }),
@@ -504,6 +494,7 @@ mod tests {
                 title: "edit a.txt".into(),
                 body: "@@ -2,1 +2,1 @@\n-two\n+2\n".into(),
                 note: "+1 -1".into(),
+                ..protocol::Card::default()
             }),
             by: Audience::Model,
         };
@@ -524,15 +515,15 @@ mod tests {
     #[test]
     fn a_slash_command_shows_as_a_card() {
         let mut item = Item::Tool {
-            call: 4,
+            call: CallId::new(4).unwrap(),
             tool: "model".into(),
             input: Json::encode(&serde_json::json!({ "args": "" })).unwrap(),
-            approval: None,
+            phase: Phase::Gating { at: 0 },
             outcome: None,
             card: None,
             by: Audience::User,
         };
-        assert!(!settled(&item));
+        assert!(!item.settled());
         assert_eq!(rows_of(&item, Look::default())[1], "• /model  running…");
         if let Item::Tool { outcome, .. } = &mut item {
             *outcome = Some(Outcome::Failed {

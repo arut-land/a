@@ -1,13 +1,12 @@
 //! The pages and the pieces of a transcript a live tab patches in, as
 //! markup. Every transcript item renders inside an element of its own
 //! (`#i{key}`) so that a change replaces just that item; the transcript's
-//! end (`#end`) follows the items, and new items go in before it.
+//! end (`#end`) follows the items, and new items go in before it. What an
+//! item says is [`Item::present`]'s; here is only where it goes.
 use hypertext::prelude::*;
-use protocol::view::{
-    Approval, Item, Phase, SessionView, Status, Usage, call_title, decision_line, output_text,
-    recap_line,
-};
-use protocol::{Card, Json, Outcome, SessionId, SessionSummary};
+use protocol::view::md::{self, Block, Inline};
+use protocol::view::{Buttons, Glyph, Item, Kind, Presented, SessionView, Shown, recap_line};
+use protocol::{CallId, SessionId, SessionSummary};
 
 use crate::{http, style};
 
@@ -162,53 +161,64 @@ pub fn transcript<'a>(view: &'a SessionView, end: &'a End) -> impl Renderable {
     }
 }
 
+/// The style of a status class.
+const fn status_style(glyph: Glyph) -> &'static str {
+    match glyph {
+        Glyph::None | Glyph::Busy => style::DIM,
+        Glyph::Ok => style::OK,
+        Glyph::Bad | Glyph::Denied => style::BAD,
+        Glyph::Warn | Glyph::Ask => style::WARN,
+    }
+}
+
 /// One transcript item, with the reply streaming into it if it is `view`'s.
 #[component]
 pub fn item_row<'a>(item: &'a Item, view: &'a SessionView) -> impl Renderable {
+    let p = item.present();
+    let live = match item {
+        Item::Reply { call, .. } => (view.streaming.as_ref())
+            .filter(|s| s.call == *call)
+            .map(|s| s.text.as_str()),
+        _ => None,
+    };
     maud! {
-        div #{ "i" (item.key()) } style=(ITEM) {
-            @match item {
-                Item::User { text, .. } => {
-                    div style=(style::MINE) { (text) }
+        div #{ "i" (item.key().get()) } style=(ITEM) {
+            @match p.kind {
+                Kind::User => {
+                    div style=(style::MINE) { (p.body.text()) }
                 }
-                Item::Assistant { text, .. } => {
-                    div style=(style::THEIRS) { (text) }
+                Kind::Assistant => {
+                    div style=(style::THEIRS) { (Markdown { text: &p.body.text() }) }
                 }
-                // The title shows in the bar.
-                item if item.titles() => {}
-                Item::Reply { call, text, status, usage, .. } => {
-                    ReplyRow call=(*call) text=(text) status=(status) usage=(usage.as_ref())
-                        live=(view.streaming.as_ref().filter(|s| s.call == *call).map(|s| s.text.as_str()));
+                Kind::Reply => {
+                    ReplyRow key=(item.key()) p=(&p) live=(live);
                 }
-                Item::Tool { tool, input, outcome, by: protocol::Audience::User, .. } => {
+                // A side request's reply is its extension's, not the conversation's:
+                // a title shows in the bar.
+                Kind::Side => {}
+                Kind::Tool => {
+                    ToolCard p=(&p);
+                }
+                Kind::Command => {
                     div style=(style::NOTE) {
-                        span style=(style::MONO) { "/" (tool) " " (Item::args(input)) }
-                        @if let Some(outcome) = outcome {
-                            " · " (outcome_text(outcome))
+                        span style=(style::MONO) { (p.title) }
+                        " · " span style=(status_style(p.glyph)) { (p.status) }
+                        @if p.body != Shown::None {
+                            " · " (p.body.text())
                         }
                     }
                 }
-                Item::Tool { call, tool, input, approval, outcome, card, .. } => {
-                    ToolCard call=(*call) line=(&call_title(tool, input, card.as_ref())) approval=(*approval)
-                        phase=(item.phase().unwrap_or(Phase::Running)) outcome=(outcome.as_ref()) card=(card.as_ref());
+                Kind::Hook | Kind::Environment => {
+                    p style=(style::NOTE) { (p.title) }
                 }
-                Item::Hook { hook, call, tool, decision, .. } => {
-                    p style=(style::NOTE) { "hook " (hook) " · " (decision_line(tool, *call, decision)) }
-                }
-                Item::Child { child, input, fired, .. } => {
+                Kind::Child => {
                     div style=(style::NOTE) {
-                        "subagent "
-                        a style=(style::LINK) href={ "/s/" (format_args!("{child}")) } {
-                            (format_args!("{}", child.short()))
+                        @if let Item::Child { child, .. } = item {
+                            a style=(style::LINK) href={ "/s/" (format_args!("{child}")) } { (p.title) }
                         }
-                        " · " (input)
-                        @if let Some(outcome) = fired {
-                            " · " (outcome_text(outcome))
-                        }
+                        " · " (p.body.text())
+                        " · " span style=(status_style(p.glyph)) { (p.status) }
                     }
-                }
-                Item::Environment { cwd, .. } => {
-                    p style=(style::NOTE) { "environment · " (format_args!("{}", cwd.display())) }
                 }
             }
         }
@@ -216,7 +226,7 @@ pub fn item_row<'a>(item: &'a Item, view: &'a SessionView) -> impl Renderable {
 }
 
 /// Where the text streamed for model call `call` goes.
-pub fn reply_id(call: u64) -> String {
+pub fn reply_id(call: CallId) -> String {
     format!("#reply-{call}")
 }
 
@@ -228,110 +238,141 @@ pub fn delta(text: &str) -> String {
 /// A model call: its streamed text while it runs, then the committed reply.
 #[component]
 fn reply_row<'a>(
-    call: u64,
-    text: &'a str,
-    status: &'a Status,
-    usage: Option<&'a Usage>,
+    key: protocol::Seq,
+    p: &'a Presented<'a>,
     live: Option<&'a str>,
 ) -> impl Renderable {
     maud! {
-        @match status {
-            Status::Running => {
+        @match p.glyph {
+            Glyph::Busy => {
                 @if let Some(text) = live.filter(|t| !t.is_empty()) {
                     div style=(style::THEIRS) {
-                        span #{ "reply-" (call) } { (text) } "▍"
+                        span #{ "reply-" (key.get()) } { (text) } "▍"
                     }
                 } @else {
                     p style=(style::NOTE) { "thinking…" }
                 }
             }
-            Status::Done => {
-                @if !text.is_empty() {
-                    div style=(style::THEIRS) { (text) }
+            Glyph::None => {
+                @if let Shown::Markdown(text) = p.body && !text.is_empty() {
+                    div style=(style::THEIRS) { (Markdown { text }) }
                 }
-                @if let Some(Usage { input, output }) = usage {
-                    p style=(style::NOTE) { (input) " in · " (output) " out" }
+                @if let Some(usage) = p.usage {
+                    p style=(style::NOTE) { (format_args!("{usage}")) }
                 }
             }
-            Status::Failed { error } => {
-                p style=(style::BAD) { "model failed: " (error) }
-            }
-            Status::Interrupted => {
-                p style=(style::WARN) { "model call interrupted" }
+            glyph => {
+                p style=(status_style(glyph)) { (p.status) }
             }
         }
     }
 }
 
-/// A tool call: what it runs, the approval it waits for, and its outcome.
+/// A tool call: what it runs, where it stands, and what it shows for it.
 #[component]
-fn tool_card<'a>(
-    call: u64,
-    line: &'a str,
-    approval: Option<Approval>,
-    phase: Phase,
-    outcome: Option<&'a Outcome>,
-    card: Option<&'a Card>,
-) -> impl Renderable {
+fn tool_card<'a>(p: &'a Presented<'a>) -> impl Renderable {
     maud! {
         div style=(style::TOOL) {
             div style=(style::TOOL_HEAD) {
-                span style=(style::MONO) { (line) }
-                @match approval {
-                    Some(Approval::Approved) => { span style=(style::OK) { "approved" } }
-                    Some(Approval::Denied) => { span style=(style::BAD) { "not approved" } }
-                    _ => {}
-                }
-                @if phase == Phase::Running {
-                    span style=(style::DIM) { "running…" }
-                }
+                span style=(style::MONO) { (p.title) }
+                span style=(status_style(p.glyph)) { (p.status) }
             }
-            @if phase == Phase::Asking {
+            @if let Buttons::Approve(call) = p.buttons {
                 div style=(style::ASK) {
                     span { "Run this?" }
                     button style=(style::BUTTON)
-                        data-on:click={ "@post('/api/approve?call=" (call) "&ok=1')" } { "Approve" }
+                        data-on:click={ "@post('/api/approve?call=" (call.get()) "&ok=1')" } { "Approve" }
                     button style=(style::BUTTON_QUIET)
-                        data-on:click={ "@post('/api/approve?call=" (call) "&ok=0')" } { "Deny" }
+                        data-on:click={ "@post('/api/approve?call=" (call.get()) "&ok=0')" } { "Deny" }
                 }
             }
-            @match outcome {
-                Some(Outcome::Done { output }) => {
-                    OutputBlock output=(output) card=(card);
+            @match &p.body {
+                Shown::None => {}
+                Shown::Json(output) => {
+                    // Any tool's output, shown as a tree of it prints.
+                    pre style=(style::OUTPUT) {
+                        (output.parse::<serde_json::Value>().and_then(|tree| serde_json::to_string_pretty(&tree)).unwrap_or_default())
+                    }
                 }
-                Some(Outcome::Failed { error }) => {
-                    pre style=(style::OUTPUT) { span style=(style::BAD) { (error) } }
+                body => {
+                    pre style=(style::OUTPUT) { (body.text()) }
                 }
-                Some(Outcome::Interrupted { .. }) => {
-                    pre style=(style::OUTPUT) { span style=(style::WARN) { "interrupted before it finished" } }
-                }
-                None => {}
             }
         }
     }
 }
 
-/// A finished call's output: as its tool presents it, anything else as
-/// JSON.
+/// A reply's markdown: the blocks as elements, bullets and code lines
+/// grouped, inline bold and code as such.
 #[component]
-fn output_block<'a>(output: &'a Json, card: Option<&'a Card>) -> impl Renderable {
-    let command = output_text(card);
+fn markdown<'a>(text: &'a str) -> impl Renderable {
+    let groups = group(text);
     maud! {
-        @if let Some((text, note)) = &command {
-            pre style=(style::OUTPUT) { (text) span style=(style::DIM) { (note) } }
-        } @else {
-            pre style=(style::OUTPUT) {
-                // Any tool's output, shown as a tree of it prints.
-                (output.parse::<serde_json::Value>().and_then(|tree| serde_json::to_string_pretty(&tree)).unwrap_or_default())
+        @for g in &groups {
+            @match g {
+                Group::Heading(level, text) => {
+                    @match level {
+                        1 => h1 { (Inlines { text }) }
+                        2 => h2 { (Inlines { text }) }
+                        _ => h3 { (Inlines { text }) }
+                    }
+                }
+                Group::Bullets(items) => {
+                    ul { @for text in items { li { (Inlines { text }) } } }
+                }
+                Group::Quote(lines) => {
+                    blockquote { @for text in lines { (Inlines { text }) "\n" } }
+                }
+                Group::Code(lines) => {
+                    pre { code { @for line in lines { (line) "\n" } } }
+                }
+                Group::Para(text) => {
+                    p { (Inlines { text }) }
+                }
             }
         }
     }
 }
 
-fn outcome_text(outcome: &Outcome) -> String {
-    match outcome {
-        Outcome::Done { output } => output.to_string(),
-        Outcome::Failed { error } => format!("failed: {error}"),
-        Outcome::Interrupted { .. } => "interrupted".to_owned(),
+#[component]
+fn inlines<'a>(text: &'a str) -> impl Renderable {
+    maud! {
+        @for run in md::inlines(text) {
+            @match run {
+                Inline::Text(t) => { (t) }
+                Inline::Bold(t) => { strong { (t) } }
+                Inline::Code(t) => { code { (t) } }
+            }
+        }
     }
+}
+
+/// Lines that go in one element together.
+enum Group<'a> {
+    Heading(u8, &'a str),
+    Bullets(Vec<&'a str>),
+    Quote(Vec<&'a str>),
+    Code(Vec<&'a str>),
+    Para(&'a str),
+}
+
+fn group(text: &str) -> Vec<Group<'_>> {
+    let mut groups: Vec<Group<'_>> = Vec::new();
+    for block in md::blocks(text) {
+        match (block, groups.last_mut()) {
+            (Block::Bullet { text, .. }, Some(Group::Bullets(items))) => items.push(text),
+            (Block::Bullet { text, .. }, _) => groups.push(Group::Bullets(vec![text])),
+            (Block::Quote(text), Some(Group::Quote(lines))) => lines.push(text),
+            (Block::Quote(text), _) => groups.push(Group::Quote(vec![text])),
+            (Block::Code(line), Some(Group::Code(lines))) => lines.push(line),
+            (Block::Code(line), _) => groups.push(Group::Code(vec![line])),
+            // An empty fence still shows as one.
+            (Block::Fence(_), Some(Group::Code(_))) => {}
+            (Block::Fence(_), _) => groups.push(Group::Code(Vec::new())),
+            (Block::Heading(level, text), _) => groups.push(Group::Heading(level, text)),
+            (Block::Para(text), _) if !text.trim().is_empty() => groups.push(Group::Para(text)),
+            (Block::Para(_), _) => {}
+        }
+    }
+    groups
 }

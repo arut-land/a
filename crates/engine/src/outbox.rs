@@ -390,14 +390,14 @@ impl Queue {
 mod tests {
     use std::sync::atomic::AtomicUsize;
 
-    use protocol::{Body, DaemonMsg};
+    use protocol::{Body, CallId, DaemonMsg, Epoch, Seq};
 
     use super::*;
 
     fn entry(seq: u64, text: &str) -> Frame {
         Frame::entry(&Entry::new(
-            seq,
-            0,
+            Seq::new(seq).unwrap(),
+            Epoch(0),
             Body::Input {
                 text: text.into(),
                 mode: protocol::Mode::Queue,
@@ -410,7 +410,7 @@ mod tests {
 
     fn delta() -> Frame {
         Frame::new(&DaemonMsg::Delta {
-            call: 1,
+            call: CallId::new(1).unwrap(),
             text: "t".into(),
             attempt: 0,
         })
@@ -431,7 +431,7 @@ mod tests {
                     origin: None,
                 })
                 .unwrap();
-            self.1.push(e.seq, Frame::entry(&e).ok());
+            self.1.push(e.seq.get(), Frame::entry(&e).ok());
         }
 
         fn frames(&self) -> Arc<FrameLog> {
@@ -551,7 +551,7 @@ mod tests {
     fn deltas_past_the_budget_are_dropped() {
         let outbox = Outbox::new();
         let big = Frame::new(&DaemonMsg::Delta {
-            call: 1,
+            call: CallId::new(1).unwrap(),
             text: "x".repeat(BUDGET / 2),
             attempt: 0,
         })

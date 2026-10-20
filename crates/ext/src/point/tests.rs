@@ -4,6 +4,7 @@ use std::sync::Mutex;
 use std::sync::atomic::{AtomicUsize, Ordering};
 
 use protocol::Permission as Level;
+use protocol::{Epoch, Seq};
 use serde_json::{Value, json};
 
 use super::*;
@@ -368,7 +369,7 @@ fn a_failing_handler_answers_its_points_failure_policy() {
     let after = broken.post_tool(&cx, ("t", &input), outcome.clone());
     assert_eq!(after, Chained::new(outcome));
     assert_eq!(broken.on_stop(&cx), None);
-    let entry = Entry::new(1, 0, protocol::Body::INTERRUPT);
+    let entry = Entry::new(Seq::new(1).unwrap(), Epoch(0), protocol::Body::INTERRUPT);
     assert_eq!(broken.observe(point_cx(&view), &entry).len(), 0);
     let mut request = llm::Request::default();
     assert_eq!(broken.step(&cx, &mut request), (Decided::new(), None));
@@ -466,7 +467,7 @@ fn merge_rules_are_applied_identically_for_every_point() {
     chains::<Step, _, _>(cx, (), ["0", "a", "b"].map(request), None);
     first::<OnStop, _>(cx, (), ["a", "b"].map(str::to_owned));
 
-    let entry = Entry::new(1, 0, protocol::Body::INTERRUPT);
+    let entry = Entry::new(Seq::new(1).unwrap(), Epoch(0), protocol::Body::INTERRUPT);
     observes::<Observe>(cx, &entry);
     observes::<SessionStart>(cx, ());
     observes::<SessionEnd>(cx, ());
@@ -527,7 +528,7 @@ fn a_point_with_no_handler_costs_nothing() {
         assert_eq!(after, Chained::new(outcome));
         hooks.observe(
             point_cx(&view),
-            &Entry::new(1, 0, protocol::Body::INTERRUPT),
+            &Entry::new(Seq::new(1).unwrap(), Epoch(0), protocol::Body::INTERRUPT),
         );
         hooks.session_start(&cx);
         hooks.session_end(&cx);

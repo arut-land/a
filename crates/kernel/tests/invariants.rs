@@ -303,8 +303,7 @@ fn an_interrupt_never_starts_work() {
         while let Some(effect) = todo.pop_front() {
             assert!(!starts_work(&effect, mark), "{name}: {effect:?}");
             let event = match effect {
-                Effect::Cancel { call } => match &s.core.ledger().call(call.get()).map(|o| &o.call)
-                {
+                Effect::Cancel { call } => match &s.core.ledger().call(call).map(|o| &o.call) {
                     Some(Call::Model { .. }) => Event::ModelDone {
                         call,
                         replied: Replied::Interrupted(None),
@@ -449,36 +448,57 @@ fn a_kernel_panic_is_a_resume() {
     assert_eq!(fx.as_slice(), [append(5, tool_result(4, INTERRUPTED))]);
 }
 
-/// No extension is known by name below the extension layer: the kernel
-/// and the engine name no plugin's state, fold or purpose. (What the
-/// `settings` extension chooses is a service; what titles a session is a
-/// side request's purpose, the plugin's own.)
+/// No extension is known by name below the extension layer: the
+/// protocol, the kernel and the engine name no plugin, its state, fold or
+/// purpose. (What the `settings` extension chooses is a service; what
+/// titles a session is a side request's purpose, the plugin's own.) The
+/// names are the `ext-*` crates'; a `kinds!` row naming a wire tag of the
+/// same spelling (the home `settings` message) is no plugin.
 #[test]
 fn no_plugin_is_named_below_the_plugin_layer() {
-    let manifest = Path::new(env!("CARGO_MANIFEST_DIR"));
-    let crates = ["kernel", "engine"].map(|c| manifest.join("..").join(c).join("src"));
-    let names = [
-        "\"settings\"",
-        "\"title\"",
-        "\"titled\"",
-        "\"compacted\"",
-        "\"mode\"",
-    ];
+    let crates = Path::new(env!("CARGO_MANIFEST_DIR")).join("..");
+    let mut plugins: Vec<String> = std::fs::read_dir(&crates)
+        .unwrap()
+        .flatten()
+        .filter_map(|e| {
+            let name = e.file_name().to_string_lossy().into_owned();
+            name.strip_prefix("ext-")
+                .filter(|n| *n != "derive")
+                .map(|n| format!("\"{n}\""))
+        })
+        .collect();
+    plugins.sort();
+    assert!(plugins.contains(&"\"settings\"".to_owned()), "{plugins:?}");
+    let wire_tag = |line: &str, literal: &str| {
+        line.trim_start()
+            .split_once(' ')
+            .is_some_and(|(kind, rest)| {
+                kind.starts_with(char::is_uppercase) && rest.starts_with(literal)
+            })
+    };
     let mut sources = Vec::new();
-    for root in crates {
-        sources.extend(rust_sources(&root));
+    for krate in ["protocol", "kernel", "engine"] {
+        sources.extend(rust_sources(&crates.join(krate).join("src")));
     }
-    assert_ne!(sources.len(), 0);
+    assert!(sources.len() > 20, "{} sources read", sources.len());
+    let mut found = Vec::new();
     for path in sources {
         let text = std::fs::read_to_string(&path).unwrap();
-        for name in names {
-            assert!(
-                !text.contains(name),
-                "{} names a plugin: {name}",
-                path.display()
-            );
+        // A file's own unit tests may name what they like.
+        let code = text.split("#[cfg(test)]").next().unwrap_or_default();
+        for (n, line) in code.lines().enumerate() {
+            for plugin in &plugins {
+                if line.contains(plugin.as_str()) && !wire_tag(line, plugin) {
+                    found.push(format!("{}:{}: {}", path.display(), n + 1, line.trim()));
+                }
+            }
         }
     }
+    assert!(
+        found.is_empty(),
+        "a plugin named below the plugin layer:\n{}",
+        found.join("\n")
+    );
 }
 
 /// The non-test Rust sources under `dir`.
@@ -634,7 +654,7 @@ fn only_notes_wait_for_the_next_commit() {
     use kernel::Durability;
     let later = [
         Body::Progress {
-            call: 2,
+            call: CallId::new(2).unwrap(),
             text: "half".into(),
         },
         Body::Ext {

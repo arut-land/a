@@ -127,47 +127,50 @@ struct RecapBar: View {
     }
 }
 
+/// One transcript item, laid out by what it is and worded by how Rust
+/// presents it (`shown`): the app decides neither status nor colour.
 struct ItemView: View {
     let item: ViewItem
     let store: SessionStore
 
     var body: some View {
+        let shown = item.shown()
         switch item {
-        case .user(_, let text):
+        case .user:
             HStack {
                 Spacer(minLength: 80)
-                Text(text)
+                Text(shown.body?.text ?? "")
                     .textSelection(.enabled)
                     .padding(.horizontal, 12).padding(.vertical, 8)
                     .background(.tint.opacity(0.15), in: .rect(cornerRadius: 12))
             }
-        case .assistant(_, let text):
-            Text(text).textSelection(.enabled)
-        // The title is the window's.
-        case .reply(_, _, _, _, _, "title"):
+        case .assistant:
+            BodyView(body: shown.body)
+        // A side request's reply is its extension's, not the conversation's:
+        // the title is the window's.
+        case .reply(_, _, _, _, .some, _):
             EmptyView()
-        case .reply(let call, let model, let text, let status, let usage, _):
-            ReplyView(
-                call: call, model: model, text: text, status: status, usage: usage,
-                streaming: live(call, status))
-        case .tool(let call, _, _, let title, let approval, let outcome, _, let phase):
-            ToolView(
-                call: call, title: title, approval: approval, outcome: outcome, phase: phase,
-                store: store)
-        case .command(_, let name, let args, let outcome):
+        case .reply(let call, _, _, let status, _, _):
+            ReplyView(shown: shown, streaming: live(call, status))
+        case .tool:
+            ToolView(shown: shown, store: store)
+        case .command:
             VStack(alignment: .leading) {
-                Note(icon: "slash.circle", text: "/\(name) \(args)")
-                if let outcome { OutcomeView(outcome: outcome) }
+                HStack {
+                    Note(icon: "slash.circle", text: shown.title)
+                    StatusText(shown: shown)
+                }
+                BodyView(body: shown.body)
             }
-        case .hook(_, let hook, _, let line):
-            Note(icon: "hook", text: "hook \(hook): \(line)")
-        case .child(_, let child, let input, _, let fired):
-            VStack(alignment: .leading) {
-                Note(icon: "arrow.triangle.branch", text: "child \(child.suffix(8)): \(input)")
-                if let fired { OutcomeView(outcome: fired) }
+        case .hook:
+            Note(icon: "hook", text: shown.title)
+        case .child:
+            HStack {
+                Note(icon: "arrow.triangle.branch", text: "\(shown.title): \(shown.body?.text ?? "")")
+                StatusText(shown: shown)
             }
-        case .environment(_, let cwd):
-            Note(icon: "folder", text: "environment: \(cwd)")
+        case .environment:
+            Note(icon: "folder", text: shown.title)
         }
     }
 }
@@ -191,31 +194,72 @@ struct Note: View {
     }
 }
 
+extension StatusGlyph {
+    var color: Color {
+        switch self {
+        case .plain, .busy: .secondary
+        case .ok: .green
+        case .bad, .denied: .red
+        case .warn, .ask: .orange
+        }
+    }
+}
+
+/// An item's status, in its class's colour; nothing when it has none.
+struct StatusText: View {
+    let shown: Presentation
+
+    var body: some View {
+        if !shown.status.isEmpty {
+            Text(shown.status).font(.caption).foregroundStyle(shown.glyph.color)
+        }
+    }
+}
+
+/// What goes under an item's header: a reply's markdown as attributed
+/// text, anything else preformatted.
+struct BodyView: View {
+    let body_: ShownBody?
+
+    init(body: ShownBody?) { body_ = body }
+
+    var body: some View {
+        if let shown = body_ {
+            switch shown.kind {
+            case .markdown:
+                Text(markdown(shown.text)).textSelection(.enabled)
+            case .text, .diff, .json:
+                Text(shown.text.trimmingCharacters(in: .newlines))
+                    .font(.callout.monospaced()).textSelection(.enabled)
+            }
+        }
+    }
+
+    private func markdown(_ text: String) -> AttributedString {
+        let options = AttributedString.MarkdownParsingOptions(
+            interpretedSyntax: .inlineOnlyPreservingWhitespace)
+        return (try? AttributedString(markdown: text, options: options)) ?? AttributedString(text)
+    }
+}
+
 struct ReplyView: View {
-    let call: UInt64
-    let model: String
-    let text: String
-    let status: ReplyStatus
-    let usage: TokenUsage?
+    let shown: Presentation
     let streaming: String?
 
     var body: some View {
         VStack(alignment: .leading, spacing: 4) {
-            switch status {
-            case .running:
+            if case .busy = shown.glyph {
                 HStack(alignment: .firstTextBaseline) {
                     Text(streaming ?? "").textSelection(.enabled)
                     ProgressView().controlSize(.small)
                 }
-            case .done:
-                Text(text).textSelection(.enabled)
-            case .failed(let error):
-                Label("model failed: \(error)", systemImage: "xmark.octagon").foregroundStyle(.red)
-            case .interrupted:
-                Label("model call interrupted", systemImage: "pause.circle").foregroundStyle(.orange)
+            } else if shown.status.isEmpty {
+                BodyView(body: shown.body)
+            } else {
+                Label(shown.status, systemImage: "xmark.octagon").foregroundStyle(shown.glyph.color)
             }
-            if let usage {
-                Text("\(model) · \(usage.input) in, \(usage.output) out")
+            if let usage = shown.usage {
+                Text("\(shown.title) · \(usage.input) in, \(usage.output) out")
                     .font(.caption2).foregroundStyle(.tertiary)
             }
         }
@@ -223,28 +267,21 @@ struct ReplyView: View {
 }
 
 struct ToolView: View {
-    let call: UInt64
-    let title: String
-    let approval: ApprovalState?
-    let outcome: ToolOutcome?
-    let phase: CallPhase
+    let shown: Presentation
     let store: SessionStore
 
     var body: some View {
         VStack(alignment: .leading, spacing: 6) {
             HStack {
                 Image(systemName: "terminal")
-                Text(title).font(.body.monospaced())
+                Text(shown.title).font(.body.monospaced())
                 Spacer()
-                switch (phase, approval) {
-                case (.asking, _):
-                    Text("waiting for approval").font(.caption).foregroundStyle(.orange)
-                case (.denied, _), (_, .denied?): Text("denied").font(.caption).foregroundStyle(.red)
-                case (_, .approved?): Text("approved").font(.caption).foregroundStyle(.green)
-                default: EmptyView()
+                StatusText(shown: shown)
+                if case .busy = shown.glyph {
+                    ProgressView().controlSize(.small)
                 }
             }
-            if phase == .asking {
+            if let call = shown.approve {
                 HStack {
                     Button("Approve") { Task { await store.approve(call: call, approved: true) } }
                         .buttonStyle(.borderedProminent)
@@ -253,39 +290,9 @@ struct ToolView: View {
                     }
                 }
             }
-            if let outcome {
-                OutcomeView(outcome: outcome)
-            } else if phase == .running {
-                ProgressView().controlSize(.small)
-            }
+            BodyView(body: shown.body)
         }
         .padding(10)
         .background(.quaternary.opacity(0.5), in: .rect(cornerRadius: 8))
-    }
-}
-
-struct OutcomeView: View {
-    let outcome: ToolOutcome
-
-    var body: some View {
-        switch outcome {
-        case .done(_, let shown?):
-            VStack(alignment: .leading, spacing: 2) {
-                if !shown.text.isEmpty {
-                    Text(shown.text.trimmingCharacters(in: .newlines))
-                        .font(.callout.monospaced()).textSelection(.enabled)
-                }
-                if !shown.note.isEmpty {
-                    Text(shown.note).font(.caption2).foregroundStyle(.secondary)
-                }
-            }
-        case .done(let json, nil):
-            Text(json).font(.callout.monospaced()).textSelection(.enabled)
-        case .failed(let error):
-            Label("failed: \(error)", systemImage: "xmark.octagon").foregroundStyle(.red)
-        case .interrupted:
-            Label("interrupted: the daemon stopped mid-call", systemImage: "pause.circle")
-                .foregroundStyle(.orange)
-        }
     }
 }

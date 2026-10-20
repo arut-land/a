@@ -1,39 +1,44 @@
 //! What a session's log says now, folded once per entry as it commits or
 //! loads, so that no question about the log scans it: which calls are open
 //! and where each stands, what waits for the user and for the agent, which
-//! watches are armed, and the settings, environment and context last
-//! logged. Pure: the daemon and any client fold the same entries to the
-//! same ledger.
+//! watches are armed, and the environment and context last logged. Pure:
+//! the daemon and any client fold the same entries to the same ledger, and
+//! a snapshot carries one as it is.
 
 use std::collections::VecDeque;
 
+use serde::{Deserialize, Serialize};
+
 use crate::{
-    Activity, Audience, Author, Body, ClientId, ClientSeq, Entry, Environment, Installed, Json,
-    Mode, Outcome, Overrides, Permission, SessionId, ToolChoice, Verdict, WaitOn,
+    Activity, Audience, Author, Body, CallId, ClientId, ClientSeq, Entry, Environment, Installed,
+    Json, Mode, Outcome, Permission, Seq, SessionId, ToolChoice, Verdict, WaitOn,
 };
 
-#[derive(Clone, Debug, Default)]
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
+#[serde(default)]
 pub struct Ledger {
     /// The seq of the last entry folded.
     seq: u64,
-    /// Model and tool calls with an intent and no outcome, by seq.
-    open: BySeq<Open>,
+    /// Model and tool calls with an intent and no outcome.
+    open: Keyed<CallId, Open>,
     /// Input queued and not yet taken up, in order.
     untaken: VecDeque<Queued>,
-    /// Watches that have not fired, by seq.
-    armed: BySeq<SessionId>,
+    /// Watches that have not fired.
+    armed: Keyed<Seq, SessionId>,
     /// Every child linked, in order, and the children ever watched.
     links: Vec<Link>,
     watched: Vec<SessionId>,
     /// Background process groups started, with the boot they ran in.
     background: Vec<(u32, String)>,
-    settings: Option<(u64, Overrides)>,
     env: Option<Environment>,
     extensions: Option<Vec<Installed>>,
     context: bool,
     /// The last mutation logged of each client that named itself.
     clients: Vec<(ClientId, ClientSeq)>,
-    /// What the session last settled with, as a child hands it back.
+    /// What the session last settled with, as a child hands it back: the
+    /// daemon's to read, so a snapshot leaves it out (its raw JSON would
+    /// make the view's hash hang on the spelling of a reply).
+    #[serde(skip)]
     result: Option<Outcome>,
     /// The seq of the input that started the current turn; 0 before the
     /// first.
@@ -41,17 +46,20 @@ pub struct Ledger {
 }
 
 /// A call between its intent and its outcome.
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Open {
     pub call: Call,
     pub phase: Phase,
     /// The process groups it started, with the boot each ran in.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub processes: Vec<(u32, String)>,
     /// The output it committed as it ran.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub progress: Option<String>,
 }
 
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
 pub enum Call {
     Model {
         attempt: u16,
@@ -64,14 +72,15 @@ pub enum Call {
     },
     /// A side model request on behalf of call `of`.
     Side {
-        of: u64,
+        of: CallId,
     },
 }
 
 /// Where an open call stands. The one lifecycle of everything that waits
 /// (an approval, a dialog, a client, a child): what is running, and what
 /// waits on whom, is read from it rather than kept beside it.
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
 pub enum Phase {
     /// Its intent is committed and its gate's decisions are being made,
     /// `at` of them so far; it runs once they are.
@@ -85,26 +94,45 @@ pub enum Phase {
     Settled(OutcomeKind),
 }
 
+impl Phase {
+    /// Whether the call waits for a user's approval: what every client
+    /// attached is asked for.
+    pub const fn asking(&self) -> bool {
+        matches!(self, Self::Waiting(WaitOn::Approval))
+    }
+}
+
 /// What an outcome was, without what it carries.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
 pub enum OutcomeKind {
     Done,
     Failed,
     Interrupted,
 }
 
+impl OutcomeKind {
+    pub const fn of(outcome: &Outcome) -> Self {
+        match outcome {
+            Outcome::Done { .. } => Self::Done,
+            Outcome::Failed { .. } => Self::Failed,
+            Outcome::Interrupted { .. } => Self::Interrupted,
+        }
+    }
+}
+
 /// Input taken in and not yet taken up.
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Queued {
-    pub seq: u64,
+    pub seq: Seq,
     pub text: String,
     pub steer: bool,
 }
 
 /// A child session linked, and the input it starts with.
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Link {
-    pub seq: u64,
+    pub seq: Seq,
     pub child: SessionId,
     pub input: String,
 }
@@ -124,7 +152,7 @@ impl Ledger {
     /// no wait) changes nothing.
     pub fn apply(&mut self, e: &Entry) {
         let (seq, body) = (e.seq, &e.body);
-        self.seq = seq;
+        self.seq = seq.get();
         match body {
             Body::Input {
                 text,
@@ -134,7 +162,7 @@ impl Ledger {
             } => {
                 self.author(*origin);
                 if *taken {
-                    self.turn = seq;
+                    self.turn = seq.get();
                 } else {
                     self.untaken.push_back(Queued {
                         seq,
@@ -144,11 +172,11 @@ impl Ledger {
                 }
             }
             Body::Take { input } => {
-                if let Some(at) = self.untaken.iter().position(|q| q.seq == input.get())
+                if let Some(at) = self.untaken.iter().position(|q| q.seq == *input)
                     && let Some(q) = self.untaken.remove(at)
                     && !q.steer
                 {
-                    self.turn = seq;
+                    self.turn = seq.get();
                 }
             }
             Body::ToolCall { .. }
@@ -159,7 +187,7 @@ impl Ledger {
             | Body::ModelResult { .. }
             | Body::Decision { .. }
             | Body::Wait { .. }
-            | Body::Answer { .. } => self.track(seq, body),
+            | Body::Answer { .. } => self.track(CallId(seq), body),
             Body::Interrupt { origin } => {
                 self.author(*origin);
                 self.result = Some(Outcome::Interrupted { output: None });
@@ -187,24 +215,20 @@ impl Ledger {
             Body::Environment(env) => self.env = Some(env.clone()),
             Body::Extensions { installed } => self.extensions = Some(installed.clone()),
             Body::Context { .. } => self.context = true,
-            // The settings extension's model, until it folds its own state.
-            Body::Ext { ext, state, data } if ext == "settings" && state == "model" => {
-                let model = data.parse().unwrap_or_default();
-                self.settings = Some((seq, Overrides { model }));
-            }
             Body::Ext { .. } | Body::Edit { .. } | Body::Unknown { .. } => {}
         }
     }
 
-    /// Folds an entry about a call: its intent, processes, progress,
-    /// outcome, a decision on it, what it waits on and the answer.
-    fn track(&mut self, seq: u64, body: &Body) {
+    /// Folds an entry about a call: its intent (whose id is `here`, the
+    /// entry's own seq), processes, progress, outcome, a decision on it,
+    /// what it waits on and the answer.
+    fn track(&mut self, here: CallId, body: &Body) {
         match body {
             Body::ToolCall {
                 tool, input, by, ..
             } => {
                 self.open(
-                    seq,
+                    here,
                     Call::Tool {
                         tool: tool.clone(),
                         input: input.clone(),
@@ -220,13 +244,13 @@ impl Ledger {
                 ..
             } => {
                 let call = match r#for {
-                    Some(of) => Call::Side { of: of.get() },
+                    Some(of) => Call::Side { of: *of },
                     None => Call::Model {
                         attempt: *attempt,
                         choice: *choice,
                     },
                 };
-                self.open(seq, call, Phase::Running);
+                self.open(here, call, Phase::Running);
             }
             Body::ToolProcess {
                 call,
@@ -255,25 +279,25 @@ impl Ledger {
                 call: Some(call),
                 d,
                 ..
-            } => self.decide(call.get(), d),
-            Body::Wait { call, on } => self.wait(call.get(), on),
+            } => self.decide(*call, d),
+            Body::Wait { call, on } => self.wait(*call, on),
             Body::Answer {
                 call,
                 value,
                 origin,
             } => {
                 self.author(*origin);
-                self.answer(call.get(), value);
+                self.answer(*call, value);
             }
             _ => {}
         }
     }
 
-    fn open(&mut self, seq: u64, call: Call, phase: Phase) {
+    fn open(&mut self, call: CallId, what: Call, phase: Phase) {
         self.open.insert(
-            seq,
+            call,
             Open {
-                call,
+                call: what,
                 phase,
                 processes: Vec::new(),
                 progress: None,
@@ -281,7 +305,7 @@ impl Ledger {
         );
     }
 
-    fn settle(&mut self, call: u64, outcome: &Outcome) {
+    fn settle(&mut self, call: CallId, outcome: &Outcome) {
         let Some(open) = self.open.remove(call) else {
             return;
         };
@@ -293,7 +317,7 @@ impl Ledger {
     }
 
     /// A decision about call `call`, made at its gate.
-    fn decide(&mut self, call: u64, d: &Verdict) {
+    fn decide(&mut self, call: CallId, d: &Verdict) {
         let Some(open) = self.open.get_mut(call) else {
             return;
         };
@@ -332,7 +356,7 @@ impl Ledger {
 
     /// Call `call` waits on `on`. A tool call waits for an approval only
     /// while gated, so an answered one is not asked again.
-    fn wait(&mut self, call: u64, on: &WaitOn) {
+    fn wait(&mut self, call: CallId, on: &WaitOn) {
         let Some(open) = self.open.get_mut(call) else {
             return;
         };
@@ -346,7 +370,7 @@ impl Ledger {
     }
 
     /// The first answer to what call `call` waits on wins.
-    fn answer(&mut self, call: u64, value: &Json) {
+    fn answer(&mut self, call: CallId, value: &Json) {
         let Some(open) = self.open.get_mut(call) else {
             return;
         };
@@ -359,7 +383,7 @@ impl Ledger {
         }
     }
 
-    fn answered(&mut self, call: u64, approved: bool) {
+    fn answered(&mut self, call: CallId, approved: bool) {
         if let Some(open) = self.open.get_mut(call) {
             open.phase = if approved {
                 Phase::Running
@@ -384,39 +408,39 @@ impl Ledger {
         self.seq
     }
 
-    /// The open model and tool calls the agent made, by seq: commands the
-    /// user ran aside ([`Ledger::open_commands`]).
-    pub fn open_calls(&self) -> impl Iterator<Item = (u64, &Open)> {
+    /// The open model and tool calls the agent made, in order: commands
+    /// the user ran aside ([`Ledger::open_commands`]).
+    pub fn open_calls(&self) -> impl Iterator<Item = (CallId, &Open)> {
         self.open.iter().filter(|(_, open)| !open.by_user())
     }
 
-    pub fn call(&self, seq: u64) -> Option<&Open> {
-        self.open.get(seq)
+    pub fn call(&self, call: CallId) -> Option<&Open> {
+        self.open.get(call)
     }
 
-    /// The tool calls waiting for an approval, by seq: the session's
+    /// The tool calls waiting for an approval, in order: the session's
     /// inbox.
-    pub fn inbox(&self) -> impl Iterator<Item = u64> + '_ {
+    pub fn inbox(&self) -> impl Iterator<Item = CallId> + '_ {
         self.open
             .iter()
-            .filter(|(_, open)| open.phase == Phase::Waiting(WaitOn::Approval))
-            .map(|(seq, _)| seq)
+            .filter(|(_, open)| open.phase.asking())
+            .map(|(call, _)| call)
     }
 
     pub fn untaken(&self) -> &VecDeque<Queued> {
         &self.untaken
     }
 
-    /// Commands the user ran with an intent and no outcome, by seq.
-    pub fn open_commands(&self) -> impl Iterator<Item = u64> + '_ {
+    /// Commands the user ran with an intent and no outcome, in order.
+    pub fn open_commands(&self) -> impl Iterator<Item = CallId> + '_ {
         self.open
             .iter()
             .filter(|(_, open)| open.by_user())
-            .map(|(seq, _)| seq)
+            .map(|(call, _)| call)
     }
 
     /// The watches that have not fired, as `(seq, child)`, by seq.
-    pub fn armed(&self) -> impl Iterator<Item = (u64, SessionId)> + '_ {
+    pub fn armed(&self) -> impl Iterator<Item = (Seq, SessionId)> + '_ {
         self.armed.iter().map(|(seq, &child)| (seq, child))
     }
 
@@ -432,13 +456,6 @@ impl Ledger {
     /// The background process groups started, with the boot each ran in.
     pub fn background(&self) -> &[(u32, String)] {
         &self.background
-    }
-
-    /// The session's own settings, and the seq of the entry that set them.
-    pub fn settings(&self) -> (Overrides, Option<u64>) {
-        self.settings
-            .clone()
-            .map_or_else(Default::default, |(seq, set)| (set, Some(seq)))
     }
 
     /// The environment most recently logged.
@@ -489,10 +506,7 @@ impl Ledger {
             Activity::Input
         } else if waits(|w| matches!(w, WaitOn::Client { .. })) {
             Activity::Client
-        } else if self.open.iter().next().is_some()
-            || !self.untaken.is_empty()
-            || self.armed.iter().next().is_some()
-        {
+        } else if !self.open.is_empty() || !self.untaken.is_empty() || !self.armed.is_empty() {
             Activity::Running
         } else {
             Activity::Idle
@@ -520,43 +534,49 @@ impl Open {
     }
 }
 
-/// Values by seq, in seq order. A session has few of each open at a time,
-/// so a vector.
-#[derive(Clone, Debug)]
-struct BySeq<V>(Vec<(u64, V)>);
+/// Values by key, in key order: a map over a vector, for the few of a
+/// kind a session has open at a time.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(transparent)]
+pub struct Keyed<K, V>(Vec<(K, V)>);
 
-impl<V> Default for BySeq<V> {
+impl<K, V> Default for Keyed<K, V> {
     fn default() -> Self {
         Self(Vec::new())
     }
 }
 
-impl<V> BySeq<V> {
-    fn insert(&mut self, seq: u64, value: V) {
-        let at = self.0.partition_point(|&(s, _)| s < seq);
+impl<K: Ord + Copy, V> Keyed<K, V> {
+    /// Sets `key` to `value`, in its place.
+    pub fn insert(&mut self, key: K, value: V) {
+        let at = self.0.partition_point(|&(k, _)| k < key);
         match self.0.get_mut(at) {
-            Some((s, held)) if *s == seq => *held = value,
-            _ => self.0.insert(at, (seq, value)),
+            Some((k, held)) if *k == key => *held = value,
+            _ => self.0.insert(at, (key, value)),
         }
     }
 
-    fn at(&self, seq: u64) -> Option<usize> {
-        self.0.iter().position(|&(s, _)| s == seq)
+    fn at(&self, key: K) -> Option<usize> {
+        self.0.binary_search_by_key(&key, |&(k, _)| k).ok()
     }
 
-    fn get(&self, seq: u64) -> Option<&V> {
-        self.at(seq).map(|at| &self.0[at].1)
+    pub fn get(&self, key: K) -> Option<&V> {
+        self.at(key).map(|at| &self.0[at].1)
     }
 
-    fn get_mut(&mut self, seq: u64) -> Option<&mut V> {
-        self.at(seq).map(|at| &mut self.0[at].1)
+    pub fn get_mut(&mut self, key: K) -> Option<&mut V> {
+        self.at(key).map(|at| &mut self.0[at].1)
     }
 
-    fn remove(&mut self, seq: u64) -> Option<V> {
-        self.at(seq).map(|at| self.0.remove(at).1)
+    pub fn remove(&mut self, key: K) -> Option<V> {
+        self.at(key).map(|at| self.0.remove(at).1)
     }
 
-    fn iter(&self) -> impl Iterator<Item = (u64, &V)> {
-        self.0.iter().map(|(seq, value)| (*seq, value))
+    pub fn is_empty(&self) -> bool {
+        self.0.is_empty()
+    }
+
+    pub fn iter(&self) -> impl Iterator<Item = (K, &V)> {
+        self.0.iter().map(|(key, value)| (*key, value))
     }
 }

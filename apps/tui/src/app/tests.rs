@@ -9,7 +9,7 @@ use protocol::{
 use serde_json::json;
 
 use client::{Cmd, Event, EventKind, Io, Welcome};
-use protocol::{Audience, Caps, Json};
+use protocol::{Audience, CallId, Caps, Epoch, Json, Seq};
 
 use super::{App, Effect};
 use crate::keys::{Input, Key, Mouse};
@@ -22,7 +22,7 @@ fn ws() -> PathBuf {
 }
 
 fn entry(seq: u64, body: Body) -> DaemonMsg {
-    DaemonMsg::Entry(Entry::new(seq, 0, body))
+    DaemonMsg::Entry(Entry::new(Seq::new(seq).unwrap(), Epoch(0), body))
 }
 
 /// An app attached to a fresh session, with `msgs` folded in.
@@ -131,7 +131,7 @@ fn asked_command() -> Vec<DaemonMsg> {
             4,
             Body::Decision {
                 by: "policy".into(),
-                call: protocol::CallId::new(3),
+                call: CallId::new(3),
                 d: protocol::Verdict::Permission {
                     permission: protocol::Permission::Ask,
                 },
@@ -151,18 +151,12 @@ fn an_approval_shows_buttons_and_y_or_a_click_answers_it() {
     assert_eq!(bar.1, 16, "above the input: {rows:#?}");
     assert!(matches!(
         press(&mut app, Key::Char('y')),
-        Some(Effect::Cmd(Cmd::Approve {
-            call: 3,
-            approved: true,
-        }))
+        Some(Effect::Cmd(Cmd::Approve { call, approved: true })) if call.get() == 3
     ));
     let (x, y) = find(&rows, "[ n  no ]");
     assert!(matches!(
         app.input(Input::Mouse(Mouse::Press { x: x + 2, y })),
-        Some(Effect::Cmd(Cmd::Approve {
-            call: 3,
-            approved: false,
-        }))
+        Some(Effect::Cmd(Cmd::Approve { call, approved: false })) if call.get() == 3
     ));
     // With text in the input, y is typed.
     press(&mut app, Key::Char('x'));
@@ -207,12 +201,12 @@ fn a_streamed_reply_shows_live_then_its_committed_text() {
             ),
             DaemonMsg::Synced { seq: 3 },
             DaemonMsg::Delta {
-                call: 3,
+                call: CallId::new(3).unwrap(),
                 text: "Hel".into(),
                 attempt: 0,
             },
             DaemonMsg::Delta {
-                call: 3,
+                call: CallId::new(3).unwrap(),
                 text: "lo **you**".into(),
                 attempt: 0,
             },
@@ -228,7 +222,7 @@ fn a_streamed_reply_shows_live_then_its_committed_text() {
     app.fold(&entry(
         4,
         Body::ModelResult {
-            call: 3,
+            call: CallId::new(3).unwrap(),
             outcome: Outcome::Done {
                 output: Json::encode(
                     &json!({"message": {"content": [{"type": "text", "text": "Hello you!"}]},
@@ -262,7 +256,7 @@ fn a_titling_reply_titles_the_session_and_is_no_reply_of_its_own() {
             entry(
                 4,
                 Body::ModelResult {
-                    call: 3,
+                    call: CallId::new(3).unwrap(),
                     outcome: Outcome::Done {
                         output: Json::encode(
                             &json!({"message": {"content": [{"type": "text", "text": "\"Fix the parser\""}]},
@@ -291,7 +285,7 @@ fn a_card_folds_on_click_and_ctrl_o_shows_all_output() {
     msgs.push(entry(
         5,
         Body::ToolResult {
-            call: 3,
+            call: CallId::new(3).unwrap(),
             outcome: Outcome::Done {
                 output: Json::encode(
                     &json!({"output": stdout, "exit": 0, "cwd": "/w", "duration_ms": 1}),
@@ -302,6 +296,7 @@ fn a_card_folds_on_click_and_ctrl_o_shows_all_output() {
                 title: "$ ls".into(),
                 body: stdout.clone(),
                 note: "exit 0".into(),
+                ..Card::default()
             }),
         },
     ));
@@ -390,7 +385,7 @@ fn ctrl_c_interrupts_a_running_call_and_shows_how_it_ended() {
     msgs.push(entry(
         5,
         Body::Answer {
-            call: protocol::CallId::new(3).unwrap(),
+            call: CallId::new(3).unwrap(),
             value: Json::encode(&true).unwrap(),
             origin: None,
         },
@@ -405,7 +400,7 @@ fn ctrl_c_interrupts_a_running_call_and_shows_how_it_ended() {
     app.fold(&entry(
         6,
         Body::ToolResult {
-            call: 3,
+            call: CallId::new(3).unwrap(),
             outcome: Outcome::Done {
                 output: Json::encode(
                     &json!({"output": "", "exit": null, "signal": "SIGTERM", "aborted": true}),
@@ -416,6 +411,7 @@ fn ctrl_c_interrupts_a_running_call_and_shows_how_it_ended() {
                 title: "$ ls".into(),
                 body: String::new(),
                 note: "aborted · killed by SIGTERM".into(),
+                mark: protocol::Mark::Bad,
             }),
         },
     ));
@@ -462,7 +458,7 @@ fn ctrl_c_interrupts_a_running_model_call_too() {
     app.fold(&entry(
         3,
         Body::ModelResult {
-            call: 2,
+            call: CallId::new(2).unwrap(),
             outcome: Outcome::Interrupted {
                 output: Some("so far".into()),
             },
@@ -595,7 +591,7 @@ fn inline_prints_settled_items_once_and_keeps_the_rest_live() {
     app.fold(&entry(
         5,
         Body::ToolResult {
-            call: 3,
+            call: CallId::new(3).unwrap(),
             outcome: Outcome::Done {
                 output: Json::encode(&json!({"output": "a\n", "exit": 0})).unwrap(),
             },
@@ -603,6 +599,7 @@ fn inline_prints_settled_items_once_and_keeps_the_rest_live() {
                 title: "$ ls".into(),
                 body: "a\n".into(),
                 note: "exit 0".into(),
+                ..Card::default()
             }),
         },
     ));
@@ -670,7 +667,7 @@ fn session(viewport: Viewport) -> Vec<(&'static str, usize, Vec<u8>)> {
     app.fold(&entry(
         5,
         Body::ToolResult {
-            call: 3,
+            call: CallId::new(3).unwrap(),
             outcome: Outcome::Done {
                 output: Json::encode(&json!({"output": "a\n", "exit": 0})).unwrap(),
             },
@@ -678,6 +675,7 @@ fn session(viewport: Viewport) -> Vec<(&'static str, usize, Vec<u8>)> {
                 title: "$ ls".into(),
                 body: "a\n".into(),
                 note: "exit 0".into(),
+                ..Card::default()
             }),
         },
     ));
@@ -727,7 +725,7 @@ fn only_what_shows_owes_a_frame() {
     });
     assert!(!app.needs_frame());
     app.fold(&DaemonMsg::Delta {
-        call: 2,
+        call: CallId::new(2).unwrap(),
         text: "hi".into(),
         attempt: 0,
     });
@@ -848,9 +846,9 @@ fn render_cost() {
             },
         ));
     }
-    let model = 2 + 2000 * 3;
+    let model = CallId::new(2 + 2000 * 3).unwrap();
     msgs.push(entry(
-        model,
+        model.get(),
         Body::ModelCall {
             model: "m".into(),
             attempt: 0,

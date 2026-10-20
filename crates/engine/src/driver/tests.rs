@@ -14,7 +14,7 @@ use crate::store::{Encoded, Loaded, Log, LogStore, Memory};
 use ext::{Answer, Extension, Recover, Registrar, Replay, Rewrite, Tool, point};
 use ext_policy::Policy;
 use llm::http::Http;
-use protocol::{Audience, CallId, Card, Installed, Permission, Seq, Verdict};
+use protocol::{Audience, CallId, Card, Epoch, Installed, Permission, Seq, Verdict};
 use serde::Deserialize as _;
 use serde_json::{Value, json};
 
@@ -29,7 +29,7 @@ mod scenarios;
 mod side;
 
 fn entry(seq: u64, body: Body) -> Entry {
-    Entry::new(seq, 0, body)
+    Entry::new(Seq::new(seq).unwrap(), Epoch(0), body)
 }
 
 fn bodies(entries: &[Entry]) -> Vec<&Body> {
@@ -74,12 +74,14 @@ fn decision(by: &str, call: Option<u64>, d: Verdict) -> Body {
 
 /// The calls asked about and not yet answered.
 fn inbox(entries: &[Entry]) -> Vec<u64> {
-    protocol::ledger::Ledger::of(entries).inbox().collect()
+    (protocol::ledger::Ledger::of(entries).inbox())
+        .map(CallId::get)
+        .collect()
 }
 
 /// The conversation before `before`, as `registry`'s tools present it.
 fn transcript(entries: &[Entry], before: u64, registry: Arc<Registry>) -> Vec<llm::Message> {
-    let before = entries.iter().take_while(|e| e.seq < before);
+    let before = entries.iter().take_while(|e| e.seq.get() < before);
     Transcript::of(before, registry, "")
         .into_messages()
         .to_vec()
@@ -87,7 +89,7 @@ fn transcript(entries: &[Entry], before: u64, registry: Arc<Registry>) -> Vec<ll
 
 /// What entries say, whichever lease wrote them.
 fn facts(entries: &[Entry]) -> Vec<(u64, &Body)> {
-    entries.iter().map(|e| (e.seq, &e.body)).collect()
+    entries.iter().map(|e| (e.seq.get(), &e.body)).collect()
 }
 
 /// The tool rig's recordings call.
@@ -321,7 +323,7 @@ impl Fixture {
         let header = Self::header();
         let mut created = self.0.store.create(&header).unwrap();
         for e in entries {
-            let e = Entry::new(e.seq, created.writer.epoch(), e.body.clone());
+            let e = Entry::new(e.seq, Epoch(created.writer.epoch()), e.body.clone());
             created.writer.append_raw(std::slice::from_ref(&e)).unwrap();
         }
         drop(created);
@@ -341,7 +343,7 @@ impl Live {
 
     fn answer(&self, call: u64, approved: bool) -> Result<(), String> {
         let answer = Request::Answer {
-            call,
+            call: CallId::new(call).unwrap(),
             value: Json::encode(&approved).unwrap(),
         };
         rt::block_on(self.request(answer, None))
@@ -400,7 +402,7 @@ fn until(session: &Live, what: &str, done: impl Fn(&[Entry]) -> bool) -> Vec<Ent
 fn finished(session: &Live, call: u64) -> Vec<Entry> {
     until(session, &format!("finished call {call}"), |log| {
         log.iter()
-            .any(|e| matches!(e.body, Body::ToolResult { call: c, .. } if c == call))
+            .any(|e| matches!(e.body, Body::ToolResult { call: c, .. } if c.get() == call))
     })
 }
 
@@ -533,12 +535,12 @@ fn the_model_calls_a_tool_and_answers_from_its_result() {
             [
                 Body::Input { .. },
                 Body::ModelCall { .. },
-                Body::ModelResult { call: 2, outcome: Outcome::Done { .. } },
+                Body::ModelResult { call: a, outcome: Outcome::Done { .. } },
                 Body::ToolCall { tool, id: Some(id), .. },
-                Body::ToolResult { call: 4, outcome: Outcome::Done { output }, card: None },
+                Body::ToolResult { call: b, outcome: Outcome::Done { output }, card: None },
                 Body::ModelCall { .. },
-                Body::ModelResult { call: 6, outcome: Outcome::Done { output: answer } },
-            ] if tool == "lookup_harbor_label" && id == call_id && output.parse::<Value>().unwrap() == "crimson-harbor"
+                Body::ModelResult { call: c, outcome: Outcome::Done { output: answer } },
+            ] if (a.get(), b.get(), c.get()) == (2, 4, 6) && tool == "lookup_harbor_label" && id == call_id && output.parse::<Value>().unwrap() == "crimson-harbor"
                 && answer.parse::<Value>().unwrap()["message"]["content"][1]["text"] == "The harbor label is crimson-harbor."
         ),
         "{log:#?}"
@@ -722,10 +724,10 @@ fn a_fired_watch_wakes_the_model_with_the_childs_result() {
         matches!(
             &bodies(&log)[1..],
             [
-                Body::Fired { watch: 1, outcome },
+                Body::Fired { watch, outcome },
                 Body::ModelCall { .. },
-                Body::ModelResult { call: 3, outcome: Outcome::Done { .. } },
-            ] if *outcome == found
+                Body::ModelResult { call, outcome: Outcome::Done { .. } },
+            ] if (watch.get(), call.get()) == (1, 3) && *outcome == found
         ),
         "{log:#?}"
     );
@@ -839,7 +841,7 @@ fn hook_decisions_are_logged_after_their_call_and_replay_to_the_same_state() {
             },
             &decision("policy", Some(2), denied),
             &Body::ToolResult {
-                call: 2,
+                call: CallId::new(2).unwrap(),
                 outcome: Outcome::Failed {
                     error: "policy denied this call".into()
                 },
@@ -882,8 +884,8 @@ fn results_are_logged_in_call_order() {
         card: None,
         by: Audience::Model,
     };
-    let result = |call| Body::ToolResult {
-        call,
+    let result = |call: u64| Body::ToolResult {
+        call: CallId::new(call).unwrap(),
         outcome: Outcome::Done {
             output: Json::encode(&json!({ "slept": call })).unwrap(),
         },
@@ -944,10 +946,10 @@ fn a_gate_cut_off_by_a_crash_logs_its_decisions_once() {
         matches!(
             &log[3].body,
             Body::ToolResult {
-                call: 2,
+                call,
                 outcome: Outcome::Failed { .. },
                 ..
-            }
+            } if call.get() == 2
         ),
         "{log:#?}"
     );
@@ -1023,7 +1025,7 @@ fn an_ask_waits_in_the_inbox_through_a_stop_and_runs_once_approved() {
             .unwrap();
         view.fold(&msg);
     }
-    assert_eq!(view.turn().asking, Some(2));
+    assert_eq!(view.ledger.inbox().next(), CallId::new(2));
     assert!(view.recap.is_some_and(|r| r.asks == 1));
     resumed.answer(2, true).unwrap();
     let log = finished(&resumed, 2);
@@ -1042,13 +1044,13 @@ fn an_ask_waits_in_the_inbox_through_a_stop_and_runs_once_approved() {
                     ..
                 },
                 Body::Answer { call, value, .. },
-                Body::ToolProcess { call: 2, .. },
+                Body::ToolProcess { call: ran, .. },
                 Body::ToolResult {
-                    call: 2,
+                    call: done,
                     outcome: Outcome::Done { output },
                     card: Some(card),
                 },
-            ] if call.get() == 2 && value.raw() == "true"
+            ] if [call, ran, done].iter().all(|c| c.get() == 2) && value.raw() == "true"
                 && output.parse::<Value>().unwrap()["output"] == "approved\n" && card.note == "exit 0"
         ),
         "{log:#?}"
@@ -1074,7 +1076,7 @@ fn a_refused_ask_answers_the_call_without_running_it() {
                 origin: None,
             },
             &Body::ToolResult {
-                call: 2,
+                call: CallId::new(2).unwrap(),
                 outcome: Outcome::Failed {
                     error: "the user did not approve this call".into()
                 },
@@ -1106,7 +1108,7 @@ fn an_interrupt_while_asked_settles_the_call_without_running_it() {
     assert!(
         log.iter().any(|e| e.body
             == Body::ToolResult {
-                call: 2,
+                call: CallId::new(2).unwrap(),
                 outcome: Outcome::Interrupted { output: None },
                 card: None,
             }),
@@ -1190,7 +1192,7 @@ fn slash_commands_are_callables_and_input_hooks_rewrite_or_refuse() {
         by: Audience::User,
     };
     let ran = Body::ToolResult {
-        call: 2,
+        call: CallId::new(2).unwrap(),
         outcome: Outcome::Done {
             output: Json::encode("all of them in 2").unwrap(),
         },
@@ -1231,10 +1233,10 @@ fn slash_commands_are_callables_and_input_hooks_rewrite_or_refuse() {
         matches!(
             &bodies(&recovered)[4],
             Body::ToolResult {
-                call: 2,
+                call,
                 outcome: Outcome::Interrupted { .. },
                 ..
-            }
+            } if call.get() == 2
         ),
         "{recovered:#?}"
     );
@@ -1505,7 +1507,7 @@ fn an_interrupt_stops_the_model_call_and_ends_the_turn() {
         bodies(&log)[2..],
         [
             &Body::ModelResult {
-                call: 2,
+                call: CallId::new(2).unwrap(),
                 outcome: Outcome::Interrupted { output: None }
             },
             &Body::INTERRUPT,
@@ -1535,12 +1537,12 @@ fn an_interrupted_turn_answers_the_calls_it_leaves_and_goes_no_further() {
             [
                 Body::ToolCall { .. },
                 Body::ToolResult {
-                    call: 4,
+                    call,
                     outcome: Outcome::Failed { .. },
                     ..
                 },
                 Body::Interrupt { .. },
-            ]
+            ] if call.get() == 4
         ),
         "{log:#?}"
     );
@@ -1567,7 +1569,7 @@ fn an_unsafe_call_cut_off_reports_the_output_it_committed() {
         by: Audience::Model,
     };
     let progress = |text: &str| Body::Progress {
-        call: 2,
+        call: CallId::new(2).unwrap(),
         text: text.into(),
     };
     let session = fixture.start(&[
@@ -1581,7 +1583,7 @@ fn an_unsafe_call_cut_off_reports_the_output_it_committed() {
     assert_eq!(
         bodies(&log)[4..],
         [&Body::ToolResult {
-            call: 2,
+            call: CallId::new(2).unwrap(),
             outcome: Outcome::Interrupted {
                 output: Some("one\ntwo\n".into())
             },
@@ -2059,7 +2061,7 @@ fn one_fsync_per_step() {
     let header = Fixture::header();
     let mut created = probe.store.create(&header).unwrap();
     for e in &entries {
-        let e = Entry::new(e.seq, created.writer.epoch(), e.body.clone());
+        let e = Entry::new(e.seq, Epoch(created.writer.epoch()), e.body.clone());
         created.writer.append_raw(&[e]).unwrap();
     }
     drop(created);
@@ -2071,7 +2073,7 @@ fn one_fsync_per_step() {
     assert!(
         matches!(
             &bodies(&log)[3..],
-            [Body::Extensions { .. }, Body::ToolResult { call: 3, .. }]
+            [Body::Extensions { .. }, Body::ToolResult { call, .. }] if call.get() == 3
         ),
         "{log:#?}"
     );

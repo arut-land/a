@@ -384,7 +384,7 @@ fn a_tab_streams_replies_and_answers_asks_until_it_closes() {
     let session = web.new_session();
 
     let mut events = web.events(&session, TAB);
-    events.until("the attach", |p| shown(p).contains("environment"));
+    events.until("the attach", |p| shown(p).contains("env "));
     assert!(
         events.patches[0].html.starts_with("<div id=\"transcript\""),
         "{:?}",
@@ -411,7 +411,7 @@ fn a_tab_streams_replies_and_answers_asks_until_it_closes() {
     events.until("the output", |p| {
         p.iter().any(|p| {
             let html = &p.html;
-            html.contains("approved") && html.contains("web-ok\n") && html.contains("exit ")
+            html.contains(">web-ok<") && html.contains("exit ")
         })
     });
 
@@ -431,7 +431,7 @@ fn a_tab_streams_replies_and_answers_asks_until_it_closes() {
             // Stop shows before the process starts, so the interrupt may
             // also land before the spawn: then nothing ran, and the call
             // ends aborted.
-            && (shown.contains("interrupted before it finished")
+            && (shown.contains(">interrupted<")
                 || shown.contains("killed by")
                 || shown.contains("[aborted]")
                 || shown.contains(">aborted<"))
@@ -458,7 +458,7 @@ fn a_long_transcript_sends_each_item_once() {
     web.sign_in();
     let session = web.new_session();
     let mut events = web.events(&session, TAB);
-    events.until("the attach", |p| shown(p).contains("environment"));
+    events.until("the attach", |p| shown(p).contains("env "));
     let shown_whole = events.patches.len();
     for n in 0..40 {
         let text = format!("note {n}.");
@@ -490,7 +490,7 @@ fn a_tab_rides_out_a_daemon_upgrade() {
     web.sign_in();
     let session = web.new_session();
     let mut events = web.events(&session, TAB);
-    events.until("the attach", |p| shown(p).contains("environment"));
+    events.until("the attach", |p| shown(p).contains("env "));
     web.call("/api/send", TAB, "before");
     events.until("the echo", |p| shown(p).matches(">before<").count() == 2);
     let first = env.pid().unwrap();

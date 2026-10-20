@@ -167,8 +167,8 @@ public final class SessionStore {
             items = snapshot
         case .draining:
             break
-        case .mismatch(let supported):
-            problem = "The daemon speaks protocol \(supported); restart it."
+        case .mismatch(_, let message):
+            problem = message
         case .error(let message):
             problem = message
         case .link(let state):

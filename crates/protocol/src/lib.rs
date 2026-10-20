@@ -13,11 +13,11 @@ use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
 /// The protocol this build speaks best.
-pub const PROTO: u32 = 2;
+pub const PROTO: u32 = 3;
 
 /// The oldest protocol this build still speaks: a peer whose range
 /// overlaps `PROTO_MIN..=PROTO` is served at the highest version both speak.
-pub const PROTO_MIN: u32 = 2;
+pub const PROTO_MIN: u32 = 3;
 
 const MAX_FRAME: u32 = 16 * 1024 * 1024;
 
@@ -91,6 +91,12 @@ impl Seq {
 impl fmt::Display for Seq {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         self.0.fmt(f)
+    }
+}
+
+impl From<CallId> for Seq {
+    fn from(call: CallId) -> Self {
+        call.0
     }
 }
 
@@ -181,16 +187,16 @@ pub struct Author {
 /// what the wire carries.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize)]
 pub struct Entry {
-    pub seq: u64,
+    pub seq: Seq,
     /// The lease its writer held: a store refuses the appends of a writer
     /// whose lease was superseded.
-    pub epoch: u32,
+    pub epoch: Epoch,
     #[serde(flatten)]
     pub body: Body,
 }
 
 impl Entry {
-    pub const fn new(seq: u64, epoch: u32, body: Body) -> Self {
+    pub const fn new(seq: Seq, epoch: Epoch, body: Body) -> Self {
         Self { seq, epoch, body }
     }
 }
@@ -232,7 +238,7 @@ kinds! {
             purpose: Option<String> = default,
         } = Durable;
         /// The reply; `Done` carries the whole `llm::Response`.
-        ModelResult "model_result" { call: u64, outcome: Outcome } = Durable;
+        ModelResult "model_result" { call: CallId, outcome: Outcome } = Durable;
         /// The committed intent to run a tool. Its seq is the call's id and
         /// idempotency key; `id` is the model's own id for the call, under which
         /// its result goes back. `by` is who called it: the model, unless the
@@ -249,13 +255,13 @@ kinds! {
         /// meaningful within the same `boot`: pgids are reused across reboots.
         /// A `background` group outlives its call: the session owns it until
         /// the session ends.
-        ToolProcess "tool_process" { call: u64, pgid: u32, boot: String, background: bool = default } = Durable;
+        ToolProcess "tool_process" { call: CallId, pgid: u32, boot: String, background: bool = default } = Durable;
         /// Output tool call `call` produced since its last progress entry,
         /// committed as it runs: what an interrupted call reports, and what
         /// clients show meanwhile.
-        Progress "progress" { call: u64, text: String } = Durable;
+        Progress "progress" { call: CallId, text: String } = Durable;
         ToolResult "tool_result" {
-            call: u64,
+            call: CallId,
             outcome: Outcome,
             /// How clients show the outcome, as the tool presents it.
             card: Option<Card> = default,
@@ -284,7 +290,7 @@ kinds! {
         Watch "watch" { child: SessionId } = Durable;
         /// Watch `watch` fired, with its child's result. Logged at most once
         /// per watch.
-        Fired "fired" { watch: u64, outcome: Outcome } = Durable;
+        Fired "fired" { watch: Seq, outcome: Outcome } = Durable;
         // ── environment and extensions ─────────────────────────────────
         /// The environment the session's commands run in from here on, as the
         /// attaching client captured it, secrets redacted.
@@ -333,8 +339,9 @@ pub enum ToolChoice {
     None,
 }
 
-/// Who called a tool.
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize)]
+/// Who called a tool. A caller a newer build has counts as neither the
+/// model nor the user.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum Audience {
     #[default]
@@ -342,6 +349,7 @@ pub enum Audience {
     /// The user, by a command.
     User,
     /// An extension.
+    #[serde(other)]
     Plugin,
 }
 
@@ -394,15 +402,6 @@ kinds! {
     else Err(serde_json::Error::custom("unknown decision"))
 }
 
-/// Settings a session sets for itself; those unset come from the config
-/// layers.
-#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
-pub struct Overrides {
-    /// The model, as `host:model`.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub model: Option<String>,
-}
-
 /// How a client shows a tool call or its outcome: pure data the tool
 /// derives from its input and output, so every client renders any tool
 /// alike without knowing it.
@@ -416,6 +415,28 @@ pub struct Card {
     /// A short status, such as `exit 1`.
     #[serde(default, skip_serializing_if = "String::is_empty")]
     pub note: String,
+    /// How the outcome went, as only the tool knows (`exit 1` is bad, a
+    /// diff applied is good): what colours the note.
+    #[serde(default, skip_serializing_if = "Mark::is_ok")]
+    pub mark: Mark,
+}
+
+/// How a call went, as its tool marks its card.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum Mark {
+    #[default]
+    Ok,
+    Bad,
+    Warn,
+}
+
+impl Mark {
+    // A reference, as `skip_serializing_if` passes it.
+    #[allow(clippy::trivially_copy_pass_by_ref)]
+    const fn is_ok(&self) -> bool {
+        matches!(self, Self::Ok)
+    }
 }
 
 /// An extension a session ran with.
@@ -1022,7 +1043,7 @@ kinds! {
         Settings "settings" { change: Option<SettingsChange> = default };
         /// Answers the approval tool call `call` waits for. The first answer
         /// logged wins.
-        Approve "approve" { call: u64, approved: bool, client_seq: Option<u64> = default };
+        Approve "approve" { call: CallId, approved: bool, client_seq: Option<u64> = default };
         /// Stops the attached session's turn: its running model or tool call
         /// and, bottom-up, the turns of the sessions it started.
         Interrupt "interrupt" { client_seq: Option<u64> = default };
@@ -1041,7 +1062,7 @@ impl ClientMsg {
         }
     }
 
-    pub const fn approve(call: u64, approved: bool) -> Self {
+    pub const fn approve(call: CallId, approved: bool) -> Self {
         Self::Approve {
             call,
             approved,
@@ -1105,7 +1126,7 @@ kinds! {
         /// Live text of an unfinished model call, of its `attempt`th try: a
         /// client shows the text of the latest only. Never logged: the
         /// committed `model_result` is the fact.
-        Delta "delta" { call: u64, text: String, attempt: u16 = default } = Ephemeral;
+        Delta "delta" { call: CallId, text: String, attempt: u16 = default } = Ephemeral;
         /// Replay is complete; everything after this is live.
         Synced "synced" { seq: u64 } = Durable;
         Sessions "sessions" { sessions: Vec<SessionSummary> } = Control;
@@ -1215,7 +1236,7 @@ impl Frame {
         let at = bytes.len();
         entry.encode(&mut bytes)?;
         bytes[at] = b',';
-        Self::finish(bytes, Some(entry.seq), entry.body.class())
+        Self::finish(bytes, Some(entry.seq.get()), entry.body.class())
     }
 
     /// Room for the length, and as much again as `serde_json::to_vec`
@@ -1333,7 +1354,11 @@ mod tests {
 
     #[test]
     fn a_shared_frame_is_the_frame_written() {
-        let entry = Entry::new(7, 0, Body::Assistant { text: "hi".into() });
+        let entry = Entry::new(
+            Seq::new(7).unwrap(),
+            Epoch(0),
+            Body::Assistant { text: "hi".into() },
+        );
         let mut written = Vec::new();
         write_frame(&mut written, &DaemonMsg::Entry(entry.clone())).unwrap();
         assert_eq!(Frame::entry(&entry).unwrap().as_bytes(), written);
@@ -1398,8 +1423,8 @@ mod tests {
     #[test]
     fn entry_wire_shape_is_flat() {
         let e = Entry::new(
-            1,
-            0,
+            Seq::new(1).unwrap(),
+            Epoch(0),
             Body::Input {
                 text: "hi".into(),
                 mode: Mode::Queue,
@@ -1525,7 +1550,7 @@ mod tests {
                 "{tag}: {msg:?}"
             );
         }
-        let entry = DaemonMsg::Entry(Entry::new(1, 0, Body::INTERRUPT));
+        let entry = DaemonMsg::Entry(Entry::new(Seq::new(1).unwrap(), Epoch(0), Body::INTERRUPT));
         assert_eq!(serde_json::to_value(&entry).unwrap()["t"], "entry");
         assert!(DaemonMsg::knows("entry") && !DaemonMsg::knows("hello"));
         assert!(Verdict::knows("retry") && !Body::knows("retry"));
@@ -1602,7 +1627,10 @@ mod tests {
         ];
         let json: Vec<_> = bodies
             .iter()
-            .map(|b| serde_json::to_string(&Entry::new(5, 1, b.clone())).unwrap())
+            .map(|b| {
+                serde_json::to_string(&Entry::new(Seq::new(5).unwrap(), Epoch(1), b.clone()))
+                    .unwrap()
+            })
             .collect();
         let who = r#""origin":{"client":"00000000-0000-0000-0000-00000000000c","seq":7}"#;
         let head = r#"{"seq":5,"epoch":1,"kind":"#;
@@ -1655,7 +1683,10 @@ mod tests {
             r#"{"seq":4,"epoch":2,"kind":"a_kind_longer_than_any_tag_is"}"#,
         ] {
             let e = Entry::from_json(line.as_bytes()).unwrap();
-            assert_eq!((e.seq, e.epoch, e.body.class()), (4, 2, Class::Durable));
+            assert_eq!(
+                (e.seq.get(), e.epoch.0, e.body.class()),
+                (4, 2, Class::Durable)
+            );
             let Body::Unknown { kind, raw } = &e.body else {
                 panic!("{e:?}");
             };
@@ -1722,11 +1753,11 @@ mod tests {
         assert_eq!(serde_json::to_string(&e).unwrap(), line);
         let bodies = [
             Body::Progress {
-                call: 2,
+                call: CallId::new(2).unwrap(),
                 text: "p\n".into(),
             },
             Body::ModelResult {
-                call: 2,
+                call: CallId::new(2).unwrap(),
                 outcome: Outcome::Interrupted {
                     output: Some("so far".into()),
                 },
@@ -1735,7 +1766,10 @@ mod tests {
         ];
         let json: Vec<_> = bodies
             .iter()
-            .map(|b| serde_json::to_string(&Entry::new(5, 1, b.clone())).unwrap())
+            .map(|b| {
+                serde_json::to_string(&Entry::new(Seq::new(5).unwrap(), Epoch(1), b.clone()))
+                    .unwrap()
+            })
             .collect();
         assert_eq!(
             json,
@@ -1760,7 +1794,7 @@ mod tests {
             },
             Body::Watch { child },
             Body::Fired {
-                watch: 2,
+                watch: Seq::new(2).unwrap(),
                 outcome: Outcome::Interrupted { output: None },
             },
         ];

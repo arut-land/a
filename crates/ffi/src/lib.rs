@@ -8,8 +8,8 @@
 //! buffer is full, so each carries a `rev`: a client that sees a gap asks
 //! [`Session::resync`] for what it missed, or a fresh snapshot. Each update
 //! also carries the turn as the SDK computes it ([`TurnInfo`]), the call
-//! whose reply is streaming, and each tool call its [`CallPhase`], so no
-//! rule is copied into Swift.
+//! whose reply is streaming, and each item how it is shown
+//! ([`Presentation`]), so no rule is copied into Swift.
 
 mod feed;
 mod live;
@@ -20,13 +20,17 @@ use std::io;
 use boltffi::{data, error};
 use client::{End, Link, Notice, SessionClient, TurnView};
 use protocol::view::{
-    Approval, Change, Item, Part, Phase, Recap, SessionView, Status, call_title, decision_line,
-    output_text, recap_line,
+    Buttons, Change, Glyph, Item, Part, Presented, Recap, SessionView, Shown, Status,
+    mismatch_line, recap_line,
 };
-use protocol::{Card, CommandInfo, Outcome, SessionSummary};
+use protocol::{CommandInfo, Outcome, SessionSummary};
 
 pub use feed::Reducer;
 pub use live::{Client, Session, SessionWatch, find_session};
+
+/// The purpose of the side request that titles a session, as the app
+/// reads its reply from the view.
+const TITLE: &str = "title";
 
 /// What went wrong, by kind. [`ClientError::code`] is stable across builds,
 /// for clients that branch on it or localize it.
@@ -212,19 +216,12 @@ impl From<protocol::HomeSettings> for Settings {
     }
 }
 
-/// As the pane shows it: names trimmed, blank rows skipped. The daemon,
-/// the one writer, refuses a name a shell could not export.
 impl From<Settings> for protocol::HomeSettings {
     fn from(s: Settings) -> Self {
         Self {
             model: s.model,
             agent: s.agent,
-            env: s
-                .env
-                .into_iter()
-                .map(|EnvVar { name, value }| (name.trim().to_owned(), value))
-                .filter(|(name, _)| !name.is_empty())
-                .collect(),
+            env: s.env.into_iter().map(|v| (v.name, v.value)).collect(),
         }
     }
 }
@@ -327,37 +324,10 @@ impl From<TurnView> for TurnInfo {
     fn from(t: TurnView) -> Self {
         Self {
             running: t.running,
-            asking: t.asking,
+            asking: t.asking.map(protocol::CallId::get),
             asks: t.asks,
             can_interrupt: t.can_interrupt,
             can_send: t.can_send,
-        }
-    }
-}
-
-/// Where a model call, tool call or command stands; see
-/// [`protocol::view::Phase`].
-#[data]
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum CallPhase {
-    Running,
-    /// Waits for an approval: show the buttons.
-    Asking,
-    Denied,
-    Done,
-    Failed,
-    Interrupted,
-}
-
-impl From<Phase> for CallPhase {
-    fn from(p: Phase) -> Self {
-        match p {
-            Phase::Running => Self::Running,
-            Phase::Asking => Self::Asking,
-            Phase::Denied => Self::Denied,
-            Phase::Done => Self::Done,
-            Phase::Failed => Self::Failed,
-            Phase::Interrupted => Self::Interrupted,
         }
     }
 }
@@ -391,7 +361,8 @@ pub(crate) fn commands(daemon: &[CommandInfo]) -> Vec<CommandHelp> {
         .collect()
 }
 
-/// See [`protocol::view::Change`]: an item is added whole, then patched.
+/// See [`protocol::view::Change`]: an item crosses whole when it is
+/// added, and as a patch when it changes.
 #[data]
 #[derive(Clone, Debug, PartialEq)]
 pub enum ViewChange {
@@ -426,8 +397,11 @@ pub enum ViewChange {
     },
     /// The daemon is restarting for an upgrade; the session reconnects.
     Draining,
+    /// The daemon speaks protocol `supported`, not this build's; `message`
+    /// says so as every client does.
     Mismatch {
         supported: u32,
+        message: String,
     },
     Error {
         message: String,
@@ -438,17 +412,20 @@ pub enum ViewChange {
     },
 }
 
-/// A transcript item; see [`protocol::view::Item`].
+/// A transcript item; see [`protocol::view::Item`]. Each carries how it
+/// is `shown`: the app lays that out and decides nothing else.
 #[data]
 #[derive(Clone, Debug, PartialEq)]
 pub enum ViewItem {
     User {
         seq: u64,
         text: String,
+        shown: Presentation,
     },
     Assistant {
         seq: u64,
         text: String,
+        shown: Presentation,
     },
     /// A model call and the reply it got. A side request an extension
     /// made names its `purpose`: its reply is the extension's (a title is
@@ -458,21 +435,16 @@ pub enum ViewItem {
         model: String,
         text: String,
         status: ReplyStatus,
-        usage: Option<TokenUsage>,
         purpose: Option<String>,
+        shown: Presentation,
     },
     Tool {
         call: u64,
         tool: String,
         /// JSON.
         input_json: String,
-        /// The call in one line, as every client shows it.
-        title: String,
-        approval: Option<ApprovalState>,
         outcome: Option<ToolOutcome>,
-        /// How the tool presents the call, or once it has one, its outcome.
-        card: Option<ToolCard>,
-        phase: CallPhase,
+        shown: Presentation,
     },
     /// A slash command and its outcome.
     Command {
@@ -480,14 +452,14 @@ pub enum ViewItem {
         name: String,
         args: String,
         outcome: Option<ToolOutcome>,
+        shown: Presentation,
     },
     Hook {
         seq: u64,
         hook: String,
         /// JSON.
         decision_json: String,
-        /// The decision in one line, as every client shows it.
-        line: String,
+        shown: Presentation,
     },
     Child {
         call: u64,
@@ -495,10 +467,12 @@ pub enum ViewItem {
         input: String,
         watch: Option<u64>,
         fired: Option<ToolOutcome>,
+        shown: Presentation,
     },
     Environment {
         seq: u64,
         cwd: String,
+        shown: Presentation,
     },
 }
 
@@ -517,17 +491,110 @@ impl ViewItem {
             | Self::Command { call, .. } => *call,
         }
     }
+
+    /// How the item is shown.
+    pub fn shown(&self) -> Presentation {
+        match self {
+            Self::User { shown, .. }
+            | Self::Assistant { shown, .. }
+            | Self::Reply { shown, .. }
+            | Self::Tool { shown, .. }
+            | Self::Command { shown, .. }
+            | Self::Hook { shown, .. }
+            | Self::Child { shown, .. }
+            | Self::Environment { shown, .. } => shown.clone(),
+        }
+    }
 }
 
-/// How a tool call or its outcome is shown; see [`protocol::Card`].
+/// How an item is shown, as every client shows it; see
+/// [`protocol::view::Presented`].
 #[data]
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub struct ToolCard {
+pub struct Presentation {
+    pub glyph: StatusGlyph,
+    /// One line: what it is, such as `$ ls`; empty for a message.
     pub title: String,
-    /// Preformatted text, such as output or a diff; may be empty.
-    pub body: String,
-    /// A short status, such as `exit 1`; may be empty.
-    pub note: String,
+    /// Where it stands, such as `exit 0` or `waiting for approval`; empty
+    /// when it has nothing to say.
+    pub status: String,
+    pub body: Option<ShownBody>,
+    /// A reply's token counts, once it has them.
+    pub usage: Option<TokenUsage>,
+    /// The call whose approval this item asks for: show the buttons.
+    pub approve: Option<u64>,
+}
+
+/// The class of a status: how it is coloured.
+#[data]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum StatusGlyph {
+    Plain,
+    Ok,
+    Bad,
+    Warn,
+    Busy,
+    /// Waits on the user.
+    Ask,
+    /// Refused before it ran.
+    Denied,
+}
+
+/// What goes under an item's header.
+#[data]
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ShownBody {
+    pub kind: BodyKind,
+    pub text: String,
+}
+
+#[data]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum BodyKind {
+    /// Preformatted text.
+    Text,
+    /// A unified diff.
+    Diff,
+    /// A tool's output as JSON text.
+    Json,
+    /// A reply's markdown.
+    Markdown,
+}
+
+impl From<&Presented<'_>> for Presentation {
+    fn from(p: &Presented<'_>) -> Self {
+        let body = match &p.body {
+            Shown::None => None,
+            body => Some(ShownBody {
+                kind: match body {
+                    Shown::Diff(_) => BodyKind::Diff,
+                    Shown::Json(_) => BodyKind::Json,
+                    Shown::Markdown(_) => BodyKind::Markdown,
+                    Shown::None | Shown::Text(_) => BodyKind::Text,
+                },
+                text: body.text().into_owned(),
+            }),
+        };
+        Self {
+            glyph: match p.glyph {
+                Glyph::None => StatusGlyph::Plain,
+                Glyph::Ok => StatusGlyph::Ok,
+                Glyph::Bad => StatusGlyph::Bad,
+                Glyph::Warn => StatusGlyph::Warn,
+                Glyph::Busy => StatusGlyph::Busy,
+                Glyph::Ask => StatusGlyph::Ask,
+                Glyph::Denied => StatusGlyph::Denied,
+            },
+            title: p.title.to_string(),
+            status: p.status.to_string(),
+            body,
+            usage: p.usage.map(Into::into),
+            approve: match p.buttons {
+                Buttons::Approve(call) => Some(call.get()),
+                Buttons::None => None,
+            },
+        }
+    }
 }
 
 #[data]
@@ -546,38 +613,27 @@ pub struct TokenUsage {
     pub output: u64,
 }
 
-#[data]
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum ApprovalState {
-    Pending,
-    Approved,
-    Denied,
-}
-
-/// What changed in an item; see [`protocol::view::Part`]. A call's phase
-/// comes with the part that moved it.
+/// What changed in an item; see [`protocol::view::Part`]. Each patch
+/// brings how the item is shown now.
 #[data]
 #[derive(Clone, Debug, PartialEq)]
 pub enum ItemPatch {
-    /// A tool's, a command's or a child's outcome, with how the tool
-    /// presents the call now: its card, and its title (which follows the
-    /// card).
+    /// A tool's, a command's or a child's outcome.
     Outcome {
         outcome: ToolOutcome,
-        title: String,
-        card: Option<ToolCard>,
-        phase: CallPhase,
+        shown: Presentation,
     },
-    /// A reply's text and status, with what its model call used.
+    /// A reply's text and status.
     Reply {
         text: String,
         status: ReplyStatus,
-        usage: Option<TokenUsage>,
+        shown: Presentation,
     },
-    Approval {
-        approval: ApprovalState,
-        phase: CallPhase,
-    },
+    /// Where the call stands changed: it is asked about, runs, or was
+    /// refused.
+    Phase { shown: Presentation },
+    /// The approval the call waited for was given, or not.
+    Answer { approved: bool, shown: Presentation },
     /// A child's watch, fired or not.
     Watch { watch: Option<u64> },
     /// The item as it is now: a typed line became the slash command it
@@ -588,26 +644,15 @@ pub enum ItemPatch {
 #[data]
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum ToolOutcome {
-    /// `output_json` is the tool's output as JSON; `shown` is it as text,
-    /// as every client shows it, when the tool or the output says how.
+    /// `output_json` is the tool's output as JSON.
     Done {
         output_json: String,
-        shown: Option<OutputText>,
     },
     Failed {
         error: String,
     },
     /// The daemon stopped mid-call and the tool is not safe to rerun.
     Interrupted,
-}
-
-/// A finished call's output as text, and a short note on it such as
-/// `exit 1`; see [`protocol::view::output_text`].
-#[data]
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub struct OutputText {
-    pub text: String,
-    pub note: String,
 }
 
 /// What happened in a session, told on attach.
@@ -745,27 +790,24 @@ impl ViewChange {
                 index: index(*i),
                 item: item.into(),
             },
-            Change::Updated {
-                index: i,
-                item,
-                part,
-            } => Self::Updated {
+            Change::Updated { index: i, part } => Self::Updated {
                 index: index(*i),
-                patch: ItemPatch::of(item, *part),
+                patch: ItemPatch::of(&view.items[*i], *part),
             },
             Change::Delta { call, text } => Self::Delta {
-                call: *call,
+                call: call.get(),
                 text: text.clone(),
             },
             Change::Synced => Self::Synced {
                 recap: view.recap.as_ref().map(Into::into),
             },
-            Change::Snapshot { items } => Self::Snapshot {
-                items: items.iter().map(Into::into).collect(),
+            Change::Snapshot => Self::Snapshot {
+                items: view.items.iter().map(Into::into).collect(),
             },
             Change::Draining => Self::Draining,
             Change::Mismatch { supported } => Self::Mismatch {
                 supported: *supported,
+                message: mismatch_line(*supported),
             },
             Change::Error { message } => Self::Error {
                 message: message.clone(),
@@ -777,7 +819,7 @@ impl ViewChange {
 impl ItemPatch {
     /// What `part` of `item` is now.
     fn of(item: &Item, part: Part) -> Self {
-        let phase = || item.phase().map_or(CallPhase::Running, Into::into);
+        let shown = Presentation::from(&item.present());
         match (item, part) {
             (
                 Item::Tool {
@@ -786,67 +828,28 @@ impl ItemPatch {
                 },
                 _,
             ) => Self::Command { item: item.into() },
-            (
-                Item::Tool {
-                    approval: Some(approval),
-                    ..
-                },
-                Part::Approval,
-            ) => Self::Approval {
-                approval: (*approval).into(),
-                phase: phase(),
+            (Item::Child { watch, .. }, Part::Watch) => Self::Watch {
+                watch: watch.map(protocol::Seq::get),
             },
-            (Item::Child { watch, .. }, Part::Watch) => Self::Watch { watch: *watch },
-            (
-                Item::Reply {
-                    text,
-                    status,
-                    usage,
-                    ..
-                },
-                Part::Outcome,
-            ) => Self::Reply {
+            (Item::Reply { text, status, .. }, Part::Outcome) => Self::Reply {
                 text: text.clone(),
                 status: status.into(),
-                usage: usage.map(Into::into),
+                shown,
             },
-            (
-                Item::Tool {
-                    tool,
-                    input,
-                    outcome,
-                    card,
-                    ..
-                },
-                _,
-            ) => Self::Outcome {
+            (Item::Tool { outcome, .. }, Part::Outcome) => Self::Outcome {
                 outcome: outcome
                     .as_ref()
-                    .map_or(ToolOutcome::Interrupted, |o| tool_outcome(o, card.as_ref())),
-                title: call_title(tool, input, card.as_ref()),
-                card: card.as_ref().map(Into::into),
-                phase: phase(),
+                    .map_or(ToolOutcome::Interrupted, Into::into),
+                shown,
             },
-            (Item::Child { fired, .. }, _) => Self::Outcome {
-                outcome: fired
-                    .as_ref()
-                    .map_or(ToolOutcome::Interrupted, |o| tool_outcome(o, None)),
-                title: String::new(),
-                card: None,
-                phase: phase(),
+            (Item::Child { fired, .. }, Part::Outcome) => Self::Outcome {
+                outcome: fired.as_ref().map_or(ToolOutcome::Interrupted, Into::into),
+                shown,
             },
+            (_, Part::Answer { approved }) => Self::Answer { approved, shown },
+            (_, Part::Phase) => Self::Phase { shown },
             // Nothing else is ever updated.
             (item, part) => unreachable!("{part:?} of {item:?}"),
-        }
-    }
-}
-
-impl From<Approval> for ApprovalState {
-    fn from(a: Approval) -> Self {
-        match a {
-            Approval::Pending => Self::Pending,
-            Approval::Approved => Self::Approved,
-            Approval::Denied => Self::Denied,
         }
     }
 }
@@ -873,51 +876,34 @@ impl From<protocol::view::Usage> for TokenUsage {
     }
 }
 
-impl From<&Card> for ToolCard {
-    fn from(c: &Card) -> Self {
-        Self {
-            title: c.title.clone(),
-            body: c.body.clone(),
-            note: c.note.clone(),
-        }
-    }
-}
-
-/// A slash command the user ran, as the app shows it.
-fn command(call: u64, tool: &str, input: &protocol::Json, outcome: Option<&Outcome>) -> ViewItem {
-    ViewItem::Command {
-        call,
-        name: tool.to_owned(),
-        args: Item::args(input),
-        outcome: outcome.map(|o| tool_outcome(o, None)),
-    }
-}
-
 impl From<&Item> for ViewItem {
     fn from(item: &Item) -> Self {
+        let shown = Presentation::from(&item.present());
         match item {
             Item::User { seq, text } => Self::User {
-                seq: *seq,
+                seq: seq.get(),
                 text: text.clone(),
+                shown,
             },
             Item::Assistant { seq, text } => Self::Assistant {
-                seq: *seq,
+                seq: seq.get(),
                 text: text.clone(),
+                shown,
             },
             Item::Reply {
                 call,
                 model,
                 text,
                 status,
-                usage,
                 purpose,
+                ..
             } => Self::Reply {
-                call: *call,
+                call: call.get(),
                 model: model.clone(),
                 text: text.clone(),
                 status: status.into(),
-                usage: usage.map(Into::into),
                 purpose: purpose.clone(),
+                shown,
             },
             // The app shows a slash command apart from a tool.
             Item::Tool {
@@ -927,37 +913,36 @@ impl From<&Item> for ViewItem {
                 outcome,
                 by: protocol::Audience::User,
                 ..
-            } => command(*call, tool, input, outcome.as_ref()),
+            } => Self::Command {
+                call: call.get(),
+                name: tool.clone(),
+                args: Item::args(input),
+                outcome: outcome.as_ref().map(Into::into),
+                shown,
+            },
             Item::Tool {
                 call,
                 tool,
                 input,
-                approval,
                 outcome,
-                card,
                 ..
             } => Self::Tool {
-                call: *call,
+                call: call.get(),
                 tool: tool.clone(),
                 input_json: input.to_string(),
-                title: call_title(tool, input, card.as_ref()),
-                approval: approval.map(Into::into),
-                outcome: outcome.as_ref().map(|o| tool_outcome(o, card.as_ref())),
-                card: card.as_ref().map(Into::into),
-                phase: item.phase().map_or(CallPhase::Running, Into::into),
+                outcome: outcome.as_ref().map(Into::into),
+                shown,
             },
-
             Item::Hook {
                 seq,
                 hook,
-                call,
-                tool,
                 decision,
+                ..
             } => Self::Hook {
-                seq: *seq,
+                seq: seq.get(),
                 hook: hook.clone(),
                 decision_json: serde_json::to_string(decision).unwrap_or_default(),
-                line: decision_line(tool, *call, decision),
+                shown,
             },
             Item::Child {
                 call,
@@ -966,30 +951,33 @@ impl From<&Item> for ViewItem {
                 watch,
                 fired,
             } => Self::Child {
-                call: *call,
+                call: call.get(),
                 child: child.to_string(),
                 input: input.clone(),
-                watch: *watch,
-                fired: fired.as_ref().map(|o| tool_outcome(o, None)),
+                watch: watch.map(protocol::Seq::get),
+                fired: fired.as_ref().map(Into::into),
+                shown,
             },
             Item::Environment { seq, cwd } => Self::Environment {
-                seq: *seq,
+                seq: seq.get(),
                 cwd: cwd.display().to_string(),
+                shown,
             },
         }
     }
 }
 
-fn tool_outcome(outcome: &Outcome, card: Option<&Card>) -> ToolOutcome {
-    match outcome {
-        Outcome::Done { output } => ToolOutcome::Done {
-            output_json: output.to_string(),
-            shown: output_text(card).map(|(text, note)| OutputText { text, note }),
-        },
-        Outcome::Failed { error } => ToolOutcome::Failed {
-            error: error.clone(),
-        },
-        Outcome::Interrupted { .. } => ToolOutcome::Interrupted,
+impl From<&Outcome> for ToolOutcome {
+    fn from(outcome: &Outcome) -> Self {
+        match outcome {
+            Outcome::Done { output } => Self::Done {
+                output_json: output.to_string(),
+            },
+            Outcome::Failed { error } => Self::Failed {
+                error: error.clone(),
+            },
+            Outcome::Interrupted { .. } => Self::Interrupted,
+        }
     }
 }
 
@@ -1019,11 +1007,11 @@ impl SessionSnapshot {
             link: client.link().into(),
             recap: view.recap.as_ref().map(Into::into),
             streaming: view.streaming.as_ref().map(|s| StreamingText {
-                call: s.call,
+                call: s.call.get(),
                 text: s.text.clone(),
             }),
             turn: client.turn().into(),
-            title: view.title.clone(),
+            title: view.side(TITLE).map(str::to_owned),
             state_hash: format!("{:016x}", view.state_hash()),
         }
     }

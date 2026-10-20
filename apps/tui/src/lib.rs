@@ -27,8 +27,11 @@ mod screen;
 mod term;
 #[cfg(unix)]
 mod text;
+/// Items as rows: public for the test that every renderer shows an item
+/// the same way.
 #[cfg(unix)]
-mod view;
+#[doc(hidden)]
+pub mod view;
 
 use std::io::{self, IsTerminal};
 

@@ -7,7 +7,7 @@ use std::time::Duration;
 
 use common::*;
 use kernel::{Effect, Load, Owner};
-use protocol::{Body, Json, Outcome, Permission, Verdict};
+use protocol::{Body, CallId, Json, Outcome, Permission, Seq, Verdict};
 use serde_json::json;
 
 /// A session the daemon was running when it stopped.
@@ -30,7 +30,7 @@ fn resume(
 
 fn progress(call: u64, text: &str) -> Body {
     Body::Progress {
-        call,
+        call: CallId::new(call).unwrap(),
         text: text.into(),
     }
 }
@@ -270,7 +270,7 @@ fn an_orphan_does_not_resume_what_it_was_doing() {
 #[test]
 fn leftover_processes_of_this_boot_are_killed() {
     let process = |pgid, boot: &str, background| Body::ToolProcess {
-        call: 2,
+        call: CallId::new(2).unwrap(),
         pgid,
         boot: boot.into(),
         background,
@@ -333,7 +333,7 @@ fn links_are_rearmed() {
     let (_, fx) = resume(Reg::echo(), [link(), watch.clone()], &Load::default());
     assert_eq!(fx, [BUSY, start()]);
     let fired = Body::Fired {
-        watch: 2,
+        watch: Seq::new(2).unwrap(),
         outcome: done(json!("ok")),
     };
     let (_, fx) = resume(Reg::echo(), [link(), watch, fired], &Load::default());
@@ -357,7 +357,7 @@ fn a_call_whose_child_settled_before_a_crash_resumes_with_its_result() {
         wait_child(2, 3),
         Body::Watch { child: child() },
         Body::Fired {
-            watch: 5,
+            watch: Seq::new(5).unwrap(),
             outcome: ok.clone(),
         },
     ];

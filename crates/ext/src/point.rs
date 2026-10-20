@@ -1223,9 +1223,10 @@ impl Hooks {
             entry.body,
             protocol::Body::ToolCall { .. } | protocol::Body::ModelCall { .. }
         );
-        let cx = match CallId::new(entry.seq) {
-            Some(call) if intent => cx.about(call),
-            _ => cx,
+        let cx = if intent {
+            cx.about(CallId(entry.seq))
+        } else {
+            cx
         };
         self.ask::<Observe>(&cx, entry)
     }

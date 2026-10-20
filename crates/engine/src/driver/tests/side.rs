@@ -34,14 +34,14 @@ impl Extension for Aside {
 }
 
 /// The side calls in `log`, as `(call, for, purpose)`.
-fn sides(log: &[Entry]) -> Vec<(u64, u64, &str)> {
+fn sides(log: &[Entry]) -> Vec<(CallId, u64, &str)> {
     log.iter()
         .filter_map(|e| match &e.body {
             Body::ModelCall {
                 r#for: Some(of),
                 purpose: Some(purpose),
                 ..
-            } => Some((e.seq, of.get(), purpose.as_str())),
+            } => Some((CallId(e.seq), of.get(), purpose.as_str())),
             _ => None,
         })
         .collect()
@@ -103,12 +103,12 @@ fn a_side_call_dies_with_its_call() {
     session.halt();
 
     let (side, ..) = sides(&log)[0];
-    let ended = |call: u64| {
+    let ended = |call: CallId| {
         log.iter().position(|e| {
             matches!(&e.body, Body::ModelResult { call: c, outcome: Outcome::Interrupted { .. } } if *c == call)
         })
     };
-    let (side_end, call_end) = (ended(side), ended(2));
+    let (side_end, call_end) = (ended(side), ended(CallId::new(2).unwrap()));
     assert!(side_end.is_some() && call_end.is_some(), "{log:#?}");
     assert!(side_end < call_end, "{log:#?}");
     assert_eq!(http.sent(), 2);
@@ -245,7 +245,7 @@ fn a_title_call_is_a_side_call() {
     assert_eq!(titles.first(), Some(&"title"), "{log:#?}");
     let view = SessionView::from_log(SessionId::new(), "/w".into(), &log);
     assert_eq!(
-        view.title.as_deref(),
+        view.side(ext_title::PURPOSE),
         Some("The harbor label is crimson-harbor.")
     );
     assert_eq!(titles.len(), 1, "titled once");

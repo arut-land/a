@@ -8,7 +8,7 @@ use protocol::view::{Item, Usage, call_title, recap_line};
 
 use super::super::render::{Canvas, Viewport, ellipsize, fit};
 use super::super::text::{Action, Color, Line, SmolStr, Span, Style, sanitize, width_of, wrap};
-use super::super::view::{self, ASK, MUTED, USER};
+use super::super::view::{ASK, MUTED, USER};
 use super::{App, HELP, Overlay};
 
 /// The input shows at most this many rows; it scrolls past them.
@@ -34,7 +34,7 @@ impl App {
             .view()
             .items
             .get(self.committed)
-            .is_some_and(view::settled)
+            .is_some_and(Item::settled)
         {
             out.extend_from_slice(self.rows(self.committed, usize::from(width)));
             self.committed += 1;
@@ -227,7 +227,7 @@ impl App {
         let room = width.saturating_sub(used + width_of(&right) + 4);
         let view = self.client.view();
         if view.session.is_some() && room > 8 {
-            let place = match &view.title {
+            let place = match view.side("title") {
                 Some(title) => (sanitize(title).replace('\n', " "), Style::new()),
                 None => (tilde(&view.workspace), MUTED),
             };

@@ -15,9 +15,10 @@ use std::collections::VecDeque;
 use std::fmt;
 use std::path::PathBuf;
 
-use protocol::view::{Change, SessionList, SessionView, Turn, Update};
+use protocol::view::{Change, SessionList, SessionView, Update};
 use protocol::{
-    ClientMsg, CommandInfo, DaemonMsg, Environment, Mode, Rejection, SessionSummary, Target,
+    Activity, CallId, ClientMsg, CommandInfo, DaemonMsg, Environment, Mode, Rejection,
+    SessionSummary, Target,
 };
 
 use crate::{Cmd, Diagnosis, Error, Welcome};
@@ -190,7 +191,7 @@ pub enum Notice {
     /// A steer or an interrupt while no turn runs.
     NothingRunning,
     /// An answer for a call that is not waiting for one.
-    NotAsking(u64),
+    NotAsking(CallId),
     /// `/env refresh` on a remote daemon, whose environment is its
     /// bridge's.
     RemoteEnv,
@@ -219,7 +220,7 @@ pub struct TurnView {
     /// A call is unsettled.
     pub running: bool,
     /// The oldest call waiting for an approval.
-    pub asking: Option<u64>,
+    pub asking: Option<CallId>,
     pub asks: u32,
     /// An interrupt has something to stop, and a steer a turn to reach.
     pub can_interrupt: bool,
@@ -250,7 +251,6 @@ pub struct SessionClient {
     /// Mutations sent and not yet answered: one refused because the daemon
     /// was draining is sent again, once, after the reattach.
     unanswered: VecDeque<ClientMsg>,
-    turn: Turn,
 }
 
 impl SessionClient {
@@ -267,7 +267,6 @@ impl SessionClient {
             seq: 0,
             queued: Vec::new(),
             unanswered: VecDeque::new(),
-            turn: Turn::default(),
         }
     }
 
@@ -293,12 +292,11 @@ impl SessionClient {
         self.conn
     }
 
-    pub const fn turn(&self) -> TurnView {
-        let Turn {
-            running,
-            asking,
-            asks,
-        } = self.turn;
+    pub fn turn(&self) -> TurnView {
+        let ledger = &self.view.ledger;
+        let running = ledger.activity() != Activity::Idle;
+        let asking = ledger.inbox().next();
+        let asks = u32::try_from(ledger.inbox().count()).unwrap_or(u32::MAX);
         TurnView {
             running,
             asking,
@@ -485,12 +483,10 @@ impl SessionClient {
             return;
         };
         match &update.change {
-            Change::Delta { .. } => {}
             Change::Synced => {
                 if let Link::Replaying { welcome, remote } = self.link {
                     self.link = Link::Live { welcome, remote };
                 }
-                self.turn = self.view.turn();
                 out.push(Effect::Show(Show::View(update)));
                 out.push(Effect::Show(Show::Link));
                 return;
@@ -501,7 +497,7 @@ impl SessionClient {
                 out.push(Effect::Show(Show::Link));
                 return;
             }
-            _ => self.turn = self.view.turn(),
+            _ => {}
         }
         out.push(Effect::Show(Show::View(update)));
     }
@@ -567,8 +563,8 @@ impl Offer<'_> {
     }
 
     /// Answers the approval call `call` waits for.
-    pub fn approve(self, call: u64, approved: bool) -> Result<Vec<Effect>, Notice> {
-        if !self.0.view.asked().any(|c| c == call) {
+    pub fn approve(self, call: CallId, approved: bool) -> Result<Vec<Effect>, Notice> {
+        if !self.0.view.ledger.inbox().any(|c| c == call) {
             return Err(Notice::NotAsking(call));
         }
         Ok(self.0.send(ClientMsg::approve(call, approved)))
@@ -586,7 +582,7 @@ impl Offer<'_> {
     }
 
     fn running(&self) -> Result<(), Notice> {
-        if self.0.turn.running {
+        if self.0.turn().running {
             Ok(())
         } else {
             Err(Notice::NothingRunning)
@@ -602,7 +598,7 @@ const fn numbered(msg: &ClientMsg, seq: u64) -> bool {
 mod tests {
     use std::path::PathBuf;
 
-    use protocol::{Audience, Body, CallId, Caps, Entry, Json, Permission, SessionId, Verdict};
+    use protocol::{Audience, Body, Caps, Entry, Epoch, Json, Permission, Seq, SessionId, Verdict};
 
     use super::*;
 
@@ -686,8 +682,8 @@ mod tests {
         client.step(msg(
             1,
             DaemonMsg::Entry(Entry::new(
-                1,
-                1,
+                Seq::new(1).unwrap(),
+                Epoch(1),
                 Body::Input {
                     text: "hi".into(),
                     mode: Mode::Queue,
@@ -702,8 +698,8 @@ mod tests {
 
     fn bash_call(seq: u64) -> DaemonMsg {
         DaemonMsg::Entry(Entry::new(
-            seq,
-            1,
+            Seq::new(seq).unwrap(),
+            Epoch(1),
             Body::ToolCall {
                 tool: "bash".into(),
                 input: Json::encode(&serde_json::json!({ "command": "ls" })).unwrap(),
@@ -716,8 +712,8 @@ mod tests {
 
     fn ask(seq: u64, call: u64) -> DaemonMsg {
         DaemonMsg::Entry(Entry::new(
-            seq,
-            1,
+            Seq::new(seq).unwrap(),
+            Epoch(1),
             Body::Decision {
                 by: "policy".into(),
                 call: CallId::new(call),
@@ -843,7 +839,7 @@ mod tests {
         let turn = client.turn();
         assert!(turn.running && turn.can_interrupt);
         client.step(msg(1, ask(3, 2)));
-        assert_eq!(client.turn().asking, Some(2));
+        assert_eq!(client.turn().asking, CallId::new(2));
         assert_eq!(client.turn().asks, 1);
     }
 
@@ -870,28 +866,29 @@ mod tests {
             client.offer().unwrap().steer("more".into()).err(),
             Some(Notice::NothingRunning)
         );
+        let two = CallId::new(2).unwrap();
         assert_eq!(
             client.offer().unwrap().interrupt().err(),
             Some(Notice::NothingRunning)
         );
         assert_eq!(
-            client.offer().unwrap().approve(2, true).err(),
-            Some(Notice::NotAsking(2))
+            client.offer().unwrap().approve(two, true).err(),
+            Some(Notice::NotAsking(two))
         );
         client.step(msg(1, bash_call(2)));
         assert!(client.offer().unwrap().interrupt().is_ok());
         assert_eq!(
-            client.offer().unwrap().approve(2, true).err(),
-            Some(Notice::NotAsking(2))
+            client.offer().unwrap().approve(two, true).err(),
+            Some(Notice::NotAsking(two))
         );
         client.step(msg(1, ask(3, 2)));
         assert!(matches!(
-            sends(&client.offer().unwrap().approve(2, false).unwrap())[..],
+            sends(&client.offer().unwrap().approve(two, false).unwrap())[..],
             [ClientMsg::Approve {
-                call: 2,
+                call,
                 approved: false,
                 ..
-            }]
+            }] if *call == two
         ));
         // Attached but reconnecting: offered, and queued until the
         // connection is up.

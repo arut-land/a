@@ -24,10 +24,11 @@ use serde::de::{Deserializer, Error as _, Visitor};
 use serde::{Deserialize, forward_to_deserialize_any};
 use serde_json::{Error, Result};
 
-use crate::view::{Approval, Item, SessionView, Status, Usage};
+use crate::ledger::{Ledger, Phase};
+use crate::view::{Item, SessionView, Status, Usage};
 use crate::{
     Audience, Author, Body, CallId, Caps, Card, ClientDecl, ClientId, ClientMsg, CommandInfo,
-    DaemonMsg, Decode, Entry, Environment, HomeSettings, Installed, Json, Mode, Outcome,
+    DaemonMsg, Decode, Entry, Environment, Epoch, HomeSettings, Installed, Json, Mode, Outcome,
     Permission, Rejection, Role, Seq, SessionId, SessionSummary, SettingsChange, Target,
     ToolChoice, Verdict, WaitOn,
 };
@@ -293,6 +294,7 @@ parsed!(
     Seq,
     Outcome,
     ClientId,
+    Ledger,
     Vec<Item>,
     Vec<SessionSummary>
 );
@@ -300,7 +302,19 @@ parsed!(
 /// A call is an entry's seq, never 0.
 impl Field<u64> for CallId {
     fn read(field: u64) -> Result<Self> {
-        Self::new(field).ok_or_else(|| Error::custom("call 0 names no entry"))
+        Seq::read(field).map(Self)
+    }
+}
+
+impl Field<u64> for Seq {
+    fn read(field: u64) -> Result<Self> {
+        Self::new(field).ok_or_else(|| Error::custom("seq 0 names no entry"))
+    }
+}
+
+impl Field<u32> for Epoch {
+    fn read(field: u32) -> Result<Self> {
+        Ok(Self(field))
     }
 }
 
@@ -448,9 +462,8 @@ pub(crate) struct MsgFields {
     pub(crate) mode: Option<Mode>,
     pub(crate) reason: Option<Rejection>,
     pub(crate) items: Option<Json>,
-    pub(crate) queued: Option<Vec<(u64, String)>>,
-    pub(crate) title: Option<String>,
-    pub(crate) environment: Option<Environment>,
+    #[serde(default, deserialize_with = "present")]
+    pub(crate) ledger: Option<Json>,
     pub(crate) pid: Option<u32>,
     pub(crate) started: Option<u64>,
     pub(crate) clients: Option<u32>,
@@ -488,7 +501,7 @@ struct ItemFields {
     tool: Option<String>,
     #[serde(default, deserialize_with = "present")]
     input: Option<Json>,
-    approval: Option<Approval>,
+    phase: Option<Phase>,
     outcome: Option<Outcome>,
     card: Option<Card>,
     by: Option<String>,
@@ -496,7 +509,7 @@ struct ItemFields {
     #[serde(default, deserialize_with = "present")]
     decision: Option<Json>,
     child: Option<SessionId>,
-    watch: Option<u64>,
+    watch: Option<Seq>,
     fired: Option<Outcome>,
     cwd: Option<PathBuf>,
 }
@@ -569,10 +582,8 @@ pub(crate) fn snapshot_msg(f: &mut MsgFields) -> Result<DaemonMsg> {
         session: f.session.take(),
         workspace: req(f.workspace.take(), "workspace")?,
         seq: req(f.seq.take(), "seq")?,
+        ledger: need(f.ledger.take(), "ledger")?,
         items: need(f.items.take(), "items")?,
-        environment: def(f.environment.take())?,
-        queued: f.queued.take().unwrap_or_default(),
-        title: f.title.take(),
         ..SessionView::default()
     })))
 }
@@ -594,8 +605,8 @@ pub(crate) fn environment_msg(f: &mut MsgFields) -> Result<ClientMsg> {
 impl EntryFields {
     fn entry(&mut self) -> Result<Entry> {
         Ok(Entry {
-            seq: req(self.seq.take(), "seq")?,
-            epoch: req(self.epoch.take(), "epoch")?,
+            seq: need(self.seq.take(), "seq")?,
+            epoch: need(self.epoch.take(), "epoch")?,
             body: Body::read(self)?,
         })
     }
@@ -606,15 +617,15 @@ impl ItemFields {
         let f = self;
         Ok(match req(f.ty.take(), "type")? {
             Type::User => Item::User {
-                seq: req(f.seq.take(), "seq")?,
+                seq: need(f.seq.take(), "seq")?,
                 text: req(f.text.take(), "text")?,
             },
             Type::Assistant => Item::Assistant {
-                seq: req(f.seq.take(), "seq")?,
+                seq: need(f.seq.take(), "seq")?,
                 text: req(f.text.take(), "text")?,
             },
             Type::Reply => Item::Reply {
-                call: req(f.call.take(), "call")?,
+                call: need(f.call.take(), "call")?,
                 model: req(f.model.take(), "model")?,
                 text: req(f.text.take(), "text")?,
                 status: req(f.status.take(), "status")?,
@@ -622,30 +633,30 @@ impl ItemFields {
                 purpose: f.purpose.take(),
             },
             Type::Tool => Item::Tool {
-                call: req(f.call.take(), "call")?,
+                call: need(f.call.take(), "call")?,
                 tool: req(f.tool.take(), "tool")?,
                 input: req(f.input.take(), "input")?,
-                approval: f.approval.take(),
+                phase: req(f.phase.take(), "phase")?,
                 outcome: f.outcome.take(),
                 card: f.card.take(),
                 by: def(f.by.take())?,
             },
             Type::Hook => Item::Hook {
-                seq: req(f.seq.take(), "seq")?,
+                seq: need(f.seq.take(), "seq")?,
                 hook: req(f.hook.take(), "hook")?,
-                call: f.call.take(),
+                call: def(f.call.take())?,
                 tool: f.tool.take().unwrap_or_default(),
                 decision: verdict(&req(f.decision.take(), "decision")?)?,
             },
             Type::Child => Item::Child {
-                call: req(f.call.take(), "call")?,
+                call: need(f.call.take(), "call")?,
                 child: req(f.child.take(), "child")?,
                 input: need(f.input.take(), "input")?,
                 watch: f.watch.take(),
                 fired: f.fired.take(),
             },
             Type::Environment => Item::Environment {
-                seq: req(f.seq.take(), "seq")?,
+                seq: need(f.seq.take(), "seq")?,
                 cwd: req(f.cwd.take(), "cwd")?,
             },
         })
@@ -655,6 +666,15 @@ impl ItemFields {
 /// A [`Verdict`] as an item nests it, read by the decoder an entry's is.
 fn verdict(json: &Json) -> Result<Verdict> {
     Verdict::read(&mut read::<EntryFields>(json.raw().as_bytes())?)
+}
+
+/// As a ledger's phase nests it (in a snapshot), read by the decoder an
+/// entry's is.
+impl<'de> Deserialize<'de> for WaitOn {
+    fn deserialize<D: Deserializer<'de>>(d: D) -> std::result::Result<Self, D::Error> {
+        let mut f = EntryFields::deserialize(MapOnly(d))?;
+        Self::read(&mut f).map_err(D::Error::custom)
+    }
 }
 
 impl Decode for Entry {
@@ -675,8 +695,8 @@ impl Decode for Entry {
 fn unknown_entry(bytes: &[u8]) -> Option<Entry> {
     #[derive(Deserialize)]
     struct Tags {
-        seq: u64,
-        epoch: u32,
+        seq: Seq,
+        epoch: Epoch,
         kind: String,
     }
     let tags = read::<Tags>(bytes).ok().filter(|t| !Body::knows(&t.kind))?;

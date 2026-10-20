@@ -17,7 +17,7 @@ use super::render::{Canvas, Viewport};
 use super::text::{Action, Color, Line, Style};
 use super::view::{Live, MUTED};
 use client::{Cmd, Env, Link, Renderer, SessionClient, Show};
-use protocol::view::{Change, Item, SessionView, Update, Usage};
+use protocol::view::{Change, Item, SessionView, Update, Usage, mismatch_line};
 use protocol::{SessionSummary, Target};
 
 /// What the event loop does for the app.
@@ -71,7 +71,7 @@ pub struct App {
     workspace: PathBuf,
     /// Per item, its rows when last drawn; `None` is out of date.
     cache: Vec<Option<Rows>>,
-    collapsed: HashSet<u64>,
+    collapsed: HashSet<protocol::Seq>,
     verbose: bool,
     /// Scrolled back: the top row shown, as (item, row within it), which
     /// stays put as output arrives below. `None` follows the latest.
@@ -226,8 +226,8 @@ impl App {
                     self.cache.clear();
                 }
             }
-            Change::Updated { index, item, .. } => {
-                spend(&mut self.tokens, &item);
+            Change::Updated { index, .. } => {
+                spend(&mut self.tokens, &self.client.view().items[index]);
                 if self.cache.len() == len {
                     self.cache[index] = None;
                 } else {
@@ -248,12 +248,9 @@ impl App {
                 self.flash = Some((message, Style::new().fg(Color::Red)));
             }
             Change::Mismatch { supported } => {
-                self.flash = Some((
-                    format!("the daemon speaks protocol {supported}; restart it"),
-                    Style::new().fg(Color::Red),
-                ));
+                self.flash = Some((mismatch_line(supported), Style::new().fg(Color::Red)));
             }
-            Change::Snapshot { .. } => {
+            Change::Snapshot => {
                 self.cache.clear();
                 self.anchor = None;
                 self.committed = self.committed.min(len);
@@ -383,7 +380,7 @@ impl App {
         let view = self.client.view();
         let asking = self.client.turn().asking;
         *self.summary.get_or_insert_with(|| Summary {
-            asked: asking.and_then(|call| view.items.binary_search_by_key(&call, Item::key).ok()),
+            asked: asking.and_then(|call| view.items.binary_search_by_key(&call.0, Item::key).ok()),
             reply: view
                 .items
                 .iter()
@@ -463,7 +460,7 @@ impl App {
     }
 
     /// Item `key`'s rows are out of date.
-    fn stale(&mut self, key: u64) {
+    fn stale(&mut self, key: protocol::Seq) {
         if let Ok(at) = self
             .client
             .view()

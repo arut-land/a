@@ -98,16 +98,15 @@ fn a_tools_outcome_crosses_as_a_patch_not_as_the_item_again() {
         index: 0,
         patch:
             ItemPatch::Outcome {
-                outcome: ToolOutcome::Done { output_json, .. },
-                phase,
-                ..
+                outcome: ToolOutcome::Done { output_json },
+                shown,
             },
     } = patched.change
     else {
         panic!("{patched:?}");
     };
     assert!(output_json.contains("\"output\":\"y\\n\""), "{output_json}");
-    assert_eq!(phase, a_ffi::CallPhase::Done);
+    assert_eq!(shown.status, "done");
     // The snapshot a client far behind takes has the whole item.
     assert!(matches!(
         &reducer.snapshot().items[..],

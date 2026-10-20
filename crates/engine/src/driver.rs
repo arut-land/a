@@ -116,7 +116,7 @@ pub enum Request {
     Interrupt,
     /// The answer to what call `call` waits on.
     Answer {
-        call: u64,
+        call: CallId,
         value: Json,
     },
 }
@@ -272,6 +272,7 @@ impl Live {
             replied: None,
             snapshot: None,
             inflight: Keyed::default(),
+            view: None,
             replies: Keyed::default(),
             sides: Keyed::default(),
             tickets: 0,
@@ -423,11 +424,14 @@ struct Actor {
     transcript: Option<Transcript>,
     /// The message of the reply model call `.0` just had, until its
     /// result commits.
-    replied: Option<(u64, llm::Assistant)>,
+    replied: Option<(CallId, llm::Assistant)>,
     /// The last snapshot made, and its seq; `None` for one too large.
     snapshot: Option<(u64, Option<Frame>)>,
     /// What each open call has in flight, one thing at a time.
     inflight: Keyed<CallId, InFlight>,
+    /// The view a far attach is sent, kept in step with each commit from
+    /// the first time one is asked for: no attach folds the whole log.
+    view: Option<SessionView>,
     replies: Keyed<Ticket, oneshot::Sender<Result<(), String>>>,
     /// Side model requests waiting for their call's id, with the
     /// conversation they asked for.
@@ -565,7 +569,7 @@ impl Actor {
                 request,
                 origin,
                 reply,
-            } => self.requested(request, origin, reply)?,
+            } => self.requested(request, origin, reply),
             Msg::Step(event) => event,
             Msg::Attach(client, since, done) => {
                 self.attach(&client, since);
@@ -607,7 +611,7 @@ impl Actor {
                 message,
             } => {
                 self.inflight.remove(&call);
-                self.replied = message.map(|m| (call.get(), m));
+                self.replied = message.map(|m| (call, m));
                 Event::ModelDone { call, replied }
             }
             Msg::Side {
@@ -669,11 +673,11 @@ impl Actor {
         request: Request,
         origin: Option<Author>,
         reply: oneshot::Sender<Result<(), String>>,
-    ) -> Option<Event> {
+    ) -> Event {
         self.tickets += 1;
         let ticket = Some(Ticket(self.tickets));
         self.replies.insert(Ticket(self.tickets), reply);
-        Some(match request {
+        match request {
             Request::Input { text, mode } => Event::Input {
                 text,
                 mode,
@@ -681,19 +685,13 @@ impl Actor {
                 ticket,
             },
             Request::Interrupt => Event::Interrupt { origin, ticket },
-            Request::Answer { call, value } => {
-                let Some(call) = CallId::new(call) else {
-                    self.reply(Ticket(self.tickets), Err("no call 0".into()));
-                    return None;
-                };
-                Event::Answer {
-                    call,
-                    value,
-                    origin,
-                    ticket,
-                }
-            }
-        })
+            Request::Answer { call, value } => Event::Answer {
+                call,
+                value,
+                origin,
+                ticket,
+            },
+        }
     }
 
     /// Steps the kernel through `events` and carries out what follows. A
@@ -882,10 +880,13 @@ impl Actor {
         if entries.iter().any(|e| matches!(e.body, Body::Edit { .. })) {
             self.transcript = None;
         }
+        if let Some(view) = &mut self.view {
+            view.extend(entries);
+        }
         for (e, line) in entries.iter().zip(lines.lines()) {
             self.live
                 .frames
-                .push(e.seq, Frame::from_line(e.seq, line).ok());
+                .push(e.seq.get(), Frame::from_line(e.seq.get(), line).ok());
             lock(&session.states).apply(e);
             // What observers do about it runs owned by the session.
             for reaction in hooks.observe(self.bound.point(), e) {
@@ -901,13 +902,11 @@ impl Actor {
             if let Some(transcript) = &mut self.transcript {
                 transcript.apply(e, replied.map(|(_, m)| m));
             }
-            if let Body::ToolResult { call, .. } | Body::ModelResult { call, .. } = &e.body
-                && let Some(call) = CallId::new(*call)
-            {
+            if let Body::ToolResult { call, .. } | Body::ModelResult { call, .. } = &e.body {
                 // Settled: what still runs of it is let go.
-                self.inflight.remove(&call);
-                session.forget(call);
-                self.bound.settled(call);
+                self.inflight.remove(call);
+                session.forget(*call);
+                self.bound.settled(*call);
             }
         }
         lock(&self.live.followers).retain(|c| c.wake().is_ok());
@@ -1107,7 +1106,7 @@ impl Actor {
                 let (decisions, answered) = self.bound.step(call, &mut request);
                 let answered = answered.map(|(by, response)| {
                     let (replied, message) = replied(response);
-                    self.replied = message.map(|m| (call.get(), m));
+                    self.replied = message.map(|m| (call, m));
                     (by, replied)
                 });
                 if answered.is_none() {
@@ -1180,7 +1179,7 @@ impl Actor {
             messages.clone()
         } else {
             // A call recovery runs after entries it does not see.
-            let before = frames.entries().take_while(|e| e.seq < call.get());
+            let before = frames.entries().take_while(|e| e.seq < call.0);
             Transcript::of(before, Arc::clone(registry), system).into_messages()
         }
     }
@@ -1256,8 +1255,10 @@ impl Actor {
             return frame.clone();
         }
         let live = &self.live;
-        let view = SessionView::from_log(live.id, live.workspace.clone(), live.frames.entries());
-        let frame = Frame::new(&DaemonMsg::Snapshot(Box::new(view))).ok();
+        let view = self.view.get_or_insert_with(|| {
+            SessionView::from_log(live.id, live.workspace.clone(), live.frames.entries())
+        });
+        let frame = Frame::new(&DaemonMsg::Snapshot(Box::new(view.clone()))).ok();
         self.snapshot = Some((seq, frame.clone()));
         frame
     }
@@ -1343,7 +1344,7 @@ impl Live {
     /// Live text of model call `call`'s attempt `attempt`, to followers.
     fn delta(&self, call: CallId, attempt: u16, text: &str) {
         let delta = DaemonMsg::Delta {
-            call: call.get(),
+            call,
             text: text.to_owned(),
             attempt,
         };

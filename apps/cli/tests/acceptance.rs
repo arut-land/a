@@ -8,7 +8,9 @@ use std::os::unix::fs::PermissionsExt;
 use std::process::Command;
 
 use common::{Env, Repl, assert_contiguous, group_alive, is_tool_call, result_of, wait_for};
-use protocol::{Audience, Body, ClientMsg, Json, Mode, Outcome, Permission, Target, Verdict};
+use protocol::{
+    Audience, Body, CallId, ClientMsg, Json, Mode, Outcome, Permission, Target, Verdict,
+};
 use serde_json::json;
 
 const ANY: Target = Target::Latest {
@@ -110,7 +112,7 @@ fn resume_after_the_terminal_closes_mid_turn_replays_every_entry() {
                 by: Audience::Model,
             },
             Body::ToolResult {
-                call,
+                call: CallId(call),
                 outcome: Outcome::Done {
                     output: Json::encode(&json!({ "slept": 1 })).unwrap()
                 },
@@ -130,7 +132,8 @@ fn resume_after_the_terminal_closes_mid_turn_replays_every_entry() {
             "a    hello",
             "you  sleep 1",
             r#"tool sleep {"seconds":1}"#,
-            r#"  └ {"slept":1}"#,
+            r#"  │ {"slept":1}"#,
+            "  └ done",
         ]
     );
     assert_eq!(resumed.line(), "[recap · you: sleep 1 · ran sleep]");
@@ -221,15 +224,18 @@ fn an_unsafe_tool_is_interrupted_with_its_output_and_its_processes_killed() {
     env.start();
     let mut conn = env.connect();
     let (_, mut entries) = conn.attach(Target::Id(id), &env.ws);
-    if !entries.iter().any(|e| result_of(e, call).is_some()) {
-        entries.extend(conn.until(|e| result_of(e, call).is_some()));
+    if !entries.iter().any(|e| result_of(e, call.0).is_some()) {
+        entries.extend(conn.until(|e| result_of(e, call.0).is_some()));
     }
     wait_for("the leftover process group to die", || !group_alive(pgid));
 
     assert!(orphaned, "the tool's processes died with the daemon");
     assert_contiguous(&entries);
     assert_eq!(entries, env.log(id));
-    let results: Vec<_> = entries.iter().filter_map(|e| result_of(e, call)).collect();
+    let results: Vec<_> = entries
+        .iter()
+        .filter_map(|e| result_of(e, call.0))
+        .collect();
     assert_eq!(
         results,
         [&Outcome::Interrupted {
@@ -463,8 +469,7 @@ fn a_pending_approval_survives_detach_and_is_re_delivered_on_attach() {
     else {
         unreachable!()
     };
-    let call = call.get();
-    assert_eq!(conn.view.turn().asking, Some(call));
+    assert_eq!(conn.view.ledger.inbox().next(), Some(call));
     let listed = env.run(&["ls"]);
     assert!(listed.contains("  approval   loaded  "), "{listed}");
     drop(conn);
@@ -479,7 +484,7 @@ fn a_pending_approval_survives_detach_and_is_re_delivered_on_attach() {
         ..protocol::view::Recap::default()
     };
     assert_eq!(conn.view.recap, Some(recap));
-    assert_eq!(conn.view.turn().asking, Some(call));
+    assert_eq!(conn.view.ledger.inbox().next(), Some(call));
     drop(conn);
 
     env.kill_daemon();
@@ -492,7 +497,7 @@ fn a_pending_approval_survives_detach_and_is_re_delivered_on_attach() {
         &shown[shown.len() - 2..],
         [
             "[recap · you: $ echo ran > ran.txt · ran bash · 1 waiting for approval]",
-            "? approve $ echo ran > ran.txt  [y/n]",
+            "? $ echo ran > ran.txt  waiting for approval  [y/n]",
         ]
     );
     term.type_line("y");
@@ -508,7 +513,7 @@ fn a_pending_approval_survives_detach_and_is_re_delivered_on_attach() {
         .collect();
     assert!(
         matches!(&answers[..], [e] if matches!(&e.body, Body::Answer { call: c, value, .. }
-            if c.get() == call && value.parse::<bool>().is_ok_and(|yes| yes))),
+            if *c == call && value.parse::<bool>().is_ok_and(|yes| yes))),
         "{log:#?}"
     );
 }

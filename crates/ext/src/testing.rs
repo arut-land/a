@@ -6,7 +6,7 @@ use std::path::PathBuf;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, LazyLock, Mutex, MutexGuard, PoisonError};
 
-use protocol::{Body, CallId, Entry, Environment, Json, Outcome, SessionId};
+use protocol::{Body, CallId, Entry, Environment, Epoch, Json, Outcome, Seq, SessionId};
 use serde_json::Value;
 
 use crate::host::{Host, Parts, Registry, Services};
@@ -156,8 +156,8 @@ impl Host for Recorder {
         let mut log = lock(&self.log);
         let seq = log.len() as u64 + 1;
         log.push(Entry::new(
-            seq,
-            0,
+            Seq::new(seq).unwrap(),
+            Epoch(0),
             Body::Ext {
                 ext: ext.to_owned(),
                 state: state.to_owned(),
@@ -167,7 +167,7 @@ impl Host for Recorder {
         Box::pin(std::future::ready(()))
     }
 
-    fn edit(&self, target: protocol::Seq, upto: Option<protocol::Seq>, replace: Option<Json>) {
+    fn edit(&self, target: Seq, upto: Option<Seq>, replace: Option<Json>) {
         let mut log = lock(&self.log);
         let seq = log.len() as u64 + 1;
         let edit = Body::Edit {
@@ -175,7 +175,7 @@ impl Host for Recorder {
             upto,
             replace,
         };
-        log.push(Entry::new(seq, 0, edit));
+        log.push(Entry::new(Seq::new(seq).unwrap(), Epoch(0), edit));
     }
 
     fn states(&self, read: &mut dyn FnMut(&States)) {

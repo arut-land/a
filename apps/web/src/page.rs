@@ -18,7 +18,7 @@ pub struct Page {
     /// The title the page shows.
     titled: Option<String>,
     /// Text streamed since the last patch, for one reply.
-    streamed: Option<(u64, String)>,
+    streamed: Option<(protocol::CallId, String)>,
     /// Events not yet sent.
     out: Vec<u8>,
 }
@@ -117,7 +117,7 @@ impl Page {
             // The first item takes the place of the note that there is
             // none; a sync brings the recap.
             Change::Added { index: 0, .. }
-            | Change::Snapshot { .. }
+            | Change::Snapshot
             | Change::Synced
             | Change::Attached { reset: true, .. } => self.show_all(),
             Change::Added { item, .. } => {
@@ -127,8 +127,11 @@ impl Page {
                     html: &item,
                 });
             }
-            Change::Updated { item, .. } => {
-                let item = html(ItemRow { item: &item, view });
+            Change::Updated { index, .. } => {
+                let item = html(ItemRow {
+                    item: &view.items[index],
+                    view,
+                });
                 self.patch(&Patch::Replace(&item));
             }
             _ => {}
@@ -147,12 +150,10 @@ impl Page {
 
     /// Shows the session's title again if it changed.
     fn show_title(&mut self) {
-        let title = &self.client.view().title;
-        if *title != self.titled {
-            let span = html(TitleSpan {
-                title: title.as_deref(),
-            });
-            self.titled.clone_from(title);
+        let title = self.client.view().side("title");
+        if title != self.titled.as_deref() {
+            let span = html(TitleSpan { title });
+            self.titled = title.map(str::to_owned);
             self.patch(&Patch::Replace(&span));
         }
     }
@@ -171,7 +172,7 @@ impl Page {
             .as_ref()
             .is_none_or(|s| s.call != call || s.text.len() == text.len());
         if started {
-            let Some(item) = view.items.iter().find(|i| i.key() == call) else {
+            let Some(item) = view.items.iter().find(|i| i.key() == call.0) else {
                 return;
             };
             let item = html(ItemRow { item, view });
@@ -245,7 +246,7 @@ mod tests {
     use std::path::PathBuf;
 
     use client::{ConnId, Error, Event, EventKind, Welcome};
-    use protocol::{Body, Caps, DaemonMsg, Entry, Json, Outcome, SessionId};
+    use protocol::{Body, CallId, Caps, DaemonMsg, Entry, Epoch, Json, Outcome, Seq, SessionId};
 
     use super::Page;
 
@@ -298,7 +299,7 @@ mod tests {
     }
 
     fn entry(seq: u64, body: Body) -> DaemonMsg {
-        DaemonMsg::Entry(Entry::new(seq, 1, body))
+        DaemonMsg::Entry(Entry::new(Seq::new(seq).unwrap(), Epoch(1), body))
     }
 
     fn user(seq: u64, text: &str) -> DaemonMsg {
@@ -315,7 +316,7 @@ mod tests {
 
     fn delta(call: u64, text: &str) -> DaemonMsg {
         DaemonMsg::Delta {
-            call,
+            call: CallId::new(call).unwrap(),
             text: text.into(),
             attempt: 0,
         }
@@ -410,7 +411,7 @@ mod tests {
         page.fold(&[entry(
             3,
             Body::ModelResult {
-                call: 2,
+                call: CallId::new(2).unwrap(),
                 outcome: Outcome::Done {
                     output: Json::encode(&serde_json::json!({ "text": "a <b> c d" })).unwrap(),
                 },
@@ -449,7 +450,7 @@ mod tests {
         page.fold(&[entry(
             3,
             Body::ModelResult {
-                call: 2,
+                call: CallId::new(2).unwrap(),
                 outcome: Outcome::Done {
                     output: Json::encode(&reply).unwrap(),
                 },
