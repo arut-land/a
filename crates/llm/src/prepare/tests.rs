@@ -267,6 +267,7 @@ fn separate_turns_keep_distinct_ids_and_all_results_even_with_native_calls() {
                     panic!()
                 };
                 let id = assistant.tool_calls().next().unwrap().id.clone();
+                assert_eq!(provider.protocol.tool_id(&id), None);
                 let Message::Tool(tool) = &pair[1] else {
                     panic!()
                 };

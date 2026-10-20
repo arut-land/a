@@ -175,10 +175,7 @@ impl Prepare {
                 let ids: Vec<_> = assistant
                     .tool_calls()
                     .filter(|call| native || !call.provider_executed)
-                    .map(|call| {
-                        self.ids
-                            .rename(&call.id, |id| if native { None } else { fit(id) })
-                    })
+                    .map(|call| self.ids.rename(&call.id, fit))
                     .collect();
                 let unchanged = assistant
                     .tool_calls()
