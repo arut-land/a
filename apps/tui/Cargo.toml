@@ -14,9 +14,11 @@ sys.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 unicode-width = { version = "0.2", default-features = false }
-# ratatui's core (cell buffer, styles) without widgets or its terminal: the
-# client wraps and lays out its own rows and writes the cells that changed.
-ratatui-core = { version = "0.1.2", default-features = false, features = ["std"] }
+# A span's text inline up to 23 bytes and shared past that, and a row's
+# spans inline: a frame keeps the rows it drew without allocating. Both
+# are in the graph already (`llm`, `ext`, `kernel`).
+smol_str = { version = "0.3", default-features = false, features = ["std"] }
+smallvec = { version = "1.13", default-features = false, features = ["const_generics"] }
 # Input decoding (keys, mouse reports, pastes); `ext-shell` links it already.
 vte = { version = "0.15", default-features = false }
 # Raw mode, the window size and polling stdin with the signal pipe.

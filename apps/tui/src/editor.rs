@@ -1,9 +1,7 @@
 //! The input: multi-line text with a cursor, readline keys, and history.
 
-use ratatui_core::style::Style;
-
 use super::keys::Key;
-use super::text::{Line, Span, char_width};
+use super::text::{Line, Span, Style, char_width};
 
 #[derive(Default)]
 pub struct Editor {
@@ -227,7 +225,7 @@ impl Editor {
                 } else {
                     Span::new("  ", prompt)
                 };
-                rows.push(Line::from(vec![pad, Span::new(row.clone(), Style::new())]));
+                rows.push(Line::from([pad, Span::new(row.as_str(), Style::new())]));
             }
             offset += logical.len() + 1;
         }

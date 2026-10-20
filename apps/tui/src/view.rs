@@ -5,10 +5,8 @@ use protocol::view::md::{self, Block, Inline};
 use protocol::view::{Buttons, Glyph, Item, Kind, Presented, Shown};
 use protocol::{CallId, Json};
 
-use ratatui_core::style::{Color, Modifier, Style};
-
 use super::render::ellipsize;
-use super::text::{Action, Line, Span, sanitize, wrap};
+use super::text::{Action, Color, Line, Modifier, Span, Style, sanitize, wrap};
 
 /// How much of a card's output shows unless everything is expanded.
 const TAIL: usize = 10;
@@ -223,7 +221,7 @@ fn markdown_into(out: &mut Vec<Line>, text: &str, width: usize, base: Style, fen
 }
 
 /// Inline `**bold**` and `` `code` `` within one line.
-fn inline(text: &str, base: Style) -> Vec<Span> {
+fn inline(text: &str, base: Style) -> smallvec::SmallVec<[Span; 4]> {
     md::inlines(text)
         .map(|run| match run {
             Inline::Text(text) => Span::new(text, base),
@@ -249,7 +247,7 @@ fn card(key: protocol::Seq, p: &Presented<'_>, input: Option<&Json>, width: usiz
     let room = width.saturating_sub(2 + 2 + super::text::width_of(&status.text));
     let mut out = vec![
         Line::default(),
-        Line::from(vec![
+        Line::from([
             Span::button(marker, MUTED, toggle),
             Span::button(
                 ellipsize(&sanitize(&p.title).replace('\n', " "), room),
@@ -271,7 +269,7 @@ fn card(key: protocol::Seq, p: &Presented<'_>, input: Option<&Json>, width: usiz
             body.len().saturating_sub(TAIL)
         };
         if hidden > 0 {
-            out.push(Line::from(vec![Span::button(
+            out.push(Line::from([Span::button(
                 format!("  │ ⋯ {hidden} earlier lines (ctrl-o shows all)"),
                 MUTED,
                 toggle,
@@ -287,7 +285,7 @@ fn card(key: protocol::Seq, p: &Presented<'_>, input: Option<&Json>, width: usiz
 
 /// The row that answers call `call`'s ask.
 fn approve_row(call: CallId) -> Line {
-    Line::from(vec![
+    Line::from([
         Span::new("  allow this call?  ", ASK),
         Span::button("[ y  yes ]", OK.bold(), Action::Approve(call, true)),
         Span::new("  ", Style::new()),
@@ -438,7 +436,7 @@ mod tests {
             texts(&rows),
             ["  Title", "  • one two x", "  ```", "  fn a()", "  ```"]
         );
-        assert!(rows[0].spans[1].style.add_modifier.contains(Modifier::BOLD));
+        assert!(rows[0].spans[1].style.mods.contains(Modifier::BOLD));
         assert_eq!(rows[1].spans[3].style, CODE);
     }
 
