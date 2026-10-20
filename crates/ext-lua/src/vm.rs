@@ -1087,6 +1087,29 @@ mod tests {
         );
     }
 
+    #[test]
+    fn cancelling_a_suspended_call_releases_its_host_handle() {
+        let module = Mod::load(
+            "cancel",
+            &tool("return cx.tool('wait',{})"),
+            &["wait".into()],
+            Limits::default(),
+        )
+        .unwrap();
+        let rig = Rig::new(
+            "lua-cancel-handle",
+            Registry::default().with(&Service(false)).unwrap(),
+        );
+        let cx = rig.cx();
+        let input = Json::default();
+        let mut call = Box::pin(module.tools[0].execute(&input, &cx));
+        let mut context = std::task::Context::from_waker(std::task::Waker::noop());
+        assert!(call.as_mut().poll(&mut context).is_pending());
+        assert_eq!(locked(&module.tools[0].callbacks.calls).len(), 1);
+        drop(call);
+        assert!(locked(&module.tools[0].callbacks.calls).is_empty());
+    }
+
     struct Wait;
     impl Tool for Wait {
         type In = ext::Args;

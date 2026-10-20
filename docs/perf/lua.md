@@ -196,3 +196,7 @@ Replacing per-invocation userdata with integer handles in a per-VM active-call
 map reduced 3,622,368 to 3,605,840 bytes (-16,528). A drop guard removes each
 handle on completion or cancellation; saved callbacks cannot retain contexts.
 Retained; the same sandbox, quota and async-delegation invariants pass.
+
+A direct recursive JSON-to-Lua conversion with integrated node/depth accounting
+measured 3,605,840 bytes, the same as the bounded serde conversion. Discarded:
+it provided no measured size reduction. The bounded serde boundary is retained.
