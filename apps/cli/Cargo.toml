@@ -53,9 +53,16 @@ subagent = ["dep:ext-subagent"]
 # dev-dependency below turns them on.
 fixtures = ["ext-fixtures/on"]
 
+# The model protocols' TLS, by target: the OS's on Apple platforms and
+# Windows, rustls elsewhere.
+[target.'cfg(any(target_vendor = "apple", windows))'.dependencies]
+llm = { workspace = true, features = ["tls-native"] }
+
+[target.'cfg(not(any(target_vendor = "apple", windows)))'.dependencies]
+llm = { workspace = true, features = ["tls-rustls"] }
+
 [dev-dependencies]
 ext-fixtures = { workspace = true, features = ["on"] }
-llm.workspace = true
 
 [target.'cfg(unix)'.dev-dependencies]
 # A pseudo-terminal for the black-box tests of the terminal client.

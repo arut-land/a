@@ -156,7 +156,7 @@ pub struct Daemon {
 /// input = "rm -rf /"
 /// effect = "deny"
 /// ```
-pub fn rules(text: &str) -> Result<Vec<(String, Option<String>, String)>, ParseError> {
+pub fn rules(text: &str) -> Result<Vec<Rule>, ParseError> {
     let doc: DocumentMut = text.parse()?;
     let Some(rules) = doc.get("rule") else {
         return Ok(Vec::new());
@@ -171,13 +171,45 @@ pub fn rules(text: &str) -> Result<Vec<(String, Option<String>, String)>, ParseE
                 string(rule, key, "rule.")?
                     .ok_or_else(|| ParseError(format!("a rule needs its {key}")))
             };
-            Ok((
-                need("tool")?,
-                string(rule, "input", "rule.")?,
-                need("effect")?,
-            ))
+            Ok(Rule {
+                tool: need("tool")?,
+                input: string(rule, "input", "rule.")?,
+                effect: need("effect")?.parse()?,
+            })
         })
         .collect()
+}
+
+/// One of the operator's rules: what calls of `tool` (`*` for any) whose
+/// input holds `input`, if any, meet.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Rule {
+    pub tool: String,
+    pub input: Option<String>,
+    pub effect: Effect,
+}
+
+/// What a rule does to the calls it names.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Effect {
+    Allow,
+    Ask,
+    Deny,
+}
+
+impl FromStr for Effect {
+    type Err = ParseError;
+
+    fn from_str(s: &str) -> Result<Self, ParseError> {
+        match s {
+            "allow" => Ok(Self::Allow),
+            "ask" => Ok(Self::Ask),
+            "deny" => Ok(Self::Deny),
+            other => Err(ParseError(format!(
+                "rule.effect: no effect {other}: allow, ask or deny"
+            ))),
+        }
+    }
 }
 
 impl Config {
@@ -519,13 +551,26 @@ model = "not this one"
         assert_eq!(
             read,
             [
-                ("bash".into(), Some("rm -rf".into()), "deny".into()),
-                ("*".into(), None, "ask".into())
+                Rule {
+                    tool: "bash".into(),
+                    input: Some("rm -rf".into()),
+                    effect: Effect::Deny
+                },
+                Rule {
+                    tool: "*".into(),
+                    input: None,
+                    effect: Effect::Ask
+                }
             ]
         );
         assert_eq!(rules("").unwrap(), []);
         let bad = rules("[[rule]]\ntool = \"x\"\n").unwrap_err();
         assert_eq!(bad.to_string(), "a rule needs its effect");
+        let bad = rules("[[rule]]\ntool = \"x\"\neffect = \"maybe\"\n").unwrap_err();
+        assert_eq!(
+            bad.to_string(),
+            "rule.effect: no effect maybe: allow, ask or deny"
+        );
     }
 
     #[test]

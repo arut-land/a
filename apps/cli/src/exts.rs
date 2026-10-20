@@ -333,7 +333,11 @@ mod tests {
         let bad = configured(&[], None, "mode = \"sometimes\"\n");
         assert_eq!(registry_refused(&bad), "ext.policy.mode: no mode sometimes");
         let floor = Config {
-            floor: Ok(vec![("bash".into(), None, "allow".into())]),
+            floor: Ok(vec![sys::config::Rule {
+                tool: "bash".into(),
+                input: None,
+                effect: sys::config::Effect::Allow,
+            }]),
             ..config.clone()
         };
         assert!(registry_refused(&floor).contains("may only ask or deny"));

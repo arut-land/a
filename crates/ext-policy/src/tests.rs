@@ -5,6 +5,7 @@ use ext::testing::Rig;
 use ext::{BoxFuture, Gate, Gated, Gating, Models, Tier};
 use protocol::Json;
 use serde_json::json;
+use sys::config::Effect;
 
 use super::*;
 
@@ -133,17 +134,21 @@ impl Extension for Lax {
     }
 }
 
+fn rule(tool: &str, input: Option<&str>, effect: Effect) -> sys::config::Rule {
+    sys::config::Rule {
+        tool: tool.to_owned(),
+        input: input.map(str::to_owned),
+        effect,
+    }
+}
+
 /// The floor holds whatever mode, or policy, is above it: `permission`
 /// takes the strictest answer, and the floor allows nothing.
 #[test]
 fn the_floor_cannot_be_loosened() {
     let floor = Floor::new([
-        (
-            "bash".to_owned(),
-            Some("rm -rf /".to_owned()),
-            "deny".to_owned(),
-        ),
-        ("*".to_owned(), Some("secret".to_owned()), "ask".to_owned()),
+        rule("bash", Some("rm -rf /"), Effect::Deny),
+        rule("*", Some("secret"), Effect::Ask),
     ])
     .unwrap();
     for mode in Mode::ALL {
@@ -177,6 +182,6 @@ fn the_floor_cannot_be_loosened() {
     let denied = gate(&rig, "bash", json!({ "command": "rm -rf /" }));
     assert_eq!(denied, Gate::Refuse("policy-floor denied this call".into()));
     // Nor may the floor allow.
-    let allows = Floor::new([("bash".to_owned(), None, "allow".to_owned())]);
+    let allows = Floor::new([rule("bash", None, Effect::Allow)]);
     assert!(allows.unwrap_err().contains("may only ask or deny"));
 }

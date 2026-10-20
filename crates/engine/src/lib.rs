@@ -51,10 +51,10 @@ pub struct Config {
     pub crash_limit: u32,
     /// `[ext]`: the extensions left out, and each one's own table.
     pub ext: sys::config::Exts,
-    /// The operator's permission rules (`$A_HOME`'s `policy.toml`), as
-    /// `(tool, input, effect)`, or why they could not be read: a daemon
-    /// whose floor is unreadable does not start.
-    pub floor: Result<Vec<(String, Option<String>, String)>, String>,
+    /// The operator's permission rules (`$A_HOME`'s `policy.toml`), or why
+    /// they could not be read: a daemon whose floor is unreadable does not
+    /// start.
+    pub floor: Result<Vec<sys::config::Rule>, String>,
     /// The registry of the extensions this build links, assembled for this
     /// configuration. The engine itself offers the model nothing.
     pub extensions: fn(&Config) -> Result<ext::host::Registry, ext::Refused>,
