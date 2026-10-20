@@ -11,6 +11,8 @@ mod acceptance;
 mod budgets;
 mod crash;
 mod home;
+#[cfg(feature = "lua")]
+mod lua;
 mod reactor;
 mod remote;
 mod tui;

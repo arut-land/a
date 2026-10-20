@@ -13,6 +13,7 @@ ext.workspace = true
 ext-compact = { workspace = true, optional = true }
 ext-edit = { workspace = true, optional = true }
 ext-fixtures.workspace = true
+ext-lua = { workspace = true, optional = true }
 ext-policy = { workspace = true, optional = true }
 ext-prompt = { workspace = true, optional = true }
 ext-retry = { workspace = true, optional = true }
@@ -29,6 +30,8 @@ web = { workspace = true, optional = true }
 
 [features]
 default = ["web", "policy", "prompt", "shell", "edit", "compact", "retry", "settings", "subagent", "title"]
+# User mods; opt-in until quiet-machine startup has been verified.
+lua = ["dep:ext-lua"]
 # `a web`; about 110 KiB of the release binary.
 web = ["dep:web"]
 # Which calls wait for the user's approval.

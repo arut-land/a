@@ -18,6 +18,20 @@ use ext::{Configured, DynExtension, Name, Refused, Registrar, Table, Tier};
 /// order, each as its `[ext.<name>]` table sets it. The fixtures come only
 /// with the `echo` agent they serve, in a build that has them.
 pub fn registry(config: &Config) -> Result<Registry, Refused> {
+    let registry = linked(config)?;
+    #[cfg(feature = "lua")]
+    if !config.ext.disable.iter().any(|name| name == "lua") {
+        let home = sys::Home::from_env().map_err(|e| Refused(e.to_string()))?;
+        let base = config.clone();
+        let loader = ext_lua::Loader::new(home.root().to_owned(), config.ext.clone(), move || {
+            linked(&base)
+        })?;
+        return registry.with_in(Tier::Pre, &loader);
+    }
+    Ok(registry)
+}
+
+fn linked(config: &Config) -> Result<Registry, Refused> {
     let built = Built::new().with(Tier::Pre, &configured::<ext::StepLimit>(config)?)?;
     #[cfg(feature = "policy")]
     let built = {
@@ -180,7 +194,10 @@ mod tests {
     fn every_extension_registers_as_any_other() {
         let registry = registry(&config(&["bash"], None)).unwrap();
         assert_eq!(tools(&registry), ["bash", "edit", "task"]);
-        let extensions: Vec<_> = registry.extensions().collect();
+        let extensions: Vec<_> = registry
+            .extensions()
+            .filter(|(name, _)| *name != "lua")
+            .collect();
         assert_eq!(
             extensions,
             [

@@ -17,5 +17,4 @@ piccolo = { version = "=0.3.3", optional = true }
 ext = { path = "../../../crates/ext" }
 llm = { path = "../../../crates/llm" }
 protocol = { path = "../../../crates/protocol" }
-rt = { path = "../../../crates/rt" }
 serde_json = "1"

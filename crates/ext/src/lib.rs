@@ -43,7 +43,7 @@ mod state;
 pub mod testing;
 mod tool;
 
-pub use agent::{Action, Actions, Agent, Input};
+pub use agent::{Action, Actions, Agent, Input, actions_from_json};
 pub use assemble::{Need, Provides};
 pub use ext::{DynExtension, Extension, Facts, Place, Refused, Registrar, Text, Tier};
 pub use flag::{Cancel, Flag};
