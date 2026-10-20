@@ -3,7 +3,7 @@
 
 use std::io::{self, Write};
 
-use client::{Cmd, Driver, End, Endpoint, Inbox, Link};
+use client::{Cmd, Daemon, Driver, End, Endpoint, Inbox, Io, Link};
 use protocol::Target;
 use sys::Signals;
 
@@ -12,19 +12,14 @@ use super::app::{App, Effect};
 use super::render::Viewport;
 use super::screen::{Screen, Stdout};
 use super::term::{self, Terminal};
-use crate::Daemon;
 
 pub fn run(daemon: &Daemon, target: Target, viewport: Viewport) -> io::Result<()> {
     let workspace = sys::workspace_of(&std::env::current_dir()?);
     let (tx, rx) = client::inbox();
     let events = tx.clone();
-    let driver = Driver::new(
-        daemon.endpoint.clone(),
-        daemon.staged.clone(),
-        move |_, event| {
-            let _ = events.send(Event::Client(event));
-        },
-    );
+    let driver = Driver::new(daemon.clone(), move |_, event| {
+        let _ = events.send(Event::Client(event));
+    });
     let mut app = App::new(viewport, workspace, &target);
     let first = app.client.open(target);
     // ssh may ask for a password on the terminal: let it, before the
@@ -33,12 +28,12 @@ pub fn run(daemon: &Daemon, target: Target, viewport: Viewport) -> io::Result<()
         Endpoint::Ssh(_) => first
             .into_iter()
             .filter_map(|effect| match effect {
-                client::Effect::Connect {
-                    id,
+                client::Effect::Io(Io::Connect {
+                    conn,
                     attach,
                     restart,
-                } => {
-                    driver.connect(id, &attach, restart);
+                }) => {
+                    driver.connect(conn, &attach, restart);
                     None
                 }
                 effect => Some(effect),
@@ -58,7 +53,7 @@ pub fn run(daemon: &Daemon, target: Target, viewport: Viewport) -> io::Result<()
     // The first frame goes out before the daemon is even reached.
     client.draw()?;
     term::spawn_input(tx, signals);
-    client.apply(first);
+    client.driver.pump(&mut client.app, first);
     let exit = client.run(&rx);
     let _ = client.screen.close();
     drop(client);
@@ -77,7 +72,7 @@ pub fn run(daemon: &Daemon, target: Target, viewport: Viewport) -> io::Result<()
 
 enum Exit {
     Detached,
-    Lost(String),
+    Lost(client::Error),
     Quit,
 }
 
@@ -99,8 +94,8 @@ impl Client {
                     Event::Resized => self.screen.invalidate(),
                     Event::InputClosed => effects.push(Effect::Detach),
                     Event::Client(event) => {
-                        let io = self.app.event(event);
-                        self.apply(io);
+                        let stepped = self.app.client.step(event);
+                        self.driver.pump(&mut self.app, stepped);
                     }
                 }
             }
@@ -115,7 +110,7 @@ impl Client {
     }
 
     fn effect(&mut self, effect: Effect) -> Option<Exit> {
-        let io = match effect {
+        let asked = match effect {
             Effect::Cmd(cmd) => self.app.command(cmd),
             Effect::Restart => self.app.client.restart(),
             Effect::Redraw => {
@@ -125,28 +120,17 @@ impl Client {
             Effect::Detach => {
                 let exit = match self.app.client.link() {
                     Link::Ended(End::Lost(why)) => return Some(Exit::Lost(why.clone())),
-                    Link::Live { .. } => Exit::Detached,
+                    link if link.up() => Exit::Detached,
                     _ => Exit::Quit,
                 };
-                let io = self.app.command(Cmd::Detach);
-                self.apply(io);
+                let asked = self.app.command(Cmd::Detach);
+                self.driver.pump(&mut self.app, asked);
                 return Some(exit);
             }
             Effect::Quit => return Some(Exit::Quit),
         };
-        self.apply(io);
+        self.driver.pump(&mut self.app, asked);
         None
-    }
-
-    /// Has the driver carry out the session client's effects.
-    fn apply(&mut self, mut effects: Vec<client::Effect>) {
-        while !effects.is_empty() {
-            let shown = effects
-                .into_iter()
-                .filter_map(|effect| self.driver.apply(effect))
-                .collect();
-            effects = self.app.absorb(shown);
-        }
     }
 
     fn draw(&mut self) -> io::Result<()> {

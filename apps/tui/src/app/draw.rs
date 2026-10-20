@@ -153,10 +153,10 @@ impl App {
                 Style::new().fg(Color::Yellow),
             ),
             Link::Connecting => ("◌ connecting".to_owned(), MUTED),
-            Link::Live { .. } if !attached => ("○ not attached".to_owned(), MUTED),
-            Link::Live { synced: false, .. } => {
-                ("↻ replaying".to_owned(), Style::new().fg(Color::Blue))
+            Link::Replaying { .. } | Link::Live { .. } if !attached => {
+                ("○ not attached".to_owned(), MUTED)
             }
+            Link::Replaying { .. } => ("↻ replaying".to_owned(), Style::new().fg(Color::Blue)),
             Link::Live { .. } => ("● live".to_owned(), Style::new().fg(Color::Green)),
         };
         let mut left = vec![Span::new(state, style)];

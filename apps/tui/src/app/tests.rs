@@ -8,7 +8,7 @@ use ratatui_core::buffer::Buffer;
 use ratatui_core::style::Modifier;
 use serde_json::json;
 
-use client::{Cmd, Event, Welcome};
+use client::{Cmd, Event, EventKind, Io, Welcome};
 use protocol::{Audience, Caps, Json};
 
 use super::{App, Effect};
@@ -41,18 +41,21 @@ fn app(viewport: Viewport, msgs: &[DaemonMsg]) -> (App, SessionId) {
 
 /// Opens a connection for `app` (to a `remote` host's daemon).
 fn connect(app: &mut App, remote: bool) {
-    let effects = app.client.open(Target::New);
-    app.absorb(effects);
-    let id = app.client.connection();
-    app.event(Event::Connected {
-        id,
-        welcome: Welcome {
-            proto: 1,
-            caps: Caps::ALL,
+    let opened = app.client.open(Target::New);
+    client::pump(|_| Ok(()), app, opened);
+    let conn = app.client.connection();
+    let connected = app.client.step(Event {
+        conn,
+        kind: EventKind::Connected {
+            welcome: Welcome {
+                proto: 1,
+                caps: Caps::ALL,
+            },
+            remote,
+            commands: Vec::new(),
         },
-        remote,
-        commands: Vec::new(),
     });
+    client::pump(|_| Ok(()), app, connected);
 }
 
 /// A frame: its cells, where the caret shows (if it does), and its rows.
@@ -497,7 +500,8 @@ fn slash_commands() {
     ));
     // A remote host's environment is not this shell's to send.
     connect(&mut app, true);
-    assert!(app.command(Cmd::RefreshEnv).is_empty());
+    let refused = app.command(Cmd::RefreshEnv);
+    client::pump(|io| panic!("{io:?}"), &mut app, refused);
     let (_, rows) = frame(&mut app, 80, 14);
     find(&rows, "reattach to refresh it");
     connect(&mut app, false);
@@ -550,7 +554,7 @@ fn resuming_where_there_is_no_session_opens_the_picker() {
         message: "no matching session".into(),
     });
     assert!(
-        matches!(&effects[..], [client::Effect::Send(ClientMsg::List)]),
+        matches!(&effects[..], [Io::Send(ClientMsg::List)]),
         "{effects:?}"
     );
     let (_, rows) = frame(&mut app, 60, 12);

@@ -7,22 +7,21 @@
 
 use std::collections::HashMap;
 use std::future::{Future, poll_fn};
-use std::io;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 use std::task::Poll;
 
-use client::{Attach, Cmd, Connection, Driver, Effect, Env, Event};
+use client::{Cmd, Daemon, Driver, Event};
 use http::header::HOST;
 use http::{Method, Request, StatusCode};
-use protocol::{ClientMsg, DaemonMsg, SessionId, SessionSummary, Target};
+use protocol::SessionId;
 use rt::Rt;
 use rt::channel::{Receiver, Sender};
 use serde::Deserialize;
 
 use crate::http::{Gate, Host, Reply, see_other, text, whole};
 use crate::page::Page;
-use crate::{Daemon, view};
+use crate::view;
 
 /// Where the calls of the tabs whose transcripts are live go, by tab id,
 /// with the number of the stream that opened it.
@@ -103,10 +102,13 @@ impl App {
         });
         let response = match (&parts.method, path, session) {
             (&Method::GET, "/", _) => {
-                let listed = self.blocking(list).await.map_err(|e| e.to_string());
+                let listed = self
+                    .blocking(Daemon::sessions)
+                    .await
+                    .map_err(|e| e.to_string());
                 page(view::sessions_page(&listed))
             }
-            (&Method::POST, "/new", _) => match self.blocking(new_session).await {
+            (&Method::POST, "/new", _) => match self.blocking(Daemon::new_session).await {
                 Ok(session) => see_other(&format!("/s/{session}"), None),
                 Err(e) => text(
                     StatusCode::BAD_GATEWAY,
@@ -194,32 +196,6 @@ fn param<'a>(query: &'a str, name: &str) -> Option<&'a str> {
     })
 }
 
-fn connect(daemon: &Daemon) -> io::Result<Connection> {
-    client::connect(&daemon.endpoint, &daemon.staged, &|| {})
-}
-
-fn list(daemon: &Daemon) -> io::Result<Vec<SessionSummary>> {
-    let mut sessions = connect(daemon)?.sessions()?;
-    // Newest first: ids are UUIDv7.
-    sessions.sort_by_key(|s| std::cmp::Reverse(s.id.0));
-    Ok(sessions)
-}
-
-/// Starts a session in the workspace `a web` runs in, with its environment
-/// (or a remote daemon's bridge's), as `a new` does.
-fn new_session(daemon: &Daemon) -> io::Result<SessionId> {
-    let new = Attach::new(Target::New, Env::Origin);
-    let mut conn = client::connect_with(&daemon.endpoint, &daemon.staged, None, &|| {}, &|conn| {
-        Ok(vec![conn.attach(&new)?])
-    })?;
-    let session = conn.reader.until(|msg| match msg {
-        DaemonMsg::Attached { session, .. } => Some(session),
-        _ => None,
-    })?;
-    conn.writer.send(&ClientMsg::Detach)?;
-    Ok(session)
-}
-
 fn parse_session(id: &str) -> Option<SessionId> {
     uuid::Uuid::try_parse(id).ok().map(SessionId)
 }
@@ -246,8 +222,7 @@ impl Live {
         let (tx, inbox) = rt::channel::unbounded();
         let tx = Arc::new(tx);
         let events = Arc::clone(&tx);
-        let daemon = app.daemon.clone();
-        let driver = Driver::new(daemon.endpoint, daemon.staged, move |_, event| {
+        let driver = Driver::new(app.daemon.clone(), move |_, event| {
             let _ = events.send(TabIn::Client(event));
         });
         let stream = app.streams.fetch_add(1, Ordering::Relaxed);
@@ -261,19 +236,8 @@ impl Live {
             driver,
             page,
         };
-        live.apply(open);
+        live.driver.pump(&mut live.page, open);
         live
-    }
-
-    /// Has the driver carry out the client's effects.
-    fn apply(&mut self, mut effects: Vec<Effect>) {
-        while !effects.is_empty() {
-            let shown = effects
-                .into_iter()
-                .filter_map(|effect| self.driver.apply(effect))
-                .collect();
-            effects = self.page.absorb(shown);
-        }
     }
 
     /// The events to send next, waiting for the client; `None` once the
@@ -289,11 +253,11 @@ impl Live {
             }
             for input in self.batch().await? {
                 let effects = match input {
-                    TabIn::Client(event) => self.page.event(event),
+                    TabIn::Client(event) => self.page.client.step(event),
                     TabIn::Line(text) => self.page.line(&text),
                     TabIn::Cmd(cmd) => self.page.command(cmd),
                 };
-                self.apply(effects);
+                self.driver.pump(&mut self.page, effects);
             }
             self.page.settle();
         }
@@ -325,10 +289,8 @@ impl Drop for Live {
         }
         drop(tabs);
         let (driver, effects) = (self.driver.clone(), self.page.client.detach());
-        self.app.rt.spawn_blocking(Box::new(move || {
-            for effect in effects {
-                driver.apply(effect);
-            }
-        }));
+        self.app
+            .rt
+            .spawn_blocking(Box::new(move || driver.pump(&mut (), effects)));
     }
 }

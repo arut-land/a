@@ -72,7 +72,7 @@ fn bridge(host: &str, script: &str, token: &str) -> io::Result<Option<Connection
     thread::spawn(move || child.wait());
     Ok(Some(Connection {
         reader: Reader(out),
-        writer: Writer::new(Box::new(stdin)),
+        writer: Writer(Box::new(stdin)),
         remote: Some(remote),
         welcome: Welcome::default(),
         commands: Vec::new(),

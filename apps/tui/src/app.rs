@@ -11,7 +11,7 @@ mod tests;
 use std::collections::HashSet;
 use std::path::PathBuf;
 
-use client::{Cmd, Env, Event, Link, SessionClient};
+use client::{Cmd, Env, Link, Renderer, SessionClient, Show};
 use protocol::view::{Change, Item, SessionView, Update, Usage};
 use protocol::{SessionSummary, Target};
 use ratatui_core::style::{Color, Style};
@@ -142,53 +142,34 @@ impl App {
         self.client.view()
     }
 
-    /// Takes in what the driver reports; returns what the driver is to do.
-    pub fn event(&mut self, event: Event) -> Vec<client::Effect> {
-        let effects = self.client.step(event);
-        self.absorb(effects)
-    }
-
     /// Has the session client carry out `cmd`; returns what the driver is
     /// to do.
     pub fn command(&mut self, cmd: Cmd) -> Vec<client::Effect> {
         if let Cmd::Sessions = cmd {
             self.overlay = Some(Overlay::Picker { selected: 0 });
         }
-        let effects = self.client.run(cmd);
-        self.absorb(effects)
+        self.client.run(cmd)
     }
 
-    /// Shows what the client's effects tell this screen and hands back the
-    /// driver's.
-    pub fn absorb(&mut self, effects: Vec<client::Effect>) -> Vec<client::Effect> {
-        let mut io = Vec::new();
-        for effect in effects {
-            match effect {
-                client::Effect::View(update) => io.extend(self.changed(update)),
-                client::Effect::Sessions => self.pick_default(),
-                client::Effect::Notice(text) => self.notice(text, true),
-                client::Effect::Link => {
-                    if let Link::Wedged(d) = self.client.link() {
-                        self.overlay = Some(Overlay::Unresponsive {
-                            who: d.who(),
-                            log: d.log_tail(),
-                        });
-                    }
-                }
-                effect => io.push(effect),
-            }
-        }
-        io
-    }
-
-    /// Folds a daemon message in, as if from the open connection.
+    /// Folds a daemon message in, as if from the open connection, showing
+    /// what it changed; returns what the driver is to do.
     #[cfg(test)]
-    pub fn fold(&mut self, msg: &protocol::DaemonMsg) -> Vec<client::Effect> {
-        let id = self.client.connection();
-        self.event(Event::Msg {
-            id,
-            msg: msg.clone(),
-        })
+    pub fn fold(&mut self, msg: &protocol::DaemonMsg) -> Vec<client::Io> {
+        let conn = self.client.connection();
+        let effects = self.client.step(client::Event {
+            conn,
+            kind: client::EventKind::Msg(msg.clone()),
+        });
+        let mut io = Vec::new();
+        client::pump(
+            |what| {
+                io.push(what);
+                Ok(())
+            },
+            self,
+            effects,
+        );
+        io
     }
 
     /// Keeps the screen's state in step with what changed in the view.
@@ -484,6 +465,29 @@ impl App {
 
     fn page(&self) -> i32 {
         i32::from(self.body).max(3) - 2
+    }
+}
+
+/// Shows what the client's effects tell this screen.
+impl Renderer for App {
+    fn show(&mut self, shown: Vec<Show>) -> Vec<client::Effect> {
+        let mut asked = Vec::new();
+        for show in shown {
+            match show {
+                Show::View(update) => asked.extend(self.changed(update)),
+                Show::Sessions => self.pick_default(),
+                Show::Notice(notice) => self.notice(notice.to_string(), true),
+                Show::Link => {
+                    if let Link::Wedged(d) = self.client.link() {
+                        self.overlay = Some(Overlay::Unresponsive {
+                            who: d.who(),
+                            log: d.log_tail(),
+                        });
+                    }
+                }
+            }
+        }
+        asked
     }
 }
 

@@ -591,15 +591,20 @@ impl Daemon {
         }
     }
 
-    /// Every session as it lists, from memory: no log is read.
+    /// Every session as it lists, newest first, from memory: no log is
+    /// read.
     fn list(&self) -> Vec<SessionSummary> {
-        self.slots()
+        let mut sessions: Vec<SessionSummary> = self
+            .slots()
             .iter()
             .map(|slot| {
                 slot.ending();
                 slot.summary()
             })
-            .collect()
+            .collect();
+        // Ids are UUIDv7: they order by creation.
+        sessions.sort_by_key(|s| std::cmp::Reverse(s.id.0));
+        sessions
     }
 
     /// Unloads sessions idle for `after`: no attachments, work or jobs.
