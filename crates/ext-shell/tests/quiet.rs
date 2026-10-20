@@ -6,7 +6,10 @@ use serde_json::json;
 
 #[test]
 fn a_quiet_command_wakes_nothing_while_it_runs() {
-    let rig = Rig::new("quiet", Registry::default().with(&ext_shell::Shell).unwrap());
+    let rig = Rig::new(
+        "quiet",
+        Registry::default().with(&ext_shell::Shell).unwrap(),
+    );
     rig.done("bash", &json!({ "command": "true" }));
     let before = rt::wakes();
     let ran = rig.done("bash", &json!({ "command": "sleep 1" }));
