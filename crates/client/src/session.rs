@@ -823,22 +823,35 @@ mod tests {
 
     #[test]
     fn unanswered_mutations_are_never_evicted_by_new_input() {
-        let (mut client, _) = attached(Env::Keep);
-        for n in 0..UNANSWERED {
-            assert_eq!(sends(&client.run(Cmd::Input(n.to_string()))).len(), 1);
+        for disconnected in [false, true] {
+            let (mut client, _) = attached(Env::Keep);
+            if disconnected {
+                client.step(msg(1, DaemonMsg::Draining));
+                client.step(closed(1));
+            }
+            for n in 0..UNANSWERED {
+                let out = client.run(Cmd::Input(n.to_string()));
+                assert!(notices(&out).is_empty());
+                assert_eq!(sends(&out).len(), usize::from(!disconnected));
+            }
+            let out = client.run(Cmd::Input("overflow".into()));
+            assert!(sends(&out).is_empty(), "{out:?}");
+            assert_eq!(notices(&out), vec![&Notice::Backpressure], "{out:?}");
+            if !disconnected {
+                client.step(msg(1, DaemonMsg::Draining));
+                client.step(closed(1));
+            }
+            let out = client.step(live(2, Caps::ALL));
+            let replay = sends(&out);
+            assert_eq!(replay.len(), UNANSWERED);
+            for (n, msg) in replay.iter().enumerate() {
+                assert_eq!(msg.client_seq(), Some(n as u64 + 1));
+                assert!(matches!(msg, ClientMsg::Input { text, .. } if text == &n.to_string()));
+            }
+            client.step(msg(2, DaemonMsg::Ack { client_seq: 1 }));
+            let out = client.run(Cmd::Input("accepted".into()));
+            assert_eq!(sends(&out)[0].client_seq(), Some(65));
         }
-        let out = client.run(Cmd::Input("overflow".into()));
-        assert!(sends(&out).is_empty(), "{out:?}");
-        assert_eq!(notices(&out).len(), 1, "{out:?}");
-        client.step(msg(1, DaemonMsg::Draining));
-        client.step(closed(1));
-        let out = client.step(live(2, Caps::ALL));
-        let replay = sends(&out);
-        assert_eq!(replay.len(), UNANSWERED);
-        assert_eq!(replay[0].client_seq(), Some(1));
-        client.step(msg(2, DaemonMsg::Ack { client_seq: 1 }));
-        let out = client.run(Cmd::Input("accepted".into()));
-        assert_eq!(sends(&out)[0].client_seq(), Some(65));
     }
 
     #[test]
