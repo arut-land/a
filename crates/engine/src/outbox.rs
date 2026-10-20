@@ -19,15 +19,28 @@ use crate::lock;
 /// it gets the committed outcome without the deltas.
 const BUDGET: usize = 1 << 20;
 
+/// How many bytes of the newest entries' frames are kept in memory, for
+/// the followers that keep up: a commit costs them no read of the log.
+const TAIL: usize = 64 << 10;
+
 /// A session's committed entries, shown to its clients: the lines its log
 /// stores, each encoded once as it committed, read back by seq as a client
-/// comes to it. The bytes stay where the log keeps them (for a file, the
-/// OS's page cache), not in the daemon's memory.
+/// comes to it. The newest stay in a bounded tail, shared by every
+/// follower; the rest stay where the log keeps them (for a file, the OS's
+/// page cache), not in the daemon's memory.
 pub struct FrameLog {
     lines: Arc<dyn Lines>,
     /// The seq of the last entry shown. Entries are shown under the lock
     /// they commit under, after the log holds them.
     seq: AtomicU64,
+    tail: Mutex<Tail>,
+}
+
+/// The frames of the newest entries, contiguous up to the last shown.
+#[derive(Default)]
+struct Tail {
+    frames: VecDeque<Frame>,
+    bytes: usize,
 }
 
 impl FrameLog {
@@ -36,6 +49,7 @@ impl FrameLog {
         Self {
             lines,
             seq: AtomicU64::new(seq),
+            tail: Mutex::default(),
         }
     }
 
@@ -44,8 +58,23 @@ impl FrameLog {
         self.seq.load(Ordering::Acquire)
     }
 
-    /// Shows entry `seq`, the next, which the log holds already.
-    pub fn push(&self, seq: u64) {
+    /// Shows entry `seq`, the next, which the log holds already, as
+    /// `frame`; `None` for one too large for a frame, which followers
+    /// come to in the log and end at.
+    pub fn push(&self, seq: u64, frame: Option<Frame>) {
+        let mut tail = lock(&self.tail);
+        match frame {
+            Some(frame) => {
+                tail.bytes += frame.as_bytes().len();
+                tail.frames.push_back(frame);
+                while tail.bytes > TAIL
+                    && let Some(old) = tail.frames.pop_front()
+                {
+                    tail.bytes -= old.as_bytes().len();
+                }
+            }
+            None => *tail = Tail::default(),
+        }
         let last = self.seq.swap(seq, Ordering::Release);
         debug_assert_eq!(last + 1, seq, "entries are shown in order");
     }
@@ -75,14 +104,24 @@ impl FrameLog {
         self.entries_after(0)
     }
 
-    /// Queues the frames of the entries after `after` that one read of the
-    /// log gets, none if there are no more. One too large for a frame, or
-    /// that cannot be read back, is an error that ends the view of a client
-    /// that comes to it rather than leaving a gap in it.
+    /// Queues the frames of the entries after `after`: from the tail when
+    /// it holds them, else what one read of the log gets; none if there
+    /// are no more. One too large for a frame, or that cannot be read
+    /// back, is an error that ends the view of a client that comes to it
+    /// rather than leaving a gap in it.
     fn read_after(&self, after: u64, ahead: &mut VecDeque<io::Result<Frame>>) {
         let last = self.seq();
         if after >= last {
             return;
+        }
+        {
+            let tail = lock(&self.tail);
+            let first = last + 1 - tail.frames.len() as u64;
+            if first <= after + 1 {
+                let skip = usize::try_from(after + 1 - first).unwrap_or(usize::MAX);
+                ahead.extend(tail.frames.iter().skip(skip).cloned().map(Ok));
+                return;
+            }
         }
         let mut run = Vec::new();
         match self.lines.read(after + 1..=last, RUN, &mut run) {
@@ -239,22 +278,39 @@ impl Outbox {
     pub async fn next(&self) -> Option<Frame> {
         loop {
             let mut seen = self.shared.ready.count();
-            {
-                let mut q = self.queue();
-                if let Some(frame) = q.step() {
-                    return Some(frame);
-                }
-                if q.closed {
-                    return None;
-                }
+            if let Some(frame) = self.try_next() {
+                return Some(frame);
+            }
+            if self.queue().closed {
+                return None;
             }
             self.shared.ready.changed(&mut seen).await;
         }
     }
 
-    /// The next frame to write if there is one now.
+    /// The next frame to write if there is one now. The log is read
+    /// outside the queue's lock: a cold read holds up no sender.
     pub fn try_next(&self) -> Option<Frame> {
-        self.queue().step()
+        loop {
+            let (log, cursor, follows) = match self.queue().step() {
+                Step::Frame(frame) => return Some(frame),
+                Step::Nothing => return None,
+                Step::Read(log, cursor, follows) => (log, cursor, follows),
+            };
+            let mut ahead = VecDeque::new();
+            log.read_after(cursor, &mut ahead);
+            if ahead.is_empty() {
+                return None;
+            }
+            let mut q = self.queue();
+            // Still following the same session from the same place.
+            if q.follows == follows
+                && let Some(follow) = &mut q.follow
+                && follow.cursor == cursor
+            {
+                follow.ahead = ahead;
+            }
+        }
     }
 
     /// Ends the connection once what is queued is written: sends fail from
@@ -275,33 +331,49 @@ impl Outbox {
     }
 }
 
+/// What the queue has next.
+enum Step {
+    Frame(Frame),
+    /// Nothing now.
+    Nothing,
+    /// The next entries of the session followed, read from its log after
+    /// this cursor; `.2` is the follow they are for.
+    Read(Arc<FrameLog>, u64, u64),
+}
+
 impl Queue {
     /// The next frame to write, if there is one now: the next queued if the
     /// client has the entries it waits for, else the next entry.
-    fn step(&mut self) -> Option<Frame> {
+    fn step(&mut self) -> Step {
         let cursor = self.follow.as_ref().map_or(u64::MAX, |f| f.cursor);
         if self
             .frames
             .front()
             .is_some_and(|&(after, _)| after <= cursor)
         {
-            let (_, frame) = self.frames.pop_front()?;
+            let Some((_, frame)) = self.frames.pop_front() else {
+                return Step::Nothing;
+            };
             if frame.class == Class::Ephemeral {
                 self.ephemeral -= frame.as_bytes().len();
             }
-            return Some(frame);
+            return Step::Frame(frame);
         }
-        let follow = self.follow.as_mut()?;
-        if follow.ahead.is_empty() {
-            follow.log.read_after(follow.cursor, &mut follow.ahead);
+        let Some(follow) = self.follow.as_mut() else {
+            return Step::Nothing;
+        };
+        match follow.ahead.pop_front() {
+            None => Step::Read(Arc::clone(&follow.log), follow.cursor, self.follows),
+            Some(Ok(frame)) => {
+                follow.cursor += 1;
+                Step::Frame(frame)
+            }
+            // Too large for a frame, or unreadable: the view ends here.
+            Some(Err(_)) => {
+                self.unfollow();
+                self.step()
+            }
         }
-        if let Ok(frame) = follow.ahead.pop_front()? {
-            follow.cursor += 1;
-            return Some(frame);
-        }
-        // Too large for a frame, or unreadable: the view ends here.
-        self.unfollow();
-        self.step()
     }
 
     /// What was queued for the session followed goes out first, as it is.
@@ -316,6 +388,8 @@ impl Queue {
 
 #[cfg(test)]
 mod tests {
+    use std::sync::atomic::AtomicUsize;
+
     use protocol::{Body, DaemonMsg};
 
     use super::*;
@@ -357,7 +431,7 @@ mod tests {
                     origin: None,
                 })
                 .unwrap();
-            self.1.push(e.seq);
+            self.1.push(e.seq, Frame::entry(&e).ok());
         }
 
         fn frames(&self) -> Arc<FrameLog> {
@@ -386,6 +460,56 @@ mod tests {
         std::iter::from_fn(|| outbox.try_next())
             .map(|f| f.seq)
             .collect()
+    }
+
+    /// Lines that count how often they are read.
+    struct Counted(Arc<dyn Lines>, AtomicUsize);
+
+    impl Lines for Counted {
+        fn read(
+            &self,
+            seqs: std::ops::RangeInclusive<u64>,
+            limit: usize,
+            out: &mut Vec<u8>,
+        ) -> io::Result<u64> {
+            self.1.fetch_add(1, Ordering::SeqCst);
+            self.0.read(seqs, limit, out)
+        }
+    }
+
+    /// Followers that keep up are served the frames the commit encoded,
+    /// however many follow: no read of the log per client per entry. Only
+    /// one that comes from far behind reads it, once per run.
+    #[test]
+    fn a_live_follower_reads_no_file() {
+        let mut log = log(&[]);
+        let counted = Arc::new(Counted(Arc::clone(&log.0.lines), AtomicUsize::new(0)));
+        log.1 = Arc::new(FrameLog::new(counted.clone(), 0));
+        let (near, far) = (Outbox::new(), Outbox::new());
+        let live = near.follow(log.frames(), 0, Vec::new());
+        for i in 0..64 {
+            log.push(&format!("{i}"));
+            live.wake().unwrap();
+            assert_eq!(written(&near).len(), 1);
+        }
+        assert_eq!(counted.1.load(Ordering::SeqCst), 0);
+        // Past the tail: read from the log, from where the tail starts on.
+        let big = "x".repeat(TAIL);
+        log.push(&big);
+        log.push("after");
+        let _ = far.follow(log.frames(), 0, Vec::new());
+        assert_eq!(written(&far).len(), 66);
+        assert!(counted.1.load(Ordering::SeqCst) >= 1);
+        // The entry too large for the tail is read, once, by whoever
+        // comes to it; what follows it is in the tail again.
+        let reads = counted.1.load(Ordering::SeqCst);
+        live.wake().unwrap();
+        assert_eq!(written(&near).len(), 2);
+        assert_eq!(counted.1.load(Ordering::SeqCst), reads + 1);
+        log.push("more");
+        live.wake().unwrap();
+        assert_eq!(written(&near).len(), 1);
+        assert_eq!(counted.1.load(Ordering::SeqCst), reads + 1);
     }
 
     #[test]

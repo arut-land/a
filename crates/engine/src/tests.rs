@@ -188,8 +188,7 @@ fn busy_sessions_recover_at_startup() {
         };
         created
             .writer
-            .log
-            .append_all(&[Entry::new(seq, created.writer.epoch(), body)])
+            .append_raw(&[Entry::new(seq, created.writer.epoch(), body)])
             .unwrap();
     }
 
@@ -246,7 +245,7 @@ fn a_damaged_log_is_shown_and_never_written() {
     };
     for (seq, body) in (1..).zip([text(1), call, text(3)]) {
         let entry = Entry::new(seq, created.writer.epoch(), body);
-        created.writer.log.append_all(&[entry]).unwrap();
+        created.writer.append_raw(&[entry]).unwrap();
     }
     let path = home.sessions_dir().join(format!("{id}.jsonl"));
     let mut file = std::fs::read(&path).unwrap();
@@ -514,8 +513,7 @@ fn watches_rearm_after_a_crash_and_fire_once() {
             let entry = Entry::new(seq, created.writer.epoch(), body);
             created
                 .writer
-                .log
-                .append_all(std::slice::from_ref(&entry))
+                .append_raw(std::slice::from_ref(&entry))
                 .unwrap();
         }
         assert_eq!(
@@ -711,8 +709,7 @@ fn an_orphan_does_not_resume_what_it_was_doing() {
         let entry = Entry::new(seq, created.writer.epoch(), body);
         created
             .writer
-            .log
-            .append_all(std::slice::from_ref(&entry))
+            .append_raw(std::slice::from_ref(&entry))
             .unwrap();
     }
     drop(created);

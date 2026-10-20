@@ -10,7 +10,7 @@ use std::time::Duration;
 
 use std::task::Poll;
 
-use crate::store::{Loaded, Log, LogStore, Memory};
+use crate::store::{Encoded, Loaded, Log, LogStore, Memory};
 use ext::{Answer, Extension, Recover, Registrar, Replay, Rewrite, Tool, point};
 use ext_policy::Policy;
 use llm::http::Http;
@@ -322,11 +322,7 @@ impl Fixture {
         let mut created = self.0.store.create(&header).unwrap();
         for e in entries {
             let e = Entry::new(e.seq, created.writer.epoch(), e.body.clone());
-            created
-                .writer
-                .log
-                .append_all(std::slice::from_ref(&e))
-                .unwrap();
+            created.writer.append_raw(std::slice::from_ref(&e)).unwrap();
         }
         drop(created);
         Live::start(&header, &self.0, Open::Load, Owner::None).unwrap()
@@ -428,7 +424,7 @@ type Written = (Vec<Entry>, bool);
 struct Probed(Box<dyn Log>, Probe);
 
 impl Probed {
-    fn write(&mut self, entries: &[Entry], durable: bool) -> io::Result<()> {
+    fn write(&mut self, entries: &[Entry], lines: &Encoded, durable: bool) -> io::Result<()> {
         self.1.waiting.fetch_add(1, Ordering::SeqCst);
         drop(lock(&self.1.held));
         self.1.waiting.fetch_sub(1, Ordering::SeqCst);
@@ -438,17 +434,17 @@ impl Probed {
         lock(&self.1.batches).push(entries.len());
 
         lock(&self.1.written).push((entries.to_vec(), durable));
-        self.0.append_all(entries)
+        self.0.append_all(entries, lines)
     }
 }
 
 impl Log for Probed {
-    fn append_all(&mut self, entries: &[Entry]) -> io::Result<()> {
-        self.write(entries, true)
+    fn append_all(&mut self, entries: &[Entry], lines: &Encoded) -> io::Result<()> {
+        self.write(entries, lines, true)
     }
 
-    fn write_all(&mut self, entries: &[Entry]) -> io::Result<()> {
-        self.write(entries, false)
+    fn write_all(&mut self, entries: &[Entry], lines: &Encoded) -> io::Result<()> {
+        self.write(entries, lines, false)
     }
 }
 
@@ -2064,7 +2060,7 @@ fn one_fsync_per_step() {
     let mut created = probe.store.create(&header).unwrap();
     for e in &entries {
         let e = Entry::new(e.seq, created.writer.epoch(), e.body.clone());
-        created.writer.log.append_all(&[e]).unwrap();
+        created.writer.append_raw(&[e]).unwrap();
     }
     drop(created);
     let session = Live::start(&header, &fixture.0, Open::Load, Owner::None).unwrap();

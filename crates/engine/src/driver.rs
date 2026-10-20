@@ -18,7 +18,7 @@ use std::task::Poll;
 use std::time::Instant;
 
 use crate::catalog::Record;
-use crate::store::{Header, Parent, Writer};
+use crate::store::{Encoded, Header, Parent, Writer};
 use ext::host::{Binding, Bound, Host, Parts, Registry, Services};
 use ext::point::View;
 use ext::{BoxFuture, Called, Cancel, Cx, Flag, States};
@@ -863,17 +863,18 @@ impl Actor {
             self.listed = listed;
         }
         self.writer = Some(writer);
-        written?;
+        let lines = written?;
         crate::session_event("commit", self.live.id, || {
             let how = if durable { "synced" } else { "written" };
             format!("{} entries {how}", entries.len())
         });
-        self.shown(&entries);
+        self.shown(&entries, &lines);
         Ok(())
     }
 
-    /// Entries committed: folded where else they are read, and sent.
-    fn shown(&mut self, entries: &[Entry]) {
+    /// Entries committed, as `lines` encodes them: folded where else they
+    /// are read, and sent.
+    fn shown(&mut self, entries: &[Entry], lines: &Encoded) {
         let session = &self.live.session;
         let hooks = self.registry.hooks();
         self.transcript = self.transcript.take().filter(|t| t.is_on(&self.registry));
@@ -881,8 +882,10 @@ impl Actor {
         if entries.iter().any(|e| matches!(e.body, Body::Edit { .. })) {
             self.transcript = None;
         }
-        for e in entries {
-            self.live.frames.push(e.seq);
+        for (e, line) in entries.iter().zip(lines.lines()) {
+            self.live
+                .frames
+                .push(e.seq, Frame::from_line(e.seq, line).ok());
             lock(&session.states).apply(e);
             // What observers do about it runs owned by the session.
             for reaction in hooks.observe(self.bound.point(), e) {

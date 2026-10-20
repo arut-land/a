@@ -6,7 +6,9 @@ use std::sync::{Arc, PoisonError, RwLock};
 
 use protocol::{Decode, Entry, ReadOnly, SessionId};
 
-use super::{Header, Kept, LeaseAuthority, Lines, Loaded, Local, Log, LogStore, Writer, span};
+use super::{
+    Encoded, Header, Kept, LeaseAuthority, Lines, Loaded, Local, Log, LogStore, Writer, span,
+};
 
 /// The format of the files this build writes, which the header line names:
 /// a file in another is kept as it is.
@@ -266,24 +268,25 @@ struct JsonlLog {
 impl Log for JsonlLog {
     /// One write and one sync for the lot, which makes what was only
     /// written before it durable too.
-    fn append_all(&mut self, entries: &[Entry]) -> io::Result<()> {
-        self.write(&lines(entries)?, true)
+    fn append_all(&mut self, _: &[Entry], lines: &Encoded) -> io::Result<()> {
+        self.write(&sealed(lines), true)
     }
 
     /// One write, and no sync.
-    fn write_all(&mut self, entries: &[Entry]) -> io::Result<()> {
-        self.write(&lines(entries)?, false)
+    fn write_all(&mut self, _: &[Entry], lines: &Encoded) -> io::Result<()> {
+        self.write(&sealed(lines), false)
     }
 }
 
-fn lines(entries: &[Entry]) -> io::Result<Vec<u8>> {
-    let mut lines = Vec::new();
-    for entry in entries {
-        let at = lines.len();
-        entry.encode(&mut lines)?;
-        seal(&mut lines, at);
+/// `lines`, each sealed, as the file stores them.
+fn sealed(lines: &Encoded) -> Vec<u8> {
+    let mut out = Vec::new();
+    for line in lines.lines() {
+        let at = out.len();
+        out.extend_from_slice(line);
+        seal(&mut out, at);
     }
-    Ok(lines)
+    out
 }
 
 impl JsonlLog {

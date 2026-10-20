@@ -118,11 +118,7 @@ fn append(loaded: &mut Loaded, seqs: impl IntoIterator<Item = u64>) -> Vec<Entry
     seqs.into_iter()
         .map(|seq| {
             let e = entry(seq, loaded.writer.epoch());
-            loaded
-                .writer
-                .log
-                .append_all(std::slice::from_ref(&e))
-                .unwrap();
+            loaded.writer.append_raw(std::slice::from_ref(&e)).unwrap();
             e
         })
         .collect()
@@ -168,8 +164,8 @@ fn batches_append_in_order(store: &dyn LogStore) {
     let mut log = store.create(&h).unwrap();
     let mut written = append(&mut log, 1..=2);
     let batch: Vec<Entry> = (3..=6).map(|seq| entry(seq, log.writer.epoch())).collect();
-    log.writer.log.append_all(&batch).unwrap();
-    log.writer.log.append_all(&[]).unwrap();
+    log.writer.append_raw(&batch).unwrap();
+    log.writer.append_raw(&[]).unwrap();
     written.extend(batch);
     written.extend(append(&mut log, 7..=7));
     assert_eq!(entries_of(store, h.id), written);

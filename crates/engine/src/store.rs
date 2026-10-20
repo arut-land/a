@@ -64,6 +64,35 @@ impl Loaded {
     }
 }
 
+/// Entries as the lines a log stores them: each one's JSON, encoded once
+/// as it is appended, end to end without newlines.
+#[derive(Default)]
+pub struct Encoded {
+    bytes: Vec<u8>,
+    /// Where each line ends.
+    ends: Vec<usize>,
+}
+
+impl Encoded {
+    pub fn of(entries: &[Entry]) -> io::Result<Self> {
+        let mut encoded = Self::default();
+        for entry in entries {
+            entry.encode(&mut encoded.bytes)?;
+            encoded.ends.push(encoded.bytes.len());
+        }
+        Ok(encoded)
+    }
+
+    pub fn lines(&self) -> impl ExactSizeIterator<Item = &[u8]> {
+        let mut start = 0;
+        self.ends.iter().map(move |&end| {
+            let line = &self.bytes[start..end];
+            start = end;
+            line
+        })
+    }
+}
+
 /// The one appender of a session's log, with the epoch of its lease: only
 /// a store makes one, as it creates or loads the log, and it is moved, never
 /// shared, so a session has one writer for as long as it lives.
@@ -88,16 +117,26 @@ impl Writer {
     }
 
     /// Appends `entries`, each stamped with the lease's epoch: durably, or
-    /// only written, to be durable with the next durable append.
-    pub fn append(&mut self, entries: &mut [Entry], durable: bool) -> io::Result<()> {
+    /// only written, to be durable with the next durable append. Returns
+    /// the lines it encoded them as, for whoever shows them.
+    pub fn append(&mut self, entries: &mut [Entry], durable: bool) -> io::Result<Encoded> {
         for e in &mut *entries {
             e.epoch = self.epoch;
         }
+        let lines = Encoded::of(entries)?;
         if durable {
-            self.log.append_all(entries)
+            self.log.append_all(entries, &lines)?;
         } else {
-            self.log.write_all(entries)
+            self.log.write_all(entries, &lines)?;
         }
+        Ok(lines)
+    }
+
+    /// Appends `entries` durably as they are, epochs included: a log laid
+    /// down for a test.
+    #[cfg(test)]
+    pub fn append_raw(&mut self, entries: &[Entry]) -> io::Result<()> {
+        self.log.append_all(entries, &Encoded::of(entries)?)
     }
 }
 
@@ -132,14 +171,15 @@ pub trait Log: Send {
     /// Appends `entries` in order, returning once they are as durable as the
     /// backend makes anything: a crash afterwards never loses them. A
     /// backend may make them durable together. After a crash the log holds
-    /// a prefix of them, and after a failure none.
-    fn append_all(&mut self, entries: &[Entry]) -> io::Result<()>;
+    /// a prefix of them, and after a failure none. `lines` is the entries
+    /// encoded, which a backend stores as they are.
+    fn append_all(&mut self, entries: &[Entry], lines: &Encoded) -> io::Result<()>;
 
     /// Appends `entries` in order, to be read back at once and made
     /// durable by the next [`Log::append_all`]: a crash before it may lose
     /// them, and nothing after them.
-    fn write_all(&mut self, entries: &[Entry]) -> io::Result<()> {
-        self.append_all(entries)
+    fn write_all(&mut self, entries: &[Entry], lines: &Encoded) -> io::Result<()> {
+        self.append_all(entries, lines)
     }
 
     fn read_only(&self) -> Option<ReadOnly> {
@@ -152,7 +192,7 @@ pub trait Log: Send {
 struct Kept(ReadOnly);
 
 impl Log for Kept {
-    fn append_all(&mut self, _: &[Entry]) -> io::Result<()> {
+    fn append_all(&mut self, _: &[Entry], _: &Encoded) -> io::Result<()> {
         Err(io::Error::new(
             io::ErrorKind::ReadOnlyFilesystem,
             self.0.to_string(),

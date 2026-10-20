@@ -441,7 +441,7 @@ fn far_behind_a_client_gets_a_snapshot() {
                 parent: None,
             })
             .unwrap();
-        let (epoch, mut log) = (created.writer.epoch(), created.writer.log);
+        let (epoch, mut writer) = (created.writer.epoch(), created.writer);
         let entries: Vec<Entry> = (1..=300)
             .map(|seq| {
                 let text = format!("m{seq}");
@@ -454,7 +454,7 @@ fn far_behind_a_client_gets_a_snapshot() {
                 Entry::new(seq, epoch, body)
             })
             .collect();
-        log.append_all(&entries).unwrap();
+        writer.append_raw(&entries).unwrap();
     });
     let replay = |since| {
         let mut peer = fixture.connect();

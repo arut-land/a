@@ -5,7 +5,9 @@ use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 
 use protocol::{Decode, Entry, SessionId};
 
-use super::{Header, LeaseAuthority, Lines, Loaded, Local, Log, LogStore, Writer, not_found, span};
+use super::{
+    Encoded, Header, LeaseAuthority, Lines, Loaded, Local, Log, LogStore, Writer, not_found, span,
+};
 
 /// Sessions held in this process, for tests: durable until it exits. Each
 /// keeps its entries as the lines a file would, so it is read back as one.
@@ -121,14 +123,8 @@ impl Lines for Shared {
 struct MemoryLog(Arc<Shared>);
 
 impl Log for MemoryLog {
-    fn append_all(&mut self, entries: &[Entry]) -> io::Result<()> {
-        let mut encoded = Vec::with_capacity(entries.len());
-        for entry in entries {
-            let mut line = Vec::new();
-            entry.encode(&mut line)?;
-            encoded.push(line.into_boxed_slice());
-        }
-        lock(&self.0.0).extend(encoded);
+    fn append_all(&mut self, _: &[Entry], lines: &Encoded) -> io::Result<()> {
+        lock(&self.0.0).extend(lines.lines().map(Box::from));
         Ok(())
     }
 }
