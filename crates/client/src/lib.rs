@@ -13,34 +13,119 @@ mod session;
 mod watch;
 
 pub use command::{COMMANDS, Cmd, Command, help, parse};
-pub use drive::Driver;
+pub use drive::{Driver, Renderer, pump};
 pub use inbox::{Inbox, Post, inbox};
-pub use session::{Attach, Effect, End, Env, Event, Link, SessionClient, TurnView};
+pub use session::{
+    Attach, ConnId, Effect, End, Env, Event, EventKind, Io, Link, Notice, Offer, SessionClient,
+    Show, TurnView,
+};
 pub use watch::SessionWatch;
 
+use std::fmt;
 use std::fs::{self, File};
 use std::io::{self, BufReader, IsTerminal, Read, Write};
 use std::path::PathBuf;
 use std::thread;
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
 use protocol::view::SessionList;
 use protocol::{
     Caps, ClientDecl, ClientId, ClientMsg, CommandInfo, DaemonMsg, Environment, HomeSettings,
-    PROTO, SessionSummary, SettingsChange, Versions, read_frame, write_frame,
+    PROTO, SessionId, SessionSummary, SettingsChange, Versions, read_frame, write_frame,
 };
 use sys::crash::{Crashes, Record};
 use sys::{Home, Signal, Staged, Stream};
 
+/// Why a daemon could not be reached, or stopped serving this client.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum Error {
+    /// The daemon speaks `theirs`, not this build's protocol. Staging never
+    /// downgrades, so when a `newer` build is staged, restarting the daemon
+    /// would only start it again: that build is the one to run. On another
+    /// `host`, one side or the other is to be updated.
+    Mismatch {
+        theirs: Versions,
+        newer: Option<PathBuf>,
+        host: Option<String>,
+    },
+    /// The daemon took the connection but did not answer the hello in
+    /// time; see [`diagnose`] and [`restart`].
+    NotResponding,
+    /// The daemon refuses to serve, as it says (after a crash loop).
+    Refused(String),
+    /// The daemon closed the connection.
+    Closed,
+    /// The socket, `ssh` or the spawn failed.
+    Io(io::ErrorKind, String),
+}
+
+impl fmt::Display for Error {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let mine = Versions::OURS;
+        match self {
+            Self::Mismatch {
+                theirs,
+                newer: Some(newer),
+                ..
+            } => write!(
+                f,
+                "the daemon runs a newer a ({theirs}) than this one ({mine}); run {} instead, or update this a",
+                newer.display()
+            ),
+            Self::Mismatch {
+                theirs,
+                host: Some(host),
+                ..
+            } => write!(
+                f,
+                "the daemon on {host} speaks {theirs}, this a {mine}; update a on one side"
+            ),
+            Self::Mismatch { theirs, .. } => {
+                write!(
+                    f,
+                    "the daemon speaks {theirs}, this a {mine}; restart the daemon"
+                )
+            }
+            Self::NotResponding => f.write_str("the daemon is not responding"),
+            Self::Refused(why) | Self::Io(_, why) => f.write_str(why),
+            Self::Closed => f.write_str("the daemon closed the connection"),
+        }
+    }
+}
+
+impl std::error::Error for Error {}
+
+impl From<io::Error> for Error {
+    fn from(e: io::Error) -> Self {
+        match e.kind() {
+            io::ErrorKind::TimedOut | io::ErrorKind::WouldBlock => Self::NotResponding,
+            io::ErrorKind::UnexpectedEof
+            | io::ErrorKind::ConnectionReset
+            | io::ErrorKind::BrokenPipe => Self::Closed,
+            kind => Self::Io(kind, e.to_string()),
+        }
+    }
+}
+
+/// For the commands that report through `io::Result`.
+impl From<Error> for io::Error {
+    fn from(e: Error) -> Self {
+        let kind = match &e {
+            Error::Mismatch { .. } => io::ErrorKind::Unsupported,
+            Error::NotResponding => io::ErrorKind::TimedOut,
+            Error::Refused(_) => io::ErrorKind::Other,
+            Error::Closed => io::ErrorKind::UnexpectedEof,
+            Error::Io(kind, _) => *kind,
+        };
+        Self::new(kind, e.to_string())
+    }
+}
+
 /// The read half of a connection, over any byte stream.
 pub struct Reader(BufReader<Box<dyn Read + Send>>);
 
-/// The write half of a connection. It numbers the mutations it sends.
-pub struct Writer {
-    out: Box<dyn Write + Send>,
-    /// The `client_seq` of the last mutation sent.
-    seq: u64,
-}
+/// The write half of a connection.
+pub struct Writer(Box<dyn Write + Send>);
 
 /// A daemon connection, split so reading and writing can run on their own
 /// threads.
@@ -76,13 +161,11 @@ impl Connection {
     }
 
     /// The message making `attach`. The daemon finds the workspace from
-    /// the directory given, else from the origin's.
+    /// the directory given, else from the origin's; an attach that keeps
+    /// the session's environment captures nothing.
     pub fn attach(&self, attach: &Attach) -> io::Result<ClientMsg> {
         let (workspace, env) = match &attach.env {
-            Env::Keep => {
-                let dir = attach.workspace.clone();
-                (dir.map_or_else(|| self.origin().map(|e| e.cwd), Ok)?, None)
-            }
+            Env::Keep => (attach.workspace.clone().unwrap_or_default(), None),
             Env::Origin => {
                 let env = self.origin()?;
                 (
@@ -130,7 +213,7 @@ impl Connection {
         self.writer.send(&ClientMsg::WatchSessions)
     }
 
-    /// The daemon's sessions.
+    /// The daemon's sessions, newest first.
     pub fn sessions(mut self) -> io::Result<Vec<SessionSummary>> {
         self.writer.send(&ClientMsg::List)?;
         let mut list = SessionList::default();
@@ -139,13 +222,20 @@ impl Connection {
     }
 }
 
+/// Why no one session matches a prefix.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum NoMatch {
+    None,
+    Several,
+}
+
 /// The one of `sessions` whose id (as `id` finds it), in full or short
 /// form, starts with `prefix`.
 pub fn matching<'a, T>(
     sessions: &'a [T],
-    id: impl Fn(&T) -> Option<protocol::SessionId>,
+    id: impl Fn(&T) -> Option<SessionId>,
     prefix: &str,
-) -> Result<&'a T, String> {
+) -> Result<&'a T, NoMatch> {
     let mut found = sessions.iter().filter(|s| {
         id(s).is_some_and(|id| {
             id.short().to_string().starts_with(prefix) || id.to_string().starts_with(prefix)
@@ -153,8 +243,8 @@ pub fn matching<'a, T>(
     });
     match (found.next(), found.next()) {
         (Some(one), None) => Ok(one),
-        (None, _) => Err(format!("no session matches {prefix}")),
-        (Some(_), Some(_)) => Err(format!("{prefix} matches several sessions")),
+        (None, _) => Err(NoMatch::None),
+        (Some(_), Some(_)) => Err(NoMatch::Several),
     }
 }
 
@@ -179,7 +269,10 @@ impl Reader {
                 return Ok(found);
             }
         }
-        Err(io::Error::other("daemon closed the connection"))
+        Err(io::Error::new(
+            io::ErrorKind::UnexpectedEof,
+            Error::Closed.to_string(),
+        ))
     }
 
     /// Waits for a draining daemon to close the connection as it exits.
@@ -197,28 +290,10 @@ impl Reader {
 }
 
 impl Writer {
-    pub(crate) fn new(out: Box<dyn Write + Send>) -> Self {
-        Self { out, seq: 0 }
-    }
-
-    /// Sends `msg`, numbering it first if it is a mutation without a
-    /// number: the daemon answers it by that number, which
-    /// [`Writer::last_seq`] gives.
+    /// Sends `msg` as it is: a mutation is numbered by the session client
+    /// that made it, which keeps it for the daemon's answer.
     pub fn send(&mut self, msg: &ClientMsg) -> io::Result<()> {
-        let mut numbered = msg.clone();
-        match numbered.client_seq_mut() {
-            Some(seq @ None) => {
-                self.seq += 1;
-                *seq = Some(self.seq);
-                write_frame(&mut self.out, &numbered)
-            }
-            _ => write_frame(&mut self.out, msg),
-        }
-    }
-
-    /// The `client_seq` of the last mutation sent.
-    pub const fn last_seq(&self) -> u64 {
-        self.seq
+        write_frame(&mut self.0, msg)
     }
 }
 
@@ -229,6 +304,142 @@ pub enum Endpoint {
     Local(Home),
     /// Another machine's, through `ssh <host> a bridge`.
     Ssh(String),
+}
+
+/// A daemon as a client reaches it: where it is, and this build (which a
+/// connection may start, or install on a host that lacks `a`).
+#[derive(Clone, Debug)]
+pub struct Daemon {
+    pub endpoint: Endpoint,
+    pub staged: Staged,
+}
+
+impl Daemon {
+    pub const fn local(home: Home, staged: Staged) -> Self {
+        Self {
+            endpoint: Endpoint::Local(home),
+            staged,
+        }
+    }
+
+    pub const fn ssh(host: String, staged: Staged) -> Self {
+        Self {
+            endpoint: Endpoint::Ssh(host),
+            staged,
+        }
+    }
+
+    /// The home, for what acts on this machine's daemon only.
+    pub fn home(&self) -> io::Result<&Home> {
+        match &self.endpoint {
+            Endpoint::Local(home) => Ok(home),
+            Endpoint::Ssh(host) => Err(io::Error::other(format!(
+                "this command acts on this machine; run it on {host} instead"
+            ))),
+        }
+    }
+
+    /// Connects and completes the hello. A daemon draining for a newer
+    /// build is waited out (`on_drain` says so first), then the next
+    /// attempt starts the new build.
+    pub fn connect(&self, on_drain: &dyn Fn()) -> Result<Connection, Error> {
+        self.connect_as(None, on_drain, &|_| Ok(Vec::new()))
+    }
+
+    /// [`Daemon::connect`] as `client`, which names the client across its
+    /// connections so a mutation it sends again is done once, sending the
+    /// messages `first` makes for the connection (an attach, say) right
+    /// behind the hello rather than after the welcome, which saves a round
+    /// trip. A daemon that does not welcome the client acts on none of
+    /// them, so each retry sends them again.
+    pub fn connect_as(
+        &self,
+        client: Option<ClientId>,
+        on_drain: &dyn Fn(),
+        first: &dyn Fn(&Connection) -> io::Result<Vec<ClientMsg>>,
+    ) -> Result<Connection, Error> {
+        // A daemon exiting (idle) as we connect, or draining, gets one more
+        // try each.
+        for _ in 0..3 {
+            let (stream, mut conn) = match &self.endpoint {
+                Endpoint::Local(home) => {
+                    let (stream, started) = connect_or_spawn(home, false)?;
+                    let timeout = if started {
+                        START_TIMEOUT
+                    } else {
+                        HELLO_TIMEOUT
+                    };
+                    stream.set_read_timeout(Some(timeout))?;
+                    let conn = split(&stream)?;
+                    (Some(stream), conn)
+                }
+                Endpoint::Ssh(host) => (None, remote::open(host, &self.staged)?),
+            };
+            let first = first(&conn)?;
+            match hello(&mut conn, &self.staged.id, client, &first) {
+                Ok(Greeting::Mismatch(theirs)) => return Err(self.mismatch(theirs)),
+                Ok(Greeting::Welcome) => {
+                    if let Some(stream) = &stream {
+                        stream.set_read_timeout(None)?;
+                    }
+                    return Ok(conn);
+                }
+                Ok(Greeting::Draining) => {
+                    on_drain();
+                    if let Some(stream) = &stream {
+                        stream.set_read_timeout(Some(DRAIN_TIMEOUT))?;
+                    }
+                    conn.reader.drained()?;
+                }
+                Err(Error::Closed) => {}
+                Err(e) => return Err(e),
+            }
+        }
+        Err(Error::Closed)
+    }
+
+    /// The daemon's sessions, newest first.
+    pub fn sessions(&self) -> Result<Vec<SessionSummary>, Error> {
+        Ok(self.connect(&|| {})?.sessions()?)
+    }
+
+    /// Starts a session in the origin's working directory with its
+    /// environment, as `a new` does, and leaves it running.
+    pub fn new_session(&self) -> Result<SessionId, Error> {
+        let new = Attach::new(protocol::Target::New, Env::Origin);
+        let mut conn = self.connect_as(None, &|| {}, &|conn| Ok(vec![conn.attach(&new)?]))?;
+        let session = conn.reader.until(|msg| match msg {
+            DaemonMsg::Attached { session, .. } => Some(session),
+            _ => None,
+        })?;
+        conn.writer.send(&ClientMsg::Detach)?;
+        Ok(session)
+    }
+
+    /// Stops any running local daemon and connects to a fresh one, which
+    /// serves even after the crash-loop breaker stopped the last ones.
+    pub fn restart(&self) -> Result<Connection, Error> {
+        restart(self.home()?, &self.staged, None)
+    }
+
+    /// Why a daemon speaking `theirs` cannot serve this client.
+    fn mismatch(&self, theirs: Versions) -> Error {
+        let (newer, host) = match &self.endpoint {
+            Endpoint::Local(home) => (
+                home.runtime()
+                    .current()
+                    .filter(|current| *current != self.staged.id)
+                    .map(|_| home.runtime().current_exe()),
+                None,
+            ),
+            Endpoint::Ssh(host) => (None, Some(host.clone())),
+        };
+        Error::Mismatch {
+            theirs,
+            newer,
+            host,
+        }
+    }
 }
 
 /// How long a daemon may take to answer the hello before it counts as wedged.
@@ -242,76 +453,10 @@ const START_TIMEOUT: Duration = Duration::from_secs(30);
 /// How long to wait for a draining daemon: its grace plus a margin.
 const DRAIN_TIMEOUT: Duration = Duration::from_secs(75);
 
-/// Connects as build `staged` and completes the hello. A daemon draining for
-/// a newer build is waited out (`on_drain` says so first), then the next
-/// attempt starts the new build. A local daemon that does not answer in time
-/// fails with `ErrorKind::TimedOut`; see [`diagnose`] and [`restart`].
-pub fn connect(
-    endpoint: &Endpoint,
-    staged: &Staged,
-    on_drain: &dyn Fn(),
-) -> io::Result<Connection> {
-    connect_with(endpoint, staged, None, on_drain, &|_| Ok(Vec::new()))
-}
-
-/// [`connect`], sending the messages `first` makes for the connection (an
-/// attach, say) right behind the hello rather than after the welcome, which
-/// saves a round trip. A daemon that does not welcome the client acts on
-/// none of them, so each retry sends them again. `client` names the client
-/// across its connections, so a mutation it sends again is done once.
-pub fn connect_with(
-    endpoint: &Endpoint,
-    staged: &Staged,
-    client: Option<ClientId>,
-    on_drain: &dyn Fn(),
-    first: &dyn Fn(&Connection) -> io::Result<Vec<ClientMsg>>,
-) -> io::Result<Connection> {
-    // A daemon exiting (idle) as we connect, or draining, gets one more try
-    // each.
-    for _ in 0..3 {
-        let (stream, mut conn) = match endpoint {
-            Endpoint::Local(home) => {
-                let (stream, started) = connect_or_spawn(home, false)?;
-                let timeout = if started {
-                    START_TIMEOUT
-                } else {
-                    HELLO_TIMEOUT
-                };
-                stream.set_read_timeout(Some(timeout))?;
-                let conn = split(&stream)?;
-                (Some(stream), conn)
-            }
-            Endpoint::Ssh(host) => (None, remote::open(host, staged)?),
-        };
-        let first = first(&conn)?;
-        match hello(&mut conn, &staged.id, client, &first) {
-            Ok(Greeting::Mismatch(supported)) => {
-                return Err(mismatch(endpoint, staged, supported));
-            }
-            Ok(Greeting::Welcome) => {
-                if let Some(stream) = &stream {
-                    stream.set_read_timeout(None)?;
-                }
-                return Ok(conn);
-            }
-            Ok(Greeting::Draining) => {
-                on_drain();
-                if let Some(stream) = &stream {
-                    stream.set_read_timeout(Some(DRAIN_TIMEOUT))?;
-                }
-                conn.reader.drained()?;
-            }
-            Err(e) if e.kind() == io::ErrorKind::UnexpectedEof => {}
-            Err(e) => return Err(e),
-        }
-    }
-    Err(io::Error::other("the daemon kept closing the connection"))
-}
-
 fn split(stream: &Stream) -> io::Result<Connection> {
     Ok(Connection {
         reader: Reader(BufReader::new(Box::new(stream.try_clone()?))),
-        writer: Writer::new(Box::new(stream.try_clone()?)),
+        writer: Writer(Box::new(stream.try_clone()?)),
         remote: None,
         welcome: Welcome::default(),
         commands: Vec::new(),
@@ -325,36 +470,13 @@ enum Greeting {
     Mismatch(Versions),
 }
 
-/// Why a daemon speaking another protocol cannot serve this client, and
-/// the fix. Staging never downgrades, so when a newer build is `current`,
-/// restarting the daemon would only start that build again: this `a` is
-/// the one to replace.
-fn mismatch(endpoint: &Endpoint, staged: &Staged, supported: Versions) -> io::Error {
-    let ours = &staged.id;
-    let mine = Versions::OURS;
-    let message = match endpoint {
-        Endpoint::Local(home) => match home.runtime().current() {
-            Some(current) if current != *ours => format!(
-                "the daemon runs a newer a ({current}, {supported}) than this one \
-                 ({ours}, {mine}); run {} instead, or update this a",
-                home.runtime().current_exe().display()
-            ),
-            _ => format!("the daemon speaks {supported}, this a {mine}; restart the daemon"),
-        },
-        Endpoint::Ssh(host) => {
-            format!("the daemon on {host} speaks {supported}, this a {mine}; update a on one side")
-        }
-    };
-    io::Error::new(io::ErrorKind::Unsupported, message)
-}
-
 /// Sends the hello and `first` back to back, then reads the answer.
 fn hello(
     conn: &mut Connection,
     build: &str,
     client: Option<ClientId>,
     first: &[ClientMsg],
-) -> io::Result<Greeting> {
+) -> Result<Greeting, Error> {
     conn.writer.send(&ClientMsg::Hello {
         proto: PROTO,
         build: build.to_owned(),
@@ -365,14 +487,7 @@ fn hello(
     // A daemon that refuses the hello may hang up before reading these, so
     // failing to send them matters only once welcomed.
     let sent = conn.send_all(first);
-    let reply = conn.reader.recv().map_err(|e| match e.kind() {
-        io::ErrorKind::WouldBlock | io::ErrorKind::TimedOut => {
-            io::Error::new(io::ErrorKind::TimedOut, "the daemon is not responding")
-        }
-        io::ErrorKind::ConnectionReset => io::ErrorKind::UnexpectedEof.into(),
-        _ => e,
-    })?;
-    match reply {
+    match conn.reader.recv()? {
         Some(DaemonMsg::Welcome {
             proto,
             caps,
@@ -389,8 +504,8 @@ fn hello(
             Ok(Greeting::Mismatch(Versions::new(min, supported)))
         }
         // A daemon refusing to serve at all, after a crash loop.
-        Some(DaemonMsg::Error { message }) => Err(io::Error::other(message)),
-        _ => Err(io::ErrorKind::UnexpectedEof.into()),
+        Some(DaemonMsg::Error { message }) => Err(Error::Refused(message)),
+        _ => Err(Error::Closed),
     }
 }
 
@@ -501,68 +616,75 @@ fn exited(home: &Home, within: Option<Duration>) -> bool {
     let Ok(file) = File::open(home.daemon_pid_file()) else {
         return true;
     };
+    locked(file, within).is_some()
+}
+
+/// Takes the lock on `file` once it is free, waiting no longer than
+/// `within`: on a helper thread, since a file lock has no timed wait. A
+/// lock taken after the wait is given up is let go at once.
+fn locked(file: File, within: Option<Duration>) -> Option<File> {
+    if file.try_lock().is_ok() {
+        return Some(file);
+    }
     let (tx, rx) = inbox();
     thread::spawn(move || {
-        // Taken only to learn that it is free.
-        let _ = tx.send(file.lock().is_ok());
+        if file.lock().is_ok() {
+            // Dropped, and so unlocked, when no one waits any more.
+            let _ = tx.send(file);
+        }
     });
     match within {
         Some(within) => rx.recv_timeout(within),
         None => rx.recv(),
     }
-    .unwrap_or(false)
 }
 
 /// Connects to the running daemon, as its own build `build` so as not to
 /// set off a drain, without starting one.
-fn reach(home: &Home, build: &str) -> io::Result<(Stream, Connection)> {
+fn reach(home: &Home, build: &str) -> Result<(Stream, Connection), Error> {
     let stream = home.endpoint().connect()?;
     stream.set_read_timeout(Some(HELLO_TIMEOUT))?;
     let mut conn = split(&stream)?;
     match hello(&mut conn, build, None, &[])? {
         Greeting::Welcome => Ok((stream, conn)),
-        _ => Err(io::Error::new(
-            io::ErrorKind::Unsupported,
-            "the daemon cannot be asked",
-        )),
+        _ => Err(Error::Refused("the daemon cannot be asked".to_owned())),
     }
 }
 
 /// Asks the daemon to stop, and waits for it to close the connection as
 /// it exits.
-fn ask_to_stop(home: &Home, build: &str) -> io::Result<()> {
+fn ask_to_stop(home: &Home, build: &str) -> Result<(), Error> {
     let (stream, mut conn) = reach(home, build)?;
     conn.writer.send(&ClientMsg::Shutdown)?;
     stream.set_read_timeout(Some(DRAIN_TIMEOUT))?;
-    conn.reader.drained()
+    Ok(conn.reader.drained()?)
 }
 
 /// What the running daemon says of itself, if one runs and answers; never
 /// starts one.
-pub fn status(home: &Home) -> io::Result<Option<Status>> {
+pub fn status(home: &Home) -> Result<Option<Status>, Error> {
     let Some(daemon) = live_daemon(home) else {
         return Ok(None);
     };
     let (_, mut conn) = reach(home, &daemon.build)?;
     conn.writer.send(&ClientMsg::Status)?;
-    conn.reader
-        .until(|msg| match msg {
-            DaemonMsg::Status {
-                pid,
-                build,
-                started,
-                clients,
-                known,
-            } => Some(Status {
-                pid,
-                build,
-                started,
-                clients,
-                sessions: known,
-            }),
-            _ => None,
-        })
-        .map(Some)
+    let status = conn.reader.until(|msg| match msg {
+        DaemonMsg::Status {
+            pid,
+            build,
+            started,
+            clients,
+            known,
+        } => Some(Status {
+            pid,
+            build,
+            started,
+            clients,
+            sessions: known,
+        }),
+        _ => None,
+    })?;
+    Ok(Some(status))
 }
 
 /// What a daemon says of itself; see [`status`].
@@ -580,11 +702,14 @@ pub struct Status {
 /// Stops any running daemon and connects to a fresh one, which serves even
 /// after the crash-loop breaker stopped the last ones; as `client`, if it
 /// is named.
-pub fn restart(home: &Home, staged: &Staged, client: Option<ClientId>) -> io::Result<Connection> {
+pub fn restart(
+    home: &Home,
+    staged: &Staged,
+    client: Option<ClientId>,
+) -> Result<Connection, Error> {
     stop(home)?;
     drop(connect_or_spawn(home, true)?);
-    let endpoint = Endpoint::Local(home.clone());
-    connect_with(&endpoint, staged, client, &|| {}, &|_| Ok(Vec::new()))
+    Daemon::local(home.clone(), staged.clone()).connect_as(client, &|| {}, &|_| Ok(Vec::new()))
 }
 
 /// Serves `ssh <host> a bridge`: connects to this machine's daemon, prints
@@ -603,15 +728,15 @@ pub fn bridge(home: &Home, token: &str) -> io::Result<()> {
     write_frame(&mut stdout, &env)?;
     let mut up = stream.try_clone()?;
     thread::spawn(move || {
-        let _ = pump(io::stdin().lock(), &mut up);
+        let _ = copy(io::stdin().lock(), &mut up);
         std::process::exit(0);
     });
-    pump(&stream, stdout)
+    copy(&stream, stdout)
 }
 
 /// Copies until EOF, flushing each read: stdout is line-buffered and frames
 /// are not lines.
-fn pump(mut from: impl Read, mut to: impl Write) -> io::Result<()> {
+fn copy(mut from: impl Read, mut to: impl Write) -> io::Result<()> {
     let mut buf = vec![0; 64 * 1024];
     loop {
         let n = from.read(&mut buf)?;
@@ -640,6 +765,12 @@ const DAEMON_ENV: &[&str] = &[
 /// that daemon reaps a dead predecessor or refuses to serve after a crash
 /// loop (`reset` clears the loop first). Says whether it started that
 /// daemon.
+///
+/// Nothing is polled. One client starts the daemon at a time, under
+/// `start.lock`, and lets go once the socket is bound: the others wait on
+/// that lock, then find the socket. A daemon lock held while no socket
+/// listens is then an exiting daemon's (let go as it ends) or a wedged
+/// one's, and is waited on for as long as a hello may take.
 fn connect_or_spawn(home: &Home, reset: bool) -> io::Result<(Stream, bool)> {
     use std::process::{Command, Stdio};
     use sys::Pass;
@@ -650,30 +781,30 @@ fn connect_or_spawn(home: &Home, reset: bool) -> io::Result<(Stream, bool)> {
     }
 
     sys::fs::private_dir(&home.run_dir())?;
-    let lock = File::options()
-        .create(true)
-        .truncate(false)
-        .read(true)
-        .write(true)
-        .open(home.daemon_pid_file())?;
-    // Held: a daemon is starting, and binds before it does, or exiting, and
-    // unlinks the socket first. Only one wedged between the two keeps it.
-    let deadline = Instant::now() + HELLO_TIMEOUT;
-    while let Err(held) = lock.try_lock() {
-        if let fs::TryLockError::Error(e) = held {
-            return Err(e);
-        }
-        if let Ok(stream) = endpoint.connect() {
-            return Ok((stream, false));
-        }
-        if Instant::now() >= deadline {
-            return Err(io::Error::new(
-                io::ErrorKind::TimedOut,
-                "the daemon holds its lock but is not listening",
-            ));
-        }
-        thread::sleep(Duration::from_millis(5));
+    let open = |name: PathBuf| {
+        File::options()
+            .create(true)
+            .truncate(false)
+            .read(true)
+            .write(true)
+            .open(name)
+    };
+    let wedged = |what: &str| {
+        io::Error::new(
+            io::ErrorKind::TimedOut,
+            format!("{what} holds its lock but the daemon is not listening"),
+        )
+    };
+    let _starting = locked(
+        open(home.run_dir().join("start.lock"))?,
+        Some(HELLO_TIMEOUT),
+    )
+    .ok_or_else(|| wedged("another client"))?;
+    if let Ok(stream) = endpoint.connect() {
+        return Ok((stream, false));
     }
+    let lock = locked(open(home.daemon_pid_file())?, Some(HELLO_TIMEOUT))
+        .ok_or_else(|| wedged("the daemon"))?;
 
     let listener = home.bind()?;
     let (listen_fd, lock_fd) = (listener.passed(), lock.passed());
@@ -720,16 +851,26 @@ mod tests {
         // Built later, so newer.
         thread::sleep(Duration::from_millis(20));
         let new = build("new");
-        let local = Endpoint::Local(home.clone());
 
-        let told = mismatch(&local, &old, (PROTO + 1).into()).to_string();
+        let theirs = Versions::from(PROTO + 1);
+        let told = Daemon::local(home.clone(), old).mismatch(theirs);
         let current = home.runtime().current_exe();
+        assert_eq!(
+            told,
+            Error::Mismatch {
+                theirs,
+                newer: Some(current.clone()),
+                host: None
+            }
+        );
+        let told = told.to_string();
         assert!(
-            told.contains(&new.id) && told.contains(&*current.to_string_lossy()),
+            told.contains(&*current.to_string_lossy()) && !told.contains("restart"),
             "{told}"
         );
-        assert!(!told.contains("restart"), "{told}");
-        let told = mismatch(&local, &new, (PROTO + 1).into()).to_string();
+        let told = Daemon::local(home.clone(), new)
+            .mismatch(theirs)
+            .to_string();
         assert!(told.contains("restart the daemon"), "{told}");
         fs::remove_dir_all(&root).unwrap();
     }
@@ -763,5 +904,23 @@ mod tests {
             let e = stopped.unwrap_err().to_string();
             assert!(e.contains("no longer the daemon"), "{e}");
         }
+    }
+
+    #[test]
+    fn a_lock_let_go_after_the_wait_is_not_kept() {
+        let (root, home) = scratch("lock-wait");
+        let path = home.daemon_pid_file();
+        fs::write(&path, "").unwrap();
+        let held = File::open(&path).unwrap();
+        held.lock().unwrap();
+        // Held throughout the wait: nothing is taken.
+        let waited = File::open(&path).unwrap();
+        assert!(locked(waited, Some(Duration::from_millis(50))).is_none());
+        // Let go afterwards: the helper that was still waiting takes it and
+        // drops it, so the next taker is not kept out.
+        drop(held);
+        let taken = locked(File::open(&path).unwrap(), Some(Duration::from_millis(500)));
+        assert!(taken.is_some());
+        fs::remove_dir_all(&root).unwrap();
     }
 }

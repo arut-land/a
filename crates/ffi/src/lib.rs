@@ -7,8 +7,9 @@
 //! renders it. Its updates arrive as a stream that drops items when its
 //! buffer is full, so each carries a `rev`: a client that sees a gap asks
 //! [`Session::resync`] for what it missed, or a fresh snapshot. Each update
-//! also carries the turn as the SDK computes it ([`TurnInfo`]), and each
-//! tool call its [`CallPhase`], so no rule is copied into Swift.
+//! also carries the turn as the SDK computes it ([`TurnInfo`]), the call
+//! whose reply is streaming, and each tool call its [`CallPhase`], so no
+//! rule is copied into Swift.
 
 mod feed;
 mod live;
@@ -17,7 +18,7 @@ use std::fmt;
 use std::io;
 
 use boltffi::{data, error};
-use client::{End, Link, SessionClient, TurnView};
+use client::{End, Link, Notice, SessionClient, TurnView};
 use protocol::view::{
     Approval, Change, Item, Part, Phase, Recap, SessionView, Status, call_title, decision_line,
     output_text, recap_line,
@@ -41,10 +42,21 @@ pub enum ClientError {
     NotResponding {
         message: String,
     },
+    /// The daemon speaks another protocol. With `newer`, a newer `a` is
+    /// staged and running it is the fix; without, updating one side is.
+    Mismatch {
+        message: String,
+        newer: Option<String>,
+    },
     /// The connection is gone; open the session again.
     Closed,
     /// The session is not open: not yet, or no longer.
     NotOpen,
+    /// The session does not take this now: a steer or an interrupt while
+    /// nothing runs, an answer for a call that is not asking.
+    NotOffered {
+        message: String,
+    },
     /// A message from the daemon, or one handed in, did not decode.
     Protocol {
         message: String,
@@ -60,8 +72,10 @@ impl ClientError {
         match self {
             Self::Unavailable { .. } => "unavailable",
             Self::NotResponding { .. } => "not_responding",
+            Self::Mismatch { .. } => "mismatch",
             Self::Closed => "closed",
             Self::NotOpen => "not_open",
+            Self::NotOffered { .. } => "not_offered",
             Self::Protocol { .. } => "protocol",
             Self::InvalidArgument { .. } => "invalid_argument",
         }
@@ -73,7 +87,9 @@ impl fmt::Display for ClientError {
         match self {
             Self::Unavailable { message }
             | Self::NotResponding { message }
+            | Self::Mismatch { message, .. }
             | Self::Protocol { message }
+            | Self::NotOffered { message }
             | Self::InvalidArgument { message } => f.write_str(message),
             Self::Closed => f.write_str("the connection to the daemon closed"),
             Self::NotOpen => f.write_str("the session is not open"),
@@ -83,6 +99,34 @@ impl fmt::Display for ClientError {
 
 impl std::error::Error for ClientError {}
 
+impl From<client::Error> for ClientError {
+    fn from(e: client::Error) -> Self {
+        let message = e.to_string();
+        match e {
+            client::Error::Mismatch { newer, .. } => Self::Mismatch {
+                message,
+                newer: newer.map(|p| p.display().to_string()),
+            },
+            client::Error::NotResponding => Self::NotResponding { message },
+            client::Error::Closed => Self::Closed,
+            client::Error::Refused(_) | client::Error::Io(..) => Self::Unavailable { message },
+        }
+    }
+}
+
+impl From<Notice> for ClientError {
+    fn from(notice: Notice) -> Self {
+        match notice {
+            Notice::NotConnected | Notice::NotSent(_) => Self::NotOpen,
+            notice => Self::NotOffered {
+                message: notice.to_string(),
+            },
+        }
+    }
+}
+
+/// For what the connection answers with `io::Error` still: settings and
+/// the CLI link.
 impl From<io::Error> for ClientError {
     fn from(e: io::Error) -> Self {
         let message = e.to_string();
@@ -117,7 +161,7 @@ pub struct SessionInfo {
     pub requires_action: bool,
 }
 
-/// The daemon's sessions, oldest first, as a [`SessionWatch`] sees them
+/// The daemon's sessions, newest first, as a [`SessionWatch`] sees them
 /// change; or, while it cannot reach the daemon, why.
 #[data]
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -163,6 +207,23 @@ impl From<protocol::HomeSettings> for Settings {
                 .env
                 .into_iter()
                 .map(|(name, value)| EnvVar { name, value })
+                .collect(),
+        }
+    }
+}
+
+/// As the pane shows it: names trimmed, blank rows skipped. The daemon,
+/// the one writer, refuses a name a shell could not export.
+impl From<Settings> for protocol::HomeSettings {
+    fn from(s: Settings) -> Self {
+        Self {
+            model: s.model,
+            agent: s.agent,
+            env: s
+                .env
+                .into_iter()
+                .map(|EnvVar { name, value }| (name.trim().to_owned(), value))
+                .filter(|(name, _)| !name.is_empty())
                 .collect(),
         }
     }
@@ -238,6 +299,9 @@ pub struct ViewUpdate {
     pub change: ViewChange,
     /// The turn after this update.
     pub turn: TurnInfo,
+    /// The call whose reply is streaming in after this update: the text
+    /// shown for it is the deltas since it became this.
+    pub streaming: Option<u64>,
     /// The session's title after this update, once its model named it.
     pub title: Option<String>,
 }
@@ -254,8 +318,8 @@ pub struct TurnInfo {
     /// The oldest call waiting for this client's approval.
     pub asking: Option<u64>,
     pub asks: u32,
+    /// An interrupt has something to stop, and a steer a turn to reach.
     pub can_interrupt: bool,
-    pub can_steer: bool,
     pub can_send: bool,
 }
 
@@ -266,7 +330,6 @@ impl From<TurnView> for TurnInfo {
             asking: t.asking,
             asks: t.asks,
             can_interrupt: t.can_interrupt,
-            can_steer: t.can_steer,
             can_send: t.can_send,
         }
     }
@@ -328,7 +391,7 @@ pub(crate) fn commands(daemon: &[CommandInfo]) -> Vec<CommandHelp> {
         .collect()
 }
 
-/// See [`protocol::view::Change`]; items are upserted whole by index.
+/// See [`protocol::view::Change`]: an item is added whole, then patched.
 #[data]
 #[derive(Clone, Debug, PartialEq)]
 pub enum ViewChange {
@@ -342,10 +405,10 @@ pub enum ViewChange {
         index: u32,
         item: ViewItem,
     },
+    /// The item at `index` changed as `patch` says; the rest of it stands.
     Updated {
         index: u32,
-        item: ViewItem,
-        part: ItemPart,
+        patch: ItemPatch,
     },
     /// Live text for the reply of `call`.
     Delta {
@@ -491,12 +554,35 @@ pub enum ApprovalState {
     Denied,
 }
 
+/// What changed in an item; see [`protocol::view::Part`]. A call's phase
+/// comes with the part that moved it.
 #[data]
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum ItemPart {
-    Outcome,
-    Approval,
-    Watch,
+#[derive(Clone, Debug, PartialEq)]
+pub enum ItemPatch {
+    /// A tool's, a command's or a child's outcome, with how the tool
+    /// presents the call now: its card, and its title (which follows the
+    /// card).
+    Outcome {
+        outcome: ToolOutcome,
+        title: String,
+        card: Option<ToolCard>,
+        phase: CallPhase,
+    },
+    /// A reply's text and status, with what its model call used.
+    Reply {
+        text: String,
+        status: ReplyStatus,
+        usage: Option<TokenUsage>,
+    },
+    Approval {
+        approval: ApprovalState,
+        phase: CallPhase,
+    },
+    /// A child's watch, fired or not.
+    Watch { watch: Option<u64> },
+    /// The item as it is now: a typed line became the slash command it
+    /// ran, which then got its outcome.
+    Command { item: ViewItem },
 }
 
 #[data]
@@ -556,9 +642,12 @@ pub enum LinkState {
         crash: Option<String>,
     },
     Detached,
-    /// The daemon is gone; open the session anew to go on.
+    /// The daemon is gone, or would not serve this build; open the
+    /// session anew to go on. With `newer`, a newer `a` is staged and
+    /// running it is the fix.
     Lost {
         message: String,
+        newer: Option<String>,
     },
 }
 
@@ -573,7 +662,7 @@ impl From<&Link> for LinkState {
     fn from(link: &Link) -> Self {
         match link {
             Link::Connecting => Self::Connecting,
-            Link::Live { synced: false, .. } => Self::Replaying,
+            Link::Replaying { .. } => Self::Replaying,
             Link::Live { .. } => Self::Live,
             Link::Draining => Self::Draining,
             Link::Reconnecting { .. } => Self::Reconnecting,
@@ -583,8 +672,14 @@ impl From<&Link> for LinkState {
                 crash: d.crash_note(),
             },
             Link::Ended(End::Detached) => Self::Detached,
-            Link::Ended(End::Lost(message)) => Self::Lost {
-                message: message.clone(),
+            Link::Ended(End::Lost(why)) => Self::Lost {
+                message: why.to_string(),
+                newer: match why {
+                    client::Error::Mismatch { newer, .. } => {
+                        newer.as_ref().map(|p| p.display().to_string())
+                    }
+                    _ => None,
+                },
             },
         }
     }
@@ -656,12 +751,7 @@ impl ViewChange {
                 part,
             } => Self::Updated {
                 index: index(*i),
-                item: item.into(),
-                part: match part {
-                    Part::Outcome => ItemPart::Outcome,
-                    Part::Approval => ItemPart::Approval,
-                    Part::Watch => ItemPart::Watch,
-                },
+                patch: ItemPatch::of(item, *part),
             },
             Change::Delta { call, text } => Self::Delta {
                 call: *call,
@@ -680,6 +770,115 @@ impl ViewChange {
             Change::Error { message } => Self::Error {
                 message: message.clone(),
             },
+        }
+    }
+}
+
+impl ItemPatch {
+    /// What `part` of `item` is now.
+    fn of(item: &Item, part: Part) -> Self {
+        let phase = || item.phase().map_or(CallPhase::Running, Into::into);
+        match (item, part) {
+            (
+                Item::Tool {
+                    by: protocol::Audience::User,
+                    ..
+                },
+                _,
+            ) => Self::Command { item: item.into() },
+            (
+                Item::Tool {
+                    approval: Some(approval),
+                    ..
+                },
+                Part::Approval,
+            ) => Self::Approval {
+                approval: (*approval).into(),
+                phase: phase(),
+            },
+            (Item::Child { watch, .. }, Part::Watch) => Self::Watch { watch: *watch },
+            (
+                Item::Reply {
+                    text,
+                    status,
+                    usage,
+                    ..
+                },
+                Part::Outcome,
+            ) => Self::Reply {
+                text: text.clone(),
+                status: status.into(),
+                usage: usage.map(Into::into),
+            },
+            (
+                Item::Tool {
+                    tool,
+                    input,
+                    outcome,
+                    card,
+                    ..
+                },
+                _,
+            ) => Self::Outcome {
+                outcome: outcome
+                    .as_ref()
+                    .map_or(ToolOutcome::Interrupted, |o| tool_outcome(o, card.as_ref())),
+                title: call_title(tool, input, card.as_ref()),
+                card: card.as_ref().map(Into::into),
+                phase: phase(),
+            },
+            (Item::Child { fired, .. }, _) => Self::Outcome {
+                outcome: fired
+                    .as_ref()
+                    .map_or(ToolOutcome::Interrupted, |o| tool_outcome(o, None)),
+                title: String::new(),
+                card: None,
+                phase: phase(),
+            },
+            // Nothing else is ever updated.
+            (item, part) => unreachable!("{part:?} of {item:?}"),
+        }
+    }
+}
+
+impl From<Approval> for ApprovalState {
+    fn from(a: Approval) -> Self {
+        match a {
+            Approval::Pending => Self::Pending,
+            Approval::Approved => Self::Approved,
+            Approval::Denied => Self::Denied,
+        }
+    }
+}
+
+impl From<&Status> for ReplyStatus {
+    fn from(s: &Status) -> Self {
+        match s {
+            Status::Running => Self::Running,
+            Status::Done => Self::Done,
+            Status::Failed { error } => Self::Failed {
+                error: error.clone(),
+            },
+            Status::Interrupted => Self::Interrupted,
+        }
+    }
+}
+
+impl From<protocol::view::Usage> for TokenUsage {
+    fn from(u: protocol::view::Usage) -> Self {
+        Self {
+            input: u.input,
+            output: u.output,
+        }
+    }
+}
+
+impl From<&Card> for ToolCard {
+    fn from(c: &Card) -> Self {
+        Self {
+            title: c.title.clone(),
+            body: c.body.clone(),
+            note: c.note.clone(),
         }
     }
 }
@@ -716,18 +915,8 @@ impl From<&Item> for ViewItem {
                 call: *call,
                 model: model.clone(),
                 text: text.clone(),
-                status: match status {
-                    Status::Running => ReplyStatus::Running,
-                    Status::Done => ReplyStatus::Done,
-                    Status::Failed { error } => ReplyStatus::Failed {
-                        error: error.clone(),
-                    },
-                    Status::Interrupted => ReplyStatus::Interrupted,
-                },
-                usage: usage.map(|u| TokenUsage {
-                    input: u.input,
-                    output: u.output,
-                }),
+                status: status.into(),
+                usage: usage.map(Into::into),
                 purpose: purpose.clone(),
             },
             // The app shows a slash command apart from a tool.
@@ -752,17 +941,9 @@ impl From<&Item> for ViewItem {
                 tool: tool.clone(),
                 input_json: input.to_string(),
                 title: call_title(tool, input, card.as_ref()),
-                approval: approval.map(|a| match a {
-                    Approval::Pending => ApprovalState::Pending,
-                    Approval::Approved => ApprovalState::Approved,
-                    Approval::Denied => ApprovalState::Denied,
-                }),
+                approval: approval.map(Into::into),
                 outcome: outcome.as_ref().map(|o| tool_outcome(o, card.as_ref())),
-                card: card.as_ref().map(|c| ToolCard {
-                    title: c.title.clone(),
-                    body: c.body.clone(),
-                    note: c.note.clone(),
-                }),
+                card: card.as_ref().map(Into::into),
                 phase: item.phase().map_or(CallPhase::Running, Into::into),
             },
 

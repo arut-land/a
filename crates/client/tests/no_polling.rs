@@ -6,12 +6,11 @@
 //! it measures is its own.
 #![cfg(unix)]
 
-use std::io;
 use std::process::Command;
 use std::time::{Duration, Instant};
 use std::{fs, process};
 
-use client::{Endpoint, HELLO_TIMEOUT};
+use client::{Daemon, Error, HELLO_TIMEOUT};
 use protocol::{ClientMsg, read_frame};
 use sys::Home;
 
@@ -27,13 +26,14 @@ fn a_daemon_that_never_accepts_is_waited_on_without_spinning() {
     let listener = home.bind().unwrap();
 
     let (start, cpu) = (Instant::now(), cpu_time());
-    let err = client::connect(&Endpoint::Local(home.clone()), &staged, &|| {})
+    let err = Daemon::local(home.clone(), staged)
+        .connect(&|| {})
         .err()
         .expect("nothing answers the hello");
     let (waited, used) = (start.elapsed(), cpu_time().saturating_sub(cpu));
     eprintln!("waited {waited:?} for the hello, using {used:?} of CPU");
 
-    assert_eq!(err.kind(), io::ErrorKind::TimedOut, "{err}");
+    assert_eq!(err, Error::NotResponding);
     // One wait, not a retry loop or a spawn.
     assert!(
         waited >= HELLO_TIMEOUT && waited < HELLO_TIMEOUT + Duration::from_millis(500),
@@ -49,7 +49,7 @@ fn a_daemon_that_never_accepts_is_waited_on_without_spinning() {
     assert!(matches!(hello, Some(ClientMsg::Hello { .. })), "{hello:?}");
     assert_eq!(
         listener.accept().err().map(|e| e.kind()),
-        Some(io::ErrorKind::WouldBlock)
+        Some(std::io::ErrorKind::WouldBlock)
     );
     home.endpoint().remove();
     fs::remove_dir_all(&root).unwrap();

@@ -104,9 +104,11 @@ crates, three of them proc-macros, for `Buffer`, `Cell` and `Style`.
   clickable span landed (an overlay makes the transcript's inert).
 - `Screen` writes the changed cells: cursor moves only where the next cell
   is not where the cursor is, one SGR per style change, inside a
-  synchronized update (`?2026`), as one `write(2)` per frame. A frame that
-  changed no cell and moved no cursor (an ack, a session list while no
-  picker is open) writes nothing, not even the envelope.
+  synchronized update (`?2026`), as one `write(2)` per frame. The event
+  loop draws only when the app owes a frame (`App::needs_frame`: a view
+  change, a key, the link moving), so an ack, or a session list while no
+  picker is open, is not even composed; a frame that still changed no cell
+  and moved no cursor writes nothing, not even the envelope.
 - The rows under the transcript (recap, approval bar, notice, input,
   status) and the overlay are composed once per frame: inline, `height`
   composes them to size the viewport and `draw` draws the same ones.
@@ -136,8 +138,9 @@ crates, three of them proc-macros, for `Buffer`, `Cell` and `Style`.
   did.
 - The terminal is restored on exit, on a panic (a hook), when stdin
   closes, and on SIGTERM or SIGHUP.
-- The first frame is painted before the daemon is reached; connecting (and
-  spawning the daemon) happens on the reader thread. An ssh endpoint
+- The first frame is painted before the daemon is reached and before the
+  repository root is walked up to for the picker's default; connecting
+  (and spawning the daemon) happens on the reader thread. An ssh endpoint
   connects first, since ssh may prompt on the terminal.
 - Unix only, like the daemon: on Windows `tui` builds to a stub and `a`
   runs the line REPL.
