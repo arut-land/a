@@ -296,27 +296,16 @@ impl Live {
         open: Open,
         owner: Owner,
     ) -> io::Result<Arc<Self>> {
-        let base = shared.registry.get();
         let source = shared.source(&header.workspace)?;
         let generation = source.as_ref().map_or_else(
             || shared.registry.generation(),
             |source| source.generation(),
         );
-        let registry = source.as_ref().map_or(base, |source| source.registry());
+        let registry = source
+            .as_ref()
+            .map_or_else(|| shared.registry.get(), |s| s.registry());
         let (tx, rx) = channel::unbounded();
-        let session = Arc::new(Session {
-            fence: AtomicU64::new(0),
-            id: header.id,
-            workspace: Arc::from(header.workspace.as_path()),
-            spill: Arc::from(shared.spill.join(header.id.to_string())),
-            mail: Arc::new(tx),
-            states: Mutex::new(Arc::new(Mutex::new(registry.states()))),
-            env: Mutex::default(),
-            jobs: Mutex::default(),
-            cancels: Mutex::default(),
-            changed: rt::Notify::new(),
-            shared: Arc::clone(shared),
-        });
+        let session = Session::new(header, shared, Arc::new(tx), &registry);
         let bound = bind(&registry, &session);
         let binding = Arc::clone(&bound) as Arc<dyn Binding>;
         let (mut loaded, folding) = Folding::open(header, shared, open, &binding, &registry)?;
@@ -751,7 +740,7 @@ impl Actor {
     }
 
     async fn refresh(&mut self) -> Result<(), ()> {
-        if !self.core.at_rest() {
+        if self.phase != Phase::Serving || !self.core.at_rest() {
             return Ok(());
         }
         let shared = &self.live.session.shared;
@@ -762,8 +751,15 @@ impl Actor {
         if number == self.generation {
             return Ok(());
         }
+        // A generation cannot divide a prefix whose epoch still owns completion.
+        if self.durable_seq < self.ordered_seq || !self.flushes.is_empty() {
+            self.sync().await?;
+            if self.durable_seq < self.ordered_seq || !self.flushes.is_empty() {
+                return Ok(());
+            }
+        }
         self.generation = number;
-        let shared = Arc::clone(shared);
+        let shared = Arc::clone(&self.live.session.shared);
         let newest = self
             .source
             .as_ref()
@@ -822,9 +818,15 @@ impl Actor {
                 if current != number {
                     return Ok(());
                 }
-                *lock(&self.live.session.states) = Arc::new(Mutex::new(states));
+                let session = &self.live.session;
+                session.fence.fetch_add(1, Ordering::SeqCst);
+                session.cancel_all();
+                lock(&session.cancels).clear();
+                self.reactions_cancel.set();
+                self.reactions_cancel = Cancel::default();
+                *lock(&session.states) = Arc::new(Mutex::new(states));
+                self.bound = bind(&newest, session);
                 self.registry = newest;
-                self.bound = bound;
                 self.step([Event::Registry(Arc::clone(&self.bound) as Arc<dyn Binding>)])
                     .await
             }
@@ -852,6 +854,7 @@ impl Actor {
             {
                 if fence == self.live.session.fence.load(Ordering::SeqCst) {
                     self.completed(through, result).await;
+                    let _ = self.refresh().await;
                     self.publish();
                     self.live.session.changed.notify();
                 }
@@ -2366,6 +2369,22 @@ impl Live {
 }
 
 impl Session {
+    fn new(header: &Header, shared: &Arc<Shared>, mail: Mail, registry: &Registry) -> Arc<Self> {
+        Arc::new(Self {
+            fence: AtomicU64::new(0),
+            id: header.id,
+            workspace: Arc::from(header.workspace.as_path()),
+            spill: Arc::from(shared.spill.join(header.id.to_string())),
+            mail,
+            states: Mutex::new(Arc::new(Mutex::new(registry.states()))),
+            env: Mutex::default(),
+            jobs: Mutex::default(),
+            cancels: Mutex::default(),
+            changed: rt::Notify::new(),
+            shared: Arc::clone(shared),
+        })
+    }
+
     fn emit(&self, fence: u64, msg: Msg) {
         let _ = self.mail.send(Msg::Fenced {
             fence,

@@ -822,3 +822,106 @@ fn submitted_input_is_cancelled_while_its_publication_flush_is_held() {
     settle(&session);
     session.halt();
 }
+
+#[derive(Default, serde::Serialize, serde::Deserialize)]
+struct AdoptionTotal(u64);
+impl ext::Fold for AdoptionTotal {
+    const NAME: &'static str = "total";
+    type Change = u64;
+    fn apply(&mut self, change: &u64) {
+        self.0 += change;
+    }
+}
+struct AdoptionState;
+impl Extension for AdoptionState {
+    const NAME: &'static str = "adoption";
+    const VERSION: u32 = 1;
+    fn contribute(&self, r: &mut Registrar) {
+        r.fold::<AdoptionTotal>();
+    }
+}
+
+#[test]
+fn registry_adoption_waits_for_rest_and_the_complete_durable_prefix() {
+    let (started, starts) = channel::unbounded();
+    let registry = Registry::default()
+        .with(&HeldHarbor(Arc::new(started)))
+        .unwrap()
+        .with(&AdoptionState)
+        .unwrap();
+    let (fixture, faulty, script) = pipeline(registry);
+    let session = fixture.create();
+    settle(&session);
+    let old = session.session.state_view();
+    let old_registry = fixture.0.registry.get();
+    let old_bound = bind(&old_registry, &session.session);
+    let fence = session.session.fence.load(Ordering::SeqCst);
+    let flush = faulty.hold_next_flush();
+    let ack = enqueue(&session, "hello");
+    flush.started();
+    let (cx, release) = started_harbor(&starts);
+    let first = cx.update::<AdoptionTotal>(&1);
+    let _ = positions(&session);
+    fixture.0.registry.replace(
+        Registry::default()
+            .with(&Agents)
+            .unwrap()
+            .with(&Harbor)
+            .unwrap()
+            .with(&AdoptionState)
+            .unwrap(),
+    );
+    let second = cx.update::<AdoptionTotal>(&1);
+    let _ = positions(&session);
+    assert!(
+        Arc::ptr_eq(&old, &session.session.state_view()),
+        "a running turn keeps its generation"
+    );
+    release.send("finished".into());
+    session.wait("speculative turn at rest", PATIENCE, || {
+        lock(&script.sent).len() == 2 && !session.has_work()
+    });
+    let (ordered, durable) = positions(&session);
+    assert!(
+        ordered > durable,
+        "the test must retain an unpublished suffix"
+    );
+    assert_eq!(lock(&old).get::<AdoptionTotal>().unwrap().0, 2);
+    assert!(
+        Arc::ptr_eq(&old, &session.session.state_view()),
+        "rest cannot split an outstanding flush epoch"
+    );
+    assert_eq!(session.session.fence.load(Ordering::SeqCst), fence);
+    flush.release();
+    assert_eq!(rt::block_on(ack), Some(Ok(())));
+    rt::block_on(first);
+    rt::block_on(second);
+    session.wait("generation adopted", PATIENCE, || {
+        !Arc::ptr_eq(&old, &session.session.state_view())
+    });
+    let (after_ordered, after_durable) = positions(&session);
+    assert!(
+        after_ordered >= ordered && after_durable >= ordered,
+        "adoption preserves admission watermarks"
+    );
+    assert_eq!(
+        lock(&session.session.state_view())
+            .get::<AdoptionTotal>()
+            .unwrap()
+            .0,
+        2,
+        "ordered reductions replay exactly once"
+    );
+    assert!(
+        old_bound.point().about(cx.call).cx().is_none(),
+        "old generation views cannot mint new context authority"
+    );
+    cx.progress("stale generation");
+    let _ = positions(&session);
+    assert!(!log_of(&session).iter().any(|e| {
+        serde_json::to_string(e)
+            .unwrap()
+            .contains("stale generation")
+    }));
+    session.halt();
+}
