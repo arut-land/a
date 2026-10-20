@@ -472,7 +472,9 @@ impl ToolCall {
             #[serde(borrow)]
             input: Option<&'a serde_json::value::RawValue>,
         }
-        self.input.parse::<Custom<'_>>().ok()?.input
+        serde_json::from_str::<Custom<'_>>(self.input.raw())
+            .ok()?
+            .input
     }
 }
 
