@@ -141,8 +141,6 @@ impl Driver {
                     .cancelled
                     .fetch_max(self.0.latest.load(Ordering::Acquire), Ordering::AcqRel);
                 if let Some((_, mut writer)) = slot.take() {
-                    // Detach makes both local daemons and remote bridges close
-                    // their sending half, releasing an already blocked reader.
                     let _ = writer.send(&ClientMsg::Detach);
                 }
                 Ok(())
@@ -175,13 +173,7 @@ impl Driver {
                 }),
             _ => daemon.connect_as(client, &on_drain, &first),
         };
-        let Connection {
-            mut reader,
-            mut writer,
-            remote,
-            welcome,
-            commands,
-        } = match made {
+        let connection = match made {
             Ok(c) => c,
             Err(e) => {
                 return sink(match &daemon.endpoint {
@@ -192,6 +184,18 @@ impl Driver {
                 });
             }
         };
+        self.install(conn, connection);
+    }
+
+    fn install(&self, conn: ConnId, connection: Connection) {
+        let sink = |kind| (self.0.sink)(self, Event { conn, kind });
+        let Connection {
+            mut reader,
+            mut writer,
+            remote,
+            welcome,
+            commands,
+        } = connection;
         {
             let mut slot = lock(&self.0.writer);
             // Replaced while it was being made.
@@ -229,6 +233,7 @@ impl Driver {
                     Err(e) => break e.into(),
                 }
             };
+            drop(reader);
             {
                 let mut slot = lock(&driver.0.writer);
                 if slot.as_ref().is_some_and(|(c, _)| *c == conn) {
@@ -353,7 +358,7 @@ mod tests {
         )
         .unwrap();
         ready.recv().unwrap();
-        write_frame(&mut peer, &DaemonMsg::Ack { client_seq: 99 }).unwrap();
+        let _ = write_frame(&mut peer, &DaemonMsg::Ack { client_seq: 99 });
         release.send(()).unwrap();
         opening.join().unwrap();
         drop(peer);
@@ -363,6 +368,76 @@ mod tests {
         drop(listener);
         home.endpoint().remove();
         std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn hangup_releases_the_reader_without_peer_cooperation() {
+        use protocol::{DaemonMsg, read_frame, write_frame};
+        use std::io::Read;
+        use std::sync::mpsc;
+        use sys::Home;
+
+        struct Released(mpsc::Sender<()>);
+        impl Drop for Released {
+            fn drop(&mut self) {
+                let _ = self.0.send(());
+            }
+        }
+        let root = std::env::temp_dir().join(format!("a-reader-hangup-{:?}", ClientId::new()));
+        std::fs::create_dir_all(&root).unwrap();
+        let home = Home::from(root.join("home"));
+        let exe = root.join("a");
+        std::fs::write(&exe, "never run").unwrap();
+        let listener = home.bind().unwrap();
+        let staged = home.runtime().stage(&exe).unwrap();
+        let (read, reading) = mpsc::channel();
+        let (resume, resumed) = mpsc::channel();
+        let resumed = Mutex::new(resumed);
+        let (released, gone) = mpsc::channel();
+        let released = Released(released);
+        let driver = Driver::new(Daemon::local(home.clone(), staged), move |_, event| {
+            let _keep = &released;
+            if matches!(event.kind, EventKind::Msg(DaemonMsg::Ack { .. })) {
+                read.send(()).unwrap();
+                lock(&resumed).recv().unwrap();
+            }
+        });
+        let weak = Arc::downgrade(&driver.0);
+        let mut probe = home.endpoint().connect().unwrap();
+        let mut peer = listener.accept().unwrap();
+        let connection = crate::split(&probe).unwrap();
+        driver.0.latest.store(1, Ordering::Release);
+        let opener = driver.clone();
+        let opening = thread::spawn(move || opener.install(ConnId(1), connection));
+        write_frame(&mut peer, &DaemonMsg::Ack { client_seq: 99 }).unwrap();
+        reading.recv().unwrap();
+        opening.join().unwrap();
+        driver.io(Io::Hangup).unwrap();
+        assert!(matches!(
+            read_frame::<ClientMsg>(&mut peer).unwrap(),
+            Some(ClientMsg::Detach)
+        ));
+        // Inspect our read side while the installed reader is paused in its sink.
+        probe.set_nonblocking(true).unwrap();
+        let shutdown = matches!(probe.read(&mut [0]), Ok(0));
+        probe.set_nonblocking(false).unwrap();
+        drop(probe);
+        let mut peer = Some(peer);
+        if !shutdown {
+            drop(peer.take());
+        }
+        drop(driver);
+        resume.send(()).unwrap();
+        gone.recv().unwrap();
+        assert!(weak.upgrade().is_none());
+        if let Some(peer) = &mut peer {
+            assert!(read_frame::<ClientMsg>(peer).unwrap().is_none());
+        }
+        drop(peer);
+        drop(listener);
+        home.endpoint().remove();
+        std::fs::remove_dir_all(root).unwrap();
+        assert!(shutdown, "hangup left the local read half open");
     }
 
     /// A renderer that asks for one more thing the first time it is shown

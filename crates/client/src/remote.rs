@@ -2,15 +2,14 @@
 //! `A_SCP` overrides `scp`). Installs this build on a host that lacks `a`.
 
 use std::ffi::OsString;
-use std::io::{self, BufRead, BufReader, Read};
-use std::process::{Command, Stdio};
-use std::thread;
+use std::io::{self, BufRead, BufReader, Read, Write};
+use std::process::{Child, ChildStdin, Command, Stdio};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use protocol::{ClientMsg, read_frame};
 use sys::Staged;
 
-use crate::{Connection, Reader, Welcome, Writer};
+use crate::{Connection, Reader, Welcome, WriteTransport, Writer};
 
 /// What the bridge prints, with its token, once it is connected.
 pub const SYNC: &str = "A-BRIDGE";
@@ -68,15 +67,35 @@ fn bridge(host: &str, script: &str, token: &str) -> io::Result<Option<Connection
         }
     };
     let stdin = child.stdin.take().expect("piped");
-    // Reaps ssh once the connection is closed.
-    thread::spawn(move || child.wait());
     Ok(Some(Connection {
         reader: Reader(out),
-        writer: Writer(Box::new(stdin)),
+        writer: Writer(Box::new(BridgeWriter { stdin, child })),
         remote: Some(remote),
         welcome: Welcome::default(),
         commands: Vec::new(),
     }))
+}
+
+struct BridgeWriter {
+    stdin: ChildStdin,
+    child: Child,
+}
+
+impl Write for BridgeWriter {
+    fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
+        self.stdin.write(bytes)
+    }
+    fn flush(&mut self) -> io::Result<()> {
+        self.stdin.flush()
+    }
+}
+
+impl WriteTransport for BridgeWriter {
+    fn shutdown(&mut self) {
+        // Killing our bridge releases stdout even if the remote daemon is stalled.
+        let _ = self.child.kill();
+        let _ = self.child.wait();
+    }
 }
 
 /// Copies this build to `~/.a/runtime/<id>/a` on `host`; a host of another
