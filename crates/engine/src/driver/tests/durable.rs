@@ -336,3 +336,25 @@ fn a_barrier_without_its_flush_neither_publishes_nor_starts_an_external_effect()
     );
     assert!(starts.try_recv().is_none());
 }
+
+#[test]
+fn cached_entries_are_never_replayed_before_their_flush() {
+    let faulty = Arc::new(Faulty::new(Arc::new(Memory::default())));
+    let fixture = Fixture::on(
+        Arc::clone(&faulty) as _,
+        ext_fixtures::ECHO,
+        Registry::default(),
+        openai(&Script::new(&[])),
+    );
+    let session = fixture.create();
+    session.submit("hello").unwrap();
+    settle(&session);
+    session.halt();
+    let header = Header {
+        id: session.id,
+        workspace: session.workspace.clone(),
+        parent: None,
+    };
+    faulty.cut_before_next_flush();
+    assert!(Live::start(&header, &fixture.0, Open::Load, Owner::None).is_err());
+}

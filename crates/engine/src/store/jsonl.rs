@@ -519,8 +519,8 @@ struct JsonlLog {
     index: Arc<Index>,
     flusher: Arc<rt::Flusher>,
     read_only: Option<ReadOnly>,
-    /// The directory of a file not yet synced since it was created: its
-    /// name is only durable once the directory is.
+    /// A previous writer may have exited before ordering the new name,
+    /// so each writer orders its directory before its first promise.
     new_in: Option<PathBuf>,
     /// A failed append may have left part of its lines past the last one
     /// indexed, and cutting them off failed too: the next append cuts them
