@@ -217,7 +217,7 @@ fn readonly(lua: &Lua, table: Table) -> mlua::Result<Table> {
     meta.set("__index", table)?;
     meta.set(
         "__newindex",
-        lua.create_function(|_, _: ()| -> mlua::Result<()> {
+        lua.create_function(|_, ()| -> mlua::Result<()> {
             Err(mlua::Error::runtime("read-only table"))
         })?,
     )?;
@@ -1007,7 +1007,7 @@ mod tests {
         let lua = Lua::new();
         let source = format!(
             "a.fold{{name='count', initial=0, apply=function(s,c) return s end}}; {}",
-            tool("return input")
+            tool("return true")
         );
         let rig = Rig::new("lua-inbound", registry(&source, &[]));
         for text in [
@@ -1030,6 +1030,48 @@ mod tests {
                     }])
                     .is_err()
             );
+        }
+    }
+
+    struct ComplexResult;
+    impl Tool for ComplexResult {
+        type In = ext::Args;
+        type Out = serde_json::Value;
+        const NAME: &'static str = "complex";
+        const DESCRIPTION: &'static str = "Return a complex value.";
+        fn call(&self, args: &ext::Args, _: &Cx) -> Result<Self::Out, String> {
+            let text = if args.args == "depth" {
+                format!("{}0{}", "[".repeat(80), "]".repeat(80))
+            } else {
+                format!("[{}]", vec!["0"; 9000].join(","))
+            };
+            serde_json::from_str(&text).map_err(|e| e.to_string())
+        }
+    }
+    impl Extension for ComplexResult {
+        const NAME: &'static str = "complex";
+        const VERSION: u32 = 1;
+        fn contribute(&self, r: &mut Registrar) {
+            r.tool(Self);
+        }
+    }
+
+    #[test]
+    fn delegated_results_are_bounded_before_lua_can_consume_them() {
+        let rig = Rig::new(
+            "lua-delegated-limits",
+            registry(
+                &tool("cx.tool('complex',input); return true"),
+                &["complex".into()],
+            )
+            .with(&ComplexResult)
+            .unwrap(),
+        );
+        for args in ["depth", "nodes"] {
+            assert!(matches!(
+                rig.call("test", &json!({"args":args})),
+                Outcome::Failed { .. }
+            ));
         }
     }
 

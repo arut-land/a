@@ -381,10 +381,12 @@ fn pending_fold_changes_survive_reload_and_the_old_view_lives_until_adoption() {
         2,
         "the prepared generation includes each pending change exactly once"
     );
+    lock(&adopted).fold("test", "value", &Json::encode(&"after adoption").unwrap());
+    assert_eq!(lock(&adopted).get::<Updates>().unwrap().0, 3);
     assert_eq!(
         cx.state(|s: &Updates| s.0),
         2,
-        "the original call retains its own generation"
+        "later changes cannot replace the original call's state view"
     );
     harness.finish();
 }

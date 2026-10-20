@@ -164,8 +164,8 @@ jobs:
     # Everything builds and lints here, the daemon and `a` included: the
     # platform seams live in `sys` and `rt`, whose Windows halves the daemon
     # still lacks report that they are unsupported. `a` runs its line REPL.
-    # The whole workspace, as `mise run check:windows` lints it from Linux,
-    # so no list of crates goes stale.
+    # Vendored Lua needs the native C SDK, so its optional CLI feature
+    # is linted here rather than in the cross-target metadata check.
     steps:
       - uses: actions/checkout@v7
       - *mbx-dir

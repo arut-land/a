@@ -23,9 +23,7 @@ pub fn registry(config: &Config) -> Result<Registry, Refused> {
     if !config.ext.disable.iter().any(|name| name == "lua") {
         let home = sys::Home::from_env().map_err(|e| Refused(e.to_string()))?;
         let base = config.clone();
-        let loader = ext_lua::Loader::new(home.root().to_owned(), config.ext.clone(), move || {
-            linked(&base)
-        })?;
+        let loader = ext_lua::Loader::new(home.root(), config.ext.clone(), move || linked(&base))?;
         return registry.with_in(Tier::Pre, &loader);
     }
     Ok(registry)

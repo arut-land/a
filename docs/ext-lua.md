@@ -10,11 +10,13 @@ order, after the Rust extensions. A workspace file replaces a home file of the
 same name. Tools and text replace earlier contributions of the same name using
 the SDK's normal tier rules. Guarded extensions cannot be replaced.
 
-Changes, additions and removals apply at the next session step, with at most a
-250 ms polling floor. Idle sessions do no polling. A refresh builds a new
-registry; running calls keep their old generation, and committed state replays
-into the new folds. A broken edit keeps the last working generation. A broken
-mod at first load is warned about and omitted. The daemon keeps running.
+File events prepare changes, additions and removals off the async worker.
+The kernel adopts a ready generation when no calls are open. Running calls
+retain their original functions and state view. New folds rebuild from a
+consistent snapshot and suffix, including pending changes. A broken edit keeps
+the last working generation and reports an error; invalid mods at first load
+are warned about and omitted. `/lua-reload` prepares edits explicitly and
+acknowledges completion. Workspace subscriptions end with their last session.
 
 Use `[ext] disable = ["name"]` in the home config to omit a mod or a compiled
 extension. `disable = ["lua"]` omits the loader. Config changes take effect on
@@ -121,7 +123,8 @@ An HTTP extension, if installed, can be delegated to in the same way; this
 crate adds no independent HTTP client.
 
 The sandbox omits `os`, `io`, `debug`, `package`, `load`, protected calls,
-user coroutines, metatable mutation and native pattern matching. These cannot
+user coroutines, metatable mutation, bytecode dumping and native pattern matching.
+The API and standard libraries are read-only views. These cannot
 be enabled through tool capabilities. Async wrappers are created by the host
 before the sandbox closes. Lua tools yield through coroutine futures over `rt`;
 waiting on a delegated process does not occupy an async worker.
@@ -133,7 +136,6 @@ Defaults, configurable in the home file:
 memory_bytes = 4194304
 instructions = 100000
 timeout_ms = 25
-poll_ms = 250
 ```
 
 Memory is capped per VM; a mod with folds has a separate reducer VM.
@@ -146,3 +148,9 @@ progress, state changes and delegated input, which the Lua allocator cannot
 account for. JSON is bounded to 256 KiB, 64 levels and 8192 nodes; repeated table identities
 are rejected. Source is capped at 256 KiB, text at 8 KiB, and a workspace loads at most 128 mods. A mod registers at most 128
 contributions.
+
+Workspace preparation also limits combined source to 1 MiB and directory scans
+to 4096 entries per root, with an aggregate compilation budget of one second.
+Fold rebuilds use a snapshot plus at most 100,000 suffix entries within a
+one-second budget. A rejected rebuild keeps the current generation and reports
+why; no partial state is installed.

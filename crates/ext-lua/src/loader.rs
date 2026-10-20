@@ -42,7 +42,7 @@ fn lock<T>(value: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
 
 impl Loader {
     pub fn new(
-        home: PathBuf,
+        home: &Path,
         config: sys::config::Exts,
         base: impl Fn() -> Result<Registry, Refused> + Send + Sync + 'static,
     ) -> Result<Self, Refused> {
@@ -179,7 +179,7 @@ impl Workspace {
         Ok(())
     }
 
-    fn changed(self: &Arc<Self>, compiler: Arc<Compiler>, path: PathBuf, prepare: Prepare) {
+    fn changed(self: &Arc<Self>, compiler: Arc<Compiler>, path: PathBuf, prepare: &Prepare) {
         self.dirty.store(true, Ordering::Release);
         if self.busy.swap(true, Ordering::AcqRel) {
             return;
@@ -239,11 +239,7 @@ impl Sources for Source {
                 return;
             }
             if let Some(workspace) = weak.upgrade() {
-                workspace.changed(
-                    Arc::clone(&compiler),
-                    owned_path.clone(),
-                    Arc::clone(&prepare),
-                );
+                workspace.changed(Arc::clone(&compiler), owned_path.clone(), &prepare);
             }
         })
         .map_err(|e| Refused(e.to_string()))?;
@@ -296,7 +292,10 @@ fn files(dir: &Path, found: &mut Files) -> Result<(), Refused> {
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(()),
         Err(e) => return Err(Refused(format!("{}: {e}", dir.display()))),
     };
-    for entry in entries {
+    for (count, entry) in entries.enumerate() {
+        if count >= 4096 {
+            return Err(Refused("lua directory exceeds 4096 entries".into()));
+        }
         let entry = entry.map_err(|e| Refused(e.to_string()))?;
         let path = entry.path();
         if path.extension().is_none_or(|ext| ext != "lua")
@@ -324,6 +323,9 @@ fn files(dir: &Path, found: &mut Files) -> Result<(), Refused> {
             return Err(Refused(format!("{} exceeds 256 KiB", path.display())));
         }
         found.insert(name.to_owned(), source);
+        if found.values().map(String::len).sum::<usize>() > 1024 * 1024 {
+            return Err(Refused("lua workspace source exceeds 1 MiB".into()));
+        }
     }
     Ok(())
 }
@@ -336,8 +338,10 @@ mod tests {
     fn workspace_subscriptions_release_their_registries_after_the_last_owner() {
         let root = std::env::temp_dir().join(format!("a-lua-lifetime-{}", std::process::id()));
         fs::create_dir_all(&root).unwrap();
-        let loader =
-            Loader::new(root.clone(), Default::default(), || Ok(Registry::default())).unwrap();
+        let loader = Loader::new(&root, sys::config::Exts::default(), || {
+            Ok(Registry::default())
+        })
+        .unwrap();
         let workspace = loader.0.open(&root, Arc::new(|_| {})).unwrap();
         let registry = workspace.registry();
         let weak = Arc::downgrade(&registry);
@@ -353,8 +357,10 @@ mod tests {
         fs::create_dir_all(root.join("ext")).unwrap();
         let file = root.join("ext/test.lua");
         fs::write(&file, "a.text{name='test',text='old'}").unwrap();
-        let loader =
-            Loader::new(root.clone(), Default::default(), || Ok(Registry::default())).unwrap();
+        let loader = Loader::new(&root, sys::config::Exts::default(), || {
+            Ok(Registry::default())
+        })
+        .unwrap();
         // Queuing work makes publication order explicit, independently of OS delivery.
         let workspace = Arc::new(Workspace {
             number: AtomicU64::new(0),
@@ -373,11 +379,7 @@ mod tests {
         let queue = Arc::new(Mutex::new(Vec::new()));
         let output = Arc::clone(&queue);
         let prepare: Prepare = Arc::new(move |work| lock(&output).push(work));
-        workspace.changed(
-            Arc::clone(&loader.0.compiler),
-            root.clone(),
-            prepare.clone(),
-        );
+        workspace.changed(Arc::clone(&loader.0.compiler), root.clone(), &prepare);
         for _ in 0..1000 {
             assert_eq!(workspace.generation(), before);
         }
@@ -386,7 +388,7 @@ mod tests {
         assert_eq!(workspace.generation(), before);
         assert!(Arc::ptr_eq(&workspace.registry(), &old));
         fs::write(&file, "a.text{name='test',text='new'}").unwrap();
-        workspace.changed(Arc::clone(&loader.0.compiler), root.clone(), prepare);
+        workspace.changed(Arc::clone(&loader.0.compiler), root.clone(), &prepare);
         assert!(Arc::ptr_eq(&workspace.registry(), &old));
         lock(&queue).pop().unwrap()();
         assert_eq!(workspace.generation(), before + 1);
@@ -404,8 +406,10 @@ mod tests {
     fn file_events_prepare_generations_without_session_bursts() {
         let root = std::env::temp_dir().join(format!("a-lua-watch-{}", std::process::id()));
         fs::create_dir_all(root.join("ext")).unwrap();
-        let loader =
-            Loader::new(root.clone(), Default::default(), || Ok(Registry::default())).unwrap();
+        let loader = Loader::new(&root, sys::config::Exts::default(), || {
+            Ok(Registry::default())
+        })
+        .unwrap();
         let (send, recv) = std::sync::mpsc::channel();
         let workspace = loader
             .0

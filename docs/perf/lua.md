@@ -1,202 +1,174 @@
 # Lua runtime selection
 
-Measured 2026-10-21 on macOS arm64, nightly-2026-10-17, at ed4beac.
-`mise run size` before changes: 2,963,552 bytes (2894 KiB).
+Lua remains opt-in (`--features lua`). No timing result here establishes a
+startup or call-overhead budget: those measurements are deferred until a quiet
+machine is available. Earlier runs competed with builds and a security scanner;
+their timings have been withdrawn.
 
-## Method and limits
+## Comparison and limits
 
-Four temporary adapters were linked into the real `a`, using its release
-profile, build-std, fat LTO, and static vendoring. Each registered an erased
-`input` handler and a user tool, `/probe`. The echo agent, transport, policy,
-log commits and client replay were real. The handler returned JSON `null`;
-the tool returned its JSON input. These small mods measure the embedding and
-ABI rather than Lua arithmetic. Production also converts JSON into Lua values
-and enforces limits; the probe does neither.
+The original comparison linked small adapters into the real daemon, using its
+release profile, build-std, fat LTO and vendored runtimes. Each adapter registered
+an erased input handler and a user tool, driven through the echo agent, policy,
+log commits and client replay in isolated homes. The adapters passed JSON text
+without the production conversion, sandbox or full primitives. These are
+historical minimum-embedding sizes, not current production sizes.
 
-The black-box harness ran three times per configuration, with 200 sequential
-handler and tool round trips each, followed by 30 new sessions. Every run used
-an isolated home and stopped its daemon on drop. Cold daemon times exclude
-first staging: start once, stop, then time `a ls` against the stopped daemon.
-RSS is sampled after attach, before work; per-session RSS is the additional
-RSS after 30 sessions, with no per-session Lua state. RSS granularity and
-allocator effects make these estimates, not allocation counts.
+| Candidate | Linked binary, KiB | Added KiB | Approximate first-mod RSS delta, KiB |
+| --- | ---: | ---: | ---: |
+| Fixture baseline | 2894 | — | — |
+| mlua 0.12.2 + Lua 5.4 | 3147 | 253 | 320 |
+| mlua 0.12.2 + LuaJIT | 3531 | 637 | 448 |
+| mlua 0.12.2 + Luau | 4112 | 1218 | 928 |
+| piccolo 0.3.3 | 3251 | 357 | 224 |
 
-Load was checked before building (1.55/1.86/2.90), and before measurements
-(4.68/4.29/3.84; rising to 6.10/4.66/3.99). Builds were stopped during the
-measurements. A system security scanner remained active, sometimes over one
-CPU. **This was not a quiet machine.** Wall times are observations, not proof
-of the latency budgets. Subtracting loaded and unloaded handler times cannot
-reliably isolate ABI cost here. Repeat on a quiet machine before enabling Lua
-by default.
+The common baseline was 2,963,600 bytes. RSS includes code pages, allocator
+behavior and coarse sampling; it is not a linear per-mod heap cost. Sessions
+share mod VMs; their folds add JSON values and engine bookkeeping. There is no
+reliable comparative per-session memory or call-latency result. Piccolo's
+experimental, non-Send VM used a blocking mailbox in the temporary adapter;
+that integration limitation cannot establish production performance.
 
-`mise exec hyperfine@latest -- hyperfine -N --warmup 10 -r 50 ... --version`
-measured process startup separately. No VM is constructed on that path.
+| Candidate | Sandbox and limits | Async over `rt` | Windows / licence |
+| --- | --- | --- | --- |
+| Lua 5.4 | Selected libraries, text-only chunks, allocation cap, coroutine instruction hooks; native calls need separate limits | Executor-independent mlua coroutine futures, `send` | Upstream support; native CI lints production feature / MIT |
+| LuaJIT | FFI/package removed; JIT complicates instruction hooks; disabling it loses its main advantage | mlua futures | Upstream support, comparison not cross-built / MIT |
+| Luau | Read-only libraries, sandbox, interrupts, allocation cap | mlua futures | Upstream support, comparison not cross-built / MIT |
+| piccolo | Safe host API, fuel-controlled execution, incremental GC, experimental API | Yielding sequences need an async owner bridge | Portable Rust, comparison not cross-built / MIT |
 
-## Results
-
-Medians of three runs; handler/tool columns are complete client-to-daemon round
-trips with one loaded mod, including durable work, in microseconds.
-
-| Candidate | Linked `a`, KiB | Added KiB | `--version`, ms mean | Cold daemon empty / loaded, ms | Handler / tool, µs | Idle RSS empty / loaded, KiB | KiB/session |
-| --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
-| Baseline | 2894 | — | 4.1 | 12.43 / — | 300 / — | 7568 / — | 26 |
-| mlua 0.12.2 + Lua 5.4 | 3147 | 253 | 4.1 | 13.56 / 11.49 | 227 / 452 | 7648 / 7968 | 20–30 |
-| mlua 0.12.2 + LuaJIT | 3531 | 637 | 4.1 | 12.81 / 18.48 | 563 / 1152 | 7584 / 8032 | 19–29 |
-| mlua 0.12.2 + Luau | 4112 | 1218 | 5.0 | 17.18 / 23.36 | 446 / 894 | 8384 / 9312 | 18–26 |
-| piccolo 0.3.3 | 3251 | 357 | 3.4 | 11.15 / 13.63 | 485 / 961 | 7712 / 7936 | 17–25 |
-
-All comparison binaries include the echo fixtures. Their common baseline is
-2,963,600 bytes; deltas use that baseline. The original shipped baseline is
-48 bytes smaller. These are minimum adapters, not complete implementations.
-Luau already exceeds 4096 KiB with this adapter. Approximate incremental idle
-RSS for one mod: 320/448/928/224 KiB respectively. One VM is shared per mod
-across sessions; session folds add their JSON payload and engine bookkeeping.
-
-## Capabilities and integration
-
-| Candidate | Sandboxing and limits | Async over `rt` | Windows | Licence |
-| --- | --- | --- | --- | --- |
-| Lua 5.4 | Select libraries; text-only chunks; memory cap; per-coroutine instruction hooks. Remove protected calls and user coroutines so code cannot swallow budget errors. Native library calls need separate care. | Executor-independent mlua coroutine futures; `send` fits the SDK traits | Upstream supported; selected implementation needs the workspace cross lint | MIT |
-| LuaJIT | Remove FFI, package and unsafe libraries. JIT execution complicates instruction hooks; disabling JIT removes its principal advantage here | Same mlua futures | Upstream supports Windows | MIT |
-| Luau | Purpose-built sandbox, read-only libraries, interrupts and memory cap | Same mlua futures | Upstream supported | MIT |
-| piccolo | Safe host API, incremental GC, fuel-controlled stackless execution; experimental API | Sequences can yield; this probe's non-Send VM needs an owner/mailbox | Portable Rust; not cross-built here | MIT |
-
-Piccolo was compiled and driven by the same daemon harness. Its mailbox blocks
-in this comparison adapter; that is an integration cost, not a production
-design. An async owner would need a separate design. The other rejected
-candidates were not Windows-cross-built either.
-
-`rlua` was checked too: 0.20.1 delegates to mlua and recommends migration, so
-it is not an independent runtime candidate.
-
-Primary references: [mlua features and futures](https://github.com/mlua-rs/mlua),
+`rlua` 0.20.1 delegates to mlua and recommends migration; it is not an independent
+runtime candidate. References: [mlua](https://github.com/mlua-rs/mlua),
 [LuaJIT platforms](https://luajit.org/status.html),
 [Luau sandbox](https://luau.org/sandbox/),
-[piccolo design](https://github.com/kyren/piccolo),
-[rlua migration](https://github.com/mlua-rs/rlua).
+[piccolo](https://github.com/kyren/piccolo),
+[rlua](https://github.com/mlua-rs/rlua).
 
-## Choice
+Vendored Lua 5.4 through mlua is the smallest measured adapter, has allocation
+and instruction limits, and fits the existing async runtime. Luau's minimum
+adapter exceeded 4096 KiB. Piccolo's ownership bridge bought no size advantage.
+This choice makes no claim about comparative timings.
 
-Use vendored Lua 5.4 through mlua, with `send`, `async` and JSON conversion.
-It is the smallest measured adapter, uses the existing runtime, supports
-per-coroutine hooks and memory limits, and leaves room for the real extension
-API. There is no observed end-to-end reason to spend more size on a JIT.
-Luau exceeds the size budget. Piccolo's experimental API and ownership bridge
-do not buy a size advantage here. Keep the CLI feature opt-in pending quiet
-startup measurements.
+## Generation preparation
 
-## Reproducing the comparison
+File events schedule preparation off the async worker. Owned workspace
+subscriptions expose an in-memory generation counter; unchanged bursts perform
+no source scan, log read or blocking dispatch. The index holds weak references.
+Calls retain their immutable registry and their generation's state view.
 
-The archived adapter and harness in `lua-probe/` target ed4beac, before the SDK's
-fallible-handler seam changed. In a clean checkout of that commit, copy that
-directory into `docs/perf/lua-probe`, apply `integration.patch`, and copy
-`client.rs` to `apps/cli/tests/lua_probe.rs`. Build each `probe54`, `probejit`,
-`probeau`, `probepure` feature with `fixtures`, using `cargo build-release -p a
---features <feature>,fixtures`, saving each binary outside the next build's
-output. Build a `fixtures` baseline too. `cargo test -p a --test lua_probe
---no-run --features probe54` builds the harness; point `A_BIN` at a saved
-release binary and run the ignored test with/without `LUA_PROBE_LOADED=1`.
-`measure.py` retains the exact local commands and paths; `results.txt` and
-`startup.json` retain the raw results. Delete temporary binaries and target
-directories afterward.
+Compilation validates the whole candidate before publication. Initial loading
+omits invalid mods with diagnostics; an invalid edit retains the published
+candidate. `/lua-reload` uses the same preparation path and acknowledges it.
+Preparation is serialized per workspace, independently of other workspaces.
+There are at most 128 mods, 4096 directory entries per root and 1 MiB of combined
+source; compilation also has a one-second aggregate budget in addition to VM
+budgets. Filesystem calls themselves do not have an OS-enforced deadline.
 
-## Implementation and final verification
+Session folds prepare off the worker from the latest session snapshot and its
+complete suffix, including folded-but-unsynced entries. Sequence and final
+boundary checks reject an incomplete read. Preparation is bounded to 100,000
+suffix entries and one second; rejection retains the old binding and reports an
+error. Pending folds receive subsequent changes once while adoption waits.
+The binding activates its state view at the kernel's safe boundary; the driver
+adopts registry, handlers and binding there before dispatching effects.
 
-The complete implementation uses mlua's `lua54`, `vendored`, `send`, `async`
-and `serde` features. The CLI feature is `lua`, currently opt-in.
+The SDK's added seams are generic: owned workspace subscriptions with a blocking
+preparation callback, fallible erased fold restoration/application, and binding
+activation. The SDK remains I/O-free. There are no Lua knobs in the kernel.
 
-| Release configuration after merging main | Bytes | KiB, as `mise run size` displays |
-| --- | ---: | ---: |
-| Default, before this work | 2963552 | 2894 |
-| Default, after this work | 2963664 | 2894 |
-| Lua enabled | 3487536 | 3405 |
-| Lua enabled with fixtures | 3504128 | 3421 |
+notify 8.2 (CC0-1.0) supplies directory creation, replacement and removal events across
+supported platforms. The existing sys watcher only follows writes to one file
+and has no Windows backend. The generation/watcher changes added 68,608 bytes
+before tuning, including notify and the SDK/engine changes; this does not isolate
+notify's individual contribution. The maintained implementation fits the binary
+budget and avoids implementing three additional watcher backends by hand. Its Windows backend pins
+windows-sys 0.60 while sys/the reactor use 0.61; the deny exception is scoped
+to 0.60.2. No Windows types cross between these backends.
 
-The minimum adapter comparison above excludes JSON value conversion, the
-sandbox, loader and full primitive implementations; these final sizes include
-all of them. Both Lua builds remain below 4194304 bytes.
+## Release size experiments
 
-The SDK changes are general seams: fallible erased handlers apply the point's
-`ON_ERROR` without a Rust panic; `DynFold` registers JSON state named at run
-time; workspace `Sources` return registry generations; delegated calls use
-existing policy hooks. Agent JSON codecs live in the SDK that owns their
-large types. There are no Lua settings in the kernel or engine.
+All numbers use the same merged main and release flags on macOS arm64 with
+nightly-2026-10-17. The limit is 4,194,304 bytes (4096 KiB).
 
-Final validation after merging main:
+| Build or experiment | Bytes | Decision |
+| --- | ---: | --- |
+| Merged baseline, default | 3,029,872 | Baseline |
+| Merged baseline, Lua | 3,570,256 | Baseline |
+| Generation/watcher fixes, Lua | 3,638,864 | Required correctness work |
+| Narrow rejection callback and shared invocation adapters | 3,622,368 | Keep: saves 16,496 |
+| Integer handles instead of userdata carriers | 3,605,840 | Keep: saves another 16,528 |
+| Direct bounded JSON-to-Lua conversion | 3,605,840 | Discard: no measured reduction |
+| Final default, including preparation bounds and lint fixes | 3,029,888 | +16 versus baseline |
+| Final Lua | 3,605,792 | +35,536 versus baseline; 588,512 bytes below limit |
 
-- `mise run check`: 811 tests passed, 25 skipped.
-- `mise run acceptance`: 12 passed; `mise run test:web`: 5 passed.
-- Lua feature: 17 CLI unit tests and 6 black-box tests passed; 12 runtime
-  invariant tests are included in the workspace check.
-- `mise run size`, `deny`, `machete`, `check:no-tokio`: passed.
-- `mise run check:windows`, plus CLI clippy with `--features lua`: passed.
-  This Mac needed C headers and a COFF archiver for vendored Lua. The first
-  plain cross check failed on missing `errno.h`; the successful check used
-  `mise exec cargo:cargo-xwin@latest` (0.23.1), its clang backend/sysroot and
-  rustup's LLVM tools (`llvm-lib` driver via `llvm-ar`). No platform cfg was
-  added above sys/rt. `check:windows` now sets this up itself on cross hosts,
-  including a temporary archiver driver directory that it removes on exit;
-  native Windows keeps its normal compiler. The pinned cargo-xwin tool adds
-  no runtime dependency or binary bytes. This checks compilation, not Windows
-  execution.
-- `mise run budgets`: all four strict checks passed. The final Lua release
-  with no mods also passed all four strict checks, one test at a time.
+Invocation handles live in a per-VM map and are removed by a drop guard on
+completion or cancellation. Saved callbacks retain no call context. The direct
+conversion experiment integrated depth/node accounting with table construction;
+it did not reduce the binary, so the bounded serde conversion remains.
 
-| Strict budget observation | Default | Lua enabled, no mods |
-| --- | ---: | ---: |
-| Cold first daemon reply, median | 17.47 ms | 16.63 ms |
-| Process floor | 1.58 ms | 1.45 ms |
-| Attach p99 | 0.433 ms | 0.178 ms |
-| Idle daemon RSS | 8448 KiB | 8688 KiB |
-| TUI first frame, median | 5.60 ms | 5.53 ms |
+## Reproduction
 
-An earlier Lua budget run failed cold start at 62.82 ms (6.77 ms floor) while
-other worktrees compiled and load exceeded 14. A repeat passed all four;
-the final observations above are from the rebuilt, quota-limited runtime.
-Load averages were still elevated (11.38/12.19/10.43) before the final run.
-These passing checks do not turn the experiment into a controlled quiet-machine
-comparison. Lua remains opt-in pending that repeat.
+The old adapter archive has been removed from the current tree. For the
+historical comparison, use a disposable detached checkout of `96ce0e7`, whose
+archive and integration patch match the SDK at that revision. Apply its
+`docs/perf/lua-probe/integration.patch`, copy its `client.rs` into
+`apps/cli/tests/lua_probe.rs`, then build the four adapters:
 
-The first-mod RSS deltas above include code pages and allocator effects; they
-are not linear per-mod heap estimates. Piccolo's ownership constraint was also
-confirmed with a compile check: `assert_send::<piccolo::Lua>()` is rejected
-because its arena's metrics contain a non-Send `Rc`.
+```sh
+cargo build-release -p a --features fixtures
+cargo build-release -p a --features probe54,fixtures
+cargo build-release -p a --features probejit,fixtures
+cargo build-release -p a --features probeau,fixtures
+cargo build-release -p a --features probepure,fixtures
+cargo test -p a --test lua_probe --features probe54 --no-run
+```
 
-Interactive or deferred approval for a *delegated* `cx.tool` call remains
-unsupported: a pending ask is refused. Lua agent tool actions use normal engine
-approval. Arbitrary Rust trait services stay on the typed side; Lua delegates
-to named tools as its service interface. The active-poll time limit is checked
-by instruction hooks, not an OS-enforced hard deadline for native code.
+Save each release binary before the next build. Locate the test executable from
+Cargo's output, rather than a hard-coded build hash, and run it with `A_BIN`
+pointing at each saved binary, with and without `LUA_PROBE_LOADED=1`. Do not use
+the historical measure.py's local paths. Remove the disposable checkout and its
+build output afterward. These historical adapters require fresh integration
+before making any comparison against the current SDK.
 
-## Review correction: generation preparation
+For current production sizes and behavior:
 
-The merged-main baseline is 3,029,872 bytes by default and 3,570,256 bytes
-with Lua. The generation/watcher implementation before size tuning is
-3,638,864 bytes with Lua (+68,608 bytes). This includes notify 8.2 and the
-SDK/engine changes; it does not isolate notify's individual contribution.
-notify supplies directory creation, replacement and removal events on all
-three supported platforms. The existing sys write watcher handles file writes
-and has no Windows implementation. This maintained dependency fits the release
-budget; extending that seam by hand would require additional platform backends.
+```sh
+mise run size
+cargo build-release -p a --features lua
+wc -c < target/release/a
+cargo nextest run -p a --features lua,fixtures --test blackbox -E 'test(/^lua::/)'
+mise run check
+mise run acceptance
+mise run check:windows
+mise run machete
+```
 
-File events schedule bounded preparation off the async worker. The SDK exposes
-owned workspace subscriptions and in-memory generation counters, keeping I/O
-out of the SDK and the kernel. A binding activates its prepared state view at
-the kernel's existing safe boundary. The driver then adopts its registry and
-observers; old contexts retain their own state view. State preparation uses the
-last session snapshot plus the complete suffix, including unsynced changes,
-with contiguous sequence and end-boundary checks. Workspace indexes are weak.
+For future timing measurements, check load first, stop other builds, use real
+client-to-daemon handler/tool round trips and isolated homes, and run the strict
+release budgets alone (`mise run budgets`). Pull temporary tools through
+`mise exec hyperfine@latest -- hyperfine ...`. Stop each owned daemon using
+`A_HOME="$home" "$binary" daemon stop` before deleting its temporary home.
+No quiet-machine timing claims are made by this change.
 
-Size tuning, same release flags: sharing the `(Value, Value)` invocation
-adapter across agents, hooks, reducers and tool coroutines, and narrowing the
-read-only rejection callback to `()`, reduced 3,638,864 to 3,622,368 bytes
-(-16,496). Retained.
+## Review validation
 
-Replacing per-invocation userdata with integer handles in a per-VM active-call
-map reduced 3,622,368 to 3,605,840 bytes (-16,528). A drop guard removes each
-handle on completion or cancellation; saved callbacks cannot retain contexts.
-Retained; the same sandbox, quota and async-delegation invariants pass.
+- `mise run check`: 867 passed, 27 skipped; includes 19 Lua host invariants.
+- `mise run acceptance`: 12 passed. Lua-feature black-box tests: 6 passed.
+- Native CLI Lua-feature clippy, `machete`, `deny`, and `check:no-tokio`: pass.
+- `mise run check:windows`: pass, using plain MSVC-target clippy with ext-lua
+  excluded and the CLI Lua feature off. No cargo-xwin or licence-acceptance
+  mechanism runs. Native Windows Lua lint is configured in CI; it was not
+  executed from this Mac.
+- Default `mise run size` and the identically configured Lua release size
+  check: pass, with no fixtures in either shipped binary.
+- `mise run budgets`: 4 daemon/client checks and the shell zero-wake check pass.
+  It ran alone locally. Load averages before/after were 3.61/3.08/4.60 and
+  3.36/3.08/4.53; security scanning remained active. This was not a controlled
+  quiet-machine timing comparison.
 
-A direct recursive JSON-to-Lua conversion with integrated node/depth accounting
-measured 3,605,840 bytes, the same as the bounded serde conversion. Discarded:
-it provided no measured size reduction. The bounded serde boundary is retained.
+The pending-state/adoption regression failed on the merged old driver (a running
+call read zero after one folded change). The inbound JSON and sandbox regressions
+also failed before their fixes. A delegated-result test was additionally checked
+against the old unbounded decoder: it failed there and passed with bounded
+conversion restored. The new subscription API is covered by controlled queued
+publication, no-blocking-hop bursts, weak-lifetime tests and a real OS file-event
+test; it deliberately replaces the polling contract rather than preserving it.

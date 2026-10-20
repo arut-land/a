@@ -59,6 +59,20 @@ pub struct Shared {
     pub(crate) daemon: Weak<Daemon>,
 }
 
+impl Shared {
+    fn source(&self, workspace: &Path) -> io::Result<Option<Arc<dyn ext::host::Generations>>> {
+        self.registry
+            .get()
+            .service::<dyn ext::host::Sources>()
+            .map(|source| {
+                let rt = Arc::clone(&self.rt);
+                source.open(workspace, Arc::new(move |work| rt.spawn_blocking(work)))
+            })
+            .transpose()
+            .map_err(io::Error::other)
+    }
+}
+
 /// How [`Live::start`] opens a session's log.
 #[derive(Clone, Copy)]
 pub enum Open {
@@ -219,17 +233,7 @@ impl Live {
         owner: Owner,
     ) -> io::Result<Arc<Self>> {
         let base = shared.registry.get();
-        let source = base
-            .service::<dyn ext::host::Sources>()
-            .map(|source| {
-                let rt = Arc::clone(&shared.rt);
-                source.open(
-                    &header.workspace,
-                    Arc::new(move |work| rt.spawn_blocking(work)),
-                )
-            })
-            .transpose()
-            .map_err(io::Error::other)?;
+        let source = shared.source(&header.workspace)?;
         let generation = source.as_ref().map_or_else(
             || shared.registry.generation(),
             |source| source.generation(),

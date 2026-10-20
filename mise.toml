@@ -79,6 +79,7 @@ fi
 # The Windows build, linted from any host: nothing above `sys` and `rt`
 # names a platform, so all of it, `a` included, builds there (what the
 # daemon still lacks on Windows says it is unsupported).
+# Vendored Lua needs the native C SDK; Windows CI lints that optional feature.
 "check:windows" = "cargo clippy --workspace --exclude ext-lua --all-targets --target x86_64-pc-windows-msvc -- -D warnings"
 # Miri over sys, the one crate with unsafe code. Miri runs no processes and
 # (on macOS) sets no file times, nor modes, so the tests that need those are skipped.

@@ -79,7 +79,7 @@ impl Watcher {
             ::notify::recommended_watcher(move |event: ::notify::Result<::notify::Event>| {
                 match event {
                     Ok(event) if !matches!(event.kind, ::notify::EventKind::Access(_)) => {
-                        changed(event.paths)
+                        changed(event.paths);
                     }
                     Err(error) => eprintln!("file watcher: {error}"),
                     _ => {}
