@@ -342,8 +342,8 @@ impl SessionClient {
         out
     }
 
-    /// Replaces a wedged daemon and attaches again: to the session shown,
-    /// keeping its environment, or as first asked.
+    /// Replaces a wedged daemon and repeats the current attachment,
+    /// keeping a known session's environment.
     pub fn restart(&mut self) -> Vec<Effect> {
         let attach = self.reattach().unwrap_or_else(|| self.opened.clone());
         let mut out = vec![Effect::Io(Io::Hangup)];
@@ -513,12 +513,15 @@ impl SessionClient {
         out.push(Effect::Show(Show::View(update)));
     }
 
-    /// The attach that picks the session shown up again where the view
-    /// left it, keeping the environment it has.
+    /// Reattaches to the current target, resuming the view only when it
+    /// belongs to that session.
     fn reattach(&self) -> Option<Attach> {
+        let Target::Id(session) = self.opened.target else {
+            return None;
+        };
         Some(Attach {
-            target: self.opened.target.clone(),
-            since: if self.opened.target == Target::Id(self.view.session?) {
+            target: Target::Id(session),
+            since: if self.view.session == Some(session) {
                 self.view.seq
             } else {
                 0
