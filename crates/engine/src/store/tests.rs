@@ -130,7 +130,9 @@ fn append(loaded: &mut Loaded, seqs: impl IntoIterator<Item = u64>) -> Vec<Entry
 /// over.
 fn load(store: &dyn LogStore, id: SessionId) -> (Loaded, Vec<Entry>) {
     let mut entries = Vec::new();
-    let loaded = store.load(id, &mut |_| false, &mut |e| entries.push(e)).unwrap();
+    let loaded = store
+        .load(id, &mut |_| false, &mut |e| entries.push(e))
+        .unwrap();
     assert_eq!(loaded.seq, entries.len() as u64);
     (loaded, entries)
 }
@@ -312,11 +314,23 @@ fn load_reads_only_the_suffix(store: &dyn LogStore) {
     for e in &written {
         assert_eq!(line(&*loaded.lines, e.seq.get()).unwrap(), encoded(e));
     }
+    let after = loaded.read;
     // Appends go on after it, and a load declining it reads the log whole.
     written.extend(append(&mut loaded, 9..=9));
     drop(loaded);
-    assert_eq!(load(store, h.id).1, written);
+    let (mut whole, entries) = load(store, h.id);
+    assert_eq!(entries, written);
     assert_eq!(store.count(h.id).unwrap(), 9);
+    assert!(0 < after && after < whole.read, "{after} of {}", whole.read);
+    // One of the last entry leaves nothing to read.
+    let last = Snapshot {
+        covers: 9,
+        image: image("all"),
+    };
+    whole.writer.snapshot(&last).unwrap();
+    drop(whole);
+    let (loaded, offered, suffix) = restore(store, h.id);
+    assert_eq!((offered, suffix, loaded.read), (Some(last), Vec::new(), 0));
 }
 
 /// A snapshot the log does not bear out (one ahead of its entries, one
@@ -387,7 +401,11 @@ fn ids_are_unique_and_missing_ones_not_found(store: &dyn LogStore) {
     assert_eq!(again.kind(), ErrorKind::AlreadyExists);
     let missing = SessionId::new();
     assert_eq!(
-        store.load(missing, &mut |_| false, &mut drop).map(drop).unwrap_err().kind(),
+        store
+            .load(missing, &mut |_| false, &mut drop)
+            .map(drop)
+            .unwrap_err()
+            .kind(),
         ErrorKind::NotFound
     );
     assert_eq!(
@@ -537,7 +555,14 @@ fn jsonl_leases_past_the_epochs_its_files_hold() {
     append(&mut created, 1..=2);
     // As a later daemon, with no leases of its own yet.
     let later = Jsonl::open(store.dir.as_ref().unwrap()).unwrap();
-    assert!(later.load(h.id, &mut |_| false, &mut drop).unwrap().writer.epoch() > created.writer.epoch());
+    assert!(
+        later
+            .load(h.id, &mut |_| false, &mut drop)
+            .unwrap()
+            .writer
+            .epoch()
+            > created.writer.epoch()
+    );
 }
 
 /// A JSONL session of entries 1 to 4, and its file as written.
@@ -737,8 +762,8 @@ fn a_sidecar_the_log_does_not_bear_out_is_rebuilt_from_it() {
     log.writer.snapshot(&snapshot).unwrap();
     drop(log);
     let dir = store.dir.as_ref().unwrap();
-    let idx = dir.join(format!("{}.idx", h.id));
-    let snap = dir.join(format!("{}.snap", h.id));
+    let idx = dir.join(format!("derived/{}.idx", h.id));
+    let snap = dir.join(format!("derived/{}.snap", h.id));
     let whole_idx = fs::read(&idx).unwrap();
     let whole_snap = fs::read(&snap).unwrap();
     assert_eq!(whole_idx.len(), 6 * 8);
@@ -752,12 +777,13 @@ fn a_sidecar_the_log_does_not_bear_out_is_rebuilt_from_it() {
         let o = header("/w");
         let mut log = store.create(&o).unwrap();
         append(&mut log, 1..=8);
-        log.writer.snapshot(&Snapshot {
-            covers: 8,
-            image: image("eight"),
-        })
-        .unwrap();
-        fs::read(dir.join(format!("{}.snap", o.id))).unwrap()
+        log.writer
+            .snapshot(&Snapshot {
+                covers: 8,
+                image: image("eight"),
+            })
+            .unwrap();
+        fs::read(dir.join(format!("derived/{}.snap", o.id))).unwrap()
     };
     for (stale, short) in [(flipped, false), (ahead, false), (whole_snap.clone(), true)] {
         fs::write(&snap, &stale).unwrap();

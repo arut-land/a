@@ -66,6 +66,9 @@ pub struct Loaded {
     pub lines: Arc<dyn Lines>,
     /// The seq of the last entry committed.
     pub seq: u64,
+    /// The bytes of log read to load it: those after the snapshot taken,
+    /// or all of them.
+    pub read: u64,
 }
 
 impl Loaded {

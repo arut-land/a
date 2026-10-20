@@ -38,11 +38,12 @@ impl Memory {
         Ok(Arc::clone(&stored.lines))
     }
 
-    fn loaded(&self, id: SessionId, lines: Arc<Shared>, floor: u32) -> Loaded {
+    fn loaded(&self, id: SessionId, lines: Arc<Shared>, floor: u32, read: u64) -> Loaded {
         let epoch = self.leases.acquire(id, floor);
         let seq = lock(&lines.lines).len() as u64;
         Loaded {
             seq,
+            read,
             writer: Writer::new(Box::new(MemoryLog(Arc::clone(&lines))), epoch),
             lines,
         }
@@ -62,7 +63,7 @@ impl LogStore for Memory {
             lines: Arc::clone(&lines),
         };
         sessions.insert(header.id, stored);
-        Ok(self.loaded(header.id, lines, 0))
+        Ok(self.loaded(header.id, lines, 0, 0))
     }
 
     fn headers(&self) -> io::Result<Vec<Header>> {
@@ -92,10 +93,13 @@ impl LogStore for Memory {
         };
         let floor = entries.last().map_or(0, |e| e.epoch.0);
         let skip = usize::try_from(covered.unwrap_or(0)).unwrap_or(usize::MAX);
+        let read = (lock(&lines.lines).iter().skip(skip))
+            .map(|line| line.len() as u64 + 1)
+            .sum();
         for entry in entries.into_iter().skip(skip) {
             each(entry);
         }
-        Ok(self.loaded(id, lines, floor))
+        Ok(self.loaded(id, lines, floor, read))
     }
 
     fn entries(&self, id: SessionId) -> io::Result<Vec<Entry>> {

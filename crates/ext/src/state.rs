@@ -243,7 +243,12 @@ mod tests {
             state: "count".into(),
             image: Json::encode("two").unwrap(),
         }];
-        assert!(restored.restore(&bad).unwrap_err().contains("reading count"));
+        assert!(
+            restored
+                .restore(&bad)
+                .unwrap_err()
+                .contains("reading count")
+        );
         assert_eq!(restored.get::<Count>().unwrap().0, 5, "left as it was");
     }
 

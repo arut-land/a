@@ -194,7 +194,7 @@ fn a_remote_session_runs_in_the_hosts_directory_and_environment() {
         .unwrap());
 
     let dir = remote.join("sessions");
-    let log = fs::read_dir(&dir).unwrap().next().unwrap().unwrap().path();
+    let log = only_log(&dir);
     assert!(log.to_str().unwrap().contains(session.trim()), "{log:?}");
     let text = fs::read_to_string(log).unwrap();
     let mut lines = text.lines();
@@ -221,12 +221,7 @@ fn a_remote_session_started_in_a_subdirectory_works_in_its_git_root() {
     let host = remote.parent().unwrap();
     ok(&new.arg("new").output().unwrap());
 
-    let log = fs::read_dir(remote.join("sessions"))
-        .unwrap()
-        .next()
-        .unwrap()
-        .unwrap()
-        .path();
+    let log = only_log(&remote.join("sessions"));
     let text = fs::read_to_string(log).unwrap();
     let mut lines = text.lines();
     let header: serde_json::Value = serde_json::from_str(lines.next().unwrap()).unwrap();
@@ -286,4 +281,15 @@ fn a_newer_build_drains_the_old_daemon() {
         fs::read_to_string(home.join("run/daemon.pid")).unwrap(),
         new
     );
+}
+
+/// The one session log in `dir`, beside what is derived from it.
+fn only_log(dir: &Path) -> PathBuf {
+    let mut logs = fs::read_dir(dir)
+        .unwrap()
+        .map(|item| item.unwrap().path())
+        .filter(|path| path.extension().is_some_and(|e| e == "jsonl"));
+    let log = logs.next().unwrap();
+    assert!(logs.next().is_none());
+    log
 }

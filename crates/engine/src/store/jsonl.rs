@@ -26,10 +26,13 @@ pub(crate) const FORMAT: u32 = 1;
 /// is the tail a crash tore and is cut, and one before the last means the
 /// file was damaged otherwise, so it is kept as it is.
 ///
-/// Beside each log, derived from it and never synced, two files spare the
-/// next load its length: `<id>.idx`, where each line ends, and `<id>.snap`,
-/// the newest snapshot. Either is used only as far as it agrees with the
-/// log, and a load without them reads the log whole, as every load did.
+/// Derived from each log and never synced, two files in `derived/` spare
+/// the next load its length: `<id>.idx`, where each line ends, and
+/// `<id>.snap`, the newest snapshot. Either is used only as far as it
+/// agrees with the log, and a load without them reads the log whole, so
+/// the directory may be deleted at any time. Being apart, writing them
+/// leaves the logs' directory as it was, which the catalog reads the age
+/// of.
 pub struct Jsonl {
     dir: PathBuf,
     leases: Local,
@@ -38,7 +41,7 @@ pub struct Jsonl {
 impl Jsonl {
     pub fn open(dir: impl Into<PathBuf>) -> io::Result<Self> {
         let dir = dir.into();
-        fs::create_dir_all(&dir)?;
+        fs::create_dir_all(dir.join(DERIVED))?;
         Ok(Self {
             dir,
             leases: Local::default(),
@@ -50,9 +53,13 @@ impl Jsonl {
     }
 }
 
-/// `<id>.jsonl`'s sidecar of extension `ext`.
+/// Where the files derived from the logs are kept, in their directory.
+const DERIVED: &str = "derived";
+
+/// `<id>.jsonl`'s derived file of extension `ext`.
 fn beside(log: &Path, ext: &str) -> PathBuf {
-    log.with_extension(ext)
+    let name = Path::new(log.file_name().unwrap_or_default()).with_extension(ext);
+    log.with_file_name(DERIVED).join(name)
 }
 
 impl LogStore for Jsonl {
@@ -72,9 +79,9 @@ impl LogStore for Jsonl {
         seal(&mut line, 0);
         file.write_all(&line)?;
         let index = Index::new(file, path, line.len() as u64);
-        index.persist();
+        index.persist(0);
         let epoch = self.leases.acquire(header.id, 0);
-        Ok(index.loaded(0, epoch, Ok(Some(self.dir.clone()))))
+        Ok(index.loaded(0, 0, epoch, Ok(Some(self.dir.clone()))))
     }
 
     /// A file whose header did not survive a crash holds no entries either,
@@ -103,8 +110,9 @@ impl LogStore for Jsonl {
     /// in what was cut; a file kept as it is is not touched.
     ///
     /// The scan starts after the snapshot if `restore` takes it, else at
-    /// the first entry; the lines before where it starts are placed by the
-    /// persisted index, checked against the file where they end.
+    /// the first entry; the lines before where it starts are placed by
+    /// `<id>.idx`, checked against the log where they end. What the scan
+    /// indexes that the file lacks is added to it.
     fn load(
         &self,
         id: SessionId,
@@ -127,22 +135,24 @@ impl LogStore for Jsonl {
             }
             _ => None,
         };
-        let resumed = index.resume(covered);
-        if !resumed {
+        if covered.is_none() {
             floor = 0;
         }
+        let placed = index.resume(covered.unwrap_or(0));
+        let from = index.end();
         let kept = index.scan(other, |entry| {
             floor = entry.epoch.0;
             each(entry);
         })?;
-        let seq = index.read().ends.len() as u64;
+        let (seq, read) = (index.read().ends.len() as u64, index.end() - from);
         if kept.is_none() && index.end() < index.file.metadata()?.len() {
             index.file.set_len(index.end())?;
             sys::sync_data(&index.file)?;
         }
-        index.persist();
+        let agreed = placed.agreed(&index.read().ends);
+        index.persist(agreed);
         let epoch = self.leases.acquire(id, floor);
-        Ok(index.loaded(seq, epoch, kept.map_or(Ok(None), Err)))
+        Ok(index.loaded(seq, read, epoch, kept.map_or(Ok(None), Err)))
     }
 
     #[cfg(test)]
@@ -211,7 +221,13 @@ impl Index {
     /// The lines indexed and an appender continuing them, whose entries up
     /// to `seq` are committed: one that refuses to, for a file kept as it
     /// is.
-    fn loaded(self, seq: u64, epoch: u32, kept: Result<Option<PathBuf>, ReadOnly>) -> Loaded {
+    fn loaded(
+        self,
+        seq: u64,
+        read: u64,
+        epoch: u32,
+        kept: Result<Option<PathBuf>, ReadOnly>,
+    ) -> Loaded {
         let index = Arc::new(self);
         let log: Box<dyn Log> = match kept {
             Ok(new_in) => Box::new(JsonlLog {
@@ -224,6 +240,7 @@ impl Index {
         Loaded {
             lines: index,
             seq,
+            read,
             writer: Writer::new(log, epoch),
         }
     }
@@ -280,78 +297,91 @@ impl Index {
     /// floor of the lease when nothing after it is read.
     fn recall(&mut self) -> io::Result<u32> {
         let path = beside(&self.path, "idx");
-        let mut ends: Vec<u64> = fs::read(&path)
-            .map(|bytes| {
+        let mut ends: Vec<u64> = fs::read(&path).map_or_else(
+            |_| Vec::new(),
+            |bytes| {
                 bytes
-                    .chunks_exact(8)
-                    .map(|b| u64::from_le_bytes(b.try_into().expect("8 bytes")))
+                    .as_chunks()
+                    .0
+                    .iter()
+                    .map(|b| u64::from_le_bytes(*b))
                     .collect()
-            })
-            .unwrap_or_default();
+            },
+        );
         let len = self.file.metadata()?.len();
         let rising = ends.first().is_none_or(|&first| first > self.start)
             && ends.windows(2).all(|w| w[0] < w[1])
             && ends.last().is_none_or(|&last| last <= len);
         let mut floor = 0;
         let placed = rising
-            && match ends.len() {
-                0 => true,
-                n => {
-                    let from = n.checked_sub(2).map_or(self.start, |i| ends[i]);
-                    let mut line = vec![0; usize::try_from(ends[n - 1] - from).unwrap_or(0)];
-                    sys::read_exact_at(&self.file, &mut line, from).is_ok()
-                        && unseal(&mut line)
-                        && Entry::from_json(&line).is_ok_and(|e| {
-                            floor = e.epoch.0;
-                            e.seq.get() == n as u64
-                        })
-                }
-            };
+            && ends.len().checked_sub(1).is_none_or(|last| {
+                self.entry(&ends, last).is_some_and(|e| {
+                    floor = e.epoch.0;
+                    e.seq.get() == ends.len() as u64
+                })
+            });
         if !placed {
             ends.clear();
         }
-        let idx = OpenOptions::new()
-            .create(true)
-            .append(true)
-            .open(&path)
-            .ok();
-        *self.ends_mut() = Ends { ends, idx };
+        self.ends_mut().ends = ends;
         Ok(floor)
     }
 
-    /// Whether the index places `snap`: its entry is indexed, and its line
-    /// ends where the snapshot says.
-    fn places(&self, snap: &Snap) -> bool {
-        let ends = &self.read().ends;
-        let at = usize::try_from(snap.covers).ok().and_then(|c| c.checked_sub(1));
-        at.and_then(|at| ends.get(at)) == Some(&snap.offset)
+    /// Entry `at + 1`, read where `ends` places its line, if it is there.
+    fn entry(&self, ends: &[u64], at: usize) -> Option<Entry> {
+        let from = at.checked_sub(1).map_or(self.start, |i| ends[i]);
+        let mut line = vec![0; usize::try_from(ends[at].checked_sub(from)?).ok()?];
+        sys::read_exact_at(&self.file, &mut line, from).ok()?;
+        unseal(&mut line).then(|| Entry::from_json(&line).ok())?
     }
 
-    /// Keeps the lines up to entry `covered`, the snapshot's, as placed,
-    /// so the scan starts after them; with no snapshot taken, nothing is
-    /// placed and the scan starts at the first entry. Whether the scan
-    /// resumes where the index left off.
-    fn resume(&mut self, covered: Option<u64>) -> bool {
-        let ends = self.ends_mut();
-        match covered {
-            Some(covers) => {
-                ends.ends.truncate(usize::try_from(covers).unwrap_or(usize::MAX));
-                true
-            }
-            None => {
-                ends.ends.clear();
-                false
-            }
+    /// Whether the index places `snap`: its line ends where the snapshot
+    /// says, and holds the entry it covers.
+    fn places(&self, snap: &Snap) -> bool {
+        let ends = &self.read().ends;
+        let at = usize::try_from(snap.covers)
+            .ok()
+            .and_then(|c| c.checked_sub(1));
+        at.is_some_and(|at| {
+            ends.get(at) == Some(&snap.offset)
+                && self
+                    .entry(ends, at)
+                    .is_some_and(|e| e.seq.get() == snap.covers)
+        })
+    }
+
+    /// Keeps the lines up to entry `covers`, the snapshot's, as placed, so
+    /// the scan starts after them (at the first entry for 0), and hands
+    /// back the rest of what the index placed, for the scan to bear out.
+    fn resume(&mut self, covers: u64) -> Placed {
+        let ends = &mut self.ends_mut().ends;
+        let at = usize::try_from(covers)
+            .unwrap_or(usize::MAX)
+            .min(ends.len());
+        Placed {
+            at,
+            after: ends.split_off(at),
         }
     }
 
-    /// Writes `<id>.idx` whole, as the lines are indexed now.
-    fn persist(&self) {
+    /// Writes to `<id>.idx` what it lacks of the lines indexed now, the
+    /// first `agreed` of which it holds already, and keeps it open to go
+    /// on appending.
+    fn persist(&self, agreed: usize) {
         let path = beside(&self.path, "idx");
         let mut ends = self.ends.write().unwrap_or_else(PoisonError::into_inner);
-        let written = fs::write(&path, little_endian(&ends.ends)).and_then(|()| {
-            OpenOptions::new().append(true).open(&path)
-        });
+        let rest = little_endian(&ends.ends[agreed..]);
+        let written = OpenOptions::new()
+            .create(true)
+            .write(true)
+            .truncate(false)
+            .open(&path)
+            .and_then(|mut idx| {
+                idx.set_len(agreed as u64 * 8)?;
+                idx.seek(SeekFrom::End(0))?;
+                idx.write_all(&rest)?;
+                Ok(idx)
+            });
         ends.idx = written.ok();
     }
 
@@ -361,7 +391,11 @@ impl Index {
     /// unsealed, is cutting a torn tail; stopping anywhere else, or in a
     /// file of another format (`other`), is keeping the file as it is,
     /// for the reason returned.
-    fn scan(&mut self, other: Option<ReadOnly>, mut each: impl FnMut(Entry)) -> io::Result<Option<ReadOnly>> {
+    fn scan(
+        &mut self,
+        other: Option<ReadOnly>,
+        mut each: impl FnMut(Entry),
+    ) -> io::Result<Option<ReadOnly>> {
         let mut end = self.end();
         (&self.file).seek(SeekFrom::Start(end))?;
         let mut reader = BufReader::with_capacity(64 * 1024, &self.file);
@@ -386,6 +420,24 @@ impl Index {
             };
             return Ok(other.or((!torn).then_some(damaged)));
         }
+    }
+}
+
+/// What `<id>.idx` placed past where a load's scan starts.
+struct Placed {
+    at: usize,
+    after: Vec<u64>,
+}
+
+impl Placed {
+    /// How many of `ends`, as the scan left them, the file holds already:
+    /// the lines before the scan, and those after it that it bore out.
+    fn agreed(&self, ends: &[u64]) -> usize {
+        let scanned = ends.get(self.at..).unwrap_or_default();
+        let same = (scanned.iter().zip(&self.after))
+            .take_while(|(a, b)| a == b)
+            .count();
+        self.at + same
     }
 }
 
@@ -482,7 +534,9 @@ impl Log for JsonlLog {
     fn snapshot(&mut self, snapshot: &Snapshot) -> io::Result<()> {
         let offset = {
             let ends = &self.index.read().ends;
-            let at = usize::try_from(snapshot.covers).ok().and_then(|c| c.checked_sub(1));
+            let at = usize::try_from(snapshot.covers)
+                .ok()
+                .and_then(|c| c.checked_sub(1));
             at.and_then(|at| ends.get(at)).copied().ok_or_else(|| {
                 let why = format!("entry {} is not committed", snapshot.covers);
                 io::Error::new(io::ErrorKind::InvalidInput, why)
