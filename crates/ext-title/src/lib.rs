@@ -43,7 +43,7 @@ impl Extension for Title {
                 rt.spawn(Box::pin(async move {
                     let Some(models) = cx.models() else { return };
                     let ask = [llm::Message::user(TITLE)].into_iter().collect();
-                    let mut side = Side::new("title", ask).after_the_conversation();
+                    let mut side = Side::new(protocol::view::TITLE, ask).after_the_conversation();
                     side.budget = Budget {
                         max_tokens: 32,
                         ..Budget::default()

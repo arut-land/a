@@ -80,11 +80,8 @@ pub fn rows(item: &Item, width: usize, look: Look) -> Vec<Line> {
             out.extend(markdown(text, width, Style::new()));
             out
         }
-        // A side request's reply is its extension's: a title shows in the
-        // status line, a summary in the conversation it stands for.
-        Item::Reply {
-            purpose: Some(_), ..
-        } => Vec::new(),
+        // The title shows in the status line.
+        item if item.titles() => Vec::new(),
         Item::Reply {
             model,
             text,

@@ -143,11 +143,10 @@ struct ItemView: View {
             }
         case .assistant(_, let text):
             Text(text).textSelection(.enabled)
-        // A side request's reply is its extension's: a title is the
-        // window's.
-        case .reply(_, _, _, _, _, .some):
+        // The title is the window's.
+        case .reply(_, _, _, _, _, "title"):
             EmptyView()
-        case .reply(let call, let model, let text, let status, let usage, nil):
+        case .reply(let call, let model, let text, let status, let usage, _):
             ReplyView(
                 call: call, model: model, text: text, status: status, usage: usage,
                 streaming: live(call, status))

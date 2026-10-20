@@ -174,9 +174,8 @@ pub fn item_row<'a>(item: &'a Item, view: &'a SessionView) -> impl Renderable {
                 Item::Assistant { text, .. } => {
                     div style=(style::THEIRS) { (text) }
                 }
-                // A side request's reply is its extension's: a title shows
-                // in the bar.
-                Item::Reply { purpose: Some(_), .. } => {}
+                // The title shows in the bar.
+                item if item.titles() => {}
                 Item::Reply { call, text, status, usage, .. } => {
                     ReplyRow call=(*call) text=(text) status=(status) usage=(usage.as_ref())
                         live=(view.streaming.as_ref().filter(|s| s.call == *call).map(|s| s.text.as_str()));

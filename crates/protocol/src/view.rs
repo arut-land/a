@@ -21,6 +21,9 @@ use crate::{
     SessionSummary, Verdict, WaitOn,
 };
 
+/// The purpose of a side request titling the session.
+pub const TITLE: &str = "title";
+
 /// One session as a client shows it. Its serialized form is also what a
 /// [`DaemonMsg::Snapshot`] carries.
 #[derive(Clone, Debug, Default, PartialEq, Serialize)]
@@ -174,6 +177,12 @@ impl Item {
             Self::Tool { .. } => Phase::Running,
             _ => return None,
         })
+    }
+
+    /// Whether this is the reply to a side request titling the session:
+    /// its text is the view's [`SessionView::title`], shown there.
+    pub fn titles(&self) -> bool {
+        matches!(self, Self::Reply { purpose: Some(purpose), .. } if purpose == TITLE)
     }
 
     /// The seq of the entry that started this item.
@@ -759,7 +768,7 @@ impl SessionView {
         else {
             return None;
         };
-        let titles = purpose.as_deref() == Some("title");
+        let titles = purpose.as_deref() == Some(TITLE);
         *status = match outcome {
             Outcome::Done { output } => {
                 let reply = output.parse::<Reply>().unwrap_or_default();
