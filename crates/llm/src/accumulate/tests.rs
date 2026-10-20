@@ -1,7 +1,7 @@
 use serde_json::json;
 
 use super::*;
-use crate::spec::{CallEnd, Reason};
+use crate::spec::{Block, CallEnd, Reason};
 
 fn finish(order: Option<Vec<u32>>) -> Event {
     Event::Finish {
@@ -40,9 +40,10 @@ fn builds_parts_in_index_order_with_state_and_calls() {
         },
         Event::End {
             index: 0,
-            redacted: false,
-            text: Some("think".into()),
-            call: None,
+            ended: Ended::Reasoning {
+                text: "think".into(),
+                redacted: false,
+            },
         },
         Event::Meta {
             index: 0,
@@ -50,9 +51,7 @@ fn builds_parts_in_index_order_with_state_and_calls() {
         },
         Event::End {
             index: 1,
-            redacted: false,
-            text: None,
-            call: Some(CallEnd {
+            ended: Ended::Call(CallEnd {
                 id: "c1".into(),
                 input: crate::Json::encode(&json!({"a": 1})).unwrap(),
                 invalid: None,
@@ -96,9 +95,9 @@ fn a_restated_end_and_a_stated_order_win() {
         .unwrap();
         acc.push(Event::End {
             index,
-            redacted: false,
-            text: Some(format!("final {index}")),
-            call: None,
+            ended: Ended::Text {
+                text: format!("final {index}"),
+            },
         })
         .unwrap();
     }

@@ -2,17 +2,20 @@
 //! it with their quirks.
 
 mod decode;
-mod encode;
+pub(super) mod encode;
 
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
 use crate::error::Error;
 use crate::protocol::{Decoder, Encoded, Host, Hosted, Protocol, Target};
-use crate::spec::Request;
+use crate::spec::{ProtocolKey, Request};
+
+/// Which protocol this is.
+pub const PROTOCOL: ProtocolKey = ProtocolKey::OpenaiResponses;
 
 /// Where this protocol's options and part state go.
-pub const KEY: &str = "openai.responses";
+pub const KEY: &str = PROTOCOL.as_str();
 
 /// Where the request's system instructions go.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -65,7 +68,7 @@ impl Responses {
 impl Hosted for Responses {
     type Quirks = Quirks;
 
-    const KEY: &'static str = KEY;
+    const PROTOCOL: ProtocolKey = PROTOCOL;
     const HOSTS: &'static [(Host, Quirks)] = HOSTS;
 
     fn with(quirks: Quirks) -> Self {
@@ -74,17 +77,15 @@ impl Hosted for Responses {
 }
 
 impl Protocol for Responses {
-    fn key(&self) -> &'static str {
-        KEY
+    fn key(&self) -> ProtocolKey {
+        PROTOCOL
     }
 
     fn encode(&self, target: &Target<'_>, request: &Request) -> Result<Encoded, Error> {
-        let (body, history) = encode::body(self, target, request)?;
+        let encoded = encode::body(self, target, request)?;
         Ok(Encoded {
             path: self.quirks.path.to_owned(),
-            body,
-            history,
-            headers: Vec::new(),
+            ..encoded
         })
     }
 

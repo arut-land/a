@@ -23,29 +23,10 @@ pub struct Meta(BTreeMap<String, Raw>);
 pub(crate) struct Raw(Box<RawValue>);
 
 impl Raw {
-    /// `value`'s text, in a buffer of its size: state can hold a whole
-    /// reasoning text, which a growing buffer would hold twice over.
+    /// `value`'s text, written once. State this crate writes always
+    /// encodes.
     fn new(value: &(impl Serialize + ?Sized)) -> Self {
-        struct Count(usize);
-
-        impl std::io::Write for Count {
-            fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
-                self.0 += bytes.len();
-                Ok(bytes.len())
-            }
-
-            fn flush(&mut self) -> std::io::Result<()> {
-                Ok(())
-            }
-        }
-
-        let mut count = Count(0);
-        // State this crate writes always encodes.
-        let _ = serde_json::to_writer(&mut count, value);
-        let mut text = Vec::with_capacity(count.0);
-        let _ = serde_json::to_writer(&mut text, value);
-        let text = String::from_utf8(text).unwrap_or_default();
-        Self(RawValue::from_string(text).unwrap_or_default())
+        Self(serde_json::value::to_raw_value(value).unwrap_or_default())
     }
 
     /// State read as it was written: the text of a reply this crate logged.

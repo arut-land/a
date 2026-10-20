@@ -12,12 +12,12 @@ use serde_json::Value;
 use crate::conversation::{History, Pieces};
 use crate::error::{Error, Kind};
 use crate::http::Payload;
-use crate::spec::{Event, Request, SmolStr};
+use crate::spec::{Event, ProtocolKey, Request, SmolStr};
 
 pub trait Protocol: Send + Sync + 'static {
-    /// The key this protocol's options and part state go under, and the
-    /// protocol an [`Origin`](crate::Origin) names.
-    fn key(&self) -> &'static str;
+    /// Which protocol this is: the key its options and part state go
+    /// under, and the protocol an [`Origin`](crate::Origin) names.
+    fn key(&self) -> ProtocolKey;
 
     /// The request for `request`, already prepared for `target`.
     fn encode(&self, target: &Target<'_>, request: &Request) -> Result<Encoded, Error>;
@@ -43,7 +43,7 @@ pub trait Protocol: Send + Sync + 'static {
 pub trait Hosted: Protocol + Sized {
     type Quirks: Copy + 'static;
 
-    const KEY: &'static str;
+    const PROTOCOL: ProtocolKey;
     const HOSTS: &'static [(Host, Self::Quirks)];
 
     fn with(quirks: Self::Quirks) -> Self;
@@ -65,12 +65,16 @@ pub struct Encoded {
     /// The conversation, written into the body at its key; `None` when
     /// options set that field themselves.
     pub history: Option<History>,
+    /// The tool definitions, written into the body at their key from the
+    /// bytes the tool set keeps; `None` when there are none, or options
+    /// set that field themselves.
+    pub tools: Option<History>,
     pub headers: Vec<(&'static str, String)>,
 }
 
 impl Encoded {
-    /// The body's bytes: its fields in order, the conversation's settled
-    /// items spliced in as they are.
+    /// The body's bytes: its fields in key order, the conversation's
+    /// settled items and the tool definitions spliced in as they are.
     pub fn payload(&self) -> Payload {
         let mut out = Pieces::default();
         let Value::Object(fields) = &self.body else {
@@ -78,31 +82,29 @@ impl Encoded {
             return out.finish().into();
         };
         out.byte(b'{');
-        let mut history = self.history.as_ref();
+        let mut spliced: Vec<&History> =
+            [&self.history, &self.tools].into_iter().flatten().collect();
+        spliced.sort_by_key(|spliced| spliced.key);
+        let mut spliced = spliced.into_iter().peekable();
         let mut first = true;
-        let mut comma = |out: &mut Pieces| {
+        let mut field = |out: &mut Pieces, key: &str| {
             if !std::mem::take(&mut first) {
                 out.byte(b',');
             }
-        };
-        for (key, value) in fields {
-            if let Some(spliced) = history.filter(|history| history.key < key.as_str()) {
-                comma(&mut out);
-                out.json(spliced.key);
-                out.byte(b':');
-                spliced.write(&mut out);
-                history = None;
-            }
-            comma(&mut out);
             out.json(key);
             out.byte(b':');
+        };
+        for (key, value) in fields {
+            while let Some(array) = spliced.next_if(|array| array.key < key.as_str()) {
+                field(&mut out, array.key);
+                array.write(&mut out);
+            }
+            field(&mut out, key);
             out.json(value);
         }
-        if let Some(spliced) = history {
-            comma(&mut out);
-            out.json(spliced.key);
-            out.byte(b':');
-            spliced.write(&mut out);
+        for array in spliced {
+            field(&mut out, array.key);
+            array.write(&mut out);
         }
         out.byte(b'}');
         out.finish().into()
@@ -189,7 +191,7 @@ impl fmt::Debug for Provider {
         f.debug_struct("Provider")
             .field("id", &self.id)
             .field("base_url", &self.base_url)
-            .field("protocol", &self.protocol.key())
+            .field("protocol", &self.protocol.key().as_str())
             .finish_non_exhaustive()
     }
 }
@@ -233,8 +235,10 @@ impl Provider {
         };
         let mut encoded = self.protocol.encode(&target, request)?;
         if let Some(overlay) = &request.body {
-            // A conversation the escape hatch states is the one sent.
+            // A conversation, or tools, the escape hatch states are the ones
+            // sent.
             encoded.history = encoded.history.filter(|h| !overlay.contains_key(h.key));
+            encoded.tools = encoded.tools.filter(|t| !overlay.contains_key(t.key));
             crate::json::overlay(&mut encoded.body, overlay);
         }
         let mut uri = format!("{}{}", self.base_url, encoded.path);

@@ -1,10 +1,10 @@
-use serde_json::json;
+use serde_json::{Value, json};
 
 use super::*;
 use crate::protocol::{Auth, Provider};
 use crate::protocols::{chat, gemini, messages, responses};
 use crate::spec::{
-    Assistant, AssistantPart, Output, Request, Text, ToolCall, ToolMessage, ToolResult,
+    Assistant, AssistantPart, Output, Request, Text, ToolCall, ToolMessage, ToolResult, Tools,
 };
 
 fn providers() -> [Provider; 4] {
@@ -135,5 +135,50 @@ fn a_change_before_the_end_is_encoded_again() {
         let sent = body(&provider, &copy);
         assert_eq!(folded(), 1);
         assert_eq!(sent, body(&provider, &Messages::from(copy.to_vec())));
+    }
+}
+
+/// The request's tools are written from the bytes the tool set keeps, in
+/// the same place and shape as the body's own field, and an escape-hatch
+/// `tools` is the one sent.
+#[test]
+fn tools_are_spliced_as_the_bodys_field_and_an_escape_hatch_replaces_them() {
+    let tools = Tools::from(vec![crate::Tool {
+        name: "bash".into(),
+        description: "Runs a command.".into(),
+        schema: json!({"type": "object", "properties": {"command": {"type": "string"}}}),
+        strict: None,
+    }]);
+    for provider in providers() {
+        let request = Request {
+            model: "claude-sonnet-4-5".into(),
+            messages: vec![Message::user("go")].into(),
+            tools: tools.clone(),
+            generation: crate::Generation {
+                max_output_tokens: std::num::NonZeroU32::new(64),
+                ..crate::Generation::default()
+            },
+            ..Request::default()
+        };
+        let sent = |request: &Request| -> Value {
+            let http = provider.request(&request.model, request).expect("encodes");
+            serde_json::from_slice(&http.body().to_vec()).expect("a JSON body")
+        };
+        let body = sent(&request);
+        let tools = body["tools"].as_array().expect("tools");
+        let text = serde_json::to_string(&body).unwrap();
+        assert!(
+            text.contains(r#""bash""#),
+            "{}: {text}",
+            provider.protocol.key()
+        );
+        assert_eq!(tools.len(), 1, "{}: {tools:?}", provider.protocol.key());
+        let again = sent(&request);
+        assert_eq!(again, body, "{}", provider.protocol.key());
+        let overlay = Request {
+            body: json!({"tools": [{"type": "hosted"}]}).as_object().cloned(),
+            ..request.clone()
+        };
+        assert_eq!(sent(&overlay)["tools"], json!([{"type": "hosted"}]));
     }
 }

@@ -1,6 +1,7 @@
 //! The hosts that serve Chat Completions, with their quirks.
 
-use super::{LaterSystem, OutputCap, Quirks, ReasoningField, Routing, Vendor};
+use super::{LaterSystem, Media, OutputCap, Quirks, ReasoningField, Routing, Vendor};
+use crate::models::Maker;
 use crate::protocol::{Host, KeyStyle};
 use crate::spec::Reason;
 
@@ -23,10 +24,51 @@ const fn at(
     }
 }
 
-/// The baseline under `vendor`'s rules.
+/// What media `vendor`'s hosts take.
+const fn media(vendor: Vendor) -> Media {
+    let parts = !matches!(vendor, Vendor::DeepSeek | Vendor::Mira);
+    let files = parts && !matches!(vendor, Vendor::Perplexity | Vendor::Cohere | Vendor::Ollama);
+    Media {
+        parts,
+        files,
+        video: files && !matches!(vendor, Vendor::OpenAi | Vendor::Azure | Vendor::Mistral),
+        // Ollama reads an image as data and never fetches a URL.
+        url_images: !matches!(vendor, Vendor::Ollama),
+        // OpenRouter and Mistral fetch a PDF a URL names.
+        url_pdfs: matches!(vendor, Vendor::OpenRouter | Vendor::Mistral),
+    }
+}
+
+/// Whose model rules `vendor`'s hosts follow.
+const fn maker(vendor: Vendor) -> Option<Maker> {
+    Some(match vendor {
+        Vendor::OpenAi | Vendor::Azure => Maker::OpenAi,
+        Vendor::DeepSeek | Vendor::Mira => Maker::TextOnly,
+        Vendor::Groq => Maker::Groq,
+        Vendor::Mistral => Maker::Mistral,
+        Vendor::Xai => Maker::Xai,
+        Vendor::Cohere => Maker::Cohere,
+        Vendor::Zai => Maker::Zai,
+        Vendor::Moonshot => Maker::Moonshot,
+        Vendor::MiniMax => Maker::MiniMax,
+        Vendor::Mimo => Maker::Xiaomi,
+        Vendor::OpenRouter
+        | Vendor::Together
+        | Vendor::Venice
+        | Vendor::LlamaCpp
+        | Vendor::Ollama
+        | Vendor::Perplexity
+        | Vendor::Other => return None,
+    })
+}
+
+/// The baseline under `vendor`'s rules: what its hosts take follows from
+/// it, here, once.
 const fn vendor(vendor: Vendor) -> Quirks {
     Quirks {
         vendor,
+        media: media(vendor),
+        maker: maker(vendor),
         ..Quirks::OPENAI
     }
 }

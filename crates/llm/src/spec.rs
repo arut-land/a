@@ -1,6 +1,9 @@
 //! The provider-agnostic representation: what goes into a request, what a
 //! stream says, and what a finished reply is. Every type here is plain serde
-//! data, stable on disk, and knows nothing about any wire API.
+//! data, stable on disk, and knows nothing about any wire API. A logged
+//! reply is read by [`Response::from_json`], the one codec of the shipped
+//! binary; the derived `Deserialize` of the larger types exists for tests
+//! (fixtures, and that the reader agrees with the derive).
 //!
 //! A message's kind decides what it may hold: only an assistant calls
 //! tools, only a tool message answers them, and a system message is text.
@@ -16,6 +19,8 @@ use std::fmt;
 use std::num::NonZeroU32;
 use std::sync::{Arc, Mutex, PoisonError};
 
+use crate::conversation::Shared;
+
 pub use ::json::Json;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -24,11 +29,46 @@ pub use smol_str::SmolStr;
 pub use self::meta::Meta;
 pub use crate::conversation::Messages;
 
-/// Typed per-protocol options, keyed by protocol.
-pub type Options = BTreeMap<String, Value>;
+/// A wire protocol by name: what an [`Origin`] names, and the key a
+/// request's options and a part's state go under. Four exist; a fifth
+/// cannot be spelled.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+pub enum ProtocolKey {
+    #[serde(rename = "openai.chat")]
+    OpenaiChat,
+    #[serde(rename = "openai.responses")]
+    OpenaiResponses,
+    #[serde(rename = "anthropic.messages")]
+    AnthropicMessages,
+    #[serde(rename = "google.gemini")]
+    GoogleGemini,
+}
+
+impl ProtocolKey {
+    /// The key as it is written: in a log's `origin` and `meta`, in a
+    /// request's options.
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::OpenaiChat => "openai.chat",
+            Self::OpenaiResponses => "openai.responses",
+            Self::AnthropicMessages => "anthropic.messages",
+            Self::GoogleGemini => "google.gemini",
+        }
+    }
+}
+
+impl fmt::Display for ProtocolKey {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+
+/// Per-protocol options, each protocol's as body fields, keyed by protocol.
+pub type Options = BTreeMap<ProtocolKey, Value>;
 
 /// One model call.
-#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
+#[derive(Clone, Debug, Default, PartialEq, Serialize)]
+#[cfg_attr(test, derive(Deserialize))]
 pub struct Request {
     pub model: SmolStr,
     /// The conversation. Leading system messages are the system prompt;
@@ -61,17 +101,18 @@ pub struct Request {
 }
 
 impl Request {
-    /// The typed options under protocol `key`, as body fields.
-    pub fn options_for(&self, key: &str) -> serde_json::Map<String, Value> {
+    /// The options under protocol `key`, as body fields.
+    pub fn options_for(&self, key: ProtocolKey) -> serde_json::Map<String, Value> {
         self.options
-            .get(key)
+            .get(&key)
             .and_then(Value::as_object)
             .cloned()
             .unwrap_or_default()
     }
 }
 
-#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
+#[derive(Clone, Debug, Default, PartialEq, Serialize)]
+#[cfg_attr(test, derive(Deserialize))]
 pub struct Generation {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub max_output_tokens: Option<NonZeroU32>,
@@ -125,7 +166,8 @@ impl Effort {
     }
 }
 
-#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[derive(Clone, Debug, PartialEq, Serialize)]
+#[cfg_attr(test, derive(Deserialize))]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum Format {
     Text,
@@ -139,7 +181,8 @@ pub enum Format {
     },
 }
 
-#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[derive(Clone, Debug, PartialEq, Serialize)]
+#[cfg_attr(test, derive(Deserialize))]
 pub struct Tool {
     pub name: SmolStr,
     #[serde(default, skip_serializing_if = "String::is_empty")]
@@ -148,55 +191,51 @@ pub struct Tool {
     pub schema: Value,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub strict: Option<bool>,
-    /// Its definition as each protocol encodes it, made the first time.
-    #[serde(skip)]
-    pub encoded: Encodings,
-}
-
-impl Tool {
-    /// The tool's definition as protocol `key` encodes it, `encode` run
-    /// for the first request that offers it and kept for every later one:
-    /// a tool set never changes, so neither do its definitions.
-    pub(crate) fn encoded(&self, key: &'static str, encode: impl FnOnce(&Self) -> Value) -> Value {
-        let mut kept = self
-            .encoded
-            .0
-            .lock()
-            .unwrap_or_else(PoisonError::into_inner);
-        if let Some((_, value)) = kept.iter().find(|(k, _)| *k == key) {
-            return value.clone();
-        }
-        let value = encode(self);
-        kept.push((key, value.clone()));
-        value
-    }
-}
-
-/// A tool's definitions as protocols encode them, shared by its copies.
-#[derive(Clone, Default)]
-pub struct Encodings(Arc<Mutex<Vec<(&'static str, Value)>>>);
-
-impl fmt::Debug for Encodings {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.write_str("Encodings")
-    }
-}
-
-/// What is kept follows from the tool, which tells two apart.
-impl PartialEq for Encodings {
-    fn eq(&self, _: &Self) -> bool {
-        true
-    }
 }
 
 /// The tools a request offers: shared, as every request of a tool set
-/// offers the same.
-#[derive(Clone, Debug, Default, PartialEq)]
-pub struct Tools(Arc<[Tool]>);
+/// offers the same, with their definitions as each wire encodes them, made
+/// for the first request that offers them and kept for every later one.
+#[derive(Clone, Default)]
+pub struct Tools(Arc<Set>);
+
+#[derive(Default)]
+struct Set {
+    tools: Vec<Tool>,
+    /// Each tool's definition, as bytes, per wire it was encoded for.
+    encoded: Mutex<Vec<(ToolWire, Arc<[Shared]>)>>,
+}
+
+/// A wire's way of writing a tool definition.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum ToolWire {
+    Chat { strict: bool },
+    Responses { strict: bool },
+    Messages { strict: bool, eager: bool },
+    Gemini,
+}
 
 impl Tools {
     fn is_empty(&self) -> bool {
-        self.0.is_empty()
+        self.0.tools.is_empty()
+    }
+
+    /// The tools' definitions as `wire` writes them, one byte run each:
+    /// `encode` runs once per tool, for the first request.
+    pub(crate) fn encoded(&self, wire: ToolWire, encode: impl Fn(&Tool) -> Value) -> Arc<[Shared]> {
+        let mut kept = self
+            .0
+            .encoded
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner);
+        if let Some((_, run)) = kept.iter().find(|(w, _)| *w == wire) {
+            return Arc::clone(run);
+        }
+        let run: Arc<[Shared]> = (self.0.tools.iter())
+            .map(|tool| serde_json::to_vec(&encode(tool)).unwrap_or_default().into())
+            .collect();
+        kept.push((wire, Arc::clone(&run)));
+        run
     }
 }
 
@@ -204,28 +243,46 @@ impl std::ops::Deref for Tools {
     type Target = [Tool];
 
     fn deref(&self) -> &[Tool] {
-        &self.0
+        &self.0.tools
+    }
+}
+
+/// Two tool sets are equal when their tools are: what each wire made of
+/// them follows.
+impl PartialEq for Tools {
+    fn eq(&self, other: &Self) -> bool {
+        **self == **other
+    }
+}
+
+impl fmt::Debug for Tools {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        self.0.tools.fmt(f)
     }
 }
 
 impl From<Vec<Tool>> for Tools {
     fn from(tools: Vec<Tool>) -> Self {
-        Self(tools.into())
+        Self(Arc::new(Set {
+            tools,
+            encoded: Mutex::default(),
+        }))
     }
 }
 
 impl FromIterator<Tool> for Tools {
     fn from_iter<I: IntoIterator<Item = Tool>>(tools: I) -> Self {
-        Self(tools.into_iter().collect())
+        Vec::from_iter(tools).into()
     }
 }
 
 impl Serialize for Tools {
     fn serialize<S: serde::Serializer>(&self, s: S) -> Result<S::Ok, S::Error> {
-        s.collect_seq(self.0.iter())
+        s.collect_seq(self.0.tools.iter())
     }
 }
 
+#[cfg(test)]
 impl<'de> Deserialize<'de> for Tools {
     fn deserialize<D: serde::Deserializer<'de>>(d: D) -> Result<Self, D::Error> {
         Vec::<Tool>::deserialize(d).map(Into::into)
@@ -248,7 +305,8 @@ impl ToolChoice {
     }
 }
 
-#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[derive(Clone, Debug, PartialEq, Serialize)]
+#[cfg_attr(test, derive(Deserialize))]
 #[serde(tag = "role", rename_all = "lowercase")]
 pub enum Message {
     System(System),
@@ -278,7 +336,8 @@ impl Message {
     }
 }
 
-#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
+#[derive(Clone, Debug, Default, PartialEq, Serialize)]
+#[cfg_attr(test, derive(Deserialize))]
 pub struct System {
     pub content: Vec<Text>,
 }
@@ -296,19 +355,22 @@ impl System {
     }
 }
 
-#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
+#[derive(Clone, Debug, Default, PartialEq, Serialize)]
+#[cfg_attr(test, derive(Deserialize))]
 pub struct User {
     pub content: Vec<UserPart>,
 }
 
-#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[derive(Clone, Debug, PartialEq, Serialize)]
+#[cfg_attr(test, derive(Deserialize))]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum UserPart {
     Text(Text),
     Media(Media),
 }
 
-#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
+#[derive(Clone, Debug, Default, PartialEq, Serialize)]
+#[cfg_attr(test, derive(Deserialize))]
 pub struct Assistant {
     /// The parts, in the order the provider produced them.
     pub content: Vec<AssistantPart>,
@@ -339,7 +401,8 @@ impl Assistant {
     }
 }
 
-#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[derive(Clone, Debug, PartialEq, Serialize)]
+#[cfg_attr(test, derive(Deserialize))]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum AssistantPart {
     Text(Text),
@@ -378,12 +441,14 @@ impl AssistantPart {
 }
 
 /// The answers to one assistant message's tool calls.
-#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
+#[derive(Clone, Debug, Default, PartialEq, Serialize)]
+#[cfg_attr(test, derive(Deserialize))]
 pub struct ToolMessage {
     pub results: Vec<ToolResult>,
 }
 
-#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
+#[derive(Clone, Debug, Default, PartialEq, Serialize)]
+#[cfg_attr(test, derive(Deserialize))]
 pub struct Text {
     pub text: String,
     #[serde(default, skip_serializing_if = "Meta::is_empty")]
@@ -401,7 +466,8 @@ impl Text {
 
 /// Reasoning the model showed. Redacted reasoning has no readable text;
 /// only its producer can replay it, from `meta`.
-#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
+#[derive(Clone, Debug, Default, PartialEq, Serialize)]
+#[cfg_attr(test, derive(Deserialize))]
 pub struct Reasoning {
     #[serde(default, skip_serializing_if = "String::is_empty")]
     pub text: String,
@@ -411,7 +477,8 @@ pub struct Reasoning {
     pub meta: Meta,
 }
 
-#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[derive(Clone, Debug, PartialEq, Serialize)]
+#[cfg_attr(test, derive(Deserialize))]
 pub struct Media {
     pub media_type: SmolStr,
     pub source: Source,
@@ -419,7 +486,8 @@ pub struct Media {
     pub meta: Meta,
 }
 
-#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[derive(Clone, Debug, PartialEq, Serialize)]
+#[cfg_attr(test, derive(Deserialize))]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum Source {
     /// Base64 data.
@@ -435,7 +503,8 @@ pub enum Source {
     },
 }
 
-#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[derive(Clone, Debug, PartialEq, Serialize)]
+#[cfg_attr(test, derive(Deserialize))]
 pub struct ToolCall {
     pub id: SmolStr,
     pub name: SmolStr,
@@ -458,6 +527,7 @@ pub struct ToolCall {
 
 /// A call's arguments as a derived `Deserialize` reads them, buffered: a
 /// JSON object, through a tree. [`Response::from_json`] keeps the text.
+#[cfg(test)]
 fn object<'de, D: serde::Deserializer<'de>>(d: D) -> Result<Json, D::Error> {
     let object = serde_json::Map::<String, Value>::deserialize(d)?;
     Json::encode(&object).map_err(serde::de::Error::custom)
@@ -476,7 +546,8 @@ impl ToolCall {
     }
 }
 
-#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[derive(Clone, Debug, PartialEq, Serialize)]
+#[cfg_attr(test, derive(Deserialize))]
 pub struct ToolResult {
     pub id: SmolStr,
     pub name: SmolStr,
@@ -487,7 +558,8 @@ pub struct ToolResult {
     pub meta: Meta,
 }
 
-#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[derive(Clone, Debug, PartialEq, Serialize)]
+#[cfg_attr(test, derive(Deserialize))]
 #[serde(tag = "type", content = "value", rename_all = "snake_case")]
 pub enum Output {
     Text(String),
@@ -502,7 +574,8 @@ impl Default for Output {
     }
 }
 
-#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
+#[derive(Clone, Debug, Default, PartialEq, Serialize)]
+#[cfg_attr(test, derive(Deserialize))]
 pub struct Opaque {
     #[serde(default, skip_serializing_if = "Meta::is_empty")]
     pub meta: Meta,
@@ -511,7 +584,7 @@ pub struct Opaque {
 /// The wire protocol, provider and model that produced a message.
 #[derive(Clone, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub struct Origin {
-    pub protocol: SmolStr,
+    pub protocol: ProtocolKey,
     pub provider: SmolStr,
     pub model: SmolStr,
 }
@@ -558,7 +631,81 @@ pub struct Usage {
     pub hosted_tool_calls: Option<u64>,
 }
 
+/// The counts a [`Usage`] holds, each naming its field.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Count {
+    Input,
+    Output,
+    CacheRead,
+    CacheWrite,
+    CacheWriteLong,
+    ToolInput,
+    AudioInput,
+    Reasoning,
+    AudioOutput,
+    HostedToolCalls,
+}
+
+impl Count {
+    pub const ALL: [Self; 10] = [
+        Self::Input,
+        Self::Output,
+        Self::CacheRead,
+        Self::CacheWrite,
+        Self::CacheWriteLong,
+        Self::ToolInput,
+        Self::AudioInput,
+        Self::Reasoning,
+        Self::AudioOutput,
+        Self::HostedToolCalls,
+    ];
+
+    /// The count field `key` names.
+    pub(crate) fn named(key: &str) -> Option<Self> {
+        Some(match key {
+            "input" => Self::Input,
+            "output" => Self::Output,
+            "cache_read" => Self::CacheRead,
+            "cache_write" => Self::CacheWrite,
+            "cache_write_long" => Self::CacheWriteLong,
+            "tool_input" => Self::ToolInput,
+            "audio_input" => Self::AudioInput,
+            "reasoning" => Self::Reasoning,
+            "audio_output" => Self::AudioOutput,
+            "hosted_tool_calls" => Self::HostedToolCalls,
+            _ => return None,
+        })
+    }
+}
+
 impl Usage {
+    /// The field `count` names.
+    pub fn count(&mut self, count: Count) -> &mut Option<u64> {
+        match count {
+            Count::Input => &mut self.input,
+            Count::Output => &mut self.output,
+            Count::CacheRead => &mut self.cache_read,
+            Count::CacheWrite => &mut self.cache_write,
+            Count::CacheWriteLong => &mut self.cache_write_long,
+            Count::ToolInput => &mut self.tool_input,
+            Count::AudioInput => &mut self.audio_input,
+            Count::Reasoning => &mut self.reasoning,
+            Count::AudioOutput => &mut self.audio_output,
+            Count::HostedToolCalls => &mut self.hosted_tool_calls,
+        }
+    }
+
+    /// The counts `table` names read from `usage`, a provider's usage
+    /// object, by JSON pointer; one absent, or not a count, stays `None`.
+    pub(crate) fn read(usage: &Value, table: &[(Count, &str)]) -> Self {
+        use crate::json::Lenient;
+        let mut read = Self::default();
+        for (count, pointer) in table {
+            *read.count(*count) = usage.at(pointer).and_then(Value::as_u64_lenient);
+        }
+        read
+    }
+
     /// The part of `input` neither read from nor written to a cache.
     pub fn uncached_input(&self) -> Option<u64> {
         let cached = self.cache_read.unwrap_or(0) + self.cache_write.unwrap_or(0);
@@ -581,23 +728,15 @@ impl Usage {
 impl std::ops::Add for Usage {
     type Output = Self;
 
-    fn add(self, other: Self) -> Self {
-        let sum = |a: Option<u64>, b: Option<u64>| match (a, b) {
-            (None, None) => None,
-            (a, b) => Some(a.unwrap_or(0) + b.unwrap_or(0)),
-        };
-        Self {
-            input: sum(self.input, other.input),
-            output: sum(self.output, other.output),
-            cache_read: sum(self.cache_read, other.cache_read),
-            cache_write: sum(self.cache_write, other.cache_write),
-            cache_write_long: sum(self.cache_write_long, other.cache_write_long),
-            tool_input: sum(self.tool_input, other.tool_input),
-            audio_input: sum(self.audio_input, other.audio_input),
-            reasoning: sum(self.reasoning, other.reasoning),
-            audio_output: sum(self.audio_output, other.audio_output),
-            hosted_tool_calls: sum(self.hosted_tool_calls, other.hosted_tool_calls),
+    fn add(mut self, mut other: Self) -> Self {
+        for count in Count::ALL {
+            let (a, b) = (*self.count(count), *other.count(count));
+            *self.count(count) = match (a, b) {
+                (None, None) => None,
+                (a, b) => Some(a.unwrap_or(0) + b.unwrap_or(0)),
+            };
         }
+        self
     }
 }
 
@@ -622,6 +761,19 @@ pub enum Reason {
     ContentFilter,
     Error,
     Other,
+}
+
+impl Reason {
+    /// The reason `table`, a protocol's vocabulary, gives `word`.
+    pub(crate) fn listed(table: &[(&str, Self)], word: &str) -> Option<Self> {
+        let found = table.iter().find(|(name, _)| *name == word);
+        found.map(|(_, reason)| *reason)
+    }
+
+    /// [`Self::listed`], `Other` for a word the table does not know.
+    pub(crate) fn of(table: &[(&str, Self)], word: &str) -> Self {
+        Self::listed(table, word).unwrap_or(Self::Other)
+    }
 }
 
 /// How a reply ended: the normalized reason, the provider's own word, and
@@ -656,7 +808,8 @@ pub enum Block {
 
 /// One step of a streamed reply. Parts are numbered by `index` as they
 /// open; each opens, grows, and ends before the reply's `Finish`.
-#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[derive(Clone, Debug, PartialEq, Serialize)]
+#[cfg_attr(test, derive(Deserialize))]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum Event {
     /// What the provider said about the reply, once it is known.
@@ -675,19 +828,8 @@ pub enum Event {
     },
     /// Text, reasoning text, or a fragment of a call's argument JSON.
     Delta { index: u32, text: String },
-    /// A part ends. Text and reasoning end with their whole `text` (what
-    /// streamed, or what the provider restated), moved rather than copied:
-    /// deltas carry pieces, and only the end the whole. A call ends with its
-    /// id and arguments.
-    End {
-        index: u32,
-        #[serde(default, skip_serializing_if = "std::ops::Not::not")]
-        redacted: bool,
-        #[serde(default, skip_serializing_if = "Option::is_none")]
-        text: Option<String>,
-        #[serde(default, skip_serializing_if = "Option::is_none")]
-        call: Option<CallEnd>,
-    },
+    /// A part ends, as what it was.
+    End { index: u32, ended: Ended },
     /// A whole part at once: media, a hosted tool's result, an opaque item.
     Part { index: u32, part: AssistantPart },
     /// Provider state for a part, merged key by key into what it has.
@@ -704,7 +846,21 @@ pub enum Event {
     },
 }
 
-#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+/// What a part ended as. Text and reasoning end with their whole `text`
+/// (what streamed, or what the provider restated), moved rather than
+/// copied: deltas carry pieces, and only the end the whole. A call ends
+/// with its id and arguments.
+#[derive(Clone, Debug, PartialEq, Serialize)]
+#[cfg_attr(test, derive(Deserialize))]
+#[serde(tag = "block", rename_all = "snake_case")]
+pub enum Ended {
+    Text { text: String },
+    Reasoning { text: String, redacted: bool },
+    Call(CallEnd),
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize)]
+#[cfg_attr(test, derive(Deserialize))]
 pub struct CallEnd {
     pub id: SmolStr,
     #[serde(deserialize_with = "object")]
@@ -716,7 +872,8 @@ pub struct CallEnd {
 }
 
 /// A finished reply.
-#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[derive(Clone, Debug, PartialEq, Serialize)]
+#[cfg_attr(test, derive(Deserialize))]
 pub struct Response {
     pub message: Assistant,
     pub finish: Finish,
@@ -734,31 +891,40 @@ mod read;
 
 #[cfg(test)]
 mod tests {
+    use std::cell::Cell;
+
     use super::*;
 
-    /// A tool set never changes, so each protocol encodes its definitions
-    /// once: every copy of a tool shares what was made.
+    /// A tool set never changes, so each wire encodes its definitions
+    /// once, as bytes every copy of the set shares; another wire, or the
+    /// same one strict, encodes its own.
     #[test]
-    fn a_tool_is_encoded_once_per_protocol() {
-        let tool = Tool {
-            name: "t".into(),
+    fn a_tool_set_is_encoded_once_per_wire() {
+        let tool = |name: &str| Tool {
+            name: name.into(),
             description: String::new(),
             schema: serde_json::json!({ "type": "object" }),
             strict: None,
-            encoded: Encodings::default(),
         };
-        let tools = Tools::from(vec![tool]);
+        let tools = Tools::from(vec![tool("a"), tool("b")]);
         let copy = tools.clone();
-        let mut made = 0;
+        let made = Cell::new(0);
+        let encode = |tool: &Tool| {
+            made.set(made.get() + 1);
+            serde_json::json!({ "name": tool.name })
+        };
+        let chat = ToolWire::Chat { strict: false };
         for tools in [&tools, &copy, &tools] {
-            let encoded = tools[0].encoded("p", |t| {
-                made += 1;
-                serde_json::json!({ "name": t.name })
-            });
-            assert_eq!(encoded["name"], "t");
+            let run = tools.encoded(chat, encode);
+            let texts: Vec<&str> = run
+                .iter()
+                .map(|bytes| std::str::from_utf8(bytes).unwrap())
+                .collect();
+            assert_eq!(texts, [r#"{"name":"a"}"#, r#"{"name":"b"}"#]);
         }
-        assert_eq!(made, 1);
-        let other = tools[0].encoded("q", |_| serde_json::json!(2));
-        assert_eq!(other, 2);
+        assert_eq!(made.get(), 2);
+        tools.encoded(ToolWire::Chat { strict: true }, encode);
+        assert_eq!(made.get(), 4);
+        assert_eq!(tools, copy, "the tools, not what was made of them");
     }
 }

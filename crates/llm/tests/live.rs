@@ -1,6 +1,7 @@
 //! Calls against real endpoints, ignored by default: `mise exec -- cargo
-//! nextest run -p llm --features ureq --run-ignored only --test live`. They read
-//! keys and base URLs from the environment.
+//! nextest run -p llm --features tls-native --run-ignored only --test live`
+//! (the TLS the platform gives). They read keys and base URLs from the
+//! environment.
 
 #![cfg(feature = "ureq")]
 
@@ -54,7 +55,6 @@ fn responses_tool_round_trip_replays_its_items() {
         description: "Returns the label of a harbor by its number.".into(),
         schema: json!({"type": "object", "properties": {"number": {"type": "integer"}}, "required": ["number"]}),
         strict: None,
-        encoded: llm::Encodings::default(),
     };
     let mut request = Request {
         model: model(),
@@ -136,7 +136,6 @@ fn messages_thinking_tool_round_trip_replays_its_signature() {
         description: "Returns the label of a harbor by its number.".into(),
         schema: json!({"type": "object", "properties": {"number": {"type": "integer"}}, "required": ["number"]}),
         strict: None,
-        encoded: llm::Encodings::default(),
     };
     let mut request = Request {
         model: claude(),
@@ -199,7 +198,6 @@ fn tool_round_trip(provider: &Provider, model: &str) {
         description: "Returns the label of a harbor by its number.".into(),
         schema: json!({"type": "object", "properties": {"number": {"type": "integer"}}, "required": ["number"]}),
         strict: None,
-        encoded: llm::Encodings::default(),
     };
     let mut request = Request {
         model: model.into(),

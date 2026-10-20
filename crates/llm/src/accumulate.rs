@@ -5,8 +5,8 @@
 
 use crate::error::{Error, Kind};
 use crate::spec::{
-    Assistant, AssistantPart, Block, CallEnd, Event, Finish, Meta, Opaque, Origin, Reasoning,
-    Response, SmolStr, Text, ToolCall, Usage,
+    Assistant, AssistantPart, Ended, Event, Finish, Meta, Opaque, Origin, Reasoning, Response,
+    SmolStr, Text, ToolCall, Usage,
 };
 
 #[derive(Debug, Default)]
@@ -27,49 +27,35 @@ struct Finished {
     order: Option<Vec<u32>>,
 }
 
+/// A part while it streams: a call's name, and the state it gathers. Its
+/// end says what it was.
 #[derive(Debug)]
 enum Building {
-    Open {
-        block: Block,
-        name: Option<SmolStr>,
-        meta: Meta,
-    },
+    Open { name: Option<SmolStr>, meta: Meta },
     Done(AssistantPart),
 }
 
 impl Building {
     /// The part an open part ends as.
-    fn end(
-        self,
-        index: u32,
-        redacted: bool,
-        text: Option<String>,
-        call: Option<CallEnd>,
-    ) -> Result<AssistantPart, Error> {
-        let Self::Open { block, name, meta } = self else {
+    fn end(self, index: u32, ended: Ended) -> Result<AssistantPart, Error> {
+        let Self::Open { name, meta } = self else {
             return Err(order(format!("part {index} ended while not open")));
         };
-        let text = text.unwrap_or_default();
-        Ok(match block {
-            Block::Text => AssistantPart::Text(Text { text, meta }),
-            Block::Reasoning => AssistantPart::Reasoning(Reasoning {
+        Ok(match ended {
+            Ended::Text { text } => AssistantPart::Text(Text { text, meta }),
+            Ended::Reasoning { text, redacted } => AssistantPart::Reasoning(Reasoning {
                 text,
                 redacted,
                 meta,
             }),
-            Block::ToolCall => {
-                let Some(call) = call else {
-                    return Err(order(format!("call {index} ended without its id")));
-                };
-                AssistantPart::ToolCall(ToolCall {
-                    id: call.id,
-                    name: name.unwrap_or_default(),
-                    input: call.input,
-                    invalid: call.invalid,
-                    provider_executed: call.provider_executed,
-                    meta,
-                })
-            }
+            Ended::Call(call) => AssistantPart::ToolCall(ToolCall {
+                id: call.id,
+                name: name.unwrap_or_default(),
+                input: call.input,
+                invalid: call.invalid,
+                provider_executed: call.provider_executed,
+                meta,
+            }),
         })
     }
 }
@@ -111,10 +97,9 @@ impl Accumulator {
                     self.model = model;
                 }
             }
-            Event::Start { index, block, name } => self.opens(
+            Event::Start { index, name, .. } => self.opens(
                 index,
                 Building::Open {
-                    block,
                     name,
                     meta: Meta::new(),
                 },
@@ -129,12 +114,7 @@ impl Accumulator {
                 Some(Building::Done(part)) => part.meta_mut().merge(more),
                 None => return Err(order(format!("state for part {index}, which never opened"))),
             },
-            Event::End {
-                index,
-                redacted,
-                text,
-                call,
-            } => {
+            Event::End { index, ended } => {
                 let Some(slot) = self
                     .part(index)
                     .filter(|part| matches!(part, Building::Open { .. }))
@@ -147,7 +127,7 @@ impl Accumulator {
                     slot,
                     Building::Done(AssistantPart::Opaque(Opaque::default())),
                 );
-                *slot = Building::Done(open.end(index, redacted, text, call)?);
+                *slot = Building::Done(open.end(index, ended)?);
             }
             Event::Part { index, part } => self.opens(index, Building::Done(part))?,
             Event::Finish {

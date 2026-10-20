@@ -155,7 +155,7 @@ fn decode(dir: &str, doc: &serde_yaml_ng::Value) -> Option<Value> {
                 .message
                 .content
                 .iter()
-                .map(|part| part_of(part, provider.protocol.key()))
+                .map(|part| part_of(part, provider.protocol.key().as_str()))
                 .collect();
             let finish = &response.finish;
             json!({

@@ -214,7 +214,6 @@ impl DynTool for Declared {
             description: "declared".into(),
             schema: json!({ "type": "object" }),
             strict: None,
-            encoded: llm::Encodings::default(),
         }
     }
     fn parse(&self, _: &Json) -> Result<Parsed, String> {

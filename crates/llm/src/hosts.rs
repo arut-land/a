@@ -45,7 +45,7 @@ struct Wire {
 
 const fn wire<P: Hosted>() -> Wire {
     Wire {
-        key: P::KEY,
+        key: P::PROTOCOL.as_str(),
         find: find::<P>,
     }
 }

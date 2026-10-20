@@ -5,7 +5,7 @@
 use serde_json::{Value, json};
 
 use super::{DONE, chunk, decode, item, provider, request, sent, turn, whole};
-use crate::protocols::chat::KEY;
+use crate::protocols::chat::PROTOCOL;
 use crate::spec::{
     Assistant, AssistantPart, Media, Message, Meta, Origin, Output, Source, ToolCall, ToolMessage,
     ToolResult, User, UserPart,
@@ -155,7 +155,7 @@ fn a_custom_call_stays_custom() {
         ],
     );
     declared.options.insert(
-        KEY.into(),
+        PROTOCOL,
         json!({"tools": [{"type": "custom", "custom": {"name": "grep", "description": "search"}}]}),
     );
     let other = sent(&openai, &declared);
@@ -264,7 +264,7 @@ fn perplexity_reads_a_tool_exchange_as_text() {
                 &json!({"q": "rig"}),
             ))],
             origin: Some(Origin {
-                protocol: KEY.into(),
+                protocol: PROTOCOL,
                 provider: "openai".into(),
                 model: "gpt-4.1".into(),
             }),
