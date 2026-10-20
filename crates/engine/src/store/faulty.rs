@@ -27,7 +27,13 @@ struct State {
     unsynced: Mutex<HashMap<SessionId, Vec<Written>>>,
     /// The power is off: nothing more is written or synced.
     cut: AtomicBool,
-    fail_sync: AtomicBool,
+    fail_sync: Mutex<Option<SyncFailure>>,
+}
+
+#[derive(Clone, Copy)]
+pub enum SyncFailure {
+    Discard,
+    Retain,
 }
 
 impl Faulty {
@@ -45,9 +51,9 @@ impl Faulty {
         lock(&self.state.unsynced).clear();
     }
 
-    /// Loses the next deferred batch and fails its sync, then permits I/O.
-    pub fn fail_next_sync(&self) {
-        self.state.fail_sync.store(true, Ordering::SeqCst);
+    /// Fails the next sync after losing or retaining its readable bytes.
+    pub fn fail_next_sync(&self, failure: SyncFailure) {
+        *lock(&self.state.fail_sync) = Some(failure);
     }
 
     fn wrap(&self, id: SessionId, mut loaded: Loaded) -> Loaded {
@@ -105,12 +111,16 @@ impl FaultyLog {
     }
 
     /// Hands `inner` what was only written, in order.
-    fn flush(&mut self) -> io::Result<()> {
+    fn flush(&mut self, durable: bool) -> io::Result<()> {
         let pending = lock(&self.state.unsynced)
             .remove(&self.id)
             .unwrap_or_default();
         for (entries, lines) in &pending {
-            self.inner.append_all(entries, lines)?;
+            if durable {
+                self.inner.append_all(entries, lines)?;
+            } else {
+                self.inner.write_all(entries, lines)?;
+            }
         }
         Ok(())
     }
@@ -119,7 +129,7 @@ impl FaultyLog {
 impl Log for FaultyLog {
     fn append_all(&mut self, entries: &[Entry], lines: &Encoded) -> io::Result<()> {
         self.on()?;
-        self.flush()?;
+        self.flush(true)?;
         self.inner.append_all(entries, lines)
     }
 
@@ -134,11 +144,18 @@ impl Log for FaultyLog {
 
     fn sync(&mut self) -> io::Result<()> {
         self.on()?;
-        if self.state.fail_sync.swap(false, Ordering::SeqCst) {
-            lock(&self.state.unsynced).remove(&self.id);
+        let failure = lock(&self.state.fail_sync).take();
+        if let Some(failure) = failure {
+            match failure {
+                SyncFailure::Discard => {
+                    lock(&self.state.unsynced).remove(&self.id);
+                }
+                SyncFailure::Retain => self.flush(false)?,
+            }
             return Err(io::Error::other("deferred sync failed"));
         }
-        self.flush()
+        self.flush(true)?;
+        self.inner.sync()
     }
 
     /// Kept at once: it covers only what is durable.

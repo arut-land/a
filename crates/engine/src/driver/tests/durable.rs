@@ -1,6 +1,6 @@
 //! What clients are shown against what a power cut keeps.
 
-use crate::store::Faulty;
+use crate::store::{Faulty, SyncFailure};
 
 use super::*;
 
@@ -62,56 +62,34 @@ fn a_seq_shown_to_a_client_survives_a_power_cut() {
 
 #[test]
 fn a_failed_deferred_sync_recovers_before_accepting_more_work() {
-    let faulty = Arc::new(Faulty::new(Arc::new(Memory::default())));
-    let fixture = Fixture::on(
-        Arc::clone(&faulty) as _,
-        ext_fixtures::ECHO,
-        Registry::default().with(&ext_fixtures::Fixtures).unwrap(),
-        openai(&Script::new(&[])),
-    );
-    let session = fixture.create();
-    session.submit("sleep 1").unwrap();
-    let log = until(&session, "sleep started", tool_running);
-    let call = log
-        .iter()
-        .find(|e| matches!(e.body, Body::ToolCall { .. }))
-        .unwrap()
-        .seq
-        .get();
-    let before = session.frames.seq();
-    faulty.fail_next_sync();
-    let (done, waited) = oneshot::channel();
-    session
-        .session
-        .mail
-        .send(Msg::Note {
-            call: id(call),
-            note: Note::State {
-                ext: "test".into(),
-                state: "value".into(),
-                data: Json::encode(&"lost").unwrap(),
-            },
-            done: Some(done),
-        })
-        .ok()
-        .unwrap();
-    assert!(
-        rt::block_on(waited).is_none(),
-        "a failed sync cannot acknowledge the note"
-    );
-    session.barrier();
-    session.interrupt_now();
-    session.submit("after").unwrap();
-    session.barrier();
-    settle(&session);
-    let kept = faulty.entries(session.id).unwrap();
-    assert!(kept.iter().all(|e| !matches!(e.body, Body::Ext { .. })));
-    assert!(kept.len() as u64 > before);
-    for (seq, entry) in (1..).zip(&kept) {
-        assert_eq!(entry.seq.get(), seq, "recovery must not leave a hole");
+    for failure in [SyncFailure::Discard, SyncFailure::Retain] {
+        let mut harness = ManualSession::new();
+        let before = harness.session.frames.seq();
+        let mut waited = harness.note();
+        harness.poll();
+        assert_eq!(
+            harness.session.frames.seq(),
+            before,
+            "unsynced bytes must stay unseen"
+        );
+        let mut cx = std::task::Context::from_waker(std::task::Waker::noop());
+        assert!(std::pin::Pin::new(&mut waited).poll(&mut cx).is_pending());
+        harness.faulty.fail_next_sync(failure);
+        harness.session.send(Msg::Sync);
+        harness.poll();
+        let acknowledged = rt::block_on(waited);
+        harness.request("after");
+        let kept = harness.finish();
+        assert!(
+            acknowledged.is_none(),
+            "a failed sync cannot acknowledge the note"
+        );
+        assert_retained(&kept, failure);
+        assert!(
+            kept.iter()
+                .any(|e| matches!(&e.body, Body::Assistant { text } if text == "after"))
+        );
     }
-    assert_eq!(log_of(&session), kept);
-    session.halt();
 }
 
 /// The actor runs only when polled by the test; I/O completes inline and
@@ -245,30 +223,65 @@ impl ManualSession {
         waited
     }
 
+    fn request(&mut self, text: &str) {
+        let (reply, received) = oneshot::channel();
+        self.session.send(Msg::Request {
+            request: Request::Input {
+                text: text.into(),
+                mode: Mode::Queue,
+            },
+            origin: None,
+            reply,
+        });
+        self.poll();
+        assert_eq!(rt::block_on(received), Some(Ok(())));
+    }
+
     fn finish(self) -> Vec<Entry> {
         self.release.send(());
         self.session.send(Msg::Stop);
         rt::block_on(self.actor);
         let kept = self.faulty.entries(self.session.id).unwrap();
         assert_eq!(log_of(&self.session), kept);
+        for (seq, entry) in (1..).zip(&kept) {
+            assert_eq!(entry.seq.get(), seq, "recovery must not leave a hole");
+        }
         kept
     }
 }
 
 #[test]
 fn a_failed_sync_drops_acknowledgements_from_the_same_burst() {
-    let mut harness = ManualSession::new();
-    harness.faulty.fail_next_sync();
-    let waited = harness.note();
-    harness.session.send(Msg::Sync);
-    harness.poll();
-    let acknowledged = rt::block_on(waited);
-    let kept = harness.finish();
-    assert!(kept.iter().all(|e| !matches!(e.body, Body::Ext { .. })));
-    assert!(
-        acknowledged.is_none(),
-        "a failed sync cannot acknowledge the burst's note"
-    );
+    for failure in [SyncFailure::Discard, SyncFailure::Retain] {
+        let mut harness = ManualSession::new();
+        harness.faulty.fail_next_sync(failure);
+        let waited = harness.note();
+        harness.session.send(Msg::Sync);
+        harness.poll();
+        let acknowledged = rt::block_on(waited);
+        harness.request("after");
+        let kept = harness.finish();
+        assert_retained(&kept, failure);
+        assert!(
+            acknowledged.is_none(),
+            "a failed sync cannot acknowledge the burst's note"
+        );
+    }
+}
+
+fn assert_retained(kept: &[Entry], failure: SyncFailure) {
+    let notes: Vec<_> = kept
+        .iter()
+        .filter_map(|e| match &e.body {
+            Body::Ext { data, .. } => Some(data.parse::<String>().unwrap()),
+            _ => None,
+        })
+        .collect();
+    let expected = match failure {
+        SyncFailure::Discard => vec![],
+        SyncFailure::Retain => vec!["pending".to_owned()],
+    };
+    assert_eq!(notes, expected);
 }
 
 fn poll_actor(actor: &mut rt::BoxFuture<'static, ()>) {

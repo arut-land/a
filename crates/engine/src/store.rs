@@ -23,7 +23,7 @@ use protocol::{Entry, Epoch, Json, ReadOnly, SessionId};
 use serde::{Deserialize, Serialize};
 
 #[cfg(test)]
-pub use faulty::Faulty;
+pub use faulty::{Faulty, SyncFailure};
 pub use jsonl::Jsonl;
 #[cfg(test)]
 pub(crate) use jsonl::{FORMAT, seal, unseal};
