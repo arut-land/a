@@ -65,6 +65,38 @@ pub trait Runtime: Send + Sync + 'static {
     }
 }
 
+/// An event subscription owned by its consumer. Dropping it unregisters
+/// the OS watches and releases the callback.
+#[cfg(feature = "watch")]
+pub struct Watcher(::notify::RecommendedWatcher);
+
+#[cfg(feature = "watch")]
+impl Watcher {
+    pub fn new(
+        changed: impl Fn(Vec<std::path::PathBuf>) + Send + 'static,
+    ) -> std::io::Result<Self> {
+        let watcher =
+            ::notify::recommended_watcher(move |event: ::notify::Result<::notify::Event>| {
+                match event {
+                    Ok(event) if !matches!(event.kind, ::notify::EventKind::Access(_)) => {
+                        changed(event.paths)
+                    }
+                    Err(error) => eprintln!("file watcher: {error}"),
+                    _ => {}
+                }
+            })
+            .map_err(std::io::Error::other)?;
+        Ok(Self(watcher))
+    }
+
+    pub fn add(&mut self, path: &std::path::Path) -> std::io::Result<()> {
+        use ::notify::Watcher as _;
+        self.0
+            .watch(path, ::notify::RecursiveMode::Recursive)
+            .map_err(std::io::Error::other)
+    }
+}
+
 /// A shared handle to the runtime a component was given.
 pub type Rt = Arc<dyn Runtime>;
 

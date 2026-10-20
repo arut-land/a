@@ -1037,6 +1037,7 @@ impl Core {
         };
         let installed = next.installed();
         let changed = installed != self.registry.installed();
+        next.activate();
         self.registry = next;
         if changed {
             self.append(fx, Body::Extensions { installed });

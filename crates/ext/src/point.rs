@@ -452,6 +452,7 @@ pub struct PointCx<'a> {
 
 /// The engine's side of a [`PointCx`], read only when a handler asks.
 pub trait View: Sync {
+    fn activate(&self) {}
     fn session(&self) -> SessionId;
     fn workspace(&self) -> &Path;
     /// The model the session talks to, as `host:model`.

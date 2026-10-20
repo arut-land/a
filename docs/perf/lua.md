@@ -167,3 +167,22 @@ unsupported: a pending ask is refused. Lua agent tool actions use normal engine
 approval. Arbitrary Rust trait services stay on the typed side; Lua delegates
 to named tools as its service interface. The active-poll time limit is checked
 by instruction hooks, not an OS-enforced hard deadline for native code.
+
+## Review correction: generation preparation
+
+The merged-main baseline is 3,029,872 bytes by default and 3,570,256 bytes
+with Lua. The generation/watcher implementation before size tuning is
+3,638,864 bytes with Lua (+68,608 bytes). This includes notify 8.2 and the
+SDK/engine changes; it does not isolate notify's individual contribution.
+notify supplies directory creation, replacement and removal events on all
+three supported platforms. The existing sys write watcher handles file writes
+and has no Windows implementation. This maintained dependency fits the release
+budget; extending that seam by hand would require additional platform backends.
+
+File events schedule bounded preparation off the async worker. The SDK exposes
+owned workspace subscriptions and in-memory generation counters, keeping I/O
+out of the SDK and the kernel. A binding activates its prepared state view at
+the kernel's existing safe boundary. The driver then adopts its registry and
+observers; old contexts retain their own state view. State preparation uses the
+last session snapshot plus the complete suffix, including unsynced changes,
+with contiguous sequence and end-boundary checks. Workspace indexes are weak.

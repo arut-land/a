@@ -11,10 +11,10 @@ mod acceptance;
 mod budgets;
 mod crash;
 mod home;
-#[cfg(feature = "lua")]
-mod lua;
 #[cfg(feature = "web")]
 mod hygiene;
+#[cfg(feature = "lua")]
+mod lua;
 mod pipe;
 mod reactor;
 mod remote;

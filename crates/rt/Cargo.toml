@@ -10,9 +10,11 @@ default = ["threads"]
 # our own (the `blocking` crate's polls every 500 ms while idle).
 threads = ["dep:async-executor"]
 smol = ["dep:smol"]
+watch = ["dep:notify"]
 tokio = ["dep:tokio"]
 
 [dependencies]
+notify = { version = "8", optional = true }
 async-executor = { version = "1", optional = true }
 # The reactor and timers of every runtime but tokio's: one thread waiting
 # in kqueue, epoll or IOCP (through polling) until something is due.

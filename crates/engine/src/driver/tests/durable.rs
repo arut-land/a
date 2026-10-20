@@ -159,14 +159,16 @@ struct ManualSession {
 
 impl ManualSession {
     fn new() -> Self {
+        Self::with_registry(Registry::default())
+    }
+
+    fn with_registry(registry: Registry) -> Self {
         let faulty = Arc::new(Faulty::new(Arc::new(Memory::default())));
         let (started, starts) = channel::unbounded();
         let mut fixture = Fixture::on(
             Arc::clone(&faulty) as _,
             ext_fixtures::ECHO,
-            Registry::default()
-                .with(&ControlledSleep(Arc::new(started)))
-                .unwrap(),
+            registry.with(&ControlledSleep(Arc::new(started))).unwrap(),
             openai(&Script::new(&[])),
         );
         let manual = Arc::new(Manual {
@@ -308,4 +310,81 @@ fn assert_retained(kept: &[Entry], failure: SyncFailure) {
 fn poll_actor(actor: &mut rt::BoxFuture<'static, ()>) {
     let mut cx = std::task::Context::from_waker(std::task::Waker::noop());
     assert!(actor.as_mut().poll(&mut cx).is_pending());
+}
+
+#[derive(Default, serde::Serialize, serde::Deserialize)]
+struct Updates(u64);
+impl ext::Fold for Updates {
+    const NAME: &'static str = "value";
+    type Change = String;
+    fn apply(&mut self, _: &String) {
+        self.0 += 1;
+    }
+}
+struct CountingState;
+impl Extension for CountingState {
+    const NAME: &'static str = "test";
+    const VERSION: u32 = 1;
+    fn contribute(&self, r: &mut Registrar) {
+        r.fold::<Updates>();
+    }
+}
+
+#[test]
+fn pending_fold_changes_survive_reload_and_the_old_view_lives_until_adoption() {
+    let make = || Registry::default().with(&CountingState).unwrap();
+    let mut harness = ManualSession::with_registry(make());
+    let registry = harness.session.session.shared.registry.get();
+    let cx = harness
+        .session
+        .session
+        .cx(harness.call, &registry, Cancel::default());
+    let _ack = harness.note();
+    harness.poll();
+    assert_eq!(cx.state(|s: &Updates| s.0), 1);
+    harness.session.session.shared.registry.replace(make());
+    harness
+        .session
+        .send(Msg::Step(Event::Environment(Environment::default())));
+    harness.poll();
+    assert_eq!(
+        cx.state(|s: &Updates| s.0),
+        1,
+        "a running call keeps its state view"
+    );
+    assert_eq!(
+        lock(&harness.session.session.state_view())
+            .get::<Updates>()
+            .unwrap()
+            .0,
+        1,
+        "reload cannot forget a folded but unsynced change"
+    );
+    let old = harness.session.session.state_view();
+    let _second = harness.note();
+    harness.poll();
+    harness.session.send(Msg::Step(Event::ToolDone {
+        call: harness.call,
+        outcome: Outcome::Done {
+            output: Json::default(),
+        },
+        card: None,
+    }));
+    harness.request("adopt");
+    let adopted = harness.session.session.state_view();
+    assert!(
+        !Arc::ptr_eq(&old, &adopted),
+        "adoption switches the state view at the kernel boundary"
+    );
+    assert_eq!(
+        lock(&adopted).get::<Updates>().unwrap().0,
+        2,
+        "the prepared generation includes each pending change exactly once"
+    );
+    assert_eq!(
+        cx.state(|s: &Updates| s.0),
+        2,
+        "the original call retains its own generation"
+    );
+    harness.finish();
 }

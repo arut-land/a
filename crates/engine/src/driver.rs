@@ -75,7 +75,7 @@ struct Session {
     spill: Arc<Path>,
     mail: Mail,
     /// The extensions' state: folded as each entry commits.
-    states: Mutex<States>,
+    states: Mutex<Arc<Mutex<States>>>,
     /// What commands run in: the last client's, secrets included, or after
     /// a restart the last one logged. One allocation per change, shared by
     /// every call made while it stands.
@@ -218,17 +218,30 @@ impl Live {
         open: Open,
         owner: Owner,
     ) -> io::Result<Arc<Self>> {
-        let registry = shared
-            .registry
-            .for_workspace(&header.workspace)
+        let base = shared.registry.get();
+        let source = base
+            .service::<dyn ext::host::Sources>()
+            .map(|source| {
+                let rt = Arc::clone(&shared.rt);
+                source.open(
+                    &header.workspace,
+                    Arc::new(move |work| rt.spawn_blocking(work)),
+                )
+            })
+            .transpose()
             .map_err(io::Error::other)?;
+        let generation = source.as_ref().map_or_else(
+            || shared.registry.generation(),
+            |source| source.generation(),
+        );
+        let registry = source.as_ref().map_or(base, |source| source.registry());
         let (tx, rx) = channel::unbounded();
         let session = Arc::new(Session {
             id: header.id,
             workspace: Arc::from(header.workspace.as_path()),
             spill: Arc::from(shared.spill.join(header.id.to_string())),
             mail: Arc::new(tx),
-            states: Mutex::new(registry.states()),
+            states: Mutex::new(Arc::new(Mutex::new(registry.states()))),
             env: Mutex::default(),
             jobs: Mutex::default(),
             cancels: Mutex::default(),
@@ -242,9 +255,10 @@ impl Live {
         let Folding {
             mut core,
             states,
+            snapshot: fold_snapshot,
             has_input,
         } = folding;
-        *lock(&session.states) = states;
+        *lock(&session.state_view()) = states;
         *lock(&session.env) = core.ledger().env().cloned().map(Arc::new);
         let fresh = lock(&shared.loaded).insert(header.id);
         let listed = (shared.catalog.get(header.id)).unwrap_or_else(|| Record::new(header.clone()));
@@ -287,9 +301,13 @@ impl Live {
             writer: Some(loaded.writer),
             registry,
             bound,
+            source,
+            generation,
+            pending: None,
             transcript: None,
             replied: None,
             snapshot: None,
+            fold_snapshot,
             inflight: Keyed::default(),
             view: None,
             replies: Keyed::default(),
@@ -426,6 +444,7 @@ impl Live {
 struct Folding {
     core: Core,
     states: States,
+    snapshot: Option<(u64, Vec<ext::Image>)>,
     /// Whether the log holds any input.
     has_input: bool,
 }
@@ -444,6 +463,7 @@ impl Folding {
         let folding = RefCell::new(Self {
             core: Core::new(Arc::clone(binding)).with_barriers(shared.barriers),
             states: registry.states(),
+            snapshot: None,
             has_input: false,
         });
         let loaded = match open {
@@ -489,6 +509,7 @@ impl Folding {
             return Err("of other extensions".to_owned());
         }
         self.states.restore(&image.states)?;
+        self.snapshot = Some((snapshot.covers, image.states));
         let core = Core::restore(Arc::clone(binding), image.ledger);
         self.core = core.with_barriers(shared.barriers);
         self.has_input = image.has_input;
@@ -544,6 +565,9 @@ struct Actor {
     registry: Arc<Registry>,
     /// The same, bound to the session: what the kernel drives.
     bound: Arc<Bound<Viewed>>,
+    source: Option<Arc<dyn ext::host::Generations>>,
+    generation: u64,
+    pending: Option<Arc<Bound<Viewed>>>,
     /// The conversation the model sees, made at the first model call.
     transcript: Option<Transcript>,
     /// The message of the reply model call `.0` just had, until its
@@ -551,6 +575,7 @@ struct Actor {
     replied: Option<(CallId, llm::Assistant)>,
     /// The last snapshot made, and its seq; `None` for one too large.
     snapshot: Option<(u64, Option<Frame>)>,
+    fold_snapshot: Option<(u64, Vec<ext::Image>)>,
     /// What each open call has in flight, one thing at a time.
     inflight: Keyed<CallId, InFlight>,
     /// The view a far attach is sent, kept in step with each commit from
@@ -625,29 +650,75 @@ impl Actor {
     }
 
     async fn refresh(&mut self) -> Option<Event> {
-        let base = self.live.session.shared.registry.get();
-        let newest = if base.service::<dyn ext::host::Sources>().is_some() {
-            let shared = Arc::clone(&self.live.session.shared);
-            let workspace = Arc::clone(&self.live.session.workspace);
-            rt::unblock(&*Arc::clone(&shared.rt), move || {
-                shared.registry.for_workspace(&workspace)
-            })
-            .await
-            .unwrap_or_else(|why| {
-                eprintln!("warning: {why}");
-                Arc::clone(&self.registry)
-            })
-        } else {
-            base
-        };
-        (!Arc::ptr_eq(&newest, &self.registry)).then(|| {
-            let mut states = newest.states();
-            states.replay(self.live.frames.entries());
-            *lock(&self.live.session.states) = states;
-            self.registry = Arc::clone(&newest);
-            self.bound = bind(&newest, &self.live.session);
-            Event::Registry(Arc::clone(&self.bound) as Arc<dyn Binding>)
+        let current = &self.live.session.shared.registry;
+        let number = self
+            .source
+            .as_ref()
+            .map_or_else(|| current.generation(), |source| source.generation());
+        if number == self.generation {
+            return None;
+        }
+        self.generation = number;
+        let newest = self
+            .source
+            .as_ref()
+            .map_or_else(|| current.get(), |source| source.registry());
+        let frames = Arc::clone(&self.live.frames);
+        let pending: Vec<Entry> = self
+            .unsynced
+            .iter()
+            .flat_map(|(entries, _)| entries.iter().cloned())
+            .collect();
+        let registry = Arc::clone(&newest);
+        let snapshot = self.fold_snapshot.clone();
+        let boundary = self.core.ledger().seq();
+        let prepared = rt::unblock(&*self.live.session.shared.rt, move || {
+            let start = Instant::now();
+            let mut states = registry.states();
+            let mut after = 0;
+            if let Some((seq, images)) = snapshot {
+                states.restore(&images)?;
+                after = seq;
+            }
+            let mut seen = after;
+            for (count, entry) in frames.entries_after(after).chain(pending).enumerate() {
+                if count >= 100_000 || start.elapsed() > std::time::Duration::from_secs(1) {
+                    return Err("registry state preparation budget exhausted".to_owned());
+                }
+                if entry.seq.get() != seen + 1 {
+                    return Err("registry log boundary is incomplete".to_owned());
+                }
+                seen = entry.seq.get();
+                states.try_apply(&entry)?;
+            }
+            if seen != boundary || start.elapsed() > std::time::Duration::from_secs(1) {
+                return Err("registry log boundary is incomplete or over budget".to_owned());
+            }
+            Ok::<_, String>(states)
         })
+        .await;
+        match prepared {
+            Ok(states) => {
+                let next = bind_states(&newest, &self.live.session, Arc::new(Mutex::new(states)));
+                self.pending = Some(Arc::clone(&next));
+                Some(Event::Registry(next as Arc<dyn Binding>))
+            }
+            Err(error) => {
+                eprintln!("warning: {error}");
+                None
+            }
+        }
+    }
+
+    fn adopted(&mut self) {
+        if self
+            .pending
+            .as_ref()
+            .is_some_and(|bound| bound.view().active.load(Ordering::Acquire))
+        {
+            self.bound = self.pending.take().expect("prepared binding");
+            self.registry = Arc::clone(self.bound.registry());
+        }
     }
 
     async fn run(mut self, mail: channel::Receiver<Msg>, first: Effects) {
@@ -695,18 +766,12 @@ impl Actor {
                     dones.extend(done);
                 }
             }
-            if !events.is_empty() {
-                if let Some(generation) = self.refresh().await {
-                    events.insert(0, generation);
-                }
-            }
             // Recovery does not commit the burst that failed.
             match self.burst(events, sync).await {
                 Ok(()) if self.unsynced.is_empty() => {
                     for done in dones {
                         done.send(());
                     }
-
                 }
                 Ok(()) => self.waiting_sync.extend(dones),
                 Err(()) => drop(dones),
@@ -883,13 +948,7 @@ impl Actor {
     /// Recovery cannot turn a failed burst into an acknowledgement.
     async fn burst(&mut self, events: Vec<Event>, sync: bool) -> Result<(), ()> {
         if !events.is_empty() {
-            // A new registry generation is taken up at the next step.
-            let newest = self.live.session.shared.registry.get();
-            let generation = (!Arc::ptr_eq(&newest, &self.registry)).then(|| {
-                self.registry = Arc::clone(&newest);
-                self.bound = bind(&newest, &self.live.session);
-                Event::Registry(Arc::clone(&self.bound) as Arc<dyn Binding>)
-            });
+            let generation = self.refresh().await;
             self.step(generation.into_iter().chain(events)).await?;
         }
         if sync {
@@ -906,7 +965,10 @@ impl Actor {
         let mut fx = Effects::new();
         for event in events {
             match catch_unwind(AssertUnwindSafe(|| self.core.step(event))) {
-                Ok(more) => fx.extend(more),
+                Ok(more) => {
+                    self.adopted();
+                    fx.extend(more);
+                }
                 Err(panic) => {
                     let why = panicked(&*panic);
                     eprintln!("session {}: the kernel {why}", self.live.id.short());
@@ -1055,7 +1117,9 @@ impl Actor {
         self.writer = Some(loaded.writer);
         self.since_snapshot = loaded.read;
         self.core = folding.core;
-        *lock(&self.live.session.states) = folding.states;
+        *lock(&self.live.session.state_view()) = folding.states;
+        self.pending = None;
+        self.fold_snapshot = folding.snapshot;
         self.live
             .has_input
             .store(folding.has_input, Ordering::SeqCst);
@@ -1170,13 +1234,14 @@ impl Actor {
             return;
         }
         self.since_snapshot = 0;
-        let states = match lock(&self.live.session.states).image() {
+        let states = match lock(&self.live.session.state_view()).image() {
             Ok(states) => states,
             Err(e) => {
                 eprintln!("session {}: snapshot: {e}", self.live.id.short());
                 return;
             }
         };
+        self.fold_snapshot = Some((covers, states.clone()));
         let image = Image {
             build: self.live.session.shared.build.clone(),
             extensions: self.registry.installed(),
@@ -1285,7 +1350,10 @@ impl Actor {
             self.transcript = None;
         }
         for e in entries {
-            lock(&session.states).apply(e);
+            lock(&session.state_view()).apply(e);
+            if let Some(next) = &self.pending {
+                lock(&next.view().states).apply(e);
+            }
             if matches!(e.body, Body::Input { .. }) {
                 self.live.has_input.store(true, Ordering::SeqCst);
             }
@@ -1780,6 +1848,10 @@ impl Live {
 }
 
 impl Session {
+    fn state_view(&self) -> Arc<Mutex<States>> {
+        Arc::clone(&lock(&self.states))
+    }
+
     /// What stops call `call`'s work: the one cancel it has while open,
     /// made as the first of its work asks for it.
     fn cancel(&self, call: CallId) -> Cancel {
@@ -1816,6 +1888,16 @@ impl Session {
 
     /// What call `call` runs with, on `registry`, stopped by `cancel`.
     fn cx(self: &Arc<Self>, call: CallId, registry: &Arc<Registry>, cancel: Cancel) -> Cx {
+        self.cx_on(call, registry, cancel, self.state_view())
+    }
+
+    fn cx_on(
+        self: &Arc<Self>,
+        call: CallId,
+        registry: &Arc<Registry>,
+        cancel: Cancel,
+        states: Arc<Mutex<States>>,
+    ) -> Cx {
         Parts {
             workspace: Arc::clone(&self.workspace),
             env: lock(&self.env).clone(),
@@ -1830,6 +1912,7 @@ impl Session {
             session: Arc::clone(self),
             call,
             registry: Arc::clone(registry),
+            states,
         }))
     }
 
@@ -1865,7 +1948,7 @@ impl Session {
         let layers = &self.shared.models.settings;
         let registry = self.shared.registry.get();
         match registry.service::<dyn ext::ModelSpec>() {
-            Some(spec) => spec.model(&lock(&self.states), layers, &self.workspace),
+            Some(spec) => spec.model(&lock(&self.state_view()), layers, &self.workspace),
             None => ext::Layers::model(layers, &self.workspace),
         }
     }
@@ -1888,44 +1971,72 @@ impl ext::Layers for crate::config::Settings {
 /// The session as handlers at decision points read it: only when one
 /// asks, so a point with no handler costs nothing. A handler may take a
 /// call's context along, to work it answers later with.
-pub(crate) struct Viewed(Arc<Session>);
+pub(crate) struct Viewed {
+    session: Arc<Session>,
+    registry: Arc<Registry>,
+    states: Arc<Mutex<States>>,
+    active: AtomicBool,
+}
 
 impl View for Viewed {
+    fn activate(&self) {
+        *lock(&self.session.states) = Arc::clone(&self.states);
+        self.active.store(true, Ordering::Release);
+    }
+
     fn session(&self) -> SessionId {
-        self.0.id
+        self.session.id
     }
 
     fn workspace(&self) -> &Path {
-        &self.0.workspace
+        &self.session.workspace
     }
 
     /// As a call is recorded: the model's name once it is made, else
     /// what the settings asked for.
     fn model(&self) -> String {
-        (self.0.model()).map_or_else(|_| self.0.model_spec(), |model| model.name())
+        (self.session.model()).map_or_else(|_| self.session.model_spec(), |model| model.name())
     }
 
     fn states(&self, read: &mut dyn FnMut(&States)) {
-        read(&lock(&self.0.states));
+        read(&lock(&self.states));
     }
 
     fn env(&self) -> Option<Arc<Environment>> {
-        lock(&self.0.env).clone()
+        lock(&self.session.env).clone()
     }
 
     /// With the call's own cancel: work a handler takes it along to ends
     /// with the call.
     fn cx(&self, call: CallId) -> Option<Cx> {
-        let registry = self.0.shared.registry.get();
-        Some(self.0.cx(call, &registry, self.0.cancel(call)))
+        let registry = Arc::clone(&self.registry);
+        Some(self.session.cx_on(
+            call,
+            &registry,
+            self.session.cancel(call),
+            Arc::clone(&self.states),
+        ))
     }
 }
 
 /// `registry` bound to `session`: what the kernel drives.
 fn bind(registry: &Arc<Registry>, session: &Arc<Session>) -> Arc<Bound<Viewed>> {
+    bind_states(registry, session, session.state_view())
+}
+
+fn bind_states(
+    registry: &Arc<Registry>,
+    session: &Arc<Session>,
+    states: Arc<Mutex<States>>,
+) -> Arc<Bound<Viewed>> {
     let settings = &session.shared.models.settings;
     let agent = settings.agent(&session.workspace);
-    let viewed = Arc::new(Viewed(Arc::clone(session)));
+    let viewed = Arc::new(Viewed {
+        session: Arc::clone(session),
+        registry: Arc::clone(registry),
+        states,
+        active: AtomicBool::new(false),
+    });
     Arc::new(Bound::new(Arc::clone(registry), viewed, agent))
 }
 
@@ -1956,6 +2067,7 @@ struct Calling {
     session: Arc<Session>,
     call: CallId,
     registry: Arc<Registry>,
+    states: Arc<Mutex<States>>,
 }
 
 impl Calling {
@@ -2022,7 +2134,7 @@ impl Host for Calling {
     }
 
     fn states(&self, read: &mut dyn FnMut(&States)) {
-        read(&lock(&self.session.states));
+        read(&lock(&self.states));
     }
 
     fn registry(&self) -> &Registry {

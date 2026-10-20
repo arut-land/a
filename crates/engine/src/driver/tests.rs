@@ -1991,7 +1991,7 @@ fn a_session_loads_from_its_snapshot_and_reads_only_the_suffix() {
     assert_eq!(*lock(&probe.snapshots), [covers]);
     session.submit("after").unwrap();
     settle(&session);
-    let states = lock(&session.session.states).image().unwrap();
+    let states = lock(&session.session.state_view()).image().unwrap();
     let log = log_of(&session);
     session.halt();
     assert_eq!(*lock(&probe.snapshots), [covers], "none for a short suffix");
@@ -2001,7 +2001,7 @@ fn a_session_loads_from_its_snapshot_and_reads_only_the_suffix() {
     settle(&loaded);
     let read = probe.read.load(Ordering::SeqCst);
     assert_eq!(read as u64, log.len() as u64 - covers);
-    assert_eq!(lock(&loaded.session.states).image().unwrap(), states);
+    assert_eq!(lock(&loaded.session.state_view()).image().unwrap(), states);
     assert_eq!(log_of(&loaded), log);
     loaded.submit("again").unwrap();
     settle(&loaded);
@@ -2097,4 +2097,71 @@ fn in_process_recovery_preserves_the_attached_environment() {
         log.iter()
             .any(|e| matches!(&e.body, Body::Environment(logged) if logged == &env.redacted()))
     );
+}
+
+struct MemoryGenerations {
+    registry: Arc<Registry>,
+    reads: AtomicUsize,
+}
+impl ext::host::Generations for MemoryGenerations {
+    fn generation(&self) -> u64 {
+        1
+    }
+    fn registry(&self) -> Arc<Registry> {
+        self.reads.fetch_add(1, Ordering::SeqCst);
+        Arc::clone(&self.registry)
+    }
+}
+struct MemorySource(Arc<MemoryGenerations>);
+impl ext::host::Sources for MemorySource {
+    fn open(
+        &self,
+        _: &Path,
+        _: ext::host::Prepare,
+    ) -> Result<Arc<dyn ext::host::Generations>, ext::Refused> {
+        Ok(self.0.clone())
+    }
+}
+impl Extension for MemorySource {
+    const NAME: &'static str = "source";
+    const VERSION: u32 = 1;
+    fn contribute(&self, r: &mut Registrar) {
+        r.provide::<dyn ext::host::Sources>(Arc::new(Self(self.0.clone())));
+    }
+}
+
+#[test]
+fn unchanged_generations_never_prepare_or_read_the_log_on_bursts() {
+    let source = Arc::new(MemoryGenerations {
+        registry: Arc::new(Registry::default().with(&Agents).unwrap()),
+        reads: AtomicUsize::new(0),
+    });
+    let fixture = Fixture::new(
+        ext_fixtures::ECHO,
+        Registry::default()
+            .with(&MemorySource(source.clone()))
+            .unwrap(),
+        openai(&Script::new(&[])),
+    );
+    let session = fixture.start(&[]);
+    session.barrier();
+    let hops = fixture.hops();
+    for _ in 0..10 {
+        session.send(Msg::Step(Event::Note {
+            call: id(999),
+            note: Note::Progress("ignored".into()),
+        }));
+        session.barrier();
+    }
+    assert_eq!(
+        source.reads.load(Ordering::SeqCst),
+        1,
+        "only initial subscription reads the registry"
+    );
+    assert_eq!(
+        fixture.hops(),
+        hops,
+        "ordinary bursts cannot dispatch blocking preparation"
+    );
+    session.halt();
 }

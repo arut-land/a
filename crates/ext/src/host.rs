@@ -5,6 +5,7 @@
 
 use std::any::{Any, TypeId};
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, OnceLock, PoisonError};
 
 use protocol::{Audience, CallId, Card, Environment, Installed, Json, Outcome, Seq, SessionId};
@@ -450,20 +451,28 @@ struct By {
     ext: Name,
 }
 
-/// A registry source scoped to a workspace. An unchanged source returns
-/// the same generation; a failed refresh leaves existing work on its old one.
+/// An owned workspace subscription. Reads never perform I/O or prepare work.
+pub trait Generations: Send + Sync {
+    fn generation(&self) -> u64;
+    fn registry(&self) -> Arc<Registry>;
+}
+
+/// Opens a workspace subscription off the async worker. Consumers own its
+/// lifetime; a source must not retain an unbounded collection of workspaces.
+pub type Prepare = Arc<dyn Fn(Box<dyn FnOnce() + Send>) + Send + Sync>;
+
 pub trait Sources: Send + Sync {
-    fn registry(&self, workspace: &Path) -> Result<Arc<Registry>, Refused>;
+    fn open(&self, workspace: &Path, prepare: Prepare) -> Result<Arc<dyn Generations>, Refused>;
 }
 
 /// The registry sessions run with. Replacing it (a reload) takes effect at
 /// each session's next step boundary: work already running finishes on the
 /// generation it started with.
-pub struct Current(Mutex<Arc<Registry>>);
+pub struct Current(Mutex<Arc<Registry>>, AtomicU64);
 
 impl Current {
     pub fn new(registry: Registry) -> Self {
-        Self(Mutex::new(Arc::new(registry)))
+        Self(Mutex::new(Arc::new(registry)), AtomicU64::new(0))
     }
 
     /// The newest generation.
@@ -471,17 +480,13 @@ impl Current {
         Arc::clone(&self.0.lock().unwrap_or_else(PoisonError::into_inner))
     }
 
-    /// The workspace's newest generation, including extensions loaded at run time.
-    pub fn for_workspace(&self, workspace: &Path) -> Result<Arc<Registry>, Refused> {
-        let base = self.get();
-        match base.service::<dyn Sources>() {
-            Some(source) => source.registry(workspace),
-            None => Ok(base),
-        }
+    pub fn generation(&self) -> u64 {
+        self.1.load(Ordering::Acquire)
     }
 
     pub fn replace(&self, registry: Registry) {
         *self.0.lock().unwrap_or_else(PoisonError::into_inner) = Arc::new(registry);
+        self.1.fetch_add(1, Ordering::Release);
     }
 }
 
@@ -492,6 +497,9 @@ impl Current {
 /// kernel never sees a model request: the `step` point is the engine's
 /// to ask, on [`Bound`].
 pub trait Binding: Send + Sync {
+    /// Publishes a prepared view at the kernel's safe adoption boundary.
+    fn activate(&self) {}
+
     /// A new agent, of the kind the session runs.
     fn agent(&self) -> Box<dyn Agent>;
 
@@ -711,6 +719,10 @@ impl<V: View + Send + Sync + 'static> Bound<V> {
 }
 
 impl<V: View + Send + Sync + 'static> Binding for Bound<V> {
+    fn activate(&self) {
+        self.view.activate();
+    }
+
     fn agent(&self) -> Box<dyn Agent> {
         self.registry.agent(self.agent.as_deref())
     }

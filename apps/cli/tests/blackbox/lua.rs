@@ -118,7 +118,6 @@ fn crashing_and_looping_mods_leave_the_daemon_usable() {
 #[test]
 fn file_reload_preserves_folded_state_and_rejects_a_broken_generation() {
     let env = Env::new("lua-reload");
-    env.ext("lua", "poll_ms=0");
     let dir = env.home.root().join("ext");
     let source = |n| {
         format!(
@@ -131,10 +130,16 @@ fn file_reload_preserves_folded_state_and_rejects_a_broken_generation() {
     let (id, _) = conn.attach(Target::New, &env.ws);
     assert_eq!(done(&mut conn, "/count"), 1);
     write(&dir, "counter", &source(3));
+    assert_eq!(done(&mut conn, "/lua-reload"), true);
     assert_eq!(done(&mut conn, "/count"), 4);
     write(&dir, "counter", "this is not lua!");
+    assert!(matches!(
+        command(&mut conn, "/lua-reload"),
+        Outcome::Failed { .. }
+    ));
     assert_eq!(done(&mut conn, "/count"), 7);
     write(&dir, "counter", &source(2));
+    assert_eq!(done(&mut conn, "/lua-reload"), true);
     assert_eq!(done(&mut conn, "/count"), 9);
     drop(conn);
     assert!(env.cmd(&["daemon", "stop"]).status().unwrap().success());
