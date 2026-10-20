@@ -14,7 +14,7 @@ use std::panic::{AssertUnwindSafe, catch_unwind};
 use std::path::{Path, PathBuf};
 use std::pin::pin;
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
-use std::sync::{Arc, Mutex, OnceLock, Weak};
+use std::sync::{Arc, Mutex, Weak};
 use std::task::Poll;
 use std::time::Instant;
 
@@ -94,9 +94,6 @@ struct Session {
     /// ending, a job ending, the actor ending. What waits on the session
     /// waits here, never by polling.
     changed: rt::Notify,
-    /// What the engine provides the session's calls, made when one first
-    /// asks.
-    services: OnceLock<Arc<Services>>,
     shared: Arc<Shared>,
 }
 
@@ -124,9 +121,9 @@ pub struct Live {
     pub(crate) ended: Flag,
 }
 
-/// What a side request is answered with: its id and the conversation it
-/// asked for, or `None` when it may not be made.
-type Opened = Option<(CallId, llm::Messages)>;
+/// An admitted side call keeps its own cancellation scope so a successful
+/// parent can revoke its contexts without cancelling work already admitted.
+type Opened = Option<(CallId, llm::Messages, Cancel)>;
 
 /// A client's mutation of a session.
 pub enum Request {
@@ -161,32 +158,14 @@ enum Msg {
     /// A client to follow the session, answered once it does.
     Attach(Outbox, u64, oneshot::Sender<()>),
     Env(Arc<Environment>),
-    /// A running call's report, answered once committed.
-    Note {
-        call: CallId,
-        note: Note,
-        done: Option<oneshot::Sender<()>>,
-    },
-    /// Call `call` starts a child on `input` and waits for its result.
-    Child {
-        call: CallId,
-        input: String,
-        reply: oneshot::Sender<Json>,
+    Context {
+        origin: ContextOrigin,
+        request: ContextRequest,
     },
     Replied {
         call: CallId,
         replied: Replied,
         message: Option<llm::Assistant>,
-    },
-    /// A side model request on behalf of call `of`, answered with its id
-    /// once its intent is committed, and if asked, the conversation the
-    /// model sees before `of`.
-    Side {
-        of: CallId,
-        purpose: String,
-        model: String,
-        conversation: bool,
-        reply: oneshot::Sender<Opened>,
     },
     Stop,
     /// Make what was only written durable, and show it: sent to itself
@@ -197,6 +176,58 @@ enum Msg {
     Barrier(oneshot::Sender<()>),
     #[cfg(test)]
     Position(oneshot::Sender<(u64, u64)>),
+}
+
+/// Context authority stays bound to its call and generation even after
+/// settlement removes that call from the session's cancellation map.
+#[derive(Clone)]
+struct ContextOrigin {
+    fence: u64,
+    call: CallId,
+    cancel: Cancel,
+}
+
+impl ContextOrigin {
+    fn current(&self, session: &Session) -> bool {
+        self.fence == session.fence.load(Ordering::SeqCst) && !self.cancel.is_set()
+    }
+
+    fn send(&self, session: &Session, request: ContextRequest) {
+        let _ = session.mail.send(Msg::Context {
+            origin: self.clone(),
+            request,
+        });
+    }
+}
+
+struct PendingSide {
+    origin: ContextOrigin,
+    reply: oneshot::Sender<Opened>,
+    conversation: Option<llm::Messages>,
+}
+
+enum ContextRequest {
+    /// A running call's report, answered once committed.
+    Note {
+        note: Note,
+        done: Option<oneshot::Sender<()>>,
+    },
+    /// Child work is admitted under the originating call, even across polling.
+    Child {
+        input: String,
+        reply: oneshot::Sender<Json>,
+    },
+    /// The actor supplies the side call's authority after committing its intent.
+    Side {
+        purpose: String,
+        model: String,
+        conversation: bool,
+        reply: oneshot::Sender<Opened>,
+    },
+    Own {
+        pgid: u32,
+        ended: BoxFuture<'static, ()>,
+    },
 }
 
 impl Msg {
@@ -214,7 +245,14 @@ impl Msg {
         if matches!(self, Self::Position(_)) {
             return true;
         }
-        matches!(self, Self::Attach(..) | Self::Side { .. })
+        matches!(
+            self,
+            Self::Attach(..)
+                | Self::Context {
+                    request: ContextRequest::Side { .. },
+                    ..
+                }
+        )
     }
 }
 
@@ -257,7 +295,6 @@ impl Live {
             jobs: Mutex::default(),
             cancels: Mutex::default(),
             changed: rt::Notify::new(),
-            services: OnceLock::new(),
             shared: Arc::clone(shared),
         });
         let bound = bind(&registry, &session);
@@ -594,7 +631,7 @@ struct Actor {
     replies: Keyed<Ticket, oneshot::Sender<Result<(), String>>>,
     /// Side model requests waiting for their call's id, with the
     /// conversation they asked for.
-    sides: Keyed<Ticket, (oneshot::Sender<Opened>, Option<llm::Messages>)>,
+    sides: Keyed<Ticket, PendingSide>,
     tickets: u64,
     phase: Phase,
     /// The session as the catalog last heard of it: busy while work is in
@@ -835,30 +872,7 @@ impl Actor {
                 *lock(&self.live.session.env) = Some(env);
                 Event::Environment(logged)
             }
-            Msg::Note { call, note, done } => return Some((Event::Note { call, note }, done)),
-            Msg::Child { call, input, reply } => {
-                // Only a running tool call asks; one run again with the
-                // answer it waited on is handed it.
-                let Some(InFlight::Tool(child)) = self.inflight.get_mut(&call) else {
-                    return None;
-                };
-                match std::mem::replace(child, Child::Waiting(reply)) {
-                    Child::Answered(value) => {
-                        let Child::Waiting(reply) = std::mem::replace(child, Child::None) else {
-                            unreachable!()
-                        };
-                        reply.send(value);
-                        return None;
-                    }
-                    Child::None | Child::Waiting(_) => {}
-                }
-                Event::Spawn {
-                    call,
-                    child: SessionId::new(),
-                    input,
-                    wait: true,
-                }
-            }
+            Msg::Context { origin, request } => return self.context(&origin, request),
             Msg::Replied {
                 call,
                 replied,
@@ -867,24 +881,6 @@ impl Actor {
                 self.inflight.remove(&call);
                 self.replied = message.map(|m| (call, m));
                 Event::ModelDone { call, replied }
-            }
-            Msg::Side {
-                of,
-                purpose,
-                model,
-                conversation,
-                reply,
-            } => {
-                let conversation = conversation.then(|| self.conversation(of));
-                self.tickets += 1;
-                let ticket = Ticket(self.tickets);
-                self.sides.insert(ticket, (reply, conversation));
-                Event::Side {
-                    of,
-                    purpose,
-                    model,
-                    ticket,
-                }
             }
             #[cfg(test)]
             Msg::Barrier(done) => {
@@ -911,6 +907,82 @@ impl Actor {
         {
             self.inflight.remove(call);
         }
+        Some((event, None))
+    }
+
+    fn context(
+        &mut self,
+        origin: &ContextOrigin,
+        request: ContextRequest,
+    ) -> Option<(Event, Option<oneshot::Sender<()>>)> {
+        let session = &self.live.session;
+        if !origin.current(session) {
+            return None;
+        }
+        let call = origin.call;
+        let event = match request {
+            ContextRequest::Note { note, done } => return Some((Event::Note { call, note }, done)),
+            ContextRequest::Child { input, reply } => {
+                // Only a running tool call asks; one run again with the
+                // answer it waited on is handed it.
+                let Some(InFlight::Tool(child)) = self.inflight.get_mut(&call) else {
+                    return None;
+                };
+                match std::mem::replace(child, Child::Waiting(reply)) {
+                    Child::Answered(value) => {
+                        let Child::Waiting(reply) = std::mem::replace(child, Child::None) else {
+                            unreachable!()
+                        };
+                        reply.send(value);
+                        return None;
+                    }
+                    Child::None | Child::Waiting(_) => {}
+                }
+                Event::Spawn {
+                    call,
+                    child: SessionId::new(),
+                    input,
+                    wait: true,
+                }
+            }
+            ContextRequest::Side {
+                purpose,
+                model,
+                conversation,
+                reply,
+            } => {
+                let conversation = conversation.then(|| self.conversation(call));
+                self.tickets += 1;
+                let ticket = Ticket(self.tickets);
+                self.sides.insert(
+                    ticket,
+                    PendingSide {
+                        origin: origin.clone(),
+                        reply,
+                        conversation,
+                    },
+                );
+                Event::Side {
+                    of: call,
+                    purpose,
+                    model,
+                    ticket,
+                }
+            }
+            ContextRequest::Own { pgid, ended } => {
+                lock(&session.jobs).push(pgid);
+                let session = Arc::clone(session);
+                self.live.session.shared.rt.spawn(Box::pin(async move {
+                    ended.await;
+                    lock(&session.jobs).retain(|&p| p != pgid);
+                    session.changed.notify();
+                    if let Some(daemon) = session.shared.daemon.upgrade() {
+                        daemon.jobs.notify();
+                    }
+                }));
+                return None;
+            }
+        };
         Some((event, None))
     }
 
@@ -1639,7 +1711,6 @@ impl Actor {
                 transcript.apply(e, replied.map(|(_, m)| m));
             }
             if let Body::ToolResult { call, .. } | Body::ModelResult { call, .. } = &e.body {
-                // Settled: what still runs of it is let go.
                 self.inflight.remove(call);
                 session.forget(*call);
                 self.bound.settled(*call);
@@ -1668,8 +1739,17 @@ impl Actor {
             }
             Effect::Reply { ticket, result } => self.reply(ticket, result),
             Effect::Side { ticket, side } => {
-                if let Some((reply, conversation)) = self.sides.remove(&ticket) {
-                    reply.send(side.map(|side| (side, conversation.unwrap_or_default())));
+                if let Some(PendingSide {
+                    reply,
+                    conversation,
+                    ..
+                }) = self.sides.remove(&ticket)
+                {
+                    let side = side.filter(|side| self.core.ledger().call(*side).is_some());
+                    reply.send(side.map(|side| {
+                        let cancel = self.live.session.cancel(side);
+                        (side, conversation.unwrap_or_default(), cancel)
+                    }));
                 }
             }
             Effect::Prepare {
@@ -1712,6 +1792,12 @@ impl Actor {
             Effect::Cancel { call } => {
                 self.inflight.remove(&call);
                 self.live.session.cancelled(call);
+                self.sides.0.retain(|(_, side)| side.origin.call != call);
+                for (side, open) in self.core.ledger().open_calls() {
+                    if open.call == (protocol::ledger::Call::Side { of: call }) {
+                        self.live.session.cancelled(side);
+                    }
+                }
             }
             Effect::StartChild { link, child, input } => self.start_child(link, child, input),
             Effect::Interrupt { child } => {
@@ -1951,14 +2037,18 @@ impl Actor {
     /// input as read at its intent if the gate left it as it was,
     /// reporting its outcome.
     fn run_tool(&mut self, call: CallId, tool: String, input: Json, child: Child) {
-        let cancel = self.live.session.cancel(call);
         self.inflight.insert(call, InFlight::Tool(child));
         let registry = Arc::clone(&self.registry);
         let parsed = self.bound.take_parsed(call, &input);
-        let cx = self.live.session.cx(call, &registry, cancel);
+        let fence = self.live.session.fence.load(Ordering::SeqCst);
+        let origin = self
+            .live
+            .session
+            .origin(call, fence)
+            .expect("actor generation");
+        let cx = self.live.session.cx(origin, &registry);
         let mail = Arc::clone(&self.live.session.mail);
         let id = self.live.id;
-        let fence = self.live.session.fence.load(Ordering::SeqCst);
         self.live.session.shared.rt.spawn(Box::pin(async move {
             let began = crate::stamp();
             let Called { outcome, card } =
@@ -2176,11 +2266,9 @@ impl Session {
         }
     }
 
-    /// Call `call` settled: what it still has running is on its own (a
-    /// side request asked beside it finishes), and nothing more of it is
-    /// stopped.
+    /// Retained contexts must lose authority before this call can be forgotten.
     fn forget(&self, call: CallId) {
-        lock(&self.cancels).remove(&call);
+        self.cancelled(call);
     }
 
     /// Stops every call's work.
@@ -2190,39 +2278,55 @@ impl Session {
         }
     }
 
-    /// What call `call` runs with, on `registry`, stopped by `cancel`.
-    fn cx(self: &Arc<Self>, call: CallId, registry: &Arc<Registry>, cancel: Cancel) -> Cx {
+    fn origin(&self, call: CallId, fence: u64) -> Option<ContextOrigin> {
+        let mut cancels = lock(&self.cancels);
+        // A retained view cannot acquire a replacement call's cancellation token.
+        if self.fence.load(Ordering::SeqCst) != fence {
+            return None;
+        }
+        let cancel = if let Some(cancel) = cancels.get(&call) {
+            cancel.clone()
+        } else {
+            let cancel = Cancel::default();
+            cancels.insert(call, cancel.clone());
+            cancel
+        };
+        Some(ContextOrigin {
+            fence,
+            call,
+            cancel,
+        })
+    }
+
+    fn cx(self: &Arc<Self>, origin: ContextOrigin, registry: &Arc<Registry>) -> Cx {
         Parts {
             workspace: Arc::clone(&self.workspace),
             env: lock(&self.env).clone(),
             session: self.id,
-            call,
+            call: origin.call,
             model: self.model_spec().into(),
             spill: Arc::clone(&self.spill),
-            cancel,
-            services: self.services(),
+            cancel: origin.cancel.clone(),
+            services: self.services(origin.clone()),
         }
         .cx(Arc::new(Calling {
-            fence: self.fence.load(Ordering::SeqCst),
+            origin,
             session: Arc::clone(self),
-            call,
             registry: Arc::clone(registry),
         }))
     }
 
     /// What the engine provides the session's calls: the config layers,
     /// child sessions, side model requests and the runtime.
-    fn services(self: &Arc<Self>) -> Arc<Services> {
-        Arc::clone(self.services.get_or_init(|| {
-            let own = Arc::new(Own(Arc::downgrade(self)));
-            Arc::new(
-                Services::default()
-                    .with::<dyn ext::Layers>(own.clone())
-                    .with::<dyn ext::Sessions>(own.clone())
-                    .with::<dyn ext::Models>(own)
-                    .with::<dyn rt::Runtime>(Arc::clone(&self.shared.rt)),
-            )
-        }))
+    fn services(self: &Arc<Self>, origin: ContextOrigin) -> Arc<Services> {
+        let own = Arc::new(Own(Arc::downgrade(self), origin));
+        Arc::new(
+            Services::default()
+                .with::<dyn ext::Layers>(own.clone())
+                .with::<dyn ext::Sessions>(own.clone())
+                .with::<dyn ext::Models>(own)
+                .with::<dyn rt::Runtime>(Arc::clone(&self.shared.rt)),
+        )
     }
 
     /// The model the newest client's environment and the settings name
@@ -2293,11 +2397,9 @@ impl View for Viewed {
     /// With the call's own cancel: work a handler takes it along to ends
     /// with the call.
     fn cx(&self, call: CallId) -> Option<Cx> {
-        if self.0.fence.load(Ordering::SeqCst) != self.1 {
-            return None;
-        }
+        let origin = self.0.origin(call, self.1)?;
         let registry = self.0.shared.registry.get();
-        Some(self.0.cx(call, &registry, self.0.cancel(call)))
+        Some(self.0.cx(origin, &registry))
     }
 }
 
@@ -2336,23 +2438,15 @@ pub fn commands(registry: &Registry) -> Vec<protocol::CommandInfo> {
 /// The engine as a running call reaches it, on the registry generation it
 /// started with: what it reports goes through the actor's mailbox.
 struct Calling {
-    fence: u64,
+    origin: ContextOrigin,
     session: Arc<Session>,
-    call: CallId,
     registry: Arc<Registry>,
 }
 
 impl Calling {
     fn report(&self, note: Note) {
-        let call = self.call;
-        self.session.emit(
-            self.fence,
-            Msg::Note {
-                call,
-                note,
-                done: None,
-            },
-        );
+        self.origin
+            .send(&self.session, ContextRequest::Note { note, done: None });
     }
 }
 
@@ -2369,16 +2463,8 @@ impl Host for Calling {
 
     fn own(&self, pgid: u32, ended: BoxFuture<'static, ()>) {
         self.spawned(pgid, true);
-        lock(&self.session.jobs).push(pgid);
-        let session = Arc::clone(&self.session);
-        self.session.shared.rt.spawn(Box::pin(async move {
-            ended.await;
-            lock(&session.jobs).retain(|&p| p != pgid);
-            session.changed.notify();
-            if let Some(daemon) = session.shared.daemon.upgrade() {
-                daemon.jobs.notify();
-            }
-        }));
+        self.origin
+            .send(&self.session, ContextRequest::Own { pgid, ended });
     }
 
     fn progress(&self, text: &str) {
@@ -2389,12 +2475,11 @@ impl Host for Calling {
     fn note(&self, ext: &str, state: &str, data: Json) -> BoxFuture<'static, ()> {
         let (ext, state) = (ext.to_owned(), state.to_owned());
         let (done, committed) = oneshot::channel();
-        let note = Msg::Note {
-            call: self.call,
+        let note = ContextRequest::Note {
             note: Note::State { ext, state, data },
             done: Some(done),
         };
-        self.session.emit(self.fence, note);
+        self.origin.send(&self.session, note);
         Box::pin(async move {
             let _ = committed.await;
         })
@@ -2419,10 +2504,10 @@ impl Host for Calling {
 
 impl ext::Models for Own {
     /// Logged under the call as a model call of its own, then sent once:
-    /// its outcome is logged as it ends, and the call's end ends it.
+    /// its outcome is logged even if its successful parent has already settled.
     fn call<'a>(
         &'a self,
-        cx: &'a Cx,
+        _cx: &'a Cx,
         side: ext::Side,
     ) -> BoxFuture<'a, Result<llm::Response, llm::Error>> {
         Box::pin(async move {
@@ -2431,8 +2516,8 @@ impl ext::Models for Own {
                 .0
                 .upgrade()
                 .ok_or_else(|| invalid("the session is gone".into()))?;
-            let fence = session.fence.load(Ordering::SeqCst);
-            if cx.cancel.is_set() {
+            let fence = self.1.fence;
+            if !self.1.current(&session) {
                 return Err(invalid("the call was cancelled".into()));
             }
             let model = match &side.model {
@@ -2443,20 +2528,19 @@ impl ext::Models for Own {
                 None => session.model(),
             }
             .map_err(invalid)?;
-            let of = cx.call;
+            let of = self.1.call;
             let (asking, opened) = oneshot::channel();
             let purpose = side.purpose.to_string();
-            session.emit(
-                fence,
-                Msg::Side {
-                    of,
+            self.1.send(
+                &session,
+                ContextRequest::Side {
                     purpose,
                     model: model.name(),
                     conversation: side.conversation,
                     reply: asking,
                 },
             );
-            let Some(Some((id, conversation))) = opened.await else {
+            let Some(Some((id, conversation, cancel))) = opened.await else {
                 return Err(invalid(format!("call {of} is not open to ask for")));
             };
             let mut request = side.request;
@@ -2472,11 +2556,11 @@ impl ext::Models for Own {
             request.generation.max_output_tokens =
                 std::num::NonZeroU32::new(side.budget.max_tokens);
             // Logged as intent, it is seen through to its outcome by a task
-            // of its own, stopped by the call's cancel: a handler that
+            // of its own, stopped by its own cancel: a handler that
             // drops its answer does not leave the side call open.
             let (answered, answer) = oneshot::channel();
             let timeout = session.shared.rt.sleep(side.budget.timeout);
-            let (cancel, mail) = (cx.cancel.clone(), Arc::clone(&session.mail));
+            let mail = Arc::clone(&session.mail);
             session.shared.rt.spawn(Box::pin(async move {
                 // Read as the call's own replies are, with nothing streamed.
                 let mut quiet = |_: &str| {};
@@ -2534,9 +2618,9 @@ async fn first<T>(work: impl Future<Output = T>, stop: impl Future<Output = ()>)
 }
 
 /// The session, as its calls reach it for what only the engine has: the
-/// config layers, child sessions and side model requests. Weak, as the
-/// session holds these.
-struct Own(Weak<Session>);
+/// config layers, child sessions and side model requests. Its authority
+/// belongs to the context that obtained the service, never a later call.
+struct Own(Weak<Session>, ContextOrigin);
 
 impl ext::Layers for Own {
     fn model(&self, workspace: &Path) -> Result<(String, String), String> {
@@ -2548,18 +2632,17 @@ impl ext::Layers for Own {
 impl ext::Sessions for Own {
     /// The child the call started, or starts now; an interrupt of the
     /// call's turn reaches it first.
-    fn child<'a>(&'a self, cx: &'a Cx, input: String) -> BoxFuture<'a, Outcome> {
+    fn child<'a>(&'a self, _cx: &'a Cx, input: String) -> BoxFuture<'a, Outcome> {
         Box::pin(async move {
             let Some(session) = self.0.upgrade() else {
                 return Outcome::Interrupted { output: None };
             };
-            let call = cx.call;
             let (reply, result) = oneshot::channel();
-            let fence = session.fence.load(Ordering::SeqCst);
-            if cx.cancel.is_set() {
+            if !self.1.current(&session) {
                 return Outcome::Interrupted { output: None };
             }
-            session.emit(fence, Msg::Child { call, input, reply });
+            self.1
+                .send(&session, ContextRequest::Child { input, reply });
             match result.await {
                 Some(value) => value
                     .parse()

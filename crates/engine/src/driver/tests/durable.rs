@@ -211,15 +211,22 @@ impl ManualSession {
 
     fn note(&self) -> oneshot::Receiver<()> {
         let (done, waited) = oneshot::channel();
-        self.session.send(Msg::Note {
+        ContextOrigin {
+            fence: self.session.session.fence.load(Ordering::SeqCst),
             call: self.call,
-            note: Note::State {
-                ext: "test".into(),
-                state: "value".into(),
-                data: Json::encode(&"pending").unwrap(),
+            cancel: self.session.session.cancel(self.call),
+        }
+        .send(
+            &self.session.session,
+            ContextRequest::Note {
+                note: Note::State {
+                    ext: "test".into(),
+                    state: "value".into(),
+                    data: Json::encode(&"pending").unwrap(),
+                },
+                done: Some(done),
             },
-            done: Some(done),
-        });
+        );
         waited
     }
 

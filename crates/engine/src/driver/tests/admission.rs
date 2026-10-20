@@ -498,3 +498,240 @@ fn a_failed_epoch_answers_an_attach_waiting_for_publication() {
     ));
     session.halt();
 }
+
+struct RetainedObserver(Arc<channel::Sender<Cx>>);
+impl Extension for RetainedObserver {
+    const NAME: &'static str = "retained_observer";
+    const VERSION: u32 = 1;
+    fn contribute(&self, r: &mut Registrar) {
+        let contexts = Arc::clone(&self.0);
+        r.on::<point::Observe>(move |cx, entry| {
+            if !matches!(entry.body, Body::ToolCall { .. }) {
+                return ext::Reaction::NONE;
+            }
+            let cx = cx.cx().unwrap();
+            let contexts = Arc::clone(&contexts);
+            ext::Reaction::later(Requirement::Ordered, async move {
+                contexts.send(cx).ok().unwrap();
+            })
+        });
+    }
+}
+
+#[derive(Clone, Copy)]
+enum RetainedProbe {
+    Side,
+    Child,
+    Reaction,
+    Mailbox,
+}
+
+fn stale_request<'a>(
+    probe: RetainedProbe,
+    old: &'a Cx,
+    session: &'a Session,
+    fence: u64,
+) -> rt::BoxFuture<'a, ()> {
+    if matches!(probe, RetainedProbe::Mailbox) {
+        Box::pin(async move {
+            // A queued request must be fenced even independently of revocation.
+            let origin = ContextOrigin {
+                fence,
+                call: old.call,
+                cancel: Cancel::default(),
+            };
+            let (reply, _) = oneshot::channel();
+            origin.send(
+                session,
+                ContextRequest::Side {
+                    purpose: "stale side".into(),
+                    model: "none".into(),
+                    conversation: false,
+                    reply,
+                },
+            );
+            let (reply, _) = oneshot::channel();
+            origin.send(
+                session,
+                ContextRequest::Child {
+                    input: "stale child".into(),
+                    reply,
+                },
+            );
+            origin.send(
+                session,
+                ContextRequest::Note {
+                    note: Note::Progress("stale note".into()),
+                    done: None,
+                },
+            );
+            origin.send(
+                session,
+                ContextRequest::Own {
+                    pgid: 42,
+                    ended: Box::pin(std::future::pending()),
+                },
+            );
+        })
+    } else if matches!(probe, RetainedProbe::Child) {
+        Box::pin(async move {
+            old.service::<dyn ext::Sessions>()
+                .unwrap()
+                .child(old, "stale child".into())
+                .await;
+        })
+    } else {
+        Box::pin(async move {
+            let side = ext::Side::new(
+                "stale side",
+                [llm::Message::user("stale request")].into_iter().collect(),
+            );
+            let _ = old.models().unwrap().call(old, side).await;
+        })
+    }
+}
+
+fn settled_context_cannot_submit_after_recovery(probe: RetainedProbe) {
+    let (started, starts) = channel::unbounded();
+    let (observed, observations) = channel::unbounded();
+    let registry = Registry::default()
+        .with(&HeldHarbor(Arc::new(started)))
+        .unwrap()
+        .with(&RetainedObserver(Arc::new(observed)))
+        .unwrap();
+    let (fixture, faulty, script) = pipeline(registry);
+    let turn = cassette("openai/streaming_grammar/tool_then_followup_text.yaml");
+    *lock(&script.replies) = [
+        turn[0].clone(),
+        turn[1].clone(),
+        turn[0].clone(),
+        turn[1].clone(),
+        turn[1].clone(),
+    ]
+    .into();
+    let session = fixture.create();
+    settle(&session);
+    let fence = session.session.fence.load(Ordering::SeqCst);
+    let flush = faulty.hold_next_flush();
+    let rejected = enqueue(&session, "before failure");
+    flush.started();
+    let (old, release) = started_harbor(&starts);
+    let observed = rt::block_on(observations.recv()).unwrap();
+    release.send("old result".into());
+    session.wait("settled speculative turn", PATIENCE, || {
+        lock(&script.sent).len() == 2 && !session.has_work()
+    });
+    let _ = positions(&session);
+    faulty.fail_next_sync(SyncFailure::Discard);
+    flush.release();
+    assert!(matches!(rt::block_on(rejected), Some(Err(_))));
+    let _ = positions(&session);
+    let accepted = enqueue(&session, "after failure");
+    let (current, release) = started_harbor(&starts);
+    assert_eq!(old.call, current.call, "exercise a reused call id");
+    let _current_observer = rt::block_on(observations.recv()).unwrap();
+    let old = if matches!(probe, RetainedProbe::Reaction) {
+        observed
+    } else {
+        old
+    };
+    let mut request = stale_request(probe, &old, &session.session, fence);
+    let _ = request
+        .as_mut()
+        .poll(&mut std::task::Context::from_waker(std::task::Waker::noop()));
+    let _ = positions(&session);
+    let admitted = faulty.pending(session.id).iter().any(|entry| {
+        matches!(&entry.body, Body::ModelCall { purpose: Some(p), .. } if p == "stale side")
+            || serde_json::to_string(entry)
+                .unwrap()
+                .contains("stale child")
+    }) || log_of(&session)
+        .iter()
+        .any(|entry| serde_json::to_string(entry).unwrap().contains("stale"));
+    drop(request);
+    assert!(
+        !admitted,
+        "old context admitted work into the recovered generation"
+    );
+    assert!(
+        lock(&session.session.jobs).is_empty(),
+        "stale process ownership was admitted"
+    );
+    release.send("fresh result".into());
+    assert_eq!(rt::block_on(accepted), Some(Ok(())));
+    settle(&session);
+    session.halt();
+    assert!(
+        old.cancel.is_set(),
+        "settlement must revoke retained contexts"
+    );
+}
+
+#[test]
+fn a_settled_context_cannot_submit_side_calls_into_a_recovered_generation() {
+    settled_context_cannot_submit_after_recovery(RetainedProbe::Side);
+}
+
+#[test]
+fn a_settled_context_cannot_submit_children_into_a_recovered_generation() {
+    settled_context_cannot_submit_after_recovery(RetainedProbe::Child);
+}
+
+#[test]
+fn a_settled_observer_context_cannot_submit_reactions_into_a_recovered_generation() {
+    settled_context_cannot_submit_after_recovery(RetainedProbe::Reaction);
+}
+
+#[test]
+fn a_queued_context_request_keeps_its_original_fence_without_a_cancel_signal() {
+    settled_context_cannot_submit_after_recovery(RetainedProbe::Mailbox);
+}
+
+#[test]
+fn an_unadmitted_side_call_cannot_outlive_its_cancelled_parent() {
+    let (started, starts) = channel::unbounded();
+    let registry = Registry::default()
+        .with(&HeldHarbor(Arc::new(started)))
+        .unwrap();
+    let (fixture, faulty, script) = pipeline(registry);
+    let session = fixture.create();
+    settle(&session);
+    let input = faulty.hold_next_flush();
+    let side_flush = faulty.hold_next_flush();
+    let ack = enqueue(&session, "hello");
+    input.started();
+    let (cx, release) = started_harbor(&starts);
+    let side = ext::Side::new(
+        "cancelled side",
+        [llm::Message::user("Say hi.")].into_iter().collect(),
+    );
+    let mut answer = cx.models().unwrap().call(&cx, side);
+    assert!(
+        answer
+            .as_mut()
+            .poll(&mut std::task::Context::from_waker(std::task::Waker::noop()))
+            .is_pending()
+    );
+    let _ = positions(&session);
+    let (reply, interrupted) = oneshot::channel();
+    session.send(Msg::Request {
+        request: Request::Interrupt,
+        origin: None,
+        reply,
+    });
+    let _ = positions(&session);
+    release.send("cancelled result".into());
+    input.release();
+    side_flush.started();
+    side_flush.release();
+    assert_eq!(rt::block_on(ack), Some(Ok(())));
+    assert_eq!(rt::block_on(interrupted), Some(Ok(())));
+    let refused = rt::block_on(answer).is_err();
+    settle(&session);
+    session.halt();
+    assert!(
+        refused,
+        "cancellation must revoke side work still awaiting admission"
+    );
+    assert_eq!(lock(&script.sent).len(), 1);
+}
