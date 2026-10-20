@@ -449,6 +449,56 @@ fn a_kernel_panic_is_a_resume() {
     assert_eq!(fx.as_slice(), [append(5, tool_result(4, INTERRUPTED))]);
 }
 
+/// No extension is known by name below the extension layer: the kernel
+/// and the engine name no plugin's state, fold or purpose. (What the
+/// `settings` extension chooses is a service; what titles a session is a
+/// side request's purpose, the plugin's own.)
+#[test]
+fn no_plugin_is_named_below_the_plugin_layer() {
+    let manifest = Path::new(env!("CARGO_MANIFEST_DIR"));
+    let crates = ["kernel", "engine"].map(|c| manifest.join("..").join(c).join("src"));
+    let names = [
+        "\"settings\"",
+        "\"title\"",
+        "\"titled\"",
+        "\"compacted\"",
+        "\"mode\"",
+    ];
+    let mut sources = Vec::new();
+    for root in crates {
+        sources.extend(rust_sources(&root));
+    }
+    assert!(!sources.is_empty());
+    for path in sources {
+        let text = std::fs::read_to_string(&path).unwrap();
+        for name in names {
+            assert!(
+                !text.contains(name),
+                "{} names a plugin: {name}",
+                path.display()
+            );
+        }
+    }
+}
+
+/// The non-test Rust sources under `dir`.
+fn rust_sources(dir: &Path) -> Vec<std::path::PathBuf> {
+    let mut found = Vec::new();
+    for entry in std::fs::read_dir(dir).unwrap().flatten() {
+        let path = entry.path();
+        let name = entry.file_name();
+        let name = name.to_string_lossy();
+        if path.is_dir() {
+            if name != "tests" {
+                found.extend(rust_sources(&path));
+            }
+        } else if name.ends_with(".rs") && !name.ends_with("tests.rs") {
+            found.push(path);
+        }
+    }
+    found
+}
+
 /// #32: the kernel cannot do I/O. Nothing it is built from reaches a
 /// runtime, the OS or the network, and its source names no file, socket,
 /// process, thread or clock.
