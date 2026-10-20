@@ -123,12 +123,15 @@ struct Held {
 
 /// One session's extension states.
 #[derive(Default)]
-pub struct States(Vec<Held>);
+pub struct States {
+    held: Vec<Held>,
+    rejected: Option<String>,
+}
 
 impl States {
     pub(crate) fn new(decls: impl IntoIterator<Item = (Name, Decl)>) -> Self {
-        Self(
-            decls
+        Self {
+            held: decls
                 .into_iter()
                 .map(|(ext, decl)| Held {
                     value: (decl.make)(),
@@ -136,15 +139,16 @@ impl States {
                     decl,
                 })
                 .collect(),
-        )
+            rejected: None,
+        }
     }
 
     pub fn get<S: Fold>(&self) -> Option<&S> {
-        self.0.iter().find_map(|h| h.value.downcast_ref())
+        self.held.iter().find_map(|h| h.value.downcast_ref())
     }
 
     pub fn erased(&self, ext: &str, name: &str) -> Option<&Json> {
-        self.0
+        self.held
             .iter()
             .find(|h| &*h.ext == ext && &*h.decl.name == name && h.decl.ty.is_none())
             .and_then(|h| h.value.downcast_ref())
@@ -153,7 +157,7 @@ impl States {
     /// The extension that registered `S`.
     pub(crate) fn ext_of<S: Fold>(&self) -> Option<&Name> {
         let ty = TypeId::of::<S>();
-        self.0
+        self.held
             .iter()
             .find(|h| h.decl.ty == Some(ty))
             .map(|h| &h.ext)
@@ -165,11 +169,12 @@ impl States {
     pub fn fold(&mut self, ext: &str, state: &str, data: &Json) {
         if let Err(e) = self.try_fold(ext, state, data) {
             eprintln!("warning: {e}");
+            self.rejected.get_or_insert(e);
         }
     }
 
     fn try_fold(&mut self, ext: &str, state: &str, data: &Json) -> Result<(), String> {
-        let held = self.0.iter_mut();
+        let held = self.held.iter_mut();
         for held in held.filter(|h| &*h.ext == ext && &*h.decl.name == state) {
             (held.decl.fold)(&mut *held.value, data)
                 .map_err(|e| format!("extension {ext}: a {state} change it cannot read: {e}"))?;
@@ -177,18 +182,17 @@ impl States {
         Ok(())
     }
 
-    /// Folds the change `e` records, if any.
+    /// Folds or skips the change `e` records, exactly as live execution does.
     pub fn apply(&mut self, e: &Entry) {
-        if let Err(error) = self.try_apply(e) {
-            eprintln!("warning: {error}");
+        if let Body::Ext { ext, state, data } = &e.body {
+            self.fold(ext, state, data);
         }
     }
 
-    pub fn try_apply(&mut self, e: &Entry) -> Result<(), String> {
-        if let Body::Ext { ext, state, data } = &e.body {
-            self.try_fold(ext, state, data)?;
-        }
-        Ok(())
+    /// Candidates require every reduction since creation or restore to
+    /// succeed; live sessions keep serving after a skipped reduction.
+    pub fn validate(&self) -> Result<(), String> {
+        self.rejected.as_ref().map_or(Ok(()), |e| Err(e.clone()))
     }
 
     /// Folds every change `entries` record.
@@ -202,7 +206,7 @@ impl States {
     /// its name: what a snapshot keeps. A state that cannot be encoded
     /// fails the lot: a snapshot is whole or not taken.
     pub fn image(&self) -> Result<Vec<Image>, String> {
-        self.0
+        self.held
             .iter()
             .map(|h| {
                 let image = (h.decl.image)(&*h.value)
@@ -221,10 +225,10 @@ impl States {
     /// cannot read fails the lot, the states left as they were: the
     /// snapshot is of another build, and the log is folded instead.
     pub fn restore(&mut self, images: &[Image]) -> Result<(), String> {
-        if images.len() != self.0.len() {
+        if images.len() != self.held.len() {
             return Err("checkpoint fold coverage differs".into());
         }
-        let restored = (self.0.iter())
+        let restored = (self.held.iter())
             .map(|h| {
                 let image = images
                     .iter()
@@ -239,9 +243,10 @@ impl States {
                 }
             })
             .collect::<Result<Vec<_>, _>>()?;
-        for (held, value) in self.0.iter_mut().zip(restored) {
+        for (held, value) in self.held.iter_mut().zip(restored) {
             held.value = value;
         }
+        self.rejected = None;
         Ok(())
     }
 }
@@ -330,16 +335,29 @@ mod tests {
     }
 
     #[test]
-    fn a_change_its_state_cannot_read_is_skipped_with_a_warning() {
+    fn a_skipped_change_keeps_its_value_and_rejects_candidate_validation() {
         let mut states = States::new([(Name::from("counter"), Decl::of::<Count>())]);
         states.fold("counter", "count", &Json::encode(&2).unwrap());
-        let bad = states.try_fold("counter", "count", &Json::encode("two").unwrap());
+        states.fold("counter", "count", &Json::encode("two").unwrap());
         assert!(
-            bad.unwrap_err()
+            states
+                .validate()
+                .unwrap_err()
                 .starts_with("extension counter: a count change")
         );
         // Another extension's state of the same name is not this one.
         states.fold("other", "count", &Json::encode(&5).unwrap());
         assert_eq!(states.get::<Count>().unwrap().0, 2);
+        states.fold("counter", "count", &Json::encode(&3).unwrap());
+        assert_eq!(states.get::<Count>().unwrap().0, 5);
+        assert!(
+            states.validate().is_err(),
+            "later successes cannot validate a rejected candidate"
+        );
+        states.restore(&states.image().unwrap()).unwrap();
+        assert!(
+            states.validate().is_ok(),
+            "a restore begins a new replay suffix"
+        );
     }
 }

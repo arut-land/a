@@ -480,7 +480,6 @@ impl Folding {
         read: impl FnOnce(&mut dyn FnMut(Snapshot) -> bool, &mut dyn FnMut(Entry)) -> io::Result<T>,
     ) -> io::Result<(T, Self)> {
         let folding = RefCell::new(Self::new(binding, registry, shared));
-        let mut failure = Ok(());
         let loaded = read(
             &mut |snapshot| {
                 folding
@@ -488,13 +487,8 @@ impl Folding {
                     .restore(&snapshot, binding, registry, shared)
                     .is_ok()
             },
-            &mut |entry| {
-                if failure.is_ok() {
-                    failure = folding.borrow_mut().fold(&entry);
-                }
-            },
+            &mut |entry| folding.borrow_mut().fold(&entry),
         )?;
-        failure.map_err(io::Error::other)?;
         Ok((loaded, folding.into_inner()))
     }
 
@@ -532,11 +526,10 @@ impl Folding {
         Ok(())
     }
 
-    fn fold(&mut self, e: &Entry) -> Result<(), String> {
-        self.states.try_apply(e)?;
+    fn fold(&mut self, e: &Entry) {
+        self.states.apply(e);
         self.has_input |= matches!(e.body, Body::Input { .. });
         self.core.load(e);
-        Ok(())
     }
 }
 
@@ -720,6 +713,7 @@ impl Actor {
                 }
                 Ok(())
             })?;
+            folding.states.validate().map_err(io::Error::other)?;
             Ok::<_, io::Error>(folding.states)
         })
         .await;

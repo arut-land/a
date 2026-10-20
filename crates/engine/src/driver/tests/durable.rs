@@ -613,3 +613,145 @@ fn a_candidate_superseded_during_rebuild_is_never_published() {
     assert_eq!(h.value(), 3);
     h.finish();
 }
+
+#[test]
+fn a_session_reopens_after_a_rejected_reduction() {
+    let mut h = ManualSession::with_registry(reload_registry(1, 1, true));
+    let _first = h.note();
+    let _rejected = h.note();
+    h.complete();
+    h.request("still usable");
+    assert_eq!(h.value(), 1);
+    let shared = Arc::clone(&h.session.session.shared);
+    let header = Header {
+        id: h.session.id,
+        workspace: h.session.workspace.clone(),
+        parent: None,
+    };
+    h.finish();
+    let loaded = Live::start(&header, &shared, Open::Load, Owner::None)
+        .unwrap_or_else(|e| panic!("a skipped reduction cannot poison reopen: {e}"));
+    loaded.submit("after reopen").unwrap();
+    settle(&loaded);
+    assert_eq!(
+        lock(&loaded.session.state_view())
+            .erased("test", "value")
+            .unwrap()
+            .parse::<u64>()
+            .unwrap(),
+        1
+    );
+    assert!(
+        log_of(&loaded)
+            .iter()
+            .any(|e| matches!(&e.body, Body::Assistant { text } if text == "after reopen"))
+    );
+    loaded.halt();
+}
+
+#[test]
+fn a_rejected_reduction_does_not_stop_deferred_write_recovery() {
+    let mut h = ManualSession::with_registry(reload_registry(1, 1, true));
+    let _first = h.note();
+    let rejected = h.note();
+    h.session.send(Msg::Sync);
+    h.poll();
+    assert_eq!(rt::block_on(rejected), Some(()));
+    assert_eq!(h.value(), 1);
+    h.faulty.fail_next_write();
+    let lost = h.note();
+    // Recovery of this unsafe call settles it instead of starting it again.
+    let mut cx = std::task::Context::from_waker(std::task::Waker::noop());
+    let polled = h.actor.as_mut().poll(&mut cx);
+    assert!(
+        polled.is_pending(),
+        "recovery must keep serving after a skipped reduction"
+    );
+    assert_eq!(rt::block_on(lost), None);
+    assert_eq!(h.value(), 1);
+    h.request("after recovery");
+    let kept = h.finish();
+    assert!(
+        kept.iter()
+            .any(|e| matches!(&e.body, Body::Assistant { text } if text == "after recovery"))
+    );
+}
+
+#[test]
+fn a_rejected_reduction_has_the_same_outcome_at_every_snapshot_position() {
+    let mut h = ManualSession::with_registry(reload_registry(1, 1, true));
+    let registry = h.session.session.shared.registry.get();
+    let mut entries = Vec::new();
+    let mut checkpoints = vec![None];
+    // Each turn rests after one reduction, allowing a checkpoint before
+    // the rejection, after it, or no checkpoint at all over the same log.
+    for _ in 0..2 {
+        let _note = h.note();
+        h.complete();
+        h.request("rest");
+        entries = log_of(&h.session);
+        let image = Image {
+            build: h.session.session.shared.build.clone(),
+            extensions: registry.installed(),
+            has_input: h.session.has_input(),
+            ledger: Ledger::of(&entries),
+            states: lock(&h.session.session.state_view()).image().unwrap(),
+        };
+        checkpoints.push(Some(Snapshot {
+            covers: entries.last().unwrap().seq.get(),
+            image: Json::encode(&image).unwrap(),
+        }));
+        if checkpoints.len() == 2 {
+            h.request("sleep 0");
+            h.call = id(log_of(&h.session)
+                .iter()
+                .rev()
+                .find(|e| matches!(e.body, Body::ToolCall { .. }))
+                .unwrap()
+                .seq
+                .get());
+            let release = rt::block_on(h.starts.recv()).unwrap();
+            h.release.send(());
+            h.release = release;
+        }
+    }
+    let shared = Arc::clone(&h.session.session.shared);
+    let binding = bind(&registry, &h.session.session) as Arc<dyn Binding>;
+    let header = Header {
+        id: h.session.id,
+        workspace: h.session.workspace.clone(),
+        parent: None,
+    };
+    h.finish();
+    let mut outcomes = Vec::new();
+    for snapshot in checkpoints {
+        if let Some(snapshot) = snapshot {
+            let mut loaded = shared
+                .store
+                .load(header.id, &mut |_| false, &mut |_| {})
+                .unwrap();
+            loaded.writer.snapshot(&snapshot).unwrap();
+        }
+        let rebuilt = Folding::open(&header, &shared, Open::Load, &binding, &registry);
+        outcomes.push(
+            rebuilt
+                .map(|(_, f)| {
+                    (
+                        f.states
+                            .erased("test", "value")
+                            .unwrap()
+                            .parse::<u64>()
+                            .unwrap(),
+                        f.core.ledger().seq(),
+                        f.has_input,
+                    )
+                })
+                .map_err(|e| e.to_string()),
+        );
+    }
+    let expected = Ok((1, entries.last().unwrap().seq.get(), true));
+    assert!(
+        outcomes.iter().all(|outcome| outcome == &expected),
+        "snapshot position changed replay: {outcomes:?}"
+    );
+}
