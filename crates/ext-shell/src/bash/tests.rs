@@ -461,7 +461,12 @@ fn a_running_commands_output_is_on_disk() {
         call.join().unwrap()
     });
     assert!(ran.aborted, "{ran:?}");
-    assert_eq!(ran.output, "started\n");
+    // The shell may say its stopped child was terminated, as it stops too.
+    let said = ran.output.strip_prefix("started\n");
+    assert!(
+        said.is_some_and(|rest| rest.is_empty() || rest.contains("Terminated")),
+        "{ran:?}"
+    );
     // Shown whole, so not kept.
     assert!(!log.exists());
 }
