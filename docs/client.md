@@ -110,7 +110,7 @@ FFI feed (`crates/ffi/src/live.rs`) are `Renderer`s over this one loop;
 
 ## Renderer rules
 
-`crates/client/tests/one_rule.rs` searches every app's sources (Swift
+`crates/client/src/one_rule.rs` searches every app's sources (Swift
 included) for the signs of a rule copied out of the SDK and fails on any:
 
 - No app decides what waits on whom from the approvals (`Approval::
