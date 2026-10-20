@@ -96,6 +96,10 @@ pub struct Live {
     pub(crate) ended: Ended,
 }
 
+/// What a side request is answered with: its id and the conversation it
+/// asked for, or `None` when it may not be made.
+type Opened = Option<(CallId, llm::Messages)>;
+
 /// A client's mutation of a session.
 pub enum Request {
     Input {
@@ -138,12 +142,14 @@ enum Msg {
         message: Option<llm::Assistant>,
     },
     /// A side model request on behalf of call `of`, answered with its id
-    /// once its intent is committed.
+    /// once its intent is committed, and if asked, the conversation the
+    /// model sees before `of`.
     Side {
         of: CallId,
         purpose: String,
         model: String,
-        reply: oneshot::Sender<Option<CallId>>,
+        conversation: bool,
+        reply: oneshot::Sender<Opened>,
     },
     Stop,
     /// Answered once every message before it is taken.
@@ -404,8 +410,9 @@ struct Actor {
     /// What calls run again are handed: the answer they waited on.
     answers: Keyed<CallId, Json>,
     replies: Keyed<Ticket, oneshot::Sender<Result<(), String>>>,
-    /// Side model requests waiting for their call's id.
-    sides: Keyed<Ticket, oneshot::Sender<Option<CallId>>>,
+    /// Side model requests waiting for their call's id, with the
+    /// conversation they asked for.
+    sides: Keyed<Ticket, (oneshot::Sender<Opened>, Option<llm::Messages>)>,
     tickets: u64,
     /// Tool and model calls in flight, each of which reports once.
     reporting: usize,
@@ -462,32 +469,7 @@ impl Actor {
                 request,
                 origin,
                 reply,
-            } => {
-                self.tickets += 1;
-                let ticket = Some(Ticket(self.tickets));
-                self.replies.insert(Ticket(self.tickets), reply);
-                match request {
-                    Request::Input { text, mode } => Event::Input {
-                        text,
-                        mode,
-                        origin,
-                        ticket,
-                    },
-                    Request::Interrupt => Event::Interrupt { origin, ticket },
-                    Request::Answer { call, value } => {
-                        let Some(call) = CallId::new(call) else {
-                            self.reply(Ticket(self.tickets), Err("no call 0".into()));
-                            return None;
-                        };
-                        Event::Answer {
-                            call,
-                            value,
-                            origin,
-                            ticket,
-                        }
-                    }
-                }
-            }
+            } => self.requested(request, origin, reply)?,
             Msg::Step(event) => event,
             Msg::Attach(client, since, done) => {
                 self.attach(&client, since);
@@ -527,11 +509,13 @@ impl Actor {
                 of,
                 purpose,
                 model,
+                conversation,
                 reply,
             } => {
+                let conversation = conversation.then(|| self.conversation(of));
                 self.tickets += 1;
                 let ticket = Ticket(self.tickets);
-                self.sides.insert(ticket, reply);
+                self.sides.insert(ticket, (reply, conversation));
                 Event::Side {
                     of,
                     purpose,
@@ -557,6 +541,40 @@ impl Actor {
             self.cancels.remove(call);
         }
         Some((event, None))
+    }
+
+    /// What a client's `request` asks the kernel, numbered so its reply
+    /// finds it.
+    fn requested(
+        &mut self,
+        request: Request,
+        origin: Option<Author>,
+        reply: oneshot::Sender<Result<(), String>>,
+    ) -> Option<Event> {
+        self.tickets += 1;
+        let ticket = Some(Ticket(self.tickets));
+        self.replies.insert(Ticket(self.tickets), reply);
+        Some(match request {
+            Request::Input { text, mode } => Event::Input {
+                text,
+                mode,
+                origin,
+                ticket,
+            },
+            Request::Interrupt => Event::Interrupt { origin, ticket },
+            Request::Answer { call, value } => {
+                let Some(call) = CallId::new(call) else {
+                    self.reply(Ticket(self.tickets), Err("no call 0".into()));
+                    return None;
+                };
+                Event::Answer {
+                    call,
+                    value,
+                    origin,
+                    ticket,
+                }
+            }
+        })
     }
 
     /// Steps the kernel through `events` and carries out what follows. A
@@ -678,6 +696,10 @@ impl Actor {
         let session = &self.live.session;
         let hooks = self.registry.hooks();
         self.transcript = self.transcript.take().filter(|t| t.is_on(&self.registry));
+        // An edit changes what came before it: the transcript is made again.
+        if entries.iter().any(|e| matches!(e.body, Body::Edit { .. })) {
+            self.transcript = None;
+        }
         for e in entries {
             self.live.frames.push(e.seq);
             lock(&session.states).apply(e);
@@ -729,8 +751,8 @@ impl Actor {
             Effect::Append(_) => unreachable!("appends are committed in runs"),
             Effect::Reply { ticket, result } => self.reply(ticket, result),
             Effect::Side { ticket, side } => {
-                if let Some(reply) = self.sides.remove(&ticket) {
-                    reply.send(side);
+                if let Some((reply, conversation)) = self.sides.remove(&ticket) {
+                    reply.send(side.map(|side| (side, conversation.unwrap_or_default())));
                 }
             }
             Effect::CallModel {
@@ -906,13 +928,16 @@ impl Actor {
                 if let Some((decisions, response)) = answered {
                     let prepared = Event::Prepared { call, decisions };
                     let _ = live.session.mail.send(Msg::Step(prepared));
-                    let replied = match Json::encode(&response) {
-                        Ok(output) => Replied::Done(output),
-                        Err(e) => {
-                            Replied::Failed(llm::Error::new(llm::Kind::Decode, e.to_string()))
-                        }
+                    let (replied, message) = match response {
+                        Ok(response) => match Json::encode(&response) {
+                            Ok(output) => (Replied::Done(output), Some(response.message)),
+                            Err(e) => {
+                                let error = llm::Error::new(llm::Kind::Decode, e.to_string());
+                                (Replied::Failed(error), None)
+                            }
+                        },
+                        Err(error) => (Replied::Failed(error), None),
                     };
-                    let message = Some(response.message);
                     let _ = live.session.mail.send(Msg::Replied {
                         call,
                         replied,
@@ -962,20 +987,25 @@ impl Actor {
     /// The request for model call `call`: the system prompt, the
     /// transcript before it, and the tools.
     fn request(&mut self, call: CallId, model: &Model) -> llm::Request {
+        let messages = self.conversation(call);
+        model.request(messages, self.registry.specs().to_vec())
+    }
+
+    /// The conversation the model sees before entry `call`.
+    fn conversation(&mut self, call: CallId) -> llm::Messages {
         let system = self.registry.system_prompt();
         let frames = &self.live.frames;
         let registry = &self.registry;
         let transcript = self
             .transcript
             .get_or_insert_with(|| Transcript::of(frames.entries(), Arc::clone(registry), system));
-        let messages = if let Some(messages) = transcript.before(call.get()) {
+        if let Some(messages) = transcript.before(call.get()) {
             messages.clone()
         } else {
             // A call recovery runs after entries it does not see.
             let before = frames.entries().take_while(|e| e.seq < call.get());
             Transcript::of(before, Arc::clone(registry), system).into_messages()
-        };
-        model.request(messages, registry.specs().to_vec())
+        }
     }
 
     /// Runs tool call `call`, the model's or a user's command, reporting
@@ -1574,6 +1604,14 @@ impl Host for Calling {
         self.report(Note::State { ext, state, data });
     }
 
+    fn edit(&self, target: protocol::Seq, upto: Option<protocol::Seq>, replace: Option<Json>) {
+        self.report(Note::Edit {
+            target,
+            upto,
+            replace,
+        });
+    }
+
     fn states(&self, read: &mut dyn FnMut(&States)) {
         read(&lock(&self.session.states));
     }
@@ -1636,12 +1674,21 @@ impl ext::Models for Own {
                 of,
                 purpose,
                 model: model.name(),
+                conversation: side.conversation,
                 reply,
             });
-            let Some(Some(id)) = opened.await else {
+            let Some(Some((id, conversation))) = opened.await else {
                 return Err(invalid(format!("call {of} is not open to ask for")));
             };
             let mut request = side.request;
+            if side.conversation {
+                // Pushed onto the conversation, whose encodings it keeps.
+                let mut messages = conversation;
+                for message in request.messages.iter() {
+                    messages.push(message.clone());
+                }
+                request.messages = messages;
+            }
             request.model = model.request(llm::Messages::default(), Vec::new()).model;
             request.generation.max_output_tokens =
                 std::num::NonZeroU32::new(side.budget.max_tokens);

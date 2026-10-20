@@ -542,8 +542,18 @@ impl Core {
 
     /// Logs what a running call reports; a call not running reports
     /// nothing more.
+    /// Logs what a call reports: a running tool call anything, and a call
+    /// whose handler answers later (a model call recovering, a gate
+    /// asking) its extension's state and edits. A call not open reports
+    /// nothing more.
     fn note(&mut self, call: CallId, note: Note, fx: &mut Effects) {
-        if self.step_of(call) != Some(Step::Running) {
+        let deciding = match &self.turn {
+            Turn::Model { call: c, .. } => *c == call,
+            _ => matches!(self.step_of(call), Some(Step::Awaiting { .. })),
+        };
+        let running = self.step_of(call) == Some(Step::Running);
+        let ext = matches!(note, Note::State { .. } | Note::Edit { .. });
+        if !(running || deciding && ext) {
             return;
         }
         let body = match note {
@@ -562,6 +572,15 @@ impl Core {
                 text,
             },
             Note::State { ext, state, data } => Body::Ext { ext, state, data },
+            Note::Edit {
+                target,
+                upto,
+                replace,
+            } => Body::Edit {
+                target,
+                upto,
+                replace,
+            },
         };
         self.append(fx, body);
     }

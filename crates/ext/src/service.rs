@@ -65,6 +65,10 @@ pub struct Side {
     pub model: Option<String>,
     /// The request; its model is set from `model`.
     pub request: llm::Request,
+    /// Whether the request's messages follow the conversation its call's
+    /// model sees (system prompt included, so a provider's cache of it
+    /// serves): what summarises or titles the conversation.
+    pub conversation: bool,
     pub budget: Budget,
 }
 
@@ -78,7 +82,17 @@ impl Side {
                 messages,
                 ..llm::Request::default()
             },
+            conversation: false,
             budget: Budget::default(),
+        }
+    }
+
+    /// The same, following the conversation its call's model sees.
+    #[must_use]
+    pub fn after_the_conversation(self) -> Self {
+        Self {
+            conversation: true,
+            ..self
         }
     }
 }

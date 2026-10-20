@@ -13,6 +13,7 @@ publish = false
 # The extension SDK, and the extensions: one crate each, or a small group
 # that belongs together. A binary links the ones it runs.
 ext = { path = "crates/ext" }
+ext-compact = { path = "crates/ext-compact" }
 ext-derive = { path = "crates/ext-derive" }
 ext-edit = { path = "crates/ext-edit" }
 ext-fixtures = { path = "crates/ext-fixtures" }

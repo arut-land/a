@@ -11,7 +11,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, PoisonError};
 use std::task::{Poll, Waker};
 
-use protocol::{Audience, Card, Environment, Json, Outcome, SessionId};
+use protocol::{Audience, Card, Environment, Json, Outcome, Seq, SessionId};
 use serde::Serialize;
 use serde::de::DeserializeOwned;
 
@@ -191,6 +191,15 @@ impl Cx {
             Ok(data) => self.host.note(&ext, S::NAME, data),
             Err(e) => eprintln!("warning: extension {ext}: a {} change: {e}", S::NAME),
         }
+    }
+
+    /// Changes what the model sees from here on: the log's entries
+    /// `target..=upto` (or just `target`) stand as `replace`, text the
+    /// model reads as a user's message, or are left out. The log itself is
+    /// never rewritten; what compacts a transcript writes this.
+    pub fn edit(&self, target: Seq, upto: Option<Seq>, replace: Option<&str>) {
+        let replace = replace.and_then(|text| Json::encode(text).ok());
+        self.host.edit(target, upto, replace);
     }
 
     /// Records a process group the call started, durably, so it is killed

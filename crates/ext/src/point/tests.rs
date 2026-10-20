@@ -551,7 +551,7 @@ fn a_step_rewrite_is_logged_and_an_answer_ends_it() {
                     model: Some(request.model.clone()),
                     meta: llm::Meta::new(),
                 };
-                Rewrite::Stop(answer)
+                Rewrite::Stop(Ok(answer))
             });
         }),
     ]);
@@ -566,6 +566,7 @@ fn a_step_rewrite_is_logged_and_an_answer_ends_it() {
         [(by, Verdict::PrepareStep { model: Some(m) })] if &**by == "fallback" && m == "cheap"
     ));
     let (by, answer) = answered.unwrap();
+    let answer = answer.unwrap();
     assert_eq!((&*by, answer.model.as_deref()), ("cache", Some("cheap")));
 }
 

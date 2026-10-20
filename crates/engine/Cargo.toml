@@ -27,6 +27,7 @@ futures-core = { version = "0.3", default-features = false, features = ["std"] }
 http.workspace = true
 serde_yaml_ng = "0.10"
 # The extensions sessions under test run.
+ext-compact.workspace = true
 ext-edit.workspace = true
 ext-fixtures = { workspace = true, features = ["on"] }
 ext-policy.workspace = true

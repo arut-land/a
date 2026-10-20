@@ -6,7 +6,7 @@ use std::any::{Any, TypeId};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex, OnceLock, PoisonError};
 
-use protocol::{Audience, Environment, Json, Outcome, SessionId};
+use protocol::{Audience, Environment, Json, Outcome, Seq, SessionId};
 
 use crate::ext::MakeAgent;
 use crate::state::States;
@@ -29,6 +29,8 @@ pub trait Host: Send + Sync {
     /// Commits `data` as a change to extension `ext`'s state `state`, and
     /// folds it in.
     fn note(&self, ext: &str, state: &str, data: Json);
+    /// Commits an `edit`: see [`Cx::edit`].
+    fn edit(&self, target: Seq, upto: Option<Seq>, replace: Option<Json>);
     /// Lends the session's states to `read`, which cannot keep them.
     fn states(&self, read: &mut dyn FnMut(&States));
     /// The registry generation the call started on.

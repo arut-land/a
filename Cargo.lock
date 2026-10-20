@@ -9,6 +9,7 @@ dependencies = [
  "client",
  "engine",
  "ext",
+ "ext-compact",
  "ext-edit",
  "ext-fixtures",
  "ext-policy",
@@ -546,6 +547,7 @@ name = "engine"
 version = "0.0.0"
 dependencies = [
  "ext",
+ "ext-compact",
  "ext-edit",
  "ext-fixtures",
  "ext-policy",
@@ -615,6 +617,18 @@ dependencies = [
  "serde_json",
  "smallvec",
  "sys",
+]
+
+[[package]]
+name = "ext-compact"
+version = "0.0.0"
+dependencies = [
+ "ext",
+ "ext-retry",
+ "llm",
+ "protocol",
+ "rt",
+ "serde_json",
 ]
 
 [[package]]

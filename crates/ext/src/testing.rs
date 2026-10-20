@@ -161,6 +161,17 @@ impl Host for Recorder {
         ));
     }
 
+    fn edit(&self, target: protocol::Seq, upto: Option<protocol::Seq>, replace: Option<Json>) {
+        let mut log = lock(&self.log);
+        let seq = log.len() as u64 + 1;
+        let edit = Body::Edit {
+            target,
+            upto,
+            replace,
+        };
+        log.push(Entry::new(seq, 0, edit));
+    }
+
     fn states(&self, read: &mut dyn FnMut(&States)) {
         read(&lock(&self.states));
     }

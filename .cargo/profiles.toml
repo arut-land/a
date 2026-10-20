@@ -54,6 +54,9 @@ opt-level = "s"
 [profile.release.package.kernel]
 opt-level = "s"
 
+[profile.release.package.ext-compact]
+opt-level = "s"
+
 [profile.release.package.ext-edit]
 opt-level = "s"
 

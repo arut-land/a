@@ -154,6 +154,13 @@ pub enum Note {
         state: String,
         data: Json,
     },
+    /// What the model sees from here on: entries `target..=upto` stand as
+    /// `replace`, or are left out.
+    Edit {
+        target: Seq,
+        upto: Option<Seq>,
+        replace: Option<Json>,
+    },
 }
 
 /// A client's request, numbered by the driver so the reply finds it. Never

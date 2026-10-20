@@ -113,3 +113,104 @@ fn a_side_call_dies_with_its_call() {
     assert!(side_end < call_end, "{log:#?}");
     assert_eq!(http.sent(), 2);
 }
+
+/// A request that overflowed is summarised aside, the summary stands for
+/// what it summarises from then on, and the request is sent again from
+/// the transcript the edit leaves; retry, installed after, is not asked.
+#[test]
+fn a_context_overflow_is_compacted_and_sent_again() {
+    let http = Flaky::new([
+        Reply::Status(413, &[]),
+        Reply::Events(text_reply()),
+        Reply::Events(text_reply()),
+    ]);
+    let registry = Registry::default()
+        .with_in(ext::Tier::Pre, &ext_compact::Compact::default())
+        .and_then(|r| r.with_in(ext::Tier::Post, &ext_retry::Retry::default()))
+        .unwrap();
+    let session = fixture(registry, &http).start(&[]);
+    session.submit("hi").unwrap();
+    settle(&session);
+    let log = log_of(&session);
+    session.halt();
+
+    assert_eq!(http.sent(), 3, "{log:#?}");
+    assert_eq!(
+        sides(&log).iter().map(|s| s.2).collect::<Vec<_>>(),
+        ["compact"]
+    );
+    let edit = log.iter().find_map(|e| match &e.body {
+        Body::Edit {
+            target,
+            upto,
+            replace,
+        } => Some((target.get(), upto.map(Seq::get), replace.clone())),
+        _ => None,
+    });
+    let (target, upto, replace) = edit.expect("an edit");
+    assert_eq!((target, upto), (1, Some(1)), "{log:#?}");
+    let summary: String = replace.unwrap().parse().unwrap();
+    assert!(summary.contains("crimson-harbor"), "{summary}");
+    assert!(log.iter().any(|e| matches!(&e.body,
+        Body::Decision { by, d: Verdict::Retry { attempt: 1, .. }, .. } if by == "compact")));
+    assert!(matches!(
+        log.last().map(|e| &e.body),
+        Some(Body::ModelResult {
+            outcome: Outcome::Done { .. },
+            ..
+        })
+    ));
+    // The model now reads the summary where the conversation was.
+    let messages = transcript(&log, log.len() as u64 + 1, Arc::new(Registry::default()));
+    assert!(matches!(&messages[0], llm::Message::User(u) if format!("{u:?}").contains("summary")));
+}
+
+/// An edit changes what the model sees from then on, and nothing else:
+/// the transcript before it is as it was, and the log keeps every entry.
+#[test]
+fn an_edit_changes_only_what_the_model_sees_after_it() {
+    let summary = Json::encode("the gist").unwrap();
+    let entries = [
+        entry(1, user("first")),
+        entry(2, echo("first")),
+        entry(
+            3,
+            Body::Edit {
+                target: Seq::new(1).unwrap(),
+                upto: Seq::new(2),
+                replace: Some(summary),
+            },
+        ),
+        entry(4, user("second")),
+    ];
+    let registry = || Arc::new(Registry::default());
+    let before = transcript(&entries[..2], 3, registry());
+    assert_eq!(
+        before,
+        [
+            llm::Message::user("first"),
+            llm::Message::assistant("first")
+        ]
+    );
+    let after = transcript(&entries, 5, registry());
+    assert_eq!(
+        after,
+        [llm::Message::user("the gist"), llm::Message::user("second")]
+    );
+    // A later edit of the same entries is what stands.
+    let mut again = entries.to_vec();
+    let newer = Json::encode("newer").unwrap();
+    again.push(entry(
+        5,
+        Body::Edit {
+            target: Seq::new(1).unwrap(),
+            upto: Seq::new(2),
+            replace: Some(newer),
+        },
+    ));
+    let after = transcript(&again, 6, registry());
+    assert_eq!(
+        after,
+        [llm::Message::user("newer"), llm::Message::user("second")]
+    );
+}

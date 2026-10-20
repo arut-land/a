@@ -108,6 +108,7 @@ impl Host for Recorded {
         self.progress.lock().unwrap().push_str(text);
     }
     fn note(&self, _: &str, _: &str, _: Json) {}
+    fn edit(&self, _: protocol::Seq, _: Option<protocol::Seq>, _: Option<Json>) {}
     fn states(&self, read: &mut dyn FnMut(&States)) {
         read(&States::default());
     }

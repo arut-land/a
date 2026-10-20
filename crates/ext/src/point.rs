@@ -428,8 +428,9 @@ point!(
 
 /// The request of a model call, about to be sent: a handler may rewrite it
 /// (a model fallback, a reminder appended at the tail) or answer it itself
-/// (a fixture, a cache). Each rewrite is logged as `prepare_step`, and an
-/// answer as the call's reply.
+/// (a fixture, a cache), with a reply or an error (a request too large
+/// to send fails as an overflow before it costs anything). Each rewrite
+/// is logged as `prepare_step`, and an answer as the call's outcome.
 pub struct Step;
 
 impl Point for Step {
@@ -438,7 +439,7 @@ impl Point for Step {
     type Cx<'c> = PointCx<'c>;
     type Facts<'a> = ();
     type In<'a> = &'a llm::Request;
-    type Out = Rewrite<llm::Request, llm::Response>;
+    type Out = Rewrite<llm::Request, Result<llm::Response, llm::Error>>;
 
     fn input<'a, 'b: 'a>((): (), request: &'a llm::Request) -> &'a llm::Request {
         request
@@ -763,6 +764,9 @@ impl Hooked {
 /// Decisions to log, with the extension whose handler made each.
 pub type Decided = Vec<(Name, Verdict)>;
 
+/// What a `step` handler answered a model call with, in its place.
+pub type Stepped = Result<llm::Response, llm::Error>;
+
 /// A point's answer: now, or later as a future the call owns, so a slow
 /// handler holds its call rather than the session.
 pub enum Answer<T> {
@@ -978,7 +982,7 @@ impl Hooks {
         &self,
         cx: &PointCx<'_>,
         request: &mut llm::Request,
-    ) -> (Decided, Option<(Name, llm::Response)>) {
+    ) -> (Decided, Option<(Name, Stepped)>) {
         let mut decisions = Decided::new();
         let answered = self.run::<Step>(cx, (), request, &mut |name, before, after| {
             let model = (before.model != after.model).then(|| after.model.to_string());

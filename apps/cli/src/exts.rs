@@ -50,6 +50,13 @@ pub fn extensions(config: &Config) -> Result<Vec<Installed>, Refused> {
     #[cfg(feature = "edit")]
     all.push((Tier::Pre, Box::new(ext_edit::Edit)));
 
+    #[cfg(feature = "compact")]
+    all.push((
+        Tier::Pre,
+        Box::new(ext_compact::Compact {
+            threshold: whole(config, "compact", "threshold")?,
+        }),
+    ));
     #[cfg(feature = "settings")]
     all.push((Tier::Pre, Box::new(ext_settings::Settings)));
     #[cfg(feature = "subagent")]
@@ -198,6 +205,7 @@ mod tests {
                 ("prompt", 1),
                 ("shell", 1),
                 ("edit", 1),
+                ("compact", 1),
                 ("settings", 1),
                 ("subagent", 1),
                 ("retry", 1)
@@ -228,7 +236,8 @@ mod tests {
             r.system_prompt().split("\n\n").map(str::to_owned).collect()
         };
         // What each contributes that the others do not.
-        let own: [(&str, &[&str], usize); 9] = [
+        let own: [(&str, &[&str], usize); 10] = [
+            ("compact", &[], 0),
             ("policy-floor", &[], 0),
             ("policy", &[], 0),
             ("loop", &[], 0),
@@ -401,7 +410,10 @@ mod tests {
                 .collect();
             assert!(owners.len() <= 1, "{kind:?} is owned by {owners:?}");
             let owner = owners.first().map(String::as_str);
-            let want = kind.is_retryable().then_some("retry");
+            let want = match kind {
+                llm::Kind::ContextOverflow => Some("compact"),
+                kind => kind.is_retryable().then_some("retry"),
+            };
             assert_eq!(owner, want, "{kind:?}");
         }
     }

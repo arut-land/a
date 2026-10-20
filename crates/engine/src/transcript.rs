@@ -34,12 +34,29 @@ pub struct Transcript {
 }
 
 impl Transcript {
-    /// The transcript of `entries`, on `registry`, that `system` prompts.
+    /// The transcript of `entries`, on `registry`, that `system` prompts,
+    /// as their edits leave it: the entries an `edit` covers stand as its
+    /// text, a user's message, or are left out; the latest edit of an
+    /// entry is what stands.
     pub fn of(
         entries: impl IntoIterator<Item = impl Borrow<Entry>>,
         registry: Arc<Registry>,
         system: &str,
     ) -> Self {
+        let entries: Vec<_> = entries.into_iter().collect();
+        let edits: Vec<(u64, u64, Option<String>)> = (entries.iter())
+            .filter_map(|e| match &e.borrow().body {
+                Body::Edit {
+                    target,
+                    upto,
+                    replace,
+                } => {
+                    let text = replace.as_ref().and_then(|j| j.parse::<String>().ok());
+                    Some((target.get(), upto.unwrap_or(*target).get(), text))
+                }
+                _ => None,
+            })
+            .collect();
         let messages = Messages::from_iter((!system.is_empty()).then(|| Message::system(system)));
         let mut transcript = Self {
             context: messages.len(),
@@ -50,8 +67,20 @@ impl Transcript {
             last: 0,
             registry,
         };
-        for e in entries {
-            transcript.apply(e.borrow(), None);
+        for e in &entries {
+            let e = e.borrow();
+            let edit = edits
+                .iter()
+                .rev()
+                .find(|(from, to, _)| (*from..=*to).contains(&e.seq));
+            match edit {
+                None => transcript.apply(e, None),
+                Some((from, _, Some(text))) if *from == e.seq => {
+                    transcript.messages.push(Message::user(text.clone()));
+                    transcript.last = e.seq;
+                }
+                Some(_) => {}
+            }
         }
         transcript
     }
