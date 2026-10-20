@@ -4,7 +4,10 @@
 
 use usage_rs::{Cli, Subcommands};
 
+// The completions and the man page, written by an example that is not
+// shipped; the tests check what it writes.
 #[cfg(test)]
+#[path = "../examples/generate.rs"]
 mod generate;
 #[cfg(test)]
 mod tests;

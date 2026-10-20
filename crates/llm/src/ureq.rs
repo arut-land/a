@@ -42,15 +42,21 @@ enum Piece {
     Chunk(Vec<u8>),
 }
 
+#[cfg(all(feature = "tls-native", feature = "tls-rustls"))]
+compile_error!("one TLS provider: tls-native or tls-rustls");
+
+/// The TLS the build chose; without either feature the agent speaks
+/// plain http only.
+const PROVIDER: TlsProvider = if cfg!(feature = "tls-native") {
+    TlsProvider::NativeTls
+} else {
+    TlsProvider::Rustls
+};
+
 impl Ureq {
     pub fn new(rt: Arc<dyn rt::Runtime>) -> Self {
-        let provider = if cfg!(any(target_vendor = "apple", windows)) {
-            TlsProvider::NativeTls
-        } else {
-            TlsProvider::Rustls
-        };
         let tls = TlsConfig::builder()
-            .provider(provider)
+            .provider(PROVIDER)
             .root_certs(RootCerts::PlatformVerifier)
             .build();
         let config = ureq::Agent::config_builder()
@@ -62,10 +68,10 @@ impl Ureq {
         // ureq's default chain with its TCP connector swapped for one whose
         // sockets an abandoned request can shut down.
         let connector = ().chain(ConnectProxyConnector::default()).chain(Tcp);
-        #[cfg(any(target_vendor = "apple", windows))]
+        #[cfg(feature = "tls-native")]
         let connector =
             connector.chain(ureq::unversioned::transport::NativeTlsConnector::default());
-        #[cfg(not(any(target_vendor = "apple", windows)))]
+        #[cfg(feature = "tls-rustls")]
         let connector = connector.chain(ureq::unversioned::transport::RustlsConnector::default());
         let agent = ureq::Agent::with_parts(config, connector, DefaultResolver::default());
         Self { agent, rt }
@@ -86,7 +92,7 @@ impl Http for Ureq {
             abort.release();
         }));
         Box::pin(async move {
-            let head = std::future::poll_fn(|cx| rx.poll_recv(cx)).await;
+            let head = rx.recv().await;
             let parts = match head {
                 Some(Ok(Piece::Head(parts))) => parts,
                 Some(Err(error)) => return Err(error),
@@ -105,7 +111,7 @@ impl Http for Ureq {
 fn run(
     agent: &ureq::Agent,
     request: http::Request<Payload>,
-    tx: &rt::channel::Sender<io::Result<Piece>>,
+    tx: &rt::channel::BlockingSender<io::Result<Piece>>,
 ) {
     let (mut parts, body) = request.into_parts();
     // Read from its pieces as it goes out, at the length they make.

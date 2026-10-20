@@ -3,8 +3,8 @@ import Testing
 
 @testable import AKit
 
-/// The shared reducer vectors (crates/protocol/tests/vectors/view.json),
-/// run through the FFI: every client folds them to the same state.
+/// The shared reducer vectors (`A_VECTORS`, as `mise run apple:test` names
+/// them), run through the FFI: every client folds them to the same state.
 struct Vector {
     let name: String
     let messages: [String]
@@ -13,11 +13,10 @@ struct Vector {
     let hash: String
 
     static let all: [Vector] = {
-        let url = URL(filePath: #filePath)
-            .deletingLastPathComponent()
-            .appending(path: "../../../../../crates/protocol/tests/vectors/view.json")
-            .standardized
-        let data = try! Data(contentsOf: url)
+        guard let path = ProcessInfo.processInfo.environment["A_VECTORS"] else {
+            fatalError("A_VECTORS names the reducer vectors; run `mise run apple:test`")
+        }
+        let data = try! Data(contentsOf: URL(filePath: path))
         let vectors = try! JSONSerialization.jsonObject(with: data) as! [[String: Any]]
         return vectors.map { v in
             let messages = (v["messages"] as! [Any]).map {

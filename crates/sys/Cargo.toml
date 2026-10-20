@@ -9,7 +9,7 @@ publish.workspace = true
 toml_edit = { version = "0.25", default-features = false, features = ["parse", "display"] }
 
 [target.'cfg(unix)'.dependencies]
-rustix = { workspace = true, features = ["stdio", "pipe", "event"] }
+rustix = { workspace = true, features = ["stdio", "pipe", "event", "net"] }
 libc.workspace = true
 
 [lints]

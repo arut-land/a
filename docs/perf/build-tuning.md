@@ -23,8 +23,7 @@ Researched 2026-10-18 on macOS arm64, `nightly-2026-10-17`, ld-prime.
 | Setting | Where | Why |
 | --- | --- | --- |
 | Cranelift for workspace crates in dev | `.cargo/profiles.toml` | Fast codegen for code we edit |
-| Deps at LLVM opt-level 1, no debug info, in dev | `.cargo/profiles.toml` | Usable dev runtime; compiled once and shared through mbx |
-| `syn`, `usage-derive` at opt-level 0 in dev | `.cargo/profiles.toml` | Clean dev build 10.7 s → 4.4 s. `package."*"` outranks `build-override`, so proc-macros must be named |
+| Deps at LLVM opt-level 0, no debug info, in dev; the few the tests feel at 1 (serde_json, vte, ratatui-core, unicode-width, rustix, memchr) | `.cargo/profiles.toml` | Proc-macros (and their syn) run once per build and build ~2x faster at 0: clean dev build 10.7 s → 4.4 s when only `syn` and `usage-derive` were named. `package."*"` outranks `build-override`, so the default is 0 and the hot ones are named, not the other way round (2026-10-20) |
 | `-Zthreads=8` | `.cargo/config.toml` | Parallel rustc frontend |
 | Release: fat LTO, `codegen-units = 1`, `strip = "symbols"`, packed split debuginfo | `.cargo/profiles.toml` | Matches uv, ruff, mise, Deno. Thin LTO measured +14% size |
 | `panic = "unwind"` in release | `.cargo/profiles.toml` | A panicking session actor must not kill the daemon |
@@ -33,7 +32,7 @@ Researched 2026-10-18 on macOS arm64, `nightly-2026-10-17`, ld-prime.
 | Windows MSVC: `+crt-static`, `/STACK:8388608` | `.cargo/config.toml` | No VC++ runtime dependency (uv, ruff, Deno, Zed, oxc, ripgrep). Untested until Windows CI |
 | mbx (mr-boxington) cargo wrapper | `mise.toml` | Shared compile cache across checkouts and worktrees |
 | Native TLS on Apple and Windows (`ureq` `native-tls`), rustls + platform verifier elsewhere | `crates/provider/Cargo.toml` | 3968 → 3179 KiB on macOS: drops ring, rustls, webpki |
-| Release `opt-level = "s"` for cold crates (ureq, ureq-proto, url, http, usage-argv; rig-core and rig-http before `crates/llm`) | `.cargo/profiles.toml` | 3179 → 3018 KiB; startup unchanged (3.4 vs 3.5 ± 0.2 ms). serde_json stays at 3 (frames every message) |
+| Release `opt-level = "s"` for everything, `3` for `serde_json` and `alloc` | `.cargo/profiles.toml` | Grown crate by crate from "cold crates at s" (3179 → 3018 KiB, startup unchanged at 3.4 vs 3.5 ± 0.2 ms) through protocol (decode and encode under 5% slower, −92 KiB), llm (decoders ~6% per frame, −160 KiB), engine/ext/client/sys/rt (−160 KiB, no measured daemon CPU change), tui (delta frame ~45 µs at s and 3 alike, docs/tui.md), std via build-std (−13 KiB), the toml crates and ureq/usage-argv at z (−32 KiB over 3). Flipped to one default on 2026-10-20: 2846 → 2717 KiB on macOS (the crates never listed, url's and native-tls's dependencies, uuid, hypertext, ratatui-core's among them, shrank more than z → s cost; 25 entries → 2, and a new crate needs none). serde_json frames every message; alloc at s costs the terminal client's frame ~15% until its text model stops allocating per span |
 
 ## Deferred: adopt when the trigger fires
 

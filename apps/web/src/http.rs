@@ -26,9 +26,9 @@ use crate::app::{App, Live};
 pub const SCRIPT_PATH: &str = "/assets/datastar-1.0.4.js";
 
 /// Datastar's browser script, as published (`bundles/datastar.js` of
-/// v1.0.4, MIT; SHA-256 727844ad…cf91), zlib-deflated by the build script
-/// (34 KB to 13).
-pub const SCRIPT: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/datastar.js.zz"));
+/// v1.0.4, MIT), zlib-deflated once and committed beside the script it is
+/// made from (34 KB to 13), which the test below holds it to.
+pub const SCRIPT: &[u8] = include_bytes!("../assets/datastar-1.0.4.js.zz");
 
 const COOKIE_NAME: &str = "a-web";
 const MAX_HEAD: usize = 64 * 1024;
@@ -439,10 +439,12 @@ async fn send_events(rt: &Rt, stream: &Arc<TcpStream>, mut live: Box<Live>) -> i
 mod tests {
     use super::{Gate, Host, SCRIPT, SCRIPT_PATH};
 
-    /// The embedded script is the one its path names.
+    /// The embedded script inflates to the published one, byte for byte,
+    /// and is the one its path names.
     #[test]
     fn the_embedded_script_is_the_published_one() {
         let script = miniz_oxide::inflate::decompress_to_vec_zlib(SCRIPT).unwrap();
+        assert!(script == include_bytes!("../assets/datastar-1.0.4.js"));
         let version = SCRIPT_PATH
             .strip_prefix("/assets/datastar-")
             .and_then(|v| v.strip_suffix(".js"))
