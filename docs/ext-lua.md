@@ -81,7 +81,9 @@ config. Inputs are JSON variants such as `{user = {text = "hello"}}` or
 for example `{{say = input.user.text}}` or
 `{{call = {tool = "bash", input = {command = "pwd"}}}}`; return nil for no
 actions. Tool actions run through the engine and its normal approval flow.
-Agent functions cannot await effects. Errors stop their turn with a diagnostic.
+Agent tool proposals need the mod's corresponding `tools` capability too.
+An agent may return at most 128 actions. Agent functions cannot await effects.
+Errors stop their turn with a diagnostic.
 
 [The counter example](examples/counter.lua) uses tools, a hook, text and a fold.
 Copy it as `$A_HOME/ext/counter.lua`, then run `/count` or type `count please`.
@@ -139,6 +141,8 @@ Instructions are counted per invocation, including async resumes. The time
 limit is checked by the instruction hook per active poll, excluding awaited
 I/O; it is not an OS-enforced hard deadline for native functions. Native
 pattern functions are omitted because they cannot be interrupted by the hook.
-JSON is bounded to 256 KiB, 64 levels and 8192 nodes; repeated table identities
+Each invocation may send at most 128 host operations and 1 MiB of outbound
+progress, state changes and delegated input, which the Lua allocator cannot
+account for. JSON is bounded to 256 KiB, 64 levels and 8192 nodes; repeated table identities
 are rejected. Source is capped at 256 KiB, text at 8 KiB, and a workspace and
 mod each have at most 128 mods/contributions respectively.

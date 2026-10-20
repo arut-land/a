@@ -1,6 +1,6 @@
 use std::future::{Future, poll_fn};
 use std::pin::pin;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, PoisonError};
 use std::time::{Duration, Instant};
 
@@ -336,6 +336,7 @@ impl Mod {
                         lua: lua.clone(),
                         run: spec.raw_get("step")?,
                         limits,
+                        grants: Arc::clone(&grants),
                     },
                 ));
             }
@@ -435,6 +436,7 @@ struct LuaAgent {
     lua: Lua,
     run: Function,
     limits: Limits,
+    grants: Arc<[String]>,
 }
 impl ext::Agent for LuaAgent {
     fn step(&mut self, input: ext::Input, _: &dyn ext::LoopPoints) -> ext::Actions {
@@ -447,7 +449,18 @@ impl ext::Agent for LuaAgent {
                 self.limits,
             )
             .map_err(|e| e.to_string())?;
-            ext::actions_from_json(&output)
+            let actions = ext::actions_from_json(&output)?;
+            if actions.len() > 128 {
+                return Err("lua agent returned too many actions".into());
+            }
+            for action in &actions {
+                if let ext::Action::Call { tool, .. } = action
+                    && !self.grants.contains(tool)
+                {
+                    return Err(format!("tool capability {tool} is not granted"));
+                }
+            }
+            Ok(actions)
         })();
         result.unwrap_or_else(|why| {
             [ext::Action::Say(format!("lua agent failed: {why}"))]
@@ -530,12 +543,43 @@ impl DynFold for LuaFold {
     }
 }
 
+struct Quota {
+    bytes: AtomicUsize,
+    operations: AtomicUsize,
+}
+impl Quota {
+    fn new() -> Arc<Self> {
+        Arc::new(Self {
+            bytes: AtomicUsize::new(1024 * 1024),
+            operations: AtomicUsize::new(128),
+        })
+    }
+    fn take(&self, bytes: usize) -> mlua::Result<()> {
+        // The VM allocator cannot account for data retained in the host's log.
+        let operations = self
+            .operations
+            .try_update(Ordering::Relaxed, Ordering::Relaxed, |left| {
+                left.checked_sub(1)
+            });
+        let bytes = self
+            .bytes
+            .try_update(Ordering::Relaxed, Ordering::Relaxed, |left| {
+                left.checked_sub(bytes)
+            });
+        if operations.is_err() || bytes.is_err() {
+            return Err(mlua::Error::runtime("lua outbound quota exhausted"));
+        }
+        Ok(())
+    }
+}
+
 #[derive(Clone)]
 struct Call {
     cx: std::sync::Weak<Cx>,
     owner: Name,
     grants: Arc<[String]>,
     tool: String,
+    quota: Arc<Quota>,
 }
 impl mlua::UserData for Call {}
 
@@ -556,7 +600,9 @@ impl Callbacks {
                 if cx.state_erased(&data.owner, &name).is_none() {
                     return Err(mlua::Error::runtime("no fold of that name"));
                 }
-                cx.update_erased(&data.owner, &name, encode(&value)?).await;
+                let change = encode(&value)?;
+                data.quota.take(change.raw().len())?;
+                cx.update_erased(&data.owner, &name, change).await;
                 Ok(())
             },
         )?;
@@ -572,7 +618,9 @@ impl Callbacks {
                     .cx
                     .upgrade()
                     .ok_or_else(|| mlua::Error::runtime("call context expired"))?;
-                match cx.invoke(&name, &encode(&value)?).await.outcome {
+                let input = encode(&value)?;
+                data.quota.take(input.raw().len())?;
+                match cx.invoke(&name, &input).await.outcome {
                     Outcome::Done { output } => decode(&lua, &output),
                     Outcome::Failed { error } => Err(mlua::Error::runtime(error)),
                     Outcome::Interrupted { .. } => {
@@ -618,11 +666,13 @@ impl LuaTool {
                 )
             })?,
         )?;
+        let quota = Quota::new();
         let data = self.lua.create_userdata(Call {
             cx: Arc::downgrade(&call),
             owner: Arc::clone(&self.owner),
             grants: Arc::clone(&self.grants),
             tool: self.name.clone(),
+            quota: Arc::clone(&quota),
         })?;
         context.set("update", self.callbacks.update.bind(data.clone())?)?;
         context.set("tool", self.callbacks.invoke.bind(data)?)?;
@@ -630,6 +680,7 @@ impl LuaTool {
         context.set(
             "progress",
             self.lua.create_function(move |_, text: String| {
+                quota.take(text.len())?;
                 progress
                     .upgrade()
                     .ok_or_else(|| mlua::Error::runtime("call context expired"))?
@@ -729,7 +780,7 @@ mod tests {
     fn lua_agents_return_sdk_actions_and_fail_within_their_budget() {
         let registry = registry(
             "a.agent{name='scripted',step=function(input) if input.user then return {{call={tool='test',input={text=input.user.text}}}} end; return {} end}",
-            &[],
+            &["test".into()],
         );
         let mut agent = registry.agent(Some("scripted"));
         let actions = agent.step(ext::Input::User { text: "hi".into() }, &ext::Defaults);
@@ -743,6 +794,18 @@ mod tests {
         let mut agent = registry.agent(Some("scripted"));
         assert!(
             matches!(&agent.step(ext::Input::User { text: "hi".into() }, &ext::Defaults)[..], [ext::Action::Say(text)] if text.contains("budget"))
+        );
+    }
+
+    #[test]
+    fn agent_proposals_cannot_bypass_tool_capabilities() {
+        let registry = registry(
+            "a.agent{name='scripted',step=function() return {{call={tool='bash',input={command='pwd'}}}} end}",
+            &[],
+        );
+        let mut agent = registry.agent(Some("scripted"));
+        assert!(
+            matches!(&agent.step(ext::Input::User { text: "hi".into() }, &ext::Defaults)[..], [ext::Action::Say(text)] if text.contains("not granted"))
         );
     }
 
@@ -785,6 +848,38 @@ mod tests {
         );
         let other = Rig::new("lua-other-session", registry(&source, &[]));
         assert_eq!(other.done("test", &json!({"n":1})), 1);
+    }
+
+    #[test]
+    fn outbound_data_cannot_escape_the_per_call_memory_budget() {
+        let source = tool(
+            "if input.spam then while true do cx.progress(string.rep('x',16384)) end end; if input.update then while true do cx.update('count',1) end end; return 7",
+        ) + "a.fold{name='count',initial=0,apply=function(state,change) return state+change end}";
+        let module = Mod::load(
+            "test",
+            &source,
+            &[],
+            Limits {
+                slice: Duration::from_secs(1),
+                ..Limits::default()
+            },
+        )
+        .unwrap();
+        let rig = Rig::new(
+            "lua-outbound",
+            Registry::default()
+                .with_dyn(ext::Tier::User, &module)
+                .unwrap(),
+        );
+        assert!(
+            matches!(rig.call("test", &json!({"spam":true})), Outcome::Failed { error } if error.contains("quota"))
+        );
+        assert!(rig.progress.lock().unwrap().len() <= 1024 * 1024);
+        assert!(
+            matches!(rig.call("test", &json!({"update":true})), Outcome::Failed { error } if error.contains("quota"))
+        );
+        assert_eq!(rig.log.lock().unwrap().len(), 128);
+        assert_eq!(rig.done("test", &json!({})), 7);
     }
 
     #[test]
