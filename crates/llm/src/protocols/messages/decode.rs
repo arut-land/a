@@ -44,7 +44,7 @@ enum EventType {
     Other,
 }
 
-#[derive(Clone, Copy, PartialEq, Eq, Deserialize)]
+#[derive(Clone, Copy, Default, PartialEq, Eq, Deserialize)]
 #[serde(rename_all = "snake_case")]
 enum BlockType {
     Text,
@@ -54,6 +54,7 @@ enum BlockType {
     /// The model that took over the request.
     Fallback,
     /// Any other block: an opaque part.
+    #[default]
     #[serde(other)]
     Other,
 }
@@ -94,17 +95,18 @@ impl DeltaType {
     }
 }
 
-/// How a `stop_reason` ends the turn. `pause_turn` is a server-tool loop
-/// that stopped at its limit: the turn is replayed as it is to resume it.
-fn stop_reason(stop: &str) -> Reason {
-    match stop {
-        "end_turn" | "stop_sequence" | "pause_turn" => Reason::Stop,
-        "max_tokens" | "model_context_window_exceeded" => Reason::Length,
-        "tool_use" => Reason::ToolCalls,
-        "refusal" => Reason::ContentFilter,
-        _ => Reason::Other,
-    }
-}
+/// How each `stop_reason` ends the turn. `pause_turn` is a server-tool
+/// loop that stopped at its limit: the turn is replayed as it is to resume
+/// it.
+const STOPS: &[(&str, Reason)] = &[
+    ("end_turn", Reason::Stop),
+    ("stop_sequence", Reason::Stop),
+    ("pause_turn", Reason::Stop),
+    ("max_tokens", Reason::Length),
+    ("model_context_window_exceeded", Reason::Length),
+    ("tool_use", Reason::ToolCalls),
+    ("refusal", Reason::ContentFilter),
+];
 
 /// An event's fields, read whatever its type: the type may come last. A
 /// block, a message and a usage object stay text until their event reads
@@ -273,9 +275,10 @@ fn usage(terminal: Option<&Value>, start: Option<&Value>) -> Usage {
     }
 }
 
-/// A content block while it is open.
-struct Block {
-    index: usize,
+/// A content block while it is open: the decoder's state in the writer's
+/// draft of it.
+#[derive(Default)]
+pub(crate) struct Block {
     /// Its type, a fallback's as `Other`.
     kind: BlockType,
     /// The input JSON streamed to it.
@@ -292,9 +295,7 @@ struct Block {
 /// `content_block_stop` states a block complete; a stop reason states every
 /// block still open complete, but a call whose input is not yet JSON.
 pub(crate) struct MessagesDecoder {
-    w: Writer,
-    /// Each open block, in index order.
-    open: Vec<Block>,
+    w: Writer<Block>,
     /// Whether a block other than a leading `fallback` opened.
     opened: bool,
     unsigned_thinking: bool,
@@ -343,7 +344,6 @@ impl MessagesDecoder {
     pub(crate) fn new(unsigned_thinking: bool) -> Self {
         Self {
             w: Writer::new(KEY).with_call_id_slot(),
-            open: Vec::new(),
             opened: false,
             unsigned_thinking,
             end: End::default(),
@@ -352,7 +352,7 @@ impl MessagesDecoder {
     }
 
     fn block(&mut self, index: usize) -> Option<&mut Block> {
-        self.open.iter_mut().find(|block| block.index == index)
+        self.w.state(index)
     }
 
     /// Open the content block at `index` as the provider states it.
@@ -371,33 +371,28 @@ impl MessagesDecoder {
         // its text, as it took each token.
         self.settle(index)?;
         let held = Block {
-            index,
             kind: if fallback { BlockType::Other } else { kind },
-            json: String::new(),
-            grew: false,
-            eager: false,
+            ..Block::default()
         };
-        let at = self.open.partition_point(|block| block.index < index);
-        match self.open.get_mut(at) {
-            Some(slot) if slot.index == index => *slot = held,
-            _ => self.open.insert(at, held),
-        }
         let block = Value::Object(block.clone());
         let (open, text) = match kind {
             BlockType::Text => (Open::Text, block.str("text")),
             BlockType::Thinking => (Open::Reasoning { redacted: false }, block.str("thinking")),
             BlockType::RedactedThinking => (Open::Reasoning { redacted: true }, None),
-            BlockType::ToolUse => return self.call(index, block),
+            BlockType::ToolUse => return self.call(index, block, held),
             BlockType::Fallback | BlockType::Other => (Open::Opaque { replay: !fallback }, None),
         };
         let text = text.unwrap_or_default().to_owned();
         self.w.open(index, open, block)?;
+        if let Some(state) = self.w.state(index) {
+            *state = held;
+        }
         self.w.push(index, text)
     }
 
     /// Open a `tool_use` block. A whole reply states the input on the
     /// block; a stream streams it, and the fragments win.
-    fn call(&mut self, index: usize, block: Value) -> Result<(), Error> {
+    fn call(&mut self, index: usize, block: Value, held: Block) -> Result<(), Error> {
         let id: SmolStr = block.str("id").unwrap_or_default().into();
         let input = block.get("input").cloned().unwrap_or_default();
         if let Some(name) = block.str("name").filter(|name| !name.is_empty()) {
@@ -411,6 +406,9 @@ impl MessagesDecoder {
                 ..CallFragment::default()
             };
             self.w.fragment(index, fragment)?;
+        }
+        if let Some(state) = self.w.state(index) {
+            *state = held;
         }
         self.w.announce(index, input)
     }
@@ -426,12 +424,7 @@ impl MessagesDecoder {
         let Some(key) = grown else {
             return Ok(());
         };
-        let text = self.w.text(index).unwrap_or_default().to_owned();
-        self.w.edit(index, |item| {
-            if let Some(item) = item.as_object_mut() {
-                item.insert(key.to_owned(), text.into());
-            }
-        })
+        self.w.land(index, key)
     }
 
     /// Apply a delta to the block at `index`: text and thinking grow the
@@ -547,11 +540,11 @@ impl MessagesDecoder {
     /// object `input`, set from what streamed. A hosted item whose input is
     /// not an object never completed.
     fn stop(&mut self, index: usize) -> Result<(), Error> {
-        let Some(at) = self.open.iter().position(|block| block.index == index) else {
+        if self.block(index).is_none() {
             return self.w.finish(index);
-        };
+        }
         self.settle(index)?;
-        let Block { kind, json, .. } = self.open.remove(at);
+        let Block { kind, json, .. } = self.block(index).map_or_default(std::mem::take);
         let call = kind == BlockType::ToolUse;
         let unsigned = self.unsigned_thinking;
         let (mut complete, mut arguments) = (true, None);
@@ -629,10 +622,12 @@ impl MessagesDecoder {
         stop: Option<&str>,
         details: Option<&Value>,
     ) -> Result<Flow, Error> {
-        let open = self.open.iter();
+        let open = self.w.open_states();
         let open =
-            open.filter(|block| block.kind != BlockType::ToolUse || whole_object(&block.json));
-        for index in open.map(|block| block.index).collect::<Vec<_>>() {
+            open.filter(|(_, block)| block.kind != BlockType::ToolUse || whole_object(&block.json));
+        let mut open: Vec<usize> = open.map(|(index, _)| index).collect();
+        open.sort_unstable();
+        for index in open {
             self.stop(index)?;
         }
         if let Some(container) = self.container.take() {
@@ -641,7 +636,7 @@ impl MessagesDecoder {
             self.w
                 .whole(index, Open::Opaque { replay: true }, item, "")?;
         }
-        let reason = stop.map(|stop| (stop_reason(stop), Some(stop.into())));
+        let reason = stop.map(|stop| (Reason::of(STOPS, stop), Some(stop.into())));
         let message = matches!(reason, Some((Reason::ContentFilter, _))).then(|| {
             let explanation = details.and_then(|details| details.str("explanation"));
             let explanation = explanation.filter(|explanation| !explanation.is_empty());
@@ -723,7 +718,9 @@ pub(super) fn frame(data: &str) -> Result<Option<Frame<'_>>, Error> {
 }
 
 impl Writes for MessagesDecoder {
-    fn writer(&mut self) -> &mut Writer {
+    type State = Block;
+
+    fn writer(&mut self) -> &mut Writer<Block> {
         &mut self.w
     }
 

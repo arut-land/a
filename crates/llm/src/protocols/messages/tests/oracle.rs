@@ -545,6 +545,8 @@ impl Oracle {
 }
 
 impl Writes for Oracle {
+    type State = ();
+
     fn writer(&mut self) -> &mut Writer {
         &mut self.w
     }

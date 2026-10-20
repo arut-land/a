@@ -21,7 +21,8 @@ use crate::error::{Error, Kind};
 use crate::protocol::{Decoder, Flow, Frame};
 use crate::replay::{Canon, Written, fingerprint};
 use crate::spec::{
-    AssistantPart, Block, CallEnd, Event, Finish, Json, Media, Meta, Opaque, Reason, SmolStr, Usage,
+    AssistantPart, Block, CallEnd, Ended, Event, Finish, Json, Media, Meta, Opaque, Reason,
+    SmolStr, Usage,
 };
 
 /// The first index the writer hands out itself ([`Writer::fresh_index`]);
@@ -34,7 +35,10 @@ const MAX_ARGUMENTS: usize = 32 * 1024 * 1024;
 /// A decoder that writes through a [`Writer`]: what each frame wrote
 /// reaches the consumer once the frame is decoded.
 pub trait Writes: Send {
-    fn writer(&mut self) -> &mut Writer;
+    /// What the decoder keeps per open item, beside the writer's draft.
+    type State: Default + Send;
+
+    fn writer(&mut self) -> &mut Writer<Self::State>;
 
     /// Decode one frame's data.
     fn data(&mut self, data: &str) -> Result<Flow, Error>;
@@ -108,12 +112,15 @@ pub struct End {
     pub raw_usage: Option<Value>,
 }
 
-pub struct Writer {
+/// `S` is the state the decoder keeps per open item ([`Writes::State`]),
+/// held in the item's draft rather than in a table of the decoder's own.
+pub struct Writer<S = ()> {
     key: &'static str,
     out: Vec<Event>,
-    /// The open items by wire index. A reply holds few at once, and a list
-    /// costs less code than a map, as for the lists below.
-    open: Vec<(usize, Draft)>,
+    /// The open items by wire index, in the order they opened. A reply
+    /// holds few at once, and a list costs less code than a map, as for the
+    /// lists below.
+    open: Vec<(usize, Draft<S>)>,
     /// The part each wire index last closed, whose item may still be edited.
     /// A reply holds few, and a list costs less code than a map.
     ended: Vec<(usize, u32)>,
@@ -146,11 +153,12 @@ struct Kept {
     replay: Option<bool>,
 }
 
-struct Draft {
+struct Draft<S> {
     part: u32,
     started: bool,
     item: Value,
     body: Body,
+    state: S,
 }
 
 enum Body {
@@ -259,7 +267,7 @@ fn not_open(index: usize) -> Error {
     )
 }
 
-impl Writer {
+impl<S: Default> Writer<S> {
     /// A writer for a protocol whose part state goes under `key`.
     pub fn new(key: &'static str) -> Self {
         Self {
@@ -310,18 +318,46 @@ impl Writer {
         Ok(())
     }
 
-    fn draft(&mut self, index: usize) -> Result<&mut Draft, Error> {
+    fn draft(&mut self, index: usize) -> Result<&mut Draft<S>, Error> {
         find(&mut self.open, index).ok_or_else(|| not_open(index))
     }
 
-    fn get(&self, index: usize) -> Option<&Draft> {
+    fn get(&self, index: usize) -> Option<&Draft<S>> {
         let mut open = self.open.iter();
         open.find(|(at, _)| *at == index).map(|(_, draft)| draft)
     }
 
-    fn take(&mut self, index: usize) -> Option<Draft> {
+    fn take(&mut self, index: usize) -> Option<Draft<S>> {
         let at = self.open.iter().position(|(at, _)| *at == index)?;
-        Some(self.open.swap_remove(at).1)
+        Some(self.open.remove(at).1)
+    }
+
+    /// The decoder's state for the open item at `index`; `None` for an
+    /// index not open.
+    pub fn state(&mut self, index: usize) -> Option<&mut S> {
+        find(&mut self.open, index).map(|draft| &mut draft.state)
+    }
+
+    /// The open items' wire indices and the decoder's state for each, in
+    /// the order they opened.
+    pub fn open_states(&self) -> impl Iterator<Item = (usize, &S)> {
+        self.open.iter().map(|(at, draft)| (*at, &draft.state))
+    }
+
+    /// The text the open item at `index` streamed so far, set as its item's
+    /// string field `key`: for a wire whose item states its text whole,
+    /// written once instead of with each token.
+    pub fn land(&mut self, index: usize, key: &str) -> Result<(), Error> {
+        let Draft { item, body, .. } = self.draft(index)?;
+        let text = match body {
+            Body::Text(text) | Body::Reasoning { text, .. } => text.as_str(),
+            Body::Call { arguments, .. } => arguments.text.as_str(),
+            Body::Opaque { .. } | Body::Media(_) => return Ok(()),
+        };
+        if let Some(fields) = item.as_object_mut() {
+            fields.insert(key.to_owned(), Value::String(text.to_owned()));
+        }
+        Ok(())
     }
 
     /// Keep `item` for `part`, in part order.
@@ -404,6 +440,7 @@ impl Writer {
             started: false,
             item,
             body,
+            state: S::default(),
         };
         self.open.push((index, draft));
     }
@@ -696,9 +733,7 @@ impl Writer {
         }
         self.out.push(Event::End {
             index: part,
-            redacted: false,
-            text: None,
-            call: Some(CallEnd {
+            ended: Ended::Call(CallEnd {
                 id,
                 input,
                 invalid,
@@ -714,6 +749,7 @@ impl Writer {
             started,
             item,
             body,
+            ..
         } = self.take(index).ok_or_else(|| not_open(index))?;
         self.ended.retain(|(at, _)| *at != index);
         self.ended.push((index, part));
@@ -725,15 +761,17 @@ impl Writer {
                 Value::Null
             }
         };
-        let (block, redacted, text) = match body {
+        let (block, ended) = match body {
             Body::Text(text) if text.is_empty() && item.is_null() => return Ok(()),
-            Body::Text(text) => (Block::Text, false, text),
+            Body::Text(text) => (Block::Text, Ended::Text { text }),
             Body::Reasoning { text, redacted }
                 if text.is_empty() && !redacted && item.is_null() =>
             {
                 return Ok(());
             }
-            Body::Reasoning { text, redacted } => (Block::Reasoning, redacted, text),
+            Body::Reasoning { text, redacted } => {
+                (Block::Reasoning, Ended::Reasoning { text, redacted })
+            }
             Body::Opaque { replay } => {
                 self.keep(part, item, String::new(), Some(replay && complete));
                 self.whole_part(part, AssistantPart::Opaque(Opaque::default()));
@@ -758,9 +796,10 @@ impl Writer {
             }
         };
         if !item.is_null() {
-            let canon = match block {
-                Block::Reasoning => Canon::Reasoning(&text, redacted),
-                _ => Canon::Text(&text),
+            let canon = match &ended {
+                Ended::Reasoning { text, redacted } => Canon::Reasoning(text, *redacted),
+                Ended::Text { text } => Canon::Text(text),
+                Ended::Call(_) => Canon::Other,
             };
             self.keep(part, item, fingerprint(canon), None);
         }
@@ -769,12 +808,7 @@ impl Writer {
         }
         // The text moves to the consumer whole: what streamed, or what the
         // provider restated.
-        self.out.push(Event::End {
-            index: part,
-            redacted,
-            text: Some(text),
-            call: None,
-        });
+        self.out.push(Event::End { index: part, ended });
         Ok(())
     }
 
@@ -895,13 +929,13 @@ impl Writer {
 }
 
 /// The wire index of the item in `open` that opened first.
-fn first_open(open: &[(usize, Draft)]) -> Option<usize> {
+fn first_open<S>(open: &[(usize, Draft<S>)]) -> Option<usize> {
     let first = open.iter().min_by_key(|(_, draft)| draft.part);
     first.map(|(index, _)| *index)
 }
 
 /// The open item at wire `index` in `open`.
-fn find(open: &mut [(usize, Draft)], index: usize) -> Option<&mut Draft> {
+fn find<S>(open: &mut [(usize, Draft<S>)], index: usize) -> Option<&mut Draft<S>> {
     let mut open = open.iter_mut();
     open.find(|(at, _)| *at == index).map(|(_, draft)| draft)
 }

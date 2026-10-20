@@ -18,8 +18,8 @@ use serde_json::value::RawValue;
 
 use super::meta::Raw;
 use super::{
-    Assistant, AssistantPart, Finish, Json, Media, Meta, Opaque, Origin, Output, Reason, Reasoning,
-    Response, SmolStr, Source, Text, ToolCall, ToolResult, Usage, UserPart,
+    Assistant, AssistantPart, Count, Finish, Json, Media, Meta, Opaque, Origin, Output, Reason,
+    Reasoning, Response, SmolStr, Source, Text, ToolCall, ToolResult, Usage, UserPart,
 };
 use crate::json::{Fields, fields, next};
 
@@ -246,21 +246,10 @@ impl<'de> Fields<'de> for UsageFields {
         key: &str,
         map: &mut A,
     ) -> std::result::Result<bool, A::Error> {
-        let usage = &mut self.0;
-        let count = match key {
-            "input" => &mut usage.input,
-            "output" => &mut usage.output,
-            "cache_read" => &mut usage.cache_read,
-            "cache_write" => &mut usage.cache_write,
-            "cache_write_long" => &mut usage.cache_write_long,
-            "tool_input" => &mut usage.tool_input,
-            "audio_input" => &mut usage.audio_input,
-            "reasoning" => &mut usage.reasoning,
-            "audio_output" => &mut usage.audio_output,
-            "hosted_tool_calls" => &mut usage.hosted_tool_calls,
-            _ => return Ok(false),
+        let Some(count) = Count::named(key) else {
+            return Ok(false);
         };
-        *count = next(map)?;
+        *self.0.count(count) = next(map)?;
         Ok(true)
     }
 }

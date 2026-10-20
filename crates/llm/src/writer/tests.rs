@@ -526,11 +526,9 @@ fn a_restatement_replaces_what_streamed() {
         w.restate(0, "hello")?;
         w.finish(0)
     });
-    assert!(
-        events
-            .iter()
-            .any(|event| matches!(event, Event::End { text: Some(text), .. } if text == "hello"))
-    );
+    assert!(events.iter().any(
+        |event| matches!(event, Event::End { ended: Ended::Text { text }, .. } if text == "hello")
+    ));
     assert!(matches!(&parts(outcome)[0], AssistantPart::Text(text) if text.text == "hello"));
 }
 
@@ -566,4 +564,39 @@ fn an_order_by_index_states_the_message_order() {
         })
         .collect();
     assert_eq!(texts, ["first", "second"]);
+}
+
+#[test]
+fn a_decoders_state_lives_in_the_item_and_leaves_with_it() {
+    let mut writer: Writer<u8> = Writer::new("test");
+    writer.open(0, Open::Text, Value::Null).unwrap();
+    writer.open(1, Open::Text, Value::Null).unwrap();
+    *writer.state(0).expect("open") = 5;
+    assert_eq!(writer.state(2), None, "an index not open has no state");
+    let states: Vec<_> = writer.open_states().map(|(at, s)| (at, *s)).collect();
+    assert_eq!(states, [(0, 5), (1, 0)], "in the order they opened");
+    writer.push(0, "hi").unwrap();
+    writer.finish(0).unwrap();
+    assert_eq!(writer.state(0), None, "a closed item keeps no state");
+    assert_eq!(writer.open_states().count(), 1);
+}
+
+#[test]
+fn landing_sets_the_streamed_text_on_the_item_whole() {
+    let end = End {
+        reason: Some((Reason::Stop, None)),
+        ..End::default()
+    };
+    let (_, outcome) = run(Writer::new("test"), end, |w| {
+        w.open(0, Open::Text, json!({"type": "text"}))?;
+        w.push(0, "hel")?;
+        w.push(0, "lo")?;
+        w.land(0, "text")?;
+        w.finish(0)
+    });
+    let parts = parts(outcome);
+    assert_eq!(
+        item(&parts[0]),
+        Some(json!({"type": "text", "text": "hello"}))
+    );
 }

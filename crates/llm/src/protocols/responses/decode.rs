@@ -15,9 +15,9 @@ use serde_json::{Value, json};
 
 use super::{ItemType, KEY, PartType, Status};
 use crate::error::{Error, Kind};
-use crate::json::{Count, Fielded, FromFields, Json, Lenient, word};
+use crate::json::{Count as Index, Fielded, FromFields, Json, Lenient, word};
 use crate::protocol::Flow;
-use crate::spec::{Reason, SmolStr, Usage};
+use crate::spec::{Count, Reason, SmolStr, Usage};
 use crate::writer::{CallFragment, End, Open, Writer, Writes};
 
 /// The events the decoder reads; any other type is skipped.
@@ -61,10 +61,10 @@ enum Incomplete {
 pub(super) struct Frame<'a> {
     kind: Json<'a>,
     pub(super) delta: Json<'a>,
-    output_index: Count,
+    output_index: Index,
     item_id: Json<'a>,
-    content_index: Count,
-    summary_index: Count,
+    content_index: Index,
+    summary_index: Index,
     item: Option<&'a RawValue>,
     response: Option<&'a RawValue>,
 }
@@ -284,17 +284,17 @@ fn finish_of(response: &Value) -> (Reason, Option<SmolStr>, Option<String>) {
     (Reason::Other, Some(raw), Some(message))
 }
 
-fn usage_of(usage: &Value) -> Usage {
-    let count = |pointer: &str| usage.at(pointer).and_then(Lenient::as_u64_lenient);
-    Usage {
-        input: count("/input_tokens"),
-        output: count("/output_tokens"),
-        cache_read: count("/input_tokens_details/cached_tokens"),
-        cache_write: count("/input_tokens_details/cache_write_tokens"),
-        reasoning: count("/output_tokens_details/reasoning_tokens"),
-        ..Usage::default()
-    }
-}
+/// Where the response's `usage` holds each count.
+const USAGE: &[(Count, &str)] = &[
+    (Count::Input, "/input_tokens"),
+    (Count::Output, "/output_tokens"),
+    (Count::CacheRead, "/input_tokens_details/cached_tokens"),
+    (
+        Count::CacheWrite,
+        "/input_tokens_details/cache_write_tokens",
+    ),
+    (Count::Reasoning, "/output_tokens_details/reasoning_tokens"),
+];
 
 /// The error a failure frame or a failed response reports.
 fn failure(frame: &Value) -> Error {
@@ -502,9 +502,9 @@ impl ResponsesDecoder {
         &mut self,
         index: Option<usize>,
         id: Option<&str>,
-        item: &Value,
+        item: Value,
     ) -> Result<(), Error> {
-        let (kind, stated) = (Item::of(item), item_id(item));
+        let (kind, stated) = (Item::of(&item), item_id(&item));
         let known = self.addressed(index, id, kind);
         let slot = match known.map(|at| (at, &self.slots[at])) {
             // At a named output index the item is the one there, whatever
@@ -521,9 +521,9 @@ impl ResponsesDecoder {
             }
             // The item this one restates is already done.
             Some((_, slot)) if stated.is_some() && slot.id.as_deref() == stated => return Ok(()),
-            _ => self.added(index, item)?,
+            _ => self.added(index, &item)?,
         };
-        self.done(slot, item.clone())
+        self.done(slot, item)
     }
 
     fn done(&mut self, slot: usize, mut item: Value) -> Result<(), Error> {
@@ -576,12 +576,12 @@ impl ResponsesDecoder {
     /// The slot an item of the terminal's `output` restates: a free one of
     /// its kind with its id, else the one at its output index, else one no
     /// id tells apart that holds no index, else one holding an index whose
-    /// output item is of another kind.
+    /// output item (of `output`'s kinds) is of another kind.
     fn restated(
         &self,
         index: usize,
         item: &Value,
-        output: &[Value],
+        output: &[Item],
         taken: &[usize],
     ) -> Option<usize> {
         let (id, kind) = (item_id(item), Item::of(item));
@@ -592,7 +592,7 @@ impl ResponsesDecoder {
         let anonymous = |slot: &Slot| id.is_none() || slot.id.is_none();
         let moved = |slot: &Slot| {
             let streamed = slot.index.map(|streamed| output.get(streamed));
-            streamed.is_some_and(|other| other.is_none_or(|other| Item::of(other) != slot.kind))
+            streamed.is_some_and(|other| other.is_none_or(|other| *other != slot.kind))
         };
         id.and_then(|id| find(&|slot| slot.id.as_deref() == Some(id)))
             .or_else(|| self.holding(index).filter(free))
@@ -600,8 +600,11 @@ impl ResponsesDecoder {
             .or_else(|| find(&|slot| anonymous(slot) && moved(slot)))
     }
 
-    fn finish(&mut self, response: &Value) -> Result<Flow, Error> {
-        let output = response.arr("output");
+    fn finish(&mut self, mut response: Value) -> Result<Flow, Error> {
+        let output = match response.get_mut("output").map(Value::take) {
+            Some(Value::Array(output)) => output,
+            _ => Vec::new(),
+        };
         if self.slots.is_empty()
             && !output.iter().any(|item| Item::of(item) == Item::Reasoning)
             && let Some(reasoning) = response.str("reasoning").filter(|text| !text.is_empty())
@@ -612,18 +615,19 @@ impl ResponsesDecoder {
             self.w.whole(0, open, Value::Null, reasoning)?;
         }
         let mut taken = Vec::new();
-        for (index, item) in output.iter().enumerate() {
+        let kinds: Vec<Item> = output.iter().map(Item::of).collect();
+        for (index, item) in output.into_iter().enumerate() {
             if !item.is_object() {
                 continue;
             }
-            let slot = match self.restated(index, item, output, &taken) {
+            let slot = match self.restated(index, &item, &kinds, &taken) {
                 Some(slot) if self.slots[slot].open => slot,
                 Some(slot) => {
                     taken.push(slot);
                     let Slot { at, kind, .. } = self.slots[slot];
                     // Reasoning done without its ciphertext takes the
                     // terminal's.
-                    if let (Item::Reasoning, Some(cipher)) = (kind, ciphertext(item)) {
+                    if let (Item::Reasoning, Some(cipher)) = (kind, ciphertext(&item)) {
                         self.w.edit(at, |stored| {
                             if ciphertext(stored).is_none()
                                 && let Some(fields) = stored.as_object_mut()
@@ -636,11 +640,11 @@ impl ResponsesDecoder {
                 }
                 None => {
                     let index = Some(index).filter(|index| self.holding(*index).is_none());
-                    self.added(index, item)?
+                    self.added(index, &item)?
                 }
             };
             taken.push(slot);
-            self.done(slot, item.clone())?;
+            self.done(slot, item)?;
         }
         // Reasoning still waiting is complete when nothing after it is left
         // open.
@@ -651,17 +655,19 @@ impl ResponsesDecoder {
                 slot.end_call(&mut self.w, None)?;
             }
         }
-        let (reason, raw, message) = finish_of(response);
+        let (reason, raw, message) = finish_of(&response);
         // Hosted tools report their requests beside the usage.
         let hosted = crate::json::counters(response.get("tool_usage"), Some("num_requests"));
         let usage = Usage {
             hosted_tool_calls: hosted.filter(|calls| *calls > 0),
-            ..response.get("usage").map_or_default(usage_of)
+            ..response
+                .get("usage")
+                .map_or_default(|usage| Usage::read(usage, USAGE))
         };
         self.w.end(End {
             usage,
             reason: Some((reason, raw)),
-            response_id: item_id(response).map(Into::into),
+            response_id: item_id(&response).map(Into::into),
             model: response.str("model").map(Into::into),
             message,
             raw_usage: response.get("usage").cloned(),
@@ -677,13 +683,15 @@ impl ResponsesDecoder {
             return Err(failure(&frame));
         }
         if ["object", "output", "status", "id"].into_iter().any(stated) {
-            return self.finish(&frame);
+            return self.finish(frame);
         }
         Ok(Flow::More)
     }
 }
 
 impl Writes for ResponsesDecoder {
+    type State = ();
+
     fn writer(&mut self) -> &mut Writer {
         &mut self.w
     }
@@ -705,7 +713,8 @@ impl Writes for ResponsesDecoder {
         let item = Some(tree(frame.item)).filter(Value::is_object);
         // The item id an event addresses: its item's, else the one it names.
         let id = item.as_ref().and_then(|item| item.get("id")?.as_str());
-        let id = id.or_else(|| frame.item_id.str());
+        let id = id.or_else(|| frame.item_id.str()).map(SmolStr::new);
+        let id = id.as_deref();
         let index = || output_index(frame.output_index.0);
         match event {
             Event::Failed => {
@@ -720,7 +729,7 @@ impl Writes for ResponsesDecoder {
                 if event == Event::Incomplete {
                     response["status"] = json!(Status::Incomplete);
                 }
-                return self.finish(&response);
+                return self.finish(response);
             }
             Event::Added => {
                 if let Some(item) = &item {
@@ -728,7 +737,7 @@ impl Writes for ResponsesDecoder {
                 }
             }
             Event::Done => {
-                if let Some(item) = &item {
+                if let Some(item) = item {
                     self.item_done(index()?, id, item)?;
                 }
             }

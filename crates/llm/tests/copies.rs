@@ -9,7 +9,7 @@ use std::path::Path;
 
 use llm::http::{BoxFuture, Http, Payload, Response, body};
 use llm::protocols::responses;
-use llm::{Accumulator, AssistantPart, Event, Message, Provider, Request};
+use llm::{Accumulator, AssistantPart, Ended, Event, Message, Provider, Request};
 
 struct Counting;
 
@@ -98,7 +98,8 @@ fn a_streamed_token_is_copied_once() {
         match event {
             Event::Delta { text, .. } => pieces.push_str(text),
             Event::End {
-                text: Some(text), ..
+                ended: Ended::Text { text },
+                ..
             } => ended = Some(text.as_ptr()),
             _ => {}
         }

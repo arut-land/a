@@ -5,7 +5,7 @@ use serde_json::{Value, json};
 
 use super::*;
 use crate::accumulate::Accumulator;
-use crate::spec::{AssistantPart, CallEnd, Event as Out, Response};
+use crate::spec::{AssistantPart, CallEnd, Ended, Event as Out, Response};
 
 /// The frames of a recorded stream in `fixtures/rig/cassettes`.
 fn recorded(cassette: &str) -> Vec<String> {
@@ -250,7 +250,7 @@ fn custom_tool_input_streams_as_its_json_object() {
     assert_eq!(deltas, r#"{"input":"say \"hi\"\n"}"#);
     let call = events.iter().find_map(|event| match event {
         Out::End {
-            call: Some(CallEnd { id, input, .. }),
+            ended: Ended::Call(CallEnd { id, input, .. }),
             ..
         } => Some((id.clone(), input.clone())),
         _ => None,

@@ -558,7 +558,81 @@ pub struct Usage {
     pub hosted_tool_calls: Option<u64>,
 }
 
+/// The counts a [`Usage`] holds, each naming its field.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Count {
+    Input,
+    Output,
+    CacheRead,
+    CacheWrite,
+    CacheWriteLong,
+    ToolInput,
+    AudioInput,
+    Reasoning,
+    AudioOutput,
+    HostedToolCalls,
+}
+
+impl Count {
+    pub const ALL: [Self; 10] = [
+        Self::Input,
+        Self::Output,
+        Self::CacheRead,
+        Self::CacheWrite,
+        Self::CacheWriteLong,
+        Self::ToolInput,
+        Self::AudioInput,
+        Self::Reasoning,
+        Self::AudioOutput,
+        Self::HostedToolCalls,
+    ];
+
+    /// The count field `key` names.
+    pub(crate) fn named(key: &str) -> Option<Self> {
+        Some(match key {
+            "input" => Self::Input,
+            "output" => Self::Output,
+            "cache_read" => Self::CacheRead,
+            "cache_write" => Self::CacheWrite,
+            "cache_write_long" => Self::CacheWriteLong,
+            "tool_input" => Self::ToolInput,
+            "audio_input" => Self::AudioInput,
+            "reasoning" => Self::Reasoning,
+            "audio_output" => Self::AudioOutput,
+            "hosted_tool_calls" => Self::HostedToolCalls,
+            _ => return None,
+        })
+    }
+}
+
 impl Usage {
+    /// The field `count` names.
+    pub fn count(&mut self, count: Count) -> &mut Option<u64> {
+        match count {
+            Count::Input => &mut self.input,
+            Count::Output => &mut self.output,
+            Count::CacheRead => &mut self.cache_read,
+            Count::CacheWrite => &mut self.cache_write,
+            Count::CacheWriteLong => &mut self.cache_write_long,
+            Count::ToolInput => &mut self.tool_input,
+            Count::AudioInput => &mut self.audio_input,
+            Count::Reasoning => &mut self.reasoning,
+            Count::AudioOutput => &mut self.audio_output,
+            Count::HostedToolCalls => &mut self.hosted_tool_calls,
+        }
+    }
+
+    /// The counts `table` names read from `usage`, a provider's usage
+    /// object, by JSON pointer; one absent, or not a count, stays `None`.
+    pub(crate) fn read(usage: &Value, table: &[(Count, &str)]) -> Self {
+        use crate::json::Lenient;
+        let mut read = Self::default();
+        for (count, pointer) in table {
+            *read.count(*count) = usage.at(pointer).and_then(Value::as_u64_lenient);
+        }
+        read
+    }
+
     /// The part of `input` neither read from nor written to a cache.
     pub fn uncached_input(&self) -> Option<u64> {
         let cached = self.cache_read.unwrap_or(0) + self.cache_write.unwrap_or(0);
@@ -581,23 +655,15 @@ impl Usage {
 impl std::ops::Add for Usage {
     type Output = Self;
 
-    fn add(self, other: Self) -> Self {
-        let sum = |a: Option<u64>, b: Option<u64>| match (a, b) {
-            (None, None) => None,
-            (a, b) => Some(a.unwrap_or(0) + b.unwrap_or(0)),
-        };
-        Self {
-            input: sum(self.input, other.input),
-            output: sum(self.output, other.output),
-            cache_read: sum(self.cache_read, other.cache_read),
-            cache_write: sum(self.cache_write, other.cache_write),
-            cache_write_long: sum(self.cache_write_long, other.cache_write_long),
-            tool_input: sum(self.tool_input, other.tool_input),
-            audio_input: sum(self.audio_input, other.audio_input),
-            reasoning: sum(self.reasoning, other.reasoning),
-            audio_output: sum(self.audio_output, other.audio_output),
-            hosted_tool_calls: sum(self.hosted_tool_calls, other.hosted_tool_calls),
+    fn add(mut self, mut other: Self) -> Self {
+        for count in Count::ALL {
+            let (a, b) = (*self.count(count), *other.count(count));
+            *self.count(count) = match (a, b) {
+                (None, None) => None,
+                (a, b) => Some(a.unwrap_or(0) + b.unwrap_or(0)),
+            };
         }
+        self
     }
 }
 
@@ -622,6 +688,19 @@ pub enum Reason {
     ContentFilter,
     Error,
     Other,
+}
+
+impl Reason {
+    /// The reason `table`, a protocol's vocabulary, gives `word`.
+    pub(crate) fn listed(table: &[(&str, Self)], word: &str) -> Option<Self> {
+        let found = table.iter().find(|(name, _)| *name == word);
+        found.map(|(_, reason)| *reason)
+    }
+
+    /// [`Self::listed`], `Other` for a word the table does not know.
+    pub(crate) fn of(table: &[(&str, Self)], word: &str) -> Self {
+        Self::listed(table, word).unwrap_or(Self::Other)
+    }
 }
 
 /// How a reply ended: the normalized reason, the provider's own word, and
@@ -675,19 +754,8 @@ pub enum Event {
     },
     /// Text, reasoning text, or a fragment of a call's argument JSON.
     Delta { index: u32, text: String },
-    /// A part ends. Text and reasoning end with their whole `text` (what
-    /// streamed, or what the provider restated), moved rather than copied:
-    /// deltas carry pieces, and only the end the whole. A call ends with its
-    /// id and arguments.
-    End {
-        index: u32,
-        #[serde(default, skip_serializing_if = "std::ops::Not::not")]
-        redacted: bool,
-        #[serde(default, skip_serializing_if = "Option::is_none")]
-        text: Option<String>,
-        #[serde(default, skip_serializing_if = "Option::is_none")]
-        call: Option<CallEnd>,
-    },
+    /// A part ends, as what it was.
+    End { index: u32, ended: Ended },
     /// A whole part at once: media, a hosted tool's result, an opaque item.
     Part { index: u32, part: AssistantPart },
     /// Provider state for a part, merged key by key into what it has.
@@ -702,6 +770,18 @@ pub enum Event {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         order: Option<Vec<u32>>,
     },
+}
+
+/// What a part ended as. Text and reasoning end with their whole `text`
+/// (what streamed, or what the provider restated), moved rather than
+/// copied: deltas carry pieces, and only the end the whole. A call ends
+/// with its id and arguments.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(tag = "block", rename_all = "snake_case")]
+pub enum Ended {
+    Text { text: String },
+    Reasoning { text: String, redacted: bool },
+    Call(CallEnd),
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
