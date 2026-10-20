@@ -54,6 +54,7 @@ fn responses_tool_round_trip_replays_its_items() {
         description: "Returns the label of a harbor by its number.".into(),
         schema: json!({"type": "object", "properties": {"number": {"type": "integer"}}, "required": ["number"]}),
         strict: None,
+        encoded: llm::Encodings::default(),
     };
     let mut request = Request {
         model: model(),
@@ -61,7 +62,7 @@ fn responses_tool_round_trip_replays_its_items() {
             "Call lookup_harbor_label for harbor 7, then tell me the label in one sentence.",
         )]
         .into(),
-        tools: vec![tool],
+        tools: vec![tool].into(),
         ..Request::default()
     };
     let provider = openai();
@@ -135,6 +136,7 @@ fn messages_thinking_tool_round_trip_replays_its_signature() {
         description: "Returns the label of a harbor by its number.".into(),
         schema: json!({"type": "object", "properties": {"number": {"type": "integer"}}, "required": ["number"]}),
         strict: None,
+        encoded: llm::Encodings::default(),
     };
     let mut request = Request {
         model: claude(),
@@ -142,7 +144,7 @@ fn messages_thinking_tool_round_trip_replays_its_signature() {
             "Call lookup_harbor_label for harbor 7, then tell me the label in one sentence.",
         )]
         .into(),
-        tools: vec![tool],
+        tools: vec![tool].into(),
         ..Request::default()
     };
     request.generation.max_output_tokens = std::num::NonZeroU32::new(4096);
@@ -197,6 +199,7 @@ fn tool_round_trip(provider: &Provider, model: &str) {
         description: "Returns the label of a harbor by its number.".into(),
         schema: json!({"type": "object", "properties": {"number": {"type": "integer"}}, "required": ["number"]}),
         strict: None,
+        encoded: llm::Encodings::default(),
     };
     let mut request = Request {
         model: model.into(),
@@ -204,7 +207,7 @@ fn tool_round_trip(provider: &Provider, model: &str) {
             "Call lookup_harbor_label for harbor 7, then tell me the label in one sentence.",
         )]
         .into(),
-        tools: vec![tool],
+        tools: vec![tool].into(),
         ..Request::default()
     };
     let first = rt::block_on(llm::generate(&http(), provider, &request)).expect("first reply");

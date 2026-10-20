@@ -51,7 +51,15 @@ pub(super) fn body(
         return Err(Error::unsupported(unset));
     };
     let caching = Caching::of(&options)?;
-    let mut tools = Vec::from_iter(request.tools.iter().map(|tool| tool_json(tool, quirks)));
+    let key = match (quirks.strict_tool_schemas, quirks.tool_input_streaming) {
+        (true, ToolInputStreaming::Eager) => "messages strict eager",
+        (true, _) => "messages strict",
+        (false, ToolInputStreaming::Eager) => "messages eager",
+        (false, _) => "messages",
+    };
+    let mut tools = Vec::from_iter(
+        (request.tools.iter()).map(|tool| tool.encoded(key, |tool| tool_json(tool, quirks))),
+    );
     // The options the encoder reads rather than sends.
     let [raw_tools, betas] = ["tools", "betas"].map(|key| options.remove(key));
     for key in ["prompt_caching", "static_prefix_cache_ttl"] {

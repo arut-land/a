@@ -54,7 +54,7 @@ fn a_strict_tool_is_marked_and_sanitized_and_provider_tools_are_not() {
         SONNET_4_6,
         vec![Message::system("System prompt"), Message::user("Hello")],
     );
-    request.tools = vec![lookup];
+    request.tools = vec![lookup].into();
     request.options.insert(
         KEY.to_owned(),
         json!({"tools": [{"type": "mcp_toolset", "name": "remote_tools"}]}),
@@ -114,7 +114,7 @@ fn tool_input_streaming(
     betas: &[&str],
 ) -> (Vec<Option<Value>>, Option<String>) {
     let mut request = request(SONNET_4_6, vec![Message::user("Hello")]);
-    request.tools = tools;
+    request.tools = tools.into();
     request.options.insert(
         KEY.to_owned(),
         json!({"tools": [{"type": "web_search_20250305", "name": "web_search"}], "betas": betas}),
@@ -202,7 +202,7 @@ fn a_tool_choice_goes_only_with_tools() {
     let mut request = request(OPUS_4_8, vec![Message::user("Hi")]);
     request.tool_choice = ToolChoice::Required;
     assert!(sent(&provider, &request).get("tool_choice").is_none());
-    request.tools = vec![tool("add")];
+    request.tools = vec![tool("add")].into();
     assert_eq!(
         sent(&provider, &request)["tool_choice"],
         json!({"type": "any"})

@@ -97,7 +97,7 @@ fn openai_options_follow_the_model() {
         sent(
             &openai,
             &Request {
-                tools,
+                tools: tools.into(),
                 parallel_tool_calls: Some(true),
                 ..hello("gpt-4o")
             },
@@ -114,7 +114,7 @@ fn openai_options_follow_the_model() {
 #[test]
 fn a_gpt_6_model_that_always_reasons_takes_no_tools() {
     let tools = |model: &str| Request {
-        tools: vec![tool("f")],
+        tools: vec![tool("f")].into(),
         ..hello(model)
     };
     let refused = sent_to(&provider("openai"), &tools("gpt-6-astra")).expect_err("refused");

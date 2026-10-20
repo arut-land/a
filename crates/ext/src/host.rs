@@ -134,7 +134,7 @@ pub struct Registry {
     /// What every model call on this generation sends, made on first use:
     /// a registry never changes once built, so neither do they.
     prompt: OnceLock<String>,
-    specs: OnceLock<Vec<llm::Tool>>,
+    specs: OnceLock<llm::Tools>,
     warnings: Vec<String>,
 }
 
@@ -350,8 +350,8 @@ impl Registry {
     }
 
     /// Every tool, as offered to the model: each schema parsed once.
-    pub fn specs(&self) -> &[llm::Tool] {
-        self.specs.get_or_init(|| self.tools.specs())
+    pub fn specs(&self) -> &llm::Tools {
+        self.specs.get_or_init(|| self.tools.specs().into())
     }
 
     /// The context the texts give for `facts`, if any.

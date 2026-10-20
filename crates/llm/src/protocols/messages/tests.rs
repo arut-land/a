@@ -83,6 +83,7 @@ fn tool(name: &str) -> Tool {
         description: format!("{name} description"),
         schema: json!({"type": "object", "properties": {}}),
         strict: None,
+        encoded: crate::Encodings::default(),
     }
 }
 
@@ -195,7 +196,7 @@ fn replays(part: &AssistantPart) -> bool {
 /// sends it.
 fn sent_with(provider: &Provider, model: &str, history: Vec<Message>, tools: Vec<Tool>) -> Value {
     let mut request = request(model, history);
-    request.tools = tools;
+    request.tools = tools.into();
     sent(provider, &request)
 }
 

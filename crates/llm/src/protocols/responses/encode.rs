@@ -73,7 +73,13 @@ pub(crate) fn body(
     let mut tools: Vec<Value> = request
         .tools
         .iter()
-        .map(|tool| function_tool(tool, strict))
+        .map(|tool| {
+            if strict {
+                tool.encoded("responses strict", |tool| function_tool(tool, true))
+            } else {
+                tool.encoded("responses", |tool| function_tool(tool, false))
+            }
+        })
         .collect();
     // Hosted tools go with the rest; the caller's other options go last.
     if let Some(Value::Array(hosted)) = options.remove("tools") {

@@ -232,7 +232,7 @@ fn the_remaining_settings_take_their_documented_cells() {
     // `parallel_tool_calls: false` joins the request's tool choice.
     let provider = provider("anthropic");
     let mut request = request(OPUS_4_6, vec![Message::user("Hi")]);
-    request.tools = vec![tool("lookup")];
+    request.tools = vec![tool("lookup")].into();
     request.parallel_tool_calls = Some(false);
     assert_eq!(
         sent(&provider, &request)["tool_choice"],

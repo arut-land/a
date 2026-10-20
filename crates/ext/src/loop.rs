@@ -151,7 +151,7 @@ impl Loop {
         (reply.message.tool_calls())
             .map(|call| {
                 let (tool, id) = (call.name.to_string(), Some(call.id.to_string()));
-                let input = Json::new(&Value::Object(call.input.clone()));
+                let input = Json::encode(&call.input).unwrap_or_default();
                 match self.refusal(call) {
                     Some(why) => Action::Refuse {
                         tool,

@@ -23,6 +23,7 @@ pub(super) fn tool(name: &str) -> Tool {
         description: "a tool".into(),
         schema: json!({"type": "object", "properties": {}}),
         strict: None,
+        encoded: crate::Encodings::default(),
     }
 }
 
@@ -126,7 +127,9 @@ fn a_recorded_request_is_what_we_send() {
         description: "Matrix tool ping".into(),
         schema: json!({"type": "object", "properties": {}, "additionalProperties": false}),
         strict: None,
-    }];
+        encoded: crate::Encodings::default(),
+    }]
+    .into();
     call.tool_choice = ToolChoice::Required;
     assert_eq!(
         sent(&openai, &call),
@@ -319,7 +322,7 @@ fn the_output_cap_is_spelled_for_the_model() {
 #[test]
 fn the_requests_own_options_join_and_override() {
     let mut joined = Request {
-        tools: vec![tool("builder_tool")],
+        tools: vec![tool("builder_tool")].into(),
         ..hello("openai/gpt-oss-20b")
     };
     options(
@@ -373,7 +376,7 @@ fn the_response_format_waits_for_a_tool_result() {
         description: None,
     };
     let first = Request {
-        tools: vec![tool("tool")],
+        tools: vec![tool("tool")].into(),
         format: Some(format.clone()),
         ..hello("gpt-4o")
     };
@@ -442,7 +445,7 @@ fn ollama_takes_an_effort_and_refuses_native_options() {
 #[test]
 fn hosts_rewrite_or_refuse_a_forced_tool_choice() {
     let forced = |model: &str, choice: ToolChoice| Request {
-        tools: vec![tool("f")],
+        tools: vec![tool("f")].into(),
         tool_choice: choice,
         ..hello(model)
     };

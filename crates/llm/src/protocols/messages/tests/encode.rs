@@ -8,7 +8,7 @@ use crate::spec::{Media, Opaque, Output, Reasoning, Source, Text, ToolCall, User
 fn last(history: Vec<Message>) -> Result<Value, Error> {
     let provider = provider("anthropic");
     let mut request = request(SONNET_4_6, history);
-    request.tools = vec![tool("add")];
+    request.tools = vec![tool("add")].into();
     encoded(&provider, &request).map(|(body, _)| {
         body["messages"]
             .as_array()
@@ -558,7 +558,7 @@ fn a_binding_model_asks_for_drop_block() {
                 Message::user("next"),
             ],
         );
-        request.tools = vec![tool("add"), tool("mul")];
+        request.tools = vec![tool("add"), tool("mul")].into();
         let body = sent(&provider, &request);
         assert_eq!(body["messages"][1]["content"][0], signed, "{model}");
         let expected = binds.then(|| {

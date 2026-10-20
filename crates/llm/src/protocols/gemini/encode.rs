@@ -488,7 +488,11 @@ pub(crate) fn body(
     let (contents, settled) = conversation::fold(&request.messages, target, contents)?;
     let (tail, system) = contents.finish();
     let mut options = request.options_for(KEY);
-    let declared = some(request.tools.iter().map(declaration).collect());
+    let declared = some(
+        (request.tools.iter())
+            .map(|tool| tool.encoded("gemini", declaration))
+            .collect(),
+    );
     let mut tools = Vec::from_iter(declared.map(|tools| obj!({"functionDeclarations": tools})));
     if let Some(Value::Array(hosted)) = options.remove("tools") {
         tools.extend(hosted);

@@ -9,7 +9,7 @@ fn cached(options: Value, tools: Vec<Tool>) -> Result<Value, Error> {
         SONNET_4_6,
         vec![Message::system("System prompt"), Message::user("Hello")],
     );
-    request.tools = tools;
+    request.tools = tools.into();
     request.options.insert(KEY.to_owned(), options);
     encoded(&provider("anthropic"), &request).map(|(body, _)| body)
 }

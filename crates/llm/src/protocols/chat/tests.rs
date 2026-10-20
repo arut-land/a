@@ -804,6 +804,7 @@ pub(super) fn request(model: &str, messages: Vec<Message>) -> Request {
                     description: "a tool the conversation calls".to_owned(),
                     schema: json!({"type": "object", "properties": {}}),
                     strict: None,
+                    encoded: crate::Encodings::default(),
                 });
             }
         }
@@ -811,7 +812,7 @@ pub(super) fn request(model: &str, messages: Vec<Message>) -> Request {
     Request {
         model: model.into(),
         messages: messages.into(),
-        tools,
+        tools: tools.into(),
         ..Request::default()
     }
 }

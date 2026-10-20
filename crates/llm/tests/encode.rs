@@ -260,6 +260,7 @@ fn bash() -> Tool {
         description: "Runs a command.".into(),
         schema: json!({"type": "object", "properties": {"command": {"type": "string"}}, "required": ["command"]}),
         strict: None,
+        encoded: llm::Encodings::default(),
     }
 }
 
@@ -275,7 +276,7 @@ fn request(model: &str, key: &str, variant: usize, messages: impl Into<llm::Mess
         ..Request::default()
     };
     if variant % 2 == 0 {
-        request.tools = vec![bash()];
+        request.tools = vec![bash()].into();
     }
     match (key, variant) {
         (_, 3) => request.tool_choice = ToolChoice::Required,

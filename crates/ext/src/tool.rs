@@ -412,6 +412,7 @@ where
             description: T::DESCRIPTION.to_owned(),
             schema: serde_json::from_str(&schema).expect("a derived schema is JSON"),
             strict: None,
+            encoded: llm::Encodings::default(),
         }
     }
 

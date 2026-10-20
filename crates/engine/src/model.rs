@@ -55,8 +55,13 @@ impl Model {
         format!("{}:{}", self.provider.id, self.id)
     }
 
+    /// The model's id, as its provider names it.
+    pub fn id(&self) -> llm::SmolStr {
+        self.id.clone()
+    }
+
     /// A request to this model for a reply to `messages`, offering `tools`.
-    pub fn request(&self, messages: Messages, tools: Vec<llm::Tool>) -> Request {
+    pub fn request(&self, messages: Messages, tools: llm::Tools) -> Request {
         Request {
             model: self.id.clone(),
             messages,

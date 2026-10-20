@@ -988,7 +988,7 @@ impl Actor {
     /// transcript before it, and the tools.
     fn request(&mut self, call: CallId, model: &Model) -> llm::Request {
         let messages = self.conversation(call);
-        model.request(messages, self.registry.specs().to_vec())
+        model.request(messages, self.registry.specs().clone())
     }
 
     /// The conversation the model sees before entry `call`.
@@ -1689,7 +1689,7 @@ impl ext::Models for Own {
                 }
                 request.messages = messages;
             }
-            request.model = model.request(llm::Messages::default(), Vec::new()).model;
+            request.model = model.id();
             request.generation.max_output_tokens =
                 std::num::NonZeroU32::new(side.budget.max_tokens);
             let asked = async {

@@ -647,7 +647,13 @@ pub(super) fn body(
     let (head, tail) = wire.finish()?;
     let typed = request.tools.iter().filter(|_| quirks.supports_tools);
     let mut tools: Vec<Value> = typed
-        .map(|tool| function_tool(tool, quirks.strict_tools))
+        .map(|tool| {
+            if quirks.strict_tools {
+                tool.encoded("chat strict", |tool| function_tool(tool, true))
+            } else {
+                tool.encoded("chat", |tool| function_tool(tool, false))
+            }
+        })
         .collect();
     tools.extend(passthrough);
     let offers_tools = quirks.supports_tools && !tools.is_empty();
