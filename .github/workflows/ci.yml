@@ -171,7 +171,7 @@ jobs:
       - *mbx-dir
       - *cache
       - *mise
-      - run: mise exec -- cargo clippy --workspace --all-targets -- -D warnings
+      - run: mise exec -- cargo clippy --workspace --all-targets --features a/lua -- -D warnings
       - run: mise exec -- cargo build -p a
       - name: test (advisory until first green on Windows)
         continue-on-error: true
