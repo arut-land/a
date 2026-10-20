@@ -883,6 +883,21 @@ mod tests {
     }
 
     #[test]
+    fn restarting_a_known_pending_target_keeps_its_environment() {
+        let mut client = SessionClient::new(Env::Origin);
+        let session = SessionId::new();
+        client.open(Target::Id(session));
+        client.run(Cmd::Input("pending".into()));
+        let out = client.restart();
+        let attach = connects(&out)[0].1;
+        assert_eq!(attach.target, Target::Id(session));
+        assert_eq!(attach.env, Env::Keep);
+        assert_eq!(attach.since, 0);
+        let out = client.step(live(2, Caps::ALL));
+        assert_eq!(sends(&out).len(), 1);
+    }
+
+    #[test]
     fn pending_input_never_crosses_an_explicit_session_change() {
         let (mut client, _) = attached(Env::Keep);
         client.run(Cmd::Input("unanswered".into()));
