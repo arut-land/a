@@ -18,7 +18,9 @@ use std::fmt;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, PoisonError};
 
-use serde::{Deserialize, Deserializer, Serialize, Serializer};
+#[cfg(test)]
+use serde::{Deserialize, Deserializer};
+use serde::{Serialize, Serializer};
 use serde_json::Value;
 
 use crate::error::Error;
@@ -131,6 +133,7 @@ impl Serialize for Messages {
     }
 }
 
+#[cfg(test)]
 impl<'de> Deserialize<'de> for Messages {
     fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
         Vec::deserialize(deserializer).map(Self::from)

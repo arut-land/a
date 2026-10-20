@@ -1,6 +1,9 @@
 //! The provider-agnostic representation: what goes into a request, what a
 //! stream says, and what a finished reply is. Every type here is plain serde
-//! data, stable on disk, and knows nothing about any wire API.
+//! data, stable on disk, and knows nothing about any wire API. A logged
+//! reply is read by [`Response::from_json`], the one codec of the shipped
+//! binary; the derived `Deserialize` of the larger types exists for tests
+//! (fixtures, and that the reader agrees with the derive).
 //!
 //! A message's kind decides what it may hold: only an assistant calls
 //! tools, only a tool message answers them, and a system message is text.
@@ -30,7 +33,8 @@ pub use crate::conversation::Messages;
 pub type Options = BTreeMap<String, Value>;
 
 /// One model call.
-#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
+#[derive(Clone, Debug, Default, PartialEq, Serialize)]
+#[cfg_attr(test, derive(Deserialize))]
 pub struct Request {
     pub model: SmolStr,
     /// The conversation. Leading system messages are the system prompt;
@@ -73,7 +77,8 @@ impl Request {
     }
 }
 
-#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
+#[derive(Clone, Debug, Default, PartialEq, Serialize)]
+#[cfg_attr(test, derive(Deserialize))]
 pub struct Generation {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub max_output_tokens: Option<NonZeroU32>,
@@ -127,7 +132,8 @@ impl Effort {
     }
 }
 
-#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[derive(Clone, Debug, PartialEq, Serialize)]
+#[cfg_attr(test, derive(Deserialize))]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum Format {
     Text,
@@ -141,7 +147,8 @@ pub enum Format {
     },
 }
 
-#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[derive(Clone, Debug, PartialEq, Serialize)]
+#[cfg_attr(test, derive(Deserialize))]
 pub struct Tool {
     pub name: SmolStr,
     #[serde(default, skip_serializing_if = "String::is_empty")]
@@ -241,6 +248,7 @@ impl Serialize for Tools {
     }
 }
 
+#[cfg(test)]
 impl<'de> Deserialize<'de> for Tools {
     fn deserialize<D: serde::Deserializer<'de>>(d: D) -> Result<Self, D::Error> {
         Vec::<Tool>::deserialize(d).map(Into::into)
@@ -263,7 +271,8 @@ impl ToolChoice {
     }
 }
 
-#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[derive(Clone, Debug, PartialEq, Serialize)]
+#[cfg_attr(test, derive(Deserialize))]
 #[serde(tag = "role", rename_all = "lowercase")]
 pub enum Message {
     System(System),
@@ -293,7 +302,8 @@ impl Message {
     }
 }
 
-#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
+#[derive(Clone, Debug, Default, PartialEq, Serialize)]
+#[cfg_attr(test, derive(Deserialize))]
 pub struct System {
     pub content: Vec<Text>,
 }
@@ -311,19 +321,22 @@ impl System {
     }
 }
 
-#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
+#[derive(Clone, Debug, Default, PartialEq, Serialize)]
+#[cfg_attr(test, derive(Deserialize))]
 pub struct User {
     pub content: Vec<UserPart>,
 }
 
-#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[derive(Clone, Debug, PartialEq, Serialize)]
+#[cfg_attr(test, derive(Deserialize))]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum UserPart {
     Text(Text),
     Media(Media),
 }
 
-#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
+#[derive(Clone, Debug, Default, PartialEq, Serialize)]
+#[cfg_attr(test, derive(Deserialize))]
 pub struct Assistant {
     /// The parts, in the order the provider produced them.
     pub content: Vec<AssistantPart>,
@@ -354,7 +367,8 @@ impl Assistant {
     }
 }
 
-#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[derive(Clone, Debug, PartialEq, Serialize)]
+#[cfg_attr(test, derive(Deserialize))]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum AssistantPart {
     Text(Text),
@@ -393,12 +407,14 @@ impl AssistantPart {
 }
 
 /// The answers to one assistant message's tool calls.
-#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
+#[derive(Clone, Debug, Default, PartialEq, Serialize)]
+#[cfg_attr(test, derive(Deserialize))]
 pub struct ToolMessage {
     pub results: Vec<ToolResult>,
 }
 
-#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
+#[derive(Clone, Debug, Default, PartialEq, Serialize)]
+#[cfg_attr(test, derive(Deserialize))]
 pub struct Text {
     pub text: String,
     #[serde(default, skip_serializing_if = "Meta::is_empty")]
@@ -416,7 +432,8 @@ impl Text {
 
 /// Reasoning the model showed. Redacted reasoning has no readable text;
 /// only its producer can replay it, from `meta`.
-#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
+#[derive(Clone, Debug, Default, PartialEq, Serialize)]
+#[cfg_attr(test, derive(Deserialize))]
 pub struct Reasoning {
     #[serde(default, skip_serializing_if = "String::is_empty")]
     pub text: String,
@@ -426,7 +443,8 @@ pub struct Reasoning {
     pub meta: Meta,
 }
 
-#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[derive(Clone, Debug, PartialEq, Serialize)]
+#[cfg_attr(test, derive(Deserialize))]
 pub struct Media {
     pub media_type: SmolStr,
     pub source: Source,
@@ -434,7 +452,8 @@ pub struct Media {
     pub meta: Meta,
 }
 
-#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[derive(Clone, Debug, PartialEq, Serialize)]
+#[cfg_attr(test, derive(Deserialize))]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum Source {
     /// Base64 data.
@@ -450,7 +469,8 @@ pub enum Source {
     },
 }
 
-#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[derive(Clone, Debug, PartialEq, Serialize)]
+#[cfg_attr(test, derive(Deserialize))]
 pub struct ToolCall {
     pub id: SmolStr,
     pub name: SmolStr,
@@ -473,6 +493,7 @@ pub struct ToolCall {
 
 /// A call's arguments as a derived `Deserialize` reads them, buffered: a
 /// JSON object, through a tree. [`Response::from_json`] keeps the text.
+#[cfg(test)]
 fn object<'de, D: serde::Deserializer<'de>>(d: D) -> Result<Json, D::Error> {
     let object = serde_json::Map::<String, Value>::deserialize(d)?;
     Json::encode(&object).map_err(serde::de::Error::custom)
@@ -491,7 +512,8 @@ impl ToolCall {
     }
 }
 
-#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[derive(Clone, Debug, PartialEq, Serialize)]
+#[cfg_attr(test, derive(Deserialize))]
 pub struct ToolResult {
     pub id: SmolStr,
     pub name: SmolStr,
@@ -502,7 +524,8 @@ pub struct ToolResult {
     pub meta: Meta,
 }
 
-#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[derive(Clone, Debug, PartialEq, Serialize)]
+#[cfg_attr(test, derive(Deserialize))]
 #[serde(tag = "type", content = "value", rename_all = "snake_case")]
 pub enum Output {
     Text(String),
@@ -517,7 +540,8 @@ impl Default for Output {
     }
 }
 
-#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
+#[derive(Clone, Debug, Default, PartialEq, Serialize)]
+#[cfg_attr(test, derive(Deserialize))]
 pub struct Opaque {
     #[serde(default, skip_serializing_if = "Meta::is_empty")]
     pub meta: Meta,
@@ -750,7 +774,8 @@ pub enum Block {
 
 /// One step of a streamed reply. Parts are numbered by `index` as they
 /// open; each opens, grows, and ends before the reply's `Finish`.
-#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[derive(Clone, Debug, PartialEq, Serialize)]
+#[cfg_attr(test, derive(Deserialize))]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum Event {
     /// What the provider said about the reply, once it is known.
@@ -791,7 +816,8 @@ pub enum Event {
 /// (what streamed, or what the provider restated), moved rather than
 /// copied: deltas carry pieces, and only the end the whole. A call ends
 /// with its id and arguments.
-#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[derive(Clone, Debug, PartialEq, Serialize)]
+#[cfg_attr(test, derive(Deserialize))]
 #[serde(tag = "block", rename_all = "snake_case")]
 pub enum Ended {
     Text { text: String },
@@ -799,7 +825,8 @@ pub enum Ended {
     Call(CallEnd),
 }
 
-#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[derive(Clone, Debug, PartialEq, Serialize)]
+#[cfg_attr(test, derive(Deserialize))]
 pub struct CallEnd {
     pub id: SmolStr,
     #[serde(deserialize_with = "object")]
@@ -811,7 +838,8 @@ pub struct CallEnd {
 }
 
 /// A finished reply.
-#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[derive(Clone, Debug, PartialEq, Serialize)]
+#[cfg_attr(test, derive(Deserialize))]
 pub struct Response {
     pub message: Assistant,
     pub finish: Finish,

@@ -513,9 +513,6 @@ fn read_logged_reply() {
     measure("from_json 150 parts", 200, || {
         let _ = std::hint::black_box(llm::Response::from_json(&text));
     });
-    measure("derived Deserialize from text 150 parts", 200, || {
-        let _ = std::hint::black_box(serde_json::from_str::<llm::Response>(&text));
-    });
     measure("text to a tree 150 parts", 200, || {
         let _ = std::hint::black_box(serde_json::from_str::<serde_json::Value>(&text));
     });
