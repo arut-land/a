@@ -1,5 +1,5 @@
 use std::fs::{self, File, OpenOptions};
-use std::io::{self, BufRead, BufReader, Read, Write};
+use std::io::{self, BufRead, BufReader, Write};
 use std::ops::RangeInclusive;
 use std::path::PathBuf;
 use std::sync::{Arc, PoisonError, RwLock};
@@ -9,9 +9,8 @@ use protocol::{Decode, Entry, SessionId};
 use super::{Header, LeaseAuthority, Lines, Loaded, Local, Log, LogStore, Writer, span};
 
 /// One append-only JSONL file per session in a directory: the header on the
-/// first line, one entry per line after it, and an empty `.busy` file beside
-/// it while work is in flight. Sessions share nothing, so they never contend;
-/// a single writer per directory is the daemon lock's job.
+/// first line, one entry per line after it. Sessions share nothing, so they
+/// never contend; a single writer per directory is the daemon lock's job.
 pub struct Jsonl {
     dir: PathBuf,
     leases: Local,
@@ -29,10 +28,6 @@ impl Jsonl {
 
     fn path(&self, id: SessionId) -> PathBuf {
         self.dir.join(format!("{id}.jsonl"))
-    }
-
-    fn busy_path(&self, id: SessionId) -> PathBuf {
-        self.dir.join(format!("{id}.busy"))
     }
 }
 
@@ -103,7 +98,9 @@ impl LogStore for Jsonl {
     }
 
     /// Counts lines rather than parsing them.
+    #[cfg(test)]
     fn count(&self, id: SessionId) -> io::Result<u64> {
+        use std::io::Read as _;
         let mut file = File::open(self.path(id))?;
         let (mut lines, mut buf) = (0u64, vec![0u8; 64 * 1024]);
         loop {
@@ -112,22 +109,6 @@ impl LogStore for Jsonl {
                 n => lines += memchr::memchr_iter(b'\n', &buf[..n]).count() as u64,
             }
         }
-    }
-
-    fn mark_busy(&self, id: SessionId, busy: bool) -> io::Result<()> {
-        let path = self.busy_path(id);
-        if busy {
-            File::create(path).map(drop)
-        } else {
-            match fs::remove_file(path) {
-                Err(e) if e.kind() != io::ErrorKind::NotFound => Err(e),
-                _ => Ok(()),
-            }
-        }
-    }
-
-    fn is_busy(&self, id: SessionId) -> bool {
-        self.busy_path(id).exists()
     }
 }
 

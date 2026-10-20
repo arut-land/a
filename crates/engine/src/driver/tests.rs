@@ -224,7 +224,25 @@ fn with_home(script: &Arc<Script>, path: &Path) -> Models {
     }
 }
 
-struct Fixture(Arc<Shared>);
+struct Fixture(Arc<Shared>, Arc<Counting>);
+
+/// The runtime sessions under test run on, counting its blocking hops.
+struct Counting(rt::Threads, AtomicUsize);
+
+impl rt::Runtime for Counting {
+    fn spawn(&self, task: rt::BoxFuture<'static, ()>) {
+        self.0.spawn(task);
+    }
+
+    fn spawn_blocking(&self, work: Box<dyn FnOnce() + Send>) {
+        self.1.fetch_add(1, Ordering::SeqCst);
+        self.0.spawn_blocking(work);
+    }
+
+    fn reactor(&self) -> rt::Reactor {
+        self.0.reactor()
+    }
+}
 
 /// The agents sessions under test run.
 struct Agents;
@@ -251,17 +269,28 @@ impl Fixture {
         } else {
             registry.with_in(ext::Tier::Post, &Agents).unwrap()
         };
-        Self(Arc::new(Shared {
-            // One worker: no effect may hold it.
-            rt: Arc::new(rt::Threads::new(1)),
-            store,
-            registry: ext::host::Current::new(registry),
-            models,
+        // One worker: no effect may hold it.
+        let counting = Arc::new(Counting(rt::Threads::new(1), AtomicUsize::new(0)));
+        let rt: rt::Rt = Arc::clone(&counting) as _;
+        Self(
+            Arc::new(Shared {
+                rt,
+                store,
+                catalog: crate::catalog::Catalog::memory(),
+                registry: ext::host::Current::new(registry),
+                models,
 
-            spill: std::env::temp_dir().join(format!("a-spill-{}", std::process::id())),
-            loaded: Mutex::default(),
-            daemon: Weak::new(),
-        }))
+                spill: std::env::temp_dir().join(format!("a-spill-{}", std::process::id())),
+                loaded: Mutex::default(),
+                daemon: Weak::new(),
+            }),
+            counting,
+        )
+    }
+
+    /// The blocking hops taken so far.
+    fn hops(&self) -> usize {
+        self.1.1.load(Ordering::SeqCst)
     }
 
     fn header() -> Header {
@@ -389,8 +418,6 @@ struct Probe {
     waiting: Arc<AtomicUsize>,
     /// Each batch, and whether it was made durable.
     written: Arc<Mutex<Vec<Written>>>,
-    /// Appends and busy marks, and the thread each ran on.
-    ops: Arc<Mutex<Vec<(&'static str, thread::ThreadId)>>>,
 }
 
 /// A batch handed to a log, and whether it was made durable.
@@ -407,7 +434,7 @@ impl Probed {
             return Err(io::Error::other("disk full"));
         }
         lock(&self.1.batches).push(entries.len());
-        lock(&self.1.ops).push(("append", thread::current().id()));
+
         lock(&self.1.written).push((entries.to_vec(), durable));
         self.0.append_all(entries)
     }
@@ -446,16 +473,6 @@ impl LogStore for Probe {
 
     fn count(&self, id: SessionId) -> io::Result<u64> {
         self.store.count(id)
-    }
-
-    fn mark_busy(&self, id: SessionId, busy: bool) -> io::Result<()> {
-        let op = if busy { "busy" } else { "idle" };
-        lock(&self.ops).push((op, thread::current().id()));
-        self.store.mark_busy(id, busy)
-    }
-
-    fn is_busy(&self, id: SessionId) -> bool {
-        self.store.is_busy(id)
     }
 }
 
@@ -1944,31 +1961,15 @@ fn the_busy_mark_rides_its_commit() {
         openai(&Script::new(&[])),
     );
     let session = fixture.create();
+    settle(&session);
+    let (hops, commits) = (fixture.hops(), lock(&probe.batches).len());
     session.submit("$ true").unwrap();
     finished(&session, 3);
     settle(&session);
+    let (hops, commits) = (fixture.hops() - hops, lock(&probe.batches).len() - commits);
     session.halt();
-    let ops = lock(&probe.ops).clone();
-    let names: Vec<&str> = ops.iter().map(|(op, _)| *op).collect();
-    let busy = names.iter().position(|&op| op == "busy").unwrap();
-    let idle = names.iter().position(|&op| op == "idle").unwrap();
-    assert_eq!(
-        names.iter().filter(|&&op| op != "append").count(),
-        2,
-        "{names:?}"
-    );
-    assert_eq!((names[busy + 1], names[idle - 1]), ("append", "append"));
-    assert_eq!(idle, names.len() - 1, "{names:?}");
-    assert_eq!(
-        ops[busy].1,
-        ops[busy + 1].1,
-        "the mark set in a hop of its own"
-    );
-    assert_eq!(
-        ops[idle].1,
-        ops[idle - 1].1,
-        "the mark cleared in a hop of its own"
-    );
+    assert_eq!(*lock(&fixture.0.catalog.marks), [true, false]);
+    assert_eq!(hops, commits, "a hop besides the {commits} commits");
 }
 
 /// Progress and extension state are written as they come, and made

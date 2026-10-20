@@ -17,6 +17,7 @@ use std::sync::{Arc, Mutex, OnceLock};
 use std::task::Poll;
 use std::time::Instant;
 
+use crate::catalog::Record;
 use crate::store::{Header, Parent, Writer};
 use ext::host::{Host, Parts, Registry};
 use ext::point::{Approving, Failed, View};
@@ -44,6 +45,8 @@ pub struct Shared {
     /// Where actors and effects run, sleep and block.
     pub rt: rt::Rt,
     pub store: Arc<dyn crate::store::LogStore>,
+    /// How every session lists, and which are busy.
+    pub catalog: crate::catalog::Catalog,
     /// The extensions, as each session takes them up at its next step.
     pub registry: ext::host::Current,
     pub models: Models,
@@ -229,7 +232,11 @@ impl Live {
         // Each entry is folded as it is read and dropped.
         let mut states = registry.states();
         let loaded = match open {
-            Open::Create => shared.store.create(header)?,
+            Open::Create => {
+                let created = shared.store.create(header)?;
+                shared.catalog.record(Record::new(header.clone()));
+                created
+            }
             Open::Load => shared.store.load(header.id, &mut |e| {
                 states.apply(&e);
                 core.load(&e);
@@ -239,7 +246,8 @@ impl Live {
         *lock(&session.env) = core.ledger().env().cloned();
         *lock(&session.overrides) = core.ledger().settings();
         let fresh = lock(&shared.loaded).insert(header.id);
-        let busy = shared.store.is_busy(header.id);
+        let listed = (shared.catalog.get(header.id)).unwrap_or_else(|| Record::new(header.clone()));
+        let busy = listed.busy;
         let load = Load {
             boot: sys::boot_id(),
             fresh,
@@ -278,7 +286,7 @@ impl Live {
             tickets: 0,
             reporting: 0,
             stopping: false,
-            marked: busy,
+            listed,
         };
         shared.rt.spawn(Box::pin(actor.run(rx, first)));
         Ok(live)
@@ -427,11 +435,10 @@ struct Actor {
     /// Tool and model calls in flight, each of which reports once.
     reporting: usize,
     stopping: bool,
-    /// Whether the store's busy marker is set: while work is in flight, or
-    /// a call waits on someone, so the next daemon loads the session at
-    /// once to recover it or to list what it waits on. Set before work
-    /// starts, cleared after it ends.
-    marked: bool,
+    /// The session as the catalog last heard of it: busy while work is in
+    /// flight, or a call waits on someone. Set before work starts, cleared
+    /// after it ends.
+    listed: Record,
 }
 
 impl Actor {
@@ -486,6 +493,13 @@ impl Actor {
             self.mark().await;
             self.publish();
         }
+        // Listed as it ends, with all it logged.
+        let listing = self.listing(self.live.has_work());
+        let shared = Arc::clone(&self.live.session.shared);
+        rt::unblock(&*Arc::clone(&shared.rt), move || {
+            shared.catalog.record(listing);
+        })
+        .await;
         let registry = &self.registry;
         registry.hooks().session_end(&self.live.session.point());
         // Closed and let go before the end is told: a reload never makes
@@ -668,16 +682,16 @@ impl Actor {
     /// if the commit failed, and the session resumed. Notes with nothing
     /// after them are durable with the next commit that is.
     async fn flush(&mut self, batch: &mut Vec<Entry>, after: &mut Vec<Effect>) -> bool {
-        // The busy mark as the session stands once `after` is carried out.
+        // The session as it stands once `after` is carried out.
         let busy = (after.iter().rev())
             .find_map(|e| match e {
                 Effect::MarkBusy(busy) => Some(*busy),
                 _ => None,
             })
             .unwrap_or_else(|| self.live.has_work());
-        let marked = busy || self.core.ledger().activity().requires_action();
+        let listing = self.listing(busy);
         if !batch.is_empty()
-            && let Err(e) = self.commit(batch, !after.is_empty(), marked).await
+            && let Err(e) = self.commit(batch, !after.is_empty(), listing).await
         {
             let why = format!("logging: {e}");
             eprintln!("session {}: {why}", self.live.id.short());
@@ -740,14 +754,15 @@ impl Actor {
     /// made durable at once unless it holds only notes and `durable` is
     /// not asked for ([`kernel::Durability`]).
     ///
-    /// The busy marker turns to `marked` in the same blocking hop: set
-    /// before the entries, as it is before the work they are the intent
-    /// of, and cleared after them, as it is once the work ends.
+    /// The catalog takes `listing`, if it changed, in the same blocking
+    /// hop: before the entries when it is busy, as the mark is set before
+    /// the work they are the intent of, and after them when it is not, as
+    /// the mark is cleared once the work ends.
     async fn commit(
         &mut self,
         batch: &mut Vec<Entry>,
         durable: bool,
-        marked: bool,
+        listing: Record,
     ) -> io::Result<()> {
         let durable = durable
             || batch
@@ -758,28 +773,29 @@ impl Actor {
             .take()
             .ok_or_else(|| io::Error::other("no writer"))?;
         let mut entries = std::mem::take(batch);
-        let mark = (marked != self.marked).then_some(marked);
-        self.marked = marked;
-        let shared = &self.live.session.shared;
-        let (rt, store, id) = (
-            Arc::clone(&shared.rt),
-            Arc::clone(&shared.store),
-            self.live.id,
-        );
-        let (writer, entries, written) = rt::unblock(&*rt, move || {
-            if mark == Some(true) {
-                busy_marker(&*store, id, true);
+        let listed = std::mem::replace(&mut self.listed, listing.clone());
+        let listing = relisted(&listed, &listing).then_some(listing);
+        let shared = Arc::clone(&self.live.session.shared);
+        let rt = Arc::clone(&shared.rt);
+        let (writer, entries, written, listing) = rt::unblock(&*rt, move || {
+            let first = listing.as_ref().is_some_and(|l| l.busy);
+            if first && let Some(listing) = &listing {
+                shared.catalog.record(listing.clone());
             }
             let written = catch_unwind(AssertUnwindSafe(|| writer.append(&mut entries, durable)))
                 .unwrap_or_else(|_| Err(io::Error::other("committing entries panicked")));
-            if mark == Some(false) && written.is_ok() {
-                busy_marker(&*store, id, false);
+            if !first
+                && written.is_ok()
+                && let Some(listing) = &listing
+            {
+                shared.catalog.record(listing.clone());
             }
-            (writer, entries, written)
+            (writer, entries, written, listing)
         })
         .await;
-        if mark == Some(false) && written.is_err() {
-            self.marked = true;
+        // Not cleared after entries that did not commit.
+        if written.is_err() && listing.is_some_and(|l| !l.busy) {
+            self.listed = listed;
         }
         self.writer = Some(writer);
         written?;
@@ -948,17 +964,37 @@ impl Actor {
         }
     }
 
-    /// Sets or clears the busy marker as the session now stands, when no
-    /// commit did.
+    /// Lists the session in the catalog as it now stands, when no commit
+    /// did: a call beginning to wait, the actor ending.
     async fn mark(&mut self) {
-        let marked = self.live.has_work() || self.core.ledger().activity().requires_action();
-        if marked == self.marked {
+        let listing = self.listing(self.live.has_work());
+        if !relisted(&self.listed, &listing) {
             return;
         }
-        self.marked = marked;
-        let shared = &self.live.session.shared;
-        let (store, id) = (Arc::clone(&shared.store), self.live.id);
-        rt::unblock(&*shared.rt, move || busy_marker(&*store, id, marked)).await;
+        self.listed = listing.clone();
+        let shared = Arc::clone(&self.live.session.shared);
+        rt::unblock(&*Arc::clone(&shared.rt), move || {
+            shared.catalog.record(listing);
+        })
+        .await;
+    }
+
+    /// The session as the catalog lists it, `busy` with work in flight:
+    /// marked busy too while a call waits on someone, so the next daemon
+    /// loads it at once to show what it asks.
+    fn listing(&self, busy: bool) -> Record {
+        let ledger = self.core.ledger();
+        let activity = ledger.activity();
+        Record {
+            header: Header {
+                id: self.live.id,
+                workspace: self.live.workspace.clone(),
+                parent: self.live.parent,
+            },
+            busy: busy || activity.requires_action(),
+            entries: ledger.seq(),
+            activity,
+        }
     }
 
     fn reply(&mut self, ticket: Ticket, result: Result<(), String>) {
@@ -1192,11 +1228,11 @@ impl Actor {
     }
 }
 
-/// Sets or clears session `id`'s busy marker; a failure is only told.
-fn busy_marker(store: &dyn crate::store::LogStore, id: SessionId, busy: bool) {
-    if let Err(e) = store.mark_busy(id, busy) {
-        eprintln!("session {}: busy marker: {e}", id.short());
-    }
+/// Whether the catalog is to hear of `now`: it lists what it waits on and
+/// whether it is busy, and its count only as of then, so a commit does not
+/// change it.
+fn relisted(listed: &Record, now: &Record) -> bool {
+    listed.busy != now.busy || listed.activity != now.activity
 }
 
 /// Values by key, in a vector: a session has few of each in flight.

@@ -79,7 +79,7 @@ macro_rules! conformance {
             lines_read_back_as_appended,
             headers_list_sessions_oldest_first,
             counts_follow_appends,
-            busy_markers_set_clear_and_repeat,
+
             sessions_are_isolated,
             concurrent_sessions_do_not_interfere,
             ids_are_unique_and_missing_ones_not_found,
@@ -260,22 +260,6 @@ fn counts_follow_appends(store: &dyn LogStore) {
     assert_eq!(store.count(h.id).unwrap(), 6);
 }
 
-fn busy_markers_set_clear_and_repeat(store: &dyn LogStore) {
-    let (a, b) = (header("/a"), header("/b"));
-    store.create(&a).unwrap();
-    store.create(&b).unwrap();
-    assert!(!store.is_busy(a.id));
-    store.mark_busy(a.id, true).unwrap();
-    store.mark_busy(a.id, true).unwrap();
-    assert!(store.is_busy(a.id));
-    assert!(!store.is_busy(b.id));
-    store.mark_busy(a.id, false).unwrap();
-    assert!(!store.is_busy(a.id));
-    store.mark_busy(a.id, false).unwrap();
-    store.mark_busy(b.id, false).unwrap();
-    assert!(!store.is_busy(a.id) && !store.is_busy(b.id));
-}
-
 fn sessions_are_isolated(store: &dyn LogStore) {
     let (a, b) = (header("/a"), header("/b"));
     let mut log_a = store.create(&a).unwrap();
@@ -285,10 +269,8 @@ fn sessions_are_isolated(store: &dyn LogStore) {
         written_a.extend(append(&mut log_a, [seq]));
         append(&mut log_b, [seq * 100]);
     }
-    store.mark_busy(b.id, true).unwrap();
     assert_eq!(entries_of(store, a.id), written_a);
     assert_eq!(store.count(b.id).unwrap(), 3);
-    assert!(!store.is_busy(a.id));
 }
 
 fn concurrent_sessions_do_not_interfere(store: &dyn LogStore) {
@@ -433,14 +415,12 @@ fn jsonl_skips_a_file_whose_header_a_crash_cut_off() {
 
 #[test]
 fn jsonl_files_are_a_header_line_then_one_line_per_entry() {
-    let (store, path, h, written) = torn(b"");
-    store.mark_busy(h.id, true).unwrap();
+    let (_store, path, h, written) = torn(b"");
     let mut expected = serde_json::to_string(&h).unwrap() + "\n";
     for e in &written {
         expected += &(serde_json::to_string(e).unwrap() + "\n");
     }
     assert_eq!(fs::read_to_string(&path).unwrap(), expected);
-    assert!(path.with_extension("busy").exists());
 }
 
 #[test]

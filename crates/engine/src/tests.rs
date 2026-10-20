@@ -1,7 +1,9 @@
 use std::path::PathBuf;
 use std::time::{Duration, Instant};
 
+use crate::catalog::Catalog;
 use crate::store::{Header, Jsonl, LogStore};
+use protocol::ledger::Ledger;
 use protocol::{
     Activity, Audience, Body, Entry, Environment, Outcome, Residency, SessionId, Target,
 };
@@ -82,6 +84,13 @@ fn settle(daemon: &Daemon) {
         assert!(Instant::now() < deadline, "work never finished");
         std::thread::sleep(Duration::from_millis(5));
     }
+}
+
+/// Whether the catalog marks session `id` busy, as the next daemon reads it.
+fn marked(home: &Home, id: SessionId) -> bool {
+    let store = Jsonl::open(home.sessions_dir()).unwrap();
+    let catalog = Catalog::open(home.catalog_file(), &home.sessions_dir(), &store).unwrap();
+    catalog.get(id).is_some_and(|r| r.busy)
 }
 
 /// Session `id`'s log; none if it is not made yet.
@@ -183,14 +192,13 @@ fn busy_sessions_recover_at_startup() {
             .append_all(&[Entry::new(seq, created.writer.epoch(), body)])
             .unwrap();
     }
-    store.mark_busy(id, true).unwrap();
 
     let daemon = Daemon::load(&home, &echo()).unwrap();
     settle(&daemon);
     // Its actor clears the marker after the work it settles.
     drop(daemon);
     let got = bodies(&store, id);
-    let still_busy = store.is_busy(id);
+    let still_busy = marked(&home, id);
     std::fs::remove_dir_all(&root).unwrap();
 
     // The safe sleep runs again; the shell command is not rerun.
@@ -229,7 +237,7 @@ fn a_session_waiting_for_approval_stays_waiting_through_hibernation_and_a_restar
     daemon.hibernate(Duration::ZERO);
     let hibernated = daemon.list().remove(0);
     drop(daemon);
-    let marked = Jsonl::open(home.sessions_dir()).unwrap().is_busy(id);
+    let marked = marked(&home, id);
 
     let restarted = Daemon::load(&home, &config).unwrap();
     let listed = restarted.list().remove(0);
@@ -457,7 +465,10 @@ fn watches_rearm_after_a_crash_and_fire_once() {
                 .append_all(std::slice::from_ref(&entry))
                 .unwrap();
         }
-        store.mark_busy(header.id, busy).unwrap();
+        assert_eq!(
+            busy,
+            Ledger::of(&store.entries(header.id).unwrap()).activity() != Activity::Idle
+        );
     };
     let session = |parent: Option<SessionId>| Header {
         id: SessionId::new(),
@@ -651,7 +662,6 @@ fn an_orphan_does_not_resume_what_it_was_doing() {
             .append_all(std::slice::from_ref(&entry))
             .unwrap();
     }
-    store.mark_busy(header.id, true).unwrap();
     drop(created);
 
     let daemon = Daemon::load(&home, &echo()).unwrap();
@@ -945,4 +955,87 @@ fn hibernating_frees_the_session() {
 
     assert_eq!(listed.residency, Residency::Hibernated);
     assert!(freed, "a hibernated session is still held");
+}
+
+/// A daemon starts, and lists, from the catalog alone: it opens no log,
+/// so its start does not grow with the sessions it keeps. Here no log is
+/// readable, so a start that opened them would list none.
+#[test]
+fn cold_start_does_not_grow_with_session_count() {
+    const SESSIONS: usize = 5000;
+    let (root, home) = home("cold");
+    let store = Jsonl::open(home.sessions_dir()).unwrap();
+    let headers: Vec<Header> = (0..SESSIONS)
+        .map(|_| Header {
+            id: SessionId::new(),
+            workspace: "/w".into(),
+            parent: None,
+        })
+        .collect();
+    for h in &headers {
+        std::fs::write(home.sessions_dir().join(format!("{}.jsonl", h.id)), "torn").unwrap();
+    }
+    let catalog = Catalog::open(home.catalog_file(), &home.sessions_dir(), &store).unwrap();
+    assert!(catalog.records().is_empty(), "the logs are unreadable");
+    for h in &headers {
+        catalog.record(crate::catalog::Record {
+            entries: 7,
+            ..crate::catalog::Record::new(h.clone())
+        });
+    }
+    drop(catalog);
+
+    let began = Instant::now();
+    let daemon = Daemon::load(&home, &echo()).unwrap();
+    let started = began.elapsed();
+    let listed = daemon.list();
+    drop(daemon);
+    std::fs::remove_dir_all(&root).unwrap();
+
+    assert_eq!(listed.len(), SESSIONS);
+    assert!(listed.iter().all(|s| s.entries == 7));
+    let ids: Vec<SessionId> = listed.iter().map(|s| s.id).collect();
+    let mut made: Vec<SessionId> = headers.iter().map(|h| h.id).collect();
+    made.sort_unstable_by_key(|id| id.0);
+    assert_eq!(ids, made, "oldest first");
+    assert!(started < Duration::from_secs(2), "started in {started:?}");
+}
+
+/// The catalog is derived: lost, the next daemon rebuilds it from the
+/// logs, listing every session as it was, and loads at once the one that
+/// was left waiting on the user.
+#[test]
+fn a_lost_catalog_is_rebuilt_from_the_logs() {
+    let (root, home, daemon) = asking("rebuilt");
+    let mut asked = None;
+    for text in ["hi", "$ echo hi", "there"] {
+        let attachment = daemon.attach_to(&Target::New, || "/w".into()).unwrap();
+        attachment.session().submit(text).unwrap();
+        settle(&daemon);
+        if text.starts_with('$') {
+            asked = Some(attachment.session().id);
+        }
+    }
+    daemon.hibernate(Duration::ZERO);
+    let listed = daemon.list();
+    drop(daemon);
+    std::fs::remove_file(home.catalog_file()).unwrap();
+
+    let config = Config {
+        ext: exts("[ext.policy]\nask = [\"bash\"]"),
+        ..echo()
+    };
+    let restarted = Daemon::load(&home, &config).unwrap();
+    let relisted = restarted.list();
+    let loaded: Vec<SessionId> = restarted.loaded().iter().map(|s| s.id).collect();
+    drop(restarted);
+    let rebuilt = home.catalog_file().exists();
+    std::fs::remove_dir_all(&root).unwrap();
+
+    let shown = |list: &[protocol::SessionSummary]| -> Vec<_> {
+        list.iter().map(|s| (s.id, s.entries, s.activity)).collect()
+    };
+    assert_eq!(shown(&relisted), shown(&listed));
+    assert_eq!(loaded, Vec::from_iter(asked));
+    assert!(rebuilt);
 }

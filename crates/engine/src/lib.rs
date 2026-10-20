@@ -1,5 +1,6 @@
 //! The daemon: owns every session, accepts clients, runs the agents.
 
+mod catalog;
 pub mod config;
 mod driver;
 mod model;
@@ -20,12 +21,11 @@ use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 use std::task::Poll;
 use std::time::{Duration, Instant};
 
-use crate::store::{Header, Jsonl, LogStore};
+use crate::catalog::Catalog;
+use crate::store::{Header, Jsonl};
 use driver::{Attachment, Ended, Live, Open, Request, Shared};
 use outbox::Outbox;
-use protocol::{
-    Activity, DaemonMsg, Environment, Frame, Mode, Outcome, SessionId, SessionSummary, Target,
-};
+use protocol::{DaemonMsg, Environment, Frame, Mode, Outcome, SessionId, SessionSummary, Target};
 use rt::oneshot;
 use server::reply;
 use sys::{Home, Listener};
@@ -211,14 +211,16 @@ struct Slot {
 /// actor, or stopping. A log is loaded once its last actor has stopped, so
 /// it has one writer, and never on a connection's task.
 enum Residency {
-    /// Unloaded, costing nothing. `last` is how it lists: as it was when
-    /// it was unloaded, or once counted from its log.
+    /// Unloaded, costing nothing. `last` is how it lists: as the catalog
+    /// had it, or as it was when it was unloaded.
     Hibernated {
-        last: Option<SessionSummary>,
+        last: SessionSummary,
     },
-    /// Loading on the blocking pool; whoever else wants it waits.
+    /// Loading on the blocking pool; whoever else wants it waits. It lists
+    /// as it did before.
     Loading {
         waiters: Vec<oneshot::Sender<Loaded>>,
+        last: SessionSummary,
     },
     Live(Arc<Live>),
     /// Unloaded, its actor not yet ended: it lists as the actor last left
@@ -264,21 +266,50 @@ impl Slot {
         if !live.ended.is_over() {
             return Some(live.ended.clone());
         }
-        let last = Some(hibernated(live.summary()));
+        let last = hibernated(live.summary());
         *residency = Residency::Hibernated { last };
         None
+    }
+
+    /// How it lists now.
+    fn summary(&self) -> SessionSummary {
+        match &*lock(&self.residency) {
+            Residency::Live(live) => live.summary(),
+            Residency::Stopping(live) => hibernated(live.summary()),
+            Residency::Hibernated { last } | Residency::Loading { last, .. } => last.clone(),
+        }
+    }
+
+    /// Marks it loading, listed as it was; `false` if it is not unloaded.
+    fn loading(&self) -> bool {
+        let mut residency = lock(&self.residency);
+        let last = match &*residency {
+            Residency::Hibernated { last } => last.clone(),
+            Residency::Stopping(live) => hibernated(live.summary()),
+            Residency::Live(_) | Residency::Loading { .. } => return false,
+        };
+        *residency = Residency::Loading {
+            waiters: Vec::new(),
+            last,
+        };
+        true
     }
 }
 
 impl Daemon {
-    /// Reads only session headers. Sessions with a busy marker were working
-    /// when the last daemon stopped, so they load at once to recover.
+    /// Reads only the session catalog, opening no log. Sessions it marks
+    /// busy were working when the last daemon stopped, so they load at
+    /// once, together, to recover.
     fn load(home: &Home, config: &Config) -> io::Result<Owner> {
         let store = Arc::new(Jsonl::open(home.sessions_dir())?);
-        let slots = store
-            .headers()?
-            .into_iter()
-            .map(|header| Slot::new(header, Residency::Hibernated { last: None }))
+        let catalog = Catalog::open(home.catalog_file(), &home.sessions_dir(), &*store)?;
+        let records = catalog.records();
+        let busy: Vec<bool> = records.iter().map(|r| r.busy).collect();
+        let slots: Vec<_> = (records.into_iter())
+            .map(|record| {
+                let last = record.summary();
+                Slot::new(record.header, Residency::Hibernated { last })
+            })
             .collect();
         let rt: rt::Rt = Arc::new(rt::Threads::default());
         let models = model::Models {
@@ -290,6 +321,7 @@ impl Daemon {
             shared: Arc::new(Shared {
                 rt,
                 store,
+                catalog,
                 registry,
                 models,
 
@@ -297,7 +329,7 @@ impl Daemon {
                 loaded: Mutex::default(),
                 daemon: daemon.clone(),
             }),
-            slots: Mutex::new(slots),
+            slots: Mutex::new(slots.clone()),
             clients: AtomicUsize::new(0),
             pulse: rt::Notify::new(),
             jobs: rt::Notify::new(),
@@ -307,26 +339,31 @@ impl Daemon {
                 .duration_since(std::time::UNIX_EPOCH)
                 .map_or(0, |d| d.as_secs()),
         });
-        // Before any client is served, on this thread, which may block;
-        // all are loading before any is loaded, so a child that reports at
-        // once finds its parent.
-        let busy: Vec<_> = (daemon.slots().into_iter())
-            .filter(|slot| daemon.shared.store.is_busy(slot.header.id))
+        // Before any client is served; all are loading before any is
+        // loaded, so a child that reports at once finds its parent; each
+        // loads on the blocking pool, alongside the others.
+        let busy: Vec<_> = (slots.into_iter().zip(busy))
+            .filter_map(|(slot, busy)| (busy && slot.loading()).then_some(slot))
             .collect();
-        for slot in &busy {
-            let waiters = Vec::new();
-            *lock(&slot.residency) = Residency::Loading { waiters };
-        }
-        for slot in &busy {
-            let owner = daemon.owner(slot);
-            let started = Live::start(&slot.header, &daemon.shared, Open::Load, owner);
-            if let Err(e) = daemon.started(slot, started) {
-                eprintln!(
-                    "session {}: loading for recovery: {e}",
-                    slot.header.id.short()
-                );
+        let starting: Vec<_> = (busy.iter())
+            .map(|slot| {
+                let (shared, header) = (Arc::clone(&daemon.shared), slot.header.clone());
+                let owner = daemon.owner(slot);
+                rt::unblock(&*daemon.shared.rt, move || {
+                    Live::start(&header, &shared, Open::Load, owner)
+                })
+            })
+            .collect();
+        rt::block_on(async {
+            for (slot, started) in busy.iter().zip(starting) {
+                if let Err(e) = daemon.started(slot, started.await) {
+                    eprintln!(
+                        "session {}: loading for recovery: {e}",
+                        slot.header.id.short()
+                    );
+                }
             }
-        }
+        });
         Ok(Owner(daemon))
     }
 
@@ -368,18 +405,17 @@ impl Daemon {
                 let mut residency = lock(&slot.residency);
                 match &mut *residency {
                     Residency::Live(live) => return Ok(Arc::clone(live)),
-                    Residency::Loading { waiters } => {
+                    Residency::Loading { waiters, .. } => {
                         let (tx, rx) = oneshot::channel();
                         waiters.push(tx);
                         Some(rx)
                     }
-                    Residency::Stopping(_) | Residency::Hibernated { .. } => {
-                        let waiters = Vec::new();
-                        *residency = Residency::Loading { waiters };
-                        None
-                    }
+                    Residency::Stopping(_) | Residency::Hibernated { .. } => None,
                 }
             };
+            if wait.is_none() && !slot.loading() {
+                continue;
+            }
             return match wait {
                 Some(loaded) => loaded
                     .await
@@ -406,9 +442,14 @@ impl Daemon {
         let mut residency = lock(&slot.residency);
         let next = match &started {
             Ok(live) => Residency::Live(Arc::clone(live)),
-            Err(_) => Residency::Hibernated { last: None },
+            Err(_) => Residency::Hibernated {
+                last: match &*residency {
+                    Residency::Loading { last, .. } => last.clone(),
+                    _ => fresh(&slot.header),
+                },
+            },
         };
-        if let Residency::Loading { waiters } = std::mem::replace(&mut *residency, next) {
+        if let Residency::Loading { waiters, .. } = std::mem::replace(&mut *residency, next) {
             for waiter in waiters {
                 waiter.send(match &started {
                     Ok(live) => Ok(Arc::clone(live)),
@@ -487,7 +528,8 @@ impl Daemon {
     /// A slot for a session to create, `Loading` until it is.
     fn new_slot(&self, header: Header) -> Arc<Slot> {
         let waiters = Vec::new();
-        let slot = Slot::new(header, Residency::Loading { waiters });
+        let last = fresh(&header);
+        let slot = Slot::new(header, Residency::Loading { waiters, last });
         lock(&self.slots).push(Arc::clone(&slot));
         slot
     }
@@ -549,36 +591,13 @@ impl Daemon {
         }
     }
 
+    /// Every session as it lists, from memory: no log is read.
     fn list(&self) -> Vec<SessionSummary> {
         self.slots()
             .iter()
             .map(|slot| {
                 slot.ending();
-                let mut residency = lock(&slot.residency);
-                match &mut *residency {
-                    Residency::Live(live) => live.summary(),
-                    Residency::Stopping(live) => hibernated(live.summary()),
-                    Residency::Hibernated { last } => last
-                        .get_or_insert_with(|| SessionSummary {
-                            id: slot.header.id,
-                            workspace: slot.header.workspace.clone(),
-                            entries: self.shared.store.count(slot.header.id).unwrap_or(0),
-                            clients: 0,
-                            // Not loaded since the daemon started, so idle: one
-                            // with work has a busy marker, and loads.
-                            activity: Activity::Idle,
-                            residency: protocol::Residency::Hibernated,
-                        })
-                        .clone(),
-                    Residency::Loading { .. } => SessionSummary {
-                        id: slot.header.id,
-                        workspace: slot.header.workspace.clone(),
-                        entries: 0,
-                        clients: 0,
-                        activity: Activity::Idle,
-                        residency: protocol::Residency::Hibernated,
-                    },
-                }
+                slot.summary()
             })
             .collect()
     }
@@ -781,6 +800,11 @@ impl Daemon {
 }
 
 /// How a session unloaded lists: as it last was, with no clients.
+/// How a session just made lists.
+fn fresh(header: &Header) -> SessionSummary {
+    catalog::Record::new(header.clone()).summary()
+}
+
 fn hibernated(summary: SessionSummary) -> SessionSummary {
     SessionSummary {
         clients: 0,

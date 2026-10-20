@@ -114,14 +114,8 @@ pub trait LogStore: Send + Sync {
     fn entries(&self, id: SessionId) -> io::Result<Vec<Entry>>;
 
     /// The number of committed entries, without loading them.
+    #[cfg(test)]
     fn count(&self, id: SessionId) -> io::Result<u64>;
-
-    /// Marks a session as having work in flight. A marker that survives a
-    /// crash tells the next daemon to load that session at once and recover.
-    /// Setting or clearing it twice is harmless.
-    fn mark_busy(&self, id: SessionId, busy: bool) -> io::Result<()>;
-
-    fn is_busy(&self, id: SessionId) -> bool;
 }
 
 /// One session's appender.
