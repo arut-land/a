@@ -58,25 +58,33 @@ terminal thread ──Input / Resized──┐
  (poll: stdin + signal pipe)       ├─> inbox ─> event loop: App::event / App::input
 client::Driver ──client::Event─────┘               │   (SessionClient folds the view)
  (a reader thread per connection)                  ▼
-        App::draw ─> Canvas (ratatui Buffer, redrawn by the row) ─> Screen: changed cells as ANSI, one write
+        App::draw ─> Canvas (a cell grid, redrawn by the row) ─> Screen: changed cells as ANSI, one write
 ```
 
 The daemon side is the client SDK's (docs/client.md): `App` holds a
 `SessionClient`, hands it the driver's events and the person's commands,
 and renders the effects it gets back; what the TUI adds is screen state.
 
-The cells are ratatui's core (`ratatui-core`: `Buffer`, `Cell`, styles),
-with no widgets, no layout cache and not its `Terminal`. The terminal layer
-is ours and small: `term.rs` (raw mode through rustix termios, the modes,
-restoring them, the input thread), `keys.rs` (input bytes to keys on vte)
-and `screen.rs` (cells to ANSI). Also ours is what a chat transcript needs
-and no widget gives: wrapping cached per item, virtualized scrolling from an
-anchor, clickable spans, and the input editor.
+Everything under the view is ours and small. The text model (`text.rs`):
+a `Style` is the pen (a palette color, attributes: 3 bytes), a `Span` is a
+`SmolStr` (inline up to 23 bytes, shared past that) and a pen, a `Line` is
+up to four spans inline; a row clones without allocating. The grid
+(`render.rs`): a `Cell` is one character with the zero-width marks that
+follow it and its pen; `Grid::put` writes a cell a character, as `wrap`
+counted them. The terminal layer: `term.rs` (raw mode through rustix
+termios, the modes, restoring them, the input thread), `keys.rs` (input
+bytes to keys on vte) and `screen.rs` (cells to ANSI). And what a chat
+transcript needs and no widget gives: wrapping cached per item,
+virtualized scrolling from an anchor, clickable spans, and the input
+editor. `ratatui-core` was the grid until October 2026; it came with ten
+crates, three of them proc-macros, for `Buffer`, `Cell` and `Style`.
 
 - One thread owns the app and blocks on its `client::Inbox`. The terminal
   thread blocks in `poll` on stdin and a signal pipe with no timeout; the
   `Driver` reads each connection on a thread of its own. Nothing polls on
-  a timer. Everything queued is folded before one frame.
+  a timer. Everything queued is folded before one frame; what the terminal
+  thread posts (`Post::send_first`) is taken before the daemon's backlog,
+  so a keystroke or a resize is folded ahead of a replay still queued.
 - Signals (`sys::Signals`, the self-pipe trick: the handler writes one byte)
   reach that same `poll`: SIGWINCH is a resize, SIGTERM and SIGHUP restore
   the terminal and then end the process as the signal would have
@@ -96,7 +104,14 @@ anchor, clickable spans, and the input editor.
   clickable span landed (an overlay makes the transcript's inert).
 - `Screen` writes the changed cells: cursor moves only where the next cell
   is not where the cursor is, one SGR per style change, inside a
-  synchronized update (`?2026`), as one `write(2)` per frame.
+  synchronized update (`?2026`), as one `write(2)` per frame. The event
+  loop draws only when the app owes a frame (`App::needs_frame`: a view
+  change, a key, the link moving), so an ack, or a session list while no
+  picker is open, is not even composed; a frame that still changed no cell
+  and moved no cursor writes nothing, not even the envelope.
+- The rows under the transcript (recap, approval bar, notice, input,
+  status) and the overlay are composed once per frame: inline, `height`
+  composes them to size the viewport and `draw` draws the same ones.
 - Full screen: the alternate buffer, addressed absolutely, with click and
   wheel reports (SGR) only (`?1000`, `?1006`; not every motion, which would
   wake the client as the pointer moves).
@@ -116,18 +131,59 @@ anchor, clickable spans, and the input editor.
   line still open. What the bottom rows need of the whole transcript (the
   oldest ask, whether a turn runs, the latest model) is found once per
   change, not per frame.
-- Text of characters that are graphemes on their own (most of it) goes
-  into the buffer a cell a character; only the rest goes through ratatui's
-  grapheme segmentation.
+- Text goes into the grid a cell a character, the columns `wrap` counted
+  for it. A zero-width character (a combining mark, a variation selector)
+  joins the cell before it; joiners and format characters are dropped,
+  since the terminal would otherwise advance fewer columns than the grid
+  did.
 - The terminal is restored on exit, on a panic (a hook), when stdin
   closes, and on SIGTERM or SIGHUP.
-- The first frame is painted before the daemon is reached; connecting (and
-  spawning the daemon) happens on the reader thread. An ssh endpoint
+- The first frame is painted before the daemon is reached and before the
+  repository root is walked up to for the picker's default; connecting
+  (and spawning the daemon) happens on the reader thread. An ssh endpoint
   connects first, since ssh may prompt on the terminal.
 - Unix only, like the daemon: on Windows `tui` builds to a stub and `a`
   runs the line REPL.
 
 ## The terminal layer: measurements
+
+### The own grid and allocation-free rows
+
+20 October 2026, release profile with `build-std` (so the `alloc` level
+applies), Apple M3 under load, `render_cost` (6000 items, 120×40) in turns:
+before is `ratatui-core` with `String` spans and `alloc` at 3, after is the
+own grid with `SmolStr` spans and inline rows. Ranges are five runs each, in
+µs; the two `alloc` levels were run alternately, seven rounds.
+
+| | before, alloc 3 | after, alloc 3 | after, alloc s |
+| --- | --- | --- | --- |
+| first frame | 289–330 | 191–216 | 199–234 |
+| delta frame p50 / p99 | 35–51 / 117–161 | 20–24 / 94–109 | 21–24 / 97–109 |
+| scroll frame p50 / p99 | 80–101 / 104–184 | 68–83 / 83–103 | 75–80 / 90–98 |
+| re-wrap all (resize) | 240–316 | 156–184 | 170–186 |
+| allocations, delta (fold and frame) / idle frame | not counted | 47 / 16 | 47 / 16 |
+| bytes written, delta / idle frame | 222 / 16 | 222 / 0 | 222 / 0 |
+
+So `alloc` builds at s with everything else (`.cargo/profiles.toml` has
+one release level and `serde_json`): the two levels are indistinguishable
+on every row. What an idle frame still allocates is the bottom rows being
+formatted (status, approval bar, editor rows) and the transcript window;
+the canvas finds them unchanged and nothing is written.
+
+| | before | after |
+| --- | --- | --- |
+| Release `a` (`cargo build-release -p a`) | 2845 KiB | 2797 KiB (`alloc` at s alone: 2780) |
+| `mise run size` | 2829 KiB | 2813 KiB |
+| Packages in `cargo tree -p a` (host) | 141 | 120 |
+| Proc-macro crates in that graph | 9 | 6 |
+| Idle client RSS (budgets) | 7.5–7.6 MB | 7.4 MB |
+
+Gone: ratatui-core, kasuari, lru, strum, strum_macros, thiserror,
+thiserror-impl, compact_str, castaway, rustversion, unicode-truncate,
+unicode-segmentation, itertools, foldhash. Came (both linked already):
+smol_str, smallvec. `syn 2` stays for `hypertext-macros` alone.
+
+### Before that: the terminal layer
 
 October 2026, release profile (fat LTO, one codegen unit, `build-std`,
 stripped), Apple M3, `nightly-2026-10-17`, on a loaded machine.
@@ -201,12 +257,19 @@ encoder) is what rustix and vte, linked already, leave to write.
 
 ## Tests
 
-- Unit tests draw the app onto its canvas and read the buffer's rows
+- Unit tests draw the app onto its canvas and read the grid's rows
   (`app/tests.rs`, `view.rs`, `text.rs`, `editor.rs`, `render.rs`):
   approvals by key and click, streaming, folding, scrolling with an
   anchor, slash commands, the picker, the recap, the inline scrollback,
   tiny sizes. Every test frame is also drawn on a blank canvas and must
   match: the rows a frame kept are the ones it would have drawn.
+- The frame invariants, on a terminal that counts `write(2)` calls, over
+  a session's frames in both viewports: `one_write_per_frame`,
+  `an_idle_frame_writes_nothing`, and `no_terminal_queries` (every byte
+  written is a cursor move, an erase, an SGR or a mode: nothing the
+  terminal would answer). `first_frame_before_the_daemon_answers`
+  (`apps/cli/tests/tui.rs`) holds the daemon's socket with a listener that
+  never answers and sees the frame; the pty harness answers no query.
 - `keys.rs` decodes byte sequences (keys with modifiers, Alt, SS3, F-keys,
   `CSI u`, UTF-8 and sequences split across reads, mouse reports, pastes);
   `screen.rs` checks the SGR it writes; `sys` checks a caught signal
@@ -222,8 +285,9 @@ encoder) is what rustix and vte, linked already, leave to write.
 
 ## Limits
 
-- Wrapping counts columns per character while ratatui draws per grapheme,
-  so an emoji ZWJ sequence may wrap a little early.
+- Wrapping and drawing count columns per character, so an emoji ZWJ
+  sequence shows as its parts (`👨‍👩‍👧` as three faces), as wide as it was
+  counted.
 - SIGKILL leaves the terminal in raw mode (`reset` fixes it).
 - Ctrl-Z is not handled (raw mode receives it as a key).
 - Inline, a terminal that reflows its lines when narrowed may leave a

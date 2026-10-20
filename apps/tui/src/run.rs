@@ -14,13 +14,12 @@ use super::screen::{Screen, Stdout};
 use super::term::{self, Terminal};
 
 pub fn run(daemon: &Daemon, target: Target, viewport: Viewport) -> io::Result<()> {
-    let workspace = sys::workspace_of(&std::env::current_dir()?);
     let (tx, rx) = client::inbox();
     let events = tx.clone();
     let driver = Driver::new(daemon.clone(), move |_, event| {
         let _ = events.send(Event::Client(event));
     });
-    let mut app = App::new(viewport, workspace, &target);
+    let mut app = App::new(viewport, &target);
     let first = app.client.open(target);
     // ssh may ask for a password on the terminal: let it, before the
     // terminal is ours.
@@ -50,8 +49,12 @@ pub fn run(daemon: &Daemon, target: Target, viewport: Viewport) -> io::Result<()
         app,
         screen: Screen::new(viewport, Stdout::default()),
     };
-    // The first frame goes out before the daemon is even reached.
+    // The first frame goes out before the daemon is even reached, or the
+    // git root walked up to.
     client.draw()?;
+    client
+        .app
+        .in_workspace(sys::workspace_of(&std::env::current_dir()?));
     term::spawn_input(tx, signals);
     client.driver.pump(&mut client.app, first);
     let exit = client.run(&rx);
@@ -76,6 +79,9 @@ enum Exit {
     Quit,
 }
 
+/// Ctrl-L: the next frame is drawn whole.
+struct Redraw;
+
 struct Client {
     driver: Driver,
     app: App,
@@ -84,14 +90,16 @@ struct Client {
 
 impl Client {
     /// Blocks for the next event, folds in everything else already queued,
-    /// applies what it asks for, then draws one frame.
+    /// applies what it asks for, then draws one frame if any of it shows:
+    /// an ack, or a list no picker is open for, draws nothing.
     fn run(&mut self, rx: &Inbox<Event>) -> io::Result<Exit> {
         while let Some(first) = rx.recv() {
             let mut effects = Vec::new();
+            let mut whole = false;
             for event in std::iter::once(first).chain(std::iter::from_fn(|| rx.try_recv())) {
                 match event {
                     Event::Input(input) => effects.extend(self.app.input(input)),
-                    Event::Resized => self.screen.invalidate(),
+                    Event::Resized => whole = true,
                     Event::InputClosed => effects.push(Effect::Detach),
                     Event::Client(event) => {
                         let stepped = self.app.client.step(event);
@@ -100,37 +108,42 @@ impl Client {
                 }
             }
             for effect in effects {
-                if let Some(exit) = self.effect(effect) {
-                    return Ok(exit);
+                match self.effect(effect) {
+                    Ok(Some(exit)) => return Ok(exit),
+                    Ok(None) => {}
+                    Err(Redraw) => whole = true,
                 }
             }
-            self.draw()?;
+            if whole {
+                self.screen.invalidate();
+            }
+            if whole || self.app.needs_frame() {
+                self.draw()?;
+            }
         }
         Ok(Exit::Quit)
     }
 
-    fn effect(&mut self, effect: Effect) -> Option<Exit> {
+    /// `Err(Redraw)` asks for the next frame whole.
+    fn effect(&mut self, effect: Effect) -> Result<Option<Exit>, Redraw> {
         let asked = match effect {
             Effect::Cmd(cmd) => self.app.command(cmd),
             Effect::Restart => self.app.client.restart(),
-            Effect::Redraw => {
-                self.screen.invalidate();
-                Vec::new()
-            }
+            Effect::Redraw => return Err(Redraw),
             Effect::Detach => {
                 let exit = match self.app.client.link() {
-                    Link::Ended(End::Lost(why)) => return Some(Exit::Lost(why.clone())),
+                    Link::Ended(End::Lost(why)) => return Ok(Some(Exit::Lost(why.clone()))),
                     link if link.up() => Exit::Detached,
                     _ => Exit::Quit,
                 };
                 let asked = self.app.command(Cmd::Detach);
                 self.driver.pump(&mut self.app, asked);
-                return Some(exit);
+                return Ok(Some(exit));
             }
-            Effect::Quit => return Some(Exit::Quit),
+            Effect::Quit => return Ok(Some(Exit::Quit)),
         };
         self.driver.pump(&mut self.app, asked);
-        None
+        Ok(None)
     }
 
     fn draw(&mut self) -> io::Result<()> {

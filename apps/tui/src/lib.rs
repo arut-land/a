@@ -1,7 +1,7 @@
 //! `a`'s terminal client: full screen on the alternate buffer with the
 //! mouse, or (`A_TUI=inline`) a viewport under the shell's scrollback. Both
-//! draw the shared reducer's view into ratatui's cell buffer and write what
-//! changed as ANSI themselves; see `docs/tui.md`.
+//! draw the shared reducer's view into a cell grid of their own and write
+//! what changed as ANSI; see `docs/tui.md`.
 //! Its own crate so it builds for size, like the web UI: it draws at the
 //! pace of one person's typing.
 //!

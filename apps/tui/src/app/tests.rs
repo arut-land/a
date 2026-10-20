@@ -1,11 +1,11 @@
+use std::alloc::{GlobalAlloc, Layout, System};
 use std::path::PathBuf;
+use std::sync::atomic::{AtomicUsize, Ordering::Relaxed};
 
 use protocol::{
     Activity, Body, Card, ClientMsg, DaemonMsg, Entry, Outcome, Residency, SessionId,
     SessionSummary, Target,
 };
-use ratatui_core::buffer::Buffer;
-use ratatui_core::style::Modifier;
 use serde_json::json;
 
 use client::{Cmd, Event, EventKind, Io, Welcome};
@@ -13,8 +13,9 @@ use protocol::{Audience, Caps, Json};
 
 use super::{App, Effect};
 use crate::keys::{Input, Key, Mouse};
-use crate::render::{Viewport, rows};
-use crate::text::Line;
+use crate::render::{Grid, Viewport};
+use crate::screen::Screen;
+use crate::text::{Line, Modifier};
 
 fn ws() -> PathBuf {
     PathBuf::from("/work/project")
@@ -27,7 +28,8 @@ fn entry(seq: u64, body: Body) -> DaemonMsg {
 /// An app attached to a fresh session, with `msgs` folded in.
 fn app(viewport: Viewport, msgs: &[DaemonMsg]) -> (App, SessionId) {
     let session = SessionId::new();
-    let mut app = App::new(viewport, ws(), &Target::New);
+    let mut app = App::new(viewport, &Target::New);
+    app.in_workspace(ws());
     connect(&mut app, false);
     app.fold(&DaemonMsg::Attached {
         session,
@@ -59,22 +61,22 @@ fn connect(app: &mut App, remote: bool) {
 }
 
 /// A frame: its cells, where the caret shows (if it does), and its rows.
-struct Screen {
-    buf: Buffer,
+struct Drawn {
+    grid: Grid,
     caret: Option<(u16, u16)>,
 }
 
 /// Draws a frame, and checks it is what drawing it on a blank canvas gives:
 /// the rows kept from the frame before are the ones it would draw.
-fn frame(app: &mut App, w: u16, h: u16) -> (Screen, Vec<String>) {
+fn frame(app: &mut App, w: u16, h: u16) -> (Drawn, Vec<String>) {
     let caret = app.draw(w, h);
-    let buf = app.canvas().buffer().clone();
+    let grid = app.canvas().grid().clone();
     let kept = std::mem::take(&mut app.canvas);
     assert_eq!(app.draw(w, h), caret);
-    assert_eq!(app.canvas().buffer(), &buf, "kept rows are stale");
+    assert_eq!(app.canvas().grid(), &grid, "kept rows are stale");
     app.canvas = kept;
-    let rows = rows(&buf);
-    (Screen { buf, caret }, rows)
+    let rows = grid.rows();
+    (Drawn { grid, caret }, rows)
 }
 
 fn find(rows: &[String], text: &str) -> (u16, u16) {
@@ -219,7 +221,7 @@ fn a_streamed_reply_shows_live_then_its_committed_text() {
     let (screen, rows) = frame(&mut app, 50, 12);
     let (x, y) = find(&rows, "Hello you▍");
     assert!(
-        screen.buf[(x + 6, y)].modifier.contains(Modifier::BOLD),
+        screen.grid[(x + 6, y)].style.mods.contains(Modifier::BOLD),
         "markdown bold"
     );
     find(&rows, "● live");
@@ -375,7 +377,7 @@ fn ctrl_c_clears_the_input_then_detaches() {
         press(&mut app, Key::Ctrl('c')),
         Some(Effect::Detach)
     ));
-    let mut unattached = App::new(Viewport::Full, ws(), &Target::New);
+    let mut unattached = App::new(Viewport::Full, &Target::New);
     assert!(matches!(
         press(&mut unattached, Key::Ctrl('c')),
         Some(Effect::Quit)
@@ -524,10 +526,11 @@ fn slash_commands() {
         residency: Residency::Loaded,
         read_only: None,
     };
+    // As the daemon lists them: newest first, which the picker keeps.
     app.fold(&DaemonMsg::Sessions {
         sessions: vec![
-            summary(other, "/elsewhere", Activity::Idle),
             summary(current, "/work/project", Activity::Approval),
+            summary(other, "/elsewhere", Activity::Idle),
         ],
     });
     let (_, rows) = frame(&mut app, 80, 14);
@@ -544,11 +547,11 @@ fn slash_commands() {
 fn resuming_where_there_is_no_session_opens_the_picker() {
     let mut app = App::new(
         Viewport::Full,
-        ws(),
         &Target::Latest {
             any_workspace: false,
         },
     );
+    app.in_workspace(ws());
     connect(&mut app, false);
     let effects = app.fold(&DaemonMsg::Error {
         message: "no matching session".into(),
@@ -620,10 +623,187 @@ fn draws_at_tiny_sizes_without_panicking() {
     frame(&mut app, 10, 4);
 }
 
+/// A terminal and what it was sent: `write(2)` calls and bytes.
+#[derive(Clone, Default)]
+struct Term(std::rc::Rc<std::cell::RefCell<(usize, Vec<u8>)>>);
+
+impl Term {
+    /// The writes since last asked, and their bytes.
+    fn take(&self) -> (usize, Vec<u8>) {
+        std::mem::take(&mut *self.0.borrow_mut())
+    }
+}
+
+impl std::io::Write for Term {
+    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        let mut out = self.0.borrow_mut();
+        out.0 += 1;
+        out.1.extend_from_slice(buf);
+        Ok(buf.len())
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
+}
+
+/// The frames a session goes through on `viewport`, drawn on `screen`:
+/// each step's writes and bytes.
+fn session(viewport: Viewport) -> Vec<(&'static str, usize, Vec<u8>)> {
+    let (mut app, _) = app(viewport, &asked_command());
+    let term = Term::default();
+    let mut screen = Screen::new(viewport, term.clone());
+    let mut out = Vec::new();
+    let mut step = |what, app: &mut App, screen: &mut Screen<Term>, size| {
+        screen.draw(app, size).unwrap();
+        let (writes, bytes) = term.take();
+        out.push((what, writes, bytes));
+    };
+    step("first", &mut app, &mut screen, (80, 24));
+    step("idle", &mut app, &mut screen, (80, 24));
+    app.fold(&DaemonMsg::Ack { client_seq: 1 });
+    step("ack", &mut app, &mut screen, (80, 24));
+    app.fold(&DaemonMsg::Sessions {
+        sessions: Vec::new(),
+    });
+    step("sessions, no picker", &mut app, &mut screen, (80, 24));
+    app.fold(&entry(
+        5,
+        Body::ToolResult {
+            call: 3,
+            outcome: Outcome::Done {
+                output: Json::encode(&json!({"output": "a\n", "exit": 0})).unwrap(),
+            },
+            card: Some(Card {
+                title: "$ ls".into(),
+                body: "a\n".into(),
+                note: "exit 0".into(),
+            }),
+        },
+    ));
+    step("result", &mut app, &mut screen, (80, 24));
+    press(&mut app, Key::Char('x'));
+    step("key", &mut app, &mut screen, (80, 24));
+    press(&mut app, Key::F(1));
+    step("overlay", &mut app, &mut screen, (80, 24));
+    press(&mut app, Key::Esc);
+    screen.invalidate();
+    step("ctrl-l", &mut app, &mut screen, (80, 24));
+    step("resize", &mut app, &mut screen, (60, 20));
+    step("idle again", &mut app, &mut screen, (60, 20));
+    screen.close().unwrap();
+    let (writes, bytes) = term.take();
+    out.push(("close", writes, bytes));
+    out
+}
+
+#[test]
+fn one_write_per_frame() {
+    for viewport in [Viewport::Full, Viewport::Inline] {
+        for (what, writes, bytes) in session(viewport) {
+            assert!(writes <= 1, "{viewport:?} {what}: {writes} writes");
+            if writes == 1 && what != "close" {
+                assert!(
+                    bytes.starts_with(b"\x1b[?2026h") && bytes.ends_with(b"\x1b[?2026l"),
+                    "{viewport:?} {what}: not one synchronized update: {bytes:?}"
+                );
+            }
+        }
+    }
+}
+
+/// The event loop draws a frame only when the app says one is owed: an
+/// ack, or a list no picker shows, costs no frame; a delta, a key or the
+/// link changing owes one, which drawing pays.
+#[test]
+fn only_what_shows_owes_a_frame() {
+    let (mut app, _) = app(Viewport::Full, &asked_command());
+    assert!(app.needs_frame());
+    app.draw(80, 24);
+    assert!(!app.needs_frame());
+    app.fold(&DaemonMsg::Ack { client_seq: 1 });
+    app.fold(&DaemonMsg::Sessions {
+        sessions: Vec::new(),
+    });
+    assert!(!app.needs_frame());
+    app.fold(&DaemonMsg::Delta {
+        call: 2,
+        text: "hi".into(),
+        attempt: 0,
+    });
+    assert!(app.needs_frame());
+    app.draw(80, 24);
+    press(&mut app, Key::Char('x'));
+    assert!(app.needs_frame());
+    app.draw(80, 24);
+    typed(&mut app, "/sessions");
+    assert!(app.needs_frame());
+}
+
+/// A frame that shows nothing new is not written: no envelope, no
+/// `write(2)`, so an ack or a list nothing shows costs no wake of the
+/// terminal.
+#[test]
+fn an_idle_frame_writes_nothing() {
+    for viewport in [Viewport::Full, Viewport::Inline] {
+        for (what, writes, bytes) in session(viewport) {
+            if what == "close" {
+                continue;
+            }
+            let idle = matches!(what, "idle" | "ack" | "sessions, no picker" | "idle again");
+            assert_eq!(
+                idle,
+                writes == 0 && bytes.is_empty(),
+                "{viewport:?} {what}: {writes} writes, {bytes:?}"
+            );
+        }
+    }
+}
+
+/// The client writes cursor moves, erases, SGR and modes, and nothing the
+/// terminal would answer (no cursor position, attribute or color query):
+/// a frame never waits on the terminal.
+#[test]
+fn no_terminal_queries() {
+    use crate::term::{ENTER, ENTER_FULL, LEAVE, LEAVE_FULL};
+    let mut all = vec![
+        ENTER.to_vec(),
+        ENTER_FULL.to_vec(),
+        LEAVE.to_vec(),
+        LEAVE_FULL.to_vec(),
+    ];
+    for viewport in [Viewport::Full, Viewport::Inline] {
+        all.extend(session(viewport).into_iter().map(|(_, _, bytes)| bytes));
+    }
+    for bytes in all {
+        let text = String::from_utf8(bytes).unwrap();
+        let mut chars = text.chars();
+        while let Some(c) = chars.next() {
+            if c != '\x1b' {
+                assert!(
+                    !c.is_control() || matches!(c, '\r' | '\n'),
+                    "{c:?} in {text:?}"
+                );
+                continue;
+            }
+            assert_eq!(chars.next(), Some('['), "not a CSI in {text:?}");
+            let fin = chars
+                .by_ref()
+                .find(|c| ('\x40'..='\x7e').contains(c))
+                .unwrap();
+            assert!(
+                matches!(fin, 'A' | 'B' | 'G' | 'H' | 'J' | 'K' | 'h' | 'l' | 'm'),
+                "CSI {fin} in {text:?}"
+            );
+        }
+    }
+}
+
 /// Render cost on a long transcript, measured rather than checked:
 /// `cargo test --release -p tui -- --ignored --nocapture render_cost`.
 #[test]
 #[ignore = "a measurement"]
+#[allow(clippy::too_many_lines)]
 fn render_cost() {
     use std::time::Instant;
 
@@ -681,17 +861,17 @@ fn render_cost() {
     ));
     let (mut app, _) = app(Viewport::Full, &msgs);
     // What a frame writes, as the client writes it.
-    let count = Count::default();
-    let mut screen = crate::screen::Screen::new(Viewport::Full, count.clone());
+    let term = Term::default();
+    let mut screen = Screen::new(Viewport::Full, term.clone());
     let mut frame = |app: &mut App, w: u16| {
-        let before = count.0.get();
         screen.draw(app, (w, 40)).unwrap();
-        count.0.get() - before
+        term.take().1.len()
     };
     let t = Instant::now();
     frame(&mut app, 120);
     let first = t.elapsed();
     let (mut delta, mut bytes) = (Vec::new(), 0);
+    let allocs = ALLOCS.load(Relaxed);
     for i in 0..500 {
         let t = Instant::now();
         app.fold(&DaemonMsg::Delta {
@@ -702,6 +882,12 @@ fn render_cost() {
         bytes += frame(&mut app, 120);
         delta.push(t.elapsed());
     }
+    let delta_allocs = (ALLOCS.load(Relaxed) - allocs) / 500;
+    let allocs = ALLOCS.load(Relaxed);
+    for _ in 0..100 {
+        frame(&mut app, 120);
+    }
+    let idle_allocs = (ALLOCS.load(Relaxed) - allocs) / 100;
     let mut scroll = Vec::new();
     for _ in 0..500 {
         let t = Instant::now();
@@ -715,7 +901,8 @@ fn render_cost() {
     delta.sort();
     scroll.sort();
     eprintln!(
-        "6000 items: first frame {first:?}; delta frame p50 {:?} p99 {:?}, {} bytes; \
+        "6000 items: first frame {first:?}; delta frame p50 {:?} p99 {:?}, {} bytes, \
+         {delta_allocs} allocs (fold and frame); idle frame {idle_allocs} allocs; \
          scroll frame p50 {:?} p99 {:?}; resize (re-wrap all) {rewrap:?}",
         delta[250],
         delta[495],
@@ -725,17 +912,32 @@ fn render_cost() {
     );
 }
 
-/// Counts the bytes a terminal is sent.
-#[derive(Clone, Default)]
-struct Count(std::rc::Rc<std::cell::Cell<usize>>);
+static ALLOCS: AtomicUsize = AtomicUsize::new(0);
 
-impl std::io::Write for Count {
-    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
-        self.0.set(self.0.get() + buf.len());
-        Ok(buf.len())
+/// Counts allocations for `render_cost`; the system allocator does the work.
+struct Counting;
+
+// SAFETY: every call is forwarded to `System` with the same arguments, so
+// the contract the caller upheld for this allocator holds for it.
+#[allow(unsafe_code)]
+unsafe impl GlobalAlloc for Counting {
+    unsafe fn alloc(&self, layout: Layout) -> *mut u8 {
+        ALLOCS.fetch_add(1, Relaxed);
+        // SAFETY: the caller's `layout`, forwarded.
+        unsafe { System.alloc(layout) }
     }
 
-    fn flush(&mut self) -> std::io::Result<()> {
-        Ok(())
+    unsafe fn dealloc(&self, ptr: *mut u8, layout: Layout) {
+        // SAFETY: `ptr` came from `System.alloc` with this `layout`.
+        unsafe { System.dealloc(ptr, layout) }
+    }
+
+    unsafe fn realloc(&self, ptr: *mut u8, layout: Layout, new: usize) -> *mut u8 {
+        ALLOCS.fetch_add(1, Relaxed);
+        // SAFETY: `ptr` came from `System.alloc` with this `layout`.
+        unsafe { System.realloc(ptr, layout, new) }
     }
 }
+
+#[global_allocator]
+static COUNTING: Counting = Counting;

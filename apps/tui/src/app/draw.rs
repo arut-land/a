@@ -1,19 +1,28 @@
 //! Frames: the transcript, what sits under it, and overlays.
 
+use std::fmt::Write as _;
 use std::path::Path;
 
 use client::{End, Link};
 use protocol::view::{Item, Usage, call_title, recap_line};
 
-use ratatui_core::style::{Color, Style};
-
 use super::super::render::{Canvas, Viewport, ellipsize, fit};
-use super::super::text::{Action, Line, Span, sanitize, width_of, wrap};
+use super::super::text::{Action, Color, Line, SmolStr, Span, Style, sanitize, width_of, wrap};
 use super::super::view::{self, ASK, MUTED, USER};
 use super::{App, HELP, Overlay};
 
 /// The input shows at most this many rows; it scrolls past them.
 const INPUT_ROWS: usize = 8;
+
+/// The rows under the transcript and over it, composed once per frame:
+/// inline, `height` composes them to size the viewport and `draw` then
+/// draws the same ones.
+pub struct Composed {
+    width: usize,
+    bottom: Vec<Line>,
+    caret: Option<(u16, u16)>,
+    overlay: Option<Vec<Line>>,
+}
 
 impl App {
     /// Inline: the rows of the items that will not change any more, to
@@ -48,10 +57,35 @@ impl App {
         out
     }
 
+    /// What a `width`-wide frame shows besides the transcript, composed
+    /// now unless this frame composed it already.
+    fn composed(&mut self, width: usize) -> Composed {
+        match self.composed.take() {
+            Some(composed) if composed.width == width => composed,
+            _ => self.compose(width),
+        }
+    }
+
+    fn compose(&mut self, width: usize) -> Composed {
+        let (bottom, caret) = self.bottom(width);
+        // An overlay is boxed on the full screen, bare inline.
+        let overlay = match self.viewport {
+            Viewport::Full => self.overlay_lines(width.saturating_sub(4)),
+            Viewport::Inline => self.overlay_lines(width),
+        };
+        Composed {
+            width,
+            bottom,
+            caret,
+            overlay,
+        }
+    }
+
     /// The rows under the transcript (the recap, the oldest approval, a
     /// notice, the input, the status line) and the caret's (x, row).
     fn bottom(&mut self, width: usize) -> (Vec<Line>, Option<(u16, u16)>) {
         let summary = self.summary();
+        let rule = self.rule(width);
         let mut out = Vec::new();
         if let Some(recap) = self
             .client
@@ -87,7 +121,7 @@ impl App {
         {
             let call_text = call_title(tool, input, card.as_ref()).replace('\n', " ");
             let room = width.saturating_sub("? approve   [ y  yes ]  [ n  no ]".len());
-            out.push(Line::from(vec![
+            out.push(Line::from([
                 Span::new(format!("? approve {}  ", ellipsize(&call_text, room)), ASK),
                 Span::button(
                     "[ y  yes ]",
@@ -105,7 +139,7 @@ impl App {
         if let Some((text, style)) = &self.flash {
             out.push(Line::plain(ellipsize(text, width), *style));
         }
-        out.push(Line::plain("─".repeat(width), MUTED));
+        out.push(rule);
         let (mut rows, (cx, cy)) = self.editor.lines(width, USER);
         if self.editor.is_empty() {
             // From the column after the caret, which would hide a first
@@ -136,49 +170,59 @@ impl App {
         (out, caret)
     }
 
+    /// The rule over the input, kept from frame to frame at one width.
+    fn rule(&mut self, width: usize) -> Line {
+        if self.rule.width() != width {
+            self.rule = Line::plain("─".repeat(width), MUTED);
+        }
+        self.rule.clone()
+    }
+
     fn status(&self, width: usize, reply: Option<usize>) -> Line {
         let attached = self.client.view().session.is_some();
-        let (state, style) = match self.client.link() {
+        let (state, style): (SmolStr, Style) = match self.client.link() {
             Link::Ended(End::Lost(why)) => (
-                format!("✗ disconnected: {why}"),
+                format!("✗ disconnected: {why}").into(),
                 Style::new().fg(Color::Red),
             ),
-            Link::Ended(End::Detached) => ("○ detached".to_owned(), MUTED),
+            Link::Ended(End::Detached) => ("○ detached".into(), MUTED),
             Link::Wedged(_) => (
-                "✗ the daemon is not responding".to_owned(),
+                "✗ the daemon is not responding".into(),
                 Style::new().fg(Color::Red),
             ),
             Link::Reconnecting { .. } | Link::Draining => (
-                "↻ daemon upgrading; reconnecting".to_owned(),
+                "↻ daemon upgrading; reconnecting".into(),
                 Style::new().fg(Color::Yellow),
             ),
-            Link::Connecting => ("◌ connecting".to_owned(), MUTED),
+            Link::Connecting => ("◌ connecting".into(), MUTED),
             Link::Replaying { .. } | Link::Live { .. } if !attached => {
-                ("○ not attached".to_owned(), MUTED)
+                ("○ not attached".into(), MUTED)
             }
-            Link::Replaying { .. } => ("↻ replaying".to_owned(), Style::new().fg(Color::Blue)),
-            Link::Live { .. } => ("● live".to_owned(), Style::new().fg(Color::Green)),
+            Link::Replaying { .. } => ("↻ replaying".into(), Style::new().fg(Color::Blue)),
+            Link::Live { .. } => ("● live".into(), Style::new().fg(Color::Green)),
         };
-        let mut left = vec![Span::new(state, style)];
+        let mut line = Line::from([Span::new(state, style)]);
         if let Some(session) = self.client.view().session {
-            left.push(Span::new(
+            line.spans.push(Span::new(
                 format!("  {}", session.short()),
                 Style::new().bold(),
             ));
         }
         let model = reply.and_then(|i| match &self.client.view().items[i] {
-            Item::Reply { model, .. } => Some(model.clone()),
+            Item::Reply { model, .. } => Some(model.as_str()),
             _ => None,
         });
-        let mut right = Vec::new();
-        right.extend(model);
+        let mut right = String::new();
+        if let Some(model) = model {
+            right.push_str(model);
+            right.push_str("  ");
+        }
         let Usage { input, output } = self.tokens;
         if input + output > 0 {
-            right.push(format!("↑{input} ↓{output}"));
+            let _ = write!(right, "↑{input} ↓{output}  ");
         }
-        right.push("F1 help".to_owned());
-        let right = right.join("  ");
-        let used: usize = left.iter().map(|s| width_of(&s.text)).sum();
+        right.push_str("F1 help");
+        let used = line.width();
         // The session's title, else its workspace, gets what room is left.
         let room = width.saturating_sub(used + width_of(&right) + 4);
         let view = self.client.view();
@@ -187,13 +231,12 @@ impl App {
                 Some(title) => (sanitize(title).replace('\n', " "), Style::new()),
                 None => (tilde(&view.workspace), MUTED),
             };
-            left.push(Span::new(
+            line.spans.push(Span::new(
                 format!("  {}", ellipsize(&place.0, room)),
                 place.1,
             ));
         }
-        let used: usize = left.iter().map(|s| width_of(&s.text)).sum();
-        let mut line = Line::from(left);
+        let used = line.width();
         if used + width_of(&right) < width {
             line.spans.push(Span::new(
                 " ".repeat(width - used - width_of(&right)),
@@ -236,14 +279,14 @@ impl App {
                     } else {
                         Style::new()
                     };
-                    out.push(Line::from(vec![Span::button(
+                    out.push(Line::from([Span::button(
                         fit(&text, width),
                         style,
                         Action::Pick(n),
                     )]));
                 }
                 out.push(Line::default());
-                out.push(Line::from(vec![
+                out.push(Line::from([
                     Span::new("enter opens  ", MUTED),
                     Span::button(
                         "[ n  new session ]",
@@ -258,13 +301,13 @@ impl App {
                 out.push(Line::plain("keys and commands", Style::new().bold()));
                 let keys = HELP.iter().map(|&(key, what)| (key.to_owned(), what));
                 for (key, what) in keys.chain(client::help(self.client.commands())) {
-                    out.push(Line::from(vec![
+                    out.push(Line::from([
                         Span::new(fit(&key, 22), Style::new().fg(Color::Cyan)),
-                        Span::new(what.to_owned(), Style::new()),
+                        Span::new(what, Style::new()),
                     ]));
                 }
                 out.push(Line::default());
-                out.push(Line::from(vec![Span::button(
+                out.push(Line::from([Span::button(
                     "[ any key  close ]",
                     MUTED,
                     Action::Dismiss,
@@ -279,7 +322,7 @@ impl App {
                     out.push(Line::plain(ellipsize(&format!("│ {line}"), width), MUTED));
                 }
                 out.push(Line::default());
-                out.push(Line::from(vec![
+                out.push(Line::from([
                     Span::button(
                         "[ r  restart the daemon ]",
                         Style::new().bold(),
@@ -301,21 +344,24 @@ impl App {
             return h;
         }
         let width = usize::from(w);
-        let (bottom, _) = self.bottom(width);
+        let composed = self.composed(width);
         let cap = usize::from(h / 2).max(3);
-        let live = match self.overlay_lines(width) {
+        let live = match &composed.overlay {
             Some(lines) => lines.len(),
             None => self.live(width, cap).len(),
         };
-        u16::try_from(bottom.len() + live.min(cap))
+        let height = u16::try_from(composed.bottom.len() + live.min(cap))
             .unwrap_or(h)
-            .min(h)
+            .min(h);
+        self.composed = Some(composed);
+        height
     }
 
     /// Draws a `w` × `h` frame on the app's canvas, which keeps the rows
     /// drawn as before and notes where buttons are; returns where the
     /// caret goes, if it shows.
     pub fn draw(&mut self, w: u16, h: u16) -> Option<(u16, u16)> {
+        self.redraw = false;
         let mut canvas = std::mem::take(&mut self.canvas);
         canvas.begin(w, h);
         let caret = self.frame(&mut canvas);
@@ -330,14 +376,17 @@ impl App {
     }
 
     fn frame(&mut self, canvas: &mut Canvas) -> Option<(u16, u16)> {
-        let area = canvas.area();
-        let width = usize::from(area.width);
-        let (bottom, caret) = self.bottom(width);
-        let body = area
-            .height
-            .saturating_sub(u16::try_from(bottom.len()).unwrap_or(u16::MAX));
+        let (w, h) = canvas.size();
+        let width = usize::from(w);
+        let Composed {
+            bottom,
+            caret,
+            overlay,
+            ..
+        } = self.composed(width);
+        let body = h.saturating_sub(u16::try_from(bottom.len()).unwrap_or(u16::MAX));
         (self.width, self.body) = (width, body);
-        match (self.viewport, self.overlay_lines(width.saturating_sub(4))) {
+        match (self.viewport, overlay) {
             (Viewport::Inline, Some(lines)) => {
                 let skip = lines.len().saturating_sub(usize::from(body));
                 for (y, line) in (0..body).zip(lines.iter().skip(skip)) {
@@ -361,7 +410,8 @@ impl App {
     }
 
     fn transcript(&mut self, canvas: &mut Canvas, body: u16, viewport: Viewport) {
-        let (width, rows) = (usize::from(canvas.area().width), usize::from(body));
+        let (w, _) = canvas.size();
+        let (width, rows) = (usize::from(w), usize::from(body));
         let shown = match viewport {
             Viewport::Full => self.window(width, rows),
             Viewport::Inline => self.live(width, rows),
@@ -374,22 +424,19 @@ impl App {
             }
         }
         if self.anchor.is_some() && body > 0 {
-            let more = Line::from(vec![Span::button(
+            let more = Line::from([Span::button(
                 " ↓ newer below · esc ",
                 Style::new().fg(Color::Cyan).reversed(),
                 Action::Bottom,
             )]);
-            let x = canvas
-                .area()
-                .width
-                .saturating_sub(u16::try_from(more.width()).unwrap_or(0));
+            let x = w.saturating_sub(u16::try_from(more.width()).unwrap_or(0));
             canvas.line(x, body - 1, &more);
         }
     }
 
     /// Draws `lines` in a bordered box centered over the top `body` rows.
     fn boxed(&self, canvas: &mut Canvas, body: u16, lines: &[Line]) {
-        let width = canvas.area().width;
+        let (width, _) = canvas.size();
         let w = width.min(84);
         let h = u16::try_from(lines.len() + 2).unwrap_or(u16::MAX).min(body);
         if w < 8 || h < 3 {
@@ -422,7 +469,7 @@ fn clip(line: &Line, cols: usize) -> Line {
         let w = width_of(&span.text);
         if used + w > cols {
             out.spans.push(Span {
-                text: ellipsize(&span.text, cols - used),
+                text: ellipsize(&span.text, cols - used).into(),
                 ..span.clone()
             });
             break;

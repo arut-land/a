@@ -11,16 +11,14 @@ mod tests;
 use std::collections::HashSet;
 use std::path::PathBuf;
 
-use client::{Cmd, Env, Link, Renderer, SessionClient, Show};
-use protocol::view::{Change, Item, SessionView, Update, Usage};
-use protocol::{SessionSummary, Target};
-use ratatui_core::style::{Color, Style};
-
 use super::editor::{Edit, Editor};
 use super::keys::{Input, Key, Mouse};
 use super::render::{Canvas, Viewport};
-use super::text::{Action, Line};
+use super::text::{Action, Color, Line, Style};
 use super::view::{Live, MUTED};
+use client::{Cmd, Env, Link, Renderer, SessionClient, Show};
+use protocol::view::{Change, Item, SessionView, Update, Usage};
+use protocol::{SessionSummary, Target};
 
 /// What the event loop does for the app.
 #[derive(Debug, PartialEq, Eq)]
@@ -64,6 +62,8 @@ struct Rows {
     live: Option<Live>,
 }
 
+// Screen toggles and the frame owed, each read where it is set.
+#[allow(clippy::struct_excessive_bools)]
 pub struct App {
     pub client: SessionClient,
     viewport: Viewport,
@@ -86,6 +86,10 @@ pub struct App {
     recap_hidden: bool,
     /// The last frame, and where its buttons are.
     canvas: Canvas,
+    /// The rows under and over the transcript, composed once per frame.
+    composed: Option<draw::Composed>,
+    /// The rule over the input, at the last width.
+    rule: Line,
     /// `None` once the transcript changed.
     summary: Option<Summary>,
     /// Tokens the session's model calls used, summed as replies arrive.
@@ -95,6 +99,8 @@ pub struct App {
     /// The attach asked for the latest session: if there is none, the
     /// picker opens instead.
     resuming: bool,
+    /// A frame is owed: something a frame shows changed since the last.
+    redraw: bool,
 }
 
 /// The keys; help lists the slash commands after them.
@@ -115,11 +121,11 @@ const HELP: &[(&str, &str)] = &[
 ];
 
 impl App {
-    pub fn new(viewport: Viewport, workspace: PathBuf, target: &Target) -> Self {
+    pub fn new(viewport: Viewport, target: &Target) -> Self {
         Self {
             client: SessionClient::new(Env::Origin),
             viewport,
-            workspace,
+            workspace: PathBuf::new(),
             cache: Vec::new(),
             collapsed: HashSet::new(),
             verbose: false,
@@ -131,11 +137,26 @@ impl App {
             flash: None,
             recap_hidden: false,
             canvas: Canvas::default(),
+            composed: None,
+            rule: Line::default(),
             summary: None,
             tokens: Usage::default(),
             committed: 0,
             resuming: matches!(target, Target::Latest { .. }),
+            redraw: true,
         }
+    }
+
+    /// The shell's workspace, which the picker starts on: found after the
+    /// first frame, as it walks up to a git root.
+    pub fn in_workspace(&mut self, workspace: PathBuf) {
+        self.workspace = workspace;
+    }
+
+    /// Whether the next frame would differ from the last: nothing is drawn
+    /// for an ack, or a list no picker shows.
+    pub const fn needs_frame(&self) -> bool {
+        self.redraw
     }
 
     pub fn view(&self) -> &SessionView {
@@ -147,6 +168,7 @@ impl App {
     pub fn command(&mut self, cmd: Cmd) -> Vec<client::Effect> {
         if let Cmd::Sessions = cmd {
             self.overlay = Some(Overlay::Picker { selected: 0 });
+            self.redraw = true;
         }
         self.client.run(cmd)
     }
@@ -253,9 +275,11 @@ impl App {
             MUTED
         };
         self.flash = Some((text.into(), style));
+        self.redraw = true;
     }
 
     pub fn input(&mut self, input: Input) -> Option<Effect> {
+        self.redraw = true;
         match input {
             Input::Key(key) => self.key(key),
             Input::Mouse(mouse) => self.mouse(mouse),
@@ -451,15 +475,17 @@ impl App {
         }
     }
 
-    /// Sessions as the picker lists them: newest first.
+    /// Sessions as the picker lists them: newest first, as the daemon
+    /// lists them.
     fn listed(&self) -> impl Iterator<Item = &SessionSummary> {
-        self.client.sessions().iter().rev()
+        self.client.sessions().iter()
     }
 
     fn pick_default(&mut self) {
         let here = self.listed().position(|s| s.workspace == self.workspace);
         if let Some(Overlay::Picker { selected }) = &mut self.overlay {
             *selected = here.unwrap_or(0);
+            self.redraw = true;
         }
     }
 
@@ -474,10 +500,14 @@ impl Renderer for App {
         let mut asked = Vec::new();
         for show in shown {
             match show {
-                Show::View(update) => asked.extend(self.changed(update)),
+                Show::View(update) => {
+                    self.redraw = true;
+                    asked.extend(self.changed(update));
+                }
                 Show::Sessions => self.pick_default(),
                 Show::Notice(notice) => self.notice(notice.to_string(), true),
                 Show::Link => {
+                    self.redraw = true;
                     if let Link::Wedged(d) = self.client.link() {
                         self.overlay = Some(Overlay::Unresponsive {
                             who: d.who(),

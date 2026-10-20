@@ -1,9 +1,123 @@
-//! Styled text: spans, word wrapping by display width, and the little
-//! markdown a reply gets (headings, bullets, quotes, code, bold).
+//! Styled text: the pen (palette colors and attributes), spans, word
+//! wrapping by display width, and the little markdown a reply gets
+//! (headings, bullets, quotes, code, bold).
 
+use smallvec::SmallVec;
+pub use smol_str::SmolStr;
 use unicode_width::UnicodeWidthChar;
 
-use ratatui_core::style::{Color, Style};
+/// The terminal palette entries the client draws with: the default, 1–6
+/// and bright black. Never RGB and never a background, so light and dark
+/// themes both read.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum Color {
+    #[default]
+    Reset,
+    Red,
+    Green,
+    Yellow,
+    Blue,
+    Magenta,
+    Cyan,
+    DarkGray,
+}
+
+impl Color {
+    /// The SGR parameter that sets it as the foreground; a background is
+    /// 10 more.
+    pub const fn sgr(self) -> u16 {
+        match self {
+            Self::Reset => 39,
+            Self::Red => 31,
+            Self::Green => 32,
+            Self::Yellow => 33,
+            Self::Blue => 34,
+            Self::Magenta => 35,
+            Self::Cyan => 36,
+            Self::DarkGray => 90,
+        }
+    }
+}
+
+/// Attributes, as a set.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct Modifier(u8);
+
+impl Modifier {
+    pub const NONE: Self = Self(0);
+    pub const BOLD: Self = Self(1);
+    pub const DIM: Self = Self(2);
+    pub const ITALIC: Self = Self(4);
+    pub const UNDERLINED: Self = Self(8);
+    pub const REVERSED: Self = Self(16);
+
+    /// Each attribute and the SGR parameter that sets it.
+    pub const ALL: [(Self, u16); 5] = [
+        (Self::BOLD, 1),
+        (Self::DIM, 2),
+        (Self::ITALIC, 3),
+        (Self::UNDERLINED, 4),
+        (Self::REVERSED, 7),
+    ];
+
+    pub const fn contains(self, other: Self) -> bool {
+        self.0 & other.0 == other.0
+    }
+
+    pub const fn is_empty(self) -> bool {
+        self.0 == 0
+    }
+
+    /// What `self` has that `other` lacks.
+    pub const fn minus(self, other: Self) -> Self {
+        Self(self.0 & !other.0)
+    }
+}
+
+/// How text is drawn: the pen the terminal is set to before it.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct Style {
+    pub fg: Color,
+    pub bg: Color,
+    pub mods: Modifier,
+}
+
+impl Style {
+    pub const fn new() -> Self {
+        Self {
+            fg: Color::Reset,
+            bg: Color::Reset,
+            mods: Modifier::NONE,
+        }
+    }
+
+    pub const fn fg(self, fg: Color) -> Self {
+        Self { fg, ..self }
+    }
+
+    pub const fn add_modifier(self, m: Modifier) -> Self {
+        Self {
+            mods: Modifier(self.mods.0 | m.0),
+            ..self
+        }
+    }
+
+    pub const fn bold(self) -> Self {
+        self.add_modifier(Modifier::BOLD)
+    }
+
+    pub const fn dim(self) -> Self {
+        self.add_modifier(Modifier::DIM)
+    }
+
+    pub const fn italic(self) -> Self {
+        self.add_modifier(Modifier::ITALIC)
+    }
+
+    pub const fn reversed(self) -> Self {
+        self.add_modifier(Modifier::REVERSED)
+    }
+}
 
 /// What a click on a span does.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -22,15 +136,18 @@ pub enum Action {
     Quit,
 }
 
+/// A run of text drawn with one pen. Its text is inline up to 23 bytes and
+/// shared past that, so a span (and a row of them) clones without
+/// allocating: a frame keeps the rows it drew before by value.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Span {
-    pub text: String,
+    pub text: SmolStr,
     pub style: Style,
     pub action: Option<Action>,
 }
 
 impl Span {
-    pub fn new(text: impl Into<String>, style: Style) -> Self {
+    pub fn new(text: impl Into<SmolStr>, style: Style) -> Self {
         Self {
             text: text.into(),
             style,
@@ -38,26 +155,29 @@ impl Span {
         }
     }
 
-    pub fn button(text: impl Into<String>, style: Style, action: Action) -> Self {
+    pub fn button(text: impl Into<SmolStr>, style: Style, action: Action) -> Self {
         Self {
             text: text.into(),
             style,
             action: Some(action),
         }
     }
+
+    /// The pen and the click, which decide whether two runs are one span.
+    fn pen(&self) -> (Style, Option<Action>) {
+        (self.style, self.action)
+    }
 }
 
-/// One row on screen.
+/// One row on screen: most rows are a prefix and a run or two, kept inline.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct Line {
-    pub spans: Vec<Span>,
+    pub spans: SmallVec<[Span; 4]>,
 }
 
 impl Line {
-    pub fn plain(text: impl Into<String>, style: Style) -> Self {
-        Self {
-            spans: vec![Span::new(text, style)],
-        }
+    pub fn plain(text: impl Into<SmolStr>, style: Style) -> Self {
+        Self::from([Span::new(text, style)])
     }
 
     pub fn width(&self) -> usize {
@@ -70,9 +190,27 @@ impl Line {
     }
 }
 
+impl<const N: usize> From<[Span; N]> for Line {
+    fn from(spans: [Span; N]) -> Self {
+        Self {
+            spans: SmallVec::from_iter(spans),
+        }
+    }
+}
+
 impl From<Vec<Span>> for Line {
     fn from(spans: Vec<Span>) -> Self {
-        Self { spans }
+        Self {
+            spans: SmallVec::from_vec(spans),
+        }
+    }
+}
+
+impl From<&[Span]> for Line {
+    fn from(spans: &[Span]) -> Self {
+        Self {
+            spans: spans.iter().cloned().collect(),
+        }
     }
 }
 
@@ -124,103 +262,123 @@ pub fn sanitize(text: &str) -> std::borrow::Cow<'_, str> {
     out.into()
 }
 
+/// Rows being wrapped. The open row's last run is gathered as it grows
+/// and becomes a span when its pen changes or the row ends, so a row costs
+/// one span per pen, not one per word.
+struct Rows<'a> {
+    lines: Vec<Line>,
+    tail: String,
+    pen: (Style, Option<Action>),
+    rest: &'a [Span],
+}
+
+impl Rows<'_> {
+    fn push(&mut self, from: &Span, text: &str) {
+        if text.is_empty() {
+            return;
+        }
+        if self.pen != from.pen() {
+            self.seal();
+            self.pen = from.pen();
+        }
+        self.tail.push_str(text);
+    }
+
+    fn seal(&mut self) {
+        if self.tail.is_empty() {
+            return;
+        }
+        let (style, action) = self.pen;
+        self.lines.last_mut().unwrap().spans.push(Span {
+            text: SmolStr::new(&self.tail),
+            style,
+            action,
+        });
+        self.tail.clear();
+    }
+
+    /// Starts the next row after the `rest` prefix.
+    fn newline(&mut self) {
+        self.seal();
+        self.lines.push(Line::from(self.rest));
+    }
+}
+
 /// Wraps a logical line of spans to `width` columns at spaces (breaking
 /// words longer than a row): the first row after the `first` prefix, the
 /// rest after `rest`. Leading spaces are kept (indentation); spaces a wrap
 /// lands on are dropped.
 pub fn wrap(spans: &[Span], width: usize, first: &[Span], rest: &[Span]) -> Vec<Line> {
     let rest_w: usize = rest.iter().map(|s| width_of(&s.text)).sum();
-    let mut lines = vec![Line {
-        spans: first.to_vec(),
-    }];
+    let mut out = Rows {
+        lines: vec![Line::from(first)],
+        tail: String::new(),
+        pen: (Style::new(), None),
+        rest,
+    };
     let mut col: usize = first.iter().map(|s| width_of(&s.text)).sum();
     let mut start = col;
-    let mut spaces: Vec<Span> = Vec::new();
-    let mut word: Vec<Span> = Vec::new();
-    let mut place = |lines: &mut Vec<Line>, spaces: &mut Vec<Span>, word: &mut Vec<Span>| {
-        let ww: usize = word.iter().map(|s| width_of(&s.text)).sum();
+    // The spans the spaces before a word came from, and the word's pieces.
+    let mut spaces: Vec<&Span> = Vec::new();
+    let mut word: Vec<(&Span, &str)> = Vec::new();
+    let mut place = |out: &mut Rows, spaces: &mut Vec<&Span>, word: &mut Vec<(&Span, &str)>| {
+        let ww: usize = word.iter().map(|(_, text)| width_of(text)).sum();
         let at_start = col == start;
         if !at_start && col + spaces.len() + ww > width {
-            lines.push(Line {
-                spans: rest.to_vec(),
-            });
+            out.newline();
             col = rest_w;
             start = col;
             spaces.clear();
-        } else if at_start && lines.len() > 1 {
+        } else if at_start && out.lines.len() > 1 {
             spaces.clear();
         }
         for space in spaces.drain(..) {
             if col < width {
-                push(lines.last_mut().unwrap(), &space, " ");
+                out.push(space, " ");
                 col += 1;
             }
         }
-        for piece in word.drain(..) {
-            let mut run = String::new();
-            for ch in piece.text.chars() {
+        for (span, text) in word.drain(..) {
+            let mut from = 0;
+            for (i, ch) in text.char_indices() {
                 let cw = usize::from(char_width(ch));
                 if col + cw > width && col > start {
-                    push(lines.last_mut().unwrap(), &piece, &run);
-                    run.clear();
-                    lines.push(Line {
-                        spans: rest.to_vec(),
-                    });
+                    out.push(span, &text[from..i]);
+                    from = i;
+                    out.newline();
                     col = rest_w;
                     start = col;
                 }
-                run.push(ch);
                 col += cw;
             }
-            push(lines.last_mut().unwrap(), &piece, &run);
+            out.push(span, &text[from..]);
         }
     };
     for span in spans {
-        // Pieces of `span`, styled as it is (not a clone of its text).
-        let piece = |text: String| Span {
-            text,
-            style: span.style,
-            action: span.action,
-        };
-        let mut run = String::new();
-        for ch in span.text.chars() {
-            if ch == ' ' {
-                if !run.is_empty() {
-                    word.push(piece(std::mem::take(&mut run)));
-                }
-                if !word.is_empty() {
-                    place(&mut lines, &mut spaces, &mut word);
-                }
-                spaces.push(piece(String::new()));
-            } else {
-                run.push(ch);
+        let text = span.text.as_str();
+        let mut from = 0;
+        for (i, ch) in text.char_indices() {
+            if ch != ' ' {
+                continue;
             }
+            if i > from {
+                word.push((span, &text[from..i]));
+            }
+            if !word.is_empty() {
+                place(&mut out, &mut spaces, &mut word);
+            }
+            spaces.push(span);
+            from = i + 1;
         }
-        if !run.is_empty() {
-            word.push(piece(run));
+        if from < text.len() {
+            word.push((span, &text[from..]));
         }
     }
     if !word.is_empty() {
-        place(&mut lines, &mut spaces, &mut word);
+        place(&mut out, &mut spaces, &mut word);
     }
-    lines
-}
-
-/// Appends `text` to `line`, merged into its last span when styled alike.
-fn push(line: &mut Line, from: &Span, text: &str) {
-    if text.is_empty() {
-        return;
-    }
-    match line.spans.last_mut() {
-        Some(last) if last.style == from.style && last.action == from.action => {
-            last.text.push_str(text);
-        }
-        _ => line.spans.push(Span {
-            text: text.to_owned(),
-            style: from.style,
-            action: from.action,
-        }),
-    }
+    out.seal();
+    out.lines
 }
 
 pub const CODE: Style = Style::new().fg(Color::Cyan);
@@ -242,6 +400,7 @@ pub fn markdown_into(
     base: Style,
     fenced: &mut bool,
 ) {
+    let indent = |style| [Span::new("  ", style)];
     for raw in text.split('\n') {
         let trimmed = raw.trim_start();
         if trimmed.starts_with("```") {
@@ -255,38 +414,23 @@ pub fn markdown_into(
             continue;
         }
         let (first, rest, body, style) = if let Some(h) = heading(trimmed) {
-            (
-                vec![Span::new("  ", base)],
-                vec![Span::new("  ", base)],
-                h,
-                base.bold(),
-            )
+            (indent(base), indent(base), h, base.bold())
         } else if let Some(item) = trimmed
             .strip_prefix("- ")
             .or_else(|| trimmed.strip_prefix("* "))
         {
             let pad = " ".repeat(raw.len() - trimmed.len());
             (
-                vec![Span::new(format!("  {pad}• "), base)],
-                vec![Span::new(format!("  {pad}  "), base)],
+                [Span::new(format!("  {pad}• "), base)],
+                [Span::new(format!("  {pad}  "), base)],
                 item,
                 base,
             )
         } else if let Some(quote) = trimmed.strip_prefix('>') {
             let bar = Span::new("  │ ", base.dim());
-            (
-                vec![bar.clone()],
-                vec![bar],
-                quote.trim_start(),
-                base.italic(),
-            )
+            ([bar.clone()], [bar], quote.trim_start(), base.italic())
         } else {
-            (
-                vec![Span::new("  ", base)],
-                vec![Span::new("  ", base)],
-                raw,
-                base,
-            )
+            (indent(base), indent(base), raw, base)
         };
         out.extend(wrap(&inline(body, style), width, &first, &rest));
     }
@@ -301,8 +445,8 @@ fn heading(line: &str) -> Option<&str> {
 }
 
 /// Inline `**bold**` and `` `code` `` within one line.
-fn inline(text: &str, base: Style) -> Vec<Span> {
-    let mut spans = Vec::new();
+fn inline(text: &str, base: Style) -> SmallVec<[Span; 4]> {
+    let mut spans = SmallVec::new();
     let mut rest = text;
     let (mut bold, mut code) = (false, false);
     let style = |bold: bool, code: bool| match (bold, code) {
@@ -340,8 +484,6 @@ fn inline(text: &str, base: Style) -> Vec<Span> {
 
 #[cfg(test)]
 mod tests {
-    use ratatui_core::style::Modifier;
-
     use super::*;
 
     fn texts(lines: &[Line]) -> Vec<String> {
@@ -374,6 +516,25 @@ mod tests {
         assert_eq!(lines[1].spans[0].style, bold);
     }
 
+    /// Spans are per pen, not per word: a plain paragraph wraps to one
+    /// span a row (after the prefix), whatever its length.
+    #[test]
+    fn a_row_holds_one_span_per_pen() {
+        let text = ["word"; 40].join(" ");
+        let pad = [Span::new("  ", MUTED)];
+        let lines = wrap(&[Span::new(text, Style::new())], 30, &pad, &pad);
+        assert!(lines.len() > 5);
+        for line in &lines {
+            assert_eq!(line.spans.len(), 2, "{line:?}");
+            assert_eq!(line.spans[0].text, "  ");
+        }
+        // Leading spaces (indentation) stay; a space a wrap lands on goes.
+        let lines = wrap(&[Span::new("  in dented", Style::new())], 5, &[], &[]);
+        assert_eq!(texts(&lines), ["  in", "dente", "d"]);
+    }
+
+    const MUTED: Style = Style::new().fg(Color::DarkGray);
+
     #[test]
     fn markdown_styles_the_common_cases() {
         let lines = markdown(
@@ -389,14 +550,14 @@ mod tests {
             lines[0]
                 .spans
                 .iter()
-                .any(|s| s.style.add_modifier.contains(Modifier::BOLD))
+                .any(|s| s.style.mods.contains(Modifier::BOLD))
         );
         let two = lines[1]
             .spans
             .iter()
             .find(|s| s.text.contains("two"))
             .unwrap();
-        assert!(two.style.add_modifier.contains(Modifier::BOLD));
+        assert!(two.style.mods.contains(Modifier::BOLD));
         let x = lines[1].spans.iter().find(|s| s.text == "x").unwrap();
         assert_eq!(x.style, CODE);
     }
