@@ -227,3 +227,56 @@ fn legal_and_normalised_call_ids_remain_distinct_and_results_follow_them() {
         );
     }
 }
+
+#[test]
+fn separate_turns_keep_distinct_ids_and_all_results_even_with_native_calls() {
+    for ids in [["a.b", "a_b"], ["a_b", "a.b"]] {
+        for native_at in [None, Some(0), Some(1)] {
+            let mut provider = provider();
+            provider.protocol = std::sync::Arc::new(crate::protocols::gemini::Gemini::default());
+            let mut messages = Vec::new();
+            for (at, id) in ids.iter().enumerate() {
+                let mut part = call(id);
+                part.meta_mut().clear();
+                messages.push(Message::Assistant(Assistant {
+                    content: vec![part],
+                    origin: (native_at == Some(at)).then(|| Origin {
+                        protocol: provider.protocol.key(),
+                        provider: provider.id.clone(),
+                        model: "m".into(),
+                    }),
+                }));
+                messages.push(Message::Tool(ToolMessage {
+                    results: vec![result(id)],
+                }));
+            }
+            let request = Request {
+                messages: messages.into(),
+                ..Request::default()
+            };
+            let out = prepare(
+                &request,
+                &Target {
+                    provider: &provider,
+                    model: "m",
+                },
+            );
+            let mut ids = Vec::new();
+            for pair in out.messages.chunks_exact(2) {
+                let Message::Assistant(assistant) = &pair[0] else {
+                    panic!()
+                };
+                let id = assistant.tool_calls().next().unwrap().id.clone();
+                let Message::Tool(tool) = &pair[1] else {
+                    panic!()
+                };
+                assert_eq!(tool.results.len(), 1);
+                assert_eq!(tool.results[0].id, id);
+                assert!(!tool.results[0].error);
+                assert_eq!(tool.results[0].output, Output::Text("ok".into()));
+                ids.push(id);
+            }
+            assert_ne!(ids[0], ids[1]);
+        }
+    }
+}

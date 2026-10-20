@@ -170,33 +170,49 @@ impl Prepare {
         let protocol = &target.provider.protocol;
         let fit = |id: &str| protocol.tool_id(id);
         match message {
-            Message::Assistant(assistant) if !native(assistant, target) => {
+            Message::Assistant(assistant) => {
+                let native = native(assistant, target);
+                let ids: Vec<_> = assistant
+                    .tool_calls()
+                    .filter(|call| native || !call.provider_executed)
+                    .map(|call| {
+                        self.ids
+                            .rename(&call.id, |id| if native { None } else { fit(id) })
+                    })
+                    .collect();
+                let unchanged = assistant
+                    .tool_calls()
+                    .filter(|call| native || !call.provider_executed)
+                    .zip(&ids)
+                    .all(|(call, id)| call.id == *id);
                 let fits = |part: &AssistantPart| match part {
                     AssistantPart::Text(_) | AssistantPart::Media(_) => part.meta().is_empty(),
                     AssistantPart::ToolCall(call) => {
-                        !call.provider_executed && call.meta.is_empty() && fit(&call.id).is_none()
+                        !call.provider_executed && call.meta.is_empty()
                     }
                     _ => false,
                 };
-                if assistant.content.iter().all(fits) {
-                    // Each id is its own, and now taken.
-                    for call in assistant.tool_calls() {
-                        self.ids.rename(&call.id, fit);
-                    }
+                if unchanged && (native || assistant.content.iter().all(fits)) {
                     return (!assistant.content.is_empty()).then_some(Cow::Borrowed(message));
                 }
                 let mut assistant = assistant.clone();
-                assistant.content.retain(|part| match part {
-                    AssistantPart::Text(_) | AssistantPart::Media(_) => true,
-                    AssistantPart::ToolCall(call) => !call.provider_executed,
-                    AssistantPart::Reasoning(_)
-                    | AssistantPart::ToolResult(_)
-                    | AssistantPart::Opaque(_) => false,
+                assistant.content.retain(|part| {
+                    native
+                        || match part {
+                            AssistantPart::Text(_) | AssistantPart::Media(_) => true,
+                            AssistantPart::ToolCall(call) => !call.provider_executed,
+                            AssistantPart::Reasoning(_)
+                            | AssistantPart::ToolResult(_)
+                            | AssistantPart::Opaque(_) => false,
+                        }
                 });
+                let mut ids = ids.into_iter();
                 for part in &mut assistant.content {
-                    part.meta_mut().clear();
+                    if !native {
+                        part.meta_mut().clear();
+                    }
                     if let AssistantPart::ToolCall(call) = part {
-                        call.id = self.ids.rename(&call.id, fit);
+                        call.id = ids.next().expect("one allocated id per call");
                     }
                 }
                 (!assistant.content.is_empty()).then_some(Cow::Owned(Message::Assistant(assistant)))
