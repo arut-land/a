@@ -247,7 +247,16 @@ pub fn find_session(sessions: Vec<SessionInfo>, wanted: &str) -> Option<String> 
 pub struct Session {
     feed: Arc<Mutex<Feed>>,
     driver: Driver,
+    /// Numbering and pumping share this lock; publishing takes only the feed.
+    sending: Arc<Mutex<()>>,
+    #[cfg(test)]
+    before_pump: Arc<Mutex<Option<BeforePump>>>,
+    #[cfg(test)]
+    before_replay: Arc<Mutex<Option<BeforePump>>>,
 }
+
+#[cfg(test)]
+type BeforePump = Box<dyn FnOnce() + Send>;
 
 /// The feed as the driver's pump renders through it: locked only while it
 /// shows, so the driver's I/O never runs under the lock the reader thread
@@ -265,6 +274,12 @@ impl Session {
     pub fn new(client: &Client) -> Self {
         let feed = Arc::new(Mutex::new(Feed::new(SessionClient::new(Env::Keep))));
         let shared = Arc::clone(&feed);
+        let sending = Arc::new(Mutex::new(()));
+        let ordered = Arc::clone(&sending);
+        #[cfg(test)]
+        let before_replay = Arc::new(Mutex::new(None::<BeforePump>));
+        #[cfg(test)]
+        let replaying = Arc::clone(&before_replay);
         let driver = Driver::with_origin(
             client.daemon.clone(),
             || {
@@ -275,11 +290,26 @@ impl Session {
                 ))
             },
             move |driver, event| {
+                let _sending = lock(&ordered);
+                #[cfg(test)]
+                let connected = matches!(event.kind, client::EventKind::Connected { .. });
                 let effects = lock(&shared).client.step(event);
+                #[cfg(test)]
+                if connected && let Some(pause) = lock(&replaying).take() {
+                    pause();
+                }
                 driver.pump(&mut Published(&shared), effects);
             },
         );
-        Self { feed, driver }
+        Self {
+            feed,
+            driver,
+            sending,
+            #[cfg(test)]
+            before_pump: Arc::default(),
+            #[cfg(test)]
+            before_replay,
+        }
     }
 
     /// Every update from here on. Subscribe before `open` to see the
@@ -335,6 +365,7 @@ impl Session {
             },
             OpenTarget::Id { id } => Attach::new(Target::Id(parse_id(&id)?), Env::Keep),
         };
+        let _sending = lock(&self.sending);
         let effects = {
             let mut feed = lock(&self.feed);
             if feed.client.connection().0 > 0 {
@@ -397,7 +428,9 @@ impl Session {
     /// Replaces a daemon that stopped answering, and attaches again.
     pub async fn restart(&self) -> Result<(), ClientError> {
         let (feed, driver) = (Arc::clone(&self.feed), self.driver.clone());
+        let sending = Arc::clone(&self.sending);
         blocking(move || {
+            let _sending = lock(&sending);
             let effects = lock(&feed).client.restart();
             driver.pump(&mut Published(&feed), effects);
             Ok(())
@@ -414,8 +447,16 @@ impl Session {
         intent: impl FnOnce(&mut SessionClient) -> Result<Vec<Effect>, Notice> + Send + 'static,
     ) -> Result<(), ClientError> {
         let (feed, driver) = (Arc::clone(&self.feed), self.driver.clone());
+        let sending = Arc::clone(&self.sending);
+        #[cfg(test)]
+        let before_pump = Arc::clone(&self.before_pump);
         blocking(move || {
+            let _sending = lock(&sending);
             let effects = intent(&mut lock(&feed).client)?;
+            #[cfg(test)]
+            if let Some(pause) = lock(&before_pump).take() {
+                pause();
+            }
             driver.pump(&mut Published(&feed), effects);
             Ok(())
         })
@@ -424,7 +465,9 @@ impl Session {
 
     async fn run(&self, cmd: Cmd) -> Result<(), ClientError> {
         let (feed, driver) = (Arc::clone(&self.feed), self.driver.clone());
+        let sending = Arc::clone(&self.sending);
         blocking(move || {
+            let _sending = lock(&sending);
             let effects = {
                 let mut feed = lock(&feed);
                 if !feed.client.link().attached() {
@@ -442,6 +485,7 @@ impl Session {
 /// Released by the app: the daemon is told, and the reader then ends.
 impl Drop for Session {
     fn drop(&mut self) {
+        let _sending = lock(&self.sending);
         let effects = lock(&self.feed).client.detach();
         self.driver.pump(&mut Published(&self.feed), effects);
     }
@@ -453,4 +497,237 @@ fn parse_id(id: &str) -> Result<SessionId, ClientError> {
         .map_err(|_| ClientError::InvalidArgument {
             message: format!("not a session id: {id}"),
         })
+}
+
+#[cfg(test)]
+mod tests {
+    use std::sync::mpsc;
+    use std::thread;
+
+    use protocol::{Caps, ClientMsg, DaemonMsg, read_frame, write_frame};
+
+    use super::*;
+
+    fn fixture() -> (Session, Home, PathBuf, sys::Listener) {
+        let root = std::env::temp_dir().join(format!("a-ffi-order-{}", SessionId::new()));
+        std::fs::create_dir_all(&root).unwrap();
+        let home = Home::from(root.join("home"));
+        let exe = root.join("a");
+        std::fs::write(&exe, "never run").unwrap();
+        let staged = home.runtime().stage(&exe).unwrap();
+        let listener = home.bind().unwrap();
+        let session = Session::new(&Client {
+            daemon: Daemon::local(home.clone(), staged),
+            home: home.clone(),
+        });
+        (session, home, root, listener)
+    }
+
+    fn paused_input(
+        session: &Session,
+        text: &str,
+        entered: mpsc::Sender<()>,
+        release: mpsc::Receiver<()>,
+    ) {
+        *lock(&session.before_pump) = Some(Box::new(move || {
+            entered.send(()).unwrap();
+            release.recv().unwrap();
+        }));
+        rt::block_on(session.send(text.to_owned())).unwrap();
+    }
+
+    #[test]
+    fn numbered_input_and_reconnect_replay_cannot_overtake_a_paused_send() {
+        let (session, home, root, listener) = fixture();
+        session
+            .open(OpenTarget::Id {
+                id: SessionId::new().to_string(),
+            })
+            .unwrap();
+        let mut peer = listener.accept().unwrap();
+        let welcome = DaemonMsg::Welcome {
+            proto: protocol::PROTO,
+            build: "test".into(),
+            caps: Caps::ALL,
+            commands: Vec::new(),
+        };
+        read_frame::<ClientMsg>(&mut peer).unwrap().unwrap();
+        read_frame::<ClientMsg>(&mut peer).unwrap().unwrap();
+        // Receiving queued input proves Connected was processed, without polling.
+        rt::block_on(session.send("ready".into())).unwrap();
+        write_frame(&mut peer, &welcome).unwrap();
+        assert_eq!(
+            read_frame::<ClientMsg>(&mut peer)
+                .unwrap()
+                .unwrap()
+                .client_seq(),
+            Some(1)
+        );
+        let id = SessionId::new();
+        write_frame(
+            &mut peer,
+            &DaemonMsg::Attached {
+                session: id,
+                workspace: root.clone(),
+            },
+        )
+        .unwrap();
+        let (numbered, numbering) = mpsc::channel();
+        let (release, released) = mpsc::channel();
+        thread::scope(|scope| {
+            let session = &session;
+            let first = scope.spawn(move || {
+                paused_input(session, "first", numbered, released);
+            });
+            numbering.recv().unwrap();
+            let serialized = session.sending.try_lock().is_err();
+            let (started, starting) = mpsc::channel();
+            let second = scope.spawn(move || {
+                started.send(()).unwrap();
+                rt::block_on(session.run(Cmd::Input("second".into()))).unwrap();
+            });
+            starting.recv().unwrap();
+            release.send(()).unwrap();
+            first.join().unwrap();
+            second.join().unwrap();
+            assert!(serialized);
+        });
+        for seq in [2, 3] {
+            assert_eq!(
+                read_frame::<ClientMsg>(&mut peer)
+                    .unwrap()
+                    .unwrap()
+                    .client_seq(),
+                Some(seq)
+            );
+        }
+        write_frame(&mut peer, &DaemonMsg::Draining).unwrap();
+        drop(peer);
+        let mut peer = listener.accept().unwrap();
+        read_frame::<ClientMsg>(&mut peer).unwrap().unwrap();
+        read_frame::<ClientMsg>(&mut peer).unwrap().unwrap();
+        let (queued, queueing) = mpsc::channel();
+        let (release, released) = mpsc::channel();
+        thread::scope(|scope| {
+            let session = &session;
+            let input = scope.spawn(move || {
+                paused_input(session, "during reconnect", queued, released);
+            });
+            queueing.recv().unwrap();
+            // Connected competes with the input while its numbering/pump lock is held.
+            write_frame(&mut peer, &welcome).unwrap();
+            let serialized = session.sending.try_lock().is_err();
+            release.send(()).unwrap();
+            input.join().unwrap();
+            assert!(serialized);
+        });
+        for seq in [1, 2, 3, 4] {
+            assert_eq!(
+                read_frame::<ClientMsg>(&mut peer)
+                    .unwrap()
+                    .unwrap()
+                    .client_seq(),
+                Some(seq)
+            );
+        }
+        drop(session);
+        assert!(matches!(
+            read_frame::<ClientMsg>(&mut peer).unwrap(),
+            Some(ClientMsg::Detach)
+        ));
+        drop(peer);
+        drop(listener);
+        home.endpoint().remove();
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn reconnect_replay_is_pumped_before_newly_numbered_input() {
+        let (session, home, root, listener) = fixture();
+        let id = SessionId::new();
+        session.open(OpenTarget::Id { id: id.to_string() }).unwrap();
+        let mut peer = listener.accept().unwrap();
+        read_frame::<ClientMsg>(&mut peer).unwrap().unwrap();
+        read_frame::<ClientMsg>(&mut peer).unwrap().unwrap();
+        let welcome = DaemonMsg::Welcome {
+            proto: protocol::PROTO,
+            build: "test".into(),
+            caps: Caps::ALL,
+            commands: Vec::new(),
+        };
+        rt::block_on(session.send("unanswered".into())).unwrap();
+        write_frame(&mut peer, &welcome).unwrap();
+        assert_eq!(
+            read_frame::<ClientMsg>(&mut peer)
+                .unwrap()
+                .unwrap()
+                .client_seq(),
+            Some(1)
+        );
+        write_frame(
+            &mut peer,
+            &DaemonMsg::Attached {
+                session: id,
+                workspace: root.clone(),
+            },
+        )
+        .unwrap();
+        write_frame(&mut peer, &DaemonMsg::Draining).unwrap();
+        drop(peer);
+        let mut peer = listener.accept().unwrap();
+        read_frame::<ClientMsg>(&mut peer).unwrap().unwrap();
+        read_frame::<ClientMsg>(&mut peer).unwrap().unwrap();
+        let (prepared, preparing) = mpsc::channel();
+        let (replay, replaying) = mpsc::channel();
+        *lock(&session.before_replay) = Some(Box::new(move || {
+            prepared.send(()).unwrap();
+            replaying.recv().unwrap();
+        }));
+        write_frame(&mut peer, &welcome).unwrap();
+        preparing.recv().unwrap();
+        assert!(lock(&session.feed).client.link().up());
+        let (numbered, numbering) = mpsc::channel();
+        let (send, sending) = mpsc::channel();
+        let mut received = Vec::new();
+        thread::scope(|scope| {
+            let session = &session;
+            // Choose the runnable side before input can acquire the lock. With
+            // incoming serialization removed, force new input ahead of replay.
+            let ordered = session.sending.try_lock().is_err();
+            let input = scope.spawn(move || paused_input(session, "new input", numbered, sending));
+            if ordered {
+                replay.send(()).unwrap();
+            }
+            numbering.recv().unwrap();
+            send.send(()).unwrap();
+            if !ordered {
+                received.push(
+                    read_frame::<ClientMsg>(&mut peer)
+                        .unwrap()
+                        .unwrap()
+                        .client_seq(),
+                );
+                replay.send(()).unwrap();
+            }
+            input.join().unwrap();
+        });
+        while received.len() < 2 {
+            received.push(
+                read_frame::<ClientMsg>(&mut peer)
+                    .unwrap()
+                    .unwrap()
+                    .client_seq(),
+            );
+        }
+        drop(session);
+        assert!(matches!(
+            read_frame::<ClientMsg>(&mut peer).unwrap(),
+            Some(ClientMsg::Detach)
+        ));
+        drop(peer);
+        drop(listener);
+        home.endpoint().remove();
+        std::fs::remove_dir_all(root).unwrap();
+        assert_eq!(received, vec![Some(1), Some(2)]);
+    }
 }

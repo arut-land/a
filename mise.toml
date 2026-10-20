@@ -126,6 +126,8 @@ fi
 CARGO_TARGET_DIR=target/fixtures cargo build-release -p a --features fixtures
 b=$(wc -c < target/fixtures/release/a); echo "a (fixtures): $((b / 1024)) KiB of 4096 KiB"; ((b <= 4194304))
 A_BIN=$PWD/target/fixtures/release/a A_STRICT_BUDGETS=${A_STRICT_BUDGETS:-$([[ -n ${CI:-} ]] && echo 0 || echo 1)} cargo nextest run -p a --test blackbox -E 'test(/^budgets::/)' --run-ignored ignored-only --test-threads 1 --no-capture --no-tests=fail
+# The process-wide wake counter needs its own executable, run alone.
+CARGO_TARGET_DIR=target/fixtures cargo nextest run --release -p ext-shell --test quiet --run-ignored ignored-only --test-threads 1 --no-capture --no-tests=fail
 '''
 
 # The macOS app (apps/apple). The FFI package: crates/ffi for macOS arm64

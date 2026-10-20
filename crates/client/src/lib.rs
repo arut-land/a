@@ -127,7 +127,24 @@ impl From<Error> for io::Error {
 pub struct Reader(BufReader<Box<dyn Read + Send>>);
 
 /// The write half of a connection.
-pub struct Writer(Box<dyn Write + Send>);
+pub struct Writer(Box<dyn WriteTransport>);
+
+trait WriteTransport: Write + Send {
+    fn shutdown(&mut self);
+}
+
+impl WriteTransport for Stream {
+    fn shutdown(&mut self) {
+        let _ = Stream::shutdown(self, std::net::Shutdown::Read);
+    }
+}
+
+impl Drop for Writer {
+    fn drop(&mut self) {
+        // The reader owns a clone; closing this write handle alone cannot wake it.
+        self.0.shutdown();
+    }
+}
 
 /// A daemon connection, split so reading and writing can run on their own
 /// threads.
