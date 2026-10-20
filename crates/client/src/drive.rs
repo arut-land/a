@@ -73,6 +73,7 @@ struct Inner {
     client: ClientId,
     /// The newest connection asked for, and its write half once it is up.
     latest: AtomicU64,
+    cancelled: AtomicU64,
     writer: Mutex<Option<(ConnId, Writer)>>,
     /// This client's environment, for `/env refresh`.
     origin: Box<Origin>,
@@ -100,6 +101,7 @@ impl Driver {
             daemon,
             client: ClientId::new(),
             latest: AtomicU64::new(0),
+            cancelled: AtomicU64::new(0),
             writer: Mutex::new(None),
             origin: Box::new(origin),
             sink: Box::new(sink),
@@ -134,7 +136,11 @@ impl Driver {
                 self.write(&ClientMsg::Environment(env))
             }
             Io::Hangup => {
-                lock(&self.0.writer).take();
+                let mut slot = lock(&self.0.writer);
+                self.0
+                    .cancelled
+                    .fetch_max(self.0.latest.load(Ordering::Acquire), Ordering::AcqRel);
+                slot.take();
                 Ok(())
             }
         }
@@ -185,7 +191,9 @@ impl Driver {
         {
             let mut slot = lock(&self.0.writer);
             // Replaced while it was being made.
-            if conn.0 < self.0.latest.load(Ordering::Acquire) {
+            if conn.0 < self.0.latest.load(Ordering::Acquire)
+                || conn.0 <= self.0.cancelled.load(Ordering::Acquire)
+            {
                 let _ = writer.send(&ClientMsg::Detach);
                 return;
             }
@@ -231,6 +239,65 @@ impl Driver {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_hung_up_connection_never_installs_after_a_late_hello() {
+        use protocol::{Caps, DaemonMsg, Target, read_frame, write_frame};
+        use std::sync::mpsc;
+        use std::time::Duration;
+        use sys::Home;
+
+        let root = std::env::temp_dir().join(format!("a-late-hello-{:?}", ClientId::new()));
+        std::fs::create_dir_all(&root).unwrap();
+        let home = Home::from(root.join("home"));
+        let exe = root.join("a");
+        std::fs::write(&exe, "never run").unwrap();
+        let staged = home.runtime().stage(&exe).unwrap();
+        let listener = home.bind().unwrap();
+        let (tx, rx) = mpsc::channel();
+        let driver = Driver::new(Daemon::local(home.clone(), staged), move |_, event| {
+            tx.send(event).unwrap();
+        });
+        driver
+            .io(Io::Connect {
+                conn: ConnId(1),
+                attach: Attach::new(Target::New, crate::Env::Keep),
+                restart: false,
+            })
+            .unwrap();
+        let mut peer = listener.accept().unwrap();
+        assert!(matches!(
+            read_frame::<ClientMsg>(&mut peer).unwrap(),
+            Some(ClientMsg::Hello { .. })
+        ));
+        assert!(matches!(
+            read_frame::<ClientMsg>(&mut peer).unwrap(),
+            Some(ClientMsg::Attach { .. })
+        ));
+        driver.io(Io::Hangup).unwrap();
+        write_frame(
+            &mut peer,
+            &DaemonMsg::Welcome {
+                proto: protocol::PROTO,
+                build: "test".into(),
+                caps: Caps::ALL,
+                commands: Vec::new(),
+            },
+        )
+        .unwrap();
+        // Join the opener by waiting for its sole driver reference to go away.
+        let deadline = std::time::Instant::now() + Duration::from_secs(2);
+        while Arc::strong_count(&driver.0) > 1 && rx.try_recv().is_err() {
+            assert!(std::time::Instant::now() < deadline);
+            thread::yield_now();
+        }
+        let installed = lock(&driver.0.writer).is_some();
+        drop(peer);
+        drop(listener);
+        home.endpoint().remove();
+        std::fs::remove_dir_all(root).unwrap();
+        assert!(!installed, "a cancelled opener installed its writer");
+    }
 
     /// A renderer that asks for one more thing the first time it is shown
     /// anything.
