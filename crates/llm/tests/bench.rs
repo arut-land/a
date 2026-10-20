@@ -486,7 +486,7 @@ fn encode_long_transcript() {
 #[ignore = "a benchmark"]
 fn read_logged_reply() {
     let origin = Origin {
-        protocol: "messages".into(),
+        protocol: llm::ProtocolKey::AnthropicMessages,
         provider: "anthropic".into(),
         model: "claude".into(),
     };

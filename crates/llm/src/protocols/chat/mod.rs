@@ -15,11 +15,15 @@ use serde_json::{Value, json};
 
 use super::schema::{legal_call_id, short_hash};
 use crate::error::Error;
+use crate::models::Maker;
 use crate::protocol::{Decoder, Encoded, Host, Hosted, Protocol, Target};
-use crate::spec::{Reason, Request};
+use crate::spec::{ProtocolKey, Reason, Request};
+
+/// Which protocol this is.
+pub const PROTOCOL: ProtocolKey = ProtocolKey::OpenaiChat;
 
 /// Where this protocol's options and part state go.
-pub const KEY: &str = "openai.chat";
+pub const KEY: &str = PROTOCOL.as_str();
 
 /// How a host addresses a model.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -78,6 +82,32 @@ pub enum Vendor {
     /// A gateway with no known option mapping: typed options beyond the
     /// sampling ones are not sent; the request's own options carry them.
     Other,
+}
+
+/// What media a host takes, as its row in [`HOSTS`] states.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[allow(clippy::struct_excessive_bools)]
+pub struct Media {
+    /// Content parts at all; a host without them takes text only.
+    pub parts: bool,
+    /// Media beyond images: audio, files.
+    pub files: bool,
+    pub video: bool,
+    /// An image by URL; a host without reads an image as data only.
+    pub url_images: bool,
+    /// A PDF by the URL that names it.
+    pub url_pdfs: bool,
+}
+
+impl Media {
+    /// Everything but a PDF by URL: what an unknown compatible host gets.
+    pub const ALL: Self = Self {
+        parts: true,
+        files: true,
+        video: true,
+        url_images: true,
+        url_pdfs: false,
+    };
 }
 
 /// The fields an assistant message carries reasoning text under, in the
@@ -149,6 +179,10 @@ pub struct Quirks {
     pub path: &'static str,
     pub routing: Routing,
     pub vendor: Vendor,
+    pub media: Media,
+    /// Whose model rules the host's models follow; `None` for a host
+    /// serving models of every kind.
+    pub maker: Option<Maker>,
     /// Whether `tools` and `tool_choice` reach the host. A host without
     /// them gets the conversation's calls and results as text.
     pub supports_tools: bool,
@@ -198,6 +232,8 @@ impl Quirks {
         path: "/chat/completions",
         routing: Routing::Path,
         vendor: Vendor::Other,
+        media: Media::ALL,
+        maker: None,
         supports_tools: true,
         supports_response_format: true,
         response_format_with_tools: false,
@@ -238,7 +274,7 @@ impl Chat {
 impl Hosted for Chat {
     type Quirks = Quirks;
 
-    const KEY: &'static str = KEY;
+    const PROTOCOL: ProtocolKey = PROTOCOL;
     const HOSTS: &'static [(Host, Quirks)] = HOSTS;
 
     fn with(quirks: Quirks) -> Self {
@@ -247,8 +283,8 @@ impl Hosted for Chat {
 }
 
 impl Protocol for Chat {
-    fn key(&self) -> &'static str {
-        KEY
+    fn key(&self) -> ProtocolKey {
+        PROTOCOL
     }
 
     fn encode(&self, target: &Target<'_>, request: &Request) -> Result<Encoded, Error> {

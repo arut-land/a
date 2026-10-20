@@ -18,7 +18,7 @@ fn with(host: &str, model: &str, generation: Generation, options: Option<Value>)
         ..generation
     };
     if let Some(options) = options {
-        request.options.insert(KEY.to_owned(), options);
+        request.options.insert(PROTOCOL, options);
     }
     sent(&provider(host), &request)
 }
@@ -282,7 +282,7 @@ fn output_config_merges_effort_options_and_the_schema_format() {
     assert_eq!(body["output_config"]["format"]["type"], "json_schema");
 
     request.options.insert(
-        KEY.to_owned(),
+        PROTOCOL,
         json!({"output_config": {"effort": "low", "task_budget": {"tokens": 1000}}}),
     );
     let body = sent(&provider, &request);
@@ -309,7 +309,7 @@ fn a_raw_output_format_is_above_the_schemas() {
     request.generation.reasoning = Some(Effort::High);
     request.format = Some(schema());
     request.options.insert(
-        KEY.to_owned(),
+        PROTOCOL,
         json!({"output_config": {"format": {"type": "json_schema",
             "schema": {"additionalProperties": true}}}}),
     );
@@ -355,7 +355,7 @@ fn adaptive_settings_merge_schema_effort_tools_and_passthrough() {
     request.generation.reasoning = Some(Effort::Max);
     request.format = Some(schema());
     request.options.insert(
-        KEY.to_owned(),
+        PROTOCOL,
         json!({
             "thinking": {"display": "omitted"},
             "output_config": {"custom_option": true},
@@ -468,7 +468,7 @@ fn raw_tools_count_for_parallel_tool_calls() {
     for (host, model) in [("anthropic", OPUS_4_6), ("xiaomimimo", "mimo-v2-flash")] {
         let mut request = request(model, vec![Message::user("Hi")]);
         request.parallel_tool_calls = Some(false);
-        request.options.insert(KEY.to_owned(), raw.clone());
+        request.options.insert(PROTOCOL, raw.clone());
         let body = sent(&provider(host), &request);
         assert_eq!(
             body["tool_choice"],

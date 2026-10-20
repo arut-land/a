@@ -18,8 +18,9 @@ use serde_json::value::RawValue;
 
 use super::meta::Raw;
 use super::{
-    Assistant, AssistantPart, Count, Finish, Json, Media, Meta, Opaque, Origin, Output, Reason,
-    Reasoning, Response, SmolStr, Source, Text, ToolCall, ToolResult, Usage, UserPart,
+    Assistant, AssistantPart, Count, Finish, Json, Media, Meta, Opaque, Origin, Output,
+    ProtocolKey, Reason, Reasoning, Response, SmolStr, Source, Text, ToolCall, ToolResult, Usage,
+    UserPart,
 };
 use crate::json::{Fields, fields, next};
 
@@ -156,7 +157,7 @@ impl<'de> Deserialize<'de> for OptionalOrigin {
 
 #[derive(Default)]
 struct OriginFields {
-    protocol: Option<SmolStr>,
+    protocol: Option<ProtocolKey>,
     provider: Option<SmolStr>,
     model: Option<SmolStr>,
 }

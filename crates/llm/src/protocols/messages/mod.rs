@@ -25,12 +25,15 @@ use serde_json::Value;
 
 use crate::error::{Error, Kind};
 use crate::protocol::{Decoder, Encoded, Host, Hosted, KeyStyle, Protocol, Target};
-use crate::spec::Request;
+use crate::spec::{ProtocolKey, Request};
 
 pub use crate::models::anthropic::{default_max_tokens, rejects_forced_tool_choice};
 
+/// Which protocol this is.
+pub const PROTOCOL: ProtocolKey = ProtocolKey::AnthropicMessages;
+
 /// Where this protocol's options and part state go.
-pub const KEY: &str = "anthropic.messages";
+pub const KEY: &str = PROTOCOL.as_str();
 
 /// The `anthropic-version` every request names.
 pub const VERSION: &str = "2023-06-01";
@@ -142,7 +145,7 @@ fn path(base_url: &str) -> &'static str {
 impl Hosted for Messages {
     type Quirks = Quirks;
 
-    const KEY: &'static str = KEY;
+    const PROTOCOL: ProtocolKey = PROTOCOL;
     const HOSTS: &'static [(Host, Quirks)] = HOSTS;
 
     fn with(quirks: Quirks) -> Self {
@@ -151,8 +154,8 @@ impl Hosted for Messages {
 }
 
 impl Protocol for Messages {
-    fn key(&self) -> &'static str {
-        KEY
+    fn key(&self) -> ProtocolKey {
+        PROTOCOL
     }
 
     fn encode(&self, target: &Target<'_>, request: &Request) -> Result<Encoded, Error> {

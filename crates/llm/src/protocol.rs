@@ -12,12 +12,12 @@ use serde_json::Value;
 use crate::conversation::{History, Pieces};
 use crate::error::{Error, Kind};
 use crate::http::Payload;
-use crate::spec::{Event, Request, SmolStr};
+use crate::spec::{Event, ProtocolKey, Request, SmolStr};
 
 pub trait Protocol: Send + Sync + 'static {
-    /// The key this protocol's options and part state go under, and the
-    /// protocol an [`Origin`](crate::Origin) names.
-    fn key(&self) -> &'static str;
+    /// Which protocol this is: the key its options and part state go
+    /// under, and the protocol an [`Origin`](crate::Origin) names.
+    fn key(&self) -> ProtocolKey;
 
     /// The request for `request`, already prepared for `target`.
     fn encode(&self, target: &Target<'_>, request: &Request) -> Result<Encoded, Error>;
@@ -43,7 +43,7 @@ pub trait Protocol: Send + Sync + 'static {
 pub trait Hosted: Protocol + Sized {
     type Quirks: Copy + 'static;
 
-    const KEY: &'static str;
+    const PROTOCOL: ProtocolKey;
     const HOSTS: &'static [(Host, Self::Quirks)];
 
     fn with(quirks: Self::Quirks) -> Self;
@@ -191,7 +191,7 @@ impl fmt::Debug for Provider {
         f.debug_struct("Provider")
             .field("id", &self.id)
             .field("base_url", &self.base_url)
-            .field("protocol", &self.protocol.key())
+            .field("protocol", &self.protocol.key().as_str())
             .finish_non_exhaustive()
     }
 }

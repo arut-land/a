@@ -141,7 +141,7 @@ fn a_raw_generation_config_beats_the_typed_fields_and_keeps_the_rest() {
                 ..Generation::default()
             },
             options: crate::spec::Options::from([(
-                KEY.to_owned(),
+                PROTOCOL,
                 json!({"generationConfig": {"temperature": 0.9, "topK": 3}, "serviceTier": "flex"}),
             )]),
             ..asking(vec![Message::user("hi")])

@@ -29,8 +29,42 @@ pub use smol_str::SmolStr;
 pub use self::meta::Meta;
 pub use crate::conversation::Messages;
 
-/// Typed per-protocol options, keyed by protocol.
-pub type Options = BTreeMap<String, Value>;
+/// A wire protocol by name: what an [`Origin`] names, and the key a
+/// request's options and a part's state go under. Four exist; a fifth
+/// cannot be spelled.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+pub enum ProtocolKey {
+    #[serde(rename = "openai.chat")]
+    OpenaiChat,
+    #[serde(rename = "openai.responses")]
+    OpenaiResponses,
+    #[serde(rename = "anthropic.messages")]
+    AnthropicMessages,
+    #[serde(rename = "google.gemini")]
+    GoogleGemini,
+}
+
+impl ProtocolKey {
+    /// The key as it is written: in a log's `origin` and `meta`, in a
+    /// request's options.
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::OpenaiChat => "openai.chat",
+            Self::OpenaiResponses => "openai.responses",
+            Self::AnthropicMessages => "anthropic.messages",
+            Self::GoogleGemini => "google.gemini",
+        }
+    }
+}
+
+impl fmt::Display for ProtocolKey {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+
+/// Per-protocol options, each protocol's as body fields, keyed by protocol.
+pub type Options = BTreeMap<ProtocolKey, Value>;
 
 /// One model call.
 #[derive(Clone, Debug, Default, PartialEq, Serialize)]
@@ -67,10 +101,10 @@ pub struct Request {
 }
 
 impl Request {
-    /// The typed options under protocol `key`, as body fields.
-    pub fn options_for(&self, key: &str) -> serde_json::Map<String, Value> {
+    /// The options under protocol `key`, as body fields.
+    pub fn options_for(&self, key: ProtocolKey) -> serde_json::Map<String, Value> {
         self.options
-            .get(key)
+            .get(&key)
             .and_then(Value::as_object)
             .cloned()
             .unwrap_or_default()
@@ -550,7 +584,7 @@ pub struct Opaque {
 /// The wire protocol, provider and model that produced a message.
 #[derive(Clone, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub struct Origin {
-    pub protocol: SmolStr,
+    pub protocol: ProtocolKey,
     pub provider: SmolStr,
     pub model: SmolStr,
 }

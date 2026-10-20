@@ -15,7 +15,7 @@ use crate::json::obj;
 
 use super::cache::{Caching, Markers};
 use super::{
-    Dialect, FINE_GRAINED_TOOL_STREAMING_BETA, KEY, Quirks, THINKING_BINDING_BETA,
+    Dialect, FINE_GRAINED_TOOL_STREAMING_BETA, KEY, PROTOCOL, Quirks, THINKING_BINDING_BETA,
     ToolInputStreaming, options, strict,
 };
 use crate::conversation::{self, Fold, History, Settled};
@@ -44,7 +44,7 @@ pub(super) fn body(
     request: &Request,
 ) -> Result<(Encoded, Option<String>), Error> {
     let model = target.model;
-    let mut options = request.options_for(KEY);
+    let mut options = request.options_for(PROTOCOL);
     let max_tokens = request.generation.max_output_tokens.map(NonZeroU32::get);
     let Some(max_tokens) = max_tokens.or_else(|| quirks.default_max_tokens(model)) else {
         let unset = format!("`max_tokens` must be set for the model {model}");

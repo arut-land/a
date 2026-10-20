@@ -11,10 +11,13 @@ mod encode;
 
 use crate::error::Error;
 use crate::protocol::{Decoder, Encoded, Host, Hosted, KeyStyle, Protocol, Target};
-use crate::spec::Request;
+use crate::spec::{ProtocolKey, Request};
+
+/// Which protocol this is.
+pub const PROTOCOL: ProtocolKey = ProtocolKey::GoogleGemini;
 
 /// Where this protocol's options and part state go.
-pub const KEY: &str = "google.gemini";
+pub const KEY: &str = PROTOCOL.as_str();
 
 /// Which earlier thought signatures a request sends back.
 ///
@@ -67,7 +70,7 @@ impl Gemini {
 impl Hosted for Gemini {
     type Quirks = Quirks;
 
-    const KEY: &'static str = KEY;
+    const PROTOCOL: ProtocolKey = PROTOCOL;
     const HOSTS: &'static [(Host, Quirks)] = HOSTS;
 
     fn with(quirks: Quirks) -> Self {
@@ -76,8 +79,8 @@ impl Hosted for Gemini {
 }
 
 impl Protocol for Gemini {
-    fn key(&self) -> &'static str {
-        KEY
+    fn key(&self) -> ProtocolKey {
+        PROTOCOL
     }
 
     fn encode(&self, target: &Target<'_>, request: &Request) -> Result<Encoded, Error> {

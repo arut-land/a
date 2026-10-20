@@ -27,7 +27,7 @@ fn every_part() -> Value {
                 {"type": "media", "media_type": "application/pdf", "source": {"type": "file", "id": "f1"}},
                 {"type": "opaque", "meta": meta},
             ],
-            "origin": {"protocol": "messages", "provider": "anthropic", "model": "claude"},
+            "origin": {"protocol": "anthropic.messages", "provider": "anthropic", "model": "claude"},
         },
         "finish": {"reason": "tool_calls", "raw": "tool_use", "message": "why"},
         "usage": {
@@ -152,4 +152,19 @@ fn provider_state_is_parsed_only_where_read() {
         written["message"]["content"][0]["meta"],
         every_part()["message"]["content"][0]["meta"]
     );
+}
+
+/// An origin names one of the four protocols; a log naming a fifth is not
+/// this crate's, and no code path can mistake one for its own.
+#[test]
+fn an_origin_names_a_protocol_the_crate_speaks() {
+    let mut reply = every_part();
+    reply["message"]["origin"]["protocol"] = json!("short");
+    let error = Response::from_json(&reply.to_string()).expect_err("no such protocol");
+    assert!(error.to_string().contains("short"), "{error}");
+    reply["message"]["origin"]["protocol"] = json!("openai.chat");
+    let read = Response::from_json(&reply.to_string()).expect("a reply");
+    let origin = read.message.origin.expect("an origin");
+    assert_eq!(origin.protocol, crate::ProtocolKey::OpenaiChat);
+    assert_eq!(origin.protocol.as_str(), "openai.chat");
 }

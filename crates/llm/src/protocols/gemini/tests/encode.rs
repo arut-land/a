@@ -605,7 +605,7 @@ fn tools_choice_and_format_take_gemini_spellings() {
             description: None,
         }),
         options: crate::spec::Options::from([(
-            KEY.to_owned(),
+            PROTOCOL,
             json!({"tools": [{"codeExecution": {}}]}),
         )]),
         ..Request::default()

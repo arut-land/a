@@ -7,7 +7,7 @@ use std::borrow::Cow;
 use serde::Serialize;
 use serde_json::{Map, Value, json};
 
-use super::{Instructions, ItemType, KEY, PartType, Responses, Status};
+use super::{Instructions, ItemType, KEY, PROTOCOL, PartType, Responses, Status};
 use crate::conversation::{self, Fold, History, Settled};
 use crate::error::Error;
 use crate::json::Lenient;
@@ -57,7 +57,7 @@ pub(crate) fn body(
     request: &Request,
 ) -> Result<Encoded, Error> {
     let (model, generation) = (target.model, &request.generation);
-    let mut options = request.options_for(KEY);
+    let mut options = request.options_for(PROTOCOL);
     // Stateless unless the caller keeps the conversation on the provider:
     // every turn is sent whole, and reasoning replays from its ciphertext.
     let stateless = options.get("store").and_then(Value::as_bool) != Some(true)

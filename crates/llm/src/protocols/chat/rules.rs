@@ -12,31 +12,13 @@ use crate::models::{
 };
 use crate::spec::{Effort, Generation};
 
-/// Whose model rules a host's models follow; `None` for a host serving
-/// models of every kind.
-fn maker(vendor: Vendor) -> Option<Maker> {
-    Some(match vendor {
-        Vendor::OpenAi | Vendor::Azure => Maker::OpenAi,
-        Vendor::DeepSeek | Vendor::Mira => Maker::TextOnly,
-        Vendor::Groq => Maker::Groq,
-        Vendor::Mistral => Maker::Mistral,
-        Vendor::Xai => Maker::Xai,
-        Vendor::Cohere => Maker::Cohere,
-        Vendor::Zai => Maker::Zai,
-        Vendor::Moonshot => Maker::Moonshot,
-        Vendor::MiniMax => Maker::MiniMax,
-        Vendor::Mimo => Maker::Xiaomi,
-        _ => return None,
-    })
-}
-
-/// Whether `model` reads user images on a host of `vendor`. An
+/// Whether `model` reads user images on a host with `quirks`. An
 /// `OpenRouter` id names its upstream, whose rule decides.
-pub(super) fn reads_images(vendor: Vendor, model: &str) -> bool {
-    let (maker, model) = match (vendor, model.split_once('/')) {
+pub(super) fn reads_images(quirks: &Quirks, model: &str) -> bool {
+    let (maker, model) = match (quirks.vendor, model.split_once('/')) {
         (Vendor::OpenRouter, Some((upstream, model))) => (Maker::named(upstream), model),
         (Vendor::OpenRouter, None) => (None, model),
-        (vendor, _) => (maker(vendor), model),
+        _ => (quirks.maker, model),
     };
     maker.is_none_or(|maker| maker.reads_images(model))
 }

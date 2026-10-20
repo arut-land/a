@@ -10,7 +10,7 @@ fn cached(options: Value, tools: Vec<Tool>) -> Result<Value, Error> {
         vec![Message::system("System prompt"), Message::user("Hello")],
     );
     request.tools = tools.into();
-    request.options.insert(KEY.to_owned(), options);
+    request.options.insert(PROTOCOL, options);
     encoded(&provider("anthropic"), &request).map(|(body, _)| body)
 }
 

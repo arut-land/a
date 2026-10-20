@@ -12,7 +12,7 @@ use std::num::NonZeroU32;
 use serde::Serialize;
 use serde_json::{Map, Value, json};
 
-use super::{Gemini, KEY, ThoughtReplay};
+use super::{Gemini, KEY, PROTOCOL, ThoughtReplay};
 use crate::conversation::{self, Fold, History, Settled};
 use crate::error::Error;
 use crate::json::{Lenient, obj};
@@ -497,7 +497,7 @@ pub(crate) fn body(
     let contents = Contents::new(model, gemini.quirks.thought_replay);
     let (contents, settled) = conversation::fold(&request.messages, target, contents)?;
     let (tail, system) = contents.finish();
-    let mut options = request.options_for(KEY);
+    let mut options = request.options_for(PROTOCOL);
     let declared =
         (!request.tools.is_empty()).then(|| request.tools.encoded(ToolWire::Gemini, declaration));
     let hosted = crate::protocols::responses::encode::hosted_tools(&mut options);
