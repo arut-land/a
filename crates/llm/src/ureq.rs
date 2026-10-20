@@ -14,6 +14,7 @@ use std::sync::{Arc, Mutex, PoisonError};
 use std::task::Poll;
 use std::time::Duration;
 
+#[cfg(any(feature = "tls-native", feature = "tls-rustls"))]
 use ureq::tls::{RootCerts, TlsConfig, TlsProvider};
 use ureq::unversioned::resolver::DefaultResolver;
 use ureq::unversioned::transport::{
@@ -47,6 +48,7 @@ compile_error!("one TLS provider: tls-native or tls-rustls");
 
 /// The TLS the build chose; without either feature the agent speaks
 /// plain http only.
+#[cfg(any(feature = "tls-native", feature = "tls-rustls"))]
 const PROVIDER: TlsProvider = if cfg!(feature = "tls-native") {
     TlsProvider::NativeTls
 } else {
@@ -55,12 +57,15 @@ const PROVIDER: TlsProvider = if cfg!(feature = "tls-native") {
 
 impl Ureq {
     pub fn new(rt: Arc<dyn rt::Runtime>) -> Self {
-        let tls = TlsConfig::builder()
-            .provider(PROVIDER)
-            .root_certs(RootCerts::PlatformVerifier)
-            .build();
-        let config = ureq::Agent::config_builder()
-            .tls_config(tls)
+        let config = ureq::Agent::config_builder();
+        #[cfg(any(feature = "tls-native", feature = "tls-rustls"))]
+        let config = config.tls_config(
+            TlsConfig::builder()
+                .provider(PROVIDER)
+                .root_certs(RootCerts::PlatformVerifier)
+                .build(),
+        );
+        let config = config
             .http_status_as_error(false)
             .timeout_connect(Some(CONNECT_TIMEOUT))
             .timeout_recv_response(Some(HEAD_TIMEOUT))
