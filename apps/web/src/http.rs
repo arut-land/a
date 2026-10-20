@@ -1,12 +1,12 @@
 //! A small HTTP/1.1 server for one local user: one request per connection,
 //! answered whole, or as an event stream that lasts until the tab goes
-//! away. Socket IO blocks, so it runs on the runtime's blocking threads;
-//! the app runs on its async workers.
+//! away. Each connection is a task waiting on its socket through the
+//! runtime's reactor, so neither a request nor an open tab holds a thread.
 
 use std::future::poll_fn;
 use std::io::{self, Read, Write};
 use std::net::{Shutdown, TcpStream};
-use std::pin::{Pin, pin};
+use std::pin::pin;
 use std::sync::{Arc, Mutex, PoisonError};
 use std::task::Poll;
 use std::time::{Duration, Instant};
@@ -16,8 +16,7 @@ use http::header::{
     SET_COOKIE,
 };
 use http::{HeaderMap, HeaderValue, Request, Response, StatusCode};
-use rt::Rt;
-use rt::oneshot::{self, Receiver};
+use rt::{Async, Rt};
 
 use crate::app::{App, Live};
 
@@ -267,26 +266,29 @@ pub fn see_other(location: &str, cookie: Option<HeaderValue>) -> Response<Vec<u8
     response
 }
 
+/// A connection, registered with the runtime's reactor.
+type Stream = Async<TcpStream>;
+
 /// Serves one connection: a single request, then closes.
 pub async fn serve(rt: Rt, app: Arc<App>, stream: TcpStream) {
-    let stream = Arc::new(stream);
-    let _ = respond(&rt, &app, &stream).await;
-    // Also wakes the probe of `closed`, which holds a duplicate.
-    let _ = stream.shutdown(Shutdown::Both);
+    let Ok(stream) = Async::socket(&rt.reactor(), stream) else {
+        return;
+    };
+    let _ = respond(&app, &stream).await;
+    let _ = stream.get_ref().shutdown(Shutdown::Both);
 }
 
-async fn respond(rt: &Rt, app: &Arc<App>, stream: &Arc<TcpStream>) -> io::Result<()> {
-    let from = Arc::clone(stream);
-    let request = match rt::unblock(&**rt, move || read_request(&from)).await {
+async fn respond(app: &Arc<App>, stream: &Stream) -> io::Result<()> {
+    let request = match read_request(stream).await {
         Ok(request) => request,
         Err(e) if e.kind() == io::ErrorKind::InvalidData => {
-            return send_whole(rt, stream, text(StatusCode::BAD_REQUEST, &e.to_string())).await;
+            return send_whole(stream, text(StatusCode::BAD_REQUEST, &e.to_string())).await;
         }
         Err(e) => return Err(e),
     };
     let cookie = match app.gate.answer(&request) {
         Ok(cookie) => cookie,
-        Err(response) => return send_whole(rt, stream, *response).await,
+        Err(response) => return send_whole(stream, *response).await,
     };
     if request.uri().path() == SCRIPT_PATH {
         // Every browser takes deflate; only browsers load the script.
@@ -297,26 +299,32 @@ async fn respond(rt: &Rt, app: &Arc<App>, stream: &Arc<TcpStream>) -> io::Result
             CACHE_CONTROL,
             HeaderValue::from_static("private, max-age=31536000, immutable"),
         );
-        return send_whole(rt, stream, response).await;
+        return send_whole(stream, response).await;
     }
     match app.handle(request).await {
         Reply::Whole(mut response) => {
             if let Some(cookie) = cookie {
                 response.headers_mut().insert(SET_COOKIE, cookie);
             }
-            send_whole(rt, stream, response).await
+            send_whole(stream, response).await
         }
-        Reply::Events(live) => send_events(rt, stream, live).await,
+        Reply::Events(live) => send_events(stream, live).await,
     }
 }
 
-fn read_request(mut stream: &TcpStream) -> io::Result<Request<Vec<u8>>> {
+/// Reads what the socket has, up to `chunk`'s length, waiting until it has
+/// some.
+async fn read(stream: &Stream, chunk: &mut [u8]) -> io::Result<usize> {
+    stream.read_with(|mut s| s.read(chunk)).await
+}
+
+async fn read_request(stream: &Stream) -> io::Result<Request<Vec<u8>>> {
     let invalid =
         |e: &dyn std::fmt::Display| io::Error::new(io::ErrorKind::InvalidData, e.to_string());
     let mut buf = Vec::with_capacity(4096);
-    let mut chunk = [0; 4096];
+    let mut chunk = vec![0; 4096];
     loop {
-        let n = stream.read(&mut chunk)?;
+        let n = read(stream, &mut chunk).await?;
         if n == 0 {
             return Err(io::ErrorKind::UnexpectedEof.into());
         }
@@ -347,7 +355,7 @@ fn read_request(mut stream: &TcpStream) -> io::Result<Request<Vec<u8>>> {
         }
         let mut body = buf[head..].to_vec();
         while body.len() < length {
-            let n = stream.read(&mut chunk)?;
+            let n = read(stream, &mut chunk).await?;
             if n == 0 {
                 return Err(io::ErrorKind::UnexpectedEof.into());
             }
@@ -356,20 +364,6 @@ fn read_request(mut stream: &TcpStream) -> io::Result<Request<Vec<u8>>> {
         body.truncate(length);
         return request.body(body).map_err(|e| invalid(&e));
     }
-}
-
-/// Ends when the browser closes the connection, which it does when the tab
-/// goes away: a stream waiting on the daemon would otherwise notice only
-/// on its next write.
-fn closed(rt: &Rt, stream: &TcpStream) -> io::Result<Receiver<()>> {
-    let mut probe = stream.try_clone()?;
-    let (tx, rx) = oneshot::channel();
-    rt.spawn_blocking(Box::new(move || {
-        // One request per connection: anything read now is the end.
-        let _ = probe.read(&mut [0; 1]);
-        drop(tx);
-    }));
-    Ok(rx)
 }
 
 fn head(status: StatusCode, headers: &HeaderMap) -> Vec<u8> {
@@ -392,37 +386,43 @@ fn head(status: StatusCode, headers: &HeaderMap) -> Vec<u8> {
     head
 }
 
-async fn write(rt: &Rt, stream: &Arc<TcpStream>, bytes: Vec<u8>) -> io::Result<()> {
-    let stream = Arc::clone(stream);
-    rt::unblock(&**rt, move || (&*stream).write_all(&bytes)).await
+/// Writes all of `bytes`, waiting whenever the socket is full.
+async fn write(stream: &Stream, mut bytes: &[u8]) -> io::Result<()> {
+    while !bytes.is_empty() {
+        match stream.write_with(|mut s| s.write(bytes)).await? {
+            0 => return Err(io::ErrorKind::WriteZero.into()),
+            n => bytes = &bytes[n..],
+        }
+    }
+    Ok(())
 }
 
-async fn send_whole(
-    rt: &Rt,
-    stream: &Arc<TcpStream>,
-    response: Response<Vec<u8>>,
-) -> io::Result<()> {
+async fn send_whole(stream: &Stream, response: Response<Vec<u8>>) -> io::Result<()> {
     let (parts, body) = response.into_parts();
     let mut bytes = head(parts.status, &parts.headers);
     bytes.extend_from_slice(format!("content-length: {}\r\n\r\n", body.len()).as_bytes());
     bytes.extend_from_slice(&body);
-    write(rt, stream, bytes).await
+    write(stream, &bytes).await
 }
 
 /// Writes each batch of events as soon as `live` has it, until it ends or
-/// the browser goes away. The body runs to the end of the connection.
-async fn send_events(rt: &Rt, stream: &Arc<TcpStream>, mut live: Box<Live>) -> io::Result<()> {
-    let mut closed = closed(rt, stream)?;
+/// the browser goes away: it closes the connection when the tab goes, and
+/// one request per connection means anything read now is that end. A
+/// stream waiting on the daemon would otherwise notice only on its next
+/// write. The body runs to the end of the connection.
+async fn send_events(stream: &Stream, mut live: Box<Live>) -> io::Result<()> {
     let mut headers = HeaderMap::new();
     headers.insert(CONTENT_TYPE, HeaderValue::from_static("text/event-stream"));
     let mut bytes = head(StatusCode::OK, &headers);
     bytes.extend_from_slice(b"\r\n");
-    write(rt, stream, bytes).await?;
+    write(stream, &bytes).await?;
+    let mut probe = [0; 1];
+    let mut closed = pin!(read(stream, &mut probe));
     loop {
         let next = {
             let mut events = pin!(live.next());
             poll_fn(|cx| {
-                if Pin::new(&mut closed).poll(cx).is_ready() {
+                if closed.as_mut().poll(cx).is_ready() {
                     return Poll::Ready(None);
                 }
                 events.as_mut().poll(cx)
@@ -431,7 +431,7 @@ async fn send_events(rt: &Rt, stream: &Arc<TcpStream>, mut live: Box<Live>) -> i
         };
         // The stream ended, or the browser left.
         let Some(events) = next else { return Ok(()) };
-        write(rt, stream, events).await?;
+        write(stream, &events).await?;
     }
 }
 
