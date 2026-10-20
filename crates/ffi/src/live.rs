@@ -541,7 +541,7 @@ mod tests {
                 .unwrap()
             });
             numbering.recv().unwrap();
-            assert!(session.sending.try_lock().is_err());
+            let serialized = session.sending.try_lock().is_err();
             let (started, starting) = mpsc::channel();
             let second = scope.spawn(move || {
                 started.send(()).unwrap();
@@ -551,6 +551,7 @@ mod tests {
             release.send(()).unwrap();
             first.join().unwrap();
             second.join().unwrap();
+            assert!(serialized);
         });
         for seq in [2, 3] {
             assert_eq!(
@@ -582,9 +583,10 @@ mod tests {
             queueing.recv().unwrap();
             // Connected competes with the input while its numbering/pump lock is held.
             write_frame(&mut peer, &welcome).unwrap();
-            assert!(session.sending.try_lock().is_err());
+            let serialized = session.sending.try_lock().is_err();
             release.send(()).unwrap();
             input.join().unwrap();
+            assert!(serialized);
         });
         for seq in [1, 2, 3, 4] {
             assert_eq!(
