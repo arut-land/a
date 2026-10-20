@@ -19,6 +19,7 @@ use serde_json::{Value, json};
 
 use super::*;
 
+mod bench;
 mod durable;
 mod interrupt;
 mod later;
