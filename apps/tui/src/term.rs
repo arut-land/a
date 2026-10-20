@@ -3,8 +3,9 @@
 //! the app's events.
 
 use std::io::{self, Write};
-use std::sync::{Mutex, Once, PoisonError};
+use std::sync::{Mutex, Once, PoisonError, mpsc};
 use std::thread;
+use std::time::Duration;
 
 use rustix::event::{PollFd, PollFlags, poll};
 use rustix::io::Errno;
@@ -68,9 +69,12 @@ impl Drop for Terminal {
     }
 }
 
+/// The mode first: it never blocks, where the escapes wait for a
+/// terminal that reads them.
 fn restore() {
     let held = HELD.lock().unwrap_or_else(PoisonError::into_inner).take();
     if let Some((viewport, cooked)) = held {
+        let _ = tcsetattr(rustix::stdio::stdin(), OptionalActions::Now, &cooked);
         let mut out = io::stdout().lock();
         let _ = out.write_all(LEAVE);
         if viewport == Viewport::Full {
@@ -78,8 +82,25 @@ fn restore() {
         }
         let _ = out.write_all(b"\x1b[?25h");
         let _ = out.flush();
-        let _ = tcsetattr(rustix::stdio::stdin(), OptionalActions::Now, &cooked);
     }
+}
+
+/// How long a signal that ends the client waits for the terminal to take
+/// the escapes that give it back.
+const GIVE_BACK: Duration = Duration::from_millis(500);
+
+/// Ends the client as `signal` would, the terminal given back first if it
+/// takes it in time: a terminal nobody reads (its emulator hung, or gone
+/// with a copy of its master left open) blocks every write, and must not
+/// keep the client alive past a SIGTERM.
+fn end(signal: Signal) -> ! {
+    let (given, wait) = mpsc::channel();
+    thread::spawn(move || {
+        restore();
+        let _ = given.send(());
+    });
+    let _ = wait.recv_timeout(GIVE_BACK);
+    sys::reraise(signal)
 }
 
 /// The terminal's columns and rows.
@@ -88,55 +109,61 @@ pub fn size() -> io::Result<(u16, u16)> {
     Ok((size.ws_col, size.ws_row))
 }
 
-/// Reads the terminal and `signals` on a thread of its own until stdin is
-/// gone. It blocks in `poll` with no timeout: an idle client never wakes.
-/// What it posts goes ahead of the daemon's backlog in the inbox: a key
-/// or a resize is folded before a replay still queued.
+/// Reads the terminal and `signals` on a thread of its own. It blocks in
+/// `poll` with no timeout: an idle client never wakes. What it posts goes
+/// ahead of the daemon's backlog in the inbox: a key or a resize is folded
+/// before a replay still queued. Once stdin is gone it goes on reading the
+/// signals, which are caught for as long as the process lives: the client
+/// may yet have a while to go, and a SIGTERM must end it all the same.
 pub fn spawn_input(tx: client::Post<Event>, signals: Signals) {
     thread::spawn(move || {
         let stdin = rustix::stdio::stdin();
         let mut decoder = Decoder::default();
         let mut buf = [0; 4096];
+        let mut open = true;
         loop {
             let mut fds = [
-                PollFd::new(&stdin, PollFlags::IN),
                 PollFd::new(&signals, PollFlags::IN),
+                PollFd::new(&stdin, PollFlags::IN),
             ];
-            match poll(&mut fds, None) {
+            let polled = if open { &mut fds[..] } else { &mut fds[..1] };
+            match poll(polled, None) {
                 Ok(_) | Err(Errno::INTR) => {}
-                Err(_) => break,
+                Err(_) => return,
             }
-            let (input, signalled) = (!fds[0].revents().is_empty(), !fds[1].revents().is_empty());
+            let (signalled, input) = (!fds[0].revents().is_empty(), !fds[1].revents().is_empty());
             let mut resized = false;
             if signalled {
                 for signal in signals.take() {
                     if signal == Signal::Resize {
                         resized = true;
                     } else {
-                        restore();
-                        sys::reraise(signal);
+                        end(signal);
                     }
                 }
             }
-            if resized && tx.send_first(Event::Resized).is_err() {
-                return;
+            if resized && open && tx.send_first(Event::Resized).is_err() {
+                open = false;
             }
-            if input {
+            if input && open {
                 let n = match rustix::io::read(stdin, &mut buf) {
-                    Ok(0) => break,
-                    Ok(n) => n,
+                    Ok(n @ 1..) => n,
                     Err(Errno::INTR | Errno::AGAIN) => continue,
-                    Err(_) => break,
+                    Ok(0) | Err(_) => {
+                        open = false;
+                        let _ = tx.send(Event::InputClosed);
+                        continue;
+                    }
                 };
                 // A full buffer says more is waiting: an ESC it ends with
                 // may start a sequence.
                 for input in decoder.feed(&buf[..n], n == buf.len()) {
                     if tx.send_first(Event::Input(input)).is_err() {
-                        return;
+                        open = false;
+                        break;
                     }
                 }
             }
         }
-        let _ = tx.send(Event::InputClosed);
     });
 }
