@@ -115,15 +115,23 @@ const HELP: &[(&str, &str)] = &[
     ("enter", "send"),
     ("ctrl-j / alt-enter", "new line"),
     ("↑ ↓", "move in the input, then through history"),
-    ("y / n", "answer the oldest approval (input empty)"),
+    (
+        "↑/↓ enter / 1/y / 2/n",
+        "choose or answer the oldest approval (input empty)",
+    ),
     ("pgup / pgdn / wheel", "scroll the transcript"),
-    ("esc", "back to the latest output"),
+    (
+        "esc",
+        "deny approval, interrupt the turn, or return to latest output",
+    ),
     ("ctrl-o", "show every card's whole output"),
     ("click a card", "fold or unfold it"),
     (
         "ctrl-c",
         "interrupt the running turn; else clear the input, or detach",
     ),
+    ("ctrl-d", "detach with an empty input"),
+    ("? / F1", "keys and commands"),
     ("ctrl-l", "redraw"),
 ];
 
@@ -308,7 +316,7 @@ impl App {
             Input::Mouse(mouse) => self.mouse(mouse),
             Input::Paste(text) => {
                 if self.overlay.is_none() {
-                    self.editor.insert(&text.replace('\t', "    "));
+                    self.editor.paste(&text.replace('\t', "    "));
                 }
                 None
             }
@@ -335,6 +343,9 @@ impl App {
             Key::PageUp => self.scroll_by(page),
             Key::PageDown => self.scroll_by(-page),
             Key::F(1) => self.overlay = Some(Overlay::Help),
+            Key::Char('?') if self.editor.is_empty() && asked.is_none() => {
+                self.overlay = Some(Overlay::Help);
+            }
             Key::Esc if self.anchor.is_some() => self.anchor = None,
             Key::Char(c @ ('y' | 'n' | 'Y' | 'N' | '1' | '2'))
                 if self.editor.is_empty() && asked.is_some() =>
@@ -595,6 +606,14 @@ impl Renderer for App {
                     }
                 }
             }
+        }
+        if self.working() {
+            self.since
+                .get_or_insert_with(|| (std::time::Instant::now(), self.tokens.output));
+        } else {
+            // Several turns can settle between frames; none may inherit
+            // the preceding turn's clock.
+            self.since = None;
         }
         asked
     }

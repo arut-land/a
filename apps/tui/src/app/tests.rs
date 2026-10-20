@@ -155,7 +155,7 @@ fn an_approval_shows_buttons_and_y_or_a_click_answers_it() {
     assert!(rows.iter().any(|r| r == "❯ $ ls"), "{rows:#?}");
     find(&rows, "⏺ $ ls  ? waiting for approval");
     let bar = find(&rows, "Do you want to proceed? $ ls");
-    assert_eq!(bar.1, 13, "above the input: {rows:#?}");
+    assert_eq!(bar.1 + 3, find(&rows, &"─".repeat(70)).1);
     assert!(matches!(
         press(&mut app, Key::Char('y')),
         Some(Effect::Cmd(Cmd::Approve { call, approved: true })) if call.get() == 3
@@ -362,11 +362,12 @@ fn the_wheel_scrolls_and_new_rows_keep_a_scrolled_view_still() {
 }
 
 #[test]
-fn the_empty_input_hint_starts_after_the_caret() {
+fn hints_stay_below_the_input_and_leave_the_caret_clear() {
     let (mut app, _) = app(Viewport::Full, &[]);
     let (screen, rows) = frame(&mut app, 60, 10);
     let (x, y) = find(&rows, "message the agent");
-    assert_eq!(screen.caret, Some((x - 1, y)));
+    assert_eq!(x, 0);
+    assert_eq!(screen.caret, Some((2, y - 2)));
 }
 
 #[test]
@@ -977,10 +978,10 @@ fn the_input_sits_between_two_rules() {
     let (_, rows) = frame(&mut app, 30, 10);
     let rule = "─".repeat(30);
     assert_eq!(
-        (rows[6].as_str(), rows[8].as_str()),
+        (rows[5].as_str(), rows[7].as_str()),
         (rule.as_str(), rule.as_str())
     );
-    assert!(rows[7].starts_with("❯ "), "{rows:#?}");
+    assert!(rows[6].starts_with("❯"), "{rows:#?}");
 }
 
 #[test]
@@ -1015,11 +1016,13 @@ fn running_command() -> Vec<DaemonMsg> {
 
 #[test]
 fn esc_interrupts_a_running_turn_that_asks_nothing() {
-    let (mut app, _) = app(Viewport::Full, &running_command());
-    assert!(matches!(
-        press(&mut app, Key::Esc),
-        Some(Effect::Cmd(Cmd::Interrupt))
-    ));
+    for viewport in [Viewport::Full, Viewport::Inline] {
+        let (mut app, _) = app(viewport, &running_command());
+        assert!(matches!(
+            press(&mut app, Key::Esc),
+            Some(Effect::Cmd(Cmd::Interrupt))
+        ));
+    }
 }
 
 #[test]
@@ -1074,4 +1077,21 @@ fn no_timer_runs_unless_a_turn_is_working() {
     assert!(!busy.working(), "the turn ended; the timer stops with it");
     let (_, rows) = frame(&mut busy, 70, 20);
     assert!(!rows.iter().any(|r| r.contains("Working")), "{rows:#?}");
+    busy.tick();
+    assert!(
+        !busy.needs_frame(),
+        "a finished turn cannot schedule animation"
+    );
+    assert!(busy.since.is_none());
+}
+
+#[test]
+fn a_question_mark_on_an_empty_input_opens_help_and_inside_text_is_typed() {
+    let (mut app, _) = app(Viewport::Full, &[DaemonMsg::Synced { seq: 0 }]);
+    press(&mut app, Key::Char('?'));
+    let (_, rows) = frame(&mut app, 80, 40);
+    find(&rows, "keys and commands");
+    press(&mut app, Key::Char('q'));
+    keys(&mut app, "why?");
+    assert_eq!(app.editor.text(), "why?");
 }

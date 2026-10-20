@@ -136,7 +136,15 @@ impl App {
                 let cyan = Style::new().fg(Color::Cyan);
                 Line::from([
                     Span::button(mark, cyan, Action::Approve(*call, yes)),
-                    Span::button(label, Style::new(), Action::Approve(*call, yes)),
+                    Span::button(
+                        label,
+                        if yes != self.deny {
+                            cyan.bold()
+                        } else {
+                            Style::new()
+                        },
+                        Action::Approve(*call, yes),
+                    ),
                 ])
             };
             let at = |no: bool| if no == self.deny { "❯ " } else { "  " };
@@ -149,26 +157,20 @@ impl App {
         out.extend(working);
         out.extend(self.menu_rows(width));
         out.push(rule.clone());
-        let (mut rows, (cx, cy)) = self.editor.lines(width, USER);
-        if self.editor.is_empty() {
-            // From the column after the caret, which would hide a first
-            // letter under it.
-            let hint = if asked.is_some() {
-                " enter confirms · 1/y yes · 2/n/esc no"
-            } else if self.client.view().session.is_none() {
-                ""
-            } else if self.client.turn().running {
-                " esc stops the tool · /help"
-            } else {
-                " message the agent · /help"
-            };
-            rows[0].spans.push(Span::new(hint, MUTED));
-        }
+        let (rows, (cx, cy)) = self.editor.lines(width, USER);
         // The caret's row stays in view.
         let skip = usize::from(cy).saturating_sub(INPUT_ROWS - 1);
         let caret_row = out.len() + usize::from(cy) - skip;
         out.extend(rows.into_iter().skip(skip).take(INPUT_ROWS));
         out.push(rule);
+        let hint = if asked.is_some() {
+            "↑/↓ choose · enter confirms · 1/y yes · 2/n/esc no"
+        } else if self.client.turn().running {
+            "esc stops it · ? help"
+        } else {
+            "message the agent · / commands · ? help"
+        };
+        out.push(Line::plain(ellipsize(hint, width), MUTED));
         out.push(self.status(width, summary.reply));
         let last_col = u16::try_from(width.saturating_sub(1)).unwrap_or(u16::MAX);
         let caret = self.overlay.is_none().then(|| {

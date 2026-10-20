@@ -110,8 +110,7 @@ fn reply(p: &Presented<'_>, width: usize) -> Vec<Line> {
     let mut out = vec![Line::default()];
     match (p.glyph, &p.body) {
         // The indicator under the transcript says a call is out.
-        (Glyph::Busy, _) => return Vec::new(),
-        (Glyph::None, Shown::Markdown("")) => return Vec::new(),
+        (Glyph::Busy, _) | (Glyph::None, Shown::Markdown("")) => return Vec::new(),
         (Glyph::None, body) => {
             out.extend(markdown(&body.text(), width, Style::new()));
             mark_reply(&mut out);
