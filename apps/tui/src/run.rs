@@ -44,10 +44,15 @@ pub fn run(daemon: &Daemon, target: Target, viewport: Viewport) -> io::Result<()
     // raw; the input thread reads them.
     let signals = Signals::catch(&term::SIGNALS)?;
     let terminal = Terminal::enter(viewport)?;
+    let mut screen = Screen::new(viewport, Stdout::default());
+    // no-color.org: set and not empty.
+    if std::env::var_os("NO_COLOR").is_some_and(|v| !v.is_empty()) {
+        screen = screen.without_colour();
+    }
     let mut client = Client {
         driver,
         app,
-        screen: Screen::new(viewport, Stdout::default()),
+        screen,
     };
     // The first frame goes out before the daemon is even reached, or the
     // git root walked up to.
