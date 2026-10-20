@@ -332,7 +332,8 @@ impl SessionClient {
     /// Makes `attach` on a new connection, leaving the current one.
     pub fn attach(&mut self, attach: Attach) -> Vec<Effect> {
         let mut out = self.leave();
-        if !matches!(attach.target, Target::Id(id) if self.view.session == Some(id)) {
+        if !matches!((&attach.target, &self.opened.target), (Target::Id(a), Target::Id(b)) if a == b)
+        {
             self.unanswered.clear();
             self.queued.clear();
         }
@@ -459,6 +460,9 @@ impl SessionClient {
 
     fn msg(&mut self, msg: &DaemonMsg, out: &mut Vec<Effect>) {
         match msg {
+            DaemonMsg::Attached { session, .. } => {
+                self.opened.target = Target::Id(*session);
+            }
             DaemonMsg::Sessions { .. } => {
                 self.sessions.fold(msg);
                 out.push(Effect::Show(Show::Sessions));
@@ -513,8 +517,12 @@ impl SessionClient {
     /// left it, keeping the environment it has.
     fn reattach(&self) -> Option<Attach> {
         Some(Attach {
-            target: Target::Id(self.view.session?),
-            since: self.view.seq,
+            target: self.opened.target.clone(),
+            since: if self.opened.target == Target::Id(self.view.session?) {
+                self.view.seq
+            } else {
+                0
+            },
             env: Env::Keep,
             workspace: self.opened.workspace.clone(),
         })
@@ -831,6 +839,31 @@ mod tests {
         client.step(msg(2, DaemonMsg::Ack { client_seq: 1 }));
         let out = client.run(Cmd::Input("accepted".into()));
         assert_eq!(sends(&out)[0].client_seq(), Some(65));
+    }
+
+    #[test]
+    fn pending_input_follows_the_opened_target_before_it_attaches() {
+        for reopen_same in [false, true] {
+            for restart in [false, true] {
+                let (mut client, a) = attached(Env::Keep);
+                let b = SessionId::new();
+                client.open(Target::Id(b));
+                client.run(Cmd::Input("for B only".into()));
+                if restart {
+                    let out = client.restart();
+                    assert_eq!(connects(&out)[0].1.target, Target::Id(b));
+                } else {
+                    client.open(Target::Id(if reopen_same { b } else { a }));
+                }
+                let conn = client.connection().0;
+                let out = client.step(live(conn, Caps::ALL));
+                assert_eq!(
+                    sends(&out).len(),
+                    usize::from(restart || reopen_same),
+                    "{out:?}"
+                );
+            }
+        }
     }
 
     #[test]
