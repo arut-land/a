@@ -44,19 +44,23 @@ pub enum Viewport {
     Inline,
 }
 
+/// `A_TUI=plain` (or `0`, `off`): the line REPL, wherever `a` runs.
+pub fn plain() -> bool {
+    matches!(std::env::var("A_TUI").as_deref(), Ok("plain" | "0" | "off"))
+}
+
 /// The client to run at this terminal: none (the line REPL) unless stdin
-/// and stdout are both terminals; `A_TUI=plain` asks for lines anyway,
+/// and stdout are both terminals; [`plain`] asks for lines anyway,
 /// `A_TUI=inline` for the inline viewport.
 pub fn viewport() -> Option<Viewport> {
     // The daemon is Unix only for now: elsewhere the REPL says so.
     if !cfg!(unix) || !io::stdin().is_terminal() || !io::stdout().is_terminal() {
         return None;
     }
-    if std::env::var_os("TERM").is_some_and(|t| t == "dumb") {
+    if plain() || std::env::var_os("TERM").is_some_and(|t| t == "dumb") {
         return None;
     }
     match std::env::var("A_TUI").as_deref() {
-        Ok("plain" | "0" | "off") => None,
         Ok("inline") => Some(Viewport::Inline),
         _ => Some(Viewport::Full),
     }
