@@ -18,10 +18,8 @@ httparse = { version = "1", default-features = false, features = ["std"] }
 # macros run at build time only.
 hypertext = { version = "0.12.1", default-features = false, features = ["alloc"] }
 
-[build-dependencies]
-miniz_oxide = "0.8"
-
 [dev-dependencies]
+# Inflates the committed script to hold it to the published one.
 miniz_oxide = "0.8"
 
 [lints]

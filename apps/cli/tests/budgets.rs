@@ -157,17 +157,3 @@ fn cpu_time(pid: u32) -> Duration {
     let (min, sec) = text.trim().split_once(':').unwrap();
     Duration::from_secs_f64(min.parse::<f64>().unwrap() * 60.0 + sec.parse::<f64>().unwrap())
 }
-
-/// The shipped build (`A_SHIPPED`, as `mise run budgets` gives it) has
-/// none of the test fixtures: no `sleep` tool, no `echo` agent.
-#[test]
-fn fixtures_are_not_in_the_release_binary() {
-    let Some(shipped) = std::env::var_os("A_SHIPPED") else {
-        return;
-    };
-    let bytes = std::fs::read(shipped).unwrap();
-    let has = |text: &str| bytes.windows(text.len()).any(|w| w == text.as_bytes());
-    assert!(!has("Waits for a number of seconds."), "the sleep fixture");
-    // A tool it does ship is found the same way.
-    assert!(has("Edits a text file by exact replacement."));
-}

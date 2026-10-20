@@ -208,26 +208,12 @@ mod imp {
     /// batch rather than once each default 8 KiB macOS buffers.
     pub fn accept(listener: &UnixListener) -> io::Result<UnixStream> {
         let (stream, _) = listener.accept()?;
-        let size: libc::c_int = SEND_BUFFER;
-        // SAFETY: `stream` is an open socket we own, and `size` is a
-        // c_int that outlives the call, whose length we pass.
-        let set = unsafe {
-            libc::setsockopt(
-                std::os::fd::AsRawFd::as_raw_fd(&stream),
-                libc::SOL_SOCKET,
-                libc::SO_SNDBUF,
-                (&raw const size).cast(),
-                INT_LEN,
-            )
-        };
         // Only a speed-up: a socket that keeps its default still works.
-        let _ = set;
+        let _ = rustix::net::sockopt::set_socket_send_buffer_size(&stream, SEND_BUFFER);
         Ok(stream)
     }
 
-    const SEND_BUFFER: libc::c_int = 256 << 10;
-    #[expect(clippy::cast_possible_truncation, reason = "a c_int is 4 bytes")]
-    const INT_LEN: libc::socklen_t = size_of::<libc::c_int>() as libc::socklen_t;
+    const SEND_BUFFER: usize = 256 << 10;
 
     pub fn listener_nonblocking(listener: &UnixListener, nonblocking: bool) -> io::Result<()> {
         listener.set_nonblocking(nonblocking)

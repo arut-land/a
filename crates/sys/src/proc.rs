@@ -431,28 +431,37 @@ mod imp {
         std::os::unix::process::ExitStatusExt::signal(&status).map(signal_name)
     }
 
-    /// A signal's name, such as `SIGKILL`.
-    pub(crate) fn signal_name(raw: i32) -> String {
+    /// The signals a process is commonly ended by, each with its name.
+    const SIGNAL_NAMES: [(process::Signal, &str); 15] = {
         use process::Signal as S;
-        let name = match S::from_named_raw(raw) {
-            Some(S::HUP) => "SIGHUP",
-            Some(S::INT) => "SIGINT",
-            Some(S::QUIT) => "SIGQUIT",
-            Some(S::ILL) => "SIGILL",
-            Some(S::TRAP) => "SIGTRAP",
-            Some(S::ABORT) => "SIGABRT",
-            Some(S::BUS) => "SIGBUS",
-            Some(S::FPE) => "SIGFPE",
-            Some(S::KILL) => "SIGKILL",
-            Some(S::USR1) => "SIGUSR1",
-            Some(S::SEGV) => "SIGSEGV",
-            Some(S::USR2) => "SIGUSR2",
-            Some(S::PIPE) => "SIGPIPE",
-            Some(S::ALARM) => "SIGALRM",
-            Some(S::TERM) => "SIGTERM",
-            _ => return format!("signal {raw}"),
-        };
-        name.to_owned()
+        [
+            (S::HUP, "SIGHUP"),
+            (S::INT, "SIGINT"),
+            (S::QUIT, "SIGQUIT"),
+            (S::ILL, "SIGILL"),
+            (S::TRAP, "SIGTRAP"),
+            (S::ABORT, "SIGABRT"),
+            (S::BUS, "SIGBUS"),
+            (S::FPE, "SIGFPE"),
+            (S::KILL, "SIGKILL"),
+            (S::USR1, "SIGUSR1"),
+            (S::SEGV, "SIGSEGV"),
+            (S::USR2, "SIGUSR2"),
+            (S::PIPE, "SIGPIPE"),
+            (S::ALARM, "SIGALRM"),
+            (S::TERM, "SIGTERM"),
+        ]
+    };
+
+    /// A signal's name, such as `SIGKILL`; one without a name is given by
+    /// its number.
+    pub(crate) fn signal_name(raw: i32) -> String {
+        let named = process::Signal::from_named_raw(raw)
+            .and_then(|signal| SIGNAL_NAMES.iter().find(|(s, _)| *s == signal));
+        match named {
+            Some((_, name)) => (*name).to_owned(),
+            None => format!("signal {raw}"),
+        }
     }
 
     fn pid(raw: u32) -> io::Result<process::Pid> {

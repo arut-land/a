@@ -1,5 +1,7 @@
-//! A channel from any producer to an async consumer: the sender of a
-//! bounded channel parks while it is full, the receiver is a stream.
+//! A channel from any producer to an async consumer. The receiver is a
+//! stream; which sender a channel has says what sending costs: an
+//! unbounded channel's never waits, a bounded channel's parks its thread
+//! while the channel is full, so an async task cannot hold one.
 
 use std::collections::VecDeque;
 use std::future::Future;
@@ -34,40 +36,13 @@ impl<T> Shared<T> {
     fn state(&self) -> MutexGuard<'_, State<T>> {
         lock(&self.state)
     }
-}
 
-pub struct Sender<T>(Arc<Shared<T>>);
-
-pub struct Receiver<T>(Arc<Shared<T>>);
-
-pub fn bounded<T>(capacity: usize) -> (Sender<T>, Receiver<T>) {
-    let shared = Arc::new(Shared {
-        state: Mutex::new(State {
-            items: VecDeque::new(),
-            closed: false,
-            receiver_gone: false,
-            waker: None,
-        }),
-        space: Condvar::new(),
-        capacity: capacity.max(1),
-    });
-    (Sender(Arc::clone(&shared)), Receiver(shared))
-}
-
-/// A channel whose sender never waits, for producers that must not block,
-/// such as async tasks.
-pub fn unbounded<T>() -> (Sender<T>, Receiver<T>) {
-    bounded(usize::MAX)
-}
-
-impl<T> Sender<T> {
-    /// Sends `item`, blocking while the channel is full. `Err` gives the item
-    /// back once the receiver is gone.
-    pub fn send(&self, item: T) -> Result<(), T> {
-        let shared = &self.0;
-        let mut state = shared.state();
-        while state.items.len() >= shared.capacity && !state.receiver_gone {
-            state = wait(&shared.space, state);
+    /// Queues `item` once there is room, parking while there is none;
+    /// `Err` gives it back once the receiver is gone.
+    fn push(&self, item: T) -> Result<(), T> {
+        let mut state = self.state();
+        while state.items.len() >= self.capacity && !state.receiver_gone {
+            state = wait(&self.space, state);
         }
         if state.receiver_gone {
             return Err(item);
@@ -76,13 +51,72 @@ impl<T> Sender<T> {
         state.wake();
         Ok(())
     }
+
+    fn close(&self) {
+        let mut state = self.state();
+        state.closed = true;
+        state.wake();
+    }
+}
+
+/// The sender of an unbounded channel: it never waits, so an async task
+/// may hold one.
+pub struct Sender<T>(Arc<Shared<T>>);
+
+/// The sender of a bounded channel: it parks its thread while the channel
+/// is full, so only a blocking thread may hold one.
+pub struct BlockingSender<T>(Arc<Shared<T>>);
+
+pub struct Receiver<T>(Arc<Shared<T>>);
+
+fn channel<T>(capacity: usize) -> (Arc<Shared<T>>, Receiver<T>) {
+    let shared = Arc::new(Shared {
+        state: Mutex::new(State {
+            items: VecDeque::new(),
+            closed: false,
+            receiver_gone: false,
+            waker: None,
+        }),
+        space: Condvar::new(),
+        capacity,
+    });
+    (Arc::clone(&shared), Receiver(shared))
+}
+
+pub fn bounded<T>(capacity: usize) -> (BlockingSender<T>, Receiver<T>) {
+    let (shared, rx) = channel(capacity.max(1));
+    (BlockingSender(shared), rx)
+}
+
+pub fn unbounded<T>() -> (Sender<T>, Receiver<T>) {
+    let (shared, rx) = channel(usize::MAX);
+    (Sender(shared), rx)
+}
+
+impl<T> Sender<T> {
+    /// Sends `item`; `Err` gives it back once the receiver is gone.
+    pub fn send(&self, item: T) -> Result<(), T> {
+        self.0.push(item)
+    }
 }
 
 impl<T> Drop for Sender<T> {
     fn drop(&mut self) {
-        let mut state = self.0.state();
-        state.closed = true;
-        state.wake();
+        self.0.close();
+    }
+}
+
+impl<T> BlockingSender<T> {
+    /// Sends `item`, parking while the channel is full. `Err` gives the
+    /// item back once the receiver is gone.
+    pub fn send(&self, item: T) -> Result<(), T> {
+        self.0.push(item)
+    }
+}
+
+impl<T> Drop for BlockingSender<T> {
+    fn drop(&mut self) {
+        self.0.close();
     }
 }
 

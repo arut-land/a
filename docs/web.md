@@ -1,0 +1,86 @@
+# The web UI (`a web`, `apps/web`)
+
+`a web` is a client process like the terminal client: it serves a browser
+UI on a random port of 127.0.0.1, prints a link that works once, opens the
+browser (`--no-open` only prints), and runs until stopped. Closing it stops
+only the UI; sessions keep running in the daemon. Every page and patch is
+rendered in Rust (hypertext's typed markup); in the browser, Datastar
+applies the patches each tab's event stream sends. There is no JavaScript
+of ours.
+
+## Design
+
+```
+browser tab ──GET /s/<id>/events?tab=…──> Live: SessionClient + Page + Driver   (one per tab)
+            <──text/event-stream: datastar-patch-elements──┘
+            ──POST /api/{send,approve,interrupt} (signals: tab, draft)──> App::tell(tab, TabIn)
+```
+
+- **Server** (`http.rs`): a small HTTP/1.1 server for one local user, one
+  request per connection, answered whole or as an event stream that lasts
+  until the tab goes away. It runs on the `rt` runtime (`rt::Threads`):
+  socket I/O blocks on the runtime's blocking threads, the app on its
+  async workers. `httparse` parses; the `http` types are the ones `ureq`
+  already links. No tokio, hyper or axum (`deny.toml`).
+- **Gate** (`http.rs`, `Gate`): who may use the UI. The printed link
+  carries a one-time token; redeeming it sets a cookie for that host.
+  Browsers open at most six HTTP/1.1 connections to a host and each chat
+  tab holds one open for its stream, so a chat page moves to a host of its
+  own, `t<label>.localhost`, by a redirect that carries a token good once
+  for sixty seconds (`handoff`); a cookie is per host, so each tab host
+  signs in that way. Requests to another port, another host or a foreign
+  origin are refused.
+- **Routes** (`app.rs`, `App::handle`): `GET /` the session list (or why
+  there is none); `POST /new` starts a session in the directory `a web`
+  runs in, as `a new` does, and redirects to it; `GET /s/<id>` the chat
+  page (through the handoff when it is asked for on the main host);
+  `GET /s/<id>/events?tab=<32 hex>` the tab's stream; `POST /api/send`,
+  `/api/approve?call=&ok=`, `/api/interrupt` with the page's signals
+  (`tab`, `draft`) as the body. A call for a tab that is not live answers
+  404 so the page reloads.
+- **A live tab** (`app.rs`, `Live`): a `SessionClient` of its own (the
+  SDK's, docs/client.md), a `Page` rendered from it, and the `Driver`
+  under it, so each tab is its own daemon client and detaches when its
+  stream is dropped (the tab closed or reloaded). The driver's events and
+  the tab's calls (`TabIn::Line`, `TabIn::Cmd`) arrive on one channel; the
+  page's patches go out after each batch (`Page::settle`).
+- **The page** (`page.rs`, `view.rs`, `patch.rs`): the chat page renders
+  at once without its transcript; the transcript arrives over the stream,
+  whole once the attach is synced (and again after an upgrade), then each
+  change alone. Every item renders inside an element of its own (`#i{key}`)
+  so a change replaces just that item; new items go in before `#end`,
+  which holds the Stop button while a turn runs, the daemon's latest
+  complaint, and whether it went away. Streamed text is appended to the
+  reply's element as it comes. Patches are Datastar's
+  `datastar-patch-elements` events, framed here (the `datastar` crate's
+  builder buffers lines and misses a lone `\r`, which also ends an
+  event-stream line).
+- **Styles** (`style.rs`): inline `style=` strings, no stylesheet; colors
+  are custom properties under `light-dark()`, layouts fluid.
+- **The script**: Datastar 1.0.4 as published, committed deflated beside
+  the source (`assets/datastar-1.0.4.js.zz`, 13 KB of 34), embedded and
+  served compressed under a versioned path so browsers keep it. A unit test
+  inflates it and holds it to the `.js` byte for byte.
+
+## Running and testing
+
+- `mise run web`: the dev build against an isolated home
+  (`target/web-home`) and the model-backed agent with `.env.local`'s keys
+  (`agent = "echo"` in its `config.toml` for none); its daemon stops with
+  it.
+- `mise run test:web`: `apps/cli/tests/web.rs`, black-box against `a web`
+  in an isolated `A_HOME` with the echo agent: the link signs in once and
+  foreign requests are refused, a chat moves to a host of its own, a tab
+  streams replies and answers asks until it closes, a long transcript sends
+  each item once, a tab rides out a daemon upgrade.
+- Unit tests: the gate (`a_host_is_ours_on_our_port_only`, the cookie and
+  handoff rules), the page's patches for an attach, a delta and an update,
+  the event framing, the embedded script.
+
+## Known costs
+
+Each live tab parks one blocking thread in the stream's read (to learn
+that the browser left) and hops to the blocking pool per write; `rt`'s
+reactor can register the socket's readiness instead. Styles repeat per
+item (~200 bytes); a `<style>` block with class names would shrink every
+patch. Neither changes what the page shows.
