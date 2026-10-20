@@ -302,15 +302,27 @@ impl Live {
     /// Asks the actor for `request`, and returns once what it logged is
     /// committed: `Err` is why it was refused.
     pub async fn request(&self, request: Request, origin: Option<Author>) -> Result<(), String> {
+        self.ask(request, origin).await
+    }
+
+    /// Sends the actor `request` now, in order with what was sent before
+    /// it; the future is its answer.
+    pub fn ask(
+        &self,
+        request: Request,
+        origin: Option<Author>,
+    ) -> impl Future<Output = Result<(), String>> + Send + 'static {
         let (reply, answer) = oneshot::channel();
         self.send(Msg::Request {
             request,
             origin,
             reply,
         });
-        answer
-            .await
-            .unwrap_or_else(|| Err("the session stopped".to_owned()))
+        async move {
+            answer
+                .await
+                .unwrap_or_else(|| Err("the session stopped".to_owned()))
+        }
     }
 
     /// Sends `client`, which has the entries up to `since`, what it missed
