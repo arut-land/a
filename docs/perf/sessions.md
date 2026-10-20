@@ -51,7 +51,11 @@ settings sync the same steps. `effects` saves syncs only where a step
 learns something and starts nothing (a call beginning to wait, a decision
 alone), which a turn of tool calls does not have.
 
-## Power-cut promises: shared flush epochs (2026-10-21)
+## Initial shared-flush measurements (2026-10-21)
+
+These busy-machine timings describe the initial four-flush tool-turn
+implementation. The replay-aware admission policy below supersedes its
+admission rules; these timings are not measurements of that revision.
 
 A write barrier orders every Apple commit, including deferred notes. The
 store requests a drive-cache flush only for `Commit(Barrier)` and before
@@ -174,3 +178,79 @@ that also encounters an unsupported process-spawn call in `sys::crash`.
 A supported subset (config, log and login parsing) passed 10 tests. The
 full prescribed Miri task therefore remains unverified. Benchmark homes
 and processes were checked absent after cleanup.
+
+## Replay-aware admission after the design review
+
+The kernel now declares an `Admission { through, requirement }` before
+work, including steps that append nothing. Model preparation and sending,
+timers and replay-safe tools require `Ordered`; unsafe tools require
+`Durable`, derived from the existing callable `Replay` metadata. Numbered
+publication, input acknowledgements and unsafe effects share the same
+durable prefix. The `step` and `effects` settings still choose write
+barriers; replay safety independently decides which work can overlap the
+cache flush. No configuration or dependency was added.
+
+The driver tracks `ordered_seq` separately from `durable_seq`. A burst
+crosses its write barriers once, and registers any required epoch from
+that blocking append job. An elected leader seals its captured prefix,
+returns ordered completion, then reuses the same thread for the full
+flush. Safe work continues while that flush runs. A successful epoch
+advances only its captured prefix; completion notifications are consumed
+in registration order so a later success cannot hide an earlier failure.
+Publication and durable acknowledgements remain behind that watermark.
+
+Cold model transcripts include ordered, unpublished entries, and warm
+transcripts fold them as they arrive. Deltas carrying a call ID are
+suppressed until that call's intent is published. Cancellation settles an
+unadmitted call without running it. Recovery cancels speculative work,
+waits for outstanding epochs, and fences callbacks, host reports and
+observer contexts by generation before any sequence can be reused.
+Observer reactions declare `Ordered` or `Durable` and enter the same
+admission queue. An attach waiting on failed publication receives an
+error instead of waiting indefinitely.
+
+`sys::fs::FlushDomain` records the store directory's device and checks
+opened log descriptors on Apple. A log on another device is refused
+before loading or writing it, including an existing cross-device symlink.
+Thus one store's shared full flush cannot falsely cover another device.
+Linux and Windows retain their existing sync path, without an extra
+flush epoch, flush syscall or blocking hop per commit.
+
+Flush counts are tested through the fault store's shared epoch flusher
+in `crates/engine/src/driver/tests/admission.rs`, using the recorded
+`openai/streaming_grammar/tool_then_followup_text` model replies. The safe
+and unsafe variants differ only in callable replay metadata. Counters
+exclude initialization, cached replay and recovery. Both `step` and
+`effects` meet the following counts:
+
+| Turn | Before review | After review | Required full flushes |
+| --- | --- | --- | --- |
+| Two model calls and one safe tool | 4 | 2 | Input acknowledgement; final publication |
+| Two model calls and one unsafe tool | 4 | 3 | Input acknowledgement; unsafe intent; final publication |
+| Plain echo | 1 | 1 | Input and echo published together |
+
+The initial counter regression failed with `[4, 4, 1]`; the revised test
+passes with `[2, 3, 1]`. It disables publication timers so these are
+logical promise counts, independent of host scheduling. The existing
+50 ms publication deadline can add intermediate flushes during longer
+turns; the flusher itself has no batching timer. Held epochs separately
+prove that safe work and observers proceed, unsafe work and publication
+wait, writes arriving during a syscall need a later epoch, and stale
+reports cannot settle a new call after sequence reuse. Error tests also
+hold the final flush after an unsafe tool has run and verify that recovery
+does not run it again.
+
+The earlier 19.79 versus 13.95 ms comparison had unequal contention and
+does not isolate scheduling overhead. No quiet-machine latency claim is
+made for this revision; the coordinator's quiet-machine run comes later.
+`mise run size` on an isolated checkout of the starting merge `00e4d80`
+measured 2,942 KiB; the revised binary measured 2,958 KiB, both below
+4,096 KiB.
+
+Validation of this revision: `mise run check` passed 863 tests, acceptance
+passed 12, seeded crash checks passed eight (`A_CRASH_SEED=20261021`), and
+all five release budget checks passed. Windows clippy, machete and the
+no-Tokio check passed. The supported Miri subset passed its 10 config,
+log and login tests; the new device-domain test also passed separately
+under Miri. The temporary baseline worktree was removed after its size
+measurement.
