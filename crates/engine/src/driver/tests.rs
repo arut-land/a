@@ -2062,3 +2062,39 @@ fn one_fsync_per_step() {
     );
     assert_eq!(*lock(&probe.batches), [2]);
 }
+
+#[test]
+fn in_process_recovery_preserves_the_attached_environment() {
+    let probe = Probe::default();
+    let fixture = Fixture::on(
+        Arc::new(probe.clone()),
+        ext_fixtures::ECHO,
+        Registry::default(),
+        openai(&Script::new(&[])),
+    );
+    let session = fixture.create();
+    let env = Arc::new(Environment::new(
+        std::env::temp_dir(),
+        [("OPENAI_API_KEY".into(), "client-test-key".into())],
+        false,
+    ));
+    session.set_env(Arc::clone(&env));
+    session.barrier();
+    probe.failing.store(true, Ordering::SeqCst);
+    assert!(session.submit("lost").is_err());
+    session.barrier();
+    probe.failing.store(false, Ordering::SeqCst);
+    let preserved = lock(&session.session.env)
+        .as_ref()
+        .is_some_and(|live| Arc::ptr_eq(live, &env));
+    let log = log_of(&session);
+    session.halt();
+    assert!(
+        preserved,
+        "in-process recovery must retain the client's live environment"
+    );
+    assert!(
+        log.iter()
+            .any(|e| matches!(&e.body, Body::Environment(logged) if logged == &env.redacted()))
+    );
+}

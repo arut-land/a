@@ -14,6 +14,9 @@ use super::{App, HELP, Overlay};
 /// The input shows at most this many rows; it scrolls past them.
 const INPUT_ROWS: usize = 8;
 
+/// The working indicator's glyphs, out and back.
+const SPINNER: [&str; 8] = ["✢", "✳", "✶", "✻", "✽", "✻", "✶", "✳"];
+
 /// The slash menu shows at most this many commands.
 const MENU_ROWS: usize = 6;
 
@@ -32,6 +35,9 @@ impl App {
     /// print above the viewport; each item is taken once, in order.
     pub fn scrollback(&mut self, width: u16) -> Vec<Line> {
         let mut out = Vec::new();
+        if self.verbose {
+            return out;
+        }
         while self
             .client
             .view()
@@ -89,6 +95,7 @@ impl App {
     fn bottom(&mut self, width: usize) -> (Vec<Line>, Option<(u16, u16)>) {
         let summary = self.summary();
         let rule = self.rule(width);
+        let working = self.working_row(width);
         let mut out = Vec::new();
         if let Some(recap) = self
             .client
@@ -132,37 +139,41 @@ impl App {
                 let cyan = Style::new().fg(Color::Cyan);
                 Line::from([
                     Span::button(mark, cyan, Action::Approve(*call, yes)),
-                    Span::button(label, Style::new(), Action::Approve(*call, yes)),
+                    Span::button(
+                        label,
+                        if yes == self.deny {
+                            Style::new()
+                        } else {
+                            cyan.bold()
+                        },
+                        Action::Approve(*call, yes),
+                    ),
                 ])
             };
-            out.push(pick("❯ ", "1. Yes", true));
-            out.push(pick("  ", "2. No", false));
+            let at = |no: bool| if no == self.deny { "❯ " } else { "  " };
+            out.push(pick(at(false), "1. Yes", true));
+            out.push(pick(at(true), "2. No", false));
         }
         if let Some((text, style)) = &self.flash {
             out.push(Line::plain(ellipsize(text, width), *style));
         }
+        out.extend(working);
         out.extend(self.menu_rows(width));
         out.push(rule.clone());
-        let (mut rows, (cx, cy)) = self.editor.lines(width, USER);
-        if self.editor.is_empty() {
-            // From the column after the caret, which would hide a first
-            // letter under it.
-            let hint = if asked.is_some() {
-                " 1 or y approves · 2, n or esc denies"
-            } else if self.client.view().session.is_none() {
-                ""
-            } else if self.client.turn().running {
-                " esc stops the tool · /help"
-            } else {
-                " message the agent · /help"
-            };
-            rows[0].spans.push(Span::new(hint, MUTED));
-        }
+        let (rows, (cx, cy)) = self.editor.lines(width, USER);
         // The caret's row stays in view.
         let skip = usize::from(cy).saturating_sub(INPUT_ROWS - 1);
         let caret_row = out.len() + usize::from(cy) - skip;
         out.extend(rows.into_iter().skip(skip).take(INPUT_ROWS));
         out.push(rule);
+        let hint = if asked.is_some() {
+            "↑/↓ choose · enter confirms · 1/y yes · 2/n/esc no"
+        } else if self.client.turn().running {
+            "esc stops it · ? help"
+        } else {
+            "message the agent · / commands · ? help"
+        };
+        out.push(Line::plain(ellipsize(hint, width), MUTED));
         out.push(self.status(width, summary.reply));
         let last_col = u16::try_from(width.saturating_sub(1)).unwrap_or(u16::MAX);
         let caret = self.overlay.is_none().then(|| {
@@ -174,11 +185,41 @@ impl App {
         (out, caret)
     }
 
+    /// `✢ Working… (3s · ↓ 120 tokens · esc to interrupt)`, while a turn
+    /// works; its glyph turns with the clock.
+    fn working_row(&mut self, width: usize) -> Option<Line> {
+        if !self.working() {
+            return None;
+        }
+        let spent = self.tokens.output.saturating_sub(self.clock.before);
+        let elapsed = self.clock.elapsed();
+        let secs = elapsed.as_secs();
+        let glyph =
+            SPINNER[usize::try_from(elapsed.as_millis() / 125).unwrap_or(0) % SPINNER.len()];
+        let mut note = if secs >= 60 {
+            format!("{}m {}s", secs / 60, secs % 60)
+        } else {
+            format!("{secs}s")
+        };
+        if spent > 0 {
+            let _ = write!(note, " · ↓ {spent} tokens");
+        }
+        note.push_str(" · esc to interrupt");
+        Some(Line::from([
+            Span::new(format!("{glyph} "), Style::new().fg(Color::Yellow)),
+            Span::new(
+                ellipsize(&format!("Working… ({note})"), width.saturating_sub(2)),
+                MUTED,
+            ),
+        ]))
+    }
+
     /// The slash commands the input's first word may become, as
     /// `(name, usage, help)`; empty once the input is more than that word.
     pub(super) fn menu(&self) -> Vec<(String, String, String)> {
         let typed = self.editor.text();
-        if !typed.starts_with('/') || typed.contains(char::is_whitespace) {
+        if self.menu_at.is_none() || !typed.starts_with('/') || typed.contains(char::is_whitespace)
+        {
             return Vec::new();
         }
         client::help(self.client.commands())
@@ -194,7 +235,10 @@ impl App {
     /// selection, as Claude Code lists commands over its prompt.
     fn menu_rows(&self, width: usize) -> Vec<Line> {
         let entries = self.menu();
-        let at = self.menu_at.min(entries.len().saturating_sub(1));
+        let at = self
+            .menu_at
+            .unwrap_or(0)
+            .min(entries.len().saturating_sub(1));
         let start = (at + 1).saturating_sub(MENU_ROWS);
         entries
             .iter()
@@ -385,9 +429,9 @@ impl App {
 
     /// The frame height this app wants: the whole terminal on the full
     /// screen; inline, its live rows (at most half the terminal) and what
-    /// is under them.
+    /// is under them. Expanded transcript review uses the whole viewport.
     pub fn height(&mut self, w: u16, h: u16) -> u16 {
-        if self.viewport == Viewport::Full {
+        if self.viewport == Viewport::Full || self.verbose {
             return h;
         }
         let width = usize::from(w);
@@ -460,8 +504,8 @@ impl App {
         let (w, _) = canvas.size();
         let (width, rows) = (usize::from(w), usize::from(body));
         let shown = match viewport {
-            Viewport::Full => self.window(width, rows),
-            Viewport::Inline => self.live(width, rows),
+            Viewport::Inline if !self.verbose => self.live(width, rows),
+            Viewport::Full | Viewport::Inline => self.window(width, rows),
         };
         // A short transcript sits at the bottom, by the input.
         let top = u16::try_from(rows - shown.len()).unwrap_or(0);
@@ -472,7 +516,7 @@ impl App {
         }
         if self.anchor.is_some() && body > 0 {
             let more = Line::from([Span::button(
-                " ↓ newer below · esc ",
+                " Jump to bottom (click) ↓ ",
                 Style::new().fg(Color::Cyan).reversed(),
                 Action::Bottom,
             )]);

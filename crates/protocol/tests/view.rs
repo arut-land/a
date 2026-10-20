@@ -491,6 +491,45 @@ fn scenarios() -> Vec<(&'static str, Vec<Value>)> {
     };
     vec![
         (
+            "each committed tool progress chunk updates its live presentation",
+            vec![
+                attached(),
+                entry(
+                    1,
+                    Body::ToolCall {
+                        tool: "bash".into(),
+                        input: Json::encode(&json!({"command":"echo hi"})).unwrap(),
+                        id: None,
+                        card: None,
+                        by: Audience::Model,
+                    },
+                ),
+                entry(
+                    2,
+                    Body::Progress {
+                        call: call(1),
+                        text: "h".into(),
+                    },
+                ),
+                entry(
+                    3,
+                    Body::Progress {
+                        call: call(1),
+                        text: "i\n".into(),
+                    },
+                ),
+                entry(
+                    4,
+                    Body::ToolResult {
+                        call: call(1),
+                        outcome: echoed(),
+                        card: Some(card()),
+                    },
+                ),
+                msg(DaemonMsg::Synced { seq: 4 }),
+            ],
+        ),
+        (
             "a streamed reply, then the committed one",
             vec![
                 attached(),

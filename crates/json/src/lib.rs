@@ -1,6 +1,6 @@
 //! Payloads carried without being read: a model's tool call arguments, a
 //! tool's output, a model's reply as the log keeps it, extension state. The
-//! same text goes from the model's reply to the log, the tool and the next
+//! Single-line text goes from the model's reply to the log, the tool and the next
 //! request: whoever reads a payload parses it into its own type, and nobody
 //! re-encodes one to pass it on.
 
@@ -10,7 +10,9 @@ use std::sync::Arc;
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
 use serde_json::value::RawValue;
 
-/// A JSON value kept as the text it was decoded from (or encoded to, once),
+/// A JSON value kept as single-line text, with raw CR/LF whitespace replaced
+/// by spaces so embedding it cannot split a log record. Otherwise it is kept
+/// as the text it was decoded from (or encoded to, once),
 /// and written out again as that text: decoding a payload checks it but
 /// builds nothing of it, and encoding it is a copy.
 ///
@@ -54,6 +56,14 @@ impl Json {
 
 impl From<Box<RawValue>> for Json {
     fn from(raw: Box<RawValue>) -> Self {
+        let raw = if raw.get().bytes().any(|b| matches!(b, b'\n' | b'\r')) {
+            // Raw CR/LF cannot occur inside a valid JSON string. RawValue's
+            // safe constructor validates the replacement without building a tree.
+            RawValue::from_string(raw.get().replace(['\n', '\r'], " "))
+                .expect("replacing JSON whitespace preserves the value")
+        } else {
+            raw
+        };
         Self(Arc::from(raw))
     }
 }
@@ -128,5 +138,25 @@ mod tests {
         let Tagged::Call { input } =
             serde_json::from_str(r#"{"type":"Call","input":{"b":1,"a":2}}"#).unwrap();
         assert_eq!(input.raw(), r#"{"a":2,"b":1}"#);
+    }
+}
+
+#[cfg(test)]
+mod single_line {
+    use super::*;
+
+    #[test]
+    fn every_constructor_preserves_the_value_on_one_line() {
+        let text = "{\r\n  \"x\": [1, \"escaped\\nline\"]\n}";
+        let expected: serde_json::Value = serde_json::from_str(text).unwrap();
+        let raw = RawValue::from_string(text.into()).unwrap();
+        for json in [
+            Json::from(raw.clone()),
+            Json::encode(&raw).unwrap(),
+            serde_json::from_str::<Json>(text).unwrap(),
+        ] {
+            assert!(!json.raw().contains(['\n', '\r']));
+            assert_eq!(json.parse::<serde_json::Value>().unwrap(), expected);
+        }
     }
 }

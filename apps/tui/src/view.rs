@@ -53,8 +53,16 @@ fn status(p: &Presented<'_>) -> Span {
 }
 
 pub fn rows(item: &Item, width: usize, look: Look) -> Vec<Line> {
+    presented_rows(item, &item.present(), width, look)
+}
+
+pub(crate) fn presented_rows(
+    item: &Item,
+    p: &Presented<'_>,
+    width: usize,
+    look: Look,
+) -> Vec<Line> {
     let blank = Line::default();
-    let p = item.present();
     match p.kind {
         Kind::User => {
             let mut out = vec![blank];
@@ -71,7 +79,7 @@ pub fn rows(item: &Item, width: usize, look: Look) -> Vec<Line> {
             mark_reply(&mut out);
             out
         }
-        Kind::Reply => reply(&p, width),
+        Kind::Reply => reply(p, width),
         // A side request's reply is its extension's, not the conversation's:
         // a title shows in the status line, a summary in what the model sees.
         Kind::Side => Vec::new(),
@@ -82,7 +90,7 @@ pub fn rows(item: &Item, width: usize, look: Look) -> Vec<Line> {
                 }
                 _ => None,
             };
-            card(item.key(), &p, input, width, look)
+            card(item.key(), p, input, width, look)
         }
         Kind::Hook | Kind::Environment => vec![Line::plain(
             ellipsize(&sanitize(&format!("  · {}", p.title)), width),
@@ -92,7 +100,7 @@ pub fn rows(item: &Item, width: usize, look: Look) -> Vec<Line> {
             let head = vec![
                 Span::new("⑂ ", BUSY),
                 Span::new(format!("{} ", p.title), Style::new().bold()),
-                status(&p),
+                status(p),
             ];
             let mut out = vec![blank, Line::from(head)];
             let body = [Span::new(
@@ -109,11 +117,8 @@ pub fn rows(item: &Item, width: usize, look: Look) -> Vec<Line> {
 fn reply(p: &Presented<'_>, width: usize) -> Vec<Line> {
     let mut out = vec![Line::default()];
     match (p.glyph, &p.body) {
-        (Glyph::Busy, _) => out.push(Line::from([
-            Span::new("✻ ", WARN),
-            Span::new(format!("{}…", p.title), MUTED),
-        ])),
-        (Glyph::None, Shown::Markdown("")) => return Vec::new(),
+        // The indicator under the transcript says a call is out.
+        (Glyph::Busy, _) | (Glyph::None, Shown::Markdown("")) => return Vec::new(),
         (Glyph::None, body) => {
             out.extend(markdown(&body.text(), width, Style::new()));
             mark_reply(&mut out);
@@ -444,7 +449,7 @@ mod tests {
             usage: None,
             purpose: None,
         };
-        assert_eq!(rows_of(&item, Look::default())[1], "✻ echo…");
+        assert!(rows_of(&item, Look::default()).len() <= 1);
         let mut live = Live::default();
         let mut lines = Vec::new();
         live.update(&mut lines, "hello **world**", 40);
