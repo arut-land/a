@@ -1238,3 +1238,25 @@ fn a_turn_keeps_its_active_time_and_tokens_across_calls_but_not_idle_time() {
     assert_eq!(app.clock.before, 3);
     assert_eq!(app.clock.elapsed, std::time::Duration::ZERO);
 }
+
+#[test]
+fn escape_and_ctrl_c_cancel_submitted_input_before_it_is_published() {
+    for viewport in [Viewport::Full, Viewport::Inline] {
+        for key in [Key::Esc, Key::Ctrl('c')] {
+            let (mut app, _) = app(viewport, &[]);
+            app.client.run(Cmd::Input("unpublished".into()));
+            assert!(!app.client.turn().running);
+            assert!(matches!(
+                press(&mut app, key),
+                Some(Effect::Cmd(Cmd::Interrupt))
+            ));
+            let out = app.client.run(Cmd::Interrupt);
+            assert!(
+                out.iter().any(|e| matches!(
+                    e,
+                    client::Effect::Io(Io::Send(ClientMsg::Interrupt { .. }))
+                ))
+            );
+        }
+    }
+}

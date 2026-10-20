@@ -735,3 +735,90 @@ fn an_unadmitted_side_call_cannot_outlive_its_cancelled_parent() {
     );
     assert_eq!(lock(&script.sent).len(), 1);
 }
+
+#[test]
+fn submitted_input_is_cancelled_while_its_publication_flush_is_held() {
+    let (started, starts) = channel::unbounded();
+    let (fixture, faulty, script) = pipeline(
+        Registry::default()
+            .with(&HeldHarbor(Arc::new(started)))
+            .unwrap(),
+    );
+    let session = fixture.create();
+    settle(&session);
+    let before = session.frames.seq();
+    let mut client = client::SessionClient::new(client::Env::Keep);
+    client.open(protocol::Target::Id(session.id));
+    let conn = client.connection();
+    let feed = |client: &mut client::SessionClient, kind| {
+        client.step(client::Event { conn, kind });
+    };
+    feed(
+        &mut client,
+        client::EventKind::Connected {
+            welcome: client::Welcome {
+                proto: protocol::PROTO,
+                caps: protocol::Caps::ALL,
+            },
+            remote: false,
+            commands: Vec::new(),
+        },
+    );
+    feed(
+        &mut client,
+        client::EventKind::Msg(DaemonMsg::Attached {
+            session: session.id,
+            workspace: session.workspace.clone(),
+        }),
+    );
+    for entry in log_of(&session) {
+        feed(&mut client, client::EventKind::Msg(DaemonMsg::Entry(entry)));
+    }
+    feed(
+        &mut client,
+        client::EventKind::Msg(DaemonMsg::Synced { seq: before }),
+    );
+    let send = |client: &mut client::SessionClient, cmd| {
+        let mut effects = client.run(cmd);
+        let request = match effects.remove(0) {
+            client::Effect::Io(client::Io::Send(protocol::ClientMsg::Input {
+                text, mode, ..
+            })) => Request::Input { text, mode },
+            client::Effect::Io(client::Io::Send(protocol::ClientMsg::Interrupt { .. })) => {
+                Request::Interrupt
+            }
+            effect => panic!("submitted input must remain interruptible: {effect:?}"),
+        };
+        let (reply, ack) = oneshot::channel();
+        session.send(Msg::Request {
+            request,
+            origin: None,
+            reply,
+        });
+        ack
+    };
+    let flush = faulty.hold_next_flush();
+    let ack = send(&mut client, client::Cmd::Input("hello".into()));
+    flush.started();
+    let (cx, release) = started_harbor(&starts);
+    assert_eq!(session.frames.seq(), before);
+    assert!(!client.turn().running);
+    let interrupted = send(&mut client, client::Cmd::Interrupt);
+    let _ = positions(&session);
+    assert!(cx.cancel.is_set(), "cancellation must precede durability");
+    release.send("finished".into());
+    session.wait("cancelled unpublished turn", PATIENCE, || {
+        !session.has_work()
+    });
+    assert_eq!(session.frames.seq(), before);
+    assert_eq!(
+        lock(&script.sent).len(),
+        1,
+        "the interrupted turn must not ask for a follow-up"
+    );
+    flush.release();
+    assert_eq!(rt::block_on(ack), Some(Ok(())));
+    assert_eq!(rt::block_on(interrupted), Some(Ok(())));
+    settle(&session);
+    session.halt();
+}

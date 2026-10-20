@@ -162,11 +162,7 @@ impl Once {
 
     fn interrupt(&mut self) -> Vec<client::Effect> {
         self.end(Ended::Interrupted);
-        if self.client.turn().can_interrupt && self.turn != Turn::Unsent {
-            self.client.run(client::Cmd::Interrupt)
-        } else {
-            Vec::new()
-        }
+        self.client.run(client::Cmd::Interrupt)
     }
 
     fn end(&mut self, ended: Ended) {
@@ -374,7 +370,69 @@ fn input(prompt: Option<&str>, stdin: Option<&str>) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::input;
+    use super::*;
+
+    #[test]
+    fn sigint_sends_cancellation_before_detaching_from_unpublished_input_and_exits_130() {
+        let mut once = Once {
+            client: SessionClient::new(Env::Keep),
+            prompt: Some("hello".into()),
+            mode: None,
+            read: true,
+            stdin: None,
+            synced: true,
+            turn: Turn::Unsent,
+            streaming: None,
+            asked: None,
+            failed: false,
+            ended: None,
+        };
+        once.client.open(Target::New);
+        let conn = once.client.connection();
+        for kind in [
+            client::EventKind::Connected {
+                welcome: client::Welcome {
+                    proto: protocol::PROTO,
+                    caps: protocol::Caps::ALL,
+                },
+                remote: false,
+                commands: Vec::new(),
+            },
+            client::EventKind::Msg(protocol::DaemonMsg::Attached {
+                session: protocol::SessionId::new(),
+                workspace: "/w".into(),
+            }),
+        ] {
+            once.client.step(Event { conn, kind });
+        }
+        let input = once.send();
+        assert!(input.iter().any(|e| matches!(
+            e,
+            client::Effect::Io(client::Io::Send(protocol::ClientMsg::Input { .. }))
+        )));
+        assert!(!once.client.turn().running);
+        let mut effects = once.interrupt();
+        effects.extend(once.client.detach());
+        let io: Vec<_> = effects
+            .into_iter()
+            .filter_map(|effect| match effect {
+                client::Effect::Io(io) => Some(io),
+                client::Effect::Show(_) => None,
+            })
+            .collect();
+        assert!(
+            matches!(
+                io.as_slice(),
+                [
+                    client::Io::Send(protocol::ClientMsg::Interrupt { .. }),
+                    client::Io::Send(protocol::ClientMsg::Detach),
+                    client::Io::Hangup
+                ]
+            ),
+            "{io:?}"
+        );
+        assert_eq!(once.ended.unwrap().unwrap(), ExitCode::from(130));
+    }
 
     #[test]
     fn the_prompt_comes_first_and_stdin_after_a_blank_line() {

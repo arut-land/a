@@ -214,7 +214,8 @@ impl App {
     /// client has no timer.
     pub fn working(&self) -> bool {
         let turn = self.client.turn();
-        turn.can_interrupt && turn.asking.is_none()
+        // Only the recorded turn supplies the clock's start time.
+        turn.running && turn.can_interrupt && turn.asking.is_none()
     }
 
     /// The indicator's clock ticked.

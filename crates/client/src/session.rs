@@ -226,13 +226,13 @@ pub struct TurnView {
     /// The oldest call waiting for an approval.
     pub asking: Option<CallId>,
     pub asks: u32,
-    /// An interrupt has something to stop, and a steer a turn to reach.
+    /// Published work or a submitted mutation can still need cancellation.
     pub can_interrupt: bool,
     /// Input reaches the daemon, now or once reconnected.
     pub can_send: bool,
 }
 
-/// How many mutations are kept for an answer.
+/// The normal send window; cancellation can reserve one further slot.
 const UNANSWERED: usize = 64;
 
 /// One session's client, sans I/O.
@@ -299,8 +299,10 @@ impl SessionClient {
     }
 
     pub fn turn(&self) -> TurnView {
+        let pending = !self.unanswered.is_empty() || self.queued.iter().any(is_mutation);
         if !self.view_current {
             return TurnView {
+                can_interrupt: pending && self.link.attached(),
                 can_send: self.link.attached(),
                 ..TurnView::default()
             };
@@ -313,7 +315,7 @@ impl SessionClient {
             running,
             asking,
             asks,
-            can_interrupt: running && self.link.attached(),
+            can_interrupt: (running || pending) && self.link.attached(),
             can_send: self.link.attached(),
         }
     }
@@ -321,12 +323,10 @@ impl SessionClient {
     /// What this client may ask of the session now; nothing unless
     /// attached, now or once reconnected.
     pub fn offer(&mut self) -> Result<Offer<'_>, Notice> {
-        if !self.link.attached() {
-            Err(Notice::NotConnected)
-        } else if self.unanswered.len() + self.queued.len() >= UNANSWERED {
-            Err(Notice::Backpressure)
-        } else {
+        if self.link.attached() {
             Ok(Offer(self))
+        } else {
+            Err(Notice::NotConnected)
         }
     }
 
@@ -386,13 +386,13 @@ impl SessionClient {
     /// [`Notice`]. [`Cmd::Help`] is the app's to show.
     pub fn run(&mut self, cmd: Cmd) -> Vec<Effect> {
         let done = match cmd {
-            Cmd::Input(text) => self.offer().map(|o| o.input(text)),
+            Cmd::Input(text) => self.offer().and_then(|o| o.input(text)),
             Cmd::Steer(text) => self.offer().and_then(|o| o.steer(text)),
             Cmd::Approve { call, approved } => self.offer().and_then(|o| o.approve(call, approved)),
             Cmd::Interrupt => self.offer().and_then(Offer::interrupt),
             Cmd::RefreshEnv => self.offer().and_then(Offer::refresh_env),
             Cmd::Detach => Ok(self.detach()),
-            Cmd::Sessions => self.offer().map(|o| o.0.send(ClientMsg::List)),
+            Cmd::Sessions => self.offer().and_then(|o| o.send(ClientMsg::List)),
             Cmd::Open(target) => Ok(self.open(target)),
             Cmd::Help => Ok(Vec::new()),
         };
@@ -570,23 +570,36 @@ pub struct Offer<'a>(&'a mut SessionClient);
 
 impl Offer<'_> {
     /// A message, or a slash command the daemon runs.
-    pub fn input(self, text: String) -> Vec<Effect> {
-        self.0.send(ClientMsg::input(text))
+    pub fn input(self, text: String) -> Result<Vec<Effect>, Notice> {
+        self.send(ClientMsg::input(text))
     }
 
     /// Input for the running turn, before its next step.
     pub fn steer(self, text: String) -> Result<Vec<Effect>, Notice> {
         self.running()?;
-        Ok(self.0.send(ClientMsg::Input {
+        self.send(ClientMsg::Input {
             text,
             mode: Mode::Steer,
             client_seq: None,
-        }))
+        })
     }
 
-    /// Stops the running turn.
+    /// Cancellation must not depend on publication or room for another input.
     pub fn interrupt(self) -> Result<Vec<Effect>, Notice> {
-        self.running()?;
+        if !self.0.turn().can_interrupt {
+            self.view()?;
+            return Err(Notice::NothingRunning);
+        }
+        // A later submission needs another interrupt even before the first is acknowledged.
+        let last = self
+            .0
+            .unanswered
+            .iter()
+            .chain(&self.0.queued)
+            .rfind(|msg| is_mutation(msg));
+        if matches!(last, Some(ClientMsg::Interrupt { .. })) {
+            return Ok(Vec::new());
+        }
         Ok(self.0.send(ClientMsg::INTERRUPT))
     }
 
@@ -596,7 +609,7 @@ impl Offer<'_> {
         if !self.0.view.ledger.inbox().any(|c| c == call) {
             return Err(Notice::NotAsking(call));
         }
-        Ok(self.0.send(ClientMsg::approve(call, approved)))
+        self.send(ClientMsg::approve(call, approved))
     }
 
     /// Sends this client's environment again.
@@ -608,6 +621,13 @@ impl Offer<'_> {
             return Err(Notice::NotConnected);
         }
         Ok(vec![Effect::Io(Io::SendEnvironment)])
+    }
+
+    fn send(self, msg: ClientMsg) -> Result<Vec<Effect>, Notice> {
+        if self.0.unanswered.len() + self.0.queued.len() >= UNANSWERED {
+            return Err(Notice::Backpressure);
+        }
+        Ok(self.0.send(msg))
     }
 
     fn view(&self) -> Result<(), Notice> {
@@ -625,6 +645,13 @@ impl Offer<'_> {
             Err(Notice::NothingRunning)
         }
     }
+}
+
+const fn is_mutation(msg: &ClientMsg) -> bool {
+    matches!(
+        msg,
+        ClientMsg::Input { .. } | ClientMsg::Approve { .. } | ClientMsg::Interrupt { .. }
+    )
 }
 
 const fn numbered(msg: &ClientMsg, seq: u64) -> bool {
@@ -844,6 +871,58 @@ mod tests {
     }
 
     #[test]
+    fn later_submissions_need_cancellation_even_with_an_earlier_interrupt_unacknowledged() {
+        let (mut client, _) = attached(Env::Keep);
+        client.run(Cmd::Input("first".into()));
+        client.run(Cmd::Interrupt);
+        client.run(Cmd::Input("second".into()));
+        let out = client.run(Cmd::Interrupt);
+        assert!(matches!(
+            sends(&out)[..],
+            [ClientMsg::Interrupt {
+                client_seq: Some(4)
+            }]
+        ));
+    }
+
+    #[test]
+    fn queued_reads_do_not_create_interruptible_work() {
+        let mut client = SessionClient::new(Env::Keep);
+        client.open(Target::New);
+        client.run(Cmd::Sessions);
+        assert!(!client.turn().can_interrupt);
+    }
+
+    #[test]
+    fn submitted_input_remains_interruptible_before_publication() {
+        for connected in [false, true] {
+            let mut client = if connected {
+                attached(Env::Keep).0
+            } else {
+                let mut client = SessionClient::new(Env::Keep);
+                client.open(Target::New);
+                client
+            };
+            client.run(Cmd::Input("unpublished".into()));
+            assert!(!client.turn().running);
+            assert!(client.turn().can_interrupt);
+            assert!(client.offer().unwrap().interrupt().is_ok());
+        }
+    }
+
+    #[test]
+    fn a_full_mutation_window_cannot_drop_cancellation_intent() {
+        let (mut client, _) = attached(Env::Keep);
+        for n in 0..UNANSWERED {
+            client.run(Cmd::Input(n.to_string()));
+        }
+        let out = client.offer().unwrap().interrupt().unwrap();
+        assert!(matches!(sends(&out)[..], [ClientMsg::Interrupt { .. }]));
+        assert!(client.offer().unwrap().interrupt().unwrap().is_empty());
+        assert_eq!(client.unanswered.len(), UNANSWERED + 1);
+    }
+
+    #[test]
     fn unanswered_mutations_are_never_evicted_by_new_input() {
         for disconnected in [false, true] {
             let (mut client, _) = attached(Env::Keep);
@@ -1031,7 +1110,14 @@ mod tests {
         // Connecting counts as attached: input waits for the connection.
         let mut client = SessionClient::new(Env::Origin);
         client.open(Target::New);
-        assert!(client.offer().unwrap().input("hi".into()).is_empty());
+        assert!(
+            client
+                .offer()
+                .unwrap()
+                .input("hi".into())
+                .unwrap()
+                .is_empty()
+        );
         client.step(Event {
             conn: ConnId(1),
             kind: EventKind::Wedged(Diagnosis::default()),
@@ -1043,17 +1129,20 @@ mod tests {
         );
 
         let (mut client, _) = attached(Env::Origin);
-        // Nothing runs: input yes, a steer or an interrupt no.
-        assert_eq!(sends(&client.offer().unwrap().input("hi".into())).len(), 1);
+        assert_eq!(
+            client.offer().unwrap().interrupt().err(),
+            Some(Notice::NothingRunning)
+        );
+        assert_eq!(
+            sends(&client.offer().unwrap().input("hi".into()).unwrap()).len(),
+            1
+        );
         assert_eq!(
             client.offer().unwrap().steer("more".into()).err(),
             Some(Notice::NothingRunning)
         );
         let two = CallId::new(2).unwrap();
-        assert_eq!(
-            client.offer().unwrap().interrupt().err(),
-            Some(Notice::NothingRunning)
-        );
+        assert!(client.offer().unwrap().interrupt().is_ok());
         assert_eq!(
             client.offer().unwrap().approve(two, true).err(),
             Some(Notice::NotAsking(two))
