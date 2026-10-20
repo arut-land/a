@@ -389,6 +389,8 @@ struct Probe {
     waiting: Arc<AtomicUsize>,
     /// Each batch, and whether it was made durable.
     written: Arc<Mutex<Vec<Written>>>,
+    /// Appends and busy marks, and the thread each ran on.
+    ops: Arc<Mutex<Vec<(&'static str, thread::ThreadId)>>>,
 }
 
 /// A batch handed to a log, and whether it was made durable.
@@ -405,6 +407,7 @@ impl Probed {
             return Err(io::Error::other("disk full"));
         }
         lock(&self.1.batches).push(entries.len());
+        lock(&self.1.ops).push(("append", thread::current().id()));
         lock(&self.1.written).push((entries.to_vec(), durable));
         self.0.append_all(entries)
     }
@@ -446,6 +449,8 @@ impl LogStore for Probe {
     }
 
     fn mark_busy(&self, id: SessionId, busy: bool) -> io::Result<()> {
+        let op = if busy { "busy" } else { "idle" };
+        lock(&self.ops).push((op, thread::current().id()));
         self.store.mark_busy(id, busy)
     }
 
@@ -1925,6 +1930,45 @@ fn one_fsync_per_burst() {
     assert_eq!(log.len(), 1 + 2 * 6, "{log:#?}");
     // The extensions, the first input and its echo, then the burst.
     assert_eq!(*lock(&probe.batches), [1, 2, 10]);
+}
+
+/// The busy marker is set and cleared in the blocking hop of the commit
+/// that starts and ends the work: before its entries, and after them.
+#[test]
+fn the_busy_mark_rides_its_commit() {
+    let probe = Probe::default();
+    let fixture = Fixture::on(
+        Arc::new(probe.clone()),
+        ext_fixtures::ECHO,
+        echoing(&Policy::default()),
+        openai(&Script::new(&[])),
+    );
+    let session = fixture.create();
+    session.submit("$ true").unwrap();
+    finished(&session, 3);
+    settle(&session);
+    session.halt();
+    let ops = lock(&probe.ops).clone();
+    let names: Vec<&str> = ops.iter().map(|(op, _)| *op).collect();
+    let busy = names.iter().position(|&op| op == "busy").unwrap();
+    let idle = names.iter().position(|&op| op == "idle").unwrap();
+    assert_eq!(
+        names.iter().filter(|&&op| op != "append").count(),
+        2,
+        "{names:?}"
+    );
+    assert_eq!((names[busy + 1], names[idle - 1]), ("append", "append"));
+    assert_eq!(idle, names.len() - 1, "{names:?}");
+    assert_eq!(
+        ops[busy].1,
+        ops[busy + 1].1,
+        "the mark set in a hop of its own"
+    );
+    assert_eq!(
+        ops[idle].1,
+        ops[idle - 1].1,
+        "the mark cleared in a hop of its own"
+    );
 }
 
 /// Progress and extension state are written as they come, and made

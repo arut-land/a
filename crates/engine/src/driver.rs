@@ -655,9 +655,9 @@ impl Actor {
                     if !self.flush(&mut batch, &mut after).await {
                         return;
                     }
-                    self.effect(effect).await;
+                    self.effect(effect);
                 }
-                Effect::MarkBusy(true) => self.effect(effect).await,
+                Effect::MarkBusy(true) => self.effect(effect),
                 effect => after.push(effect),
             }
         }
@@ -668,8 +668,16 @@ impl Actor {
     /// if the commit failed, and the session resumed. Notes with nothing
     /// after them are durable with the next commit that is.
     async fn flush(&mut self, batch: &mut Vec<Entry>, after: &mut Vec<Effect>) -> bool {
+        // The busy mark as the session stands once `after` is carried out.
+        let busy = (after.iter().rev())
+            .find_map(|e| match e {
+                Effect::MarkBusy(busy) => Some(*busy),
+                _ => None,
+            })
+            .unwrap_or_else(|| self.live.has_work());
+        let marked = busy || self.core.ledger().activity().requires_action();
         if !batch.is_empty()
-            && let Err(e) = self.commit(batch, !after.is_empty()).await
+            && let Err(e) = self.commit(batch, !after.is_empty(), marked).await
         {
             let why = format!("logging: {e}");
             eprintln!("session {}: {why}", self.live.id.short());
@@ -682,7 +690,7 @@ impl Actor {
             return false;
         }
         for effect in after.drain(..) {
-            self.effect(effect).await;
+            self.effect(effect);
         }
         true
     }
@@ -731,7 +739,16 @@ impl Actor {
     /// Writes `batch`, then shows it: the writer stamps its lease. It is
     /// made durable at once unless it holds only notes and `durable` is
     /// not asked for ([`kernel::Durability`]).
-    async fn commit(&mut self, batch: &mut Vec<Entry>, durable: bool) -> io::Result<()> {
+    ///
+    /// The busy marker turns to `marked` in the same blocking hop: set
+    /// before the entries, as it is before the work they are the intent
+    /// of, and cleared after them, as it is once the work ends.
+    async fn commit(
+        &mut self,
+        batch: &mut Vec<Entry>,
+        durable: bool,
+        marked: bool,
+    ) -> io::Result<()> {
         let durable = durable
             || batch
                 .iter()
@@ -741,13 +758,29 @@ impl Actor {
             .take()
             .ok_or_else(|| io::Error::other("no writer"))?;
         let mut entries = std::mem::take(batch);
-        let rt = Arc::clone(&self.live.session.shared.rt);
+        let mark = (marked != self.marked).then_some(marked);
+        self.marked = marked;
+        let shared = &self.live.session.shared;
+        let (rt, store, id) = (
+            Arc::clone(&shared.rt),
+            Arc::clone(&shared.store),
+            self.live.id,
+        );
         let (writer, entries, written) = rt::unblock(&*rt, move || {
+            if mark == Some(true) {
+                busy_marker(&*store, id, true);
+            }
             let written = catch_unwind(AssertUnwindSafe(|| writer.append(&mut entries, durable)))
                 .unwrap_or_else(|_| Err(io::Error::other("committing entries panicked")));
+            if mark == Some(false) && written.is_ok() {
+                busy_marker(&*store, id, false);
+            }
             (writer, entries, written)
         })
         .await;
+        if mark == Some(false) && written.is_err() {
+            self.marked = true;
+        }
         self.writer = Some(writer);
         written?;
         crate::session_event("commit", self.live.id, || {
@@ -797,7 +830,7 @@ impl Actor {
         summary.activity = ledger.activity();
     }
 
-    async fn effect(&mut self, effect: Effect) {
+    fn effect(&mut self, effect: Effect) {
         let shared = Arc::clone(&self.live.session.shared);
         // A stopping session starts nothing: what it would have started is
         // in the log, for its next load.
@@ -888,7 +921,6 @@ impl Actor {
                 self.live.busy.store(busy, Ordering::SeqCst);
                 let how = if busy { "busy" } else { "settled" };
                 crate::session_event(how, self.live.id, String::new);
-                self.mark().await;
                 self.live.touch();
             }
         }
@@ -916,7 +948,8 @@ impl Actor {
         }
     }
 
-    /// Sets or clears the busy marker as the session now stands.
+    /// Sets or clears the busy marker as the session now stands, when no
+    /// commit did.
     async fn mark(&mut self) {
         let marked = self.live.has_work() || self.core.ledger().activity().requires_action();
         if marked == self.marked {
@@ -925,9 +958,7 @@ impl Actor {
         self.marked = marked;
         let shared = &self.live.session.shared;
         let (store, id) = (Arc::clone(&shared.store), self.live.id);
-        if let Err(e) = rt::unblock(&*shared.rt, move || store.mark_busy(id, marked)).await {
-            eprintln!("session {}: busy marker: {e}", id.short());
-        }
+        rt::unblock(&*shared.rt, move || busy_marker(&*store, id, marked)).await;
     }
 
     fn reply(&mut self, ticket: Ticket, result: Result<(), String>) {
@@ -1158,6 +1189,13 @@ impl Actor {
         let frame = Frame::new(&DaemonMsg::Snapshot(Box::new(view))).ok();
         self.snapshot = Some((seq, frame.clone()));
         frame
+    }
+}
+
+/// Sets or clears session `id`'s busy marker; a failure is only told.
+fn busy_marker(store: &dyn crate::store::LogStore, id: SessionId, busy: bool) {
+    if let Err(e) = store.mark_busy(id, busy) {
+        eprintln!("session {}: busy marker: {e}", id.short());
     }
 }
 
