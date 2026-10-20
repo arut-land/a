@@ -326,6 +326,10 @@ impl SessionClient {
     /// Makes `attach` on a new connection, leaving the current one.
     pub fn attach(&mut self, attach: Attach) -> Vec<Effect> {
         let mut out = self.leave();
+        if !matches!(attach.target, Target::Id(id) if self.view.session == Some(id)) {
+            self.unanswered.clear();
+            self.queued.clear();
+        }
         self.opened = attach.clone();
         self.connect(attach, false, Link::Connecting, &mut out);
         out
@@ -804,6 +808,28 @@ mod tests {
             ] if one == "one" && two == "two"),
             "{out:?}"
         );
+    }
+
+    #[test]
+    fn pending_input_never_crosses_an_explicit_session_change() {
+        let (mut client, _) = attached(Env::Keep);
+        client.run(Cmd::Input("unanswered".into()));
+        client.step(msg(1, DaemonMsg::Draining));
+        client.run(Cmd::Input("queued".into()));
+        client.open(Target::New);
+        let out = client.step(live(2, Caps::ALL));
+        assert!(sends(&out).is_empty(), "{out:?}");
+    }
+
+    #[test]
+    fn pending_input_survives_a_restart_of_the_same_session() {
+        let (mut client, _) = attached(Env::Keep);
+        client.run(Cmd::Input("unanswered".into()));
+        client.step(msg(1, DaemonMsg::Draining));
+        client.run(Cmd::Input("queued".into()));
+        client.restart();
+        let out = client.step(live(2, Caps::ALL));
+        assert_eq!(sends(&out).len(), 2, "{out:?}");
     }
 
     #[test]
