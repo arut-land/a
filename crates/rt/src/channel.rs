@@ -104,6 +104,13 @@ impl<T> Receiver<T> {
         Poll::Pending
     }
 
+    /// The next item if one is queued, without waiting.
+    pub fn try_recv(&self) -> Option<T> {
+        let item = self.0.state().items.pop_front()?;
+        self.0.space.notify_one();
+        Some(item)
+    }
+
     /// The next item, as a future.
     pub fn recv(&self) -> impl Future<Output = Option<T>> + '_ {
         std::future::poll_fn(|cx| self.poll_recv(cx))

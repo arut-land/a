@@ -157,6 +157,14 @@ enum Msg {
     Barrier(oneshot::Sender<()>),
 }
 
+impl Msg {
+    /// Whether taking it reads what the session committed: a client's
+    /// replay, the conversation a side request asks for.
+    const fn reads_the_log(&self) -> bool {
+        matches!(self, Self::Attach(..) | Self::Side { .. })
+    }
+}
+
 /// The end of a session's actor: over once its writer is closed, so a
 /// reload never makes a second.
 #[derive(Clone, Default)]
@@ -427,20 +435,50 @@ struct Actor {
 impl Actor {
     async fn run(mut self, mail: channel::Receiver<Msg>, first: Effects) {
         self.carry(first).await;
+        let mut next = None;
         while !(self.stopping && self.reporting == 0)
-            && let Some(msg) = mail.recv().await
+            && let Some(msg) = match next.take() {
+                Some(msg) => Some(msg),
+                None => mail.recv().await,
+            }
         {
-            if let Some((event, done)) = self.take(msg) {
+            // What queued meanwhile is a burst, stepped together and
+            // committed once. One that reads what is committed starts a
+            // burst of its own, once what came before it is carried out.
+            let mut burst = vec![msg];
+            while burst.len() < BURST
+                && let Some(msg) = mail.try_recv()
+            {
+                if msg.reads_the_log() {
+                    next = Some(msg);
+                    break;
+                }
+                burst.push(msg);
+            }
+            let (mut events, mut dones) = (Vec::new(), Vec::new());
+            for msg in burst {
+                // Answered once what came before it is carried out.
+                #[cfg(test)]
+                if let Msg::Barrier(done) = msg {
+                    dones.push(done);
+                    continue;
+                }
+                if let Some((event, done)) = self.take(msg) {
+                    events.push(event);
+                    dones.extend(done);
+                }
+            }
+            if !events.is_empty() {
                 // A new registry generation is taken up at the next step.
                 let newest = self.live.session.shared.registry.get();
                 let generation = (!Arc::ptr_eq(&newest, &self.registry)).then(|| {
                     self.registry = Arc::clone(&newest);
                     Event::Registry(Bound::bind(&newest, &self.live.session))
                 });
-                self.step(generation.into_iter().chain([event])).await;
-                if let Some(done) = done {
-                    done.send(());
-                }
+                self.step(generation.into_iter().chain(events)).await;
+            }
+            for done in dones {
+                done.send(());
             }
             // A call may begin to wait without the work marked ending.
             self.mark().await;
@@ -578,56 +616,72 @@ impl Actor {
     }
 
     /// Steps the kernel through `events` and carries out what follows. A
-    /// step that panics is a bug the session survives: what the steps did
-    /// is dropped, as a commit that failed drops it, and the session
-    /// resumes from its log.
+    /// step that panics is a bug the session survives: what it did is
+    /// dropped, as a commit that failed drops it, what the steps before it
+    /// did is carried out, and the session resumes from its log.
     async fn step(&mut self, events: impl IntoIterator<Item = Event>) {
-        let stepped = catch_unwind(AssertUnwindSafe(|| {
-            let mut fx = Effects::new();
-            for event in events {
-                fx.extend(self.core.step(event));
-            }
-            fx
-        }));
-        match stepped {
-            Ok(fx) => self.carry(fx).await,
-            Err(panic) => {
-                let why = panicked(&*panic);
-                eprintln!("session {}: the kernel {why}", self.live.id.short());
-                Box::pin(self.resume()).await;
+        let mut fx = Effects::new();
+        for event in events {
+            match catch_unwind(AssertUnwindSafe(|| self.core.step(event))) {
+                Ok(more) => fx.extend(more),
+                Err(panic) => {
+                    let why = panicked(&*panic);
+                    eprintln!("session {}: the kernel {why}", self.live.id.short());
+                    self.carry(fx).await;
+                    return Box::pin(self.resume()).await;
+                }
             }
         }
+        self.carry(fx).await;
     }
 
-    /// Carries out `fx` in order, committing each run of appends before
-    /// the effect after it. A commit that fails drops the rest and resumes
-    /// from what the log holds.
+    /// Carries out `fx`: its appends are committed together, before the
+    /// effects among them, which then run in order. Whatever the steps
+    /// `fx` came from, a burst costs one commit, and each intent is still
+    /// durable before the work it names. Only a kill, of a process group
+    /// whose call the entries after it settle, and a busy mark, set before
+    /// the work it marks, go before what was appended ahead of them is
+    /// committed. A commit that fails drops the rest and resumes from what
+    /// the log holds.
     async fn carry(&mut self, fx: Effects) {
         let mut batch = Vec::new();
-        let mut fx = fx.into_iter();
-        loop {
-            let next = fx.next();
-            if let Some(Effect::Append(e)) = next {
-                batch.push(e);
-                continue;
-            }
-            if !batch.is_empty()
-                && let Err(e) = self.commit(&mut batch).await
-            {
-                let why = format!("logging: {e}");
-                eprintln!("session {}: {why}", self.live.id.short());
-                for effect in next.into_iter().chain(fx) {
-                    if let Effect::Reply { ticket, .. } = effect {
-                        self.reply(ticket, Err(why.clone()));
+        let mut after = Vec::new();
+        for effect in fx {
+            match effect {
+                Effect::Append(e) => batch.push(e),
+                Effect::Kill { .. } => {
+                    if !self.flush(&mut batch, &mut after).await {
+                        return;
                     }
+                    self.effect(effect).await;
                 }
-                return Box::pin(self.resume()).await;
-            }
-            match next {
-                Some(effect) => self.effect(effect).await,
-                None => return,
+                Effect::MarkBusy(true) => self.effect(effect).await,
+                effect => after.push(effect),
             }
         }
+        self.flush(&mut batch, &mut after).await;
+    }
+
+    /// Commits `batch`, then carries out the effects `after` it; `false`
+    /// if the commit failed, and the session resumed.
+    async fn flush(&mut self, batch: &mut Vec<Entry>, after: &mut Vec<Effect>) -> bool {
+        if !batch.is_empty()
+            && let Err(e) = self.commit(batch).await
+        {
+            let why = format!("logging: {e}");
+            eprintln!("session {}: {why}", self.live.id.short());
+            for effect in after.drain(..) {
+                if let Effect::Reply { ticket, .. } = effect {
+                    self.reply(ticket, Err(why.clone()));
+                }
+            }
+            Box::pin(self.resume()).await;
+            return false;
+        }
+        for effect in after.drain(..) {
+            self.effect(effect).await;
+        }
+        true
     }
 
     /// After a failed commit or a step that panicked: what runs is
@@ -1129,6 +1183,10 @@ impl<K: PartialEq, V> Keyed<K, V> {
 /// How many entries behind a client must be to get a snapshot rather than
 /// a replay.
 const SNAPSHOT_GAP: u64 = 256;
+
+/// The most messages an actor steps together, so that a flood of them
+/// still commits now and then.
+const BURST: usize = 64;
 
 #[cfg(test)]
 impl Live {

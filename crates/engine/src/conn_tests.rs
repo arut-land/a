@@ -251,16 +251,20 @@ fn a_pipelined_hello_attach_and_input_are_answered_in_order() {
         "{first:?}"
     );
     assert!(matches!(peer.recv(), DaemonMsg::Synced { seq: 1 }));
-    // The input is logged before it is acknowledged.
+    // The input is logged before it is acknowledged, with what its step
+    // logged after it.
     let logged = peer.recv();
     assert!(
         matches!(&logged, DaemonMsg::Entry(e) if is_input(&e.body)),
         "{logged:?}"
     );
-    assert!(matches!(peer.recv(), DaemonMsg::Ack { client_seq: o } if o == origin(1, 1)));
-    let seen = peer
-        .until(|m| matches!(m, DaemonMsg::Entry(e) if matches!(e.body, Body::Assistant { .. })));
+    let seen = peer.until(|m| matches!(m, DaemonMsg::Ack { client_seq: o } if *o == origin(1, 1)));
     assert_eq!(users(&seen), 0, "the input was already seen");
+    assert!(
+        seen.iter()
+            .any(|m| matches!(m, DaemonMsg::Entry(e) if matches!(e.body, Body::Assistant { .. }))),
+        "{seen:?}"
+    );
 }
 
 #[test]

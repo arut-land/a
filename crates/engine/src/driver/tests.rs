@@ -377,19 +377,25 @@ fn finished(session: &Live, call: u64) -> Vec<Entry> {
     })
 }
 
-/// A store whose logs keep the size of each batch they are handed, and
-/// fail while told to.
+/// A store whose logs keep the size of each batch they are handed, fail
+/// while told to, and wait while `held` is locked.
 #[derive(Clone, Default)]
 struct Probe {
     store: Arc<Memory>,
     batches: Arc<Mutex<Vec<usize>>>,
     failing: Arc<AtomicBool>,
+    held: Arc<Mutex<()>>,
+    /// Appends waiting for `held`.
+    waiting: Arc<AtomicUsize>,
 }
 
 struct Probed(Box<dyn Log>, Probe);
 
 impl Log for Probed {
     fn append_all(&mut self, entries: &[Entry]) -> io::Result<()> {
+        self.1.waiting.fetch_add(1, Ordering::SeqCst);
+        drop(lock(&self.1.held));
+        self.1.waiting.fetch_sub(1, Ordering::SeqCst);
         if self.1.failing.load(Ordering::SeqCst) {
             return Err(io::Error::other("disk full"));
         }
@@ -458,7 +464,7 @@ fn input_commits_on_arrival_and_a_failed_commit_leaves_no_trace() {
 
     assert_eq!(lost, Err("logging: disk full".into()));
     // The extensions it was created with, then a batch a step.
-    assert_eq!(*lock(&probe.batches), [1, 1, 1, 1, 1]);
+    assert_eq!(*lock(&probe.batches), [1, 2, 2]);
     assert!(matches!(log[0].body, Body::Extensions { .. }));
     assert_eq!(
         facts(&log[1..]),
@@ -1864,6 +1870,45 @@ fn a_kernel_panic_is_a_resume() {
             (4, &echo("again"))
         ]
     );
+}
+
+/// Messages that queue while the actor commits are stepped together and
+/// committed once: a burst of input costs one fsync, not one each.
+#[test]
+fn one_fsync_per_burst() {
+    let probe = Probe::default();
+    let fixture = Fixture::on(
+        Arc::new(probe.clone()),
+        ext_fixtures::ECHO,
+        Registry::default(),
+        openai(&Script::new(&[])),
+    );
+    let session = fixture.create();
+    settle(&session);
+    let input = |text: &str| {
+        let input = Event::Input {
+            text: text.into(),
+            mode: Mode::Queue,
+            origin: None,
+            ticket: None,
+        };
+        session.send(Msg::Step(input));
+    };
+    let held = lock(&probe.held);
+    input("first");
+    while probe.waiting.load(Ordering::SeqCst) == 0 {
+        thread::yield_now();
+    }
+    for n in 0..5 {
+        input(&format!("then {n}"));
+    }
+    drop(held);
+    settle(&session);
+    let log = log_of(&session);
+    session.halt();
+    assert_eq!(log.len(), 1 + 2 * 6, "{log:#?}");
+    // The extensions, the first input and its echo, then the burst.
+    assert_eq!(*lock(&probe.batches), [1, 2, 10]);
 }
 
 /// #57: the entries of one step are committed together: one write and
