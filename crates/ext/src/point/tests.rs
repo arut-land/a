@@ -764,8 +764,8 @@ fn input_rejections_name_who_and_post_tool_logs_the_original() {
 struct Erased(fn(&Value) -> Value);
 
 impl ErasedHandler for Erased {
-    fn on(&self, _: &PointCx<'_>, args: &Json) -> Json {
-        Json::encode(&(self.0)(&args.parse::<Value>().unwrap())).unwrap()
+    fn on(&self, _: &PointCx<'_>, args: &Json) -> Result<Json, String> {
+        Ok(Json::encode(&(self.0)(&args.parse::<Value>().unwrap())).unwrap())
     }
 }
 
@@ -806,4 +806,22 @@ fn erased_handlers_answer_in_json_and_a_policy_that_cannot_be_read_denies() {
     let mut r = Registrar::default();
     r.on_erased("spawn", Arc::new(Erased(|_| Value::Null)));
     assert_eq!(r.errors, ["point spawn takes no erased handlers"]);
+}
+
+#[test]
+fn erased_errors_obey_the_points_declared_failure_rule() {
+    struct Broken;
+    impl ErasedHandler for Broken {
+        fn on(&self, _: &PointCx<'_>, _: &Json) -> Result<Json, String> {
+            Err("broken".into())
+        }
+    }
+    let set = hooks(vec![one("dynamic", |r| {
+        r.on_erased("input", Arc::new(Broken));
+        r.on_erased("on_stop", Arc::new(Broken));
+    })]);
+    let view = Counted::default();
+    let cx = point_cx(&view);
+    assert!(set.input(&cx, "hi".into()).unwrap_err().contains("broken"));
+    assert!(set.on_stop(&cx).is_none());
 }

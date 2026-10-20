@@ -218,7 +218,10 @@ impl Live {
         open: Open,
         owner: Owner,
     ) -> io::Result<Arc<Self>> {
-        let registry = shared.registry.get();
+        let registry = shared
+            .registry
+            .for_workspace(&header.workspace)
+            .map_err(io::Error::other)?;
         let (tx, rx) = channel::unbounded();
         let session = Arc::new(Session {
             id: header.id,
@@ -621,6 +624,32 @@ impl Actor {
             .count()
     }
 
+    async fn refresh(&mut self) -> Option<Event> {
+        let base = self.live.session.shared.registry.get();
+        let newest = if base.service::<dyn ext::host::Sources>().is_some() {
+            let shared = Arc::clone(&self.live.session.shared);
+            let workspace = Arc::clone(&self.live.session.workspace);
+            rt::unblock(&*Arc::clone(&shared.rt), move || {
+                shared.registry.for_workspace(&workspace)
+            })
+            .await
+            .unwrap_or_else(|why| {
+                eprintln!("warning: {why}");
+                Arc::clone(&self.registry)
+            })
+        } else {
+            base
+        };
+        (!Arc::ptr_eq(&newest, &self.registry)).then(|| {
+            let mut states = newest.states();
+            states.replay(self.live.frames.entries());
+            *lock(&self.live.session.states) = states;
+            self.registry = Arc::clone(&newest);
+            self.bound = bind(&newest, &self.live.session);
+            Event::Registry(Arc::clone(&self.bound) as Arc<dyn Binding>)
+        })
+    }
+
     async fn run(mut self, mail: channel::Receiver<Msg>, first: Effects) {
         self.carry(first).await;
         let mut next = None;
@@ -668,12 +697,7 @@ impl Actor {
             }
             if !events.is_empty() {
                 // A new registry generation is taken up at the next step.
-                let newest = self.live.session.shared.registry.get();
-                let generation = (!Arc::ptr_eq(&newest, &self.registry)).then(|| {
-                    self.registry = Arc::clone(&newest);
-                    self.bound = bind(&newest, &self.live.session);
-                    Event::Registry(Arc::clone(&self.bound) as Arc<dyn Binding>)
-                });
+                let generation = self.refresh().await;
                 self.step(generation.into_iter().chain(events)).await;
             }
             if sync {

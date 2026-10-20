@@ -5,6 +5,7 @@
 
 use std::any::{Any, TypeId};
 use std::borrow::Borrow;
+use std::sync::Arc;
 
 use protocol::{Body, Entry, Json};
 use serde::de::DeserializeOwned;
@@ -40,38 +41,72 @@ pub trait Fold: Default + Serialize + DeserializeOwned + Send + 'static {
     fn apply(&mut self, change: &Self::Change);
 }
 
+/// A durable fold whose name and value are known only at run time.
+/// A failed change leaves its previous value intact.
+pub trait DynFold: Send + Sync {
+    fn name(&self) -> Name;
+    fn initial(&self) -> Json;
+    fn apply(&self, state: &Json, change: &Json) -> Result<Json, String>;
+}
+
+type Value = Box<dyn Any + Send>;
+type Apply = dyn Fn(&mut dyn Any, &Json) -> Result<(), String> + Send + Sync;
+type Encode = dyn Fn(&dyn Any) -> Result<Json, String> + Send + Sync;
+type Restore = dyn Fn(&Json) -> Result<Value, String> + Send + Sync;
+
 /// How to make and fold one registered state.
-#[derive(Clone, Copy)]
+#[derive(Clone)]
 pub(crate) struct Decl {
-    pub name: &'static str,
-    pub ty: TypeId,
-    make: fn() -> Box<dyn Any + Send>,
-    fold: fn(&mut dyn Any, &Json) -> Result<(), String>,
-    image: fn(&dyn Any) -> Result<Json, String>,
-    restore: fn(&Json) -> Result<Box<dyn Any + Send>, String>,
+    pub name: Name,
+    pub ty: Option<TypeId>,
+    make: Arc<dyn Fn() -> Value + Send + Sync>,
+    fold: Arc<Apply>,
+    image: Arc<Encode>,
+    restore: Arc<Restore>,
 }
 
 impl Decl {
     pub fn of<S: Fold>() -> Self {
         Self {
-            name: S::NAME,
-            ty: TypeId::of::<S>(),
-            make: || Box::new(S::default()),
-            fold: |state, data| {
+            name: Name::from(S::NAME),
+            ty: Some(TypeId::of::<S>()),
+            make: Arc::new(|| Box::new(S::default())),
+            fold: Arc::new(|state, data| {
                 let change = data.parse::<S::Change>().map_err(|e| e.to_string())?;
                 if let Some(state) = state.downcast_mut::<S>() {
                     state.apply(&change);
                 }
                 Ok(())
-            },
-            image: |state| {
+            }),
+            image: Arc::new(|state| {
                 let state = state.downcast_ref::<S>().ok_or("another state")?;
                 Json::encode(state).map_err(|e| e.to_string())
-            },
-            restore: |image| {
+            }),
+            restore: Arc::new(|image| {
                 let state = image.parse::<S>().map_err(|e| e.to_string())?;
                 Ok(Box::new(state))
-            },
+            }),
+        }
+    }
+
+    pub fn erased(fold: Arc<dyn DynFold>) -> Self {
+        let initial = fold.initial();
+        Self {
+            name: fold.name(),
+            ty: None,
+            make: Arc::new(move || Box::new(initial.clone())),
+            fold: Arc::new(move |state, change| {
+                let state = state.downcast_mut::<Json>().ok_or("another state")?;
+                *state = fold.apply(state, change)?;
+                Ok(())
+            }),
+            image: Arc::new(|state| {
+                state
+                    .downcast_ref::<Json>()
+                    .cloned()
+                    .ok_or_else(|| "another state".into())
+            }),
+            restore: Arc::new(|image| Ok(Box::new(image.clone()))),
         }
     }
 }
@@ -92,9 +127,9 @@ impl States {
             decls
                 .into_iter()
                 .map(|(ext, decl)| Held {
+                    value: (decl.make)(),
                     ext,
                     decl,
-                    value: (decl.make)(),
                 })
                 .collect(),
         )
@@ -104,10 +139,20 @@ impl States {
         self.0.iter().find_map(|h| h.value.downcast_ref())
     }
 
+    pub fn erased(&self, ext: &str, name: &str) -> Option<&Json> {
+        self.0
+            .iter()
+            .find(|h| &*h.ext == ext && &*h.decl.name == name && h.decl.ty.is_none())
+            .and_then(|h| h.value.downcast_ref())
+    }
+
     /// The extension that registered `S`.
     pub(crate) fn ext_of<S: Fold>(&self) -> Option<&Name> {
         let ty = TypeId::of::<S>();
-        self.0.iter().find(|h| h.decl.ty == ty).map(|h| &h.ext)
+        self.0
+            .iter()
+            .find(|h| h.decl.ty == Some(ty))
+            .map(|h| &h.ext)
     }
 
     /// Folds one change in. A change to a state no extension registers now
@@ -121,7 +166,7 @@ impl States {
 
     fn try_fold(&mut self, ext: &str, state: &str, data: &Json) -> Result<(), String> {
         let held = self.0.iter_mut();
-        for held in held.filter(|h| &*h.ext == ext && h.decl.name == state) {
+        for held in held.filter(|h| &*h.ext == ext && &*h.decl.name == state) {
             (held.decl.fold)(&mut *held.value, data)
                 .map_err(|e| format!("extension {ext}: a {state} change it cannot read: {e}"))?;
         }
@@ -153,7 +198,7 @@ impl States {
                     .map_err(|e| format!("extension {}: encoding {}: {e}", h.ext, h.decl.name))?;
                 Ok(Image {
                     ext: h.ext.to_string(),
-                    state: h.decl.name.to_owned(),
+                    state: h.decl.name.to_string(),
                     image,
                 })
             })
@@ -169,7 +214,7 @@ impl States {
             .map(|h| {
                 let image = images
                     .iter()
-                    .find(|i| i.ext == *h.ext && i.state == h.decl.name);
+                    .find(|i| i.ext == *h.ext && i.state == *h.decl.name);
                 match image {
                     Some(i) => (h.decl.restore)(&i.image)
                         .map_err(|e| format!("extension {}: reading {}: {e}", h.ext, h.decl.name)),

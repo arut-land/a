@@ -503,6 +503,13 @@ impl<'a> PointCx<'a> {
     pub fn state<S: Fold, R>(&self, read: impl FnOnce(&S) -> R) -> R {
         crate::state::read(|f| self.view.states(f), read)
     }
+
+    pub fn state_erased(&self, ext: &str, name: &str) -> Option<Json> {
+        let mut value = None;
+        self.view
+            .states(&mut |states| value = states.erased(ext, name).cloned());
+        value
+    }
 }
 
 /// A tool call, as handlers see it: its input the text the call holds,
@@ -763,7 +770,7 @@ fn text((): (), text: &String) -> &str {
 /// takes `{"replace": ..}` or `{"stop": ..}`, a permission its name. The
 /// text is handed over as it is, for the handler to read as it reads JSON.
 pub trait ErasedHandler: Send + Sync {
-    fn on(&self, cx: &PointCx<'_>, args: &Json) -> Json;
+    fn on(&self, cx: &PointCx<'_>, args: &Json) -> Result<Json, String>;
 }
 
 /// A point that takes [`ErasedHandler`]s.
@@ -861,8 +868,10 @@ fn rewrite<T: DeserializeOwned>(answer: &Json) -> Rewrite<T, String> {
 type Adapt = fn(Arc<dyn ErasedHandler>) -> Hooked;
 
 fn adapt<P: Wire>(erased: Arc<dyn ErasedHandler>) -> Hooked {
-    let handler: Handler<P> =
-        Arc::new(move |cx, input| P::from_json(&erased.on(cx, &P::to_json(&input))));
+    let handler: Handler<P> = Arc::new(move |cx, input| match erased.on(cx, &P::to_json(&input)) {
+        Ok(answer) => P::from_json(&answer),
+        Err(why) => P::failed(why),
+    });
     P::hook(handler)
 }
 

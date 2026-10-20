@@ -398,7 +398,7 @@ impl Registry {
             i.made
                 .states
                 .iter()
-                .map(|decl| (Name::clone(&i.name), *decl))
+                .map(|decl| (Name::clone(&i.name), decl.clone()))
         }))
     }
 
@@ -450,6 +450,12 @@ struct By {
     ext: Name,
 }
 
+/// A registry source scoped to a workspace. An unchanged source returns
+/// the same generation; a failed refresh leaves existing work on its old one.
+pub trait Sources: Send + Sync {
+    fn registry(&self, workspace: &Path) -> Result<Arc<Registry>, Refused>;
+}
+
 /// The registry sessions run with. Replacing it (a reload) takes effect at
 /// each session's next step boundary: work already running finishes on the
 /// generation it started with.
@@ -463,6 +469,15 @@ impl Current {
     /// The newest generation.
     pub fn get(&self) -> Arc<Registry> {
         Arc::clone(&self.0.lock().unwrap_or_else(PoisonError::into_inner))
+    }
+
+    /// The workspace's newest generation, including extensions loaded at run time.
+    pub fn for_workspace(&self, workspace: &Path) -> Result<Arc<Registry>, Refused> {
+        let base = self.get();
+        match base.service::<dyn Sources>() {
+            Some(source) => source.registry(workspace),
+            None => Ok(base),
+        }
     }
 
     pub fn replace(&self, registry: Registry) {
