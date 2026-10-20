@@ -79,8 +79,17 @@ impl Core {
     /// a time with [`Core::load`], as it is read, then it is resumed with
     /// [`Core::resumed`]. [`Core::resume`] does all three.
     pub fn new(registry: Arc<dyn Binding>) -> Self {
+        Self::restore(registry, Ledger::default())
+    }
+
+    /// A session folded up to a point at which it was at rest
+    /// ([`Core::at_rest`]), from the ledger it had there: the rest of the
+    /// fold is empty between turns, and the agent starts each turn afresh,
+    /// so a snapshot keeps only the ledger, and the log after it is folded
+    /// with [`Core::load`] as a load folds it.
+    pub fn restore(registry: Arc<dyn Binding>, ledger: Ledger) -> Self {
         Self {
-            fold: Fold::new(registry.agent()),
+            fold: Fold::restore(registry.agent(), ledger),
             registry,
             next: None,
             turn: Turn::Idle,
@@ -211,6 +220,17 @@ impl Core {
 
     pub const fn turn(&self) -> &Turn {
         &self.turn
+    }
+
+    /// Whether nothing is in flight, asked for, queued or deferred: the
+    /// ledger alone says where the session stands, so a snapshot of it
+    /// restores the session ([`Core::restore`]).
+    pub fn at_rest(&self) -> bool {
+        self.turn == Turn::Idle
+            && self.fold.asked.is_empty()
+            && self.deferred.is_empty()
+            && self.fold.ledger.untaken().is_empty()
+            && self.fold.ledger.open_calls().next().is_none()
     }
 
     /// What the log says now, through the last entry appended.

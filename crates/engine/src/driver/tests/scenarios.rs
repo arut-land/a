@@ -86,7 +86,7 @@ fn a_users_bash_replaces_the_shells_in_place() {
 }
 
 /// The model a rate-limited call falls back to, until the turn ends.
-#[derive(Debug, Default)]
+#[derive(Debug, Default, serde::Serialize, serde::Deserialize)]
 struct FallbackTo(Option<String>);
 
 impl Fold for FallbackTo {

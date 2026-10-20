@@ -40,9 +40,11 @@ pub struct Fold {
 }
 
 impl Fold {
-    pub fn new(agent: Box<dyn Agent>) -> Self {
+    /// The fold of a log whose ledger is `ledger`, at rest: everything
+    /// else here is empty between turns, so nothing else is kept.
+    pub fn restore(agent: Box<dyn Agent>, ledger: Ledger) -> Self {
         Self {
-            ledger: Ledger::default(),
+            ledger,
             agent,
             asked: VecDeque::new(),
             stepped: false,

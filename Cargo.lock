@@ -596,6 +596,7 @@ dependencies = [
  "llm",
  "protocol",
  "rt",
+ "serde",
 ]
 
 [[package]]
@@ -698,6 +699,7 @@ dependencies = [
  "ext",
  "llm",
  "protocol",
+ "serde",
 ]
 
 [[package]]

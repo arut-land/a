@@ -7,7 +7,7 @@ use serde::{Deserialize, Serialize};
 
 /// Where the session's last command left off, and the client directory it
 /// started from, as the shell records it.
-#[derive(Debug, Default)]
+#[derive(Debug, Default, Serialize, Deserialize)]
 pub struct Cwd {
     dir: Option<PathBuf>,
     base: Option<PathBuf>,

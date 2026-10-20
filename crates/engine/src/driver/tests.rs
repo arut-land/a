@@ -10,12 +10,11 @@ use std::time::Duration;
 
 use std::task::Poll;
 
-use crate::store::{Encoded, Loaded, Log, LogStore, Memory};
+use crate::store::{Encoded, Loaded, Log, LogStore, Memory, Snapshot};
 use ext::{Answer, Extension, Recover, Registrar, Replay, Rewrite, Tool, point};
 use ext_policy::Policy;
 use llm::http::Http;
 use protocol::{Audience, CallId, Card, Epoch, Installed, Permission, Seq, Verdict};
-use serde::Deserialize as _;
 use serde_json::{Value, json};
 
 use super::*;
@@ -75,7 +74,7 @@ fn decision(by: &str, call: Option<u64>, d: Verdict) -> Body {
 
 /// The calls asked about and not yet answered.
 fn inbox(entries: &[Entry]) -> Vec<u64> {
-    (protocol::ledger::Ledger::of(entries).inbox())
+    (Ledger::of(entries).inbox())
         .map(CallId::get)
         .collect()
 }
@@ -461,8 +460,13 @@ impl LogStore for Probe {
         self.store.headers()
     }
 
-    fn load(&self, id: SessionId, each: &mut dyn FnMut(Entry)) -> io::Result<Loaded> {
-        let mut loaded = self.store.load(id, each)?;
+    fn load(
+        &self,
+        id: SessionId,
+        restore: &mut dyn FnMut(Snapshot) -> bool,
+        each: &mut dyn FnMut(Entry),
+    ) -> io::Result<Loaded> {
+        let mut loaded = self.store.load(id, restore, each)?;
         loaded.writer.log = Box::new(Probed(loaded.writer.log, self.clone()));
         Ok(loaded)
     }
@@ -1652,7 +1656,7 @@ fn the_first_answer_wins() {
 }
 
 /// Counts, as a tool's own state.
-#[derive(Default)]
+#[derive(Default, serde::Serialize, serde::Deserialize)]
 struct Count(u64);
 
 impl ext::Fold for Count {

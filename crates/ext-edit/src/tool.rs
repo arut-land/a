@@ -60,7 +60,7 @@ pub struct Edited {
 }
 
 /// The hash of each file as this session last wrote it.
-#[derive(Debug, Default)]
+#[derive(Debug, Default, Serialize, Deserialize)]
 pub struct Seen(HashMap<PathBuf, u64>);
 
 /// A file this session wrote, and the hash of what it wrote.

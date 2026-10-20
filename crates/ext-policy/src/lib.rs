@@ -50,7 +50,7 @@ impl Mode {
 }
 
 /// The session's mode, once one is set: before, the configured default.
-#[derive(Debug, Default)]
+#[derive(Debug, Default, Serialize, Deserialize)]
 pub struct ModeState(pub Option<Mode>);
 
 impl Fold for ModeState {
