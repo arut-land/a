@@ -140,7 +140,11 @@ impl Driver {
                 self.0
                     .cancelled
                     .fetch_max(self.0.latest.load(Ordering::Acquire), Ordering::AcqRel);
-                slot.take();
+                if let Some((_, mut writer)) = slot.take() {
+                    // Detach makes both local daemons and remote bridges close
+                    // their sending half, releasing an already blocked reader.
+                    let _ = writer.send(&ClientMsg::Detach);
+                }
                 Ok(())
             }
         }
@@ -204,10 +208,16 @@ impl Driver {
             remote: remote.is_some(),
             commands,
         });
+        if conn.0 <= self.0.cancelled.load(Ordering::Acquire) {
+            return;
+        }
         let driver = self.clone();
         thread::spawn(move || {
             let why = loop {
                 match reader.recv() {
+                    Ok(Some(_)) if conn.0 <= driver.0.cancelled.load(Ordering::Acquire) => {
+                        break Error::Closed;
+                    }
                     Ok(Some(msg)) => (driver.0.sink)(
                         &driver,
                         Event {
@@ -244,7 +254,6 @@ mod tests {
     fn a_hung_up_connection_never_installs_after_a_late_hello() {
         use protocol::{Caps, DaemonMsg, Target, read_frame, write_frame};
         use std::sync::mpsc;
-        use std::time::Duration;
         use sys::Home;
 
         let root = std::env::temp_dir().join(format!("a-late-hello-{:?}", ClientId::new()));
@@ -258,13 +267,14 @@ mod tests {
         let driver = Driver::new(Daemon::local(home.clone(), staged), move |_, event| {
             tx.send(event).unwrap();
         });
-        driver
-            .io(Io::Connect {
-                conn: ConnId(1),
-                attach: Attach::new(Target::New, crate::Env::Keep),
-                restart: false,
-            })
-            .unwrap();
+        let opener = driver.clone();
+        let opening = thread::spawn(move || {
+            opener.connect(
+                ConnId(1),
+                &Attach::new(Target::New, crate::Env::Keep),
+                false,
+            )
+        });
         let mut peer = listener.accept().unwrap();
         assert!(matches!(
             read_frame::<ClientMsg>(&mut peer).unwrap(),
@@ -285,18 +295,74 @@ mod tests {
             },
         )
         .unwrap();
-        // Join the opener by waiting for its sole driver reference to go away.
-        let deadline = std::time::Instant::now() + Duration::from_secs(2);
-        while Arc::strong_count(&driver.0) > 1 && rx.try_recv().is_err() {
-            assert!(std::time::Instant::now() < deadline);
-            thread::yield_now();
-        }
+        opening.join().unwrap();
+        assert!(rx.try_recv().is_err());
         let installed = lock(&driver.0.writer).is_some();
         drop(peer);
         drop(listener);
         home.endpoint().remove();
         std::fs::remove_dir_all(root).unwrap();
         assert!(!installed, "a cancelled opener installed its writer");
+    }
+
+    #[test]
+    fn hangup_during_connection_publication_ends_the_reader() {
+        use protocol::{Caps, DaemonMsg, Target, read_frame, write_frame};
+        use std::sync::mpsc;
+        use sys::Home;
+
+        let root = std::env::temp_dir().join(format!("a-publish-hangup-{:?}", ClientId::new()));
+        std::fs::create_dir_all(&root).unwrap();
+        let home = Home::from(root.join("home"));
+        let exe = root.join("a");
+        std::fs::write(&exe, "never run").unwrap();
+        let staged = home.runtime().stage(&exe).unwrap();
+        let listener = home.bind().unwrap();
+        let (published, ready) = mpsc::channel();
+        let (release, released) = mpsc::channel();
+        let released = Mutex::new(released);
+        let (events, received) = mpsc::channel();
+        let driver = Driver::new(Daemon::local(home.clone(), staged), move |driver, event| {
+            if matches!(event.kind, EventKind::Connected { .. }) {
+                driver.io(Io::Hangup).unwrap();
+                published.send(()).unwrap();
+                lock(&released).recv().unwrap();
+            } else {
+                events.send(event).unwrap();
+            }
+        });
+        let opener = driver.clone();
+        let opening = thread::spawn(move || {
+            opener.connect(
+                ConnId(1),
+                &Attach::new(Target::New, crate::Env::Keep),
+                false,
+            )
+        });
+        let mut peer = listener.accept().unwrap();
+        read_frame::<ClientMsg>(&mut peer).unwrap().unwrap();
+        read_frame::<ClientMsg>(&mut peer).unwrap().unwrap();
+        write_frame(
+            &mut peer,
+            &DaemonMsg::Welcome {
+                proto: protocol::PROTO,
+                build: "test".into(),
+                caps: Caps::ALL,
+                commands: Vec::new(),
+            },
+        )
+        .unwrap();
+        ready.recv().unwrap();
+        write_frame(&mut peer, &DaemonMsg::Ack { client_seq: 99 }).unwrap();
+        release.send(()).unwrap();
+        opening.join().unwrap();
+        drop(peer);
+        // The opener must release its reader before returning from publication.
+        assert_eq!(Arc::strong_count(&driver.0), 1);
+        assert!(received.try_recv().is_err());
+        drop(listener);
+        home.endpoint().remove();
+        std::fs::remove_dir_all(root).unwrap();
     }
 
     /// A renderer that asks for one more thing the first time it is shown
