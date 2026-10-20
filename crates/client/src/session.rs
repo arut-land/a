@@ -204,7 +204,9 @@ impl fmt::Display for Notice {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Self::NotConnected => f.write_str("not connected"),
-            Self::Backpressure => f.write_str("waiting for the daemon to acknowledge pending input"),
+            Self::Backpressure => {
+                f.write_str("waiting for the daemon to acknowledge pending input")
+            }
             Self::NothingRunning => f.write_str("nothing is running"),
             Self::NotAsking(call) => write!(f, "call {call} is not waiting for an answer"),
             Self::RemoteEnv => f.write_str(

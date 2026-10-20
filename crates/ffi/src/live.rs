@@ -247,6 +247,8 @@ pub fn find_session(sessions: Vec<SessionInfo>, wanted: &str) -> Option<String> 
 pub struct Session {
     feed: Arc<Mutex<Feed>>,
     driver: Driver,
+    /// Numbering and pumping share this lock; publishing takes only the feed.
+    sending: Arc<Mutex<()>>,
 }
 
 /// The feed as the driver's pump renders through it: locked only while it
@@ -265,6 +267,8 @@ impl Session {
     pub fn new(client: &Client) -> Self {
         let feed = Arc::new(Mutex::new(Feed::new(SessionClient::new(Env::Keep))));
         let shared = Arc::clone(&feed);
+        let sending = Arc::new(Mutex::new(()));
+        let ordered = Arc::clone(&sending);
         let driver = Driver::with_origin(
             client.daemon.clone(),
             || {
@@ -275,11 +279,16 @@ impl Session {
                 ))
             },
             move |driver, event| {
+                let _sending = lock(&ordered);
                 let effects = lock(&shared).client.step(event);
                 driver.pump(&mut Published(&shared), effects);
             },
         );
-        Self { feed, driver }
+        Self {
+            feed,
+            driver,
+            sending,
+        }
     }
 
     /// Every update from here on. Subscribe before `open` to see the
@@ -335,6 +344,7 @@ impl Session {
             },
             OpenTarget::Id { id } => Attach::new(Target::Id(parse_id(&id)?), Env::Keep),
         };
+        let _sending = lock(&self.sending);
         let effects = {
             let mut feed = lock(&self.feed);
             if feed.client.connection().0 > 0 {
@@ -397,7 +407,9 @@ impl Session {
     /// Replaces a daemon that stopped answering, and attaches again.
     pub async fn restart(&self) -> Result<(), ClientError> {
         let (feed, driver) = (Arc::clone(&self.feed), self.driver.clone());
+        let sending = Arc::clone(&self.sending);
         blocking(move || {
+            let _sending = lock(&sending);
             let effects = lock(&feed).client.restart();
             driver.pump(&mut Published(&feed), effects);
             Ok(())
@@ -414,7 +426,9 @@ impl Session {
         intent: impl FnOnce(&mut SessionClient) -> Result<Vec<Effect>, Notice> + Send + 'static,
     ) -> Result<(), ClientError> {
         let (feed, driver) = (Arc::clone(&self.feed), self.driver.clone());
+        let sending = Arc::clone(&self.sending);
         blocking(move || {
+            let _sending = lock(&sending);
             let effects = intent(&mut lock(&feed).client)?;
             driver.pump(&mut Published(&feed), effects);
             Ok(())
@@ -424,7 +438,9 @@ impl Session {
 
     async fn run(&self, cmd: Cmd) -> Result<(), ClientError> {
         let (feed, driver) = (Arc::clone(&self.feed), self.driver.clone());
+        let sending = Arc::clone(&self.sending);
         blocking(move || {
+            let _sending = lock(&sending);
             let effects = {
                 let mut feed = lock(&feed);
                 if !feed.client.link().attached() {
@@ -442,6 +458,7 @@ impl Session {
 /// Released by the app: the daemon is told, and the reader then ends.
 impl Drop for Session {
     fn drop(&mut self) {
+        let _sending = lock(&self.sending);
         let effects = lock(&self.feed).client.detach();
         self.driver.pump(&mut Published(&self.feed), effects);
     }
@@ -453,4 +470,93 @@ fn parse_id(id: &str) -> Result<SessionId, ClientError> {
         .map_err(|_| ClientError::InvalidArgument {
             message: format!("not a session id: {id}"),
         })
+}
+
+#[cfg(test)]
+mod tests {
+    use std::sync::Barrier;
+    use std::thread;
+    use std::time::Instant;
+
+    use protocol::{Caps, ClientMsg, DaemonMsg, read_frame, write_frame};
+
+    use super::*;
+
+    #[test]
+    fn concurrent_mutations_arrive_in_sequence_order() {
+        for _ in 0..10 {
+            let root = std::env::temp_dir().join(format!("a-ffi-order-{}", SessionId::new()));
+            std::fs::create_dir_all(&root).unwrap();
+            let home = Home::from(root.join("home"));
+            let exe = root.join("a");
+            std::fs::write(&exe, "never run").unwrap();
+            let staged = home.runtime().stage(&exe).unwrap();
+            let listener = home.bind().unwrap();
+            let peer = thread::spawn(move || {
+                let mut peer = listener.accept().unwrap();
+                assert!(matches!(
+                    read_frame::<ClientMsg>(&mut peer).unwrap(),
+                    Some(ClientMsg::Hello { .. })
+                ));
+                assert!(matches!(
+                    read_frame::<ClientMsg>(&mut peer).unwrap(),
+                    Some(ClientMsg::Attach { .. })
+                ));
+                write_frame(
+                    &mut peer,
+                    &DaemonMsg::Welcome {
+                        proto: protocol::PROTO,
+                        build: "test".into(),
+                        caps: Caps::ALL,
+                        commands: Vec::new(),
+                    },
+                )
+                .unwrap();
+                let mut received = Vec::new();
+                while let Some(msg) = read_frame::<ClientMsg>(&mut peer).unwrap() {
+                    if let Some(seq) = msg.client_seq() {
+                        received.push(seq);
+                    }
+                    if matches!(msg, ClientMsg::Detach) {
+                        break;
+                    }
+                }
+                received
+            });
+            let session = Session::new(&Client {
+                daemon: Daemon::local(home.clone(), staged),
+                home: home.clone(),
+            });
+            session
+                .open(OpenTarget::Id {
+                    id: SessionId::new().to_string(),
+                })
+                .unwrap();
+            let deadline = Instant::now() + Duration::from_secs(5);
+            while !lock(&session.feed).client.link().up() {
+                assert!(Instant::now() < deadline);
+                thread::yield_now();
+            }
+            let start = Barrier::new(64);
+            thread::scope(|scope| {
+                for n in 0..64 {
+                    let (session, start) = (&session, &start);
+                    scope.spawn(move || {
+                        start.wait();
+                        let text = "x".repeat(64 * 1024);
+                        if n % 2 == 0 {
+                            rt::block_on(session.send(text)).unwrap();
+                        } else {
+                            rt::block_on(session.run(Cmd::Input(text))).unwrap();
+                        }
+                    });
+                }
+            });
+            drop(session);
+            let received = peer.join().unwrap();
+            home.endpoint().remove();
+            std::fs::remove_dir_all(root).unwrap();
+            assert_eq!(received, (1..=64).collect::<Vec<_>>());
+        }
+    }
 }
