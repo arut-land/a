@@ -81,7 +81,7 @@ pub struct App {
     body: u16,
     editor: Editor,
     /// The slash menu's selected command.
-    menu_at: usize,
+    menu_at: Option<usize>,
     /// The approval list's highlight: Yes until moved to No.
     deny: bool,
     overlay: Option<Overlay>,
@@ -148,7 +148,7 @@ impl App {
             width: 0,
             body: 0,
             editor: Editor::default(),
-            menu_at: 0,
+            menu_at: Some(0),
             deny: false,
             overlay: None,
             flash: None,
@@ -182,7 +182,7 @@ impl App {
     /// client has no timer.
     pub fn working(&self) -> bool {
         let turn = self.client.turn();
-        turn.running && turn.asking.is_none()
+        turn.can_interrupt && turn.asking.is_none()
     }
 
     /// The indicator's clock ticked.
@@ -317,6 +317,7 @@ impl App {
             Input::Paste(text) => {
                 if self.overlay.is_none() {
                     self.editor.paste(&text.replace('\t', "    "));
+                    self.menu_at = Some(0);
                 }
                 None
             }
@@ -337,6 +338,9 @@ impl App {
             Key::Ctrl('d') if self.editor.is_empty() => return Some(self.leave()),
             Key::Ctrl('o') => {
                 self.verbose = !self.verbose;
+                if self.viewport == Viewport::Inline {
+                    self.anchor = None;
+                }
                 self.cache.iter_mut().for_each(|r| *r = None);
             }
             Key::Ctrl('l') => return Some(Effect::Redraw),
@@ -346,7 +350,7 @@ impl App {
             Key::Char('?') if self.editor.is_empty() && asked.is_none() => {
                 self.overlay = Some(Overlay::Help);
             }
-            Key::Esc if self.anchor.is_some() => self.anchor = None,
+            Key::Esc if !self.menu().is_empty() => self.menu_at = None,
             Key::Char(c @ ('y' | 'n' | 'Y' | 'N' | '1' | '2'))
                 if self.editor.is_empty() && asked.is_some() =>
             {
@@ -374,22 +378,21 @@ impl App {
                     approved: false,
                 }));
             }
-            // Esc stops a running turn, as in Claude Code, once there is
-            // nothing to scroll back from.
-            Key::Esc if self.anchor.is_none() && self.client.turn().can_interrupt => {
+            Key::Esc if self.client.turn().can_interrupt => {
                 return Some(self.interrupt());
             }
+            Key::Esc if self.anchor.is_some() => self.anchor = None,
             Key::Esc => self.recap_hidden = true,
             key => {
                 let menu = self.menu();
                 let last = menu.len().saturating_sub(1);
-                let at = self.menu_at.min(last);
+                let at = self.menu_at.unwrap_or(0).min(last);
                 match key {
                     Key::Up | Key::Ctrl('p') if !menu.is_empty() => {
-                        self.menu_at = at.saturating_sub(1);
+                        self.menu_at = Some(at.saturating_sub(1));
                     }
                     Key::Down | Key::Ctrl('n') if !menu.is_empty() => {
-                        self.menu_at = (at + 1).min(last);
+                        self.menu_at = Some((at + 1).min(last));
                     }
                     // Tab takes the selected name; a command with
                     // arguments waits for them, one without runs on Enter.
@@ -409,7 +412,7 @@ impl App {
                         }
                     }
                     key => {
-                        self.menu_at = 0;
+                        self.menu_at = Some(0);
                         if let Edit::Submit(text) = self.editor.key(key) {
                             return self.submit(&text);
                         }
@@ -482,7 +485,7 @@ impl App {
     }
 
     fn interrupt(&mut self) -> Effect {
-        self.notice("stopping the turn (ctrl-d detaches)", false);
+        self.notice("interrupt requested · what should it do next?", false);
         Effect::Cmd(Cmd::Interrupt)
     }
 

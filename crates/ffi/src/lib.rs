@@ -788,11 +788,11 @@ impl ViewChange {
             },
             Change::Added { index: i, item } => Self::Added {
                 index: index(*i),
-                item: item.into(),
+                item: ViewItem::in_view(item, view),
             },
             Change::Updated { index: i, part } => Self::Updated {
                 index: index(*i),
-                patch: ItemPatch::of(&view.items[*i], *part),
+                patch: ItemPatch::of(&view.items[*i], *part, view),
             },
             Change::Delta { call, text } => Self::Delta {
                 call: call.get(),
@@ -802,7 +802,11 @@ impl ViewChange {
                 recap: view.recap.as_ref().map(Into::into),
             },
             Change::Snapshot => Self::Snapshot {
-                items: view.items.iter().map(Into::into).collect(),
+                items: view
+                    .items
+                    .iter()
+                    .map(|item| ViewItem::in_view(item, view))
+                    .collect(),
             },
             Change::Draining => Self::Draining,
             Change::Mismatch { supported } => Self::Mismatch {
@@ -818,16 +822,19 @@ impl ViewChange {
 
 impl ItemPatch {
     /// What `part` of `item` is now.
-    fn of(item: &Item, part: Part) -> Self {
-        let shown = Presentation::from(&item.present());
+    fn of(item: &Item, part: Part, view: &SessionView) -> Self {
+        let shown = Presentation::from(&view.present(item));
         match (item, part) {
+            (_, Part::Progress) => Self::Phase { shown },
             (
                 Item::Tool {
                     by: protocol::Audience::User,
                     ..
                 },
                 _,
-            ) => Self::Command { item: item.into() },
+            ) => Self::Command {
+                item: ViewItem::in_view(item, view),
+            },
             (Item::Child { watch, .. }, Part::Watch) => Self::Watch {
                 watch: watch.map(protocol::Seq::get),
             },
@@ -878,7 +885,16 @@ impl From<protocol::view::Usage> for TokenUsage {
 
 impl From<&Item> for ViewItem {
     fn from(item: &Item) -> Self {
-        let shown = Presentation::from(&item.present());
+        Self::presented(item, Presentation::from(&item.present()))
+    }
+}
+
+impl ViewItem {
+    fn in_view(item: &Item, view: &SessionView) -> Self {
+        Self::presented(item, Presentation::from(&view.present(item)))
+    }
+
+    fn presented(item: &Item, shown: Presentation) -> Self {
         match item {
             Item::User { seq, text } => Self::User {
                 seq: seq.get(),
@@ -1003,7 +1019,11 @@ impl SessionSnapshot {
             seq: view.seq,
             session: view.session.map(|s| s.to_string()),
             workspace: view.workspace.display().to_string(),
-            items: view.items.iter().map(Into::into).collect(),
+            items: view
+                .items
+                .iter()
+                .map(|item| ViewItem::in_view(item, view))
+                .collect(),
             link: client.link().into(),
             recap: view.recap.as_ref().map(Into::into),
             streaming: view.streaming.as_ref().map(|s| StreamingText {

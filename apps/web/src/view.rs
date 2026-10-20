@@ -174,7 +174,7 @@ const fn status_style(glyph: Glyph) -> &'static str {
 /// One transcript item, with the reply streaming into it if it is `view`'s.
 #[component]
 pub fn item_row<'a>(item: &'a Item, view: &'a SessionView) -> impl Renderable {
-    let p = item.present();
+    let p = view.present(item);
     let live = match item {
         Item::Reply { call, .. } => (view.streaming.as_ref())
             .filter(|s| s.call == *call)

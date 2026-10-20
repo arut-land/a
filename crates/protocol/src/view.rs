@@ -281,6 +281,8 @@ pub enum Part {
     /// Where the call stands changed: it is asked about, runs, or was
     /// refused.
     Phase,
+    /// More output was committed by a running tool.
+    Progress,
     /// The approval the call waited for was given, or not.
     Answer {
         approved: bool,
@@ -325,6 +327,22 @@ impl SessionView {
             seq: self.seq,
             change,
         })
+    }
+
+    /// A call's live output comes from the ledger until its final outcome
+    /// replaces it, so attaching mid-call shows the same output as watching.
+    pub fn present<'a>(&'a self, item: &'a Item) -> Presented<'a> {
+        let mut shown = item.present();
+        if let Item::Tool {
+            call,
+            outcome: None,
+            ..
+        } = item
+            && let Some(text) = self.ledger.call(*call).and_then(|c| c.progress.as_deref())
+        {
+            shown.body = Shown::Text(text.into());
+        }
+        shown
     }
 
     /// The latest done reply to a side request for `purpose` (a title,
@@ -601,9 +619,14 @@ impl SessionView {
                     _ => self.rephase(*call),
                 }
             }
-            Body::Wait { call, .. }
-            | Body::ToolProcess { call, .. }
-            | Body::Progress { call, .. } => self.rephase(*call),
+            Body::Progress { call, .. } => {
+                self.rephase(*call);
+                Some(Change::Updated {
+                    index: self.call(*call)?,
+                    part: Part::Progress,
+                })
+            }
+            Body::Wait { call, .. } | Body::ToolProcess { call, .. } => self.rephase(*call),
             Body::Watch { child } => {
                 let at = self.items.iter().rposition(
                     |item| matches!(item, Item::Child { child: c, watch: None, .. } if c == child),

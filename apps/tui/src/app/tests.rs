@@ -1018,6 +1018,7 @@ fn running_command() -> Vec<DaemonMsg> {
 fn esc_interrupts_a_running_turn_that_asks_nothing() {
     for viewport in [Viewport::Full, Viewport::Inline] {
         let (mut app, _) = app(viewport, &running_command());
+        app.anchor = Some((0, 0));
         assert!(matches!(
             press(&mut app, Key::Esc),
             Some(Effect::Cmd(Cmd::Interrupt))
@@ -1094,4 +1095,86 @@ fn a_question_mark_on_an_empty_input_opens_help_and_inside_text_is_typed() {
     press(&mut app, Key::Char('q'));
     keys(&mut app, "why?");
     assert_eq!(app.editor.text(), "why?");
+}
+
+#[test]
+fn escape_closes_the_slash_menu_without_losing_the_draft() {
+    let (mut app, _) = app(Viewport::Full, &[DaemonMsg::Synced { seq: 0 }]);
+    keys(&mut app, "/s");
+    assert_eq!(app.menu()[0].0, "/sessions");
+    press(&mut app, Key::Esc);
+    assert_eq!(app.menu(), [] as [(String, String, String); 0]);
+    assert_eq!(app.editor.text(), "/s");
+    keys(&mut app, "e");
+    assert_eq!(app.menu()[0].0, "/sessions");
+}
+
+#[test]
+fn running_tools_show_each_progress_update_and_then_the_finished_card() {
+    for viewport in [Viewport::Full, Viewport::Inline] {
+        let (mut app, _) = app(viewport, &running_command());
+        for (seq, text) in [(6, "first\n"), (7, "second\n")] {
+            app.fold(&entry(
+                seq,
+                Body::Progress {
+                    call: CallId::new(3).unwrap(),
+                    text: text.into(),
+                },
+            ));
+            assert!(app.needs_frame());
+            let (_, rows) = frame(&mut app, 80, 24);
+            find(&rows, "⎿  first");
+            if seq == 7 {
+                find(&rows, "second");
+            }
+        }
+        app.fold(&entry(
+            8,
+            Body::ToolResult {
+                call: CallId::new(3).unwrap(),
+                outcome: Outcome::Done {
+                    output: Json::encode(&json!({"output":"final", "exit":0})).unwrap(),
+                },
+                card: Some(Card {
+                    body: "final".into(),
+                    note: "exit 0".into(),
+                    ..Card::default()
+                }),
+            },
+        ));
+        let (_, rows) = frame(&mut app, 80, 24);
+        find(&rows, "⎿  final");
+        assert!(!rows.iter().any(|r| r.contains("second")));
+    }
+}
+
+#[test]
+fn inline_review_expands_finished_cards_without_printing_history_twice() {
+    let (mut app, _) = app(Viewport::Inline, &running_command());
+    app.fold(&entry(
+        6,
+        Body::ToolResult {
+            call: CallId::new(3).unwrap(),
+            outcome: Outcome::Done {
+                output: Json::encode(&json!({"output":"done", "exit":0})).unwrap(),
+            },
+            card: Some(Card {
+                body: (1..=30).map(|n| format!("output {n}\n")).collect(),
+                note: "exit 0".into(),
+                ..Card::default()
+            }),
+        },
+    ));
+    assert_ne!(app.scrollback(80).len(), 0);
+    assert_eq!(app.committed, app.view().items.len());
+    press(&mut app, Key::Ctrl('o'));
+    let h = app.height(80, 24);
+    let (_, rows) = frame(&mut app, 80, h);
+    find(&rows, "output 30");
+    press(&mut app, Key::PageUp);
+    let (_, rows) = frame(&mut app, 80, h);
+    find(&rows, "output 10");
+    press(&mut app, Key::Ctrl('o'));
+    assert!(app.anchor.is_none());
+    assert_eq!(app.scrollback(80).len(), 0);
 }

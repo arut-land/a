@@ -35,6 +35,9 @@ impl App {
     /// print above the viewport; each item is taken once, in order.
     pub fn scrollback(&mut self, width: u16) -> Vec<Line> {
         let mut out = Vec::new();
+        if self.verbose {
+            return out;
+        }
         while self
             .client
             .view()
@@ -138,10 +141,10 @@ impl App {
                     Span::button(mark, cyan, Action::Approve(*call, yes)),
                     Span::button(
                         label,
-                        if yes != self.deny {
-                            cyan.bold()
-                        } else {
+                        if yes == self.deny {
                             Style::new()
+                        } else {
+                            cyan.bold()
                         },
                         Action::Approve(*call, yes),
                     ),
@@ -219,7 +222,8 @@ impl App {
     /// `(name, usage, help)`; empty once the input is more than that word.
     pub(super) fn menu(&self) -> Vec<(String, String, String)> {
         let typed = self.editor.text();
-        if !typed.starts_with('/') || typed.contains(char::is_whitespace) {
+        if self.menu_at.is_none() || !typed.starts_with('/') || typed.contains(char::is_whitespace)
+        {
             return Vec::new();
         }
         client::help(self.client.commands())
@@ -235,7 +239,10 @@ impl App {
     /// selection, as Claude Code lists commands over its prompt.
     fn menu_rows(&self, width: usize) -> Vec<Line> {
         let entries = self.menu();
-        let at = self.menu_at.min(entries.len().saturating_sub(1));
+        let at = self
+            .menu_at
+            .unwrap_or(0)
+            .min(entries.len().saturating_sub(1));
         let start = (at + 1).saturating_sub(MENU_ROWS);
         entries
             .iter()
@@ -426,9 +433,9 @@ impl App {
 
     /// The frame height this app wants: the whole terminal on the full
     /// screen; inline, its live rows (at most half the terminal) and what
-    /// is under them.
+    /// is under them. Expanded transcript review uses the whole viewport.
     pub fn height(&mut self, w: u16, h: u16) -> u16 {
-        if self.viewport == Viewport::Full {
+        if self.viewport == Viewport::Full || self.verbose {
             return h;
         }
         let width = usize::from(w);
@@ -501,8 +508,8 @@ impl App {
         let (w, _) = canvas.size();
         let (width, rows) = (usize::from(w), usize::from(body));
         let shown = match viewport {
-            Viewport::Full => self.window(width, rows),
-            Viewport::Inline => self.live(width, rows),
+            Viewport::Inline if !self.verbose => self.live(width, rows),
+            Viewport::Full | Viewport::Inline => self.window(width, rows),
         };
         // A short transcript sits at the bottom, by the input.
         let top = u16::try_from(rows - shown.len()).unwrap_or(0);

@@ -53,8 +53,16 @@ fn status(p: &Presented<'_>) -> Span {
 }
 
 pub fn rows(item: &Item, width: usize, look: Look) -> Vec<Line> {
+    presented_rows(item, &item.present(), width, look)
+}
+
+pub(crate) fn presented_rows(
+    item: &Item,
+    p: &Presented<'_>,
+    width: usize,
+    look: Look,
+) -> Vec<Line> {
     let blank = Line::default();
-    let p = item.present();
     match p.kind {
         Kind::User => {
             let mut out = vec![blank];
@@ -71,7 +79,7 @@ pub fn rows(item: &Item, width: usize, look: Look) -> Vec<Line> {
             mark_reply(&mut out);
             out
         }
-        Kind::Reply => reply(&p, width),
+        Kind::Reply => reply(p, width),
         // A side request's reply is its extension's, not the conversation's:
         // a title shows in the status line, a summary in what the model sees.
         Kind::Side => Vec::new(),
@@ -82,7 +90,7 @@ pub fn rows(item: &Item, width: usize, look: Look) -> Vec<Line> {
                 }
                 _ => None,
             };
-            card(item.key(), &p, input, width, look)
+            card(item.key(), p, input, width, look)
         }
         Kind::Hook | Kind::Environment => vec![Line::plain(
             ellipsize(&sanitize(&format!("  · {}", p.title)), width),
@@ -92,7 +100,7 @@ pub fn rows(item: &Item, width: usize, look: Look) -> Vec<Line> {
             let head = vec![
                 Span::new("⑂ ", BUSY),
                 Span::new(format!("{} ", p.title), Style::new().bold()),
-                status(&p),
+                status(p),
             ];
             let mut out = vec![blank, Line::from(head)];
             let body = [Span::new(
