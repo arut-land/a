@@ -7,7 +7,7 @@
 pub mod pty;
 
 use std::fs;
-use std::io::{BufRead, BufReader, ErrorKind, Read, Write};
+use std::io::{self, BufRead, BufReader, ErrorKind, Read, Write};
 use std::os::unix::fs::PermissionsExt;
 use std::os::unix::net::UnixStream;
 use std::os::unix::process::CommandExt;
@@ -54,43 +54,56 @@ pub fn warm_up(exe: &Path) {
     );
 }
 
-/// A test's process group, led by a watchdog that blocks reading a pipe
-/// only the test holds. However the test ends (it returns, panics, or is
-/// killed and runs no destructor), the pipe closes; the watchdog then stops
-/// the daemon of every home the test listed (daemons leave the group, as
-/// they leave their client's session) and kills the group: every process
-/// the test started, and whatever those started in turn.
+/// A test's process group, and the watchdog that ends it. The group's
+/// leader and the watchdog (in a group of its own, out of reach of
+/// whatever signals the test's) each block reading a pipe only the test
+/// holds. However the test ends (it returns, panics, or is killed and runs
+/// no destructor), the pipe closes; the watchdog then kills the group,
+/// which is every process the test started and whatever those started in
+/// turn, and stops the daemon of every home the test listed (daemons leave
+/// the group, as they leave their client's session).
 struct Group {
+    leader: Child,
     watchdog: Child,
-    lifeline: Option<ChildStdin>,
+    lifeline: Option<io::PipeWriter>,
     pgid: u32,
     /// Where the test lists its homes, one per line, for the watchdog.
     homes: PathBuf,
 }
 
-/// The watchdog: `$1` is the `a` to stop daemons with, `$2` the homes.
+/// The watchdog: `$1` is the group, `$2` the `a` to stop daemons with,
+/// `$3` the homes.
 const WATCHDOG: &str = r#"read -r _
-while read -r home; do A_HOME="$home" "$1" daemon stop >/dev/null 2>&1; done < "$2"
-kill -KILL 0
+kill -KILL -- "-$1"
+while read -r home; do A_HOME="$home" "$2" daemon stop >/dev/null 2>&1; done < "$3"
 "#;
 
 impl Group {
     fn new(exe: &Path, homes: PathBuf) -> Self {
-        let mut watchdog = Command::new("/bin/sh")
-            .args(["-c", WATCHDOG, "watchdog"])
+        let (read, lifeline) = io::pipe().unwrap();
+        let sh = |script: &str| {
+            let mut sh = Command::new("/bin/sh");
+            sh.args(["-c", script, "sh"])
+                .env_remove("A_HOST")
+                .process_group(0)
+                .stdin(read.try_clone().unwrap())
+                .stdout(Stdio::null())
+                .stderr(Stdio::null());
+            sh
+        };
+        let leader = sh("read -r _").spawn().unwrap();
+        let pgid = leader.id();
+        let watchdog = sh(WATCHDOG)
+            .arg(pgid.to_string())
             .arg(exe)
             .arg(&homes)
-            .env_remove("A_HOST")
-            .process_group(0)
-            .stdin(Stdio::piped())
-            .stdout(Stdio::null())
-            .stderr(Stdio::null())
             .spawn()
             .unwrap();
         Self {
-            lifeline: watchdog.stdin.take(),
-            pgid: watchdog.id(),
+            leader,
             watchdog,
+            lifeline: Some(lifeline),
+            pgid,
             homes,
         }
     }
@@ -109,6 +122,7 @@ impl Group {
     /// it is left. Never panics: it runs as a failed test unwinds.
     fn end(&mut self) {
         drop(self.lifeline.take());
+        let _ = self.leader.wait();
         let _ = self.watchdog.wait();
         // Killed, so gone at once; a zombie a test never reaped is not live.
         let deadline = Instant::now() + Duration::from_secs(10);
@@ -356,7 +370,7 @@ impl Drop for Env {
         let _ = fs::remove_file(self.home.endpoint().path());
         // A failed test's home, with the daemon's log, is kept to look at.
         if std::thread::panicking() {
-            let _ = writeln!(std::io::stderr(), "kept {}", self.root.display());
+            let _ = writeln!(io::stderr(), "kept {}", self.root.display());
         } else {
             let _ = fs::remove_dir_all(&self.root);
         }
