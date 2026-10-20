@@ -35,7 +35,7 @@ func aLiveSessionChatsRunsAnApprovedToolAndIsListed() async throws {
 
     await store.send("hi")
     try await eventually("the echo") {
-        store.items.contains { if case .assistant(_, "hi") = $0 { true } else { false } }
+        store.items.contains { if case .assistant(_, "hi", _) = $0 { true } else { false } }
     }
 
     await store.send("$ echo hello")

@@ -1,6 +1,6 @@
 [
   {
-    "hash": "32324c15cbeb305f",
+    "hash": "214e1fb9e25e80df",
     "messages": [
       {
         "session": "00000000-0000-0000-0000-00000000000a",
@@ -92,23 +92,6 @@
         "extensions": null,
         "links": [],
         "open": [],
-        "result": {
-          "output": {
-            "message": {
-              "content": [
-                {
-                  "text": "hello",
-                  "type": "text"
-                }
-              ]
-            },
-            "usage": {
-              "input": 4,
-              "output": 2
-            }
-          },
-          "status": "done"
-        },
         "seq": 3,
         "turn": 1,
         "untaken": [],
@@ -199,7 +182,7 @@
     ]
   },
   {
-    "hash": "c6b3d5eccb4ee2c0",
+    "hash": "6c8e00eea9b68da2",
     "messages": [
       {
         "session": "00000000-0000-0000-0000-00000000000a",
@@ -294,13 +277,6 @@
         "extensions": null,
         "links": [],
         "open": [],
-        "result": {
-          "output": {
-            "exit": 0,
-            "output": "hi\n"
-          },
-          "status": "done"
-        },
         "seq": 4,
         "turn": 0,
         "untaken": [],
@@ -387,7 +363,7 @@
     ]
   },
   {
-    "hash": "33aa525f9e6b6dd7",
+    "hash": "aa35ced2ba389e41",
     "messages": [
       {
         "session": "00000000-0000-0000-0000-00000000000a",
@@ -467,7 +443,6 @@
         "extensions": null,
         "links": [],
         "open": [],
-        "result": null,
         "seq": 4,
         "turn": 1,
         "untaken": [],
@@ -543,7 +518,7 @@
     ]
   },
   {
-    "hash": "b978b04f9d22ce2c",
+    "hash": "c8fe22c5dd26f903",
     "messages": [
       {
         "session": "00000000-0000-0000-0000-00000000000a",
@@ -615,12 +590,6 @@
           }
         ],
         "open": [],
-        "result": {
-          "output": {
-            "slept": 1
-          },
-          "status": "done"
-        },
         "seq": 3,
         "turn": 0,
         "untaken": [],
@@ -691,7 +660,7 @@
     ]
   },
   {
-    "hash": "b8134a8f4f682ce9",
+    "hash": "f98ad5c1bb0f4165",
     "messages": [
       {
         "session": "00000000-0000-0000-0000-00000000000a",
@@ -773,10 +742,6 @@
         "extensions": null,
         "links": [],
         "open": [],
-        "result": {
-          "output": "one",
-          "status": "done"
-        },
         "seq": 3,
         "turn": 3,
         "untaken": [],
@@ -870,7 +835,7 @@
     ]
   },
   {
-    "hash": "8d95f4ebbe98da51",
+    "hash": "3477bf9eb6b56d0f",
     "messages": [
       {
         "session": "00000000-0000-0000-0000-00000000000a",
@@ -924,7 +889,6 @@
         "extensions": null,
         "links": [],
         "open": [],
-        "result": null,
         "seq": 2,
         "turn": 0,
         "untaken": [],
@@ -968,7 +932,7 @@
     ]
   },
   {
-    "hash": "f311292849e92ace",
+    "hash": "204eab33a89f2660",
     "messages": [
       {
         "session": "00000000-0000-0000-0000-00000000000a",
@@ -1105,13 +1069,6 @@
         "extensions": null,
         "links": [],
         "open": [],
-        "result": {
-          "output": {
-            "exit": 0,
-            "output": "hi\n"
-          },
-          "status": "done"
-        },
         "seq": 6,
         "turn": 4,
         "untaken": [],
@@ -1213,7 +1170,7 @@
     ]
   },
   {
-    "hash": "df148450319289cb",
+    "hash": "46cc360b6d40d957",
     "messages": [
       {
         "session": "00000000-0000-0000-0000-00000000000a",
@@ -1322,7 +1279,6 @@
               }
             ]
           ],
-          "result": null,
           "seq": 4,
           "turn": 1,
           "untaken": [],
@@ -1424,10 +1380,6 @@
             }
           ]
         ],
-        "result": {
-          "output": "done",
-          "status": "done"
-        },
         "seq": 5,
         "turn": 1,
         "untaken": [],
@@ -1535,7 +1487,7 @@
     ]
   },
   {
-    "hash": "abb555d5c0d94c8a",
+    "hash": "9836a68da3076432",
     "messages": [
       {
         "session": "00000000-0000-0000-0000-00000000000a",
@@ -2144,10 +2096,6 @@
             }
           ]
         ],
-        "result": {
-          "output": "a38",
-          "status": "done"
-        },
         "seq": 30,
         "turn": 22,
         "untaken": [],
@@ -2722,7 +2670,7 @@
     ]
   },
   {
-    "hash": "5807c0ca5ee96cc6",
+    "hash": "c93e610da369f38d",
     "messages": [
       {
         "session": "00000000-0000-0000-0000-00000000000a",
@@ -2884,10 +2832,6 @@
           }
         ],
         "open": [],
-        "result": {
-          "output": "a11",
-          "status": "done"
-        },
         "seq": 8,
         "turn": 0,
         "untaken": [],

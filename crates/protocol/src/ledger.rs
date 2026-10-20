@@ -35,7 +35,10 @@ pub struct Ledger {
     context: bool,
     /// The last mutation logged of each client that named itself.
     clients: Vec<(ClientId, ClientSeq)>,
-    /// What the session last settled with, as a child hands it back.
+    /// What the session last settled with, as a child hands it back: the
+    /// daemon's to read, so a snapshot leaves it out (its raw JSON would
+    /// make the view's hash hang on the spelling of a reply).
+    #[serde(skip)]
     result: Option<Outcome>,
     /// The seq of the input that started the current turn; 0 before the
     /// first.
