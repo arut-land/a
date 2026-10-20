@@ -20,9 +20,6 @@ opt-level = 1
 [profile.dev.package.vte]
 opt-level = 1
 
-[profile.dev.package.ratatui-core]
-opt-level = 1
-
 [profile.dev.package.unicode-width]
 opt-level = 1
 
@@ -37,7 +34,9 @@ opt-level = 1
 #
 # Size and speed by architecture, not by level: everything at s, which
 # the measurements in docs/perf/build-tuning.md hold to within noise of 3
-# on every path but the two below. std (build-std) is at s too.
+# on every path but the one below. std (build-std) is at s too, alloc
+# included: the terminal client's frame no longer allocates per span
+# (docs/tui.md), which was what alloc at 3 bought.
 [profile.release]
 opt-level = "s"
 lto = "fat"
@@ -48,11 +47,6 @@ strip = "symbols"
 
 # The wire: serde_json frames every message and parses every log entry.
 [profile.release.package.serde_json]
-opt-level = 3
-
-# s costs the terminal client's frame ~15% through alloc: its text model
-# allocates per span. Goes with the allocation-free frame (docs/tui.md).
-[profile.release.package.alloc]
 opt-level = 3
 
 # cargo-bolero (`mise run fuzz`): optimized, and LLVM throughout for
