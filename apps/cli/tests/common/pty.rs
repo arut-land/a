@@ -70,7 +70,9 @@ impl Env {
         let master = File::from(master);
         let output = Arc::new(Mutex::new(Output::default()));
         let (mut reader, sink) = (master.try_clone().unwrap(), Arc::clone(&output));
-        let mut answer = master.try_clone().unwrap();
+        // Nothing answers the client: it never asks the terminal anything
+        // (`no_terminal_queries` in the tui crate), so one that did would
+        // hang here, and the test with it.
         std::thread::spawn(move || {
             let mut buf = [0; 8192];
             // EIO once the child and every copy of the slave are gone.
@@ -79,11 +81,6 @@ impl Env {
                 out.bytes.extend_from_slice(&buf[..n]);
                 if out.first_frame.is_none() && contains(&out.bytes, b"\x1b[?2026l") {
                     out.first_frame = Some(Instant::now());
-                }
-                // A cursor position request, as a terminal answers it.
-                if contains(&buf[..n], b"\x1b[6n") {
-                    let (x, y) = Screen::parse(&out.bytes, cols, rows).cursor;
-                    let _ = write!(answer, "\x1b[{};{}R", y + 1, x + 1);
                 }
             }
         });

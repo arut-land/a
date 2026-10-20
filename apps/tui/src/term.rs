@@ -90,6 +90,8 @@ pub fn size() -> io::Result<(u16, u16)> {
 
 /// Reads the terminal and `signals` on a thread of its own until stdin is
 /// gone. It blocks in `poll` with no timeout: an idle client never wakes.
+/// What it posts goes ahead of the daemon's backlog in the inbox: a key
+/// or a resize is folded before a replay still queued.
 pub fn spawn_input(tx: client::Post<Event>, signals: Signals) {
     thread::spawn(move || {
         let stdin = rustix::stdio::stdin();
@@ -116,7 +118,7 @@ pub fn spawn_input(tx: client::Post<Event>, signals: Signals) {
                     }
                 }
             }
-            if resized && tx.send(Event::Resized).is_err() {
+            if resized && tx.send_first(Event::Resized).is_err() {
                 return;
             }
             if input {
@@ -129,7 +131,7 @@ pub fn spawn_input(tx: client::Post<Event>, signals: Signals) {
                 // A full buffer says more is waiting: an ESC it ends with
                 // may start a sequence.
                 for input in decoder.feed(&buf[..n], n == buf.len()) {
-                    if tx.send(Event::Input(input)).is_err() {
+                    if tx.send_first(Event::Input(input)).is_err() {
                         return;
                     }
                 }
