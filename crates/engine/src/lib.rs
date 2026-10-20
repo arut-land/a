@@ -568,6 +568,7 @@ impl Daemon {
                             // with work has a busy marker, and loads.
                             activity: Activity::Idle,
                             residency: protocol::Residency::Hibernated,
+                            read_only: None,
                         })
                         .clone(),
                     Residency::Loading { .. } => SessionSummary {
@@ -577,6 +578,7 @@ impl Daemon {
                         clients: 0,
                         activity: Activity::Idle,
                         residency: protocol::Residency::Hibernated,
+                        read_only: None,
                     },
                 }
             })

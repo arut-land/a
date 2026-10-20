@@ -192,7 +192,7 @@ impl Ledger {
                 let model = data.parse().unwrap_or_default();
                 self.settings = Some((seq, Overrides { model }));
             }
-            Body::Ext { .. } | Body::Edit { .. } => {}
+            Body::Ext { .. } | Body::Edit { .. } | Body::Unknown { .. } => {}
         }
     }
 

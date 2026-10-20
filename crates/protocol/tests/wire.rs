@@ -19,8 +19,8 @@ use protocol::view::SessionView;
 use protocol::{
     Activity, Audience, Author, Body, CallId, Caps, Card, ClientDecl, ClientId, ClientMsg,
     ClientSeq, DaemonMsg, Decode, Entry, Environment, HomeSettings, Installed, Mode, Outcome,
-    PROTO, Permission, Rejection, Residency, Role, Seq, SessionId, SessionSummary, SettingsChange,
-    Target, Verdict, WaitOn,
+    PROTO, Permission, ReadOnly, Rejection, Residency, Role, Seq, SessionId, SessionSummary,
+    SettingsChange, Target, Verdict, WaitOn,
 };
 use serde_json::json;
 use uuid::Uuid;
@@ -668,6 +668,7 @@ fn daemon_samples() -> Vec<Sample<DaemonMsg>> {
                         clients: 1,
                         activity: Activity::Approval,
                         residency: Residency::Loaded,
+                        read_only: None,
                     },
                     SessionSummary {
                         id: SessionId(Uuid::from_u128(0xb)),
@@ -676,8 +677,28 @@ fn daemon_samples() -> Vec<Sample<DaemonMsg>> {
                         clients: 0,
                         activity: Activity::Idle,
                         residency: Residency::Hibernated,
+                        read_only: None,
                     },
                 ],
+            },
+        ),
+        sample(
+            "sessions_read_only",
+            DaemonMsg::Sessions {
+                sessions: [
+                    ReadOnly::Damaged { seq: 4 },
+                    ReadOnly::Format { version: 2 },
+                ]
+                .map(|why| SessionSummary {
+                    id: SESSION,
+                    workspace: "/w".into(),
+                    entries: 3,
+                    clients: 0,
+                    activity: Activity::Idle,
+                    residency: Residency::Loaded,
+                    read_only: Some(why),
+                })
+                .into(),
             },
         ),
         sample(

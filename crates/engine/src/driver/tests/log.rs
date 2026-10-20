@@ -9,6 +9,7 @@ use std::fs;
 use protocol::Decode;
 
 use super::*;
+use crate::store::{FORMAT, seal, unseal};
 
 /// The system allocator, counting the bytes this thread holds and the most
 /// it has held.
@@ -86,11 +87,13 @@ impl OnDisk {
             workspace: std::env::temp_dir(),
             parent: None,
         };
-        let mut file = serde_json::to_vec(&header).unwrap();
-        file.push(b'\n');
+        let fields = serde_json::to_string(&header).unwrap();
+        let mut file = format!(r#"{{"format":{FORMAT},{}"#, &fields[1..]).into_bytes();
+        seal(&mut file, 0);
         for line in lines {
+            let at = file.len();
             file.extend_from_slice(line);
-            file.push(b'\n');
+            seal(&mut file, at);
         }
         fs::write(self.path(header.id), file).unwrap();
         header
@@ -104,13 +107,16 @@ impl OnDisk {
         self.dir.join(format!("{id}.jsonl"))
     }
 
-    /// The lines of session `id`'s file after its header.
+    /// The lines of session `id`'s file after its header, unsealed.
     fn lines(&self, id: SessionId) -> Vec<Vec<u8>> {
         let file = fs::read(self.path(id)).unwrap();
-        let mut lines: Vec<Vec<u8>> = file.split(|&b| b == b'\n').map(<[u8]>::to_vec).collect();
-        lines.pop();
-        lines.remove(0);
-        lines
+        let lines = file.split_inclusive(|&b| b == b'\n').skip(1);
+        let unsealed = lines.map(|line| {
+            let mut line = line.to_vec();
+            assert!(unseal(&mut line));
+            line
+        });
+        unsealed.collect()
     }
 }
 

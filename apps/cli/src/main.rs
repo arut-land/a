@@ -536,8 +536,11 @@ fn ls(ctx: &Ctx) -> io::Result<()> {
 
 /// A session as `a ls` lists it.
 fn listed(s: &SessionSummary) -> String {
+    let kept = s
+        .read_only
+        .map_or_else(String::new, |why| format!("  ({why})"));
     format!(
-        "{}  {:<9}  {:<10}  {:>4} entries  {}",
+        "{}  {:<9}  {:<10}  {:>4} entries  {}{kept}",
         s.id.short(),
         s.activity.name(),
         s.residency.name(),
