@@ -46,6 +46,9 @@ pub trait Fold: Default + Serialize + DeserializeOwned + Send + 'static {
 pub trait DynFold: Send + Sync {
     fn name(&self) -> Name;
     fn initial(&self) -> Json;
+    fn restore(&self, image: &Json) -> Result<Json, String> {
+        Ok(image.clone())
+    }
     fn apply(&self, state: &Json, change: &Json) -> Result<Json, String>;
 }
 
@@ -91,6 +94,7 @@ impl Decl {
 
     pub fn erased(fold: Arc<dyn DynFold>) -> Self {
         let initial = fold.initial();
+        let restore = Arc::clone(&fold);
         Self {
             name: fold.name(),
             ty: None,
@@ -106,7 +110,7 @@ impl Decl {
                     .cloned()
                     .ok_or_else(|| "another state".into())
             }),
-            restore: Arc::new(|image| Ok(Box::new(image.clone()))),
+            restore: Arc::new(move |image| Ok(Box::new(restore.restore(image)?))),
         }
     }
 }
@@ -175,9 +179,16 @@ impl States {
 
     /// Folds the change `e` records, if any.
     pub fn apply(&mut self, e: &Entry) {
-        if let Body::Ext { ext, state, data } = &e.body {
-            self.fold(ext, state, data);
+        if let Err(error) = self.try_apply(e) {
+            eprintln!("warning: {error}");
         }
+    }
+
+    pub fn try_apply(&mut self, e: &Entry) -> Result<(), String> {
+        if let Body::Ext { ext, state, data } = &e.body {
+            self.try_fold(ext, state, data)?;
+        }
+        Ok(())
     }
 
     /// Folds every change `entries` record.

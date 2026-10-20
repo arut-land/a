@@ -70,6 +70,25 @@ fn decode(lua: &Lua, json: &Json) -> mlua::Result<Value> {
         return Err(mlua::Error::runtime("lua JSON exceeds 256 KiB"));
     }
     let value: serde_json::Value = json.parse().map_err(mlua::Error::external)?;
+    let mut work = vec![(&value, 0)];
+    let mut nodes = 0;
+    while let Some((value, depth)) = work.pop() {
+        nodes += 1;
+        if nodes > 8192 || depth > 64 {
+            return Err(mlua::Error::runtime("lua JSON is too complex"));
+        }
+        match value {
+            serde_json::Value::Array(values) => work.extend(values.iter().map(|v| (v, depth + 1))),
+            serde_json::Value::Object(values) => {
+                nodes += values.len();
+                work.extend(values.values().map(|v| (v, depth + 1)));
+            }
+            _ => {}
+        }
+        if work.len() > 8192 {
+            return Err(mlua::Error::runtime("lua JSON is too complex"));
+        }
+    }
     lua.to_value(&value)
 }
 
@@ -174,6 +193,7 @@ fn sandbox(limits: Limits) -> mlua::Result<(Lua, Callbacks)> {
         "collectgarbage",
         "setmetatable",
         "getmetatable",
+        "rawset",
         "print",
         "warn",
     ] {
@@ -181,10 +201,29 @@ fn sandbox(limits: Limits) -> mlua::Result<(Lua, Callbacks)> {
     }
     // Native pattern matching does not visit Lua's instruction hook.
     let strings: Table = lua.globals().get("string")?;
-    for name in ["find", "match", "gmatch", "gsub"] {
+    for name in ["find", "match", "gmatch", "gsub", "dump"] {
         strings.set(name, Value::Nil)?;
     }
+    for name in ["string", "table", "math"] {
+        let library: Table = lua.globals().get(name)?;
+        lua.globals().set(name, readonly(&lua, library)?)?;
+    }
     Ok((lua, callbacks))
+}
+
+fn readonly(lua: &Lua, table: Table) -> mlua::Result<Table> {
+    let view = lua.create_table()?;
+    let meta = lua.create_table()?;
+    meta.set("__index", table)?;
+    meta.set(
+        "__newindex",
+        lua.create_function(|_, _: (Value, Value, Value)| -> mlua::Result<()> {
+            Err(mlua::Error::runtime("read-only table"))
+        })?,
+    )?;
+    meta.set("__metatable", false)?;
+    view.set_metatable(Some(meta))?;
+    Ok(view)
 }
 
 fn text_field(spec: &Table, name: &str, limit: usize) -> mlua::Result<String> {
@@ -274,7 +313,7 @@ fn register(lua: &Lua) -> mlua::Result<Arc<Mutex<Contributions>>> {
         })?,
     )?;
     api.set("null", lua.null())?;
-    lua.globals().set("a", api)?;
+    lua.globals().set("a", readonly(lua, api)?)?;
     Ok(made)
 }
 
@@ -529,6 +568,10 @@ impl DynFold for LuaFold {
     }
     fn initial(&self) -> Json {
         self.initial.clone()
+    }
+    fn restore(&self, image: &Json) -> Result<Json, String> {
+        decode(&self.lua, image).map_err(|e| e.to_string())?;
+        Ok(image.clone())
     }
     fn apply(&self, state: &Json, change: &Json) -> Result<Json, String> {
         (|| {
@@ -927,6 +970,55 @@ mod tests {
             ),
         );
         assert_eq!(rig.done("test", &json!({})), true);
+    }
+
+    #[test]
+    fn inbound_json_has_the_same_depth_and_node_limits_as_output() {
+        let lua = Lua::new();
+        let source = format!(
+            "a.fold{{name='count', initial=0, apply=function(s,c) return s end}}; {}",
+            tool("return input")
+        );
+        let rig = Rig::new("lua-inbound", registry(&source, &[]));
+        for text in [
+            format!("{}0{}", "[".repeat(80), "]".repeat(80)),
+            format!("[{}]", vec!["0"; 9000].join(",")),
+        ] {
+            let json: Json = serde_json::from_str(&text).unwrap();
+            assert!(decode(&lua, &json).is_err());
+            assert!(matches!(
+                rig.call("test", &json.parse().unwrap()),
+                Outcome::Failed { .. }
+            ));
+            assert!(
+                rig.registry
+                    .states()
+                    .restore(&[ext::Image {
+                        ext: "test".into(),
+                        state: "count".into(),
+                        image: json,
+                    }])
+                    .is_err()
+            );
+        }
+    }
+
+    #[test]
+    fn shared_sandbox_tables_cannot_be_changed_or_dump_bytecode() {
+        assert!(Mod::load("dump", "assert(string.dump == nil)", &[], Limits::default()).is_ok());
+        for source in [
+            "string.len = nil",
+            "table.insert = nil",
+            "math.abs = nil",
+            "a.null = nil",
+            "rawset(a, 'tool', nil)",
+            "table.insert(a, true)",
+        ] {
+            assert!(
+                Mod::load("readonly", source, &[], Limits::default()).is_err(),
+                "{source}"
+            );
+        }
     }
 
     #[test]
