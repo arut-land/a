@@ -269,6 +269,11 @@ async fn run(input: &Command, cx: &Cx, progress: Partials<String>) -> io::Result
     let spawn = spawn(cx, &input.command, &dir, env, Some(&report))?;
     // Both streams share the one file, and its offset: in the order written.
     let (file, log) = create_private(&log)?;
+    // Watched before anything can write to it: a write before the watch
+    // raises no edge, and would be read only once the command exits.
+    let written = sys::write_watch(&log)
+        .and_then(|watch| rt::Async::for_reading(&runtime(cx)?.reactor(), watch))
+        .ok();
     let child = {
         let mut cmd = process(&spawn);
         cmd.stdout(file.try_clone()?).stderr(file);
@@ -277,7 +282,8 @@ async fn run(input: &Command, cx: &Cx, progress: Partials<String>) -> io::Result
     let pgid = child.id();
     cx.spawned(pgid, false);
     let limit = input.timeout.unwrap_or(TIMEOUT).clamp(1, MAX_TIMEOUT);
-    let done = supervise(child, &log, Duration::from_secs(limit), cx, &progress).await?;
+    let output = Followed { log: &log, written };
+    let done = supervise(child, output, Duration::from_secs(limit), cx, &progress).await?;
     // The file is kept as the whole output only when the model saw less.
     if done.output.full.is_none() {
         let _ = std::fs::remove_file(&log);
@@ -556,6 +562,14 @@ struct Finished {
     output: Rendered,
 }
 
+/// A command's log, and what turns readable as it is written to: made
+/// before the command could write, or `None` where writes cannot be
+/// watched.
+struct Followed<'a> {
+    log: &'a Path,
+    written: Option<rt::Async<sys::fs::WriteWatch>>,
+}
+
 /// Follows the command's output in `log` until it ends, reporting it as it
 /// comes and stopping the command when it runs out of time, writes too
 /// much or the call is cancelled. It waits, as a task on the reactor, for
@@ -566,7 +580,7 @@ struct Finished {
 /// [`LINGER`].
 async fn supervise(
     mut child: Child,
-    log: &Path,
+    Followed { log, written }: Followed<'_>,
     limit: Duration,
     cx: &Cx,
     progress: &Partials<String>,
@@ -577,9 +591,6 @@ async fn supervise(
     let reactor = rt.reactor();
     // Where writes or the exit cannot be watched, they are looked for
     // every tick.
-    let written = sys::write_watch(log)
-        .and_then(|watch| rt::Async::for_reading(&reactor, watch))
-        .ok();
     let exit = sys::exit_watch(pgid)
         .and_then(|watch| rt::Async::for_reading(&reactor, watch))
         .ok();

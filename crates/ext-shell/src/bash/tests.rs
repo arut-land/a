@@ -318,6 +318,32 @@ fn output_is_reported_as_it_arrives() {
     assert!(ran.output.starts_with(&reported), "{reported:?}");
 }
 
+/// Output written as the command starts, with nothing after it, is
+/// reported while the command runs: the log is watched before anything
+/// can write to it, so no write comes before the watch.
+#[test]
+fn the_first_output_is_reported_while_the_command_runs() {
+    let rig = rig("first-output");
+    let started = Instant::now();
+    let ran = std::thread::scope(|scope| {
+        scope.spawn(|| {
+            while rig.progress.lock().unwrap().is_empty() {
+                assert!(
+                    started.elapsed() < Duration::from_secs(10),
+                    "never reported"
+                );
+                std::thread::sleep(Duration::from_millis(10));
+            }
+            rig.cancel.set();
+        });
+        run(&rig, "echo one; sleep 100")
+    });
+    assert!(started.elapsed() < Duration::from_secs(10));
+    let reported = rig.progress.lock().unwrap().clone();
+    assert!(reported.starts_with("one\n"), "{reported:?}");
+    assert!(ran.aborted, "{ran:?}");
+}
+
 #[test]
 fn a_cancelled_call_stops_with_its_partial_output() {
     let rig = rig("cancel");
