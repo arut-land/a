@@ -58,8 +58,8 @@ const LINGER: Duration = Duration::from_secs(2);
 const TICK: Duration = Duration::from_millis(20);
 /// The most output read in one go, so a flood shares the reactor.
 const READ: u64 = 1 << 20;
-/// How often output is reported as it arrives: each report is committed,
-/// so this bounds how often a busy command syncs the log.
+/// How often output is reported as it arrives: each report is a log entry,
+/// written at once and made durable with the next commit that has to be.
 const REPORT: Duration = Duration::from_millis(100);
 
 /// Set for every command: no colors, pagers or prompts, as no one is at a

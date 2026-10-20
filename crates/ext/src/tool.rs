@@ -231,7 +231,7 @@ impl Cx {
         self.host.own(pgid, Box::pin(ended));
     }
 
-    /// Commits `text` as more of the call's output, for clients to show as
+    /// Logs `text` as more of the call's output, for clients to show as
     /// it runs and for the call's outcome should it be interrupted.
     pub fn progress(&self, text: &str) {
         self.host.progress(text);

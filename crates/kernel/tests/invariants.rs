@@ -577,6 +577,41 @@ fn a_watch_fires_once() {
     assert_eq!(fired, 1, "{:#?}", s.log);
 }
 
+/// Only what a running call reports as it goes waits for the next commit
+/// to be durable; what the session decided or learned never does.
+#[test]
+fn only_notes_wait_for_the_next_commit() {
+    use kernel::Durability;
+    let later = [
+        Body::Progress {
+            call: 2,
+            text: "half".into(),
+        },
+        Body::Ext {
+            ext: "shell".into(),
+            state: "cwd".into(),
+            data: json!("/").into(),
+        },
+    ];
+    for body in &later {
+        assert_eq!(Durability::of(body), Durability::WithNext, "{body:?}");
+    }
+    let now = [
+        input("hi"),
+        bash("ls"),
+        model_call(0),
+        tool_result(2, done(json!(1))),
+        model_result(2, done(json!(1))),
+        decision("policy", Some(2), protocol::Verdict::Answered),
+        said("hi"),
+        Body::INTERRUPT,
+        wait_child(2, 3),
+    ];
+    for body in &now {
+        assert_eq!(Durability::of(body), Durability::Now, "{body:?}");
+    }
+}
+
 /// The calls set running, in the order they start.
 fn running(fx: &Effects) -> impl Iterator<Item = CallId> + '_ {
     fx.iter().filter_map(|e| match e {

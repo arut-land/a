@@ -241,19 +241,29 @@ struct JsonlLog {
 }
 
 impl Log for JsonlLog {
-    /// One write and one sync for the lot.
+    /// One write and one sync for the lot, which makes what was only
+    /// written before it durable too.
     fn append_all(&mut self, entries: &[Entry]) -> io::Result<()> {
-        let mut lines = Vec::new();
-        for entry in entries {
-            entry.encode(&mut lines)?;
-            lines.push(b'\n');
-        }
-        self.write(&lines)
+        self.write(&lines(entries)?, true)
+    }
+
+    /// One write, and no sync.
+    fn write_all(&mut self, entries: &[Entry]) -> io::Result<()> {
+        self.write(&lines(entries)?, false)
     }
 }
 
+fn lines(entries: &[Entry]) -> io::Result<Vec<u8>> {
+    let mut lines = Vec::new();
+    for entry in entries {
+        entry.encode(&mut lines)?;
+        lines.push(b'\n');
+    }
+    Ok(lines)
+}
+
 impl JsonlLog {
-    fn write(&mut self, lines: &[u8]) -> io::Result<()> {
+    fn write(&mut self, lines: &[u8], sync: bool) -> io::Result<()> {
         if lines.is_empty() {
             return Ok(());
         }
@@ -265,6 +275,9 @@ impl JsonlLog {
         }
         let written = (|| {
             (&*file).write_all(lines)?;
+            if !sync {
+                return Ok(());
+            }
             sys::sync_data(file)?;
             if let Some(dir) = &self.new_in {
                 sys::fs::sync_dir(dir)?;
@@ -273,7 +286,9 @@ impl JsonlLog {
         })();
         match written {
             Ok(()) => {
-                self.new_in = None;
+                if sync {
+                    self.new_in = None;
+                }
                 self.index.extend(lines);
                 Ok(())
             }

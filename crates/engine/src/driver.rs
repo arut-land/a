@@ -24,7 +24,9 @@ use ext::{
     Asked, BoxFuture, Callable, Called, Cancel, Chained, Cx, Facts, Gated, Gating, Name, Parsed,
     PointCx, Recover, Route, States,
 };
-use kernel::{Answer, Core, Effect, Effects, Event, Load, Note, Owner, Replied, Ticket};
+use kernel::{
+    Answer, Core, Durability, Effect, Effects, Event, Load, Note, Owner, Replied, Ticket,
+};
 use protocol::view::SessionView;
 use protocol::{
     Author, Body, CallId, Card, DaemonMsg, Entry, Environment, Frame, Installed, Json, Mode,
@@ -663,10 +665,11 @@ impl Actor {
     }
 
     /// Commits `batch`, then carries out the effects `after` it; `false`
-    /// if the commit failed, and the session resumed.
+    /// if the commit failed, and the session resumed. Notes with nothing
+    /// after them are durable with the next commit that is.
     async fn flush(&mut self, batch: &mut Vec<Entry>, after: &mut Vec<Effect>) -> bool {
         if !batch.is_empty()
-            && let Err(e) = self.commit(batch).await
+            && let Err(e) = self.commit(batch, !after.is_empty()).await
         {
             let why = format!("logging: {e}");
             eprintln!("session {}: {why}", self.live.id.short());
@@ -725,8 +728,14 @@ impl Actor {
         }
     }
 
-    /// Writes `batch` durably, then shows it: the writer stamps its lease.
-    async fn commit(&mut self, batch: &mut Vec<Entry>) -> io::Result<()> {
+    /// Writes `batch`, then shows it: the writer stamps its lease. It is
+    /// made durable at once unless it holds only notes and `durable` is
+    /// not asked for ([`kernel::Durability`]).
+    async fn commit(&mut self, batch: &mut Vec<Entry>, durable: bool) -> io::Result<()> {
+        let durable = durable
+            || batch
+                .iter()
+                .any(|e| Durability::of(&e.body) == Durability::Now);
         let mut writer = self
             .writer
             .take()
@@ -734,7 +743,7 @@ impl Actor {
         let mut entries = std::mem::take(batch);
         let rt = Arc::clone(&self.live.session.shared.rt);
         let (writer, entries, written) = rt::unblock(&*rt, move || {
-            let written = catch_unwind(AssertUnwindSafe(|| writer.append(&mut entries)))
+            let written = catch_unwind(AssertUnwindSafe(|| writer.append(&mut entries, durable)))
                 .unwrap_or_else(|_| Err(io::Error::other("committing entries panicked")));
             (writer, entries, written)
         })
@@ -742,7 +751,8 @@ impl Actor {
         self.writer = Some(writer);
         written?;
         crate::session_event("commit", self.live.id, || {
-            format!("{} entries synced", entries.len())
+            let how = if durable { "synced" } else { "written" };
+            format!("{} entries {how}", entries.len())
         });
         self.shown(&entries);
         Ok(())

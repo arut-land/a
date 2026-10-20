@@ -387,12 +387,17 @@ struct Probe {
     held: Arc<Mutex<()>>,
     /// Appends waiting for `held`.
     waiting: Arc<AtomicUsize>,
+    /// Each batch, and whether it was made durable.
+    written: Arc<Mutex<Vec<Written>>>,
 }
+
+/// A batch handed to a log, and whether it was made durable.
+type Written = (Vec<Entry>, bool);
 
 struct Probed(Box<dyn Log>, Probe);
 
-impl Log for Probed {
-    fn append_all(&mut self, entries: &[Entry]) -> io::Result<()> {
+impl Probed {
+    fn write(&mut self, entries: &[Entry], durable: bool) -> io::Result<()> {
         self.1.waiting.fetch_add(1, Ordering::SeqCst);
         drop(lock(&self.1.held));
         self.1.waiting.fetch_sub(1, Ordering::SeqCst);
@@ -400,7 +405,18 @@ impl Log for Probed {
             return Err(io::Error::other("disk full"));
         }
         lock(&self.1.batches).push(entries.len());
+        lock(&self.1.written).push((entries.to_vec(), durable));
         self.0.append_all(entries)
+    }
+}
+
+impl Log for Probed {
+    fn append_all(&mut self, entries: &[Entry]) -> io::Result<()> {
+        self.write(entries, true)
+    }
+
+    fn write_all(&mut self, entries: &[Entry]) -> io::Result<()> {
+        self.write(entries, false)
     }
 }
 
@@ -1909,6 +1925,46 @@ fn one_fsync_per_burst() {
     assert_eq!(log.len(), 1 + 2 * 6, "{log:#?}");
     // The extensions, the first input and its echo, then the burst.
     assert_eq!(*lock(&probe.batches), [1, 2, 10]);
+}
+
+/// Progress and extension state are written as they come, and made
+/// durable with the next commit that has to be: a crash after any write
+/// loses at most notes, never an intent, a decision or a result.
+#[test]
+fn a_crash_loses_at_most_notes() {
+    let probe = Probe::default();
+    let fixture = Fixture::on(
+        Arc::new(probe.clone()),
+        ext_fixtures::ECHO,
+        echoing(&Policy::default()),
+        openai(&Script::new(&[])),
+    );
+    let session = fixture.create();
+    session
+        .submit("$ cd /; for i in 1 2 3 4; do echo $i; sleep 0.15; done")
+        .unwrap();
+    finished(&session, 3);
+    session.submit("hi").unwrap();
+    settle(&session);
+    session.halt();
+    let written = lock(&probe.written).clone();
+    let notes = written.iter().filter(|(_, durable)| !durable).count();
+    assert!(notes >= 2, "{written:#?}");
+    // A crash after write `at` keeps every write up to the last durable
+    // one: what it loses is what was only written after that.
+    for at in 0..written.len() {
+        let kept = written[..=at].iter().rposition(|(_, durable)| *durable);
+        let lost = written[kept.map_or(0, |k| k + 1)..=at]
+            .iter()
+            .flat_map(|(entries, _)| entries);
+        for e in lost {
+            assert!(
+                matches!(e.body, Body::Progress { .. } | Body::Ext { .. }),
+                "a crash after write {at} loses {e:?}"
+            );
+        }
+    }
+    assert!(written.last().is_some_and(|(_, durable)| *durable));
 }
 
 /// #57: the entries of one step are committed together: one write and
