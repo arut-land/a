@@ -276,6 +276,14 @@ impl Log for JsonlLog {
     fn write_all(&mut self, _: &[Entry], lines: &Encoded) -> io::Result<()> {
         self.write(&sealed(lines), false)
     }
+
+    fn sync(&mut self) -> io::Result<()> {
+        sys::sync_data(&self.index.file)?;
+        if let Some(dir) = self.new_in.take() {
+            sys::fs::sync_dir(&dir)?;
+        }
+        Ok(())
+    }
 }
 
 /// `lines`, each sealed, as the file stores them.

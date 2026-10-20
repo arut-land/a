@@ -20,6 +20,7 @@ use serde_json::{Value, json};
 
 use super::*;
 
+mod durable;
 mod interrupt;
 mod later;
 mod log;
@@ -441,6 +442,11 @@ impl Log for Probed {
 
     fn write_all(&mut self, entries: &[Entry], lines: &Encoded) -> io::Result<()> {
         self.write(entries, lines, false)
+    }
+
+    fn sync(&mut self) -> io::Result<()> {
+        lock(&self.1.written).push((Vec::new(), true));
+        self.0.sync()
     }
 }
 

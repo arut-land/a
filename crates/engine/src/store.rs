@@ -3,6 +3,8 @@
 //! durability guarantees; the conformance suite in `tests` holds every one
 //! to the same contract.
 
+#[cfg(test)]
+mod faulty;
 mod jsonl;
 mod lease;
 #[cfg(test)]
@@ -20,6 +22,8 @@ use protocol::Seq;
 use protocol::{Entry, Epoch, ReadOnly, SessionId};
 use serde::{Deserialize, Serialize};
 
+#[cfg(test)]
+pub use faulty::Faulty;
 pub use jsonl::Jsonl;
 #[cfg(test)]
 pub(crate) use jsonl::{FORMAT, seal, unseal};
@@ -134,6 +138,11 @@ impl Writer {
         Ok(lines)
     }
 
+    /// Makes what was only written durable.
+    pub fn sync(&mut self) -> io::Result<()> {
+        self.log.sync()
+    }
+
     /// Appends `entries` durably as they are, epochs included: a log laid
     /// down for a test.
     #[cfg(test)]
@@ -182,6 +191,12 @@ pub trait Log: Send {
     /// them, and nothing after them.
     fn write_all(&mut self, entries: &[Entry], lines: &Encoded) -> io::Result<()> {
         self.append_all(entries, lines)
+    }
+
+    /// Makes what [`Log::write_all`] wrote durable, as the next
+    /// [`Log::append_all`] would.
+    fn sync(&mut self) -> io::Result<()> {
+        Ok(())
     }
 
     fn read_only(&self) -> Option<ReadOnly> {

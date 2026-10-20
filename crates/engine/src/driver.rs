@@ -169,6 +169,9 @@ enum Msg {
         reply: oneshot::Sender<Opened>,
     },
     Stop,
+    /// Make what was only written durable, and show it: sent to itself
+    /// [`SYNC_LAG`] after a write that was not synced.
+    Sync,
     /// Answered once every message before it is taken.
     #[cfg(test)]
     Barrier(oneshot::Sender<()>),
@@ -293,6 +296,10 @@ impl Live {
             tickets: 0,
             phase: Phase::Serving,
             listed,
+            unsynced: Vec::new(),
+            waiting_sync: Vec::new(),
+            sync_armed: false,
+            resuming: false,
         };
         shared.rt.spawn(Box::pin(actor.run(rx, first)));
         Ok(live)
@@ -454,7 +461,21 @@ struct Actor {
     /// flight, or a call waits on someone. Set before work starts, cleared
     /// after it ends.
     listed: Record,
+    /// Entries written and not yet durable, in order, with whoever waits
+    /// for each: shown to no one until a sync. A seq a client has seen is
+    /// one that survives a power cut, so it is never given out twice.
+    unsynced: Vec<(Vec<Entry>, Encoded)>,
+    waiting_sync: Vec<oneshot::Sender<()>>,
+    /// A [`Msg::Sync`] is on its way.
+    sync_armed: bool,
+    /// Carrying out what a resume asked for: a commit that fails now does
+    /// not resume again, the session stops.
+    resuming: bool,
 }
+
+/// How long written entries may stay unsynced, and so unseen: a sync is
+/// asked for this long after a write that none followed.
+const SYNC_LAG: std::time::Duration = std::time::Duration::from_millis(50);
 
 /// What a call has in flight: the one thing it waits on now.
 enum InFlight {
@@ -518,11 +539,16 @@ impl Actor {
                 burst.push(msg);
             }
             let (mut events, mut dones) = (Vec::new(), Vec::new());
+            let mut sync = false;
             for msg in burst {
                 // Answered once what came before it is carried out.
                 #[cfg(test)]
                 if let Msg::Barrier(done) = msg {
                     dones.push(done);
+                    continue;
+                }
+                if let Msg::Sync = msg {
+                    sync = true;
                     continue;
                 }
                 // Kept as it is, its catalog listing and all.
@@ -545,14 +571,23 @@ impl Actor {
                 });
                 self.step(generation.into_iter().chain(events)).await;
             }
-            for done in dones {
-                done.send(());
+            if sync {
+                self.sync().await;
+            }
+            // Answered once what they waited for is durable.
+            if self.unsynced.is_empty() {
+                for done in dones {
+                    done.send(());
+                }
+            } else {
+                self.waiting_sync.extend(dones);
             }
             // A call may begin to wait without the work marked ending.
             self.mark().await;
             self.publish();
             self.live.session.changed.notify();
         }
+        self.sync().await;
         // Listed as it ends, with all it logged.
         let listing = self.listing(self.live.has_work());
         let shared = Arc::clone(&self.live.session.shared);
@@ -652,6 +687,7 @@ impl Actor {
                 done.send(());
                 return None;
             }
+            Msg::Sync => return None,
             Msg::Stop => {
                 self.phase = Phase::Draining;
                 self.live.session.cancel_all();
@@ -779,6 +815,13 @@ impl Actor {
                     self.reply(ticket, Err(why.clone()));
                 }
             }
+            // Its log takes nothing: the session stops, and loads again
+            // when next wanted.
+            if self.resuming {
+                self.phase = Phase::Draining;
+                self.live.session.cancel_all();
+                return false;
+            }
             Box::pin(self.resume()).await;
             return false;
         }
@@ -792,6 +835,10 @@ impl Actor {
     /// cancelled, what was asked is answered that the session stopped, and
     /// the kernel is rebuilt from the committed log, as a load rebuilds it.
     async fn resume(&mut self) {
+        // What was written is in the log, whether or not it is durable
+        // yet: made so, it is what the log holds, and shown; not made so,
+        // it is as good as lost.
+        self.sync().await;
         self.live.session.cancel_all();
         self.replies.clear();
         self.inflight.clear();
@@ -816,7 +863,9 @@ impl Actor {
         match resumed {
             Ok((core, fx)) => {
                 self.core = core;
+                self.resuming = true;
                 self.carry(fx).await;
+                self.resuming = false;
             }
             // Its log is what it is: the session stops, and loads again
             // when next wanted.
@@ -890,20 +939,74 @@ impl Actor {
             let how = if durable { "synced" } else { "written" };
             format!("{} entries {how}", entries.len())
         });
-        self.shown(&entries, &lines);
+        self.folded(&entries);
+        if durable {
+            // The sync made what was written before durable too.
+            self.show_synced();
+            self.show(&entries, &lines);
+        } else {
+            self.unsynced.push((entries, lines));
+            self.arm_sync();
+        }
         Ok(())
     }
 
-    /// Entries committed, as `lines` encodes them: folded where else they
-    /// are read, and sent.
-    fn shown(&mut self, entries: &[Entry], lines: &Encoded) {
-        let session = &self.live.session;
-        let hooks = self.registry.hooks();
-        self.transcript = self.transcript.take().filter(|t| t.is_on(&self.registry));
-        // An edit changes what came before it: the transcript is made again.
-        if entries.iter().any(|e| matches!(e.body, Body::Edit { .. })) {
-            self.transcript = None;
+    /// Asks for a sync [`SYNC_LAG`] from now, unless one is on its way.
+    fn arm_sync(&mut self) {
+        if std::mem::replace(&mut self.sync_armed, true) {
+            return;
         }
+        let shared = &self.live.session.shared;
+        let (mail, lag) = (
+            Arc::clone(&self.live.session.mail),
+            shared.rt.sleep(SYNC_LAG),
+        );
+        shared.rt.spawn(Box::pin(async move {
+            lag.await;
+            let _ = mail.send(Msg::Sync);
+        }));
+    }
+
+    /// Makes what was only written durable, and shows it. A sync that
+    /// fails leaves the session as a failed commit does.
+    async fn sync(&mut self) {
+        self.sync_armed = false;
+        if self.unsynced.is_empty() {
+            return;
+        }
+        let Some(mut writer) = self.writer.take() else {
+            return;
+        };
+        let rt = Arc::clone(&self.live.session.shared.rt);
+        let (writer, synced) = rt::unblock(&*rt, move || {
+            let synced = writer.sync();
+            (writer, synced)
+        })
+        .await;
+        self.writer = Some(writer);
+        match synced {
+            Ok(()) => self.show_synced(),
+            Err(e) => {
+                eprintln!("session {}: syncing: {e}", self.live.id.short());
+                self.unsynced.clear();
+                self.waiting_sync.clear();
+            }
+        }
+    }
+
+    /// Shows what was written and is durable now, and answers whoever
+    /// waited for it.
+    fn show_synced(&mut self) {
+        for (entries, lines) in std::mem::take(&mut self.unsynced) {
+            self.show(&entries, &lines);
+        }
+        for done in std::mem::take(&mut self.waiting_sync) {
+            done.send(());
+        }
+    }
+
+    /// Entries durable, as `lines` encodes them: shown to every client.
+    fn show(&mut self, entries: &[Entry], lines: &Encoded) {
         if let Some(view) = &mut self.view {
             view.extend(entries);
         }
@@ -911,6 +1014,20 @@ impl Actor {
             self.live
                 .frames
                 .push(e.seq.get(), Frame::from_line(e.seq.get(), line).ok());
+        }
+        lock(&self.live.followers).retain(|c| c.wake().is_ok());
+    }
+
+    /// Entries committed: folded where else they are read.
+    fn folded(&mut self, entries: &[Entry]) {
+        let session = &self.live.session;
+        let hooks = self.registry.hooks();
+        self.transcript = self.transcript.take().filter(|t| t.is_on(&self.registry));
+        // An edit changes what came before it: the transcript is made again.
+        if entries.iter().any(|e| matches!(e.body, Body::Edit { .. })) {
+            self.transcript = None;
+        }
+        for e in entries {
             lock(&session.states).apply(e);
             if matches!(e.body, Body::Input { .. }) {
                 self.live.has_input.store(true, Ordering::SeqCst);
@@ -937,14 +1054,13 @@ impl Actor {
                 self.bound.settled(*call);
             }
         }
-        lock(&self.live.followers).retain(|c| c.wake().is_ok());
     }
 
-    /// The summary as the log now says.
+    /// The summary as the log now says: as many entries as are shown.
     fn publish(&self) {
         let ledger = self.core.ledger();
         let mut summary = lock(&self.live.summary);
-        summary.entries = ledger.seq();
+        summary.entries = self.live.frames.seq();
         summary.activity = ledger.activity();
     }
 
