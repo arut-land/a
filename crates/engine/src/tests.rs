@@ -211,6 +211,60 @@ fn busy_sessions_recover_at_startup() {
     assert!(!still_busy);
 }
 
+/// A busy session whose log is damaged before its tail is listed as kept
+/// as it is, shown, and never resumed or written: its open call does not
+/// run again, and input is refused.
+#[test]
+fn a_damaged_log_is_shown_and_never_written() {
+    let (root, home) = home("damaged");
+    let store = Jsonl::open(home.sessions_dir()).unwrap();
+    let id = SessionId::new();
+    let mut created = store
+        .create(&Header {
+            id,
+            workspace: "/w".into(),
+            parent: None,
+        })
+        .unwrap();
+    let call = Body::ToolCall {
+        tool: "sleep".into(),
+        input: json!({ "seconds": 0 }).into(),
+        id: None,
+        card: None,
+        by: Audience::Model,
+    };
+    let text = |seq| Body::Assistant {
+        text: format!("reply {seq}"),
+    };
+    for (seq, body) in (1..).zip([text(1), call, text(3)]) {
+        let entry = Entry::new(seq, created.writer.epoch(), body);
+        created.writer.log.append_all(&[entry]).unwrap();
+    }
+    store.mark_busy(id, true).unwrap();
+    let path = home.sessions_dir().join(format!("{id}.jsonl"));
+    let mut file = std::fs::read(&path).unwrap();
+    // In the call's line, before the last.
+    let call = memchr::memchr_iter(b'\n', &file).nth(1).unwrap() + 10;
+    file[call] ^= 1;
+    std::fs::write(&path, &file).unwrap();
+
+    let daemon = Daemon::load(&home, &echo()).unwrap();
+    settle(&daemon);
+    let listed = daemon.list();
+    let attachment = daemon.attach_to(&Target::Id(id), || "/w".into()).unwrap();
+    let refused = attachment.session().submit("hi");
+    settle(&daemon);
+    drop((attachment, daemon));
+    let after = std::fs::read(&path).unwrap();
+    std::fs::remove_dir_all(&root).unwrap();
+
+    let why = protocol::ReadOnly::Damaged { seq: 2 };
+    assert_eq!(listed[0].read_only, Some(why));
+    assert_eq!(listed[0].entries, 1);
+    assert_eq!(refused, Err(why.to_string()));
+    assert_eq!(after, file, "the log is never touched");
+}
+
 /// A session waiting for approval is listed as such once hibernated, and
 /// a restarted daemon loads it at once to ask again.
 #[test]

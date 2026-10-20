@@ -299,8 +299,11 @@ kinds! {
         /// (or just `target`) are left out of its context, or stand as
         /// `replace`. The log itself is never rewritten.
         Edit "edit" { target: Seq, upto: Option<Seq> = default, replace: Option<Json> = default } = Durable;
-
     }
+    /// An entry of a kind this build does not know, such as a newer
+    /// build's: folds pass over it, and it is written back as the text it
+    /// was read as, `raw`, the whole entry.
+    unknown Unknown { kind: String, raw: Json } = Durable;
     else Err(serde_json::Error::custom("unknown entry kind"))
 }
 
@@ -567,6 +570,31 @@ pub struct SessionSummary {
     pub clients: u32,
     pub activity: Activity,
     pub residency: Residency,
+    /// Why its log is kept as it is, if it is: shown, never written.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub read_only: Option<ReadOnly>,
+}
+
+/// Why a session's log opened read-only: this build shows what it reads
+/// of it and never writes to it, so nothing in it is lost.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ReadOnly {
+    /// Its lines from entry `seq` on are damaged or unreadable, and are
+    /// not the tail a crash leaves: the entries before it are shown.
+    Damaged { seq: u64 },
+    /// It was written in log format `version`, which this build does not
+    /// write: a newer build's, or one too old to read.
+    Format { version: u32 },
+}
+
+impl fmt::Display for ReadOnly {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Damaged { seq } => write!(f, "read-only: damaged at entry {seq}"),
+            Self::Format { version } => write!(f, "read-only: log format {version}"),
+        }
+    }
 }
 
 /// What a session is doing. A newer build's states this build does not
@@ -1180,7 +1208,13 @@ impl Entry {
     /// Appends the entry's JSON object to `out`. Encoded here, once, for
     /// the reason [`Decode`] gives.
     pub fn encode(&self, out: &mut Vec<u8>) -> serde_json::Result<()> {
-        serde_json::to_writer(out, self)
+        match &self.body {
+            Body::Unknown { raw, .. } => {
+                out.extend_from_slice(raw.raw().as_bytes());
+                Ok(())
+            }
+            _ => serde_json::to_writer(out, self),
+        }
     }
 }
 
@@ -1527,6 +1561,39 @@ mod tests {
         ] {
             assert!(Entry::from_json(bad.as_bytes()).is_err(), "{bad}");
         }
+    }
+
+    /// An entry of a kind this build does not know reads whatever its
+    /// fields hold, folds as nothing, and encodes as the text it was read
+    /// from, byte for byte.
+    #[test]
+    fn unknown_entries_read_and_write_back_as_they_were() {
+        for line in [
+            r#"{"seq":4,"epoch":2,"kind":"newer","x":{"y":[1, 2]}}"#,
+            r#"{"seq":4,"epoch":2,"kind":"newer","text":5,"call":"c","input":null}"#,
+            r#"{"seq":4,"epoch":2,"kind":"a_kind_longer_than_any_tag_is"}"#,
+        ] {
+            let e = Entry::from_json(line.as_bytes()).unwrap();
+            assert_eq!((e.seq, e.epoch, e.body.class()), (4, 2, Class::Durable));
+            let Body::Unknown { kind, raw } = &e.body else {
+                panic!("{e:?}");
+            };
+            assert!(line.contains(&format!(r#""kind":"{kind}""#)));
+            assert_eq!(raw.raw(), line);
+            let mut written = Vec::new();
+            e.encode(&mut written).unwrap();
+            assert_eq!(written, line.as_bytes());
+            let mut ledger = ledger::Ledger::default();
+            ledger.apply(&e);
+            assert_eq!(ledger.seq(), 4);
+        }
+        let frame =
+            Frame::entry(&Entry::from_json(br#"{"seq":4,"epoch":2,"kind":"newer"}"#).unwrap());
+        let msg = DaemonMsg::from_json(&frame.unwrap().as_bytes()[4..]).unwrap();
+        assert!(
+            matches!(msg, DaemonMsg::Unknown { seq: Some(4) }),
+            "{msg:?}"
+        );
     }
 
     #[test]

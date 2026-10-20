@@ -8,8 +8,9 @@ use std::path::PathBuf;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::thread;
 
-use protocol::{Body, Entry, SessionId};
+use protocol::{Body, Decode, Entry, Json, ReadOnly, SessionId};
 
+use super::jsonl::{FORMAT, seal, unseal};
 use super::*;
 
 /// A fresh store, and the directory to remove once the test is done.
@@ -357,6 +358,17 @@ fn reading_entries_leaves_the_writer_alone(store: &dyn LogStore) {
     assert_eq!(store.entries(h.id).unwrap()[2..], more);
 }
 
+/// Entries' lines end to end, sealed, as a file holds them.
+fn sealed<'a>(entries: impl IntoIterator<Item = &'a Entry>) -> Vec<u8> {
+    let mut file = Vec::new();
+    for e in entries {
+        let at = file.len();
+        e.encode(&mut file).unwrap();
+        seal(&mut file, at);
+    }
+    file
+}
+
 /// A JSONL session file with `tail` written after its entries, as a crash
 /// mid-append leaves it.
 fn torn(tail: &[u8]) -> (Fixture, PathBuf, Header, Vec<Entry>) {
@@ -409,11 +421,7 @@ fn a_torn_tail_is_never_indexed() {
             }
         }
         let file = fs::read(&path).unwrap();
-        let after: Vec<u8> = written[2..]
-            .iter()
-            .flat_map(|e| [encoded(e), b"\n".to_vec()].concat())
-            .collect();
-        assert_eq!(file[usize::try_from(cut).unwrap()..], after);
+        assert_eq!(file[usize::try_from(cut).unwrap()..], sealed(&written[2..]));
     }
 }
 
@@ -435,11 +443,18 @@ fn jsonl_skips_a_file_whose_header_a_crash_cut_off() {
 fn jsonl_files_are_a_header_line_then_one_line_per_entry() {
     let (store, path, h, written) = torn(b"");
     store.mark_busy(h.id, true).unwrap();
-    let mut expected = serde_json::to_string(&h).unwrap() + "\n";
-    for e in &written {
-        expected += &(serde_json::to_string(e).unwrap() + "\n");
-    }
-    assert_eq!(fs::read_to_string(&path).unwrap(), expected);
+    let header = serde_json::to_string(&h).unwrap();
+    let mut expected = format!(r#"{{"format":{FORMAT},{}"#, &header[1..]).into_bytes();
+    seal(&mut expected, 0);
+    expected.extend(sealed(&written));
+    assert_eq!(fs::read(&path).unwrap(), expected);
+    let header = String::from_utf8(expected).unwrap();
+    assert!(header.starts_with(r#"{"format":1,"id":""#), "{header}");
+    assert!(
+        header
+            .lines()
+            .all(|l| l.len() > 18 && l[l.len() - 18..].starts_with(r#","crc":""#))
+    );
     assert!(path.with_extension("busy").exists());
 }
 
@@ -452,4 +467,201 @@ fn jsonl_leases_past_the_epochs_its_files_hold() {
     // As a later daemon, with no leases of its own yet.
     let later = Jsonl::open(store.dir.as_ref().unwrap()).unwrap();
     assert!(later.load(h.id, &mut drop).unwrap().writer.epoch() > created.writer.epoch());
+}
+
+/// A JSONL session of entries 1 to 4, and its file as written.
+fn written() -> (Fixture, PathBuf, Header, Vec<Entry>, Vec<u8>) {
+    let (store, path, h, mut written) = torn(b"");
+    let mut log = load(&*store, h.id).0;
+    written.extend(append(&mut log, 3..=4));
+    let file = fs::read(&path).unwrap();
+    (store, path, h, written, file)
+}
+
+/// The file's lines, newline included: the header's first.
+fn lines_of(file: &[u8]) -> Vec<Vec<u8>> {
+    file.split_inclusive(|&b| b == b'\n')
+        .map(<[u8]>::to_vec)
+        .collect()
+}
+
+/// That a load of `id` keeps its log as it is, for `why`: it hands over
+/// `entries`, appends nothing and leaves the file as `file`.
+fn kept_as_is(
+    store: &dyn LogStore,
+    id: SessionId,
+    path: &PathBuf,
+    file: &[u8],
+    why: ReadOnly,
+    entries: &[Entry],
+) {
+    let (mut loaded, got) = load(store, id);
+    assert_eq!(got, entries);
+    assert_eq!(loaded.writer.read_only(), Some(why));
+    let refused = loaded.append(entry(9, 0).body).unwrap_err();
+    assert_eq!(refused.kind(), ErrorKind::ReadOnlyFilesystem);
+    assert_eq!(refused.to_string(), why.to_string());
+    assert_eq!(fs::read(path).unwrap(), file, "the file is never touched");
+    for e in entries {
+        assert_eq!(line(&*loaded.lines, e.seq).unwrap(), encoded(e));
+    }
+}
+
+/// A sealed line is never cut, whatever it holds: one of a kind this
+/// build does not know reads as such, is passed over and is read back as
+/// it was written; one this build cannot read keeps the file as it is.
+#[test]
+fn a_valid_line_is_never_cut() {
+    let (store, path, h, mut written, file) = written();
+    let unknown = br#"{"seq":5,"epoch":7,"kind":"newer","text":5,"x":[1]}"#;
+    let mut grown = file.clone();
+    let at = grown.len();
+    grown.extend_from_slice(unknown);
+    seal(&mut grown, at);
+    fs::write(&path, &grown).unwrap();
+    let (mut loaded, entries) = load(&*store, h.id);
+    let raw: Json = serde_json::from_slice(unknown).unwrap();
+    let kind = "newer".to_owned();
+    written.push(Entry::new(5, 7, Body::Unknown { kind, raw }));
+    assert_eq!(entries, written);
+    assert_eq!(loaded.writer.read_only(), None);
+    assert_eq!(line(&*loaded.lines, 5).unwrap(), unknown);
+    assert_eq!(
+        encoded(&written[4]),
+        unknown,
+        "it is written back as it was read"
+    );
+    written.extend(append(&mut loaded, [6]));
+    assert_eq!(entries_of(&*store, h.id), written);
+    assert_eq!(fs::read(&path).unwrap()[..grown.len()], grown);
+
+    // A sealed line of a kind this build knows, which it cannot read, in
+    // the middle and at the end.
+    let bad = br#"{"seq":3,"epoch":1,"kind":"input","text":5}"#;
+    let mut lines = lines_of(&file);
+    lines[3] = bad.to_vec();
+    seal(&mut lines[3], 0);
+    let middle = lines.concat();
+    fs::write(&path, &middle).unwrap();
+    kept_as_is(
+        &*store,
+        h.id,
+        &path,
+        &middle,
+        ReadOnly::Damaged { seq: 3 },
+        &written[..2],
+    );
+    let mut tail = file.clone();
+    let at = tail.len();
+    tail.extend_from_slice(&bad[..]);
+    seal(&mut tail, at);
+    fs::write(&path, &tail).unwrap();
+    kept_as_is(
+        &*store,
+        h.id,
+        &path,
+        &tail,
+        ReadOnly::Damaged { seq: 5 },
+        &written[..4],
+    );
+}
+
+/// What a crash leaves is a last line cut short, or not sealed: that alone
+/// is cut, and only it.
+#[test]
+fn only_a_torn_tail_is_trimmed() {
+    let (store, path, h, written, file) = written();
+    let mut next = Vec::new();
+    entry(5, 1).encode(&mut next).unwrap();
+    let mut sealed = next.clone();
+    seal(&mut sealed, 0);
+    let flipped = |at: usize| {
+        let mut line = sealed.clone();
+        line[at] ^= 0x20;
+        line
+    };
+    for tail in [
+        next.clone(),
+        [&next[..], b"\n"].concat(),
+        sealed[..sealed.len() - 1].to_vec(),
+        sealed[..sealed.len() - 4].to_vec(),
+        flipped(3),
+        flipped(sealed.len() - 3),
+        b"\n".to_vec(),
+    ] {
+        fs::write(&path, [&file[..], &tail].concat()).unwrap();
+        let (loaded, entries) = load(&*store, h.id);
+        assert_eq!(entries, written, "{}", String::from_utf8_lossy(&tail));
+        assert_eq!(loaded.writer.read_only(), None);
+        assert_eq!(fs::read(&path).unwrap(), file);
+    }
+}
+
+/// Damage anywhere but the last line is not what a crash leaves: the log
+/// is kept as it is, its entries before the damage shown, and is never
+/// cut or appended to.
+#[test]
+fn damage_before_the_tail_opens_read_only() {
+    let (store, path, h, written, file) = written();
+    let lines = lines_of(&file);
+    for (line, at) in [(2, 5), (3, lines[3].len() - 4), (1, lines[1].len() - 1)] {
+        let mut damaged = lines.clone();
+        damaged[line][at] ^= 1;
+        let damaged = [&damaged.concat()[..], b"{\"seq\":5"].concat();
+        fs::write(&path, &damaged).unwrap();
+        let why = ReadOnly::Damaged { seq: line as u64 };
+        kept_as_is(&*store, h.id, &path, &damaged, why, &written[..line - 1]);
+        assert!(store.headers().unwrap().contains(&h), "it is still listed");
+    }
+}
+
+/// A log in a format this build does not write, a newer build's, is read
+/// as far as this build can and kept as it is, torn tail and all.
+#[test]
+fn a_newer_log_is_never_written_by_an_older_daemon() {
+    let (store, path, h, written, file) = written();
+    let mut lines = lines_of(&file);
+    assert!(unseal(&mut lines[0]));
+    let header = String::from_utf8(lines[0].clone()).unwrap();
+    let newer = FORMAT + 1;
+    lines[0] = header
+        .replacen(
+            &format!(r#""format":{FORMAT}"#),
+            &format!(r#""format":{newer}"#),
+            1,
+        )
+        .into_bytes();
+    seal(&mut lines[0], 0);
+    let file = [&lines.concat()[..], br#"{"seq":5,"ep"#].concat();
+    fs::write(&path, &file).unwrap();
+    assert_eq!(store.headers().unwrap(), std::slice::from_ref(&h));
+    kept_as_is(
+        &*store,
+        h.id,
+        &path,
+        &file,
+        ReadOnly::Format { version: newer },
+        &written,
+    );
+}
+
+/// Every flip of a bit of a sealed line, the seal's own included, is
+/// found: the line no longer unseals.
+#[test]
+fn crc_detects_a_flipped_byte() {
+    let mut line = Vec::new();
+    entry(1, 2).encode(&mut line).unwrap();
+    let object = line.clone();
+    seal(&mut line, 0);
+    let mut again = line.clone();
+    assert!(unseal(&mut again));
+    assert_eq!(again, object);
+    assert_eq!(Entry::from_json(&again).unwrap(), entry(1, 2));
+    for at in 0..line.len() {
+        for bit in 0..8 {
+            let mut flipped = line.clone();
+            flipped[at] ^= 1 << bit;
+            assert!(!unseal(&mut flipped), "byte {at}, bit {bit}");
+        }
+    }
 }

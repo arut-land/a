@@ -518,6 +518,7 @@ fn slash_commands() {
         clients: 0,
         activity,
         residency: Residency::Loaded,
+        read_only: None,
     };
     app.fold(&DaemonMsg::Sessions {
         sessions: vec![

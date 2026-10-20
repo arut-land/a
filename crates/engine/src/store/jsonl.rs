@@ -4,14 +4,24 @@ use std::ops::RangeInclusive;
 use std::path::PathBuf;
 use std::sync::{Arc, PoisonError, RwLock};
 
-use protocol::{Decode, Entry, SessionId};
+use protocol::{Decode, Entry, ReadOnly, SessionId};
 
-use super::{Header, LeaseAuthority, Lines, Loaded, Local, Log, LogStore, Writer, span};
+use super::{Header, Kept, LeaseAuthority, Lines, Loaded, Local, Log, LogStore, Writer, span};
+
+/// The format of the files this build writes, which the header line names:
+/// a file in another is kept as it is.
+pub(crate) const FORMAT: u32 = 1;
 
 /// One append-only JSONL file per session in a directory: the header on the
 /// first line, one entry per line after it, and an empty `.busy` file beside
 /// it while work is in flight. Sessions share nothing, so they never contend;
 /// a single writer per directory is the daemon lock's job.
+///
+/// Every line is sealed with a checksum of itself ([`seal`]), so what a load
+/// cuts depends only on whether a line is whole, never on whether this
+/// build understands it: a sealed line is never cut, a last line that is not
+/// is the tail a crash tore and is cut, and one before the last means the
+/// file was damaged otherwise, so it is kept as it is.
 pub struct Jsonl {
     dir: PathBuf,
     leases: Local,
@@ -45,24 +55,29 @@ impl LogStore for Jsonl {
             .read(true)
             .append(true)
             .open(self.path(header.id))?;
-        let mut line = serde_json::to_vec(header)?;
-        line.push(b'\n');
+        let mut line = format!(r#"{{"format":{FORMAT},"#).into_bytes();
+        let at = line.len();
+        serde_json::to_writer(&mut line, header)?;
+        line.remove(at);
+        seal(&mut line, 0);
         file.write_all(&line)?;
         let index = Index::new(file, line.len() as u64);
         let epoch = self.leases.acquire(header.id, 0);
-        Ok(index.loaded(0, epoch, Some(self.dir.clone())))
+        Ok(index.loaded(0, epoch, Ok(Some(self.dir.clone()))))
     }
 
     /// A file whose header did not survive a crash holds no entries either,
-    /// so it holds no session.
+    /// so it holds no session; nor does one whose header is not sealed.
     fn headers(&self) -> io::Result<Vec<Header>> {
         let mut headers = Vec::new();
         for item in fs::read_dir(&self.dir)? {
             let path = item?.path();
             if path.extension().is_some_and(|e| e == "jsonl") {
-                let mut line = String::new();
-                BufReader::new(File::open(&path)?).read_line(&mut line)?;
-                if let Ok(header) = serde_json::from_str::<Header>(&line) {
+                let mut line = Vec::new();
+                BufReader::new(File::open(&path)?).read_until(b'\n', &mut line)?;
+                if unseal(&mut line)
+                    && let Ok(header) = serde_json::from_slice::<Header>(&line)
+                {
                     headers.push(header);
                 }
             }
@@ -71,10 +86,10 @@ impl LogStore for Jsonl {
         Ok(headers)
     }
 
-    /// Entries end at the first line that is unterminated or unreadable: a
-    /// crash mid-append, never acknowledged. The file is cut back to there
-    /// before any line is indexed past it, so the next append starts on a
-    /// fresh line and no read lands in what was cut.
+    /// Entries end where [`Index::scan`] stops. A torn tail, a crash
+    /// mid-append never acknowledged, is cut off before any line is indexed
+    /// past it, so the next append starts on a fresh line and no read lands
+    /// in what was cut; a file kept as it is is not touched.
     fn load(&self, id: SessionId, each: &mut dyn FnMut(Entry)) -> io::Result<Loaded> {
         let file = OpenOptions::new()
             .read(true)
@@ -82,17 +97,17 @@ impl LogStore for Jsonl {
             .open(self.path(id))?;
         let mut index = Index::new(file, 0);
         let mut floor = 0;
-        index.scan(|entry| {
+        let kept = index.scan(|entry| {
             floor = entry.epoch;
             each(entry);
         })?;
         let seq = index.read().len() as u64;
-        if index.end() < index.file.metadata()?.len() {
+        if kept.is_none() && index.end() < index.file.metadata()?.len() {
             index.file.set_len(index.end())?;
             sys::sync_data(&index.file)?;
         }
         let epoch = self.leases.acquire(id, floor);
-        Ok(index.loaded(seq, epoch, None))
+        Ok(index.loaded(seq, epoch, kept.map_or(Ok(None), Err)))
     }
 
     #[cfg(test)]
@@ -154,18 +169,22 @@ impl Index {
     }
 
     /// The lines indexed and an appender continuing them, whose entries up
-    /// to `seq` are committed.
-    fn loaded(self, seq: u64, epoch: u32, new_in: Option<PathBuf>) -> Loaded {
+    /// to `seq` are committed: one that refuses to, for a file kept as it
+    /// is.
+    fn loaded(self, seq: u64, epoch: u32, kept: Result<Option<PathBuf>, ReadOnly>) -> Loaded {
         let index = Arc::new(self);
-        let log = JsonlLog {
-            index: Arc::clone(&index),
-            new_in,
-            torn: false,
+        let log: Box<dyn Log> = match kept {
+            Ok(new_in) => Box::new(JsonlLog {
+                index: Arc::clone(&index),
+                new_in,
+                torn: false,
+            }),
+            Err(why) => Box::new(Kept(why)),
         };
         Loaded {
             lines: index,
             seq,
-            writer: Writer::new(Box::new(log), epoch),
+            writer: Writer::new(log, epoch),
         }
     }
 
@@ -186,37 +205,59 @@ impl Index {
     }
 
     /// Reads the file from the start, line by line, indexing and handing
-    /// `each` every entry up to the first unterminated or unreadable line.
-    fn scan(&mut self, mut each: impl FnMut(Entry)) -> io::Result<()> {
+    /// `each` every entry up to the first line that is not a sealed entry
+    /// this build reads. Stopping at the last line, unsealed, is cutting a
+    /// torn tail; stopping anywhere else, or in a file of another format,
+    /// is keeping the file as it is, for the reason returned.
+    fn scan(&mut self, mut each: impl FnMut(Entry)) -> io::Result<Option<ReadOnly>> {
+        #[derive(serde::Deserialize)]
+        struct Format {
+            format: u32,
+        }
         let mut reader = BufReader::with_capacity(64 * 1024, &self.file);
         let mut line = Vec::new();
         self.start = reader.read_until(b'\n', &mut line)? as u64;
+        let format = unseal(&mut line)
+            .then(|| serde_json::from_slice::<Format>(&line).ok())
+            .flatten()
+            .map_or(0, |f| f.format);
+        let other = (format != FORMAT).then_some(ReadOnly::Format { version: format });
         let ends = self.ends.get_mut().unwrap_or_else(PoisonError::into_inner);
         let mut end = self.start;
         loop {
             line.clear();
             let n = reader.read_until(b'\n', &mut line)?;
-            if !line.ends_with(b"\n") {
-                return Ok(());
+            if n == 0 {
+                return Ok(other);
             }
-            let Ok(entry) = Entry::from_json(&line) else {
-                return Ok(());
+            let sealed = unseal(&mut line);
+            if let Some(entry) = sealed.then(|| Entry::from_json(&line).ok()).flatten() {
+                end += n as u64;
+                ends.push(end);
+                each(entry);
+                continue;
+            }
+            let torn = !sealed && reader.fill_buf()?.is_empty();
+            let damaged = ReadOnly::Damaged {
+                seq: ends.len() as u64 + 1,
             };
-            end += n as u64;
-            ends.push(end);
-            each(entry);
+            return Ok(other.or((!torn).then_some(damaged)));
         }
     }
 }
 
 impl Lines for Index {
-    /// One positioned read for the lot: the lines lie end to end.
+    /// One positioned read for the lot: the lines lie end to end, each
+    /// unsealed as it is handed over.
     fn read(&self, seqs: RangeInclusive<u64>, limit: usize, out: &mut Vec<u8>) -> io::Result<u64> {
         let (from, to, count) = {
             let ends = self.read();
             let (first, last) = span(&seqs, ends.len())?;
             let from = first.checked_sub(1).map_or(self.start, |i| ends[i]);
-            let fit = ends[first..=last].partition_point(|&end| end - from <= limit as u64);
+            let unsealed = |(end, lines): (&u64, u64)| end - from - lines * SEAL as u64;
+            let fit = (ends[first..=last].iter().zip(1..))
+                .take_while(|&line| unsealed(line) <= limit as u64)
+                .count();
             let count = fit.max(1);
             (from, ends[first + count - 1], count)
         };
@@ -224,6 +265,7 @@ impl Lines for Index {
         let len = usize::try_from(to - from).map_err(io::Error::other)?;
         out.resize(at + len, 0);
         sys::read_exact_at(&self.file, &mut out[at..], from)?;
+        unseal_run(out, at);
         Ok(count as u64)
     }
 }
@@ -245,8 +287,9 @@ impl Log for JsonlLog {
     fn append_all(&mut self, entries: &[Entry]) -> io::Result<()> {
         let mut lines = Vec::new();
         for entry in entries {
+            let at = lines.len();
             entry.encode(&mut lines)?;
-            lines.push(b'\n');
+            seal(&mut lines, at);
         }
         self.write(&lines)
     }
@@ -283,4 +326,58 @@ impl JsonlLog {
             }
         }
     }
+}
+
+/// What ends a sealed line, after its JSON object's last field: the CRC32C
+/// of every byte before it, as 8 hex digits, so the line is still one JSON
+/// object, `,"crc":"1a2b3c4d"}`.
+const CRC: &[u8] = br#","crc":""#;
+const SEAL: usize = CRC.len() + 8 + br#""}"#.len();
+
+/// Seals the JSON object `line` holds from `at` on, a line of its own.
+pub(crate) fn seal(line: &mut Vec<u8>, at: usize) {
+    debug_assert_eq!(line.last(), Some(&b'}'), "a line is a JSON object");
+    line.pop();
+    let crc = crc32c::crc32c(&line[at..]);
+    line.extend_from_slice(CRC);
+    line.extend_from_slice(&hex(crc));
+    line.extend_from_slice(b"\"}\n");
+}
+
+/// Whether `line`, newline included, is sealed; if it is, it becomes the
+/// JSON object it seals.
+pub(crate) fn unseal(line: &mut Vec<u8>) -> bool {
+    let Some(fields) = line.len().checked_sub(SEAL + 1) else {
+        return false;
+    };
+    let (object, seal) = line.split_at(fields);
+    let sealed = seal.starts_with(CRC)
+        && seal.ends_with(b"\"}\n")
+        && seal[CRC.len()..][..8] == hex(crc32c::crc32c(object));
+    if sealed {
+        line.truncate(fields);
+        line.push(b'}');
+    }
+    sealed
+}
+
+/// The lines of `out` from `at` on, each sealed, as the objects they seal:
+/// lines read back are the entries' JSON.
+fn unseal_run(out: &mut Vec<u8>, at: usize) {
+    let (mut from, mut to) = (at, at);
+    while let Some(newline) = memchr::memchr(b'\n', &out[from..]) {
+        let fields = from + newline - SEAL;
+        out.copy_within(from..fields, to);
+        to += fields - from;
+        out[to..to + 2].copy_from_slice(b"}\n");
+        to += 2;
+        from += newline + 1;
+    }
+    out.truncate(to);
+}
+
+/// `crc` as 8 lower-case hex digits.
+fn hex(crc: u32) -> [u8; 8] {
+    const DIGITS: &[u8; 16] = b"0123456789abcdef";
+    std::array::from_fn(|i| DIGITS[(crc >> (28 - 4 * i) & 0xf) as usize])
 }

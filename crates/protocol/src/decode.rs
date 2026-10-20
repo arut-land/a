@@ -658,9 +658,36 @@ fn verdict(json: &Json) -> Result<Verdict> {
 }
 
 impl Decode for Entry {
+    /// One of a kind this build does not know reads as [`Body::Unknown`],
+    /// whatever its other fields hold; a known kind that is malformed is
+    /// an error.
     fn from_json(bytes: &[u8]) -> Result<Self> {
-        read::<EntryFields>(bytes)?.entry()
+        // Looked for only once the entry does not read, off the hot path.
+        read::<EntryFields>(bytes)
+            .and_then(|mut f| f.entry())
+            .or_else(|e| unknown_entry(bytes).ok_or(e))
     }
+}
+
+/// An entry of a kind this build does not know, kept as its text; `None`
+/// for one of a kind it does.
+#[cold]
+fn unknown_entry(bytes: &[u8]) -> Option<Entry> {
+    #[derive(Deserialize)]
+    struct Tags {
+        seq: u64,
+        epoch: u32,
+        kind: String,
+    }
+    let tags = read::<Tags>(bytes).ok().filter(|t| !Body::knows(&t.kind))?;
+    Some(Entry {
+        seq: tags.seq,
+        epoch: tags.epoch,
+        body: Body::Unknown {
+            kind: tags.kind,
+            raw: serde_json::from_slice(bytes).ok()?,
+        },
+    })
 }
 
 /// Through [`Decode`]'s decoder, whatever the input: for a type that holds
