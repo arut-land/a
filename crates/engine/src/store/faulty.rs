@@ -27,6 +27,7 @@ struct State {
     unsynced: Mutex<HashMap<SessionId, Vec<Written>>>,
     /// The power is off: nothing more is written or synced.
     cut: AtomicBool,
+    fail_sync: AtomicBool,
 }
 
 impl Faulty {
@@ -42,6 +43,11 @@ impl Faulty {
     pub fn cut(&self) {
         self.state.cut.store(true, Ordering::SeqCst);
         lock(&self.state.unsynced).clear();
+    }
+
+    /// Loses the next deferred batch and fails its sync, then permits I/O.
+    pub fn fail_next_sync(&self) {
+        self.state.fail_sync.store(true, Ordering::SeqCst);
     }
 
     fn wrap(&self, id: SessionId, mut loaded: Loaded) -> Loaded {
@@ -128,6 +134,10 @@ impl Log for FaultyLog {
 
     fn sync(&mut self) -> io::Result<()> {
         self.on()?;
+        if self.state.fail_sync.swap(false, Ordering::SeqCst) {
+            lock(&self.state.unsynced).remove(&self.id);
+            return Err(io::Error::other("deferred sync failed"));
+        }
         self.flush()
     }
 

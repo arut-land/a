@@ -965,35 +965,68 @@ impl Actor {
     /// cancelled, what was asked is answered that the session stopped, and
     /// the kernel is rebuilt from the committed log, as a load rebuilds it.
     async fn resume(&mut self) {
-        // What was written is in the log, whether or not it is durable
-        // yet: made so, it is what the log holds, and shown; not made so,
-        // it is as good as lost.
-        self.sync().await;
         self.live.session.cancel_all();
+        lock(&self.live.session.cancels).clear();
         self.replies.clear();
+        self.sides.clear();
         self.inflight.clear();
+        self.unsynced.clear();
+        self.waiting_sync.clear();
+        self.sync_armed = false;
+        self.writer.take();
         self.bound = bind(&self.registry, &self.live.session);
         let bound = Arc::clone(&self.bound) as Arc<dyn Binding>;
+        let header = Header {
+            id: self.live.id,
+            workspace: self.live.workspace.clone(),
+            parent: self.live.parent,
+        };
+        let shared = Arc::clone(&self.live.session.shared);
+        let registry = Arc::clone(&self.registry);
+        let reloaded = rt::unblock(&*Arc::clone(&shared.rt), move || {
+            let (mut loaded, folding) =
+                Folding::open(&header, &shared, Open::Load, &bound, &registry)?;
+            // A failed sync may have left complete, readable bytes. They
+            // cannot be published until the replacement writer syncs them.
+            loaded.writer.sync()?;
+            io::Result::Ok((loaded, folding))
+        })
+        .await;
+        let (loaded, folding) = match reloaded {
+            Ok(reloaded) => reloaded,
+            Err(e) => {
+                eprintln!("session {}: reloading: {e}", self.live.id.short());
+                self.phase = Phase::Draining;
+                return;
+            }
+        };
+        let recovered = FrameLog::new(Arc::clone(&loaded.lines), loaded.seq);
+        self.live.frames.reloaded(loaded.lines);
+        for entry in recovered.entries_after(self.live.frames.seq()) {
+            let lines = Encoded::of(std::slice::from_ref(&entry)).expect("loaded entry encodes");
+            self.show(std::slice::from_ref(&entry), &lines);
+        }
+        self.writer = Some(loaded.writer);
+        self.since_snapshot = loaded.read;
+        self.core = folding.core;
+        *lock(&self.live.session.states) = folding.states;
+        *lock(&self.live.session.env) = self.core.ledger().env().cloned().map(Arc::new);
+        self.live
+            .has_input
+            .store(folding.has_input, Ordering::SeqCst);
+        self.transcript = None;
+        self.replied = None;
+        self.snapshot = None;
+        self.view = None;
         let load = Load {
             boot: sys::boot_id(),
             busy: self.live.has_work(),
             owner: self.owner(),
             ..Load::default()
         };
-        // Folded an entry at a time, as a load folds it.
-        let frames = &self.live.frames;
-        let barriers = self.live.session.shared.barriers;
-        let resumed = catch_unwind(AssertUnwindSafe(|| {
-            let mut core = Core::new(bound).with_barriers(barriers);
-            for e in frames.entries() {
-                core.load(&e);
-            }
-            let fx = core.resumed(&load);
-            (core, fx)
-        }));
+        let resumed = catch_unwind(AssertUnwindSafe(|| self.core.resumed(&load)));
         match resumed {
-            Ok((core, fx)) => {
-                self.core = core;
+            Ok(fx) => {
                 self.resuming = true;
                 self.carry(fx).await;
                 self.resuming = false;
@@ -1160,9 +1193,9 @@ impl Actor {
         match synced {
             Ok(()) => self.show_synced(),
             Err(e) => {
-                eprintln!("session {}: syncing: {e}", self.live.id.short());
                 self.unsynced.clear();
                 self.waiting_sync.clear();
+                Box::pin(self.failed(format!("syncing: {e}"), Vec::new())).await;
             }
         }
     }

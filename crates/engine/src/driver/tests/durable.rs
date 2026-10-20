@@ -59,3 +59,57 @@ fn a_seq_shown_to_a_client_survives_a_power_cut() {
         );
     }
 }
+
+#[test]
+fn a_failed_deferred_sync_recovers_before_accepting_more_work() {
+    let faulty = Arc::new(Faulty::new(Arc::new(Memory::default())));
+    let fixture = Fixture::on(
+        Arc::clone(&faulty) as _,
+        ext_fixtures::ECHO,
+        Registry::default().with(&ext_fixtures::Fixtures).unwrap(),
+        openai(&Script::new(&[])),
+    );
+    let session = fixture.create();
+    session.submit("sleep 1").unwrap();
+    let log = until(&session, "sleep started", tool_running);
+    let call = log
+        .iter()
+        .find(|e| matches!(e.body, Body::ToolCall { .. }))
+        .unwrap()
+        .seq
+        .get();
+    let before = session.frames.seq();
+    faulty.fail_next_sync();
+    let (done, waited) = oneshot::channel();
+    session
+        .session
+        .mail
+        .send(Msg::Note {
+            call: id(call),
+            note: Note::State {
+                ext: "test".into(),
+                state: "value".into(),
+                data: Json::encode(&"lost").unwrap(),
+            },
+            done: Some(done),
+        })
+        .ok()
+        .unwrap();
+    assert!(
+        rt::block_on(waited).is_none(),
+        "a failed sync cannot acknowledge the note"
+    );
+    session.barrier();
+    session.interrupt_now();
+    session.submit("after").unwrap();
+    session.barrier();
+    settle(&session);
+    let kept = faulty.entries(session.id).unwrap();
+    assert!(kept.iter().all(|e| !matches!(e.body, Body::Ext { .. })));
+    assert!(kept.len() as u64 > before);
+    for (seq, entry) in (1..).zip(&kept) {
+        assert_eq!(entry.seq.get(), seq, "recovery must not leave a hole");
+    }
+    assert_eq!(log_of(&session), kept);
+    session.halt();
+}
