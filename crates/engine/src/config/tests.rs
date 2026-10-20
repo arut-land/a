@@ -19,7 +19,7 @@ fn dirs(name: &str, home: Option<&str>, workspace: Option<&str>) -> (PathBuf, Pa
 }
 
 fn settings(root: &Path) -> Settings {
-    Settings::new(root.join("config.toml"), None)
+    Settings::looking(root.join("config.toml"), None, Duration::ZERO)
 }
 
 #[test]
@@ -58,7 +58,11 @@ fn later_layers_win() {
     assert_eq!(s.agent(&ws), Some(ext_fixtures::ECHO.to_owned()));
     assert_eq!(s.model(&root).unwrap().0, "home:m");
 
-    let overridden = Settings::new(root.join("config.toml"), Some(ext::LOOP.into()));
+    let overridden = Settings::looking(
+        root.join("config.toml"),
+        Some(ext::LOOP.into()),
+        Duration::ZERO,
+    );
     assert_eq!(overridden.agent(&ws), Some(ext::LOOP.to_owned()));
 
     let (bare, ws) = dirs("defaults", None, None);
@@ -152,5 +156,24 @@ fn a_workspace_file_is_parsed_once_per_change_for_all_its_sessions() {
     // A change is read.
     std::fs::write(&path, "model = \"ws:longer\"\n").unwrap();
     assert_eq!(s.model(&ws).unwrap().0, "ws:longer");
+    std::fs::remove_dir_all(root).unwrap();
+}
+
+/// Between looks the file is trusted, so a call costs no stat: a hand edit
+/// waits for the next look, while a change made through the daemon, which
+/// is the file's one writer, is seen at once.
+#[test]
+fn a_file_is_looked_at_once_per_floor_and_the_daemons_own_change_at_once() {
+    let (root, ws) = dirs("floor", Some("model = \"first:m\""), None);
+    let s = Settings::looking(root.join("config.toml"), None, Duration::from_secs(3600));
+    assert_eq!(s.model(&ws).unwrap().0, "first:m");
+    std::fs::write(root.join("config.toml"), "model = \"second:m\"").unwrap();
+    assert_eq!(s.model(&ws).unwrap().0, "first:m");
+    let change = SettingsChange {
+        model: Some("third:m".into()),
+        ..SettingsChange::default()
+    };
+    s.home.change(&change).unwrap();
+    assert_eq!(s.model(&ws).unwrap().0, "third:m");
     std::fs::remove_dir_all(root).unwrap();
 }

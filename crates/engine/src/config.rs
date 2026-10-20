@@ -9,7 +9,7 @@ use std::collections::HashMap;
 use std::fmt;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
-use std::time::SystemTime;
+use std::time::{Duration, Instant, SystemTime};
 
 use protocol::{Environment, HomeSettings, SettingsChange};
 
@@ -37,19 +37,33 @@ fn stamp(path: &Path) -> Stamp {
 /// A file as last read, or why it could not be.
 pub type Loaded = Arc<Result<File, String>>;
 
+/// How long a hand edit may go unseen: the file is looked at (one stat)
+/// at most this often, not once per call.
+pub const FLOOR: Duration = Duration::from_secs(2);
+
 /// A file read again only once it changes, so hand edits apply without a
 /// daemon restart. Clients change it through the daemon ([`Watched::change`]),
-/// which is then its one writer.
+/// which is then its one writer and sees its own writes at once.
 pub struct Watched {
     path: PathBuf,
-    read: Mutex<Option<(Stamp, Loaded)>>,
+    read: Mutex<Option<Read>>,
+    /// How long after a look the file is trusted not to have changed.
+    floor: Duration,
+}
+
+/// The file as last read: its stamp then, and when it was last looked at.
+struct Read {
+    stamp: Stamp,
+    file: Loaded,
+    looked: Instant,
 }
 
 impl Watched {
-    pub fn new(path: PathBuf) -> Self {
+    pub fn new(path: PathBuf, floor: Duration) -> Self {
         Self {
             path,
             read: Mutex::new(None),
+            floor,
         }
     }
 
@@ -59,13 +73,26 @@ impl Watched {
 
     /// The file as it is now, or why it could not be read.
     pub fn get(&self) -> Loaded {
-        let now = stamp(&self.path);
         let mut read = lock(&self.read);
-        match &*read {
-            Some((then, file)) if *then == now => Arc::clone(file),
+        if let Some(last) = &*read
+            && last.looked.elapsed() < self.floor
+        {
+            return Arc::clone(&last.file);
+        }
+        let now = stamp(&self.path);
+        let looked = Instant::now();
+        match read.as_mut() {
+            Some(last) if last.stamp == now => {
+                last.looked = looked;
+                Arc::clone(&last.file)
+            }
             _ => {
                 let file = Arc::new(load(&self.path));
-                *read = Some((now, Arc::clone(&file)));
+                *read = Some(Read {
+                    stamp: now,
+                    file: Arc::clone(&file),
+                    looked,
+                });
                 file
             }
         }
@@ -93,7 +120,11 @@ impl Watched {
         }
         file.write(&self.path).map_err(|e| e.to_string())?;
         let file = Arc::new(Ok(file));
-        *read = Some((stamp(&self.path), Arc::clone(&file)));
+        *read = Some(Read {
+            stamp: stamp(&self.path),
+            file: Arc::clone(&file),
+            looked: Instant::now(),
+        });
         Ok(file)
     }
 }
@@ -133,14 +164,21 @@ pub struct Settings {
     pub agent: Option<String>,
     /// Each workspace's `.a/config.toml`, shared by all its sessions.
     workspaces: Mutex<HashMap<PathBuf, Arc<Watched>>>,
+    floor: Duration,
 }
 
 impl Settings {
     pub fn new(home: PathBuf, agent: Option<String>) -> Self {
+        Self::looking(home, agent, FLOOR)
+    }
+
+    /// The same, looking at the files at most once per `floor`.
+    pub fn looking(home: PathBuf, agent: Option<String>, floor: Duration) -> Self {
         Self {
-            home: Watched::new(home),
+            home: Watched::new(home, floor),
             agent,
             workspaces: Mutex::default(),
+            floor,
         }
     }
 
@@ -151,7 +189,8 @@ impl Settings {
             lock(&self.workspaces)
                 .entry(workspace.to_path_buf())
                 .or_insert_with(|| {
-                    Arc::new(Watched::new(workspace.join(".a").join("config.toml")))
+                    let path = workspace.join(".a").join("config.toml");
+                    Arc::new(Watched::new(path, self.floor))
                 }),
         );
         watched.get()

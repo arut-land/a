@@ -540,7 +540,7 @@ impl Daemon {
         &self,
         header: Header,
         input: String,
-        env: Option<Environment>,
+        env: Option<Arc<Environment>>,
     ) -> io::Result<()> {
         let live = if let Some(slot) = self.slot(header.id) {
             self.live(&slot).await?

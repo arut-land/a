@@ -63,13 +63,16 @@ pub enum Open {
 /// is folded, as the kernel's registry binds it.
 struct Session {
     id: SessionId,
-    workspace: PathBuf,
+    workspace: Arc<Path>,
+    /// The session's directory for output too large for its log.
+    spill: Arc<Path>,
     mail: Mail,
     /// The extensions' state: folded as each entry commits.
     states: Mutex<States>,
     /// What commands run in: the last client's, secrets included, or after
-    /// a restart the last one logged.
-    env: Mutex<Option<Environment>>,
+    /// a restart the last one logged. One allocation per change, shared by
+    /// every call made while it stands.
+    env: Mutex<Option<Arc<Environment>>>,
     /// Background process groups the session owns, until each ends.
     jobs: Mutex<Vec<u32>>,
     /// What stops each open call's work, one per call for as long as it
@@ -95,6 +98,9 @@ pub struct Live {
     followers: Mutex<Vec<Outbox>>,
     /// Whether work is in flight, as the kernel marks it.
     busy: AtomicBool,
+    /// Whether the log holds any input: a child's first comes from its
+    /// parent, once.
+    has_input: AtomicBool,
     attached: AtomicUsize,
     last_active: Mutex<Instant>,
     summary: Mutex<SessionSummary>,
@@ -130,7 +136,7 @@ enum Msg {
     Step(Event),
     /// A client to follow the session, answered once it does.
     Attach(Outbox, u64, oneshot::Sender<()>),
-    Env(Environment),
+    Env(Arc<Environment>),
     /// A running call's report, answered once committed.
     Note {
         call: CallId,
@@ -202,7 +208,8 @@ impl Live {
         let (tx, rx) = channel::unbounded();
         let session = Arc::new(Session {
             id: header.id,
-            workspace: header.workspace.clone(),
+            workspace: Arc::from(header.workspace.as_path()),
+            spill: Arc::from(shared.spill.join(header.id.to_string())),
             mail: Arc::new(tx),
             states: Mutex::new(registry.states()),
             env: Mutex::default(),
@@ -215,6 +222,7 @@ impl Live {
         let mut core = Core::new(Arc::clone(&bound) as Arc<dyn Binding>);
         // Each entry is folded as it is read and dropped.
         let mut states = registry.states();
+        let mut has_input = false;
         let loaded = match open {
             Open::Create => {
                 let created = shared.store.create(header)?;
@@ -222,12 +230,13 @@ impl Live {
                 created
             }
             Open::Load => shared.store.load(header.id, &mut |e| {
+                has_input |= matches!(e.body, Body::Input { .. });
                 states.apply(&e);
                 core.load(&e);
             })?,
         };
         *lock(&session.states) = states;
-        *lock(&session.env) = core.ledger().env().cloned();
+        *lock(&session.env) = core.ledger().env().cloned().map(Arc::new);
         let fresh = lock(&shared.loaded).insert(header.id);
         let listed = (shared.catalog.get(header.id)).unwrap_or_else(|| Record::new(header.clone()));
         let busy = listed.busy;
@@ -252,6 +261,7 @@ impl Live {
             frames: Arc::new(FrameLog::new(loaded.lines, loaded.seq)),
             followers: Mutex::default(),
             busy: AtomicBool::new(busy && read_only.is_none()),
+            has_input: AtomicBool::new(has_input),
             attached: AtomicUsize::new(0),
             last_active: Mutex::new(Instant::now()),
             summary: Mutex::new(SessionSummary {
@@ -327,8 +337,8 @@ impl Live {
 
     /// Runs commands from now on in `env`, the newest client's; its
     /// redacted form is logged unless it is the one logged last.
-    pub fn set_env(&self, env: Environment) {
-        self.send(Msg::Env(env));
+    pub fn set_env(&self, env: impl Into<Arc<Environment>>) {
+        self.send(Msg::Env(env.into()));
     }
 
     /// Hands the session child `child`'s result.
@@ -359,12 +369,9 @@ impl Live {
     }
 
     /// Whether the log holds any input: a child's first comes from its
-    /// parent, once. Read from the log's start, where the input of a
-    /// child is.
+    /// parent, once.
     pub fn has_input(&self) -> bool {
-        self.frames
-            .entries()
-            .any(|e| matches!(e.body, Body::Input { .. }))
+        self.has_input.load(Ordering::SeqCst)
     }
 
     pub fn summary(&self) -> SessionSummary {
@@ -788,8 +795,17 @@ impl Actor {
             owner: self.owner(),
             ..Load::default()
         };
-        let log: Vec<Entry> = self.live.frames.entries().collect();
-        match catch_unwind(AssertUnwindSafe(|| Core::resume(bound, &log, &load))) {
+        // Folded an entry at a time, as a load folds it.
+        let frames = &self.live.frames;
+        let resumed = catch_unwind(AssertUnwindSafe(|| {
+            let mut core = Core::new(bound);
+            for e in frames.entries() {
+                core.load(&e);
+            }
+            let fx = core.resumed(&load);
+            (core, fx)
+        }));
+        match resumed {
             Ok((core, fx)) => {
                 self.core = core;
                 self.carry(fx).await;
@@ -888,6 +904,10 @@ impl Actor {
                 .frames
                 .push(e.seq.get(), Frame::from_line(e.seq.get(), line).ok());
             lock(&session.states).apply(e);
+            if matches!(e.body, Body::Input { .. }) {
+                self.live.has_input.store(true, Ordering::SeqCst);
+            }
+
             // What observers do about it runs owned by the session.
             for reaction in hooks.observe(self.bound.point(), e) {
                 let ended = self.live.ended.clone();
@@ -1393,12 +1413,12 @@ impl Session {
     /// What call `call` runs with, on `registry`, stopped by `cancel`.
     fn cx(self: &Arc<Self>, call: CallId, registry: &Arc<Registry>, cancel: Cancel) -> Cx {
         Parts {
-            workspace: Arc::from(self.workspace.as_path()),
-            env: lock(&self.env).clone().map(Arc::new),
+            workspace: Arc::clone(&self.workspace),
+            env: lock(&self.env).clone(),
             session: self.id,
             call,
             model: self.model_spec().into(),
-            spill: Arc::from(self.shared.spill.join(self.id.to_string())),
+            spill: Arc::clone(&self.spill),
             cancel,
             services: self.services(),
         }
@@ -1431,7 +1451,7 @@ impl Session {
         let env = lock(&self.env).clone();
         self.shared
             .models
-            .model(&self.workspace, env.as_ref(), &spec)
+            .model(&self.workspace, env.as_deref(), &spec)
     }
 
     /// The model spec the settings name now, and what names it: the
@@ -1486,7 +1506,7 @@ impl View for Viewed {
     }
 
     fn env(&self) -> Option<Arc<Environment>> {
-        lock(&self.0.env).clone().map(Arc::new)
+        lock(&self.0.env).clone()
     }
 
     /// With the call's own cancel: work a handler takes it along to ends
@@ -1622,7 +1642,7 @@ impl ext::Models for Own {
             let model = match &side.model {
                 Some(spec) => {
                     let env = lock(&session.env).clone();
-                    (session.shared.models).model(&session.workspace, env.as_ref(), spec)
+                    (session.shared.models).model(&session.workspace, env.as_deref(), spec)
                 }
                 None => session.model(),
             }
