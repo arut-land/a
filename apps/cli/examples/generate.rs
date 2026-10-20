@@ -1,20 +1,27 @@
-//! Shell completions and the man page, written from the spec. The
-//! completion scripts are usage's: each asks `a __complete_word__`, which
-//! answers from the same tables the parser reads. usage writes no man page,
-//! so this does. Only the tests link this: `mise run generate:completions`
-//! and `generate:man` run the test below with `A_GENERATE` set to the
-//! directory they go to.
+//! Shell completions and the man page, written from the spec:
+//! `mise run generate [dir]`. The completion scripts are usage's: each asks
+//! `a __complete_word__`, which answers from the same tables the parser
+//! reads. usage writes no man page, so this does. Nothing of it ships: the
+//! command line's tests include this file to check what it writes.
 
 use std::fmt::Write;
-use std::path::Path;
-use std::process::Command;
 
 use usage_rs::complete::Shell;
 use usage_rs::help::usage_line;
 use usage_rs::spec::{CommandMeta, FlagMeta};
 
+// As an example, the spec comes from the source; as the tests' module,
+// from the crate. Only the spec is read of it; rustfmt reaches it through
+// the binary, not through this cycle.
+#[cfg(not(test))]
+#[allow(dead_code)]
+#[rustfmt::skip]
+#[path = "../src/args.rs"]
+mod args;
+#[cfg(test)]
 use super::Args;
-use super::tests::commands;
+#[cfg(not(test))]
+use args::Args;
 
 /// Every shell usage writes a script for: the file it goes to, and the
 /// command that checks it parses, where one is known.
@@ -30,6 +37,43 @@ const SHELLS: [(Shell, &str, Option<[&str; 2]>); 6] = [
     (Shell::PowerShell, "completions/a.ps1", None),
     (Shell::Elvish, "completions/a.elv", None),
 ];
+
+#[cfg(not(test))]
+fn main() {
+    use std::path::Path;
+
+    let dir = std::env::args_os().nth(1).expect("usage: generate <dir>");
+    for (name, text) in files() {
+        let path = Path::new(&dir).join(name);
+        std::fs::create_dir_all(path.parent().unwrap()).expect("the directory");
+        std::fs::write(&path, text).expect("written");
+        println!("{}", path.display());
+    }
+}
+
+/// Every file written, by its path under the directory given.
+fn files() -> impl Iterator<Item = (&'static str, String)> {
+    let scripts = SHELLS.map(|(shell, name, _)| (name, Args::completion_script(shell)));
+    scripts.into_iter().chain([("man/a.1", man())])
+}
+
+/// Every command, as the path of names from the root to it.
+pub(crate) fn commands() -> Vec<Vec<&'static CommandMeta<'static>>> {
+    fn walk(
+        path: &mut Vec<&'static CommandMeta<'static>>,
+        out: &mut Vec<Vec<&'static CommandMeta<'static>>>,
+    ) {
+        out.push(path.clone());
+        for sub in path[path.len() - 1].subcommands() {
+            path.push(sub);
+            walk(path, out);
+            path.pop();
+        }
+    }
+    let mut out = Vec::new();
+    walk(&mut vec![Args::spec().root], &mut out);
+    out
+}
 
 /// `text` for roff: backslashes and dashes escaped, and no line read as a
 /// request.
@@ -80,7 +124,7 @@ fn flag(out: &mut String, flag: &FlagMeta) {
     }
 }
 
-pub fn man() -> String {
+fn man() -> String {
     let spec = Args::spec();
     let root = spec.root;
     let bin = spec.bin.unwrap_or(spec.name);
@@ -129,28 +173,25 @@ pub fn man() -> String {
     out
 }
 
-/// Writes the files to `A_GENERATE` when it is set; checks each script
-/// with the shell that reads it, where this machine has that shell.
+/// Every file shows no hidden command, and each script parses in the
+/// shell that reads it, where this machine has that shell.
 #[test]
 fn completions_and_the_man_page_are_generated_from_the_spec() {
-    let out = std::env::var_os("A_GENERATE");
-    let scripts = SHELLS.map(|(shell, name, check)| (name, check, Args::completion_script(shell)));
-    let files = scripts.into_iter().chain([("man/a.1", None, man())]);
-    for (name, check, text) in files {
+    use std::process::Command;
+
+    let dir = std::env::temp_dir().join(format!("a-generate-{}", std::process::id()));
+    let checks: std::collections::HashMap<_, _> = SHELLS
+        .iter()
+        .filter_map(|(_, name, check)| Some((*name, (*check)?)))
+        .collect();
+    for (name, text) in files() {
         assert!(
             !text.contains("__daemon"),
             "{name} shows the hidden command"
         );
-        if let Some(dir) = &out {
-            let path = Path::new(dir).join(name);
-            std::fs::create_dir_all(path.parent().unwrap()).unwrap();
-            std::fs::write(&path, &text).unwrap();
-            println!("{}", path.display());
-        }
-        let Some([program, flag]) = check else {
+        let Some([program, flag]) = checks.get(name) else {
             continue;
         };
-        let dir = std::env::temp_dir().join(format!("a-generate-{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
         let file = dir.join(name.rsplit('/').next().unwrap());
         std::fs::write(&file, &text).unwrap();

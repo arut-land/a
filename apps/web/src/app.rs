@@ -243,7 +243,7 @@ pub struct Live {
 
 impl Live {
     fn open(app: Arc<App>, id: &str, session: SessionId) -> Self {
-        let (tx, inbox) = rt::channel::bounded(256);
+        let (tx, inbox) = rt::channel::unbounded();
         let tx = Arc::new(tx);
         let events = Arc::clone(&tx);
         let daemon = app.daemon.clone();

@@ -5,8 +5,8 @@ use std::ffi::{OsStr, OsString};
 use std::process::Command;
 
 use usage_rs::embedded::{Exit, Outcome};
-use usage_rs::spec::CommandMeta;
 
+use super::generate::commands;
 use super::{Args, Cmd, Daemon};
 
 fn words(argv: &str) -> Vec<OsString> {
@@ -56,24 +56,6 @@ fn help(argv: &str) -> String {
     let exit = exit(argv);
     assert!(!exit.stderr && exit.code == 0, "{argv}: {exit:?}");
     exit.text
-}
-
-/// Every command, as the path of names from the root to it.
-pub(super) fn commands() -> Vec<Vec<&'static CommandMeta<'static>>> {
-    fn walk(
-        path: &mut Vec<&'static CommandMeta<'static>>,
-        out: &mut Vec<Vec<&'static CommandMeta<'static>>>,
-    ) {
-        out.push(path.clone());
-        for sub in path[path.len() - 1].subcommands() {
-            path.push(sub);
-            walk(path, out);
-            path.pop();
-        }
-    }
-    let mut out = Vec::new();
-    walk(&mut vec![Args::spec().root], &mut out);
-    out
 }
 
 #[test]

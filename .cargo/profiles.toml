@@ -3,122 +3,57 @@ codegen-backend = "cranelift"
 debug = "line-tables-only"
 split-debuginfo = "unpacked"
 
+# Dependencies build once (mbx shares them) and most run once per build
+# (proc-macros, their syn) or never in a test: unoptimized, which builds
+# ~2x faster. package."*" outranks build-override, so proc-macros cannot be
+# told apart here; the few whose runtime the tests feel are named below.
 [profile.dev.package."*"]
 codegen-backend = "llvm"
-opt-level = 1
+opt-level = 0
 debug = false
 
-# package."*" outranks build-override, so proc-macro crates are named here;
-# at opt-level 0 they build ~2x faster and expansion cost is negligible.
-[profile.dev.package.syn]
-opt-level = 0
+# Frames every message.
+[profile.dev.package.serde_json]
+opt-level = 1
 
-[profile.dev.package.usage-derive]
-opt-level = 0
+# The terminal client's input and cells, drawn in every TUI test.
+[profile.dev.package.vte]
+opt-level = 1
+
+[profile.dev.package.ratatui-core]
+opt-level = 1
+
+[profile.dev.package.unicode-width]
+opt-level = 1
+
+# Under every OS call and search.
+[profile.dev.package.rustix]
+opt-level = 1
+
+[profile.dev.package.memchr]
+opt-level = 1
 
 # panic stays unwind so a panicking session actor cannot take the daemon down.
+#
+# Size and speed by architecture, not by level: everything at s, which
+# the measurements in docs/perf/build-tuning.md hold to within noise of 3
+# on every path but the two below. std (build-std) is at s too.
 [profile.release]
+opt-level = "s"
 lto = "fat"
 codegen-units = 1
 debug = "line-tables-only"
 split-debuginfo = "packed"
 strip = "symbols"
 
-# Cold paths (one request encode per model turn, argv parsed once): size over
-# speed. Network time dominates these; hot paths such as serde_json stay at 3.
-# ureq and usage-argv are smaller at z; http is not.
-[profile.release.package.ureq]
-opt-level = "z"
+# The wire: serde_json frames every message and parses every log entry.
+[profile.release.package.serde_json]
+opt-level = 3
 
-[profile.release.package.ureq-proto]
-opt-level = "s"
-
-[profile.release.package.url]
-opt-level = "s"
-
-[profile.release.package.http]
-opt-level = "s"
-
-[profile.release.package.usage-argv]
-opt-level = "z"
-
-# The daemon's control flow (sessions, tools, the log, the runtime, OS
-# calls) and the clients' connection: syscalls and the model dominate, and
-# s saves about 160 KiB with no measured change in daemon CPU.
-[profile.release.package.engine]
-opt-level = "s"
-
-[profile.release.package.ext]
-opt-level = "s"
-
-[profile.release.package.kernel]
-opt-level = "s"
-
-[profile.release.package.ext-compact]
-opt-level = "s"
-
-[profile.release.package.ext-edit]
-opt-level = "s"
-
-[profile.release.package.ext-title]
-opt-level = "s"
-
-[profile.release.package.ext-fixtures]
-opt-level = "s"
-
-[profile.release.package.ext-policy]
-opt-level = "s"
-
-[profile.release.package.ext-prompt]
-opt-level = "s"
-
-[profile.release.package.ext-retry]
-opt-level = "s"
-
-[profile.release.package.ext-settings]
-opt-level = "s"
-
-[profile.release.package.ext-shell]
-opt-level = "s"
-
-[profile.release.package.ext-subagent]
-opt-level = "s"
-
-[profile.release.package.client]
-opt-level = "s"
-
-[profile.release.package.sys]
-opt-level = "s"
-
-[profile.release.package.rt]
-opt-level = "s"
-
-# The command line's dispatch, run once a process (-32 KiB). An override
-# on the binary's own package loses the profile's strip, so it is repeated.
-[profile.release.package.a]
-opt-level = "s"
-strip = "symbols"
-
-# The wire codec: payloads stay raw JSON and records decode in one pass,
-# so s costs decode and encode under 5% (over 1000 MB/s on a 15k-entry
-# log) and saves 92 KiB. std (build-std) saves 13 KiB more at no measured cost;
-# alloc stays at 3, as s costs the terminal client's frame ~15%.
-[profile.release.package.protocol]
-opt-level = "s"
-
-[profile.release.package.std]
-opt-level = "s"
-
-# Network time dominates the provider layer: s costs its decoders ~6% per
-# frame and saves ~160 KiB.
-[profile.release.package.llm]
-opt-level = "s"
-
-# The terminal client redraws once per streamed token, but only the rows a
-# token changed: a 6000-item session's delta frame is ~45 µs at s and at 3
-# alike (docs/tui.md).
-[profile.release.package.tui]
-opt-level = "s"
+# s costs the terminal client's frame ~15% through alloc: its text model
+# allocates per span. Goes with the allocation-free frame (docs/tui.md).
+[profile.release.package.alloc]
+opt-level = 3
 
 # cargo-bolero (`mise run fuzz`): optimized, and LLVM throughout for
 # libFuzzer's coverage instrumentation.
@@ -128,20 +63,3 @@ opt-level = 3
 incremental = false
 codegen-units = 1
 codegen-backend = "llvm"
-
-# config.toml is read at startup and written from the settings pane: z
-# saves 32 KiB over 3.
-[profile.release.package.toml_edit]
-opt-level = "z"
-
-[profile.release.package.toml_parser]
-opt-level = "z"
-
-[profile.release.package.toml_writer]
-opt-level = "z"
-
-[profile.release.package.toml_datetime]
-opt-level = "z"
-
-[profile.release.package.winnow]
-opt-level = "z"

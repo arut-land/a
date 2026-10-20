@@ -5,10 +5,11 @@ use std::fs;
 use std::path::{Path, PathBuf};
 
 /// The crates that must not name a platform: the daemon, the extension
-/// SDK and every extension, the protocol, the client SDK and the store.
+/// SDK and every extension, the protocol, the client SDK, the store and
+/// the model protocols (whose TLS provider the build picks by feature).
 fn kernel_crates() -> Vec<PathBuf> {
     let crates = Path::new(env!("CARGO_MANIFEST_DIR")).join("..");
-    let mut dirs: Vec<PathBuf> = ["engine", "ext", "kernel", "protocol", "client"]
+    let mut dirs: Vec<PathBuf> = ["engine", "ext", "kernel", "protocol", "client", "llm"]
         .iter()
         .map(|name| crates.join(name))
         .collect();
