@@ -72,6 +72,10 @@ struct Session {
     env: Mutex<Option<Environment>>,
     /// Background process groups the session owns, until each ends.
     jobs: Mutex<Vec<u32>>,
+    /// What stops each open call's work, one per call for as long as it
+    /// is open: its run, its gate, and whatever a handler deciding about
+    /// it took its context along to, all end with it.
+    cancels: Mutex<Keyed<CallId, Cancel>>,
     /// What the engine provides the session's calls, made when one first
     /// asks.
     services: OnceLock<Arc<Services>>,
@@ -203,6 +207,7 @@ impl Live {
             states: Mutex::new(registry.states()),
             env: Mutex::default(),
             jobs: Mutex::default(),
+            cancels: Mutex::default(),
             services: OnceLock::new(),
             shared: Arc::clone(shared),
         });
@@ -266,15 +271,11 @@ impl Live {
             transcript: None,
             replied: None,
             snapshot: None,
-            prepared: Keyed::default(),
-            cancels: Keyed::default(),
-            waiting: Keyed::default(),
-            answers: Keyed::default(),
+            inflight: Keyed::default(),
             replies: Keyed::default(),
             sides: Keyed::default(),
             tickets: 0,
-            reporting: 0,
-            stopping: false,
+            phase: Phase::Serving,
             listed,
         };
         shared.rt.spawn(Box::pin(actor.run(rx, first)));
@@ -425,35 +426,63 @@ struct Actor {
     replied: Option<(u64, llm::Assistant)>,
     /// The last snapshot made, and its seq; `None` for one too large.
     snapshot: Option<(u64, Option<Frame>)>,
-    /// Each model call's request, prepared and not yet sent: the step
-    /// point's decisions about it are logged in between. `Err` is why
-    /// there is no model to send it to.
-    prepared: Keyed<CallId, Result<(Model, llm::Request, u16), String>>,
-    /// What stops each effect in flight.
-    cancels: Keyed<CallId, Cancel>,
-    /// Calls waiting on a child, for its result.
-    waiting: Keyed<CallId, oneshot::Sender<Json>>,
-    /// What calls run again are handed: the answer they waited on.
-    answers: Keyed<CallId, Json>,
+    /// What each open call has in flight, one thing at a time.
+    inflight: Keyed<CallId, InFlight>,
     replies: Keyed<Ticket, oneshot::Sender<Result<(), String>>>,
     /// Side model requests waiting for their call's id, with the
     /// conversation they asked for.
     sides: Keyed<Ticket, (oneshot::Sender<Opened>, Option<llm::Messages>)>,
     tickets: u64,
-    /// Tool and model calls in flight, each of which reports once.
-    reporting: usize,
-    stopping: bool,
+    phase: Phase,
     /// The session as the catalog last heard of it: busy while work is in
     /// flight, or a call waits on someone. Set before work starts, cleared
     /// after it ends.
     listed: Record,
 }
 
+/// What a call has in flight: the one thing it waits on now.
+enum InFlight {
+    /// A model call's request, prepared and not yet sent: the step point's
+    /// decisions about it are logged in between. `Err` is why there is no
+    /// model to send it to.
+    Prepared(Box<Result<(Model, llm::Request, u16), String>>),
+    /// A model call sent; it reports once, with [`Msg::Replied`].
+    Model,
+    /// A tool call running; it reports once, with [`Event::ToolDone`].
+    Tool(Child),
+    /// A gate, a recovery or a sleep, answered by an event of its own.
+    Later,
+}
+
+/// Where a running tool call stands with the child it asks for.
+enum Child {
+    None,
+    /// It asked, and waits for the result.
+    Waiting(oneshot::Sender<Json>),
+    /// Run again with the answer it waited on, to hand it when it asks.
+    Answered(Json),
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Phase {
+    Serving,
+    /// Stopping: what runs is cancelled, nothing starts, and the actor ends
+    /// once nothing in flight has to report.
+    Draining,
+}
+
 impl Actor {
+    /// Tool and model calls in flight, each of which reports once.
+    fn reporting(&self) -> usize {
+        (self.inflight.values())
+            .filter(|f| matches!(f, InFlight::Model | InFlight::Tool(_)))
+            .count()
+    }
+
     async fn run(mut self, mail: channel::Receiver<Msg>, first: Effects) {
         self.carry(first).await;
         let mut next = None;
-        while !(self.stopping && self.reporting == 0)
+        while !(self.phase == Phase::Draining && self.reporting() == 0)
             && let Some(msg) = match next.take() {
                 Some(msg) => Some(msg),
                 None => mail.recv().await,
@@ -550,11 +579,21 @@ impl Actor {
             }
             Msg::Note { call, note, done } => return Some((Event::Note { call, note }, done)),
             Msg::Child { call, input, reply } => {
-                if let Some(value) = self.answers.remove(&call) {
-                    reply.send(value);
+                // Only a running tool call asks; one run again with the
+                // answer it waited on is handed it.
+                let Some(InFlight::Tool(child)) = self.inflight.get_mut(&call) else {
                     return None;
+                };
+                match std::mem::replace(child, Child::Waiting(reply)) {
+                    Child::Answered(value) => {
+                        let Child::Waiting(reply) = std::mem::replace(child, Child::None) else {
+                            unreachable!()
+                        };
+                        reply.send(value);
+                        return None;
+                    }
+                    Child::None | Child::Waiting(_) => {}
                 }
-                self.waiting.insert(call, reply);
                 Event::Spawn {
                     call,
                     child: SessionId::new(),
@@ -567,8 +606,7 @@ impl Actor {
                 replied,
                 message,
             } => {
-                self.reporting -= 1;
-                self.cancels.remove(&call);
+                self.inflight.remove(&call);
                 self.replied = message.map(|m| (call.get(), m));
                 Event::ModelDone { call, replied }
             }
@@ -596,16 +634,18 @@ impl Actor {
                 return None;
             }
             Msg::Stop => {
-                self.stopping = true;
-                for cancel in self.cancels.values() {
-                    cancel.set();
-                }
+                self.phase = Phase::Draining;
+                self.live.session.cancel_all();
                 return None;
             }
         };
-        if let Event::ToolDone { call, .. } = &event {
-            self.reporting -= 1;
-            self.cancels.remove(call);
+        // What was in flight reported, or was answered.
+        if let Event::ToolDone { call, .. }
+        | Event::Gated { call, .. }
+        | Event::Recovered { call, .. }
+        | Event::Woke { call } = &event
+        {
+            self.inflight.remove(call);
         }
         Some((event, None))
     }
@@ -680,7 +720,8 @@ impl Actor {
     /// effects among them, which then run in order. Whatever the steps
     /// `fx` came from, a burst costs one commit, and each intent is still
     /// durable before the work it names. Only a kill, of a process group
-    /// whose call the entries after it settle, and a busy mark, set before
+    /// whose call the entries after it settle, a cancel, which the kernel
+    /// orders before the outcome it then logs, and a busy mark, set before
     /// the work it marks, go before what was appended ahead of them is
     /// committed. A commit that fails drops the rest and resumes from what
     /// the log holds.
@@ -696,7 +737,7 @@ impl Actor {
                     }
                     self.effect(effect);
                 }
-                Effect::MarkBusy(true) => self.effect(effect),
+                Effect::MarkBusy(true) | Effect::Cancel { .. } => self.effect(effect),
                 effect => after.push(effect),
             }
         }
@@ -738,12 +779,9 @@ impl Actor {
     /// cancelled, what was asked is answered that the session stopped, and
     /// the kernel is rebuilt from the committed log, as a load rebuilds it.
     async fn resume(&mut self) {
-        for cancel in self.cancels.values() {
-            cancel.set();
-        }
+        self.live.session.cancel_all();
         self.replies.clear();
-        self.waiting.clear();
-        self.prepared.clear();
+        self.inflight.clear();
         self.bound = bind(&self.registry, &self.live.session);
         let bound = Arc::clone(&self.bound) as Arc<dyn Binding>;
         let load = Load {
@@ -763,7 +801,7 @@ impl Actor {
             Err(panic) => {
                 let why = panicked(&*panic);
                 eprintln!("session {}: resuming {why}", self.live.id.short());
-                self.stopping = true;
+                self.phase = Phase::Draining;
             }
         }
     }
@@ -864,7 +902,8 @@ impl Actor {
                 && let Some(call) = CallId::new(*call)
             {
                 // Settled: what still runs of it is let go.
-                self.waiting.remove(&call);
+                self.inflight.remove(&call);
+                session.forget(call);
                 self.bound.settled(call);
             }
         }
@@ -883,7 +922,7 @@ impl Actor {
         let shared = Arc::clone(&self.live.session.shared);
         // A stopping session starts nothing: what it would have started is
         // in the log, for its next load.
-        if self.stopping && effect.starts() {
+        if self.phase == Phase::Draining && effect.starts() {
             return;
         }
         match effect {
@@ -900,20 +939,22 @@ impl Actor {
                 choice,
             } => self.prepare(call, attempt, choice),
             Effect::Send { call } => self.send(call),
-            Effect::RunTool { call, tool, input } => self.run_tool(call, tool, input),
+            Effect::RunTool { call, tool, input } => self.run_tool(call, tool, input, Child::None),
             Effect::Resume {
                 call,
                 tool,
                 input,
                 value,
-            } => {
-                if let Some(waiting) = self.waiting.remove(&call) {
-                    waiting.send(value);
-                } else {
-                    self.answers.insert(call, value);
-                    self.run_tool(call, tool, input);
+            } => match self.inflight.get_mut(&call) {
+                // Still running, and waiting for it.
+                Some(InFlight::Tool(child @ Child::Waiting(_))) => {
+                    if let Child::Waiting(reply) = std::mem::replace(child, Child::None) {
+                        reply.send(value);
+                    }
                 }
-            }
+                // Run again, from a log that holds the answer.
+                _ => self.run_tool(call, tool, input, Child::Answered(value)),
+            },
             Effect::Await { call, answer } => {
                 let gated = self.cancellable(call, answer.0);
                 self.later(gated, move |gated| Event::Gated { call, gated });
@@ -930,11 +971,8 @@ impl Actor {
                 self.later(slept, move |()| Event::Woke { call });
             }
             Effect::Cancel { call } => {
-                if let Some(cancel) = self.cancels.remove(&call) {
-                    cancel.set();
-                }
-                self.waiting.remove(&call);
-                self.prepared.remove(&call);
+                self.inflight.remove(&call);
+                self.live.session.cancelled(call);
             }
             Effect::StartChild { link, child, input } => self.start_child(link, child, input),
             Effect::Interrupt { child } => {
@@ -1030,8 +1068,8 @@ impl Actor {
         call: CallId,
         work: impl Future<Output = T> + Send + 'static,
     ) -> impl Future<Output = Option<T>> + Send + 'static {
-        let cancel = Cancel::default();
-        self.cancels.insert(call, cancel.clone());
+        let cancel = self.live.session.cancel(call);
+        self.inflight.insert(call, InFlight::Later);
         async move { unless(&cancel, work).await }
     }
 
@@ -1070,12 +1108,14 @@ impl Actor {
                     (by, replied)
                 });
                 if answered.is_none() {
-                    self.prepared.insert(call, Ok((model, request, attempt)));
+                    let prepared = InFlight::Prepared(Box::new(Ok((model, request, attempt))));
+                    self.inflight.insert(call, prepared);
                 }
                 (decisions, answered)
             }
             Err(error) => {
-                self.prepared.insert(call, Err(error));
+                self.inflight
+                    .insert(call, InFlight::Prepared(Box::new(Err(error))));
                 (Vec::new(), None)
             }
         };
@@ -1090,15 +1130,14 @@ impl Actor {
     /// Sends the request prepared for model call `call`, its text
     /// streaming to followers under its attempt.
     fn send(&mut self, call: CallId) {
-        let Some(prepared) = self.prepared.remove(&call) else {
+        let Some(InFlight::Prepared(prepared)) = self.inflight.remove(&call) else {
             return;
         };
-        let cancel = Cancel::default();
-        self.cancels.insert(call, cancel.clone());
-        self.reporting += 1;
+        let cancel = self.live.session.cancel(call);
+        self.inflight.insert(call, InFlight::Model);
         let live = Arc::clone(&self.live);
         self.live.session.shared.rt.spawn(Box::pin(async move {
-            let (replied, message) = match prepared {
+            let (replied, message) = match *prepared {
                 Ok((model, request, attempt)) => {
                     let mut deltas = |text: &str| live.delta(call, attempt, text);
                     let replying: BoxFuture<'_, _> =
@@ -1146,10 +1185,9 @@ impl Actor {
     /// Runs tool call `call`, the model's or a user's command, on its
     /// input as read at its intent if the gate left it as it was,
     /// reporting its outcome.
-    fn run_tool(&mut self, call: CallId, tool: String, input: Json) {
-        let cancel = Cancel::default();
-        self.cancels.insert(call, cancel.clone());
-        self.reporting += 1;
+    fn run_tool(&mut self, call: CallId, tool: String, input: Json, child: Child) {
+        let cancel = self.live.session.cancel(call);
+        self.inflight.insert(call, InFlight::Tool(child));
         let registry = Arc::clone(&self.registry);
         let parsed = self.bound.take_parsed(call, &input);
         let cx = self.live.session.cx(call, &registry, cancel);
@@ -1249,6 +1287,14 @@ impl<K: PartialEq, V> Keyed<K, V> {
         Some(self.0.swap_remove(at).1)
     }
 
+    fn get(&self, key: &K) -> Option<&V> {
+        self.0.iter().find(|(k, _)| k == key).map(|(_, v)| v)
+    }
+
+    fn get_mut(&mut self, key: &K) -> Option<&mut V> {
+        self.0.iter_mut().find(|(k, _)| k == key).map(|(_, v)| v)
+    }
+
     fn values(&self) -> impl Iterator<Item = &V> {
         self.0.iter().map(|(_, v)| v)
     }
@@ -1306,6 +1352,40 @@ impl Live {
 }
 
 impl Session {
+    /// What stops call `call`'s work: the one cancel it has while open,
+    /// made as the first of its work asks for it.
+    fn cancel(&self, call: CallId) -> Cancel {
+        let mut cancels = lock(&self.cancels);
+        if let Some(cancel) = cancels.get(&call) {
+            return cancel.clone();
+        }
+        let cancel = Cancel::default();
+        cancels.insert(call, cancel.clone());
+        cancel
+    }
+
+    /// Stops everything in flight for call `call`; work it starts after
+    /// this gets a cancel of its own.
+    fn cancelled(&self, call: CallId) {
+        if let Some(cancel) = lock(&self.cancels).remove(&call) {
+            cancel.set();
+        }
+    }
+
+    /// Call `call` settled: what it still has running is on its own (a
+    /// side request asked beside it finishes), and nothing more of it is
+    /// stopped.
+    fn forget(&self, call: CallId) {
+        lock(&self.cancels).remove(&call);
+    }
+
+    /// Stops every call's work.
+    fn cancel_all(&self) {
+        for cancel in lock(&self.cancels).values() {
+            cancel.set();
+        }
+    }
+
     /// What call `call` runs with, on `registry`, stopped by `cancel`.
     fn cx(self: &Arc<Self>, call: CallId, registry: &Arc<Registry>, cancel: Cancel) -> Cx {
         Parts {
@@ -1405,9 +1485,11 @@ impl View for Viewed {
         lock(&self.0.env).clone().map(Arc::new)
     }
 
+    /// With the call's own cancel: work a handler takes it along to ends
+    /// with the call.
     fn cx(&self, call: CallId) -> Option<Cx> {
         let registry = self.0.shared.registry.get();
-        Some(self.0.cx(call, &registry, Cancel::default()))
+        Some(self.0.cx(call, &registry, self.0.cancel(call)))
     }
 }
 
@@ -1566,39 +1648,53 @@ impl ext::Models for Own {
             request.model = model.id();
             request.generation.max_output_tokens =
                 std::num::NonZeroU32::new(side.budget.max_tokens);
-            // Read as the call's own replies are, with nothing streamed.
-            let mut quiet = |_: &str| {};
-            let asked = reply(&model, &request, &cx.cancel, &mut quiet);
+            // Logged as intent, it is seen through to its outcome by a task
+            // of its own, stopped by the call's cancel: a handler that
+            // drops its answer does not leave the side call open.
+            let (answered, answer) = oneshot::channel();
             let timeout = session.shared.rt.sleep(side.budget.timeout);
-            let (outcome, answer) = match first(asked, timeout).await.map(|(replied, _)| replied) {
-                Some(Replied::Done(output)) => {
-                    let answer = llm::Response::from_json(output.raw())
-                        .map_err(|e| llm::Error::new(llm::Kind::Decode, e.to_string()));
-                    (Outcome::Done { output }, answer)
-                }
-                Some(Replied::Failed(error)) => {
-                    let failed = Outcome::Failed {
-                        error: error.to_string(),
-                    };
-                    (failed, Err(error))
-                }
-                Some(Replied::Interrupted(output)) => {
-                    let error = llm::Error::new(llm::Kind::Incomplete, "the call ended first");
-                    (Outcome::Interrupted { output }, Err(error))
-                }
-                None => {
-                    let error = llm::Error::new(llm::Kind::Transport, "the side request timed out");
-                    let failed = Outcome::Failed {
-                        error: error.to_string(),
-                    };
-                    (failed, Err(error))
-                }
-            };
-            let _ = session
-                .mail
-                .send(Msg::Step(Event::SideDone { side: id, outcome }));
+            let (cancel, mail) = (cx.cancel.clone(), Arc::clone(&session.mail));
+            session.shared.rt.spawn(Box::pin(async move {
+                // Read as the call's own replies are, with nothing streamed.
+                let mut quiet = |_: &str| {};
+                let asked = reply(&model, &request, &cancel, &mut quiet);
+                let (outcome, answer) = sided(first(asked, timeout).await.map(|(r, _)| r));
+                let _ = mail.send(Msg::Step(Event::SideDone { side: id, outcome }));
+                answered.send(answer);
+            }));
             answer
+                .await
+                .unwrap_or_else(|| Err(llm::Error::new(llm::Kind::Incomplete, "not answered")))
         })
+    }
+}
+
+/// What a side request's reply, or its timing out, is logged as and
+/// answered with.
+fn sided(replied: Option<Replied>) -> (Outcome, Result<llm::Response, llm::Error>) {
+    match replied {
+        Some(Replied::Done(output)) => {
+            let answer = llm::Response::from_json(output.raw())
+                .map_err(|e| llm::Error::new(llm::Kind::Decode, e.to_string()));
+            (Outcome::Done { output }, answer)
+        }
+        Some(Replied::Failed(error)) => {
+            let failed = Outcome::Failed {
+                error: error.to_string(),
+            };
+            (failed, Err(error))
+        }
+        Some(Replied::Interrupted(output)) => {
+            let error = llm::Error::new(llm::Kind::Incomplete, "the call ended first");
+            (Outcome::Interrupted { output }, Err(error))
+        }
+        None => {
+            let error = llm::Error::new(llm::Kind::Transport, "the side request timed out");
+            let failed = Outcome::Failed {
+                error: error.to_string(),
+            };
+            (failed, Err(error))
+        }
     }
 }
 
