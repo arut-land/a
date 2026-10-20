@@ -11,7 +11,7 @@ use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 use std::time::SystemTime;
 
-use protocol::{Environment, HomeSettings, Overrides, SettingsChange};
+use protocol::{Environment, HomeSettings, SettingsChange};
 
 use crate::lock;
 
@@ -113,8 +113,6 @@ pub enum Source {
     Default,
     Home,
     Workspace,
-    /// The session's own, set by its entry `seq`.
-    Session(u64),
 }
 
 impl fmt::Display for Source {
@@ -123,12 +121,12 @@ impl fmt::Display for Source {
             Self::Default => f.write_str("the built-in default"),
             Self::Home => f.write_str("the home config.toml"),
             Self::Workspace => f.write_str("the workspace's .a/config.toml"),
-            Self::Session(seq) => write!(f, "this session, at entry {seq}"),
         }
     }
 }
 
-/// The layers, and the overrides on top of them.
+/// The layers: a session's own choice, if an extension keeps one, sits
+/// on top of them ([`ext::ModelSpec`]).
 pub struct Settings {
     /// `$A_HOME/config.toml`.
     pub home: Watched,
@@ -171,23 +169,10 @@ impl Settings {
         named(&self.workspace(workspace)).or_else(|| named(&self.home.get()))
     }
 
-    /// The model spec for a session in `workspace` that sets none itself.
-    pub fn model(&self, workspace: &Path) -> Result<String, String> {
-        self.model_in(workspace, (Overrides::default(), None))
-            .map(|(model, _)| model)
-    }
-
-    /// The model spec for a session in `workspace` with its own settings
-    /// `session` (and the seq of the entry that set them), and the layer
-    /// that named it: the session's own over every other.
-    pub fn model_in(
-        &self,
-        workspace: &Path,
-        session: (Overrides, Option<u64>),
-    ) -> Result<(String, Source), String> {
-        if let (Overrides { model: Some(model) }, seq) = session {
-            return Ok((model, Source::Session(seq.unwrap_or_default())));
-        }
+    /// The model spec the layers name for a session in `workspace`, and
+    /// the layer that names it: the workspace's file over the home file
+    /// over the default.
+    pub fn model(&self, workspace: &Path) -> Result<(String, Source), String> {
         let local = self.workspace(workspace);
         if let Some(model) = &local.as_ref().as_ref().map_err(Clone::clone)?.model {
             return Ok((model.clone(), Source::Workspace));
@@ -215,3 +200,10 @@ impl Settings {
 
 #[cfg(test)]
 mod tests;
+
+/// The layers as every extension asks them.
+impl ext::Layers for Settings {
+    fn model(&self, workspace: &Path) -> Result<(String, String), String> {
+        Self::model(self, workspace).map(|(model, from)| (model, from.to_string()))
+    }
+}

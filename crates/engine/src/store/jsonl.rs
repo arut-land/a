@@ -93,7 +93,7 @@ impl LogStore for Jsonl {
         let mut index = Index::new(file, 0);
         let mut floor = 0;
         let kept = index.scan(|entry| {
-            floor = entry.epoch;
+            floor = entry.epoch.0;
             each(entry);
         })?;
         let seq = index.read().len() as u64;

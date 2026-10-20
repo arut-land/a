@@ -1,11 +1,15 @@
 //! `title`: a session is titled by its model, asked aside as its first
 //! model call goes out. The title is the side request's reply, logged as
-//! its outcome: clients read it from there (`SessionView::title`), so no
-//! extension state holds it twice. The `titled` fold keeps a session from
-//! being titled again.
+//! its outcome: clients read it from there (`SessionView::side(PURPOSE)`),
+//! so no extension state holds it twice. The `titled` fold keeps a
+//! session from being titled again.
 
 use ext::point::Step;
 use ext::{Budget, Extension, Fold, Registrar, Rewrite, Side};
+
+/// The purpose the side request is logged with: what a client asks the
+/// view for.
+pub const PURPOSE: &str = "title";
 
 /// What the model is asked.
 const TITLE: &str = "Name this conversation in at most six words, for a list of sessions: the task, not the tools. Answer with the name alone.";
@@ -43,7 +47,7 @@ impl Extension for Title {
                 rt.spawn(Box::pin(async move {
                     let Some(models) = cx.models() else { return };
                     let ask = [llm::Message::user(TITLE)].into_iter().collect();
-                    let mut side = Side::new(protocol::view::TITLE, ask).after_the_conversation();
+                    let mut side = Side::new(PURPOSE, ask).after_the_conversation();
                     side.budget = Budget {
                         max_tokens: 32,
                         ..Budget::default()

@@ -2,7 +2,7 @@
 //! commands that every client (the terminal, the line REPL, the web page,
 //! the apps through their FFI) parses typed lines with.
 
-use protocol::{CommandInfo, Target};
+use protocol::{CallId, CommandInfo, Target};
 
 /// A person's intent: from a typed line, a key or a button.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -13,7 +13,7 @@ pub enum Cmd {
     /// Input for the running turn, before its next step.
     Steer(String),
     Approve {
-        call: u64,
+        call: CallId,
         approved: bool,
     },
     Interrupt,
@@ -107,7 +107,7 @@ pub const COMMANDS: &[Command] = &[
 
 /// What `line` asks for; `None` for a blank one. While call `asking` waits
 /// for this client's answer, `y`/`yes` and `n`/`no` answer it.
-pub fn parse(line: &str, asking: Option<u64>) -> Option<Cmd> {
+pub fn parse(line: &str, asking: Option<CallId>) -> Option<Cmd> {
     let line = line.trim();
     if line.is_empty() {
         return None;
@@ -156,9 +156,10 @@ mod tests {
 
     #[test]
     fn the_command_table_is_the_only_parser() {
-        let cases: &[(&str, Option<u64>, Option<Cmd>)] = &[
+        let seven = CallId::new(7);
+        let cases: &[(&str, Option<CallId>, Option<Cmd>)] = &[
             ("", None, None),
-            ("   ", Some(3), None),
+            ("   ", CallId::new(3), None),
             ("/detach", None, Some(Cmd::Detach)),
             ("/quit", None, Some(Cmd::Detach)),
             (" /exit ", None, Some(Cmd::Detach)),
@@ -179,17 +180,17 @@ mod tests {
             ("y", None, Some(Cmd::Input("y".into()))),
             (
                 "y",
-                Some(7),
+                seven,
                 Some(Cmd::Approve {
-                    call: 7,
+                    call: seven.unwrap(),
                     approved: true,
                 }),
             ),
             (
                 "no",
-                Some(7),
+                seven,
                 Some(Cmd::Approve {
-                    call: 7,
+                    call: seven.unwrap(),
                     approved: false,
                 }),
             ),

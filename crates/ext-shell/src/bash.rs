@@ -26,7 +26,7 @@ use std::process::{Child, Command as Process, ExitStatus, Stdio};
 use std::task::Poll;
 use std::time::{Duration, Instant};
 
-use protocol::{Card, Environment};
+use protocol::{Card, Environment, Mark};
 use serde::{Deserialize, Serialize};
 use sys::Signal;
 
@@ -156,6 +156,7 @@ impl Tool for Bash {
             title: title(input),
             body: ran.output.clone(),
             note: note(ran),
+            mark: mark(ran),
         })
     }
 }
@@ -190,6 +191,23 @@ fn note(ran: &Ran) -> String {
         _ => {}
     }
     note.join(" · ")
+}
+
+/// How the command went, as only its exit status says: a nonzero exit, a
+/// signal, a timeout or an abort is a failure; stopped for flooding, a
+/// warning.
+fn mark(ran: &Ran) -> Mark {
+    let failed = ran.exit.is_some_and(|code| code != 0)
+        || ran.signal.is_some()
+        || ran.timed_out.is_some()
+        || ran.aborted;
+    if failed {
+        Mark::Bad
+    } else if ran.flooded.is_some() {
+        Mark::Warn
+    } else {
+        Mark::Ok
+    }
 }
 
 /// What the model reads: the output, then what became of the command,

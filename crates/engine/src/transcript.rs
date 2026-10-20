@@ -7,7 +7,7 @@ use std::sync::Arc;
 
 use ext::host::Registry;
 use llm::{Assistant, Message, Messages, ToolMessage, ToolResult};
-use protocol::{Body, Entry, Outcome, Verdict};
+use protocol::{Body, CallId, Entry, Outcome, Seq, Verdict};
 
 /// The conversation the model sees, folded from the log's facts as they
 /// commit, so that a model call reads it rather than the log. A model
@@ -22,16 +22,16 @@ pub struct Transcript {
     context: usize,
     /// The model's id and the tool of each call the model made and that is
     /// not yet answered, by seq.
-    calls: HashMap<u64, (String, String)>,
+    calls: HashMap<CallId, (String, String)>,
     /// The calls the last message answers, by seq, in the order it does:
     /// the calls' order, whatever order they ended in, so the request is
     /// the same however a run went.
-    answered: Vec<u64>,
+    answered: Vec<CallId>,
     /// Input waiting to be taken up, by seq: the user's once it is.
-    waiting: HashMap<u64, String>,
+    waiting: HashMap<Seq, String>,
     /// Side model requests not yet answered, by seq: their replies are
     /// their extensions', not the conversation's.
-    sides: Vec<u64>,
+    sides: Vec<CallId>,
     /// The seq of the last entry that changed the messages.
     last: u64,
     registry: Arc<Registry>,
@@ -77,12 +77,12 @@ impl Transcript {
             let edit = edits
                 .iter()
                 .rev()
-                .find(|(from, to, _)| (*from..=*to).contains(&e.seq));
+                .find(|(from, to, _)| (*from..=*to).contains(&e.seq.get()));
             match edit {
                 None => transcript.apply(e, None),
-                Some((from, _, Some(text))) if *from == e.seq => {
+                Some((from, _, Some(text))) if *from == e.seq.get() => {
                     transcript.messages.push(Message::user(text.clone()));
-                    transcript.last = e.seq;
+                    transcript.last = e.seq.get();
                 }
                 Some(_) => {}
             }
@@ -105,7 +105,7 @@ impl Transcript {
                 self.waiting.insert(e.seq, text.clone());
                 return;
             }
-            Body::Take { input } => match self.waiting.remove(&input.get()) {
+            Body::Take { input } => match self.waiting.remove(input) {
                 Some(text) => Message::user(text),
                 None => return,
             },
@@ -114,12 +114,12 @@ impl Transcript {
                 self.messages
                     .insert(self.context, Message::user(text.clone()));
                 self.context += 1;
-                self.last = e.seq;
+                self.last = e.seq.get();
                 return;
             }
             Body::Fired { outcome, .. } => Message::user(ext::child_result(outcome)),
             Body::ModelCall { r#for: Some(_), .. } => {
-                self.sides.push(e.seq);
+                self.sides.push(CallId(e.seq));
                 return;
             }
             Body::ModelResult { call, .. } if self.sides.contains(call) => {
@@ -142,7 +142,7 @@ impl Transcript {
             Body::ToolCall {
                 tool, id: Some(id), ..
             } => {
-                self.calls.insert(e.seq, (id.clone(), tool.clone()));
+                self.calls.insert(CallId(e.seq), (id.clone(), tool.clone()));
                 return;
             }
             Body::ToolResult { call, outcome, .. } => {
@@ -157,7 +157,7 @@ impl Transcript {
                     error,
                     meta: llm::Meta::new(),
                 };
-                self.last = e.seq;
+                self.last = e.seq.get();
                 // Only a tool message changes to take the result.
                 if let Some(Message::Tool(answers)) = self.messages.last_mut() {
                     let at = self.answered.partition_point(|&seq| seq < *call);
@@ -174,7 +174,7 @@ impl Transcript {
             _ => return,
         };
         self.messages.push(message);
-        self.last = e.seq;
+        self.last = e.seq.get();
     }
 
     /// Whether the tools of `registry` presented the results.

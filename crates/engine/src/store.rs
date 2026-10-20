@@ -91,7 +91,7 @@ impl Writer {
     /// only written, to be durable with the next durable append.
     pub fn append(&mut self, entries: &mut [Entry], durable: bool) -> io::Result<()> {
         for e in &mut *entries {
-            e.epoch = self.epoch;
+            e.epoch = protocol::Epoch(self.epoch);
         }
         if durable {
             self.log.append_all(entries)

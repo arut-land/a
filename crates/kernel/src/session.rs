@@ -323,7 +323,7 @@ impl Core {
         origin: Option<Author>,
         fx: &mut Effects,
     ) -> Result<(), String> {
-        let on = match self.fold.ledger.call(call.get()).map(|open| &open.phase) {
+        let on = match self.fold.ledger.call(call).map(|open| &open.phase) {
             Some(Phase::Waiting(on)) if !matches!(on, WaitOn::Child { .. }) => on.clone(),
             _ => return Err(format!("call {call} is not waiting for an answer")),
         };
@@ -464,10 +464,9 @@ impl Core {
 
     /// Logs side request `side`'s outcome, unless it has one.
     fn side_done(&mut self, side: CallId, outcome: Outcome, fx: &mut Effects) {
-        let open = self.fold.ledger.call(side.get()).map(|open| &open.call);
+        let open = self.fold.ledger.call(side).map(|open| &open.call);
         if matches!(open, Some(Call::Side { .. })) {
-            let call = side.get();
-            self.append(fx, Body::ModelResult { call, outcome });
+            self.append(fx, Body::ModelResult { call: side, outcome });
         }
     }
 
@@ -480,7 +479,7 @@ impl Core {
         model: String,
         fx: &mut Effects,
     ) -> Option<CallId> {
-        let owner = self.fold.ledger.call(of.get())?;
+        let owner = self.fold.ledger.call(of)?;
         if matches!(owner.call, Call::Side { .. }) {
             return None;
         }
@@ -496,7 +495,7 @@ impl Core {
 
     /// Sends model call `call` again, as attempt `attempt`.
     fn again(&mut self, call: CallId, attempt: u16, fx: &mut Effects) {
-        let choice = match self.fold.ledger.call(call.get()).map(|open| &open.call) {
+        let choice = match self.fold.ledger.call(call).map(|open| &open.call) {
             Some(&Call::Model { choice, .. }) => choice,
             _ => ToolChoice::Auto,
         };
@@ -533,7 +532,7 @@ impl Core {
         self.append(
             fx,
             Body::ToolResult {
-                call: call.get(),
+                call,
                 outcome,
                 card,
             },
@@ -562,13 +561,13 @@ impl Core {
                 boot,
                 background,
             } => Body::ToolProcess {
-                call: call.get(),
+                call,
                 pgid,
                 boot,
                 background,
             },
             Note::Progress(text) => Body::Progress {
-                call: call.get(),
+                call,
                 text,
             },
             Note::State { ext, state, data } => Body::Ext { ext, state, data },
@@ -658,7 +657,7 @@ impl Core {
 
     /// Logs each armed watch on `child` fired; whether any was.
     fn fire(&mut self, child: SessionId, outcome: &Outcome, fx: &mut Effects) -> bool {
-        let watches: SmallVec<[u64; 1]> = (self.fold.ledger.armed())
+        let watches: SmallVec<[Seq; 1]> = (self.fold.ledger.armed())
             .filter_map(|(watch, watched)| (watched == child).then_some(watch))
             .collect();
         for &watch in &watches {
@@ -710,7 +709,7 @@ impl Core {
                 .ledger
                 .untaken()
                 .front()
-                .and_then(|q| Seq::new(q.seq))
+                .map(|q| q.seq)
             {
                 self.resolve(fx);
                 self.turn = Turn::Acting {
@@ -763,7 +762,7 @@ impl Core {
                 // next asked.
                 let steers: SmallVec<[Seq; 2]> = (self.fold.ledger.untaken().iter())
                     .filter(|q| q.steer)
-                    .filter_map(|q| Seq::new(q.seq))
+                    .map(|q| q.seq)
                     .collect();
                 for input in steers {
                     self.append(fx, Body::Take { input });
@@ -888,7 +887,7 @@ impl Core {
             }
             Gate::Ask => {
                 let asked = matches!(
-                    self.fold.ledger.call(call.get()).map(|open| &open.phase),
+                    self.fold.ledger.call(call).map(|open| &open.phase),
                     Some(Phase::Waiting(WaitOn::Approval))
                 );
                 if !asked {
@@ -1033,14 +1032,12 @@ impl Core {
         fx.extend(kills.into_iter().map(|pgid| Effect::Kill { pgid }));
         self.relink(fx);
         // A command cut off is not run again.
-        let commands: SmallVec<[u64; 1]> = self.fold.ledger.open_commands().collect();
-        for call in commands.into_iter().filter_map(CallId::new) {
+        let commands: SmallVec<[CallId; 1]> = self.fold.ledger.open_commands().collect();
+        for call in commands {
             self.settle(call, self.interrupted(call), fx);
         }
         let open: Vec<(CallId, Call, Phase)> = (self.fold.ledger.open_calls())
-            .filter_map(|(seq, open)| {
-                Some((CallId::new(seq)?, open.call.clone(), open.phase.clone()))
-            })
+            .map(|(call, open)| (call, open.call.clone(), open.phase.clone()))
             .collect();
         if !open.is_empty() || !self.fold.asked.is_empty() {
             self.turn = Turn::Acting {
@@ -1076,17 +1073,14 @@ impl Core {
             .filter_map(|link| {
                 let watched = ledger.watched(link.child);
                 let armed = ledger.armed().any(|(_, child)| child == link.child);
-                (armed || !watched)
-                    .then(|| (Seq::new(link.seq), link.child, link.input.clone(), watched))
+                (armed || !watched).then(|| (link.seq, link.child, link.input.clone(), watched))
             })
             .collect();
         for (link, child, input, watched) in links {
             if !watched {
                 self.append(fx, Body::Watch { child });
             }
-            if let Some(link) = link {
-                fx.push(Effect::StartChild { link, child, input });
-            }
+            fx.push(Effect::StartChild { link, child, input });
         }
     }
 
@@ -1156,11 +1150,11 @@ impl Core {
 
     /// Numbers `body` next, folds it and has it appended; its seq.
     fn append(&mut self, fx: &mut Effects, body: Body) -> CallId {
-        let seq = self.fold.ledger.seq() + 1;
-        let entry = Entry::new(seq, 0, body);
+        let seq = Seq::new(self.fold.ledger.seq() + 1).expect("an entry after the last has a seq");
+        let entry = Entry::new(seq, protocol::Epoch::default(), body);
         self.fold.apply(&entry, &*self.registry);
         fx.push(Effect::Append(entry));
-        CallId::new(seq).expect("an entry after the last has a seq")
+        CallId(seq)
     }
 
     fn decide(&mut self, call: Option<CallId>, by: &str, d: Verdict, fx: &mut Effects) {
@@ -1174,8 +1168,8 @@ impl Core {
     /// end as they do.
     fn settle(&mut self, call: CallId, outcome: Outcome, fx: &mut Effects) {
         let done = matches!(outcome, Outcome::Done { .. });
-        let sides: SmallVec<[u64; 1]> = (self.fold.ledger.open_calls())
-            .filter(|(_, open)| !done && open.call == Call::Side { of: call.get() })
+        let sides: SmallVec<[CallId; 1]> = (self.fold.ledger.open_calls())
+            .filter(|(_, open)| !done && open.call == Call::Side { of: call })
             .map(|(seq, _)| seq)
             .collect();
         for side in sides {
@@ -1188,13 +1182,13 @@ impl Core {
                 },
             );
         }
-        let body = match self.fold.ledger.call(call.get()).map(|open| &open.call) {
+        let body = match self.fold.ledger.call(call).map(|open| &open.call) {
             Some(Call::Model { .. } | Call::Side { .. }) => Body::ModelResult {
-                call: call.get(),
+                call,
                 outcome,
             },
             Some(Call::Tool { .. }) => Body::ToolResult {
-                call: call.get(),
+                call,
                 outcome,
                 card: None,
             },
@@ -1205,7 +1199,7 @@ impl Core {
 
     /// An interrupted outcome for call `call`, with the output it logged.
     fn interrupted(&self, call: CallId) -> Outcome {
-        let output = (self.fold.ledger.call(call.get())).and_then(|open| open.progress.clone());
+        let output = (self.fold.ledger.call(call)).and_then(|open| open.progress.clone());
         Outcome::Interrupted { output }
     }
 
@@ -1222,7 +1216,7 @@ impl Core {
 
     /// The tool and input call `call` runs with: as its gate left it.
     fn tool_of(&self, call: CallId) -> Option<(String, Json)> {
-        match &self.fold.ledger.call(call.get())?.call {
+        match &self.fold.ledger.call(call)?.call {
             Call::Tool { tool, input, .. } => {
                 let input = self.fold.input_of(call).unwrap_or(input);
                 Some((tool.clone(), input.clone()))
@@ -1240,10 +1234,10 @@ impl Core {
     /// The child call `call` waits on.
     fn child_of(&self, call: CallId) -> Option<SessionId> {
         let ledger = &self.fold.ledger;
-        let Phase::Waiting(WaitOn::Child { link }) = ledger.call(call.get())?.phase else {
+        let Phase::Waiting(WaitOn::Child { link }) = ledger.call(call)?.phase else {
             return None;
         };
-        let link = ledger.links().iter().find(|l| l.seq == link.get())?;
+        let link = ledger.links().iter().find(|l| l.seq == link)?;
         Some(link.child)
     }
 

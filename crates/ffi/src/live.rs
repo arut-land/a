@@ -393,6 +393,9 @@ impl Session {
 
     /// Answers the ask for tool call `call`.
     pub async fn approve(&self, call: u64, approved: bool) -> Result<(), ClientError> {
+        let call = protocol::CallId::new(call).ok_or_else(|| ClientError::InvalidArgument {
+            message: "call 0 names no call".to_owned(),
+        })?;
         self.run(Cmd::Approve { call, approved }).await
     }
 

@@ -145,7 +145,7 @@ impl App {
                 None => done(false),
             },
             (&Method::POST, "/api/approve", _) => {
-                let call = param(query, "call").and_then(|c| c.parse().ok());
+                let call = param(query, "call").and_then(|c| c.parse().ok().and_then(protocol::CallId::new));
                 let approved = param(query, "ok") == Some("1");
                 match (signals(&body), call) {
                     (Some(Signals { tab, .. }), Some(call)) => {

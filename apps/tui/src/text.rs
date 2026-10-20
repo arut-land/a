@@ -1,16 +1,15 @@
-//! Styled text: spans, word wrapping by display width, and the little
-//! markdown a reply gets (headings, bullets, quotes, code, bold).
+//! Styled text: spans, and word wrapping by display width.
 
 use unicode_width::UnicodeWidthChar;
 
-use ratatui_core::style::{Color, Style};
+use ratatui_core::style::Style;
 
 /// What a click on a span does.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Action {
     /// Collapses or expands tool call `call`'s card.
-    Toggle(u64),
-    Approve(u64, bool),
+    Toggle(protocol::Seq),
+    Approve(protocol::CallId, bool),
     /// Opens session `n` of the picker.
     Pick(usize),
     NewSession,
@@ -223,125 +222,8 @@ fn push(line: &mut Line, from: &Span, text: &str) {
     }
 }
 
-pub const CODE: Style = Style::new().fg(Color::Cyan);
-
-/// A reply's markdown as rows: `#` headings bold, `-`/`*` bullets as `•`,
-/// `>` quotes, fenced code verbatim, and `**bold**` and `` `code` `` inline.
-pub fn markdown(text: &str, width: usize, base: Style) -> Vec<Line> {
-    let mut out = Vec::new();
-    markdown_into(&mut out, &sanitize(text), width, base, &mut false);
-    out
-}
-
-/// [`markdown`] of sanitized `text`, appended to `out`; `fenced` says
-/// whether it starts inside a code fence, and is left as it ends.
-pub fn markdown_into(
-    out: &mut Vec<Line>,
-    text: &str,
-    width: usize,
-    base: Style,
-    fenced: &mut bool,
-) {
-    for raw in text.split('\n') {
-        let trimmed = raw.trim_start();
-        if trimmed.starts_with("```") {
-            *fenced = !*fenced;
-            out.push(Line::plain(format!("  {trimmed}"), CODE.dim()));
-            continue;
-        }
-        if *fenced {
-            // Code is not reflowed; long lines are cut by the screen.
-            out.push(Line::plain(format!("  {raw}"), CODE));
-            continue;
-        }
-        let (first, rest, body, style) = if let Some(h) = heading(trimmed) {
-            (
-                vec![Span::new("  ", base)],
-                vec![Span::new("  ", base)],
-                h,
-                base.bold(),
-            )
-        } else if let Some(item) = trimmed
-            .strip_prefix("- ")
-            .or_else(|| trimmed.strip_prefix("* "))
-        {
-            let pad = " ".repeat(raw.len() - trimmed.len());
-            (
-                vec![Span::new(format!("  {pad}• "), base)],
-                vec![Span::new(format!("  {pad}  "), base)],
-                item,
-                base,
-            )
-        } else if let Some(quote) = trimmed.strip_prefix('>') {
-            let bar = Span::new("  │ ", base.dim());
-            (
-                vec![bar.clone()],
-                vec![bar],
-                quote.trim_start(),
-                base.italic(),
-            )
-        } else {
-            (
-                vec![Span::new("  ", base)],
-                vec![Span::new("  ", base)],
-                raw,
-                base,
-            )
-        };
-        out.extend(wrap(&inline(body, style), width, &first, &rest));
-    }
-}
-
-fn heading(line: &str) -> Option<&str> {
-    let hashes = line.bytes().take_while(|&b| b == b'#').count();
-    (1..=6)
-        .contains(&hashes)
-        .then(|| line[hashes..].strip_prefix(' '))
-        .flatten()
-}
-
-/// Inline `**bold**` and `` `code` `` within one line.
-fn inline(text: &str, base: Style) -> Vec<Span> {
-    let mut spans = Vec::new();
-    let mut rest = text;
-    let (mut bold, mut code) = (false, false);
-    let style = |bold: bool, code: bool| match (bold, code) {
-        (_, true) => CODE,
-        (true, false) => base.bold(),
-        (false, false) => base,
-    };
-    while !rest.is_empty() {
-        let next = if code {
-            rest.find('`').map(|i| (i, 1))
-        } else {
-            match (rest.find("**"), rest.find('`')) {
-                (Some(b), Some(c)) if c < b => Some((c, 1)),
-                (Some(b), _) => Some((b, 2)),
-                (None, Some(c)) => Some((c, 1)),
-                (None, None) => None,
-            }
-        };
-        let Some((at, len)) = next else {
-            spans.push(Span::new(rest, style(bold, code)));
-            break;
-        };
-        if at > 0 {
-            spans.push(Span::new(&rest[..at], style(bold, code)));
-        }
-        if len == 1 {
-            code = !code;
-        } else {
-            bold = !bold;
-        }
-        rest = &rest[at + len..];
-    }
-    spans
-}
-
 #[cfg(test)]
 mod tests {
-    use ratatui_core::style::Modifier;
-
     use super::*;
 
     fn texts(lines: &[Line]) -> Vec<String> {
@@ -372,33 +254,6 @@ mod tests {
         let lines = wrap(&spans, 7, &[], &[]);
         assert_eq!(texts(&lines), ["aaa bbb", "ccc"]);
         assert_eq!(lines[1].spans[0].style, bold);
-    }
-
-    #[test]
-    fn markdown_styles_the_common_cases() {
-        let lines = markdown(
-            "# Title\n- one **two** `x`\n```\nfn a()\n```",
-            40,
-            Style::new(),
-        );
-        assert_eq!(
-            texts(&lines),
-            ["  Title", "  • one two x", "  ```", "  fn a()", "  ```"]
-        );
-        assert!(
-            lines[0]
-                .spans
-                .iter()
-                .any(|s| s.style.add_modifier.contains(Modifier::BOLD))
-        );
-        let two = lines[1]
-            .spans
-            .iter()
-            .find(|s| s.text.contains("two"))
-            .unwrap();
-        assert!(two.style.add_modifier.contains(Modifier::BOLD));
-        let x = lines[1].spans.iter().find(|s| s.text == "x").unwrap();
-        assert_eq!(x.style, CODE);
     }
 
     #[test]

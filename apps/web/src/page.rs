@@ -18,7 +18,7 @@ pub struct Page {
     /// The title the page shows.
     titled: Option<String>,
     /// Text streamed since the last patch, for one reply.
-    streamed: Option<(u64, String)>,
+    streamed: Option<(protocol::CallId, String)>,
     /// Events not yet sent.
     out: Vec<u8>,
 }
@@ -157,8 +157,8 @@ impl Page {
                     html: &item,
                 });
             }
-            Change::Updated { item, .. } => {
-                let item = html(ItemRow { item: &item, view });
+            Change::Updated { index, .. } => {
+                let item = html(ItemRow { item: &view.items[index], view });
                 self.patch(&Patch::Replace(&item));
             }
             _ => {}
@@ -177,12 +177,10 @@ impl Page {
 
     /// Shows the session's title again if it changed.
     fn show_title(&mut self) {
-        let title = &self.client.view().title;
-        if *title != self.titled {
-            let span = html(TitleSpan {
-                title: title.as_deref(),
-            });
-            self.titled.clone_from(title);
+        let title = self.client.view().side("title");
+        if title != self.titled.as_deref() {
+            let span = html(TitleSpan { title });
+            self.titled = title.map(str::to_owned);
             self.patch(&Patch::Replace(&span));
         }
     }
@@ -201,7 +199,7 @@ impl Page {
             .as_ref()
             .is_none_or(|s| s.call != call || s.text.len() == text.len());
         if started {
-            let Some(item) = view.items.iter().find(|i| i.key() == call) else {
+            let Some(item) = view.items.iter().find(|i| i.key() == call.0) else {
                 return;
             };
             let item = html(ItemRow { item, view });

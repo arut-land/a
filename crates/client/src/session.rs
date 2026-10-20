@@ -13,9 +13,9 @@
 use std::collections::VecDeque;
 use std::path::PathBuf;
 
-use protocol::view::{Change, SessionList, SessionView, Turn, Update};
+use protocol::view::{Change, SessionList, SessionView, Update};
 use protocol::{
-    ClientMsg, CommandInfo, DaemonMsg, Environment, Mode, Rejection, SessionSummary, Target,
+    Activity, CallId,    ClientMsg, CommandInfo, DaemonMsg, Environment, Mode, Rejection, SessionSummary, Target,
 };
 
 use crate::{Cmd, Diagnosis, Welcome};
@@ -162,7 +162,7 @@ pub struct TurnView {
     /// A call is unsettled.
     pub running: bool,
     /// The oldest call waiting for an approval.
-    pub asking: Option<u64>,
+    pub asking: Option<CallId>,
     pub asks: u32,
     /// An interrupt has something to stop.
     pub can_interrupt: bool,
@@ -196,7 +196,6 @@ pub struct SessionClient {
     /// Mutations sent and not yet answered: one refused because the daemon
     /// was draining is sent again, once, after the reattach.
     unanswered: VecDeque<ClientMsg>,
-    turn: Turn,
 }
 
 const NOT_CONNECTED: &str = "not connected";
@@ -217,7 +216,6 @@ impl SessionClient {
             seq: 0,
             queued: Vec::new(),
             unanswered: VecDeque::new(),
-            turn: Turn::default(),
         }
     }
 
@@ -248,12 +246,11 @@ impl SessionClient {
         matches!(self.link, Link::Live { remote: true, .. })
     }
 
-    pub const fn turn(&self) -> TurnView {
-        let Turn {
-            running,
-            asking,
-            asks,
-        } = self.turn;
+    pub fn turn(&self) -> TurnView {
+        let ledger = &self.view.ledger;
+        let running = ledger.activity() != Activity::Idle;
+        let asking = ledger.inbox().next();
+        let asks = u32::try_from(ledger.inbox().count()).unwrap_or(u32::MAX);
         TurnView {
             running,
             asking,
@@ -456,7 +453,6 @@ impl SessionClient {
                 if let Link::Live { synced, .. } = &mut self.link {
                     *synced = true;
                 }
-                self.turn = self.view.turn();
                 out.push(Effect::View(update));
                 out.push(Effect::Link);
                 return;
@@ -467,7 +463,7 @@ impl SessionClient {
                 out.push(Effect::Link);
                 return;
             }
-            _ => self.turn = self.view.turn(),
+            _ => {}
         }
         out.push(Effect::View(update));
     }
@@ -509,7 +505,9 @@ const fn numbered(msg: &ClientMsg, seq: u64) -> bool {
 mod tests {
     use std::path::PathBuf;
 
-    use protocol::{Audience, Body, CallId, Caps, Entry, Json, Permission, SessionId, Verdict};
+    use protocol::{
+        Audience, Body, CallId, Caps, Entry, Epoch, Json, Permission, Seq, SessionId, Verdict,
+    };
 
     use super::*;
 
@@ -557,8 +555,8 @@ mod tests {
         client.step(msg(
             1,
             DaemonMsg::Entry(Entry::new(
-                1,
-                1,
+                Seq::new(1).unwrap(),
+                Epoch(1),
                 Body::Input {
                     text: "hi".into(),
                     mode: Mode::Queue,
@@ -723,8 +721,8 @@ mod tests {
         client.step(msg(
             1,
             DaemonMsg::Entry(Entry::new(
-                2,
-                1,
+                Seq::new(2).unwrap(),
+                Epoch(1),
                 Body::ToolCall {
                     tool: "bash".into(),
                     input: Json::encode(&serde_json::json!({ "command": "ls" })).unwrap(),
@@ -739,8 +737,8 @@ mod tests {
         client.step(msg(
             1,
             DaemonMsg::Entry(Entry::new(
-                3,
-                1,
+                Seq::new(3).unwrap(),
+                Epoch(1),
                 Body::Decision {
                     by: "policy".into(),
                     call: CallId::new(2),
@@ -750,7 +748,7 @@ mod tests {
                 },
             )),
         ));
-        assert_eq!(client.turn().asking, Some(2));
+        assert_eq!(client.turn().asking, CallId::new(2));
         assert_eq!(client.turn().asks, 1);
     }
 

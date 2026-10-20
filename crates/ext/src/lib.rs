@@ -44,7 +44,7 @@ pub use llm::Json;
 pub use r#loop::{Defaults, LOOP, Loop, LoopPoints, Resume, StepLimit};
 pub use point::{Answer, Asked, Chained, Gate, Gated, Gating, Later, PointCx, Recover, Rewrite};
 pub use schema::Schema;
-pub use service::{Budget, CwdOf, Models, Sessions, Settings, Side, Spawner};
+pub use service::{Budget, CwdOf, Layers, ModelSpec, Models, Sessions, Side, Spawner};
 pub use shape::{Output, Partials, Streamed, stream};
 pub use state::{Fold, States};
 pub use tool::{

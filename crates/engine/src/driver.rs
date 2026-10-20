@@ -31,7 +31,7 @@ use kernel::{
 use protocol::view::SessionView;
 use protocol::{
     Author, Body, CallId, Card, DaemonMsg, Entry, Environment, Frame, Installed, Json, Mode,
-    Outcome, Overrides, ReadOnly, Residency, SessionId, SessionSummary, ToolChoice, Verdict,
+    Outcome, ReadOnly, Residency, SessionId, SessionSummary, ToolChoice, Verdict,
 };
 use rt::{channel, oneshot};
 
@@ -75,8 +75,6 @@ struct Session {
     /// What commands run in: the last client's, secrets included, or after
     /// a restart the last one logged.
     env: Mutex<Option<Environment>>,
-    /// The session's own settings, and the entry that set them.
-    overrides: Mutex<(Overrides, Option<u64>)>,
     /// Background process groups the session owns, until each ends.
     jobs: Mutex<Vec<u32>>,
     shared: Arc<Shared>,
@@ -114,7 +112,7 @@ pub enum Request {
     Interrupt,
     /// The answer to what call `call` waits on.
     Answer {
-        call: u64,
+        call: CallId,
         value: Json,
     },
 }
@@ -224,7 +222,6 @@ impl Live {
             mail: Arc::new(tx),
             states: Mutex::new(registry.states()),
             env: Mutex::default(),
-            overrides: Mutex::default(),
             jobs: Mutex::default(),
             shared: Arc::clone(shared),
         });
@@ -244,7 +241,6 @@ impl Live {
         };
         *lock(&session.states) = states;
         *lock(&session.env) = core.ledger().env().cloned();
-        *lock(&session.overrides) = core.ledger().settings();
         let fresh = lock(&shared.loaded).insert(header.id);
         let listed = (shared.catalog.get(header.id)).unwrap_or_else(|| Record::new(header.clone()));
         let busy = listed.busy;
@@ -440,7 +436,7 @@ struct Actor {
     transcript: Option<Transcript>,
     /// The message of the reply model call `.0` just had, until its
     /// result commits.
-    replied: Option<(u64, llm::Assistant)>,
+    replied: Option<(CallId, llm::Assistant)>,
     /// The last snapshot made, and its seq; `None` for one too large.
     snapshot: Option<(u64, Option<Frame>)>,
     /// What stops each effect in flight.
@@ -583,7 +579,7 @@ impl Actor {
             } => {
                 self.reporting -= 1;
                 self.cancels.remove(&call);
-                self.replied = message.map(|m| (call.get(), m));
+                self.replied = message.map(|m| (call, m));
                 Event::ModelDone { call, replied }
             }
             Msg::Side {
@@ -656,10 +652,6 @@ impl Actor {
             },
             Request::Interrupt => Event::Interrupt { origin, ticket },
             Request::Answer { call, value } => {
-                let Some(call) = CallId::new(call) else {
-                    self.reply(Ticket(self.tickets), Err("no call 0".into()));
-                    return None;
-                };
                 Event::Answer {
                     call,
                     value,
@@ -856,7 +848,7 @@ impl Actor {
             self.transcript = None;
         }
         for e in entries {
-            self.live.frames.push(e.seq);
+            self.live.frames.push(e.seq.get());
             lock(&session.states).apply(e);
             hooks.observe(&session.point(), e);
             let replied = match &e.body {
@@ -866,15 +858,12 @@ impl Actor {
             if let Some(transcript) = &mut self.transcript {
                 transcript.apply(e, replied.map(|(_, m)| m));
             }
-            if let Body::ToolResult { call, .. } | Body::ModelResult { call, .. } = &e.body
-                && let Some(call) = CallId::new(*call)
-            {
+            if let Body::ToolResult { call, .. } | Body::ModelResult { call, .. } = &e.body {
                 // Settled: what still runs of it is let go.
-                self.waiting.remove(&call);
+                self.waiting.remove(call);
             }
         }
         lock(&self.live.followers).retain(|c| c.wake().is_ok());
-        *lock(&session.overrides) = self.core.ledger().settings();
     }
 
     /// The summary as the log now says.
@@ -1177,7 +1166,7 @@ impl Actor {
             messages.clone()
         } else {
             // A call recovery runs after entries it does not see.
-            let before = frames.entries().take_while(|e| e.seq < call.get());
+            let before = frames.entries().take_while(|e| e.seq < call.0);
             Transcript::of(before, Arc::clone(registry), system).into_messages()
         }
     }
@@ -1340,7 +1329,7 @@ impl Live {
     /// Live text of model call `call`'s attempt `attempt`, to followers.
     fn delta(&self, call: CallId, attempt: u16, text: &str) {
         let delta = DaemonMsg::Delta {
-            call: call.get(),
+            call,
             text: text.to_owned(),
             attempt,
         };
@@ -1375,20 +1364,29 @@ impl Session {
         PointCx::new(self.id, &self.workspace, self)
     }
 
-    /// The model the settings and the newest client's environment name
-    /// now, or why there is none.
+    /// The model the session's choice (or the layers) and the newest
+    /// client's environment name now, or why there is none.
     fn model(&self) -> Result<Model, String> {
-        let set = lock(&self.overrides).clone();
+        let (spec, _) = self.chosen()?;
         let env = lock(&self.env).clone();
-        self.shared.models.model(&self.workspace, env.as_ref(), set)
+        self.shared.models.model(env.as_ref(), &spec)
     }
 
-    /// The model spec the settings name now.
+    /// The model spec the session calls, and where it comes from: as the
+    /// extension that lets a session choose says, else as the layers do.
+    fn chosen(&self) -> Result<(String, String), String> {
+        let layers = &self.shared.models.settings;
+        let registry = self.shared.registry.get();
+        match registry.service::<dyn ext::ModelSpec>() {
+            Some(spec) => spec.model(&lock(&self.states), layers, &self.workspace),
+            None => ext::Layers::model(layers, &self.workspace),
+        }
+    }
+
+    /// The model spec the session calls now; `none` while none can be
+    /// read.
     fn model_spec(&self) -> String {
-        let set = lock(&self.overrides).clone();
-        let settings = &self.shared.models.settings;
-        settings
-            .model_in(&self.workspace, set)
+        self.chosen()
             .map_or_else(|_| "none".to_owned(), |(model, _)| model)
     }
 
@@ -1743,7 +1741,7 @@ struct Calling {
 
 /// The services the engine provides a call.
 struct Owned {
-    settings: Arc<dyn ext::Settings>,
+    layers: Arc<dyn ext::Layers>,
     sessions: Arc<dyn ext::Sessions>,
     models: Arc<dyn ext::Models>,
 }
@@ -1812,13 +1810,13 @@ impl Host for Calling {
         let own = || {
             let own = Arc::new(Own(Arc::clone(&self.session)));
             Owned {
-                settings: Arc::clone(&own) as _,
+                layers: Arc::clone(&own) as _,
                 sessions: Arc::clone(&own) as _,
                 models: own as _,
             }
         };
-        if ty == TypeId::of::<dyn ext::Settings>() {
-            return Some(&self.own.get_or_init(own).settings);
+        if ty == TypeId::of::<dyn ext::Layers>() {
+            return Some(&self.own.get_or_init(own).layers);
         }
         if ty == TypeId::of::<dyn ext::Sessions>() {
             return Some(&self.own.get_or_init(own).sessions);
@@ -1843,14 +1841,8 @@ impl ext::Models for Own {
             let invalid = |e: String| llm::Error::new(llm::Kind::InvalidRequest, e);
             let model = match &side.model {
                 Some(spec) => {
-                    let set = (
-                        Overrides {
-                            model: Some(spec.clone()),
-                        },
-                        None,
-                    );
                     let env = lock(&session.env).clone();
-                    (session.shared.models).model(&session.workspace, env.as_ref(), set)
+                    session.shared.models.model(env.as_ref(), spec)
                 }
                 None => session.model(),
             }
@@ -1931,35 +1923,9 @@ async fn first<T>(work: impl Future<Output = T>, stop: impl Future<Output = ()>)
 /// A session's settings and children, as its calls reach them.
 struct Own(Arc<Session>);
 
-impl ext::Settings for Own {
-    fn model(&self, _: &Cx) -> Result<(String, String), String> {
-        let session = &self.0;
-        let set = lock(&session.overrides).clone();
-        let settings = &session.shared.models.settings;
-        let (model, from) = settings.model_in(&session.workspace, set)?;
-        Ok((model, from.to_string()))
-    }
-
-    /// Committed as the settings extension's state, before it returns.
-    fn set<'a>(&'a self, cx: &'a Cx, set: Overrides) -> BoxFuture<'a, io::Result<()>> {
-        Box::pin(async move {
-            let call = CallId::new(cx.call).ok_or_else(|| io::Error::other("no call"))?;
-            let (done, committed) = oneshot::channel();
-            let note = Note::State {
-                ext: "settings".to_owned(),
-                state: "model".to_owned(),
-                data: Json::encode(&set.model).unwrap_or_default(),
-            };
-            let note = Msg::Note {
-                call,
-                note,
-                done: Some(done),
-            };
-            let _ = self.0.mail.send(note);
-            committed
-                .await
-                .ok_or_else(|| io::Error::other("the session stopped"))
-        })
+impl ext::Layers for Own {
+    fn model(&self, workspace: &std::path::Path) -> Result<(String, String), String> {
+        ext::Layers::model(&self.0.shared.models.settings, workspace)
     }
 }
 

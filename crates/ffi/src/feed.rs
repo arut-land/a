@@ -11,7 +11,8 @@ use client::{Effect, Event, SessionClient, Welcome};
 use protocol::{Caps, DaemonMsg, Decode};
 
 use crate::{
-    ClientError, Resync, SessionSnapshot, ToolOutcome, TurnInfo, ViewChange, ViewItem, ViewUpdate,
+    ClientError, Resync, SessionSnapshot, TITLE, ToolOutcome, TurnInfo, ViewChange, ViewItem,
+    ViewUpdate,
 };
 
 /// How many updates a stream buffers for a slow reader before it drops.
@@ -84,7 +85,7 @@ impl Feed {
             seq: self.client.view().seq,
             change,
             turn: self.client.turn().into(),
-            title: self.client.view().title.clone(),
+            title: self.client.view().side(TITLE).map(str::to_owned),
         };
         self.producer.push(update.clone());
         self.recent_bytes += weight(&update.change);
@@ -133,28 +134,29 @@ fn weight(change: &ViewChange) -> usize {
     }
 }
 
+/// An item carries its text twice at most: as data, and as shown.
 fn item_weight(item: &ViewItem) -> usize {
     let outcome = |o: &Option<ToolOutcome>| match o {
-        Some(ToolOutcome::Done { output_json, shown }) => {
-            output_json.len() + shown.as_ref().map_or(0, |s| s.text.len())
-        }
+        Some(ToolOutcome::Done { output_json }) => output_json.len(),
         Some(ToolOutcome::Failed { error }) => error.len(),
         _ => 0,
     };
-    match item {
-        ViewItem::User { text, .. }
-        | ViewItem::Assistant { text, .. }
-        | ViewItem::Reply { text, .. } => text.len(),
-        ViewItem::Tool {
-            input_json,
-            outcome: o,
-            card,
-            ..
-        } => input_json.len() + outcome(o) + card.as_ref().map_or(0, |c| c.body.len()),
-        ViewItem::Command { outcome: o, .. } | ViewItem::Child { fired: o, .. } => outcome(o),
-        ViewItem::Hook { decision_json, .. } => decision_json.len(),
-        ViewItem::Environment { .. } => 0,
-    }
+    let shown = item.shown();
+    let shown = shown.title.len() + shown.body.as_ref().map_or(0, |b| b.text.len());
+    shown
+        + match item {
+            ViewItem::User { text, .. }
+            | ViewItem::Assistant { text, .. }
+            | ViewItem::Reply { text, .. } => text.len(),
+            ViewItem::Tool {
+                input_json,
+                outcome: o,
+                ..
+            } => input_json.len() + outcome(o),
+            ViewItem::Command { outcome: o, .. } | ViewItem::Child { fired: o, .. } => outcome(o),
+            ViewItem::Hook { decision_json, .. } => decision_json.len(),
+            ViewItem::Environment { .. } => 0,
+        }
 }
 
 pub(crate) fn lock<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {

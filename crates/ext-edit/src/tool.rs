@@ -174,6 +174,7 @@ impl Tool for Edit {
             title: format!("edit {}", input.path),
             body: edited.diff.clone(),
             note: format!("+{} -{}", edited.added, edited.removed),
+            ..Card::default()
         })
     }
 }

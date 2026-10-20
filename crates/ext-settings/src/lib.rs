@@ -1,19 +1,56 @@
-//! `settings`: the commands that show and change what a session runs with,
-//! over the [`ext::Settings`] the engine keeps.
+//! `settings`: a session's own choice of model over the config layers the
+//! engine reads, as the [`ModelSpec`] the engine asks, and the command
+//! that shows and changes it.
 
-use ext::{Args, Cx, Extension, Registrar, Tool};
-use protocol::{Audience, Overrides};
+use std::path::Path;
+use std::sync::Arc;
+
+use ext::{Args, Cx, Extension, Fold, Layers, ModelSpec, Registrar, States, Tool};
+use protocol::Audience;
 use serde::Serialize;
 
 /// The `settings` extension.
 pub struct Settings;
+
+/// The model the session chose for itself, if it did: `/model <spec>`
+/// sets it, `/model reset` clears it.
+#[derive(Debug, Default)]
+pub struct ModelChoice(pub Option<String>);
+
+impl Fold for ModelChoice {
+    const NAME: &'static str = "model";
+    type Change = Option<String>;
+
+    fn apply(&mut self, choice: &Option<String>) {
+        self.0.clone_from(choice);
+    }
+}
 
 impl Extension for Settings {
     const NAME: &'static str = "settings";
     const VERSION: u32 = 1;
 
     fn contribute(&self, r: &mut Registrar) {
-        r.tool(Model);
+        r.fold::<ModelChoice>()
+            .provide::<dyn ModelSpec>(Arc::new(Self))
+            .tool(Model);
+    }
+}
+
+/// Where a session's own choice comes from.
+const OWN: &str = "this session";
+
+impl ModelSpec for Settings {
+    fn model(
+        &self,
+        states: &States,
+        layers: &dyn Layers,
+        workspace: &Path,
+    ) -> Result<(String, String), String> {
+        match states.get::<ModelChoice>().and_then(|m| m.0.clone()) {
+            Some(model) => Ok((model, OWN.to_owned())),
+            None => layers.model(workspace),
+        }
     }
 }
 
@@ -39,17 +76,20 @@ impl Tool for Model {
 
     async fn call(&self, Args { args }: &Args, cx: &Cx) -> Result<Chosen, String> {
         let args = args.as_str();
-        let settings = cx
-            .service::<dyn ext::Settings>()
-            .ok_or("this engine keeps no settings")?;
-        if !args.is_empty() {
-            let model = (args != "reset").then(|| args.to_owned());
-            settings
-                .set(cx, Overrides { model })
-                .await
-                .map_err(|e| e.to_string())?;
-        }
-        let (model, from) = settings.model(cx)?;
+        let layers = cx
+            .service::<dyn Layers>()
+            .ok_or("this engine reads no settings")?;
+        let chosen = if args.is_empty() {
+            cx.state(|m: &ModelChoice| m.0.clone())
+        } else {
+            let choice = (args != "reset").then(|| args.to_owned());
+            cx.update::<ModelChoice>(choice.clone());
+            choice
+        };
+        let (model, from) = match chosen {
+            Some(model) => (model, OWN.to_owned()),
+            None => layers.model(&cx.workspace)?,
+        };
         Ok(Chosen { model, from })
     }
 }

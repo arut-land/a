@@ -6,13 +6,8 @@ use std::process::ExitCode;
 use std::thread;
 
 use client::{Attach, Driver, Effect, End, Endpoint, Env, Event, Link, SessionClient};
-use protocol::Verdict;
-use protocol::view::SessionView;
-use protocol::view::{
-    Approval, Change, Item, Part, Phase, Status, Usage, call_title, decision_line, output_text,
-    recap_line,
-};
-use protocol::{Card, ClientMsg, DaemonMsg, Outcome, SessionSummary, Target};
+use protocol::view::{Change, Item, Kind, Part, Presented, SessionView, Shown, recap_line};
+use protocol::{CallId, ClientMsg, DaemonMsg, SessionSummary, Target, Verdict};
 use sys::{Home, Staged};
 
 use crate::args::{Args, Cmd, Daemon};
@@ -325,14 +320,15 @@ fn report(d: &client::Diagnosis) {
     }
 }
 
-/// Prints the shared view's updates as transcript lines. A model reply
-/// streams in as deltas; on replay there are none, so the committed text is
-/// printed instead. What waits for an approval is asked once the replay is
-/// in, after its recap, and as it begins to wait from then on.
+/// Prints the shared view's updates as transcript lines, each item as
+/// [`Item::present`] has it. A model reply streams in as deltas; on replay
+/// there are none, so the committed text is printed instead. What waits
+/// for an approval is asked once the replay is in, after its recap, and as
+/// it begins to wait from then on.
 #[derive(Default)]
 struct Screen {
     /// The call whose streamed reply is on the current line.
-    streaming: Option<u64>,
+    streaming: Option<CallId>,
     /// The replay of the latest attach is in.
     synced: bool,
 }
@@ -365,29 +361,27 @@ impl Screen {
                 {
                     println!();
                 }
-                added(item);
+                print_all(&added(item));
             }
             // Sent in place of a long replay: shown as the replay would be.
-            Change::Snapshot { items } => {
-                for item in items {
-                    added(item);
-                    for part in [Part::Approval, Part::Outcome] {
-                        self.updated(item, part);
+            Change::Snapshot => {
+                for item in &view.items {
+                    print_all(&added(item));
+                    if item.settled() {
+                        print_all(&outcome(&item.present()));
                     }
                 }
             }
-            Change::Updated { item, part, .. } => self.updated(item, *part),
+            Change::Updated { index, part } => self.updated(&view.items[*index], *part),
             Change::Synced => {
                 self.synced = true;
                 if let Some(recap) = &view.recap {
                     println!("[{}]", recap_line(recap));
                 }
-                for item in view
-                    .items
-                    .iter()
-                    .filter(|i| i.phase() == Some(Phase::Asking))
-                {
-                    ask(item);
+                for call in view.ledger.inbox() {
+                    if let Some(item) = view.items.iter().find(|i| i.key() == call.0) {
+                        println!("{}", ask(&item.present()));
+                    }
                 }
             }
             Change::Mismatch { supported } => eprintln!("[daemon speaks protocol {supported}]"),
@@ -397,134 +391,75 @@ impl Screen {
     }
 
     fn updated(&mut self, item: &Item, part: Part) {
-        match (item, part) {
-            (
-                Item::Tool {
-                    outcome: Some(outcome),
-                    card,
-                    ..
-                },
-                Part::Outcome,
-            ) => print_outcome(outcome, card.as_ref()),
-            (
-                Item::Child {
-                    fired: Some(outcome),
-                    ..
-                },
-                Part::Outcome,
-            ) => print_outcome(outcome, None),
-            (Item::Tool { .. }, Part::Approval)
-                if self.synced && item.phase() == Some(Phase::Asking) =>
-            {
-                ask(item);
-            }
-            (
-                Item::Tool {
-                    approval: Some(answer @ (Approval::Approved | Approval::Denied)),
-                    ..
-                },
-                Part::Approval,
-            ) => println!(
-                "  · {}",
-                if *answer == Approval::Approved {
-                    "approved"
-                } else {
-                    "not approved"
-                }
-            ),
-            (
-                Item::Reply {
-                    call,
-                    text,
-                    status,
-                    usage,
-                    ..
-                },
-                Part::Outcome,
-            ) => {
+        let p = item.present();
+        match (part, p.kind) {
+            (Part::Outcome, Kind::Reply | Kind::Side) => {
                 // A streamed reply is on screen already; end its line.
-                if self.streaming.take() == Some(*call) {
+                let streamed = self.streaming.take_if(|s| s.0 == item.key()).is_some();
+                if streamed {
                     println!();
-                } else if *status == Status::Done && !text.is_empty() {
+                } else if let Shown::Markdown(text) = p.body
+                    && !text.is_empty()
+                {
                     println!("a    {text}");
                 }
-                match status {
-                    Status::Done => {
-                        if let Some(Usage { input, output }) = usage {
-                            println!("     · {input} in, {output} out");
-                        }
-                    }
-                    Status::Failed { error } => println!("  └ model failed: {error}"),
-                    Status::Interrupted => println!("  └ model call interrupted"),
-                    Status::Running => {}
+                if let Some(usage) = p.usage {
+                    println!("     · {usage}");
+                }
+                if !p.status.is_empty() {
+                    println!("  └ {}", p.status);
                 }
             }
+            (Part::Outcome, Kind::Tool | Kind::Command | Kind::Child) => print_all(&outcome(&p)),
+            (Part::Phase, _) if self.synced && p.buttons != protocol::view::Buttons::None => {
+                println!("{}", ask(&p));
+            }
+            (Part::Answer { approved }, _) => println!(
+                "  · {}",
+                if approved { "approved" } else { "not approved" }
+            ),
             _ => {}
         }
     }
 }
 
-fn ask(item: &Item) {
-    if let Item::Tool {
-        tool, input, card, ..
-    } = item
-    {
-        println!(
-            "? approve {}  [y/n]",
-            call_title(tool, input, card.as_ref())
-        );
+fn print_all(lines: &[String]) {
+    for line in lines {
+        println!("{line}");
     }
 }
 
-fn added(item: &Item) {
-    match item {
-        Item::User { text, .. } => println!("you  {text}"),
-        Item::Assistant { text, .. } => println!("a    {text}"),
-        Item::Tool {
-            tool,
-            input,
-            by: protocol::Audience::User,
-            ..
-        } => println!("cmd  /{tool} {}", Item::args(input)),
-        Item::Tool {
-            tool, input, card, ..
-        } => println!("tool {}", call_title(tool, input, card.as_ref())),
-        Item::Hook {
-            hook,
-            call,
-            tool,
-            decision,
-            ..
-        } => println!("  · hook {hook}: {}", decision_line(tool, *call, decision)),
-        Item::Child { child, input, .. } => println!("child {} {input}", child.short()),
-        Item::Environment { cwd, .. } => println!("  · env {}", cwd.display()),
-        Item::Reply { .. } => {}
+/// The question a call waiting for approval puts.
+fn ask(p: &Presented<'_>) -> String {
+    format!("? approve {}  [y/n]", p.title)
+}
+
+/// The lines an item starts with, as it is added.
+fn added(item: &Item) -> Vec<String> {
+    let p = item.present();
+    match p.kind {
+        Kind::User => vec![format!("you  {}", p.body.text())],
+        Kind::Assistant => vec![format!("a    {}", p.body.text())],
+        Kind::Command => vec![format!("cmd  {}", p.title)],
+        Kind::Tool => vec![format!("tool {}", p.title)],
+        Kind::Hook | Kind::Environment => vec![format!("  · {}", p.title)],
+        Kind::Child => vec![format!("{} {}", p.title, p.body.text())],
+        // Printed when done: as its text streams, or whole.
+        Kind::Reply | Kind::Side => Vec::new(),
     }
 }
 
-/// An outcome as its tool's card presents it, else text as lines and
-/// anything else as JSON.
-fn print_outcome(outcome: &Outcome, card: Option<&Card>) {
-    match outcome {
-        Outcome::Done { output } => {
-            let (text, note) = match (output_text(card), output.parse::<String>()) {
-                (Some(shown), _) => shown,
-                (None, Ok(text)) => (text, String::new()),
-                (None, Err(_)) => (String::new(), output.to_string()),
-            };
-            for line in text.lines() {
-                println!("  │ {line}");
-            }
-            println!("  └ {}", if note.is_empty() { "done" } else { &note });
-        }
-        Outcome::Failed { error } => println!("  └ failed: {error}"),
-        Outcome::Interrupted { output } => {
-            for line in output.iter().flat_map(|text| text.lines()) {
-                println!("  │ {line}");
-            }
-            println!("  └ interrupted before it finished");
-        }
-    }
+/// The lines a settled call or command ends with: its body behind a
+/// gutter, then its status.
+fn outcome(p: &Presented<'_>) -> Vec<String> {
+    let body = p.body.text();
+    let mut lines: Vec<String> = body
+        .lines()
+        .filter(|_| !matches!(p.body, Shown::None))
+        .map(|line| format!("  │ {line}"))
+        .collect();
+    lines.push(format!("  └ {}", p.status));
+    lines
 }
 
 fn ls(ctx: &Ctx) -> io::Result<()> {

@@ -411,7 +411,7 @@ fn a_tab_streams_replies_and_answers_asks_until_it_closes() {
     events.until("the output", |p| {
         p.iter().any(|p| {
             let html = &p.html;
-            html.contains("approved") && html.contains("web-ok\n") && html.contains("exit ")
+            html.contains("web-ok\n") \&\& html.contains("exit ")
         })
     });
 
@@ -431,7 +431,7 @@ fn a_tab_streams_replies_and_answers_asks_until_it_closes() {
             // Stop shows before the process starts, so the interrupt may
             // also land before the spawn: then nothing ran, and the call
             // ends aborted.
-            && (shown.contains("interrupted before it finished")
+            && (shown.contains(">interrupted<")
                 || shown.contains("killed by")
                 || shown.contains("[aborted]")
                 || shown.contains(">aborted<"))

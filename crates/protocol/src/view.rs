@@ -7,7 +7,10 @@
 //! any two clients that have folded the same session up to the same seq,
 //! which [`SessionView::state_hash`] checks. What only this connection saw
 //! (streamed text, the recap of what it missed) is kept beside it and left
-//! out.
+//! out. How an item is shown is decided once too, by [`Item::present`].
+
+pub mod md;
+mod present;
 
 use std::borrow::{Borrow, Cow};
 use std::io;
@@ -16,13 +19,13 @@ use std::path::PathBuf;
 use serde::de::{SeqAccess, Visitor};
 use serde::{Deserialize, Deserializer, Serialize};
 
+use crate::ledger::{Ledger, OutcomeKind, Phase};
 use crate::{
-    Audience, Body, Card, DaemonMsg, Entry, Environment, Json, Outcome, Permission, SessionId,
+    Audience, Body, CallId, Card, DaemonMsg, Entry, Json, Outcome, Permission, Seq, SessionId,
     SessionSummary, Verdict, WaitOn,
 };
 
-/// The purpose of a side request titling the session.
-pub const TITLE: &str = "title";
+pub use present::{Buttons, Glyph, Kind, Presented, Shown, call_title, decision_line, recap_line};
 
 /// One session as a client shows it. Its serialized form is also what a
 /// [`DaemonMsg::Snapshot`] carries.
@@ -32,17 +35,11 @@ pub struct SessionView {
     pub workspace: PathBuf,
     /// The last entry folded: a reconnect attaches with it as `since`.
     pub seq: u64,
+    /// What the log says now: where each open call stands, what waits,
+    /// the environment. The one rule for all of it, shared with the daemon.
+    pub ledger: Ledger,
     /// The transcript, in log order.
     pub items: Vec<Item>,
-    /// The environment the session's commands run in.
-    pub environment: Option<Environment>,
-    /// Input waiting to be taken up, by the seq of its entry: shown once
-    /// it is.
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    pub queued: Vec<(u64, String)>,
-    /// The session's title: the latest reply to a side request titling it.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub title: Option<String>,
     /// What happened since the seq the latest attach started from, once
     /// its replay is in.
     #[serde(skip)]
@@ -82,7 +79,7 @@ pub struct Recap {
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Stream {
-    pub call: u64,
+    pub call: CallId,
     /// The attempt the text is of: a retry streams anew.
     pub attempt: u16,
     pub text: String,
@@ -94,17 +91,17 @@ pub struct Stream {
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum Item {
     User {
-        seq: u64,
+        seq: Seq,
         text: String,
     },
     Assistant {
-        seq: u64,
+        seq: Seq,
         text: String,
     },
     /// A model call and the reply it got; a side request an extension
     /// made names its `purpose`.
     Reply {
-        call: u64,
+        call: CallId,
         model: String,
         text: String,
         status: Status,
@@ -115,10 +112,12 @@ pub enum Item {
     /// A call of a tool, by the model or (`by` the user) a slash command,
     /// whose arguments are its input's `args` ([`Item::args`]).
     Tool {
-        call: u64,
+        call: CallId,
         tool: String,
         input: Json,
-        approval: Option<Approval>,
+        /// Where it stands, as the ledger has it: once it has its outcome,
+        /// settled with that outcome's kind.
+        phase: Phase,
         outcome: Option<Outcome>,
         /// How the tool presents the call, or once it has one, its outcome.
         #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -127,26 +126,26 @@ pub enum Item {
         by: Audience,
     },
     /// What extension `hook` decided, about call `call` (of tool `tool`)
-    /// when it is about one; an approval asked is the call's [`Approval`].
+    /// when it is about one.
     Hook {
-        seq: u64,
+        seq: Seq,
         hook: String,
         #[serde(default, skip_serializing_if = "Option::is_none")]
-        call: Option<u64>,
+        call: Option<CallId>,
         #[serde(default, skip_serializing_if = "String::is_empty")]
         tool: String,
         decision: Verdict,
     },
     /// A child session started by call `call`, and its watch.
     Child {
-        call: u64,
+        call: CallId,
         child: SessionId,
         input: String,
-        watch: Option<u64>,
+        watch: Option<Seq>,
         fired: Option<Outcome>,
     },
     Environment {
-        seq: u64,
+        seq: Seq,
         cwd: PathBuf,
     },
 }
@@ -154,45 +153,37 @@ pub enum Item {
 impl Item {
     /// Where the call this item shows stands; `None` for an item that is
     /// not a call.
-    pub const fn phase(&self) -> Option<Phase> {
+    pub fn phase(&self) -> Option<Phase> {
         Some(match self {
             Self::Reply { status, .. } => match status {
                 Status::Running => Phase::Running,
-                Status::Done => Phase::Done,
-                Status::Failed { .. } => Phase::Failed,
-                Status::Interrupted => Phase::Interrupted,
+                Status::Done => Phase::Settled(OutcomeKind::Done),
+                Status::Failed { .. } => Phase::Settled(OutcomeKind::Failed),
+                Status::Interrupted => Phase::Settled(OutcomeKind::Interrupted),
             },
-            Self::Tool {
-                outcome: Some(outcome),
-                ..
-            } => Phase::of(outcome),
-            Self::Tool {
-                approval: Some(Approval::Pending),
-                ..
-            } => Phase::Asking,
-            Self::Tool {
-                approval: Some(Approval::Denied),
-                ..
-            } => Phase::Denied,
-            Self::Tool { .. } => Phase::Running,
+            Self::Tool { phase, .. } => phase.clone(),
             _ => return None,
         })
     }
 
-    /// Whether this is the reply to a side request titling the session:
-    /// its text is the view's [`SessionView::title`], shown there.
-    pub fn titles(&self) -> bool {
-        matches!(self, Self::Reply { purpose: Some(purpose), .. } if purpose == TITLE)
+    /// Whether the item will not change any more: a call with its outcome,
+    /// or no call at all.
+    pub const fn settled(&self) -> bool {
+        match self {
+            Self::Reply { status, .. } => !matches!(status, Status::Running),
+            Self::Tool { outcome, .. } => outcome.is_some(),
+            _ => true,
+        }
     }
 
     /// The seq of the entry that started this item.
-    pub const fn key(&self) -> u64 {
+    pub const fn key(&self) -> Seq {
         match self {
             Self::User { seq, .. }
             | Self::Assistant { seq, .. }
             | Self::Hook { seq, .. }
             | Self::Environment { seq, .. } => *seq,
-            Self::Reply { call, .. } | Self::Tool { call, .. } | Self::Child { call, .. } => *call,
+            Self::Reply { call, .. } | Self::Tool { call, .. } | Self::Child { call, .. } => call.0,
         }
     }
 
@@ -223,65 +214,16 @@ pub struct Usage {
     pub output: u64,
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum Approval {
-    Pending,
-    Approved,
-    Denied,
-}
-
-/// Where a model call, tool call or slash command stands: the decision
-/// table over an item's status, approval and outcome, kept here once so
-/// that no client re-derives it.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
-#[serde(rename_all = "snake_case")]
-pub enum Phase {
-    /// It runs, or is about to.
-    Running,
-    /// It waits for an approval, which every client attached is asked for.
-    Asking,
-    /// Not approved; it will not run.
-    Denied,
-    Done,
-    Failed,
-    Interrupted,
-}
-
-impl Phase {
-    /// Whether it is unsettled: what an interrupt stops. A call waiting for
-    /// approval counts, since an interrupt settles it without running it.
-    pub const fn open(self) -> bool {
-        matches!(self, Self::Running | Self::Asking)
-    }
-
-    /// Whether it has its outcome: nothing about it changes any more.
-    pub const fn settled(self) -> bool {
-        matches!(self, Self::Done | Self::Failed | Self::Interrupted)
-    }
-
-    const fn of(outcome: &Outcome) -> Self {
-        match outcome {
-            Outcome::Done { .. } => Self::Done,
-            Outcome::Failed { .. } => Self::Failed,
-            Outcome::Interrupted { .. } => Self::Interrupted,
-        }
+/// `12 in · 34 out`.
+impl std::fmt::Display for Usage {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{} in · {} out", self.input, self.output)
     }
 }
 
-/// What a session's turn is doing, as [`SessionView::turn`] finds it.
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize)]
-pub struct Turn {
-    /// A call is unsettled: an interrupt has something to stop.
-    pub running: bool,
-    /// The oldest call waiting for an approval.
-    pub asking: Option<u64>,
-    /// How many calls wait for an approval.
-    pub asks: u32,
-}
-
-/// What one daemon message changed, as owned data a client applies to its
-/// own copy: items are upserted whole by index.
+/// What one daemon message changed, as a client applies it to its own
+/// copy: an item added is carried; one updated is read back from the view
+/// by index.
 #[derive(Clone, Debug, PartialEq, Serialize)]
 pub struct Update {
     /// One more than the previous update's: a gap means updates were lost.
@@ -307,20 +249,17 @@ pub enum Change {
     },
     Updated {
         index: usize,
-        item: Item,
         part: Part,
     },
     /// Live text for the reply of `call`, appended to [`SessionView::streaming`].
     Delta {
-        call: u64,
+        call: CallId,
         text: String,
     },
     /// The replay is in; [`SessionView::recap`] tells what it held.
     Synced,
     /// The daemon sent the whole view: the items are these now.
-    Snapshot {
-        items: Vec<Item>,
-    },
+    Snapshot,
     Draining,
     Mismatch {
         supported: u32,
@@ -332,11 +271,15 @@ pub enum Change {
 
 /// Which part of an item an [`Change::Updated`] changed.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
-#[serde(rename_all = "snake_case")]
+#[serde(tag = "part", rename_all = "snake_case")]
 pub enum Part {
     /// A tool's result, a reply's, a command's, or a child's fired watch.
     Outcome,
-    Approval,
+    /// Where the call stands changed: it is asked about, runs, or was
+    /// refused.
+    Phase,
+    /// The approval the call waited for was given, or not.
+    Answer { approved: bool },
     Watch,
 }
 
@@ -373,31 +316,19 @@ impl SessionView {
         })
     }
 
-    /// Tool calls waiting for an approval, oldest first.
-    pub fn asked(&self) -> impl Iterator<Item = u64> + '_ {
-        self.items
-            .iter()
-            .filter(|item| item.phase() == Some(Phase::Asking))
-            .map(Item::key)
-    }
-
-    /// Where the session's turn stands, from the items' phases: the one
-    /// place any client learns whether something runs and what waits on
-    /// it.
-    pub fn turn(&self) -> Turn {
-        let mut turn = Turn::default();
-        for item in &self.items {
-            match item.phase() {
-                Some(Phase::Asking) => {
-                    turn.running = true;
-                    turn.asks += 1;
-                    turn.asking = turn.asking.or(Some(item.key()));
-                }
-                Some(phase) if phase.open() => turn.running = true,
-                _ => {}
-            }
-        }
-        turn
+    /// The latest done reply to a side request for `purpose` (a title,
+    /// say), trimmed and bare of the quotes a model wraps a short answer
+    /// in; `None` until there is one.
+    pub fn side(&self, purpose: &str) -> Option<&str> {
+        self.items.iter().rev().find_map(|item| match item {
+            Item::Reply {
+                text,
+                status: Status::Done,
+                purpose: Some(p),
+                ..
+            } if p == purpose => Some(text.trim().trim_matches('"').trim()).filter(|t| !t.is_empty()),
+            _ => None,
+        })
     }
 
     /// A hash of the log-derived state (the serialized view): equal on every
@@ -489,9 +420,8 @@ impl SessionView {
     /// Takes the log-derived state of `snapshot`, keeping what only this
     /// connection saw where it still holds: the reply streaming in.
     fn adopt(&mut self, snapshot: &Self) -> Change {
-        let items = snapshot.items.clone();
         let running = |call| {
-            items.iter().any(
+            snapshot.items.iter().any(
                 |i| matches!(i, Item::Reply { call: c, status: Status::Running, .. } if *c == call),
             )
         };
@@ -501,22 +431,30 @@ impl SessionView {
         self.session = snapshot.session;
         self.workspace.clone_from(&snapshot.workspace);
         self.seq = snapshot.seq;
-        self.environment.clone_from(&snapshot.environment);
-        self.queued.clone_from(&snapshot.queued);
-        self.title.clone_from(&snapshot.title);
-        self.items = items;
-        Change::Snapshot {
-            items: self.items.clone(),
-        }
+        self.ledger.clone_from(&snapshot.ledger);
+        self.items.clone_from(&snapshot.items);
+        Change::Snapshot
     }
 
     /// Folds a new entry: most start an item, the rest change one.
     fn entry(&mut self, e: &Entry) -> Option<Change> {
-        if e.seq <= self.seq {
+        if e.seq.get() <= self.seq {
             return None;
         }
-        self.seq = e.seq;
+        self.seq = e.seq.get();
         let seq = e.seq;
+        // Input taken up is shown as the user's message where it was taken:
+        // its text is in the ledger until this entry leaves it.
+        let taken = match &e.body {
+            Body::Take { input } => {
+                let text = (self.ledger.untaken().iter())
+                    .find(|q| q.seq == *input)
+                    .map(|q| q.text.clone());
+                Some(text)
+            }
+            _ => None,
+        };
+        self.ledger.apply(e);
         let item = match &e.body {
             Body::Input {
                 text, taken: true, ..
@@ -524,21 +462,18 @@ impl SessionView {
                 seq,
                 text: text.clone(),
             },
-            Body::Input { text, .. } => {
-                self.queued.push((seq, text.clone()));
-                return None;
-            }
-            Body::Take { input } => {
-                let at = self.queued.iter().position(|(s, _)| *s == input.get())?;
-                let (_, text) = self.queued.remove(at);
-                Item::User { seq, text }
-            }
+            Body::Input { .. } => return None,
+            Body::Take { .. } => Item::User {
+                seq,
+                text: taken.flatten()?,
+            },
             Body::ToolCall {
                 tool,
                 input,
                 by: Audience::User,
                 ..
             } => return Some(self.command(seq, tool, input)),
+            // The ask shows on the call, as its phase.
             Body::Decision {
                 call: Some(call),
                 d:
@@ -546,14 +481,16 @@ impl SessionView {
                         permission: Permission::Ask,
                     },
                 ..
-            } => return self.approval(call.get(), Approval::Pending),
+            } => return self.rephase(*call),
             Body::Decision { by, call, d } => {
-                let call = call.map(crate::CallId::get);
+                if let Some(call) = call {
+                    self.rephase(*call);
+                }
                 Item::Hook {
                     seq,
                     hook: by.clone(),
-                    call,
-                    tool: self.tool_of(call),
+                    call: *call,
+                    tool: self.tool_of(*call),
                     decision: d.clone(),
                 }
             }
@@ -568,16 +505,16 @@ impl SessionView {
                 by,
                 ..
             } => Item::Tool {
-                call: seq,
+                call: CallId(seq),
                 tool: tool.clone(),
                 input: input.clone(),
-                approval: None,
+                phase: Phase::Gating { at: 0 },
                 outcome: None,
                 card: card.clone(),
                 by: *by,
             },
             Body::ModelCall { model, purpose, .. } => Item::Reply {
-                call: seq,
+                call: CallId(seq),
                 model: model.clone(),
                 text: String::new(),
                 status: Status::Running,
@@ -585,19 +522,16 @@ impl SessionView {
                 purpose: purpose.clone(),
             },
             Body::Link { child, input } => Item::Child {
-                call: seq,
+                call: CallId(seq),
                 child: *child,
                 input: input.clone(),
                 watch: None,
                 fired: None,
             },
-            Body::Environment(env) => {
-                self.environment = Some(env.clone());
-                Item::Environment {
-                    seq,
-                    cwd: env.cwd.clone(),
-                }
-            }
+            Body::Environment(env) => Item::Environment {
+                seq,
+                cwd: env.cwd.clone(),
+            },
             body => return self.change(seq, body),
         };
         self.items.push(item.clone());
@@ -608,7 +542,7 @@ impl SessionView {
     }
 
     /// Folds entry `seq`, which changes an item already shown.
-    fn change(&mut self, seq: u64, body: &Body) -> Option<Change> {
+    fn change(&mut self, seq: Seq, body: &Body) -> Option<Change> {
         match body {
             Body::ToolResult {
                 call,
@@ -619,30 +553,43 @@ impl SessionView {
                 let Item::Tool {
                     outcome: o,
                     card: shown,
+                    phase,
                     ..
                 } = &mut self.items[at]
                 else {
                     return None;
                 };
+                *phase = Phase::Settled(OutcomeKind::of(outcome));
                 *o = Some(outcome.clone());
                 if card.is_some() {
                     shown.clone_from(card);
                 }
-                Some(self.updated(at, Part::Outcome))
+                Some(Change::Updated {
+                    index: at,
+                    part: Part::Outcome,
+                })
             }
             Body::ModelResult { call, outcome } => self.replied(*call, outcome),
-            Body::Wait {
-                call,
-                on: WaitOn::Approval,
-            } => self.approval(call.get(), Approval::Pending),
-            Body::Answer { call, value, .. } => {
-                let approved = value.parse::<bool>().ok()?;
-                let to = if approved {
-                    Approval::Approved
-                } else {
-                    Approval::Denied
+            Body::Answer { call, .. } => {
+                let at = self.call(*call)?;
+                let Item::Tool { phase, .. } = &mut self.items[at] else {
+                    return None;
                 };
-                self.approval(call.get(), to)
+                let now = self.ledger.call(*call).map(|open| &open.phase);
+                match (&*phase, now) {
+                    (Phase::Waiting(WaitOn::Approval), Some(now)) if !now.asking() => {
+                        let approved = *now == Phase::Running;
+                        *phase = now.clone();
+                        Some(Change::Updated {
+                            index: at,
+                            part: Part::Answer { approved },
+                        })
+                    }
+                    _ => self.rephase(*call),
+                }
+            }
+            Body::Wait { call, .. } | Body::ToolProcess { call, .. } | Body::Progress { call, .. } => {
+                self.rephase(*call)
             }
             Body::Watch { child } => {
                 let at = self.items.iter().rposition(
@@ -651,7 +598,10 @@ impl SessionView {
                 if let Item::Child { watch, .. } = &mut self.items[at] {
                     *watch = Some(seq);
                 }
-                Some(self.updated(at, Part::Watch))
+                Some(Change::Updated {
+                    index: at,
+                    part: Part::Watch,
+                })
             }
             Body::Fired { watch, outcome } => {
                 let at = self.items.iter().rposition(
@@ -660,20 +610,38 @@ impl SessionView {
                 if let Item::Child { fired, .. } = &mut self.items[at] {
                     *fired = Some(outcome.clone());
                 }
-                Some(self.updated(at, Part::Outcome))
+                Some(Change::Updated {
+                    index: at,
+                    part: Part::Outcome,
+                })
             }
             _ => None,
         }
     }
 
+    /// Brings tool call `call`'s item to the phase the ledger has it at;
+    /// the change, if that moved it.
+    fn rephase(&mut self, call: CallId) -> Option<Change> {
+        let now = self.ledger.call(call)?.phase.clone();
+        let at = self.call(call)?;
+        match &mut self.items[at] {
+            Item::Tool { phase, .. } if *phase != now => *phase = now,
+            _ => return None,
+        }
+        Some(Change::Updated {
+            index: at,
+            part: Part::Phase,
+        })
+    }
+
     /// A command the user ran, called `seq`. The input that ran it is
     /// shown as the command it is.
-    fn command(&mut self, seq: u64, tool: &str, input: &Json) -> Change {
+    fn command(&mut self, seq: Seq, tool: &str, input: &Json) -> Change {
         let item = Item::Tool {
-            call: seq,
+            call: CallId(seq),
             tool: tool.to_owned(),
             input: input.clone(),
-            approval: None,
+            phase: Phase::Gating { at: 0 },
             outcome: None,
             card: None,
             by: Audience::User,
@@ -687,7 +655,10 @@ impl SessionView {
         {
             let at = self.items.len() - 1;
             self.items[at] = item;
-            return self.updated(at, Part::Outcome);
+            return Change::Updated {
+                index: at,
+                part: Part::Outcome,
+            };
         }
         self.items.push(item.clone());
         Change::Added {
@@ -697,7 +668,7 @@ impl SessionView {
     }
 
     /// The tool of call `call`, as a hook item names it.
-    fn tool_of(&self, call: Option<u64>) -> String {
+    fn tool_of(&self, call: Option<CallId>) -> String {
         match call
             .and_then(|call| self.call(call))
             .map(|at| &self.items[at])
@@ -723,7 +694,7 @@ impl SessionView {
                 Item::User { text, .. } => Some(short(text)),
                 _ => None,
             }),
-            asks: u32::try_from(self.asked().count()).unwrap_or(u32::MAX),
+            asks: u32::try_from(self.ledger.inbox().count()).unwrap_or(u32::MAX),
             ..Recap::default()
         };
         for item in &self.items[prompt.map_or(0, |at| at + 1)..] {
@@ -742,18 +713,19 @@ impl SessionView {
                 } if !text.is_empty() => recap.reply = Some(short(text)),
                 _ => {}
             }
-            if let Item::Tool { .. } | Item::Reply { .. } = item {
-                match item.phase() {
-                    Some(Phase::Failed | Phase::Interrupted) => recap.failed += 1,
-                    Some(Phase::Running) => recap.running += 1,
-                    _ => {}
+            match item.phase() {
+                Some(Phase::Settled(OutcomeKind::Failed | OutcomeKind::Interrupted)) => {
+                    recap.failed += 1;
                 }
+                Some(Phase::Settled(OutcomeKind::Done)) | None => {}
+                Some(phase) if !phase.asking() => recap.running += 1,
+                Some(_) => {}
             }
         }
         (recap != Recap::default()).then_some(recap)
     }
 
-    fn replied(&mut self, call: u64, outcome: &Outcome) -> Option<Change> {
+    fn replied(&mut self, call: CallId, outcome: &Outcome) -> Option<Change> {
         if self.streaming.as_ref().is_some_and(|s| s.call == call) {
             self.streaming = None;
         }
@@ -762,22 +734,15 @@ impl SessionView {
             text,
             status,
             usage,
-            purpose,
             ..
         } = &mut self.items[at]
         else {
             return None;
         };
-        let titles = purpose.as_deref() == Some(TITLE);
         *status = match outcome {
             Outcome::Done { output } => {
                 let reply = output.parse::<Reply>().unwrap_or_default();
-                if titles {
-                    let title = reply.message.content.0.trim().trim_matches('"').trim();
-                    self.title = (!title.is_empty()).then(|| title.to_owned());
-                } else {
-                    *usage = reply.usage.and_then(ReplyUsage::counts);
-                }
+                *usage = reply.usage.and_then(ReplyUsage::counts);
                 *text = reply.message.content.0;
                 Status::Done
             }
@@ -786,29 +751,15 @@ impl SessionView {
             },
             Outcome::Interrupted { .. } => Status::Interrupted,
         };
-        Some(self.updated(at, Part::Outcome))
-    }
-
-    fn approval(&mut self, call: u64, to: Approval) -> Option<Change> {
-        let at = self.call(call)?;
-        match &mut self.items[at] {
-            Item::Tool { approval, .. } if *approval != Some(to) => *approval = Some(to),
-            _ => return None,
-        }
-        Some(self.updated(at, Part::Approval))
+        Some(Change::Updated {
+            index: at,
+            part: Part::Outcome,
+        })
     }
 
     /// The index of the item call `call` started.
-    fn call(&self, call: u64) -> Option<usize> {
-        self.items.binary_search_by_key(&call, Item::key).ok()
-    }
-
-    fn updated(&self, index: usize, part: Part) -> Change {
-        Change::Updated {
-            index,
-            item: self.items[index].clone(),
-            part,
-        }
+    fn call(&self, call: CallId) -> Option<usize> {
+        self.items.binary_search_by_key(&call.0, Item::key).ok()
     }
 }
 
@@ -893,18 +844,6 @@ fn short(text: &str) -> String {
     }
 }
 
-/// A tool call in one line: as its tool presents it, else a command as
-/// `$ command` and anything else as the tool and its input.
-pub fn call_title(tool: &str, input: &Json, card: Option<&Card>) -> String {
-    if let Some(card) = card {
-        return card.title.clone();
-    }
-    match command(input) {
-        Some(command) => format!("$ {command}"),
-        None => format!("{tool} {input}"),
-    }
-}
-
 /// The command a call's input runs, when it runs one: its `command`.
 pub fn command(input: &Json) -> Option<Cow<'_, str>> {
     #[derive(Deserialize)]
@@ -915,77 +854,8 @@ pub fn command(input: &Json) -> Option<Cow<'_, str>> {
     input.parse::<Command<'_>>().ok().map(|c| c.command)
 }
 
-/// A finished call's output as text and a short note on it, as its tool's
-/// card presents it; `None` when it presents neither.
-pub fn output_text(card: Option<&Card>) -> Option<(String, String)> {
-    card.filter(|c| !c.body.is_empty() || !c.note.is_empty())
-        .map(|card| (card.body.clone(), card.note.clone()))
-}
-
-/// One line on what a session did, shown after an attach's replay.
-pub fn recap_line(recap: &Recap) -> String {
-    let mut parts = vec!["recap".to_owned()];
-    if let Some(prompt) = &recap.prompt {
-        parts.push(format!("you: {prompt}"));
-    }
-    match &recap.tools[..] {
-        [] => {}
-        few @ ([_] | [_, _] | [_, _, _]) => parts.push(format!("ran {}", few.join(", "))),
-        many => parts.push(format!("ran {} tools", many.len())),
-    }
-    let count = |parts: &mut Vec<String>, n: u32, what: &str| {
-        if n > 0 {
-            parts.push(format!("{n} {what}"));
-        }
-    };
-    count(&mut parts, recap.failed, "failed");
-    count(&mut parts, recap.running, "running");
-    if let Some(reply) = &recap.reply {
-        parts.push(format!("a: {reply}"));
-    }
-    count(&mut parts, recap.asks, "waiting for approval");
-    parts.join(" · ")
-}
-
-/// What extension decision `decision` about call `call` (of tool `tool`)
-/// was, in one line.
-pub fn decision_line(tool: &str, call: Option<u64>, decision: &Verdict) -> String {
-    let call = call.unwrap_or_default();
-    match decision {
-        Verdict::Answered => format!("answered call {call} itself"),
-        Verdict::PrepareStep { model: None } => format!("rewrote the request of call {call}"),
-        Verdict::PrepareStep { model: Some(model) } => {
-            format!("sent call {call} to {model}")
-        }
-        Verdict::PreTool { .. } => format!("rewrote the input of {tool}"),
-        Verdict::Block { reason } => format!("blocked {tool}: {reason}"),
-        Verdict::Permission { permission } => {
-            let permission = match permission {
-                Permission::Allow => "allow",
-                Permission::Ask => "ask",
-                Permission::Defer => "defer",
-                Permission::Deny => "deny",
-            };
-            format!("{tool}: {permission}")
-        }
-        Verdict::Approval { approved } => {
-            let answer = if *approved {
-                "approved"
-            } else {
-                "not approved"
-            };
-            format!("{tool} {answer}")
-        }
-        Verdict::PostTool { .. } => format!("rewrote the outcome of call {call}"),
-        Verdict::OnStop { text } => format!("continued with: {text}"),
-        Verdict::Input { original } => format!("rewrote your input: {original}"),
-        Verdict::Retry { attempt, error } => {
-            format!("retried call {call} (attempt {attempt}): {error}")
-        }
-    }
-}
-
-/// The daemon's sessions, as `a ls` and a session picker show them.
+/// The daemon's sessions, newest first, as `a ls` and a session picker
+/// show them.
 #[derive(Clone, Debug, Default, PartialEq, Eq, Serialize)]
 pub struct SessionList {
     pub sessions: Vec<SessionSummary>,

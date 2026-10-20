@@ -78,7 +78,7 @@ impl Fold {
                     .ledger
                     .untaken()
                     .iter()
-                    .find(|q| q.seq == input.get())?;
+                    .find(|q| q.seq == *input)?;
                 // A steer taken just before a model call is the model's to
                 // read; one left when the turn ended starts the next.
                 let steers = queued.steer
@@ -111,9 +111,9 @@ impl Fold {
                 None
             }
             Body::ModelResult { call, outcome } => {
-                let call = CallId::new(*call)?;
+                let call = *call;
                 // A side request's reply is its extension's.
-                let open = self.ledger.call(call.get())?;
+                let open = self.ledger.call(call)?;
                 if matches!(open.call, Call::Side { .. }) {
                     return None;
                 }
@@ -123,8 +123,8 @@ impl Fold {
                 })
             }
             Body::ToolResult { call, outcome, .. } => {
-                let call = CallId::new(*call)?;
-                let open = self.ledger.call(call.get())?;
+                let call = *call;
+                let open = self.ledger.call(call)?;
                 self.inputs.retain(|(c, _)| *c != call);
                 self.fired.retain(|(c, _)| *c != call);
                 self.owners.retain(|(_, c)| *c != call);
@@ -149,7 +149,7 @@ impl Fold {
                 None
             }
             Body::Fired { watch, outcome } => {
-                let watch = Seq::new(*watch)?;
+                let watch = *watch;
                 let child = self.watched(watch)?;
                 if let Some(call) = self.owner(child) {
                     self.fired.push((call, outcome.clone()));
@@ -195,7 +195,7 @@ impl Fold {
                 self.carried(|next| {
                     matches!(next, Next::Agent(Action::Call { tool: t, .. } | Action::Refuse { tool: t, .. }) if t == tool)
                 });
-                if let (Some(why), Some(call)) = (refused, CallId::new(e.seq)) {
+                if let (Some(why), Some(call)) = (refused, Some(CallId(e.seq))) {
                     self.refused.push((call, why));
                 }
             }
@@ -244,7 +244,7 @@ impl Fold {
     fn watched(&self, watch: Seq) -> Option<protocol::SessionId> {
         self.ledger
             .armed()
-            .find_map(|(seq, child)| (seq == watch.get()).then_some(child))
+            .find_map(|(seq, child)| (seq == watch).then_some(child))
     }
 
     /// The open call waiting on `child`, if one does.
@@ -257,7 +257,7 @@ impl Fold {
             .find(|l| l.child == child)?;
         self.owners
             .iter()
-            .find_map(|&(l, call)| (l.get() == link.seq).then_some(call))
+            .find_map(|&(l, call)| (l == link.seq).then_some(call))
     }
 
     /// The input the gate left call `call` with, if it changed it.
