@@ -45,7 +45,6 @@ pub(crate) fn extensions(policy: &ext_policy::Policy) -> Result<Registry, ext::R
         .with_in(ext::Tier::Pre, &ext_prompt::Prompt::default())?
         .with_in(ext::Tier::Pre, &ext_shell::Shell)?
         .with_in(ext::Tier::Pre, &ext_edit::Edit)?
-        .with_in(ext::Tier::Pre, &ext_chat::Chat)?
         .with_in(ext::Tier::Pre, &ext_subagent::Subagent)?
         .with_in(ext::Tier::Pre, &ext_fixtures::Fixtures)
 }

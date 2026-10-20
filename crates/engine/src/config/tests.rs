@@ -26,7 +26,7 @@ fn settings(root: &Path) -> Settings {
 fn files_parse_the_contract() {
     let file: File = r#"
         model = "openai:gpt-6-luna"
-        agent = "chat"
+        agent = "loop"
         future = 1
 
         [env]
@@ -38,7 +38,7 @@ fn files_parse_the_contract() {
         file,
         File {
             model: Some("openai:gpt-6-luna".into()),
-            agent: Some("chat".into()),
+            agent: Some("loop".into()),
             env: BTreeMap::from([("OPENAI_API_KEY".into(), "sk-test".into())]),
             daemon: sys::config::Daemon::default(),
             ext: sys::config::Exts::default(),
@@ -58,8 +58,8 @@ fn later_layers_win() {
     assert_eq!(s.agent(&ws), Some(ext_fixtures::ECHO.to_owned()));
     assert_eq!(s.model(&root).unwrap(), "home:m");
 
-    let overridden = Settings::new(root.join("config.toml"), Some(ext_chat::CHAT.into()));
-    assert_eq!(overridden.agent(&ws), Some(ext_chat::CHAT.to_owned()));
+    let overridden = Settings::new(root.join("config.toml"), Some(ext::LOOP.into()));
+    assert_eq!(overridden.agent(&ws), Some(ext::LOOP.to_owned()));
 
     let (bare, ws) = dirs("defaults", None, None);
     let s = settings(&bare);

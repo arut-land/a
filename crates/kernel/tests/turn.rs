@@ -14,8 +14,8 @@ fn echo() -> Session {
     Session::new(Reg::echo().arc())
 }
 
-fn chat() -> Session {
-    Session::new(Reg::chat().arc())
+fn modeled() -> Session {
+    Session::new(Reg::modeled().arc())
 }
 
 /// A call the model made, under its id.
@@ -234,7 +234,7 @@ fn an_interrupt_between_turns_is_not_kept_for_the_next() {
 
 #[test]
 fn an_interrupt_stops_the_model_call_and_ends_the_turn() {
-    chat().table(vec![
+    modeled().table(vec![
         (
             user("hi"),
             vec![
@@ -275,7 +275,7 @@ fn an_interrupt_stops_the_model_call_and_ends_the_turn() {
 fn an_interrupted_turn_answers_the_calls_it_leaves_and_goes_no_further() {
     let a = json!({ "command": "a" });
     let b = json!({ "command": "b" });
-    chat().table(vec![
+    modeled().table(vec![
         (
             user("go"),
             vec![
@@ -324,7 +324,7 @@ fn a_steer_reaches_the_running_turn_before_the_model_is_next_asked() {
         taken: false,
         origin: None,
     };
-    chat().table(vec![
+    modeled().table(vec![
         (
             user("go"),
             vec![
@@ -424,7 +424,7 @@ fn input_waits_its_turn_behind_a_call_waiting_for_approval() {
 }
 
 fn retrying() -> Session {
-    Session::new(Reg::chat().retry(Duration::from_secs(1)).arc())
+    Session::new(Reg::modeled().retry(Duration::from_secs(1)).arc())
 }
 
 fn retried() -> Vec<Effect> {
@@ -518,7 +518,7 @@ fn an_interrupt_in_backoff_sends_nothing_again() {
 /// A handler that answers later how to recover holds the call meanwhile:
 /// nothing is sent until it answers.
 fn recovering() -> (Session, Effect) {
-    let mut s = Session::new(Reg::chat().resend().arc());
+    let mut s = Session::new(Reg::modeled().resend().arc());
     s.step(user("hi"));
     let mut fx = s.step(model_failed(2)).into_vec();
     assert_eq!(fx.len(), 1, "{fx:?}");
@@ -590,7 +590,7 @@ fn an_interrupt_in_recovering_sends_nothing() {
 
 #[test]
 fn a_failure_no_extension_retries_fails_the_turn() {
-    chat().table(vec![
+    modeled().table(vec![
         (
             user("hi"),
             vec![

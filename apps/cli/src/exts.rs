@@ -49,8 +49,7 @@ pub fn extensions(config: &Config) -> Result<Vec<Installed>, Refused> {
     all.push((Tier::Pre, Box::new(ext_shell::Shell)));
     #[cfg(feature = "edit")]
     all.push((Tier::Pre, Box::new(ext_edit::Edit)));
-    #[cfg(feature = "chat")]
-    all.push((Tier::Pre, Box::new(ext_chat::Chat)));
+
     #[cfg(feature = "settings")]
     all.push((Tier::Pre, Box::new(ext_settings::Settings)));
     #[cfg(feature = "subagent")]
@@ -199,16 +198,12 @@ mod tests {
                 ("prompt", 1),
                 ("shell", 1),
                 ("edit", 1),
-                ("chat", 1),
                 ("settings", 1),
                 ("subagent", 1),
                 ("retry", 1)
             ]
         );
-        assert_eq!(
-            registry.agents().collect::<Vec<_>>(),
-            [ext::LOOP, ext_chat::CHAT]
-        );
+        assert_eq!(registry.agents().collect::<Vec<_>>(), [ext::LOOP]);
 
         let mut decided = Decided::new();
         assert_eq!(gate(&registry, "bash", &mut decided), Gate::Ask);
@@ -233,19 +228,18 @@ mod tests {
             r.system_prompt().split("\n\n").map(str::to_owned).collect()
         };
         // What each contributes that the others do not.
-        let own: [(&str, &[&str], usize, bool); 10] = [
-            ("policy-floor", &[], 0, false),
-            ("policy", &[], 0, false),
-            ("loop", &[], 0, false),
-            ("prompt", &[], 1, false),
-            ("shell", &["bash"], 1, false),
-            ("edit", &["edit"], 1, false),
-            ("chat", &[], 0, true),
-            ("retry", &[], 0, false),
-            ("settings", &[], 0, false),
-            ("subagent", &["task"], 1, false),
+        let own: [(&str, &[&str], usize); 9] = [
+            ("policy-floor", &[], 0),
+            ("policy", &[], 0),
+            ("loop", &[], 0),
+            ("prompt", &[], 1),
+            ("shell", &["bash"], 1),
+            ("edit", &["edit"], 1),
+            ("retry", &[], 0),
+            ("settings", &[], 0),
+            ("subagent", &["task"], 1),
         ];
-        for (name, tools_of, texts_of, agent_of) in own {
+        for (name, tools_of, texts_of) in own {
             let rest = extensions(&config)
                 .unwrap()
                 .into_iter()
@@ -276,7 +270,7 @@ mod tests {
             assert!(after.iter().all(|p| before.contains(p)), "{name}");
             assert_eq!(before.len() - after.len(), texts_of, "{name}");
             // The default loop is always there.
-            assert_eq!(rest.agents().count(), 1 + usize::from(!agent_of), "{name}");
+            assert_eq!(rest.agents().count(), 1, "{name}");
             let facts = Facts {
                 workspace: Path::new("/w"),
                 dir: Path::new("/w"),
@@ -340,12 +334,9 @@ mod tests {
         assert_eq!(tools.get("edit").unwrap().replay(), Replay::Unsafe);
         assert_eq!(tools.get("sleep").unwrap().replay(), Replay::Safe);
         // Only the echo agent brings the fixtures.
-        let chat = super::registry(&config(&[], None)).unwrap();
-        assert!(chat.tools().get("sleep").is_none());
-        assert_eq!(
-            chat.agents().collect::<Vec<_>>(),
-            [ext::LOOP, ext_chat::CHAT]
-        );
+        let shipped = super::registry(&config(&[], None)).unwrap();
+        assert!(shipped.tools().get("sleep").is_none());
+        assert_eq!(shipped.agents().collect::<Vec<_>>(), [ext::LOOP]);
     }
 
     /// Every kind of model failure there is.

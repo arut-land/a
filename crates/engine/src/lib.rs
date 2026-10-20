@@ -110,6 +110,9 @@ impl Config {
         {
             return Err(ext::Refused(format!("no agent named {name} is registered")));
         }
+        for warning in registry.warnings() {
+            eprintln!("warning: {warning}");
+        }
         Ok(registry)
     }
 }

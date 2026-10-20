@@ -133,6 +133,7 @@ pub struct Registry {
     /// a registry never changes once built, so neither do they.
     prompt: OnceLock<String>,
     specs: OnceLock<Vec<llm::Tool>>,
+    warnings: Vec<String>,
 }
 
 impl Registry {
@@ -210,24 +211,48 @@ impl Registry {
         let mut texts = Vec::new();
         let mut agents = Vec::new();
         let mut hooks = Hooks::default();
+        let mut warnings = Vec::new();
         for Installed {
             name, made, tier, ..
         } in &self.installed
         {
-            let guarded = *tier == Tier::Guarded;
+            let by = || By {
+                tier: *tier,
+                ext: Name::clone(name),
+            };
+            let warn = &mut warnings;
             for tool in &made.tools {
-                replace(&mut tools, (guarded, Arc::clone(tool)), |t| t.1.name());
+                replace(
+                    &mut tools,
+                    (by(), Arc::clone(tool)),
+                    |t| t.1.name(),
+                    "tool",
+                    warn,
+                );
             }
             for text in &made.texts {
-                replace(&mut texts, (guarded, text.clone()), |t| &t.1.name);
+                replace(
+                    &mut texts,
+                    (by(), text.clone()),
+                    |t| &t.1.name,
+                    "text",
+                    warn,
+                );
             }
             for agent in &made.agents {
-                replace(&mut agents, (guarded, agent.clone()), |a| &a.1.0);
+                replace(
+                    &mut agents,
+                    (by(), agent.clone()),
+                    |a| &a.1.0,
+                    "agent",
+                    warn,
+                );
             }
             for hooked in &made.hooks {
                 hooks.add(name, hooked);
             }
         }
+        self.warnings = warnings;
         texts.sort_by_key(|t| t.1.order);
         self.tools = Toolset(tools.into_iter().map(|t| t.1).collect());
         self.texts = texts.into_iter().map(|t| t.1).collect();
@@ -243,6 +268,12 @@ impl Registry {
 
     pub fn hooks(&self) -> &Hooks {
         &self.hooks
+    }
+
+    /// What the extensions did that is worth telling: one replacing an
+    /// item of another of its tier, which a typo could do unseen.
+    pub fn warnings(&self) -> &[String] {
+        &self.warnings
     }
 
     /// The callables the user runs as `/name args`, in registration order.
@@ -353,12 +384,34 @@ impl Registry {
 
 /// Puts `new` in place of the item of the same name, or last; a guarded
 /// item is replaced only by another.
-fn replace<T>(items: &mut Vec<(bool, T)>, new: (bool, T), name: impl Fn(&(bool, T)) -> &str) {
+fn replace<T>(
+    items: &mut Vec<(By, T)>,
+    new: (By, T),
+    name: impl Fn(&(By, T)) -> &str,
+    what: &str,
+    warnings: &mut Vec<String>,
+) {
     match items.iter_mut().find(|t| name(t) == name(&new)) {
-        Some(slot) if slot.0 && !new.0 => {}
-        Some(slot) => *slot = new,
+        Some(slot) if slot.0.tier == Tier::Guarded && new.0.tier != Tier::Guarded => {}
+        Some(slot) => {
+            if slot.0.tier == new.0.tier && slot.0.ext != new.0.ext {
+                warnings.push(format!(
+                    "{what} {} of extension {} replaces the one of {}, in the same tier",
+                    name(&new),
+                    new.0.ext,
+                    slot.0.ext
+                ));
+            }
+            *slot = new;
+        }
         None => items.push(new),
     }
+}
+
+/// Who contributed an item, and where.
+struct By {
+    tier: Tier,
+    ext: Name,
 }
 
 /// The registry sessions run with. Replacing it (a reload) takes effect at

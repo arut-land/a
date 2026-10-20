@@ -106,7 +106,7 @@ pub(super) fn fixture(registry: Registry, http: &Arc<Flaky>) -> Fixture {
         http: Arc::clone(http) as Arc<dyn Http>,
         ..openai(&Script::new(&[]))
     };
-    Fixture::new(ext_chat::CHAT, registry, models)
+    Fixture::new(ext::LOOP, registry, models)
 }
 
 /// The attempts each retry decision starts, by call.

@@ -9,7 +9,6 @@ dependencies = [
  "client",
  "engine",
  "ext",
- "ext-chat",
  "ext-edit",
  "ext-fixtures",
  "ext-policy",
@@ -547,7 +546,6 @@ name = "engine"
 version = "0.0.0"
 dependencies = [
  "ext",
- "ext-chat",
  "ext-edit",
  "ext-fixtures",
  "ext-policy",
@@ -617,13 +615,6 @@ dependencies = [
  "serde_json",
  "smallvec",
  "sys",
-]
-
-[[package]]
-name = "ext-chat"
-version = "0.0.0"
-dependencies = [
- "ext",
 ]
 
 [[package]]

@@ -148,7 +148,7 @@ impl From<&SessionSummary> for SessionInfo {
 pub struct Settings {
     /// `host[@protocol]:model`, such as `openai:gpt-6-luna`.
     pub model: Option<String>,
-    /// `chat` (the default) or `echo`.
+    /// `loop` (the default) or `echo`.
     pub agent: Option<String>,
     /// Provider variables, such as `OPENAI_API_KEY` and `OPENAI_BASE_URL`.
     pub env: Vec<EnvVar>,

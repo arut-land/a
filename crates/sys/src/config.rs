@@ -3,7 +3,7 @@
 //!
 //! ```toml
 //! model = "openai:gpt-6-luna"   # host[@protocol]:model
-//! agent = "chat"                # "chat" (default) | "echo"
+//! agent = "loop"                # "loop" (default) | "echo"
 //!
 //! [env]
 //! OPENAI_API_KEY = "sk-..."
@@ -140,7 +140,7 @@ pub struct Daemon {
     pub idle_secs: Option<u64>,
     pub hibernate_secs: Option<u64>,
     pub drain_secs: Option<u64>,
-    /// `chat` or `echo` (which needs no model, and offers the test
+    /// `loop` or `echo` (which needs no model, and offers the test
     /// fixtures).
     pub agent: Option<String>,
     pub crash_limit: Option<u64>,

@@ -94,8 +94,8 @@ impl Reg {
         Self::new(|| Box::new(Echo))
     }
 
-    pub fn chat() -> Self {
-        Self::new(|| Box::new(Chat::default()))
+    pub fn modeled() -> Self {
+        Self::new(|| Box::new(Modeled::default()))
     }
 
     pub fn policy(mut self, policy: Policy) -> Self {
@@ -289,11 +289,11 @@ impl Agent for Echo {
 /// (`{"calls": [{"tool", "input", "id"}]}`) names the calls to run, and
 /// their results go back to it, until it replies with none.
 #[derive(Default)]
-pub struct Chat {
+pub struct Modeled {
     pending: usize,
 }
 
-impl Agent for Chat {
+impl Agent for Modeled {
     fn step(&mut self, input: Input, _: &dyn LoopPoints) -> Actions {
         match input {
             Input::User { .. } | Input::ChildDone { .. } => {
@@ -484,7 +484,7 @@ pub fn response(calls: &[(&str, Value)]) -> Json {
     Json::encode(&response).unwrap()
 }
 
-/// A model reply calling `calls`, as the chat agent reads it.
+/// A model reply calling `calls`, as the modeled agent reads it.
 pub fn reply(calls: &[(&str, Value)]) -> Json {
     let calls: Vec<Value> = (calls.iter().enumerate())
         .map(|(i, (tool, input))| json!({ "tool": tool, "input": input, "id": format!("c{i}") }))

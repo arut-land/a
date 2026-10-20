@@ -233,8 +233,7 @@ impl Extension for Agents {
     const VERSION: u32 = 1;
 
     fn contribute(&self, r: &mut Registrar) {
-        r.agent(ext_chat::CHAT, || Box::new(ext::Loop::default()))
-            .agent(ext_fixtures::ECHO, || Box::new(ext_fixtures::Echo));
+        r.agent(ext_fixtures::ECHO, || Box::new(ext_fixtures::Echo));
     }
 }
 
@@ -476,7 +475,7 @@ fn the_model_calls_a_tool_and_answers_from_its_result() {
     let replies = cassette("openai/streaming_grammar/tool_then_followup_text.yaml");
     let script = Script::new(&replies);
     let tools = Registry::default().with(&Harbor).unwrap();
-    let fixture = Fixture::new(ext_chat::CHAT, tools, openai(&script));
+    let fixture = Fixture::new(ext::LOOP, tools, openai(&script));
     let session = fixture.start(&[]);
     session.submit("Call the tool, then answer.").unwrap();
     settle(&session);
@@ -528,11 +527,7 @@ fn the_model_calls_a_tool_and_answers_from_its_result() {
             base: Duration::ZERO,
             ..ext_retry::Retry::default()
         };
-        let fixture = Fixture::new(
-            ext_chat::CHAT,
-            registry.with(&retry).unwrap(),
-            openai(&script),
-        );
+        let fixture = Fixture::new(ext::LOOP, registry.with(&retry).unwrap(), openai(&script));
         let resumed = fixture.start(&log[..cut]);
         let got = log_of(&resumed);
         resumed.halt();
@@ -566,7 +561,7 @@ fn model_calls_take_credentials_from_the_client_then_the_config() {
         std::fs::write(&config, text).unwrap();
         let script = Script::new(&replies);
         let fixture = Fixture::new(
-            ext_chat::CHAT,
+            ext::LOOP,
             Registry::default().with(&Harbor).unwrap(),
             with_home(&script, &config),
         );
@@ -593,7 +588,7 @@ fn a_missing_credential_fails_the_model_call_saying_where_to_set_it() {
     let script = Script::new(&[]);
     let config = std::env::temp_dir().join("a-engine-no-config.toml");
     let models = with_home(&script, &config);
-    let fixture = Fixture::new(ext_chat::CHAT, Registry::default(), models);
+    let fixture = Fixture::new(ext::LOOP, Registry::default(), models);
     let session = fixture.start(&[]);
     session.submit("hi").unwrap();
     settle(&session);
@@ -639,7 +634,7 @@ fn live_the_model_calls_a_tool_and_answers_from_its_result() {
         http: Arc::new(llm::Ureq::new(rt)),
     };
     let fixture = Fixture::new(
-        ext_chat::CHAT,
+        ext::LOOP,
         Registry::default().with(&Harbor).unwrap(),
         models,
     );
@@ -667,7 +662,7 @@ fn live_the_model_calls_a_tool_and_answers_from_its_result() {
 fn a_fired_watch_wakes_the_model_with_the_childs_result() {
     let replies = cassette("openai/streaming_grammar/tool_then_followup_text.yaml");
     let fixture =
-        |script: &Arc<Script>| Fixture::new(ext_chat::CHAT, Registry::default(), openai(script));
+        |script: &Arc<Script>| Fixture::new(ext::LOOP, Registry::default(), openai(script));
     let child = SessionId::new();
     let script = Script::new(&replies[1..]);
     let session = fixture(&script).load(&[entry(1, Body::Watch { child })]);
@@ -1176,7 +1171,7 @@ fn slash_commands_are_callables_and_input_hooks_rewrite_or_refuse() {
 fn the_model_gets_the_prompt_and_the_logged_context_first() {
     let replies = cassette("openai/streaming_grammar/tool_then_followup_text.yaml");
     let script = Script::new(&replies[1..]);
-    let fixture = Fixture::new(ext_chat::CHAT, echoing(&Policy::default()), openai(&script));
+    let fixture = Fixture::new(ext::LOOP, echoing(&Policy::default()), openai(&script));
     let session = fixture.start(&[]);
     session.submit("hi").unwrap();
     settle(&session);
@@ -1367,7 +1362,7 @@ fn a_steer_reaches_the_running_turn_before_the_model_is_next_asked() {
     let tools = Registry::default()
         .with(&HeldHarbor(Arc::clone(&release)))
         .unwrap();
-    let fixture = Fixture::new(ext_chat::CHAT, tools, openai(&script));
+    let fixture = Fixture::new(ext::LOOP, tools, openai(&script));
     let session = fixture.start(&[]);
     session.submit("Call the tool, then answer.").unwrap();
     until(&session, "called the tool", tool_running);
@@ -1418,7 +1413,7 @@ fn an_interrupt_stops_the_model_call_and_ends_the_turn() {
         settings: crate::config::Settings::new(gpt_home(), None),
         http: Arc::new(Silent),
     };
-    let fixture = Fixture::new(ext_chat::CHAT, Registry::default(), models);
+    let fixture = Fixture::new(ext::LOOP, Registry::default(), models);
     let session = fixture.start(&[]);
     session.submit("hi").unwrap();
     until(&session, "called the model", |log| {
@@ -1447,7 +1442,7 @@ fn an_interrupted_turn_answers_the_calls_it_leaves_and_goes_no_further() {
     let tools = Registry::default()
         .with(&HeldHarbor(Arc::default()))
         .unwrap();
-    let fixture = Fixture::new(ext_chat::CHAT, tools, openai(&script));
+    let fixture = Fixture::new(ext::LOOP, tools, openai(&script));
     let session = fixture.start(&[]);
     session.submit("Call the tool, then answer.").unwrap();
     until(&session, "called the tool", tool_running);

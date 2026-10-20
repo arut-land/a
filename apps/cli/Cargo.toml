@@ -10,7 +10,6 @@ engine.workspace = true
 ext.workspace = true
 # The extensions: see `exts`. Each is a feature, every one on but the
 # fixtures, which are empty unless turned on.
-ext-chat = { workspace = true, optional = true }
 ext-edit = { workspace = true, optional = true }
 ext-fixtures.workspace = true
 ext-policy = { workspace = true, optional = true }
@@ -27,7 +26,7 @@ usage-rs.workspace = true
 web = { workspace = true, optional = true }
 
 [features]
-default = ["web", "policy", "prompt", "shell", "edit", "chat", "retry", "settings", "subagent"]
+default = ["web", "policy", "prompt", "shell", "edit", "retry", "settings", "subagent"]
 # `a web`; about 110 KiB of the release binary.
 web = ["dep:web"]
 # Which calls wait for the user's approval.
@@ -38,8 +37,6 @@ prompt = ["dep:ext-prompt"]
 shell = ["dep:ext-shell"]
 # `edit`, which needs the working directory the shell provides.
 edit = ["shell", "dep:ext-edit"]
-# The model-backed `chat` agent.
-chat = ["dep:ext-chat"]
 # Model requests that failed for a reason that may pass are sent again.
 retry = ["dep:ext-retry"]
 # `/model`, which shows and sets the session's model.

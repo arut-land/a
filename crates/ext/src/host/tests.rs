@@ -344,6 +344,29 @@ fn tiers_order_extensions_and_guarded_ones_stay() {
     ));
 }
 
+extension!(Theirs, "theirs", 1, |r| r.tool(Named("theirs")));
+
+/// Two extensions of one tier naming the same tool: the later wins, and
+/// the registry says so, naming both. Across tiers it is an override,
+/// said nothing of.
+#[test]
+fn a_same_tier_clash_warns_and_the_later_wins() {
+    let registry = Registry::default()
+        .with(&Mine)
+        .and_then(|r| r.with(&Theirs))
+        .unwrap();
+    assert_eq!(registry.tools().specs().len(), 1);
+    assert_eq!(
+        registry.warnings(),
+        ["tool bash of extension theirs replaces the one of mine, in the same tier"]
+    );
+    let overridden = Registry::default()
+        .with_in(Tier::Pre, &Mine)
+        .and_then(|r| r.with(&Theirs))
+        .unwrap();
+    assert_eq!(overridden.warnings(), [] as [String; 0]);
+}
+
 #[test]
 fn commands_and_agents_are_found_by_name() {
     let registry = Registry::default()

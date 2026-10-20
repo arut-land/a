@@ -123,7 +123,7 @@ fn crash_everywhere(reg: impl Fn() -> Reg, inputs: &[&str]) {
 #[test]
 fn recovery_is_just_resume() {
     crash_everywhere(Reg::echo, &["sleep 1", "hi", "sleep 2", "bye"]);
-    crash_everywhere(|| Reg::chat().retry(Duration::ZERO), &["go", "again"]);
+    crash_everywhere(|| Reg::modeled().retry(Duration::ZERO), &["go", "again"]);
 }
 
 /// Refuses every call of a reply but its first: a `reply` handler.
@@ -234,10 +234,10 @@ fn states() -> Vec<(&'static str, Session)> {
         states.push((name, s));
     };
     state("idle", Reg::echo(), vec![user("hi")]);
-    state("model streaming", Reg::chat(), vec![user("hi")]);
-    let retrying = Reg::chat().retry(Duration::from_secs(1));
+    state("model streaming", Reg::modeled(), vec![user("hi")]);
+    let retrying = Reg::modeled().retry(Duration::from_secs(1));
     state("model backoff", retrying, vec![user("hi"), model_failed(2)]);
-    let recovering = Reg::chat().resend();
+    let recovering = Reg::modeled().resend();
     state(
         "model recovering",
         recovering,

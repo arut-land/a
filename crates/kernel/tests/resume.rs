@@ -40,7 +40,7 @@ fn progress(call: u64, text: &str) -> Body {
 /// whatever the `request_error` point would say.
 #[test]
 fn a_crash_loop_cannot_retry_forever() {
-    let reg = || Reg::chat().forever().arc();
+    let reg = || Reg::modeled().forever().arc();
     let mut log = log([input("hi"), model_call(0)]);
     for _ in 0..kernel::RESTART_CAP {
         let (s, fx) = Session::resume(reg(), log, &BUSY_LOAD);
@@ -185,7 +185,7 @@ fn a_wait_survives_a_restart_and_runs_once_answered() {
 /// `request_error` point retries it as it would any failure.
 #[test]
 fn a_model_call_cut_off_is_retried_as_a_failed_attempt() {
-    let reg = Reg::chat().retry(Duration::ZERO);
+    let reg = Reg::modeled().retry(Duration::ZERO);
     let (_, fx) = resume(reg, [input("hi"), model_call(0)], &BUSY_LOAD);
     let retry = Verdict::Retry {
         attempt: 1,
@@ -201,7 +201,7 @@ fn a_model_call_cut_off_is_retried_as_a_failed_attempt() {
             },
         ]
     );
-    let (_, fx) = resume(Reg::chat(), [input("hi"), model_call(0)], &BUSY_LOAD);
+    let (_, fx) = resume(Reg::modeled(), [input("hi"), model_call(0)], &BUSY_LOAD);
     let cut = failed("the daemon stopped during the call");
     assert_eq!(
         fx,
@@ -214,7 +214,7 @@ fn a_model_call_cut_off_is_retried_as_a_failed_attempt() {
 /// every attempt fails the call once the retries run out.
 #[test]
 fn a_crash_loop_fails_once_the_retries_run_out() {
-    let reg = || Reg::chat().retry(Duration::ZERO).arc();
+    let reg = || Reg::modeled().retry(Duration::ZERO).arc();
     let mut log = log([input("hi"), model_call(0)]);
     for _ in 0..RETRIES {
         let (s, fx) = Session::resume(reg(), log, &BUSY_LOAD);
