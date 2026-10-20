@@ -23,7 +23,9 @@ pub(super) enum Reply {
 #[derive(Default)]
 pub(super) struct Flaky {
     replies: Mutex<VecDeque<Reply>>,
-    sent: AtomicUsize,
+    sent: Mutex<usize>,
+    /// Notified at each request sent.
+    went: std::sync::Condvar,
     /// The bodies it was sent, in order.
     bodies: Mutex<Vec<Value>>,
 }
@@ -32,7 +34,8 @@ impl Flaky {
     pub(super) fn new(replies: impl IntoIterator<Item = Reply>) -> Arc<Self> {
         Arc::new(Self {
             replies: Mutex::new(replies.into_iter().collect()),
-            sent: AtomicUsize::new(0),
+            sent: Mutex::new(0),
+            went: std::sync::Condvar::new(),
             bodies: Mutex::default(),
         })
     }
@@ -43,7 +46,19 @@ impl Flaky {
     }
 
     pub(super) fn sent(&self) -> usize {
-        self.sent.load(Ordering::SeqCst)
+        *lock(&self.sent)
+    }
+
+    /// Waits until `n` requests have been sent: a request's call is logged
+    /// before it goes out.
+    pub(super) fn wait_sent(&self, n: usize) {
+        let sent = lock(&self.sent);
+        let (sent, waited) = self
+            .went
+            .wait_timeout_while(sent, PATIENCE, |sent| *sent < n)
+            .unwrap();
+        drop(sent);
+        assert!(!waited.timed_out(), "{n} requests were never sent");
     }
 }
 
@@ -65,7 +80,8 @@ impl Http for Flaky {
         &self,
         request: http::Request<llm::http::Payload>,
     ) -> llm::http::BoxFuture<'static, io::Result<llm::http::Response>> {
-        self.sent.fetch_add(1, Ordering::SeqCst);
+        *lock(&self.sent) += 1;
+        self.went.notify_all();
         let body = serde_json::from_slice(&request.body().to_vec()).unwrap_or_default();
         lock(&self.bodies).push(body);
         let reply = lock(&self.replies).pop_front();

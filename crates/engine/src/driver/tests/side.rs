@@ -97,6 +97,7 @@ fn a_side_call_dies_with_its_call() {
     let session = fixture(registry, &http).start(&[]);
     session.submit("hi").unwrap();
     until(&session, "asked aside", |log| !sides(log).is_empty());
+    http.wait_sent(2);
     session.interrupt_now();
     settle(&session);
     let log = log_of(&session);
