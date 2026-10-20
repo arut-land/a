@@ -23,6 +23,7 @@ mod interrupt;
 mod log;
 mod parsed;
 mod retry;
+mod scenarios;
 mod side;
 
 fn entry(seq: u64, body: Body) -> Entry {

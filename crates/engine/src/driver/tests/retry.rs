@@ -24,6 +24,8 @@ pub(super) enum Reply {
 pub(super) struct Flaky {
     replies: Mutex<VecDeque<Reply>>,
     sent: AtomicUsize,
+    /// The bodies it was sent, in order.
+    bodies: Mutex<Vec<Value>>,
 }
 
 impl Flaky {
@@ -31,7 +33,13 @@ impl Flaky {
         Arc::new(Self {
             replies: Mutex::new(replies.into_iter().collect()),
             sent: AtomicUsize::new(0),
+            bodies: Mutex::default(),
         })
+    }
+
+    /// The bodies of the requests sent, in order.
+    pub(super) fn bodies(&self) -> Vec<Value> {
+        lock(&self.bodies).clone()
     }
 
     pub(super) fn sent(&self) -> usize {
@@ -55,9 +63,11 @@ impl futures_core::Stream for Hanging {
 impl Http for Flaky {
     fn send(
         &self,
-        _: http::Request<llm::http::Payload>,
+        request: http::Request<llm::http::Payload>,
     ) -> llm::http::BoxFuture<'static, io::Result<llm::http::Response>> {
         self.sent.fetch_add(1, Ordering::SeqCst);
+        let body = serde_json::from_slice(&request.body().to_vec()).unwrap_or_default();
+        lock(&self.bodies).push(body);
         let reply = lock(&self.replies).pop_front();
         let response = |status, body: llm::http::Body| {
             http::Response::builder()
