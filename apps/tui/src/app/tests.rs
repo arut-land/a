@@ -344,7 +344,7 @@ fn the_wheel_scrolls_and_new_rows_keep_a_scrolled_view_still() {
     let (_, rows) = frame(&mut app, 40, 12);
     assert!(!rows.iter().any(|r| r.contains("message 39")));
     let top = rows[0].clone();
-    find(&rows, "newer below");
+    find(&rows, "Jump to bottom");
     app.fold(&entry(
         40,
         Body::Input {
@@ -997,4 +997,81 @@ fn esc_denies_an_approval_and_1_approves_it() {
         press(&mut app, Key::Char('1')),
         Some(Effect::Cmd(Cmd::Approve { approved: true, .. }))
     ));
+}
+
+/// A running call that nothing waits on: the approved `asked_command`.
+fn running_command() -> Vec<DaemonMsg> {
+    let mut msgs = asked_command();
+    msgs.push(entry(
+        5,
+        Body::Answer {
+            call: CallId::new(3).unwrap(),
+            value: Json::encode(&true).unwrap(),
+            origin: None,
+        },
+    ));
+    msgs
+}
+
+#[test]
+fn esc_interrupts_a_running_turn_that_asks_nothing() {
+    let (mut app, _) = app(Viewport::Full, &running_command());
+    assert!(matches!(
+        press(&mut app, Key::Esc),
+        Some(Effect::Cmd(Cmd::Interrupt))
+    ));
+}
+
+#[test]
+fn enter_confirms_the_highlighted_approval_and_down_moves_it_to_no() {
+    let (mut app, _) = app(Viewport::Full, &asked_command());
+    let (_, rows) = frame(&mut app, 70, 20);
+    find(&rows, "❯ 1. Yes");
+    assert!(matches!(
+        press(&mut app, Key::Enter),
+        Some(Effect::Cmd(Cmd::Approve { approved: true, .. }))
+    ));
+    press(&mut app, Key::Down);
+    let (_, rows) = frame(&mut app, 70, 20);
+    find(&rows, "❯ 2. No");
+    assert!(matches!(
+        press(&mut app, Key::Enter),
+        Some(Effect::Cmd(Cmd::Approve {
+            approved: false,
+            ..
+        }))
+    ));
+}
+
+/// The one timer exists only while a turn works: no tick is asked of the
+/// event loop when idle, nor while an approval waits for the person, nor
+/// once the call has ended.
+#[test]
+fn no_timer_runs_unless_a_turn_is_working() {
+    let (mut idle, _) = app(Viewport::Full, &[DaemonMsg::Synced { seq: 0 }]);
+    assert!(!idle.working());
+    frame(&mut idle, 70, 20);
+    idle.tick();
+    assert!(!idle.needs_frame(), "an idle tick owes no frame");
+    let (asked, _) = app(Viewport::Full, &asked_command());
+    assert!(!asked.working(), "an approval waits for the person");
+    let (mut busy, _) = app(Viewport::Full, &running_command());
+    assert!(busy.working());
+    let (_, rows) = frame(&mut busy, 70, 20);
+    find(&rows, "Working… (0s · esc to interrupt)");
+    busy.tick();
+    assert!(busy.needs_frame(), "a working turn redraws its clock");
+    busy.fold(&entry(
+        6,
+        Body::ToolResult {
+            call: CallId::new(3).unwrap(),
+            outcome: Outcome::Done {
+                output: Json::encode(&json!({"output": "", "exit": 0})).unwrap(),
+            },
+            card: None,
+        },
+    ));
+    assert!(!busy.working(), "the turn ended; the timer stops with it");
+    let (_, rows) = frame(&mut busy, 70, 20);
+    assert!(!rows.iter().any(|r| r.contains("Working")), "{rows:#?}");
 }

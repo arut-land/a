@@ -14,6 +14,9 @@ use super::{App, HELP, Overlay};
 /// The input shows at most this many rows; it scrolls past them.
 const INPUT_ROWS: usize = 8;
 
+/// The working indicator's glyphs, out and back.
+const SPINNER: [&str; 8] = ["✢", "✳", "✶", "✻", "✽", "✻", "✶", "✳"];
+
 /// The slash menu shows at most this many commands.
 const MENU_ROWS: usize = 6;
 
@@ -89,6 +92,7 @@ impl App {
     fn bottom(&mut self, width: usize) -> (Vec<Line>, Option<(u16, u16)>) {
         let summary = self.summary();
         let rule = self.rule(width);
+        let working = self.working_row(width);
         let mut out = Vec::new();
         if let Some(recap) = self
             .client
@@ -135,12 +139,14 @@ impl App {
                     Span::button(label, Style::new(), Action::Approve(*call, yes)),
                 ])
             };
-            out.push(pick("❯ ", "1. Yes", true));
-            out.push(pick("  ", "2. No", false));
+            let at = |no: bool| if no == self.deny { "❯ " } else { "  " };
+            out.push(pick(at(false), "1. Yes", true));
+            out.push(pick(at(true), "2. No", false));
         }
         if let Some((text, style)) = &self.flash {
             out.push(Line::plain(ellipsize(text, width), *style));
         }
+        out.extend(working);
         out.extend(self.menu_rows(width));
         out.push(rule.clone());
         let (mut rows, (cx, cy)) = self.editor.lines(width, USER);
@@ -148,7 +154,7 @@ impl App {
             // From the column after the caret, which would hide a first
             // letter under it.
             let hint = if asked.is_some() {
-                " 1 or y approves · 2, n or esc denies"
+                " enter confirms · 1/y yes · 2/n/esc no"
             } else if self.client.view().session.is_none() {
                 ""
             } else if self.client.turn().running {
@@ -172,6 +178,39 @@ impl App {
             )
         });
         (out, caret)
+    }
+
+    /// `✢ Working… (3s · ↓ 120 tokens · esc to interrupt)`, while a turn
+    /// works; its glyph turns with the clock.
+    fn working_row(&mut self, width: usize) -> Option<Line> {
+        if !self.working() {
+            self.since = None;
+            return None;
+        }
+        let spent = self.tokens.output;
+        let (began, before) = *self
+            .since
+            .get_or_insert_with(|| (std::time::Instant::now(), spent));
+        let elapsed = began.elapsed();
+        let secs = elapsed.as_secs();
+        let glyph =
+            SPINNER[usize::try_from(elapsed.as_millis() / 125).unwrap_or(0) % SPINNER.len()];
+        let mut note = if secs >= 60 {
+            format!("{}m {}s", secs / 60, secs % 60)
+        } else {
+            format!("{secs}s")
+        };
+        if spent > before {
+            let _ = write!(note, " · ↓ {} tokens", spent - before);
+        }
+        note.push_str(" · esc to interrupt");
+        Some(Line::from([
+            Span::new(format!("{glyph} "), Style::new().fg(Color::Yellow)),
+            Span::new(
+                ellipsize(&format!("Working… ({note})"), width.saturating_sub(2)),
+                MUTED,
+            ),
+        ]))
     }
 
     /// The slash commands the input's first word may become, as
@@ -472,7 +511,7 @@ impl App {
         }
         if self.anchor.is_some() && body > 0 {
             let more = Line::from([Span::button(
-                " ↓ newer below · esc ",
+                " Jump to bottom (click) ↓ ",
                 Style::new().fg(Color::Cyan).reversed(),
                 Action::Bottom,
             )]);

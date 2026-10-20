@@ -109,10 +109,8 @@ pub fn rows(item: &Item, width: usize, look: Look) -> Vec<Line> {
 fn reply(p: &Presented<'_>, width: usize) -> Vec<Line> {
     let mut out = vec![Line::default()];
     match (p.glyph, &p.body) {
-        (Glyph::Busy, _) => out.push(Line::from([
-            Span::new("✻ ", WARN),
-            Span::new(format!("{}…", p.title), MUTED),
-        ])),
+        // The indicator under the transcript says a call is out.
+        (Glyph::Busy, _) => return Vec::new(),
         (Glyph::None, Shown::Markdown("")) => return Vec::new(),
         (Glyph::None, body) => {
             out.extend(markdown(&body.text(), width, Style::new()));
@@ -444,7 +442,7 @@ mod tests {
             usage: None,
             purpose: None,
         };
-        assert_eq!(rows_of(&item, Look::default())[1], "✻ echo…");
+        assert!(rows_of(&item, Look::default()).len() <= 1);
         let mut live = Live::default();
         let mut lines = Vec::new();
         live.update(&mut lines, "hello **world**", 40);

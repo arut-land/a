@@ -82,6 +82,8 @@ pub struct App {
     editor: Editor,
     /// The slash menu's selected command.
     menu_at: usize,
+    /// The approval list's highlight: Yes until moved to No.
+    deny: bool,
     overlay: Option<Overlay>,
     /// A one-line notice (an error, a refused command) until the next key.
     flash: Option<(String, Style)>,
@@ -96,6 +98,9 @@ pub struct App {
     summary: Option<Summary>,
     /// Tokens the session's model calls used, summed as replies arrive.
     tokens: Usage,
+    /// While a turn works: when it began and the output tokens spent
+    /// before it, for the working indicator.
+    since: Option<(std::time::Instant, u64)>,
     /// Inline: the items already printed into the scrollback.
     committed: usize,
     /// The attach asked for the latest session: if there is none, the
@@ -136,6 +141,7 @@ impl App {
             body: 0,
             editor: Editor::default(),
             menu_at: 0,
+            deny: false,
             overlay: None,
             flash: None,
             recap_hidden: false,
@@ -144,6 +150,7 @@ impl App {
             rule: Line::default(),
             summary: None,
             tokens: Usage::default(),
+            since: None,
             committed: 0,
             resuming: matches!(target, Target::Latest { .. }),
             redraw: true,
@@ -162,6 +169,19 @@ impl App {
         self.redraw
     }
 
+    /// A turn is working and nothing waits for the person: the indicator
+    /// turns, and the event loop wakes to turn it. At every other time the
+    /// client has no timer.
+    pub fn working(&self) -> bool {
+        let turn = self.client.turn();
+        turn.running && turn.asking.is_none()
+    }
+
+    /// The indicator's clock ticked.
+    pub fn tick(&mut self) {
+        self.redraw |= self.working();
+    }
+
     pub fn view(&self) -> &SessionView {
         self.client.view()
     }
@@ -169,6 +189,9 @@ impl App {
     /// Has the session client carry out `cmd`; returns what the driver is
     /// to do.
     pub fn command(&mut self, cmd: Cmd) -> Vec<client::Effect> {
+        if let Cmd::Approve { .. } = cmd {
+            self.deny = false;
+        }
         if let Cmd::Sessions = cmd {
             self.overlay = Some(Overlay::Picker { selected: 0 });
             self.redraw = true;
@@ -320,6 +343,18 @@ impl App {
                 return Some(Effect::Cmd(Cmd::Approve {
                     call,
                     approved: matches!(c, 'y' | 'Y' | '1'),
+                }));
+            }
+            Key::Up | Key::Down | Key::Tab | Key::Ctrl('p' | 'n')
+                if self.editor.is_empty() && asked.is_some() =>
+            {
+                self.deny = !self.deny;
+            }
+            Key::Enter if self.editor.is_empty() && asked.is_some() => {
+                let deny = std::mem::take(&mut self.deny);
+                return Some(Effect::Cmd(Cmd::Approve {
+                    call: asked?,
+                    approved: !deny,
                 }));
             }
             Key::Esc if self.editor.is_empty() && asked.is_some() => {
