@@ -993,6 +993,65 @@ fn asking() -> Fixture {
     )
 }
 
+/// An interrupt stepped in the burst that approves a call stops that
+/// call: its cancel is carried out after the call starts, not before, when
+/// there would be nothing of it to stop.
+#[test]
+fn an_interrupt_in_the_burst_that_approves_a_call_stops_it() {
+    let probe = Probe::default();
+    let fixture = Fixture::on(
+        Arc::new(probe.clone()),
+        ext_fixtures::ECHO,
+        echoing(&Policy::ask(&["bash"])),
+        openai(&Script::new(&[])),
+    );
+    let session = fixture.create();
+    session.submit("$ sleep 30").unwrap();
+    settle(&session);
+    let [call] = inbox(&log_of(&session))[..] else {
+        panic!("not asked");
+    };
+    // The actor waits in a commit while the answer and the interrupt
+    // queue behind it.
+    let held = lock(&probe.held);
+    let queued = session.ask(
+        Request::Input {
+            text: "then".into(),
+            mode: Mode::Queue,
+        },
+        None,
+    );
+    while probe.waiting.load(Ordering::SeqCst) == 0 {
+        thread::yield_now();
+    }
+    let approve = Request::Answer {
+        call: CallId::new(call).unwrap(),
+        value: Json::encode(&true).unwrap(),
+    };
+    let asked = [
+        queued,
+        session.ask(approve, None),
+        session.ask(Request::Interrupt, None),
+    ];
+    drop(held);
+    for answer in asked {
+        rt::block_on(answer).unwrap();
+    }
+    let log = finished(&session, call);
+    session.halt();
+    let outcome = log.iter().find_map(|e| match &e.body {
+        Body::ToolResult {
+            call: c, outcome, ..
+        } if c.get() == call => Some(outcome),
+        _ => None,
+    });
+    // Aborted before it ran, or killed as it started: never run through.
+    assert!(
+        !matches!(outcome, Some(Outcome::Done { output }) if output.parse::<Value>().unwrap()["exit"] == 0),
+        "{log:#?}"
+    );
+}
+
 /// #18 `a_wait_survives_anything`: an ask waits in the inbox through a
 /// stop, every client that attaches folds it from the log, and it runs
 /// once approved.

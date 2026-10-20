@@ -286,6 +286,20 @@ impl Effect {
                 | Self::StartChild { .. }
         )
     }
+
+    /// The call whose work carrying it out starts, if it starts a call's.
+    pub const fn starts_call(&self) -> Option<CallId> {
+        match *self {
+            Self::Prepare { call, .. }
+            | Self::Send { call }
+            | Self::RunTool { call, .. }
+            | Self::Resume { call, .. }
+            | Self::Await { call, .. }
+            | Self::Recover { call, .. }
+            | Self::Sleep { call, .. } => Some(call),
+            _ => None,
+        }
+    }
 }
 
 /// Where the session's turn stands.

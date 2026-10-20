@@ -772,7 +772,8 @@ impl Actor {
     /// whose call the entries after it settle, a cancel, which the kernel
     /// orders before the outcome it then logs, and a busy mark, set before
     /// the work it marks, go before what was appended ahead of them is
-    /// committed. A commit that fails drops the rest and resumes from what
+    /// committed; a cancel of work `fx` has yet to start goes after that
+    /// start, as before it there is nothing of the call's to stop. A commit that fails drops the rest and resumes from what
     /// the log holds.
     async fn carry(&mut self, fx: Effects) {
         let mut batch = Vec::new();
@@ -785,6 +786,9 @@ impl Actor {
                         return;
                     }
                     self.effect(effect);
+                }
+                Effect::Cancel { call } if after.iter().any(|e| e.starts_call() == Some(call)) => {
+                    after.push(effect);
                 }
                 Effect::MarkBusy(true) | Effect::Cancel { .. } => self.effect(effect),
                 effect => after.push(effect),
