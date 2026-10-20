@@ -161,3 +161,16 @@ cache flushes under concurrency; it cannot amortize an isolated promise.
 The host contention and small number of independent runs warrant a quiet
 repeat before treating these ratios as stable. Shipped binary size from
 `mise run size`: 2,910 KiB before, 2,894 KiB after, both below 4,096 KiB.
+
+After these measurements, `main` advanced to `6744d05` and was merged as
+`b498833`. The tables identify the pre-merge variants; the incoming client
+changes were not remeasured. On the merged tree, `mise run check` passed
+839 tests, acceptance passed 12, seeded crash checks passed eight
+(`A_CRASH_SEED=20261021`), and all five release budget checks passed.
+Windows clippy, machete and the no-Tokio check passed; shipped size was
+still 2,894 KiB. `mise run test:miri` stopped at the existing unsupported
+CoreFoundation `CFStringCreateWithCString` call in `sys::awake`; skipping
+that also encounters an unsupported process-spawn call in `sys::crash`.
+A supported subset (config, log and login parsing) passed 10 tests. The
+full prescribed Miri task therefore remains unverified. Benchmark homes
+and processes were checked absent after cleanup.
