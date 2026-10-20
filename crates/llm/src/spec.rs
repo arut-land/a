@@ -16,6 +16,8 @@ use std::fmt;
 use std::num::NonZeroU32;
 use std::sync::{Arc, Mutex, PoisonError};
 
+use crate::conversation::Shared;
+
 pub use ::json::Json;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -148,55 +150,51 @@ pub struct Tool {
     pub schema: Value,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub strict: Option<bool>,
-    /// Its definition as each protocol encodes it, made the first time.
-    #[serde(skip)]
-    pub encoded: Encodings,
-}
-
-impl Tool {
-    /// The tool's definition as protocol `key` encodes it, `encode` run
-    /// for the first request that offers it and kept for every later one:
-    /// a tool set never changes, so neither do its definitions.
-    pub(crate) fn encoded(&self, key: &'static str, encode: impl FnOnce(&Self) -> Value) -> Value {
-        let mut kept = self
-            .encoded
-            .0
-            .lock()
-            .unwrap_or_else(PoisonError::into_inner);
-        if let Some((_, value)) = kept.iter().find(|(k, _)| *k == key) {
-            return value.clone();
-        }
-        let value = encode(self);
-        kept.push((key, value.clone()));
-        value
-    }
-}
-
-/// A tool's definitions as protocols encode them, shared by its copies.
-#[derive(Clone, Default)]
-pub struct Encodings(Arc<Mutex<Vec<(&'static str, Value)>>>);
-
-impl fmt::Debug for Encodings {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.write_str("Encodings")
-    }
-}
-
-/// What is kept follows from the tool, which tells two apart.
-impl PartialEq for Encodings {
-    fn eq(&self, _: &Self) -> bool {
-        true
-    }
 }
 
 /// The tools a request offers: shared, as every request of a tool set
-/// offers the same.
-#[derive(Clone, Debug, Default, PartialEq)]
-pub struct Tools(Arc<[Tool]>);
+/// offers the same, with their definitions as each wire encodes them, made
+/// for the first request that offers them and kept for every later one.
+#[derive(Clone, Default)]
+pub struct Tools(Arc<Set>);
+
+#[derive(Default)]
+struct Set {
+    tools: Vec<Tool>,
+    /// Each tool's definition, as bytes, per wire it was encoded for.
+    encoded: Mutex<Vec<(ToolWire, Arc<[Shared]>)>>,
+}
+
+/// A wire's way of writing a tool definition.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum ToolWire {
+    Chat { strict: bool },
+    Responses { strict: bool },
+    Messages { strict: bool, eager: bool },
+    Gemini,
+}
 
 impl Tools {
     fn is_empty(&self) -> bool {
-        self.0.is_empty()
+        self.0.tools.is_empty()
+    }
+
+    /// The tools' definitions as `wire` writes them, one byte run each:
+    /// `encode` runs once per tool, for the first request.
+    pub(crate) fn encoded(&self, wire: ToolWire, encode: impl Fn(&Tool) -> Value) -> Arc<[Shared]> {
+        let mut kept = self
+            .0
+            .encoded
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner);
+        if let Some((_, run)) = kept.iter().find(|(w, _)| *w == wire) {
+            return Arc::clone(run);
+        }
+        let run: Arc<[Shared]> = (self.0.tools.iter())
+            .map(|tool| serde_json::to_vec(&encode(tool)).unwrap_or_default().into())
+            .collect();
+        kept.push((wire, Arc::clone(&run)));
+        run
     }
 }
 
@@ -204,25 +202,42 @@ impl std::ops::Deref for Tools {
     type Target = [Tool];
 
     fn deref(&self) -> &[Tool] {
-        &self.0
+        &self.0.tools
+    }
+}
+
+/// Two tool sets are equal when their tools are: what each wire made of
+/// them follows.
+impl PartialEq for Tools {
+    fn eq(&self, other: &Self) -> bool {
+        **self == **other
+    }
+}
+
+impl fmt::Debug for Tools {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        self.0.tools.fmt(f)
     }
 }
 
 impl From<Vec<Tool>> for Tools {
     fn from(tools: Vec<Tool>) -> Self {
-        Self(tools.into())
+        Self(Arc::new(Set {
+            tools,
+            encoded: Mutex::default(),
+        }))
     }
 }
 
 impl FromIterator<Tool> for Tools {
     fn from_iter<I: IntoIterator<Item = Tool>>(tools: I) -> Self {
-        Self(tools.into_iter().collect())
+        Vec::from_iter(tools).into()
     }
 }
 
 impl Serialize for Tools {
     fn serialize<S: serde::Serializer>(&self, s: S) -> Result<S::Ok, S::Error> {
-        s.collect_seq(self.0.iter())
+        s.collect_seq(self.0.tools.iter())
     }
 }
 
@@ -814,31 +829,40 @@ mod read;
 
 #[cfg(test)]
 mod tests {
+    use std::cell::Cell;
+
     use super::*;
 
-    /// A tool set never changes, so each protocol encodes its definitions
-    /// once: every copy of a tool shares what was made.
+    /// A tool set never changes, so each wire encodes its definitions
+    /// once, as bytes every copy of the set shares; another wire, or the
+    /// same one strict, encodes its own.
     #[test]
-    fn a_tool_is_encoded_once_per_protocol() {
-        let tool = Tool {
-            name: "t".into(),
+    fn a_tool_set_is_encoded_once_per_wire() {
+        let tool = |name: &str| Tool {
+            name: name.into(),
             description: String::new(),
             schema: serde_json::json!({ "type": "object" }),
             strict: None,
-            encoded: Encodings::default(),
         };
-        let tools = Tools::from(vec![tool]);
+        let tools = Tools::from(vec![tool("a"), tool("b")]);
         let copy = tools.clone();
-        let mut made = 0;
+        let made = Cell::new(0);
+        let encode = |tool: &Tool| {
+            made.set(made.get() + 1);
+            serde_json::json!({ "name": tool.name })
+        };
+        let chat = ToolWire::Chat { strict: false };
         for tools in [&tools, &copy, &tools] {
-            let encoded = tools[0].encoded("p", |t| {
-                made += 1;
-                serde_json::json!({ "name": t.name })
-            });
-            assert_eq!(encoded["name"], "t");
+            let run = tools.encoded(chat, encode);
+            let texts: Vec<&str> = run
+                .iter()
+                .map(|bytes| std::str::from_utf8(bytes).unwrap())
+                .collect();
+            assert_eq!(texts, [r#"{"name":"a"}"#, r#"{"name":"b"}"#]);
         }
-        assert_eq!(made, 1);
-        let other = tools[0].encoded("q", |_| serde_json::json!(2));
-        assert_eq!(other, 2);
+        assert_eq!(made.get(), 2);
+        tools.encoded(ToolWire::Chat { strict: true }, encode);
+        assert_eq!(made.get(), 4);
+        assert_eq!(tools, copy, "the tools, not what was made of them");
     }
 }

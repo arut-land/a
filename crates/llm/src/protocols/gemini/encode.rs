@@ -18,11 +18,11 @@ use crate::error::Error;
 use crate::json::{Lenient, obj};
 use crate::models::Reasoning;
 use crate::models::google as model;
-use crate::protocol::Target;
+use crate::protocol::{Encoded, Target};
 use crate::replay::{Replay, replay, replays};
 use crate::spec::{
     AssistantPart, Effort, Format, Generation, Media, Message, Output, Request, SmolStr, Source,
-    Tool, ToolChoice, ToolResult, UserPart,
+    Tool, ToolChoice, ToolResult, ToolWire, UserPart,
 };
 
 /// What leads the user content a tool result's images move to, for a model
@@ -182,10 +182,12 @@ impl Fold for Contents {
         &self.cx
     }
 
-    /// Every content but the last when that is a user's, which the next may
-    /// join; where only the current turn keeps its signatures, those before
-    /// the newest user text, without theirs.
-    fn settle(&mut self, out: &mut Settled) {
+    /// After each message, every content but the last when that is a
+    /// user's, which the next may join, settles; where only the current
+    /// turn keeps its signatures, those before the newest user text,
+    /// without theirs.
+    fn push(&mut self, at: usize, message: &Message, out: &mut Settled) -> Result<(), Error> {
+        self.take(at, message)?;
         let settled = match self.cx.thought_replay {
             ThoughtReplay::All => {
                 let user = self
@@ -203,9 +205,12 @@ impl Fold for Contents {
         for content in &settled {
             out.item(content);
         }
+        Ok(())
     }
+}
 
-    fn push(&mut self, _: usize, message: &Message) -> Result<(), Error> {
+impl Contents {
+    fn take(&mut self, _: usize, message: &Message) -> Result<(), Error> {
         let model = &*self.cx.model;
         let ids = model::takes_call_ids(model);
         match message {
@@ -254,7 +259,7 @@ pub(super) fn contents(
 ) -> Result<(Vec<Value>, Vec<Value>), Error> {
     let mut contents = Contents::new(model, ThoughtReplay::All);
     for (at, message) in messages.iter().enumerate() {
-        contents.push(at, message)?;
+        contents.take(at, message)?;
     }
     Ok(contents.finish())
 }
@@ -480,41 +485,44 @@ fn generation_config(model: &str, request: &Request) -> Value {
     }))
 }
 
-/// The request body for `request` to `target`. This protocol's options are
-/// body fields merged over it last: their `tools` join the declared ones,
-/// and objects such as `generationConfig` merge key by key.
+/// The request for `request` to `target`, but its path. This protocol's
+/// options are body fields merged over it last: their `tools` join the
+/// declared ones, and objects such as `generationConfig` merge key by key.
 pub(crate) fn body(
     gemini: &Gemini,
     target: &Target<'_>,
     request: &Request,
-) -> Result<(Value, Option<History>), Error> {
+) -> Result<Encoded, Error> {
     let model = target.model;
     let contents = Contents::new(model, gemini.quirks.thought_replay);
     let (contents, settled) = conversation::fold(&request.messages, target, contents)?;
     let (tail, system) = contents.finish();
     let mut options = request.options_for(KEY);
-    let declared = some(
-        (request.tools.iter())
-            .map(|tool| tool.encoded("gemini", declaration))
-            .collect(),
-    );
-    let mut tools = Vec::from_iter(declared.map(|tools| obj!({"functionDeclarations": tools})));
-    if let Some(Value::Array(hosted)) = options.remove("tools") {
-        tools.extend(hosted);
-    }
-    let choice = &request.tool_choice;
-    let history = (!options.contains_key("contents")).then(|| History {
-        key: "contents",
+    let declared =
+        (!request.tools.is_empty()).then(|| request.tools.encoded(ToolWire::Gemini, declaration));
+    let hosted = crate::protocols::responses::encode::hosted_tools(&mut options);
+    // The declarations are one tool among the hosted ones.
+    let tools = (declared.is_some() || !hosted.is_empty()).then(|| History {
+        key: "tools",
         head: Vec::new(),
-        settled,
-        tail,
+        settled: declared.map_or_default(|run| run.to_vec()),
+        tail: hosted,
+        wrap: Some((r#"{"functionDeclarations":["#, "]}")),
     });
+    let choice = &request.tool_choice;
+    let history =
+        (!options.contains_key("contents")).then(|| History::new("contents", settled, tail));
     let mut body = set(obj!({
         "systemInstruction": some(system.into()).map(|parts| obj!({"parts": parts})),
         "generationConfig": some(generation_config(model, request)),
-        "tools": some(tools.into()),
         "toolConfig": (*choice != ToolChoice::Auto).then(|| tool_config(choice)),
     }));
     crate::json::overlay(&mut body, &options);
-    Ok((body, history))
+    Ok(Encoded {
+        path: String::new(),
+        body,
+        history,
+        tools,
+        headers: Vec::new(),
+    })
 }

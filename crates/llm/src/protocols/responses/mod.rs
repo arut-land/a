@@ -2,7 +2,7 @@
 //! it with their quirks.
 
 mod decode;
-mod encode;
+pub(super) mod encode;
 
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -79,12 +79,10 @@ impl Protocol for Responses {
     }
 
     fn encode(&self, target: &Target<'_>, request: &Request) -> Result<Encoded, Error> {
-        let (body, history) = encode::body(self, target, request)?;
+        let encoded = encode::body(self, target, request)?;
         Ok(Encoded {
             path: self.quirks.path.to_owned(),
-            body,
-            history,
-            headers: Vec::new(),
+            ..encoded
         })
     }
 

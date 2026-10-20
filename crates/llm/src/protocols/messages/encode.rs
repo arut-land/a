@@ -24,25 +24,25 @@ use crate::json::Lenient;
 use crate::models::anthropic::{
     binds_context, rejects_forced_tool_choice, takes_mid_conversation_system,
 };
-use crate::protocol::Target;
+use crate::protocol::{Encoded, Target};
 use crate::replay::{Replay, replay, replays};
 use crate::spec::{
     Assistant, AssistantPart, Format, Json, Media, Message, Output, Request, Source, System, Tool,
-    ToolChoice, ToolResult, UserPart,
+    ToolChoice, ToolResult, ToolWire, UserPart,
 };
 
 /// What an assistant image goes as: assistant turns take no images.
 pub(super) const ASSISTANT_IMAGE_OMITTED: &str = "(image omitted: model does not support images)";
 
-/// The body for `request` to `model`, and the `anthropic-beta` header it
-/// needs: the request's own fields with the cache breakpoints placed inside
-/// them, then the mapped generation settings, then the caller's options,
-/// then the rewrites the API requires.
+/// The request for `request` to `model`, but its path and headers, and the
+/// `anthropic-beta` header it needs: the request's own fields with the
+/// cache breakpoints placed inside them, then the mapped generation
+/// settings, then the caller's options, then the rewrites the API requires.
 pub(super) fn body(
     quirks: Quirks,
     target: &Target<'_>,
     request: &Request,
-) -> Result<(Value, Option<History>, Option<String>), Error> {
+) -> Result<(Encoded, Option<String>), Error> {
     let model = target.model;
     let mut options = request.options_for(KEY);
     let max_tokens = request.generation.max_output_tokens.map(NonZeroU32::get);
@@ -51,25 +51,31 @@ pub(super) fn body(
         return Err(Error::unsupported(unset));
     };
     let caching = Caching::of(&options)?;
-    let key = match (quirks.strict_tool_schemas, quirks.tool_input_streaming) {
-        (true, ToolInputStreaming::Eager) => "messages strict eager",
-        (true, _) => "messages strict",
-        (false, ToolInputStreaming::Eager) => "messages eager",
-        (false, _) => "messages",
+    let wire = ToolWire::Messages {
+        strict: quirks.strict_tool_schemas,
+        eager: quirks.tool_input_streaming == ToolInputStreaming::Eager,
     };
-    let mut tools = Vec::from_iter(
-        (request.tools.iter()).map(|tool| tool.encoded(key, |tool| tool_json(tool, quirks))),
-    );
+    let typed = (!request.tools.is_empty())
+        .then(|| request.tools.encoded(wire, |tool| tool_json(tool, quirks)));
+    let mut typed = typed.map_or_default(|run| run.to_vec());
     // The options the encoder reads rather than sends.
     let [raw_tools, betas] = ["tools", "betas"].map(|key| options.remove(key));
     for key in ["prompt_caching", "static_prefix_cache_ttl"] {
         options.remove(key);
     }
-    match raw_tools {
-        None | Some(Value::Null) => {}
-        Some(Value::Array(raw)) => tools.extend(raw),
+    let mut tools = match raw_tools {
+        None | Some(Value::Null) => Vec::new(),
+        Some(Value::Array(raw)) => raw,
         Some(_) => return Err(Error::unsupported("the `tools` option must be an array")),
+    };
+    // A breakpoint goes on the last tool not deferred: when that is one of
+    // the request's own, that one is written for this request, marked.
+    let deferred = |tool: &Value| tool.get("defer_loading") == Some(&Value::Bool(true));
+    if caching.marks_tools() && typed.pop().is_some() && tools.iter().all(deferred) {
+        let last = request.tools.last().expect("a tool was encoded");
+        tools.insert(0, tool_json(last, quirks));
     }
+    let has_tools = !typed.is_empty() || !tools.is_empty();
     let mid = takes_mid_conversation_system(model);
     let (turns, settled) = conversation::fold(&request.messages, target, Turns::new(mid))?;
     let Ended {
@@ -83,11 +89,8 @@ pub(super) fn body(
     if !system.is_empty() {
         body["system"] = system.into();
     }
-    if let Some(choice) = tool_choice(quirks.dialect, model, request, !tools.is_empty()) {
+    if let Some(choice) = tool_choice(quirks.dialect, model, request, has_tools) {
         body["tool_choice"] = choice;
-    }
-    if !tools.is_empty() {
-        body["tools"] = tools.into();
     }
     if let Some(Format::Json { schema, .. }) = &request.format
         && let Some(schema) = schema
@@ -101,19 +104,16 @@ pub(super) fn body(
     {
         body["container"] = container.into();
     }
-    let history = (!options.contains_key("messages")).then(|| History {
-        key: "messages",
-        head: Vec::new(),
-        settled,
-        tail: messages,
-    });
+    let history =
+        (!options.contains_key("messages")).then(|| History::new("messages", settled, messages));
+    let tools = has_tools.then(|| History::new("tools", typed, tools));
     let mapped = options::generation(quirks, model, &request.generation, max_tokens);
     crate::json::overlay(&mut body, &mapped);
     crate::json::overlay(&mut body, &options);
     let unbound =
         quirks.dialect == Dialect::Anthropic && binds_context(model) && drop_unbound(&mut body);
     // Anthropic rejects a tool choice without tools.
-    if body.arr("tools").is_empty() {
+    if !has_tools {
         if let Some(fields) = body.as_object_mut() {
             fields.remove("tool_choice");
         }
@@ -138,7 +138,14 @@ pub(super) fn body(
         .collect();
     betas.extend(missing);
     let betas = (!betas.is_empty()).then(|| betas.join(","));
-    Ok((body, history, betas))
+    let encoded = Encoded {
+        path: String::new(),
+        body,
+        history,
+        tools,
+        headers: Vec::new(),
+    };
+    Ok((encoded, betas))
 }
 
 /// Ask Anthropic to drop a thinking block bound to another context rather
@@ -384,8 +391,6 @@ pub(super) struct Turns {
     follows: Option<bool>,
     /// The messages since the turns that settled.
     open: Vec<Message>,
-    /// Messages placed, written, to settle.
-    placed: Vec<u8>,
     /// Whether a message other than a system message came.
     begun: bool,
     /// Whether a system message came mid-conversation on `mid`.
@@ -414,7 +419,6 @@ impl Turns {
             system: Vec::new(),
             follows: None,
             open: Vec::new(),
-            placed: Vec::new(),
             begun: false,
             pinned: false,
             container: None,
@@ -451,7 +455,7 @@ impl Fold for Turns {
         &self.mid
     }
 
-    fn push(&mut self, _: usize, message: &Message) -> Result<(), Error> {
+    fn push(&mut self, _: usize, message: &Message, out: &mut Settled) -> Result<(), Error> {
         match message {
             Message::System(system) => {
                 self.pinned |= self.mid && self.begun && !system.text().is_empty();
@@ -472,11 +476,7 @@ impl Fold for Turns {
                 .markers
                 .then(Markers::of(blocks.filter_map(Block::as_tree)));
             for sent in &placed.sent {
-                if !self.placed.is_empty() {
-                    self.placed.push(b',');
-                }
-                // Writing to memory cannot fail.
-                let _ = serde_json::to_writer(&mut self.placed, sent);
+                out.item(sent);
             }
             self.system.extend(placed.system);
             self.follows = placed.follows;
@@ -487,11 +487,6 @@ impl Fold for Turns {
             self.open.clear();
         }
         Ok(())
-    }
-
-    fn settle(&mut self, out: &mut Settled) {
-        out.written(&self.placed);
-        self.placed.clear();
     }
 }
 

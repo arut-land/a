@@ -82,7 +82,6 @@ fn tool(name: &str) -> Tool {
         description: format!("{name} description"),
         schema: json!({"type": "object", "properties": {}}),
         strict: None,
-        encoded: crate::Encodings::default(),
     }
 }
 

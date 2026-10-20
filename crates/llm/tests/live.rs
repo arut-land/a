@@ -54,7 +54,6 @@ fn responses_tool_round_trip_replays_its_items() {
         description: "Returns the label of a harbor by its number.".into(),
         schema: json!({"type": "object", "properties": {"number": {"type": "integer"}}, "required": ["number"]}),
         strict: None,
-        encoded: llm::Encodings::default(),
     };
     let mut request = Request {
         model: model(),
@@ -136,7 +135,6 @@ fn messages_thinking_tool_round_trip_replays_its_signature() {
         description: "Returns the label of a harbor by its number.".into(),
         schema: json!({"type": "object", "properties": {"number": {"type": "integer"}}, "required": ["number"]}),
         strict: None,
-        encoded: llm::Encodings::default(),
     };
     let mut request = Request {
         model: claude(),
@@ -199,7 +197,6 @@ fn tool_round_trip(provider: &Provider, model: &str) {
         description: "Returns the label of a harbor by its number.".into(),
         schema: json!({"type": "object", "properties": {"number": {"type": "integer"}}, "required": ["number"]}),
         strict: None,
-        encoded: llm::Encodings::default(),
     };
     let mut request = Request {
         model: model.into(),

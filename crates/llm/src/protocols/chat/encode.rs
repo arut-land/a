@@ -15,12 +15,12 @@ use crate::conversation::{self, Fold, History, Settled};
 use crate::error::Error;
 use crate::json::{Lenient, obj};
 use crate::models::openai;
-use crate::protocol::Target;
+use crate::protocol::{Encoded, Target};
 use crate::protocols::schema;
 use crate::replay::{Replay, replay, replays};
 use crate::spec::{
     Assistant, AssistantPart, Format, Media, Message, Output, Request, Source, Tool, ToolCall,
-    ToolChoice, ToolResult, UserPart,
+    ToolChoice, ToolResult, ToolWire, UserPart,
 };
 
 /// What replaces an image for a model that reads none.
@@ -322,6 +322,7 @@ pub(super) struct Wire {
     later: bool,
     /// Whether a tool message went.
     answered: bool,
+    /// How many messages settled.
     settled: usize,
 }
 
@@ -368,7 +369,10 @@ impl Fold for Wire {
         &self.ctx
     }
 
-    fn settle(&mut self, out: &mut Settled) {
+    /// Every message but a trailing user message, which the next may join,
+    /// settles as the host takes it.
+    fn push(&mut self, _: usize, message: &Message, out: &mut Settled) -> Result<(), Error> {
+        self.take(message);
         let user = self
             .open
             .last()
@@ -379,9 +383,12 @@ impl Fold for Wire {
             out.item(&message);
         }
         self.settled += settled;
+        Ok(())
     }
+}
 
-    fn push(&mut self, _: usize, message: &Message) -> Result<(), Error> {
+impl Wire {
+    fn take(&mut self, message: &Message) {
         let ctx = &self.ctx;
         let messages = &mut self.open;
         if let Message::System(system) = message {
@@ -393,7 +400,7 @@ impl Fold for Wire {
                 let system = |text: String| Role::System.message(vec![text_part(&text)].into());
                 messages.extend(text.map(system));
             }
-            return Ok(());
+            return;
         }
         self.begun = true;
         match message {
@@ -419,7 +426,6 @@ impl Fold for Wire {
             }
             Message::Assistant(assistant) => messages.extend(assistant_message(assistant, ctx)),
         }
-        Ok(())
     }
 }
 
@@ -608,12 +614,12 @@ fn response_format(format: &Format) -> Option<Value> {
     Some(obj!({"type": "json_schema", "json_schema": json_schema}))
 }
 
-/// The request body for `request` to `target`.
+/// The request for `request` to `target`, but its path.
 pub(super) fn body(
     quirks: &Quirks,
     target: &Target<'_>,
     request: &Request,
-) -> Result<(Value, Option<History>), Error> {
+) -> Result<Encoded, Error> {
     let model = target.model;
     let mut options = request.options_for(KEY);
     // The request's own tools, function or native (Groq's
@@ -638,18 +644,15 @@ pub(super) fn body(
     // at once, so the model can still call a tool.
     let answered = wire.answered;
     let (head, tail) = wire.finish()?;
-    let typed = request.tools.iter().filter(|_| quirks.supports_tools);
-    let mut tools: Vec<Value> = typed
-        .map(|tool| {
-            if quirks.strict_tools {
-                tool.encoded("chat strict", |tool| function_tool(tool, true))
-            } else {
-                tool.encoded("chat", |tool| function_tool(tool, false))
-            }
-        })
-        .collect();
-    tools.extend(passthrough);
-    let offers_tools = quirks.supports_tools && !tools.is_empty();
+    let strict = quirks.strict_tools;
+    let typed = (quirks.supports_tools && !request.tools.is_empty()).then(|| {
+        let wire = ToolWire::Chat { strict };
+        request
+            .tools
+            .encoded(wire, |tool| function_tool(tool, strict))
+    });
+    let has_tools = typed.is_some() || !passthrough.is_empty();
+    let offers_tools = quirks.supports_tools && has_tools;
     if offers_tools
         && matches!(quirks.vendor, V::OpenAi | V::Azure)
         && !openai::chat_calls_tools(model)
@@ -662,7 +665,7 @@ pub(super) fn body(
         .format
         .as_ref()
         .filter(|_| quirks.supports_response_format)
-        .filter(|_| quirks.response_format_with_tools || tools.is_empty() || answered)
+        .filter(|_| quirks.response_format_with_tools || !has_tools || answered)
         .and_then(response_format);
     let choice = (offers_tools && request.tool_choice != ToolChoice::Auto)
         .then(|| tool_choice(&request.tool_choice));
@@ -671,7 +674,7 @@ pub(super) fn body(
         model,
         &request.generation,
         request.parallel_tool_calls,
-        !tools.is_empty(),
+        has_tools,
     );
     let cache_key = request
         .cache_key
@@ -681,7 +684,6 @@ pub(super) fn body(
         "model": (quirks.routing == Routing::Path).then_some(model),
         "response_format": format,
         "tool_choice": choice,
-        "tools": (!tools.is_empty()).then_some(tools),
         "prompt_cache_key": cache_key.map(String::as_str),
         "stream": true,
     });
@@ -695,10 +697,21 @@ pub(super) fn body(
         head,
         settled,
         tail,
+        wrap: None,
+    });
+    let tools = has_tools.then(|| {
+        let typed = typed.map_or_default(|run| run.to_vec());
+        History::new("tools", typed, passthrough)
     });
     crate::json::overlay(&mut body, &options);
     if let Some(fields) = body.as_object_mut() {
-        rewrite::finish(quirks, fields, history.as_mut())?;
+        rewrite::finish(quirks, fields, history.as_mut(), has_tools)?;
     }
-    Ok((body, history))
+    Ok(Encoded {
+        path: String::new(),
+        body,
+        history,
+        tools,
+        headers: Vec::new(),
+    })
 }

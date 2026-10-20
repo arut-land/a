@@ -23,7 +23,6 @@ pub(super) fn tool(name: &str) -> Tool {
         description: "a tool".into(),
         schema: json!({"type": "object", "properties": {}}),
         strict: None,
-        encoded: crate::Encodings::default(),
     }
 }
 
@@ -127,7 +126,6 @@ fn a_recorded_request_is_what_we_send() {
         description: "Matrix tool ping".into(),
         schema: json!({"type": "object", "properties": {}, "additionalProperties": false}),
         strict: None,
-        encoded: crate::Encodings::default(),
     }]
     .into();
     call.tool_choice = ToolChoice::Required;

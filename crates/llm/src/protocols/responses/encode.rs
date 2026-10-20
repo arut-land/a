@@ -12,12 +12,12 @@ use crate::conversation::{self, Fold, History, Settled};
 use crate::error::Error;
 use crate::json::Lenient;
 use crate::models::openai;
-use crate::protocol::Target;
+use crate::protocol::{Encoded, Target};
 use crate::protocols::schema;
 use crate::replay::{Replay, replay, replays};
 use crate::spec::{
     AssistantPart, Effort, Format, Media, Message, Output, Request, SmolStr, Source, Tool,
-    ToolChoice, ToolResult, UserPart,
+    ToolChoice, ToolResult, ToolWire, UserPart,
 };
 
 /// The request body but its `input` and `tools`, which move in after
@@ -50,12 +50,12 @@ struct Body<'a> {
     prompt_cache_key: Option<&'a str>,
 }
 
-/// The request body for `request` to `target`.
+/// The request for `request` to `target`, but its path.
 pub(crate) fn body(
     responses: &Responses,
     target: &Target<'_>,
     request: &Request,
-) -> Result<(Value, Option<History>), Error> {
+) -> Result<Encoded, Error> {
     let (model, generation) = (target.model, &request.generation);
     let mut options = request.options_for(KEY);
     // Stateless unless the caller keeps the conversation on the provider:
@@ -70,22 +70,15 @@ pub(crate) fn body(
     let (input, settled) = conversation::fold(&request.messages, target, Input::new(cx))?;
     let (instructions, tail) = input.finish()?;
     let strict = responses.quirks.strict_tools;
-    let mut tools: Vec<Value> = request
-        .tools
-        .iter()
-        .map(|tool| {
-            if strict {
-                tool.encoded("responses strict", |tool| function_tool(tool, true))
-            } else {
-                tool.encoded("responses", |tool| function_tool(tool, false))
-            }
-        })
-        .collect();
+    let typed = (!request.tools.is_empty()).then(|| {
+        let wire = ToolWire::Responses { strict };
+        request
+            .tools
+            .encoded(wire, |tool| function_tool(tool, strict))
+    });
     // Hosted tools go with the rest; the caller's other options go last.
-    if let Some(Value::Array(hosted)) = options.remove("tools") {
-        tools.extend(hosted);
-    }
-    let tooled = !tools.is_empty();
+    let hosted = hosted_tools(&mut options);
+    let tooled = typed.is_some() || !hosted.is_empty();
     // Reasoning models reject sampling while they reason: dropped rather
     // than failing a request that would otherwise succeed.
     let sampling = openai::sampling(model).takes(generation.reasoning);
@@ -114,19 +107,33 @@ pub(crate) fn body(
     };
     let mut body =
         serde_json::to_value(body).map_err(|error| Error::unsupported(error.to_string()))?;
-    let history = (!options.contains_key("input")).then(|| History {
-        key: "input",
-        head: Vec::new(),
-        settled,
-        tail,
+    let history = (!options.contains_key("input")).then(|| History::new("input", settled, tail));
+    let tools = tooled.then(|| {
+        let typed = typed.map_or_default(|run| run.to_vec());
+        History::new("tools", typed, hosted)
     });
     if let Some(fields) = body.as_object_mut() {
-        if tooled {
-            fields.insert("tools".to_owned(), tools.into());
-        }
         fields.extend(options);
     }
-    Ok((body, history))
+    Ok(Encoded {
+        path: String::new(),
+        body,
+        history,
+        tools,
+        headers: Vec::new(),
+    })
+}
+
+/// The `tools` option's list, taken out of `options`; a `tools` that is no
+/// list stays an option.
+pub(crate) fn hosted_tools(options: &mut Map<String, Value>) -> Vec<Value> {
+    match options.get("tools") {
+        Some(Value::Array(_)) => match options.remove("tools") {
+            Some(Value::Array(hosted)) => hosted,
+            _ => Vec::new(),
+        },
+        _ => Vec::new(),
+    }
 }
 
 /// The keys of a stale item a rebuilt part keeps.
@@ -257,10 +264,6 @@ pub(crate) struct Input {
     /// The leading system messages, while nothing else came, where they
     /// go to `instructions` if they lead.
     open: Vec<Value>,
-    /// Items written as they came, to settle.
-    written: Vec<u8>,
-    /// How many items `written` holds.
-    pending: usize,
     /// The system texts lifted to `instructions`.
     lifted: Vec<String>,
     /// How many items settled.
@@ -275,8 +278,6 @@ impl Input {
             cx,
             custom: Vec::new(),
             open: Vec::new(),
-            written: Vec::new(),
-            pending: 0,
             lifted: Vec::new(),
             settled: 0,
             begun: false,
@@ -285,7 +286,7 @@ impl Input {
 
     /// An item that is not a system message; the leading ones before it go
     /// to `instructions` where they lead.
-    fn item(&mut self, item: &impl Serialize) {
+    fn item(&mut self, item: &impl Serialize, out: &mut Settled) {
         if !std::mem::replace(&mut self.begun, true)
             && self.cx.instructions == Instructions::Leading
         {
@@ -295,17 +296,13 @@ impl Input {
                 .map(|item| system_text(&item).to_owned());
             self.lifted.extend(leading);
         }
-        self.write(item);
+        self.write(item, out);
     }
 
-    /// `item` written, to settle.
-    fn write(&mut self, item: &impl Serialize) {
-        if !self.written.is_empty() {
-            self.written.push(b',');
-        }
-        // Writing to memory cannot fail.
-        let _ = serde_json::to_writer(&mut self.written, item);
-        self.pending += 1;
+    /// `item` settled: no later message changes an item once written.
+    fn write(&mut self, item: &impl Serialize, out: &mut Settled) {
+        out.item(item);
+        self.settled += 1;
     }
 
     /// The instructions lifted, and the items left open: a request of only
@@ -334,7 +331,7 @@ fn system_text(item: &Value) -> &str {
 
 impl Input {
     /// A user message's parts, a message item each.
-    fn user(&mut self, parts: &[UserPart]) -> Result<(), Error> {
+    fn user(&mut self, parts: &[UserPart], out: &mut Settled) -> Result<(), Error> {
         for part in parts {
             match part {
                 // Blank text says nothing, and some backends reject it.
@@ -344,10 +341,10 @@ impl Input {
                         text: &text.text,
                         kind: PartType::InputText,
                     };
-                    self.item(&MessageItem::new("user", text));
+                    self.item(&MessageItem::new("user", text), out);
                 }
                 UserPart::Media(media) => {
-                    self.item(&MessageItem::new("user", user_part(media)?));
+                    self.item(&MessageItem::new("user", user_part(media)?), out);
                 }
             }
         }
@@ -356,7 +353,7 @@ impl Input {
 
     /// Tool results, an output item each. A function output has no error
     /// field: a failed result says so in its text.
-    fn results(&mut self, results: &[ToolResult]) -> Result<(), Error> {
+    fn results(&mut self, results: &[ToolResult], out: &mut Settled) -> Result<(), Error> {
         for result in results {
             let custom = self.custom.contains(&result.id);
             let item = OutputItem {
@@ -369,7 +366,7 @@ impl Input {
                     ItemType::FunctionCallOutput
                 },
             };
-            self.item(&item);
+            self.item(&item, out);
         }
         Ok(())
     }
@@ -382,15 +379,9 @@ impl Fold for Input {
         &self.cx
     }
 
-    /// What was written; the leading system messages wait for the item
-    /// that tells whether they go to `instructions`.
-    fn settle(&mut self, out: &mut Settled) {
-        self.settled += std::mem::take(&mut self.pending);
-        out.written(&self.written);
-        self.written.clear();
-    }
-
-    fn push(&mut self, position: usize, turn: &Message) -> Result<(), Error> {
+    /// Every item settles as it is written; the leading system messages
+    /// wait for the item that tells whether they go to `instructions`.
+    fn push(&mut self, position: usize, turn: &Message, out: &mut Settled) -> Result<(), Error> {
         let parts = match turn {
             Message::System(system) => {
                 let text = system.text();
@@ -403,7 +394,7 @@ impl Fold for Input {
                     };
                     let item = MessageItem::new("system", text);
                     if self.begun || self.cx.instructions != Instructions::Leading {
-                        self.write(&item);
+                        self.write(&item, out);
                     } else {
                         self.open
                             .push(serde_json::to_value(item).unwrap_or_default());
@@ -411,8 +402,8 @@ impl Fold for Input {
                 }
                 return Ok(());
             }
-            Message::User(user) => return self.user(&user.content),
-            Message::Tool(tool) => return self.results(&tool.results),
+            Message::User(user) => return self.user(&user.content, out),
+            Message::Tool(tool) => return self.results(&tool.results, out),
             Message::Assistant(assistant) => &assistant.content,
         };
         let stateless = self.cx.stateless;
@@ -456,14 +447,14 @@ impl Fold for Input {
                         // The call takes the id its result answers.
                         item["call_id"] = call.id.as_str().into();
                     }
-                    self.item(&item);
+                    self.item(&item, out);
                     continue;
                 }
                 Replay::Identity(kept) => kept,
                 Replay::Rebuild => Map::new(),
             };
             if let Some(item) = rebuilt(part, &kept, kind, position, texts)? {
-                self.item(&item);
+                self.item(&item, out);
             }
             texts += usize::from(matches!(part, AssistantPart::Text(_)));
         }

@@ -5,12 +5,13 @@
 //!
 //! A protocol encodes a conversation as a left fold ([`Fold`]): each
 //! message, as [`Prepare`] passes it on for the target, extends the wire
-//! items; the items no later message can change settle as bytes, and the
-//! rest stay open in the fold. What a conversation keeps per encoding is
-//! the fold after its last message and the settled bytes. A request for a
-//! conversation that grew since folds only the new messages; one that
-//! changed before its end (an edit, an insertion) folds from the start.
-//! Either way the bytes are the ones folding from the start makes.
+//! items; the items no later message can change are written as bytes
+//! there and then, once, and the rest stay open in the fold. What a
+//! conversation keeps per encoding is the fold after its last message and
+//! the settled bytes. A request for a conversation that grew since folds
+//! only the new messages; one that changed before its end (an edit, an
+//! insertion) folds from the start. Either way the bytes are the ones
+//! folding from the start makes.
 
 use std::any::Any;
 use std::fmt;
@@ -145,28 +146,20 @@ pub(crate) trait Fold: Clone + Send + 'static {
 
     fn cx(&self) -> &Self::Cx;
 
-    /// Folds message `at` of the prepared conversation.
-    fn push(&mut self, at: usize, message: &Message) -> Result<(), Error>;
-
-    /// Writes the items no later message can change to `out`, in order.
-    fn settle(&mut self, out: &mut Settled);
+    /// Folds message `at` of the prepared conversation; the items no later
+    /// message can change go to `out`, in order.
+    fn push(&mut self, at: usize, message: &Message, out: &mut Settled) -> Result<(), Error>;
 }
 
-/// A fold's steps, past its type: the pass and the code that keeps
+/// A fold's step, past its type: the pass and the code that keeps
 /// encodings drive every protocol's fold through one copy.
 pub(crate) trait Step {
-    fn push(&mut self, at: usize, message: &Message) -> Result<(), Error>;
-
-    fn settle(&mut self, out: &mut Settled);
+    fn push(&mut self, at: usize, message: &Message, out: &mut Settled) -> Result<(), Error>;
 }
 
 impl<F: Fold> Step for F {
-    fn push(&mut self, at: usize, message: &Message) -> Result<(), Error> {
-        Fold::push(self, at, message)
-    }
-
-    fn settle(&mut self, out: &mut Settled) {
-        Fold::settle(self, out);
+    fn push(&mut self, at: usize, message: &Message, out: &mut Settled) -> Result<(), Error> {
+        Fold::push(self, at, message, out)
     }
 }
 
@@ -221,7 +214,7 @@ impl Kept {
     }
 
     /// Folds the messages of `messages` past those this encoding folded,
-    /// into `fold`; what settles is written to one buffer.
+    /// into `fold`; what settles is written to one buffer, shared once.
     fn grow(
         &mut self,
         messages: &Messages,
@@ -232,12 +225,9 @@ impl Kept {
         for message in &messages[self.len..] {
             #[cfg(test)]
             FOLDED.with(|folded| folded.set(folded.get() + 1));
-            self.pass.push(target, message, fold)?;
-            fold.settle(&mut bytes);
+            self.pass.push(target, message, fold, &mut bytes)?;
         }
-        if !bytes.0.is_empty() {
-            self.settled.push(bytes.0.into());
-        }
+        self.settled.extend(bytes.shared());
         Ok(())
     }
 
@@ -262,39 +252,30 @@ fn end(
     mut settled: Vec<Shared>,
     fold: &mut dyn Step,
 ) -> Result<Vec<Shared>, Error> {
-    pass.finish(fold)?;
     let mut bytes = Settled::default();
-    fold.settle(&mut bytes);
-    if !bytes.0.is_empty() {
-        settled.push(bytes.0.into());
-    }
+    pass.finish(fold, &mut bytes)?;
+    settled.extend(bytes.shared());
     Ok(settled)
 }
 
 /// Items that settled, as JSON separated by commas: each written once,
-/// from whatever the protocol holds it as.
+/// from whatever the protocol holds it as, into the buffer the requests
+/// then share.
 #[derive(Default)]
 pub(crate) struct Settled(Vec<u8>);
 
 impl Settled {
     pub(crate) fn item(&mut self, item: &(impl Serialize + ?Sized)) {
-        self.comma();
+        if !self.0.is_empty() {
+            self.0.push(b',');
+        }
         // Writing to memory cannot fail.
         let _ = serde_json::to_writer(&mut self.0, item);
     }
 
-    /// Items already written, separated by commas.
-    pub(crate) fn written(&mut self, items: &[u8]) {
-        if !items.is_empty() {
-            self.comma();
-            self.0.extend_from_slice(items);
-        }
-    }
-
-    fn comma(&mut self) {
-        if !self.0.is_empty() {
-            self.0.push(b',');
-        }
+    /// The run written, shared; none when nothing settled.
+    fn shared(self) -> Option<Shared> {
+        (!self.0.is_empty()).then(|| self.0.into())
     }
 }
 
@@ -321,8 +302,10 @@ pub(crate) fn fold<F: Fold>(
     Ok((state, settled))
 }
 
-/// A conversation encoded for one request: the items its fold makes only
-/// for this request (`head` and `tail`) around the bytes it settled.
+/// An array of a body written from shared bytes: a conversation encoded
+/// for one request, or the request's tool definitions. The items its fold
+/// makes only for this request (`head` and `tail`) go around the bytes it
+/// settled.
 #[derive(Debug)]
 pub struct History {
     /// The body field the items are.
@@ -331,29 +314,47 @@ pub struct History {
     /// Runs of items, separated by commas; none is empty.
     pub settled: Vec<Shared>,
     pub tail: Vec<Value>,
+    /// Text around the settled runs, when they are one element of the
+    /// array rather than its elements (Gemini's `functionDeclarations`).
+    pub wrap: Option<(&'static str, &'static str)>,
 }
 
 impl History {
+    pub(crate) fn new(key: &'static str, settled: Vec<Shared>, tail: Vec<Value>) -> Self {
+        Self {
+            key,
+            head: Vec::new(),
+            settled,
+            tail,
+            wrap: None,
+        }
+    }
+
     /// Writes the items as a JSON array to `out`, the settled bytes as they
     /// are.
     pub(crate) fn write(&self, out: &mut Pieces) {
         out.byte(b'[');
         let mut first = true;
-        let mut comma = |out: &mut Pieces| {
-            if !std::mem::take(&mut first) {
-                out.byte(b',');
-            }
-        };
         for item in &self.head {
-            comma(out);
+            out.comma(&mut first);
             out.json(item);
         }
+        let wrap = self.wrap.filter(|_| !self.settled.is_empty());
+        if let Some((open, _)) = wrap {
+            out.comma(&mut first);
+            out.text(open);
+            first = true;
+        }
         for bytes in &self.settled {
-            comma(out);
+            out.comma(&mut first);
             out.shared(Arc::clone(bytes));
         }
+        if let Some((_, close)) = wrap {
+            out.text(close);
+            first = false;
+        }
         for item in &self.tail {
-            comma(out);
+            out.comma(&mut first);
             out.json(item);
         }
         out.byte(b']');
@@ -374,6 +375,17 @@ pub(crate) struct Pieces {
 impl Pieces {
     pub(crate) fn byte(&mut self, byte: u8) {
         self.buf.push(byte);
+    }
+
+    pub(crate) fn text(&mut self, text: &str) {
+        self.buf.extend_from_slice(text.as_bytes());
+    }
+
+    /// A comma before every element but the first.
+    pub(crate) fn comma(&mut self, first: &mut bool) {
+        if !std::mem::take(first) {
+            self.byte(b',');
+        }
     }
 
     pub(crate) fn json(&mut self, value: &(impl Serialize + ?Sized)) {

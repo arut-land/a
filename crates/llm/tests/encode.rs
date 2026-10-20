@@ -260,7 +260,6 @@ fn bash() -> Tool {
         description: "Runs a command.".into(),
         schema: json!({"type": "object", "properties": {"command": {"type": "string"}}, "required": ["command"]}),
         strict: None,
-        encoded: llm::Encodings::default(),
     }
 }
 
