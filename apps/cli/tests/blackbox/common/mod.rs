@@ -301,6 +301,8 @@ pub struct Conn {
     writer: UnixStream,
     /// Everything received, folded as a client's view.
     pub view: SessionView,
+    /// The seq of the last entry received, and of its session.
+    last: Option<(SessionId, u64)>,
 }
 
 /// The hello these tests say, as the first clients did: any build the
@@ -343,6 +345,7 @@ impl Conn {
             reader: BufReader::new(stream.try_clone().unwrap()),
             writer: stream,
             view: SessionView::default(),
+            last: None,
         }
     }
 
@@ -366,10 +369,22 @@ impl Conn {
         let msg = match protocol::read_frame(&mut self.reader) {
             Ok(msg) => msg?,
             Err(e) if matches!(e.kind(), ErrorKind::WouldBlock | ErrorKind::TimedOut) => {
-                panic!("the daemon sent nothing for {READ_TIMEOUT:?}")
+                panic!(
+                    "the daemon sent nothing for {READ_TIMEOUT:?} after entry {:?}",
+                    self.last
+                )
             }
             Err(_) => return None,
         };
+        match &msg {
+            DaemonMsg::Attached { session, .. } => self.last = Some((*session, 0)),
+            DaemonMsg::Entry(e) => {
+                if let Some((_, seq)) = &mut self.last {
+                    *seq = e.seq.get();
+                }
+            }
+            _ => {}
+        }
         self.view.fold(&msg);
         Some(msg)
     }
