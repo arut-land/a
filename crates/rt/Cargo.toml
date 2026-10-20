@@ -18,6 +18,8 @@ async-executor = { version = "1", optional = true }
 # in kqueue, epoll or IOCP (through polling) until something is due.
 async-io = "2"
 futures-core = { version = "0.3", default-features = false, features = ["std"] }
+# `future::or`, the one racer: async-io links it already.
+futures-lite = { version = "2", default-features = false }
 smol = { version = "2", optional = true }
 tokio = { version = "1", default-features = false, features = ["rt", "time", "net"], optional = true }
 

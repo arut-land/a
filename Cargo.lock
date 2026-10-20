@@ -742,7 +742,6 @@ dependencies = [
  "ext",
  "llm",
  "protocol",
- "rt",
 ]
 
 [[package]]
@@ -1588,6 +1587,7 @@ dependencies = [
  "async-executor",
  "async-io",
  "futures-core",
+ "futures-lite",
  "rustix",
  "smol",
  "tokio",
