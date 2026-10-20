@@ -141,13 +141,12 @@ fn snapshot_everywhere(reg: &dyn Fn() -> Reg, inputs: &[&str], go: &dyn Fn(&mut 
         if s.core.at_rest() {
             rests.push((s.log.len(), s.core.ledger().clone()));
         }
-        match text.strip_prefix('+') {
-            Some(text) => pending.extend(s.step(user(text))),
-            None => {
-                let mut fx = std::mem::take(&mut pending);
-                fx.extend(s.step(user(text)));
-                go(&mut s, fx);
-            }
+        if let Some(text) = text.strip_prefix('+') {
+            pending.extend(s.step(user(text)));
+        } else {
+            let mut fx = std::mem::take(&mut pending);
+            fx.extend(s.step(user(text)));
+            go(&mut s, fx);
         }
     }
     go(&mut s, pending);

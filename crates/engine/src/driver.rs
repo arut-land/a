@@ -19,7 +19,7 @@ use std::task::Poll;
 use std::time::Instant;
 
 use crate::catalog::Record;
-use crate::store::{Encoded, Header, Parent, Snapshot, Writer};
+use crate::store::{Encoded, Header, Loaded, Parent, Snapshot, Writer};
 use ext::host::{Binding, Bound, Host, Parts, Registry, Services};
 use ext::point::View;
 use ext::{BoxFuture, Called, Cancel, Cx, Flag, States};
@@ -50,6 +50,8 @@ pub struct Shared {
     pub models: Models,
     /// Where every session's commits are barriers.
     pub barriers: kernel::Barriers,
+    /// This build: what a snapshot must be of to be restored.
+    pub build: String,
     /// Where sessions keep output too large for their logs.
     pub spill: PathBuf,
     /// Sessions loaded since the daemon started.
@@ -233,45 +235,12 @@ impl Live {
         });
         let bound = bind(&registry, &session);
         let binding = Arc::clone(&bound) as Arc<dyn Binding>;
-        // From the newest snapshot, if it is of this build and these
-        // extensions, else from nothing; then each entry read after it is
-        // folded and dropped.
-        let folding = RefCell::new(Folding {
-            core: Core::new(Arc::clone(&binding)).with_barriers(shared.barriers),
-            states: registry.states(),
-            has_input: false,
-            restored: false,
-        });
-        let loaded = match open {
-            Open::Create => {
-                let created = shared.store.create(header)?;
-                shared.catalog.record(Record::new(header.clone()));
-                created
-            }
-            Open::Load => shared.store.load(
-                header.id,
-                &mut |snapshot| {
-                    let mut folding = folding.borrow_mut();
-                    let restored = folding.restore(snapshot, &binding, &registry, shared);
-                    match restored {
-                        Ok(()) => true,
-                        Err(e) => {
-                            crate::session_event("snapshot", header.id, || {
-                                format!("not restored: {e}")
-                            });
-                            false
-                        }
-                    }
-                },
-                &mut |e| folding.borrow_mut().fold(&e),
-            )?,
-        };
+        let (loaded, folding) = Folding::open(header, shared, open, &binding, &registry)?;
         let Folding {
             mut core,
             states,
             has_input,
-            restored,
-        } = folding.into_inner();
+        } = folding;
         *lock(&session.states) = states;
         *lock(&session.env) = core.ledger().env().cloned().map(Arc::new);
         let fresh = lock(&shared.loaded).insert(header.id);
@@ -329,12 +298,7 @@ impl Live {
             waiting_sync: Vec::new(),
             sync_armed: false,
             resuming: false,
-            // A log read whole is worth a snapshot at its first rest.
-            since_snapshot: if restored || loaded.seq == 0 {
-                0
-            } else {
-                SNAPSHOT_EVERY
-            },
+            since_snapshot: loaded.read,
         };
         shared.rt.spawn(Box::pin(actor.run(rx, first)));
         Ok(live)
@@ -461,23 +425,62 @@ struct Folding {
     states: States,
     /// Whether the log holds any input.
     has_input: bool,
-    restored: bool,
 }
 
 impl Folding {
+    /// Creates session `header`'s log, or loads it: from the newest
+    /// snapshot if it is of this build and these extensions, else from
+    /// nothing; then each entry read after it is folded and dropped.
+    fn open(
+        header: &Header,
+        shared: &Shared,
+        open: Open,
+        binding: &Arc<dyn Binding>,
+        registry: &Registry,
+    ) -> io::Result<(Loaded, Self)> {
+        let folding = RefCell::new(Self {
+            core: Core::new(Arc::clone(binding)).with_barriers(shared.barriers),
+            states: registry.states(),
+            has_input: false,
+        });
+        let loaded = match open {
+            Open::Create => {
+                let created = shared.store.create(header)?;
+                shared.catalog.record(Record::new(header.clone()));
+                created
+            }
+            Open::Load => shared.store.load(
+                header.id,
+                &mut |snapshot| {
+                    let restored =
+                        (folding.borrow_mut()).restore(&snapshot, binding, registry, shared);
+                    restored
+                        .inspect_err(|e| {
+                            crate::session_event("snapshot", header.id, || {
+                                format!("not restored: {e}")
+                            });
+                        })
+                        .is_ok()
+                },
+                &mut |e| folding.borrow_mut().fold(&e),
+            )?,
+        };
+        Ok((loaded, folding.into_inner()))
+    }
+
     /// Starts from `snapshot`, if it is an [`Image`] this build made with
     /// the extensions installed now: else nothing changes, and the log is
     /// folded from its first entry.
     fn restore(
         &mut self,
-        snapshot: Snapshot,
+        snapshot: &Snapshot,
         binding: &Arc<dyn Binding>,
         registry: &Registry,
         shared: &Shared,
     ) -> Result<(), String> {
         let image: Image = snapshot.image.parse().map_err(|e| e.to_string())?;
-        if image.proto != protocol::PROTO {
-            return Err(format!("of protocol {}", image.proto));
+        if image.build != shared.build {
+            return Err(format!("of build {}", image.build));
         }
         if image.extensions != registry.installed() {
             return Err("of other extensions".to_owned());
@@ -486,7 +489,6 @@ impl Folding {
         let core = Core::restore(Arc::clone(binding), image.ledger);
         self.core = core.with_barriers(shared.barriers);
         self.has_input = image.has_input;
-        self.restored = true;
         Ok(())
     }
 
@@ -504,16 +506,19 @@ impl Folding {
 /// instead: the snapshot is derived, and only ever spares the fold.
 #[derive(Serialize, Deserialize)]
 struct Image {
-    /// The protocol the ledger is of: its shape changes with it.
-    proto: u32,
+    /// The build that took it: the ledger's shape, and what a fold makes
+    /// of an entry, are a build's own.
+    build: String,
     extensions: Vec<protocol::Installed>,
     has_input: bool,
     ledger: Ledger,
     states: Vec<ext::Image>,
 }
 
-/// How much log, in bytes, follows a snapshot before the next is taken.
-const SNAPSHOT_EVERY: usize = 64 << 10;
+/// How much log, in bytes, a load may read past the newest snapshot: at
+/// rest with more, a session takes one. Folding this much costs about as
+/// much as taking one.
+const SNAPSHOT_EVERY: u64 = 64 << 10;
 
 fn summary(header: &Header, ledger: &Ledger) -> SessionSummary {
     SessionSummary {
@@ -568,9 +573,9 @@ struct Actor {
     /// Carrying out what a resume asked for: a commit that fails now does
     /// not resume again, the session stops.
     resuming: bool,
-    /// The log committed, in bytes, since the newest snapshot: once it is
-    /// [`SNAPSHOT_EVERY`], the next rest is snapshotted.
-    since_snapshot: usize,
+    /// The bytes of log the next load would read past the newest
+    /// snapshot: once [`SNAPSHOT_EVERY`], the next rest is snapshotted.
+    since_snapshot: u64,
 }
 
 /// How long written entries may stay unsynced, and so unseen: a sync is
@@ -691,8 +696,7 @@ impl Actor {
             }
         }
         self.sync().await;
-        // Unloaded at rest with something new: the next load starts here.
-        if self.since_snapshot > 0 {
+        if self.since_snapshot >= SNAPSHOT_EVERY {
             self.keep_snapshot().await;
         }
         // Listed as it ends, with all it logged.
@@ -1058,7 +1062,7 @@ impl Actor {
             format!("{} entries {how}", entries.len())
         });
         self.folded(&entries);
-        self.since_snapshot += lines.lines().map(<[u8]>::len).sum::<usize>();
+        self.since_snapshot += lines.lines().map(|l| l.len() as u64 + 1).sum::<u64>();
         if durable {
             // The sync made what was written before durable too.
             self.show_synced();
@@ -1076,7 +1080,9 @@ impl Actor {
     /// from its log, not the ledger's to carry. One that cannot be taken
     /// is reported and not tried again until as much log follows.
     async fn keep_snapshot(&mut self) {
-        let rest = self.core.at_rest() && self.unsynced.is_empty();
+        let covers = self.core.ledger().seq();
+        let rest =
+            self.core.at_rest() && self.unsynced.is_empty() && covers == self.live.frames.seq();
         if !rest || self.live.parent.is_some() || self.writer.is_none() {
             return;
         }
@@ -1089,13 +1095,12 @@ impl Actor {
             }
         };
         let image = Image {
-            proto: protocol::PROTO,
+            build: self.live.session.shared.build.clone(),
             extensions: self.registry.installed(),
             has_input: self.live.has_input(),
             ledger: self.core.ledger().clone(),
             states,
         };
-        let covers = self.live.frames.seq();
         let Some(mut writer) = self.writer.take() else {
             return;
         };

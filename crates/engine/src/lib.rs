@@ -49,6 +49,9 @@ pub struct Config {
     pub crash_limit: u32,
     /// `[daemon] durability`: where a session's commits are barriers.
     pub barriers: kernel::Barriers,
+    /// This build, as staged: a session's snapshot is restored only by
+    /// the build that took it.
+    pub build: String,
     /// `[ext]`: the extensions left out, and each one's own table.
     pub ext: sys::config::Exts,
     /// The operator's permission rules (`$A_HOME`'s `policy.toml`), or why
@@ -69,6 +72,7 @@ impl Default for Config {
             agent: None,
             crash_limit: sys::crash::LIMIT,
             barriers: kernel::Barriers::default(),
+            build: env!("CARGO_PKG_VERSION").to_owned(),
             ext: sys::config::Exts::default(),
             floor: Ok(Vec::new()),
             #[cfg(not(test))]
@@ -141,6 +145,7 @@ impl From<sys::config::Daemon> for Config {
                         defaults.barriers
                     })
                 }),
+            build: defaults.build,
             ext: defaults.ext,
             floor: defaults.floor,
             extensions: defaults.extensions,
@@ -339,6 +344,7 @@ impl Daemon {
                 registry,
                 models,
                 barriers: config.barriers,
+                build: config.build.clone(),
                 spill: home.spill_dir(),
                 loaded: Mutex::default(),
                 daemon: daemon.clone(),
@@ -940,9 +946,13 @@ pub fn serve(
             return Err(io::Error::other(why));
         }
     };
-    let daemon = Daemon::load(home, config)?;
+    let config = Config {
+        build: build.to_owned(),
+        ..config.clone()
+    };
+    let daemon = Daemon::load(home, &config)?;
     let life = Arc::new(Lifecycle::new(build.to_owned(), home.runtime()));
-    let (monitor, watch, config) = (Arc::clone(&daemon), Arc::clone(&life), config.clone());
+    let (monitor, watch, config) = (Arc::clone(&daemon), Arc::clone(&life), config);
     let exit = Exit {
         home: home.clone(),
         pid,
