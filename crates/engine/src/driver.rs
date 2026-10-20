@@ -1011,9 +1011,11 @@ impl Actor {
             view.extend(entries);
         }
         for (e, line) in entries.iter().zip(lines.lines()) {
-            self.live
-                .frames
-                .push(e.seq.get(), Frame::from_line(e.seq.get(), line).ok());
+            // One too large for the tail is not framed: followers read it.
+            let frame = (line.len() <= crate::outbox::TAIL)
+                .then(|| Frame::from_line(e.seq.get(), line).ok())
+                .flatten();
+            self.live.frames.push(e.seq.get(), frame);
         }
         lock(&self.live.followers).retain(|c| c.wake().is_ok());
     }

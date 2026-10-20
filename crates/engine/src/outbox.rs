@@ -21,7 +21,7 @@ const BUDGET: usize = 1 << 20;
 
 /// How many bytes of the newest entries' frames are kept in memory, for
 /// the followers that keep up: a commit costs them no read of the log.
-const TAIL: usize = 64 << 10;
+pub const TAIL: usize = 64 << 10;
 
 /// A session's committed entries, shown to its clients: the lines its log
 /// stores, each encoded once as it committed, read back by seq as a client
@@ -59,12 +59,12 @@ impl FrameLog {
     }
 
     /// Shows entry `seq`, the next, which the log holds already, as
-    /// `frame`; `None` for one too large for a frame, which followers
-    /// come to in the log and end at.
+    /// `frame`; `None` for one not framed, too large for the tail or for
+    /// a frame at all, which followers come to in the log.
     pub fn push(&self, seq: u64, frame: Option<Frame>) {
         let mut tail = lock(&self.tail);
         match frame {
-            Some(frame) => {
+            Some(frame) if frame.as_bytes().len() <= TAIL => {
                 tail.bytes += frame.as_bytes().len();
                 tail.frames.push_back(frame);
                 while tail.bytes > TAIL
@@ -73,7 +73,7 @@ impl FrameLog {
                     tail.bytes -= old.as_bytes().len();
                 }
             }
-            None => *tail = Tail::default(),
+            _ => *tail = Tail::default(),
         }
         let last = self.seq.swap(seq, Ordering::Release);
         debug_assert_eq!(last + 1, seq, "entries are shown in order");
@@ -431,7 +431,10 @@ mod tests {
                     origin: None,
                 })
                 .unwrap();
-            self.1.push(e.seq.get(), Frame::entry(&e).ok());
+            let frame = (text.len() <= TAIL)
+                .then(|| Frame::entry(&e).ok())
+                .flatten();
+            self.1.push(e.seq.get(), frame);
         }
 
         fn frames(&self) -> Arc<FrameLog> {
