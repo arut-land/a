@@ -831,7 +831,7 @@ mod tests {
             }
             for n in 0..UNANSWERED {
                 let out = client.run(Cmd::Input(n.to_string()));
-                assert!(notices(&out).is_empty());
+                assert_eq!(notices(&out), [] as [&Notice; 0]);
                 assert_eq!(sends(&out).len(), usize::from(!disconnected));
             }
             let out = client.run(Cmd::Input("overflow".into()));

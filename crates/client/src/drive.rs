@@ -273,7 +273,7 @@ mod tests {
                 ConnId(1),
                 &Attach::new(Target::New, crate::Env::Keep),
                 false,
-            )
+            );
         });
         let mut peer = listener.accept().unwrap();
         assert!(matches!(
@@ -337,7 +337,7 @@ mod tests {
                 ConnId(1),
                 &Attach::new(Target::New, crate::Env::Keep),
                 false,
-            )
+            );
         });
         let mut peer = listener.accept().unwrap();
         read_frame::<ClientMsg>(&mut peer).unwrap().unwrap();
