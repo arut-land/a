@@ -214,3 +214,39 @@ fn an_edit_changes_only_what_the_model_sees_after_it() {
         [llm::Message::user("newer"), llm::Message::user("second")]
     );
 }
+
+/// A session is titled by a side request beside its first model call: its
+/// reply, logged as the side request's outcome, is the title clients
+/// show; the conversation never hears of it, and no later call asks again.
+#[test]
+fn a_title_call_is_a_side_call() {
+    let http = Flaky::new([
+        Reply::Events(text_reply()),
+        Reply::Events(text_reply()),
+        Reply::Events(text_reply()),
+    ]);
+    let registry = Registry::default()
+        .with_in(ext::Tier::Post, &ext_title::Title)
+        .unwrap();
+    let session = fixture(registry, &http).start(&[]);
+    session.submit("hi").unwrap();
+    until(&session, "titled", |log| {
+        sides(log).first().is_some_and(|&(side, ..)| {
+            log.iter()
+                .any(|e| matches!(&e.body, Body::ModelResult { call, .. } if *call == side))
+        })
+    });
+    session.submit("again").unwrap();
+    settle(&session);
+    let log = log_of(&session);
+    session.halt();
+
+    let titles: Vec<_> = sides(&log).iter().map(|s| s.2).collect();
+    assert_eq!(titles.first(), Some(&"title"), "{log:#?}");
+    let view = SessionView::from_log(SessionId::new(), "/w".into(), &log);
+    assert_eq!(
+        view.title.as_deref(),
+        Some("The harbor label is crimson-harbor.")
+    );
+    assert_eq!(titles.len(), 1, "titled once");
+}

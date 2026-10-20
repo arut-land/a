@@ -60,6 +60,9 @@ opt-level = "s"
 [profile.release.package.ext-edit]
 opt-level = "s"
 
+[profile.release.package.ext-title]
+opt-level = "s"
+
 [profile.release.package.ext-fixtures]
 opt-level = "s"
 

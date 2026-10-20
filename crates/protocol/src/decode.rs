@@ -450,6 +450,7 @@ pub(crate) struct MsgFields {
     pub(crate) reason: Option<Rejection>,
     pub(crate) items: Option<Json>,
     pub(crate) queued: Option<Vec<(u64, String)>>,
+    pub(crate) title: Option<String>,
     pub(crate) environment: Option<Environment>,
     pub(crate) pid: Option<u32>,
     pub(crate) started: Option<u64>,
@@ -573,6 +574,7 @@ pub(crate) fn snapshot_msg(f: &mut MsgFields) -> Result<DaemonMsg> {
         items: need(f.items.take(), "items")?,
         environment: def(f.environment.take())?,
         queued: f.queued.take().unwrap_or_default(),
+        title: f.title.take(),
         ..SessionView::default()
     })))
 }

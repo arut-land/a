@@ -1139,11 +1139,14 @@ impl Core {
         self.append(fx, Body::Decision { by, call, d });
     }
 
-    /// Logs call `call`'s outcome, after those of the side requests made
-    /// on its behalf that are still out: they end with it.
+    /// Logs call `call`'s outcome. One that did not finish (it failed, or
+    /// was interrupted) takes the side requests made on its behalf that are
+    /// still out with it, their ends logged first; one done leaves them to
+    /// end as they do.
     fn settle(&mut self, call: CallId, outcome: Outcome, fx: &mut Effects) {
+        let done = matches!(outcome, Outcome::Done { .. });
         let sides: SmallVec<[u64; 1]> = (self.fold.ledger.open_calls())
-            .filter(|(_, open)| open.call == Call::Side { of: call.get() })
+            .filter(|(_, open)| !done && open.call == Call::Side { of: call.get() })
             .map(|(seq, _)| seq)
             .collect();
         for side in sides {

@@ -72,6 +72,8 @@ pub fn extensions(config: &Config) -> Result<Vec<Installed>, Refused> {
         };
         all.push((Tier::Post, Box::new(retry)));
     }
+    #[cfg(feature = "title")]
+    all.push((Tier::Post, Box::new(ext_title::Title)));
     if config.agent.as_deref() == Some(ext_fixtures::ECHO)
         && let Some(fixtures) = ext_fixtures::extension()
     {
@@ -208,7 +210,8 @@ mod tests {
                 ("compact", 1),
                 ("settings", 1),
                 ("subagent", 1),
-                ("retry", 1)
+                ("retry", 1),
+                ("title", 1)
             ]
         );
         assert_eq!(registry.agents().collect::<Vec<_>>(), [ext::LOOP]);
@@ -236,7 +239,8 @@ mod tests {
             r.system_prompt().split("\n\n").map(str::to_owned).collect()
         };
         // What each contributes that the others do not.
-        let own: [(&str, &[&str], usize); 10] = [
+        let own: [(&str, &[&str], usize); 11] = [
+            ("title", &[], 0),
             ("compact", &[], 0),
             ("policy-floor", &[], 0),
             ("policy", &[], 0),

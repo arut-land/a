@@ -37,6 +37,9 @@ pub struct SessionView {
     /// it is.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub queued: Vec<(u64, String)>,
+    /// The session's title: the latest reply to a side request titling it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub title: Option<String>,
     /// What happened since the seq the latest attach started from, once
     /// its replay is in.
     #[serde(skip)]
@@ -490,6 +493,7 @@ impl SessionView {
         self.seq = snapshot.seq;
         self.environment.clone_from(&snapshot.environment);
         self.queued.clone_from(&snapshot.queued);
+        self.title.clone_from(&snapshot.title);
         self.items = items;
         Change::Snapshot {
             items: self.items.clone(),
@@ -753,12 +757,21 @@ impl SessionView {
             text,
             status,
             usage,
+            purpose,
             ..
         } = &mut self.items[at]
         else {
             return None;
         };
+        let titles = purpose.as_deref() == Some("title");
         *status = match outcome {
+            Outcome::Done { output } if titles => {
+                let reply = reply_text(&output.value());
+                let title = reply.trim().trim_matches('"').trim();
+                self.title = (!title.is_empty()).then(|| title.to_owned());
+                *text = reply;
+                Status::Done
+            }
             Outcome::Done { output } => {
                 let output = output.value();
                 *text = reply_text(&output);

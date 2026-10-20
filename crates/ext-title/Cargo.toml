@@ -1,0 +1,16 @@
+[package]
+name = "ext-title"
+version.workspace = true
+edition.workspace = true
+publish.workspace = true
+
+[dependencies]
+ext.workspace = true
+llm.workspace = true
+rt.workspace = true
+
+[dev-dependencies]
+ext = { workspace = true, features = ["testing"] }
+
+[lints]
+workspace = true
