@@ -2,7 +2,7 @@
 //! the same updates, state and hash through it as through
 //! `protocol::view`, and a client that missed updates catches up.
 
-use a_ffi::{Reducer, Resync, ViewChange};
+use a_ffi::{ItemPatch, Reducer, Resync, ToolOutcome, ViewChange, ViewItem};
 use serde_json::{Value, json};
 
 fn vectors() -> Vec<Value> {
@@ -74,25 +74,79 @@ fn a_missed_update_is_handed_back_and_a_long_gap_gets_a_snapshot() {
     assert!(matches!(reducer.resync(900), Resync::Updates { updates } if updates.len() == 101));
 }
 
-/// Updates that carry big outputs are kept for a resync up to a few
-/// megabytes, not a fixed count: past that a gap takes a snapshot.
+/// An item crosses whole when it is added; what changes after is a patch,
+/// so a tool's output crosses once.
 #[test]
-fn big_outputs_are_kept_for_a_resync_by_size() {
+fn a_tools_outcome_crosses_as_a_patch_not_as_the_item_again() {
     let reducer = Reducer::new();
     let attached = json!({ "t": "attached", "session": "00000000-0000-0000-0000-00000000000a", "workspace": "/w" });
     reducer.fold(&attached.to_string()).unwrap();
-    let output = "x".repeat(64 * 1024);
-    for call in (1..=200).map(|n| n * 2 - 1) {
-        let started = json!({ "t": "entry", "seq": call, "epoch": 0, "kind": "tool_call",
-            "tool": "bash", "input": { "command": "yes" } });
-        let done = json!({ "t": "entry", "seq": call + 1, "epoch": 0, "kind": "tool_result",
-            "call": call, "outcome": { "status": "done", "output": { "exit": 0, "output": output } } });
-        reducer.fold(&started.to_string()).unwrap();
-        reducer.fold(&done.to_string()).unwrap();
-    }
-    let rev = reducer.snapshot().rev;
-    assert!(matches!(reducer.resync(rev - 20), Resync::Updates { updates } if updates.len() == 20));
-    assert!(matches!(reducer.resync(rev - 200), Resync::Snapshot { .. }));
+    let started = json!({ "t": "entry", "seq": 1, "epoch": 0, "kind": "tool_call",
+        "tool": "bash", "input": { "command": "yes" } });
+    let done = json!({ "t": "entry", "seq": 2, "epoch": 0, "kind": "tool_result",
+        "call": 1, "outcome": { "status": "done", "output": { "exit": 0, "output": "y\n" } } });
+    let added = reducer.fold(&started.to_string()).unwrap().unwrap();
+    assert!(matches!(
+        added.change,
+        ViewChange::Added {
+            item: ViewItem::Tool { outcome: None, .. },
+            ..
+        }
+    ));
+    let patched = reducer.fold(&done.to_string()).unwrap().unwrap();
+    let ViewChange::Updated {
+        index: 0,
+        patch:
+            ItemPatch::Outcome {
+                outcome: ToolOutcome::Done { output_json, .. },
+                phase,
+                ..
+            },
+    } = patched.change
+    else {
+        panic!("{patched:?}");
+    };
+    assert!(output_json.contains("\"output\":\"y\\n\""), "{output_json}");
+    assert_eq!(phase, a_ffi::CallPhase::Done);
+    // The snapshot a client far behind takes has the whole item.
+    assert!(matches!(
+        &reducer.snapshot().items[..],
+        [ViewItem::Tool {
+            outcome: Some(ToolOutcome::Done { .. }),
+            ..
+        }]
+    ));
+}
+
+/// Each update names the call whose reply is streaming, so a client
+/// clears the streamed text when the update says it is no one's.
+#[test]
+fn an_update_says_whose_reply_is_streaming() {
+    let reducer = Reducer::new();
+    let attached = json!({ "t": "attached", "session": "00000000-0000-0000-0000-00000000000a", "workspace": "/w" });
+    reducer.fold(&attached.to_string()).unwrap();
+    let call = json!({ "t": "entry", "seq": 1, "epoch": 0, "kind": "model_call", "model": "m" });
+    let delta = json!({ "t": "delta", "call": 1, "text": "hi", "attempt": 0 });
+    let reply = json!({ "t": "entry", "seq": 2, "epoch": 0, "kind": "model_result", "call": 1,
+        "outcome": { "status": "done", "output": { "message": { "content": [{ "type": "text", "text": "hi" }] } } } });
+    assert_eq!(
+        reducer.fold(&call.to_string()).unwrap().unwrap().streaming,
+        None
+    );
+    assert_eq!(
+        reducer.fold(&delta.to_string()).unwrap().unwrap().streaming,
+        Some(1)
+    );
+    let settled = reducer.fold(&reply.to_string()).unwrap().unwrap();
+    assert_eq!(settled.streaming, None);
+    assert!(matches!(
+        settled.change,
+        ViewChange::Updated {
+            patch: ItemPatch::Reply { .. },
+            ..
+        }
+    ));
+    assert_eq!(reducer.snapshot().streaming, None);
 }
 
 #[test]
@@ -116,7 +170,15 @@ fn a_titling_reply_is_the_sessions_title() {
     assert_eq!(titled.title.as_deref(), Some("Fix the parser"));
     assert!(matches!(
         titled.change,
-        ViewChange::Updated { item: a_ffi::ViewItem::Reply { purpose: Some(ref p), .. }, .. } if p == "title"
+        ViewChange::Updated {
+            patch: ItemPatch::Reply { .. },
+            ..
+        }
     ));
-    assert_eq!(reducer.snapshot().title.as_deref(), Some("Fix the parser"));
+    let snapshot = reducer.snapshot();
+    assert_eq!(snapshot.title.as_deref(), Some("Fix the parser"));
+    assert!(matches!(
+        &snapshot.items[..],
+        [ViewItem::Reply { purpose: Some(p), .. }] if p == "title"
+    ));
 }

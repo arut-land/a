@@ -7,9 +7,8 @@ use std::thread;
 use std::time::Duration;
 
 use protocol::{ClientMsg, DaemonMsg, SessionSummary};
-use sys::Staged;
 
-use crate::{Connection, Endpoint, Writer};
+use crate::{Connection, Daemon, Error, Writer};
 
 /// How long a watch waits to try again after failing to reach the daemon.
 const REWATCH: Duration = Duration::from_secs(1);
@@ -22,13 +21,12 @@ pub struct SessionWatch {
 }
 
 impl SessionWatch {
-    /// Hands `sink` the list now and after each change, starting the daemon
-    /// if needed and again after it restarts; while it cannot be reached,
-    /// why.
+    /// Hands `sink` the list (newest first) now and after each change,
+    /// starting the daemon if needed and again after it restarts; while
+    /// it cannot be reached, why.
     pub fn start(
-        endpoint: Endpoint,
-        staged: Staged,
-        sink: impl Fn(Result<&[SessionSummary], String>) + Send + 'static,
+        daemon: Daemon,
+        sink: impl Fn(Result<&[SessionSummary], &Error>) + Send + 'static,
     ) -> Self {
         let writer: Arc<Mutex<Option<Writer>>> = Arc::default();
         let done: Arc<AtomicBool> = Arc::default();
@@ -36,31 +34,25 @@ impl SessionWatch {
         thread::spawn(move || {
             let lock = || slot.lock().unwrap_or_else(PoisonError::into_inner);
             while !stop.load(Ordering::Acquire) {
-                let (problem, met) =
-                    match crate::connect(&endpoint, &staged, &|| {}).and_then(|mut c| {
-                        c.watch_sessions()?;
-                        Ok(c)
-                    }) {
-                        Ok(Connection {
-                            mut reader, writer, ..
-                        }) => {
-                            *lock() = Some(writer);
-                            let why = loop {
-                                match reader.recv() {
-                                    Ok(Some(DaemonMsg::Sessions { sessions })) => {
-                                        sink(Ok(&sessions));
-                                    }
-                                    Ok(Some(_)) => {}
-                                    Ok(None) => {
-                                        break "the daemon closed the connection".to_owned();
-                                    }
-                                    Err(e) => break e.to_string(),
-                                }
-                            };
-                            (why, true)
+                let met = match daemon.connect(&|| {}).and_then(|mut c| {
+                    c.watch_sessions()?;
+                    Ok(c)
+                }) {
+                    Ok(Connection {
+                        mut reader, writer, ..
+                    }) => {
+                        *lock() = Some(writer);
+                        loop {
+                            match reader.recv() {
+                                Ok(Some(DaemonMsg::Sessions { sessions })) => sink(Ok(&sessions)),
+                                Ok(Some(_)) => {}
+                                Ok(None) | Err(_) => break,
+                            }
                         }
-                        Err(e) => (e.to_string(), false),
-                    };
+                        Ok(())
+                    }
+                    Err(e) => Err(e),
+                };
                 lock().take();
                 if stop.load(Ordering::Acquire) {
                     return;
@@ -68,8 +60,8 @@ impl SessionWatch {
                 // A daemon that went (an upgrade, a restart) is followed at
                 // once to the next one; only one that cannot be reached is
                 // reported, and tried again later.
-                if !met {
-                    sink(Err(problem));
+                if let Err(e) = met {
+                    sink(Err(&e));
                     thread::sleep(REWATCH);
                 }
             }

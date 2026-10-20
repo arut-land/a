@@ -8,7 +8,7 @@ use protocol::{
 };
 use serde_json::json;
 
-use client::{Cmd, Event, Welcome};
+use client::{Cmd, Event, EventKind, Io, Welcome};
 use protocol::{Audience, Caps, Json};
 
 use super::{App, Effect};
@@ -28,7 +28,8 @@ fn entry(seq: u64, body: Body) -> DaemonMsg {
 /// An app attached to a fresh session, with `msgs` folded in.
 fn app(viewport: Viewport, msgs: &[DaemonMsg]) -> (App, SessionId) {
     let session = SessionId::new();
-    let mut app = App::new(viewport, ws(), &Target::New);
+    let mut app = App::new(viewport, &Target::New);
+    app.in_workspace(ws());
     connect(&mut app, false);
     app.fold(&DaemonMsg::Attached {
         session,
@@ -42,18 +43,21 @@ fn app(viewport: Viewport, msgs: &[DaemonMsg]) -> (App, SessionId) {
 
 /// Opens a connection for `app` (to a `remote` host's daemon).
 fn connect(app: &mut App, remote: bool) {
-    let effects = app.client.open(Target::New);
-    app.absorb(effects);
-    let id = app.client.connection();
-    app.event(Event::Connected {
-        id,
-        welcome: Welcome {
-            proto: 1,
-            caps: Caps::ALL,
+    let opened = app.client.open(Target::New);
+    client::pump(|_| Ok(()), app, opened);
+    let conn = app.client.connection();
+    let connected = app.client.step(Event {
+        conn,
+        kind: EventKind::Connected {
+            welcome: Welcome {
+                proto: 1,
+                caps: Caps::ALL,
+            },
+            remote,
+            commands: Vec::new(),
         },
-        remote,
-        commands: Vec::new(),
     });
+    client::pump(|_| Ok(()), app, connected);
 }
 
 /// A frame: its cells, where the caret shows (if it does), and its rows.
@@ -373,7 +377,7 @@ fn ctrl_c_clears_the_input_then_detaches() {
         press(&mut app, Key::Ctrl('c')),
         Some(Effect::Detach)
     ));
-    let mut unattached = App::new(Viewport::Full, ws(), &Target::New);
+    let mut unattached = App::new(Viewport::Full, &Target::New);
     assert!(matches!(
         press(&mut unattached, Key::Ctrl('c')),
         Some(Effect::Quit)
@@ -498,7 +502,8 @@ fn slash_commands() {
     ));
     // A remote host's environment is not this shell's to send.
     connect(&mut app, true);
-    assert!(app.command(Cmd::RefreshEnv).is_empty());
+    let refused = app.command(Cmd::RefreshEnv);
+    client::pump(|io| panic!("{io:?}"), &mut app, refused);
     let (_, rows) = frame(&mut app, 80, 14);
     find(&rows, "reattach to refresh it");
     connect(&mut app, false);
@@ -521,10 +526,11 @@ fn slash_commands() {
         residency: Residency::Loaded,
         read_only: None,
     };
+    // As the daemon lists them: newest first, which the picker keeps.
     app.fold(&DaemonMsg::Sessions {
         sessions: vec![
-            summary(other, "/elsewhere", Activity::Idle),
             summary(current, "/work/project", Activity::Approval),
+            summary(other, "/elsewhere", Activity::Idle),
         ],
     });
     let (_, rows) = frame(&mut app, 80, 14);
@@ -541,17 +547,17 @@ fn slash_commands() {
 fn resuming_where_there_is_no_session_opens_the_picker() {
     let mut app = App::new(
         Viewport::Full,
-        ws(),
         &Target::Latest {
             any_workspace: false,
         },
     );
+    app.in_workspace(ws());
     connect(&mut app, false);
     let effects = app.fold(&DaemonMsg::Error {
         message: "no matching session".into(),
     });
     assert!(
-        matches!(&effects[..], [client::Effect::Send(ClientMsg::List)]),
+        matches!(&effects[..], [Io::Send(ClientMsg::List)]),
         "{effects:?}"
     );
     let (_, rows) = frame(&mut app, 60, 12);
@@ -704,6 +710,34 @@ fn one_write_per_frame() {
             }
         }
     }
+}
+
+/// The event loop draws a frame only when the app says one is owed: an
+/// ack, or a list no picker shows, costs no frame; a delta, a key or the
+/// link changing owes one, which drawing pays.
+#[test]
+fn only_what_shows_owes_a_frame() {
+    let (mut app, _) = app(Viewport::Full, &asked_command());
+    assert!(app.needs_frame());
+    app.draw(80, 24);
+    assert!(!app.needs_frame());
+    app.fold(&DaemonMsg::Ack { client_seq: 1 });
+    app.fold(&DaemonMsg::Sessions {
+        sessions: Vec::new(),
+    });
+    assert!(!app.needs_frame());
+    app.fold(&DaemonMsg::Delta {
+        call: 2,
+        text: "hi".into(),
+        attempt: 0,
+    });
+    assert!(app.needs_frame());
+    app.draw(80, 24);
+    press(&mut app, Key::Char('x'));
+    assert!(app.needs_frame());
+    app.draw(80, 24);
+    typed(&mut app, "/sessions");
+    assert!(app.needs_frame());
 }
 
 /// A frame that shows nothing new is not written: no envelope, no

@@ -295,6 +295,33 @@ fn pipelined_mutations_are_answered_in_order() {
     assert!(matches!(peer.answer(), DaemonMsg::Sessions { .. }));
 }
 
+/// One order for every client's picker and `a ls`: no client sorts.
+#[test]
+fn sessions_are_listed_newest_first() {
+    let fixture = Fixture::new("newest-first");
+    let mut ids = Vec::new();
+    for _ in 0..3 {
+        let mut peer = fixture.connect();
+        peer.send(&hello(Caps::ALL));
+        peer.send(&attach(Target::New, 0, ClientDecl::default()));
+        assert!(matches!(peer.answer(), DaemonMsg::Welcome { .. }));
+        let DaemonMsg::Attached { session, .. } = peer.answer() else {
+            panic!("not attached");
+        };
+        ids.push(session);
+        peer.send(&ClientMsg::Detach);
+    }
+    let mut peer = fixture.connect();
+    peer.send(&hello(Caps::ALL));
+    peer.send(&ClientMsg::List);
+    assert!(matches!(peer.answer(), DaemonMsg::Welcome { .. }));
+    let DaemonMsg::Sessions { sessions } = peer.answer() else {
+        panic!("no list");
+    };
+    ids.reverse();
+    assert_eq!(sessions.iter().map(|s| s.id).collect::<Vec<_>>(), ids);
+}
+
 #[test]
 fn a_repeated_mutation_is_answered_again_but_not_done_again() {
     let fixture = Fixture::new("repeat");

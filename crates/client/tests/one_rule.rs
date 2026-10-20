@@ -20,6 +20,10 @@ const COPIES: &[(&str, &str)] = &[
     ("\"/interrupt\"", "parsing slash commands"),
     ("\"/env refresh\"", "parsing slash commands"),
     ("\"/steer", "parsing slash commands"),
+    (
+        "part == .outcome",
+        "deciding when a reply stops streaming from parts",
+    ),
 ];
 
 fn sources(dir: &Path, out: &mut Vec<PathBuf>) {

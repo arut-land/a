@@ -2,7 +2,7 @@
 //! that bring the page up to date: the transcript whole once an attach is
 //! synced, then each change alone.
 
-use client::{Attach, Cmd, Effect, Env, Event, Link, SessionClient};
+use client::{Attach, Cmd, Effect, Env, Link, Renderer, SessionClient, Show};
 use protocol::view::{Change, Update};
 use protocol::{SessionId, Target};
 
@@ -50,12 +50,6 @@ impl Page {
         matches!(self.client.link(), Link::Ended(_) | Link::Wedged(_))
     }
 
-    /// Takes in what the driver reports; returns what the driver is to do.
-    pub fn event(&mut self, event: Event) -> Vec<Effect> {
-        let effects = self.client.step(event);
-        self.absorb(effects)
-    }
-
     /// A line typed in the composer, parsed as every client parses it.
     pub fn line(&mut self, text: &str) -> Vec<Effect> {
         match client::parse(text, self.client.turn().asking) {
@@ -65,42 +59,18 @@ impl Page {
     }
 
     pub fn command(&mut self, cmd: Cmd) -> Vec<Effect> {
-        let effects = match cmd {
+        match cmd {
             // This page's own controls do these, or nothing does.
             Cmd::Help | Cmd::Sessions | Cmd::Open(_) | Cmd::Detach | Cmd::RefreshEnv => {
-                vec![Effect::Notice("not available on the web page".to_owned())]
+                self.error = Some("not available on the web page".to_owned());
+                Vec::new()
             }
             cmd => self.client.run(cmd),
-        };
-        self.absorb(effects)
-    }
-
-    /// Patches in what the client's effects change and hands back the
-    /// driver's.
-    pub fn absorb(&mut self, effects: Vec<Effect>) -> Vec<Effect> {
-        let mut io = Vec::new();
-        for effect in effects {
-            match effect {
-                Effect::View(update) => self.update(update),
-                Effect::Notice(text) => self.error = Some(text),
-                Effect::Link if self.ended() => {
-                    if let Link::Ended(client::End::Lost(why)) = self.client.link()
-                        && self.shown.is_none()
-                    {
-                        self.error = Some(format!("Could not attach: {why}"));
-                    }
-                    self.flush();
-                    self.show_end();
-                }
-                Effect::Link | Effect::Sessions => {}
-                effect => io.push(effect),
-            }
         }
-        io
     }
 
     fn synced(&self) -> bool {
-        matches!(self.client.link(), Link::Live { synced: true, .. })
+        matches!(self.client.link(), Link::Live { .. })
     }
 
     fn end_row(&self) -> End {
@@ -247,24 +217,56 @@ impl Page {
     }
 }
 
+/// Patches in what the client's effects change.
+impl Renderer for Page {
+    fn show(&mut self, shown: Vec<Show>) -> Vec<Effect> {
+        for show in shown {
+            match show {
+                Show::View(update) => self.update(update),
+                Show::Notice(notice) => self.error = Some(notice.to_string()),
+                Show::Link if self.ended() => {
+                    if let Link::Ended(client::End::Lost(why)) = self.client.link()
+                        && self.shown.is_none()
+                    {
+                        self.error = Some(format!("Could not attach: {why}"));
+                    }
+                    self.flush();
+                    self.show_end();
+                }
+                Show::Link | Show::Sessions => {}
+            }
+        }
+        Vec::new()
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use std::path::PathBuf;
 
-    use client::{Event, Welcome};
+    use client::{ConnId, Error, Event, EventKind, Welcome};
     use protocol::{Body, Caps, DaemonMsg, Entry, Json, Outcome, SessionId};
 
     use super::Page;
 
-    fn connected(id: u64) -> Event {
-        Event::Connected {
-            id,
-            welcome: Welcome {
-                proto: 1,
-                caps: Caps::ALL,
+    fn connected(conn: u64) -> Event {
+        Event {
+            conn: ConnId(conn),
+            kind: EventKind::Connected {
+                welcome: Welcome {
+                    proto: 1,
+                    caps: Caps::ALL,
+                },
+                remote: false,
+                commands: Vec::new(),
             },
-            remote: false,
-            commands: Vec::new(),
+        }
+    }
+
+    fn closed(conn: u64) -> Event {
+        Event {
+            conn: ConnId(conn),
+            kind: EventKind::Closed(Error::Closed),
         }
     }
 
@@ -276,13 +278,19 @@ mod tests {
     }
 
     impl Page {
+        /// Takes in what the driver reports, as the pump would.
+        fn event(&mut self, event: Event) {
+            let effects = self.client.step(event);
+            client::pump(|_| Ok(()), self, effects);
+        }
+
         /// Folds `msgs` in as one batch from the open connection.
         fn fold(&mut self, msgs: &[DaemonMsg]) {
             for msg in msgs {
-                let id = self.client.connection();
-                self.event(Event::Msg {
-                    id,
-                    msg: msg.clone(),
+                let conn = self.client.connection();
+                self.event(Event {
+                    conn,
+                    kind: EventKind::Msg(msg.clone()),
                 });
             }
             self.settle();
@@ -465,10 +473,7 @@ mod tests {
         page.fold(&[DaemonMsg::Draining]);
         assert_eq!(events(&mut page), NONE);
         let session = page.client.view().session.unwrap();
-        page.event(Event::Closed {
-            id: 1,
-            why: "drained".into(),
-        });
+        page.event(closed(1));
         page.event(connected(2));
         // The new daemon replays what was missed, then syncs.
         page.fold(&[
@@ -488,19 +493,16 @@ mod tests {
     #[test]
     fn the_end_says_the_daemon_went_away() {
         let mut page = synced();
-        page.event(Event::Closed {
-            id: 1,
-            why: "gone".into(),
-        });
+        page.event(closed(1));
         let ended = events(&mut page);
         assert_eq!(ended.len(), 1, "{ended:?}");
         assert!(ended[0].contains("reload to reconnect"), "{ended:?}");
 
         // Before the transcript showed, the end comes with it.
         let (mut page, _) = Page::new(SessionId::new());
-        page.event(Event::Failed {
-            id: 1,
-            why: "refused".into(),
+        page.event(Event {
+            conn: ConnId(1),
+            kind: EventKind::Failed(Error::Refused("refused".into())),
         });
         let failed = events(&mut page);
         assert!(
