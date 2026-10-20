@@ -55,11 +55,15 @@ both read.
 
 ```
 terminal thread ──Input / Resized──┐
- (poll: stdin + signal pipe)       ├─> channel ─> event loop: App::fold / App::input
-daemon reader(s) ──────Daemon──────┘                          │
-                                                              ▼
+ (poll: stdin + signal pipe)       ├─> inbox ─> event loop: App::event / App::input
+client::Driver ──client::Event─────┘               │   (SessionClient folds the view)
+ (a reader thread per connection)                  ▼
         App::draw ─> Canvas (ratatui Buffer, redrawn by the row) ─> Screen: changed cells as ANSI, one write
 ```
+
+The daemon side is the client SDK's (docs/client.md): `App` holds a
+`SessionClient`, hands it the driver's events and the person's commands,
+and renders the effects it gets back; what the TUI adds is screen state.
 
 The cells are ratatui's core (`ratatui-core`: `Buffer`, `Cell`, styles),
 with no widgets, no layout cache and not its `Terminal`. The terminal layer
@@ -69,10 +73,10 @@ and `screen.rs` (cells to ANSI). Also ours is what a chat transcript needs
 and no widget gives: wrapping cached per item, virtualized scrolling from an
 anchor, clickable spans, and the input editor.
 
-- One thread owns the app and blocks on an `mpsc` channel. The terminal
-  thread blocks in `poll` on stdin and a signal pipe with no timeout; each
-  connection has a reader thread. Nothing polls on a timer. Everything
-  queued is folded before one frame.
+- One thread owns the app and blocks on its `client::Inbox`. The terminal
+  thread blocks in `poll` on stdin and a signal pipe with no timeout; the
+  `Driver` reads each connection on a thread of its own. Nothing polls on
+  a timer. Everything queued is folded before one frame.
 - Signals (`sys::Signals`, the self-pipe trick: the handler writes one byte)
   reach that same `poll`: SIGWINCH is a resize, SIGTERM and SIGHUP restore
   the terminal and then end the process as the signal would have
@@ -163,7 +167,8 @@ Gone: crossterm, crossterm_winapi, ratatui-crossterm, signal-hook,
 signal-hook-mio, signal-hook-registry, parking_lot, parking_lot_core,
 lock_api, scopeguard, derive_more, convert_case, darling, ident_case,
 strsim, document-features, litrs, indoc, instability, winapi and
-redox_syscall (mio stays: tokio, in the web UI, links it). What replaced
+redox_syscall (mio went with tokio once the web UI moved onto `rt`;
+`mise run check:no-tokio` keeps both out). What replaced
 them, on rustix and vte (which `a` linked already): `keys.rs`, `screen.rs`
 and `term.rs` are 830 lines without their tests (570 on crossterm), and
 `sys::Signals` 140.
