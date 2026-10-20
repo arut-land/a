@@ -224,6 +224,18 @@ pub(crate) trait Fields<'de>: Default {
     }
 }
 
+/// A type read from an object's fields: by [`Fields`], each key read as a
+/// string, or by a type's own visit of its keys.
+pub(crate) trait FromFields<'de>: Sized {
+    fn read<A: MapAccess<'de>>(map: A) -> Result<Self, A::Error>;
+}
+
+impl<'de, T: Fields<'de>> FromFields<'de> for T {
+    fn read<A: MapAccess<'de>>(map: A) -> Result<Self, A::Error> {
+        read_fields(map)
+    }
+}
+
 /// The next value of `map`, compiled once a type rather than at each field
 /// that reads one.
 #[inline(never)]
@@ -241,23 +253,74 @@ pub(crate) fn fields<'de, D: Deserializer<'de>, T: Fields<'de>>(json: D) -> Resu
         fn expecting(&self, f: &mut fmt::Formatter) -> fmt::Result {
             f.write_str("an object")
         }
-        fn visit_map<A: MapAccess<'de>>(self, mut map: A) -> Result<T, A::Error> {
-            let mut out = T::default();
-            while let Some(Str(key)) = map.next_key()? {
-                if out.field(&key, &mut map)? {
-                    continue;
-                }
-                if let Some(rest) = out.rest() {
-                    let value = next(&mut map)?;
-                    rest.insert(key.into_owned(), value);
-                } else {
-                    map.next_value::<IgnoredAny>()?;
-                }
-            }
-            Ok(out)
+        fn visit_map<A: MapAccess<'de>>(self, map: A) -> Result<T, A::Error> {
+            read_fields(map)
         }
     }
     json.deserialize_map(Read(PhantomData))
+}
+
+fn read_fields<'de, A: MapAccess<'de>, T: Fields<'de>>(mut map: A) -> Result<T, A::Error> {
+    let mut out = T::default();
+    while let Some(Str(key)) = map.next_key()? {
+        if out.field(&key, &mut map)? {
+            continue;
+        }
+        if let Some(rest) = out.rest() {
+            let value = next(&mut map)?;
+            rest.insert(key.into_owned(), value);
+        } else {
+            map.next_value::<IgnoredAny>()?;
+        }
+    }
+    Ok(out)
+}
+
+/// An object read as `T`'s [`Fields`], or `None` for any other value: an
+/// [`Obj`] that reads the object's fields straight from the frame.
+pub(crate) struct Fielded<T>(pub(crate) Option<T>);
+
+impl<T> Default for Fielded<T> {
+    fn default() -> Self {
+        Self(None)
+    }
+}
+
+impl<'de, T: FromFields<'de>> Deserialize<'de> for Fielded<T> {
+    fn deserialize<D: Deserializer<'de>>(json: D) -> Result<Self, D::Error> {
+        struct Read<T>(PhantomData<T>);
+        impl<'de, T: FromFields<'de>> Visitor<'de> for Read<T> {
+            type Value = Fielded<T>;
+            fn expecting(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+                f.write_str("JSON")
+            }
+            fn visit_map<A: MapAccess<'de>>(self, map: A) -> Result<Fielded<T>, A::Error> {
+                T::read(map).map(|fields| Fielded(Some(fields)))
+            }
+            fn visit_seq<A: SeqAccess<'de>>(self, list: A) -> Result<Fielded<T>, A::Error> {
+                IgnoredAny.visit_seq(list).map(|_| Fielded(None))
+            }
+            fn visit_unit<X: de::Error>(self) -> Result<Fielded<T>, X> {
+                Ok(Fielded(None))
+            }
+            fn visit_bool<X: de::Error>(self, _: bool) -> Result<Fielded<T>, X> {
+                Ok(Fielded(None))
+            }
+            fn visit_i64<X: de::Error>(self, _: i64) -> Result<Fielded<T>, X> {
+                Ok(Fielded(None))
+            }
+            fn visit_u64<X: de::Error>(self, _: u64) -> Result<Fielded<T>, X> {
+                Ok(Fielded(None))
+            }
+            fn visit_f64<X: de::Error>(self, _: f64) -> Result<Fielded<T>, X> {
+                Ok(Fielded(None))
+            }
+            fn visit_str<X: de::Error>(self, _: &str) -> Result<Fielded<T>, X> {
+                Ok(Fielded(None))
+            }
+        }
+        json.deserialize_any(Read(PhantomData))
+    }
 }
 
 /// The first element of a list, or `None` for `null`; any other value fails.
@@ -281,6 +344,99 @@ impl<'de, T: Deserialize<'de>> Deserialize<'de> for First<T> {
             }
         }
         list.deserialize_any(Read(PhantomData))
+    }
+}
+
+/// A value read as a word of the vocabulary `T`: `None` for a word it
+/// lacks or a value that is no string.
+pub(crate) struct Word<T>(pub(crate) Option<T>);
+
+impl<T> Default for Word<T> {
+    fn default() -> Self {
+        Self(None)
+    }
+}
+
+impl<'de, T: de::DeserializeOwned> Deserialize<'de> for Word<T> {
+    fn deserialize<D: Deserializer<'de>>(json: D) -> Result<Self, D::Error> {
+        struct Read<T>(PhantomData<T>);
+        impl<'de, T: de::DeserializeOwned> Visitor<'de> for Read<T> {
+            type Value = Word<T>;
+            fn expecting(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+                f.write_str("JSON")
+            }
+            fn visit_str<X: de::Error>(self, name: &str) -> Result<Word<T>, X> {
+                Ok(Word(word(name)))
+            }
+            fn visit_map<A: MapAccess<'de>>(self, map: A) -> Result<Word<T>, A::Error> {
+                IgnoredAny.visit_map(map).map(|_| Word(None))
+            }
+            fn visit_seq<A: SeqAccess<'de>>(self, list: A) -> Result<Word<T>, A::Error> {
+                IgnoredAny.visit_seq(list).map(|_| Word(None))
+            }
+            fn visit_unit<X: de::Error>(self) -> Result<Word<T>, X> {
+                Ok(Word(None))
+            }
+            fn visit_bool<X: de::Error>(self, _: bool) -> Result<Word<T>, X> {
+                Ok(Word(None))
+            }
+            fn visit_i64<X: de::Error>(self, _: i64) -> Result<Word<T>, X> {
+                Ok(Word(None))
+            }
+            fn visit_u64<X: de::Error>(self, _: u64) -> Result<Word<T>, X> {
+                Ok(Word(None))
+            }
+            fn visit_f64<X: de::Error>(self, _: f64) -> Result<Word<T>, X> {
+                Ok(Word(None))
+            }
+        }
+        json.deserialize_any(Read(PhantomData))
+    }
+}
+
+/// A count read as [`Lenient::as_u64_lenient`] reads one: a non-negative
+/// integer, a float that is one, or a string that parses as one.
+///
+/// [`Lenient::as_u64_lenient`]: super::Lenient::as_u64_lenient
+#[derive(Default)]
+pub(crate) struct Count(pub(crate) Option<u64>);
+
+impl<'de> Deserialize<'de> for Count {
+    fn deserialize<D: Deserializer<'de>>(json: D) -> Result<Self, D::Error> {
+        struct Read;
+        impl<'de> Visitor<'de> for Read {
+            type Value = Count;
+            fn expecting(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+                f.write_str("JSON")
+            }
+            fn visit_u64<X: de::Error>(self, count: u64) -> Result<Count, X> {
+                Ok(Count(Some(count)))
+            }
+            fn visit_i64<X: de::Error>(self, count: i64) -> Result<Count, X> {
+                Ok(Count(u64::try_from(count).ok()))
+            }
+            #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+            fn visit_f64<X: de::Error>(self, count: f64) -> Result<Count, X> {
+                let whole = count >= 0.0 && count.fract() == 0.0;
+                Ok(Count(whole.then_some(count as u64)))
+            }
+            fn visit_str<X: de::Error>(self, count: &str) -> Result<Count, X> {
+                Ok(Count(count.trim().parse().ok()))
+            }
+            fn visit_map<A: MapAccess<'de>>(self, map: A) -> Result<Count, A::Error> {
+                IgnoredAny.visit_map(map).map(|_| Count(None))
+            }
+            fn visit_seq<A: SeqAccess<'de>>(self, list: A) -> Result<Count, A::Error> {
+                IgnoredAny.visit_seq(list).map(|_| Count(None))
+            }
+            fn visit_unit<X: de::Error>(self) -> Result<Count, X> {
+                Ok(Count(None))
+            }
+            fn visit_bool<X: de::Error>(self, _: bool) -> Result<Count, X> {
+                Ok(Count(None))
+            }
+        }
+        json.deserialize_any(Read)
     }
 }
 

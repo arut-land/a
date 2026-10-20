@@ -1,19 +1,21 @@
 //! Responses frames into parts: one part per output item, in the order the
 //! items arrive, each holding the item as the provider stated it complete.
 //! Every field is read leniently, so a gateway that omits or retypes a field
-//! no part or finish needs never fails a reply. Delta events, nearly every
-//! frame, are read into fields borrowed from the frame; any other frame, or
-//! one those fields do not fit, is read as a `Value`.
+//! no part or finish needs never fails a reply. A frame is read once, into
+//! fields borrowed from it: a delta, nearly every frame, builds no tree, an
+//! item or a response stays text until its event reads it, and a frame of
+//! an event the decoder skips is only validated.
 
 use std::borrow::Cow;
 
 use serde::Deserialize;
-use serde::de::{self, Deserializer};
+use serde::de::{IgnoredAny, MapAccess};
+use serde_json::value::RawValue;
 use serde_json::{Value, json};
 
 use super::{ItemType, KEY, PartType, Status};
 use crate::error::{Error, Kind};
-use crate::json::{Lenient, word};
+use crate::json::{Count, Fielded, FromFields, Json, Lenient, word};
 use crate::protocol::Flow;
 use crate::spec::{Reason, SmolStr, Usage};
 use crate::writer::{CallFragment, End, Open, Writer, Writes};
@@ -54,51 +56,76 @@ enum Incomplete {
     ContentFilter,
 }
 
-/// A delta event's fields, borrowed from its frame.
+/// A frame's fields, whatever its event: the type may come last.
+#[derive(Default)]
+pub(super) struct Frame<'a> {
+    kind: Json<'a>,
+    pub(super) delta: Json<'a>,
+    output_index: Count,
+    item_id: Json<'a>,
+    content_index: Count,
+    summary_index: Count,
+    item: Option<&'a RawValue>,
+    response: Option<&'a RawValue>,
+}
+
+/// A frame's keys, read as a vocabulary.
 #[derive(Deserialize)]
+#[serde(field_identifier, rename_all = "snake_case")]
+enum FrameKey {
+    Type,
+    Delta,
+    OutputIndex,
+    ItemId,
+    ContentIndex,
+    SummaryIndex,
+    Item,
+    Response,
+    #[serde(other)]
+    Other,
+}
+
+impl<'de: 'a, 'a> FromFields<'de> for Frame<'a> {
+    fn read<A: MapAccess<'de>>(mut map: A) -> Result<Self, A::Error> {
+        let mut frame = Self::default();
+        while let Some(key) = map.next_key()? {
+            match key {
+                FrameKey::Type => frame.kind = map.next_value()?,
+                FrameKey::Delta => frame.delta = map.next_value()?,
+                FrameKey::OutputIndex => frame.output_index = map.next_value()?,
+                FrameKey::ItemId => frame.item_id = map.next_value()?,
+                FrameKey::ContentIndex => frame.content_index = map.next_value()?,
+                FrameKey::SummaryIndex => frame.summary_index = map.next_value()?,
+                FrameKey::Item => frame.item = map.next_value()?,
+                FrameKey::Response => frame.response = map.next_value()?,
+                FrameKey::Other => drop(map.next_value::<IgnoredAny>()?),
+            }
+        }
+        Ok(frame)
+    }
+}
+
+/// `raw` as a tree, `null` when absent.
+fn tree(raw: Option<&RawValue>) -> Value {
+    raw.and_then(|raw| serde_json::from_str(raw.get()).ok())
+        .unwrap_or_default()
+}
+
+/// `data` read as a frame; `None` for JSON that is no object.
+pub(super) fn frame(data: &str) -> Result<Option<Frame<'_>>, Error> {
+    let frame: Fielded<Frame<'_>> =
+        serde_json::from_str(data).map_err(|error| Error::decode(error, data))?;
+    Ok(frame.0)
+}
+
+/// A delta event's fields, borrowed from its frame.
 struct Delta<'a> {
-    /// Only a delta event reads as one, so any other frame stops at its
-    /// type.
-    #[serde(rename = "type", deserialize_with = "delta_event")]
     event: Event,
-    #[serde(rename = "delta", borrow)]
     text: Cow<'a, str>,
     output_index: Option<u64>,
     item_id: Option<&'a str>,
     content_index: Option<u64>,
     summary_index: Option<u64>,
-    /// A frame stating an item or a response is no delta this reads: the
-    /// `Value` path addresses an event by its item's id.
-    #[serde(rename = "item", default, deserialize_with = "refuse")]
-    _item: (),
-    #[serde(rename = "response", default, deserialize_with = "refuse")]
-    _response: (),
-}
-
-fn delta_event<'de, D: Deserializer<'de>>(kind: D) -> Result<Event, D::Error> {
-    match Event::deserialize(kind)? {
-        event @ (Event::Text | Event::Summary | Event::Reasoning | Event::Arguments) => Ok(event),
-        _ => Err(de::Error::custom("not a delta event")),
-    }
-}
-
-fn refuse<'de, D: Deserializer<'de>>(_: D) -> Result<(), D::Error> {
-    Err(de::Error::custom("not a delta event"))
-}
-
-impl<'a> Delta<'a> {
-    fn lenient(event: Event, frame: &'a Value) -> Self {
-        Self {
-            event,
-            text: frame.str("delta").unwrap_or_default().into(),
-            output_index: frame.u64("output_index"),
-            item_id: address(frame),
-            content_index: frame.u64("content_index"),
-            summary_index: frame.u64("summary_index"),
-            _item: (),
-            _response: (),
-        }
-    }
 }
 
 /// What an output item becomes.
@@ -172,12 +199,6 @@ impl Slot {
 
 fn item_id(item: &Value) -> Option<&str> {
     item.str("id").filter(|id| !id.is_empty())
-}
-
-/// The item id an event addresses.
-fn address(frame: &Value) -> Option<&str> {
-    let id = frame.at("/item/id").and_then(Value::as_str);
-    id.or_else(|| frame.str("item_id"))
 }
 
 fn ciphertext(item: &Value) -> Option<&Value> {
@@ -647,49 +668,16 @@ impl ResponsesDecoder {
         })
     }
 
-    /// A frame read as a `Value`: every event, leniently.
-    fn lenient(&mut self, data: &str) -> Result<Flow, Error> {
-        if data.trim() == "[DONE]" {
-            // The provider's end is `response.completed`.
-            return Ok(Flow::More);
+    /// A frame with no `type`: the whole response, or its error.
+    fn untagged(&mut self, data: &str) -> Result<Flow, Error> {
+        let frame: Value = serde_json::from_str(data).unwrap_or_default();
+        let stated = |key: &str| frame.get(key).is_some();
+        let failed = frame.get("error").is_some_and(|error| !error.is_null());
+        if failed && !stated("output") && !stated("status") {
+            return Err(failure(&frame));
         }
-        let mut frame: Value =
-            serde_json::from_str(data).map_err(|error| Error::decode(error, data))?;
-        if !frame.is_object() {
-            return Ok(Flow::More);
-        }
-        let Some(kind) = frame.str("type") else {
-            // An untagged body: the whole response, or its error.
-            let stated = |key: &str| frame.get(key).is_some();
-            let failed = frame.get("error").is_some_and(|error| !error.is_null());
-            if failed && !stated("output") && !stated("status") {
-                return Err(failure(&frame));
-            }
-            if ["object", "output", "status", "id"].into_iter().any(stated) {
-                return self.finish(&frame);
-            }
-            return Ok(Flow::More);
-        };
-        let item = frame.get("item").filter(|item| item.is_object());
-        let index = || output_index(frame.u64("output_index"));
-        match (word(kind), item) {
-            (Some(Event::Failed), _) => return Err(failure(&frame)),
-            // `response.incomplete` is a terminal that keeps the partial
-            // output and usage, incomplete whatever its `status` says.
-            (Some(event @ (Event::Completed | Event::Incomplete)), _) => {
-                let response = frame
-                    .get_mut("response")
-                    .filter(|response| response.is_object());
-                let mut response = response.map_or_else(|| json!({}), Value::take);
-                if event == Event::Incomplete {
-                    response["status"] = json!(Status::Incomplete);
-                }
-                return self.finish(&response);
-            }
-            (Some(Event::Added), Some(item)) => self.added(index()?, item).map(drop)?,
-            (Some(Event::Done), Some(item)) => self.item_done(index()?, address(&frame), item)?,
-            (Some(Event::Added | Event::Done) | None, _) => {}
-            (Some(event), _) => self.delta(Delta::lenient(event, &frame))?,
+        if ["object", "output", "status", "id"].into_iter().any(stated) {
+            return self.finish(&frame);
         }
         Ok(Flow::More)
     }
@@ -701,18 +689,64 @@ impl Writes for ResponsesDecoder {
     }
 
     fn data(&mut self, data: &str) -> Result<Flow, Error> {
-        match typed(data) {
-            Some(delta) => self.delta(delta).map(|()| Flow::More),
-            None => self.lenient(data),
+        if data.trim() == "[DONE]" {
+            // The provider's end is `response.completed`.
+            return Ok(Flow::More);
         }
+        let Some(frame) = frame(data)? else {
+            return Ok(Flow::More);
+        };
+        let Some(kind) = frame.kind.str() else {
+            return self.untagged(data);
+        };
+        let Some(event) = word(kind) else {
+            return Ok(Flow::More);
+        };
+        let item = Some(tree(frame.item)).filter(Value::is_object);
+        // The item id an event addresses: its item's, else the one it names.
+        let id = item.as_ref().and_then(|item| item.get("id")?.as_str());
+        let id = id.or_else(|| frame.item_id.str());
+        let index = || output_index(frame.output_index.0);
+        match event {
+            Event::Failed => {
+                let frame: Value = serde_json::from_str(data).unwrap_or_default();
+                return Err(failure(&frame));
+            }
+            // `response.incomplete` is a terminal that keeps the partial
+            // output and usage, incomplete whatever its `status` says.
+            Event::Completed | Event::Incomplete => {
+                let response = Some(tree(frame.response)).filter(Value::is_object);
+                let mut response = response.unwrap_or_else(|| json!({}));
+                if event == Event::Incomplete {
+                    response["status"] = json!(Status::Incomplete);
+                }
+                return self.finish(&response);
+            }
+            Event::Added => {
+                if let Some(item) = &item {
+                    self.added(index()?, item)?;
+                }
+            }
+            Event::Done => {
+                if let Some(item) = &item {
+                    self.item_done(index()?, id, item)?;
+                }
+            }
+            event => self.delta(Delta {
+                event,
+                text: frame.delta.str().unwrap_or_default().into(),
+                output_index: frame.output_index.0,
+                item_id: id,
+                content_index: frame.content_index.0,
+                summary_index: frame.summary_index.0,
+            })?,
+        }
+        Ok(Flow::More)
     }
-}
-
-/// A delta frame read into fields borrowed from it; `None` for any other
-/// frame, or one those fields do not fit.
-fn typed(data: &str) -> Option<Delta<'_>> {
-    serde_json::from_str(data).ok()
 }
 
 #[cfg(test)]
 mod tests;
+
+#[cfg(test)]
+mod oracle;

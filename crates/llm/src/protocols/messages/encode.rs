@@ -6,6 +6,9 @@
 
 use std::num::NonZeroU32;
 
+use std::borrow::Cow;
+
+use serde::ser::{Serialize, SerializeMap, Serializer};
 use serde_json::{Map, Value, json};
 
 use crate::json::obj;
@@ -15,7 +18,7 @@ use super::{
     Dialect, FINE_GRAINED_TOOL_STREAMING_BETA, KEY, Quirks, THINKING_BINDING_BETA,
     ToolInputStreaming, options, strict,
 };
-use crate::conversation::{self, Fold, History};
+use crate::conversation::{self, Fold, History, Settled};
 use crate::error::Error;
 use crate::json::Lenient;
 use crate::models::anthropic::{
@@ -193,11 +196,88 @@ enum Turn<'a> {
     Assistant(&'a Assistant),
 }
 
+/// A content block as the request sends it: one the encoder builds, typed
+/// and borrowed from the conversation, or any other as a tree (a provider
+/// block replayed, a block a part's state adds fields to). Each writes its
+/// fields in key order, as a tree of it would.
+enum Block<'a> {
+    Text(Cow<'a, str>),
+    Result {
+        id: &'a str,
+        content: Vec<Block<'a>>,
+        error: bool,
+    },
+    Use {
+        id: &'a str,
+        name: &'a str,
+        input: &'a Map<String, Value>,
+    },
+    Tree(Value),
+}
+
+impl Block<'_> {
+    /// A block as a tree, for state that adds fields to it.
+    fn tree(self) -> Value {
+        match self {
+            Self::Tree(tree) => tree,
+            block => serde_json::to_value(&block).unwrap_or_default(),
+        }
+    }
+
+    /// The tree a block is, when it is one: only such a block carries a
+    /// cache marker before the request places its own.
+    fn as_tree(&self) -> Option<&Value> {
+        match self {
+            Self::Tree(tree) => Some(tree),
+            _ => None,
+        }
+    }
+}
+
+impl Serialize for Block<'_> {
+    fn serialize<S: Serializer>(&self, s: S) -> Result<S::Ok, S::Error> {
+        match self {
+            Self::Text(text) => {
+                let mut block = s.serialize_map(Some(2))?;
+                block.serialize_entry("text", text)?;
+                block.serialize_entry("type", "text")?;
+                block.end()
+            }
+            Self::Result { id, content, error } => {
+                let mut block = s.serialize_map(None)?;
+                block.serialize_entry("content", content)?;
+                if *error {
+                    block.serialize_entry("is_error", &true)?;
+                }
+                block.serialize_entry("tool_use_id", id)?;
+                block.serialize_entry("type", "tool_result")?;
+                block.end()
+            }
+            Self::Use { id, name, input } => {
+                let mut block = s.serialize_map(Some(4))?;
+                block.serialize_entry("id", id)?;
+                block.serialize_entry("input", input)?;
+                block.serialize_entry("name", name)?;
+                block.serialize_entry("type", "tool_use")?;
+                block.end()
+            }
+            Self::Tree(tree) => tree.serialize(s),
+        }
+    }
+}
+
+/// A message of blocks, its fields in key order.
+#[derive(serde::Serialize)]
+struct Sent<'a> {
+    content: Vec<Block<'a>>,
+    role: &'static str,
+}
+
 /// What turns add to the request: top-level `system` blocks, messages, and
 /// whether a system message may follow them.
-struct Placed {
+struct Placed<'a> {
     system: Vec<Value>,
-    sent: Vec<Value>,
+    sent: Vec<Sent<'a>>,
     follows: Option<bool>,
 }
 
@@ -210,7 +290,10 @@ struct Placed {
 /// missing the cache and, on models that bind thinking to their context,
 /// turning every earlier thinking block into an error. It is hoisted only
 /// when no slot exists.
-fn place(messages: &[Message], mid: bool, mut follows: Option<bool>) -> Result<Placed, Error> {
+fn place(messages: &[Message], mid: bool, mut follows: Option<bool>) -> Result<Placed<'_>, Error> {
+    fn message<'a>(role: &'static str, content: Vec<Block<'a>>) -> Option<Sent<'a>> {
+        (!content.is_empty()).then_some(Sent { content, role })
+    }
     let user = |message: &Message| matches!(message, Message::User(_) | Message::Tool(_));
     let turns: Vec<Turn<'_>> = messages
         .chunk_by(|earlier, later| user(earlier) && user(later))
@@ -234,9 +317,6 @@ fn place(messages: &[Message], mid: bool, mut follows: Option<bool>) -> Result<P
             Turn::User(_) => (slot, next) = (slot || next, false),
         }
     }
-    let message = |role, content: Vec<Value>| {
-        (!content.is_empty()).then(|| obj!({"role": role, "content": content}))
-    };
     let (mut system, mut sent, mut deferred) = (Vec::new(), Vec::new(), Vec::new());
     // Whether a system message may follow the last turn that is not one: a
     // user turn, or an assistant turn ending in a server tool's result.
@@ -247,7 +327,7 @@ fn place(messages: &[Message], mid: bool, mut follows: Option<bool>) -> Result<P
                 let text = prompt.text();
                 if text.is_empty() {
                 } else if mid && follows == Some(true) && before_assistant[at] {
-                    sent.extend(message("system", vec![text_block(&text)]));
+                    sent.extend(message("system", vec![Block::Text(text.into())]));
                 } else if mid && follows.is_some() && slot_after[at] {
                     deferred.push(text);
                 } else {
@@ -268,7 +348,7 @@ fn place(messages: &[Message], mid: bool, mut follows: Option<bool>) -> Result<P
                 follows = Some(true);
                 sent.extend(message("user", user_blocks(run)?));
                 if before_assistant[at] && !deferred.is_empty() {
-                    let text = text_block(&deferred.join("\n\n"));
+                    let text = Block::Text(deferred.join("\n\n").into());
                     sent.extend(message("system", vec![text]));
                     deferred.clear();
                 }
@@ -296,8 +376,8 @@ pub(super) struct Turns {
     follows: Option<bool>,
     /// The messages since the turns that settled.
     open: Vec<Message>,
-    /// Messages placed, to settle.
-    placed: Vec<Value>,
+    /// Messages placed, written, to settle.
+    placed: Vec<u8>,
     /// Whether a message other than a system message came.
     begun: bool,
     /// Whether a system message came mid-conversation on `mid`.
@@ -312,6 +392,8 @@ pub(super) struct Turns {
 /// the markers settled.
 pub(super) struct Ended {
     pub system: Vec<Value>,
+    /// The messages after those settled: the request places its cache
+    /// breakpoints on them.
     pub messages: Vec<Value>,
     pub container: Option<String>,
     pub markers: Markers,
@@ -336,9 +418,18 @@ impl Turns {
     pub(super) fn finish(mut self) -> Result<Ended, Error> {
         let placed = place(&self.open, self.mid, self.follows)?;
         self.system.extend(placed.system);
+        let messages = placed.sent.into_iter().map(|sent| {
+            let content = sent
+                .content
+                .into_iter()
+                .map(Block::tree)
+                .collect::<Vec<_>>();
+            obj!({"role": sent.role, "content": content})
+        });
+        let messages = messages.collect();
         Ok(Ended {
             system: self.system,
-            messages: placed.sent,
+            messages,
             container: container(&self.open).or(self.container),
             markers: self.markers,
         })
@@ -367,32 +458,39 @@ impl Fold for Turns {
         // A turn that sends nothing leaves the last message the one
         // before, which takes the request's breakpoint.
         let last = placed.sent.last();
-        if last.and_then(|message| message.str("role")) == Some("assistant") {
+        if last.map(|message| message.role) == Some("assistant") {
+            let blocks = placed.sent.iter().flat_map(|sent| &sent.content);
+            self.markers = self
+                .markers
+                .then(Markers::of(blocks.filter_map(Block::as_tree)));
+            for sent in &placed.sent {
+                if !self.placed.is_empty() {
+                    self.placed.push(b',');
+                }
+                // Writing to memory cannot fail.
+                let _ = serde_json::to_writer(&mut self.placed, sent);
+            }
             self.system.extend(placed.system);
             self.follows = placed.follows;
-            self.placed.extend(placed.sent);
-            if let Some(id) = container(&self.open) {
-                self.container = Some(id);
+            let id = container(&self.open);
+            if id.is_some() {
+                self.container = id;
             }
             self.open.clear();
         }
         Ok(())
     }
 
-    fn settle(&mut self, out: &mut Vec<Value>) {
-        let content = self
-            .placed
-            .iter()
-            .flat_map(|message| message.arr("content"));
-        self.markers = self.markers.then(Markers::of(content));
-        out.append(&mut self.placed);
+    fn settle(&mut self, out: &mut Settled) {
+        out.written(&self.placed);
+        self.placed.clear();
     }
 }
 
 /// The provider item of an opaque part this protocol kept.
 fn opaque_item(part: &AssistantPart) -> Option<Value> {
     match part {
-        AssistantPart::Opaque(opaque) => opaque.meta.field(KEY, "item"),
+        AssistantPart::Opaque(opaque) => crate::replay::item(&opaque.meta, KEY),
         _ => None,
     }
 }
@@ -418,7 +516,7 @@ fn text_block(text: &str) -> Value {
 /// text, and rejects blank text. A part's state under [`KEY`] names fields
 /// its block takes, such as a document's `title` or a `cache_control`
 /// marker.
-fn user_blocks(run: &[Message]) -> Result<Vec<Value>, Error> {
+fn user_blocks(run: &[Message]) -> Result<Vec<Block<'_>>, Error> {
     let (mut results, mut parts) = (Vec::new(), Vec::new());
     for message in run {
         match message {
@@ -429,15 +527,21 @@ fn user_blocks(run: &[Message]) -> Result<Vec<Value>, Error> {
             }
             Message::User(user) => {
                 for part in &user.content {
-                    let (mut block, meta) = match part {
+                    let (block, meta) = match part {
                         UserPart::Text(text) if text.text.trim().is_empty() => continue,
-                        UserPart::Text(text) => (text_block(&text.text), &text.meta),
-                        UserPart::Media(media) => (media_block(media)?, &media.meta),
+                        UserPart::Text(text) => {
+                            (Block::Text(text.text.as_str().into()), &text.meta)
+                        }
+                        UserPart::Media(media) => (Block::Tree(media_block(media)?), &media.meta),
                     };
-                    if let Some(Value::Object(fields)) = meta.get(KEY) {
-                        crate::json::overlay(&mut block, &fields);
-                    }
-                    parts.push(block);
+                    parts.push(match meta.get(KEY) {
+                        Some(Value::Object(fields)) => {
+                            let mut block = block.tree();
+                            crate::json::overlay(&mut block, &fields);
+                            Block::Tree(block)
+                        }
+                        _ => block,
+                    });
                 }
             }
             Message::System(_) | Message::Assistant(_) => {}
@@ -447,24 +551,23 @@ fn user_blocks(run: &[Message]) -> Result<Vec<Value>, Error> {
     Ok(results)
 }
 
-fn result_json(result: &ToolResult) -> Result<Value, Error> {
+fn result_json(result: &ToolResult) -> Result<Block<'_>, Error> {
     let content = match &result.output {
-        Output::Text(text) => vec![text_block(text)],
-        Output::Json(value) => vec![text_block(&value.to_string())],
+        Output::Text(text) => vec![Block::Text(text.as_str().into())],
+        Output::Json(value) => vec![Block::Text(value.to_string().into())],
         Output::Content(parts) => parts
             .iter()
             .map(|part| match part {
-                UserPart::Text(text) => Ok(text_block(&text.text)),
-                UserPart::Media(media) => media_block(media),
+                UserPart::Text(text) => Ok(Block::Text(text.text.as_str().into())),
+                UserPart::Media(media) => media_block(media).map(Block::Tree),
             })
             .collect::<Result<_, _>>()?,
     };
-    let id = result.id.as_str();
-    let mut block = obj!({"type": "tool_result", "tool_use_id": id, "content": content});
-    if result.error {
-        block["is_error"] = true.into();
-    }
-    Ok(block)
+    Ok(Block::Result {
+        id: result.id.as_str(),
+        content,
+        error: result.error,
+    })
 }
 
 /// An image or a document block for `media`. An image goes as base64 data
@@ -538,7 +641,7 @@ fn identity(item: &Value) -> Map<String, Value> {
 /// An assistant turn's blocks: each part's provider block while it is
 /// current, else the part rebuilt. A server tool's result goes only with
 /// its use, and the reply's container goes as the request's `container`.
-fn assistant_blocks(assistant: &Assistant) -> Vec<Value> {
+fn assistant_blocks(assistant: &Assistant) -> Vec<Block<'_>> {
     let mut uses: Vec<String> = Vec::new();
     let mut blocks = Vec::new();
     for part in &assistant.content {
@@ -558,7 +661,7 @@ fn assistant_blocks(assistant: &Assistant) -> Vec<Value> {
             {
                 uses.push(id.to_owned());
             }
-            blocks.push(sendable(&item));
+            blocks.push(Block::Tree(sendable(&item)));
             continue;
         }
         let identity = match replay(part, KEY, identity) {
@@ -568,31 +671,38 @@ fn assistant_blocks(assistant: &Assistant) -> Vec<Value> {
                     // The call takes the id its result answers.
                     item["id"] = call.id.as_str().into();
                 }
-                blocks.push(item);
+                blocks.push(Block::Tree(item));
                 continue;
             }
             Replay::Identity(identity) => identity,
             Replay::Rebuild => Map::new(),
         };
         blocks.push(match part {
-            AssistantPart::Text(text) if !text.text.trim().is_empty() => text_block(&text.text),
+            AssistantPart::Text(text) if !text.text.trim().is_empty() => {
+                Block::Text(text.text.as_str().into())
+            }
             // Thinking without its signature is text; a redacted block's
             // payload lived only in its item.
             AssistantPart::Reasoning(reasoning)
                 if !reasoning.redacted && !reasoning.text.trim().is_empty() =>
             {
-                text_block(&reasoning.text)
+                Block::Text(reasoning.text.as_str().into())
             }
             AssistantPart::ToolCall(call) => {
                 let (id, name) = (call.id.as_str(), call.name.as_str());
-                let input = call.input.clone();
-                let mut block = obj!({"type": "tool_use", "id": id, "name": name, "input": input});
-                if let Some(fields) = block.as_object_mut() {
-                    fields.extend(identity);
+                let input = &call.input;
+                let block = Block::Use { id, name, input };
+                if identity.is_empty() {
+                    block
+                } else {
+                    let mut block = block.tree();
+                    if let Some(fields) = block.as_object_mut() {
+                        fields.extend(identity);
+                    }
+                    Block::Tree(block)
                 }
-                block
             }
-            AssistantPart::Media(_) => text_block(ASSISTANT_IMAGE_OMITTED),
+            AssistantPart::Media(_) => Block::Text(ASSISTANT_IMAGE_OMITTED.into()),
             _ => continue,
         });
     }

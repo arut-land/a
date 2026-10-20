@@ -310,7 +310,7 @@ fn an_interrupt_never_starts_work() {
                         replied: Replied::Interrupted(None),
                     },
                     Some(Call::Tool { .. }) => tool_done(call.get(), INTERRUPTED),
-                    None => continue,
+                    Some(Call::Side { .. }) | None => continue,
                 },
                 Effect::Interrupt { child } => Event::ChildSettled {
                     child,

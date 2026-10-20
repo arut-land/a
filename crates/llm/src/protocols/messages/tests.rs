@@ -6,6 +6,7 @@ mod decode;
 mod encode;
 mod hosts;
 mod options;
+mod oracle;
 mod tools;
 
 use serde_json::{Value, json};
@@ -182,9 +183,7 @@ fn reply(blocks: Vec<Vec<Value>>, stop_reason: &str) -> Vec<Value> {
 
 /// The provider item a decoded part holds.
 fn item(part: &AssistantPart) -> Option<Value> {
-    part.meta()
-        .field(KEY, "item")
-        .filter(|item| !item.is_null())
+    crate::replay::item(part.meta(), KEY)
 }
 
 /// Whether the opaque `part` replays.

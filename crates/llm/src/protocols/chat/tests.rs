@@ -136,7 +136,7 @@ pub(super) fn decode(provider: &Provider, model: &str, frames: &[String]) -> Res
 
 /// The provider item a part holds.
 pub(super) fn item(part: &AssistantPart) -> Option<Value> {
-    part.meta().field(KEY, "item")
+    crate::replay::item(part.meta(), KEY)
 }
 
 fn kinds(response: &Response) -> Vec<&'static str> {

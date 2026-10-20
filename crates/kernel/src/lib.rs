@@ -101,6 +101,23 @@ pub enum Event {
         call: CallId,
         recovered: Option<(Name, Recover)>,
     },
+    /// An extension asks `model` aside on behalf of open call `of`, for
+    /// `purpose`: logged as a model call of its own under it, its id the
+    /// answer to `ticket` ([`Effect::Side`]).
+    Side {
+        of: CallId,
+        purpose: String,
+        model: String,
+        ticket: Ticket,
+    },
+    /// Side request `side` ended.
+    SideDone { side: CallId, outcome: Outcome },
+    /// The `step` point decided `decisions` about model call `call`'s
+    /// request as it was sent (or answered it).
+    Prepared {
+        call: CallId,
+        decisions: ext::host::Decided,
+    },
     /// Child session `child` settled with `outcome`.
     ChildSettled { child: SessionId, outcome: Outcome },
     /// A new registry generation, taken up at the next step boundary.
@@ -153,6 +170,12 @@ pub enum Effect {
     Reply {
         ticket: Ticket,
         result: Result<(), String>,
+    },
+    /// Answer side request `ticket` with its call's id, once committed;
+    /// `None`, it may not be made (its owner is not open).
+    Side {
+        ticket: Ticket,
+        side: Option<CallId>,
     },
     /// Ask the model to reply to the transcript before `call`, as it is
     /// now, as attempt `attempt` (from 0), streaming under it, with the

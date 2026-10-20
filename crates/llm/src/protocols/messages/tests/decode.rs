@@ -712,22 +712,27 @@ fn the_container_is_kept_as_a_last_opaque_part() {
     );
 }
 
-/// `frames` decoded through the typed fast path where it applies (`fast`),
-/// or every frame through a `Value`; `each` sees each frame's flow and
-/// events.
+/// `frames` decoded by the decoder (`fast`), or each through a `Value` by
+/// the decoder it replaced ([`super::oracle`]); `each` sees each frame's
+/// flow and events.
 fn decode_frames(
     frames: &[String],
     fast: bool,
     mut each: impl FnMut(Result<crate::Flow, Error>, &mut Vec<Event>),
 ) {
     let mut decoder = super::super::decode::MessagesDecoder::new(false);
+    let mut oracle = oracle::Oracle::new(false);
     let mut events = Vec::new();
     for data in frames {
         let flow = if fast {
             Decoder::frame(&mut decoder, Frame { event: "", data }, &mut events)
         } else {
-            let flow = decoder.value(data);
-            crate::writer::Writes::writer(&mut decoder).drain(&mut events);
+            // Every frame through its `Value` path.
+            let flow = match data.trim() {
+                "[DONE]" => Ok(crate::Flow::More),
+                _ => oracle.value(data),
+            };
+            crate::writer::Writes::writer(&mut oracle).drain(&mut events);
             flow
         };
         each(flow, &mut events);
@@ -744,12 +749,12 @@ fn events_of(frames: &[String], fast: bool) -> Vec<String> {
     log
 }
 
-/// Frames the fast path takes, declines, or must agree on with the `Value`
-/// path: escapes, extra fields, empty and missing fragments, a string
-/// index, a duplicate field, deltas to a block that never started and to
-/// one of another kind.
+/// Frames the decoder must agree on with the `Value` path it replaced:
+/// escapes, extra fields, empty and missing fragments, a string index, a
+/// duplicate field, deltas to a block that never started and to one of
+/// another kind.
 #[test]
-fn the_typed_delta_path_decodes_as_the_value_path_does() {
+fn frames_read_once_decode_as_the_value_path_does() {
     let start = |index: usize, block: Value| {
         json!({"type": "content_block_start", "index": index, "content_block": block}).to_string()
     };
@@ -834,6 +839,140 @@ fn the_typed_delta_path_decodes_as_the_value_path_does() {
     assert_eq!(events_of(&frames, true), events_of(&frames, false));
 }
 
+/// A block's text lands on its item when it stops, unless a delta of
+/// another kind or another delta's field touches that text first: the item
+/// is the one the `Value` path assembled token by token.
+#[test]
+fn a_blocks_text_lands_on_its_item_as_each_token_did() {
+    let start = |index: usize, block: Value| {
+        json!({"type": "content_block_start", "index": index, "content_block": block}).to_string()
+    };
+    let delta = |index: usize, delta: Value| {
+        json!({"type": "content_block_delta", "index": index, "delta": delta}).to_string()
+    };
+    let stop = |index: usize| json!({"type": "content_block_stop", "index": index}).to_string();
+    let text = |text: &str| json!({"type": "text_delta", "text": text});
+    let thinking = |text: &str| json!({"type": "thinking_delta", "thinking": text});
+    let signature = json!({"type": "signature_delta", "signature": "sig"});
+    let cases: Vec<Vec<String>> = vec![
+        // Its own deltas only, from a block that states text and one that
+        // states none.
+        vec![
+            start(0, json!({"type": "text", "text": "a"})),
+            delta(0, text("b")),
+            delta(0, text("c")),
+            stop(0),
+        ],
+        vec![
+            start(0, json!({"type": "text"})),
+            delta(0, text("b")),
+            stop(0),
+        ],
+        vec![
+            start(0, json!({"type": "text", "text": 5})),
+            delta(0, text("b")),
+            delta(0, text("c")),
+            stop(0),
+        ],
+        // Another kind's delta to a text block, and text to thinking.
+        vec![
+            start(0, json!({"type": "text", "text": ""})),
+            delta(0, text("b")),
+            delta(0, thinking("t")),
+            delta(0, text("c")),
+            stop(0),
+        ],
+        vec![
+            start(0, json!({"type": "thinking", "thinking": "x"})),
+            delta(0, thinking("y")),
+            delta(0, text("z")),
+            delta(0, thinking("w")),
+            delta(0, signature.clone()),
+            stop(0),
+        ],
+        // A delta of no known type stating the text field, a citation, and
+        // a text delta stating other fields.
+        vec![
+            start(0, json!({"type": "text", "text": ""})),
+            delta(0, text("b")),
+            delta(0, json!({"type": "mystery", "text": "!", "n": 1})),
+            delta(
+                0,
+                json!({"type": "citations_delta", "citation": {"url": "u"}}),
+            ),
+            delta(0, json!({"type": "text_delta", "text": "c", "extra": "e"})),
+            stop(0),
+        ],
+        // The block opened again while open, deltas after it stopped, and
+        // a thinking block that never stops.
+        vec![
+            start(0, json!({"type": "text", "text": ""})),
+            delta(0, text("b")),
+            start(0, json!({"type": "text", "text": "again"})),
+            delta(0, text("c")),
+            stop(0),
+            delta(0, text("late")),
+            start(1, json!({"type": "thinking", "thinking": ""})),
+            delta(1, thinking("open")),
+            delta(1, signature),
+        ],
+    ];
+    let end = json!({"type": "message_delta", "delta": {"stop_reason": "end_turn"}, "usage": {}});
+    for mut frames in cases {
+        frames.push(end.to_string());
+        assert_eq!(
+            events_of(&frames, true),
+            events_of(&frames, false),
+            "{frames:#?}"
+        );
+    }
+}
+
+/// Every recorded Messages stream decodes as the `Value` path decoded it.
+#[test]
+fn recorded_streams_decode_as_the_value_path_did() {
+    fn walk(dir: &std::path::Path, out: &mut Vec<std::path::PathBuf>) {
+        for entry in std::fs::read_dir(dir).expect("cassettes") {
+            let path = entry.expect("an entry").path();
+            if path.is_dir() {
+                walk(&path, out);
+            } else if path.extension().is_some_and(|ext| ext == "yaml") {
+                out.push(path);
+            }
+        }
+    }
+    let root = format!(
+        "{}/../../fixtures/rig/cassettes",
+        env!("CARGO_MANIFEST_DIR")
+    );
+    let mut files = Vec::new();
+    walk(std::path::Path::new(&root), &mut files);
+    let mut streams = 0;
+    for file in files {
+        let text = std::fs::read_to_string(&file).expect("a cassette");
+        for doc in serde_yaml_ng::Deserializer::from_str(&text) {
+            let doc: serde_yaml_ng::Value = serde::Deserialize::deserialize(doc).expect("yaml");
+            if !doc["when"]["path"]
+                .as_str()
+                .is_some_and(|path| path.ends_with("/messages"))
+            {
+                continue;
+            }
+            let body = doc["then"]["body"].as_str().unwrap_or_default();
+            let events = crate::sse::events(&mut crate::sse::SseFramer::new(), body.as_bytes());
+            let frames: Vec<String> = events.into_iter().map(|(_, data)| data).collect();
+            assert_eq!(
+                events_of(&frames, true),
+                events_of(&frames, false),
+                "{}",
+                file.display()
+            );
+            streams += 1;
+        }
+    }
+    assert!(streams > 30, "{streams}");
+}
+
 /// The frames of the recorded Anthropic stream `name`.
 fn recorded(name: &str) -> Vec<String> {
     let path = format!(
@@ -847,13 +986,13 @@ fn recorded(name: &str) -> Vec<String> {
     events.into_iter().map(|(_, data)| data).collect()
 }
 
-/// The typed path reads every delta of a recorded stream without building
-/// a `Value`, borrowing each fragment that needs no unescaping, and decodes
+/// The decoder reads every delta of a recorded stream without building a
+/// `Value`, borrowing each fragment that needs no unescaping, and decodes
 /// the same events as the `Value` path. An optimized build is faster too;
 /// both timings are printed.
 #[test]
-fn the_typed_delta_path_reads_recorded_streams_without_values() {
-    use super::super::decode::Fast;
+fn a_delta_is_read_without_a_value() {
+    use super::super::decode::frame;
     let frames: Vec<String> = [
         "effect_corpus/cancelled_stream",
         "corpus_endings/tool_call_delta_stop",
@@ -866,12 +1005,19 @@ fn the_typed_delta_path_reads_recorded_streams_without_values() {
         .filter(|data| data.contains(r#""type":"content_block_delta""#))
         .collect();
     assert!(deltas.len() > 500, "{}", deltas.len());
-    let read: Vec<_> = deltas.iter().filter_map(|data| Fast::read(data)).collect();
-    assert_eq!(read.len(), deltas.len(), "every delta takes the typed path");
+    let read: Vec<_> = deltas
+        .iter()
+        .filter_map(|data| frame(data).ok().flatten())
+        .collect();
+    assert_eq!(read.len(), deltas.len(), "every delta reads as a frame");
     let escaped = deltas.iter().filter(|data| data.contains('\\')).count();
     let owned = read
         .iter()
-        .filter(|(.., fragment)| matches!(fragment, std::borrow::Cow::Owned(_)))
+        .filter(|frame| {
+            frame.delta.0.as_ref().is_some_and(|delta| {
+                matches!(delta.streamed, Some((_, std::borrow::Cow::Owned(_))))
+            })
+        })
         .count();
     assert_eq!(owned, escaped, "only an escaped fragment is copied");
     assert_eq!(events_of(&frames, true), events_of(&frames, false));

@@ -95,13 +95,16 @@ pub enum Item {
         seq: u64,
         text: String,
     },
-    /// A model call and the reply it got.
+    /// A model call and the reply it got; a side request an extension
+    /// made names its `purpose`.
     Reply {
         call: u64,
         model: String,
         text: String,
         status: Status,
         usage: Option<Usage>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        purpose: Option<String>,
     },
     Tool {
         call: u64,
@@ -554,12 +557,13 @@ impl SessionView {
                 outcome: None,
                 card: card.clone(),
             },
-            Body::ModelCall { model, .. } => Item::Reply {
+            Body::ModelCall { model, purpose, .. } => Item::Reply {
                 call: seq,
                 model: model.clone(),
                 text: String::new(),
                 status: Status::Running,
                 usage: None,
+                purpose: purpose.clone(),
             },
             Body::Link { child, input } => Item::Child {
                 call: seq,
@@ -724,6 +728,7 @@ impl SessionView {
                 Item::Reply {
                     text,
                     status: Status::Done,
+                    purpose: None,
                     ..
                 } if !text.is_empty() => recap.reply = Some(short(text)),
                 _ => {}
@@ -872,6 +877,7 @@ pub fn recap_line(recap: &Recap) -> String {
 pub fn decision_line(tool: &str, call: Option<u64>, decision: &Verdict) -> String {
     let call = call.unwrap_or_default();
     match decision {
+        Verdict::Answered => format!("answered call {call} itself"),
         Verdict::PrepareStep { model: None } => format!("rewrote the request of call {call}"),
         Verdict::PrepareStep { model: Some(model) } => {
             format!("sent call {call} to {model}")

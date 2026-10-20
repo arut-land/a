@@ -114,7 +114,7 @@ impl Agent for Loop {
                 outcome: Outcome::Done { output },
                 ..
             } => {
-                let Ok(reply) = llm::Response::from_value(&output.value()) else {
+                let Ok(reply) = llm::Response::from_json(output.raw()) else {
                     return Actions::new();
                 };
                 let default = self.calls(&reply);

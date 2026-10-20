@@ -197,6 +197,8 @@ fn a_streamed_reply_shows_live_then_its_committed_text() {
                     model: "gpt".into(),
                     attempt: 0,
                     choice: protocol::ToolChoice::Auto,
+                    r#for: None,
+                    purpose: None,
                 },
             ),
             DaemonMsg::Synced { seq: 3 },
@@ -396,6 +398,8 @@ fn ctrl_c_interrupts_a_running_model_call_too() {
                 model: "m".into(),
                 attempt: 0,
                 choice: protocol::ToolChoice::Auto,
+                r#for: None,
+                purpose: None,
             },
         ),
     ];
@@ -620,6 +624,8 @@ fn render_cost() {
             model: "m".into(),
             attempt: 0,
             choice: protocol::ToolChoice::Auto,
+            r#for: None,
+            purpose: None,
         },
     ));
     let (mut app, _) = app(Viewport::Full, &msgs);

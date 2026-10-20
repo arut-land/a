@@ -20,12 +20,12 @@ use serde_json::value::RawValue;
 pub struct Meta(BTreeMap<String, Raw>);
 
 #[derive(Clone)]
-struct Raw(Box<RawValue>);
+pub(crate) struct Raw(Box<RawValue>);
 
 impl Raw {
     /// `value`'s text, in a buffer of its size: state can hold a whole
     /// reasoning text, which a growing buffer would hold twice over.
-    fn new(value: &Value) -> Self {
+    fn new(value: &(impl Serialize + ?Sized)) -> Self {
         struct Count(usize);
 
         impl std::io::Write for Count {
@@ -40,12 +40,17 @@ impl Raw {
         }
 
         let mut count = Count(0);
-        // A tree always encodes.
+        // State this crate writes always encodes.
         let _ = serde_json::to_writer(&mut count, value);
         let mut text = Vec::with_capacity(count.0);
         let _ = serde_json::to_writer(&mut text, value);
         let text = String::from_utf8(text).unwrap_or_default();
         Self(RawValue::from_string(text).unwrap_or_default())
+    }
+
+    /// State read as it was written: the text of a reply this crate logged.
+    pub(crate) fn from_text(text: Box<RawValue>) -> Self {
+        Self(text)
     }
 
     fn value(&self) -> Value {
@@ -68,7 +73,10 @@ impl Serialize for Raw {
 }
 
 /// Read through a tree: a part's tag makes serde buffer its fields, and a
-/// buffer cannot hand on raw text.
+/// buffer cannot hand on raw text. [`Response::from_json`] reads the text
+/// as it is.
+///
+/// [`Response::from_json`]: crate::Response::from_json
 impl<'de> Deserialize<'de> for Raw {
     fn deserialize<D: Deserializer<'de>>(d: D) -> Result<Self, D::Error> {
         Value::deserialize(d).map(|value| Self::new(&value))
@@ -88,14 +96,16 @@ impl Meta {
         self.0.clear();
     }
 
-    /// The state under `key`, parsed.
+    /// The state under `key`, parsed into a tree, for state a protocol
+    /// edits.
     pub fn get(&self, key: &str) -> Option<Value> {
         self.0.get(key).map(Raw::value)
     }
 
-    /// Field `field` of the state under `key`.
-    pub fn field(&self, key: &str, field: &str) -> Option<Value> {
-        self.get(key)?.get_mut(field).map(Value::take)
+    /// The state under `key` read as `T`, which may borrow from it; `None`
+    /// when absent or of another shape.
+    pub fn parse<'a, T: Deserialize<'a>>(&'a self, key: &str) -> Option<T> {
+        serde_json::from_str(self.raw(key)?).ok()
     }
 
     /// The state under `key`, as its text.
@@ -103,8 +113,12 @@ impl Meta {
         self.0.get(key).map(|raw| raw.0.get())
     }
 
-    pub fn insert(&mut self, key: impl Into<String>, value: &Value) {
+    pub fn insert(&mut self, key: impl Into<String>, value: &(impl Serialize + ?Sized)) {
         self.0.insert(key.into(), Raw::new(value));
+    }
+
+    pub(crate) fn insert_raw(&mut self, key: String, raw: Raw) {
+        self.0.insert(key, raw);
     }
 
     /// `more` over this state, key by key; object values merge one level
@@ -116,7 +130,7 @@ impl Meta {
                 Some(have) => match (have.value(), raw.value()) {
                     (Value::Object(mut fields), Value::Object(add)) => {
                         fields.extend(add);
-                        *have = Raw::new(&Value::Object(fields));
+                        *have = Raw::new(&fields);
                     }
                     _ => *have = raw,
                 },

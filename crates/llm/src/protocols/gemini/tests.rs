@@ -163,7 +163,7 @@ fn native(text: &str, item: Value) -> AssistantPart {
 }
 
 fn item(part: &AssistantPart) -> Option<Value> {
-    part.meta().field(KEY, "item")
+    crate::replay::item(part.meta(), KEY)
 }
 
 fn the_function_response(contents: &[Value]) -> &Value {

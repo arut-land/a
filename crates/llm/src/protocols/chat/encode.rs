@@ -11,7 +11,7 @@ use super::merge::merge_fields;
 use super::{
     KEY, LaterSystem, PartKind, Quirks, ReasoningField, Routing, Vendor as V, rewrite, rules,
 };
-use crate::conversation::{self, Fold, History};
+use crate::conversation::{self, Fold, History, Settled};
 use crate::error::Error;
 use crate::json::{Lenient, obj};
 use crate::models::openai;
@@ -368,7 +368,7 @@ impl Fold for Wire {
         &self.ctx
     }
 
-    fn settle(&mut self, out: &mut Vec<Value>) {
+    fn settle(&mut self, out: &mut Settled) {
         let user = self
             .open
             .last()
@@ -376,7 +376,7 @@ impl Fold for Wire {
         let settled = self.open.len() - usize::from(user);
         for mut message in self.open.drain(..settled) {
             rewrite::message(self.ctx.quirks.vendor, &mut message);
-            out.push(message);
+            out.item(&message);
         }
         self.settled += settled;
     }
@@ -489,8 +489,8 @@ fn assistant_message(assistant: &Assistant, ctx: &Context) -> Option<Value> {
             AssistantPart::ToolCall(call) => calls.push(call_item(call, sent, &ctx.custom)),
             // An opaque item is a content part; one with no `type` is not.
             AssistantPart::Opaque(opaque) if replays(part, KEY) => {
-                if let Some(item) =
-                    (opaque.meta.field(KEY, "item")).filter(|item| item.get("type").is_some())
+                if let Some(item) = (crate::replay::item(&opaque.meta, KEY))
+                    .filter(|item| item.get("type").is_some())
                 {
                     has_parts = true;
                     parts.push(item);

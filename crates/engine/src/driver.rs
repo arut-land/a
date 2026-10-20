@@ -137,6 +137,14 @@ enum Msg {
         replied: Replied,
         message: Option<llm::Assistant>,
     },
+    /// A side model request on behalf of call `of`, answered with its id
+    /// once its intent is committed.
+    Side {
+        of: CallId,
+        purpose: String,
+        model: String,
+        reply: oneshot::Sender<Option<CallId>>,
+    },
     Stop,
     /// Answered once every message before it is taken.
     #[cfg(test)]
@@ -250,6 +258,7 @@ impl Live {
             waiting: Keyed::default(),
             answers: Keyed::default(),
             replies: Keyed::default(),
+            sides: Keyed::default(),
             tickets: 0,
             reporting: 0,
             stopping: false,
@@ -395,6 +404,8 @@ struct Actor {
     /// What calls run again are handed: the answer they waited on.
     answers: Keyed<CallId, Json>,
     replies: Keyed<Ticket, oneshot::Sender<Result<(), String>>>,
+    /// Side model requests waiting for their call's id.
+    sides: Keyed<Ticket, oneshot::Sender<Option<CallId>>>,
     tickets: u64,
     /// Tool and model calls in flight, each of which reports once.
     reporting: usize,
@@ -511,6 +522,22 @@ impl Actor {
                 self.cancels.remove(&call);
                 self.replied = message.map(|m| (call.get(), m));
                 Event::ModelDone { call, replied }
+            }
+            Msg::Side {
+                of,
+                purpose,
+                model,
+                reply,
+            } => {
+                self.tickets += 1;
+                let ticket = Ticket(self.tickets);
+                self.sides.insert(ticket, reply);
+                Event::Side {
+                    of,
+                    purpose,
+                    model,
+                    ticket,
+                }
             }
             #[cfg(test)]
             Msg::Barrier(done) => {
@@ -701,6 +728,11 @@ impl Actor {
         match effect {
             Effect::Append(_) => unreachable!("appends are committed in runs"),
             Effect::Reply { ticket, result } => self.reply(ticket, result),
+            Effect::Side { ticket, side } => {
+                if let Some(reply) = self.sides.remove(&ticket) {
+                    reply.send(side);
+                }
+            }
             Effect::CallModel {
                 call,
                 attempt,
@@ -857,6 +889,45 @@ impl Actor {
         self.cancels.insert(call, cancel.clone());
         self.reporting += 1;
         let live = Arc::clone(&self.live);
+        // The `step` point, where the request is: what rewrote it is
+        // logged, and an answer of a handler's own is the reply.
+        let work = match work {
+            Ok((model, mut request)) => {
+                let bound = self.bound();
+                let (decisions, answered) = guarded(
+                    || self.registry.hooks().step(&bound.about(call), &mut request),
+                    |_| (Vec::new(), None),
+                );
+                let answered = answered.map(|(by, response)| {
+                    let mut decisions = decisions.clone();
+                    decisions.push((by, Verdict::Answered));
+                    (decisions, response)
+                });
+                if let Some((decisions, response)) = answered {
+                    let prepared = Event::Prepared { call, decisions };
+                    let _ = live.session.mail.send(Msg::Step(prepared));
+                    let replied = match Json::encode(&response) {
+                        Ok(output) => Replied::Done(output),
+                        Err(e) => {
+                            Replied::Failed(llm::Error::new(llm::Kind::Decode, e.to_string()))
+                        }
+                    };
+                    let message = Some(response.message);
+                    let _ = live.session.mail.send(Msg::Replied {
+                        call,
+                        replied,
+                        message,
+                    });
+                    return;
+                }
+                if !decisions.is_empty() {
+                    let prepared = Event::Prepared { call, decisions };
+                    let _ = live.session.mail.send(Msg::Step(prepared));
+                }
+                Ok((model, request))
+            }
+            Err(error) => Err(error),
+        };
         self.live.session.shared.rt.spawn(Box::pin(async move {
             let (replied, message) = match work {
                 Ok((model, request)) => {
@@ -877,6 +948,15 @@ impl Actor {
                 message,
             });
         }));
+    }
+
+    /// This generation of the registry, bound to the session.
+    fn bound(&self) -> Bound {
+        Bound {
+            registry: Arc::clone(&self.registry),
+            session: Arc::clone(&self.live.session),
+            agent: None,
+        }
     }
 
     /// The request for model call `call`: the system prompt, the
@@ -1438,8 +1518,16 @@ struct Calling {
     session: Arc<Session>,
     call: CallId,
     registry: Arc<Registry>,
-    /// The session's settings and children, made when a call first asks.
-    own: OnceLock<(Arc<dyn ext::Settings>, Arc<dyn ext::Sessions>)>,
+    /// The session's settings, children and side model requests, made
+    /// when a call first asks.
+    own: OnceLock<Owned>,
+}
+
+/// The services the engine provides a call.
+struct Owned {
+    settings: Arc<dyn ext::Settings>,
+    sessions: Arc<dyn ext::Sessions>,
+    models: Arc<dyn ext::Models>,
 }
 
 impl Calling {
@@ -1497,19 +1585,108 @@ impl Host for Calling {
     fn service(&self, ty: TypeId) -> Option<&(dyn Any + Send + Sync)> {
         let own = || {
             let own = Arc::new(Own(Arc::clone(&self.session)));
-            (
-                Arc::clone(&own) as Arc<dyn ext::Settings>,
-                own as Arc<dyn ext::Sessions>,
-            )
+            Owned {
+                settings: Arc::clone(&own) as _,
+                sessions: Arc::clone(&own) as _,
+                models: own as _,
+            }
         };
         if ty == TypeId::of::<dyn ext::Settings>() {
-            return Some(&self.own.get_or_init(own).0);
+            return Some(&self.own.get_or_init(own).settings);
         }
         if ty == TypeId::of::<dyn ext::Sessions>() {
-            return Some(&self.own.get_or_init(own).1);
+            return Some(&self.own.get_or_init(own).sessions);
+        }
+        if ty == TypeId::of::<dyn ext::Models>() {
+            return Some(&self.own.get_or_init(own).models);
         }
         (ty == TypeId::of::<dyn rt::Runtime>()).then_some(&self.session.shared.rt as _)
     }
+}
+
+impl ext::Models for Own {
+    /// Logged under the call as a model call of its own, then sent once:
+    /// its outcome is logged as it ends, and the call's end ends it.
+    fn call<'a>(
+        &'a self,
+        cx: &'a Cx,
+        side: ext::Side,
+    ) -> BoxFuture<'a, Result<llm::Response, llm::Error>> {
+        Box::pin(async move {
+            let session = &self.0;
+            let invalid = |e: String| llm::Error::new(llm::Kind::InvalidRequest, e);
+            let model = match &side.model {
+                Some(spec) => {
+                    let set = (
+                        Overrides {
+                            model: Some(spec.clone()),
+                        },
+                        None,
+                    );
+                    let env = lock(&session.env).clone();
+                    (session.shared.models).model(&session.workspace, env.as_ref(), set)
+                }
+                None => session.model(),
+            }
+            .map_err(invalid)?;
+            let of = CallId::new(cx.call).ok_or_else(|| invalid("no call to ask for".into()))?;
+            let (reply, opened) = oneshot::channel();
+            let purpose = side.purpose.to_string();
+            let _ = session.mail.send(Msg::Side {
+                of,
+                purpose,
+                model: model.name(),
+                reply,
+            });
+            let Some(Some(id)) = opened.await else {
+                return Err(invalid(format!("call {of} is not open to ask for")));
+            };
+            let mut request = side.request;
+            request.model = model.request(llm::Messages::default(), Vec::new()).model;
+            request.generation.max_output_tokens =
+                std::num::NonZeroU32::new(side.budget.max_tokens);
+            let asked = async {
+                let mut events = model.send(&request);
+                crate::model::read(&mut events, &mut |_| {}).await?;
+                events.finish(Some(model.origin(&request)))
+            };
+            let timeout = session.shared.rt.sleep(side.budget.timeout);
+            let answer = match first(asked, timeout).await {
+                Some(answer) => answer,
+                None => Err(llm::Error::new(
+                    llm::Kind::Transport,
+                    "the side request timed out",
+                )),
+            };
+            let outcome = match &answer {
+                Ok(response) => match Json::encode(response) {
+                    Ok(output) => Outcome::Done { output },
+                    Err(e) => Outcome::Failed {
+                        error: e.to_string(),
+                    },
+                },
+                Err(error) => Outcome::Failed {
+                    error: error.to_string(),
+                },
+            };
+            let _ = session
+                .mail
+                .send(Msg::Step(Event::SideDone { side: id, outcome }));
+            answer
+        })
+    }
+}
+
+/// What `work` yields, unless `stop` resolves first.
+async fn first<T>(work: impl Future<Output = T>, stop: impl Future<Output = ()>) -> Option<T> {
+    let (mut work, mut stop) = (pin!(work), pin!(stop));
+    poll_fn(|cx| {
+        if let Poll::Ready(done) = work.as_mut().poll(cx) {
+            return Poll::Ready(Some(done));
+        }
+        stop.as_mut().poll(cx).map(|()| None)
+    })
+    .await
 }
 
 /// A session's settings and children, as its calls reach them.

@@ -42,7 +42,7 @@ fn parts(outcome: Result<Response, Error>) -> Vec<AssistantPart> {
 }
 
 fn item(part: &AssistantPart) -> Option<Value> {
-    part.meta().field("test", "item")
+    crate::replay::item(part.meta(), "test")
 }
 
 fn call(id: &str, name: &str) -> Open {

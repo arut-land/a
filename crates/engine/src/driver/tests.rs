@@ -23,6 +23,7 @@ mod interrupt;
 mod log;
 mod parsed;
 mod retry;
+mod side;
 
 fn entry(seq: u64, body: Body) -> Entry {
     Entry::new(seq, 0, body)

@@ -352,6 +352,8 @@ mod tests {
                 model: "m".into(),
                 attempt: 0,
                 choice: protocol::ToolChoice::Auto,
+                r#for: None,
+                purpose: None,
             },
         )]);
         let added = events(&mut page);

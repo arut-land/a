@@ -25,6 +25,9 @@ pub struct Transcript {
     calls: HashMap<u64, (String, String)>,
     /// Input waiting to be taken up, by seq: the user's once it is.
     waiting: HashMap<u64, String>,
+    /// Side model requests not yet answered, by seq: their replies are
+    /// their extensions', not the conversation's.
+    sides: Vec<u64>,
     /// The seq of the last entry that changed the messages.
     last: u64,
     registry: Arc<Registry>,
@@ -43,6 +46,7 @@ impl Transcript {
             messages,
             calls: HashMap::new(),
             waiting: HashMap::new(),
+            sides: Vec::new(),
             last: 0,
             registry,
         };
@@ -80,13 +84,21 @@ impl Transcript {
                 return;
             }
             Body::Fired { outcome, .. } => Message::user(ext::child_result(outcome)),
+            Body::ModelCall { r#for: Some(_), .. } => {
+                self.sides.push(e.seq);
+                return;
+            }
+            Body::ModelResult { call, .. } if self.sides.contains(call) => {
+                self.sides.retain(|s| s != call);
+                return;
+            }
             Body::ModelResult {
                 outcome: Outcome::Done { output },
                 ..
             } => {
                 let reply = match fresh {
                     Some(message) => Ok(message),
-                    None => llm::Response::from_value(&output.value()).map(|r| r.message),
+                    None => llm::Response::from_json(output.raw()).map(|r| r.message),
                 };
                 match reply {
                     Ok(message) => Message::Assistant(message),

@@ -2,11 +2,13 @@
 //! provider items verbatim, an edited part keeps its item's identity, and
 //! everything else is rebuilt from the shared fields.
 
+use std::borrow::Cow;
+
 use serde::Serialize;
 use serde_json::{Map, Value, json};
 
 use super::{Instructions, ItemType, KEY, PartType, Responses, Status};
-use crate::conversation::{self, Fold, History};
+use crate::conversation::{self, Fold, History, Settled};
 use crate::error::Error;
 use crate::json::Lenient;
 use crate::models::openai;
@@ -14,8 +16,8 @@ use crate::protocol::Target;
 use crate::protocols::schema;
 use crate::replay::{Replay, replay, replays};
 use crate::spec::{
-    AssistantPart, Effort, Format, Message, Output, Request, SmolStr, Source, Tool, ToolChoice,
-    UserPart,
+    AssistantPart, Effort, Format, Media, Message, Output, Request, SmolStr, Source, Tool,
+    ToolChoice, ToolResult, UserPart,
 };
 
 /// The request body but its `input` and `tools`, which move in after
@@ -139,13 +141,55 @@ fn unsendable(part: &str) -> Error {
     Error::unsupported(format!("the Responses API cannot carry this {part}"))
 }
 
-/// The content part a user part goes as: text, an image, or an
-/// `input_file`.
-fn user_part(part: &UserPart) -> Result<Value, Error> {
-    let media = match part {
-        UserPart::Text(text) => return Ok(json!({"type": PartType::InputText, "text": text.text})),
-        UserPart::Media(media) => media,
-    };
+/// A message item of one content part, its keys in order.
+#[derive(Serialize)]
+struct MessageItem<'a, P> {
+    content: [P; 1],
+    role: &'a str,
+    #[serde(rename = "type")]
+    kind: ItemType,
+}
+
+impl<'a, P> MessageItem<'a, P> {
+    fn new(role: &'a str, part: P) -> Self {
+        Self {
+            content: [part],
+            role,
+            kind: ItemType::Message,
+        }
+    }
+}
+
+/// A text part, its keys in order.
+#[derive(Serialize)]
+struct TextPart<'a> {
+    text: &'a str,
+    #[serde(rename = "type")]
+    kind: PartType,
+}
+
+/// A tool result's item, its keys in order.
+#[derive(Serialize)]
+struct OutputItem<'a> {
+    call_id: &'a str,
+    output: ResultOutput<'a>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    status: Option<Status>,
+    #[serde(rename = "type")]
+    kind: ItemType,
+}
+
+/// A tool result's `output`: one text as a string, anything else as its
+/// ordered parts.
+#[derive(Serialize)]
+#[serde(untagged)]
+enum ResultOutput<'a> {
+    Text(Cow<'a, str>),
+    Parts(Vec<Value>),
+}
+
+/// The content part a user's media goes as: an image, or an `input_file`.
+fn user_part(media: &Media) -> Result<Value, Error> {
     let kind = &media.media_type;
     if kind.starts_with("image/") {
         let (key, source) = match &media.source {
@@ -171,15 +215,17 @@ fn user_part(part: &UserPart) -> Result<Value, Error> {
     Ok(json!({"type": PartType::InputFile, key: source}))
 }
 
-/// A tool result's `output`: one text as a string, anything else as its
-/// ordered parts.
-fn result_output(output: &Output) -> Result<Value, Error> {
+fn result_output(output: &Output) -> Result<ResultOutput<'_>, Error> {
+    let part = |part: &UserPart| match part {
+        UserPart::Text(text) => Ok(json!({"type": PartType::InputText, "text": text.text})),
+        UserPart::Media(media) => user_part(media),
+    };
     Ok(match output {
-        Output::Text(text) => text.as_str().into(),
-        Output::Json(value) => value.to_string().into(),
+        Output::Text(text) => ResultOutput::Text(text.as_str().into()),
+        Output::Json(value) => ResultOutput::Text(value.to_string().into()),
         Output::Content(parts) => match parts.as_slice() {
-            [UserPart::Text(text)] => text.text.as_str().into(),
-            parts => parts.iter().map(user_part).collect::<Result<_, _>>()?,
+            [UserPart::Text(text)] => ResultOutput::Text(text.text.as_str().into()),
+            parts => ResultOutput::Parts(parts.iter().map(part).collect::<Result<_, _>>()?),
         },
     })
 }
@@ -202,9 +248,13 @@ pub(crate) struct Input {
     cx: Cx,
     /// The call ids the request sends as custom calls, which are rare.
     custom: Vec<SmolStr>,
-    /// Items not settled: the leading system messages, while nothing else
-    /// came.
+    /// The leading system messages, while nothing else came, where they
+    /// go to `instructions` if they lead.
     open: Vec<Value>,
+    /// Items written as they came, to settle.
+    written: Vec<u8>,
+    /// How many items `written` holds.
+    pending: usize,
     /// The system texts lifted to `instructions`.
     lifted: Vec<String>,
     /// How many items settled.
@@ -219,6 +269,8 @@ impl Input {
             cx,
             custom: Vec::new(),
             open: Vec::new(),
+            written: Vec::new(),
+            pending: 0,
             lifted: Vec::new(),
             settled: 0,
             begun: false,
@@ -227,7 +279,7 @@ impl Input {
 
     /// An item that is not a system message; the leading ones before it go
     /// to `instructions` where they lead.
-    fn item(&mut self, item: Value) {
+    fn item(&mut self, item: &impl Serialize) {
         if !std::mem::replace(&mut self.begun, true)
             && self.cx.instructions == Instructions::Leading
         {
@@ -237,7 +289,17 @@ impl Input {
                 .map(|item| system_text(&item).to_owned());
             self.lifted.extend(leading);
         }
-        self.open.push(item);
+        self.write(item);
+    }
+
+    /// `item` written, to settle.
+    fn write(&mut self, item: &impl Serialize) {
+        if !self.written.is_empty() {
+            self.written.push(b',');
+        }
+        // Writing to memory cannot fail.
+        let _ = serde_json::to_writer(&mut self.written, item);
+        self.pending += 1;
     }
 
     /// The instructions lifted, and the items left open: a request of only
@@ -264,6 +326,49 @@ fn system_text(item: &Value) -> &str {
     text.unwrap_or_default().trim()
 }
 
+impl Input {
+    /// A user message's parts, a message item each.
+    fn user(&mut self, parts: &[UserPart]) -> Result<(), Error> {
+        for part in parts {
+            match part {
+                // Blank text says nothing, and some backends reject it.
+                UserPart::Text(text) if text.text.trim().is_empty() => {}
+                UserPart::Text(text) => {
+                    let text = TextPart {
+                        text: &text.text,
+                        kind: PartType::InputText,
+                    };
+                    self.item(&MessageItem::new("user", text));
+                }
+                UserPart::Media(media) => {
+                    self.item(&MessageItem::new("user", user_part(media)?));
+                }
+            }
+        }
+        Ok(())
+    }
+
+    /// Tool results, an output item each. A function output has no error
+    /// field: a failed result says so in its text.
+    fn results(&mut self, results: &[ToolResult]) -> Result<(), Error> {
+        for result in results {
+            let custom = self.custom.contains(&result.id);
+            let item = OutputItem {
+                call_id: &result.id,
+                output: result_output(&result.output)?,
+                status: (!custom).then_some(Status::Completed),
+                kind: if custom {
+                    ItemType::CustomToolCallOutput
+                } else {
+                    ItemType::FunctionCallOutput
+                },
+            };
+            self.item(&item);
+        }
+        Ok(())
+    }
+}
+
 impl Fold for Input {
     type Cx = Cx;
 
@@ -271,57 +376,37 @@ impl Fold for Input {
         &self.cx
     }
 
-    fn settle(&mut self, out: &mut Vec<Value>) {
-        if self.begun || self.cx.instructions != Instructions::Leading {
-            self.settled += self.open.len();
-            out.append(&mut self.open);
-        }
+    /// What was written; the leading system messages wait for the item
+    /// that tells whether they go to `instructions`.
+    fn settle(&mut self, out: &mut Settled) {
+        self.settled += std::mem::take(&mut self.pending);
+        out.written(&self.written);
+        self.written.clear();
     }
 
     fn push(&mut self, position: usize, turn: &Message) -> Result<(), Error> {
-        let message = |role: &str, part: Value| {
-            let mut message = json!({"type": ItemType::Message, "role": role});
-            message["content"] = vec![part].into();
-            message
-        };
         let parts = match turn {
             Message::System(system) => {
                 let text = system.text();
                 if self.cx.instructions == Instructions::All {
                     self.lifted.push(text.trim().to_owned());
                 } else {
-                    let text = json!({"type": PartType::InputText, "text": text});
-                    self.open.push(message("system", text));
-                }
-                return Ok(());
-            }
-            Message::User(user) => {
-                for part in &user.content {
-                    // Blank text says nothing, and some backends reject it.
-                    if let UserPart::Text(text) = part
-                        && text.text.trim().is_empty()
-                    {
-                        continue;
-                    }
-                    self.item(message("user", user_part(part)?));
-                }
-                return Ok(());
-            }
-            // A function output has no error field: a failed result says so
-            // in its text.
-            Message::Tool(tool) => {
-                for result in &tool.results {
-                    let (id, output) = (&result.id, result_output(&result.output)?);
-                    let mut item = if self.custom.contains(id) {
-                        json!({"type": ItemType::CustomToolCallOutput, "call_id": id})
-                    } else {
-                        json!({"type": ItemType::FunctionCallOutput, "call_id": id, "status": Status::Completed})
+                    let text = TextPart {
+                        text: &text,
+                        kind: PartType::InputText,
                     };
-                    item["output"] = output;
-                    self.item(item);
+                    let item = MessageItem::new("system", text);
+                    if self.begun || self.cx.instructions != Instructions::Leading {
+                        self.write(&item);
+                    } else {
+                        self.open
+                            .push(serde_json::to_value(item).unwrap_or_default());
+                    }
                 }
                 return Ok(());
             }
+            Message::User(user) => return self.user(&user.content),
+            Message::Tool(tool) => return self.results(&tool.results),
             Message::Assistant(assistant) => &assistant.content,
         };
         let stateless = self.cx.stateless;
@@ -365,14 +450,14 @@ impl Fold for Input {
                         // The call takes the id its result answers.
                         item["call_id"] = call.id.as_str().into();
                     }
-                    self.item(item);
+                    self.item(&item);
                     continue;
                 }
                 Replay::Identity(kept) => kept,
                 Replay::Rebuild => Map::new(),
             };
             if let Some(item) = rebuilt(part, &kept, kind, position, texts)? {
-                self.item(item);
+                self.item(&item);
             }
             texts += usize::from(matches!(part, AssistantPart::Text(_)));
         }
@@ -445,7 +530,7 @@ fn rebuilt(
             item
         }
         AssistantPart::Opaque(opaque) if replays(part, KEY) => {
-            return Ok(opaque.meta.field(KEY, "item"));
+            return Ok(crate::replay::item(&opaque.meta, KEY));
         }
         AssistantPart::Opaque(_) | AssistantPart::ToolResult(_) => return Ok(None),
         AssistantPart::Media(_) => return Err(unsendable("assistant image")),

@@ -694,6 +694,7 @@ impl From<&Item> for ViewItem {
                 text,
                 status,
                 usage,
+                ..
             } => Self::Reply {
                 call: *call,
                 model: model.clone(),

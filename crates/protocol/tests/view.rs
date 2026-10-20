@@ -175,6 +175,8 @@ impl Session {
             model: "m".into(),
             attempt: 0,
             choice: protocol::ToolChoice::Auto,
+            r#for: None,
+            purpose: None,
         });
         let text = format!("reply {}", rng.below(1000));
         let mut rest = text.as_str();
@@ -485,6 +487,8 @@ fn scenarios() -> Vec<(&'static str, Vec<Value>)> {
                         model: "m".into(),
                         attempt: 0,
                         choice: protocol::ToolChoice::Auto,
+                        r#for: None,
+                        purpose: None,
                     },
                 ),
                 msg(DaemonMsg::Delta {
@@ -710,6 +714,8 @@ fn scenarios() -> Vec<(&'static str, Vec<Value>)> {
                     model: "m".into(),
                     attempt: 0,
                     choice: protocol::ToolChoice::Auto,
+                    r#for: None,
+                    purpose: None,
                 },
                 asked,
                 ask(3),
@@ -728,6 +734,8 @@ fn scenarios() -> Vec<(&'static str, Vec<Value>)> {
                         model: "m".into(),
                         attempt: 0,
                         choice: protocol::ToolChoice::Auto,
+                        r#for: None,
+                        purpose: None,
                     },
                 ),
                 msg(DaemonMsg::Synced { seq: 2 }),

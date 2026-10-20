@@ -16,8 +16,8 @@ use protocol::Card;
 
 use crate::fold::{Fold, Next};
 use crate::{
-    Action, Answer, Chained, Effect, Effects, Event, Gate, Gated, Load, ModelPhase, Note, Owner,
-    Recover, Registry, Replay, Replied, Step, Ticket, Turn,
+    Action, Answer, Chained, Effect, Effects, Event, Gate, Gated, Load, ModelPhase, Name, Note,
+    Owner, Recover, Registry, Replay, Replied, Step, Ticket, Turn,
 };
 
 /// Who refused a call the agent would not run.
@@ -178,25 +178,25 @@ impl Core {
                     self.again(call, attempt, &mut fx);
                 }
             }
-            Event::Recovered { call, recovered } => {
-                if let Turn::Model {
-                    call: failed,
-                    attempt,
-                    phase: ModelPhase::Recovering,
-                } = self.turn
-                    && failed == call
+            Event::Recovered { call, recovered } => self.recovered_later(call, recovered, &mut fx),
+            Event::Side {
+                of,
+                purpose,
+                model,
+                ticket,
+            } => {
+                let side = self.side(of, purpose, model, &mut fx);
+                fx.push(Effect::Side { ticket, side });
+            }
+            Event::Prepared { call, decisions } => {
+                if matches!(self.turn, Turn::Model { call: c, phase: ModelPhase::Streaming, .. } if c == call)
                 {
-                    let error = self.failed.take().unwrap_or_default();
-                    if let Some((by, recover)) = recovered {
-                        self.recovered(call, attempt, &by, recover, error, &mut fx);
-                    } else {
-                        self.turn = Turn::Acting {
-                            open: SmallVec::new(),
-                        };
-                        self.settle(call, Outcome::Failed { error }, &mut fx);
+                    for (by, d) in decisions {
+                        self.decide(Some(call), &by, d, &mut fx);
                     }
                 }
             }
+            Event::SideDone { side, outcome } => self.side_done(side, outcome, &mut fx),
             Event::ChildSettled { child, outcome } => self.child_settled(child, outcome, &mut fx),
             Event::Registry(registry) => self.next = Some(registry),
             Event::Environment(env) => {
@@ -430,6 +430,68 @@ impl Core {
             }
             Recover::Resend => self.again(call, next, fx),
         }
+    }
+
+    /// How a handler that answered later says to recover model call
+    /// `call`, if it still waits on it: with no answer, it fails.
+    fn recovered_later(
+        &mut self,
+        call: CallId,
+        recovered: Option<(Name, Recover)>,
+        fx: &mut Effects,
+    ) {
+        let Turn::Model {
+            call: failed,
+            attempt,
+            phase: ModelPhase::Recovering,
+        } = self.turn
+        else {
+            return;
+        };
+        if failed != call {
+            return;
+        }
+        let error = self.failed.take().unwrap_or_default();
+        if let Some((by, recover)) = recovered {
+            self.recovered(call, attempt, &by, recover, error, fx);
+        } else {
+            self.turn = Turn::Acting {
+                open: SmallVec::new(),
+            };
+            self.settle(call, Outcome::Failed { error }, fx);
+        }
+    }
+
+    /// Logs side request `side`'s outcome, unless it has one.
+    fn side_done(&mut self, side: CallId, outcome: Outcome, fx: &mut Effects) {
+        let open = self.fold.ledger.call(side.get()).map(|open| &open.call);
+        if matches!(open, Some(Call::Side { .. })) {
+            let call = side.get();
+            self.append(fx, Body::ModelResult { call, outcome });
+        }
+    }
+
+    /// Logs the intent of a side model request on behalf of call `of`, if
+    /// it is open and its own: the side call's id.
+    fn side(
+        &mut self,
+        of: CallId,
+        purpose: String,
+        model: String,
+        fx: &mut Effects,
+    ) -> Option<CallId> {
+        let owner = self.fold.ledger.call(of.get())?;
+        if matches!(owner.call, Call::Side { .. }) {
+            return None;
+        }
+        let body = Body::ModelCall {
+            model,
+            attempt: 0,
+            choice: ToolChoice::Auto,
+            r#for: Some(of),
+            purpose: Some(purpose),
+        };
+        Some(self.append(fx, body))
     }
 
     /// Sends model call `call` again, as attempt `attempt`.
@@ -668,6 +730,8 @@ impl Core {
                     model,
                     attempt: 0,
                     choice,
+                    r#for: None,
+                    purpose: None,
                 };
                 let call = self.append(fx, body);
                 self.again(call, 0, fx);
@@ -944,6 +1008,8 @@ impl Core {
             match kind {
                 Call::Model { attempt, .. } => self.restart(call, attempt, fx),
                 Call::Tool { tool, input, .. } => self.reopen(call, &tool, &input, &phase, fx),
+                // Its owner asks again, if it still wants an answer.
+                Call::Side { .. } => self.settle(call, Outcome::Interrupted { output: None }, fx),
             }
         }
         if orphan && self.turn != Turn::Idle {
@@ -1054,10 +1120,25 @@ impl Core {
         self.append(fx, Body::Decision { by, call, d });
     }
 
-    /// Logs call `call`'s outcome.
+    /// Logs call `call`'s outcome, after those of the side requests made
+    /// on its behalf that are still out: they end with it.
     fn settle(&mut self, call: CallId, outcome: Outcome, fx: &mut Effects) {
+        let sides: SmallVec<[u64; 1]> = (self.fold.ledger.open_calls())
+            .filter(|(_, open)| open.call == Call::Side { of: call.get() })
+            .map(|(seq, _)| seq)
+            .collect();
+        for side in sides {
+            let outcome = Outcome::Interrupted { output: None };
+            self.append(
+                fx,
+                Body::ModelResult {
+                    call: side,
+                    outcome,
+                },
+            );
+        }
         let body = match self.fold.ledger.call(call.get()).map(|open| &open.call) {
-            Some(Call::Model { .. }) => Body::ModelResult {
+            Some(Call::Model { .. } | Call::Side { .. }) => Body::ModelResult {
                 call: call.get(),
                 outcome,
             },
@@ -1095,7 +1176,7 @@ impl Core {
                 let input = self.fold.input_of(call).unwrap_or(input);
                 Some((tool.clone(), input.clone()))
             }
-            Call::Model { .. } => None,
+            Call::Model { .. } | Call::Side { .. } => None,
         }
     }
 

@@ -11,8 +11,9 @@
 use std::borrow::Cow;
 use std::fmt::Write as _;
 
-use serde::de::{IgnoredAny, MapAccess};
+use serde::de::MapAccess;
 use serde::{Deserialize, Deserializer};
+use serde_json::value::RawValue;
 use serde_json::{Map, Value, json};
 use smol_str::format_smolstr;
 
@@ -27,7 +28,7 @@ use crate::writer::{End, Open, Writer, Writes};
 struct Chunk<'a> {
     response_id: Json<'a>,
     model_version: Json<'a>,
-    usage_metadata: bool,
+    usage_metadata: Option<&'a RawValue>,
     error: Option<Value>,
     prompt_feedback: Option<Value>,
     /// The first: it holds every part and the finish, so one of the wrong
@@ -40,10 +41,7 @@ impl<'de: 'a, 'a> Fields<'de> for Chunk<'a> {
         match key {
             "responseId" => self.response_id = next(map)?,
             "modelVersion" => self.model_version = next(map)?,
-            "usageMetadata" => {
-                map.next_value::<IgnoredAny>()?;
-                self.usage_metadata = true;
-            }
+            "usageMetadata" => self.usage_metadata = Some(next(map)?),
             "error" => self.error = next(map)?,
             "promptFeedback" => self.prompt_feedback = next(map)?,
             "candidates" => self.candidates = map.next_value::<First<_>>()?.0,
@@ -266,8 +264,8 @@ pub(crate) struct GeminiDecoder {
     /// `finishReason` and the `finishMessage` beside it, the reply's id and
     /// model.
     end: End,
-    /// The latest chunk that carried `usageMetadata`, read when the reply
-    /// ends: most chunks carry one.
+    /// The latest `usageMetadata`, as its text, read when the reply ends:
+    /// most chunks carry one.
     usage: String,
     /// The part written last.
     last: Option<usize>,
@@ -303,8 +301,7 @@ impl GeminiDecoder {
             return Err(Error::incomplete());
         };
         self.close()?;
-        let chunk = serde_json::from_str::<Value>(&self.usage).ok();
-        end.raw_usage = chunk.and_then(|mut chunk| Some(chunk.get_mut("usageMetadata")?.take()));
+        end.raw_usage = serde_json::from_str::<Value>(&self.usage).ok();
         end.usage = end.raw_usage.as_ref().map_or_default(usage_of);
         end.message = end.message.filter(|_| reason != Reason::Stop);
         self.w.end(end)
@@ -458,8 +455,8 @@ impl Writes for GeminiDecoder {
         if let Some(model) = chunk.model_version.str().filter(|model| !model.is_empty()) {
             self.end.model = Some(model.into());
         }
-        if chunk.usage_metadata {
-            data.clone_into(&mut self.usage);
+        if let Some(usage) = chunk.usage_metadata {
+            usage.get().clone_into(&mut self.usage);
         }
         if let Some(error) = chunk.error {
             return Err(in_band(&error));

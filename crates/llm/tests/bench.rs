@@ -225,6 +225,25 @@ fn long_chat(deltas: usize) -> Vec<u8> {
     body.into()
 }
 
+/// A chat completions stream of one tool call in `fragments` argument
+/// fragments that name neither the call's index nor its id, as some
+/// compatible servers stream them: each is judged against the arguments
+/// so far.
+fn long_chat_call(fragments: usize) -> Vec<u8> {
+    let mut body = String::from(
+        "data: {\"id\":\"c1\",\"model\":\"m\",\"choices\":[{\"index\":0,\"delta\":{\"tool_calls\":[{\"id\":\"call_1\",\"type\":\"function\",\"function\":{\"name\":\"write\",\"arguments\":\"{\\\"content\\\":\\\"\"}}]}}]}\n\n",
+    );
+    for n in 0..fragments {
+        let _ = write!(
+            body,
+            "data: {{\"id\":\"c1\",\"model\":\"m\",\"choices\":[{{\"index\":0,\"delta\":{{\"tool_calls\":[{{\"function\":{{\"arguments\":\"line {n} of the file \"}}}}]}}}}]}}\n\n"
+        );
+    }
+    body.push_str("data: {\"id\":\"c1\",\"model\":\"m\",\"choices\":[{\"index\":0,\"delta\":{\"tool_calls\":[{\"function\":{\"arguments\":\"\\\"}\"}}]}}]}\n\n");
+    body.push_str("data: {\"id\":\"c1\",\"model\":\"m\",\"choices\":[{\"index\":0,\"delta\":{},\"finish_reason\":\"tool_calls\"}],\"usage\":{\"prompt_tokens\":10,\"completion_tokens\":20}}\n\ndata: [DONE]\n\n");
+    body.into()
+}
+
 /// A messages stream of `deltas` thinking deltas and as many text deltas.
 fn long_messages(deltas: usize) -> Vec<u8> {
     let mut body = String::from(
@@ -290,6 +309,14 @@ fn decode_long_streams() {
         let reply =
             rt::block_on(llm::generate(&messages_body, &messages, &request)).expect("reply");
         assert_eq!(reply.message.content.len(), 2);
+    });
+    let call_body = Recorded {
+        status: 200,
+        body: long_chat_call(4_000),
+    };
+    measure("chat call in 4k unindexed fragments", 5, || {
+        let reply = rt::block_on(llm::generate(&call_body, &chat, &request)).expect("reply");
+        assert_eq!(reply.message.tool_calls().count(), 1);
     });
 }
 
@@ -438,7 +465,6 @@ fn encode_long_transcript() {
 #[test]
 #[ignore = "a benchmark"]
 fn read_logged_reply() {
-    use serde::Deserialize as _;
     let origin = Origin {
         protocol: "messages".into(),
         provider: "anthropic".into(),
@@ -463,12 +489,60 @@ fn read_logged_reply() {
         model: None,
         meta: llm::Meta::new(),
     };
-    let value = serde_json::to_value(&reply).expect("a value");
-    measure("from_value 150 parts", 200, || {
-        let _ = std::hint::black_box(llm::Response::from_value(&value));
+    let text = serde_json::to_string(&reply).expect("a reply writes");
+    measure("from_json 150 parts", 200, || {
+        let _ = std::hint::black_box(llm::Response::from_json(&text));
     });
-    measure("derived Deserialize 150 parts", 200, || {
-        let _ = std::hint::black_box(llm::Response::deserialize(&value));
+    measure("derived Deserialize from text 150 parts", 200, || {
+        let _ = std::hint::black_box(serde_json::from_str::<llm::Response>(&text));
+    });
+    measure("text to a tree 150 parts", 200, || {
+        let _ = std::hint::black_box(serde_json::from_str::<serde_json::Value>(&text));
+    });
+}
+
+/// The replies a session's log at `A_SESSION_LOG` holds, as their text.
+fn logged_replies() -> Option<Vec<String>> {
+    #[derive(serde::Deserialize)]
+    struct Entry<'a> {
+        #[serde(borrow)]
+        kind: std::borrow::Cow<'a, str>,
+        #[serde(borrow)]
+        outcome: Option<Outcome<'a>>,
+    }
+    #[derive(serde::Deserialize)]
+    struct Outcome<'a> {
+        #[serde(borrow)]
+        output: Option<&'a serde_json::value::RawValue>,
+    }
+    let text = std::fs::read_to_string(std::env::var_os("A_SESSION_LOG")?).expect("a log");
+    let replies = text.lines().skip(1).filter_map(|line| {
+        let entry: Entry<'_> = serde_json::from_str(line).ok()?;
+        let output = entry.outcome?.output?;
+        (entry.kind == "model_result").then(|| output.get().to_owned())
+    });
+    Some(replies.collect())
+}
+
+/// Every reply of a session's log read as the engine reads it at load and
+/// on each turn.
+#[test]
+#[ignore = "a benchmark"]
+fn read_session_replies() {
+    let Some(replies) = logged_replies() else {
+        return;
+    };
+    let bytes: usize = replies.iter().map(String::len).sum();
+    eprintln!("{} replies, {} KiB", replies.len(), bytes / 1024);
+    measure("session replies from_json", 10, || {
+        for reply in &replies {
+            let _ = std::hint::black_box(llm::Response::from_json(reply).expect("a reply"));
+        }
+    });
+    measure("session replies text to a tree", 10, || {
+        for reply in &replies {
+            let _ = std::hint::black_box(serde_json::from_str::<serde_json::Value>(reply));
+        }
     });
 }
 
@@ -487,10 +561,12 @@ fn transcript_memory() {
         let entry: serde_json::Value = serde_json::from_str(line).expect("an entry");
         let message = match entry["kind"].as_str() {
             Some("user" | "context") => Message::user(entry["text"].as_str().unwrap_or_default()),
-            Some("model_result") => match llm::Response::from_value(&entry["outcome"]["output"]) {
-                Ok(reply) => Message::Assistant(reply.message),
-                Err(_) => continue,
-            },
+            Some("model_result") => {
+                match llm::Response::from_json(&entry["outcome"]["output"].to_string()) {
+                    Ok(reply) => Message::Assistant(reply.message),
+                    Err(_) => continue,
+                }
+            }
             Some("tool_result") => Message::Tool(ToolMessage {
                 results: vec![ToolResult {
                     id: "call".into(),

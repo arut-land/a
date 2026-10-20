@@ -426,6 +426,7 @@ mod tests {
             text: String::new(),
             status: Status::Running,
             usage: None,
+            purpose: None,
         };
         assert_eq!(rows_of(&item, Look::default())[1], "  … echo");
         let mut live = Live::default();

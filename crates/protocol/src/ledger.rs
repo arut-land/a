@@ -62,6 +62,10 @@ pub enum Call {
         input: Json,
         by: Audience,
     },
+    /// A side model request on behalf of call `of`.
+    Side {
+        of: u64,
+    },
 }
 
 /// Where an open call stands. The one lifecycle of everything that waits
@@ -210,11 +214,17 @@ impl Ledger {
                 );
             }
             Body::ModelCall {
-                attempt, choice, ..
+                attempt,
+                choice,
+                r#for,
+                ..
             } => {
-                let call = Call::Model {
-                    attempt: *attempt,
-                    choice: *choice,
+                let call = match r#for {
+                    Some(of) => Call::Side { of: of.get() },
+                    None => Call::Model {
+                        attempt: *attempt,
+                        choice: *choice,
+                    },
                 };
                 self.open(seq, call, Phase::Running);
             }
@@ -275,8 +285,9 @@ impl Ledger {
         let Some(open) = self.open.remove(call) else {
             return;
         };
-        // A command the user ran is not the agent's work.
-        if !open.by_user() {
+        // A command the user ran is not the agent's work, nor is a side
+        // request an extension made.
+        if !open.by_user() && !matches!(open.call, Call::Side { .. }) {
             self.result = Some(outcome.clone());
         }
     }

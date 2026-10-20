@@ -222,7 +222,16 @@ kinds! {
         /// The committed intent to ask a model for a reply; a retry is an
         /// intent of its own, its `attempt` one more. With `choice` none the
         /// model is offered the tools but may call none: a turn's last call.
-        ModelCall "model_call" { model: String, attempt: u16 = default, choice: ToolChoice = default } = Durable;
+        /// A side request an extension makes on behalf of call `for` (to
+        /// compact, judge, title) names it and its `purpose`: its reply is
+        /// the extension's, never the conversation's.
+        ModelCall "model_call" {
+            model: String,
+            attempt: u16 = default,
+            choice: ToolChoice = default,
+            r#for: Option<CallId> = default,
+            purpose: Option<String> = default,
+        } = Durable;
         /// The reply; `Done` carries the whole `llm::Response`.
         ModelResult "model_result" { call: u64, outcome: Outcome } = Durable;
         /// The committed intent to run a tool. Its seq is the call's id and
@@ -358,6 +367,9 @@ kinds! {
         /// The request of the model call was replaced before it was sent;
         /// `model` is the model it went to instead, if that changed.
         PrepareStep "prepare_step" { model: Option<String> = default };
+        /// The model call was answered by the extension, not sent: its
+        /// result is the extension's answer.
+        Answered "answered";
         /// The tool call's input was replaced by `input`.
         PreTool "pre_tool" { input: Json };
         /// The tool call was blocked before it ran.
@@ -1443,6 +1455,8 @@ mod tests {
                 model: "m".into(),
                 attempt: 1,
                 choice: ToolChoice::None,
+                r#for: None,
+                purpose: None,
             },
             Body::Decision {
                 by: "policy".into(),

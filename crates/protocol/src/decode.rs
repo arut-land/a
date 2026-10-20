@@ -391,6 +391,9 @@ pub(crate) struct EntryFields {
     pub(crate) model: Option<String>,
     pub(crate) attempt: Option<u16>,
     pub(crate) choice: Option<ToolChoice>,
+    #[serde(rename = "for")]
+    pub(crate) r#for: Option<u64>,
+    pub(crate) purpose: Option<String>,
     pub(crate) on: Option<Tag>,
     #[serde(default, deserialize_with = "present")]
     pub(crate) ui: Option<Json>,
@@ -481,6 +484,7 @@ struct ItemFields {
     model: Option<String>,
     status: Option<Status>,
     usage: Option<Usage>,
+    purpose: Option<String>,
     tool: Option<String>,
     #[serde(default, deserialize_with = "present")]
     input: Option<Json>,
@@ -615,6 +619,7 @@ impl ItemFields {
                 text: req(f.text.take(), "text")?,
                 status: req(f.status.take(), "status")?,
                 usage: f.usage.take(),
+                purpose: f.purpose.take(),
             },
             Type::Tool => Item::Tool {
                 call: req(f.call.take(), "call")?,

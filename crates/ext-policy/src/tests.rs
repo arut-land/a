@@ -68,8 +68,6 @@ fn gate(rig: &Rig, tool: &str, input: serde_json::Value) -> Gate {
     }
 }
 
-
-
 fn policy() -> Policy {
     Policy::ask(&["bash", "edit"])
 }

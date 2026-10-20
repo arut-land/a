@@ -588,6 +588,8 @@ pub fn model_call(attempt: u16) -> Body {
         model: "test:model".to_owned(),
         attempt,
         choice: ToolChoice::Auto,
+        r#for: None,
+        purpose: None,
     }
 }
 

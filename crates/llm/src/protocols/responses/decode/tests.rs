@@ -20,22 +20,120 @@ fn recorded(cassette: &str) -> Vec<String> {
     events.into_iter().map(|(_, data)| data).collect()
 }
 
-/// The events `frames` decode to, `value` reading every frame as a `Value`.
+/// The events `frames` decode to, `value` reading every frame as a `Value`
+/// through the decoder this one replaced ([`super::oracle`]).
 fn events(frames: &[String], value: bool) -> Vec<Out> {
-    let mut decoder = ResponsesDecoder::new();
+    let (mut decoder, mut oracle) = (ResponsesDecoder::new(), oracle::Oracle::new());
     let mut out = Vec::new();
     for data in frames {
         let flow = if value {
-            decoder.lenient(data)
+            let flow = oracle.lenient(data);
+            oracle.writer().drain(&mut out);
+            flow
         } else {
-            decoder.data(data)
+            let flow = decoder.data(data);
+            decoder.writer().drain(&mut out);
+            flow
         };
-        decoder.writer().drain(&mut out);
         if flow.expect("a frame") == Flow::Done {
             break;
         }
     }
     out
+}
+
+/// What each of `frames` decodes to, failures included, by the decoder or
+/// by the one it replaced.
+fn outcomes(frames: &[String], value: bool) -> Vec<String> {
+    let (mut decoder, mut oracle) = (ResponsesDecoder::new(), oracle::Oracle::new());
+    let mut log = Vec::new();
+    for data in frames {
+        let mut out = Vec::new();
+        let flow = if value {
+            let flow = oracle.lenient(data);
+            oracle.writer().drain(&mut out);
+            flow
+        } else {
+            let flow = decoder.data(data);
+            decoder.writer().drain(&mut out);
+            flow
+        };
+        log.push(format!("{flow:?} {out:?}"));
+    }
+    log
+}
+
+/// Every recorded Responses stream decodes as the `Value` path decoded it.
+#[test]
+fn recorded_streams_decode_as_the_value_path_did() {
+    fn walk(dir: &Path, out: &mut Vec<std::path::PathBuf>) {
+        for entry in std::fs::read_dir(dir).expect("cassettes") {
+            let path = entry.expect("an entry").path();
+            if path.is_dir() {
+                walk(&path, out);
+            } else if path.extension().is_some_and(|ext| ext == "yaml") {
+                out.push(path);
+            }
+        }
+    }
+    let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../fixtures/rig/cassettes");
+    let mut files = Vec::new();
+    walk(&root, &mut files);
+    let mut streams = 0;
+    for file in files {
+        let text = std::fs::read_to_string(&file).expect("a cassette");
+        for doc in serde_yaml_ng::Deserializer::from_str(&text) {
+            let doc: serde_yaml_ng::Value = Deserialize::deserialize(doc).expect("yaml");
+            if !doc["when"]["path"]
+                .as_str()
+                .is_some_and(|path| path.ends_with("/responses"))
+            {
+                continue;
+            }
+            let body = doc["then"]["body"].as_str().unwrap_or_default();
+            let events = crate::sse::events(&mut crate::sse::SseFramer::new(), body.as_bytes());
+            let frames: Vec<String> = events.into_iter().map(|(_, data)| data).collect();
+            assert_eq!(
+                outcomes(&frames, false),
+                outcomes(&frames, true),
+                "{}",
+                file.display()
+            );
+            streams += 1;
+        }
+    }
+    assert!(streams > 30, "{streams}");
+}
+
+/// Frames whose fields come in any order, of another type, twice, or not
+/// at all decode as the `Value` path decodes them.
+#[test]
+fn odd_frames_decode_as_the_value_path_does() {
+    let frames: Vec<String> = [
+        json!({"type": "response.output_item.added", "output_index": 0, "item": {"type": "message", "id": "m1"}}).to_string(),
+        r#"{"delta":"a","item_id":"m1","output_index":0,"type":"response.output_text.delta"}"#.to_owned(),
+        r#"{"type":"response.output_text.delta","output_index":"0","delta":"b"}"#.to_owned(),
+        r#"{"type":"response.output_text.delta","output_index":0,"delta":5}"#.to_owned(),
+        r#"{"type":"response.output_text.delta","delta":"c","delta":"d","item_id":"m1"}"#.to_owned(),
+        r#"{"type":"response.output_text.delta","item":{"id":"m1"},"delta":"e"}"#.to_owned(),
+        r#"{"type":"response.output_text.delta","item":"m1","item_id":"m1","delta":"f"}"#.to_owned(),
+        r#"{"type":"response.output_text.done","text":"abdef","output_index":0}"#.to_owned(),
+        r#"{"type":5,"delta":"g"}"#.to_owned(),
+        r#"["not", "an", "object"]"#.to_owned(),
+        r#"{"type":"response.reasoning_summary_text.delta","output_index":1,"summary_index":1,"delta":"r"}"#.to_owned(),
+        json!({"type": "response.output_item.done", "output_index": 0, "item": {"type": "message", "id": "m1", "content": [{"type": "output_text", "text": "abdef"}]}}).to_string(),
+        r#"{"type":"response.output_item.done","item":null}"#.to_owned(),
+        json!({"type": "response.completed", "response": {"status": "completed", "usage": {"input_tokens": "3", "output_tokens": 2}}}).to_string(),
+    ]
+    .into();
+    assert_eq!(outcomes(&frames, false), outcomes(&frames, true));
+    let untagged = [json!({"error": {"code": "x", "message": "bad"}}).to_string()];
+    assert_eq!(outcomes(&untagged, false), outcomes(&untagged, true));
+    let failed = [
+        json!({"type": "response.failed", "response": {"error": {"code": "c", "message": "m"}}})
+            .to_string(),
+    ];
+    assert_eq!(outcomes(&failed, false), outcomes(&failed, true));
 }
 
 fn reply(frames: &[Value]) -> Response {
@@ -55,18 +153,19 @@ const STREAMS: [&str; 3] = [
 
 /// Every recorded delta frame is read without a `Value`, borrowing its
 /// fields: only a delta that holds an escape is copied, unescaped, and that
-/// text is what its event owns anyway. Other frames stop at their type.
+/// text is what its event owns anyway.
 #[test]
 fn every_recorded_delta_frame_is_read_in_place() {
     let frames: Vec<String> = STREAMS.iter().flat_map(|stream| recorded(stream)).collect();
     let (mut deltas, mut copied) = (0, 0);
     for data in &frames {
-        let Some(delta) = typed(data) else {
+        let frame = frame(data).expect("a frame").expect("an object");
+        let Json::Str(text) = &frame.delta else {
             assert!(!data.contains(".delta\""), "{data}");
             continue;
         };
         deltas += 1;
-        if let Cow::Owned(text) = &delta.text {
+        if let Cow::Owned(text) = text {
             assert!(data.contains('\\'), "{data}");
             assert_eq!(
                 serde_json::to_string(text)
@@ -81,11 +180,10 @@ fn every_recorded_delta_frame_is_read_in_place() {
     eprintln!("{deltas} delta frames, {copied} with an escape copied");
 }
 
-/// The typed path decodes recorded streams exactly as the `Value` path
-/// does, in about half the time (release: 220µs against 440µs for these
-/// 480 frames), since it builds no tree and copies no field. Timing needs
-/// an optimized build: `cargo nextest run --release -p llm --run-ignored
-/// all -E 'test(faster)'`.
+/// The decoder decodes recorded streams exactly as the `Value` path does,
+/// in about half the time, since it builds no tree and copies no field.
+/// Timing needs an optimized build: `cargo nextest run --release -p llm
+/// --run-ignored all -E 'test(faster)'`.
 #[test]
 #[cfg_attr(debug_assertions, ignore = "timing needs an optimized build")]
 fn delta_frames_decode_as_values_do_but_faster() {
@@ -110,15 +208,13 @@ fn delta_frames_decode_as_values_do_but_faster() {
     assert!(typed < value, "typed {typed:?}, as values {value:?}");
 }
 
-/// A delta frame whose fields do not fit the typed read (an index sent as a
-/// string) is read leniently, to the same effect.
+/// A delta frame with a field of another type (an index sent as a string)
+/// is read leniently, to the same effect.
 #[test]
-fn a_retyped_delta_field_takes_the_value_path() {
+fn a_retyped_delta_field_is_read_leniently() {
     let added = json!({"type": "response.output_item.added", "output_index": 0, "item": {"type": "message", "id": "msg_1"}});
     let strict = json!({"type": "response.output_text.delta", "output_index": 0, "delta": "Hi"});
     let retyped = json!({"type": "response.output_text.delta", "output_index": "0", "delta": "Hi"});
-    assert!(typed(&strict.to_string()).is_some());
-    assert!(typed(&retyped.to_string()).is_none());
     let completed = json!({"type": "response.completed", "response": {"status": "completed"}});
     let text = |delta: &Value| {
         reply(&[added.clone(), delta.clone(), completed.clone()])

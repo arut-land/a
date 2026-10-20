@@ -112,7 +112,11 @@ impl Fold {
             }
             Body::ModelResult { call, outcome } => {
                 let call = CallId::new(*call)?;
-                self.ledger.call(call.get())?;
+                // A side request's reply is its extension's.
+                let open = self.ledger.call(call.get())?;
+                if matches!(open.call, Call::Side { .. }) {
+                    return None;
+                }
                 Some(Input::ModelDone {
                     call,
                     outcome: outcome.clone(),
@@ -171,9 +175,9 @@ impl Fold {
             Body::Assistant { text } => {
                 self.carried(|next| matches!(next, Next::Agent(Action::Say(said)) if said == text));
             }
-            Body::ModelCall { attempt, .. } => {
-                // A retry is not the agent's to ask for.
-                if *attempt == 0 {
+            Body::ModelCall { attempt, r#for, .. } => {
+                // A retry is not the agent's to ask for, nor a side request.
+                if *attempt == 0 && r#for.is_none() {
                     self.carried(|next| matches!(next, Next::Agent(Action::CallModel { .. })));
                 }
             }

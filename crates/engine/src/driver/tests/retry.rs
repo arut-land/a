@@ -10,7 +10,7 @@ use super::*;
 
 /// A reply a [`Flaky`] provider gives.
 #[derive(Clone)]
-enum Reply {
+pub(super) enum Reply {
     /// A failure, with its headers.
     Status(u16, &'static [(&'static str, &'static str)]),
     /// These SSE events, then the end of the stream.
@@ -21,20 +21,20 @@ enum Reply {
 
 /// A provider answering each request with the next of its replies.
 #[derive(Default)]
-struct Flaky {
+pub(super) struct Flaky {
     replies: Mutex<VecDeque<Reply>>,
     sent: AtomicUsize,
 }
 
 impl Flaky {
-    fn new(replies: impl IntoIterator<Item = Reply>) -> Arc<Self> {
+    pub(super) fn new(replies: impl IntoIterator<Item = Reply>) -> Arc<Self> {
         Arc::new(Self {
             replies: Mutex::new(replies.into_iter().collect()),
             sent: AtomicUsize::new(0),
         })
     }
 
-    fn sent(&self) -> usize {
+    pub(super) fn sent(&self) -> usize {
         self.sent.load(Ordering::SeqCst)
     }
 }
@@ -83,7 +83,7 @@ impl Http for Flaky {
 }
 
 /// The text reply of the rig's recordings, its events whole.
-fn text_reply() -> String {
+pub(super) fn text_reply() -> String {
     cassette("openai/streaming_grammar/tool_then_followup_text.yaml").swap_remove(1)
 }
 
@@ -101,7 +101,7 @@ fn quick() -> Registry {
     Registry::default().with(&retry).unwrap()
 }
 
-fn fixture(registry: Registry, http: &Arc<Flaky>) -> Fixture {
+pub(super) fn fixture(registry: Registry, http: &Arc<Flaky>) -> Fixture {
     let models = Models {
         http: Arc::clone(http) as Arc<dyn Http>,
         ..openai(&Script::new(&[]))
@@ -185,6 +185,8 @@ fn a_crash_loop_cannot_retry_forever() {
                     model: "m".into(),
                     attempt: 0,
                     choice: ToolChoice::Auto,
+                    r#for: None,
+                    purpose: None,
                 },
             ),
         ];

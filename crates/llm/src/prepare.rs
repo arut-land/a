@@ -283,7 +283,7 @@ pub(crate) fn prepare(request: &crate::spec::Request, target: &Target<'_>) -> cr
             Ok(())
         }
 
-        fn settle(&mut self, _: &mut Vec<serde_json::Value>) {}
+        fn settle(&mut self, _: &mut crate::conversation::Settled) {}
     }
 
     let (mut pass, mut sent) = (Prepare::default(), Sent(Vec::new()));
