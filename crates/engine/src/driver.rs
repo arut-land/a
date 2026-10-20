@@ -1010,7 +1010,6 @@ impl Actor {
         self.since_snapshot = loaded.read;
         self.core = folding.core;
         *lock(&self.live.session.states) = folding.states;
-        *lock(&self.live.session.env) = self.core.ledger().env().cloned().map(Arc::new);
         self.live
             .has_input
             .store(folding.has_input, Ordering::SeqCst);
