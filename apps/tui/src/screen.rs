@@ -10,30 +10,17 @@ use std::io::{self, Write};
 use std::ops::Range;
 use std::os::fd::BorrowedFd;
 
-use ratatui_core::buffer::{Buffer, Cell};
-use ratatui_core::style::{Color, Modifier, Style};
-
 use super::app::App;
-use super::render::{Viewport, cell_width};
-use super::text::Line;
+use super::render::{Cell, Grid, Viewport};
+use super::text::{Line, Modifier, Style};
 
-/// SGR state: foreground, background, attributes.
-type Pen = (Color, Color, Modifier);
+/// The pen the terminal starts from and is left at.
+const PLAIN: Style = Style::new();
 
-const PLAIN: Pen = (Color::Reset, Color::Reset, Modifier::empty());
-
-/// Attributes and the SGR parameter that sets each.
-const ATTRS: [(Modifier, u16); 9] = [
-    (Modifier::BOLD, 1),
-    (Modifier::DIM, 2),
-    (Modifier::ITALIC, 3),
-    (Modifier::UNDERLINED, 4),
-    (Modifier::SLOW_BLINK, 5),
-    (Modifier::RAPID_BLINK, 6),
-    (Modifier::REVERSED, 7),
-    (Modifier::HIDDEN, 8),
-    (Modifier::CROSSED_OUT, 9),
-];
+/// Opens and closes a synchronized update: the terminal shows the frame
+/// at once, not as it arrives.
+const OPEN: &[u8] = b"\x1b[?2026h";
+const CLOSE: &[u8] = b"\x1b[?2026l";
 
 pub struct Screen<W = Stdout> {
     out: W,
@@ -46,7 +33,7 @@ pub struct Screen<W = Stdout> {
     /// column, where known: after the last column it waits to wrap.
     row: Option<u16>,
     col: Option<u16>,
-    pen: Pen,
+    pen: Style,
     cursor_shown: bool,
     /// Draw the next frame whole: the first, after a resize, Ctrl-L, or
     /// (inline) when the viewport moved or changed size.
@@ -74,9 +61,10 @@ impl<W: Write> Screen<W> {
     }
 
     /// Draws `app` on a `cols` × `rows` terminal: inline, its settled items
-    /// go into the scrollback first.
+    /// go into the scrollback first. A frame that changed nothing (an ack,
+    /// a list nothing shows) writes nothing, not even the envelope.
     pub fn draw(&mut self, app: &mut App, (cols, rows): (u16, u16)) -> io::Result<()> {
-        self.bytes.extend_from_slice(b"\x1b[?2026h");
+        self.bytes.extend_from_slice(OPEN);
         let (w, h) = match self.viewport {
             Viewport::Full => {
                 if self.stale || self.size != (cols, rows) {
@@ -101,15 +89,15 @@ impl<W: Write> Screen<W> {
         self.size = (w, h);
         let caret = app.draw(w, h);
         let canvas = app.canvas();
-        let buf = canvas.buffer();
+        let grid = canvas.grid();
         if self.stale {
             // Onto a cleared screen: blank cells need no writing.
             for y in 0..h {
-                self.cells(buf, y, 0..w, true);
+                self.cells(grid, y, 0..w, true);
             }
         } else {
             for (y, cols) in canvas.changed() {
-                self.cells(buf, *y, cols.clone(), false);
+                self.cells(grid, *y, cols.clone(), false);
             }
         }
         self.stale = false;
@@ -129,7 +117,11 @@ impl<W: Write> Screen<W> {
             };
             self.bytes.extend_from_slice(mode);
         }
-        self.bytes.extend_from_slice(b"\x1b[?2026l");
+        if self.bytes.len() == OPEN.len() {
+            self.bytes.clear();
+            return Ok(());
+        }
+        self.bytes.extend_from_slice(CLOSE);
         self.flush()
     }
 
@@ -162,7 +154,7 @@ impl<W: Write> Screen<W> {
         self.bytes.extend_from_slice(b"\x1b[J");
         for line in lines {
             for span in &line.spans {
-                self.repen(pen_of(span.style));
+                self.repen(span.style);
                 self.bytes.extend_from_slice(span.text.as_bytes());
             }
             self.repen(PLAIN);
@@ -200,20 +192,19 @@ impl<W: Write> Screen<W> {
         (self.row, self.col) = (Some(0), Some(0));
     }
 
-    /// Writes columns `cols` of row `y` of `buf`, skipping the ones wide
+    /// Writes columns `cols` of row `y` of `grid`, skipping the ones wide
     /// characters cover and, when `blank` is already on screen, blank ones.
-    fn cells(&mut self, buf: &Buffer, y: u16, cols: Range<u16>, blank: bool) {
-        let width = buf.area.width;
-        let start = usize::from(y) * usize::from(width);
-        let row = &buf.content[start..start + usize::from(width)];
+    fn cells(&mut self, grid: &Grid, y: u16, cols: Range<u16>, blank: bool) {
+        let (width, _) = grid.size();
+        let row = grid.row(y);
         let mut x = cols.start;
         while x < cols.end {
             let cell = &row[usize::from(x)];
-            let w = cell_width(cell);
-            if !(blank && *cell == Cell::EMPTY) {
+            let w = cell.width();
+            if !(blank && *cell == Cell::BLANK) {
                 self.move_to(x, y);
-                self.repen((cell.fg, cell.bg, cell.modifier));
-                self.bytes.extend_from_slice(cell.symbol().as_bytes());
+                self.repen(cell.style);
+                self.bytes.extend_from_slice(cell.text.as_bytes());
                 self.col = Some(x + w).filter(|&col| col < width);
             }
             x += w;
@@ -252,7 +243,7 @@ impl<W: Write> Screen<W> {
     }
 
     /// Switches SGR state to `pen`, in one sequence.
-    fn repen(&mut self, pen: Pen) {
+    fn repen(&mut self, pen: Style) {
         if pen == self.pen {
             return;
         }
@@ -266,66 +257,25 @@ impl<W: Write> Screen<W> {
             num(bytes, n);
         };
         let mut was = self.pen;
-        if !(was.2 - pen.2).is_empty() {
+        // An attribute is only dropped by starting from plain.
+        if !was.mods.minus(pen.mods).is_empty() {
             param(bytes, 0);
             was = PLAIN;
         }
-        for (attr, n) in ATTRS {
-            if pen.2.contains(attr) && !was.2.contains(attr) {
+        for (attr, n) in Modifier::ALL {
+            if pen.mods.contains(attr) && !was.mods.contains(attr) {
                 param(bytes, n);
             }
         }
-        for (color, was, base) in [(pen.0, was.0, 30), (pen.1, was.1, 40)] {
-            if color == was {
-                continue;
-            }
-            match color {
-                Color::Reset => param(bytes, base + 9),
-                Color::Rgb(r, g, b) => {
-                    for n in [base + 8, 2, r.into(), g.into(), b.into()] {
-                        param(bytes, n);
-                    }
-                }
-                Color::Indexed(i) => {
-                    for n in [base + 8, 5, i.into()] {
-                        param(bytes, n);
-                    }
-                }
-                named => param(bytes, base + named_offset(named)),
-            }
+        if pen.fg != was.fg {
+            param(bytes, pen.fg.sgr());
+        }
+        if pen.bg != was.bg {
+            param(bytes, pen.bg.sgr() + 10);
         }
         bytes.push(b'm');
         self.pen = pen;
     }
-}
-
-/// A named color's SGR parameter, from 30 (40 for a background).
-fn named_offset(color: Color) -> u16 {
-    match color {
-        Color::Red => 1,
-        Color::Green => 2,
-        Color::Yellow => 3,
-        Color::Blue => 4,
-        Color::Magenta => 5,
-        Color::Cyan => 6,
-        Color::Gray => 7,
-        Color::DarkGray => 60,
-        Color::LightRed => 61,
-        Color::LightGreen => 62,
-        Color::LightYellow => 63,
-        Color::LightBlue => 64,
-        Color::LightMagenta => 65,
-        Color::LightCyan => 66,
-        Color::White => 67,
-        _ => 0,
-    }
-}
-
-/// The pen `style` draws with over a blank cell.
-fn pen_of(style: Style) -> Pen {
-    let mut cell = Cell::EMPTY;
-    cell.set_style(style);
-    (cell.fg, cell.bg, cell.modifier)
 }
 
 /// `ESC [ n final`.
@@ -373,35 +323,28 @@ impl Write for Stdout {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::text::Color;
 
-    fn pen(fg: Color, bg: Color, m: Modifier) -> Vec<u8> {
+    fn pen(style: Style) -> Vec<u8> {
         let mut screen = Screen::new(Viewport::Full, Vec::new());
-        screen.repen((fg, bg, m));
+        screen.repen(style);
         screen.bytes
     }
 
     #[test]
     fn styles_are_one_sgr_each() {
-        assert_eq!(pen(Color::Red, Color::Reset, Modifier::BOLD), b"\x1b[1;31m");
-        assert_eq!(
-            pen(Color::DarkGray, Color::Reset, Modifier::empty()),
-            b"\x1b[90m"
-        );
-        assert_eq!(
-            pen(Color::Reset, Color::Blue, Modifier::REVERSED),
-            b"\x1b[7;44m"
-        );
-        assert_eq!(
-            pen(Color::Indexed(208), Color::Rgb(1, 2, 3), Modifier::empty()),
-            b"\x1b[38;5;208;48;2;1;2;3m"
-        );
+        assert_eq!(pen(Style::new().fg(Color::Red).bold()), b"\x1b[1;31m");
+        assert_eq!(pen(Style::new().fg(Color::DarkGray)), b"\x1b[90m");
         let mut screen = Screen::new(Viewport::Full, Vec::new());
-        screen.repen((Color::Green, Color::Reset, Modifier::BOLD | Modifier::DIM));
+        screen.repen(Style::new().fg(Color::Green).bold().dim());
+        assert_eq!(screen.bytes, b"\x1b[1;2;32m");
         screen.bytes.clear();
         // Dropping an attribute starts from plain.
-        screen.repen((Color::Green, Color::Reset, Modifier::DIM));
+        screen.repen(Style::new().fg(Color::Green).dim());
         assert_eq!(screen.bytes, b"\x1b[0;2;32m");
         screen.bytes.clear();
+        screen.repen(Style::new().fg(Color::Green).dim());
+        assert!(screen.bytes.is_empty(), "the same pen writes nothing");
         screen.repen(PLAIN);
         assert_eq!(screen.bytes, b"\x1b[0m");
     }

@@ -1,18 +1,143 @@
-//! The [`Canvas`] a frame is drawn on, which redraws only the rows that
-//! changed; drawing text into a ratatui [`Buffer`]; and fitting text to
+//! The cell [`Grid`] a frame is drawn into, the [`Canvas`] that draws rows
+//! onto it and redraws only the rows that changed, and fitting text to
 //! columns. Frames are drawn from row 0, so one draws the same on the
 //! alternate screen and in an inline viewport further down.
 
-use std::ops::Range;
+use std::ops::{Index, Range};
 
-use ratatui_core::buffer::{Buffer, Cell};
-use ratatui_core::layout::Rect;
-use ratatui_core::style::Style;
-use unicode_width::UnicodeWidthStr;
-
-use super::text::{Action, Line, char_width, width_of};
+use super::text::{Action, Line, SmolStr, Style, char_width, width_of};
 
 pub use crate::Viewport;
+
+/// One cell: the character drawn there with the zero-width marks that
+/// follow it (an accent, a variation selector), and its pen. A wide
+/// character's second column is a blank cell the screen skips.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Cell {
+    pub text: SmolStr,
+    pub style: Style,
+}
+
+impl Cell {
+    pub const BLANK: Self = Self {
+        text: SmolStr::new_inline(" "),
+        style: Style::new(),
+    };
+
+    /// The columns it takes: its character's, at least one.
+    pub fn width(&self) -> u16 {
+        if self.text.len() == 1 {
+            return 1;
+        }
+        self.text
+            .chars()
+            .next()
+            .map_or(1, |ch| char_width(ch).max(1))
+    }
+}
+
+/// A `w` × `h` frame of cells, row-major.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct Grid {
+    w: u16,
+    h: u16,
+    cells: Vec<Cell>,
+}
+
+impl Grid {
+    pub fn new(w: u16, h: u16) -> Self {
+        Self {
+            w,
+            h,
+            cells: vec![Cell::BLANK; usize::from(w) * usize::from(h)],
+        }
+    }
+
+    pub fn size(&self) -> (u16, u16) {
+        (self.w, self.h)
+    }
+
+    pub fn row(&self, y: u16) -> &[Cell] {
+        let start = usize::from(y) * usize::from(self.w);
+        &self.cells[start..start + usize::from(self.w)]
+    }
+
+    fn row_mut(&mut self, y: u16) -> &mut [Cell] {
+        let start = usize::from(y) * usize::from(self.w);
+        &mut self.cells[start..start + usize::from(self.w)]
+    }
+
+    /// Writes `text` from column `x` of row `y`, a cell a character,
+    /// clipped at the right edge; returns the column after it. A
+    /// zero-width character joins the cell before it (a combining mark, a
+    /// variation selector), except joiners and format characters, which
+    /// would make the terminal's cursor disagree with the grid's columns.
+    pub fn put(&mut self, x: u16, y: u16, text: &str, style: Style) -> u16 {
+        if y >= self.h || x >= self.w {
+            return x;
+        }
+        let cells = self.row_mut(y);
+        let mut at = usize::from(x);
+        let mut last = None;
+        for ch in text.chars() {
+            let w = usize::from(char_width(ch));
+            if w == 0 {
+                if let Some(last) = last
+                    && !ch.is_control()
+                    && !matches!(ch, '\u{200b}'..='\u{200f}' | '\u{2060}'..='\u{206f}' | '\u{feff}')
+                {
+                    let cell: &mut Cell = &mut cells[last];
+                    cell.text = cell.text.chars().chain([ch]).collect();
+                }
+                continue;
+            }
+            if at + w > cells.len() {
+                break;
+            }
+            let mut utf8 = [0; 4];
+            cells[at] = Cell {
+                text: SmolStr::new_inline(ch.encode_utf8(&mut utf8)),
+                style,
+            };
+            // The column a wide character covers.
+            for cell in &mut cells[at + 1..at + w] {
+                *cell = Cell::BLANK;
+            }
+            last = Some(at);
+            at += w;
+        }
+        u16::try_from(at).unwrap_or(self.w)
+    }
+
+    /// The rows as text, trailing blanks trimmed: what a test asserts on.
+    #[cfg(test)]
+    pub fn rows(&self) -> Vec<String> {
+        (0..self.h)
+            .map(|y| {
+                let mut s = String::new();
+                let mut hidden = 0;
+                for cell in self.row(y) {
+                    // The cells a wide character covers.
+                    if hidden > 0 {
+                        hidden -= 1;
+                        continue;
+                    }
+                    s.push_str(&cell.text);
+                    hidden = cell.width() - 1;
+                }
+                s.trim_end().to_owned()
+            })
+            .collect()
+    }
+}
+
+impl Index<(u16, u16)> for Grid {
+    type Output = Cell;
+
+    fn index(&self, (x, y): (u16, u16)) -> &Cell {
+        &self.row(y)[usize::from(x)]
+    }
+}
 
 /// A frame's cells, drawn by the line and redrawn by the row: a row drawn
 /// with the same lines as the frame before keeps its cells, so a streamed
@@ -20,7 +145,7 @@ pub use crate::Viewport;
 /// rows are compared to find what the terminal is sent.
 #[derive(Default)]
 pub struct Canvas {
-    buf: Buffer,
+    grid: Grid,
     rows: Vec<Row>,
     /// Lines drawn now are under an overlay: they show, but a click on
     /// them does nothing.
@@ -51,9 +176,8 @@ struct Op {
 impl Canvas {
     /// Starts a `w` × `h` frame; a new size starts from blank.
     pub fn begin(&mut self, w: u16, h: u16) {
-        let area = Rect::new(0, 0, w, h);
-        if self.buf.area != area {
-            self.buf = Buffer::empty(area);
+        if self.grid.size() != (w, h) {
+            self.grid = Grid::new(w, h);
             self.rows.clear();
             self.rows.resize_with(usize::from(h), Row::default);
         }
@@ -65,8 +189,9 @@ impl Canvas {
         self.changed.clear();
     }
 
-    pub fn area(&self) -> Rect {
-        self.buf.area
+    /// The frame's columns and rows.
+    pub fn size(&self) -> (u16, u16) {
+        self.grid.size()
     }
 
     /// Draws `line` from column `x` of row `y`, clipped at the right edge;
@@ -95,7 +220,6 @@ impl Canvas {
     /// Ends the frame: redraws the rows whose lines changed, and notes
     /// which of their cells did.
     pub fn finish(&mut self) {
-        let width = usize::from(self.buf.area.width);
         for (y, row) in (0..).zip(&mut self.rows) {
             if row.kept < row.ops.len() {
                 row.ops.truncate(row.kept);
@@ -104,23 +228,30 @@ impl Canvas {
             if !row.dirty {
                 continue;
             }
-            let start = usize::from(y) * width;
-            let cells = &mut self.buf.content[start..start + width];
+            let cells = self.grid.row_mut(y);
             self.before.clear();
             self.before.extend_from_slice(cells);
-            cells.iter_mut().for_each(Cell::reset);
+            cells.fill(Cell::BLANK);
             for op in &mut row.ops {
-                op.hits = draw(&mut self.buf, op.x, y, &op.line);
+                op.hits.clear();
+                let mut at = op.x;
+                for span in &op.line.spans {
+                    let end = self.grid.put(at, y, &span.text, span.style);
+                    if let Some(action) = span.action {
+                        op.hits.push((at..end, action));
+                    }
+                    at = end;
+                }
             }
-            if let Some(cols) = changed(&self.before, &self.buf.content[start..start + width]) {
+            if let Some(cols) = changed(&self.before, self.grid.row(y)) {
                 self.changed.push((y, cols));
             }
         }
     }
 
     /// The frame's cells.
-    pub fn buffer(&self) -> &Buffer {
-        &self.buf
+    pub fn grid(&self) -> &Grid {
+        &self.grid
     }
 
     /// The cells the last frame changed, by row.
@@ -142,88 +273,16 @@ impl Canvas {
     }
 }
 
-/// Draws `line`'s spans from column `x` of row `y`; returns where its
-/// clickable ones landed.
-fn draw(buf: &mut Buffer, x: u16, y: u16, line: &Line) -> Vec<(Range<u16>, Action)> {
-    let mut hits = Vec::new();
-    let mut at = x;
-    for span in &line.spans {
-        let end = put(buf, at, y, &span.text, span.style);
-        if let Some(action) = span.action {
-            hits.push((at..end, action));
-        }
-        at = end;
-    }
-    hits
-}
-
 /// The columns from the first to the last cell that differ, starting at a
 /// wide character rather than at the column it covers.
 fn changed(before: &[Cell], after: &[Cell]) -> Option<Range<u16>> {
     let differs = |(a, b): (&Cell, &Cell)| a != b;
     let mut first = before.iter().zip(after).position(differs)?;
     let last = before.iter().zip(after).rposition(differs)?;
-    if first > 0 && cell_width(&after[first - 1]) > 1 {
+    if first > 0 && after[first - 1].width() > 1 {
         first -= 1;
     }
     Some(u16::try_from(first).ok()?..u16::try_from(last + 1).ok()?)
-}
-
-/// The columns a cell's symbol takes, as ratatui counts them when placing
-/// it (the next ones it covers are blank).
-pub fn cell_width(cell: &Cell) -> u16 {
-    let symbol = cell.symbol();
-    if symbol.len() == 1 {
-        return 1;
-    }
-    u16::try_from(symbol.width()).map_or(1, |w| w.max(1))
-}
-
-/// Writes `text` from column `x` of row `y` of `buf`'s area, clipped at its
-/// right edge; returns the column after it.
-pub fn put(buf: &mut Buffer, x: u16, y: u16, text: &str, style: Style) -> u16 {
-    let area = buf.area;
-    if y >= area.height || x >= area.width {
-        return x;
-    }
-    if !text.chars().all(alone) {
-        let (end, _) = buf.set_stringn(area.x + x, area.y + y, text, usize::MAX, style);
-        return end - area.x;
-    }
-    // A cell a character, as `set_stringn` would place them, without its
-    // grapheme segmentation.
-    let row = buf.index_of(area.x, area.y + y);
-    let cells = &mut buf.content[row..row + usize::from(area.width)];
-    let mut at = usize::from(x);
-    for ch in text.chars() {
-        let w = usize::from(char_width(ch));
-        if at + w > cells.len() {
-            break;
-        }
-        cells[at].set_char(ch).set_style(style);
-        // The column a wide character covers.
-        for cell in &mut cells[at + 1..at + w] {
-            cell.reset();
-        }
-        at += w;
-    }
-    u16::try_from(at).unwrap_or(area.width)
-}
-
-/// Whether `ch` is a grapheme of its own whatever is around it (no mark,
-/// joiner, jamo, regional indicator or control): what most text is made of.
-fn alone(ch: char) -> bool {
-    matches!(ch, ' '..='~')
-        || matches!(
-            ch,
-            '\u{a0}'..='\u{5ff}'
-                | '\u{2010}'..='\u{2027}'
-                | '\u{2030}'..='\u{205f}'
-                | '\u{2070}'..='\u{2bff}'
-                | '\u{3000}'..='\u{9fff}'
-                | '\u{ac00}'..='\u{d7a3}'
-                | '\u{ff01}'..='\u{ff9d}'
-        ) && char_width(ch) > 0
 }
 
 /// Pads or clips `text` to exactly `cols` columns.
@@ -261,72 +320,81 @@ pub fn ellipsize(text: &str, cols: usize) -> String {
     out
 }
 
-/// The rows of `buf` as text, trailing blanks trimmed: what a test asserts
-/// on.
-#[cfg(test)]
-pub fn rows(buf: &Buffer) -> Vec<String> {
-    let w = usize::from(buf.area.width).max(1);
-    buf.content()
-        .chunks(w)
-        .map(|row| {
-            let mut s = String::new();
-            let mut hidden = 0;
-            for cell in row {
-                // The cells a wide character covers.
-                if hidden > 0 {
-                    hidden -= 1;
-                    continue;
-                }
-                s.push_str(cell.symbol());
-                hidden = width_of(cell.symbol()).saturating_sub(1);
-            }
-            s.trim_end().to_owned()
-        })
-        .collect()
-}
-
 #[cfg(test)]
 mod tests {
-    use ratatui_core::layout::Rect;
-
     use super::*;
+    use crate::text::Color;
 
     #[test]
     fn wide_characters_take_two_columns() {
-        let mut buf = Buffer::empty(Rect::new(0, 0, 6, 1));
-        assert_eq!(put(&mut buf, 0, 0, "日本語", Style::new()), 6);
-        assert_eq!(rows(&buf), ["日本語"]);
-        let mut buf = Buffer::empty(Rect::new(0, 0, 5, 1));
-        assert_eq!(put(&mut buf, 0, 0, "日本語", Style::new()), 4);
+        let mut grid = Grid::new(6, 1);
+        assert_eq!(grid.put(0, 0, "日本語", Style::new()), 6);
+        assert_eq!(grid.rows(), ["日本語"]);
+        let mut grid = Grid::new(5, 1);
+        assert_eq!(grid.put(0, 0, "日本語", Style::new()), 4);
+        assert_eq!(grid.rows(), ["日本"]);
+        // Drawn over a wide character, a narrow one blanks its other column.
+        assert_eq!(grid.put(0, 0, "a", Style::new()), 1);
+        assert_eq!(grid.rows(), ["a 本"]);
     }
 
+    /// Text takes the columns `wrap` counted for it: a cell a character,
+    /// marks riding on the cell before, joiners dropped.
     #[test]
-    fn cells_are_what_ratatui_would_write() {
-        let red = Style::new().fg(ratatui_core::style::Color::Red);
-        for text in [
-            "plain ascii",
-            "日本語 and ─│•▍…",
-            "e\u{301}e",
-            "👨‍👩‍👧",
-            "🇯🇵",
-            "ab日",
-            "ｶﾞ",
-        ] {
-            for x in [0, 3, 6] {
-                let area = Rect::new(2, 1, 7, 2);
-                let (mut ours, mut theirs) = (Buffer::empty(area), Buffer::empty(area));
-                let end = put(&mut ours, x, 1, text, red);
-                let (to, _) = theirs.set_stringn(2 + x, 2, text, usize::MAX, red);
-                assert_eq!((end + 2, &ours), (to, &theirs), "{text:?} at {x}");
-            }
+    fn wide_and_combining_text_takes_its_columns() {
+        let red = Style::new().fg(Color::Red);
+        let mut grid = Grid::new(12, 2);
+        assert_eq!(grid.put(0, 1, "e\u{301}e", red), 2);
+        assert_eq!(grid[(0, 1)].text, "e\u{301}");
+        assert_eq!(grid[(0, 1)].style, red);
+        assert_eq!(grid[(1, 1)].text, "e");
+        assert_eq!(grid.put(2, 1, "👨\u{200d}👩", red), 6);
+        assert_eq!(grid[(2, 1)].text, "👨");
+        assert_eq!(grid[(4, 1)].text, "👩");
+        assert_eq!(grid.put(6, 1, "\u{301}x\x07y", red), 8);
+        assert_eq!(grid[(6, 1)].text, "x", "a lone mark is dropped");
+        assert_eq!(grid[(7, 1)].text, "y", "a control is dropped");
+        assert_eq!(grid.rows()[0], "");
+        for cell in grid.row(1) {
+            assert!(cell.width() <= 2);
         }
     }
 
     #[test]
-    fn coordinates_are_relative_to_the_area() {
-        let mut buf = Buffer::empty(Rect::new(0, 5, 4, 2));
-        assert_eq!(put(&mut buf, 1, 1, "abcdef", Style::new()), 4);
-        assert_eq!(rows(&buf), ["", " abc"]);
+    fn clipped_at_the_right_edge() {
+        let mut grid = Grid::new(4, 2);
+        assert_eq!(grid.put(1, 1, "abcdef", Style::new()), 4);
+        assert_eq!(grid.rows(), ["", " abc"]);
+        assert_eq!(grid.put(4, 1, "z", Style::new()), 4);
+        assert_eq!(grid.put(0, 2, "z", Style::new()), 0);
+    }
+
+    /// A redrawn row reports the columns that differ, from a wide
+    /// character's first column.
+    #[test]
+    fn a_frame_changes_only_the_cells_it_redrew() {
+        let mut canvas = Canvas::default();
+        let line = |t: &str| Line::plain(t, Style::new());
+        canvas.begin(8, 2);
+        canvas.line(0, 0, &line("ab日x"));
+        canvas.line(0, 1, &line("same"));
+        canvas.finish();
+        assert_eq!(canvas.changed(), [(0, 0..5), (1, 0..4)]);
+        canvas.begin(8, 2);
+        canvas.line(0, 0, &line("ab日y"));
+        canvas.line(0, 1, &line("same"));
+        canvas.finish();
+        assert_eq!(canvas.changed(), [(0, 4..5)]);
+        canvas.begin(8, 2);
+        canvas.line(0, 0, &line("ab本y"));
+        canvas.line(0, 1, &line("same"));
+        canvas.finish();
+        assert_eq!(canvas.changed(), [(0, 2..3)]);
+        canvas.begin(8, 2);
+        canvas.line(0, 0, &line("ab本y"));
+        canvas.line(0, 1, &line("same"));
+        canvas.finish();
+        assert_eq!(canvas.changed(), []);
     }
 
     #[test]

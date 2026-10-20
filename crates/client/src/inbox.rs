@@ -12,9 +12,18 @@ use std::sync::{Arc, Condvar, Mutex, MutexGuard, PoisonError};
 use std::time::{Duration, Instant};
 
 struct Queue<T> {
+    /// Posted with [`Post::send_first`]: taken before `items`, in their
+    /// own order.
+    first: VecDeque<T>,
     items: VecDeque<T>,
     posts: usize,
     taken: bool,
+}
+
+impl<T> Queue<T> {
+    fn pop(&mut self) -> Option<T> {
+        self.first.pop_front().or_else(|| self.items.pop_front())
+    }
 }
 
 struct Shared<T> {
@@ -38,6 +47,7 @@ pub struct Inbox<T>(Arc<Shared<T>>);
 pub fn inbox<T>() -> (Post<T>, Inbox<T>) {
     let shared = Arc::new(Shared {
         queue: Mutex::new(Queue {
+            first: VecDeque::new(),
             items: VecDeque::new(),
             posts: 1,
             taken: true,
@@ -50,11 +60,26 @@ pub fn inbox<T>() -> (Post<T>, Inbox<T>) {
 impl<T> Post<T> {
     /// Queues `item`; `Err` gives it back once the inbox is gone.
     pub fn send(&self, item: T) -> Result<(), T> {
+        self.post(item, false)
+    }
+
+    /// Queues `item` ahead of everything [`Post::send`] queued (after what
+    /// was sent first before it): a person's keystroke is folded before
+    /// the daemon's backlog, so a paste never waits behind a replay.
+    pub fn send_first(&self, item: T) -> Result<(), T> {
+        self.post(item, true)
+    }
+
+    fn post(&self, item: T, first: bool) -> Result<(), T> {
         let mut queue = self.0.queue();
         if !queue.taken {
             return Err(item);
         }
-        queue.items.push_back(item);
+        if first {
+            queue.first.push_back(item);
+        } else {
+            queue.items.push_back(item);
+        }
         self.0.ready.notify_one();
         Ok(())
     }
@@ -91,13 +116,13 @@ impl<T> Inbox<T> {
 
     /// The next item already queued.
     pub fn try_recv(&self) -> Option<T> {
-        self.0.queue().items.pop_front()
+        self.0.queue().pop()
     }
 
     fn recv_by(&self, deadline: Option<Instant>) -> Option<T> {
         let mut queue = self.0.queue();
         loop {
-            if let Some(item) = queue.items.pop_front() {
+            if let Some(item) = queue.pop() {
                 return Some(item);
             }
             if queue.posts == 0 {
@@ -120,6 +145,7 @@ impl<T> Drop for Inbox<T> {
     fn drop(&mut self) {
         let mut queue = self.0.queue();
         queue.taken = false;
+        queue.first.clear();
         queue.items.clear();
     }
 }
@@ -142,6 +168,18 @@ mod tests {
         assert_eq!(inbox.recv(), Some(1));
         assert_eq!(inbox.recv(), Some(2));
         assert_eq!(inbox.recv(), None);
+    }
+
+    #[test]
+    fn what_is_posted_first_is_taken_before_the_backlog_in_its_own_order() {
+        let (post, inbox) = inbox();
+        for n in 1..=3 {
+            post.send(n).unwrap();
+        }
+        post.send_first(10).unwrap();
+        post.send_first(11).unwrap();
+        let taken: Vec<_> = std::iter::from_fn(|| inbox.try_recv()).collect();
+        assert_eq!(taken, [10, 11, 1, 2, 3]);
     }
 
     #[test]
