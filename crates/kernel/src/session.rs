@@ -16,8 +16,8 @@ use protocol::Card;
 
 use crate::fold::{Fold, Next};
 use crate::{
-    Action, Answer, Chained, Effect, Effects, Event, Gate, Gated, Load, ModelPhase, Name, Note,
-    Owner, Recover, Registry, Replay, Replied, Step, Ticket, Turn,
+    Action, Answer, Chained, Concurrency, Effect, Effects, Event, Gate, Gated, Load, ModelPhase,
+    Name, Note, Owner, Recover, Registry, Replay, Replied, Step, Ticket, Turn,
 };
 
 /// Who refused a call the agent would not run.
@@ -671,13 +671,14 @@ impl Core {
     // ── the turn ──────────────────────────────────────────────────────
 
     /// Carries out what is asked for while nothing is open: the agent's
-    /// next action; once it stopped, what the `on_stop` point gives it;
-    /// then queued input, and children's results.
+    /// next action, or a shared call alongside the shared calls open;
+    /// once it stopped, what the `on_stop` point gives it; then queued
+    /// input, and children's results.
     fn advance(&mut self, fx: &mut Effects) {
         loop {
             match &self.turn {
                 Turn::Model { .. } => return,
-                Turn::Acting { open } if !open.is_empty() => return,
+                Turn::Acting { open } if !open.is_empty() && !self.alongside(open) => return,
                 Turn::Stopping { open, .. } if !open.is_empty() => return,
                 Turn::Stopping { .. } => {
                     self.stopped(fx);
@@ -686,10 +687,13 @@ impl Core {
                 Turn::Acting { .. } | Turn::Idle => {}
             }
             if let Some(next) = self.fold.asked.front().cloned() {
-                self.resolve(fx);
-                self.turn = Turn::Acting {
-                    open: SmallVec::new(),
-                };
+                // A new generation is taken up only with nothing open.
+                if !matches!(&self.turn, Turn::Acting { open } if !open.is_empty()) {
+                    self.resolve(fx);
+                    self.turn = Turn::Acting {
+                        open: SmallVec::new(),
+                    };
+                }
                 self.act(next, fx);
                 continue;
             }
@@ -721,6 +725,31 @@ impl Core {
             }
             return;
         }
+    }
+
+    /// Whether the next thing asked for starts alongside the calls `open`:
+    /// a refusal, which runs nothing, or a shared call while every open
+    /// one is shared. Anything else waits for them, so an exclusive call
+    /// never overlaps another, and nothing starts ahead of what was asked
+    /// before it.
+    fn alongside(&self, open: &[(CallId, Step)]) -> bool {
+        match self.fold.asked.front() {
+            Some(Next::Agent(Action::Refuse { .. })) => true,
+            Some(Next::Agent(Action::Call { tool, .. })) => {
+                self.shared(tool)
+                    && open
+                        .iter()
+                        .all(|&(call, _)| self.tool_of(call).is_some_and(|(t, _)| self.shared(&t)))
+            }
+            _ => false,
+        }
+    }
+
+    /// Whether calls of `tool` run alongside others.
+    fn shared(&self, tool: &str) -> bool {
+        self.registry
+            .callable(tool)
+            .is_some_and(|c| c.concurrency == Concurrency::Shared)
     }
 
     /// Carries out `next`: its entry takes it off what is asked for.

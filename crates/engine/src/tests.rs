@@ -756,7 +756,9 @@ fn the_supervisor_sleeps_until_a_deadline_and_never_polls() {
     let wakes = EVENTS.count("wake");
     std::thread::sleep(Duration::from_secs(1));
     let idle_wakes = EVENTS.count("wake") - wakes;
-    let names: Vec<_> = EVENTS.of(id).iter().map(|e| e.name).collect();
+    let names: Vec<_> = (EVENTS.of(id).iter().map(|e| e.name))
+        .filter(|&name| name != "commit")
+        .collect();
     std::fs::remove_dir_all(&root).unwrap();
 
     assert!(

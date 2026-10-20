@@ -687,6 +687,9 @@ impl Actor {
         .await;
         self.writer = Some(writer);
         written?;
+        crate::session_event("commit", self.live.id, || {
+            format!("{} entries synced", entries.len())
+        });
         self.shown(&entries);
         Ok(())
     }
@@ -1370,8 +1373,11 @@ impl kernel::Registry for Bound {
 
     fn callable(&self, name: &str) -> Option<Callable> {
         let tool = self.registry.tools().get(name)?;
-        let (audience, replay) = (tool.audience(), tool.replay());
-        Some(Callable { audience, replay })
+        Some(Callable {
+            audience: tool.audience(),
+            replay: tool.replay(),
+            concurrency: tool.concurrency(),
+        })
     }
 
     fn model(&self) -> String {

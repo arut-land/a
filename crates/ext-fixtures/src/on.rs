@@ -1,7 +1,8 @@
 use std::time::Duration;
 
 use ext::{
-    Action, Actions, Agent, Cx, Extension, Input, LoopPoints, Registrar, Replay, Schema, Tool,
+    Action, Actions, Agent, Concurrency, Cx, Extension, Input, LoopPoints, Registrar, Replay,
+    Schema, Tool,
 };
 use protocol::Json;
 use serde::{Deserialize, Serialize};
@@ -20,9 +21,10 @@ impl Extension for Fixtures {
 }
 
 /// Echoes messages back. `$ <command>` runs it with `bash`,
-/// `sleep <seconds>` calls the `sleep` fixture and `spawn <message>` hands
-/// the message to a child session with `task`, so tool calls and links can
-/// be exercised without a model.
+/// `sleep <seconds>` calls the `sleep` fixture, `spawn <message>` hands
+/// the message to a child session with `task`, and `par <n> <message>`
+/// makes n of the call the message makes, so tool calls and links can be
+/// exercised without a model.
 pub struct Echo;
 
 impl Agent for Echo {
@@ -35,16 +37,24 @@ impl Agent for Echo {
             }
             Input::ToolDone { .. } | Input::ModelDone { .. } => return Actions::new(),
         };
-        let (tool, input) = if let Some(prompt) = text.strip_prefix("spawn ") {
-            ("task", json!({ "prompt": prompt }))
-        } else if let Some(command) = text.strip_prefix("$ ") {
-            ("bash", json!({ "command": command }))
-        } else if let Some(Ok(seconds)) = text.strip_prefix("sleep ").map(str::parse::<u64>) {
-            (Sleep::NAME, json!({ "seconds": seconds }))
-        } else {
+        // `par <n> <message>`: n of the call the message makes, at once, as
+        // a model reply with several tool calls asks for them.
+        if let Some((n, text)) = (text.strip_prefix("par "))
+            .and_then(|rest| rest.split_once(' '))
+            .and_then(|(n, text)| Some((n.parse::<usize>().ok()?, text)))
+            && let Some((tool, input)) = call(text)
+        {
+            return (0..n)
+                .map(|i| Action::Call {
+                    tool: tool.to_owned(),
+                    input: input.clone(),
+                    id: Some(format!("p{i}")),
+                })
+                .collect();
+        }
+        let Some((tool, input)) = call(&text) else {
             return Actions::from_elem(Action::Say(text), 1);
         };
-        let input = Json::new(&input);
         Actions::from_elem(
             Action::Call {
                 tool: tool.to_owned(),
@@ -54,6 +64,20 @@ impl Agent for Echo {
             1,
         )
     }
+}
+
+/// The tool and input a message calls, if it calls one.
+fn call(text: &str) -> Option<(&'static str, Json)> {
+    let (tool, input) = if let Some(prompt) = text.strip_prefix("spawn ") {
+        ("task", json!({ "prompt": prompt }))
+    } else if let Some(command) = text.strip_prefix("$ ") {
+        ("bash", json!({ "command": command }))
+    } else if let Some(Ok(seconds)) = text.strip_prefix("sleep ").map(str::parse::<u64>) {
+        (Sleep::NAME, json!({ "seconds": seconds }))
+    } else {
+        return None;
+    };
+    Some((tool, Json::new(&input)))
 }
 
 /// Waits: a safe tool, so tests can watch a call that recovery reruns.
@@ -77,6 +101,7 @@ impl Tool for Sleep {
     const NAME: &'static str = "sleep";
     const DESCRIPTION: &'static str = "Waits for a number of seconds.";
     const REPLAY: Replay = Replay::Safe;
+    const CONCURRENCY: Concurrency = Concurrency::Shared;
 
     async fn call(&self, input: &Seconds, cx: &Cx) -> Result<Slept, String> {
         let rt = cx

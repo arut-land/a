@@ -3,7 +3,7 @@ use serde_json::{Value, json};
 
 use super::*;
 use crate::point::{self, PointCx, View};
-use crate::{Args, Replay, Route, Tool};
+use crate::{Args, Concurrency, Replay, Route, Tool};
 
 /// A tool named `bash`, described as `mine`.
 struct Named(&'static str);
@@ -191,6 +191,9 @@ impl DynTool for Declared {
     }
     fn replay(&self) -> Replay {
         Replay::Safe
+    }
+    fn concurrency(&self) -> Concurrency {
+        Concurrency::Shared
     }
     fn route(&self) -> Route {
         Route::Owner

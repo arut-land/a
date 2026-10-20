@@ -47,7 +47,8 @@ pub use service::{Budget, CwdOf, Models, Sessions, Settings, Side, Spawner};
 pub use shape::{Output, Partials, Streamed, stream};
 pub use state::{Fold, States};
 pub use tool::{
-    Args, Callable, Called, Cancel, Cx, DynTool, Parsed, Replay, Route, SpawnSpec, Tool,
+    Args, Callable, Called, Cancel, Concurrency, Cx, DynTool, Parsed, Replay, Route, SpawnSpec,
+    Tool,
 };
 
 /// A runtime name: of an extension, a tool, an agent. Typed Rust items

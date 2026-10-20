@@ -25,8 +25,8 @@ use std::sync::Arc;
 use std::time::Duration;
 
 pub use ext::{
-    Action, Actions, Agent, Answer, Callable, Chained, Gate, Gated, Input, Later, LoopPoints, Name,
-    Parsed, Recover, Replay,
+    Action, Actions, Agent, Answer, Callable, Chained, Concurrency, Gate, Gated, Input, Later,
+    LoopPoints, Name, Parsed, Recover, Replay,
 };
 use protocol::{
     Author, CallId, Card, Entry, Environment, Installed, Json, Mode, Outcome, Seq, SessionId,
@@ -251,8 +251,8 @@ pub enum Turn {
         attempt: u16,
         phase: ModelPhase,
     },
-    /// The open tool calls of the turn; the agent's next action waits until
-    /// none is.
+    /// The open tool calls of the turn: shared calls of one reply run
+    /// together, and the agent's next action waits until none is open.
     Acting { open: SmallVec<[(CallId, Step); 2]> },
     /// Interrupted: once these calls settle, the turn ends.
     Stopping {

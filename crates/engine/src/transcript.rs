@@ -23,6 +23,10 @@ pub struct Transcript {
     /// The model's id and the tool of each call the model made and that is
     /// not yet answered, by seq.
     calls: HashMap<u64, (String, String)>,
+    /// The calls the last message answers, by seq, in the order it does:
+    /// the calls' order, whatever order they ended in, so the request is
+    /// the same however a run went.
+    answered: Vec<u64>,
     /// Input waiting to be taken up, by seq: the user's once it is.
     waiting: HashMap<u64, String>,
     /// Side model requests not yet answered, by seq: their replies are
@@ -62,6 +66,7 @@ impl Transcript {
             context: messages.len(),
             messages,
             calls: HashMap::new(),
+            answered: Vec::new(),
             waiting: HashMap::new(),
             sides: Vec::new(),
             last: 0,
@@ -155,8 +160,11 @@ impl Transcript {
                 self.last = e.seq;
                 // Only a tool message changes to take the result.
                 if let Some(Message::Tool(answers)) = self.messages.last_mut() {
-                    answers.results.push(result);
+                    let at = self.answered.partition_point(|&seq| seq < *call);
+                    self.answered.insert(at, *call);
+                    answers.results.insert(at, result);
                 } else {
+                    self.answered = vec![*call];
                     self.messages.push(Message::Tool(ToolMessage {
                         results: vec![result],
                     }));

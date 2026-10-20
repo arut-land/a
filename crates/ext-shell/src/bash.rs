@@ -6,8 +6,8 @@
 //! timeout unnoticed. Its stdout and stderr share one pipe, in the order
 //! written. The directory it ends in is reported through an exit trap and
 //! kept as the `shell` extension's `cwd` state, so `cd` persists across
-//! calls and restarts. A session runs its calls one at a time, so commands
-//! never race each other for that directory.
+//! calls and restarts. Its calls are exclusive ([`ext::Concurrency`]): a
+//! session runs one at a time, so commands never race for that directory.
 //!
 //! Its output goes to a file in the session's spill directory as it runs,
 //! never through the daemon's memory: the supervisor follows the file,

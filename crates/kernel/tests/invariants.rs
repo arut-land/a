@@ -11,7 +11,7 @@ use std::time::Duration;
 use common::*;
 use kernel::{Effect, Effects, Event, Load, Note, Owner, Replied, Turn};
 use protocol::ledger::Call;
-use protocol::{Body, Entry, Json, Outcome, WaitOn};
+use protocol::{Body, CallId, Entry, Json, Outcome, WaitOn};
 use serde_json::json;
 
 /// Carries effects out as a driver would, at once and always the same way:
@@ -389,6 +389,17 @@ fn the_same_events_give_the_same_log() {
     assert!(fx.is_empty(), "{fx:?}");
     assert_eq!(resumed.core.turn(), a.core.turn());
     assert_eq!(resumed.core.ledger().activity(), a.core.ledger().activity());
+    // So do the calls of one reply, run together and ending out of order.
+    let together = || {
+        let mut s = Session::new(Reg::modeled().arc());
+        s.step(user("go"));
+        let sleep = |n: u64| ("sleep", json!({ "seconds": n }));
+        s.step(model_done(2, &[sleep(1), sleep(2)]));
+        s.step(tool_done(5, done(json!(2))));
+        s.step(tool_done(4, done(json!(1))));
+        s.log
+    };
+    assert_eq!(together(), together());
 }
 
 /// Whether `f` panics, run as a session actor runs: in a process of its
@@ -564,4 +575,74 @@ fn a_watch_fires_once() {
         .filter(|e| matches!(e.body, Body::Fired { .. }))
         .count();
     assert_eq!(fired, 1, "{:#?}", s.log);
+}
+
+/// The calls set running, in the order they start.
+fn running(fx: &Effects) -> impl Iterator<Item = CallId> + '_ {
+    fx.iter().filter_map(|e| match e {
+        Effect::RunTool { call, .. } => Some(*call),
+        _ => None,
+    })
+}
+
+fn asks_the_model(fx: &Effects) -> bool {
+    fx.iter().any(|e| matches!(e, Effect::CallModel { .. }))
+}
+
+/// What call `call` asked of its tool, as its intent logged it.
+fn asked_of(s: &Session, call: CallId) -> (String, String) {
+    match &s.log[usize::try_from(call.get()).unwrap() - 1].body {
+        Body::ToolCall { tool, input, .. } => (tool.clone(), input.to_string()),
+        body => panic!("call {call} is {body:?}"),
+    }
+}
+
+/// Shared calls of one reply all start in the step that logs it; the
+/// agent goes on once every one has ended, in whatever order.
+#[test]
+fn calls_in_one_reply_run_concurrently() {
+    let mut s = Session::new(Reg::modeled().arc());
+    s.step(user("go"));
+    let sleep = |n: u64| ("sleep", json!({ "seconds": n }));
+    let fx = s.step(model_done(2, &[sleep(1), sleep(2), sleep(3)]));
+    let started: Vec<u64> = running(&fx).map(CallId::get).collect();
+    assert_eq!(started, [4, 5, 6], "{fx:#?}");
+    assert!(matches!(s.core.turn(), Turn::Acting { open } if open.len() == 3));
+    assert!(!asks_the_model(&s.step(tool_done(6, done(json!(3))))));
+    assert!(!asks_the_model(&s.step(tool_done(4, done(json!(1))))));
+    assert!(asks_the_model(&s.step(tool_done(5, done(json!(2))))));
+}
+
+/// Of a reply's calls, an exclusive one runs alone: it waits for the
+/// shared calls before it, and those after it wait for it. Every call
+/// starts in the order asked, whichever ends first.
+#[test]
+fn exclusive_tools_never_overlap() {
+    let mut s = Session::new(Reg::modeled().arc());
+    s.step(user("go"));
+    let sleep = |n: u64| ("sleep", json!({ "seconds": n }));
+    let bash = |c: &str| ("bash", json!({ "command": c }));
+    let reply = [sleep(1), sleep(2), bash("a"), sleep(3), bash("b"), sleep(4)];
+    let mut open: Vec<CallId> = running(&s.step(model_done(2, &reply))).collect();
+    let mut started = open.clone();
+    // The newest call ends first.
+    while let Some(call) = open.pop() {
+        let fx = s.step(tool_done(call.get(), done(json!(null))));
+        open.extend(running(&fx));
+        started.extend(running(&fx));
+        let tools: Vec<String> = open.iter().map(|&c| asked_of(&s, c).0).collect();
+        assert!(
+            tools.len() <= 1 || tools.iter().all(|t| t == "sleep"),
+            "{tools:?} run together"
+        );
+    }
+    let asked: Vec<(String, String)> = (s.log.iter())
+        .filter_map(|e| match &e.body {
+            Body::ToolCall { tool, input, .. } => Some((tool.clone(), input.to_string())),
+            _ => None,
+        })
+        .collect();
+    let ran: Vec<(String, String)> = started.iter().map(|&c| asked_of(&s, c)).collect();
+    assert_eq!(asked.len(), 6);
+    assert_eq!(ran, asked);
 }

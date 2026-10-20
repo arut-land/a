@@ -828,6 +828,41 @@ fn hook_decisions_are_logged_after_their_call_and_replay_to_the_same_state() {
     );
 }
 
+/// The calls of one reply end in any order, and are logged as they end;
+/// the model reads their results in the order it made the calls, so the
+/// request is the same however the run went.
+#[test]
+fn results_are_logged_in_call_order() {
+    let call = |id: &str| Body::ToolCall {
+        tool: "sleep".into(),
+        input: json!({ "seconds": 1 }).into(),
+        id: Some(id.into()),
+        card: None,
+        by: Audience::Model,
+    };
+    let result = |call| Body::ToolResult {
+        call,
+        outcome: Outcome::Done {
+            output: json!({ "slept": call }).into(),
+        },
+        card: None,
+    };
+    let log = [
+        entry(1, call("a")),
+        entry(2, call("b")),
+        entry(3, call("c")),
+        entry(4, result(3)),
+        entry(5, result(1)),
+        entry(6, result(2)),
+    ];
+    let messages = transcript(&log, u64::MAX, Arc::default());
+    let [llm::Message::Tool(answers)] = &messages[..] else {
+        panic!("{messages:#?}");
+    };
+    let ids: Vec<&str> = answers.results.iter().map(|r| r.id.as_str()).collect();
+    assert_eq!(ids, ["a", "b", "c"]);
+}
+
 /// #41: a crash after a gate's decisions but before what follows them:
 /// recovery gates the call again without logging the decisions twice.
 #[test]
