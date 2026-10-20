@@ -622,55 +622,77 @@ struct Call {
     tool: String,
     quota: Arc<Quota>,
 }
-impl mlua::UserData for Call {}
+struct ActiveCall {
+    calls: Arc<Mutex<std::collections::BTreeMap<u64, Call>>>,
+    id: u64,
+}
+impl Drop for ActiveCall {
+    fn drop(&mut self) {
+        locked(&self.calls).remove(&self.id);
+    }
+}
 
 #[derive(Clone)]
 struct Callbacks {
+    calls: Arc<Mutex<std::collections::BTreeMap<u64, Call>>>,
+    next: Arc<AtomicU64>,
     update: Function,
     invoke: Function,
 }
 impl Callbacks {
     fn new(lua: &Lua) -> mlua::Result<Self> {
-        let update = lua.create_async_function(
-            |_lua, (data, name, value): (mlua::AnyUserData, String, Value)| async move {
-                let data = data.borrow::<Call>()?.clone();
-                let cx = data
-                    .cx
-                    .upgrade()
-                    .ok_or_else(|| mlua::Error::runtime("call context expired"))?;
-                if cx.state_erased(&data.owner, &name).is_none() {
-                    return Err(mlua::Error::runtime("no fold of that name"));
+        let calls = Arc::new(Mutex::new(std::collections::BTreeMap::<u64, Call>::new()));
+        let updates = Arc::clone(&calls);
+        let update =
+            lua.create_async_function(move |_lua, (id, name, value): (u64, String, Value)| {
+                let data = locked(&updates).get(&id).cloned();
+                async move {
+                    let data = data.ok_or_else(|| mlua::Error::runtime("call context expired"))?;
+                    let cx = data
+                        .cx
+                        .upgrade()
+                        .ok_or_else(|| mlua::Error::runtime("call context expired"))?;
+                    if cx.state_erased(&data.owner, &name).is_none() {
+                        return Err(mlua::Error::runtime("no fold of that name"));
+                    }
+                    let change = encode(&value)?;
+                    data.quota.take(change.raw().len())?;
+                    cx.update_erased(&data.owner, &name, change).await;
+                    Ok(())
                 }
-                let change = encode(&value)?;
-                data.quota.take(change.raw().len())?;
-                cx.update_erased(&data.owner, &name, change).await;
-                Ok(())
-            },
-        )?;
-        let invoke = lua.create_async_function(
-            |lua, (data, name, value): (mlua::AnyUserData, String, Value)| async move {
-                let data = data.borrow::<Call>()?.clone();
-                if name == data.tool || !data.grants.contains(&name) {
-                    return Err(mlua::Error::runtime(format!(
-                        "tool capability {name} is not granted"
-                    )));
-                }
-                let cx = data
-                    .cx
-                    .upgrade()
-                    .ok_or_else(|| mlua::Error::runtime("call context expired"))?;
-                let input = encode(&value)?;
-                data.quota.take(input.raw().len())?;
-                match cx.invoke(&name, &input).await.outcome {
-                    Outcome::Done { output } => decode(&lua, &output),
-                    Outcome::Failed { error } => Err(mlua::Error::runtime(error)),
-                    Outcome::Interrupted { .. } => {
-                        Err(mlua::Error::runtime("delegated tool interrupted"))
+            })?;
+        let invokes = Arc::clone(&calls);
+        let invoke =
+            lua.create_async_function(move |lua, (id, name, value): (u64, String, Value)| {
+                let data = locked(&invokes).get(&id).cloned();
+                async move {
+                    let data = data.ok_or_else(|| mlua::Error::runtime("call context expired"))?;
+                    if name == data.tool || !data.grants.contains(&name) {
+                        return Err(mlua::Error::runtime(format!(
+                            "tool capability {name} is not granted"
+                        )));
+                    }
+                    let cx = data
+                        .cx
+                        .upgrade()
+                        .ok_or_else(|| mlua::Error::runtime("call context expired"))?;
+                    let input = encode(&value)?;
+                    data.quota.take(input.raw().len())?;
+                    match cx.invoke(&name, &input).await.outcome {
+                        Outcome::Done { output } => decode(&lua, &output),
+                        Outcome::Failed { error } => Err(mlua::Error::runtime(error)),
+                        Outcome::Interrupted { .. } => {
+                            Err(mlua::Error::runtime("delegated tool interrupted"))
+                        }
                     }
                 }
-            },
-        )?;
-        Ok(Self { update, invoke })
+            })?;
+        Ok(Self {
+            calls,
+            next: Arc::new(AtomicU64::new(0)),
+            update,
+            invoke,
+        })
     }
 }
 
@@ -708,15 +730,23 @@ impl LuaTool {
             })?,
         )?;
         let quota = Quota::new();
-        let data = self.lua.create_userdata(Call {
-            cx: Arc::downgrade(&call),
-            owner: Arc::clone(&self.owner),
-            grants: Arc::clone(&self.grants),
-            tool: self.name.clone(),
-            quota: Arc::clone(&quota),
-        })?;
-        context.set("update", self.callbacks.update.bind(data.clone())?)?;
-        context.set("tool", self.callbacks.invoke.bind(data)?)?;
+        let id = self.callbacks.next.fetch_add(1, Ordering::Relaxed);
+        let active = ActiveCall {
+            calls: Arc::clone(&self.callbacks.calls),
+            id,
+        };
+        locked(&self.callbacks.calls).insert(
+            id,
+            Call {
+                cx: Arc::downgrade(&call),
+                owner: Arc::clone(&self.owner),
+                grants: Arc::clone(&self.grants),
+                tool: self.name.clone(),
+                quota: Arc::clone(&quota),
+            },
+        );
+        context.set("update", self.callbacks.update.bind(id)?)?;
+        context.set("tool", self.callbacks.invoke.bind(id)?)?;
         let progress = Arc::downgrade(&call);
         context.set(
             "progress",
@@ -743,6 +773,7 @@ impl LuaTool {
             work.as_mut().poll(cx)
         })
         .await?;
+        drop(active);
         drop(call);
         encode(&value)
     }

@@ -191,3 +191,8 @@ Size tuning, same release flags: sharing the `(Value, Value)` invocation
 adapter across agents, hooks, reducers and tool coroutines, and narrowing the
 read-only rejection callback to `()`, reduced 3,638,864 to 3,622,368 bytes
 (-16,496). Retained.
+
+Replacing per-invocation userdata with integer handles in a per-VM active-call
+map reduced 3,622,368 to 3,605,840 bytes (-16,528). A drop guard removes each
+handle on completion or cancellation; saved callbacks cannot retain contexts.
+Retained; the same sandbox, quota and async-delegation invariants pass.
