@@ -31,7 +31,7 @@ use kernel::{
 use protocol::view::SessionView;
 use protocol::{
     Author, Body, CallId, Card, DaemonMsg, Entry, Environment, Frame, Installed, Json, Mode,
-    Outcome, Overrides, Residency, SessionId, SessionSummary, ToolChoice, Verdict,
+    Outcome, Overrides, ReadOnly, Residency, SessionId, SessionSummary, ToolChoice, Verdict,
 };
 use rt::{channel, oneshot};
 
@@ -255,17 +255,26 @@ impl Live {
             busy,
             created: matches!(open, Open::Create),
         };
-        let first = core.resumed(&load);
+        // A log kept as it is is shown, never resumed or stepped: nothing
+        // would commit.
+        let read_only = loaded.writer.read_only();
+        let first = match read_only {
+            None => core.resumed(&load),
+            Some(_) => Effects::new(),
+        };
         let live = Arc::new(Self {
             id: header.id,
             workspace: header.workspace.clone(),
             parent: header.parent,
             frames: Arc::new(FrameLog::new(loaded.lines, loaded.seq)),
             followers: Mutex::default(),
-            busy: AtomicBool::new(busy),
+            busy: AtomicBool::new(busy && read_only.is_none()),
             attached: AtomicUsize::new(0),
             last_active: Mutex::new(Instant::now()),
-            summary: Mutex::new(summary(header, core.ledger())),
+            summary: Mutex::new(SessionSummary {
+                read_only,
+                ..summary(header, core.ledger())
+            }),
             ended: Ended::default(),
             session: Arc::clone(&session),
         });
@@ -416,6 +425,7 @@ fn summary(header: &Header, ledger: &protocol::ledger::Ledger) -> SessionSummary
         clients: 0,
         activity: ledger.activity(),
         residency: Residency::Loaded,
+        read_only: None,
     }
 }
 
@@ -482,6 +492,11 @@ impl Actor {
                 #[cfg(test)]
                 if let Msg::Barrier(done) = msg {
                     dones.push(done);
+                    continue;
+                }
+                // Kept as it is, its catalog listing and all.
+                if let Some(why) = self.writer.as_ref().and_then(Writer::read_only) {
+                    self.refuse(msg, why);
                     continue;
                 }
                 if let Some((event, done)) = self.take(msg) {
@@ -607,6 +622,18 @@ impl Actor {
             self.cancels.remove(call);
         }
         Some((event, None))
+    }
+
+    /// What `msg` gets in a session whose log is kept as it is: clients
+    /// are shown it, and what would be logged is refused or dropped.
+    fn refuse(&mut self, msg: Msg, why: ReadOnly) {
+        match msg {
+            Msg::Request { reply, .. } => reply.send(Err(why.to_string())),
+            #[cfg(test)]
+            Msg::Barrier(_) => drop(self.take(msg)),
+            Msg::Attach(..) | Msg::Stop => drop(self.take(msg)),
+            _ => {}
+        }
     }
 
     /// What a client's `request` asks the kernel, numbered so its reply
@@ -1006,6 +1033,7 @@ impl Actor {
             busy: busy || activity.requires_action(),
             entries: ledger.seq(),
             activity,
+            read_only: lock(&self.live.summary).read_only,
         }
     }
 

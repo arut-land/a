@@ -15,10 +15,12 @@ use std::ops::RangeInclusive;
 use std::path::PathBuf;
 use std::sync::Arc;
 
-use protocol::{Entry, SessionId};
+use protocol::{Entry, ReadOnly, SessionId};
 use serde::{Deserialize, Serialize};
 
 pub use jsonl::Jsonl;
+#[cfg(test)]
+pub(crate) use jsonl::{FORMAT, seal, unseal};
 pub use lease::{LeaseAuthority, Local};
 #[cfg(test)]
 pub use memory::Memory;
@@ -80,6 +82,11 @@ impl Writer {
         self.epoch
     }
 
+    /// Why the log is kept as it is, if it is: then every append fails.
+    pub fn read_only(&self) -> Option<ReadOnly> {
+        self.log.read_only()
+    }
+
     /// Appends `entries`, each stamped with the lease's epoch: durably, or
     /// only written, to be durable with the next durable append.
     pub fn append(&mut self, entries: &mut [Entry], durable: bool) -> io::Result<()> {
@@ -105,7 +112,9 @@ pub trait LogStore: Send + Sync {
 
     /// One session's appender, handing `each` the committed entries in
     /// order as they are read, one at a time: loading keeps none that
-    /// `each` does not. `NotFound` if there is none.
+    /// `each` does not. `NotFound` if there is none. A log the store cannot
+    /// continue without changing what it holds is handed out kept as it is
+    /// ([`Writer::read_only`]), with the entries it reads.
     fn load(&self, id: SessionId, each: &mut dyn FnMut(Entry)) -> io::Result<Loaded>;
 
     /// One session's committed entries, read without taking its lease: its
@@ -131,6 +140,27 @@ pub trait Log: Send {
     /// them, and nothing after them.
     fn write_all(&mut self, entries: &[Entry]) -> io::Result<()> {
         self.append_all(entries)
+    }
+
+    fn read_only(&self) -> Option<ReadOnly> {
+        None
+    }
+}
+
+/// The appender of a log kept as it is, which a store hands out for a log
+/// it must not change: it refuses every append.
+struct Kept(ReadOnly);
+
+impl Log for Kept {
+    fn append_all(&mut self, _: &[Entry]) -> io::Result<()> {
+        Err(io::Error::new(
+            io::ErrorKind::ReadOnlyFilesystem,
+            self.0.to_string(),
+        ))
+    }
+
+    fn read_only(&self) -> Option<ReadOnly> {
+        Some(self.0)
     }
 }
 

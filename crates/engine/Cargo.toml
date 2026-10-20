@@ -9,6 +9,8 @@ publish.workspace = true
 events = []
 
 [dependencies]
+# Each log line's checksum, in hardware where the CPU has it.
+crc32c = "0.6.8"
 ext.workspace = true
 kernel.workspace = true
 llm = { workspace = true, features = ["ureq"] }

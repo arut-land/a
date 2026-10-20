@@ -13,7 +13,7 @@ use std::path::{Path, PathBuf};
 use std::sync::Mutex;
 
 use protocol::ledger::Ledger;
-use protocol::{Activity, SessionId, SessionSummary};
+use protocol::{Activity, ReadOnly, SessionId, SessionSummary};
 use serde::{Deserialize, Serialize};
 
 use crate::lock;
@@ -30,6 +30,9 @@ pub struct Record {
     pub entries: u64,
     #[serde(default)]
     pub activity: Activity,
+    /// Why its log is kept as it is, if it is.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub read_only: Option<ReadOnly>,
 }
 
 impl Record {
@@ -40,6 +43,7 @@ impl Record {
             busy: false,
             entries: 0,
             activity: Activity::Idle,
+            read_only: None,
         }
     }
 
@@ -52,6 +56,7 @@ impl Record {
             clients: 0,
             activity: self.activity,
             residency: protocol::Residency::Hibernated,
+            read_only: self.read_only,
         }
     }
 }
@@ -202,8 +207,8 @@ fn rebuild(store: &dyn LogStore) -> io::Result<State> {
     let mut state = State::default();
     for header in store.headers()? {
         let mut ledger = Ledger::default();
-        let entries = match store.load(header.id, &mut |e| ledger.apply(&e)) {
-            Ok(loaded) => loaded.seq,
+        let (entries, read_only) = match store.load(header.id, &mut |e| ledger.apply(&e)) {
+            Ok(loaded) => (loaded.seq, loaded.writer.read_only()),
             Err(e) => {
                 eprintln!("session {}: cataloguing: {e}", header.id.short());
                 continue;
@@ -211,9 +216,10 @@ fn rebuild(store: &dyn LogStore) -> io::Result<State> {
         };
         let activity = ledger.activity();
         let record = Record {
-            busy: activity != Activity::Idle,
+            busy: activity != Activity::Idle && read_only.is_none(),
             entries,
             activity,
+            read_only,
             header,
         };
         state.records.insert(record.header.id.0.as_u128(), record);
