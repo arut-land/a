@@ -251,6 +251,8 @@ pub struct Session {
     sending: Arc<Mutex<()>>,
     #[cfg(test)]
     before_pump: Arc<Mutex<Option<BeforePump>>>,
+    #[cfg(test)]
+    before_replay: Arc<Mutex<Option<BeforePump>>>,
 }
 
 #[cfg(test)]
@@ -274,6 +276,10 @@ impl Session {
         let shared = Arc::clone(&feed);
         let sending = Arc::new(Mutex::new(()));
         let ordered = Arc::clone(&sending);
+        #[cfg(test)]
+        let before_replay = Arc::new(Mutex::new(None::<BeforePump>));
+        #[cfg(test)]
+        let replaying = Arc::clone(&before_replay);
         let driver = Driver::with_origin(
             client.daemon.clone(),
             || {
@@ -285,7 +291,13 @@ impl Session {
             },
             move |driver, event| {
                 let _sending = lock(&ordered);
+                #[cfg(test)]
+                let connected = matches!(event.kind, client::EventKind::Connected { .. });
                 let effects = lock(&shared).client.step(event);
+                #[cfg(test)]
+                if connected && let Some(pause) = lock(&replaying).take() {
+                    pause();
+                }
                 driver.pump(&mut Published(&shared), effects);
             },
         );
@@ -295,6 +307,8 @@ impl Session {
             sending,
             #[cfg(test)]
             before_pump: Arc::default(),
+            #[cfg(test)]
+            before_replay,
         }
     }
 
@@ -625,5 +639,95 @@ mod tests {
         drop(listener);
         home.endpoint().remove();
         std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn reconnect_replay_is_pumped_before_newly_numbered_input() {
+        let (session, home, root, listener) = fixture();
+        let id = SessionId::new();
+        session.open(OpenTarget::Id { id: id.to_string() }).unwrap();
+        let mut peer = listener.accept().unwrap();
+        read_frame::<ClientMsg>(&mut peer).unwrap().unwrap();
+        read_frame::<ClientMsg>(&mut peer).unwrap().unwrap();
+        let welcome = DaemonMsg::Welcome {
+            proto: protocol::PROTO,
+            build: "test".into(),
+            caps: Caps::ALL,
+            commands: Vec::new(),
+        };
+        rt::block_on(session.send("unanswered".into())).unwrap();
+        write_frame(&mut peer, &welcome).unwrap();
+        assert_eq!(
+            read_frame::<ClientMsg>(&mut peer)
+                .unwrap()
+                .unwrap()
+                .client_seq(),
+            Some(1)
+        );
+        write_frame(
+            &mut peer,
+            &DaemonMsg::Attached {
+                session: id,
+                workspace: root.clone(),
+            },
+        )
+        .unwrap();
+        write_frame(&mut peer, &DaemonMsg::Draining).unwrap();
+        drop(peer);
+        let mut peer = listener.accept().unwrap();
+        read_frame::<ClientMsg>(&mut peer).unwrap().unwrap();
+        read_frame::<ClientMsg>(&mut peer).unwrap().unwrap();
+        let (prepared, preparing) = mpsc::channel();
+        let (replay, replaying) = mpsc::channel();
+        *lock(&session.before_replay) = Some(Box::new(move || {
+            prepared.send(()).unwrap();
+            replaying.recv().unwrap();
+        }));
+        write_frame(&mut peer, &welcome).unwrap();
+        preparing.recv().unwrap();
+        assert!(lock(&session.feed).client.link().up());
+        let (numbered, numbering) = mpsc::channel();
+        let (send, sending) = mpsc::channel();
+        let mut received = Vec::new();
+        thread::scope(|scope| {
+            let session = &session;
+            // Choose the runnable side before input can acquire the lock. With
+            // incoming serialization removed, force new input ahead of replay.
+            let ordered = session.sending.try_lock().is_err();
+            let input = scope.spawn(move || paused_input(session, "new input", numbered, sending));
+            if ordered {
+                replay.send(()).unwrap();
+            }
+            numbering.recv().unwrap();
+            send.send(()).unwrap();
+            if !ordered {
+                received.push(
+                    read_frame::<ClientMsg>(&mut peer)
+                        .unwrap()
+                        .unwrap()
+                        .client_seq(),
+                );
+                replay.send(()).unwrap();
+            }
+            input.join().unwrap();
+        });
+        while received.len() < 2 {
+            received.push(
+                read_frame::<ClientMsg>(&mut peer)
+                    .unwrap()
+                    .unwrap()
+                    .client_seq(),
+            );
+        }
+        drop(session);
+        assert!(matches!(
+            read_frame::<ClientMsg>(&mut peer).unwrap(),
+            Some(ClientMsg::Detach)
+        ));
+        drop(peer);
+        drop(listener);
+        home.endpoint().remove();
+        std::fs::remove_dir_all(root).unwrap();
+        assert_eq!(received, vec![Some(1), Some(2)]);
     }
 }
