@@ -113,3 +113,165 @@ fn a_failed_deferred_sync_recovers_before_accepting_more_work() {
     assert_eq!(log_of(&session), kept);
     session.halt();
 }
+
+/// The actor runs only when polled by the test; I/O completes inline and
+/// deferred timers never fire, so queued messages define exact bursts.
+struct Manual {
+    background: rt::Threads,
+    captured: AtomicBool,
+    actor: Mutex<Option<rt::BoxFuture<'static, ()>>>,
+}
+
+impl rt::Runtime for Manual {
+    fn spawn(&self, task: rt::BoxFuture<'static, ()>) {
+        if !self.captured.swap(true, Ordering::SeqCst) {
+            *lock(&self.actor) = Some(task);
+        } else {
+            self.background.spawn(task);
+        }
+    }
+
+    fn spawn_blocking(&self, work: Box<dyn FnOnce() + Send>) {
+        work();
+    }
+
+    fn reactor(&self) -> rt::Reactor {
+        rt::Reactor::AsyncIo
+    }
+
+    fn sleep(&self, _: Duration) -> rt::BoxFuture<'static, ()> {
+        Box::pin(std::future::pending())
+    }
+}
+
+struct ControlledSleep(Arc<channel::Sender<oneshot::Sender<()>>>);
+
+impl Tool for ControlledSleep {
+    type In = ext_fixtures::Seconds;
+    type Out = String;
+    const NAME: &'static str = "sleep";
+    const DESCRIPTION: &'static str = "Wait for the test to release this call.";
+
+    async fn call(&self, _: &Self::In, cx: &Cx) -> Result<String, String> {
+        let (release, released) = oneshot::channel();
+        self.0.send(release).ok().unwrap();
+        unless(&cx.cancel, released)
+            .await
+            .ok_or_else(|| "stopped".to_owned())?;
+        Ok("released".into())
+    }
+}
+
+impl Extension for ControlledSleep {
+    const NAME: &'static str = "controlled";
+    const VERSION: u32 = 1;
+
+    fn contribute(&self, r: &mut Registrar) {
+        r.tool(ControlledSleep(self.0.clone()));
+    }
+}
+
+struct ManualSession {
+    session: Arc<Live>,
+    actor: rt::BoxFuture<'static, ()>,
+    faulty: Arc<Faulty>,
+    release: oneshot::Sender<()>,
+    call: CallId,
+}
+
+impl ManualSession {
+    fn new() -> Self {
+        let faulty = Arc::new(Faulty::new(Arc::new(Memory::default())));
+        let (started, starts) = channel::unbounded();
+        let mut fixture = Fixture::on(
+            Arc::clone(&faulty) as _,
+            ext_fixtures::ECHO,
+            Registry::default()
+                .with(&ControlledSleep(Arc::new(started)))
+                .unwrap(),
+            openai(&Script::new(&[])),
+        );
+        let manual = Arc::new(Manual {
+            background: rt::Threads::new(1),
+            captured: AtomicBool::new(false),
+            actor: Mutex::default(),
+        });
+        Arc::get_mut(&mut fixture.0).unwrap().rt = Arc::clone(&manual) as _;
+        let session = fixture.create();
+        let mut actor = lock(&manual.actor).take().unwrap();
+        let (reply, received) = oneshot::channel();
+        session.send(Msg::Request {
+            request: Request::Input {
+                text: "sleep 0".into(),
+                mode: Mode::Queue,
+            },
+            origin: None,
+            reply,
+        });
+        poll_actor(&mut actor);
+        assert_eq!(rt::block_on(received), Some(Ok(())));
+        let release = rt::block_on(starts.recv()).unwrap();
+        let call = id(session
+            .frames
+            .entries()
+            .find(|e| matches!(e.body, Body::ToolCall { .. }))
+            .unwrap()
+            .seq
+            .get());
+        Self {
+            session,
+            actor,
+            faulty,
+            release,
+            call,
+        }
+    }
+
+    fn poll(&mut self) {
+        poll_actor(&mut self.actor);
+    }
+
+    fn note(&self) -> oneshot::Receiver<()> {
+        let (done, waited) = oneshot::channel();
+        self.session.send(Msg::Note {
+            call: self.call,
+            note: Note::State {
+                ext: "test".into(),
+                state: "value".into(),
+                data: Json::encode(&"pending").unwrap(),
+            },
+            done: Some(done),
+        });
+        waited
+    }
+
+    fn finish(self) -> Vec<Entry> {
+        self.release.send(());
+        self.session.send(Msg::Stop);
+        rt::block_on(self.actor);
+        let kept = self.faulty.entries(self.session.id).unwrap();
+        assert_eq!(log_of(&self.session), kept);
+        kept
+    }
+}
+
+#[test]
+fn a_failed_sync_drops_acknowledgements_from_the_same_burst() {
+    let mut harness = ManualSession::new();
+    harness.faulty.fail_next_sync();
+    let waited = harness.note();
+    harness.session.send(Msg::Sync);
+    harness.poll();
+    let acknowledged = rt::block_on(waited);
+    let kept = harness.finish();
+    assert!(kept.iter().all(|e| !matches!(e.body, Body::Ext { .. })));
+    assert!(
+        acknowledged.is_none(),
+        "a failed sync cannot acknowledge the burst's note"
+    );
+}
+
+fn poll_actor(actor: &mut rt::BoxFuture<'static, ()>) {
+    let mut cx = std::task::Context::from_waker(std::task::Waker::noop());
+    assert!(actor.as_mut().poll(&mut cx).is_pending());
+}

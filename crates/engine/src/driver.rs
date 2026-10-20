@@ -676,8 +676,8 @@ impl Actor {
                 });
                 self.step(generation.into_iter().chain(events)).await;
             }
-            if sync {
-                self.sync().await;
+            if sync && !self.sync().await {
+                dones.clear();
             }
             // Answered once what they waited for is durable.
             if self.unsynced.is_empty() {
@@ -1174,13 +1174,13 @@ impl Actor {
 
     /// Makes what was only written durable, and shows it. A sync that
     /// fails leaves the session as a failed commit does.
-    async fn sync(&mut self) {
+    async fn sync(&mut self) -> bool {
         self.sync_armed = false;
         if self.unsynced.is_empty() {
-            return;
+            return true;
         }
         let Some(mut writer) = self.writer.take() else {
-            return;
+            return false;
         };
         let rt = Arc::clone(&self.live.session.shared.rt);
         let (writer, synced) = rt::unblock(&*rt, move || {
@@ -1190,11 +1190,15 @@ impl Actor {
         .await;
         self.writer = Some(writer);
         match synced {
-            Ok(()) => self.show_synced(),
+            Ok(()) => {
+                self.show_synced();
+                true
+            }
             Err(e) => {
                 self.unsynced.clear();
                 self.waiting_sync.clear();
                 Box::pin(self.failed(format!("syncing: {e}"), Vec::new())).await;
+                false
             }
         }
     }
