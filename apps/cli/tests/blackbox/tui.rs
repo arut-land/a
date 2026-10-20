@@ -18,7 +18,7 @@ fn the_full_screen_client_shows_replies_and_answers_approvals_by_click() {
     term.wait_for("● live");
 
     term.send(b"hello from a tty\r");
-    let screen = term.wait_for("  hello from a tty");
+    let screen = term.wait_for("⏺ hello from a tty");
     assert!(
         screen.find("❯ hello from a tty").is_some(),
         "{}",
@@ -67,7 +67,7 @@ fn the_inline_client_prints_the_transcript_into_the_scrollback() {
     let mut term = env.tty(&[], 80, 24);
     term.wait_for("● live");
     term.send(b"$ echo first\r");
-    term.wait_for("? approve $ echo first");
+    term.wait_for("Do you want to proceed? $ echo first");
     term.send(b"y");
     term.wait_for("✓ exit 0");
     term.send(b"\x03");
@@ -118,14 +118,14 @@ fn the_full_screen_client_rides_out_a_daemon_upgrade() {
     let mut term = Env::tty_of(env.cmd_as(&old, &[]), 100, 30);
     term.wait_for("● live");
     term.send(b"before\r");
-    term.wait_for("  before");
+    term.wait_for("⏺ before");
     let first = env.pid().unwrap();
 
     // The newer build drains the older one's daemon and starts its own.
     env.run(&["ls"]);
     assert_ne!(env.pid().unwrap(), first);
     term.send(b"after the upgrade\r");
-    let screen = term.wait_for("  after the upgrade");
+    let screen = term.wait_for("⏺ after the upgrade");
     assert!(!screen.text().contains("disconnected"), "{}", screen.text());
     assert_eq!(screen.text().matches("❯ after the upgrade").count(), 1);
 

@@ -340,10 +340,10 @@ impl App {
                 let at = self.menu_at.min(last);
                 match key {
                     Key::Up | Key::Ctrl('p') if !menu.is_empty() => {
-                        self.menu_at = at.saturating_sub(1)
+                        self.menu_at = at.saturating_sub(1);
                     }
                     Key::Down | Key::Ctrl('n') if !menu.is_empty() => {
-                        self.menu_at = (at + 1).min(last)
+                        self.menu_at = (at + 1).min(last);
                     }
                     // Tab takes the selected name; a command with
                     // arguments waits for them, one without runs on Enter.
@@ -356,10 +356,10 @@ impl App {
                         self.editor.insert(name);
                         if args {
                             self.editor.insert(" ");
-                        } else if key == Key::Enter {
-                            if let Edit::Submit(text) = self.editor.key(Key::Enter) {
-                                return self.submit(&text);
-                            }
+                        } else if key == Key::Enter
+                            && let Edit::Submit(text) = self.editor.key(Key::Enter)
+                        {
+                            return self.submit(&text);
                         }
                     }
                     key => {
