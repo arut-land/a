@@ -246,7 +246,6 @@ mod tests {
             welcome: Welcome {
                 proto: 1,
                 caps: Caps::ALL,
-                client: 1,
             },
             remote: false,
             commands: Vec::new(),

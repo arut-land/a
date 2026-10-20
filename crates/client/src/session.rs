@@ -14,7 +14,9 @@ use std::collections::VecDeque;
 use std::path::PathBuf;
 
 use protocol::view::{Change, SessionList, SessionView, Turn, Update};
-use protocol::{ClientMsg, CommandInfo, DaemonMsg, Environment, Rejection, SessionSummary, Target};
+use protocol::{
+    ClientMsg, CommandInfo, DaemonMsg, Environment, Mode, Rejection, SessionSummary, Target,
+};
 
 use crate::{Cmd, Diagnosis, Welcome};
 
@@ -310,8 +312,9 @@ impl SessionClient {
     pub fn run(&mut self, cmd: Cmd) -> Vec<Effect> {
         match cmd {
             Cmd::Input(text) => self.send(ClientMsg::input(text)),
-            Cmd::Steer(text) => self.send(ClientMsg::Steer {
+            Cmd::Steer(text) => self.send(ClientMsg::Input {
                 text,
+                mode: Mode::Steer,
                 client_seq: None,
             }),
             Cmd::Approve { call, approved } => self.send(ClientMsg::approve(call, approved)),
@@ -422,15 +425,17 @@ impl SessionClient {
                 out.push(Effect::Sessions);
                 return;
             }
-            DaemonMsg::Ack { origin } => {
-                self.unanswered.retain(|m| !numbered(m, origin.client_seq));
+            DaemonMsg::Ack { client_seq } => {
+                self.unanswered.retain(|m| !numbered(m, *client_seq));
                 return;
             }
-            DaemonMsg::Rejected { origin, reason, .. } => {
+            DaemonMsg::Rejected {
+                client_seq, reason, ..
+            } => {
                 let at = self
                     .unanswered
                     .iter()
-                    .position(|m| numbered(m, origin.client_seq));
+                    .position(|m| numbered(m, *client_seq));
                 let refused = at.and_then(|at| self.unanswered.remove(at));
                 if let (Some(mut again), Rejection::Draining) = (refused, reason) {
                     if let Some(seq) = again.client_seq_mut() {
@@ -504,9 +509,7 @@ const fn numbered(msg: &ClientMsg, seq: u64) -> bool {
 mod tests {
     use std::path::PathBuf;
 
-    use protocol::{
-        Audience, Body, CallId, Caps, Entry, Mode, Origin, Permission, SessionId, Verdict,
-    };
+    use protocol::{Audience, Body, CallId, Caps, Entry, Permission, SessionId, Verdict};
 
     use super::*;
 
@@ -516,7 +519,6 @@ mod tests {
             welcome: Welcome {
                 proto: protocol::PROTO,
                 caps,
-                client: 1,
             },
             remote: false,
             commands: Vec::new(),
@@ -668,8 +670,8 @@ mod tests {
         // who sent what does it once.
         assert!(
             matches!(&sends(&out)[..], [
-                ClientMsg::Input { text: one, client_seq: Some(1) },
-                ClientMsg::Input { text: two, client_seq: Some(2) },
+                ClientMsg::Input { text: one, client_seq: Some(1), .. },
+                ClientMsg::Input { text: two, client_seq: Some(2), .. },
             ] if one == "one" && two == "two"),
             "{out:?}"
         );
@@ -683,10 +685,7 @@ mod tests {
         let refused = client.step(msg(
             1,
             DaemonMsg::Rejected {
-                origin: Origin {
-                    client: 1,
-                    client_seq: 1,
-                },
+                client_seq: 1,
                 reason: Rejection::Draining,
                 message: "send that again".into(),
             },
@@ -704,15 +703,7 @@ mod tests {
         let out = client.step(reconnected);
         assert_eq!(sends(&out).len(), 1, "{out:?}");
         // Taken this time: a second drain does not send it again.
-        client.step(msg(
-            2,
-            DaemonMsg::Ack {
-                origin: Origin {
-                    client: 2,
-                    client_seq: 2,
-                },
-            },
-        ));
+        client.step(msg(2, DaemonMsg::Ack { client_seq: 2 }));
         client.step(msg(2, DaemonMsg::Draining));
         client.step(Event::Closed {
             id: 2,

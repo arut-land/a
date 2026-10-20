@@ -109,6 +109,8 @@ pub enum Item {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         purpose: Option<String>,
     },
+    /// A call of a tool, by the model or (`by` the user) a slash command,
+    /// whose arguments are its input's `args` ([`Item::args`]).
     Tool {
         call: u64,
         tool: String,
@@ -118,13 +120,8 @@ pub enum Item {
         /// How the tool presents the call, or once it has one, its outcome.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         card: Option<Card>,
-    },
-    /// A slash command and its outcome.
-    Command {
-        call: u64,
-        name: String,
-        args: String,
-        outcome: Option<Outcome>,
+        #[serde(default, skip_serializing_if = "crate::decode::skip")]
+        by: Audience,
     },
     /// What extension `hook` decided, about call `call` (of tool `tool`)
     /// when it is about one; an approval asked is the call's [`Approval`].
@@ -165,10 +162,6 @@ impl Item {
             Self::Tool {
                 outcome: Some(outcome),
                 ..
-            }
-            | Self::Command {
-                outcome: Some(outcome),
-                ..
             } => Phase::of(outcome),
             Self::Tool {
                 approval: Some(Approval::Pending),
@@ -178,7 +171,7 @@ impl Item {
                 approval: Some(Approval::Denied),
                 ..
             } => Phase::Denied,
-            Self::Tool { .. } | Self::Command { .. } => Phase::Running,
+            Self::Tool { .. } => Phase::Running,
             _ => return None,
         })
     }
@@ -190,11 +183,19 @@ impl Item {
             | Self::Assistant { seq, .. }
             | Self::Hook { seq, .. }
             | Self::Environment { seq, .. } => *seq,
-            Self::Reply { call, .. }
-            | Self::Tool { call, .. }
-            | Self::Child { call, .. }
-            | Self::Command { call, .. } => *call,
+            Self::Reply { call, .. } | Self::Tool { call, .. } | Self::Child { call, .. } => *call,
         }
+    }
+
+    /// The arguments of a slash command, as typed after its name: its
+    /// input's `args`.
+    pub fn args(input: &Json) -> String {
+        #[derive(Deserialize)]
+        struct Args {
+            #[serde(default)]
+            args: String,
+        }
+        input.parse::<Args>().map_or_default(|a| a.args)
     }
 }
 
@@ -552,7 +553,11 @@ impl SessionView {
                 text: text.clone(),
             },
             Body::ToolCall {
-                tool, input, card, ..
+                tool,
+                input,
+                card,
+                by,
+                ..
             } => Item::Tool {
                 call: seq,
                 tool: tool.clone(),
@@ -560,6 +565,7 @@ impl SessionView {
                 approval: None,
                 outcome: None,
                 card: card.clone(),
+                by: *by,
             },
             Body::ModelCall { model, purpose, .. } => Item::Reply {
                 call: seq,
@@ -601,9 +607,6 @@ impl SessionView {
                 card,
             } => {
                 let at = self.call(*call)?;
-                if let Item::Command { .. } = self.items[at] {
-                    return self.command_result(*call, outcome);
-                }
                 let Item::Tool {
                     outcome: o,
                     card: shown,
@@ -654,27 +657,17 @@ impl SessionView {
         }
     }
 
-    fn command_result(&mut self, call: u64, outcome: &Outcome) -> Option<Change> {
-        let at = self.call(call)?;
-        let Item::Command { outcome: o, .. } = &mut self.items[at] else {
-            return None;
-        };
-        *o = Some(outcome.clone());
-        Some(self.updated(at, Part::Outcome))
-    }
-
     /// A command the user ran, called `seq`. The input that ran it is
     /// shown as the command it is.
     fn command(&mut self, seq: u64, tool: &str, input: &Json) -> Change {
-        let args = input.value()["args"]
-            .as_str()
-            .unwrap_or_default()
-            .to_owned();
-        let item = Item::Command {
+        let item = Item::Tool {
             call: seq,
-            name: tool.to_owned(),
-            args,
+            tool: tool.to_owned(),
+            input: input.clone(),
+            approval: None,
             outcome: None,
+            card: None,
+            by: Audience::User,
         };
         let typed = |text: &str| {
             let rest = text.strip_prefix('/').unwrap_or_default();
@@ -701,7 +694,6 @@ impl SessionView {
             .map(|at| &self.items[at])
         {
             Some(Item::Tool { tool, .. }) => tool.clone(),
-            Some(Item::Command { name, .. }) => name.clone(),
             _ => String::new(),
         }
     }
@@ -727,7 +719,11 @@ impl SessionView {
         };
         for item in &self.items[prompt.map_or(0, |at| at + 1)..] {
             match item {
-                Item::Tool { tool, .. } => recap.tools.push(tool.clone()),
+                Item::Tool {
+                    tool,
+                    by: Audience::Model,
+                    ..
+                } => recap.tools.push(tool.clone()),
                 Item::Assistant { text, .. } => recap.reply = Some(short(text)),
                 Item::Reply {
                     text,

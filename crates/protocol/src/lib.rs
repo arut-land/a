@@ -870,13 +870,6 @@ pub struct CommandInfo {
     pub description: String,
 }
 
-/// Who caused something: connection `client`'s mutation `client_seq`.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
-pub struct Origin {
-    pub client: u32,
-    pub client_seq: u64,
-}
-
 /// Why the daemon refused a mutation.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -932,10 +925,9 @@ kinds! {
         Declare "declare" (ClientDecl), read decode::declare_msg;
         /// Replaces the attached session's environment (`/env refresh`).
         Environment "environment" (Environment), read decode::environment_msg;
-        Input "input" { text: String, client_seq: Option<u64> = default };
-        /// Input for the running turn, given to it at its next step boundary;
-        /// with no turn running it is plain input.
-        Steer "steer" { text: String, client_seq: Option<u64> = default };
+        /// Input; a `steer` goes to the running turn at its next step
+        /// boundary, and with no turn running is plain input.
+        Input "input" { text: String, mode: Mode = default, client_seq: Option<u64> = default };
         List "list";
         Detach "detach";
         /// Asks for [`DaemonMsg::Sessions`] now and whenever a session's
@@ -966,6 +958,7 @@ impl ClientMsg {
     pub fn input(text: impl Into<String>) -> Self {
         Self::Input {
             text: text.into(),
+            mode: Mode::Queue,
             client_seq: None,
         }
     }
@@ -982,7 +975,6 @@ impl ClientMsg {
     pub const fn client_seq(&self) -> Option<u64> {
         match self {
             Self::Input { client_seq, .. }
-            | Self::Steer { client_seq, .. }
             | Self::Approve { client_seq, .. }
             | Self::Interrupt { client_seq } => *client_seq,
             _ => None,
@@ -994,7 +986,6 @@ impl ClientMsg {
     pub const fn client_seq_mut(&mut self) -> Option<&mut Option<u64>> {
         match self {
             Self::Input { client_seq, .. }
-            | Self::Steer { client_seq, .. }
             | Self::Approve { client_seq, .. }
             | Self::Interrupt { client_seq } => Some(client_seq),
             Self::Hello { .. }
@@ -1015,14 +1006,12 @@ kinds! {
     #[derive(Clone, Debug, Serialize)]
     pub enum DaemonMsg: t = "t" in MsgFields, class {
         /// The hello is accepted at protocol `proto`. `caps` are the client's
-        /// capabilities the daemon takes up, and `client` this connection's id,
-        /// as [`Origin`]s name it. `commands` are the slash commands the daemon
-        /// runs, for help and completion.
+        /// capabilities the daemon takes up. `commands` are the slash
+        /// commands the daemon runs, for help and completion.
         Welcome "welcome" {
             proto: u32,
             build: String,
             caps: Caps = default,
-            client: u32 = default,
             commands: Vec<CommandInfo> = default,
         } = Control;
         /// The daemon speaks protocols `min..=supported` (just `supported`
@@ -1062,12 +1051,12 @@ kinds! {
         /// behind live. Folding it and what follows equals folding the entries
         /// it stands for.
         Snapshot "snapshot" (Box<view::SessionView>) = Durable, read decode::snapshot_msg;
-        /// Numbered mutation `origin` was taken; what it causes follows as
-        /// entries. A mutation sent without a number is answered only when
-        /// refused, with an [`DaemonMsg::Error`].
-        Ack "ack" { origin: Origin } = Control;
-        /// Numbered mutation `origin` was refused.
-        Rejected "rejected" { origin: Origin, reason: Rejection, message: String = default } = Control;
+        /// This connection's mutation numbered `client_seq` was taken; what
+        /// it causes follows as entries. A mutation sent without a number
+        /// is answered only when refused, with an [`DaemonMsg::Error`].
+        Ack "ack" { client_seq: u64 } = Control;
+        /// This connection's mutation numbered `client_seq` was refused.
+        Rejected "rejected" { client_seq: u64, reason: Rejection, message: String = default } = Control;
     }
     /// A message, or an entry, of a kind this build does not know: a newer
     /// daemon's. Never sent; decoding yields it so a client skips what it

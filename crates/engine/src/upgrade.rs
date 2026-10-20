@@ -128,14 +128,6 @@ pub struct Registered<'a> {
     id: u64,
 }
 
-impl Registered<'_> {
-    /// The connection's id for its client, from 1: what its welcome and
-    /// the origins of its mutations carry.
-    pub fn client(&self) -> u32 {
-        u32::try_from(self.id + 1).unwrap_or(u32::MAX)
-    }
-}
-
 impl Drop for Registered<'_> {
     fn drop(&mut self) {
         lock(&self.life.conns).retain(|(id, _)| *id != self.id);

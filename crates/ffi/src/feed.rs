@@ -183,7 +183,6 @@ impl Reducer {
             welcome: Welcome {
                 proto: protocol::PROTO,
                 caps: Caps::ALL,
-                client: 0,
             },
             remote: false,
             commands: Vec::new(),

@@ -169,17 +169,17 @@ pub fn item_row<'a>(item: &'a Item, view: &'a SessionView) -> impl Renderable {
                     ReplyRow call=(*call) text=(text) status=(status) usage=(usage.as_ref())
                         live=(view.streaming.as_ref().filter(|s| s.call == *call).map(|s| s.text.as_str()));
                 }
-                Item::Tool { call, tool, input, approval, outcome, card, .. } => {
-                    ToolCard call=(*call) line=(&call_title(tool, input, card.as_ref())) approval=(*approval)
-                        phase=(item.phase().unwrap_or(Phase::Running)) outcome=(outcome.as_ref()) card=(card.as_ref());
-                }
-                Item::Command { name, args, outcome, .. } => {
+                Item::Tool { tool, input, outcome, by: protocol::Audience::User, .. } => {
                     div style=(style::NOTE) {
-                        span style=(style::MONO) { "/" (name) " " (args) }
+                        span style=(style::MONO) { "/" (tool) " " (Item::args(input)) }
                         @if let Some(outcome) = outcome {
                             " · " (outcome_text(outcome))
                         }
                     }
+                }
+                Item::Tool { call, tool, input, approval, outcome, card, .. } => {
+                    ToolCard call=(*call) line=(&call_title(tool, input, card.as_ref())) approval=(*approval)
+                        phase=(item.phase().unwrap_or(Phase::Running)) outcome=(outcome.as_ref()) card=(card.as_ref());
                 }
                 Item::Hook { hook, call, tool, decision, .. } => {
                     p style=(style::NOTE) { "hook " (hook) " · " (decision_line(tool, *call, decision)) }

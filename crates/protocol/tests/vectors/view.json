@@ -902,7 +902,7 @@
     ]
   },
   {
-    "hash": "f4b4a384fdd00046",
+    "hash": "7d68819abec4dd2e",
     "messages": [
       {
         "session": "00000000-0000-0000-0000-00000000000a",
@@ -1013,14 +1013,18 @@
           "type": "tool"
         },
         {
-          "args": "",
+          "approval": null,
+          "by": "user",
           "call": 5,
-          "name": "jobs",
+          "input": {
+            "args": ""
+          },
           "outcome": {
             "output": "no jobs",
             "status": "done"
           },
-          "type": "command"
+          "tool": "jobs",
+          "type": "tool"
         }
       ],
       "seq": 6,
@@ -1107,11 +1111,15 @@
           "change": "updated",
           "index": 1,
           "item": {
-            "args": "",
+            "approval": null,
+            "by": "user",
             "call": 5,
-            "name": "jobs",
+            "input": {
+              "args": ""
+            },
             "outcome": null,
-            "type": "command"
+            "tool": "jobs",
+            "type": "tool"
           },
           "part": "outcome"
         },
@@ -1123,14 +1131,18 @@
           "change": "updated",
           "index": 1,
           "item": {
-            "args": "",
+            "approval": null,
+            "by": "user",
             "call": 5,
-            "name": "jobs",
+            "input": {
+              "args": ""
+            },
             "outcome": {
               "output": "no jobs",
               "status": "done"
             },
-            "type": "command"
+            "tool": "jobs",
+            "type": "tool"
           },
           "part": "outcome"
         },

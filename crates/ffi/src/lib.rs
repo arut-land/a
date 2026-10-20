@@ -677,6 +677,16 @@ impl ViewChange {
     }
 }
 
+/// A slash command the user ran, as the app shows it.
+fn command(call: u64, tool: &str, input: &protocol::Json, outcome: Option<&Outcome>) -> ViewItem {
+    ViewItem::Command {
+        call,
+        name: tool.to_owned(),
+        args: Item::args(input),
+        outcome: outcome.map(|o| tool_outcome(o, None)),
+    }
+}
+
 impl From<&Item> for ViewItem {
     fn from(item: &Item) -> Self {
         match item {
@@ -712,6 +722,15 @@ impl From<&Item> for ViewItem {
                     output: u.output,
                 }),
             },
+            // The app shows a slash command apart from a tool.
+            Item::Tool {
+                call,
+                tool,
+                input,
+                outcome,
+                by: protocol::Audience::User,
+                ..
+            } => command(*call, tool, input, outcome.as_ref()),
             Item::Tool {
                 call,
                 tool,
@@ -738,17 +757,7 @@ impl From<&Item> for ViewItem {
                 }),
                 phase: item.phase().map_or(CallPhase::Running, Into::into),
             },
-            Item::Command {
-                call,
-                name,
-                args,
-                outcome,
-            } => Self::Command {
-                call: *call,
-                name: name.clone(),
-                args: args.clone(),
-                outcome: outcome.as_ref().map(|o| tool_outcome(o, None)),
-            },
+
             Item::Hook {
                 seq,
                 hook,

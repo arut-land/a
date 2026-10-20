@@ -15,7 +15,7 @@ use std::time::Duration;
 
 use protocol::{
     Author, Caps, ClientDecl, ClientId, ClientMsg, ClientSeq, DaemonMsg, Decode, Environment,
-    Frame, HomeSettings, Mode, Origin, PROTO, Rejection, Role, SettingsChange, Versions,
+    Frame, HomeSettings, PROTO, Rejection, Role, SettingsChange, Versions,
 };
 use rt::{Async, Reactor};
 use sys::{Listener, Stream};
@@ -209,12 +209,11 @@ pub(crate) async fn handle(
     // and dropped, never acted on.
     let result = match (verdict, Versions::OURS.common(theirs)) {
         (Verdict::Welcome, Some(proto)) => {
-            let registered = life.register(outbox.clone());
+            let _registered = life.register(outbox.clone());
             let mut conn = Conn {
                 daemon,
                 life,
                 outbox: &outbox,
-                number: registered.client(),
                 // One that does not name itself is one client for as long
                 // as its connection lasts.
                 client: client.unwrap_or_default(),
@@ -225,7 +224,6 @@ pub(crate) async fn handle(
                 proto,
                 build: life.build.clone(),
                 caps,
-                client: conn.number,
                 commands: driver::commands(&daemon.shared.registry.get()),
             });
             conn.serve(&mut frames).await
@@ -277,8 +275,6 @@ struct Conn<'a> {
     daemon: &'a Arc<Daemon>,
     life: &'a Lifecycle,
     outbox: &'a Outbox,
-    /// The connection's number, as acks name it.
-    number: u32,
     /// The client, as the log names who did what: a mutation it numbered
     /// that the log holds already is a resend, answered as the first was,
     /// across reconnects and daemon restarts.
@@ -362,7 +358,6 @@ impl Conn<'_> {
                 ClientMsg::Detach => break,
                 ClientMsg::Hello { .. }
                 | ClientMsg::Input { .. }
-                | ClientMsg::Steer { .. }
                 | ClientMsg::Approve { .. }
                 | ClientMsg::Interrupt { .. } => {}
             }
@@ -412,12 +407,7 @@ impl Conn<'_> {
                     "the daemon is restarting for an upgrade; send that again in a moment".into(),
                 ));
             }
-            ClientMsg::Input { text, .. } => {
-                let mode = Mode::Queue;
-                (Request::Input { text, mode }, Rejection::Refused)
-            }
-            ClientMsg::Steer { text, .. } => {
-                let mode = Mode::Steer;
+            ClientMsg::Input { text, mode, .. } => {
                 (Request::Input { text, mode }, Rejection::Refused)
             }
             ClientMsg::Approve { call, approved, .. } => {
@@ -435,14 +425,10 @@ impl Conn<'_> {
     fn answered(&self, client_seq: Option<u64>, answer: Answer) {
         match (client_seq, answer) {
             (Some(client_seq), answer) => {
-                let origin = Origin {
-                    client: self.number,
-                    client_seq,
-                };
                 self.reply(&match answer {
-                    Ok(()) => DaemonMsg::Ack { origin },
+                    Ok(()) => DaemonMsg::Ack { client_seq },
                     Err((reason, message)) => DaemonMsg::Rejected {
-                        origin,
+                        client_seq,
                         reason,
                         message,
                     },

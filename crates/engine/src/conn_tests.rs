@@ -10,8 +10,8 @@ use std::time::{Duration, Instant};
 use crate::store::{Header, Jsonl, LogStore};
 use protocol::view::SessionView;
 use protocol::{
-    Body, Caps, ClientDecl, ClientId, ClientMsg, DaemonMsg, Entry, Environment, Origin, PROTO,
-    Rejection, Role, SessionId, SettingsChange, Target, read_frame, write_frame,
+    Body, Caps, ClientDecl, ClientId, ClientMsg, DaemonMsg, Entry, Environment, PROTO, Rejection,
+    Role, SessionId, SettingsChange, Target, read_frame, write_frame,
 };
 use sys::Home;
 
@@ -170,7 +170,7 @@ fn resent_once(fixture: &mut Fixture, again: impl FnOnce(&mut Fixture)) {
     peer.send(&hello_as(client));
     peer.send(&attach(Target::New, 0, ClientDecl::default()));
     peer.send(&input("hi", 1));
-    let acked = |m: &DaemonMsg| matches!(m, DaemonMsg::Ack { origin } if origin.client_seq == 1);
+    let acked = |m: &DaemonMsg| matches!(m, DaemonMsg::Ack { client_seq: 1 });
     let seen = peer.until(acked);
     let attached = seen.iter().find_map(|m| match m {
         DaemonMsg::Attached { session, .. } => Some(*session),
@@ -213,11 +213,12 @@ fn input(text: &str, seq: u64) -> ClientMsg {
     ClientMsg::Input {
         text: text.into(),
         client_seq: Some(seq),
+        mode: protocol::Mode::Queue,
     }
 }
 
-fn origin(client: u32, client_seq: u64) -> Origin {
-    Origin { client, client_seq }
+fn origin(_client: u32, client_seq: u64) -> u64 {
+    client_seq
 }
 
 /// Whether `body` is a client's input.
@@ -238,10 +239,10 @@ fn a_pipelined_hello_attach_and_input_are_answered_in_order() {
     peer.send(&hello(Caps::ALL));
     peer.send(&attach(Target::New, 0, ClientDecl::default()));
     peer.send(&input("hi", 1));
-    let DaemonMsg::Welcome { caps, client, .. } = peer.recv() else {
+    let DaemonMsg::Welcome { caps, .. } = peer.recv() else {
         panic!("no welcome");
     };
-    assert_eq!((caps, client), (Caps::SERVED, 1));
+    assert_eq!(caps, Caps::SERVED);
     assert!(matches!(peer.recv(), DaemonMsg::Attached { .. }));
     // A new session's first entry records its extensions.
     let first = peer.recv();
@@ -256,7 +257,7 @@ fn a_pipelined_hello_attach_and_input_are_answered_in_order() {
         matches!(&logged, DaemonMsg::Entry(e) if is_input(&e.body)),
         "{logged:?}"
     );
-    assert!(matches!(peer.recv(), DaemonMsg::Ack { origin: o } if o == origin(1, 1)));
+    assert!(matches!(peer.recv(), DaemonMsg::Ack { client_seq: o } if o == origin(1, 1)));
     let seen = peer
         .until(|m| matches!(m, DaemonMsg::Entry(e) if matches!(e.body, Body::Assistant { .. })));
     assert_eq!(users(&seen), 0, "the input was already seen");
@@ -282,13 +283,13 @@ fn a_repeated_mutation_is_answered_again_but_not_done_again() {
     });
     assert!(matches!(peer.answer(), DaemonMsg::Welcome { .. }));
     assert!(matches!(peer.answer(), DaemonMsg::Attached { .. }));
-    let acked = |m: DaemonMsg| matches!(m, DaemonMsg::Ack { origin: o } if o == origin(1, 1));
+    let acked = |m: DaemonMsg| matches!(m, DaemonMsg::Ack { client_seq: o } if o == origin(1, 1));
     assert!(acked(peer.answer()));
     assert!(acked(peer.answer()));
     for _ in 0..2 {
         assert!(matches!(
             peer.answer(),
-            DaemonMsg::Rejected { origin: o, reason: Rejection::NotWaiting, .. } if o == origin(1, 2)
+            DaemonMsg::Rejected { client_seq: o, reason: Rejection::NotWaiting, .. } if o == origin(1, 2)
         ));
     }
     // An older one, sent again, is answered as it was.
@@ -326,7 +327,7 @@ fn a_viewer_cannot_change_the_session() {
             ..
         }
     ));
-    assert!(matches!(peer.answer(), DaemonMsg::Ack { origin: o } if o == origin(1, 2)));
+    assert!(matches!(peer.answer(), DaemonMsg::Ack { client_seq: o } if o == origin(1, 2)));
 }
 
 #[test]

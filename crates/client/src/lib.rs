@@ -62,8 +62,6 @@ pub struct Welcome {
     pub proto: u32,
     /// The capabilities taken up.
     pub caps: Caps,
-    /// This connection's id, as origins name it.
-    pub client: u32,
 }
 
 impl Connection {
@@ -378,16 +376,11 @@ fn hello(
         Some(DaemonMsg::Welcome {
             proto,
             caps,
-            client,
             commands,
             ..
         }) => {
             sent?;
-            conn.welcome = Welcome {
-                proto,
-                caps,
-                client,
-            };
+            conn.welcome = Welcome { proto, caps };
             conn.commands = commands;
             Ok(Greeting::Welcome)
         }

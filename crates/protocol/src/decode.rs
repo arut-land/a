@@ -27,7 +27,7 @@ use serde_json::{Error, Result};
 use crate::view::{Approval, Item, SessionView, Status, Usage};
 use crate::{
     Audience, Author, Body, CallId, Caps, Card, ClientDecl, ClientId, ClientMsg, CommandInfo,
-    DaemonMsg, Decode, Entry, Environment, HomeSettings, Installed, Json, Mode, Origin, Outcome,
+    DaemonMsg, Decode, Entry, Environment, HomeSettings, Installed, Json, Mode, Outcome,
     Permission, Rejection, Role, Seq, SessionId, SessionSummary, SettingsChange, Target,
     ToolChoice, Verdict, WaitOn,
 };
@@ -264,7 +264,6 @@ same!(
     SessionId,
     PathBuf,
     Caps,
-    Origin,
     Rejection,
     Target,
     Environment,
@@ -446,7 +445,7 @@ pub(crate) struct MsgFields {
     pub(crate) sessions: Option<Json>,
     pub(crate) tools: Option<Vec<String>>,
     pub(crate) message: Option<String>,
-    pub(crate) origin: Option<Origin>,
+    pub(crate) mode: Option<Mode>,
     pub(crate) reason: Option<Rejection>,
     pub(crate) items: Option<Json>,
     pub(crate) queued: Option<Vec<(u64, String)>>,
@@ -492,8 +491,7 @@ struct ItemFields {
     approval: Option<Approval>,
     outcome: Option<Outcome>,
     card: Option<Card>,
-    name: Option<String>,
-    args: Option<String>,
+    by: Option<String>,
     hook: Option<String>,
     #[serde(default, deserialize_with = "present")]
     decision: Option<Json>,
@@ -510,7 +508,7 @@ enum Type {
     Assistant,
     Reply,
     Tool,
-    Command,
+
     Hook,
     Child,
     Environment,
@@ -630,12 +628,7 @@ impl ItemFields {
                 approval: f.approval.take(),
                 outcome: f.outcome.take(),
                 card: f.card.take(),
-            },
-            Type::Command => Item::Command {
-                call: req(f.call.take(), "call")?,
-                name: req(f.name.take(), "name")?,
-                args: req(f.args.take(), "args")?,
-                outcome: f.outcome.take(),
+                by: def(f.by.take())?,
             },
             Type::Hook => Item::Hook {
                 seq: req(f.seq.take(), "seq")?,

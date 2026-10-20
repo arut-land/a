@@ -49,7 +49,6 @@ fn connect(app: &mut App, remote: bool) {
         welcome: Welcome {
             proto: 1,
             caps: Caps::ALL,
-            client: 1,
         },
         remote,
         commands: Vec::new(),

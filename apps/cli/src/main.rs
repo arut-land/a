@@ -410,10 +410,6 @@ impl Screen {
                 Item::Child {
                     fired: Some(outcome),
                     ..
-                }
-                | Item::Command {
-                    outcome: Some(outcome),
-                    ..
                 },
                 Part::Outcome,
             ) => print_outcome(outcome, None),
@@ -485,9 +481,14 @@ fn added(item: &Item) {
         Item::User { text, .. } => println!("you  {text}"),
         Item::Assistant { text, .. } => println!("a    {text}"),
         Item::Tool {
+            tool,
+            input,
+            by: protocol::Audience::User,
+            ..
+        } => println!("cmd  /{tool} {}", Item::args(input)),
+        Item::Tool {
             tool, input, card, ..
         } => println!("tool {}", call_title(tool, input, card.as_ref())),
-        Item::Command { name, args, .. } => println!("cmd  /{name} {args}"),
         Item::Hook {
             hook,
             call,

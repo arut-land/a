@@ -18,9 +18,9 @@ use std::path::{Path, PathBuf};
 use protocol::view::SessionView;
 use protocol::{
     Activity, Audience, Author, Body, CallId, Caps, Card, ClientDecl, ClientId, ClientMsg,
-    ClientSeq, DaemonMsg, Decode, Entry, Environment, HomeSettings, Installed, Mode, Origin,
-    Outcome, PROTO, Permission, Rejection, Residency, Role, Seq, SessionId, SessionSummary,
-    SettingsChange, Target, Verdict, WaitOn,
+    ClientSeq, DaemonMsg, Decode, Entry, Environment, HomeSettings, Installed, Mode, Outcome,
+    PROTO, Permission, Rejection, Residency, Role, Seq, SessionId, SessionSummary, SettingsChange,
+    Target, Verdict, WaitOn,
 };
 use serde_json::json;
 use uuid::Uuid;
@@ -110,6 +110,7 @@ fn client_samples() -> Vec<Sample<ClientMsg>> {
             ClientMsg::Input {
                 text: "hi".into(),
                 client_seq: Some(1),
+                mode: Mode::Queue,
             },
         ),
         sample("list", ClientMsg::List),
@@ -125,15 +126,17 @@ fn client_samples() -> Vec<Sample<ClientMsg>> {
         ),
         sample(
             "steer",
-            ClientMsg::Steer {
+            ClientMsg::Input {
                 text: "also this".into(),
+                mode: Mode::Steer,
                 client_seq: None,
             },
         ),
         sample(
             "steer_numbered",
-            ClientMsg::Steer {
+            ClientMsg::Input {
                 text: "also this".into(),
+                mode: Mode::Steer,
                 client_seq: Some(4),
             },
         ),
@@ -244,6 +247,32 @@ fn input_samples() -> Vec<Sample<DaemonMsg>> {
                     choice: protocol::ToolChoice::Auto,
                     r#for: None,
                     purpose: None,
+                },
+            ),
+        ),
+        sample(
+            "entry_model_call_last",
+            entry(
+                9,
+                Body::ModelCall {
+                    model: "openai:m".into(),
+                    attempt: 0,
+                    choice: protocol::ToolChoice::None,
+                    r#for: None,
+                    purpose: None,
+                },
+            ),
+        ),
+        sample(
+            "entry_model_call_side",
+            entry(
+                10,
+                Body::ModelCall {
+                    model: "openai:m".into(),
+                    attempt: 0,
+                    choice: protocol::ToolChoice::Auto,
+                    r#for: CallId::new(8),
+                    purpose: Some("compact".into()),
                 },
             ),
         ),
@@ -398,10 +427,6 @@ fn daemon_samples() -> Vec<Sample<DaemonMsg>> {
             },
         ),
     ];
-    let origin = Origin {
-        client: 1,
-        client_seq: 2,
-    };
     vec![
         sample(
             "welcome",
@@ -409,7 +434,6 @@ fn daemon_samples() -> Vec<Sample<DaemonMsg>> {
                 proto: PROTO,
                 build: "0.0.0+0123456789abcdef".into(),
                 caps: Caps::NONE,
-                client: 0,
                 commands: Vec::new(),
             },
         ),
@@ -419,7 +443,6 @@ fn daemon_samples() -> Vec<Sample<DaemonMsg>> {
                 proto: PROTO,
                 build: "0.0.0+0123456789abcdef".into(),
                 caps: Caps::NONE,
-                client: 1,
                 commands: vec![protocol::CommandInfo {
                     name: "model".into(),
                     description: "show or set the model".into(),
@@ -667,11 +690,11 @@ fn daemon_samples() -> Vec<Sample<DaemonMsg>> {
             "snapshot",
             DaemonMsg::Snapshot(Box::new(SessionView::from_log(SESSION, "/w".into(), &log))),
         ),
-        sample("ack", DaemonMsg::Ack { origin }),
+        sample("ack", DaemonMsg::Ack { client_seq: 2 }),
         sample(
             "rejected",
             DaemonMsg::Rejected {
-                origin,
+                client_seq: 2,
                 reason: Rejection::NotWaiting,
                 message: "call 9 is not waiting for approval".into(),
             },

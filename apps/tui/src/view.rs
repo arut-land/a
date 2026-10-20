@@ -1,7 +1,7 @@
 //! Transcript items as rows: messages, replies, and tool call cards.
 
 use protocol::view::{Item, Phase, Status, call_title, decision_line, output_text};
-use protocol::{Json, Outcome};
+use protocol::{Audience, Json, Outcome};
 use serde_json::Value;
 
 use ratatui_core::style::{Color, Modifier, Style};
@@ -35,6 +35,33 @@ pub fn settled(item: &Item) -> bool {
     item.phase().is_none_or(Phase::settled)
 }
 
+/// A slash command the user ran, as a card of its own.
+fn command(item: &Item, width: usize, look: Look) -> Vec<Line> {
+    let Item::Tool {
+        call,
+        tool,
+        input,
+        outcome,
+        ..
+    } = item
+    else {
+        return Vec::new();
+    };
+    let title = format!("/{tool} {}", Item::args(input));
+    card(
+        &Card {
+            call: *call,
+            title: title.trim_end().to_owned(),
+            input: None,
+            phase: item.phase().unwrap_or(Phase::Running),
+            outcome: outcome.as_ref(),
+            shown: None,
+        },
+        width,
+        look,
+    )
+}
+
 pub fn rows(item: &Item, width: usize, look: Look) -> Vec<Line> {
     let blank = Line::default();
     match item {
@@ -59,6 +86,9 @@ pub fn rows(item: &Item, width: usize, look: Look) -> Vec<Line> {
             ..
         } => reply(model, text, status, width),
         Item::Tool {
+            by: Audience::User, ..
+        } => command(item, width, look),
+        Item::Tool {
             call,
             tool,
             input,
@@ -77,23 +107,7 @@ pub fn rows(item: &Item, width: usize, look: Look) -> Vec<Line> {
             width,
             look,
         ),
-        Item::Command {
-            call,
-            name,
-            args,
-            outcome,
-        } => card(
-            &Card {
-                call: *call,
-                title: format!("/{name} {args}").trim_end().to_owned(),
-                input: None,
-                phase: item.phase().unwrap_or(Phase::Running),
-                outcome: outcome.as_ref(),
-                shown: None,
-            },
-            width,
-            look,
-        ),
+
         Item::Hook {
             hook,
             call,
@@ -363,6 +377,7 @@ mod tests {
             approval,
             outcome,
             card: None,
+            by: Audience::Model,
         }
     }
 
@@ -482,6 +497,7 @@ mod tests {
                 body: "@@ -2,1 +2,1 @@\n-two\n+2\n".into(),
                 note: "+1 -1".into(),
             }),
+            by: Audience::Model,
         };
         let lines = rows(&item, 40, Look::default());
         assert_eq!(
@@ -499,15 +515,18 @@ mod tests {
 
     #[test]
     fn a_slash_command_shows_as_a_card() {
-        let mut item = Item::Command {
+        let mut item = Item::Tool {
             call: 4,
-            name: "model".into(),
-            args: String::new(),
+            tool: "model".into(),
+            input: Json::encode(&serde_json::json!({ "args": "" })).unwrap(),
+            approval: None,
             outcome: None,
+            card: None,
+            by: Audience::User,
         };
         assert!(!settled(&item));
         assert_eq!(rows_of(&item, Look::default())[1], "• /model  running…");
-        if let Item::Command { outcome, .. } = &mut item {
+        if let Item::Tool { outcome, .. } = &mut item {
             *outcome = Some(Outcome::Failed {
                 error: "no command /model".into(),
             });
