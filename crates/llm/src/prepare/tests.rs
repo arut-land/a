@@ -262,7 +262,7 @@ fn separate_turns_keep_distinct_ids_and_all_results_even_with_native_calls() {
                 },
             );
             let mut ids = Vec::new();
-            for pair in out.messages.chunks_exact(2) {
+            for pair in out.messages.as_chunks::<2>().0 {
                 let Message::Assistant(assistant) = &pair[0] else {
                     panic!()
                 };
