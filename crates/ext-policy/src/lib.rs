@@ -195,27 +195,25 @@ pub struct Rule {
 }
 
 impl Floor {
-    /// The floor of rules `(tool, input, effect)`, `effect` `ask` or
-    /// `deny`; a rule that allows is refused.
-    pub fn new(
-        rules: impl IntoIterator<Item = (String, Option<String>, String)>,
-    ) -> Result<Self, String> {
+    /// The floor of the operator's rules; one that allows is refused.
+    pub fn new(rules: impl IntoIterator<Item = sys::config::Rule>) -> Result<Self, String> {
+        use sys::config::Effect;
         let rules = rules
             .into_iter()
-            .map(|(tool, input, effect)| {
-                let effect = match effect.as_str() {
-                    "ask" => Permission::Ask,
-                    "deny" => Permission::Deny,
-                    "allow" => {
+            .map(|rule| {
+                let effect = match rule.effect {
+                    Effect::Ask => Permission::Ask,
+                    Effect::Deny => Permission::Deny,
+                    Effect::Allow => {
                         return Err(format!(
-                            "a floor rule for {tool} allows: the floor may only ask or deny"
+                            "a floor rule for {} allows: the floor may only ask or deny",
+                            rule.tool
                         ));
                     }
-                    other => return Err(format!("no effect {other}: ask or deny")),
                 };
                 Ok(Rule {
-                    tool,
-                    input,
+                    tool: rule.tool,
+                    input: rule.input,
                     effect,
                 })
             })
