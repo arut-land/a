@@ -189,14 +189,10 @@ impl App {
     /// works; its glyph turns with the clock.
     fn working_row(&mut self, width: usize) -> Option<Line> {
         if !self.working() {
-            self.since = None;
             return None;
         }
-        let spent = self.tokens.output;
-        let (began, before) = *self
-            .since
-            .get_or_insert_with(|| (std::time::Instant::now(), spent));
-        let elapsed = began.elapsed();
+        let spent = self.tokens.output.saturating_sub(self.clock.before);
+        let elapsed = self.clock.elapsed();
         let secs = elapsed.as_secs();
         let glyph =
             SPINNER[usize::try_from(elapsed.as_millis() / 125).unwrap_or(0) % SPINNER.len()];
@@ -205,8 +201,8 @@ impl App {
         } else {
             format!("{secs}s")
         };
-        if spent > before {
-            let _ = write!(note, " · ↓ {} tokens", spent - before);
+        if spent > 0 {
+            let _ = write!(note, " · ↓ {spent} tokens");
         }
         note.push_str(" · esc to interrupt");
         Some(Line::from([

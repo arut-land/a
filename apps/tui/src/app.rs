@@ -98,9 +98,7 @@ pub struct App {
     summary: Option<Summary>,
     /// Tokens the session's model calls used, summed as replies arrive.
     tokens: Usage,
-    /// While a turn works: when it began and the output tokens spent
-    /// before it, for the working indicator.
-    since: Option<(std::time::Instant, u64)>,
+    clock: WorkingClock,
     /// Inline: the items already printed into the scrollback.
     committed: usize,
     /// The attach asked for the latest session: if there is none, the
@@ -108,6 +106,40 @@ pub struct App {
     resuming: bool,
     /// A frame is owed: something a frame shows changed since the last.
     redraw: bool,
+}
+
+// Calls in one turn can settle between frames or wait for approval.
+// Preserve their active time and usage without keeping a timer alive.
+#[derive(Default)]
+struct WorkingClock {
+    turn: u64,
+    since: Option<std::time::Instant>,
+    elapsed: std::time::Duration,
+    before: u64,
+}
+
+impl WorkingClock {
+    fn sync(&mut self, turn: u64, active: bool, spent: u64) {
+        if self.turn != turn {
+            *self = Self {
+                turn,
+                before: spent,
+                ..Self::default()
+            };
+        }
+        if active {
+            self.since.get_or_insert_with(std::time::Instant::now);
+        } else if let Some(began) = self.since.take() {
+            self.elapsed += began.elapsed();
+        }
+    }
+
+    fn elapsed(&self) -> std::time::Duration {
+        self.elapsed
+            + self
+                .since
+                .map_or(std::time::Duration::ZERO, |t| t.elapsed())
+    }
 }
 
 /// The keys; help lists the slash commands after them.
@@ -158,7 +190,7 @@ impl App {
             rule: Line::default(),
             summary: None,
             tokens: Usage::default(),
-            since: None,
+            clock: WorkingClock::default(),
             committed: 0,
             resuming: matches!(target, Target::Latest { .. }),
             redraw: true,
@@ -246,6 +278,7 @@ impl App {
                     self.anchor = None;
                     self.committed = 0;
                     self.tokens = Usage::default();
+                    self.clock = WorkingClock::default();
                     self.recap_hidden = false;
                     self.flash = None;
                 }
@@ -610,14 +643,11 @@ impl Renderer for App {
                 }
             }
         }
-        if self.working() {
-            self.since
-                .get_or_insert_with(|| (std::time::Instant::now(), self.tokens.output));
-        } else {
-            // Several turns can settle between frames; none may inherit
-            // the preceding turn's clock.
-            self.since = None;
-        }
+        self.clock.sync(
+            self.client.view().ledger.turn_start(),
+            self.working(),
+            self.tokens.output,
+        );
         asked
     }
 }

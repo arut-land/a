@@ -1083,7 +1083,7 @@ fn no_timer_runs_unless_a_turn_is_working() {
         !busy.needs_frame(),
         "a finished turn cannot schedule animation"
     );
-    assert!(busy.since.is_none());
+    assert!(busy.clock.since.is_none());
 }
 
 #[test]
@@ -1159,7 +1159,7 @@ fn inline_review_expands_finished_cards_without_printing_history_twice() {
                 output: Json::encode(&json!({"output":"done", "exit":0})).unwrap(),
             },
             card: Some(Card {
-                body: (1..=30).map(|n| format!("output {n}\n")).collect(),
+                body: (1..=30).fold(String::new(), |s, n| s + &format!("output {n}\n")),
                 note: "exit 0".into(),
                 ..Card::default()
             }),
@@ -1177,4 +1177,64 @@ fn inline_review_expands_finished_cards_without_printing_history_twice() {
     press(&mut app, Key::Ctrl('o'));
     assert!(app.anchor.is_none());
     assert_eq!(app.scrollback(80).len(), 0);
+}
+
+#[test]
+fn a_turn_keeps_its_active_time_and_tokens_across_calls_but_not_idle_time() {
+    let (mut app, _) = app(
+        Viewport::Full,
+        &[
+            entry(
+                1,
+                Body::Input {
+                    text: "hi".into(),
+                    mode: protocol::Mode::Queue,
+                    taken: true,
+                    origin: None,
+                },
+            ),
+            entry(
+                2,
+                Body::ModelCall {
+                    model: "m".into(),
+                    attempt: 0,
+                    choice: protocol::ToolChoice::Auto,
+                    r#for: None,
+                    purpose: None,
+                },
+            ),
+        ],
+    );
+    app.clock.elapsed = std::time::Duration::from_secs(3);
+    app.fold(&entry(3, Body::ModelResult {
+        call:CallId::new(2).unwrap(),
+        outcome:Outcome::Done {output:Json::encode(&json!({"message":{"content":[{"type":"text","text":"hi"}]},"usage":{"input":12,"output":3}})).unwrap()},
+    }));
+    assert!(!app.working());
+    assert!(app.clock.since.is_none());
+    let elapsed = app.clock.elapsed();
+    app.fold(&entry(
+        4,
+        Body::ToolCall {
+            tool: "bash".into(),
+            input: Json::encode(&json!({"command":"true"})).unwrap(),
+            id: None,
+            card: None,
+            by: Audience::Model,
+        },
+    ));
+    assert_eq!(app.clock.elapsed, elapsed);
+    let (_, rows) = frame(&mut app, 80, 24);
+    find(&rows, "Working… (3s · ↓ 3 tokens");
+    app.fold(&entry(
+        5,
+        Body::Input {
+            text: "next".into(),
+            mode: protocol::Mode::Queue,
+            taken: true,
+            origin: None,
+        },
+    ));
+    assert_eq!(app.clock.before, 3);
+    assert_eq!(app.clock.elapsed, std::time::Duration::ZERO);
 }
