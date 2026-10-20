@@ -249,7 +249,12 @@ pub struct Session {
     driver: Driver,
     /// Numbering and pumping share this lock; publishing takes only the feed.
     sending: Arc<Mutex<()>>,
+    #[cfg(test)]
+    before_pump: Arc<Mutex<Option<BeforePump>>>,
 }
+
+#[cfg(test)]
+type BeforePump = Box<dyn FnOnce() + Send>;
 
 /// The feed as the driver's pump renders through it: locked only while it
 /// shows, so the driver's I/O never runs under the lock the reader thread
@@ -288,6 +293,8 @@ impl Session {
             feed,
             driver,
             sending,
+            #[cfg(test)]
+            before_pump: Arc::default(),
         }
     }
 
@@ -427,9 +434,15 @@ impl Session {
     ) -> Result<(), ClientError> {
         let (feed, driver) = (Arc::clone(&self.feed), self.driver.clone());
         let sending = Arc::clone(&self.sending);
+        #[cfg(test)]
+        let before_pump = Arc::clone(&self.before_pump);
         blocking(move || {
             let _sending = lock(&sending);
             let effects = intent(&mut lock(&feed).client)?;
+            #[cfg(test)]
+            if let Some(pause) = lock(&before_pump).take() {
+                pause();
+            }
             driver.pump(&mut Published(&feed), effects);
             Ok(())
         })
@@ -481,8 +494,7 @@ mod tests {
 
     use super::*;
 
-    #[test]
-    fn numbered_input_and_reconnect_replay_cannot_overtake_a_paused_send() {
+    fn fixture() -> (Session, Home, PathBuf, sys::Listener) {
         let root = std::env::temp_dir().join(format!("a-ffi-order-{}", SessionId::new()));
         std::fs::create_dir_all(&root).unwrap();
         let home = Home::from(root.join("home"));
@@ -494,6 +506,25 @@ mod tests {
             daemon: Daemon::local(home.clone(), staged),
             home: home.clone(),
         });
+        (session, home, root, listener)
+    }
+
+    fn paused_input(
+        session: &Session,
+        text: &str,
+        entered: mpsc::Sender<()>,
+        release: mpsc::Receiver<()>,
+    ) {
+        *lock(&session.before_pump) = Some(Box::new(move || {
+            entered.send(()).unwrap();
+            release.recv().unwrap();
+        }));
+        rt::block_on(session.send(text.to_owned())).unwrap();
+    }
+
+    #[test]
+    fn numbered_input_and_reconnect_replay_cannot_overtake_a_paused_send() {
+        let (session, home, root, listener) = fixture();
         session
             .open(OpenTarget::Id {
                 id: SessionId::new().to_string(),
@@ -532,13 +563,7 @@ mod tests {
         thread::scope(|scope| {
             let session = &session;
             let first = scope.spawn(move || {
-                rt::block_on(session.intend(move |client| {
-                    let effects = client.offer()?.input("first".into());
-                    numbered.send(()).unwrap();
-                    released.recv().unwrap();
-                    Ok(effects)
-                }))
-                .unwrap()
+                paused_input(session, "first", numbered, released);
             });
             numbering.recv().unwrap();
             let serialized = session.sending.try_lock().is_err();
@@ -572,13 +597,7 @@ mod tests {
         thread::scope(|scope| {
             let session = &session;
             let input = scope.spawn(move || {
-                rt::block_on(session.intend(move |client| {
-                    let effects = client.offer()?.input("during reconnect".into());
-                    queued.send(()).unwrap();
-                    released.recv().unwrap();
-                    Ok(effects)
-                }))
-                .unwrap()
+                paused_input(session, "during reconnect", queued, released);
             });
             queueing.recv().unwrap();
             // Connected competes with the input while its numbering/pump lock is held.
