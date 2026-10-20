@@ -112,8 +112,8 @@ a.tool{
 
 The capability does not authorize an effect. Delegation runs the target's
 `pre_tool`, permission, approval and `post_tool` hooks; shell spawning also
-runs its normal spawn hooks. A deny or defer fails the call. An ask that needs
-the client's approval is currently refused rather than bypassed. Configure
+runs its normal spawn hooks. A deny or defer fails the call. Synchronous approval answers are honored. A request requiring a later approval,
+including the client's, is currently refused. Configure
 policy deliberately for delegated tools that should run without interaction.
 Delegated work shares its parent's durable call identity and progress; it does
 not create an independent tool intent. Delegation depth is capped at eight.
@@ -144,5 +144,5 @@ pattern functions are omitted because they cannot be interrupted by the hook.
 Each invocation may send at most 128 host operations and 1 MiB of outbound
 progress, state changes and delegated input, which the Lua allocator cannot
 account for. JSON is bounded to 256 KiB, 64 levels and 8192 nodes; repeated table identities
-are rejected. Source is capped at 256 KiB, text at 8 KiB, and a workspace and
-mod each have at most 128 mods/contributions respectively.
+are rejected. Source is capped at 256 KiB, text at 8 KiB, and a workspace loads at most 128 mods. A mod registers at most 128
+contributions.

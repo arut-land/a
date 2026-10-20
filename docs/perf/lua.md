@@ -99,3 +99,67 @@ release binary and run the ignored test with/without `LUA_PROBE_LOADED=1`.
 `measure.py` retains the exact local commands and paths; `results.txt` and
 `startup.json` retain the raw results. Delete temporary binaries and target
 directories afterward.
+
+## Implementation and final verification
+
+The complete implementation uses mlua's `lua54`, `vendored`, `send`, `async`
+and `serde` features. The CLI feature is `lua`, currently opt-in.
+
+| Release configuration after merging main | Bytes | KiB, as `mise run size` displays |
+| --- | ---: | ---: |
+| Default, before this work | 2963552 | 2894 |
+| Default, after this work | 2963664 | 2894 |
+| Lua enabled | 3487536 | 3405 |
+| Lua enabled with fixtures | 3504128 | 3421 |
+
+The minimum adapter comparison above excludes JSON value conversion, the
+sandbox, loader and full primitive implementations; these final sizes include
+all of them. Both Lua builds remain below 4194304 bytes.
+
+The SDK changes are general seams: fallible erased handlers apply the point's
+`ON_ERROR` without a Rust panic; `DynFold` registers JSON state named at run
+time; workspace `Sources` return registry generations; delegated calls use
+existing policy hooks. Agent JSON codecs live in the SDK that owns their
+large types. There are no Lua settings in the kernel or engine.
+
+Final validation after merging main:
+
+- `mise run check`: 811 tests passed, 25 skipped.
+- `mise run acceptance`: 12 passed; `mise run test:web`: 5 passed.
+- Lua feature: 17 CLI unit tests and 6 black-box tests passed; 12 runtime
+  invariant tests are included in the workspace check.
+- `mise run size`, `deny`, `machete`, `check:no-tokio`: passed.
+- `mise run check:windows`, plus CLI clippy with `--features lua`: passed.
+  This Mac needed C headers and a COFF archiver for vendored Lua. The first
+  plain cross check failed on missing `errno.h`; the successful check used
+  `mise exec cargo:cargo-xwin@latest` (0.23.1), its clang backend/sysroot and
+  rustup's LLVM tools (`llvm-lib` driver via `llvm-ar`). No platform cfg was
+  added above sys/rt. This checks compilation, not Windows execution.
+- `mise run budgets`: all four strict checks passed. The final Lua release
+  with no mods also passed all four strict checks, one test at a time.
+
+| Strict budget observation | Default | Lua enabled, no mods |
+| --- | ---: | ---: |
+| Cold first daemon reply, median | 17.47 ms | 16.63 ms |
+| Process floor | 1.58 ms | 1.45 ms |
+| Attach p99 | 0.433 ms | 0.178 ms |
+| Idle daemon RSS | 8448 KiB | 8688 KiB |
+| TUI first frame, median | 5.60 ms | 5.53 ms |
+
+An earlier Lua budget run failed cold start at 62.82 ms (6.77 ms floor) while
+other worktrees compiled and load exceeded 14. A repeat passed all four;
+the final observations above are from the rebuilt, quota-limited runtime.
+Load averages were still elevated (11.38/12.19/10.43) before the final run.
+These passing checks do not turn the experiment into a controlled quiet-machine
+comparison. Lua remains opt-in pending that repeat.
+
+The first-mod RSS deltas above include code pages and allocator effects; they
+are not linear per-mod heap estimates. Piccolo's ownership constraint was also
+confirmed with a compile check: `assert_send::<piccolo::Lua>()` is rejected
+because its arena's metrics contain a non-Send `Rc`.
+
+Interactive or deferred approval for a *delegated* `cx.tool` call remains
+unsupported: a pending ask is refused. Lua agent tool actions use normal engine
+approval. Arbitrary Rust trait services stay on the typed side; Lua delegates
+to named tools as its service interface. The active-poll time limit is checked
+by instruction hooks, not an OS-enforced hard deadline for native code.
