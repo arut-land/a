@@ -21,12 +21,6 @@ struct VarRow: Identifiable {
     let id = UUID()
     var name: String
     var value: String
-
-    /// Shown masked: the names the daemon treats as secrets look like this.
-    var secret: Bool {
-        let name = name.uppercased()
-        return ["KEY", "TOKEN", "SECRET", "PASSWORD", "CREDENTIAL"].contains { name.contains($0) }
-    }
 }
 
 struct ModelSettings: View {
@@ -55,7 +49,8 @@ struct ModelSettings: View {
                         TextField("Name", text: $row.name, prompt: Text("NAME"))
                             .font(.body.monospaced())
                             .frame(width: 180)
-                        if row.secret {
+                        // Masked by the daemon's rule for what it keeps out of its logs.
+                        if model.client?.isSecretName(name: row.name) == true {
                             SecureField("Value", text: $row.value, prompt: Text("value"))
                         } else {
                             TextField("Value", text: $row.value, prompt: Text("value"))

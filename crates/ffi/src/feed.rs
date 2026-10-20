@@ -1,36 +1,31 @@
 //! A session client behind a stream: what it tells the app goes out as
 //! numbered changes, and the latest are kept so a client that missed some
 //! can catch up without a full snapshot. The app renders the changes; every
-//! rule (what runs, what waits, what the controls offer) comes computed.
+//! rule (what runs, what waits, what the controls offer, whose reply is
+//! streaming) comes computed.
 
 use std::collections::VecDeque;
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 
 use boltffi::{EventSubscription, StreamProducer, export};
-use client::{Effect, Event, SessionClient, Welcome};
+use client::{ConnId, Effect, Event, EventKind, Renderer, SessionClient, Show, Welcome};
 use protocol::{Caps, DaemonMsg, Decode};
 
-use crate::{
-    ClientError, Resync, SessionSnapshot, ToolOutcome, TurnInfo, ViewChange, ViewItem, ViewUpdate,
-};
+use crate::{ClientError, Resync, SessionSnapshot, TurnInfo, ViewChange, ViewUpdate};
 
 /// How many updates a stream buffers for a slow reader before it drops.
 const BUFFER: usize = 1024;
 
-/// How many recent updates [`Feed::resync`] can hand back, and about how
-/// many bytes of text they may hold: a tool's outcome carries its output
-/// twice (as JSON and as shown), so a long session's last few hundred
-/// updates could otherwise keep tens of megabytes.
+/// How many recent updates [`Feed::resync`] can hand back. An item crosses
+/// whole once and is patched after, so what they keep is about what the
+/// transcript holds.
 const KEPT: usize = 512;
-const KEPT_BYTES: usize = 4 << 20;
 
 pub(crate) struct Feed {
     pub client: SessionClient,
     /// The number of the last update published.
     rev: u64,
     recent: VecDeque<ViewUpdate>,
-    /// What [`weight`] puts on `recent`.
-    recent_bytes: usize,
     producer: StreamProducer<ViewUpdate>,
 }
 
@@ -40,7 +35,6 @@ impl Feed {
             client,
             rev: 0,
             recent: VecDeque::with_capacity(KEPT),
-            recent_bytes: 0,
             producer: StreamProducer::new(BUFFER),
         }
     }
@@ -49,53 +43,22 @@ impl Feed {
         self.producer.subscribe()
     }
 
-    /// Steps the client with `event`, publishing what it tells the app;
-    /// returns what the driver is to do.
-    pub fn step(&mut self, event: Event) -> Vec<Effect> {
-        let effects = self.client.step(event);
-        self.absorb(effects)
-    }
-
-    /// Publishes the app's effects, handing back the driver's.
-    pub fn absorb(&mut self, effects: Vec<Effect>) -> Vec<Effect> {
-        let mut io = Vec::new();
-        for effect in effects {
-            let change = match effect {
-                Effect::View(update) => ViewChange::of(&update.change, self.client.view()),
-                Effect::Link => ViewChange::Link {
-                    state: self.client.link().into(),
-                },
-                Effect::Notice(message) => ViewChange::Error { message },
-                Effect::Sessions => continue,
-                effect => {
-                    io.push(effect);
-                    continue;
-                }
-            };
-            self.publish(change);
-        }
-        io
-    }
-
-    fn publish(&mut self, change: ViewChange) -> &ViewUpdate {
+    fn publish(&mut self, change: ViewChange) {
         self.rev += 1;
+        let view = self.client.view();
         let update = ViewUpdate {
             rev: self.rev,
-            seq: self.client.view().seq,
+            seq: view.seq,
             change,
             turn: self.client.turn().into(),
-            title: self.client.view().title.clone(),
+            streaming: view.streaming.as_ref().map(|s| s.call),
+            title: view.title.clone(),
         };
         self.producer.push(update.clone());
-        self.recent_bytes += weight(&update.change);
-        self.recent.push_back(update);
-        while self.recent.len() > KEPT || (self.recent.len() > 1 && self.recent_bytes > KEPT_BYTES)
-        {
-            if let Some(old) = self.recent.pop_front() {
-                self.recent_bytes -= weight(&old.change);
-            }
+        if self.recent.len() == KEPT {
+            self.recent.pop_front();
         }
-        &self.recent[self.recent.len() - 1]
+        self.recent.push_back(update);
     }
 
     pub fn snapshot(&self) -> SessionSnapshot {
@@ -123,37 +86,23 @@ impl Feed {
     }
 }
 
-/// About how many bytes of text `change` holds.
-fn weight(change: &ViewChange) -> usize {
-    match change {
-        ViewChange::Added { item, .. } | ViewChange::Updated { item, .. } => item_weight(item),
-        ViewChange::Snapshot { items } => items.iter().map(item_weight).sum(),
-        ViewChange::Delta { text, .. } => text.len(),
-        _ => 0,
-    }
-}
-
-fn item_weight(item: &ViewItem) -> usize {
-    let outcome = |o: &Option<ToolOutcome>| match o {
-        Some(ToolOutcome::Done { output_json, shown }) => {
-            output_json.len() + shown.as_ref().map_or(0, |s| s.text.len())
+/// Publishes what the client shows.
+impl Renderer for Feed {
+    fn show(&mut self, shown: Vec<Show>) -> Vec<Effect> {
+        for show in shown {
+            let change = match show {
+                Show::View(update) => ViewChange::of(&update.change, self.client.view()),
+                Show::Link => ViewChange::Link {
+                    state: self.client.link().into(),
+                },
+                Show::Notice(notice) => ViewChange::Error {
+                    message: notice.to_string(),
+                },
+                Show::Sessions => continue,
+            };
+            self.publish(change);
         }
-        Some(ToolOutcome::Failed { error }) => error.len(),
-        _ => 0,
-    };
-    match item {
-        ViewItem::User { text, .. }
-        | ViewItem::Assistant { text, .. }
-        | ViewItem::Reply { text, .. } => text.len(),
-        ViewItem::Tool {
-            input_json,
-            outcome: o,
-            card,
-            ..
-        } => input_json.len() + outcome(o) + card.as_ref().map_or(0, |c| c.body.len()),
-        ViewItem::Command { outcome: o, .. } | ViewItem::Child { fired: o, .. } => outcome(o),
-        ViewItem::Hook { decision_json, .. } => decision_json.len(),
-        ViewItem::Environment { .. } => 0,
+        Vec::new()
     }
 }
 
@@ -179,14 +128,16 @@ impl Reducer {
     pub fn new() -> Self {
         let mut client = SessionClient::new(client::Env::Keep);
         client.open(protocol::Target::New);
-        client.step(Event::Connected {
-            id: 1,
-            welcome: Welcome {
-                proto: protocol::PROTO,
-                caps: Caps::ALL,
+        client.step(Event {
+            conn: ConnId(1),
+            kind: EventKind::Connected {
+                welcome: Welcome {
+                    proto: protocol::PROTO,
+                    caps: Caps::ALL,
+                },
+                remote: false,
+                commands: Vec::new(),
             },
-            remote: false,
-            commands: Vec::new(),
         });
         Self {
             feed: Mutex::new(Feed::new(client)),
@@ -200,14 +151,17 @@ impl Reducer {
             message: e.to_string(),
         })?;
         let mut feed = lock(&self.feed);
-        let effects = feed.client.step(Event::Msg { id: 1, msg });
+        let effects = feed.client.step(Event {
+            conn: ConnId(1),
+            kind: EventKind::Msg(msg),
+        });
         // As a view alone: no link to change.
         let shown = effects
             .into_iter()
-            .filter(|e| matches!(e, Effect::View(_)))
+            .filter(|e| matches!(e, Effect::Show(Show::View(_))))
             .collect();
         let rev = feed.rev;
-        feed.absorb(shown);
+        client::pump(|_| Ok(()), &mut *feed, shown);
         Ok((feed.rev > rev).then(|| feed.recent[feed.recent.len() - 1].clone()))
     }
 
