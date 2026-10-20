@@ -1,4 +1,4 @@
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
 use std::io;
 use std::ops::RangeInclusive;
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
@@ -12,7 +12,7 @@ use super::{Header, LeaseAuthority, Lines, Loaded, Local, Log, LogStore, Writer,
 #[derive(Default)]
 pub struct Memory {
     sessions: Mutex<HashMap<SessionId, Stored>>,
-    busy: Mutex<HashSet<SessionId>>,
+
     leases: Local,
 }
 
@@ -82,22 +82,9 @@ impl LogStore for Memory {
         self.shared(id)?.entries()
     }
 
+    #[cfg(test)]
     fn count(&self, id: SessionId) -> io::Result<u64> {
         Ok(lock(&self.shared(id)?.0).len() as u64)
-    }
-
-    fn mark_busy(&self, id: SessionId, busy: bool) -> io::Result<()> {
-        let mut marked = lock(&self.busy);
-        if busy {
-            marked.insert(id);
-        } else {
-            marked.remove(&id);
-        }
-        Ok(())
-    }
-
-    fn is_busy(&self, id: SessionId) -> bool {
-        lock(&self.busy).contains(&id)
     }
 }
 

@@ -34,6 +34,20 @@ pub enum Replay {
     Unsafe,
 }
 
+/// Whether a call runs alongside the other calls of its turn. The calls
+/// of one reply start together while each is shared; an exclusive one
+/// waits until none runs, and those after it wait for it, so it never
+/// overlaps another.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum Concurrency {
+    /// It changes nothing another call reads, or works elsewhere.
+    Shared,
+    /// It may change what another call reads: files, the working
+    /// directory.
+    #[default]
+    Exclusive,
+}
+
 /// What a user's command is given: the text after its name.
 #[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, serde::Deserialize)]
 pub struct Args {
@@ -47,12 +61,13 @@ impl Schema for Args {
     }
 }
 
-/// What the kernel knows of a callable: who may call it, and whether a
-/// call a crash cut off runs again.
+/// What the kernel knows of a callable: who may call it, whether a call a
+/// crash cut off runs again, and whether it runs alongside others.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Callable {
     pub audience: Audience,
     pub replay: Replay,
+    pub concurrency: Concurrency,
 }
 
 /// Where a call runs: tools run in the daemon, and later ones may run in
@@ -216,7 +231,7 @@ impl Cx {
         self.host.own(pgid, Box::pin(ended));
     }
 
-    /// Commits `text` as more of the call's output, for clients to show as
+    /// Logs `text` as more of the call's output, for clients to show as
     /// it runs and for the call's outcome should it be interrupted.
     pub fn progress(&self, text: &str) {
         self.host.progress(text);
@@ -287,6 +302,8 @@ pub trait Tool: Send + Sync + 'static {
     const AUDIENCE: Audience = Audience::Model;
     /// How a call left dangling by a crash is finished.
     const REPLAY: Replay = Replay::Unsafe;
+    /// Whether its calls run alongside others of the turn.
+    const CONCURRENCY: Concurrency = Concurrency::Exclusive;
     const ROUTE: Route = Route::Local;
 
     /// Runs a call. What it returns is its shape ([`Output`]): a
@@ -367,6 +384,7 @@ pub trait DynTool: Send + Sync {
     fn description(&self) -> &str;
     fn audience(&self) -> Audience;
     fn replay(&self) -> Replay;
+    fn concurrency(&self) -> Concurrency;
     fn route(&self) -> Route;
     /// How the tool is offered to the model, its schema written now.
     fn spec(&self) -> llm::Tool;
@@ -402,6 +420,10 @@ where
 
     fn replay(&self) -> Replay {
         T::REPLAY
+    }
+
+    fn concurrency(&self) -> Concurrency {
+        T::CONCURRENCY
     }
 
     fn route(&self) -> Route {

@@ -57,7 +57,7 @@ impl Loaded {
     #[cfg(test)]
     pub fn append(&mut self, body: protocol::Body) -> io::Result<Entry> {
         let mut entry = [Entry::new(self.seq + 1, 0, body)];
-        self.writer.append(&mut entry)?;
+        self.writer.append(&mut entry, true)?;
         let [entry] = entry;
         self.seq = entry.seq;
         Ok(entry)
@@ -87,12 +87,17 @@ impl Writer {
         self.log.read_only()
     }
 
-    /// Appends `entries`, each stamped with the lease's epoch, durably.
-    pub fn append(&mut self, entries: &mut [Entry]) -> io::Result<()> {
+    /// Appends `entries`, each stamped with the lease's epoch: durably, or
+    /// only written, to be durable with the next durable append.
+    pub fn append(&mut self, entries: &mut [Entry], durable: bool) -> io::Result<()> {
         for e in &mut *entries {
             e.epoch = self.epoch;
         }
-        self.log.append_all(entries)
+        if durable {
+            self.log.append_all(entries)
+        } else {
+            self.log.write_all(entries)
+        }
     }
 }
 
@@ -118,14 +123,8 @@ pub trait LogStore: Send + Sync {
     fn entries(&self, id: SessionId) -> io::Result<Vec<Entry>>;
 
     /// The number of committed entries, without loading them.
+    #[cfg(test)]
     fn count(&self, id: SessionId) -> io::Result<u64>;
-
-    /// Marks a session as having work in flight. A marker that survives a
-    /// crash tells the next daemon to load that session at once and recover.
-    /// Setting or clearing it twice is harmless.
-    fn mark_busy(&self, id: SessionId, busy: bool) -> io::Result<()>;
-
-    fn is_busy(&self, id: SessionId) -> bool;
 }
 
 /// One session's appender.
@@ -135,6 +134,13 @@ pub trait Log: Send {
     /// backend may make them durable together. After a crash the log holds
     /// a prefix of them, and after a failure none.
     fn append_all(&mut self, entries: &[Entry]) -> io::Result<()>;
+
+    /// Appends `entries` in order, to be read back at once and made
+    /// durable by the next [`Log::append_all`]: a crash before it may lose
+    /// them, and nothing after them.
+    fn write_all(&mut self, entries: &[Entry]) -> io::Result<()> {
+        self.append_all(entries)
+    }
 
     fn read_only(&self) -> Option<ReadOnly> {
         None

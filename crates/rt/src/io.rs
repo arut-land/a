@@ -109,6 +109,15 @@ impl<T: std::os::fd::AsFd> Async<T> {
     }
 }
 
+#[cfg(unix)]
+impl<T: std::os::fd::AsFd> Async<T> {
+    /// Registers socket `io`, in non-blocking mode: [`Async::new`], by the
+    /// name Windows registers a socket by.
+    pub fn socket(reactor: &Reactor, io: T) -> io::Result<Self> {
+        Self::new(reactor, io)
+    }
+}
+
 #[cfg(windows)]
 impl<T: std::os::windows::io::AsHandle> Async<T> {
     /// A handle's I/O (a named pipe's) completes through IOCP rather than

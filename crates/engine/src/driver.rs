@@ -17,6 +17,7 @@ use std::sync::{Arc, Mutex, OnceLock};
 use std::task::Poll;
 use std::time::Instant;
 
+use crate::catalog::Record;
 use crate::store::{Header, Parent, Writer};
 use ext::host::{Host, Parts, Registry};
 use ext::point::{Approving, Failed, View};
@@ -24,7 +25,9 @@ use ext::{
     Asked, BoxFuture, Callable, Called, Cancel, Chained, Cx, Facts, Gated, Gating, Name, Parsed,
     PointCx, Recover, Route, States,
 };
-use kernel::{Answer, Core, Effect, Effects, Event, Load, Note, Owner, Replied, Ticket};
+use kernel::{
+    Answer, Core, Durability, Effect, Effects, Event, Load, Note, Owner, Replied, Ticket,
+};
 use protocol::view::SessionView;
 use protocol::{
     Author, Body, CallId, Card, DaemonMsg, Entry, Environment, Frame, Installed, Json, Mode,
@@ -42,6 +45,8 @@ pub struct Shared {
     /// Where actors and effects run, sleep and block.
     pub rt: rt::Rt,
     pub store: Arc<dyn crate::store::LogStore>,
+    /// How every session lists, and which are busy.
+    pub catalog: crate::catalog::Catalog,
     /// The extensions, as each session takes them up at its next step.
     pub registry: ext::host::Current,
     pub models: Models,
@@ -157,6 +162,14 @@ enum Msg {
     Barrier(oneshot::Sender<()>),
 }
 
+impl Msg {
+    /// Whether taking it reads what the session committed: a client's
+    /// replay, the conversation a side request asks for.
+    const fn reads_the_log(&self) -> bool {
+        matches!(self, Self::Attach(..) | Self::Side { .. })
+    }
+}
+
 /// The end of a session's actor: over once its writer is closed, so a
 /// reload never makes a second.
 #[derive(Clone, Default)]
@@ -219,7 +232,11 @@ impl Live {
         // Each entry is folded as it is read and dropped.
         let mut states = registry.states();
         let loaded = match open {
-            Open::Create => shared.store.create(header)?,
+            Open::Create => {
+                let created = shared.store.create(header)?;
+                shared.catalog.record(Record::new(header.clone()));
+                created
+            }
             Open::Load => shared.store.load(header.id, &mut |e| {
                 states.apply(&e);
                 core.load(&e);
@@ -229,7 +246,8 @@ impl Live {
         *lock(&session.env) = core.ledger().env().cloned();
         *lock(&session.overrides) = core.ledger().settings();
         let fresh = lock(&shared.loaded).insert(header.id);
-        let busy = shared.store.is_busy(header.id);
+        let listed = (shared.catalog.get(header.id)).unwrap_or_else(|| Record::new(header.clone()));
+        let busy = listed.busy;
         let load = Load {
             boot: sys::boot_id(),
             fresh,
@@ -277,7 +295,7 @@ impl Live {
             tickets: 0,
             reporting: 0,
             stopping: false,
-            marked: busy,
+            listed,
         };
         shared.rt.spawn(Box::pin(actor.run(rx, first)));
         Ok(live)
@@ -293,15 +311,27 @@ impl Live {
     /// Asks the actor for `request`, and returns once what it logged is
     /// committed: `Err` is why it was refused.
     pub async fn request(&self, request: Request, origin: Option<Author>) -> Result<(), String> {
+        self.ask(request, origin).await
+    }
+
+    /// Sends the actor `request` now, in order with what was sent before
+    /// it; the future is its answer.
+    pub fn ask(
+        &self,
+        request: Request,
+        origin: Option<Author>,
+    ) -> impl Future<Output = Result<(), String>> + Send + 'static {
         let (reply, answer) = oneshot::channel();
         self.send(Msg::Request {
             request,
             origin,
             reply,
         });
-        answer
-            .await
-            .unwrap_or_else(|| Err("the session stopped".to_owned()))
+        async move {
+            answer
+                .await
+                .unwrap_or_else(|| Err("the session stopped".to_owned()))
+        }
     }
 
     /// Sends `client`, which has the entries up to `since`, what it missed
@@ -427,40 +457,76 @@ struct Actor {
     /// Tool and model calls in flight, each of which reports once.
     reporting: usize,
     stopping: bool,
-    /// Whether the store's busy marker is set: while work is in flight, or
-    /// a call waits on someone, so the next daemon loads the session at
-    /// once to recover it or to list what it waits on. Set before work
-    /// starts, cleared after it ends.
-    marked: bool,
+    /// The session as the catalog last heard of it: busy while work is in
+    /// flight, or a call waits on someone. Set before work starts, cleared
+    /// after it ends.
+    listed: Record,
 }
 
 impl Actor {
     async fn run(mut self, mail: channel::Receiver<Msg>, first: Effects) {
         self.carry(first).await;
+        let mut next = None;
         while !(self.stopping && self.reporting == 0)
-            && let Some(msg) = mail.recv().await
-        {
-            // Kept as it is, busy marker and all.
-            if let Some(why) = self.writer.as_ref().and_then(Writer::read_only) {
-                self.refuse(msg, why);
-                continue;
+            && let Some(msg) = match next.take() {
+                Some(msg) => Some(msg),
+                None => mail.recv().await,
             }
-            if let Some((event, done)) = self.take(msg) {
+        {
+            // What queued meanwhile is a burst, stepped together and
+            // committed once. One that reads what is committed starts a
+            // burst of its own, once what came before it is carried out.
+            let mut burst = vec![msg];
+            while burst.len() < BURST
+                && let Some(msg) = mail.try_recv()
+            {
+                if msg.reads_the_log() {
+                    next = Some(msg);
+                    break;
+                }
+                burst.push(msg);
+            }
+            let (mut events, mut dones) = (Vec::new(), Vec::new());
+            for msg in burst {
+                // Answered once what came before it is carried out.
+                #[cfg(test)]
+                if let Msg::Barrier(done) = msg {
+                    dones.push(done);
+                    continue;
+                }
+                // Kept as it is, its catalog listing and all.
+                if let Some(why) = self.writer.as_ref().and_then(Writer::read_only) {
+                    self.refuse(msg, why);
+                    continue;
+                }
+                if let Some((event, done)) = self.take(msg) {
+                    events.push(event);
+                    dones.extend(done);
+                }
+            }
+            if !events.is_empty() {
                 // A new registry generation is taken up at the next step.
                 let newest = self.live.session.shared.registry.get();
                 let generation = (!Arc::ptr_eq(&newest, &self.registry)).then(|| {
                     self.registry = Arc::clone(&newest);
                     Event::Registry(Bound::bind(&newest, &self.live.session))
                 });
-                self.step(generation.into_iter().chain([event])).await;
-                if let Some(done) = done {
-                    done.send(());
-                }
+                self.step(generation.into_iter().chain(events)).await;
+            }
+            for done in dones {
+                done.send(());
             }
             // A call may begin to wait without the work marked ending.
             self.mark().await;
             self.publish();
         }
+        // Listed as it ends, with all it logged.
+        let listing = self.listing(self.live.has_work());
+        let shared = Arc::clone(&self.live.session.shared);
+        rt::unblock(&*Arc::clone(&shared.rt), move || {
+            shared.catalog.record(listing);
+        })
+        .await;
         let registry = &self.registry;
         registry.hooks().session_end(&self.live.session.point());
         // Closed and let go before the end is told: a reload never makes
@@ -605,56 +671,81 @@ impl Actor {
     }
 
     /// Steps the kernel through `events` and carries out what follows. A
-    /// step that panics is a bug the session survives: what the steps did
-    /// is dropped, as a commit that failed drops it, and the session
-    /// resumes from its log.
+    /// step that panics is a bug the session survives: what it did is
+    /// dropped, as a commit that failed drops it, what the steps before it
+    /// did is carried out, and the session resumes from its log.
     async fn step(&mut self, events: impl IntoIterator<Item = Event>) {
-        let stepped = catch_unwind(AssertUnwindSafe(|| {
-            let mut fx = Effects::new();
-            for event in events {
-                fx.extend(self.core.step(event));
-            }
-            fx
-        }));
-        match stepped {
-            Ok(fx) => self.carry(fx).await,
-            Err(panic) => {
-                let why = panicked(&*panic);
-                eprintln!("session {}: the kernel {why}", self.live.id.short());
-                Box::pin(self.resume()).await;
+        let mut fx = Effects::new();
+        for event in events {
+            match catch_unwind(AssertUnwindSafe(|| self.core.step(event))) {
+                Ok(more) => fx.extend(more),
+                Err(panic) => {
+                    let why = panicked(&*panic);
+                    eprintln!("session {}: the kernel {why}", self.live.id.short());
+                    self.carry(fx).await;
+                    return Box::pin(self.resume()).await;
+                }
             }
         }
+        self.carry(fx).await;
     }
 
-    /// Carries out `fx` in order, committing each run of appends before
-    /// the effect after it. A commit that fails drops the rest and resumes
-    /// from what the log holds.
+    /// Carries out `fx`: its appends are committed together, before the
+    /// effects among them, which then run in order. Whatever the steps
+    /// `fx` came from, a burst costs one commit, and each intent is still
+    /// durable before the work it names. Only a kill, of a process group
+    /// whose call the entries after it settle, and a busy mark, set before
+    /// the work it marks, go before what was appended ahead of them is
+    /// committed. A commit that fails drops the rest and resumes from what
+    /// the log holds.
     async fn carry(&mut self, fx: Effects) {
         let mut batch = Vec::new();
-        let mut fx = fx.into_iter();
-        loop {
-            let next = fx.next();
-            if let Some(Effect::Append(e)) = next {
-                batch.push(e);
-                continue;
-            }
-            if !batch.is_empty()
-                && let Err(e) = self.commit(&mut batch).await
-            {
-                let why = format!("logging: {e}");
-                eprintln!("session {}: {why}", self.live.id.short());
-                for effect in next.into_iter().chain(fx) {
-                    if let Effect::Reply { ticket, .. } = effect {
-                        self.reply(ticket, Err(why.clone()));
+        let mut after = Vec::new();
+        for effect in fx {
+            match effect {
+                Effect::Append(e) => batch.push(e),
+                Effect::Kill { .. } => {
+                    if !self.flush(&mut batch, &mut after).await {
+                        return;
                     }
+                    self.effect(effect);
                 }
-                return Box::pin(self.resume()).await;
-            }
-            match next {
-                Some(effect) => self.effect(effect).await,
-                None => return,
+                Effect::MarkBusy(true) => self.effect(effect),
+                effect => after.push(effect),
             }
         }
+        self.flush(&mut batch, &mut after).await;
+    }
+
+    /// Commits `batch`, then carries out the effects `after` it; `false`
+    /// if the commit failed, and the session resumed. Notes with nothing
+    /// after them are durable with the next commit that is.
+    async fn flush(&mut self, batch: &mut Vec<Entry>, after: &mut Vec<Effect>) -> bool {
+        // The session as it stands once `after` is carried out.
+        let busy = (after.iter().rev())
+            .find_map(|e| match e {
+                Effect::MarkBusy(busy) => Some(*busy),
+                _ => None,
+            })
+            .unwrap_or_else(|| self.live.has_work());
+        let listing = self.listing(busy);
+        if !batch.is_empty()
+            && let Err(e) = self.commit(batch, !after.is_empty(), listing).await
+        {
+            let why = format!("logging: {e}");
+            eprintln!("session {}: {why}", self.live.id.short());
+            for effect in after.drain(..) {
+                if let Effect::Reply { ticket, .. } = effect {
+                    self.reply(ticket, Err(why.clone()));
+                }
+            }
+            Box::pin(self.resume()).await;
+            return false;
+        }
+        for effect in after.drain(..) {
+            self.effect(effect);
+        }
+        true
     }
 
     /// After a failed commit or a step that panicked: what runs is
@@ -698,22 +789,59 @@ impl Actor {
         }
     }
 
-    /// Writes `batch` durably, then shows it: the writer stamps its lease.
-    async fn commit(&mut self, batch: &mut Vec<Entry>) -> io::Result<()> {
+    /// Writes `batch`, then shows it: the writer stamps its lease. It is
+    /// made durable at once unless it holds only notes and `durable` is
+    /// not asked for ([`kernel::Durability`]).
+    ///
+    /// The catalog takes `listing`, if it changed, in the same blocking
+    /// hop: before the entries when it is busy, as the mark is set before
+    /// the work they are the intent of, and after them when it is not, as
+    /// the mark is cleared once the work ends.
+    async fn commit(
+        &mut self,
+        batch: &mut Vec<Entry>,
+        durable: bool,
+        listing: Record,
+    ) -> io::Result<()> {
+        let durable = durable
+            || batch
+                .iter()
+                .any(|e| Durability::of(&e.body) == Durability::Now);
         let mut writer = self
             .writer
             .take()
             .ok_or_else(|| io::Error::other("no writer"))?;
         let mut entries = std::mem::take(batch);
-        let rt = Arc::clone(&self.live.session.shared.rt);
-        let (writer, entries, written) = rt::unblock(&*rt, move || {
-            let written = catch_unwind(AssertUnwindSafe(|| writer.append(&mut entries)))
+        let listed = std::mem::replace(&mut self.listed, listing.clone());
+        let listing = relisted(&listed, &listing).then_some(listing);
+        let shared = Arc::clone(&self.live.session.shared);
+        let rt = Arc::clone(&shared.rt);
+        let (writer, entries, written, listing) = rt::unblock(&*rt, move || {
+            let first = listing.as_ref().is_some_and(|l| l.busy);
+            if first && let Some(listing) = &listing {
+                shared.catalog.record(listing.clone());
+            }
+            let written = catch_unwind(AssertUnwindSafe(|| writer.append(&mut entries, durable)))
                 .unwrap_or_else(|_| Err(io::Error::other("committing entries panicked")));
-            (writer, entries, written)
+            if !first
+                && written.is_ok()
+                && let Some(listing) = &listing
+            {
+                shared.catalog.record(listing.clone());
+            }
+            (writer, entries, written, listing)
         })
         .await;
+        // Not cleared after entries that did not commit.
+        if written.is_err() && listing.is_some_and(|l| !l.busy) {
+            self.listed = listed;
+        }
         self.writer = Some(writer);
         written?;
+        crate::session_event("commit", self.live.id, || {
+            let how = if durable { "synced" } else { "written" };
+            format!("{} entries {how}", entries.len())
+        });
         self.shown(&entries);
         Ok(())
     }
@@ -757,7 +885,7 @@ impl Actor {
         summary.activity = ledger.activity();
     }
 
-    async fn effect(&mut self, effect: Effect) {
+    fn effect(&mut self, effect: Effect) {
         let shared = Arc::clone(&self.live.session.shared);
         // A stopping session starts nothing: what it would have started is
         // in the log, for its next load.
@@ -848,7 +976,6 @@ impl Actor {
                 self.live.busy.store(busy, Ordering::SeqCst);
                 let how = if busy { "busy" } else { "settled" };
                 crate::session_event(how, self.live.id, String::new);
-                self.mark().await;
                 self.live.touch();
             }
         }
@@ -876,17 +1003,37 @@ impl Actor {
         }
     }
 
-    /// Sets or clears the busy marker as the session now stands.
+    /// Lists the session in the catalog as it now stands, when no commit
+    /// did: a call beginning to wait, the actor ending.
     async fn mark(&mut self) {
-        let marked = self.live.has_work() || self.core.ledger().activity().requires_action();
-        if marked == self.marked {
+        let listing = self.listing(self.live.has_work());
+        if !relisted(&self.listed, &listing) {
             return;
         }
-        self.marked = marked;
-        let shared = &self.live.session.shared;
-        let (store, id) = (Arc::clone(&shared.store), self.live.id);
-        if let Err(e) = rt::unblock(&*shared.rt, move || store.mark_busy(id, marked)).await {
-            eprintln!("session {}: busy marker: {e}", id.short());
+        self.listed = listing.clone();
+        let shared = Arc::clone(&self.live.session.shared);
+        rt::unblock(&*Arc::clone(&shared.rt), move || {
+            shared.catalog.record(listing);
+        })
+        .await;
+    }
+
+    /// The session as the catalog lists it, `busy` with work in flight:
+    /// marked busy too while a call waits on someone, so the next daemon
+    /// loads it at once to show what it asks.
+    fn listing(&self, busy: bool) -> Record {
+        let ledger = self.core.ledger();
+        let activity = ledger.activity();
+        Record {
+            header: Header {
+                id: self.live.id,
+                workspace: self.live.workspace.clone(),
+                parent: self.live.parent,
+            },
+            busy: busy || activity.requires_action(),
+            entries: ledger.seq(),
+            activity,
+            read_only: lock(&self.live.summary).read_only,
         }
     }
 
@@ -1121,6 +1268,13 @@ impl Actor {
     }
 }
 
+/// Whether the catalog is to hear of `now`: it lists what it waits on and
+/// whether it is busy, and its count only as of then, so a commit does not
+/// change it.
+fn relisted(listed: &Record, now: &Record) -> bool {
+    listed.busy != now.busy || listed.activity != now.activity
+}
+
 /// Values by key, in a vector: a session has few of each in flight.
 struct Keyed<K, V>(Vec<(K, V)>);
 
@@ -1153,6 +1307,10 @@ impl<K: PartialEq, V> Keyed<K, V> {
 /// How many entries behind a client must be to get a snapshot rather than
 /// a replay.
 const SNAPSHOT_GAP: u64 = 256;
+
+/// The most messages an actor steps together, so that a flood of them
+/// still commits now and then.
+const BURST: usize = 64;
 
 #[cfg(test)]
 impl Live {
@@ -1397,8 +1555,11 @@ impl kernel::Registry for Bound {
 
     fn callable(&self, name: &str) -> Option<Callable> {
         let tool = self.registry.tools().get(name)?;
-        let (audience, replay) = (tool.audience(), tool.replay());
-        Some(Callable { audience, replay })
+        Some(Callable {
+            audience: tool.audience(),
+            replay: tool.replay(),
+            concurrency: tool.concurrency(),
+        })
     }
 
     fn model(&self) -> String {

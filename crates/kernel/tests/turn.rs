@@ -269,8 +269,60 @@ fn an_interrupt_stops_the_model_call_and_ends_the_turn() {
     ]);
 }
 
+/// The shared calls of a reply run together, and an interrupt cancels
+/// every one; the turn ends once all have reported.
+#[test]
+fn an_interrupt_cancels_every_call_of_the_reply_running() {
+    let a = json!({ "seconds": 1 });
+    let b = json!({ "seconds": 2 });
+    let calls = [("sleep", a.clone()), ("sleep", b.clone())];
+    modeled().table(vec![
+        (
+            user("go"),
+            vec![
+                BUSY,
+                append(1, input("go")),
+                append(2, model_call(0)),
+                call_model(2, 0),
+            ],
+        ),
+        (
+            model_done(2, &calls),
+            vec![
+                append(
+                    3,
+                    model_result(
+                        2,
+                        Outcome::Done {
+                            output: reply(&calls),
+                        },
+                    ),
+                ),
+                append(4, model_tool_call("sleep", &a, "c0")),
+                run_tool(4, "sleep", a.clone()),
+                append(5, model_tool_call("sleep", &b, "c1")),
+                run_tool(5, "sleep", b.clone()),
+            ],
+        ),
+        (interrupt(), vec![cancel(4), cancel(5)]),
+        (
+            tool_done(5, INTERRUPTED),
+            vec![append(6, tool_result(5, INTERRUPTED))],
+        ),
+        (
+            tool_done(4, INTERRUPTED),
+            vec![
+                append(7, tool_result(4, INTERRUPTED)),
+                append(8, Body::INTERRUPT),
+                IDLE,
+            ],
+        ),
+    ]);
+}
+
 /// Each call the model made is answered, the ones not started as
-/// interrupted, and the model is not asked again.
+/// interrupted, and the model is not asked again: an exclusive call
+/// waits for the one before it, so the interrupt leaves it unstarted.
 #[test]
 fn an_interrupted_turn_answers_the_calls_it_leaves_and_goes_no_further() {
     let a = json!({ "command": "a" });

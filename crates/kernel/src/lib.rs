@@ -25,11 +25,11 @@ use std::sync::Arc;
 use std::time::Duration;
 
 pub use ext::{
-    Action, Actions, Agent, Answer, Callable, Chained, Gate, Gated, Input, Later, LoopPoints, Name,
-    Parsed, Recover, Replay,
+    Action, Actions, Agent, Answer, Callable, Chained, Concurrency, Gate, Gated, Input, Later,
+    LoopPoints, Name, Parsed, Recover, Replay,
 };
 use protocol::{
-    Author, CallId, Card, Entry, Environment, Installed, Json, Mode, Outcome, Seq, SessionId,
+    Author, Body, CallId, Card, Entry, Environment, Installed, Json, Mode, Outcome, Seq, SessionId,
     ToolChoice, WaitOn,
 };
 use smallvec::SmallVec;
@@ -45,6 +45,27 @@ pub use crate::session::{Core, RESTART_CAP};
 /// step's entries share an fsync). If a commit fails, the effects after it
 /// are dropped and the driver resumes from the log ([`Core::resume`]).
 pub type Effects = SmallVec<[Effect; 4]>;
+
+/// How soon an entry must be durable once appended: the one place that
+/// says. Everything the session decided or learned (input, intents,
+/// decisions, results) is durable before anything follows it. A note a
+/// running call reports (its progress, an extension's state) has nothing
+/// waiting on it: it is written at once, for clients to see, and made
+/// durable by the next commit that is, so a crash loses at most notes.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Durability {
+    Now,
+    WithNext,
+}
+
+impl Durability {
+    pub const fn of(body: &Body) -> Self {
+        match body {
+            Body::Progress { .. } | Body::Ext { .. } => Self::WithNext,
+            _ => Self::Now,
+        }
+    }
+}
 
 /// What happened, as the driver tells the kernel.
 #[derive(Debug)]
@@ -251,8 +272,8 @@ pub enum Turn {
         attempt: u16,
         phase: ModelPhase,
     },
-    /// The open tool calls of the turn; the agent's next action waits until
-    /// none is.
+    /// The open tool calls of the turn: shared calls of one reply run
+    /// together, and the agent's next action waits until none is open.
     Acting { open: SmallVec<[(CallId, Step); 2]> },
     /// Interrupted: once these calls settle, the turn ends.
     Stopping {

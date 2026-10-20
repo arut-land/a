@@ -251,16 +251,48 @@ fn a_pipelined_hello_attach_and_input_are_answered_in_order() {
         "{first:?}"
     );
     assert!(matches!(peer.recv(), DaemonMsg::Synced { seq: 1 }));
-    // The input is logged before it is acknowledged.
+    // The input is logged before it is acknowledged, with what its step
+    // logged after it.
     let logged = peer.recv();
     assert!(
         matches!(&logged, DaemonMsg::Entry(e) if is_input(&e.body)),
         "{logged:?}"
     );
-    assert!(matches!(peer.recv(), DaemonMsg::Ack { client_seq: o } if o == origin(1, 1)));
-    let seen = peer
-        .until(|m| matches!(m, DaemonMsg::Entry(e) if matches!(e.body, Body::Assistant { .. })));
+    let seen = peer.until(|m| matches!(m, DaemonMsg::Ack { client_seq: o } if *o == origin(1, 1)));
     assert_eq!(users(&seen), 0, "the input was already seen");
+    assert!(
+        seen.iter()
+            .any(|m| matches!(m, DaemonMsg::Entry(e) if matches!(e.body, Body::Assistant { .. }))),
+        "{seen:?}"
+    );
+}
+
+/// Mutations sent one behind another go on to the session as they are
+/// read, without waiting for the one before to commit, and are answered
+/// in the order sent; what is not a mutation waits for their answers.
+#[test]
+fn pipelined_mutations_are_answered_in_order() {
+    let fixture = Fixture::new("pipelined-mutations");
+    let mut peer = fixture.connect();
+    peer.send(&hello(Caps::ALL));
+    peer.send(&attach(Target::New, 0, ClientDecl::default()));
+    for seq in 1..=3 {
+        peer.send(&input(&format!("m{seq}"), seq * 2 - 1));
+        peer.send(&ClientMsg::Interrupt {
+            client_seq: Some(seq * 2),
+        });
+    }
+    peer.send(&ClientMsg::List);
+    assert!(matches!(peer.answer(), DaemonMsg::Welcome { .. }));
+    assert!(matches!(peer.answer(), DaemonMsg::Attached { .. }));
+    let answers: Vec<u64> = (0..6)
+        .map(|_| match peer.answer() {
+            DaemonMsg::Ack { client_seq } => client_seq,
+            msg => panic!("{msg:?}"),
+        })
+        .collect();
+    assert_eq!(answers, [1, 2, 3, 4, 5, 6]);
+    assert!(matches!(peer.answer(), DaemonMsg::Sessions { .. }));
 }
 
 #[test]

@@ -19,8 +19,10 @@ browser tab ──GET /s/<id>/events?tab=…──> Live: SessionClient + Page +
 - **Server** (`http.rs`): a small HTTP/1.1 server for one local user, one
   request per connection, answered whole or as an event stream that lasts
   until the tab goes away. It runs on the `rt` runtime (`rt::Threads`):
-  socket I/O blocks on the runtime's blocking threads, the app on its
-  async workers. `httparse` parses; the `http` types are the ones `ureq`
+  the listener and each connection wait on their sockets through its
+  reactor (`rt::Async`), so neither a request nor an open tab holds a
+  thread, and the app runs on its async workers. `httparse` parses; the
+  `http` types are the ones `ureq`
   already links. No tokio, hyper or axum (`deny.toml`).
 - **Gate** (`http.rs`, `Gate`): who may use the UI. The printed link
   carries a one-time token; redeeming it sets a cookie for that host.
@@ -79,8 +81,7 @@ browser tab ──GET /s/<id>/events?tab=…──> Live: SessionClient + Page +
 
 ## Known costs
 
-Each live tab parks one blocking thread in the stream's read (to learn
-that the browser left) and hops to the blocking pool per write; `rt`'s
-reactor can register the socket's readiness instead. Styles repeat per
+Each live tab's daemon client is a `client::Driver`, with the threads its
+connection takes. Styles repeat per
 item (~200 bytes); a `<style>` block with class names would shrink every
 patch. Neither changes what the page shows.

@@ -10,8 +10,8 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 
 use kernel::{
-    Action, Actions, Agent, Answer, Callable, Chained, Core, Effect, Effects, Event, Gate, Gated,
-    Input, Later, Load, LoopPoints, Name, Recover, Registry, Replay, Replied,
+    Action, Actions, Agent, Answer, Callable, Chained, Concurrency, Core, Effect, Effects, Event,
+    Gate, Gated, Input, Later, Load, LoopPoints, Name, Recover, Registry, Replay, Replied,
 };
 use protocol::{
     Audience, Author, Body, CallId, ClientId, ClientSeq, Entry, Installed, Json, Mode, Outcome,
@@ -149,13 +149,17 @@ impl Registry for Reg {
     }
 
     fn callable(&self, tool: &str) -> Option<Callable> {
-        let (audience, replay) = match tool {
-            "sleep" | "task" => (Audience::Model, Replay::Safe),
-            "bash" | "ask" => (Audience::Model, Replay::Unsafe),
-            "jobs" => (Audience::User, Replay::Unsafe),
+        let (audience, replay, concurrency) = match tool {
+            "sleep" | "task" => (Audience::Model, Replay::Safe, Concurrency::Shared),
+            "bash" | "ask" => (Audience::Model, Replay::Unsafe, Concurrency::Exclusive),
+            "jobs" => (Audience::User, Replay::Unsafe, Concurrency::Exclusive),
             _ => return None,
         };
-        Some(Callable { audience, replay })
+        Some(Callable {
+            audience,
+            replay,
+            concurrency,
+        })
     }
 
     fn model(&self) -> String {

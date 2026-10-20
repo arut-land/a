@@ -224,7 +224,25 @@ fn with_home(script: &Arc<Script>, path: &Path) -> Models {
     }
 }
 
-struct Fixture(Arc<Shared>);
+struct Fixture(Arc<Shared>, Arc<Counting>);
+
+/// The runtime sessions under test run on, counting its blocking hops.
+struct Counting(rt::Threads, AtomicUsize);
+
+impl rt::Runtime for Counting {
+    fn spawn(&self, task: rt::BoxFuture<'static, ()>) {
+        self.0.spawn(task);
+    }
+
+    fn spawn_blocking(&self, work: Box<dyn FnOnce() + Send>) {
+        self.1.fetch_add(1, Ordering::SeqCst);
+        self.0.spawn_blocking(work);
+    }
+
+    fn reactor(&self) -> rt::Reactor {
+        self.0.reactor()
+    }
+}
 
 /// The agents sessions under test run.
 struct Agents;
@@ -251,17 +269,28 @@ impl Fixture {
         } else {
             registry.with_in(ext::Tier::Post, &Agents).unwrap()
         };
-        Self(Arc::new(Shared {
-            // One worker: no effect may hold it.
-            rt: Arc::new(rt::Threads::new(1)),
-            store,
-            registry: ext::host::Current::new(registry),
-            models,
+        // One worker: no effect may hold it.
+        let counting = Arc::new(Counting(rt::Threads::new(1), AtomicUsize::new(0)));
+        let rt: rt::Rt = Arc::clone(&counting) as _;
+        Self(
+            Arc::new(Shared {
+                rt,
+                store,
+                catalog: crate::catalog::Catalog::memory(),
+                registry: ext::host::Current::new(registry),
+                models,
 
-            spill: std::env::temp_dir().join(format!("a-spill-{}", std::process::id())),
-            loaded: Mutex::default(),
-            daemon: Weak::new(),
-        }))
+                spill: std::env::temp_dir().join(format!("a-spill-{}", std::process::id())),
+                loaded: Mutex::default(),
+                daemon: Weak::new(),
+            }),
+            counting,
+        )
+    }
+
+    /// The blocking hops taken so far.
+    fn hops(&self) -> usize {
+        self.1.1.load(Ordering::SeqCst)
     }
 
     fn header() -> Header {
@@ -377,24 +406,47 @@ fn finished(session: &Live, call: u64) -> Vec<Entry> {
     })
 }
 
-/// A store whose logs keep the size of each batch they are handed, and
-/// fail while told to.
+/// A store whose logs keep the size of each batch they are handed, fail
+/// while told to, and wait while `held` is locked.
 #[derive(Clone, Default)]
 struct Probe {
     store: Arc<Memory>,
     batches: Arc<Mutex<Vec<usize>>>,
     failing: Arc<AtomicBool>,
+    held: Arc<Mutex<()>>,
+    /// Appends waiting for `held`.
+    waiting: Arc<AtomicUsize>,
+    /// Each batch, and whether it was made durable.
+    written: Arc<Mutex<Vec<Written>>>,
 }
+
+/// A batch handed to a log, and whether it was made durable.
+type Written = (Vec<Entry>, bool);
 
 struct Probed(Box<dyn Log>, Probe);
 
-impl Log for Probed {
-    fn append_all(&mut self, entries: &[Entry]) -> io::Result<()> {
+impl Probed {
+    fn write(&mut self, entries: &[Entry], durable: bool) -> io::Result<()> {
+        self.1.waiting.fetch_add(1, Ordering::SeqCst);
+        drop(lock(&self.1.held));
+        self.1.waiting.fetch_sub(1, Ordering::SeqCst);
         if self.1.failing.load(Ordering::SeqCst) {
             return Err(io::Error::other("disk full"));
         }
         lock(&self.1.batches).push(entries.len());
+
+        lock(&self.1.written).push((entries.to_vec(), durable));
         self.0.append_all(entries)
+    }
+}
+
+impl Log for Probed {
+    fn append_all(&mut self, entries: &[Entry]) -> io::Result<()> {
+        self.write(entries, true)
+    }
+
+    fn write_all(&mut self, entries: &[Entry]) -> io::Result<()> {
+        self.write(entries, false)
     }
 }
 
@@ -421,14 +473,6 @@ impl LogStore for Probe {
 
     fn count(&self, id: SessionId) -> io::Result<u64> {
         self.store.count(id)
-    }
-
-    fn mark_busy(&self, id: SessionId, busy: bool) -> io::Result<()> {
-        self.store.mark_busy(id, busy)
-    }
-
-    fn is_busy(&self, id: SessionId) -> bool {
-        self.store.is_busy(id)
     }
 }
 
@@ -458,7 +502,7 @@ fn input_commits_on_arrival_and_a_failed_commit_leaves_no_trace() {
 
     assert_eq!(lost, Err("logging: disk full".into()));
     // The extensions it was created with, then a batch a step.
-    assert_eq!(*lock(&probe.batches), [1, 1, 1, 1, 1]);
+    assert_eq!(*lock(&probe.batches), [1, 2, 2]);
     assert!(matches!(log[0].body, Body::Extensions { .. }));
     assert_eq!(
         facts(&log[1..]),
@@ -826,6 +870,41 @@ fn hook_decisions_are_logged_after_their_call_and_replay_to_the_same_state() {
             llm::Message::assistant("and again")
         ]
     );
+}
+
+/// The calls of one reply end in any order, and are logged as they end;
+/// the model reads their results in the order it made the calls, so the
+/// request is the same however the run went.
+#[test]
+fn results_are_logged_in_call_order() {
+    let call = |id: &str| Body::ToolCall {
+        tool: "sleep".into(),
+        input: Json::encode(&json!({ "seconds": 1 })).unwrap(),
+        id: Some(id.into()),
+        card: None,
+        by: Audience::Model,
+    };
+    let result = |call| Body::ToolResult {
+        call,
+        outcome: Outcome::Done {
+            output: Json::encode(&json!({ "slept": call })).unwrap(),
+        },
+        card: None,
+    };
+    let log = [
+        entry(1, call("a")),
+        entry(2, call("b")),
+        entry(3, call("c")),
+        entry(4, result(3)),
+        entry(5, result(1)),
+        entry(6, result(2)),
+    ];
+    let messages = transcript(&log, u64::MAX, Arc::default());
+    let [llm::Message::Tool(answers)] = &messages[..] else {
+        panic!("{messages:#?}");
+    };
+    let ids: Vec<&str> = answers.results.iter().map(|r| r.id.as_str()).collect();
+    assert_eq!(ids, ["a", "b", "c"]);
 }
 
 /// #41: a crash after a gate's decisions but before what follows them:
@@ -1829,6 +1908,108 @@ fn a_kernel_panic_is_a_resume() {
             (4, &echo("again"))
         ]
     );
+}
+
+/// Messages that queue while the actor commits are stepped together and
+/// committed once: a burst of input costs one fsync, not one each.
+#[test]
+fn one_fsync_per_burst() {
+    let probe = Probe::default();
+    let fixture = Fixture::on(
+        Arc::new(probe.clone()),
+        ext_fixtures::ECHO,
+        Registry::default(),
+        openai(&Script::new(&[])),
+    );
+    let session = fixture.create();
+    settle(&session);
+    let input = |text: &str| {
+        let input = Event::Input {
+            text: text.into(),
+            mode: Mode::Queue,
+            origin: None,
+            ticket: None,
+        };
+        session.send(Msg::Step(input));
+    };
+    let held = lock(&probe.held);
+    input("first");
+    while probe.waiting.load(Ordering::SeqCst) == 0 {
+        thread::yield_now();
+    }
+    for n in 0..5 {
+        input(&format!("then {n}"));
+    }
+    drop(held);
+    settle(&session);
+    let log = log_of(&session);
+    session.halt();
+    assert_eq!(log.len(), 1 + 2 * 6, "{log:#?}");
+    // The extensions, the first input and its echo, then the burst.
+    assert_eq!(*lock(&probe.batches), [1, 2, 10]);
+}
+
+/// The busy mark is set and cleared in the blocking hop of the commit
+/// that starts and ends the work: before its entries, and after them.
+#[test]
+fn the_busy_mark_rides_its_commit() {
+    let probe = Probe::default();
+    let fixture = Fixture::on(
+        Arc::new(probe.clone()),
+        ext_fixtures::ECHO,
+        echoing(&Policy::default()),
+        openai(&Script::new(&[])),
+    );
+    let session = fixture.create();
+    settle(&session);
+    let (hops, commits) = (fixture.hops(), lock(&probe.batches).len());
+    session.submit("$ true").unwrap();
+    finished(&session, 3);
+    settle(&session);
+    let (hops, commits) = (fixture.hops() - hops, lock(&probe.batches).len() - commits);
+    session.halt();
+    assert_eq!(*lock(&fixture.0.catalog.marks), [true, false]);
+    assert_eq!(hops, commits, "a hop besides the {commits} commits");
+}
+
+/// Progress and extension state are written as they come, and made
+/// durable with the next commit that has to be: a crash after any write
+/// loses at most notes, never an intent, a decision or a result.
+#[test]
+fn a_crash_loses_at_most_notes() {
+    let probe = Probe::default();
+    let fixture = Fixture::on(
+        Arc::new(probe.clone()),
+        ext_fixtures::ECHO,
+        echoing(&Policy::default()),
+        openai(&Script::new(&[])),
+    );
+    let session = fixture.create();
+    session
+        .submit("$ cd /; for i in 1 2 3 4; do echo $i; sleep 0.15; done")
+        .unwrap();
+    finished(&session, 3);
+    session.submit("hi").unwrap();
+    settle(&session);
+    session.halt();
+    let written = lock(&probe.written).clone();
+    let notes = written.iter().filter(|(_, durable)| !durable).count();
+    assert!(notes >= 2, "{written:#?}");
+    // A crash after write `at` keeps every write up to the last durable
+    // one: what it loses is what was only written after that.
+    for at in 0..written.len() {
+        let kept = written[..=at].iter().rposition(|(_, durable)| *durable);
+        let lost = written[kept.map_or(0, |k| k + 1)..=at]
+            .iter()
+            .flat_map(|(entries, _)| entries);
+        for e in lost {
+            assert!(
+                matches!(e.body, Body::Progress { .. } | Body::Ext { .. }),
+                "a crash after write {at} loses {e:?}"
+            );
+        }
+    }
+    assert!(written.last().is_some_and(|(_, durable)| *durable));
 }
 
 /// #57: the entries of one step are committed together: one write and

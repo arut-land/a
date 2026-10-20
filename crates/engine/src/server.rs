@@ -4,6 +4,7 @@
 //! reactor, so a connection costs no thread, and a client that stops
 //! reading costs only its cursor.
 
+use std::collections::VecDeque;
 use std::future::{Future, poll_fn};
 use std::io::{self, Read, Write};
 use std::path::{Path, PathBuf};
@@ -17,7 +18,7 @@ use protocol::{
     Author, Caps, ClientDecl, ClientId, ClientMsg, ClientSeq, DaemonMsg, Decode, Environment,
     Frame, HomeSettings, PROTO, Rejection, Role, SettingsChange, Versions,
 };
-use rt::{Async, Reactor};
+use rt::{Async, BoxFuture, Reactor};
 use sys::{Listener, Stream};
 
 use crate::driver::{self, Attachment, Request};
@@ -292,16 +293,38 @@ impl Conn<'_> {
         self.reply(&DaemonMsg::Error { message });
     }
 
+    /// Takes the client's frames as they come. Mutations are sent on at
+    /// once and answered in order as they commit, while the next frames
+    /// are read: an interrupt behind an input does not wait for its fsync.
+    /// Anything else waits until what was asked before it is answered.
     async fn serve(&mut self, frames: &mut Frames) -> io::Result<()> {
-        while let Some(mut msg) = frames.next::<ClientMsg>().await? {
+        let mut pending: VecDeque<(Option<u64>, BoxFuture<'static, Answer>)> = VecDeque::new();
+        loop {
+            let next = {
+                let mut next = pin!(frames.next::<ClientMsg>());
+                poll_fn(|cx| {
+                    while let Some((client_seq, answer)) = pending.front_mut() {
+                        let Poll::Ready(answer) = answer.as_mut().poll(cx) else {
+                            break;
+                        };
+                        self.answered(*client_seq, answer);
+                        pending.pop_front();
+                    }
+                    next.as_mut().poll(cx)
+                })
+                .await
+            };
+            let Some(mut msg) = next? else { break };
             if let Some(&mut client_seq) = msg.client_seq_mut() {
                 let origin = client_seq.and_then(ClientSeq::new).map(|seq| Author {
                     client: self.client,
                     seq,
                 });
-                let answer = self.mutate(msg, origin).await;
-                self.answered(client_seq, answer);
+                pending.push_back((client_seq, self.mutate(msg, origin)));
                 continue;
+            }
+            while let Some((client_seq, answer)) = pending.pop_front() {
+                self.answered(client_seq, answer.await);
             }
             match msg {
                 ClientMsg::Attach {
@@ -362,6 +385,9 @@ impl Conn<'_> {
                 | ClientMsg::Interrupt { .. } => {}
             }
         }
+        while let Some((client_seq, answer)) = pending.pop_front() {
+            self.answered(client_seq, answer.await);
+        }
         self.outbox.unfollow();
         Ok(())
     }
@@ -390,22 +416,25 @@ impl Conn<'_> {
         DaemonMsg::Settings { settings, error }
     }
 
-    /// Does mutation `msg`, from `origin`, if this client may.
-    async fn mutate(&self, msg: ClientMsg, origin: Option<Author>) -> Answer {
+    /// Sends mutation `msg`, from `origin`, on if this client may: the
+    /// future is its answer.
+    fn mutate(&self, msg: ClientMsg, origin: Option<Author>) -> BoxFuture<'static, Answer> {
+        let refused =
+            |answer: Answer| -> BoxFuture<'static, Answer> { Box::pin(std::future::ready(answer)) };
         let session = match &self.attached {
             _ if self.decl.role == Role::Viewer => {
-                return Err((Rejection::ReadOnly, "this client is a viewer".into()));
+                return refused(Err((Rejection::ReadOnly, "this client is a viewer".into())));
             }
             Some(s) => s.session(),
-            None => return Err((Rejection::NotAttached, "not attached".into())),
+            None => return refused(Err((Rejection::NotAttached, "not attached".into()))),
         };
-        let (request, refused) = match msg {
+        let (request, rejection) = match msg {
             ClientMsg::Interrupt { .. } => (Request::Interrupt, Rejection::Other),
             _ if self.life.draining().is_some() => {
-                return Err((
+                return refused(Err((
                     Rejection::Draining,
                     "the daemon is restarting for an upgrade; send that again in a moment".into(),
-                ));
+                )));
             }
             ClientMsg::Input { text, mode, .. } => {
                 (Request::Input { text, mode }, Rejection::Refused)
@@ -414,10 +443,10 @@ impl Conn<'_> {
                 let value = protocol::Json::encode(&approved).unwrap_or_default();
                 (Request::Answer { call, value }, Rejection::NotWaiting)
             }
-            _ => return Err((Rejection::Other, "not a mutation".into())),
+            _ => return refused(Err((Rejection::Other, "not a mutation".into()))),
         };
-        let answer = session.request(request, origin).await;
-        answer.map_err(|message| (refused, message))
+        let answer = session.ask(request, origin);
+        Box::pin(async move { answer.await.map_err(|message| (rejection, message)) })
     }
 
     /// Tells the client the answer to its mutation `client_seq`: an ack or

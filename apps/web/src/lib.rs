@@ -53,12 +53,18 @@ pub fn run(daemon: Daemon, open: bool) -> io::Result<()> {
     if open && let Err(e) = open_browser(&link) {
         eprintln!("[could not open a browser: {e}; open the link above]");
     }
-    for stream in listener.incoming() {
-        let Ok(stream) = stream else { continue };
-        let task = http::serve(Arc::clone(&rt), Arc::clone(&app), stream);
-        rt.spawn(Box::pin(task));
-    }
-    Ok(())
+    // Each connection is a task of its own; this thread only waits for the
+    // next, through the reactor.
+    let listener = rt::Async::socket(&rt.reactor(), listener)?;
+    rt::block_on(async {
+        loop {
+            let Ok((stream, _)) = listener.read_with(TcpListener::accept).await else {
+                continue;
+            };
+            let task = http::serve(Arc::clone(&rt), Arc::clone(&app), stream);
+            rt.spawn(Box::pin(task));
+        }
+    })
 }
 
 fn open_browser(link: &str) -> io::Result<()> {

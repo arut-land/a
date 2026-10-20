@@ -1,5 +1,5 @@
 use std::fs::{self, File, OpenOptions};
-use std::io::{self, BufRead, BufReader, Read, Write};
+use std::io::{self, BufRead, BufReader, Write};
 use std::ops::RangeInclusive;
 use std::path::PathBuf;
 use std::sync::{Arc, PoisonError, RwLock};
@@ -13,9 +13,8 @@ use super::{Header, Kept, LeaseAuthority, Lines, Loaded, Local, Log, LogStore, W
 pub(crate) const FORMAT: u32 = 1;
 
 /// One append-only JSONL file per session in a directory: the header on the
-/// first line, one entry per line after it, and an empty `.busy` file beside
-/// it while work is in flight. Sessions share nothing, so they never contend;
-/// a single writer per directory is the daemon lock's job.
+/// first line, one entry per line after it. Sessions share nothing, so they
+/// never contend; a single writer per directory is the daemon lock's job.
 ///
 /// Every line is sealed with a checksum of itself ([`seal`]), so what a load
 /// cuts depends only on whether a line is whole, never on whether this
@@ -39,10 +38,6 @@ impl Jsonl {
 
     fn path(&self, id: SessionId) -> PathBuf {
         self.dir.join(format!("{id}.jsonl"))
-    }
-
-    fn busy_path(&self, id: SessionId) -> PathBuf {
-        self.dir.join(format!("{id}.busy"))
     }
 }
 
@@ -118,7 +113,9 @@ impl LogStore for Jsonl {
     }
 
     /// Counts lines rather than parsing them.
+    #[cfg(test)]
     fn count(&self, id: SessionId) -> io::Result<u64> {
+        use std::io::Read as _;
         let mut file = File::open(self.path(id))?;
         let (mut lines, mut buf) = (0u64, vec![0u8; 64 * 1024]);
         loop {
@@ -127,22 +124,6 @@ impl LogStore for Jsonl {
                 n => lines += memchr::memchr_iter(b'\n', &buf[..n]).count() as u64,
             }
         }
-    }
-
-    fn mark_busy(&self, id: SessionId, busy: bool) -> io::Result<()> {
-        let path = self.busy_path(id);
-        if busy {
-            File::create(path).map(drop)
-        } else {
-            match fs::remove_file(path) {
-                Err(e) if e.kind() != io::ErrorKind::NotFound => Err(e),
-                _ => Ok(()),
-            }
-        }
-    }
-
-    fn is_busy(&self, id: SessionId) -> bool {
-        self.busy_path(id).exists()
     }
 }
 
@@ -283,20 +264,30 @@ struct JsonlLog {
 }
 
 impl Log for JsonlLog {
-    /// One write and one sync for the lot.
+    /// One write and one sync for the lot, which makes what was only
+    /// written before it durable too.
     fn append_all(&mut self, entries: &[Entry]) -> io::Result<()> {
-        let mut lines = Vec::new();
-        for entry in entries {
-            let at = lines.len();
-            entry.encode(&mut lines)?;
-            seal(&mut lines, at);
-        }
-        self.write(&lines)
+        self.write(&lines(entries)?, true)
+    }
+
+    /// One write, and no sync.
+    fn write_all(&mut self, entries: &[Entry]) -> io::Result<()> {
+        self.write(&lines(entries)?, false)
     }
 }
 
+fn lines(entries: &[Entry]) -> io::Result<Vec<u8>> {
+    let mut lines = Vec::new();
+    for entry in entries {
+        let at = lines.len();
+        entry.encode(&mut lines)?;
+        seal(&mut lines, at);
+    }
+    Ok(lines)
+}
+
 impl JsonlLog {
-    fn write(&mut self, lines: &[u8]) -> io::Result<()> {
+    fn write(&mut self, lines: &[u8], sync: bool) -> io::Result<()> {
         if lines.is_empty() {
             return Ok(());
         }
@@ -308,6 +299,9 @@ impl JsonlLog {
         }
         let written = (|| {
             (&*file).write_all(lines)?;
+            if !sync {
+                return Ok(());
+            }
             sys::sync_data(file)?;
             if let Some(dir) = &self.new_in {
                 sys::fs::sync_dir(dir)?;
@@ -316,7 +310,9 @@ impl JsonlLog {
         })();
         match written {
             Ok(()) => {
-                self.new_in = None;
+                if sync {
+                    self.new_in = None;
+                }
                 self.index.extend(lines);
                 Ok(())
             }

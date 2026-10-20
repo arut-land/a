@@ -81,6 +81,11 @@ impl Home {
         self.root.join("sessions")
     }
 
+    /// How every session lists, derived from their logs by the daemon.
+    pub fn catalog_file(&self) -> PathBuf {
+        self.root.join("sessions.idx")
+    }
+
     /// Where tools keep output too large for a session's log, a private
     /// directory per session.
     pub fn spill_dir(&self) -> PathBuf {
