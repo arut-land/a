@@ -113,14 +113,21 @@ pub struct End {
 }
 
 /// `S` is the state the decoder keeps per open item ([`Writes::State`]),
-/// held in the item's draft rather than in a table of the decoder's own.
+/// held beside the item's draft rather than in a table of the decoder's
+/// own; it leaves with the item. The rules live in [`Core`], compiled once
+/// whatever `S` is.
 pub struct Writer<S = ()> {
+    core: Core,
+    states: Vec<(usize, S)>,
+}
+
+struct Core {
     key: &'static str,
     out: Vec<Event>,
     /// The open items by wire index, in the order they opened. A reply
     /// holds few at once, and a list costs less code than a map, as for the
     /// lists below.
-    open: Vec<(usize, Draft<S>)>,
+    open: Vec<(usize, Draft)>,
     /// The part each wire index last closed, whose item may still be edited.
     /// A reply holds few, and a list costs less code than a map.
     ended: Vec<(usize, u32)>,
@@ -153,12 +160,11 @@ struct Kept {
     replay: Option<bool>,
 }
 
-struct Draft<S> {
+struct Draft {
     part: u32,
     started: bool,
     item: Value,
     body: Body,
-    state: S,
 }
 
 enum Body {
@@ -267,9 +273,8 @@ fn not_open(index: usize) -> Error {
     )
 }
 
-impl<S: Default> Writer<S> {
-    /// A writer for a protocol whose part state goes under `key`.
-    pub fn new(key: &'static str) -> Self {
+impl Core {
+    fn new(key: &'static str) -> Self {
         Self {
             key,
             out: Vec::new(),
@@ -288,66 +293,47 @@ impl<S: Default> Writer<S> {
         }
     }
 
-    /// A wire whose call items hold their id in a slot replay can fill.
-    #[must_use]
-    pub fn with_call_id_slot(mut self) -> Self {
-        self.call_id_slot = true;
-        self
-    }
-
     /// Moves the events written so far to `out`.
-    pub fn drain(&mut self, out: &mut Vec<Event>) {
+    fn drain(&mut self, out: &mut Vec<Event>) {
         out.append(&mut self.out);
     }
 
-    pub fn fresh_index(&mut self) -> usize {
+    fn fresh_index(&mut self) -> usize {
         self.next_auto += 1;
         self.next_auto - 1
     }
 
     /// Order the message's parts by wire index rather than by when they
     /// opened, for a wire whose end may state items it never streamed.
-    pub fn order_by_index(&mut self) {
+    fn order_by_index(&mut self) {
         self.by_index.get_or_insert_with(Vec::new);
     }
 
     /// Hold the open item at `index` first in the message.
-    pub fn lead(&mut self, index: usize) -> Result<(), Error> {
+    fn lead(&mut self, index: usize) -> Result<(), Error> {
         let part = self.draft(index)?.part;
         self.lead.get_or_insert(part);
         Ok(())
     }
 
-    fn draft(&mut self, index: usize) -> Result<&mut Draft<S>, Error> {
+    fn draft(&mut self, index: usize) -> Result<&mut Draft, Error> {
         find(&mut self.open, index).ok_or_else(|| not_open(index))
     }
 
-    fn get(&self, index: usize) -> Option<&Draft<S>> {
+    fn get(&self, index: usize) -> Option<&Draft> {
         let mut open = self.open.iter();
         open.find(|(at, _)| *at == index).map(|(_, draft)| draft)
     }
 
-    fn take(&mut self, index: usize) -> Option<Draft<S>> {
+    fn take(&mut self, index: usize) -> Option<Draft> {
         let at = self.open.iter().position(|(at, _)| *at == index)?;
         Some(self.open.remove(at).1)
-    }
-
-    /// The decoder's state for the open item at `index`; `None` for an
-    /// index not open.
-    pub fn state(&mut self, index: usize) -> Option<&mut S> {
-        find(&mut self.open, index).map(|draft| &mut draft.state)
-    }
-
-    /// The open items' wire indices and the decoder's state for each, in
-    /// the order they opened.
-    pub fn open_states(&self) -> impl Iterator<Item = (usize, &S)> {
-        self.open.iter().map(|(at, draft)| (*at, &draft.state))
     }
 
     /// The text the open item at `index` streamed so far, set as its item's
     /// string field `key`: for a wire whose item states its text whole,
     /// written once instead of with each token.
-    pub fn land(&mut self, index: usize, key: &str) -> Result<(), Error> {
+    fn land(&mut self, index: usize, key: &str) -> Result<(), Error> {
         let Draft { item, body, .. } = self.draft(index)?;
         let text = match body {
             Body::Text(text) | Body::Reasoning { text, .. } => text.as_str(),
@@ -376,7 +362,7 @@ impl<S: Default> Writer<S> {
     }
 
     /// Whether an item opened at `index`, closed since or not.
-    pub fn opened(&self, index: usize) -> bool {
+    fn opened(&self, index: usize) -> bool {
         self.get(index).is_some() || self.closed(index).is_some()
     }
 
@@ -388,7 +374,7 @@ impl<S: Default> Writer<S> {
 
     /// The text, reasoning or argument JSON the open item at `index` holds
     /// so far; `None` for an item of none.
-    pub fn text(&self, index: usize) -> Option<&str> {
+    fn text(&self, index: usize) -> Option<&str> {
         match &self.get(index)?.body {
             Body::Text(text) | Body::Reasoning { text, .. } => Some(text),
             Body::Call { arguments, .. } => Some(&arguments.text),
@@ -398,7 +384,7 @@ impl<S: Default> Writer<S> {
 
     /// What the open call at `index` holds so far: its id and tool name
     /// once stated, and its argument JSON.
-    pub fn call(&self, index: usize) -> Option<CallFragment<'_>> {
+    fn call(&self, index: usize) -> Option<CallFragment<'_>> {
         match &self.get(index)?.body {
             Body::Call {
                 id,
@@ -416,7 +402,7 @@ impl<S: Default> Writer<S> {
     /// Open the provider item at wire `index`. `item` is the item as its
     /// first event states it, the base its deltas merge into; `Null` when
     /// the part keeps no provider item.
-    pub fn open(&mut self, index: usize, block: Open, item: Value) -> Result<(), Error> {
+    fn open(&mut self, index: usize, block: Open, item: Value) -> Result<(), Error> {
         if self.get(index).is_some() {
             return Err(Error::decode(
                 format!("the reply opened item {index} twice"),
@@ -440,7 +426,6 @@ impl<S: Default> Writer<S> {
             started: false,
             item,
             body,
-            state: S::default(),
         };
         self.open.push((index, draft));
     }
@@ -458,14 +443,6 @@ impl<S: Default> Writer<S> {
     /// Append text, reasoning, or a call's argument JSON to the item at
     /// `index`: the part's one copy of its text grows in place, and the
     /// event carries the new piece only.
-    pub fn push<'a>(
-        &mut self,
-        index: usize,
-        fragment: impl Into<Cow<'a, str>>,
-    ) -> Result<(), Error> {
-        self.push_text(index, fragment.into())
-    }
-
     fn push_text(&mut self, index: usize, fragment: Cow<'_, str>) -> Result<(), Error> {
         if fragment.is_empty() {
             return Ok(());
@@ -506,7 +483,7 @@ impl<S: Default> Writer<S> {
     /// Edit the item at `index` in place: merge a delta, or replace the
     /// whole item the provider restates when it finishes. An index whose
     /// part already closed edits that part's item until the reply ends.
-    pub fn edit(&mut self, index: usize, edit: impl FnOnce(&mut Value)) -> Result<(), Error> {
+    fn edit(&mut self, index: usize, edit: impl FnOnce(&mut Value)) -> Result<(), Error> {
         if let Some(draft) = find(&mut self.open, index) {
             edit(&mut draft.item);
             return Ok(());
@@ -521,7 +498,7 @@ impl<S: Default> Writer<S> {
     /// Replace the text, reasoning or argument JSON of the open item at
     /// `index` with the whole of it as the provider restates it. What
     /// streamed stands; the part ends holding `text`.
-    pub fn restate(&mut self, index: usize, text: &str) -> Result<(), Error> {
+    fn restate(&mut self, index: usize, text: &str) -> Result<(), Error> {
         let draft = self.draft(index)?;
         match &mut draft.body {
             Body::Text(body) | Body::Reasoning { text: body, .. } => {
@@ -539,34 +516,9 @@ impl<S: Default> Writer<S> {
         Ok(())
     }
 
-    /// Close the item at `index` the provider never stated complete: its
-    /// part keeps no provider item, and an opaque one does not replay.
-    pub fn close(&mut self, index: usize) -> Result<(), Error> {
-        self.close_item(index, false)
-    }
-
-    /// Close the item at `index` the provider stated complete: its item as
-    /// assembled becomes the part's state.
-    pub fn finish(&mut self, index: usize) -> Result<(), Error> {
-        self.close_item(index, true)
-    }
-
-    /// Open and finish the item at `index` in one step.
-    pub fn whole<'a>(
-        &mut self,
-        index: usize,
-        block: Open,
-        item: Value,
-        text: impl Into<Cow<'a, str>>,
-    ) -> Result<(), Error> {
-        self.open(index, block, item)?;
-        self.push(index, text)?;
-        self.finish(index)
-    }
-
     /// Arguments the provider announced for the call at `index`, used only
     /// if no fragment arrives.
-    pub fn announce(&mut self, index: usize, announced: Value) -> Result<(), Error> {
+    fn announce(&mut self, index: usize, announced: Value) -> Result<(), Error> {
         if let Body::Call { arguments, .. } = &mut self.draft(index)?.body {
             arguments.announced = Some(announced);
         }
@@ -579,7 +531,7 @@ impl<S: Default> Writer<S> {
     /// the index starts a new call once the held call's arguments are a
     /// complete object or the new fragment names a tool (some providers send
     /// a fresh id, and no name, with every chunk of one call).
-    pub fn fragment(&mut self, index: usize, fragment: CallFragment<'_>) -> Result<(), Error> {
+    fn fragment(&mut self, index: usize, fragment: CallFragment<'_>) -> Result<(), Error> {
         let new_id = fragment.id.filter(|id| stated(id));
         self.take_over(index, new_id, fragment.name)?;
         if self.get(index).is_none() {
@@ -749,7 +701,6 @@ impl<S: Default> Writer<S> {
             started,
             item,
             body,
-            ..
         } = self.take(index).ok_or_else(|| not_open(index))?;
         self.ended.retain(|(at, _)| *at != index);
         self.ended.push((index, part));
@@ -814,7 +765,7 @@ impl<S: Default> Writer<S> {
 
     /// The reader stopped reading: what is still open closes as far as it
     /// got, in the order it opened, and keeps no provider item.
-    pub fn cut(&mut self) {
+    fn cut(&mut self) {
         while let Some(index) = first_open(&self.open) {
             if self.close_item(index, false).is_err() {
                 break;
@@ -826,7 +777,7 @@ impl<S: Default> Writer<S> {
     /// is attached, and the finish follows. A reply that names no reason
     /// fails, as does one that ends with a call left open short of the
     /// output limit.
-    pub fn end(&mut self, end: End) -> Result<Flow, Error> {
+    fn end(&mut self, end: End) -> Result<Flow, Error> {
         let unfinished_call = self
             .open
             .iter()
@@ -928,14 +879,196 @@ impl<S: Default> Writer<S> {
     }
 }
 
+impl<S: Default> Writer<S> {
+    /// A writer for a protocol whose part state goes under `key`.
+    pub fn new(key: &'static str) -> Self {
+        Self {
+            core: Core::new(key),
+            states: Vec::new(),
+        }
+    }
+
+    /// A wire whose call items hold their id in a slot replay can fill.
+    #[must_use]
+    pub fn with_call_id_slot(mut self) -> Self {
+        self.core.call_id_slot = true;
+        self
+    }
+
+    /// Moves the events written so far to `out`.
+    pub fn drain(&mut self, out: &mut Vec<Event>) {
+        self.core.drain(out);
+    }
+
+    pub fn fresh_index(&mut self) -> usize {
+        self.core.fresh_index()
+    }
+
+    /// Order the message's parts by wire index rather than by when they
+    /// opened, for a wire whose end may state items it never streamed.
+    pub fn order_by_index(&mut self) {
+        self.core.order_by_index();
+    }
+
+    /// Hold the open item at `index` first in the message.
+    pub fn lead(&mut self, index: usize) -> Result<(), Error> {
+        self.core.lead(index)
+    }
+
+    /// Whether an item opened at `index`, closed since or not.
+    pub fn opened(&self, index: usize) -> bool {
+        self.core.opened(index)
+    }
+
+    /// The text, reasoning or argument JSON the open item at `index` holds
+    /// so far; `None` for an item of none.
+    pub fn text(&self, index: usize) -> Option<&str> {
+        self.core.text(index)
+    }
+
+    /// What the open call at `index` holds so far: its id and tool name
+    /// once stated, and its argument JSON.
+    pub fn call(&self, index: usize) -> Option<CallFragment<'_>> {
+        self.core.call(index)
+    }
+
+    /// Open the provider item at wire `index`. `item` is the item as its
+    /// first event states it, the base its deltas merge into; `Null` when
+    /// the part keeps no provider item.
+    pub fn open(&mut self, index: usize, block: Open, item: Value) -> Result<(), Error> {
+        self.core.open(index, block, item)?;
+        self.reset(index);
+        Ok(())
+    }
+
+    /// Append text, reasoning, or a call's argument JSON to the item at
+    /// `index`: the part's one copy of its text grows in place, and the
+    /// event carries the new piece only.
+    pub fn push<'a>(
+        &mut self,
+        index: usize,
+        fragment: impl Into<Cow<'a, str>>,
+    ) -> Result<(), Error> {
+        self.core.push_text(index, fragment.into())
+    }
+
+    /// Edit the item at `index` in place: merge a delta, or replace the
+    /// whole item the provider restates when it finishes. An index whose
+    /// part already closed edits that part's item until the reply ends.
+    pub fn edit(&mut self, index: usize, edit: impl FnOnce(&mut Value)) -> Result<(), Error> {
+        self.core.edit(index, edit)
+    }
+
+    /// Replace the text, reasoning or argument JSON of the open item at
+    /// `index` with the whole of it as the provider restates it. What
+    /// streamed stands; the part ends holding `text`.
+    pub fn restate(&mut self, index: usize, text: &str) -> Result<(), Error> {
+        self.core.restate(index, text)
+    }
+
+    /// Close the item at `index` the provider never stated complete: its
+    /// part keeps no provider item, and an opaque one does not replay.
+    pub fn close(&mut self, index: usize) -> Result<(), Error> {
+        self.core.close_item(index, false)
+    }
+
+    /// Close the item at `index` the provider stated complete: its item as
+    /// assembled becomes the part's state.
+    pub fn finish(&mut self, index: usize) -> Result<(), Error> {
+        self.core.close_item(index, true)
+    }
+
+    /// Open and finish the item at `index` in one step.
+    pub fn whole<'a>(
+        &mut self,
+        index: usize,
+        block: Open,
+        item: Value,
+        text: impl Into<Cow<'a, str>>,
+    ) -> Result<(), Error> {
+        self.open(index, block, item)?;
+        self.push(index, text)?;
+        self.finish(index)
+    }
+
+    /// Arguments the provider announced for the call at `index`, used only
+    /// if no fragment arrives.
+    pub fn announce(&mut self, index: usize, announced: Value) -> Result<(), Error> {
+        self.core.announce(index, announced)
+    }
+
+    /// One fragment of a call the provider streams under wire `index`,
+    /// opening the call at its first fragment. Its id and name may arrive in
+    /// any fragment, and the first name it is given stays. A new id under
+    /// the index starts a new call once the held call's arguments are a
+    /// complete object or the new fragment names a tool (some providers send
+    /// a fresh id, and no name, with every chunk of one call); the state
+    /// under the index stays the decoder's to carry over.
+    pub fn fragment(&mut self, index: usize, fragment: CallFragment<'_>) -> Result<(), Error> {
+        let fresh = self.core.get(index).is_none();
+        self.core.fragment(index, fragment)?;
+        if fresh && self.core.get(index).is_some() {
+            self.reset(index);
+        }
+        Ok(())
+    }
+
+    /// The reader stopped reading: what is still open closes as far as it
+    /// got, in the order it opened, and keeps no provider item.
+    pub fn cut(&mut self) {
+        self.core.cut();
+    }
+
+    /// The reply ends: what is still open closes, the parts' provider state
+    /// is attached, and the finish follows. A reply that names no reason
+    /// fails, as does one that ends with a call left open short of the
+    /// output limit.
+    pub fn end(&mut self, end: End) -> Result<Flow, Error> {
+        self.core.end(end)
+    }
+
+    /// The text the open item at `index` streamed so far, set as its item's
+    /// string field `key`: for a wire whose item states its text whole,
+    /// written once instead of with each token.
+    pub fn land(&mut self, index: usize, key: &str) -> Result<(), Error> {
+        self.core.land(index, key)
+    }
+
+    /// The decoder's state for the open item at `index`; `None` for an
+    /// index not open.
+    pub fn state(&mut self, index: usize) -> Option<&mut S> {
+        self.core.get(index)?;
+        let state = self.states.iter_mut().find(|(at, _)| *at == index);
+        state.map(|(_, state)| state)
+    }
+
+    /// The open items' wire indices and the decoder's state for each, in
+    /// the order they opened.
+    pub fn open_states(&self) -> impl Iterator<Item = (usize, &S)> {
+        self.core.open.iter().filter_map(|(at, _)| {
+            let state = self.states.iter().find(|(held, _)| held == at)?;
+            Some((*at, &state.1))
+        })
+    }
+
+    /// A fresh state for the item that just opened at `index`; what closed
+    /// items left goes.
+    fn reset(&mut self, index: usize) {
+        let core = &self.core;
+        self.states
+            .retain(|(at, _)| *at != index && core.get(*at).is_some());
+        self.states.push((index, S::default()));
+    }
+}
+
 /// The wire index of the item in `open` that opened first.
-fn first_open<S>(open: &[(usize, Draft<S>)]) -> Option<usize> {
+fn first_open(open: &[(usize, Draft)]) -> Option<usize> {
     let first = open.iter().min_by_key(|(_, draft)| draft.part);
     first.map(|(index, _)| *index)
 }
 
 /// The open item at wire `index` in `open`.
-fn find<S>(open: &mut [(usize, Draft<S>)], index: usize) -> Option<&mut Draft<S>> {
+fn find(open: &mut [(usize, Draft)], index: usize) -> Option<&mut Draft> {
     let mut open = open.iter_mut();
     open.find(|(at, _)| *at == index).map(|(_, draft)| draft)
 }
