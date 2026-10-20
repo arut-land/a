@@ -51,9 +51,8 @@ fn a_crash_loop_is_the_daemons_to_refuse() {
 
     // Started by hand, without a client's lock: it refuses all the same.
     let mut by_hand = env.cmd(&["__daemon"]).spawn().unwrap();
-    // Not by connecting: the first connection it answers is its last.
-    wait_for("the socket", || env.home.endpoint().path().exists());
-    let mut conn = Conn::open(&env.home);
+    // The first connection it answers is its last.
+    let mut conn = Conn::open_when_listening(&env.home);
     let answer = conn.hello();
     assert!(
         matches!(&answer, DaemonMsg::Error { message } if message.contains("crashed 3 times")),

@@ -5,7 +5,7 @@
 mod pty;
 
 use std::fs;
-use std::io::{BufRead, BufReader, Read, Write};
+use std::io::{BufRead, BufReader, ErrorKind, Read, Write};
 use std::os::unix::fs::PermissionsExt;
 use std::os::unix::net::UnixStream;
 use std::path::{Path, PathBuf};
@@ -87,6 +87,10 @@ impl Env {
             vars: Vec::new(),
         };
         warm_up(&env.exe);
+        // The socket lives under /tmp by a hash of the home, which carries
+        // this process's pid: a failed test of an earlier run, kept to look
+        // at, may have left one that nothing listens on.
+        env.home.endpoint().remove();
         env.daemon("agent = \"echo\"\nidle_secs = 15");
         env
     }
@@ -289,6 +293,9 @@ impl Drop for Env {
     }
 }
 
+/// How long a connection waits for the daemon's next frame.
+pub const READ_TIMEOUT: Duration = Duration::from_secs(30);
+
 pub struct Conn {
     reader: BufReader<UnixStream>,
     writer: UnixStream,
@@ -313,10 +320,25 @@ pub fn hello() -> ClientMsg {
 impl Conn {
     /// A connection to `home`'s socket, before any hello.
     pub fn open(home: &Home) -> Self {
-        let stream = UnixStream::connect(home.endpoint().path()).unwrap();
-        stream
-            .set_read_timeout(Some(Duration::from_secs(30)))
-            .unwrap();
+        Self::from(UnixStream::connect(home.endpoint().path()).unwrap())
+    }
+
+    /// [`Conn::open`] to a daemon that is starting by itself: connects
+    /// until something listens, as a socket path alone may be a stale
+    /// socket's, or bound but not yet listened on. The connection that
+    /// gets through is the one kept, so nothing else knocks first.
+    pub fn open_when_listening(home: &Home) -> Self {
+        let endpoint = home.endpoint();
+        let mut stream = None;
+        wait_for("the daemon to listen", || {
+            stream = UnixStream::connect(endpoint.path()).ok();
+            stream.is_some()
+        });
+        Self::from(stream.unwrap())
+    }
+
+    fn from(stream: UnixStream) -> Self {
+        stream.set_read_timeout(Some(READ_TIMEOUT)).unwrap();
         Self {
             reader: BufReader::new(stream.try_clone().unwrap()),
             writer: stream,
@@ -338,9 +360,16 @@ impl Conn {
         self.try_recv().expect("daemon closed the connection")
     }
 
-    /// The next message, or none once the daemon has gone.
+    /// The next message, or none once the daemon has gone. A daemon that
+    /// is up but silent for [`READ_TIMEOUT`] is a failure of its own.
     pub fn try_recv(&mut self) -> Option<DaemonMsg> {
-        let msg = protocol::read_frame(&mut self.reader).ok()??;
+        let msg = match protocol::read_frame(&mut self.reader) {
+            Ok(msg) => msg?,
+            Err(e) if matches!(e.kind(), ErrorKind::WouldBlock | ErrorKind::TimedOut) => {
+                panic!("the daemon sent nothing for {READ_TIMEOUT:?}")
+            }
+            Err(_) => return None,
+        };
         self.view.fold(&msg);
         Some(msg)
     }
