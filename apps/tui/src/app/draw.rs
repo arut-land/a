@@ -14,6 +14,9 @@ use super::{App, HELP, Overlay};
 /// The input shows at most this many rows; it scrolls past them.
 const INPUT_ROWS: usize = 8;
 
+/// The slash menu shows at most this many commands.
+const MENU_ROWS: usize = 6;
+
 /// The rows under the transcript and over it, composed once per frame:
 /// inline, `height` composes them to size the viewport and `draw` then
 /// draws the same ones.
@@ -120,36 +123,36 @@ impl App {
         }) = asked
         {
             let call_text = call_title(tool, input, card.as_ref()).replace('\n', " ");
-            let room = width.saturating_sub("? approve   [ y  yes ]  [ n  no ]".len());
+            let room = width.saturating_sub("Do you want to proceed? ".len());
             out.push(Line::from([
-                Span::new(format!("? approve {}  ", ellipsize(&call_text, room)), ASK),
-                Span::button(
-                    "[ y  yes ]",
-                    Style::new().fg(Color::Green).bold(),
-                    Action::Approve(*call, true),
-                ),
-                Span::new("  ", Style::new()),
-                Span::button(
-                    "[ n  no ]",
-                    Style::new().fg(Color::Red).bold(),
-                    Action::Approve(*call, false),
-                ),
+                Span::new("Do you want to proceed? ", ASK),
+                Span::new(ellipsize(&call_text, room), MUTED),
             ]));
+            let pick = |mark: &'static str, label: &'static str, yes| {
+                let cyan = Style::new().fg(Color::Cyan);
+                Line::from([
+                    Span::button(mark, cyan, Action::Approve(*call, yes)),
+                    Span::button(label, Style::new(), Action::Approve(*call, yes)),
+                ])
+            };
+            out.push(pick("❯ ", "1. Yes", true));
+            out.push(pick("  ", "2. No", false));
         }
         if let Some((text, style)) = &self.flash {
             out.push(Line::plain(ellipsize(text, width), *style));
         }
-        out.push(rule);
+        out.extend(self.menu_rows(width));
+        out.push(rule.clone());
         let (mut rows, (cx, cy)) = self.editor.lines(width, USER);
         if self.editor.is_empty() {
             // From the column after the caret, which would hide a first
             // letter under it.
             let hint = if asked.is_some() {
-                " y approves · n denies"
+                " 1 or y approves · 2, n or esc denies"
             } else if self.client.view().session.is_none() {
                 ""
             } else if self.client.turn().running {
-                " ctrl-c stops the tool · /help"
+                " esc stops the tool · /help"
             } else {
                 " message the agent · /help"
             };
@@ -159,6 +162,7 @@ impl App {
         let skip = usize::from(cy).saturating_sub(INPUT_ROWS - 1);
         let caret_row = out.len() + usize::from(cy) - skip;
         out.extend(rows.into_iter().skip(skip).take(INPUT_ROWS));
+        out.push(rule);
         out.push(self.status(width, summary.reply));
         let last_col = u16::try_from(width.saturating_sub(1)).unwrap_or(u16::MAX);
         let caret = self.overlay.is_none().then(|| {
@@ -168,6 +172,49 @@ impl App {
             )
         });
         (out, caret)
+    }
+
+    /// The slash commands the input's first word may become, as
+    /// `(name, usage, help)`; empty once the input is more than that word.
+    pub(super) fn menu(&self) -> Vec<(String, String, String)> {
+        let typed = self.editor.text();
+        if !typed.starts_with('/') || typed.contains(char::is_whitespace) {
+            return Vec::new();
+        }
+        client::help(self.client.commands())
+            .filter_map(|(usage, help)| {
+                let name = usage.split(' ').next()?.to_owned();
+                name.starts_with(typed)
+                    .then(|| (name, usage, help.to_owned()))
+            })
+            .collect()
+    }
+
+    /// The menu over the input, a window of `MENU_ROWS` around the
+    /// selection, as Claude Code lists commands over its prompt.
+    fn menu_rows(&self, width: usize) -> Vec<Line> {
+        let entries = self.menu();
+        let at = self.menu_at.min(entries.len().saturating_sub(1));
+        let start = (at + 1).saturating_sub(MENU_ROWS);
+        entries
+            .iter()
+            .enumerate()
+            .skip(start)
+            .take(MENU_ROWS)
+            .map(|(n, (_, usage, help))| {
+                let (mark, name) = if n == at {
+                    ("❯ ", Style::new().fg(Color::Cyan).bold())
+                } else {
+                    ("  ", Style::new().fg(Color::Cyan))
+                };
+                let room = width.saturating_sub(26);
+                Line::from([
+                    Span::new(mark, name),
+                    Span::new(fit(usage, 24), name),
+                    Span::new(ellipsize(help, room), MUTED),
+                ])
+            })
+            .collect()
     }
 
     /// The rule over the input, kept from frame to frame at one width.

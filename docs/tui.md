@@ -20,19 +20,22 @@ input, overlays).
   `` `code` ``), hooks and environment changes as muted lines.
 - Tool cards: the call as its tool presents it (the `Card` from
   `Tool::present`, else the input, as every client shows it via
-  `protocol::view`), its state (running, waiting for approval, not
-  approved, the card's note such as `exit 1` or `+3 -1`, failed,
-  interrupted) and the last 10 lines of output; an edit's diff is colored.
+  `protocol::view`) behind a `⏺` in its state's color, its state (running,
+  waiting for approval, not approved, the card's note such as `exit 1` or
+  `+3 -1`, failed, interrupted) and the last 10 lines of output hung under
+  it behind `⎿`; an edit's diff is colored.
   A click on a card folds it; Ctrl-O shows every card's whole output.
   Command output has its escapes stripped. Slash commands the daemon runs
   show as cards too.
 - Approvals: the oldest call `asked()` of this client shows above the
-  input with `[ y yes ]` `[ n no ]` buttons, and on its card; `y` or `n`
-  with an empty input answers it.
+  input as `Do you want to proceed?` with `1. Yes` and `2. No`, and on its
+  card; `1`/`y` or `2`/`n` with an empty input answers it, and Esc denies.
 - The recap after an attach, as a banner (Esc or its `×` hides it).
 - Status line: link state (connecting, replaying, live, daemon upgrading,
   disconnected), session, workspace, model, tokens.
-- Input: multi-line (Ctrl-J or Alt-Enter for a new line, bracketed paste
+- Input: between two rules, `❯ `; typing `/` lists the commands it may
+  become over the input (Up/Down choose, Tab takes the name, Enter runs one
+  that takes no arguments); multi-line (Ctrl-J or Alt-Enter for a new line, bracketed paste
   keeps newlines), readline keys, Up/Down through history (seeded from the
   session's own messages).
 - `/sessions` (a picker showing each session's activity and residency;
@@ -40,12 +43,41 @@ input, overlays).
   `/env refresh`, `/interrupt`, `/detach`, `/help` (or F1). Any other
   `/name` goes to the daemon, which runs the session's slash command or
   says there is none.
-- Ctrl-C while a model call, tool call or slash command runs sends
+- Esc or Ctrl-C while a model call, tool call or slash command runs sends
   `ClientMsg::Interrupt`, which stops it and the rest of its turn; otherwise it
   clears the input, or detaches when it is empty. Nothing the client does
   stops the daemon. Ctrl-D on an empty input detaches.
 - A daemon that drains for an upgrade is reconnected and replayed from
   `SessionView::seq`; one that does not answer the hello offers a restart.
+
+## Compared with Claude Code
+
+Both programs were driven side by side with tuistory (100x40, then resized)
+in the main buffer (`A_TUI=inline`) and, for `a`, full screen. Claude Code's
+own full-screen mode was not reachable without changing its settings, so its
+layout there is taken to be the main-buffer one with the transcript pinned
+above the prompt, which is what `a` draws in both modes.
+
+| Feature | Claude Code | `a` before | Change |
+| --- | --- | --- | --- |
+| your message | `❯ text` | `› text` | `❯` |
+| reply | `⏺ text`, continuation indented 2 | text indented 2 | `⏺` leads the reply, streaming too |
+| tool card | `⏺ Name(arg)`, result under `⎿` | `▾ title  ✓ note`, `│` gutter | `⏺` in the state's color, `⎿` hung output, `… +N lines (ctrl-o to expand)` |
+| working | `✻ Thinking… (3s)` animated | `… model` | `✻ model…`, static (idle CPU stays 0) |
+| input | rule above and below, `❯ ` | rule above only | rule below too, status under it |
+| slash menu | commands over the prompt, filtered as you type | none | same, from the client's command table |
+| approval | `Do you want to proceed?` `1. Yes` `2. No`, Esc cancels | `? approve … [ y yes ] [ n no ]` | same wording and keys, buttons stay clickable |
+| interrupt | Esc | Ctrl-C | Esc as well; Ctrl-C kept |
+| scrollback (main buffer) | finished output printed above the prompt | same | unchanged |
+| `/help`, picker, detach, resize, paste, history | overlay or screen, history on Up | same set | unchanged |
+
+Still different: Claude Code's spinner animates and shows elapsed time and
+tokens (a timer would wake the client while a turn runs; `a` stays at zero
+wakeups), its menu lists more commands than `a` has, it offers "always allow"
+(no such feature here), keeps a cursor-blinking selection list for approvals
+(Enter on an empty input does not approve here, deliberately), and shows
+its status hints below the prompt where `a` has its link, session, model and
+token line. Its orange accent is not a palette entry; `a` uses yellow.
 
 Colors are the terminal's palette entries (1–7 and bright black) plus bold,
 dim, italic and reverse, never RGB or a background, so light and dark themes

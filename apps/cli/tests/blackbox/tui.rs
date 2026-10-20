@@ -20,24 +20,19 @@ fn the_full_screen_client_shows_replies_and_answers_approvals_by_click() {
     term.send(b"hello from a tty\r");
     let screen = term.wait_for("  hello from a tty");
     assert!(
-        screen.find("› hello from a tty").is_some(),
+        screen.find("❯ hello from a tty").is_some(),
         "{}",
         screen.text()
     );
 
     term.send(b"$ echo ran > ran.txt\r");
-    let screen = term.wait_for("? approve $ echo ran > ran.txt");
+    let screen = term.wait_for("Do you want to proceed? $ echo ran > ran.txt");
     assert!(screen.find("? waiting for approval").is_some());
     let ran = env.ws.join("ran.txt");
     assert!(!ran.exists(), "ran before it was approved");
-    // The approval bar's own button, on the row above the input.
-    let (x, y) = screen.find("? approve").unwrap();
-    let bar = screen.row(usize::from(y));
-    let yes = bar.find("[ y  yes ]").unwrap();
-    term.click((
-        x + u16::try_from(bar[..yes].chars().count()).unwrap() + 2,
-        y,
-    ));
+    // The approval bar's own choice, on the row under its question.
+    let (x, y) = screen.find("1. Yes").unwrap();
+    term.click((x + 2, y));
     term.wait_for("✓ exit 0");
     assert_eq!(fs::read_to_string(&ran).unwrap(), "ran\n");
 
@@ -82,7 +77,7 @@ fn the_inline_client_prints_the_transcript_into_the_scrollback() {
     let mut term = env.tty(&["resume"], 80, 24);
     let screen = term.wait_for("recap · you: $ echo first");
     assert!(
-        screen.find("› $ echo first").is_some(),
+        screen.find("❯ $ echo first").is_some(),
         "the replay is printed above the input:\n{}",
         screen.text()
     );
@@ -132,7 +127,7 @@ fn the_full_screen_client_rides_out_a_daemon_upgrade() {
     term.send(b"after the upgrade\r");
     let screen = term.wait_for("  after the upgrade");
     assert!(!screen.text().contains("disconnected"), "{}", screen.text());
-    assert_eq!(screen.text().matches("› after the upgrade").count(), 1);
+    assert_eq!(screen.text().matches("❯ after the upgrade").count(), 1);
 
     term.send(b"\x03");
     assert!(term.wait().success());

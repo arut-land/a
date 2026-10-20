@@ -24,7 +24,6 @@ pub enum Edit {
 }
 
 impl Editor {
-    #[cfg(test)]
     pub fn text(&self) -> &str {
         &self.text
     }
@@ -194,7 +193,7 @@ impl Editor {
         self.browsing = Some((at, draft));
     }
 
-    /// The input as rows `width` wide behind a `› ` prompt, and the
+    /// The input as rows `width` wide behind a `❯ ` prompt, and the
     /// cursor's (column, row) among them.
     pub fn lines(&self, width: usize, prompt: Style) -> (Vec<Line>, (u16, u16)) {
         let mut rows = Vec::new();
@@ -202,7 +201,7 @@ impl Editor {
         let mut offset = 0;
         for (n, logical) in self.text.split('\n').enumerate() {
             let first = if n == 0 {
-                Span::new("› ", prompt)
+                Span::new("❯ ", prompt)
             } else {
                 Span::new("  ", prompt)
             };
@@ -305,7 +304,7 @@ mod tests {
         typed(&mut e, "abcdef\nx");
         let (rows, cursor) = e.lines(6, Style::new());
         let rows: Vec<String> = rows.iter().map(Line::text).collect();
-        assert_eq!(rows, ["› abcd", "  ef", "  x"]);
+        assert_eq!(rows, ["❯ abcd", "  ef", "  x"]);
         assert_eq!(cursor, (3, 2));
         e.key(Key::Up);
         let (_, cursor) = e.lines(6, Style::new());

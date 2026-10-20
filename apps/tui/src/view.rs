@@ -59,7 +59,7 @@ pub fn rows(item: &Item, width: usize, look: Look) -> Vec<Line> {
         Kind::User => {
             let mut out = vec![blank];
             for (n, line) in sanitize(&p.body.text()).split('\n').enumerate() {
-                let first = Span::new(if n == 0 { "› " } else { "  " }, USER);
+                let first = Span::new(if n == 0 { "❯ " } else { "  " }, USER);
                 let body = [Span::new(line, Style::new().bold())];
                 out.extend(wrap(&body, width, &[first], &[Span::new("  ", USER)]));
             }
@@ -68,6 +68,7 @@ pub fn rows(item: &Item, width: usize, look: Look) -> Vec<Line> {
         Kind::Assistant => {
             let mut out = vec![blank];
             out.extend(markdown(&p.body.text(), width, Style::new()));
+            mark_reply(&mut out);
             out
         }
         Kind::Reply => reply(&p, width),
@@ -108,9 +109,15 @@ pub fn rows(item: &Item, width: usize, look: Look) -> Vec<Line> {
 fn reply(p: &Presented<'_>, width: usize) -> Vec<Line> {
     let mut out = vec![Line::default()];
     match (p.glyph, &p.body) {
-        (Glyph::Busy, _) => out.push(Line::plain(format!("  … {}", p.title), MUTED)),
+        (Glyph::Busy, _) => out.push(Line::from([
+            Span::new("✻ ", WARN),
+            Span::new(format!("{}…", p.title), MUTED),
+        ])),
         (Glyph::None, Shown::Markdown("")) => return Vec::new(),
-        (Glyph::None, body) => out.extend(markdown(&body.text(), width, Style::new())),
+        (Glyph::None, body) => {
+            out.extend(markdown(&body.text(), width, Style::new()));
+            mark_reply(&mut out);
+        }
         (glyph, _) => {
             let body = [Span::new(
                 format!("{} {}", glyph.sign(), sanitize(&p.status)),
@@ -125,6 +132,16 @@ fn reply(p: &Presented<'_>, width: usize) -> Vec<Line> {
         }
     }
     out
+}
+
+/// A reply's first row (after the blank one) led by `⏺`, as Claude Code
+/// marks the model's turn; the rows under it keep the two-column indent.
+pub fn mark_reply(rows: &mut [Line]) {
+    if let Some(first) = rows.get_mut(1).and_then(|row| row.spans.first_mut())
+        && first.text.as_str() == "  "
+    {
+        *first = Span::new("⏺ ", Style::new());
+    }
 }
 
 /// Where a reply streaming in was wrapped to: the lines that ended are
@@ -165,6 +182,7 @@ impl Live {
         if let Some(last) = rows.last_mut() {
             last.spans.push(Span::new("▍", MUTED));
         }
+        mark_reply(rows);
         self.seen = text.len();
     }
 }
@@ -257,16 +275,17 @@ fn card(
     let toggle = Action::Toggle(key);
     let status = status(p);
     let body = output_rows(p, input, width, look.verbose);
-    let marker = match (body.is_empty(), look.collapsed) {
-        (true, _) => "• ",
-        (false, true) => "▸ ",
-        (false, false) => "▾ ",
+    // The dot takes the state's color; the output hangs under it behind `⎿`.
+    let marker = "⏺ ";
+    let dot = match p.glyph {
+        Glyph::None => MUTED,
+        glyph => style(glyph),
     };
     let room = width.saturating_sub(2 + 2 + super::text::width_of(&status.text));
     let mut out = vec![
         Line::default(),
         Line::from([
-            Span::button(marker, MUTED, toggle),
+            Span::button(marker, dot, toggle),
             Span::button(
                 ellipsize(&sanitize(&p.title).replace('\n', " "), room),
                 Style::new().bold(),
@@ -276,9 +295,10 @@ fn card(
             Span::button(status.text, status.style, toggle),
         ]),
     ];
+    let from = out.len();
     if look.collapsed {
         if !body.is_empty() {
-            out.push(Line::plain(format!("  │ {} lines", body.len()), MUTED));
+            out.push(Line::plain(format!("     {} lines", body.len()), MUTED));
         }
     } else {
         let hidden = if look.verbose {
@@ -288,12 +308,15 @@ fn card(
         };
         if hidden > 0 {
             out.push(Line::from([Span::button(
-                format!("  │ ⋯ {hidden} earlier lines (ctrl-o shows all)"),
+                format!("     … +{hidden} lines (ctrl-o to expand)"),
                 MUTED,
                 toggle,
             )]));
         }
         out.extend(body.into_iter().skip(hidden));
+    }
+    if let Some(first) = out.get_mut(from).and_then(|row| row.spans.first_mut()) {
+        first.text = format!("  ⎿  {}", first.text.trim_start_matches(' ')).into();
     }
     if let Buttons::Approve(call) = p.buttons {
         out.push(approve_row(call));
@@ -311,9 +334,9 @@ fn approve_row(call: CallId) -> Line {
     ])
 }
 
-/// A call's output rows behind the card's `│` gutter; a diff colored as one.
+/// A call's output rows indented under the card's header; a diff colored as one.
 fn output_rows(p: &Presented<'_>, input: Option<&Json>, width: usize, verbose: bool) -> Vec<Line> {
-    let bar = [Span::new("  │ ", MUTED)];
+    let bar = [Span::new("     ", MUTED)];
     let mut rows = Vec::new();
     let mut add = |text: &str, style: Style, diff: bool| {
         for line in sanitize(text).split('\n') {
@@ -373,9 +396,9 @@ mod tests {
             });
         }
         let rows = texts(&rows(&finished, 40, Look::default()));
-        assert_eq!(rows[1], "▾ $ ls  ✓ exit 0");
-        assert_eq!(rows[2], "  │ ⋯ 5 earlier lines (ctrl-o shows all)");
-        assert_eq!(rows.last().unwrap(), "  │ line 15");
+        assert_eq!(rows[1], "⏺ $ ls  ✓ exit 0");
+        assert_eq!(rows[2], "  ⎿  … +5 lines (ctrl-o to expand)");
+        assert_eq!(rows.last().unwrap(), "     line 15");
         let all = rows_of(
             &finished,
             Look {
@@ -391,7 +414,7 @@ mod tests {
                 ..Look::default()
             },
         );
-        assert_eq!(folded[1..], ["▸ $ ls  ✓ exit 0", "  │ 15 lines"]);
+        assert_eq!(folded[1..], ["⏺ $ ls  ✓ exit 0", "  ⎿  15 lines"]);
     }
 
     fn rows_of(item: &Item, look: Look) -> Vec<String> {
@@ -402,7 +425,7 @@ mod tests {
     fn a_card_waiting_for_approval_has_buttons() {
         let item = tool(None, Phase::Waiting(WaitOn::Approval));
         let lines = rows(&item, 60, Look::default());
-        assert_eq!(texts(&lines)[1], "• $ ls  ? waiting for approval");
+        assert_eq!(texts(&lines)[1], "⏺ $ ls  ? waiting for approval");
         let buttons: Vec<_> = lines[2].spans.iter().filter_map(|s| s.action).collect();
         let call = CallId::new(7).unwrap();
         assert_eq!(
@@ -421,11 +444,11 @@ mod tests {
             usage: None,
             purpose: None,
         };
-        assert_eq!(rows_of(&item, Look::default())[1], "  … echo");
+        assert_eq!(rows_of(&item, Look::default())[1], "✻ echo…");
         let mut live = Live::default();
         let mut lines = Vec::new();
         live.update(&mut lines, "hello **world**", 40);
-        assert_eq!(texts(&lines)[1], "  hello world▍");
+        assert_eq!(texts(&lines)[1], "⏺ hello world▍");
     }
 
     #[test]
@@ -438,6 +461,7 @@ mod tests {
             live.update(&mut lines, &text[..end], 20);
             let mut whole = vec![Line::default()];
             whole.extend(markdown(&text[..end], 20, Style::new()));
+            mark_reply(&mut whole);
             whole.last_mut().unwrap().spans.push(Span::new("▍", MUTED));
             assert_eq!(lines, whole, "at {end}");
         }
@@ -476,7 +500,7 @@ mod tests {
             });
         }
         let lines = rows(&ran, 40, Look::default());
-        assert_eq!(texts(&lines)[1..], ["▾ $ ls  ✗ exit 1", "  │ red"]);
+        assert_eq!(texts(&lines)[1..], ["⏺ $ ls  ✗ exit 1", "  ⎿  red"]);
         assert_eq!(lines[1].spans[3].style, BAD);
     }
 
@@ -502,10 +526,10 @@ mod tests {
         assert_eq!(
             texts(&lines)[1..],
             [
-                "▾ edit a.txt  ✓ +1 -1",
-                "  │ @@ -2,1 +2,1 @@",
-                "  │ -two",
-                "  │ +2"
+                "⏺ edit a.txt  ✓ +1 -1",
+                "  ⎿  @@ -2,1 +2,1 @@",
+                "     -two",
+                "     +2"
             ]
         );
         let color = |row: usize| lines[row].spans[1].style;
@@ -524,7 +548,7 @@ mod tests {
             by: Audience::User,
         };
         assert!(!item.settled());
-        assert_eq!(rows_of(&item, Look::default())[1], "• /model  running…");
+        assert_eq!(rows_of(&item, Look::default())[1], "⏺ /model  running…");
         if let Item::Tool { outcome, .. } = &mut item {
             *outcome = Some(Outcome::Failed {
                 error: "no command /model".into(),
@@ -532,7 +556,7 @@ mod tests {
         }
         assert_eq!(
             rows_of(&item, Look::default())[1..],
-            ["▾ /model  ✗ failed", "  │ no command /model"]
+            ["⏺ /model  ✗ failed", "  ⎿  no command /model"]
         );
     }
 }

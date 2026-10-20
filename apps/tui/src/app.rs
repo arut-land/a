@@ -80,6 +80,8 @@ pub struct App {
     width: usize,
     body: u16,
     editor: Editor,
+    /// The slash menu's selected command.
+    menu_at: usize,
     overlay: Option<Overlay>,
     /// A one-line notice (an error, a refused command) until the next key.
     flash: Option<(String, Style)>,
@@ -133,6 +135,7 @@ impl App {
             width: 0,
             body: 0,
             editor: Editor::default(),
+            menu_at: 0,
             overlay: None,
             flash: None,
             recap_hidden: false,
@@ -310,17 +313,61 @@ impl App {
             Key::PageDown => self.scroll_by(-page),
             Key::F(1) => self.overlay = Some(Overlay::Help),
             Key::Esc if self.anchor.is_some() => self.anchor = None,
-            Key::Esc => self.recap_hidden = true,
-            Key::Char(c @ ('y' | 'n' | 'Y' | 'N')) if self.editor.is_empty() && asked.is_some() => {
+            Key::Char(c @ ('y' | 'n' | 'Y' | 'N' | '1' | '2'))
+                if self.editor.is_empty() && asked.is_some() =>
+            {
                 let call = asked?;
                 return Some(Effect::Cmd(Cmd::Approve {
                     call,
-                    approved: c.eq_ignore_ascii_case(&'y'),
+                    approved: matches!(c, 'y' | 'Y' | '1'),
                 }));
             }
+            Key::Esc if self.editor.is_empty() && asked.is_some() => {
+                return Some(Effect::Cmd(Cmd::Approve {
+                    call: asked?,
+                    approved: false,
+                }));
+            }
+            // Esc stops a running turn, as in Claude Code, once there is
+            // nothing to scroll back from.
+            Key::Esc if self.anchor.is_none() && self.client.turn().can_interrupt => {
+                return Some(self.interrupt());
+            }
+            Key::Esc => self.recap_hidden = true,
             key => {
-                if let Edit::Submit(text) = self.editor.key(key) {
-                    return self.submit(&text);
+                let menu = self.menu();
+                let last = menu.len().saturating_sub(1);
+                let at = self.menu_at.min(last);
+                match key {
+                    Key::Up | Key::Ctrl('p') if !menu.is_empty() => {
+                        self.menu_at = at.saturating_sub(1)
+                    }
+                    Key::Down | Key::Ctrl('n') if !menu.is_empty() => {
+                        self.menu_at = (at + 1).min(last)
+                    }
+                    // Tab takes the selected name; a command with
+                    // arguments waits for them, one without runs on Enter.
+                    Key::Tab | Key::Enter
+                        if !menu.is_empty() && self.editor.text() != menu[at].0 =>
+                    {
+                        let (name, usage, _) = &menu[at];
+                        let args = usage.len() > name.len();
+                        self.editor.clear();
+                        self.editor.insert(name);
+                        if args {
+                            self.editor.insert(" ");
+                        } else if key == Key::Enter {
+                            if let Edit::Submit(text) = self.editor.key(Key::Enter) {
+                                return self.submit(&text);
+                            }
+                        }
+                    }
+                    key => {
+                        self.menu_at = 0;
+                        if let Edit::Submit(text) = self.editor.key(key) {
+                            return self.submit(&text);
+                        }
+                    }
                 }
             }
         }

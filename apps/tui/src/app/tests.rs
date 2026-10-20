@@ -103,6 +103,13 @@ fn typed(app: &mut App, text: &str) -> Option<Effect> {
     press(app, Key::Enter)
 }
 
+/// Types `text` without sending it.
+fn keys(app: &mut App, text: &str) {
+    for c in text.chars() {
+        press(app, Key::Char(c));
+    }
+}
+
 fn asked_command() -> Vec<DaemonMsg> {
     vec![
         entry(
@@ -145,15 +152,15 @@ fn asked_command() -> Vec<DaemonMsg> {
 fn an_approval_shows_buttons_and_y_or_a_click_answers_it() {
     let (mut app, _) = app(Viewport::Full, &asked_command());
     let (_, rows) = frame(&mut app, 70, 20);
-    assert!(rows.iter().any(|r| r == "› $ ls"), "{rows:#?}");
-    find(&rows, "• $ ls  ? waiting for approval");
-    let bar = find(&rows, "? approve $ ls");
-    assert_eq!(bar.1, 16, "above the input: {rows:#?}");
+    assert!(rows.iter().any(|r| r == "❯ $ ls"), "{rows:#?}");
+    find(&rows, "⏺ $ ls  ? waiting for approval");
+    let bar = find(&rows, "Do you want to proceed? $ ls");
+    assert_eq!(bar.1, 13, "above the input: {rows:#?}");
     assert!(matches!(
         press(&mut app, Key::Char('y')),
         Some(Effect::Cmd(Cmd::Approve { call, approved: true })) if call.get() == 3
     ));
-    let (x, y) = find(&rows, "[ n  no ]");
+    let (x, y) = find(&rows, "2. No");
     assert!(matches!(
         app.input(Input::Mouse(Mouse::Press { x: x + 2, y })),
         Some(Effect::Cmd(Cmd::Approve { call, approved: false })) if call.get() == 3
@@ -233,7 +240,7 @@ fn a_streamed_reply_shows_live_then_its_committed_text() {
         },
     ));
     let (_, rows) = frame(&mut app, 50, 12);
-    find(&rows, "  Hello you!");
+    find(&rows, "⏺ Hello you!");
     assert!(!rows.iter().any(|r| r.contains('▍')));
     find(&rows, "gpt  ↑12 ↓3");
 }
@@ -302,17 +309,17 @@ fn a_card_folds_on_click_and_ctrl_o_shows_all_output() {
     ));
     let (mut app, _) = app(Viewport::Full, &msgs);
     let (_, rows) = frame(&mut app, 60, 40);
-    find(&rows, "⋯ 20 earlier lines");
-    let (x, y) = find(&rows, "▾ $ ls  ✓ exit 0");
+    find(&rows, "… +20 lines");
+    let (x, y) = find(&rows, "⏺ $ ls  ✓ exit 0");
     assert!(app.input(Input::Mouse(Mouse::Press { x, y })).is_none());
     let (_, rows) = frame(&mut app, 60, 40);
-    find(&rows, "▸ $ ls  ✓ exit 0");
-    find(&rows, "│ 30 lines");
-    let (x, y) = find(&rows, "▸ $ ls");
+    find(&rows, "⏺ $ ls  ✓ exit 0");
+    find(&rows, "⎿  30 lines");
+    let (x, y) = find(&rows, "⏺ $ ls");
     app.input(Input::Mouse(Mouse::Press { x, y }));
     press(&mut app, Key::Ctrl('o'));
     let (_, rows) = frame(&mut app, 60, 40);
-    find(&rows, "│ out 1");
+    find(&rows, "out 1");
 }
 
 #[test]
@@ -416,7 +423,7 @@ fn ctrl_c_interrupts_a_running_call_and_shows_how_it_ended() {
         },
     ));
     let (_, rows) = frame(&mut app, 60, 12);
-    find(&rows, "• $ ls  ✗ aborted · killed by SIGTERM");
+    find(&rows, "⏺ $ ls  ✗ aborted · killed by SIGTERM");
     assert!(
         press(&mut app, Key::Ctrl('c')).is_none(),
         "clears the input"
@@ -582,12 +589,12 @@ fn the_recap_shows_until_dismissed() {
 fn inline_prints_settled_items_once_and_keeps_the_rest_live() {
     let (mut app, _) = app(Viewport::Inline, &asked_command());
     let printed: Vec<String> = app.scrollback(60).iter().map(Line::text).collect();
-    assert!(printed.contains(&"› $ ls".to_owned()), "{printed:?}");
+    assert!(printed.contains(&"❯ $ ls".to_owned()), "{printed:?}");
     assert!(app.scrollback(60).is_empty(), "printed once");
     let height = app.height(60, 40);
     let (_, rows) = frame(&mut app, 60, height);
     find(&rows, "? waiting for approval");
-    assert!(!rows.iter().any(|r| r == "› $ ls"), "{rows:#?}");
+    assert!(!rows.iter().any(|r| r == "❯ $ ls"), "{rows:#?}");
     app.fold(&entry(
         5,
         Body::ToolResult {
@@ -939,3 +946,55 @@ unsafe impl GlobalAlloc for Counting {
 
 #[global_allocator]
 static COUNTING: Counting = Counting;
+
+#[test]
+fn a_slash_lists_the_commands_it_may_become_and_tab_takes_one() {
+    let (mut app, _) = app(Viewport::Full, &[DaemonMsg::Synced { seq: 0 }]);
+    keys(&mut app, "/s");
+    let (_, rows) = frame(&mut app, 70, 20);
+    find(&rows, "❯ /sessions");
+    find(&rows, "  /steer text");
+    assert!(!rows.iter().any(|r| r.contains("/detach")), "{rows:#?}");
+    press(&mut app, Key::Down);
+    let (_, rows) = frame(&mut app, 70, 20);
+    find(&rows, "❯ /steer text");
+    assert_eq!(press(&mut app, Key::Tab), None);
+    assert_eq!(app.editor.text(), "/steer ");
+    let (_, rows) = frame(&mut app, 70, 20);
+    assert!(!rows.iter().any(|r| r.contains("/sessions")), "{rows:#?}");
+}
+
+#[test]
+fn enter_on_a_partial_command_without_arguments_runs_it() {
+    let (mut app, _) = app(Viewport::Full, &[DaemonMsg::Synced { seq: 0 }]);
+    keys(&mut app, "/deta");
+    assert_eq!(press(&mut app, Key::Enter), Some(Effect::Detach));
+}
+
+#[test]
+fn the_input_sits_between_two_rules() {
+    let (mut app, _) = app(Viewport::Full, &[DaemonMsg::Synced { seq: 0 }]);
+    let (_, rows) = frame(&mut app, 30, 10);
+    let rule = "─".repeat(30);
+    assert_eq!(
+        (rows[6].as_str(), rows[8].as_str()),
+        (rule.as_str(), rule.as_str())
+    );
+    assert!(rows[7].starts_with("❯ "), "{rows:#?}");
+}
+
+#[test]
+fn esc_denies_an_approval_and_1_approves_it() {
+    let (mut app, _) = app(Viewport::Full, &asked_command());
+    assert!(matches!(
+        press(&mut app, Key::Esc),
+        Some(Effect::Cmd(Cmd::Approve {
+            approved: false,
+            ..
+        }))
+    ));
+    assert!(matches!(
+        press(&mut app, Key::Char('1')),
+        Some(Effect::Cmd(Cmd::Approve { approved: true, .. }))
+    ));
+}
