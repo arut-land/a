@@ -102,10 +102,10 @@ struct Manual {
 
 impl rt::Runtime for Manual {
     fn spawn(&self, task: rt::BoxFuture<'static, ()>) {
-        if !self.captured.swap(true, Ordering::SeqCst) {
-            *lock(&self.actor) = Some(task);
-        } else {
+        if self.captured.swap(true, Ordering::SeqCst) {
             self.background.spawn(task);
+        } else {
+            *lock(&self.actor) = Some(task);
         }
     }
 
