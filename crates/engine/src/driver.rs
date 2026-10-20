@@ -956,9 +956,9 @@ impl Actor {
         self.live.session.shared.rt.spawn(Box::pin(async move {
             let (replied, message) = match work {
                 Ok((model, request)) => {
-                    let deltas = |text: &str| live.delta(call, attempt, text);
+                    let mut deltas = |text: &str| live.delta(call, attempt, text);
                     let replying: BoxFuture<'_, _> =
-                        Box::pin(reply(&model, &request, &cancel, deltas));
+                        Box::pin(reply(&model, &request, &cancel, &mut deltas));
                     contain(replying).await
                 }
                 // Said so the user can fix it; sending again would not.
@@ -1668,14 +1668,14 @@ impl ext::Models for Own {
             }
             .map_err(invalid)?;
             let of = CallId::new(cx.call).ok_or_else(|| invalid("no call to ask for".into()))?;
-            let (reply, opened) = oneshot::channel();
+            let (asking, opened) = oneshot::channel();
             let purpose = side.purpose.to_string();
             let _ = session.mail.send(Msg::Side {
                 of,
                 purpose,
                 model: model.name(),
                 conversation: side.conversation,
-                reply,
+                reply: asking,
             });
             let Some(Some((id, conversation))) = opened.await else {
                 return Err(invalid(format!("call {of} is not open to ask for")));
@@ -1692,29 +1692,33 @@ impl ext::Models for Own {
             request.model = model.id();
             request.generation.max_output_tokens =
                 std::num::NonZeroU32::new(side.budget.max_tokens);
-            let asked = async {
-                let mut events = model.send(&request);
-                crate::model::read(&mut events, &mut |_| {}).await?;
-                events.finish(Some(model.origin(&request)))
-            };
+            // Read as the call's own replies are, with nothing streamed.
+            let mut quiet = |_: &str| {};
+            let asked = reply(&model, &request, &cx.cancel, &mut quiet);
             let timeout = session.shared.rt.sleep(side.budget.timeout);
-            let answer = match first(asked, timeout).await {
-                Some(answer) => answer,
-                None => Err(llm::Error::new(
-                    llm::Kind::Transport,
-                    "the side request timed out",
-                )),
-            };
-            let outcome = match &answer {
-                Ok(response) => match Json::encode(response) {
-                    Ok(output) => Outcome::Done { output },
-                    Err(e) => Outcome::Failed {
-                        error: e.to_string(),
-                    },
-                },
-                Err(error) => Outcome::Failed {
-                    error: error.to_string(),
-                },
+            let (outcome, answer) = match first(asked, timeout).await.map(|(replied, _)| replied) {
+                Some(Replied::Done(output)) => {
+                    let answer = llm::Response::from_json(output.raw())
+                        .map_err(|e| llm::Error::new(llm::Kind::Decode, e.to_string()));
+                    (Outcome::Done { output }, answer)
+                }
+                Some(Replied::Failed(error)) => {
+                    let failed = Outcome::Failed {
+                        error: error.to_string(),
+                    };
+                    (failed, Err(error))
+                }
+                Some(Replied::Interrupted(output)) => {
+                    let error = llm::Error::new(llm::Kind::Incomplete, "the call ended first");
+                    (Outcome::Interrupted { output }, Err(error))
+                }
+                None => {
+                    let error = llm::Error::new(llm::Kind::Transport, "the side request timed out");
+                    let failed = Outcome::Failed {
+                        error: error.to_string(),
+                    };
+                    (failed, Err(error))
+                }
             };
             let _ = session
                 .mail
@@ -1797,13 +1801,13 @@ async fn reply(
     model: &Model,
     request: &llm::Request,
     cancel: &Cancel,
-    mut deltas: impl FnMut(&str) + Send,
+    deltas: &mut (dyn FnMut(&str) + Send),
 ) -> (Replied, Option<llm::Assistant>) {
     // Sent once polled, as an interrupt meanwhile finds it.
     let mut events = None;
     let reading = async {
         let events = events.insert(model.send(request));
-        crate::model::read(events, &mut deltas).await
+        crate::model::read(events, deltas).await
     };
     let reading: BoxFuture<'_, _> = Box::pin(reading);
     let Some(read) = unless(cancel, reading).await else {

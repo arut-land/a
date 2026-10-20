@@ -90,9 +90,31 @@ impl Extension for Compact {
 }
 
 /// About how many tokens `request`'s messages are: a quarter of their
-/// encoded bytes. Asked only with a threshold set.
+/// text, a JSON output's as a few hundred, and media as a thousand.
 fn estimate(request: &llm::Request) -> u64 {
-    let bytes = serde_json::to_vec(&request.messages).map_or(0, |b| b.len());
+    use llm::{Message, Output, UserPart};
+    let parts = |parts: &[UserPart]| -> usize {
+        (parts.iter())
+            .map(|p| match p {
+                UserPart::Text(t) => t.text.len(),
+                UserPart::Media(_) => 4000,
+            })
+            .sum()
+    };
+    let bytes: usize = (request.messages.iter())
+        .map(|m| match m {
+            Message::System(s) => s.text().len(),
+            Message::User(u) => parts(&u.content),
+            Message::Assistant(a) => a.text().len(),
+            Message::Tool(t) => (t.results.iter())
+                .map(|r| match &r.output {
+                    Output::Text(text) => text.len(),
+                    Output::Json(_) => 1000,
+                    Output::Content(content) => parts(content),
+                })
+                .sum(),
+        })
+        .sum();
     u64::try_from(bytes / 4).unwrap_or(u64::MAX)
 }
 

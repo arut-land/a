@@ -49,7 +49,8 @@ impl Json {
     /// The payload as a `T`, read straight from the text: one that
     /// borrows (a `&str`, a `&RawValue`) borrows it.
     pub fn parse<'a, T: Deserialize<'a>>(&'a self) -> serde_json::Result<T> {
-        serde_json::from_str(self.raw())
+        // From bytes, as every other decoder reads: one reader's code.
+        serde_json::from_slice(self.raw().as_bytes())
     }
 }
 

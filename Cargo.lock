@@ -630,7 +630,6 @@ dependencies = [
  "llm",
  "protocol",
  "rt",
- "serde_json",
 ]
 
 [[package]]
