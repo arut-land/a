@@ -6,14 +6,13 @@ publish.workspace = true
 
 [features]
 # The fixtures themselves; off, the crate is empty.
-on = ["dep:protocol", "dep:rt", "dep:serde", "dep:serde_json"]
+on = ["dep:protocol", "dep:rt", "dep:serde"]
 
 [dependencies]
 ext.workspace = true
 protocol = { workspace = true, optional = true }
 rt = { workspace = true, optional = true }
 serde = { workspace = true, optional = true }
-serde_json = { workspace = true, optional = true }
 
 [dev-dependencies]
 protocol.workspace = true

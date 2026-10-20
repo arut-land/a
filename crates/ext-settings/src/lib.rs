@@ -3,7 +3,7 @@
 
 use ext::{Args, Cx, Extension, Registrar, Tool};
 use protocol::{Audience, Overrides};
-use serde_json::{Value, json};
+use serde::Serialize;
 
 /// The `settings` extension.
 pub struct Settings;
@@ -22,15 +22,22 @@ impl Extension for Settings {
 /// layer, and `/model reset` leaves it to them again.
 struct Model;
 
+/// The session's model, and the layer that names it.
+#[derive(Serialize)]
+struct Chosen {
+    model: String,
+    from: String,
+}
+
 impl Tool for Model {
     type In = Args;
-    type Out = Value;
+    type Out = Chosen;
 
     const NAME: &'static str = "model";
     const DESCRIPTION: &'static str = "set the session's model";
     const AUDIENCE: Audience = Audience::User;
 
-    async fn call(&self, Args { args }: &Args, cx: &Cx) -> Result<Value, String> {
+    async fn call(&self, Args { args }: &Args, cx: &Cx) -> Result<Chosen, String> {
         let args = args.as_str();
         let settings = cx
             .service::<dyn ext::Settings>()
@@ -43,6 +50,6 @@ impl Tool for Model {
                 .map_err(|e| e.to_string())?;
         }
         let (model, from) = settings.model(cx)?;
-        Ok(json!({ "model": model, "from": from }))
+        Ok(Chosen { model, from })
     }
 }

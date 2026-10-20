@@ -278,7 +278,7 @@ impl View for Cx {
 /// [`Tool::present`] and [`Tool::present_result`] describe.
 pub trait Tool: Send + Sync + 'static {
     type In: DeserializeOwned + Schema + Send + Sync;
-    type Out: Serialize + DeserializeOwned + Send;
+    type Out: Serialize + Send;
 
     const NAME: &'static str;
     const DESCRIPTION: &'static str;

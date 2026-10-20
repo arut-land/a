@@ -698,7 +698,7 @@ version = "0.0.0"
 dependencies = [
  "ext",
  "protocol",
- "serde_json",
+ "serde",
 ]
 
 [[package]]

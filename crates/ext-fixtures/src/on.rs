@@ -5,7 +5,6 @@ use ext::{
 };
 use protocol::Json;
 use serde::{Deserialize, Serialize};
-use serde_json::json;
 
 /// The `fixtures` extension.
 pub struct Fixtures;
@@ -25,6 +24,15 @@ impl Extension for Fixtures {
 /// be exercised without a model.
 pub struct Echo;
 
+/// A call's input, as each tool reads it.
+#[derive(Serialize)]
+#[serde(untagged)]
+enum Call<'a> {
+    Task { prompt: &'a str },
+    Bash { command: &'a str },
+    Sleep { seconds: u64 },
+}
+
 impl Agent for Echo {
     fn step(&mut self, input: Input, _: &dyn LoopPoints) -> Actions {
         let text = match input {
@@ -36,11 +44,11 @@ impl Agent for Echo {
             Input::ToolDone { .. } | Input::ModelDone { .. } => return Actions::new(),
         };
         let (tool, input) = if let Some(prompt) = text.strip_prefix("spawn ") {
-            ("task", json!({ "prompt": prompt }))
+            ("task", Call::Task { prompt })
         } else if let Some(command) = text.strip_prefix("$ ") {
-            ("bash", json!({ "command": command }))
+            ("bash", Call::Bash { command })
         } else if let Some(Ok(seconds)) = text.strip_prefix("sleep ").map(str::parse::<u64>) {
-            (Sleep::NAME, json!({ "seconds": seconds }))
+            (Sleep::NAME, Call::Sleep { seconds })
         } else {
             return Actions::from_elem(Action::Say(text), 1);
         };
