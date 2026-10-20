@@ -255,7 +255,9 @@ impl Slot {
     }
 
     /// The actor still stopping, if any; one that has ended leaves the
-    /// session hibernated, as it last listed, and nothing of it held.
+    /// session hibernated, as it last listed, and nothing of it held. The
+    /// actor's end makes the transition ([`Daemon::ended`]); whoever waits
+    /// for it only reads it.
     fn ending(&self) -> Option<Flag> {
         let mut residency = lock(&self.residency);
         let Residency::Stopping(live) = &*residency else {
@@ -589,17 +591,18 @@ impl Daemon {
         }
     }
 
+    /// Session `id`'s actor ended: it is hibernated, as it last listed.
+    fn ended(&self, id: SessionId) {
+        if let Some(slot) = self.slot(id) {
+            slot.ending();
+        }
+        self.pulse.notify();
+    }
+
     /// Every session as it lists, newest first, from memory: no log is
     /// read.
     fn list(&self) -> Vec<SessionSummary> {
-        let mut sessions: Vec<SessionSummary> = self
-            .slots()
-            .iter()
-            .map(|slot| {
-                slot.ending();
-                slot.summary()
-            })
-            .collect();
+        let mut sessions: Vec<SessionSummary> = self.slots().iter().map(|s| s.summary()).collect();
         // Ids are UUIDv7: they order by creation.
         sessions.sort_by_key(|s| std::cmp::Reverse(s.id.0));
         sessions
@@ -608,7 +611,6 @@ impl Daemon {
     /// Unloads sessions idle for `after`: no attachments, work or jobs.
     fn hibernate(&self, after: Duration) {
         for slot in self.slots() {
-            slot.ending();
             let idle = slot.live().is_some_and(|s| s.idle_for() >= after);
             if idle && slot.unload() {
                 session_event("hibernate", slot.header.id, String::new);

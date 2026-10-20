@@ -602,12 +602,12 @@ impl Actor {
             self.live.ended.clone(),
             self.live.session.shared.daemon.clone(),
         );
-        let changed = Arc::clone(&self.live.session);
+        let session = Arc::clone(&self.live.session);
         drop((self, mail));
         ended.set();
-        changed.changed.notify();
+        session.changed.notify();
         if let Some(daemon) = daemon.upgrade() {
-            daemon.pulse.notify();
+            daemon.ended(session.id);
         }
     }
 
