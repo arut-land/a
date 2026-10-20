@@ -337,7 +337,7 @@ fn no_writer_outlives_its_daemon() {
     let id = waiting.session().id;
     drop(daemon);
 
-    let over = ended.iter().map(super::Ended::is_over).collect::<Vec<_>>();
+    let over = ended.iter().map(ext::Flag::is_set).collect::<Vec<_>>();
     let store = Jsonl::open(home.sessions_dir()).unwrap();
     let at_exit = store.count(id).unwrap();
     // A client still holding on cannot write either: the log is closed.
@@ -365,7 +365,7 @@ fn a_hibernated_session_reloads_only_after_its_actor_has_exited() {
     // at once.
     daemon.hibernate(Duration::ZERO);
     let again = daemon.attach_to(&Target::Id(id), || "/w".into()).unwrap();
-    let over = first.is_over();
+    let over = first.is_set();
     let asks = again.session().summary().activity;
     drop(again);
     drop(daemon);
@@ -825,7 +825,7 @@ fn the_supervisor_sleeps_until_a_deadline_and_never_polls() {
     wait_until("hibernation", hibernated);
     let after = detached.elapsed();
     // The actor's end, which it tells the supervisor, is the last news.
-    rt::block_on(ended.over());
+    rt::block_on(ended.wait());
     let mut wakes = EVENTS.count("wake");
     loop {
         std::thread::sleep(Duration::from_millis(100));
@@ -1019,7 +1019,7 @@ fn hibernating_frees_the_session() {
     let ended = attachment.session().ended();
     drop(attachment);
     daemon.hibernate(Duration::ZERO);
-    rt::block_on(ended.over());
+    rt::block_on(ended.wait());
     // What lists it lets the stopped session go.
     let listed = daemon.list().remove(0);
     let freed = live.upgrade().is_none();

@@ -9,18 +9,19 @@ use serde_json::{Map, Value, json};
 
 use super::merge::merge_fields;
 use super::{
-    KEY, LaterSystem, PartKind, Quirks, ReasoningField, Routing, Vendor as V, rewrite, rules,
+    KEY, LaterSystem, PROTOCOL, PartKind, Quirks, ReasoningField, Routing, Vendor as V, rewrite,
+    rules,
 };
 use crate::conversation::{self, Fold, History, Settled};
 use crate::error::Error;
 use crate::json::{Lenient, obj};
 use crate::models::openai;
-use crate::protocol::Target;
+use crate::protocol::{Encoded, Target};
 use crate::protocols::schema;
 use crate::replay::{Replay, replay, replays};
 use crate::spec::{
     Assistant, AssistantPart, Format, Media, Message, Output, Request, Source, Tool, ToolCall,
-    ToolChoice, ToolResult, UserPart,
+    ToolChoice, ToolResult, ToolWire, UserPart,
 };
 
 /// What replaces an image for a model that reads none.
@@ -97,22 +98,6 @@ pub(super) struct Context {
     custom: Vec<String>,
 }
 
-/// What media a host takes: content parts at all, media beyond images, and
-/// video.
-impl Context {
-    fn parts(&self) -> bool {
-        !matches!(self.quirks.vendor, V::DeepSeek | V::Mira)
-    }
-
-    fn files(&self) -> bool {
-        self.parts() && !matches!(self.quirks.vendor, V::Perplexity | V::Cohere | V::Ollama)
-    }
-
-    fn video(&self) -> bool {
-        self.files() && !matches!(self.quirks.vendor, V::OpenAi | V::Azure | V::Mistral)
-    }
-}
-
 fn text_part(text: &str) -> Value {
     PartKind::Text.part(text.into())
 }
@@ -130,10 +115,10 @@ fn data_url(media: &Media, data: &str) -> String {
 /// The `image_url` part an image goes as, when the host takes it in its
 /// form; a user image names a detail level, `auto`.
 fn image_url(media: &Media, ctx: &Context, user: bool) -> Option<Value> {
+    let takes = ctx.quirks.media;
     let url = match &media.source {
-        Source::Data { data } if ctx.parts() => data_url(media, data),
-        // Ollama reads an image as data and never fetches a URL.
-        Source::Url { url } if ctx.parts() && ctx.quirks.vendor != V::Ollama => url.clone(),
+        Source::Data { data } if takes.parts => data_url(media, data),
+        Source::Url { url } if takes.parts && takes.url_images => url.clone(),
         Source::Data { .. } | Source::Url { .. } | Source::File { .. } => return None,
     };
     let mut part = obj!({"url": url});
@@ -156,30 +141,28 @@ fn audio_format(media_type: &str) -> &str {
 fn media_part(media: &Media, ctx: &Context) -> Result<Value, &'static str> {
     let pdf = |file_data: String| obj!({"file_data": file_data, "filename": "document.pdf"});
     let kind = media.media_type.split('/').next().unwrap_or_default();
+    let takes = ctx.quirks.media;
     match (kind, &media.source) {
         ("image", _) if !ctx.images => Err(USER_IMAGE_OMITTED),
         ("image", _) => image_url(media, ctx, true).ok_or(IMAGE_UNSENDABLE),
-        ("audio", Source::Data { data }) if ctx.files() => Ok(PartKind::InputAudio
+        ("audio", Source::Data { data }) if takes.files => Ok(PartKind::InputAudio
             .part(obj!({"data": data.as_str(), "format": audio_format(&media.media_type)}))),
         ("audio", _) => Err(AUDIO_UNSENDABLE),
-        ("video", Source::Data { data }) if ctx.video() => {
+        ("video", Source::Data { data }) if takes.video => {
             Ok(PartKind::VideoUrl.part(obj!({"url": data_url(media, data)})))
         }
-        ("video", Source::Url { url }) if ctx.video() => {
+        ("video", Source::Url { url }) if takes.video => {
             Ok(PartKind::VideoUrl.part(obj!({"url": url.as_str()})))
         }
         ("video", _) => Err(VIDEO_UNSENDABLE),
-        (_, Source::File { id }) if ctx.files() && ctx.quirks.file_ids => {
+        (_, Source::File { id }) if takes.files && ctx.quirks.file_ids => {
             Ok(PartKind::File.part(obj!({"file_id": id.as_str()})))
         }
         _ if media.media_type != "application/pdf" => Err(DOCUMENT_UNSENDABLE),
-        (_, Source::Data { data }) if ctx.files() => {
+        (_, Source::Data { data }) if takes.files => {
             Ok(PartKind::File.part(pdf(data_url(media, data))))
         }
-        // OpenRouter and Mistral fetch a PDF a URL names.
-        (_, Source::Url { url }) if matches!(ctx.quirks.vendor, V::OpenRouter | V::Mistral) => {
-            Ok(PartKind::File.part(pdf(url.clone())))
-        }
+        (_, Source::Url { url }) if takes.url_pdfs => Ok(PartKind::File.part(pdf(url.clone()))),
         _ => Err(DOCUMENT_UNSENDABLE),
     }
 }
@@ -322,6 +305,7 @@ pub(super) struct Wire {
     later: bool,
     /// Whether a tool message went.
     answered: bool,
+    /// How many messages settled.
     settled: usize,
 }
 
@@ -368,7 +352,10 @@ impl Fold for Wire {
         &self.ctx
     }
 
-    fn settle(&mut self, out: &mut Settled) {
+    /// Every message but a trailing user message, which the next may join,
+    /// settles as the host takes it.
+    fn push(&mut self, _: usize, message: &Message, out: &mut Settled) -> Result<(), Error> {
+        self.take(message);
         let user = self
             .open
             .last()
@@ -379,9 +366,12 @@ impl Fold for Wire {
             out.item(&message);
         }
         self.settled += settled;
+        Ok(())
     }
+}
 
-    fn push(&mut self, _: usize, message: &Message) -> Result<(), Error> {
+impl Wire {
+    fn take(&mut self, message: &Message) {
         let ctx = &self.ctx;
         let messages = &mut self.open;
         if let Message::System(system) = message {
@@ -393,7 +383,7 @@ impl Fold for Wire {
                 let system = |text: String| Role::System.message(vec![text_part(&text)].into());
                 messages.extend(text.map(system));
             }
-            return Ok(());
+            return;
         }
         self.begun = true;
         match message {
@@ -419,7 +409,6 @@ impl Fold for Wire {
             }
             Message::Assistant(assistant) => messages.extend(assistant_message(assistant, ctx)),
         }
-        Ok(())
     }
 }
 
@@ -608,14 +597,14 @@ fn response_format(format: &Format) -> Option<Value> {
     Some(obj!({"type": "json_schema", "json_schema": json_schema}))
 }
 
-/// The request body for `request` to `target`.
+/// The request for `request` to `target`, but its path.
 pub(super) fn body(
     quirks: &Quirks,
     target: &Target<'_>,
     request: &Request,
-) -> Result<(Value, Option<History>), Error> {
+) -> Result<Encoded, Error> {
     let model = target.model;
-    let mut options = request.options_for(KEY);
+    let mut options = request.options_for(PROTOCOL);
     // The request's own tools, function or native (Groq's
     // `browser_search`), join the typed ones.
     let passthrough = match options.remove("tools") {
@@ -624,7 +613,7 @@ pub(super) fn body(
     };
     let ctx = Context {
         quirks: *quirks,
-        images: rules::reads_images(quirks.vendor, model),
+        images: rules::reads_images(quirks, model),
         reasoning_field: rules::reasoning_field(quirks, &target.provider.base_url, model),
         custom: passthrough
             .iter()
@@ -638,18 +627,15 @@ pub(super) fn body(
     // at once, so the model can still call a tool.
     let answered = wire.answered;
     let (head, tail) = wire.finish()?;
-    let typed = request.tools.iter().filter(|_| quirks.supports_tools);
-    let mut tools: Vec<Value> = typed
-        .map(|tool| {
-            if quirks.strict_tools {
-                tool.encoded("chat strict", |tool| function_tool(tool, true))
-            } else {
-                tool.encoded("chat", |tool| function_tool(tool, false))
-            }
-        })
-        .collect();
-    tools.extend(passthrough);
-    let offers_tools = quirks.supports_tools && !tools.is_empty();
+    let strict = quirks.strict_tools;
+    let typed = (quirks.supports_tools && !request.tools.is_empty()).then(|| {
+        let wire = ToolWire::Chat { strict };
+        request
+            .tools
+            .encoded(wire, |tool| function_tool(tool, strict))
+    });
+    let has_tools = typed.is_some() || !passthrough.is_empty();
+    let offers_tools = quirks.supports_tools && has_tools;
     if offers_tools
         && matches!(quirks.vendor, V::OpenAi | V::Azure)
         && !openai::chat_calls_tools(model)
@@ -662,7 +648,7 @@ pub(super) fn body(
         .format
         .as_ref()
         .filter(|_| quirks.supports_response_format)
-        .filter(|_| quirks.response_format_with_tools || tools.is_empty() || answered)
+        .filter(|_| quirks.response_format_with_tools || !has_tools || answered)
         .and_then(response_format);
     let choice = (offers_tools && request.tool_choice != ToolChoice::Auto)
         .then(|| tool_choice(&request.tool_choice));
@@ -671,7 +657,7 @@ pub(super) fn body(
         model,
         &request.generation,
         request.parallel_tool_calls,
-        !tools.is_empty(),
+        has_tools,
     );
     let cache_key = request
         .cache_key
@@ -681,7 +667,6 @@ pub(super) fn body(
         "model": (quirks.routing == Routing::Path).then_some(model),
         "response_format": format,
         "tool_choice": choice,
-        "tools": (!tools.is_empty()).then_some(tools),
         "prompt_cache_key": cache_key.map(String::as_str),
         "stream": true,
     });
@@ -695,10 +680,21 @@ pub(super) fn body(
         head,
         settled,
         tail,
+        wrap: None,
+    });
+    let tools = has_tools.then(|| {
+        let typed = typed.map_or_default(|run| run.to_vec());
+        History::new("tools", typed, passthrough)
     });
     crate::json::overlay(&mut body, &options);
     if let Some(fields) = body.as_object_mut() {
-        rewrite::finish(quirks, fields, history.as_mut())?;
+        rewrite::finish(quirks, fields, history.as_mut(), has_tools)?;
     }
-    Ok((body, history))
+    Ok(Encoded {
+        path: String::new(),
+        body,
+        history,
+        tools,
+        headers: Vec::new(),
+    })
 }

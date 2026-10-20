@@ -18,12 +18,10 @@
 use std::collections::BTreeMap;
 use std::fmt::Write as _;
 use std::fs::File;
-use std::future::{Future, poll_fn};
+use std::future::Future;
 use std::io::{self, Read};
 use std::path::{Path, PathBuf};
-use std::pin::{Pin, pin};
 use std::process::{Child, Command as Process, ExitStatus, Stdio};
-use std::task::Poll;
 use std::time::{Duration, Instant};
 
 use protocol::{Card, Environment, Mark};
@@ -252,10 +250,10 @@ fn model_text(ran: &Ran) -> String {
 }
 
 async fn run(input: &Command, cx: &Cx, progress: Partials<String>) -> io::Result<Ran> {
-    let started = Instant::now();
+    let started = runtime(cx)?.now();
     let dir = cx.dir();
     // An interrupted turn's call starts nothing.
-    if cx.cancel.is_cancelled() {
+    if cx.cancel.is_set() {
         return Ok(Ran {
             aborted: true,
             cwd: dir,
@@ -294,7 +292,7 @@ async fn run(input: &Command, cx: &Cx, progress: Partials<String>) -> io::Result
     // `pwd -P` resolves symlinks the starting directory may have.
     if std::fs::canonicalize(&dir).ok().as_ref() != Some(&cwd) {
         let base = cx.env.as_ref().map(|env| env.cwd.as_path());
-        cx.update::<Cwd>(Cwd::change(&cwd, base));
+        cx.update::<Cwd>(&Cwd::change(&cwd, base)).await;
     }
     if done.lingering {
         cx.own(pgid, crate::job::ended(runtime(cx)?.reactor(), pgid, None));
@@ -323,7 +321,7 @@ async fn run(input: &Command, cx: &Cx, progress: Partials<String>) -> io::Result
 /// Starts the command with its output going straight to its log, and
 /// leaves it running: the session owns it from here.
 fn background(cx: &Cx, spawn: Spawn, log: &Path) -> io::Result<Ran> {
-    let started = Instant::now();
+    let started = runtime(cx)?.now();
     let (file, log) = create_private(log)?;
     let mut cmd = process(&spawn);
     cmd.stdout(file.try_clone()?).stderr(file);
@@ -380,7 +378,7 @@ fn spawn(
         env,
         cwd: dir.to_path_buf(),
     };
-    cx.spawn_hooks(&mut spawn);
+    cx.spawn_hooks(&mut spawn).map_err(io::Error::other)?;
     if spawn.argv.is_empty() {
         return Err(io::Error::other("a spawn hook left no program to run"));
     }
@@ -619,10 +617,9 @@ async fn supervise(
                 }
             });
             let running = matches!(run, Run::Running { .. });
-            let cancelled = when(running, cx.cancel.cancelled());
+            let cancelled = when(running, cx.cancel.wait());
             let sleep = when(wait.is_some(), rt.sleep(wait.unwrap_or_default()));
-            let woke = first([pin!(writes), pin!(exits), pin!(cancelled), pin!(sleep)]).await;
-            exit_seen |= woke == 1;
+            exit_seen |= exited_first(writes, exits, cancelled, sleep).await;
         }
         // Taken before reading, so a write meanwhile is the next edge.
         if let Some(written) = &written {
@@ -647,7 +644,7 @@ async fn supervise(
         }
         let seen = Seen {
             exited: if exited { None } else { child.try_wait()? },
-            cancelled: cx.cancel.is_cancelled(),
+            cancelled: cx.cancel.is_set(),
             flooded: output.bytes() > OUTPUT_CAP,
         };
         let signal;
@@ -702,6 +699,32 @@ fn follow(
     Ok(read)
 }
 
+/// Waits for whichever of the four comes first; whether it was the exit.
+async fn exited_first(
+    writes: impl Future<Output = ()>,
+    exits: impl Future<Output = ()>,
+    cancelled: impl Future<Output = ()>,
+    sleep: impl Future<Output = ()>,
+) -> bool {
+    let written = async {
+        writes.await;
+        false
+    };
+    let exited = async {
+        exits.await;
+        true
+    };
+    let stopped = async {
+        cancelled.await;
+        false
+    };
+    let slept = async {
+        sleep.await;
+        false
+    };
+    rt::or(written, rt::or(exited, rt::or(stopped, slept))).await
+}
+
 /// `future`, or one that never resolves when `cond` does not hold.
 async fn when(cond: bool, future: impl Future<Output = ()>) {
     if cond {
@@ -709,18 +732,6 @@ async fn when(cond: bool, future: impl Future<Output = ()>) {
     } else {
         std::future::pending::<()>().await;
     }
-}
-
-/// Which of `futures` resolved first.
-fn first<const N: usize>(
-    mut futures: [Pin<&mut (dyn Future<Output = ()> + Send)>; N],
-) -> impl Future<Output = usize> {
-    poll_fn(move |cx| {
-        futures
-            .iter_mut()
-            .position(|f| f.as_mut().poll(cx).is_ready())
-            .map_or(Poll::Pending, Poll::Ready)
-    })
 }
 
 #[cfg(all(test, unix))]

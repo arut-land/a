@@ -15,9 +15,10 @@
 
 use ext::point::{RequestError, Step};
 use ext::{
-    Answer, Args, Cx, Extension, Fold, Later, PointCx, Recover, Registrar, Rewrite, Side, Tool,
+    Answer, Args, Configured, Cx, Extension, Fold, Later, PointCx, Recover, Refused, Registrar,
+    Rewrite, Side, Table, Tool,
 };
-use protocol::{Audience, Seq};
+use protocol::{Audience, CallId, Seq};
 
 /// What the model is asked to write.
 const SUMMARY: &str = "The conversation above no longer fits the model's context. Write a summary of it to continue from: the user's goal and every request they made (the latest word for word), what was done and found (files, commands, results, decisions), and what is left to do. Leave out nothing a continuation needs; nothing else.";
@@ -46,10 +47,18 @@ impl Fold for Compacted {
 impl Compact {
     /// Whether a failure is one this compacts: an overflow of a call not
     /// compacted yet.
-    fn owns(cx: &PointCx<'_>, error: &llm::Error) -> Option<u64> {
+    fn owns(cx: &PointCx<'_>, error: &llm::Error) -> Option<CallId> {
         let call = cx.call?;
-        let done = cx.state(|c: &Compacted| c.0.contains(&call));
+        let done = cx.state(|c: &Compacted| c.0.contains(&call.get()));
         (error.kind == llm::Kind::ContextOverflow && !done).then_some(call)
+    }
+}
+
+impl Configured for Compact {
+    fn configure(table: &impl Table) -> Result<Self, Refused> {
+        Ok(Self {
+            threshold: table.whole("threshold")?,
+        })
     }
 }
 
@@ -74,9 +83,9 @@ impl Extension for Compact {
             .on::<Step>(move |cx, request| match threshold {
                 Some(most)
                     if estimate(request) > most
-                        && cx
-                            .call
-                            .is_some_and(|call| !cx.state(|c: &Compacted| c.0.contains(&call))) =>
+                        && cx.call.is_some_and(|call| {
+                            !cx.state(|c: &Compacted| c.0.contains(&call.get()))
+                        }) =>
                 {
                     let error = format!(
                         "the request is about {} tokens, past the {most} to compact at",
@@ -120,7 +129,7 @@ fn estimate(request: &llm::Request) -> u64 {
 
 /// Summarises the conversation before call `call` and has the model see
 /// the summary in its place from now on.
-async fn compact(cx: &Cx, call: u64) -> Result<String, String> {
+async fn compact(cx: &Cx, call: CallId) -> Result<String, String> {
     let models = cx.models().ok_or("this engine asks no model aside")?;
     let ask = [llm::Message::user(SUMMARY)].into_iter().collect();
     let side = Side::new("compact", ask).after_the_conversation();
@@ -129,11 +138,11 @@ async fn compact(cx: &Cx, call: u64) -> Result<String, String> {
     if summary.trim().is_empty() {
         return Err("the model wrote no summary".into());
     }
-    let (first, last) = (Seq::new(1), Seq::new(call.saturating_sub(1)));
+    let (first, last) = (Seq::new(1), Seq::new(call.get() - 1));
     let (Some(first), Some(last)) = (first, last) else {
         return Err("nothing to compact".into());
     };
-    cx.update::<Compacted>(call);
+    cx.update::<Compacted>(&call.get()).await;
     let text = format!("<summary of the conversation so far>\n{summary}\n</summary>");
     cx.edit(first, Some(last), Some(&text));
     Ok(summary)

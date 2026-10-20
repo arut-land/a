@@ -7,7 +7,7 @@ use std::thread;
 
 use client::{Driver, End, Endpoint, Env, Event, Link, Renderer, SessionClient, Show};
 use protocol::view::{
-    Change, Item, Kind, Part, Presented, SessionView, Shown, mismatch_line, recap_line,
+    Change, Item, Kind, Part, Presented, SessionView, Shown, answer_line, mismatch_line, recap_line,
 };
 use protocol::{CallId, Target, Verdict};
 use sys::Home;
@@ -398,7 +398,7 @@ impl Screen {
                 println!("{}", ask(&p));
             }
             (Part::Answer { approved }, _) => {
-                println!("  · {}", if approved { "approved" } else { "not approved" });
+                println!("  · {}", answer_line(approved));
             }
             _ => {}
         }
@@ -413,7 +413,7 @@ fn print_all(lines: &[String]) {
 
 /// The question a call waiting for approval puts.
 fn ask(p: &Presented<'_>) -> String {
-    format!("? approve {}  [y/n]", p.title)
+    format!("? {}  {}  [y/n]", p.title, p.status)
 }
 
 /// The lines an item starts with, as it is added.
@@ -561,13 +561,23 @@ mod parity {
                 };
                 let tui = tui::view::texts(&tui::view::rows(item, 200, look)).join("\n");
                 let web = text_of_html(&web::view::html(web::view::ItemRow { item, view: &view }));
+                // The line printer prints an item as it is added, asks when it
+                // asks, and ends it once settled: in between it says nothing.
                 let mut repl = super::added(item);
+                let asking = p.buttons != protocol::view::Buttons::None;
+                if asking {
+                    repl.push(super::ask(&p));
+                }
                 if item.settled() {
                     repl.extend(super::outcome(&p));
                 }
                 let repl = repl.join("\n");
+                let repl_status = item.settled() || asking;
+                // A reply's title is its model, shown with its usage, which the
+                // terminal keeps in its status line.
+                let title = if p.kind == Kind::Reply { "" } else { &p.title };
                 let said = [
-                    bare(&p.title),
+                    bare(title),
                     bare(&p.status),
                     match &p.body {
                         Shown::None => String::new(),
@@ -576,7 +586,10 @@ mod parity {
                 ];
                 for (name, shown) in [("tui", &tui), ("web", &web), ("repl", &repl)] {
                     let shown = bare(shown);
-                    for word in &said {
+                    for (n, word) in said.iter().enumerate() {
+                        if n == 1 && name == "repl" && !repl_status {
+                            continue;
+                        }
                         assert!(
                             shown.contains(word.as_str()),
                             "{name} leaves {word:?} out of {item:?}:\n{shown}"

@@ -2,7 +2,6 @@
 //! read from frames, and (in the modules below) the bodies requests and
 //! replayed turns become.
 
-mod bench;
 mod history;
 mod merge;
 mod options;
@@ -804,7 +803,6 @@ pub(super) fn request(model: &str, messages: Vec<Message>) -> Request {
                     description: "a tool the conversation calls".to_owned(),
                     schema: json!({"type": "object", "properties": {}}),
                     strict: None,
-                    encoded: crate::Encodings::default(),
                 });
             }
         }
@@ -832,4 +830,19 @@ pub(super) fn sent_to(provider: &Provider, request: &Request) -> Result<(String,
 
 pub(super) fn sent(provider: &Provider, request: &Request) -> Value {
     sent_to(provider, request).expect("the request encodes").1
+}
+
+/// What a host takes is stated by its row in the table, once, and read
+/// from there: no code decides it again by the vendor's name.
+#[test]
+fn what_a_host_takes_is_its_row() {
+    let takes = |id: &str| host(id).1.media;
+    assert!(!takes("deepseek").parts && !takes("mira").parts);
+    assert!(takes("perplexity").parts && !takes("perplexity").files);
+    assert!(takes("openai").files && !takes("openai").video);
+    assert!(takes("groq").video);
+    assert!(!takes("ollama").url_images && takes("groq").url_images);
+    assert!(takes("mistral").url_pdfs && !takes("openai").url_pdfs);
+    assert_eq!(host("openai").1.maker, Some(Maker::OpenAi));
+    assert_eq!(host("openrouter").1.maker, None);
 }

@@ -8,8 +8,8 @@ use crate::spec::{Assistant, Meta, Origin, Reasoning, Request, Text, ToolCall, U
 struct Short;
 
 impl Protocol for Short {
-    fn key(&self) -> &'static str {
-        "short"
+    fn key(&self) -> crate::ProtocolKey {
+        crate::ProtocolKey::OpenaiChat
     }
 
     fn encode(&self, _: &Target<'_>, _: &Request) -> Result<Encoded, Error> {
@@ -31,7 +31,7 @@ fn provider() -> Provider {
 
 fn origin(model: &str) -> Origin {
     Origin {
-        protocol: "short".into(),
+        protocol: crate::ProtocolKey::OpenaiChat,
         provider: "p".into(),
         model: model.into(),
     }

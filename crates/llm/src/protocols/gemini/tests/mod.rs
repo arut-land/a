@@ -176,5 +176,4 @@ fn the_function_response(contents: &[Value]) -> &Value {
 
 mod decode;
 mod encode;
-mod hot_path;
 mod options;

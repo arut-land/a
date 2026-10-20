@@ -213,6 +213,15 @@ impl StepLimit {
     }
 }
 
+/// `[ext.loop] max_steps`.
+impl crate::Configured for StepLimit {
+    fn configure(table: &impl crate::Table) -> Result<Self, crate::Refused> {
+        Ok(Self {
+            max: table.number("max_steps")?.unwrap_or(Self::default().max),
+        })
+    }
+}
+
 impl Extension for StepLimit {
     const NAME: &'static str = LOOP;
     const VERSION: u32 = 1;

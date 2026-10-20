@@ -6,7 +6,7 @@ mod common;
 use std::time::Duration;
 
 use common::*;
-use kernel::{Effect, Event, Gated, Later, Load, Note, Owner, Recover, Ticket};
+use kernel::{Effect, Event, Gated, Later, Load, Note, Owner, Recover, Replied, Ticket};
 use protocol::{Audience, Body, CallId, Installed, Json, Mode, Outcome, Permission, Seq, Verdict};
 use serde_json::json;
 
@@ -241,7 +241,7 @@ fn an_interrupt_stops_the_model_call_and_ends_the_turn() {
                 BUSY,
                 append(1, input("hi")),
                 append(2, model_call(0)),
-                call_model(2, 0),
+                prepare(2, 0),
             ],
         ),
         (interrupt(), vec![cancel(2)]),
@@ -250,7 +250,7 @@ fn an_interrupt_stops_the_model_call_and_ends_the_turn() {
         (
             Event::ModelDone {
                 call: id(2),
-                replied: kernel::Replied::Interrupted(Some("par".into())),
+                replied: Replied::Interrupted(Some("par".into())),
             },
             vec![
                 append(
@@ -283,7 +283,7 @@ fn an_interrupt_cancels_every_call_of_the_reply_running() {
                 BUSY,
                 append(1, input("go")),
                 append(2, model_call(0)),
-                call_model(2, 0),
+                prepare(2, 0),
             ],
         ),
         (
@@ -334,7 +334,7 @@ fn an_interrupted_turn_answers_the_calls_it_leaves_and_goes_no_further() {
                 BUSY,
                 append(1, input("go")),
                 append(2, model_call(0)),
-                call_model(2, 0),
+                prepare(2, 0),
             ],
         ),
         (
@@ -383,7 +383,7 @@ fn a_steer_reaches_the_running_turn_before_the_model_is_next_asked() {
                 BUSY,
                 append(1, input("go")),
                 append(2, model_call(0)),
-                call_model(2, 0),
+                prepare(2, 0),
             ],
         ),
         (
@@ -410,7 +410,7 @@ fn a_steer_reaches_the_running_turn_before_the_model_is_next_asked() {
                 append(7, tool_result(4, done(json!({ "slept": 1 })))),
                 append(8, take(5)),
                 append(9, model_call(0)),
-                call_model(9, 0),
+                prepare(9, 0),
             ],
         ),
         (
@@ -419,7 +419,7 @@ fn a_steer_reaches_the_running_turn_before_the_model_is_next_asked() {
                 append(10, model_result(9, Outcome::Done { output: reply(&[]) })),
                 append(11, take(6)),
                 append(12, model_call(0)),
-                call_model(12, 0),
+                prepare(12, 0),
             ],
         ),
     ]);
@@ -506,15 +506,82 @@ fn a_failed_model_call_is_retried_as_the_request_error_point_asks() {
                 BUSY,
                 append(1, input("hi")),
                 append(2, model_call(0)),
-                call_model(2, 0),
+                prepare(2, 0),
             ],
         ),
         (model_failed(2), retried()),
-        (Event::Woke { call: id(2) }, vec![call_model(2, 1)]),
+        (Event::Woke { call: id(2) }, vec![prepare(2, 1)]),
         (
             model_done(2, &[]),
             vec![
                 append(4, model_result(2, Outcome::Done { output: reply(&[]) })),
+                IDLE,
+            ],
+        ),
+    ]);
+}
+
+/// What the `step` point decided about a request is logged before the
+/// request is sent: the kernel has it prepared, logs, then sends.
+#[test]
+fn a_step_decision_is_logged_before_the_request_is_sent() {
+    let mut s = modeled();
+    s.step(user("hi"));
+    let fallback = Verdict::PrepareStep {
+        model: Some("cheap".into()),
+    };
+    s.table(vec![
+        (
+            Event::Prepared {
+                call: id(2),
+                decisions: vec![("fallback".into(), fallback.clone())],
+                answered: None,
+            },
+            vec![append(3, decision("fallback", Some(2), fallback)), send(2)],
+        ),
+        (
+            model_done(2, &[]),
+            vec![
+                append(4, model_result(2, Outcome::Done { output: reply(&[]) })),
+                IDLE,
+            ],
+        ),
+    ]);
+}
+
+/// A handler's own answer at `step` stands as the model's reply, logged
+/// as its decision; nothing is sent.
+#[test]
+fn a_step_answer_stands_as_the_reply_and_nothing_is_sent() {
+    let mut s = modeled();
+    s.step(user("hi"));
+    s.table(vec![(
+        Event::Prepared {
+            call: id(2),
+            decisions: Vec::new(),
+            answered: Some(("cache".into(), Replied::Done(reply(&[])))),
+        },
+        vec![
+            append(3, decision("cache", Some(2), Verdict::Answered)),
+            append(4, model_result(2, Outcome::Done { output: reply(&[]) })),
+            IDLE,
+        ],
+    )]);
+}
+
+/// A request prepared for a turn interrupted meanwhile is never sent:
+/// the call ends interrupted, and the turn with it.
+#[test]
+fn a_request_prepared_after_an_interrupt_is_not_sent() {
+    let mut s = modeled();
+    s.step(user("hi"));
+    s.table(vec![
+        (interrupt(), vec![cancel(2)]),
+        (
+            prepared(2),
+            vec![
+                append(3, model_result(2, INTERRUPTED)),
+                append(4, Body::INTERRUPT),
                 IDLE,
             ],
         ),
@@ -530,7 +597,7 @@ fn a_call_fails_once_the_retries_run_out() {
         s.step(model_failed(2));
         assert_eq!(
             s.step(Event::Woke { call: id(2) }).as_slice(),
-            [call_model(2, attempt)]
+            [prepare(2, attempt)]
         );
     }
     let fx = s.step(model_failed(2));
@@ -550,7 +617,7 @@ fn an_interrupt_in_backoff_sends_nothing_again() {
                 BUSY,
                 append(1, input("hi")),
                 append(2, model_call(0)),
-                call_model(2, 0),
+                prepare(2, 0),
             ],
         ),
         (model_failed(2), retried()),
@@ -601,7 +668,7 @@ fn a_resend_rebuilds_from_the_transcript() {
         },
         vec![
             append(3, decision("compact", Some(2), retry)),
-            call_model(2, 1),
+            prepare(2, 1),
         ],
     )]);
     // An answer of none fails the call with its error.
@@ -649,7 +716,7 @@ fn a_failure_no_extension_retries_fails_the_turn() {
                 BUSY,
                 append(1, input("hi")),
                 append(2, model_call(0)),
-                call_model(2, 0),
+                prepare(2, 0),
             ],
         ),
         (

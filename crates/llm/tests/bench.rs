@@ -1,37 +1,51 @@
-//! Time and allocations of decoding every recorded stream and of encoding a
-//! long transcript, ignored by default: `cargo test -p llm --release --test
-//! bench -- --ignored --nocapture`.
+//! What decoding and encoding cost, counted by one allocator: the
+//! invariants that hold in any build (a streamed token is copied once, a
+//! chunk that continues text allocates little), and the benchmarks, ignored
+//! by default: `cargo test -p llm --release --test bench -- --ignored
+//! --nocapture`.
 
 use std::alloc::{GlobalAlloc, Layout, System};
+use std::cell::Cell;
 use std::fmt::Write as _;
 use std::io;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicUsize, Ordering::Relaxed};
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use llm::http::{BoxFuture, Http, Payload, Response, body};
 use llm::protocols::{chat, gemini, messages, responses};
 use llm::{
-    Assistant, AssistantPart, Message, Origin, Output, Provider, Request, Text, ToolCall,
-    ToolMessage, ToolResult,
+    Accumulator, Assistant, AssistantPart, Ended, Event, Flow, Frame, Message, Origin, Output,
+    Provider, Request, Target, Text, ToolCall, ToolMessage, ToolResult,
 };
 
+/// The system allocator, counting: allocations and bytes per thread, so
+/// tests running beside each other do not disturb each other's counts, and
+/// the bytes live across threads for the peak.
 struct Counting;
 
-static ALLOCS: AtomicUsize = AtomicUsize::new(0);
-static BYTES: AtomicUsize = AtomicUsize::new(0);
+thread_local! {
+    static ALLOCS: Cell<usize> = const { Cell::new(0) };
+    static BYTES: Cell<usize> = const { Cell::new(0) };
+}
+
 static LIVE: AtomicUsize = AtomicUsize::new(0);
 static PEAK: AtomicUsize = AtomicUsize::new(0);
+
+fn count(size: usize) {
+    // A thread being torn down counts nothing.
+    let _ = ALLOCS.try_with(|allocs| allocs.set(allocs.get() + 1));
+    let _ = BYTES.try_with(|bytes| bytes.set(bytes.get() + size));
+    let live = LIVE.fetch_add(size, Relaxed) + size;
+    PEAK.fetch_max(live, Relaxed);
+}
 
 // Only this test binary counts: the allocator defers to the system's.
 #[allow(unsafe_code)]
 // SAFETY: every method forwards to `System`, which upholds the contract.
 unsafe impl GlobalAlloc for Counting {
     unsafe fn alloc(&self, layout: Layout) -> *mut u8 {
-        ALLOCS.fetch_add(1, Relaxed);
-        BYTES.fetch_add(layout.size(), Relaxed);
-        let live = LIVE.fetch_add(layout.size(), Relaxed) + layout.size();
-        PEAK.fetch_max(live, Relaxed);
+        count(layout.size());
         // SAFETY: the caller upholds `System.alloc`'s contract.
         unsafe { System.alloc(layout) }
     }
@@ -43,11 +57,8 @@ unsafe impl GlobalAlloc for Counting {
     }
 
     unsafe fn realloc(&self, ptr: *mut u8, layout: Layout, new: usize) -> *mut u8 {
-        ALLOCS.fetch_add(1, Relaxed);
-        BYTES.fetch_add(new, Relaxed);
-        let live = LIVE.fetch_add(new, Relaxed) + new;
+        count(new);
         LIVE.fetch_sub(layout.size(), Relaxed);
-        PEAK.fetch_max(live, Relaxed);
         // SAFETY: the caller upholds `System.realloc`'s contract.
         unsafe { System.realloc(ptr, layout, new) }
     }
@@ -56,14 +67,25 @@ unsafe impl GlobalAlloc for Counting {
 #[global_allocator]
 static GLOBAL: Counting = Counting;
 
+/// What `f` allocates on this thread: its result, allocations and bytes.
+fn allocated<T>(f: impl FnOnce() -> T) -> (T, usize, usize) {
+    let (allocs, bytes) = (ALLOCS.with(Cell::get), BYTES.with(Cell::get));
+    let out = f();
+    (
+        out,
+        ALLOCS.with(Cell::get) - allocs,
+        BYTES.with(Cell::get) - bytes,
+    )
+}
+
 /// Runs `f` `runs` times and prints its fastest time, which a busy machine
 /// disturbs least, and its allocations per run.
 fn measure(label: &str, runs: usize, mut f: impl FnMut()) {
     f();
-    let (allocs, bytes) = (ALLOCS.load(Relaxed), BYTES.load(Relaxed));
+    let (allocs, bytes) = (ALLOCS.with(Cell::get), BYTES.with(Cell::get));
     let base = LIVE.load(Relaxed);
     PEAK.store(base, Relaxed);
-    let mut fastest = std::time::Duration::MAX;
+    let mut fastest = Duration::MAX;
     for _ in 0..runs {
         let start = Instant::now();
         f();
@@ -72,8 +94,8 @@ fn measure(label: &str, runs: usize, mut f: impl FnMut()) {
     let runs = runs.max(1);
     eprintln!(
         "{label}: {fastest:?}/run, {} allocs/run, {} KiB allocated/run, peak {} KiB",
-        (ALLOCS.load(Relaxed) - allocs) / runs,
-        (BYTES.load(Relaxed) - bytes) / runs / 1024,
+        (ALLOCS.with(Cell::get) - allocs) / runs,
+        (BYTES.with(Cell::get) - bytes) / runs / 1024,
         (PEAK.load(Relaxed) - base) / 1024,
     );
 }
@@ -464,7 +486,7 @@ fn encode_long_transcript() {
 #[ignore = "a benchmark"]
 fn read_logged_reply() {
     let origin = Origin {
-        protocol: "messages".into(),
+        protocol: llm::ProtocolKey::AnthropicMessages,
         provider: "anthropic".into(),
         model: "claude".into(),
     };
@@ -490,9 +512,6 @@ fn read_logged_reply() {
     let text = serde_json::to_string(&reply).expect("a reply writes");
     measure("from_json 150 parts", 200, || {
         let _ = std::hint::black_box(llm::Response::from_json(&text));
-    });
-    measure("derived Deserialize from text 150 parts", 200, || {
-        let _ = std::hint::black_box(serde_json::from_str::<llm::Response>(&text));
     });
     measure("text to a tree 150 parts", 200, || {
         let _ = std::hint::black_box(serde_json::from_str::<serde_json::Value>(&text));
@@ -611,4 +630,198 @@ fn transcript_memory() {
         messages.push(Message::user("and then?"));
         let _ = llm::stream(&reply, &provider, &request(messages.clone()));
     });
+}
+
+/// The cassette at `path` under `fixtures/rig/cassettes`.
+fn cassette(path: &str) -> String {
+    std::fs::read_to_string(root().join(path)).expect("cassette")
+}
+
+/// The `data:` lines of a recorded body.
+fn frames(body: &str) -> Vec<String> {
+    let data = body.lines().filter_map(|line| line.strip_prefix("data: "));
+    data.map(str::to_owned).collect()
+}
+
+/// The streams of every exchange in `cassettes` to `path`: the model
+/// asked, and the frames.
+fn streams(cassettes: &[PathBuf], path: &str) -> Vec<(String, Vec<String>)> {
+    cassettes
+        .iter()
+        .flat_map(|file| {
+            let text = std::fs::read_to_string(file).expect("cassette");
+            serde_yaml_ng::Deserializer::from_str(&text)
+                .filter_map(|doc| {
+                    let doc: serde_yaml_ng::Value = serde::Deserialize::deserialize(doc).ok()?;
+                    let when = doc.get("when")?;
+                    if !when.get("path")?.as_str()?.contains(path) {
+                        return None;
+                    }
+                    let sent: serde_json::Value =
+                        serde_json::from_str(when.get("body")?.as_str().unwrap_or("{}")).ok()?;
+                    let body = doc.get("then")?.get("body")?.as_str()?;
+                    let model = sent["model"].as_str().unwrap_or("recorded-model");
+                    Some((model.to_owned(), frames(body)))
+                })
+                .filter(|(_, frames)| !frames.is_empty())
+                .collect::<Vec<_>>()
+        })
+        .collect()
+}
+
+/// A recorded reply of four paragraphs, streamed in some 350 deltas.
+fn text_delta_stop() -> Recorded {
+    let text = cassette("openai/corpus_breadth/text_delta_stop.yaml");
+    let doc: serde_yaml_ng::Value = serde_yaml_ng::from_str(&text).expect("yaml");
+    let body = doc["then"]["body"].as_str().expect("a body");
+    Recorded {
+        status: 200,
+        body: body.as_bytes().to_vec(),
+    }
+}
+
+/// A streamed token is lent to the reader as a piece and moved to the
+/// reply whole with its end: neither the writer nor the fold copies it.
+#[test]
+fn a_streamed_token_is_copied_once() {
+    let (host, quirks) = responses::HOSTS[0];
+    let provider = Provider::new(
+        host.id,
+        "http://recorded",
+        llm::Auth::None,
+        responses::Responses::new(quirks),
+    );
+    let request = Request {
+        model: "gpt-4o".into(),
+        messages: vec![Message::user("hi")].into(),
+        ..Request::default()
+    };
+    let mut events = llm::stream(&text_delta_stop(), &provider, &request);
+    let (mut read, mut pieces, mut ended) = (Vec::new(), String::new(), None);
+    while let Some(event) = rt::block_on(events.next()) {
+        let event = event.expect("an event");
+        match event {
+            Event::Delta { text, .. } => pieces.push_str(text),
+            Event::End {
+                ended: Ended::Text { text },
+                ..
+            } => ended = Some(text.as_ptr()),
+            _ => {}
+        }
+        read.push(event.clone());
+    }
+    let reply = events.finish(None).expect("the reply");
+    let [AssistantPart::Text(answer)] = reply.message.content.as_slice() else {
+        panic!("one text part: {:?}", reply.message.content);
+    };
+    assert!(read.len() > 300 && answer.text.len() > 2000);
+    assert_eq!(answer.text, pieces, "the end states what streamed");
+    // The buffer the text grew in while it streamed is the reply's: moved
+    // on at its end, not copied.
+    assert_eq!(ended, Some(answer.text.as_ptr()));
+    // Folding the events into a reply copies none of the text that
+    // streamed: a piece lent to the reader is only read.
+    let mut reply = Accumulator::new();
+    for event in read {
+        let delta = matches!(event, Event::Delta { .. });
+        let (pushed, _, bytes) = allocated(|| reply.push(event));
+        pushed.expect("in order");
+        assert!(!delta || bytes == 0, "a delta folded with {bytes} bytes");
+    }
+}
+
+/// A Gemini chunk that continues a text run parses into types that borrow
+/// its text, so it allocates little beyond what its events own; parsing it
+/// as a `Value`, as the decoder once did first, allocates several times
+/// more.
+#[test]
+fn a_gemini_chunk_that_continues_text_allocates_a_fraction_of_its_value() {
+    let mut cassettes = Vec::new();
+    walk(&root().join("gemini"), &mut cassettes);
+    let streams = streams(&cassettes, ":streamGenerateContent");
+    let (host, quirks) = gemini::HOSTS[0];
+    let provider = Provider::new(
+        host.id,
+        "http://recorded",
+        llm::Auth::None,
+        gemini::Gemini::new(quirks),
+    );
+    let (mut chunks, mut typed, mut parsed) = (0, 0, 0);
+    let mut events = Vec::with_capacity(64);
+    for (model, frames) in &streams {
+        let target = Target {
+            provider: &provider,
+            model,
+        };
+        let mut decoder = provider.protocol.decoder(&target, &Request::default());
+        for (index, data) in frames.iter().enumerate() {
+            let frame = Frame { event: "", data };
+            let (flow, made, _) = allocated(|| decoder.frame(frame, &mut events));
+            if index > 0 && data.contains("\"text\"") && !data.contains("functionCall") {
+                chunks += 1;
+                typed += made;
+                parsed += allocated(|| drop(serde_json::from_str::<serde_json::Value>(data))).1;
+            }
+            events.clear();
+            if !matches!(flow, Ok(Flow::More)) {
+                break;
+            }
+        }
+    }
+    eprintln!(
+        "{chunks} later text chunks: decoding allocates {typed} times, parsing them as \
+         values alone {parsed}"
+    );
+    assert!(chunks >= 20, "{chunks} text chunks");
+    assert!(typed * 3 < parsed, "{typed} allocations against {parsed}");
+}
+
+/// The Chat Completions decoder's time per frame on recorded streams, the
+/// fastest of several rounds.
+#[test]
+#[ignore = "a benchmark"]
+fn chat_time_per_frame() {
+    for (host, cassette) in [
+        (
+            "openai",
+            "openai/streaming_grammar_chat/long_text_stream.yaml",
+        ),
+        ("venice", "venice/streaming/streaming_smoke.yaml"),
+        (
+            "deepseek",
+            "deepseek/agent_tool_sessions/sequential_complex_tool_calls_streaming.yaml",
+        ),
+    ] {
+        let provider = provider(host, "/chat/completions").expect("a chat host");
+        let exchanges = streams(&[root().join(cassette)], "/chat/completions");
+        let frames: usize = exchanges.iter().map(|(_, frames)| frames.len()).sum();
+        let mut events = Vec::with_capacity(4096);
+        let (rounds, runs) = (7, 100);
+        let mut fastest = Duration::MAX;
+        for _ in 0..rounds {
+            let start = Instant::now();
+            for _ in 0..runs {
+                for (model, frames) in &exchanges {
+                    let target = Target {
+                        provider: &provider,
+                        model,
+                    };
+                    let mut decoder = provider.protocol.decoder(&target, &Request::default());
+                    events.clear();
+                    for data in frames {
+                        let frame = Frame {
+                            event: "message",
+                            data,
+                        };
+                        if decoder.frame(frame, &mut events).expect("decodes") == Flow::Done {
+                            break;
+                        }
+                    }
+                }
+            }
+            fastest = fastest.min(start.elapsed());
+        }
+        let per_frame = fastest / (u32::try_from(frames).expect("frames") * runs);
+        eprintln!("{cassette}: {frames} frames, {per_frame:?} per frame");
+    }
 }

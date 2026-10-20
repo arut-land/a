@@ -3,11 +3,20 @@
 //! [`Sessions`] starts the child, owned by the call: it is interrupted with
 //! the turn, survives a restart, and is heard from once.
 
-use ext::{Concurrency, Cx, Extension, Json, Registrar, Replay, Schema, Sessions, Text, Tool};
+use ext::{
+    Concurrency, Configured, Cx, Extension, Json, Refused, Registrar, Replay, Schema, Sessions,
+    Table, Text, Tool,
+};
 use serde::Deserialize;
 
 /// The `subagent` extension.
 pub struct Subagent;
+
+impl Configured for Subagent {
+    fn configure(_: &impl Table) -> Result<Self, Refused> {
+        Ok(Self)
+    }
+}
 
 impl Extension for Subagent {
     const NAME: &'static str = "subagent";

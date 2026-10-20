@@ -6,34 +6,29 @@
 //! across an await. What the driver decides is only how: the kernel
 //! decides what.
 
-use std::any::{Any, TypeId};
+use std::any::Any;
 use std::future::{Future, poll_fn};
 use std::io;
 use std::panic::{AssertUnwindSafe, catch_unwind};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::pin::pin;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
-use std::sync::{Arc, Mutex, OnceLock};
+use std::sync::{Arc, Mutex, OnceLock, Weak};
 use std::task::Poll;
 use std::time::Instant;
 
 use crate::catalog::Record;
 use crate::store::{Header, Parent, Writer};
-use ext::host::{Host, Parts, Registry};
-use ext::point::{Approving, Failed, View};
-use ext::{
-    Asked, BoxFuture, Callable, Called, Cancel, Chained, Cx, Facts, Gated, Gating, Name, Parsed,
-    PointCx, Recover, Route, States,
-};
-use kernel::{
-    Answer, Core, Durability, Effect, Effects, Event, Load, Note, Owner, Replied, Ticket,
-};
+use ext::host::{Binding, Bound, Host, Parts, Registry, Services};
+use ext::point::View;
+use ext::{BoxFuture, Called, Cancel, Cx, Flag, States};
+use kernel::{Core, Durability, Effect, Effects, Event, Load, Note, Owner, Replied, Ticket};
 use protocol::view::SessionView;
 use protocol::{
-    Author, Body, CallId, Card, DaemonMsg, Entry, Environment, Frame, Installed, Json, Mode,
-    Outcome, ReadOnly, Residency, SessionId, SessionSummary, ToolChoice, Verdict,
+    Author, Body, CallId, DaemonMsg, Entry, Environment, Frame, Json, Mode, Outcome, ReadOnly,
+    Residency, SessionId, SessionSummary, ToolChoice,
 };
-use rt::{channel, oneshot};
+use rt::{channel, oneshot, or};
 
 use crate::model::{Model, Models};
 use crate::outbox::{FrameLog, Outbox};
@@ -54,7 +49,7 @@ pub struct Shared {
     pub spill: PathBuf,
     /// Sessions loaded since the daemon started.
     pub(crate) loaded: Mutex<std::collections::HashSet<SessionId>>,
-    pub(crate) daemon: std::sync::Weak<Daemon>,
+    pub(crate) daemon: Weak<Daemon>,
 }
 
 /// How [`Live::start`] opens a session's log.
@@ -77,6 +72,9 @@ struct Session {
     env: Mutex<Option<Environment>>,
     /// Background process groups the session owns, until each ends.
     jobs: Mutex<Vec<u32>>,
+    /// What the engine provides the session's calls, made when one first
+    /// asks.
+    services: OnceLock<Arc<Services>>,
     shared: Arc<Shared>,
 }
 
@@ -96,7 +94,9 @@ pub struct Live {
     attached: AtomicUsize,
     last_active: Mutex<Instant>,
     summary: Mutex<SessionSummary>,
-    pub(crate) ended: Ended,
+    /// The end of the session's actor: set once its writer is closed, so
+    /// a reload never makes a second.
+    pub(crate) ended: Flag,
 }
 
 /// What a side request is answered with: its id and the conversation it
@@ -168,26 +168,6 @@ impl Msg {
     }
 }
 
-/// The end of a session's actor: over once its writer is closed, so a
-/// reload never makes a second.
-#[derive(Clone, Default)]
-pub struct Ended(Arc<(AtomicBool, rt::Notify)>);
-
-impl Ended {
-    fn end(&self) {
-        self.0.0.store(true, Ordering::SeqCst);
-        self.0.1.notify();
-    }
-
-    pub fn is_over(&self) -> bool {
-        self.0.0.load(Ordering::SeqCst)
-    }
-
-    pub async fn over(&self) {
-        self.0.1.until(|| self.is_over()).await;
-    }
-}
-
 /// A client's hold on a session; dropping it detaches.
 pub struct Attachment(Arc<Live>);
 
@@ -223,9 +203,11 @@ impl Live {
             states: Mutex::new(registry.states()),
             env: Mutex::default(),
             jobs: Mutex::default(),
+            services: OnceLock::new(),
             shared: Arc::clone(shared),
         });
-        let mut core = Core::new(Bound::bind(&registry, &session));
+        let bound = bind(&registry, &session);
+        let mut core = Core::new(Arc::clone(&bound) as Arc<dyn Binding>);
         // Each entry is folded as it is read and dropped.
         let mut states = registry.states();
         let loaded = match open {
@@ -271,19 +253,21 @@ impl Live {
                 read_only,
                 ..summary(header, core.ledger())
             }),
-            ended: Ended::default(),
+            ended: Flag::default(),
             session: Arc::clone(&session),
         });
-        registry.hooks().session_start(&session.point());
+        registry.hooks().session_start(&bound.point());
         let actor = Actor {
             live: Arc::clone(&live),
             core,
             writer: Some(loaded.writer),
             registry,
+            bound,
             transcript: None,
             replied: None,
             snapshot: None,
             view: None,
+            prepared: Keyed::default(),
             cancels: Keyed::default(),
             waiting: Keyed::default(),
             answers: Keyed::default(),
@@ -433,6 +417,8 @@ struct Actor {
     writer: Option<Writer>,
     /// The registry generation the newest step ran on.
     registry: Arc<Registry>,
+    /// The same, bound to the session: what the kernel drives.
+    bound: Arc<Bound<Viewed>>,
     /// The conversation the model sees, made at the first model call.
     transcript: Option<Transcript>,
     /// The message of the reply model call `.0` just had, until its
@@ -443,6 +429,10 @@ struct Actor {
     /// The view a far attach is sent, kept in step with each commit from
     /// the first time one is asked for: no attach folds the whole log.
     view: Option<SessionView>,
+    /// Each model call's request, prepared and not yet sent: the step
+    /// point's decisions about it are logged in between. `Err` is why
+    /// there is no model to send it to.
+    prepared: Keyed<CallId, Result<(Model, llm::Request, u16), String>>,
     /// What stops each effect in flight.
     cancels: Keyed<CallId, Cancel>,
     /// Calls waiting on a child, for its result.
@@ -509,7 +499,8 @@ impl Actor {
                 let newest = self.live.session.shared.registry.get();
                 let generation = (!Arc::ptr_eq(&newest, &self.registry)).then(|| {
                     self.registry = Arc::clone(&newest);
-                    Event::Registry(Bound::bind(&newest, &self.live.session))
+                    self.bound = bind(&newest, &self.live.session);
+                    Event::Registry(Arc::clone(&self.bound) as Arc<dyn Binding>)
                 });
                 self.step(generation.into_iter().chain(events)).await;
             }
@@ -527,8 +518,7 @@ impl Actor {
             shared.catalog.record(listing);
         })
         .await;
-        let registry = &self.registry;
-        registry.hooks().session_end(&self.live.session.point());
+        self.registry.hooks().session_end(&self.bound.point());
         // Closed and let go before the end is told: a reload never makes
         // a second writer, and what is told the end holds the last of it.
         let (ended, daemon) = (
@@ -536,7 +526,7 @@ impl Actor {
             self.live.session.shared.daemon.clone(),
         );
         drop((self, mail));
-        ended.end();
+        ended.set();
         if let Some(daemon) = daemon.upgrade() {
             daemon.pulse.notify();
         }
@@ -612,7 +602,7 @@ impl Actor {
             Msg::Stop => {
                 self.stopping = true;
                 for cancel in self.cancels.values() {
-                    cancel.cancel();
+                    cancel.set();
                 }
                 return None;
             }
@@ -747,11 +737,13 @@ impl Actor {
     /// the kernel is rebuilt from the committed log, as a load rebuilds it.
     async fn resume(&mut self) {
         for cancel in self.cancels.values() {
-            cancel.cancel();
+            cancel.set();
         }
         self.replies.clear();
         self.waiting.clear();
-        let bound = Bound::bind(&self.registry, &self.live.session);
+        self.prepared.clear();
+        self.bound = bind(&self.registry, &self.live.session);
+        let bound = Arc::clone(&self.bound) as Arc<dyn Binding>;
         let load = Load {
             boot: sys::boot_id(),
             busy: self.live.has_work(),
@@ -855,7 +847,13 @@ impl Actor {
         for e in entries {
             self.live.frames.push(e.seq.get());
             lock(&session.states).apply(e);
-            hooks.observe(&session.point(), e);
+            // What observers do about it runs owned by the session.
+            for reaction in hooks.observe(self.bound.point(), e) {
+                let ended = self.live.ended.clone();
+                session.shared.rt.spawn(Box::pin(async move {
+                    unless(&ended, reaction.0).await;
+                }));
+            }
             let replied = match &e.body {
                 Body::ModelResult { call, .. } => self.replied.take_if(|(of, _)| of == call),
                 _ => None,
@@ -866,6 +864,7 @@ impl Actor {
             if let Body::ToolResult { call, .. } | Body::ModelResult { call, .. } = &e.body {
                 // Settled: what still runs of it is let go.
                 self.waiting.remove(call);
+                self.bound.settled(*call);
             }
         }
         lock(&self.live.followers).retain(|c| c.wake().is_ok());
@@ -883,17 +882,7 @@ impl Actor {
         let shared = Arc::clone(&self.live.session.shared);
         // A stopping session starts nothing: what it would have started is
         // in the log, for its next load.
-        let starts = matches!(
-            effect,
-            Effect::CallModel { .. }
-                | Effect::RunTool { .. }
-                | Effect::Resume { .. }
-                | Effect::Await { .. }
-                | Effect::Recover { .. }
-                | Effect::Sleep { .. }
-                | Effect::StartChild { .. }
-        );
-        if self.stopping && starts {
+        if self.stopping && effect.starts() {
             return;
         }
         match effect {
@@ -904,17 +893,13 @@ impl Actor {
                     reply.send(side.map(|side| (side, conversation.unwrap_or_default())));
                 }
             }
-            Effect::CallModel {
+            Effect::Prepare {
                 call,
                 attempt,
                 choice,
-            } => self.call_model(call, attempt, choice),
-            Effect::RunTool {
-                call,
-                tool,
-                input,
-                parsed,
-            } => self.run_tool(call, tool, input, parsed),
+            } => self.prepare(call, attempt, choice),
+            Effect::Send { call } => self.send(call),
+            Effect::RunTool { call, tool, input } => self.run_tool(call, tool, input),
             Effect::Resume {
                 call,
                 tool,
@@ -925,7 +910,7 @@ impl Actor {
                     waiting.send(value);
                 } else {
                     self.answers.insert(call, value);
-                    self.run_tool(call, tool, input, None);
+                    self.run_tool(call, tool, input);
                 }
             }
             Effect::Await { call, answer } => {
@@ -945,9 +930,10 @@ impl Actor {
             }
             Effect::Cancel { call } => {
                 if let Some(cancel) = self.cancels.remove(&call) {
-                    cancel.cancel();
+                    cancel.set();
                 }
                 self.waiting.remove(&call);
+                self.prepared.remove(&call);
             }
             Effect::StartChild { link, child, input } => self.start_child(link, child, input),
             Effect::Interrupt { child } => {
@@ -1063,67 +1049,56 @@ impl Actor {
         }));
     }
 
-    /// Asks the model to reply to the transcript before `call`, with the
-    /// tools `choice` lets it call, its text streaming to followers under
-    /// `attempt`.
-    fn call_model(&mut self, call: CallId, attempt: u16, choice: ToolChoice) {
-        let work = self.live.session.model().map(|model| {
-            let mut request = self.request(call, &model);
-            request.tool_choice = match choice {
-                ToolChoice::Auto => llm::ToolChoice::Auto,
-                ToolChoice::None => llm::ToolChoice::None,
-            };
-            (model, request)
-        });
+    /// Prepares the request of model call `call`, attempt `attempt`: the
+    /// transcript before it with the tools `choice` lets it call, as the
+    /// `step` point leaves it. What the point decided goes to the kernel
+    /// to log; the request waits here until the kernel has it sent, unless
+    /// a handler answered it, in which case the answer is the reply.
+    fn prepare(&mut self, call: CallId, attempt: u16, choice: ToolChoice) {
+        let (decisions, answered) = match self.live.session.model() {
+            Ok(model) => {
+                let mut request = self.request(call, &model);
+                request.tool_choice = match choice {
+                    ToolChoice::Auto => llm::ToolChoice::Auto,
+                    ToolChoice::None => llm::ToolChoice::None,
+                };
+                let (decisions, answered) = self.bound.step(call, &mut request);
+                let answered = answered.map(|(by, response)| {
+                    let (replied, message) = replied(response);
+                    self.replied = message.map(|m| (call, m));
+                    (by, replied)
+                });
+                if answered.is_none() {
+                    self.prepared.insert(call, Ok((model, request, attempt)));
+                }
+                (decisions, answered)
+            }
+            Err(error) => {
+                self.prepared.insert(call, Err(error));
+                (Vec::new(), None)
+            }
+        };
+        let prepared = Event::Prepared {
+            call,
+            decisions,
+            answered,
+        };
+        let _ = self.live.session.mail.send(Msg::Step(prepared));
+    }
+
+    /// Sends the request prepared for model call `call`, its text
+    /// streaming to followers under its attempt.
+    fn send(&mut self, call: CallId) {
+        let Some(prepared) = self.prepared.remove(&call) else {
+            return;
+        };
         let cancel = Cancel::default();
         self.cancels.insert(call, cancel.clone());
         self.reporting += 1;
         let live = Arc::clone(&self.live);
-        // The `step` point, where the request is: what rewrote it is
-        // logged, and an answer of a handler's own is the reply.
-        let work = match work {
-            Ok((model, mut request)) => {
-                let bound = self.bound();
-                let (decisions, answered) = guarded(
-                    || self.registry.hooks().step(&bound.about(call), &mut request),
-                    |_| (Vec::new(), None),
-                );
-                let answered = answered.map(|(by, response)| {
-                    let mut decisions = decisions.clone();
-                    decisions.push((by, Verdict::Answered));
-                    (decisions, response)
-                });
-                if let Some((decisions, response)) = answered {
-                    let prepared = Event::Prepared { call, decisions };
-                    let _ = live.session.mail.send(Msg::Step(prepared));
-                    let (replied, message) = match response {
-                        Ok(response) => match Json::encode(&response) {
-                            Ok(output) => (Replied::Done(output), Some(response.message)),
-                            Err(e) => {
-                                let error = llm::Error::new(llm::Kind::Decode, e.to_string());
-                                (Replied::Failed(error), None)
-                            }
-                        },
-                        Err(error) => (Replied::Failed(error), None),
-                    };
-                    let _ = live.session.mail.send(Msg::Replied {
-                        call,
-                        replied,
-                        message,
-                    });
-                    return;
-                }
-                if !decisions.is_empty() {
-                    let prepared = Event::Prepared { call, decisions };
-                    let _ = live.session.mail.send(Msg::Step(prepared));
-                }
-                Ok((model, request))
-            }
-            Err(error) => Err(error),
-        };
         self.live.session.shared.rt.spawn(Box::pin(async move {
-            let (replied, message) = match work {
-                Ok((model, request)) => {
+            let (replied, message) = match prepared {
+                Ok((model, request, attempt)) => {
                     let mut deltas = |text: &str| live.delta(call, attempt, text);
                     let replying: BoxFuture<'_, _> =
                         Box::pin(reply(&model, &request, &cancel, &mut deltas));
@@ -1141,15 +1116,6 @@ impl Actor {
                 message,
             });
         }));
-    }
-
-    /// This generation of the registry, bound to the session.
-    fn bound(&self) -> Bound {
-        Bound {
-            registry: Arc::clone(&self.registry),
-            session: Arc::clone(&self.live.session),
-            agent: None,
-        }
     }
 
     /// The request for model call `call`: the system prompt, the
@@ -1176,29 +1142,22 @@ impl Actor {
         }
     }
 
-    /// Runs tool call `call`, the model's or a user's command, reporting
-    /// its outcome.
-    fn run_tool(&mut self, call: CallId, tool: String, input: Json, parsed: Option<Parsed>) {
+    /// Runs tool call `call`, the model's or a user's command, on its
+    /// input as read at its intent if the gate left it as it was,
+    /// reporting its outcome.
+    fn run_tool(&mut self, call: CallId, tool: String, input: Json) {
         let cancel = Cancel::default();
         self.cancels.insert(call, cancel.clone());
         self.reporting += 1;
         let registry = Arc::clone(&self.registry);
+        let parsed = self.bound.take_parsed(call, &input);
         let cx = self.live.session.cx(call, &registry, cancel);
         let mail = Arc::clone(&self.live.session.mail);
         let id = self.live.id;
         self.live.session.shared.rt.spawn(Box::pin(async move {
             let began = crate::stamp();
-            let Called { outcome, card } = if registry
-                .tools()
-                .get(&tool)
-                .is_some_and(|t| t.route() != Route::Local)
-            {
-                Called::failed(format!(
-                    "{tool} runs in a client, and this daemon routes none yet"
-                ))
-            } else {
-                contain(registry.tools().run(&tool, &input, parsed, &cx)).await
-            };
+            let Called { outcome, card } =
+                contain(registry.tools().run(&tool, &input, parsed, &cx)).await;
             crate::session_event("effect", id, || {
                 let elapsed = began.map_or(std::time::Duration::ZERO, |t| t.elapsed());
                 let how = match &outcome {
@@ -1320,7 +1279,7 @@ impl Live {
         rt::block_on(self.request(input, None))
     }
 
-    pub fn ended(&self) -> Ended {
+    pub fn ended(&self) -> Flag {
         self.ended.clone()
     }
 
@@ -1354,34 +1313,48 @@ impl Session {
             workspace: Arc::from(self.workspace.as_path()),
             env: lock(&self.env).clone().map(Arc::new),
             session: self.id,
-            call: call.get(),
+            call,
             model: self.model_spec().into(),
             spill: Arc::from(self.shared.spill.join(self.id.to_string())),
             cancel,
+            services: self.services(),
         }
         .cx(Arc::new(Calling {
             session: Arc::clone(self),
             call,
             registry: Arc::clone(registry),
-            own: OnceLock::new(),
         }))
     }
 
-    fn point(&self) -> PointCx<'_> {
-        PointCx::new(self.id, &self.workspace, self)
+    /// What the engine provides the session's calls: the config layers,
+    /// child sessions, side model requests and the runtime.
+    fn services(self: &Arc<Self>) -> Arc<Services> {
+        Arc::clone(self.services.get_or_init(|| {
+            let own = Arc::new(Own(Arc::downgrade(self)));
+            Arc::new(
+                Services::default()
+                    .with::<dyn ext::Layers>(own.clone())
+                    .with::<dyn ext::Sessions>(own.clone())
+                    .with::<dyn ext::Models>(own)
+                    .with::<dyn rt::Runtime>(Arc::clone(&self.shared.rt)),
+            )
+        }))
     }
 
-    /// The model the session's choice (or the layers) and the newest
-    /// client's environment name now, or why there is none.
+    /// The model the newest client's environment and the settings name
+    /// now, or why there is none.
     fn model(&self) -> Result<Model, String> {
-        let (spec, _) = self.chosen()?;
+        let (spec, _) = self.model_named()?;
         let env = lock(&self.env).clone();
-        self.shared.models.model(env.as_ref(), &spec)
+        self.shared
+            .models
+            .model(&self.workspace, env.as_ref(), &spec)
     }
 
-    /// The model spec the session calls, and where it comes from: as the
-    /// extension that lets a session choose says, else as the layers do.
-    fn chosen(&self) -> Result<(String, String), String> {
+    /// The model spec the settings name now, and what names it: the
+    /// `ModelSpec` service's word (the session's own choice over the
+    /// config layers) if an extension provides it, else the layers'.
+    fn model_named(&self) -> Result<(String, String), String> {
         let layers = &self.shared.models.settings;
         let registry = self.shared.registry.get();
         match registry.service::<dyn ext::ModelSpec>() {
@@ -1390,317 +1363,61 @@ impl Session {
         }
     }
 
-    /// The model spec the session calls now; `none` while none can be
-    /// read.
+    /// The model spec the settings name now.
     fn model_spec(&self) -> String {
-        self.chosen()
+        self.model_named()
             .map_or_else(|_| "none".to_owned(), |(model, _)| model)
     }
+}
 
-    /// The directory the session's commands run in now.
-    fn dir(&self, registry: &Registry) -> PathBuf {
-        let env = lock(&self.env);
-        registry.dir(&self.workspace, env.as_ref(), &lock(&self.states))
+/// The config files, as the layers a model is named in.
+impl ext::Layers for crate::config::Settings {
+    fn model(&self, workspace: &Path) -> Result<(String, String), String> {
+        let (model, source) = self.model(workspace)?;
+        Ok((model, source.to_string()))
     }
 }
 
-/// Read only when a handler asks: a point with no handler costs nothing.
-impl View for Session {
+/// The session as handlers at decision points read it: only when one
+/// asks, so a point with no handler costs nothing. A handler may take a
+/// call's context along, to work it answers later with.
+pub(crate) struct Viewed(Arc<Session>);
+
+impl View for Viewed {
+    fn session(&self) -> SessionId {
+        self.0.id
+    }
+
+    fn workspace(&self) -> &Path {
+        &self.0.workspace
+    }
+
+    /// As a call is recorded: the model's name once it is made, else
+    /// what the settings asked for.
     fn model(&self) -> String {
-        self.model_spec()
+        (self.0.model()).map_or_else(|_| self.0.model_spec(), |model| model.name())
     }
 
     fn states(&self, read: &mut dyn FnMut(&States)) {
-        read(&lock(&self.states));
+        read(&lock(&self.0.states));
+    }
+
+    fn env(&self) -> Option<Arc<Environment>> {
+        lock(&self.0.env).clone().map(Arc::new)
+    }
+
+    fn cx(&self, call: CallId) -> Option<Cx> {
+        let registry = self.0.shared.registry.get();
+        Some(self.0.cx(call, &registry, Cancel::default()))
     }
 }
 
-/// A registry generation bound to a session: the kernel's view of the
-/// extensions.
-#[derive(Clone)]
-struct Bound {
-    registry: Arc<Registry>,
-    session: Arc<Session>,
-    /// The agent the session runs, by name.
-    agent: Option<String>,
-}
-
-impl Bound {
-    fn bind(registry: &Arc<Registry>, session: &Arc<Session>) -> Arc<dyn kernel::Registry> {
-        let settings = &session.shared.models.settings;
-        Arc::new(Self {
-            registry: Arc::clone(registry),
-            session: Arc::clone(session),
-            agent: settings.agent(&session.workspace),
-        })
-    }
-
-    fn point(&self) -> PointCx<'_> {
-        self.session.point()
-    }
-
-    /// The session, as handlers deciding about call `call` see it.
-    fn about(&self, call: CallId) -> PointCx<'_> {
-        PointCx::new(self.session.id, &self.session.workspace, self).about(call.get())
-    }
-
-    /// The gate of call `call` once the `approve` handler it waits on
-    /// answers: with none, the handlers after it are asked, and with no
-    /// answer at all the user is. A handler that panics refuses the call.
-    async fn approving(self, call: CallId, tool: String, mut asked: Approving) -> Gated {
-        loop {
-            let answer = contain(async { Ok(asked.answer.0.await) }).await;
-            let answer = match answer {
-                Ok(Some(approved)) => Some((asked.by, approved)),
-                Ok(None) => {
-                    let rest = guarded(
-                        || {
-                            (self.registry.hooks()).approve_from(
-                                &self.about(call),
-                                &tool,
-                                &asked.input,
-                                asked.next,
-                            )
-                        },
-                        |_| Asked::Now(Name::from("gate"), false),
-                    );
-                    match rest {
-                        Asked::None => None,
-                        Asked::Now(by, approved) => Some((by, approved)),
-                        Asked::Later { by, at, answer } => {
-                            (asked.by, asked.next, asked.answer) = (by, at + 1, answer);
-                            continue;
-                        }
-                    }
-                }
-                Err(why) => {
-                    let mut decisions = asked.decisions;
-                    let reason = format!("{} {why}", asked.by);
-                    decisions.push((
-                        asked.by,
-                        Verdict::Block {
-                            reason: reason.clone(),
-                        },
-                    ));
-                    return Gated {
-                        input: asked.input,
-                        decisions,
-                        gate: ext::Gate::Refuse(reason),
-                    };
-                }
-            };
-            return Gated::approved(asked.input, asked.decisions, answer);
-        }
-    }
-
-    /// How to recover model call `call` from `error` once the
-    /// `request_error` handler `by`, the `at`th, answers: with none, or if
-    /// it panics, the handlers after it are asked.
-    async fn recovering(
-        self,
-        call: CallId,
-        attempt: u16,
-        error: llm::Error,
-        (mut by, mut at, mut answer): (Name, usize, ext::Later<Option<Recover>>),
-    ) -> Option<(Name, Recover)> {
-        loop {
-            if let Ok(Some(recover)) = contain(async { Ok(answer.0.await) }).await {
-                return Some((by, recover));
-            }
-            let failed = Failed {
-                error: &error,
-                attempt,
-            };
-            let rest = guarded(
-                || (self.registry.hooks()).request_error_from(&self.about(call), failed, at + 1),
-                |_| Asked::None,
-            );
-            match rest {
-                Asked::None => return None,
-                Asked::Now(by, recover) => return Some((by, recover)),
-                Asked::Later {
-                    by: next,
-                    at: next_at,
-                    answer: next_answer,
-                } => (by, at, answer) = (next, next_at, next_answer),
-            }
-        }
-    }
-}
-
-/// What a decision about a call reads of the session, and the call's own
-/// context for work it answers later with.
-impl View for Bound {
-    fn model(&self) -> String {
-        self.session.model_spec()
-    }
-
-    fn states(&self, read: &mut dyn FnMut(&States)) {
-        read(&lock(&self.session.states));
-    }
-
-    fn cx(&self, call: u64) -> Option<Cx> {
-        let call = CallId::new(call)?;
-        Some(self.session.cx(call, &self.registry, Cancel::default()))
-    }
-}
-
-impl kernel::Registry for Bound {
-    fn agent(&self) -> Box<dyn kernel::Agent> {
-        self.registry.agent(self.agent.as_deref())
-    }
-
-    fn loop_points(&self) -> &dyn ext::LoopPoints {
-        self
-    }
-
-    fn installed(&self) -> Vec<Installed> {
-        installed(&self.registry)
-    }
-
-    fn callable(&self, name: &str) -> Option<Callable> {
-        let tool = self.registry.tools().get(name)?;
-        Some(Callable {
-            audience: tool.audience(),
-            replay: tool.replay(),
-            concurrency: tool.concurrency(),
-        })
-    }
-
-    fn model(&self) -> String {
-        self.session
-            .model()
-            .map_or_else(|_| "none".to_owned(), |model| model.name())
-    }
-
-    fn context(&self) -> Option<String> {
-        let dir = self.session.dir(&self.registry);
-        let workspace = &self.session.workspace;
-        let facts = Facts {
-            workspace,
-            dir: &dir,
-        };
-        guarded(|| self.registry.context(&facts), |_| None)
-    }
-
-    fn read(&self, tool: &str, input: &Json) -> (Option<Parsed>, Option<Card>) {
-        let Some(tool) = self.registry.tools().get(tool) else {
-            return (None, None);
-        };
-        let Ok(parsed) = tool.parse(input) else {
-            return (None, None);
-        };
-        let card = guarded(|| tool.present(&parsed), |_| None);
-        (Some(parsed), card)
-    }
-
-    /// Fails closed ([`ext::point::Input::ON_ERROR`]): input a handler
-    /// could not decide on is refused, and its client told why.
-    fn input(&self, text: String) -> Result<Chained<String>, String> {
-        guarded(
-            || self.registry.hooks().input(&self.point(), text),
-            |why| Err(format!("the input point {why}")),
-        )
-    }
-
-    /// #43 `a_failing_gate_fails_closed`: a gate that cannot decide denies
-    /// the call, and says why.
-    fn gate(&self, call: CallId, tool: &str, input: &Json) -> Answer<Gated> {
-        let gating = guarded(
-            || self.registry.hooks().gate(&self.about(call), tool, input),
-            |why| {
-                Gating::Now(Gated {
-                    input: input.clone(),
-                    decisions: vec![(
-                        Name::from("gate"),
-                        Verdict::Block {
-                            reason: why.clone(),
-                        },
-                    )],
-                    gate: ext::Gate::Refuse(format!("the gate {why}")),
-                })
-            },
-        );
-        match gating {
-            Gating::Now(gated) => Answer::Now(gated),
-            Gating::Approving(asked) => {
-                let later = self.clone().approving(call, tool.to_owned(), asked);
-                Answer::Later(ext::Later::new(later))
-            }
-        }
-    }
-
-    fn request_error(
-        &self,
-        call: CallId,
-        attempt: u16,
-        error: &llm::Error,
-    ) -> Answer<Option<(Name, Recover)>> {
-        let failed = Failed { error, attempt };
-        let asked = guarded(
-            || {
-                self.registry
-                    .hooks()
-                    .request_error(&self.about(call), failed)
-            },
-            |_| Asked::None,
-        );
-        match asked {
-            Asked::None => Answer::Now(None),
-            Asked::Now(by, recover) => Answer::Now(Some((by, recover))),
-            Asked::Later { by, at, answer } => {
-                let later =
-                    (self.clone()).recovering(call, attempt, error.clone(), (by, at, answer));
-                Answer::Later(ext::Later::new(later))
-            }
-        }
-    }
-
-    /// A transform fails open: the outcome goes on as it was.
-    fn post_tool(
-        &self,
-        call: CallId,
-        tool: &str,
-        input: &Json,
-        outcome: Outcome,
-    ) -> Chained<Outcome> {
-        let original = outcome.clone();
-        guarded(
-            || (self.registry.hooks()).post_tool(&self.about(call), (tool, input), outcome),
-            |_| Chained::new(original),
-        )
-    }
-
-    fn on_stop(&self) -> Option<(Name, String)> {
-        guarded(|| self.registry.hooks().on_stop(&self.point()), |_| None)
-    }
-}
-
-/// The loop points fail open: a handler that panics leaves what the loop
-/// would do by default.
-impl ext::LoopPoints for Bound {
-    fn turn(&self, input: &kernel::Input, default: kernel::Actions) -> kernel::Actions {
-        let points = self.registry.hooks();
-        let shown = default.clone();
-        guarded(|| points.turn(input, default), |_| shown)
-    }
-
-    fn reply(&self, step: u16, reply: &llm::Response, default: kernel::Actions) -> kernel::Actions {
-        let points = self.registry.hooks();
-        let shown = default.clone();
-        guarded(|| points.reply(step, reply, default), |_| shown)
-    }
-
-    fn resume(&self, step: u16) -> ext::Resume {
-        let points = self.registry.hooks();
-        guarded(|| points.resume(step), |_| ext::Resume::Continue)
-    }
-}
-
-/// What `point` answers, or what `failed` makes of the panic of a handler
-/// in it: an extension's failure is never the session's.
-fn guarded<T>(point: impl FnOnce() -> T, failed: impl FnOnce(String) -> T) -> T {
-    catch_unwind(AssertUnwindSafe(point)).unwrap_or_else(|panic| failed(panicked(&*panic)))
+/// `registry` bound to `session`: what the kernel drives.
+fn bind(registry: &Arc<Registry>, session: &Arc<Session>) -> Arc<Bound<Viewed>> {
+    let settings = &session.shared.models.settings;
+    let agent = settings.agent(&session.workspace);
+    let viewed = Arc::new(Viewed(Arc::clone(session)));
+    Arc::new(Bound::new(Arc::clone(registry), viewed, agent))
 }
 
 /// What a panic says.
@@ -1711,17 +1428,6 @@ fn panicked(panic: &(dyn Any + Send)) -> String {
         .or_else(|| panic.downcast_ref::<&str>().copied())
         .unwrap_or("unknown panic");
     format!("panicked: {message}")
-}
-
-/// The registry's extensions as a log records them.
-pub fn installed(registry: &Registry) -> Vec<Installed> {
-    registry
-        .extensions()
-        .map(|(name, version)| Installed {
-            name: name.to_owned(),
-            version,
-        })
-        .collect()
 }
 
 /// The slash commands a session runs, as a welcome advertises them.
@@ -1741,16 +1447,6 @@ struct Calling {
     session: Arc<Session>,
     call: CallId,
     registry: Arc<Registry>,
-    /// The session's settings, children and side model requests, made
-    /// when a call first asks.
-    own: OnceLock<Owned>,
-}
-
-/// The services the engine provides a call.
-struct Owned {
-    layers: Arc<dyn ext::Layers>,
-    sessions: Arc<dyn ext::Sessions>,
-    models: Arc<dyn ext::Models>,
 }
 
 impl Calling {
@@ -1792,9 +1488,19 @@ impl Host for Calling {
         self.report(Note::Progress(text.to_owned()));
     }
 
-    fn note(&self, ext: &str, state: &str, data: Json) {
+    /// Resolves once the change is committed, so a read after it sees it.
+    fn note(&self, ext: &str, state: &str, data: Json) -> BoxFuture<'static, ()> {
         let (ext, state) = (ext.to_owned(), state.to_owned());
-        self.report(Note::State { ext, state, data });
+        let (done, committed) = oneshot::channel();
+        let note = Msg::Note {
+            call: self.call,
+            note: Note::State { ext, state, data },
+            done: Some(done),
+        };
+        let _ = self.session.mail.send(note);
+        Box::pin(async move {
+            let _ = committed.await;
+        })
     }
 
     fn edit(&self, target: protocol::Seq, upto: Option<protocol::Seq>, replace: Option<Json>) {
@@ -1812,27 +1518,6 @@ impl Host for Calling {
     fn registry(&self) -> &Registry {
         &self.registry
     }
-
-    fn service(&self, ty: TypeId) -> Option<&(dyn Any + Send + Sync)> {
-        let own = || {
-            let own = Arc::new(Own(Arc::clone(&self.session)));
-            Owned {
-                layers: Arc::clone(&own) as _,
-                sessions: Arc::clone(&own) as _,
-                models: own as _,
-            }
-        };
-        if ty == TypeId::of::<dyn ext::Layers>() {
-            return Some(&self.own.get_or_init(own).layers);
-        }
-        if ty == TypeId::of::<dyn ext::Sessions>() {
-            return Some(&self.own.get_or_init(own).sessions);
-        }
-        if ty == TypeId::of::<dyn ext::Models>() {
-            return Some(&self.own.get_or_init(own).models);
-        }
-        (ty == TypeId::of::<dyn rt::Runtime>()).then_some(&self.session.shared.rt as _)
-    }
 }
 
 impl ext::Models for Own {
@@ -1844,17 +1529,20 @@ impl ext::Models for Own {
         side: ext::Side,
     ) -> BoxFuture<'a, Result<llm::Response, llm::Error>> {
         Box::pin(async move {
-            let session = &self.0;
             let invalid = |e: String| llm::Error::new(llm::Kind::InvalidRequest, e);
+            let session = self
+                .0
+                .upgrade()
+                .ok_or_else(|| invalid("the session is gone".into()))?;
             let model = match &side.model {
                 Some(spec) => {
                     let env = lock(&session.env).clone();
-                    session.shared.models.model(env.as_ref(), spec)
+                    (session.shared.models).model(&session.workspace, env.as_ref(), spec)
                 }
                 None => session.model(),
             }
             .map_err(invalid)?;
-            let of = CallId::new(cx.call).ok_or_else(|| invalid("no call to ask for".into()))?;
+            let of = cx.call;
             let (asking, opened) = oneshot::channel();
             let purpose = side.purpose.to_string();
             let _ = session.mail.send(Msg::Side {
@@ -1917,22 +1605,22 @@ impl ext::Models for Own {
 
 /// What `work` yields, unless `stop` resolves first.
 async fn first<T>(work: impl Future<Output = T>, stop: impl Future<Output = ()>) -> Option<T> {
-    let (mut work, mut stop) = (pin!(work), pin!(stop));
-    poll_fn(|cx| {
-        if let Poll::Ready(done) = work.as_mut().poll(cx) {
-            return Poll::Ready(Some(done));
-        }
-        stop.as_mut().poll(cx).map(|()| None)
+    or(async { Some(work.await) }, async {
+        stop.await;
+        None
     })
     .await
 }
 
-/// A session's settings and children, as its calls reach them.
-struct Own(Arc<Session>);
+/// The session, as its calls reach it for what only the engine has: the
+/// config layers, child sessions and side model requests. Weak, as the
+/// session holds these.
+struct Own(Weak<Session>);
 
 impl ext::Layers for Own {
-    fn model(&self, workspace: &std::path::Path) -> Result<(String, String), String> {
-        ext::Layers::model(&self.0.shared.models.settings, workspace)
+    fn model(&self, workspace: &Path) -> Result<(String, String), String> {
+        let session = self.0.upgrade().ok_or("the session is gone")?;
+        ext::Layers::model(&session.shared.models.settings, workspace)
     }
 }
 
@@ -1941,11 +1629,12 @@ impl ext::Sessions for Own {
     /// call's turn reaches it first.
     fn child<'a>(&'a self, cx: &'a Cx, input: String) -> BoxFuture<'a, Outcome> {
         Box::pin(async move {
-            let Some(call) = CallId::new(cx.call) else {
+            let Some(session) = self.0.upgrade() else {
                 return Outcome::Interrupted { output: None };
             };
+            let call = cx.call;
             let (reply, result) = oneshot::channel();
-            let _ = self.0.mail.send(Msg::Child { call, input, reply });
+            let _ = session.mail.send(Msg::Child { call, input, reply });
             match result.await {
                 Some(value) => value
                     .parse()
@@ -1980,8 +1669,17 @@ async fn reply(
         events.finish(Some(model.origin(request)))
     });
     match reply {
-        Ok(reply) => match Json::encode(&reply) {
-            Ok(output) => (Replied::Done(output), Some(reply.message)),
+        Ok(reply) => replied(Ok(reply)),
+        Err(error) => (Replied::Failed(error), None),
+    }
+}
+
+/// What the kernel is told of a reply, or a failure, and the message of
+/// the reply for the transcript.
+fn replied(response: Result<llm::Response, llm::Error>) -> (Replied, Option<llm::Assistant>) {
+    match response {
+        Ok(response) => match Json::encode(&response) {
+            Ok(output) => (Replied::Done(output), Some(response.message)),
             Err(e) => (
                 Replied::Failed(llm::Error::new(llm::Kind::Decode, e.to_string())),
                 None,
@@ -1991,20 +1689,13 @@ async fn reply(
     }
 }
 
-/// `work`'s output, or `None` once `cancel` is cancelled first; `work` is
-/// then dropped, and not started at all if cancelled already.
-async fn unless<T>(cancel: &Cancel, work: impl Future<Output = T>) -> Option<T> {
-    if cancel.is_cancelled() {
+/// `work`'s output, or `None` once `cancel` is set first; `work` is then
+/// dropped, and not started at all if set already.
+async fn unless<T>(cancel: &Flag, work: impl Future<Output = T>) -> Option<T> {
+    if cancel.is_set() {
         return None;
     }
-    let (mut work, mut stop) = (pin!(work), pin!(cancel.cancelled()));
-    poll_fn(|cx| {
-        if let Poll::Ready(done) = work.as_mut().poll(cx) {
-            return Poll::Ready(Some(done));
-        }
-        stop.as_mut().poll(cx).map(|()| None)
-    })
-    .await
+    first(work, cancel.wait()).await
 }
 
 /// Runs `effect` so that a panic inside it fails the call instead of

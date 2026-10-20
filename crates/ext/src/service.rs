@@ -1,8 +1,9 @@
 //! Services: typed capabilities one extension provides and others build
 //! on, by type rather than by knowing each other. Each has at most one
 //! provider per registry, and an extension that needs one no extension
-//! provides is refused as it installs. The engine provides the ones only
-//! it can, such as [`Layers`], to every call.
+//! provides is refused as it installs (or, in a static assembly, does not
+//! compile). The engine provides the ones only it can, such as
+//! [`Layers`], to every call.
 
 use std::path::{Path, PathBuf};
 use std::process::Command;
@@ -31,16 +32,16 @@ pub trait Spawner: Send + Sync {
 /// The config layers the engine reads: a workspace's file, then the home
 /// file, then the built-in default. The engine provides it.
 pub trait Layers: Send + Sync {
-    /// The model the layers name for a session in `workspace`, as
-    /// `host:model`, and which layer names it; or why none can be read.
+    /// The model a session in `workspace` talks to as the layers name it,
+    /// as `host:model`, and which layer names it; or why there is none.
     fn model(&self, workspace: &Path) -> Result<(String, String), String>;
 }
 
-/// The model a session calls, over the layers: an extension that lets a
-/// session choose its own provides it. Without one, the layers decide.
+/// Which model a session's calls go to: the session's own choice, kept as
+/// an extension's state, over the [`Layers`]. An extension provides it
+/// (`settings`); with none, the engine reads the layers alone.
 pub trait ModelSpec: Send + Sync {
-    /// The model for a session in `workspace` whose extensions' states are
-    /// `states`, as `host:model`, and where it comes from.
+    /// The model, as `host:model`, and what names it.
     fn model(
         &self,
         states: &States,

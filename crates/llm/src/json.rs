@@ -7,8 +7,6 @@ use serde_json::{Map, Number, Value};
 
 mod read;
 
-#[cfg(test)]
-pub(crate) use read::Str;
 pub(crate) use read::{
     Count, Fielded, Fields, First, FromFields, Json, Obj, Word, fields, next, tag, word,
 };

@@ -1,24 +1,23 @@
 //! Typed tools, the erased form a toolset holds, and what a call runs
 //! with.
 
-use std::any::{Any, TypeId};
+use std::any::Any;
 use std::collections::BTreeMap;
 use std::fmt;
-use std::future::{Future, poll_fn};
+use std::future::Future;
 use std::marker::PhantomData;
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, Mutex, PoisonError};
-use std::task::{Poll, Waker};
+use std::sync::Arc;
 
-use protocol::{Audience, Card, Environment, Json, Outcome, Seq, SessionId};
+use protocol::{Audience, CallId, Card, Environment, Json, Outcome, Seq, SessionId};
 use serde::Serialize;
 use serde::de::DeserializeOwned;
 
 use crate::BoxFuture;
 #[cfg(doc)]
 use crate::CwdOf;
-use crate::host::Host;
+use crate::flag::Cancel;
+use crate::host::{Host, Services};
 use crate::point::{PointCx, View};
 use crate::schema::Schema;
 use crate::shape::Output;
@@ -70,70 +69,6 @@ pub struct Callable {
     pub concurrency: Concurrency,
 }
 
-/// Where a call runs: tools run in the daemon, and later ones may run in
-/// a client, routed to the clients it names.
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
-pub enum Route {
-    #[default]
-    Local,
-    /// The client that owns the session.
-    Owner,
-    /// The client that sent the last input.
-    LastActive,
-    /// Every client declaring the tool; the first answer wins.
-    Broadcast,
-}
-
-/// Set when a running turn should stop: the user interrupted it, or the
-/// session or daemon is going away. Tools that block poll it; async work
-/// awaits [`Cancel::cancelled`].
-#[derive(Clone, Debug, Default)]
-pub struct Cancel(Arc<Flag>);
-
-#[derive(Debug, Default)]
-struct Flag {
-    set: AtomicBool,
-    /// The tasks awaiting it.
-    waiting: Mutex<Vec<Waker>>,
-}
-
-impl Cancel {
-    pub fn cancel(&self) {
-        self.0.set.store(true, Ordering::SeqCst);
-        let waiting = std::mem::take(&mut *self.waiting());
-        waiting.into_iter().for_each(Waker::wake);
-    }
-
-    pub fn is_cancelled(&self) -> bool {
-        self.0.set.load(Ordering::SeqCst)
-    }
-
-    /// Resolves once cancelled.
-    pub fn cancelled(&self) -> impl Future<Output = ()> + Send + '_ {
-        poll_fn(|cx| {
-            if self.is_cancelled() {
-                return Poll::Ready(());
-            }
-            let mut waiting = self.waiting();
-            // Checked again under the lock `cancel` takes to wake.
-            if self.is_cancelled() {
-                return Poll::Ready(());
-            }
-            if !waiting.iter().any(|w| w.will_wake(cx.waker())) {
-                waiting.push(cx.waker().clone());
-            }
-            Poll::Pending
-        })
-    }
-
-    fn waiting(&self) -> std::sync::MutexGuard<'_, Vec<Waker>> {
-        self.0
-            .waiting
-            .lock()
-            .unwrap_or_else(PoisonError::into_inner)
-    }
-}
-
 /// A process a tool starts: `argv[0]` is the program.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct SpawnSpec {
@@ -154,14 +89,16 @@ pub struct Cx {
     /// (a session no client has described) inherits the daemon's.
     pub env: Option<Arc<Environment>>,
     pub session: SessionId,
-    /// The call's id: the seq of its intent.
-    pub call: u64,
+    /// The call's id: the seq of its intent, and the key a call run again
+    /// (as recovery runs a safe one) is told apart by.
+    pub call: CallId,
     /// The model the session talks to, as `host:model`.
     pub model: Arc<str>,
     /// The session's directory for output too large for the log, created
     /// on first use.
     pub spill: Arc<Path>,
     pub cancel: Cancel,
+    services: Arc<Services>,
     host: Arc<dyn Host>,
 }
 
@@ -175,6 +112,7 @@ impl Cx {
             model,
             spill,
             cancel,
+            services,
         } = call;
         Self {
             workspace,
@@ -184,6 +122,7 @@ impl Cx {
             model,
             spill,
             cancel,
+            services,
             host,
         }
     }
@@ -193,18 +132,22 @@ impl Cx {
         state::read(|f| self.host.states(f), read)
     }
 
-    /// Commits `change` to state `S`; nothing when no extension registered
-    /// it.
-    // Given up to the log, as a change is.
-    #[allow(clippy::needless_pass_by_value)]
-    pub fn update<S: Fold>(&self, change: S::Change) {
+    /// Commits `change` to state `S`: it resolves once the change is
+    /// committed and folded in, so a read after it sees it. Nothing when no
+    /// extension registered `S`.
+    pub fn update<S: Fold>(&self, change: &S::Change) -> BoxFuture<'static, ()> {
         let mut ext = None;
         self.host
             .states(&mut |states| ext = states.ext_of::<S>().cloned());
-        let Some(ext) = ext else { return };
-        match Json::encode(&change) {
+        let Some(ext) = ext else {
+            return Box::pin(std::future::ready(()));
+        };
+        match Json::encode(change) {
             Ok(data) => self.host.note(&ext, S::NAME, data),
-            Err(e) => eprintln!("warning: extension {ext}: a {} change: {e}", S::NAME),
+            Err(e) => {
+                eprintln!("warning: extension {ext}: a {} change: {e}", S::NAME);
+                Box::pin(std::future::ready(()))
+            }
         }
     }
 
@@ -237,28 +180,31 @@ impl Cx {
         self.host.progress(text);
     }
 
-    /// Side model requests on behalf of this call: see [`Models`].
+    /// Side model requests on behalf of this call: see [`Models`](crate::Models).
     pub fn models(&self) -> Option<&dyn crate::Models> {
         self.service::<dyn crate::Models>()
     }
 
     /// Service `S`, if an extension or the engine provides it.
     pub fn service<S: ?Sized + 'static>(&self) -> Option<&S> {
-        self.host.registry().service::<S>().or_else(|| {
-            let service = self.host.service(TypeId::of::<S>())?;
-            service.downcast_ref::<Arc<S>>().map(|s| &**s)
-        })
+        self.host
+            .registry()
+            .service::<S>()
+            .or_else(|| self.services.get::<S>())
     }
 
     /// The call's session, as handlers at decision points see it.
     pub fn point(&self) -> PointCx<'_> {
-        PointCx::new(self.session, &self.workspace, self).about(self.call)
+        PointCx::new(self).about(self.call)
     }
 
     /// `spawn` as the `spawn` point leaves it: every process a tool starts
-    /// goes through it, so a sandbox or a remote runner can wrap it.
-    pub fn spawn_hooks(&self, spawn: &mut SpawnSpec) {
-        self.host.registry().hooks().spawn(&self.point(), spawn);
+    /// goes through it, so a sandbox or a remote runner can wrap it; `Err`
+    /// is why a handler refused it.
+    pub fn spawn_hooks(&self, spawn: &mut SpawnSpec) -> Result<(), String> {
+        (self.host.registry().hooks())
+            .spawn(&self.point(), spawn)
+            .map_err(|(name, why)| format!("{name}: {why}"))
     }
 
     /// The directory the session's commands run in: see [`CwdOf`].
@@ -273,6 +219,14 @@ impl Cx {
 }
 
 impl View for Cx {
+    fn session(&self) -> SessionId {
+        self.session
+    }
+
+    fn workspace(&self) -> &Path {
+        &self.workspace
+    }
+
     fn model(&self) -> String {
         self.model.to_string()
     }
@@ -281,7 +235,11 @@ impl View for Cx {
         self.host.states(read);
     }
 
-    fn cx(&self, call: u64) -> Option<Cx> {
+    fn env(&self) -> Option<Arc<Environment>> {
+        self.env.clone()
+    }
+
+    fn cx(&self, call: CallId) -> Option<Cx> {
         (call == self.call).then(|| self.clone())
     }
 }
@@ -304,7 +262,6 @@ pub trait Tool: Send + Sync + 'static {
     const REPLAY: Replay = Replay::Unsafe;
     /// Whether its calls run alongside others of the turn.
     const CONCURRENCY: Concurrency = Concurrency::Exclusive;
-    const ROUTE: Route = Route::Local;
 
     /// Runs a call. What it returns is its shape ([`Output`]): a
     /// `Result<Self::Out, String>` for a call done at once, a future of one
@@ -354,13 +311,6 @@ impl fmt::Debug for Parsed {
     }
 }
 
-/// The input it was read from is what tells two apart.
-impl PartialEq for Parsed {
-    fn eq(&self, _: &Self) -> bool {
-        true
-    }
-}
-
 /// How a call ended: its outcome, and how clients show it.
 #[derive(Debug, PartialEq)]
 pub struct Called {
@@ -385,7 +335,6 @@ pub trait DynTool: Send + Sync {
     fn audience(&self) -> Audience;
     fn replay(&self) -> Replay;
     fn concurrency(&self) -> Concurrency;
-    fn route(&self) -> Route;
     /// How the tool is offered to the model, its schema written now.
     fn spec(&self) -> llm::Tool;
     /// Reads a call's input into the tool's own type.
@@ -426,10 +375,6 @@ where
         T::CONCURRENCY
     }
 
-    fn route(&self) -> Route {
-        T::ROUTE
-    }
-
     fn spec(&self) -> llm::Tool {
         let schema = crate::schema::of::<T::In>();
         llm::Tool {
@@ -437,7 +382,6 @@ where
             description: T::DESCRIPTION.to_owned(),
             schema: serde_json::from_str(&schema).expect("a derived schema is JSON"),
             strict: None,
-            encoded: llm::Encodings::default(),
         }
     }
 
@@ -474,40 +418,5 @@ where
 
     fn present(&self, input: &Parsed) -> Option<Card> {
         T::present(input.get()?)
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use std::future::Future;
-    use std::pin::pin;
-    use std::sync::Arc;
-    use std::sync::atomic::{AtomicUsize, Ordering};
-    use std::task::{Context, Wake, Waker};
-
-    use super::Cancel;
-
-    #[derive(Default)]
-    struct Count(AtomicUsize);
-
-    impl Wake for Count {
-        fn wake(self: Arc<Self>) {
-            self.0.fetch_add(1, Ordering::SeqCst);
-        }
-    }
-
-    #[test]
-    fn cancelled_wakes_whoever_waits() {
-        let cancel = Cancel::default();
-        let count = Arc::new(Count::default());
-        let waker = Waker::from(Arc::clone(&count));
-        let mut cx = Context::from_waker(&waker);
-        let mut waiting = pin!(cancel.cancelled());
-        assert!(waiting.as_mut().poll(&mut cx).is_pending());
-        assert!(waiting.as_mut().poll(&mut cx).is_pending());
-        cancel.clone().cancel();
-        assert!(count.0.load(Ordering::SeqCst) > 0);
-        assert!(waiting.as_mut().poll(&mut cx).is_ready());
-        assert!(pin!(cancel.cancelled()).poll(&mut cx).is_ready());
     }
 }

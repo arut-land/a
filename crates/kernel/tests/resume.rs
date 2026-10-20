@@ -50,7 +50,7 @@ fn a_crash_loop_cannot_retry_forever() {
     let (s, fx) = Session::resume(reg(), log, &BUSY_LOAD);
     assert!(
         !fx.iter()
-            .any(|e| matches!(e, Effect::Sleep { .. } | Effect::CallModel { .. }))
+            .any(|e| matches!(e, Effect::Sleep { .. } | Effect::Prepare { .. }))
     );
     let last = &s.log.last().unwrap().body;
     assert!(

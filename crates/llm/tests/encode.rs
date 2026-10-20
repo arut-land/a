@@ -12,8 +12,8 @@ use std::path::{Path, PathBuf};
 use llm::http::{BoxFuture, Http, Payload, Response, body};
 use llm::protocols::{chat, gemini, messages, responses};
 use llm::{
-    AssistantPart, Media, Message, Origin, Output, Provider, Request, Source, Text, Tool,
-    ToolChoice, ToolMessage, ToolResult, User, UserPart,
+    AssistantPart, Media, Message, Origin, Output, ProtocolKey, Provider, Request, Source, Text,
+    Tool, ToolChoice, ToolMessage, ToolResult, User, UserPart,
 };
 use serde_json::json;
 
@@ -46,33 +46,33 @@ fn walk(dir: &Path, out: &mut Vec<PathBuf>) {
 }
 
 /// The protocol a recorded path speaks.
-fn protocol_of(path: &str) -> Option<&'static str> {
+fn protocol_of(path: &str) -> Option<ProtocolKey> {
     if path.ends_with("/responses") {
-        Some(responses::KEY)
+        Some(responses::PROTOCOL)
     } else if path.ends_with("/chat/completions") {
-        Some(chat::KEY)
+        Some(chat::PROTOCOL)
     } else if path.contains(":streamGenerateContent") {
-        Some(gemini::KEY)
+        Some(gemini::PROTOCOL)
     } else if path.ends_with("/messages") {
-        Some(messages::KEY)
+        Some(messages::PROTOCOL)
     } else {
         None
     }
 }
 
 /// A provider speaking `key` at its first host, for decoding.
-fn decoder(key: &str) -> Provider {
+fn decoder(key: ProtocolKey) -> Provider {
     let url = "http://recorded";
     let auth = llm::Auth::None;
     match key {
-        chat::KEY => Provider::new("openai", url, auth, chat::Chat::new(chat::HOSTS[0].1)),
-        messages::KEY => Provider::new(
+        chat::PROTOCOL => Provider::new("openai", url, auth, chat::Chat::new(chat::HOSTS[0].1)),
+        messages::PROTOCOL => Provider::new(
             "anthropic",
             url,
             auth,
             messages::Messages::new(messages::HOSTS[0].1),
         ),
-        responses::KEY => Provider::new(
+        responses::PROTOCOL => Provider::new(
             "openai",
             url,
             auth,
@@ -85,7 +85,7 @@ fn decoder(key: &str) -> Provider {
 /// Every reply recorded that decodes, by the protocol that produced it, in
 /// cassette order. The ids the writer issues itself are random per process,
 /// so they are renumbered.
-fn replies() -> Vec<(&'static str, llm::Response)> {
+fn replies() -> Vec<(ProtocolKey, llm::Response)> {
     let mut files = Vec::new();
     walk(&root(), &mut files);
     files.sort();
@@ -260,12 +260,16 @@ fn bash() -> Tool {
         description: "Runs a command.".into(),
         schema: json!({"type": "object", "properties": {"command": {"type": "string"}}, "required": ["command"]}),
         strict: None,
-        encoded: llm::Encodings::default(),
     }
 }
 
 /// A request for `messages`, as variant `variant` asks.
-fn request(model: &str, key: &str, variant: usize, messages: impl Into<llm::Messages>) -> Request {
+fn request(
+    model: &str,
+    key: ProtocolKey,
+    variant: usize,
+    messages: impl Into<llm::Messages>,
+) -> Request {
     let mut request = Request {
         model: model.into(),
         messages: messages.into(),
@@ -280,15 +284,15 @@ fn request(model: &str, key: &str, variant: usize, messages: impl Into<llm::Mess
     }
     match (key, variant) {
         (_, 3) => request.tool_choice = ToolChoice::Required,
-        (messages::KEY, 1) => {
-            request.options = llm::Options::from([(key.into(), json!({"prompt_caching": true}))]);
+        (messages::PROTOCOL, 1) => {
+            request.options = llm::Options::from([(key, json!({"prompt_caching": true}))]);
         }
-        (messages::KEY, 5) => {
+        (messages::PROTOCOL, 5) => {
             let ttl = json!({"static_prefix_cache_ttl": "1h", "cache_control": {"type": "ephemeral", "ttl": "1h"}});
-            request.options = llm::Options::from([(key.into(), ttl)]);
+            request.options = llm::Options::from([(key, ttl)]);
         }
-        (responses::KEY, 1) => {
-            request.options = llm::Options::from([(key.into(), json!({"store": true}))]);
+        (responses::PROTOCOL, 1) => {
+            request.options = llm::Options::from([(key, json!({"store": true}))]);
         }
         (_, 5) => {
             request.body = json!({"temperature": 0.5}).as_object().cloned();

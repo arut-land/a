@@ -30,36 +30,42 @@ use crate::writer::{AUTO_INDEX, CallFragment, End, Open, Writer, Writes};
 
 /// `reason` in the host's documented vocabulary, then the shared one.
 pub(super) fn finish_reason(reason: &str, quirks: &Quirks) -> Reason {
-    quirks
-        .finishes
-        .iter()
-        .find(|(name, _)| *name == reason)
-        .map_or_else(|| shared_finish(reason), |(_, finish)| *finish)
+    Reason::listed(quirks.finishes, reason).unwrap_or_else(|| Reason::of(SHARED, reason))
 }
 
 /// `OpenAI`'s reasons, the legacy `function_call`, and the spellings
 /// compatible servers use for the same endings.
-fn shared_finish(reason: &str) -> Reason {
-    match reason {
-        "stop" | "end" | "eos" | "end_turn" | "stop_sequence" => Reason::Stop,
-        "length" | "max_tokens" | "model_length" => Reason::Length,
-        "tool_calls" | "function_call" => Reason::ToolCalls,
-        "content_filter" => Reason::ContentFilter,
-        _ => Reason::Other,
-    }
-}
+const SHARED: &[(&str, Reason)] = &[
+    ("stop", Reason::Stop),
+    ("end", Reason::Stop),
+    ("eos", Reason::Stop),
+    ("end_turn", Reason::Stop),
+    ("stop_sequence", Reason::Stop),
+    ("length", Reason::Length),
+    ("max_tokens", Reason::Length),
+    ("model_length", Reason::Length),
+    ("tool_calls", Reason::ToolCalls),
+    ("function_call", Reason::ToolCalls),
+    ("content_filter", Reason::ContentFilter),
+];
 
 /// The upstreams' own reasons a gateway forwards beside its normalized one,
-/// compared lowercased.
+/// compared lowercased; one not here reads as a shared one.
+const NATIVE: &[(&str, Reason)] = &[
+    ("end", Reason::Other),
+    ("eos", Reason::Other),
+    ("complete", Reason::Stop),
+    ("completed", Reason::Stop),
+    ("max_output_tokens", Reason::Length),
+    ("tool_use", Reason::ToolCalls),
+    ("safety", Reason::ContentFilter),
+    ("blocklist", Reason::ContentFilter),
+    ("prohibited_content", Reason::ContentFilter),
+    ("spii", Reason::ContentFilter),
+];
+
 fn native_finish(reason: &str) -> Reason {
-    match reason {
-        "end" | "eos" => Reason::Other,
-        "complete" | "completed" => Reason::Stop,
-        "max_output_tokens" => Reason::Length,
-        "tool_use" => Reason::ToolCalls,
-        "safety" | "blocklist" | "prohibited_content" | "spii" => Reason::ContentFilter,
-        reason => shared_finish(reason),
-    }
+    Reason::listed(NATIVE, reason).unwrap_or_else(|| Reason::of(SHARED, reason))
 }
 
 impl<T> Json<'_, T> {
@@ -366,15 +372,16 @@ enum Writing {
     Thinking,
 }
 
-/// A tool call the reply has open; `opaque` for a kind nothing can answer.
-struct OpenCall {
-    at: usize,
+/// A tool call while it is open, the decoder's state in the writer's draft
+/// of it; `opaque` for a kind nothing can answer.
+pub(super) struct OpenCall {
     id: Option<String>,
     opaque: bool,
 }
 
 pub(super) struct ChatDecoder {
-    w: Writer,
+    /// Each open call carries its state; a text or reasoning run none.
+    w: Writer<Option<OpenCall>>,
     quirks: Quirks,
     /// The run being written and its index.
     writing: Option<(Writing, usize)>,
@@ -385,8 +392,6 @@ pub(super) struct ChatDecoder {
     reasoning_field: Option<ReasoningField>,
     reasoning_details: Map<String, Value>,
     audio_id: Option<Value>,
-    /// The calls still open, in the order they opened.
-    calls: Vec<OpenCall>,
     finish: Option<(Reason, SmolStr)>,
     /// The reply's id, model and usage object, as the end reports them.
     end: End,
@@ -406,7 +411,6 @@ impl ChatDecoder {
             reasoning_field: None,
             reasoning_details: Map::new(),
             audio_id: None,
-            calls: Vec::new(),
             finish: None,
             end: End::default(),
             ended: false,
@@ -673,21 +677,22 @@ impl ChatDecoder {
             let index = usize::try_from(call?.index.as_u64()?).ok()?;
             Some(index).filter(|index| *index < AUTO_INDEX)
         });
-        let at = match index {
-            Some(index) => index,
-            None => match id.as_deref() {
-                Some(id) => self
-                    .calls
-                    .iter()
-                    .find(|open| open.id.as_deref() == Some(id)),
-                None => self.calls.last().filter(|open| {
-                    let arguments = self.w.text(open.at).unwrap_or_default();
-                    open.opaque || !whole_object(arguments) || !starts
-                }),
-            }
-            .map_or_else(|| self.w.fresh_index(), |open| open.at),
+        let held = match id.as_deref() {
+            _ if index.is_some() => None,
+            Some(id) => self
+                .calls()
+                .find(|(_, open)| open.id.as_deref() == Some(id)),
+            None => self.calls().last().filter(|(at, open)| {
+                let arguments = self.w.text(*at).unwrap_or_default();
+                open.opaque || !whole_object(arguments) || !starts
+            }),
+        }
+        .map(|(at, _)| at);
+        let at = match index.or(held) {
+            Some(at) => at,
+            None => self.w.fresh_index(),
         };
-        let opaque = if let Some(open) = self.calls.iter_mut().find(|open| open.at == at) {
+        let opaque = if let Some(Some(open)) = self.w.state(at) {
             if let Some(id) = &id {
                 open.id = Some(id.as_ref().to_owned());
             }
@@ -698,12 +703,17 @@ impl ChatDecoder {
             if opaque {
                 self.w
                     .open(at, Open::Opaque { replay: false }, Value::Null)?;
+            } else {
+                // The call opens under its index, named or not yet.
+                self.w.fragment(at, CallFragment::default())?;
             }
-            self.calls.push(OpenCall {
-                at,
+            let open = OpenCall {
                 id: id.as_deref().map(str::to_owned),
                 opaque,
-            });
+            };
+            if let Some(state) = self.w.state(at) {
+                *state = Some(open);
+            }
             opaque
         };
         if !opaque {
@@ -725,6 +735,13 @@ impl ChatDecoder {
         })
     }
 
+    /// The open calls, in the order they opened.
+    fn calls(&self) -> impl Iterator<Item = (usize, &OpenCall)> {
+        self.w
+            .open_states()
+            .filter_map(|(at, open)| Some((at, open.as_ref()?)))
+    }
+
     /// Close the open calls with their items: every one at the end (`all`),
     /// only those whose arguments are whole at a finish chunk, since a
     /// provider may still send fragments after it. A custom call's arguments
@@ -732,14 +749,14 @@ impl ChatDecoder {
     /// were whole keeps no item: the provider never stated it complete.
     fn close_calls(&mut self, all: bool) -> Result<(), Error> {
         let cut = matches!(self.finish, Some((Reason::Length, _)));
-        let mut waiting = Vec::new();
-        for call in std::mem::take(&mut self.calls) {
-            if call.opaque {
-                self.w.finish(call.at)?;
+        let calls: Vec<(usize, bool)> = self.calls().map(|(at, open)| (at, open.opaque)).collect();
+        for (at, opaque) in calls {
+            if opaque {
+                self.w.finish(at)?;
                 continue;
             }
             let (mut input, mut complete) = (None, false);
-            self.w.edit(call.at, |item| {
+            self.w.edit(at, |item| {
                 if CallKind::of(item.str("type")) == CallKind::Custom {
                     let custom = item.at("/custom/input").cloned();
                     input = Some(custom.unwrap_or_else(|| Value::from("")));
@@ -751,19 +768,17 @@ impl ChatDecoder {
                 };
             })?;
             if !all && !complete {
-                waiting.push(call);
                 continue;
             }
             if let Some(input) = input {
-                self.w.announce(call.at, json!({ "input": input }))?;
+                self.w.announce(at, json!({ "input": input }))?;
             }
             if cut && !complete {
-                self.w.close(call.at)?;
+                self.w.close(at)?;
             } else {
-                self.w.finish(call.at)?;
+                self.w.finish(at)?;
             }
         }
-        self.calls = waiting;
         Ok(())
     }
 
@@ -789,7 +804,9 @@ impl ChatDecoder {
 }
 
 impl Writes for ChatDecoder {
-    fn writer(&mut self) -> &mut Writer {
+    type State = Option<OpenCall>;
+
+    fn writer(&mut self) -> &mut Writer<Option<OpenCall>> {
         &mut self.w
     }
 
@@ -799,7 +816,7 @@ impl Writes for ChatDecoder {
         // else as a stop.
         if data.trim() == "[DONE]" {
             if !self.ended && self.chunked && self.quirks.done_without_finish_reason {
-                self.finish = Some(if self.calls.is_empty() {
+                self.finish = Some(if self.calls().next().is_none() {
                     (Reason::Stop, SmolStr::new_static("stop"))
                 } else {
                     (Reason::ToolCalls, SmolStr::new_static("tool_calls"))

@@ -411,7 +411,7 @@ fn a_tab_streams_replies_and_answers_asks_until_it_closes() {
     events.until("the output", |p| {
         p.iter().any(|p| {
             let html = &p.html;
-            html.contains("web-ok\n") && html.contains("exit ")
+            html.contains(">web-ok<") && html.contains("exit ")
         })
     });
 

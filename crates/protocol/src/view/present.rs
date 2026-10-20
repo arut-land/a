@@ -319,6 +319,11 @@ pub fn call_title<'a>(tool: &'a str, input: &'a Json, card: Option<&'a Card>) ->
     }
 }
 
+/// What a client says of the answer a call waited for.
+pub const fn answer_line(approved: bool) -> &'static str {
+    if approved { "approved" } else { "not approved" }
+}
+
 /// What a client says when the daemon turns out to speak protocol
 /// `supported`, not this build's.
 pub fn mismatch_line(supported: u32) -> String {

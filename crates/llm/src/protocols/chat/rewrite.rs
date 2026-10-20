@@ -13,11 +13,13 @@ use crate::models::openai;
 
 /// `history` is the conversation, when the body leaves it to be spliced;
 /// its messages took their host's shapes as they were encoded
-/// ([`message`]).
+/// ([`message`]). `tools` says whether the request offers any, which the
+/// body leaves to be spliced too.
 pub(super) fn finish(
     quirks: &Quirks,
     body: &mut Map<String, Value>,
     history: Option<&mut History>,
+    tools: bool,
 ) -> Result<(), Error> {
     // A `vendor/model` id (a proxy behind the base URL) keeps `max_tokens`.
     let reasoning = body
@@ -45,7 +47,7 @@ pub(super) fn finish(
             self::message(quirks.vendor, message);
         }
     }
-    rewrite(quirks.vendor, body, history)
+    rewrite(quirks.vendor, body, history, tools)
 }
 
 /// One message's content as the host takes it. Mira takes every content as
@@ -81,6 +83,7 @@ fn rewrite(
     vendor: Vendor,
     body: &mut Map<String, Value>,
     history: Option<&mut History>,
+    tools: bool,
 ) -> Result<(), Error> {
     let choice = body.get("tool_choice");
     let forced = choice.and_then(|choice| choice.at("/function/name")?.as_str());
@@ -125,7 +128,7 @@ fn rewrite(
                 body.remove("tool_choice");
             }
         }
-        Vendor::Mistral => mistral(body),
+        Vendor::Mistral => mistral(body, tools),
         Vendor::Ollama => {
             if let Some(key) = ["num_ctx", "options"]
                 .into_iter()
@@ -143,14 +146,10 @@ fn rewrite(
 
 /// Mistral rejects a forced tool call beside a JSON format, so the choice
 /// is relaxed rather than the format dropped.
-fn mistral(body: &mut Map<String, Value>) {
+fn mistral(body: &mut Map<String, Value>, has_tools: bool) {
     let forces = body
         .get("tool_choice")
         .is_some_and(|choice| !matches!(choice.as_str(), Some("auto" | "none")));
-    let has_tools = body
-        .get("tools")
-        .and_then(Value::as_array)
-        .is_some_and(|tools| !tools.is_empty());
     let structured = body
         .get("response_format")
         .and_then(|format| format.str("type"))

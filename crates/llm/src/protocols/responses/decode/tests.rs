@@ -1,11 +1,10 @@
 use std::path::Path;
-use std::time::{Duration, Instant};
 
 use serde_json::{Value, json};
 
 use super::*;
 use crate::accumulate::Accumulator;
-use crate::spec::{AssistantPart, CallEnd, Event as Out, Response};
+use crate::spec::{AssistantPart, CallEnd, Ended, Event as Out, Response};
 
 /// The frames of a recorded stream in `fixtures/rig/cassettes`.
 fn recorded(cassette: &str) -> Vec<String> {
@@ -20,21 +19,13 @@ fn recorded(cassette: &str) -> Vec<String> {
     events.into_iter().map(|(_, data)| data).collect()
 }
 
-/// The events `frames` decode to, `value` reading every frame as a `Value`
-/// through the decoder this one replaced ([`super::oracle`]).
-fn events(frames: &[String], value: bool) -> Vec<Out> {
-    let (mut decoder, mut oracle) = (ResponsesDecoder::new(), oracle::Oracle::new());
+/// The events `frames` decode to, up to the frame that ends the reply.
+fn events(frames: &[String]) -> Vec<Out> {
+    let mut decoder = ResponsesDecoder::new();
     let mut out = Vec::new();
     for data in frames {
-        let flow = if value {
-            let flow = oracle.lenient(data);
-            oracle.writer().drain(&mut out);
-            flow
-        } else {
-            let flow = decoder.data(data);
-            decoder.writer().drain(&mut out);
-            flow
-        };
+        let flow = decoder.data(data);
+        decoder.writer().drain(&mut out);
         if flow.expect("a frame") == Flow::Done {
             break;
         }
@@ -42,73 +33,26 @@ fn events(frames: &[String], value: bool) -> Vec<Out> {
     out
 }
 
-/// What each of `frames` decodes to, failures included, by the decoder or
-/// by the one it replaced.
-fn outcomes(frames: &[String], value: bool) -> Vec<String> {
-    let (mut decoder, mut oracle) = (ResponsesDecoder::new(), oracle::Oracle::new());
-    let mut log = Vec::new();
-    for data in frames {
-        let mut out = Vec::new();
-        let flow = if value {
-            let flow = oracle.lenient(data);
-            oracle.writer().drain(&mut out);
-            flow
-        } else {
+/// What each of `frames` decodes to, failures included.
+fn outcomes(frames: &[String]) -> Vec<Result<(Flow, Vec<Out>), Error>> {
+    let mut decoder = ResponsesDecoder::new();
+    frames
+        .iter()
+        .map(|data| {
             let flow = decoder.data(data);
+            let mut out = Vec::new();
             decoder.writer().drain(&mut out);
-            flow
-        };
-        log.push(format!("{flow:?} {out:?}"));
-    }
-    log
-}
-
-/// Every recorded Responses stream decodes as the `Value` path decoded it.
-#[test]
-fn recorded_streams_decode_as_the_value_path_did() {
-    fn walk(dir: &Path, out: &mut Vec<std::path::PathBuf>) {
-        for entry in std::fs::read_dir(dir).expect("cassettes") {
-            let path = entry.expect("an entry").path();
-            if path.is_dir() {
-                walk(&path, out);
-            } else if path.extension().is_some_and(|ext| ext == "yaml") {
-                out.push(path);
-            }
-        }
-    }
-    let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../fixtures/rig/cassettes");
-    let mut files = Vec::new();
-    walk(&root, &mut files);
-    let mut streams = 0;
-    for file in files {
-        let text = std::fs::read_to_string(&file).expect("a cassette");
-        for doc in serde_yaml_ng::Deserializer::from_str(&text) {
-            let doc: serde_yaml_ng::Value = Deserialize::deserialize(doc).expect("yaml");
-            if !doc["when"]["path"]
-                .as_str()
-                .is_some_and(|path| path.ends_with("/responses"))
-            {
-                continue;
-            }
-            let body = doc["then"]["body"].as_str().unwrap_or_default();
-            let events = crate::sse::events(&mut crate::sse::SseFramer::new(), body.as_bytes());
-            let frames: Vec<String> = events.into_iter().map(|(_, data)| data).collect();
-            assert_eq!(
-                outcomes(&frames, false),
-                outcomes(&frames, true),
-                "{}",
-                file.display()
-            );
-            streams += 1;
-        }
-    }
-    assert!(streams > 30, "{streams}");
+            flow.map(|flow| (flow, out))
+        })
+        .collect()
 }
 
 /// Frames whose fields come in any order, of another type, twice, or not
-/// at all decode as the `Value` path decodes them.
+/// at all are read leniently: a retyped index or delta is skipped, a
+/// repeated key's last value stands, an item id addresses the item, and
+/// JSON that is no object or names no known type says nothing.
 #[test]
-fn odd_frames_decode_as_the_value_path_does() {
+fn odd_frames_are_read_leniently() {
     let frames: Vec<String> = [
         json!({"type": "response.output_item.added", "output_index": 0, "item": {"type": "message", "id": "m1"}}).to_string(),
         r#"{"delta":"a","item_id":"m1","output_index":0,"type":"response.output_text.delta"}"#.to_owned(),
@@ -126,20 +70,42 @@ fn odd_frames_decode_as_the_value_path_does() {
         json!({"type": "response.completed", "response": {"status": "completed", "usage": {"input_tokens": "3", "output_tokens": 2}}}).to_string(),
     ]
     .into();
-    assert_eq!(outcomes(&frames, false), outcomes(&frames, true));
-    let untagged = [json!({"error": {"code": "x", "message": "bad"}}).to_string()];
-    assert_eq!(outcomes(&untagged, false), outcomes(&untagged, true));
-    let failed = [
-        json!({"type": "response.failed", "response": {"error": {"code": "c", "message": "m"}}})
-            .to_string(),
-    ];
-    assert_eq!(outcomes(&failed, false), outcomes(&failed, true));
+    let read = outcomes(&frames);
+    assert!(read.iter().all(Result::is_ok), "{read:?}");
+    let mut acc = Accumulator::new();
+    for event in events(&frames) {
+        acc.push(event).expect("in order");
+    }
+    let reply = acc.finish(None).expect("a reply");
+    assert_eq!(reply.message.text(), "abdef");
+    let reasoning: Vec<&str> = reply
+        .message
+        .content
+        .iter()
+        .filter_map(|part| match part {
+            AssistantPart::Reasoning(reasoning) => Some(reasoning.text.as_str()),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(reasoning, ["r"]);
+    assert_eq!((reply.usage.input, reply.usage.output), (Some(3), Some(2)));
+    for failure in [
+        json!({"error": {"code": "x", "message": "bad"}}),
+        json!({"type": "response.failed", "response": {"error": {"code": "c", "message": "m"}}}),
+    ] {
+        let [outcome] = outcomes(&[failure.to_string()]).try_into().expect("one");
+        let error = outcome.expect_err("the frame fails the reply");
+        assert!(
+            error.to_string().contains("bad") || error.to_string().contains('m'),
+            "{error}"
+        );
+    }
 }
 
 fn reply(frames: &[Value]) -> Response {
     let frames: Vec<String> = frames.iter().map(Value::to_string).collect();
     let mut accumulator = Accumulator::new();
-    for event in events(&frames, false) {
+    for event in events(&frames) {
         accumulator.push(event).expect("an event");
     }
     accumulator.finish(None).expect("a reply")
@@ -180,34 +146,6 @@ fn every_recorded_delta_frame_is_read_in_place() {
     eprintln!("{deltas} delta frames, {copied} with an escape copied");
 }
 
-/// The decoder decodes recorded streams exactly as the `Value` path does,
-/// in about half the time, since it builds no tree and copies no field.
-/// Timing needs an optimized build: `cargo nextest run --release -p llm
-/// --run-ignored all -E 'test(faster)'`.
-#[test]
-#[cfg_attr(debug_assertions, ignore = "timing needs an optimized build")]
-fn delta_frames_decode_as_values_do_but_faster() {
-    let streams: Vec<Vec<String>> = STREAMS.iter().map(|stream| recorded(stream)).collect();
-    for frames in &streams {
-        assert_eq!(events(frames, false), events(frames, true));
-    }
-    let time = |value: bool| {
-        let start = Instant::now();
-        for frames in &streams {
-            std::hint::black_box(events(frames, value));
-        }
-        start.elapsed()
-    };
-    // Interleaved, so both paths see the same load; the best run of each.
-    let (mut typed, mut value) = (Duration::MAX, Duration::MAX);
-    for _ in 0..30 {
-        typed = typed.min(time(false));
-        value = value.min(time(true));
-    }
-    eprintln!("typed {typed:?}, as values {value:?}");
-    assert!(typed < value, "typed {typed:?}, as values {value:?}");
-}
-
 /// A delta frame with a field of another type (an index sent as a string)
 /// is read leniently, to the same effect.
 #[test]
@@ -239,7 +177,7 @@ fn custom_tool_input_streams_as_its_json_object() {
     .iter()
     .map(Value::to_string)
     .collect();
-    let events = events(&frames, false);
+    let events = events(&frames);
     let deltas: String = events
         .iter()
         .filter_map(|event| match event {
@@ -250,7 +188,7 @@ fn custom_tool_input_streams_as_its_json_object() {
     assert_eq!(deltas, r#"{"input":"say \"hi\"\n"}"#);
     let call = events.iter().find_map(|event| match event {
         Out::End {
-            call: Some(CallEnd { id, input, .. }),
+            ended: Ended::Call(CallEnd { id, input, .. }),
             ..
         } => Some((id.clone(), input.clone())),
         _ => None,

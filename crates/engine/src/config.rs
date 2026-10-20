@@ -125,8 +125,7 @@ impl fmt::Display for Source {
     }
 }
 
-/// The layers: a session's own choice, if an extension keeps one, sits
-/// on top of them ([`ext::ModelSpec`]).
+/// The layers, and the overrides on top of them.
 pub struct Settings {
     /// `$A_HOME/config.toml`.
     pub home: Watched,
@@ -170,8 +169,9 @@ impl Settings {
     }
 
     /// The model spec the layers name for a session in `workspace`, and
-    /// the layer that names it: the workspace's file over the home file
-    /// over the default.
+    /// which layer named it: the workspace's file over the home file over
+    /// the default. A session's own choice is an extension's state, over
+    /// these ([`ext::ModelSpec`]).
     pub fn model(&self, workspace: &Path) -> Result<(String, Source), String> {
         let local = self.workspace(workspace);
         if let Some(model) = &local.as_ref().as_ref().map_err(Clone::clone)?.model {
@@ -200,10 +200,3 @@ impl Settings {
 
 #[cfg(test)]
 mod tests;
-
-/// The layers as every extension asks them.
-impl ext::Layers for Settings {
-    fn model(&self, workspace: &Path) -> Result<(String, String), String> {
-        Self::model(self, workspace).map(|(model, from)| (model, from.to_string()))
-    }
-}

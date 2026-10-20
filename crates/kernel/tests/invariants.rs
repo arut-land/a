@@ -28,7 +28,7 @@ fn drive(s: &mut Session, fx: Effects) {
                     card: None,
                 }
             }
-            Effect::CallModel { call, .. } => {
+            Effect::Prepare { call, .. } => {
                 let before = &s.log[usize::try_from(call.get()).unwrap() - 2].body;
                 let first = matches!(before, Body::Input { .. } | Body::Take { .. });
                 let calls = if first {
@@ -159,7 +159,7 @@ fn drive_loop(s: &mut Session, fx: Effects, script: u64) {
     while let Some(effect) = todo.pop_front() {
         let event = match effect {
             Effect::RunTool { call, tool, .. } => tool_done(call.get(), done(json!(tool))),
-            Effect::CallModel { call, .. } => {
+            Effect::Prepare { call, .. } => {
                 let k = (s.log.iter())
                     .filter(|e| matches!(e.body, Body::ModelResult { .. }))
                     .count() as u64;
@@ -185,11 +185,11 @@ fn drive_loop(s: &mut Session, fx: Effects, script: u64) {
 fn loop_points_are_folds() {
     let reg = |script: u64| {
         let max = u16::try_from(script % 4).unwrap() + 1;
-        let points = ext::host::Registry::default()
-            .with_in(ext::Tier::Pre, &ext::StepLimit { max })
-            .and_then(|r| r.with(&OneAtATime))
-            .unwrap();
-        Reg::looping(points).retry(Duration::ZERO)
+        Reg::looping(move |r| {
+            r.with_in(ext::Tier::Pre, &ext::StepLimit { max })
+                .and_then(|r| r.with(&OneAtATime))
+        })
+        .retry(Duration::ZERO)
     };
     let inputs = ["a", "b"];
     for script in 1..24u64 {
@@ -276,7 +276,7 @@ fn starts_work(effect: &Effect, open_at_interrupt: u64) -> bool {
     match effect {
         Effect::RunTool { call, .. }
         | Effect::Resume { call, .. }
-        | Effect::CallModel { call, .. }
+        | Effect::Prepare { call, .. }
         | Effect::Await { call, .. }
         | Effect::Recover { call, .. } => call.get() <= open_at_interrupt,
         Effect::StartChild { .. } => true,
@@ -382,8 +382,8 @@ fn the_same_events_give_the_same_log() {
     let (a, b) = (run(), run());
     assert_eq!(a.log, b.log);
     assert_eq!(*a.core.turn(), Turn::Idle, "{:#?}", a.log);
+    // A resume asks `on_stop` of nothing: the log shows the agent stopped.
     let reg = Reg::echo().on_stop("more");
-    reg.stopped.store(true, std::sync::atomic::Ordering::SeqCst);
     let (resumed, fx) = Session::resume(reg.arc(), a.log.clone(), &Load::default());
     assert!(fx.is_empty(), "{fx:?}");
     assert_eq!(resumed.core.turn(), a.core.turn());
@@ -446,6 +446,77 @@ fn a_kernel_panic_is_a_resume() {
     )]);
     let (_, fx) = Session::resume(Reg::echo().arc(), s.log, &Load::default());
     assert_eq!(fx.as_slice(), [append(5, tool_result(4, INTERRUPTED))]);
+}
+
+/// No extension is known by name below the extension layer: the
+/// protocol, the kernel and the engine name no plugin, its state, fold or
+/// purpose. (What the `settings` extension chooses is a service; what
+/// titles a session is a side request's purpose, the plugin's own.) The
+/// names are the `ext-*` crates'; a `kinds!` row naming a wire tag of the
+/// same spelling (the home `settings` message) is no plugin.
+#[test]
+fn no_plugin_is_named_below_the_plugin_layer() {
+    let crates = Path::new(env!("CARGO_MANIFEST_DIR")).join("..");
+    let mut plugins: Vec<String> = std::fs::read_dir(&crates)
+        .unwrap()
+        .flatten()
+        .filter_map(|e| {
+            let name = e.file_name().to_string_lossy().into_owned();
+            name.strip_prefix("ext-")
+                .filter(|n| *n != "derive")
+                .map(|n| format!("\"{n}\""))
+        })
+        .collect();
+    plugins.sort();
+    assert!(plugins.contains(&"\"settings\"".to_owned()), "{plugins:?}");
+    let wire_tag = |line: &str, literal: &str| {
+        line.trim_start()
+            .split_once(' ')
+            .is_some_and(|(kind, rest)| {
+                kind.starts_with(char::is_uppercase) && rest.starts_with(literal)
+            })
+    };
+    let mut sources = Vec::new();
+    for krate in ["protocol", "kernel", "engine"] {
+        sources.extend(rust_sources(&crates.join(krate).join("src")));
+    }
+    assert!(sources.len() > 20, "{} sources read", sources.len());
+    let mut found = Vec::new();
+    for path in sources {
+        let text = std::fs::read_to_string(&path).unwrap();
+        // A file's own unit tests may name what they like.
+        let code = text.split("#[cfg(test)]").next().unwrap_or_default();
+        for (n, line) in code.lines().enumerate() {
+            for plugin in &plugins {
+                if line.contains(plugin.as_str()) && !wire_tag(line, plugin) {
+                    found.push(format!("{}:{}: {}", path.display(), n + 1, line.trim()));
+                }
+            }
+        }
+    }
+    assert!(
+        found.is_empty(),
+        "a plugin named below the plugin layer:\n{}",
+        found.join("\n")
+    );
+}
+
+/// The non-test Rust sources under `dir`.
+fn rust_sources(dir: &Path) -> Vec<std::path::PathBuf> {
+    let mut found = Vec::new();
+    for entry in std::fs::read_dir(dir).unwrap().flatten() {
+        let path = entry.path();
+        let name = entry.file_name();
+        let name = name.to_string_lossy();
+        if path.is_dir() {
+            if name != "tests" {
+                found.extend(rust_sources(&path));
+            }
+        } else if name.ends_with(".rs") && !name.ends_with("tests.rs") {
+            found.push(path);
+        }
+    }
+    found
 }
 
 /// #32: the kernel cannot do I/O. Nothing it is built from reaches a
@@ -620,7 +691,7 @@ fn running(fx: &Effects) -> impl Iterator<Item = CallId> + '_ {
 }
 
 fn asks_the_model(fx: &Effects) -> bool {
-    fx.iter().any(|e| matches!(e, Effect::CallModel { .. }))
+    fx.iter().any(|e| matches!(e, Effect::Prepare { .. }))
 }
 
 /// What call `call` asked of its tool, as its intent logged it.

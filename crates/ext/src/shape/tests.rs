@@ -107,7 +107,9 @@ impl Host for Recorded {
     fn progress(&self, text: &str) {
         self.progress.lock().unwrap().push_str(text);
     }
-    fn note(&self, _: &str, _: &str, _: Json) {}
+    fn note(&self, _: &str, _: &str, _: Json) -> BoxFuture<'static, ()> {
+        Box::pin(std::future::ready(()))
+    }
     fn edit(&self, _: protocol::Seq, _: Option<protocol::Seq>, _: Option<Json>) {}
     fn states(&self, read: &mut dyn FnMut(&States)) {
         read(&States::default());
@@ -126,10 +128,11 @@ fn run(tool: &str, input: u64) -> (Outcome, String) {
         workspace: Path::new("/w").into(),
         env: None,
         session: SessionId::new(),
-        call: 1,
+        call: protocol::CallId::new(1).unwrap(),
         model: "test:model".into(),
         spill: Path::new("/s").into(),
         cancel: Cancel::default(),
+        services: Arc::default(),
     }
     .cx(Arc::clone(&host) as _);
     let input = Json::encode(&input).unwrap();

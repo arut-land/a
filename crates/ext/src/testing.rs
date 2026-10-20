@@ -1,20 +1,23 @@
 //! A stand-in engine for an extension's tests: calls run against a
 //! registry, with state folded and processes recorded in memory.
 
-use std::any::{Any, TypeId};
 use std::ops::Deref;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, LazyLock, Mutex, MutexGuard, PoisonError};
 
-use protocol::{Body, Entry, Environment, Epoch, Json, Outcome, Seq, SessionId};
+use protocol::{Body, CallId, Entry, Environment, Epoch, Json, Outcome, Seq, SessionId};
 use serde_json::Value;
 
-use crate::host::{Host, Parts, Registry};
+use crate::host::{Host, Parts, Registry, Services};
 use crate::{BoxFuture, Cancel, Cx, States};
 
 /// The runtime the calls run on, as the engine provides it.
 static RT: LazyLock<rt::Rt> = LazyLock::new(|| Arc::new(rt::Threads::default()));
+
+/// The services the engine provides: its runtime.
+static SERVICES: LazyLock<Arc<Services>> =
+    LazyLock::new(|| Arc::new(Services::default().with::<dyn rt::Runtime>(Arc::clone(&RT))));
 
 fn lock<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
     mutex.lock().unwrap_or_else(PoisonError::into_inner)
@@ -88,10 +91,11 @@ impl Rig {
             workspace: self.workspace().into(),
             env: self.env.clone().map(Arc::new),
             session: self.session,
-            call: self.calls.fetch_add(1, Ordering::SeqCst) + 1,
+            call: CallId::new(self.calls.fetch_add(1, Ordering::SeqCst) + 1).expect("from 1"),
             model: "test:model".into(),
             spill: self.spill().into(),
             cancel: self.cancel.clone(),
+            services: Arc::clone(&SERVICES),
         }
         .cx(Arc::clone(&self.host) as _)
     }
@@ -146,7 +150,8 @@ impl Host for Recorder {
         lock(&self.progress).push_str(text);
     }
 
-    fn note(&self, ext: &str, state: &str, data: Json) {
+    /// Committed at once: the fold is in memory.
+    fn note(&self, ext: &str, state: &str, data: Json) -> BoxFuture<'static, ()> {
         lock(&self.states).fold(ext, state, &data);
         let mut log = lock(&self.log);
         let seq = log.len() as u64 + 1;
@@ -159,6 +164,7 @@ impl Host for Recorder {
                 data,
             },
         ));
+        Box::pin(std::future::ready(()))
     }
 
     fn edit(&self, target: Seq, upto: Option<Seq>, replace: Option<Json>) {
@@ -178,9 +184,5 @@ impl Host for Recorder {
 
     fn registry(&self) -> &Registry {
         &self.registry
-    }
-
-    fn service(&self, ty: TypeId) -> Option<&(dyn Any + Send + Sync)> {
-        (ty == TypeId::of::<dyn rt::Runtime>()).then_some(&*RT as _)
     }
 }

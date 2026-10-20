@@ -26,7 +26,8 @@ use crate::{
 };
 
 pub use present::{
-    Buttons, Glyph, Kind, Presented, Shown, call_title, decision_line, mismatch_line, recap_line,
+    Buttons, Glyph, Kind, Presented, Shown, answer_line, call_title, decision_line, mismatch_line,
+    recap_line,
 };
 
 /// One session as a client shows it. Its serialized form is also what a

@@ -56,7 +56,7 @@ fn a_strict_tool_is_marked_and_sanitized_and_provider_tools_are_not() {
     );
     request.tools = vec![lookup].into();
     request.options.insert(
-        KEY.to_owned(),
+        PROTOCOL,
         json!({"tools": [{"type": "mcp_toolset", "name": "remote_tools"}]}),
     );
     let body = sent(&provider("anthropic"), &request);
@@ -116,7 +116,7 @@ fn tool_input_streaming(
     let mut request = request(SONNET_4_6, vec![Message::user("Hello")]);
     request.tools = tools.into();
     request.options.insert(
-        KEY.to_owned(),
+        PROTOCOL,
         json!({"tools": [{"type": "web_search_20250305", "name": "web_search"}], "betas": betas}),
     );
     let eager = sent(provider, &request)["tools"]

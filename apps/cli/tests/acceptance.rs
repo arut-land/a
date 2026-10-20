@@ -497,7 +497,7 @@ fn a_pending_approval_survives_detach_and_is_re_delivered_on_attach() {
         &shown[shown.len() - 2..],
         [
             "[recap · you: $ echo ran > ran.txt · ran bash · 1 waiting for approval]",
-            "? approve $ echo ran > ran.txt  [y/n]",
+            "? $ echo ran > ran.txt  waiting for approval  [y/n]",
         ]
     );
     term.type_line("y");

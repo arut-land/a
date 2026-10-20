@@ -11,10 +11,13 @@ mod encode;
 
 use crate::error::Error;
 use crate::protocol::{Decoder, Encoded, Host, Hosted, KeyStyle, Protocol, Target};
-use crate::spec::Request;
+use crate::spec::{ProtocolKey, Request};
+
+/// Which protocol this is.
+pub const PROTOCOL: ProtocolKey = ProtocolKey::GoogleGemini;
 
 /// Where this protocol's options and part state go.
-pub const KEY: &str = "google.gemini";
+pub const KEY: &str = PROTOCOL.as_str();
 
 /// Which earlier thought signatures a request sends back.
 ///
@@ -67,7 +70,7 @@ impl Gemini {
 impl Hosted for Gemini {
     type Quirks = Quirks;
 
-    const KEY: &'static str = KEY;
+    const PROTOCOL: ProtocolKey = PROTOCOL;
     const HOSTS: &'static [(Host, Quirks)] = HOSTS;
 
     fn with(quirks: Quirks) -> Self {
@@ -76,21 +79,19 @@ impl Hosted for Gemini {
 }
 
 impl Protocol for Gemini {
-    fn key(&self) -> &'static str {
-        KEY
+    fn key(&self) -> ProtocolKey {
+        PROTOCOL
     }
 
     fn encode(&self, target: &Target<'_>, request: &Request) -> Result<Encoded, Error> {
         let model = target.model.strip_prefix("models/").unwrap_or(target.model);
         let models = self.quirks.models_path;
-        let (body, history) = encode::body(self, target, request)?;
+        let encoded = encode::body(self, target, request)?;
         Ok(Encoded {
             // `alt=sse` makes the reply an event stream rather than one JSON
             // array of the same chunks.
             path: format!("{models}/{model}:streamGenerateContent?alt=sse"),
-            body,
-            history,
-            headers: Vec::new(),
+            ..encoded
         })
     }
 

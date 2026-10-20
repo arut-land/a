@@ -16,7 +16,7 @@ use crate::accumulate::Accumulator;
 use crate::error::{Error, Kind};
 use crate::http::{Body, BoxFuture, Http};
 use crate::protocol::{Decoder, Flow, Provider, Target};
-use crate::spec::{Event, Origin, Request, Response, SmolStr};
+use crate::spec::{Event, Origin, Request, Response};
 use crate::sse::SseFramer;
 
 /// Streams the reply to `request` from `provider`.
@@ -56,7 +56,7 @@ pub async fn generate(
 /// What the reply's message names as its producer.
 pub fn origin(provider: &Provider, model: &str) -> Origin {
     Origin {
-        protocol: SmolStr::new_static(provider.protocol.key()),
+        protocol: provider.protocol.key(),
         provider: provider.id.clone(),
         model: model.into(),
     }

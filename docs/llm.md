@@ -10,6 +10,7 @@ everything around them is our own and small.
 | --- | --- | --- |
 | Spec | `spec.rs` | Provider-agnostic, serde-stable types. Messages are one enum per role (`System`, `User`, `Assistant`, `Tool`), each holding only the parts that role may. Every part carries `meta`: provider state keyed by the protocol that wrote it. |
 | Protocol | `protocol.rs` | A wire protocol is a pure `encode` (request to body) and a pure `Decoder` (frames to events). A `Provider` is data: id, base URL, auth, and a protocol value carrying that host's quirks. `Host` builds one from the environment. |
+| Conversation | `conversation.rs` | A conversation's messages, shared by every request that carries them, with what each protocol encoded of them: a fold writes each message's items once, as bytes, and later requests splice those bytes. A tool set keeps its definitions the same way, as bytes per wire. |
 | Writer | `writer.rs` | rig's completion fold as a sans-IO helper every decoder writes through (`Writes`). It owns the rules all wires share (see its module doc). |
 | JSON | `json.rs` | Lenient reads of what providers send, the borrowing frame reader every decoder shares (`json/read.rs`), and tool arguments parsed so a cut-off call never fails a reply. |
 | Models | `models/` | What model ids say: reasoning (levels, budgets, whether it turns off), sampling, vision and output limits, as id rules and const tables, one module per vendor. Protocols ask here and keep only how their wire spells an option. |

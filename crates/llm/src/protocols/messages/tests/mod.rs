@@ -6,7 +6,6 @@ mod decode;
 mod encode;
 mod hosts;
 mod options;
-mod oracle;
 mod tools;
 
 use serde_json::{Value, json};
@@ -83,7 +82,6 @@ fn tool(name: &str) -> Tool {
         description: format!("{name} description"),
         schema: json!({"type": "object", "properties": {}}),
         strict: None,
-        encoded: crate::Encodings::default(),
     }
 }
 

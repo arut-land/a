@@ -589,14 +589,12 @@ fn tools_choice_and_format_take_gemini_spellings() {
                 description: "Add x and y".into(),
                 schema: json!({"type": "object", "properties": {"x": {"type": "number"}}}),
                 strict: None,
-                encoded: crate::Encodings::default(),
             },
             Tool {
                 name: "now".into(),
                 description: String::new(),
                 schema: Value::Null,
                 strict: None,
-                encoded: crate::Encodings::default(),
             },
         ]
         .into(),
@@ -607,7 +605,7 @@ fn tools_choice_and_format_take_gemini_spellings() {
             description: None,
         }),
         options: crate::spec::Options::from([(
-            KEY.to_owned(),
+            PROTOCOL,
             json!({"tools": [{"codeExecution": {}}]}),
         )]),
         ..Request::default()

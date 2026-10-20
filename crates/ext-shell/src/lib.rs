@@ -5,7 +5,10 @@
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
-use ext::{CwdOf, Cx, Extension, Registrar, SpawnSpec, Spawner, States, Text, Tool};
+use ext::{
+    Configured, CwdOf, Cx, Extension, Provides, Refused, Registrar, SpawnSpec, Spawner, States,
+    Table, Text, Tool,
+};
 use protocol::Environment;
 
 pub mod bash;
@@ -17,6 +20,15 @@ pub use bash::Bash;
 
 /// The `shell` extension.
 pub struct Shell;
+
+impl Provides<dyn CwdOf> for Shell {}
+impl Provides<dyn Spawner> for Shell {}
+
+impl Configured for Shell {
+    fn configure(_: &impl Table) -> Result<Self, Refused> {
+        Ok(Self)
+    }
+}
 
 impl Extension for Shell {
     const NAME: &'static str = "shell";
@@ -48,7 +60,7 @@ impl CwdOf for Shell {
 
 impl Spawner for Shell {
     fn process(&self, cx: &Cx, mut spawn: SpawnSpec) -> Result<std::process::Command, String> {
-        cx.spawn_hooks(&mut spawn);
+        cx.spawn_hooks(&mut spawn)?;
         if spawn.argv.is_empty() {
             return Err("a spawn hook left no program to run".to_owned());
         }

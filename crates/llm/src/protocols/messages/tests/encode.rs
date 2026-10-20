@@ -2,6 +2,7 @@
 
 use super::*;
 use crate::Meta;
+use crate::spec::ProtocolKey;
 use crate::spec::{Media, Opaque, Output, Reasoning, Source, Text, ToolCall, UserPart};
 
 /// The last message of `history` on the wire to Claude Sonnet 4.6.
@@ -591,7 +592,7 @@ fn drop_block_joins_the_callers_thinking() {
         let mut request = request(OPUS_5_5, vec![Message::user("q")]);
         request
             .options
-            .insert(KEY.to_owned(), json!({"thinking": thinking}));
+            .insert(PROTOCOL, json!({"thinking": thinking}));
         assert_eq!(sent(&provider("anthropic"), &request)["thinking"], sent_as);
         let binding = beta(&provider("anthropic"), &request);
         assert_eq!(binding.is_some(), sent_as.get("block_binding").is_some());
@@ -693,7 +694,7 @@ fn violations(body: &Value) -> Vec<String> {
 #[test]
 fn adversarial_histories_encode_to_requests_anthropic_takes() {
     let other = Some(crate::Origin {
-        protocol: "openai.chat".into(),
+        protocol: ProtocolKey::OpenaiChat,
         provider: "openai".into(),
         model: "gpt-4.1".into(),
     });

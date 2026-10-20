@@ -712,49 +712,37 @@ fn the_container_is_kept_as_a_last_opaque_part() {
     );
 }
 
-/// `frames` decoded by the decoder (`fast`), or each through a `Value` by
-/// the decoder it replaced ([`super::oracle`]); `each` sees each frame's
-/// flow and events.
-fn decode_frames(
-    frames: &[String],
-    fast: bool,
-    mut each: impl FnMut(Result<crate::Flow, Error>, &mut Vec<Event>),
-) {
+/// What each of `frames` decodes to: its flow and events, or its failure.
+fn outcomes(frames: &[String]) -> Vec<Result<(crate::Flow, Vec<Event>), Error>> {
     let mut decoder = super::super::decode::MessagesDecoder::new(false);
-    let mut oracle = oracle::Oracle::new(false);
-    let mut events = Vec::new();
-    for data in frames {
-        let flow = if fast {
-            Decoder::frame(&mut decoder, Frame { event: "", data }, &mut events)
-        } else {
-            // Every frame through its `Value` path.
-            let flow = match data.trim() {
-                "[DONE]" => Ok(crate::Flow::More),
-                _ => oracle.value(data),
-            };
-            crate::writer::Writes::writer(&mut oracle).drain(&mut events);
-            flow
-        };
-        each(flow, &mut events);
-        events.clear();
+    frames
+        .iter()
+        .map(|data| {
+            let mut events = Vec::new();
+            let flow = Decoder::frame(&mut decoder, Frame { event: "", data }, &mut events);
+            flow.map(|flow| (flow, events))
+        })
+        .collect()
+}
+
+/// The reply the events of `outcomes` fold to, failed frames skipped.
+fn folded(outcomes: Vec<Result<(crate::Flow, Vec<Event>), Error>>) -> Response {
+    let mut acc = Accumulator::new();
+    for (_, events) in outcomes.into_iter().flatten() {
+        for event in events {
+            acc.push(event).expect("in order");
+        }
     }
+    acc.finish(None).expect("a reply")
 }
 
-/// What each of `frames` decodes to.
-fn events_of(frames: &[String], fast: bool) -> Vec<String> {
-    let mut log = Vec::new();
-    decode_frames(frames, fast, |flow, events| {
-        log.push(format!("{flow:?} {events:?}"));
-    });
-    log
-}
-
-/// Frames the decoder must agree on with the `Value` path it replaced:
-/// escapes, extra fields, empty and missing fragments, a string index, a
-/// duplicate field, deltas to a block that never started and to one of
-/// another kind.
+/// Frames read leniently: escapes, extra fields, empty and missing
+/// fragments, a string index, a duplicate field (its last value stands),
+/// deltas to a block that never started (which open it) and to one of
+/// another kind (which fail the frame, and only the frame).
 #[test]
-fn frames_read_once_decode_as_the_value_path_does() {
+#[allow(clippy::too_many_lines)]
+fn odd_frames_are_read_leniently_and_a_failed_frame_leaves_the_rest_readable() {
     let start = |index: usize, block: Value| {
         json!({"type": "content_block_start", "index": index, "content_block": block}).to_string()
     };
@@ -836,14 +824,36 @@ fn frames_read_once_decode_as_the_value_path_does() {
     );
     // Frames after one that fails are decoded too: each path must agree on
     // every frame, not only on the reply.
-    assert_eq!(events_of(&frames, true), events_of(&frames, false));
+    let outcomes = outcomes(&frames);
+    let failed: Vec<usize> = (outcomes.iter().enumerate())
+        .filter_map(|(at, outcome)| outcome.is_err().then_some(at))
+        .collect();
+    // The `null` text to block 3, and the input JSON to the thinking block.
+    assert_eq!(failed, [16, 17], "{outcomes:?}");
+    let reply = folded(outcomes);
+    let [
+        AssistantPart::Reasoning(thinking),
+        AssistantPart::ToolCall(call),
+        AssistantPart::Opaque(_),
+        AssistantPart::Text(text),
+    ] = reply.message.content.as_slice()
+    else {
+        panic!("{:?}", reply.message.content);
+    };
+    assert_eq!(thinking.text, "plainesc\"aped\n\u{e9}xxstring indexb");
+    let thinking = item(&reply.message.content[0]).expect("kept");
+    assert_eq!(thinking["signature"], "ssig\\");
+    assert_eq!(thinking["extra"], json!([1]));
+    assert_eq!(call.id, "toolu_1");
+    assert_eq!(call.input.raw(), "{\"a\":\"\u{e9}\"}");
+    assert_eq!(text.text, "opens block 3");
 }
 
 /// A block's text lands on its item when it stops, unless a delta of
-/// another kind or another delta's field touches that text first: the item
-/// is the one the `Value` path assembled token by token.
+/// another kind or another delta's field touches that text first, when the
+/// item takes each delta as it comes.
 #[test]
-fn a_blocks_text_lands_on_its_item_as_each_token_did() {
+fn a_blocks_item_holds_the_text_it_streamed() {
     let start = |index: usize, block: Value| {
         json!({"type": "content_block_start", "index": index, "content_block": block}).to_string()
     };
@@ -918,59 +928,39 @@ fn a_blocks_text_lands_on_its_item_as_each_token_did() {
         ],
     ];
     let end = json!({"type": "message_delta", "delta": {"stop_reason": "end_turn"}, "usage": {}});
+    let mut streamed = Vec::new();
     for mut frames in cases {
         frames.push(end.to_string());
-        assert_eq!(
-            events_of(&frames, true),
-            events_of(&frames, false),
-            "{frames:#?}"
-        );
-    }
-}
-
-/// Every recorded Messages stream decodes as the `Value` path decoded it.
-#[test]
-fn recorded_streams_decode_as_the_value_path_did() {
-    fn walk(dir: &std::path::Path, out: &mut Vec<std::path::PathBuf>) {
-        for entry in std::fs::read_dir(dir).expect("cassettes") {
-            let path = entry.expect("an entry").path();
-            if path.is_dir() {
-                walk(&path, out);
-            } else if path.extension().is_some_and(|ext| ext == "yaml") {
-                out.push(path);
-            }
+        let reply = folded(outcomes(&frames));
+        for part in &reply.message.content {
+            let (text, key) = match part {
+                AssistantPart::Text(text) => (&text.text, "text"),
+                AssistantPart::Reasoning(thinking) => (&thinking.text, "thinking"),
+                _ => continue,
+            };
+            let item = item(part).expect("the block is kept");
+            let held = item[key].as_str().expect("a string").to_owned();
+            streamed.push((text.clone(), held));
         }
     }
-    let root = format!(
-        "{}/../../fixtures/rig/cassettes",
-        env!("CARGO_MANIFEST_DIR")
-    );
-    let mut files = Vec::new();
-    walk(std::path::Path::new(&root), &mut files);
-    let mut streams = 0;
-    for file in files {
-        let text = std::fs::read_to_string(&file).expect("a cassette");
-        for doc in serde_yaml_ng::Deserializer::from_str(&text) {
-            let doc: serde_yaml_ng::Value = serde::Deserialize::deserialize(doc).expect("yaml");
-            if !doc["when"]["path"]
-                .as_str()
-                .is_some_and(|path| path.ends_with("/messages"))
-            {
-                continue;
-            }
-            let body = doc["then"]["body"].as_str().unwrap_or_default();
-            let events = crate::sse::events(&mut crate::sse::SseFramer::new(), body.as_bytes());
-            let frames: Vec<String> = events.into_iter().map(|(_, data)| data).collect();
-            assert_eq!(
-                events_of(&frames, true),
-                events_of(&frames, false),
-                "{}",
-                file.display()
-            );
-            streams += 1;
-        }
-    }
-    assert!(streams > 30, "{streams}");
+    // The part's text, and its item's: another kind's delta reaches only
+    // the part, a text another delta states only the item, and a delta
+    // after the stop only the item.
+    let expected = [
+        ("abc", "abc"),
+        ("b", "b"),
+        ("bc", "bc"),
+        ("btc", "bc"),
+        ("xyzw", "xyw"),
+        ("bc", "b!c"),
+        ("bc", "bclate"),
+        ("open", "open"),
+    ];
+    let streamed: Vec<(&str, &str)> = streamed
+        .iter()
+        .map(|(text, held)| (text.as_str(), held.as_str()))
+        .collect();
+    assert_eq!(streamed, expected);
 }
 
 /// The frames of the recorded Anthropic stream `name`.
@@ -987,9 +977,7 @@ fn recorded(name: &str) -> Vec<String> {
 }
 
 /// The decoder reads every delta of a recorded stream without building a
-/// `Value`, borrowing each fragment that needs no unescaping, and decodes
-/// the same events as the `Value` path. An optimized build is faster too;
-/// both timings are printed.
+/// `Value`, borrowing each fragment that needs no unescaping.
 #[test]
 fn a_delta_is_read_without_a_value() {
     use super::super::decode::frame;
@@ -1020,27 +1008,5 @@ fn a_delta_is_read_without_a_value() {
         })
         .count();
     assert_eq!(owned, escaped, "only an escaped fragment is copied");
-    assert_eq!(events_of(&frames, true), events_of(&frames, false));
-    let time = |fast: bool| {
-        (0..15)
-            .map(|_| {
-                let start = std::time::Instant::now();
-                decode_frames(&frames, fast, |flow, events| {
-                    let _ = std::hint::black_box((flow, events));
-                });
-                start.elapsed()
-            })
-            .min()
-            .expect("rounds")
-    };
-    let (fast, slow) = (time(true), time(false));
-    eprintln!(
-        "{} frames, {} deltas ({owned} copied): typed {fast:?}, Value {slow:?} ({:.2}x)",
-        frames.len(),
-        deltas.len(),
-        slow.as_secs_f64() / fast.as_secs_f64()
-    );
-    if !cfg!(debug_assertions) {
-        assert!(fast < slow, "typed {fast:?}, Value {slow:?}");
-    }
+    assert!(outcomes(&frames).iter().all(Result::is_ok));
 }

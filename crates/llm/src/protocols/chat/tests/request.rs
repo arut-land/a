@@ -11,7 +11,7 @@ use crate::Kind;
 use crate::protocols::chat::encode::{
     DOCUMENT_UNSENDABLE, TOOL_IMAGE_ATTACHED, TOOL_IMAGES_HEADING,
 };
-use crate::protocols::chat::{KEY, Quirks};
+use crate::protocols::chat::{PROTOCOL, Quirks};
 use crate::spec::{
     Assistant, AssistantPart, Effort, Format, Generation, Media, Message, Meta, Output, Request,
     Source, Text, Tool, ToolCall, ToolChoice, ToolMessage, ToolResult, User, UserPart,
@@ -23,7 +23,6 @@ pub(super) fn tool(name: &str) -> Tool {
         description: "a tool".into(),
         schema: json!({"type": "object", "properties": {}}),
         strict: None,
-        encoded: crate::Encodings::default(),
     }
 }
 
@@ -50,7 +49,7 @@ pub(super) fn effort(effort: Effort) -> Generation {
 }
 
 fn options(request: &mut Request, options: Value) {
-    request.options.insert(KEY.into(), options);
+    request.options.insert(PROTOCOL, options);
 }
 
 fn media(media_type: &str, source: Source) -> UserPart {
@@ -127,7 +126,6 @@ fn a_recorded_request_is_what_we_send() {
         description: "Matrix tool ping".into(),
         schema: json!({"type": "object", "properties": {}, "additionalProperties": false}),
         strict: None,
-        encoded: crate::Encodings::default(),
     }]
     .into();
     call.tool_choice = ToolChoice::Required;

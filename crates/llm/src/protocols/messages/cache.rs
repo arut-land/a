@@ -102,6 +102,11 @@ impl Caching {
         })
     }
 
+    /// Whether a breakpoint goes on the last tool.
+    pub(super) fn marks_tools(&self) -> bool {
+        self.manual || self.static_ttl.is_some()
+    }
+
     /// Place the breakpoints, one fewer with a top-level marker, in
     /// `messages`, which follow messages settled with `settled`. Markers a
     /// tool already carries are kept and count toward the budget, and every
@@ -135,7 +140,7 @@ impl Caching {
             ));
         }
         let unmarked = |block: &&mut Map<String, Value>| !block.contains_key("cache_control");
-        if self.manual || self.static_ttl.is_some() {
+        if self.marks_tools() {
             let marker = ephemeral(self.static_ttl.or(top_ttl));
             let last_tool = tools
                 .iter_mut()

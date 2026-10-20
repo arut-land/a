@@ -4,7 +4,7 @@
 //!
 //! 1. swap `bash` for a sandboxed one: [`a_users_bash_replaces_the_shells_in_place`]
 //!    here, `ext-shell`'s `every_process_goes_through_the_spawn_hooks`,
-//!    and [`super::fails`]'s `a_failing_spawn_hook_refuses_the_process`;
+//!    and `ext`'s `a_failing_handler_answers_its_points_failure_policy`;
 //! 2. approval modes, the judge among them: `ext-policy`'s
 //!    `modes_decide_what_is_asked_about`, `a_judge_that_fails_asks_the_user`
 //!    and `the_floor_cannot_be_loosened`;
@@ -115,7 +115,7 @@ impl Extension for Fallback {
                 }
                 let cx = cx.cx();
                 Answer::Later(Later::new(async move {
-                    cx?.update::<FallbackTo>(Some("gpt-5.6-mini".into()));
+                    cx?.update::<FallbackTo>(&Some("gpt-5.6-mini".into())).await;
                     Some(Recover::Resend)
                 }))
             })

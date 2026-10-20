@@ -95,12 +95,9 @@ pub(crate) async fn refuse(reactor: &Reactor, listener: &Async<&Listener>, why: 
 
 /// `work`'s output, unless `limit` passes first.
 async fn within<T>(reactor: &Reactor, limit: Duration, work: impl Future<Output = T>) -> Option<T> {
-    let (mut work, mut late) = (pin!(work), reactor.sleep(limit));
-    poll_fn(|cx| {
-        if let Poll::Ready(done) = work.as_mut().poll(cx) {
-            return Poll::Ready(Some(done));
-        }
-        late.as_mut().poll(cx).map(|()| None)
+    rt::or(async { Some(work.await) }, async {
+        reactor.sleep(limit).await;
+        None
     })
     .await
 }

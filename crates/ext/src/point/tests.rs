@@ -8,13 +8,21 @@ use protocol::{Epoch, Seq};
 use serde_json::{Value, json};
 
 use super::*;
-use crate::{Registrar, SpawnSpec};
+use crate::{LoopPoints, Registrar, SpawnSpec};
 
 /// Counts every time a handler's context is read.
 #[derive(Default)]
 struct Counted(AtomicUsize);
 
 impl View for Counted {
+    fn session(&self) -> SessionId {
+        SessionId::new()
+    }
+
+    fn workspace(&self) -> &Path {
+        Path::new("/w")
+    }
+
     fn model(&self) -> String {
         self.0.fetch_add(1, Ordering::SeqCst);
         "test:model".to_owned()
@@ -27,7 +35,7 @@ impl View for Counted {
 }
 
 fn point_cx(view: &Counted) -> PointCx<'_> {
-    PointCx::new(SessionId::new(), Path::new("/w"), view)
+    PointCx::new(view)
 }
 
 /// The hooks extensions named as given register.
@@ -219,16 +227,29 @@ where
 }
 
 /// An observed point tells every handler, in order.
-fn observes<P: Point<Out = ()>>(cx: &P::Cx<'_>, facts: P::Facts<'_>) {
+fn observes<P>(cx: &P::Cx<'_>, facts: P::Facts<'_>)
+where
+    P: Point,
+    P::Out: Rule<Subject = ()> + From<()>,
+{
     let told = Arc::new(Mutex::new(Vec::new()));
     let by = ["a", "b", "c"].map(|name| {
         let told = Arc::clone(&told);
         one(name, move |r| {
-            r.on::<P>(move |_, _| told.lock().unwrap().push(name));
+            r.on::<P>(move |_, _| {
+                told.lock().unwrap().push(name);
+                P::Out::from(())
+            });
         })
     });
     hooks(by.into()).run::<P>(cx, facts, &mut (), &mut |_, (), ()| {});
     assert_eq!(*told.lock().unwrap(), ["a", "b", "c"], "{}", P::NAME);
+}
+
+impl From<()> for Reaction {
+    fn from((): ()) -> Self {
+        Self::NONE
+    }
 }
 
 /// Every point says what a failing handler comes to, and what decides
@@ -258,6 +279,123 @@ fn every_point_declares_its_failure_policy() {
         ("step", FailOpen),
     ];
     assert_eq!(declared, want);
+    // The table of points is the table of erased points: a point cannot
+    // be declared without saying whether it takes one.
+    let named: Vec<&str> = ERASED.iter().map(|(name, _)| *name).collect();
+    let mut declared: Vec<&str> = declared.iter().map(|(name, _)| *name).collect();
+    declared.sort_unstable();
+    let mut named_sorted = named.clone();
+    named_sorted.sort_unstable();
+    assert_eq!(declared, named_sorted);
+    let wired: Vec<&str> = (ERASED.iter())
+        .filter(|(_, adapt)| adapt.is_some())
+        .map(|(name, _)| *name)
+        .collect();
+    assert_eq!(
+        wired,
+        [
+            "input",
+            "pre_tool",
+            "permission",
+            "approve",
+            "on_stop",
+            "observe"
+        ]
+    );
+}
+
+/// A handler that panics answers as its point's policy says, at every
+/// point, with no engine in between: a closed point refuses what it
+/// decides about, naming the handler; an open one is passed over.
+#[test]
+#[cfg_attr(
+    debug_assertions,
+    ignore = "dev builds' cranelift backend cannot unwind through these frames: \
+              CARGO_PROFILE_DEV_CODEGEN_BACKEND=llvm cargo nextest run -p ext --run-ignored all"
+)]
+fn a_failing_handler_answers_its_points_failure_policy() {
+    let view = Counted::default();
+    let cx = point_cx(&view);
+    let input = Json::encode(&json!({})).unwrap();
+    let broken = hooks(vec![one("broken", |r| {
+        r.on::<Input>(|_, _| panic!("i"))
+            .on::<PreTool>(|_, _| panic!("p"))
+            .on::<Permission>(|_, _| panic!("m"))
+            .on::<Spawn>(|_, _| panic!("s"))
+            .on::<PostTool>(|_, _| panic!("t"))
+            .on::<OnStop>(|_, ()| panic!("o"))
+            .on::<Observe>(|_, _| panic!("b"))
+            .on::<Step>(|_, _| panic!("e"))
+            .on::<RequestError>(|_, _| panic!("r"))
+            .on::<Resume>(|(), _| panic!("u"))
+            .on::<Turn>(|(), _| panic!("n"));
+    })]);
+    // Closed: refused, naming who.
+    let refused = broken.input(&cx, "hi".into()).unwrap_err();
+    assert_eq!(refused, "broken: broken panicked: i");
+    let gated = broken.gate(&cx, "t", &input).now().unwrap();
+    assert_eq!(gated.gate, Gate::Refuse("broken panicked: p".into()));
+    let mut spawn = SpawnSpec {
+        argv: vec!["x".into()],
+        env: BTreeMap::new(),
+        cwd: "/".into(),
+    };
+    let refused = broken.spawn(&cx, &mut spawn).unwrap_err();
+    assert_eq!(
+        (&*refused.0, refused.1.as_str()),
+        ("broken", "broken panicked: s")
+    );
+    let asks = hooks(vec![
+        one("policy", |r| {
+            r.on::<Permission>(|_, _| Level::Ask);
+        }),
+        one("broken", |r| {
+            r.on::<Approve>(|_, _| panic!("a"));
+        }),
+    ]);
+    let gated = asks.gate(&cx, "t", &input).now().unwrap();
+    assert_eq!(
+        gated.gate,
+        Gate::Refuse("broken did not approve this call".into())
+    );
+    let denies = hooks(vec![one("broken", |r| {
+        r.on::<PreTool>(|_, _| Rewrite::Pass)
+            .on::<Permission>(|_, _| panic!("m"));
+    })]);
+    let gated = denies.gate(&cx, "t", &input).now().unwrap();
+    assert_eq!(gated.gate, Gate::Refuse("broken denied this call".into()));
+    // Open: passed over.
+    let outcome = Outcome::Interrupted { output: None };
+    let after = broken.post_tool(&cx, ("t", &input), outcome.clone());
+    assert_eq!(after, Chained::new(outcome));
+    assert_eq!(broken.on_stop(&cx), None);
+    let entry = Entry::new(Seq::new(1).unwrap(), Epoch(0), protocol::Body::INTERRUPT);
+    assert_eq!(broken.observe(point_cx(&view), &entry).len(), 0);
+    let mut request = llm::Request::default();
+    assert_eq!(broken.step(&cx, &mut request), (Decided::new(), None));
+    let error = llm::Error::new(llm::Kind::Server, "e");
+    let failed = Failed {
+        error: &error,
+        attempt: 0,
+    };
+    assert_eq!(broken.request_error(&cx, failed), Asked::None);
+    assert_eq!(LoopPoints::resume(&broken, 1), crate::Resume::Continue);
+    let user = crate::Input::User { text: "hi".into() };
+    let actions = Actions::from_elem(crate::Action::Say("hi".into()), 1);
+    assert_eq!(LoopPoints::turn(&broken, &user, actions.clone()), actions);
+    // A later answer that panics comes to the same.
+    let later = hooks(vec![
+        one("policy", |r| {
+            r.on::<Permission>(|_, _| Level::Ask);
+        }),
+        one("broken", |r| {
+            r.on::<Approve>(|_, _| Answer::Later(Later::new(async { panic!("later") })));
+        }),
+    ]);
+    let Gating::Approving(approving) = later.gate(&cx, "t", &input) else {
+        panic!("answers later")
+    };
+    assert_eq!(rt::block_on(approving.answer.0), Some(false));
 }
 
 #[test]
@@ -389,7 +527,7 @@ fn a_point_with_no_handler_costs_nothing() {
         let after = hooks.post_tool(&cx, ("t", &input), outcome.clone());
         assert_eq!(after, Chained::new(outcome));
         hooks.observe(
-            &cx,
+            point_cx(&view),
             &Entry::new(Seq::new(1).unwrap(), Epoch(0), protocol::Body::INTERRUPT),
         );
         hooks.session_start(&cx);

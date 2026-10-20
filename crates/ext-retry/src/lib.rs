@@ -12,7 +12,7 @@ use std::hash::{BuildHasher, BuildHasherDefault, DefaultHasher};
 use std::time::Duration;
 
 use ext::point::{Failed, Recover, RequestError};
-use ext::{Answer, Extension, PointCx, Registrar};
+use ext::{Answer, Configured, Extension, PointCx, Refused, Registrar, Table};
 
 /// The `retry` extension.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -81,6 +81,18 @@ fn jitter(wait: Duration, seed: u64) -> Duration {
 /// What spreads the backoff of the call `cx` is about, at `attempt`.
 fn seed(cx: &PointCx<'_>, attempt: u16) -> u64 {
     BuildHasherDefault::<DefaultHasher>::default().hash_one((cx.session.0, cx.call, attempt))
+}
+
+/// `[ext.retry] attempts` and `transport`.
+impl Configured for Retry {
+    fn configure(table: &impl Table) -> Result<Self, Refused> {
+        let default = Self::default();
+        Ok(Self {
+            attempts: table.number("attempts")?.unwrap_or(default.attempts),
+            transport: table.number("transport")?.unwrap_or(default.transport),
+            ..default
+        })
+    }
 }
 
 impl Extension for Retry {

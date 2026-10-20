@@ -26,7 +26,7 @@ fn body(messages: Vec<Message>) -> Value {
 
 fn origin() -> Origin {
     Origin {
-        protocol: KEY.into(),
+        protocol: PROTOCOL,
         provider: "openai".into(),
         model: "gpt-6-luna".into(),
     }

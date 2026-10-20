@@ -29,6 +29,9 @@ use std::thread::{self, Thread};
 use std::time::{Duration, Instant};
 
 pub use events::{Event, EventSink, Noop, Stderr};
+/// The first of two futures to resolve, the left polled first: every
+/// race in the engine and the extensions is one of these.
+pub use futures_lite::future::or;
 pub use io::{Async, Reactor, Source};
 pub use notify::Notify;
 #[cfg(feature = "threads")]

@@ -153,16 +153,21 @@ fn filtered(reason: &str) -> bool {
 }
 
 /// Every finish reason but `STOP` and `MAX_TOKENS` is a failure: the
-/// content filters' are one kind, the rest (`RECITATION`,
-/// `MALFORMED_FUNCTION_CALL`, …) another.
+/// content filters' ([`filtered`], and these) are one kind, the rest
+/// (`RECITATION`, `MALFORMED_FUNCTION_CALL`, …) another.
+const FINISHES: &[(&str, Reason)] = &[
+    ("STOP", Reason::Stop),
+    ("MAX_TOKENS", Reason::Length),
+    ("SPII", Reason::ContentFilter),
+    ("IMAGE_PROHIBITED_CONTENT", Reason::ContentFilter),
+];
+
 fn reason_of(name: &str) -> Reason {
-    match name {
-        "STOP" => Reason::Stop,
-        "MAX_TOKENS" => Reason::Length,
-        "SPII" | "IMAGE_PROHIBITED_CONTENT" => Reason::ContentFilter,
-        name if filtered(name) => Reason::ContentFilter,
-        _ => Reason::Other,
-    }
+    Reason::listed(FINISHES, name).unwrap_or(if filtered(name) {
+        Reason::ContentFilter
+    } else {
+        Reason::Other
+    })
 }
 
 /// Usage from `usageMetadata`. Input is the prompt plus the tool-use
@@ -313,12 +318,7 @@ impl GeminiDecoder {
         let (Some(_), Some(index)) = (self.run.take(), self.last) else {
             return Ok(());
         };
-        let text = self.w.text(index).unwrap_or_default().to_owned();
-        self.w.edit(index, |item| {
-            if let Some(item) = item.as_object_mut() {
-                item.insert("text".into(), text.into());
-            }
-        })?;
+        self.w.land(index, "text")?;
         self.w.finish(index)
     }
 
@@ -427,6 +427,8 @@ impl GeminiDecoder {
 }
 
 impl Writes for GeminiDecoder {
+    type State = ();
+
     fn writer(&mut self) -> &mut Writer {
         &mut self.w
     }

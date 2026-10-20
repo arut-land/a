@@ -10,26 +10,31 @@
 //! feeds their outcomes back.
 //!
 //! The kernel numbers the entries it appends and folds each at once, as it
-//! folds an entry it loads: the [`Ledger`](protocol::ledger::Ledger), and the agent, whose inputs are
-//! all logged facts. So the state a live session reaches and the state
+//! folds an entry it loads: the [`Ledger`], and the agent, whose inputs
+//! are all logged facts. So the state a live session reaches and the state
 //! loading its log rebuilds are one fold, and recovery is one function,
 //! [`Core::resume`]: after a load, a failed commit, a registry reload or a
 //! panic alike.
 //!
 //! The kernel ships no tool, prompt, permission rule, model choice, retry
 //! policy or agent loop: all of that answers through the session's
-//! [`Registry`] and [`Agent`].
+//! [`Binding`] and [`Agent`]. Nor does it see a model request: it asks
+//! the driver to prepare one ([`Effect::Prepare`]), logs what the `step`
+//! point decided about it ([`Event::Prepared`]), and only then has it sent
+//! ([`Effect::Send`]), so a decision is durable before the work it shaped.
 
-use std::fmt;
 use std::sync::Arc;
 use std::time::Duration;
 
+pub use ext::host::Binding;
 pub use ext::{
     Action, Actions, Agent, Answer, Callable, Chained, Concurrency, Gate, Gated, Input, Later,
-    LoopPoints, Name, Parsed, Recover, Replay,
+    LoopPoints, Name, Recover, Replay,
 };
+#[cfg(doc)]
+use protocol::ledger::Ledger;
 use protocol::{
-    Author, Body, CallId, Card, Entry, Environment, Installed, Json, Mode, Outcome, Seq, SessionId,
+    Author, Body, CallId, Card, Entry, Environment, Json, Mode, Outcome, Seq, SessionId,
     ToolChoice, WaitOn,
 };
 use smallvec::SmallVec;
@@ -133,16 +138,20 @@ pub enum Event {
     },
     /// Side request `side` ended.
     SideDone { side: CallId, outcome: Outcome },
-    /// The `step` point decided `decisions` about model call `call`'s
-    /// request as it was sent (or answered it).
+    /// The request of model call `call` is prepared ([`Effect::Prepare`]):
+    /// the `step` point decided `decisions` about it, and a handler
+    /// `answered` it in the model's place, if one did. Logged, then the
+    /// request is sent ([`Effect::Send`]), or the answer is the call's
+    /// outcome.
     Prepared {
         call: CallId,
         decisions: ext::host::Decided,
+        answered: Option<(Name, Replied)>,
     },
     /// Child session `child` settled with `outcome`.
     ChildSettled { child: SessionId, outcome: Outcome },
     /// A new registry generation, taken up at the next step boundary.
-    Registry(Arc<dyn Registry>),
+    Registry(Arc<dyn Binding>),
     /// The environment the session's commands run in from now on, as
     /// logged (secrets redacted): logged unless it is the one last logged.
     Environment(Environment),
@@ -205,21 +214,23 @@ pub enum Effect {
         ticket: Ticket,
         side: Option<CallId>,
     },
-    /// Ask the model to reply to the transcript before `call`, as it is
-    /// now, as attempt `attempt` (from 0), streaming under it, with the
-    /// tools `choice` lets it call.
-    CallModel {
+    /// Prepare the request of model call `call`, attempt `attempt` (from
+    /// 0): the transcript before it as it is now, with the tools `choice`
+    /// lets it call, through the `step` point; what that decided comes
+    /// back as [`Event::Prepared`]. Nothing is sent yet.
+    Prepare {
         call: CallId,
         attempt: u16,
         choice: ToolChoice,
     },
-    /// Run tool call `call`: on `input`, read already as `parsed` unless
-    /// it is to be read now.
+    /// Send the request prepared for model call `call`, its decisions
+    /// logged, streaming under it.
+    Send { call: CallId },
+    /// Run tool call `call` on `input`.
     RunTool {
         call: CallId,
         tool: String,
         input: Json,
-        parsed: Option<Parsed>,
     },
     /// Hand tool call `call` the answer to what it waited on.
     Resume {
@@ -257,6 +268,24 @@ pub enum Effect {
     Kill { pgid: u32 },
     /// Whether the session has work in flight, which a restart recovers.
     MarkBusy(bool),
+}
+
+impl Effect {
+    /// Whether carrying it out starts work: what a session that is
+    /// stopping leaves in its log for the next load.
+    pub const fn starts(&self) -> bool {
+        matches!(
+            self,
+            Self::Prepare { .. }
+                | Self::Send { .. }
+                | Self::RunTool { .. }
+                | Self::Resume { .. }
+                | Self::Await { .. }
+                | Self::Recover { .. }
+                | Self::Sleep { .. }
+                | Self::StartChild { .. }
+        )
+    }
 }
 
 /// Where the session's turn stands.
@@ -305,90 +334,6 @@ pub enum Step {
     /// It waits on someone: an approval, a dialog, a client, a child.
     Waiting,
     Running,
-}
-
-/// One registry generation, as the driver binds it to a session: the
-/// extensions' callables, decision points and agent. Points answer from
-/// what they are given and the session's committed state; each method is
-/// sync and must not block (a slow answer is [`Answer::Later`]).
-pub trait Registry: Send + Sync {
-    /// A new agent, of the kind the session runs.
-    fn agent(&self) -> Box<dyn Agent>;
-
-    /// What the agent asks at its decisions: the handlers at the loop
-    /// points. Pure, as the agent is: a load asks them again.
-    fn loop_points(&self) -> &dyn LoopPoints {
-        &ext::Defaults
-    }
-
-    /// The extensions it runs, in install order, as a log records them.
-    fn installed(&self) -> Vec<Installed>;
-
-    fn callable(&self, name: &str) -> Option<Callable>;
-
-    /// The model a call goes to now, as `host:model`.
-    fn model(&self) -> String {
-        "none".to_owned()
-    }
-
-    /// What the model is told of where the session runs, logged once
-    /// before its first call.
-    fn context(&self) -> Option<String> {
-        None
-    }
-
-    /// Call `tool`'s input as its tool reads it, once, and the card clients
-    /// show the call with.
-    fn read(&self, _tool: &str, _input: &Json) -> (Option<Parsed>, Option<Card>) {
-        (None, None)
-    }
-
-    /// The `input` point: the text as the chain leaves it, or why it is
-    /// refused.
-    fn input(&self, text: String) -> Result<Chained<String>, String> {
-        Ok(Chained::new(text))
-    }
-
-    /// The `pre_tool`, `permission` and `approve` points, merged.
-    fn gate(&self, _call: CallId, _tool: &str, input: &Json) -> Answer<Gated> {
-        Answer::Now(Gated::run(input.clone()))
-    }
-
-    /// The `request_error` point: how to recover model call `call` from
-    /// the failure of its attempt `attempt` (from 0, counted in the log, so
-    /// a restart does not start again), and who says; now or later. With
-    /// no answer the call fails.
-    fn request_error(
-        &self,
-        _call: CallId,
-        _attempt: u16,
-        _error: &llm::Error,
-    ) -> Answer<Option<(Name, Recover)>> {
-        Answer::Now(None)
-    }
-
-    /// The `post_tool` point: the outcome as the chain leaves it.
-    fn post_tool(
-        &self,
-        _call: CallId,
-        _tool: &str,
-        _input: &Json,
-        outcome: Outcome,
-    ) -> Chained<Outcome> {
-        Chained::new(outcome)
-    }
-
-    /// The `on_stop` point: text for the agent to go on with once it
-    /// stopped.
-    fn on_stop(&self) -> Option<(Name, String)> {
-        None
-    }
-}
-
-impl fmt::Debug for dyn Registry {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.write_str("Registry")
-    }
 }
 
 /// The session that owns a child session.

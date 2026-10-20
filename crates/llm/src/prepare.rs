@@ -19,7 +19,7 @@
 
 use std::borrow::Cow;
 
-use crate::conversation::Step;
+use crate::conversation::{Settled, Step};
 use crate::error::Error;
 use crate::protocol::Target;
 use crate::spec::{
@@ -56,49 +56,52 @@ pub(crate) struct Prepare {
 
 impl Prepare {
     /// Passes `message` on to `fold` as `target` takes it, with what it
-    /// releases.
+    /// releases; what the fold settles goes to `out`.
     pub(crate) fn push(
         &mut self,
         target: &Target<'_>,
         message: &Message,
         fold: &mut dyn Step,
+        out: &mut Settled,
     ) -> Result<(), Error> {
         let Some(message) = self.fit(message, target) else {
             return Ok(());
         };
+        let mut fold = Into { fold, out };
         match &*message {
-            Message::Tool(_) => self.results(message, fold),
+            Message::Tool(_) => self.results(message, &mut fold),
             Message::System(_) if !self.pending.is_empty() => {
                 self.held.push(message.into_owned());
                 Ok(())
             }
             Message::System(_) | Message::User(_) | Message::Assistant(_) => {
-                self.answer(fold)?;
-                self.release(fold)?;
+                self.answer(&mut fold)?;
+                self.release(&mut fold)?;
                 if let Message::Assistant(assistant) = &*message {
                     let calls = assistant.tool_calls();
                     let calls = calls.map(|call| (call.id.clone(), call.name.clone()));
                     self.pending.extend(calls);
                 }
-                self.send(&message, fold)
+                self.send(&message, &mut fold)
             }
         }
     }
 
     /// The conversation ends here: the calls still waiting are answered,
     /// and what waited goes on.
-    pub(crate) fn finish(&mut self, fold: &mut dyn Step) -> Result<(), Error> {
-        self.answer(fold)?;
-        self.release(fold)
+    pub(crate) fn finish(&mut self, fold: &mut dyn Step, out: &mut Settled) -> Result<(), Error> {
+        let mut fold = Into { fold, out };
+        self.answer(&mut fold)?;
+        self.release(&mut fold)
     }
 
-    fn send(&mut self, message: &Message, fold: &mut dyn Step) -> Result<(), Error> {
+    fn send(&mut self, message: &Message, fold: &mut Into<'_>) -> Result<(), Error> {
         self.sent += 1;
-        fold.push(self.sent - 1, message)
+        fold.fold.push(self.sent - 1, message, fold.out)
     }
 
     /// The system messages held, once no call waits.
-    fn release(&mut self, fold: &mut dyn Step) -> Result<(), Error> {
+    fn release(&mut self, fold: &mut Into<'_>) -> Result<(), Error> {
         for message in std::mem::take(&mut self.held) {
             self.send(&message, fold)?;
         }
@@ -107,7 +110,7 @@ impl Prepare {
 
     /// A tool message: the results that waiting calls asked for. It waits
     /// itself while calls still do.
-    fn results(&mut self, mut message: Cow<'_, Message>, fold: &mut dyn Step) -> Result<(), Error> {
+    fn results(&mut self, mut message: Cow<'_, Message>, fold: &mut Into<'_>) -> Result<(), Error> {
         let Message::Tool(tool) = &*message else {
             return Ok(());
         };
@@ -145,7 +148,7 @@ impl Prepare {
 
     /// Every call still waiting gets an error result before the
     /// conversation moves on, joining the results it began.
-    fn answer(&mut self, fold: &mut dyn Step) -> Result<(), Error> {
+    fn answer(&mut self, fold: &mut Into<'_>) -> Result<(), Error> {
         if self.pending.is_empty() {
             return Ok(());
         }
@@ -217,6 +220,12 @@ impl Prepare {
     }
 }
 
+/// The fold a pass sends into, and where that fold settles.
+struct Into<'a> {
+    fold: &'a mut dyn Step,
+    out: &'a mut Settled,
+}
+
 #[derive(Clone, Default)]
 struct Ids {
     /// Sorted by the id renamed, as `taken` is sorted: sets this small
@@ -278,19 +287,18 @@ pub(crate) fn prepare(request: &crate::spec::Request, target: &Target<'_>) -> cr
     struct Sent(Vec<Message>);
 
     impl Step for Sent {
-        fn push(&mut self, _: usize, message: &Message) -> Result<(), Error> {
+        fn push(&mut self, _: usize, message: &Message, _: &mut Settled) -> Result<(), Error> {
             self.0.push(message.clone());
             Ok(())
         }
-
-        fn settle(&mut self, _: &mut crate::conversation::Settled) {}
     }
 
     let (mut pass, mut sent) = (Prepare::default(), Sent(Vec::new()));
+    let mut out = Settled::default();
     for message in request.messages.iter() {
-        let _ = pass.push(target, message, &mut sent);
+        let _ = pass.push(target, message, &mut sent, &mut out);
     }
-    let _ = pass.finish(&mut sent);
+    let _ = pass.finish(&mut sent, &mut out);
     crate::spec::Request {
         messages: sent.0.into(),
         ..request.clone()
