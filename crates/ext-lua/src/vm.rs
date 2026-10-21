@@ -218,7 +218,7 @@ impl Contributions {
     }
 }
 
-fn sandbox(limits: Limits) -> mlua::Result<(Lua, Callbacks)> {
+fn sandbox(limits: Limits, fold_only: bool) -> mlua::Result<(Lua, Callbacks, Table)> {
     let lua = Lua::new_with(
         StdLib::TABLE | StdLib::STRING | StdLib::MATH,
         mlua::LuaOptions::default(),
@@ -253,7 +253,18 @@ fn sandbox(limits: Limits) -> mlua::Result<(Lua, Callbacks)> {
         let library: Table = lua.globals().get(name)?;
         lua.globals().set(name, readonly(&lua, library)?)?;
     }
-    Ok((lua, callbacks))
+    if fold_only {
+        lua.globals()
+            .get::<Table>("math")?
+            .get::<Function>("randomseed")?
+            .call::<()>(0)?;
+    }
+    let globals = lua.create_table()?;
+    for pair in lua.globals().pairs::<Value, Value>() {
+        let (key, value) = pair?;
+        globals.raw_set(key, value)?;
+    }
+    Ok((lua, callbacks, globals))
 }
 
 fn readonly(lua: &Lua, table: Table) -> mlua::Result<Table> {
@@ -281,7 +292,7 @@ fn text_field(spec: &Table, name: &str, limit: usize) -> mlua::Result<String> {
     Ok(value.to_str()?.to_owned())
 }
 
-fn register(lua: &Lua) -> mlua::Result<Arc<Mutex<Contributions>>> {
+fn register(lua: &Lua, environment: &Table) -> mlua::Result<Arc<Mutex<Contributions>>> {
     let made = Arc::new(Mutex::new(Contributions::default()));
     let api = lua.create_table()?;
     let collect = Arc::downgrade(&made);
@@ -367,12 +378,13 @@ fn register(lua: &Lua) -> mlua::Result<Arc<Mutex<Contributions>>> {
                 .ok_or_else(|| mlua::Error::runtime("registration has ended"))?;
             let mut made = locked(&collect);
             made.check()?;
+            let _: Function = spec.raw_get("apply")?;
             made.folds.push(spec);
             Ok(())
         })?,
     )?;
     api.set("null", lua.null())?;
-    lua.globals().set("a", readonly(lua, api)?)?;
+    environment.set("a", readonly(lua, api)?)?;
     Ok(made)
 }
 
@@ -408,7 +420,8 @@ impl Mod {
 
     /// Compiles one generation; registration is transactional.
     /// Tools, hooks and agents share mutable Lua globals across all sessions of
-    /// this generation. Durable per-session state belongs in folds, whose VM is separate.
+    /// this generation. Folds use a separate VM and fresh environments on every
+    /// application: only their explicit JSON state survives, including during replay.
     pub fn load(
         name: &str,
         source: &str,
@@ -440,8 +453,8 @@ impl Mod {
         budget: &Arc<Budget>,
     ) -> mlua::Result<Self> {
         budget.check_time()?;
-        let (lua, callbacks) = sandbox(limits)?;
-        let made = register(&lua)?;
+        let (lua, callbacks, globals) = sandbox(limits, fold_only)?;
+        let made = register(&lua, &lua.globals())?;
         let hook = Arc::clone(budget);
         let thread = lua.create_thread(
             lua.load(source)
@@ -526,11 +539,14 @@ impl Mod {
             // share a lock with callbacks that read that session's state.
             result.folds = Self::compile(&name, source, tools, limits, true, budget)?.folds;
         } else if fold_only {
-            for spec in made.folds {
+            let source: Arc<str> = source.into();
+            for (slot, spec) in made.folds.into_iter().enumerate() {
                 result.folds.push(Arc::new(LuaFold {
                     name: Name::from(text_field(&spec, "name", 128)?),
                     initial: encode(&spec.raw_get("initial")?)?,
-                    run: spec.raw_get("apply")?,
+                    source: Arc::clone(&source),
+                    globals: globals.clone(),
+                    slot,
                     lua: lua.clone(),
                     limits,
                 }));
@@ -677,7 +693,9 @@ struct LuaFold {
     name: Name,
     initial: Json,
     lua: Lua,
-    run: Function,
+    source: Arc<str>,
+    globals: Table,
+    slot: usize,
     limits: Limits,
 }
 impl DynFold for LuaFold {
@@ -692,15 +710,55 @@ impl DynFold for LuaFold {
         Ok(image.clone())
     }
     fn apply(&self, state: &Json, change: &Json) -> Result<Json, String> {
-        (|| {
-            sync(
-                &self.lua,
-                &self.run,
-                (decode(&self.lua, state)?, decode(&self.lua, change)?),
-                self.limits,
-            )
-        })()
-        .map_err(|e| e.to_string())
+        self.lua
+            .scope(|_| {
+                let budget = Budget::new(self.limits);
+                budget.dispatch(&self.lua, || {
+                    let environment = self.lua.create_table()?;
+                    for pair in self.globals.pairs::<Value, Value>() {
+                        let (key, value) = pair?;
+                        environment.raw_set(key, value)?;
+                    }
+                    environment.raw_set("_G", environment.clone())?;
+                    // The private reducer VM's native PRNG must not carry state between applications.
+                    self.globals
+                        .get::<Table>("math")?
+                        .get::<Function>("randomseed")?
+                        .call::<()>(0)?;
+                    let made = register(&self.lua, &environment)?;
+                    let prepare = self
+                        .lua
+                        .load(&*self.source)
+                        .set_mode(ChunkMode::Text)
+                        .set_environment(environment)
+                        .into_function()?;
+                    let thread = self.lua.create_thread(prepare)?;
+                    let hook = Arc::clone(&budget);
+                    thread.set_hook(
+                        HookTriggers::new().every_nth_instruction(1000),
+                        move |_, _| hook.check(),
+                    )?;
+                    budget.check_time()?;
+                    thread.resume::<()>(())?;
+                    let contributions = std::mem::take(&mut *locked(&made));
+                    drop(made);
+                    let spec = contributions
+                        .folds
+                        .into_iter()
+                        .nth(self.slot)
+                        .ok_or_else(|| mlua::Error::runtime("fold registration changed"))?;
+                    if text_field(&spec, "name", 128)? != *self.name {
+                        return Err(mlua::Error::runtime("fold registration changed"));
+                    }
+                    sync(
+                        &self.lua,
+                        &spec.raw_get("apply")?,
+                        (decode(&self.lua, state)?, decode(&self.lua, change)?),
+                        self.limits,
+                    )
+                })
+            })
+            .map_err(|e| e.to_string())
     }
 }
 
@@ -1110,7 +1168,7 @@ mod tests {
                 .value,
             "fast"
         );
-        let (lua, _) = sandbox(limits).unwrap();
+        let (lua, _, _) = sandbox(limits, false).unwrap();
         let inner = lua
             .load("return function() local n=0; for i=1,1000 do n=n+i end; return n end")
             .eval::<Function>()
@@ -1310,6 +1368,59 @@ mod tests {
                 .parse::<u64>()
                 .unwrap(),
             2
+        );
+    }
+
+    #[test]
+    fn another_sessions_reducer_calls_cannot_change_replay() {
+        let source = "local transient=0; a.fold{name='count',initial=0,apply=function(state,change) transient=transient+1; return state+change+transient end}; a.tool{name='test',description='test',input={type='object'},run=function(_,cx) cx.update('count',1); return cx.state('count') end}";
+        let module = Mod::load("test", source, &[], Limits::default()).unwrap();
+        let registry = Registry::default()
+            .with_dyn(ext::Tier::User, &module)
+            .unwrap();
+        let first = Rig::new("lua-reducer-first", registry.clone());
+        let second = Rig::new("lua-reducer-second", registry);
+        assert_eq!(first.done("test", &json!({})), 2);
+        assert_eq!(second.done("test", &json!({})), 2);
+        assert_eq!(first.done("test", &json!({})), 4);
+
+        let fresh = Mod::load("test", source, &[], Limits::default()).unwrap();
+        let mut replay = Registry::default()
+            .with_dyn(ext::Tier::User, &fresh)
+            .unwrap()
+            .states();
+        replay.replay(first.log.lock().unwrap().iter());
+        assert_eq!(
+            replay
+                .erased("test", "count")
+                .unwrap()
+                .parse::<u64>()
+                .unwrap(),
+            4,
+            "replay must reproduce the first session without the second session's log"
+        );
+    }
+
+    #[test]
+    fn reducers_reset_globals_and_native_random_state() {
+        let source = "a.fold{name='count',initial={count=0},apply=function(state,change) _G.counter=(_G.counter or 0)+1; return {count=state.count+change+_G.counter,random=math.random()} end}; a.tool{name='test',description='test',input={type='object'},run=function(_,cx) cx.update('count',1); return cx.state('count') end}";
+        let registry = registry(source, &[]);
+        let first = Rig::new("lua-fresh-globals", registry.clone());
+        let second = Rig::new("lua-other-globals", registry);
+        let initial = first.done("test", &json!({}));
+        assert_eq!(second.done("test", &json!({})), initial);
+        let live = first.done("test", &json!({}));
+        assert_eq!(live["count"], 4);
+        assert_eq!(live["random"], initial["random"]);
+        let mut replay = tests::registry(source, &[]).states();
+        replay.replay(first.log.lock().unwrap().iter());
+        assert_eq!(
+            replay
+                .erased("test", "count")
+                .unwrap()
+                .parse::<serde_json::Value>()
+                .unwrap(),
+            live
         );
     }
 
