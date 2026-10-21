@@ -521,3 +521,327 @@ fn a_kind_cannot_drop_a_service_its_inherited_extensions_require() {
     let result = Registry::default().with(&Provider).unwrap().with(&Consumer);
     assert!(matches!(result, Err(Refused(why)) if why.contains("needs")));
 }
+
+#[derive(Clone)]
+struct ImageExtension {
+    name: &'static str,
+    value: u32,
+}
+impl DynExtension for ImageExtension {
+    fn name(&self) -> Name {
+        Name::from(self.name)
+    }
+    fn version(&self) -> u32 {
+        self.value
+    }
+    fn image(&self) -> Option<Json> {
+        Some(Json::encode(&self.value).unwrap())
+    }
+    fn contribute(&self, _: &mut Registrar) {}
+}
+
+#[derive(Default)]
+struct TestLayer {
+    name: &'static str,
+    value: std::sync::atomic::AtomicU32,
+    scans: std::sync::atomic::AtomicUsize,
+    fail: std::sync::atomic::AtomicBool,
+    changed: Mutex<Option<Arc<Changed>>>,
+    during: Mutex<Option<Box<dyn FnOnce() + Send>>>,
+}
+impl GenerationLayer for TestLayer {
+    fn name(&self) -> &'static str {
+        self.name
+    }
+    fn watch(&self, _: &Path, _: Spawn, changed: Arc<Changed>) -> Result<Box<Refresh>, Refused> {
+        *self.changed.lock().unwrap() = Some(changed);
+        Ok(Box::new(|| Ok(())))
+    }
+    fn prepare(
+        &self,
+        _: &Path,
+        _: &Registry,
+        _: Option<&PreparedLayer>,
+        _: bool,
+    ) -> Result<PreparedLayer, Refused> {
+        use std::sync::atomic::Ordering::SeqCst;
+        self.scans.fetch_add(1, SeqCst);
+        let during = self.during.lock().unwrap().take();
+        if let Some(during) = during {
+            during();
+        }
+        if self.fail.load(SeqCst) {
+            return Err(Refused("invalid source".into()));
+        }
+        Ok(PreparedLayer {
+            inputs: Arc::new(()),
+            registrations: vec![(
+                Tier::User,
+                Arc::new(ImageExtension {
+                    name: self.name,
+                    value: self.value.load(SeqCst),
+                }),
+            )],
+        })
+    }
+    fn restore(&self, own_image: &[Installed]) -> Result<Registrations, Refused> {
+        let [image] = own_image else {
+            panic!("layer received another layer's image")
+        };
+        assert_eq!(image.name, self.name);
+        Ok(vec![(
+            Tier::User,
+            Arc::new(ImageExtension {
+                name: self.name,
+                value: image.image.as_ref().unwrap().parse().unwrap(),
+            }),
+        )])
+    }
+}
+
+#[test]
+fn generation_number_and_registry_are_published_together() {
+    let current = Arc::new(Current::new(
+        Registry::default()
+            .with_dyn(
+                Tier::User,
+                &ImageExtension {
+                    name: "revision",
+                    value: 0,
+                },
+            )
+            .unwrap(),
+    ));
+    let first = current.snapshot();
+    std::thread::scope(|scope| {
+        scope.spawn(|| {
+            for value in 1..100 {
+                current.replace(
+                    Registry::default()
+                        .with_dyn(
+                            Tier::User,
+                            &ImageExtension {
+                                name: "revision",
+                                value,
+                            },
+                        )
+                        .unwrap(),
+                );
+            }
+        });
+        for _ in 0..100 {
+            let snapshot = current.snapshot();
+            assert_eq!(
+                u64::from(snapshot.registry.extensions().next().unwrap().1),
+                snapshot.id
+            );
+        }
+    });
+    assert_eq!(first.id, 0);
+    assert_eq!(first.registry.extensions().next().unwrap().1, 0);
+    assert_eq!(current.snapshot().id, 99);
+}
+
+#[test]
+fn a_layer_never_decodes_another_layers_image() {
+    let one = Arc::new(TestLayer {
+        name: "one",
+        ..TestLayer::default()
+    });
+    let two = Arc::new(TestLayer {
+        name: "two",
+        ..TestLayer::default()
+    });
+    let base = Registry::default()
+        .with_dyn(
+            Tier::User,
+            &ImageExtension {
+                name: "static",
+                value: 9,
+            },
+        )
+        .unwrap();
+    let coordinator = Coordinator::new(base, vec![one.clone(), two.clone()]);
+    let workspace = coordinator
+        .open(Path::new("/layers"), Arc::new(|_| {}), Arc::new(|_| {}))
+        .unwrap();
+    let installed = workspace.snapshot().registry.installed();
+    one.value.store(5, std::sync::atomic::Ordering::SeqCst);
+    two.fail.store(true, std::sync::atomic::Ordering::SeqCst);
+    let restored = workspace.restore(&installed).unwrap();
+    assert_eq!(restored.installed(), installed);
+    assert_eq!(one.scans.load(std::sync::atomic::Ordering::SeqCst), 1);
+    assert_eq!(two.scans.load(std::sync::atomic::Ordering::SeqCst), 1);
+}
+
+#[test]
+fn event_bursts_schedule_one_pending_rebuild() {
+    use std::sync::atomic::Ordering::SeqCst;
+    let layer = Arc::new(TestLayer {
+        name: "events",
+        ..TestLayer::default()
+    });
+    let coordinator = Coordinator::new(Registry::default(), vec![layer.clone()]);
+    let queue = Arc::new(Mutex::new(Vec::new()));
+    let queued = queue.clone();
+    let workspace = coordinator
+        .open(
+            Path::new("/events"),
+            Arc::new(|_| {}),
+            Arc::new(move |work| queued.lock().unwrap().push(work)),
+        )
+        .unwrap();
+    let changed = layer.changed.lock().unwrap().clone().unwrap();
+    for _ in 0..1000 {
+        changed();
+    }
+    assert_eq!(queue.lock().unwrap().len(), 1);
+    assert_eq!(layer.scans.load(SeqCst), 1);
+    queue.lock().unwrap().pop().unwrap()();
+    assert_eq!(layer.scans.load(SeqCst), 2);
+    let during = changed.clone();
+    *layer.during.lock().unwrap() = Some(Box::new(move || {
+        for _ in 0..1000 {
+            during();
+        }
+    }));
+    layer.value.store(1, SeqCst);
+    changed();
+    let work = queue.lock().unwrap().pop().unwrap();
+    work();
+    assert_eq!(layer.scans.load(SeqCst), 4);
+    assert!(queue.lock().unwrap().is_empty());
+    assert_eq!(workspace.snapshot().id, 2);
+    let old = workspace.snapshot();
+    layer.fail.store(true, SeqCst);
+    changed();
+    queue.lock().unwrap().pop().unwrap()();
+    let retained = workspace.snapshot();
+    assert_eq!(retained.id, old.id);
+    assert!(Arc::ptr_eq(&retained.registry, &old.registry));
+    let shared = coordinator
+        .open(
+            Path::new("/events"),
+            Arc::new(|_| {}),
+            Arc::new(|_| panic!("duplicate subscription")),
+        )
+        .unwrap();
+    assert!(Arc::ptr_eq(&shared, &workspace));
+    drop(shared);
+    let weak = Arc::downgrade(&retained.registry);
+    drop(old);
+    drop(retained);
+    drop(workspace);
+    assert!(weak.upgrade().is_none());
+}
+
+#[test]
+fn children_and_grandchildren_never_regain_excluded_registrations() {
+    extension!(Kept, "kept", 1, |_r| {});
+    extension!(Excluded, "excluded", 1, |_r| {});
+    struct Narrow;
+    impl crate::AgentKind for Narrow {
+        const NAME: &'static str = "child";
+        const INHERIT: crate::Inheritance = crate::Inheritance::Except(&[Excluded::NAME]);
+        fn make() -> Box<dyn Agent> {
+            Box::new(Loop::default())
+        }
+    }
+    struct Wide;
+    impl crate::AgentKind for Wide {
+        const NAME: &'static str = "child";
+        fn make() -> Box<dyn Agent> {
+            Box::new(Loop::default())
+        }
+    }
+    struct Kinds(bool);
+    impl Extension for Kinds {
+        const NAME: &'static str = "kinds";
+        const VERSION: u32 = 1;
+        fn contribute(&self, r: &mut Registrar) {
+            if self.0 {
+                r.agent_kind::<Wide>();
+            } else {
+                r.agent_kind::<Narrow>();
+            }
+        }
+    }
+    let root = Registry::default()
+        .with(&Kept)
+        .unwrap()
+        .with(&Excluded)
+        .unwrap()
+        .with(&Kinds(false))
+        .unwrap();
+    let child = root.select(root.kind("child").unwrap().0, None).unwrap();
+    let frozen: Vec<_> = child
+        .extensions()
+        .map(|(name, _)| name.to_owned())
+        .collect();
+    let newer = root.clone().with(&Kinds(true)).unwrap();
+    let restored_child = newer
+        .select(crate::Inheritance::All, Some(&frozen))
+        .unwrap();
+    let grandchild = restored_child
+        .select(restored_child.kind("child").unwrap().0, None)
+        .unwrap();
+    let grandchild_names: Vec<_> = grandchild
+        .extensions()
+        .map(|(name, _)| name.to_owned())
+        .collect();
+    let restored_grandchild = newer
+        .select(crate::Inheritance::All, Some(&grandchild_names))
+        .unwrap();
+    assert_eq!(
+        restored_child.extensions().collect::<Vec<_>>(),
+        [(Kept::NAME, 1), (Kinds::NAME, 1)]
+    );
+    assert_eq!(
+        restored_grandchild.extensions().collect::<Vec<_>>(),
+        [(Kept::NAME, 1), (Kinds::NAME, 1)]
+    );
+    assert_eq!(restored_grandchild.installed(), root.installed());
+}
+
+#[test]
+fn opening_a_workspace_never_holds_the_global_reservation_map() {
+    use std::sync::mpsc::channel;
+    use std::time::Duration;
+    let layer = Arc::new(TestLayer {
+        name: "opening",
+        ..TestLayer::default()
+    });
+    let (entered, entering) = channel();
+    let (release, released) = channel();
+    *layer.during.lock().unwrap() = Some(Box::new(move || {
+        entered.send(()).unwrap();
+        released.recv().unwrap();
+    }));
+    let coordinator = Coordinator::new(Registry::default(), vec![layer.clone()]);
+    std::thread::scope(|scope| {
+        let first = scope.spawn(|| {
+            coordinator
+                .open(Path::new("/first"), Arc::new(|_| {}), Arc::new(|_| {}))
+                .unwrap()
+        });
+        entering.recv_timeout(Duration::from_secs(5)).unwrap();
+        let (sent, completed) = channel();
+        let coordinator = &coordinator;
+        scope.spawn(move || {
+            let other = coordinator.open(Path::new("/other"), Arc::new(|_| {}), Arc::new(|_| {}));
+            sent.send(other).unwrap();
+        });
+        let other = completed.recv_timeout(Duration::from_secs(5));
+        release.send(()).unwrap();
+        let other = other
+            .expect("unrelated opening waited for the first workspace's I/O")
+            .unwrap();
+        let first = first.join().unwrap();
+        let shared = coordinator
+            .open(Path::new("/first"), Arc::new(|_| {}), Arc::new(|_| {}))
+            .unwrap();
+        assert!(Arc::ptr_eq(&first, &shared));
+        assert!(!Arc::ptr_eq(&first, &other));
+        assert_eq!(layer.scans.load(std::sync::atomic::Ordering::SeqCst), 2);
+    });
+}

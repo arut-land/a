@@ -2,57 +2,24 @@ use std::collections::BTreeMap;
 use std::fs;
 use std::io::Read;
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use std::sync::{Arc, Mutex, PoisonError, Weak};
+use std::sync::{Arc, Weak};
 use std::time::{Duration, Instant};
 
-use ext::host::{Changed, Generations, Prepare, Registry, Sources, Spawn, Updates};
+use ext::host::{Changed, GenerationLayer, PreparedLayer, Rebuild, Registrations, Registry, Spawn};
 use ext::{Extension, Refused, Registrar, Tier};
 
 use crate::{Limits, Mod};
 
-type Base = dyn Fn() -> Result<Registry, Refused> + Send + Sync;
 type Files = BTreeMap<String, String>;
 
-/// Sessions own workspace subscriptions; the index owns only weak references.
-pub struct Loader(Arc<Source>);
-struct Source {
-    compiler: Arc<Compiler>,
-    workspaces: Mutex<BTreeMap<PathBuf, Weak<Workspace>>>,
-}
-struct Compiler {
+pub struct Loader {
     home: PathBuf,
     config: sys::config::Exts,
-    base: Arc<Base>,
     limits: Limits,
-}
-struct Workspace {
-    compiler: Arc<Compiler>,
-    path: PathBuf,
-    number: AtomicU64,
-    current: Mutex<Arc<Registry>>,
-    files: Mutex<Files>,
-    dirty: AtomicBool,
-    busy: AtomicBool,
-    watcher: Mutex<Option<rt::Watcher>>,
-    preparing: Mutex<()>,
-    opened: Mutex<()>,
-    updates: Updates,
-}
-fn lock<T>(value: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
-    value.lock().unwrap_or_else(PoisonError::into_inner)
 }
 
 impl Loader {
-    pub fn source(&self) -> Arc<dyn Sources> {
-        Arc::clone(&self.0) as _
-    }
-
-    pub fn new(
-        home: &Path,
-        config: sys::config::Exts,
-        base: impl Fn() -> Result<Registry, Refused> + Send + Sync + 'static,
-    ) -> Result<Self, Refused> {
+    pub fn new(home: &Path, config: sys::config::Exts) -> Result<Self, Refused> {
         let home = home.canonicalize().map_err(|e| Refused(e.to_string()))?;
         let table = config.table("lua");
         let read = |key, default| {
@@ -71,79 +38,65 @@ impl Loader {
                     .into(),
             ));
         }
-        Ok(Self(Arc::new(Source {
-            compiler: Arc::new(Compiler {
-                home,
-                config,
-                base: Arc::new(base),
-                limits: Limits {
-                    memory,
-                    instructions,
-                    slice: Duration::from_millis(timeout),
-                },
-            }),
-            workspaces: Mutex::default(),
-        })))
+        Ok(Self {
+            home,
+            config,
+            limits: Limits {
+                memory,
+                instructions,
+                slice: Duration::from_millis(timeout),
+            },
+        })
     }
 }
-impl Extension for Loader {
-    const NAME: &'static str = "lua";
-    const VERSION: u32 = 1;
-    fn contribute(&self, r: &mut Registrar) {
-        r.provide::<dyn Sources>(Arc::clone(&self.0) as _);
+
+impl GenerationLayer for Loader {
+    fn name(&self) -> &'static str {
+        "lua"
     }
-}
-impl Generations for Workspace {
-    fn generation(&self) -> u64 {
-        self.number.load(Ordering::Acquire)
-    }
-    fn subscribe(&self, changed: Weak<Changed>) {
-        self.updates.subscribe(changed);
-    }
-    fn registry(&self) -> Arc<Registry> {
-        Arc::clone(&lock(&self.current))
-    }
-    fn restore(
-        self: Arc<Self>,
-        installed: &[protocol::Installed],
-    ) -> Result<Arc<Registry>, Refused> {
-        let mut registry = (self.compiler.base)()?;
-        for extension in installed {
-            if let Some(image) = &extension.image {
-                registry = registry.with_dyn(Tier::User, &Mod::restore(&extension.name, image)?)?;
+    fn watch(
+        &self,
+        workspace: &Path,
+        spawn: Spawn,
+        changed: Arc<Changed>,
+    ) -> Result<Box<ext::host::Refresh>, Refused> {
+        let home = self.home.join("ext");
+        let local = workspace.join(".a/ext");
+        let mut watcher = rt::Watcher::new(spawn, [home.clone(), local.clone()], move |paths| {
+            if paths.iter().any(|path| {
+                path.starts_with(&home)
+                    || path.starts_with(&local)
+                    || home.starts_with(path)
+                    || local.starts_with(path)
+            }) {
+                changed();
             }
-        }
-        registry = registry.with(&Reload {
-            workspace: Arc::downgrade(&self),
-            compiler: Arc::clone(&self.compiler),
-            path: self.path.clone(),
-        })?;
-        if registry.installed() != installed {
-            return Err(Refused(
-                "recorded extension generation differs from this build".into(),
-            ));
-        }
-        Ok(Arc::new(registry))
+        })
+        .map_err(|e| Refused(e.to_string()))?;
+        Ok(Box::new(move || {
+            watcher.refresh().map_err(|e| Refused(e.to_string()))
+        }))
     }
-}
-impl Compiler {
-    fn scan(&self, workspace: &Path) -> Result<Files, Refused> {
+    fn prepare(
+        &self,
+        workspace: &Path,
+        base: &Registry,
+        previous: Option<&PreparedLayer>,
+        initial: bool,
+    ) -> Result<PreparedLayer, Refused> {
         let mut found = Files::new();
         files(&self.home.join("ext"), &mut found)?;
         files(&workspace.join(".a/ext"), &mut found)?;
-        if found.values().map(String::len).sum::<usize>() > 1024 * 1024 {
-            return Err(Refused("lua workspace source exceeds 1 MiB".into()));
+        found.retain(|name, _| !self.config.disable.contains(name));
+        if let Some(previous) =
+            previous.filter(|p| p.inputs.downcast_ref::<Files>() == Some(&found))
+        {
+            return Ok(previous.clone());
         }
-        Ok(found)
-    }
-    fn compile(&self, found: &Files, initial: bool) -> Result<Arc<Registry>, Refused> {
         let started = Instant::now();
-        let mut registry = (self.base)()?;
+        let mut registry = base.clone();
         let mut installed = Vec::new();
-        for (name, source) in found {
-            if self.config.disable.contains(name) {
-                continue;
-            }
+        for (name, source) in &found {
             // A workspace preparation has an aggregate bound as well as per-VM fuel.
             if started.elapsed() > Duration::from_secs(1) {
                 return Err(Refused("lua workspace preparation budget exhausted".into()));
@@ -166,172 +119,54 @@ impl Compiler {
                 }
                 Err(error) => return Err(error),
             };
-            registry = match registry.with_dyn(Tier::User, &module) {
-                Ok(registry) => {
+            match registry.clone().with_dyn(Tier::User, &module) {
+                Ok(next) => {
                     installed.push(module);
-                    registry
+                    registry = next;
                 }
                 Err(error) if initial => {
                     ext_logging::emit(ext_logging::Fact::ExtensionRejected {
                         module: ext_logging::workspace(Path::new(name)),
                     });
                     eprintln!("warning: {error}");
-                    let mut registry = (self.base)()?;
-                    for module in &installed {
-                        registry = registry.with_dyn(Tier::User, module)?;
-                    }
-                    registry
                 }
                 Err(error) => return Err(error),
-            };
+            }
         }
         if started.elapsed() > Duration::from_secs(1) {
             return Err(Refused("lua workspace preparation budget exhausted".into()));
         }
-        Ok(Arc::new(registry))
+        Ok(PreparedLayer {
+            inputs: Arc::new(found),
+            registrations: installed
+                .into_iter()
+                .map(|module| (Tier::User, Arc::new(module) as Arc<dyn ext::DynExtension>))
+                .collect(),
+        })
     }
-}
-impl Workspace {
-    fn prepare(
-        self: &Arc<Self>,
-        compiler: &Arc<Compiler>,
-        path: &Path,
-        initial: bool,
-    ) -> Result<(), Refused> {
-        let _preparing = lock(&self.preparing);
-        if let Some(watcher) = lock(&self.watcher).as_mut() {
-            watcher.refresh().map_err(|e| Refused(e.to_string()))?;
-        }
-        let result = self.prepare_inner(compiler, path, initial);
-        if result.is_err() {
-            ext_logging::emit(ext_logging::Fact::Generation {
-                workspace: ext_logging::workspace(path),
-                number: self.generation(),
-                accepted: false,
-            });
-        }
-        result
-    }
-
-    fn prepare_inner(
-        self: &Arc<Self>,
-        compiler: &Arc<Compiler>,
-        path: &Path,
-        initial: bool,
-    ) -> Result<(), Refused> {
-        let found = compiler.scan(path)?;
-        if !initial && *lock(&self.files) == found {
-            return Ok(());
-        }
-        let registry = compiler.compile(&found, initial)?;
-        let registry = Arc::try_unwrap(registry)
-            .map_err(|_| Refused("shared registry during preparation".into()))?
-            .with(&Reload {
-                workspace: Arc::downgrade(self),
-                compiler: Arc::clone(compiler),
-                path: path.to_path_buf(),
-            })?;
-        *lock(&self.files) = found;
-        *lock(&self.current) = Arc::new(registry);
-        let number = self.number.fetch_add(1, Ordering::Release) + 1;
-        ext_logging::emit(ext_logging::Fact::Generation {
-            workspace: ext_logging::workspace(path),
-            number,
-            accepted: true,
-        });
-        self.updates.notify();
-        Ok(())
-    }
-
-    fn changed(self: &Arc<Self>, compiler: Arc<Compiler>, path: PathBuf, prepare: &Prepare) {
-        self.dirty.store(true, Ordering::Release);
-        if self.busy.swap(true, Ordering::AcqRel) {
-            return;
-        }
-        let weak = Arc::downgrade(self);
-        prepare(Box::new(move || {
-            while let Some(workspace) = weak.upgrade() {
-                workspace.dirty.store(false, Ordering::Release);
-                if let Err(error) = workspace.prepare(&compiler, &path, false) {
-                    eprintln!("warning: {error}");
-                }
-                workspace.busy.store(false, Ordering::Release);
-                if !workspace.dirty.load(Ordering::Acquire)
-                    || workspace.busy.swap(true, Ordering::AcqRel)
-                {
-                    break;
-                }
-            }
-        }));
-    }
-}
-impl Sources for Source {
-    fn open(
-        &self,
-        path: &Path,
-        spawn: Spawn,
-        prepare: Prepare,
-    ) -> Result<Arc<dyn Generations>, Refused> {
-        let canonical = path.canonicalize().map_err(|e| Refused(e.to_string()))?;
-        let path = canonical.as_path();
-        // Only weak-index access is global; preparation is serialized per workspace.
-        let mut index = lock(&self.workspaces);
-        index.retain(|_, workspace| workspace.strong_count() > 0);
-        if let Some(workspace) = index.get(path).and_then(Weak::upgrade) {
-            drop(index);
-            drop(lock(&workspace.opened));
-            return Ok(workspace);
-        }
-        let workspace = Arc::new(Workspace {
-            compiler: Arc::clone(&self.compiler),
-            path: path.to_path_buf(),
-            number: AtomicU64::new(0),
-            current: Mutex::new(Arc::new((self.compiler.base)()?)),
-            files: Mutex::default(),
-            dirty: AtomicBool::new(false),
-            busy: AtomicBool::new(false),
-            watcher: Mutex::default(),
-            preparing: Mutex::default(),
-            opened: Mutex::default(),
-            updates: Updates::default(),
-        });
-        let opened = lock(&workspace.opened);
-        index.insert(path.to_path_buf(), Arc::downgrade(&workspace));
-        drop(index);
-        let weak = Arc::downgrade(&workspace);
-        let compiler = Arc::clone(&self.compiler);
-        let owned_path = path.to_path_buf();
-        let home_ext = self.compiler.home.join("ext");
-        let local_ext = path.join(".a/ext");
-        // Watching the parent also catches an ext directory created after the session opens.
-        let watcher =
-            rt::Watcher::new(spawn, [home_ext.clone(), local_ext.clone()], move |paths| {
-                if !paths.iter().any(|p| {
-                    p.starts_with(&home_ext)
-                        || p.starts_with(&local_ext)
-                        || home_ext.starts_with(p)
-                        || local_ext.starts_with(p)
-                }) {
-                    return;
-                }
-                if let Some(workspace) = weak.upgrade() {
-                    workspace.changed(Arc::clone(&compiler), owned_path.clone(), &prepare);
-                }
+    fn restore(&self, own_image: &[protocol::Installed]) -> Result<Registrations, Refused> {
+        own_image
+            .iter()
+            .map(|extension| {
+                let image = extension
+                    .image
+                    .as_ref()
+                    .ok_or_else(|| Refused("recorded lua source is absent".into()))?;
+                Ok((
+                    Tier::User,
+                    Arc::new(Mod::restore(&extension.name, image)?) as Arc<dyn ext::DynExtension>,
+                ))
             })
-            .map_err(|e| Refused(e.to_string()))?;
-        *lock(&workspace.watcher) = Some(watcher);
-        if let Err(error) = workspace.prepare(&self.compiler, path, true) {
-            eprintln!("warning: {error}");
-        }
-        drop(opened);
-        Ok(workspace)
+            .collect()
+    }
+    fn controls(&self, rebuild: Weak<Rebuild>) -> Registrations {
+        vec![(Tier::User, Arc::new(Reload { rebuild }))]
     }
 }
+
 #[derive(Clone)]
 struct Reload {
-    workspace: Weak<Workspace>,
-    compiler: Arc<Compiler>,
-    path: PathBuf,
+    rebuild: Weak<Rebuild>,
 }
 impl ext::Tool for Reload {
     type In = ext::Args;
@@ -340,12 +175,10 @@ impl ext::Tool for Reload {
     const DESCRIPTION: &'static str = "Reload this workspace's Lua mods.";
     const AUDIENCE: protocol::Audience = protocol::Audience::User;
     async fn call(&self, _: &ext::Args, cx: &ext::Cx) -> Result<bool, String> {
-        let workspace = self.workspace.upgrade().ok_or("workspace closed")?;
-        let compiler = Arc::clone(&self.compiler);
-        let path = self.path.clone();
+        let rebuild = self.rebuild.upgrade().ok_or("workspace closed")?;
         let rt = cx.service::<dyn rt::Runtime>().ok_or("no runtime")?;
         rt::unblock_with(rt, rt::BlockingClass::Cpu, rt::STORAGE_BYTES, move || {
-            workspace.prepare(&compiler, &path, false)
+            rebuild()
         })
         .await
         .map(|()| true)
@@ -407,10 +240,47 @@ fn files(dir: &Path, found: &mut Files) -> Result<(), Refused> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use ext::host::{Coordinator, Sources};
 
     fn spawn() -> Spawn {
         let rt: rt::Rt = Arc::new(rt::Threads::default());
         Arc::new(move |task| rt.spawn(task))
+    }
+
+    #[test]
+    fn unchanged_rejected_sources_do_not_poison_other_layers_rebuilds() {
+        let rig = ext::testing::Rig::new("lua-preparation-cache", Registry::default());
+        fs::create_dir_all(rig.dir.join("ext")).unwrap();
+        fs::write(
+            rig.dir.join("ext/good.lua"),
+            "a.text{name='good',text='cached'}",
+        )
+        .unwrap();
+        let bad = rig.dir.join("ext/bad.lua");
+        fs::write(&bad, "error('invalid source')").unwrap();
+        let loader = Loader::new(&rig.dir, sys::config::Exts::default()).unwrap();
+        let first = loader
+            .prepare(&rig.workspace(), &Registry::default(), None, true)
+            .unwrap();
+        assert_eq!(first.registrations.len(), 1);
+        let next = loader
+            .prepare(&rig.workspace(), &Registry::default(), Some(&first), false)
+            .unwrap();
+        assert!(Arc::ptr_eq(
+            &first.registrations[0].1,
+            &next.registrations[0].1
+        ));
+        fs::write(&bad, "error('different invalid source')").unwrap();
+        assert!(
+            loader
+                .prepare(&rig.workspace(), &Registry::default(), Some(&first), false)
+                .is_err()
+        );
+        fs::remove_file(bad).unwrap();
+        let recovered = loader
+            .prepare(&rig.workspace(), &Registry::default(), Some(&first), false)
+            .unwrap();
+        assert_eq!(recovered.registrations.len(), 1);
     }
 
     #[test]
@@ -423,12 +293,11 @@ mod tests {
             "a.fold{name='count',initial=0,apply=function(s,c) return s+c end}",
         )
         .unwrap();
-        let loader = Loader::new(&root, sys::config::Exts::default(), || {
-            Ok(Registry::default())
-        })
-        .unwrap();
-        let source = loader.0.open(&root, spawn(), Arc::new(|_| {})).unwrap();
-        let installed = source.registry().installed();
+        let loader = Loader::new(&root, sys::config::Exts::default()).unwrap();
+        let source = Coordinator::new(Registry::default(), vec![Arc::new(loader)])
+            .open(&root, spawn(), Arc::new(|_| {}))
+            .unwrap();
+        let installed = source.snapshot().registry.installed();
         fs::remove_file(file).unwrap();
         let restored = source.restore(&installed).unwrap();
         let mut states = restored.states();
@@ -444,12 +313,11 @@ mod tests {
     fn workspace_subscriptions_release_their_registries_after_the_last_owner() {
         let root = std::env::temp_dir().join(format!("a-lua-lifetime-{}", std::process::id()));
         fs::create_dir_all(&root).unwrap();
-        let loader = Loader::new(&root, sys::config::Exts::default(), || {
-            Ok(Registry::default())
-        })
-        .unwrap();
-        let workspace = loader.0.open(&root, spawn(), Arc::new(|_| {})).unwrap();
-        let registry = workspace.registry();
+        let loader = Loader::new(&root, sys::config::Exts::default()).unwrap();
+        let workspace = Coordinator::new(Registry::default(), vec![Arc::new(loader)])
+            .open(&root, spawn(), Arc::new(|_| {}))
+            .unwrap();
+        let registry = workspace.snapshot().registry;
         let weak = Arc::downgrade(&registry);
         drop(registry);
         drop(workspace);
@@ -458,70 +326,12 @@ mod tests {
     }
 
     #[test]
-    fn failed_preparation_keeps_the_published_generation_and_reads_do_no_work() {
-        let root = std::env::temp_dir().join(format!("a-lua-prepare-{}", std::process::id()));
-        fs::create_dir_all(root.join("ext")).unwrap();
-        let file = root.join("ext/test.lua");
-        fs::write(&file, "a.text{name='test',text='old'}").unwrap();
-        let loader = Loader::new(&root, sys::config::Exts::default(), || {
-            Ok(Registry::default())
-        })
-        .unwrap();
-        // Queuing work makes publication order explicit, independently of OS delivery.
-        let workspace = Arc::new(Workspace {
-            compiler: Arc::clone(&loader.0.compiler),
-            path: root.clone(),
-            number: AtomicU64::new(0),
-            current: Mutex::new(Arc::new(Registry::default())),
-            files: Mutex::default(),
-            dirty: AtomicBool::new(false),
-            busy: AtomicBool::new(false),
-            watcher: Mutex::default(),
-            preparing: Mutex::default(),
-            opened: Mutex::default(),
-            updates: Updates::default(),
-        });
-        workspace.prepare(&loader.0.compiler, &root, true).unwrap();
-        let old = workspace.registry();
-        let before = workspace.generation();
-        fs::write(&file, "error('invalid edit')").unwrap();
-        let queue = Arc::new(Mutex::new(Vec::new()));
-        let output = Arc::clone(&queue);
-        let prepare: Prepare = Arc::new(move |work| lock(&output).push(work));
-        workspace.changed(Arc::clone(&loader.0.compiler), root.clone(), &prepare);
-        for _ in 0..1000 {
-            assert_eq!(workspace.generation(), before);
-        }
-        assert_eq!(lock(&queue).len(), 1, "reads cannot schedule preparation");
-        lock(&queue).pop().unwrap()();
-        assert_eq!(workspace.generation(), before);
-        assert!(Arc::ptr_eq(&workspace.registry(), &old));
-        fs::write(&file, "a.text{name='test',text='new'}").unwrap();
-        workspace.changed(Arc::clone(&loader.0.compiler), root.clone(), &prepare);
-        assert!(Arc::ptr_eq(&workspace.registry(), &old));
-        lock(&queue).pop().unwrap()();
-        assert_eq!(workspace.generation(), before + 1);
-        assert_eq!(workspace.registry().system_prompt(), "new");
-        assert_eq!(
-            old.system_prompt(),
-            "old",
-            "a call retains its immutable generation"
-        );
-        drop(workspace);
-        fs::remove_dir_all(root).unwrap();
-    }
-
-    #[test]
     fn file_events_prepare_generations_without_session_bursts() {
         let root = std::env::temp_dir().join(format!("a-lua-watch-{}", std::process::id()));
         fs::create_dir_all(root.join("ext")).unwrap();
-        let loader = Loader::new(&root, sys::config::Exts::default(), || {
-            Ok(Registry::default())
-        })
-        .unwrap();
+        let loader = Loader::new(&root, sys::config::Exts::default()).unwrap();
         let (send, recv) = std::sync::mpsc::channel();
-        let workspace = loader
-            .0
+        let workspace = Coordinator::new(Registry::default(), vec![Arc::new(loader)])
             .open(
                 &root,
                 spawn(),
@@ -539,7 +349,7 @@ mod tests {
             .recv_timeout(Duration::from_secs(5))
             .expect("file-change event");
         work();
-        assert_eq!(workspace.registry().system_prompt(), "event");
+        assert_eq!(workspace.snapshot().registry.system_prompt(), "event");
         drop(workspace);
         fs::remove_dir_all(root).unwrap();
     }

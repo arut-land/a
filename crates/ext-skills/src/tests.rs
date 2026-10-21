@@ -174,10 +174,13 @@ fn explicit_extra_roots_are_opt_in_and_own_roots_override_them() {
             dirs: vec![".claude/skills".into()],
             ..Skills::default()
         },
-        Registry::default(),
-        None,
     );
-    let registry = Registry::default().with(&loader).unwrap();
+    let registry = Registry::default()
+        .with(&Arc::new(ext::host::Coordinator::new(
+            Registry::default(),
+            vec![Arc::new(loader)],
+        )))
+        .unwrap();
     let source = registry
         .service::<dyn Sources>()
         .unwrap()
@@ -190,7 +193,7 @@ fn explicit_extra_roots_are_opt_in_and_own_roots_override_them() {
         .unwrap();
     assert!(Arc::ptr_eq(&source, &another));
     drop(another);
-    let registry = source.registry();
+    let registry = source.snapshot().registry;
     let catalog = registry.tools().get("skill").unwrap();
     assert_eq!(catalog.replay(), ext::Replay::Unsafe);
     let calls = Rig::new("skills-roots-call", (*registry).clone());
@@ -203,13 +206,13 @@ fn explicit_extra_roots_are_opt_in_and_own_roots_override_them() {
             .iter()
             .any(|e| matches!(&e.body, Body::Context{text, ..} if text.ends_with("workspace")))
     );
-    let reserved = Loader::new(
-        &home,
-        Skills::default().reserving(["review"]),
-        Registry::default(),
-        None,
-    );
-    let reserved = Registry::default().with(&reserved).unwrap();
+    let reserved = Loader::new(&home, Skills::default().reserving(["review"]));
+    let reserved = Registry::default()
+        .with(&Arc::new(ext::host::Coordinator::new(
+            Registry::default(),
+            vec![Arc::new(reserved)],
+        )))
+        .unwrap();
     assert!(
         reserved
             .service::<dyn Sources>()

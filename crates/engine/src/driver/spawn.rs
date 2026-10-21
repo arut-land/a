@@ -509,6 +509,7 @@ pub(super) fn restore(
     shared: &Shared,
     open: Open,
     source: Option<&Arc<dyn ext::host::Generations>>,
+    current: Arc<Registry>,
 ) -> io::Result<(Arc<Registry>, Option<SpawnIntent>)> {
     let image = if matches!(open, Open::Load) && header.parent.is_some() {
         let entries = shared.store.prefix(header.id, 1)?;
@@ -524,8 +525,7 @@ pub(super) fn restore(
     } else {
         match (source, open) {
             (Some(source), Open::Load) => super::load_registry(header, shared, source)?,
-            (Some(source), Open::Create) => source.registry(),
-            (None, _) => shared.registry.get(),
+            (_, Open::Create) | (None, _) => current,
         }
     };
     let registry = if header.parent.is_some() {
@@ -545,13 +545,10 @@ pub(super) fn restore(
             .states()
             .restore_settings(&image.settings)
             .map_err(io::Error::other)?;
-        let names: Vec<_> = registry.extensions().map(|(name, _)| name).collect();
-        if names
-            != image
-                .extensions
-                .iter()
-                .map(String::as_str)
-                .collect::<Vec<_>>()
+        if !registry
+            .extensions()
+            .map(|(name, _)| name)
+            .eq(image.extensions.iter().map(String::as_str))
         {
             return Err(io::Error::other("frozen child registrations differ"));
         }

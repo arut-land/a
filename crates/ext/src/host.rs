@@ -4,8 +4,8 @@
 //! of it.
 
 use std::any::{Any, TypeId};
+use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, OnceLock, PoisonError, Weak};
 
 use protocol::{Audience, CallId, Card, Environment, Installed, Json, Outcome, Seq, SessionId};
@@ -169,7 +169,7 @@ struct Loaded {
 /// The extensions a daemon runs with, and what they make.
 #[derive(Default)]
 pub struct Registry {
-    /// The complete generation image is needed by layered loaders on recovery.
+    /// Frozen admission retains the complete source image for recovery.
     source_manifest: Option<Vec<Installed>>,
     installed: Vec<Loaded>,
     tools: Toolset,
@@ -592,22 +592,274 @@ pub trait HistoryPolicy: Send + Sync {
     ) -> Result<(), protocol::ForkError>;
 }
 
-/// An owned workspace subscription. Reads never perform I/O or prepare work.
+fn lock<T>(mutex: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
+    mutex.lock().unwrap_or_else(PoisonError::into_inner)
+}
+
+/// One publication is the authority for both identity and registrations.
+#[derive(Clone)]
+pub struct GenerationSnapshot {
+    pub id: u64,
+    pub registry: Arc<Registry>,
+}
+
+/// Reads never perform I/O or prepare work.
 pub trait Generations: Send + Sync {
-    fn generation(&self) -> u64;
-    fn registry(&self) -> Arc<Registry>;
-    /// Registers a weak callback. Mutable sources notify it after publication,
-    /// off the async worker, before preparation returns.
+    fn snapshot(&self) -> GenerationSnapshot;
     fn subscribe(&self, _changed: Weak<Changed>) {}
-    /// Rebuilds a recorded generation without consulting current source files.
-    fn restore(self: Arc<Self>, installed: &[Installed]) -> Result<Arc<Registry>, Refused> {
-        let registry = self.registry();
-        if registry.installed() != installed {
-            return Err(Refused(
-                "recorded extension generation cannot be restored".into(),
-            ));
+    fn restore(self: Arc<Self>, installed: &[Installed]) -> Result<Arc<Registry>, Refused>;
+}
+
+pub type Refresh = dyn FnMut() -> Result<(), Refused> + Send + Sync;
+pub type Rebuild = dyn Fn() -> Result<(), Refused> + Send + Sync;
+pub type Registrations = Vec<(Tier, Arc<dyn DynExtension>)>;
+
+#[derive(Clone)]
+pub struct PreparedLayer {
+    pub inputs: Arc<dyn Any + Send + Sync>,
+    pub registrations: Registrations,
+}
+
+/// Scanning and compilation belong to the extension that understands the image.
+pub trait GenerationLayer: Send + Sync {
+    fn name(&self) -> &'static str;
+    fn watch(
+        &self,
+        workspace: &Path,
+        spawn: Spawn,
+        changed: Arc<Changed>,
+    ) -> Result<Box<Refresh>, Refused>;
+    fn prepare(
+        &self,
+        workspace: &Path,
+        base: &Registry,
+        previous: Option<&PreparedLayer>,
+        initial: bool,
+    ) -> Result<PreparedLayer, Refused>;
+    fn restore(&self, own_image: &[Installed]) -> Result<Registrations, Refused>;
+    fn controls(&self, _rebuild: Weak<Rebuild>) -> Registrations {
+        Vec::new()
+    }
+}
+
+#[derive(serde::Serialize, serde::Deserialize)]
+struct LayerImage {
+    layer: String,
+    image: Option<Json>,
+}
+
+/// Reservations precede opening, so unrelated workspaces never wait on I/O.
+pub struct Coordinator {
+    base: Arc<Registry>,
+    layers: Vec<Arc<dyn GenerationLayer>>,
+    workspaces: Mutex<BTreeMap<PathBuf, Weak<Workspace>>>,
+}
+
+struct Workspace {
+    base: Arc<Registry>,
+    layers: Vec<Arc<dyn GenerationLayer>>,
+    path: PathBuf,
+    current: Current,
+    opened: OnceLock<Result<(), String>>,
+    preparing: Mutex<Vec<PreparedLayer>>,
+    pending: Mutex<(bool, bool)>,
+    watches: Mutex<Vec<Box<Refresh>>>,
+    changed: Arc<Changed>,
+    rebuild: Arc<Rebuild>,
+    updates: Updates,
+}
+
+impl Coordinator {
+    pub fn new(base: Registry, layers: Vec<Arc<dyn GenerationLayer>>) -> Self {
+        Self {
+            base: Arc::new(base),
+            layers,
+            workspaces: Mutex::default(),
+        }
+    }
+}
+
+impl Extension for Arc<Coordinator> {
+    const NAME: &'static str = "generation-source";
+    const VERSION: u32 = 1;
+    fn contribute(&self, r: &mut Registrar) {
+        r.provide::<dyn Sources>(self.clone());
+    }
+}
+
+impl Sources for Coordinator {
+    fn open(
+        &self,
+        path: &Path,
+        spawn: Spawn,
+        prepare: Prepare,
+    ) -> Result<Arc<dyn Generations>, Refused> {
+        let mut index = lock(&self.workspaces);
+        index.retain(|_, slot| slot.strong_count() > 0);
+        if let Some(workspace) = index.get(path).and_then(Weak::upgrade) {
+            drop(index);
+            workspace
+                .opened
+                .wait()
+                .as_ref()
+                .map_err(|e| Refused(e.clone()))?;
+            return Ok(workspace);
+        }
+        let workspace = Arc::new_cyclic(|weak: &Weak<Workspace>| {
+            let refresh = weak.clone();
+            let weak = weak.clone();
+            Workspace {
+                base: self.base.clone(),
+                layers: self.layers.clone(),
+                path: path.to_owned(),
+                current: Current::new((*self.base).clone()),
+                opened: OnceLock::new(),
+                preparing: Mutex::default(),
+                pending: Mutex::new((false, false)),
+                watches: Mutex::default(),
+                updates: Updates::default(),
+                rebuild: Arc::new(move || {
+                    refresh
+                        .upgrade()
+                        .ok_or_else(|| Refused("workspace closed".into()))?
+                        .rebuild(false)
+                }),
+                changed: Arc::new(move || {
+                    if let Some(workspace) = weak.upgrade() {
+                        workspace.changed(&prepare);
+                    }
+                }),
+            }
+        });
+        index.insert(path.to_owned(), Arc::downgrade(&workspace));
+        drop(index);
+        let result = (|| {
+            for layer in &workspace.layers {
+                let watch = layer.watch(path, spawn.clone(), workspace.changed.clone())?;
+                lock(&workspace.watches).push(watch);
+            }
+            workspace.rebuild(true)
+        })();
+        let _ = workspace
+            .opened
+            .set(result.as_ref().copied().map_err(|e| e.0.clone()));
+        result?;
+        Ok(workspace)
+    }
+}
+
+impl Workspace {
+    fn compose_layer(
+        &self,
+        mut registry: Registry,
+        layer: &dyn GenerationLayer,
+        registrations: Registrations,
+    ) -> Result<Registry, Refused> {
+        for (tier, extension) in registrations {
+            registry = registry.with_dyn(tier, &*extension)?;
+            let loaded = registry
+                .installed
+                .iter_mut()
+                .find(|i| i.name == extension.name())
+                .unwrap();
+            loaded.image = Some(
+                Json::encode(&LayerImage {
+                    layer: layer.name().to_owned(),
+                    image: loaded.image.take(),
+                })
+                .map_err(|e| Refused(e.to_string()))?,
+            );
+        }
+        for (tier, control) in layer.controls(Arc::downgrade(&self.rebuild)) {
+            registry = registry.with_dyn(tier, &*control)?;
         }
         Ok(registry)
+    }
+
+    fn rebuild(&self, initial: bool) -> Result<(), Refused> {
+        let mut previous = lock(&self.preparing);
+        for watch in lock(&self.watches).iter_mut() {
+            watch()?;
+        }
+        let mut registry = (*self.base).clone();
+        let mut prepared = Vec::new();
+        for (index, layer) in self.layers.iter().enumerate() {
+            let next = layer.prepare(&self.path, &registry, previous.get(index), initial)?;
+            registry = self.compose_layer(registry, &**layer, next.registrations.clone())?;
+            prepared.push(next);
+        }
+        *previous = prepared;
+        if registry.installed() != self.current.snapshot().registry.installed() {
+            self.current.replace(registry);
+            self.updates.notify();
+        }
+        Ok(())
+    }
+
+    fn changed(self: &Arc<Self>, prepare: &Prepare) {
+        let mut pending = lock(&self.pending);
+        pending.1 = true;
+        if pending.0 {
+            return;
+        }
+        pending.0 = true;
+        drop(pending);
+        let weak = Arc::downgrade(self);
+        prepare(Box::new(move || {
+            while let Some(workspace) = weak.upgrade() {
+                lock(&workspace.pending).1 = false;
+                if let Err(error) = workspace.rebuild(false) {
+                    eprintln!("warning: {error}");
+                }
+                let mut pending = lock(&workspace.pending);
+                if !pending.1 {
+                    pending.0 = false;
+                    break;
+                }
+            }
+        }));
+    }
+}
+
+impl Generations for Workspace {
+    fn snapshot(&self) -> GenerationSnapshot {
+        self.current.snapshot()
+    }
+    fn subscribe(&self, changed: Weak<Changed>) {
+        self.updates.subscribe(changed);
+    }
+    fn restore(self: Arc<Self>, installed: &[Installed]) -> Result<Arc<Registry>, Refused> {
+        let mut images: BTreeMap<String, Vec<Installed>> = BTreeMap::new();
+        for extension in installed {
+            if self
+                .base
+                .installed
+                .iter()
+                .any(|loaded| *loaded.name == extension.name && loaded.image == extension.image)
+            {
+                continue;
+            }
+            if let Some(image) = &extension.image {
+                let image = image
+                    .parse::<LayerImage>()
+                    .map_err(|e| Refused(e.to_string()))?;
+                images.entry(image.layer).or_default().push(Installed {
+                    image: image.image,
+                    ..extension.clone()
+                });
+            }
+        }
+        let mut registry = (*self.base).clone();
+        for layer in &self.layers {
+            let own = images.remove(layer.name()).unwrap_or_default();
+            registry = self.compose_layer(registry, &**layer, layer.restore(&own)?)?;
+        }
+        if registry.installed() != installed {
+            return Err(Refused(
+                "recorded generation differs from this build".into(),
+            ));
+        }
+        Ok(Arc::new(registry))
     }
 }
 
@@ -619,27 +871,20 @@ pub struct Updates(Mutex<Vec<Weak<Changed>>>);
 
 impl Updates {
     pub fn subscribe(&self, changed: Weak<Changed>) {
-        let mut listeners = self.0.lock().unwrap_or_else(PoisonError::into_inner);
+        let mut listeners = lock(&self.0);
         listeners.retain(|listener| listener.strong_count() > 0);
         listeners.push(changed);
     }
 
     pub fn notify(&self) {
-        let listeners: Vec<_> = self
-            .0
-            .lock()
-            .unwrap_or_else(PoisonError::into_inner)
-            .iter()
-            .filter_map(Weak::upgrade)
-            .collect();
+        let listeners: Vec<_> = lock(&self.0).iter().filter_map(Weak::upgrade).collect();
         for changed in listeners {
             changed();
         }
     }
 }
 
-/// Opens a workspace subscription off the async worker. Consumers own its
-/// lifetime; a source must not retain an unbounded collection of workspaces.
+/// Admits compilation off the async worker.
 pub type Prepare = Arc<dyn Fn(Box<dyn FnOnce() + Send>) + Send + Sync>;
 
 /// Schedules owned asynchronous subscription work on the host runtime.
@@ -656,25 +901,30 @@ pub trait Sources: Send + Sync {
 
 /// The registry sessions run with. Replacing it (a reload) takes effect at
 /// each session's next rest, between bursts of events.
-pub struct Current(Mutex<Arc<Registry>>, AtomicU64);
+pub struct Current(Mutex<GenerationSnapshot>);
 
 impl Current {
     pub fn new(registry: Registry) -> Self {
-        Self(Mutex::new(Arc::new(registry)), AtomicU64::new(0))
+        Self(Mutex::new(GenerationSnapshot {
+            id: 0,
+            registry: Arc::new(registry),
+        }))
     }
 
-    /// The newest generation.
+    pub fn snapshot(&self) -> GenerationSnapshot {
+        lock(&self.0).clone()
+    }
+
     pub fn get(&self) -> Arc<Registry> {
-        Arc::clone(&self.0.lock().unwrap_or_else(PoisonError::into_inner))
-    }
-
-    pub fn generation(&self) -> u64 {
-        self.1.load(Ordering::Acquire)
+        self.snapshot().registry
     }
 
     pub fn replace(&self, registry: Registry) {
-        *self.0.lock().unwrap_or_else(PoisonError::into_inner) = Arc::new(registry);
-        self.1.fetch_add(1, Ordering::Release);
+        let mut current = lock(&self.0);
+        *current = GenerationSnapshot {
+            id: current.id + 1,
+            registry: Arc::new(registry),
+        };
     }
 }
 
