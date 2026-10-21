@@ -202,3 +202,58 @@ func expectInStep(_ store: SessionStore, _ reducer: Reducer, _ name: String) {
     #expect(sawBatch)
     #expect(store.resyncs == 0)
 }
+
+@Test func anInvalidDisplayBatchLeavesItemsAndRevisionUnchanged() throws {
+    let vector = Vector.all.first { $0.name == "approval reviews the effective multiline call" }!
+    let (reducer, _) = try vector.fold()
+    let item = reducer.snapshot().items[0]
+    let store = SessionStore(source: Reducer())
+    let batch = ChangeBatch(
+        revision: 1, seq: 99,
+        changes: [
+            .added(index: 0, item: item),
+            .updated(index: 10, item: item),
+            .error(message: "must not be applied"),
+        ],
+        turn: reducer.turn(), streaming: nil, title: "must not be applied")
+    store.apply(batch)
+    #expect(store.items.isEmpty)
+    #expect(store.rev == 0)
+    #expect(store.seq == 0)
+    #expect(store.title == nil)
+}
+
+@Test func rejectedDisplayBatchesRespectResetsAndSnapshotsAndAllowRetry() throws {
+    let vector = Vector.all.first { $0.name == "approval reviews the effective multiline call" }!
+    let (reducer, _) = try vector.fold()
+    let item = reducer.snapshot().items[0]
+    let next = reducer.snapshot().items[1]
+    let invalid: [[ViewChange]] = [
+        [.added(index: 2, item: next)],
+        [.snapshot(items: []), .updated(index: 0, item: item)],
+        [.attached(session: "discarded", workspace: "/discarded", reset: true), .updated(index: 0, item: item)],
+        [.added(index: 1, item: next), .updated(index: 2, item: item)],
+    ]
+    for changes in invalid {
+        let store = SessionStore(source: Reducer())
+        let turn = store.turn
+        store.apply(ChangeBatch(
+            revision: 1, seq: 1, changes: [.added(index: 0, item: item)],
+            turn: turn, streaming: nil, title: "original"))
+        store.apply(ChangeBatch(
+            revision: 2, seq: 99, changes: [.error(message: "discarded")] + changes,
+            turn: reducer.turn(), streaming: 123, title: "discarded"))
+        #expect(store.items == [item])
+        #expect(store.rev == 1 && store.seq == 1)
+        #expect(store.title == "original")
+        #expect(store.turn == turn && store.streaming == nil)
+        #expect(store.sessionId == nil && store.workspace.isEmpty && store.problem == nil)
+
+        store.apply(ChangeBatch(
+            revision: 2, seq: 2,
+            changes: [.added(index: 1, item: next), .updated(index: 1, item: next)],
+            turn: turn, streaming: nil, title: "retry"))
+        #expect(store.items == [item, next])
+        #expect(store.rev == 2 && store.seq == 2 && store.title == "retry")
+    }
+}

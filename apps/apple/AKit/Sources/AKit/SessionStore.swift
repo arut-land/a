@@ -186,6 +186,23 @@ public final class SessionStore {
     }
 
     private func fold(_ update: ChangeBatch) {
+        // Preflight keeps invalid batches inert without copying the transcript.
+        var count = items.count
+        for change in update.changes {
+            switch change {
+            case .attached(_, _, let reset) where reset:
+                count = 0
+            case .snapshot(let items):
+                count = items.count
+            case .added(let index, _):
+                guard Int(index) <= count else { return }
+                count += 1
+            case .updated(let index, _):
+                guard Int(index) < count else { return }
+            case .attached, .delta, .synced, .activity, .draining, .mismatch, .error, .link:
+                break
+            }
+        }
         (rev, seq, turn, title) = (update.revision, update.seq, update.turn, update.title)
         if streaming?.call != update.streaming {
             streaming = update.streaming.map { StreamingText(call: $0, text: "") }
@@ -199,9 +216,8 @@ public final class SessionStore {
                 (sessionId, self.workspace) = (session, workspace)
                 attachment = .attached(id: session)
             case .added(let index, let item):
-                items.insert(item, at: min(Int(index), items.count))
+                items.insert(item, at: Int(index))
             case .updated(let index, let item):
-                guard Int(index) < items.count else { return }
                 items[Int(index)] = item
             case .delta(_, let text):
                 streaming?.text += text
