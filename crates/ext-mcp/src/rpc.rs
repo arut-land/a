@@ -124,7 +124,10 @@ async fn exchange(
     let mut pending = Vec::new();
     let mut event = Vec::new();
     let mut total = 0;
-    while let Some(chunk) = poll_fn(|cx| body.as_mut().poll_next(cx)).await {
+    while let Some(chunk) = incoming
+        .wait(cx, poll_fn(|cx| body.as_mut().poll_next(cx)))
+        .await
+    {
         let bytes = chunk.map_err(transport)?;
         total += bytes.len();
         if total > LIMIT {

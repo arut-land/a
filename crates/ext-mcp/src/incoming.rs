@@ -52,6 +52,35 @@ impl Incoming {
         Ok(result)
     }
 
+    pub(crate) async fn wait<F: Future + Send>(
+        &mut self,
+        cx: &Cx,
+        future: F,
+    ) -> F::Output
+    where
+        F::Output: Send,
+    {
+        let mut future = std::pin::pin!(future);
+        let runtime = cx.service::<dyn rt::Runtime>().expect("engine runtime");
+        loop {
+            if self.progress.pending.is_none() || self.progress.sent >= PUBLICATIONS - 1 {
+                return future.await;
+            }
+            let delay = self.progress.last.map_or(Duration::ZERO, |last| {
+                INTERVAL.saturating_sub(runtime.now().saturating_duration_since(last))
+            });
+            if let Some(result) = rt::or(async { Some(future.as_mut().await) }, async {
+                runtime.sleep(delay).await;
+                None
+            })
+            .await
+            {
+                return result;
+            }
+            self.publish(cx, false);
+        }
+    }
+
     pub(crate) fn publish(&mut self, cx: &Cx, finished: bool) {
         let now = cx
             .service::<dyn rt::Runtime>()
@@ -127,7 +156,7 @@ mod tests {
         );
         for i in 2..1000 {
             progress.pending = Some(i.to_string());
-            progress.take(start + INTERVAL * i, false);
+            let _ = progress.take(start + INTERVAL * i, false);
         }
         assert_eq!(progress.sent, PUBLICATIONS - 1);
         assert_eq!(progress.take(start, true).as_deref(), Some("999"));

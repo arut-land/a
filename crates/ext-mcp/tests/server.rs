@@ -70,6 +70,14 @@ fn main() {
                 )
                 .unwrap();
                 match tool {
+                    "progress-pause" => {
+                        for message in ["initial\n", "latest\n"] {
+                            send(
+                                &json!({"jsonrpc":"2.0","method":"notifications/progress","params":{"progressToken":id,"message":message}}),
+                            );
+                        }
+                        continue;
+                    }
                     "progress-burst" => {
                         for i in 0..100 {
                             send(

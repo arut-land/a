@@ -155,7 +155,7 @@ impl Client {
         }
         let mut incoming = crate::incoming::Incoming::new(id);
         loop {
-            let (value, bytes) = self.read().await?;
+            let (value, bytes) = incoming.wait(cx, self.read()).await?;
             let result = incoming.decode(&value, bytes)?;
             incoming.publish(cx, result.is_some());
             if let Some(result) = result {

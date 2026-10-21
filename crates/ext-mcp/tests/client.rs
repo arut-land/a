@@ -262,3 +262,33 @@ fn invalid_discovered_identities_are_refused_before_publication() {
     assert!(result["failed"].get("protocol").is_some());
     finish(&rig);
 }
+
+#[test]
+fn coalesced_progress_is_published_even_when_the_peer_goes_quiet() {
+    let rig = rig("progress-pause", Duration::from_secs(5));
+    let cx = rig.cx();
+    let input =
+        protocol::Json::encode(&json!({"server":"fixture","tool":"progress-pause","arguments":{}}))
+            .unwrap();
+    let called = rt::block_on(async {
+        rt::or(
+            rig.registry.tools().run("mcp_call", &input, None, &cx),
+            async {
+                let reactor = rt::Reactor::AsyncIo;
+                while !rig.progress.lock().unwrap().ends_with("latest\n") {
+                    reactor.sleep(Duration::from_millis(5)).await;
+                }
+                rig.cancel.set();
+                std::future::pending().await
+            },
+        )
+        .await
+    });
+    let protocol::Outcome::Done { output } = called.outcome else {
+        panic!("no typed result")
+    };
+    let fact: Value = output.parse().unwrap();
+    assert_eq!(fact["failed"], "cancelled");
+    assert!(rig.progress.lock().unwrap().lines().count() <= 8);
+    finish(&rig);
+}
