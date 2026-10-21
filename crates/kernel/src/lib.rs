@@ -45,7 +45,7 @@ mod session;
 pub use crate::session::{Core, RESTART_CAP};
 
 /// A step separates its journal changes from work admitted by that prefix.
-#[derive(Debug, Default)]
+#[derive(Debug, Default, PartialEq)]
 pub struct StepPlan {
     pub appends: Vec<Entry>,
     pub commit: Option<Commit>,
@@ -60,30 +60,10 @@ pub struct Commit {
     pub publish: bool,
 }
 
-#[derive(Debug)]
+#[derive(Debug, PartialEq)]
 pub struct Guarded<W> {
     pub admission: Admission,
     pub work: W,
-}
-
-impl Extend<StepPlan> for StepPlan {
-    fn extend<T: IntoIterator<Item = StepPlan>>(&mut self, plans: T) {
-        for plan in plans {
-            self.appends.extend(plan.appends);
-            self.immediate.extend(plan.immediate);
-            self.admitted.extend(plan.admitted);
-            if let Some(commit) = plan.commit {
-                self.commit = Some(match self.commit {
-                    Some(previous) => Commit {
-                        through: previous.through.max(commit.through),
-                        durability: previous.durability.max(commit.durability),
-                        publish: previous.publish || commit.publish,
-                    },
-                    None => commit,
-                });
-            }
-        }
-    }
 }
 
 /// Whether the append must cross a write barrier. Admission and numbered

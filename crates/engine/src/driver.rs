@@ -869,7 +869,7 @@ struct Actor {
     /// after it ends.
     listed: Record,
 
-    admissions: Vec<(Admission, Admitted)>,
+    admissions: Vec<Guarded<Admitted>>,
 
     /// Carrying out what a resume asked for: a commit that fails now does
     /// not resume again, the session stops.
@@ -1257,13 +1257,13 @@ impl Actor {
             } => self.requested(request, origin, reply),
             Msg::Step(event) => event,
             Msg::Attach(client, since, done) => {
-                self.admissions.push((
-                    Admission {
+                self.admissions.push(Guarded {
+                    admission: Admission {
                         through: self.journal.ordered_seq,
                         requirement: Requirement::Durable,
                     },
-                    Admitted::Attach(client, since, done),
-                ));
+                    work: Admitted::Attach(client, since, done),
+                });
                 self.admit().await;
                 return None;
             }
@@ -1389,7 +1389,6 @@ impl Actor {
                 .map(|event| (event, None)),
             ContextRequest::Own { pgid, ended } => {
                 lock(&session.jobs).push(pgid);
-                let session = Arc::clone(&session);
                 self.live
                     .session
                     .spawn_work(WorkId::Job(pgid), origin.admission, |cancel| {
@@ -1543,7 +1542,16 @@ impl Actor {
                             )));
                         }
                     }
-                    fx.extend([more]);
+                    fx.appends.extend(more.appends);
+                    fx.immediate.extend(more.immediate);
+                    fx.admitted.extend(more.admitted);
+                    if let Some(mut commit) = more.commit {
+                        if let Some(previous) = fx.commit {
+                            commit.durability = commit.durability.max(previous.durability);
+                            commit.publish |= previous.publish;
+                        }
+                        fx.commit = Some(commit);
+                    }
                 }
                 Err(panic) => {
                     let why = panicked(&*panic);
@@ -1578,38 +1586,29 @@ impl Actor {
             immediate,
             admitted,
         } = plan;
-        let mut after: Vec<_> = admitted
-            .into_iter()
-            .map(|Guarded { admission, work }| (admission, work))
-            .collect();
+        let mut after = admitted;
+        let busy = immediate.iter().rev().find_map(|work| match work {
+            Effect::MarkBusy(busy) => Some(*busy),
+            _ => None,
+        });
         for effect in immediate {
             match effect {
                 Effect::Cancel { call } => self.cancel_pending(call, &mut after).await,
                 Effect::MarkBusy(true) => self.effect(effect).await,
-                effect => after.push((
-                    Admission {
-                        through: 0,
-                        requirement: Requirement::Ordered,
-                    },
-                    effect,
-                )),
+                Effect::MarkBusy(false) => {}
+                _ => unreachable!("external work requires admission"),
             }
         }
-        for (_, effect) in &after {
+        for Guarded { admission, work } in &after {
             if let Effect::Side {
                 ticket,
                 side: Some(id),
-            } = effect
+            } = work
                 && let Some(pending) = self.sides.get_mut(ticket)
             {
-                self.live.session.own_work(
-                    WorkId::Call(*id),
-                    Admission {
-                        through: id.get(),
-                        requirement: Requirement::Durable,
-                    },
-                    pending.cancel.clone(),
-                );
+                self.live
+                    .session
+                    .own_work(WorkId::Call(*id), *admission, pending.cancel.clone());
                 if pending.while_waiting {
                     self.waiting_sides.push((pending.origin.id, *id));
                 }
@@ -1619,25 +1618,17 @@ impl Actor {
         let publish = commit.is_some_and(|commit| commit.publish);
         let needs = after
             .iter()
-            .filter(|(a, _)| a.requirement == Requirement::Durable)
-            .map(|(a, _)| a.through)
+            .filter(|guarded| guarded.admission.requirement == Requirement::Durable)
+            .map(|guarded| guarded.admission.through)
             .max()
             .unwrap_or(0);
         let flush = (publish || needs > self.journal.durable_seq) && through > self.covering();
-        let busy = after
-            .iter()
-            .rev()
-            .find_map(|(_, e)| match e {
-                Effect::MarkBusy(busy) => Some(*busy),
-                _ => None,
-            })
-            .unwrap_or_else(|| self.live.has_work());
         let written = if let Some(commit) = commit {
             self.commit(
                 &mut appends,
                 commit.durability == Durability::Barrier,
                 flush,
-                self.listing(busy),
+                self.listing(busy.unwrap_or_else(|| self.live.has_work())),
             )
             .await
         } else if flush {
@@ -1648,7 +1639,7 @@ impl Actor {
         if let Err(error) = written {
             self.failed(
                 format!("logging: {error}"),
-                after.into_iter().map(|(_, effect)| effect).collect(),
+                after.into_iter().map(|guarded| guarded.work).collect(),
             )
             .await;
             return Err(());
@@ -1656,13 +1647,19 @@ impl Actor {
         self.admissions.extend(
             after
                 .into_iter()
-                .map(|(a, effect)| (a, Admitted::Effect(effect))),
+                .map(|Guarded { admission, work }| Guarded {
+                    admission,
+                    work: Admitted::Effect(work),
+                }),
         );
         self.admit().await;
+        if busy == Some(false) {
+            self.effect(Effect::MarkBusy(false)).await;
+        }
         Ok(())
     }
 
-    async fn cancel_pending(&mut self, call: CallId, after: &mut Vec<(Admission, Effect)>) {
+    async fn cancel_pending(&mut self, call: CallId, after: &mut Vec<Guarded<Effect>>) {
         let mut cancelled = None;
         let mut retain = |effect: &Effect| {
             if effect.starts_call() != Some(call) {
@@ -1679,11 +1676,11 @@ impl Actor {
             }
             false
         };
-        self.admissions.retain(|(_, work)| match work {
+        self.admissions.retain(|guarded| match &guarded.work {
             Admitted::Effect(effect) => retain(effect),
             _ => true,
         });
-        after.retain(|(_, effect)| retain(effect));
+        after.retain(|guarded| retain(&guarded.work));
         let running = matches!(
             self.inflight.get(&call),
             Some(InFlight::Tool(_) | InFlight::Model)
@@ -1711,22 +1708,24 @@ impl Actor {
 
     async fn admit(&mut self) {
         let mut waiting = Vec::new();
-        for (admission, work) in std::mem::take(&mut self.admissions) {
+        for guarded in std::mem::take(&mut self.admissions) {
+            let admission = guarded.admission;
             let watermark = match admission.requirement {
                 Requirement::Ordered => self.journal.ordered_seq,
                 Requirement::Durable => self.journal.durable_seq,
             };
             if admission.through > watermark {
-                waiting.push((admission, work));
+                waiting.push(guarded);
                 continue;
             }
-            match work {
+            match guarded.work {
                 Admitted::Effect(effect) => {
                     if let Some(call) = effect.starts_call() {
-                        let cancel = self.live.session.cancel(call);
-                        self.live
-                            .session
-                            .own_work(WorkId::Call(call), admission, cancel);
+                        self.live.session.call_work(
+                            call,
+                            self.live.session.fence.load(Ordering::SeqCst),
+                            Some(admission),
+                        );
                     }
                     self.effect(effect).await;
                 }
@@ -1758,7 +1757,7 @@ impl Actor {
         rest.extend(
             std::mem::take(&mut self.admissions)
                 .into_iter()
-                .filter_map(|(_, work)| match work {
+                .filter_map(|guarded| match guarded.work {
                     Admitted::Effect(effect) => Some(effect),
                     Admitted::Reaction(_) => None,
                     Admitted::Attach(client, _, done) => {
@@ -2069,7 +2068,7 @@ impl Actor {
         let env = lock(&self.live.session.env).clone();
         if let Some(daemon) = shared.daemon.upgrade() {
             let parent = self.live.id;
-            shared.rt.spawn(Box::pin(handle.run(async move {
+            handle.spawn(&*shared.rt, async move {
                 let refusal = spawn::SpawnIntent::from_json(&intent)
                     .ok()
                     .and_then(|i| i.refusal);
@@ -2104,7 +2103,7 @@ impl Actor {
                         )
                         .await;
                 }
-            })));
+            });
         }
     }
 
@@ -2160,11 +2159,11 @@ impl Actor {
         self.inflight.insert(call, InFlight::Later);
         let cancel = handle.cancel.clone();
         let fence = handle.fence;
-        Arc::clone(&session.shared.rt).spawn(Box::pin(handle.run(async move {
+        handle.spawn(&*Arc::clone(&session.shared.rt), async move {
             if let Some(done) = unless(&cancel, work).await {
                 session.emit(fence, Completion::Event(then(done)));
             }
-        })));
+        });
     }
 
     /// Prepares the request of model call `call`, attempt `attempt`: the
@@ -2224,33 +2223,29 @@ impl Actor {
         let fence = live.session.fence.load(Ordering::SeqCst);
         let handle = live.session.origin(call, fence).expect("actor generation");
         let cancel = handle.cancel.clone();
-        self.live
-            .session
-            .shared
-            .rt
-            .spawn(Box::pin(handle.run(async move {
-                let (replied, message) = match *prepared {
-                    Ok((model, request, attempt)) => {
-                        let mut deltas = |text: &str| live.delta(call, attempt, text, fence);
-                        let replying: BoxFuture<'_, _> =
-                            Box::pin(reply(&model, &request, &cancel, &mut deltas));
-                        contain(replying).await
-                    }
-                    // Said so the user can fix it; sending again would not.
-                    Err(error) => {
-                        let error = llm::Error::new(llm::Kind::InvalidRequest, error);
-                        (Replied::Failed(error), None)
-                    }
-                };
-                live.session.emit(
-                    fence,
-                    Completion::Replied {
-                        call,
-                        replied,
-                        message,
-                    },
-                );
-            })));
+        handle.spawn(&*self.live.session.shared.rt, async move {
+            let (replied, message) = match *prepared {
+                Ok((model, request, attempt)) => {
+                    let mut deltas = |text: &str| live.delta(call, attempt, text, fence);
+                    let replying: BoxFuture<'_, _> =
+                        Box::pin(reply(&model, &request, &cancel, &mut deltas));
+                    contain(replying).await
+                }
+                // Said so the user can fix it; sending again would not.
+                Err(error) => {
+                    let error = llm::Error::new(llm::Kind::InvalidRequest, error);
+                    (Replied::Failed(error), None)
+                }
+            };
+            live.session.emit(
+                fence,
+                Completion::Replied {
+                    call,
+                    replied,
+                    message,
+                },
+            );
+        });
     }
 
     /// The request for model call `call`: the system prompt, the
@@ -2277,24 +2272,20 @@ impl Actor {
         let cx = self.live.session.cx(origin.clone(), &registry);
         let session = Arc::clone(&self.live.session);
         let id = self.live.id;
-        self.live
-            .session
-            .shared
-            .rt
-            .spawn(Box::pin(origin.run(async move {
-                let began = crate::stamp();
-                let called = contain(registry.tools().run(&tool, &input, parsed, &cx)).await;
-                crate::session_event("effect", id, || {
-                    let elapsed = began.map_or(std::time::Duration::ZERO, |t| t.elapsed());
-                    let how = match &called.outcome {
-                        Outcome::Done { .. } => "done",
-                        Outcome::Failed { .. } => "failed",
-                        Outcome::Interrupted { .. } => "interrupted",
-                    };
-                    format!("{tool} call {call}: {how} in {elapsed:?}")
-                });
-                session.emit(fence, Completion::Tool { call, called });
-            })));
+        origin.spawn(&*self.live.session.shared.rt, async move {
+            let began = crate::stamp();
+            let called = contain(registry.tools().run(&tool, &input, parsed, &cx)).await;
+            crate::session_event("effect", id, || {
+                let elapsed = began.map_or(std::time::Duration::ZERO, |t| t.elapsed());
+                let how = match &called.outcome {
+                    Outcome::Done { .. } => "done",
+                    Outcome::Failed { .. } => "failed",
+                    Outcome::Interrupted { .. } => "interrupted",
+                };
+                format!("{tool} call {call}: {how} in {elapsed:?}")
+            });
+            session.emit(fence, Completion::Tool { call, called });
+        });
     }
 }
 
@@ -2418,12 +2409,21 @@ impl Session {
     }
 
     fn origin(&self, call: CallId, fence: u64) -> Option<ContextOrigin> {
+        self.call_work(call, fence, None)
+    }
+
+    fn call_work(
+        &self,
+        call: CallId,
+        fence: u64,
+        admission: Option<Admission>,
+    ) -> Option<ContextOrigin> {
         let mut work = lock(&self.work);
         if self.fence.load(Ordering::SeqCst) != fence {
             return None;
         }
         let id = WorkId::Call(call);
-        if work.get(&id).is_none() {
+        if work.get_mut(&id).is_none() {
             work.insert(WorkHandle::new(
                 id.clone(),
                 fence,
@@ -2434,7 +2434,10 @@ impl Session {
                 Cancel::default(),
             ));
         }
-        let handle = work.get(&id).unwrap();
+        let handle = work.get_mut(&id).unwrap();
+        if let Some(admission) = admission {
+            handle.admission = admission;
+        }
         Some(WorkHandle {
             id: call,
             fence: handle.fence,

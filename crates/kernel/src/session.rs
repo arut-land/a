@@ -146,7 +146,7 @@ impl Core {
                 input,
                 ticket,
             } => {
-                let result = self.invoke(existing, parent, name, tool, input, &mut fx);
+                let result = self.invoke(existing, parent, name, &tool, &input, &mut fx);
                 fx.immediate.push(Work::Invocation { ticket, result });
             }
             Event::Input {
@@ -260,7 +260,6 @@ impl Core {
     }
 
     fn finish(&mut self, fx: &mut StepPlan) {
-        self.admit_invocations(fx);
         self.advance(fx);
         self.marks(fx);
         let through = self.fold.ledger.seq();
@@ -1060,9 +1059,21 @@ impl Core {
     /// input, and children's results.
     fn advance(&mut self, fx: &mut StepPlan) {
         loop {
+            self.admit_queued(fx);
             match &self.turn {
                 Turn::Model { .. } => return,
-                Turn::Acting { open } if !open.is_empty() && !self.alongside(open) => return,
+                Turn::Acting { open } if !open.is_empty() => {
+                    let alongside = match self.fold.asked.front() {
+                        Some(Next::Agent(Action::Refuse { .. })) => true,
+                        Some(Next::Agent(Action::Call { tool, .. })) => {
+                            self.alongside(tool, None, open)
+                        }
+                        _ => false,
+                    };
+                    if !alongside {
+                        return;
+                    }
+                }
                 Turn::Stopping { open, .. } if !open.is_empty() => return,
                 Turn::Stopping { .. } => {
                     self.stopped(fx);
@@ -1148,22 +1159,27 @@ impl Core {
         }
     }
 
-    /// Whether the next thing asked for starts alongside the calls `open`:
-    /// a refusal, which runs nothing, or a shared call while every open
-    /// one is shared. Anything else waits for them, so an exclusive call
-    /// never overlaps another, and nothing starts ahead of what was asked
-    /// before it.
-    fn alongside(&self, open: &[(CallId, Step)]) -> bool {
-        match self.fold.asked.front() {
-            Some(Next::Agent(Action::Refuse { .. })) => true,
-            Some(Next::Agent(Action::Call { tool, .. })) => {
-                self.shared(tool)
-                    && open
-                        .iter()
-                        .all(|&(call, _)| self.tool_of(call).is_some_and(|(t, _)| self.shared(&t)))
+    fn ancestors(&self, call: CallId) -> impl Iterator<Item = CallId> + '_ {
+        std::iter::successors(Some(call), |call| {
+            match self.fold.ledger.call(*call).map(|open| &open.call) {
+                Some(Call::Tool {
+                    invoke: Some(key), ..
+                }) => Some(key.parent),
+                _ => None,
             }
-            _ => false,
-        }
+        })
+    }
+
+    fn alongside(&self, tool: &str, call: Option<CallId>, open: &[(CallId, Step)]) -> bool {
+        let shared = self.shared(tool);
+        open.iter().all(|(other, step)| {
+            matches!(step, Step::Queued { .. })
+                || call.is_some_and(|call| self.ancestors(call).any(|ancestor| ancestor == *other))
+                || shared
+                    && self
+                        .tool_of(*other)
+                        .is_some_and(|(tool, _)| self.shared(&tool))
+        })
     }
 
     /// Whether calls of `tool` run alongside others.
@@ -1214,8 +1230,8 @@ impl Core {
                 self.again(call, 0, fx);
             }
             Next::Agent(Action::Call { tool, input, id }) => {
-                let call = self.call(&tool, &input, id, Audience::Model, fx);
-                self.gate(call, &tool, &input, fx);
+                let call = self.call(&tool, &input, id, Audience::Model, None, fx);
+                self.set_step(call, Step::Queued { recovered: false });
             }
             Next::Agent(Action::Refuse {
                 tool,
@@ -1223,15 +1239,15 @@ impl Core {
                 id,
                 why,
             }) => {
-                let call = self.call(&tool, &input, id, Audience::Model, fx);
+                let call = self.call(&tool, &input, id, Audience::Model, None, fx);
                 let reason = why.clone();
                 self.decide(Some(call), AGENT, Verdict::Block { reason }, fx);
                 self.settle(call, Outcome::Failed { error: why }, fx);
             }
             Next::Command { name, args } => {
                 let input = args_of(args);
-                let call = self.call(&name, &input, None, Audience::User, fx);
-                self.gate(call, &name, &input, fx);
+                let call = self.call(&name, &input, None, Audience::User, None, fx);
+                self.set_step(call, Step::Queued { recovered: false });
             }
         }
     }
@@ -1241,8 +1257,8 @@ impl Core {
         existing: Option<CallId>,
         parent: CallId,
         name: String,
-        tool: String,
-        input: Json,
+        tool: &str,
+        input: &Json,
         fx: &mut StepPlan,
     ) -> Result<CallId, String> {
         if self.step_of(parent) != Some(Step::Running) {
@@ -1260,39 +1276,20 @@ impl Core {
             }
             return Ok(call);
         }
-        let mut ancestor = parent;
-        loop {
-            if !self.shared(&tool)
-                && self
-                    .tool_of(ancestor)
+        if !self.shared(tool)
+            && self.ancestors(parent).any(|ancestor| {
+                self.tool_of(ancestor)
                     .is_some_and(|(tool, _)| self.shared(&tool))
-            {
-                return Err("exclusive invocation requires exclusive ancestors".into());
-            }
-            match self.fold.ledger.call(ancestor).map(|open| &open.call) {
-                Some(Call::Tool {
-                    invoke: Some(key), ..
-                }) => ancestor = key.parent,
-                _ => break,
-            }
+            })
+        {
+            return Err("exclusive invocation requires exclusive ancestors".into());
         }
-        let card = self.registry.read(self.next_seq(), &tool, &input);
-        let call = self.append(
-            fx,
-            Body::ToolCall {
-                invoke: Some(key),
-                tool,
-                input,
-                card,
-                id: None,
-                by: Audience::Model,
-            },
-        );
+        let call = self.call(tool, input, None, Audience::Model, Some(key), fx);
         self.set_step(call, Step::Queued { recovered: false });
         Ok(call)
     }
 
-    fn admit_invocations(&mut self, fx: &mut StepPlan) {
+    fn admit_queued(&mut self, fx: &mut StepPlan) {
         let queued: Vec<_> = match &self.turn {
             Turn::Acting { open } => open
                 .iter()
@@ -1303,31 +1300,13 @@ impl Core {
             _ => return,
         };
         for (call, step) in queued {
-            let mut ancestors = Vec::new();
-            let mut owner = call;
-            while let Some(Call::Tool {
-                invoke: Some(key), ..
-            }) = self.fold.ledger.call(owner).map(|open| &open.call)
-            {
-                ancestors.push(key.parent);
-                owner = key.parent;
-            }
             let Some((tool, input)) = self.tool_of(call) else {
                 continue;
             };
             let Turn::Acting { open } = &self.turn else {
                 return;
             };
-            let available = open.iter().all(|(other, step)| {
-                *other == call
-                    || ancestors.contains(other)
-                    || matches!(step, Step::Queued { .. })
-                    || self.shared(&tool)
-                        && self
-                            .tool_of(*other)
-                            .is_some_and(|(tool, _)| self.shared(&tool))
-            });
-            if available {
+            if self.alongside(&tool, Some(call), open) {
                 if step == (Step::Queued { recovered: true }) {
                     let phase = self
                         .fold
@@ -1369,12 +1348,13 @@ impl Core {
         input: &Json,
         id: Option<String>,
         by: Audience,
+        invoke: Option<protocol::Invocation>,
         fx: &mut StepPlan,
     ) -> CallId {
         let next = self.next_seq();
         let card = self.registry.read(next, tool, input);
         let body = Body::ToolCall {
-            invoke: None,
+            invoke,
             tool: tool.to_owned(),
             input: input.clone(),
             id,
@@ -1495,7 +1475,7 @@ impl Core {
                     continue;
                 }
             };
-            let call = self.call(&tool, &input, id, by, fx);
+            let call = self.call(&tool, &input, id, by, None, fx);
             self.settle(call, Outcome::Interrupted { output: None }, fx);
         }
         self.append(fx, Body::Interrupt { origin });

@@ -236,13 +236,13 @@ impl Actor {
             };
             for reaction in hooks.observe(point, e) {
                 if let Some(work) = reaction.work {
-                    self.admissions.push((
-                        Admission {
+                    self.admissions.push(super::Guarded {
+                        admission: Admission {
                             through: e.seq.get(),
                             requirement: reaction.requirement,
                         },
-                        Admitted::Reaction(work),
-                    ));
+                        work: Admitted::Reaction(work),
+                    });
                 }
             }
             let replied = match &e.body {

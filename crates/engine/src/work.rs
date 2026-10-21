@@ -24,7 +24,7 @@ pub(super) struct WorkHandle<K = WorkId> {
     pub(super) ended: Flag,
 }
 
-impl<K> WorkHandle<K> {
+impl<K: Send + 'static> WorkHandle<K> {
     pub(super) fn new(id: K, fence: u64, admission: Admission, cancel: Cancel) -> Self {
         Self {
             id,
@@ -35,10 +35,15 @@ impl<K> WorkHandle<K> {
         }
     }
 
-    pub(super) async fn run<T>(self, work: impl Future<Output = T>) -> T {
-        let result = work.await;
-        self.ended.set();
-        result
+    pub(super) fn spawn(
+        self,
+        rt: &dyn rt::Runtime,
+        work: impl Future<Output = ()> + Send + 'static,
+    ) {
+        rt.spawn(Box::pin(async move {
+            work.await;
+            self.ended.set();
+        }));
     }
 }
 
@@ -56,8 +61,8 @@ impl<K: PartialEq> WorkSet<K> {
         self.0.push(handle);
     }
 
-    pub(super) fn get(&self, id: &K) -> Option<&WorkHandle<K>> {
-        self.0.iter().find(|handle| &handle.id == id)
+    pub(super) fn get_mut(&mut self, id: &K) -> Option<&mut WorkHandle<K>> {
+        self.0.iter_mut().find(|handle| &handle.id == id)
     }
 
     pub(super) fn cancel(&mut self, id: &K) {
@@ -84,12 +89,6 @@ impl<K> Drop for WorkSet<K> {
 impl Session {
     pub(super) fn own_work(&self, id: WorkId, admission: Admission, cancel: Cancel) -> WorkHandle {
         let mut owned = lock(&self.work);
-        if matches!(id, WorkId::Call(_))
-            && let Some(previous) = owned.0.iter_mut().find(|handle| handle.id == id)
-        {
-            previous.admission = admission;
-            return previous.clone();
-        }
         let handle = WorkHandle::new(id, self.fence.load(Ordering::SeqCst), admission, cancel);
         owned.0.retain(|previous| {
             if !matches!(previous.id, WorkId::Call(_)) && previous.ended.is_set() {
@@ -110,7 +109,7 @@ impl Session {
     ) {
         let handle = self.own_work(id, admission, Cancel::default());
         let task = work(handle.cancel.clone());
-        self.shared.rt.spawn(Box::pin(handle.run(task)));
+        handle.spawn(&*self.shared.rt, task);
     }
 }
 
