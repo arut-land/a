@@ -5,7 +5,7 @@ use std::path::{Path, PathBuf};
 use std::sync::{Arc, Weak};
 use std::time::{Duration, Instant};
 
-use ext::host::{Changed, GenerationLayer, Rebuild, Registrations, Registry, Spawn};
+use ext::host::{Changed, GenerationLayer, PreparedLayer, Rebuild, Registrations, Registry, Spawn};
 use ext::{Extension, Refused, Registrar, Tier};
 
 use crate::{Limits, Mod};
@@ -81,25 +81,15 @@ impl GenerationLayer for Loader {
         &self,
         workspace: &Path,
         base: &Registry,
-        previous: &Registrations,
+        previous: Option<&PreparedLayer>,
         initial: bool,
-    ) -> Result<Registrations, Refused> {
+    ) -> Result<PreparedLayer, Refused> {
         let mut found = Files::new();
         files(&self.home.join("ext"), &mut found)?;
         files(&workspace.join(".a/ext"), &mut found)?;
         found.retain(|name, _| !self.config.disable.contains(name));
-        if !initial
-            && found.len() == previous.len()
-            && previous.iter().all(|(_, extension)| {
-                extension
-                    .image()
-                    .and_then(|image| image.parse::<serde_json::Value>().ok())
-                    .is_some_and(|image| {
-                        found
-                            .get(&*extension.name())
-                            .is_some_and(|source| image[0].as_str() == Some(source))
-                    })
-            })
+        if let Some(previous) =
+            previous.filter(|p| p.inputs.downcast_ref::<Files>() == Some(&found))
         {
             return Ok(previous.clone());
         }
@@ -107,9 +97,6 @@ impl GenerationLayer for Loader {
         let mut registry = base.clone();
         let mut installed = Vec::new();
         for (name, source) in &found {
-            if self.config.disable.contains(name) {
-                continue;
-            }
             // A workspace preparation has an aggregate bound as well as per-VM fuel.
             if started.elapsed() > Duration::from_secs(1) {
                 return Err(Refused("lua workspace preparation budget exhausted".into()));
@@ -149,10 +136,13 @@ impl GenerationLayer for Loader {
         if started.elapsed() > Duration::from_secs(1) {
             return Err(Refused("lua workspace preparation budget exhausted".into()));
         }
-        Ok(installed
-            .into_iter()
-            .map(|module| (Tier::User, Arc::new(module) as Arc<dyn ext::DynExtension>))
-            .collect())
+        Ok(PreparedLayer {
+            inputs: Arc::new(found),
+            registrations: installed
+                .into_iter()
+                .map(|module| (Tier::User, Arc::new(module) as Arc<dyn ext::DynExtension>))
+                .collect(),
+        })
     }
     fn restore(&self, own_image: &[protocol::Installed]) -> Result<Registrations, Refused> {
         own_image
@@ -255,6 +245,42 @@ mod tests {
     fn spawn() -> Spawn {
         let rt: rt::Rt = Arc::new(rt::Threads::default());
         Arc::new(move |task| rt.spawn(task))
+    }
+
+    #[test]
+    fn unchanged_rejected_sources_do_not_poison_other_layers_rebuilds() {
+        let rig = ext::testing::Rig::new("lua-preparation-cache", Registry::default());
+        fs::create_dir_all(rig.dir.join("ext")).unwrap();
+        fs::write(
+            rig.dir.join("ext/good.lua"),
+            "a.text{name='good',text='cached'}",
+        )
+        .unwrap();
+        let bad = rig.dir.join("ext/bad.lua");
+        fs::write(&bad, "error('invalid source')").unwrap();
+        let loader = Loader::new(&rig.dir, sys::config::Exts::default()).unwrap();
+        let first = loader
+            .prepare(&rig.workspace(), &Registry::default(), None, true)
+            .unwrap();
+        assert_eq!(first.registrations.len(), 1);
+        let next = loader
+            .prepare(&rig.workspace(), &Registry::default(), Some(&first), false)
+            .unwrap();
+        assert!(Arc::ptr_eq(
+            &first.registrations[0].1,
+            &next.registrations[0].1
+        ));
+        fs::write(&bad, "error('different invalid source')").unwrap();
+        assert!(
+            loader
+                .prepare(&rig.workspace(), &Registry::default(), Some(&first), false)
+                .is_err()
+        );
+        fs::remove_file(bad).unwrap();
+        let recovered = loader
+            .prepare(&rig.workspace(), &Registry::default(), Some(&first), false)
+            .unwrap();
+        assert_eq!(recovered.registrations.len(), 1);
     }
 
     #[test]

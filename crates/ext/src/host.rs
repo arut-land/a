@@ -611,10 +611,14 @@ pub trait Generations: Send + Sync {
 }
 
 pub type Refresh = dyn FnMut() -> Result<(), Refused> + Send + Sync;
-
 pub type Rebuild = dyn Fn() -> Result<(), Refused> + Send + Sync;
-
 pub type Registrations = Vec<(Tier, Arc<dyn DynExtension>)>;
+
+#[derive(Clone)]
+pub struct PreparedLayer {
+    pub inputs: Arc<dyn Any + Send + Sync>,
+    pub registrations: Registrations,
+}
 
 /// Scanning and compilation belong to the extension that understands the image.
 pub trait GenerationLayer: Send + Sync {
@@ -629,9 +633,9 @@ pub trait GenerationLayer: Send + Sync {
         &self,
         workspace: &Path,
         base: &Registry,
-        previous: &Registrations,
+        previous: Option<&PreparedLayer>,
         initial: bool,
-    ) -> Result<Registrations, Refused>;
+    ) -> Result<PreparedLayer, Refused>;
     fn restore(&self, own_image: &[Installed]) -> Result<Registrations, Refused>;
     fn controls(&self, _rebuild: Weak<Rebuild>) -> Registrations {
         Vec::new()
@@ -657,7 +661,7 @@ struct Workspace {
     path: PathBuf,
     current: Current,
     opened: OnceLock<Result<(), String>>,
-    preparing: Mutex<Vec<Registrations>>,
+    preparing: Mutex<Vec<PreparedLayer>>,
     pending: Mutex<(bool, bool)>,
     watches: Mutex<Vec<Box<Refresh>>>,
     changed: Arc<Changed>,
@@ -780,14 +784,9 @@ impl Workspace {
         let mut registry = (*self.base).clone();
         let mut prepared = Vec::new();
         for (index, layer) in self.layers.iter().enumerate() {
-            let registrations = layer.prepare(
-                &self.path,
-                &registry,
-                previous.get(index).unwrap_or(&Vec::new()),
-                initial,
-            )?;
-            prepared.push(registrations.clone());
-            registry = self.compose_layer(registry, &**layer, registrations)?;
+            let next = layer.prepare(&self.path, &registry, previous.get(index), initial)?;
+            registry = self.compose_layer(registry, &**layer, next.registrations.clone())?;
+            prepared.push(next);
         }
         *previous = prepared;
         if registry.installed() != self.current.snapshot().registry.installed() {

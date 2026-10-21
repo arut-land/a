@@ -2,18 +2,20 @@
 //! [`Built`]. Runtime configuration may replace registrations, so the same
 //! dependency checks also apply to disabled and dynamically loaded extensions.
 
+use std::sync::Arc;
+
 use engine::Config;
-use ext::host::{Built, Registry};
+use ext::host::{Built, Coordinator, GenerationLayer, Registry};
 use ext::{Configured, DynExtension, Name, Refused, Registrar, Table, Tier};
 
 /// Tiering and dependency validation apply equally to linked and source registrations.
 pub fn registry(config: &Config) -> Result<Registry, Refused> {
     let registry = linked(config)?;
-    let mut layers: Vec<std::sync::Arc<dyn ext::host::GenerationLayer>> = Vec::new();
+    let mut layers: Vec<Arc<dyn GenerationLayer>> = Vec::new();
     #[cfg(feature = "lua")]
     if !config.ext.disable.iter().any(|name| name == "lua") {
         let home = sys::Home::from_env().map_err(|e| Refused(e.to_string()))?;
-        layers.push(std::sync::Arc::new(ext_lua::Loader::new(
+        layers.push(Arc::new(ext_lua::Loader::new(
             home.root(),
             config.ext.clone(),
         )?));
@@ -25,12 +27,9 @@ pub fn registry(config: &Config) -> Result<Registry, Refused> {
             configured::<ext_skills::Skills>(config)?.reserving(client::COMMANDS.iter().flat_map(
                 |command| std::iter::once(command.name).chain(command.aliases.iter().copied()),
             ));
-        layers.push(std::sync::Arc::new(ext_skills::Loader::new(
-            home.root(),
-            skills,
-        )));
+        layers.push(Arc::new(ext_skills::Loader::new(home.root(), skills)));
     }
-    let coordinator = std::sync::Arc::new(ext::host::Coordinator::new(registry.clone(), layers));
+    let coordinator = Arc::new(Coordinator::new(registry.clone(), layers));
     registry.with_in(Tier::Pre, &coordinator)
 }
 

@@ -561,9 +561,9 @@ impl GenerationLayer for TestLayer {
         &self,
         _: &Path,
         _: &Registry,
-        _: &Registrations,
+        _: Option<&PreparedLayer>,
         _: bool,
-    ) -> Result<Registrations, Refused> {
+    ) -> Result<PreparedLayer, Refused> {
         use std::sync::atomic::Ordering::SeqCst;
         self.scans.fetch_add(1, SeqCst);
         let during = self.during.lock().unwrap().take();
@@ -573,13 +573,16 @@ impl GenerationLayer for TestLayer {
         if self.fail.load(SeqCst) {
             return Err(Refused("invalid source".into()));
         }
-        Ok(vec![(
-            Tier::User,
-            Arc::new(ImageExtension {
-                name: self.name,
-                value: self.value.load(SeqCst),
-            }),
-        )])
+        Ok(PreparedLayer {
+            inputs: Arc::new(()),
+            registrations: vec![(
+                Tier::User,
+                Arc::new(ImageExtension {
+                    name: self.name,
+                    value: self.value.load(SeqCst),
+                }),
+            )],
+        })
     }
     fn restore(&self, own_image: &[Installed]) -> Result<Registrations, Refused> {
         let [image] = own_image else {

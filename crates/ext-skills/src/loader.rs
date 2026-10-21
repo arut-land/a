@@ -4,7 +4,7 @@ use std::io::Read;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
-use ext::host::{Changed, GenerationLayer, Registrations, Registry, Spawn};
+use ext::host::{Changed, GenerationLayer, PreparedLayer, Registrations, Registry, Spawn};
 use ext::{Extension, Refused, Tier};
 
 use crate::{Catalog, Skill, Skills, parse};
@@ -66,9 +66,9 @@ impl GenerationLayer for Loader {
         &self,
         workspace: &Path,
         base: &Registry,
-        _previous: &Registrations,
+        previous: Option<&PreparedLayer>,
         _: bool,
-    ) -> Result<Registrations, Refused> {
+    ) -> Result<PreparedLayer, Refused> {
         let mut catalog = BTreeMap::new();
         for root in self.roots(workspace) {
             scan(&root, &mut catalog)?;
@@ -80,7 +80,16 @@ impl GenerationLayer for Loader {
                 )));
             }
         }
-        Ok(vec![(Tier::Pre, Arc::new(Catalog(Arc::new(catalog))))])
+        if let Some(previous) = previous
+            .filter(|p| p.inputs.downcast_ref::<BTreeMap<String, Skill>>() == Some(&catalog))
+        {
+            return Ok(previous.clone());
+        }
+        let catalog = Arc::new(catalog);
+        Ok(PreparedLayer {
+            inputs: catalog.clone(),
+            registrations: vec![(Tier::Pre, Arc::new(Catalog(catalog)))],
+        })
     }
 
     fn restore(&self, own_image: &[protocol::Installed]) -> Result<Registrations, Refused> {
@@ -240,10 +249,10 @@ mod tests {
         assert!(!core.at_rest());
         write("new index", "new instructions");
         let registrations = Loader::new(&rig.dir, Skills::default())
-            .prepare(&rig.workspace(), &Registry::default(), &Vec::new(), false)
+            .prepare(&rig.workspace(), &Registry::default(), None, false)
             .unwrap();
         let mut registry = Registry::default();
-        for (tier, extension) in registrations {
+        for (tier, extension) in registrations.registrations {
             registry = registry.with_dyn(tier, &*extension).unwrap();
         }
         let new = Arc::new(registry);
@@ -297,13 +306,13 @@ mod tests {
         let loader = Loader::new(&rig.dir, Skills::default());
         assert!(
             loader
-                .prepare(&rig.workspace(), &Registry::default(), &Vec::new(), true)
+                .prepare(&rig.workspace(), &Registry::default(), None, true)
                 .is_ok()
         );
         fs::write(file, "---\nname: [broken").unwrap();
         assert!(
             loader
-                .prepare(&rig.workspace(), &Registry::default(), &Vec::new(), false)
+                .prepare(&rig.workspace(), &Registry::default(), None, false)
                 .is_err()
         );
     }
