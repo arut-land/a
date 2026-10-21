@@ -1014,37 +1014,49 @@ fn watchers_are_sent_the_session_list_as_it_changes() {
 
     let watcher = Outbox::new();
     daemon.watch_list(&watcher);
-    let seen = std::sync::Mutex::new(Vec::<Vec<SessionSummary>>::new());
-    let latest = |pick: &dyn Fn(&[SessionSummary]) -> bool| {
-        let mut seen = seen.lock().unwrap();
-        for frame in std::iter::from_fn(|| watcher.try_next()) {
-            if let Ok(Some(DaemonMsg::Sessions { sessions })) =
-                protocol::read_frame::<DaemonMsg>(&mut frame.as_bytes())
-            {
-                seen.push(sessions);
-            }
-        }
-        seen.last().is_some_and(|list| pick(list))
+    let decode = |frame: protocol::Frame| {
+        let Some(DaemonMsg::Sessions { sessions }) =
+            protocol::read_frame::<DaemonMsg>(&mut frame.as_bytes()).unwrap()
+        else {
+            panic!("expected a session list");
+        };
+        sessions
     };
-    assert!(
-        latest(&|list| list.is_empty()),
-        "the list as it is, at once"
-    );
+    let initial = decode(watcher.try_next().expect("the list as it is, at once"));
+    assert!(initial.is_empty());
+    let mut seen = vec![initial];
+    let mut until = |pick: &dyn Fn(&[SessionSummary]) -> bool| {
+        // Publishing wakes the outbox, after the supervisor's wake event;
+        // daemon notifications cannot certify that its frame was queued.
+        rt::block_on(rt::or(
+            async {
+                loop {
+                    let frame = watcher.next(&*daemon.shared.rt).await.unwrap();
+                    let sessions = decode(frame);
+                    let done = pick(&sessions);
+                    seen.push(sessions);
+                    if done {
+                        break;
+                    }
+                }
+            },
+            async {
+                rt::Reactor::AsyncIo.sleep(PATIENCE).await;
+                panic!("never received the expected session list");
+            },
+        ));
+    };
 
     let attachment = daemon.attach_to(&Target::New, || "/w".into()).unwrap();
-    daemon.wait("the new session listed", PATIENCE, || {
-        latest(&|list| list.len() == 1 && list[0].clients == 1)
-    });
+    until(&|list| list.len() == 1 && list[0].clients == 1);
     drop(attachment);
-    daemon.wait("its client gone", PATIENCE, || {
-        latest(&|list| list.len() == 1 && list[0].clients == 0)
-    });
-    // Only changes are sent.
-    let sent = seen.lock().unwrap().len();
-    while anything_within(&daemon, Duration::from_millis(100)) {}
-    latest(&|_| true);
-    assert_eq!(seen.lock().unwrap().len(), sent);
+    until(&|list| list.len() == 1 && list[0].clients == 0);
     settle(&daemon);
+    daemon.publish_list();
+    seen.extend(std::iter::from_fn(|| watcher.try_next()).map(decode));
+    assert!(seen.windows(2).all(|lists| lists[0] != lists[1]));
+    daemon.publish_list();
+    assert!(watcher.try_next().is_none(), "only changes are sent");
     std::fs::remove_dir_all(&root).unwrap();
 }
 
