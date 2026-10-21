@@ -1302,3 +1302,25 @@ fn side_usage_does_not_change_the_main_turn_counter() {
     spend(&mut tokens, &item);
     assert_eq!(tokens, Usage::default());
 }
+
+#[test]
+fn escape_and_ctrl_c_cancel_submitted_input_before_it_is_published() {
+    for viewport in [Viewport::Full, Viewport::Inline] {
+        for key in [Key::Esc, Key::Ctrl('c')] {
+            let (mut app, _) = app(viewport, &[]);
+            app.client.run(Cmd::Input("unpublished".into()));
+            assert!(!app.client.turn().running);
+            assert!(matches!(
+                press(&mut app, key),
+                Some(Effect::Cmd(Cmd::Interrupt))
+            ));
+            let out = app.client.run(Cmd::Interrupt);
+            assert!(
+                out.iter().any(|e| matches!(
+                    e,
+                    client::Effect::Io(Io::Send(ClientMsg::Interrupt { .. }))
+                ))
+            );
+        }
+    }
+}

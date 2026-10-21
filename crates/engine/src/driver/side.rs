@@ -1,9 +1,9 @@
 //! Side requests: admission, replay, bounded execution, and committed results.
 
 use super::{
-    Actor, Admitted, Arc, Body, BoxFuture, CallId, Cancel, Cx, Event, Json, Model, Msg, Opened,
-    Outcome, Own, Phase, Replied, Session, Ticket, contain, first, lock, oneshot, replied, reply,
-    unless,
+    Actor, Arc, Body, BoxFuture, CallId, Cancel, ContextOrigin, ContextRequest, Cx, Event, Json,
+    Model, Msg, Opened, Outcome, Own, PendingSide, Phase, Replied, Session, SideAdmitted, Ticket,
+    contain, first, lock, oneshot, replied, reply, unless,
 };
 
 pub(super) enum SideFact {
@@ -20,6 +20,42 @@ pub(super) enum SideFact {
 }
 
 impl Actor {
+    // Successful settlement revokes mutation authority, but a background
+    // observer may not have submitted its request yet. Interrupts revoke both.
+    pub(super) fn background_owner_succeeded(&self, origin: &ContextOrigin) -> bool {
+        if origin.fence != self.live.session.fence.load(super::Ordering::SeqCst) {
+            return false;
+        }
+        let mut succeeded = false;
+        for entry in self
+            .live
+            .frames
+            .entries()
+            .chain(
+                self.unsynced
+                    .iter()
+                    .flat_map(|(entries, _)| entries.iter().cloned()),
+            )
+            .filter(|entry| entry.seq > origin.call.0)
+        {
+            match entry.body {
+                Body::Interrupt { .. } => return false,
+                Body::ModelResult {
+                    call,
+                    outcome: Outcome::Done { .. },
+                    ..
+                }
+                | Body::ToolResult {
+                    call,
+                    outcome: Outcome::Done { .. },
+                    ..
+                } if call == origin.call => succeeded = true,
+                _ => {}
+            }
+        }
+        succeeded
+    }
+
     pub(super) fn side_fact(
         &mut self,
         side: CallId,
@@ -54,25 +90,35 @@ impl Actor {
 
     pub(super) fn open_side(
         &mut self,
-        of: CallId,
+        origin: ContextOrigin,
         model: String,
         side: ext::Side,
         reply: oneshot::Sender<Opened>,
     ) -> Option<Event> {
-        let previous = self.live.frames.entries().find_map(|e| match e.body {
-            Body::ModelCall {
-                r#for: Some(parent),
-                purpose: Some(ref name),
-                request: Some(ref intent),
-                ..
-            } if (side.has_session_key() || parent == of)
-                && name == &side.purpose
-                && side.matches_intent(intent) =>
-            {
-                Some(CallId(e.seq))
-            }
-            _ => None,
-        });
+        let of = origin.call;
+        let previous = self
+            .live
+            .frames
+            .entries()
+            .chain(
+                self.unsynced
+                    .iter()
+                    .flat_map(|(entries, _)| entries.iter().cloned()),
+            )
+            .find_map(|e| match e.body {
+                Body::ModelCall {
+                    r#for: Some(parent),
+                    purpose: Some(ref name),
+                    request: Some(ref intent),
+                    ..
+                } if (side.has_session_key() || parent == of)
+                    && name == &side.purpose
+                    && side.matches_intent(intent) =>
+                {
+                    Some(CallId(e.seq))
+                }
+                _ => None,
+            });
         if let Some(id) = previous {
             let cached = self.live.frames.entries().find_map(|e| match e.body {
                 Body::ModelResult {
@@ -117,7 +163,15 @@ impl Actor {
         self.tickets += 1;
         let ticket = Ticket(self.tickets);
         let background = side.is_background();
-        self.sides.insert(ticket, (reply, messages, limited));
+        self.sides.insert(
+            ticket,
+            PendingSide {
+                origin,
+                reply,
+                messages,
+                limited,
+            },
+        );
         Some(Event::Side(kernel::SideEvent::Open {
             of,
             purpose: side.purpose,
@@ -138,10 +192,17 @@ impl ext::Models for Own {
         Box::pin(async move {
             let session = self.0.upgrade().ok_or_else(llm::Error::incomplete)?;
             let (sent, answer) = oneshot::channel();
+            let origin = self.1.clone();
+            if !origin.current(&session)
+                && (!side.is_background()
+                    || origin.fence != session.fence.load(super::Ordering::SeqCst))
+            {
+                return Err(llm::Error::incomplete());
+            }
             let cx = cx.clone();
             let runtime = Arc::clone(&session.shared.rt);
             runtime.spawn(Box::pin(async move {
-                sent.send(side_call(&session, &cx, side).await);
+                sent.send(side_call(&session, &cx, origin, side).await);
             }));
             answer
                 .await
@@ -153,6 +214,7 @@ impl ext::Models for Own {
 async fn side_call(
     session: &Arc<Session>,
     cx: &Cx,
+    origin: ContextOrigin,
     side: ext::Side,
 ) -> Result<llm::Response, llm::Error> {
     let invalid = |e: String| llm::Error::new(llm::Kind::InvalidRequest, e);
@@ -175,14 +237,16 @@ async fn side_call(
         })
         .map_err(invalid);
     let (asking, opened) = oneshot::channel();
-    let _ = session.mail.send(Msg::Side {
-        of: cx.call,
-        model: model
-            .as_ref()
-            .map_or_else(|_| "unresolved".into(), Model::name),
-        side: side.clone(),
-        reply: asking,
-    });
+    origin.send(
+        session,
+        ContextRequest::Side {
+            model: model
+                .as_ref()
+                .map_or_else(|_| "unresolved".into(), Model::name),
+            side: side.clone(),
+            reply: asking,
+        },
+    );
     let opened = opened.await.ok_or_else(llm::Error::incomplete)?;
     let admitted = match opened {
         Opened::Cached { outcome, failure } => return side_answer(outcome, failure),
@@ -190,24 +254,32 @@ async fn side_call(
         Opened::Fresh(admitted) => admitted,
     };
     let id = admitted.id;
-    let cancel = session.cancel(id);
-    let work: BoxFuture<'_, Replied> =
-        Box::pin(run_side(session, cx, &side, admitted, &model, &cancel));
+    let cancel = admitted.cancel.clone();
+    let work: BoxFuture<'_, Replied> = Box::pin(run_side(
+        session,
+        cx,
+        &side,
+        admitted,
+        &model,
+        &cancel,
+        origin.fence,
+    ));
     let work = async {
-        let both = async { unless(&cancel, work).await };
-        unless(&cx.cancel, both)
+        unless(&cancel, work)
             .await
-            .flatten()
             .unwrap_or(Replied::Interrupted(None))
     };
     let result = first(work, session.shared.rt.sleep(side.budget.timeout)).await;
     let (outcome, answer) = sided(result);
     let failure = answer.as_ref().err().and_then(|e| Json::encode(e).ok());
     let (done, committed) = oneshot::channel();
-    let _ = session.mail.send(Msg::SideFact {
-        side: id,
-        fact: SideFact::Done { outcome, failure },
-        done,
+    let _ = session.mail.send(Msg::Fenced {
+        fence: origin.fence,
+        msg: Box::new(Msg::SideFact {
+            side: id,
+            fact: SideFact::Done { outcome, failure },
+            done,
+        }),
     });
     match committed.await {
         Some(Ok(())) => answer,
@@ -219,14 +291,16 @@ async fn run_side(
     session: &Arc<Session>,
     cx: &Cx,
     side: &ext::Side,
-    admitted: Admitted,
+    admitted: SideAdmitted,
     model: &Result<Model, llm::Error>,
     cancel: &Cancel,
+    fence: u64,
 ) -> Replied {
-    let Admitted {
+    let SideAdmitted {
         id,
         messages,
         limited,
+        ..
     } = admitted;
     let start = session.shared.rt.now();
 
@@ -292,15 +366,18 @@ async fn run_side(
             return result;
         };
         let (done, committed) = oneshot::channel();
-        let _ = session.mail.send(Msg::SideFact {
-            side: id,
-            fact: SideFact::Retry {
-                by: by.to_owned(),
-                attempt,
-                failure,
-                after_ms: u64::try_from(after.as_millis()).unwrap_or(u64::MAX),
-            },
-            done,
+        let _ = session.mail.send(Msg::Fenced {
+            fence,
+            msg: Box::new(Msg::SideFact {
+                side: id,
+                fact: SideFact::Retry {
+                    by: by.to_owned(),
+                    attempt,
+                    failure,
+                    after_ms: u64::try_from(after.as_millis()).unwrap_or(u64::MAX),
+                },
+                done,
+            }),
         });
         if !matches!(committed.await, Some(Ok(()))) {
             return Replied::Interrupted(None);

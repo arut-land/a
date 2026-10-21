@@ -219,15 +219,22 @@ impl ManualSession {
 
     fn change(&self, data: Json) -> oneshot::Receiver<()> {
         let (done, waited) = oneshot::channel();
-        self.session.send(Msg::Note {
+        ContextOrigin {
+            fence: self.session.session.fence.load(Ordering::SeqCst),
             call: self.call,
-            note: Note::State {
-                ext: "test".into(),
-                state: "value".into(),
-                data,
+            cancel: self.session.session.cancel(self.call),
+        }
+        .send(
+            &self.session.session,
+            ContextRequest::Note {
+                note: Note::State {
+                    ext: "test".into(),
+                    state: "value".into(),
+                    data,
+                },
+                done: Some(done),
             },
-            done: Some(done),
-        });
+        );
         waited
     }
 
@@ -318,6 +325,55 @@ fn poll_actor(actor: &mut rt::BoxFuture<'static, ()>) {
     assert!(actor.as_mut().poll(&mut cx).is_pending());
 }
 
+#[test]
+fn a_barrier_without_its_flush_neither_publishes_nor_starts_an_external_effect() {
+    let faulty = Arc::new(Faulty::new(Arc::new(Memory::default())));
+    let (started, starts) = channel::unbounded();
+    let fixture = Fixture::on(
+        Arc::clone(&faulty) as _,
+        ext_fixtures::ECHO,
+        Registry::default()
+            .with(&ControlledSleep(Arc::new(started)))
+            .unwrap(),
+        openai(&Script::new(&[])),
+    );
+    let session = fixture.create();
+    settle(&session);
+    let before = log_of(&session);
+    faulty.cut_before_next_flush();
+    assert!(session.submit("sleep 0").is_err());
+    session.halt();
+    assert_eq!(faulty.entries(session.id).unwrap(), before);
+    assert_eq!(
+        log_of(&session),
+        before,
+        "a failed promise cannot publish a seq"
+    );
+    assert!(starts.try_recv().is_none());
+}
+
+#[test]
+fn cached_entries_are_never_replayed_before_their_flush() {
+    let faulty = Arc::new(Faulty::new(Arc::new(Memory::default())));
+    let fixture = Fixture::on(
+        Arc::clone(&faulty) as _,
+        ext_fixtures::ECHO,
+        Registry::default(),
+        openai(&Script::new(&[])),
+    );
+    let session = fixture.create();
+    session.submit("hello").unwrap();
+    settle(&session);
+    session.halt();
+    let header = Header {
+        id: session.id,
+        workspace: session.workspace.clone(),
+        parent: None,
+    };
+    faulty.cut_before_next_flush();
+    assert!(Live::start(&header, &fixture.0, Open::Load, Owner::None).is_err());
+}
+
 #[derive(Default, serde::Serialize, serde::Deserialize)]
 struct Updates(u64);
 impl ext::Fold for Updates {
@@ -341,10 +397,17 @@ fn pending_fold_changes_survive_reload_exactly_once() {
     let make = || Registry::default().with(&CountingState).unwrap();
     let mut harness = ManualSession::with_registry(make());
     let registry = harness.session.session.shared.registry.get();
-    let cx = harness
-        .session
-        .session
-        .cx(harness.call, &registry, Cancel::default());
+    let cx = harness.session.session.cx(
+        harness
+            .session
+            .session
+            .origin(
+                harness.call,
+                harness.session.session.fence.load(Ordering::SeqCst),
+            )
+            .unwrap(),
+        &registry,
+    );
     let _ack = harness.note();
     harness.poll();
     assert_eq!(cx.state(|s: &Updates| s.0), 1);
@@ -913,15 +976,22 @@ fn final_sync_publishes_activity_after_its_entries() {
     }
     assert!(view.activity.is_some());
     let before = view.seq;
-    session.send(Msg::Note {
+    ContextOrigin {
+        fence: session.session.fence.load(Ordering::SeqCst),
         call: CallId::new(call.get()).unwrap(),
-        note: Note::State {
-            ext: "test".into(),
-            state: "value".into(),
-            data: Json::default(),
+        cancel: session.session.cancel(CallId::new(call.get()).unwrap()),
+    }
+    .send(
+        &session.session,
+        ContextRequest::Note {
+            note: Note::State {
+                ext: "test".into(),
+                state: "value".into(),
+                data: Json::default(),
+            },
+            done: None,
         },
-        done: None,
-    });
+    );
     poll_actor(&mut actor);
     assert_eq!(session.frames.seq(), before, "note is deferred");
     session.send(Msg::Stop);
@@ -969,6 +1039,16 @@ fn attaching_behind_a_deferred_write_gets_activity_after_sync_or_recovery() {
         }
         h.session.send(Msg::Sync);
         h.poll();
+        if failure.is_some() {
+            let frame = outbox.try_next().expect("failed attach is answered");
+            assert!(matches!(
+                protocol::read_frame::<DaemonMsg>(&mut frame.as_bytes()).unwrap(),
+                Some(DaemonMsg::Error { .. })
+            ));
+            let (done, _) = oneshot::channel();
+            h.session.send(Msg::Attach(outbox.clone(), since, done));
+            h.poll();
+        }
         while let Some(frame) = outbox.try_next() {
             view.fold(
                 &protocol::read_frame::<DaemonMsg>(&mut frame.as_bytes())

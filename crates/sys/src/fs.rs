@@ -5,22 +5,98 @@ use std::fs::{self, File, OpenOptions};
 use std::io;
 use std::path::Path;
 
-/// Makes what was written to `file` durable, in write order. On Apple this
-/// is a write barrier (`F_BARRIERFSYNC`, ~0.25 ms) rather than the cache
-/// flush `sync_data` does there (`F_FULLFSYNC`, ~2.6 ms): writes still land
-/// in order, but the newest may be lost on power loss. A filesystem without
-/// barriers gets the full sync; Windows gets `FlushFileBuffers`.
+/// Orders earlier writes before later commits. Apple keeps them in the
+/// drive cache until a cache flush covers the promise made to a client or
+/// an external effect; other platforms already flush here.
 pub fn sync_data(file: &File) -> io::Result<()> {
     #[cfg(target_vendor = "apple")]
     {
         use std::os::fd::AsRawFd;
-        // SAFETY: `fcntl` on a descriptor `file` owns and keeps open; the
-        // command takes no argument.
+        // SAFETY: `file` keeps the descriptor open; this command takes no argument.
         if unsafe { libc::fcntl(file.as_raw_fd(), libc::F_BARRIERFSYNC) } != -1 {
             return Ok(());
         }
     }
     file.sync_data()
+}
+
+/// Whether an ordered write still needs a separate drive-cache flush.
+pub const SEPARATE_CACHE_FLUSH: bool = cfg!(target_vendor = "apple");
+
+/// A shared cache flush can cover only files on the store's device.
+pub struct FlushDomain {
+    #[cfg(target_vendor = "apple")]
+    device: u64,
+}
+
+impl FlushDomain {
+    pub fn of(dir: &Path) -> io::Result<Self> {
+        #[cfg(target_vendor = "apple")]
+        {
+            use std::os::unix::fs::MetadataExt;
+            Ok(Self {
+                device: fs::metadata(dir)?.dev(),
+            })
+        }
+        #[cfg(not(target_vendor = "apple"))]
+        {
+            let _ = dir;
+            Ok(Self {})
+        }
+    }
+
+    pub fn check(&self, file: &File) -> io::Result<()> {
+        #[cfg(target_vendor = "apple")]
+        {
+            use std::os::unix::fs::MetadataExt;
+            if file.metadata()?.dev() != self.device {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    "log is outside the store's flush device",
+                ));
+            }
+        }
+        #[cfg(not(target_vendor = "apple"))]
+        let _ = file;
+        Ok(())
+    }
+}
+
+/// Flushes the cache containing earlier ordered writes. Other platforms
+/// have already flushed it with `sync_data`.
+pub fn flush_cache(file: &File) -> io::Result<()> {
+    #[cfg(target_vendor = "apple")]
+    {
+        use std::os::fd::AsRawFd;
+        // SAFETY: `file` keeps the descriptor open; this command takes no argument.
+        if unsafe { libc::fcntl(file.as_raw_fd(), libc::F_FULLFSYNC) } == -1 {
+            return Err(io::Error::last_os_error());
+        }
+    }
+    #[cfg(not(target_vendor = "apple"))]
+    let _ = file;
+    Ok(())
+}
+
+/// Orders a deferred commit without flushing the cache. On platforms
+/// without a separate barrier it rides on the next durable commit.
+pub fn order_data(file: &File) -> io::Result<()> {
+    #[cfg(target_vendor = "apple")]
+    return sync_data(file);
+    #[cfg(not(target_vendor = "apple"))]
+    {
+        let _ = file;
+        Ok(())
+    }
+}
+
+/// Orders a newly created log's directory before its shared cache flush.
+/// `File::sync_all` would issue its own full flush on Apple.
+pub fn order_dir(dir: &Path) -> io::Result<()> {
+    #[cfg(target_vendor = "apple")]
+    return sync_data(&File::open(dir)?);
+    #[cfg(not(target_vendor = "apple"))]
+    sync_dir(dir)
 }
 
 /// Makes the entries of `dir` durable: a file created in it survives a
@@ -197,6 +273,19 @@ mod tests {
     use std::os::unix::fs::PermissionsExt;
 
     use super::*;
+
+    #[cfg(target_vendor = "apple")]
+    #[test]
+    fn a_file_on_another_device_is_never_admitted_to_a_flush_domain() {
+        let dir = std::env::temp_dir();
+        let file = File::open(&dir).unwrap();
+        let domain = FlushDomain::of(&dir).unwrap();
+        domain.check(&file).unwrap();
+        let other = FlushDomain {
+            device: domain.device ^ 1,
+        };
+        assert!(other.check(&file).is_err());
+    }
 
     #[test]
     fn private_files_and_dirs_are_the_owners_alone() {

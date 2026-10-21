@@ -44,7 +44,9 @@ The driver admits a request through the existing side-call kernel event.
 `ModelCall` records the owner, purpose, resolved model, and an opaque
 `request` payload encoded by the SDK: extension identity, role, context
 selection, prompt, frozen transcript, lifecycle, key scope, and budget.
-The intent crosses a barrier before the provider is polled.
+The intent crosses a durable admission barrier before the provider is
+polled, including when safe parent work starts before a shared flush.
+Duplicate consumers also share intents still awaiting that flush.
 
 `ModelResult` records the complete response and usage, or an outcome plus
 an optional structured `llm::Error` in `failure`. The LLM crate owns error
@@ -88,7 +90,8 @@ This is not a currency or aggregate-token quota.
 A side call has its own cancellation registration before execution starts.
 Its owning call's cancellation stops awaited and background work; an
 explicit interrupt also cancels open side calls. A successful owner may
-finish before background work. That work remains registered with the
+finish before background work is admitted. Admission still checks its
+original generation and rejects work after an interrupt. That work remains registered with the
 session, so shutdown cancels it even after its owner is forgotten. Dropping
 a consumer future does not abandon an admitted request: the engine task
 still records its terminal result. Provider futures run through the same

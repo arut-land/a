@@ -50,7 +50,8 @@ pub use flag::{Cancel, Flag};
 pub use llm::Json;
 pub use r#loop::{Defaults, LOOP, Loop, LoopPoints, Resume, StepLimit};
 pub use point::{
-    Answer, Asked, Chained, Gate, Gated, Gating, Later, PointCx, Reaction, Recover, Rewrite,
+    Answer, Asked, Chained, Gate, Gated, Gating, Later, PointCx, Reaction, Recover, Requirement,
+    Rewrite,
 };
 pub use schema::Schema;
 pub use service::{

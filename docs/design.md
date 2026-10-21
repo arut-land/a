@@ -88,18 +88,25 @@ encoding every entry for every client.
 
 ### Durability
 
-The kernel emits `Commit(Barrier | Lazy)` after a step's appends. An external
-effect or client acknowledgement waits for its barrier. `[daemon] durability`
-selects `step` (default: barriers for decisions and outcomes) or `effects`
-(barriers before external effects and at turn end). Notes alone may be lazy.
-The driver batches mailbox bursts into one commit and syncs lazy writes
-before publishing those entries to followers. Fault-injecting store tests
-check that failed syncs do not expose the failed prefix.
+The kernel emits `Commit(Barrier | Lazy)` after a step's appends and typed
+`Admission` requirements before work. `[daemon] durability` selects `step`
+(default: barriers for decisions and outcomes) or `effects` (barriers before
+external effects and at turn end). Notes alone may be lazy. The driver
+batches mailbox bursts into one commit.
 
-These guarantees use `sys::sync_data`. On Apple platforms it uses a write
-barrier, preserving write order while allowing the newest writes to be lost
-on power loss; it does not promise a hardware-cache flush. The measurement
-and tradeoff are recorded in [build tuning](perf/build-tuning.md).
+On Apple platforms each commit uses a write barrier, then a daemon-wide
+flush epoch performs `F_FULLFSYNC` at promise points. Replay-safe work may
+use the ordered prefix while publication, acknowledgements and unsafe work
+wait for the durable prefix. Other platforms retain their existing sync
+path. Fault-injecting store tests cover power cuts between ordering and
+flushing, failed epochs, recovery and replay-safe admission. The design and
+measurements are recorded in [session measurements](perf/sessions.md).
+
+Kernel activity is certified after a complete burst. Activity at N requires
+both the ledger and visible frames to end at N, with `durable_seq >= N`;
+`send_after(N, ...)` orders it after its entries. Live publication, snapshot
+and suffix attach, recovery and the final drain share that condition.
+Clients end turns on this certification rather than an entry prefix.
 
 ### Snapshots and recovery
 
@@ -255,8 +262,8 @@ for the distributed design. Each needs its own contract and measurements.
 - Does fork copy a prefix or reference it, and what isolates simultaneous
   tool effects in one workspace? A read-only source is not a filesystem
   checkpoint.
-- Should a stronger power-loss guarantee be selectable, given the measured
-  Apple write-barrier tradeoff?
+- How much can shared flush epochs amortize the stronger Apple power-loss
+  guarantee under realistic concurrent workloads on a quiet machine?
 - When should indexed replay verify all skipped lines? Catalog rebuilds and
   failed-commit recovery still have whole-log paths worth measuring.
 - What are daemon RSS and cancellation behavior under real provider/tool

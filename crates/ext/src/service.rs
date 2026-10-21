@@ -176,7 +176,7 @@ pub struct Background(Side);
 
 impl Background {
     pub fn start(self, cx: Cx) -> crate::Reaction {
-        crate::Reaction::later(async move {
+        crate::Reaction::later(crate::Requirement::Ordered, async move {
             if let Some(models) = cx.models() {
                 // The service owns and commits both success and failure.
                 let _ = models.call(&cx, self.0).await;

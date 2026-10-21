@@ -381,8 +381,7 @@ impl Session {
 
     /// Sends the user's input as it is.
     pub async fn send(&self, text: String) -> Result<(), ClientError> {
-        self.intend(move |client| Ok(client.offer()?.input(text)))
-            .await
+        self.intend(move |client| client.offer()?.input(text)).await
     }
 
     /// A line the user typed, parsed as every client parses it: what it

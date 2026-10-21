@@ -272,7 +272,7 @@ impl Tool for Probe {
             [llm::Message::user("Say hi.")].into_iter().collect(),
         );
         if args.args == "background" {
-            let work = side.background().start(cx.clone()).0.unwrap();
+            let work = side.background().start(cx.clone()).work.unwrap();
             cx.service::<dyn rt::Runtime>().unwrap().spawn(work.0);
             return Ok("started".into());
         }
@@ -609,7 +609,7 @@ impl ext::SideProvider for FailResultCommit {
     ) -> BoxFuture<'a, Result<llm::Response, llm::Error>> {
         Box::pin(async move {
             let reply = ext::SideProvider::reply(&ext_fixtures::Fixtures, side, messages).await;
-            self.0.fail_next_barrier();
+            self.0.fail_next_sync(crate::store::SyncFailure::Discard);
             reply
         })
     }
