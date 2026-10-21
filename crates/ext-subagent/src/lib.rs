@@ -52,7 +52,19 @@ impl Tool for Task {
         let sessions = cx
             .service::<dyn Sessions>()
             .ok_or("this engine runs no child sessions")?;
-        let outcome = sessions.child(cx, input.prompt.clone()).await;
+        let outcome = sessions
+            .spawn(
+                cx,
+                ext::Spawn::new::<Subagent>(
+                    "task",
+                    input.prompt.clone(),
+                    sessions.runner(),
+                    ext::DepthBudget::new(8),
+                )
+                .awaited(),
+            )
+            .await
+            .map_err(|e| format!("{e:?}"))?;
         Ok(ext::child_result(&outcome))
     }
 
