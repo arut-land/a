@@ -1,6 +1,6 @@
 //! The session catalog: what the daemon lists, and which sessions it
 //! recovers at once, without opening a log. It is derived: the daemon, the
-//! one writer, appends changes without syncing. A durable dirty marker
+//! one writer, coalesces revisions outside session commits. A durable dirty marker
 //! precedes use; only an orderly shutdown syncs the complete catalog and
 //! removes the marker. An unclean or unreadable catalog is rebuilt from
 //! the logs, which are the truth.
@@ -9,8 +9,8 @@ use std::collections::BTreeMap;
 use std::fs::{self, File, OpenOptions};
 use std::io::{self, BufRead, BufReader, Write};
 use std::path::{Path, PathBuf};
-use std::sync::Mutex;
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Mutex, OnceLock};
 
 use protocol::ledger::Ledger;
 use protocol::{Activity, ReadOnly, SessionId, SessionSummary};
@@ -62,21 +62,28 @@ impl Record {
 }
 
 pub struct Catalog {
-    /// `None` keeps it in memory only.
-    path: Option<PathBuf>,
-    state: Mutex<State>,
+    writer: Arc<CatalogWriter>,
+    state: Arc<Mutex<State>>,
     uncertain: AtomicBool,
     /// Each change of a session's busy mark, in order.
     #[cfg(test)]
     pub(crate) marks: Mutex<Vec<bool>>,
 }
 
+struct CatalogWriter {
+    /// `None` keeps it in memory only.
+    path: Option<PathBuf>,
+    gate: Mutex<()>,
+    runtime: OnceLock<Arc<dyn rt::Runtime>>,
+    scheduled: AtomicBool,
+    closed: AtomicBool,
+}
+
 #[derive(Default)]
 struct State {
     records: BTreeMap<u128, Record>,
-    /// Lines in the file, old ones included.
+    pending: BTreeMap<u128, Record>,
     lines: usize,
-    file: Option<File>,
 }
 
 impl Catalog {
@@ -121,20 +128,18 @@ impl Catalog {
                 .map(|r| r.header)
                 .collect::<Vec<_>>(),
         )?;
-        let mut state = lock(&catalog.state);
-        if rebuilt || state.bloated() {
-            catalog.compact(&mut state);
-        } else if let Some(path) = &catalog.path {
-            state.file = Some(OpenOptions::new().append(true).open(path)?);
+        if rebuilt && let Some(path) = &catalog.writer.path {
+            persist(path, &lock(&catalog.state).records, true)?;
         }
-        drop(state);
         Ok(catalog)
     }
 
     /// Called only once all session writers have stopped. Rewriting avoids
     /// trusting an earlier best-effort append that may have failed.
     pub fn clean(&self) -> io::Result<()> {
-        let Some(path) = &self.path else {
+        self.writer.closed.store(true, Ordering::Release);
+        let _writing = lock(&self.writer.gate);
+        let Some(path) = &self.writer.path else {
             return Ok(());
         };
         if self.uncertain.load(Ordering::Acquire) {
@@ -142,16 +147,21 @@ impl Catalog {
                 "an interrupted import requires catalog rebuild",
             ));
         }
-        let mut state = lock(&self.state);
-        state.file = Some(rewrite(path, &state)?);
-        state.lines = state.records.len();
+        let records = lock(&self.state).records.clone();
+        persist(path, &records, true)?;
         sys::fs::remove_durable(&path.with_extension("dirty"))
     }
 
     fn with(path: Option<PathBuf>, state: State) -> Self {
         Self {
-            path,
-            state: Mutex::new(state),
+            writer: Arc::new(CatalogWriter {
+                path,
+                gate: Mutex::new(()),
+                runtime: OnceLock::new(),
+                scheduled: AtomicBool::new(false),
+                closed: AtomicBool::new(false),
+            }),
+            state: Arc::new(Mutex::new(state)),
             uncertain: AtomicBool::new(false),
             #[cfg(test)]
             marks: Mutex::default(),
@@ -198,8 +208,11 @@ impl Catalog {
         Ok(())
     }
 
-    /// Notes `record`, unless it is what the catalog says already. It
-    /// blocks on a write, so it runs where that may.
+    pub fn start(&self, runtime: Arc<dyn rt::Runtime>) {
+        let _ = self.writer.runtime.set(runtime);
+    }
+
+    /// Committers publish only memory; the writer coalesces revisions.
     pub fn record(&self, record: Record) {
         let mut state = lock(&self.state);
         let id = record.header.id.0.as_u128();
@@ -214,39 +227,53 @@ impl Catalog {
         if state.records.get(&id) == Some(&record) {
             return;
         }
-        let line = line(&record);
+        if self.writer.runtime.get().is_some() {
+            state.pending.insert(id, record.clone());
+        }
         state.records.insert(id, record);
-        state.lines += 1;
-        if state.bloated() {
-            return self.compact(&mut state);
+        drop(state);
+        let Some(runtime) = self.writer.runtime.get() else {
+            return;
+        };
+        if self.writer.scheduled.swap(true, Ordering::AcqRel) {
+            return;
         }
-        if let (Some(file), Ok(line)) = (&mut state.file, line)
-            && let Err(e) = file.write_all(&line)
-        {
-            catalog_fault(&e);
-            eprintln!("the session catalog: {e}");
-        }
-    }
-
-    /// Rewrites the file with one line a session, in one step: a crash
-    /// leaves the old one or the new.
-    fn compact(&self, state: &mut State) {
-        let Some(path) = &self.path else { return };
-        let written = rewrite(path, state);
-        match written {
-            Ok(file) => {
-                state.file = Some(file);
-                state.lines = state.records.len();
-            }
-            Err(e) => catalog_fault(&e),
-        }
-    }
-}
-
-impl State {
-    /// Whether most of the file's lines are old ones.
-    fn bloated(&self) -> bool {
-        self.lines > 2 * self.records.len() + 64
+        let writer = Arc::clone(&self.writer);
+        let state = Arc::clone(&self.state);
+        let rt = Arc::clone(runtime);
+        runtime.spawn(Box::pin(async move {
+            rt::unblock(&*rt, move || {
+                let _writing = lock(&writer.gate);
+                loop {
+                    if writer.closed.load(Ordering::Acquire) {
+                        break;
+                    }
+                    let (records, compact) = {
+                        let mut state = lock(&state);
+                        if state.pending.is_empty() {
+                            writer.scheduled.store(false, Ordering::Release);
+                            break;
+                        }
+                        let pending = std::mem::take(&mut state.pending);
+                        state.lines += pending.len();
+                        let compact = state.lines > 2 * state.records.len() + 64;
+                        let records = if compact {
+                            state.lines = state.records.len();
+                            state.records.clone()
+                        } else {
+                            pending
+                        };
+                        (records, compact)
+                    };
+                    if let Some(path) = &writer.path
+                        && let Err(e) = persist(path, &records, compact)
+                    {
+                        catalog_fault(&e);
+                    }
+                }
+            })
+            .await;
+        }));
     }
 }
 
@@ -270,44 +297,71 @@ fn read(path: &Path) -> io::Result<State> {
 /// Every log read through: a session is busy if it was left with
 /// anything open or waiting.
 fn rebuild(store: &dyn LogStore) -> io::Result<State> {
-    let mut state = State::default();
-    for header in store.headers()? {
-        let mut ledger = Ledger::default();
-        let loaded = store.load(header.id, &mut |_| false, &mut |e| ledger.apply(&e));
-        let (entries, read_only) = match loaded {
-            Ok(loaded) => (loaded.seq, loaded.writer.read_only()),
-            Err(e) => {
-                ext_logging::emit(ext_logging::Fact::Fault {
-                    session: Some(header.id),
-                    operation: ext_logging::Operation::Reload,
-                    kind: ext_logging::Fault(e.kind()),
-                });
-                eprintln!("session {}: cataloguing: {e}", header.id.short());
-                continue;
-            }
-        };
-        let activity = ledger.activity();
-        let record = Record {
-            busy: activity != Activity::Idle && read_only.is_none(),
-            entries,
-            activity,
-            read_only,
-            header,
-        };
-        state.records.insert(record.header.id.0.as_u128(), record);
-    }
-    Ok(state)
+    let headers = store.headers()?;
+    let workers = headers.len().min(4);
+    let headers = Mutex::new(headers.into_iter());
+    let records = Mutex::new(BTreeMap::new());
+    std::thread::scope(|scope| {
+        for _ in 0..workers {
+            scope.spawn(|| {
+                loop {
+                    let Some(header) = lock(&headers).next() else {
+                        break;
+                    };
+                    let mut ledger = Ledger::default();
+                    let loaded =
+                        match store.load(header.id, &mut |_| false, &mut |e| ledger.apply(&e)) {
+                            Ok(loaded) => loaded,
+                            Err(e) => {
+                                ext_logging::emit(ext_logging::Fact::Fault {
+                                    session: Some(header.id),
+                                    operation: ext_logging::Operation::Reload,
+                                    kind: ext_logging::Fault(e.kind()),
+                                });
+                                continue;
+                            }
+                        };
+                    let activity = ledger.activity();
+                    let read_only = loaded.writer.read_only();
+                    lock(&records).insert(
+                        header.id.0.as_u128(),
+                        Record {
+                            busy: activity != Activity::Idle && read_only.is_none(),
+                            entries: loaded.seq,
+                            activity,
+                            read_only,
+                            header,
+                        },
+                    );
+                }
+            });
+        }
+    });
+    let records = records
+        .into_inner()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    Ok(State {
+        lines: records.len(),
+        records,
+        ..State::default()
+    })
 }
 
-fn rewrite(path: &Path, state: &State) -> io::Result<File> {
+fn persist(path: &Path, records: &BTreeMap<u128, Record>, compact: bool) -> io::Result<()> {
     let new = path.with_extension("new");
-    let mut file = File::create(&new)?;
-    for record in state.records.values() {
+    let mut file = if compact {
+        File::create(&new)?
+    } else {
+        OpenOptions::new().append(true).open(path)?
+    };
+    for record in records.values() {
         file.write_all(&line(record)?)?;
     }
-    file.sync_all()?;
-    sys::fs::publish(&new, path)?;
-    OpenOptions::new().append(true).open(path)
+    if compact {
+        file.sync_all()?;
+        sys::fs::publish(&new, path)?;
+    }
+    Ok(())
 }
 
 fn catalog_fault(error: &io::Error) {
@@ -316,4 +370,62 @@ fn catalog_fault(error: &io::Error) {
         operation: ext_logging::Operation::Catalog,
         kind: ext_logging::Fault(error.kind()),
     });
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::store::Memory;
+
+    #[test]
+    fn catalog_compaction_does_not_hold_session_commits() {
+        let dir = std::env::temp_dir().join(format!("a-catalog-{}", SessionId::new()));
+        fs::create_dir(&dir).unwrap();
+        let store = Memory::default();
+        let catalog = Catalog::open(dir.join("catalog"), &store).unwrap();
+        let runtime = Arc::new(rt::Threads::new(2));
+        catalog.start(runtime.clone());
+        let header = Header {
+            id: SessionId::new(),
+            workspace: "/w".into(),
+            parent: None,
+        };
+        let mut loaded = store.create(&header).unwrap();
+        lock(&catalog.state).lines = 100;
+        let writing = lock(&catalog.writer.gate);
+        std::thread::scope(|scope| {
+            let (sent, done) = std::sync::mpsc::channel();
+            let catalog = &catalog;
+            scope.spawn(move || {
+                for entries in 0..128 {
+                    let mut record = Record::new(header.clone());
+                    record.entries = entries;
+                    catalog.record(record);
+                    loaded
+                        .append(protocol::Body::Assistant {
+                            text: "committed".into(),
+                        })
+                        .unwrap();
+                }
+                sent.send(()).unwrap();
+            });
+            let committed = done.recv_timeout(std::time::Duration::from_secs(5));
+            drop(writing);
+            committed.unwrap();
+        });
+        catalog.clean().unwrap();
+        runtime.shutdown();
+        assert_eq!(
+            read(&dir.join("catalog"))
+                .unwrap()
+                .records
+                .values()
+                .next()
+                .unwrap()
+                .entries,
+            127
+        );
+        assert!(!dir.join("catalog.dirty").exists());
+        fs::remove_dir_all(dir).unwrap();
+    }
 }

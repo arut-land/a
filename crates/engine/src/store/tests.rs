@@ -1080,7 +1080,7 @@ fn imported_history_does_not_need_its_parents_file_or_derived_directory() {
 }
 
 #[test]
-fn every_failed_import_is_absent_or_discovered_after_an_orderly_shutdown() {
+fn uncertain_import_never_leaves_a_clean_catalog() {
     use crate::catalog::Catalog;
     for step in [
         ImportStep::Write,

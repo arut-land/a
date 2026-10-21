@@ -8,6 +8,7 @@ use super::{
 
 #[derive(Default)]
 pub(super) struct Journal {
+    pub(super) index: crate::store::index::Index,
     /// `None` only while a commit has it on a blocking thread.
     pub(super) writer: Option<Writer>,
     pub(super) fold_snapshot: Option<Snapshot>,
@@ -43,6 +44,39 @@ impl Journal {
 }
 
 impl Actor {
+    pub(super) async fn indexed(&mut self) -> io::Result<()> {
+        let mut index = std::mem::take(&mut self.journal.index);
+        let frames = Arc::clone(&self.live.frames);
+        let fence = self.live.session.fence.load(Ordering::SeqCst);
+        let (mut index, result) = rt::unblock(&*self.live.session.shared.rt, move || {
+            let result = index.update(&frames, fence);
+            (index, result)
+        })
+        .await;
+        if result.is_ok() {
+            for entry in self.pending_entries() {
+                index.apply(&entry);
+            }
+        }
+        self.journal.index = index;
+        result
+    }
+
+    pub(super) async fn indexed_entry(&mut self, seq: protocol::Seq) -> io::Result<Entry> {
+        if let Some(entry) = self.pending_entries().find(|entry| entry.seq == seq) {
+            return Ok(entry);
+        }
+        let mut index = std::mem::take(&mut self.journal.index);
+        let frames = Arc::clone(&self.live.frames);
+        let (index, result) = rt::unblock(&*self.live.session.shared.rt, move || {
+            let result = index.entry(&frames, seq);
+            (index, result)
+        })
+        .await;
+        self.journal.index = index;
+        result
+    }
+
     pub(super) fn pending_entries(&self) -> impl Iterator<Item = Entry> + '_ {
         self.journal
             .unsynced

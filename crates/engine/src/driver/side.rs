@@ -26,31 +26,7 @@ impl Actor {
         if origin.fence != self.live.session.fence.load(super::Ordering::SeqCst) {
             return false;
         }
-        let Ok(entries) = self.live.entries().await else {
-            return false;
-        };
-        let mut succeeded = false;
-        for entry in entries
-            .into_iter()
-            .chain(self.pending_entries())
-            .filter(|entry| entry.seq > origin.id.0)
-        {
-            match entry.body {
-                Body::Interrupt { .. } => return false,
-                Body::ModelResult {
-                    call,
-                    outcome: Outcome::Done { .. },
-                    ..
-                }
-                | Body::ToolResult {
-                    call,
-                    outcome: Outcome::Done { .. },
-                    ..
-                } if call == origin.id => succeeded = true,
-                _ => {}
-            }
-        }
-        succeeded
+        self.indexed().await.is_ok() && self.journal.index.succeeded(origin.id)
     }
 
     pub(super) async fn admit_side(&mut self, ticket: Ticket, side: Option<CallId>) {
@@ -143,35 +119,18 @@ impl Actor {
             reply.send(Opened::Closed);
             return None;
         }
-        let entries = self.live.entries().await.ok()?;
-        let previous = entries
-            .iter()
-            .cloned()
-            .chain(self.pending_entries())
-            .find_map(|e| match e.body {
-                Body::ModelCall {
-                    r#for: Some(parent),
-                    purpose: Some(ref name),
-                    request: Some(ref intent),
-                    ..
-                } if (side.has_session_key() || parent == of)
-                    && name == &side.purpose
-                    && side.matches_intent(intent) =>
-                {
-                    Some(CallId(e.seq))
+        self.indexed().await.ok()?;
+        if let Some(id) = self.journal.index.side(of, &side) {
+            let cached = if let Some(seq) = self.journal.index.result(id, self.live.frames.seq()) {
+                match self.indexed_entry(seq).await.ok()?.body {
+                    Body::ModelResult {
+                        outcome, failure, ..
+                    } => Some(Opened::Cached { outcome, failure }),
+                    _ => None,
                 }
-                _ => None,
-            });
-        if let Some(id) = previous {
-            let cached = entries.into_iter().find_map(|e| match e.body {
-                Body::ModelResult {
-                    call,
-                    outcome,
-                    failure,
-                    ..
-                } if call == id => Some(Opened::Cached { outcome, failure }),
-                _ => None,
-            });
+            } else {
+                None
+            };
             if let Some(cached) = cached {
                 reply.send(cached);
             } else if let Some(waiters) = self.side_waiters.get_mut(&id) {

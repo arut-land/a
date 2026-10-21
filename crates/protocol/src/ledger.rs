@@ -1,6 +1,6 @@
 //! Execution state recovered from the durable session log.
 
-use std::collections::VecDeque;
+use std::collections::{BTreeMap, BTreeSet, VecDeque};
 
 use serde::{Deserialize, Serialize};
 
@@ -13,7 +13,8 @@ use crate::{
 pub struct Ledger {
     /// The seq of the last entry folded.
     seq: u64,
-    received: Vec<(Seq, crate::EnvelopeId)>,
+    received: BTreeSet<Seq>,
+    identities: BTreeMap<String, BTreeSet<(u128, u64)>>,
     outbox: Vec<crate::Envelope>,
     acknowledgements: Vec<(crate::EnvelopeId, Option<crate::InboxRefusal>)>,
     /// Model and tool calls with an intent and no outcome.
@@ -24,7 +25,7 @@ pub struct Ledger {
     armed: Keyed<Seq, SessionId>,
     /// Every child linked, in order, and the children ever watched.
     links: Vec<Link>,
-    watched: Vec<SessionId>,
+    watched: BTreeSet<u128>,
     /// Background process groups started, with the boot they ran in.
     background: Vec<(u32, String)>,
     env: Option<Environment>,
@@ -208,7 +209,9 @@ impl Ledger {
         self.seq = seq.get();
         match body {
             Body::Outbox { envelope } => {
-                if !self.outbox.iter().any(|e| e.id == envelope.id) {
+                if self.acknowledged(&envelope.id).is_none()
+                    && !self.outbox.iter().any(|e| e.id == envelope.id)
+                {
                     self.outbox.push(envelope.clone());
                 }
             }
@@ -216,18 +219,23 @@ impl Ledger {
                 envelope_id,
                 refusal,
             } => {
-                if !self
+                self.outbox.retain(|e| &e.id != envelope_id);
+                if let Err(at) = self
                     .acknowledgements
-                    .iter()
-                    .any(|(id, _)| id == envelope_id)
+                    .binary_search_by(|(id, _)| identity(id).cmp(&identity(envelope_id)))
                 {
                     self.acknowledgements
-                        .push((envelope_id.clone(), refusal.clone()));
+                        .insert(at, (envelope_id.clone(), refusal.clone()));
                 }
             }
             Body::Enqueue { envelope } => {
-                if !self.received.iter().any(|(_, id)| id == &envelope.id) {
-                    self.received.push((seq, envelope.id.clone()));
+                if self
+                    .identities
+                    .entry(envelope.id.purpose.clone())
+                    .or_default()
+                    .insert((envelope.id.sender.0.as_u128(), envelope.id.call.0.get()))
+                {
+                    self.received.insert(seq);
                     self.untaken.push_back(Queued {
                         seq,
                         text: envelope.payload.clone(),
@@ -268,6 +276,8 @@ impl Ledger {
             | Body::ModelResult { .. }
             | Body::Decision { .. }
             | Body::Wait { .. }
+            | Body::Watch { .. }
+            | Body::Fired { .. }
             | Body::Answer { .. } => self.track(CallId(seq), body),
             Body::Interrupt { origin } => {
                 self.author(*origin);
@@ -283,16 +293,6 @@ impl Ledger {
                 child: *child,
                 input: input.clone(),
             }),
-            Body::Watch { child } => {
-                self.armed.insert(seq, *child);
-                if !self.watched.contains(child) {
-                    self.watched.push(*child);
-                }
-            }
-            Body::Fired { watch, outcome } => {
-                self.armed.remove(*watch);
-                self.result = Some(outcome.clone());
-            }
             Body::Assistant { text } => {
                 self.result = Some(Outcome::Done {
                     output: Json::encode(text.as_str()).unwrap_or_default(),
@@ -305,9 +305,6 @@ impl Ledger {
         }
     }
 
-    /// Folds an entry about a call: its intent (whose id is `here`, the
-    /// entry's own seq), processes, progress, outcome, a decision on it,
-    /// what it waits on and the answer.
     fn track(&mut self, here: CallId, body: &Body) {
         match body {
             Body::ToolCall {
@@ -379,6 +376,14 @@ impl Ledger {
             } => {
                 self.author(*origin);
                 self.answer(*call, value);
+            }
+            Body::Watch { child } => {
+                self.armed.insert(here.0, *child);
+                self.watched.insert(child.0.as_u128());
+            }
+            Body::Fired { watch, outcome } => {
+                self.armed.remove(*watch);
+                self.result = Some(outcome.clone());
             }
             _ => {}
         }
@@ -498,30 +503,30 @@ impl Ledger {
     }
 
     pub fn enqueued(&self, seq: Seq) -> bool {
-        self.received.iter().any(|(queued, _)| *queued == seq)
+        self.received.contains(&seq)
     }
     pub fn received(&self, id: &crate::EnvelopeId) -> bool {
-        self.received.iter().any(|(_, seen)| seen == id)
+        self.identities
+            .get(&id.purpose)
+            .is_some_and(|ids| ids.contains(&(id.sender.0.as_u128(), id.call.0.get())))
     }
     pub fn inbox_len(&self) -> usize {
         self.untaken
             .iter()
-            .filter(|q| self.received.iter().any(|(seq, _)| *seq == q.seq))
+            .filter(|q| self.received.contains(&q.seq))
             .count()
     }
     pub fn pending_outbox(&self) -> impl Iterator<Item = &crate::Envelope> {
-        self.outbox
-            .iter()
-            .filter(|e| self.acknowledged(&e.id).is_none())
+        self.outbox.iter()
     }
     pub fn outbox(&self) -> &[crate::Envelope] {
         &self.outbox
     }
     pub fn acknowledged(&self, id: &crate::EnvelopeId) -> Option<&Option<crate::InboxRefusal>> {
         self.acknowledgements
-            .iter()
-            .find(|(seen, _)| seen == id)
-            .map(|(_, refusal)| refusal)
+            .binary_search_by(|(seen, _)| identity(seen).cmp(&identity(id)))
+            .ok()
+            .map(|at| &self.acknowledgements[at].1)
     }
 
     pub fn links(&self) -> &[Link] {
@@ -530,7 +535,7 @@ impl Ledger {
 
     /// Whether `child` was ever watched.
     pub fn watched(&self, child: SessionId) -> bool {
-        self.watched.contains(&child)
+        self.watched.contains(&child.0.as_u128())
     }
 
     /// The background process groups started, with the boot each ran in.
@@ -670,5 +675,59 @@ impl<K: Ord + Copy, V> Keyed<K, V> {
 
     pub fn iter(&self) -> impl Iterator<Item = (K, &V)> {
         self.0.iter().map(|(key, value)| (*key, value))
+    }
+}
+
+fn identity(id: &crate::EnvelopeId) -> (u128, u64, &str) {
+    (id.sender.0.as_u128(), id.call.0.get(), &id.purpose)
+}
+
+#[cfg(test)]
+mod durable_tests {
+    use super::*;
+    use crate::{Envelope, EnvelopeId, Epoch};
+
+    #[test]
+    fn acknowledged_payloads_leave_the_live_outbox() {
+        let envelope = Envelope {
+            id: EnvelopeId {
+                sender: SessionId::new(),
+                call: CallId::new(1).unwrap(),
+                purpose: "delivery".into(),
+            },
+            destination: SessionId::new(),
+            payload: "large payload".repeat(1024),
+        };
+        let mut ledger = Ledger::default();
+        for (seq, body) in [
+            Body::Outbox {
+                envelope: envelope.clone(),
+            },
+            Body::Ack {
+                envelope_id: envelope.id.clone(),
+                refusal: Some(crate::InboxRefusal::Full),
+            },
+            Body::Outbox {
+                envelope: envelope.clone(),
+            },
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            ledger.apply(&Entry::new(
+                Seq::new(seq as u64 + 1).unwrap(),
+                Epoch(0),
+                body,
+            ));
+        }
+        assert_eq!(ledger.outbox(), []);
+        assert!(ledger.pending_outbox().next().is_none());
+        let image = Json::encode(&ledger).unwrap();
+        assert!(!image.raw().contains("large payload"));
+        let restored: Ledger = image.parse().unwrap();
+        assert_eq!(
+            restored.acknowledged(&envelope.id),
+            Some(&Some(crate::InboxRefusal::Full))
+        );
     }
 }

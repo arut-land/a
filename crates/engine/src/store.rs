@@ -5,6 +5,7 @@
 
 #[cfg(test)]
 mod faulty;
+pub(crate) mod index;
 mod jsonl;
 mod lease;
 #[cfg(test)]

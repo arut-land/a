@@ -350,6 +350,7 @@ impl Daemon {
     fn load_on(home: &Home, config: &Config, runtime: &Arc<rt::Threads>) -> io::Result<Owner> {
         let store = Arc::new(Jsonl::open(home.sessions_dir())?);
         let catalog = Catalog::open(home.catalog_file(), &*store)?;
+        catalog.start(Arc::clone(runtime) as Arc<dyn rt::Runtime>);
         let records = catalog.records();
         let busy: Vec<bool> = records.iter().map(|r| r.busy).collect();
         let slots: Vec<_> = (records.into_iter())

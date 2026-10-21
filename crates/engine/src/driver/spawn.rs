@@ -169,30 +169,29 @@ impl Actor {
             }
             SpawnReply::Awaited(reply) => {
                 if let Some(link) = &previous {
-                    let Ok(entries) = self.live.entries().await else {
-                        reply.send(
-                            Json::encode(&Result::<Outcome, _>::Err(SpawnRefusal::Unavailable(
-                                "unreadable parent log".into(),
-                            )))
-                            .unwrap(),
-                        );
-                        return None;
+                    let outcome = async {
+                        self.indexed().await?;
+                        let Some(seq) = self.journal.index.fired(link.child) else {
+                            return Ok(None);
+                        };
+                        match self.indexed_entry(seq).await?.body {
+                            Body::Fired { outcome, .. } => Ok(Some(outcome)),
+                            _ => Err(io::Error::other("invalid watch index")),
+                        }
+                    }
+                    .await;
+                    let outcome = match outcome {
+                        Ok(outcome) => outcome,
+                        Err(error) => {
+                            reply.send(
+                                Json::encode(&Result::<Outcome, _>::Err(
+                                    SpawnRefusal::Unavailable(error.to_string()),
+                                ))
+                                .unwrap(),
+                            );
+                            return None;
+                        }
                     };
-                    let entries: Vec<_> =
-                        entries.into_iter().chain(self.pending_entries()).collect();
-                    let watch = entries.iter().find_map(|e| match e.body {
-                        Body::Watch { child } if child == link.child => Some(e.seq),
-                        _ => None,
-                    });
-                    let outcome = watch.and_then(|watch| {
-                        entries.iter().find_map(|e| match &e.body {
-                            Body::Fired {
-                                watch: fired,
-                                outcome,
-                            } if *fired == watch => Some(outcome.clone()),
-                            _ => None,
-                        })
-                    });
                     if let Some(outcome) = outcome {
                         let refusal = SpawnIntent::from_json(&link.intent)
                             .ok()

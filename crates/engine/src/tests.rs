@@ -165,8 +165,8 @@ fn idle_sessions_hibernate_and_reload_on_attach() {
     };
     let latest = daemon.attach_to(&mine, || "/w".into());
     let missing = daemon.attach_to(&mine, || "/x".into());
-    // The reloaded session's recovery pass may relist it in the catalog.
     settle(&daemon);
+    drop(daemon);
     std::fs::remove_dir_all(&root).unwrap();
 
     assert!(hibernated);
@@ -198,6 +198,7 @@ fn a_hibernated_session_lists_the_entries_it_has_now() {
         let stored = daemon.shared.store.count(id).unwrap();
         counts.push([daemon.list()[0].entries, daemon.list()[0].entries, stored]);
     }
+    drop(daemon);
     std::fs::remove_dir_all(&root).unwrap();
     assert_eq!(counts[0], [3; 3]);
     assert!(
@@ -1115,6 +1116,7 @@ fn one_writer_per_session() {
         unreachable!()
     };
     let entries = daemon.shared.store.entries(id).unwrap();
+    drop(daemon);
     std::fs::remove_dir_all(&root).unwrap();
 
     let seqs: Vec<u64> = entries.iter().map(|e| e.seq.get()).collect();
