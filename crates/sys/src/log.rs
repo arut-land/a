@@ -70,6 +70,8 @@ fn stderr_to(log: &fs::File) -> io::Result<()> {
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner);
     let duplicate = log.try_clone()?;
+    // A standard writer must finish before its old borrowed handle closes.
+    let _writer = io::stderr().lock();
     // SAFETY: duplicate remains owned in STDERR after the call.
     crate::windows::ok(unsafe { SetStdHandle(STD_ERROR_HANDLE, duplicate.as_raw_handle()) })?;
     *current = Some(duplicate);
