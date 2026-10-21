@@ -570,7 +570,7 @@ mod tests {
                 )
             }
         }
-        for (at, cancelled) in [(1, false), (1, true), (2, true)] {
+        for (at, cancelled) in [(1, false), (0, true), (1, true), (2, true)] {
             let rig = Rig::new("edit-worker", registry());
             let path = rig.workspace().join("large.txt");
             let file = path.clone();

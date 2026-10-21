@@ -1,4 +1,5 @@
 #!/usr/bin/env bash
+#MISE description="Compare logging facade size and formatting throughput"
 # Comparable facade/formatting probes; no daemon, home or provider is used.
 set -euo pipefail
 probe=$(mktemp -d "${TMPDIR:-/tmp}/a-logging-probe.XXXXXX")
@@ -63,8 +64,8 @@ fn main() {
 }
 RUST
 for backend in tiny facade subscriber; do
-    features=()
-    if [[ $backend != tiny ]]; then features=(--features "$backend"); fi
+    features=(--no-default-features)
+    if [[ $backend != tiny ]]; then features+=(--features "$backend"); fi
     cargo build --release --manifest-path "$probe/Cargo.toml" "${features[@]}"
     printf '%s: ' "$backend"
     wc -c < "$probe/target/release/a-logging-probe"
