@@ -166,6 +166,46 @@ fn a_context_overflow_is_compacted_and_sent_again() {
     assert!(matches!(&messages[0], llm::Message::User(u) if format!("{u:?}").contains("summary")));
 }
 
+struct Index;
+impl Extension for Index {
+    const NAME: &'static str = "index";
+    const VERSION: u32 = 1;
+    fn contribute(&self, r: &mut Registrar) {
+        r.text(ext::Text::generation("index", 0, "available: review"));
+    }
+}
+
+#[test]
+fn a_compaction_retry_republishes_the_index_and_keeps_the_summary() {
+    let http = Flaky::new([
+        Reply::Status(413, &[]),
+        Reply::Events(text_reply()),
+        Reply::Events(text_reply()),
+    ]);
+    let registry = Registry::default()
+        .with(&Index)
+        .unwrap()
+        .with(&ext_compact::Compact::default())
+        .unwrap();
+    let session = fixture(registry, &http).start(&[]);
+    session.submit("hi").unwrap();
+    settle(&session);
+    let log = log_of(&session);
+    session.halt();
+    assert_eq!(http.sent(), 3, "{log:#?}");
+    assert_eq!(
+        log.iter()
+            .filter(|e| matches!(&e.body,
+        Body::Context { text, .. } if text == "available: review"))
+            .count(),
+        2
+    );
+    let bodies = http.bodies();
+    let resent = bodies[2].to_string();
+    assert!(resent.contains("available: review"), "{resent}");
+    assert!(resent.contains("summary of the conversation"), "{resent}");
+}
+
 /// An edit changes what the model sees from then on, and nothing else:
 /// the transcript before it is as it was, and the log keeps every entry.
 #[test]

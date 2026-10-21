@@ -20,6 +20,8 @@ mod mcp;
 mod pipe;
 mod reactor;
 mod remote;
+#[cfg(feature = "skills")]
+mod skills;
 mod tui;
 #[cfg(feature = "web")]
 mod web;

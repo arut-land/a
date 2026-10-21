@@ -33,6 +33,8 @@ pub struct Ledger {
     env: Option<Environment>,
     extensions: Option<Vec<Installed>>,
     context: bool,
+    #[serde(skip_serializing_if = "crate::publication::Publications::is_empty")]
+    publications: crate::publication::Publications,
     /// The last mutation logged of each client that named itself.
     clients: Vec<(ClientId, ClientSeq)>,
     /// What the session last settled with, as a child hands it back: the
@@ -151,6 +153,7 @@ impl Ledger {
     /// not fit what came before (an outcome for no open call, an answer for
     /// no wait) changes nothing.
     pub fn apply(&mut self, e: &Entry) {
+        self.publications.apply(e);
         let (seq, body) = (e.seq, &e.body);
         self.seq = seq.get();
         match body {
@@ -466,6 +469,10 @@ impl Ledger {
     /// The extensions most recently logged, if any were.
     pub fn extensions(&self) -> Option<&[Installed]> {
         self.extensions.as_deref()
+    }
+
+    pub fn publications(&self) -> &crate::publication::Publications {
+        &self.publications
     }
 
     /// Whether the session's context is logged.

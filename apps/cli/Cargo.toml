@@ -20,6 +20,7 @@ ext-policy = { workspace = true, optional = true }
 ext-prompt = { workspace = true, optional = true }
 ext-retry = { workspace = true, optional = true }
 ext-settings = { workspace = true, optional = true }
+ext-skills = { workspace = true, optional = true }
 ext-shell = { workspace = true, optional = true }
 ext-subagent = { workspace = true, optional = true }
 ext-title = { workspace = true, optional = true }
@@ -31,7 +32,7 @@ usage-rs.workspace = true
 web = { workspace = true, optional = true }
 
 [features]
-default = ["mcp", "fork", "web", "policy", "prompt", "shell", "edit", "compact", "retry", "settings", "subagent", "title"]
+default = ["mcp", "fork", "web", "policy", "prompt", "shell", "edit", "compact", "retry", "settings", "subagent", "title", "skills"]
 # User mods; opt-in until quiet-machine startup has been verified.
 lua = ["dep:ext-lua"]
 fork = ["dep:ext-fork"]
@@ -53,6 +54,8 @@ compact = ["dep:ext-compact"]
 retry = ["dep:ext-retry"]
 # `/model`, which shows and sets the session's model.
 settings = ["dep:ext-settings"]
+# Lazily published skill instructions and /name commands.
+skills = ["dep:ext-skills"]
 # Sessions titled by their model, asked aside.
 title = ["dep:ext-title"]
 # `task`, which runs a piece of work in a child session.

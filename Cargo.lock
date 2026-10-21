@@ -20,6 +20,7 @@ dependencies = [
  "ext-retry",
  "ext-settings",
  "ext-shell",
+ "ext-skills",
  "ext-subagent",
  "ext-title",
  "libc",
@@ -748,6 +749,21 @@ dependencies = [
  "serde_json",
  "sys",
  "vte",
+]
+
+[[package]]
+name = "ext-skills"
+version = "0.0.0"
+dependencies = [
+ "ext",
+ "kernel",
+ "llm",
+ "protocol",
+ "rt",
+ "serde",
+ "serde_json",
+ "serde_yaml_ng",
+ "sys",
 ]
 
 [[package]]
