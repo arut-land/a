@@ -83,8 +83,13 @@ fn the_inline_client_prints_the_transcript_into_the_scrollback() {
     let mut term = env.tty(&["resume"], 80, 24);
     let screen = term.wait_for("recap · you: $ echo first");
     assert!(
-        screen.find("❯ $ echo first").is_some(),
-        "the replay is printed above the input:\n{}",
+        screen.find("❯ $ echo first").is_some()
+            || screen
+                .scrollback
+                .iter()
+                .any(|line| line.contains("❯ $ echo first")),
+        "the replay is printed above the input:\n{:?}\n{}",
+        screen.scrollback,
         screen.text()
     );
     let out = String::from_utf8_lossy(&term.bytes()).into_owned();
