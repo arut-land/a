@@ -83,16 +83,23 @@ fi
 # Miri over sys, the one crate with unsafe code. Miri runs no processes and
 # (on macOS) sets no file times, nor modes, so the tests that need those are skipped.
 "test:miri" = "MIRIFLAGS=-Zmiri-disable-isolation cargo miri test -p sys --lib -- --skip install:: --skip asks_a_shell --skip stages_newest --skip a_higher_version --skip tests::a_group_leader --skip tests::kills --skip fs::tests"
-# Coverage-guided fuzzing (libFuzzer) of crates/protocol/tests/fuzz.rs:
-# each target, or the one named, for TIME. Crashes land in
-# crates/protocol/tests/__fuzz__/<target>/crashes, which every test run
-# replays; the corpus stays in target/fuzz.
+# Coverage-guided fuzzing (libFuzzer) of protocol and skill frontmatter.
+# Crashes land beside the target in __fuzz__, replayed by ordinary tests;
+# generated corpora stay in target/fuzz.
 fuzz = { usage = '''
-arg "[target]" help="framer, json_decode or view_reducer; all by default"
+arg "[target]" help="framer, json_decode, view_reducer or skill_frontmatter; all by default"
 flag "-T --time <time>" default="60s"
 ''', run = '''
-for target in ${usage_target:-framer json_decode view_reducer}; do
-  cargo bolero test -p protocol "$target" -T "$usage_time" --corpus-dir "target/fuzz/$target/corpus"
+for target in ${usage_target:-framer json_decode view_reducer skill_frontmatter}; do
+  package=protocol
+  test="$target"
+  if [[ "$target" == skill_frontmatter ]]; then
+    package=ext-skills
+    test=parse::tests::skill_frontmatter
+    mkdir -p "target/fuzz/$target/corpus"
+    cp crates/ext-skills/tests/corpus/*.md "target/fuzz/$target/corpus/"
+  fi
+  cargo bolero test -p "$package" "$test" -T "$usage_time" --corpus-dir "target/fuzz/$target/corpus"
 done
 ''' }
 # The black-box tests (apps/cli/tests/blackbox) are one binary; a task
