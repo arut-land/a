@@ -66,3 +66,7 @@ After merging main and sharing workspace subscriptions, the integrated build
 measures **3139 KiB**, below the 4096 KiB budget. The integrated delta includes
 main's intervening changes. Budgets and startup are left to the coordinator
 on a quiet machine, as requested.
+
+Discovery also uses the existing `sys` crate's regular-file open seam. This
+adds no third-party dependency: metadata rejects devices and FIFOs before open,
+and Unix `O_NONBLOCK` prevents a replacement FIFO from waiting for a writer.

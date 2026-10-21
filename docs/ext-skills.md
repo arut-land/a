@@ -117,3 +117,8 @@ There is no tilde expansion or implicit scan of other tools' directories.
 Additional roots load in listed order, later overriding earlier; the owned
 home and workspace roots load last. Settings change on daemon restart; file
 edits change through generations.
+
+Discovery skips nonregular `SKILL.md` candidates with the typed
+`sys::fs::RejectedFile::NotRegular` reason. It checks metadata before open and
+checks the resulting handle again; the Unix open is nonblocking, so a FIFO
+substituted between checks cannot stall shared generation preparation.

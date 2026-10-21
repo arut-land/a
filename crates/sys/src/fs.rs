@@ -5,6 +5,45 @@ use std::fs::{self, File, OpenOptions};
 use std::io;
 use std::path::Path;
 
+/// Why discovery skipped a candidate instead of opening arbitrary filesystem objects.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum RejectedFile {
+    NotRegular,
+}
+
+/// A regular file or a typed discovery rejection; IO failures remain errors.
+#[derive(Debug)]
+pub enum RegularFile {
+    Open(File),
+    Skipped(RejectedFile),
+}
+
+/// Checking metadata first avoids opening devices; nonblocking open and a
+/// second check on the handle also cover replacement by a FIFO during discovery.
+pub fn open_regular(path: &Path) -> io::Result<RegularFile> {
+    if !fs::metadata(path)?.is_file() {
+        return Ok(RegularFile::Skipped(RejectedFile::NotRegular));
+    }
+    let mut options = OpenOptions::new();
+    options.read(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.custom_flags(libc::O_NONBLOCK | libc::O_NOFOLLOW);
+    }
+    #[cfg(windows)]
+    {
+        use std::os::windows::fs::OpenOptionsExt;
+        // Open a replaced link itself, never its device target.
+        options.custom_flags(0x0020_0000); // FILE_FLAG_OPEN_REPARSE_POINT
+    }
+    let file = options.open(path)?;
+    if !file.metadata()?.is_file() {
+        return Ok(RegularFile::Skipped(RejectedFile::NotRegular));
+    }
+    Ok(RegularFile::Open(file))
+}
+
 /// Orders earlier writes before later commits. Apple keeps them in the
 /// drive cache until a cache flush covers the promise made to a client or
 /// an external effect; other platforms already flush here.
@@ -273,6 +312,27 @@ mod tests {
     use std::os::unix::fs::PermissionsExt;
 
     use super::*;
+
+    #[test]
+    fn discovery_never_opens_a_fifo_or_directory() {
+        let dir = std::env::temp_dir().join(format!("a-sys-regular-{}", std::process::id()));
+        fs::create_dir_all(&dir).unwrap();
+        let fifo = dir.join("fifo");
+        rustix::fs::mkfifo(&fifo, rustix::fs::Mode::RUSR).unwrap();
+        for path in [&dir, &fifo] {
+            assert!(matches!(
+                open_regular(path).unwrap(),
+                RegularFile::Skipped(RejectedFile::NotRegular)
+            ));
+        }
+        let regular = dir.join("regular");
+        fs::write(&regular, "instructions").unwrap();
+        assert!(matches!(
+            open_regular(&regular).unwrap(),
+            RegularFile::Open(_)
+        ));
+        fs::remove_dir_all(dir).unwrap();
+    }
 
     #[cfg(target_vendor = "apple")]
     #[test]
