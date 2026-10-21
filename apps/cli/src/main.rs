@@ -380,6 +380,11 @@ struct Screen {
 impl Screen {
     fn show(&mut self, change: &Change, view: &SessionView) {
         match change {
+            Change::Batch { changes } => {
+                for change in changes {
+                    self.show(change, view);
+                }
+            }
             Change::Attached {
                 session, workspace, ..
             } => {
@@ -415,7 +420,7 @@ impl Screen {
                     }
                 }
             }
-            Change::Updated { index, part } => self.updated(&view.items[*index], *part),
+            Change::Updated { index, part } => self.updated(&view.items[*index], *part, view),
             Change::Synced => {
                 self.synced = true;
                 if let Some(recap) = &view.recap {
@@ -423,7 +428,7 @@ impl Screen {
                 }
                 for call in view.ledger.inbox() {
                     if let Some(item) = view.items.iter().find(|i| i.key() == call.0) {
-                        sayln!("{}", ask(&item.present()));
+                        sayln!("{}", ask(&view.present(item)));
                     }
                 }
             }
@@ -433,8 +438,8 @@ impl Screen {
         }
     }
 
-    fn updated(&mut self, item: &Item, part: Part) {
-        let p = item.present();
+    fn updated(&mut self, item: &Item, part: Part, view: &SessionView) {
+        let p = view.present(item);
         match (part, p.kind) {
             (Part::Outcome, Kind::Reply) => {
                 // A streamed reply is on screen already; end its line.
@@ -457,6 +462,11 @@ impl Screen {
             (Part::Phase, _) if self.synced && p.buttons != protocol::view::Buttons::None => {
                 sayln!("{}", ask(&p));
             }
+            (Part::Presentation, _) if self.synced => {
+                if let Some(text) = description_update(&p) {
+                    sayln!("{text}");
+                }
+            }
             (Part::Answer { approved }, _) => {
                 sayln!("  · {}", answer_line(approved));
             }
@@ -471,9 +481,22 @@ fn print_all(lines: &[String]) {
     }
 }
 
+fn description_update(p: &Presented<'_>) -> Option<String> {
+    p.description.map(|_| ask(p))
+}
+
 /// The question a call waiting for approval puts.
 fn ask(p: &Presented<'_>) -> String {
-    format!("? {}  {}  [y/n]", p.title, p.status)
+    client::approval_parts(p)
+        .into_iter()
+        .map(|part| match part {
+            client::ApprovalPart::Controls { title, .. } => {
+                format!("? {title}  {}  [y/n]", p.status)
+            }
+            part => part.text().unwrap_or_default().to_owned(),
+        })
+        .collect::<Vec<_>>()
+        .join("\n")
 }
 
 /// The lines an item starts with, as it is added.
@@ -682,5 +705,90 @@ mod parity {
             }
         }
         assert!(items > 20, "{items} items checked");
+    }
+}
+
+#[cfg(test)]
+mod approval_tests {
+    use super::*;
+    use protocol::{Body, DaemonMsg, Decode, Entry, Epoch, Json, Seq};
+
+    #[test]
+    fn the_repl_never_prints_a_late_description() {
+        let vectors: serde_json::Value = serde_json::from_str(include_str!(
+            "../../../crates/protocol/tests/vectors/view.json"
+        ))
+        .unwrap();
+        let vector = vectors
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|v| v["name"] == "approval reason precedes its optional description")
+            .unwrap();
+        let mut view = SessionView::default();
+        for value in vector["messages"].as_array().unwrap() {
+            let mut msg = DaemonMsg::from_json(value.to_string().as_bytes()).unwrap();
+            if let DaemonMsg::Entry(entry) = &mut msg
+                && matches!(entry.body, Body::ModelResult { .. })
+            {
+                view.fold(&DaemonMsg::Entry(Entry::new(
+                    entry.seq,
+                    Epoch(0),
+                    Body::Answer {
+                        call: CallId::new(1).unwrap(),
+                        value: Json::encode(&true).unwrap(),
+                        origin: None,
+                    },
+                )));
+                entry.seq = Seq::new(entry.seq.get() + 1).unwrap();
+                view.fold(&msg);
+                assert_eq!(description_update(&view.present(&view.items[0])), None);
+                return;
+            }
+            view.fold(&msg);
+        }
+        panic!("scenario has no description");
+    }
+    #[test]
+    fn every_summary_follows_complete_effective_input_before_controls() {
+        let vectors: serde_json::Value = serde_json::from_str(include_str!(
+            "../../../crates/protocol/tests/vectors/view.json"
+        ))
+        .unwrap();
+        for vector in vectors
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter(|v| v["name"].as_str().unwrap().starts_with("approval reviews "))
+        {
+            let mut view = SessionView::default();
+            for message in vector["messages"].as_array().unwrap() {
+                view.fold(&DaemonMsg::from_json(message.to_string().as_bytes()).unwrap());
+            }
+            let p = view.present(&view.items[0]);
+            let text = ask(&p);
+            let reason = text.find("Why:").unwrap();
+            let summary = text.find("Model summary (unverified):").unwrap();
+            assert!(reason < summary && summary < text.find("[y/n]").unwrap());
+            let markers: &[&str] = if vector["name"].as_str().unwrap().contains("multiline") {
+                &[
+                    "printf harmless\nrm -rf /tmp/approval-test-sentinel",
+                    "60000",
+                    "every argument",
+                ]
+            } else {
+                &[
+                    "/work/deep/config.ini",
+                    "-allow = false",
+                    "+allow = true",
+                    "-delete = no",
+                    "+delete = yes",
+                    "flag",
+                ]
+            };
+            for marker in markers {
+                assert!(text.find(marker).unwrap() < reason, "{marker}: {text}");
+            }
+        }
     }
 }

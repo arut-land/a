@@ -552,16 +552,40 @@ impl Environment {
 
 /// Whether a tool call may run, from least to most restrictive: merging
 /// takes the maximum.
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum Permission {
     #[default]
     Allow,
     /// Runs once someone approves it.
-    Ask,
+    Ask(ApprovalReason),
     /// Decided outside this run, later.
     Defer,
     Deny,
+}
+
+/// The policy fact that requires a person to approve a call. Model-written
+/// descriptions never replace this fact.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ApprovalReason {
+    Mode { mode: String },
+    OperatorRule { tool: String, input: Option<String> },
+    OutsideWorkspace { path: PathBuf, workspace: PathBuf },
+    Classifier { reason: String },
+}
+
+impl Permission {
+    /// Restrictiveness ignores explanatory data; equal rules retain the
+    /// first handler's reason.
+    pub const fn rank(&self) -> u8 {
+        match self {
+            Self::Allow => 0,
+            Self::Ask(_) => 1,
+            Self::Defer => 2,
+            Self::Deny => 3,
+        }
+    }
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize)]
@@ -1687,7 +1711,7 @@ mod tests {
                 by: "policy".into(),
                 call: CallId::new(4),
                 d: Verdict::Permission {
-                    permission: Permission::Ask,
+                    permission: Permission::Ask(ApprovalReason::Mode { mode: "ask".into() }),
                 },
             },
             Body::Decision {
@@ -1739,7 +1763,7 @@ mod tests {
                 format!(r#"{head}"take","input":2}}"#),
                 format!(r#"{head}"model_call","model":"m","attempt":1,"choice":"none"}}"#),
                 format!(
-                    r#"{head}"decision","by":"policy","call":4,"d":"permission","permission":"ask"}}"#
+                    r#"{head}"decision","by":"policy","call":4,"d":"permission","permission":{{"ask":{{"mode":{{"mode":"ask"}}}}}}}}"#
                 ),
                 format!(
                     r#"{head}"decision","by":"hook","call":3,"d":"prepare_step","model":"cheap"}}"#

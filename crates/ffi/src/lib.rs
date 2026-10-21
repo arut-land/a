@@ -20,8 +20,8 @@ use std::io;
 use boltffi::{data, error};
 use client::{End, Link, Notice, SessionClient, TurnView};
 use protocol::view::{
-    Buttons, Change, Glyph, Item, Part, Presented, Recap, SessionView, Shown, Status,
-    mismatch_line, recap_line,
+    Change, Glyph, Item, Part, Presented, Recap, SessionView, Shown, Status, mismatch_line,
+    recap_line,
 };
 use protocol::{CommandInfo, Outcome, SessionSummary};
 
@@ -522,11 +522,20 @@ pub struct Presentation {
     /// Where it stands, such as `exit 0` or `waiting for approval`; empty
     /// when it has nothing to say.
     pub status: String,
+    pub approval: Vec<ApprovalPart>,
     pub body: Option<ShownBody>,
     /// A reply's token counts, once it has them.
     pub usage: Option<TokenUsage>,
-    /// The call whose approval this item asks for: show the buttons.
-    pub approve: Option<u64>,
+}
+
+/// Ordered approval content from the client SDK.
+#[data]
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum ApprovalPart {
+    Call { text: String },
+    Reason { text: String },
+    UnverifiedSummary { text: String },
+    Controls { call: u64 },
 }
 
 /// The class of a status: how it is coloured.
@@ -591,12 +600,21 @@ impl From<&Presented<'_>> for Presentation {
             },
             title: p.title.to_string(),
             status: p.status.to_string(),
+            approval: client::approval_parts(p)
+                .into_iter()
+                .map(|part| match part {
+                    client::ApprovalPart::Call { text } => ApprovalPart::Call { text },
+                    client::ApprovalPart::Reason { text } => ApprovalPart::Reason { text },
+                    client::ApprovalPart::UnverifiedSummary { text } => {
+                        ApprovalPart::UnverifiedSummary { text }
+                    }
+                    client::ApprovalPart::Controls { call, .. } => {
+                        ApprovalPart::Controls { call: call.get() }
+                    }
+                })
+                .collect(),
             body,
             usage: p.usage.map(Into::into),
-            approve: match p.buttons {
-                Buttons::Approve(call) => Some(call.get()),
-                Buttons::None => None,
-            },
         }
     }
 }
@@ -806,7 +824,7 @@ impl ViewChange {
             Change::Synced => Self::Synced {
                 recap: view.recap.as_ref().map(Into::into),
             },
-            Change::Snapshot => Self::Snapshot {
+            Change::Snapshot | Change::Batch { .. } => Self::Snapshot {
                 items: view
                     .items
                     .iter()
@@ -830,7 +848,7 @@ impl ItemPatch {
     fn of(item: &Item, part: Part, view: &SessionView) -> Self {
         let shown = Presentation::from(&view.present(item));
         match (item, part) {
-            (_, Part::Progress) => Self::Phase { shown },
+            (_, Part::Progress | Part::Presentation) => Self::Phase { shown },
             (
                 Item::Tool {
                     by: protocol::Audience::User,

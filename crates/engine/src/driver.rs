@@ -398,6 +398,7 @@ impl ContextOrigin {
 }
 
 struct PendingSide {
+    while_waiting: bool,
     background: bool,
     cancel: Cancel,
     origin: ContextOrigin,
@@ -568,6 +569,7 @@ impl Live {
             detached: Vec::new(),
             sides: Keyed::default(),
             side_waiters: Keyed::default(),
+            waiting_sides: Vec::new(),
             tickets: 0,
             phase: Phase::Serving,
             listed,
@@ -881,6 +883,7 @@ struct Actor {
     transport_active: bool,
     delivery_queue: std::collections::VecDeque<(protocol::Envelope, Option<Ticket>)>,
     child_cancels: Vec<(SessionId, Cancel)>,
+    waiting_sides: Vec<(CallId, CallId)>,
     tickets: u64,
     phase: Phase,
     /// The session as the catalog last heard of it: busy while work is in
@@ -1479,6 +1482,9 @@ impl Actor {
                         && let Some(pending) = self.sides.get_mut(&ticket)
                     {
                         lock(&self.live.session.cancels).insert(id, pending.cancel.clone());
+                        if pending.while_waiting {
+                            self.waiting_sides.push((pending.origin.call, id));
+                        }
                     }
                     after.push((admission, Effect::Side { ticket, side }));
                     admission = Admission {
@@ -2134,13 +2140,40 @@ impl Actor {
             self.transcript = None;
         }
         for e in entries {
+            if let Body::Answer { call, .. }
+            | Body::Decision {
+                call: Some(call),
+                d: protocol::Verdict::Approval { .. },
+                ..
+            } = &e.body
+            {
+                for (owner, side) in &self.waiting_sides {
+                    if owner == call {
+                        session.cancel(*side).set();
+                    }
+                }
+            }
+            if let Body::ModelResult { call, .. } = &e.body {
+                self.waiting_sides.retain(|(_, side)| side != call);
+            }
             lock(&session.state_view()).apply(e);
             if matches!(e.body, Body::Input { .. }) {
                 self.live.has_input.store(true, Ordering::SeqCst);
             }
 
             // What observers do about it runs owned by the session.
-            for reaction in hooks.observe(self.bound.point(), e) {
+            let tool = match &e.body {
+                Body::Decision {
+                    call: Some(call), ..
+                } => self.core.tool_of(*call),
+                _ => None,
+            };
+            let point = self.bound.point();
+            let point = match &tool {
+                Some((tool, input)) => point.with_tool(ext::point::ToolUse { tool, input }),
+                None => point,
+            };
+            for reaction in hooks.observe(point, e) {
                 if let Some(work) = reaction.work {
                     self.admissions.push((
                         Admission {

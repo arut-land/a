@@ -1010,3 +1010,129 @@ fn cancellation_is_not_reported_as_a_side_provider_failure() {
         matches!(fact, ext_logging::Fact::ProviderError { session: id, .. } if *id == session)
     }));
 }
+
+struct HeldDescription {
+    started: Flag,
+    release: Flag,
+    tool_release: Flag,
+}
+
+impl ext::SideProvider for HeldDescription {
+    fn reply<'a>(
+        &'a self,
+        side: &'a ext::Side,
+        messages: &'a llm::Messages,
+    ) -> BoxFuture<'a, Result<llm::Response, llm::Error>> {
+        Box::pin(async move {
+            assert_eq!(side.purpose, "approval-description");
+            assert!(matches!(side.role, ext::ModelRole::Fast));
+            assert!(matches!(side.context, ext::SideContext::None));
+            assert!(side.is_while_waiting());
+            assert!(
+                side.messages.iter().any(|message| match message {
+                    llm::Message::User(user) => user.content.iter().any(|part| matches!(part, llm::UserPart::Text(text) if text.text.contains(r#""seconds":7"#))),
+                    _ => false,
+                }),
+                "the description must use the input the gate left behind"
+            );
+            self.started.set();
+            self.release.wait().await;
+            ext::SideProvider::reply(&ext_fixtures::Fixtures, side, messages).await
+        })
+    }
+}
+
+impl Extension for HeldDescription {
+    const NAME: &'static str = "held-description";
+    const VERSION: u32 = 1;
+
+    fn contribute(&self, r: &mut Registrar) {
+        r.on::<point::PreTool>(|_, call| {
+            if call.tool == "sleep" {
+                Rewrite::Replace(Json::encode(&json!({"seconds":7})).unwrap())
+            } else {
+                Rewrite::Pass
+            }
+        });
+        r.tool(ApprovalWork(self.tool_release.clone()))
+            .agent(ext_fixtures::ECHO, || Box::new(ext_fixtures::Echo))
+            .provide::<dyn ext::SideProvider>(Arc::new(Self {
+                started: self.started.clone(),
+                release: self.release.clone(),
+                tool_release: self.tool_release.clone(),
+            }));
+    }
+}
+
+#[test]
+fn answering_an_approval_cancels_its_description_without_cancelling_the_tool() {
+    for approved in [true, false] {
+        let started = Flag::default();
+        let release = Flag::default();
+        let tool_release = Flag::default();
+        let registry = Registry::default()
+            .with(&Policy {
+                describe: true,
+                ..Policy::ask(&["sleep"])
+            })
+            .unwrap()
+            .with(&HeldDescription {
+                started: started.clone(),
+                release,
+                tool_release: tool_release.clone(),
+            })
+            .unwrap();
+        let fixture = Fixture::new(ext_fixtures::ECHO, registry, openai(&Script::new(&[])));
+        let session = fixture.start(&[]);
+        session.submit("sleep 60").unwrap();
+        let asked = until(&session, "approval before description", |log| {
+            !inbox(log).is_empty()
+        });
+        let view = SessionView::from_log(session.id, session.workspace.clone(), &asked);
+        let tool = view
+            .items
+            .iter()
+            .find(|i| matches!(i, protocol::view::Item::Tool { .. }))
+            .unwrap();
+        let shown = view.present(tool);
+        assert!(matches!(shown.buttons, protocol::view::Buttons::Approve(_)));
+        assert!(
+            client::approval_text(&shown)
+                .ends_with("Why: the ask mode requires approval for this tool")
+        );
+        assert!(rt::block_on(first(started.wait(), fixture.0.rt.sleep(PATIENCE))).is_some());
+        let call = inbox(&asked)[0];
+        session.answer(call, approved).unwrap();
+        let cancelled = until(&session, "description cancelled", |log| {
+            let Some((side, _, _)) = sides(log)
+                .into_iter()
+                .find(|(_, _, purpose)| *purpose == "approval-description")
+            else {
+                return false;
+            };
+            log.iter().any(|entry| matches!(&entry.body, Body::ModelResult { call, outcome: Outcome::Interrupted { .. }, .. } if *call == side))
+        });
+        if approved {
+            assert!(!cancelled.iter().any(
+                |entry| matches!(&entry.body, Body::ToolResult { call: c, .. } if c.get() == call)
+            ));
+            tool_release.set();
+        }
+        let done = finished(&session, call);
+        assert_eq!(done.iter().any(|entry| matches!(&entry.body, Body::ToolResult { call: c, outcome: Outcome::Done { .. }, .. } if c.get() == call)), approved);
+        session.halt();
+    }
+}
+
+struct ApprovalWork(Flag);
+impl Tool for ApprovalWork {
+    type In = ext_fixtures::Seconds;
+    type Out = String;
+    const NAME: &'static str = "sleep";
+    const DESCRIPTION: &'static str = "Wait for the test to release work.";
+    const REPLAY: Replay = Replay::Safe;
+    async fn call(&self, _: &Self::In, _: &Cx) -> Result<String, String> {
+        self.0.wait().await;
+        Ok("done".into())
+    }
+}

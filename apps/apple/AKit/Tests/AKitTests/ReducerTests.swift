@@ -19,9 +19,8 @@ struct Vector {
         let data = try! Data(contentsOf: URL(filePath: path))
         let vectors = try! JSONSerialization.jsonObject(with: data) as! [[String: Any]]
         return vectors.map { v in
-            let messages = (v["messages"] as! [Any]).map {
-                String(decoding: try! JSONSerialization.data(withJSONObject: $0), as: UTF8.self)
-            }
+            // Preserve the wire bytes: rebuilding JSON objects changes raw argument ordering.
+            let messages = v["frames"] as! [String]
             let updates = (v["updates"] as! [[String: Any]]).map {
                 (($0["rev"] as! NSNumber).uint64Value, ($0["seq"] as! NSNumber).uint64Value)
             }
@@ -105,11 +104,8 @@ func expectInStep(_ store: SessionStore, _ reducer: Reducer, _ name: String) {
 @Test func aCallWaitingForApprovalCanBeStopped() throws {
     let reducer = Reducer()
     let store = SessionStore(source: reducer)
-    for message in [
-        #"{"t":"attached","session":"00000000-0000-0000-0000-00000000000a","workspace":"/w"}"#,
-        #"{"t":"entry","seq":1,"epoch":0,"kind":"tool_call","tool":"bash","input":{"command":"ls"}}"#,
-        #"{"t":"entry","seq":2,"epoch":0,"kind":"decision","by":"policy","call":1,"d":"permission","permission":"ask"}"#,
-    ] {
+    let vector = Vector.all.first { $0.name == "approval reason precedes its optional description" }!
+    for message in vector.messages.prefix(4) {
         if let update = try reducer.fold(message: message) { store.apply(update) }
     }
     #expect(store.items.count == 1)
@@ -145,5 +141,49 @@ func expectInStep(_ store: SessionStore, _ reducer: Reducer, _ name: String) {
         #expect(error.code() == "protocol")
     } catch {
         Issue.record("unexpected \(error)")
+    }
+}
+
+@Test func approvalReasonsShowBeforeDescriptionsAndSurviveReplay() throws {
+    let vector = Vector.all.first { $0.name == "approval reason precedes its optional description" }!
+    let reducer = Reducer()
+    let store = SessionStore(source: reducer)
+    var sawQuestion = false
+    for message in vector.messages {
+        if let update = try reducer.fold(message: message) { store.apply(update) }
+        if let shown = store.items.first?.shown(), !shown.approval.isEmpty {
+            if shown.approval.count == 3 { sawQuestion = true }
+        }
+    }
+    #expect(sawQuestion)
+    let parts = store.items.first!.shown().approval
+    #expect(parts.count == 4)
+    #expect(parts[1] == .reason(text: "Why: the ask mode requires approval for this tool"))
+    #expect(parts[2] == .unverifiedSummary(text: "Model summary (unverified): Lists files in the current directory."))
+    let (replayed, _) = try vector.fold()
+    #expect(replayed.snapshot().items.first!.shown().approval == parts)
+    expectInStep(store, reducer, vector.name)
+}
+
+@Test func everySummaryFollowsCompleteEffectiveInputBeforeControls() throws {
+    let vectors = Vector.all.filter { $0.name.hasPrefix("approval reviews ") }
+    #expect(vectors.count == 4)
+    for vector in vectors {
+        let (reducer, _) = try vector.fold()
+        let parts = reducer.snapshot().items.first!.shown().approval
+        guard parts.count == 4,
+            case .call(let input) = parts[0],
+            case .reason = parts[1],
+            case .unverifiedSummary(let summary) = parts[2],
+            case .controls = parts[3] else {
+            Issue.record("The app must render complete input, reason, unverified summary, controls in order")
+            continue
+        }
+        #expect(summary.hasPrefix("Model summary (unverified):"))
+        #expect(!input.contains("original harmless input"))
+        let markers = vector.name.contains("multiline")
+            ? ["printf harmless\nrm -rf /tmp/approval-test-sentinel", "60000", "every argument"]
+            : ["/work/deep/config.ini", "-allow = false", "+allow = true", "-delete = no", "+delete = yes", "flag"]
+        for marker in markers { #expect(input.contains(marker), "\(vector.name): \(marker)") }
     }
 }

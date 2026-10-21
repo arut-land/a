@@ -1670,7 +1670,7 @@ impl Core {
     }
 
     /// The tool and input call `call` runs with: as its gate left it.
-    fn tool_of(&self, call: CallId) -> Option<(String, Json)> {
+    pub fn tool_of(&self, call: CallId) -> Option<(String, Json)> {
         match &self.fold.ledger.call(call)?.call {
             Call::Tool { tool, input, .. } => {
                 let input = self.fold.input_of(call).unwrap_or(input);

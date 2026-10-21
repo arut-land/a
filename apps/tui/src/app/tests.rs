@@ -144,7 +144,9 @@ fn asked_command() -> Vec<DaemonMsg> {
                 by: "policy".into(),
                 call: CallId::new(3),
                 d: protocol::Verdict::Permission {
-                    permission: protocol::Permission::Ask,
+                    permission: protocol::Permission::Ask(protocol::ApprovalReason::Mode {
+                        mode: "ask".into(),
+                    }),
                 },
             },
         ),
@@ -159,7 +161,7 @@ fn an_approval_shows_buttons_and_y_or_a_click_answers_it() {
     assert!(rows.iter().any(|r| r == "❯ $ ls"), "{rows:#?}");
     find(&rows, "⏺ $ ls  ? waiting for approval");
     let bar = find(&rows, "Do you want to proceed? $ ls");
-    assert_eq!(bar.1 + 3, find(&rows, &"─".repeat(70)).1);
+    assert_eq!(bar.1 + 4, find(&rows, &"─".repeat(70)).1);
     assert!(matches!(
         press(&mut app, Key::Char('y')),
         Some(Effect::Cmd(Cmd::Approve { call, approved: true })) if call.get() == 3
@@ -1300,6 +1302,7 @@ fn side_usage_does_not_change_the_main_turn_counter() {
             output: 3,
         }),
         purpose: Some("title".into()),
+        owner: None,
     };
     spend(&mut tokens, &item);
     assert_eq!(tokens, Usage::default());
@@ -1323,6 +1326,71 @@ fn escape_and_ctrl_c_cancel_submitted_input_before_it_is_published() {
                     client::Effect::Io(Io::Send(ClientMsg::Interrupt { .. }))
                 ))
             );
+        }
+    }
+}
+
+#[test]
+fn both_viewports_keep_complete_approval_input_before_summaries_and_controls() {
+    use protocol::Decode;
+    let vectors: serde_json::Value = serde_json::from_str(include_str!(
+        "../../../../crates/protocol/tests/vectors/view.json"
+    ))
+    .unwrap();
+    for viewport in [Viewport::Full, Viewport::Inline] {
+        for vector in vectors
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter(|v| v["name"].as_str().unwrap().starts_with("approval reviews "))
+        {
+            let messages: Vec<_> = vector["messages"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .map(|message| DaemonMsg::from_json(message.to_string().as_bytes()).unwrap())
+                .collect();
+            let (mut app, _) = app(viewport, &messages);
+            app.collapsed.insert(
+                messages
+                    .iter()
+                    .find_map(|msg| match msg {
+                        DaemonMsg::Entry(e) if matches!(e.body, Body::ToolCall { .. }) => {
+                            Some(e.seq)
+                        }
+                        _ => None,
+                    })
+                    .unwrap(),
+            );
+            let text = super::super::view::texts(app.rows(0, 120)).join("\n");
+            let reason = text.find("Why:").unwrap();
+            let summary = text.find("Model summary (unverified):").unwrap();
+            assert!(reason < summary && summary < text.find("Do you want to proceed?").unwrap());
+            let markers: &[&str] = if vector["name"].as_str().unwrap().contains("multiline") {
+                &[
+                    "printf harmless",
+                    "rm -rf /tmp/approval-test-sentinel",
+                    "60000",
+                    "every argument",
+                ]
+            } else {
+                &[
+                    "/work/deep/config.ini",
+                    "-allow = false",
+                    "+allow = true",
+                    "-delete = no",
+                    "+delete = yes",
+                    "flag",
+                ]
+            };
+            for marker in markers {
+                assert!(text.find(marker).unwrap() < reason, "{marker}: {text}");
+            }
+            frame(&mut app, 120, 16);
+            app.scroll_by(10_000);
+            let (_, top) = frame(&mut app, 120, 16);
+            find(&top, "Call:");
+            assert!(!top.join("\n").contains("Model summary (unverified):"));
         }
     }
 }

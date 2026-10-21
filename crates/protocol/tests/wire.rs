@@ -327,7 +327,9 @@ fn input_samples() -> Vec<Sample<DaemonMsg>> {
                     by: "policy".into(),
                     call: Some(call(2)),
                     d: Verdict::Permission {
-                        permission: Permission::Ask,
+                        permission: Permission::Ask(protocol::ApprovalReason::Mode {
+                            mode: "ask".into(),
+                        }),
                     },
                 },
             ),
@@ -442,7 +444,9 @@ fn daemon_samples() -> Vec<Sample<DaemonMsg>> {
                 by: "policy".into(),
                 call: CallId::new(2),
                 d: Verdict::Permission {
-                    permission: Permission::Ask,
+                    permission: Permission::Ask(protocol::ApprovalReason::Mode {
+                        mode: "ask".into(),
+                    }),
                 },
             },
         ),
@@ -643,7 +647,7 @@ fn daemon_samples() -> Vec<Sample<DaemonMsg>> {
         sample("entry_enqueue", entry(1, Body::Enqueue { envelope: envelope() })),
         sample("entry_ack", entry(2, Body::Ack { envelope_id: envelope().id, refusal: None })),
         sample("entry_inbox_full", entry(2, Body::Ack { envelope_id: envelope().id, refusal: Some(protocol::InboxRefusal::Full) })),
-        sample("entry_spawned", entry(1, Body::Spawned { intent: protocol::Json::encode(&json!({"image": []})).unwrap() })),
+        sample("entry_spawned", entry(1, Body::Spawned { intent: protocol::publication::SpawnImage { authority: protocol::Json::null(), image: Vec::new() }.to_json().unwrap() })),
         sample(
             "entry_watch",
             entry(
@@ -694,7 +698,7 @@ fn daemon_samples() -> Vec<Sample<DaemonMsg>> {
             "entry_extensions_dynamic",
             entry(19, Body::Extensions { installed: vec![Installed {
                 name: "counter".into(), version: 7,
-                image: Some(protocol::Json::encode(&json!(["a.text{name='test',text='old'}", [], 4_194_304, 100_000, {"secs":0,"nanos":25_000_000}])).unwrap()),
+                image: Some(protocol::Json::encode(&json!(["a.text{name='test',text='old'}", [], 4_194_304, 100_000, {"secs":0,"nanos":25_000_000}, true])).unwrap()),
             }] }),
         ),
         sample(

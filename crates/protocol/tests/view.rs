@@ -35,6 +35,43 @@ impl Rng {
 
 const SESSION: SessionId = SessionId(Uuid::from_u128(0xa));
 
+#[test]
+fn a_description_arriving_after_the_answer_is_not_presented_as_current() {
+    let (_, messages) = scenarios()
+        .into_iter()
+        .find(|(name, _)| *name == "approval reason precedes its optional description")
+        .unwrap();
+    let mut view = SessionView::default();
+    for value in messages {
+        let mut msg = DaemonMsg::from_json(value.to_string().as_bytes()).unwrap();
+        if let DaemonMsg::Entry(entry) = &mut msg
+            && matches!(entry.body, Body::ModelResult { .. })
+        {
+            view.fold(&DaemonMsg::Entry(Entry::new(
+                entry.seq,
+                Epoch(0),
+                Body::Answer {
+                    call: CallId::new(1).unwrap(),
+                    value: Json::encode(&true).unwrap(),
+                    origin: None,
+                },
+            )));
+            entry.seq = Seq::new(entry.seq.get() + 1).unwrap();
+            view.fold(&msg);
+            let shown = view.present(&view.items[0]);
+            assert_eq!(shown.buttons, protocol::view::Buttons::None);
+            assert!(
+                shown.description.is_none(),
+                "an answered question acquired a late description: {:?}",
+                shown.description
+            );
+            return;
+        }
+        view.fold(&msg);
+    }
+    panic!("scenario has no description result");
+}
+
 /// A session as the daemon has it: its log (entries, and entries of kinds
 /// this build does not know as `Unknown`), and what a client attached from
 /// the start saw live, deltas included.
@@ -137,7 +174,9 @@ impl Session {
                 by: "policy".into(),
                 call: Some(id),
                 d: Verdict::Permission {
-                    permission: Permission::Ask,
+                    permission: Permission::Ask(protocol::ApprovalReason::Mode {
+                        mode: "ask".into(),
+                    }),
                 },
             });
             if rng.chance(30) {
@@ -498,7 +537,7 @@ fn scenarios() -> Vec<(&'static str, Vec<Value>)> {
         by: "policy".into(),
         call: Some(call(seq)),
         d: Verdict::Permission {
-            permission: Permission::Ask,
+            permission: Permission::Ask(protocol::ApprovalReason::Mode { mode: "ask".into() }),
         },
     };
     let echoed = || Outcome::Done {
@@ -522,7 +561,42 @@ fn scenarios() -> Vec<(&'static str, Vec<Value>)> {
             })
             .collect::<Vec<_>>()
     };
-    vec![
+    let review = |tool: &str, effective: Value| {
+        vec![
+        attached(),
+        entry(1, Body::ToolCall { tool: tool.into(), input: Json::encode(&json!({"command":"original harmless input"})).unwrap(), id: None, card: Some(Card { title: "shortened title".into(), ..Card::default() }), by: Audience::Model }),
+        entry(2, Body::Decision { by: "rewrite".into(), call: Some(call(1)), d: Verdict::PreTool { input: Json::encode(&effective).unwrap() } }),
+        entry(3, ask(1)),
+        msg(DaemonMsg::Activity { seq: 3, activity: protocol::Activity::Approval }),
+        entry(4, Body::ModelCall { model: "fast".into(), attempt: 0, choice: protocol::ToolChoice::Auto, r#for: Some(call(1)), purpose: Some("approval-description".into()), request: None }),
+        entry(5, Body::ModelResult { call: call(4), r#for: Some(call(1)), failure: None, outcome: Outcome::Done { output: Json::encode(&json!({"message":{"content":[{"type":"text","text":"Only lists files."}]}})).unwrap() } }),
+        msg(DaemonMsg::Synced { seq: 5 }),
+    ]
+    };
+    let mut scenarios = vec![
+        ("approval reviews the effective multiline call", review("bash", json!({"command":"printf harmless\nrm -rf /tmp/approval-test-sentinel", "timeout":60000, "extra":"every argument"}))),
+        ("approval reviews every edit replacement", review("edit", json!({"path":"/work/deep/config.ini", "edits":[{"old":"allow = false\nkeep = yes", "new":"allow = true\nkeep = yes"}, {"old":"delete = no", "new":"delete = yes"}], "extra":{"flag":true}}))),
+        (
+            "approval reason precedes its optional description",
+            vec![
+                attached(),
+                entry(1, Body::ToolCall {
+                    tool: "bash".into(), input: Json::encode(&json!({"command":"ls"})).unwrap(),
+                    id: None, card: None, by: Audience::Model,
+                }),
+                entry(2, ask(1)),
+                msg(DaemonMsg::Activity { seq: 2, activity: protocol::Activity::Approval }),
+                entry(3, Body::ModelCall {
+                    model: "fast".into(), attempt: 0, choice: protocol::ToolChoice::Auto,
+                    r#for: Some(call(1)), purpose: Some("approval-description".into()), request: None,
+                }),
+                entry(4, Body::ModelResult {
+                    call: call(3), r#for: Some(call(1)), failure: None,
+                    outcome: Outcome::Done { output: Json::encode(&json!({"message":{"content":[{"type":"text","text":"Lists files in the current directory."}]}})).unwrap() },
+                }),
+                msg(DaemonMsg::Synced { seq: 4 }),
+            ],
+        ),
         (
             "only a complete burst certifies idle after its final entry",
             vec![
@@ -875,7 +949,36 @@ fn scenarios() -> Vec<(&'static str, Vec<Value>)> {
         }),
         ("generated session 7", generated(7)),
         ("generated session 11", generated(11)),
-    ]
+    ];
+    for (source, name) in [
+        (
+            "approval reviews the effective multiline call",
+            "approval reviews a user multiline call",
+        ),
+        (
+            "approval reviews every edit replacement",
+            "approval reviews a user edit replacement",
+        ),
+    ] {
+        let messages = scenarios
+            .iter()
+            .find(|(name, _)| *name == source)
+            .unwrap()
+            .1
+            .iter()
+            .map(|value| {
+                let mut msg = DaemonMsg::from_json(value.to_string().as_bytes()).unwrap();
+                if let DaemonMsg::Entry(entry) = &mut msg
+                    && let Body::ToolCall { by, .. } = &mut entry.body
+                {
+                    *by = Audience::User;
+                }
+                serde_json::to_value(msg).unwrap()
+            })
+            .collect();
+        scenarios.push((name, messages));
+    }
+    scenarios
 }
 
 /// Folds each vector's messages and compares the updates, the state and
@@ -895,6 +998,7 @@ fn vectors() {
                 .collect();
             json!({
                 "name": name,
+                "frames": messages.iter().map(Value::to_string).collect::<Vec<_>>(),
                 "messages": messages,
                 "updates": updates,
                 "state": view,
@@ -963,7 +1067,9 @@ fn a_recap_tells_what_the_replay_held() {
                 by: "policy".into(),
                 call: CallId::new(2),
                 d: Verdict::Permission {
-                    permission: Permission::Ask,
+                    permission: Permission::Ask(protocol::ApprovalReason::Mode {
+                        mode: "ask".into(),
+                    }),
                 },
             },
         ),
@@ -1021,7 +1127,7 @@ fn clients_describe_calls_and_recaps_alike() {
         "blocked bash: no network"
     );
     let asked = Verdict::Permission {
-        permission: Permission::Ask,
+        permission: Permission::Ask(protocol::ApprovalReason::Mode { mode: "ask".into() }),
     };
     assert_eq!(decision_line("bash", CallId::new(2), &asked), "bash: ask");
     let retried = Verdict::Retry {
@@ -1032,4 +1138,41 @@ fn clients_describe_calls_and_recaps_alike() {
         decision_line("", CallId::new(3), &retried),
         "retried call 3 (attempt 2): e"
     );
+}
+
+#[test]
+fn answered_and_cancelled_questions_stop_presenting_existing_descriptions() {
+    for terminal in [
+        Body::Answer {
+            call: CallId::new(1).unwrap(),
+            value: Json::encode(&true).unwrap(),
+            origin: None,
+        },
+        Body::Answer {
+            call: CallId::new(1).unwrap(),
+            value: Json::encode(&false).unwrap(),
+            origin: None,
+        },
+        Body::ToolResult {
+            call: CallId::new(1).unwrap(),
+            outcome: Outcome::Interrupted { output: None },
+            card: None,
+        },
+    ] {
+        let (_, messages) = scenarios()
+            .into_iter()
+            .find(|(name, _)| *name == "approval reason precedes its optional description")
+            .unwrap();
+        let mut view = SessionView::default();
+        for value in messages {
+            view.fold(&DaemonMsg::from_json(value.to_string().as_bytes()).unwrap());
+        }
+        assert!(view.present(&view.items[0]).description.is_some());
+        view.fold(&DaemonMsg::Entry(Entry::new(
+            Seq::new(view.seq + 1).unwrap(),
+            Epoch(0),
+            terminal,
+        )));
+        assert!(view.present(&view.items[0]).description.is_none());
+    }
 }

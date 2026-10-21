@@ -235,9 +235,9 @@ mod tests {
         assert_eq!(
             extensions,
             [
-                ("policy-floor", 1),
+                ("policy-floor", 2),
                 ("loop", 1),
-                ("policy", 2),
+                ("policy", 3),
                 ("fork", 1),
                 ("prompt", 1),
                 ("shell", 1),

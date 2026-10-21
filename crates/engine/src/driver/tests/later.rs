@@ -18,7 +18,9 @@ impl Extension for Mute {
 
     fn contribute(&self, r: &mut Registrar) {
         let ended = Arc::clone(&self.ended);
-        r.on::<point::Permission>(|_, _| Permission::Ask);
+        r.on::<point::Permission>(|_, _| {
+            Permission::Ask(protocol::ApprovalReason::Mode { mode: "ask".into() })
+        });
         r.on::<point::Approve>(move |cx, _| {
             let Some(cx) = cx.cx() else {
                 return Answer::Now(None);

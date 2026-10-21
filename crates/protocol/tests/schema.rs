@@ -136,7 +136,7 @@ fn log() -> Vec<Vec<u8>> {
         r#"{"seq":3,"epoch":0,"kind":"model_call","model":"openai:m"}"#,
         r#"{"seq":4,"epoch":0,"kind":"model_result","call":3,"outcome":{"status":"done","output":{"text":"ok"}}}"#,
         r#"{"seq":5,"epoch":0,"kind":"tool_call","tool":"bash","input":{"command":"ls"}}"#,
-        r#"{"seq":6,"epoch":0,"kind":"decision","by":"policy","call":5,"d":"permission","permission":"ask"}"#,
+        r#"{"seq":6,"epoch":0,"kind":"decision","by":"policy","call":5,"d":"permission","permission":{"ask":{"mode":{"mode":"ask"}}}}"#,
         r#"{"seq":7,"epoch":0,"kind":"input","text":"and sizes","mode":"steer"}"#,
         r#"{"seq":8,"epoch":0,"kind":"answer","call":5,"value":true}"#,
         r#"{"seq":9,"epoch":0,"kind":"tool_process","call":5,"pgid":42,"boot":"b"}"#,
@@ -150,7 +150,7 @@ fn log() -> Vec<Vec<u8>> {
         r#"{"seq":17,"epoch":0,"kind":"tool_result","call":15,"outcome":{"status":"done","output":null}}"#,
         r#"{"seq":18,"epoch":0,"kind":"input","text":"later"}"#,
         r#"{"seq":19,"epoch":0,"kind":"tool_call","tool":"bash","input":{"command":"rm x"}}"#,
-        r#"{"seq":20,"epoch":0,"kind":"decision","by":"policy","call":19,"d":"permission","permission":"ask"}"#,
+        r#"{"seq":20,"epoch":0,"kind":"decision","by":"policy","call":19,"d":"permission","permission":{"ask":{"mode":{"mode":"ask"}}}}"#,
     ]
     .map(|l| l.as_bytes().to_vec())
     .to_vec()

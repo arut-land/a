@@ -138,6 +138,7 @@ impl Page {
             // none; a sync brings the recap.
             Change::Added { index: 0, .. }
             | Change::Snapshot
+            | Change::Batch { .. }
             | Change::Synced
             | Change::Attached { reset: true, .. } => self.show_all(),
             Change::Added { item, .. } => {
