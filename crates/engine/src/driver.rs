@@ -267,6 +267,7 @@ struct Session {
     mail: Mail,
     states: Mutex<Arc<Mutex<States>>>,
     env: Mutex<Option<Arc<Environment>>>,
+    pending_env: Mutex<Option<Arc<Environment>>>,
     /// Background process groups the session owns, until each ends.
     jobs: Mutex<Vec<Arc<dyn ext::RunningProcess>>>,
     work: Mutex<WorkSet<WorkId>>,
@@ -370,7 +371,7 @@ enum Msg {
     Step(Event),
     /// A client to follow the session, answered once it does.
     Attach(Outbox, u64, oneshot::Sender<()>),
-    Env(Arc<Environment>),
+    Env,
     Context {
         origin: ContextOrigin,
         request: ContextRequest,
@@ -640,7 +641,10 @@ impl Live {
     /// Runs commands from now on in `env`, the newest client's; its
     /// redacted form is logged unless it is the one logged last.
     pub fn set_env(&self, env: impl Into<Arc<Environment>>) {
-        self.send(Msg::Env(env.into()));
+        let mut pending = lock(&self.session.pending_env);
+        if pending.replace(env.into()).is_none() {
+            self.send(Msg::Env);
+        }
     }
 
     pub(crate) fn settled(&self, child: SessionId, outcome: Outcome) {
@@ -1252,7 +1256,8 @@ impl Actor {
                 self.admit().await;
                 return None;
             }
-            Msg::Env(env) => {
+            Msg::Env => {
+                let env = lock(&self.live.session.pending_env).take()?;
                 let logged = env.redacted();
                 *lock(&self.live.session.env) = Some(env);
                 Event::Environment(logged)
@@ -1403,6 +1408,9 @@ impl Actor {
 
     async fn refuse(&mut self, msg: Msg, why: ReadOnly) {
         match msg {
+            Msg::Env => {
+                lock(&self.live.session.pending_env).take();
+            }
             Msg::Request { reply, .. } => reply.send(Err(why.to_string())),
             #[cfg(test)]
             Msg::Barrier(_) => drop(self.take(msg).await),
@@ -2390,6 +2398,7 @@ impl Session {
             mail,
             states: Mutex::new(Arc::new(Mutex::new(registry.states()))),
             env: Mutex::default(),
+            pending_env: Mutex::default(),
             jobs: Mutex::default(),
             work: Mutex::default(),
             changed: rt::Notify::new(),

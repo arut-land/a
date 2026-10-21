@@ -2590,3 +2590,48 @@ fn corrupt_or_mismatched_checkpoints_fall_back_to_the_log() {
         );
     }
 }
+
+#[test]
+fn environment_bursts_retain_one_payload_and_one_mailbox_marker() {
+    let home = gpt_home();
+    let fixture = Fixture::new(
+        "echo",
+        Registry::default(),
+        with_home(&Script::new(&[]), &home),
+    );
+    let registry = fixture.0.registry.get();
+    let header = Fixture::header();
+    let loaded = fixture.0.store.create(&header).unwrap();
+    let (tx, rx) = channel::unbounded();
+    let live = Live {
+        session: Session::new(&header, &fixture.0, Arc::new(tx), &registry),
+        id: header.id,
+        workspace: header.workspace.clone(),
+        parent: None,
+        frames: Arc::new(FrameLog::new(loaded.lines, 0)),
+        followers: Mutex::default(),
+        busy: AtomicBool::new(false),
+        has_input: AtomicBool::new(false),
+        attached: AtomicUsize::new(0),
+        last_active: Mutex::new(Instant::now()),
+        summary: Mutex::new(summary(&header, &Ledger::default())),
+        ended: Flag::default(),
+    };
+    let mut previous = Weak::new();
+    for n in 0..1000 {
+        let env = Arc::new(Environment::new(n.to_string().into(), Vec::new(), false));
+        live.set_env(Arc::clone(&env));
+        assert!(previous.upgrade().is_none());
+        previous = Arc::downgrade(&env);
+    }
+    assert!(matches!(rx.try_recv(), Some(Msg::Env)));
+    assert!(rx.try_recv().is_none());
+    let latest = lock(&live.session.pending_env).take().unwrap();
+    assert_eq!(latest.cwd, PathBuf::from("999"));
+    live.set_env(Environment::new("next".into(), Vec::new(), false));
+    assert!(matches!(rx.try_recv(), Some(Msg::Env)));
+    assert!(rx.try_recv().is_none());
+    drop(live);
+    drop(fixture);
+    std::fs::remove_file(home).unwrap();
+}

@@ -633,7 +633,7 @@ impl Offer<'_> {
         if matches!(last, Some(ClientMsg::Interrupt { .. })) {
             return Ok(Vec::new());
         }
-        Ok(self.0.send(ClientMsg::INTERRUPT))
+        self.send(ClientMsg::INTERRUPT)
     }
 
     /// Answers the approval call `call` waits for.
@@ -657,7 +657,23 @@ impl Offer<'_> {
     }
 
     fn send(self, msg: ClientMsg) -> Result<Vec<Effect>, Notice> {
-        if self.0.unanswered.len() + self.0.queued.len() >= UNANSWERED {
+        let control = matches!(msg, ClientMsg::Interrupt { .. });
+        let budget = crate::QueueBudget::default();
+        let bytes: usize = self
+            .0
+            .unanswered
+            .iter()
+            .chain(&self.0.queued)
+            .map(retained_bytes)
+            .sum();
+        let limit = if control {
+            budget.bytes
+        } else {
+            budget.bytes / 2
+        };
+        if self.0.unanswered.len() + self.0.queued.len() >= UNANSWERED + usize::from(control)
+            || retained_bytes(&msg) > limit.saturating_sub(bytes)
+        {
             return Err(Notice::Backpressure);
         }
         Ok(self.0.send(msg))
@@ -678,6 +694,14 @@ impl Offer<'_> {
             Err(Notice::NothingRunning)
         }
     }
+}
+
+pub(crate) fn retained_bytes(msg: &ClientMsg) -> usize {
+    size_of::<ClientMsg>()
+        + match msg {
+            ClientMsg::Input { text, .. } => text.capacity(),
+            _ => 0,
+        }
 }
 
 pub(crate) const fn is_mutation(msg: &ClientMsg) -> bool {
@@ -724,6 +748,35 @@ mod tests {
         Event {
             conn: ConnId(conn),
             kind: EventKind::Closed(Error::Closed),
+        }
+    }
+
+    #[test]
+    fn retained_mutations_reject_bytes_before_numbering_and_keep_cancellation_capacity() {
+        for connected in [false, true] {
+            let mut client = SessionClient::new(Env::Keep);
+            client.open(Target::New);
+            if connected {
+                client.step(live(1, Caps::ALL));
+            }
+            let text = "x".repeat(crate::QueueBudget::default().bytes / 3);
+            client.offer().unwrap().input(text.clone()).unwrap();
+            let seq = client.seq;
+            assert!(matches!(
+                client.offer().unwrap().input(text),
+                Err(Notice::Backpressure)
+            ));
+            assert_eq!(client.seq, seq);
+            assert_eq!(client.queued.len() + client.unanswered.len(), 1);
+            client.offer().unwrap().interrupt().unwrap();
+            assert_eq!(client.queued.len() + client.unanswered.len(), 2);
+            if !connected {
+                client.step(live(1, Caps::ALL));
+            }
+            let bytes: usize = client.unanswered.iter().map(retained_bytes).sum();
+            assert!(bytes <= crate::QueueBudget::default().bytes);
+            client.step(msg(1, DaemonMsg::Ack { client_seq: 1 }));
+            assert!(client.offer().unwrap().input("x".repeat(bytes)).is_ok());
         }
     }
 
