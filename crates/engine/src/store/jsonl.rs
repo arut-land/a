@@ -9,8 +9,8 @@ use protocol::{Decode, Entry, Json, ReadOnly, SessionId};
 use serde::{Deserialize, Serialize};
 
 use super::{
-    Encoded, Header, ImportStep, LeaseAuthority, Lines, Loaded, Local, Log, LogStore, Snapshot,
-    Writer, span,
+    Encoded, Header, History, ImportStep, LeaseAuthority, Lines, Loaded, Local, Log, LogStore,
+    Snapshot, Writer, span,
 };
 
 /// The format of the files this build writes, which the header line names:
@@ -83,10 +83,11 @@ impl Jsonl {
             line.remove(at);
             seal(&mut line, 0);
             file.write_all(&line)?;
-            for (index, entry) in entries.iter().enumerate() {
-                if entry.seq.get() != index as u64 + 1 {
-                    return Err(io::Error::other("import has a sequence gap"));
-                }
+            let mut history = History::default();
+            for entry in entries {
+                history
+                    .accept(entry)
+                    .map_err(|why| io::Error::other(why.to_string()))?;
                 line.clear();
                 entry.encode(&mut line)?;
                 seal(&mut line, 0);
@@ -257,16 +258,16 @@ impl LogStore for Jsonl {
             return Err(io::Error::other("unreadable session header"));
         }
         let mut entries = Vec::new();
-        for next in 1..=seq {
+        let mut history = History::default();
+        for _ in 1..=seq {
             line.clear();
             reader.read_until(b'\n', &mut line)?;
             if !unseal(&mut line) {
                 return Err(io::Error::other("incomplete or damaged session prefix"));
             }
-            let entry = Entry::from_json(&line)?;
-            if entry.seq.get() != next {
-                return Err(io::Error::other("session prefix has a sequence gap"));
-            }
+            let entry = history
+                .decode(&line)
+                .map_err(|why| io::Error::other(why.to_string()))?;
             entries.push(entry);
         }
         Ok(entries)
@@ -313,10 +314,7 @@ impl LogStore for Jsonl {
     /// past it, so the next append starts on a fresh line and no read lands
     /// in what was cut; a file kept as it is is not touched.
     ///
-    /// The scan starts after the snapshot if `restore` takes it, else at
-    /// the first entry; the lines before where it starts are placed by
-    /// `<id>.idx`, checked against the log where they end. What the scan
-    /// indexes that the file lacks is added to it.
+    /// A snapshot may skip replay only after its covered entries validate.
     fn load(
         &self,
         id: SessionId,
@@ -328,27 +326,26 @@ impl LogStore for Jsonl {
         self.domain.check(&file)?;
         let mut index = Index::new(file, path, 0);
         let other = index.header()?;
-        let mut floor = index.recall()?;
-        let covered = match Snap::read(&index.path) {
-            Some(snap) if index.places(&snap) => {
-                let covers = snap.covers;
-                let taken = restore(Snapshot {
-                    covers,
+        index.recall()?;
+        let snapshot = Snap::read(&index.path).filter(|snap| index.places(snap));
+        let placed = index.resume(0);
+        let mut history = History::default();
+        if let Some(snap) = snapshot {
+            let damage = index.scan(other, &mut history, snap.covers, |_| {})?;
+            let valid =
+                damage.is_none() && history.seq == snap.covers && index.end() == snap.offset;
+            if !valid
+                || !restore(Snapshot {
+                    covers: snap.covers,
                     image: snap.image,
-                });
-                taken.then_some(covers)
+                })
+            {
+                index.resume(0);
+                history = History::default();
             }
-            _ => None,
-        };
-        if covered.is_none() {
-            floor = 0;
         }
-        let placed = index.resume(covered.unwrap_or(0));
         let from = index.end();
-        let kept = index.scan(other, |entry| {
-            floor = entry.epoch.0;
-            each(entry);
-        })?;
+        let kept = index.scan(other, &mut history, u64::MAX, each)?;
         let (seq, read) = (index.read().ends.len() as u64, index.end() - from);
         if kept.is_some() {
             ext_logging::emit(ext_logging::Fact::StoreRepair {
@@ -368,7 +365,7 @@ impl LogStore for Jsonl {
         }
         let agreed = placed.agreed(&index.read().ends);
         index.persist(agreed);
-        let epoch = self.leases.acquire(id, floor);
+        let epoch = self.leases.acquire(id, history.epoch);
         Ok(index.loaded(
             seq,
             read,
@@ -384,7 +381,9 @@ impl LogStore for Jsonl {
         let path = self.path(id)?;
         let mut index = Index::new(File::open(&path)?, path, 0);
         let other = index.header()?;
-        index.scan(other, |e| entries.push(e))?;
+        index.scan(other, &mut History::default(), u64::MAX, |e| {
+            entries.push(e);
+        })?;
         Ok(entries)
     }
 
@@ -520,9 +519,8 @@ impl Index {
     /// Takes up `<id>.idx` as far as the file bears it out: its ends must
     /// rise from after the header to no further than the file goes, and
     /// the last line it places must be a sealed entry numbered as it says;
-    /// else none of it is used. Returns the epoch of that last line, the
-    /// floor of the lease when nothing after it is read.
-    fn recall(&mut self) -> io::Result<u32> {
+    /// else none of it is used. These offsets cannot certify log ordering.
+    fn recall(&mut self) -> io::Result<()> {
         let path = beside(&self.path, "idx");
         let mut ends: Vec<u64> = fs::read(&path).map_or_else(
             |_| Vec::new(),
@@ -539,19 +537,16 @@ impl Index {
         let rising = ends.first().is_none_or(|&first| first > self.start)
             && ends.windows(2).all(|w| w[0] < w[1])
             && ends.last().is_none_or(|&last| last <= len);
-        let mut floor = 0;
         let placed = rising
             && ends.len().checked_sub(1).is_none_or(|last| {
-                self.entry(&ends, last).is_some_and(|e| {
-                    floor = e.epoch.0;
-                    e.seq.get() == ends.len() as u64
-                })
+                self.entry(&ends, last)
+                    .is_some_and(|e| e.seq.get() == ends.len() as u64)
             });
         if !placed {
             ends.clear();
         }
         self.ends_mut().ends = ends;
-        Ok(floor)
+        Ok(())
     }
 
     /// Entry `at + 1`, read where `ends` places its line, if it is there.
@@ -621,6 +616,8 @@ impl Index {
     fn scan(
         &mut self,
         other: Option<ReadOnly>,
+        history: &mut History,
+        through: u64,
         mut each: impl FnMut(Entry),
     ) -> io::Result<Option<ReadOnly>> {
         let mut end = self.end();
@@ -629,13 +626,16 @@ impl Index {
         let ends = self.ends.get_mut().unwrap_or_else(PoisonError::into_inner);
         let mut line = Vec::new();
         loop {
+            if history.seq == through {
+                return Ok(other);
+            }
             line.clear();
             let n = reader.read_until(b'\n', &mut line)?;
             if n == 0 {
                 return Ok(other);
             }
             let sealed = unseal(&mut line);
-            if let Some(entry) = sealed.then(|| Entry::from_json(&line).ok()).flatten() {
+            if let Some(entry) = sealed.then(|| history.decode(&line).ok()).flatten() {
                 end += n as u64;
                 ends.ends.push(end);
                 each(entry);

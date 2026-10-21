@@ -19,7 +19,7 @@ use std::sync::Arc;
 
 #[cfg(test)]
 use protocol::Seq;
-use protocol::{Entry, Epoch, Json, ReadOnly, SessionId};
+use protocol::{Decode, Entry, Epoch, Json, ReadOnly, SessionId};
 use serde::{Deserialize, Serialize};
 
 #[cfg(test)]
@@ -61,6 +61,36 @@ pub struct Snapshot {
     pub image: Json,
 }
 
+/// Snapshots and indexes cannot certify the ordering of the underlying log.
+#[derive(Default)]
+struct History {
+    seq: u64,
+    epoch: u32,
+}
+
+impl History {
+    fn accept(&mut self, entry: &Entry) -> Result<(), ReadOnly> {
+        if self.seq.checked_add(1) != Some(entry.seq.get()) || entry.epoch.0 < self.epoch {
+            return Err(self.damage());
+        }
+        self.seq = entry.seq.get();
+        self.epoch = entry.epoch.0;
+        Ok(())
+    }
+
+    fn decode(&mut self, line: &[u8]) -> Result<Entry, ReadOnly> {
+        let entry = Entry::from_json(line).map_err(|_| self.damage())?;
+        self.accept(&entry)?;
+        Ok(entry)
+    }
+
+    fn damage(&self) -> ReadOnly {
+        ReadOnly::Damaged {
+            seq: self.seq.saturating_add(1),
+        }
+    }
+}
+
 /// A session's writer, and the entries it continues as their lines.
 pub struct Loaded {
     pub writer: Writer,
@@ -69,7 +99,7 @@ pub struct Loaded {
     pub lines: Arc<dyn Lines>,
     /// The seq of the last entry committed.
     pub seq: u64,
-    /// The bytes of log read to load it: those after the snapshot taken,
+    /// The bytes of log replayed to load it: those after the snapshot taken,
     /// or all of them.
     pub read: u64,
 }
@@ -267,14 +297,13 @@ pub trait LogStore: Send + Sync {
     /// Every session's header, oldest first, without reading the entries.
     fn headers(&self) -> io::Result<Vec<Header>>;
 
-    /// One session's appender, handing `each` the committed entries in
-    /// order as they are read, one at a time: loading keeps none that
-    /// `each` does not. The newest snapshot the store holds of the log,
-    /// if it has one it can place, is handed to `restore` first: taken,
-    /// only the entries after it are read. `NotFound` if there is no log.
-    /// A log the store cannot continue without changing what it holds is
-    /// handed out kept as it is ([`Writer::read_only`]), with the entries
-    /// it reads.
+    /// Validates contiguous sequences and nondecreasing epochs as entries
+    /// decode. Only the validated prefix may reach `each` or certify a
+    /// snapshot offered to `restore`; an accepted snapshot skips replay,
+    /// not validation. `NotFound` if there is no log.
+    /// Damage preserves the log and returns its valid prefix with a typed
+    /// [`Writer::read_only`] reason, even when the damaged entry is last.
+    /// Only an unsealed torn tail may be discarded by a backend.
     fn load(
         &self,
         id: SessionId,
