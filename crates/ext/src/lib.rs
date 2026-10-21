@@ -29,6 +29,7 @@ use protocol::Outcome;
 
 mod agent;
 mod assemble;
+mod conversation;
 mod ext;
 mod flag;
 mod history;
@@ -37,6 +38,9 @@ mod r#loop;
 pub mod point;
 pub mod schema;
 mod service;
+pub use conversation::{
+    Awaited, ContextSource, ConversationHandle, DepthBudget, Detached, Runner, Spawn, SpawnRefusal,
+};
 mod settings;
 pub mod shape;
 mod state;

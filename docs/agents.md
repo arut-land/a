@@ -5,8 +5,9 @@ Side threads and the metrics projection are follow-up work, not part of the
 initial implementation.
 
 Implementation status: registration inheritance and nested conversation storage
-are implemented. The spawn request types, prefix-context admission, detached SDK
-API, durable messaging and depth-budget enforcement below remain planned. The
+are implemented. Typed spawn requests and private depth budgets are defined in
+the SDK. Engine admission, prefix-context admission, detached SDK execution,
+durable messaging and depth-budget enforcement below remain planned. The
 existing `task` still uses the awaited fresh-child API. This document must not
 be read as claiming that those modes are available yet.
 
