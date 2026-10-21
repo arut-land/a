@@ -15,13 +15,13 @@ impl<const SHARED: bool> Tool for Owner<SHARED> {
     };
     async fn call(&self, args: &ext::Args, cx: &Cx) -> Result<Outcome, String> {
         let input = Json::encode(args).unwrap();
-        let tool = if args.args == "safe" {
-            "safe_effect"
-        } else {
-            "effect"
+        let tool = match args.args.as_str() {
+            "safe" => "safe_effect",
+            "nested" => "branch",
+            _ => "effect",
         };
         let first = cx.invoke("first", tool, &input);
-        if args.args == "parallel" {
+        if matches!(args.args.as_str(), "parallel" | "nested") {
             let mut first = pin!(first);
             let mut second = pin!(cx.invoke("second", tool, &input));
             let (mut a, mut b) = (None, None);
@@ -260,4 +260,75 @@ fn recover<const SAFE: bool>() {
     );
     assert!(log.iter().any(|entry| matches!(&entry.body, Body::ToolResult { call, outcome, .. } if call.0 == child && (SAFE || matches!(outcome, Outcome::Interrupted { .. })))));
     recovered.halt();
+}
+
+#[derive(Clone)]
+struct Branch(Arc<(AtomicUsize, rt::Notify)>);
+impl Tool for Branch {
+    type In = ext::Args;
+    type Out = bool;
+    const NAME: &'static str = "branch";
+    const DESCRIPTION: &'static str = "await an exclusive descendant";
+    const REPLAY: Replay = Replay::Safe;
+    const CONCURRENCY: Concurrency = Concurrency::Shared;
+    async fn call(&self, _: &ext::Args, cx: &Cx) -> Result<bool, String> {
+        self.0.0.fetch_add(1, Ordering::SeqCst);
+        self.0.1.notify();
+        or(
+            self.0.1.until(|| self.0.0.load(Ordering::SeqCst) == 2),
+            cx.cancel.wait(),
+        )
+        .await;
+        match cx
+            .invoke(
+                "exclusive",
+                "effect",
+                &Json::encode(&ext::Args {
+                    args: String::new(),
+                })
+                .unwrap(),
+            )
+            .await
+            .outcome
+        {
+            Outcome::Failed { error } => Err(error),
+            _ => Ok(true),
+        }
+    }
+}
+impl Extension for Branch {
+    const NAME: &'static str = "branch";
+    const VERSION: u32 = 1;
+    fn contribute(&self, r: &mut Registrar) {
+        r.tool(self.clone());
+    }
+}
+
+#[test]
+fn shared_siblings_cannot_deadlock_on_exclusive_descendants() {
+    let entered = Arc::new((AtomicUsize::new(0), rt::Notify::new()));
+    let calls = Arc::new(AtomicUsize::new(0));
+    let effect = Effect::<false> {
+        calls: calls.clone(),
+        active: Arc::default(),
+        maximum: Arc::default(),
+        release: Flag::default(),
+    };
+    let fixture = Fixture::new(
+        ext_fixtures::ECHO,
+        Registry::default()
+            .with(&effect)
+            .unwrap()
+            .with(&Branch(entered.clone()))
+            .unwrap(),
+        openai(&Script::new(&[])),
+    );
+    let session = fixture.create();
+    session.submit("call owner {\"args\":\"nested\"}").unwrap();
+    settle(&session);
+    assert_eq!(entered.0.load(Ordering::SeqCst), 2);
+    assert_eq!(calls.load(Ordering::SeqCst), 0);
+    let log = log_of(&session);
+    assert_eq!(log.iter().filter(|e| matches!(&e.body, Body::ToolResult { outcome: Outcome::Failed { error }, .. } if error == "exclusive invocation requires exclusive ancestors")).count(), 2);
+    session.halt();
 }

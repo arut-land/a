@@ -1265,24 +1265,24 @@ impl Core {
             }
             return Ok(call);
         }
-        let mut root = parent;
+        let mut ancestor = parent;
         for depth in 1..=8 {
-            match self.fold.ledger.call(root).map(|open| &open.call) {
+            if !self.shared(&tool)
+                && self
+                    .tool_of(ancestor)
+                    .is_some_and(|(tool, _)| self.shared(&tool))
+            {
+                return Err("exclusive invocation requires exclusive ancestors".into());
+            }
+            match self.fold.ledger.call(ancestor).map(|open| &open.call) {
                 Some(Call::Tool {
                     invoke: Some(key), ..
-                }) if depth < 8 => root = key.parent,
+                }) if depth < 8 => ancestor = key.parent,
                 Some(Call::Tool {
                     invoke: Some(_), ..
                 }) => return Err("tool delegation is too deep".into()),
                 _ => break,
             }
-        }
-        if !self.shared(&tool)
-            && self
-                .tool_of(root)
-                .is_some_and(|(tool, _)| self.shared(&tool))
-        {
-            return Err("exclusive invocation requires an exclusive owner".into());
         }
         let card = self.registry.read(self.next_seq(), &tool, &input);
         let call = self.append(
