@@ -1552,3 +1552,52 @@ fn recursive_children_keep_the_admitted_runner_and_decreasing_budget() {
     drop(daemon);
     std::fs::remove_dir_all(root).unwrap();
 }
+
+#[test]
+fn a_prefix_child_is_admitted_inside_its_unfinished_owning_turn() {
+    let (root, home) = home("prefix-task");
+    let daemon = Daemon::load(&home, &echo()).unwrap();
+    let parent = daemon.attach_to(&Target::New, || "/w".into()).unwrap();
+    parent.session().submit("before").unwrap();
+    settle(&daemon);
+    parent
+        .session()
+        .submit("call fork_task {\"prompt\":\"done\"}")
+        .unwrap();
+    settle(&daemon);
+    let children: Vec<_> = daemon
+        .shared
+        .store
+        .headers()
+        .unwrap()
+        .into_iter()
+        .filter(|h| h.parent.is_some())
+        .collect();
+    assert_eq!(
+        children.len(),
+        1,
+        "{:?}",
+        bodies(&*daemon.shared.store, parent.session().id)
+    );
+    let child = bodies(&*daemon.shared.store, children[0].id);
+    let Body::Spawned { intent } = &child[0] else {
+        panic!("{child:?}")
+    };
+    let image: serde_json::Value = intent.parse().unwrap();
+    assert!(
+        image["image"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|e| e["text"] == "before")
+    );
+    assert!(
+        fired(&bodies(&*daemon.shared.store, parent.session().id))
+            .iter()
+            .all(|o| matches!(o, Outcome::Done { .. }))
+    );
+    assert!(child.iter().all(|b| !matches!(b, Body::ToolCall { .. })));
+    drop(parent);
+    drop(daemon);
+    std::fs::remove_dir_all(root).unwrap();
+}

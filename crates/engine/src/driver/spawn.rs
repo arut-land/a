@@ -79,13 +79,41 @@ impl Actor {
                 .and_then(|m| m.map_or_else(|| session.model_named().map(|(m, _)| m), Ok)),
         }
         .unwrap_or_else(|_| "none".into());
+        let mut image = Vec::new();
+        let mut installed = self.registry.installed();
+        if let ext::ContextSource::Prefix { session, seq } = request.context {
+            if session != self.live.id || seq.get() > self.ordered_seq {
+                refusal = Some(SpawnRefusal::Unavailable(
+                    "prefix is not committed in the owning conversation".into(),
+                ));
+            } else {
+                let entries: Vec<_> = self
+                    .live
+                    .frames
+                    .entries()
+                    .chain(
+                        self.unsynced
+                            .iter()
+                            .flat_map(|(entries, _)| entries.iter().cloned()),
+                    )
+                    .filter(|e| e.seq <= seq)
+                    .collect();
+                if let Some(source) = entries.iter().rev().find_map(|e| match &e.body {
+                    Body::Extensions { installed } => Some(installed),
+                    _ => None,
+                }) {
+                    installed = source.clone();
+                }
+                image = crate::transcript::context_image(&entries);
+            }
+        }
         let input = request.prompt.clone();
         let intent = Json::encode(&SpawnIntent {
             call,
             request,
             model,
-            installed: self.registry.installed(),
-            image: Vec::new(),
+            installed,
+            image,
             refusal,
         })
         .expect("spawn intent encodes");

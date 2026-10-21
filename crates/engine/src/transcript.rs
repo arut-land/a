@@ -7,7 +7,7 @@ use std::sync::Arc;
 
 use ext::host::Registry;
 use llm::{Assistant, Message, Messages, ToolMessage, ToolResult};
-use protocol::{Body, CallId, Entry, Outcome, Seq, Verdict};
+use protocol::{Body, CallId, Decode, Entry, Outcome, Seq, Verdict};
 
 /// The conversation the model sees, folded from the log's facts as they
 /// commit, so that a model call reads it rather than the log. A model
@@ -90,6 +90,25 @@ impl Transcript {
     /// just had, which `e` stores: taken as it is rather than read again.
     pub fn apply(&mut self, e: &Entry, fresh: Option<Assistant>) {
         let message = match &e.body {
+            Body::Spawned { intent } => {
+                #[derive(serde::Deserialize)]
+                struct Image {
+                    image: Vec<protocol::Json>,
+                }
+                if let Ok(image) = intent.parse::<Image>() {
+                    let entries = image
+                        .image
+                        .iter()
+                        .filter_map(|j| Entry::from_json(j.raw().as_bytes()).ok());
+                    let messages = Self::of(entries, Arc::clone(&self.registry), "").into_context();
+                    for message in messages.iter() {
+                        self.messages.push(message.clone());
+                    }
+                    self.context = self.messages.len();
+                    self.last = e.seq.get();
+                }
+                return;
+            }
             Body::Input {
                 text, taken: true, ..
             }
@@ -176,7 +195,130 @@ impl Transcript {
         (self.last < before).then_some(&self.messages)
     }
 
+    /// Pending exchanges cannot be replayed by a context-only child.
+    pub fn into_context(self) -> Messages {
+        let answered: std::collections::HashSet<_> = self
+            .messages
+            .iter()
+            .filter_map(|m| match m {
+                Message::Tool(t) => Some(t.results.iter().map(|r| r.id.clone())),
+                _ => None,
+            })
+            .flatten()
+            .collect();
+        self.messages.iter().cloned().filter_map(|mut m| {
+            if let Message::Assistant(a) = &mut m {
+                a.content.retain(|p| !matches!(p, llm::AssistantPart::ToolCall(c) if !c.provider_executed && !answered.contains(&c.id)));
+                if a.content.is_empty() { return None; }
+            }
+            Some(m)
+        }).collect()
+    }
+
     pub fn into_messages(self) -> Messages {
         self.messages
+    }
+}
+
+/// The image contains projection inputs, never an executable child ledger.
+pub(crate) fn context_image(entries: &[Entry]) -> Vec<protocol::Json> {
+    entries
+        .iter()
+        .filter(|e| {
+            matches!(
+                e.body,
+                Body::Input { .. }
+                    | Body::Take { .. }
+                    | Body::Assistant { .. }
+                    | Body::Context { .. }
+                    | Body::Edit { .. }
+                    | Body::ModelResult { r#for: None, .. }
+                    | Body::ToolCall { .. }
+                    | Body::ToolResult { .. }
+                    | Body::Fired { .. }
+                    | Body::Spawned { .. }
+            )
+        })
+        .map(|e| protocol::Json::encode(e).expect("context entry encodes"))
+        .collect()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use protocol::{Epoch, Json, Mode, SessionId};
+    fn entry(seq: u64, body: Body) -> Entry {
+        Entry::new(Seq::new(seq).unwrap(), Epoch(0), body)
+    }
+    #[test]
+    fn a_prefix_projects_edits_and_publications_without_executable_ownership() {
+        let entries = vec![
+            entry(
+                1,
+                Body::Input {
+                    text: "old".into(),
+                    mode: Mode::Queue,
+                    taken: true,
+                    origin: None,
+                },
+            ),
+            entry(
+                2,
+                Body::Context {
+                    text: "skill".into(),
+                    publication: Some(protocol::publication::Publication {
+                        namespace: "skills".into(),
+                        key: Json::encode("review").unwrap(),
+                    }),
+                },
+            ),
+            entry(
+                3,
+                Body::Edit {
+                    target: Seq::new(1).unwrap(),
+                    upto: None,
+                    replace: Some(Json::encode("effective").unwrap()),
+                },
+            ),
+            entry(
+                4,
+                Body::ToolCall {
+                    tool: "task".into(),
+                    input: Json::null(),
+                    id: Some("pending".into()),
+                    card: None,
+                    by: protocol::Audience::Model,
+                },
+            ),
+            entry(
+                5,
+                Body::Watch {
+                    child: SessionId::new(),
+                },
+            ),
+        ];
+        let image = context_image(&entries);
+        let inherited: Vec<_> = image
+            .iter()
+            .map(|j| Entry::from_json(j.raw().as_bytes()).unwrap())
+            .collect();
+        assert!(
+            inherited
+                .iter()
+                .all(|e| !matches!(e.body, Body::Watch { .. }))
+        );
+        let registry = Arc::new(Registry::default());
+        let expected = Transcript::of(&entries, registry.clone(), "").into_context();
+        let intent = Json::encode(&serde_json::json!({"image": image})).unwrap();
+        let child = [entry(1, Body::Spawned { intent })];
+        let actual = Transcript::of(&child, registry, "").into_messages();
+        assert_eq!(actual, expected);
+        assert_eq!(
+            actual,
+            Messages::from_iter([Message::user("skill"), Message::user("effective")])
+        );
+        let ledger = protocol::ledger::Ledger::of(child.iter());
+        assert!(ledger.open_calls().next().is_none());
+        assert!(ledger.armed().next().is_none());
     }
 }

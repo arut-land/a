@@ -7,8 +7,9 @@ initial implementation.
 Implementation status: registration inheritance and nested conversation storage
 are implemented. Typed spawn requests and private depth budgets are defined in
 the SDK, and awaited admission records the runner, extension manifest and
-remaining depth before creating the child. Prefix-context admission, detached
-SDK execution and durable messaging below remain planned. This document must not
+remaining depth before creating the child. Prefix-context children are available through `fork_task`; their immutable
+projection images never fold ownership into the child. Detached SDK execution
+and durable messaging below remain planned. This document must not
 be read as claiming that those modes are available yet.
 
 A conversation owns an ordered log, an inbox and a

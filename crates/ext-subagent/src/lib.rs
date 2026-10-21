@@ -23,7 +23,7 @@ impl Extension for Subagent {
     const VERSION: u32 = 1;
 
     fn contribute(&self, r: &mut Registrar) {
-        r.tool(Task).text(Text::system("task", 30, "`task` hands a self-contained piece of work to a fresh session, which sees nothing of this conversation: say all it needs in `prompt`. It answers with what that session ended with.").for_tool(Task::NAME));
+        r.tool(Task).tool(ForkTask).text(Text::system("task", 30, "`task` hands a self-contained piece of work to a fresh session, which sees nothing of this conversation: say all it needs in `prompt`. It answers with what that session ended with.").for_tool(Task::NAME));
     }
 }
 
@@ -73,5 +73,40 @@ impl Tool for Task {
         output
             .parse()
             .map_or_else(|_| llm::Output::Json(output.clone()), llm::Output::Text)
+    }
+}
+
+/// A current-context task can be admitted while its owning turn is open.
+pub struct ForkTask;
+impl Tool for ForkTask {
+    type In = Prompt;
+    type Out = String;
+    const NAME: &'static str = "fork_task";
+    const DESCRIPTION: &'static str =
+        "Runs work in a child with this conversation's current context.";
+    const REPLAY: Replay = Replay::Safe;
+    const CONCURRENCY: Concurrency = Concurrency::Shared;
+    async fn call(&self, input: &Prompt, cx: &Cx) -> Result<String, String> {
+        let sessions = cx
+            .service::<dyn Sessions>()
+            .ok_or("this engine runs no child sessions")?;
+        let mut spawn = ext::Spawn::new::<Subagent>(
+            "fork_task",
+            input.prompt.clone(),
+            sessions.runner(),
+            ext::DepthBudget::new(8),
+        );
+        spawn.context = ext::ContextSource::Prefix {
+            session: cx.session,
+            seq: cx.call.0,
+        };
+        let outcome = sessions
+            .spawn(cx, spawn.awaited())
+            .await
+            .map_err(|e| format!("{e:?}"))?;
+        Ok(ext::child_result(&outcome))
+    }
+    fn to_model(output: &Json) -> llm::Output {
+        Task::to_model(output)
     }
 }

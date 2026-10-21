@@ -389,7 +389,7 @@ impl Msg {
             self,
             Self::Attach(..)
                 | Self::Context {
-                    request: ContextRequest::Side { .. },
+                    request: ContextRequest::Side { .. } | ContextRequest::Child { .. },
                     ..
                 }
         )
