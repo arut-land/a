@@ -716,3 +716,27 @@ mod tests {
         assert_eq!(exit_signal(ExitStatus::from_raw(0)), None);
     }
 }
+
+/// Owns a child's input pipe as a file, suitable for reactor registration.
+pub fn child_input(pipe: std::process::ChildStdin) -> File {
+    #[cfg(unix)]
+    {
+        File::from(std::os::fd::OwnedFd::from(pipe))
+    }
+    #[cfg(windows)]
+    {
+        File::from(std::os::windows::io::OwnedHandle::from(pipe))
+    }
+}
+
+/// Owns a child's output pipe as a file, suitable for reactor registration.
+pub fn child_output(pipe: std::process::ChildStdout) -> File {
+    #[cfg(unix)]
+    {
+        File::from(std::os::fd::OwnedFd::from(pipe))
+    }
+    #[cfg(windows)]
+    {
+        File::from(std::os::windows::io::OwnedHandle::from(pipe))
+    }
+}

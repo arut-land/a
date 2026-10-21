@@ -38,8 +38,8 @@ pub use fs::{read_exact_at, sync_data, write_watch};
 pub use login::login_env;
 pub use platform::{Arch, Os, Platform};
 pub use proc::{
-    ExitWatch, Group, Pass, Passed, adopt_lock, boot_id, detach_session, exit_signal, exit_watch,
-    find_bash, pass, process_started, signal_process,
+    ExitWatch, Group, Pass, Passed, adopt_lock, boot_id, child_input, child_output, detach_session,
+    exit_signal, exit_watch, find_bash, pass, process_started, signal_process,
 };
 pub use runtime::{Runtime, Staged, VERSION};
 pub use signals::{Signals, reraise};

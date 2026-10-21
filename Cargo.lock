@@ -14,6 +14,7 @@ dependencies = [
  "ext-fixtures",
  "ext-fork",
  "ext-lua",
+ "ext-mcp",
  "ext-policy",
  "ext-prompt",
  "ext-retry",
@@ -691,6 +692,24 @@ dependencies = [
  "mlua",
  "protocol",
  "rt",
+ "serde_json",
+ "sys",
+]
+
+[[package]]
+name = "ext-mcp"
+version = "0.0.0"
+dependencies = [
+ "base64",
+ "ext",
+ "ext-derive",
+ "ext-policy",
+ "ext-shell",
+ "http",
+ "llm",
+ "protocol",
+ "rt",
+ "serde",
  "serde_json",
  "sys",
 ]

@@ -350,7 +350,7 @@ impl Daemon {
         let rt: rt::Rt = Arc::new(rt::Threads::default());
         let models = model::Models {
             settings: config::Settings::new(home.config_file(), config.agent.clone()),
-            http: Arc::new(llm::Ureq::new(Arc::clone(&rt))),
+            http: Arc::new(llm::Ureq::new(Arc::clone(&rt), llm::Redirects::Follow)),
         };
         let registry = ext::host::Current::new(config.registry().map_err(io::Error::other)?);
         let daemon = Arc::new_cyclic(|daemon| Self {

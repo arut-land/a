@@ -55,8 +55,15 @@ const PROVIDER: TlsProvider = if cfg!(feature = "tls-native") {
     TlsProvider::Rustls
 };
 
+/// Whether a caller permits the HTTP transport to resend at another URL.
+#[derive(Clone, Copy, Debug)]
+pub enum Redirects {
+    Refuse,
+    Follow,
+}
+
 impl Ureq {
-    pub fn new(rt: Arc<dyn rt::Runtime>) -> Self {
+    pub fn new(rt: Arc<dyn rt::Runtime>, redirects: Redirects) -> Self {
         let config = ureq::Agent::config_builder();
         #[cfg(any(feature = "tls-native", feature = "tls-rustls"))]
         let config = config.tls_config(
@@ -67,6 +74,10 @@ impl Ureq {
         );
         let config = config
             .http_status_as_error(false)
+            .max_redirects(match redirects {
+                Redirects::Refuse => 0,
+                Redirects::Follow => 10,
+            })
             .timeout_connect(Some(CONNECT_TIMEOUT))
             .timeout_recv_response(Some(HEAD_TIMEOUT))
             .build();

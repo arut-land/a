@@ -68,6 +68,8 @@ fn linked(config: &Config) -> Result<Registry, Refused> {
     // Needs the shell: without it, this does not compile.
     #[cfg(feature = "edit")]
     let built = built.with(Tier::Pre, &configured::<ext_edit::Edit>(config)?)?;
+    #[cfg(feature = "mcp")]
+    let built = built.with(Tier::Pre, &configured::<ext_mcp::Mcp>(config)?)?;
     #[cfg(feature = "compact")]
     let built = built.with(Tier::Pre, &configured::<ext_compact::Compact>(config)?)?;
     #[cfg(feature = "skills")]
@@ -230,6 +232,8 @@ mod tests {
                 ("prompt", 1),
                 ("shell", 1),
                 ("edit", 1),
+                #[cfg(feature = "mcp")]
+                ("mcp", 1),
                 ("compact", 1),
                 ("skills", 1),
                 ("settings", 1),

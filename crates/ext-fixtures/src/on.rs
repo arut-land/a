@@ -66,7 +66,10 @@ impl Agent for Echo {
 }
 
 /// The tool and input a message calls, if it calls one.
-fn call(text: &str) -> Option<(&'static str, Json)> {
+fn call(text: &str) -> Option<(&str, Json)> {
+    if let Some((tool, input)) = text.strip_prefix("call ").and_then(|s| s.split_once(' ')) {
+        return Some((tool, serde_json::from_str(input).ok()?));
+    }
     let (tool, input) = if let Some(prompt) = text.strip_prefix("spawn ") {
         ("task", Call::Task { prompt })
     } else if let Some(command) = text.strip_prefix("$ ") {

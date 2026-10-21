@@ -32,4 +32,4 @@ pub use prepare::NO_RESULT;
 pub use protocol::{Auth, Decoder, Encoded, Flow, Frame, Protocol, Provider, Secret, Target};
 pub use spec::*;
 #[cfg(feature = "ureq")]
-pub use ureq::Ureq;
+pub use ureq::{Redirects, Ureq};
