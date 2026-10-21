@@ -9,8 +9,7 @@ use std::time::Duration;
 
 use crate::Home;
 #[cfg(unix)]
-use crate::proc::Pass;
-use crate::proc::Passed;
+use crate::proc::{Pass, Passed};
 
 /// Where a home's daemon listens.
 #[derive(Clone, Debug, PartialEq, Eq)]

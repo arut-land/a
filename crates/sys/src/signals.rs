@@ -246,7 +246,8 @@ mod imp {
             }
             // Drain the wake pipe before the bits: a concurrent handler
             // leaves either a bit in this batch or a wake for the next one.
-            let bits = self.0.source.pending.swap(0, Ordering::AcqRel);
+            let bits = self.0.source.pending.swap(0, Ordering::AcqRel)
+                & self.0.source.requested.load(Ordering::Acquire);
             ALL.into_iter()
                 .filter(|signal| bits & bit(*signal) != 0)
                 .collect()
@@ -373,7 +374,14 @@ mod imp {
             on_signal(raw(Signal::Resize).as_raw());
             assert_eq!(signals.wait(), [Signal::Resize]);
             drop(signals);
-            assert!(Signals::catch(&[Signal::Terminate]).is_ok());
+            let next = Signals::catch(&[Signal::Terminate]).unwrap();
+            // A handler from the previous lease may finish after reacquisition.
+            next.0
+                .source
+                .pending
+                .fetch_or(bit(Signal::Resize), Ordering::Release);
+            assert_eq!(next.take(), []);
+            drop(next);
             assert!(Signals::catch(&[Signal::Kill]).is_err());
         }
 

@@ -1221,8 +1221,6 @@ fn run(
     daemon.shared.rt.spawn(Box::pin(async move {
         monitor.supervise(&watch, &config, exit).await;
     }));
-    // Connections are tasks waiting on the reactor, and reach the
-    // sessions' actors through their mailboxes.
     let listener = rt::Async::new(&daemon.shared.rt.reactor(), listener)?;
     // The signal lease is scoped to serving, including non-signal shutdown.
     rt::block_on(rt::or(server::accept(&listener, &daemon, &life), signalled))
