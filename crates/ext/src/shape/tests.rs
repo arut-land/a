@@ -107,11 +107,11 @@ impl Host for Recorded {
     fn progress(&self, text: &str) {
         self.progress.lock().unwrap().push_str(text);
     }
-    fn note(&self, _: &str, _: &str, _: Json) -> BoxFuture<'static, ()> {
-        Box::pin(std::future::ready(()))
+    fn note(&self, _: &str, _: &str, _: Json) -> BoxFuture<'static, crate::MutationResult> {
+        Box::pin(std::future::ready(Err(crate::MutationError::Unregistered)))
     }
-    fn publish(&self, _: &str, _: Json, _: String) -> BoxFuture<'static, ()> {
-        Box::pin(std::future::ready(()))
+    fn publish(&self, _: &str, _: Json, _: String) -> BoxFuture<'static, crate::MutationResult> {
+        Box::pin(std::future::ready(Err(crate::MutationError::Unregistered)))
     }
 
     fn edit(&self, _: protocol::Seq, _: Option<protocol::Seq>, _: Option<Json>) {}

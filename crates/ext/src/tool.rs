@@ -25,6 +25,31 @@ use crate::shape::Output;
 use crate::shape::Streamed;
 use crate::state::{self, Fold, States};
 
+/// The durable entry acknowledging an accepted mutation.
+pub type MutationResult = Result<Seq, MutationError>;
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum MutationError {
+    Revoked,
+    Unregistered,
+    Rejected(String),
+    Encoding(String),
+    CommitFailed,
+}
+
+impl fmt::Display for MutationError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Revoked => f.write_str("mutation authority revoked"),
+            Self::Unregistered => f.write_str("mutation state is not registered"),
+            Self::Rejected(error) | Self::Encoding(error) => f.write_str(error),
+            Self::CommitFailed => f.write_str("mutation was not durably committed"),
+        }
+    }
+}
+
+impl std::error::Error for MutationError {}
+
 /// Whether a call interrupted by a crash may run again.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub enum Replay {
@@ -135,21 +160,19 @@ impl Cx {
     }
 
     /// Commits `change` to state `S`: it resolves once the change is
-    /// committed and folded in, so a read after it sees it. Nothing when no
-    /// extension registered `S`.
-    pub fn update<S: Fold>(&self, change: &S::Change) -> BoxFuture<'static, ()> {
+    /// committed and folded in, so a read after success sees it.
+    pub fn update<S: Fold>(&self, change: &S::Change) -> BoxFuture<'static, MutationResult> {
         let mut ext = None;
         self.host
             .states(&mut |states| ext = states.ext_of::<S>().cloned());
         let Some(ext) = ext else {
-            return Box::pin(std::future::ready(()));
+            return Box::pin(std::future::ready(Err(MutationError::Unregistered)));
         };
         match Json::encode(change) {
             Ok(data) => self.host.note(&ext, S::NAME, data),
-            Err(e) => {
-                eprintln!("warning: extension {ext}: a {} change: {e}", S::NAME);
-                Box::pin(std::future::ready(()))
-            }
+            Err(e) => Box::pin(std::future::ready(Err(MutationError::Encoding(
+                e.to_string(),
+            )))),
         }
     }
 
@@ -158,13 +181,12 @@ impl Cx {
         &self,
         key: &P::Key,
         text: String,
-    ) -> BoxFuture<'static, ()> {
+    ) -> BoxFuture<'static, MutationResult> {
         match Json::encode(key) {
             Ok(key) => self.publish_erased(P::NAME, key, text),
-            Err(error) => {
-                eprintln!("warning: publication {}: {error}", P::NAME);
-                Box::pin(std::future::ready(()))
-            }
+            Err(error) => Box::pin(std::future::ready(Err(MutationError::Encoding(
+                error.to_string(),
+            )))),
         }
     }
 
@@ -180,7 +202,7 @@ impl Cx {
         namespace: &str,
         key: Json,
         text: String,
-    ) -> BoxFuture<'static, ()> {
+    ) -> BoxFuture<'static, MutationResult> {
         self.host.publish(namespace, key, text)
     }
 
@@ -200,11 +222,16 @@ impl Cx {
     }
 
     /// Commits a change to a registered fold named at run time.
-    pub fn update_erased(&self, ext: &str, name: &str, change: Json) -> BoxFuture<'static, ()> {
+    pub fn update_erased(
+        &self,
+        ext: &str,
+        name: &str,
+        change: Json,
+    ) -> BoxFuture<'static, MutationResult> {
         if self.state_erased(ext, name).is_some() {
             self.host.note(ext, name, change)
         } else {
-            Box::pin(std::future::ready(()))
+            Box::pin(std::future::ready(Err(MutationError::Unregistered)))
         }
     }
 

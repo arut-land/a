@@ -101,7 +101,9 @@ impl Tool for Model {
             .ok_or("this engine reads no config layers")?;
         if !args.is_empty() {
             let choice = (args != "reset").then(|| args.to_owned());
-            cx.update::<ModelChoice>(&choice).await;
+            cx.update::<ModelChoice>(&choice)
+                .await
+                .map_err(|e| e.to_string())?;
         }
         let chosen = cx.state(|m: &ModelChoice| m.0.clone());
         let (model, from) = named(chosen, layers, &cx.workspace)?;

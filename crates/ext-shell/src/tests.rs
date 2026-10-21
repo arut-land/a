@@ -30,7 +30,7 @@ fn an_extension_cannot_hold_session_state_across_an_await() {
     });
     paused.1.recv().unwrap();
     // A change commits while the reader is suspended at an await.
-    rt::block_on(writer.update::<Cwd>(&Cwd::change(&sub, None)));
+    rt::block_on(writer.update::<Cwd>(&Cwd::change(&sub, None))).unwrap();
     resume.0.send(()).unwrap();
     let (before, after) = read.join().unwrap();
     assert_eq!((before, after), (None, Some(sub)));

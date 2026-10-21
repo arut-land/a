@@ -365,7 +365,7 @@ impl Live {
     }
 
     fn model_spec(&self) -> String {
-        self.session.model_spec()
+        self.session.model_spec(&self.session.shared.registry.get())
     }
 }
 
@@ -380,7 +380,7 @@ fn settle(session: &Live) {
 }
 
 fn log_of(session: &Live) -> Vec<Entry> {
-    session.frames.entries().collect()
+    session.frames.entries().unwrap().into_iter().collect()
 }
 
 /// Waits until `done` holds for the session's log.
@@ -1771,7 +1771,7 @@ impl Tool for Bump {
     const AUDIENCE: Audience = Audience::User;
 
     async fn call(&self, _: &ext::Args, cx: &Cx) -> Result<u64, String> {
-        cx.update::<Count>(&1).await;
+        cx.update::<Count>(&1).await.map_err(|e| e.to_string())?;
         Ok(cx.state(|c: &Count| c.0))
     }
 }

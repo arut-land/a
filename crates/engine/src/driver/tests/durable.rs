@@ -231,7 +231,7 @@ struct ManualSession {
 
 impl ManualSession {
     fn new() -> Self {
-        Self::with_registry(Registry::default())
+        Self::with_registry(reload_registry(1, 1, false))
     }
 
     fn with_registry(registry: Registry) -> Self {
@@ -266,6 +266,8 @@ impl ManualSession {
         let call = id(session
             .frames
             .entries()
+            .unwrap()
+            .into_iter()
             .find(|e| matches!(e.body, Body::ToolCall { .. }))
             .unwrap()
             .seq
@@ -284,11 +286,11 @@ impl ManualSession {
         poll_actor(&mut self.actor);
     }
 
-    fn note(&self) -> oneshot::Receiver<()> {
+    fn note(&self) -> oneshot::Receiver<ext::MutationResult> {
         self.change(Json::encode(&"pending").unwrap())
     }
 
-    fn change(&self, data: Json) -> oneshot::Receiver<()> {
+    fn change(&self, data: Json) -> oneshot::Receiver<ext::MutationResult> {
         let (done, waited) = oneshot::channel();
         ContextOrigin {
             fence: self.session.session.fence.load(Ordering::SeqCst),
@@ -794,7 +796,10 @@ fn a_rejected_reduction_does_not_stop_deferred_write_recovery() {
     let rejected = h.note();
     h.session.send(Msg::Sync);
     h.poll();
-    assert_eq!(rt::block_on(rejected), Some(()));
+    assert!(matches!(
+        rt::block_on(rejected),
+        Some(Err(ext::MutationError::Rejected(_)))
+    ));
     assert_eq!(h.value(), 1);
     h.faulty.fail_next_write();
     let lost = h.note();
@@ -1004,7 +1009,7 @@ fn final_sync_publishes_activity_after_its_entries() {
     }
     let mut fixture = Fixture::new(
         ext_fixtures::ECHO,
-        Registry::default()
+        reload_registry(1, 1, false)
             .with(&HeldGate)
             .unwrap()
             .with(&ext_shell::Shell)
@@ -1032,6 +1037,8 @@ fn final_sync_publishes_activity_after_its_entries() {
     let call = session
         .frames
         .entries()
+        .unwrap()
+        .into_iter()
         .find(|e| matches!(e.body, Body::ToolCall { .. }))
         .unwrap()
         .seq;
@@ -1091,7 +1098,7 @@ fn attaching_behind_a_deferred_write_gets_activity_after_sync_or_recovery() {
         let mut view = SessionView::from_log(
             h.session.id,
             h.session.workspace.clone(),
-            h.session.frames.entries(),
+            h.session.frames.entries().unwrap(),
         );
         let _note = h.note();
         h.poll();
@@ -1166,4 +1173,141 @@ fn initial_store_failures_keep_the_session_operation_and_kind() {
             "each failed store admission has exactly one fact"
         );
     }
+}
+
+impl ManualSession {
+    fn context(&self) -> Cx {
+        let session = &self.session.session;
+        session.cx(
+            session
+                .origin(self.call, session.fence.load(Ordering::SeqCst))
+                .unwrap(),
+            &session.shared.registry.get(),
+        )
+    }
+}
+
+#[test]
+fn failed_commit_never_resolves_as_mutation_success() {
+    for failure in [None, Some(SyncFailure::Discard), Some(SyncFailure::Retain)] {
+        let mut h = ManualSession::new();
+        let cx = h.context();
+        match failure {
+            None => h.faulty.fail_next_write(),
+            Some(failure) => h.faulty.fail_next_sync(failure),
+        }
+        let result = cx.update_erased("test", "value", Json::encode(&"pending").unwrap());
+        h.session.send(Msg::Sync);
+        h.poll();
+        assert_eq!(rt::block_on(result), Err(ext::MutationError::CommitFailed));
+        h.finish();
+    }
+}
+
+#[test]
+fn rejected_fold_reports_failure() {
+    let mut h = ManualSession::with_registry(reload_registry(1, 1, true));
+    let cx = h.context();
+    let first = cx.update_erased("test", "value", Json::default());
+    let rejected = cx.update_erased("test", "value", Json::default());
+    h.session.send(Msg::Sync);
+    h.poll();
+    let seq = rt::block_on(first).unwrap();
+    assert!(
+        log_of(&h.session)
+            .iter()
+            .any(|e| e.seq == seq && matches!(e.body, Body::Ext { .. }))
+    );
+    assert!(matches!(
+        rt::block_on(rejected),
+        Err(ext::MutationError::Rejected(_))
+    ));
+    assert_eq!(h.value(), 1);
+    h.finish();
+}
+
+#[test]
+fn revoked_and_unregistered_mutations_are_explicit_failures() {
+    let mut h = ManualSession::new();
+    let cx = h.context();
+    assert_eq!(
+        rt::block_on(cx.update_erased("missing", "value", Json::default())),
+        Err(ext::MutationError::Unregistered)
+    );
+    h.complete();
+    h.poll();
+    let revoked = cx.update_erased("test", "value", Json::default());
+    h.poll();
+    assert_eq!(rt::block_on(revoked), Err(ext::MutationError::Revoked));
+    assert_eq!(h.value(), 0);
+    h.finish();
+}
+
+struct Routes(&'static str);
+impl Extension for Routes {
+    const NAME: &'static str = "routes";
+    const VERSION: u32 = 1;
+    fn contribute(&self, r: &mut Registrar) {
+        r.provide::<dyn ext::ModelSpec>(Arc::new(Self(self.0)))
+            .provide::<dyn ext::ModelRoles>(Arc::new(Self(self.0)));
+    }
+}
+impl ext::ModelSpec for Routes {
+    fn model(&self, _: &States, _: &dyn ext::Layers, _: &Path) -> Result<(String, String), String> {
+        Err(self.0.into())
+    }
+}
+impl ext::ModelRoles for Routes {
+    fn model(&self, _: &str, _: &States, _: &dyn ext::Layers, _: &Path) -> Result<String, String> {
+        Err(self.0.into())
+    }
+}
+
+#[test]
+fn admitted_calls_never_resolve_services_from_a_newer_registry() {
+    let mut h = ManualSession::with_registry(
+        reload_registry(1, 1, false)
+            .with(&Routes("admitted"))
+            .unwrap(),
+    );
+    let cx = h.context();
+    h.replace(reload_registry(2, 1, false).with(&Routes("newer")).unwrap());
+    for (index, role) in [
+        ext::ModelRole::Session,
+        ext::ModelRole::Fast,
+        ext::ModelRole::Named("worker".into()),
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        let side = ext::Side::new::<Routes>(
+            &format!("route-{index}"),
+            role,
+            ext::SideContext::None,
+            llm::Messages::default(),
+        );
+        let error = rt::block_on(first(cx.models().unwrap().call(&cx, side), &mut h.actor))
+            .unwrap()
+            .unwrap_err();
+        assert!(error.to_string().contains("admitted"), "{error}");
+    }
+    h.finish();
+}
+
+#[test]
+fn retired_generation_owns_no_child_admission() {
+    let cancels = [Cancel::default(), Cancel::default()];
+    let mut owned = ChildAdmissions(
+        cancels
+            .iter()
+            .map(|cancel| (SessionId::new(), cancel.clone()))
+            .collect(),
+    );
+    drop(std::mem::take(&mut owned));
+    assert!(owned.0.is_empty());
+    assert!(cancels.iter().all(Cancel::is_set));
+    let late = Cancel::default();
+    owned.0.push((SessionId::new(), late.clone()));
+    drop(owned);
+    assert!(late.is_set(), "actor exit also retires admission");
 }

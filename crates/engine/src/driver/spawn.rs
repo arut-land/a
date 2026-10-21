@@ -169,10 +169,17 @@ impl Actor {
             }
             SpawnReply::Awaited(reply) => {
                 if let Some(link) = &previous {
-                    let entries: Vec<_> = self
-                        .live
-                        .frames
-                        .entries()
+                    let Ok(entries) = self.live.frames.entries() else {
+                        reply.send(
+                            Json::encode(&Result::<Outcome, _>::Err(SpawnRefusal::Unavailable(
+                                "unreadable parent log".into(),
+                            )))
+                            .unwrap(),
+                        );
+                        return None;
+                    };
+                    let entries: Vec<_> = entries
+                        .into_iter()
                         .chain(
                             self.unsynced
                                 .iter()
@@ -258,7 +265,6 @@ impl Actor {
         role: &ext::ModelRole,
         child: &Registry,
         states: &ext::States,
-        inherit_settings: bool,
     ) -> Result<String, String> {
         let session = &self.live.session;
         let layers = &session.shared.models.settings;
@@ -267,7 +273,6 @@ impl Actor {
                 .service::<dyn ext::ModelRoles>()
                 .ok_or_else(|| format!("no model service resolves role {role}"))
                 .and_then(|roles| roles.model(role, states, layers, &session.workspace)),
-            role if inherit_settings => session.role_model(role),
             role => {
                 let base = || match child.service::<dyn ext::ModelSpec>() {
                     Some(spec) => spec
@@ -328,7 +333,7 @@ impl Actor {
             refusal = Some(SpawnRefusal::Unavailable(error));
             ext::Checkpoint::default()
         });
-        let selected = self.child_model(&request.runner.role, &child, &states, inherit_settings);
+        let selected = self.child_model(&request.runner.role, &child, &states);
         if matches!(request.runner.role, ext::ModelRole::Named(_))
             && let Err(error) = &selected
         {
@@ -349,18 +354,22 @@ impl Actor {
                     "prefix is not committed in the owning conversation".into(),
                 ));
             } else {
-                let entries: Vec<_> = self
-                    .live
-                    .frames
-                    .entries()
-                    .chain(
-                        self.unsynced
-                            .iter()
-                            .flat_map(|(entries, _)| entries.iter().cloned()),
-                    )
-                    .filter(|e| e.seq <= seq)
-                    .collect();
-                image = crate::transcript::context_image(&entries);
+                let entries = self.live.frames.entries();
+                if let Err(error) = &entries {
+                    refusal = Some(SpawnRefusal::Unavailable(error.to_string()));
+                }
+                if let Ok(entries) = entries {
+                    let entries: Vec<_> = entries
+                        .into_iter()
+                        .chain(
+                            self.unsynced
+                                .iter()
+                                .flat_map(|(entries, _)| entries.iter().cloned()),
+                        )
+                        .filter(|e| e.seq <= seq)
+                        .collect();
+                    image = crate::transcript::context_image(&entries);
+                }
             }
         }
         SpawnIntent {
@@ -458,7 +467,10 @@ impl ext::Sessions for Own {
 impl Live {
     pub(crate) fn pending_child(&self, child: SessionId) -> bool {
         let mut watch = None;
-        for entry in self.frames.entries() {
+        let Ok(entries) = self.frames.entries() else {
+            return false;
+        };
+        for entry in entries {
             match entry.body {
                 Body::Watch { child: watched } if watched == child => watch = Some(entry.seq),
                 Body::Fired { watch: fired, .. } if Some(fired) == watch => return false,

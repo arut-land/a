@@ -730,7 +730,9 @@ impl Callbacks {
                     }
                     let change = encode(&value)?;
                     data.quota.take(change.raw().len())?;
-                    cx.update_erased(&data.owner, &name, change).await;
+                    cx.update_erased(&data.owner, &name, change)
+                        .await
+                        .map_err(mlua::Error::external)?;
                     Ok(())
                 }
             })?;
@@ -747,7 +749,8 @@ impl Callbacks {
                     let key = encode(&key)?;
                     data.quota.take(key.raw().len() + text.len())?;
                     cx.publish_erased(&format!("lua:{}", data.owner), key, text)
-                        .await;
+                        .await
+                        .map_err(mlua::Error::external)?;
                     Ok(())
                 }
             })?;

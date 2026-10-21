@@ -115,7 +115,9 @@ impl Extension for Fallback {
                 }
                 let cx = cx.cx();
                 Answer::Later(Later::new(async move {
-                    cx?.update::<FallbackTo>(&Some("gpt-5.6-mini".into())).await;
+                    cx?.update::<FallbackTo>(&Some("gpt-5.6-mini".into()))
+                        .await
+                        .ok()?;
                     Some(Recover::Resend)
                 }))
             })

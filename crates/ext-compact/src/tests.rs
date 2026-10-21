@@ -52,7 +52,7 @@ fn a_second_overflow_on_the_same_call_fails_the_turn() {
         .unwrap();
     let rig = Rig::new("compact-twice", registry);
     let cx = rig.cx();
-    rt::block_on(cx.update::<Compacted>(&cx.call.get()));
+    rt::block_on(cx.update::<Compacted>(&cx.call.get())).unwrap();
     let error = llm::Error::new(llm::Kind::ContextOverflow, "too long");
     let failed = Failed {
         error: &error,

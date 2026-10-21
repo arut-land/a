@@ -75,6 +75,9 @@ macro_rules! conformance {
     ($($backend:ident),*) => {
         $(cases!($backend;
             round_trip,
+            ordering_damage_is_read_only_even_behind_a_snapshot,
+            imports_reject_sequence_and_epoch_regressions,
+            increasing_epochs_survive_snapshot_restore,
             importing_a_prefix_preserves_the_sources_writer_lease,
             multiline_payloads_survive_reload,
             appends_keep_their_order_across_reopens,
@@ -95,6 +98,158 @@ macro_rules! conformance {
 }
 
 conformance!(jsonl, memory);
+
+#[test]
+fn store_load_never_certifies_a_sequence_gap() {
+    let mut accepted = Vec::new();
+    for (name, fixture) in [("jsonl", jsonl()), ("memory", memory())] {
+        let h = header("/w");
+        let mut created = fixture.create(&h).unwrap();
+        append(&mut created, [1, 3]);
+        drop(created);
+        let mut seen = Vec::new();
+        let loaded = fixture.load(h.id, &mut |_| false, &mut |e| seen.push(e));
+        if let Ok(loaded) = loaded
+            && loaded.writer.read_only().is_none()
+        {
+            accepted.push((
+                name,
+                loaded.seq,
+                seen.iter().map(|e| e.seq.get()).collect::<Vec<_>>(),
+            ));
+        }
+    }
+    assert!(
+        accepted.is_empty(),
+        "gap accepted as a writable prefix: {accepted:?}"
+    );
+}
+
+fn invalid_histories() -> [Vec<Entry>; 3] {
+    [
+        vec![entry(1, 5), entry(3, 5), entry(3, 5)],
+        vec![entry(1, 5), entry(1, 5), entry(3, 5)],
+        vec![entry(1, 5), entry(2, 4), entry(3, 5)],
+    ]
+}
+
+fn ordering_damage_is_read_only_even_behind_a_snapshot(store: &dyn LogStore) {
+    for entries in invalid_histories() {
+        for len in [2, 3] {
+            for covers in [None, Some(1), Some(len as u64)] {
+                let h = header("/w");
+                let mut created = store.create(&h).unwrap();
+                created.writer.append_raw(&entries[..len]).unwrap();
+                if let Some(covers) = covers {
+                    created
+                        .writer
+                        .snapshot(&Snapshot {
+                            covers,
+                            image: image("snapshot"),
+                        })
+                        .unwrap();
+                }
+                drop(created);
+                for _ in 0..2 {
+                    let (mut loaded, offered, replayed) = restore(store, h.id);
+                    assert_eq!(loaded.seq, 1);
+                    assert_eq!(
+                        loaded.writer.read_only(),
+                        Some(ReadOnly::Damaged { seq: 2 })
+                    );
+                    if let Some(snapshot) = &offered {
+                        assert_eq!(snapshot.covers, 1);
+                        assert_eq!(covers, Some(1));
+                    }
+                    assert_eq!(
+                        replayed,
+                        if offered.is_some() {
+                            vec![]
+                        } else {
+                            entries[..1].to_vec()
+                        }
+                    );
+                    assert!(loaded.writer.append(&mut [entry(2, 6)], true).is_err());
+                    assert!(
+                        loaded
+                            .lines
+                            .read(1..=2, usize::MAX, &mut Vec::new())
+                            .is_err()
+                    );
+                }
+                assert_eq!(store.prefix(h.id, 1).unwrap(), entries[..1]);
+                assert!(store.prefix(h.id, len as u64).is_err());
+            }
+        }
+    }
+}
+
+fn imports_reject_sequence_and_epoch_regressions(store: &dyn LogStore) {
+    for entries in invalid_histories() {
+        let h = header("/w");
+        assert!(store.import(&h, &entries).is_err());
+        assert!(
+            !store
+                .headers()
+                .unwrap()
+                .iter()
+                .any(|header| header.id == h.id)
+        );
+    }
+}
+
+fn increasing_epochs_survive_snapshot_restore(store: &dyn LogStore) {
+    let h = header("/w");
+    let entries = vec![entry(1, 5), entry(2, 5), entry(3, 7)];
+    store.import(&h, &entries).unwrap();
+    let (mut loaded, replayed) = load(store, h.id);
+    assert_eq!(replayed, entries);
+    loaded
+        .writer
+        .snapshot(&Snapshot {
+            covers: 2,
+            image: image("snapshot"),
+        })
+        .unwrap();
+    drop(loaded);
+    let (loaded, offered, replayed) = restore(store, h.id);
+    assert_eq!(offered.unwrap().covers, 2);
+    assert_eq!(replayed, entries[2..]);
+    assert!(loaded.writer.read_only().is_none());
+    assert!(loaded.writer.epoch() > 7);
+}
+
+#[test]
+fn ordering_damage_preserves_the_log_bytes() {
+    for entries in invalid_histories() {
+        let fixture = jsonl();
+        let h = header("/w");
+        let mut created = fixture.create(&h).unwrap();
+        created.writer.append_raw(&entries).unwrap();
+        created
+            .writer
+            .snapshot(&Snapshot {
+                covers: 3,
+                image: image("snapshot"),
+            })
+            .unwrap();
+        drop(created);
+        let path = fixture
+            .dir
+            .as_ref()
+            .unwrap()
+            .join(h.id.to_string())
+            .join("log.jsonl");
+        let before = fs::read(&path).unwrap();
+        let (loaded, offered, _) = restore(&*fixture, h.id);
+        assert!(offered.is_none());
+        assert_eq!(
+            loaded.writer.read_only(),
+            Some(ReadOnly::Damaged { seq: 2 })
+        );
+        assert_eq!(fs::read(path).unwrap(), before);
+    }
+}
 
 fn header(workspace: &str) -> Header {
     Header {

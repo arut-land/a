@@ -97,7 +97,7 @@ impl Shared {
                 return Ok(Owner::Gone);
             };
             let cancelled = if let Some(live) = slot.live() {
-                cancelled_watch(live.frames.entries(), child)
+                cancelled_watch(live.frames.entries()?, child)
             } else {
                 let seq = self.catalog.get(parent.session).map_or(0, |r| r.entries);
                 cancelled_watch(self.store.prefix(parent.session, seq)?, child)
@@ -415,7 +415,7 @@ enum ContextRequest {
     /// A running call's report, answered once committed.
     Note {
         note: Note,
-        done: Option<oneshot::Sender<()>>,
+        done: Option<oneshot::Sender<ext::MutationResult>>,
     },
     /// Child work is admitted under the originating call, even across polling.
     Child {
@@ -563,7 +563,7 @@ impl Live {
             inflight: Keyed::default(),
             view: None,
             replies: Replies::default(),
-            child_cancels: Vec::new(),
+            child_cancels: ChildAdmissions::default(),
             transport_active: false,
             delivery_queue: std::collections::VecDeque::new(),
             detached: Vec::new(),
@@ -581,6 +581,7 @@ impl Live {
             published_activity: None,
             unsynced: Vec::new(),
             waiting_sync: Vec::new(),
+            waiting_mutations: Vec::new(),
             sync_armed: false,
             resuming: false,
             since_snapshot: loaded.read,
@@ -888,7 +889,7 @@ struct Actor {
     sides: Keyed<Ticket, PendingSide>,
     transport_active: bool,
     delivery_queue: std::collections::VecDeque<(protocol::Envelope, Option<Ticket>)>,
-    child_cancels: Vec<(SessionId, Cancel)>,
+    child_cancels: ChildAdmissions,
     waiting_sides: Vec<(CallId, CallId)>,
     tickets: u64,
     phase: Phase,
@@ -904,6 +905,11 @@ struct Actor {
     /// one that survives a power cut, so it is never given out twice.
     unsynced: Vec<(Vec<Entry>, Encoded)>,
     waiting_sync: Vec<(u64, oneshot::Sender<()>)>,
+    waiting_mutations: Vec<(
+        protocol::Seq,
+        ext::MutationResult,
+        oneshot::Sender<ext::MutationResult>,
+    )>,
     ordered_seq: u64,
     durable_seq: u64,
     admissions: Vec<(Admission, Admitted)>,
@@ -1012,15 +1018,18 @@ impl Actor {
             && self.phase == Phase::Serving
             && self.core.at_rest()
     }
+    fn source_generation(&self) -> u64 {
+        self.source.as_ref().map_or_else(
+            || self.live.session.shared.registry.generation(),
+            |source| source.generation(),
+        )
+    }
+
     async fn refresh(&mut self) -> Result<(), ()> {
         if !self.can_refresh() {
             return Ok(());
         }
-        let shared = &self.live.session.shared;
-        let number = self.source.as_ref().map_or_else(
-            || shared.registry.generation(),
-            |source| source.generation(),
-        );
+        let number = self.source_generation();
         if number == self.generation {
             return Ok(());
         }
@@ -1055,17 +1064,24 @@ impl Actor {
                     .filter(|s| restore(s.clone()))
                     .map_or(0, |s| s.covers);
                 let mut seen = after;
-                for (count, entry) in frames.entries_after(after).chain(pending).enumerate() {
-                    if count >= 100_000 || start.elapsed() > std::time::Duration::from_secs(1) {
-                        return Err(io::Error::other(
-                            "registry state preparation budget exhausted",
-                        ));
+                for batch in frames
+                    .batches_after(after)
+                    .chain(std::iter::once(Ok(pending)))
+                {
+                    for entry in batch? {
+                        if seen - after >= 100_000
+                            || start.elapsed() > std::time::Duration::from_secs(1)
+                        {
+                            return Err(io::Error::other(
+                                "registry state preparation budget exhausted",
+                            ));
+                        }
+                        if entry.seq.get() != seen + 1 {
+                            return Err(io::Error::other("registry log boundary is incomplete"));
+                        }
+                        seen = entry.seq.get();
+                        each(entry);
                     }
-                    if entry.seq.get() != seen + 1 {
-                        return Err(io::Error::other("registry log boundary is incomplete"));
-                    }
-                    seen = entry.seq.get();
-                    each(entry);
                 }
                 if seen != boundary || start.elapsed() > std::time::Duration::from_secs(1) {
                     return Err(io::Error::other(
@@ -1083,19 +1099,12 @@ impl Actor {
         .await;
         match prepared {
             Ok(states) => {
-                let current = self.source.as_ref().map_or_else(
-                    || self.live.session.shared.registry.generation(),
-                    |source| source.generation(),
-                );
+                let current = self.source_generation();
                 if current != number {
                     return Ok(());
                 }
+                self.retire_contexts();
                 let session = &self.live.session;
-                session.fence.fetch_add(1, Ordering::SeqCst);
-                session.cancel_all();
-                lock(&session.cancels).clear();
-                self.reactions_cancel.set();
-                self.reactions_cancel = Cancel::default();
                 *lock(&session.states) = Arc::new(Mutex::new(states));
                 self.bound = bind(&newest, session);
                 self.registry = newest;
@@ -1149,7 +1158,11 @@ impl Actor {
                 }
                 burst.push(msg);
             }
-            let (mut events, mut dones) = (Vec::new(), Vec::new());
+            let mut events = Vec::new();
+            let dones: Vec<oneshot::Sender<()>> = Vec::new();
+            #[cfg(test)]
+            let mut dones = dones;
+            let mut mutations = Vec::new();
             let mut sync = false;
             for msg in burst {
                 // Answered once what came before it is carried out.
@@ -1168,12 +1181,12 @@ impl Actor {
                     continue;
                 }
                 if let Some((event, done)) = self.take(msg) {
+                    mutations.push(done);
                     events.push(event);
-                    dones.extend(done);
                 }
             }
             // Recovery does not commit the burst that failed.
-            match self.burst(events, sync).await {
+            match self.burst(events, mutations, sync).await {
                 Ok(()) if self.durable_seq >= self.ordered_seq => {
                     for done in dones {
                         done.send(());
@@ -1248,7 +1261,7 @@ impl Actor {
 
     /// What `msg` asks the kernel, and whom to tell once it is carried
     /// out; `None` for what the actor answers itself.
-    fn take(&mut self, msg: Msg) -> Option<(Event, Option<oneshot::Sender<()>>)> {
+    fn take(&mut self, msg: Msg) -> Option<(Event, Option<oneshot::Sender<ext::MutationResult>>)> {
         let msg = self.current(msg)?;
         let event = match msg {
             Msg::Fenced { .. } | Msg::Flushed { .. } => unreachable!("mailbox admission"),
@@ -1337,13 +1350,19 @@ impl Actor {
         &mut self,
         origin: &ContextOrigin,
         request: ContextRequest,
-    ) -> Option<(Event, Option<oneshot::Sender<()>>)> {
+    ) -> Option<(Event, Option<oneshot::Sender<ext::MutationResult>>)> {
         let session = &self.live.session;
         if !origin.current(session) {
             let background =
                 matches!(&request, ContextRequest::Side { side, .. } if side.is_background());
             let succeeded = background && self.background_owner_succeeded(origin);
             if !succeeded {
+                if let ContextRequest::Note {
+                    done: Some(done), ..
+                } = request
+                {
+                    done.send(Err(ext::MutationError::Revoked));
+                }
                 return None;
             }
         }
@@ -1370,7 +1389,17 @@ impl Actor {
                 let ticket = self.delivery_ticket(reply);
                 Some((Event::SendEnvelope { envelope, ticket }, None))
             }
-            ContextRequest::Note { note, done } => Some((Event::Note { call, note }, done)),
+            ContextRequest::Note { note, done } => {
+                if let Note::State { ext, state, .. } = &note
+                    && !lock(&session.state_view()).registered(ext, state)
+                {
+                    if let Some(done) = done {
+                        done.send(Err(ext::MutationError::Unregistered));
+                    }
+                    return None;
+                }
+                Some((Event::Note { call, note }, done))
+            }
             ContextRequest::Child { request, reply } => self
                 .open_spawn(call, request, reply)
                 .map(|event| (event, None)),
@@ -1434,15 +1463,22 @@ impl Actor {
     }
 
     /// Recovery cannot turn a failed burst into an acknowledgement.
-    async fn burst(&mut self, events: Vec<Event>, sync: bool) -> Result<(), ()> {
+    async fn burst(
+        &mut self,
+        events: Vec<Event>,
+        mutations: Vec<Option<oneshot::Sender<ext::MutationResult>>>,
+        sync: bool,
+    ) -> Result<(), ()> {
         if !events.is_empty() {
             self.refresh().await?;
-            self.step(events).await?;
+            self.step_mutations(events.into_iter().zip(mutations))
+                .await?;
             self.refresh().await?;
         }
         if sync {
             self.sync().await?;
         }
+        self.show_synced();
         Ok(())
     }
 
@@ -1451,10 +1487,43 @@ impl Actor {
     /// dropped, as a commit that failed drops it, what the steps before it
     /// did is carried out, and the session resumes from its log.
     async fn step(&mut self, events: impl IntoIterator<Item = Event>) -> Result<(), ()> {
+        self.step_mutations(events.into_iter().map(|event| (event, None)))
+            .await
+    }
+
+    async fn step_mutations(
+        &mut self,
+        events: impl IntoIterator<Item = (Event, Option<oneshot::Sender<ext::MutationResult>>)>,
+    ) -> Result<(), ()> {
+        let mut acknowledgements = Vec::new();
         let mut fx = Effects::new();
-        for event in events {
+        for (event, done) in events {
             match catch_unwind(AssertUnwindSafe(|| self.core.step(event))) {
                 Ok(more) => {
+                    if let Some(done) = done {
+                        let entry = more.iter().rev().find_map(|effect| match effect {
+                            Effect::Append(entry)
+                                if matches!(
+                                    entry.body,
+                                    Body::Ext { .. }
+                                        | Body::Context {
+                                            publication: Some(_),
+                                            ..
+                                        }
+                                ) =>
+                            {
+                                Some(entry.clone())
+                            }
+                            _ => None,
+                        });
+                        if let Some(entry) = entry {
+                            acknowledgements.push((entry, done));
+                        } else {
+                            done.send(Err(ext::MutationError::Rejected(
+                                "kernel rejected mutation".into(),
+                            )));
+                        }
+                    }
                     fx.extend(more);
                 }
                 Err(panic) => {
@@ -1470,7 +1539,12 @@ impl Actor {
                 }
             }
         }
-        self.carry(fx).await
+        self.carry(fx).await?;
+        for (entry, done) in acknowledgements {
+            let result = lock(&self.live.session.state_view()).mutation_result(&entry);
+            self.waiting_mutations.push((entry.seq, result, done));
+        }
+        Ok(())
     }
 
     /// Appends a burst once, then admits each effect against the prefix
@@ -1835,7 +1909,15 @@ impl Actor {
         self.replied = None;
         self.snapshot = None;
         self.view = None;
-        for entry in recovered.entries_after(self.live.frames.seq()) {
+        let entries = match recovered.entries_after(self.live.frames.seq()) {
+            Ok(entries) => entries,
+            Err(error) => {
+                eprintln!("session {}: recovery log: {error}", self.live.id.short());
+                self.phase = Phase::Draining;
+                return;
+            }
+        };
+        for entry in entries {
             let lines = Encoded::of(std::slice::from_ref(&entry)).expect("loaded entry encodes");
             self.show(std::slice::from_ref(&entry), &lines);
         }
@@ -1867,19 +1949,25 @@ impl Actor {
         }
     }
 
-    // Retire the old generation before reopening its log: no waiter or
-    // cancellation owner can cross the recovery boundary.
-    async fn abandon_generation(&mut self) {
+    fn retire_contexts(&mut self) {
         self.live.session.fence.fetch_add(1, Ordering::SeqCst);
         self.reactions_cancel.set();
         self.reactions_cancel = Cancel::default();
         self.live.session.cancel_all();
+        lock(&self.live.session.cancels).clear();
+        drop(std::mem::take(&mut self.child_cancels));
+        self.detached.clear();
+    }
+
+    // Retire the old generation before reopening its log: no waiter or
+    // cancellation owner can cross the recovery boundary.
+    async fn abandon_generation(&mut self) {
+        self.retire_contexts();
         for pending in std::mem::take(&mut self.flushes) {
             pending.ended.wait().await;
         }
         self.admissions.clear();
         self.transcript = None;
-        lock(&self.live.session.cancels).clear();
         self.replies = Replies::default();
         self.delivery_queue.clear();
         self.transport_active = false;
@@ -1888,6 +1976,7 @@ impl Actor {
         self.inflight.clear();
         self.unsynced.clear();
         self.waiting_sync.clear();
+        self.waiting_mutations.clear();
         self.sync_armed = false;
         self.writer.take();
     }
@@ -2055,6 +2144,7 @@ impl Actor {
         if let Err(error) = self.order_flush().await {
             self.unsynced.clear();
             self.waiting_sync.clear();
+            self.waiting_mutations.clear();
             Box::pin(self.failed(format!("syncing: {error}"), Vec::new())).await;
             return Err(());
         }
@@ -2110,6 +2200,15 @@ impl Actor {
             }
         }
         self.waiting_sync = waiting;
+        let mut waiting = Vec::new();
+        for (seq, result, done) in std::mem::take(&mut self.waiting_mutations) {
+            if seq.get() <= self.durable_seq {
+                done.send(result);
+            } else {
+                waiting.push((seq, result, done));
+            }
+        }
+        self.waiting_mutations = waiting;
     }
 
     /// Entries durable, as `lines` encodes them: shown to every client.
@@ -2298,7 +2397,8 @@ impl Actor {
             }
             Effect::StartChild { link, child, input } => self.start_child(link, child, input),
             Effect::Interrupt { child } => {
-                if let Some((_, cancel)) = self.child_cancels.iter().find(|(id, _)| *id == child) {
+                if let Some((_, cancel)) = self.child_cancels.0.iter().find(|(id, _)| *id == child)
+                {
                     cancel.set();
                 }
                 if let Some(daemon) = shared.daemon.upgrade() {
@@ -2354,7 +2454,7 @@ impl Actor {
     /// this session's environment.
     fn start_child(&mut self, link: protocol::Seq, child: SessionId, input: String) {
         let cancel = Cancel::default();
-        self.child_cancels.push((child, cancel.clone()));
+        self.child_cancels.0.push((child, cancel.clone()));
         let detached = self
             .detached
             .iter()
@@ -2495,9 +2595,13 @@ impl Actor {
     /// to log; the request waits here until the kernel has it sent, unless
     /// a handler answered it, in which case the answer is the reply.
     fn prepare(&mut self, call: CallId, attempt: u16, choice: ToolChoice) {
-        let (decisions, answered) = match self.live.session.model() {
-            Ok(model) => {
-                let mut request = self.request(call, &model);
+        let (decisions, answered) = match self
+            .live
+            .session
+            .model(&self.registry)
+            .and_then(|model| self.request(call, &model).map(|request| (model, request)))
+        {
+            Ok((model, mut request)) => {
                 request.tool_choice = match choice {
                     ToolChoice::Auto => llm::ToolChoice::Auto,
                     ToolChoice::None => llm::ToolChoice::None,
@@ -2568,38 +2672,40 @@ impl Actor {
 
     /// The request for model call `call`: the system prompt, the
     /// transcript before it, and the tools.
-    fn request(&mut self, call: CallId, model: &Model) -> llm::Request {
-        let messages = self.conversation(call);
+    fn request(&mut self, call: CallId, model: &Model) -> Result<llm::Request, String> {
+        let messages = self.conversation(call).map_err(|e| e.to_string())?;
         let mut request = model.request(messages, self.registry.specs().clone());
         if let Some(spawn) = lock(&self.live.session.spawn).as_ref() {
             request.generation.max_output_tokens = Some(spawn.request.budget.max_tokens);
         }
-        request
+        Ok(request)
     }
 
     /// The conversation the model sees before entry `call`.
-    fn conversation(&mut self, call: CallId) -> llm::Messages {
+    fn conversation(&mut self, call: CallId) -> io::Result<llm::Messages> {
         let system = self.registry.system_prompt();
         let frames = &self.live.frames;
         let registry = &self.registry;
-        let transcript = self.transcript.get_or_insert_with(|| {
-            Transcript::of(
-                frames.entries().chain(
+        if self.transcript.is_none() {
+            self.transcript = Some(Transcript::of(
+                frames.entries()?.into_iter().chain(
                     self.unsynced
                         .iter()
                         .flat_map(|(entries, _)| entries.iter().cloned()),
                 ),
                 Arc::clone(registry),
                 system,
-            )
-        });
+            ));
+        }
+        let transcript = self.transcript.as_ref().expect("transcript initialized");
         if let Some(messages) = transcript.before(call.get()) {
-            messages.clone()
+            Ok(messages.clone())
         } else {
             // Recovery keeps the call's conversation boundary, including later
             // transcript edits and context republished while preparing it.
             let before = frames
-                .entries()
+                .entries()?
+                .into_iter()
                 .chain(
                     self.unsynced
                         .iter()
@@ -2608,7 +2714,7 @@ impl Actor {
                 .filter(|e| {
                     e.seq < call.0 || matches!(e.body, Body::Context { .. } | Body::Edit { .. })
                 });
-            Transcript::of(before, Arc::clone(registry), system).into_messages()
+            Ok(Transcript::of(before, Arc::clone(registry), system).into_messages())
         }
     }
 
@@ -2698,9 +2804,14 @@ impl Actor {
             return frame.clone();
         }
         let live = &self.live;
-        let view = self.view.get_or_insert_with(|| {
-            SessionView::from_log(live.id, live.workspace.clone(), live.frames.entries())
-        });
+        if self.view.is_none() {
+            self.view = Some(SessionView::from_log(
+                live.id,
+                live.workspace.clone(),
+                live.frames.entries().ok()?,
+            ));
+        }
+        let view = self.view.as_ref().expect("view initialized");
         let frame = Frame::new(&DaemonMsg::Snapshot(Box::new(view.clone()))).ok();
         self.snapshot = Some((seq, frame.clone()));
         frame
@@ -2911,10 +3022,10 @@ impl Session {
             env: lock(&self.env).clone(),
             session: self.id,
             call: origin.call,
-            model: self.model_spec().into(),
+            model: self.model_spec(registry).into(),
             spill: Arc::clone(&self.spill),
             cancel: origin.cancel.clone(),
-            services: self.services(origin.clone()),
+            services: self.services(origin.clone(), registry),
         }
         .cx(Arc::new(Calling {
             origin,
@@ -2925,8 +3036,12 @@ impl Session {
 
     /// What the engine provides the session's calls: the config layers,
     /// child sessions, side model requests and the runtime.
-    fn services(self: &Arc<Self>, origin: ContextOrigin) -> Arc<Services> {
-        let own = Arc::new(Own(Arc::downgrade(self), origin));
+    fn services(
+        self: &Arc<Self>,
+        origin: ContextOrigin,
+        registry: &Arc<Registry>,
+    ) -> Arc<Services> {
+        let own = Arc::new(Own(Arc::downgrade(self), origin, Arc::clone(registry)));
         Arc::new(
             Services::default()
                 .with::<dyn ext::Layers>(own.clone())
@@ -2938,19 +3053,16 @@ impl Session {
 
     /// The model the newest client's environment and the settings name
     /// now, or why there is none.
-    fn role_model(&self, role: &ext::ModelRole) -> Result<String, String> {
+    fn role_model(&self, role: &ext::ModelRole, registry: &Registry) -> Result<String, String> {
         match role {
-            ext::ModelRole::Session => self.model_named().map(|(m, _)| m),
+            ext::ModelRole::Session => self.model_named(registry).map(|(m, _)| m),
             ext::ModelRole::Fast => self
                 .shared
                 .models
                 .settings
                 .fast_model(&self.workspace)
-                .and_then(|m| m.map_or_else(|| self.model_named().map(|(m, _)| m), Ok)),
-            ext::ModelRole::Named(role) => self
-                .shared
-                .registry
-                .get()
+                .and_then(|m| m.map_or_else(|| self.model_named(registry).map(|(m, _)| m), Ok)),
+            ext::ModelRole::Named(role) => registry
                 .service::<dyn ext::ModelRoles>()
                 .ok_or_else(|| format!("no model service resolves role {role}"))?
                 .model(
@@ -2962,7 +3074,7 @@ impl Session {
         }
     }
 
-    fn model(&self) -> Result<Model, String> {
+    fn model(&self, registry: &Registry) -> Result<Model, String> {
         if let Some(image) = lock(&self.spawn).as_ref() {
             let route = image.routing.as_ref().map_err(Clone::clone)?;
             return self
@@ -2970,7 +3082,7 @@ impl Session {
                 .models
                 .routed(&self.workspace, lock(&self.env).as_deref(), route);
         }
-        let (spec, _) = self.model_named()?;
+        let (spec, _) = self.model_named(registry)?;
         let env = lock(&self.env).clone();
         self.shared
             .models
@@ -2980,12 +3092,11 @@ impl Session {
     /// The model spec the settings name now, and what names it: the
     /// `ModelSpec` service's word (the session's own choice over the
     /// config layers) if an extension provides it, else the layers'.
-    fn model_named(&self) -> Result<(String, String), String> {
+    fn model_named(&self, registry: &Registry) -> Result<(String, String), String> {
         if let Some(image) = lock(&self.spawn).as_ref() {
             return Ok((image.model.clone(), "spawn intent".into()));
         }
         let layers = &self.shared.models.settings;
-        let registry = self.shared.registry.get();
         match registry.service::<dyn ext::ModelSpec>() {
             Some(spec) => spec.model(&lock(&self.state_view()), layers, &self.workspace),
             None => ext::Layers::model(layers, &self.workspace),
@@ -2993,8 +3104,8 @@ impl Session {
     }
 
     /// The model spec the settings name now.
-    fn model_spec(&self) -> String {
-        self.model_named()
+    fn model_spec(&self, registry: &Registry) -> String {
+        self.model_named(registry)
             .map_or_else(|_| "none".to_owned(), |(model, _)| model)
     }
 }
@@ -3004,6 +3115,17 @@ impl ext::Layers for crate::config::Settings {
     fn model(&self, workspace: &Path) -> Result<(String, String), String> {
         let (model, source) = self.model(workspace)?;
         Ok((model, source.to_string()))
+    }
+}
+
+#[derive(Default)]
+struct ChildAdmissions(Vec<(SessionId, Cancel)>);
+
+impl Drop for ChildAdmissions {
+    fn drop(&mut self) {
+        for (_, cancel) in &self.0 {
+            cancel.set();
+        }
     }
 }
 
@@ -3028,7 +3150,10 @@ impl View for Viewed {
     /// As a call is recorded: the model's name once it is made, else
     /// what the settings asked for.
     fn model(&self) -> String {
-        (self.session.model()).map_or_else(|_| self.session.model_spec(), |model| model.name())
+        (self.session.model(&self.registry)).map_or_else(
+            |_| self.session.model_spec(&self.registry),
+            |model| model.name(),
+        )
     }
 
     fn states(&self, read: &mut dyn FnMut(&States)) {
@@ -3119,7 +3244,7 @@ impl Host for Calling {
     }
 
     /// Resolves once the change is committed, so a read after it sees it.
-    fn note(&self, ext: &str, state: &str, data: Json) -> BoxFuture<'static, ()> {
+    fn note(&self, ext: &str, state: &str, data: Json) -> BoxFuture<'static, ext::MutationResult> {
         let (ext, state) = (ext.to_owned(), state.to_owned());
         let (done, committed) = oneshot::channel();
         let note = ContextRequest::Note {
@@ -3128,11 +3253,18 @@ impl Host for Calling {
         };
         self.origin.send(&self.session, note);
         Box::pin(async move {
-            let _ = committed.await;
+            committed
+                .await
+                .unwrap_or(Err(ext::MutationError::CommitFailed))
         })
     }
 
-    fn publish(&self, namespace: &str, key: Json, text: String) -> BoxFuture<'static, ()> {
+    fn publish(
+        &self,
+        namespace: &str,
+        key: Json,
+        text: String,
+    ) -> BoxFuture<'static, ext::MutationResult> {
         let (done, committed) = oneshot::channel();
         self.origin.send(
             &self.session,
@@ -3146,7 +3278,9 @@ impl Host for Calling {
             },
         );
         Box::pin(async move {
-            let _ = committed.await;
+            committed
+                .await
+                .unwrap_or(Err(ext::MutationError::CommitFailed))
         })
     }
 
@@ -3179,7 +3313,7 @@ async fn first<T>(work: impl Future<Output = T>, stop: impl Future<Output = ()>)
 /// The session, as its calls reach it for what only the engine has: the
 /// config layers, child sessions and side model requests. Its authority
 /// belongs to the context that obtained the service, never a later call.
-struct Own(Weak<Session>, ContextOrigin);
+struct Own(Weak<Session>, ContextOrigin, Arc<Registry>);
 
 impl ext::Layers for Own {
     fn model(&self, workspace: &Path) -> Result<(String, String), String> {

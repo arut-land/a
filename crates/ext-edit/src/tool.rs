@@ -110,7 +110,9 @@ impl Tool for Edit {
         if let Some(bytes) = &original {
             let last = cx.state(|seen: &Seen| seen.0.get(&path).copied());
             if last.is_some_and(|last| last != hash(bytes)) {
-                cx.update::<Seen>(&Seen::change(&path, bytes)).await;
+                cx.update::<Seen>(&Seen::change(&path, bytes))
+                    .await
+                    .map_err(|e| e.to_string())?;
                 return Err(format!(
                     "{shown} changed since this session last edited it; look at it again before editing it"
                 ));
@@ -134,7 +136,8 @@ impl Tool for Edit {
         .await
         .map_err(|e| format!("{shown}: {e}"))?;
         cx.update::<Seen>(&Seen::change(&path, content.as_bytes()))
-            .await;
+            .await
+            .map_err(|e| e.to_string())?;
         Ok(Edited {
             path,
             created: original.is_none(),

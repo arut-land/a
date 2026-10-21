@@ -3,11 +3,11 @@ use std::io;
 use std::ops::RangeInclusive;
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 
-use protocol::{Decode, Entry, SessionId};
+use protocol::{Entry, SessionId};
 
 use super::{
-    Encoded, Header, LeaseAuthority, Lines, Loaded, Local, Log, LogStore, Snapshot, Writer,
-    not_found, span,
+    Encoded, Header, History, LeaseAuthority, Lines, Loaded, Local, Log, LogStore, Snapshot,
+    Writer, not_found, span,
 };
 
 /// Sessions held in this process, for tests: durable until it exits. Each
@@ -67,21 +67,30 @@ impl LogStore for Memory {
     }
 
     fn prefix(&self, id: SessionId, seq: u64) -> io::Result<Vec<Entry>> {
-        let mut entries = self.shared(id)?.entries()?;
+        let shared = self.shared(id)?;
+        let lines = lock(&shared.lines);
+        let mut history = History::default();
+        let entries = lines
+            .iter()
+            .take(usize::try_from(seq).map_err(io::Error::other)?)
+            .map(|line| {
+                history
+                    .decode(line)
+                    .map_err(|why| io::Error::other(why.to_string()))
+            })
+            .collect::<io::Result<Vec<_>>>()?;
         if (entries.len() as u64) < seq {
             return Err(io::ErrorKind::NotFound.into());
         }
-        entries.truncate(usize::try_from(seq).map_err(io::Error::other)?);
         Ok(entries)
     }
 
     fn import(&self, header: &Header, entries: &[Entry]) -> io::Result<()> {
-        if entries
-            .iter()
-            .enumerate()
-            .any(|(index, entry)| entry.seq.get() != index as u64 + 1)
-        {
-            return Err(io::Error::other("import has a sequence gap"));
+        let mut history = History::default();
+        for entry in entries {
+            history
+                .accept(entry)
+                .map_err(|why| io::Error::other(why.to_string()))?;
         }
         let encoded = Encoded::of(entries)?;
         let lines = Arc::new(Shared {
@@ -118,7 +127,18 @@ impl LogStore for Memory {
         each: &mut dyn FnMut(Entry),
     ) -> io::Result<Loaded> {
         let lines = self.shared(id)?;
-        let entries = lines.entries()?;
+        let mut history = History::default();
+        let mut entries = Vec::new();
+        let mut damage = None;
+        for line in lock(&lines.lines).iter() {
+            match history.decode(line) {
+                Ok(entry) => entries.push(entry),
+                Err(why) => {
+                    damage = Some(why);
+                    break;
+                }
+            }
+        }
         let snapshot = lock(&lines.snapshot).clone();
         let covered = match snapshot {
             Some(snapshot) if snapshot.covers <= entries.len() as u64 => {
@@ -129,13 +149,28 @@ impl LogStore for Memory {
         };
         let floor = entries.last().map_or(0, |e| e.epoch.0);
         let skip = usize::try_from(covered.unwrap_or(0)).unwrap_or(usize::MAX);
-        let read = (lock(&lines.lines).iter().skip(skip))
+        let read = (lock(&lines.lines).iter().take(entries.len()).skip(skip))
             .map(|line| line.len() as u64 + 1)
             .sum();
+        let valid = entries.len();
         for entry in entries.into_iter().skip(skip) {
             each(entry);
         }
-        Ok(self.loaded(id, lines, floor, read))
+        let mut loaded = self.loaded(id, lines, floor, read);
+        loaded.seq = history.seq;
+        if let Some(why) = damage {
+            loaded.writer.keep(why);
+            let prefix = lock(&self.shared(id)?.lines)
+                .iter()
+                .take(valid)
+                .cloned()
+                .collect();
+            loaded.lines = Arc::new(Shared {
+                lines: Mutex::new(prefix),
+                snapshot: Mutex::default(),
+            });
+        }
+        Ok(loaded)
     }
 
     fn entries(&self, id: SessionId) -> io::Result<Vec<Entry>> {
@@ -152,9 +187,14 @@ impl Shared {
     /// The entries, decoded from a copy of the lines taken at once.
     fn entries(&self) -> io::Result<Vec<Entry>> {
         let lines = lock(&self.lines).clone();
+        let mut history = History::default();
         lines
             .iter()
-            .map(|line| Entry::from_json(line).map_err(io::Error::from))
+            .map(|line| {
+                history
+                    .decode(line)
+                    .map_err(|why| io::Error::other(why.to_string()))
+            })
             .collect()
     }
 }

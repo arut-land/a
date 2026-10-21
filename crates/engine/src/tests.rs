@@ -2028,6 +2028,27 @@ mod inheritance {
             Box::new(ext_fixtures::Echo)
         }
     }
+    struct Seeded;
+    impl AgentKind for Seeded {
+        const NAME: &'static str = "seeded";
+        fn settings(states: &mut ext::States) {
+            states.set(ext_settings::ModelChoice(Some("test:kind".into())));
+        }
+        fn make() -> Box<dyn ext::Agent> {
+            Box::new(ext_fixtures::Echo)
+        }
+    }
+    struct FreshSeeded;
+    impl AgentKind for FreshSeeded {
+        const NAME: &'static str = "fresh_seeded";
+        const INHERIT_SETTINGS: bool = false;
+        fn settings(states: &mut ext::States) {
+            Seeded::settings(states);
+        }
+        fn make() -> Box<dyn ext::Agent> {
+            Seeded::make()
+        }
+    }
     struct Kinds;
     impl Extension for Kinds {
         const NAME: &'static str = "kinds";
@@ -2035,6 +2056,8 @@ mod inheritance {
         fn contribute(&self, r: &mut ext::Registrar) {
             r.agent_kind::<Inherited>()
                 .agent_kind::<Fresh>()
+                .agent_kind::<Seeded>()
+                .agent_kind::<FreshSeeded>()
                 .tool(RoleTask)
                 .provide::<dyn ext::ModelRoles>(std::sync::Arc::new(Self));
         }
@@ -2062,12 +2085,21 @@ mod inheritance {
         const DESCRIPTION: &'static str = "Exercise source-declared child kinds.";
         const REPLAY: ext::Replay = ext::Replay::Safe;
         async fn call(&self, input: &ext::Args, cx: &ext::Cx) -> Result<String, String> {
+            let (agent, role) = input
+                .args
+                .split_once(' ')
+                .unwrap_or((&input.args, "worker"));
+            let role = match role {
+                "session" => ext::ModelRole::Session,
+                "fast" => ext::ModelRole::Fast,
+                name => ext::ModelRole::Named(name.into()),
+            };
             let request = ext::Spawn::new::<Kinds>(
                 "role",
                 "spawn done".into(),
                 ext::Runner {
-                    agent: input.args.clone(),
-                    role: ext::ModelRole::Named("worker".into()),
+                    agent: agent.into(),
+                    role,
                 },
                 ext::DepthBudget::new(4),
             );
@@ -2095,6 +2127,63 @@ mod inheritance {
                 .agent(Inherited::NAME, Inherited::make)
                 .provide::<dyn ext::ModelRoles>(std::sync::Arc::new(Kinds));
         }
+    }
+
+    #[test]
+    fn session_and_fast_roles_use_kind_seeded_settings() {
+        let config = Config {
+            extensions: registry,
+            ..echo()
+        };
+        let (root, home) = home("kind-seeded-roles");
+        let daemon = Daemon::load(&home, &config).unwrap();
+        let parent = daemon.attach_to(&Target::New, || "/w".into()).unwrap();
+        parent
+            .session()
+            .submit("call model {\"args\":\"test:parent\"}")
+            .unwrap();
+        settle(&daemon);
+        for kind in [Seeded::NAME, FreshSeeded::NAME] {
+            for role in ["session", "fast"] {
+                parent
+                    .session()
+                    .submit(&format!("call role_task {{\"args\":\"{kind} {role}\"}}"))
+                    .unwrap();
+                settle(&daemon);
+            }
+        }
+        let mut checked = 0;
+        for header in daemon
+            .shared
+            .store
+            .headers()
+            .unwrap()
+            .into_iter()
+            .filter(|h| h.parent.is_some())
+        {
+            let log = bodies(&*daemon.shared.store, header.id);
+            let Body::Spawned { intent } = &log[0] else {
+                panic!("missing spawn authority")
+            };
+            let frozen = crate::driver::spawn::SpawnIntent::from_json(intent).unwrap();
+            if frozen.request.owner == Kinds::NAME {
+                assert_eq!(frozen.model, "test:kind");
+                let mut states = registry(&config).unwrap().states();
+                states.restore_settings(&frozen.settings).unwrap();
+                assert_eq!(
+                    states
+                        .get::<ext_settings::ModelChoice>()
+                        .unwrap()
+                        .0
+                        .as_deref(),
+                    Some("test:kind")
+                );
+                checked += 1;
+            }
+        }
+        assert_eq!(checked, 4);
+        drop((parent, daemon));
+        std::fs::remove_dir_all(root).unwrap();
     }
 
     #[test]
