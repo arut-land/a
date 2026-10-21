@@ -40,14 +40,16 @@
 //! once by [`points!`], which also makes the [`Hooks`] table that holds
 //! their handlers: a point cannot be added without its slot.
 
-use std::any::Any;
+use std::any::{Any, TypeId};
+use std::cell::RefCell;
+use std::collections::BTreeMap;
 use std::convert::Infallible;
 use std::fmt;
 use std::future::{Future, poll_fn};
 use std::panic::{AssertUnwindSafe, catch_unwind};
 use std::path::Path;
 use std::pin::Pin;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex, PoisonError};
 use std::task::Poll;
 use std::time::Duration;
 
@@ -463,6 +465,75 @@ impl Rule for Reaction {
             .map(|(name, handler)| P::call(name, handler, cx, P::input(facts, &())))
             .filter(|reaction| reaction.work.is_some())
             .collect()
+    }
+}
+
+type DispatchLocals = BTreeMap<(TypeId, usize), Box<dyn Any + Send + Sync>>;
+
+/// Ephemeral state owned by a call and shared with its named invocations.
+/// It carries budgets across workers; it is neither a session service nor replay state.
+#[derive(Clone, Default)]
+pub struct InvocationContext(Arc<Mutex<DispatchLocals>>);
+impl InvocationContext {
+    pub fn local<T: Any + Send + Sync>(&self, key: usize, init: impl FnOnce() -> Arc<T>) -> Arc<T> {
+        let slot = (TypeId::of::<T>(), key);
+        let existing = self
+            .0
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .get(&slot)
+            .and_then(|value| value.downcast_ref::<Arc<T>>())
+            .cloned();
+        if let Some(existing) = existing {
+            return existing;
+        }
+        let value = init();
+        let mut locals = self.0.lock().unwrap_or_else(PoisonError::into_inner);
+        Arc::clone(
+            locals
+                .entry(slot)
+                .or_insert_with(|| Box::new(value))
+                .downcast_ref::<Arc<T>>()
+                .expect("typed invocation local"),
+        )
+    }
+
+    /// Installs this owned context for synchronous dispatch only, never across an await.
+    pub fn scope<T>(&self, run: impl FnOnce() -> T) -> T {
+        let _scope = InvocationScope(DISPATCH.replace(Some(self.clone())));
+        run()
+    }
+}
+
+thread_local! {
+    static DISPATCH: RefCell<Option<InvocationContext>> = const { RefCell::new(None) };
+}
+struct InvocationScope(Option<InvocationContext>);
+impl Drop for InvocationScope {
+    fn drop(&mut self) {
+        DISPATCH.replace(self.0.take());
+    }
+}
+struct Dispatch {
+    _scope: Option<InvocationScope>,
+}
+impl Dispatch {
+    fn enter() -> Self {
+        Self {
+            _scope: DISPATCH
+                .with_borrow(Option::is_none)
+                .then(|| InvocationScope(DISPATCH.replace(Some(InvocationContext::default())))),
+        }
+    }
+}
+
+/// State shared by synchronous handlers and their owned invocation context.
+/// `key` identifies a resource within the context. Without a context, state is fresh.
+pub fn dispatch_local<T: Any + Send + Sync>(key: usize, init: impl FnOnce() -> Arc<T>) -> Arc<T> {
+    let context = DISPATCH.with_borrow(Clone::clone);
+    match context {
+        Some(context) => context.local(key, init),
+        None => init(),
     }
 }
 
@@ -1070,6 +1141,7 @@ impl Hooks {
         subject: &mut Subject<P>,
         replaced: &mut Replaced<'_, Subject<P>>,
     ) -> Merged<P> {
+        let _dispatch = Dispatch::enter();
         P::Out::merge::<P>(self.handlers::<P>(), cx, facts, subject, replaced)
     }
 
@@ -1239,6 +1311,7 @@ impl Hooks {
     ) -> Asked<T> {
         let handlers = self.handlers::<P>();
         let rest = handlers.get(from..).unwrap_or_default();
+        let _dispatch = Dispatch::enter();
         P::Out::merge::<P>(rest, cx, facts, &mut (), &mut |_, (), ()| {}).from(from)
     }
 

@@ -414,6 +414,7 @@ struct PendingSide {
 
 enum ContextRequest {
     Invoke {
+        context: ext::point::InvocationContext,
         name: String,
         tool: String,
         input: Json,
@@ -808,7 +809,7 @@ impl Folding {
         self.states.apply(e);
         self.has_input |= matches!(e.body, Body::Input { .. });
         self.core.load(e);
-        self.invocations.fold(e);
+        let _ = self.invocations.fold(e);
     }
 }
 
@@ -883,7 +884,8 @@ struct Actor {
 
 #[derive(Default)]
 struct Replies {
-    invocations: BTreeMap<Ticket, oneshot::Sender<Called>>,
+    invocations: BTreeMap<Ticket, (oneshot::Sender<Called>, ext::point::InvocationContext)>,
+    contexts: BTreeMap<CallId, ext::point::InvocationContext>,
     invoked: BTreeMap<CallId, Vec<oneshot::Sender<Called>>>,
     clients: BTreeMap<Ticket, oneshot::Sender<Result<(), String>>>,
     deliveries: BTreeMap<Ticket, oneshot::Sender<Result<(), protocol::InboxRefusal>>>,
@@ -1298,9 +1300,8 @@ impl Actor {
     ) -> Option<(Event, Option<oneshot::Sender<ext::MutationResult>>)> {
         let session = Arc::clone(&self.live.session);
         if !origin.current(&session) {
-            let background =
-                matches!(&request, ContextRequest::Side { side, .. } if side.is_background());
-            let succeeded = background && self.background_owner_succeeded(origin).await;
+            let succeeded = matches!(&request, ContextRequest::Side { side, .. } if side.is_background())
+                && self.background_owner_succeeded(origin).await;
             if !succeeded {
                 if let ContextRequest::Note {
                     done: Some(done), ..
@@ -1314,13 +1315,14 @@ impl Actor {
         let call = origin.id;
         match request {
             ContextRequest::Invoke {
+                context,
                 name,
                 tool,
                 input,
                 reply,
             } => {
                 let ticket = self.ticket();
-                self.replies.invocations.insert(ticket, reply);
+                self.replies.invocations.insert(ticket, (reply, context));
                 Some((
                     Event::Invoke {
                         existing: None,
@@ -1472,6 +1474,7 @@ impl Actor {
         let mut acknowledgements = Vec::new();
         let mut fx = StepPlan::default();
         for (mut event, done) in events {
+            let mut context = ext::point::InvocationContext::default();
             if let Event::Invoke {
                 existing,
                 parent,
@@ -1481,6 +1484,9 @@ impl Actor {
                 ticket,
             } = &mut event
             {
+                if let Some((_, inherited)) = self.replies.invocations.get(ticket) {
+                    context = inherited.clone();
+                }
                 match self
                     .projection
                     .invocations
@@ -1501,10 +1507,12 @@ impl Actor {
                     }
                 }
             }
-            match catch_unwind(AssertUnwindSafe(|| self.core.step(event))) {
+            match catch_unwind(AssertUnwindSafe(|| context.scope(|| self.core.step(event)))) {
                 Ok(more) => {
                     for entry in &more.appends {
-                        self.projection.invocations.fold(entry);
+                        if let Some(call) = self.projection.invocations.fold(entry) {
+                            self.replies.contexts.insert(call, context.clone());
+                        }
                     }
                     if let Some(done) = done {
                         let entry = more
@@ -1534,10 +1542,9 @@ impl Actor {
                     fx.immediate.extend(more.immediate);
                     fx.admitted.extend(more.admitted);
                     if let Some(mut commit) = more.commit {
-                        if let Some(previous) = fx.commit {
-                            commit.durability = commit.durability.max(previous.durability);
-                            commit.publish |= previous.publish;
-                        }
+                        let previous = fx.commit.unwrap_or(commit);
+                        commit.durability = commit.durability.max(previous.durability);
+                        commit.publish |= previous.publish;
                         fx.commit = Some(commit);
                     }
                 }
@@ -2257,7 +2264,11 @@ impl Actor {
             .session
             .origin(call, fence)
             .expect("actor generation");
-        let cx = self.live.session.cx(origin.clone(), &registry);
+        let cx = self
+            .live
+            .session
+            .cx(origin.clone(), &registry)
+            .with_invocation(self.replies.contexts.remove(&call).unwrap_or_default());
         let session = Arc::clone(&self.live.session);
         let id = self.live.id;
         origin.spawn(&*self.live.session.shared.rt, async move {

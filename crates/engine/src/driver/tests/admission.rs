@@ -1126,6 +1126,7 @@ fn delegated_results_wait_for_their_own_durable_prefix() {
         origin.send(
             &session.session,
             ContextRequest::Invoke {
+                context: cx.invocation().clone(),
                 name: "lookup".into(),
                 tool: <DelegatedHarbor as Tool>::NAME.into(),
                 input: Json::encode(&serde_json::json!({})).unwrap(),

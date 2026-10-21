@@ -41,9 +41,9 @@ env = { MBX_CARGO_SHIM_MODE = "1" }
 build = "cargo build --workspace"
 release = "cargo build-release --workspace"
 fmt = "cargo fmt --all"
-test = "cargo nextest run --workspace --no-tests=pass"
+test = "cargo nextest run --workspace --features a/lua --no-tests=pass"
 "check:fmt" = "cargo fmt --all --check"
-"check:clippy" = "cargo clippy --workspace --all-targets -- -D warnings"
+"check:clippy" = "cargo clippy --workspace --all-targets --features a/lua -- -D warnings"
 # Sequential: the tests and clippy would rebuild the same target at once.
 check = { depends = ["check:fmt", "check:clippy"], run = "mise run test" }
 # The shipped binary: under 4 MiB, and without the test fixtures (no

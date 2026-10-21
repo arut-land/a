@@ -33,9 +33,9 @@ struct Invocation {
 }
 
 impl Invocations {
-    pub(super) fn fold(&mut self, entry: &Entry) {
+    pub(super) fn fold(&mut self, entry: &Entry) -> Option<CallId> {
         if entry.seq.get() <= self.through {
-            return;
+            return None;
         }
         self.through = entry.seq.get();
         match &entry.body {
@@ -54,6 +54,7 @@ impl Invocations {
                         result: None,
                     },
                 );
+                return Some(CallId(entry.seq));
             }
             Body::ToolResult {
                 call,
@@ -74,6 +75,7 @@ impl Invocations {
             }
             _ => {}
         }
+        None
     }
 
     pub(super) fn request(
@@ -129,16 +131,20 @@ impl Actor {
         ticket: super::Ticket,
         result: Result<CallId, String>,
     ) {
-        if let Some(reply) = self.replies.invocations.remove(&ticket) {
+        if let Some((reply, _)) = self.replies.invocations.remove(&ticket) {
             match result {
-                Ok(call) => match self
-                    .projection
-                    .invocations
-                    .result(call, self.journal.durable_seq)
-                {
-                    Some(result) => reply.send(result.clone()),
-                    None => self.replies.invoked.entry(call).or_default().push(reply),
-                },
+                Ok(call) => {
+                    if let Some(result) = self
+                        .projection
+                        .invocations
+                        .result(call, self.journal.durable_seq)
+                    {
+                        self.replies.contexts.remove(&call);
+                        reply.send(result.clone());
+                    } else {
+                        self.replies.invoked.entry(call).or_default().push(reply);
+                    }
+                }
                 Err(error) => reply.send(super::Called::failed(error)),
             }
         }
@@ -156,6 +162,7 @@ impl Actor {
             } = &e.body
                 && let Some(waiters) = self.replies.invoked.remove(call)
             {
+                self.replies.contexts.remove(call);
                 for waiter in waiters {
                     waiter.send(super::Called {
                         outcome: outcome.clone(),
@@ -200,7 +207,7 @@ impl Actor {
             self.projection.transcript = None;
         }
         for e in entries {
-            self.projection.invocations.fold(e);
+            let _ = self.projection.invocations.fold(e);
             if let Body::Answer { call, .. }
             | Body::Decision {
                 call: Some(call),

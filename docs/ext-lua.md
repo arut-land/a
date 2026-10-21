@@ -59,10 +59,14 @@ while an `on_stop` error passes. Hooks cannot await effects.
 
 `a.text{name = "name", order = 0, text = "system text"}` contributes system
 text. `a.fold{name = "count", initial = 0, apply = function(state, change)
-return state + change end}` declares durable JSON state. Reducers must be
-pure: they run in a separate VM during replay and cannot perform effects.
-A failed reduction leaves its previous value intact. Keep state in folds;
-module globals are shared by sessions and are discarded on reload.
+return state + change end}` declares durable JSON state. Reducers run in a
+separate VM without effects. On every application, live or replayed, the host
+re-evaluates the source in a fresh environment and resets the private VM's PRNG.
+Closure upvalues and global mutations cannot survive an application; only the
+JSON state passed in and returned carries session data. Another session's
+reductions therefore cannot change replay. A failed reduction leaves its
+previous value intact. Tool, hook and agent globals remain generation-wide,
+shared by sessions and discarded on reload.
 
 Tool context functions use a dot, not a colon:
 
@@ -73,7 +77,7 @@ Tool context functions use a dot, not a colon:
 | `cx.published(key)` | Whether the publication remains in effective context |
 | `cx.update(name, change)` | Await a durable change; the next read sees it |
 | `cx.progress(text)` | Publish call progress |
-| `cx.tool(name, input)` | Await a granted tool through policy |
+| `cx.tool(name, tool, input)` | Await a named, granted tool through policy |
 | `cx.session` | Session identity |
 
 Hooks receive `cx.session` and read-only `cx.state(name)`. A saved context
@@ -112,18 +116,17 @@ a.tool{
     name = "run", audience = "user", description = "Run a greeting.",
     input = {type = "object"},
     run = function(input, cx)
-        return cx.tool("bash", {command = "printf hello"})
+        return cx.tool("greeting", "bash", {command = "printf hello"})
     end,
 }
 ```
 
 The capability does not authorize an effect. Delegation runs the target's
 `pre_tool`, permission, approval and `post_tool` hooks; shell spawning also
-runs its normal spawn hooks. A deny or defer fails the call. Synchronous approval answers are honored. A request requiring a later approval,
-including the client's, is currently refused. Configure
-policy deliberately for delegated tools that should run without interaction.
-Delegated work shares its parent's durable call identity and progress; it does
-not create an independent tool intent. Delegation depth is capped at eight.
+runs its normal spawn hooks. A deny or defer fails the call. Approval may wait for a client answer. Each
+named invocation has its own durable intent, progress and result, owned by its
+caller. Repeating a name reuses that result; the callee's replay and concurrency
+contracts govern execution. Names are unique within their owner call.
 An HTTP extension, if installed, can be delegated to in the same way; this
 crate adds no independent HTTP client.
 
@@ -144,9 +147,16 @@ timeout_ms = 25
 ```
 
 Memory is capped per VM; a mod with folds has a separate reducer VM.
-Instructions are counted per invocation, including async resumes. The time
-limit is checked by the instruction hook per active poll, excluding awaited
-I/O; it is not an OS-enforced hard deadline for native functions. Native
+An owned invocation chain shares its instruction and dispatch allowance,
+including named descendants on other workers or in other mod VMs. Sequential
+hooks share a dispatch allowance too. Preparation shares one allowance across
+the tool and reducer VM compilations. Reducer applications budget both source
+preparation and reduction. Active poll time accumulates across resumes,
+excluding awaited I/O; this is not an OS-enforced hard deadline for native functions.
+Each generation admits at most 16 executing calls and 64 waiters. A call releases
+its permit while awaiting a delegated tool, then reacquires before resuming;
+waiting owners cannot occupy the capacity their children need. Cancellation
+removes waiters and releases held permits. Native
 pattern functions are omitted because they cannot be interrupted by the hook.
 Each invocation may send at most 128 host operations and 1 MiB of outbound
 progress, state changes and delegated input, which the Lua allocator cannot

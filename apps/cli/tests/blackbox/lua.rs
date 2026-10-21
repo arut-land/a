@@ -46,6 +46,34 @@ fn lua_tools_run_through_the_echo_agents_durable_calls() {
 }
 
 #[test]
+fn named_lua_invocations_share_the_owners_instruction_budget() {
+    let env = Env::new("lua-named-budget");
+    env.ext("lua", "instructions=10000\ntimeout_ms=1000");
+    env.ext("budget", "tools=['budget']");
+    env.ext("policy", "mode='auto'");
+    write(
+        &env.home.root().join("ext"),
+        "budget",
+        "a.tool{name='budget',audience='user',description='budget',input={type='object'},run=function(input,cx) local n=0; for i=1,3000 do n=n+i end; if input.args=='leaf' then return n end; return cx.tool('leaf','budget',{args='leaf'}) end}",
+    );
+    env.start();
+    let mut conn = env.connect();
+    conn.attach(Target::New, &env.ws);
+    assert_eq!(done(&mut conn, "/budget leaf"), 4_501_500);
+    conn.input("/budget");
+    let entries = conn.until(
+        |e| matches!(&e.body, Body::ToolCall { invoke: None, tool, .. } if tool == "budget"),
+    );
+    let root = protocol::CallId(entries.last().unwrap().seq);
+    let entries = conn.until(|e| matches!(&e.body, Body::ToolResult { call, .. } if *call == root));
+    assert!(
+        matches!(&entries.last().unwrap().body, Body::ToolResult { outcome: Outcome::Failed { error }, .. } if error.contains("budget")),
+        "owner and leaf together exceed 10000 instructions: {:?}",
+        entries.last().unwrap().body
+    );
+}
+
+#[test]
 fn lua_input_handlers_run_before_the_echo_agent() {
     let env = Env::new("lua-handler");
     write(
@@ -157,7 +185,7 @@ fn lua_shell_delegation_requires_a_grant_and_obeys_the_policy_floor() {
     write(
         &env.home.root().join("ext"),
         "runner",
-        "a.tool{name='run',audience='user',description='run',input={type='object'},run=function(input,cx) return cx.tool('bash',{command='printf lua'}) end}",
+        "a.tool{name='run',audience='user',description='run',input={type='object'},run=function(input,cx) return cx.tool('run','bash',{command='printf lua'}) end}",
     );
     env.start();
     let mut conn = env.connect();
