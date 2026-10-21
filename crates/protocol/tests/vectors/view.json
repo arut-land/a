@@ -1,5 +1,255 @@
 [
   {
+    "hash": "2071e181b41464a1",
+    "messages": [
+      {
+        "session": "00000000-0000-0000-0000-00000000000a",
+        "t": "attached",
+        "workspace": "/w"
+      },
+      {
+        "epoch": 0,
+        "input": {
+          "command": "ls"
+        },
+        "kind": "tool_call",
+        "seq": 1,
+        "t": "entry",
+        "tool": "bash"
+      },
+      {
+        "by": "policy",
+        "call": 1,
+        "d": "permission",
+        "epoch": 0,
+        "kind": "decision",
+        "permission": {
+          "ask": {
+            "mode": {
+              "mode": "ask"
+            }
+          }
+        },
+        "seq": 2,
+        "t": "entry"
+      },
+      {
+        "activity": "approval",
+        "seq": 2,
+        "t": "activity"
+      },
+      {
+        "epoch": 0,
+        "for": 1,
+        "kind": "model_call",
+        "model": "fast",
+        "purpose": "approval-description",
+        "seq": 3,
+        "t": "entry"
+      },
+      {
+        "call": 3,
+        "epoch": 0,
+        "for": 1,
+        "kind": "model_result",
+        "outcome": {
+          "output": {
+            "message": {
+              "content": [
+                {
+                  "text": "Lists files in the current directory.",
+                  "type": "text"
+                }
+              ]
+            }
+          },
+          "status": "done"
+        },
+        "seq": 4,
+        "t": "entry"
+      },
+      {
+        "seq": 4,
+        "t": "synced"
+      }
+    ],
+    "name": "approval reason precedes its optional description",
+    "state": {
+      "items": [
+        {
+          "call": 1,
+          "input": {
+            "command": "ls"
+          },
+          "outcome": null,
+          "phase": {
+            "waiting": {
+              "on": "approval"
+            }
+          },
+          "reason": {
+            "mode": {
+              "mode": "ask"
+            }
+          },
+          "tool": "bash",
+          "type": "tool"
+        },
+        {
+          "call": 3,
+          "model": "fast",
+          "owner": 1,
+          "purpose": "approval-description",
+          "status": {
+            "status": "done"
+          },
+          "text": "Lists files in the current directory.",
+          "type": "reply",
+          "usage": null
+        }
+      ],
+      "ledger": {
+        "armed": [],
+        "background": [],
+        "clients": [],
+        "context": false,
+        "env": null,
+        "extensions": null,
+        "links": [],
+        "open": [
+          [
+            1,
+            {
+              "call": {
+                "tool": {
+                  "by": "model",
+                  "input": {
+                    "command": "ls"
+                  },
+                  "tool": "bash"
+                }
+              },
+              "phase": {
+                "waiting": {
+                  "on": "approval"
+                }
+              }
+            }
+          ]
+        ],
+        "seq": 4,
+        "turn": 0,
+        "untaken": [],
+        "watched": []
+      },
+      "seq": 4,
+      "session": "00000000-0000-0000-0000-00000000000a",
+      "workspace": "/w"
+    },
+    "updates": [
+      {
+        "change": {
+          "change": "attached",
+          "reset": true,
+          "session": "00000000-0000-0000-0000-00000000000a",
+          "workspace": "/w"
+        },
+        "rev": 1,
+        "seq": 0
+      },
+      {
+        "change": {
+          "change": "added",
+          "index": 0,
+          "item": {
+            "call": 1,
+            "input": {
+              "command": "ls"
+            },
+            "outcome": null,
+            "phase": {
+              "gating": {
+                "at": 0
+              }
+            },
+            "tool": "bash",
+            "type": "tool"
+          }
+        },
+        "rev": 2,
+        "seq": 1
+      },
+      {
+        "change": {
+          "change": "updated",
+          "index": 0,
+          "part": {
+            "part": "phase"
+          }
+        },
+        "rev": 3,
+        "seq": 2
+      },
+      {
+        "change": {
+          "change": "activity"
+        },
+        "rev": 4,
+        "seq": 2
+      },
+      {
+        "change": {
+          "change": "added",
+          "index": 1,
+          "item": {
+            "call": 3,
+            "model": "fast",
+            "owner": 1,
+            "purpose": "approval-description",
+            "status": {
+              "status": "running"
+            },
+            "text": "",
+            "type": "reply",
+            "usage": null
+          }
+        },
+        "rev": 5,
+        "seq": 3
+      },
+      {
+        "change": {
+          "change": "batch",
+          "changes": [
+            {
+              "change": "updated",
+              "index": 1,
+              "part": {
+                "part": "outcome"
+              }
+            },
+            {
+              "change": "updated",
+              "index": 0,
+              "part": {
+                "part": "presentation"
+              }
+            }
+          ]
+        },
+        "rev": 6,
+        "seq": 4
+      },
+      {
+        "change": {
+          "change": "synced"
+        },
+        "rev": 7,
+        "seq": 4
+      }
+    ]
+  },
+  {
     "hash": "ba47e388c35a427d",
     "messages": [
       {
@@ -507,7 +757,7 @@
     ]
   },
   {
-    "hash": "6c8e00eea9b68da2",
+    "hash": "777d6bc0c815196d",
     "messages": [
       {
         "session": "00000000-0000-0000-0000-00000000000a",
@@ -530,7 +780,13 @@
         "d": "permission",
         "epoch": 0,
         "kind": "decision",
-        "permission": "ask",
+        "permission": {
+          "ask": {
+            "mode": {
+              "mode": "ask"
+            }
+          }
+        },
         "seq": 2,
         "t": "entry"
       },
@@ -588,6 +844,11 @@
           },
           "phase": {
             "settled": "done"
+          },
+          "reason": {
+            "mode": {
+              "mode": "ask"
+            }
           },
           "tool": "bash",
           "type": "tool"
@@ -1495,7 +1756,7 @@
     ]
   },
   {
-    "hash": "46cc360b6d40d957",
+    "hash": "2f82fdc1219ca912",
     "messages": [
       {
         "session": "00000000-0000-0000-0000-00000000000a",
@@ -1557,6 +1818,11 @@
             "phase": {
               "waiting": {
                 "on": "approval"
+              }
+            },
+            "reason": {
+              "mode": {
+                "mode": "ask"
               }
             },
             "tool": "bash",
@@ -1653,6 +1919,11 @@
           "phase": {
             "waiting": {
               "on": "approval"
+            }
+          },
+          "reason": {
+            "mode": {
+              "mode": "ask"
             }
           },
           "tool": "bash",
@@ -1812,7 +2083,7 @@
     ]
   },
   {
-    "hash": "9836a68da3076432",
+    "hash": "4bce6a9c0b65c62a",
     "messages": [
       {
         "session": "00000000-0000-0000-0000-00000000000a",
@@ -1940,7 +2211,13 @@
         "d": "permission",
         "epoch": 0,
         "kind": "decision",
-        "permission": "ask",
+        "permission": {
+          "ask": {
+            "mode": {
+              "mode": "ask"
+            }
+          }
+        },
         "seq": 10,
         "t": "entry"
       },
@@ -2190,7 +2467,13 @@
         "d": "permission",
         "epoch": 0,
         "kind": "decision",
-        "permission": "ask",
+        "permission": {
+          "ask": {
+            "mode": {
+              "mode": "ask"
+            }
+          }
+        },
         "seq": 28,
         "t": "entry"
       },
@@ -2268,6 +2551,11 @@
           "phase": {
             "settled": "done"
           },
+          "reason": {
+            "mode": {
+              "mode": "ask"
+            }
+          },
           "tool": "bash",
           "type": "tool"
         },
@@ -2344,6 +2632,11 @@
           "phase": {
             "waiting": {
               "on": "approval"
+            }
+          },
+          "reason": {
+            "mode": {
+              "mode": "ask"
             }
           },
           "tool": "bash",
@@ -2995,7 +3288,7 @@
     ]
   },
   {
-    "hash": "c93e610da369f38d",
+    "hash": "81c697640b2c5716",
     "messages": [
       {
         "session": "00000000-0000-0000-0000-00000000000a",
@@ -3022,7 +3315,13 @@
         "d": "permission",
         "epoch": 0,
         "kind": "decision",
-        "permission": "ask",
+        "permission": {
+          "ask": {
+            "mode": {
+              "mode": "ask"
+            }
+          }
+        },
         "seq": 2,
         "t": "entry"
       },
@@ -3119,6 +3418,11 @@
           },
           "phase": {
             "settled": "done"
+          },
+          "reason": {
+            "mode": {
+              "mode": "ask"
+            }
           },
           "tool": "bash",
           "type": "tool"

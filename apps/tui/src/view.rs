@@ -323,6 +323,14 @@ fn card(
     if let Some(first) = out.get_mut(from).and_then(|row| row.spans.first_mut()) {
         first.text = format!("  ⎿  {}", first.text.trim_start_matches(' ')).into();
     }
+    for text in client::approval_text(p).lines() {
+        out.extend(wrap(
+            &[Span::new(sanitize(text), ASK)],
+            width,
+            &[Span::new("     ", MUTED)],
+            &[Span::new("     ", MUTED)],
+        ));
+    }
     if let Buttons::Approve(call) = p.buttons {
         out.push(approve_row(call));
     }
@@ -380,6 +388,7 @@ mod tests {
             input: Json::encode(&json!({"command": "ls"})).unwrap(),
             phase,
             outcome,
+            reason: None,
             card: None,
             by: Audience::Model,
         }
@@ -440,6 +449,30 @@ mod tests {
     }
 
     #[test]
+    fn an_approval_card_explains_its_rule_even_when_collapsed() {
+        let mut item = tool(None, Phase::Waiting(WaitOn::Approval));
+        if let Item::Tool { reason, .. } = &mut item {
+            *reason = Some(Box::new(protocol::ApprovalReason::Classifier {
+                reason: "needs review".into(),
+            }));
+        }
+        let lines = texts(&rows(
+            &item,
+            100,
+            Look {
+                collapsed: true,
+                ..Look::default()
+            },
+        ));
+        assert!(
+            lines
+                .iter()
+                .any(|line| line.contains("Why: the classifier requested approval: needs review"))
+        );
+        assert!(lines.iter().any(|line| line.contains("allow this call?")));
+    }
+
+    #[test]
     fn a_streaming_reply_shows_its_live_text() {
         let item = Item::Reply {
             call: CallId::new(3).unwrap(),
@@ -448,6 +481,7 @@ mod tests {
             status: protocol::view::Status::Running,
             usage: None,
             purpose: None,
+            owner: None,
         };
         assert!(rows_of(&item, Look::default()).len() <= 1);
         let mut live = Live::default();
@@ -516,6 +550,7 @@ mod tests {
             tool: "edit".into(),
             input: Json::encode(&json!({"path": "a.txt", "edits": []})).unwrap(),
             phase: Phase::Running,
+            reason: None,
             outcome: Some(Outcome::Done {
                 output: Json::encode(&json!({"path": "a.txt"})).unwrap(),
             }),
@@ -549,6 +584,7 @@ mod tests {
             input: Json::encode(&serde_json::json!({ "args": "" })).unwrap(),
             phase: Phase::Gating { at: 0 },
             outcome: None,
+            reason: None,
             card: None,
             by: Audience::User,
         };

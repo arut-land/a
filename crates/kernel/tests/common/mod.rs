@@ -432,10 +432,12 @@ impl Extension for Policed {
             });
         }
         r.on::<PermissionPoint>(move |_, call| match policy {
-            Policy::Ask(tools) if tools.contains(&call.tool) => Permission::Ask,
+            Policy::Ask(tools) if tools.contains(&call.tool) => {
+                Permission::Ask(protocol::ApprovalReason::Mode { mode: "ask".into() })
+            }
             Policy::Deny(tools) if tools.contains(&call.tool) => Permission::Deny,
             Policy::RewriteThenDeny => Permission::Deny,
-            Policy::Later => Permission::Ask,
+            Policy::Later => Permission::Ask(protocol::ApprovalReason::Mode { mode: "ask".into() }),
             _ => Permission::Allow,
         });
         if policy == Policy::RewriteThenDeny {

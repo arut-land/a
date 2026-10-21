@@ -347,7 +347,9 @@ fn a_failing_handler_answers_its_points_failure_policy() {
     );
     let asks = hooks(vec![
         one("policy", |r| {
-            r.on::<Permission>(|_, _| Level::Ask);
+            r.on::<Permission>(|_, _| {
+                Level::Ask(protocol::ApprovalReason::Mode { mode: "ask".into() })
+            });
         }),
         one("broken", |r| {
             r.on::<Approve>(|_, _| panic!("a"));
@@ -386,7 +388,9 @@ fn a_failing_handler_answers_its_points_failure_policy() {
     // A later answer that panics comes to the same.
     let later = hooks(vec![
         one("policy", |r| {
-            r.on::<Permission>(|_, _| Level::Ask);
+            r.on::<Permission>(|_, _| {
+                Level::Ask(protocol::ApprovalReason::Mode { mode: "ask".into() })
+            });
         }),
         one("broken", |r| {
             r.on::<Approve>(|_, _| Answer::Later(Later::new(async { panic!("later") })));
@@ -400,7 +404,8 @@ fn a_failing_handler_answers_its_points_failure_policy() {
 
 #[test]
 fn merge_rules_are_applied_identically_for_every_point() {
-    use Level::{Allow, Ask, Defer, Deny};
+    use Level::{Allow, Defer, Deny};
+    let ask = || Level::Ask(protocol::ApprovalReason::Mode { mode: "ask".into() });
 
     macro_rules! table {
         ($($point:ident),*) => { [$(($point::NAME, $point::MERGE)),*] };
@@ -476,9 +481,18 @@ fn merge_rules_are_applied_identically_for_every_point() {
     // equals, and all allowing is no answer.
     let cases = [
         (vec![Allow, Allow], None),
-        (vec![Ask, Allow], Some(("a", Ask))),
-        (vec![Ask, Defer, Ask], Some(("b", Defer))),
-        (vec![Defer, Deny, Ask], Some(("b", Deny))),
+        (vec![ask(), Allow], Some(("a", ask()))),
+        (
+            vec![
+                ask(),
+                Level::Ask(protocol::ApprovalReason::Classifier {
+                    reason: "needs review".into(),
+                }),
+            ],
+            Some(("a", ask())),
+        ),
+        (vec![ask(), Defer, ask()], Some(("b", Defer))),
+        (vec![Defer, Deny, ask()], Some(("b", Deny))),
         (vec![Deny, Deny], Some(("a", Deny))),
     ];
     let view = Counted::default();
@@ -488,7 +502,7 @@ fn merge_rules_are_applied_identically_for_every_point() {
             .zip(levels.clone())
             .map(|(name, level)| {
                 one(name, move |r| {
-                    r.on::<Permission>(move |_, _| level);
+                    r.on::<Permission>(move |_, _| level.clone());
                 })
             })
             .collect();
@@ -586,7 +600,9 @@ fn gate_logs_what_the_chain_and_the_policy_decided() {
     let asks = |approve: Option<bool>| {
         hooks(vec![
             one("policy", |r| {
-                r.on::<Permission>(|_, _| Level::Ask);
+                r.on::<Permission>(|_, _| {
+                    Level::Ask(protocol::ApprovalReason::Mode { mode: "ask".into() })
+                });
             }),
             one("approver", move |r| {
                 r.on::<Approve>(move |_, _| Answer::Now(approve));
@@ -631,7 +647,9 @@ fn a_later_answer_resumes_the_merge_where_it_stopped() {
     let after = Arc::clone(&told);
     let set = hooks(vec![
         one("policy", |r| {
-            r.on::<Permission>(|_, _| Level::Ask);
+            r.on::<Permission>(|_, _| {
+                Level::Ask(protocol::ApprovalReason::Mode { mode: "ask".into() })
+            });
         }),
         one("none", |r| {
             r.on::<Approve>(|_, _| Answer::Now(None));
@@ -783,7 +801,12 @@ fn erased_handlers_answer_in_json_and_a_policy_that_cannot_be_read_denies() {
         .on_erased(
             "permission",
             Arc::new(Erased(|args| match args["input"]["tool"].as_str() {
-                Some("bash") => json!("ask"),
+                Some("bash") => {
+                    serde_json::to_value(Level::Ask(protocol::ApprovalReason::Classifier {
+                        reason: "needs review".into(),
+                    }))
+                    .unwrap()
+                }
                 _ => json!("maybe"),
             })),
         );

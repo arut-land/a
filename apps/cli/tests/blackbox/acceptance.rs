@@ -467,7 +467,7 @@ fn a_pending_approval_survives_detach_and_is_re_delivered_on_attach() {
             body,
             Body::Decision {
                 d: Verdict::Permission {
-                    permission: Permission::Ask
+                    permission: Permission::Ask(_)
                 },
                 ..
             }
@@ -505,9 +505,10 @@ fn a_pending_approval_survives_detach_and_is_re_delivered_on_attach() {
     let mut term = env.repl(&["resume"]);
     let shown = term.lines_until("?");
     assert_eq!(
-        &shown[shown.len() - 2..],
+        &shown[shown.len() - 3..],
         [
             "[recap · you: $ echo ran > ran.txt · ran bash · 1 waiting for approval]",
+            "Why: the ask mode requires approval for this tool",
             "? $ echo ran > ran.txt  waiting for approval  [y/n]",
         ]
     );

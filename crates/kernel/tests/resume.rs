@@ -166,7 +166,10 @@ fn a_wait_survives_a_restart_and_runs_once_answered() {
     let bodies = [
         input("$ echo"),
         bash("echo"),
-        permission(2, Permission::Ask),
+        permission(
+            2,
+            Permission::Ask(protocol::ApprovalReason::Mode { mode: "ask".into() }),
+        ),
     ];
     let (mut s, fx) = resume(reg, bodies, &BUSY_LOAD);
     assert_eq!(fx, [IDLE], "waiting is not work");

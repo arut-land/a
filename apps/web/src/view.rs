@@ -277,6 +277,9 @@ fn tool_card<'a>(p: &'a Presented<'a>) -> impl Renderable {
                 span style=(style::MONO) { (p.title) }
                 span style=(status_style(p.glyph)) { (p.status) }
             }
+            @if p.reason.is_some() {
+                div style=(style::NOTE) { @for line in client::approval_text(p).lines() { div { (line) } } }
+            }
             @if let Buttons::Approve(call) = p.buttons {
                 div style=(style::ASK) {
                     span { "Run this?" }

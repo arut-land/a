@@ -822,7 +822,9 @@ mod tests {
                 by: "policy".into(),
                 call: CallId::new(call),
                 d: Verdict::Permission {
-                    permission: Permission::Ask,
+                    permission: Permission::Ask(protocol::ApprovalReason::Mode {
+                        mode: "ask".into(),
+                    }),
                 },
             },
         ))

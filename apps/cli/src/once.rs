@@ -283,13 +283,17 @@ impl Once {
                 Item::Tool { tool, .. }
                     if matches!(item.present().buttons, Buttons::Approve(_)) =>
                 {
-                    Some((tool, item.present().title))
+                    Some((
+                        tool,
+                        item.present().title,
+                        client::approval_text(&view.present(item)),
+                    ))
                 }
                 _ => None,
             });
             match approval {
-                Some((tool, title)) => eprintln!(
-                    "a: {tool} ({title}) waits for approval in session {id}, which keeps the \
+                Some((tool, title, explanation)) => eprintln!(
+                    "a: {tool} ({title}) waits for approval in session {id}. {explanation}. The session keeps the \
                      question open: {answer}, or run with `--mode auto` (A_MODE=auto) to let \
                      calls through unasked"
                 ),

@@ -5,6 +5,7 @@
 //! session's link, view and intents ([`SessionClient`]) and the one slash
 //! command table ([`COMMANDS`]); a thin [`Driver`] runs them on threads.
 
+mod approval;
 mod command;
 mod drive;
 mod inbox;
@@ -14,6 +15,7 @@ mod remote;
 mod session;
 mod watch;
 
+pub use approval::approval_text;
 pub use command::{COMMANDS, Cmd, Command, help, parse};
 pub use drive::{Driver, Renderer, pump};
 pub use inbox::{Inbox, Post, inbox};

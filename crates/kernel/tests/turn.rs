@@ -78,7 +78,13 @@ fn asked() -> Vec<Effect> {
     vec![
         append(1, input("$ echo")),
         append(2, bash("echo")),
-        append(3, permission(2, Permission::Ask)),
+        append(
+            3,
+            permission(
+                2,
+                Permission::Ask(protocol::ApprovalReason::Mode { mode: "ask".into() }),
+            ),
+        ),
     ]
 }
 

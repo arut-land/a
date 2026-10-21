@@ -6,7 +6,9 @@ use std::borrow::Cow;
 
 use crate::ledger::Phase;
 use crate::view::{Item, Recap, Status, Usage};
-use crate::{Audience, CallId, Card, Json, Mark, Outcome, Permission, Verdict, WaitOn};
+use crate::{
+    ApprovalReason, Audience, CallId, Card, Json, Mark, Outcome, Permission, Verdict, WaitOn,
+};
 
 /// What an item is, for the layout a renderer gives it.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -112,6 +114,8 @@ pub struct Presented<'a> {
     /// A reply's token counts, once it has them.
     pub usage: Option<Usage>,
     pub buttons: Buttons,
+    pub reason: Option<&'a ApprovalReason>,
+    pub description: Option<&'a str>,
 }
 
 /// An item with nothing to say of its state.
@@ -124,6 +128,8 @@ fn plain<'a>(kind: Kind, title: Cow<'a, str>, body: Shown<'a>) -> Presented<'a> 
         body,
         usage: None,
         buttons: Buttons::None,
+        reason: None,
+        description: None,
     }
 }
 
@@ -151,6 +157,7 @@ impl Item {
                 outcome,
                 card,
                 by,
+                reason,
             } => {
                 let (kind, title) = match by {
                     Audience::User => (
@@ -165,6 +172,7 @@ impl Item {
                 };
                 let mut p = plain(kind, title, Shown::None);
                 standing(&mut p, *call, phase, outcome.as_ref(), card.as_ref());
+                p.reason = reason.as_deref();
                 p
             }
             Self::Hook {
@@ -370,7 +378,7 @@ pub fn decision_line(tool: &str, call: Option<CallId>, decision: &Verdict) -> St
         Verdict::Permission { permission } => {
             let permission = match permission {
                 Permission::Allow => "allow",
-                Permission::Ask => "ask",
+                Permission::Ask(_) => "ask",
                 Permission::Defer => "defer",
                 Permission::Deny => "deny",
             };

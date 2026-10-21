@@ -64,13 +64,24 @@ impl Actor {
             cancel,
             origin,
             background,
+            while_waiting,
         }) = self.sides.remove(&ticket)
         {
+            if while_waiting
+                && !self
+                    .core
+                    .ledger()
+                    .call(origin.call)
+                    .is_some_and(|o| matches!(o.phase, protocol::ledger::Phase::Waiting(_)))
+            {
+                cancel.set();
+            }
             let side = side.filter(|side| {
                 self.phase == Phase::Serving
-                    && !cancel.is_set()
+                    && (!cancel.is_set() || while_waiting)
                     && (origin.current(&self.live.session)
-                        || background && self.background_owner_succeeded(&origin))
+                        || background && self.background_owner_succeeded(&origin)
+                        || while_waiting && cancel.is_set())
                     && self.core.ledger().call(*side).is_some()
             });
             reply.send(side.map_or(Opened::Closed, |id| {
@@ -125,6 +136,16 @@ impl Actor {
         reply: oneshot::Sender<Opened>,
     ) -> Option<Event> {
         let of = origin.call;
+        if side.is_while_waiting()
+            && !self
+                .core
+                .ledger()
+                .call(of)
+                .is_some_and(|o| matches!(o.phase, protocol::ledger::Phase::Waiting(_)))
+        {
+            reply.send(Opened::Closed);
+            return None;
+        }
         let previous = self
             .live
             .frames
@@ -196,6 +217,7 @@ impl Actor {
         self.sides.insert(
             ticket,
             PendingSide {
+                while_waiting: side.is_while_waiting(),
                 background,
                 cancel: Cancel::default(),
                 origin,

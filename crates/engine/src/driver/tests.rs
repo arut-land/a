@@ -1119,7 +1119,7 @@ fn an_ask_waits_in_the_inbox_through_a_stop_and_runs_once_approved() {
                 Body::ToolCall { .. },
                 Body::Decision {
                     d: Verdict::Permission {
-                        permission: Permission::Ask,
+                        permission: Permission::Ask(_),
                     },
                     ..
                 },

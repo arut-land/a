@@ -508,6 +508,8 @@ struct ItemFields {
     status: Option<Status>,
     usage: Option<Usage>,
     purpose: Option<String>,
+    owner: Option<CallId>,
+    reason: Option<Box<crate::ApprovalReason>>,
     tool: Option<String>,
     #[serde(default, deserialize_with = "present")]
     input: Option<Json>,
@@ -641,6 +643,7 @@ impl ItemFields {
                 status: req(f.status.take(), "status")?,
                 usage: f.usage.take(),
                 purpose: f.purpose.take(),
+                owner: f.owner.take(),
             },
             Type::Tool => Item::Tool {
                 call: need(f.call.take(), "call")?,
@@ -648,6 +651,7 @@ impl ItemFields {
                 input: req(f.input.take(), "input")?,
                 phase: req(f.phase.take(), "phase")?,
                 outcome: f.outcome.take(),
+                reason: f.reason.take(),
                 card: f.card.take(),
                 by: def(f.by.take())?,
             },

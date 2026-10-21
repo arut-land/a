@@ -8,6 +8,10 @@ use std::path::{Path, PathBuf};
 /// What an app holding a rule of its own would write.
 const COPIES: &[(&str, &str)] = &[
     (
+        "ApprovalReason::",
+        "wording a policy reason outside the SDK",
+    ),
+    (
         ".ledger.activity()",
         "inferring turn completion from an entry prefix",
     ),

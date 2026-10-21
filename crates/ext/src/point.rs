@@ -371,8 +371,14 @@ impl Rule for protocol::Permission {
         handlers
             .iter()
             .map(|(name, handler)| (name, P::call(name, handler, cx, P::input(facts, &()))))
-            .filter(|(_, level)| *level > Self::Allow)
-            .reduce(|most, next| if next.1 > most.1 { next } else { most })
+            .filter(|(_, level)| level.rank() > Self::Allow.rank())
+            .reduce(|most, next| {
+                if next.1.rank() > most.1.rank() {
+                    next
+                } else {
+                    most
+                }
+            })
             .map(|(name, level)| (Name::clone(name), level))
     }
 }
@@ -468,6 +474,7 @@ pub struct PointCx<'a> {
     /// The call: the seq of its intent.
     pub call: Option<CallId>,
     view: &'a dyn View,
+    tool: Option<ToolUse<'a>>,
 }
 
 /// The engine's side of a [`PointCx`], read only when a handler asks.
@@ -496,6 +503,7 @@ impl<'a> PointCx<'a> {
             workspace: view.workspace(),
             call: None,
             view,
+            tool: None,
         }
     }
 
@@ -513,6 +521,17 @@ impl<'a> PointCx<'a> {
     /// request, say ([`Cx::models`]). `None` for a point about no call.
     pub fn cx(&self) -> Option<Cx> {
         self.call.and_then(|call| self.view.cx(call))
+    }
+
+    /// The owning tool, when an observation is about one of its facts.
+    pub const fn tool_use(&self) -> Option<ToolUse<'a>> {
+        self.tool
+    }
+
+    #[must_use]
+    pub fn with_tool(mut self, tool: ToolUse<'a>) -> Self {
+        self.tool = Some(tool);
+        self
     }
 
     pub fn model(&self) -> String {
@@ -1180,10 +1199,15 @@ impl Hooks {
         let Some((by, permission)) = self.ask::<Permission>(cx, call) else {
             return Ok(Gate::Run);
         };
-        decided.push((Name::clone(&by), Verdict::Permission { permission }));
+        decided.push((
+            Name::clone(&by),
+            Verdict::Permission {
+                permission: permission.clone(),
+            },
+        ));
         Ok(match permission {
             protocol::Permission::Allow => Gate::Run,
-            protocol::Permission::Ask => match self.approve_from(cx, tool, input, 0) {
+            protocol::Permission::Ask(_) => match self.approve_from(cx, tool, input, 0) {
                 Asked::None => Gate::Ask,
                 Asked::Now(who, approved) => approval(who, approved, decided),
                 later @ Asked::Later { .. } => return Err(later),
@@ -1254,6 +1278,11 @@ impl Hooks {
         );
         let cx = if intent {
             cx.about(CallId(entry.seq))
+        } else if let protocol::Body::Decision {
+            call: Some(call), ..
+        } = &entry.body
+        {
+            cx.about(*call)
         } else {
             cx
         };

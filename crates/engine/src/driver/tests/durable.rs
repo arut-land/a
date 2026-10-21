@@ -952,7 +952,9 @@ fn final_sync_publishes_activity_after_its_entries() {
         const NAME: &'static str = "held-gate";
         const VERSION: u32 = 1;
         fn contribute(&self, r: &mut Registrar) {
-            r.on::<point::Permission>(|_, _| Permission::Ask);
+            r.on::<point::Permission>(|_, _| {
+                Permission::Ask(protocol::ApprovalReason::Mode { mode: "ask".into() })
+            });
             r.on::<point::Approve>(|_, _| Answer::Later(ext::Later::new(std::future::pending())));
         }
     }

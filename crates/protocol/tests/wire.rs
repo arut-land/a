@@ -315,7 +315,9 @@ fn input_samples() -> Vec<Sample<DaemonMsg>> {
                     by: "policy".into(),
                     call: Some(call(2)),
                     d: Verdict::Permission {
-                        permission: Permission::Ask,
+                        permission: Permission::Ask(protocol::ApprovalReason::Mode {
+                            mode: "ask".into(),
+                        }),
                     },
                 },
             ),
@@ -430,7 +432,9 @@ fn daemon_samples() -> Vec<Sample<DaemonMsg>> {
                 by: "policy".into(),
                 call: CallId::new(2),
                 d: Verdict::Permission {
-                    permission: Permission::Ask,
+                    permission: Permission::Ask(protocol::ApprovalReason::Mode {
+                        mode: "ask".into(),
+                    }),
                 },
             },
         ),

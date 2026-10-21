@@ -105,11 +105,8 @@ func expectInStep(_ store: SessionStore, _ reducer: Reducer, _ name: String) {
 @Test func aCallWaitingForApprovalCanBeStopped() throws {
     let reducer = Reducer()
     let store = SessionStore(source: reducer)
-    for message in [
-        #"{"t":"attached","session":"00000000-0000-0000-0000-00000000000a","workspace":"/w"}"#,
-        #"{"t":"entry","seq":1,"epoch":0,"kind":"tool_call","tool":"bash","input":{"command":"ls"}}"#,
-        #"{"t":"entry","seq":2,"epoch":0,"kind":"decision","by":"policy","call":1,"d":"permission","permission":"ask"}"#,
-    ] {
+    let vector = Vector.all.first { $0.name == "approval reason precedes its optional description" }!
+    for message in vector.messages.prefix(4) {
         if let update = try reducer.fold(message: message) { store.apply(update) }
     }
     #expect(store.items.count == 1)
@@ -146,4 +143,24 @@ func expectInStep(_ store: SessionStore, _ reducer: Reducer, _ name: String) {
     } catch {
         Issue.record("unexpected \(error)")
     }
+}
+
+@Test func approvalReasonsShowBeforeDescriptionsAndSurviveReplay() throws {
+    let vector = Vector.all.first { $0.name == "approval reason precedes its optional description" }!
+    let reducer = Reducer()
+    let store = SessionStore(source: reducer)
+    var sawQuestion = false
+    for message in vector.messages {
+        if let update = try reducer.fold(message: message) { store.apply(update) }
+        if let shown = store.items.first?.shown(), shown.approve != nil {
+            #expect(shown.explanation.hasPrefix("Why: the ask mode"))
+            if !shown.explanation.contains("What (model):") { sawQuestion = true }
+        }
+    }
+    #expect(sawQuestion)
+    let explanation = store.items.first!.shown().explanation
+    #expect(explanation == "Why: the ask mode requires approval for this tool\nWhat (model): Lists files in the current directory.")
+    let (replayed, _) = try vector.fold()
+    #expect(replayed.snapshot().items.first!.shown().explanation == explanation)
+    expectInStep(store, reducer, vector.name)
 }

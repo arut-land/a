@@ -121,7 +121,7 @@ fn approval_and_cancellation_precede_any_remote_effect() {
             &e.body,
             Body::Decision {
                 d: Verdict::Permission {
-                    permission: Permission::Ask
+                    permission: Permission::Ask(_)
                 },
                 ..
             }

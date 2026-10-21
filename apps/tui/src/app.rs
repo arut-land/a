@@ -318,7 +318,7 @@ impl App {
             Change::Mismatch { supported } => {
                 self.flash = Some((mismatch_line(supported), Style::new().fg(Color::Red)));
             }
-            Change::Snapshot => {
+            Change::Snapshot | Change::Batch { .. } => {
                 self.cache.clear();
                 self.anchor = None;
                 self.committed = self.committed.min(len);

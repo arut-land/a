@@ -88,6 +88,7 @@ pub struct Side {
     pub budget: Budget,
     background: bool,
     session_key: bool,
+    while_waiting: bool,
 }
 
 impl Side {
@@ -136,6 +137,10 @@ impl Side {
         .map_err(|e| e.to_string())
     }
 
+    pub const fn is_while_waiting(&self) -> bool {
+        self.while_waiting
+    }
+
     pub const fn is_background(&self) -> bool {
         self.background
     }
@@ -155,6 +160,7 @@ impl Side {
             budget: Budget::default(),
             background: false,
             session_key: false,
+            while_waiting: false,
         }
     }
 
@@ -175,6 +181,13 @@ impl Side {
 pub struct Background(Side);
 
 impl Background {
+    /// Scope optional work to the owner's current question. Answering the
+    /// question cancels it even when the approved owner keeps running.
+    #[must_use]
+    pub fn while_waiting(mut self) -> Self {
+        self.0.while_waiting = true;
+        self
+    }
     pub fn start(self, cx: Cx) -> crate::Reaction {
         crate::Reaction::later(crate::Requirement::Ordered, async move {
             if let Some(models) = cx.models() {

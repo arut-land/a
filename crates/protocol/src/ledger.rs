@@ -341,7 +341,7 @@ impl Ledger {
             Phase::Gating { at } => {
                 open.phase = match d {
                     Verdict::Permission {
-                        permission: Permission::Ask,
+                        permission: Permission::Ask(_),
                     } => Phase::Waiting(WaitOn::Approval),
                     Verdict::Permission {
                         permission: Permission::Deny,

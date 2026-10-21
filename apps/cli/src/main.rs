@@ -379,6 +379,11 @@ struct Screen {
 impl Screen {
     fn show(&mut self, change: &Change, view: &SessionView) {
         match change {
+            Change::Batch { changes } => {
+                for change in changes {
+                    self.show(change, view);
+                }
+            }
             Change::Attached {
                 session, workspace, ..
             } => {
@@ -414,7 +419,7 @@ impl Screen {
                     }
                 }
             }
-            Change::Updated { index, part } => self.updated(&view.items[*index], *part),
+            Change::Updated { index, part } => self.updated(&view.items[*index], *part, view),
             Change::Synced => {
                 self.synced = true;
                 if let Some(recap) = &view.recap {
@@ -422,7 +427,7 @@ impl Screen {
                 }
                 for call in view.ledger.inbox() {
                     if let Some(item) = view.items.iter().find(|i| i.key() == call.0) {
-                        sayln!("{}", ask(&item.present()));
+                        sayln!("{}", ask(&view.present(item)));
                     }
                 }
             }
@@ -432,8 +437,8 @@ impl Screen {
         }
     }
 
-    fn updated(&mut self, item: &Item, part: Part) {
-        let p = item.present();
+    fn updated(&mut self, item: &Item, part: Part, view: &SessionView) {
+        let p = view.present(item);
         match (part, p.kind) {
             (Part::Outcome, Kind::Reply) => {
                 // A streamed reply is on screen already; end its line.
@@ -456,6 +461,9 @@ impl Screen {
             (Part::Phase, _) if self.synced && p.buttons != protocol::view::Buttons::None => {
                 sayln!("{}", ask(&p));
             }
+            (Part::Presentation, _) if self.synced && p.reason.is_some() => {
+                sayln!("{}", client::approval_text(&p));
+            }
             (Part::Answer { approved }, _) => {
                 sayln!("  · {}", answer_line(approved));
             }
@@ -472,7 +480,12 @@ fn print_all(lines: &[String]) {
 
 /// The question a call waiting for approval puts.
 fn ask(p: &Presented<'_>) -> String {
-    format!("? {}  {}  [y/n]", p.title, p.status)
+    format!(
+        "{}\n? {}  {}  [y/n]",
+        client::approval_text(p),
+        p.title,
+        p.status
+    )
 }
 
 /// The lines an item starts with, as it is added.

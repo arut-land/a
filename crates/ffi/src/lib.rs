@@ -522,6 +522,7 @@ pub struct Presentation {
     /// Where it stands, such as `exit 0` or `waiting for approval`; empty
     /// when it has nothing to say.
     pub status: String,
+    pub explanation: String,
     pub body: Option<ShownBody>,
     /// A reply's token counts, once it has them.
     pub usage: Option<TokenUsage>,
@@ -591,6 +592,7 @@ impl From<&Presented<'_>> for Presentation {
             },
             title: p.title.to_string(),
             status: p.status.to_string(),
+            explanation: client::approval_text(p),
             body,
             usage: p.usage.map(Into::into),
             approve: match p.buttons {
@@ -806,7 +808,7 @@ impl ViewChange {
             Change::Synced => Self::Synced {
                 recap: view.recap.as_ref().map(Into::into),
             },
-            Change::Snapshot => Self::Snapshot {
+            Change::Snapshot | Change::Batch { .. } => Self::Snapshot {
                 items: view
                     .items
                     .iter()
@@ -830,7 +832,7 @@ impl ItemPatch {
     fn of(item: &Item, part: Part, view: &SessionView) -> Self {
         let shown = Presentation::from(&view.present(item));
         match (item, part) {
-            (_, Part::Progress) => Self::Phase { shown },
+            (_, Part::Progress | Part::Presentation) => Self::Phase { shown },
             (
                 Item::Tool {
                     by: protocol::Audience::User,

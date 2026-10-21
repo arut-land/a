@@ -375,7 +375,7 @@ fn a_chat_moves_to_a_host_of_its_own() {
 #[test]
 fn a_tab_streams_replies_and_answers_asks_until_it_closes() {
     let env = Env::new("web-chat");
-    env.ext("policy", "ask = [\"bash\"]");
+    env.ext("policy", "ask = [\"bash\"]\ndescribe = true");
     let mut web = Web::start(&env);
     web.sign_in();
     let session = web.new_session();
@@ -400,6 +400,10 @@ fn a_tab_streams_replies_and_answers_asks_until_it_closes() {
 
     web.call("/api/send", TAB, "$ echo web-ok");
     events.until("the ask", |p| shown(p).contains("Run this?"));
+    assert!(shown(&events.patches).contains("Why: the ask mode requires approval for this tool"));
+    events.until("the description", |p| {
+        shown(p).contains("What (model): fixture approval-description")
+    });
     let html = shown(&events.patches);
     let ask = &html[..html.find("Run this?").unwrap()];
     let call = between(&ask[ask.rfind("id=\"i").unwrap()..], "id=\"i", "\"").unwrap();

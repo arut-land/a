@@ -137,7 +137,9 @@ impl Session {
                 by: "policy".into(),
                 call: Some(id),
                 d: Verdict::Permission {
-                    permission: Permission::Ask,
+                    permission: Permission::Ask(protocol::ApprovalReason::Mode {
+                        mode: "ask".into(),
+                    }),
                 },
             });
             if rng.chance(30) {
@@ -497,7 +499,7 @@ fn scenarios() -> Vec<(&'static str, Vec<Value>)> {
         by: "policy".into(),
         call: Some(call(seq)),
         d: Verdict::Permission {
-            permission: Permission::Ask,
+            permission: Permission::Ask(protocol::ApprovalReason::Mode { mode: "ask".into() }),
         },
     };
     let echoed = || Outcome::Done {
@@ -522,6 +524,27 @@ fn scenarios() -> Vec<(&'static str, Vec<Value>)> {
             .collect::<Vec<_>>()
     };
     vec![
+        (
+            "approval reason precedes its optional description",
+            vec![
+                attached(),
+                entry(1, Body::ToolCall {
+                    tool: "bash".into(), input: Json::encode(&json!({"command":"ls"})).unwrap(),
+                    id: None, card: None, by: Audience::Model,
+                }),
+                entry(2, ask(1)),
+                msg(DaemonMsg::Activity { seq: 2, activity: protocol::Activity::Approval }),
+                entry(3, Body::ModelCall {
+                    model: "fast".into(), attempt: 0, choice: protocol::ToolChoice::Auto,
+                    r#for: Some(call(1)), purpose: Some("approval-description".into()), request: None,
+                }),
+                entry(4, Body::ModelResult {
+                    call: call(3), r#for: Some(call(1)), failure: None,
+                    outcome: Outcome::Done { output: Json::encode(&json!({"message":{"content":[{"type":"text","text":"Lists files in the current directory."}]}})).unwrap() },
+                }),
+                msg(DaemonMsg::Synced { seq: 4 }),
+            ],
+        ),
         (
             "only a complete burst certifies idle after its final entry",
             vec![
@@ -961,7 +984,9 @@ fn a_recap_tells_what_the_replay_held() {
                 by: "policy".into(),
                 call: CallId::new(2),
                 d: Verdict::Permission {
-                    permission: Permission::Ask,
+                    permission: Permission::Ask(protocol::ApprovalReason::Mode {
+                        mode: "ask".into(),
+                    }),
                 },
             },
         ),
@@ -1019,7 +1044,7 @@ fn clients_describe_calls_and_recaps_alike() {
         "blocked bash: no network"
     );
     let asked = Verdict::Permission {
-        permission: Permission::Ask,
+        permission: Permission::Ask(protocol::ApprovalReason::Mode { mode: "ask".into() }),
     };
     assert_eq!(decision_line("bash", CallId::new(2), &asked), "bash: ask");
     let retried = Verdict::Retry {

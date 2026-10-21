@@ -25,8 +25,8 @@ use serde::{Deserialize, Deserializer, Serialize};
 
 use crate::ledger::{Ledger, OutcomeKind, Phase};
 use crate::{
-    Activity, Audience, Body, CallId, Card, DaemonMsg, Entry, Json, Outcome, Permission, Seq,
-    SessionId, SessionSummary, Verdict, WaitOn,
+    Activity, ApprovalReason, Audience, Body, CallId, Card, DaemonMsg, Entry, Json, Outcome,
+    Permission, Seq, SessionId, SessionSummary, Verdict, WaitOn,
 };
 
 pub use present::{
@@ -121,6 +121,8 @@ pub enum Item {
         usage: Option<Usage>,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         purpose: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        owner: Option<CallId>,
     },
     /// A call of a tool, by the model or (`by` the user) a slash command,
     /// whose arguments are its input's `args` ([`Item::args`]).
@@ -132,6 +134,8 @@ pub enum Item {
         /// settled with that outcome's kind.
         phase: Phase,
         outcome: Option<Outcome>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        reason: Option<Box<ApprovalReason>>,
         /// How the tool presents the call, or once it has one, its outcome.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         card: Option<Card>,
@@ -260,6 +264,10 @@ pub enum Change {
         index: usize,
         item: Item,
     },
+    /// One fact changed several items, applied together.
+    Batch {
+        changes: Vec<Change>,
+    },
     Updated {
         index: usize,
         part: Part,
@@ -295,6 +303,8 @@ pub enum Part {
     Phase,
     /// More output was committed by a running tool.
     Progress,
+    /// Optional explanatory text arrived independently of the question.
+    Presentation,
     /// The approval the call waited for was given, or not.
     Answer {
         approved: bool,
@@ -353,6 +363,28 @@ impl SessionView {
             && let Some(text) = self.ledger.call(*call).and_then(|c| c.progress.as_deref())
         {
             shown.body = Shown::Text(text.into());
+        }
+        if let Item::Tool {
+            call,
+            reason: Some(_),
+            ..
+        } = item
+        {
+            shown.description = self.items.iter().rev().find_map(|reply| match reply {
+                Item::Reply {
+                    owner: Some(owner),
+                    purpose: Some(purpose),
+                    status: Status::Done,
+                    text,
+                    ..
+                } if owner == call
+                    && purpose == "approval-description"
+                    && !text.trim().is_empty() =>
+                {
+                    Some(text.trim())
+                }
+                _ => None,
+            });
         }
         shown
     }
@@ -528,27 +560,15 @@ impl SessionView {
                 by: Audience::User,
                 ..
             } => return Some(self.command(seq, tool, input)),
-            // The ask shows on the call, as its phase.
             Body::Decision {
                 call: Some(call),
                 d:
                     Verdict::Permission {
-                        permission: Permission::Ask,
+                        permission: Permission::Ask(reason),
                     },
                 ..
-            } => return self.rephase(*call),
-            Body::Decision { by, call, d } => {
-                if let Some(call) = call {
-                    self.rephase(*call);
-                }
-                Item::Hook {
-                    seq,
-                    hook: by.clone(),
-                    call: *call,
-                    tool: self.tool_of(*call),
-                    decision: d.clone(),
-                }
-            }
+            } => return self.asked(*call, reason),
+            Body::Decision { by, call, d } => self.hook(seq, by, *call, d),
             Body::Assistant { text } => Item::Assistant {
                 seq,
                 text: text.clone(),
@@ -565,16 +585,23 @@ impl SessionView {
                 input: input.clone(),
                 phase: Phase::Gating { at: 0 },
                 outcome: None,
+                reason: None,
                 card: card.clone(),
                 by: *by,
             },
-            Body::ModelCall { model, purpose, .. } => Item::Reply {
+            Body::ModelCall {
+                model,
+                purpose,
+                r#for,
+                ..
+            } => Item::Reply {
                 call: CallId(seq),
                 model: model.clone(),
                 text: String::new(),
                 status: Status::Running,
                 usage: None,
                 purpose: purpose.clone(),
+                owner: *r#for,
             },
             Body::Link { child, input } => Item::Child {
                 call: CallId(seq),
@@ -624,7 +651,12 @@ impl SessionView {
                     part: Part::Outcome,
                 })
             }
-            Body::ModelResult { call, outcome, .. } => self.replied(*call, outcome),
+            Body::ModelResult {
+                call,
+                outcome,
+                r#for,
+                ..
+            } => self.model_result(*call, outcome, *r#for),
             Body::Answer { call, .. } => {
                 let at = self.call(*call)?;
                 let Item::Tool { phase, .. } = &mut self.items[at] else {
@@ -679,6 +711,53 @@ impl SessionView {
         }
     }
 
+    fn hook(&mut self, seq: Seq, by: &str, call: Option<CallId>, d: &Verdict) -> Item {
+        if let Some(call) = call {
+            self.rephase(call);
+        }
+        Item::Hook {
+            seq,
+            hook: by.to_owned(),
+            call,
+            tool: self.tool_of(call),
+            decision: d.clone(),
+        }
+    }
+
+    fn asked(&mut self, call: CallId, reason: &ApprovalReason) -> Option<Change> {
+        let at = self.call(call)?;
+        if let Item::Tool { reason: shown, .. } = &mut self.items[at] {
+            *shown = Some(Box::new(reason.clone()));
+        }
+        self.rephase(call)
+    }
+
+    fn model_result(
+        &mut self,
+        call: CallId,
+        outcome: &Outcome,
+        owner: Option<CallId>,
+    ) -> Option<Change> {
+        let reply = self.replied(call, outcome)?;
+        let described = self.call(call).is_some_and(|at| matches!(&self.items[at], Item::Reply { purpose: Some(purpose), status: Status::Done, text, .. } if purpose == "approval-description" && !text.trim().is_empty()));
+        let owner = owner
+            .filter(|_| described)
+            .and_then(|owner| self.call(owner));
+        if let Some(index) = owner {
+            Some(Change::Batch {
+                changes: vec![
+                    reply,
+                    Change::Updated {
+                        index,
+                        part: Part::Presentation,
+                    },
+                ],
+            })
+        } else {
+            Some(reply)
+        }
+    }
+
     /// Brings tool call `call`'s item to the phase the ledger has it at;
     /// the change, if that moved it.
     fn rephase(&mut self, call: CallId) -> Option<Change> {
@@ -703,6 +782,7 @@ impl SessionView {
             input: input.clone(),
             phase: Phase::Gating { at: 0 },
             outcome: None,
+            reason: None,
             card: None,
             by: Audience::User,
         };

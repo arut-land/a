@@ -112,6 +112,7 @@ fn a_call_needing_approval_ends_a_piped_run_and_waits_in_the_session() {
     let told = text(&out.stderr);
     for said in [
         "bash ($ echo ran > ran.txt) waits for approval",
+        "Why: the ask mode requires approval for this tool",
         &format!("session {id}"),
         &format!("`a attach {id}`"),
         "`a web`",

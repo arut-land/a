@@ -281,6 +281,9 @@ struct ToolView: View {
                     ProgressView().controlSize(.small)
                 }
             }
+            if !shown.explanation.isEmpty {
+                Text(shown.explanation).font(.callout).textSelection(.enabled)
+            }
             if let call = shown.approve {
                 HStack {
                     Button("Approve") { Task { await store.approve(call: call, approved: true) } }

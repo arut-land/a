@@ -144,7 +144,9 @@ fn asked_command() -> Vec<DaemonMsg> {
                 by: "policy".into(),
                 call: CallId::new(3),
                 d: protocol::Verdict::Permission {
-                    permission: protocol::Permission::Ask,
+                    permission: protocol::Permission::Ask(protocol::ApprovalReason::Mode {
+                        mode: "ask".into(),
+                    }),
                 },
             },
         ),
@@ -1300,6 +1302,7 @@ fn side_usage_does_not_change_the_main_turn_counter() {
             output: 3,
         }),
         purpose: Some("title".into()),
+        owner: None,
     };
     spend(&mut tokens, &item);
     assert_eq!(tokens, Usage::default());
