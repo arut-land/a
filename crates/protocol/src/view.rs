@@ -369,6 +369,10 @@ impl SessionView {
             reason: Some(_),
             ..
         } = item
+            && self
+                .ledger
+                .call(*call)
+                .is_some_and(|open| open.phase.asking())
         {
             shown.description = self.items.iter().rev().find_map(|reply| match reply {
                 Item::Reply {
@@ -741,7 +745,13 @@ impl SessionView {
         let reply = self.replied(call, outcome)?;
         let described = self.call(call).is_some_and(|at| matches!(&self.items[at], Item::Reply { purpose: Some(purpose), status: Status::Done, text, .. } if purpose == "approval-description" && !text.trim().is_empty()));
         let owner = owner
-            .filter(|_| described)
+            .filter(|owner| {
+                described
+                    && self
+                        .ledger
+                        .call(*owner)
+                        .is_some_and(|open| open.phase.asking())
+            })
             .and_then(|owner| self.call(owner));
         if let Some(index) = owner {
             Some(Change::Batch {

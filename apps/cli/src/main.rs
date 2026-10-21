@@ -462,8 +462,10 @@ impl Screen {
             (Part::Phase, _) if self.synced && p.buttons != protocol::view::Buttons::None => {
                 sayln!("{}", ask(&p));
             }
-            (Part::Presentation, _) if self.synced && p.reason.is_some() => {
-                sayln!("{}", client::approval_text(&p));
+            (Part::Presentation, _) if self.synced => {
+                if let Some(text) = description_update(&p) {
+                    sayln!("{text}");
+                }
             }
             (Part::Answer { approved }, _) => {
                 sayln!("  · {}", answer_line(approved));
@@ -477,6 +479,10 @@ fn print_all(lines: &[String]) {
     for line in lines {
         sayln!("{line}");
     }
+}
+
+fn description_update(p: &Presented<'_>) -> Option<String> {
+    p.description.map(|_| client::approval_text(p))
 }
 
 /// The question a call waiting for approval puts.
@@ -695,5 +701,48 @@ mod parity {
             }
         }
         assert!(items > 20, "{items} items checked");
+    }
+}
+
+#[cfg(test)]
+mod approval_tests {
+    use super::*;
+    use protocol::{Body, DaemonMsg, Decode, Entry, Epoch, Json, Seq};
+
+    #[test]
+    fn the_repl_never_prints_a_late_description() {
+        let vectors: serde_json::Value = serde_json::from_str(include_str!(
+            "../../../crates/protocol/tests/vectors/view.json"
+        ))
+        .unwrap();
+        let vector = vectors
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|v| v["name"] == "approval reason precedes its optional description")
+            .unwrap();
+        let mut view = SessionView::default();
+        for value in vector["messages"].as_array().unwrap() {
+            let mut msg = DaemonMsg::from_json(value.to_string().as_bytes()).unwrap();
+            if let DaemonMsg::Entry(entry) = &mut msg
+                && matches!(entry.body, Body::ModelResult { .. })
+            {
+                view.fold(&DaemonMsg::Entry(Entry::new(
+                    entry.seq,
+                    Epoch(0),
+                    Body::Answer {
+                        call: CallId::new(1).unwrap(),
+                        value: Json::encode(&true).unwrap(),
+                        origin: None,
+                    },
+                )));
+                entry.seq = Seq::new(entry.seq.get() + 1).unwrap();
+                view.fold(&msg);
+                assert_eq!(description_update(&view.present(&view.items[0])), None);
+                return;
+            }
+            view.fold(&msg);
+        }
+        panic!("scenario has no description");
     }
 }
