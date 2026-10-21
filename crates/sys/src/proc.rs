@@ -16,6 +16,18 @@ pub(crate) use imp::passed;
 pub(crate) use imp::raw;
 pub use imp::{Child, ExitWatch};
 
+pub(crate) fn prepare_spawn(cmd: &mut Command) {
+    #[cfg(unix)]
+    {
+        use std::os::unix::process::CommandExt;
+        // SAFETY: the hook only resets signal state with async-signal-safe
+        // libc calls; it does not allocate or acquire locks after fork.
+        unsafe { cmd.pre_exec(crate::signals::reset_before_exec) };
+    }
+    #[cfg(windows)]
+    let _ = cmd;
+}
+
 /// Finds bash using the system location first, then the session's PATH.
 pub fn find_bash(search: Option<&str>) -> Option<String> {
     let system = std::path::Path::new("/bin/bash");
@@ -310,6 +322,7 @@ mod imp {
             "--lock-fd",
             &handles[1].to_string(),
         ]);
+        super::prepare_spawn(cmd);
         pass(cmd, handles)?;
         let child = cmd.spawn();
         drop((listener, lock));
@@ -422,6 +435,7 @@ mod imp {
 
     pub fn lead(cmd: &mut Command) {
         use std::os::unix::process::CommandExt;
+        super::prepare_spawn(cmd);
         // SAFETY: the closure runs in the forked child before exec and only
         // calls setsid(2), which is async-signal-safe and allocates nothing.
         unsafe {

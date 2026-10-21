@@ -2,6 +2,8 @@
 //! An exclusive lease prevents competing consumers from stealing shutdown.
 //! Windows console control events wake a permanently owned manual-reset event.
 
+#[cfg(unix)]
+pub(crate) use imp::reset_before_exec;
 pub use imp::{Signals, reraise};
 
 #[cfg(windows)]
@@ -287,6 +289,24 @@ mod imp {
         }
     }
 
+    pub(crate) fn reset_before_exec() -> io::Result<()> {
+        for signal in ALL {
+            install(signal, libc::SIG_DFL)?;
+        }
+        // SAFETY: sigemptyset initializes a writable set. sigprocmask is
+        // async-signal-safe; after fork there is only this thread in the child.
+        let ok = unsafe {
+            let mut empty: libc::sigset_t = std::mem::zeroed();
+            libc::sigemptyset(&raw mut empty);
+            libc::sigprocmask(libc::SIG_SETMASK, &raw const empty, std::ptr::null_mut())
+        };
+        if ok == 0 {
+            Ok(())
+        } else {
+            Err(io::Error::last_os_error())
+        }
+    }
+
     fn install(signal: Signal, handler: libc::sighandler_t) -> io::Result<()> {
         // SAFETY: a zeroed `sigaction` is a valid value of the C struct; every
         // field we rely on is set below.
@@ -361,9 +381,165 @@ mod imp {
     #[cfg(test)]
     mod tests {
         use super::*;
+        use std::os::unix::process::ExitStatusExt;
 
         // libtest can run tests concurrently; signal ownership is per process.
         static SERIAL: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+        #[test]
+        fn every_spawn_path_resets_signal_masks_and_ignored_dispositions() {
+            use std::process::{Command, Stdio};
+            const TEST: &str = "signals::imp::tests::every_spawn_path_resets_signal_masks_and_ignored_dispositions";
+            let mode = std::env::var("A_SYS_SPAWN_STATE").ok();
+            if mode.is_none() {
+                // Dispositions are process-wide: isolate the ignored-signal
+                // fixture rather than changing other libtest threads' handlers.
+                let output = Command::new(std::env::current_exe().unwrap())
+                    .args(["--exact", TEST, "--nocapture"])
+                    .env("A_SYS_SPAWN_STATE", "spawn")
+                    .output()
+                    .unwrap();
+                assert!(
+                    output.status.success(),
+                    "{}",
+                    String::from_utf8_lossy(&output.stdout)
+                );
+                return;
+            }
+            if mode.as_deref() == Some("inspect") {
+                // SAFETY: valid writable buffers; null set queries the mask
+                // and null action queries a disposition without modifying it.
+                unsafe {
+                    let mut mask: libc::sigset_t = std::mem::zeroed();
+                    assert_eq!(
+                        libc::pthread_sigmask(libc::SIG_SETMASK, std::ptr::null(), &raw mut mask),
+                        0
+                    );
+                    for signal in 1..128 {
+                        assert_ne!(
+                            libc::sigismember(&raw const mask, signal),
+                            1,
+                            "blocked {signal}"
+                        );
+                    }
+                    for signal in ALL {
+                        let mut action: libc::sigaction = std::mem::zeroed();
+                        assert_eq!(
+                            libc::sigaction(
+                                raw(signal).as_raw(),
+                                std::ptr::null(),
+                                &raw mut action
+                            ),
+                            0
+                        );
+                        assert_eq!(action.sa_sigaction, libc::SIG_DFL, "{signal:?}");
+                    }
+                }
+                return;
+            }
+            assert_eq!(mode.as_deref(), Some("spawn"));
+            // SAFETY: the valid sets/actions affect only this isolated test
+            // process. Blocking is thread-local and inherited by each child.
+            unsafe {
+                let mut mask: libc::sigset_t = std::mem::zeroed();
+                libc::sigfillset(&raw mut mask);
+                assert_eq!(
+                    libc::pthread_sigmask(libc::SIG_SETMASK, &raw const mask, std::ptr::null_mut()),
+                    0
+                );
+                let mut ignored: libc::sigaction = std::mem::zeroed();
+                ignored.sa_sigaction = libc::SIG_IGN;
+                libc::sigemptyset(&raw mut ignored.sa_mask);
+                for signal in ALL {
+                    assert_eq!(
+                        libc::sigaction(
+                            raw(signal).as_raw(),
+                            &raw const ignored,
+                            std::ptr::null_mut()
+                        ),
+                        0
+                    );
+                }
+            }
+            let command = || {
+                let mut command = Command::new(std::env::current_exe().unwrap());
+                command
+                    .args(["--exact", TEST, "--nocapture", "--"])
+                    .env("A_SYS_SPAWN_STATE", "inspect")
+                    .stdin(Stdio::null())
+                    .stdout(Stdio::null())
+                    .stderr(Stdio::null());
+                command
+            };
+            let (mut child, input, output) = crate::spawn_stdio(&mut command()).unwrap();
+            drop(input);
+            let status = child.wait().unwrap();
+            drop(output);
+            assert!(status.success(), "stdio child inherited signal state");
+            let dir = std::env::temp_dir().join(format!("a-c02-spawn-{}", std::process::id()));
+            std::fs::create_dir_all(dir.join("run")).unwrap();
+            let home = crate::Home::from(dir.clone());
+            let output = std::fs::File::create(dir.join("output")).unwrap();
+            let mut child = crate::spawn_group(&mut command(), output).unwrap();
+            assert!(
+                child.wait().unwrap().success(),
+                "group child inherited signal state"
+            );
+            let lock = std::fs::File::create(home.daemon_pid_file()).unwrap();
+            crate::fs::try_lock(&lock).unwrap();
+            let mut child = crate::spawn_daemon(&mut command(), &home, lock).unwrap();
+            assert!(
+                child.wait().unwrap().success(),
+                "daemon child inherited signal state"
+            );
+            home.endpoint().remove();
+            std::fs::remove_dir_all(dir).unwrap();
+        }
+
+        #[test]
+        fn tool_children_can_receive_termination_when_the_parent_blocks_it() {
+            let _serial = SERIAL.lock().unwrap();
+            let status = std::thread::spawn(|| {
+                let _signals = Signals::catch(&[Signal::Terminate]).unwrap();
+                // SAFETY: valid writable signal sets; only this test thread's mask changes.
+                let old = unsafe {
+                    let mut blocked: libc::sigset_t = std::mem::zeroed();
+                    let mut old: libc::sigset_t = std::mem::zeroed();
+                    libc::sigemptyset(&raw mut blocked);
+                    libc::sigaddset(&raw mut blocked, libc::SIGTERM);
+                    assert_eq!(
+                        libc::pthread_sigmask(libc::SIG_BLOCK, &raw const blocked, &raw mut old),
+                        0
+                    );
+                    old
+                };
+                let mut command = std::process::Command::new("/bin/sh");
+                command.args(["-c", "kill -TERM $$; exit 42"]);
+                let spawned = crate::spawn_stdio(&mut command);
+                // SAFETY: restore the valid mask saved above before asserting results.
+                assert_eq!(
+                    // SAFETY: old is the valid mask saved on this thread above.
+                    unsafe {
+                        libc::pthread_sigmask(
+                            libc::SIG_SETMASK,
+                            &raw const old,
+                            std::ptr::null_mut(),
+                        )
+                    },
+                    0
+                );
+                let (mut child, input, output) = spawned.unwrap();
+                drop((input, output));
+                child.wait().unwrap()
+            })
+            .join()
+            .unwrap();
+            assert_eq!(
+                status.signal(),
+                Some(libc::SIGTERM),
+                "child exited as {status}"
+            );
+        }
 
         #[test]
         fn signal_registration_is_exclusive() {
