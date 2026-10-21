@@ -1058,6 +1058,8 @@ pub struct Start {
     pub lock: Option<File>,
     /// Serve even after a crash loop, for `a daemon restart`.
     pub reset_breaker: bool,
+    /// A detached starter waits for discovery to be published.
+    pub logs: bool,
 }
 
 /// Runs the daemon, as staged build `build`, until it has been idle for
@@ -1091,7 +1093,7 @@ fn run(
     build: &str,
     start: Start,
 ) -> io::Result<()> {
-    let origin = if start.lock.is_some() {
+    let origin = if start.logs || start.lock.is_some() {
         ext_logging::Origin::Client
     } else {
         ext_logging::Origin::Foreground
@@ -1104,16 +1106,23 @@ fn run(
         config.crash_limit,
     )? {
         Claim::Serve(pid) => pid,
-        Claim::Tripped(why) => {
+        Claim::Tripped(pid, why) => {
+            if start.logs {
+                sys::daemon_ready()?;
+            }
             // The reactor of the runtime the daemon would serve on.
             let reactor = rt::Runtime::reactor(&rt::Threads::default());
             if let Ok(listener) = rt::Async::new(&reactor, listener) {
                 rt::block_on(server::refuse(&reactor, &listener, &why));
             }
             home.endpoint().remove();
+            pid.set_len(0)?;
             return Err(io::Error::other(why));
         }
     };
+    if start.logs {
+        sys::daemon_ready()?;
+    }
     let config = Config {
         build: build.to_owned(),
         ..config.clone()
@@ -1176,7 +1185,7 @@ enum Claim {
     /// Yes, holding the locked pid file.
     Serve(File),
     /// No, for this reason: its predecessors died young too often.
-    Tripped(String),
+    Tripped(File, String),
 }
 
 /// Keeps the daemon lock (`lock`, handed down by the client that started
@@ -1202,7 +1211,7 @@ fn claim(
             .read(true)
             .write(true)
             .open(home.daemon_pid_file())?;
-        if file.try_lock().is_err() {
+        if sys::fs::try_lock(&file).is_err() {
             return Err(io::Error::new(
                 io::ErrorKind::AddrInUse,
                 "another daemon is running",
@@ -1229,6 +1238,8 @@ fn claim(
             dead.pid
         );
     }
+    // The lock holder alone publishes the identity used for endpoint discovery.
+    write!(file, "{}", sys::crash::Record::current(build))?;
     let crashes = sys::crash::Crashes::of(home);
     if crashes.breaker.tripped(limit) {
         fact(Fact::BreakerTripped {
@@ -1237,15 +1248,15 @@ fn claim(
         let report = crashes
             .last
             .map_or_else(String::new, |p| format!("; see {}", p.display()));
-        return Ok(Claim::Tripped(format!(
-            "the daemon crashed {} times in a row soon after starting{report}; \
+        return Ok(Claim::Tripped(
+            file,
+            format!(
+                "the daemon crashed {} times in a row soon after starting{report}; \
              `a daemon restart` tries again",
-            crashes.breaker.young()
-        )));
+                crashes.breaker.young()
+            ),
+        ));
     }
-    // Not synced: clients read it while we hold the lock, and after a crash
-    // there is no lock to vouch for it.
-    write!(file, "{}", sys::crash::Record::current(build))?;
     Ok(Claim::Serve(file))
 }
 

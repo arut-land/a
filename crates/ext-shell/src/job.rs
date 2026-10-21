@@ -1,8 +1,8 @@
 //! How a group the session owns is seen to end: through its processes'
 //! exit events, not by polling, until none of it is left.
 
-use std::process::Child;
 use std::time::Duration;
+use sys::Child;
 
 /// How soon a group whose processes cannot be watched (zombies about to
 /// be reaped, or members of another user) is looked at again, at first and

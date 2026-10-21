@@ -26,8 +26,11 @@ pre-release: formats change outright, without compatibility shims.
 The CLI stages its executable into the home runtime directory. A local
 client first connects to the daemon's endpoint. On a cold start, clients
 serialize through `start.lock`, recheck the connection, take the daemon
-lock, bind the listener and pass both to a detached `a __daemon`. The client
-connects into the listener's backlog without readiness polling. The daemon
+lock, then start a detached `a __daemon`. Unix passes the bound listener
+and lock; the client connects into its backlog. Windows starts the child
+with an explicit stdio handle allowlist and waits for discovery publication
+under the start lock. Its locked daemon record selects a process-generation
+pipe, so retained clients cannot reserve a successor's endpoint. Neither path polls for readiness. The daemon
 holds its pid-file lock for its lifetime, excluding other writers to that
 home. `A_HOME` overrides the default `~/.a`.
 
@@ -45,8 +48,11 @@ system SSH and `a bridge`; missing installations may receive this build
 only when `sys::Platform` recognizes the host as matching it.
 
 See [the client SDK](client.md) and [CLI](cli.md), and the staging and
-endpoint types in `crates/sys`. The daemon works on macOS and Linux.
-Windows builds and lints, but its daemon platform operations are incomplete.
+endpoint types in `crates/sys`. The daemon targets macOS, Linux and Windows.
+Windows uses SID-restricted named pipes, overlapped completion events over
+`rt`, atomic staging references and kill-on-close shell jobs. Its native CI
+lane must establish runtime behavior; cross-lint alone is insufficient.
+See [Windows platform details and validation limits](perf/windows.md).
 
 ## Session spine
 
@@ -249,8 +255,9 @@ cold first reply, attach latency, idle RSS and quiet shell execution on an
 isolated release build. `startup` compares process launch against its floor.
 Timing runs require a quiet machine. CI also runs fmt, clippy, nextest,
 dependency checks, fuzzing, Miri and the Apple facade/app lane. Windows has
-a native build/lint lane with advisory tests, plus cross-target linting;
-this does not establish a working Windows daemon.
+a native build/lint lane with required workspace and daemon acceptance
+tests, plus cross-target linting. Windows runtime validation depends on that
+native lane; it cannot run on the Apple development host.
 
 ## Milestones
 
@@ -269,8 +276,8 @@ These supersede the original M1/M2/M3 schedule: web and remote SSH are already p
 - Audit essential non-derivable facts: exact sent-request identity, runtime
   decisions and recovery inputs. Side-call logging exists; it is not proof
   that every externally relevant fact is recorded.
-- Complete the Windows daemon platform with named pipes, process/handle
-  transfer and staging, and make its native CI tests required once working.
+- Establish native Windows CI results and measure its daemon budgets on
+  a quiet Windows host; validate storage behavior across power loss.
 
 **Later:** cross-host lease authority and migration, hot handoff,
 checkpoints, additional codecs/transports, and deterministic fault simulation

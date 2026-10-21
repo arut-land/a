@@ -1,5 +1,6 @@
-//! Durable, private and atomic file operations. Locks need no seam: std's
-//! `File::lock` is `flock` on Unix and `LockFileEx` on Windows.
+//! Durable, private and atomic file operations.
+//! Unix uses flock; Windows locks a byte beyond a record so its contents
+//! remain readable by clients inspecting the daemon identity.
 
 use std::fs::{self, File, OpenOptions};
 use std::io;
@@ -216,21 +217,117 @@ pub fn order_dir(dir: &Path) -> io::Result<()> {
     sync_dir(dir)
 }
 
-/// Makes the entries of `dir` durable: a file created in it survives a
-/// crash. Windows makes them durable with the file itself.
+/// Makes directory entries durable on platforms with a directory barrier.
+/// Windows callers must publish names with `publish` instead.
 pub fn sync_dir(dir: &Path) -> io::Result<()> {
     #[cfg(unix)]
-    File::open(dir)?.sync_all()?;
+    return File::open(dir)?.sync_all();
     #[cfg(windows)]
-    let _ = dir;
+    {
+        let _ = dir;
+        Err(io::Error::new(
+            io::ErrorKind::Unsupported,
+            "publish names with write-through rename",
+        ))
+    }
+}
+
+/// Atomically replaces a name. Windows also waits for the move on disk.
+pub fn replace(from: &Path, to: &Path) -> io::Result<()> {
+    #[cfg(unix)]
+    return fs::rename(from, to);
+    #[cfg(windows)]
+    move_file(from, to, true)
+}
+
+#[cfg(windows)]
+fn move_file(from: &Path, to: &Path, replacing: bool) -> io::Result<()> {
+    use windows_sys::Win32::Storage::FileSystem::{
+        MOVEFILE_REPLACE_EXISTING, MOVEFILE_WRITE_THROUGH, MoveFileExW,
+    };
+    let from = crate::windows::wide(from.as_os_str());
+    let to = crate::windows::wide(to.as_os_str());
+    // WRITE_THROUGH waits for the move on disk; COPY_ALLOWED is deliberately
+    // absent so publication cannot degrade to a cross-volume copy/delete.
+    // Microsoft does not document FlushFileBuffers as a directory barrier.
+    // https://learn.microsoft.com/en-us/windows/win32/api/winbase/nf-winbase-movefileexw
+    // SAFETY: both NUL-terminated paths remain alive for the call.
+    crate::windows::ok(unsafe {
+        MoveFileExW(
+            from.as_ptr(),
+            to.as_ptr(),
+            if replacing {
+                MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH
+            } else {
+                MOVEFILE_WRITE_THROUGH
+            },
+        )
+    })
+}
+
+/// Publishes an already flushed file, including its directory entry.
+pub fn publish(from: &Path, to: &Path) -> io::Result<()> {
+    replace(from, to)?;
+    #[cfg(unix)]
+    sync_dir(to.parent().ok_or(io::ErrorKind::InvalidInput)?)?;
     Ok(())
 }
 
-/// Replaces `to` with `from` in one step: a reader sees the old file or
-/// the new one. `rename`, which on Windows std makes
-/// `MoveFileExW(MOVEFILE_REPLACE_EXISTING)`.
-pub fn replace(from: &Path, to: &Path) -> io::Result<()> {
-    fs::rename(from, to)
+/// Removes the durable name before best-effort reclamation of its contents.
+pub fn remove_durable(path: &Path) -> io::Result<()> {
+    let tombstone = path.with_extension("removed");
+    publish(path, &tombstone)?;
+    fs::remove_file(tombstone)
+}
+
+/// A name whose publication must precede the log's first durable promise.
+/// Windows receives this only after a flushed temporary file was published;
+/// Unix retains its deferred directory barrier to share the first log flush.
+pub struct Publication {
+    #[cfg(unix)]
+    parent: std::path::PathBuf,
+}
+
+impl Publication {
+    pub fn order(&self) -> io::Result<()> {
+        #[cfg(unix)]
+        order_dir(&self.parent)?;
+        Ok(())
+    }
+}
+
+/// Opens a log, optionally creating its header in an unpublished name first.
+pub fn open_log(path: &Path, header: Option<&[u8]>) -> io::Result<(File, Publication)> {
+    use std::io::Write;
+    let parent = path.parent().ok_or(io::ErrorKind::InvalidInput)?;
+    #[cfg(windows)]
+    if let Some(header) = header {
+        let pending = path.with_extension("creating");
+        // Exclusive creation prevents two writers from sharing a temporary file.
+        let mut file = private_file().open(&pending)?;
+        file.write_all(header)?;
+        file.sync_all()?;
+        drop(file);
+        move_file(&pending, path, false)?;
+    }
+    let mut open = OpenOptions::new();
+    open.read(true).append(true);
+    #[cfg(unix)]
+    open.create_new(header.is_some());
+    let mut file = open.open(path)?;
+    #[cfg(unix)]
+    if let Some(header) = header {
+        file.write_all(header)?;
+    }
+    #[cfg(windows)]
+    let _ = (&mut file, parent);
+    Ok((
+        file,
+        Publication {
+            #[cfg(unix)]
+            parent: parent.to_owned(),
+        },
+    ))
 }
 
 /// Options that create a new file only its owner can read and write
@@ -256,7 +353,22 @@ pub fn private_dir(dir: &Path) -> io::Result<()> {
         fs::set_permissions(dir, fs::Permissions::from_mode(0o700))
     }
     #[cfg(windows)]
-    builder.create(dir)
+    {
+        use windows_sys::Win32::Security::{
+            DACL_SECURITY_INFORMATION, PROTECTED_DACL_SECURITY_INFORMATION, SetFileSecurityW,
+        };
+        builder.create(dir)?;
+        let security = crate::windows::Security::user_only()?;
+        let path = crate::windows::wide(dir.as_os_str());
+        // SAFETY: the path and security descriptor remain valid during the call.
+        crate::windows::ok(unsafe {
+            SetFileSecurityW(
+                path.as_ptr(),
+                DACL_SECURITY_INFORMATION | PROTECTED_DACL_SECURITY_INFORMATION,
+                security.descriptor(),
+            )
+        })
+    }
 }
 
 /// Fills `buf` from `file` at `offset`, as one positioned read where the
@@ -345,28 +457,68 @@ pub fn write_watch(path: &Path) -> io::Result<WriteWatch> {
     Ok(WriteWatch { fd, _file: file })
 }
 
-/// Not on Windows yet, where a reader polls.
+/// A directory change notification: writes to any output in this session's
+/// spill directory wake its followers, which recheck their own files.
 #[cfg(windows)]
-pub struct WriteWatch(std::convert::Infallible);
+pub struct WriteWatch(Option<std::os::windows::io::OwnedHandle>);
 
-/// Watches `path` for writes: not on Windows yet, where a reader polls.
 #[cfg(windows)]
 impl std::os::windows::io::AsHandle for WriteWatch {
     fn as_handle(&self) -> std::os::windows::io::BorrowedHandle<'_> {
-        match self.0 {}
+        self.0.as_ref().unwrap().as_handle()
     }
 }
 
 #[cfg(windows)]
-pub fn write_watch(_path: &Path) -> io::Result<WriteWatch> {
-    Err(io::ErrorKind::Unsupported.into())
+impl Drop for WriteWatch {
+    fn drop(&mut self) {
+        use std::os::windows::io::IntoRawHandle;
+        use windows_sys::Win32::Storage::FileSystem::FindCloseChangeNotification;
+        if let Some(handle) = self.0.take() {
+            // SAFETY: notification handles need their matching close API,
+            // after rt has unregistered the wait on this owned source.
+            unsafe { FindCloseChangeNotification(handle.into_raw_handle()) };
+        }
+    }
+}
+
+#[cfg(windows)]
+pub fn write_watch(path: &Path) -> io::Result<WriteWatch> {
+    use windows_sys::Win32::Storage::FileSystem::{
+        FILE_NOTIFY_CHANGE_LAST_WRITE, FILE_NOTIFY_CHANGE_SIZE, FindFirstChangeNotificationW,
+    };
+    let parent = path
+        .parent()
+        .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "output has no directory"))?;
+    let path = crate::windows::wide(parent.as_os_str());
+    // SAFETY: path is NUL-terminated and lives across the call. WriteWatch
+    // uses FindCloseChangeNotification instead of dropping the OwnedHandle.
+    let handle = crate::windows::owned(unsafe {
+        FindFirstChangeNotificationW(
+            path.as_ptr(),
+            0,
+            FILE_NOTIFY_CHANGE_LAST_WRITE | FILE_NOTIFY_CHANGE_SIZE,
+        )
+    })?;
+    Ok(WriteWatch(Some(handle)))
 }
 
 impl WriteWatch {
     /// Takes the writes seen so far, without waiting.
     pub fn clear(&self) {
         #[cfg(windows)]
-        match self.0 {}
+        {
+            use std::os::windows::io::AsRawHandle;
+            use windows_sys::Win32::Storage::FileSystem::FindNextChangeNotification;
+            use windows_sys::Win32::System::Threading::WaitForSingleObject;
+            let handle = self.0.as_ref().unwrap().as_raw_handle();
+            // SAFETY: the watch owns this handle; rearm only after a signal.
+            unsafe {
+                if WaitForSingleObject(handle, 0) == 0 {
+                    FindNextChangeNotification(handle);
+                }
+            }
+        }
         #[cfg(target_os = "linux")]
         {
             let mut buf = [0; 1024];
@@ -516,5 +668,107 @@ mod tests {
             assert!(!readable(20), "what was seen is taken");
         }
         fs::remove_file(&path).unwrap();
+    }
+}
+
+/// Locks a byte beyond the record, so Windows readers can still read its
+/// contents while another process holds the daemon's exclusive lock.
+pub fn lock(file: &File) -> io::Result<()> {
+    #[cfg(unix)]
+    return file.lock();
+    #[cfg(windows)]
+    return windows_lock(file, false);
+}
+
+pub fn try_lock(file: &File) -> io::Result<()> {
+    #[cfg(unix)]
+    return file.try_lock().map_err(io::Error::from);
+    #[cfg(windows)]
+    return windows_lock(file, true);
+}
+
+#[cfg(windows)]
+fn windows_lock(file: &File, nonblocking: bool) -> io::Result<()> {
+    use std::os::windows::io::AsRawHandle;
+    use windows_sys::Win32::Storage::FileSystem::{
+        LOCKFILE_EXCLUSIVE_LOCK, LOCKFILE_FAIL_IMMEDIATELY, LockFileEx,
+    };
+    use windows_sys::Win32::System::IO::OVERLAPPED;
+    // SAFETY: zero initializes the union; the lock byte is far beyond data.
+    let mut operation: OVERLAPPED = unsafe { std::mem::zeroed() };
+    operation.Anonymous.Anonymous.Offset = u32::MAX - 1;
+    operation.Anonymous.Anonymous.OffsetHigh = 0x7fff_ffff;
+    let flags = LOCKFILE_EXCLUSIVE_LOCK
+        | if nonblocking {
+            LOCKFILE_FAIL_IMMEDIATELY
+        } else {
+            0
+        };
+    // SAFETY: daemon records use synchronous handles. LockFileEx completes
+    // before returning, so this stack OVERLAPPED cannot escape the call.
+    crate::windows::ok(unsafe {
+        LockFileEx(file.as_raw_handle(), flags, 0, 1, 0, &raw mut operation)
+    })
+}
+
+#[cfg(test)]
+mod lock_tests {
+    use super::*;
+
+    #[test]
+    fn a_locked_record_remains_readable_and_excludes_other_writers() {
+        let root = std::env::temp_dir().join(format!("a-record-lock-{}", std::process::id()));
+        fs::create_dir_all(&root).unwrap();
+        let path = root.join("record");
+        fs::write(&path, b"daemon identity").unwrap();
+        let held = File::options().read(true).write(true).open(&path).unwrap();
+        lock(&held).unwrap();
+        assert_eq!(fs::read(&path).unwrap(), b"daemon identity");
+        let other = File::options().read(true).write(true).open(&path).unwrap();
+        assert!(try_lock(&other).is_err());
+        drop(held);
+        try_lock(&other).unwrap();
+        drop(other);
+        fs::remove_dir_all(&root).unwrap();
+    }
+}
+
+#[cfg(test)]
+mod publication_tests {
+    use super::*;
+    use std::io::{Read, Write};
+
+    #[test]
+    fn a_published_log_has_its_complete_header_before_appends() {
+        let root = std::env::temp_dir().join(format!("a-publish-log-{}", std::process::id()));
+        fs::create_dir_all(&root).unwrap();
+        let path = root.join("session.jsonl");
+        let (mut file, publication) = open_log(&path, Some(b"header\n")).unwrap();
+        publication.order().unwrap();
+        assert_eq!(fs::read(&path).unwrap(), b"header\n");
+        assert!(open_log(&path, Some(b"replacement\n")).is_err());
+        file.write_all(b"entry\n").unwrap();
+        file.sync_all().unwrap();
+        drop(file);
+        let (mut file, publication) = open_log(&path, None).unwrap();
+        publication.order().unwrap();
+        let mut bytes = Vec::new();
+        file.read_to_end(&mut bytes).unwrap();
+        assert_eq!(bytes, b"header\nentry\n");
+        drop(file);
+        remove_durable(&path).unwrap();
+        assert!(!path.exists());
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn failed_publication_never_replaces_the_existing_name() {
+        let root = std::env::temp_dir().join(format!("a-publish-failure-{}", std::process::id()));
+        fs::create_dir_all(&root).unwrap();
+        let path = root.join("published");
+        fs::write(&path, b"old").unwrap();
+        assert!(publish(&root.join("missing"), &path).is_err());
+        assert_eq!(fs::read(&path).unwrap(), b"old");
+        fs::remove_dir_all(root).unwrap();
     }
 }

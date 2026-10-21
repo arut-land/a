@@ -161,21 +161,18 @@ jobs:
     defaults:
       run:
         shell: bash
-    # Everything builds and lints here, the daemon and `a` included: the
-    # platform seams live in `sys` and `rt`, whose Windows halves the daemon
-    # still lacks report that they are unsupported. `a` runs its line REPL.
-    # Vendored Lua needs the native C SDK, so its optional CLI feature
-    # is linted here rather than in the cross-target metadata check.
+    # Native completion, security, job containment, and daemon acceptance.
     steps:
+      # Recorded wire/provider fixtures must keep their checked-in bytes.
+      - run: git config --global core.autocrlf false
       - uses: actions/checkout@v7
       - *mbx-dir
       - *cache
       - *mise
       - run: mise exec -- cargo clippy --workspace --all-targets --features a/lua -- -D warnings
       - run: mise exec -- cargo build -p a
-      - name: test (advisory until first green on Windows)
-        continue-on-error: true
-        run: mise exec -- cargo nextest run --workspace --no-tests=pass
+      - run: mise exec -- cargo nextest run --workspace --no-tests=fail
+      - run: mise run acceptance
 
   # The macOS app: the FFI package (boltffi pack apple --deny-skipped), the
   # reducer vectors and a live session through it in Swift, then the app

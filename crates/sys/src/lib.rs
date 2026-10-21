@@ -1,11 +1,15 @@
 //! Platform specifics. The only crate allowed to use `unsafe`.
 #![allow(unsafe_code)]
+#![cfg_attr(
+    windows,
+    feature(windows_process_extensions_raw_attribute, windows_by_handle)
+)]
 
 //!
 //! Everything a platform does its own way sits behind a type here (a
 //! process [`Group`], the daemon's [`Endpoint`], [`Signals`], the [`fs`]
-//! operations), so no crate above names a platform: Unix is complete, and
-//! on Windows what its daemon still lacks says it is unsupported.
+//! operations), so no crate above names a platform. Local daemon transports are Unix
+//! sockets and Windows named pipes with per-user security.
 
 mod awake;
 pub mod config;
@@ -18,13 +22,13 @@ pub mod log;
 mod login;
 mod platform;
 mod proc;
-#[cfg(unix)]
-mod runtime;
-#[cfg(not(unix))]
-#[path = "unstaged.rs"]
 mod runtime;
 mod signals;
 pub mod terminal;
+#[cfg(windows)]
+mod windows;
+#[cfg(all(test, not(windows)))]
+mod windows_quote;
 mod workspace;
 
 use std::io;
@@ -38,11 +42,14 @@ pub use fs::{read_exact_at, sync_data, write_watch};
 pub use login::login_env;
 pub use platform::{Arch, Os, Platform};
 pub use proc::{
-    ExitWatch, Group, Pass, Passed, adopt_lock, boot_id, child_input, child_output, detach_session,
-    exit_signal, exit_watch, find_bash, pass, process_started, signal_process,
+    Child, ExitWatch, Group, Pass, Passed, ProcessPipe, RecordedProcess, adopt_lock, boot_id,
+    daemon_ready, detach_session, exit_signal, exit_watch, find_bash, process_started,
+    signal_process, spawn_daemon, spawn_group, spawn_stdio,
 };
 pub use runtime::{Runtime, Staged, VERSION};
 pub use signals::{Signals, reraise};
+#[cfg(windows)]
+pub use windows::CompletionSource;
 pub use workspace::{GitEnv, workspace_in, workspace_of};
 
 /// Locations under the per-user home (`$A_HOME`, default `~/.a`).
@@ -161,4 +168,76 @@ fn fnv1a(bytes: &[u8]) -> u64 {
     bytes.iter().fold(0xcbf2_9ce4_8422_2325, |h, &b| {
         (h ^ u64::from(b)).wrapping_mul(0x0100_0000_01b3)
     })
+}
+
+/// A native path as understood by the shell executing a session's tools.
+pub fn shell_path(path: &Path) -> std::borrow::Cow<'_, str> {
+    #[cfg(unix)]
+    {
+        path.to_string_lossy()
+    }
+    #[cfg(windows)]
+    {
+        let path = path.to_string_lossy();
+        if let Some(unc) = path.strip_prefix(r"\\?\UNC\") {
+            format!("//{}", unc.replace('\\', "/")).into()
+        } else {
+            path.trim_start_matches(r"\\?\").replace('\\', "/").into()
+        }
+    }
+}
+
+/// The directory reported by that shell, as a native absolute path.
+pub fn shell_directory(text: &str) -> PathBuf {
+    let text = text.trim_end_matches(['\r', '\n']);
+    #[cfg(windows)]
+    {
+        let bytes = text.as_bytes();
+        if bytes.len() >= 3
+            && bytes[0] == b'/'
+            && bytes[1].is_ascii_alphabetic()
+            && bytes[2] == b'/'
+        {
+            return PathBuf::from(format!("{}:{}", char::from(bytes[1]), &text[2..]));
+        }
+    }
+    PathBuf::from(text)
+}
+
+/// The shell builtin that reports a directory in the host's path syntax.
+pub const fn shell_pwd() -> &'static str {
+    #[cfg(unix)]
+    {
+        "pwd -P"
+    }
+    #[cfg(windows)]
+    {
+        "pwd -W"
+    }
+}
+
+#[cfg(test)]
+mod path_tests {
+    use super::*;
+
+    #[test]
+    fn shell_directory_reports_roundtrip_spaces_unicode_and_line_endings() {
+        let path = std::env::temp_dir().join("space café");
+        let report = format!("{}\r\n", shell_path(&path));
+        assert_eq!(shell_directory(&report), path);
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn extended_and_unc_paths_keep_their_shell_meaning() {
+        assert_eq!(shell_path(Path::new(r"\\?\C:\space café")), "C:/space café");
+        assert_eq!(
+            shell_path(Path::new(r"\\?\UNC\server\share\dir")),
+            "//server/share/dir"
+        );
+        assert_eq!(
+            shell_directory("/c/space café\n"),
+            PathBuf::from("c:/space café")
+        );
+    }
 }

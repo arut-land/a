@@ -1,41 +1,145 @@
 //! Signals as bytes on a pipe (the self-pipe trick), so a thread that polls
 //! its input sees them with it, and no handler does more than one write.
-//! Windows has console control events instead (`SetConsoleCtrlHandler`),
-//! which arrive the same way once its terminal client lands.
+//! Windows console control events wake a permanently owned manual-reset event.
 
 pub use imp::{Signals, reraise};
 
 #[cfg(windows)]
 mod imp {
-    use std::io;
-
     use crate::Signal;
+    use std::io;
+    use std::os::windows::io::{AsHandle, AsRawHandle, BorrowedHandle, OwnedHandle};
+    use std::sync::OnceLock;
+    use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
+    use windows_sys::Win32::System::Console::{
+        CTRL_BREAK_EVENT, CTRL_C_EVENT, CTRL_CLOSE_EVENT, CTRL_LOGOFF_EVENT, CTRL_SHUTDOWN_EVENT,
+        SetConsoleCtrlHandler,
+    };
+    use windows_sys::Win32::System::Threading::{
+        INFINITE, ResetEvent, SetEvent, WaitForSingleObject,
+    };
 
-    /// Caught console control events, as [`Signal`]s.
-    pub struct Signals(std::os::windows::io::OwnedHandle);
+    struct Source {
+        event: OwnedHandle,
+        pending: AtomicU32,
+        requested: AtomicU32,
+        active: AtomicBool,
+    }
+    // Handler invocations may outlive a Signals. Process-lifetime ownership
+    // prevents a closing event handle from being reused under the callback.
+    static SOURCE: OnceLock<Source> = OnceLock::new();
 
-    impl std::os::windows::io::AsHandle for Signals {
-        fn as_handle(&self) -> std::os::windows::io::BorrowedHandle<'_> {
-            std::os::windows::io::AsHandle::as_handle(&self.0)
+    pub struct Signals(&'static Source);
+
+    impl AsHandle for Signals {
+        fn as_handle(&self) -> BorrowedHandle<'_> {
+            self.0.event.as_handle()
         }
     }
 
+    fn bit(signal: Signal) -> u32 {
+        match signal {
+            Signal::Interrupt => 1,
+            Signal::Terminate => 2,
+            Signal::Hangup => 4,
+            _ => 0,
+        }
+    }
+
+    unsafe extern "system" fn control(event: u32) -> i32 {
+        let signal = match event {
+            CTRL_C_EVENT => Signal::Interrupt,
+            CTRL_BREAK_EVENT => Signal::Terminate,
+            CTRL_CLOSE_EVENT | CTRL_LOGOFF_EVENT | CTRL_SHUTDOWN_EVENT => Signal::Hangup,
+            _ => return 0,
+        };
+        let Some(source) = SOURCE.get() else {
+            return 0;
+        };
+        let bit = bit(signal);
+        if source.requested.load(Ordering::Acquire) & bit == 0 {
+            return 0;
+        }
+        source.pending.fetch_or(bit, Ordering::Release);
+        // SAFETY: SOURCE owns the event for the process lifetime.
+        unsafe { SetEvent(source.event.as_raw_handle()) };
+        1
+    }
+
     impl Signals {
-        pub fn catch(_signals: &[Signal]) -> io::Result<Self> {
-            Err(io::ErrorKind::Unsupported.into())
+        pub fn catch(signals: &[Signal]) -> io::Result<Self> {
+            if SOURCE.get().is_none() {
+                let source = Source {
+                    event: crate::windows::event()?,
+                    pending: AtomicU32::new(0),
+                    requested: AtomicU32::new(0),
+                    active: AtomicBool::new(false),
+                };
+                let _ = SOURCE.set(source);
+            }
+            let source = SOURCE.get().unwrap();
+            if source.active.swap(true, Ordering::AcqRel) {
+                return Err(io::ErrorKind::AlreadyExists.into());
+            }
+            let this = Self(source);
+            this.take();
+            source.requested.store(
+                signals.iter().fold(0, |bits, signal| bits | bit(*signal)),
+                Ordering::Release,
+            );
+            // SAFETY: callback uses only atomics and its permanently owned event.
+            crate::windows::ok(unsafe { SetConsoleCtrlHandler(Some(control), 1) })?;
+            Ok(this)
         }
 
         pub fn take(&self) -> Vec<Signal> {
-            Vec::new()
+            // Reset before draining, so a concurrent callback always leaves
+            // either a pending bit in this drain or a signaled event behind.
+            // SAFETY: the process-lifetime event remains open.
+            unsafe { ResetEvent(self.0.event.as_raw_handle()) };
+            let bits = self.0.pending.swap(0, Ordering::AcqRel);
+            [Signal::Interrupt, Signal::Terminate, Signal::Hangup]
+                .into_iter()
+                .filter(|signal| bits & bit(*signal) != 0)
+                .collect()
         }
 
         pub fn wait(&self) -> Vec<Signal> {
-            Vec::new()
+            // SAFETY: this event stays owned throughout the wait.
+            unsafe { WaitForSingleObject(self.0.event.as_raw_handle(), INFINITE) };
+            self.take()
+        }
+    }
+
+    impl Drop for Signals {
+        fn drop(&mut self) {
+            self.0.requested.store(0, Ordering::Release);
+            // SAFETY: removes precisely this process's registered callback.
+            unsafe { SetConsoleCtrlHandler(Some(control), 0) };
+            self.0.active.store(false, Ordering::Release);
         }
     }
 
     pub fn reraise(_signal: Signal) -> ! {
         std::process::exit(1)
+    }
+
+    #[cfg(test)]
+    mod tests {
+        use super::*;
+        #[test]
+        fn console_events_wake_the_daemon_and_drain_once() {
+            let signals = Signals::catch(&[Signal::Terminate, Signal::Interrupt]).unwrap();
+            // SAFETY: exercises the same scalar callback input the OS supplies.
+            assert_eq!(unsafe { control(CTRL_BREAK_EVENT) }, 1);
+            // SAFETY: the source owns this event for the entire test.
+            let status = unsafe { WaitForSingleObject(signals.as_handle().as_raw_handle(), 0) };
+            assert_eq!(status, 0);
+            assert_eq!(signals.take(), [Signal::Terminate]);
+            assert_eq!(signals.take(), []);
+            // SAFETY: an unrequested callback must remain unhandled.
+            assert_eq!(unsafe { control(CTRL_CLOSE_EVENT) }, 0);
+        }
     }
 }
 

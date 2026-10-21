@@ -1,9 +1,7 @@
 //! A leased stdio connection: every abnormal return drops it and kills
 //! the group, so a late response can never answer a later call.
 
-use std::fs::File;
 use std::io::{Read, Write};
-use std::process::Stdio;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 
@@ -13,8 +11,8 @@ use serde_json::{Value, json};
 use crate::{Failure, Server, Transport, rpc};
 
 pub(crate) struct Client {
-    input: rt::Async<File>,
-    output: rt::Async<File>,
+    input: rt::Async<sys::ProcessPipe>,
+    output: rt::Async<sys::ProcessPipe>,
     pending: Vec<u8>,
     scratch: Box<[u8; 8192]>,
     next: u64,
@@ -71,16 +69,11 @@ impl Client {
             env,
         };
         let mut command = spawner.process(cx, spec).map_err(Failure::Spawn)?;
-        command
-            .stdin(Stdio::piped())
-            .stdout(Stdio::piped())
-            .stderr(Stdio::null());
-        let mut child = command.spawn().map_err(|e| Failure::Spawn(e.to_string()))?;
+        let (mut child, input, output) =
+            sys::spawn_stdio(&mut command).map_err(|e| Failure::Spawn(e.to_string()))?;
         let group = sys::Group(child.id());
         let alive = Arc::new(AtomicBool::new(true));
         let reactor = rt.reactor();
-        let input = child.stdin.take().expect("piped stdin");
-        let output = child.stdout.take().expect("piped stdout");
         // Ownership precedes registration, so even a reactor failure leaves
         // a child that will be killed and reaped by the daemon.
         let live = Arc::clone(&alive);
@@ -109,10 +102,8 @@ impl Client {
         });
         let registered = (|| {
             Ok(Self {
-                input: rt::Async::new(&rt.reactor(), sys::child_input(input))
-                    .map_err(|e| io(&e))?,
-                output: rt::Async::for_reading(&rt.reactor(), sys::child_output(output))
-                    .map_err(|e| io(&e))?,
+                input: rt::Async::new(&rt.reactor(), input).map_err(|e| io(&e))?,
+                output: rt::Async::read_pipe(&rt.reactor(), output).map_err(|e| io(&e))?,
                 pending: Vec::new(),
                 scratch: Box::new([0; 8192]),
                 next: 0,

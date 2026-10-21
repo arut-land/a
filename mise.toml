@@ -77,8 +77,7 @@ if grep -E '^tokio v' target/no-tokio.txt; then
 fi
 '''
 # The Windows build, linted from any host: nothing above `sys` and `rt`
-# names a platform, so all of it, `a` included, builds there (what the
-# daemon still lacks on Windows says it is unsupported).
+# names a platform, so all of it, `a` included, builds there.
 # Vendored Lua needs the native C SDK; Windows CI lints that optional feature.
 "check:windows" = "cargo clippy --workspace --exclude ext-lua --all-targets --target x86_64-pc-windows-msvc -- -D warnings"
 # Miri over sys, the one crate with unsafe code. Miri runs no processes and
@@ -98,7 +97,7 @@ done
 ''' }
 # The black-box tests (apps/cli/tests/blackbox) are one binary; a task
 # picks its module by name. The M1 acceptance tests on the dev build:
-acceptance = "cargo nextest run -p a --test blackbox -E 'test(/^acceptance::/)' --no-tests=fail"
+acceptance = "cargo nextest run -p a --test blackbox -E 'test(/^(acceptance|daemon_acceptance)::/)' --no-tests=fail"
 # `a web` on the dev build against an isolated home (target/web-home) and
 # the model-backed agent, with the keys .env.local gives its sessions
 # (`[daemon]` `agent = "echo"` in its config.toml for none); its daemon

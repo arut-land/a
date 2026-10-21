@@ -7,8 +7,10 @@ use std::net::Shutdown;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
-use crate::proc::{Pass, Passed};
-use crate::{Home, fnv1a};
+use crate::Home;
+#[cfg(unix)]
+use crate::proc::Pass;
+use crate::proc::Passed;
 
 /// Where a home's daemon listens.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -34,10 +36,10 @@ impl Endpoint {
 impl Home {
     /// The daemon's endpoint. A socket path is kept short because
     /// `sun_path` holds ~104 bytes: `/tmp/a-<uid>/<hash of the home>.sock`;
-    /// a pipe is `\\.\pipe\a-<hash of the home>`.
+    /// Windows discovers a process-generation pipe through the daemon record.
     pub fn endpoint(&self) -> Endpoint {
-        let hash = fnv1a(self.root().as_os_str().as_encoded_bytes());
-        Endpoint(imp::address(hash))
+        let hash = imp::home_hash(self.root());
+        Endpoint(imp::address(self.root(), hash))
     }
 
     /// Listens at [`Home::endpoint`], replacing a stale socket, and points
@@ -62,11 +64,12 @@ impl Listener {
     }
 
     /// Adopts the listener our parent bound and passed down.
-    pub fn adopt(passed: Passed) -> io::Result<Self> {
-        imp::adopt(passed).map(Self)
+    pub fn adopt(passed: Passed, endpoint: &Endpoint) -> io::Result<Self> {
+        imp::adopt(passed, &endpoint.0).map(Self)
     }
 }
 
+#[cfg(unix)]
 impl Pass for Listener {
     fn passed(&self) -> Passed {
         crate::proc::passed(&self.0)
@@ -115,16 +118,22 @@ impl std::os::fd::AsFd for Listener {
 }
 
 #[cfg(windows)]
-impl std::os::windows::io::AsHandle for Stream {
-    fn as_handle(&self) -> std::os::windows::io::BorrowedHandle<'_> {
-        self.0.as_handle()
+impl crate::CompletionSource for Stream {
+    fn completion_events(&self) -> io::Result<[std::os::windows::io::OwnedHandle; 2]> {
+        self.0.completion_events()
+    }
+    fn nonblocking(&self) -> io::Result<()> {
+        self.set_nonblocking(true)
     }
 }
 
 #[cfg(windows)]
-impl std::os::windows::io::AsHandle for Listener {
-    fn as_handle(&self) -> std::os::windows::io::BorrowedHandle<'_> {
-        self.0.as_handle()
+impl crate::CompletionSource for Listener {
+    fn completion_events(&self) -> io::Result<[std::os::windows::io::OwnedHandle; 2]> {
+        self.0.completion_events()
+    }
+    fn nonblocking(&self) -> io::Result<()> {
+        self.set_nonblocking(true)
     }
 }
 
@@ -184,7 +193,11 @@ mod imp {
     pub type Listener = UnixListener;
     pub type Stream = UnixStream;
 
-    pub fn address(hash: u64) -> PathBuf {
+    pub fn home_hash(root: &Path) -> u64 {
+        crate::fnv1a(root.as_os_str().as_encoded_bytes())
+    }
+
+    pub fn address(_root: &Path, hash: u64) -> PathBuf {
         socket_dir().join(format!("{hash:016x}.sock"))
     }
 
@@ -225,7 +238,7 @@ mod imp {
         listener.set_nonblocking(nonblocking)
     }
 
-    pub fn adopt(Passed(fd): Passed) -> io::Result<UnixListener> {
+    pub fn adopt(Passed(fd): Passed, _endpoint: &Path) -> io::Result<UnixListener> {
         // SAFETY: the parent (`a` itself) passes the fd number of a
         // listening socket it bound and left open for us; nothing else in
         // this process owns that fd. `local_addr` below rejects anything
@@ -278,68 +291,9 @@ mod imp {
     }
 }
 
-/// A client opens the pipe as a file, which is all it takes; serving one
-/// (`CreateNamedPipeW` with `FILE_FLAG_FIRST_PIPE_INSTANCE`, owner-only)
-/// lands with the Windows daemon.
 #[cfg(windows)]
-mod imp {
-    use std::fs::{File, OpenOptions};
-    use std::io;
-    use std::os::windows::io::OwnedHandle;
-    use std::path::{Path, PathBuf};
-    use std::time::Duration;
-
-    use crate::proc::Passed;
-
-    pub type Listener = OwnedHandle;
-    pub type Stream = File;
-
-    fn unsupported() -> io::Error {
-        io::Error::new(
-            io::ErrorKind::Unsupported,
-            "a's daemon does not run on Windows yet",
-        )
-    }
-
-    pub fn address(hash: u64) -> PathBuf {
-        PathBuf::from(format!(r"\\.\pipe\a-{hash:016x}"))
-    }
-
-    pub fn connect(path: &Path) -> io::Result<File> {
-        OpenOptions::new().read(true).write(true).open(path)
-    }
-
-    /// A pipe goes with its last handle.
-    pub fn remove(_path: &Path) {}
-
-    pub fn bind(_pipe: &Path, _link: &Path) -> io::Result<OwnedHandle> {
-        Err(unsupported())
-    }
-
-    pub fn accept(_listener: &OwnedHandle) -> io::Result<File> {
-        Err(unsupported())
-    }
-
-    pub fn listener_nonblocking(_listener: &OwnedHandle, _nonblocking: bool) -> io::Result<()> {
-        Err(unsupported())
-    }
-
-    pub fn adopt(_passed: Passed) -> io::Result<OwnedHandle> {
-        Err(unsupported())
-    }
-
-    pub fn shutdown(_stream: &File, _how: std::net::Shutdown) -> io::Result<()> {
-        Err(unsupported())
-    }
-
-    pub fn read_timeout(_stream: &File, _timeout: Option<Duration>) -> io::Result<()> {
-        Err(unsupported())
-    }
-
-    pub fn stream_nonblocking(_stream: &File, _nonblocking: bool) -> io::Result<()> {
-        Err(unsupported())
-    }
-}
+#[path = "endpoint_windows.rs"]
+pub(crate) mod imp;
 
 #[cfg(all(test, unix))]
 mod tests {

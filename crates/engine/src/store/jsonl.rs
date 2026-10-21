@@ -91,9 +91,8 @@ impl Jsonl {
             file.sync_all()?;
             drop(file);
             check(ImportStep::Rename)?;
-            fs::rename(&pending, &path)?;
+            sys::fs::publish(&pending, &path)?;
             check(ImportStep::DirectorySync)?;
-            sys::fs::sync_dir(&self.dir)?;
             check(ImportStep::Published)
         })();
         if result.is_err() {
@@ -117,32 +116,21 @@ fn beside(log: &Path, ext: &str) -> PathBuf {
 }
 
 impl LogStore for Jsonl {
-    /// The file, header included, becomes durable with its first entry: a
-    /// session with none has nothing to lose, and creating one costs no sync.
+    /// Windows publishes a flushed header before opening its append handle;
+    /// Unix can share the directory barrier with the first entry.
     fn create(&self, header: &Header) -> io::Result<Loaded> {
         let path = self.path(header.id);
-        let mut file = OpenOptions::new()
-            .create_new(true)
-            .read(true)
-            .append(true)
-            .open(&path)?;
-        self.domain.check(&file)?;
         let mut line = format!(r#"{{"format":{FORMAT},"#).into_bytes();
         let at = line.len();
         serde_json::to_writer(&mut line, header)?;
         line.remove(at);
         seal(&mut line, 0);
-        file.write_all(&line)?;
+        let (file, publication) = sys::fs::open_log(&path, Some(&line))?;
+        self.domain.check(&file)?;
         let index = Index::new(file, path, line.len() as u64);
         index.persist(0);
         let epoch = self.leases.acquire(header.id, 0);
-        Ok(index.loaded(
-            0,
-            0,
-            epoch,
-            Ok(Some(self.dir.clone())),
-            Arc::clone(&self.flusher),
-        ))
+        Ok(index.loaded(0, 0, epoch, Ok(publication), Arc::clone(&self.flusher)))
     }
 
     fn prefix(&self, id: SessionId, seq: u64) -> io::Result<Vec<Entry>> {
@@ -218,7 +206,7 @@ impl LogStore for Jsonl {
         each: &mut dyn FnMut(Entry),
     ) -> io::Result<Loaded> {
         let path = self.path(id);
-        let file = OpenOptions::new().read(true).append(true).open(&path)?;
+        let (file, publication) = sys::fs::open_log(&path, None)?;
         self.domain.check(&file)?;
         let mut index = Index::new(file, path, 0);
         let other = index.header()?;
@@ -267,7 +255,7 @@ impl LogStore for Jsonl {
             seq,
             read,
             epoch,
-            kept.map_or(Ok(Some(self.dir.clone())), Err),
+            kept.map_or(Ok(publication), Err),
             Arc::clone(&self.flusher),
         ))
     }
@@ -343,13 +331,13 @@ impl Index {
         seq: u64,
         read: u64,
         epoch: u32,
-        kept: Result<Option<PathBuf>, ReadOnly>,
+        kept: Result<sys::fs::Publication, ReadOnly>,
         flusher: Arc<rt::Flusher>,
     ) -> Loaded {
         let index = Arc::new(self);
         let (new_in, read_only) = match kept {
-            Ok(new_in) => (new_in, None),
-            Err(why) => (index.path.parent().map(Path::to_path_buf), Some(why)),
+            Ok(publication) => (Some(publication), None),
+            Err(why) => (None, Some(why)),
         };
         let log = Box::new(JsonlLog {
             index: Arc::clone(&index),
@@ -625,7 +613,7 @@ struct JsonlLog {
     read_only: Option<ReadOnly>,
     /// A previous writer may have exited before ordering the new name,
     /// so each writer orders its directory before its first promise.
-    new_in: Option<PathBuf>,
+    new_in: Option<sys::fs::Publication>,
     /// A failed append may have left part of its lines past the last one
     /// indexed, and cutting them off failed too: the next append cuts them
     /// first.
@@ -647,7 +635,7 @@ impl Log for JsonlLog {
     fn sync(&mut self) -> io::Result<()> {
         sys::sync_data(&self.index.file)?;
         if let Some(dir) = &self.new_in {
-            sys::fs::order_dir(dir)?;
+            dir.order()?;
         }
         self.new_in = None;
         Ok(())
@@ -729,7 +717,7 @@ impl JsonlLog {
             }
             sys::sync_data(file)?;
             if let Some(dir) = &self.new_in {
-                sys::fs::order_dir(dir)?;
+                dir.order()?;
             }
             io::Result::Ok(())
         })();
