@@ -120,7 +120,7 @@ impl Actor {
             return None;
         }
         self.indexed().await.ok()?;
-        if let Some(id) = self.journal.index.side(of, &side) {
+        if let Some(id) = self.journal.index.side(&side.identity(of)) {
             let cached = if let Some(seq) = self.journal.index.result(id, self.live.frames.seq()) {
                 match self.indexed_entry(seq).await.ok()?.body {
                     Body::ModelResult {

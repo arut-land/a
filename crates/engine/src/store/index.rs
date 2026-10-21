@@ -3,23 +3,15 @@
 use std::collections::HashMap;
 use std::io;
 
-use protocol::{Body, CallId, Decode, Entry, Json, Seq, SessionId};
-use serde::Deserialize;
+use protocol::{Body, CallId, Decode, Entry, Seq, SessionId};
 
 use crate::outbox::FrameLog;
-
-#[derive(Deserialize, PartialEq, Eq, Hash)]
-struct Identity {
-    owner: String,
-    purpose: String,
-    session_key: bool,
-}
 
 #[derive(Default)]
 pub(crate) struct Index {
     through: u64,
     fence: u64,
-    sides: HashMap<(Option<CallId>, Identity), CallId>,
+    sides: HashMap<ext::SideIdentity, CallId>,
     results: HashMap<CallId, (Seq, bool)>,
     interrupt: u64,
     watches: HashMap<SessionId, Seq>,
@@ -54,17 +46,10 @@ impl Index {
                 purpose: Some(purpose),
                 ..
             } => {
-                #[derive(Deserialize)]
-                struct Intent {
-                    request: Identity,
-                }
-                if let Ok(Intent { request }) = request.parse()
-                    && request.purpose == *purpose
+                if let Ok(identity) = ext::SideIdentity::from_intent(*of, request)
+                    && identity.purpose == *purpose
                 {
-                    let owner = (!request.session_key).then_some(*of);
-                    self.sides
-                        .entry((owner, request))
-                        .or_insert(CallId(entry.seq));
+                    self.sides.entry(identity).or_insert(CallId(entry.seq));
                 }
             }
             Body::ModelResult { call, outcome, .. } | Body::ToolResult { call, outcome, .. } => {
@@ -84,11 +69,8 @@ impl Index {
         self.through = entry.seq.get();
     }
 
-    pub(crate) fn side(&self, of: CallId, side: &ext::Side) -> Option<CallId> {
-        let identity: Identity = Json::encode(side).ok()?.parse().ok()?;
-        self.sides
-            .get(&((!identity.session_key).then_some(of), identity))
-            .copied()
+    pub(crate) fn side(&self, identity: &ext::SideIdentity) -> Option<CallId> {
+        self.sides.get(identity).copied()
     }
 
     pub(crate) fn result(&self, call: CallId, durable: u64) -> Option<Seq> {
@@ -136,7 +118,7 @@ impl Index {
 mod tests {
     use super::*;
     use crate::store::{Header, Jsonl, LogStore};
-    use protocol::{Envelope, EnvelopeId, Epoch, Outcome, ToolChoice};
+    use protocol::{Envelope, EnvelopeId, Epoch, Json, Outcome, ToolChoice};
 
     fn history() -> (Vec<Entry>, ext::Side, SessionId, Envelope) {
         let child = SessionId::new();
@@ -238,7 +220,10 @@ mod tests {
             let mut index = Index::default();
             index.update(&frames, 0).unwrap();
             let owner = CallId::new(1).unwrap();
-            assert_eq!(index.side(CallId::new(99).unwrap(), &side), Some(owner));
+            assert_eq!(
+                index.side(&side.identity(CallId::new(99).unwrap())),
+                Some(owner)
+            );
             let result = index.result(owner, frames.seq()).unwrap();
             let before = index.entry(&frames, result).unwrap();
             for n in 9..=12 {
@@ -282,7 +267,7 @@ mod tests {
         }
         let mut ignored = Index::default();
         ignored.apply(&incomplete);
-        assert_eq!(ignored.side(CallId::new(1).unwrap(), &side), None);
+        assert_eq!(ignored.side(&side.identity(CallId::new(1).unwrap())), None);
         let mut live = Index::default();
         for entry in &entries {
             live.apply(entry);
@@ -290,7 +275,10 @@ mod tests {
         let mut rebuilt = Index::default();
         rebuilt.update(&frames, 0).unwrap();
         let owner = CallId::new(1).unwrap();
-        assert_eq!(live.side(owner, &side), rebuilt.side(owner, &side));
+        assert_eq!(
+            live.side(&side.identity(owner)),
+            rebuilt.side(&side.identity(owner))
+        );
         for seq in [
             live.result(owner, frames.seq()).unwrap(),
             live.fired(child).unwrap(),

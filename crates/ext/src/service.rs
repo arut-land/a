@@ -196,6 +196,45 @@ pub enum SideContext {
     BeforeOwner,
 }
 
+/// Replay identity excludes prompts, budgets and model routing.
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+pub struct SideIdentity {
+    pub extension: String,
+    pub purpose: String,
+    pub scope: SideScope,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub enum SideScope {
+    Session,
+    Call(protocol::CallId),
+}
+
+impl SideIdentity {
+    pub fn from_intent(of: protocol::CallId, intent: &llm::Json) -> serde_json::Result<Self> {
+        #[derive(serde::Deserialize)]
+        struct Fields {
+            owner: String,
+            purpose: String,
+            session_key: bool,
+        }
+        #[derive(serde::Deserialize)]
+        struct Intent {
+            request: Fields,
+        }
+        let Intent { request } = intent.parse()?;
+        Ok(Self {
+            extension: request.owner,
+            purpose: request.purpose,
+            scope: if request.session_key {
+                SideScope::Session
+            } else {
+                SideScope::Call(of)
+            },
+        })
+    }
+}
+
 /// A side request whose result the caller needs before continuing.
 #[derive(Clone, Debug, serde::Serialize)]
 pub struct Side {
@@ -211,24 +250,16 @@ pub struct Side {
 }
 
 impl Side {
-    /// Match the extension namespace and key policy, independently of
-    /// mutable config or a newly assembled prompt during recovery.
-    pub fn matches_intent(&self, intent: &llm::Json) -> bool {
-        #[derive(serde::Deserialize)]
-        struct Identity {
-            owner: String,
-            purpose: String,
-            session_key: bool,
+    pub fn identity(&self, of: protocol::CallId) -> SideIdentity {
+        SideIdentity {
+            extension: self.owner.clone(),
+            purpose: self.purpose.clone(),
+            scope: if self.session_key {
+                SideScope::Session
+            } else {
+                SideScope::Call(of)
+            },
         }
-        #[derive(serde::Deserialize)]
-        struct Intent {
-            request: Identity,
-        }
-        intent.parse::<Intent>().is_ok_and(|i| {
-            i.request.owner == self.owner
-                && i.request.purpose == self.purpose
-                && i.request.session_key == self.session_key
-        })
     }
 
     /// Reuse this purpose across owners, for session metadata such as a title.
@@ -236,10 +267,6 @@ impl Side {
     pub fn once_per_session(mut self) -> Self {
         self.session_key = true;
         self
-    }
-
-    pub const fn has_session_key(&self) -> bool {
-        self.session_key
     }
 
     /// The prompt and its selected transcript stay separate in the intent.
@@ -383,4 +410,49 @@ pub trait SideProvider: Send + Sync {
         side: &'a Side,
         messages: &'a llm::Messages,
     ) -> BoxFuture<'a, Result<llm::Response, llm::Error>>;
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    struct Owner;
+    impl crate::Extension for Owner {
+        const NAME: &'static str = "identity";
+        const VERSION: u32 = 1;
+        fn contribute(&self, _: &mut crate::Registrar) {}
+    }
+
+    #[test]
+    fn side_identity_depends_only_on_extension_purpose_and_owner_scope() {
+        let of = protocol::CallId::new(1).unwrap();
+        let other = protocol::CallId::new(2).unwrap();
+        let mut side = Side::new::<Owner>(
+            "summary",
+            ModelRole::Fast,
+            SideContext::None,
+            llm::Messages::default(),
+        );
+        let identity = side.identity(of);
+        side.messages
+            .push(llm::Message::user("prompt".repeat(1 << 18)));
+        side.context = SideContext::BeforeOwner;
+        side.role = ModelRole::Session;
+        assert_eq!(side.identity(of), identity);
+        assert_ne!(side.identity(other), identity);
+        let mut renamed = side.clone();
+        renamed.owner = "another-extension".into();
+        assert_ne!(renamed.identity(of), identity);
+        renamed = side.clone();
+        renamed.purpose = "another-purpose".into();
+        assert_ne!(renamed.identity(of), identity);
+        let session = side.once_per_session();
+        assert_eq!(session.identity(of), session.identity(other));
+        assert_ne!(session.identity(of), identity);
+        let intent = session.intent(&llm::Messages::default()).unwrap();
+        assert_eq!(
+            SideIdentity::from_intent(of, &intent).unwrap(),
+            session.identity(of)
+        );
+    }
 }

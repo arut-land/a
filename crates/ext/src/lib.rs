@@ -63,7 +63,8 @@ pub use schema::Schema;
 pub use service::{
     Background, Budget, CwdOf, InboxAccess, LaunchSpec, Layers, ModelRole, ModelRoles, ModelSpec,
     Models, OwnedProcess, ProcessLease, ProcessOutput, ProcessPipe, ProcessSignal, Processes,
-    RunningProcess, Sessions, Side, SideContext, SideProvider, SideRetry, SpawnError,
+    RunningProcess, Sessions, Side, SideContext, SideIdentity, SideProvider, SideRetry, SideScope,
+    SpawnError,
 };
 pub use settings::{Configured, Empty, Table};
 pub use shape::{Output, Partials, Streamed, stream};
