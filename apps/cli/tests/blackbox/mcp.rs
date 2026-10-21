@@ -180,13 +180,22 @@ fn interrupting_an_active_call_kills_its_server() {
     let child = pid(&env);
     conn.send(&ClientMsg::INTERRUPT);
     let entries = conn.until(|e| matches!(e.body, Body::ToolResult { .. }));
-    assert!(matches!(
-        entries.last().unwrap().body,
+    match &entries.last().unwrap().body {
         Body::ToolResult {
             outcome: Outcome::Interrupted { .. },
             ..
+        } => {}
+        Body::ToolResult {
+            outcome: Outcome::Done { output },
+            ..
+        } => {
+            // The tool can observe cancellation before the driver's race;
+            // either winner must durably record that no reply was obtained.
+            let fact: serde_json::Value = output.parse().unwrap();
+            assert_eq!(fact["failed"], "cancelled");
         }
-    ));
+        other => panic!("expected a cancelled call, got {other:?}"),
+    }
     wait_for("interrupted MCP server to exit", || {
         !sys::Group(child).alive()
     });
