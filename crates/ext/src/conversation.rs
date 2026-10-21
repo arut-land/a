@@ -6,6 +6,7 @@ use protocol::{Seq, SessionId};
 use serde::{Deserialize, Serialize};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[must_use]
 pub struct DepthBudget(u16);
 
 impl DepthBudget {
@@ -79,9 +80,19 @@ impl Spawn {
 
 #[derive(Clone, Debug)]
 pub struct Awaited<T>(pub T);
+/// Detached requests cannot be passed to the awaited service.
+/// ```compile_fail
+/// fn wrong(sessions: &dyn ext::Sessions, cx: &ext::Cx, spawn: ext::Spawn) {
+///     let _ = sessions.spawn(cx, spawn.detached());
+/// }
+/// ```
 #[derive(Clone, Debug)]
 pub struct Detached<T>(pub T);
 
+/// A durable address has no future or polling semantics.
+/// ```compile_fail
+/// async fn wrong(handle: ext::ConversationHandle) { handle.await; }
+/// ```
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ConversationHandle {
     pub session: SessionId,
@@ -92,6 +103,40 @@ pub enum SpawnRefusal {
     DepthExhausted,
     Unavailable(String),
     Interrupted,
+}
+
+/// A sender chooses an extension-local purpose; the engine supplies its call id.
+#[derive(Clone, Debug)]
+pub struct SendMessage {
+    pub(crate) owner: &'static str,
+    pub purpose: String,
+    pub destination: ConversationHandle,
+    pub payload: String,
+}
+impl SendMessage {
+    pub fn new<E: Extension>(
+        purpose: &str,
+        destination: ConversationHandle,
+        payload: String,
+    ) -> Self {
+        Self {
+            owner: E::NAME,
+            purpose: purpose.into(),
+            destination,
+            payload,
+        }
+    }
+    pub fn envelope(&self, sender: SessionId, call: protocol::CallId) -> protocol::Envelope {
+        protocol::Envelope {
+            id: protocol::EnvelopeId {
+                sender,
+                call,
+                purpose: format!("{}:{}", self.owner, self.purpose),
+            },
+            destination: self.destination.session,
+            payload: self.payload.clone(),
+        }
+    }
 }
 
 #[cfg(test)]

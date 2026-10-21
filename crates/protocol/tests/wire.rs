@@ -37,6 +37,18 @@ const fn sample<M>(name: &'static str, msg: M) -> Sample<M> {
     Sample { name, msg }
 }
 
+fn envelope() -> protocol::Envelope {
+    protocol::Envelope {
+        id: protocol::EnvelopeId {
+            sender: SESSION,
+            call: CallId::new(3).unwrap(),
+            purpose: "subagent:message".into(),
+        },
+        destination: SessionId(Uuid::from_u128(0xc)),
+        payload: "hello".into(),
+    }
+}
+
 fn client_samples() -> Vec<Sample<ClientMsg>> {
     let env = Environment {
         cwd: "/w".into(),
@@ -621,12 +633,16 @@ fn daemon_samples() -> Vec<Sample<DaemonMsg>> {
             "entry_link",
             entry(
                 15,
-                Body::Link { intent: Default::default(),
+                Body::Link { intent: protocol::Json::null(),
                     child: SessionId(Uuid::from_u128(0xc)),
                     input: "look".into(),
                 },
             ),
         ),
+        sample("entry_outbox", entry(1, Body::Outbox { envelope: envelope() })),
+        sample("entry_enqueue", entry(1, Body::Enqueue { envelope: envelope() })),
+        sample("entry_ack", entry(2, Body::Ack { envelope_id: envelope().id, refusal: None })),
+        sample("entry_inbox_full", entry(2, Body::Ack { envelope_id: envelope().id, refusal: Some(protocol::InboxRefusal::Full) })),
         sample("entry_spawned", entry(1, Body::Spawned { intent: protocol::Json::encode(&json!({"image": []})).unwrap() })),
         sample(
             "entry_watch",

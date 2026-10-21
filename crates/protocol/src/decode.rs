@@ -250,6 +250,9 @@ macro_rules! same {
 }
 
 same!(
+    crate::Envelope,
+    crate::EnvelopeId,
+    crate::InboxRefusal,
     publication::Publication,
     String,
     bool,
@@ -389,6 +392,9 @@ fn present<'de, D: Deserializer<'de>>(d: D) -> std::result::Result<Option<Json>,
 /// An [`Entry`], or a [`Verdict`] within one.
 #[derive(Deserialize)]
 pub(crate) struct EntryFields {
+    pub(crate) envelope: Option<crate::Envelope>,
+    pub(crate) envelope_id: Option<crate::EnvelopeId>,
+    pub(crate) refusal: Option<crate::InboxRefusal>,
     #[serde(default, deserialize_with = "present")]
     pub(crate) intent: Option<Json>,
     pub(crate) publication: Option<publication::Publication>,

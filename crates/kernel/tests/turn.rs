@@ -875,7 +875,7 @@ fn a_generation_is_adopted_only_at_rest() {
 
 fn spawn(wait: bool) -> Event {
     Event::Spawn {
-        intent: Default::default(),
+        intent: Json::null(),
         call: id(2),
         child: child(),
         input: "go".into(),
@@ -887,7 +887,7 @@ fn spawned() -> Vec<Effect> {
     vec![append(
         3,
         Body::Link {
-            intent: Default::default(),
+            intent: Json::null(),
             child: child(),
             input: "go".into(),
         },
@@ -1192,4 +1192,259 @@ fn a_call_waits_on_a_dialog_and_resumes_with_its_answer() {
             ],
         ),
     ]);
+}
+
+fn envelope(purpose: &str) -> protocol::Envelope {
+    protocol::Envelope {
+        id: protocol::EnvelopeId {
+            sender: child(),
+            call: id(2),
+            purpose: purpose.into(),
+        },
+        destination: child(),
+        payload: purpose.into(),
+    }
+}
+
+#[test]
+fn inbox_order_and_consumption_survive_duplicate_delivery_and_replay() {
+    let mut s = echo();
+    s.step(user("$ hold"));
+    for purpose in ["one", "two", "one"] {
+        s.step(Event::Enqueue {
+            envelope: envelope(purpose),
+            ticket: Ticket(1),
+        });
+    }
+    assert_eq!(s.core.ledger().inbox_len(), 2);
+    assert!(s.log.iter().all(|e| !matches!(e.body, Body::Take { .. })));
+    s.step(tool_done(2, done(json!("finished"))));
+    let taken: Vec<_> = s
+        .log
+        .iter()
+        .filter_map(|e| match e.body {
+            Body::Take { input } => Some(input),
+            _ => None,
+        })
+        .collect();
+    let queued: Vec<_> = s
+        .log
+        .iter()
+        .filter_map(|e| matches!(e.body, Body::Enqueue { .. }).then_some(e.seq))
+        .collect();
+    assert_eq!(taken, queued);
+    let (mut restored, _) = Session::resume(Reg::echo().arc(), s.log, &Load::default());
+    restored.step(Event::Enqueue {
+        envelope: envelope("one"),
+        ticket: Ticket(2),
+    });
+    assert_eq!(restored.core.ledger().inbox_len(), 0);
+    assert_eq!(
+        restored
+            .log
+            .iter()
+            .filter(|e| matches!(e.body, Body::Take { .. }))
+            .count(),
+        2
+    );
+}
+
+#[test]
+fn a_full_inbox_refuses_new_identity_but_acknowledges_duplicates() {
+    let mut s = echo();
+    s.step(user("$ hold"));
+    for index in 0..protocol::INBOX_CAPACITY {
+        s.step(Event::Enqueue {
+            envelope: envelope(&index.to_string()),
+            ticket: Ticket(1),
+        });
+    }
+    let fx = s.step(Event::Enqueue {
+        envelope: envelope("overflow"),
+        ticket: Ticket(2),
+    });
+    assert!(fx.iter().any(|e| matches!(
+        e,
+        Effect::Delivery {
+            result: Err(protocol::InboxRefusal::Full),
+            ..
+        }
+    )));
+    let fx = s.step(Event::Enqueue {
+        envelope: envelope("0"),
+        ticket: Ticket(3),
+    });
+    assert!(
+        fx.iter()
+            .any(|e| matches!(e, Effect::Delivery { result: Ok(()), .. }))
+    );
+    assert_eq!(s.core.ledger().inbox_len(), protocol::INBOX_CAPACITY);
+}
+
+#[test]
+fn an_outbox_replays_the_original_envelope_until_its_durable_ack() {
+    let mut s = echo();
+    s.step(user("$ hold"));
+    let original = envelope("first");
+    s.step(Event::SendEnvelope {
+        envelope: original.clone(),
+        ticket: Ticket(1),
+    });
+    let (mut restored, fx) = Session::resume(Reg::echo().arc(), s.log.clone(), &Load::default());
+    assert!(
+        fx.iter()
+            .any(|e| matches!(e, Effect::Deliver { envelope, .. } if envelope == &original))
+    );
+    let mut changed = original.clone();
+    changed.payload = "different".into();
+    let fx = restored.step(Event::SendEnvelope {
+        envelope: changed,
+        ticket: Ticket(2),
+    });
+    assert!(
+        fx.iter()
+            .any(|e| matches!(e, Effect::Deliver { envelope, .. } if envelope == &original))
+    );
+    restored.step(Event::Delivered {
+        id: original.id.clone(),
+        result: Ok(()),
+        ticket: Some(Ticket(2)),
+    });
+    let (mut again, fx) = Session::resume(Reg::echo().arc(), restored.log, &Load::default());
+    assert!(!fx.iter().any(|e| matches!(e, Effect::Deliver { .. })));
+    let fx = again.step(Event::SendEnvelope {
+        envelope: original,
+        ticket: Ticket(3),
+    });
+    assert!(!fx.iter().any(|e| matches!(e, Effect::Deliver { .. })));
+    assert_eq!(
+        again
+            .log
+            .iter()
+            .filter(|e| matches!(e.body, Body::Outbox { .. }))
+            .count(),
+        1
+    );
+    assert_eq!(
+        again
+            .log
+            .iter()
+            .filter(|e| matches!(e.body, Body::Ack { .. }))
+            .count(),
+        1
+    );
+}
+
+#[test]
+fn cancel_wins_once_over_a_detached_result_even_after_reload() {
+    let mut s = echo();
+    s.step(user("task go"));
+    s.step(spawn(false));
+    s.step(tool_done(2, done(json!(null))));
+    let fx = s.step(Event::Interrupt {
+        origin: None,
+        ticket: None,
+    });
+    assert!(
+        fx.iter()
+            .any(|e| matches!(e, Effect::Interrupt { child: c } if *c == child()))
+    );
+    s.step(Event::ChildSettled {
+        child: child(),
+        outcome: done(json!("late")),
+    });
+    let (mut restored, fx) = Session::resume(Reg::echo().arc(), s.log, &Load::default());
+    assert!(!fx.iter().any(|e| matches!(e, Effect::StartChild { .. })));
+    restored.step(Event::ChildSettled {
+        child: child(),
+        outcome: done(json!("later")),
+    });
+    let results: Vec<_> = restored
+        .log
+        .iter()
+        .filter_map(|e| match &e.body {
+            Body::Fired { outcome, .. } => Some(outcome),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(results, [&Outcome::Interrupted { output: None }]);
+}
+
+#[test]
+fn compaction_never_removes_owned_watches() {
+    let mut s = echo();
+    s.step(user("task go"));
+    s.step(spawn(false));
+    s.step(Event::Note {
+        call: id(2),
+        note: Note::Edit {
+            target: seq(1),
+            upto: Some(seq(4)),
+            replace: None,
+        },
+    });
+    assert_eq!(
+        s.core.ledger().armed().collect::<Vec<_>>(),
+        [(seq(4), child())]
+    );
+}
+
+#[test]
+fn detached_results_and_messages_enter_before_the_next_provider_step() {
+    let mut s = modeled();
+    s.step(user("work"));
+    s.step(model_done(2, &[("task", json!({"prompt":"go"}))]));
+    let call = s
+        .log
+        .iter()
+        .find_map(|e| matches!(e.body, Body::ToolCall { .. }).then_some(CallId(e.seq)))
+        .unwrap();
+    s.step(Event::Spawn {
+        call,
+        child: child(),
+        input: "go".into(),
+        intent: Json::null(),
+        wait: false,
+    });
+    s.step(Event::ChildSettled {
+        child: child(),
+        outcome: done(json!("result")),
+    });
+    s.step(Event::Enqueue {
+        envelope: envelope("update"),
+        ticket: Ticket(1),
+    });
+    assert!(
+        s.log
+            .iter()
+            .all(|e| !matches!(e.body, Body::Fired { .. } | Body::Take { .. }))
+    );
+    s.step(Event::ToolDone {
+        call,
+        outcome: done(json!("handle")),
+        card: None,
+    });
+    let request = s
+        .log
+        .iter()
+        .rposition(|e| matches!(e.body, Body::ModelCall { .. }))
+        .unwrap();
+    let fired = s
+        .log
+        .iter()
+        .position(|e| matches!(e.body, Body::Fired { .. }))
+        .unwrap();
+    let taken = s
+        .log
+        .iter()
+        .position(|e| matches!(e.body, Body::Take { .. }))
+        .unwrap();
+    assert!(fired < request && taken < request);
+    assert_eq!(
+        s.log
+            .iter()
+            .filter(|e| matches!(e.body, Body::ModelCall { .. }))
+            .count(),
+        2
+    );
 }

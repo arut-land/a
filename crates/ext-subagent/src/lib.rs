@@ -23,7 +23,8 @@ impl Extension for Subagent {
     const VERSION: u32 = 1;
 
     fn contribute(&self, r: &mut Registrar) {
-        r.tool(Task).tool(ForkTask).text(Text::system("task", 30, "`task` hands a self-contained piece of work to a fresh session, which sees nothing of this conversation: say all it needs in `prompt`. It answers with what that session ended with.").for_tool(Task::NAME));
+        r.provide::<dyn ext::InboxAccess>(std::sync::Arc::new(Self));
+        r.tool(Task).tool(ForkTask).tool(BackgroundTask).text(Text::system("task", 30, "`task` hands a self-contained piece of work to a fresh session, which sees nothing of this conversation: say all it needs in `prompt`. It answers with what that session ended with.").for_tool(Task::NAME));
     }
 }
 
@@ -108,5 +109,63 @@ impl Tool for ForkTask {
     }
     fn to_model(output: &Json) -> llm::Output {
         Task::to_model(output)
+    }
+}
+
+/// Detached work keeps running after this call returns its handle.
+pub struct BackgroundTask;
+#[derive(Deserialize, Schema)]
+pub struct BackgroundPrompt {
+    pub prompt: String,
+    /// Messages enqueued after admission, while the child's initial work runs.
+    pub messages: Vec<String>,
+}
+impl Tool for BackgroundTask {
+    type In = BackgroundPrompt;
+    type Out = ext::ConversationHandle;
+    const NAME: &'static str = "background_task";
+    const DESCRIPTION: &'static str =
+        "Starts owned background work and sends it messages; its result arrives later.";
+    const REPLAY: Replay = Replay::Safe;
+    const CONCURRENCY: Concurrency = Concurrency::Shared;
+    async fn call(&self, input: &BackgroundPrompt, cx: &Cx) -> Result<Self::Out, String> {
+        let sessions = cx
+            .service::<dyn Sessions>()
+            .ok_or("this engine runs no child sessions")?;
+        let spawn = ext::Spawn::new::<Subagent>(
+            "background_task",
+            input.prompt.clone(),
+            sessions.runner(),
+            ext::DepthBudget::new(8),
+        );
+        let handle = sessions
+            .detach(cx, spawn.detached())
+            .await
+            .map_err(|e| format!("{e:?}"))?;
+        for (index, message) in input.messages.iter().enumerate() {
+            sessions
+                .send(
+                    cx,
+                    ext::SendMessage::new::<Subagent>(
+                        &format!("message/{index}"),
+                        handle,
+                        message.clone(),
+                    ),
+                )
+                .await
+                .map_err(|e| format!("{e:?}"))?;
+        }
+        Ok(handle)
+    }
+}
+
+impl ext::InboxAccess for Subagent {
+    fn permits(
+        &self,
+        destination: protocol::SessionId,
+        parent: Option<protocol::SessionId>,
+        children: &[protocol::SessionId],
+    ) -> bool {
+        parent == Some(destination) || children.contains(&destination)
     }
 }

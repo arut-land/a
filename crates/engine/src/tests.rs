@@ -416,6 +416,31 @@ fn a_hibernated_session_reloads_only_after_its_actor_has_exited() {
     assert_eq!(asks, Activity::Approval);
 }
 
+fn spawn_intent(call: u64, prompt: &str) -> Json {
+    Json::encode(&crate::driver::spawn::SpawnIntent {
+        awaited: true,
+        admitted_at: std::time::SystemTime::now(),
+        call: CallId::new(call).unwrap(),
+        request: ext::Spawn::new::<ext_subagent::Subagent>(
+            "task",
+            prompt.into(),
+            ext::Runner {
+                agent: ext_fixtures::ECHO.into(),
+                role: ext::ModelRole::Session,
+            },
+            ext::DepthBudget::new(7),
+        ),
+        model: "none".into(),
+        routing: Err("no model".into()),
+        installed: extensions(&ext_policy::Policy::default())
+            .unwrap()
+            .installed(),
+        image: Vec::new(),
+        refusal: None,
+    })
+    .unwrap()
+}
+
 fn fired(bodies: &[Body]) -> Vec<&Outcome> {
     bodies
         .iter()
@@ -597,7 +622,7 @@ fn watches_rearm_after_a_crash_and_fire_once() {
             },
             Body::Link {
                 child,
-                intent: Default::default(),
+                intent: spawn_intent(2, "sleep 0"),
                 input: "sleep 0".into(),
             },
             Body::Wait {
@@ -631,18 +656,39 @@ fn watches_rearm_after_a_crash_and_fire_once() {
     let parent = session(None);
     let child = session(Some(parent.id));
     write(&parent, spawned(child.id), true);
-    write(&child, vec![opened(), sleep()], true);
+    write(
+        &child,
+        vec![
+            Body::Spawned {
+                intent: spawn_intent(2, "sleep 0"),
+            },
+            opened(),
+            sleep(),
+        ],
+        true,
+    );
     parents.push(parent.id);
     // Killed after the child finished, before the parent heard.
     let parent = session(None);
     let child = session(Some(parent.id));
     write(&parent, spawned(child.id), true);
     let done = Body::ToolResult {
-        call: CallId::new(2).unwrap(),
+        call: CallId::new(3).unwrap(),
         outcome: slept.clone(),
         card: None,
     };
-    write(&child, vec![opened(), sleep(), done], false);
+    write(
+        &child,
+        vec![
+            Body::Spawned {
+                intent: spawn_intent(2, "sleep 0"),
+            },
+            opened(),
+            sleep(),
+            done,
+        ],
+        false,
+    );
     parents.push(parent.id);
     // Killed before the child was created.
     let parent = session(None);
@@ -757,6 +803,9 @@ fn an_orphan_does_not_resume_what_it_was_doing() {
     )
     .unwrap();
     let bodies_written = [
+        Body::Spawned {
+            intent: spawn_intent(2, "sleep 0"),
+        },
         Body::Input {
             text: "sleep 0".into(),
             mode: protocol::Mode::Queue,
@@ -789,7 +838,7 @@ fn an_orphan_does_not_resume_what_it_was_doing() {
     // The safe sleep would run again in a session whose owner is there.
     assert!(
         matches!(
-            &got[2..],
+            &got[3..],
             [
                 Body::ToolResult {
                     call,
@@ -797,7 +846,7 @@ fn an_orphan_does_not_resume_what_it_was_doing() {
                     ..
                 },
                 Body::Interrupt { origin: None },
-            ] if call.get() == 2
+            ] if call.get() == 3
         ),
         "{got:#?}"
     );
@@ -1600,4 +1649,240 @@ fn a_prefix_child_is_admitted_inside_its_unfinished_owning_turn() {
     drop(parent);
     drop(daemon);
     std::fs::remove_dir_all(root).unwrap();
+}
+
+static BACKGROUND_CONTROL: std::sync::LazyLock<(ext::Flag, ext::Flag)> =
+    std::sync::LazyLock::new(|| (ext::Flag::default(), ext::Flag::default()));
+#[derive(serde::Deserialize, ext::Schema)]
+struct NoInput {}
+struct HeldChild;
+impl ext::Extension for HeldChild {
+    const NAME: &'static str = "held_child";
+    const VERSION: u32 = 1;
+    fn contribute(&self, r: &mut ext::Registrar) {
+        r.tool(Self);
+    }
+}
+impl ext::Tool for HeldChild {
+    type In = NoInput;
+    type Out = String;
+    const NAME: &'static str = "held_child";
+    const DESCRIPTION: &'static str = "Holds a child at a deterministic work boundary.";
+    const REPLAY: ext::Replay = ext::Replay::Safe;
+    const CONCURRENCY: ext::Concurrency = ext::Concurrency::Shared;
+    async fn call(&self, _: &NoInput, _: &ext::Cx) -> Result<String, String> {
+        BACKGROUND_CONTROL.0.set();
+        BACKGROUND_CONTROL.1.wait().await;
+        Ok("finished".into())
+    }
+}
+
+#[test]
+fn detached_messages_wait_for_a_boundary_and_the_parent_hears_once() {
+    let (root, home) = home("detached-inbox");
+    let config = Config {
+        extensions: |c| configured(c)?.with(&HeldChild),
+        ..echo()
+    };
+    let daemon = Daemon::load(&home, &config).unwrap();
+    let parent = daemon.attach_to(&Target::New, || "/w".into()).unwrap();
+    let id = parent.session().id;
+    parent.session().submit("call background_task {\"prompt\":\"call held_child {}\",\"messages\":[\"one\",\"two\"]}").unwrap();
+    let parent_log = until(&daemon, id, |log| {
+        log.iter().any(|b| matches!(b, Body::ToolResult { .. }))
+    });
+    assert!(BACKGROUND_CONTROL.0.is_set());
+    let child = parent_log
+        .iter()
+        .find_map(|b| match b {
+            Body::Link { child, .. } => Some(*child),
+            _ => None,
+        })
+        .unwrap();
+    let child_log = bodies(&*daemon.shared.store, child);
+    assert_eq!(
+        child_log
+            .iter()
+            .filter(|b| matches!(b, Body::Enqueue { .. }))
+            .count(),
+        2
+    );
+    assert!(child_log.iter().all(|b| !matches!(b, Body::Take { .. })));
+    assert_eq!(fired(&parent_log), [] as [&Outcome; 0]);
+    assert!(rt::block_on(daemon.fork(&id.to_string(), None)).is_err());
+    assert!(rt::block_on(daemon.fork(&child.to_string(), None)).is_err());
+    BACKGROUND_CONTROL.1.set();
+    settle(&daemon);
+    let child_log = bodies(&*daemon.shared.store, child);
+    assert_eq!(
+        child_log
+            .iter()
+            .filter(|b| matches!(b, Body::Take { .. }))
+            .count(),
+        2
+    );
+    assert_eq!(fired(&bodies(&*daemon.shared.store, id)).len(), 1);
+    drop(parent);
+    drop(daemon);
+    let again = Daemon::load(&home, &config).unwrap();
+    settle(&again);
+    assert_eq!(fired(&bodies(&*again.shared.store, id)).len(), 1);
+    assert_eq!(again.shared.store.headers().unwrap().len(), 2);
+    drop(again);
+    std::fs::remove_dir_all(root).unwrap();
+}
+
+
+#[test]
+fn interrupt_cancels_detached_descendants_after_the_spawning_call_completes() {
+    let (root, home) = home("interrupt-detached-tree");
+    let config = Config {
+        ext: exts("[ext.policy]\nask = [\"bash\"]"),
+        ..echo()
+    };
+    let daemon = Daemon::load(&home, &config).unwrap();
+    let parent = daemon.attach_to(&Target::New, || "/w".into()).unwrap();
+    let id = parent.session().id;
+    parent
+        .session()
+        .submit("call background_task {\"prompt\":\"spawn $ echo hi\",\"messages\":[]}")
+        .unwrap();
+    until(&daemon, id, |log| {
+        log.iter().any(|b| matches!(b, Body::ToolResult { .. }))
+    });
+    daemon.wait("grandchild approval", PATIENCE, || {
+        daemon
+            .list()
+            .iter()
+            .any(|s| s.activity == Activity::Approval)
+    });
+    parent.session().interrupt();
+    settle(&daemon);
+    let headers = daemon.shared.store.headers().unwrap();
+    assert_eq!(headers.len(), 3);
+    let child = headers
+        .iter()
+        .find(|h| h.parent.is_some_and(|p| p.session == id))
+        .unwrap()
+        .id;
+    rt::block_on(daemon.report(
+        id,
+        child,
+        Outcome::Done {
+            output: Json::encode("late").unwrap(),
+        },
+    ));
+    parent.session().barrier();
+    let log = bodies(&*daemon.shared.store, id);
+    assert_eq!(fired(&log), [&Outcome::Interrupted { output: None }]);
+    assert!(daemon.list().iter().all(|s| s.activity == Activity::Idle));
+    drop(parent);
+    drop(daemon);
+    let again = Daemon::load(&home, &config).unwrap();
+    settle(&again);
+    assert_eq!(
+        fired(&bodies(&*again.shared.store, id)),
+        [&Outcome::Interrupted { output: None }]
+    );
+    drop(again);
+    std::fs::remove_dir_all(root).unwrap();
+}
+
+struct PairTasks;
+impl ext::Extension for PairTasks {
+    const NAME: &'static str = "pair_tasks";
+    const VERSION: u32 = 1;
+    fn contribute(&self, r: &mut ext::Registrar) {
+        r.tool(Self);
+    }
+}
+impl ext::Tool for PairTasks {
+    type In = NoInput;
+    type Out = Vec<String>;
+    const NAME: &'static str = "pair_tasks";
+    const DESCRIPTION: &'static str = "Awaits two independently named children.";
+    const REPLAY: ext::Replay = ext::Replay::Safe;
+    const CONCURRENCY: ext::Concurrency = ext::Concurrency::Shared;
+    async fn call(&self, _: &NoInput, cx: &ext::Cx) -> Result<Self::Out, String> {
+        let sessions = cx.service::<dyn ext::Sessions>().unwrap();
+        let mut results = Vec::new();
+        for purpose in ["first", "second"] {
+            let spawn = ext::Spawn::new::<Self>(
+                purpose,
+                purpose.into(),
+                sessions.runner(),
+                ext::DepthBudget::new(2),
+            );
+            let result = sessions
+                .spawn(cx, spawn.awaited())
+                .await
+                .map_err(|e| format!("{e:?}"))?;
+            results.push(ext::child_result(&result));
+        }
+        Ok(results)
+    }
+}
+
+#[test]
+fn replay_reuses_each_named_child_and_its_own_result() {
+    let (root, home) = home("named-replay-source");
+    let (restored_root, restored_home) = self::home("named-replay-restored");
+    let config = Config {
+        extensions: |c| configured(c)?.with(&PairTasks),
+        ..echo()
+    };
+    let daemon = Daemon::load(&home, &config).unwrap();
+    let parent = daemon.attach_to(&Target::New, || "/w".into()).unwrap();
+    let id = parent.session().id;
+    parent.session().submit("call pair_tasks {}").unwrap();
+    settle(&daemon);
+    let store = Jsonl::open(restored_home.sessions_dir()).unwrap();
+    let headers = daemon.shared.store.headers().unwrap();
+    let original = daemon.shared.store.entries(id).unwrap();
+    let expected = original
+        .iter()
+        .find_map(|e| match &e.body {
+            Body::ToolResult { outcome, .. } => Some(outcome.clone()),
+            _ => None,
+        })
+        .unwrap();
+    let before_result = original
+        .iter()
+        .rposition(|e| matches!(e.body, Body::Fired { .. }))
+        .unwrap()
+        + 1;
+    store
+        .import(
+            headers.iter().find(|h| h.id == id).unwrap(),
+            &original[..before_result],
+        )
+        .unwrap();
+    for child in headers.iter().filter(|h| h.id != id) {
+        store
+            .import(child, &daemon.shared.store.entries(child.id).unwrap())
+            .unwrap();
+    }
+    drop(parent);
+    drop(daemon);
+    let restored = Daemon::load(&restored_home, &config).unwrap();
+    settle(&restored);
+    let log = bodies(&*restored.shared.store, id);
+    assert_eq!(
+        log.iter()
+            .filter(|b| matches!(b, Body::Link { .. }))
+            .count(),
+        2
+    );
+    assert_eq!(fired(&log).len(), 2);
+    assert_eq!(restored.shared.store.headers().unwrap().len(), 3);
+    assert!(matches!(log.last(), Some(Body::ToolResult { outcome, .. }) if outcome == &expected));
+    let results: Vec<String> = match expected {
+        Outcome::Done { output } => output.parse().unwrap(),
+        other => panic!("{other:?}"),
+    };
+    assert!(results[0].ends_with("first"));
+    assert!(results[1].ends_with("second"));
+    drop(restored);
+    std::fs::remove_dir_all(root).unwrap();
+    std::fs::remove_dir_all(restored_root).unwrap();
 }

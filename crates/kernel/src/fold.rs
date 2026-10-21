@@ -96,7 +96,7 @@ impl Fold {
                 let queued = self.ledger.untaken().iter().find(|q| q.seq == *input)?;
                 // A steer taken just before a model call is the model's to
                 // read; one left when the turn ended starts the next.
-                let steers = queued.steer
+                let steers = (queued.steer || self.ledger.enqueued(*input))
                     && matches!(
                         self.asked.front(),
                         Some(Next::Agent(Action::CallModel { .. }))
@@ -168,6 +168,10 @@ impl Fold {
                 let child = self.watched(watch)?;
                 if let Some(call) = self.owner(child) {
                     self.fired.push((call, outcome.clone()));
+                    return None;
+                }
+                // A committed continuation will read the delivery in its request.
+                if !self.asked.is_empty() {
                     return None;
                 }
                 Some(Input::ChildDone {

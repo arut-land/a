@@ -250,15 +250,7 @@ async fn side_call(
     side: ext::Side,
 ) -> Result<llm::Response, llm::Error> {
     let invalid = |e: String| llm::Error::new(llm::Kind::InvalidRequest, e);
-    let routed = match side.role {
-        ext::ModelRole::Session => session.model_named().map(|(s, _)| s),
-        ext::ModelRole::Fast => session
-            .shared
-            .models
-            .settings
-            .fast_model(&session.workspace)
-            .and_then(|m| m.map_or_else(|| session.model_named().map(|(s, _)| s), Ok)),
-    };
+    let routed = session.role_model(&side.role);
     let model = routed
         .and_then(|spec| {
             let env = lock(&session.env).clone();

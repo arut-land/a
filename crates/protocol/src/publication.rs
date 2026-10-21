@@ -1,6 +1,6 @@
 //! Named model context is recorded with its identity in the same sealed line.
 
-use crate::{Body, Entry, Json};
+use crate::{Body, Decode, Entry, Json};
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 
@@ -11,10 +11,28 @@ pub struct Publication {
 }
 
 #[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
-pub struct Publications(BTreeMap<u64, Publication>);
+pub struct Publications(BTreeMap<u64, Vec<Publication>>);
 
 impl Publications {
     pub fn apply(&mut self, entry: &Entry) {
+        if let Body::Spawned { intent } = &entry.body {
+            #[derive(Deserialize)]
+            struct Image {
+                image: Vec<Json>,
+            }
+            if let Ok(image) = intent.parse::<Image>() {
+                let mut inherited = Self::default();
+                for encoded in image.image {
+                    if let Ok(source) = Entry::from_json(encoded.raw().as_bytes()) {
+                        inherited.apply(&source);
+                    }
+                }
+                self.0.insert(
+                    entry.seq.get(),
+                    inherited.0.into_values().flatten().collect(),
+                );
+            }
+        }
         if let Body::Edit { target, upto, .. } = &entry.body {
             let end = upto.unwrap_or(*target).get();
             self.0.retain(|seq, _| *seq < target.get() || *seq > end);
@@ -24,7 +42,7 @@ impl Publications {
             ..
         } = &entry.body
         {
-            self.0.insert(entry.seq.get(), publication.clone());
+            self.0.insert(entry.seq.get(), vec![publication.clone()]);
         }
     }
 
@@ -35,6 +53,7 @@ impl Publications {
     pub fn contains(&self, namespace: &str, key: &Json) -> bool {
         self.0
             .values()
+            .flatten()
             .any(|publication| publication.namespace == namespace && publication.key == *key)
     }
 }

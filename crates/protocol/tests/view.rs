@@ -213,7 +213,7 @@ impl Session {
     fn child(&mut self, rng: &mut Rng) {
         let child = SessionId(Uuid::from_u128(u128::from(rng.next())));
         self.commit(Body::Link {
-            intent: Default::default(),
+            intent: Json::null(),
             child,
             input: "go".into(),
         });
@@ -706,7 +706,7 @@ fn scenarios() -> Vec<(&'static str, Vec<Value>)> {
                 entry(
                     1,
                     Body::Link {
-                        intent: Default::default(),
+                        intent: Json::null(),
                         child: SessionId(Uuid::from_u128(0xc)),
                         input: "sleep 1".into(),
                     },

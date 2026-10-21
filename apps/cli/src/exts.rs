@@ -217,7 +217,17 @@ mod tests {
     #[test]
     fn every_extension_registers_as_any_other() {
         let registry = registry(&config(&["bash"], None)).unwrap();
-        assert_eq!(tools(&registry), ["bash", "edit", "skill", "task"]);
+        assert_eq!(
+            tools(&registry),
+            [
+                "bash",
+                "edit",
+                "skill",
+                "task",
+                "fork_task",
+                "background_task"
+            ]
+        );
         let extensions: Vec<_> = registry
             .extensions()
             .filter(|(name, _)| !["lua", "skills-source"].contains(name))
@@ -283,7 +293,7 @@ mod tests {
             ("retry", &[], 0),
             ("settings", &[], 0),
             ("skills", &["skill"], 0),
-            ("subagent", &["task"], 1),
+            ("subagent", &["task", "fork_task", "background_task"], 1),
         ];
         for (name, tools_of, texts_of) in own {
             let without = Config {

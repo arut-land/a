@@ -158,6 +158,19 @@ pub enum Event {
     },
     /// Child session `child` settled with `outcome`.
     ChildSettled { child: SessionId, outcome: Outcome },
+    SendEnvelope {
+        envelope: protocol::Envelope,
+        ticket: Ticket,
+    },
+    Enqueue {
+        envelope: protocol::Envelope,
+        ticket: Ticket,
+    },
+    Delivered {
+        id: protocol::EnvelopeId,
+        result: Result<(), protocol::InboxRefusal>,
+        ticket: Option<Ticket>,
+    },
     /// A registry generation to adopt at rest; discarded while busy.
     Registry(Arc<dyn Binding>),
     /// The environment the session's commands run in from now on, as
@@ -331,6 +344,14 @@ pub enum Effect {
     Kill { pgid: u32 },
     /// Whether the session has work in flight, which a restart recovers.
     MarkBusy(bool),
+    Deliver {
+        envelope: protocol::Envelope,
+        ticket: Option<Ticket>,
+    },
+    Delivery {
+        ticket: Ticket,
+        result: Result<(), protocol::InboxRefusal>,
+    },
 }
 
 impl Effect {
@@ -347,6 +368,7 @@ impl Effect {
                 | Self::Recover { .. }
                 | Self::Sleep { .. }
                 | Self::StartChild { .. }
+                | Self::Deliver { .. }
         )
     }
 

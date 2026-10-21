@@ -567,7 +567,7 @@ fn stale_request<'a>(
                         },
                         ext::DepthBudget::new(1),
                     ),
-                    reply,
+                    reply: spawn::SpawnReply::Awaited(reply),
                 },
             );
             origin.send(

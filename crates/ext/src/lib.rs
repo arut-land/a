@@ -39,7 +39,8 @@ pub mod point;
 pub mod schema;
 mod service;
 pub use conversation::{
-    Awaited, ContextSource, ConversationHandle, DepthBudget, Detached, Runner, Spawn, SpawnRefusal,
+    Awaited, ContextSource, ConversationHandle, DepthBudget, Detached, Runner, SendMessage, Spawn,
+    SpawnRefusal,
 };
 mod settings;
 pub mod shape;
@@ -60,8 +61,8 @@ pub use point::{
 };
 pub use schema::Schema;
 pub use service::{
-    Background, Budget, CwdOf, Layers, ModelRole, ModelSpec, Models, Sessions, Side, SideContext,
-    SideProvider, SideRetry, Spawner,
+    Background, Budget, CwdOf, InboxAccess, Layers, ModelRole, ModelRoles, ModelSpec, Models,
+    Sessions, Side, SideContext, SideProvider, SideRetry, Spawner,
 };
 pub use settings::{Configured, Empty, Table};
 pub use shape::{Output, Partials, Streamed, stream};

@@ -1,6 +1,6 @@
 [
   {
-    "hash": "ba47e388c35a427d",
+    "hash": "fd5f27f01593d32c",
     "messages": [
       {
         "session": "00000000-0000-0000-0000-00000000000a",
@@ -62,6 +62,7 @@
         }
       ],
       "ledger": {
+        "acknowledgements": [],
         "armed": [],
         "background": [],
         "clients": [],
@@ -70,6 +71,8 @@
         "extensions": null,
         "links": [],
         "open": [],
+        "outbox": [],
+        "received": [],
         "seq": 2,
         "turn": 1,
         "untaken": [],
@@ -147,7 +150,7 @@
     ]
   },
   {
-    "hash": "6c8e00eea9b68da2",
+    "hash": "8a401a4ef94b8903",
     "messages": [
       {
         "session": "00000000-0000-0000-0000-00000000000a",
@@ -232,6 +235,7 @@
         }
       ],
       "ledger": {
+        "acknowledgements": [],
         "armed": [],
         "background": [],
         "clients": [],
@@ -240,6 +244,8 @@
         "extensions": null,
         "links": [],
         "open": [],
+        "outbox": [],
+        "received": [],
         "seq": 4,
         "turn": 0,
         "untaken": [],
@@ -325,7 +331,7 @@
     ]
   },
   {
-    "hash": "214e1fb9e25e80df",
+    "hash": "d2997d54b2d14372",
     "messages": [
       {
         "session": "00000000-0000-0000-0000-00000000000a",
@@ -409,6 +415,7 @@
         }
       ],
       "ledger": {
+        "acknowledgements": [],
         "armed": [],
         "background": [],
         "clients": [],
@@ -417,6 +424,8 @@
         "extensions": null,
         "links": [],
         "open": [],
+        "outbox": [],
+        "received": [],
         "seq": 3,
         "turn": 1,
         "untaken": [],
@@ -507,7 +516,7 @@
     ]
   },
   {
-    "hash": "6c8e00eea9b68da2",
+    "hash": "8a401a4ef94b8903",
     "messages": [
       {
         "session": "00000000-0000-0000-0000-00000000000a",
@@ -594,6 +603,7 @@
         }
       ],
       "ledger": {
+        "acknowledgements": [],
         "armed": [],
         "background": [],
         "clients": [],
@@ -602,6 +612,8 @@
         "extensions": null,
         "links": [],
         "open": [],
+        "outbox": [],
+        "received": [],
         "seq": 4,
         "turn": 0,
         "untaken": [],
@@ -688,7 +700,7 @@
     ]
   },
   {
-    "hash": "aa35ced2ba389e41",
+    "hash": "16181453d2f7f4a6",
     "messages": [
       {
         "session": "00000000-0000-0000-0000-00000000000a",
@@ -760,6 +772,7 @@
         }
       ],
       "ledger": {
+        "acknowledgements": [],
         "armed": [],
         "background": [],
         "clients": [],
@@ -768,6 +781,8 @@
         "extensions": null,
         "links": [],
         "open": [],
+        "outbox": [],
+        "received": [],
         "seq": 4,
         "turn": 1,
         "untaken": [],
@@ -843,7 +858,7 @@
     ]
   },
   {
-    "hash": "ee68e666b82ebfa4",
+    "hash": "b22678dc0d0d112f",
     "messages": [
       {
         "session": "00000000-0000-0000-0000-00000000000a",
@@ -902,6 +917,7 @@
         }
       ],
       "ledger": {
+        "acknowledgements": [],
         "armed": [],
         "background": [],
         "clients": [],
@@ -917,6 +933,8 @@
           }
         ],
         "open": [],
+        "outbox": [],
+        "received": [],
         "seq": 3,
         "turn": 0,
         "untaken": [],
@@ -987,7 +1005,7 @@
     ]
   },
   {
-    "hash": "f98ad5c1bb0f4165",
+    "hash": "77894b63878a3566",
     "messages": [
       {
         "session": "00000000-0000-0000-0000-00000000000a",
@@ -1061,6 +1079,7 @@
         }
       ],
       "ledger": {
+        "acknowledgements": [],
         "armed": [],
         "background": [],
         "clients": [],
@@ -1069,6 +1088,8 @@
         "extensions": null,
         "links": [],
         "open": [],
+        "outbox": [],
+        "received": [],
         "seq": 3,
         "turn": 3,
         "untaken": [],
@@ -1162,7 +1183,7 @@
     ]
   },
   {
-    "hash": "3477bf9eb6b56d0f",
+    "hash": "06224d84569c39a0",
     "messages": [
       {
         "session": "00000000-0000-0000-0000-00000000000a",
@@ -1204,6 +1225,7 @@
         }
       ],
       "ledger": {
+        "acknowledgements": [],
         "armed": [],
         "background": [],
         "clients": [],
@@ -1216,6 +1238,8 @@
         "extensions": null,
         "links": [],
         "open": [],
+        "outbox": [],
+        "received": [],
         "seq": 2,
         "turn": 0,
         "untaken": [],
@@ -1259,7 +1283,7 @@
     ]
   },
   {
-    "hash": "204eab33a89f2660",
+    "hash": "fd21c961a131ddf7",
     "messages": [
       {
         "session": "00000000-0000-0000-0000-00000000000a",
@@ -1388,6 +1412,7 @@
         }
       ],
       "ledger": {
+        "acknowledgements": [],
         "armed": [],
         "background": [],
         "clients": [],
@@ -1396,6 +1421,8 @@
         "extensions": null,
         "links": [],
         "open": [],
+        "outbox": [],
+        "received": [],
         "seq": 6,
         "turn": 4,
         "untaken": [],
@@ -1497,7 +1524,7 @@
     ]
   },
   {
-    "hash": "46cc360b6d40d957",
+    "hash": "e0bf1ddc934999b4",
     "messages": [
       {
         "session": "00000000-0000-0000-0000-00000000000a",
@@ -1566,6 +1593,7 @@
           }
         ],
         "ledger": {
+          "acknowledgements": [],
           "armed": [],
           "background": [],
           "clients": [],
@@ -1606,6 +1634,8 @@
               }
             ]
           ],
+          "outbox": [],
+          "received": [],
           "seq": 4,
           "turn": 1,
           "untaken": [],
@@ -1667,6 +1697,7 @@
         }
       ],
       "ledger": {
+        "acknowledgements": [],
         "armed": [],
         "background": [],
         "clients": [],
@@ -1707,6 +1738,8 @@
             }
           ]
         ],
+        "outbox": [],
+        "received": [],
         "seq": 5,
         "turn": 1,
         "untaken": [],
@@ -1814,7 +1847,7 @@
     ]
   },
   {
-    "hash": "1ad2f9e92171052d",
+    "hash": "612b4922e782b6c6",
     "messages": [
       {
         "session": "00000000-0000-0000-0000-00000000000a",
@@ -2366,6 +2399,7 @@
         }
       ],
       "ledger": {
+        "acknowledgements": [],
         "armed": [],
         "background": [],
         "clients": [],
@@ -2429,6 +2463,8 @@
             }
           ]
         ],
+        "outbox": [],
+        "received": [],
         "seq": 30,
         "turn": 22,
         "untaken": [],
@@ -3003,7 +3039,7 @@
     ]
   },
   {
-    "hash": "baefe59d9904a388",
+    "hash": "2aa8621eebfe2459",
     "messages": [
       {
         "session": "00000000-0000-0000-0000-00000000000a",
@@ -3152,6 +3188,7 @@
         }
       ],
       "ledger": {
+        "acknowledgements": [],
         "armed": [],
         "background": [],
         "clients": [],
@@ -3167,6 +3204,8 @@
           }
         ],
         "open": [],
+        "outbox": [],
+        "received": [],
         "seq": 8,
         "turn": 0,
         "untaken": [],

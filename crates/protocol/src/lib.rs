@@ -13,11 +13,11 @@ use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
 /// The protocol this build speaks best.
-pub const PROTO: u32 = 10;
+pub const PROTO: u32 = 11;
 
 /// The oldest protocol this build still speaks: a peer whose range
 /// overlaps `PROTO_MIN..=PROTO` is served at the highest version both speak.
-pub const PROTO_MIN: u32 = 10;
+pub const PROTO_MIN: u32 = 11;
 
 const MAX_FRAME: u32 = 16 * 1024 * 1024;
 
@@ -290,6 +290,9 @@ kinds! {
         Link "link" { child: SessionId, input: String, intent: Json } = Durable;
         /// A durable watch on `child`: when it settles, its result comes back
         /// as a `fired` under this entry's seq, which is the idempotency key.
+        Outbox "outbox" { envelope: Envelope } = Durable;
+        Enqueue "enqueue" { envelope: Envelope } = Durable;
+        Ack "ack" { envelope_id: EnvelopeId, refusal: Option<InboxRefusal> = default } = Durable;
         Spawned "spawned" { intent: Json } = Durable;
         Watch "watch" { child: SessionId } = Durable;
         /// Watch `watch` fired, with its child's result. Logged at most once
@@ -1419,6 +1422,28 @@ fn read_body(r: &mut dyn Read) -> io::Result<Option<Vec<u8>>> {
     Ok(Some(body))
 }
 
+/// Sender-local identity remains stable across retries and receiver restarts.
+#[derive(Clone, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub struct EnvelopeId {
+    pub sender: SessionId,
+    pub call: CallId,
+    pub purpose: String,
+}
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Envelope {
+    pub id: EnvelopeId,
+    pub destination: SessionId,
+    pub payload: String,
+}
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub enum InboxRefusal {
+    Full,
+    Unavailable,
+    Unauthorized,
+    Interrupted,
+}
+pub const INBOX_CAPACITY: usize = 128;
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1863,7 +1888,7 @@ mod tests {
         let child = SessionId(Uuid::from_u128(1));
         let entries = [
             Body::Link {
-                intent: Default::default(),
+                intent: Json::null(),
                 child,
                 input: "hi".into(),
             },

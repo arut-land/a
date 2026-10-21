@@ -1,33 +1,133 @@
 //! Admission freezes authority before any child is created.
-use super::*;
+use super::{
+    Actor, Arc, Body, BoxFuture, CallId, Child, ContextRequest, Cx, Deserialize, Event, InFlight,
+    Json, Live, Open, Outcome, Own, Registry, Serialize, SessionId, Shared, lock, oneshot, or,
+};
+use crate::store::Header;
 use ext::{DepthBudget, SpawnRefusal};
+use std::io;
 
 #[derive(Clone, Serialize, Deserialize)]
 pub(crate) struct SpawnIntent {
+    pub awaited: bool,
+    pub admitted_at: std::time::SystemTime,
     pub call: CallId,
     pub request: ext::Spawn,
     pub model: String,
+    pub routing: Result<crate::model::FrozenRoute, String>,
     pub installed: Vec<protocol::Installed>,
     pub image: Vec<Json>,
     pub refusal: Option<SpawnRefusal>,
 }
 
-pub(crate) fn spawn_image(entries: impl IntoIterator<Item = Entry>) -> Option<SpawnIntent> {
-    entries.into_iter().find_map(|entry| match entry.body {
-        Body::Spawned { intent } => intent.parse().ok(),
-        _ => None,
-    })
+pub(super) enum SpawnReply {
+    Awaited(oneshot::Sender<Json>),
+    Detached(oneshot::Sender<Result<ext::ConversationHandle, SpawnRefusal>>),
 }
 
 impl Actor {
     pub(super) fn open_spawn(
         &mut self,
         call: CallId,
-        mut request: ext::Spawn,
-        reply: oneshot::Sender<Json>,
+        request: ext::Spawn,
+        reply: SpawnReply,
     ) -> Option<Event> {
-        let previous = self
-            .core
+        let previous = self.recorded_spawn(call, &request);
+        let awaited = matches!(reply, SpawnReply::Awaited(_));
+        match reply {
+            SpawnReply::Detached(reply) => {
+                if let Some(link) = previous {
+                    let refusal = link
+                        .intent
+                        .parse::<SpawnIntent>()
+                        .ok()
+                        .and_then(|i| i.refusal);
+                    reply.send(refusal.map_or(
+                        Ok(ext::ConversationHandle {
+                            session: link.child,
+                        }),
+                        Err,
+                    ));
+                    return None;
+                }
+                // Filled with the admitted id below; this sender stays behind the commit barrier.
+                self.detached.push((SessionId::new(), reply));
+            }
+            SpawnReply::Awaited(reply) => {
+                if let Some(link) = &previous {
+                    let entries: Vec<_> = self
+                        .live
+                        .frames
+                        .entries()
+                        .chain(
+                            self.unsynced
+                                .iter()
+                                .flat_map(|(entries, _)| entries.iter().cloned()),
+                        )
+                        .collect();
+                    let watch = entries.iter().find_map(|e| match e.body {
+                        Body::Watch { child } if child == link.child => Some(e.seq),
+                        _ => None,
+                    });
+                    let outcome = watch.and_then(|watch| {
+                        entries.iter().find_map(|e| match &e.body {
+                            Body::Fired {
+                                watch: fired,
+                                outcome,
+                            } if *fired == watch => Some(outcome.clone()),
+                            _ => None,
+                        })
+                    });
+                    if let Some(outcome) = outcome {
+                        let refusal = link
+                            .intent
+                            .parse::<SpawnIntent>()
+                            .ok()
+                            .and_then(|i| i.refusal);
+                        let value = refusal.map_or_else(
+                            || Json::encode(&outcome).unwrap(),
+                            |r| Json::encode(&Result::<Outcome, _>::Err(r)).unwrap(),
+                        );
+                        reply.send(value);
+                        return None;
+                    }
+                }
+                let Some(InFlight::Tool(child)) = self.inflight.get_mut(&call) else {
+                    return None;
+                };
+                if matches!(child, Child::Waiting(_)) {
+                    reply.send(
+                        Json::encode(&Result::<Outcome, _>::Err(SpawnRefusal::Unavailable(
+                            "the call already awaits a child".into(),
+                        )))
+                        .unwrap(),
+                    );
+                    return None;
+                }
+                *child = Child::Waiting(reply);
+                if previous.is_some() {
+                    return None;
+                }
+            }
+        }
+
+        let frozen = self.freeze_spawn(call, request, awaited);
+        let input = frozen.request.prompt.clone();
+        let intent = Json::encode(&frozen).expect("spawn intent encodes");
+        let child = SessionId::new();
+        if !awaited {
+            self.detached.last_mut().unwrap().0 = child;
+        }
+        Some(Event::Spawn {
+            call,
+            child,
+            input,
+            intent,
+            wait: awaited,
+        })
+    }
+    fn recorded_spawn(&self, call: CallId, request: &ext::Spawn) -> Option<protocol::ledger::Link> {
+        self.core
             .ledger()
             .links()
             .iter()
@@ -38,20 +138,10 @@ impl Actor {
                         && i.request.purpose == request.purpose
                 })
             })
-            .cloned();
-        let Some(InFlight::Tool(child)) = self.inflight.get_mut(&call) else {
-            return None;
-        };
-        if let Child::Answered(value) = std::mem::replace(child, Child::Waiting(reply)) {
-            let Child::Waiting(reply) = std::mem::replace(child, Child::None) else {
-                unreachable!()
-            };
-            reply.send(value);
-            return None;
-        }
-        if previous.is_some() {
-            return None;
-        }
+            .cloned()
+    }
+
+    fn freeze_spawn(&self, call: CallId, mut request: ext::Spawn, awaited: bool) -> SpawnIntent {
         let allowance = lock(&self.live.session.spawn)
             .as_ref()
             .map_or(DepthBudget::new(u16::MAX), |i| i.request.depth);
@@ -64,21 +154,38 @@ impl Actor {
                 refusal = Some(SpawnRefusal::Unavailable(format!(
                     "unknown child agent {}",
                     request.runner.agent
-                )))
+                )));
             }
             Ok(_) => {}
         }
         let session = &self.live.session;
-        let model = match request.runner.role {
-            ext::ModelRole::Session => session.model_named().map(|(m, _)| m),
-            ext::ModelRole::Fast => session
-                .shared
-                .models
-                .settings
-                .fast_model(&session.workspace)
-                .and_then(|m| m.map_or_else(|| session.model_named().map(|(m, _)| m), Ok)),
+        let selected = match &request.runner.role {
+            ext::ModelRole::Named(role) => self
+                .registry
+                .service::<dyn ext::ModelRoles>()
+                .ok_or_else(|| format!("no model service resolves role {role}"))
+                .and_then(|roles| {
+                    roles.model(
+                        role,
+                        &lock(&session.state_view()),
+                        &session.shared.models.settings,
+                        &session.workspace,
+                    )
+                }),
+            role => session.role_model(role),
+        };
+        if matches!(request.runner.role, ext::ModelRole::Named(_))
+            && let Err(error) = &selected
+        {
+            refusal = Some(SpawnRefusal::Unavailable(error.clone()));
         }
-        .unwrap_or_else(|_| "none".into());
+        let model = selected.unwrap_or_else(|_| "none".into());
+        let env = lock(&session.env).clone();
+        let routing = session
+            .shared
+            .models
+            .model(&session.workspace, env.as_deref(), &model)
+            .map(|m| m.freeze());
         let mut image = Vec::new();
         let mut installed = self.registry.installed();
         if let ext::ContextSource::Prefix { session, seq } = request.context {
@@ -102,32 +209,55 @@ impl Actor {
                     Body::Extensions { installed } => Some(installed),
                     _ => None,
                 }) {
-                    installed = source.clone();
+                    installed.clone_from(source);
                 }
                 image = crate::transcript::context_image(&entries);
             }
         }
-        let input = request.prompt.clone();
-        let intent = Json::encode(&SpawnIntent {
+        SpawnIntent {
+            awaited,
+            admitted_at: std::time::SystemTime::now(),
             call,
             request,
             model,
+            routing,
             installed,
             image,
             refusal,
-        })
-        .expect("spawn intent encodes");
-        Some(Event::Spawn {
-            call,
-            child: SessionId::new(),
-            input,
-            intent,
-            wait: true,
-        })
+        }
     }
 }
 
 impl ext::Sessions for Own {
+    fn send<'a>(
+        &'a self,
+        _cx: &'a Cx,
+        message: ext::SendMessage,
+    ) -> BoxFuture<'a, Result<(), protocol::InboxRefusal>> {
+        self.send_message(message)
+    }
+
+    fn detach<'a>(
+        &'a self,
+        _cx: &'a Cx,
+        request: ext::Detached<ext::Spawn>,
+    ) -> BoxFuture<'a, Result<ext::ConversationHandle, SpawnRefusal>> {
+        Box::pin(async move {
+            let session = self.0.upgrade().ok_or(SpawnRefusal::Interrupted)?;
+            if !self.1.current(&session) {
+                return Err(SpawnRefusal::Interrupted);
+            }
+            let (reply, result) = oneshot::channel();
+            self.1.send(
+                &session,
+                ContextRequest::Child {
+                    request: request.0,
+                    reply: SpawnReply::Detached(reply),
+                },
+            );
+            result.await.unwrap_or(Err(SpawnRefusal::Interrupted))
+        })
+    }
     fn runner(&self) -> ext::Runner {
         let agent = self
             .0
@@ -160,7 +290,7 @@ impl ext::Sessions for Own {
                 &session,
                 ContextRequest::Child {
                     request: request.0,
-                    reply,
+                    reply: SpawnReply::Awaited(reply),
                 },
             );
             let value = result.await.ok_or(SpawnRefusal::Interrupted)?;
@@ -172,4 +302,69 @@ impl ext::Sessions for Own {
                 .unwrap_or(Err(SpawnRefusal::Interrupted))
         })
     }
+}
+
+impl Live {
+    pub(crate) fn pending_child(&self, child: SessionId) -> bool {
+        let mut watch = None;
+        for entry in self.frames.entries() {
+            match entry.body {
+                Body::Watch { child: watched } if watched == child => watch = Some(entry.seq),
+                Body::Fired { watch: fired, .. } if Some(fired) == watch => return false,
+                _ => {}
+            }
+        }
+        watch.is_some()
+    }
+
+    pub(crate) fn bound(self: Arc<Self>, budget: ext::Budget) {
+        let runtime = Arc::clone(&self.session.shared.rt);
+        let clock = Arc::clone(&runtime);
+        runtime.spawn(Box::pin(async move {
+            let finished = async {
+                self.session.changed.until(|| !self.has_work()).await;
+                true
+            };
+            if !or(finished, async {
+                clock.sleep(budget.timeout).await;
+                false
+            })
+            .await
+            {
+                self.interrupt();
+            }
+        }));
+    }
+}
+
+pub(super) fn restore(
+    header: &Header,
+    shared: &Shared,
+    open: Open,
+    source: Option<&Arc<dyn ext::host::Generations>>,
+) -> io::Result<(Arc<Registry>, Option<SpawnIntent>)> {
+    let image = if matches!(open, Open::Load) && header.parent.is_some() {
+        let entries = shared.store.prefix(header.id, 1)?;
+        let Body::Spawned { intent } = &entries[0].body else {
+            return Err(io::Error::other("child has no spawn authority"));
+        };
+        Some(intent.parse::<SpawnIntent>().map_err(io::Error::other)?)
+    } else {
+        None
+    };
+    let registry = if let Some(image) = &image {
+        super::recorded_registry(shared, source, Some(&image.installed))?
+    } else {
+        match (source, open) {
+            (Some(source), Open::Load) => super::load_registry(header, shared, source)?,
+            (Some(source), Open::Create) => source.registry(),
+            (None, _) => shared.registry.get(),
+        }
+    };
+    let registry = if header.parent.is_some() {
+        Arc::new(registry.inherited().map_err(io::Error::other)?)
+    } else {
+        registry
+    };
+    Ok((registry, image))
 }

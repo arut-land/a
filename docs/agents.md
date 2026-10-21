@@ -4,13 +4,12 @@ This document specifies the conversation primitives for composable agents.
 Side threads and the metrics projection are follow-up work, not part of the
 initial implementation.
 
-Implementation status: registration inheritance and nested conversation storage
-are implemented. Typed spawn requests and private depth budgets are defined in
-the SDK, and awaited admission records the runner, extension manifest and
-remaining depth before creating the child. Prefix-context children are available through `fork_task`; their immutable
-projection images never fold ownership into the child. Detached SDK execution
-and durable messaging below remain planned. This document must not
-be read as claiming that those modes are available yet.
+Implementation status: typed awaited and detached spawning, immutable prefix
+images, inherited registrations, nested storage, durable inbox transport and
+depth enforcement are implemented. `ext-subagent` supplies `task`, `fork_task`
+and `background_task`. Side threads, named channels, questions and metrics
+remain follow-up compositions. The current inbox access policy permits parent
+and child edges; `InboxAccess` is the extension seam for other policies.
 
 A conversation owns an ordered log, an inbox and a
 runner. Main sessions, child agents and side threads differ in their runner
@@ -46,7 +45,11 @@ accepts the awaited type to return an `Outcome`; its detached method returns
 only a durable conversation handle after admission. A detached handle is not
 a future. Modes compose these constructors in tool implementations; no config
 flag selects execution semantics. An extension namespace and purpose name
-allow several children per call without positional identities.
+allow several children per call without positional identities. Calls can await
+several purposes in sequence or admit several detached children. The current
+kernel has one active child wait per tool call; overlapping awaited requests
+receive a typed refusal instead of replacing a live waiter. This initial limit
+keeps the existing wait lifecycle singular; a multi-watch join is follow-up.
 
 `DepthBudget` is a private-field value constructed with a maximum remaining
 edge count. Descending consumes one level and returns a smaller budget or
@@ -54,7 +57,9 @@ exhaustion. The engine intersects a requested budget with the parent's
 remaining allowance, so a recursive tool cannot reset its depth. Persist the
 remaining budget in the spawn intent. Static constructors may use const depth
 parameters, but a runtime check is necessary at erased extension boundaries
-and when restoring serialized data. Token and elapsed-time allowances use the
+and when restoring serialized data. The token allowance bounds each model
+response. The duration bounds the owned child's work; admission time is persisted so recovery subtracts elapsed time
+rather than replenishing it. Token and elapsed-time allowances use the
 existing positive token limit and duration types; they are not currency caps.
 
 A prefix child inherits the effective conversation through the chosen seq,
@@ -66,7 +71,15 @@ process groups, watches or pending actions into the child's kernel. This lets
 a tool fork its current context while its owning turn is unfinished. It is
 separate from the ordinary fork command's rest-point policy. Pending tool
 calls do not become executable work or unmatched provider tool exchanges in
-the child's context. Extension generation images accompany the prefix; only
+the child's context. The image stores transcript projection inputs inside the
+spawn authority,
+rather than installing those entries in the child's executable log. Unfinished
+tool intents and queued inputs are excluded, and unmatched provider exchanges
+are removed after projection. Keeping projection inputs preserves provider
+state and uses the same reducer for live and recovered context. Effective skill
+publication identities are restored with the image, so an inherited skill is
+not published again merely because its source has a different sequence space.
+Extension generation images accompany the prefix; only
 explicitly inheritable state is restored into the child.
 
 ## Inheritance
@@ -128,7 +141,7 @@ Send commits an outbox intent before delivery. The receiver commits enqueue
 and deduplicates by envelope id before acknowledging. The sender then records
 acknowledgement. Recovery resends unacknowledged envelopes with the same id;
 this is at-least-once transport with exactly-once logged enqueue. Receiver
-sequence numbers define order. Each sender serializes sends to a destination;
+sequence numbers define order. Each sender serializes its durable outbox;
 concurrent senders are ordered by receiver admission, not wall clocks.
 
 The receiver records `Take` with the enqueue identity at a step boundary,
@@ -136,7 +149,8 @@ before the input influences an agent or request. Folding the log reconstructs
 both queued and consumed input. Messages arriving during a provider request
 wait for its next step. Context edits cannot undo delivery. Forks copy consumed
 context but do not replay outbound effects; queued external messages require
-an explicit fork policy and default to refusal. Bounded inbox admission
+an explicit fork policy and default to refusal. Inbox admission is bounded to
+128 queued envelopes and
 returns a typed refusal rather than silently dropping input.
 
 A question is a message carrying a correlation id and a reply address. An

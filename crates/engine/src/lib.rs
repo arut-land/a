@@ -560,6 +560,17 @@ impl Daemon {
             }
             _ => {}
         }
+        if let Target::Id(id) = target
+            && self.slot(*id).is_none()
+        {
+            self.pulse
+                .until(|| {
+                    self.slot(*id).is_some()
+                        || !self.loaded().iter().any(|live| live.pending_child(*id))
+                        || !*lock(&self.admission)
+                })
+                .await;
+        }
         let slot = self.find(target, workspace)?;
         Ok(self.live(&slot).await?.open())
     }
@@ -685,6 +696,7 @@ impl Daemon {
             },
         );
         lock(&self.slots).push(Arc::clone(&slot));
+        self.pulse.notify();
         Ok(slot)
     }
 
@@ -699,12 +711,20 @@ impl Daemon {
         env: Option<Arc<Environment>>,
         intent: Json,
     ) -> io::Result<()> {
+        let admitted = intent
+            .parse::<driver::spawn::SpawnIntent>()
+            .map_err(io::Error::other)?;
+        let mut budget = admitted.request.budget;
+        budget.timeout = budget
+            .timeout
+            .saturating_sub(admitted.admitted_at.elapsed().unwrap_or_default());
         let live = if let Some(slot) = self.slot(header.id) {
             self.live(&slot).await?
         } else {
+            let slot = self.new_slot(header.clone())?;
             let shared = Arc::clone(&self.shared);
             let imported = header.clone();
-            rt::unblock(&*self.shared.rt, move || {
+            let imported = rt::unblock(&*self.shared.rt, move || {
                 let entry = Entry::new(
                     protocol::Seq::new(1).unwrap(),
                     protocol::Epoch(0),
@@ -712,8 +732,10 @@ impl Daemon {
                 );
                 shared.catalog.import(&*shared.store, &imported, &[entry])
             })
-            .await?;
-            let slot = self.new_slot(header)?;
+            .await;
+            if let Err(error) = imported {
+                return self.started(&slot, Err(error)).map(|_| ());
+            }
             self.start(&slot, Open::Load).await?
         };
         if !live.has_input() {
@@ -726,7 +748,19 @@ impl Daemon {
             };
             live.request(input, None).await.map_err(io::Error::other)?;
         }
+        live.bound(budget);
         Ok(())
+    }
+
+    async fn deliver(&self, envelope: protocol::Envelope) -> Result<(), protocol::InboxRefusal> {
+        let slot = self
+            .slot(envelope.destination)
+            .ok_or(protocol::InboxRefusal::Unavailable)?;
+        let live = self
+            .live(&slot)
+            .await
+            .map_err(|_| protocol::InboxRefusal::Unavailable)?;
+        live.enqueue(envelope).await
     }
 
     /// Hands child `child`'s result to session `parent`, unless it is

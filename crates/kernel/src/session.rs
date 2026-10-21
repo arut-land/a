@@ -198,6 +198,11 @@ impl Core {
                 decisions,
                 answered,
             } => self.prepared(call, decisions, answered, &mut fx),
+            Event::SendEnvelope { envelope, ticket } => {
+                self.send_envelope(envelope, ticket, &mut fx);
+            }
+            Event::Enqueue { envelope, ticket } => self.enqueue(envelope, ticket, &mut fx),
+            Event::Delivered { id, result, ticket } => self.delivered(id, result, ticket, &mut fx),
             Event::ChildSettled { child, outcome } => self.child_settled(child, outcome, &mut fx),
             Event::Registry(registry) => {
                 if self.at_rest() {
@@ -228,6 +233,7 @@ impl Core {
             && self.deferred.is_empty()
             && self.fold.ledger.untaken().is_empty()
             && self.fold.ledger.open_calls().next().is_none()
+            && self.fold.ledger.pending_outbox().next().is_none()
     }
 
     /// What the log says now, through the last entry appended.
@@ -256,6 +262,8 @@ impl Core {
                 | Effect::Recover { .. }
                 | Effect::Kill { .. } => Some(Requirement::Ordered),
                 Effect::Reply { .. }
+                | Effect::Deliver { .. }
+                | Effect::Delivery { .. }
                 | Effect::Side { .. }
                 | Effect::StartChild { .. }
                 | Effect::Interrupt { .. }
@@ -313,6 +321,81 @@ impl Core {
         }
     }
 
+    fn send_envelope(&mut self, envelope: protocol::Envelope, ticket: Ticket, fx: &mut Effects) {
+        let id = &envelope.id;
+        if let Some(refusal) = self.fold.ledger.acknowledged(id) {
+            fx.push(Effect::Delivery {
+                ticket,
+                result: refusal.clone().map_or(Ok(()), Err),
+            });
+        } else {
+            let envelope = self
+                .fold
+                .ledger
+                .outbox()
+                .iter()
+                .find(|e| e.id == *id)
+                .cloned()
+                .unwrap_or(envelope);
+            if !self
+                .fold
+                .ledger
+                .outbox()
+                .iter()
+                .any(|e| e.id == envelope.id)
+            {
+                self.append(
+                    fx,
+                    Body::Outbox {
+                        envelope: envelope.clone(),
+                    },
+                );
+            }
+            fx.push(Effect::Deliver {
+                envelope,
+                ticket: Some(ticket),
+            });
+        }
+    }
+
+    fn enqueue(&mut self, envelope: protocol::Envelope, ticket: Ticket, fx: &mut Effects) {
+        let result = if self.fold.ledger.received(&envelope.id) {
+            Ok(())
+        } else if self.fold.ledger.inbox_len() >= protocol::INBOX_CAPACITY {
+            Err(protocol::InboxRefusal::Full)
+        } else {
+            self.append(fx, Body::Enqueue { envelope });
+            Ok(())
+        };
+        fx.push(Effect::Delivery { ticket, result });
+    }
+
+    fn delivered(
+        &mut self,
+        id: protocol::EnvelopeId,
+        result: Result<(), protocol::InboxRefusal>,
+        ticket: Option<Ticket>,
+        fx: &mut Effects,
+    ) {
+        let result = self
+            .fold
+            .ledger
+            .acknowledged(&id)
+            .map_or(result, |r| r.clone().map_or(Ok(()), Err));
+        if self.fold.ledger.acknowledged(&id).is_none() {
+            self.append(
+                fx,
+                Body::Ack {
+                    envelope_id: id,
+                    refusal: result.clone().err(),
+                },
+            );
+        }
+        if let Some(ticket) = ticket {
+            fx.push(Effect::Delivery { ticket, result });
+        }
+    }
+
     // ── events ────────────────────────────────────────────────────────
 
     fn input(
@@ -358,6 +441,16 @@ impl Core {
     /// in any state: what waits settles at once, what runs is cancelled and
     /// settles as it reports.
     fn interrupt(&mut self, origin: Option<Author>, fx: &mut Effects) {
+        let detached: Vec<_> = self
+            .fold
+            .ledger
+            .armed()
+            .filter_map(|(_, child)| self.fold.owner(child).is_none().then_some(child))
+            .collect();
+        for child in detached {
+            fx.push(Effect::Interrupt { child });
+            self.fire(child, &Outcome::Interrupted { output: None }, fx);
+        }
         let sides: Vec<_> = self
             .fold
             .ledger
@@ -959,6 +1052,28 @@ impl Core {
                 }
                 Turn::Acting { .. } | Turn::Idle => {}
             }
+            let next_request = matches!(&self.turn, Turn::Acting { open } if open.is_empty())
+                && matches!(
+                    self.fold.asked.front(),
+                    Some(Next::Agent(Action::CallModel { .. }))
+                );
+            if next_request {
+                if let Some((child, outcome)) = self.deferred.pop_front() {
+                    self.fire(child, &outcome, fx);
+                    continue;
+                }
+                if let Some(input) = self
+                    .fold
+                    .ledger
+                    .untaken()
+                    .front()
+                    .filter(|q| self.fold.ledger.enqueued(q.seq))
+                    .map(|q| q.seq)
+                {
+                    self.append(fx, Body::Take { input });
+                    continue;
+                }
+            }
             if let Some(next) = self.fold.asked.front().cloned() {
                 if !matches!(&self.turn, Turn::Acting { open } if !open.is_empty()) {
                     self.turn = Turn::Acting {
@@ -1244,7 +1359,8 @@ impl Core {
                 .any(|&(call, step)| step != Step::Waiting || self.child_of(call).is_some()),
             Turn::Model { .. } | Turn::Stopping { .. } => true,
         };
-        let busy = working || queued || armed;
+        let outgoing = ledger.pending_outbox().next().is_some();
+        let busy = working || queued || armed || outgoing;
         if busy != self.busy {
             self.busy = busy;
             // Marked before the work starts, cleared after it ends.
@@ -1256,7 +1372,7 @@ impl Core {
         }
         // Settled with something new since it last reported (one given no
         // input yet has not run).
-        let settled = self.turn == Turn::Idle && !queued && !armed;
+        let settled = self.turn == Turn::Idle && !queued && !armed && !outgoing;
         let ran = ledger.turn_start() > 0;
         if settled && self.child && ran && ledger.seq() > self.reported {
             self.reported = ledger.seq();
@@ -1327,6 +1443,18 @@ impl Core {
     /// Re-arms links: a link not yet watched is watched, and every child
     /// still watched is started, so it runs to its end and reports back.
     fn relink(&mut self, fx: &mut Effects) {
+        for envelope in self
+            .fold
+            .ledger
+            .outbox()
+            .iter()
+            .filter(|e| self.fold.ledger.acknowledged(&e.id).is_none())
+        {
+            fx.push(Effect::Deliver {
+                envelope: envelope.clone(),
+                ticket: None,
+            });
+        }
         let ledger = &self.fold.ledger;
         let links: SmallVec<[_; 1]> = (ledger.links().iter())
             .filter_map(|link| {

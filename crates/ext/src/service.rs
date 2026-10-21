@@ -63,10 +63,21 @@ pub trait Models: Send + Sync {
 }
 
 /// Routing intent, never a provider model id.
-#[derive(Clone, Copy, Debug, serde::Serialize, serde::Deserialize)]
+#[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
 pub enum ModelRole {
     Session,
     Fast,
+    Named(String),
+}
+
+pub trait ModelRoles: Send + Sync {
+    fn model(
+        &self,
+        role: &str,
+        states: &States,
+        layers: &dyn Layers,
+        workspace: &Path,
+    ) -> Result<String, String>;
 }
 
 /// The immutable transcript prefix visible to a side request.
@@ -210,8 +221,28 @@ impl Default for Budget {
 
 /// Child sessions: a call starts one it owns and waits for what it settles
 /// with. The engine provides it.
+/// An extension chooses which ownership edges may carry messages.
+pub trait InboxAccess: Send + Sync {
+    fn permits(
+        &self,
+        destination: protocol::SessionId,
+        parent: Option<protocol::SessionId>,
+        children: &[protocol::SessionId],
+    ) -> bool;
+}
+
 pub trait Sessions: Send + Sync {
     fn runner(&self) -> crate::Runner;
+    fn send<'a>(
+        &'a self,
+        cx: &'a Cx,
+        message: crate::SendMessage,
+    ) -> BoxFuture<'a, Result<(), protocol::InboxRefusal>>;
+    fn detach<'a>(
+        &'a self,
+        cx: &'a Cx,
+        request: crate::Detached<crate::Spawn>,
+    ) -> BoxFuture<'a, Result<crate::ConversationHandle, crate::SpawnRefusal>>;
     /// What a child session started on `input` settles with. The child is
     /// the call's own: started once however often the call runs again (as
     /// recovery runs it), and heard from once. An interrupt of the call's

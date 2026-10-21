@@ -42,6 +42,25 @@ impl Models {
     }
 }
 
+#[derive(Clone, serde::Serialize, serde::Deserialize)]
+pub(crate) struct FrozenRoute {
+    spec: String,
+    base_url: String,
+}
+
+impl Models {
+    pub(crate) fn routed(
+        &self,
+        workspace: &Path,
+        env: Option<&Environment>,
+        route: &FrozenRoute,
+    ) -> Result<Model, String> {
+        let mut model = self.model(workspace, env, &route.spec)?;
+        model.provider.base_url.clone_from(&route.base_url);
+        Ok(model)
+    }
+}
+
 pub struct Model {
     provider: Provider,
     id: llm::SmolStr,
@@ -49,6 +68,15 @@ pub struct Model {
 }
 
 impl Model {
+    pub(crate) fn freeze(&self) -> FrozenRoute {
+        let wire = self.provider.protocol.key();
+        let wire = wire.as_str().rsplit('.').next().unwrap();
+        FrozenRoute {
+            spec: format!("{}@{}:{}", self.provider.id, wire, self.id),
+            base_url: self.provider.base_url.clone(),
+        }
+    }
+
     /// How a call to this model is recorded: `host:model`.
     pub fn name(&self) -> String {
         format!("{}:{}", self.provider.id, self.id)

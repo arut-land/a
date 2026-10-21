@@ -116,6 +116,10 @@ impl Transcript {
                 d: Verdict::OnStop { text },
                 ..
             } => Message::user(text.clone()),
+            Body::Enqueue { envelope } => {
+                self.waiting.insert(e.seq, envelope.payload.clone());
+                return;
+            }
             Body::Input { text, .. } => {
                 self.waiting.insert(e.seq, text.clone());
                 return;
@@ -197,6 +201,15 @@ impl Transcript {
 
     /// Pending exchanges cannot be replayed by a context-only child.
     pub fn into_context(self) -> Messages {
+        let requested: std::collections::HashSet<_> = self
+            .messages
+            .iter()
+            .filter_map(|m| match m {
+                Message::Assistant(a) => Some(a.tool_calls().map(|c| c.id.clone())),
+                _ => None,
+            })
+            .flatten()
+            .collect();
         let answered: std::collections::HashSet<_> = self
             .messages
             .iter()
@@ -207,9 +220,16 @@ impl Transcript {
             .flatten()
             .collect();
         self.messages.iter().cloned().filter_map(|mut m| {
-            if let Message::Assistant(a) = &mut m {
-                a.content.retain(|p| !matches!(p, llm::AssistantPart::ToolCall(c) if !c.provider_executed && !answered.contains(&c.id)));
-                if a.content.is_empty() { return None; }
+            match &mut m {
+                Message::Assistant(a) => {
+                    a.content.retain(|p| !matches!(p, llm::AssistantPart::ToolCall(c) if !c.provider_executed && !answered.contains(&c.id)));
+                    if a.content.is_empty() { return None; }
+                }
+                Message::Tool(t) => {
+                    t.results.retain(|r| requested.contains(&r.id));
+                    if t.results.is_empty() { return None; }
+                }
+                _ => {},
             }
             Some(m)
         }).collect()
@@ -222,22 +242,35 @@ impl Transcript {
 
 /// The image contains projection inputs, never an executable child ledger.
 pub(crate) fn context_image(entries: &[Entry]) -> Vec<protocol::Json> {
+    let completed: std::collections::HashSet<_> = entries
+        .iter()
+        .filter_map(|e| match e.body {
+            Body::ToolResult { call, .. } => Some(call),
+            _ => None,
+        })
+        .collect();
+    let taken_inputs: std::collections::HashSet<_> = entries
+        .iter()
+        .filter_map(|e| match e.body {
+            Body::Take { input } => Some(input),
+            _ => None,
+        })
+        .collect();
     entries
         .iter()
-        .filter(|e| {
-            matches!(
-                e.body,
-                Body::Input { .. }
-                    | Body::Take { .. }
-                    | Body::Assistant { .. }
-                    | Body::Context { .. }
-                    | Body::Edit { .. }
-                    | Body::ModelResult { r#for: None, .. }
-                    | Body::ToolCall { .. }
-                    | Body::ToolResult { .. }
-                    | Body::Fired { .. }
-                    | Body::Spawned { .. }
-            )
+        .filter(|e| match e.body {
+            Body::ToolCall { .. } => completed.contains(&CallId(e.seq)),
+            Body::Input { taken, .. } => taken || taken_inputs.contains(&e.seq),
+            Body::Enqueue { .. } => taken_inputs.contains(&e.seq),
+            Body::Take { .. }
+            | Body::Assistant { .. }
+            | Body::Context { .. }
+            | Body::Edit { .. }
+            | Body::ModelResult { r#for: None, .. }
+            | Body::ToolResult { .. }
+            | Body::Fired { .. }
+            | Body::Spawned { .. } => true,
+            _ => false,
         })
         .map(|e| protocol::Json::encode(e).expect("context entry encodes"))
         .collect()
@@ -305,7 +338,7 @@ mod tests {
         assert!(
             inherited
                 .iter()
-                .all(|e| !matches!(e.body, Body::Watch { .. }))
+                .all(|e| !matches!(e.body, Body::Watch { .. } | Body::ToolCall { .. }))
         );
         let registry = Arc::new(Registry::default());
         let expected = Transcript::of(&entries, registry.clone(), "").into_context();
@@ -320,5 +353,106 @@ mod tests {
         let ledger = protocol::ledger::Ledger::of(child.iter());
         assert!(ledger.open_calls().next().is_none());
         assert!(ledger.armed().next().is_none());
+        assert!(
+            ledger
+                .publications()
+                .contains("skills", &Json::encode("review").unwrap())
+        );
+    }
+    #[test]
+    fn a_prefix_never_exports_an_unmatched_provider_tool_exchange() {
+        let call = |id: &str| {
+            llm::AssistantPart::ToolCall(llm::ToolCall {
+                id: id.into(),
+                name: "task".into(),
+                input: Json::encode(&serde_json::json!({})).unwrap(),
+                invalid: None,
+                provider_executed: false,
+                meta: llm::Meta::new(),
+            })
+        };
+        let assistant = Assistant {
+            content: vec![call("complete"), call("pending")],
+            origin: None,
+        };
+        let reply = llm::Response {
+            message: assistant,
+            finish: llm::Finish::new(llm::Reason::ToolCalls, None),
+            usage: llm::Usage::default(),
+            id: None,
+            model: None,
+            meta: llm::Meta::new(),
+        };
+        let entries = vec![
+            entry(
+                1,
+                Body::ModelResult {
+                    call: CallId::new(1).unwrap(),
+                    outcome: Outcome::Done {
+                        output: Json::encode(&reply).unwrap(),
+                    },
+                    r#for: None,
+                    failure: None,
+                },
+            ),
+            entry(
+                2,
+                Body::ToolCall {
+                    tool: "task".into(),
+                    input: Json::null(),
+                    id: Some("complete".into()),
+                    card: None,
+                    by: protocol::Audience::Model,
+                },
+            ),
+            entry(
+                3,
+                Body::ToolResult {
+                    call: CallId::new(2).unwrap(),
+                    outcome: Outcome::Done {
+                        output: Json::encode("answer").unwrap(),
+                    },
+                    card: None,
+                },
+            ),
+            entry(
+                4,
+                Body::ToolCall {
+                    tool: "task".into(),
+                    input: Json::null(),
+                    id: Some("pending".into()),
+                    card: None,
+                    by: protocol::Audience::Model,
+                },
+            ),
+        ];
+        let image = context_image(&entries);
+        let intent = Json::encode(&serde_json::json!({"image":image})).unwrap();
+        let messages = Transcript::of(
+            [entry(1, Body::Spawned { intent })],
+            Arc::new(Registry::default()),
+            "",
+        )
+        .into_messages();
+        let Message::Assistant(assistant) = &messages[0] else {
+            panic!("{messages:?}")
+        };
+        assert_eq!(
+            assistant
+                .tool_calls()
+                .map(|c| c.id.as_str())
+                .collect::<Vec<_>>(),
+            ["complete"]
+        );
+        let Message::Tool(tool) = &messages[1] else {
+            panic!("{messages:?}")
+        };
+        assert_eq!(
+            tool.results
+                .iter()
+                .map(|r| r.id.as_str())
+                .collect::<Vec<_>>(),
+            ["complete"]
+        );
     }
 }

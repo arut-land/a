@@ -1285,7 +1285,17 @@ fn the_model_gets_the_prompt_and_the_logged_context_first() {
         .iter()
         .map(|t| t["name"].as_str().unwrap())
         .collect();
-    assert_eq!(tools, ["bash", "edit", "task", "sleep"]);
+    assert_eq!(
+        tools,
+        [
+            "bash",
+            "edit",
+            "task",
+            "fork_task",
+            "background_task",
+            "sleep"
+        ]
+    );
     assert_eq!(
         transcript(&log, u64::MAX, fixture.0.registry.get())[0],
         llm::Message::user(text.clone())

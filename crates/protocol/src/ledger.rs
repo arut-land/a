@@ -19,6 +19,9 @@ use crate::{
 pub struct Ledger {
     /// The seq of the last entry folded.
     seq: u64,
+    received: Vec<(Seq, crate::EnvelopeId)>,
+    outbox: Vec<crate::Envelope>,
+    acknowledgements: Vec<(crate::EnvelopeId, Option<crate::InboxRefusal>)>,
     /// Model and tool calls with an intent and no outcome.
     open: Keyed<CallId, Open>,
     /// Input queued and not yet taken up, in order.
@@ -158,6 +161,34 @@ impl Ledger {
         let (seq, body) = (e.seq, &e.body);
         self.seq = seq.get();
         match body {
+            Body::Outbox { envelope } => {
+                if !self.outbox.iter().any(|e| e.id == envelope.id) {
+                    self.outbox.push(envelope.clone());
+                }
+            }
+            Body::Ack {
+                envelope_id,
+                refusal,
+            } => {
+                if !self
+                    .acknowledgements
+                    .iter()
+                    .any(|(id, _)| id == envelope_id)
+                {
+                    self.acknowledgements
+                        .push((envelope_id.clone(), refusal.clone()));
+                }
+            }
+            Body::Enqueue { envelope } => {
+                if !self.received.iter().any(|(_, id)| id == &envelope.id) {
+                    self.received.push((seq, envelope.id.clone()));
+                    self.untaken.push_back(Queued {
+                        seq,
+                        text: envelope.payload.clone(),
+                        steer: false,
+                    });
+                }
+            }
             Body::Input {
                 text,
                 mode,
@@ -453,6 +484,33 @@ impl Ledger {
         self.armed.iter().map(|(seq, &child)| (seq, child))
     }
 
+    pub fn enqueued(&self, seq: Seq) -> bool {
+        self.received.iter().any(|(queued, _)| *queued == seq)
+    }
+    pub fn received(&self, id: &crate::EnvelopeId) -> bool {
+        self.received.iter().any(|(_, seen)| seen == id)
+    }
+    pub fn inbox_len(&self) -> usize {
+        self.untaken
+            .iter()
+            .filter(|q| self.received.iter().any(|(seq, _)| *seq == q.seq))
+            .count()
+    }
+    pub fn pending_outbox(&self) -> impl Iterator<Item = &crate::Envelope> {
+        self.outbox
+            .iter()
+            .filter(|e| self.acknowledged(&e.id).is_none())
+    }
+    pub fn outbox(&self) -> &[crate::Envelope] {
+        &self.outbox
+    }
+    pub fn acknowledged(&self, id: &crate::EnvelopeId) -> Option<&Option<crate::InboxRefusal>> {
+        self.acknowledgements
+            .iter()
+            .find(|(seen, _)| seen == id)
+            .map(|(_, refusal)| refusal)
+    }
+
     pub fn links(&self) -> &[Link] {
         &self.links
     }
@@ -525,6 +583,7 @@ impl Ledger {
             .any(|(_, open)| !matches!(open.call, Call::Side { .. }))
             || !self.untaken.is_empty()
             || !self.armed.is_empty()
+            || self.pending_outbox().next().is_some()
         {
             Activity::Running
         } else {

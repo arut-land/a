@@ -44,8 +44,9 @@ use crate::transcript::Transcript;
 use crate::{Daemon, lock};
 use side::SideFact;
 
+mod inbox;
 mod side;
-mod spawn;
+pub(crate) mod spawn;
 
 /// What every session runs with.
 pub struct Shared {
@@ -273,6 +274,15 @@ pub enum Request {
 }
 
 enum Msg {
+    Enqueue {
+        envelope: protocol::Envelope,
+        reply: oneshot::Sender<Result<(), protocol::InboxRefusal>>,
+    },
+    Delivered {
+        id: protocol::EnvelopeId,
+        result: Result<(), protocol::InboxRefusal>,
+        ticket: Option<Ticket>,
+    },
     Fenced {
         fence: u64,
         msg: Box<Msg>,
@@ -348,6 +358,10 @@ struct PendingSide {
 }
 
 enum ContextRequest {
+    Send {
+        envelope: protocol::Envelope,
+        reply: oneshot::Sender<Result<(), protocol::InboxRefusal>>,
+    },
     /// A running call's report, answered once committed.
     Note {
         note: Note,
@@ -356,7 +370,7 @@ enum ContextRequest {
     /// Child work is admitted under the originating call, even across polling.
     Child {
         request: ext::Spawn,
-        reply: oneshot::Sender<Json>,
+        reply: spawn::SpawnReply,
     },
     /// The actor supplies the side call's authority after committing its intent.
     Side {
@@ -427,29 +441,8 @@ impl Live {
             || shared.registry.generation(),
             |source| source.generation(),
         );
-        let image = if matches!(open, Open::Load)
-            && header.parent.is_some()
-            && shared.catalog.get(header.id).is_some_and(|r| r.entries > 0)
-        {
-            spawn::spawn_image(shared.store.prefix(header.id, 1)?)
-        } else {
-            None
-        };
-        let registry = if let Some(image) = &image {
-            recorded_registry(shared, source.as_ref(), Some(&image.installed))?
-        } else {
-            match (&source, open) {
-                (Some(source), Open::Load) => load_registry(header, shared, source)?,
-                (Some(source), Open::Create) => source.registry(),
-                (None, _) => shared.registry.get(),
-            }
-        };
+        let (registry, image) = spawn::restore(header, shared, open, source.as_ref())?;
         let (tx, rx) = channel::unbounded();
-        let registry = if header.parent.is_some() {
-            Arc::new(registry.inherited().map_err(io::Error::other)?)
-        } else {
-            registry
-        };
         let session = Session::new(header, shared, Arc::new(tx), &registry);
         *lock(&session.spawn) = image;
         let bound = bind(&registry, &session);
@@ -520,6 +513,11 @@ impl Live {
             inflight: Keyed::default(),
             view: None,
             replies: Keyed::default(),
+            child_cancels: Vec::new(),
+            transport_active: false,
+            delivery_queue: std::collections::VecDeque::new(),
+            deliveries: Keyed::default(),
+            detached: Vec::new(),
             sides: Keyed::default(),
             side_waiters: Keyed::default(),
             tickets: 0,
@@ -823,7 +821,15 @@ struct Actor {
     side_waiters: Keyed<CallId, Vec<oneshot::Sender<Opened>>>,
     /// Side model requests waiting for their call's id, with the
     /// conversation they asked for.
+    detached: Vec<(
+        SessionId,
+        oneshot::Sender<Result<ext::ConversationHandle, ext::SpawnRefusal>>,
+    )>,
     sides: Keyed<Ticket, PendingSide>,
+    transport_active: bool,
+    delivery_queue: std::collections::VecDeque<(protocol::Envelope, Option<Ticket>)>,
+    child_cancels: Vec<(SessionId, Cancel)>,
+    deliveries: Keyed<Ticket, oneshot::Sender<Result<(), protocol::InboxRefusal>>>,
     tickets: u64,
     phase: Phase,
     /// The session as the catalog last heard of it: busy while work is in
@@ -890,8 +896,6 @@ enum Child {
     None,
     /// It asked, and waits for the result.
     Waiting(oneshot::Sender<Json>),
-    /// Run again with the answer it waited on, to hand it when it asks.
-    Answered(Json),
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -923,11 +927,13 @@ impl Actor {
         }
     }
 
+    fn can_refresh(&self) -> bool {
+        lock(&self.live.session.spawn).is_none()
+            && self.phase == Phase::Serving
+            && self.core.at_rest()
+    }
     async fn refresh(&mut self) -> Result<(), ()> {
-        if lock(&self.live.session.spawn).is_some()
-            || self.phase != Phase::Serving
-            || !self.core.at_rest()
-        {
+        if !self.can_refresh() {
             return Ok(());
         }
         let shared = &self.live.session.shared;
@@ -1189,6 +1195,15 @@ impl Actor {
                 Event::Environment(logged)
             }
             Msg::Context { origin, request } => return self.context(&origin, request),
+            Msg::Enqueue { envelope, reply } => {
+                let ticket = self.delivery_ticket(reply);
+                Event::Enqueue { envelope, ticket }
+            }
+            Msg::Delivered { id, result, ticket } => {
+                self.transport_active = false;
+                self.pump_delivery();
+                Event::Delivered { id, result, ticket }
+            }
             Msg::SideFact { side, fact, done } => self.side_fact(side, fact, done),
             Msg::Replied {
                 call,
@@ -1246,17 +1261,34 @@ impl Actor {
         }
         let call = origin.call;
         match request {
-            ContextRequest::Note { note, done } => return Some((Event::Note { call, note }, done)),
-            ContextRequest::Child { request, reply } => {
-                return self
-                    .open_spawn(call, request, reply)
-                    .map(|event| (event, None));
+            ContextRequest::Send { envelope, reply } => {
+                let children: Vec<_> = self.core.ledger().links().iter().map(|l| l.child).collect();
+                let allowed = envelope.id.sender == self.live.id
+                    && envelope.id.call == call
+                    && self
+                        .registry
+                        .service::<dyn ext::InboxAccess>()
+                        .is_some_and(|access| {
+                            access.permits(
+                                envelope.destination,
+                                self.live.parent.map(|p| p.session),
+                                &children,
+                            )
+                        });
+                if !allowed {
+                    reply.send(Err(protocol::InboxRefusal::Unauthorized));
+                    return None;
+                }
+                let ticket = self.delivery_ticket(reply);
+                Some((Event::SendEnvelope { envelope, ticket }, None))
             }
-            ContextRequest::Side { model, side, reply } => {
-                return self
-                    .open_side(origin.clone(), model, side, reply)
-                    .map(|event| (event, None));
-            }
+            ContextRequest::Note { note, done } => Some((Event::Note { call, note }, done)),
+            ContextRequest::Child { request, reply } => self
+                .open_spawn(call, request, reply)
+                .map(|event| (event, None)),
+            ContextRequest::Side { model, side, reply } => self
+                .open_side(origin.clone(), model, side, reply)
+                .map(|event| (event, None)),
             ContextRequest::Own { pgid, ended } => {
                 lock(&session.jobs).push(pgid);
                 let session = Arc::clone(session);
@@ -1268,7 +1300,7 @@ impl Actor {
                         daemon.jobs.notify();
                     }
                 }));
-                return None;
+                None
             }
         }
     }
@@ -2107,6 +2139,12 @@ impl Actor {
             Effect::Append(_) | Effect::Commit { .. } | Effect::Require(_) => {
                 unreachable!("appends commit in runs")
             }
+            Effect::Delivery { ticket, result } => {
+                if let Some(reply) = self.deliveries.remove(&ticket) {
+                    reply.send(result);
+                }
+            }
+            Effect::Deliver { envelope, ticket } => self.deliver(envelope, ticket),
             Effect::Reply { ticket, result } => self.reply(ticket, result),
             Effect::Side { ticket, side } => self.admit_side(ticket, side),
             Effect::Prepare {
@@ -2121,29 +2159,7 @@ impl Actor {
                 tool,
                 input,
                 value,
-            } => {
-                let refusal = self
-                    .core
-                    .ledger()
-                    .links()
-                    .iter()
-                    .filter_map(|l| l.intent.parse::<spawn::SpawnIntent>().ok())
-                    .find(|i| i.call == call)
-                    .and_then(|i| i.refusal);
-                let value = refusal.map_or(value, |r| {
-                    Json::encode(&Result::<Outcome, _>::Err(r)).unwrap()
-                });
-                match self.inflight.get_mut(&call) {
-                    // Still running, and waiting for it.
-                    Some(InFlight::Tool(child @ Child::Waiting(_))) => {
-                        if let Child::Waiting(reply) = std::mem::replace(child, Child::None) {
-                            reply.send(value);
-                        }
-                    }
-                    // Run again, from a log that holds the answer.
-                    _ => self.run_tool(call, tool, input, Child::Answered(value)),
-                }
-            }
+            } => self.resume_tool(call, tool, input, value),
             Effect::Await { call, answer } => {
                 let gated = self.cancellable(call, answer.0);
                 self.later(gated, move |gated| Event::Gated { call, gated });
@@ -2171,6 +2187,9 @@ impl Actor {
             }
             Effect::StartChild { link, child, input } => self.start_child(link, child, input),
             Effect::Interrupt { child } => {
+                if let Some((_, cancel)) = self.child_cancels.iter().find(|(id, _)| *id == child) {
+                    cancel.set();
+                }
                 if let Some(daemon) = shared.daemon.upgrade() {
                     daemon.interrupt(child);
                 }
@@ -2195,9 +2214,41 @@ impl Actor {
         }
     }
 
+    fn resume_tool(&mut self, call: CallId, tool: String, input: Json, value: Json) {
+        let refusal = self
+            .core
+            .ledger()
+            .links()
+            .iter()
+            .rev()
+            .filter_map(|l| l.intent.parse::<spawn::SpawnIntent>().ok())
+            .find(|i| i.call == call)
+            .and_then(|i| i.refusal);
+        let value = refusal.map_or(value, |r| {
+            Json::encode(&Result::<Outcome, _>::Err(r)).unwrap()
+        });
+        match self.inflight.get_mut(&call) {
+            // Still running, and waiting for it.
+            Some(InFlight::Tool(child @ Child::Waiting(_))) => {
+                if let Child::Waiting(reply) = std::mem::replace(child, Child::None) {
+                    reply.send(value);
+                }
+            }
+            // Run again, from a log that holds the answer.
+            _ => self.run_tool(call, tool, input, Child::None),
+        }
+    }
+
     /// Starts child session `child` on `input`, owned by link `link`, in
     /// this session's environment.
-    fn start_child(&self, link: protocol::Seq, child: SessionId, input: String) {
+    fn start_child(&mut self, link: protocol::Seq, child: SessionId, input: String) {
+        let cancel = Cancel::default();
+        self.child_cancels.push((child, cancel.clone()));
+        let detached = self
+            .detached
+            .iter()
+            .position(|(id, _)| *id == child)
+            .map(|at| self.detached.remove(at).1);
         let shared = &self.live.session.shared;
         let header = Header {
             id: child,
@@ -2223,10 +2274,26 @@ impl Actor {
                     .parse::<spawn::SpawnIntent>()
                     .ok()
                     .and_then(|i| i.refusal);
-                let result = match refusal {
-                    Some(refusal) => Err(io::Error::other(format!("{refusal:?}"))),
-                    None => daemon.start_child(header, input, env, intent).await,
+                let result = if cancel.is_set() {
+                    Err(io::Error::other("child admission interrupted"))
+                } else {
+                    match &refusal {
+                        Some(refusal) => Err(io::Error::other(format!("{refusal:?}"))),
+                        None => daemon.start_child(header, input, env, intent).await,
+                    }
                 };
+                if cancel.is_set() {
+                    daemon.interrupt(child);
+                }
+                if let Some(reply) = detached {
+                    let answer = result
+                        .as_ref()
+                        .map(|()| ext::ConversationHandle { session: child })
+                        .map_err(|e| {
+                            refusal.unwrap_or_else(|| ext::SpawnRefusal::Unavailable(e.to_string()))
+                        });
+                    reply.send(answer);
+                }
                 if let Err(error) = result {
                     daemon
                         .report(
@@ -2393,7 +2460,11 @@ impl Actor {
     /// transcript before it, and the tools.
     fn request(&mut self, call: CallId, model: &Model) -> llm::Request {
         let messages = self.conversation(call);
-        model.request(messages, self.registry.specs().clone())
+        let mut request = model.request(messages, self.registry.specs().clone());
+        if let Some(spawn) = lock(&self.live.session.spawn).as_ref() {
+            request.generation.max_output_tokens = Some(spawn.request.budget.max_tokens);
+        }
+        request
     }
 
     /// The conversation the model sees before entry `call`.
@@ -2757,7 +2828,38 @@ impl Session {
 
     /// The model the newest client's environment and the settings name
     /// now, or why there is none.
+    fn role_model(&self, role: &ext::ModelRole) -> Result<String, String> {
+        match role {
+            ext::ModelRole::Session => self.model_named().map(|(m, _)| m),
+            ext::ModelRole::Fast => self
+                .shared
+                .models
+                .settings
+                .fast_model(&self.workspace)
+                .and_then(|m| m.map_or_else(|| self.model_named().map(|(m, _)| m), Ok)),
+            ext::ModelRole::Named(role) => self
+                .shared
+                .registry
+                .get()
+                .service::<dyn ext::ModelRoles>()
+                .ok_or_else(|| format!("no model service resolves role {role}"))?
+                .model(
+                    role,
+                    &lock(&self.state_view()),
+                    &self.shared.models.settings,
+                    &self.workspace,
+                ),
+        }
+    }
+
     fn model(&self) -> Result<Model, String> {
+        if let Some(image) = lock(&self.spawn).as_ref() {
+            let route = image.routing.as_ref().map_err(Clone::clone)?;
+            return self
+                .shared
+                .models
+                .routed(&self.workspace, lock(&self.env).as_deref(), route);
+        }
         let (spec, _) = self.model_named()?;
         let env = lock(&self.env).clone();
         self.shared
