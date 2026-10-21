@@ -182,3 +182,29 @@ fn two_installs_upgrade_once_and_the_older_client_never_downgrades() {
     assert!(env.command_at(&older, &["ls"]).status().unwrap().success());
     assert_eq!(env.pid(), new_pid);
 }
+
+#[test]
+fn a_cold_clients_output_reaches_eof_while_the_daemon_stays_alive() {
+    let env = Isolated::new("stdio-eof");
+    let child = env
+        .command(&["ls"])
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .spawn()
+        .unwrap();
+    let (tx, rx) = std::sync::mpsc::channel();
+    let reader = std::thread::spawn(move || {
+        let _ = tx.send(child.wait_with_output());
+    });
+    let result = rx.recv_timeout(std::time::Duration::from_secs(10));
+    if result.is_err() {
+        env.run(&["daemon", "stop"]);
+    }
+    reader.join().unwrap();
+    assert!(result.unwrap().unwrap().status.success());
+    assert_ne!(std::process::id(), env.pid());
+    assert!(!client::wait_exited(
+        &env.home,
+        Some(std::time::Duration::ZERO)
+    ));
+}

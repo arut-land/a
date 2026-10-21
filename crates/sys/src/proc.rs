@@ -11,12 +11,12 @@ use std::process::{Command, ExitStatus};
 
 use crate::Signal;
 
-pub use imp::ExitWatch;
 #[cfg(unix)]
 pub(crate) use imp::keep;
 pub(crate) use imp::passed;
 #[cfg(unix)]
 pub(crate) use imp::raw;
+pub use imp::{Child, ExitWatch};
 
 /// Finds bash using the system location first, then the session's PATH.
 pub fn find_bash(search: Option<&str>) -> Option<String> {
@@ -107,17 +107,10 @@ impl Pass for File {
     }
 }
 
-/// Lets the child `cmd` starts inherit `handles`, and only it: they stay
-/// uninheritable in this process, so no child another thread starts
-/// meanwhile holds them.
 /// Starts a detached daemon. Unix hands over the bound listener and lock;
 /// Windows re-listens under the client's start lock and acknowledges binding
 /// on stdout, avoiding process-owned byte-lock and handle inheritance races.
-pub fn spawn_daemon(
-    cmd: &mut Command,
-    home: &crate::Home,
-    lock: File,
-) -> io::Result<std::process::Child> {
+pub fn spawn_daemon(cmd: &mut Command, home: &crate::Home, lock: File) -> io::Result<Child> {
     imp::spawn_daemon(cmd, home, lock)
 }
 
@@ -126,8 +119,8 @@ pub fn daemon_ready() -> io::Result<()> {
 }
 
 /// Creates a command's process tree as a group before any user code runs.
-pub fn spawn_group(cmd: &mut Command) -> io::Result<std::process::Child> {
-    imp::spawn_group(cmd)
+pub fn spawn_group(cmd: &mut Command, output: File) -> io::Result<Child> {
+    imp::spawn_group(cmd, output)
 }
 
 /// Adopts the locked daemon record our parent passed down: the lock is the
@@ -191,6 +184,7 @@ mod imp {
     use crate::Signal;
 
     pub type ExitWatch = OwnedFd;
+    pub type Child = std::process::Child;
 
     pub fn spawn_daemon(
         cmd: &mut Command,
@@ -220,9 +214,12 @@ mod imp {
         Ok(())
     }
 
-    pub fn spawn_group(cmd: &mut Command) -> io::Result<std::process::Child> {
+    pub fn spawn_group(cmd: &mut Command, output: fs::File) -> io::Result<Child> {
         lead(cmd);
-        cmd.spawn()
+        cmd.stdin(std::process::Stdio::null())
+            .stdout(output.try_clone()?)
+            .stderr(output)
+            .spawn()
     }
 
     pub fn passed(fd: &impl AsRawFd) -> Passed {

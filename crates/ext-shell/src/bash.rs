@@ -21,8 +21,9 @@ use std::fs::File;
 use std::future::Future;
 use std::io::{self, Read};
 use std::path::{Path, PathBuf};
-use std::process::{Child, Command as Process, ExitStatus, Stdio};
+use std::process::{Command as Process, ExitStatus, Stdio};
 use std::time::{Duration, Instant};
+use sys::Child;
 
 use protocol::{Card, Environment, Mark};
 use serde::{Deserialize, Serialize};
@@ -276,8 +277,7 @@ async fn run(input: &Command, cx: &Cx, progress: Partials<String>) -> io::Result
         .ok();
     let child = {
         let mut cmd = process(&spawn);
-        cmd.stdout(file.try_clone()?).stderr(file);
-        sys::spawn_group(&mut cmd)?
+        sys::spawn_group(&mut cmd, file)?
     };
     let pgid = child.id();
     cx.spawned(pgid, false);
@@ -330,8 +330,7 @@ fn background(cx: &Cx, spawn: Spawn, log: &Path) -> io::Result<Ran> {
     let started = runtime(cx)?.now();
     let (file, log) = create_private(log)?;
     let mut cmd = process(&spawn);
-    cmd.stdout(file.try_clone()?).stderr(file);
-    let child = sys::spawn_group(&mut cmd)?;
+    let child = sys::spawn_group(&mut cmd, file)?;
     drop(cmd);
     let pgid = child.id();
     cx.own(

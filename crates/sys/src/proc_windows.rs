@@ -1,8 +1,11 @@
 use std::fs::File;
 use std::io::{self, Read, Write};
 use std::os::windows::io::{AsRawHandle, OwnedHandle};
-use std::os::windows::process::{CommandExt, ProcThreadAttributeList};
-use std::process::{Child, Command, ExitStatus, Stdio};
+use std::os::windows::process::CommandExt;
+use std::process::{Command, ExitStatus};
+#[path = "spawn_windows.rs"]
+mod spawn;
+pub use spawn::Child;
 use std::ptr::{null, null_mut};
 use std::sync::{Mutex, OnceLock};
 
@@ -14,8 +17,7 @@ use windows_sys::Win32::System::JobObjects::{
 };
 use windows_sys::Win32::System::Threading::{
     CREATE_NEW_PROCESS_GROUP, CREATE_NO_WINDOW, DETACHED_PROCESS, GetProcessTimes, OpenProcess,
-    PROC_THREAD_ATTRIBUTE_JOB_LIST, PROCESS_QUERY_LIMITED_INFORMATION, PROCESS_TERMINATE,
-    TerminateProcess,
+    PROCESS_QUERY_LIMITED_INFORMATION, PROCESS_TERMINATE, TerminateProcess,
 };
 
 use windows_sys::Win32::System::SystemInformation::GetTickCount64;
@@ -44,8 +46,7 @@ pub fn spawn_daemon(cmd: &mut Command, _home: &crate::Home, lock: File) -> io::R
     // by the client until binding is acknowledged, serializing re-listen.
     drop(lock);
     cmd.arg("--detached")
-        .creation_flags(DETACHED_PROCESS | CREATE_NEW_PROCESS_GROUP)
-        .stdout(Stdio::piped());
+        .creation_flags(DETACHED_PROCESS | CREATE_NEW_PROCESS_GROUP);
     for name in [
         "SystemRoot",
         "WINDIR",
@@ -61,11 +62,16 @@ pub fn spawn_daemon(cmd: &mut Command, _home: &crate::Home, lock: File) -> io::R
             cmd.env(name, value);
         }
     }
-    let mut child = cmd.spawn()?;
-    let mut output = child
-        .stdout
-        .take()
-        .ok_or_else(|| io::Error::other("daemon readiness pipe is missing"))?;
+    let (mut output, writer) = io::pipe()?;
+    let input = File::open("NUL")?;
+    let error = File::options().write(true).open("NUL")?;
+    let mut child = spawn::spawn(
+        cmd,
+        [&input, &writer, &error],
+        None,
+        DETACHED_PROCESS | CREATE_NEW_PROCESS_GROUP,
+    )?;
+    drop(writer);
     let (tx, rx) = std::sync::mpsc::sync_channel(1);
     let reader = std::thread::spawn(move || {
         let _ = tx.send(output.read_exact(&mut [0]));
@@ -118,7 +124,7 @@ fn jobs() -> std::sync::MutexGuard<'static, Vec<Job>> {
 
 /// Job assignment is a process creation attribute, so no shell can fork
 /// before containment. The daemon alone owns each kill-on-close handle.
-pub fn spawn_group(cmd: &mut Command) -> io::Result<Child> {
+pub fn spawn_group(cmd: &mut Command, output: File) -> io::Result<Child> {
     let security = Security::user_only()?;
     let attributes = security.attributes();
     // SAFETY: attributes live through creation, unnamed job cannot be pre-created.
@@ -135,12 +141,14 @@ pub fn spawn_group(cmd: &mut Command) -> io::Result<Child> {
             u32::try_from(size_of_val(&limits)).unwrap(),
         )
     })?;
-    let handles = [job.as_raw_handle()];
-    let attributes = ProcThreadAttributeList::build()
-        .attribute(PROC_THREAD_ATTRIBUTE_JOB_LIST as usize, &handles)
-        .finish()?;
-    lead(cmd);
-    let child = cmd.spawn_with_attributes(&attributes)?;
+    let input = File::open("NUL")?;
+    let child = spawn::spawn(
+        cmd,
+        [&input, &output, &output],
+        Some(&job),
+        CREATE_NEW_PROCESS_GROUP | CREATE_NO_WINDOW,
+    )?;
+    drop(output);
     let mut jobs = jobs();
     jobs.retain(|job| !members(&job.handle).is_empty());
     jobs.push(Job {
@@ -254,6 +262,7 @@ pub fn read_boot_id() -> Option<String> {
 mod tests {
     use super::*;
     use std::io::{BufRead, BufReader};
+    use std::process::Stdio;
     use windows_sys::Win32::System::Threading::WaitForSingleObject;
 
     #[test]
@@ -266,7 +275,9 @@ mod tests {
             .args(["/D", "/C", "ping -n 60 127.0.0.1 >NUL"])
             .stdout(Stdio::null())
             .stderr(Stdio::null());
-        let mut child = spawn_group(&mut command).unwrap();
+        command.envs(std::env::vars_os());
+        let output = File::options().write(true).open("NUL").unwrap();
+        let mut child = spawn_group(&mut command, output).unwrap();
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
         let members = loop {
             let members = group_members(child.id());
@@ -325,6 +336,37 @@ mod tests {
             let status = unsafe { WaitForSingleObject(watch.as_raw_handle(), 5000) };
             assert_eq!(status, 0);
         }
+    }
+
+    #[test]
+    fn a_shell_never_inherits_an_unrelated_inheritable_pipe() {
+        use windows_sys::Win32::Foundation::{HANDLE_FLAG_INHERIT, SetHandleInformation};
+        let (mut input, output) = io::pipe().unwrap();
+        // SAFETY: the test owns this pipe; only its inheritance bit changes.
+        ok(unsafe {
+            SetHandleInformation(
+                output.as_raw_handle(),
+                HANDLE_FLAG_INHERIT,
+                HANDLE_FLAG_INHERIT,
+            )
+        })
+        .unwrap();
+        let mut command = Command::new("cmd.exe");
+        command
+            .args(["/D", "/C", "ping -n 60 127.0.0.1 >NUL"])
+            .envs(std::env::vars_os());
+        let null = File::options().write(true).open("NUL").unwrap();
+        let mut child = spawn_group(&mut command, null).unwrap();
+        drop(output);
+        let (tx, rx) = std::sync::mpsc::channel();
+        let reader = std::thread::spawn(move || {
+            let _ = tx.send(input.read(&mut [0]));
+        });
+        let result = rx.recv_timeout(std::time::Duration::from_secs(5));
+        signal_group(child.id(), Signal::Kill).unwrap();
+        child.wait().unwrap();
+        reader.join().unwrap();
+        assert_eq!(result.unwrap().unwrap(), 0);
     }
 
     #[test]

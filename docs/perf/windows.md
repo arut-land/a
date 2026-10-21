@@ -113,3 +113,23 @@ After merging main's fork implementation and protocol 7, it measured
 3,039 KiB, including fixture exclusion, below the 4,096 KiB cap. All builds
 used `CARGO_BUILD_JOBS=3`. Budgets and startup timing were deliberately not
 run on this shared machine; the coordinator runs them on a quiet host.
+
+## Explicit process inheritance
+
+Daemon and shell creation now own three child stdio duplicates and use
+`CreateProcessW` with an explicit `PROC_THREAD_ATTRIBUTE_HANDLE_LIST`.
+The shell's attribute list also assigns its kill-on-close job before user
+code runs. No other inheritable handle in the parent is eligible. This
+uses the existing windows-sys bindings; no package is added.
+
+The pinned standard library duplicates stdio inside `Command::spawn`,
+which prevents an external allowlist from naming the actual child stdio.
+The sys seam therefore owns native creation and its child handle, while
+Unix retains std::process::Child. The command carries an explicit environment
+and argv; MS C argument escaping is shared with pure Unix/Miri tests.
+The API takes the output file separately, eliminating hidden stdio state.
+
+`a_cold_clients_output_reaches_eof_while_the_daemon_stays_alive` exercises
+cold-start capture on every platform with a bounded EOF wait. Native
+`a_shell_never_inherits_an_unrelated_inheritable_pipe` keeps a shell alive
+while an unrelated inheritable pipe must reach EOF.
