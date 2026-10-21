@@ -71,7 +71,9 @@ Stdio uses newline-delimited JSON-RPC with per-request version and
 capabilities, and probes `server/discover` before its first operation.
 There is no `initialize` fallback. Cancellation attempts a nonblocking
 `notifications/cancelled` write and then kills the process group, including
-servers that ignore notifications. HTTP uses `llm::Ureq` over the existing
+servers that ignore notifications. HTTP refuses all redirects before resending, including same-origin redirects.
+Provider HTTP callers choose their redirect policy explicitly. HTTP uses
+`llm::Ureq` over the existing
 runtime, supports JSON and request-scoped SSE, and closes its response
 stream on cancellation. It mirrors method, tool name and valid
 `x-mcp-header` parameters, using the prescribed Base64 sentinel encoding

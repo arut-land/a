@@ -317,6 +317,7 @@ pub enum Failure {
     Configuration(String),
     Spawn(String),
     Transport(String),
+    Redirect { status: u16 },
     Crashed,
     Timeout,
     Cancelled,

@@ -71,7 +71,10 @@ pub(crate) async fn http(
     headers: http::HeaderMap,
     cx: &Cx,
 ) -> Result<Value, Failure> {
-    let client = llm::Ureq::new(std::sync::Arc::new(CallRuntime(cx.clone())));
+    let client = llm::Ureq::new(
+        std::sync::Arc::new(CallRuntime(cx.clone())),
+        llm::Redirects::Refuse,
+    );
     exchange(&client, url, method, params, headers, cx).await
 }
 
@@ -106,6 +109,11 @@ async fn exchange(
         .map_err(protocol)?;
     let response = client.send(request).await.map_err(transport)?;
     let status = response.status();
+    if status.is_redirection() {
+        return Err(Failure::Redirect {
+            status: status.as_u16(),
+        });
+    }
     let kind = response
         .headers()
         .get("content-type")
@@ -276,5 +284,121 @@ mod tests {
                 Err(Failure::Protocol(_))
             ));
         }
+    }
+
+    #[test]
+    fn same_origin_redirects_are_refused_before_any_resend() {
+        use std::io::{Read, Write};
+        use std::net::TcpListener;
+        use std::time::{Duration, Instant};
+
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let url = format!("http://{}/mcp", listener.local_addr().unwrap());
+        let server = std::thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            stream
+                .set_read_timeout(Some(Duration::from_secs(2)))
+                .unwrap();
+            let mut head = Vec::new();
+            while !head.ends_with(b"\r\n\r\n") {
+                let mut byte = [0];
+                stream.read_exact(&mut byte).unwrap();
+                head.push(byte[0]);
+            }
+            stream.write_all(b"HTTP/1.1 307 Temporary Redirect\r\nLocation: /other\r\nContent-Length: 0\r\nConnection: close\r\n\r\n").unwrap();
+            drop(stream);
+            listener.set_nonblocking(true).unwrap();
+            let deadline = Instant::now() + Duration::from_secs(1);
+            while Instant::now() < deadline {
+                if listener.accept().is_ok() {
+                    return true;
+                }
+                std::thread::sleep(Duration::from_millis(5));
+            }
+            false
+        });
+        let rig = Rig::new("mcp-same-origin", Registry::default());
+        let result = rt::block_on(http(
+            &url,
+            "tools/call",
+            json!({"name":"echo","arguments":{}}),
+            http::HeaderMap::new(),
+            &rig.cx(),
+        ));
+        assert_eq!(result, Err(Failure::Redirect { status: 307 }));
+        assert!(!server.join().unwrap(), "same-origin request was resent");
+    }
+
+    #[test]
+    fn cross_host_redirects_never_receive_mirrored_arguments() {
+        use std::io::{Read, Write};
+        use std::net::TcpListener;
+        use std::time::{Duration, Instant};
+
+        fn receive(listener: TcpListener, reply: String) -> Option<String> {
+            listener.set_nonblocking(true).unwrap();
+            let deadline = Instant::now() + Duration::from_secs(3);
+            loop {
+                match listener.accept() {
+                    Ok((mut stream, _)) => {
+                        stream.set_nonblocking(false).unwrap();
+                        stream
+                            .set_read_timeout(Some(Duration::from_secs(2)))
+                            .unwrap();
+                        let mut bytes = Vec::new();
+                        let mut byte = [0];
+                        while !bytes.ends_with(b"\r\n\r\n") {
+                            if stream.read(&mut byte).unwrap() == 0 {
+                                break;
+                            }
+                            bytes.push(byte[0]);
+                        }
+                        stream.write_all(reply.as_bytes()).unwrap();
+                        return Some(String::from_utf8(bytes).unwrap());
+                    }
+                    Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
+                        if Instant::now() >= deadline {
+                            return None;
+                        }
+                        std::thread::sleep(Duration::from_millis(5));
+                    }
+                    Err(e) => panic!("{e}"),
+                }
+            }
+        }
+
+        let source = TcpListener::bind("127.0.0.1:0").unwrap();
+        let target = TcpListener::bind("127.0.0.1:0").unwrap();
+        let url = format!(
+            "http://localhost:{}/mcp",
+            source.local_addr().unwrap().port()
+        );
+        let redirect = format!(
+            "HTTP/1.1 302 Found\r\nLocation: http://127.0.0.1:{}/other\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
+            target.local_addr().unwrap().port()
+        );
+        let source = std::thread::spawn(move || receive(source, redirect));
+        let target = std::thread::spawn(move || {
+            receive(
+                target,
+                "HTTP/1.1 204 No Content\r\nConnection: close\r\n\r\n".into(),
+            )
+        });
+        let rig = Rig::new("mcp-review-redirect", Registry::default());
+        let mut headers = http::HeaderMap::new();
+        headers.insert("mcp-param-tenant", "private-test-tenant".parse().unwrap());
+        let _ = rt::block_on(http(
+            &url,
+            "tools/call",
+            json!({"name":"echo","arguments":{"tenant":"private-test-tenant"}}),
+            headers,
+            &rig.cx(),
+        ));
+        assert!(source.join().unwrap().is_some());
+        let received = target.join().unwrap();
+        assert!(
+            received.is_none(),
+            "cross-host request leaked: {received:?}"
+        );
     }
 }

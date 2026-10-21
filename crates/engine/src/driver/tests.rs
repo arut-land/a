@@ -693,7 +693,7 @@ fn live_the_model_calls_a_tool_and_answers_from_its_result() {
     file.write(&home).unwrap();
     let models = Models {
         settings: crate::config::Settings::new(home, None),
-        http: Arc::new(llm::Ureq::new(rt)),
+        http: Arc::new(llm::Ureq::new(rt, llm::Redirects::Follow)),
     };
     let fixture = Fixture::new(
         ext::LOOP,
