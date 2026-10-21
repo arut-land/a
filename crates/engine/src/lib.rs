@@ -1102,7 +1102,7 @@ impl Exit {
 pub struct Start {
     /// The daemon lock, taken by the client that started it; without one
     /// the daemon takes it.
-    pub lock: Option<File>,
+    pub lock: Option<sys::DaemonLock>,
     /// Serve even after a crash loop, for `a daemon restart`.
     pub reset_breaker: bool,
     /// A detached starter waits for discovery to be published.
@@ -1244,12 +1244,12 @@ enum Claim {
 fn claim(
     home: &Home,
     build: &str,
-    lock: Option<File>,
+    lock: Option<sys::DaemonLock>,
     reset: bool,
     limit: u32,
 ) -> io::Result<Claim> {
     let mut file = if let Some(file) = lock {
-        file
+        file.into_file(home)?
     } else {
         let file = OpenOptions::new()
             .create(true)

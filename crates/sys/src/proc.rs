@@ -134,9 +134,67 @@ pub fn spawn_group(cmd: &mut Command, output: File) -> io::Result<Child> {
     imp::spawn_group(cmd, output)
 }
 
-/// Consumes an owned duplicate of the inherited daemon lock.
-pub fn adopt_lock(file: File) -> io::Result<File> {
-    imp::adopt_lock(file)
+/// An inherited daemon record whose identity and exclusive lock were verified.
+#[derive(Debug)]
+pub struct DaemonLock(File);
+
+impl DaemonLock {
+    /// Revalidates the destination so a lock cannot authorize another home.
+    pub fn into_file(self, home: &crate::Home) -> Result<File, AdoptLockError> {
+        imp::adopt_lock(self.0, home)
+    }
+}
+
+#[derive(Debug)]
+pub enum AdoptLockError {
+    WrongRecord,
+    NotExclusive,
+    Unsupported,
+    Io(io::Error),
+}
+
+impl std::fmt::Display for AdoptLockError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::WrongRecord => f.write_str("inherited lock is not the writable daemon record"),
+            Self::NotExclusive => f.write_str("inherited daemon record is not exclusively locked"),
+            Self::Unsupported => f.write_str("inherited daemon locks are unsupported"),
+            Self::Io(error) => error.fmt(f),
+        }
+    }
+}
+
+impl std::error::Error for AdoptLockError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            Self::Io(error) => Some(error),
+            _ => None,
+        }
+    }
+}
+
+impl From<io::Error> for AdoptLockError {
+    fn from(error: io::Error) -> Self {
+        Self::Io(error)
+    }
+}
+
+impl From<AdoptLockError> for io::Error {
+    fn from(error: AdoptLockError) -> Self {
+        let kind = match &error {
+            AdoptLockError::WrongRecord | AdoptLockError::Unsupported => {
+                io::ErrorKind::InvalidInput
+            }
+            AdoptLockError::NotExclusive => io::ErrorKind::WouldBlock,
+            AdoptLockError::Io(error) => error.kind(),
+        };
+        Self::new(kind, error)
+    }
+}
+
+/// Consumes a duplicate only if it owns the expected record's exclusive lock.
+pub fn adopt_lock(file: File, home: &crate::Home) -> Result<DaemonLock, AdoptLockError> {
+    imp::adopt_lock(file, home).map(DaemonLock)
 }
 
 /// Leaves the spawning terminal's session so its hangup never reaches us.
@@ -318,14 +376,43 @@ mod imp {
         Ok(file)
     }
 
-    pub fn adopt_lock(file: fs::File) -> io::Result<fs::File> {
-        if !file.metadata()?.is_file() {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidInput,
-                "the lock fd is not a file",
-            ));
+    pub fn adopt_lock(
+        file: fs::File,
+        home: &crate::Home,
+    ) -> Result<fs::File, super::AdoptLockError> {
+        use super::AdoptLockError;
+        use std::os::unix::fs::{MetadataExt, OpenOptionsExt};
+        let actual = file.metadata()?;
+        if !actual.is_file()
+            || (rustix::fs::fcntl_getfl(&file).map_err(io::Error::from)?
+                & rustix::fs::OFlags::ACCMODE)
+                != rustix::fs::OFlags::RDWR
+        {
+            return Err(AdoptLockError::WrongRecord);
         }
-        Ok(file)
+        let probe = fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK)
+            .open(home.daemon_pid_file())?;
+        let expected = probe.metadata()?;
+        if (actual.dev(), actual.ino()) != (expected.dev(), expected.ino()) {
+            return Err(AdoptLockError::WrongRecord);
+        }
+        // A fresh open must conflict before the inherited description can
+        // verify ownership. Otherwise we would silently accept an unlocked fd.
+        match crate::fs::try_lock(&probe) {
+            Ok(()) => return Err(AdoptLockError::NotExclusive),
+            Err(error) if error.kind() == io::ErrorKind::WouldBlock => {}
+            Err(error) => return Err(error.into()),
+        }
+        match crate::fs::try_lock(&file) {
+            Ok(()) => Ok(file),
+            Err(error) if error.kind() == io::ErrorKind::WouldBlock => {
+                Err(AdoptLockError::NotExclusive)
+            }
+            Err(error) => Err(error.into()),
+        }
     }
 
     pub fn detach_session() -> io::Result<()> {
@@ -621,6 +708,73 @@ mod imp;
 #[cfg(all(test, unix))]
 mod tests {
     use super::*;
+    use std::os::fd::AsRawFd;
+
+    #[test]
+    fn adopted_daemon_lock_excludes_an_independent_opener() {
+        let dir = std::env::temp_dir().join(format!("a-c02-review-lock-{}", std::process::id()));
+        std::fs::create_dir_all(dir.join("run")).unwrap();
+        let home = crate::Home::from(dir.clone());
+        let open = || {
+            File::options()
+                .read(true)
+                .write(true)
+                .open(home.daemon_pid_file())
+                .unwrap()
+        };
+        let original = File::options()
+            .read(true)
+            .write(true)
+            .create_new(true)
+            .open(home.daemon_pid_file())
+            .unwrap();
+        assert!(matches!(
+            adopt_lock(original.try_clone().unwrap(), &home),
+            Err(AdoptLockError::NotExclusive)
+        ));
+        crate::fs::try_lock(&original).unwrap();
+        let adopted = adopt_lock(
+            InheritedNumber::from(original.as_raw_fd())
+                .duplicate()
+                .unwrap(),
+            &home,
+        )
+        .unwrap();
+        let contender = open();
+        assert_eq!(
+            crate::fs::try_lock(&contender).unwrap_err().kind(),
+            io::ErrorKind::WouldBlock
+        );
+        assert!(matches!(
+            adopt_lock(contender, &home),
+            Err(AdoptLockError::NotExclusive)
+        ));
+        let foreign = File::options()
+            .read(true)
+            .write(true)
+            .create_new(true)
+            .open(dir.join("foreign"))
+            .unwrap();
+        crate::fs::try_lock(&foreign).unwrap();
+        assert!(matches!(
+            adopt_lock(foreign, &home),
+            Err(AdoptLockError::WrongRecord)
+        ));
+        let other_home = crate::Home::from(dir.join("other"));
+        std::fs::create_dir_all(other_home.run_dir()).unwrap();
+        File::create(other_home.daemon_pid_file()).unwrap();
+        assert!(matches!(
+            adopted.into_file(&other_home),
+            Err(AdoptLockError::WrongRecord)
+        ));
+        assert_eq!(
+            crate::fs::try_lock(&open()).unwrap_err().kind(),
+            io::ErrorKind::WouldBlock
+        );
+        drop(original);
+        crate::fs::try_lock(&open()).unwrap();
+        std::fs::remove_dir_all(dir).unwrap();
+    }
 
     #[test]
     fn kills_a_whole_process_group() {

@@ -597,7 +597,7 @@ fn serve(
     };
     let start = engine::Start {
         lock: lock_fd
-            .map(|fd| sys::adopt_lock(sys::InheritedNumber::from(fd).duplicate()?))
+            .map(|fd| sys::adopt_lock(sys::InheritedNumber::from(fd).duplicate()?, home))
             .transpose()?,
         reset_breaker,
         logs: detached || listen_fd.is_some(),

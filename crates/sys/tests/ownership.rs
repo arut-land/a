@@ -11,13 +11,23 @@ fn invalid_inherited_numbers_never_create_owned_handles() {
     }
     let (read, _write) = rustix::pipe::pipe().unwrap();
     let number = InheritedNumber::from(read.as_raw_fd());
-    assert!(sys::adopt_lock(number.duplicate().unwrap()).is_err());
+    let home = sys::Home::from(std::env::temp_dir().join("a-c02-invalid"));
+    assert!(sys::adopt_lock(number.duplicate().unwrap(), &home).is_err());
     assert!(rustix::io::fcntl_getfd(&read).is_ok());
 }
 
 #[test]
 fn adoption_never_double_closes() {
-    let original = File::open(std::env::current_exe().unwrap()).unwrap();
+    let dir = std::env::temp_dir().join(format!("a-c02-{}", std::process::id()));
+    std::fs::create_dir_all(dir.join("run")).unwrap();
+    let home = sys::Home::from(dir.clone());
+    let original = File::options()
+        .read(true)
+        .write(true)
+        .create_new(true)
+        .open(home.daemon_pid_file())
+        .unwrap();
+    sys::fs::try_lock(&original).unwrap();
     rustix::io::fcntl_setfd(&original, rustix::io::FdFlags::empty()).unwrap();
     let number = InheritedNumber::from(original.as_raw_fd());
     for _ in 0..2 {
@@ -30,12 +40,9 @@ fn adoption_never_double_closes() {
                     .contains(rustix::io::FdFlags::CLOEXEC)
             );
         }
-        drop(sys::adopt_lock(owned).unwrap());
+        drop(sys::adopt_lock(owned, &home).unwrap());
         assert!(original.metadata().unwrap().is_file());
     }
-    let dir = std::env::temp_dir().join(format!("a-c02-{}", std::process::id()));
-    std::fs::create_dir_all(dir.join("run")).unwrap();
-    let home = sys::Home::from(dir.clone());
     let listener = home.bind().unwrap();
     let number = InheritedNumber::from(listener.passed().to_string().parse::<i32>().unwrap());
     let adopted = sys::Listener::adopt(number.duplicate().unwrap(), &home.endpoint()).unwrap();

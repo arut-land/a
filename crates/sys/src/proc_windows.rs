@@ -39,11 +39,8 @@ pub fn duplicate(_number: i32) -> io::Result<File> {
     Err(io::ErrorKind::Unsupported.into())
 }
 
-pub fn adopt_lock(_file: File) -> io::Result<File> {
-    Err(io::Error::new(
-        io::ErrorKind::InvalidInput,
-        "Windows daemon startup claims its own lock",
-    ))
+pub fn adopt_lock(_file: File, _home: &crate::Home) -> Result<File, super::AdoptLockError> {
+    Err(super::AdoptLockError::Unsupported)
 }
 
 pub fn spawn_daemon(cmd: &mut Command, _home: &crate::Home, lock: File) -> io::Result<Child> {
