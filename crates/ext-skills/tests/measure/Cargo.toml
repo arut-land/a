@@ -1,0 +1,24 @@
+[workspace]
+[package]
+name = "skill-parser-probe"
+version = "0.0.0"
+edition = "2024"
+publish = false
+[features]
+custom = []
+serde = ["dep:serde_yaml_ng"]
+yaml = ["dep:yaml-rust2"]
+[dependencies]
+serde_json = { version = "1", default-features = false, features = ["std"] }
+serde = { version = "1", default-features = false, features = ["std", "derive"] }
+serde_yaml_ng = { version = "=0.10.0", default-features = false, optional = true }
+yaml-rust2 = { version = "=0.13.0", default-features = false, optional = true }
+[profile.release]
+opt-level = "s"
+lto = "fat"
+codegen-units = 1
+debug = "line-tables-only"
+split-debuginfo = "packed"
+strip = "symbols"
+[profile.release.package.serde_json]
+opt-level = 3
