@@ -284,3 +284,21 @@ covers shutdown's final drain. The pipe renderer regression
 activity ends the process without querying the daemon. Failed attachments
 retain the durability design's explicit error; reconnect after recovery
 gets activity for the recovered prefix.
+
+The branch also merged main's platform and canonical-design changes through
+`a420694`. On that final tree, `mise run check` passed 918 tests (28 skipped);
+acceptance passed 12, web passed five, and Apple passed 10. Windows clippy,
+machete and the no-Tokio check passed. `CARGO_BUILD_JOBS=3` was set for every
+build. `mise run size` measured 3,007 KiB before the merges and 2,991 KiB
+after, including the fixture-exclusion check, below the 4,096 KiB limit.
+Budgets and startup timing were deliberately left to the coordinator on a
+quiet machine; no timing claim is made under the shared host's load.
+
+The final release fixture binary was built with
+`CARGO_TARGET_DIR=target/fixtures cargo build-release -p a --features fixtures`.
+One isolated `A_HOME` selected the `echo` agent. Sequential runs of `a -p hi`,
+`a -p 'sleep 0'` and `a --mode auto -p '$ true'`, 1,000 each with a 10-second
+per-process timeout, completed with zero hangs and zero nonzero exits in
+all three groups. The daemon was stopped through that home and the home
+removed; the fixture build directory and temporary stress script were
+removed. The loop is not committed.
