@@ -2130,12 +2130,13 @@ impl Actor {
             .origin(call, session.fence.load(Ordering::SeqCst))
             .expect("actor generation");
         self.inflight.insert(call, InFlight::Later);
-        Arc::clone(&session.shared.rt).spawn(Box::pin(async move {
-            if let Some(done) = unless(&handle.cancel, work).await {
-                session.emit(handle.fence, Completion::Event(then(done)));
+        let cancel = handle.cancel.clone();
+        let fence = handle.fence;
+        Arc::clone(&session.shared.rt).spawn(Box::pin(handle.run(async move {
+            if let Some(done) = unless(&cancel, work).await {
+                session.emit(fence, Completion::Event(then(done)));
             }
-            handle.ended.set();
-        }));
+        })));
     }
 
     /// Prepares the request of model call `call`, attempt `attempt`: the
@@ -2190,14 +2191,11 @@ impl Actor {
         let Some(InFlight::Prepared(prepared)) = self.inflight.remove(&call) else {
             return;
         };
-        let cancel = self.live.session.cancel(call);
         self.inflight.insert(call, InFlight::Model);
         let live = Arc::clone(&self.live);
         let fence = live.session.fence.load(Ordering::SeqCst);
-        let handle = lock(&self.live.session.work)
-            .get(&WorkId::Call(call))
-            .unwrap()
-            .clone();
+        let handle = live.session.origin(call, fence).expect("actor generation");
+        let cancel = handle.cancel.clone();
         self.live
             .session
             .shared
@@ -2248,18 +2246,14 @@ impl Actor {
             .session
             .origin(call, fence)
             .expect("actor generation");
-        let cx = self.live.session.cx(origin, &registry);
+        let cx = self.live.session.cx(origin.clone(), &registry);
         let session = Arc::clone(&self.live.session);
         let id = self.live.id;
-        let handle = lock(&self.live.session.work)
-            .get(&WorkId::Call(call))
-            .unwrap()
-            .clone();
         self.live
             .session
             .shared
             .rt
-            .spawn(Box::pin(handle.run(async move {
+            .spawn(Box::pin(origin.run(async move {
                 let began = crate::stamp();
                 let called = contain(registry.tools().run(&tool, &input, parsed, &cx)).await;
                 crate::session_event("effect", id, || {

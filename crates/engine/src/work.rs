@@ -52,7 +52,7 @@ impl<K> Default for WorkSet<K> {
 
 impl<K: PartialEq> WorkSet<K> {
     pub(super) fn insert(&mut self, handle: WorkHandle<K>) {
-        self.0.retain(|previous| previous.id != handle.id);
+        self.cancel(&handle.id);
         self.0.push(handle);
     }
 
@@ -83,14 +83,14 @@ impl<K> Drop for WorkSet<K> {
 
 impl Session {
     pub(super) fn own_work(&self, id: WorkId, admission: Admission, cancel: Cancel) -> WorkHandle {
-        let handle = WorkHandle {
-            id,
-            fence: self.fence.load(Ordering::SeqCst),
-            admission,
-            cancel,
-            ended: Flag::default(),
-        };
         let mut owned = lock(&self.work);
+        if matches!(id, WorkId::Call(_))
+            && let Some(previous) = owned.0.iter_mut().find(|handle| handle.id == id)
+        {
+            previous.admission = admission;
+            return previous.clone();
+        }
+        let handle = WorkHandle::new(id, self.fence.load(Ordering::SeqCst), admission, cancel);
         owned.0.retain(|previous| {
             if !matches!(previous.id, WorkId::Call(_)) && previous.ended.is_set() {
                 previous.cancel.set();
@@ -109,8 +109,6 @@ impl Session {
         work: impl FnOnce(Cancel) -> BoxFuture<'static, ()>,
     ) {
         let handle = self.own_work(id, admission, Cancel::default());
-        debug_assert_eq!(handle.fence, self.fence.load(Ordering::SeqCst));
-        debug_assert_eq!(handle.admission, admission);
         let task = work(handle.cancel.clone());
         self.shared.rt.spawn(Box::pin(handle.run(task)));
     }
@@ -120,6 +118,30 @@ impl Session {
 mod tests {
     use super::*;
     use kernel::Requirement;
+
+    #[test]
+    fn retirement_revokes_replaced_report_tasks() {
+        let mut work = WorkSet::default();
+        let id = WorkId::Report(SessionId::new());
+        let first = WorkHandle::new(
+            id.clone(),
+            7,
+            Admission {
+                through: 11,
+                requirement: Requirement::Durable,
+            },
+            Cancel::default(),
+        );
+        let second = WorkHandle::new(id, 7, first.admission, Cancel::default());
+        work.insert(first.clone());
+        work.insert(second.clone());
+        work.revoke();
+        assert!(second.cancel.is_set());
+        assert!(
+            first.cancel.is_set(),
+            "replacement must not orphan live report work"
+        );
+    }
 
     #[test]
     fn generation_retirement_revokes_every_owned_task() {
