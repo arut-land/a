@@ -1140,11 +1140,17 @@ fn hibernating_frees_the_session() {
     attachment.session().submit("hi").unwrap();
     settle(&daemon);
     let live = std::sync::Arc::downgrade(attachment.session());
-    let ended = attachment.session().ended();
+    let slot = daemon.slot(attachment.session().id).unwrap();
     drop(attachment);
     daemon.hibernate(Duration::ZERO);
-    rt::block_on(ended.wait());
-    // What lists it lets the stopped session go.
+    // The actor's end closes its writer before the daemon releases the
+    // stopping slot; even then, the slot already lists as hibernated.
+    daemon.wait("session unloaded", PATIENCE, || {
+        matches!(
+            *super::lock(&slot.residency),
+            super::Residency::Hibernated { .. }
+        )
+    });
     let listed = daemon.list().remove(0);
     let freed = live.upgrade().is_none();
     drop(daemon);
