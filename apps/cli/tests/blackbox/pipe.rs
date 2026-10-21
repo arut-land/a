@@ -40,6 +40,21 @@ fn text(bytes: &[u8]) -> &str {
     std::str::from_utf8(bytes).unwrap()
 }
 
+#[test]
+fn pipe_output_to_a_tty_cannot_inject_terminal_controls() {
+    let env = Env::new("pipe-tty-controls");
+    let mut term = env.tty(&["-p", "\x1b]0;injected-title\x07héllo 世界"], 80, 24);
+    assert!(term.wait().success());
+    term.wait_for("héllo 世界");
+    let output = term.bytes();
+    assert!(
+        !output
+            .windows(b"\x1b]0;injected-title\x07".len())
+            .any(|w| w == b"\x1b]0;injected-title\x07"),
+        "pipe mode wrote an OSC command to the terminal: {output:?}"
+    );
+}
+
 /// The short id of the one session `a ls` lists.
 fn only_session(env: &Env) -> String {
     let listed = env.run(&["ls"]);

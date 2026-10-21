@@ -4,14 +4,14 @@ macro_rules! sayln {
         $crate::out(format_args!("\n"))
     };
     ($($arg:tt)*) => {
-        $crate::out(format_args!("{}\n", client::sanitize(&format!($($arg)*))))
+        $crate::out(format_args!("{}\n", format_args!($($arg)*)))
     };
 }
 
 /// [`out`]s formatted text.
 macro_rules! say {
     ($($arg:tt)*) => {
-        $crate::out(format_args!("{}", client::sanitize(&format!($($arg)*))))
+        $crate::out(format_args!($($arg)*))
     };
 }
 
@@ -87,7 +87,12 @@ const STDOUT_GONE: i32 = 141;
 /// was attached to goes on in the daemon.
 fn out(args: fmt::Arguments<'_>) {
     let mut stdout = io::stdout().lock();
-    if let Err(e) = stdout.write_fmt(args).and_then(|()| stdout.flush())
+    let written = if stdout.is_terminal() {
+        write!(stdout, "{}", client::sanitize(&args.to_string()))
+    } else {
+        stdout.write_fmt(args)
+    };
+    if let Err(e) = written.and_then(|()| stdout.flush())
         && e.kind() == io::ErrorKind::BrokenPipe
     {
         std::process::exit(STDOUT_GONE);
