@@ -397,3 +397,56 @@ fn commands_and_agents_are_found_by_name() {
     let said = registry.agent(Some("nope")).step(hi(), registry.hooks());
     assert!(matches!(&said[..], [crate::Action::CallModel { .. }]));
 }
+
+#[test]
+fn a_non_inheritable_extension_contributes_nothing_to_children() {
+    struct RootOnly;
+    impl Extension for RootOnly {
+        const NAME: &'static str = "root-only";
+        const VERSION: u32 = 1;
+        const INHERIT: bool = false;
+
+        fn contribute(&self, r: &mut Registrar) {
+            r.tool(Named("root"))
+                .tool(Jobs)
+                .text(Text::system("root", 0, "root prompt"));
+            deny(r, "bash");
+        }
+    }
+    let parent = Registry::default().with(&RootOnly).unwrap();
+    let child = parent.inherited().unwrap();
+    assert!(child.tools().get("bash").is_none());
+    assert_eq!(child.commands().count(), 0);
+    assert!(child.system_prompt().is_empty());
+    assert_eq!(child.extensions().count(), 0);
+    assert_eq!(child.installed(), parent.installed());
+    assert_eq!(child.inherited().unwrap().extensions().count(), 0);
+}
+
+#[test]
+fn inheritance_refuses_a_missing_service_instead_of_weakening_the_child() {
+    trait Required: Send + Sync {}
+    struct Provider;
+    impl Required for Provider {}
+    impl Extension for Provider {
+        const NAME: &'static str = "provider";
+        const VERSION: u32 = 1;
+        const INHERIT: bool = false;
+        fn contribute(&self, r: &mut Registrar) {
+            r.provide::<dyn Required>(Arc::new(Self));
+        }
+    }
+    struct Consumer;
+    impl Extension for Consumer {
+        const NAME: &'static str = "consumer";
+        const VERSION: u32 = 1;
+        type Needs = (Need<dyn Required>, ());
+        fn contribute(&self, _: &mut Registrar) {}
+    }
+    let parent = Registry::default()
+        .with(&Provider)
+        .unwrap()
+        .with(&Consumer)
+        .unwrap();
+    assert!(parent.inherited().is_err());
+}

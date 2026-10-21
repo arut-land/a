@@ -431,6 +431,11 @@ impl Live {
             (None, _) => shared.registry.get(),
         };
         let (tx, rx) = channel::unbounded();
+        let registry = if header.parent.is_some() {
+            Arc::new(registry.inherited().map_err(io::Error::other)?)
+        } else {
+            registry
+        };
         let session = Session::new(header, shared, Arc::new(tx), &registry);
         let bound = bind(&registry, &session);
         let binding = Arc::clone(&bound) as Arc<dyn Binding>;
@@ -915,6 +920,14 @@ impl Actor {
             .source
             .as_ref()
             .map_or_else(|| shared.registry.get(), |source| source.registry());
+        let newest = if self.live.parent.is_some() {
+            match newest.inherited() {
+                Ok(registry) => Arc::new(registry),
+                Err(_) => return Ok(()),
+            }
+        } else {
+            newest
+        };
         let bound = bind(&newest, &self.live.session);
         let binding = Arc::clone(&bound) as Arc<dyn Binding>;
         let frames = Arc::clone(&self.live.frames);

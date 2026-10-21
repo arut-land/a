@@ -145,6 +145,7 @@ impl Toolset {
 
 #[derive(Clone)]
 struct Loaded {
+    inherit: bool,
     name: Name,
     version: u32,
     image: Option<Json>,
@@ -155,6 +156,8 @@ struct Loaded {
 /// The extensions a daemon runs with, and what they make.
 #[derive(Default)]
 pub struct Registry {
+    /// The complete generation image is needed by layered loaders on recovery.
+    source_manifest: Option<Vec<Installed>>,
     installed: Vec<Loaded>,
     tools: Toolset,
     hooks: Hooks,
@@ -170,6 +173,7 @@ pub struct Registry {
 impl Clone for Registry {
     fn clone(&self) -> Self {
         let mut registry = Self {
+            source_manifest: self.source_manifest.clone(),
             installed: self.installed.clone(),
             ..Self::default()
         };
@@ -179,6 +183,38 @@ impl Clone for Registry {
 }
 
 impl Registry {
+    /// Selects complete registrations, then validates the remaining service graph.
+    pub fn inherited(&self) -> Result<Self, Refused> {
+        let mut registry = Self {
+            source_manifest: Some(self.installed()),
+            installed: self
+                .installed
+                .iter()
+                .filter(|i| i.inherit)
+                .cloned()
+                .collect(),
+            ..Self::default()
+        };
+        for extension in &registry.installed {
+            for (ty, name) in &extension.made.needs {
+                if !registry.installed.iter().any(|provider| {
+                    provider
+                        .made
+                        .services
+                        .iter()
+                        .any(|service| service.ty == *ty)
+                }) {
+                    return Err(Refused(format!(
+                        "inherited extension {} needs {name}, which no inherited extension provides",
+                        extension.name
+                    )));
+                }
+            }
+        }
+        registry.rebuild();
+        Ok(registry)
+    }
+
     /// Registers `ext` in [`Tier::User`]: see [`Registry::with_in`].
     pub fn with<E: Extension>(self, ext: &E) -> Result<Self, Refused> {
         self.with_in(Tier::User, ext)
@@ -196,6 +232,7 @@ impl Registry {
         let mut made = Registrar::default();
         ext.contribute(&mut made);
         self.install(Loaded {
+            inherit: ext.inherit(),
             name: ext.name(),
             version: ext.version(),
             image: ext.image(),
@@ -441,6 +478,9 @@ impl Registry {
 
     /// The extensions, as a log records them.
     pub fn installed(&self) -> Vec<Installed> {
+        if let Some(manifest) = &self.source_manifest {
+            return manifest.clone();
+        }
         self.installed
             .iter()
             .map(|loaded| Installed {

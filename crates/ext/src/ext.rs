@@ -32,6 +32,8 @@ pub trait Extension: Send + Sync {
     /// Who the extension's handlers are, in logged decisions.
     const NAME: &'static str;
     const VERSION: u32;
+    /// Whether the whole registration participates in owned child conversations.
+    const INHERIT: bool = true;
     /// The services it needs of the extensions before it, as a list of
     /// [`Need`](crate::Need)s: `(Need<dyn CwdOf>, ())`. A static assembly
     /// ([`Built`](crate::host::Built)) that lacks one does not compile; a
@@ -46,6 +48,9 @@ pub trait Extension: Send + Sync {
 pub trait DynExtension: Send + Sync {
     fn name(&self) -> Name;
     fn version(&self) -> u32;
+    fn inherit(&self) -> bool {
+        true
+    }
     fn image(&self) -> Option<protocol::Json> {
         None
     }
@@ -59,6 +64,10 @@ impl<E: Extension> DynExtension for E {
 
     fn version(&self) -> u32 {
         E::VERSION
+    }
+
+    fn inherit(&self) -> bool {
+        E::INHERIT
     }
 
     fn contribute(&self, r: &mut Registrar) {

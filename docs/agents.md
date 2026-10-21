@@ -63,6 +63,9 @@ explicitly inheritable state is restored into the child.
 
 `Extension::INHERIT` is an associated const, defaulting to `true`.
 The erased extension trait exposes that declaration for runtime assemblies.
+The recorded installation manifest retains the complete source generation so
+layered loaders can restore it before applying the child filter. This is
+restoration metadata, not a declaration that excluded handlers execute.
 Filtering operates on whole registrations: tools, client callables, hooks,
 text, folds, services and agents travel together. There is no per-feature
 list in the engine. A child registry is rebuilt and its service requirements
