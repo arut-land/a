@@ -131,7 +131,8 @@ impl Mcp {
                     let mut client = if let Some(client) = client.filter(stdio::Client::alive) {
                         client
                     } else {
-                        let mut client = stdio::Client::start(server, cx).await?;
+                        let mut client =
+                            stdio::Client::start(server, cx, Arc::downgrade(&self.0)).await?;
                         let discovered = client.request("server/discover", json!({}), cx).await?;
                         if !discovered["supportedVersions"]
                             .as_array()

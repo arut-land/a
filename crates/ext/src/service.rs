@@ -98,24 +98,42 @@ impl std::ops::Deref for OwnedProcess {
 }
 
 /// Session cancellation owns a control lease independently of pipe ownership.
-pub struct ProcessLease(Arc<dyn RunningProcess>);
+pub struct ProcessLease {
+    process: Arc<dyn RunningProcess>,
+    released: Option<Box<dyn FnOnce() + Send + Sync>>,
+}
+
+impl ProcessLease {
+    /// Completion and rejected adoption must both release dependent resources.
+    #[must_use]
+    pub fn on_release(mut self, released: impl FnOnce() + Send + Sync + 'static) -> Self {
+        self.released = Some(Box::new(released));
+        self
+    }
+}
 
 impl From<Arc<dyn RunningProcess>> for ProcessLease {
     fn from(process: Arc<dyn RunningProcess>) -> Self {
-        Self(process)
+        Self {
+            process,
+            released: None,
+        }
     }
 }
 
 impl std::ops::Deref for ProcessLease {
     type Target = Arc<dyn RunningProcess>;
     fn deref(&self) -> &Self::Target {
-        &self.0
+        &self.process
     }
 }
 
 impl Drop for ProcessLease {
     fn drop(&mut self) {
         let _ = self.signal(ProcessSignal::Kill);
+        if let Some(released) = self.released.take() {
+            released();
+        }
     }
 }
 
