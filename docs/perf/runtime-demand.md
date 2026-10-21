@@ -53,6 +53,20 @@ A last handle dropped on one of its own workers signals shutdown without
 joining: the executor must return before its pending futures can
 release I/O cancellation guards. This path has a dedicated regression test.
 
+Task wakers pin the executor only while forwarding a wake. A weak reference
+breaks the ownership cycle and makes wakes after executor destruction no-ops.
+This guards async-executor 1.14.0's borrowed scheduler state against concurrent
+executor destruction; the unguarded race reports undefined behaviour in Miri.
+The private spawn adapter caches one wrapper for the task's fixed scheduler
+waker: one Arc allocation on first poll, none on subsequent polls. Comparing
+cloned scheduler wakers with `will_wake` caused false negatives and repeated
+allocations in both the native dev build and Miri. Each forwarded wake pays
+one weak upgrade and strong-reference release; no timers or idle work are added.
+The `task_wakes_can_race_executor_drop` and
+`task_waker_is_reused_when_the_scheduler_waker_is_unchanged` tests cover the
+race, late wakes, executor reclamation and allocation reuse. `mise run test:miri`
+runs both before the existing sys tests.
+
 Network reservations include request payload and bounded stream buffers.
 Logging reserves its fixed-record batch plus encoding scratch. Generic
 storage and projection jobs reserve an explicit 8 MiB working allowance;

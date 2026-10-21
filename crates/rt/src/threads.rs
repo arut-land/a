@@ -5,8 +5,8 @@ use std::collections::{BTreeMap, VecDeque};
 use std::future::Future;
 use std::io;
 use std::pin::Pin;
-use std::sync::{Arc, Condvar, Mutex};
-use std::task::{Context, Poll, Waker};
+use std::sync::{Arc, Condvar, Mutex, Weak};
+use std::task::{Context, Poll, Wake, Waker};
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
 
@@ -69,6 +69,46 @@ pub struct Threads {
 struct Workers {
     tasks: Option<Arc<Executor<'static>>>,
     threads: Vec<(Arc<Wakeup>, JoinHandle<()>)>,
+}
+
+// async-executor's scheduler borrows its State. Cancellation drains tasks,
+// but an external wake can still be inside the scheduler when State is freed.
+// Only expose wakers that hold the executor for the duration of scheduling;
+// a weak reference avoids keeping pending tasks and their executor in a cycle.
+struct TaskWake {
+    executor: Weak<Executor<'static>>,
+    task: Waker,
+}
+
+impl Wake for TaskWake {
+    fn wake(self: Arc<Self>) {
+        self.wake_by_ref();
+    }
+
+    fn wake_by_ref(self: &Arc<Self>) {
+        if let Some(_executor) = self.executor.upgrade() {
+            self.task.wake_by_ref();
+        }
+    }
+}
+
+fn guarded_task(
+    executor: &Arc<Executor<'static>>,
+    mut task: BoxFuture<'static, ()>,
+) -> impl Future<Output = ()> + Send + 'static {
+    let executor = Arc::downgrade(executor);
+    // async-executor polls each task with its fixed async-task scheduler waker.
+    // Cache the wrapper itself: no allocation or refcount traffic on later polls.
+    let mut waker = None;
+    std::future::poll_fn(move |cx| {
+        let waker = waker.get_or_insert_with(|| {
+            Waker::from(Arc::new(TaskWake {
+                executor: executor.clone(),
+                task: cx.waker().clone(),
+            }))
+        });
+        task.as_mut().poll(&mut Context::from_waker(waker))
+    })
 }
 
 #[derive(Default)]
@@ -263,7 +303,7 @@ impl Runtime for Threads {
                 workers.threads.push((stop, handle));
             }
         }
-        tasks.spawn(task).detach();
+        tasks.spawn(guarded_task(&tasks, task)).detach();
     }
 
     fn spawn_blocking(
@@ -434,6 +474,58 @@ impl Gate {
 mod tests {
     use super::*;
     use crate::{block_on, oneshot, spawn};
+
+    #[test]
+    fn task_wakes_can_race_executor_drop() {
+        for _ in 0..100 {
+            let executor = Arc::new(Executor::new());
+            let (sent, received) = std::sync::mpsc::channel();
+            let task = Box::pin(std::future::poll_fn(move |cx| {
+                sent.send(cx.waker().clone()).unwrap();
+                Poll::<()>::Pending
+            }));
+            executor.spawn(guarded_task(&executor, task)).detach();
+            assert!(executor.try_tick());
+            let wake = received.recv().unwrap();
+            let late = wake.clone();
+            let gone = Arc::downgrade(&executor);
+            let barrier = Arc::new(std::sync::Barrier::new(2));
+            let start = Arc::clone(&barrier);
+            let worker = thread::spawn(move || {
+                start.wait();
+                wake.wake();
+            });
+            barrier.wait();
+            drop(executor);
+            worker.join().unwrap();
+            assert!(
+                gone.upgrade().is_none(),
+                "wakers cannot retain the executor"
+            );
+            late.wake_by_ref();
+            late.wake();
+        }
+    }
+
+    #[test]
+    fn task_waker_is_reused_when_the_scheduler_waker_is_unchanged() {
+        let executor = Arc::new(Executor::new());
+        let (sent, received) = std::sync::mpsc::channel();
+        let task = Box::pin(std::future::poll_fn(move |cx| {
+            sent.send(cx.waker().clone()).unwrap();
+            Poll::<()>::Pending
+        }));
+        executor.spawn(guarded_task(&executor, task)).detach();
+        assert!(executor.try_tick());
+        let first = received.recv().unwrap();
+        for _ in 0..3 {
+            first.wake_by_ref();
+            assert!(executor.try_tick());
+            let next = received.recv().unwrap();
+            // Compare allocations: will_wake permits false negatives.
+            assert_eq!(first.data(), next.data());
+        }
+    }
 
     #[test]
     fn submission_bursts_count_starting_workers() {

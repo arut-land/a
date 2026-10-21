@@ -80,9 +80,12 @@ fi
 # names a platform, so all of it, `a` included, builds there.
 # Vendored Lua needs the native C SDK; Windows CI lints that optional feature.
 "check:windows" = "cargo clippy --workspace --exclude ext-lua --all-targets --target x86_64-pc-windows-msvc -- -D warnings"
-# Miri over sys, the one crate with unsafe code. Miri runs no processes and
+# Miri over sys and rt's executor lifetime boundary. Miri runs no processes and
 # (on macOS) sets no file times, nor modes, so the tests that need those are skipped.
-"test:miri" = "MIRIFLAGS=-Zmiri-disable-isolation cargo miri test -p sys --lib -- --skip install:: --skip asks_a_shell --skip stages_newest --skip a_higher_version --skip tests::a_group_leader --skip tests::kills --skip fs::tests"
+"test:miri" = '''
+cargo miri test -p rt --lib threads::tests::task_wak
+MIRIFLAGS=-Zmiri-disable-isolation cargo miri test -p sys --lib -- --skip install:: --skip asks_a_shell --skip stages_newest --skip a_higher_version --skip tests::a_group_leader --skip tests::kills --skip fs::tests
+'''
 # Coverage-guided fuzzing (libFuzzer) of protocol and skill frontmatter.
 # Crashes land beside the target in __fuzz__, replayed by ordinary tests;
 # generated corpora stay in target/fuzz.
