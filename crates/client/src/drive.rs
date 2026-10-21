@@ -17,6 +17,18 @@ use crate::{
 type Sink = dyn Fn(&ClientHandle, Event) + Send + Sync;
 type Origin = dyn Fn() -> io::Result<Environment> + Send + Sync;
 
+pub async fn yield_now() {
+    let mut yielded = false;
+    std::future::poll_fn(|cx| {
+        if std::mem::replace(&mut yielded, true) {
+            return std::task::Poll::Ready(());
+        }
+        cx.waker().wake_by_ref();
+        std::task::Poll::Pending
+    })
+    .await;
+}
+
 /// What renders a session client's [`Show`] effects: an app's screen, a
 /// web page, a feed to another language. Showing may ask the client for
 /// more (a picker opening asks for the list), which comes back as effects.
@@ -87,7 +99,7 @@ struct Outbox {
 
 #[derive(Default)]
 struct Queued {
-    items: VecDeque<(u64, Request)>,
+    items: VecDeque<(u64, usize, Request)>,
     closed: bool,
 }
 
@@ -114,29 +126,59 @@ impl Outbox {
             epoch.fetch_add(1, Ordering::AcqRel);
         }
         let coalesced =
-            request.environment() && state.items.iter().any(|(_, item)| item.environment());
+            request.environment() && state.items.iter().any(|(_, _, item)| item.environment());
         if coalesced {
-            state.items.retain(|(_, item)| !item.environment());
+            state.items.retain(|(_, _, item)| !item.environment());
+        }
+        let bytes = match &request {
+            Request::Io(io) => match &**io {
+                Io::Send(msg) => {
+                    let mut bytes = crate::ByteCount(0);
+                    serde_json::to_writer(&mut bytes, msg).map_err(io::Error::other)?;
+                    bytes.0
+                }
+                Io::Connect { attach, .. } => match &attach.env {
+                    crate::Env::Given(env) => env
+                        .vars
+                        .iter()
+                        .map(|(key, value)| key.len() + value.len())
+                        .sum(),
+                    _ => 0,
+                },
+                _ => 0,
+            },
+            Request::Flush(_) => 0,
+        };
+        let retained: usize = state.items.iter().map(|(_, bytes, _)| bytes).sum();
+        let control = matches!(&request, Request::Io(io) if matches!(&**io, Io::Send(ClientMsg::Interrupt { .. })));
+        let budget = crate::QueueBudget::default();
+        let limit = if control {
+            budget.bytes
+        } else {
+            budget.bytes / 2
+        };
+        if bytes > limit.saturating_sub(retained) {
+            return Err(Error::Busy);
         }
         let mutation = request.mutation();
         let limit = if mutation {
-            MUTATION_SLOTS
+            MUTATION_SLOTS - usize::from(!control)
         } else {
             CONTROL_SLOTS
         };
         if state
             .items
             .iter()
-            .filter(|(_, item)| item.mutation() == mutation)
+            .filter(|(_, _, item)| item.mutation() == mutation)
             .count()
-            == limit
+            >= limit
         {
             return Err(Error::Busy);
         }
         if !matches!(&request, Request::Io(io) if matches!(&**io, Io::Hangup)) {
             state
                 .items
-                .push_back((epoch.load(Ordering::Acquire), request));
+                .push_back((epoch.load(Ordering::Acquire), bytes, request));
         }
         drop(state);
         self.ready.notify();
@@ -148,8 +190,8 @@ impl Outbox {
             let seen = self.ready.count();
             {
                 let mut state = self.state.lock().unwrap_or_else(PoisonError::into_inner);
-                if let Some(item) = state.items.pop_front() {
-                    return Some(item);
+                if let Some((epoch, _, item)) = state.items.pop_front() {
+                    return Some((epoch, item));
                 }
                 if state.closed {
                     return None;
@@ -322,7 +364,13 @@ impl Driver {
             return None;
         }
         let read = async {
+            let mut batch = 0;
             loop {
+                batch += 1;
+                if batch == crate::PUMP_BATCH {
+                    batch = 0;
+                    yield_now().await;
+                }
                 match io.recv(&mut buffered).await {
                     Ok(Some(msg)) => {
                         if !self.emit(handle, conn, generation, EventKind::Msg(msg)) {
@@ -335,7 +383,13 @@ impl Driver {
             }
         };
         let write = async {
+            let mut batch = 0;
             while let Some((epoch, command)) = rx.recv().await {
+                batch += 1;
+                if batch == crate::PUMP_BATCH {
+                    batch = 0;
+                    yield_now().await;
+                }
                 if epoch != generation {
                     return (Error::Closed, Some((epoch, command)));
                 }
@@ -744,6 +798,44 @@ mod tests {
     use std::sync::mpsc;
     use std::task::Poll;
 
+    #[test]
+    fn cancellation_progresses_under_saturation() {
+        let outbox = Outbox::default();
+        let epoch = AtomicU64::new(0);
+        let send = |msg| outbox.send(&epoch, Request::Io(Box::new(Io::Send(msg))));
+        for _ in 0..MUTATION_SLOTS - 1 {
+            send(ClientMsg::input("input")).unwrap();
+        }
+        assert_eq!(send(ClientMsg::input("overflow")), Err(Error::Busy));
+        send(ClientMsg::Interrupt {
+            client_seq: Some(65),
+        })
+        .unwrap();
+        let outbox = Outbox::default();
+        let large = "x".repeat(crate::QueueBudget::default().bytes / 3);
+        outbox
+            .send(
+                &epoch,
+                Request::Io(Box::new(Io::Send(ClientMsg::input(large.clone())))),
+            )
+            .unwrap();
+        assert_eq!(
+            outbox.send(
+                &epoch,
+                Request::Io(Box::new(Io::Send(ClientMsg::input(large))))
+            ),
+            Err(Error::Busy)
+        );
+        outbox
+            .send(
+                &epoch,
+                Request::Io(Box::new(Io::Send(ClientMsg::Interrupt {
+                    client_seq: Some(2),
+                }))),
+            )
+            .unwrap();
+    }
+
     struct Fixture {
         home: sys::Home,
         daemon: Daemon,
@@ -900,7 +992,7 @@ mod tests {
             queue.send(&epoch, Request::Io(Box::new(Io::Send(ClientMsg::List)))),
             Err(Error::Busy)
         );
-        for seq in 1..=MUTATION_SLOTS {
+        for seq in 1..MUTATION_SLOTS {
             queue
                 .send(
                     &epoch,
@@ -912,6 +1004,14 @@ mod tests {
                 )
                 .unwrap();
         }
+        queue
+            .send(
+                &epoch,
+                Request::Io(Box::new(Io::Send(ClientMsg::Interrupt {
+                    client_seq: Some(MUTATION_SLOTS as u64),
+                }))),
+            )
+            .unwrap();
         assert_eq!(
             queue.send(&epoch, Request::Io(Box::new(Io::Send(large_input())))),
             Err(Error::Busy)
@@ -943,7 +1043,7 @@ mod tests {
         }
         let mut state = queue.state.lock().unwrap();
         assert_eq!(state.items.len(), 1);
-        let (_, Request::Io(io)) = state.items.pop_front().unwrap() else {
+        let (_, _, Request::Io(io)) = state.items.pop_front().unwrap() else {
             panic!("expected environment");
         };
         assert!(

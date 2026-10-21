@@ -14,17 +14,40 @@ use protocol::{Caps, DaemonMsg, Decode};
 use crate::{ClientError, Resync, SessionSnapshot, TITLE, TurnInfo, ViewChange, ViewUpdate};
 
 /// How many updates a stream buffers for a slow reader before it drops.
-const BUFFER: usize = 1024;
+const BUFFER: usize = BUDGET.control_reserve;
 
 /// How many recent updates [`Feed::resync`] can hand back. An item crosses
 /// whole once and is patched after, so what they keep is about what the
 /// transcript holds.
-const KEPT: usize = 512;
+const BUDGET: client::QueueBudget = client::QueueBudget {
+    bytes: 4 << 20,
+    requests: 512,
+    control_reserve: 16,
+};
+const KEPT: usize = BUDGET.requests;
+const BYTES: usize = BUDGET.bytes;
+
+impl ViewUpdate {
+    #[allow(unexpected_cfgs)]
+    fn retained_bytes(&self) -> usize {
+        #[cfg(not(boltffi_metadata))]
+        {
+            use boltffi::__private::wire::WireEncode;
+            self.wire_size()
+        }
+        // The binding scanner omits generated codecs and never executes this code.
+        #[cfg(boltffi_metadata)]
+        {
+            0
+        }
+    }
+}
 
 pub(crate) struct Feed {
     pub client: SessionClient,
-    /// The number of the last update published.
     rev: u64,
+    bytes: usize,
+    pub retained_bytes: usize,
     recent: VecDeque<ViewUpdate>,
     producer: StreamProducer<ViewUpdate>,
 }
@@ -34,6 +57,8 @@ impl Feed {
         Self {
             client,
             rev: 0,
+            bytes: 0,
+            retained_bytes: 0,
             recent: VecDeque::with_capacity(KEPT),
             producer: StreamProducer::new(BUFFER),
         }
@@ -46,7 +71,7 @@ impl Feed {
     fn publish(&mut self, change: ViewChange) {
         self.rev += 1;
         let view = self.client.view();
-        let update = ViewUpdate {
+        let mut update = ViewUpdate {
             rev: self.rev,
             seq: view.seq,
             change,
@@ -54,10 +79,25 @@ impl Feed {
             streaming: view.streaming.as_ref().map(|s| s.call.get()),
             title: view.side(TITLE).map(str::to_owned),
         };
-        self.producer.push(update.clone());
-        if self.recent.len() == KEPT {
-            self.recent.pop_front();
+        let mut bytes = update.retained_bytes();
+        self.retained_bytes = self.retained_bytes.saturating_add(bytes);
+        if bytes > BYTES / BUFFER {
+            self.recent.clear();
+            self.bytes = 0;
+            // The missing revision forces a snapshot before this small notification.
+            self.rev += 1;
+            update.rev = self.rev;
+            update.change = ViewChange::Activity;
+            update.title = None;
+            bytes = update.retained_bytes();
         }
+        self.producer.push(update.clone());
+        while self.recent.len() >= KEPT || self.bytes + bytes > BYTES {
+            if let Some(old) = self.recent.pop_front() {
+                self.bytes -= old.retained_bytes();
+            }
+        }
+        self.bytes += bytes;
         self.recent.push_back(update);
     }
 
@@ -68,7 +108,11 @@ impl Feed {
     /// The updates after rev `from`, or a snapshot once some are no longer
     /// kept.
     pub fn resync(&self, from: u64) -> Resync {
-        let kept = self.recent.front().is_none_or(|u| u.rev <= from + 1);
+        let kept = from == self.rev
+            || self
+                .recent
+                .front()
+                .is_some_and(|u| u.rev <= from.saturating_add(1));
         if kept {
             Resync::Updates {
                 updates: self
@@ -86,7 +130,6 @@ impl Feed {
     }
 }
 
-/// Publishes what the client shows.
 impl Renderer for Feed {
     fn show(&mut self, shown: Vec<Show>) -> Vec<Effect> {
         for show in shown {
@@ -186,5 +229,33 @@ impl Reducer {
     /// What the controls offer for the turn now.
     pub fn turn(&self) -> TurnInfo {
         lock(&self.feed).client.turn().into()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn oversized_updates_force_a_snapshot_instead_of_retaining_payload_copies() {
+        let mut feed = Feed::new(SessionClient::new(client::Env::Keep));
+        let stream = feed.subscribe();
+        feed.publish(ViewChange::Delta {
+            call: 1,
+            text: "x".repeat(BYTES),
+        });
+        assert!(feed.bytes < BYTES);
+        assert!(matches!(feed.resync(0), Resync::Snapshot { .. }));
+        let update = stream.pop_event().unwrap();
+        assert_eq!(update.rev, 2);
+        assert!(matches!(update.change, ViewChange::Activity));
+        for _ in 0..KEPT * 2 {
+            feed.publish(ViewChange::Error {
+                message: "x".repeat(16 << 10),
+            });
+        }
+        assert!(feed.bytes <= BYTES);
+        assert!(feed.recent.len() <= KEPT);
+        assert!(matches!(feed.resync(0), Resync::Snapshot { .. }));
     }
 }

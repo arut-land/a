@@ -17,8 +17,8 @@ mod watch;
 
 pub use approval::{ApprovalPart, approval_parts, approval_text};
 pub use command::{COMMANDS, Cmd, Command, help, parse};
-pub use drive::{ClientHandle, Driver, Renderer, pump};
-pub use inbox::{Inbox, Post, inbox};
+pub use drive::{ClientHandle, Driver, Renderer, pump, yield_now};
+pub use inbox::{Inbox, PUMP_BATCH, Post, QueueBudget, inbox};
 pub use session::{
     Attach, ConnId, Effect, End, Env, Event, EventKind, Io, Link, Notice, Offer, SessionClient,
     Show, TurnView,
@@ -721,7 +721,7 @@ fn locked(file: File, within: Option<Duration>) -> Option<File> {
     if sys::fs::try_lock(&file).is_ok() {
         return Some(file);
     }
-    let (tx, rx) = inbox();
+    let (tx, rx) = inbox(QueueBudget::default(), |_| size_of::<File>());
     thread::spawn(move || {
         if sys::fs::lock(&file).is_ok() {
             // Dropped, and so unlocked, when no one waits any more.
@@ -931,6 +931,38 @@ fn connect_or_spawn(home: &Home, reset: bool) -> io::Result<(Stream, bool)> {
     let mut daemon = sys::spawn_daemon(&mut cmd, home, lock)?;
     thread::spawn(move || daemon.wait());
     Ok((endpoint.connect()?, true))
+}
+
+impl Event {
+    /// Encoded payload plus fixed queue overhead; no payload copy is retained.
+    pub fn retained_bytes(&self) -> usize {
+        let mut count = ByteCount(size_of::<Self>());
+        match &self.kind {
+            EventKind::Msg(msg) => {
+                let _ = serde_json::to_writer(&mut count, msg);
+            }
+            EventKind::Connected { commands, .. } => {
+                for command in commands {
+                    count.0 += command.name.len() + command.description.len();
+                }
+            }
+            _ => {
+                count.0 += 4096;
+            }
+        }
+        count.0
+    }
+}
+
+pub(crate) struct ByteCount(pub usize);
+impl Write for ByteCount {
+    fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
+        self.0 += bytes.len();
+        Ok(bytes.len())
+    }
+    fn flush(&mut self) -> io::Result<()> {
+        Ok(())
+    }
 }
 
 #[cfg(test)]

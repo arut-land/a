@@ -82,9 +82,9 @@ final class AppModel {
     /// Files the draft under its id once it is attached.
     func adoptDraft() {
         guard let draft, let id = draft.sessionId else { return }
+        selection = id
         cache.insert(draft, id: id)
         self.draft = nil
-        selection = id
     }
 
     func chooseWorkspace() {

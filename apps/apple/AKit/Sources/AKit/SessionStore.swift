@@ -1,6 +1,10 @@
 import Foundation
 import Observation
 
+public enum CacheState: Equatable {
+    case active, cached, detached
+}
+
 public enum AttachmentState: Equatable {
     case detached
     case attaching
@@ -38,6 +42,10 @@ public final class SessionStore {
         }
     }
 
+    public fileprivate(set) var cacheState: CacheState = .detached
+    fileprivate var retainedBytes: UInt64 { session?.retainedBytes() ?? 0 }
+    @ObservationIgnored fileprivate var viewChanged: (() -> Void)?
+
     @ObservationIgnored private var source: (any ViewSource)?
     @ObservationIgnored private var session: Session?
     @ObservationIgnored fileprivate var attachmentChanged: ((SessionStore) -> Void)?
@@ -60,9 +68,15 @@ public final class SessionStore {
         guard listening == nil, let source else { return }
         let updates = source.updates()
         listening = Task { [weak self] in
+            var batch = 0
             for await update in updates {
                 guard !Task.isCancelled else { break }
                 self?.apply(update)
+                batch += 1
+                if batch == 64 {
+                    batch = 0
+                    await Task.yield()
+                }
             }
         }
     }
@@ -121,7 +135,8 @@ public final class SessionStore {
         }
     }
 
-    private func releaseAttachment() {
+    fileprivate func releaseAttachment() {
+        cacheState = .detached
         listening?.cancel()
         listening = nil
         session = nil
@@ -142,6 +157,7 @@ public final class SessionStore {
     /// Applies `update`: once, in order, catching up first on a gap.
     public func apply(_ update: ViewUpdate) {
         if update.rev <= rev { return }
+        defer { viewChanged?() }
         if update.rev != rev + 1 {
             catchUp()
             if update.rev <= rev { return }
@@ -212,9 +228,35 @@ public final class SessionStore {
 @Observable
 public final class SessionStoreCache {
     public private(set) var stores: [String: SessionStore] = [:]
-    public var selection: String?
+    public var selection: String? {
+        didSet {
+            if let selection { order.removeAll { $0 == selection }; order.append(selection) }
+            trim()
+        }
+    }
+    @ObservationIgnored private var order: [String] = []
+    private let budgetBytes: UInt64
+    private let capacity: Int
 
-    public init() {}
+    public init(capacity: Int = 4, bytes: UInt64 = 16 << 20) {
+        self.capacity = max(0, capacity)
+        self.budgetBytes = bytes
+    }
+
+    private func trim() {
+        for (id, store) in stores { store.cacheState = id == selection ? .active : .cached }
+        var inactive = order.filter { $0 != selection && stores[$0] != nil }
+        var bytes = inactive.reduce(UInt64(0)) { $0 + (stores[$1]?.retainedBytes ?? 0) }
+        while inactive.count > capacity || bytes > budgetBytes {
+            let id = inactive.removeFirst()
+            guard let store = stores.removeValue(forKey: id) else { continue }
+            bytes -= store.retainedBytes
+            order.removeAll { $0 == id }
+            store.attachmentChanged = nil
+            store.viewChanged = nil
+            store.releaseAttachment()
+        }
+    }
 
     @discardableResult
     public func open(_ id: String, client: Client) -> SessionStore {
@@ -227,8 +269,12 @@ public final class SessionStoreCache {
 
     public func insert(_ store: SessionStore, id: String) {
         stores[id] = store
+        order.removeAll { $0 == id }
+        order.append(id)
+        store.viewChanged = { [weak self] in self?.trim() }
         store.attachmentChanged = { [weak self] store in self?.rekey(store) }
         if case .attached = store.attachment { rekey(store) }
+        trim()
     }
 
     private func rekey(_ store: SessionStore) {
@@ -236,12 +282,15 @@ public final class SessionStoreCache {
         let oldKeys = stores.keys.filter { stores[$0] === store }
         let selected = oldKeys.contains { $0 == selection }
         for key in oldKeys { stores.removeValue(forKey: key) }
+        order.removeAll { oldKeys.contains($0) }
         if case .attached(let id) = store.attachment {
             stores[id] = store
+            order.append(id)
             if selected { selection = id }
         } else if selected {
             selection = nil
         }
+        trim()
     }
 }
 

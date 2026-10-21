@@ -37,6 +37,7 @@ impl From<Ended> for ExitCode {
 
 /// What wakes the loop.
 enum Input {
+    Busy,
     /// All of stdin; none when it is a terminal.
     Stdin(Option<String>),
     Interrupt,
@@ -49,13 +50,18 @@ pub fn run(
     prompt: Option<String>,
     mode: Option<String>,
 ) -> io::Result<ExitCode> {
-    let (tx, rx) = client::inbox();
+    let (tx, rx) = client::inbox(client::QueueBudget::default(), |input| {
+        size_of::<Input>()
+            + match input {
+                Input::Client(event) => event.retained_bytes(),
+                Input::Stdin(Some(text)) => text.len(),
+                _ => 0,
+            }
+    });
     let events = tx.clone();
     let runtime: rt::Rt = std::sync::Arc::new(rt::Threads::default());
-    let driver = Driver::new(move |_, event| {
-        let _ = events.send(Input::Client(event));
-    })
-    .start(runtime.clone(), daemon.clone());
+    let driver = Driver::new(move |driver, event| events.event(driver, event, Input::Client))
+        .start(runtime.clone(), daemon.clone());
     let stdin = tx.clone();
     thread::spawn(move || {
         let text = (!io::stdin().is_terminal()).then(|| {
@@ -63,7 +69,9 @@ pub fn run(
             let _ = io::stdin().lock().read_to_end(&mut bytes);
             String::from_utf8_lossy(&bytes).into_owned()
         });
-        let _ = stdin.send(Input::Stdin(text));
+        if stdin.send(Input::Stdin(text)).is_err() {
+            stdin.close_with(Input::Busy);
+        }
     });
     // Ctrl-C interrupts the turn; where signals are not caught it ends `a`
     // as it would anything else.
@@ -105,6 +113,7 @@ pub fn run(
         };
         effects = match input {
             Input::Client(event) => once.client.step(event),
+            Input::Busy => return Err(client::Error::Busy.into()),
             Input::Stdin(text) => {
                 (once.read, once.stdin) = (true, text);
                 once.send()

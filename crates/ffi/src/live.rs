@@ -316,6 +316,11 @@ impl Session {
         lock(&self.feed).subscribe()
     }
 
+    /// A conservative byte charge for all view payloads received since opening.
+    pub fn retained_bytes(&self) -> u64 {
+        lock(&self.feed).retained_bytes as u64
+    }
+
     pub fn snapshot(&self) -> SessionSnapshot {
         lock(&self.feed).snapshot()
     }

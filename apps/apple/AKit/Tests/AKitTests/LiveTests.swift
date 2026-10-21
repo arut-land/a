@@ -185,3 +185,38 @@ func daemon_diagnosis_is_fetched_asynchronously() async throws {
     _ = try await client.settings()
     #expect(try await client.daemonPid() != nil)
 }
+
+@Test(.enabled(if: live != nil))
+func evicted_sessions_release_connections() async throws {
+    let client = try Client(helper: live!)
+    let cache = SessionStoreCache(capacity: 0)
+    let workspace = FileManager.default.temporaryDirectory.appending(path: "akit-cache-\(UUID())")
+    try FileManager.default.createDirectory(at: workspace, withIntermediateDirectories: true)
+    defer { try? FileManager.default.removeItem(at: workspace) }
+    weak var handle: Session?
+    let store: SessionStore = {
+        let session = Session(client: client)
+        handle = session
+        return SessionStore(session: session)
+    }()
+    store.open(.new(workspace: workspace.path))
+    try await eventually("attached") { store.link == .live }
+    let id = try #require(store.sessionId)
+    cache.selection = id
+    cache.insert(store, id: id)
+    #expect(store.cacheState == .active)
+    let list = SessionListStore(client: client)
+    let following = Task { await list.follow() }
+    defer { following.cancel() }
+    try await eventually("listed") { list.sessions.contains { $0.id == id && $0.clients == 1 } }
+    cache.selection = nil
+    #expect(cache.stores.isEmpty)
+    #expect(store.cacheState == .detached)
+    try await eventually("handle released") { handle == nil }
+    try await eventually("connection released") { list.sessions.contains { $0.id == id && $0.clients == 0 } }
+
+    let bounded = SessionStoreCache(capacity: 1, bytes: 0)
+    let reopened = bounded.open(id, client: client)
+    try await eventually("byte budget evicts inactive views") { bounded.stores.isEmpty }
+    #expect(reopened.cacheState == .detached)
+}

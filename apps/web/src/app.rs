@@ -12,11 +12,11 @@ use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 use std::task::Poll;
 
 use client::{Cmd, Daemon, Driver, Event};
+use client::{Inbox, Post};
 use http::header::HOST;
 use http::{Method, Request, StatusCode};
 use protocol::SessionId;
 use rt::Rt;
-use rt::channel::{Receiver, Sender};
 use serde::Deserialize;
 
 use crate::http::{Gate, Host, Reply, see_other, text, whole};
@@ -25,7 +25,7 @@ use crate::view;
 
 /// Where the calls of the tabs whose transcripts are live go, by tab id,
 /// with the number of the stream that opened it.
-type Tabs = Mutex<HashMap<String, (u64, Arc<Sender<TabIn>>)>>;
+type Tabs = Mutex<HashMap<String, (u64, Arc<Post<TabIn>>)>>;
 
 /// What a live tab's client takes in.
 enum TabIn {
@@ -213,20 +213,25 @@ pub struct Live {
     id: String,
     /// This stream's number: a reload's stream replaces it.
     stream: u64,
-    inbox: Receiver<TabIn>,
+    inbox: Inbox<TabIn>,
     driver: client::ClientHandle,
     page: Page,
 }
 
 impl Live {
     fn open(app: Arc<App>, id: &str, session: SessionId) -> Self {
-        let (tx, inbox) = rt::channel::unbounded();
+        let (tx, inbox) = client::inbox(client::QueueBudget::default(), |input| {
+            size_of::<TabIn>()
+                + match input {
+                    TabIn::Client(event) => event.retained_bytes(),
+                    TabIn::Line(text) => text.len(),
+                    TabIn::Cmd(_) => 4096,
+                }
+        });
         let tx = Arc::new(tx);
         let events = Arc::clone(&tx);
-        let driver = Driver::new(move |_, event| {
-            let _ = events.send(TabIn::Client(event));
-        })
-        .start(app.rt.clone(), app.daemon.clone());
+        let driver = Driver::new(move |driver, event| events.event(driver, event, TabIn::Client))
+            .start(app.rt.clone(), app.daemon.clone());
         let stream = app.streams.fetch_add(1, Ordering::Relaxed);
         lock(&app.tabs).insert(id.to_owned(), (stream, tx));
         let (page, open) = Page::new(session);
@@ -253,7 +258,7 @@ impl Live {
             if self.page.ended() {
                 return None;
             }
-            for input in self.batch().await? {
+            for input in Self::batch(&self.inbox).await? {
                 let effects = match input {
                     TabIn::Client(event) => self.page.client.step(event),
                     TabIn::Line(text) => self.page.line(&text),
@@ -262,21 +267,23 @@ impl Live {
                 self.driver.pump(&mut self.page, effects);
             }
             self.page.settle();
+            client::yield_now().await;
         }
     }
 
     /// Everything that has arrived, waiting for at least one.
-    async fn batch(&self) -> Option<Vec<TabIn>> {
+    async fn batch(inbox: &Inbox<TabIn>) -> Option<Vec<TabIn>> {
         poll_fn(|cx| {
             let mut batch = Vec::new();
-            loop {
-                match self.inbox.poll_recv(cx) {
+            while batch.len() < client::PUMP_BATCH {
+                match inbox.poll_recv(cx) {
                     Poll::Ready(Some(input)) => batch.push(input),
                     Poll::Ready(None) => return Poll::Ready((!batch.is_empty()).then_some(batch)),
                     Poll::Pending if batch.is_empty() => return Poll::Pending,
                     Poll::Pending => return Poll::Ready(Some(batch)),
                 }
             }
+            Poll::Ready(Some(batch))
         })
         .await
     }
@@ -291,5 +298,64 @@ impl Drop for Live {
         }
         drop(tabs);
         self.driver.pump(&mut (), self.page.client.detach());
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn sustained_input_cannot_starve_rendering() {
+        let (post, inbox) = client::inbox(client::QueueBudget::default(), |_| 64);
+        let input = |n: usize| {
+            TabIn::Client(Event {
+                conn: client::ConnId(1),
+                kind: client::EventKind::Msg(protocol::DaemonMsg::Error {
+                    message: n.to_string(),
+                }),
+            })
+        };
+        for n in 0..client::PUMP_BATCH * 2 {
+            post.send(input(n)).ok().unwrap();
+        }
+        let (mut page, _) = Page::new(SessionId::new());
+        for kind in [
+            client::EventKind::Connected {
+                welcome: client::Welcome {
+                    proto: protocol::PROTO,
+                    caps: protocol::Caps::ALL,
+                },
+                remote: false,
+                commands: Vec::new(),
+            },
+            client::EventKind::Msg(protocol::DaemonMsg::Synced { seq: 0 }),
+        ] {
+            let effects = page.client.step(Event {
+                conn: client::ConnId(1),
+                kind,
+            });
+            client::pump(|_| Ok(()), &mut page, effects);
+        }
+        page.take();
+        let mut next = client::PUMP_BATCH * 2;
+        for _ in 0..3 {
+            let batch = rt::block_on(Live::batch(&inbox)).unwrap();
+            assert_eq!(batch.len(), client::PUMP_BATCH);
+            for queued in batch {
+                let TabIn::Client(event) = queued else {
+                    panic!("daemon event")
+                };
+                let effects = page.client.step(event);
+                client::pump(|_| Ok(()), &mut page, effects);
+                post.send(input(next)).ok().unwrap();
+                next += 1;
+            }
+            page.settle();
+            assert_ne!(page.take(), [] as [u8; 0]);
+            assert!(inbox.try_recv().is_some());
+            post.send(input(next)).ok().unwrap();
+            next += 1;
+        }
     }
 }

@@ -186,6 +186,7 @@ fn session(
 
 /// What wakes the line client.
 enum Input {
+    Busy,
     /// A line typed; `None` once stdin closed.
     Line(Option<String>),
     Client(Event),
@@ -195,13 +196,18 @@ enum Input {
 /// as lines and its intents typed. When the daemon drains for an upgrade,
 /// it reconnects (starting the new build) and replays what it missed.
 fn repl(daemon: &client::Daemon, target: Target) -> io::Result<()> {
-    let (tx, rx) = client::inbox();
+    let (tx, rx) = client::inbox(client::QueueBudget::default(), |input| {
+        size_of::<Input>()
+            + match input {
+                Input::Client(event) => event.retained_bytes(),
+                Input::Line(Some(text)) => text.len(),
+                Input::Line(None) | Input::Busy => 0,
+            }
+    });
     let events = tx.clone();
     let runtime: rt::Rt = std::sync::Arc::new(rt::Threads::default());
-    let driver = Driver::new(move |_, event| {
-        let _ = events.send(Input::Client(event));
-    })
-    .start(runtime.clone(), daemon.clone());
+    let driver = Driver::new(move |driver, event| events.event(driver, event, Input::Client))
+        .start(runtime.clone(), daemon.clone());
     let mut repl = Repl {
         client: SessionClient::new(Env::Origin),
         screen: Screen::default(),
@@ -219,6 +225,7 @@ fn repl(daemon: &client::Daemon, target: Target) -> io::Result<()> {
             return Ok(());
         };
         effects = match input {
+            Input::Busy => return Err(client::Error::Busy.into()),
             Input::Client(event) => repl.client.step(event),
             Input::Line(None) => repl.client.detach(),
             Input::Line(Some(line)) => repl.line(&line)?,
@@ -309,6 +316,7 @@ impl Repl {
             for line in io::stdin().lock().lines() {
                 let Ok(line) = line else { break };
                 if tx.send(Input::Line(Some(line))).is_err() {
+                    tx.close_with(Input::Busy);
                     return;
                 }
             }

@@ -15,13 +15,25 @@ use super::screen::{Screen, Stdout};
 use super::term::{self, Terminal};
 
 pub fn run(daemon: &Daemon, target: Target, viewport: Viewport) -> io::Result<()> {
-    let (tx, rx) = client::inbox();
+    let (tx, rx) = client::inbox(
+        client::QueueBudget {
+            bytes: 64 << 20,
+            requests: 1 << 18,
+            control_reserve: 16,
+        },
+        |event| {
+            size_of::<Event>()
+                + match event {
+                    Event::Client(event) => event.retained_bytes(),
+                    Event::Input(super::keys::Input::Paste(text)) => text.len(),
+                    _ => 0,
+                }
+        },
+    );
     let events = tx.clone();
     let runtime: rt::Rt = std::sync::Arc::new(rt::Threads::default());
-    let driver = Driver::new(move |_, event| {
-        let _ = events.send(Event::Client(event));
-    })
-    .start(runtime.clone(), daemon.clone());
+    let driver = Driver::new(move |driver, event| events.event(driver, event, Event::Client))
+        .start(runtime.clone(), daemon.clone());
     let mut app = App::new(viewport, &target);
     let mut first = app.client.open(target);
     // SSH may need the terminal for authentication before raw mode starts.
@@ -127,7 +139,10 @@ impl Client {
             };
             let mut effects = Vec::new();
             let mut whole = false;
-            for event in std::iter::once(first).chain(std::iter::from_fn(|| rx.try_recv())) {
+            for event in std::iter::once(first)
+                .chain(std::iter::from_fn(|| rx.try_recv()))
+                .take(client::PUMP_BATCH)
+            {
                 match event {
                     Event::Input(input) => effects.extend(self.app.input(input)),
                     Event::Resized => whole = true,

@@ -1,34 +1,56 @@
-//! An app's inbox: what its [`Driver`](crate::Driver) and its input
-//! threads post, taken by the one thread that folds it into the app.
-//!
-//! std's `mpsc` would do, but each type sent through it instantiates all
-//! three of its channel flavours (about 7 KiB for the line client's, 15
-//! for the terminal client's); a lock around a queue is all an inbox
-//! needs, as it is only ever drained by one thread that sleeps when it is
-//! empty.
+//! The app's bounded inbox for daemon events and input.
+//! A locked queue avoids std mpsc's per-type channel implementations,
+//! which cost 7–15 KiB in the shipped clients.
 
 use std::collections::VecDeque;
 use std::sync::{Arc, Condvar, Mutex, MutexGuard, PoisonError};
+use std::task::{Context, Poll, Waker};
 use std::time::{Duration, Instant};
+
+#[derive(Clone, Copy)]
+pub struct QueueBudget {
+    pub bytes: usize,
+    pub requests: usize,
+    pub control_reserve: usize,
+}
+
+impl Default for QueueBudget {
+    fn default() -> Self {
+        Self {
+            bytes: 32 << 20,
+            requests: 1024,
+            control_reserve: 16,
+        }
+    }
+}
+
+pub const PUMP_BATCH: usize = 64;
 
 struct Queue<T> {
     /// Posted with [`Post::send_first`]: taken before `items`, in their
     /// own order.
-    first: VecDeque<T>,
-    items: VecDeque<T>,
+    first: VecDeque<(usize, T)>,
+    items: VecDeque<(usize, T)>,
     posts: usize,
+    bytes: usize,
+    ended: bool,
+    waker: Option<Waker>,
     taken: bool,
 }
 
 impl<T> Queue<T> {
     fn pop(&mut self) -> Option<T> {
-        self.first.pop_front().or_else(|| self.items.pop_front())
+        let (bytes, item) = self.first.pop_front().or_else(|| self.items.pop_front())?;
+        self.bytes -= bytes;
+        Some(item)
     }
 }
 
 struct Shared<T> {
     queue: Mutex<Queue<T>>,
     ready: Condvar,
+    budget: QueueBudget,
+    weight: fn(&T) -> usize,
 }
 
 impl<T> Shared<T> {
@@ -44,12 +66,17 @@ pub struct Post<T>(Arc<Shared<T>>);
 /// The receiving end: closed once every [`Post`] is dropped.
 pub struct Inbox<T>(Arc<Shared<T>>);
 
-pub fn inbox<T>() -> (Post<T>, Inbox<T>) {
+pub fn inbox<T>(budget: QueueBudget, weight: fn(&T) -> usize) -> (Post<T>, Inbox<T>) {
     let shared = Arc::new(Shared {
+        budget,
+        weight,
         queue: Mutex::new(Queue {
             first: VecDeque::new(),
             items: VecDeque::new(),
             posts: 1,
+            bytes: 0,
+            ended: false,
+            waker: None,
             taken: true,
         }),
         ready: Condvar::new(),
@@ -58,27 +85,77 @@ pub fn inbox<T>() -> (Post<T>, Inbox<T>) {
 }
 
 impl<T> Post<T> {
-    /// Queues `item`; `Err` gives it back once the inbox is gone.
+    /// An overflowing durable stream ends explicitly; reopening replays its log.
+    pub fn event(
+        &self,
+        driver: &crate::ClientHandle,
+        event: crate::Event,
+        wrap: fn(crate::Event) -> T,
+    ) {
+        let conn = event.conn;
+        if self.send(wrap(event)).is_err() {
+            let _ = driver.io(crate::Io::Hangup);
+            self.close_with(wrap(crate::Event {
+                conn,
+                kind: crate::EventKind::Closed(crate::Error::Busy),
+            }));
+        }
+    }
+
+    /// Returns `item` if the byte/request budget is full or the receiver is gone.
     pub fn send(&self, item: T) -> Result<(), T> {
         self.post(item, false)
     }
 
-    /// Queues `item` ahead of everything [`Post::send`] queued (after what
-    /// was sent first before it): a person's keystroke is folded before
-    /// the daemon's backlog, so a paste never waits behind a replay.
+    /// Reserves priority capacity so keystrokes stay ahead of replay.
     pub fn send_first(&self, item: T) -> Result<(), T> {
         self.post(item, true)
     }
 
+    /// Replaces an incomplete backlog with an explicit terminal outcome.
+    pub fn close_with(&self, item: T) {
+        let mut queue = self.0.queue();
+        queue.first.clear();
+        queue.items.clear();
+        queue.bytes = 0;
+        queue.ended = true;
+        queue.first.push_back((0, item));
+        if let Some(waker) = queue.waker.take() {
+            waker.wake();
+        }
+        self.0.ready.notify_one();
+    }
+
     fn post(&self, item: T, first: bool) -> Result<(), T> {
         let mut queue = self.0.queue();
-        if !queue.taken {
+        let bytes = (self.0.weight)(&item);
+        let reserve = if first {
+            0
+        } else {
+            self.0.budget.control_reserve
+        };
+        if !queue.taken
+            || queue.ended
+            || queue.first.len() + queue.items.len()
+                >= self.0.budget.requests.saturating_sub(reserve)
+            || bytes
+                > self
+                    .0
+                    .budget
+                    .bytes
+                    .saturating_sub(reserve.saturating_mul(4096))
+                    .saturating_sub(queue.bytes)
+        {
             return Err(item);
         }
         if first {
-            queue.first.push_back(item);
+            queue.first.push_back((bytes, item));
         } else {
-            queue.items.push_back(item);
+            queue.items.push_back((bytes, item));
+        }
+        queue.bytes += bytes;
+        if let Some(waker) = queue.waker.take() {
+            waker.wake();
         }
         self.0.ready.notify_one();
         Ok(())
@@ -97,6 +174,9 @@ impl<T> Drop for Post<T> {
         let mut queue = self.0.queue();
         queue.posts -= 1;
         if queue.posts == 0 {
+            if let Some(waker) = queue.waker.take() {
+                waker.wake();
+            }
             self.0.ready.notify_one();
         }
     }
@@ -117,12 +197,24 @@ impl<T> Inbox<T> {
     /// Nothing is queued and nothing can post.
     pub fn closed(&self) -> bool {
         let queue = self.0.queue();
-        queue.posts == 0 && queue.first.is_empty() && queue.items.is_empty()
+        (queue.posts == 0 || queue.ended) && queue.first.is_empty() && queue.items.is_empty()
     }
 
     /// The next item already queued.
     pub fn try_recv(&self) -> Option<T> {
         self.0.queue().pop()
+    }
+
+    pub fn poll_recv(&self, cx: &mut Context<'_>) -> Poll<Option<T>> {
+        let mut queue = self.0.queue();
+        if let Some(item) = queue.pop() {
+            return Poll::Ready(Some(item));
+        }
+        if queue.posts == 0 || queue.ended {
+            return Poll::Ready(None);
+        }
+        queue.waker = Some(cx.waker().clone());
+        Poll::Pending
     }
 
     fn recv_by(&self, deadline: Option<Instant>) -> Option<T> {
@@ -131,7 +223,7 @@ impl<T> Inbox<T> {
             if let Some(item) = queue.pop() {
                 return Some(item);
             }
-            if queue.posts == 0 {
+            if queue.posts == 0 || queue.ended {
                 return None;
             }
             let ready = &self.0.ready;
@@ -153,6 +245,7 @@ impl<T> Drop for Inbox<T> {
         queue.taken = false;
         queue.first.clear();
         queue.items.clear();
+        self.0.ready.notify_all();
     }
 }
 
@@ -161,11 +254,32 @@ mod tests {
     use std::thread;
     use std::time::Duration;
 
-    use super::inbox;
+    use super::{QueueBudget, inbox};
+
+    #[test]
+    fn byte_overload_returns_the_payload_and_a_terminal_outcome_is_observable() {
+        let (post, inbox) = inbox(
+            QueueBudget {
+                bytes: 64 << 10,
+                requests: 4,
+                control_reserve: 1,
+            },
+            String::len,
+        );
+        post.send("x".repeat(32 << 10)).unwrap();
+        let refused = "y".repeat(32 << 10);
+        assert_eq!(post.send(refused.clone()), Err(refused));
+        post.send_first("interrupt".into()).unwrap();
+        assert_eq!(inbox.try_recv().as_deref(), Some("interrupt"));
+        post.close_with("resync required".into());
+        assert_eq!(inbox.recv().as_deref(), Some("resync required"));
+        assert_eq!(inbox.recv(), None);
+        assert!(inbox.closed());
+    }
 
     #[test]
     fn an_inbox_closes_when_its_last_post_goes() {
-        let (post, inbox) = inbox();
+        let (post, inbox) = inbox(QueueBudget::default(), |_| size_of::<i32>());
         let other = post.clone();
         thread::spawn(move || {
             post.send(1).unwrap();
@@ -178,7 +292,7 @@ mod tests {
 
     #[test]
     fn what_is_posted_first_is_taken_before_the_backlog_in_its_own_order() {
-        let (post, inbox) = inbox();
+        let (post, inbox) = inbox(QueueBudget::default(), |_| size_of::<i32>());
         for n in 1..=3 {
             post.send(n).unwrap();
         }
@@ -190,14 +304,14 @@ mod tests {
 
     #[test]
     fn a_post_to_a_dropped_inbox_comes_back() {
-        let (post, inbox) = inbox();
+        let (post, inbox) = inbox(QueueBudget::default(), |_| size_of::<i32>());
         drop(inbox);
         assert_eq!(post.send(1), Err(1));
     }
 
     #[test]
     fn a_wait_ends_at_its_deadline() {
-        let (_post, inbox) = inbox::<u8>();
+        let (_post, inbox) = inbox::<u8>(QueueBudget::default(), |_| 1);
         assert_eq!(inbox.recv_timeout(Duration::from_millis(5)), None);
         assert_eq!(inbox.try_recv(), None);
     }

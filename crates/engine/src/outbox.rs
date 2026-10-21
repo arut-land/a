@@ -15,9 +15,50 @@ use protocol::{Class, Decode, Entry, Frame};
 
 use crate::lock;
 
-/// How many bytes of ephemeral frames may wait for a client: past that,
-/// it gets the committed outcome without the deltas.
-const BUDGET: usize = 1 << 20;
+/// Limits queued metadata; durable overflow closes the connection for replay.
+pub(crate) struct QueueBudget {
+    pub bytes: usize,
+    pub requests: usize,
+    pub control_reserve: usize,
+}
+
+pub(crate) const BUDGET: QueueBudget = QueueBudget {
+    bytes: 32 << 20,
+    requests: 256,
+    control_reserve: 16,
+};
+
+// Reservations cover queued session requests until their durable answer resolves.
+static QUEUED: Mutex<(usize, usize)> = Mutex::new((0, 0));
+
+pub(super) struct QueuePermit(usize);
+
+impl QueuePermit {
+    pub(super) fn acquire(bytes: usize, control: bool) -> Option<Self> {
+        let mut queued = lock(&QUEUED);
+        let budget = &BUDGET;
+        let slots = budget.requests - if control { 0 } else { budget.control_reserve };
+        let limit = if control {
+            budget.bytes
+        } else {
+            budget.bytes / 2
+        };
+        if queued.0 >= slots || bytes > limit.saturating_sub(queued.1) {
+            return None;
+        }
+        queued.0 += 1;
+        queued.1 += bytes;
+        Some(Self(bytes))
+    }
+}
+
+impl Drop for QueuePermit {
+    fn drop(&mut self) {
+        let mut queued = lock(&QUEUED);
+        queued.0 -= 1;
+        queued.1 -= self.0;
+    }
+}
 
 /// How many bytes of the newest entries' frames are kept in memory, for
 /// the followers that keep up: a commit costs them no read of the log.
@@ -219,8 +260,7 @@ struct Queue {
     /// Frames to write once the client has every entry up to the seq each
     /// waits for, in order.
     frames: VecDeque<(u64, Frame)>,
-    /// Bytes of ephemeral frames queued.
-    ephemeral: usize,
+    bytes: usize,
     follow: Option<Follow>,
     /// The number of the last session followed.
     follows: u64,
@@ -274,13 +314,22 @@ impl Outbox {
         if q.closed || (self.following != 0 && self.following != q.follows) {
             return Err(Closed);
         }
-        if frame.class == Class::Ephemeral {
-            let len = frame.as_bytes().len();
-            if q.ephemeral + len > BUDGET {
-                return Ok(());
-            }
-            q.ephemeral += len;
+        let len = frame.as_bytes().len();
+        if frame.class == Class::Ephemeral
+            && (q.frames.len() >= BUDGET.requests - BUDGET.control_reserve
+                || q.bytes.saturating_add(len) > BUDGET.bytes / 2)
+        {
+            return Ok(());
         }
+        if q.frames.len() >= BUDGET.requests || q.bytes.saturating_add(len) > BUDGET.bytes {
+            q.closed = true;
+            q.follow = None;
+            q.frames.clear();
+            q.bytes = 0;
+            self.shared.ready.notify();
+            return Err(Closed);
+        }
+        q.bytes += len;
         q.frames.push_back((after, frame));
         self.shared.ready.notify();
         Ok(())
@@ -309,7 +358,11 @@ impl Outbox {
             cursor,
             ahead: VecDeque::new(),
         });
-        q.frames.extend(frames);
+        for (after, frame) in frames {
+            if self.push(&mut q, after, frame).is_err() {
+                break;
+            }
+        }
         self.shared.ready.notify();
         Self {
             shared: Arc::clone(&self.shared),
@@ -413,7 +466,7 @@ impl Outbox {
         q.closed = true;
         q.follow = None;
         q.frames.clear();
-        q.ephemeral = 0;
+        q.bytes = 0;
         self.shared.ready.notify();
     }
 }
@@ -441,9 +494,7 @@ impl Queue {
             let Some((_, frame)) = self.frames.pop_front() else {
                 return Step::Nothing;
             };
-            if frame.class == Class::Ephemeral {
-                self.ephemeral -= frame.as_bytes().len();
-            }
+            self.bytes -= frame.as_bytes().len();
             return Step::Frame(frame);
         }
         let Some(follow) = self.follow.as_mut() else {
@@ -460,7 +511,7 @@ impl Queue {
                 self.closed = true;
                 self.follow = None;
                 self.frames.clear();
-                self.ephemeral = 0;
+                self.bytes = 0;
                 Step::Nothing
             }
         }
@@ -496,6 +547,42 @@ mod tests {
             },
         ))
         .unwrap()
+    }
+
+    #[test]
+    fn slow_consumers_have_bounded_retained_bytes() {
+        let outbox = Outbox::new();
+        let frame = Frame::new(&DaemonMsg::Error {
+            message: "x".repeat(1 << 20),
+        })
+        .unwrap();
+        for _ in 0..BUDGET.requests {
+            if outbox.send(frame.clone()).is_err() {
+                break;
+            }
+            let q = outbox.queue();
+            assert!(q.bytes <= BUDGET.bytes);
+            assert!(q.frames.len() <= BUDGET.requests);
+        }
+        assert!(outbox.queue().closed);
+        assert_eq!(outbox.queue().bytes, 0);
+        assert!(outbox.try_next().is_none());
+    }
+
+    #[test]
+    fn durable_entries_are_never_silently_dropped() {
+        let log = log(&["one", "two", "three"]);
+        let outbox = Outbox::new();
+        let _session = outbox.follow(log.frames(), 0, Vec::new());
+        let frame = Frame::new(&DaemonMsg::Ack { client_seq: 1 }).unwrap();
+        for _ in 0..BUDGET.requests {
+            outbox.send(frame.clone()).unwrap();
+        }
+        assert!(outbox.send(frame).is_err());
+        assert!(outbox.queue().closed);
+        let reconnected = Outbox::new();
+        let _session = reconnected.follow(log.frames(), 0, Vec::new());
+        assert_eq!(written(&reconnected), [Some(1), Some(2), Some(3)]);
     }
 
     fn delta() -> Frame {
@@ -712,7 +799,7 @@ mod tests {
         let mut log = log(&[]);
         let outbox = Outbox::new();
         let session = outbox.follow(log.frames(), 0, Vec::new());
-        let big = "x".repeat(BUDGET);
+        let big = "x".repeat(TAIL * 2);
         for seq in 1..=64 {
             log.push(&big);
             session.wake().unwrap();
@@ -722,7 +809,7 @@ mod tests {
         // its cursor and the bounded deltas, however far it lags.
         let q = outbox.queue();
         assert!(q.frames.iter().all(|(_, f)| f.class == Class::Ephemeral));
-        assert!(q.ephemeral <= BUDGET);
+        assert!(q.bytes <= BUDGET.bytes);
         assert_eq!(q.follow.as_ref().map(|f| f.cursor), Some(0));
         drop(q);
         let seqs = written(&outbox);
@@ -734,7 +821,7 @@ mod tests {
         let outbox = Outbox::new();
         let big = Frame::new(&DaemonMsg::Delta {
             call: CallId::new(1).unwrap(),
-            text: "x".repeat(BUDGET / 2),
+            text: "x".repeat(BUDGET.bytes / 3),
             attempt: 0,
         })
         .unwrap();

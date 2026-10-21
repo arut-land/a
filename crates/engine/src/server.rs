@@ -22,7 +22,7 @@ use rt::{Async, BoxFuture, Reactor};
 use sys::{Listener, Stream};
 
 use crate::driver::{self, Attachment, Request};
-use crate::outbox::Outbox;
+use crate::outbox::{BUDGET, Outbox};
 use crate::upgrade::{Lifecycle, Verdict};
 use crate::{Daemon, config, lock, session_event};
 
@@ -41,10 +41,15 @@ pub(crate) async fn accept(
 ) -> io::Result<()> {
     loop {
         let stream = listener.read_with(|l| l.accept()).await?;
+        if daemon.clients.load(Ordering::SeqCst) >= BUDGET.requests {
+            let _ = stream.shutdown(std::net::Shutdown::Both);
+            continue;
+        }
+        let client = Client::new(daemon);
         let (daemon, life) = (Arc::clone(daemon), Arc::clone(life));
         let rt = Arc::clone(&daemon.shared.rt);
         rt.spawn(Box::pin(async move {
-            let _client = Client::new(&daemon);
+            let _client = client;
             if let Err(e) = handle(&daemon, &life, stream).await {
                 ext_logging::emit(ext_logging::Fact::Fault {
                     session: None,
@@ -57,17 +62,17 @@ pub(crate) async fn accept(
 }
 
 /// Counts one open connection for as long as it lives.
-struct Client<'a>(&'a Daemon);
+struct Client(Arc<Daemon>);
 
-impl<'a> Client<'a> {
-    fn new(daemon: &'a Daemon) -> Self {
+impl Client {
+    fn new(daemon: &Arc<Daemon>) -> Self {
         daemon.clients.fetch_add(1, Ordering::SeqCst);
         daemon.pulse.notify();
-        Self(daemon)
+        Self(Arc::clone(daemon))
     }
 }
 
-impl Drop for Client<'_> {
+impl Drop for Client {
     fn drop(&mut self) {
         self.0.clients.fetch_sub(1, Ordering::SeqCst);
         self.0.pulse.notify();
@@ -110,6 +115,7 @@ async fn within<T>(reactor: &Reactor, limit: Duration, work: impl Future<Output 
 struct Frames {
     io: Arc<Async<Stream>>,
     buf: Vec<u8>,
+    bytes: usize,
 }
 
 impl Frames {
@@ -117,6 +123,7 @@ impl Frames {
         Self {
             io,
             buf: Vec::new(),
+            bytes: 0,
         }
     }
 
@@ -125,6 +132,7 @@ impl Frames {
         loop {
             if let Some((len, body)) = protocol::frame_in(&self.buf)? {
                 let msg = T::from_json(body)?;
+                self.bytes = len;
                 self.buf.drain(..len);
                 return Ok(Some(msg));
             }
@@ -174,10 +182,12 @@ async fn write_out(io: Arc<Async<Stream>>, outbox: Outbox, rt: rt::Rt) {
         }
         if write_all(&io, &batch).await.is_err() {
             outbox.abandon();
+            let _ = io.get_ref().shutdown(std::net::Shutdown::Both);
             return;
         }
         batch.clear();
     }
+    let _ = io.get_ref().shutdown(std::net::Shutdown::Both);
 }
 
 /// Serves connection `stream` until the client hangs up.
@@ -305,6 +315,7 @@ impl Conn<'_> {
     /// Anything else waits until what was asked before it is answered.
     async fn serve(&mut self, frames: &mut Frames) -> io::Result<()> {
         let mut pending: VecDeque<(Option<u64>, BoxFuture<'static, Answer>)> = VecDeque::new();
+        let mut result = Ok(());
         loop {
             let next = {
                 let mut next = pin!(frames.next::<ClientMsg>());
@@ -320,13 +331,30 @@ impl Conn<'_> {
                 })
                 .await
             };
-            let Some(mut msg) = next? else { break };
+            let mut msg = match next {
+                Ok(Some(msg)) => msg,
+                ended => {
+                    result = ended.map(|_| ());
+                    break;
+                }
+            };
             if let Some(&mut client_seq) = msg.client_seq_mut() {
-                let origin = client_seq.and_then(ClientSeq::new).map(|seq| Author {
-                    client: self.client,
-                    seq,
-                });
-                pending.push_back((client_seq, self.mutate(msg, origin)));
+                let control = matches!(msg, ClientMsg::Interrupt { .. });
+                if let Some(permit) = crate::outbox::QueuePermit::acquire(frames.bytes, control) {
+                    let answer = self.mutate(msg);
+                    pending.push_back((
+                        client_seq,
+                        Box::pin(async move {
+                            let _permit = permit;
+                            answer.await
+                        }),
+                    ));
+                } else {
+                    self.answered(
+                        client_seq,
+                        Err((Rejection::Refused, "daemon admission is full".into())),
+                    );
+                }
                 continue;
             }
             while let Some((client_seq, answer)) = pending.pop_front() {
@@ -381,7 +409,7 @@ impl Conn<'_> {
             self.answered(client_seq, answer.await);
         }
         self.outbox.unfollow();
-        Ok(())
+        result
     }
 
     async fn attach(
@@ -461,7 +489,11 @@ impl Conn<'_> {
 
     /// Sends mutation `msg`, from `origin`, on if this client may: the
     /// future is its answer.
-    fn mutate(&self, msg: ClientMsg, origin: Option<Author>) -> BoxFuture<'static, Answer> {
+    fn mutate(&self, msg: ClientMsg) -> BoxFuture<'static, Answer> {
+        let origin = msg.client_seq().and_then(ClientSeq::new).map(|seq| Author {
+            client: self.client,
+            seq,
+        });
         let refused =
             |answer: Answer| -> BoxFuture<'static, Answer> { Box::pin(std::future::ready(answer)) };
         let session = match &self.attached {
