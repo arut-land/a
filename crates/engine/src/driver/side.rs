@@ -93,7 +93,7 @@ impl Actor {
     ) -> Event {
         self.tickets += 1;
         let ticket = Ticket(self.tickets);
-        self.replies.insert(ticket, done);
+        self.replies.clients.insert(ticket, done);
         Event::Side(match fact {
             SideFact::Retry {
                 by,

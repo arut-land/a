@@ -9,7 +9,7 @@ impl Actor {
     ) -> Ticket {
         self.tickets += 1;
         let ticket = Ticket(self.tickets);
-        self.deliveries.insert(ticket, reply);
+        self.replies.deliveries.insert(ticket, reply);
         ticket
     }
     pub(super) fn deliver(&mut self, envelope: Envelope, ticket: Option<Ticket>) {
@@ -26,6 +26,7 @@ impl Actor {
         self.transport_active = true;
         let session = Arc::clone(&self.live.session);
         let daemon = session.shared.daemon.upgrade();
+        let fence = session.fence.load(super::Ordering::SeqCst);
         let rt = Arc::clone(&session.shared.rt);
         rt.spawn(Box::pin(async move {
             let id = envelope.id.clone();
@@ -38,7 +39,7 @@ impl Actor {
             } else {
                 Msg::Delivered { id, result, ticket }
             };
-            let _ = session.mail.send(message);
+            session.emit(fence, message);
         }));
     }
 }

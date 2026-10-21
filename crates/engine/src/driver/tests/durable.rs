@@ -4,6 +4,34 @@ use crate::store::{Faulty, SyncFailure};
 
 use super::*;
 
+#[test]
+fn a_failed_enqueue_releases_transport_for_retry() {
+    let mut harness = ManualSession::new();
+    let (reply, mut received) = oneshot::channel();
+    harness.faulty.fail_next_sync(SyncFailure::Discard);
+    harness.session.send(Msg::Enqueue {
+        envelope: protocol::Envelope {
+            id: protocol::EnvelopeId {
+                sender: SessionId::new(),
+                call: id(1),
+                purpose: "retry".into(),
+            },
+            destination: harness.session.id,
+            payload: "update".into(),
+        },
+        reply,
+    });
+    harness.poll();
+    let mut cx = std::task::Context::from_waker(std::task::Waker::noop());
+    let result = std::pin::Pin::new(&mut received).poll(&mut cx);
+    let kept = harness.finish();
+    assert!(!kept.iter().any(|e| matches!(e.body, Body::Enqueue { .. })));
+    assert_eq!(
+        result,
+        std::task::Poll::Ready(Some(Err(protocol::InboxRefusal::Interrupted)))
+    );
+}
+
 /// The entries `outbox` is sent, until `done` holds of them.
 fn shown(outbox: &Outbox, done: impl Fn(&[Entry]) -> bool) -> Vec<Entry> {
     let mut seen = Vec::new();

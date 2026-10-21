@@ -515,11 +515,10 @@ impl Live {
             fold_snapshot,
             inflight: Keyed::default(),
             view: None,
-            replies: Keyed::default(),
+            replies: Replies::default(),
             child_cancels: Vec::new(),
             transport_active: false,
             delivery_queue: std::collections::VecDeque::new(),
-            deliveries: Keyed::default(),
             detached: Vec::new(),
             sides: Keyed::default(),
             side_waiters: Keyed::default(),
@@ -819,7 +818,7 @@ struct Actor {
     /// The view a far attach is sent, kept in step with each commit from
     /// the first time one is asked for: no attach folds the whole log.
     view: Option<SessionView>,
-    replies: Keyed<Ticket, oneshot::Sender<Result<(), String>>>,
+    replies: Replies,
     /// Duplicate consumers wait for the same durable result.
     side_waiters: Keyed<CallId, Vec<oneshot::Sender<Opened>>>,
     /// Side model requests waiting for their call's id, with the
@@ -832,7 +831,6 @@ struct Actor {
     transport_active: bool,
     delivery_queue: std::collections::VecDeque<(protocol::Envelope, Option<Ticket>)>,
     child_cancels: Vec<(SessionId, Cancel)>,
-    deliveries: Keyed<Ticket, oneshot::Sender<Result<(), protocol::InboxRefusal>>>,
     tickets: u64,
     phase: Phase,
     /// The session as the catalog last heard of it: busy while work is in
@@ -860,6 +858,20 @@ struct Actor {
     /// The bytes of log the next load would read past the newest
     /// snapshot: once [`SNAPSHOT_EVERY`], the next rest is snapshotted.
     since_snapshot: u64,
+}
+
+#[derive(Default)]
+struct Replies {
+    clients: Keyed<Ticket, oneshot::Sender<Result<(), String>>>,
+    deliveries: Keyed<Ticket, oneshot::Sender<Result<(), protocol::InboxRefusal>>>,
+}
+
+impl Drop for Replies {
+    fn drop(&mut self) {
+        for (_, reply) in self.deliveries.0.drain(..) {
+            reply.send(Err(protocol::InboxRefusal::Interrupted));
+        }
+    }
 }
 
 struct PendingFlush {
@@ -1204,7 +1216,7 @@ impl Actor {
             }
             Msg::DeliveryLost { ticket } => {
                 self.transport_active = false;
-                if let Some(reply) = ticket.and_then(|t| self.deliveries.remove(&t)) {
+                if let Some(reply) = ticket.and_then(|t| self.replies.deliveries.remove(&t)) {
                     reply.send(Err(protocol::InboxRefusal::Interrupted));
                 }
                 self.pump_delivery();
@@ -1338,7 +1350,7 @@ impl Actor {
     ) -> Event {
         self.tickets += 1;
         let ticket = Some(Ticket(self.tickets));
-        self.replies.insert(Ticket(self.tickets), reply);
+        self.replies.clients.insert(Ticket(self.tickets), reply);
         match request {
             Request::Input { text, mode } => Event::Input {
                 text,
@@ -1800,7 +1812,9 @@ impl Actor {
         self.admissions.clear();
         self.transcript = None;
         lock(&self.live.session.cancels).clear();
-        self.replies.clear();
+        self.replies = Replies::default();
+        self.delivery_queue.clear();
+        self.transport_active = false;
         self.sides.clear();
         self.side_waiters.clear();
         self.inflight.clear();
@@ -2151,7 +2165,7 @@ impl Actor {
                 unreachable!("appends commit in runs")
             }
             Effect::Delivery { ticket, result } => {
-                if let Some(reply) = self.deliveries.remove(&ticket) {
+                if let Some(reply) = self.replies.deliveries.remove(&ticket) {
                     reply.send(result);
                 }
             }
@@ -2355,7 +2369,7 @@ impl Actor {
     }
 
     fn reply(&mut self, ticket: Ticket, result: Result<(), String>) {
-        if let Some(reply) = self.replies.remove(&ticket) {
+        if let Some(reply) = self.replies.clients.remove(&ticket) {
             reply.send(result);
         }
     }
