@@ -87,6 +87,8 @@ pub enum Cmd {
 /// What `a daemon` does.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Subcommands)]
 pub enum Daemon {
+    /// Read the current daemon diagnostic log (JSON lines); never starts it
+    Log,
     /// Show whether the daemon is running and responding
     Status,
     /// Stop the daemon; sessions resume when it next starts

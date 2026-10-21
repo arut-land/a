@@ -156,9 +156,11 @@ The linked extensions own:
 | Crate | Responsibility |
 | --- | --- |
 | `ext-shell`, `ext-edit` | Streaming `bash`, spill files and `edit` |
+| `ext-mcp` | Lazy external tools over stdio and Streamable HTTP |
 | `ext-prompt` | System prompt |
 | `ext-policy` | Permission modes, judge and guarded operator floor |
 | `ext-settings` | Model choice fold and model-spec service |
+| `ext-skills` | Skill index and instructions loaded on demand from workspace generations |
 | `ext-retry`, `ext-compact` | Retryable failures; overflow recovery and transcript edits |
 | `ext-subagent` | `task` over owned child sessions |
 | `ext-title` | Titles from a side model call |
@@ -171,7 +173,27 @@ budgeted side requests with logged purpose and outcome; title, compact and
 the policy judge use it. Compaction edits the model's transcript without
 erasing history. Optional [Lua mods](ext-lua.md) already support tools,
 wire points, folds, text and agents in a bounded sandbox. They do not expose
-every Rust service or decision point. MCP remains planned.
+every Rust service or decision point. [Skills](ext-skills.md) publish a small
+index per adopted generation and load instructions through a typed tool or
+user command. Both index and instructions are ordinary logged context; reload
+adoption waits for rest.
+
+[MCP tools](ext-mcp.md) register through the same SDK and policy path.
+The model initially sees a compact server index via `Text::generation`;
+listing tools and loading a selected schema are explicit calls. Schema
+loading uses the same typed `Cx::publish` context primitive as skills,
+including edit-aware deduplication. Stdio servers start on first use,
+one per server per session, with their process groups owned by the daemon.
+All MCP operations are external, unsafe to replay, and admitted only after
+their intent is durable; progress and typed results become logged facts.
+Streamable HTTP reuses the existing model HTTP transport and runtime with
+an explicit refusal of redirects. Per-request notification and publication
+budgets coalesce progress into a bounded latest value. Discovery has an
+aggregate byte budget; compact summaries and typed names keep the result
+and its card safely below the protocol frame limit.
+The client targets MCP 2026-07-28 without a legacy handshake fallback;
+HTTP authentication, sampling and elicitation remain unsupported.
+
 
 ## Runtime, wire and clients
 
@@ -224,6 +246,7 @@ Do not treat a historical result as a current budget pass.
 - [Sessions](perf/sessions.md): whole-log versus snapshot load, retained
   memory and commit costs for the two durability settings.
 - [Lua](perf/lua.md): runtime choice, optional-build cost and sandbox budgets.
+- [Skills](perf/skills.md): frontmatter parser comparison and shipped size.
 
 `mise run size` checks shipped bytes and fixture exclusion. `budgets` checks
 cold first reply, attach latency, idle RSS and quiet shell execution on an
@@ -239,16 +262,14 @@ native lane; it cannot run on the Apple development host.
 **Done:** durable CLI sessions on macOS/Linux; connect-or-spawn, staging,
 drain/reconnect, CRC logs, snapshots, recovery, typed extensions and policy;
 recorded provider codecs; TUI, web and SwiftUI renderers over the client SDK;
-optional Lua mods; child sessions; side model calls for title, compact and
-judge with purpose/outcome logging; conversation-only forks from `(session, seq)`
-with independent copied logs, recorded ancestry, exact Lua generations and
-rest-point validation ([fork semantics](fork.md)). These supersede the original
-M1/M2/M3 schedule: web and remote SSH are already present.
+lazy MCP tools; optional Lua mods; lazy skill instructions; child sessions; side model calls
+for title, compact and judge with purpose/outcome logging; conversation-only
+forks from `(session, seq)` with independent copied logs, recorded ancestry,
+exact extension generations and rest-point validation ([fork semantics](fork.md)).
+These supersede the original M1/M2/M3 schedule: web and remote SSH are already present.
 
 **Next:**
 
-- `ext-skills`: skill discovery and loading on SDK primitives.
-- `ext-mcp`: external tools through the registry and existing policy path.
 - Approval explanations that retain and present why a call needs consent.
 - Audit essential non-derivable facts: exact sent-request identity, runtime
   decisions and recovery inputs. Side-call logging exists; it is not proof

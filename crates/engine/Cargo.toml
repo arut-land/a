@@ -5,10 +5,11 @@ edition.workspace = true
 publish.workspace = true
 
 [features]
-# The daemon's events, written to its log; see `EventSink`.
+# Optional debug events on stderr; separate from typed daemon diagnostics.
 events = []
 
 [dependencies]
+ext-logging.workspace = true
 # Each log line's checksum, in hardware where the CPU has it.
 crc32c = "0.6.8"
 ext.workspace = true
@@ -26,6 +27,7 @@ workspace = true
 
 [dev-dependencies]
 client.workspace = true
+ext-logging = { workspace = true, features = ["testing"] }
 futures-core = { version = "0.3", default-features = false, features = ["std"] }
 http.workspace = true
 serde_yaml_ng = "0.10"

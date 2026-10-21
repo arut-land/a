@@ -21,12 +21,16 @@ mod hygiene;
 #[cfg(feature = "lua")]
 #[cfg(unix)]
 mod lua;
+#[cfg(all(unix, feature = "mcp"))]
+mod mcp;
 #[cfg(unix)]
 mod pipe;
 #[cfg(unix)]
 mod reactor;
 #[cfg(unix)]
 mod remote;
+#[cfg(all(unix, feature = "skills"))]
+mod skills;
 #[cfg(unix)]
 mod tui;
 #[cfg(feature = "web")]

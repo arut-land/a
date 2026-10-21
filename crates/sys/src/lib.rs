@@ -42,9 +42,9 @@ pub use fs::{read_exact_at, sync_data, write_watch};
 pub use login::login_env;
 pub use platform::{Arch, Os, Platform};
 pub use proc::{
-    Child, ExitWatch, Group, Pass, Passed, RecordedProcess, adopt_lock, boot_id, daemon_ready,
-    detach_session, exit_signal, exit_watch, find_bash, process_started, signal_process,
-    spawn_daemon, spawn_group,
+    Child, ExitWatch, Group, Pass, Passed, ProcessPipe, RecordedProcess, adopt_lock, boot_id,
+    daemon_ready, detach_session, exit_signal, exit_watch, find_bash, process_started,
+    signal_process, spawn_daemon, spawn_group, spawn_stdio,
 };
 pub use runtime::{Runtime, Staged, VERSION};
 pub use signals::{Signals, reraise};
@@ -109,7 +109,7 @@ impl Home {
     }
 
     pub fn daemon_log(&self) -> PathBuf {
-        self.logs_dir().join("daemon.log")
+        self.logs_dir().join("daemon.jsonl")
     }
 
     /// The daemon's crash reports; see [`crash`].

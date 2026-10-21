@@ -50,7 +50,9 @@ Derived files can be removed and rebuilt from that log.
 
 Extension folds replay only the chosen prefix. Dynamic extension installation
 facts retain portable generation images: Lua source, tool grants and execution
-limits. Replay reconstructs the recorded generation, even after its files
+limits, plus immutable skill catalogs. Skill publications and transcript edits
+are replayed only through the selected sequence: a fork after a load keeps it
+loaded; a fork before that load can load it independently. Replay reconstructs the recorded generation, even after its files
 change or disappear; it never substitutes today's Lua code. Images are part
 of the durable log, not a snapshot cache. A build without the required
 generation opens that history read-only with `ReadOnly::Extensions`; it never

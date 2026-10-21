@@ -45,7 +45,7 @@ fn client() -> (Ureq, mpsc::Receiver<()>) {
         inner: rt::Threads::new(1),
         done,
     };
-    (Ureq::new(Arc::new(rt)), returned)
+    (Ureq::new(Arc::new(rt), Redirects::Follow), returned)
 }
 
 fn request(port: u16) -> http::Request<Payload> {

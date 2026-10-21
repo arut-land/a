@@ -42,6 +42,12 @@ pub trait Fold: Default + Serialize + DeserializeOwned + Send + 'static {
     fn apply(&mut self, change: &Self::Change);
 }
 
+/// A typed identity for model context, sealed with its text in one entry.
+pub trait Publication {
+    const NAME: &'static str;
+    type Key: Serialize + ?Sized;
+}
+
 /// A durable fold whose name and value are known only at run time.
 /// A failed change leaves its previous value intact.
 pub trait DynFold: Send + Sync {
@@ -127,11 +133,13 @@ struct Held {
 #[derive(Default)]
 pub struct States {
     held: Vec<Held>,
+    publications: protocol::publication::Publications,
 }
 
 impl States {
     pub(crate) fn new(decls: impl IntoIterator<Item = (Name, Decl)>) -> Self {
         Self {
+            publications: protocol::publication::Publications::default(),
             held: decls
                 .into_iter()
                 .map(|(ext, decl)| Held {
@@ -189,9 +197,14 @@ impl States {
 
     /// Folds or skips the change `e` records, exactly as live execution does.
     pub fn apply(&mut self, e: &Entry) {
+        self.publications.apply(e);
         if let Body::Ext { ext, state, data } = &e.body {
             self.reduce(ext, state, data, Some(e.seq));
         }
+    }
+
+    pub fn publications(&self) -> &protocol::publication::Publications {
+        &self.publications
     }
 
     /// A candidate may fix or share live rejections, but cannot reject an
@@ -221,8 +234,9 @@ impl States {
     /// Every state as it stands, by the extension that registered it and
     /// its name: what a snapshot keeps. A state that cannot be encoded
     /// fails the lot: a snapshot is whole or not taken.
-    pub fn image(&self) -> Result<Vec<Image>, String> {
-        self.held
+    pub fn image(&self) -> Result<Checkpoint, String> {
+        let folds = self
+            .held
             .iter()
             .map(|h| {
                 let image = (h.decl.image)(&*h.value)
@@ -234,14 +248,19 @@ impl States {
                     rejected: h.rejected.clone(),
                 })
             })
-            .collect()
+            .collect::<Result<_, String>>()?;
+        Ok(Checkpoint {
+            folds,
+            publications: self.publications.clone(),
+        })
     }
 
     /// The states as `images` left them: exactly one image per registered
     /// state. One missing, extra, or with an image its state
     /// cannot read fails the lot, the states left as they were: the
     /// snapshot is of another build, and the log is folded instead.
-    pub fn restore(&mut self, images: &[Image]) -> Result<(), String> {
+    pub fn restore(&mut self, checkpoint: &Checkpoint) -> Result<(), String> {
+        let images = &checkpoint.folds;
         if images.len() != self.held.len() {
             return Err("checkpoint fold coverage differs".into());
         }
@@ -261,12 +280,20 @@ impl States {
                 }
             })
             .collect::<Result<Vec<_>, _>>()?;
+        self.publications = checkpoint.publications.clone();
         for (held, (value, rejected)) in self.held.iter_mut().zip(restored) {
             held.value = value;
             held.rejected = rejected;
         }
         Ok(())
     }
+}
+
+/// A complete SDK checkpoint, including named model context identities.
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Checkpoint {
+    pub folds: Vec<Image>,
+    pub publications: protocol::publication::Publications,
 }
 
 /// One state as a snapshot keeps it.
@@ -333,7 +360,10 @@ mod tests {
         }];
         assert!(
             restored
-                .restore(&bad)
+                .restore(&Checkpoint {
+                    folds: bad,
+                    ..Checkpoint::default()
+                })
                 .unwrap_err()
                 .contains("reading count")
         );
@@ -344,9 +374,9 @@ mod tests {
     fn a_checkpoint_covers_exactly_the_registered_folds() {
         let mut states = States::new([(Name::from("counter"), Decl::of::<Count>())]);
         states.fold("counter", "count", &Json::encode(&2).unwrap());
-        assert!(states.restore(&[]).is_err());
+        assert!(states.restore(&Checkpoint::default()).is_err());
         let mut extra = states.image().unwrap();
-        extra.push(Image {
+        extra.folds.push(Image {
             ext: "other".into(),
             state: "count".into(),
             image: Json::default(),
@@ -384,7 +414,7 @@ mod tests {
         let checkpoint = Json::encode(&live.image().unwrap()).unwrap();
         let mut restored = make();
         restored
-            .restore(&checkpoint.parse::<Vec<Image>>().unwrap())
+            .restore(&checkpoint.parse::<Checkpoint>().unwrap())
             .unwrap();
         assert!(candidate.validate(&restored).is_ok());
         // The seq identifies the decision; an equal payload at another

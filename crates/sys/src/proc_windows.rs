@@ -125,6 +125,21 @@ fn jobs() -> std::sync::MutexGuard<'static, Vec<Job>> {
 /// Job assignment is a process creation attribute, so no shell can fork
 /// before containment. The daemon alone owns each kill-on-close handle.
 pub fn spawn_group(cmd: &mut Command, output: File) -> io::Result<Child> {
+    let input = File::open("NUL")?;
+    let child = spawn_job(cmd, [&input, &output, &output]);
+    drop(output);
+    child
+}
+
+pub fn spawn_stdio(cmd: &mut Command) -> io::Result<(Child, crate::Stream, crate::Stream)> {
+    let (input, child_input) = crate::endpoint::imp::process_pipe()?;
+    let (output, child_output) = crate::endpoint::imp::process_pipe()?;
+    let error = File::options().write(true).open("NUL")?;
+    let child = spawn_job(cmd, [&child_input, &child_output, &error])?;
+    Ok((child, input, output))
+}
+
+fn spawn_job(cmd: &Command, io: [&dyn std::os::windows::io::AsHandle; 3]) -> io::Result<Child> {
     let security = Security::user_only()?;
     let attributes = security.attributes();
     // SAFETY: attributes live through creation, unnamed job cannot be pre-created.
@@ -141,14 +156,12 @@ pub fn spawn_group(cmd: &mut Command, output: File) -> io::Result<Child> {
             u32::try_from(size_of_val(&limits)).unwrap(),
         )
     })?;
-    let input = File::open("NUL")?;
     let child = spawn::spawn(
         cmd,
-        [&input, &output, &output],
+        io,
         Some(&job),
         CREATE_NEW_PROCESS_GROUP | CREATE_NO_WINDOW,
     )?;
-    drop(output);
     let mut jobs = jobs();
     jobs.retain(|job| !members(&job.handle).is_empty());
     jobs.push(Job {

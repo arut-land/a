@@ -15,6 +15,7 @@ mod notify;
 pub mod oneshot;
 #[cfg(feature = "threads")]
 mod threads;
+mod wakeup;
 
 #[cfg(feature = "smol")]
 mod smol;
@@ -38,6 +39,7 @@ pub use io::{Async, Reactor, Source};
 pub use notify::Notify;
 #[cfg(feature = "threads")]
 pub use threads::Threads;
+pub use wakeup::Wakeup;
 
 #[cfg(feature = "smol")]
 pub use self::smol::Smol;

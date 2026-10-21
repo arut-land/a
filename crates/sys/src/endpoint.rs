@@ -36,7 +36,7 @@ impl Endpoint {
 impl Home {
     /// The daemon's endpoint. A socket path is kept short because
     /// `sun_path` holds ~104 bytes: `/tmp/a-<uid>/<hash of the home>.sock`;
-    /// a pipe is `\\.\pipe\a-<hash of the home>`.
+    /// Windows discovers a process-generation pipe through the daemon record.
     pub fn endpoint(&self) -> Endpoint {
         let hash = imp::home_hash(self.root());
         Endpoint(imp::address(self.root(), hash))
@@ -293,7 +293,7 @@ mod imp {
 
 #[cfg(windows)]
 #[path = "endpoint_windows.rs"]
-mod imp;
+pub(crate) mod imp;
 
 #[cfg(all(test, unix))]
 mod tests {

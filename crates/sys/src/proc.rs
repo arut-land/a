@@ -703,3 +703,29 @@ mod tests {
         assert_eq!(exit_signal(ExitStatus::from_raw(0)), None);
     }
 }
+
+/// Parent ends of child stdio: readiness pipes on Unix, overlapped pipes on Windows.
+#[cfg(unix)]
+pub type ProcessPipe = File;
+#[cfg(windows)]
+pub type ProcessPipe = crate::Stream;
+
+/// Starts a contained child with only its explicit stdio inherited.
+pub fn spawn_stdio(cmd: &mut Command) -> io::Result<(Child, ProcessPipe, ProcessPipe)> {
+    #[cfg(unix)]
+    {
+        use std::os::fd::OwnedFd;
+        use std::process::Stdio;
+        imp::lead(cmd);
+        let mut child = cmd
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::null())
+            .spawn()?;
+        let input = File::from(OwnedFd::from(child.stdin.take().unwrap()));
+        let output = File::from(OwnedFd::from(child.stdout.take().unwrap()));
+        Ok((child, input, output))
+    }
+    #[cfg(windows)]
+    imp::spawn_stdio(cmd)
+}

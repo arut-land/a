@@ -18,11 +18,14 @@ ext-derive = { path = "crates/ext-derive" }
 ext-edit = { path = "crates/ext-edit" }
 ext-fork = { path = "crates/ext-fork" }
 ext-fixtures = { path = "crates/ext-fixtures" }
+ext-logging = { path = "crates/ext-logging" }
+ext-mcp = { path = "crates/ext-mcp" }
 ext-lua = { path = "crates/ext-lua" }
 ext-policy = { path = "crates/ext-policy" }
 ext-prompt = { path = "crates/ext-prompt" }
 ext-retry = { path = "crates/ext-retry" }
 ext-settings = { path = "crates/ext-settings" }
+ext-skills = { path = "crates/ext-skills" }
 ext-shell = { path = "crates/ext-shell" }
 ext-subagent = { path = "crates/ext-subagent" }
 ext-title = { path = "crates/ext-title" }

@@ -1,0 +1,74 @@
+#!/usr/bin/env bash
+# Comparable facade/formatting probes; no daemon, home or provider is used.
+set -euo pipefail
+probe=$(mktemp -d "${TMPDIR:-/tmp}/a-logging-probe.XXXXXX")
+trap 'rm -rf "$probe"' EXIT
+export CARGO_BUILD_JOBS=3
+mkdir "$probe/src"
+cat > "$probe/Cargo.toml" <<'TOML'
+[package]
+name = "a-logging-probe"
+version = "0.1.0"
+edition = "2024"
+[features]
+facade = ["dep:log"]
+subscriber = ["dep:tracing", "dep:tracing-subscriber"]
+[dependencies]
+log = { version = "=0.4.34", optional = true }
+tracing = { version = "=0.1.44", optional = true, default-features = false, features = ["std"] }
+tracing-subscriber = { version = "=0.3.23", optional = true, default-features = false, features = ["fmt", "json", "registry"] }
+[profile.release]
+opt-level = "z"
+lto = true
+codegen-units = 1
+strip = true
+TOML
+cat > "$probe/src/main.rs" <<'RUST'
+use std::io::{self, Write};
+use std::sync::atomic::{AtomicU64, Ordering};
+static BYTES: AtomicU64 = AtomicU64::new(0);
+struct Count;
+impl Write for Count {
+    fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
+        BYTES.fetch_add(std::hint::black_box(bytes.len()) as u64, Ordering::Relaxed);
+        Ok(bytes.len())
+    }
+    fn flush(&mut self) -> io::Result<()> { Ok(()) }
+}
+#[cfg(feature="facade")]
+struct Sink;
+#[cfg(feature="facade")]
+impl log::Log for Sink {
+    fn enabled(&self, _: &log::Metadata<'_>) -> bool { true }
+    fn log(&self, record: &log::Record<'_>) { writeln!(Count, "{}", record.args()).unwrap(); }
+    fn flush(&self) {}
+}
+fn main() {
+    #[cfg(feature="facade")]
+    { log::set_logger(&Sink).unwrap(); log::set_max_level(log::LevelFilter::Info); }
+    #[cfg(feature="subscriber")]
+    tracing::subscriber::set_global_default(tracing_subscriber::fmt().json().without_time()
+        .with_target(false).with_current_span(false).with_span_list(false).with_writer(|| Count).finish()).unwrap();
+    let start = std::time::Instant::now();
+    for n in 0..1_000_000u64 {
+        let n = std::hint::black_box(n);
+        #[cfg(feature="facade")]
+        log::info!("{{\"event\":\"repair\",\"offset\":{n}}}");
+        #[cfg(feature="subscriber")]
+        tracing::info!(event="repair", offset=n);
+        #[cfg(not(any(feature="facade", feature="subscriber")))]
+        writeln!(Count, "{{\"event\":\"repair\",\"offset\":{n}}}").unwrap();
+    }
+    eprintln!("ns/record={} bytes={}", start.elapsed().as_nanos()/1_000_000, BYTES.load(Ordering::Relaxed));
+}
+RUST
+for backend in tiny facade subscriber; do
+    features=()
+    if [[ $backend != tiny ]]; then features=(--features "$backend"); fi
+    cargo build --release --manifest-path "$probe/Cargo.toml" "${features[@]}"
+    printf '%s: ' "$backend"
+    wc -c < "$probe/target/release/a-logging-probe"
+    for trial in 1 2 3 4 5; do "$probe/target/release/a-logging-probe"; done
+done
+cargo tree --manifest-path "$probe/Cargo.toml" --features subscriber -e normal --prefix none -f '{p}' > "$probe/tree"
+if rg '^tokio v' "$probe/tree"; then exit 1; fi

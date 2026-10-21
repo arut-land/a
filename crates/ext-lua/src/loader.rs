@@ -6,7 +6,7 @@ use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, PoisonError, Weak};
 use std::time::{Duration, Instant};
 
-use ext::host::{Generations, Prepare, Registry, Sources};
+use ext::host::{Changed, Generations, Prepare, Registry, Sources, Updates};
 use ext::{Extension, Refused, Registrar, Tier};
 
 use crate::{Limits, Mod};
@@ -37,12 +37,17 @@ struct Workspace {
     watcher: Mutex<Option<rt::Watcher>>,
     preparing: Mutex<()>,
     opened: Mutex<()>,
+    updates: Updates,
 }
 fn lock<T>(value: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
     value.lock().unwrap_or_else(PoisonError::into_inner)
 }
 
 impl Loader {
+    pub fn source(&self) -> Arc<dyn Sources> {
+        Arc::clone(&self.0) as _
+    }
+
     pub fn new(
         home: &Path,
         config: sys::config::Exts,
@@ -91,6 +96,9 @@ impl Extension for Loader {
 impl Generations for Workspace {
     fn generation(&self) -> u64 {
         self.number.load(Ordering::Acquire)
+    }
+    fn subscribe(&self, changed: Weak<Changed>) {
+        self.updates.subscribe(changed);
     }
     fn registry(&self) -> Arc<Registry> {
         Arc::clone(&lock(&self.current))
@@ -150,6 +158,9 @@ impl Compiler {
             let module = match Mod::load(name, source, &grants, self.limits) {
                 Ok(module) => module,
                 Err(error) if initial => {
+                    ext_logging::emit(ext_logging::Fact::ExtensionRejected {
+                        module: ext_logging::workspace(Path::new(name)),
+                    });
                     eprintln!("warning: {error}");
                     continue;
                 }
@@ -161,6 +172,9 @@ impl Compiler {
                     registry
                 }
                 Err(error) if initial => {
+                    ext_logging::emit(ext_logging::Fact::ExtensionRejected {
+                        module: ext_logging::workspace(Path::new(name)),
+                    });
                     eprintln!("warning: {error}");
                     let mut registry = (self.base)()?;
                     for module in &installed {
@@ -185,6 +199,23 @@ impl Workspace {
         initial: bool,
     ) -> Result<(), Refused> {
         let _preparing = lock(&self.preparing);
+        let result = self.prepare_inner(compiler, path, initial);
+        if result.is_err() {
+            ext_logging::emit(ext_logging::Fact::Generation {
+                workspace: ext_logging::workspace(path),
+                number: self.generation(),
+                accepted: false,
+            });
+        }
+        result
+    }
+
+    fn prepare_inner(
+        self: &Arc<Self>,
+        compiler: &Arc<Compiler>,
+        path: &Path,
+        initial: bool,
+    ) -> Result<(), Refused> {
         let found = compiler.scan(path)?;
         if !initial && *lock(&self.files) == found {
             return Ok(());
@@ -199,7 +230,13 @@ impl Workspace {
             })?;
         *lock(&self.files) = found;
         *lock(&self.current) = Arc::new(registry);
-        self.number.fetch_add(1, Ordering::Release);
+        let number = self.number.fetch_add(1, Ordering::Release) + 1;
+        ext_logging::emit(ext_logging::Fact::Generation {
+            workspace: ext_logging::workspace(path),
+            number,
+            accepted: true,
+        });
+        self.updates.notify();
         Ok(())
     }
 
@@ -248,6 +285,7 @@ impl Sources for Source {
             watcher: Mutex::default(),
             preparing: Mutex::default(),
             opened: Mutex::default(),
+            updates: Updates::default(),
         });
         let opened = lock(&workspace.opened);
         index.insert(path.to_path_buf(), Arc::downgrade(&workspace));
@@ -426,6 +464,7 @@ mod tests {
             watcher: Mutex::default(),
             preparing: Mutex::default(),
             opened: Mutex::default(),
+            updates: Updates::default(),
         });
         workspace.prepare(&loader.0.compiler, &root, true).unwrap();
         let old = workspace.registry();

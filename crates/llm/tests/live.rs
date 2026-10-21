@@ -15,7 +15,7 @@ use llm::{
 use serde_json::json;
 
 fn http() -> Ureq {
-    Ureq::new(Arc::new(rt::Threads::new(1)))
+    Ureq::new(Arc::new(rt::Threads::new(1)), llm::Redirects::Follow)
 }
 
 fn openai() -> Provider {

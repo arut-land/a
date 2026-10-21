@@ -64,6 +64,13 @@ No output format flag: stdout is the reply, and scripts that want the
 structure read the session's log (`$A_HOME/sessions/<id>.jsonl`) or speak
 the protocol (`a bridge`).
 
+## Daemon diagnostics
+
+`a daemon status` reports liveness and the diagnostic log path. `a daemon
+log` reads the current JSONL diagnostic file without starting the daemon.
+The [logging contract](logging.md) describes its typed facts, retention,
+privacy boundary and best-effort delivery.
+
 ## Fork a conversation
 
 `a fork <session>[@<seq>]` creates a new session and prints its id. `/fork [seq]` copies the current conversation at a rest point and switches to it.

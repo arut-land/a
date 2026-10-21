@@ -55,7 +55,10 @@ fn over_ureq(port: u16) -> (Fixture, PathBuf) {
     std::fs::write(&home, env).unwrap();
     let models = Models {
         settings: crate::config::Settings::new(home.clone(), None),
-        http: Arc::new(llm::Ureq::new(Arc::new(rt::Threads::new(1)))),
+        http: Arc::new(llm::Ureq::new(
+            Arc::new(rt::Threads::new(1)),
+            llm::Redirects::Follow,
+        )),
     };
     let fixture = Fixture::new(ext::LOOP, Registry::default(), models);
     (fixture, home)

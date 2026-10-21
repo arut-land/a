@@ -14,11 +14,13 @@ dependencies = [
  "ext-fixtures",
  "ext-fork",
  "ext-lua",
+ "ext-mcp",
  "ext-policy",
  "ext-prompt",
  "ext-retry",
  "ext-settings",
  "ext-shell",
+ "ext-skills",
  "ext-subagent",
  "ext-title",
  "libc",
@@ -438,6 +440,7 @@ checksum = "f079e83a288787bcd14a6aea84cee5c87a67c5a3e660c30f557a3d24761b3527"
 name = "client"
 version = "0.0.0"
 dependencies = [
+ "ext-logging",
  "protocol",
  "serde_json",
  "sys",
@@ -531,6 +534,7 @@ dependencies = [
  "ext-edit",
  "ext-fixtures",
  "ext-fork",
+ "ext-logging",
  "ext-policy",
  "ext-prompt",
  "ext-retry",
@@ -667,14 +671,45 @@ dependencies = [
 ]
 
 [[package]]
+name = "ext-logging"
+version = "0.0.0"
+dependencies = [
+ "json",
+ "protocol",
+ "rt",
+ "serde",
+ "serde_json",
+ "sys",
+]
+
+[[package]]
 name = "ext-lua"
 version = "0.0.0"
 dependencies = [
  "ext",
+ "ext-logging",
  "llm",
  "mlua",
  "protocol",
  "rt",
+ "serde_json",
+ "sys",
+]
+
+[[package]]
+name = "ext-mcp"
+version = "0.0.0"
+dependencies = [
+ "base64",
+ "ext",
+ "ext-derive",
+ "ext-policy",
+ "ext-shell",
+ "http",
+ "llm",
+ "protocol",
+ "rt",
+ "serde",
  "serde_json",
  "sys",
 ]
@@ -729,6 +764,21 @@ dependencies = [
  "serde_json",
  "sys",
  "vte",
+]
+
+[[package]]
+name = "ext-skills"
+version = "0.0.0"
+dependencies = [
+ "ext",
+ "kernel",
+ "llm",
+ "protocol",
+ "rt",
+ "serde",
+ "serde_json",
+ "serde_yaml_ng",
+ "sys",
 ]
 
 [[package]]
@@ -1659,6 +1709,7 @@ version = "0.0.0"
 dependencies = [
  "async-executor",
  "async-io",
+ "atomic-waker",
  "futures-core",
  "futures-lite",
  "notify",
@@ -2051,6 +2102,8 @@ version = "0.0.0"
 dependencies = [
  "libc",
  "rustix",
+ "serde",
+ "serde_json",
  "toml_edit 0.25.17+spec-1.1.0",
  "windows-sys 0.61.2",
 ]

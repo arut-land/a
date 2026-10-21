@@ -171,3 +171,15 @@ Termination never reopens the PID. Missing or mismatched Windows tokens are
 rejected. The existing portable impostor-record test protects the public stop
 path; the native handle test retains the verified target after exit, starts a
 successor and confirms a second signal cannot affect that successor.
+
+## Main integration
+
+Main through b6a11da uses protocol 8 and adds a daemon signal listener and MCP
+stdio. Windows console callbacks now signal a process-lifetime event registered
+through rt; detached processes can wait without a console or a polling thread.
+The permanently owned event avoids callback/handle-close reuse races.
+MCP also uses the contained, explicitly allowlisted native spawn path. Its
+parent stdio uses overlapped private pipes and the same completion ownership
+as daemon transport; inherited child stdio remains synchronous. Unix keeps
+ordinary readiness pipes. No extra package, worker thread or timer is added.
+Native CI must execute these integration paths as well as the five fixes.

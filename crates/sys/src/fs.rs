@@ -6,6 +6,123 @@ use std::fs::{self, File, OpenOptions};
 use std::io;
 use std::path::Path;
 
+/// Why discovery skipped a candidate instead of opening arbitrary filesystem objects.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum RejectedFile {
+    NotRegular,
+    OutsideRoot,
+}
+
+/// A regular file or a typed discovery rejection; IO failures remain errors.
+#[derive(Debug)]
+pub enum RegularFile {
+    Open(File),
+    Skipped(RejectedFile),
+}
+
+/// Checking metadata first avoids opening devices; nonblocking open and a
+/// second check on the handle also cover replacement by a FIFO during discovery.
+pub fn open_regular(path: &Path) -> io::Result<RegularFile> {
+    if !fs::metadata(path)?.is_file() {
+        return Ok(RegularFile::Skipped(RejectedFile::NotRegular));
+    }
+    let mut options = OpenOptions::new();
+    options.read(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.custom_flags(libc::O_NONBLOCK | libc::O_NOFOLLOW);
+    }
+    #[cfg(windows)]
+    {
+        use std::os::windows::fs::OpenOptionsExt;
+        // Open a replaced link itself, never its device target.
+        options.custom_flags(0x0020_0000); // FILE_FLAG_OPEN_REPARSE_POINT
+    }
+    let file = options.open(path)?;
+    if !file.metadata()?.is_file() {
+        return Ok(RegularFile::Skipped(RejectedFile::NotRegular));
+    }
+    Ok(RegularFile::Open(file))
+}
+
+/// Resolving links is permitted only within the explicitly configured root.
+/// The Unix walk pins each directory and refuses new links after resolution.
+pub fn open_regular_within(root: &Path, path: &Path) -> io::Result<RegularFile> {
+    let root = root.canonicalize()?;
+    let path = path.canonicalize()?;
+    let Ok(relative) = path.strip_prefix(&root) else {
+        return Ok(RegularFile::Skipped(RejectedFile::OutsideRoot));
+    };
+    if !fs::metadata(&path)?.is_file() {
+        return Ok(RegularFile::Skipped(RejectedFile::NotRegular));
+    }
+    #[cfg(unix)]
+    {
+        use rustix::fs::{Mode, OFlags, open, openat};
+        let directory = OFlags::RDONLY | OFlags::DIRECTORY | OFlags::NOFOLLOW | OFlags::CLOEXEC;
+        let mut parent = open(&root, directory, Mode::empty())?;
+        let mut parts = relative.components().peekable();
+        while let Some(part) = parts.next() {
+            let flags = if parts.peek().is_some() {
+                directory
+            } else {
+                OFlags::RDONLY | OFlags::NONBLOCK | OFlags::NOFOLLOW | OFlags::CLOEXEC
+            };
+            parent = openat(&parent, part.as_os_str(), flags, Mode::empty())?;
+        }
+        let file = File::from(parent);
+        if !file.metadata()?.is_file() {
+            return Ok(RegularFile::Skipped(RejectedFile::NotRegular));
+        }
+        Ok(RegularFile::Open(file))
+    }
+    #[cfg(windows)]
+    {
+        let _ = relative;
+        let opened = open_regular(&path)?;
+        if let RegularFile::Open(file) = &opened {
+            // A handle's final path detects ancestor replacement as well as
+            // links in the originally supplied spelling.
+            if !final_path(file)?.starts_with(&root) {
+                return Ok(RegularFile::Skipped(RejectedFile::OutsideRoot));
+            }
+        }
+        Ok(opened)
+    }
+}
+
+#[cfg(windows)]
+fn final_path(file: &File) -> io::Result<std::path::PathBuf> {
+    use std::os::windows::{ffi::OsStringExt, io::AsRawHandle};
+    #[link(name = "kernel32")]
+    unsafe extern "system" {
+        fn GetFinalPathNameByHandleW(
+            handle: *mut std::ffi::c_void,
+            buffer: *mut u16,
+            length: u32,
+            flags: u32,
+        ) -> u32;
+    }
+    let mut buffer = vec![0u16; 512];
+    loop {
+        let capacity = u32::try_from(buffer.len())
+            .map_err(|_| io::Error::other("resolved path exceeds system capacity"))?;
+        // SAFETY: the file owns the handle and buffer has the advertised capacity.
+        let length = unsafe {
+            GetFinalPathNameByHandleW(file.as_raw_handle(), buffer.as_mut_ptr(), capacity, 0)
+        };
+        if length == 0 {
+            return Err(io::Error::last_os_error());
+        }
+        if (length as usize) < buffer.len() {
+            buffer.truncate(length as usize);
+            return Ok(std::ffi::OsString::from_wide(&buffer).into());
+        }
+        buffer.resize(length as usize + 1, 0);
+    }
+}
+
 /// Orders earlier writes before later commits. Apple keeps them in the
 /// drive cache until a cache flush covers the promise made to a client or
 /// an external effect; other platforms already flush here.
@@ -425,6 +542,66 @@ mod tests {
     use std::os::unix::fs::PermissionsExt;
 
     use super::*;
+
+    #[test]
+    fn discovery_never_opens_a_fifo_or_directory() {
+        let dir = std::env::temp_dir().join(format!("a-sys-regular-{}", std::process::id()));
+        fs::create_dir_all(&dir).unwrap();
+        let fifo = dir.join("fifo");
+        let encoded = std::ffi::CString::new(fifo.as_os_str().as_encoded_bytes()).unwrap();
+        // SAFETY: encoded is a terminated path and lives through the call.
+        assert_eq!(unsafe { libc::mkfifo(encoded.as_ptr(), 0o600) }, 0);
+        for path in [&dir, &fifo] {
+            assert!(matches!(
+                open_regular(path).unwrap(),
+                RegularFile::Skipped(RejectedFile::NotRegular)
+            ));
+        }
+        let regular = dir.join("regular");
+        fs::write(&regular, "instructions").unwrap();
+        assert!(matches!(
+            open_regular(&regular).unwrap(),
+            RegularFile::Open(_)
+        ));
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn resolved_files_and_packages_cannot_escape_the_configured_root() {
+        use std::os::unix::fs::symlink;
+        let dir = std::env::temp_dir().join(format!("a-sys-contained-{}", std::process::id()));
+        let root = dir.join("root");
+        let outside = dir.join("outside");
+        fs::create_dir_all(root.join("real")).unwrap();
+        fs::create_dir_all(&outside).unwrap();
+        fs::write(root.join("real/SKILL.md"), "inside").unwrap();
+        fs::write(outside.join("SKILL.md"), "outside").unwrap();
+        symlink(&outside, root.join("escape-package")).unwrap();
+        symlink(outside.join("SKILL.md"), root.join("escape-file")).unwrap();
+        symlink(root.join("real"), root.join("alias")).unwrap();
+        for candidate in [
+            root.join("escape-package/SKILL.md"),
+            root.join("escape-file"),
+        ] {
+            assert!(matches!(
+                open_regular_within(&root, &candidate).unwrap(),
+                RegularFile::Skipped(RejectedFile::OutsideRoot)
+            ));
+        }
+        assert!(matches!(
+            open_regular_within(&root, &root.join("alias/SKILL.md")).unwrap(),
+            RegularFile::Open(_)
+        ));
+        let fifo = root.join("fifo");
+        let encoded = std::ffi::CString::new(fifo.as_os_str().as_encoded_bytes()).unwrap();
+        // SAFETY: encoded is a terminated path and lives through the call.
+        assert_eq!(unsafe { libc::mkfifo(encoded.as_ptr(), 0o600) }, 0);
+        assert!(matches!(
+            open_regular_within(&root, &fifo).unwrap(),
+            RegularFile::Skipped(RejectedFile::NotRegular)
+        ));
+        fs::remove_dir_all(dir).unwrap();
+    }
 
     #[cfg(target_vendor = "apple")]
     #[test]

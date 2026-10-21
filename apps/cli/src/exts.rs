@@ -17,11 +17,34 @@ use ext::{Configured, DynExtension, Name, Refused, Registrar, Table, Tier};
 pub fn registry(config: &Config) -> Result<Registry, Refused> {
     let registry = linked(config)?;
     #[cfg(feature = "lua")]
-    if !config.ext.disable.iter().any(|name| name == "lua") {
+    let lua = if config.ext.disable.iter().any(|name| name == "lua") {
+        None
+    } else {
         let home = sys::Home::from_env().map_err(|e| Refused(e.to_string()))?;
         let base = config.clone();
-        let loader = ext_lua::Loader::new(home.root(), config.ext.clone(), move || linked(&base))?;
+        Some(ext_lua::Loader::new(
+            home.root(),
+            config.ext.clone(),
+            move || linked(&base),
+        )?)
+    };
+    #[cfg(feature = "skills")]
+    if !config.ext.disable.iter().any(|name| name == "skills") {
+        let home = sys::Home::from_env().map_err(|e| Refused(e.to_string()))?;
+        #[cfg(feature = "lua")]
+        let inner = lua.as_ref().map(ext_lua::Loader::source);
+        #[cfg(not(feature = "lua"))]
+        let inner = None;
+        let skills =
+            configured::<ext_skills::Skills>(config)?.reserving(client::COMMANDS.iter().flat_map(
+                |command| std::iter::once(command.name).chain(command.aliases.iter().copied()),
+            ));
+        let loader = ext_skills::Loader::new(home.root(), skills, registry.clone(), inner);
         return registry.with_in(Tier::Pre, &loader);
+    }
+    #[cfg(feature = "lua")]
+    if let Some(lua) = lua {
+        return registry.with_in(Tier::Pre, &lua);
     }
     Ok(registry)
 }
@@ -45,8 +68,12 @@ fn linked(config: &Config) -> Result<Registry, Refused> {
     // Needs the shell: without it, this does not compile.
     #[cfg(feature = "edit")]
     let built = built.with(Tier::Pre, &configured::<ext_edit::Edit>(config)?)?;
+    #[cfg(feature = "mcp")]
+    let built = built.with(Tier::Pre, &configured::<ext_mcp::Mcp>(config)?)?;
     #[cfg(feature = "compact")]
     let built = built.with(Tier::Pre, &configured::<ext_compact::Compact>(config)?)?;
+    #[cfg(feature = "skills")]
+    let built = built.with(Tier::Pre, &configured::<ext_skills::Skills>(config)?)?;
     #[cfg(feature = "settings")]
     let built = built.with(Tier::Pre, &configured::<ext_settings::Settings>(config)?)?;
     #[cfg(feature = "subagent")]
@@ -190,10 +217,10 @@ mod tests {
     #[test]
     fn every_extension_registers_as_any_other() {
         let registry = registry(&config(&["bash"], None)).unwrap();
-        assert_eq!(tools(&registry), ["bash", "edit", "task"]);
+        assert_eq!(tools(&registry), ["bash", "edit", "skill", "task"]);
         let extensions: Vec<_> = registry
             .extensions()
-            .filter(|(name, _)| *name != "lua")
+            .filter(|(name, _)| !["lua", "skills-source"].contains(name))
             .collect();
         assert_eq!(
             extensions,
@@ -205,7 +232,10 @@ mod tests {
                 ("prompt", 1),
                 ("shell", 1),
                 ("edit", 1),
+                #[cfg(feature = "mcp")]
+                ("mcp", 1),
                 ("compact", 1),
+                ("skills", 1),
                 ("settings", 1),
                 ("subagent", 1),
                 ("retry", 1),
@@ -241,7 +271,7 @@ mod tests {
             r.system_prompt().split("\n\n").map(str::to_owned).collect()
         };
         // What each contributes that the others do not.
-        let own: [(&str, &[&str], usize); 11] = [
+        let own: [(&str, &[&str], usize); 12] = [
             ("title", &[], 0),
             ("compact", &[], 0),
             ("policy-floor", &[], 0),
@@ -252,6 +282,7 @@ mod tests {
             ("edit", &["edit"], 1),
             ("retry", &[], 0),
             ("settings", &[], 0),
+            ("skills", &["skill"], 0),
             ("subagent", &["task"], 1),
         ];
         for (name, tools_of, texts_of) in own {
@@ -283,8 +314,18 @@ mod tests {
             }
             let rest = rest.unwrap();
             // Replaced by nothing of its name: listed, contributing nothing.
-            let listed: Vec<_> = rest.extensions().map(|(n, _)| n).collect();
-            assert_eq!(listed, all.extensions().map(|(n, _)| n).collect::<Vec<_>>());
+            let listed: Vec<_> = rest
+                .extensions()
+                .map(|(n, _)| n)
+                .filter(|n| *n != "skills-source")
+                .collect();
+            assert_eq!(
+                listed,
+                all.extensions()
+                    .map(|(n, _)| n)
+                    .filter(|n| *n != "skills-source")
+                    .collect::<Vec<_>>()
+            );
             assert_eq!(rest.extensions().find(|(n, _)| *n == name).unwrap().1, 0);
             let mut kept = tools(&all);
             kept.retain(|t| !tools_of.contains(&t.as_str()));

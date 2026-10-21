@@ -35,7 +35,7 @@ impl EventSink for Noop {
     fn emit(&self, _event: impl FnOnce() -> Event) {}
 }
 
-/// Writes each event as a line on stderr: the daemon's log.
+/// Writes debugging events to stderr; never the typed daemon log.
 #[derive(Clone, Copy, Debug, Default)]
 pub struct Stderr;
 

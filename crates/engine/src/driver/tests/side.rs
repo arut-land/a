@@ -166,6 +166,46 @@ fn a_context_overflow_is_compacted_and_sent_again() {
     assert!(matches!(&messages[0], llm::Message::User(u) if format!("{u:?}").contains("summary")));
 }
 
+struct Index;
+impl Extension for Index {
+    const NAME: &'static str = "index";
+    const VERSION: u32 = 1;
+    fn contribute(&self, r: &mut Registrar) {
+        r.text(ext::Text::generation("index", 0, "available: review"));
+    }
+}
+
+#[test]
+fn a_compaction_retry_republishes_the_index_and_keeps_the_summary() {
+    let http = Flaky::new([
+        Reply::Status(413, &[]),
+        Reply::Events(text_reply()),
+        Reply::Events(text_reply()),
+    ]);
+    let registry = Registry::default()
+        .with(&Index)
+        .unwrap()
+        .with(&ext_compact::Compact::default())
+        .unwrap();
+    let session = fixture(registry, &http).start(&[]);
+    session.submit("hi").unwrap();
+    settle(&session);
+    let log = log_of(&session);
+    session.halt();
+    assert_eq!(http.sent(), 3, "{log:#?}");
+    assert_eq!(
+        log.iter()
+            .filter(|e| matches!(&e.body,
+        Body::Context { text, .. } if text == "available: review"))
+            .count(),
+        2
+    );
+    let bodies = http.bodies();
+    let resent = bodies[2].to_string();
+    assert!(resent.contains("available: review"), "{resent}");
+    assert!(resent.contains("summary of the conversation"), "{resent}");
+}
+
 /// An edit changes what the model sees from then on, and nothing else:
 /// the transcript before it is as it was, and the log keeps every entry.
 #[test]
@@ -250,4 +290,43 @@ fn a_title_call_is_a_side_call() {
         Some("The harbor label is crimson-harbor.")
     );
     assert_eq!(titles.len(), 1, "titled once");
+}
+
+#[test]
+fn side_failures_keep_classification_without_provider_content() {
+    let secret = "private provider body, message and request id";
+    for (kind, status, classified) in [
+        (llm::Kind::RateLimit, Some(429), "rate_limit"),
+        (llm::Kind::Auth, Some(401), "auth"),
+        (llm::Kind::Transport, None, "transport"),
+    ] {
+        let session = SessionId::new();
+        let mut error = llm::Error::new(kind, secret);
+        error.status = status;
+        error.body = Some(secret.into());
+        error.request_id = Some(secret.into());
+        assert!(sided(session, Some(Replied::Failed(error))).1.is_err());
+        let records: Vec<_> = ext_logging::testing::pending().into_iter().filter(|fact| {
+            matches!(fact, ext_logging::Fact::ProviderError { session: id, .. } if *id == session)
+        }).collect();
+        assert_eq!(records.len(), 1);
+        let text = serde_json::to_string(&records[0]).unwrap();
+        let record: Value = serde_json::from_str(&text).unwrap();
+        assert_eq!(record["provider_error"]["kind"], classified);
+        assert_eq!(
+            record["provider_error"]["status"],
+            serde_json::to_value(status).unwrap()
+        );
+        assert_eq!(record["provider_error"]["retryable"], kind.is_retryable());
+        assert!(!text.contains(secret));
+    }
+    let session = SessionId::new();
+    assert!(sided(session, None).1.is_err());
+    assert!(
+        ext_logging::testing::pending()
+            .iter()
+            .any(|fact| matches!(fact,
+        ext_logging::Fact::ProviderError { session: id, kind: ext_logging::Provider::Transport, .. }
+        if *id == session))
+    );
 }

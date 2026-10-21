@@ -141,6 +141,22 @@ fn listener(file: Arc<File>, path: &Path) -> io::Result<Listener> {
     })
 }
 
+pub(crate) fn process_pipe() -> io::Result<(super::Stream, File)> {
+    use std::sync::atomic::AtomicU64;
+    static NEXT: AtomicU64 = AtomicU64::new(0);
+    let token = crate::process_started(std::process::id()).ok_or(io::ErrorKind::NotFound)?;
+    let name = PathBuf::from(format!(
+        r"\\.\pipe\a-stdio-{}-{token}-{}",
+        std::process::id(),
+        NEXT.fetch_add(1, Ordering::Relaxed)
+    ));
+    let listener = listener(instance(&name, true)?, &name)?;
+    // The parent's server end is overlapped; the inherited child end uses
+    // synchronous stdio, as arbitrary child programs expect.
+    let child = OpenOptions::new().read(true).write(true).open(&name)?;
+    Ok((super::Stream(accept(&listener)?), child))
+}
+
 pub fn adopt(_passed: Passed, _path: &Path) -> io::Result<Listener> {
     Err(io::Error::new(
         io::ErrorKind::InvalidInput,

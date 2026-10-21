@@ -173,6 +173,16 @@ impl<T: std::os::windows::io::AsSocket> Async<T> {
     }
 }
 
+impl Async<sys::ProcessPipe> {
+    /// Child output needs readiness on Unix and overlapped completion on Windows.
+    pub fn read_pipe(reactor: &Reactor, io: sys::ProcessPipe) -> io::Result<Self> {
+        #[cfg(unix)]
+        return Self::for_reading(reactor, io);
+        #[cfg(windows)]
+        Self::new(reactor, io)
+    }
+}
+
 impl<T: Source> Async<T> {
     pub fn get_ref(&self) -> &T {
         match &self.0 {
