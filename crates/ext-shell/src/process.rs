@@ -64,14 +64,20 @@ impl RunningProcess for Live {
 
 struct Reap(Option<sys::Child>, Arc<Live>);
 
+impl Reap {
+    fn complete(&mut self, status: Option<ExitStatus>) {
+        if let Some(mut child) = self.0.take() {
+            *lock(&self.1.status) = Some(status.map_or_else(|| child.wait(), Ok));
+            self.1.exited.set();
+        }
+    }
+}
+
 impl Drop for Reap {
     fn drop(&mut self) {
         // Also covers failed registration and a runtime dropping its task.
         lock(&self.1.group).take();
-        if let Some(mut child) = self.0.take() {
-            *lock(&self.1.status) = Some(child.wait());
-            self.1.exited.set();
-        }
+        self.complete(None);
         self.1.ended.set();
     }
 }
@@ -160,9 +166,7 @@ async fn launch(
         Ok(watch) => Some(rt::Async::for_reading(&reactor, watch)?),
         Err(e) if e.kind() == io::ErrorKind::NotFound => {
             if let Some(status) = owned.0.as_mut().unwrap().try_wait()? {
-                *lock(&live.status) = Some(Ok(status));
-                live.exited.set();
-                owned.0.take();
+                owned.complete(Some(status));
                 None
             } else {
                 return Err(e);
@@ -185,10 +189,7 @@ async fn launch(
         {
             return;
         }
-        if let Some(mut child) = owned.0.take() {
-            *lock(&owned.1.status) = Some(child.wait());
-            owned.1.exited.set();
-        }
+        owned.complete(None);
         // Descendants may survive their leader. Rebuild only on exits;
         // unsupported watches trigger containment cleanup, never a timer.
         loop {
