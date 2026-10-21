@@ -627,11 +627,7 @@ impl ext::Agent for LuaAgent {
 fn sync(lua: &Lua, run: &Function, args: (Value, Value), limits: Limits) -> mlua::Result<Json> {
     lua.scope(|_| {
         let budget = lua.app_data_ref::<Arc<Budget>>().map_or_else(
-            || {
-                ext::point::dispatch_local(lua.globals().to_pointer() as usize, || {
-                    Budget::new(limits)
-                })
-            },
+            || ext::point::dispatch_local(0, || Budget::new(limits)),
             |budget| Arc::clone(&budget),
         );
         budget.dispatch(lua, || {
@@ -970,10 +966,7 @@ impl LuaTool {
                 Ok(())
             })?,
         )?;
-        let budget = self
-            .lua
-            .app_data_ref::<Arc<Budget>>()
-            .map_or_else(|| Budget::new(self.limits), |budget| Arc::clone(&budget));
+        let budget = cx.invocation().local(0, || Budget::new(self.limits));
         let hook = Arc::clone(&budget);
         let thread = self.lua.create_thread(self.run.clone())?;
         thread.set_hook(
@@ -982,12 +975,15 @@ impl LuaTool {
         )?;
         let mut work =
             pin!(thread.into_async::<Value>((decode(&self.lua, input)?, Value::Table(context)))?);
-        let value = poll_fn(
-            |cx| match budget.dispatch(&self.lua, || Ok(work.as_mut().poll(cx))) {
+        let value = poll_fn(|poll| {
+            match cx
+                .invocation()
+                .scope(|| budget.dispatch(&self.lua, || Ok(work.as_mut().poll(poll))))
+            {
                 Ok(poll) => poll,
                 Err(error) => Poll::Ready(Err(error)),
-            },
-        )
+            }
+        })
         .await?;
         drop(active);
         drop(call);

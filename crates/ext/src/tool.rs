@@ -125,6 +125,7 @@ pub struct Cx {
     pub cancel: Cancel,
     services: Arc<SessionServices>,
     host: Arc<dyn Host>,
+    invocation: crate::point::InvocationContext,
 }
 
 impl Cx {
@@ -149,7 +150,20 @@ impl Cx {
             cancel,
             services,
             host,
+            invocation: crate::point::InvocationContext::default(),
         }
+    }
+
+    /// State shared only by this owned invocation chain.
+    pub const fn invocation(&self) -> &crate::point::InvocationContext {
+        &self.invocation
+    }
+
+    /// The host binds a delegated call to its owner's ephemeral context.
+    #[must_use]
+    pub fn with_invocation(mut self, context: crate::point::InvocationContext) -> Self {
+        self.invocation = context;
+        self
     }
 
     /// Reads state `S`, or its default when no extension registered it.

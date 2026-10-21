@@ -183,7 +183,7 @@ impl Host for CallPorts {
 
     fn invoke(
         self: Arc<Self>,
-        _: Cx,
+        cx: Cx,
         name: String,
         tool: String,
         input: Json,
@@ -192,6 +192,7 @@ impl Host for CallPorts {
         self.origin.send(
             &self.session,
             ContextRequest::Invoke {
+                context: cx.invocation().clone(),
                 name,
                 tool,
                 input,

@@ -49,7 +49,7 @@ use std::future::{Future, poll_fn};
 use std::panic::{AssertUnwindSafe, catch_unwind};
 use std::path::Path;
 use std::pin::Pin;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex, PoisonError};
 use std::task::Poll;
 use std::time::Duration;
 
@@ -468,55 +468,73 @@ impl Rule for Reaction {
     }
 }
 
-type DispatchLocals = BTreeMap<(TypeId, usize), Box<dyn Any>>;
-thread_local! {
-    static DISPATCH: RefCell<Option<DispatchLocals>> = const { RefCell::new(None) };
+type DispatchLocals = BTreeMap<(TypeId, usize), Box<dyn Any + Send + Sync>>;
+
+/// Ephemeral state owned by a call and shared with its named invocations.
+/// It carries budgets across workers; it is neither a session service nor replay state.
+#[derive(Clone, Default)]
+pub struct InvocationContext(Arc<Mutex<DispatchLocals>>);
+impl InvocationContext {
+    pub fn local<T: Any + Send + Sync>(&self, key: usize, init: impl FnOnce() -> Arc<T>) -> Arc<T> {
+        let slot = (TypeId::of::<T>(), key);
+        let existing = self
+            .0
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .get(&slot)
+            .and_then(|value| value.downcast_ref::<Arc<T>>())
+            .cloned();
+        if let Some(existing) = existing {
+            return existing;
+        }
+        let value = init();
+        let mut locals = self.0.lock().unwrap_or_else(PoisonError::into_inner);
+        Arc::clone(
+            locals
+                .entry(slot)
+                .or_insert_with(|| Box::new(value))
+                .downcast_ref::<Arc<T>>()
+                .expect("typed invocation local"),
+        )
+    }
+
+    /// Installs this owned context for synchronous dispatch only, never across an await.
+    pub fn scope<T>(&self, run: impl FnOnce() -> T) -> T {
+        let _scope = InvocationScope(DISPATCH.replace(Some(self.clone())));
+        run()
+    }
 }
 
-struct Dispatch(bool);
+thread_local! {
+    static DISPATCH: RefCell<Option<InvocationContext>> = const { RefCell::new(None) };
+}
+struct InvocationScope(Option<InvocationContext>);
+impl Drop for InvocationScope {
+    fn drop(&mut self) {
+        DISPATCH.replace(self.0.take());
+    }
+}
+struct Dispatch {
+    _scope: Option<InvocationScope>,
+}
 impl Dispatch {
     fn enter() -> Self {
-        Self(DISPATCH.with_borrow_mut(|locals| {
-            if locals.is_some() {
-                false
-            } else {
-                *locals = Some(BTreeMap::new());
-                true
-            }
-        }))
-    }
-}
-impl Drop for Dispatch {
-    fn drop(&mut self) {
-        if self.0 {
-            let locals = DISPATCH.with_borrow_mut(Option::take);
-            drop(locals);
+        Self {
+            _scope: DISPATCH
+                .with_borrow(Option::is_none)
+                .then(|| InvocationScope(DISPATCH.replace(Some(InvocationContext::default())))),
         }
     }
 }
 
-/// State shared by sequential and nested synchronous handlers in one dispatch.
-/// `key` identifies the caller's resource (for example a VM). Outside a dispatch,
-/// state is fresh; no state survives the outermost dispatch, including unwinding.
-/// This scope never spans an await or moves between runtime workers.
-pub fn dispatch_local<T: Any>(key: usize, init: impl FnOnce() -> Arc<T>) -> Arc<T> {
-    let slot = (TypeId::of::<T>(), key);
-    if let Some(value) = DISPATCH.with_borrow(|locals| {
-        locals
-            .as_ref()?
-            .get(&slot)?
-            .downcast_ref::<Arc<T>>()
-            .cloned()
-    }) {
-        return value;
+/// State shared by synchronous handlers and their owned invocation context.
+/// `key` identifies a resource within the context. Without a context, state is fresh.
+pub fn dispatch_local<T: Any + Send + Sync>(key: usize, init: impl FnOnce() -> Arc<T>) -> Arc<T> {
+    let context = DISPATCH.with_borrow(Clone::clone);
+    match context {
+        Some(context) => context.local(key, init),
+        None => init(),
     }
-    let value = init();
-    DISPATCH.with_borrow_mut(|locals| {
-        if let Some(locals) = locals {
-            locals.insert(slot, Box::new(Arc::clone(&value)));
-        }
-    });
-    value
 }
 
 /// What every handler is given: the session it decides for, and the call

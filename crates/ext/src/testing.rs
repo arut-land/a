@@ -173,6 +173,7 @@ impl Host for Recorder {
                 })
                 .expect("in-memory intent"),
             );
+            let context = cx.invocation().clone();
             let child = Parts {
                 workspace: cx.workspace,
                 env: cx.env,
@@ -183,7 +184,8 @@ impl Host for Recorder {
                 cancel: cx.cancel,
                 services: Arc::clone(&SERVICES),
             }
-            .cx(self.clone());
+            .cx(self.clone())
+            .with_invocation(context);
             let gated = match self.registry.hooks().gate(&child.point(), &tool, &input) {
                 Gating::Now(gated) => gated,
                 Gating::Approving(_) => {
