@@ -52,6 +52,7 @@ pub struct FlushRequest {
 }
 
 pub struct FlushLeader {
+    finished: bool,
     shared: Arc<Mutex<State>>,
     first: Option<(Work, Vec<oneshot::Sender<io::Result<()>>>)>,
 }
@@ -76,6 +77,18 @@ impl FlushLeader {
         let (work, pending) = leader.first.take().expect("sealed flush");
         complete(work, pending);
         run(&leader.shared);
+        leader.finished = true;
+    }
+}
+
+impl Drop for FlushLeader {
+    fn drop(&mut self) {
+        if !self.finished {
+            // Cancellation before admission must fail every enrolled epoch,
+            // and leave this flusher usable by a subsequent runtime.
+            let abandoned = std::mem::take(&mut *lock(&self.shared));
+            drop(abandoned);
+        }
     }
 }
 
@@ -154,6 +167,7 @@ impl Flusher {
         } else {
             state.running = true;
             Some(FlushLeader {
+                finished: false,
                 shared: Arc::clone(&self.0),
                 first: None,
             })
@@ -203,7 +217,7 @@ mod tests {
 
     impl Runtime for Manual {
         fn spawn(&self, task: BoxFuture<'static, ()>) {
-            crate::block_on(task)
+            crate::block_on(task);
         }
         fn spawn_blocking(
             &self,
@@ -226,6 +240,19 @@ mod tests {
         fn reactor(&self) -> Reactor {
             unreachable!()
         }
+    }
+
+    #[test]
+    fn closed_admission_fails_every_enrolled_flush_waiter() {
+        let runtime = crate::Threads::new(1);
+        runtime.shutdown();
+        let flusher = Flusher::default();
+        let first = flusher.enroll(|| Ok(()));
+        let second = flusher.enroll(|| Ok(()));
+        assert!(crate::block_on(first.dispatch(&runtime)).is_err());
+        assert!(crate::block_on(second.epoch).is_err());
+        let next = crate::Threads::new(1);
+        crate::block_on(flusher.request(&next, || Ok(()))).unwrap();
     }
 
     #[test]

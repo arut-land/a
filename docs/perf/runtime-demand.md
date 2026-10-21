@@ -30,8 +30,8 @@ contents. Shared flush epochs still coalesce requests without timers.
 These are ceilings, not eagerly created threads or allocated buffers.
 Async workers start together on first spawn; blocking workers start on
 demand. Starting workers count against the limit while their first
-instruction is still unscheduled. Blocking workers remain parked until
-work or shutdown; no retirement timer or periodic wake is installed.
+instruction is still unscheduled. Blocking workers retire after one ten-second idle wait, releasing their
+thread resources. No last-worker polling loop remains after retirement.
 The shared async-io reactor remains process-scoped. Runtime shutdown
 reclaims the runtime's own workers, not that shared reactor.
 
@@ -48,8 +48,8 @@ Config lookups clone immutable snapshots; demand-triggered refreshes do
 the filesystem work on storage workers.
 
 The daemon owns one runtime for sessions and logging. Shutdown stops
-sessions, flushes logging, cancels remaining async tasks, closes blocking
-admission, and joins workers after accepted work finishes. Running native
+sessions, flushes logging, closes blocking admission, cancels remaining async tasks,
+and joins workers after accepted work finishes. Running native
 I/O must first be cancelled by its owning operation; Rust cannot forcibly
 terminate an arbitrary closure. HTTP response cancellation still closes
 its socket, including registration after cancellation.

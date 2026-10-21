@@ -1,5 +1,5 @@
 //! Owned async workers and independently admitted blocking classes. Idle
-//! workers park without timers; shutdown closes admission before joining.
+//! workers retire after one idle timeout; shutdown closes admission before joining.
 
 use std::collections::{BTreeMap, VecDeque};
 use std::future::Future;
@@ -9,7 +9,7 @@ use std::sync::{Arc, Condvar, Mutex};
 use std::task::{Context, Poll, Waker};
 use std::thread::{self, JoinHandle};
 
-use crate::{BlockingClass, BoxFuture, Reactor, Runtime, Wakeup, lock, wait};
+use crate::{BlockingClass, BoxFuture, Reactor, Runtime, Wakeup, lock};
 use async_executor::Executor;
 
 type Work = Box<dyn FnOnce() + Send>;
@@ -265,7 +265,11 @@ impl Future for Admission {
                 .name("rt-blocking".into())
                 .spawn(move || pool.serve())
             {
-                Ok(worker) => lock(&this.pool.threads).push(worker),
+                Ok(worker) => {
+                    let mut threads = lock(&this.pool.threads);
+                    threads.retain(|worker| !worker.is_finished());
+                    threads.push(worker);
+                }
                 Err(error) => {
                     state.starting -= 1;
                     let (bytes, _) = state.queue.pop_back().expect("just submitted");
@@ -316,8 +320,16 @@ impl Blocking {
                 return;
             } else {
                 state.idle += 1;
-                state = wait(&self.ready, state);
+                let (next, timeout) = self
+                    .ready
+                    .wait_timeout(state, std::time::Duration::from_secs(10))
+                    .unwrap_or_else(std::sync::PoisonError::into_inner);
+                state = next;
                 state.idle -= 1;
+                if timeout.timed_out() && state.queue.is_empty() {
+                    state.workers -= 1;
+                    return;
+                }
             }
         }
     }
@@ -331,7 +343,7 @@ impl Gate {
     fn wait(&self) {
         let mut open = lock(&self.0);
         while !*open {
-            open = wait(&self.1, open);
+            open = crate::wait(&self.1, open);
         }
     }
     fn open(&self) {
@@ -420,7 +432,7 @@ mod tests {
         let (tx, rx) = oneshot::channel();
         rt.spawn(Box::pin(async move {
             let _held = tx;
-            std::future::pending::<()>().await
+            std::future::pending::<()>().await;
         }));
         rt.shutdown();
         assert_eq!(block_on(rx), None::<()>);

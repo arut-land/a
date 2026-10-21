@@ -29,7 +29,7 @@ fn main() {
                     let mut n = seed;
                     for _ in 0..100_000 {
                         n = std::hint::black_box(
-                            n.wrapping_mul(6364136223846793005).wrapping_add(1),
+                            n.wrapping_mul(6_364_136_223_846_793_005).wrapping_add(1),
                         );
                     }
                     n
