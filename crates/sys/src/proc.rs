@@ -712,7 +712,11 @@ mod imp {
     }
 
     pub fn signal_group(pgid: u32, signal: Signal) -> io::Result<()> {
-        gone_is_ok(process::kill_process_group(pid(pgid)?, raw(signal)))
+        let pgid = pid(pgid)?;
+        match process::kill_process_group(pgid, raw(signal)) {
+            Err(rustix::io::Errno::PERM) if !has_members(pgid) => Ok(()),
+            result => gone_is_ok(result),
+        }
     }
 
     pub fn group_alive(pgid: u32) -> bool {
