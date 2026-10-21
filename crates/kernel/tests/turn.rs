@@ -1448,3 +1448,30 @@ fn detached_results_and_messages_enter_before_the_next_provider_step() {
         2
     );
 }
+
+#[test]
+fn an_unacknowledged_outbox_keeps_its_owner_recoverable() {
+    let mut s = echo();
+    s.step(user("$ hold"));
+    let message = envelope("pending");
+    s.step(Event::SendEnvelope {
+        envelope: message.clone(),
+        ticket: Ticket(1),
+    });
+    s.step(tool_done(2, done(json!("finished"))));
+    assert_eq!(s.core.ledger().activity(), protocol::Activity::Running);
+    assert!(!s.core.at_rest());
+    let (mut restored, effects) = Session::resume(Reg::echo().arc(), s.log, &Load::default());
+    assert!(
+        effects
+            .iter()
+            .any(|e| matches!(e, Effect::Deliver { envelope, .. } if envelope == &message))
+    );
+    restored.step(Event::Delivered {
+        id: message.id,
+        result: Ok(()),
+        ticket: None,
+    });
+    assert_eq!(restored.core.ledger().activity(), protocol::Activity::Idle);
+    assert!(restored.core.at_rest());
+}

@@ -274,6 +274,9 @@ pub enum Request {
 }
 
 enum Msg {
+    DeliveryLost {
+        ticket: Option<Ticket>,
+    },
     Enqueue {
         envelope: protocol::Envelope,
         reply: oneshot::Sender<Result<(), protocol::InboxRefusal>>,
@@ -1198,6 +1201,14 @@ impl Actor {
             Msg::Enqueue { envelope, reply } => {
                 let ticket = self.delivery_ticket(reply);
                 Event::Enqueue { envelope, ticket }
+            }
+            Msg::DeliveryLost { ticket } => {
+                self.transport_active = false;
+                if let Some(reply) = ticket.and_then(|t| self.deliveries.remove(&t)) {
+                    reply.send(Err(protocol::InboxRefusal::Interrupted));
+                }
+                self.pump_delivery();
+                return None;
             }
             Msg::Delivered { id, result, ticket } => {
                 self.transport_active = false;

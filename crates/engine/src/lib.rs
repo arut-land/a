@@ -756,11 +756,22 @@ impl Daemon {
         let slot = self
             .slot(envelope.destination)
             .ok_or(protocol::InboxRefusal::Unavailable)?;
-        let live = self
-            .live(&slot)
-            .await
-            .map_err(|_| protocol::InboxRefusal::Unavailable)?;
-        live.enqueue(envelope).await
+        loop {
+            if !*lock(&self.admission) {
+                return Err(protocol::InboxRefusal::Interrupted);
+            }
+            let live = self.live(&slot).await.map_err(|_| {
+                if *lock(&self.admission) {
+                    protocol::InboxRefusal::Unavailable
+                } else {
+                    protocol::InboxRefusal::Interrupted
+                }
+            })?;
+            match live.enqueue(envelope.clone()).await {
+                Err(protocol::InboxRefusal::Interrupted) => {}
+                result => return result,
+            }
+        }
     }
 
     /// Hands child `child`'s result to session `parent`, unless it is

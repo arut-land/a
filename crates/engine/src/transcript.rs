@@ -45,7 +45,7 @@ impl Transcript {
         system: &str,
     ) -> Self {
         let entries: Vec<_> = entries.into_iter().collect();
-        let edits = context_edits(entries.iter().map(|e| e.borrow()));
+        let edits = context_edits(entries.iter().map(Borrow::borrow));
         let messages = Messages::from_iter((!system.is_empty()).then(|| Message::system(system)));
         let mut transcript = Self {
             context: messages.len(),

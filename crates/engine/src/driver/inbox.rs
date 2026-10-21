@@ -33,7 +33,12 @@ impl Actor {
                 Some(daemon) => daemon.deliver(envelope).await,
                 None => Err(InboxRefusal::Unavailable),
             };
-            let _ = session.mail.send(Msg::Delivered { id, result, ticket });
+            let message = if result == Err(InboxRefusal::Interrupted) {
+                Msg::DeliveryLost { ticket }
+            } else {
+                Msg::Delivered { id, result, ticket }
+            };
+            let _ = session.mail.send(message);
         }));
     }
 }
@@ -42,7 +47,7 @@ impl Live {
     pub(crate) async fn enqueue(&self, envelope: Envelope) -> Result<(), InboxRefusal> {
         let (reply, result) = oneshot::channel();
         self.send(Msg::Enqueue { envelope, reply });
-        result.await.unwrap_or(Err(InboxRefusal::Unavailable))
+        result.await.unwrap_or(Err(InboxRefusal::Interrupted))
     }
 }
 
