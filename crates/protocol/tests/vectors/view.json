@@ -2,12 +2,12 @@
   {
     "frames": [
       "{\"session\":\"00000000-0000-0000-0000-00000000000a\",\"t\":\"attached\",\"workspace\":\"/w\"}",
-      "{\"items\":[],\"seq\":1,\"session\":null,\"state\":{\"calls\":[],\"queued\":[{\"origin\":{\"client\":\"00000000-0000-0000-0000-00000000000c\",\"seq\":7},\"seq\":1,\"steer\":false,\"text\":\"same\"}],\"turn\":0},\"t\":\"snapshot\",\"workspace\":\"\"}",
+      "{\"items\":[],\"seq\":1,\"session\":null,\"state\":{\"calls\":[],\"queued\":[{\"origin\":{\"client\":\"00000000-0000-0000-0000-00000000000c\",\"seq\":7},\"seq\":1,\"steer\":false,\"text\":\"same\"}],\"taken\":[],\"turn\":0},\"t\":\"snapshot\",\"workspace\":\"\"}",
       "{\"epoch\":0,\"input\":1,\"kind\":\"take\",\"seq\":2,\"t\":\"entry\"}",
       "{\"activity\":\"idle\",\"seq\":2,\"t\":\"activity\"}",
       "{\"seq\":2,\"t\":\"synced\"}"
     ],
-    "hash": "9d0e610e5c885dcb",
+    "hash": "0433f3ba22223f52",
     "messages": [
       {
         "session": "00000000-0000-0000-0000-00000000000a",
@@ -31,6 +31,7 @@
               "text": "same"
             }
           ],
+          "taken": [],
           "turn": 0
         },
         "t": "snapshot",
@@ -57,10 +58,6 @@
     "state": {
       "items": [
         {
-          "origin": {
-            "client": "00000000-0000-0000-0000-00000000000c",
-            "seq": 7
-          },
           "seq": 2,
           "text": "same",
           "type": "user"
@@ -71,6 +68,12 @@
       "state": {
         "calls": [],
         "queued": [],
+        "taken": [
+          {
+            "client": "00000000-0000-0000-0000-00000000000c",
+            "seq": 7
+          }
+        ],
         "turn": 2
       },
       "workspace": ""
@@ -98,10 +101,6 @@
           "change": "added",
           "index": 0,
           "item": {
-            "origin": {
-              "client": "00000000-0000-0000-0000-00000000000c",
-              "seq": 7
-            },
             "seq": 2,
             "text": "same",
             "type": "user"
@@ -129,11 +128,11 @@
   {
     "frames": [
       "{\"session\":\"00000000-0000-0000-0000-00000000000a\",\"t\":\"attached\",\"workspace\":\"/w\"}",
-      "{\"items\":[],\"seq\":2,\"session\":\"00000000-0000-0000-0000-00000000000a\",\"state\":{\"calls\":[],\"publications\":{\"1\":[{\"key\":\"loaded-publication\",\"namespace\":\"skills\"}],\"2\":[{\"key\":\"loaded-publication\",\"namespace\":\"mcp-schemas\"}]},\"queued\":[],\"turn\":0},\"t\":\"snapshot\",\"workspace\":\"/w\"}",
+      "{\"items\":[],\"seq\":2,\"session\":\"00000000-0000-0000-0000-00000000000a\",\"state\":{\"calls\":[],\"publications\":{\"1\":[{\"key\":\"loaded-publication\",\"namespace\":\"skills\"}],\"2\":[{\"key\":\"loaded-publication\",\"namespace\":\"mcp-schemas\"}]},\"queued\":[],\"taken\":[],\"turn\":0},\"t\":\"snapshot\",\"workspace\":\"/w\"}",
       "{\"epoch\":0,\"kind\":\"context\",\"publication\":{\"key\":\"later-publication\",\"namespace\":\"mcp-schemas\"},\"seq\":3,\"t\":\"entry\",\"text\":\"later schema\"}",
       "{\"seq\":3,\"t\":\"synced\"}"
     ],
-    "hash": "e11613cc1c15673d",
+    "hash": "d6d3d92a71976fdc",
     "messages": [
       {
         "session": "00000000-0000-0000-0000-00000000000a",
@@ -161,6 +160,7 @@
             ]
           },
           "queued": [],
+          "taken": [],
           "turn": 0
         },
         "t": "snapshot",
@@ -210,6 +210,7 @@
           ]
         },
         "queued": [],
+        "taken": [],
         "turn": 0
       },
       "workspace": "/w"
@@ -250,7 +251,7 @@
       "{\"call\":3,\"epoch\":0,\"kind\":\"tool_result\",\"outcome\":{\"output\":{\"exit\":0,\"output\":\"hi\\n\"},\"status\":\"done\"},\"seq\":4,\"t\":\"entry\"}",
       "{\"call\":2,\"epoch\":0,\"kind\":\"tool_result\",\"outcome\":{\"output\":{\"exit\":0,\"output\":\"hi\\n\"},\"status\":\"done\"},\"seq\":5,\"t\":\"entry\"}"
     ],
-    "hash": "978cbf88497a76f3",
+    "hash": "a48e3388153238d7",
     "messages": [
       {
         "session": "00000000-0000-0000-0000-00000000000a",
@@ -318,7 +319,6 @@
     "state": {
       "items": [
         {
-          "origin": null,
           "seq": 1,
           "text": "run",
           "type": "user"
@@ -365,6 +365,7 @@
       "state": {
         "calls": [],
         "queued": [],
+        "taken": [],
         "turn": 1
       },
       "workspace": "/w"
@@ -385,7 +386,6 @@
           "change": "added",
           "index": 0,
           "item": {
-            "origin": null,
             "seq": 1,
             "text": "run",
             "type": "user"
@@ -474,7 +474,7 @@
       "{\"epoch\":0,\"fact\":{\"annotation\":{\"card\":{\"body\":\"Only lists files.\",\"title\":\"\"},\"lifetime\":\"question\",\"target\":1}},\"kind\":\"fact\",\"seq\":6,\"t\":\"entry\"}",
       "{\"seq\":6,\"t\":\"synced\"}"
     ],
-    "hash": "e59b77305bd1dd21",
+    "hash": "0bf5c74add33d97a",
     "messages": [
       {
         "session": "00000000-0000-0000-0000-00000000000a",
@@ -659,6 +659,7 @@
           ]
         ],
         "queued": [],
+        "taken": [],
         "turn": 0
       },
       "workspace": "/w"
@@ -815,7 +816,7 @@
       "{\"epoch\":0,\"fact\":{\"annotation\":{\"card\":{\"body\":\"Only lists files.\",\"title\":\"\"},\"lifetime\":\"question\",\"target\":1}},\"kind\":\"fact\",\"seq\":6,\"t\":\"entry\"}",
       "{\"seq\":6,\"t\":\"synced\"}"
     ],
-    "hash": "077261a17bb50b23",
+    "hash": "0304561f974076b0",
     "messages": [
       {
         "session": "00000000-0000-0000-0000-00000000000a",
@@ -1033,6 +1034,7 @@
           ]
         ],
         "queued": [],
+        "taken": [],
         "turn": 0
       },
       "workspace": "/w"
@@ -1199,7 +1201,7 @@
       "{\"epoch\":0,\"fact\":{\"annotation\":{\"card\":{\"body\":\"Lists files in the current directory.\",\"title\":\"\"},\"lifetime\":\"question\",\"target\":1}},\"kind\":\"fact\",\"seq\":5,\"t\":\"entry\"}",
       "{\"seq\":5,\"t\":\"synced\"}"
     ],
-    "hash": "78fa9abc4dfbcad7",
+    "hash": "37580c17f7f29dd6",
     "messages": [
       {
         "session": "00000000-0000-0000-0000-00000000000a",
@@ -1347,6 +1349,7 @@
           ]
         ],
         "queued": [],
+        "taken": [],
         "turn": 0
       },
       "workspace": "/w"
@@ -1464,7 +1467,7 @@
       "{\"activity\":\"idle\",\"seq\":2,\"t\":\"activity\"}",
       "{\"seq\":2,\"t\":\"synced\"}"
     ],
-    "hash": "d362e5246b657fd4",
+    "hash": "298734c4d01cff34",
     "messages": [
       {
         "session": "00000000-0000-0000-0000-00000000000a",
@@ -1515,7 +1518,6 @@
     "state": {
       "items": [
         {
-          "origin": null,
           "seq": 1,
           "text": "hi",
           "type": "user"
@@ -1531,6 +1533,7 @@
       "state": {
         "calls": [],
         "queued": [],
+        "taken": [],
         "turn": 1
       },
       "workspace": "/w"
@@ -1558,7 +1561,6 @@
           "change": "added",
           "index": 0,
           "item": {
-            "origin": null,
             "seq": 1,
             "text": "hi",
             "type": "user"
@@ -1612,7 +1614,7 @@
       "{\"call\":1,\"card\":{\"body\":\"hi\\n\",\"note\":\"exit 0\",\"title\":\"$ echo hi\"},\"epoch\":0,\"kind\":\"tool_result\",\"outcome\":{\"output\":{\"exit\":0,\"output\":\"hi\\n\"},\"status\":\"done\"},\"seq\":4,\"t\":\"entry\"}",
       "{\"seq\":4,\"t\":\"synced\"}"
     ],
-    "hash": "bacf42a5a38aad4c",
+    "hash": "6ee03e459f5208c7",
     "messages": [
       {
         "session": "00000000-0000-0000-0000-00000000000a",
@@ -1701,6 +1703,7 @@
       "state": {
         "calls": [],
         "queued": [],
+        "taken": [],
         "turn": 0
       },
       "workspace": "/w"
@@ -1790,7 +1793,7 @@
       "{\"call\":2,\"t\":\"delta\",\"text\":\"lo\"}",
       "{\"call\":2,\"epoch\":0,\"kind\":\"model_result\",\"outcome\":{\"output\":{\"message\":{\"content\":[{\"text\":\"hello\",\"type\":\"text\"}]},\"usage\":{\"input\":4,\"output\":2}},\"status\":\"done\"},\"seq\":3,\"t\":\"entry\"}"
     ],
-    "hash": "7ed2394100d275ad",
+    "hash": "38da752b9dbfad2b",
     "messages": [
       {
         "session": "00000000-0000-0000-0000-00000000000a",
@@ -1855,7 +1858,6 @@
     "state": {
       "items": [
         {
-          "origin": null,
           "seq": 1,
           "text": "hi",
           "type": "user"
@@ -1879,6 +1881,7 @@
       "state": {
         "calls": [],
         "queued": [],
+        "taken": [],
         "turn": 1
       },
       "workspace": "/w"
@@ -1906,7 +1909,6 @@
           "change": "added",
           "index": 0,
           "item": {
-            "origin": null,
             "seq": 1,
             "text": "hi",
             "type": "user"
@@ -1973,7 +1975,7 @@
       "{\"call\":1,\"epoch\":0,\"kind\":\"answer\",\"seq\":3,\"t\":\"entry\",\"value\":true}",
       "{\"call\":1,\"card\":{\"body\":\"hi\\n\",\"note\":\"exit 0\",\"title\":\"$ echo hi\"},\"epoch\":0,\"kind\":\"tool_result\",\"outcome\":{\"output\":{\"exit\":0,\"output\":\"hi\\n\"},\"status\":\"done\"},\"seq\":4,\"t\":\"entry\"}"
     ],
-    "hash": "fda57fd08cb55a17",
+    "hash": "6764b2dcffae203e",
     "messages": [
       {
         "session": "00000000-0000-0000-0000-00000000000a",
@@ -2075,6 +2077,7 @@
       "state": {
         "calls": [],
         "queued": [],
+        "taken": [],
         "turn": 0
       },
       "workspace": "/w"
@@ -2164,7 +2167,7 @@
       "{\"epoch\":0,\"input\":2,\"kind\":\"take\",\"seq\":4,\"t\":\"entry\"}",
       "{\"seq\":4,\"t\":\"synced\"}"
     ],
-    "hash": "4a216b01eaafec05",
+    "hash": "421afa831210cc9c",
     "messages": [
       {
         "session": "00000000-0000-0000-0000-00000000000a",
@@ -2214,7 +2217,6 @@
     "state": {
       "items": [
         {
-          "origin": null,
           "seq": 1,
           "text": "one",
           "type": "user"
@@ -2231,7 +2233,6 @@
           "type": "hook"
         },
         {
-          "origin": null,
           "seq": 4,
           "text": "two",
           "type": "user"
@@ -2242,6 +2243,7 @@
       "state": {
         "calls": [],
         "queued": [],
+        "taken": [],
         "turn": 1
       },
       "workspace": "/w"
@@ -2262,7 +2264,6 @@
           "change": "added",
           "index": 0,
           "item": {
-            "origin": null,
             "seq": 1,
             "text": "one",
             "type": "user"
@@ -2295,7 +2296,6 @@
           "change": "added",
           "index": 2,
           "item": {
-            "origin": null,
             "seq": 4,
             "text": "two",
             "type": "user"
@@ -2321,7 +2321,7 @@
       "{\"epoch\":0,\"kind\":\"fired\",\"outcome\":{\"output\":{\"slept\":1},\"status\":\"done\"},\"seq\":3,\"t\":\"entry\",\"watch\":2}",
       "{\"seq\":3,\"t\":\"synced\"}"
     ],
-    "hash": "53b479be5658306c",
+    "hash": "eefd7cb7dd9b2aef",
     "messages": [
       {
         "session": "00000000-0000-0000-0000-00000000000a",
@@ -2384,6 +2384,7 @@
       "state": {
         "calls": [],
         "queued": [],
+        "taken": [],
         "turn": 0
       },
       "workspace": "/w"
@@ -2458,7 +2459,7 @@
       "{\"epoch\":0,\"kind\":\"input\",\"seq\":3,\"t\":\"entry\",\"taken\":true,\"text\":\"two\"}",
       "{\"seq\":3,\"t\":\"synced\"}"
     ],
-    "hash": "b51baa09e31f3f86",
+    "hash": "64ada3363c907849",
     "messages": [
       {
         "session": "00000000-0000-0000-0000-00000000000a",
@@ -2516,7 +2517,6 @@
     "state": {
       "items": [
         {
-          "origin": null,
           "seq": 1,
           "text": "one",
           "type": "user"
@@ -2527,7 +2527,6 @@
           "type": "assistant"
         },
         {
-          "origin": null,
           "seq": 3,
           "text": "two",
           "type": "user"
@@ -2538,6 +2537,7 @@
       "state": {
         "calls": [],
         "queued": [],
+        "taken": [],
         "turn": 3
       },
       "workspace": "/w"
@@ -2558,7 +2558,6 @@
           "change": "added",
           "index": 0,
           "item": {
-            "origin": null,
             "seq": 1,
             "text": "one",
             "type": "user"
@@ -2609,7 +2608,6 @@
           "change": "added",
           "index": 2,
           "item": {
-            "origin": null,
             "seq": 3,
             "text": "two",
             "type": "user"
@@ -2635,7 +2633,7 @@
       "{\"cwd\":\"/w\",\"epoch\":0,\"kind\":\"environment\",\"seq\":2,\"t\":\"entry\",\"tty\":false,\"vars\":{}}",
       "{\"seq\":2,\"t\":\"synced\"}"
     ],
-    "hash": "58bdd7d7691683e4",
+    "hash": "6bb4056fb3c1bd69",
     "messages": [
       {
         "session": "00000000-0000-0000-0000-00000000000a",
@@ -2681,6 +2679,7 @@
       "state": {
         "calls": [],
         "queued": [],
+        "taken": [],
         "turn": 0
       },
       "workspace": "/w"
@@ -2729,7 +2728,7 @@
       "{\"call\":5,\"epoch\":0,\"kind\":\"tool_result\",\"outcome\":{\"output\":\"no jobs\",\"status\":\"done\"},\"seq\":6,\"t\":\"entry\"}",
       "{\"seq\":6,\"t\":\"synced\"}"
     ],
-    "hash": "1c550a679b545ed0",
+    "hash": "47f123402c83d60d",
     "messages": [
       {
         "session": "00000000-0000-0000-0000-00000000000a",
@@ -2862,6 +2861,7 @@
       "state": {
         "calls": [],
         "queued": [],
+        "taken": [],
         "turn": 4
       },
       "workspace": "/w"
@@ -2918,7 +2918,6 @@
           "change": "added",
           "index": 1,
           "item": {
-            "origin": null,
             "seq": 4,
             "text": "/jobs",
             "type": "user"
@@ -2966,11 +2965,11 @@
       "{\"seq\":2,\"t\":\"synced\"}",
       "{\"call\":2,\"t\":\"delta\",\"text\":\"thinking\"}",
       "{\"session\":\"00000000-0000-0000-0000-00000000000a\",\"t\":\"attached\",\"workspace\":\"/w\"}",
-      "{\"items\":[{\"origin\":null,\"seq\":1,\"text\":\"one\",\"type\":\"user\"},{\"call\":2,\"model\":\"m\",\"status\":{\"status\":\"running\"},\"text\":\"\",\"type\":\"reply\",\"usage\":null},{\"call\":3,\"input\":{\"command\":\"echo hi\"},\"outcome\":null,\"phase\":{\"waiting\":{\"on\":\"approval\"}},\"reason\":{\"mode\":{\"mode\":\"ask\"}},\"tool\":\"bash\",\"type\":\"tool\"}],\"seq\":4,\"session\":\"00000000-0000-0000-0000-00000000000a\",\"state\":{\"calls\":[[2,{\"phase\":\"running\",\"progress\":null}],[3,{\"phase\":{\"waiting\":{\"on\":\"approval\"}},\"progress\":null}]],\"queued\":[],\"turn\":1},\"t\":\"snapshot\",\"workspace\":\"/w\"}",
+      "{\"items\":[{\"seq\":1,\"text\":\"one\",\"type\":\"user\"},{\"call\":2,\"model\":\"m\",\"status\":{\"status\":\"running\"},\"text\":\"\",\"type\":\"reply\",\"usage\":null},{\"call\":3,\"input\":{\"command\":\"echo hi\"},\"outcome\":null,\"phase\":{\"waiting\":{\"on\":\"approval\"}},\"reason\":{\"mode\":{\"mode\":\"ask\"}},\"tool\":\"bash\",\"type\":\"tool\"}],\"seq\":4,\"session\":\"00000000-0000-0000-0000-00000000000a\",\"state\":{\"calls\":[[2,{\"phase\":\"running\",\"progress\":null}],[3,{\"phase\":{\"waiting\":{\"on\":\"approval\"}},\"progress\":null}]],\"queued\":[],\"taken\":[],\"turn\":1},\"t\":\"snapshot\",\"workspace\":\"/w\"}",
       "{\"seq\":4,\"t\":\"synced\"}",
       "{\"epoch\":0,\"kind\":\"assistant\",\"seq\":5,\"t\":\"entry\",\"text\":\"done\"}"
     ],
-    "hash": "d081e739aa7f40ad",
+    "hash": "48aaa9db9d36a1bf",
     "messages": [
       {
         "session": "00000000-0000-0000-0000-00000000000a",
@@ -3009,7 +3008,6 @@
       {
         "items": [
           {
-            "origin": null,
             "seq": 1,
             "text": "one",
             "type": "user"
@@ -3068,6 +3066,7 @@
             ]
           ],
           "queued": [],
+          "taken": [],
           "turn": 1
         },
         "t": "snapshot",
@@ -3089,7 +3088,6 @@
     "state": {
       "items": [
         {
-          "origin": null,
           "seq": 1,
           "text": "one",
           "type": "user"
@@ -3153,6 +3151,7 @@
           ]
         ],
         "queued": [],
+        "taken": [],
         "turn": 1
       },
       "workspace": "/w"
@@ -3173,7 +3172,6 @@
           "change": "added",
           "index": 0,
           "item": {
-            "origin": null,
             "seq": 1,
             "text": "one",
             "type": "user"
@@ -3310,7 +3308,7 @@
       "{\"epoch\":0,\"kind\":\"assistant\",\"seq\":29,\"t\":\"entry\",\"text\":\"a38\"}",
       "{\"cwd\":\"/w1\",\"epoch\":0,\"kind\":\"environment\",\"seq\":30,\"t\":\"entry\",\"tty\":false,\"vars\":{}}"
     ],
-    "hash": "f6a09e4f0b2f522c",
+    "hash": "02156b35c53370c2",
     "messages": [
       {
         "session": "00000000-0000-0000-0000-00000000000a",
@@ -3838,7 +3836,6 @@
           }
         },
         {
-          "origin": null,
           "seq": 22,
           "text": "u47",
           "type": "user"
@@ -3908,6 +3905,7 @@
           ]
         ],
         "queued": [],
+        "taken": [],
         "turn": 22
       },
       "workspace": "/w"
@@ -4365,7 +4363,6 @@
           "change": "added",
           "index": 9,
           "item": {
-            "origin": null,
             "seq": 22,
             "text": "u47",
             "type": "user"
@@ -4488,7 +4485,7 @@
       "{\"message\":\"e\",\"t\":\"error\"}",
       "{\"epoch\":0,\"kind\":\"assistant\",\"seq\":8,\"t\":\"entry\",\"text\":\"a11\"}"
     ],
-    "hash": "1e40177d193870d2",
+    "hash": "6c181965a7f8a0b9",
     "messages": [
       {
         "session": "00000000-0000-0000-0000-00000000000a",
@@ -4652,6 +4649,7 @@
       "state": {
         "calls": [],
         "queued": [],
+        "taken": [],
         "turn": 0
       },
       "workspace": "/w"
@@ -4811,7 +4809,7 @@
       "{\"epoch\":0,\"fact\":{\"annotation\":{\"card\":{\"body\":\"Only lists files.\",\"title\":\"\"},\"lifetime\":\"question\",\"target\":1}},\"kind\":\"fact\",\"seq\":6,\"t\":\"entry\"}",
       "{\"seq\":6,\"t\":\"synced\"}"
     ],
-    "hash": "3761e85baf15bd57",
+    "hash": "9fa46f95d11fac02",
     "messages": [
       {
         "session": "00000000-0000-0000-0000-00000000000a",
@@ -4995,6 +4993,7 @@
           ]
         ],
         "queued": [],
+        "taken": [],
         "turn": 0
       },
       "workspace": "/w"
@@ -5149,7 +5148,7 @@
       "{\"epoch\":0,\"fact\":{\"annotation\":{\"card\":{\"body\":\"Only lists files.\",\"title\":\"\"},\"lifetime\":\"question\",\"target\":1}},\"kind\":\"fact\",\"seq\":6,\"t\":\"entry\"}",
       "{\"seq\":6,\"t\":\"synced\"}"
     ],
-    "hash": "21f1e5be97ff3893",
+    "hash": "91673466797cfdfe",
     "messages": [
       {
         "session": "00000000-0000-0000-0000-00000000000a",
@@ -5366,6 +5365,7 @@
           ]
         ],
         "queued": [],
+        "taken": [],
         "turn": 0
       },
       "workspace": "/w"

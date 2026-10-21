@@ -50,6 +50,8 @@ pub struct ViewState {
     calls: Keyed<CallId, ViewCall>,
     queued: VecDeque<Queued>,
     turn: u64,
+    /// Transcript replacement must not erase logged input ownership.
+    pub taken: Vec<crate::Author>,
     #[serde(
         default,
         skip_serializing_if = "crate::publication::Publications::is_empty"
@@ -118,6 +120,7 @@ impl ViewState {
                 ..
             } => {
                 if *taken {
+                    self.taken.extend(origin);
                     self.turn = e.seq.get();
                 } else {
                     self.queued.push_back(Queued {
@@ -137,9 +140,11 @@ impl ViewState {
             Body::Take { input } => {
                 if let Some(at) = self.queued.iter().position(|q| q.seq == *input)
                     && let Some(q) = self.queued.remove(at)
-                    && !q.steer
                 {
-                    self.turn = e.seq.get();
+                    self.taken.extend(q.origin);
+                    if !q.steer {
+                        self.turn = e.seq.get();
+                    }
                 }
             }
             Body::ToolCall { .. } | Body::ModelCall { .. } => {
@@ -284,7 +289,6 @@ pub enum Item {
     User {
         seq: Seq,
         text: String,
-        origin: Option<crate::Author>,
     },
     Assistant {
         seq: Seq,
@@ -726,27 +730,20 @@ impl SessionView {
                 .queued
                 .iter()
                 .find(|q| q.seq == *input)
-                .map(|q| (q.text.clone(), q.origin))
+                .map(|q| q.text.clone())
         } else {
             None
         };
         self.state.apply(e);
         let item = match &e.body {
             Body::Input {
-                text,
-                taken: true,
-                origin,
-                ..
+                text, taken: true, ..
             } => Item::User {
                 seq,
                 text: text.clone(),
-                origin: *origin,
             },
             Body::Input { .. } => return None,
-            Body::Take { .. } => {
-                let (text, origin) = taken?;
-                Item::User { seq, text, origin }
-            }
+            Body::Take { .. } => Item::User { seq, text: taken? },
             Body::ToolCall {
                 tool,
                 input,

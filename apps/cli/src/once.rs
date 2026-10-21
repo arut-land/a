@@ -91,7 +91,7 @@ pub fn run(
         read: false,
         stdin: None,
         synced: false,
-        turn: Turn::Unsent,
+        turn: None,
         stream: client::ReplyStream::default(),
         failed: false,
         ended: None,
@@ -123,13 +123,6 @@ pub fn run(
     }
 }
 
-/// Where the input stands.
-#[derive(Clone, Copy, PartialEq, Eq)]
-enum Turn {
-    Unsent,
-    Sent(client::SubmissionId),
-}
-
 struct Once {
     client: SessionClient,
     /// `-p`'s prompt.
@@ -142,7 +135,7 @@ struct Once {
     stdin: Option<String>,
     /// The replay of the attach is in.
     synced: bool,
-    turn: Turn,
+    turn: Option<client::SubmissionId>,
     stream: client::ReplyStream,
     failed: bool,
     ended: Option<io::Result<ExitCode>>,
@@ -151,7 +144,7 @@ struct Once {
 impl Once {
     /// Sends the input once attached and stdin is read.
     fn send(&mut self) -> Vec<client::Effect> {
-        if !self.synced || !self.read || self.turn != Turn::Unsent {
+        if !self.synced || !self.read || self.turn.is_some() {
             return Vec::new();
         }
         let text = input(self.prompt.as_deref(), self.stdin.as_deref());
@@ -166,7 +159,7 @@ impl Once {
         }
         match self.client.submit(text) {
             Ok((id, sent)) => {
-                self.turn = Turn::Sent(id);
+                self.turn = Some(id);
                 effects.extend(sent);
             }
             Err(notice) => self.fail(io::Error::other(notice.to_string())),
@@ -206,7 +199,7 @@ impl Once {
     }
 
     fn taken(&self) -> bool {
-        matches!(self.turn, Turn::Sent(id) if matches!(self.client.submission(id), Some(client::SubmissionState::Taken | client::SubmissionState::Finished(_))))
+        matches!(self.turn, Some(id) if matches!(self.client.submission(id), Some(client::SubmissionState::Taken | client::SubmissionState::Finished(_))))
     }
 
     fn view(&mut self, change: &Change) {
@@ -279,7 +272,7 @@ impl Once {
 
     /// Only a complete kernel burst can certify that our turn ended.
     fn settle(&mut self) {
-        let Turn::Sent(id) = self.turn else {
+        let Some(id) = self.turn else {
             return;
         };
         let Some(client::SubmissionState::Finished(activity)) = self.client.submission(id) else {
@@ -397,7 +390,7 @@ mod tests {
             read: true,
             stdin: None,
             synced: true,
-            turn: Turn::Unsent,
+            turn: None,
             stream: client::ReplyStream::default(),
             failed: false,
             ended: None,
@@ -410,7 +403,7 @@ mod tests {
             },
         );
         once.send();
-        let Turn::Sent(id) = once.turn else {
+        let Some(id) = once.turn else {
             panic!("input was not submitted")
         };
         for (seq, origin) in [
@@ -478,7 +471,7 @@ mod tests {
             read: true,
             stdin: None,
             synced: true,
-            turn: Turn::Unsent,
+            turn: None,
             stream: client::ReplyStream::default(),
             failed: false,
             ended: None,

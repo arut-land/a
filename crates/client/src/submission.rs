@@ -1,7 +1,4 @@
-use protocol::{
-    Activity,
-    view::{Item, SessionView},
-};
+use protocol::{Activity, view::SessionView};
 
 pub type SubmissionId = protocol::Author;
 
@@ -27,12 +24,7 @@ impl Submission {
     }
 
     pub fn fold(&mut self, view: &SessionView) {
-        if self.state == SubmissionState::Queued
-            && view
-                .items
-                .iter()
-                .any(|item| matches!(item, Item::User { origin: Some(id), .. } if *id == self.id))
-        {
+        if self.state == SubmissionState::Queued && view.state.taken.contains(&self.id) {
             self.state = SubmissionState::Taken;
         }
         if self.state == SubmissionState::Taken
@@ -47,7 +39,10 @@ impl Submission {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use protocol::{Author, Body, ClientId, ClientSeq, DaemonMsg, Decode, Entry, Epoch, Mode, Seq};
+    use protocol::{
+        Audience, Author, Body, ClientId, ClientSeq, DaemonMsg, Decode, Entry, Epoch, Json, Mode,
+        Seq,
+    };
 
     fn fold(submission: &mut Submission, view: &mut SessionView, msg: &DaemonMsg) {
         view.fold(msg);
@@ -181,6 +176,50 @@ mod tests {
                 activity: Activity::Idle,
             },
         );
+        assert_eq!(submission.state, SubmissionState::Finished(Activity::Idle));
+    }
+
+    #[test]
+    fn reconnect_snapshot_retains_ownership_of_a_taken_slash_command() {
+        let id = Author {
+            client: ClientId::new(),
+            seq: ClientSeq::new(1).unwrap(),
+        };
+        let mut daemon_view = SessionView::default();
+        for msg in [
+            entry(
+                1,
+                Body::Input {
+                    text: "/model m".into(),
+                    mode: Mode::Queue,
+                    taken: true,
+                    origin: Some(id),
+                },
+            ),
+            entry(
+                2,
+                Body::ToolCall {
+                    invoke: None,
+                    tool: "model".into(),
+                    input: Json::null(),
+                    id: None,
+                    card: None,
+                    by: Audience::User,
+                },
+            ),
+        ] {
+            daemon_view.fold(&msg);
+        }
+        let mut view = SessionView::default();
+        let encoded =
+            serde_json::to_vec(&DaemonMsg::Snapshot(Box::new(daemon_view.snapshot()))).unwrap();
+        view.fold(&DaemonMsg::from_json(&encoded).unwrap());
+        view.fold(&DaemonMsg::Activity {
+            seq: 2,
+            activity: Activity::Idle,
+        });
+        let mut submission = Submission::new(id);
+        submission.fold(&view);
         assert_eq!(submission.state, SubmissionState::Finished(Activity::Idle));
     }
 }
