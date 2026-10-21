@@ -94,10 +94,6 @@ impl Processes for Provider {
     }
 }
 
-#[allow(
-    clippy::too_many_lines,
-    reason = "one rollback guard covers launch through reactor registration"
-)]
 async fn launch(
     cx: &Cx,
     mut launch: LaunchSpec,
@@ -190,46 +186,42 @@ async fn launch(
             return;
         }
         owned.complete(None);
-        // Descendants may survive their leader. Rebuild only on exits;
-        // unsupported watches trigger containment cleanup, never a timer.
-        loop {
-            let members = lock(&owned.1.group)
-                .as_ref()
-                .map_or_else(Vec::new, sys::OwnedGroup::members);
-            let mut watches = Vec::new();
-            let mut failed = false;
-            for pid in members {
-                match sys::exit_watch(pid).and_then(|w| rt::Async::for_reading(&reactor, w)) {
-                    Ok(watch) => watches.push(watch),
-                    Err(e) if e.kind() == io::ErrorKind::NotFound => {}
-                    Err(_) => {
-                        failed = true;
-                        break;
-                    }
-                }
-            }
-            if failed || watches.is_empty() {
-                break;
-            }
-            let mut exits: Vec<_> = watches
-                .iter()
-                .map(|w| Box::pin(w.readable_result()))
-                .collect();
-            let failed = std::future::poll_fn(|cx| {
-                for exit in &mut exits {
-                    if let std::task::Poll::Ready(result) = exit.as_mut().poll(cx) {
-                        return std::task::Poll::Ready(result.is_err());
-                    }
-                }
-                std::task::Poll::Pending
-            })
-            .await;
-            if failed {
-                break;
-            }
-        }
+        let _ = descendants(&reactor, &owned.1).await;
     }));
     Ok(OwnedProcess::new(live, input, output))
+}
+
+// A leader can exit first. Failed descendant watches must revoke containment.
+async fn descendants(reactor: &rt::Reactor, live: &Live) -> io::Result<()> {
+    loop {
+        let members = lock(&live.group)
+            .as_ref()
+            .map_or_else(Vec::new, sys::OwnedGroup::members);
+        let mut watches = Vec::new();
+        for pid in members {
+            match sys::exit_watch(pid).and_then(|w| rt::Async::for_reading(reactor, w)) {
+                Ok(watch) => watches.push(watch),
+                Err(e) if e.kind() == io::ErrorKind::NotFound => {}
+                Err(e) => return Err(e),
+            }
+        }
+        if watches.is_empty() {
+            return Ok(());
+        }
+        let mut exits: Vec<_> = watches
+            .iter()
+            .map(|w| Box::pin(w.readable_result()))
+            .collect();
+        std::future::poll_fn(|cx| {
+            for exit in &mut exits {
+                if let std::task::Poll::Ready(result) = exit.as_mut().poll(cx) {
+                    return std::task::Poll::Ready(result);
+                }
+            }
+            std::task::Poll::Pending
+        })
+        .await?;
+    }
 }
 
 struct Pipe(rt::Async<sys::ProcessPipe>);
