@@ -588,6 +588,7 @@ fn scenarios() -> Vec<(&'static str, Vec<Value>)> {
                 entry(3, Body::Context { text: "later schema".into(), publication: Some(Publication {
                     namespace: "mcp-schemas".into(), key: Json::encode(&"later-publication").unwrap(),
                 }) }),
+                msg(DaemonMsg::Synced { seq: 3 }),
             ]
         }),
         ("owned_invocation", vec![

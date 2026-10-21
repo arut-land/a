@@ -3,7 +3,8 @@
     "frames": [
       "{\"session\":\"00000000-0000-0000-0000-00000000000a\",\"t\":\"attached\",\"workspace\":\"/w\"}",
       "{\"items\":[],\"seq\":2,\"session\":\"00000000-0000-0000-0000-00000000000a\",\"state\":{\"calls\":[],\"publications\":{\"1\":[{\"key\":\"loaded-publication\",\"namespace\":\"skills\"}],\"2\":[{\"key\":\"loaded-publication\",\"namespace\":\"mcp-schemas\"}]},\"queued\":[],\"turn\":0},\"t\":\"snapshot\",\"workspace\":\"/w\"}",
-      "{\"epoch\":0,\"kind\":\"context\",\"publication\":{\"key\":\"later-publication\",\"namespace\":\"mcp-schemas\"},\"seq\":3,\"t\":\"entry\",\"text\":\"later schema\"}"
+      "{\"epoch\":0,\"kind\":\"context\",\"publication\":{\"key\":\"later-publication\",\"namespace\":\"mcp-schemas\"},\"seq\":3,\"t\":\"entry\",\"text\":\"later schema\"}",
+      "{\"seq\":3,\"t\":\"synced\"}"
     ],
     "hash": "e11613cc1c15673d",
     "messages": [
@@ -48,6 +49,10 @@
         "seq": 3,
         "t": "entry",
         "text": "later schema"
+      },
+      {
+        "seq": 3,
+        "t": "synced"
       }
     ],
     "name": "publication identities survive snapshots and later publications",
@@ -99,6 +104,13 @@
         },
         "rev": 2,
         "seq": 2
+      },
+      {
+        "change": {
+          "change": "synced"
+        },
+        "rev": 3,
+        "seq": 3
       }
     ]
   },
