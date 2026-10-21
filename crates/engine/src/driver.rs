@@ -239,6 +239,7 @@ impl ContextOrigin {
 }
 
 struct PendingSide {
+    background: bool,
     cancel: Cancel,
     origin: ContextOrigin,
     reply: oneshot::Sender<Opened>,
@@ -1946,12 +1947,15 @@ impl Actor {
                     messages,
                     limited,
                     cancel,
-                    ..
+                    origin,
+                    background,
                 }) = self.sides.remove(&ticket)
                 {
                     let side = side.filter(|side| {
                         self.phase == Phase::Serving
                             && !cancel.is_set()
+                            && (origin.current(&self.live.session)
+                                || background && self.background_owner_succeeded(&origin))
                             && self.core.ledger().call(*side).is_some()
                     });
                     reply.send(side.map_or(Opened::Closed, |id| {
