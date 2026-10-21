@@ -3,7 +3,7 @@
 set -euo pipefail
 probe=$(mktemp -d "${TMPDIR:-/tmp}/a-logging-probe.XXXXXX")
 trap 'rm -rf "$probe"' EXIT
-export CARGO_BUILD_JOBS=3
+export CARGO_BUILD_JOBS=${CARGO_BUILD_JOBS:-2}
 mkdir "$probe/src"
 cat > "$probe/Cargo.toml" <<'TOML'
 [package]

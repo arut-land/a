@@ -8,7 +8,7 @@ it adds no new third-party package to the production graph.
 We compared `log` 0.4.34 and `tracing` 0.1.44 with `tracing-subscriber`
 0.3.23 (`fmt,json,registry`, defaults off). The standalone probe builds with
 size optimization, LTO, one codegen unit and stripping on macOS arm64,
-nightly-2026-10-17. Run `bash docs/perf/logging-probe.sh`. The probe counts
+nightly-2026-10-17. Run `mise run perf:logging-probe`. The probe counts
 bytes in a `Write` sink and formats one million repair records. Tiny and
 log emit identical bytes; tracing emits its normal structured JSON envelope
 with time, target and span context disabled. These are formatting/dispatch

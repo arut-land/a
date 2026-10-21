@@ -2332,5 +2332,4 @@ fn busy_session_recovery_admits_independent_loads_concurrently() {
     );
 }
 
-#[path = "../../../docs/perf/runtime-demand.rs"]
 mod runtime_demand;
