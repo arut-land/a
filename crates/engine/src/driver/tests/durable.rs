@@ -6,11 +6,9 @@ use super::*;
 
 #[test]
 fn a_failed_enqueue_releases_transport_for_retry() {
-    let mut harness = ManualSession::new();
-    let (reply, mut received) = oneshot::channel();
-    harness.faulty.fail_next_sync(SyncFailure::Discard);
-    harness.session.send(Msg::Enqueue {
-        envelope: protocol::Envelope {
+    for failure in [SyncFailure::Discard, SyncFailure::Retain] {
+        let mut harness = ManualSession::new();
+        let envelope = protocol::Envelope {
             id: protocol::EnvelopeId {
                 sender: SessionId::new(),
                 call: id(1),
@@ -18,18 +16,36 @@ fn a_failed_enqueue_releases_transport_for_retry() {
             },
             destination: harness.session.id,
             payload: "update".into(),
-        },
-        reply,
-    });
-    harness.poll();
-    let mut cx = std::task::Context::from_waker(std::task::Waker::noop());
-    let result = std::pin::Pin::new(&mut received).poll(&mut cx);
-    let kept = harness.finish();
-    assert!(!kept.iter().any(|e| matches!(e.body, Body::Enqueue { .. })));
-    assert_eq!(
-        result,
-        Poll::Ready(Some(Err(protocol::InboxRefusal::Interrupted)))
-    );
+        };
+        let (reply, mut received) = oneshot::channel();
+        harness.faulty.fail_next_sync(failure);
+        harness.session.send(Msg::Enqueue {
+            envelope: envelope.clone(),
+            reply,
+        });
+        harness.poll();
+        let mut cx = std::task::Context::from_waker(std::task::Waker::noop());
+        assert_eq!(
+            std::pin::Pin::new(&mut received).poll(&mut cx),
+            Poll::Ready(Some(Err(protocol::InboxRefusal::Interrupted)))
+        );
+        for _ in 0..2 {
+            let (reply, received) = oneshot::channel();
+            harness.session.send(Msg::Enqueue {
+                envelope: envelope.clone(),
+                reply,
+            });
+            harness.poll();
+            assert_eq!(rt::block_on(received), Some(Ok(())));
+        }
+        let kept = harness.finish();
+        assert_eq!(
+            kept.iter()
+                .filter(|e| matches!(&e.body, Body::Enqueue { envelope: e } if e.id == envelope.id))
+                .count(),
+            1
+        );
+    }
 }
 
 /// The entries `outbox` is sent, until `done` holds of them.
