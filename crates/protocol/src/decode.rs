@@ -28,9 +28,9 @@ use crate::ledger::{Ledger, Phase};
 use crate::view::{Item, SessionView, Status, Usage};
 use crate::{
     Activity, Audience, Author, Body, CallId, Caps, Card, ClientDecl, ClientId, ClientMsg,
-    CommandInfo, DaemonMsg, Decode, Entry, Environment, Epoch, HomeSettings, Installed, Json, Mode,
-    Outcome, Permission, Rejection, Role, Seq, SessionId, SessionSummary, SettingsChange, Target,
-    ToolChoice, Verdict, WaitOn,
+    CommandInfo, DaemonMsg, Decode, Entry, Environment, Epoch, ForkError, HomeSettings, Installed,
+    Json, Mode, Outcome, Permission, Rejection, Role, Seq, SessionId, SessionSummary,
+    SettingsChange, Target, ToolChoice, Verdict, WaitOn,
 };
 
 /// Declares a tagged union of the wire, one line per kind:
@@ -290,6 +290,8 @@ macro_rules! parsed {
 }
 
 parsed!(
+    ForkError,
+    Rejection,
     String,
     u32,
     Seq,
@@ -465,7 +467,7 @@ pub(crate) struct MsgFields {
     pub(crate) tools: Option<Vec<String>>,
     pub(crate) message: Option<String>,
     pub(crate) mode: Option<Mode>,
-    pub(crate) reason: Option<Rejection>,
+    pub(crate) reason: Option<Json>,
     pub(crate) items: Option<Json>,
     #[serde(default, deserialize_with = "present")]
     pub(crate) ledger: Option<Json>,

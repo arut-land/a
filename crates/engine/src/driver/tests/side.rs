@@ -757,8 +757,11 @@ fn a_background_result_stays_out_of_context_after_its_intent_is_compacted() {
     let http = Flaky::new([]);
     let registry = Registry::default()
         .with(&DelayedSide(release.clone()))
+        .unwrap()
+        .with(&ext_fork::Fork)
         .unwrap();
-    let session = probes(&http, registry).start(&[]);
+    let fixture = probes(&http, registry);
+    let session = fixture.start(&[]);
     session.submit("background").unwrap();
     until(&session, "background intent", |log| !sides(log).is_empty());
     settle(&session);
@@ -773,5 +776,27 @@ fn a_background_result_stays_out_of_context_after_its_intent_is_compacted() {
     let log = log_of(&session);
     session.halt();
     let messages = transcript(&log, log.len() as u64 + 1, Arc::new(Registry::default()));
+    assert_eq!(messages, [llm::Message::user("summary")]);
+    let header = fixture
+        .0
+        .store
+        .headers()
+        .unwrap()
+        .into_iter()
+        .find(|header| header.id == session.id)
+        .unwrap();
+    let fork = copy_history(
+        &header,
+        log.last().unwrap().seq,
+        SessionId::new(),
+        &fixture.0,
+    )
+    .unwrap();
+    let copied = fixture.0.store.entries(fork.id).unwrap();
+    let messages = transcript(
+        &copied,
+        copied.len() as u64 + 1,
+        Arc::new(Registry::default()),
+    );
     assert_eq!(messages, [llm::Message::user("summary")]);
 }

@@ -127,11 +127,16 @@ impl Encoded {
 pub struct Writer {
     pub(crate) log: Box<dyn Log>,
     epoch: u32,
+    kept: Option<ReadOnly>,
 }
 
 impl Writer {
     pub(crate) fn new(log: Box<dyn Log>, epoch: u32) -> Self {
-        Self { log, epoch }
+        Self {
+            log,
+            epoch,
+            kept: None,
+        }
     }
 
     #[cfg(test)]
@@ -141,13 +146,24 @@ impl Writer {
 
     /// Why the log is kept as it is, if it is: then every append fails.
     pub fn read_only(&self) -> Option<ReadOnly> {
-        self.log.read_only()
+        self.kept.or_else(|| self.log.read_only())
+    }
+
+    fn writable(&self) -> io::Result<()> {
+        match self.read_only() {
+            Some(why) => Err(io::Error::new(
+                io::ErrorKind::ReadOnlyFilesystem,
+                why.to_string(),
+            )),
+            None => Ok(()),
+        }
     }
 
     /// Appends `entries`, each stamped with the lease's epoch, ordered if
     /// `durable`. Before publishing or starting effects, [`Writer::flushed`]
     /// completes that promise. Returns the lines encoded for publication.
     pub fn append(&mut self, entries: &mut [Entry], durable: bool) -> io::Result<Encoded> {
+        self.writable()?;
         for e in &mut *entries {
             e.epoch = Epoch(self.epoch);
         }
@@ -158,6 +174,11 @@ impl Writer {
             self.log.write_all(entries, &lines)?;
         }
         Ok(lines)
+    }
+
+    /// Keeps the backing log for publication flushes while forbidding mutation.
+    pub fn keep(&mut self, why: ReadOnly) {
+        self.kept = Some(why);
     }
 
     /// Orders what was only written, before [`Writer::flushed`].
@@ -185,6 +206,7 @@ impl Writer {
     /// Keeps `snapshot` beside the log, for the next load to start from:
     /// it covers entries committed already.
     pub fn snapshot(&mut self, snapshot: &Snapshot) -> io::Result<()> {
+        self.writable()?;
         self.log.snapshot(snapshot)
     }
 
@@ -197,11 +219,45 @@ impl Writer {
     }
 }
 
+/// Publication boundaries of an imported log. Faults on either side of
+/// rename must exercise the same catalog recovery protocol as a crash.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ImportStep {
+    Write,
+    FileSync,
+    Rename,
+    DirectorySync,
+    Published,
+}
+
 /// Where session logs live. Each `create` or `load` hands out the log's
 /// writer under a lease newer than every one before.
 pub trait LogStore: Send + Sync {
     /// A new, empty session log; fails with `AlreadyExists` if the id is taken.
     fn create(&self, header: &Header) -> io::Result<Loaded>;
+
+    /// Reads exactly a committed prefix without acquiring a writer lease,
+    /// recovering a torn tail, or touching any derived files.
+    fn prefix(&self, id: SessionId, seq: u64) -> io::Result<Vec<Entry>>;
+
+    /// Publishes a complete imported history atomically. A failed import
+    /// must never expose a partial session through `headers`.
+    fn import(&self, header: &Header, entries: &[Entry]) -> io::Result<()>;
+
+    #[cfg(test)]
+    fn import_checked(
+        &self,
+        header: &Header,
+        entries: &[Entry],
+        check: &mut dyn FnMut(ImportStep) -> io::Result<()>,
+    ) -> io::Result<()> {
+        for step in [ImportStep::Write, ImportStep::FileSync, ImportStep::Rename] {
+            check(step)?;
+        }
+        self.import(header, entries)?;
+        check(ImportStep::DirectorySync)?;
+        check(ImportStep::Published)
+    }
 
     /// Every session's header, oldest first, without reading the entries.
     fn headers(&self) -> io::Result<Vec<Header>>;

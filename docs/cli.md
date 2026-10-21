@@ -63,3 +63,9 @@ a -p "and the tests?" resume        # one more turn in the latest session
 No output format flag: stdout is the reply, and scripts that want the
 structure read the session's log (`$A_HOME/sessions/<id>.jsonl`) or speak
 the protocol (`a bridge`).
+
+## Fork a conversation
+
+`a fork <session>[@<seq>]` creates a new session and prints its id. `/fork [seq]` copies the current conversation at a rest point and switches to it.
+Files stay as they are; this does not rewind or copy the workspace. The fork
+keeps its recorded cwd and environment. See [fork semantics](fork.md).

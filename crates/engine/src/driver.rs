@@ -81,6 +81,101 @@ impl Shared {
     }
 }
 
+fn recorded_registry(
+    shared: &Shared,
+    source: Option<&Arc<dyn ext::host::Generations>>,
+    installed: Option<&[protocol::Installed]>,
+) -> io::Result<Arc<Registry>> {
+    match (source, installed) {
+        (Some(source), Some(installed)) => Arc::clone(source)
+            .restore(installed)
+            .map_err(io::Error::other),
+        (Some(source), None) => Ok(source.registry()),
+        (None, Some(installed)) if installed.iter().any(|i| i.image.is_some()) => Err(
+            io::Error::other("recorded dynamic extensions require their loader"),
+        ),
+        (None, _) => Ok(shared.registry.get()),
+    }
+}
+
+fn load_registry(
+    header: &Header,
+    shared: &Shared,
+    source: &Arc<dyn ext::host::Generations>,
+) -> io::Result<Arc<Registry>> {
+    let seq = shared.catalog.get(header.id).map_or(0, |r| r.entries);
+    let entries = shared.store.prefix(header.id, seq)?;
+    let installed = entries.iter().rev().find_map(|entry| match &entry.body {
+        Body::Extensions { installed } => Some(installed.as_slice()),
+        _ => None,
+    });
+    recorded_registry(shared, Some(source), installed)
+}
+
+pub(crate) fn copy_history(
+    header: &Header,
+    seq: protocol::Seq,
+    id: SessionId,
+    shared: &Arc<Shared>,
+) -> Result<Header, protocol::ForkError> {
+    let entries = shared.store.prefix(header.id, seq.get())?;
+    let source = shared.source(&header.workspace)?;
+    let installed = entries.iter().rev().find_map(|entry| match &entry.body {
+        Body::Extensions { installed } => Some(installed.as_slice()),
+        _ => None,
+    });
+    let registry = recorded_registry(shared, source.as_ref(), installed)
+        .map_err(|_| protocol::ForkError::UnavailableGeneration)?;
+    let policy = registry
+        .service::<dyn ext::host::HistoryPolicy>()
+        .ok_or(protocol::ForkError::Disabled)?;
+    let (tx, _rx) = channel::unbounded();
+    let target = Header {
+        id,
+        workspace: header.workspace.clone(),
+        parent: None,
+    };
+    let session = Session::new(&target, shared, Arc::new(tx), &registry);
+    for entry in &entries {
+        lock(&session.state_view()).apply(entry);
+        if let Body::Environment(env) = &entry.body {
+            *lock(&session.env) = Some(Arc::new(env.clone()));
+        }
+    }
+    let binding = bind(&registry, &session);
+    let prefix = ext::host::ValidatedPrefix::prepare(
+        policy,
+        binding as Arc<dyn Binding>,
+        entries,
+        header.id,
+        seq,
+    )?;
+    let (mut entries, parent, namespace) = prefix.into_history();
+    let fact = Body::Ext {
+        ext: namespace.ext.to_string(),
+        state: namespace.state.to_string(),
+        data: Json::encode(&parent).map_err(io::Error::other)?,
+    };
+    entries.push(Entry::new(
+        protocol::Seq::new(seq.get() + 1).ok_or_else(|| io::Error::other("sequence exhausted"))?,
+        protocol::Epoch(
+            entries
+                .last()
+                .map_or(0, |entry| entry.epoch.0)
+                .checked_add(1)
+                .ok_or_else(|| io::Error::other("epoch exhausted"))?,
+        ),
+        fact,
+    ));
+    let copied = Header {
+        id: session.id,
+        workspace: header.workspace.clone(),
+        parent: None,
+    };
+    shared.catalog.import(&*shared.store, &copied, &entries)?;
+    Ok(copied)
+}
+
 /// How [`Live::start`] opens a session's log.
 #[derive(Clone, Copy)]
 pub enum Open {
@@ -327,9 +422,11 @@ impl Live {
             || shared.registry.generation(),
             |source| source.generation(),
         );
-        let registry = source
-            .as_ref()
-            .map_or_else(|| shared.registry.get(), |s| s.registry());
+        let registry = match (&source, open) {
+            (Some(source), Open::Load) => load_registry(header, shared, source)?,
+            (Some(source), Open::Create) => source.registry(),
+            (None, _) => shared.registry.get(),
+        };
         let (tx, rx) = channel::unbounded();
         let session = Session::new(header, shared, Arc::new(tx), &registry);
         let bound = bind(&registry, &session);
@@ -555,14 +652,24 @@ impl Folding {
         binding: &Arc<dyn Binding>,
         registry: &Registry,
     ) -> io::Result<(Loaded, Self)> {
-        Self::rebuild(binding, registry, shared, |restore, each| match open {
-            Open::Create => {
-                let created = shared.store.create(header)?;
-                shared.catalog.record(Record::new(header.clone()));
-                Ok(created)
-            }
-            Open::Load => shared.store.load(header.id, restore, each),
-        })
+        let (mut loaded, folding) =
+            Self::rebuild(binding, registry, shared, |restore, each| match open {
+                Open::Create => {
+                    let created = shared.store.create(header)?;
+                    shared.catalog.record(Record::new(header.clone()));
+                    Ok(created)
+                }
+                Open::Load => shared.store.load(header.id, restore, each),
+            })?;
+        if loaded.writer.read_only().is_none()
+            && folding.core.ledger().extensions().is_some_and(|installed| {
+                installed.iter().any(|extension| extension.image.is_some())
+                    && installed != registry.installed()
+            })
+        {
+            loaded.writer.keep(ReadOnly::Extensions);
+        }
+        Ok((loaded, folding))
     }
 
     fn rebuild<T>(
