@@ -1,5 +1,95 @@
 # Skill frontmatter parser
 
+The measured subset parser supersedes the earlier flat-parser comparison below.
+It parses the portable skill header structures we collected, rather than treating
+colon-separated lines as YAML. The production crate no longer depends on a YAML
+library; the comparison libraries live only in an isolated measurement workspace.
+
+## Corpus and contract
+
+`crates/ext-skills/tests/corpus` holds 17 verbatim frontmatter excerpts, with
+commit-pinned source URLs in `sources.json`. `refresh.py` retrieves those exact
+headers without their instruction bodies. The sources are
+[Anthropic skills](https://github.com/anthropics/skills),
+[Claude Code plugins](https://github.com/anthropics/claude-code),
+[OpenAI skills](https://github.com/openai/skills),
+[pi skills](https://github.com/badlogic/pi-skills),
+[pi loader fixtures](https://github.com/badlogic/pi-mono/tree/main/packages/coding-agent/test/fixtures/skills),
+and [Trail of Bits skills](https://github.com/trailofbits/skills).
+The corpus includes plain and double-quoted scalars, folded and literal block
+scalars, nested metadata, and scalar and list forms of `allowed-tools`.
+Single quotes, escaped quotes, comments, flow collections, deeper nested maps,
+invalid syntax, CRLF, delimiters, and resource limits have separate grammar tests.
+These constructed cases are not presented as upstream excerpts.
+
+The oracle is the normalized `(name, description)` pair: all three adapters
+must agree on every real header before `tests/measure/run.py` writes
+`expected.json`. Ordinary crate tests use that snapshot without linking either
+comparison library. Decoding is separate from catalog admission: the long
+Anthropic `claude-api` description and Claude Code's `Agent Development` name violate this
+product's existing 1024-byte description / lower-case command-name rules and
+remain rejected at admission. No source header was shortened or renamed to pass.
+
+The custom parser has an 8192-byte header limit and 16-level nesting limit;
+the loader independently limits files to 64 KiB. Errors carry a typed kind and
+1-based file line, including the opening delimiter. Metadata is validated but
+never used as permissions. The parser has no unsafe code or panic paths.
+It supports indented maps, scalar sequences and single-line flow collections;
+plain, single-quoted and JSON-escaped double-quoted text; and description blocks
+with chomping/indent indicators. Descriptions are whitespace-normalized, so no
+YAML tree or exact block-chomping result needs to survive. Quoted block-map keys,
+multiline plain/quoted scalars, tags, anchors, aliases and directives are rejected.
+This is a documented subset, not a replacement general-purpose YAML library.
+
+## Measurement
+
+Measured on 2026-10-21, macOS arm64, nightly-2026-10-17, always
+`CARGO_BUILD_JOBS=2`. Run from the repository root:
+
+```sh
+CARGO_BUILD_JOBS=2 python3 crates/ext-skills/tests/measure/run.py
+```
+
+The three probes use fresh, separate target directories, an empty compiler
+wrapper, pinned dependencies and the shipped release settings (`s`, fat LTO,
+one codegen unit, stripped symbols, serde_json at 3), including rebuilt std with
+`panic-unwind,optimize_for_size`. Each executable reads files from argv and
+prints the normalized fields, preventing parser elimination. Compile times
+include rebuilding std and proc macros, with downloads/index/cache effects;
+the machine was shared and the runs were sequential, so these are observations,
+not quiet-machine performance budgets. No startup or budget timings were run.
+
+| Parser | Executable bytes | Delta over custom | Fresh build wall seconds | Corpus |
+| --- | ---: | ---: | ---: | ---: |
+| Custom bounded subset | 153216 | +0 | 207.25 | 17/17 |
+| serde_yaml_ng 0.10.0 | 219520 | +66304 | 237.85 | 17/17 |
+| yaml-rust2 0.13.0 | 236048 | +82832 | 196.47 | 17/17 |
+
+`mise run size`, before: **3844240 bytes (3754 KiB)**; final: **3794544 bytes (3705 KiB)**. The integrated binary saves **49696 bytes** and remains below 4096 KiB. Main was already merged (`git merge main`: already up to date). A final parser-only rebuild after diagnostic corrections still measured **153216 bytes**, with all 17 headers matching (93.81 s incremental rebuild, separate from the fresh-build table). The earlier intermediate integrated build measured 3689 KiB; the final source and full link above are the reported result.
+
+Choose the custom subset parser: it passes the complete sourced corpus and
+retains diagnostics, validation and bounds at the lowest measured shipped-profile
+size. `serde_yaml_ng` 0.10.0 and `yaml-rust2` 0.13.0 (default features disabled)
+remain reproducible comparison candidates, not shipped or dev dependencies.
+The maintained alternatives are linked above through their primary source
+package pages: [serde_yaml_ng](https://crates.io/crates/serde_yaml_ng) and
+[yaml-rust2](https://crates.io/crates/yaml-rust2).
+
+`mise run fuzz skill_frontmatter --time 10s` exercises arbitrary UTF-8 and binary
+input through both delimiter extraction and header parsing using the repository's
+Bolero/libFuzzer setup. The real headers seed the generated corpus under
+`target/fuzz/skill_frontmatter/corpus`; ordinary tests also run Bolero's random
+input engine. The measured coverage run completed 11267 executions in 11 seconds
+(the requested fuzz duration was 10 seconds), without a crash. Discovery, loading
+and publication semantics are unchanged.
+
+Validation: `mise run check` (1148 passed, 30 skipped), `acceptance` (23 passed),
+`machete`, `deny`, `check:no-tokio`, the coverage run above, and `size` before
+and after. All Cargo invocations used two build jobs. No budgets or startup
+timings were run.
+
+# Historical flat-parser probe
+
 Measured on 2026-10-21, macOS arm64, nightly-2026-10-17, with
 `CARGO_BUILD_JOBS=3`. The machine was shared. Compile durations below describe
 this run, including cache/index/download contention; they establish no runtime,
@@ -25,13 +115,13 @@ The compiler was warm for the later builds, so compile times cannot be compared
 as cold builds. The probe used the standard shipped std, rather than this
 repository's build-std profile; compare deltas, not absolute binary sizes.
 
-Choose [serde_yaml_ng](https://crates.io/crates/serde_yaml_ng): the maintained
+The earlier choice was [serde_yaml_ng](https://crates.io/crates/serde_yaml_ng): the maintained
 Serde parser is smaller than the measured tree adapter, supports ordinary
 portable YAML skill headers, and fits the 4 MiB product budget. The saved 97 KiB
 of a tiny parser does not justify maintaining a second quoting and block-scalar
 language. `serde_yaml` 0.9 is deprecated and was excluded rather than added as a
 production dependency. `yaml-rust2` is the measured alternate maintained parser.
-No handwritten YAML parser is shipped. Frontmatter has an 8 KiB limit and a
+At that point no handwritten YAML parser was shipped. Frontmatter has an 8 KiB limit and a
 skill file a 64 KiB limit before decoding; aggregate catalog limits constrain
 snapshot memory independently of model context. Filesystem calls have no
 OS-enforced deadline.

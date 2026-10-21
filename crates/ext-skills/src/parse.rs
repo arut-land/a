@@ -1,27 +1,20 @@
+use crate::Skill;
 use std::path::Path;
 
-use serde::Deserialize;
+mod yaml;
+use yaml::{Error, Kind, header};
 
-use crate::Skill;
-
-#[derive(Deserialize)]
-struct Header {
-    name: String,
-    description: String,
-}
-
-pub(crate) fn parse(source: &str, directory: &Path) -> Result<(String, Skill), String> {
+pub(crate) fn parse(source: &str, directory: &Path) -> Result<(String, Skill), Error> {
     let mut lines = source.split_inclusive('\n');
-    let opening = lines.next().ok_or("expected opening ---")?;
+    let opening = lines.next().ok_or_else(|| Error::new(1, Kind::Delimiter))?;
     if opening.trim_end() != "---" {
-        return Err("expected opening ---".into());
+        return Err(Error::new(1, Kind::Delimiter));
     }
     let start = opening.len();
     let mut end = start;
     for line in lines {
         if line.trim_end() == "---" {
-            let header: Header =
-                serde_yaml_ng::from_str(&source[start..end]).map_err(|e| e.to_string())?;
+            let header = header(&source[start..end])?;
             if header.name.is_empty()
                 || header.name.len() > 64
                 || !header
@@ -31,9 +24,7 @@ pub(crate) fn parse(source: &str, directory: &Path) -> Result<(String, Skill), S
                 || header.name.starts_with('-')
                 || header.name.ends_with('-')
             {
-                return Err(
-                    "name must be 1..64 lower-case letters, digits or internal hyphens".into(),
-                );
+                return Err(Error::new(header.name_line, Kind::Name));
             }
             let description = header
                 .description
@@ -41,7 +32,7 @@ pub(crate) fn parse(source: &str, directory: &Path) -> Result<(String, Skill), S
                 .collect::<Vec<_>>()
                 .join(" ");
             if description.is_empty() || description.len() > 1024 {
-                return Err("description must be 1..1024 bytes".into());
+                return Err(Error::new(header.description_line, Kind::Description));
             }
             return Ok((
                 header.name,
@@ -54,8 +45,11 @@ pub(crate) fn parse(source: &str, directory: &Path) -> Result<(String, Skill), S
         }
         end += line.len();
         if end - start > 8192 {
-            return Err("frontmatter exceeds 8 KiB".into());
+            return Err(Error::new(2, Kind::Size));
         }
     }
-    Err("expected closing ---".into())
+    Err(Error::new(source.lines().count(), Kind::Delimiter))
 }
+
+#[cfg(test)]
+mod tests;

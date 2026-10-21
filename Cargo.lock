@@ -660,6 +660,7 @@ dependencies = [
 name = "ext-skills"
 version = "0.0.0"
 dependencies = [
+ "bolero",
  "ext",
  "kernel",
  "llm",
@@ -667,7 +668,6 @@ dependencies = [
  "rt",
  "serde",
  "serde_json",
- "serde_yaml_ng",
  "sys",
 ]
 

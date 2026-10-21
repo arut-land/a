@@ -1,0 +1,70 @@
+[
+  {
+    "file": "anthropics-academy-guide.md",
+    "source": "https://github.com/anthropics/skills/blob/dbd4588f9e1033efb41dad4bef2f7947c8993d44/skills/academy-guide/SKILL.md"
+  },
+  {
+    "file": "anthropics-claude-api.md",
+    "source": "https://github.com/anthropics/skills/blob/dbd4588f9e1033efb41dad4bef2f7947c8993d44/skills/claude-api/SKILL.md"
+  },
+  {
+    "file": "anthropics-docx.md",
+    "source": "https://github.com/anthropics/skills/blob/dbd4588f9e1033efb41dad4bef2f7947c8993d44/skills/docx/SKILL.md"
+  },
+  {
+    "file": "anthropics-frontend-design.md",
+    "source": "https://github.com/anthropics/skills/blob/dbd4588f9e1033efb41dad4bef2f7947c8993d44/skills/frontend-design/SKILL.md"
+  },
+  {
+    "file": "openai-aspnet-core.md",
+    "source": "https://github.com/openai/skills/blob/49f948faa9258a0c61caceaf225e179651397431/skills/.curated/aspnet-core/SKILL.md"
+  },
+  {
+    "file": "openai-figma-generate-design.md",
+    "source": "https://github.com/openai/skills/blob/49f948faa9258a0c61caceaf225e179651397431/skills/.curated/figma-generate-design/SKILL.md"
+  },
+  {
+    "file": "openai-skill-creator.md",
+    "source": "https://github.com/openai/skills/blob/49f948faa9258a0c61caceaf225e179651397431/skills/.system/skill-creator/SKILL.md"
+  },
+  {
+    "file": "badlogic-brave-search.md",
+    "source": "https://github.com/badlogic/pi-skills/blob/90bb51cae36515a648515b633a81c0c6efc8c74d/brave-search/SKILL.md"
+  },
+  {
+    "file": "badlogic-browser-tools.md",
+    "source": "https://github.com/badlogic/pi-skills/blob/90bb51cae36515a648515b633a81c0c6efc8c74d/browser-tools/SKILL.md"
+  },
+  {
+    "file": "badlogic-gccli.md",
+    "source": "https://github.com/badlogic/pi-skills/blob/90bb51cae36515a648515b633a81c0c6efc8c74d/gccli/SKILL.md"
+  },
+  {
+    "file": "claude-code-agent-development.md",
+    "source": "https://github.com/anthropics/claude-code/blob/d014fc0fa64280540728772fc84063918ed185cc/plugins/plugin-dev/skills/agent-development/SKILL.md"
+  },
+  {
+    "file": "pi-mono-multiline-description.md",
+    "source": "https://github.com/badlogic/pi-mono/blob/bd3c9b823762b7383954aa49e13ee350471015fe/packages/coding-agent/test/fixtures/skills/multiline-description/SKILL.md"
+  },
+  {
+    "file": "pi-mono-unknown-field.md",
+    "source": "https://github.com/badlogic/pi-mono/blob/bd3c9b823762b7383954aa49e13ee350471015fe/packages/coding-agent/test/fixtures/skills/unknown-field/SKILL.md"
+  },
+  {
+    "file": "pi-mono-valid-skill.md",
+    "source": "https://github.com/badlogic/pi-mono/blob/bd3c9b823762b7383954aa49e13ee350471015fe/packages/coding-agent/test/fixtures/skills/valid-skill/SKILL.md"
+  },
+  {
+    "file": "trailofbits-agentic-actions-auditor.md",
+    "source": "https://github.com/trailofbits/skills/blob/a3131740a39291e42fd15b9eac07e0b393ad71b1/plugins/agentic-actions-auditor/skills/agentic-actions-auditor/SKILL.md"
+  },
+  {
+    "file": "trailofbits-trailmark-finding-triage.md",
+    "source": "https://github.com/trailofbits/skills/blob/a3131740a39291e42fd15b9eac07e0b393ad71b1/plugins/trailmark/skills/trailmark-finding-triage/SKILL.md"
+  },
+  {
+    "file": "trailofbits-trailmark-review-gate.md",
+    "source": "https://github.com/trailofbits/skills/blob/a3131740a39291e42fd15b9eac07e0b393ad71b1/plugins/trailmark/skills/trailmark-review-gate/SKILL.md"
+  }
+]
