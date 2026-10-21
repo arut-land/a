@@ -21,16 +21,32 @@ impl rt::Runtime for Watched {
         self.inner.spawn(task);
     }
 
-    fn spawn_blocking(&self, work: Box<dyn FnOnce() + Send>) {
+    fn spawn_blocking(
+        &self,
+        class: rt::BlockingClass,
+        bytes: usize,
+        work: Box<dyn FnOnce() + Send>,
+    ) -> rt::BoxFuture<'static, io::Result<()>> {
         let done = self.done.clone();
-        self.inner.spawn_blocking(Box::new(move || {
-            work();
-            let _ = done.send(());
-        }));
+        self.inner.spawn_blocking(
+            class,
+            bytes,
+            Box::new(move || {
+                work();
+                let _ = done.send(());
+            }),
+        )
     }
 
     fn sleep(&self, duration: Duration) -> rt::BoxFuture<'static, ()> {
         self.inner.sleep(duration)
+    }
+
+    fn spawn_flush(
+        &self,
+        work: Box<dyn FnOnce() + Send>,
+    ) -> rt::BoxFuture<'static, io::Result<()>> {
+        self.inner.spawn_flush(work)
     }
 
     fn reactor(&self) -> rt::Reactor {
@@ -101,7 +117,13 @@ fn next_chunk(body: &mut crate::http::Body) -> Option<io::Result<Vec<u8>>> {
 fn dropping_a_request_waiting_for_its_head_closes_the_connection() {
     let (http, returned) = client();
     let (port, got, closed) = server(b"");
-    let reply = http.send(request(port));
+    let mut reply = http.send(request(port));
+    assert!(
+        reply
+            .as_mut()
+            .poll(&mut std::task::Context::from_waker(std::task::Waker::noop()))
+            .is_pending()
+    );
     got.recv().unwrap();
     let dropped = Instant::now();
     drop(reply);

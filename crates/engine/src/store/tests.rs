@@ -1187,7 +1187,7 @@ fn a_read_only_writer_still_flushes_the_prefix_it_will_replay() {
     let mut forbidden = [entry(2, 0)];
     assert!(loaded.writer.append(&mut forbidden, true).is_err());
     loaded.writer.sync().unwrap();
-    rt::block_on(loaded.writer.flushed(&*FLUSH_RT)).unwrap();
+    loaded.writer.flush_inline().unwrap();
     assert_eq!(memory.entries(header.id).unwrap(), entries);
     assert_eq!(loaded.writer.read_only(), Some(ReadOnly::Extensions));
 }

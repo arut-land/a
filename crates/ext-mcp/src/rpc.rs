@@ -187,12 +187,27 @@ impl rt::Runtime for CallRuntime {
             .expect("engine runtime")
             .spawn(task);
     }
-    fn spawn_blocking(&self, work: Box<dyn FnOnce() + Send>) {
+    fn spawn_blocking(
+        &self,
+        class: rt::BlockingClass,
+        bytes: usize,
+        work: Box<dyn FnOnce() + Send>,
+    ) -> rt::BoxFuture<'static, std::io::Result<()>> {
         self.0
             .service::<dyn rt::Runtime>()
             .expect("engine runtime")
-            .spawn_blocking(work);
+            .spawn_blocking(class, bytes, work)
     }
+    fn spawn_flush(
+        &self,
+        work: Box<dyn FnOnce() + Send>,
+    ) -> rt::BoxFuture<'static, std::io::Result<()>> {
+        self.0
+            .service::<dyn rt::Runtime>()
+            .expect("engine runtime")
+            .spawn_flush(work)
+    }
+
     fn reactor(&self) -> rt::Reactor {
         self.0
             .service::<dyn rt::Runtime>()

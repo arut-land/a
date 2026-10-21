@@ -15,9 +15,6 @@ pub enum Reactor {
     /// nothing due it sleeps until something is: an idle process never
     /// wakes.
     AsyncIo,
-    /// The reactor of the tokio runtime behind the handle.
-    #[cfg(feature = "tokio")]
-    Tokio(tokio::runtime::Handle),
 }
 
 impl Reactor {
@@ -27,11 +24,6 @@ impl Reactor {
             Self::AsyncIo => Box::pin(async move {
                 async_io::Timer::after(duration).await;
             }),
-            #[cfg(feature = "tokio")]
-            Self::Tokio(handle) => {
-                let _entered = handle.enter();
-                Box::pin(tokio::time::sleep(duration))
-            }
         }
     }
 }
@@ -63,8 +55,6 @@ enum Inner<T: Source> {
     /// A handle that is signalled, as a process is when it exits.
     #[cfg(windows)]
     Signal(async_io::os::windows::Waitable<T>),
-    #[cfg(all(unix, feature = "tokio"))]
-    Tokio(tokio::io::unix::AsyncFd<Fd<T>>),
 }
 
 #[cfg(unix)]
@@ -93,21 +83,6 @@ impl<T: std::os::fd::AsFd> Async<T> {
             Reactor::AsyncIo => {
                 let _ = write;
                 Inner::AsyncIo(async_io::Async::new_nonblocking(io)?)
-            }
-            #[cfg(feature = "tokio")]
-            Reactor::Tokio(handle) => {
-                use tokio::io::Interest;
-                let interest = if write {
-                    Interest::READABLE | Interest::WRITABLE
-                } else {
-                    Interest::READABLE
-                };
-                let _entered = handle.enter();
-                // The safe registration; its replacement is `unsafe`, and
-                // unsafe code lives in `sys` only.
-                #[expect(deprecated)]
-                let fd = tokio::io::unix::AsyncFd::with_interest(Fd(io), interest);
-                Inner::Tokio(fd?)
             }
         };
         Ok(Self(inner))
@@ -140,8 +115,6 @@ impl<T: sys::CompletionSource> Async<T> {
                     io,
                 }))
             }
-            #[cfg(feature = "tokio")]
-            Reactor::Tokio(_) => Err(io::ErrorKind::Unsupported.into()),
         }
     }
 }
@@ -155,8 +128,6 @@ impl<T: std::os::windows::io::AsHandle> Async<T> {
             Reactor::AsyncIo => Ok(Self(Inner::Signal(async_io::os::windows::Waitable::new(
                 io,
             )?))),
-            #[cfg(feature = "tokio")]
-            Reactor::Tokio(_) => Err(io::ErrorKind::Unsupported.into()),
         }
     }
 }
@@ -167,8 +138,6 @@ impl<T: std::os::windows::io::AsSocket> Async<T> {
     pub fn socket(reactor: &Reactor, io: T) -> io::Result<Self> {
         match reactor {
             Reactor::AsyncIo => Ok(Self(Inner::AsyncIo(async_io::Async::new(io)?))),
-            #[cfg(feature = "tokio")]
-            Reactor::Tokio(_) => Err(io::ErrorKind::Unsupported.into()),
         }
     }
 }
@@ -197,8 +166,6 @@ impl<T: Source> Async<T> {
             Inner::Signal(handle) => handle.get_ref(),
             #[cfg(windows)]
             Inner::Completion { io, .. } => io,
-            #[cfg(all(unix, feature = "tokio"))]
-            Inner::Tokio(fd) => &fd.get_ref().0,
         }
     }
 
@@ -256,28 +223,6 @@ impl<T: Source> Async<T> {
             Inner::Signal(handle) => handle.ready().await,
             #[cfg(windows)]
             Inner::Completion { events, .. } => events[usize::from(write)].ready().await,
-            #[cfg(all(unix, feature = "tokio"))]
-            Inner::Tokio(fd) => {
-                let mut ready = if write {
-                    fd.writable().await?
-                } else {
-                    fd.readable().await?
-                };
-                // Taken as it is seen, so what comes after is the next.
-                ready.clear_ready();
-                Ok(())
-            }
         }
-    }
-}
-
-/// What tokio's `AsyncFd` takes: a raw descriptor.
-#[cfg(all(unix, feature = "tokio"))]
-struct Fd<T>(T);
-
-#[cfg(all(unix, feature = "tokio"))]
-impl<T: std::os::fd::AsFd> std::os::fd::AsRawFd for Fd<T> {
-    fn as_raw_fd(&self) -> std::os::fd::RawFd {
-        self.0.as_fd().as_raw_fd()
     }
 }

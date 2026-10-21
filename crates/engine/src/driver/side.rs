@@ -22,21 +22,17 @@ pub(super) enum SideFact {
 impl Actor {
     // Successful settlement revokes mutation authority, but a background
     // observer may not have submitted its request yet. Interrupts revoke both.
-    pub(super) fn background_owner_succeeded(&self, origin: &ContextOrigin) -> bool {
+    pub(super) async fn background_owner_succeeded(&mut self, origin: &ContextOrigin) -> bool {
         if origin.fence != self.live.session.fence.load(super::Ordering::SeqCst) {
             return false;
         }
-        let Ok(entries) = self.live.frames.entries() else {
+        let Ok(entries) = self.live.entries().await else {
             return false;
         };
         let mut succeeded = false;
         for entry in entries
             .into_iter()
-            .chain(
-                self.unsynced
-                    .iter()
-                    .flat_map(|(entries, _)| entries.iter().cloned()),
-            )
+            .chain(self.pending_entries())
             .filter(|entry| entry.seq > origin.call.0)
         {
             match entry.body {
@@ -57,7 +53,7 @@ impl Actor {
         succeeded
     }
 
-    pub(super) fn admit_side(&mut self, ticket: Ticket, side: Option<CallId>) {
+    pub(super) async fn admit_side(&mut self, ticket: Ticket, side: Option<CallId>) {
         if let Some(PendingSide {
             reply,
             messages,
@@ -77,11 +73,12 @@ impl Actor {
             {
                 cancel.set();
             }
+            let succeeded = background && self.background_owner_succeeded(&origin).await;
             let side = side.filter(|side| {
                 self.phase == Phase::Serving
                     && (!cancel.is_set() || while_waiting)
                     && (origin.current(&self.live.session)
-                        || background && self.background_owner_succeeded(&origin)
+                        || succeeded
                         || while_waiting && cancel.is_set())
                     && self.core.ledger().call(*side).is_some()
             });
@@ -129,7 +126,7 @@ impl Actor {
         })
     }
 
-    pub(super) fn open_side(
+    pub(super) async fn open_side(
         &mut self,
         origin: ContextOrigin,
         model: String,
@@ -147,15 +144,11 @@ impl Actor {
             reply.send(Opened::Closed);
             return None;
         }
-        let entries = self.live.frames.entries().ok()?;
+        let entries = self.live.entries().await.ok()?;
         let previous = entries
             .iter()
             .cloned()
-            .chain(
-                self.unsynced
-                    .iter()
-                    .flat_map(|(entries, _)| entries.iter().cloned()),
-            )
+            .chain(self.pending_entries())
             .find_map(|e| match e.body {
                 Body::ModelCall {
                     r#for: Some(parent),
@@ -194,7 +187,7 @@ impl Actor {
             return None;
         }
         let conversation = match side.context {
-            ext::SideContext::BeforeOwner => self.conversation(of).ok()?,
+            ext::SideContext::BeforeOwner => self.conversation(of).await.ok()?,
             ext::SideContext::None => llm::Messages::default(),
         };
         let Ok(request) = side.intent(&conversation) else {

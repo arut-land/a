@@ -348,30 +348,35 @@ impl Logger {
                 }
                 let count = batch.len() as u64;
                 let lost = queue.lost.swap(0, Ordering::Relaxed);
-                let (returned, failed, pending) = rt::unblock(&*executor, move || {
-                    let (mut pending, mut failed) = (lost, failures);
-                    for record in batch {
-                        if write_record(&mut write, record).is_err() {
-                            failed += 1;
+                let (returned, failed, pending) = rt::unblock_with(
+                    &*executor,
+                    rt::BlockingClass::Storage,
+                    batch.len() * size_of::<Record>() + 4096,
+                    move || {
+                        let (mut pending, mut failed) = (lost, failures);
+                        for record in batch {
+                            if write_record(&mut write, record).is_err() {
+                                failed += 1;
+                            }
                         }
-                    }
-                    // Flush includes the loss count even when recovery was
-                    // in the last batch and no further facts arrive.
-                    if (pending != 0 || failed != 0)
-                        && write_record(
-                            &mut write,
-                            Record::new(Fact::Lost {
-                                queue: pending,
-                                writes: failed,
-                            }),
-                        )
-                        .is_ok()
-                    {
-                        pending = 0;
-                        failed = 0;
-                    }
-                    (write, failed, pending)
-                })
+                        // Flush includes the loss count even when recovery was
+                        // in the last batch and no further facts arrive.
+                        if (pending != 0 || failed != 0)
+                            && write_record(
+                                &mut write,
+                                Record::new(Fact::Lost {
+                                    queue: pending,
+                                    writes: failed,
+                                }),
+                            )
+                            .is_ok()
+                        {
+                            pending = 0;
+                            failed = 0;
+                        }
+                        (write, failed, pending)
+                    },
+                )
                 .await;
                 write = returned;
                 failures = failed;

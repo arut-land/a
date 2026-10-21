@@ -32,7 +32,7 @@ fn runtime() -> &'static Threads {
 async fn blocking<T: Send + 'static>(
     work: impl FnOnce() -> Result<T, ClientError> + Send + 'static,
 ) -> Result<T, ClientError> {
-    rt::unblock(runtime(), work).await
+    rt::unblock_with(runtime(), rt::BlockingClass::Network, 64 << 10, work).await
 }
 
 /// The environment a new session's commands run with: this process's, and

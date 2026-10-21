@@ -119,6 +119,11 @@ impl FrameLog {
         self.entries_after(0)
     }
 
+    pub async fn read_entries(self: &Arc<Self>, rt: &dyn rt::Runtime) -> io::Result<Vec<Entry>> {
+        let log = Arc::clone(self);
+        rt::unblock(rt, move || log.entries()).await
+    }
+
     fn batch(&self, next: u64, last: u64) -> io::Result<(Vec<u8>, Vec<Entry>)> {
         let mut run = Vec::new();
         let count = lock(&self.lines).read(next..=last, RUN, &mut run)?;
@@ -145,21 +150,8 @@ impl FrameLog {
     /// back, is an error that ends the view of a client that comes to it
     /// rather than leaving a gap in it.
     fn read_after(&self, after: u64, ahead: &mut VecDeque<io::Result<Frame>>) {
-        let last = {
-            // The seq read under the lock it is shown under: the tail's
-            // frames end at it, where a seq read before may be behind them.
-            let tail = lock(&self.tail);
-            let last = self.seq();
-            if after >= last {
-                return;
-            }
-            let first = last + 1 - tail.frames.len() as u64;
-            if first <= after + 1 {
-                let skip = usize::try_from(after + 1 - first).unwrap_or(usize::MAX);
-                ahead.extend(tail.frames.iter().skip(skip).cloned().map(Ok));
-                return;
-            }
-            last
+        let Some(last) = self.read_tail(after, ahead) else {
+            return;
         };
         match self.batch(after + 1, last) {
             Ok((run, _)) => ahead.extend(
@@ -168,6 +160,25 @@ impl FrameLog {
                     .map(|(line, seq)| Frame::from_line(seq, line)),
             ),
             Err(e) => ahead.push_back(Err(e)),
+        }
+    }
+
+    fn read_tail(&self, after: u64, ahead: &mut VecDeque<io::Result<Frame>>) -> Option<u64> {
+        {
+            // The seq read under the lock it is shown under: the tail's
+            // frames end at it, where a seq read before may be behind them.
+            let tail = lock(&self.tail);
+            let last = self.seq();
+            if after >= last {
+                return None;
+            }
+            let first = last + 1 - tail.frames.len() as u64;
+            if first <= after + 1 {
+                let skip = usize::try_from(after + 1 - first).unwrap_or(usize::MAX);
+                ahead.extend(tail.frames.iter().skip(skip).cloned().map(Ok));
+                return None;
+            }
+            Some(last)
         }
     }
 }
@@ -312,11 +323,26 @@ impl Outbox {
 
     /// The next frame to write, once there is one; `None` once closed and
     /// all written. The writer waits here, a task: no thread per client.
-    pub async fn next(&self) -> Option<Frame> {
+    pub async fn next(&self, rt: &dyn rt::Runtime) -> Option<Frame> {
         loop {
             let mut seen = self.shared.ready.count();
-            if let Some(frame) = self.try_next() {
+            if let Some(frame) = self.try_ready() {
                 return Some(frame);
+            }
+            let step = self.queue().step();
+            match step {
+                Step::Read(log, cursor, follows) if cursor < log.seq() => {
+                    let ahead = rt::unblock(rt, move || {
+                        let mut ahead = VecDeque::new();
+                        log.read_after(cursor, &mut ahead);
+                        ahead
+                    })
+                    .await;
+                    self.accept_read(cursor, follows, ahead);
+                    continue;
+                }
+                Step::Frame(frame) => return Some(frame),
+                Step::Nothing | Step::Read(..) => {}
             }
             if self.queue().closed {
                 return None;
@@ -327,7 +353,7 @@ impl Outbox {
 
     /// The next frame to write if there is one now. The log is read
     /// outside the queue's lock: a cold read holds up no sender.
-    pub fn try_next(&self) -> Option<Frame> {
+    pub fn try_ready(&self) -> Option<Frame> {
         loop {
             let (log, cursor, follows) = match self.queue().step() {
                 Step::Frame(frame) => return Some(frame),
@@ -335,18 +361,41 @@ impl Outbox {
                 Step::Read(log, cursor, follows) => (log, cursor, follows),
             };
             let mut ahead = VecDeque::new();
+            if log.read_tail(cursor, &mut ahead).is_some() {
+                return None;
+            }
+            if ahead.is_empty() {
+                return None;
+            }
+            self.accept_read(cursor, follows, ahead);
+        }
+    }
+
+    #[cfg(test)]
+    pub fn try_next(&self) -> Option<Frame> {
+        loop {
+            if let Some(frame) = self.try_ready() {
+                return Some(frame);
+            }
+            let Step::Read(log, cursor, follows) = self.queue().step() else {
+                return None;
+            };
+            let mut ahead = VecDeque::new();
             log.read_after(cursor, &mut ahead);
             if ahead.is_empty() {
                 return None;
             }
-            let mut q = self.queue();
-            // Still following the same session from the same place.
-            if q.follows == follows
-                && let Some(follow) = &mut q.follow
-                && follow.cursor == cursor
-            {
-                follow.ahead = ahead;
-            }
+            self.accept_read(cursor, follows, ahead);
+        }
+    }
+
+    fn accept_read(&self, cursor: u64, follows: u64, ahead: VecDeque<io::Result<Frame>>) {
+        let mut q = self.queue();
+        if q.follows == follows
+            && let Some(follow) = &mut q.follow
+            && follow.cursor == cursor
+        {
+            follow.ahead = ahead;
         }
     }
 
@@ -723,7 +772,62 @@ mod tests {
         outbox.send(delta()).unwrap();
         outbox.close();
         assert!(outbox.send(entry(1, "a")).is_err());
-        assert!(rt::block_on(outbox.next()).is_some());
-        assert!(rt::block_on(outbox.next()).is_none());
+        assert!(rt::block_on(outbox.next(&rt::Threads::new(1))).is_some());
+        assert!(rt::block_on(outbox.next(&rt::Threads::new(1))).is_none());
+    }
+}
+
+#[cfg(test)]
+mod scheduling {
+    use super::*;
+    use rt::Runtime;
+
+    #[test]
+    fn cold_replay_does_not_block_async_workers() {
+        struct Cold {
+            entered: std::sync::mpsc::Sender<()>,
+            release: Mutex<std::sync::mpsc::Receiver<()>>,
+        }
+        impl Lines for Cold {
+            fn read(
+                &self,
+                _: std::ops::RangeInclusive<u64>,
+                _: usize,
+                _: &mut Vec<u8>,
+            ) -> io::Result<u64> {
+                self.entered.send(()).unwrap();
+                lock(&self.release).recv().unwrap();
+                Err(io::Error::other("cold read failed"))
+            }
+        }
+        let rt = Arc::new(rt::Threads::new(1));
+        let (entered, reading) = std::sync::mpsc::channel();
+        let (release, released) = std::sync::mpsc::channel();
+        let outbox = Outbox::new();
+        let _follower = outbox.follow(
+            Arc::new(FrameLog::new(
+                Arc::new(Cold {
+                    entered,
+                    release: Mutex::new(released),
+                }),
+                1,
+            )),
+            0,
+            Vec::new(),
+        );
+        let runtime = Arc::clone(&rt);
+        let read = rt::spawn(&*rt, async move { outbox.next(&*runtime).await });
+        reading
+            .recv_timeout(std::time::Duration::from_secs(2))
+            .unwrap();
+        let (sent, responsive) = std::sync::mpsc::channel();
+        rt.spawn(Box::pin(async move {
+            sent.send(()).unwrap();
+        }));
+        let result = responsive.recv_timeout(std::time::Duration::from_secs(2));
+        release.send(()).unwrap();
+        result.unwrap();
+        assert!(rt::block_on(read).is_none());
+        rt.shutdown();
     }
 }

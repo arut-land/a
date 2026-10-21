@@ -290,8 +290,13 @@ impl Drop for Live {
         }
         drop(tabs);
         let (driver, effects) = (self.driver.clone(), self.page.client.detach());
-        self.app
-            .rt
-            .spawn_blocking(Box::new(move || driver.pump(&mut (), effects)));
+        let admitted = self.app.rt.spawn_blocking(
+            rt::BlockingClass::Network,
+            64 << 10,
+            Box::new(move || driver.pump(&mut (), effects)),
+        );
+        self.app.rt.spawn(Box::pin(async move {
+            let _ = admitted.await;
+        }));
     }
 }

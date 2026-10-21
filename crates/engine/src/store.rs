@@ -31,9 +31,6 @@ pub use lease::{LeaseAuthority, Local};
 #[cfg(test)]
 pub use memory::Memory;
 
-#[cfg(test)]
-static FLUSH_RT: std::sync::LazyLock<rt::Threads> = std::sync::LazyLock::new(rt::Threads::default);
-
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Header {
     pub id: SessionId,
@@ -110,7 +107,7 @@ impl Loaded {
     pub fn append(&mut self, body: protocol::Body) -> io::Result<Entry> {
         let mut entry = [Entry::new(Seq::new(self.seq + 1).unwrap(), Epoch(0), body)];
         self.writer.append(&mut entry, true)?;
-        rt::block_on(self.writer.flushed(&*FLUSH_RT))?;
+        self.writer.flush_inline()?;
         let [entry] = entry;
         self.seq = entry.seq.get();
         Ok(entry)
@@ -224,6 +221,18 @@ impl Writer {
         self.log.enroll()
     }
 
+    /// Loading already owns a storage worker: run an elected flush there
+    /// instead of waiting for a second worker from the same pool.
+    pub fn flush_inline(&mut self) -> io::Result<()> {
+        if let Some(request) = self.enroll() {
+            if let Some(leader) = request.leader {
+                leader.run();
+            }
+            rt::block_on(request.epoch)?;
+        }
+        Ok(())
+    }
+
     /// Waits for a cache flush covering the writer's earlier barriers.
     /// Backends whose barriers already flush return without scheduling work.
     pub async fn flushed(&mut self, rt: &dyn rt::Runtime) -> io::Result<()> {
@@ -245,7 +254,7 @@ impl Writer {
     #[cfg(test)]
     pub fn append_raw(&mut self, entries: &[Entry]) -> io::Result<()> {
         self.log.append_all(entries, &Encoded::of(entries)?)?;
-        rt::block_on(self.flushed(&*FLUSH_RT))
+        self.flush_inline()
     }
 }
 

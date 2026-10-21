@@ -53,7 +53,10 @@ fn shown(outbox: &Outbox, done: impl Fn(&[Entry]) -> bool) -> Vec<Entry> {
     let mut seen = Vec::new();
     let reading = async {
         while !done(&seen) {
-            let frame = outbox.next().await.expect("the follower is open");
+            let frame = outbox
+                .next(&rt::Threads::new(1))
+                .await
+                .expect("the follower is open");
             if let Ok(Some(DaemonMsg::Entry(e))) =
                 protocol::read_frame::<DaemonMsg>(&mut frame.as_bytes())
             {
@@ -180,8 +183,23 @@ impl rt::Runtime for Manual {
         }
     }
 
-    fn spawn_blocking(&self, work: Box<dyn FnOnce() + Send>) {
+    fn spawn_blocking(
+        &self,
+        class: rt::BlockingClass,
+        bytes: usize,
+        work: Box<dyn FnOnce() + Send>,
+    ) -> rt::BoxFuture<'static, io::Result<()>> {
+        let _ = (class, bytes);
         work();
+        Box::pin(async { Ok(()) })
+    }
+
+    fn spawn_flush(
+        &self,
+        work: Box<dyn FnOnce() + Send>,
+    ) -> rt::BoxFuture<'static, io::Result<()>> {
+        work();
+        Box::pin(async { Ok(()) })
     }
 
     fn reactor(&self) -> rt::Reactor {

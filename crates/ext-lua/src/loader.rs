@@ -336,10 +336,12 @@ impl ext::Tool for Reload {
         let compiler = Arc::clone(&self.compiler);
         let path = self.path.clone();
         let rt = cx.service::<dyn rt::Runtime>().ok_or("no runtime")?;
-        rt::unblock(rt, move || workspace.prepare(&compiler, &path, false))
-            .await
-            .map(|()| true)
-            .map_err(|e| e.to_string())
+        rt::unblock_with(rt, rt::BlockingClass::Cpu, rt::STORAGE_BYTES, move || {
+            workspace.prepare(&compiler, &path, false)
+        })
+        .await
+        .map(|()| true)
+        .map_err(|e| e.to_string())
     }
 }
 impl Extension for Reload {

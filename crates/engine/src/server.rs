@@ -163,12 +163,12 @@ async fn write_all(io: &Async<Stream>, mut bytes: &[u8]) -> io::Result<()> {
 /// Writes what `outbox` hands out until it closes, as many frames as are
 /// ready at a time, up to [`WRITE_BATCH`] bytes: the client's cursor into
 /// what it is sent, moved on as the socket takes it.
-async fn write_out(io: Arc<Async<Stream>>, outbox: Outbox) {
+async fn write_out(io: Arc<Async<Stream>>, outbox: Outbox, rt: rt::Rt) {
     let mut batch = Vec::new();
-    while let Some(frame) = outbox.next().await {
+    while let Some(frame) = outbox.next(&*rt).await {
         batch.extend_from_slice(frame.as_bytes());
         while batch.len() < WRITE_BATCH
-            && let Some(frame) = outbox.try_next()
+            && let Some(frame) = outbox.try_ready()
         {
             batch.extend_from_slice(frame.as_bytes());
         }
@@ -203,10 +203,11 @@ pub(crate) async fn handle(
         _ => (Verdict::Mismatch, Versions::from(0), Caps::NONE, None),
     };
     let outbox = Outbox::new();
-    daemon
-        .shared
-        .rt
-        .spawn(Box::pin(write_out(Arc::clone(&io), outbox.clone())));
+    daemon.shared.rt.spawn(Box::pin(write_out(
+        Arc::clone(&io),
+        outbox.clone(),
+        Arc::clone(&daemon.shared.rt),
+    )));
     // Whatever the client sent behind a hello that is not welcomed is read
     // and dropped, never acted on.
     let result = match (verdict, Versions::OURS.common(theirs)) {
@@ -441,6 +442,7 @@ impl Conn<'_> {
         let rt = Arc::clone(&shared.rt);
         let (file, refused) = rt::unblock(&*rt, move || {
             let home = &shared.models.settings.home;
+            home.refresh();
             match change {
                 None => (home.get(), None),
                 Some(_) if viewer => (home.get(), Some("this client is a viewer".to_owned())),

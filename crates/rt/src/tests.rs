@@ -32,12 +32,13 @@ fn blocking_pool_runs_work_concurrently() {
     let jobs: Vec<_> = (0..4)
         .map(|_| {
             let (running, peak) = (Arc::clone(&running), Arc::clone(&peak));
-            unblock(&rt, move || {
+            let job = unblock(&rt, move || {
                 let now = running.fetch_add(1, Ordering::SeqCst) + 1;
                 peak.fetch_max(now, Ordering::SeqCst);
                 thread::sleep(Duration::from_millis(30));
                 running.fetch_sub(1, Ordering::SeqCst);
-            })
+            });
+            spawn(&rt, job)
         })
         .collect();
     block_on(async {
@@ -45,18 +46,23 @@ fn blocking_pool_runs_work_concurrently() {
             job.await;
         }
     });
-    assert_eq!(peak.load(Ordering::SeqCst), 4);
+    assert_eq!(peak.load(Ordering::SeqCst), 2);
 }
 
 #[test]
 fn a_bounded_channel_streams_and_ends() {
     let rt = Threads::new(1);
     let (tx, rx) = channel::bounded(2);
-    rt.spawn_blocking(Box::new(move || {
-        for n in 0..10 {
-            tx.send(n).unwrap();
-        }
-    }));
+    block_on(rt.spawn_blocking(
+        BlockingClass::Storage,
+        0,
+        Box::new(move || {
+            for n in 0..10 {
+                tx.send(n).unwrap();
+            }
+        }),
+    ))
+    .unwrap();
     let got = block_on(async {
         let mut got = Vec::new();
         while let Some(n) = rx.recv().await {
@@ -130,9 +136,10 @@ fn an_unbounded_sender_never_waits() {
 // Each test runs in a process of its own (nextest), so the wake count is
 // this test's alone.
 #[test]
-fn an_idle_runtime_never_wakes() {
+fn idle_runtime_has_no_periodic_wakeups() {
     let rt = Threads::new(2);
     block_on(spawn(&rt, rt.sleep(Duration::from_millis(5))));
+    block_on(unblock(&rt, || ()));
     // A task waiting for a later deadline keeps every worker asleep.
     let late = spawn(&rt, rt.sleep(Duration::from_secs(30)));
     thread::sleep(Duration::from_millis(20));
@@ -212,21 +219,4 @@ fn readiness_wakes_a_waiter_once_not_in_a_spin() {
 #[test]
 fn a_registered_pipe_reads_when_written_without_a_thread_per_read() {
     assert_eq!(read_a_pipe(&Threads::new(1)), b"onetwo");
-}
-
-/// A tokio host's descriptors wait on tokio's reactor, the only one it
-/// runs.
-#[cfg(all(unix, feature = "tokio"))]
-#[test]
-fn a_tokio_runtime_reads_through_its_own_reactor() {
-    let host = ::tokio::runtime::Builder::new_current_thread()
-        .enable_all()
-        .build()
-        .unwrap();
-    let rt = Tokio(host.handle().clone());
-    // A current-thread runtime's reactor turns while it blocks on a task.
-    let driving = thread::spawn(move || host.block_on(std::future::pending::<()>()));
-    assert_eq!(read_a_pipe(&rt), b"onetwo");
-    block_on(rt.sleep(Duration::from_millis(5)));
-    drop(driving);
 }

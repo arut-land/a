@@ -9,9 +9,21 @@ impl rt::Runtime for NoTimers {
     fn spawn(&self, task: rt::BoxFuture<'static, ()>) {
         self.0.spawn(task);
     }
-    fn spawn_blocking(&self, work: Box<dyn FnOnce() + Send>) {
-        self.0.spawn_blocking(work);
+    fn spawn_blocking(
+        &self,
+        class: rt::BlockingClass,
+        bytes: usize,
+        work: Box<dyn FnOnce() + Send>,
+    ) -> rt::BoxFuture<'static, io::Result<()>> {
+        self.0.spawn_blocking(class, bytes, work)
     }
+    fn spawn_flush(
+        &self,
+        work: Box<dyn FnOnce() + Send>,
+    ) -> rt::BoxFuture<'static, io::Result<()>> {
+        self.0.spawn_flush(work)
+    }
+
     fn reactor(&self) -> rt::Reactor {
         self.0.reactor()
     }
@@ -115,7 +127,7 @@ fn safe_work_uses_ordered_transcripts_without_publishing_past_its_flush() {
     let outbox = Outbox::new();
     session.follow(&outbox, 0);
     loop {
-        let frame = rt::block_on(outbox.next()).unwrap();
+        let frame = rt::block_on(outbox.next(&rt::Threads::new(1))).unwrap();
         if matches!(
             protocol::read_frame::<DaemonMsg>(&mut frame.as_bytes()),
             Ok(Some(DaemonMsg::Synced { .. }))
@@ -141,7 +153,8 @@ fn safe_work_uses_ordered_transcripts_without_publishing_past_its_flush() {
     );
     drop(sent);
     assert_eq!(session.frames.seq(), before);
-    let mut next = std::pin::pin!(outbox.next());
+    let reader = rt::Threads::new(1);
+    let mut next = std::pin::pin!(outbox.next(&reader));
     let mut next_cx = std::task::Context::from_waker(std::task::Waker::noop());
     assert!(
         next.as_mut().poll(&mut next_cx).is_pending(),
@@ -491,7 +504,7 @@ fn a_failed_epoch_answers_an_attach_waiting_for_publication() {
     flush.release();
     assert!(matches!(rt::block_on(rejected), Some(Err(_))));
     assert_eq!(rt::block_on(attached), Some(()));
-    let frame = rt::block_on(outbox.next()).unwrap();
+    let frame = rt::block_on(outbox.next(&rt::Threads::new(1))).unwrap();
     assert!(matches!(
         protocol::read_frame::<DaemonMsg>(&mut frame.as_bytes()),
         Ok(Some(DaemonMsg::Error { .. }))

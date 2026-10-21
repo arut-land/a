@@ -1,9 +1,8 @@
 //! The async runtime seam. Library code is plain async Rust over [`Runtime`]:
 //! it spawns, sleeps, runs blocking work and waits on the OS through
 //! whichever runtime the host plugs in, and never names one itself.
-//! [`Threads`] is the built-in runtime; `smol` and `tokio` adapters sit
-//! behind features. A runtime brings its own reactor ([`Reactor`]), which
-//! [`Async`] descriptors register with, so a host never runs two.
+//! [`Threads`] owns the workers; [`Async`] descriptors and timers share
+//! its [`Reactor`], so a host never runs two.
 //! [`block_on`] drives a future to completion on the calling thread.
 //! [`EventSink`] is the observability seam, free when off.
 
@@ -16,11 +15,6 @@ pub mod oneshot;
 #[cfg(feature = "threads")]
 mod threads;
 mod wakeup;
-
-#[cfg(feature = "smol")]
-mod smol;
-#[cfg(feature = "tokio")]
-mod tokio;
 
 use std::future::Future;
 use std::pin::{Pin, pin};
@@ -38,22 +32,41 @@ pub use futures_lite::future::or;
 pub use io::{Async, Reactor, Source};
 pub use notify::Notify;
 #[cfg(feature = "threads")]
-pub use threads::Threads;
+pub use threads::{Config, PoolLimits, Threads};
 pub use wakeup::Wakeup;
 
-#[cfg(feature = "smol")]
-pub use self::smol::Smol;
-#[cfg(feature = "tokio")]
-pub use self::tokio::Tokio;
-
 pub type BoxFuture<'a, T> = Pin<Box<dyn Future<Output = T> + Send + 'a>>;
+
+#[derive(Clone, Copy, Debug)]
+pub enum BlockingClass {
+    Storage,
+    Network,
+    Cpu,
+}
+
+/// Default reservation for storage jobs whose buffers are owned by their caller.
+pub const STORAGE_BYTES: usize = 8 << 20;
 
 pub trait Runtime: Send + Sync + 'static {
     /// Runs `task` in the background; it is never awaited.
     fn spawn(&self, task: BoxFuture<'static, ()>);
 
-    /// Runs `work`, which may block, off the async workers.
-    fn spawn_blocking(&self, work: Box<dyn FnOnce() + Send>);
+    /// Admits `work` asynchronously, reserving `bytes` until it completes.
+    /// Resolves when queued, not when finished. Dropping before admission
+    /// cancels submission; accepted closures must arrange their own cancellation.
+    fn spawn_blocking(
+        &self,
+        class: BlockingClass,
+        bytes: usize,
+        work: Box<dyn FnOnce() + Send>,
+    ) -> BoxFuture<'static, std::io::Result<()>>;
+
+    /// Flush leaders have a reserved worker, so storage reads waiting on an
+    /// existing epoch cannot occupy the capacity needed to complete it.
+    fn spawn_flush(
+        &self,
+        work: Box<dyn FnOnce() + Send>,
+    ) -> BoxFuture<'static, std::io::Result<()>>;
 
     /// The reactor this runtime's tasks wait on the OS through: its timers
     /// and the descriptors registered with it ([`Async`]).
@@ -149,9 +162,27 @@ where
     T: Send + 'static,
     F: FnOnce() -> T + Send + 'static,
 {
+    unblock_with(rt, BlockingClass::Storage, STORAGE_BYTES, work)
+}
+
+/// `bytes` reserves queued captures and the job's working buffers until
+/// completion. Waiting futures remain caller-owned and are cancellable.
+pub fn unblock_with<T, F>(
+    rt: &dyn Runtime,
+    class: BlockingClass,
+    bytes: usize,
+    work: F,
+) -> impl Future<Output = T> + Send + 'static
+where
+    T: Send + 'static,
+    F: FnOnce() -> T + Send + 'static,
+{
     let (tx, rx) = oneshot::channel();
-    rt.spawn_blocking(Box::new(move || tx.send(work())));
-    async move { rx.await.expect("blocking work panicked") }
+    let admitted = rt.spawn_blocking(class, bytes, Box::new(move || tx.send(work())));
+    async move {
+        admitted.await.expect("blocking admission failed");
+        rx.await.expect("blocking work panicked")
+    }
 }
 
 /// Spawns `task` and returns a future of its output.
@@ -174,19 +205,6 @@ fn lock<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
 
 fn wait<'a, T>(cv: &Condvar, guard: MutexGuard<'a, T>) -> MutexGuard<'a, T> {
     cv.wait(guard).unwrap_or_else(PoisonError::into_inner)
-}
-
-/// Waits up to `timeout`; `true` if it timed out.
-#[cfg(feature = "threads")]
-fn wait_timeout<'a, T>(
-    cv: &Condvar,
-    guard: MutexGuard<'a, T>,
-    timeout: Duration,
-) -> (MutexGuard<'a, T>, bool) {
-    let (guard, result) = cv
-        .wait_timeout(guard, timeout)
-        .unwrap_or_else(PoisonError::into_inner);
-    (guard, result.timed_out())
 }
 
 #[cfg(all(test, feature = "threads"))]

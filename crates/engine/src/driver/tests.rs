@@ -238,9 +238,21 @@ impl rt::Runtime for Counting {
         self.0.spawn(task);
     }
 
-    fn spawn_blocking(&self, work: Box<dyn FnOnce() + Send>) {
+    fn spawn_blocking(
+        &self,
+        class: rt::BlockingClass,
+        bytes: usize,
+        work: Box<dyn FnOnce() + Send>,
+    ) -> rt::BoxFuture<'static, io::Result<()>> {
         self.1.fetch_add(1, Ordering::SeqCst);
-        self.0.spawn_blocking(work);
+        self.0.spawn_blocking(class, bytes, work)
+    }
+
+    fn spawn_flush(
+        &self,
+        work: Box<dyn FnOnce() + Send>,
+    ) -> rt::BoxFuture<'static, io::Result<()>> {
+        self.0.spawn_flush(work)
     }
 
     fn reactor(&self) -> rt::Reactor {
@@ -2335,4 +2347,41 @@ fn validated_prefixes_reject_sequence_gaps_and_unfinished_work_by_type() {
         Err(protocol::ForkError::Unfinished)
     ));
     session.halt();
+}
+
+#[test]
+fn loading_cannot_wait_on_its_own_exhausted_pool() {
+    let home = std::env::temp_dir().join(format!("a-c09-loading-{}", SessionId::new()));
+    std::fs::create_dir_all(&home).unwrap();
+    let store = Arc::new(crate::store::Jsonl::open(home.join("sessions")).unwrap());
+    let mut fixture = Fixture::on(
+        store.clone(),
+        ext_fixtures::ECHO,
+        Registry::default(),
+        with_home(&Script::new(&[]), &home.join("config.toml")),
+    );
+    let mut config = rt::Config::for_cores(1);
+    config.storage.workers = 1;
+    let runtime = Arc::new(Counting(
+        rt::Threads::configured(config),
+        AtomicUsize::new(0),
+    ));
+    Arc::get_mut(&mut fixture.0).unwrap().rt = runtime.clone();
+    fixture.1 = runtime.clone();
+    let header = Fixture::header();
+    let mut log = store.create(&header).unwrap();
+    log.append(echo("persisted")).unwrap();
+    drop(log);
+    let shared = Arc::clone(&fixture.0);
+    let loaded = rt::unblock(&*runtime, move || {
+        Live::start(&header, &shared, Open::Load, Owner::None)
+    });
+    let live = rt::block_on(loaded).unwrap();
+    live.stop();
+    rt::block_on(live.ended.wait());
+    drop(live);
+    runtime.0.shutdown();
+    drop(fixture);
+    drop(store);
+    std::fs::remove_dir_all(home).unwrap();
 }

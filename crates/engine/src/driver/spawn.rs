@@ -142,7 +142,7 @@ pub(super) enum SpawnReply {
 }
 
 impl Actor {
-    pub(super) fn open_spawn(
+    pub(super) async fn open_spawn(
         &mut self,
         call: CallId,
         request: ext::Spawn,
@@ -169,7 +169,7 @@ impl Actor {
             }
             SpawnReply::Awaited(reply) => {
                 if let Some(link) = &previous {
-                    let Ok(entries) = self.live.frames.entries() else {
+                    let Ok(entries) = self.live.entries().await else {
                         reply.send(
                             Json::encode(&Result::<Outcome, _>::Err(SpawnRefusal::Unavailable(
                                 "unreadable parent log".into(),
@@ -178,14 +178,8 @@ impl Actor {
                         );
                         return None;
                     };
-                    let entries: Vec<_> = entries
-                        .into_iter()
-                        .chain(
-                            self.unsynced
-                                .iter()
-                                .flat_map(|(entries, _)| entries.iter().cloned()),
-                        )
-                        .collect();
+                    let entries: Vec<_> =
+                        entries.into_iter().chain(self.pending_entries()).collect();
                     let watch = entries.iter().find_map(|e| match e.body {
                         Body::Watch { child } if child == link.child => Some(e.seq),
                         _ => None,
@@ -230,7 +224,7 @@ impl Actor {
             }
         }
 
-        let frozen = self.freeze_spawn(call, request, awaited);
+        let frozen = self.freeze_spawn(call, request, awaited).await;
         let input = frozen.request.prompt.clone();
         let intent = frozen.into_json().expect("spawn intent encodes");
         let child = SessionId::new();
@@ -291,7 +285,12 @@ impl Actor {
         }
     }
 
-    fn freeze_spawn(&self, call: CallId, mut request: ext::Spawn, awaited: bool) -> SpawnIntent {
+    async fn freeze_spawn(
+        &mut self,
+        call: CallId,
+        mut request: ext::Spawn,
+        awaited: bool,
+    ) -> SpawnIntent {
         let allowance = lock(&self.live.session.spawn)
             .as_ref()
             .map_or(DepthBudget::new(u16::MAX), |i| i.request.depth);
@@ -354,18 +353,14 @@ impl Actor {
                     "prefix is not committed in the owning conversation".into(),
                 ));
             } else {
-                let entries = self.live.frames.entries();
+                let entries = self.live.entries().await;
                 if let Err(error) = &entries {
                     refusal = Some(SpawnRefusal::Unavailable(error.to_string()));
                 }
                 if let Ok(entries) = entries {
                     let entries: Vec<_> = entries
                         .into_iter()
-                        .chain(
-                            self.unsynced
-                                .iter()
-                                .flat_map(|(entries, _)| entries.iter().cloned()),
-                        )
+                        .chain(self.pending_entries())
                         .filter(|e| e.seq <= seq)
                         .collect();
                     image = crate::transcript::context_image(&entries);

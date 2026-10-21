@@ -339,7 +339,15 @@ impl Daemon {
     /// Reads only the session catalog, opening no log. Sessions it marks
     /// busy were working when the last daemon stopped, so they load at
     /// once, together, to recover.
+    #[cfg(test)]
     fn load(home: &Home, config: &Config) -> io::Result<Owner> {
+        let runtime = Arc::new(rt::Threads::default());
+        let mut owner = Self::load_on(home, config, &runtime)?;
+        owner.1 = Some(runtime);
+        Ok(owner)
+    }
+
+    fn load_on(home: &Home, config: &Config, runtime: &Arc<rt::Threads>) -> io::Result<Owner> {
         let store = Arc::new(Jsonl::open(home.sessions_dir())?);
         let catalog = Catalog::open(home.catalog_file(), &*store)?;
         let records = catalog.records();
@@ -350,7 +358,7 @@ impl Daemon {
                 Slot::new(record.header, Residency::Hibernated { last })
             })
             .collect();
-        let rt: rt::Rt = Arc::new(rt::Threads::default());
+        let rt: rt::Rt = runtime.clone();
         let models = model::Models {
             settings: config::Settings::new(home.config_file(), config.agent.clone()),
             http: Arc::new(llm::Ureq::new(Arc::clone(&rt), llm::Redirects::Follow)),
@@ -405,7 +413,7 @@ impl Daemon {
                 }
             }
         });
-        Ok(Owner(daemon))
+        Ok(Owner(daemon, None))
     }
 
     fn slots(&self) -> Vec<Arc<Slot>> {
@@ -552,13 +560,19 @@ impl Daemon {
         if let Target::Id(id) = target
             && self.slot(*id).is_none()
         {
-            self.pulse
-                .until(|| {
-                    self.slot(*id).is_some()
-                        || !self.loaded().iter().any(|live| live.pending_child(*id))
-                        || !*lock(&self.admission)
+            let id = *id;
+            let mut seen = self.pulse.count();
+            loop {
+                let loaded = self.loaded();
+                let pending = rt::unblock(&*self.shared.rt, move || {
+                    loaded.iter().any(|live| live.pending_child(id))
                 })
                 .await;
+                if self.slot(id).is_some() || !pending || !*lock(&self.admission) {
+                    break;
+                }
+                self.pulse.changed(&mut seen).await;
+            }
         }
         let slot = self.find(target, workspace)?;
         Ok(self.live(&slot).await?.open())
@@ -1043,7 +1057,7 @@ const KILL_GRACE: Duration = Duration::from_secs(3);
 /// waits for their actors, so no writer outlives it. Every other holder
 /// (the supervisor, connections, sessions) has a plain `Arc`. Dropped only
 /// where blocking is fine: [`serve`]'s thread, or a test's.
-struct Owner(Arc<Daemon>);
+struct Owner(Arc<Daemon>, Option<Arc<rt::Threads>>);
 
 impl Deref for Owner {
     type Target = Arc<Daemon>;
@@ -1056,6 +1070,9 @@ impl Deref for Owner {
 impl Drop for Owner {
     fn drop(&mut self) {
         rt::block_on(self.0.shutdown());
+        if let Some(runtime) = &self.1 {
+            runtime.shutdown();
+        }
     }
 }
 
@@ -1121,15 +1138,17 @@ pub fn serve(
     build: &str,
     start: Start,
 ) -> io::Result<()> {
-    let result = run(listener, home, config, build, start);
+    let runtime = Arc::new(rt::Threads::default());
+    let result = run(listener, home, config, build, start, &runtime);
     if let Err(error) = &result {
         fact(Fact::Fault {
             session: None,
             operation: Operation::Startup,
             kind: Fault(error.kind()),
         });
-        rt::block_on(ext_logging::flush(&rt::Threads::new(1)));
     }
+    rt::block_on(ext_logging::flush(&*runtime));
+    runtime.shutdown();
     result
 }
 
@@ -1139,6 +1158,7 @@ fn run(
     config: &Config,
     build: &str,
     start: Start,
+    runtime: &Arc<rt::Threads>,
 ) -> io::Result<()> {
     let origin = if start.logs || start.lock.is_some() {
         ext_logging::Origin::Client
@@ -1167,6 +1187,8 @@ fn run(
             return Err(io::Error::other(why));
         }
     };
+    #[cfg(not(test))]
+    ext_logging::install(&(runtime.clone() as rt::Rt), home.daemon_log());
     if start.logs {
         sys::daemon_ready()?;
     }
@@ -1184,7 +1206,7 @@ fn run(
         sys::Signal::Interrupt,
         sys::Signal::Hangup,
     ])?;
-    let daemon = Daemon::load(home, &config)?;
+    let daemon = Daemon::load_on(home, &config, runtime)?;
     let signals = rt::Async::for_reading(&daemon.shared.rt.reactor(), signals)?;
     let signalled = async {
         let signal = signals
@@ -1265,11 +1287,6 @@ fn claim(
         }
         file
     };
-    #[cfg(not(test))]
-    ext_logging::install(
-        &(Arc::new(rt::Threads::new(1)) as rt::Rt),
-        home.daemon_log(),
-    );
     ext_logging::replay_witness(home);
     if reset {
         sys::crash::reset(home)?;

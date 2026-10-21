@@ -100,14 +100,23 @@ impl Http for Ureq {
         let agent = self.agent.clone();
         let abort = Arc::new(Abort::default());
         let guard = Guard(Arc::clone(&abort));
-        self.rt.spawn_blocking(Box::new(move || {
-            CURRENT.set(Some(Arc::clone(&abort)));
-            run(&agent, request, &tx);
-            CURRENT.set(None);
-            // Done with the connection: it may serve the next request now.
-            abort.release();
-        }));
+        let bytes = request.body().len().saturating_add((AHEAD + 1) * CHUNK);
+        let admitted = self.rt.spawn_blocking(
+            rt::BlockingClass::Network,
+            bytes,
+            Box::new(move || {
+                if abort.line().abandoned {
+                    return;
+                }
+                CURRENT.set(Some(Arc::clone(&abort)));
+                run(&agent, request, &tx);
+                CURRENT.set(None);
+                // Done with the connection: it may serve the next request now.
+                abort.release();
+            }),
+        );
         Box::pin(async move {
+            admitted.await?;
             let head = rx.recv().await;
             let parts = match head {
                 Some(Ok(Piece::Head(parts))) => parts,

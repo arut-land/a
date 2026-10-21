@@ -292,7 +292,10 @@ fn an_interrupted_retry_keeps_only_its_own_text() {
     session.follow(&outbox, 0);
     let streaming = async {
         loop {
-            let frame = outbox.next().await.expect("the follower is open");
+            let frame = outbox
+                .next(&rt::Threads::new(1))
+                .await
+                .expect("the follower is open");
             if let Ok(Some(DaemonMsg::Delta { attempt: 1, .. })) =
                 protocol::read_frame::<DaemonMsg>(&mut frame.as_bytes())
             {

@@ -89,7 +89,10 @@ impl FlushRequest {
 
     pub fn dispatch(self, rt: &dyn Runtime) -> FlushEpoch {
         if let Some(leader) = self.leader {
-            rt.spawn_blocking(Box::new(move || leader.run()));
+            let admitted = rt.spawn_flush(Box::new(move || leader.run()));
+            rt.spawn(Box::pin(async move {
+                let _ = admitted.await;
+            }));
         }
         self.epoch
     }
@@ -101,15 +104,22 @@ pub fn unblock_flush<T: Send + 'static>(
     work: impl FnOnce() -> (T, Option<FlushLeader>) + Send + 'static,
 ) -> impl Future<Output = T> + Send + 'static {
     let (send, receive) = oneshot::channel();
-    rt.spawn_blocking(Box::new(move || {
-        let (ordered, leader) = work();
-        let leader = leader.map(FlushLeader::seal);
-        send.send(ordered);
-        if let Some(leader) = leader {
-            leader.run();
-        }
-    }));
-    async move { receive.await.expect("ordered write panicked") }
+    let admitted = rt.spawn_blocking(
+        crate::BlockingClass::Storage,
+        crate::STORAGE_BYTES,
+        Box::new(move || {
+            let (ordered, leader) = work();
+            let leader = leader.map(FlushLeader::seal);
+            send.send(ordered);
+            if let Some(leader) = leader {
+                leader.run();
+            }
+        }),
+    );
+    async move {
+        admitted.await.expect("write admission failed");
+        receive.await.expect("ordered write panicked")
+    }
 }
 
 impl Flusher {
@@ -192,14 +202,26 @@ mod tests {
     struct Manual(Mutex<Option<Box<dyn FnOnce() + Send>>>);
 
     impl Runtime for Manual {
-        fn spawn(&self, _: BoxFuture<'static, ()>) {
-            unreachable!()
+        fn spawn(&self, task: BoxFuture<'static, ()>) {
+            crate::block_on(task)
         }
-        fn spawn_blocking(&self, work: Box<dyn FnOnce() + Send>) {
+        fn spawn_blocking(
+            &self,
+            _: crate::BlockingClass,
+            _: usize,
+            work: Box<dyn FnOnce() + Send>,
+        ) -> BoxFuture<'static, io::Result<()>> {
             assert!(
                 lock(&self.0).replace(work).is_none(),
                 "only one flush worker"
             );
+            Box::pin(async { Ok(()) })
+        }
+        fn spawn_flush(
+            &self,
+            work: Box<dyn FnOnce() + Send>,
+        ) -> BoxFuture<'static, io::Result<()>> {
+            self.spawn_blocking(crate::BlockingClass::Storage, 0, work)
         }
         fn reactor(&self) -> Reactor {
             unreachable!()

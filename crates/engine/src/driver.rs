@@ -35,6 +35,7 @@ use protocol::{
     Activity, Author, Body, CallId, DaemonMsg, Entry, Environment, Frame, Json, Mode, Outcome,
     ReadOnly, Residency, SessionId, SessionSummary, ToolChoice,
 };
+use rt::BlockingClass::Cpu;
 use rt::{channel, oneshot, or};
 use serde::{Deserialize, Serialize};
 
@@ -71,12 +72,21 @@ pub struct Shared {
 
 impl Shared {
     fn source(&self, workspace: &Path) -> io::Result<Option<Arc<dyn ext::host::Generations>>> {
+        self.models.settings.refresh(workspace);
         self.registry
             .get()
             .service::<dyn ext::host::Sources>()
             .map(|source| {
                 let rt = Arc::clone(&self.rt);
-                source.open(workspace, Arc::new(move |work| rt.spawn_blocking(work)))
+                source.open(
+                    workspace,
+                    Arc::new(move |work| {
+                        let admitted = rt.spawn_blocking(Cpu, rt::STORAGE_BYTES, work);
+                        rt.spawn(Box::pin(async move {
+                            let _ = admitted.await;
+                        }));
+                    }),
+                )
             })
             .transpose()
             .map_err(io::Error::other)
@@ -477,6 +487,10 @@ impl Drop for Attachment {
 }
 
 impl Live {
+    async fn entries(&self) -> io::Result<Vec<Entry>> {
+        self.frames.read_entries(&*self.session.shared.rt).await
+    }
+
     /// Opens session `header`'s log, folds it into a kernel and starts the
     /// actor, which resumes it: the only way a session recovers. It blocks
     /// on the store, so it runs on a thread that may.
@@ -505,7 +519,9 @@ impl Live {
                 .writer
                 .sync()
                 .inspect_err(|e| store_fault(header.id, ext_logging::Operation::Reload, e))?;
-            rt::block_on(loaded.writer.flushed(&*shared.rt))
+            loaded
+                .writer
+                .flush_inline()
                 .inspect_err(|e| store_fault(header.id, ext_logging::Operation::Reload, e))?;
         }
         let Folding {
@@ -1048,54 +1064,58 @@ impl Actor {
         let bound = bind(&newest, &self.live.session);
         let binding = Arc::clone(&bound) as Arc<dyn Binding>;
         let frames = Arc::clone(&self.live.frames);
-        let pending: Vec<Entry> = self
-            .unsynced
-            .iter()
-            .flat_map(|(entries, _)| entries.iter().cloned())
-            .collect();
+        let pending: Vec<Entry> = self.pending_entries().collect();
         let registry = Arc::clone(&newest);
         let snapshot = self.fold_snapshot.clone();
         let boundary = self.core.ledger().seq();
         let live = self.live.session.state_view();
-        let prepared = rt::unblock(&*Arc::clone(&shared.rt), move || {
-            let start = Instant::now();
-            let ((), folding) = Folding::rebuild(&binding, &registry, &shared, |restore, each| {
-                let after = snapshot
-                    .filter(|s| restore(s.clone()))
-                    .map_or(0, |s| s.covers);
-                let mut seen = after;
-                for batch in frames
-                    .batches_after(after)
-                    .chain(std::iter::once(Ok(pending)))
-                {
-                    for entry in batch? {
-                        if seen - after >= 100_000
-                            || start.elapsed() > std::time::Duration::from_secs(1)
+        let prepared = rt::unblock_with(
+            &*Arc::clone(&shared.rt),
+            Cpu,
+            rt::STORAGE_BYTES,
+            move || {
+                let start = Instant::now();
+                let ((), folding) =
+                    Folding::rebuild(&binding, &registry, &shared, |restore, each| {
+                        let after = snapshot
+                            .filter(|s| restore(s.clone()))
+                            .map_or(0, |s| s.covers);
+                        let mut seen = after;
+                        for batch in frames
+                            .batches_after(after)
+                            .chain(std::iter::once(Ok(pending)))
                         {
+                            for entry in batch? {
+                                if seen - after >= 100_000
+                                    || start.elapsed() > std::time::Duration::from_secs(1)
+                                {
+                                    return Err(io::Error::other(
+                                        "registry state preparation budget exhausted",
+                                    ));
+                                }
+                                if entry.seq.get() != seen + 1 {
+                                    return Err(io::Error::other(
+                                        "registry log boundary is incomplete",
+                                    ));
+                                }
+                                seen = entry.seq.get();
+                                each(entry);
+                            }
+                        }
+                        if seen != boundary || start.elapsed() > std::time::Duration::from_secs(1) {
                             return Err(io::Error::other(
-                                "registry state preparation budget exhausted",
+                                "registry log boundary is incomplete or over budget",
                             ));
                         }
-                        if entry.seq.get() != seen + 1 {
-                            return Err(io::Error::other("registry log boundary is incomplete"));
-                        }
-                        seen = entry.seq.get();
-                        each(entry);
-                    }
-                }
-                if seen != boundary || start.elapsed() > std::time::Duration::from_secs(1) {
-                    return Err(io::Error::other(
-                        "registry log boundary is incomplete or over budget",
-                    ));
-                }
-                Ok(())
-            })?;
-            folding
-                .states
-                .validate(&lock(&live))
-                .map_err(io::Error::other)?;
-            Ok::<_, io::Error>(folding.states)
-        })
+                        Ok(())
+                    })?;
+                folding
+                    .states
+                    .validate(&lock(&live))
+                    .map_err(io::Error::other)?;
+                Ok::<_, io::Error>(folding.states)
+            },
+        )
         .await;
         match prepared {
             Ok(states) => {
@@ -1119,6 +1139,23 @@ impl Actor {
                 eprintln!("warning: {error}");
                 Ok(())
             }
+        }
+    }
+
+    fn pending_entries(&self) -> impl Iterator<Item = Entry> + '_ {
+        self.unsynced
+            .iter()
+            .flat_map(|(entries, _)| entries.iter().cloned())
+    }
+
+    async fn refresh_settings(&mut self) {
+        let shared = Arc::clone(&self.live.session.shared);
+        let workspace = self.live.workspace.clone();
+        if shared.models.settings.due(&workspace) {
+            rt::unblock(&*Arc::clone(&shared.rt), move || {
+                shared.models.settings.refresh(&workspace);
+            })
+            .await;
         }
     }
 
@@ -1158,11 +1195,11 @@ impl Actor {
                 }
                 burst.push(msg);
             }
-            let mut events = Vec::new();
+            self.refresh_settings().await;
+            let (mut events, mut mutations) = (Vec::new(), Vec::new());
             let dones: Vec<oneshot::Sender<()>> = Vec::new();
             #[cfg(test)]
             let mut dones = dones;
-            let mut mutations = Vec::new();
             let mut sync = false;
             for msg in burst {
                 // Answered once what came before it is carried out.
@@ -1177,10 +1214,10 @@ impl Actor {
                 }
                 // Kept as it is, its catalog listing and all.
                 if let Some(why) = self.writer.as_ref().and_then(Writer::read_only) {
-                    self.refuse(msg, why);
+                    self.refuse(msg, why).await;
                     continue;
                 }
-                if let Some((event, done)) = self.take(msg) {
+                if let Some((event, done)) = self.take(msg).await {
                     mutations.push(done);
                     events.push(event);
                 }
@@ -1261,7 +1298,10 @@ impl Actor {
 
     /// What `msg` asks the kernel, and whom to tell once it is carried
     /// out; `None` for what the actor answers itself.
-    fn take(&mut self, msg: Msg) -> Option<(Event, Option<oneshot::Sender<ext::MutationResult>>)> {
+    async fn take(
+        &mut self,
+        msg: Msg,
+    ) -> Option<(Event, Option<oneshot::Sender<ext::MutationResult>>)> {
         let msg = self.current(msg)?;
         let event = match msg {
             Msg::Fenced { .. } | Msg::Flushed { .. } => unreachable!("mailbox admission"),
@@ -1279,7 +1319,7 @@ impl Actor {
                     },
                     Admitted::Attach(client, since, done),
                 ));
-                self.admit();
+                self.admit().await;
                 return None;
             }
             Msg::Env(env) => {
@@ -1287,7 +1327,7 @@ impl Actor {
                 *lock(&self.live.session.env) = Some(env);
                 Event::Environment(logged)
             }
-            Msg::Context { origin, request } => return self.context(&origin, request),
+            Msg::Context { origin, request } => return self.context(&origin, request).await,
             Msg::Enqueue { envelope, reply } => {
                 let ticket = self.delivery_ticket(reply);
                 Event::Enqueue { envelope, ticket }
@@ -1346,16 +1386,16 @@ impl Actor {
         Some((event, None))
     }
 
-    fn context(
+    async fn context(
         &mut self,
         origin: &ContextOrigin,
         request: ContextRequest,
     ) -> Option<(Event, Option<oneshot::Sender<ext::MutationResult>>)> {
-        let session = &self.live.session;
-        if !origin.current(session) {
+        let session = Arc::clone(&self.live.session);
+        if !origin.current(&session) {
             let background =
                 matches!(&request, ContextRequest::Side { side, .. } if side.is_background());
-            let succeeded = background && self.background_owner_succeeded(origin);
+            let succeeded = background && self.background_owner_succeeded(origin).await;
             if !succeeded {
                 if let ContextRequest::Note {
                     done: Some(done), ..
@@ -1402,13 +1442,15 @@ impl Actor {
             }
             ContextRequest::Child { request, reply } => self
                 .open_spawn(call, request, reply)
+                .await
                 .map(|event| (event, None)),
             ContextRequest::Side { model, side, reply } => self
                 .open_side(origin.clone(), model, side, reply)
+                .await
                 .map(|event| (event, None)),
             ContextRequest::Own { pgid, ended } => {
                 lock(&session.jobs).push(pgid);
-                let session = Arc::clone(session);
+                let session = Arc::clone(&session);
                 self.live.session.shared.rt.spawn(Box::pin(async move {
                     ended.await;
                     lock(&session.jobs).retain(|&p| p != pgid);
@@ -1424,12 +1466,12 @@ impl Actor {
 
     /// What `msg` gets in a session whose log is kept as it is: clients
     /// are shown it, and what would be logged is refused or dropped.
-    fn refuse(&mut self, msg: Msg, why: ReadOnly) {
+    async fn refuse(&mut self, msg: Msg, why: ReadOnly) {
         match msg {
             Msg::Request { reply, .. } => reply.send(Err(why.to_string())),
             #[cfg(test)]
-            Msg::Barrier(_) => drop(self.take(msg)),
-            Msg::Attach(..) | Msg::Stop => drop(self.take(msg)),
+            Msg::Barrier(_) => drop(self.take(msg).await),
+            Msg::Attach(..) | Msg::Stop => drop(self.take(msg).await),
             _ => {}
         }
     }
@@ -1590,8 +1632,8 @@ impl Actor {
                 Effect::Require(required) => admission = required,
                 effect => {
                     match &effect {
-                        Effect::Cancel { call } => self.cancel_pending(*call, &mut after),
-                        Effect::MarkBusy(true) => self.effect(effect),
+                        Effect::Cancel { call } => self.cancel_pending(*call, &mut after).await,
+                        Effect::MarkBusy(true) => self.effect(effect).await,
                         _ => after.push((admission, effect)),
                     }
                     admission = Admission {
@@ -1647,11 +1689,11 @@ impl Actor {
                 .into_iter()
                 .map(|(a, effect)| (a, Admitted::Effect(effect))),
         );
-        self.admit();
+        self.admit().await;
         Ok(())
     }
 
-    fn cancel_pending(&mut self, call: CallId, after: &mut Vec<(Admission, Effect)>) {
+    async fn cancel_pending(&mut self, call: CallId, after: &mut Vec<(Admission, Effect)>) {
         let mut cancelled = None;
         let mut retain = |effect: &Effect| {
             if effect.starts_call() != Some(call) {
@@ -1677,7 +1719,7 @@ impl Actor {
             self.inflight.get(&call),
             Some(InFlight::Tool(_) | InFlight::Model)
         );
-        self.effect(Effect::Cancel { call });
+        self.effect(Effect::Cancel { call }).await;
         if !running && let Some(tool) = cancelled {
             let event = if tool {
                 Event::ToolDone {
@@ -1707,7 +1749,7 @@ impl Actor {
             .max(self.durable_seq)
     }
 
-    fn admit(&mut self) {
+    async fn admit(&mut self) {
         let mut waiting = Vec::new();
         for (admission, work) in std::mem::take(&mut self.admissions) {
             let watermark = match admission.requirement {
@@ -1719,9 +1761,9 @@ impl Actor {
                 continue;
             }
             match work {
-                Admitted::Effect(effect) => self.effect(effect),
+                Admitted::Effect(effect) => self.effect(effect).await,
                 Admitted::Attach(client, since, done) => {
-                    self.attach(&client, since);
+                    self.attach(&client, since).await;
                     done.send(());
                 }
                 Admitted::Reaction(reaction) => {
@@ -1739,19 +1781,22 @@ impl Actor {
         self.admissions = waiting;
     }
 
-    fn durable(&mut self, through: u64) {
+    async fn durable(&mut self, through: u64) {
         self.durable_seq = self.durable_seq.max(through);
         self.show_synced();
         self.publish();
-        self.admit();
+        self.admit().await;
     }
 
-    fn track(&mut self, through: u64, mut epoch: rt::FlushEpoch) -> io::Result<()> {
-        let mut cx = std::task::Context::from_waker(std::task::Waker::noop());
-        if let Poll::Ready(result) = std::pin::Pin::new(&mut epoch).poll(&mut cx) {
+    async fn track(&mut self, through: u64, mut epoch: rt::FlushEpoch) -> io::Result<()> {
+        let polled = {
+            let mut cx = std::task::Context::from_waker(std::task::Waker::noop());
+            std::pin::Pin::new(&mut epoch).poll(&mut cx)
+        };
+        if let Poll::Ready(result) = polled {
             result.inspect_err(|e| store_fault(self.live.id, ext_logging::Operation::Commit, e))?;
             if self.flushes.is_empty() {
-                self.durable(through);
+                self.durable(through).await;
             } else {
                 let ended = Flag::default();
                 ended.set();
@@ -1801,7 +1846,7 @@ impl Actor {
         {
             let pending = self.flushes.remove(0);
             match pending.result.expect("completed epoch") {
-                Ok(()) => self.durable(pending.through),
+                Ok(()) => self.durable(pending.through).await,
                 Err(error) => {
                     store_fault(self.live.id, ext_logging::Operation::Commit, &error);
                     self.failed(format!("flushing: {error}"), Vec::new()).await;
@@ -1909,7 +1954,12 @@ impl Actor {
         self.replied = None;
         self.snapshot = None;
         self.view = None;
-        let entries = match recovered.entries_after(self.live.frames.seq()) {
+        let after = self.live.frames.seq();
+        let entries = match rt::unblock(&*self.live.session.shared.rt, move || {
+            recovered.entries_after(after)
+        })
+        .await
+        {
             Ok(entries) => entries,
             Err(error) => {
                 eprintln!("session {}: recovery log: {error}", self.live.id.short());
@@ -2047,9 +2097,9 @@ impl Actor {
         self.unsynced.push((entries.clone(), lines));
         self.folded(&entries);
         if let Some(epoch) = epoch {
-            self.track(self.ordered_seq, epoch)?;
+            self.track(self.ordered_seq, epoch).await?;
         } else if durable_on_order || flush {
-            self.durable(self.ordered_seq);
+            self.durable(self.ordered_seq).await;
         }
         if !self.unsynced.is_empty() {
             self.arm_sync();
@@ -2169,9 +2219,9 @@ impl Actor {
         self.writer = Some(writer);
         result.inspect_err(|e| store_fault(self.live.id, ext_logging::Operation::Commit, e))?;
         if let Some(epoch) = epoch {
-            self.track(self.ordered_seq, epoch)?;
+            self.track(self.ordered_seq, epoch).await?;
         } else {
-            self.durable(self.ordered_seq);
+            self.durable(self.ordered_seq).await;
         }
         Ok(())
     }
@@ -2338,91 +2388,98 @@ impl Actor {
             .then(|| (seq, self.core.ledger().activity()))
     }
 
-    fn effect(&mut self, effect: Effect) {
-        let shared = Arc::clone(&self.live.session.shared);
-        // A stopping session starts nothing: what it would have started is
-        // in the log, for its next load.
-        if self.phase == Phase::Draining && effect.starts() {
-            return;
-        }
-        match effect {
-            Effect::Append(_) | Effect::Commit { .. } | Effect::Require(_) => {
-                unreachable!("appends commit in runs")
+    fn effect(&mut self, effect: Effect) -> BoxFuture<'_, ()> {
+        Box::pin(async move {
+            let shared = Arc::clone(&self.live.session.shared);
+            // A stopping session starts nothing: what it would have started is
+            // in the log, for its next load.
+            if self.phase == Phase::Draining && effect.starts() {
+                return;
             }
-            Effect::Delivery { ticket, result } => {
-                if let Some(reply) = self.replies.deliveries.remove(&ticket) {
-                    reply.send(result);
+            match effect {
+                Effect::Append(_) | Effect::Commit { .. } | Effect::Require(_) => {
+                    unreachable!("appends commit in runs")
                 }
-            }
-            Effect::Deliver { envelope, ticket } => self.deliver(envelope, ticket),
-            Effect::Reply { ticket, result } => self.reply(ticket, result),
-            Effect::Side { ticket, side } => self.admit_side(ticket, side),
-            Effect::Prepare {
-                call,
-                attempt,
-                choice,
-            } => self.prepare(call, attempt, choice),
-            Effect::Send { call } => self.send(call),
-            Effect::RunTool { call, tool, input } => self.run_tool(call, tool, input, Child::None),
-            Effect::Resume {
-                call,
-                tool,
-                input,
-                value,
-            } => self.resume_tool(call, tool, input, value),
-            Effect::Await { call, answer } => {
-                let gated = self.cancellable(call, answer.0);
-                self.later(gated, move |gated| Event::Gated { call, gated });
-            }
-            Effect::Recover { call, answer } => {
-                let recovered = self.cancellable(call, answer.0);
-                self.later(recovered, move |recovered| Event::Recovered {
-                    call,
-                    recovered,
-                });
-            }
-            Effect::Sleep { call, after } => {
-                let slept = self.cancellable(call, shared.rt.sleep(after));
-                self.later(slept, move |()| Event::Woke { call });
-            }
-            Effect::Cancel { call } => {
-                self.inflight.remove(&call);
-                self.live.session.cancelled(call);
-                self.sides.0.retain(|(_, side)| side.origin.call != call);
-                for (side, open) in self.core.ledger().open_calls() {
-                    if open.call == (protocol::ledger::Call::Side { of: call }) {
-                        self.live.session.cancelled(side);
+                Effect::Delivery { ticket, result } => {
+                    if let Some(reply) = self.replies.deliveries.remove(&ticket) {
+                        reply.send(result);
                     }
                 }
-            }
-            Effect::StartChild { link, child, input } => self.start_child(link, child, input),
-            Effect::Interrupt { child } => {
-                if let Some((_, cancel)) = self.child_cancels.0.iter().find(|(id, _)| *id == child)
-                {
-                    cancel.set();
+                Effect::Deliver { envelope, ticket } => self.deliver(envelope, ticket),
+                Effect::Reply { ticket, result } => self.reply(ticket, result),
+                Effect::Side { ticket, side } => self.admit_side(ticket, side).await,
+                Effect::Prepare {
+                    call,
+                    attempt,
+                    choice,
+                } => self.prepare(call, attempt, choice).await,
+                Effect::Send { call } => self.send(call),
+                Effect::RunTool { call, tool, input } => {
+                    self.run_tool(call, tool, input, Child::None);
                 }
-                if let Some(daemon) = shared.daemon.upgrade() {
-                    daemon.interrupt(child);
+                Effect::Resume {
+                    call,
+                    tool,
+                    input,
+                    value,
+                } => self.resume_tool(call, tool, input, value),
+                Effect::Await { call, answer } => {
+                    let gated = self.cancellable(call, answer.0);
+                    self.later(gated, move |gated| Event::Gated { call, gated });
+                }
+                Effect::Recover { call, answer } => {
+                    let recovered = self.cancellable(call, answer.0);
+                    self.later(recovered, move |recovered| Event::Recovered {
+                        call,
+                        recovered,
+                    });
+                }
+                Effect::Sleep { call, after } => {
+                    let slept = self.cancellable(call, shared.rt.sleep(after));
+                    self.later(slept, move |()| Event::Woke { call });
+                }
+                Effect::Cancel { call } => {
+                    self.inflight.remove(&call);
+                    self.live.session.cancelled(call);
+                    self.sides.0.retain(|(_, side)| side.origin.call != call);
+                    for (side, open) in self.core.ledger().open_calls() {
+                        if open.call == (protocol::ledger::Call::Side { of: call }) {
+                            self.live.session.cancelled(side);
+                        }
+                    }
+                }
+                Effect::StartChild { link, child, input } => self.start_child(link, child, input),
+                Effect::Interrupt { child } => {
+                    if let Some((_, cancel)) =
+                        self.child_cancels.0.iter().find(|(id, _)| *id == child)
+                    {
+                        cancel.set();
+                    }
+                    if let Some(daemon) = shared.daemon.upgrade() {
+                        daemon.interrupt(child);
+                    }
+                }
+                Effect::Report { outcome } => {
+                    if let (Some(parent), Some(daemon)) =
+                        (self.live.parent, shared.daemon.upgrade())
+                    {
+                        let child = self.live.id;
+                        shared.rt.spawn(Box::pin(async move {
+                            daemon.report(parent.session, child, outcome).await;
+                        }));
+                    }
+                }
+                Effect::Kill { pgid } => {
+                    let _ = sys::Group(pgid).kill();
+                }
+                Effect::MarkBusy(busy) => {
+                    self.live.busy.store(busy, Ordering::SeqCst);
+                    let how = if busy { "busy" } else { "settled" };
+                    crate::session_event(how, self.live.id, String::new);
+                    self.live.touch();
                 }
             }
-            Effect::Report { outcome } => {
-                if let (Some(parent), Some(daemon)) = (self.live.parent, shared.daemon.upgrade()) {
-                    let child = self.live.id;
-                    shared.rt.spawn(Box::pin(async move {
-                        daemon.report(parent.session, child, outcome).await;
-                    }));
-                }
-            }
-            Effect::Kill { pgid } => {
-                let _ = sys::Group(pgid).kill();
-            }
-            Effect::MarkBusy(busy) => {
-                self.live.busy.store(busy, Ordering::SeqCst);
-                let how = if busy { "busy" } else { "settled" };
-                crate::session_event(how, self.live.id, String::new);
-                self.live.touch();
-            }
-        }
+        })
     }
 
     fn resume_tool(&mut self, call: CallId, tool: String, input: Json, value: Json) {
@@ -2594,13 +2651,15 @@ impl Actor {
     /// `step` point leaves it. What the point decided goes to the kernel
     /// to log; the request waits here until the kernel has it sent, unless
     /// a handler answered it, in which case the answer is the reply.
-    fn prepare(&mut self, call: CallId, attempt: u16, choice: ToolChoice) {
-        let (decisions, answered) = match self
-            .live
-            .session
-            .model(&self.registry)
-            .and_then(|model| self.request(call, &model).map(|request| (model, request)))
-        {
+    async fn prepare(&mut self, call: CallId, attempt: u16, choice: ToolChoice) {
+        let prepared = match self.live.session.model(&self.registry) {
+            Ok(model) => self
+                .request(call, &model)
+                .await
+                .map(|request| (model, request)),
+            Err(error) => Err(error),
+        };
+        let (decisions, answered) = match prepared {
             Ok((model, mut request)) => {
                 request.tool_choice = match choice {
                     ToolChoice::Auto => llm::ToolChoice::Auto,
@@ -2672,8 +2731,8 @@ impl Actor {
 
     /// The request for model call `call`: the system prompt, the
     /// transcript before it, and the tools.
-    fn request(&mut self, call: CallId, model: &Model) -> Result<llm::Request, String> {
-        let messages = self.conversation(call).map_err(|e| e.to_string())?;
+    async fn request(&mut self, call: CallId, model: &Model) -> Result<llm::Request, String> {
+        let messages = self.conversation(call).await.map_err(|e| e.to_string())?;
         let mut request = model.request(messages, self.registry.specs().clone());
         if let Some(spawn) = lock(&self.live.session.spawn).as_ref() {
             request.generation.max_output_tokens = Some(spawn.request.budget.max_tokens);
@@ -2682,40 +2741,39 @@ impl Actor {
     }
 
     /// The conversation the model sees before entry `call`.
-    fn conversation(&mut self, call: CallId) -> io::Result<llm::Messages> {
-        let system = self.registry.system_prompt();
-        let frames = &self.live.frames;
-        let registry = &self.registry;
-        if self.transcript.is_none() {
-            self.transcript = Some(Transcript::of(
-                frames.entries()?.into_iter().chain(
-                    self.unsynced
-                        .iter()
-                        .flat_map(|(entries, _)| entries.iter().cloned()),
-                ),
-                Arc::clone(registry),
-                system,
-            ));
+    async fn conversation(&mut self, call: CallId) -> io::Result<llm::Messages> {
+        if let Some(messages) = self.transcript.as_ref().and_then(|t| t.before(call.get())) {
+            return Ok(messages.clone());
         }
-        let transcript = self.transcript.as_ref().expect("transcript initialized");
-        if let Some(messages) = transcript.before(call.get()) {
-            Ok(messages.clone())
-        } else {
-            // Recovery keeps the call's conversation boundary, including later
-            // transcript edits and context republished while preparing it.
-            let before = frames
-                .entries()?
-                .into_iter()
-                .chain(
-                    self.unsynced
-                        .iter()
-                        .flat_map(|(entries, _)| entries.iter().cloned()),
-                )
-                .filter(|e| {
-                    e.seq < call.0 || matches!(e.body, Body::Context { .. } | Body::Edit { .. })
+        let frames = Arc::clone(&self.live.frames);
+        let registry = Arc::clone(&self.registry);
+        let pending: Vec<_> = self.pending_entries().collect();
+        let (transcript, messages) = rt::unblock_with(
+            &*self.live.session.shared.rt,
+            Cpu,
+            rt::STORAGE_BYTES,
+            move || {
+                let entries: Vec<_> = frames.entries()?.into_iter().chain(pending).collect();
+                let system = registry.system_prompt();
+                let transcript =
+                    Transcript::of(entries.iter().cloned(), Arc::clone(&registry), system);
+                let messages = transcript.before(call.get()).cloned().unwrap_or_else(|| {
+                    Transcript::of(
+                        entries.into_iter().filter(|e| {
+                            e.seq < call.0
+                                || matches!(e.body, Body::Context { .. } | Body::Edit { .. })
+                        }),
+                        Arc::clone(&registry),
+                        system,
+                    )
+                    .into_messages()
                 });
-            Ok(Transcript::of(before, Arc::clone(registry), system).into_messages())
-        }
+                io::Result::Ok((transcript, messages))
+            },
+        )
+        .await?;
+        self.transcript = Some(transcript);
+        Ok(messages)
     }
 
     /// Runs tool call `call`, the model's or a user's command, on its
@@ -2762,10 +2820,10 @@ impl Actor {
     /// Sends `client`, which has the entries up to `since`, the attach,
     /// what it missed (or a snapshot, far behind) and its end; then
     /// everything live.
-    fn attach(&mut self, client: &Outbox, since: u64) {
+    async fn attach(&mut self, client: &Outbox, since: u64) {
         let seq = self.live.frames.seq();
         let far = seq.saturating_sub(since) > SNAPSHOT_GAP;
-        let snapshot = far.then(|| self.snapshot(seq)).flatten();
+        let snapshot = if far { self.snapshot(seq).await } else { None };
         let cursor = if snapshot.is_some() {
             seq
         } else {
@@ -2797,22 +2855,33 @@ impl Actor {
 
     /// The snapshot at entry `seq`, the last committed, made once for every
     /// client attaching then; `None` if too large for a frame.
-    fn snapshot(&mut self, seq: u64) -> Option<Frame> {
+    async fn snapshot(&mut self, seq: u64) -> Option<Frame> {
         if let Some((at, frame)) = &self.snapshot
             && *at == seq
         {
             return frame.clone();
         }
-        let live = &self.live;
-        if self.view.is_none() {
-            self.view = Some(SessionView::from_log(
-                live.id,
-                live.workspace.clone(),
-                live.frames.entries().ok()?,
-            ));
-        }
-        let view = self.view.as_ref().expect("view initialized");
-        let frame = Frame::new(&DaemonMsg::Snapshot(Box::new(view.clone()))).ok();
+        let live = Arc::clone(&self.live);
+        let view = self.view.take();
+        let (view, frame) = rt::unblock_with(
+            &*self.live.session.shared.rt,
+            Cpu,
+            rt::STORAGE_BYTES,
+            move || {
+                let view = match view {
+                    Some(view) => view,
+                    None => SessionView::from_log(
+                        live.id,
+                        live.workspace.clone(),
+                        live.frames.entries().ok()?,
+                    ),
+                };
+                let frame = Frame::new(&DaemonMsg::Snapshot(Box::new(view.clone()))).ok();
+                Some((view, frame))
+            },
+        )
+        .await?;
+        self.view = Some(view);
         self.snapshot = Some((seq, frame.clone()));
         frame
     }

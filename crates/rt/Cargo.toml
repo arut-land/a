@@ -9,23 +9,19 @@ default = ["threads"]
 # The built-in runtime: async-executor's workers and a blocking pool of
 # our own (the `blocking` crate's polls every 500 ms while idle).
 threads = ["dep:async-executor"]
-smol = ["dep:smol"]
 watch = ["dep:notify"]
-tokio = ["dep:tokio"]
 
 [dependencies]
 # Already linked by async-io; producer wake never waits on registration.
 atomic-waker = "1"
 notify = { version = "8", optional = true }
 async-executor = { version = "1", optional = true }
-# The reactor and timers of every runtime but tokio's: one thread waiting
+# The reactor and timers: one thread waiting
 # in kqueue, epoll or IOCP (through polling) until something is due.
 async-io = "2"
 futures-core = { version = "0.3", default-features = false, features = ["std"] }
 # `future::or`, the one racer: async-io links it already.
 futures-lite = { version = "2", default-features = false }
-smol = { version = "2", optional = true }
-tokio = { version = "1", default-features = false, features = ["rt", "time", "net"], optional = true }
 
 [target.'cfg(unix)'.dependencies]
 rustix.workspace = true

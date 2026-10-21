@@ -47,6 +47,8 @@ pub const FLOOR: Duration = Duration::from_secs(2);
 pub struct Watched {
     path: PathBuf,
     read: Mutex<Option<Read>>,
+    snapshot: Mutex<Loaded>,
+    checked: Mutex<Option<Instant>>,
     /// How long after a look the file is trusted not to have changed.
     floor: Duration,
 }
@@ -63,6 +65,8 @@ impl Watched {
         Self {
             path,
             read: Mutex::new(None),
+            snapshot: Mutex::new(Arc::new(Ok(File::default()))),
+            checked: Mutex::new(None),
             floor,
         }
     }
@@ -71,8 +75,17 @@ impl Watched {
         &self.path
     }
 
-    /// The file as it is now, or why it could not be read.
+    /// Readers only clone the last immutable snapshot; disk work belongs
+    /// to the caller's storage admission, never a model lookup.
     pub fn get(&self) -> Loaded {
+        Arc::clone(&lock(&self.snapshot))
+    }
+
+    fn due(&self) -> bool {
+        lock(&self.checked).is_none_or(|at| at.elapsed() >= self.floor)
+    }
+
+    pub fn refresh(&self) -> Loaded {
         let mut read = lock(&self.read);
         if let Some(last) = &*read
             && last.looked.elapsed() < self.floor
@@ -81,6 +94,7 @@ impl Watched {
         }
         let now = stamp(&self.path);
         let looked = Instant::now();
+        *lock(&self.checked) = Some(looked);
         match read.as_mut() {
             Some(last) if last.stamp == now => {
                 last.looked = looked;
@@ -88,6 +102,7 @@ impl Watched {
             }
             _ => {
                 let file = Arc::new(load(&self.path));
+                *lock(&self.snapshot) = Arc::clone(&file);
                 *read = Some(Read {
                     stamp: now,
                     file: Arc::clone(&file),
@@ -120,6 +135,8 @@ impl Watched {
         }
         file.write(&self.path).map_err(|e| e.to_string())?;
         let file = Arc::new(Ok(file));
+        *lock(&self.checked) = Some(Instant::now());
+        *lock(&self.snapshot) = Arc::clone(&file);
         *read = Some(Read {
             stamp: stamp(&self.path),
             file: Arc::clone(&file),
@@ -185,15 +202,30 @@ impl Settings {
     /// The workspace's file: parsed once per change for every session in
     /// the workspace, as the home file is.
     fn workspace(&self, workspace: &Path) -> Loaded {
+        lock(&self.workspaces)
+            .get(workspace)
+            .map_or_else(|| Arc::new(Ok(File::default())), |watched| watched.get())
+    }
+
+    pub fn due(&self, workspace: &Path) -> bool {
+        self.home.due()
+            || lock(&self.workspaces)
+                .get(workspace)
+                .is_none_or(|file| file.due())
+    }
+
+    /// Called on demand on a storage worker, once before session loading
+    /// and before processing fresh mailbox input. No periodic polling.
+    pub fn refresh(&self, workspace: &Path) {
+        self.home.refresh();
         let watched = Arc::clone(
             lock(&self.workspaces)
                 .entry(workspace.to_path_buf())
                 .or_insert_with(|| {
-                    let path = workspace.join(".a").join("config.toml");
-                    Arc::new(Watched::new(path, self.floor))
+                    Arc::new(Watched::new(workspace.join(".a/config.toml"), self.floor))
                 }),
         );
-        watched.get()
+        watched.refresh();
     }
 
     /// The name of the agent a session in `workspace` runs, if configured:
