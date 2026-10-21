@@ -331,6 +331,43 @@ impl<'de: 'a, 'a> Deserialize<'de> for Function<'a> {
 }
 
 impl Call<'_> {
+    fn growth(&self, w: &mut Writer<Option<OpenCall>>) -> Result<usize, Error> {
+        fn json(value: &Json<'_>, w: &mut Writer<Option<OpenCall>>) -> Result<usize, Error> {
+            Ok(match value {
+                Json::Absent => 4,
+                Json::Str(text) => w.measure_str(text)?,
+                Json::Object(value) | Json::Other(value) => w.measure(value)?,
+                Json::List(values) => {
+                    let mut bytes: usize = 2;
+                    for value in values {
+                        bytes = bytes.saturating_add(w.measure(value)?).saturating_add(1);
+                    }
+                    bytes
+                }
+            })
+        }
+        let function = match &self.function {
+            Json::Object(function) => json(&function.name, w)?
+                .saturating_add(json(&function.arguments, w)?)
+                .saturating_add(w.measure_fields(&function.rest)?),
+            Json::Str(text) => w.measure_str(text)?,
+            Json::Other(value) => w.measure(value)?,
+            Json::List(values) => {
+                let mut bytes: usize = 2;
+                for value in values {
+                    bytes = bytes.saturating_add(w.measure(value)?).saturating_add(1);
+                }
+                bytes
+            }
+            Json::Absent => 4,
+        };
+        Ok(64_usize
+            .saturating_add(json(&self.id, w)?)
+            .saturating_add(json(&self.kind, w)?)
+            .saturating_add(function)
+            .saturating_add(w.measure_fields(&self.rest)?))
+    }
+
     fn merge(&self, item: &mut Map<String, Value>) {
         self.id.merge_value(item, "id");
         self.kind.merge_value(item, "type");
@@ -538,11 +575,12 @@ impl ChatDecoder {
         };
         let mut item = Map::new();
         if let Some(field) = self.reasoning_field.take() {
+            self.w.reserve(self.w.text(at).map_or(0, str::len))?;
             let text = self.w.text(at).unwrap_or_default();
             item.insert(field.as_str().to_owned(), text.into());
         }
         item.append(&mut self.reasoning_details);
-        self.w.edit(at, |slot| *slot = Value::Object(item))?;
+        self.w.replace(at, Value::Object(item))?;
         self.w.finish(at)
     }
 
@@ -578,12 +616,13 @@ impl ChatDecoder {
                 .take()
                 .map(|id| json!({ "audio": { "id": id } })),
             Writing::Thinking => {
+                self.w.reserve(self.w.text(index).map_or(0, str::len))?;
                 let text = self.w.text(index).unwrap_or_default();
                 Some(PartKind::Thinking.part(vec![PartKind::Text.part(text.into())].into()))
             }
         };
         if let Some(item) = item {
-            self.w.edit(index, |slot| *slot = item)?;
+            self.w.replace(index, item)?;
         }
         self.w.finish(index)
     }
@@ -656,6 +695,8 @@ impl ChatDecoder {
     /// and otherwise opens a new call when it brings a name or arguments.
     fn call(&mut self, call: Option<&Call<'_>>, position: Option<usize>) -> Result<(), Error> {
         self.close_writing()?;
+        let growth = call.map_or(Ok(2), |call| call.growth(&mut self.w))?;
+        self.w.reserve(growth)?;
         let id = call.and_then(|call| match &call.id {
             Json::Str(id) => Some(Cow::Borrowed(id.as_ref())),
             Json::Other(id @ Value::Number(_)) => Some(Cow::Owned(id.to_string())),
@@ -682,10 +723,15 @@ impl ChatDecoder {
             Some(id) => self
                 .calls()
                 .find(|(_, open)| open.id.as_deref() == Some(id)),
-            None => self.calls().last().filter(|(at, open)| {
-                let arguments = self.w.text(*at).unwrap_or_default();
-                open.opaque || !whole_object(arguments) || !starts
-            }),
+            None => {
+                let last = self.calls().last().map(|(at, open)| (at, open.opaque));
+                let continues = match last {
+                    Some((at, false)) => !starts || !self.w.complete_arguments(at)?,
+                    _ => true,
+                };
+                last.filter(|_| continues)
+                    .and_then(|(at, _)| self.calls().find(|(held, _)| *held == at))
+            }
         }
         .map(|(at, _)| at);
         let at = match index.or(held) {
@@ -725,7 +771,7 @@ impl ChatDecoder {
             };
             self.w.fragment(at, fragment)?;
         }
-        self.w.edit(at, |item| {
+        self.w.edit(at, growth, |item| {
             if !item.is_object() {
                 *item = Value::Object(Map::new());
             }
@@ -756,7 +802,7 @@ impl ChatDecoder {
                 continue;
             }
             let (mut input, mut complete) = (None, false);
-            self.w.edit(at, |item| {
+            self.w.inspect(at, |item| {
                 if CallKind::of(item.str("type")) == CallKind::Custom {
                     let custom = item.at("/custom/input").cloned();
                     input = Some(custom.unwrap_or_else(|| Value::from("")));

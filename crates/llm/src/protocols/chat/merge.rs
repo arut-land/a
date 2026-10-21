@@ -77,7 +77,14 @@ fn fragment(key: &str) -> bool {
 /// A string fragment appended; a literal `null` argument placeholder gives
 /// way to the first real fragment.
 fn append(existing: &mut String, more: &str) {
-    if existing.trim() == "null" && !more.trim().is_empty() {
+    // Read whitespace runs from the end only when a nonblank fragment
+    // arrives, so no accumulated prefix is scanned for every token.
+    if !more.trim().is_empty()
+        && existing
+            .trim_end()
+            .strip_suffix("null")
+            .is_some_and(|prefix| prefix.chars().rev().all(char::is_whitespace))
+    {
         existing.clear();
     }
     existing.push_str(more);

@@ -195,3 +195,13 @@ fn partial_candidates_spend_their_copy_budget_before_allocating() {
     assert!(partial_object(text, limits).is_none());
     assert!(partial_object(text, DecodeLimits::default()).is_some());
 }
+
+#[test]
+fn argument_repair_charges_only_the_bytes_it_adds() {
+    let limit = DecodeLimits::default().argument_bytes;
+    let mut text = String::from("{\"value\":\"\n\"}");
+    text.extend(std::iter::repeat_n(' ', limit - text.len() - 1));
+    assert_eq!(parse_partial_arguments(&text)["value"], "\n");
+    text.push(' ');
+    assert!(parse_partial_arguments(&text).is_empty());
+}

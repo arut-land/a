@@ -127,7 +127,7 @@ fn deltas_merge_into_the_item_signatures_concatenate_and_unknown_fields_survive(
             json!({"type": "novel_delta", "novel": "x", "list": [1]}),
             json!({"type": "novel_delta", "novel": "y", "list": [2]}),
         ] {
-            w.edit(7, |item| merge(item, delta.as_object().unwrap()))?;
+            w.merge(7, delta.as_object().unwrap())?;
         }
         w.push(7, "hm")?;
         w.finish(7)
@@ -238,9 +238,7 @@ fn a_call_sent_without_an_id_keeps_its_item_only_where_the_item_has_an_id_slot()
                 arguments: Some("{}"),
             },
         )?;
-        w.edit(0, |item| {
-            *item = json!({"functionCall": {"name": "lookup"}});
-        })?;
+        w.replace(0, json!({"functionCall": {"name": "lookup"}}))?;
         w.finish(0)
     };
     let end = || End {
@@ -636,10 +634,10 @@ fn all_ingress_paths_obey_the_same_reply_budget() {
     ));
     let mut w = writer();
     w.open(0, Open::Text, Value::Null).unwrap();
-    limit(w.edit(0, |item| *item = json!({"blob": huge})));
+    limit(w.replace(0, json!({"blob": huge})));
     let mut w = writer();
     w.whole(0, Open::Text, json!({}), "").unwrap();
-    limit(w.edit(0, |item| *item = json!({"blob": huge})));
+    limit(w.replace(0, json!({"blob": huge})));
     let mut w = writer();
     w.open(
         0,
@@ -724,4 +722,57 @@ fn arguments_and_unstarted_parts_have_independent_ceilings() {
     let error = w.finish(1).unwrap_err();
     assert!(error.message.contains("JSON depth"));
     assert!(!error.is_retryable());
+}
+
+#[test]
+fn provider_item_edits_reserve_before_mutating_open_or_closed_items() {
+    for closed in [false, true] {
+        let mut w = Writer::<()>::new("test");
+        let original = json!({"citations": [], "signature": "old"});
+        w.open(0, Open::Text, original.clone()).unwrap();
+        if closed {
+            w.finish(0).unwrap();
+        }
+        w.reserve(w.limits().reply_bytes - w.core.bytes).unwrap();
+        let mut ran = false;
+        assert!(w.edit(0, 1, |_| ran = true).is_err());
+        assert!(!ran);
+        assert!(
+            w.merge(0, json!({"signature": "new"}).as_object().unwrap())
+                .is_err()
+        );
+        assert!(w.replace(0, json!({"replacement": true})).is_err());
+        let held = if closed {
+            &w.core.items[0].item
+        } else {
+            &w.core.get(0).unwrap().item
+        };
+        assert_eq!(held, &original);
+    }
+}
+
+#[test]
+fn whole_item_scans_spend_work_before_entering_the_callback() {
+    let mut w = Writer::<()>::new("test");
+    w.open(0, Open::Text, json!({"text": "content"})).unwrap();
+    w.core.scan_left = 0;
+    let mut ran = false;
+    assert!(w.inspect(0, |_| ran = true).is_err());
+    assert!(!ran);
+    assert!(w.measure(&json!({"text": "incoming"})).is_err());
+}
+
+#[test]
+fn field_merges_include_the_destination_container_in_the_depth_limit() {
+    let limits = DecodeLimits {
+        depth: 2,
+        ..Default::default()
+    };
+    let mut w = Writer::<()>::with_limits("test", limits);
+    w.open(0, Open::Text, json!({})).unwrap();
+    assert!(
+        w.merge(0, json!({"field": [[1]]}).as_object().unwrap())
+            .is_err()
+    );
+    assert_eq!(w.core.get(0).unwrap().item, json!({}));
 }
