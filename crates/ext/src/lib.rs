@@ -59,6 +59,7 @@ pub use point::{
     Answer, Asked, Chained, Gate, Gated, Gating, Later, PointCx, Reaction, Recover, Requirement,
     Rewrite,
 };
+pub use protocol::{Annotation, AnnotationLifetime, ExtensionFact};
 pub use schema::Schema;
 pub use service::{
     Background, Budget, CwdOf, InboxAccess, LaunchSpec, Layers, ModelRole, ModelRoles, ModelSpec,

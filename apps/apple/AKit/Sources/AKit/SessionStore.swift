@@ -14,7 +14,7 @@ public enum AttachmentState: Equatable {
 /// A session view follows numbered Rust updates; gaps require resynchronization.
 @Observable
 public final class SessionStore {
-    public private(set) var items: [ViewItem] = []
+    public private(set) var items: [DisplayItem] = []
     /// Live text of the reply in flight.
     public private(set) var streaming: StreamingText?
     public private(set) var recap: RecapInfo?
@@ -155,12 +155,12 @@ public final class SessionStore {
     }
 
     /// Applies `update`: once, in order, catching up first on a gap.
-    public func apply(_ update: ViewUpdate) {
-        if update.rev <= rev { return }
+    public func apply(_ update: ChangeBatch) {
+        if update.revision <= rev { return }
         defer { viewChanged?() }
-        if update.rev != rev + 1 {
+        if update.revision != rev + 1 {
             catchUp()
-            if update.rev <= rev { return }
+            if update.revision <= rev { return }
         }
         fold(update)
     }
@@ -170,7 +170,7 @@ public final class SessionStore {
         resyncs += 1
         switch source.resync(from: rev) {
         case .updates(let updates):
-            for update in updates where update.rev == rev + 1 {
+            for update in updates where update.revision == rev + 1 {
                 fold(update)
             }
         case .snapshot(let snapshot):
@@ -185,40 +185,42 @@ public final class SessionStore {
         if s.link == .detached { releaseAttachment() }
     }
 
-    private func fold(_ update: ViewUpdate) {
-        (rev, seq, turn, title) = (update.rev, update.seq, update.turn, update.title)
+    private func fold(_ update: ChangeBatch) {
+        (rev, seq, turn, title) = (update.revision, update.seq, update.turn, update.title)
         if streaming?.call != update.streaming {
             streaming = update.streaming.map { StreamingText(call: $0, text: "") }
         }
-        switch update.change {
-        case .attached(let session, let workspace, let reset):
-            if reset {
-                (items, recap) = ([], nil)
-            }
-            (sessionId, self.workspace) = (session, workspace)
-            attachment = .attached(id: session)
-        case .added(let index, let item):
-            items.insert(item, at: min(Int(index), items.count))
-        case .updated(let index, let patch):
-            guard Int(index) < items.count else { return }
-            items[Int(index)] = items[Int(index)].patched(patch)
-        case .delta(_, let text):
-            streaming?.text += text
-        case .synced(let recap):
-            self.recap = recap
-        case .snapshot(let snapshot):
-            items = snapshot
-        case .activity, .draining:
-            break
-        case .mismatch(_, let message):
-            problem = message
-        case .error(let message):
-            problem = message
-        case .link(let state):
-            link = state
-            if state == .detached { releaseAttachment() }
-            if case .lost(let message, let newer) = state {
-                (problem, newerBuild) = (message, newer)
+        for change in update.changes {
+            switch change {
+            case .attached(let session, let workspace, let reset):
+                if reset {
+                    (items, recap) = ([], nil)
+                }
+                (sessionId, self.workspace) = (session, workspace)
+                attachment = .attached(id: session)
+            case .added(let index, let item):
+                items.insert(item, at: min(Int(index), items.count))
+            case .updated(let index, let item):
+                guard Int(index) < items.count else { return }
+                items[Int(index)] = item
+            case .delta(_, let text):
+                streaming?.text += text
+            case .synced(let recap):
+                self.recap = recap
+            case .snapshot(let snapshot):
+                items = snapshot
+            case .activity, .draining:
+                break
+            case .mismatch(_, let message):
+                problem = message
+            case .error(let message):
+                problem = message
+            case .link(let state):
+                link = state
+                if state == .detached { releaseAttachment() }
+                if case .lost(let message, let newer) = state {
+                    (problem, newerBuild) = (message, newer)
+                }
             }
         }
     }

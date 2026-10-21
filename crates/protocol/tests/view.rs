@@ -37,7 +37,7 @@ impl Rng {
 const SESSION: SessionId = SessionId(Uuid::from_u128(0xa));
 
 #[test]
-fn a_description_arriving_after_the_answer_is_not_presented_as_current() {
+fn answered_questions_discard_late_annotations() {
     let (_, messages) = scenarios()
         .into_iter()
         .find(|(name, _)| *name == "approval reason precedes its optional description")
@@ -46,7 +46,7 @@ fn a_description_arriving_after_the_answer_is_not_presented_as_current() {
     for value in messages {
         let mut msg = DaemonMsg::from_json(value.to_string().as_bytes()).unwrap();
         if let DaemonMsg::Entry(entry) = &mut msg
-            && matches!(entry.body, Body::ModelResult { .. })
+            && matches!(entry.body, Body::Fact { .. })
         {
             view.fold(&DaemonMsg::Entry(Entry::new(
                 entry.seq,
@@ -572,7 +572,8 @@ fn scenarios() -> Vec<(&'static str, Vec<Value>)> {
         msg(DaemonMsg::Activity { seq: 3, activity: protocol::Activity::Approval }),
         entry(4, Body::ModelCall { model: "fast".into(), attempt: 0, choice: protocol::ToolChoice::Auto, r#for: Some(call(1)), purpose: Some("approval-description".into()), request: None }),
         entry(5, Body::ModelResult { call: call(4), r#for: Some(call(1)), failure: None, outcome: Outcome::Done { output: Json::encode(&json!({"message":{"content":[{"type":"text","text":"Only lists files."}]}})).unwrap() } }),
-        msg(DaemonMsg::Synced { seq: 5 }),
+        entry(6, annotation(1, "Only lists files.")),
+        msg(DaemonMsg::Synced { seq: 6 }),
     ]
     };
     let mut scenarios = vec![
@@ -620,7 +621,8 @@ fn scenarios() -> Vec<(&'static str, Vec<Value>)> {
                     call: call(3), r#for: Some(call(1)), failure: None,
                     outcome: Outcome::Done { output: Json::encode(&json!({"message":{"content":[{"type":"text","text":"Lists files in the current directory."}]}})).unwrap() },
                 }),
-                msg(DaemonMsg::Synced { seq: 4 }),
+                entry(5, annotation(1, "Lists files in the current directory.")),
+                msg(DaemonMsg::Synced { seq: 5 }),
             ],
         ),
         (
@@ -1349,4 +1351,99 @@ fn view_publications_follow_edits_to_inherited_context() {
         },
     )));
     assert!(restored.state.publications().is_empty());
+}
+
+fn annotation(target: u64, body: &str) -> Body {
+    Body::Fact {
+        fact: protocol::ExtensionFact::Annotation(protocol::Annotation {
+            target: CallId::new(target).unwrap(),
+            lifetime: protocol::AnnotationLifetime::Question,
+            card: Card {
+                body: body.into(),
+                ..Card::default()
+            },
+        }),
+    }
+}
+
+#[test]
+fn extension_presentation_needs_no_purpose_string_branch() {
+    let (_, messages) = scenarios()
+        .into_iter()
+        .find(|(name, _)| *name == "approval reason precedes its optional description")
+        .unwrap();
+    let mut view = SessionView::default();
+    for message in messages {
+        let mut message = DaemonMsg::from_json(message.to_string().as_bytes()).unwrap();
+        if let DaemonMsg::Entry(entry) = &mut message
+            && let Body::ModelCall { purpose, .. } = &mut entry.body
+        {
+            *purpose = Some("an arbitrary extension purpose".into());
+        }
+        view.fold(&message);
+    }
+    assert_eq!(
+        view.present(&view.items[0]).description,
+        Some("Lists files in the current directory.")
+    );
+    let snapshot = view.snapshot();
+    let mut attached = SessionView::default();
+    attached.fold(&DaemonMsg::Snapshot(Box::new(snapshot)));
+    assert_eq!(
+        attached.present(&attached.items[0]),
+        view.present(&view.items[0])
+    );
+}
+
+#[test]
+fn call_annotations_present_generic_cards_until_the_call_finishes() {
+    let call = CallId::new(1).unwrap();
+    let mut view = SessionView::default();
+    for (seq, body) in [
+        Body::ModelCall {
+            model: "fast".into(),
+            attempt: 0,
+            choice: protocol::ToolChoice::Auto,
+            r#for: None,
+            purpose: Some("custom".into()),
+            request: None,
+        },
+        Body::Fact {
+            fact: protocol::ExtensionFact::Annotation(protocol::Annotation {
+                target: call,
+                lifetime: protocol::AnnotationLifetime::Call,
+                card: Card {
+                    title: "Extension status".into(),
+                    body: "Typed presentation".into(),
+                    note: "working".into(),
+                    mark: protocol::Mark::Warn,
+                },
+            }),
+        },
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        view.fold(&DaemonMsg::Entry(Entry::new(
+            Seq::new(seq as u64 + 1).unwrap(),
+            Epoch(0),
+            body,
+        )));
+    }
+    let shown = view.present(&view.items[0]);
+    assert_eq!(shown.title, "Extension status");
+    assert_eq!(shown.body.text(), "Typed presentation");
+    assert_eq!(shown.status, "working");
+    assert_eq!(shown.glyph, protocol::view::Glyph::Warn);
+    view.fold(&DaemonMsg::Entry(Entry::new(
+        Seq::new(3).unwrap(),
+        Epoch(0),
+        Body::ModelResult {
+            call,
+            r#for: None,
+            failure: None,
+            outcome: Outcome::Interrupted { output: None },
+        },
+    )));
+    assert_eq!(view.present(&view.items[0]).title, "custom");
 }

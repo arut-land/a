@@ -120,6 +120,9 @@ impl Host for Recorded {
     fn note(&self, _: &str, _: &str, _: Json) -> BoxFuture<'static, crate::MutationResult> {
         Box::pin(std::future::ready(Err(crate::MutationError::Unregistered)))
     }
+    fn fact(&self, _: protocol::ExtensionFact) -> BoxFuture<'static, crate::MutationResult> {
+        unreachable!()
+    }
     fn publish(&self, _: &str, _: Json, _: String) -> BoxFuture<'static, crate::MutationResult> {
         Box::pin(std::future::ready(Err(crate::MutationError::Unregistered)))
     }

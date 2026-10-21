@@ -20,10 +20,9 @@ use std::io;
 use boltffi::{data, error};
 use client::{End, Link, Notice, SessionClient, TurnView};
 use protocol::view::{
-    Change, Glyph, Item, Part, Presented, Recap, SessionView, Shown, Status, mismatch_line,
-    recap_line,
+    Change, Glyph, Item, Kind, Presented, Recap, SessionView, Shown, mismatch_line, recap_line,
 };
-use protocol::{CommandInfo, Outcome, SessionSummary};
+use protocol::{CommandInfo, SessionSummary};
 
 pub use feed::Reducer;
 pub use live::{Client, Session, SessionWatch, find_session};
@@ -298,15 +297,15 @@ pub enum OpenTarget {
     Id { id: String },
 }
 
-/// One change to a session's view, numbered.
+/// All display changes from one fold cross the boundary under one revision.
 #[data]
 #[derive(Clone, Debug, PartialEq)]
-pub struct ViewUpdate {
-    /// One more than the previous update's; a gap means some were dropped.
-    pub rev: u64,
+pub struct ChangeBatch {
+    /// One more than the previous batch; a gap requires resynchronization.
+    pub revision: u64,
     /// The last log entry folded, after this update.
     pub seq: u64,
-    pub change: ViewChange,
+    pub changes: Vec<ViewChange>,
     /// The turn after this update.
     pub turn: TurnInfo,
     /// The call whose reply is streaming in after this update: the text
@@ -379,7 +378,7 @@ pub(crate) fn commands(daemon: &[CommandInfo]) -> Vec<CommandHelp> {
 #[data]
 #[derive(Clone, Debug, PartialEq)]
 pub enum ViewChange {
-    /// The turn controls changed; carried by `ViewUpdate::turn`.
+    /// The turn controls changed; carried by `ChangeBatch::turn`.
     Activity,
     /// Attached; `reset` when the view started over.
     Attached {
@@ -389,12 +388,12 @@ pub enum ViewChange {
     },
     Added {
         index: u32,
-        item: ViewItem,
+        item: DisplayItem,
     },
-    /// The item at `index` changed as `patch` says; the rest of it stands.
+    /// Replaces only the affected display record.
     Updated {
         index: u32,
-        patch: ItemPatch,
+        item: DisplayItem,
     },
     /// Live text for the reply of `call`.
     Delta {
@@ -408,7 +407,7 @@ pub enum ViewChange {
     },
     /// The daemon sent the whole view: the items are these now.
     Snapshot {
-        items: Vec<ViewItem>,
+        items: Vec<DisplayItem>,
     },
     /// The daemon is restarting for an upgrade; the session reconnects.
     Draining,
@@ -427,99 +426,28 @@ pub enum ViewChange {
     },
 }
 
-/// A transcript item; see [`protocol::view::Item`]. Each carries how it
-/// is `shown`: the app lays that out and decides nothing else.
+/// Display data excludes raw inputs, results and provider state; request details by key.
 #[data]
 #[derive(Clone, Debug, PartialEq)]
-pub enum ViewItem {
-    User {
-        seq: u64,
-        text: String,
-        shown: Presentation,
-    },
-    Assistant {
-        seq: u64,
-        text: String,
-        shown: Presentation,
-    },
-    /// A model call and the reply it got. A side request an extension
-    /// made names its `purpose`: its reply is the extension's (a title is
-    /// the session's [`SessionSnapshot::title`]), not the conversation's.
-    Reply {
-        call: u64,
-        model: String,
-        text: String,
-        status: ReplyStatus,
-        purpose: Option<String>,
-        shown: Presentation,
-    },
-    Tool {
-        call: u64,
-        tool: String,
-        /// JSON.
-        input_json: String,
-        outcome: Option<ToolOutcome>,
-        shown: Presentation,
-    },
-    /// A slash command and its outcome.
-    Command {
-        call: u64,
-        name: String,
-        args: String,
-        outcome: Option<ToolOutcome>,
-        shown: Presentation,
-    },
-    Hook {
-        seq: u64,
-        hook: String,
-        /// JSON.
-        decision_json: String,
-        shown: Presentation,
-    },
-    Child {
-        call: u64,
-        child: String,
-        input: String,
-        watch: Option<u64>,
-        fired: Option<ToolOutcome>,
-        shown: Presentation,
-    },
-    Environment {
-        seq: u64,
-        cwd: String,
-        shown: Presentation,
-    },
+pub struct DisplayItem {
+    pub key: u64,
+    pub kind: DisplayKind,
+    pub presentation: Presentation,
+    pub navigation: Option<String>,
 }
 
-#[boltffi::data(impl)]
-impl ViewItem {
-    /// The seq of the entry that started this item: items are in its order.
-    pub fn key(&self) -> u64 {
-        match self {
-            Self::User { seq, .. }
-            | Self::Assistant { seq, .. }
-            | Self::Hook { seq, .. }
-            | Self::Environment { seq, .. } => *seq,
-            Self::Reply { call, .. }
-            | Self::Tool { call, .. }
-            | Self::Child { call, .. }
-            | Self::Command { call, .. } => *call,
-        }
-    }
-
-    /// How the item is shown.
-    pub fn shown(&self) -> Presentation {
-        match self {
-            Self::User { shown, .. }
-            | Self::Assistant { shown, .. }
-            | Self::Reply { shown, .. }
-            | Self::Tool { shown, .. }
-            | Self::Command { shown, .. }
-            | Self::Hook { shown, .. }
-            | Self::Child { shown, .. }
-            | Self::Environment { shown, .. } => shown.clone(),
-        }
-    }
+#[data]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum DisplayKind {
+    User,
+    Assistant,
+    Reply,
+    Side,
+    Tool,
+    Command,
+    Hook,
+    Child,
+    Environment,
 }
 
 /// How an item is shown, as every client shows it; see
@@ -631,64 +559,12 @@ impl From<&Presented<'_>> for Presentation {
 }
 
 #[data]
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub enum ReplyStatus {
-    Running,
-    Done,
-    Failed { error: String },
-    Interrupted,
-}
-
-#[data]
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct TokenUsage {
     pub input: u64,
     pub output: u64,
 }
 
-/// What changed in an item; see [`protocol::view::Part`]. Each patch
-/// brings how the item is shown now.
-#[data]
-#[derive(Clone, Debug, PartialEq)]
-pub enum ItemPatch {
-    /// A tool's, a command's or a child's outcome.
-    Outcome {
-        outcome: ToolOutcome,
-        shown: Presentation,
-    },
-    /// A reply's text and status.
-    Reply {
-        text: String,
-        status: ReplyStatus,
-        shown: Presentation,
-    },
-    /// Where the call stands changed: it is asked about, runs, or was
-    /// refused.
-    Phase { shown: Presentation },
-    /// The approval the call waited for was given, or not.
-    Answer { approved: bool, shown: Presentation },
-    /// A child's watch, fired or not.
-    Watch { watch: Option<u64> },
-    /// The item as it is now: a typed line became the slash command it
-    /// ran, which then got its outcome.
-    Command { item: ViewItem },
-}
-
-#[data]
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub enum ToolOutcome {
-    /// `output_json` is the tool's output as JSON.
-    Done {
-        output_json: String,
-    },
-    Failed {
-        error: String,
-    },
-    /// The daemon stopped mid-call and the tool is not safe to rerun.
-    Interrupted,
-}
-
-/// What happened in a session, told on attach.
 #[data]
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct RecapInfo {
@@ -779,7 +655,7 @@ pub struct SessionSnapshot {
     pub seq: u64,
     pub session: Option<String>,
     pub workspace: String,
-    pub items: Vec<ViewItem>,
+    pub items: Vec<DisplayItem>,
     pub link: LinkState,
     pub recap: Option<RecapInfo>,
     pub streaming: Option<StreamingText>,
@@ -798,7 +674,7 @@ pub struct SessionSnapshot {
 // By value: that is how it crosses the boundary.
 #[allow(clippy::large_enum_variant)]
 pub enum Resync {
-    Updates { updates: Vec<ViewUpdate> },
+    Updates { updates: Vec<ChangeBatch> },
     Snapshot { snapshot: SessionSnapshot },
 }
 
@@ -808,8 +684,14 @@ fn index(i: usize) -> u32 {
 
 impl ViewChange {
     /// `change`, which `view` holds now.
-    fn of(change: &Change, view: &SessionView) -> Self {
-        match change {
+    fn of(change: &Change, view: &SessionView) -> Vec<Self> {
+        let change = match change {
+            Change::Batch { changes } => {
+                return changes
+                    .iter()
+                    .flat_map(|change| Self::of(change, view))
+                    .collect();
+            }
             Change::Attached {
                 session,
                 workspace,
@@ -821,11 +703,11 @@ impl ViewChange {
             },
             Change::Added { index: i, item } => Self::Added {
                 index: index(*i),
-                item: ViewItem::in_view(item, view),
+                item: DisplayItem::in_view(item, view),
             },
-            Change::Updated { index: i, part } => Self::Updated {
+            Change::Updated { index: i, .. } => Self::Updated {
                 index: index(*i),
-                patch: ItemPatch::of(&view.items[*i], *part, view),
+                item: DisplayItem::in_view(&view.items[*i], view),
             },
             Change::Delta { call, text } => Self::Delta {
                 call: call.get(),
@@ -835,11 +717,11 @@ impl ViewChange {
             Change::Synced => Self::Synced {
                 recap: view.recap.as_ref().map(Into::into),
             },
-            Change::Snapshot | Change::Batch { .. } => Self::Snapshot {
+            Change::Snapshot => Self::Snapshot {
                 items: view
                     .items
                     .iter()
-                    .map(|item| ViewItem::in_view(item, view))
+                    .map(|item| DisplayItem::in_view(item, view))
                     .collect(),
             },
             Change::Draining => Self::Draining,
@@ -850,61 +732,8 @@ impl ViewChange {
             Change::Error { message } => Self::Error {
                 message: message.clone(),
             },
-        }
-    }
-}
-
-impl ItemPatch {
-    /// What `part` of `item` is now.
-    fn of(item: &Item, part: Part, view: &SessionView) -> Self {
-        let shown = Presentation::from(&view.present(item));
-        match (item, part) {
-            (_, Part::Progress | Part::Presentation) => Self::Phase { shown },
-            (
-                Item::Tool {
-                    by: protocol::Audience::User,
-                    ..
-                },
-                _,
-            ) => Self::Command {
-                item: ViewItem::in_view(item, view),
-            },
-            (Item::Child { watch, .. }, Part::Watch) => Self::Watch {
-                watch: watch.map(protocol::Seq::get),
-            },
-            (Item::Reply { text, status, .. }, Part::Outcome) => Self::Reply {
-                text: text.clone(),
-                status: status.into(),
-                shown,
-            },
-            (Item::Tool { outcome, .. }, Part::Outcome) => Self::Outcome {
-                outcome: outcome
-                    .as_ref()
-                    .map_or(ToolOutcome::Interrupted, Into::into),
-                shown,
-            },
-            (Item::Child { fired, .. }, Part::Outcome) => Self::Outcome {
-                outcome: fired.as_ref().map_or(ToolOutcome::Interrupted, Into::into),
-                shown,
-            },
-            (_, Part::Answer { approved }) => Self::Answer { approved, shown },
-            (_, Part::Phase) => Self::Phase { shown },
-            // Nothing else is ever updated.
-            (item, part) => unreachable!("{part:?} of {item:?}"),
-        }
-    }
-}
-
-impl From<&Status> for ReplyStatus {
-    fn from(s: &Status) -> Self {
-        match s {
-            Status::Running => Self::Running,
-            Status::Done => Self::Done,
-            Status::Failed { error } => Self::Failed {
-                error: error.clone(),
-            },
-            Status::Interrupted => Self::Interrupted,
-        }
+        };
+        vec![change]
     }
 }
 
@@ -917,116 +746,27 @@ impl From<protocol::view::Usage> for TokenUsage {
     }
 }
 
-impl From<&Item> for ViewItem {
-    fn from(item: &Item) -> Self {
-        Self::presented(item, Presentation::from(&item.present()))
-    }
-}
-
-impl ViewItem {
+impl DisplayItem {
     fn in_view(item: &Item, view: &SessionView) -> Self {
-        Self::presented(item, Presentation::from(&view.present(item)))
-    }
-
-    fn presented(item: &Item, shown: Presentation) -> Self {
-        match item {
-            Item::User { seq, text } => Self::User {
-                seq: seq.get(),
-                text: text.clone(),
-                shown,
+        let shown = view.present(item);
+        Self {
+            key: item.key().get(),
+            kind: match shown.kind {
+                Kind::User => DisplayKind::User,
+                Kind::Assistant => DisplayKind::Assistant,
+                Kind::Reply => DisplayKind::Reply,
+                Kind::Side => DisplayKind::Side,
+                Kind::Tool => DisplayKind::Tool,
+                Kind::Command => DisplayKind::Command,
+                Kind::Hook => DisplayKind::Hook,
+                Kind::Child => DisplayKind::Child,
+                Kind::Environment => DisplayKind::Environment,
             },
-            Item::Assistant { seq, text } => Self::Assistant {
-                seq: seq.get(),
-                text: text.clone(),
-                shown,
+            presentation: Presentation::from(&shown),
+            navigation: match item {
+                Item::Child { child, .. } => Some(child.to_string()),
+                _ => None,
             },
-            Item::Reply {
-                call,
-                model,
-                text,
-                status,
-                purpose,
-                ..
-            } => Self::Reply {
-                call: call.get(),
-                model: model.clone(),
-                text: text.clone(),
-                status: status.into(),
-                purpose: purpose.clone(),
-                shown,
-            },
-            // The app shows a slash command apart from a tool.
-            Item::Tool {
-                call,
-                tool,
-                input,
-                outcome,
-                by: protocol::Audience::User,
-                ..
-            } => Self::Command {
-                call: call.get(),
-                name: tool.clone(),
-                args: Item::args(input),
-                outcome: outcome.as_ref().map(Into::into),
-                shown,
-            },
-            Item::Tool {
-                call,
-                tool,
-                input,
-                outcome,
-                ..
-            } => Self::Tool {
-                call: call.get(),
-                tool: tool.clone(),
-                input_json: input.to_string(),
-                outcome: outcome.as_ref().map(Into::into),
-                shown,
-            },
-            Item::Hook {
-                seq,
-                hook,
-                decision,
-                ..
-            } => Self::Hook {
-                seq: seq.get(),
-                hook: hook.clone(),
-                decision_json: serde_json::to_string(decision).unwrap_or_default(),
-                shown,
-            },
-            Item::Child {
-                call,
-                child,
-                input,
-                watch,
-                fired,
-            } => Self::Child {
-                call: call.get(),
-                child: child.to_string(),
-                input: input.clone(),
-                watch: watch.map(protocol::Seq::get),
-                fired: fired.as_ref().map(Into::into),
-                shown,
-            },
-            Item::Environment { seq, cwd } => Self::Environment {
-                seq: seq.get(),
-                cwd: cwd.display().to_string(),
-                shown,
-            },
-        }
-    }
-}
-
-impl From<&Outcome> for ToolOutcome {
-    fn from(outcome: &Outcome) -> Self {
-        match outcome {
-            Outcome::Done { output } => Self::Done {
-                output_json: output.to_string(),
-            },
-            Outcome::Failed { error } => Self::Failed {
-                error: error.clone(),
-            },
-            Outcome::Interrupted { .. } => Self::Interrupted,
         }
     }
 }
@@ -1056,7 +796,7 @@ impl SessionSnapshot {
             items: view
                 .items
                 .iter()
-                .map(|item| ViewItem::in_view(item, view))
+                .map(|item| DisplayItem::in_view(item, view))
                 .collect(),
             link: client.link().into(),
             recap: view.recap.as_ref().map(Into::into),

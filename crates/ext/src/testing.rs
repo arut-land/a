@@ -263,6 +263,10 @@ impl Host for Recorder {
         })))
     }
 
+    fn fact(&self, fact: protocol::ExtensionFact) -> BoxFuture<'static, crate::MutationResult> {
+        Box::pin(std::future::ready(self.append(Body::Fact { fact })))
+    }
+
     fn publish(
         &self,
         namespace: &str,

@@ -263,6 +263,18 @@ impl App {
 
     /// Keeps the screen's state in step with what changed in the view.
     fn changed(&mut self, update: Update) -> Vec<client::Effect> {
+        if let Change::Batch { changes } = update.change {
+            return changes
+                .into_iter()
+                .flat_map(|change| {
+                    self.changed(Update {
+                        change,
+                        rev: update.rev,
+                        seq: update.seq,
+                    })
+                })
+                .collect();
+        }
         let len = self.view().items.len();
         if !matches!(update.change, Change::Delta { .. }) {
             self.summary = None;
@@ -288,19 +300,13 @@ impl App {
                 if let Item::User { text, .. } = &item {
                     self.editor.remember(text);
                 }
-                if index + 1 == len && self.cache.len() == index {
-                    self.cache.push(None);
-                } else {
-                    self.cache.clear();
-                }
+                self.cache.resize_with(len, || None);
+                self.cache[index] = None;
             }
             Change::Updated { index, .. } => {
                 spend(&mut self.tokens, &self.client.view().items[index]);
-                if self.cache.len() == len {
-                    self.cache[index] = None;
-                } else {
-                    self.cache.clear();
-                }
+                self.cache.resize_with(len, || None);
+                self.cache[index] = None;
             }
             Change::Synced => self.recap_hidden = false,
             Change::Error { message } => {
@@ -318,7 +324,7 @@ impl App {
             Change::Mismatch { supported } => {
                 self.flash = Some((mismatch_line(supported), Style::new().fg(Color::Red)));
             }
-            Change::Snapshot | Change::Batch { .. } => {
+            Change::Snapshot => {
                 self.cache.clear();
                 self.anchor = None;
                 self.committed = self.committed.min(len);
@@ -329,6 +335,7 @@ impl App {
             }
             // A streaming reply's rows catch up with its text when drawn.
             Change::Delta { .. } | Change::Activity | Change::Draining => {}
+            Change::Batch { .. } => unreachable!(),
         }
         Vec::new()
     }
@@ -664,5 +671,79 @@ fn spend(tokens: &mut Usage, item: &Item) {
     {
         tokens.input += usage.input;
         tokens.output += usage.output;
+    }
+}
+
+#[cfg(test)]
+mod display_tests {
+    use super::*;
+    use client::{ConnId, Event, EventKind, Welcome};
+    use protocol::{Audience, Body, CallId, Caps, DaemonMsg, Entry, Epoch, Json, Seq, Verdict};
+
+    #[test]
+    fn display_batches_invalidate_only_affected_terminal_rows() {
+        let mut app = App::new(Viewport::Full, &Target::New);
+        app.client.open(Target::New);
+        app.client.step(Event {
+            conn: ConnId(1),
+            kind: EventKind::Connected {
+                welcome: Welcome {
+                    proto: protocol::PROTO,
+                    caps: Caps::ALL,
+                },
+                remote: false,
+                commands: Vec::new(),
+            },
+        });
+        app.fold(&DaemonMsg::Attached {
+            session: protocol::SessionId::new(),
+            workspace: "/w".into(),
+        });
+        for (seq, body) in [
+            Body::Assistant {
+                text: "unchanged".into(),
+            },
+            Body::ToolCall {
+                invoke: None,
+                tool: "custom".into(),
+                input: Json::null(),
+                id: None,
+                card: None,
+                by: Audience::Model,
+            },
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            app.fold(&DaemonMsg::Entry(Entry::new(
+                Seq::new(seq as u64 + 1).unwrap(),
+                Epoch(0),
+                body,
+            )));
+        }
+        app.cache = (0..2)
+            .map(|_| {
+                Some(Rows {
+                    width: 80,
+                    lines: Vec::new(),
+                    live: None,
+                })
+            })
+            .collect();
+        app.fold(&DaemonMsg::Entry(Entry::new(
+            Seq::new(3).unwrap(),
+            Epoch(0),
+            Body::Decision {
+                by: "rewrite".into(),
+                call: CallId::new(2),
+                d: Verdict::PreTool {
+                    input: Json::encode(&"effective").unwrap(),
+                },
+            },
+        )));
+        assert_eq!(app.cache.len(), 3);
+        assert_eq!(app.cache[0].as_ref().unwrap().width, 80);
+        assert!(app.cache[1].is_none());
+        assert!(app.cache[2].is_none());
     }
 }

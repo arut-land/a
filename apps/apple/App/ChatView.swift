@@ -130,12 +130,12 @@ struct RecapBar: View {
 /// One transcript item, laid out by what it is and worded by how Rust
 /// presents it (`shown`): the app decides neither status nor colour.
 struct ItemView: View {
-    let item: ViewItem
+    let item: DisplayItem
     let store: SessionStore
 
     var body: some View {
-        let shown = item.shown()
-        switch item {
+        let shown = item.presentation
+        switch item.kind {
         case .user:
             HStack {
                 Spacer(minLength: 80)
@@ -148,10 +148,10 @@ struct ItemView: View {
             BodyView(body: shown.body)
         // A side request's reply is its extension's, not the conversation's:
         // the title is the window's.
-        case .reply(_, _, _, _, .some, _):
+        case .side:
             EmptyView()
-        case .reply(let call, _, _, let status, _, _):
-            ReplyView(shown: shown, streaming: live(call, status))
+        case .reply:
+            ReplyView(shown: shown, streaming: live(item.key))
         case .tool:
             ToolView(shown: shown, store: store)
         case .command where !shown.approval.isEmpty:
@@ -180,8 +180,8 @@ struct ItemView: View {
 extension ItemView {
     /// The streamed text of a reply still running. Only such a reply reads
     /// it, so a token re-evaluates that reply alone.
-    private func live(_ call: UInt64, _ status: ReplyStatus) -> String? {
-        guard case .running = status, let streaming = store.streaming, streaming.call == call
+    private func live(_ call: UInt64) -> String? {
+        guard let streaming = store.streaming, streaming.call == call
         else { return nil }
         return streaming.text
     }

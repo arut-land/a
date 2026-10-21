@@ -94,6 +94,16 @@ impl Page {
     /// [`Page::settle`]. Until the attach is synced (again, after an
     /// upgrade) the page is left as it is; then it is shown whole.
     fn update(&mut self, update: Update) {
+        if let Change::Batch { changes } = update.change {
+            for change in changes {
+                self.update(Update {
+                    change,
+                    rev: update.rev,
+                    seq: update.seq,
+                });
+            }
+            return;
+        }
         if let Change::Attached { .. } = &update.change
             && self.forking
             && let Some(session) = self.client.view().session
@@ -138,7 +148,6 @@ impl Page {
             // none; a sync brings the recap.
             Change::Added { index: 0, .. }
             | Change::Snapshot
-            | Change::Batch { .. }
             | Change::Synced
             | Change::Attached { reset: true, .. } => self.show_all(),
             Change::Added { item, .. } => {

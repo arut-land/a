@@ -29,28 +29,30 @@ func aLiveSessionChatsRunsAnApprovedToolAndIsListed() async throws {
     try FileManager.default.createDirectory(at: workspace, withIntermediateDirectories: true)
     defer { try? FileManager.default.removeItem(at: workspace) }
 
-    let store = SessionStore(session: Session(client: client))
+    let session = Session(client: client)
+    let store = SessionStore(session: session)
     store.open(.new(workspace: workspace.path))
     try await eventually("live") { store.link == .live }
     let id = try #require(store.sessionId)
 
     await store.send("hi")
     try await eventually("the echo") {
-        store.items.contains { if case .assistant(_, "hi", _) = $0 { true } else { false } }
+        store.items.contains { $0.kind == .assistant && $0.presentation.body?.text == "hi" }
     }
 
     await store.send("$ echo hello")
     try await eventually("the ask") { store.turn.asking != nil }
     let call = store.turn.asking!
-    #expect(store.items.contains { if case .tool(call, _, _, _, let shown) = $0 { shown.approval.contains { if case .controls(call: call) = $0 { true } else { false } } } else { false } })
+    #expect(store.items.contains { $0.kind == .tool && $0.key == call && $0.presentation.approval.contains(.controls(call: call)) })
     await store.approve(call: call, approved: true)
     try await eventually("the outcome") {
         store.items.contains {
-            if case .tool(call, _, _, .done(let output)?, let shown) = $0 {
-                output.contains(#""output":"hello\n""#) && shown.status == "exit 0"
-            } else { false }
+            $0.kind == .tool && $0.key == call && $0.presentation.body?.text == "hello" && $0.presentation.status == "exit 0"
         }
     }
+
+    let details = try #require(session.details(key: call))
+    #expect(details.contains(#""output":"hello\n""#))
 
     let list = SessionListStore(client: client)
     let following = Task { await list.follow() }
@@ -118,7 +120,7 @@ func detached_session_reopens_with_a_new_handle() async throws {
     #expect(reopened.attachment == .attached(id: id))
     await reopened.send("reopened")
     try await eventually("new handle receives replies") {
-        reopened.items.contains { if case .assistant(_, "reopened", _) = $0 { true } else { false } }
+        reopened.items.contains { $0.kind == .assistant && $0.presentation.body?.text == "reopened" }
     }
     await reopened.detach()
 }
@@ -138,7 +140,7 @@ func fork_rekeys_the_cached_store() async throws {
     cache.selection = original
     await store.send("before fork")
     try await eventually("fork rest point") { !store.turn.running && store.items.contains {
-        if case .assistant(_, "before fork", _) = $0 { true } else { false }
+        $0.kind == .assistant && $0.presentation.body?.text == "before fork"
     } }
 
     _ = await store.submit("/fork")

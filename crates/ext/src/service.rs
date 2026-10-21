@@ -334,11 +334,33 @@ impl Background {
         self.0.while_waiting = true;
         self
     }
+    pub fn annotate(self, cx: Cx, lifetime: protocol::AnnotationLifetime) -> crate::Reaction {
+        self.finish(cx, Some(lifetime))
+    }
+
     pub fn start(self, cx: Cx) -> crate::Reaction {
+        self.finish(cx, None)
+    }
+
+    fn finish(self, cx: Cx, annotation: Option<protocol::AnnotationLifetime>) -> crate::Reaction {
         crate::Reaction::later(crate::Requirement::Ordered, async move {
-            if let Some(models) = cx.models() {
-                // The service owns and commits both success and failure.
-                let _ = models.call(&cx, self.0).await;
+            if let Some(models) = cx.models()
+                && let Ok(reply) = models.call(&cx, self.0).await
+                && let Some(lifetime) = annotation
+            {
+                let body = reply.message.text().trim().to_owned();
+                if !body.is_empty() {
+                    let _ = cx
+                        .fact(protocol::ExtensionFact::Annotation(protocol::Annotation {
+                            target: cx.call,
+                            lifetime,
+                            card: protocol::Card {
+                                body,
+                                ..protocol::Card::default()
+                            },
+                        }))
+                        .await;
+                }
             }
         })
     }

@@ -236,6 +236,10 @@ impl Host for CallPorts {
         })
     }
 
+    fn fact(&self, fact: protocol::ExtensionFact) -> BoxFuture<'static, ext::MutationResult> {
+        self.mutation(Note::Fact(fact))
+    }
+
     fn publish(
         &self,
         namespace: &str,

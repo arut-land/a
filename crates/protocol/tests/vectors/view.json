@@ -342,9 +342,10 @@
       "{\"activity\":\"approval\",\"seq\":3,\"t\":\"activity\"}",
       "{\"epoch\":0,\"for\":1,\"kind\":\"model_call\",\"model\":\"fast\",\"purpose\":\"approval-description\",\"seq\":4,\"t\":\"entry\"}",
       "{\"call\":4,\"epoch\":0,\"for\":1,\"kind\":\"model_result\",\"outcome\":{\"output\":{\"message\":{\"content\":[{\"text\":\"Only lists files.\",\"type\":\"text\"}]}},\"status\":\"done\"},\"seq\":5,\"t\":\"entry\"}",
-      "{\"seq\":5,\"t\":\"synced\"}"
+      "{\"epoch\":0,\"fact\":{\"annotation\":{\"card\":{\"body\":\"Only lists files.\",\"title\":\"\"},\"lifetime\":\"question\",\"target\":1}},\"kind\":\"fact\",\"seq\":6,\"t\":\"entry\"}",
+      "{\"seq\":6,\"t\":\"synced\"}"
     ],
-    "hash": "c338bd44b22cd3a2",
+    "hash": "e59b77305bd1dd21",
     "messages": [
       {
         "session": "00000000-0000-0000-0000-00000000000a",
@@ -430,7 +431,23 @@
         "t": "entry"
       },
       {
-        "seq": 5,
+        "epoch": 0,
+        "fact": {
+          "annotation": {
+            "card": {
+              "body": "Only lists files.",
+              "title": ""
+            },
+            "lifetime": "question",
+            "target": 1
+          }
+        },
+        "kind": "fact",
+        "seq": 6,
+        "t": "entry"
+      },
+      {
+        "seq": 6,
         "t": "synced"
       }
     ],
@@ -443,7 +460,9 @@
             "title": "shortened title"
           },
           "input": {
-            "command": "original harmless input"
+            "command": "printf harmless\nrm -rf /tmp/approval-test-sentinel",
+            "extra": "every argument",
+            "timeout": 60000
           },
           "outcome": null,
           "phase": {
@@ -487,13 +506,20 @@
           "usage": null
         }
       ],
-      "seq": 5,
+      "seq": 6,
       "session": "00000000-0000-0000-0000-00000000000a",
       "state": {
         "calls": [
           [
             1,
             {
+              "annotation": [
+                "question",
+                {
+                  "body": "Only lists files.",
+                  "title": ""
+                }
+              ],
               "phase": {
                 "waiting": {
                   "on": "approval"
@@ -546,23 +572,35 @@
       },
       {
         "change": {
-          "change": "added",
-          "index": 1,
-          "item": {
-            "call": 1,
-            "decision": {
-              "d": "pre_tool",
-              "input": {
-                "command": "printf harmless\nrm -rf /tmp/approval-test-sentinel",
-                "extra": "every argument",
-                "timeout": 60000
+          "change": "batch",
+          "changes": [
+            {
+              "change": "updated",
+              "index": 0,
+              "part": {
+                "part": "presentation"
               }
             },
-            "hook": "rewrite",
-            "seq": 2,
-            "tool": "bash",
-            "type": "hook"
-          }
+            {
+              "change": "added",
+              "index": 1,
+              "item": {
+                "call": 1,
+                "decision": {
+                  "d": "pre_tool",
+                  "input": {
+                    "command": "printf harmless\nrm -rf /tmp/approval-test-sentinel",
+                    "extra": "every argument",
+                    "timeout": 60000
+                  }
+                },
+                "hook": "rewrite",
+                "seq": 2,
+                "tool": "bash",
+                "type": "hook"
+              }
+            }
+          ]
         },
         "rev": 3,
         "seq": 2
@@ -607,33 +645,32 @@
       },
       {
         "change": {
-          "change": "batch",
-          "changes": [
-            {
-              "change": "updated",
-              "index": 2,
-              "part": {
-                "part": "outcome"
-              }
-            },
-            {
-              "change": "updated",
-              "index": 0,
-              "part": {
-                "part": "presentation"
-              }
-            }
-          ]
+          "change": "updated",
+          "index": 2,
+          "part": {
+            "part": "outcome"
+          }
         },
         "rev": 7,
         "seq": 5
       },
       {
         "change": {
-          "change": "synced"
+          "change": "updated",
+          "index": 0,
+          "part": {
+            "part": "presentation"
+          }
         },
         "rev": 8,
-        "seq": 5
+        "seq": 6
+      },
+      {
+        "change": {
+          "change": "synced"
+        },
+        "rev": 9,
+        "seq": 6
       }
     ]
   },
@@ -646,9 +683,10 @@
       "{\"activity\":\"approval\",\"seq\":3,\"t\":\"activity\"}",
       "{\"epoch\":0,\"for\":1,\"kind\":\"model_call\",\"model\":\"fast\",\"purpose\":\"approval-description\",\"seq\":4,\"t\":\"entry\"}",
       "{\"call\":4,\"epoch\":0,\"for\":1,\"kind\":\"model_result\",\"outcome\":{\"output\":{\"message\":{\"content\":[{\"text\":\"Only lists files.\",\"type\":\"text\"}]}},\"status\":\"done\"},\"seq\":5,\"t\":\"entry\"}",
-      "{\"seq\":5,\"t\":\"synced\"}"
+      "{\"epoch\":0,\"fact\":{\"annotation\":{\"card\":{\"body\":\"Only lists files.\",\"title\":\"\"},\"lifetime\":\"question\",\"target\":1}},\"kind\":\"fact\",\"seq\":6,\"t\":\"entry\"}",
+      "{\"seq\":6,\"t\":\"synced\"}"
     ],
-    "hash": "baf02b23c176b073",
+    "hash": "077261a17bb50b23",
     "messages": [
       {
         "session": "00000000-0000-0000-0000-00000000000a",
@@ -745,7 +783,23 @@
         "t": "entry"
       },
       {
-        "seq": 5,
+        "epoch": 0,
+        "fact": {
+          "annotation": {
+            "card": {
+              "body": "Only lists files.",
+              "title": ""
+            },
+            "lifetime": "question",
+            "target": 1
+          }
+        },
+        "kind": "fact",
+        "seq": 6,
+        "t": "entry"
+      },
+      {
+        "seq": 6,
         "t": "synced"
       }
     ],
@@ -758,7 +812,20 @@
             "title": "shortened title"
           },
           "input": {
-            "command": "original harmless input"
+            "edits": [
+              {
+                "new": "allow = true\nkeep = yes",
+                "old": "allow = false\nkeep = yes"
+              },
+              {
+                "new": "delete = yes",
+                "old": "delete = no"
+              }
+            ],
+            "extra": {
+              "flag": true
+            },
+            "path": "/work/deep/config.ini"
           },
           "outcome": null,
           "phase": {
@@ -813,13 +880,20 @@
           "usage": null
         }
       ],
-      "seq": 5,
+      "seq": 6,
       "session": "00000000-0000-0000-0000-00000000000a",
       "state": {
         "calls": [
           [
             1,
             {
+              "annotation": [
+                "question",
+                {
+                  "body": "Only lists files.",
+                  "title": ""
+                }
+              ],
               "phase": {
                 "waiting": {
                   "on": "approval"
@@ -872,34 +946,46 @@
       },
       {
         "change": {
-          "change": "added",
-          "index": 1,
-          "item": {
-            "call": 1,
-            "decision": {
-              "d": "pre_tool",
-              "input": {
-                "edits": [
-                  {
-                    "new": "allow = true\nkeep = yes",
-                    "old": "allow = false\nkeep = yes"
-                  },
-                  {
-                    "new": "delete = yes",
-                    "old": "delete = no"
-                  }
-                ],
-                "extra": {
-                  "flag": true
-                },
-                "path": "/work/deep/config.ini"
+          "change": "batch",
+          "changes": [
+            {
+              "change": "updated",
+              "index": 0,
+              "part": {
+                "part": "presentation"
               }
             },
-            "hook": "rewrite",
-            "seq": 2,
-            "tool": "edit",
-            "type": "hook"
-          }
+            {
+              "change": "added",
+              "index": 1,
+              "item": {
+                "call": 1,
+                "decision": {
+                  "d": "pre_tool",
+                  "input": {
+                    "edits": [
+                      {
+                        "new": "allow = true\nkeep = yes",
+                        "old": "allow = false\nkeep = yes"
+                      },
+                      {
+                        "new": "delete = yes",
+                        "old": "delete = no"
+                      }
+                    ],
+                    "extra": {
+                      "flag": true
+                    },
+                    "path": "/work/deep/config.ini"
+                  }
+                },
+                "hook": "rewrite",
+                "seq": 2,
+                "tool": "edit",
+                "type": "hook"
+              }
+            }
+          ]
         },
         "rev": 3,
         "seq": 2
@@ -944,33 +1030,32 @@
       },
       {
         "change": {
-          "change": "batch",
-          "changes": [
-            {
-              "change": "updated",
-              "index": 2,
-              "part": {
-                "part": "outcome"
-              }
-            },
-            {
-              "change": "updated",
-              "index": 0,
-              "part": {
-                "part": "presentation"
-              }
-            }
-          ]
+          "change": "updated",
+          "index": 2,
+          "part": {
+            "part": "outcome"
+          }
         },
         "rev": 7,
         "seq": 5
       },
       {
         "change": {
-          "change": "synced"
+          "change": "updated",
+          "index": 0,
+          "part": {
+            "part": "presentation"
+          }
         },
         "rev": 8,
-        "seq": 5
+        "seq": 6
+      },
+      {
+        "change": {
+          "change": "synced"
+        },
+        "rev": 9,
+        "seq": 6
       }
     ]
   },
@@ -982,9 +1067,10 @@
       "{\"activity\":\"approval\",\"seq\":2,\"t\":\"activity\"}",
       "{\"epoch\":0,\"for\":1,\"kind\":\"model_call\",\"model\":\"fast\",\"purpose\":\"approval-description\",\"seq\":3,\"t\":\"entry\"}",
       "{\"call\":3,\"epoch\":0,\"for\":1,\"kind\":\"model_result\",\"outcome\":{\"output\":{\"message\":{\"content\":[{\"text\":\"Lists files in the current directory.\",\"type\":\"text\"}]}},\"status\":\"done\"},\"seq\":4,\"t\":\"entry\"}",
-      "{\"seq\":4,\"t\":\"synced\"}"
+      "{\"epoch\":0,\"fact\":{\"annotation\":{\"card\":{\"body\":\"Lists files in the current directory.\",\"title\":\"\"},\"lifetime\":\"question\",\"target\":1}},\"kind\":\"fact\",\"seq\":5,\"t\":\"entry\"}",
+      "{\"seq\":5,\"t\":\"synced\"}"
     ],
-    "hash": "6b58ae3c4aed9325",
+    "hash": "78fa9abc4dfbcad7",
     "messages": [
       {
         "session": "00000000-0000-0000-0000-00000000000a",
@@ -1053,7 +1139,23 @@
         "t": "entry"
       },
       {
-        "seq": 4,
+        "epoch": 0,
+        "fact": {
+          "annotation": {
+            "card": {
+              "body": "Lists files in the current directory.",
+              "title": ""
+            },
+            "lifetime": "question",
+            "target": 1
+          }
+        },
+        "kind": "fact",
+        "seq": 5,
+        "t": "entry"
+      },
+      {
+        "seq": 5,
         "t": "synced"
       }
     ],
@@ -1092,13 +1194,20 @@
           "usage": null
         }
       ],
-      "seq": 4,
+      "seq": 5,
       "session": "00000000-0000-0000-0000-00000000000a",
       "state": {
         "calls": [
           [
             1,
             {
+              "annotation": [
+                "question",
+                {
+                  "body": "Lists files in the current directory.",
+                  "title": ""
+                }
+              ],
               "phase": {
                 "waiting": {
                   "on": "approval"
@@ -1186,33 +1295,32 @@
       },
       {
         "change": {
-          "change": "batch",
-          "changes": [
-            {
-              "change": "updated",
-              "index": 1,
-              "part": {
-                "part": "outcome"
-              }
-            },
-            {
-              "change": "updated",
-              "index": 0,
-              "part": {
-                "part": "presentation"
-              }
-            }
-          ]
+          "change": "updated",
+          "index": 1,
+          "part": {
+            "part": "outcome"
+          }
         },
         "rev": 6,
         "seq": 4
       },
       {
         "change": {
-          "change": "synced"
+          "change": "updated",
+          "index": 0,
+          "part": {
+            "part": "presentation"
+          }
         },
         "rev": 7,
-        "seq": 4
+        "seq": 5
+      },
+      {
+        "change": {
+          "change": "synced"
+        },
+        "rev": 8,
+        "seq": 5
       }
     ]
   },
@@ -2716,11 +2824,11 @@
       "{\"seq\":2,\"t\":\"synced\"}",
       "{\"call\":2,\"t\":\"delta\",\"text\":\"thinking\"}",
       "{\"session\":\"00000000-0000-0000-0000-00000000000a\",\"t\":\"attached\",\"workspace\":\"/w\"}",
-      "{\"items\":[{\"seq\":1,\"text\":\"one\",\"type\":\"user\"},{\"call\":2,\"model\":\"m\",\"status\":{\"status\":\"running\"},\"text\":\"\",\"type\":\"reply\",\"usage\":null},{\"call\":3,\"input\":{\"command\":\"echo hi\"},\"outcome\":null,\"phase\":{\"waiting\":{\"on\":\"approval\"}},\"reason\":{\"mode\":{\"mode\":\"ask\"}},\"tool\":\"bash\",\"type\":\"tool\"}],\"seq\":4,\"session\":\"00000000-0000-0000-0000-00000000000a\",\"state\":{\"calls\":[[3,{\"phase\":{\"waiting\":{\"on\":\"approval\"}},\"progress\":null}]],\"queued\":[],\"turn\":1},\"t\":\"snapshot\",\"workspace\":\"/w\"}",
+      "{\"items\":[{\"seq\":1,\"text\":\"one\",\"type\":\"user\"},{\"call\":2,\"model\":\"m\",\"status\":{\"status\":\"running\"},\"text\":\"\",\"type\":\"reply\",\"usage\":null},{\"call\":3,\"input\":{\"command\":\"echo hi\"},\"outcome\":null,\"phase\":{\"waiting\":{\"on\":\"approval\"}},\"reason\":{\"mode\":{\"mode\":\"ask\"}},\"tool\":\"bash\",\"type\":\"tool\"}],\"seq\":4,\"session\":\"00000000-0000-0000-0000-00000000000a\",\"state\":{\"calls\":[[2,{\"phase\":\"running\",\"progress\":null}],[3,{\"phase\":{\"waiting\":{\"on\":\"approval\"}},\"progress\":null}]],\"queued\":[],\"turn\":1},\"t\":\"snapshot\",\"workspace\":\"/w\"}",
       "{\"seq\":4,\"t\":\"synced\"}",
       "{\"epoch\":0,\"kind\":\"assistant\",\"seq\":5,\"t\":\"entry\",\"text\":\"done\"}"
     ],
-    "hash": "7b764cfd6c3f181c",
+    "hash": "5a0b03f4b84b1da8",
     "messages": [
       {
         "session": "00000000-0000-0000-0000-00000000000a",
@@ -2798,6 +2906,13 @@
         "state": {
           "calls": [
             [
+              2,
+              {
+                "phase": "running",
+                "progress": null
+              }
+            ],
+            [
               3,
               {
                 "phase": {
@@ -2874,6 +2989,13 @@
       "session": "00000000-0000-0000-0000-00000000000a",
       "state": {
         "calls": [
+          [
+            2,
+            {
+              "phase": "running",
+              "progress": null
+            }
+          ],
           [
             3,
             {
@@ -3043,7 +3165,7 @@
       "{\"epoch\":0,\"kind\":\"assistant\",\"seq\":29,\"t\":\"entry\",\"text\":\"a38\"}",
       "{\"cwd\":\"/w1\",\"epoch\":0,\"kind\":\"environment\",\"seq\":30,\"t\":\"entry\",\"tty\":false,\"vars\":{}}"
     ],
-    "hash": "219ab386d7c42b73",
+    "hash": "6a650f65432fc1ab",
     "messages": [
       {
         "session": "00000000-0000-0000-0000-00000000000a",
@@ -3620,6 +3742,13 @@
       "session": "00000000-0000-0000-0000-00000000000a",
       "state": {
         "calls": [
+          [
+            6,
+            {
+              "phase": "running",
+              "progress": null
+            }
+          ],
           [
             27,
             {
@@ -4532,9 +4661,10 @@
       "{\"activity\":\"approval\",\"seq\":3,\"t\":\"activity\"}",
       "{\"epoch\":0,\"for\":1,\"kind\":\"model_call\",\"model\":\"fast\",\"purpose\":\"approval-description\",\"seq\":4,\"t\":\"entry\"}",
       "{\"call\":4,\"epoch\":0,\"for\":1,\"kind\":\"model_result\",\"outcome\":{\"output\":{\"message\":{\"content\":[{\"text\":\"Only lists files.\",\"type\":\"text\"}]}},\"status\":\"done\"},\"seq\":5,\"t\":\"entry\"}",
-      "{\"seq\":5,\"t\":\"synced\"}"
+      "{\"epoch\":0,\"fact\":{\"annotation\":{\"card\":{\"body\":\"Only lists files.\",\"title\":\"\"},\"lifetime\":\"question\",\"target\":1}},\"kind\":\"fact\",\"seq\":6,\"t\":\"entry\"}",
+      "{\"seq\":6,\"t\":\"synced\"}"
     ],
-    "hash": "f0f26f3ff19d318a",
+    "hash": "3761e85baf15bd57",
     "messages": [
       {
         "session": "00000000-0000-0000-0000-00000000000a",
@@ -4621,7 +4751,23 @@
         "t": "entry"
       },
       {
-        "seq": 5,
+        "epoch": 0,
+        "fact": {
+          "annotation": {
+            "card": {
+              "body": "Only lists files.",
+              "title": ""
+            },
+            "lifetime": "question",
+            "target": 1
+          }
+        },
+        "kind": "fact",
+        "seq": 6,
+        "t": "entry"
+      },
+      {
+        "seq": 6,
         "t": "synced"
       }
     ],
@@ -4632,7 +4778,9 @@
           "by": "user",
           "call": 1,
           "input": {
-            "command": "original harmless input"
+            "command": "printf harmless\nrm -rf /tmp/approval-test-sentinel",
+            "extra": "every argument",
+            "timeout": 60000
           },
           "outcome": null,
           "phase": {
@@ -4676,13 +4824,20 @@
           "usage": null
         }
       ],
-      "seq": 5,
+      "seq": 6,
       "session": "00000000-0000-0000-0000-00000000000a",
       "state": {
         "calls": [
           [
             1,
             {
+              "annotation": [
+                "question",
+                {
+                  "body": "Only lists files.",
+                  "title": ""
+                }
+              ],
               "phase": {
                 "waiting": {
                   "on": "approval"
@@ -4733,23 +4888,35 @@
       },
       {
         "change": {
-          "change": "added",
-          "index": 1,
-          "item": {
-            "call": 1,
-            "decision": {
-              "d": "pre_tool",
-              "input": {
-                "command": "printf harmless\nrm -rf /tmp/approval-test-sentinel",
-                "extra": "every argument",
-                "timeout": 60000
+          "change": "batch",
+          "changes": [
+            {
+              "change": "updated",
+              "index": 0,
+              "part": {
+                "part": "presentation"
               }
             },
-            "hook": "rewrite",
-            "seq": 2,
-            "tool": "bash",
-            "type": "hook"
-          }
+            {
+              "change": "added",
+              "index": 1,
+              "item": {
+                "call": 1,
+                "decision": {
+                  "d": "pre_tool",
+                  "input": {
+                    "command": "printf harmless\nrm -rf /tmp/approval-test-sentinel",
+                    "extra": "every argument",
+                    "timeout": 60000
+                  }
+                },
+                "hook": "rewrite",
+                "seq": 2,
+                "tool": "bash",
+                "type": "hook"
+              }
+            }
+          ]
         },
         "rev": 3,
         "seq": 2
@@ -4794,33 +4961,32 @@
       },
       {
         "change": {
-          "change": "batch",
-          "changes": [
-            {
-              "change": "updated",
-              "index": 2,
-              "part": {
-                "part": "outcome"
-              }
-            },
-            {
-              "change": "updated",
-              "index": 0,
-              "part": {
-                "part": "presentation"
-              }
-            }
-          ]
+          "change": "updated",
+          "index": 2,
+          "part": {
+            "part": "outcome"
+          }
         },
         "rev": 7,
         "seq": 5
       },
       {
         "change": {
-          "change": "synced"
+          "change": "updated",
+          "index": 0,
+          "part": {
+            "part": "presentation"
+          }
         },
         "rev": 8,
-        "seq": 5
+        "seq": 6
+      },
+      {
+        "change": {
+          "change": "synced"
+        },
+        "rev": 9,
+        "seq": 6
       }
     ]
   },
@@ -4833,9 +4999,10 @@
       "{\"activity\":\"approval\",\"seq\":3,\"t\":\"activity\"}",
       "{\"epoch\":0,\"for\":1,\"kind\":\"model_call\",\"model\":\"fast\",\"purpose\":\"approval-description\",\"seq\":4,\"t\":\"entry\"}",
       "{\"call\":4,\"epoch\":0,\"for\":1,\"kind\":\"model_result\",\"outcome\":{\"output\":{\"message\":{\"content\":[{\"text\":\"Only lists files.\",\"type\":\"text\"}]}},\"status\":\"done\"},\"seq\":5,\"t\":\"entry\"}",
-      "{\"seq\":5,\"t\":\"synced\"}"
+      "{\"epoch\":0,\"fact\":{\"annotation\":{\"card\":{\"body\":\"Only lists files.\",\"title\":\"\"},\"lifetime\":\"question\",\"target\":1}},\"kind\":\"fact\",\"seq\":6,\"t\":\"entry\"}",
+      "{\"seq\":6,\"t\":\"synced\"}"
     ],
-    "hash": "c4c6bfb19bb4b9e3",
+    "hash": "21f1e5be97ff3893",
     "messages": [
       {
         "session": "00000000-0000-0000-0000-00000000000a",
@@ -4933,7 +5100,23 @@
         "t": "entry"
       },
       {
-        "seq": 5,
+        "epoch": 0,
+        "fact": {
+          "annotation": {
+            "card": {
+              "body": "Only lists files.",
+              "title": ""
+            },
+            "lifetime": "question",
+            "target": 1
+          }
+        },
+        "kind": "fact",
+        "seq": 6,
+        "t": "entry"
+      },
+      {
+        "seq": 6,
         "t": "synced"
       }
     ],
@@ -4944,7 +5127,20 @@
           "by": "user",
           "call": 1,
           "input": {
-            "command": "original harmless input"
+            "edits": [
+              {
+                "new": "allow = true\nkeep = yes",
+                "old": "allow = false\nkeep = yes"
+              },
+              {
+                "new": "delete = yes",
+                "old": "delete = no"
+              }
+            ],
+            "extra": {
+              "flag": true
+            },
+            "path": "/work/deep/config.ini"
           },
           "outcome": null,
           "phase": {
@@ -4999,13 +5195,20 @@
           "usage": null
         }
       ],
-      "seq": 5,
+      "seq": 6,
       "session": "00000000-0000-0000-0000-00000000000a",
       "state": {
         "calls": [
           [
             1,
             {
+              "annotation": [
+                "question",
+                {
+                  "body": "Only lists files.",
+                  "title": ""
+                }
+              ],
               "phase": {
                 "waiting": {
                   "on": "approval"
@@ -5056,34 +5259,46 @@
       },
       {
         "change": {
-          "change": "added",
-          "index": 1,
-          "item": {
-            "call": 1,
-            "decision": {
-              "d": "pre_tool",
-              "input": {
-                "edits": [
-                  {
-                    "new": "allow = true\nkeep = yes",
-                    "old": "allow = false\nkeep = yes"
-                  },
-                  {
-                    "new": "delete = yes",
-                    "old": "delete = no"
-                  }
-                ],
-                "extra": {
-                  "flag": true
-                },
-                "path": "/work/deep/config.ini"
+          "change": "batch",
+          "changes": [
+            {
+              "change": "updated",
+              "index": 0,
+              "part": {
+                "part": "presentation"
               }
             },
-            "hook": "rewrite",
-            "seq": 2,
-            "tool": "edit",
-            "type": "hook"
-          }
+            {
+              "change": "added",
+              "index": 1,
+              "item": {
+                "call": 1,
+                "decision": {
+                  "d": "pre_tool",
+                  "input": {
+                    "edits": [
+                      {
+                        "new": "allow = true\nkeep = yes",
+                        "old": "allow = false\nkeep = yes"
+                      },
+                      {
+                        "new": "delete = yes",
+                        "old": "delete = no"
+                      }
+                    ],
+                    "extra": {
+                      "flag": true
+                    },
+                    "path": "/work/deep/config.ini"
+                  }
+                },
+                "hook": "rewrite",
+                "seq": 2,
+                "tool": "edit",
+                "type": "hook"
+              }
+            }
+          ]
         },
         "rev": 3,
         "seq": 2
@@ -5128,33 +5343,32 @@
       },
       {
         "change": {
-          "change": "batch",
-          "changes": [
-            {
-              "change": "updated",
-              "index": 2,
-              "part": {
-                "part": "outcome"
-              }
-            },
-            {
-              "change": "updated",
-              "index": 0,
-              "part": {
-                "part": "presentation"
-              }
-            }
-          ]
+          "change": "updated",
+          "index": 2,
+          "part": {
+            "part": "outcome"
+          }
         },
         "rev": 7,
         "seq": 5
       },
       {
         "change": {
-          "change": "synced"
+          "change": "updated",
+          "index": 0,
+          "part": {
+            "part": "presentation"
+          }
         },
         "rev": 8,
-        "seq": 5
+        "seq": 6
+      },
+      {
+        "change": {
+          "change": "synced"
+        },
+        "rev": 9,
+        "seq": 6
       }
     ]
   }

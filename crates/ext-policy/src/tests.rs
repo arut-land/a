@@ -185,3 +185,63 @@ fn the_floor_cannot_be_loosened() {
     let allows = Floor::new([rule("bash", None, Effect::Allow)]);
     assert!(allows.unwrap_err().contains("may only ask or deny"));
 }
+
+struct Descriptions;
+
+impl Extension for Descriptions {
+    const NAME: &'static str = "descriptions";
+    const VERSION: u32 = 1;
+
+    fn contribute(&self, r: &mut Registrar) {
+        r.provide::<dyn Models>(Arc::new(Self));
+    }
+}
+
+impl Models for Descriptions {
+    fn call<'a>(
+        &'a self,
+        _: &'a Cx,
+        side: Side,
+    ) -> BoxFuture<'a, Result<llm::Response, llm::Error>> {
+        assert!(side.is_background());
+        assert!(side.is_while_waiting());
+        assert_eq!(side.purpose, "approval-description");
+        Box::pin(async {
+            Ok(llm::Response {
+                message: llm::Assistant {
+                    content: vec![llm::AssistantPart::Text(llm::Text::new(
+                        "  Optional summary  ",
+                    ))],
+                    origin: None,
+                },
+                finish: llm::Finish::new(llm::Reason::Stop, None),
+                usage: llm::Usage::default(),
+                id: None,
+                model: None,
+                meta: llm::Meta::new(),
+            })
+        })
+    }
+}
+
+#[test]
+fn optional_descriptions_commit_extension_owned_facts() {
+    let rig = rig(
+        "description",
+        Registry::default().with(&Descriptions).unwrap(),
+    );
+    let cx = rig.cx();
+    let target = cx.call;
+    let reaction = description(cx, "custom", &Json::null());
+    rt::block_on(reaction.work.unwrap().0);
+    let log = rig.log.lock().unwrap();
+    let Body::Fact {
+        fact: protocol::ExtensionFact::Annotation(annotation),
+    } = &log.last().unwrap().body
+    else {
+        panic!("description must commit a typed fact");
+    };
+    assert_eq!(annotation.target, target);
+    assert_eq!(annotation.lifetime, protocol::AnnotationLifetime::Question);
+    assert_eq!(annotation.card.body, "Optional summary");
+}

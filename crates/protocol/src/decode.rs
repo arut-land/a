@@ -266,6 +266,7 @@ same!(
     u64,
     Json,
     Card,
+    crate::ExtensionFact,
     Outcome,
     Permission,
     Mode,
@@ -408,6 +409,7 @@ fn present<'de, D: Deserializer<'de>>(d: D) -> std::result::Result<Option<Json>,
 /// An [`Entry`], or a [`Verdict`] within one.
 #[derive(Deserialize)]
 pub(crate) struct EntryFields {
+    pub(crate) fact: Option<crate::ExtensionFact>,
     pub(crate) invoke: Option<crate::Invocation>,
     pub(crate) envelope: Option<crate::Envelope>,
     pub(crate) envelope_id: Option<crate::EnvelopeId>,

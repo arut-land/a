@@ -203,6 +203,7 @@ impl Ledger {
     /// Folds entry `e`, the one after the last folded. An entry that does
     /// not fit what came before (an outcome for no open call, an answer for
     /// no wait) changes nothing.
+    #[allow(clippy::too_many_lines)]
     pub fn apply(&mut self, e: &Entry) {
         self.publications.apply(e);
         let (seq, body) = (e.seq, &e.body);
@@ -301,7 +302,11 @@ impl Ledger {
             Body::Environment(env) => self.env = Some(env.clone()),
             Body::Extensions { installed } => self.extensions = Some(installed.clone()),
             Body::Context { .. } => self.context = true,
-            Body::Spawned { .. } | Body::Ext { .. } | Body::Edit { .. } | Body::Unknown { .. } => {}
+            Body::Fact { .. }
+            | Body::Spawned { .. }
+            | Body::Ext { .. }
+            | Body::Edit { .. }
+            | Body::Unknown { .. } => {}
         }
     }
 

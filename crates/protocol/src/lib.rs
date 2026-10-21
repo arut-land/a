@@ -13,11 +13,11 @@ use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
 /// The protocol this build speaks best.
-pub const PROTO: u32 = 13;
+pub const PROTO: u32 = 14;
 
 /// The oldest protocol this build still speaks: a peer whose range
 /// overlaps `PROTO_MIN..=PROTO` is served at the highest version both speak.
-pub const PROTO_MIN: u32 = 13;
+pub const PROTO_MIN: u32 = 14;
 
 /// Ordinary payloads leave 4 KiB per reserved control slot for cancellation.
 #[derive(Clone, Copy)]
@@ -317,6 +317,8 @@ kinds! {
         /// A `background` group outlives its call: the session owns it until
         /// the session ends.
         ToolProcess "tool_process" { call: CallId, pgid: u32, boot: String, background: bool = default } = Durable;
+        /// Extension-owned facts carry no execution authority.
+        Fact "fact" { fact: ExtensionFact } = Durable;
         /// Output tool call `call` produced since its last progress entry,
         /// committed as it runs: what an interrupted call reports, and what
         /// clients show meanwhile.
@@ -466,6 +468,29 @@ kinds! {
         SideRetry "side_retry" { attempt: u16, failure: Json, after_ms: u64 };
     }
     else Err(serde_json::Error::custom("unknown decision"))
+}
+
+/// Extension-owned facts are externally tagged to avoid nested tag buffering.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ExtensionFact {
+    Annotation(Annotation),
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum AnnotationLifetime {
+    /// An answer or cancellation revokes presentation for this question.
+    Question,
+    /// Presentation lasts only while the target call is open.
+    Call,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Annotation {
+    pub target: CallId,
+    pub lifetime: AnnotationLifetime,
+    pub card: Card,
 }
 
 /// How a client shows a tool call or its outcome: pure data the tool

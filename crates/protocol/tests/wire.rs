@@ -307,6 +307,22 @@ fn input_samples() -> Vec<Sample<DaemonMsg>> {
             ),
         ),
         sample(
+            "entry_annotation",
+            entry(
+                11,
+                Body::Fact {
+                    fact: protocol::ExtensionFact::Annotation(protocol::Annotation {
+                        target: call(8),
+                        lifetime: protocol::AnnotationLifetime::Question,
+                        card: Card {
+                            body: "Optional extension explanation".into(),
+                            ..Card::default()
+                        },
+                    }),
+                },
+            ),
+        ),
+        sample(
             "entry_tool_call_by_user",
             entry(
                 22,

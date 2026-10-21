@@ -201,6 +201,10 @@ impl Cx {
         }
     }
 
+    pub fn fact(&self, fact: protocol::ExtensionFact) -> BoxFuture<'static, MutationResult> {
+        self.host.fact(fact)
+    }
+
     pub fn publish_erased(
         &self,
         namespace: &str,

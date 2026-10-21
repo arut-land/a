@@ -48,6 +48,7 @@ pub trait Host: Send + Sync {
     /// resolves once it is committed and folded in.
     fn note(&self, ext: &str, state: &str, data: Json)
     -> BoxFuture<'static, crate::MutationResult>;
+    fn fact(&self, fact: protocol::ExtensionFact) -> BoxFuture<'static, crate::MutationResult>;
     /// Seals a publication identity and model context in one ordinary entry.
     fn publish(
         &self,

@@ -902,10 +902,8 @@ impl Core {
         );
     }
 
-    /// Logs what a call reports: a running tool call anything, and a call
-    /// whose handler answers later (a model call recovering, a gate
-    /// asking) its extension's state and edits. A call not open reports
-    /// nothing more.
+    /// Extension-owned facts may arrive while an open call waits. Closing
+    /// the call revokes every mutation, including optional observations.
     fn note(&mut self, call: CallId, note: Note, fx: &mut StepPlan) {
         let deciding = match &self.turn {
             Turn::Model { call: c, .. } => *c == call,
@@ -914,12 +912,14 @@ impl Core {
         let running = self.step_of(call) == Some(Step::Running);
         let ext = matches!(
             note,
-            Note::State { .. } | Note::Publish { .. } | Note::Edit { .. }
+            Note::State { .. } | Note::Publish { .. } | Note::Edit { .. } | Note::Fact(_)
         );
-        if !(running || deciding && ext) {
+        let fact = matches!(note, Note::Fact(_)) && self.step_of(call).is_some();
+        if !(running || deciding && ext || fact) {
             return;
         }
         let body = match note {
+            Note::Fact(fact) => Body::Fact { fact },
             Note::Process {
                 pgid,
                 boot,
@@ -1866,4 +1866,47 @@ fn to_json(outcome: &Outcome) -> Json {
 /// A command's input: the text after its name.
 fn args_of(args: String) -> Json {
     Json::encode(&ext::Args { args }).unwrap_or_default()
+}
+
+#[cfg(test)]
+mod fact_tests {
+    use super::*;
+
+    struct Registry;
+
+    impl Binding for Registry {
+        fn agent(&self) -> Box<dyn crate::Agent> {
+            Box::new(ext::Loop::default())
+        }
+        fn installed(&self) -> Vec<protocol::Installed> {
+            Vec::new()
+        }
+        fn callable(&self, _: &str) -> Option<ext::Callable> {
+            None
+        }
+    }
+
+    #[test]
+    fn extension_facts_commit_for_open_waits_without_changing_execution() {
+        let mut core = Core::new(Arc::new(Registry));
+        let call = CallId::new(1).unwrap();
+        core.turn = Turn::Acting {
+            open: [(call, Step::Waiting)].into_iter().collect(),
+        };
+        let turn = core.turn.clone();
+        let fact = protocol::ExtensionFact::Annotation(protocol::Annotation {
+            target: call,
+            lifetime: protocol::AnnotationLifetime::Question,
+            card: Card::default(),
+        });
+        let mut plan = StepPlan::default();
+        core.note(call, Note::Fact(fact.clone()), &mut plan);
+        assert_eq!(plan.appends.len(), 1);
+        assert_eq!(plan.appends[0].body, Body::Fact { fact: fact.clone() });
+        assert_eq!(core.turn, turn);
+        assert_eq!(plan.immediate, []);
+        core.close(call);
+        core.note(call, Note::Fact(fact), &mut plan);
+        assert_eq!(plan.appends.len(), 1);
+    }
 }

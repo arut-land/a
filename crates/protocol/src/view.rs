@@ -61,6 +61,21 @@ pub struct ViewState {
 struct ViewCall {
     phase: Phase,
     progress: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    annotation: Option<(crate::AnnotationLifetime, Card)>,
+}
+
+impl ViewCall {
+    fn discard_annotation(&mut self) {
+        if !self.phase.asking()
+            && self
+                .annotation
+                .as_ref()
+                .is_some_and(|(lifetime, _)| *lifetime == crate::AnnotationLifetime::Question)
+        {
+            self.annotation = None;
+        }
+    }
 }
 
 impl ViewState {
@@ -112,12 +127,17 @@ impl ViewState {
                     self.turn = e.seq.get();
                 }
             }
-            Body::ToolCall { .. } => {
+            Body::ToolCall { .. } | Body::ModelCall { .. } => {
                 self.calls.insert(
                     CallId(e.seq),
                     ViewCall {
-                        phase: Phase::Gating { at: 0 },
+                        phase: if matches!(e.body, Body::ToolCall { .. }) {
+                            Phase::Gating { at: 0 }
+                        } else {
+                            Phase::Running
+                        },
                         progress: None,
+                        annotation: None,
                     },
                 );
             }
@@ -131,16 +151,33 @@ impl ViewState {
             } => {
                 if let Some(c) = self.calls.get_mut(*call) {
                     c.phase.decide(d);
+                    c.discard_annotation();
                 }
             }
             Body::Wait { call, on } => {
                 if let Some(c) = self.calls.get_mut(*call) {
                     c.phase.wait(on);
+                    c.discard_annotation();
                 }
             }
             Body::Answer { call, value, .. } => {
                 if let Some(c) = self.calls.get_mut(*call) {
                     c.phase.answer(value);
+                    c.discard_annotation();
+                }
+            }
+            Body::Fact {
+                fact:
+                    crate::ExtensionFact::Annotation(crate::Annotation {
+                        target,
+                        lifetime,
+                        card,
+                    }),
+            } => {
+                if let Some(c) = self.calls.get_mut(*target)
+                    && (*lifetime != crate::AnnotationLifetime::Question || c.phase.asking())
+                {
+                    c.annotation = Some((*lifetime, card.clone()));
                 }
             }
             Body::Progress { call, text } => {
@@ -494,25 +531,6 @@ impl SessionView {
     pub fn present<'a>(&'a self, item: &'a Item) -> Presented<'a> {
         let mut shown = item.present();
         if let Item::Tool {
-            call, tool, input, ..
-        } = item
-        {
-            let effective = self
-                .items
-                .iter()
-                .rev()
-                .find_map(|item| match item {
-                    Item::Hook {
-                        call: Some(owner),
-                        decision: Verdict::PreTool { input },
-                        ..
-                    } if owner == call => Some(input),
-                    _ => None,
-                })
-                .unwrap_or(input);
-            shown.input = Some((tool, effective));
-        }
-        if let Item::Tool {
             call,
             outcome: None,
             ..
@@ -521,31 +539,24 @@ impl SessionView {
         {
             shown.body = Shown::Text(text.into());
         }
-        if let Item::Tool {
-            call,
-            reason: Some(_),
-            ..
-        } = item
-            && self
-                .state
-                .call(*call)
-                .is_some_and(|open| open.phase.asking())
+        if let Some((lifetime, card)) = self
+            .state
+            .call(CallId(item.key()))
+            .and_then(|c| c.annotation.as_ref())
         {
-            shown.description = self.items.iter().rev().find_map(|reply| match reply {
-                Item::Reply {
-                    owner: Some(owner),
-                    purpose: Some(purpose),
-                    status: Status::Done,
-                    text,
-                    ..
-                } if owner == call
-                    && purpose == "approval-description"
-                    && !text.trim().is_empty() =>
-                {
-                    Some(text.trim())
+            match lifetime {
+                crate::AnnotationLifetime::Question => shown.description = Some(&card.body),
+                crate::AnnotationLifetime::Call => {
+                    if !card.title.is_empty() {
+                        shown.title = card.title.as_str().into();
+                    }
+                    shown.body = Shown::Text(card.body.as_str().into());
+                    if !card.note.is_empty() {
+                        shown.status = card.note.as_str().into();
+                    }
+                    shown.glyph = Glyph::of(card.mark);
                 }
-                _ => None,
-            });
+            }
         }
         shown
     }
@@ -730,7 +741,7 @@ impl SessionView {
                     },
                 ..
             } => return self.asked(*call, reason),
-            Body::Decision { by, call, d } => self.hook(seq, by, *call, d),
+            Body::Decision { by, call, d } => return Some(self.decision(seq, by, *call, d)),
             Body::Assistant { text } => Item::Assistant {
                 seq,
                 text: text.clone(),
@@ -790,6 +801,15 @@ impl SessionView {
     /// Folds entry `seq`, which changes an item already shown.
     fn change(&mut self, seq: Seq, body: &Body) -> Option<Change> {
         match body {
+            Body::Fact {
+                fact: crate::ExtensionFact::Annotation(annotation),
+            } => {
+                self.state.call(annotation.target)?.annotation.as_ref()?;
+                Some(Change::Updated {
+                    index: self.call(annotation.target)?,
+                    part: Part::Presentation,
+                })
+            }
             Body::ToolResult {
                 call,
                 outcome,
@@ -815,12 +835,7 @@ impl SessionView {
                     part: Part::Outcome,
                 })
             }
-            Body::ModelResult {
-                call,
-                outcome,
-                r#for,
-                ..
-            } => self.model_result(*call, outcome, *r#for),
+            Body::ModelResult { call, outcome, .. } => self.replied(*call, outcome),
             Body::Answer { call, .. } => {
                 let at = self.call(*call)?;
                 let Item::Tool { phase, .. } = &mut self.items[at] else {
@@ -875,16 +890,37 @@ impl SessionView {
         }
     }
 
-    fn hook(&mut self, seq: Seq, by: &str, call: Option<CallId>, d: &Verdict) -> Item {
-        if let Some(call) = call {
-            self.rephase(call);
+    fn decision(&mut self, seq: Seq, by: &str, call: Option<CallId>, d: &Verdict) -> Change {
+        let mut changed = call.and_then(|call| self.rephase(call));
+        if let Some(index) = call.and_then(|call| self.call(call))
+            && let Verdict::PreTool { input } = d
+            && let Item::Tool {
+                input: effective, ..
+            } = &mut self.items[index]
+        {
+            effective.clone_from(input);
+            changed = Some(Change::Updated {
+                index,
+                part: Part::Presentation,
+            });
         }
-        Item::Hook {
+        let item = Item::Hook {
             seq,
             hook: by.to_owned(),
             call,
             tool: self.tool_of(call),
             decision: d.clone(),
+        };
+        self.items.push(item.clone());
+        let added = Change::Added {
+            index: self.items.len() - 1,
+            item,
+        };
+        match changed {
+            Some(changed) => Change::Batch {
+                changes: vec![changed, added],
+            },
+            None => added,
         }
     }
 
@@ -894,38 +930,6 @@ impl SessionView {
             *shown = Some(Box::new(reason.clone()));
         }
         self.rephase(call)
-    }
-
-    fn model_result(
-        &mut self,
-        call: CallId,
-        outcome: &Outcome,
-        owner: Option<CallId>,
-    ) -> Option<Change> {
-        let reply = self.replied(call, outcome)?;
-        let described = self.call(call).is_some_and(|at| matches!(&self.items[at], Item::Reply { purpose: Some(purpose), status: Status::Done, text, .. } if purpose == "approval-description" && !text.trim().is_empty()));
-        let owner = owner
-            .filter(|owner| {
-                described
-                    && self
-                        .state
-                        .call(*owner)
-                        .is_some_and(|open| open.phase.asking())
-            })
-            .and_then(|owner| self.call(owner));
-        if let Some(index) = owner {
-            Some(Change::Batch {
-                changes: vec![
-                    reply,
-                    Change::Updated {
-                        index,
-                        part: Part::Presentation,
-                    },
-                ],
-            })
-        } else {
-            Some(reply)
-        }
     }
 
     /// Brings tool call `call`'s item to the phase the ledger has it at;

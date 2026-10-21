@@ -2,7 +2,7 @@
 //! the same updates, state and hash through it as through
 //! `protocol::view`, and a client that missed updates catches up.
 
-use a_ffi::{ItemPatch, Reducer, Resync, ToolOutcome, ViewChange, ViewItem};
+use a_ffi::{DisplayKind, Reducer, Resync, ViewChange};
 use serde_json::{Value, json};
 
 fn vectors() -> Vec<Value> {
@@ -29,7 +29,7 @@ fn the_shared_vectors_fold_the_same_through_the_facade() {
         let expected = vector["updates"].as_array().unwrap();
         assert_eq!(updates.len(), expected.len(), "{name}");
         for (got, want) in updates.iter().zip(expected) {
-            assert_eq!(got.rev, want["rev"], "{name}");
+            assert_eq!(got.revision, want["rev"], "{name}");
             assert_eq!(got.seq, want["seq"], "{name}");
         }
         let state: Value = serde_json::from_str(&reducer.state_json()).unwrap();
@@ -54,9 +54,12 @@ fn a_missed_update_is_handed_back_and_a_long_gap_gets_a_snapshot() {
     let Resync::Updates { updates } = reducer.resync(2) else {
         panic!("a recent gap replays");
     };
-    assert_eq!(updates.iter().map(|u| u.rev).collect::<Vec<_>>(), [3, 4]);
+    assert_eq!(
+        updates.iter().map(|u| u.revision).collect::<Vec<_>>(),
+        [3, 4]
+    );
     assert!(matches!(
-        &updates[1].change,
+        &updates[1].changes[0],
         ViewChange::Added { index: 2, .. }
     ));
     assert_eq!(reducer.resync(4), Resync::Updates { updates: vec![] });
@@ -87,34 +90,35 @@ fn a_tools_outcome_crosses_as_a_patch_not_as_the_item_again() {
         "call": 1, "outcome": { "status": "done", "output": { "exit": 0, "output": "y\n" } } });
     let added = reducer.fold(&started.to_string()).unwrap().unwrap();
     assert!(matches!(
-        added.change,
+        added.changes[0],
         ViewChange::Added {
-            item: ViewItem::Tool { outcome: None, .. },
+            item: a_ffi::DisplayItem {
+                kind: DisplayKind::Tool,
+                ..
+            },
             ..
         }
     ));
     let patched = reducer.fold(&done.to_string()).unwrap().unwrap();
-    let ViewChange::Updated {
-        index: 0,
-        patch:
-            ItemPatch::Outcome {
-                outcome: ToolOutcome::Done { output_json },
-                shown,
-            },
-    } = patched.change
-    else {
+    let ViewChange::Updated { index: 0, item } = &patched.changes[0] else {
         panic!("{patched:?}");
     };
-    assert!(output_json.contains("\"output\":\"y\\n\""), "{output_json}");
-    assert_eq!(shown.status, "done");
-    // The snapshot a client far behind takes has the whole item.
-    assert!(matches!(
-        &reducer.snapshot().items[..],
-        [ViewItem::Tool {
-            outcome: Some(ToolOutcome::Done { .. }),
-            ..
-        }]
-    ));
+    assert_eq!(item.presentation.status, "done");
+    assert!(
+        item.presentation
+            .body
+            .as_ref()
+            .unwrap()
+            .text
+            .contains("y\\n")
+    );
+    let details = reducer.details(1).unwrap();
+    assert!(details.contains("\"command\":\"yes\""));
+    assert!(details.contains("\"exit\":0"));
+    assert_eq!(
+        reducer.snapshot().items.as_slice(),
+        std::slice::from_ref(item)
+    );
 }
 
 /// Each update names the call whose reply is streaming, so a client
@@ -139,9 +143,12 @@ fn an_update_says_whose_reply_is_streaming() {
     let settled = reducer.fold(&reply.to_string()).unwrap().unwrap();
     assert_eq!(settled.streaming, None);
     assert!(matches!(
-        settled.change,
+        &settled.changes[0],
         ViewChange::Updated {
-            patch: ItemPatch::Reply { .. },
+            item: a_ffi::DisplayItem {
+                kind: DisplayKind::Reply | DisplayKind::Side,
+                ..
+            },
             ..
         }
     ));
@@ -168,9 +175,12 @@ fn a_titling_reply_is_the_sessions_title() {
     let titled = reducer.fold(&reply.to_string()).unwrap().unwrap();
     assert_eq!(titled.title.as_deref(), Some("Fix the parser"));
     assert!(matches!(
-        titled.change,
+        &titled.changes[0],
         ViewChange::Updated {
-            patch: ItemPatch::Reply { .. },
+            item: a_ffi::DisplayItem {
+                kind: DisplayKind::Reply | DisplayKind::Side,
+                ..
+            },
             ..
         }
     ));
@@ -178,6 +188,9 @@ fn a_titling_reply_is_the_sessions_title() {
     assert_eq!(snapshot.title.as_deref(), Some("Fix the parser"));
     assert!(matches!(
         &snapshot.items[..],
-        [ViewItem::Reply { purpose: Some(p), .. }] if p == "title"
+        [a_ffi::DisplayItem {
+            kind: DisplayKind::Side,
+            ..
+        }]
     ));
 }

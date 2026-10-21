@@ -35,6 +35,9 @@ impl Host for PausedRecord {
         let reply = self.reply.lock().unwrap().take().unwrap();
         Box::pin(async move { reply.await.unwrap() })
     }
+    fn fact(&self, fact: protocol::ExtensionFact) -> BoxFuture<'static, MutationResult> {
+        self.rig.fact(fact)
+    }
     fn publish(
         &self,
         namespace: &str,

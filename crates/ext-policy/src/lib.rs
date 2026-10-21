@@ -329,5 +329,7 @@ fn description(cx: Cx, tool: &str, input: &protocol::Json) -> Reaction {
         [llm::Message::user(prompt)].into_iter().collect(),
     );
     side.budget.max_tokens = std::num::NonZeroU32::new(96).unwrap();
-    side.background().while_waiting().start(cx)
+    side.background()
+        .while_waiting()
+        .annotate(cx, protocol::AnnotationLifetime::Question)
 }

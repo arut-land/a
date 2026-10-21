@@ -19,8 +19,8 @@ use sys::{Home, Staged};
 
 use crate::feed::{Feed, lock};
 use crate::{
-    AppAction, CliStatus, ClientError, CommandHelp, OpenTarget, Resync, SessionInfo,
-    SessionListUpdate, SessionSnapshot, Settings, TurnInfo, ViewUpdate,
+    AppAction, ChangeBatch, CliStatus, ClientError, CommandHelp, OpenTarget, Resync, SessionInfo,
+    SessionListUpdate, SessionSnapshot, Settings, TurnInfo,
 };
 
 fn runtime() -> &'static Arc<Threads> {
@@ -311,14 +311,18 @@ impl Session {
     /// Every update from here on. Subscribe before `open` to see the
     /// attach; items dropped by a full buffer show as a `rev` gap, for
     /// `resync`.
-    #[ffi_stream(item = ViewUpdate)]
-    pub fn updates(&self) -> Arc<EventSubscription<ViewUpdate>> {
+    #[ffi_stream(item = ChangeBatch)]
+    pub fn updates(&self) -> Arc<EventSubscription<ChangeBatch>> {
         lock(&self.feed).subscribe()
     }
 
     /// A conservative byte charge for all view payloads received since opening.
     pub fn retained_bytes(&self) -> u64 {
         lock(&self.feed).retained_bytes as u64
+    }
+
+    pub fn details(&self, key: u64) -> Option<String> {
+        lock(&self.feed).details(key)
     }
 
     pub fn snapshot(&self) -> SessionSnapshot {

@@ -249,6 +249,8 @@ pub enum Replied {
 /// What a running tool reports, logged under its call.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum Note {
+    /// An extension-owned fact, committed without interpretation.
+    Fact(protocol::ExtensionFact),
     /// It started process group `pgid` in boot `boot`.
     Process {
         pgid: u32,

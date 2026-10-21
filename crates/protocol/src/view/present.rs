@@ -56,7 +56,7 @@ impl Glyph {
         }
     }
 
-    const fn of(mark: Mark) -> Self {
+    pub(super) const fn of(mark: Mark) -> Self {
         match mark {
             Mark::Ok => Self::Ok,
             Mark::Bad => Self::Bad,

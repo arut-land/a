@@ -31,7 +31,7 @@ struct Vector {
     }()
 
     /// Folds the messages into a fresh reducer.
-    func fold() throws -> (Reducer, [ViewUpdate]) {
+    func fold() throws -> (Reducer, [ChangeBatch]) {
         let reducer = Reducer()
         let updates = try messages.compactMap { try reducer.fold(message: $0) }
         return (reducer, updates)
@@ -42,7 +42,7 @@ struct Vector {
     #expect(!Vector.all.isEmpty)
     for vector in Vector.all {
         let (reducer, updates) = try vector.fold()
-        #expect(updates.map(\.rev) == vector.updates.map(\.rev), "\(vector.name)")
+        #expect(updates.map(\.revision) == vector.updates.map(\.rev), "\(vector.name)")
         #expect(updates.map(\.seq) == vector.updates.map(\.seq), "\(vector.name)")
         let state = try JSONSerialization.jsonObject(with: Data(reducer.stateJson().utf8))
         #expect((state as! NSDictionary) == vector.state, "\(vector.name)")
@@ -90,7 +90,7 @@ func expectInStep(_ store: SessionStore, _ reducer: Reducer, _ name: String) {
     _ = try reducer.fold(
         message: #"{"t":"attached","session":"00000000-0000-0000-0000-00000000000a","workspace":"/w"}"#)
     let store = SessionStore(source: reducer)
-    var last: ViewUpdate?
+    var last: ChangeBatch?
     for seq in 1...1000 {
         last = try reducer.fold(
             message: #"{"t":"entry","seq":\#(seq),"epoch":0,"kind":"input","text":"m\#(seq)","taken":true}"#)
@@ -126,11 +126,8 @@ func expectInStep(_ store: SessionStore, _ reducer: Reducer, _ name: String) {
         if let update = try reducer.fold(message: message) { store.apply(update) }
     }
     #expect(store.title == "Fix the parser")
-    guard case .reply(_, _, _, _, let purpose, _) = store.items.first else {
-        Issue.record("a reply item")
-        return
-    }
-    #expect(purpose == "title")
+    #expect(store.items.first?.kind == .side)
+
 }
 
 @Test func errorsCarryStableCodes() {
@@ -151,17 +148,17 @@ func expectInStep(_ store: SessionStore, _ reducer: Reducer, _ name: String) {
     var sawQuestion = false
     for message in vector.messages {
         if let update = try reducer.fold(message: message) { store.apply(update) }
-        if let shown = store.items.first?.shown(), !shown.approval.isEmpty {
+        if let shown = store.items.first?.presentation, !shown.approval.isEmpty {
             if shown.approval.count == 3 { sawQuestion = true }
         }
     }
     #expect(sawQuestion)
-    let parts = store.items.first!.shown().approval
+    let parts = store.items.first!.presentation.approval
     #expect(parts.count == 4)
     #expect(parts[1] == .reason(text: "Why: the ask mode requires approval for this tool"))
     #expect(parts[2] == .unverifiedSummary(text: "Model summary (unverified): Lists files in the current directory."))
     let (replayed, _) = try vector.fold()
-    #expect(replayed.snapshot().items.first!.shown().approval == parts)
+    #expect(replayed.snapshot().items.first!.presentation.approval == parts)
     expectInStep(store, reducer, vector.name)
 }
 
@@ -170,7 +167,7 @@ func expectInStep(_ store: SessionStore, _ reducer: Reducer, _ name: String) {
     #expect(vectors.count == 4)
     for vector in vectors {
         let (reducer, _) = try vector.fold()
-        let parts = reducer.snapshot().items.first!.shown().approval
+        let parts = reducer.snapshot().items.first!.presentation.approval
         guard parts.count == 4,
             case .call(let input) = parts[0],
             case .reason = parts[1],
@@ -186,4 +183,22 @@ func expectInStep(_ store: SessionStore, _ reducer: Reducer, _ name: String) {
             : ["/work/deep/config.ini", "-allow = false", "+allow = true", "-delete = no", "+delete = yes", "flag"]
         for marker in markers { #expect(input.contains(marker), "\(vector.name): \(marker)") }
     }
+}
+
+@Test func display_batches_apply_under_one_revision() throws {
+    let vector = Vector.all.first { $0.name == "approval reviews the effective multiline call" }!
+    let reducer = Reducer()
+    let store = SessionStore(source: reducer)
+    var sawBatch = false
+    for message in vector.messages {
+        if let update = try reducer.fold(message: message) {
+            let previous = store.rev
+            store.apply(update)
+            #expect(store.rev == previous + 1)
+            expectInStep(store, reducer, vector.name)
+            if update.changes.count > 1 { sawBatch = true }
+        }
+    }
+    #expect(sawBatch)
+    #expect(store.resyncs == 0)
 }
