@@ -55,8 +55,22 @@ fn stderr_to(log: &fs::File) -> io::Result<()> {
 }
 
 #[cfg(windows)]
-fn stderr_to(_log: &fs::File) -> io::Result<()> {
-    Err(io::ErrorKind::Unsupported.into())
+fn stderr_to(log: &fs::File) -> io::Result<()> {
+    use std::os::windows::io::AsRawHandle;
+    use windows_sys::Win32::System::Console::{STD_ERROR_HANDLE, SetStdHandle};
+    // SetStdHandle does not duplicate or own its input. Keep our duplicate
+    // alive until the next redirection, closing the previous one only then.
+    static STDERR: std::sync::Mutex<Option<fs::File>> = std::sync::Mutex::new(None);
+    let mut current = STDERR
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let duplicate = log.try_clone()?;
+    // A standard writer must finish before its old borrowed handle closes.
+    let _writer = io::stderr().lock();
+    // SAFETY: duplicate remains owned in STDERR after the call.
+    crate::windows::ok(unsafe { SetStdHandle(STD_ERROR_HANDLE, duplicate.as_raw_handle()) })?;
+    *current = Some(duplicate);
+    Ok(())
 }
 
 #[cfg(test)]

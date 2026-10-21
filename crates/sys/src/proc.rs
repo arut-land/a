@@ -2,8 +2,8 @@
 //! given, and watches on a process's exit.
 //!
 //! A [`Group`] is a Unix process group (its pgid is its leader's pid) or,
-//! on Windows, a job object named after its leader, so either is known by
-//! a number that a log can record and a later daemon act on.
+//! on Windows, a kill-on-close job object indexed by its leader. Windows
+//! trees die with their owning daemon, so recovery has none left to reap.
 
 use std::fs::File;
 use std::io;
@@ -11,18 +11,30 @@ use std::process::{Command, ExitStatus};
 
 use crate::Signal;
 
-pub use imp::ExitWatch;
 #[cfg(unix)]
 pub(crate) use imp::keep;
 pub(crate) use imp::passed;
 #[cfg(unix)]
 pub(crate) use imp::raw;
+pub use imp::{Child, ExitWatch};
 
 /// Finds bash using the system location first, then the session's PATH.
 pub fn find_bash(search: Option<&str>) -> Option<String> {
     let system = std::path::Path::new("/bin/bash");
     if system.is_file() {
         return Some(system.display().to_string());
+    }
+    #[cfg(windows)]
+    for (variable, suffix) in [
+        ("ProgramFiles", "Git/bin/bash.exe"),
+        ("LOCALAPPDATA", "Programs/Git/bin/bash.exe"),
+    ] {
+        if let Some(root) = std::env::var_os(variable) {
+            let path = std::path::PathBuf::from(root).join(suffix);
+            if path.is_file() {
+                return Some(path.display().to_string());
+            }
+        }
     }
     let name = format!("bash{}", std::env::consts::EXE_SUFFIX);
     std::env::split_paths(search?)
@@ -95,11 +107,20 @@ impl Pass for File {
     }
 }
 
-/// Lets the child `cmd` starts inherit `handles`, and only it: they stay
-/// uninheritable in this process, so no child another thread starts
-/// meanwhile holds them.
-pub fn pass<const N: usize>(cmd: &mut Command, handles: [Passed; N]) -> io::Result<()> {
-    imp::pass(cmd, handles)
+/// Starts a detached daemon. Unix hands over the bound listener and lock;
+/// Windows re-listens under the client's start lock and acknowledges binding
+/// on stdout, avoiding process-owned byte-lock and handle inheritance races.
+pub fn spawn_daemon(cmd: &mut Command, home: &crate::Home, lock: File) -> io::Result<Child> {
+    imp::spawn_daemon(cmd, home, lock)
+}
+
+pub fn daemon_ready() -> io::Result<()> {
+    imp::daemon_ready()
+}
+
+/// Creates a command's process tree as a group before any user code runs.
+pub fn spawn_group(cmd: &mut Command, output: File) -> io::Result<Child> {
+    imp::spawn_group(cmd, output)
 }
 
 /// Adopts the locked daemon record our parent passed down: the lock is the
@@ -125,6 +146,48 @@ pub fn exit_watch(pid: u32) -> io::Result<ExitWatch> {
 /// no such process, or no way to tell.
 pub fn process_started(pid: u32) -> Option<u64> {
     imp::process_started(pid)
+}
+
+/// A daemon identity bound to its stop target. On Windows the same owned
+/// query+terminate handle checks creation time and performs termination.
+pub struct RecordedProcess {
+    #[cfg(windows)]
+    process: imp::RecordedProcess,
+    #[cfg(unix)]
+    record: crate::crash::Record,
+}
+
+impl RecordedProcess {
+    pub fn open(record: &crate::crash::Record) -> io::Result<Self> {
+        #[cfg(windows)]
+        return imp::RecordedProcess::open(record.pid, record.token)
+            .map(|process| Self { process });
+        #[cfg(unix)]
+        {
+            if !record.is_live() {
+                return Err(io::Error::other(
+                    "process is no longer the daemon that recorded it",
+                ));
+            }
+            Ok(Self {
+                record: record.clone(),
+            })
+        }
+    }
+
+    pub fn signal(&self, signal: Signal) -> io::Result<()> {
+        #[cfg(windows)]
+        return self.process.signal(signal);
+        #[cfg(unix)]
+        {
+            if !self.record.is_live() {
+                return Err(io::Error::other(
+                    "process is no longer the daemon that recorded it",
+                ));
+            }
+            signal_process(self.record.pid, signal)
+        }
+    }
 }
 
 /// Sends `signal` to a process.
@@ -163,6 +226,43 @@ mod imp {
     use crate::Signal;
 
     pub type ExitWatch = OwnedFd;
+    pub type Child = std::process::Child;
+
+    pub fn spawn_daemon(
+        cmd: &mut Command,
+        home: &crate::Home,
+        lock: fs::File,
+    ) -> io::Result<std::process::Child> {
+        use super::Pass;
+        let listener = home.bind()?;
+        let handles = [listener.passed(), lock.passed()];
+        cmd.args([
+            "--listen-fd",
+            &handles[0].to_string(),
+            "--lock-fd",
+            &handles[1].to_string(),
+        ]);
+        pass(cmd, handles)?;
+        let child = cmd.spawn();
+        drop((listener, lock));
+        child
+    }
+
+    #[allow(
+        clippy::unnecessary_wraps,
+        reason = "Windows writes the startup acknowledgement"
+    )]
+    pub fn daemon_ready() -> io::Result<()> {
+        Ok(())
+    }
+
+    pub fn spawn_group(cmd: &mut Command, output: fs::File) -> io::Result<Child> {
+        lead(cmd);
+        cmd.stdin(std::process::Stdio::null())
+            .stdout(output.try_clone()?)
+            .stderr(output)
+            .spawn()
+    }
 
     pub fn passed(fd: &impl AsRawFd) -> Passed {
         Passed(fd.as_raw_fd())
@@ -493,122 +593,9 @@ mod imp {
     }
 }
 
-/// Windows until its daemon lands (job objects, handle lists): commands
-/// still lead a console process group of their own, a process's exit is
-/// waited for through its handle, and what needs the rest says it is
-/// unsupported.
 #[cfg(windows)]
-mod imp {
-    use std::fs::File;
-    use std::io;
-    use std::os::windows::io::{AsRawHandle, OwnedHandle};
-    use std::process::{Command, ExitStatus};
-
-    use super::Passed;
-    use crate::Signal;
-
-    /// A process handle, signalled when it exits.
-    pub type ExitWatch = OwnedHandle;
-
-    /// `CREATE_NEW_PROCESS_GROUP`.
-    const NEW_GROUP: u32 = 0x0000_0200;
-
-    fn unsupported() -> io::Error {
-        io::Error::new(io::ErrorKind::Unsupported, "not supported on Windows yet")
-    }
-
-    pub fn passed(handle: &impl AsRawHandle) -> Passed {
-        Passed(i32::try_from(handle.as_raw_handle() as isize).unwrap_or(-1))
-    }
-
-    pub fn pass<const N: usize>(_cmd: &mut Command, _handles: [Passed; N]) -> io::Result<()> {
-        Err(unsupported())
-    }
-
-    pub fn adopt_lock(_passed: Passed) -> io::Result<File> {
-        Err(unsupported())
-    }
-
-    /// A detached daemon is started detached; there is no session to leave.
-    #[allow(clippy::unnecessary_wraps, reason = "Unix can fail")]
-    pub fn detach_session() -> io::Result<()> {
-        Ok(())
-    }
-
-    pub fn lead(cmd: &mut Command) {
-        std::os::windows::process::CommandExt::creation_flags(cmd, NEW_GROUP);
-    }
-
-    /// When the machine booted, in Unix seconds rounded to the minute: the
-    /// clock less the time since boot (`GetTickCount64`), so the same for
-    /// every process of one boot. Rounding absorbs the two clocks' drift; a
-    /// wall-clock jump can make one boot look like another, which only
-    /// leaves a recorded group unkilled.
-    pub fn read_boot_id() -> Option<String> {
-        #[link(name = "kernel32")]
-        unsafe extern "system" {
-            fn GetTickCount64() -> u64;
-        }
-        // SAFETY: takes nothing and cannot fail.
-        let since_boot = unsafe { GetTickCount64() } / 1000;
-        let now = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .ok()?
-            .as_secs();
-        let booted = (now.checked_sub(since_boot)? + 30) / 60 * 60;
-        Some(format!("boot-{booted}"))
-    }
-
-    pub fn process_started(_pid: u32) -> Option<u64> {
-        None
-    }
-
-    /// A handle on the process that can only wait for it (`SYNCHRONIZE`):
-    /// it is signalled once the process exits.
-    pub fn exit_watch(pid: u32) -> io::Result<OwnedHandle> {
-        use std::os::windows::io::{FromRawHandle, RawHandle};
-
-        const SYNCHRONIZE: u32 = 0x0010_0000;
-        /// What `OpenProcess` fails with for a pid no process has.
-        const ERROR_INVALID_PARAMETER: i32 = 87;
-        #[link(name = "kernel32")]
-        unsafe extern "system" {
-            fn OpenProcess(access: u32, inherit: i32, pid: u32) -> RawHandle;
-        }
-        // SAFETY: takes plain values; a null return is checked below.
-        let handle = unsafe { OpenProcess(SYNCHRONIZE, 0, pid) };
-        if handle.is_null() {
-            let e = io::Error::last_os_error();
-            return Err(if e.raw_os_error() == Some(ERROR_INVALID_PARAMETER) {
-                io::ErrorKind::NotFound.into()
-            } else {
-                e
-            });
-        }
-        // SAFETY: a handle just opened, which nothing else owns.
-        Ok(unsafe { OwnedHandle::from_raw_handle(handle) })
-    }
-
-    pub fn group_members(_pgid: u32) -> Vec<u32> {
-        Vec::new()
-    }
-
-    pub fn signal_group(_pgid: u32, _signal: Signal) -> io::Result<()> {
-        Err(unsupported())
-    }
-
-    pub fn group_alive(_pgid: u32) -> bool {
-        false
-    }
-
-    pub fn signal_process(_pid: u32, _signal: Signal) -> io::Result<()> {
-        Err(unsupported())
-    }
-
-    pub fn exit_signal(_status: ExitStatus) -> Option<String> {
-        None
-    }
-}
+#[path = "proc_windows.rs"]
+mod imp;
 
 #[cfg(all(test, unix))]
 mod tests {
@@ -717,26 +704,28 @@ mod tests {
     }
 }
 
-/// Owns a child's input pipe as a file, suitable for reactor registration.
-pub fn child_input(pipe: std::process::ChildStdin) -> File {
-    #[cfg(unix)]
-    {
-        File::from(std::os::fd::OwnedFd::from(pipe))
-    }
-    #[cfg(windows)]
-    {
-        File::from(std::os::windows::io::OwnedHandle::from(pipe))
-    }
-}
+/// Parent ends of child stdio: readiness pipes on Unix, overlapped pipes on Windows.
+#[cfg(unix)]
+pub type ProcessPipe = File;
+#[cfg(windows)]
+pub type ProcessPipe = crate::Stream;
 
-/// Owns a child's output pipe as a file, suitable for reactor registration.
-pub fn child_output(pipe: std::process::ChildStdout) -> File {
+/// Starts a contained child with only its explicit stdio inherited.
+pub fn spawn_stdio(cmd: &mut Command) -> io::Result<(Child, ProcessPipe, ProcessPipe)> {
     #[cfg(unix)]
     {
-        File::from(std::os::fd::OwnedFd::from(pipe))
+        use std::os::fd::OwnedFd;
+        use std::process::Stdio;
+        imp::lead(cmd);
+        let mut child = cmd
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::null())
+            .spawn()?;
+        let input = File::from(OwnedFd::from(child.stdin.take().unwrap()));
+        let output = File::from(OwnedFd::from(child.stdout.take().unwrap()));
+        Ok((child, input, output))
     }
     #[cfg(windows)]
-    {
-        File::from(std::os::windows::io::OwnedHandle::from(pipe))
-    }
+    imp::spawn_stdio(cmd)
 }

@@ -4,11 +4,14 @@
 
 use std::fs::{self, File};
 use std::io::{self, Read};
+#[cfg(unix)]
 use std::os::unix::fs::{MetadataExt, OpenOptionsExt, symlink};
 use std::path::{Path, PathBuf};
 use std::time::SystemTime;
 
 use crate::fnv1a;
+
+const EXE: &str = if cfg!(windows) { "a.exe" } else { "a" };
 
 /// The version every build id starts with.
 pub const VERSION: &str = env!("CARGO_PKG_VERSION");
@@ -40,12 +43,19 @@ impl Runtime {
 
     /// What the daemon runs: `current/a`, resolved by `exec`.
     pub fn current_exe(&self) -> PathBuf {
-        self.dir.join("current").join("a")
+        #[cfg(unix)]
+        {
+            self.dir.join("current").join(EXE)
+        }
+        #[cfg(windows)]
+        {
+            self.dir.join(self.current().unwrap_or_default()).join(EXE)
+        }
     }
 
     /// The id `current` points at.
     pub fn current(&self) -> Option<String> {
-        let target = fs::read_link(self.dir.join("current")).ok()?;
+        let target = read_reference(&self.dir.join("current"))?;
         target.into_os_string().into_string().ok()
     }
 
@@ -70,7 +80,7 @@ impl Runtime {
                 id
             }
         };
-        let exe = Some(self.dir.join(&id).join("a"))
+        let exe = Some(self.dir.join(&id).join(EXE))
             .filter(|staged| staged.is_file())
             .unwrap_or(exe);
         Ok(Staged { id, exe })
@@ -79,7 +89,7 @@ impl Runtime {
     /// The id of an exe that already is `runtime/<id>/a`.
     fn id_in_runtime(&self, exe: &Path) -> Option<String> {
         let dir = exe.parent()?;
-        if exe.file_name()? != "a" || dir.parent()? != fs::canonicalize(&self.dir).ok()? {
+        if exe.file_name()? != EXE || dir.parent()? != fs::canonicalize(&self.dir).ok()? {
             return None;
         }
         dir.file_name()?.to_str().map(str::to_owned)
@@ -88,11 +98,7 @@ impl Runtime {
     fn stamp(&self, exe: &Path) -> io::Result<PathBuf> {
         let meta = fs::metadata(exe)?;
         let mut key = exe.as_os_str().as_encoded_bytes().to_vec();
-        for n in [meta.dev(), meta.ino(), meta.size()] {
-            key.extend(n.to_le_bytes());
-        }
-        key.extend(meta.mtime().to_le_bytes());
-        key.extend(meta.mtime_nsec().to_le_bytes());
+        stamp_metadata(&meta, &mut key);
         Ok(self
             .dir
             .join("stamps")
@@ -101,12 +107,12 @@ impl Runtime {
 
     /// The id a stamp remembers for `exe`, staged or since pruned.
     fn stamped(&self, exe: &Path) -> Option<String> {
-        let id = fs::read_link(self.stamp(exe).ok()?).ok()?.into_os_string();
+        let id = read_reference(&self.stamp(exe).ok()?)?.into_os_string();
         id.into_string().ok()
     }
 
     fn is_staged(&self, id: &str) -> bool {
-        self.dir.join(id).join("a").is_file()
+        self.dir.join(id).join(EXE).is_file()
     }
 
     /// A known build that is no longer staged while `current` is: only
@@ -125,16 +131,15 @@ impl Runtime {
         let hash = content_hash(File::open(exe)?)?;
         let id = format!("{VERSION}+{hash:016x}");
         let dir = self.dir.join(&id);
-        let target = dir.join("a");
+        let target = dir.join(EXE);
         if !target.is_file() {
             fs::create_dir_all(&dir)?;
             let tmp = dir.join(format!(".a.{}", std::process::id()));
-            let mut file = fs::OpenOptions::new()
-                .write(true)
-                .create(true)
-                .truncate(true)
-                .mode(0o755)
-                .open(&tmp)?;
+            let mut options = fs::OpenOptions::new();
+            options.write(true).create(true).truncate(true);
+            #[cfg(unix)]
+            options.mode(0o755);
+            let mut file = options.open(&tmp)?;
             io::copy(&mut File::open(exe)?, &mut file)?;
             // The build's own time orders builds of one version.
             file.set_modified(fs::metadata(exe)?.modified()?)?;
@@ -150,7 +155,7 @@ impl Runtime {
         }
         let stamp = self.stamp(exe)?;
         fs::create_dir_all(stamp.parent().unwrap_or(&self.dir))?;
-        replace_symlink(&id, &stamp)?;
+        replace_reference(&id, &stamp)?;
         Ok(id)
     }
 
@@ -162,7 +167,7 @@ impl Runtime {
             None => true,
         };
         if newer {
-            replace_symlink(id, &self.dir.join("current"))?;
+            replace_reference(id, &self.dir.join("current"))?;
         }
         self.prune()
     }
@@ -183,7 +188,13 @@ impl Runtime {
             others.retain(|other| *other != newest);
         }
         for (_, id) in others {
-            fs::remove_dir_all(self.dir.join(id))?;
+            match fs::remove_dir_all(self.dir.join(id)) {
+                // Windows keeps a running executable open. Prune it after
+                // that daemon exits, without preventing newer builds staging.
+                #[cfg(windows)]
+                Err(e) if matches!(e.raw_os_error(), Some(5 | 32)) => {}
+                result => result?,
+            }
         }
         let Ok(stamps) = fs::read_dir(self.dir.join("stamps")) else {
             return Ok(());
@@ -192,7 +203,7 @@ impl Runtime {
         let mut dangling: Vec<(u128, PathBuf)> = stamps
             .flatten()
             .map(|stamp| stamp.path())
-            .filter(|path| fs::read_link(path).is_ok_and(|id| !self.dir.join(id).exists()))
+            .filter(|path| read_reference(path).is_some_and(|id| !self.dir.join(id).exists()))
             .filter_map(|path| {
                 let modified = fs::symlink_metadata(&path).ok()?.modified().ok()?;
                 let since = modified
@@ -210,7 +221,7 @@ impl Runtime {
 
     /// Builds order by version, then by build time; `None` if not staged.
     fn order(&self, id: &str) -> Option<Order> {
-        let built = fs::metadata(self.dir.join(id).join("a"))
+        let built = fs::metadata(self.dir.join(id).join(EXE))
             .ok()?
             .modified()
             .ok()?;
@@ -226,9 +237,14 @@ impl Runtime {
 
     /// Serializes stagers so a prune never races a copy or a repoint.
     fn lock(&self) -> io::Result<File> {
-        fs::create_dir_all(&self.dir)?;
-        let file = File::create(self.dir.join(".lock"))?;
-        file.lock()?;
+        crate::fs::private_dir(&self.dir)?;
+        let file = File::options()
+            .create(true)
+            .truncate(false)
+            .read(true)
+            .write(true)
+            .open(self.dir.join(".lock"))?;
+        crate::fs::lock(&file)?;
         Ok(file)
     }
 }
@@ -239,12 +255,55 @@ struct Order {
     built: SystemTime,
 }
 
-/// Atomically replaces `link` with a symlink to `target` (relative).
-fn replace_symlink(target: &str, link: &Path) -> io::Result<()> {
+/// Atomically publishes a build id: a relative symlink on Unix, a small
+/// reference file on Windows, where symlinks would need elevated rights.
+fn replace_reference(target: &str, link: &Path) -> io::Result<()> {
     let tmp = link.with_file_name(format!(".link.{}", std::process::id()));
     let _ = fs::remove_file(&tmp);
+    #[cfg(unix)]
     symlink(target, &tmp)?;
-    fs::rename(&tmp, link)
+    #[cfg(windows)]
+    {
+        fs::write(&tmp, target)?;
+        File::options().write(true).open(&tmp)?.sync_all()?;
+    }
+    crate::fs::replace(&tmp, link)
+}
+
+fn read_reference(path: &Path) -> Option<PathBuf> {
+    #[cfg(unix)]
+    {
+        fs::read_link(path).ok()
+    }
+    #[cfg(windows)]
+    {
+        fs::read_to_string(path)
+            .ok()
+            .filter(|id| !id.is_empty() && !id.contains(['/', '\\', ':', '\n', '\r']))
+            .map(PathBuf::from)
+    }
+}
+
+fn stamp_metadata(meta: &fs::Metadata, key: &mut Vec<u8>) {
+    #[cfg(unix)]
+    {
+        for n in [meta.dev(), meta.ino(), meta.size()] {
+            key.extend(n.to_le_bytes());
+        }
+        key.extend(meta.mtime().to_le_bytes());
+        key.extend(meta.mtime_nsec().to_le_bytes());
+    }
+    #[cfg(windows)]
+    {
+        use std::os::windows::fs::MetadataExt;
+        for n in [
+            meta.creation_time(),
+            meta.last_write_time(),
+            meta.file_size(),
+        ] {
+            key.extend(n.to_le_bytes());
+        }
+    }
 }
 
 /// FNV-1a over 64-bit words with a rotate, so a multi-megabyte binary hashes
@@ -278,6 +337,7 @@ fn content_hash(mut from: impl Read) -> io::Result<u64> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[cfg(unix)]
     use std::os::unix::fs::PermissionsExt;
     use std::time::Duration;
 
@@ -343,9 +403,13 @@ mod tests {
         // Running it again finds it outranked by its stamp: no copy, which
         // a read-only runtime would refuse.
         let runtime_dir = dir.join("runtime");
+        #[cfg(unix)]
         fs::set_permissions(&runtime_dir, fs::Permissions::from_mode(0o555)).unwrap();
         let restaged = runtime.stage(&dir.join("bin/old2"));
+        #[cfg(unix)]
         fs::set_permissions(&runtime_dir, fs::Permissions::from_mode(0o755)).unwrap();
+        #[cfg(windows)]
+        let _ = runtime_dir;
         assert_eq!(restaged.unwrap(), again);
 
         // A known file is recognised by its stamp; the copy is never redone.
@@ -364,10 +428,10 @@ mod tests {
         // A hand-made build of a higher version, built earlier.
         let higher = "99.0.0+0000000000000001";
         fs::create_dir_all(dir.join("runtime").join(higher)).unwrap();
-        fs::copy(&staged.exe, dir.join("runtime").join(higher).join("a")).unwrap();
+        fs::copy(&staged.exe, dir.join("runtime").join(higher).join(EXE)).unwrap();
         File::options()
             .write(true)
-            .open(dir.join("runtime").join(higher).join("a"))
+            .open(dir.join("runtime").join(higher).join(EXE))
             .unwrap()
             .set_modified(SystemTime::UNIX_EPOCH)
             .unwrap();

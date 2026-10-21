@@ -302,3 +302,37 @@ per-process timeout, completed with zero hangs and zero nonzero exits in
 all three groups. The daemon was stopped through that home and the home
 removed; the fixture build directory and temporary stress script were
 removed. The loop is not committed.
+
+## Windows sync classes
+
+On Windows, Rust's `File::sync_data` and `File::sync_all` both call
+`FlushFileBuffers`. Thus an ordered barrier already requests a file cache
+flush, and `SEPARATE_CACHE_FLUSH` is false: there is no additional shared
+flush epoch or blocking hop. Lazy writes can remain cached until the next
+barrier; publication and unsafe effects still await the durable prefix.
+This is stronger, and potentially more expensive, than Apple's separate
+ordering barrier. No Windows latency measurement has been made here.
+
+Namespace durability is separate from flushing file contents. On NTFS,
+`sys::fs::publish` moves a flushed temporary file within its volume using
+`MoveFileExW(REPLACE_EXISTING | WRITE_THROUGH)`: return waits for the move
+on disk. Cross-volume copy fallback is disabled. Imports and catalog rewrites
+use this operation before acknowledging publication. Windows creates a new
+log by flushing and publishing its header before opening its append handle;
+Unix retains the deferred directory barrier on the first durable entry.
+The Windows path adds a header flush and rename per new session; this is a
+correctness cost, with no local Windows timing claim.
+
+The catalog dirty marker is also published before logs may change. Cleaning
+renames that marker to a tombstone with the same durable operation, then
+reclaims the tombstone. A surviving tombstone cannot make a stale catalog
+look clean. Unix publication uses rename followed by parent-directory fsync.
+The former successful Windows `sync_dir` no-op now returns Unsupported;
+Windows publication never depends on it. Microsoft does not document
+`FlushFileBuffers` on a directory opened with BACKUP_SEMANTICS as a directory
+persistence contract, so that is not used as evidence.
+
+These guarantees target local NTFS with storage that honors flush requests.
+Crash/restart tests establish logical recovery, not persistence under power
+loss. Native Windows CI must execute rename/error handling and new-log tests;
+physical power-cut verification requires a suitable filesystem/storage host.
