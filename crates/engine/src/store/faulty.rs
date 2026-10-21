@@ -8,7 +8,7 @@ use std::sync::{Arc, Mutex};
 
 use protocol::{Entry, SessionId};
 
-use super::{Encoded, Header, Loaded, Log, LogStore, Snapshot};
+use super::{Encoded, Header, ImportStep, Loaded, Log, LogStore, Snapshot};
 use crate::lock;
 
 /// `inner`, whose logs keep what is only written apart from what is
@@ -29,6 +29,7 @@ struct State {
     cut: AtomicBool,
     fail_sync: Mutex<Option<SyncFailure>>,
     fail_write: AtomicBool,
+    fail_import: Mutex<Option<ImportStep>>,
 }
 
 #[derive(Clone, Copy)]
@@ -62,6 +63,10 @@ impl Faulty {
         self.state.fail_write.store(true, Ordering::SeqCst);
     }
 
+    pub fn fail_import_at(&self, step: ImportStep) {
+        *lock(&self.state.fail_import) = Some(step);
+    }
+
     fn wrap(&self, id: SessionId, mut loaded: Loaded) -> Loaded {
         let inner = std::mem::replace(&mut loaded.writer.log, Box::new(Off));
         loaded.writer.log = Box::new(FaultyLog {
@@ -84,7 +89,14 @@ impl LogStore for Faulty {
     }
 
     fn import(&self, header: &Header, entries: &[Entry]) -> io::Result<()> {
-        self.inner.import(header, entries)
+        self.inner.import_checked(header, entries, &mut |step| {
+            let mut failure = lock(&self.state.fail_import);
+            if *failure == Some(step) {
+                failure.take();
+                return Err(io::Error::other(format!("import failed at {step:?}")));
+            }
+            Ok(())
+        })
     }
 
     fn headers(&self) -> io::Result<Vec<Header>> {

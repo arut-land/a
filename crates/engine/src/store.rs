@@ -180,6 +180,17 @@ impl Writer {
     }
 }
 
+/// Publication boundaries of an imported log. Faults on either side of
+/// rename must exercise the same catalog recovery protocol as a crash.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ImportStep {
+    Write,
+    FileSync,
+    Rename,
+    DirectorySync,
+    Published,
+}
+
 /// Where session logs live. Each `create` or `load` hands out the log's
 /// writer under a lease newer than every one before.
 pub trait LogStore: Send + Sync {
@@ -193,6 +204,21 @@ pub trait LogStore: Send + Sync {
     /// Publishes a complete imported history atomically. A failed import
     /// must never expose a partial session through `headers`.
     fn import(&self, header: &Header, entries: &[Entry]) -> io::Result<()>;
+
+    #[cfg(test)]
+    fn import_checked(
+        &self,
+        header: &Header,
+        entries: &[Entry],
+        check: &mut dyn FnMut(ImportStep) -> io::Result<()>,
+    ) -> io::Result<()> {
+        for step in [ImportStep::Write, ImportStep::FileSync, ImportStep::Rename] {
+            check(step)?;
+        }
+        self.import(header, entries)?;
+        check(ImportStep::DirectorySync)?;
+        check(ImportStep::Published)
+    }
 
     /// Every session's header, oldest first, without reading the entries.
     fn headers(&self) -> io::Result<Vec<Header>>;

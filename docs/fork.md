@@ -43,6 +43,9 @@ there is no shared lease or retention graph, and hibernation and snapshots use
 the existing independent-session path. The import is written and synced under
 a pending filename, then renamed and the directory synced before publication.
 A crash exposes a whole imported log or none; pending files are not sessions.
+Publication and cataloguing share a recovery guard. Any failed or unwound
+import keeps the catalog dirty, including on orderly shutdown, so the next
+startup discovers a log left behind after rename or directory-sync failure.
 Derived files can be removed and rebuilt from that log.
 
 Extension folds replay only the chosen prefix. Dynamic extension installation

@@ -162,10 +162,7 @@ pub(crate) fn copy_history(
         workspace: header.workspace.clone(),
         parent: None,
     };
-    shared.store.import(&copied, &entries)?;
-    let mut record = Record::new(copied.clone());
-    record.entries = seq.get() + 1;
-    shared.catalog.record(record);
+    shared.catalog.import(&*shared.store, &copied, &entries)?;
     Ok(copied)
 }
 

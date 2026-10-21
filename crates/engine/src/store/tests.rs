@@ -921,3 +921,59 @@ fn imported_history_does_not_need_its_parents_file_or_derived_directory() {
         .unwrap();
     assert_eq!(replay, entries);
 }
+
+#[test]
+fn every_failed_import_is_absent_or_discovered_after_an_orderly_shutdown() {
+    use crate::catalog::Catalog;
+    for step in [
+        ImportStep::Write,
+        ImportStep::FileSync,
+        ImportStep::Rename,
+        ImportStep::DirectorySync,
+        ImportStep::Published,
+    ] {
+        let dir = temp_dir();
+        let inner = Arc::new(Jsonl::open(dir.join("sessions")).unwrap());
+        let store = Faulty::new(inner.clone());
+        let catalog_path = dir.join("catalog");
+        let catalog = Catalog::open(catalog_path.clone(), &store).unwrap();
+        let header = header("/w");
+        let entries = [entry(1, 1)];
+        store.fail_import_at(step);
+        assert!(
+            catalog.import(&store, &header, &entries).is_err(),
+            "{step:?}"
+        );
+        assert!(catalog.clean().is_err(), "{step:?}");
+        assert!(catalog_path.with_extension("dirty").exists());
+        drop(catalog);
+        let catalog = Catalog::open(catalog_path, &*inner).unwrap();
+        let published = matches!(step, ImportStep::DirectorySync | ImportStep::Published);
+        assert_eq!(catalog.get(header.id).is_some(), published, "{step:?}");
+        if published {
+            assert_eq!(inner.prefix(header.id, 1).unwrap(), entries);
+        }
+        catalog.clean().unwrap();
+        drop((catalog, store, inner));
+        fs::remove_dir_all(dir).unwrap();
+    }
+}
+
+#[test]
+fn a_successful_import_survives_a_clean_catalog_restart() {
+    use crate::catalog::Catalog;
+    let dir = temp_dir();
+    let store = Jsonl::open(dir.join("sessions")).unwrap();
+    let path = dir.join("catalog");
+    let catalog = Catalog::open(path.clone(), &store).unwrap();
+    let header = header("/w");
+    let entries = [entry(1, 1)];
+    catalog.import(&store, &header, &entries).unwrap();
+    catalog.clean().unwrap();
+    drop(catalog);
+    let catalog = Catalog::open(path, &store).unwrap();
+    assert_eq!(catalog.get(header.id).unwrap().entries, 1);
+    assert_eq!(store.prefix(header.id, 1).unwrap(), entries);
+    drop((catalog, store));
+    fs::remove_dir_all(dir).unwrap();
+}

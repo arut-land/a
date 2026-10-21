@@ -8,8 +8,8 @@ use protocol::{Decode, Entry, Json, ReadOnly, SessionId};
 use serde::{Deserialize, Serialize};
 
 use super::{
-    Encoded, Header, Kept, LeaseAuthority, Lines, Loaded, Local, Log, LogStore, Snapshot, Writer,
-    span,
+    Encoded, Header, ImportStep, Kept, LeaseAuthority, Lines, Loaded, Local, Log, LogStore,
+    Snapshot, Writer, span,
 };
 
 /// The format of the files this build writes, which the header line names:
@@ -46,6 +46,55 @@ impl Jsonl {
             dir,
             leases: Local::default(),
         })
+    }
+
+    fn import_with(
+        &self,
+        header: &Header,
+        entries: &[Entry],
+        mut check: impl FnMut(ImportStep) -> io::Result<()>,
+    ) -> io::Result<()> {
+        let path = self.path(header.id);
+        if path.exists() {
+            return Err(io::ErrorKind::AlreadyExists.into());
+        }
+        // Pending imports are outside the catalog's namespace, including
+        // after a crash. Only the complete, synced file becomes a session.
+        let pending = path.with_extension("pending");
+        let result = (|| {
+            check(ImportStep::Write)?;
+            let mut file = OpenOptions::new()
+                .create_new(true)
+                .write(true)
+                .open(&pending)?;
+            let mut line = format!(r#"{{"format":{FORMAT},"#).into_bytes();
+            let at = line.len();
+            serde_json::to_writer(&mut line, header)?;
+            line.remove(at);
+            seal(&mut line, 0);
+            file.write_all(&line)?;
+            for (index, entry) in entries.iter().enumerate() {
+                if entry.seq.get() != index as u64 + 1 {
+                    return Err(io::Error::other("import has a sequence gap"));
+                }
+                line.clear();
+                entry.encode(&mut line)?;
+                seal(&mut line, 0);
+                file.write_all(&line)?;
+            }
+            check(ImportStep::FileSync)?;
+            file.sync_all()?;
+            drop(file);
+            check(ImportStep::Rename)?;
+            fs::rename(&pending, &path)?;
+            check(ImportStep::DirectorySync)?;
+            sys::fs::sync_dir(&self.dir)?;
+            check(ImportStep::Published)
+        })();
+        if result.is_err() {
+            let _ = fs::remove_file(pending);
+        }
+        result
     }
 
     fn path(&self, id: SessionId) -> PathBuf {
@@ -108,42 +157,17 @@ impl LogStore for Jsonl {
     }
 
     fn import(&self, header: &Header, entries: &[Entry]) -> io::Result<()> {
-        let path = self.path(header.id);
-        if path.exists() {
-            return Err(io::ErrorKind::AlreadyExists.into());
-        }
-        // Pending imports are outside the catalog's namespace, including
-        // after a crash. Only the complete, synced file becomes a session.
-        let pending = path.with_extension("pending");
-        let result = (|| {
-            let mut file = OpenOptions::new()
-                .create_new(true)
-                .write(true)
-                .open(&pending)?;
-            let mut line = format!(r#"{{"format":{FORMAT},"#).into_bytes();
-            let at = line.len();
-            serde_json::to_writer(&mut line, header)?;
-            line.remove(at);
-            seal(&mut line, 0);
-            file.write_all(&line)?;
-            for (index, entry) in entries.iter().enumerate() {
-                if entry.seq.get() != index as u64 + 1 {
-                    return Err(io::Error::other("import has a sequence gap"));
-                }
-                line.clear();
-                entry.encode(&mut line)?;
-                seal(&mut line, 0);
-                file.write_all(&line)?;
-            }
-            file.sync_all()?;
-            drop(file);
-            fs::rename(&pending, &path)?;
-            sys::fs::sync_dir(&self.dir)
-        })();
-        if result.is_err() {
-            let _ = fs::remove_file(pending);
-        }
-        result
+        self.import_with(header, entries, |_| Ok(()))
+    }
+
+    #[cfg(test)]
+    fn import_checked(
+        &self,
+        header: &Header,
+        entries: &[Entry],
+        check: &mut dyn FnMut(ImportStep) -> io::Result<()>,
+    ) -> io::Result<()> {
+        self.import_with(header, entries, check)
     }
 
     /// A file whose header did not survive a crash holds no entries either,
