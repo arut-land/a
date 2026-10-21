@@ -403,16 +403,35 @@ impl Rule for () {
     }
 }
 
+/// The log guarantee required before work can start.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
+pub enum Requirement {
+    Ordered,
+    Durable,
+}
+
 /// An observer's answer: nothing, or work to do about what it saw, which
 /// the engine runs owned by the session (a side model request, say) and
 /// ends with it. An observer changes nothing itself.
-pub struct Reaction(pub Option<Later<()>>);
+pub struct Reaction {
+    pub requirement: Requirement,
+    pub work: Option<Later<()>>,
+}
 
 impl Reaction {
-    pub const NONE: Self = Self(None);
+    pub const NONE: Self = Self {
+        requirement: Requirement::Ordered,
+        work: None,
+    };
 
-    pub fn later(work: impl Future<Output = ()> + Send + 'static) -> Self {
-        Self(Some(Later::new(work)))
+    pub fn later(
+        requirement: Requirement,
+        work: impl Future<Output = ()> + Send + 'static,
+    ) -> Self {
+        Self {
+            requirement,
+            work: Some(Later::new(work)),
+        }
     }
 }
 
@@ -420,7 +439,7 @@ impl Rule for Reaction {
     const MERGE: Merge = Merge::Observe;
     type Subject = ();
     /// What the handlers do about it, in their order.
-    type Merged = Vec<Later<()>>;
+    type Merged = Vec<Reaction>;
 
     fn open() -> Self {
         Self::NONE
@@ -435,7 +454,8 @@ impl Rule for Reaction {
     ) -> Self::Merged {
         handlers
             .iter()
-            .filter_map(|(name, handler)| P::call(name, handler, cx, P::input(facts, &())).0)
+            .map(|(name, handler)| P::call(name, handler, cx, P::input(facts, &())))
+            .filter(|reaction| reaction.work.is_some())
             .collect()
     }
 }
@@ -1224,7 +1244,7 @@ impl Hooks {
     /// Tells every observer of `entry`, about the call it is the intent
     /// of, if one: what they do about it, for the engine to run owned by
     /// the session.
-    pub fn observe(&self, cx: PointCx<'_>, entry: &Entry) -> Vec<Later<()>> {
+    pub fn observe(&self, cx: PointCx<'_>, entry: &Entry) -> Vec<Reaction> {
         if self.observe.is_empty() {
             return Vec::new();
         }

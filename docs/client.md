@@ -48,14 +48,17 @@ transport (lib.rs, remote.rs)      Daemon { endpoint: Local(Home) | Ssh(host), s
   `Wedged(Diagnosis)` (the daemon took the connection and does not answer)
   or `Ended(Detached | Lost(Error))`. The view is
   `protocol::view::SessionView`, folded here from every `DaemonMsg`;
-  `TurnView` (running, asking, can interrupt, can send) is computed from
-  it for the app's controls. Intents become numbered `ClientMsg`s, kept
-  until the daemon's ack; a message sent while reconnecting goes out once
-  the connection is up again. `offer()` is how an app asks for anything:
-  `None` unless attached, and each intent (`input`, `steer`, `interrupt`,
-  `approve(call)`, `refresh_env`) only when the turn takes it, else the
-  typed `Notice` saying why; `run(Cmd)` goes through the same offers and
-  shows the notice. What used to differ between clients is decided here:
+  `TurnView` (running, asking, can interrupt, can send) combines that view
+  with pending submitted mutations: input awaiting publication or an ack
+  can be interrupted even while the local view is idle. Intents become
+  numbered `ClientMsg`s, kept until the daemon's ack; a message sent while
+  reconnecting goes out once the connection is up again. `offer()` refuses
+  with a typed `Notice` unless attached. Each intent (`input`, `steer`,
+  `interrupt`, `approve(call)`, `refresh_env`) is accepted only when the
+  turn takes it, otherwise returning a `Notice` saying why. `run(Cmd)`
+  goes through the same offers and shows the notice. Cancellation has room beyond the normal mutation
+  window; repeated interrupts coalesce until another mutation is submitted.
+  What used to differ between clients is decided here:
   reconnecting after a drain by id from the last seq without sending the
   environment again, a detach never reading as a lost daemon, input given
   while reconnecting.

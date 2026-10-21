@@ -755,8 +755,8 @@ fn a_watch_fires_once() {
 #[test]
 fn a_run_commits_as_the_barriers_setting_says() {
     use kernel::{Barriers, Durability};
-    let last = |fx: &Effects| match fx.iter().rev().find(|e| matches!(e, Effect::Commit(_))) {
-        Some(Effect::Commit(d)) => *d,
+    let last = |fx: &Effects| match fx.iter().rev().find(|e| matches!(e, Effect::Commit { .. })) {
+        Some(Effect::Commit { durability, .. }) => *durability,
         _ => panic!("no commit in {fx:?}"),
     };
     let both = [
@@ -884,4 +884,30 @@ fn exclusive_tools_never_overlap() {
     let ran: Vec<(String, String)> = started.iter().map(|&c| asked_of(&s, c)).collect();
     assert_eq!(asked.len(), 6);
     assert_eq!(ran, asked);
+}
+
+#[test]
+fn replay_safe_work_requires_ordering_even_when_its_step_appends_nothing() {
+    let mut s = Session::new(Reg::modeled().arc());
+    let first = s.step_committing(user("hello"));
+    assert!(first.iter().any(|effect| matches!(
+        effect,
+        Effect::Require(kernel::Admission {
+            through: 2,
+            requirement: kernel::Requirement::Ordered
+        })
+    )));
+    let prepared = s.step_committing(prepared(2));
+    assert!(
+        !prepared
+            .iter()
+            .any(|effect| matches!(effect, Effect::Append(_)))
+    );
+    assert!(prepared.iter().any(|effect| matches!(
+        effect,
+        Effect::Require(kernel::Admission {
+            through: 2,
+            requirement: kernel::Requirement::Ordered
+        })
+    )));
 }

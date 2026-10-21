@@ -3,7 +3,7 @@
 
 use std::io::{BufRead, BufReader, Read, Write};
 use std::net::{TcpListener, TcpStream};
-use std::sync::mpsc;
+use std::sync::{OnceLock, mpsc};
 
 use super::*;
 

@@ -161,3 +161,64 @@ fn bench_turns_under_each_barrier_setting() {
         let _ = std::fs::remove_dir_all(&dir);
     }
 }
+
+/// Simultaneous echo turns through real actors and JSONL writers, including
+/// their publication barriers, rather than isolated filesystem calls.
+#[test]
+#[ignore = "a measurement"]
+fn bench_concurrent_session_commits() {
+    const ROUNDS: usize = 30;
+    for n in [1, 8, 64] {
+        let dir =
+            std::env::temp_dir().join(format!("a-bench-concurrent-{}-{n}", std::process::id()));
+        let fixture = Fixture::on(
+            Arc::new(Jsonl::open(&dir).unwrap()),
+            ext_fixtures::ECHO,
+            Registry::default(),
+            openai(&Script::new(&[])),
+        );
+        let sessions: Vec<_> = (0..n).map(|_| fixture.create()).collect();
+        for session in &sessions {
+            settle(session);
+        }
+        let mut times = Vec::new();
+        let mut elapsed = Duration::ZERO;
+        for _ in 0..ROUNDS {
+            let ready = std::sync::Barrier::new(n + 1);
+            thread::scope(|scope| {
+                let workers: Vec<_> = sessions
+                    .iter()
+                    .map(|session| {
+                        let ready = &ready;
+                        scope.spawn(move || {
+                            ready.wait();
+                            let start = Instant::now();
+                            session.submit("hello").unwrap();
+                            settle(session);
+                            start.elapsed()
+                        })
+                    })
+                    .collect();
+                let start = Instant::now();
+                ready.wait();
+                for worker in workers {
+                    times.push(worker.join().unwrap());
+                }
+                elapsed += start.elapsed();
+            });
+        }
+        times.sort();
+        eprintln!(
+            "{n} sessions: {:.0} turns/s, p50 {:?}, p99 {:?} ({} turns)",
+            f64::from(u32::try_from(n * ROUNDS).unwrap()) / elapsed.as_secs_f64(),
+            times[times.len() / 2],
+            times[(times.len() * 99 / 100).min(times.len() - 1)],
+            times.len()
+        );
+        for session in sessions {
+            session.halt();
+        }
+        drop(fixture);
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+}
