@@ -635,7 +635,7 @@ impl Folding {
             Self::rebuild(binding, registry, shared, |restore, each| match open {
                 Open::Create => {
                     let created = shared.store.create(header).inspect_err(|e| {
-                        store_fault(header.id, ext_logging::Operation::Create, e)
+                        store_fault(header.id, ext_logging::Operation::Create, e);
                     })?;
                     shared.catalog.record(Record::new(header.clone()));
                     Ok(created)

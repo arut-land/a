@@ -271,8 +271,7 @@ pub fn reap(home: &Home, pid_file: &mut File) -> io::Result<Option<Record>> {
 
 /// Installs the daemon's content-free panic hook. The default hook formats
 /// arbitrary payloads and paths, so it must not run after this one.
-pub fn install(dir: PathBuf, build: String) {
-    let build = Build::of(&build);
+pub fn install(dir: PathBuf, build: Build) {
     panic::set_hook(Box::new(move |info| {
         let _ = write_report(&dir, &describe(info, build));
     }));
@@ -507,7 +506,7 @@ mod tests {
         assert!(crashes.breaker.tripped(LIMIT) && !crashes.breaker.tripped(0));
         let report = fs::read_to_string(crashes.last.unwrap()).unwrap();
         let report: serde_json::Value = serde_json::from_str(&report).unwrap();
-        assert_eq!(report["pid"], 999999);
+        assert_eq!(report["pid"], 999_999);
         assert_eq!(report["kind"], "unclean_exit");
         assert!(!report.to_string().contains("b1"));
         assert_eq!(fs::read_to_string(home.daemon_pid_file()).unwrap(), "");
@@ -720,7 +719,7 @@ mod tests {
     #[test]
     fn panicking_child() {
         if let Some(dir) = std::env::var_os("A_CRASH_TEST_DIR") {
-            install(dir.into(), "secret-build-text".into());
+            install(dir.into(), Build::of("secret-build-text"));
             let _ = std::thread::Builder::new()
                 .name("secret-thread-text".into())
                 .spawn(|| panic::panic_any("secret-payload-text".repeat(100_000)))

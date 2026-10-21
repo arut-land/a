@@ -214,6 +214,10 @@ fn a_consumer_parked_during_wake_registration_cannot_hold_admission() {
         entered: mpsc::Sender<()>,
         release: Mutex<mpsc::Receiver<()>>,
     }
+    #[expect(
+        clippy::manual_noop_waker,
+        reason = "its destructor parks registration"
+    )]
     impl Wake for ParkOnDrop {
         fn wake(self: Arc<Self>) {}
     }

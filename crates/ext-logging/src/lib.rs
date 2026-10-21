@@ -468,7 +468,7 @@ fn repair_tail(path: &std::path::Path) -> io::Result<()> {
     let mut end = original;
     let mut bytes = [0; 1024];
     while end != 0 {
-        let len = end.min(bytes.len() as u64) as usize;
+        let len = usize::try_from(end).unwrap_or(bytes.len()).min(bytes.len());
         let start = end - len as u64;
         file.seek(SeekFrom::Start(start))?;
         file.read_exact(&mut bytes[..len])?;

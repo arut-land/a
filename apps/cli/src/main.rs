@@ -557,7 +557,7 @@ fn serve(
     reset_breaker: bool,
 ) -> io::Result<()> {
     let home = daemon.home()?;
-    sys::crash::install(home.crash_dir(), daemon.staged.id.clone());
+    sys::crash::install(home.crash_dir(), sys::crash::Build::of(&daemon.staged.id));
     let listener = if let Some(fd) = listen_fd {
         sys::detach_session()?;
         sys::log::discard_stderr()?;
