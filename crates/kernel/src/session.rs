@@ -139,13 +139,14 @@ impl Core {
         let mut fx = StepPlan::default();
         match event {
             Event::Invoke {
+                existing,
                 parent,
                 name,
                 tool,
                 input,
                 ticket,
             } => {
-                let result = self.invoke(parent, name, tool, input, &mut fx);
+                let result = self.invoke(existing, parent, name, tool, input, &mut fx);
                 fx.immediate.push(Work::Invocation { ticket, result });
             }
             Event::Input {
@@ -1237,6 +1238,7 @@ impl Core {
 
     fn invoke(
         &mut self,
+        existing: Option<CallId>,
         parent: CallId,
         name: String,
         tool: String,
@@ -1247,26 +1249,19 @@ impl Core {
             return Err("invocation owner is not running".into());
         }
         let key = protocol::Invocation { parent, name };
-        if key.name.is_empty() {
-            return Err("invocation needs a name".into());
-        }
-        if let Some(invoked) = self
-            .fold
-            .invocations
-            .iter()
-            .find(|invoked| invoked.key == key)
-        {
-            if invoked.tool != tool || invoked.input != input {
-                return Err("invocation name was already used with different arguments".into());
+        if let Some(call) = existing {
+            if !matches!(self.fold.ledger.call(call).map(|open| &open.call),
+                Some(Call::Tool { invoke: Some(owner), .. }) if owner == &key)
+            {
+                return Err("invocation is not open".into());
             }
-            let call = invoked.call;
-            if invoked.result.is_none() && self.step_of(call).is_none() {
+            if self.step_of(call).is_none() {
                 self.set_step(call, Step::Queued { recovered: true });
             }
             return Ok(call);
         }
         let mut ancestor = parent;
-        for depth in 1..=8 {
+        loop {
             if !self.shared(&tool)
                 && self
                     .tool_of(ancestor)
@@ -1277,10 +1272,7 @@ impl Core {
             match self.fold.ledger.call(ancestor).map(|open| &open.call) {
                 Some(Call::Tool {
                     invoke: Some(key), ..
-                }) if depth < 8 => ancestor = key.parent,
-                Some(Call::Tool {
-                    invoke: Some(_), ..
-                }) => return Err("tool delegation is too deep".into()),
+                }) => ancestor = key.parent,
                 _ => break,
             }
         }
@@ -1350,15 +1342,6 @@ impl Core {
                 }
             }
         }
-    }
-
-    pub fn invocation_result(&self, call: CallId) -> Option<&ext::Called> {
-        self.fold
-            .invocations
-            .iter()
-            .find(|invoked| invoked.call == call)?
-            .result
-            .as_ref()
     }
 
     fn cancel_invocations(&mut self, parent: CallId, fx: &mut StepPlan) {

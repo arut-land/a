@@ -127,6 +127,7 @@ impl Barriers {
 #[derive(Debug)]
 pub enum Event {
     Invoke {
+        existing: Option<CallId>,
         parent: CallId,
         name: String,
         tool: String,

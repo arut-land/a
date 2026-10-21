@@ -51,7 +51,7 @@ mod journal;
 #[path = "projection.rs"]
 mod projection;
 use journal::Journal;
-use projection::Projection;
+use projection::{Invocations, Projection};
 #[path = "work.rs"]
 mod work;
 use work::{WorkHandle, WorkId, WorkSet};
@@ -520,6 +520,7 @@ impl Live {
             states,
             snapshot: fold_snapshot,
             has_input,
+            invocations,
         } = folding;
         *lock(&session.state_view()) = states;
         *lock(&session.env) = core.ledger().env().cloned().map(Arc::new);
@@ -583,7 +584,10 @@ impl Live {
                 since_snapshot: loaded.read,
                 ..Journal::default()
             },
-            projection: Projection::default(),
+            projection: Projection {
+                invocations,
+                ..Projection::default()
+            },
         };
         shared.rt.spawn(Box::pin(actor.run(rx, first)));
         Ok(live)
@@ -705,6 +709,7 @@ struct Folding {
     states: States,
     snapshot: Option<Snapshot>,
     has_input: bool,
+    invocations: Invocations,
 }
 
 impl Folding {
@@ -765,6 +770,7 @@ impl Folding {
             states: registry.states(),
             snapshot: None,
             has_input: false,
+            invocations: Invocations::default(),
         }
     }
 
@@ -800,6 +806,7 @@ impl Folding {
         self.states.apply(e);
         self.has_input |= matches!(e.body, Body::Input { .. });
         self.core.load(e);
+        self.invocations.fold(e);
     }
 }
 
@@ -1330,6 +1337,7 @@ impl Actor {
                 self.replies.invocations.insert(ticket, reply);
                 Some((
                     Event::Invoke {
+                        existing: None,
                         parent: call,
                         name,
                         tool,
@@ -1476,9 +1484,41 @@ impl Actor {
     ) -> Result<(), ()> {
         let mut acknowledgements = Vec::new();
         let mut fx = StepPlan::default();
-        for (event, done) in events {
+        for (mut event, done) in events {
+            if let Event::Invoke {
+                existing,
+                parent,
+                name,
+                tool,
+                input,
+                ticket,
+            } = &mut event
+            {
+                match self
+                    .projection
+                    .invocations
+                    .request(*parent, name, tool, input)
+                {
+                    Ok(found) => {
+                        *existing = found;
+                        if let Some(call) =
+                            found.filter(|call| self.projection.invocations.completed(*call))
+                        {
+                            self.invocation_reply(*ticket, Ok(call));
+                            continue;
+                        }
+                    }
+                    Err(error) => {
+                        self.invocation_reply(*ticket, Err(error));
+                        continue;
+                    }
+                }
+            }
             match catch_unwind(AssertUnwindSafe(|| self.core.step(event))) {
                 Ok(more) => {
+                    for entry in &more.appends {
+                        self.projection.invocations.fold(entry);
+                    }
                     if let Some(done) = done {
                         let entry = more
                             .appends
@@ -1803,6 +1843,7 @@ impl Actor {
             .has_input
             .store(folding.has_input, Ordering::SeqCst);
         self.projection = Projection {
+            invocations: folding.invocations,
             published_activity: self.projection.published_activity.take(),
             ..Projection::default()
         };
@@ -1887,20 +1928,7 @@ impl Actor {
             return;
         }
         match effect {
-            Effect::Invocation { ticket, result } => {
-                if let Some(reply) = self.replies.invocations.remove(&ticket) {
-                    match result {
-                        Ok(call) => {
-                            if let Some(result) = self.core.invocation_result(call) {
-                                reply.send(result.clone());
-                            } else {
-                                self.replies.invoked.entry(call).or_default().push(reply);
-                            }
-                        }
-                        Err(error) => reply.send(Called::failed(error)),
-                    }
-                }
-            }
+            Effect::Invocation { ticket, result } => self.invocation_reply(ticket, result),
             Effect::Delivery { ticket, result } => {
                 respond(&mut self.replies.deliveries, ticket, result);
             }

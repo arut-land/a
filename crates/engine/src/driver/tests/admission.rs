@@ -1083,3 +1083,123 @@ fn activity_waits_for_the_current_ledgers_flush_on_live_snapshot_and_since_repla
     }
     session.halt();
 }
+
+struct DelegatedHarbor;
+impl Tool for DelegatedHarbor {
+    type In = Nothing;
+    type Out = bool;
+    const NAME: &'static str = "delegated_harbor";
+    const DESCRIPTION: &'static str = "finish before an earlier flush";
+    const REPLAY: Replay = Replay::Safe;
+    fn call(&self, _: &Nothing, _: &Cx) -> Result<bool, String> {
+        Ok(true)
+    }
+}
+impl Extension for DelegatedHarbor {
+    const NAME: &'static str = "delegated_harbor";
+    const VERSION: u32 = 1;
+    fn contribute(&self, r: &mut Registrar) {
+        r.tool(Self);
+    }
+}
+
+#[test]
+fn delegated_results_wait_for_their_own_durable_prefix() {
+    let (started, starts) = channel::unbounded();
+    let (fixture, faulty, _) = pipeline(
+        Registry::default()
+            .with(&HeldHarbor(Arc::new(started)))
+            .unwrap()
+            .with(&DelegatedHarbor)
+            .unwrap(),
+    );
+    let session = fixture.create();
+    settle(&session);
+    let input = faulty.hold_next_flush();
+    let intent = faulty.hold_next_flush();
+    let result = faulty.hold_next_flush();
+    let accepted = enqueue(&session, "hello");
+    input.started();
+    let (cx, release) = started_harbor(&starts);
+    let origin = session.session.origin(cx.call, 0).unwrap();
+    let invoke = || {
+        let (reply, received) = oneshot::channel();
+        origin.send(
+            &session.session,
+            ContextRequest::Invoke {
+                name: "lookup".into(),
+                tool: <DelegatedHarbor as Tool>::NAME.into(),
+                input: Json::encode(&serde_json::json!({})).unwrap(),
+                reply,
+            },
+        );
+        received
+    };
+    let mut first = invoke();
+    let mut completed = 0;
+    session.wait("speculative delegated result", PATIENCE, || {
+        completed = faulty
+            .pending(session.id)
+            .iter()
+            .find_map(|e| {
+                matches!(e.body, Body::ToolResult { call, .. } if call != cx.call)
+                    .then_some(e.seq.get())
+            })
+            .unwrap_or(0);
+        completed != 0
+    });
+    let mut repeated = invoke();
+    let (_, before) = positions(&session);
+    assert!(before < completed);
+    input.release();
+    intent.started();
+    let captured = faulty
+        .entries(session.id)
+        .unwrap()
+        .last()
+        .unwrap()
+        .seq
+        .get();
+    intent.release();
+    session.wait("intent durable", PATIENCE, || {
+        session.frames.seq() > captured
+    });
+    let (ordered, durable) = positions(&session);
+    assert!(ordered >= completed && durable < completed);
+    let mut task = std::task::Context::from_waker(std::task::Waker::noop());
+    assert!(std::pin::Pin::new(&mut first).poll(&mut task).is_pending());
+    assert!(
+        std::pin::Pin::new(&mut repeated)
+            .poll(&mut task)
+            .is_pending()
+    );
+    session.send(Msg::Sync);
+    result.started();
+    assert!(std::pin::Pin::new(&mut first).poll(&mut task).is_pending());
+    result.release();
+    let first = rt::block_on(first).unwrap();
+    assert_eq!(first, rt::block_on(repeated).unwrap());
+    assert_eq!(
+        first.outcome,
+        Outcome::Done {
+            output: Json::encode(&true).unwrap()
+        }
+    );
+    assert_eq!(rt::block_on(accepted), Some(Ok(())));
+    release.send("parent finished".into());
+    settle(&session);
+    assert_eq!(
+        log_of(&session)
+            .iter()
+            .filter(|e| matches!(
+                e.body,
+                Body::ToolCall {
+                    invoke: Some(_),
+                    ..
+                }
+            ))
+            .count(),
+        1
+    );
+    session.halt();
+}

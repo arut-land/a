@@ -20,7 +20,6 @@ pub enum Next {
 
 pub struct Fold {
     pub ledger: Ledger,
-    pub invocations: Vec<Invocation>,
     agent: Box<dyn Agent>,
     /// What was asked for that the log does not show yet, in order: the
     /// front is carried out next, and the entry that carries it out takes
@@ -40,14 +39,6 @@ pub struct Fold {
     refused: Vec<(CallId, String)>,
 }
 
-pub struct Invocation {
-    pub call: CallId,
-    pub key: protocol::Invocation,
-    pub tool: String,
-    pub input: Json,
-    pub result: Option<ext::Called>,
-}
-
 impl Fold {
     /// The fold of a log whose ledger is `ledger`, at rest
     /// ([`Fold::at_rest`]): everything else here is empty between turns,
@@ -55,7 +46,6 @@ impl Fold {
     pub fn restore(agent: Box<dyn Agent>, ledger: Ledger) -> Self {
         Self {
             ledger,
-            invocations: Vec::new(),
             agent,
             asked: VecDeque::new(),
             stepped: false,
@@ -70,8 +60,7 @@ impl Fold {
     /// logged, and nothing kept of a call (its rewritten input, the child
     /// it waits on, a result fired for it, why it was refused).
     pub fn at_rest(&self) -> bool {
-        self.invocations.is_empty()
-            && self.asked.is_empty()
+        self.asked.is_empty()
             && self.inputs.is_empty()
             && self.owners.is_empty()
             && self.fired.is_empty()
@@ -81,42 +70,6 @@ impl Fold {
     /// Folds entry `e`, the one after the last folded: the agent is given
     /// the input it records, if any.
     pub fn apply(&mut self, e: &Entry, registry: &dyn Binding) {
-        match &e.body {
-            Body::ToolCall {
-                invoke: Some(key),
-                tool,
-                input,
-                ..
-            } => {
-                self.invocations.push(Invocation {
-                    call: CallId(e.seq),
-                    key: key.clone(),
-                    tool: tool.clone(),
-                    input: input.clone(),
-                    result: None,
-                });
-            }
-            Body::ToolResult {
-                call,
-                outcome,
-                card,
-            } => {
-                let call = *call;
-                self.invocations
-                    .retain(|invoked| invoked.key.parent != call);
-                if let Some(invoked) = self
-                    .invocations
-                    .iter_mut()
-                    .find(|invoked| invoked.call == call)
-                {
-                    invoked.result = Some(ext::Called {
-                        outcome: outcome.clone(),
-                        card: card.clone(),
-                    });
-                }
-            }
-            _ => {}
-        }
         let input = self.input(e, registry);
         self.ledger.apply(e);
         if let Some(input) = input {

@@ -8,6 +8,7 @@ use super::{
 #[derive(Default)]
 pub(super) struct Projection {
     pub(super) transcript: Option<Transcript>,
+    pub(super) invocations: Invocations,
     /// The message of the reply model call `.0` just had, until its
     /// result commits.
     pub(super) replied: Option<(CallId, llm::Assistant)>,
@@ -18,7 +19,131 @@ pub(super) struct Projection {
     pub(super) published_activity: Option<(u64, Activity)>,
 }
 
+#[derive(Default)]
+pub(super) struct Invocations {
+    through: u64,
+    calls: std::collections::BTreeMap<CallId, Invocation>,
+}
+
+struct Invocation {
+    key: protocol::Invocation,
+    tool: String,
+    input: super::Json,
+    result: Option<(protocol::Seq, super::Called)>,
+}
+
+impl Invocations {
+    pub(super) fn fold(&mut self, entry: &Entry) {
+        if entry.seq.get() <= self.through {
+            return;
+        }
+        self.through = entry.seq.get();
+        match &entry.body {
+            Body::ToolCall {
+                invoke: Some(key),
+                tool,
+                input,
+                ..
+            } => {
+                self.calls.insert(
+                    CallId(entry.seq),
+                    Invocation {
+                        key: key.clone(),
+                        tool: tool.clone(),
+                        input: input.clone(),
+                        result: None,
+                    },
+                );
+            }
+            Body::ToolResult {
+                call,
+                outcome,
+                card,
+            } => {
+                self.calls
+                    .retain(|_, invocation| invocation.key.parent != *call);
+                if let Some(invocation) = self.calls.get_mut(call) {
+                    invocation.result = Some((
+                        entry.seq,
+                        super::Called {
+                            outcome: outcome.clone(),
+                            card: card.clone(),
+                        },
+                    ));
+                }
+            }
+            _ => {}
+        }
+    }
+
+    pub(super) fn request(
+        &self,
+        parent: CallId,
+        name: &str,
+        tool: &str,
+        input: &super::Json,
+    ) -> Result<Option<CallId>, String> {
+        if name.is_empty() {
+            return Err("invocation needs a name".into());
+        }
+        if let Some((call, invocation)) = self
+            .calls
+            .iter()
+            .find(|(_, invocation)| invocation.key.parent == parent && invocation.key.name == name)
+        {
+            return if invocation.tool == tool && &invocation.input == input {
+                Ok(Some(*call))
+            } else {
+                Err("invocation name was already used with different arguments".into())
+            };
+        }
+        let mut ancestor = parent;
+        for _ in 1..8 {
+            let Some(invocation) = self.calls.get(&ancestor) else {
+                return Ok(None);
+            };
+            ancestor = invocation.key.parent;
+        }
+        if self.calls.contains_key(&ancestor) {
+            Err("tool delegation is too deep".into())
+        } else {
+            Ok(None)
+        }
+    }
+
+    pub(super) fn completed(&self, call: CallId) -> bool {
+        self.calls
+            .get(&call)
+            .is_some_and(|invocation| invocation.result.is_some())
+    }
+
+    fn result(&self, call: CallId, durable: u64) -> Option<&super::Called> {
+        let (seq, result) = self.calls.get(&call)?.result.as_ref()?;
+        (seq.get() <= durable).then_some(result)
+    }
+}
+
 impl Actor {
+    pub(super) fn invocation_reply(
+        &mut self,
+        ticket: super::Ticket,
+        result: Result<CallId, String>,
+    ) {
+        if let Some(reply) = self.replies.invocations.remove(&ticket) {
+            match result {
+                Ok(call) => match self
+                    .projection
+                    .invocations
+                    .result(call, self.journal.durable_seq)
+                {
+                    Some(result) => reply.send(result.clone()),
+                    None => self.replies.invoked.entry(call).or_default().push(reply),
+                },
+                Err(error) => reply.send(super::Called::failed(error)),
+            }
+        }
+    }
+
     pub(super) fn show(&mut self, entries: &[Entry], lines: &Encoded) {
         if let Some(view) = &mut self.projection.view {
             view.extend(entries);
@@ -75,6 +200,7 @@ impl Actor {
             self.projection.transcript = None;
         }
         for e in entries {
+            self.projection.invocations.fold(e);
             if let Body::Answer { call, .. }
             | Body::Decision {
                 call: Some(call),
