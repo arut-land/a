@@ -42,11 +42,11 @@ pub struct Change {
 
 #[derive(Deserialize)]
 #[serde(from = "Vec<Replace>")]
-pub struct Edits(Arc<Vec<Replace>>);
+pub struct Edits(Arc<[Replace]>);
 
 impl From<Vec<Replace>> for Edits {
     fn from(edits: Vec<Replace>) -> Self {
-        Self(Arc::new(edits))
+        Self(edits.into())
     }
 }
 
@@ -107,14 +107,15 @@ impl Tool for Edit {
         let path = cx.dir().join(&input.path);
         let shown = &input.path;
         let prior = cx.state(|seen: &Seen| seen.0.get(&path).copied());
-        let (edited, hash) = match (Transaction {
+        let transaction = Transaction {
             rt: cx
                 .service::<dyn rt::Runtime>()
                 .ok_or("the engine provides no runtime")?,
             cancel: &cx.cancel,
-        })
-        .edit(path, input.edits.0.clone(), prior, LIMITS)
-        .await
+        };
+        let (edited, hash) = match transaction
+            .edit(path, input.edits.0.clone(), prior, LIMITS)
+            .await
         {
             Ok(result) => result,
             Err(EditError::Stale(wrote)) => {
@@ -202,7 +203,7 @@ impl Transaction<'_> {
                 Err(EditError::Failed("edit cancelled".into()))
             } else {
                 work()
-            })
+            });
         };
         self.rt.spawn_blocking(class, bytes, Box::new(job)).await?;
         rx.await
@@ -212,11 +213,11 @@ impl Transaction<'_> {
     async fn edit(
         &self,
         path: PathBuf,
-        edits: Arc<Vec<Replace>>,
+        edits: Arc<[Replace]>,
         prior_hash: Option<u64>,
         limits: Limits,
     ) -> Result<(Edited, u64), EditError> {
-        let captured = size_of_val(edits.as_slice())
+        let captured = size_of_val(edits.as_ref())
             + edits
                 .iter()
                 .map(|edit| edit.old.len() + edit.new.len())
@@ -491,7 +492,7 @@ mod tests {
                     rt: &runtime,
                     cancel: &ext::Cancel::default()
                 }
-                .edit(path.clone(), Arc::new(edits(&[("1", "2")])), None, limits)
+                .edit(path.clone(), edits(&[("1", "2")]).into(), None, limits)
             )
             .is_err()
         );
@@ -592,7 +593,7 @@ mod tests {
                 }
                 .edit(
                     path,
-                    Arc::new(edits(&[("", &"x".repeat(2 << 20))])),
+                    edits(&[("", &"x".repeat(2 << 20))]).into(),
                     None,
                     LIMITS,
                 )
