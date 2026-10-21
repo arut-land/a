@@ -173,7 +173,7 @@ fn logging_flush_deadline_also_bounds_owned_runtime_shutdown() {
     let stall = ext_logging::testing::stall(&handle);
     drop(handle);
     let (finished, done) = std::sync::mpsc::channel();
-    let owner = std::thread::spawn(move || {
+    let owner = thread::spawn(move || {
         crate::finish_runtime(&runtime);
         drop(runtime);
         finished.send(()).unwrap();

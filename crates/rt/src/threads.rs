@@ -35,7 +35,7 @@ impl Config {
         Self {
             workers: cores.clamp(1, 4),
             storage: PoolLimits {
-                workers: 2,
+                workers: (cores / 2).clamp(1, 4),
                 queue: 16,
                 bytes: 64 << 20,
             },
@@ -45,11 +45,17 @@ impl Config {
                 bytes: 32 << 20,
             },
             cpu: PoolLimits {
-                workers: 2,
+                workers: cores.saturating_sub(1).max(1),
                 queue: 8,
-                bytes: 32 << 20,
+                bytes: 64 << 20,
             },
         }
+    }
+}
+
+impl Default for Config {
+    fn default() -> Self {
+        Self::for_cores(thread::available_parallelism().map_or(1, usize::from))
     }
 }
 
@@ -128,7 +134,7 @@ impl Threads {
     pub fn new(workers: usize) -> Self {
         Self::configured(Config {
             workers: workers.max(1),
-            ..Config::for_cores(workers)
+            ..Config::default()
         })
     }
 
@@ -189,9 +195,6 @@ impl Threads {
             pool.ready.notify_all();
             wake(&mut state);
         }
-        for (stop, _) in &threads {
-            stop.notify();
-        }
         let blocking: Vec<_> = self
             .blocking
             .iter()
@@ -207,6 +210,9 @@ impl Threads {
         // Executors cancel their futures on their workers, where a blocking
         // destructor cannot consume the owner's shutdown deadline.
         drop(tasks);
+        for (stop, _) in &threads {
+            stop.notify();
+        }
         if !on_worker {
             self.lifecycle.wait_until(deadline);
         }
@@ -230,9 +236,7 @@ impl Drop for Threads {
 
 impl Default for Threads {
     fn default() -> Self {
-        Self::configured(Config::for_cores(
-            thread::available_parallelism().map_or(1, usize::from),
-        ))
+        Self::configured(Config::default())
     }
 }
 
@@ -396,7 +400,7 @@ impl Blocking {
                 state.idle += 1;
                 let (next, timeout) = self
                     .ready
-                    .wait_timeout(state, std::time::Duration::from_secs(10))
+                    .wait_timeout(state, Duration::from_secs(10))
                     .unwrap_or_else(std::sync::PoisonError::into_inner);
                 state = next;
                 state.idle -= 1;
@@ -433,7 +437,7 @@ mod tests {
 
     #[test]
     fn submission_bursts_count_starting_workers() {
-        let rt = Threads::new(1);
+        let rt = Threads::configured(Config::for_cores(4));
         let pool = &rt.blocking[0];
         let gate = Arc::new(Gate::default());
         *lock(&pool.start_gate) = Some(Arc::clone(&gate));
@@ -623,21 +627,60 @@ mod tests {
     }
 
     #[test]
-    fn memory_budgets_do_not_scale_with_core_count() {
-        for cores in [2, 4, 8, 32] {
+    fn cpu_capacity_follows_demand_within_the_fixed_byte_budget() {
+        for (cores, bytes) in [
+            (2, 1 << 20),
+            (4, 1 << 20),
+            (8, 1 << 20),
+            (32, 1 << 20),
+            (32, crate::STORAGE_BYTES),
+        ] {
             let config = Config::for_cores(cores);
-            assert_eq!(config.workers, cores.min(4));
+            let expected = config.cpu.workers.min(config.cpu.bytes / bytes);
+            let runtime = Threads::configured(config);
+            let pool = &runtime.blocking[BlockingClass::Cpu as usize];
+            assert_eq!(lock(&pool.state).workers, 0, "no workers before demand");
+            let gate = Arc::new(Gate::default());
+            let (entered, running) = std::sync::mpsc::channel();
+            for _ in 0..expected {
+                let held = Arc::clone(&gate);
+                let entered = entered.clone();
+                block_on(runtime.spawn_blocking(
+                    BlockingClass::Cpu,
+                    bytes,
+                    Box::new(move || {
+                        entered.send(()).unwrap();
+                        held.wait();
+                    }),
+                ))
+                .unwrap();
+                running.recv_timeout(Duration::from_secs(2)).unwrap();
+            }
+            let state = lock(&pool.state);
+            let observed = (state.workers, state.starting, state.bytes);
+            drop(state);
+            gate.open();
+            runtime.shutdown();
+            assert_eq!(observed, (expected, 0, expected * bytes));
+        }
+    }
+
+    #[test]
+    fn memory_budgets_do_not_scale_with_core_count() {
+        for cores in [0, 1, 2, 4, 8, 32] {
+            let config = Config::for_cores(cores);
+            assert_eq!(config.workers, cores.clamp(1, 4));
             assert_eq!(
                 (
                     config.storage.workers,
                     config.network.workers,
                     config.cpu.workers
                 ),
-                (2, 8, 2)
+                ((cores / 2).clamp(1, 4), 8, cores.saturating_sub(1).max(1))
             );
             assert_eq!(
                 config.storage.bytes + config.network.bytes + config.cpu.bytes,
-                128 << 20
+                160 << 20
             );
         }
     }

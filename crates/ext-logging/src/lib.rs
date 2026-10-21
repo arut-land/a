@@ -415,10 +415,11 @@ pub fn emit(fact: impl Loggable) {
     CURRENT.get_or_init(Logger::new).emit(fact);
 }
 
-/// Best effort only, including on orderly exit: a wedged disk never holds
-/// daemon shutdown indefinitely. There is deliberately no flush in `Drop`.
+/// Logging and worker reclamation share this shutdown allowance.
 pub const FLUSH_GRACE: Duration = Duration::from_millis(250);
 
+/// Best effort only, including on orderly exit: a wedged disk never holds
+/// daemon shutdown indefinitely. There is deliberately no flush in `Drop`.
 pub async fn flush(rt: &dyn rt::Runtime) {
     flush_until(rt, rt.now() + FLUSH_GRACE).await;
 }

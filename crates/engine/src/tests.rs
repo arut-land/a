@@ -2330,3 +2330,6 @@ fn busy_session_recovery_admits_independent_loads_concurrently() {
         "the first cold recovery waits alone despite two available storage workers"
     );
 }
+
+#[path = "../../../docs/perf/runtime-demand.rs"]
+mod runtime_demand;

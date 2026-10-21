@@ -26,7 +26,7 @@ fn threads_run_spawned_blocking_and_timed_work() {
 
 #[test]
 fn blocking_pool_runs_work_concurrently() {
-    let rt = Threads::new(1);
+    let rt = Threads::configured(Config::for_cores(4));
     let running = Arc::new(AtomicUsize::new(0));
     let peak = Arc::new(AtomicUsize::new(0));
     let jobs: Vec<_> = (0..4)

@@ -1,7 +1,7 @@
 # Runtime demand (C09)
 
-`Threads` owns its async and blocking workers and bounds shutdown with a deadline. Each blocking
-class has its own queue and byte ledger. Admission is a cancellable
+`Threads` owns its async and blocking workers and bounds shutdown with a
+deadline. Each blocking class has its own queue and byte ledger. Admission is a cancellable
 future: a full queue or byte budget suspends its caller without occupying
 a worker. Both queued and running jobs retain their byte reservations.
 Oversized reservations and admission after shutdown fail. Pending futures
@@ -15,29 +15,42 @@ whole-daemon RSS bound (A07 owns aggregate outstanding work).
 configurable through `Threads::configured`; RAM is never inferred from
 processor count.
 
-| Simulated cores | Async workers | Storage workers | Network workers | CPU workers | Reserved flush workers | Reserved bytes |
+| Simulated cores | Async workers | Storage ceiling | Network ceiling | CPU ceiling | Flush ceiling | Admission byte budgets |
 | --- | ---: | ---: | ---: | ---: | ---: | ---: |
-| 2 | 2 | 2 | 8 | 2 | 1 | 128 MiB |
-| 4 | 4 | 2 | 8 | 2 | 1 | 128 MiB |
-| 8 | 4 | 2 | 8 | 2 | 1 | 128 MiB |
-| 32 | 4 | 2 | 8 | 2 | 1 | 128 MiB |
+| 2 | 2 | 1 | 8 | 1 | 1 | 160 MiB |
+| 4 | 4 | 2 | 8 | 3 | 1 | 160 MiB |
+| 8 | 4 | 4 | 8 | 7 | 1 | 160 MiB |
+| 32 | 4 | 4 | 8 | 31 | 1 | 160 MiB |
+
+CPU workers are created on demand up to `max(1, cores - 1)`; storage is
+`clamp(cores / 2, 1, 4)`. `Threads::new` sets async worker count while
+blocking defaults use the machine's cores. `Threads::configured` can
+set every lane's worker, queue, and byte limits explicitly.
 
 Storage admits up to 16 queued jobs and 64 MiB; Network admits 16 and
-32 MiB; CPU admits 8 and 32 MiB. The flush lane admits one queued leader
-and one running leader. Leaders hold flush metadata, not copied file
-contents. Shared flush epochs still coalesce requests without timers.
+32 MiB; CPU admits 8 and 64 MiB. Budgets cover queued and running jobs
+and do not grow with core count. Seven 8 MiB projections can run together
+on the eight-core host. At 32 cores, the same budget permits eight such
+projections at once; smaller jobs can use all 31 CPU workers. The invariant
+`cpu_capacity_follows_demand_within_the_fixed_byte_budget` exercises both
+cases, plus simulated 2/4/8-core configurations.
+
+The flush lane admits one queued leader and one running leader. Leaders
+hold metadata, not copied file contents. Shared flush epochs coalesce
+requests without timers.
 
 These are ceilings, not eagerly created threads or allocated buffers.
 Async workers start together on first spawn; blocking workers start on
 demand. Starting workers count against the limit while their first
-instruction is still unscheduled. Blocking workers retire after one ten-second idle wait, releasing their
-thread resources. No last-worker polling loop remains after retirement.
+instruction is still unscheduled. Blocking workers retire after one
+ten-second idle wait, releasing their thread resources. No last-worker polling loop remains after retirement.
 The shared async-io reactor remains process-scoped. Owner shutdown closes
 admission and signals the workers, then waits on their completion until its
 deadline. It only joins threads that have already finished. Live threads are
 detached at the deadline so uninterruptible native I/O cannot hold the owner.
-The runtime destructor does not restart the wait after explicit shutdown. A last handle dropped on one of its own workers signals shutdown
-without joining: the executor must return before its pending futures can
+The runtime destructor does not restart the wait after explicit shutdown.
+A last handle dropped on one of its own workers signals shutdown without
+joining: the executor must return before its pending futures can
 release I/O cancellation guards. This path has a dedicated regression test.
 
 Network reservations include request payload and bounded stream buffers.
@@ -50,7 +63,10 @@ storage or flush lanes. A loader runs an elected flush on its current
 worker rather than submitting and waiting on its own pool. A follower's
 cold log reads and projection rebuilds are awaited off async workers.
 Config lookups clone immutable snapshots; demand-triggered refreshes do
-the filesystem work on storage workers.
+the filesystem work on storage workers. Busy-session recovery marks all
+slots as loading, then schedules every independent admission future before
+awaiting results. Available storage workers can therefore load later
+sessions while the first is stalled.
 
 The daemon owns one runtime for sessions and logging. Shutdown stops
 sessions, then gives logging and runtime reclamation one shared 250 ms
@@ -60,28 +76,57 @@ uninterruptible native closure is detached when the deadline expires so
 the daemon can exit. HTTP response cancellation still closes
 its socket, including registration after cancellation.
 
-## Worker comparison
+## Session measurements
 
-Command: `CARGO_BUILD_JOBS=2 cargo run --release -p rt --example demand`.
-Measured on the shared arm64 development machine (8 logical cores, 16 GiB
-RAM) on 2026-10-21. This is a
-fixed-workload scheduling comparison, not a startup or resource-budget
-measurement. No budgets or startup timings were run.
+The reproducible harness is [runtime-demand.rs](runtime-demand.rs), compiled
+as an ignored engine test. It uses 24 file-backed sessions, each containing
+1,200 assistant entries of approximately 1 KiB. CPU timing covers concurrent
+attach requests through replay, view rebuilding, and snapshot framing.
+Storage timing covers concurrent cold session resolution. Both include
+queueing and exclude socket/UI transport; filesystem pages are warm.
+There are six samples per worker count, with 2/4/7-worker order reversed
+on alternate rounds. No remote provider is contacted.
 
-The async workload schedules 2,048 tasks with 100 cooperative yields each.
-The CPU workload submits 256 jobs, each with 100,000 dependent integer
-updates, through the same two-worker CPU lane in every configuration.
+```sh
+A_BENCH_CPU_MIB=32 CARGO_BUILD_JOBS=2 cargo nextest run --release -p engine --lib \
+  -E 'test(tests::runtime_demand::concurrent_session_sizing)' \
+  --run-ignored only --test-threads 1 --no-capture --no-tests fail
+A_BENCH_CPU_MIB=64 CARGO_BUILD_JOBS=2 cargo nextest run --release -p engine --lib \
+  -E 'test(tests::runtime_demand::concurrent_session_sizing)' \
+  --run-ignored only --test-threads 1 --no-capture --no-tests fail
+```
 
-| Explicit async workers | Async workload | CPU workload |
-| --- | ---: | ---: |
-| 2 | 24,310 µs | 43,154 µs |
-| 4 | 17,665 µs | 32,709 µs |
-| 32 | 34,790 µs | 33,183 µs |
+Independent review measured these medians on the Apple M3 (8 cores,
+16 GiB RAM), release builds, six samples per configuration:
 
-This single shared-machine sample gives no reason to change the default
-`min(cores, 4)` or increase the CPU lane. Repeat on quiet target hardware
-before tuning either. The workload and configurations are reproducible;
-these timings are not claimed as portable performance budgets.
+| Operation / byte budget | 2 workers | 4 workers | 7 workers |
+| --- | ---: | ---: | ---: |
+| Snapshot rebuild / 32 MiB CPU | 52.3 ms | 31.6 ms | 32.3 ms |
+| Snapshot rebuild / 64 MiB CPU | 50.9 ms | 30.9 ms | 22.9 ms |
+| Cold session load / 64 MiB storage | 40.6 ms | 22.6 ms | 36.5 ms |
+
+Seven CPU workers need the 64 MiB budget for the measured projection
+reservations; increasing the worker limit alone left performance flat.
+Four storage workers improved throughput; seven varied from 24.2 to
+49.5 ms. These results support the core-aware CPU ceiling and the four-worker
+storage cap. They do not establish optimal settings on 32-core hardware.
+The async worker default remains `min(cores, 4)`.
+
+The follow-up rerun on the same shared M3, six samples per configuration,
+produced these medians on 2026-10-21. [Raw samples](runtime-demand.csv) retain
+all 72 observations, including storage runs under both CPU-budget settings.
+
+| Operation / byte budget | 2 workers | 4 workers | 7 workers |
+| --- | ---: | ---: | ---: |
+| Snapshot rebuild / 32 MiB CPU | 52.5 ms | 31.8 ms | 31.4 ms |
+| Snapshot rebuild / 64 MiB CPU | 54.7 ms | 31.6 ms | 25.4 ms |
+| Cold session load / 64 MiB storage | 40.1 ms | 24.3 ms | 35.6 ms |
+
+With 64 MiB, seven CPU workers ranged from 23.35 to 25.73 ms; seven
+storage workers ranged from 25.60 to 44.86 ms. This rerun reproduces the
+review's direction: about 53% lower snapshot latency at seven CPU workers
+and 39% lower cold-load latency at four storage workers than at two.
+These are shared-machine observations, not portable latency budgets.
 
 No dependency was added. The existing pool was extended because the
 `blocking` crate's last worker periodically wakes (the original reason
@@ -116,16 +161,13 @@ The coordinator expanded C09 ownership for these integration call sites:
 in `crates/engine/src/driver/tests.rs`, `crates/engine/src/config/tests.rs`,
 and `crates/engine/src/store/tests.rs`.
 
-Final validation on the merged tree, with `CARGO_BUILD_JOBS=2`:
+The review regressions live with the corresponding engine invariants:
 
-- `mise run check`: formatting, clippy, and 1,127 tests passed; 29 skipped.
-- `mise run acceptance`: 23 passed.
-- `mise run check:windows`: Windows cross-target clippy passed.
-- `mise run machete`, `check:no-tokio`, and `deny`: passed.
-- `mise run test:web`: 6 passed.
-- `mise run apple:test`: 14 Swift integration tests passed.
-- `mise run size`: 3,624 KiB before, 3,657 KiB after, below 4,096 KiB;
-  the final measurement includes the merged main changes.
+- `driver::tests::durable::logging_flush_deadline_also_bounds_owned_runtime_shutdown`
+- `tests::busy_session_recovery_admits_independent_loads_concurrently`
 
-Budgets and startup timings were deliberately not run. No sys unsafe code
-changed, so Miri was not required. Native Windows execution was not tested.
+Additional runtime tests cover expired shutdown deadlines with stalled
+closures and demand-created CPU capacity under the fixed byte budget.
+The scratch review module and its platform-specific idle observation were
+removed. The smaller synthetic yielding example was replaced by the
+file-backed session harness used for these decisions.
