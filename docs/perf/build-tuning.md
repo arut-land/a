@@ -18,6 +18,9 @@ Researched 2026-10-18 on macOS arm64, `nightly-2026-10-17`, ld-prime.
 | Cold first daemon reply | < 50 ms | `mise run budgets` | 20–33 ms (2026-10-19, see engine hot paths) |
 | Where size goes | — | `mise run bloat`, `mise run bloat:lines` | `.text` 343.9 KiB |
 
+The 2026-10-21 idle RSS regression, merge-by-merge measurements and lazy
+subscription fix are recorded in [idle-rss.md](idle-rss.md).
+
 ## In place
 
 | Setting | Where | Why |

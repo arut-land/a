@@ -151,6 +151,8 @@ fn portable_yaml_is_parsed_and_ambiguous_headers_are_rejected() {
 #[test]
 fn explicit_extra_roots_are_opt_in_and_own_roots_override_them() {
     let rig = Rig::new("skills-roots", Registry::default());
+    let rt: rt::Rt = Arc::new(rt::Threads::default());
+    let spawn: ext::host::Spawn = Arc::new(move |task| rt.spawn(task));
     let home = rig.dir.join("home");
     let workspace = rig.workspace();
     fs::create_dir_all(&home).unwrap();
@@ -179,12 +181,12 @@ fn explicit_extra_roots_are_opt_in_and_own_roots_override_them() {
     let source = registry
         .service::<dyn Sources>()
         .unwrap()
-        .open(&workspace, Arc::new(|_| {}))
+        .open(&workspace, spawn.clone(), Arc::new(|_| {}))
         .unwrap();
     let another = registry
         .service::<dyn Sources>()
         .unwrap()
-        .open(&workspace, Arc::new(|_| {}))
+        .open(&workspace, spawn.clone(), Arc::new(|_| {}))
         .unwrap();
     assert!(Arc::ptr_eq(&source, &another));
     drop(another);
@@ -212,7 +214,7 @@ fn explicit_extra_roots_are_opt_in_and_own_roots_override_them() {
         reserved
             .service::<dyn Sources>()
             .unwrap()
-            .open(&workspace, Arc::new(|_| {}))
+            .open(&workspace, spawn.clone(), Arc::new(|_| {}))
             .is_err()
     );
     drop(source);

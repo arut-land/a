@@ -635,8 +635,16 @@ impl Updates {
 /// lifetime; a source must not retain an unbounded collection of workspaces.
 pub type Prepare = Arc<dyn Fn(Box<dyn FnOnce() + Send>) + Send + Sync>;
 
+/// Schedules owned asynchronous subscription work on the host runtime.
+pub type Spawn = Arc<dyn Fn(BoxFuture<'static, ()>) + Send + Sync>;
+
 pub trait Sources: Send + Sync {
-    fn open(&self, workspace: &Path, prepare: Prepare) -> Result<Arc<dyn Generations>, Refused>;
+    fn open(
+        &self,
+        workspace: &Path,
+        spawn: Spawn,
+        prepare: Prepare,
+    ) -> Result<Arc<dyn Generations>, Refused>;
 }
 
 /// The registry sessions run with. Replacing it (a reload) takes effect at

@@ -80,6 +80,10 @@ impl Shared {
                 let rt = Arc::clone(&self.rt);
                 source.open(
                     workspace,
+                    {
+                        let rt = Arc::clone(&self.rt);
+                        Arc::new(move |task| rt.spawn(task))
+                    },
                     Arc::new(move |work| {
                         let admitted = rt.spawn_blocking(Cpu, rt::STORAGE_BYTES, work);
                         rt.spawn(Box::pin(async move {

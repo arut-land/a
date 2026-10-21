@@ -2273,6 +2273,7 @@ fn busy_session_recovery_admits_independent_loads_concurrently() {
         fn open(
             &self,
             _: &std::path::Path,
+            _: ext::host::Spawn,
             _: ext::host::Prepare,
         ) -> Result<Arc<dyn ext::host::Generations>, ext::Refused> {
             let mut entered = self.0.lock().unwrap();

@@ -2149,6 +2149,7 @@ impl ext::host::Sources for MemorySource {
     fn open(
         &self,
         _: &Path,
+        _: ext::host::Spawn,
         _: ext::host::Prepare,
     ) -> Result<Arc<dyn ext::host::Generations>, ext::Refused> {
         Ok(self.0.clone())

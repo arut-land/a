@@ -5,7 +5,7 @@ use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, OnceLock, PoisonError, Weak};
 
-use ext::host::{Changed, Generations, Prepare, Registry, Sources, Updates};
+use ext::host::{Changed, Generations, Prepare, Registry, Sources, Spawn, Updates};
 use ext::{Extension, Refused, Registrar, Tier};
 
 use crate::{Catalog, Skill, Skills, parse};
@@ -125,7 +125,12 @@ impl Generations for Workspace {
     }
 }
 impl Sources for Source {
-    fn open(&self, path: &Path, prepare: Prepare) -> Result<Arc<dyn Generations>, Refused> {
+    fn open(
+        &self,
+        path: &Path,
+        spawn: Spawn,
+        prepare: Prepare,
+    ) -> Result<Arc<dyn Generations>, Refused> {
         let path = match path.canonicalize() {
             Ok(path) => path,
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => path.to_owned(),
@@ -152,7 +157,7 @@ impl Sources for Source {
             updates: Updates::default(),
         });
         if let Some(inner) = &self.inner {
-            let inner = inner.open(&path, prepare.clone())?;
+            let inner = inner.open(&path, spawn.clone(), prepare.clone())?;
             let weak = Arc::downgrade(&workspace);
             let changed: Arc<Changed> = Arc::new(move || {
                 if let Some(workspace) = weak.upgrade() {
@@ -165,10 +170,9 @@ impl Sources for Source {
         }
         let roots = workspace.roots();
         let weak = Arc::downgrade(&workspace);
-        let filters = roots.clone();
-        let mut watcher = rt::Watcher::new(move |paths| {
+        let watcher = rt::Watcher::new(spawn, roots.clone(), move |paths| {
             if !paths.iter().any(|path| {
-                filters
+                roots
                     .iter()
                     .any(|root| path.starts_with(root) || root.starts_with(path))
             }) {
@@ -182,22 +186,6 @@ impl Sources for Source {
             }));
         })
         .map_err(|e| Refused(e.to_string()))?;
-        let mut parents = Vec::new();
-        for root in roots {
-            if root.starts_with(&workspace.path) && !workspace.path.is_dir() {
-                continue;
-            }
-            let mut parent = root.as_path();
-            while !parent.exists() {
-                parent = parent
-                    .parent()
-                    .ok_or_else(|| Refused("skill root has no existing parent".into()))?;
-            }
-            if !parents.iter().any(|p: &PathBuf| parent.starts_with(p)) {
-                watcher.add(parent).map_err(|e| Refused(e.to_string()))?;
-                parents.push(parent.to_owned());
-            }
-        }
         *lock(&workspace.watcher) = Some(watcher);
         workspace.refresh()?;
         if path.is_dir() {
@@ -227,6 +215,9 @@ impl Workspace {
     fn refresh(&self) -> Result<(), Refused> {
         // Publication and comparisons share a lock; racing preparations cannot regress.
         let _preparing = lock(&self.preparing);
+        if let Some(watcher) = lock(&self.watcher).as_mut() {
+            watcher.refresh().map_err(|e| Refused(e.to_string()))?;
+        }
         let mut catalog = BTreeMap::new();
         for root in self.roots() {
             scan(&root, &mut catalog)?;

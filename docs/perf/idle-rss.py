@@ -1,0 +1,105 @@
+#!/usr/bin/env python3
+"""Sample a fixture binary at the idle budget boundary, in fresh homes."""
+import argparse
+import fcntl
+import json
+import os
+from pathlib import Path
+import pty
+import select
+import struct
+import subprocess
+import tempfile
+import termios
+import time
+
+
+def sample(binary, output, label, run):
+    with tempfile.TemporaryDirectory(prefix="a-rss-") as directory:
+        root = Path(directory)
+        home, workspace = root / "home", root / "ws"
+        home.mkdir()
+        workspace.mkdir()
+        (home / "config.toml").write_text(
+            '[daemon]\nagent = "echo"\nidle_secs = 15\n'
+        )
+        env = dict(os.environ, A_HOME=str(home), TERM="xterm-256color")
+        env.pop("A_HOST", None)
+        master, slave = pty.openpty()
+        fcntl.ioctl(slave, termios.TIOCSWINSZ, struct.pack("HHHH", 30, 100, 0, 0))
+        client = None
+        try:
+            subprocess.run(
+                [binary, "--version"], env=env, check=True,
+                stdout=subprocess.DEVNULL,
+            )
+            client = subprocess.Popen(
+                [binary], stdin=slave, stdout=slave, stderr=slave,
+                env=env, cwd=workspace,
+            )
+            os.close(slave)
+            slave = None
+            data = b""
+            deadline = time.monotonic() + 30
+            while b"live" not in data:
+                if time.monotonic() >= deadline or client.poll() is not None:
+                    raise RuntimeError(f"terminal never became live: {data!r}")
+                if select.select([master], [], [], 0.1)[0]:
+                    data += os.read(master, 65536)
+            time.sleep(3)
+            processes = subprocess.check_output(
+                ["ps", "-axo", "pid=,args="], text=True,
+            )
+            daemons = [
+                int(line.split()[0]) for line in processes.splitlines()
+                if str(home / "runtime") in line and " __daemon " in line
+            ]
+            if len(daemons) != 1:
+                raise RuntimeError(f"expected one staged daemon: {daemons}")
+            pid = daemons[0]
+            rss = int(subprocess.check_output(["ps", "-o", "rss=", "-p", str(pid)]))
+            print(f"{label} sample {run}: {rss} KiB", flush=True)
+            # Profilers run after the RSS observation, never during its window.
+            if run == 0:
+                for command in (
+                    ["vmmap", "--summary", str(pid)],
+                    ["footprint", str(pid)],
+                    ["sample", str(pid), "1", "1"],
+                ):
+                    with (output / f"{label}-{command[0]}.txt").open("w") as log:
+                        subprocess.run(command, stdout=log, stderr=subprocess.STDOUT, check=True)
+            return rss
+        finally:
+            try:
+                subprocess.run(
+                    [binary, "daemon", "stop"], env=env, timeout=15,
+                    stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, check=True,
+                )
+            finally:
+                if client is not None:
+                    if client.poll() is None:
+                        client.kill()
+                    client.wait()
+                os.close(master)
+                if slave is not None:
+                    os.close(slave)
+
+
+def main():
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("binary", type=Path)
+    parser.add_argument("label")
+    parser.add_argument("--samples", type=int, default=5)
+    parser.add_argument("--output", type=Path, default=Path("target/rss"))
+    args = parser.parse_args()
+    if args.samples < 1:
+        parser.error("--samples must be positive")
+    args.output.mkdir(parents=True, exist_ok=True)
+    binary = str(args.binary.resolve())
+    rss = [sample(binary, args.output, args.label, run) for run in range(args.samples)]
+    with (args.output / "samples.jsonl").open("a") as log:
+        log.write(json.dumps({"commit": args.label, "rss": rss, "bytes": os.stat(binary).st_size}) + "\n")
+
+
+if __name__ == "__main__":
+    main()

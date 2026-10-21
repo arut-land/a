@@ -6,7 +6,7 @@ use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, PoisonError, Weak};
 use std::time::{Duration, Instant};
 
-use ext::host::{Changed, Generations, Prepare, Registry, Sources, Updates};
+use ext::host::{Changed, Generations, Prepare, Registry, Sources, Spawn, Updates};
 use ext::{Extension, Refused, Registrar, Tier};
 
 use crate::{Limits, Mod};
@@ -199,6 +199,9 @@ impl Workspace {
         initial: bool,
     ) -> Result<(), Refused> {
         let _preparing = lock(&self.preparing);
+        if let Some(watcher) = lock(&self.watcher).as_mut() {
+            watcher.refresh().map_err(|e| Refused(e.to_string()))?;
+        }
         let result = self.prepare_inner(compiler, path, initial);
         if result.is_err() {
             ext_logging::emit(ext_logging::Fact::Generation {
@@ -263,7 +266,12 @@ impl Workspace {
     }
 }
 impl Sources for Source {
-    fn open(&self, path: &Path, prepare: Prepare) -> Result<Arc<dyn Generations>, Refused> {
+    fn open(
+        &self,
+        path: &Path,
+        spawn: Spawn,
+        prepare: Prepare,
+    ) -> Result<Arc<dyn Generations>, Refused> {
         let canonical = path.canonicalize().map_err(|e| Refused(e.to_string()))?;
         let path = canonical.as_path();
         // Only weak-index access is global; preparation is serialized per workspace.
@@ -295,22 +303,22 @@ impl Sources for Source {
         let owned_path = path.to_path_buf();
         let home_ext = self.compiler.home.join("ext");
         let local_ext = path.join(".a/ext");
-        let local_parent = path.join(".a");
-        let mut watcher = rt::Watcher::new(move |paths| {
-            if !paths.iter().any(|p| {
-                p.starts_with(&home_ext) || p.starts_with(&local_ext) || p == &local_parent
-            }) {
-                return;
-            }
-            if let Some(workspace) = weak.upgrade() {
-                workspace.changed(Arc::clone(&compiler), owned_path.clone(), &prepare);
-            }
-        })
-        .map_err(|e| Refused(e.to_string()))?;
         // Watching the parent also catches an ext directory created after the session opens.
-        for dir in [&self.compiler.home, path] {
-            watcher.add(dir).map_err(|e| Refused(e.to_string()))?;
-        }
+        let watcher =
+            rt::Watcher::new(spawn, [home_ext.clone(), local_ext.clone()], move |paths| {
+                if !paths.iter().any(|p| {
+                    p.starts_with(&home_ext)
+                        || p.starts_with(&local_ext)
+                        || home_ext.starts_with(p)
+                        || local_ext.starts_with(p)
+                }) {
+                    return;
+                }
+                if let Some(workspace) = weak.upgrade() {
+                    workspace.changed(Arc::clone(&compiler), owned_path.clone(), &prepare);
+                }
+            })
+            .map_err(|e| Refused(e.to_string()))?;
         *lock(&workspace.watcher) = Some(watcher);
         if let Err(error) = workspace.prepare(&self.compiler, path, true) {
             eprintln!("warning: {error}");
@@ -400,6 +408,11 @@ fn files(dir: &Path, found: &mut Files) -> Result<(), Refused> {
 mod tests {
     use super::*;
 
+    fn spawn() -> Spawn {
+        let rt: rt::Rt = Arc::new(rt::Threads::default());
+        Arc::new(move |task| rt.spawn(task))
+    }
+
     #[test]
     fn recorded_generations_rebuild_their_own_folds_after_source_files_are_deleted() {
         let root = std::env::temp_dir().join(format!("a-lua-history-{}", std::process::id()));
@@ -414,7 +427,7 @@ mod tests {
             Ok(Registry::default())
         })
         .unwrap();
-        let source = loader.0.open(&root, Arc::new(|_| {})).unwrap();
+        let source = loader.0.open(&root, spawn(), Arc::new(|_| {})).unwrap();
         let installed = source.registry().installed();
         fs::remove_file(file).unwrap();
         let restored = source.restore(&installed).unwrap();
@@ -435,7 +448,7 @@ mod tests {
             Ok(Registry::default())
         })
         .unwrap();
-        let workspace = loader.0.open(&root, Arc::new(|_| {})).unwrap();
+        let workspace = loader.0.open(&root, spawn(), Arc::new(|_| {})).unwrap();
         let registry = workspace.registry();
         let weak = Arc::downgrade(&registry);
         drop(registry);
@@ -511,6 +524,7 @@ mod tests {
             .0
             .open(
                 &root,
+                spawn(),
                 Arc::new(move |work| {
                     send.send(work).unwrap();
                 }),

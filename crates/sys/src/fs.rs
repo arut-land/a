@@ -439,7 +439,11 @@ pub fn write_watch(path: &Path) -> io::Result<WriteWatch> {
     let watch = [Event::new(
         EventFilter::Vnode {
             vnode: file.as_raw_fd(),
-            flags: VnodeEvents::WRITE | VnodeEvents::EXTEND,
+            flags: VnodeEvents::WRITE
+                | VnodeEvents::EXTEND
+                | VnodeEvents::DELETE
+                | VnodeEvents::RENAME
+                | VnodeEvents::REVOKE,
         },
         EventFlags::ADD | EventFlags::CLEAR,
         std::ptr::null_mut(),
