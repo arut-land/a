@@ -20,11 +20,26 @@ const MARK: &str = "A-LOGIN-ENV-7f3d";
 /// is killed with everything it started if it takes longer than `timeout`.
 #[cfg(unix)]
 pub fn login_env(shell: &OsString, timeout: Duration) -> io::Result<Vec<(OsString, OsString)>> {
+    use rustix::event::{PollFd, PollFlags, Timespec, poll};
+    use rustix::fs::{OFlags, fcntl_getfl, fcntl_setfl};
+    use rustix::process::{Pid, WaitId, WaitIdOptions, waitid};
     use std::io::Read;
     use std::process::{Command, Stdio};
-    use std::sync::mpsc;
-    use std::thread;
+    use std::time::Instant;
 
+    struct Capture(std::process::Child);
+    impl Drop for Capture {
+        fn drop(&mut self) {
+            // Every error path (including unwinding) revokes the entire
+            // shell group and reaps the child. No detached reader survives.
+            let _ = crate::Group(self.0.id()).kill();
+            let _ = self.0.wait();
+        }
+    }
+
+    let deadline = Instant::now()
+        .checked_add(timeout)
+        .ok_or(io::ErrorKind::InvalidInput)?;
     let script = format!("printf %s {MARK}; /usr/bin/env -0; printf %s {MARK}");
     let mut command = Command::new(shell);
     command
@@ -33,24 +48,67 @@ pub fn login_env(shell: &OsString, timeout: Duration) -> io::Result<Vec<(OsStrin
         .stdout(Stdio::piped())
         .stderr(Stdio::null());
     crate::Group::lead(&mut command);
-    let mut child = command.spawn()?;
-    let mut stdout = child.stdout.take().expect("stdout is piped");
-    let (tx, rx) = mpsc::channel();
-    thread::spawn(move || {
-        let mut out = Vec::new();
-        let _ = tx.send(stdout.read_to_end(&mut out).map(|_| out));
-    });
-    let out = rx.recv_timeout(timeout);
-    if out.is_err() {
-        let _ = crate::Group(child.id()).kill();
+    let mut child = Capture(command.spawn()?);
+    let mut stdout = child.0.stdout.take().expect("stdout is piped");
+    fcntl_setfl(&stdout, fcntl_getfl(&stdout)? | OFlags::NONBLOCK)?;
+    let mut out = Vec::new();
+    let mut eof = false;
+    loop {
+        let remaining = deadline
+            .checked_duration_since(Instant::now())
+            .ok_or_else(|| {
+                io::Error::new(
+                    io::ErrorKind::TimedOut,
+                    format!("{} took over {timeout:?} to start", shell.display()),
+                )
+            })?;
+        if !eof {
+            let mut buf = [0u8; 8192];
+            match stdout.read(&mut buf) {
+                Ok(0) => eof = true,
+                Ok(n) => {
+                    if out.len() + n > 8 * 1024 * 1024 {
+                        return Err(io::Error::new(
+                            io::ErrorKind::InvalidData,
+                            "login output exceeds 8 MiB",
+                        ));
+                    }
+                    out.extend_from_slice(&buf[..n]);
+                    continue;
+                }
+                Err(e) if e.kind() == io::ErrorKind::Interrupted => continue,
+                Err(e) if e.kind() == io::ErrorKind::WouldBlock => {}
+                Err(e) => return Err(e),
+            }
+        }
+        // Keep the zombie until group cleanup, so its pgid cannot be reused.
+        let exited = match waitid(
+            WaitId::Pid(
+                Pid::from_raw(child.0.id().try_into().expect("child pid fits i32")).unwrap(),
+            ),
+            WaitIdOptions::EXITED | WaitIdOptions::NOHANG | WaitIdOptions::NOWAIT,
+        ) {
+            Ok(status) => status.is_some(),
+            Err(rustix::io::Errno::INTR) => continue,
+            Err(e) => return Err(e.into()),
+        };
+        if eof && exited {
+            break;
+        }
+        // Pipe EOF does not imply process exit. Poll in bounded slices so
+        // either event is covered by the same deadline, without a reader thread.
+        let slice = remaining.min(Duration::from_millis(10));
+        let wait = Timespec {
+            tv_sec: 0,
+            tv_nsec: i64::from(slice.subsec_nanos()),
+        };
+        let mut fds = [PollFd::new(&stdout, PollFlags::IN)];
+        let fds = if eof { &mut [][..] } else { &mut fds[..] };
+        match poll(fds, Some(&wait)) {
+            Ok(_) | Err(rustix::io::Errno::INTR) => {}
+            Err(e) => return Err(e.into()),
+        }
     }
-    let _ = child.wait();
-    let out = out.map_err(|_| {
-        io::Error::new(
-            io::ErrorKind::TimedOut,
-            format!("{} took over {timeout:?} to start", shell.display()),
-        )
-    })??;
     parse(&out).ok_or_else(|| {
         io::Error::new(
             io::ErrorKind::InvalidData,
@@ -109,6 +167,38 @@ mod tests {
     }
 
     #[test]
+    #[cfg_attr(miri, ignore)]
+    fn login_deadline_includes_child_exit() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = std::env::temp_dir().join(format!("a-login-exit-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("shell");
+        // The output is complete and EOF arrives immediately; the shell
+        // stays alive until deadline cleanup kills and reaps its group.
+        std::fs::write(
+            &path,
+            "#!/bin/sh\necho $$ > \"$0.pid\"\neval \"$4\"\nexec 1>&-\nexec sleep 30\n",
+        )
+        .unwrap();
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let started = std::time::Instant::now();
+        let result = login_env(&path.as_os_str().to_os_string(), Duration::from_secs(1));
+        let pid: i32 = std::fs::read_to_string(path.with_extension("pid"))
+            .unwrap()
+            .trim()
+            .parse()
+            .unwrap();
+        let reaped = rustix::process::waitpid(
+            rustix::process::Pid::from_raw(pid),
+            rustix::process::WaitOptions::NOHANG,
+        );
+        std::fs::remove_dir_all(dir).unwrap();
+        assert_eq!(reaped.unwrap_err(), rustix::io::Errno::CHILD);
+        assert_eq!(result.unwrap_err().kind(), io::ErrorKind::TimedOut);
+        assert!(started.elapsed() < Duration::from_secs(10));
+    }
+
+    #[test]
     fn asks_a_shell_and_gives_up_on_a_slow_one() {
         let dir = std::env::temp_dir().join(format!("a-login-{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
@@ -128,6 +218,20 @@ mod tests {
         let slow = script("slow", "sleep 30");
         let err = login_env(&slow, Duration::from_millis(200)).unwrap_err();
         assert_eq!(err.kind(), io::ErrorKind::TimedOut);
+        let inherited = script("inherited", "sleep 30 & eval \"$4\"");
+        assert_eq!(
+            login_env(&inherited, Duration::from_millis(100))
+                .unwrap_err()
+                .kind(),
+            io::ErrorKind::TimedOut
+        );
+        let noisy = script("noisy", "exec /usr/bin/yes");
+        assert_eq!(
+            login_env(&noisy, Duration::from_secs(5))
+                .unwrap_err()
+                .kind(),
+            io::ErrorKind::InvalidData
+        );
         std::fs::remove_dir_all(&dir).unwrap();
     }
 }

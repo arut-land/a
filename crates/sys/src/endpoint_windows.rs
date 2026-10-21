@@ -23,7 +23,6 @@ use windows_sys::Win32::System::Pipes::{
 };
 use windows_sys::Win32::System::Threading::{INFINITE, ResetEvent, SetEvent, WaitForSingleObject};
 
-use crate::proc::Passed;
 use crate::windows::{CompletionSource, Security, duplicate, event, ok, owned, user_sid, wide};
 
 fn lock<T>(value: &Mutex<T>) -> MutexGuard<'_, T> {
@@ -157,7 +156,7 @@ pub(crate) fn process_pipe() -> io::Result<(super::Stream, File)> {
     Ok((super::Stream(accept(&listener)?), child))
 }
 
-pub fn adopt(_passed: Passed, _path: &Path) -> io::Result<Listener> {
+pub fn adopt(_file: File, _path: &Path) -> io::Result<Listener> {
     Err(io::Error::new(
         io::ErrorKind::InvalidInput,
         "Windows daemon startup re-listens; inherited listeners are not accepted",

@@ -10,12 +10,14 @@ pub fn open_browser(link: &str) -> io::Result<()> {
     let program = "explorer.exe";
     #[cfg(not(any(target_os = "macos", windows)))]
     let program = "xdg-open";
-    let mut child = Command::new(program)
+    let mut command = Command::new(program);
+    command
         .arg(link)
         .stdin(Stdio::null())
         .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .spawn()?;
+        .stderr(Stdio::null());
+    crate::proc::prepare_spawn(&mut command);
+    let mut child = command.spawn()?;
     // Some openers stay until the browser they started exits.
     thread::spawn(move || child.wait());
     Ok(())
