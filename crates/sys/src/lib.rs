@@ -15,6 +15,7 @@ pub mod fs;
 pub mod install;
 pub mod log;
 mod login;
+mod platform;
 mod proc;
 #[cfg(unix)]
 mod runtime;
@@ -32,6 +33,7 @@ pub use config::Config;
 pub use endpoint::{Endpoint, Listener, Stream};
 pub use fs::{read_exact_at, sync_data, write_watch};
 pub use login::login_env;
+pub use platform::Platform;
 pub use proc::{
     ExitWatch, Group, Pass, Passed, adopt_lock, boot_id, detach_session, exit_signal, exit_watch,
     pass, process_started, signal_process,
