@@ -407,6 +407,27 @@ impl ContextOrigin {
     }
 }
 
+/// A terminal result belongs to the admitted call, not its revocable context.
+/// Consuming this capability sends at most one result in its generation.
+struct ToolSettlement {
+    call: CallId,
+    fence: u64,
+    mail: Mail,
+}
+
+impl ToolSettlement {
+    fn finish(self, called: Called) {
+        let _ = self.mail.send(Msg::Fenced {
+            fence: self.fence,
+            msg: Box::new(Msg::Step(Event::ToolDone {
+                call: self.call,
+                outcome: called.outcome,
+                card: called.card,
+            })),
+        });
+    }
+}
+
 struct PendingSide {
     while_waiting: bool,
     background: bool,
@@ -2790,7 +2811,11 @@ impl Actor {
             .origin(call, fence)
             .expect("actor generation");
         let cx = self.live.session.cx(origin, &registry);
-        let mail = Arc::clone(&self.live.session.mail);
+        let settlement = ToolSettlement {
+            call,
+            fence,
+            mail: Arc::clone(&self.live.session.mail),
+        };
         let id = self.live.id;
         self.live.session.shared.rt.spawn(Box::pin(async move {
             let began = crate::stamp();
@@ -2805,15 +2830,7 @@ impl Actor {
                 };
                 format!("{tool} call {call}: {how} in {elapsed:?}")
             });
-            let done = Event::ToolDone {
-                call,
-                outcome,
-                card,
-            };
-            let _ = mail.send(Msg::Fenced {
-                fence,
-                msg: Box::new(Msg::Step(done)),
-            });
+            settlement.finish(Called { outcome, card });
         }));
     }
 

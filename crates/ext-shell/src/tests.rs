@@ -35,3 +35,104 @@ fn an_extension_cannot_hold_session_state_across_an_await() {
     let (before, after) = read.join().unwrap();
     assert_eq!((before, after), (None, Some(sub)));
 }
+
+#[test]
+fn revoking_a_pending_cwd_record_preserves_the_shell_result() {
+    use std::sync::{Arc, Mutex};
+
+    use ext::host::{Host, Parts, Services};
+    use ext::{BoxFuture, MutationError, MutationResult, States};
+    use protocol::{Json, Outcome, Seq};
+    use rt::oneshot;
+
+    struct PausedRecord {
+        rig: Arc<Rig>,
+        ready: Mutex<Option<oneshot::Sender<()>>>,
+        reply: Mutex<Option<oneshot::Receiver<MutationResult>>>,
+    }
+    impl Host for PausedRecord {
+        fn spawned(&self, pgid: u32, background: bool) {
+            self.rig.spawned(pgid, background);
+        }
+        fn own(&self, pgid: u32, ended: BoxFuture<'static, ()>) {
+            self.rig.own(pgid, ended);
+        }
+        fn progress(&self, text: &str) {
+            self.rig.progress(text);
+        }
+        fn note(&self, _: &str, state: &str, _: Json) -> BoxFuture<'static, MutationResult> {
+            assert_eq!(state, "cwd");
+            self.ready.lock().unwrap().take().unwrap().send(());
+            let reply = self.reply.lock().unwrap().take().unwrap();
+            Box::pin(async move { reply.await.unwrap() })
+        }
+        fn publish(
+            &self,
+            namespace: &str,
+            key: Json,
+            text: String,
+        ) -> BoxFuture<'static, MutationResult> {
+            self.rig.publish(namespace, key, text)
+        }
+        fn edit(&self, target: Seq, upto: Option<Seq>, replace: Option<Json>) {
+            self.rig.edit(target, upto, replace);
+        }
+        fn states(&self, read: &mut dyn FnMut(&States)) {
+            self.rig.states(read);
+        }
+        fn registry(&self) -> &Registry {
+            &self.rig.registry
+        }
+    }
+
+    let rig = Arc::new(Rig::new(
+        "revoked-cwd",
+        Registry::default().with(&Shell).unwrap(),
+    ));
+    std::fs::create_dir(rig.workspace().join("sub")).unwrap();
+    let (ready, waiting) = oneshot::channel();
+    let (reply, response) = oneshot::channel();
+    let original = rig.cx();
+    let cx = Parts {
+        workspace: original.workspace,
+        env: original.env,
+        session: original.session,
+        call: original.call,
+        model: original.model,
+        spill: original.spill,
+        cancel: original.cancel,
+        services: Arc::new(
+            Services::default().with::<dyn rt::Runtime>(Arc::new(rt::Threads::default())),
+        ),
+    }
+    .cx(Arc::new(PausedRecord {
+        rig: Arc::clone(&rig),
+        ready: Mutex::new(Some(ready)),
+        reply: Mutex::new(Some(response)),
+    }));
+    let input = Json::encode(&serde_json::json!({"command": "cd sub; printf settled"})).unwrap();
+    let called = rt::block_on(async {
+        let mut work = std::pin::pin!(rig.registry.tools().run("bash", &input, None, &cx));
+        rt::or(
+            async {
+                waiting.await.unwrap();
+            },
+            async {
+                let early = work.as_mut().await;
+                panic!("shell settled before its cwd record: {:?}", early.outcome);
+            },
+        )
+        .await;
+        cx.cancel.set();
+        reply.send(Err(MutationError::Revoked));
+        work.await
+    });
+    let Outcome::Done { output } = called.outcome else {
+        panic!("{:?}", called.outcome)
+    };
+    let ran: crate::bash::Ran = output.parse().unwrap();
+    assert_eq!(ran.exit, Some(0));
+    assert_eq!(ran.output, "settled");
+    assert_eq!(ran.cwd, rig.workspace().join("sub"));
+    assert!(rig.log.lock().unwrap().is_empty());
+}

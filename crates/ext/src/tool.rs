@@ -176,6 +176,20 @@ impl Cx {
         }
     }
 
+    /// Records bookkeeping for an effect whose result already exists.
+    /// Revocation prevents the record, but cannot undo the effect or replace
+    /// its result. Use `update` instead when committing state is the operation.
+    pub async fn record_effect<S: Fold, T>(
+        &self,
+        output: T,
+        change: &S::Change,
+    ) -> Result<T, MutationError> {
+        match self.update::<S>(change).await {
+            Ok(_) | Err(MutationError::Revoked) => Ok(output),
+            Err(error) => Err(error),
+        }
+    }
+
     /// Seals a typed publication key and its model context in one log entry.
     pub fn publish<P: crate::Publication>(
         &self,
