@@ -3,33 +3,19 @@
 //! what the agent says and nothing else.
 
 use std::fs;
-use std::io::{BufRead, BufReader, Read, Write};
+use std::io::{BufRead, BufReader, Write};
 use std::process::{Child, Output, Stdio};
+
+use crate::support::{TestProcess, deadline};
 
 use crate::common::{Env, wait_for};
 use rustix::process::{Pid, Signal, kill_process};
 
 /// `a args` with `input` on stdin, run to its end.
 fn piped(env: &Env, args: &[&str], input: &str) -> Output {
-    let mut child = spawn(env, args, input);
-    let mut out = Output {
-        status: child.wait().unwrap(),
-        stdout: Vec::new(),
-        stderr: Vec::new(),
-    };
-    child
-        .stdout
-        .take()
+    TestProcess::from(spawn(env, args, input))
+        .collect(deadline())
         .unwrap()
-        .read_to_end(&mut out.stdout)
-        .unwrap();
-    child
-        .stderr
-        .take()
-        .unwrap()
-        .read_to_end(&mut out.stderr)
-        .unwrap();
-    out
 }
 
 /// `a args` with `input` written to its stdin, which is then closed.
@@ -164,16 +150,9 @@ fn a_reader_that_goes_ends_a_quietly_and_the_session_goes_on() {
         .read_line(&mut first)
         .unwrap();
     assert_eq!(first, "a line of the reply, longer than the pipe holds\n");
-    let status = child.wait().unwrap();
-    let mut stderr = String::new();
-    child
-        .stderr
-        .take()
-        .unwrap()
-        .read_to_string(&mut stderr)
-        .unwrap();
-    assert_eq!(status.code(), Some(141), "{stderr}");
-    assert_eq!(stderr, "");
+    let out = TestProcess::from(child).collect(deadline()).unwrap();
+    assert_eq!(out.status.code(), Some(141), "{}", text(&out.stderr));
+    assert_eq!(out.stderr, b"");
     let id = only_session(&env);
     let mut again = env.repl(&["attach", &id]);
     again.lines_until("[session");
@@ -183,11 +162,12 @@ fn a_reader_that_goes_ends_a_quietly_and_the_session_goes_on() {
 #[test]
 fn ctrl_c_interrupts_a_piped_turn_and_exits_130() {
     let env = Env::new("pipe-sigint");
-    let mut child = spawn(&env, &[], "$ sleep 30");
+    let child = spawn(&env, &[], "$ sleep 30");
     wait_for("the command to run", || {
         env.run(&["ls"]).contains(" running ")
     });
     kill_process(Pid::from_child(&child), Signal::INT).unwrap();
-    assert_eq!(child.wait().unwrap().code(), Some(130));
+    let out = TestProcess::from(child).collect(deadline()).unwrap();
+    assert_eq!(out.status.code(), Some(130));
     wait_for("the turn to end", || env.run(&["ls"]).contains(" idle "));
 }
