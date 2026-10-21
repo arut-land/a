@@ -39,7 +39,7 @@ impl Home {
     /// a pipe is `\\.\pipe\a-<hash of the home>`.
     pub fn endpoint(&self) -> Endpoint {
         let hash = imp::home_hash(self.root());
-        Endpoint(imp::address(hash))
+        Endpoint(imp::address(self.root(), hash))
     }
 
     /// Listens at [`Home::endpoint`], replacing a stale socket, and points
@@ -197,7 +197,7 @@ mod imp {
         crate::fnv1a(root.as_os_str().as_encoded_bytes())
     }
 
-    pub fn address(hash: u64) -> PathBuf {
+    pub fn address(_root: &Path, hash: u64) -> PathBuf {
         socket_dir().join(format!("{hash:016x}.sock"))
     }
 

@@ -54,11 +54,20 @@ pub fn home_hash(root: &Path) -> u64 {
     crate::fnv1a(root.to_string_lossy().to_uppercase().as_bytes())
 }
 
-pub fn address(hash: u64) -> PathBuf {
-    // The SID scopes homes shared by multiple accounts; the DACL and peer
-    // token check enforce identity independently of the address's hash.
-    let user = user_sid(None).map_or(0, |sid| crate::fnv1a(sid.as_bytes()));
-    PathBuf::from(format!(r"\\.\pipe\a-{user:016x}-{hash:016x}"))
+pub fn address(root: &Path, _hash: u64) -> PathBuf {
+    root.join("run/daemon.pid")
+}
+
+fn generation(record: &crate::crash::Record, root: &Path) -> io::Result<PathBuf> {
+    let token = record
+        .token
+        .ok_or_else(|| io::Error::other("missing process identity"))?;
+    let user = crate::fnv1a(user_sid(None)?.as_bytes());
+    let home = home_hash(root);
+    Ok(PathBuf::from(format!(
+        r"\\.\pipe\a-{user:016x}-{home:016x}-{}-{token:016x}",
+        record.pid
+    )))
 }
 
 pub fn remove(_path: &Path) {}
@@ -112,7 +121,12 @@ fn instance(path: &Path, first: bool) -> io::Result<Arc<File>> {
 }
 
 pub fn bind(path: &Path, _link: &Path) -> io::Result<Listener> {
-    listener(instance(path, true)?, path)
+    let root = path
+        .parent()
+        .and_then(Path::parent)
+        .ok_or(io::ErrorKind::InvalidInput)?;
+    let name = generation(&crate::crash::Record::current(""), root)?;
+    listener(instance(&name, true)?, &name)
 }
 
 fn listener(file: Arc<File>, path: &Path) -> io::Result<Listener> {
@@ -250,6 +264,21 @@ impl CompletionSource for Stream {
 }
 
 pub fn connect(path: &Path) -> io::Result<Stream> {
+    // The locked daemon record is also discovery: only its owner writes it.
+    // A generation never reuses an old pipe namespace, even if a client
+    // keeps an old instance alive after its server has exited.
+    let record: crate::crash::Record = std::fs::read_to_string(path)?.parse()?;
+    if record.token.is_none() || !record.is_live() {
+        return Err(io::ErrorKind::NotFound.into());
+    }
+    let root = path
+        .parent()
+        .and_then(Path::parent)
+        .ok_or(io::ErrorKind::InvalidInput)?;
+    connect_pipe(&generation(&record, root)?, Some(record.pid))
+}
+
+fn connect_pipe(path: &Path, expected: Option<u32>) -> io::Result<Stream> {
     let file = loop {
         match OpenOptions::new()
             .read(true)
@@ -270,7 +299,7 @@ pub fn connect(path: &Path) -> io::Result<Stream> {
     let mut pid = 0;
     // SAFETY: file is an open pipe, pid is a writable output.
     ok(unsafe { GetNamedPipeServerProcessId(file.as_raw_handle(), &raw mut pid) })?;
-    if user_sid(Some(pid))? != user_sid(None)? {
+    if expected.is_some_and(|expected| expected != pid) || user_sid(Some(pid))? != user_sid(None)? {
         return Err(io::Error::new(
             io::ErrorKind::PermissionDenied,
             "pipe server belongs to another user",
@@ -566,7 +595,7 @@ mod tests {
         std::fs::create_dir_all(home.root()).unwrap();
         let alternate =
             crate::Home::from(PathBuf::from(home.root().to_string_lossy().to_uppercase()));
-        assert_eq!(home.endpoint(), alternate.endpoint());
+        assert_eq!(home_hash(home.root()), home_hash(alternate.root()));
         std::fs::remove_dir_all(home.root()).unwrap();
     }
 
@@ -574,9 +603,9 @@ mod tests {
     fn a_listener_has_one_owner_and_accepts_multiple_independent_clients() {
         let home = home("instances");
         let listener = home.bind().unwrap();
-        assert!(home.bind().is_err());
+        assert!(instance(&listener.0.path, true).is_err());
         for text in [b"first".as_slice(), b"second".as_slice()] {
-            let mut client = home.endpoint().connect().unwrap();
+            let mut client = connect_pipe(&listener.0.path, None).unwrap();
             let mut server = accept(&listener.0).unwrap();
             client.write_all(text).unwrap();
             let mut bytes = vec![0; text.len()];
@@ -594,14 +623,17 @@ mod tests {
         let listener = home.bind().unwrap();
         listener.set_nonblocking(true).unwrap();
         for _ in 0..4 {
-            drop(home.endpoint().connect().unwrap());
+            drop(connect_pipe(&listener.0.path, None).unwrap());
             match accept(&listener.0) {
                 Ok(stream) => drop(stream),
                 Err(error) => assert_eq!(error.kind(), io::ErrorKind::WouldBlock),
             }
-            assert_eq!(accept(&listener.0).unwrap_err().kind(), io::ErrorKind::WouldBlock);
+            assert_eq!(
+                accept(&listener.0).unwrap_err().kind(),
+                io::ErrorKind::WouldBlock
+            );
         }
-        let mut client = home.endpoint().connect().unwrap();
+        let mut client = connect_pipe(&listener.0.path, None).unwrap();
         let mut server = accept(&listener.0).unwrap();
         client.write_all(b"still serving").unwrap();
         let mut bytes = [0; 13];
@@ -613,7 +645,7 @@ mod tests {
     fn a_cancelled_read_keeps_its_buffer_and_completion_until_observed() {
         let home = home("cancel");
         let listener = home.bind().unwrap();
-        let mut client = home.endpoint().connect().unwrap();
+        let mut client = connect_pipe(&listener.0.path, None).unwrap();
         let mut server = accept(&listener.0).unwrap();
         stream_nonblocking(&server, true).unwrap();
         assert_eq!(
@@ -643,7 +675,7 @@ mod tests {
     fn shutdown_wakes_a_blocked_clone_without_waiting_for_the_peer() {
         let home = home("shutdown");
         let listener = home.bind().unwrap();
-        let _client = home.endpoint().connect().unwrap();
+        let _client = connect_pipe(&listener.0.path, None).unwrap();
         let mut server = accept(&listener.0).unwrap();
         let clone = server.try_clone().unwrap();
         let (tx, rx) = std::sync::mpsc::channel();

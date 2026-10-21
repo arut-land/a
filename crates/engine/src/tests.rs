@@ -883,9 +883,12 @@ fn a_daemon_after_a_crash_loop_refuses_to_serve_until_reset() {
     let (root, home) = home("breaker");
     std::fs::create_dir_all(home.run_dir()).unwrap();
     std::fs::write(home.run_dir().join("crashes"), "3\n").unwrap();
-    let Claim::Tripped(why) = claim(&home, "b1", None, false, 3).unwrap() else {
+    let Claim::Tripped(pid, why) = claim(&home, "b1", None, false, 3).unwrap() else {
         panic!("served after a crash loop");
     };
+
+    pid.set_len(0).unwrap();
+    drop(pid);
     assert!(
         why.contains("crashed 3 times") && why.contains("a daemon restart"),
         "{why}"

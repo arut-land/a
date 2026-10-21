@@ -133,3 +133,12 @@ The API takes the output file separately, eliminating hidden stdio state.
 cold-start capture on every platform with a bounded EOF wait. Native
 `a_shell_never_inherits_an_unrelated_inheritable_pipe` keeps a shell alive
 while an unrelated inheritable pipe must reach EOF.
+
+Pipe discovery uses the existing locked daemon record. The physical pipe name
+includes the home identity, SID hash, PID and process creation time. Only the
+lock holder publishes that record, before acknowledging startup; clients reject
+stale process identities and verify the pipe server's PID and SID. Each
+successor therefore creates its own namespace with FIRST_PIPE_INSTANCE even
+when a client retains a previous generation's handle. No extra discovery file
+or compatibility path is needed. The portable retained-client acceptance test
+covers graceful restart; native CI exercises the Windows namespace lifetime.

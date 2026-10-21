@@ -208,3 +208,15 @@ fn a_cold_clients_output_reaches_eof_while_the_daemon_stays_alive() {
         Some(std::time::Duration::ZERO)
     ));
 }
+
+#[test]
+fn a_successor_starts_while_an_old_client_keeps_its_handle() {
+    let env = Isolated::new("retained-client");
+    env.run(&["ls"]);
+    let previous = env.pid();
+    let retained = env.home.endpoint().connect().unwrap();
+    env.run(&["daemon", "stop"]);
+    env.run(&["ls"]);
+    assert_ne!(env.pid(), previous);
+    drop(retained);
+}
