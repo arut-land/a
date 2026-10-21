@@ -99,7 +99,7 @@ impl Generations for Workspace {
                 .find(|extension| extension.name == recorded.name);
             let installed: Vec<_> = installed
                 .iter()
-                .flat_map(|extension| {
+                .filter_map(|extension| {
                     if extension.name == recorded.name {
                         underlying.clone()
                     } else {
