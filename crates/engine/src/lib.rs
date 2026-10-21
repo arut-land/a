@@ -1186,8 +1186,7 @@ fn run(
     ])?;
     let daemon = Daemon::load(home, &config)?;
     let signals = rt::Async::for_reading(&daemon.shared.rt.reactor(), signals)?;
-    let signalled = Arc::clone(&daemon);
-    daemon.shared.rt.spawn(Box::pin(async move {
+    let signalled = async {
         let signal = signals
             .read_with(|s| {
                 s.take()
@@ -1209,9 +1208,10 @@ fn run(
                 Stop::Terminate
             }
         };
-        lock(&signalled.stopping).get_or_insert(reason);
-        signalled.pulse.notify();
-    }));
+        lock(&daemon.stopping).get_or_insert(reason);
+        daemon.pulse.notify();
+        std::future::pending::<io::Result<()>>().await
+    };
     let life = Arc::new(Lifecycle::new(build.to_owned(), home.runtime()));
     let (monitor, watch, config) = (Arc::clone(&daemon), Arc::clone(&life), config);
     let exit = Exit {
@@ -1224,7 +1224,8 @@ fn run(
     // Connections are tasks waiting on the reactor, and reach the
     // sessions' actors through their mailboxes.
     let listener = rt::Async::new(&daemon.shared.rt.reactor(), listener)?;
-    rt::block_on(server::accept(&listener, &daemon, &life))
+    // The signal lease is scoped to serving, including non-signal shutdown.
+    rt::block_on(rt::or(server::accept(&listener, &daemon, &life), signalled))
 }
 
 /// Whether a daemon may serve.

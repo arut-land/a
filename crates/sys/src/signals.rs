@@ -1,5 +1,5 @@
-//! Signals as bytes on a pipe (the self-pipe trick), so a thread that polls
-//! its input sees them with it, and no handler does more than one write.
+//! Pending signal bits with a wake source that outlives every handler.
+//! An exclusive lease prevents competing consumers from stealing shutdown.
 //! Windows console control events wake a permanently owned manual-reset event.
 
 pub use imp::{Signals, reraise};
@@ -147,7 +147,8 @@ mod imp {
 mod imp {
     use std::io;
     use std::os::fd::{AsFd, AsRawFd, BorrowedFd, OwnedFd};
-    use std::sync::atomic::{AtomicI32, Ordering};
+    use std::sync::OnceLock;
+    use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 
     use rustix::event::{PollFd, PollFlags, poll};
     use rustix::fs::{OFlags, fcntl_getfl, fcntl_setfl};
@@ -156,62 +157,99 @@ mod imp {
     use crate::Signal;
     use crate::proc::raw;
 
-    /// Every signal [`Signals`] can report, to read a byte back as one.
-    const ALL: [Signal; 5] = [
+    const ALL: [Signal; 4] = [
         Signal::Terminate,
-        Signal::Kill,
         Signal::Interrupt,
         Signal::Hangup,
         Signal::Resize,
     ];
 
-    /// The pipe's write end while a [`Signals`] lives, else -1.
-    static PIPE: AtomicI32 = AtomicI32::new(-1);
-
-    /// Caught signals, readable from [`AsFd::as_fd`] (poll it) and then
-    /// [`Signals::take`]. One at a time per process; dropping it gives the
-    /// signals their default action back.
-    pub struct Signals {
+    struct Source {
         read: OwnedFd,
         write: OwnedFd,
+        pending: AtomicU32,
+        requested: AtomicU32,
+        active: AtomicBool,
+    }
+
+    // A handler already in flight may write after its lease is dropped.
+    // Keeping both ends open prevents fd reuse and SIGPIPE in that race.
+    static SOURCE: OnceLock<Source> = OnceLock::new();
+
+    struct SignalLease {
+        source: &'static Source,
         caught: Vec<Signal>,
+    }
+
+    pub struct Signals(SignalLease);
+
+    fn bit(signal: Signal) -> u32 {
+        match signal {
+            Signal::Terminate => 1,
+            Signal::Interrupt => 2,
+            Signal::Hangup => 4,
+            Signal::Resize => 8,
+            Signal::Kill => 0,
+        }
     }
 
     impl Signals {
         pub fn catch(signals: &[Signal]) -> io::Result<Self> {
-            let (read, write) = rustix::pipe::pipe()?;
-            for fd in [&read, &write] {
-                fcntl_setfd(fd, FdFlags::CLOEXEC)?;
-                // A full pipe drops a signal rather than blocking the handler;
-                // one byte already waiting says as much.
-                fcntl_setfl(fd, fcntl_getfl(fd)? | OFlags::NONBLOCK)?;
+            if signals.contains(&Signal::Kill) {
+                return Err(io::ErrorKind::InvalidInput.into());
             }
-            PIPE.store(write.as_raw_fd(), Ordering::Release);
-            let this = Self {
-                read,
-                write,
-                caught: signals.to_vec(),
-            };
+            if SOURCE.get().is_none() {
+                let (read, write) = rustix::pipe::pipe()?;
+                for fd in [&read, &write] {
+                    fcntl_setfd(fd, FdFlags::CLOEXEC)?;
+                    fcntl_setfl(fd, fcntl_getfl(fd)? | OFlags::NONBLOCK)?;
+                }
+                let _ = SOURCE.set(Source {
+                    read,
+                    write,
+                    pending: AtomicU32::new(0),
+                    requested: AtomicU32::new(0),
+                    active: AtomicBool::new(false),
+                });
+            }
+            let source = SOURCE.get().unwrap();
+            if source.active.swap(true, Ordering::AcqRel) {
+                return Err(io::ErrorKind::AlreadyExists.into());
+            }
+            let mut this = Self(SignalLease {
+                source,
+                caught: Vec::new(),
+            });
+            this.take();
+            source.requested.store(
+                signals.iter().fold(0, |bits, signal| bits | bit(*signal)),
+                Ordering::Release,
+            );
             for &signal in signals {
                 install(
                     signal,
                     on_signal as extern "C" fn(libc::c_int) as libc::sighandler_t,
                 )?;
+                this.0.caught.push(signal);
             }
             Ok(this)
         }
 
-        /// The signals that arrived since the last call, oldest first.
+        /// Coalesced signals since the last drain, with termination first.
         pub fn take(&self) -> Vec<Signal> {
-            let mut out = Vec::new();
-            let mut buf = [0u8; 32];
-            while let Ok(n @ 1..) = read(&self.read, &mut buf) {
-                let raws = buf[..n].iter().map(|&b| i32::from(b));
-                out.extend(
-                    raws.filter_map(|byte| ALL.into_iter().find(|&s| raw(s).as_raw() == byte)),
-                );
+            let mut buf = [0u8; 256];
+            for _ in 0..64 {
+                match read(&self.0.source.read, &mut buf) {
+                    Ok(1..) | Err(Errno::INTR) => {}
+                    _ => break,
+                }
             }
-            out
+            // Drain the wake pipe before the bits: a concurrent handler
+            // leaves either a bit in this batch or a wake for the next one.
+            let bits = self.0.source.pending.swap(0, Ordering::AcqRel);
+            ALL.into_iter()
+                .filter(|signal| bits & bit(*signal) != 0)
+                .collect()
         }
 
         /// The signals that arrived since the last call, waited for if none
@@ -222,7 +260,7 @@ mod imp {
                 if !got.is_empty() {
                     return got;
                 }
-                let mut fds = [PollFd::new(&self.read, PollFlags::IN)];
+                let mut fds = [PollFd::new(&self.0.source.read, PollFlags::IN)];
                 if let Err(e) = poll(&mut fds, None)
                     && e != Errno::INTR
                 {
@@ -234,21 +272,17 @@ mod imp {
 
     impl AsFd for Signals {
         fn as_fd(&self) -> BorrowedFd<'_> {
-            self.read.as_fd()
+            self.0.source.read.as_fd()
         }
     }
 
-    impl Drop for Signals {
+    impl Drop for SignalLease {
         fn drop(&mut self) {
+            self.source.requested.store(0, Ordering::Release);
             for &signal in &self.caught {
                 let _ = install(signal, libc::SIG_DFL);
             }
-            let _ = PIPE.compare_exchange(
-                self.write.as_raw_fd(),
-                -1,
-                Ordering::AcqRel,
-                Ordering::Relaxed,
-            );
+            self.source.active.store(false, Ordering::Release);
         }
     }
 
@@ -278,17 +312,22 @@ mod imp {
     }
 
     extern "C" fn on_signal(signal: libc::c_int) {
-        let fd = PIPE.load(Ordering::Acquire);
-        if fd < 0 {
+        let Some(source) = SOURCE.get() else {
+            return;
+        };
+        let Some(signal) = ALL.into_iter().find(|&s| raw(s).as_raw() == signal) else {
+            return;
+        };
+        let bit = bit(signal);
+        if source.requested.load(Ordering::Acquire) & bit == 0 {
             return;
         }
+        source.pending.fetch_or(bit, Ordering::Release);
         let saved = io::Error::last_os_error().raw_os_error();
-        // Signal numbers fit a byte.
-        #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
-        let byte = signal as u8;
-        // SAFETY: write(2) is async-signal-safe; `byte` lives across the call
-        // and `fd` is the pipe's write end, open while it is published.
-        unsafe { libc::write(fd, (&raw const byte).cast(), 1) };
+        let byte = 1u8;
+        // SAFETY: write is async-signal-safe and both pipe ends are owned
+        // for the process lifetime. Pending bits survive a full pipe.
+        unsafe { libc::write(source.write.as_raw_fd(), (&raw const byte).cast(), 1) };
         if let Some(errno) = saved {
             set_errno(errno);
         }
@@ -322,25 +361,32 @@ mod imp {
     mod tests {
         use super::*;
 
+        // libtest can run tests concurrently; signal ownership is per process.
+        static SERIAL: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
         #[test]
-        fn a_caught_signal_arrives_on_the_pipe() {
+        fn signal_registration_is_exclusive() {
+            let _serial = SERIAL.lock().unwrap();
             let signals = Signals::catch(&[Signal::Resize]).unwrap();
-            assert_eq!(signals.take(), []);
-            crate::signal_process(std::process::id(), Signal::Resize).unwrap();
-            // Delivered to some thread, soon.
-            let mut got = Vec::new();
-            for _ in 0..100 {
-                got = signals.take();
-                if !got.is_empty() {
-                    break;
-                }
-                std::thread::sleep(std::time::Duration::from_millis(10));
-            }
-            assert_eq!(got, [Signal::Resize]);
-            crate::signal_process(std::process::id(), Signal::Resize).unwrap();
+            assert!(matches!(Signals::catch(&[Signal::Terminate]), Err(e)
+                if e.kind() == io::ErrorKind::AlreadyExists));
+            on_signal(raw(Signal::Resize).as_raw());
             assert_eq!(signals.wait(), [Signal::Resize]);
             drop(signals);
-            assert_eq!(PIPE.load(Ordering::Relaxed), -1);
+            assert!(Signals::catch(&[Signal::Terminate]).is_ok());
+            assert!(Signals::catch(&[Signal::Kill]).is_err());
+        }
+
+        #[test]
+        fn termination_survives_a_full_signal_pipe() {
+            let _serial = SERIAL.lock().unwrap();
+            let signals = Signals::catch(&[Signal::Resize, Signal::Terminate]).unwrap();
+            let source = signals.0.source;
+            let buf = [1u8; 1024];
+            while rustix::io::write(&source.write, &buf).is_ok() {}
+            on_signal(raw(Signal::Terminate).as_raw());
+            assert_eq!(signals.take(), [Signal::Terminate]);
+            assert_eq!(signals.take(), []);
         }
     }
 }
