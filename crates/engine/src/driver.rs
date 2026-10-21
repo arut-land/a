@@ -564,14 +564,24 @@ impl Folding {
         binding: &Arc<dyn Binding>,
         registry: &Registry,
     ) -> io::Result<(Loaded, Self)> {
-        Self::rebuild(binding, registry, shared, |restore, each| match open {
-            Open::Create => {
-                let created = shared.store.create(header)?;
-                shared.catalog.record(Record::new(header.clone()));
-                Ok(created)
-            }
-            Open::Load => shared.store.load(header.id, restore, each),
-        })
+        let (mut loaded, folding) =
+            Self::rebuild(binding, registry, shared, |restore, each| match open {
+                Open::Create => {
+                    let created = shared.store.create(header)?;
+                    shared.catalog.record(Record::new(header.clone()));
+                    Ok(created)
+                }
+                Open::Load => shared.store.load(header.id, restore, each),
+            })?;
+        if loaded.writer.read_only().is_none()
+            && folding.core.ledger().extensions().is_some_and(|installed| {
+                installed.iter().any(|extension| extension.image.is_some())
+                    && installed != registry.installed()
+            })
+        {
+            loaded.writer.keep(ReadOnly::Extensions);
+        }
+        Ok((loaded, folding))
     }
 
     fn rebuild<T>(

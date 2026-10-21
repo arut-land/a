@@ -13,11 +13,11 @@ use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
 /// The protocol this build speaks best.
-pub const PROTO: u32 = 5;
+pub const PROTO: u32 = 6;
 
 /// The oldest protocol this build still speaks: a peer whose range
 /// overlaps `PROTO_MIN..=PROTO` is served at the highest version both speak.
-pub const PROTO_MIN: u32 = 5;
+pub const PROTO_MIN: u32 = 6;
 
 const MAX_FRAME: u32 = 16 * 1024 * 1024;
 
@@ -609,6 +609,8 @@ pub struct SessionSummary {
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum ReadOnly {
+    /// The recorded dynamic generation cannot be reconstructed by this registry.
+    Extensions,
     /// Its lines from entry `seq` on are damaged or unreadable, and are
     /// not the tail a crash leaves: the entries before it are shown.
     Damaged { seq: u64 },
@@ -641,6 +643,7 @@ impl fmt::Display for SessionSummary {
 impl fmt::Display for ReadOnly {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
+            Self::Extensions => f.write_str("read-only: recorded extension generation unavailable"),
             Self::Damaged { seq } => write!(f, "read-only: damaged at entry {seq}"),
             Self::Format { version } => write!(f, "read-only: log format {version}"),
         }

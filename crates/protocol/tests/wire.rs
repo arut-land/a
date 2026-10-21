@@ -720,6 +720,7 @@ fn daemon_samples() -> Vec<Sample<DaemonMsg>> {
                 sessions: [
                     ReadOnly::Damaged { seq: 4 },
                     ReadOnly::Format { version: 2 },
+                    ReadOnly::Extensions,
                 ]
                 .map(|why| SessionSummary {
                     id: SESSION,

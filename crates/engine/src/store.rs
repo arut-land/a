@@ -156,6 +156,11 @@ impl Writer {
         Ok(lines)
     }
 
+    /// Prevents recovery or future appends when replay cannot honor the log.
+    pub fn keep(&mut self, why: ReadOnly) {
+        self.log = Box::new(Kept(why));
+    }
+
     /// Makes what was only written durable.
     pub fn sync(&mut self) -> io::Result<()> {
         self.log.sync()

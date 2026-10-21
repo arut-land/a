@@ -2225,3 +2225,65 @@ fn every_recorded_prefix_is_either_copied_exactly_or_refused_without_a_log() {
     assert_eq!(fixture.0.store.entries(session.id).unwrap(), log);
     session.halt();
 }
+
+#[test]
+fn recorded_dynamic_history_is_refused_without_its_loader() {
+    let fixture = Fixture::new(
+        ext_fixtures::ECHO,
+        Registry::default().with(&ext_fork::Fork).unwrap(),
+        openai(&Script::new(&[])),
+    );
+    let header = Fixture::header();
+    let mut installed = fixture.0.registry.get().installed();
+    installed.push(Installed {
+        name: "counter".into(),
+        version: 1,
+        image: Some(
+            Json::encode(&(
+                "a.fold{name='count',initial=0,apply=function(s,c) return s+c end}",
+                Vec::<String>::new(),
+                4_194_304_usize,
+                100_000_u64,
+                Duration::from_millis(25),
+            ))
+            .unwrap(),
+        ),
+    });
+    let entries = vec![
+        entry(1, Body::Extensions { installed }),
+        entry(
+            2,
+            Body::Ext {
+                ext: "counter".into(),
+                state: "count".into(),
+                data: Json::encode(&7).unwrap(),
+            },
+        ),
+        entry(
+            3,
+            Body::Ext {
+                ext: "fork".into(),
+                state: "parent".into(),
+                data: Json::encode(&ext_fork::Parent {
+                    session: SessionId::new(),
+                    seq: Seq::new(2).unwrap(),
+                })
+                .unwrap(),
+            },
+        ),
+    ];
+    fixture.0.store.import(&header, &entries).unwrap();
+    let mut record = Record::new(header.clone());
+    record.entries = entries.len() as u64;
+    fixture.0.catalog.record(record);
+
+    let live = Live::start(&header, &fixture.0, Open::Load, Owner::None).unwrap();
+    settle(&live);
+    assert_eq!(live.summary().read_only, Some(ReadOnly::Extensions));
+    assert!(
+        live.submit("must not replace the recorded generation")
+            .is_err()
+    );
+    live.halt();
+    assert_eq!(fixture.0.store.entries(header.id).unwrap(), entries);
+}
