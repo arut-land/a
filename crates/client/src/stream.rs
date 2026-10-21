@@ -200,7 +200,7 @@ mod tests {
             part: Part::Outcome,
         };
         assert_eq!(stream.project(&done, &view), [ReplyEvent::End]);
-        assert!(stream.project(&done, &view).is_empty());
+        assert_eq!(stream.project(&done, &view), []);
         assert_eq!(
             stream.project(&delta, &view),
             [ReplyEvent::Start, ReplyEvent::Text("reply")]
@@ -276,7 +276,7 @@ mod tests {
         let running = view
             .fold(&DaemonMsg::Snapshot(Box::new(view.snapshot())))
             .unwrap();
-        assert!(stream.project(&running.change, &view).is_empty());
+        assert_eq!(stream.project(&running.change, &view), []);
         let mut daemon_view = view.clone();
         daemon_view.fold(&DaemonMsg::Entry(entry(
         2,
@@ -292,9 +292,7 @@ mod tests {
             },
         },
     )));
-        assert!(
-            matches!(&daemon_view.items[0], protocol::view::Item::Reply { text, .. } if text == "hello")
-        );
+        assert!(matches!(&daemon_view.items[0], Item::Reply { text, .. } if text == "hello"));
         let update = view
             .fold(&DaemonMsg::Snapshot(Box::new(daemon_view.snapshot())))
             .unwrap();
@@ -303,17 +301,16 @@ mod tests {
             stream.project(&update.change, &view),
             [ReplyEvent::Text("lo"), ReplyEvent::End]
         );
-        assert!(stream.project(&update.change, &view).is_empty());
-        assert!(
-            stream
-                .project(
-                    &Change::Updated {
-                        index: 0,
-                        part: Part::Outcome
-                    },
-                    &view
-                )
-                .is_empty()
+        assert_eq!(stream.project(&update.change, &view), []);
+        assert_eq!(
+            stream.project(
+                &Change::Updated {
+                    index: 0,
+                    part: Part::Outcome
+                },
+                &view
+            ),
+            []
         );
     }
 }
