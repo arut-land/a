@@ -623,7 +623,7 @@ impl SessionView {
                     part: Part::Outcome,
                 })
             }
-            Body::ModelResult { call, outcome } => self.replied(*call, outcome),
+            Body::ModelResult { call, outcome, .. } => self.replied(*call, outcome),
             Body::Answer { call, .. } => {
                 let at = self.call(*call)?;
                 let Item::Tool { phase, .. } = &mut self.items[at] else {

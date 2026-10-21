@@ -15,6 +15,7 @@ impl Extension for Fixtures {
     const VERSION: u32 = 1;
 
     fn contribute(&self, r: &mut Registrar) {
+        r.provide::<dyn ext::SideProvider>(std::sync::Arc::new(Fixtures));
         r.tool(Sleep).agent(crate::ECHO, || Box::new(Echo));
     }
 }
@@ -118,6 +119,33 @@ impl Tool for Sleep {
         rt.sleep(Duration::from_secs(input.seconds)).await;
         Ok(Slept {
             slept: input.seconds,
+        })
+    }
+}
+
+impl ext::Provides<dyn ext::SideProvider> for Fixtures {}
+
+impl ext::SideProvider for Fixtures {
+    fn reply<'a>(
+        &'a self,
+        side: &'a ext::Side,
+        _: &'a llm::Messages,
+    ) -> ext::BoxFuture<'a, Result<llm::Response, llm::Error>> {
+        Box::pin(async move {
+            Ok(llm::Response {
+                message: llm::Assistant {
+                    content: vec![llm::AssistantPart::Text(llm::Text::new(format!(
+                        "fixture {}",
+                        side.purpose
+                    )))],
+                    origin: None,
+                },
+                finish: llm::Finish::new(llm::Reason::Stop, None),
+                usage: llm::Usage::default(),
+                id: None,
+                model: None,
+                meta: llm::Meta::new(),
+            })
         })
     }
 }

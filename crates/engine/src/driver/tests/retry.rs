@@ -208,6 +208,7 @@ fn a_crash_loop_cannot_retry_forever() {
             entry(
                 2,
                 Body::ModelCall {
+                    request: None,
                     model: "m".into(),
                     attempt: 0,
                     choice: ToolChoice::Auto,

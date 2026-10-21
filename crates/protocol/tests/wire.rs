@@ -242,6 +242,7 @@ fn input_samples() -> Vec<Sample<DaemonMsg>> {
             entry(
                 8,
                 Body::ModelCall {
+                    request: None,
                     model: "openai:m".into(),
                     attempt: 1,
                     choice: protocol::ToolChoice::Auto,
@@ -255,6 +256,7 @@ fn input_samples() -> Vec<Sample<DaemonMsg>> {
             entry(
                 9,
                 Body::ModelCall {
+                    request: None,
                     model: "openai:m".into(),
                     attempt: 0,
                     choice: protocol::ToolChoice::None,
@@ -268,6 +270,9 @@ fn input_samples() -> Vec<Sample<DaemonMsg>> {
             entry(
                 10,
                 Body::ModelCall {
+                    request: Some(
+                        protocol::Json::encode(&json!({"opaque": "side intent"})).unwrap(),
+                    ),
                     model: "openai:m".into(),
                     attempt: 0,
                     choice: protocol::ToolChoice::Auto,
@@ -429,6 +434,22 @@ fn daemon_samples() -> Vec<Sample<DaemonMsg>> {
     ];
     vec![
         sample(
+            "entry_side_retry",
+            entry(
+                12,
+                Body::Decision {
+                    by: "retry".into(),
+                    call: CallId::new(10),
+                    d: Verdict::SideRetry {
+                        attempt: 1,
+                        failure: protocol::Json::encode(&json!({"opaque": "model failure"}))
+                            .unwrap(),
+                        after_ms: 2000,
+                    },
+                },
+            ),
+        ),
+        sample(
             "welcome",
             DaemonMsg::Welcome {
                 proto: PROTO,
@@ -535,6 +556,7 @@ fn daemon_samples() -> Vec<Sample<DaemonMsg>> {
             entry(
                 8,
                 Body::ModelCall {
+                    request: None,
                     model: "openai:m".into(),
                     attempt: 0,
                     choice: protocol::ToolChoice::Auto,
@@ -548,6 +570,9 @@ fn daemon_samples() -> Vec<Sample<DaemonMsg>> {
             entry(
                 9,
                 Body::ModelResult {
+                    failure: Some(
+                        protocol::Json::encode(&json!({"opaque": "model failure"})).unwrap(),
+                    ),
                     call: CallId::new(8).unwrap(),
                     outcome: Outcome::Failed {
                         error: "rate limited".into(),
@@ -560,6 +585,7 @@ fn daemon_samples() -> Vec<Sample<DaemonMsg>> {
             entry(
                 10,
                 Body::ModelResult {
+                    failure: None,
                     call: CallId::new(8).unwrap(),
                     outcome: Outcome::Interrupted {
                         output: Some("so far".into()),

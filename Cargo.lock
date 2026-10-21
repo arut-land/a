@@ -648,6 +648,7 @@ name = "ext-fixtures"
 version = "0.0.0"
 dependencies = [
  "ext",
+ "llm",
  "protocol",
  "rt",
  "serde",
@@ -735,7 +736,6 @@ dependencies = [
  "ext",
  "llm",
  "protocol",
- "serde",
 ]
 
 [[package]]

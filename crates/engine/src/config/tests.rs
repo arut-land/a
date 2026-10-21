@@ -38,6 +38,7 @@ fn files_parse_the_contract() {
         file,
         File {
             model: Some("openai:gpt-6-luna".into()),
+            fast_model: None,
             agent: Some("loop".into()),
             env: BTreeMap::from([("OPENAI_API_KEY".into(), "sk-test".into())]),
             daemon: sys::config::Daemon::default(),
@@ -175,5 +176,23 @@ fn a_file_is_looked_at_once_per_floor_and_the_daemons_own_change_at_once() {
     };
     s.home.change(&change).unwrap();
     assert_eq!(s.model(&ws).unwrap().0, "third:m");
+    std::fs::remove_dir_all(root).unwrap();
+}
+
+#[test]
+fn fast_role_routes_through_workspace_then_home_without_changing_the_session_model() {
+    let (root, ws) = dirs(
+        "side-role",
+        Some("model = \"main:m\"\nfast_model = \"home:fast\""),
+        Some("fast_model = \"ws:fast\""),
+    );
+    let s = settings(&root);
+    assert_eq!(s.fast_model(&ws).unwrap().as_deref(), Some("ws:fast"));
+    assert_eq!(s.fast_model(&root).unwrap().as_deref(), Some("home:fast"));
+    assert_eq!(s.model(&ws).unwrap().0, "main:m");
+    let mut file = File::read(&root.join("config.toml")).unwrap();
+    file.model = Some("main:new".into());
+    file.write(&root.join("config.toml")).unwrap();
+    assert_eq!(s.fast_model(&root).unwrap().as_deref(), Some("home:fast"));
     std::fs::remove_dir_all(root).unwrap();
 }

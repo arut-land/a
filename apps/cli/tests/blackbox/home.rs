@@ -29,7 +29,9 @@ fn a_clients_key_never_serves_another_clients_session() {
     let mut conn = env.connect();
     conn.attach(Target::New, &env.ws);
     conn.input("hi");
-    let entries = conn.until(|e| matches!(e.body, Body::ModelResult { .. }));
+    let entries = conn.until(|e| matches!(e.body, Body::ModelCall { r#for: None, .. }));
+    let main = protocol::CallId(entries.last().unwrap().seq);
+    let entries = conn.until(|e| matches!(e.body, Body::ModelResult { call, .. } if call == main));
     let Body::ModelResult {
         outcome: Outcome::Failed { error },
         ..

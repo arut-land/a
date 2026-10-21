@@ -39,6 +39,9 @@ use crate::model::{Model, Models};
 use crate::outbox::{FrameLog, Outbox};
 use crate::transcript::Transcript;
 use crate::{Daemon, lock};
+use side::SideFact;
+
+mod side;
 
 /// What every session runs with.
 pub struct Shared {
@@ -137,8 +140,21 @@ pub struct Live {
 }
 
 /// What a side request is answered with: its id and the conversation it
-/// asked for, or `None` when it may not be made.
-type Opened = Option<(CallId, llm::Messages)>;
+/// asked for, a committed result, or a closed owner.
+enum Opened {
+    Fresh(Admitted),
+    Cached {
+        outcome: Outcome,
+        failure: Option<Json>,
+    },
+    Closed,
+}
+
+struct Admitted {
+    id: CallId,
+    messages: llm::Messages,
+    limited: bool,
+}
 
 /// A client's mutation of a session.
 pub enum Request {
@@ -186,10 +202,14 @@ enum Msg {
     /// model sees before `of`.
     Side {
         of: CallId,
-        purpose: String,
         model: String,
-        conversation: bool,
+        side: ext::Side,
         reply: oneshot::Sender<Opened>,
+    },
+    SideFact {
+        side: CallId,
+        fact: SideFact,
+        done: oneshot::Sender<Result<(), String>>,
     },
     Stop,
     /// Make what was only written durable, and show it: sent to itself
@@ -317,6 +337,7 @@ impl Live {
             view: None,
             replies: Keyed::default(),
             sides: Keyed::default(),
+            side_waiters: Keyed::default(),
             tickets: 0,
             phase: Phase::Serving,
             listed,
@@ -594,9 +615,10 @@ struct Actor {
     /// the first time one is asked for: no attach folds the whole log.
     view: Option<SessionView>,
     replies: Keyed<Ticket, oneshot::Sender<Result<(), String>>>,
-    /// Side model requests waiting for their call's id, with the
-    /// conversation they asked for.
-    sides: Keyed<Ticket, (oneshot::Sender<Opened>, Option<llm::Messages>)>,
+    /// Duplicate consumers wait for the same durable result.
+    side_waiters: Keyed<CallId, Vec<oneshot::Sender<Opened>>>,
+    /// Admission replies retain the frozen context until the intent commits.
+    sides: Keyed<Ticket, (oneshot::Sender<Opened>, llm::Messages, bool)>,
     tickets: u64,
     phase: Phase,
     /// The session as the catalog last heard of it: busy while work is in
@@ -634,6 +656,8 @@ enum InFlight {
     Prepared(Box<Result<(Model, llm::Request, u16), String>>),
     /// A model call sent; it reports once, with [`Msg::Replied`].
     Model,
+    /// Side work must report before the session closes its writer.
+    Side,
     /// A tool call running; it reports once, with [`Event::ToolDone`].
     Tool(Child),
     /// A gate, a recovery or a sleep, answered by an event of its own.
@@ -661,7 +685,7 @@ impl Actor {
     /// Tool and model calls in flight, each of which reports once.
     fn reporting(&self) -> usize {
         (self.inflight.values())
-            .filter(|f| matches!(f, InFlight::Model | InFlight::Tool(_)))
+            .filter(|f| matches!(f, InFlight::Model | InFlight::Side | InFlight::Tool(_)))
             .count()
     }
 
@@ -895,22 +919,15 @@ impl Actor {
             }
             Msg::Side {
                 of,
-                purpose,
                 model,
-                conversation,
+                side,
                 reply,
             } => {
-                let conversation = conversation.then(|| self.conversation(of));
-                self.tickets += 1;
-                let ticket = Ticket(self.tickets);
-                self.sides.insert(ticket, (reply, conversation));
-                Event::Side {
-                    of,
-                    purpose,
-                    model,
-                    ticket,
-                }
+                return self
+                    .open_side(of, model, side, reply)
+                    .map(|event| (event, None));
             }
+            Msg::SideFact { side, fact, done } => self.side_fact(side, fact, done),
             #[cfg(test)]
             Msg::Barrier(done) => {
                 done.send(());
@@ -1106,6 +1123,7 @@ impl Actor {
         lock(&self.live.session.cancels).clear();
         self.replies.clear();
         self.sides.clear();
+        self.side_waiters.clear();
         self.inflight.clear();
         self.unsynced.clear();
         self.waiting_sync.clear();
@@ -1366,6 +1384,20 @@ impl Actor {
             view.extend(entries);
         }
         for (e, line) in entries.iter().zip(lines.lines()) {
+            if let Body::ModelResult {
+                call,
+                outcome,
+                failure,
+            } = &e.body
+                && let Some(waiters) = self.side_waiters.remove(call)
+            {
+                for waiter in waiters {
+                    waiter.send(Opened::Cached {
+                        outcome: outcome.clone(),
+                        failure: failure.clone(),
+                    });
+                }
+            }
             // One too large for the tail is not framed: followers read it.
             let frame = (line.len() <= crate::outbox::TAIL)
                 .then(|| Frame::from_line(e.seq.get(), line).ok())
@@ -1447,8 +1479,16 @@ impl Actor {
             Effect::Append(_) | Effect::Commit(_) => unreachable!("appends commit in runs"),
             Effect::Reply { ticket, result } => self.reply(ticket, result),
             Effect::Side { ticket, side } => {
-                if let Some((reply, conversation)) = self.sides.remove(&ticket) {
-                    reply.send(side.map(|side| (side, conversation.unwrap_or_default())));
+                if let Some((reply, messages, limited)) = self.sides.remove(&ticket) {
+                    reply.send(side.map_or(Opened::Closed, |id| {
+                        self.live.session.cancel(id);
+                        self.inflight.insert(id, InFlight::Side);
+                        Opened::Fresh(Admitted {
+                            id,
+                            messages,
+                            limited,
+                        })
+                    }));
                 }
             }
             Effect::Prepare {
@@ -2161,103 +2201,6 @@ impl Host for Calling {
 
     fn registry(&self) -> &Registry {
         &self.registry
-    }
-}
-
-impl ext::Models for Own {
-    /// Logged under the call as a model call of its own, then sent once:
-    /// its outcome is logged as it ends, and the call's end ends it.
-    fn call<'a>(
-        &'a self,
-        cx: &'a Cx,
-        side: ext::Side,
-    ) -> BoxFuture<'a, Result<llm::Response, llm::Error>> {
-        Box::pin(async move {
-            let invalid = |e: String| llm::Error::new(llm::Kind::InvalidRequest, e);
-            let session = self
-                .0
-                .upgrade()
-                .ok_or_else(|| invalid("the session is gone".into()))?;
-            let model = match &side.model {
-                Some(spec) => {
-                    let env = lock(&session.env).clone();
-                    (session.shared.models).model(&session.workspace, env.as_deref(), spec)
-                }
-                None => session.model(),
-            }
-            .map_err(invalid)?;
-            let of = cx.call;
-            let (asking, opened) = oneshot::channel();
-            let purpose = side.purpose.to_string();
-            let _ = session.mail.send(Msg::Side {
-                of,
-                purpose,
-                model: model.name(),
-                conversation: side.conversation,
-                reply: asking,
-            });
-            let Some(Some((id, conversation))) = opened.await else {
-                return Err(invalid(format!("call {of} is not open to ask for")));
-            };
-            let mut request = side.request;
-            if side.conversation {
-                // Pushed onto the conversation, whose encodings it keeps.
-                let mut messages = conversation;
-                for message in request.messages.iter() {
-                    messages.push(message.clone());
-                }
-                request.messages = messages;
-            }
-            request.model = model.id();
-            request.generation.max_output_tokens =
-                std::num::NonZeroU32::new(side.budget.max_tokens);
-            // Logged as intent, it is seen through to its outcome by a task
-            // of its own, stopped by the call's cancel: a handler that
-            // drops its answer does not leave the side call open.
-            let (answered, answer) = oneshot::channel();
-            let timeout = session.shared.rt.sleep(side.budget.timeout);
-            let (cancel, mail) = (cx.cancel.clone(), Arc::clone(&session.mail));
-            session.shared.rt.spawn(Box::pin(async move {
-                // Read as the call's own replies are, with nothing streamed.
-                let mut quiet = |_: &str| {};
-                let asked = reply(&model, &request, &cancel, &mut quiet);
-                let (outcome, answer) = sided(first(asked, timeout).await.map(|(r, _)| r));
-                let _ = mail.send(Msg::Step(Event::SideDone { side: id, outcome }));
-                answered.send(answer);
-            }));
-            answer
-                .await
-                .unwrap_or_else(|| Err(llm::Error::new(llm::Kind::Incomplete, "not answered")))
-        })
-    }
-}
-
-/// What a side request's reply, or its timing out, is logged as and
-/// answered with.
-fn sided(replied: Option<Replied>) -> (Outcome, Result<llm::Response, llm::Error>) {
-    match replied {
-        Some(Replied::Done(output)) => {
-            let answer = llm::Response::from_json(output.raw())
-                .map_err(|e| llm::Error::new(llm::Kind::Decode, e.to_string()));
-            (Outcome::Done { output }, answer)
-        }
-        Some(Replied::Failed(error)) => {
-            let failed = Outcome::Failed {
-                error: error.to_string(),
-            };
-            (failed, Err(error))
-        }
-        Some(Replied::Interrupted(output)) => {
-            let error = llm::Error::new(llm::Kind::Incomplete, "the call ended first");
-            (Outcome::Interrupted { output }, Err(error))
-        }
-        None => {
-            let error = llm::Error::new(llm::Kind::Transport, "the side request timed out");
-            let failed = Outcome::Failed {
-                error: error.to_string(),
-            };
-            (failed, Err(error))
-        }
     }
 }
 

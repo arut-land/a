@@ -53,7 +53,10 @@ pub use point::{
     Answer, Asked, Chained, Gate, Gated, Gating, Later, PointCx, Reaction, Recover, Rewrite,
 };
 pub use schema::Schema;
-pub use service::{Budget, CwdOf, Layers, ModelSpec, Models, Sessions, Side, Spawner};
+pub use service::{
+    Background, Budget, CwdOf, Layers, ModelRole, ModelSpec, Models, Sessions, Side, SideContext,
+    SideProvider, SideRetry, Spawner,
+};
 pub use settings::{Configured, Empty, Table};
 pub use shape::{Output, Partials, Streamed, stream};
 pub use state::{DynFold, Fold, Image, States};

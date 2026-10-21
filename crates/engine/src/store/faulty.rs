@@ -29,6 +29,7 @@ struct State {
     cut: AtomicBool,
     fail_sync: Mutex<Option<SyncFailure>>,
     fail_write: AtomicBool,
+    fail_barrier: AtomicBool,
 }
 
 #[derive(Clone, Copy)]
@@ -55,6 +56,11 @@ impl Faulty {
     /// Fails the next sync after losing or retaining its readable bytes.
     pub fn fail_next_sync(&self, failure: SyncFailure) {
         *lock(&self.state.fail_sync) = Some(failure);
+    }
+
+    /// Rejects a durable append before any of its bytes are written.
+    pub fn fail_next_barrier(&self) {
+        self.state.fail_barrier.store(true, Ordering::SeqCst);
     }
 
     /// Rejects the next deferred write before storing any of its bytes.
@@ -135,6 +141,9 @@ impl FaultyLog {
 impl Log for FaultyLog {
     fn append_all(&mut self, entries: &[Entry], lines: &Encoded) -> io::Result<()> {
         self.on()?;
+        if self.state.fail_barrier.swap(false, Ordering::SeqCst) {
+            return Err(io::Error::other("durable append failed"));
+        }
         self.flush(true)?;
         self.inner.append_all(entries, lines)
     }

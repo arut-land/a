@@ -22,8 +22,10 @@ impl Extension for Aside {
             };
             Answer::Later(ext::Later::new(async move {
                 let models = cx.models()?;
-                let side = ext::Side::new(
+                let side = ext::Side::new::<Aside>(
                     "test",
+                    ext::ModelRole::Session,
+                    ext::SideContext::None,
                     [llm::Message::user("Say hi.")].into_iter().collect(),
                 );
                 models.call(&cx, side).await.ok()?;
@@ -70,7 +72,7 @@ fn a_side_call_is_logged_as_its_own_call() {
     let (side, of, purpose) = sides[0];
     assert_eq!((of, purpose), (2, "test"));
     let answered = log.iter().any(
-        |e| matches!(&e.body, Body::ModelResult { call, outcome: Outcome::Done { .. } } if *call == side),
+        |e| matches!(&e.body, Body::ModelResult { failure: None, call, outcome: Outcome::Done { .. } } if *call == side),
     );
     assert!(answered, "{log:#?}");
     // Resent once the side request answered, as the handler's decision.
@@ -106,7 +108,7 @@ fn a_side_call_dies_with_its_call() {
     let (side, ..) = sides(&log)[0];
     let ended = |call: CallId| {
         log.iter().position(|e| {
-            matches!(&e.body, Body::ModelResult { call: c, outcome: Outcome::Interrupted { .. } } if *c == call)
+            matches!(&e.body, Body::ModelResult { failure: None, call: c, outcome: Outcome::Interrupted { .. } } if *c == call)
         })
     };
     let (side_end, call_end) = (ended(side), ended(CallId::new(2).unwrap()));
@@ -250,4 +252,404 @@ fn a_title_call_is_a_side_call() {
         Some("The harbor label is crimson-harbor.")
     );
     assert_eq!(titles.len(), 1, "titled once");
+}
+
+struct Probe;
+
+impl Tool for Probe {
+    type In = ext::Args;
+    type Out = String;
+    const NAME: &'static str = "side-probe";
+    const DESCRIPTION: &'static str = "ask a side model";
+    const REPLAY: Replay = Replay::Safe;
+    const CONCURRENCY: ext::Concurrency = ext::Concurrency::Shared;
+
+    async fn call(&self, args: &ext::Args, cx: &Cx) -> Result<String, String> {
+        let side = ext::Side::new::<Probes>(
+            "probe",
+            ext::ModelRole::Session,
+            ext::SideContext::None,
+            [llm::Message::user("Say hi.")].into_iter().collect(),
+        );
+        if args.args == "background" {
+            let work = side.background().start(cx.clone()).0.unwrap();
+            cx.service::<dyn rt::Runtime>().unwrap().spawn(work.0);
+            return Ok("started".into());
+        }
+        if args.args == "duplicate" {
+            let (done, other) = oneshot::channel();
+            let owned = cx.clone();
+            let again = side.clone();
+            cx.service::<dyn rt::Runtime>()
+                .unwrap()
+                .spawn(Box::pin(async move {
+                    done.send(owned.models().unwrap().call(&owned, again).await);
+                }));
+            let first = cx
+                .models()
+                .unwrap()
+                .call(cx, side)
+                .await
+                .map_err(|e| e.to_string())?;
+            let second = other.await.unwrap().map_err(|e| e.to_string())?;
+            assert_eq!(first.message.text(), second.message.text());
+            return Ok(first.message.text());
+        }
+        cx.models()
+            .unwrap()
+            .call(cx, side)
+            .await
+            .map(|r| r.message.text())
+            .map_err(|e| e.to_string())
+    }
+}
+
+struct Probes;
+
+impl ext::Agent for Probes {
+    fn step(&mut self, input: ext::Input, _: &dyn ext::LoopPoints) -> ext::Actions {
+        let ext::Input::User { text } = input else {
+            return ext::Actions::new();
+        };
+        (0..text.parse::<usize>().unwrap_or(1))
+            .map(|_| ext::Action::Call {
+                tool: "side-probe".into(),
+                input: Json::encode(&ext::Args { args: text.clone() }).unwrap(),
+                id: None,
+            })
+            .collect()
+    }
+}
+
+impl Extension for Probes {
+    const NAME: &'static str = "probes";
+    const VERSION: u32 = 1;
+    fn contribute(&self, r: &mut Registrar) {
+        r.tool(Probe).agent("probes", || Box::new(Probes));
+    }
+}
+
+fn probes(http: &Arc<Flaky>, registry: Registry) -> Fixture {
+    Fixture::new(
+        "probes",
+        registry.with(&Probes).unwrap(),
+        Models {
+            http: Arc::clone(http) as Arc<dyn Http>,
+            ..openai(&Script::new(&[]))
+        },
+    )
+}
+
+#[test]
+fn replay_never_calls_a_side_model_again() {
+    let http = Flaky::new([Reply::Events(text_reply())]);
+    let session = probes(&http, Registry::default()).start(&[]);
+    session.submit("1").unwrap();
+    settle(&session);
+    let log = log_of(&session);
+    session.halt();
+    let prefix: Vec<_> = log
+        .into_iter()
+        .take_while(|e| !matches!(e.body, Body::ToolResult { .. }))
+        .collect();
+    assert!(
+        prefix
+            .iter()
+            .any(|e| matches!(e.body, Body::ModelResult { .. }))
+    );
+
+    let replay = Flaky::new([]);
+    let session = probes(&replay, Registry::default()).start(&prefix);
+    let log = log_of(&session);
+    session.halt();
+    assert_eq!(replay.sent(), 0);
+    assert_eq!(sides(&log).len(), 1);
+    assert!(log.iter().any(|e| matches!(&e.body,
+        Body::ToolResult { outcome: Outcome::Done { output }, .. }
+            if output.raw().contains("crimson-harbor"))));
+}
+
+#[test]
+fn crash_mid_side_call_recovers_as_interrupted_without_spending_again() {
+    let http = Flaky::new([Reply::Hang(String::new())]);
+    let session = probes(&http, Registry::default()).start(&[]);
+    session.submit("1").unwrap();
+    http.wait_sent(1);
+    let prefix = log_of(&session);
+    session.halt();
+    let replay = Flaky::new([]);
+    let session = probes(&replay, Registry::default()).start(&prefix);
+    let log = log_of(&session);
+    session.halt();
+    assert_eq!(replay.sent(), 0);
+    let side = sides(&log)[0].0;
+    assert!(log.iter().any(|e| matches!(&e.body,
+        Body::ModelResult { call, outcome: Outcome::Interrupted { .. }, .. } if *call == side)));
+    assert!(log.iter().any(|e| matches!(
+        e.body,
+        Body::ToolResult {
+            outcome: Outcome::Failed { .. },
+            ..
+        }
+    )));
+}
+
+#[test]
+fn a_side_call_dies_with_its_session() {
+    let http = Flaky::new([Reply::Hang(String::new())]);
+    let session = probes(&http, Registry::default()).start(&[]);
+    session.submit("background").unwrap();
+    http.wait_sent(1);
+    until(&session, "owner done", |log| {
+        log.iter().any(|e| {
+            matches!(
+                e.body,
+                Body::ToolResult {
+                    outcome: Outcome::Done { .. },
+                    ..
+                }
+            )
+        })
+    });
+    let mut ledger = Ledger::default();
+    for entry in log_of(&session) {
+        ledger.apply(&entry);
+    }
+    assert_eq!(ledger.activity(), Activity::Idle);
+    session.halt();
+    let log = log_of(&session);
+    assert!(log.iter().any(|e| matches!(
+        e.body,
+        Body::ModelResult {
+            outcome: Outcome::Interrupted { .. },
+            ..
+        }
+    )));
+    assert_eq!(http.sent(), 1);
+}
+
+#[test]
+fn retry_policy_applies_to_side_calls_without_reentering_compaction() {
+    let http = Flaky::new([Reply::Status(429, &[]), Reply::Events(text_reply())]);
+    let registry = Registry::default()
+        .with(&ext_retry::Retry {
+            base: Duration::ZERO,
+            ..ext_retry::Retry::default()
+        })
+        .unwrap();
+    let session = probes(&http, registry).start(&[]);
+    session.submit("1").unwrap();
+    settle(&session);
+    let log = log_of(&session);
+    session.halt();
+    assert_eq!(http.sent(), 2);
+    assert_eq!(sides(&log).len(), 1);
+    let failure = log
+        .iter()
+        .find_map(|e| match &e.body {
+            Body::Decision {
+                d:
+                    Verdict::SideRetry {
+                        attempt: 1,
+                        failure,
+                        ..
+                    },
+                ..
+            } => Some(failure),
+            _ => None,
+        })
+        .unwrap();
+    assert_eq!(
+        llm::Error::from_json(failure.raw()).unwrap().kind,
+        llm::Kind::RateLimit
+    );
+    assert!(log.iter().any(|e| matches!(
+        e.body,
+        Body::ToolResult {
+            outcome: Outcome::Done { .. },
+            ..
+        }
+    )));
+}
+
+#[test]
+fn side_concurrency_is_bounded_and_rejection_is_a_typed_fact() {
+    let http = Flaky::new((0..4).map(|_| Reply::Hang(String::new())));
+    let session = probes(&http, Registry::default()).start(&[]);
+    session.submit("5").unwrap();
+    until(&session, "side limit", |log| {
+        log.iter().any(|e| {
+            matches!(
+                e.body,
+                Body::ModelResult {
+                    failure: Some(_),
+                    ..
+                }
+            )
+        })
+    });
+    http.wait_sent(4);
+    let log = log_of(&session);
+    session.halt();
+    assert_eq!(http.sent(), 4);
+    let failure = log
+        .iter()
+        .find_map(|e| match &e.body {
+            Body::ModelResult {
+                failure: Some(failure),
+                ..
+            } => Some(failure),
+            _ => None,
+        })
+        .unwrap();
+    let failure = llm::Error::from_json(failure.raw()).unwrap();
+    assert_eq!(failure.kind, llm::Kind::InvalidRequest);
+    assert!(failure.message.contains("four side calls"));
+}
+
+#[test]
+fn fixtures_answer_side_calls_through_the_durable_service() {
+    let http = Flaky::new([]);
+    let registry = Registry::default().with(&ext_fixtures::Fixtures).unwrap();
+    let session = probes(&http, registry).start(&[]);
+    session.submit("1").unwrap();
+    settle(&session);
+    let log = log_of(&session);
+    session.halt();
+    assert_eq!(http.sent(), 0);
+    let view = SessionView::from_log(SessionId::new(), "/w".into(), &log);
+    assert_eq!(view.side("probe"), Some("fixture probe"));
+}
+
+#[test]
+fn concurrent_consumers_share_one_side_intent_and_result() {
+    let http = Flaky::new([Reply::Events(text_reply())]);
+    let session = probes(&http, Registry::default()).start(&[]);
+    session.submit("duplicate").unwrap();
+    settle(&session);
+    let log = log_of(&session);
+    session.halt();
+    assert_eq!(http.sent(), 1);
+    assert_eq!(sides(&log).len(), 1);
+    assert!(log.iter().any(|e| matches!(
+        e.body,
+        Body::ToolResult {
+            outcome: Outcome::Done { .. },
+            ..
+        }
+    )));
+}
+
+#[test]
+fn a_fast_role_uses_config_and_logs_its_prompt_separately_from_context() {
+    let http = Flaky::new([Reply::Events(text_reply()), Reply::Events(text_reply())]);
+    let registry = Registry::default().with(&ext_title::Title).unwrap();
+    let harness = fixture(registry, &http);
+    let path = harness.0.models.settings.home.path();
+    let mut config = crate::config::File::read(path).unwrap();
+    config.fast_model = Some("openai:side-fast".into());
+    config.write(path).unwrap();
+    let session = harness.start(&[]);
+    session.submit("my distinct task").unwrap();
+    until(&session, "title result", |log| {
+        sides(log).first().is_some_and(|&(side, ..)| {
+            log.iter()
+                .any(|e| matches!(&e.body, Body::ModelResult { call, .. } if *call == side))
+        })
+    });
+    settle(&session);
+    let log = log_of(&session);
+    session.halt();
+    assert_eq!(
+        http.bodies()
+            .iter()
+            .filter(|b| b["model"] == "side-fast")
+            .count(),
+        1
+    );
+    let intent = log
+        .iter()
+        .find_map(|e| match &e.body {
+            Body::ModelCall {
+                purpose: Some(p),
+                request: Some(request),
+                model,
+                ..
+            } if p == "title" => {
+                assert_eq!(model, "openai:side-fast");
+                Some(request.parse::<Value>().unwrap())
+            }
+            _ => None,
+        })
+        .unwrap();
+    assert_eq!(intent["request"]["role"], "Fast");
+    assert!(
+        !intent["request"]["messages"]
+            .to_string()
+            .contains("my distinct task")
+    );
+    assert!(
+        intent["transcript"]
+            .to_string()
+            .contains("my distinct task")
+    );
+    let view = SessionView::from_log(SessionId::new(), "/w".into(), &log);
+    assert!(view.items.iter().any(|i| matches!(i,
+        protocol::view::Item::Reply { purpose: Some(p), usage: Some(_), .. } if p == "title")));
+    std::fs::remove_file(path).unwrap();
+}
+
+struct FailResultCommit(Arc<crate::store::Faulty>);
+
+impl ext::SideProvider for FailResultCommit {
+    fn reply<'a>(
+        &'a self,
+        side: &'a ext::Side,
+        messages: &'a llm::Messages,
+    ) -> BoxFuture<'a, Result<llm::Response, llm::Error>> {
+        Box::pin(async move {
+            let reply = ext::SideProvider::reply(&ext_fixtures::Fixtures, side, messages).await;
+            self.0.fail_next_barrier();
+            reply
+        })
+    }
+}
+
+impl Extension for FailResultCommit {
+    const NAME: &'static str = "fail-side-result";
+    const VERSION: u32 = 1;
+    fn contribute(&self, r: &mut Registrar) {
+        r.provide::<dyn ext::SideProvider>(Arc::new(Self(Arc::clone(&self.0))));
+    }
+}
+
+#[test]
+fn a_failed_result_commit_cannot_release_a_successful_side_reply() {
+    let faulty = Arc::new(crate::store::Faulty::new(Arc::new(Memory::default())));
+    let registry = Registry::default()
+        .with(&Probes)
+        .unwrap()
+        .with(&FailResultCommit(Arc::clone(&faulty)))
+        .unwrap();
+    let harness = Fixture::on(faulty, "probes", registry, openai(&Script::new(&[])));
+    let session = harness.start(&[]);
+    session.submit("1").unwrap();
+    settle(&session);
+    let log = log_of(&session);
+    session.halt();
+    assert_eq!(sides(&log).len(), 1);
+    assert!(log.iter().any(|e| matches!(
+        e.body,
+        Body::ModelResult {
+            outcome: Outcome::Interrupted { .. },
+            ..
+        }
+    )));
+    assert!(!log.iter().any(|e| matches!(
+        e.body,
+        Body::ToolResult {
+            outcome: Outcome::Done { .. },
+            ..
+        }
+    )));
 }

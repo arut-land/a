@@ -13,11 +13,11 @@ use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
 /// The protocol this build speaks best.
-pub const PROTO: u32 = 4;
+pub const PROTO: u32 = 5;
 
 /// The oldest protocol this build still speaks: a peer whose range
 /// overlaps `PROTO_MIN..=PROTO` is served at the highest version both speak.
-pub const PROTO_MIN: u32 = 4;
+pub const PROTO_MIN: u32 = 5;
 
 const MAX_FRAME: u32 = 16 * 1024 * 1024;
 
@@ -236,9 +236,10 @@ kinds! {
             choice: ToolChoice = default,
             r#for: Option<CallId> = default,
             purpose: Option<String> = default,
+            request: Option<Json> = default,
         } = Durable;
         /// The reply; `Done` carries the whole `llm::Response`.
-        ModelResult "model_result" { call: CallId, outcome: Outcome } = Durable;
+        ModelResult "model_result" { call: CallId, outcome: Outcome, failure: Option<Json> = default } = Durable;
         /// The committed intent to run a tool. Its seq is the call's id and
         /// idempotency key; `id` is the model's own id for the call, under which
         /// its result goes back. `by` is who called it: the model, unless the
@@ -398,6 +399,7 @@ kinds! {
         /// The model call failed with `error` and is sent again, for the
         /// `attempt`th time, with the request as the extension left it.
         Retry "retry" { attempt: u16, error: String };
+        SideRetry "side_retry" { attempt: u16, failure: Json, after_ms: u64 };
     }
     else Err(serde_json::Error::custom("unknown decision"))
 }
@@ -1583,6 +1585,7 @@ mod tests {
             },
             Body::Take { input: seq(2) },
             Body::ModelCall {
+                request: None,
                 model: "m".into(),
                 attempt: 1,
                 choice: ToolChoice::None,
@@ -1760,6 +1763,7 @@ mod tests {
                 text: "p\n".into(),
             },
             Body::ModelResult {
+                failure: None,
                 call: CallId::new(2).unwrap(),
                 outcome: Outcome::Interrupted {
                     output: Some("so far".into()),

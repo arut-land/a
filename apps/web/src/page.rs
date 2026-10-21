@@ -377,6 +377,7 @@ mod tests {
         page.fold(&[entry(
             2,
             Body::ModelCall {
+                request: None,
                 model: "m".into(),
                 attempt: 0,
                 choice: protocol::ToolChoice::Auto,
@@ -415,6 +416,7 @@ mod tests {
         page.fold(&[entry(
             3,
             Body::ModelResult {
+                failure: None,
                 call: CallId::new(2).unwrap(),
                 outcome: Outcome::Done {
                     output: Json::encode(&serde_json::json!({ "text": "a <b> c d" })).unwrap(),
@@ -446,6 +448,7 @@ mod tests {
         page.fold(&[entry(
             2,
             Body::ModelCall {
+                request: None,
                 model: "m".into(),
                 attempt: 0,
                 choice: protocol::ToolChoice::Auto,
@@ -460,6 +463,7 @@ mod tests {
         page.fold(&[entry(
             3,
             Body::ModelResult {
+                failure: None,
                 call: CallId::new(2).unwrap(),
                 outcome: Outcome::Done {
                     output: Json::encode(&reply).unwrap(),

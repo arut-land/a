@@ -125,7 +125,7 @@ impl Fold {
                 self.intent(e);
                 None
             }
-            Body::ModelResult { call, outcome } => {
+            Body::ModelResult { call, outcome, .. } => {
                 let call = *call;
                 // A side request's reply is its extension's.
                 let open = self.ledger.call(call)?;
