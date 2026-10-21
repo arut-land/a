@@ -158,7 +158,11 @@ struct CommandLineSettings: View {
             }
         }
         .formStyle(.grouped)
-        .task { await model.refreshCli() }
+        .task(id: model.client?.build()) {
+            async let daemon: Void = model.refreshDaemon()
+            await model.refreshCli()
+            await daemon
+        }
     }
 }
 

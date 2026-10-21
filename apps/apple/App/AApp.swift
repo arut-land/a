@@ -46,6 +46,7 @@ final class AppModel {
     var cliDir = FileManager.default.homeDirectoryForCurrentUser.appending(path: ".local/bin")
     private(set) var cliStatus: CliStatus?
     private(set) var cliProblem: String?
+    private(set) var daemonPid: UInt32?
     /// A message for an alert, such as the outcome of installing the CLI.
     var notice: String?
 
@@ -56,6 +57,7 @@ final class AppModel {
                 let client = try await startClient(helper: helper)
                 self.client = client
                 list = SessionListStore(client: client)
+                await refreshDaemon()
             } catch {
                 problem = error.localizedDescription
             }
@@ -95,7 +97,10 @@ final class AppModel {
         }
     }
 
-    var daemonPid: UInt32? { client?.daemonPid() }
+    func refreshDaemon() async {
+        guard let client else { return }
+        daemonPid = await client.daemonPid()
+    }
 
     func refreshCli() async {
         guard let client else { return }

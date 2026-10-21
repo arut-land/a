@@ -34,6 +34,13 @@ async fn blocking<T: Send + 'static>(
     rt::unblock_with(&**runtime(), rt::BlockingClass::Network, 64 << 10, work).await
 }
 
+fn diagnosis(
+    rt: &dyn rt::Runtime,
+    home: Home,
+) -> impl std::future::Future<Output = client::Diagnosis> + Send + 'static {
+    rt::unblock(rt, move || client::diagnose(&home))
+}
+
 /// The environment a new session's commands run with: this process's, and
 /// over it what the user's login shell exports. An app opened from Finder
 /// or the Dock has launchd's environment, whose `PATH` lacks everything the
@@ -98,9 +105,9 @@ impl Client {
         self.home.daemon_log().display().to_string()
     }
 
-    /// The pid of the running daemon, if one is.
-    pub fn daemon_pid(&self) -> Option<u32> {
-        client::diagnose(&self.home).pid
+    /// Reads the daemon record and crash files off the caller's thread.
+    pub async fn daemon_pid(&self) -> Option<u32> {
+        diagnosis(&**runtime(), self.home.clone()).await.pid
     }
 
     /// `$A_HOME/config.toml`, where the settings are kept.
@@ -474,6 +481,39 @@ mod tests {
     use protocol::{Caps, ClientMsg, DaemonMsg, read_frame, write_frame};
 
     use super::*;
+
+    #[test]
+    fn diagnostic_reads_wait_for_storage_without_blocking_the_caller() {
+        use rt::Runtime as _;
+        use std::future::{Future, poll_fn};
+        use std::pin::pin;
+        use std::task::Poll;
+
+        let (_session, home, root, listener) = fixture();
+        let runtime = Threads::configured(rt::Config::for_cores(1));
+        let (entered, waiting) = mpsc::channel();
+        let (release, released) = mpsc::channel();
+        rt::block_on(runtime.spawn_blocking(
+            rt::BlockingClass::Storage,
+            0,
+            Box::new(move || {
+                entered.send(()).unwrap();
+                released.recv().unwrap();
+            }),
+        ))
+        .unwrap();
+        waiting.recv().unwrap();
+        let mut reading = pin!(diagnosis(&runtime, home.clone()));
+        rt::block_on(poll_fn(|cx| {
+            assert!(reading.as_mut().poll(cx).is_pending());
+            Poll::Ready(())
+        }));
+        release.send(()).unwrap();
+        assert!(rt::block_on(reading).pid.is_none());
+        drop(listener);
+        home.endpoint().remove();
+        std::fs::remove_dir_all(root).unwrap();
+    }
 
     fn fixture() -> (Session, Home, PathBuf, sys::Listener) {
         let root = std::env::temp_dir().join(format!("a-ffi-order-{}", SessionId::new()));
