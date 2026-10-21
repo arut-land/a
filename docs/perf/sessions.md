@@ -354,3 +354,8 @@ sequence keys for both sets. The net reduction is 32 KiB despite the added
 recovery and Lua inheritance logic. This is a shipped-binary comparison, not a
 claim that all 21.6 KiB attributed to the former spawn codecs disappeared.
 No dependencies were added.
+
+After merging `main`'s approval explanations and regenerating protocol 11's
+corpus and view vectors, the same size task measured 3559 KiB. The review
+baseline and final merged build therefore have equal total size; the isolated
+pre-merge reduction above is 32 KiB. The merged build remains below 4096 KiB.
