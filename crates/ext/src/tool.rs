@@ -256,7 +256,7 @@ impl Cx {
     }
 
     /// Transfers live ownership to the session, including cancellation and reaping.
-    pub fn own(&self, process: crate::OwnedProcess) {
+    pub fn own(&self, process: crate::ProcessLease) {
         self.host.own(process);
     }
 

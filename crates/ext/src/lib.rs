@@ -62,8 +62,8 @@ pub use point::{
 pub use schema::Schema;
 pub use service::{
     Background, Budget, CwdOf, InboxAccess, LaunchSpec, Layers, ModelRole, ModelRoles, ModelSpec,
-    Models, OwnedProcess, ProcessOutput, ProcessPipe, ProcessSignal, Processes, RunningProcess,
-    Sessions, Side, SideContext, SideProvider, SideRetry, SpawnError,
+    Models, OwnedProcess, ProcessLease, ProcessOutput, ProcessPipe, ProcessSignal, Processes,
+    RunningProcess, Sessions, Side, SideContext, SideProvider, SideRetry, SpawnError,
 };
 pub use settings::{Configured, Empty, Table};
 pub use shape::{Output, Partials, Streamed, stream};

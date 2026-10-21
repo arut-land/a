@@ -216,7 +216,7 @@ impl Host for CallPorts {
         });
     }
 
-    fn own(&self, process: ext::OwnedProcess) {
+    fn own(&self, process: ext::ProcessLease) {
         self.spawned(process.id(), true);
         self.origin
             .send(&self.session, ContextRequest::Own { process });

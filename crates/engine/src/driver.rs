@@ -438,7 +438,7 @@ enum ContextRequest {
         reply: oneshot::Sender<Opened>,
     },
     Own {
-        process: ext::OwnedProcess,
+        process: ext::ProcessLease,
     },
 }
 
@@ -1374,9 +1374,9 @@ impl Actor {
                 .await
                 .map(|event| (event, None)),
             ContextRequest::Own { process } => {
-                lock(&session.jobs).push(Arc::clone(&process.process));
+                lock(&session.jobs).push(Arc::clone(&process));
                 self.live.session.spawn_work(
-                    WorkId::Job(Arc::as_ptr(&process.process).cast::<()>() as usize),
+                    WorkId::Job(Arc::as_ptr(&process).cast::<()>() as usize),
                     origin.admission,
                     |cancel| {
                         Box::pin(async move {
@@ -1385,7 +1385,7 @@ impl Actor {
                                 let _ = process.signal(ext::ProcessSignal::Kill);
                                 ended.await;
                             }
-                            lock(&session.jobs).retain(|p| !Arc::ptr_eq(p, &process.process));
+                            lock(&session.jobs).retain(|p| !Arc::ptr_eq(p, &process));
                             session.changed.notify();
                             if let Some(daemon) = session.shared.daemon.upgrade() {
                                 daemon.jobs.notify();

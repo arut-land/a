@@ -70,7 +70,7 @@ impl Client {
             )
             .await
             .map_err(|e| Failure::Spawn(e.to_string()))?;
-        cx.own(OwnedProcess::new(Arc::clone(&child.process), None, None));
+        cx.own(Arc::clone(&child.process).into());
         Ok(Self {
             child,
             pending: Vec::new(),

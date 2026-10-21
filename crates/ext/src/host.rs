@@ -41,7 +41,7 @@ pub trait Host: Send + Sync {
     ) -> BoxFuture<'static, Called>;
     /// See [`Cx::spawned`].
     fn spawned(&self, pgid: u32, background: bool);
-    fn own(&self, process: crate::OwnedProcess);
+    fn own(&self, process: crate::ProcessLease);
     /// See [`Cx::progress`].
     fn progress(&self, text: &str);
     /// Commits `data` as a change to extension `ext`'s state `state`:

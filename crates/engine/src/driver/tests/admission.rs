@@ -597,7 +597,7 @@ fn stale_request<'a>(
             origin.send(
                 session,
                 ContextRequest::Own {
-                    process: ext::OwnedProcess::new(Arc::new(StaleProcess), None, None),
+                    process: (Arc::new(StaleProcess) as Arc<dyn ext::RunningProcess>).into(),
                 },
             );
         })

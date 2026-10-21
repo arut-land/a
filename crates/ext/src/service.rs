@@ -6,6 +6,7 @@
 //! [`Layers`], to every call.
 
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 use std::time::Duration;
 
 use crate::BoxFuture;
@@ -65,19 +66,19 @@ pub trait ProcessPipe: Send + Sync {
 }
 
 pub struct OwnedProcess {
-    pub process: std::sync::Arc<dyn RunningProcess>,
+    pub process: ProcessLease,
     pub input: Option<Box<dyn ProcessPipe>>,
     pub output: Option<Box<dyn ProcessPipe>>,
 }
 
 impl OwnedProcess {
     pub fn new(
-        process: std::sync::Arc<dyn RunningProcess>,
+        process: Arc<dyn RunningProcess>,
         input: Option<Box<dyn ProcessPipe>>,
         output: Option<Box<dyn ProcessPipe>>,
     ) -> Self {
         Self {
-            process,
+            process: process.into(),
             input,
             output,
         }
@@ -85,18 +86,34 @@ impl OwnedProcess {
 
     /// Transfer cancellation to the session while retaining native ownership.
     pub fn detach(self, cx: &Cx) {
-        cx.own(self);
+        cx.own(self.process);
     }
 }
 
 impl std::ops::Deref for OwnedProcess {
     type Target = dyn RunningProcess;
     fn deref(&self) -> &Self::Target {
-        &*self.process
+        &**self.process
     }
 }
 
-impl Drop for OwnedProcess {
+/// Session cancellation owns a control lease independently of pipe ownership.
+pub struct ProcessLease(Arc<dyn RunningProcess>);
+
+impl From<Arc<dyn RunningProcess>> for ProcessLease {
+    fn from(process: Arc<dyn RunningProcess>) -> Self {
+        Self(process)
+    }
+}
+
+impl std::ops::Deref for ProcessLease {
+    type Target = Arc<dyn RunningProcess>;
+    fn deref(&self) -> &Self::Target {
+        &self.0
+    }
+}
+
+impl Drop for ProcessLease {
     fn drop(&mut self) {
         let _ = self.signal(ProcessSignal::Kill);
     }
