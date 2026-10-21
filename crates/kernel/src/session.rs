@@ -15,9 +15,9 @@ use protocol::Card;
 
 use crate::fold::{Fold, Next};
 use crate::{
-    Action, Admission, Answer, Barriers, Binding, Chained, Concurrency, Durability, Effect,
-    Effects, Event, Gate, Gated, Load, ModelPhase, Name, Note, Owner, Recover, Replay, Replied,
-    Requirement, Step, Ticket, Turn,
+    Action, Admission, Answer, Barriers, Binding, Chained, Concurrency, Durability, Event, Gate,
+    Gated, Load, ModelPhase, Name, Note, Owner, Recover, Replay, Replied, Requirement, Step,
+    StepPlan, Ticket, Turn, Work,
 };
 
 /// Who refused a call the agent would not run.
@@ -67,7 +67,7 @@ impl Core {
         registry: Arc<dyn Binding>,
         log: impl IntoIterator<Item = &'e Entry>,
         load: &Load<'_>,
-    ) -> (Self, Effects) {
+    ) -> (Self, StepPlan) {
         let mut core = Self::new(registry);
         for e in log {
             core.load(e);
@@ -117,13 +117,13 @@ impl Core {
     }
 
     /// Picks the loaded log up where it leaves off: see [`Core::resume`].
-    pub fn resumed(&mut self, load: &Load<'_>) -> Effects {
+    pub fn resumed(&mut self, load: &Load<'_>) -> StepPlan {
         // What the log shows the agent stepped through is done.
         self.fold.stepped = false;
         self.child = matches!(load.owner, Owner::Present | Owner::Cancelled);
         self.owned_cancelled = matches!(load.owner, Owner::Gone | Owner::Cancelled);
         self.busy = load.busy;
-        let mut fx = Effects::new();
+        let mut fx = StepPlan::default();
         let installed = self.registry.installed();
         let logged = self.fold.ledger.extensions();
         if load.created || logged.is_some_and(|logged| logged != installed) {
@@ -135,8 +135,8 @@ impl Core {
     }
 
     /// What follows `event`.
-    pub fn step(&mut self, event: Event) -> Effects {
-        let mut fx = Effects::new();
+    pub fn step(&mut self, event: Event) -> StepPlan {
+        let mut fx = StepPlan::default();
         match event {
             Event::Input {
                 text,
@@ -248,68 +248,56 @@ impl Core {
         &self.fold.ledger
     }
 
-    fn finish(&mut self, fx: &mut Effects) {
+    fn finish(&mut self, fx: &mut StepPlan) {
         self.advance(fx);
         self.marks(fx);
-        self.commits(fx);
         let through = self.fold.ledger.seq();
-        for index in (0..fx.len()).rev() {
-            let requirement = match &fx[index] {
-                Effect::RunTool { call, .. } | Effect::Resume { call, .. } => {
+        if !fx.appends.is_empty() {
+            let fact = fx
+                .appends
+                .iter()
+                .any(|entry| !matches!(entry.body, Body::Progress { .. } | Body::Ext { .. }));
+            fx.commit = Some(crate::Commit {
+                through,
+                durability: self.commit(fact, fx.immediate.iter().any(Work::external)),
+                publish: fact && self.turn == Turn::Idle,
+            });
+        }
+        for work in mem::take(&mut fx.immediate) {
+            let requirement = match &work {
+                Work::RunTool { call, .. } | Work::Resume { call, .. } => {
                     Some(if self.safe(*call) {
                         Requirement::Ordered
                     } else {
                         Requirement::Durable
                     })
                 }
-                Effect::Prepare { .. }
-                | Effect::Send { .. }
-                | Effect::Sleep { .. }
-                | Effect::Await { .. }
-                | Effect::Recover { .. }
-                | Effect::Kill { .. } => Some(Requirement::Ordered),
-                Effect::Reply { .. }
-                | Effect::Deliver { .. }
-                | Effect::Delivery { .. }
-                | Effect::Side { .. }
-                | Effect::StartChild { .. }
-                | Effect::Interrupt { .. }
-                | Effect::Report { .. } => Some(Requirement::Durable),
-                _ => None,
+                Work::Prepare { .. }
+                | Work::Send { .. }
+                | Work::Sleep { .. }
+                | Work::Await { .. }
+                | Work::Recover { .. }
+                | Work::Kill { .. } => Some(Requirement::Ordered),
+                Work::Reply { .. }
+                | Work::Deliver { .. }
+                | Work::Delivery { .. }
+                | Work::Side { .. }
+                | Work::StartChild { .. }
+                | Work::Interrupt { .. }
+                | Work::Report { .. } => Some(Requirement::Durable),
+                Work::Cancel { .. } | Work::MarkBusy(_) => None,
             };
-            if let Some(requirement) = requirement {
-                fx.insert(
-                    index,
-                    Effect::Require(Admission {
+            match requirement {
+                Some(requirement) => fx.admitted.push(crate::Guarded {
+                    admission: Admission {
                         through,
                         requirement,
-                    }),
-                );
+                    },
+                    work,
+                }),
+                None => fx.immediate.push(work),
             }
         }
-    }
-
-    /// Ends the entries `fx` appends with their commit, after the last of
-    /// them: a barrier if anything in `fx` is external, whatever the
-    /// barriers setting; otherwise as it says. The driver commits them
-    /// together, before any effect among them but a cancel, a busy mark
-    /// set or a kill runs.
-    fn commits(&self, fx: &mut Effects) {
-        let Some(last) = fx.iter().rposition(|e| matches!(e, Effect::Append(_))) else {
-            return;
-        };
-        let fact = fx.iter().any(|e| {
-            matches!(e, Effect::Append(e) if !matches!(e.body, Body::Progress { .. } | Body::Ext { .. }))
-        });
-        let before = fx.iter().any(Effect::external);
-        fx.insert(
-            last + 1,
-            Effect::Commit {
-                through: self.fold.ledger.seq(),
-                durability: self.commit(fact, before),
-                publish: fact && self.turn == Turn::Idle,
-            },
-        );
     }
 
     /// How durable a step's entries are to be: holding `fact`s beyond
@@ -328,10 +316,10 @@ impl Core {
         }
     }
 
-    fn send_envelope(&mut self, envelope: protocol::Envelope, ticket: Ticket, fx: &mut Effects) {
+    fn send_envelope(&mut self, envelope: protocol::Envelope, ticket: Ticket, fx: &mut StepPlan) {
         let id = &envelope.id;
         if let Some(refusal) = self.fold.ledger.acknowledged(id) {
-            fx.push(Effect::Delivery {
+            fx.immediate.push(Work::Delivery {
                 ticket,
                 result: refusal.clone().map_or(Ok(()), Err),
             });
@@ -358,14 +346,14 @@ impl Core {
                     },
                 );
             }
-            fx.push(Effect::Deliver {
+            fx.immediate.push(Work::Deliver {
                 envelope,
                 ticket: Some(ticket),
             });
         }
     }
 
-    fn enqueue(&mut self, envelope: protocol::Envelope, ticket: Ticket, fx: &mut Effects) {
+    fn enqueue(&mut self, envelope: protocol::Envelope, ticket: Ticket, fx: &mut StepPlan) {
         let result = if self.owned_cancelled {
             Err(protocol::InboxRefusal::Unavailable)
         } else if self.fold.ledger.received(&envelope.id) {
@@ -376,7 +364,7 @@ impl Core {
             self.append(fx, Body::Enqueue { envelope });
             Ok(())
         };
-        fx.push(Effect::Delivery { ticket, result });
+        fx.immediate.push(Work::Delivery { ticket, result });
     }
 
     fn delivered(
@@ -384,7 +372,7 @@ impl Core {
         id: protocol::EnvelopeId,
         result: Result<(), protocol::InboxRefusal>,
         ticket: Option<Ticket>,
-        fx: &mut Effects,
+        fx: &mut StepPlan,
     ) {
         let result = self
             .fold
@@ -401,7 +389,7 @@ impl Core {
             );
         }
         if let Some(ticket) = ticket {
-            fx.push(Effect::Delivery { ticket, result });
+            fx.immediate.push(Work::Delivery { ticket, result });
         }
     }
 
@@ -413,7 +401,7 @@ impl Core {
         mode: Mode,
         origin: Option<Author>,
         ticket: Option<Ticket>,
-        fx: &mut Effects,
+        fx: &mut StepPlan,
     ) {
         if self.owned_cancelled {
             return reply(
@@ -456,7 +444,7 @@ impl Core {
     /// An interrupt with no turn running stops nothing, and starts nothing
     /// in any state: what waits settles at once, what runs is cancelled and
     /// settles as it reports.
-    fn interrupt(&mut self, origin: Option<Author>, fx: &mut Effects) {
+    fn interrupt(&mut self, origin: Option<Author>, fx: &mut StepPlan) {
         let detached: Vec<_> = self
             .fold
             .ledger
@@ -464,7 +452,7 @@ impl Core {
             .filter_map(|(_, child)| self.fold.owner(child).is_none().then_some(child))
             .collect();
         for child in detached {
-            fx.push(Effect::Interrupt { child });
+            fx.immediate.push(Work::Interrupt { child });
             self.fire(child, &Outcome::Interrupted { output: None }, fx);
         }
         let sides: Vec<_> = self
@@ -474,7 +462,7 @@ impl Core {
             .filter_map(|(call, open)| matches!(open.call, Call::Side { .. }).then_some(call))
             .collect();
         for side in sides {
-            fx.push(Effect::Cancel { call: side });
+            fx.immediate.push(Work::Cancel { call: side });
             self.settle(side, Outcome::Interrupted { output: None }, fx);
         }
         let open = match mem::take(&mut self.turn) {
@@ -484,7 +472,7 @@ impl Core {
                 return;
             }
             Turn::Model { call, phase, .. } => {
-                fx.push(Effect::Cancel { call });
+                fx.immediate.push(Work::Cancel { call });
                 match phase {
                     ModelPhase::Streaming => SmallVec::from_elem(call, 1),
                     // Nothing is out to report.
@@ -500,16 +488,16 @@ impl Core {
                 for (call, step) in open {
                     match (step, self.child_of(call)) {
                         (Step::Running, _) => {
-                            fx.push(Effect::Cancel { call });
+                            fx.immediate.push(Work::Cancel { call });
                             left.push(call);
                         }
                         (Step::Awaiting { .. }, _) => {
-                            fx.push(Effect::Cancel { call });
+                            fx.immediate.push(Work::Cancel { call });
                             self.settle(call, self.interrupted(call), fx);
                         }
                         // Its child stops first, and reports.
                         (Step::Waiting, Some(child)) => {
-                            fx.push(Effect::Interrupt { child });
+                            fx.immediate.push(Work::Interrupt { child });
                             left.push(call);
                         }
                         (Step::Waiting, None) => self.settle(call, self.interrupted(call), fx),
@@ -527,7 +515,7 @@ impl Core {
         call: CallId,
         value: Json,
         origin: Option<Author>,
-        fx: &mut Effects,
+        fx: &mut StepPlan,
     ) -> Result<(), String> {
         let on = match self.fold.ledger.call(call).map(|open| &open.phase) {
             Some(Phase::Waiting(on)) if !matches!(on, WaitOn::Child { .. }) => on.clone(),
@@ -553,7 +541,7 @@ impl Core {
         Ok(())
     }
 
-    fn model_done(&mut self, call: CallId, replied: Replied, fx: &mut Effects) {
+    fn model_done(&mut self, call: CallId, replied: Replied, fx: &mut StepPlan) {
         match &self.turn {
             &Turn::Model {
                 call: sent,
@@ -588,7 +576,7 @@ impl Core {
     /// the failure of attempt `attempt`, now or once a handler answers
     /// later: if so, the next attempt is logged, and sent at once or once
     /// the backoff the point asks for is over.
-    fn retry(&mut self, call: CallId, attempt: u16, error: &llm::Error, fx: &mut Effects) -> bool {
+    fn retry(&mut self, call: CallId, attempt: u16, error: &llm::Error, fx: &mut StepPlan) -> bool {
         match self.registry.request_error(call, attempt, error) {
             Answer::Now(None) => false,
             Answer::Now(Some((by, recover))) => {
@@ -597,7 +585,7 @@ impl Core {
             }
             Answer::Later(answer) => {
                 self.failed = Some(error.to_string());
-                fx.push(Effect::Recover { call, answer });
+                fx.immediate.push(Work::Recover { call, answer });
                 self.turn = Turn::Model {
                     call,
                     attempt,
@@ -617,7 +605,7 @@ impl Core {
         by: &str,
         recover: Recover,
         error: String,
-        fx: &mut Effects,
+        fx: &mut StepPlan,
     ) {
         let next = attempt.saturating_add(1);
         let d = Verdict::Retry {
@@ -627,7 +615,7 @@ impl Core {
         self.decide(Some(call), by, d, fx);
         match recover {
             Recover::Retry { after } => {
-                fx.push(Effect::Sleep { call, after });
+                fx.immediate.push(Work::Sleep { call, after });
                 self.turn = Turn::Model {
                     call,
                     attempt: next,
@@ -644,7 +632,7 @@ impl Core {
         &mut self,
         call: CallId,
         recovered: Option<(Name, Recover)>,
-        fx: &mut Effects,
+        fx: &mut StepPlan,
     ) {
         let Turn::Model {
             call: failed,
@@ -668,7 +656,7 @@ impl Core {
         }
     }
 
-    fn side_event(&mut self, event: crate::SideEvent, fx: &mut Effects) {
+    fn side_event(&mut self, event: crate::SideEvent, fx: &mut StepPlan) {
         match event {
             crate::SideEvent::Open {
                 of,
@@ -679,7 +667,7 @@ impl Core {
                 ticket,
             } => {
                 let side = self.side(of, purpose, model, request, background, fx);
-                fx.push(Effect::Side { ticket, side });
+                fx.immediate.push(Work::Side { ticket, side });
             }
             crate::SideEvent::Retry {
                 side,
@@ -714,7 +702,7 @@ impl Core {
         by: &str,
         decision: Verdict,
         ticket: Ticket,
-        fx: &mut Effects,
+        fx: &mut StepPlan,
     ) {
         let open = self
             .fold
@@ -724,7 +712,7 @@ impl Core {
         if open {
             self.decide(Some(side), by, decision, fx);
         }
-        fx.push(Effect::Reply {
+        fx.immediate.push(Work::Reply {
             ticket,
             result: if open {
                 Ok(())
@@ -741,7 +729,7 @@ impl Core {
         outcome: Outcome,
         failure: Option<Json>,
         ticket: Ticket,
-        fx: &mut Effects,
+        fx: &mut StepPlan,
     ) {
         let owner = self
             .fold
@@ -762,7 +750,7 @@ impl Core {
                 },
             );
         }
-        fx.push(Effect::Reply {
+        fx.immediate.push(Work::Reply {
             ticket,
             result: if owner.is_some() {
                 Ok(())
@@ -781,7 +769,7 @@ impl Core {
         model: String,
         request: Json,
         background: bool,
-        fx: &mut Effects,
+        fx: &mut StepPlan,
     ) -> Option<CallId> {
         let owner = self.fold.ledger.call(of);
         if owner.is_none() && !background
@@ -800,7 +788,7 @@ impl Core {
         Some(self.append(fx, body))
     }
 
-    fn publish_generation(&mut self, fx: &mut Effects) {
+    fn publish_generation(&mut self, fx: &mut StepPlan) {
         let Some(text) = self.generation_context.as_ref() else {
             return;
         };
@@ -821,13 +809,13 @@ impl Core {
     }
 
     /// Has model call `call` prepared again, as attempt `attempt`.
-    fn again(&mut self, call: CallId, attempt: u16, fx: &mut Effects) {
+    fn again(&mut self, call: CallId, attempt: u16, fx: &mut StepPlan) {
         self.publish_generation(fx);
         let choice = match self.fold.ledger.call(call).map(|open| &open.call) {
             Some(&Call::Model { choice, .. }) => choice,
             _ => ToolChoice::Auto,
         };
-        fx.push(Effect::Prepare {
+        fx.immediate.push(Work::Prepare {
             call,
             attempt,
             choice,
@@ -848,7 +836,7 @@ impl Core {
         call: CallId,
         decisions: ext::host::Decided,
         answered: Option<(Name, Replied)>,
-        fx: &mut Effects,
+        fx: &mut StepPlan,
     ) {
         match &self.turn {
             Turn::Model {
@@ -869,13 +857,13 @@ impl Core {
                 self.decide(Some(call), &by, Verdict::Answered, fx);
                 self.model_done(call, replied, fx);
             }
-            None => fx.push(Effect::Send { call }),
+            None => fx.immediate.push(Work::Send { call }),
         }
     }
 
     /// Logs a call's outcome as the `post_tool` chain leaves it, with the
     /// card its tool showed it with, unless a handler replaced it.
-    fn tool_done(&mut self, call: CallId, outcome: Outcome, card: Option<Card>, fx: &mut Effects) {
+    fn tool_done(&mut self, call: CallId, outcome: Outcome, card: Option<Card>, fx: &mut StepPlan) {
         if self.step_of(call) != Some(Step::Running) {
             return;
         }
@@ -905,7 +893,7 @@ impl Core {
     /// whose handler answers later (a model call recovering, a gate
     /// asking) its extension's state and edits. A call not open reports
     /// nothing more.
-    fn note(&mut self, call: CallId, note: Note, fx: &mut Effects) {
+    fn note(&mut self, call: CallId, note: Note, fx: &mut StepPlan) {
         let deciding = match &self.turn {
             Turn::Model { call: c, .. } => *c == call,
             _ => matches!(self.step_of(call), Some(Step::Awaiting { .. })),
@@ -965,7 +953,7 @@ impl Core {
         self.append(fx, body);
     }
 
-    fn waits(&mut self, call: CallId, on: WaitOn, fx: &mut Effects) {
+    fn waits(&mut self, call: CallId, on: WaitOn, fx: &mut StepPlan) {
         let acting = matches!(self.turn, Turn::Acting { .. });
         if !acting
             || self.step_of(call) != Some(Step::Running)
@@ -987,7 +975,7 @@ impl Core {
         input: String,
         intent: Json,
         wait: bool,
-        fx: &mut Effects,
+        fx: &mut StepPlan,
     ) {
         let acting = matches!(self.turn, Turn::Acting { .. });
         if !acting || self.step_of(call) != Some(Step::Running) {
@@ -1007,7 +995,7 @@ impl Core {
             self.set_step(call, Step::Waiting);
         }
         self.append(fx, Body::Watch { child });
-        fx.push(Effect::StartChild {
+        fx.immediate.push(Work::StartChild {
             link: link.0,
             child,
             input,
@@ -1016,7 +1004,7 @@ impl Core {
 
     /// Fires the watches on `child`. A call waiting on it goes on with its
     /// result; otherwise the result is the agent's, between turns.
-    fn child_settled(&mut self, child: SessionId, outcome: Outcome, fx: &mut Effects) {
+    fn child_settled(&mut self, child: SessionId, outcome: Outcome, fx: &mut StepPlan) {
         let Some(call) = self.fold.owner(child) else {
             if self.turn == Turn::Idle {
                 self.fire(child, &outcome, fx);
@@ -1039,7 +1027,7 @@ impl Core {
     }
 
     /// Logs each armed watch on `child` fired; whether any was.
-    fn fire(&mut self, child: SessionId, outcome: &Outcome, fx: &mut Effects) -> bool {
+    fn fire(&mut self, child: SessionId, outcome: &Outcome, fx: &mut StepPlan) -> bool {
         let watches: SmallVec<[Seq; 1]> = (self.fold.ledger.armed())
             .filter_map(|(watch, watched)| (watched == child).then_some(watch))
             .collect();
@@ -1056,7 +1044,7 @@ impl Core {
     /// next action, or a shared call alongside the shared calls open;
     /// once it stopped, what the `on_stop` point gives it; then queued
     /// input, and children's results.
-    fn advance(&mut self, fx: &mut Effects) {
+    fn advance(&mut self, fx: &mut StepPlan) {
         loop {
             match &self.turn {
                 Turn::Model { .. } => return,
@@ -1172,7 +1160,7 @@ impl Core {
     }
 
     /// Carries out `next`: its entry takes it off what is asked for.
-    fn act(&mut self, next: Next, fx: &mut Effects) {
+    fn act(&mut self, next: Next, fx: &mut StepPlan) {
         match next {
             Next::Agent(Action::Say(text)) => {
                 self.append(fx, Body::Assistant { text });
@@ -1242,7 +1230,7 @@ impl Core {
         input: &Json,
         id: Option<String>,
         by: Audience,
-        fx: &mut Effects,
+        fx: &mut StepPlan,
     ) -> CallId {
         let next = self.next_seq();
         let card = self.registry.read(next, tool, input);
@@ -1256,12 +1244,12 @@ impl Core {
         self.append(fx, body)
     }
 
-    fn run_tool(&mut self, call: CallId, tool: String, input: Json, fx: &mut Effects) {
+    fn run_tool(&mut self, call: CallId, tool: String, input: Json, fx: &mut StepPlan) {
         self.set_step(call, Step::Running);
-        fx.push(Effect::RunTool { call, tool, input });
+        fx.immediate.push(Work::RunTool { call, tool, input });
     }
 
-    fn gate(&mut self, call: CallId, tool: &str, input: &Json, fx: &mut Effects) {
+    fn gate(&mut self, call: CallId, tool: &str, input: &Json, fx: &mut StepPlan) {
         match self.registry.gate(call, tool, input) {
             Answer::Now(gated) => self.gated(call, gated, 0, false, fx),
             Answer::Later(answer) => {
@@ -1272,7 +1260,7 @@ impl Core {
                         resumed: false,
                     },
                 );
-                fx.push(Effect::Await { call, answer });
+                fx.immediate.push(Work::Await { call, answer });
             }
         }
     }
@@ -1281,7 +1269,7 @@ impl Core {
     /// already), then runs it, has it wait for an approval or answers it
     /// with why not. One gated before a restart may have run: an unsafe
     /// one is interrupted rather than run twice.
-    fn gated(&mut self, call: CallId, gated: Gated, skip: u16, resumed: bool, fx: &mut Effects) {
+    fn gated(&mut self, call: CallId, gated: Gated, skip: u16, resumed: bool, fx: &mut StepPlan) {
         let Gated {
             input,
             decisions,
@@ -1320,7 +1308,7 @@ impl Core {
     }
 
     /// Runs call `call`, approved.
-    fn run(&mut self, call: CallId, fx: &mut Effects) {
+    fn run(&mut self, call: CallId, fx: &mut StepPlan) {
         let Some((tool, input)) = self.tool_of(call) else {
             return;
         };
@@ -1328,12 +1316,12 @@ impl Core {
     }
 
     /// Hands call `call` what it waited on.
-    fn resume_call(&mut self, call: CallId, value: Json, fx: &mut Effects) {
+    fn resume_call(&mut self, call: CallId, value: Json, fx: &mut StepPlan) {
         let Some((tool, input)) = self.tool_of(call) else {
             return;
         };
         self.set_step(call, Step::Running);
-        fx.push(Effect::Resume {
+        fx.immediate.push(Work::Resume {
             call,
             tool,
             input,
@@ -1344,7 +1332,7 @@ impl Core {
     /// Ends an interrupted turn whose calls have settled. Every tool call
     /// the agent asked for is answered, interrupted, so that each call a
     /// model made has its answer; nothing else it asked for is done.
-    fn stopped(&mut self, fx: &mut Effects) {
+    fn stopped(&mut self, fx: &mut StepPlan) {
         let Turn::Stopping { origin, .. } = mem::take(&mut self.turn) else {
             return;
         };
@@ -1376,7 +1364,7 @@ impl Core {
 
     /// Takes up a registry generation at rest,
     /// logging the extensions it runs when they changed.
-    fn resolve(&mut self, next: Arc<dyn Binding>, fx: &mut Effects) {
+    fn resolve(&mut self, next: Arc<dyn Binding>, fx: &mut StepPlan) {
         let installed = next.installed();
         let changed = installed != self.registry.installed();
         self.generation_context = next.generation_context();
@@ -1388,7 +1376,7 @@ impl Core {
 
     /// Marks the session busy while it has work in flight (waiting is not
     /// work), and has a child report each time it settles.
-    fn marks(&mut self, fx: &mut Effects) {
+    fn marks(&mut self, fx: &mut StepPlan) {
         let ledger = &self.fold.ledger;
         let armed = ledger.armed().next().is_some();
         let queued = !ledger.untaken().is_empty();
@@ -1405,9 +1393,9 @@ impl Core {
             self.busy = busy;
             // Marked before the work starts, cleared after it ends.
             if busy {
-                fx.insert(0, Effect::MarkBusy(true));
+                fx.immediate.insert(0, Work::MarkBusy(true));
             } else {
-                fx.push(Effect::MarkBusy(false));
+                fx.immediate.push(Work::MarkBusy(false));
             }
         }
         // Settled with something new since it last reported (one given no
@@ -1419,13 +1407,13 @@ impl Core {
             let outcome = ledger.result().cloned().unwrap_or_else(|| Outcome::Failed {
                 error: "the child settled without a result".to_owned(),
             });
-            fx.push(Effect::Report { outcome });
+            fx.immediate.push(Work::Report { outcome });
         }
     }
 
     // ── recovery ──────────────────────────────────────────────────────
 
-    fn recover(&mut self, load: &Load<'_>, fx: &mut Effects) {
+    fn recover(&mut self, load: &Load<'_>, fx: &mut StepPlan) {
         let ledger = &self.fold.ledger;
         let here = |boot: &str| load.boot == Some(boot);
         let open = ledger.open_calls().map(|(_, open)| open);
@@ -1444,7 +1432,8 @@ impl Core {
                 }
             }
         }
-        fx.extend(kills.into_iter().map(|pgid| Effect::Kill { pgid }));
+        fx.immediate
+            .extend(kills.into_iter().map(|pgid| Work::Kill { pgid }));
         if self.owned_cancelled {
             self.cancel_recovered(fx);
             return;
@@ -1473,10 +1462,10 @@ impl Core {
         }
     }
 
-    fn cancel_recovered(&mut self, fx: &mut Effects) {
+    fn cancel_recovered(&mut self, fx: &mut StepPlan) {
         let children: Vec<_> = self.fold.ledger.armed().map(|(_, child)| child).collect();
         for child in children {
-            fx.push(Effect::Interrupt { child });
+            fx.immediate.push(Work::Interrupt { child });
             self.fire(child, &Outcome::Interrupted { output: None }, fx);
         }
         let calls: Vec<_> = self
@@ -1498,7 +1487,7 @@ impl Core {
 
     /// Re-arms links: a link not yet watched is watched, and every child
     /// still watched is started, so it runs to its end and reports back.
-    fn relink(&mut self, fx: &mut Effects) {
+    fn relink(&mut self, fx: &mut StepPlan) {
         for envelope in self
             .fold
             .ledger
@@ -1506,7 +1495,7 @@ impl Core {
             .iter()
             .filter(|e| self.fold.ledger.acknowledged(&e.id).is_none())
         {
-            fx.push(Effect::Deliver {
+            fx.immediate.push(Work::Deliver {
                 envelope: envelope.clone(),
                 ticket: None,
             });
@@ -1523,14 +1512,14 @@ impl Core {
             if !watched {
                 self.append(fx, Body::Watch { child });
             }
-            fx.push(Effect::StartChild { link, child, input });
+            fx.immediate.push(Work::StartChild { link, child, input });
         }
     }
 
     /// A model call a restart cut off: the attempt it was on failed, and the
     /// `request_error` point says whether there is another, so restarts
     /// count as attempts and a crash loop cannot retry forever.
-    fn restart(&mut self, call: CallId, attempt: u16, fx: &mut Effects) {
+    fn restart(&mut self, call: CallId, attempt: u16, fx: &mut StepPlan) {
         let error = llm::Error::new(llm::Kind::Incomplete, "the daemon stopped during the call");
         if attempt >= RESTART_CAP {
             let error = format!("{error}; gave up after {attempt} attempts");
@@ -1544,7 +1533,7 @@ impl Core {
 
     /// Picks tool call `call` up as its phase says: one the agent refused
     /// is answered so, whatever of it committed.
-    fn reopen(&mut self, call: CallId, tool: &str, input: &Json, phase: &Phase, fx: &mut Effects) {
+    fn reopen(&mut self, call: CallId, tool: &str, input: &Json, phase: &Phase, fx: &mut StepPlan) {
         if let Some(why) = self.fold.refused(call).map(str::to_owned) {
             if *phase == (Phase::Gating { at: 0 }) {
                 let reason = why.clone();
@@ -1564,7 +1553,7 @@ impl Core {
                             resumed: true,
                         },
                     );
-                    fx.push(Effect::Await { call, answer });
+                    fx.immediate.push(Work::Await { call, answer });
                 }
             },
             Phase::Waiting(WaitOn::Child { .. }) => match self.fold.fired(call).cloned() {
@@ -1592,11 +1581,11 @@ impl Core {
     // ── helpers ───────────────────────────────────────────────────────
 
     /// Numbers `body` next, folds it and has it appended; its seq.
-    fn append(&mut self, fx: &mut Effects, body: Body) -> CallId {
+    fn append(&mut self, fx: &mut StepPlan, body: Body) -> CallId {
         let next = self.next_seq();
         let entry = Entry::new(next.0, protocol::Epoch::default(), body);
         self.fold.apply(&entry, &*self.registry);
-        fx.push(Effect::Append(entry));
+        fx.appends.push(entry);
         next
     }
 
@@ -1605,7 +1594,7 @@ impl Core {
         CallId::new(self.fold.ledger.seq() + 1).expect("an entry after the last has a seq")
     }
 
-    fn decide(&mut self, call: Option<CallId>, by: &str, d: Verdict, fx: &mut Effects) {
+    fn decide(&mut self, call: Option<CallId>, by: &str, d: Verdict, fx: &mut StepPlan) {
         let by = by.to_owned();
         self.append(fx, Body::Decision { by, call, d });
     }
@@ -1614,7 +1603,7 @@ impl Core {
     /// was interrupted) takes the side requests made on its behalf that are
     /// still out with it, their ends logged first; one done leaves them to
     /// end as they do.
-    fn settle(&mut self, call: CallId, outcome: Outcome, fx: &mut Effects) {
+    fn settle(&mut self, call: CallId, outcome: Outcome, fx: &mut StepPlan) {
         let done = matches!(outcome, Outcome::Done { .. });
         let sides: SmallVec<[CallId; 1]> = (self.fold.ledger.open_calls())
             .filter(|(_, open)| !done && open.call == Call::Side { of: call })
@@ -1725,9 +1714,9 @@ impl Core {
     }
 }
 
-fn reply(fx: &mut Effects, ticket: Option<Ticket>, result: Result<(), String>) {
+fn reply(fx: &mut StepPlan, ticket: Option<Ticket>, result: Result<(), String>) {
     if let Some(ticket) = ticket {
-        fx.push(Effect::Reply { ticket, result });
+        fx.immediate.push(Work::Reply { ticket, result });
     }
 }
 

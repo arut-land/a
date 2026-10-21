@@ -6,7 +6,7 @@ mod common;
 use std::time::Duration;
 
 use common::*;
-use kernel::{Effect, Event, Gated, Later, Load, Note, Owner, Recover, Replied, Ticket};
+use kernel::{Event, Gated, Later, Load, Note, Owner, Recover, Replied, Ticket};
 use protocol::{Audience, Body, CallId, Installed, Json, Mode, Outcome, Permission, Seq, Verdict};
 use serde_json::json;
 
@@ -1480,4 +1480,59 @@ fn an_unacknowledged_outbox_keeps_its_owner_recoverable() {
     });
     assert_eq!(restored.core.ledger().activity(), protocol::Activity::Idle);
     assert!(restored.core.at_rest());
+}
+
+#[test]
+fn child_and_inbox_recovery_keep_their_original_identity() {
+    let mut session = echo();
+    session.step(user("task go"));
+    let child = child();
+    session.step(Event::Spawn {
+        call: id(2),
+        child,
+        input: "original child input".into(),
+        intent: Json::null(),
+        wait: true,
+    });
+    let message = envelope("identity");
+    session.step(Event::Enqueue {
+        envelope: message.clone(),
+        ticket: Ticket(1),
+    });
+    session.step(Event::SendEnvelope {
+        envelope: message.clone(),
+        ticket: Ticket(2),
+    });
+    let link = session
+        .core
+        .ledger()
+        .links()
+        .iter()
+        .find(|link| link.child == child)
+        .unwrap()
+        .seq;
+    let (mut recovered, effects) =
+        Session::resume(Reg::echo().arc(), session.log, &Load::default());
+    assert!(effects.iter().any(|effect| matches!(effect, Effect::StartChild { link: recovered, child: id, input } if *recovered == link && *id == child && input == "original child input")));
+    assert!(
+        effects.iter().any(
+            |effect| matches!(effect, Effect::Deliver { envelope, .. } if envelope == &message)
+        )
+    );
+    recovered.step(Event::Enqueue {
+        envelope: message.clone(),
+        ticket: Ticket(3),
+    });
+    assert_eq!(
+        recovered
+            .log
+            .iter()
+            .filter(
+                |entry| matches!(&entry.body, Body::Enqueue { envelope } if envelope == &message)
+            )
+            .count(),
+        1
+    );
+    assert_eq!(recovered.core.ledger().links().len(), 1);
+    assert_eq!(recovered.core.ledger().links()[0].seq, link);
 }

@@ -27,20 +27,30 @@ impl Actor {
         let session = Arc::clone(&self.live.session);
         let daemon = session.shared.daemon.upgrade();
         let fence = session.fence.load(super::Ordering::SeqCst);
-        let rt = Arc::clone(&session.shared.rt);
-        rt.spawn(Box::pin(async move {
-            let id = envelope.id.clone();
-            let result = match daemon {
-                Some(daemon) => daemon.deliver(envelope).await,
-                None => Err(InboxRefusal::Unavailable),
-            };
-            let message = if result == Err(InboxRefusal::Interrupted) {
-                Msg::DeliveryLost { ticket }
-            } else {
-                Msg::Delivered { id, result, ticket }
-            };
-            session.emit(fence, message);
-        }));
+        self.live.session.spawn_work(
+            super::WorkId::Delivery,
+            super::Admission {
+                through: self.journal.durable_seq,
+                requirement: super::Requirement::Durable,
+            },
+            |cancel| {
+                Box::pin(async move {
+                    let id = envelope.id.clone();
+                    let result = match daemon {
+                        Some(daemon) => super::unless(&cancel, daemon.deliver(envelope))
+                            .await
+                            .unwrap_or(Err(InboxRefusal::Interrupted)),
+                        None => Err(InboxRefusal::Unavailable),
+                    };
+                    let message = if result == Err(InboxRefusal::Interrupted) {
+                        super::Completion::DeliveryLost { ticket }
+                    } else {
+                        super::Completion::Delivered { id, result, ticket }
+                    };
+                    session.emit(fence, message);
+                })
+            },
+        );
     }
 }
 

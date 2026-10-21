@@ -119,7 +119,7 @@ fn enqueue(session: &Live, text: &str) -> oneshot::Receiver<Result<(), String>> 
 }
 
 #[test]
-fn safe_work_uses_ordered_transcripts_without_publishing_past_its_flush() {
+fn publication_never_crosses_the_durable_prefix() {
     let (fixture, faulty, script) = pipeline(Registry::default().with(&Harbor).unwrap());
     let session = fixture.create();
     settle(&session);
@@ -455,15 +455,15 @@ fn failed_epochs_fence_speculative_reports_before_sequences_are_reused() {
     let (current, release_current) = started_harbor(&starts);
     assert_eq!(current.call, old.call, "exercise the reused sequence");
     old.progress("stale progress");
-    session.send(Msg::Fenced {
+    session.send(Msg::Completed {
         fence: 0,
-        msg: Box::new(Msg::Step(Event::ToolDone {
+        completion: Completion::Event(Event::ToolDone {
             call: old.call,
             outcome: Outcome::Done {
                 output: Json::encode(&"stale result").unwrap(),
             },
             card: None,
-        })),
+        }),
     });
     let _ = positions(&session);
     assert_eq!(

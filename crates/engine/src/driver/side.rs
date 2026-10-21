@@ -315,13 +315,13 @@ async fn side_call(
     let (outcome, answer) = sided(session.id, result);
     let failure = answer.as_ref().err().and_then(|e| Json::encode(e).ok());
     let (done, committed) = oneshot::channel();
-    let _ = session.mail.send(Msg::Fenced {
+    let _ = session.mail.send(Msg::Completed {
         fence: origin.fence,
-        msg: Box::new(Msg::SideFact {
+        completion: super::Completion::SideFact {
             side: id,
             fact: SideFact::Done { outcome, failure },
             done,
-        }),
+        },
     });
     match committed.await {
         Some(Ok(())) => answer,
@@ -409,9 +409,9 @@ async fn run_side(
         };
         super::provider_error(session.id, error);
         let (done, committed) = oneshot::channel();
-        let _ = session.mail.send(Msg::Fenced {
+        let _ = session.mail.send(Msg::Completed {
             fence,
-            msg: Box::new(Msg::SideFact {
+            completion: super::Completion::SideFact {
                 side: id,
                 fact: SideFact::Retry {
                     by: by.to_owned(),
@@ -420,7 +420,7 @@ async fn run_side(
                     after_ms: u64::try_from(after.as_millis()).unwrap_or(u64::MAX),
                 },
                 done,
-            }),
+            },
         });
         if !matches!(committed.await, Some(Ok(()))) {
             return Replied::Interrupted(None);

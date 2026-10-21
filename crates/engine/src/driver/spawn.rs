@@ -348,7 +348,7 @@ impl Actor {
         let mut image = Vec::new();
         let installed = self.registry.installed();
         if let ext::ContextSource::Prefix { session, seq } = request.context {
-            if session != self.live.id || seq.get() > self.ordered_seq {
+            if session != self.live.id || seq.get() > self.journal.ordered_seq {
                 refusal = Some(SpawnRefusal::Unavailable(
                     "prefix is not committed in the owning conversation".into(),
                 ));

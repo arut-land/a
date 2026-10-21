@@ -6,7 +6,7 @@ mod common;
 use std::time::Duration;
 
 use common::*;
-use kernel::{Effect, Load, Owner};
+use kernel::{Load, Owner};
 use protocol::{Body, CallId, Json, Outcome, Permission, Seq, Verdict};
 use serde_json::json;
 
@@ -291,10 +291,10 @@ fn leftover_processes_of_this_boot_are_killed() {
     assert_eq!(
         fx,
         [
-            Effect::Kill { pgid: 7 },
-            Effect::Kill { pgid: 8 },
             append(6, tool_result(2, INTERRUPTED)),
             IDLE,
+            Effect::Kill { pgid: 7 },
+            Effect::Kill { pgid: 8 },
         ]
     );
     // A background group outlives its call, until the session ends.
@@ -305,7 +305,7 @@ fn leftover_processes_of_this_boot_are_killed() {
         tool_result(2, done(json!(0))),
     ];
     let (_, fx) = resume(Reg::echo(), ended.clone(), &BUSY_LOAD);
-    assert_eq!(fx, [Effect::Kill { pgid: 8 }, IDLE]);
+    assert_eq!(fx, [IDLE, Effect::Kill { pgid: 8 }]);
     let again = Load {
         fresh: false,
         ..BUSY_LOAD

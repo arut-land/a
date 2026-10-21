@@ -21,9 +21,12 @@ use ext::{
     Concurrency, DynExtension, DynTool, Extension, Later, Name, Parsed, Refused, Registrar, Replay,
     Rewrite, States, Tier,
 };
+mod effects;
+pub use effects::{Effect, Effects};
+
 use kernel::{
-    Action, Actions, Agent, Answer, Barriers, Core, Durability, Effect, Effects, Event, Gated,
-    Input, Load, LoopPoints, Recover, Replied,
+    Action, Actions, Agent, Answer, Barriers, Core, Durability, Event, Gated, Input, Load,
+    LoopPoints, Recover, Replied,
 };
 use protocol::ledger::Ledger;
 use protocol::{
@@ -608,7 +611,7 @@ impl Session {
     /// A new session whose barriers fall as `barriers` says.
     pub fn with_barriers(registry: Arc<dyn Binding>, barriers: Barriers) -> Self {
         let mut core = Core::new(registry).with_barriers(barriers);
-        let fx = core.resumed(&Load::default());
+        let fx = effects(core.resumed(&Load::default()));
         barriered(&fx);
         let log = appended(&fx).collect();
         Self { core, log }
@@ -622,7 +625,8 @@ impl Session {
         mut log: Vec<Entry>,
         load: &Load<'_>,
     ) -> (Self, Effects) {
-        let (core, fx) = Core::resume(registry, &log, load);
+        let (core, plan) = Core::resume(registry, &log, load);
+        let fx = effects(plan);
         barriered(&fx);
         log.extend(appended(&fx));
         (Self { core, log }, uncommitted(fx))
@@ -644,7 +648,7 @@ impl Session {
         for e in &log[at..] {
             core.load(e);
         }
-        let fx = core.resumed(load);
+        let fx = effects(core.resumed(load));
         barriered(&fx);
         log.extend(appended(&fx));
         (Self { core, log }, uncommitted(fx))
@@ -656,7 +660,7 @@ impl Session {
 
     /// [`Session::step`], with the commits ending each run of appends.
     pub fn step_committing(&mut self, event: Event) -> Effects {
-        let fx = self.core.step(event);
+        let fx = effects(self.core.step(event));
         barriered(&fx);
         self.log.extend(appended(&fx));
         fx
@@ -664,9 +668,17 @@ impl Session {
 
     /// Steps through `rows`, each event's effects as expected.
     pub fn table(&mut self, rows: Vec<(Event, Vec<Effect>)>) {
-        for (i, (event, want)) in rows.into_iter().enumerate() {
+        for (i, (event, mut want)) in rows.into_iter().enumerate() {
             let shown = format!("{event:?}");
-            let got = self.step(event);
+            let mut got = self.step(event);
+            let phase = |effect: &Effect| match effect {
+                Effect::Cancel { .. } | Effect::MarkBusy(true) => 0,
+                Effect::Append(_) => 1,
+                Effect::MarkBusy(false) => 3,
+                _ => 2,
+            };
+            got.sort_by_key(phase);
+            want.sort_by_key(phase);
             assert_eq!(
                 got.as_slice(),
                 want.as_slice(),
@@ -1011,3 +1023,32 @@ pub fn wait_child(call: u64, link: u64) -> Body {
 
 pub const BUSY: Effect = Effect::MarkBusy(true);
 pub const IDLE: Effect = Effect::MarkBusy(false);
+
+fn effects(plan: kernel::StepPlan) -> Effects {
+    let mut fx: Effects = plan.appends.into_iter().map(Effect::Append).collect();
+    if let Some(kernel::Commit {
+        through,
+        durability,
+        publish,
+    }) = plan.commit
+    {
+        fx.push(Effect::Commit {
+            through,
+            durability,
+            publish,
+        });
+    }
+    fx.extend(plan.immediate.into_iter().map(Effect::from));
+    for kernel::Guarded { admission, work } in plan.admitted {
+        fx.push(Effect::Require(admission));
+        fx.push(work.into());
+    }
+    if let Some(at) = fx
+        .iter()
+        .position(|effect| matches!(effect, Effect::MarkBusy(true)))
+    {
+        let busy = fx.remove(at);
+        fx.insert(0, busy);
+    }
+    fx
+}

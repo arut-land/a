@@ -9,7 +9,7 @@ use std::process::Command;
 use std::time::Duration;
 
 use common::*;
-use kernel::{Effect, Effects, Event, Load, Note, Owner, Replied, Turn};
+use kernel::{Event, Load, Note, Owner, Replied, Turn};
 use protocol::ledger::Call;
 use protocol::{Body, CallId, Entry, Json, Outcome, WaitOn};
 use serde_json::json;
@@ -913,4 +913,36 @@ fn replay_safe_work_requires_ordering_even_when_its_step_appends_nothing() {
             requirement: kernel::Requirement::Ordered
         })
     )));
+}
+
+#[test]
+fn every_external_effect_has_an_explicit_admission() {
+    for (name, mut session) in states() {
+        for interrupted in [false, true] {
+            let plan = if interrupted {
+                session.core.step(interrupt())
+            } else {
+                session.core.resumed(&Load::default())
+            };
+            assert!(
+                plan.immediate.iter().all(|work| !work.external()),
+                "{name}: {plan:?}"
+            );
+            for guarded in &plan.admitted {
+                assert_eq!(
+                    guarded.admission.through,
+                    session.core.ledger().seq(),
+                    "{name}"
+                );
+                if matches!(
+                    guarded.work,
+                    kernel::Work::StartChild { .. }
+                        | kernel::Work::Deliver { .. }
+                        | kernel::Work::Reply { .. }
+                ) {
+                    assert_eq!(guarded.admission.requirement, kernel::Requirement::Durable);
+                }
+            }
+        }
+    }
 }

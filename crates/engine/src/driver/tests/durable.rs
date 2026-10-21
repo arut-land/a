@@ -1412,17 +1412,30 @@ fn admitted_calls_never_resolve_services_from_a_newer_registry() {
 #[test]
 fn retired_generation_owns_no_child_admission() {
     let cancels = [Cancel::default(), Cancel::default()];
-    let mut owned = ChildAdmissions(
-        cancels
-            .iter()
-            .map(|cancel| (SessionId::new(), cancel.clone()))
-            .collect(),
-    );
-    drop(std::mem::take(&mut owned));
-    assert!(owned.0.is_empty());
+    let mut owned = WorkSet::default();
+    for cancel in &cancels {
+        owned.insert(WorkHandle::new(
+            WorkId::Child(SessionId::new()),
+            0,
+            Admission {
+                through: 1,
+                requirement: Requirement::Durable,
+            },
+            cancel.clone(),
+        ));
+    }
+    owned.revoke();
     assert!(cancels.iter().all(Cancel::is_set));
     let late = Cancel::default();
-    owned.0.push((SessionId::new(), late.clone()));
+    owned.insert(WorkHandle::new(
+        WorkId::Child(SessionId::new()),
+        1,
+        Admission {
+            through: 2,
+            requirement: Requirement::Durable,
+        },
+        late.clone(),
+    ));
     drop(owned);
     assert!(late.is_set(), "actor exit also retires admission");
 }

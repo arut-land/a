@@ -41,9 +41,12 @@ impl HistoryPolicy for Fork {
         // Anything recovery would write or start makes this an unfinished prefix.
         let effects = core.resumed(&kernel::Load::default());
         if !core.at_rest()
+            || !effects.appends.is_empty()
+            || !effects.admitted.is_empty()
             || effects
+                .immediate
                 .iter()
-                .any(|effect| !matches!(effect, kernel::Effect::MarkBusy(false)))
+                .any(|effect| !matches!(effect, kernel::Work::MarkBusy(false)))
         {
             return Err(ForkError::Unfinished);
         }

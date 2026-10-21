@@ -331,7 +331,7 @@ fn scan(root: &Path, found: &mut BTreeMap<String, Skill>) -> Result<(), Refused>
 mod tests {
     use ext::host::Bound;
     use ext::testing::Rig;
-    use kernel::{Core, Effect, Event};
+    use kernel::{Core, Event, StepPlan};
     use protocol::{Body, CallId, Json, Mode, Outcome};
     use serde_json::json;
 
@@ -346,14 +346,12 @@ mod tests {
         }
     }
 
-    fn contexts(effects: &[Effect]) -> Vec<&str> {
+    fn contexts(effects: &StepPlan) -> Vec<&str> {
         effects
+            .appends
             .iter()
-            .filter_map(|effect| match effect {
-                Effect::Append(entry) => match &entry.body {
-                    Body::Context { text, .. } => Some(text.as_str()),
-                    _ => None,
-                },
+            .filter_map(|entry| match &entry.body {
+                Body::Context { text, .. } => Some(text.as_str()),
                 _ => None,
             })
             .collect()
@@ -401,12 +399,10 @@ mod tests {
         let mut core = Core::new(old_binding);
         let started = core.step(input("/review"));
         let call = started
+            .appends
             .iter()
-            .find_map(|effect| match effect {
-                Effect::Append(entry) if matches!(entry.body, Body::ToolCall { .. }) => {
-                    Some(CallId(entry.seq))
-                }
-                _ => None,
+            .find_map(|entry| {
+                matches!(entry.body, Body::ToolCall { .. }).then_some(CallId(entry.seq))
             })
             .unwrap();
         assert!(!core.at_rest());
@@ -415,7 +411,12 @@ mod tests {
         let new = workspace.registry();
         assert!(!Arc::ptr_eq(&old, &new));
         let new_binding = Arc::new(Bound::new(new.clone(), Arc::new(rig.cx()), None));
-        assert!(core.step(Event::Registry(new_binding.clone())).is_empty());
+        let ignored = core.step(Event::Registry(new_binding.clone()));
+        assert!(
+            ignored.appends.is_empty()
+                && ignored.immediate.is_empty()
+                && ignored.admitted.is_empty()
+        );
         // Commands and model calls retain the same immutable registry while busy.
         let old_call = Rig::new("skills-old-call", (*old).clone());
         old_call.done("review", &json!({}));

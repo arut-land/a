@@ -2,7 +2,7 @@
 //! what it has logged and what just happened.
 //!
 //! [`Core::step`] takes one [`Event`] (input, an effect's outcome, a timer
-//! firing) and returns the [`Effects`] that follow: entries to append, and
+//! firing) and returns the [`StepPlan`] that follow: entries to append, and
 //! the work they are the committed intent of. It is sync, does no I/O and
 //! reads no clock (time comes in as events), so every ordering a session
 //! can meet is a row of a table test, and two runs of the same events log
@@ -19,9 +19,9 @@
 //! The kernel ships no tool, prompt, permission rule, model choice, retry
 //! policy or agent loop: all of that answers through the session's
 //! [`Binding`] and [`Agent`]. Nor does it see a model request: it asks
-//! the driver to prepare one ([`Effect::Prepare`]), logs what the `step`
+//! the driver to prepare one ([`Work::Prepare`]), logs what the `step`
 //! point decided about it ([`Event::Prepared`]), and only then has it sent
-//! ([`Effect::Send`]), so a decision is durable before the work it shaped.
+//! ([`Work::Send`]), so a decision is durable before the work it shaped.
 
 use std::sync::Arc;
 use std::time::Duration;
@@ -44,12 +44,47 @@ mod session;
 
 pub use crate::session::{Core, RESTART_CAP};
 
-/// Each step ends its appends with a commit. Admission declarations carry
-/// the required prefix even when the next step appends nothing. Ordered
-/// work can overlap cache flushing; unsafe work and numbered publication
-/// wait for durability. A failed write or epoch fences the work and resumes
-/// from the log ([`Core::resume`]).
-pub type Effects = SmallVec<[Effect; 4]>;
+/// A step separates its journal changes from work admitted by that prefix.
+#[derive(Debug, Default)]
+pub struct StepPlan {
+    pub appends: Vec<Entry>,
+    pub commit: Option<Commit>,
+    pub immediate: Vec<Work>,
+    pub admitted: Vec<Guarded<Work>>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Commit {
+    pub through: u64,
+    pub durability: Durability,
+    pub publish: bool,
+}
+
+#[derive(Debug)]
+pub struct Guarded<W> {
+    pub admission: Admission,
+    pub work: W,
+}
+
+impl Extend<StepPlan> for StepPlan {
+    fn extend<T: IntoIterator<Item = StepPlan>>(&mut self, plans: T) {
+        for plan in plans {
+            self.appends.extend(plan.appends);
+            self.immediate.extend(plan.immediate);
+            self.admitted.extend(plan.admitted);
+            if let Some(commit) = plan.commit {
+                self.commit = Some(match self.commit {
+                    Some(previous) => Commit {
+                        through: previous.through.max(commit.through),
+                        durability: previous.durability.max(commit.durability),
+                        publish: previous.publish || commit.publish,
+                    },
+                    None => commit,
+                });
+            }
+        }
+    }
+}
 
 /// Whether the append must cross a write barrier. Admission and numbered
 /// publication independently require the appropriate completed prefix.
@@ -139,17 +174,17 @@ pub enum Event {
     /// The backoff before retrying model call `call` is over.
     Woke { call: CallId },
     /// How to recover model call `call`, answered later
-    /// ([`Effect::Recover`]): `None` fails it.
+    /// ([`Work::Recover`]): `None` fails it.
     Recovered {
         call: CallId,
         recovered: Option<(Name, Recover)>,
     },
     /// A side request changes independently of the main turn.
     Side(SideEvent),
-    /// The request of model call `call` is prepared ([`Effect::Prepare`]):
+    /// The request of model call `call` is prepared ([`Work::Prepare`]):
     /// the `step` point decided `decisions` about it, and a handler
     /// `answered` it in the model's place, if one did. Logged, then the
-    /// request is sent ([`Effect::Send`]), or the answer is the call's
+    /// request is sent ([`Work::Send`]), or the answer is the call's
     /// outcome.
     Prepared {
         call: CallId,
@@ -185,7 +220,7 @@ pub enum Event {
 pub enum SideEvent {
     /// An extension asks `model` aside on behalf of open call `of`, for
     /// `purpose`: logged as a model call of its own under it, its id the
-    /// answer to `ticket` ([`Effect::Side`]).
+    /// answer to `ticket` ([`Work::Side`]).
     Open {
         of: CallId,
         purpose: String,
@@ -269,18 +304,7 @@ pub struct Admission {
 
 /// What the driver is to do.
 #[derive(Debug, PartialEq)]
-pub enum Effect {
-    /// Commit this entry, numbered next.
-    Append(Entry),
-    /// Commit the entries appended, as durably as said: once per step,
-    /// after the last of them.
-    Commit {
-        through: u64,
-        durability: Durability,
-        publish: bool,
-    },
-    /// Applies to the following effect, including when this step appends nothing.
-    Require(Admission),
+pub enum Work {
     /// Answer request `ticket`, once what it logged is committed.
     Reply {
         ticket: Ticket,
@@ -318,11 +342,11 @@ pub enum Effect {
         value: Json,
     },
     /// Await the gate's answer for call `call`; it comes back as
-    /// [`Event::Gated`]. Dropped by a [`Effect::Cancel`] of the call.
+    /// [`Event::Gated`]. Dropped by a [`Work::Cancel`] of the call.
     Await { call: CallId, answer: Later<Gated> },
     /// Await how to recover model call `call`, which a `request_error`
     /// handler answers later; it comes back as [`Event::Recovered`].
-    /// Dropped by a [`Effect::Cancel`] of the call.
+    /// Dropped by a [`Work::Cancel`] of the call.
     Recover {
         call: CallId,
         answer: Later<Option<(Name, Recover)>>,
@@ -356,7 +380,7 @@ pub enum Effect {
     },
 }
 
-impl Effect {
+impl Work {
     /// Whether carrying it out starts work: what a session that is
     /// stopping leaves in its log for the next load.
     pub const fn starts(&self) -> bool {
