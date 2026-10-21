@@ -1,42 +1,58 @@
 //! `edit`: exact replacements in one file, all against the file as it was.
 //!
-//! Stale reads: the `edit` extension records a hash of every file it writes
-//! as its `seen` state. An edit to a file whose content no longer has the
-//! hash recorded for it (it changed since this session last wrote it, by
-//! `bash` or by someone else) fails, and records the new hash: the model is
-//! told to look again, and its next edit, made knowing the change, goes
-//! through. Files the session never wrote have nothing to compare against,
-//! as reads through `bash` are not seen.
+//! A stale edit records the current hash so a retry can proceed after inspection.
+//! Reads through `bash` are not tracked.
 
 use std::collections::HashMap;
 use std::fmt::Write as _;
+use std::io::Read as _;
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 
 use protocol::Card;
 use serde::{Deserialize, Serialize};
 
-use ext::Fold;
-
-use ext::{Cx, Json, Schema, Tool};
-
-/// The runtime the engine runs the call on, whose blocking pool file work
-/// goes to.
-fn runtime(cx: &Cx) -> Result<&dyn rt::Runtime, String> {
-    cx.service::<dyn rt::Runtime>()
-        .ok_or_else(|| "the engine provides no runtime".to_owned())
-}
+use ext::{Cx, Fold, Json, Schema, Tool};
 
 pub struct Edit;
 
-/// The most of a diff an outcome keeps.
 const DIFF_LIMIT: usize = 16 * 1024;
+
+#[derive(Clone, Copy)]
+struct Limits {
+    file: usize,
+    diff_bytes: usize,
+    diff_work: usize,
+}
+
+const LIMITS: Limits = Limits {
+    file: 8 << 20,
+    diff_bytes: DIFF_LIMIT,
+    diff_work: 1 << 20,
+};
 
 #[derive(Deserialize, Schema)]
 pub struct Change {
     /// Relative to the working directory, or absolute.
     pub path: String,
     #[schema(min_items = 1)]
-    pub edits: Vec<Replace>,
+    pub edits: Edits,
+}
+
+#[derive(Deserialize)]
+#[serde(from = "Vec<Replace>")]
+pub struct Edits(Arc<Vec<Replace>>);
+
+impl From<Vec<Replace>> for Edits {
+    fn from(edits: Vec<Replace>) -> Self {
+        Self(Arc::new(edits))
+    }
+}
+
+impl Schema for Edits {
+    fn schema(out: &mut String) {
+        Vec::<Replace>::schema(out);
+    }
 }
 
 #[derive(Deserialize, Schema)]
@@ -70,15 +86,6 @@ pub struct Wrote {
     hash: u64,
 }
 
-impl Seen {
-    fn change(path: &Path, content: &[u8]) -> Wrote {
-        Wrote {
-            path: path.to_path_buf(),
-            hash: hash(content),
-        }
-    }
-}
-
 impl Fold for Seen {
     const NAME: &'static str = "seen";
     type Change = Wrote;
@@ -97,52 +104,32 @@ impl Tool for Edit {
 
     async fn call(&self, input: &Change, cx: &Cx) -> Result<Edited, String> {
         let path = cx.dir().join(&input.path);
-        let shown = input.path.clone();
-        let read = path.clone();
-        let original = rt::unblock(runtime(cx)?, move || match std::fs::read(&read) {
-            Ok(bytes) => Ok(Some(bytes)),
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
-            Err(e) => Err(e),
-        })
+        let shown = &input.path;
+        let prior = cx.state(|seen: &Seen| seen.0.get(&path).copied());
+        let (edited, hash) = match edit_file(
+            cx.service::<dyn rt::Runtime>()
+                .ok_or("the engine provides no runtime")?,
+            path,
+            input.edits.0.clone(),
+            prior,
+            LIMITS,
+            &cx.cancel,
+        )
         .await
-        .map_err(|e| format!("{shown}: {e}"))?;
-
-        if let Some(bytes) = &original {
-            let last = cx.state(|seen: &Seen| seen.0.get(&path).copied());
-            if last.is_some_and(|last| last != hash(bytes)) {
-                cx.update::<Seen>(&Seen::change(&path, bytes))
-                    .await
-                    .map_err(|e| e.to_string())?;
+        {
+            Ok(result) => result,
+            Err(EditError::Stale(wrote)) => {
+                cx.update::<Seen>(&wrote).await.map_err(|e| e.to_string())?;
                 return Err(format!(
                     "{shown} changed since this session last edited it; look at it again before editing it"
                 ));
             }
-        }
-        let text = match &original {
-            Some(bytes) => {
-                Some(std::str::from_utf8(bytes).map_err(|_| format!("{shown} is not UTF-8 text"))?)
-            }
-            None => None,
+            Err(EditError::InvalidText) => return Err(format!("{shown} is not UTF-8 text")),
+            Err(EditError::Failed(error)) => return Err(format!("{shown}: {error}")),
         };
-        let (content, diff) = apply(text, &input.edits).map_err(|e| format!("{shown}: {e}"))?;
-
-        let write = (path.clone(), content.clone());
-        rt::unblock(runtime(cx)?, move || {
-            if let Some(parent) = write.0.parent() {
-                std::fs::create_dir_all(parent)?;
-            }
-            std::fs::write(&write.0, &write.1)
-        })
-        .await
-        .map_err(|e| format!("{shown}: {e}"))?;
-        let seen = Seen::change(&path, content.as_bytes());
-        let edited = Edited {
-            path,
-            created: original.is_none(),
-            replaced: input.edits.len(),
-            added: diff.added,
-            removed: diff.removed,
-            diff: diff.text,
+        let seen = Wrote {
+            path: edited.path.clone(),
+            hash,
         };
         cx.record_effect::<Seen, _>(edited, &seen)
             .await
@@ -184,26 +171,161 @@ impl Tool for Edit {
     }
 }
 
+#[derive(Debug)]
+enum EditError {
+    Stale(Wrote),
+    InvalidText,
+    Failed(String),
+}
+
+impl From<std::io::Error> for EditError {
+    fn from(error: std::io::Error) -> Self {
+        Self::Failed(error.to_string())
+    }
+}
+
+async fn admitted<T: Send + 'static>(
+    rt: &dyn rt::Runtime,
+    class: rt::BlockingClass,
+    bytes: usize,
+    cancel: &ext::Cancel,
+    work: impl FnOnce() -> Result<T, EditError> + Send + 'static,
+) -> Result<T, EditError> {
+    let (tx, rx) = rt::oneshot::channel();
+    let cancel = cancel.clone();
+    let job = move || {
+        tx.send(if cancel.is_set() {
+            Err(EditError::Failed("edit cancelled".into()))
+        } else {
+            work()
+        });
+    };
+    rt.spawn_blocking(class, bytes, Box::new(job)).await?;
+    rx.await
+        .ok_or_else(|| EditError::Failed("edit worker panicked".into()))?
+}
+
+async fn edit_file(
+    rt: &dyn rt::Runtime,
+    path: PathBuf,
+    edits: Arc<Vec<Replace>>,
+    prior_hash: Option<u64>,
+    limits: Limits,
+    cancel: &ext::Cancel,
+) -> Result<(Edited, u64), EditError> {
+    let captured = size_of_val(edits.as_slice())
+        + edits
+            .iter()
+            .map(|edit| edit.old.len() + edit.new.len())
+            .sum::<usize>();
+    if captured > limits.file {
+        return Err(EditError::Failed("edits exceed byte limit".into()));
+    }
+    let (path, original) = admitted(
+        rt,
+        rt::BlockingClass::Storage,
+        limits.file * 2 + captured,
+        cancel,
+        move || {
+            let file = match std::fs::File::open(&path) {
+                Ok(file) => file,
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok((path, None)),
+                Err(e) => return Err(e.into()),
+            };
+            let mut bytes = Vec::new();
+            file.take(limits.file as u64 + 1).read_to_end(&mut bytes)?;
+            if bytes.len() > limits.file {
+                return Err(EditError::Failed("file exceeds byte limit".into()));
+            }
+            Ok((path, Some(bytes)))
+        },
+    )
+    .await?;
+    let (content, edited, hash) = admitted(
+        rt,
+        rt::BlockingClass::Cpu,
+        limits.file * 5 + captured,
+        cancel,
+        move || {
+            if let Some(bytes) = &original {
+                let current = hash(bytes);
+                if prior_hash.is_some_and(|prior| prior != current) {
+                    return Err(EditError::Stale(Wrote {
+                        path,
+                        hash: current,
+                    }));
+                }
+            }
+            let text = original
+                .as_ref()
+                .map(|bytes| std::str::from_utf8(bytes))
+                .transpose()
+                .map_err(|_| EditError::InvalidText)?;
+            let (content, diff) = apply(text, &edits, limits).map_err(EditError::Failed)?;
+            let hash = hash(content.as_bytes());
+            let edited = Edited {
+                path,
+                created: original.is_none(),
+                replaced: edits.len(),
+                added: diff.added,
+                removed: diff.removed,
+                diff: diff.text,
+            };
+            Ok((content, edited, hash))
+        },
+    )
+    .await?;
+    admitted(
+        rt,
+        rt::BlockingClass::Storage,
+        content.len() + limits.diff_bytes * 2,
+        cancel,
+        move || {
+            write_content(&edited.path, content)?;
+            Ok((edited, hash))
+        },
+    )
+    .await
+}
+
+fn write_content(path: &Path, content: impl AsRef<[u8]>) -> std::io::Result<()> {
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+    std::fs::write(path, content)
+}
+
 #[derive(Default)]
 struct Diff {
     text: String,
     added: usize,
     removed: usize,
+    work: usize,
 }
 
-/// `edits` applied to `original`, and their diff.
-fn apply(original: Option<&str>, edits: &[Replace]) -> Result<(String, Diff), String> {
+fn apply(
+    original: Option<&str>,
+    edits: &[Replace],
+    limits: Limits,
+) -> Result<(String, Diff), String> {
     if let [Replace { old, new }] = edits
         && old.is_empty()
     {
+        if new.len() > limits.file * 2 {
+            return Err("result exceeds byte limit".into());
+        }
         let mut diff = Diff::default();
-        diff.lines((1, 1), original.unwrap_or_default(), new);
+        let old = original.unwrap_or_default();
+        diff.hunk(old, (0, old.len()), new, (1, 1), limits);
         return Ok((new.clone(), diff));
     }
-    let original = original
-        .ok_or("no such file; to create it, give one edit with an empty `old`".to_owned())?;
+    let original =
+        original.ok_or("no such file; to create it, give one edit with an empty `old`")?;
     if edits.is_empty() {
         return Err("no edits".to_owned());
+    }
+    if original.len().saturating_mul(edits.len()) > 64 << 20 {
+        return Err("edit matching exceeds work limit".into());
     }
     let mut spans = Vec::with_capacity(edits.len());
     for (n, Replace { old, new }) in (1..).zip(edits) {
@@ -231,21 +353,26 @@ fn apply(original: Option<&str>, edits: &[Replace]) -> Result<(String, Diff), St
             return Err(format!("edits {} and {} overlap", pair[0].3, pair[1].3));
         }
     }
-    let (mut content, mut diff, mut last) = (String::new(), Diff::default(), 0);
-    // How far line numbers in the new text have moved from the old.
-    let mut shift: isize = 0;
+    let size = spans
+        .iter()
+        .fold(original.len(), |size, &(start, end, new, _)| {
+            size - (end - start) + new.len()
+        });
+    if size > limits.file * 2 {
+        return Err("result exceeds byte limit".into());
+    }
+    let (mut content, mut diff, mut last) = (String::with_capacity(size), Diff::default(), 0);
+    let (mut old_line, mut new_line) = (1, 1);
     for &(start, end, new, _) in &spans {
         content.push_str(&original[last..start]);
         content.push_str(new);
+        let skipped = line_count(&original[last..start]);
+        old_line += skipped;
+        new_line += skipped;
         last = end;
-        let line = original[..start].matches('\n').count() + 1;
-        diff.hunk(
-            original,
-            (start, end),
-            new,
-            (line, line.saturating_add_signed(shift)),
-        );
-        shift += line_count(new).cast_signed() - line_count(&original[start..end]).cast_signed();
+        diff.hunk(original, (start, end), new, (old_line, new_line), limits);
+        old_line += line_count(&original[start..end]);
+        new_line += line_count(new);
     }
     content.push_str(&original[last..]);
     Ok((content, diff))
@@ -256,50 +383,60 @@ fn line_count(text: &str) -> usize {
 }
 
 impl Diff {
-    /// The hunk for replacing `original[start..end]` with `new`: the whole
-    /// lines the span touches, before and after.
     fn hunk(
         &mut self,
         original: &str,
         (start, end): (usize, usize),
         new: &str,
         lines: (usize, usize),
+        limits: Limits,
     ) {
+        let tail = end < original.len();
+        let prefix = start > 0 && original.as_bytes()[start - 1] != b'\n';
+        let count = |text: &str| {
+            line_count(text)
+                + usize::from(tail || (!text.ends_with('\n') && (!text.is_empty() || prefix)))
+        };
+        self.removed += count(&original[start..end]);
+        self.added += count(new);
+        if self.work > limits.diff_work {
+            return;
+        }
+        self.work = self.work.saturating_add((original.len() + new.len()) * 4);
+        if self.work > limits.diff_work {
+            self.cut(limits);
+            return;
+        }
         let from = original[..start].rfind('\n').map_or(0, |at| at + 1);
         let to = original[end..]
             .find('\n')
             .map_or(original.len(), |at| end + at + 1);
-        let after = format!("{}{new}{}", &original[from..start], &original[end..to]);
-        self.lines(lines, &original[from..to], &after);
-    }
-
-    /// A hunk turning `old` lines, from line `lines.0`, into `new`, from
-    /// line `lines.1`.
-    fn lines(&mut self, lines: (usize, usize), old: &str, new: &str) {
-        let old: Vec<&str> = old.lines().collect();
-        let new: Vec<&str> = new.lines().collect();
-        self.removed += old.len();
-        self.added += new.len();
-        if self.text.len() >= DIFF_LIMIT {
+        let before = &original[from..to];
+        let parts = [&original[from..start], new, &original[end..to]];
+        let bytes = before.len() + parts.iter().map(|part| part.len()).sum::<usize>();
+        if self.text.len() + bytes * 2 + 96 > limits.diff_bytes {
+            self.cut(limits);
             return;
         }
+        let after = parts.concat();
         let _ = writeln!(
             self.text,
             "@@ -{},{} +{},{} @@",
             lines.0,
-            old.len(),
+            before.lines().count(),
             lines.1,
-            new.len()
+            after.lines().count()
         );
-        for line in old {
-            let _ = writeln!(self.text, "-{line}");
+        for (prefix, text) in [('-', before), ('+', after.as_str())] {
+            for line in text.lines() {
+                let _ = writeln!(self.text, "{prefix}{line}");
+            }
         }
-        for line in new {
-            let _ = writeln!(self.text, "+{line}");
-        }
-        if self.text.len() > DIFF_LIMIT {
-            let cut = self.text.floor_char_boundary(DIFF_LIMIT);
-            self.text.truncate(cut);
+    }
+
+    fn cut(&mut self, limits: Limits) {
+        self.work = usize::MAX;
+        if self.text.len() + "\n[diff cut]\n".len() <= limits.diff_bytes {
             self.text.push_str("\n[diff cut]\n");
         }
     }
@@ -332,10 +469,180 @@ mod tests {
     }
 
     #[test]
+    fn diff_work_is_bounded_before_formatting() {
+        let huge = "é".repeat(1 << 20);
+        for limits in [
+            Limits {
+                diff_work: 1,
+                ..LIMITS
+            },
+            Limits {
+                diff_bytes: 64,
+                diff_work: usize::MAX,
+                ..LIMITS
+            },
+        ] {
+            let (_, diff) = apply(Some(&huge), &edits(&[("", "x")]), limits).unwrap();
+            assert_eq!(diff.text, "\n[diff cut]\n");
+            assert!(diff.text.capacity() <= limits.diff_bytes);
+            assert_eq!((diff.added, diff.removed), (1, 1));
+        }
+        let original = format!("{huge}target");
+        let (_, diff) = apply(Some(&original), &edits(&[("target", "next")]), LIMITS).unwrap();
+        assert_eq!(diff.text, "\n[diff cut]\n");
+        assert!(diff.text.capacity() <= DIFF_LIMIT);
+        assert_eq!((diff.added, diff.removed), (1, 1));
+    }
+
+    #[test]
+    fn limits_reject_growth_and_matching_before_building_the_result() {
+        let limits = Limits { file: 4, ..LIMITS };
+        assert!(apply(Some("abcd"), &edits(&[("a", "123456789")]), limits).is_err());
+        let original = "x".repeat(1 << 20);
+        let many = edits(&vec![("x", "y"); 65]);
+        assert_eq!(
+            apply(Some(&original), &many, LIMITS).err().unwrap(),
+            "edit matching exceeds work limit"
+        );
+        let rig = Rig::new("edit-limits", registry());
+        let path = rig.workspace().join("large.txt");
+        std::fs::write(&path, "12345").unwrap();
+        let runtime = rt::Threads::new(1);
+        assert!(
+            rt::block_on(edit_file(
+                &runtime,
+                path.clone(),
+                Arc::new(edits(&[("1", "2")])),
+                None,
+                limits,
+                &ext::Cancel::default()
+            ))
+            .is_err()
+        );
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), "12345");
+    }
+
+    #[test]
+    fn writing_does_not_clone_the_complete_result() {
+        struct Contents(String);
+        impl AsRef<[u8]> for Contents {
+            fn as_ref(&self) -> &[u8] {
+                self.0.as_bytes()
+            }
+        }
+        let rig = Rig::new("edit-owned-write", registry());
+        let file = rig.workspace().join("large.txt");
+        let content = Contents("a".repeat(1 << 20));
+        write_content(&file, content).unwrap();
+        assert_eq!(std::fs::metadata(file).unwrap().len(), 1 << 20);
+    }
+
+    #[test]
+    fn large_edits_do_not_block_async_workers() {
+        use std::sync::Mutex;
+        struct Gated {
+            inner: rt::Threads,
+            stage: std::sync::atomic::AtomicUsize,
+            at: usize,
+            gate: Mutex<Option<(rt::oneshot::Sender<()>, std::sync::mpsc::Receiver<()>)>>,
+        }
+        impl rt::Runtime for Gated {
+            fn spawn(&self, task: rt::BoxFuture<'static, ()>) {
+                self.inner.spawn(task);
+            }
+            fn spawn_flush(
+                &self,
+                work: Box<dyn FnOnce() + Send>,
+            ) -> rt::BoxFuture<'static, std::io::Result<()>> {
+                self.inner.spawn_flush(work)
+            }
+            fn reactor(&self) -> rt::Reactor {
+                self.inner.reactor()
+            }
+            fn spawn_blocking(
+                &self,
+                class: rt::BlockingClass,
+                bytes: usize,
+                work: Box<dyn FnOnce() + Send>,
+            ) -> rt::BoxFuture<'static, std::io::Result<()>> {
+                let stage = self
+                    .stage
+                    .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                let gate = if stage == self.at {
+                    self.gate.lock().unwrap().take()
+                } else {
+                    None
+                };
+                self.inner.spawn_blocking(
+                    class,
+                    bytes,
+                    Box::new(move || {
+                        if let Some((started, resume)) = gate {
+                            started.send(());
+                            resume.recv().unwrap();
+                        }
+                        work();
+                    }),
+                )
+            }
+        }
+        for (at, cancelled) in [(1, false), (1, true), (2, true)] {
+            let rig = Rig::new("edit-worker", registry());
+            let path = rig.workspace().join("large.txt");
+            let file = path.clone();
+            let (started, running) = rt::oneshot::channel();
+            let (resume, receiver) = std::sync::mpsc::channel();
+            let runtime = Arc::new(Gated {
+                inner: rt::Threads::new(1),
+                stage: std::sync::atomic::AtomicUsize::new(0),
+                at,
+                gate: Mutex::new(Some((started, receiver))),
+            });
+            let cancel = ext::Cancel::default();
+            let stop = cancel.clone();
+            let worker = runtime.clone();
+            let result = rt::spawn(runtime.as_ref(), async move {
+                edit_file(
+                    worker.as_ref(),
+                    path,
+                    Arc::new(edits(&[("", &"x".repeat(2 << 20))])),
+                    None,
+                    LIMITS,
+                    &cancel,
+                )
+                .await
+            });
+            rt::block_on(running).unwrap();
+            let heartbeat = rt::spawn(runtime.as_ref(), async move {
+                if cancelled {
+                    stop.set();
+                }
+                resume.send(()).unwrap();
+            });
+            let result = rt::block_on(result);
+            rt::block_on(heartbeat);
+            if cancelled {
+                assert!(
+                    matches!(result, Err(EditError::Failed(error)) if error == "edit cancelled")
+                );
+                assert!(!file.exists());
+            } else {
+                let (edited, current) = result.unwrap();
+                assert_eq!(current, hash(&vec![b'x'; 2 << 20]));
+                assert!(edited.diff.len() <= DIFF_LIMIT);
+            }
+        }
+    }
+
+    #[test]
     fn edits_apply_against_the_original_in_any_order() {
         let original = "one\ntwo\nthree\nfour\n";
-        let (content, diff) =
-            apply(Some(original), &edits(&[("four", "4"), ("one\ntwo", "1")])).unwrap();
+        let (content, diff) = apply(
+            Some(original),
+            &edits(&[("four", "4"), ("one\ntwo", "1")]),
+            LIMITS,
+        )
+        .unwrap();
         assert_eq!(content, "1\nthree\n4\n");
         assert_eq!(
             diff.text,
@@ -343,14 +650,14 @@ mod tests {
         );
         assert_eq!((diff.added, diff.removed), (2, 3));
         // An edit's `new` is never searched by a later one.
-        let (swapped, _) = apply(Some("a b"), &edits(&[("a", "b"), ("b", "a")])).unwrap();
+        let (swapped, _) = apply(Some("a b"), &edits(&[("a", "b"), ("b", "a")]), LIMITS).unwrap();
         assert_eq!(swapped, "b a");
     }
 
     #[test]
     fn every_old_must_match_exactly_once_without_overlapping() {
         let text = Some("x x y\n");
-        let err = |pairs: &[(&str, &str)]| apply(text, &edits(pairs)).err().unwrap();
+        let err = |pairs: &[(&str, &str)]| apply(text, &edits(pairs), LIMITS).err().unwrap();
         assert_eq!(err(&[("z", "")]), "edit 1: `old` is not in the file");
         assert_eq!(
             err(&[("y", "Y"), ("x", "")]),
@@ -361,21 +668,20 @@ mod tests {
             err(&[("y", "1"), ("", "2")]),
             "edit 2: an empty `old` only works as the only edit"
         );
-        assert!(apply(None, &edits(&[("x", "y")])).is_err());
-        assert_eq!(apply(text, &[]).err().unwrap(), "no edits");
+        assert!(apply(None, &edits(&[("x", "y")]), LIMITS).is_err());
+        assert_eq!(apply(text, &[], LIMITS).err().unwrap(), "no edits");
     }
 
     #[test]
     fn an_empty_old_writes_the_whole_file() {
-        let (created, diff) = apply(None, &edits(&[("", "a\nb\n")])).unwrap();
+        let (created, diff) = apply(None, &edits(&[("", "a\nb\n")]), LIMITS).unwrap();
         assert_eq!(created, "a\nb\n");
         assert_eq!(diff.text, "@@ -1,0 +1,2 @@\n+a\n+b\n");
-        let (replaced, diff) = apply(Some("old\n"), &edits(&[("", "new\n")])).unwrap();
+        let (replaced, diff) = apply(Some("old\n"), &edits(&[("", "new\n")]), LIMITS).unwrap();
         assert_eq!(replaced, "new\n");
         assert_eq!((diff.added, diff.removed), (1, 1));
     }
 
-    /// The shell, where edits are made, and the edit.
     fn registry() -> Registry {
         Registry::default()
             .with(&ext_shell::Shell)
@@ -399,7 +705,7 @@ mod tests {
     }
 
     #[test]
-    fn edits_create_and_change_files_and_catch_stale_reads() {
+    fn stale_file_checks_survive_offloaded_edits() {
         let rig = Rig::new("edit", registry());
         let file = rig.workspace().join("notes.txt");
         let created = change(&rig, "notes.txt", &[("", "one\ntwo\n")]);
@@ -416,7 +722,7 @@ mod tests {
         );
         let input = Change {
             path: "notes.txt".into(),
-            edits: Vec::new(),
+            edits: Vec::new().into(),
         };
         let card = Edit::present_result(&input, &output.parse().unwrap());
         assert_eq!(card.unwrap().note, "+1 -1");
@@ -429,6 +735,7 @@ mod tests {
             stale.contains("changed since this session last edited it"),
             "{stale}"
         );
+        assert_eq!(std::fs::read_to_string(&file).unwrap(), "one\n2\nthree\n");
         assert!(matches!(
             change(&rig, "notes.txt", &[("one", "1")]),
             Outcome::Done { .. }
