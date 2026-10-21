@@ -361,7 +361,7 @@ mod tests {
         use std::net::TcpListener;
         use std::time::{Duration, Instant};
 
-        fn receive(listener: TcpListener, reply: String) -> Option<String> {
+        fn receive(listener: &TcpListener, reply: &str) -> Option<String> {
             listener.set_nonblocking(true).unwrap();
             let deadline = Instant::now() + Duration::from_secs(3);
             loop {
@@ -403,11 +403,11 @@ mod tests {
             "HTTP/1.1 302 Found\r\nLocation: http://127.0.0.1:{}/other\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
             target.local_addr().unwrap().port()
         );
-        let source = std::thread::spawn(move || receive(source, redirect));
+        let source = std::thread::spawn(move || receive(&source, &redirect));
         let target = std::thread::spawn(move || {
             receive(
-                target,
-                "HTTP/1.1 204 No Content\r\nConnection: close\r\n\r\n".into(),
+                &target,
+                "HTTP/1.1 204 No Content\r\nConnection: close\r\n\r\n",
             )
         });
         let rig = Rig::new("mcp-review-redirect", Registry::default());
