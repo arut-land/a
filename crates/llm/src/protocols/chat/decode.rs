@@ -336,7 +336,8 @@ impl Call<'_> {
             Ok(match value {
                 Json::Absent => 4,
                 Json::Str(text) => w.measure_str(text)?,
-                Json::Object(value) | Json::Other(value) => w.measure(value)?,
+                // Content merges can wrap strings in text-part objects.
+                Json::Object(value) | Json::Other(value) => w.measure(value)?.saturating_mul(4),
                 Json::List(values) => {
                     let mut bytes: usize = 2;
                     for value in values {
@@ -349,9 +350,9 @@ impl Call<'_> {
         let function = match &self.function {
             Json::Object(function) => json(&function.name, w)?
                 .saturating_add(json(&function.arguments, w)?)
-                .saturating_add(w.measure_fields(&function.rest)?),
+                .saturating_add(w.measure_fields(&function.rest)?.saturating_mul(4)),
             Json::Str(text) => w.measure_str(text)?,
-            Json::Other(value) => w.measure(value)?,
+            Json::Other(value) => w.measure(value)?.saturating_mul(4),
             Json::List(values) => {
                 let mut bytes: usize = 2;
                 for value in values {
@@ -365,7 +366,7 @@ impl Call<'_> {
             .saturating_add(json(&self.id, w)?)
             .saturating_add(json(&self.kind, w)?)
             .saturating_add(function)
-            .saturating_add(w.measure_fields(&self.rest)?))
+            .saturating_add(w.measure_fields(&self.rest)?.saturating_mul(4)))
     }
 
     fn merge(&self, item: &mut Map<String, Value>) {
@@ -1007,6 +1008,27 @@ fn usage_of(usage: &Value, quirks: &Quirks) -> Usage {
 #[cfg(test)]
 mod growth_tests {
     use super::*;
+
+    #[test]
+    fn structured_field_merges_reserve_content_wrappers() {
+        let mut item = Map::new();
+        let mut rest = Map::new();
+        for index in 0..32 {
+            let key = index.to_string();
+            item.insert(key.clone(), json!({"content": [], "thinking": []}));
+            rest.insert(key, json!({"content": "x", "thinking": "y"}));
+        }
+        let before = crate::json::encoded_bytes(&item, usize::MAX).unwrap();
+        let call = Call {
+            rest,
+            ..Default::default()
+        };
+        let mut writer = Writer::new(KEY);
+        let reserved = call.growth(&mut writer).unwrap();
+        call.merge(&mut item);
+        let after = crate::json::encoded_bytes(&item, usize::MAX).unwrap();
+        assert!(after - before <= reserved);
+    }
 
     #[test]
     fn small_argument_fragments_cost_linear_work() {
