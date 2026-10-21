@@ -25,6 +25,13 @@ impl SpawnImage {
         json.parse()
     }
 
+    pub fn entries(&self) -> Vec<Entry> {
+        self.image
+            .iter()
+            .filter_map(|encoded| Entry::from_json(encoded.raw().as_bytes()).ok())
+            .collect()
+    }
+
     pub fn to_json(&self) -> Result<Json, serde_json::Error> {
         Json::encode(self)
     }
@@ -36,10 +43,8 @@ impl Publications {
             && let Ok(image) = SpawnImage::from_json(intent)
         {
             let mut inherited = Self::default();
-            for encoded in image.image {
-                if let Ok(source) = Entry::from_json(encoded.raw().as_bytes()) {
-                    inherited.apply(&source);
-                }
+            for source in image.entries() {
+                inherited.apply(&source);
             }
             self.0.insert(
                 entry.seq.get(),
@@ -60,7 +65,7 @@ impl Publications {
     }
 
     pub fn is_empty(&self) -> bool {
-        self.0.is_empty()
+        self.0.values().all(Vec::is_empty)
     }
 
     pub fn contains(&self, namespace: &str, key: &Json) -> bool {
