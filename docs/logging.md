@@ -52,7 +52,8 @@ writing succeeds again. Diagnostic I/O errors never recurse into logging.
 Each file is capped at 256 KiB by rotating before every write, independent
 of supervisor wakes. Live plus retained files use at most 768 KiB. Files
 are reopened after rotation; a partial failed write is truncated before
-another append is attempted in that process. This is best-effort
+another append is attempted. Reopening also truncates an unsealed tail left
+by a previous process, so the first new fact is always a complete line. This is best-effort
 observability, not a second durable ledger: it does not fsync. An abrupt
 process death can lose queued facts or tear the final diagnostic line.
 Orderly exit closes admission and gives queued writes at most 250 ms before

@@ -4,7 +4,7 @@
 
 use std::collections::VecDeque;
 use std::fs::{self, OpenOptions};
-use std::io::{self, Read, Write};
+use std::io::{self, Read, Seek, SeekFrom, Write};
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
@@ -462,6 +462,7 @@ impl Rotating {
                 .set_len(offset)?;
             self.repair = None;
         }
+        repair_tail(&self.path)?;
         // Rotate before writing: neither an idle daemon nor a large burst
         // can grow a file beyond the bound. Reopening avoids stale inodes.
         sys::log::rotate(&self.path, self.max - line.len() as u64, self.keep)?;
@@ -474,6 +475,34 @@ impl Rotating {
         self.repair = None;
         Ok(())
     }
+}
+
+// A restarted writer has no in-memory offset for an interrupted append.
+// Find the last delimiter without reading an unbounded file into memory.
+fn repair_tail(path: &std::path::Path) -> io::Result<()> {
+    let mut file = match OpenOptions::new().read(true).write(true).open(path) {
+        Ok(file) => file,
+        Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(()),
+        Err(e) => return Err(e),
+    };
+    let original = file.metadata()?.len();
+    let mut end = original;
+    let mut bytes = [0; 1024];
+    while end != 0 {
+        let len = end.min(bytes.len() as u64) as usize;
+        let start = end - len as u64;
+        file.seek(SeekFrom::Start(start))?;
+        file.read_exact(&mut bytes[..len])?;
+        if let Some(at) = bytes[..len].iter().rposition(|b| *b == b'\n') {
+            let sealed = start + at as u64 + 1;
+            if sealed != original {
+                file.set_len(sealed)?;
+            }
+            return Ok(());
+        }
+        end = start;
+    }
+    file.set_len(0)
 }
 
 #[cfg(test)]

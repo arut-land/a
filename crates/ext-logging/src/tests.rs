@@ -1,6 +1,33 @@
 use super::*;
 
 #[test]
+fn a_restart_keeps_new_records_separate_from_a_torn_tail() {
+    let dir = std::env::temp_dir().join(format!("a-review-log-tail-{}", std::process::id()));
+    fs::create_dir_all(&dir).unwrap();
+    let path = dir.join("daemon.jsonl");
+    fs::write(&path, b"{\"unix_ms\":123,\"fact\":").unwrap();
+    let mut writer = Rotating {
+        path: path.clone(),
+        max: MAX,
+        keep: KEEP,
+        repair: None,
+    };
+    write_record(
+        &mut |line| writer.write(line),
+        Record::new(Fact::RegistryRejected),
+    )
+    .unwrap();
+    let text = fs::read_to_string(&path).unwrap();
+    fs::remove_dir_all(dir).unwrap();
+    assert!(
+        text.lines()
+            .any(|line| serde_json::from_str::<serde_json::Value>(line)
+                .is_ok_and(|record| record["fact"] == "registry_rejected")),
+        "the first post-restart record is joined to the torn tail: {text}"
+    );
+}
+
+#[test]
 fn a_stalled_writer_cannot_hold_a_producer_or_grow_the_queue() {
     let logger = Logger::new();
     // This is the consumer stopped at the worst possible instruction.
