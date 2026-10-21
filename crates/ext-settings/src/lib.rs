@@ -22,6 +22,7 @@ pub struct Settings;
 pub struct ModelChoice(pub Option<String>);
 
 impl Fold for ModelChoice {
+    const SETTINGS: bool = true;
     const NAME: &'static str = "model";
     type Change = Option<String>;
 

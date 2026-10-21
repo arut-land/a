@@ -438,6 +438,20 @@ pub(crate) fn spawn_intent(call: u64, prompt: &str) -> Json {
             .unwrap()
             .installed(),
         image: Vec::new(),
+        extensions: extensions(&ext_policy::Policy::default())
+            .unwrap()
+            .inherited()
+            .unwrap()
+            .extensions()
+            .map(|(name, _)| name.to_string())
+            .collect(),
+        settings: extensions(&ext_policy::Policy::default())
+            .unwrap()
+            .inherited()
+            .unwrap()
+            .states()
+            .settings_image()
+            .unwrap(),
         refusal: None,
     }
     .into_json()
@@ -1539,7 +1553,7 @@ fn a_fork_keeps_the_selected_recorded_environment_without_live_secrets() {
 }
 
 #[test]
-fn a_refused_child_registration_settles_the_parent_once() {
+fn invalid_child_dependencies_are_rejected_before_the_daemon_starts() {
     trait Required: Send + Sync {}
     struct Provider;
     impl Required for Provider {}
@@ -1563,15 +1577,7 @@ fn a_refused_child_registration_settles_the_parent_once() {
         ..echo()
     };
     let (root, home) = home("refused-child");
-    let daemon = Daemon::load(&home, &config).unwrap();
-    let parent = daemon.attach_to(&Target::New, || "/w".into()).unwrap();
-    let id = parent.session().id;
-    parent.session().submit("spawn hi").unwrap();
-    settle(&daemon);
-    let log = bodies(&*daemon.shared.store, id);
-    assert!(matches!(fired(&log).as_slice(), [Outcome::Failed { .. }]));
-    drop(parent);
-    drop(daemon);
+    assert!(Daemon::load(&home, &config).is_err());
     std::fs::remove_dir_all(root).unwrap();
 }
 
@@ -2001,4 +2007,170 @@ fn replay_reuses_each_named_child_and_its_own_result() {
     drop(restored);
     std::fs::remove_dir_all(root).unwrap();
     std::fs::remove_dir_all(restored_root).unwrap();
+}
+
+mod inheritance {
+    use super::*;
+    use ext::{AgentKind, Extension, Tool};
+    struct Inherited;
+    impl AgentKind for Inherited {
+        const NAME: &'static str = "inherited";
+        fn make() -> Box<dyn ext::Agent> {
+            Box::new(ext_fixtures::Echo)
+        }
+    }
+    struct Fresh;
+    impl AgentKind for Fresh {
+        const NAME: &'static str = "fresh";
+        const INHERIT: ext::Inheritance = ext::Inheritance::Except(&[ext_compact::Compact::NAME]);
+        const INHERIT_SETTINGS: bool = false;
+        fn make() -> Box<dyn ext::Agent> {
+            Box::new(ext_fixtures::Echo)
+        }
+    }
+    struct Kinds;
+    impl Extension for Kinds {
+        const NAME: &'static str = "kinds";
+        const VERSION: u32 = 1;
+        fn contribute(&self, r: &mut ext::Registrar) {
+            r.agent_kind::<Inherited>()
+                .agent_kind::<Fresh>()
+                .tool(RoleTask)
+                .provide::<dyn ext::ModelRoles>(std::sync::Arc::new(Self));
+        }
+    }
+    impl ext::ModelRoles for Kinds {
+        fn model(
+            &self,
+            role: &str,
+            states: &ext::States,
+            _: &dyn ext::Layers,
+            _: &std::path::Path,
+        ) -> Result<String, String> {
+            assert_eq!(role, "worker");
+            Ok(states
+                .get::<ext_settings::ModelChoice>()
+                .and_then(|m| m.0.clone())
+                .unwrap_or_else(|| "test:base".into()))
+        }
+    }
+    struct RoleTask;
+    impl Tool for RoleTask {
+        type In = ext::Args;
+        type Out = String;
+        const NAME: &'static str = "role_task";
+        const DESCRIPTION: &'static str = "Exercise source-declared child kinds.";
+        const REPLAY: ext::Replay = ext::Replay::Safe;
+        async fn call(&self, input: &ext::Args, cx: &ext::Cx) -> Result<String, String> {
+            let request = ext::Spawn::new::<Kinds>(
+                "role",
+                "spawn done".into(),
+                ext::Runner {
+                    agent: input.args.clone(),
+                    role: ext::ModelRole::Named("worker".into()),
+                },
+                ext::DepthBudget::new(4),
+            );
+            cx.service::<dyn ext::Sessions>()
+                .unwrap()
+                .spawn(cx, request.awaited())
+                .await
+                .map(|outcome| ext::child_result(&outcome))
+                .map_err(|e| format!("{e:?}"))
+        }
+    }
+    fn registry(config: &Config) -> Result<Registry, ext::Refused> {
+        configured(config)?
+            .with(&ext_settings::Settings)?
+            .with(&ext_compact::Compact::default())?
+            .with(&Kinds)
+    }
+    // Replacing the declaration cannot add authority to an admitted child.
+    struct ChangedKinds;
+    impl Extension for ChangedKinds {
+        const NAME: &'static str = Kinds::NAME;
+        const VERSION: u32 = 1;
+        fn contribute(&self, r: &mut ext::Registrar) {
+            r.agent(Fresh::NAME, Fresh::make)
+                .agent(Inherited::NAME, Inherited::make)
+                .provide::<dyn ext::ModelRoles>(std::sync::Arc::new(Kinds));
+        }
+    }
+
+    #[test]
+    fn settings_roles_and_frozen_child_sets_survive_reload_without_widening() {
+        let config = Config {
+            extensions: registry,
+            ..echo()
+        };
+        let (root, home) = home("kind-inheritance");
+        let daemon = Daemon::load(&home, &config).unwrap();
+        let parent = daemon.attach_to(&Target::New, || "/w".into()).unwrap();
+        parent
+            .session()
+            .submit("call model {\"args\":\"test:parent\"}")
+            .unwrap();
+        settle(&daemon);
+        for kind in [Inherited::NAME, Fresh::NAME] {
+            parent
+                .session()
+                .submit(&format!("call role_task {{\"args\":\"{kind}\"}}"))
+                .unwrap();
+            settle(&daemon);
+        }
+        let headers = daemon.shared.store.headers().unwrap();
+        let children: Vec<_> = headers.into_iter().filter(|h| h.parent.is_some()).collect();
+        assert_eq!(children.len(), 4);
+        for header in &children {
+            let log = bodies(&*daemon.shared.store, header.id);
+            let Body::Spawned { intent } = &log[0] else {
+                panic!("missing authority")
+            };
+            let frozen = crate::driver::spawn::SpawnIntent::from_json(intent).unwrap();
+            if frozen.request.agent == Fresh::NAME {
+                assert!(
+                    !frozen
+                        .extensions
+                        .iter()
+                        .any(|name| name == ext_compact::Compact::NAME)
+                );
+            }
+            if frozen.request.owner == Kinds::NAME {
+                assert_eq!(
+                    frozen.model,
+                    if frozen.request.agent == Fresh::NAME {
+                        "test:base"
+                    } else {
+                        "test:parent"
+                    }
+                );
+            }
+        }
+        drop((parent, daemon));
+        let changed = Config {
+            extensions: |c| registry(c)?.with(&ChangedKinds),
+            ..echo()
+        };
+        let daemon = Daemon::load(&home, &changed).unwrap();
+        for header in &children {
+            let attachment = daemon
+                .attach_to(&Target::Id(header.id), PathBuf::new)
+                .unwrap();
+            let log = bodies(&*daemon.shared.store, header.id);
+            let Body::Spawned { intent } = &log[0] else {
+                panic!("missing authority")
+            };
+            let intent = crate::driver::spawn::SpawnIntent::from_json(intent).unwrap();
+            if intent.request.agent == Fresh::NAME {
+                attachment.session().submit("call compact {}").unwrap();
+                settle(&daemon);
+                let log = bodies(&*daemon.shared.store, header.id);
+                assert!(log.iter().any(|body| matches!(body,
+                Body::ToolResult { outcome: Outcome::Failed { error }, .. } if error == "unknown tool compact")));
+            }
+        }
+
+        drop(daemon);
+        std::fs::remove_dir_all(root).unwrap();
+    }
 }

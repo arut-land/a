@@ -171,7 +171,16 @@ impl Text {
 }
 
 /// Makes an agent for a session.
-pub(crate) type MakeAgent = dyn Fn() -> Box<dyn Agent> + Send + Sync;
+type MakeAgent = dyn Fn() -> Box<dyn Agent> + Send + Sync;
+
+#[derive(Clone)]
+pub(crate) struct RegisteredAgent {
+    pub name: Name,
+    pub make: Arc<MakeAgent>,
+    pub inherit: crate::Inheritance,
+    pub settings: bool,
+    pub configure: fn(&mut crate::States),
+}
 
 /// A service an extension provides: an `Arc<S>` of its trait object type.
 pub(crate) struct Provided {
@@ -189,7 +198,7 @@ pub struct Registrar {
     pub(crate) states: Vec<Decl>,
     pub(crate) services: Vec<Provided>,
     pub(crate) needs: Vec<(TypeId, &'static str)>,
-    pub(crate) agents: Vec<(Name, Arc<MakeAgent>)>,
+    pub(crate) agents: Vec<RegisteredAgent>,
     pub(crate) errors: Vec<String>,
 }
 
@@ -282,6 +291,16 @@ impl Registrar {
         self.needs.push((TypeId::of::<S>(), type_name::<S>()));
     }
 
+    /// Registers a kind with its compile-time admission declaration.
+    pub fn agent_kind<K: crate::AgentKind>(&mut self) -> &mut Self {
+        self.agent(K::NAME, K::make);
+        let agent = self.agents.last_mut().expect("just registered");
+        agent.inherit = K::INHERIT;
+        agent.settings = K::INHERIT_SETTINGS;
+        agent.configure = K::settings;
+        self
+    }
+
     /// Offers an agent loop, which `make` starts for each session that
     /// runs it.
     pub fn agent(
@@ -289,9 +308,15 @@ impl Registrar {
         name: &str,
         make: impl Fn() -> Box<dyn Agent> + Send + Sync + 'static,
     ) -> &mut Self {
-        let names = self.agents.iter().map(|(n, _)| &**n);
+        let names = self.agents.iter().map(|a| &*a.name);
         self.errors.extend(twice("agent", name, names));
-        self.agents.push((Name::from(name), Arc::new(make)));
+        self.agents.push(RegisteredAgent {
+            name: Name::from(name),
+            make: Arc::new(make),
+            inherit: crate::Inheritance::All,
+            settings: true,
+            configure: |_| {},
+        });
         self
     }
 }

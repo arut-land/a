@@ -36,6 +36,8 @@ use crate::Name;
 /// ```
 pub trait Fold: Default + Serialize + DeserializeOwned + Send + 'static {
     const NAME: &'static str;
+    /// Session configuration that a child kind may inherit.
+    const SETTINGS: bool = false;
     /// What one change records.
     type Change: Serialize + DeserializeOwned;
 
@@ -68,6 +70,7 @@ type Restore = dyn Fn(&Json) -> Result<Value, String> + Send + Sync;
 #[derive(Clone)]
 pub(crate) struct Decl {
     pub name: Name,
+    settings: bool,
     pub ty: Option<TypeId>,
     make: Arc<dyn Fn() -> Value + Send + Sync>,
     fold: Arc<Apply>,
@@ -79,6 +82,7 @@ impl Decl {
     pub fn of<S: Fold>() -> Self {
         Self {
             name: Name::from(S::NAME),
+            settings: S::SETTINGS,
             ty: Some(TypeId::of::<S>()),
             make: Arc::new(|| Box::new(S::default())),
             fold: Arc::new(|state, data| {
@@ -104,6 +108,7 @@ impl Decl {
         let restore = Arc::clone(&fold);
         Self {
             name: fold.name(),
+            settings: false,
             ty: None,
             make: Arc::new(move || Box::new(initial.clone())),
             fold: Arc::new(move |state, change| {
@@ -129,6 +134,19 @@ struct Held {
     rejected: BTreeMap<Seq, String>,
 }
 
+impl Held {
+    fn image(&self) -> Result<Image, String> {
+        let image = (self.decl.image)(&*self.value)
+            .map_err(|e| format!("extension {}: encoding {}: {e}", self.ext, self.decl.name))?;
+        Ok(Image {
+            ext: self.ext.to_string(),
+            state: self.decl.name.to_string(),
+            image,
+            rejected: self.rejected.clone(),
+        })
+    }
+}
+
 /// One session's extension states.
 #[derive(Default)]
 pub struct States {
@@ -149,6 +167,58 @@ impl States {
                     rejected: BTreeMap::new(),
                 })
                 .collect(),
+        }
+    }
+
+    /// Only declared settings of registrations present in the child travel.
+    pub fn inherit_settings(&mut self, parent: &Self) -> Result<(), String> {
+        for held in &mut self.held {
+            if held.decl.settings
+                && let Some(source) = parent
+                    .held
+                    .iter()
+                    .find(|s| s.ext == held.ext && s.decl.name == held.decl.name)
+            {
+                held.value = (held.decl.restore)(&(source.decl.image)(&*source.value)?)?;
+            }
+        }
+        Ok(())
+    }
+
+    /// A child receives configuration, without conversation publications or resources.
+    pub fn settings_image(&self) -> Result<Checkpoint, String> {
+        Ok(Checkpoint {
+            folds: self
+                .held
+                .iter()
+                .filter(|h| h.decl.settings)
+                .map(Held::image)
+                .collect::<Result<_, _>>()?,
+            publications: protocol::publication::Publications::default(),
+        })
+    }
+
+    pub fn restore_settings(&mut self, image: &Checkpoint) -> Result<(), String> {
+        for setting in &image.folds {
+            let held = self
+                .held
+                .iter_mut()
+                .find(|h| h.decl.settings && *h.ext == setting.ext && *h.decl.name == setting.state)
+                .ok_or_else(|| format!("unregistered setting {}:{}", setting.ext, setting.state))?;
+            held.value = (held.decl.restore)(&setting.image)?;
+        }
+        Ok(())
+    }
+
+    /// Sets a registered setting while constructing a kind's admission image.
+    pub fn set<S: Fold>(&mut self, value: S) {
+        const { assert!(S::SETTINGS, "only settings can seed an agent kind") };
+        if let Some(held) = self
+            .held
+            .iter_mut()
+            .find(|h| h.decl.ty == Some(TypeId::of::<S>()))
+        {
+            held.value = Box::new(value);
         }
     }
 
@@ -238,17 +308,8 @@ impl States {
         let folds = self
             .held
             .iter()
-            .map(|h| {
-                let image = (h.decl.image)(&*h.value)
-                    .map_err(|e| format!("extension {}: encoding {}: {e}", h.ext, h.decl.name))?;
-                Ok(Image {
-                    ext: h.ext.to_string(),
-                    state: h.decl.name.to_string(),
-                    image,
-                    rejected: h.rejected.clone(),
-                })
-            })
-            .collect::<Result<_, String>>()?;
+            .map(Held::image)
+            .collect::<Result<_, _>>()?;
         Ok(Checkpoint {
             folds,
             publications: self.publications.clone(),

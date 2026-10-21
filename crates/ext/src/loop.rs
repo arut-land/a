@@ -234,3 +234,10 @@ impl Extension for StepLimit {
 
 #[cfg(test)]
 mod tests;
+
+impl crate::AgentKind for Loop {
+    const NAME: &'static str = LOOP;
+    fn make() -> Box<dyn Agent> {
+        Box::new(Self::default())
+    }
+}

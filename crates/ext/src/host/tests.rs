@@ -424,7 +424,7 @@ fn a_non_inheritable_extension_contributes_nothing_to_children() {
 }
 
 #[test]
-fn inheritance_refuses_a_missing_service_instead_of_weakening_the_child() {
+fn inheritance_rejects_a_missing_service_at_registration() {
     trait Required: Send + Sync {}
     struct Provider;
     impl Required for Provider {}
@@ -443,10 +443,81 @@ fn inheritance_refuses_a_missing_service_instead_of_weakening_the_child() {
         type Needs = (Need<dyn Required>, ());
         fn contribute(&self, _: &mut Registrar) {}
     }
-    let parent = Registry::default()
-        .with(&Provider)
+    assert!(
+        Registry::default()
+            .with(&Provider)
+            .unwrap()
+            .with(&Consumer)
+            .is_err()
+    );
+}
+
+#[test]
+fn a_child_never_widens_its_parents_set_and_never_beats_an_extensions_never() {
+    extension!(Kept, "kept", 1, |_r| {});
+    extension!(Dropped, "dropped", 1, |_r| {});
+    struct Never;
+    impl Extension for Never {
+        const NAME: &'static str = "never";
+        const VERSION: u32 = 1;
+        const INHERIT: bool = false;
+        fn contribute(&self, _: &mut Registrar) {}
+    }
+    let root = Registry::default()
+        .with(&Kept)
         .unwrap()
-        .with(&Consumer)
+        .with(&Dropped)
+        .unwrap()
+        .with(&Never)
         .unwrap();
-    assert!(parent.inherited().is_err());
+    let child = root
+        .select(crate::Inheritance::Except(&[Dropped::NAME]), None)
+        .unwrap();
+    let grandchild = child
+        .select(
+            crate::Inheritance::Only(&[Kept::NAME, Dropped::NAME, Never::NAME]),
+            None,
+        )
+        .unwrap();
+    assert_eq!(
+        grandchild.extensions().collect::<Vec<_>>(),
+        [(Kept::NAME, 1)]
+    );
+    let only = root
+        .select(crate::Inheritance::Only(&[Never::NAME]), None)
+        .unwrap();
+    assert_eq!(only.extensions().count(), 0);
+}
+
+#[test]
+fn a_kind_cannot_drop_a_service_its_inherited_extensions_require() {
+    trait Required: Send + Sync {}
+    struct Provider;
+    impl Required for Provider {}
+    impl Extension for Provider {
+        const NAME: &'static str = "provider";
+        const VERSION: u32 = 1;
+        fn contribute(&self, r: &mut Registrar) {
+            r.provide::<dyn Required>(Arc::new(Self));
+        }
+    }
+    struct Broken;
+    impl crate::AgentKind for Broken {
+        const NAME: &'static str = "broken";
+        const INHERIT: crate::Inheritance = crate::Inheritance::Except(&[Provider::NAME]);
+        fn make() -> Box<dyn Agent> {
+            Box::new(Loop::default())
+        }
+    }
+    extension!(
+        Consumer,
+        "consumer",
+        1,
+        needs(Need<dyn Required>, ()),
+        |r| {
+            r.agent_kind::<Broken>();
+        }
+    );
+    let result = Registry::default().with(&Provider).unwrap().with(&Consumer);
+    assert!(matches!(result, Err(Refused(why)) if why.contains("needs")));
 }

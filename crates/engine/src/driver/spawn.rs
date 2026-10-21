@@ -17,6 +17,8 @@ pub(crate) struct SpawnIntent {
     pub routing: Result<crate::model::FrozenRoute, String>,
     pub installed: Vec<protocol::Installed>,
     pub image: Vec<Json>,
+    pub extensions: Vec<String>,
+    pub settings: ext::Checkpoint,
     pub refusal: Option<SpawnRefusal>,
 }
 
@@ -96,6 +98,8 @@ impl SpawnIntent {
                 self.routing,
                 self.installed,
                 self.refusal,
+                self.extensions,
+                self.settings,
             ))?,
             image: self.image,
         }
@@ -104,8 +108,18 @@ impl SpawnIntent {
 
     pub(crate) fn from_json(json: &Json) -> Result<Self, serde_json::Error> {
         let image = protocol::publication::SpawnImage::from_json(json)?;
-        let (awaited, admitted_at, call, request, model, routing, installed, refusal) =
-            image.authority.parse()?;
+        let (
+            awaited,
+            admitted_at,
+            call,
+            request,
+            model,
+            routing,
+            installed,
+            refusal,
+            extensions,
+            settings,
+        ) = image.authority.parse()?;
         Ok(Self {
             awaited,
             admitted_at,
@@ -115,6 +129,8 @@ impl SpawnIntent {
             routing,
             installed,
             image: image.image,
+            extensions,
+            settings,
             refusal,
         })
     }
@@ -237,6 +253,39 @@ impl Actor {
             .cloned()
     }
 
+    fn child_model(
+        &self,
+        role: &ext::ModelRole,
+        child: &Registry,
+        states: &ext::States,
+        inherit_settings: bool,
+    ) -> Result<String, String> {
+        let session = &self.live.session;
+        let layers = &session.shared.models.settings;
+        match role {
+            ext::ModelRole::Named(role) => child
+                .service::<dyn ext::ModelRoles>()
+                .ok_or_else(|| format!("no model service resolves role {role}"))
+                .and_then(|roles| roles.model(role, states, layers, &session.workspace)),
+            role if inherit_settings => session.role_model(role),
+            role => {
+                let base = || match child.service::<dyn ext::ModelSpec>() {
+                    Some(spec) => spec
+                        .model(states, layers, &session.workspace)
+                        .map(|(m, _)| m),
+                    None => ext::Layers::model(layers, &session.workspace).map(|(m, _)| m),
+                };
+                if matches!(role, ext::ModelRole::Fast) {
+                    layers
+                        .fast_model(&session.workspace)
+                        .and_then(|m| m.map_or_else(base, Ok))
+                } else {
+                    base()
+                }
+            }
+        }
+    }
+
     fn freeze_spawn(&self, call: CallId, mut request: ext::Spawn, awaited: bool) -> SpawnIntent {
         let allowance = lock(&self.live.session.spawn)
             .as_ref()
@@ -244,32 +293,42 @@ impl Actor {
         let depth = request.depth.intersect(allowance).descend();
         let mut refusal = depth.as_ref().err().cloned();
         request.depth = depth.unwrap_or(DepthBudget::new(0));
-        match self.registry.inherited() {
-            Err(e) => refusal = Some(SpawnRefusal::Unavailable(e.to_string())),
-            Ok(registry) if !registry.agents().any(|a| a == request.runner.agent) => {
-                refusal = Some(SpawnRefusal::Unavailable(format!(
-                    "unknown child agent {}",
-                    request.runner.agent
-                )));
-            }
-            Ok(_) => {}
+        let kind = self.registry.kind(&request.runner.agent);
+        let (inherit, inherit_settings) = kind.unwrap_or_default();
+        if kind.is_none() {
+            refusal = Some(SpawnRefusal::Unavailable(format!(
+                "unknown child agent {}",
+                request.runner.agent
+            )));
         }
+        let child = self.registry.select(inherit, None);
+        if let Err(error) = &child {
+            refusal = Some(SpawnRefusal::Unavailable(error.to_string()));
+        }
+        let child = child.unwrap_or_default();
+        if !child.agents().any(|name| name == request.runner.agent) {
+            refusal = Some(SpawnRefusal::Unavailable(format!(
+                "agent {} is not inheritable",
+                request.runner.agent
+            )));
+        }
+        let extensions = child
+            .extensions()
+            .map(|(name, _)| name.to_string())
+            .collect();
+        let mut states = child.states();
         let session = &self.live.session;
-        let selected = match &request.runner.role {
-            ext::ModelRole::Named(role) => self
-                .registry
-                .service::<dyn ext::ModelRoles>()
-                .ok_or_else(|| format!("no model service resolves role {role}"))
-                .and_then(|roles| {
-                    roles.model(
-                        role,
-                        &lock(&session.state_view()),
-                        &session.shared.models.settings,
-                        &session.workspace,
-                    )
-                }),
-            role => session.role_model(role),
-        };
+        if inherit_settings
+            && let Err(error) = states.inherit_settings(&lock(&session.state_view()))
+        {
+            refusal = Some(SpawnRefusal::Unavailable(error));
+        }
+        child.kind_settings(&request.runner.agent, &mut states);
+        let settings = states.settings_image().unwrap_or_else(|error| {
+            refusal = Some(SpawnRefusal::Unavailable(error));
+            ext::Checkpoint::default()
+        });
+        let selected = self.child_model(&request.runner.role, &child, &states, inherit_settings);
         if matches!(request.runner.role, ext::ModelRole::Named(_))
             && let Err(error) = &selected
         {
@@ -283,7 +342,7 @@ impl Actor {
             .model(&session.workspace, env.as_deref(), &model)
             .map(|m| m.freeze());
         let mut image = Vec::new();
-        let mut installed = self.registry.installed();
+        let installed = self.registry.installed();
         if let ext::ContextSource::Prefix { session, seq } = request.context {
             if session != self.live.id || seq.get() > self.ordered_seq {
                 refusal = Some(SpawnRefusal::Unavailable(
@@ -301,12 +360,6 @@ impl Actor {
                     )
                     .filter(|e| e.seq <= seq)
                     .collect();
-                if let Some(source) = entries.iter().rev().find_map(|e| match &e.body {
-                    Body::Extensions { installed } => Some(installed),
-                    _ => None,
-                }) {
-                    installed.clone_from(source);
-                }
                 image = crate::transcript::context_image(&entries);
             }
         }
@@ -319,6 +372,8 @@ impl Actor {
             routing,
             installed,
             image,
+            extensions,
+            settings,
             refusal,
         }
     }
@@ -458,9 +513,32 @@ pub(super) fn restore(
         }
     };
     let registry = if header.parent.is_some() {
-        Arc::new(registry.inherited().map_err(io::Error::other)?)
+        Arc::new(
+            registry
+                .select(
+                    ext::Inheritance::All,
+                    image.as_ref().map(|i| i.extensions.as_slice()),
+                )
+                .map_err(io::Error::other)?,
+        )
     } else {
         registry
     };
+    if let Some(image) = &image {
+        registry
+            .states()
+            .restore_settings(&image.settings)
+            .map_err(io::Error::other)?;
+        let names: Vec<_> = registry.extensions().map(|(name, _)| name).collect();
+        if names
+            != image
+                .extensions
+                .iter()
+                .map(String::as_str)
+                .collect::<Vec<_>>()
+        {
+            return Err(io::Error::other("frozen child registrations differ"));
+        }
+    }
     Ok((registry, image))
 }

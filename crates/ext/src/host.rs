@@ -10,7 +10,7 @@ use std::sync::{Arc, Mutex, OnceLock, PoisonError, Weak};
 
 use protocol::{Audience, CallId, Card, Environment, Installed, Json, Outcome, Seq, SessionId};
 
-use crate::ext::MakeAgent;
+use crate::ext::RegisteredAgent;
 use crate::point::{Approving, Asked, Failed, Later, Stepped, View};
 use crate::state::States;
 use crate::{
@@ -162,7 +162,7 @@ pub struct Registry {
     tools: Toolset,
     hooks: Hooks,
     texts: Vec<Text>,
-    agents: Vec<(Name, Arc<MakeAgent>)>,
+    agents: Vec<RegisteredAgent>,
     /// What every model call on this generation sends, made on first use:
     /// a registry never changes once built, so neither do they.
     prompt: OnceLock<String>,
@@ -185,12 +185,45 @@ impl Clone for Registry {
 impl Registry {
     /// Selects complete registrations, then validates the remaining service graph.
     pub fn inherited(&self) -> Result<Self, Refused> {
+        self.select(crate::Inheritance::All, None)
+    }
+
+    pub fn kind(&self, name: &str) -> Option<(crate::Inheritance, bool)> {
+        if !self.agents().any(|agent| agent == name) {
+            return None;
+        }
+        Some(
+            self.agents
+                .iter()
+                .find(|agent| &*agent.name == name)
+                .map_or((crate::Inheritance::All, true), |agent| {
+                    (agent.inherit, agent.settings)
+                }),
+        )
+    }
+
+    pub fn kind_settings(&self, name: &str, states: &mut States) {
+        if let Some(agent) = self.agents.iter().find(|agent| &*agent.name == name) {
+            (agent.configure)(states);
+        }
+    }
+
+    /// Intersects authority with this generation; excluded registrations cannot return.
+    pub fn select(
+        &self,
+        inherit: crate::Inheritance,
+        frozen: Option<&[String]>,
+    ) -> Result<Self, Refused> {
         let mut registry = Self {
             source_manifest: Some(self.installed()),
             installed: self
                 .installed
                 .iter()
-                .filter(|i| i.inherit)
+                .filter(|i| {
+                    i.inherit
+                        && inherit.includes(&i.name)
+                        && frozen.is_none_or(|names| names.iter().any(|n| n == &*i.name))
+                })
                 .cloned()
                 .collect(),
             ..Self::default()
@@ -284,6 +317,16 @@ impl Registry {
             }
         }
         self.rebuild();
+        let inheritable = self.inherited()?;
+        for agent in &inheritable.agents {
+            let child = self.select(agent.inherit, None)?;
+            if !child.agents().any(|name| name == &*agent.name) {
+                return Err(Refused(format!(
+                    "agent kind {} excludes its own registration",
+                    agent.name
+                )));
+            }
+        }
         Ok(self)
     }
 
@@ -324,7 +367,7 @@ impl Registry {
                 replace(
                     &mut agents,
                     (by(), agent.clone()),
-                    |a| &a.1.0,
+                    |a| &a.1.name,
                     "agent",
                     warn,
                 );
@@ -369,14 +412,14 @@ impl Registry {
     /// is reported, and the default runs instead.
     pub fn agent(&self, name: Option<&str>) -> Box<dyn Agent> {
         let named = name.filter(|&n| n != crate::LOOP).and_then(|name| {
-            let named = self.agents.iter().find(|(n, _)| &**n == name);
+            let named = self.agents.iter().find(|a| &*a.name == name);
             if named.is_none() {
                 eprintln!("warning: no agent named {name} is registered");
             }
             named
         });
         match named {
-            Some((_, make)) => make(),
+            Some(agent) => (agent.make)(),
             None => Box::new(Loop::default()),
         }
     }
@@ -384,7 +427,7 @@ impl Registry {
     /// The names of the agents sessions can run: the default loop's, then
     /// the extensions'.
     pub fn agents(&self) -> impl Iterator<Item = &str> + '_ {
-        std::iter::once(crate::LOOP).chain(self.agents.iter().map(|(name, _)| &**name))
+        std::iter::once(crate::LOOP).chain(self.agents.iter().map(|agent| &*agent.name))
     }
 
     /// Service `S`, if an extension provides it.

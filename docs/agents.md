@@ -88,25 +88,43 @@ explicitly inheritable state is restored into the child.
 
 ## Inheritance
 
-`Extension::INHERIT` is an associated const, defaulting to `true`.
-The erased extension trait exposes that declaration for runtime assemblies.
-The recorded installation manifest retains the complete source generation so
-layered loaders can restore it before applying the child filter. This is
-restoration metadata, not a declaration that excluded handlers execute.
-Filtering operates on whole registrations: tools, client callables, hooks,
-text, folds, services and agents travel together. There is no per-feature
-list in the engine. A child registry is rebuilt and its service requirements
-validated after filtering. Missing requirements refuse admission; they never
-silently disable a policy. Static assemblies can additionally reject an
-inheritable dependent of a root-only provider with trait bounds.
+Inheritance is the intersection of two source declarations:
+`Extension::INHERIT` (default `true`) and the selected `AgentKind::INHERIT`
+(default `Inheritance::All`). A kind declares `Except(&[Compact::NAME,
+Title::NAME])` or `Only(&[Shell::NAME, ...])` using extension type constants.
+`Registrar::agent_kind::<K>()` registers the kind's factory and declaration
+together. Ordinary erased registrations, including Lua agents, use the default.
+`Loop` is the default Rust kind. The model selects a kind by name; neither
+`Spawn` nor the task tool arguments contain inheritance options.
 
-Inheritance selects registrations, not mutable parent state. Each child has
-fresh folds and resources. Context publications and generation images come
-from the selected prefix, while transport connections and cancellation scopes
-are newly owned. A registry generation remains pinned during admission and
-execution; reload adoption must reapply the child filter. Root-only extensions
-must not reappear on recovery or reload. Dynamic extension images carry their
-inheritance declaration and are validated on restoration.
+An extension's `false` always wins, including over `Only`. Selection operates
+on the parent's effective registrations, so recursion cannot regain an excluded
+extension. Tools, client callables, hooks, text, folds, services and agents travel
+together. Registration validates both the default child service graph and every
+registered kind's graph; dropping a provider while retaining its dependent is a
+startup error. A kind must retain the registration supplying its agent factory.
+There is no per-feature list in the engine.
+
+`AgentKind::INHERIT_SETTINGS` defaults to `true`. Folds opt into the session
+settings layer with `Fold::SETTINGS`: model overrides and policy mode do so.
+Each child starts with fresh resources and conversation folds, copies only
+settings belonging to its selected registrations when enabled, then applies the
+kind's source-defined `settings` layer. A kind can seed registered settings with
+`States::set`; seeding a non-setting does not compile. Disabling inheritance
+resolves model roles against fresh settings instead of the parent's overrides.
+The daemon's configured base layers and operator policy remain in force.
+
+Admission records the resolved extension names, settings image, model and route
+in the spawn intent. The complete source generation manifest remains restoration
+metadata for layered loaders, including Lua: excluded handlers never execute.
+Restoration applies the frozen set, rather than rerunning a potentially changed
+kind declaration, and validates its settings and service graph. Child generations
+stay pinned; reload cannot widen their authority.
+
+The `task` tool retains the current kind by default; its optional `kind` selects
+a registered kind. `reviewer` is a source-declared example: it excludes
+`Compact`, starts with fresh settings, and adds a policy layer denying tool calls.
+It reviews the supplied prompt or `fork_task` context without tool side effects.
 
 ## Durable lifecycle
 

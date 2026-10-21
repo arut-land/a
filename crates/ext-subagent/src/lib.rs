@@ -7,7 +7,7 @@ use ext::{
     Concurrency, Configured, Cx, Extension, Json, Refused, Registrar, Replay, Schema, Sessions,
     Table, Text, Tool,
 };
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 
 /// The `subagent` extension.
 pub struct Subagent;
@@ -23,6 +23,15 @@ impl Extension for Subagent {
     const VERSION: u32 = 1;
 
     fn contribute(&self, r: &mut Registrar) {
+        r.agent_kind::<Reviewer>()
+            .fold::<ReviewPolicy>()
+            .on::<ext::point::Permission>(|cx, _| {
+                if cx.state(|policy: &ReviewPolicy| policy.0) {
+                    protocol::Permission::Deny
+                } else {
+                    protocol::Permission::Allow
+                }
+            });
         r.provide::<dyn ext::InboxAccess>(std::sync::Arc::new(Self));
         r.tool(Task).tool(ForkTask).tool(BackgroundTask).text(Text::system("task", 30, "`task` hands a self-contained piece of work to a fresh session, which sees nothing of this conversation: say all it needs in `prompt`. It answers with what that session ended with.").for_tool(Task::NAME));
     }
@@ -35,6 +44,8 @@ pub struct Task;
 pub struct Prompt {
     /// The work, said in full.
     pub prompt: String,
+    /// Optional agent kind; omission keeps the current kind.
+    pub kind: Option<String>,
 }
 
 impl Tool for Task {
@@ -100,7 +111,13 @@ async fn awaited_task(
     let mut spawn = ext::Spawn::new::<Subagent>(
         purpose,
         input.prompt.clone(),
-        sessions.runner(),
+        ext::Runner {
+            agent: input
+                .kind
+                .clone()
+                .unwrap_or_else(|| sessions.runner().agent),
+            role: ext::ModelRole::Session,
+        },
         ext::DepthBudget::new(8),
     );
     spawn.context = context;
@@ -166,5 +183,84 @@ impl ext::InboxAccess for Subagent {
         children: &[protocol::SessionId],
     ) -> bool {
         parent == Some(destination) || children.contains(&destination)
+    }
+}
+
+/// Reviews supplied context without compaction or tool side effects.
+pub struct Reviewer;
+impl ext::AgentKind for Reviewer {
+    const NAME: &'static str = "reviewer";
+    const INHERIT: ext::Inheritance = ext::Inheritance::Except(&[ext_compact::Compact::NAME]);
+    const INHERIT_SETTINGS: bool = false;
+    fn settings(states: &mut ext::States) {
+        states.set(ReviewPolicy(true));
+    }
+    fn make() -> Box<dyn ext::Agent> {
+        Box::new(ext::Loop::default())
+    }
+}
+
+#[derive(Default, Serialize, Deserialize)]
+struct ReviewPolicy(bool);
+impl ext::Fold for ReviewPolicy {
+    const NAME: &'static str = "review-policy";
+    const SETTINGS: bool = true;
+    type Change = bool;
+    fn apply(&mut self, value: &bool) {
+        self.0 = *value;
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use ext::AgentKind;
+    use ext::host::Registry;
+    use ext::point::{PointCx, View};
+
+    struct Settings(std::sync::Mutex<ext::States>);
+    impl View for Settings {
+        fn session(&self) -> protocol::SessionId {
+            protocol::SessionId::new()
+        }
+        fn workspace(&self) -> &std::path::Path {
+            std::path::Path::new("/w")
+        }
+        fn model(&self) -> String {
+            String::new()
+        }
+        fn states(&self, read: &mut dyn FnMut(&ext::States)) {
+            read(&self.0.lock().unwrap());
+        }
+    }
+
+    #[test]
+    fn reviewer_policy_survives_its_settings_image_and_cannot_allow_tool_effects() {
+        let root = Registry::default()
+            .with(&ext_compact::Compact::default())
+            .unwrap()
+            .with(&Subagent)
+            .unwrap();
+        let child = root.select(Reviewer::INHERIT, None).unwrap();
+        assert!(child.tools().get("compact").is_none());
+        let mut states = child.states();
+        child.kind_settings(Reviewer::NAME, &mut states);
+        let image = Json::encode(&states.settings_image().unwrap()).unwrap();
+        let mut restored = child.states();
+        restored.restore_settings(&image.parse().unwrap()).unwrap();
+        let view = Settings(std::sync::Mutex::new(restored));
+        let denied = child
+            .hooks()
+            .gate(&PointCx::new(&view), "bash", &Json::null())
+            .now()
+            .unwrap();
+        assert!(matches!(denied.gate, ext::Gate::Refuse(_)));
+        let root_view = Settings(std::sync::Mutex::new(root.states()));
+        let allowed = root
+            .hooks()
+            .gate(&PointCx::new(&root_view), "bash", &Json::null())
+            .now()
+            .unwrap();
+        assert_eq!(allowed.gate, ext::Gate::Run);
     }
 }

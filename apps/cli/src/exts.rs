@@ -252,7 +252,10 @@ mod tests {
                 ("title", 2)
             ]
         );
-        assert_eq!(registry.agents().collect::<Vec<_>>(), [ext::LOOP]);
+        assert_eq!(
+            registry.agents().collect::<Vec<_>>(),
+            [ext::LOOP, "reviewer"]
+        );
 
         let mut decided = Decided::new();
         assert_eq!(gate(&registry, "bash", &mut decided), Gate::Ask);
@@ -344,7 +347,11 @@ mod tests {
             assert!(after.iter().all(|p| before.contains(p)), "{name}");
             assert_eq!(before.len() - after.len(), texts_of, "{name}");
             // The default loop is always there.
-            assert_eq!(rest.agents().count(), 1, "{name}");
+            assert_eq!(
+                rest.agents().count(),
+                if name == "subagent" { 1 } else { 2 },
+                "{name}"
+            );
             let facts = Facts {
                 workspace: Path::new("/w"),
                 dir: Path::new("/w"),
@@ -406,7 +413,10 @@ mod tests {
         // Only the echo agent brings the fixtures.
         let shipped = super::registry(&config(&[], None)).unwrap();
         assert!(shipped.tools().get("sleep").is_none());
-        assert_eq!(shipped.agents().collect::<Vec<_>>(), [ext::LOOP]);
+        assert_eq!(
+            shipped.agents().collect::<Vec<_>>(),
+            [ext::LOOP, "reviewer"]
+        );
     }
 
     /// Every kind of model failure there is.

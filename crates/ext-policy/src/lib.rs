@@ -54,6 +54,7 @@ impl Mode {
 pub struct ModeState(pub Option<Mode>);
 
 impl Fold for ModeState {
+    const SETTINGS: bool = true;
     const NAME: &'static str = "mode";
     type Change = Mode;
 

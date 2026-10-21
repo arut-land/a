@@ -81,3 +81,33 @@ pub fn actions_from_json(json: &Json) -> Result<Actions, String> {
         .map(Into::into)
         .map_err(|error| error.to_string())
 }
+
+/// Developer-owned admission policy for an agent kind. Names are constants
+/// from extension types, for example `Except(&[Compact::NAME, Title::NAME])`.
+#[derive(Clone, Copy, Debug, Default)]
+pub enum Inheritance {
+    #[default]
+    All,
+    Except(&'static [&'static str]),
+    Only(&'static [&'static str]),
+}
+
+impl Inheritance {
+    pub fn includes(self, name: &str) -> bool {
+        match self {
+            Self::All => true,
+            Self::Except(names) => !names.contains(&name),
+            Self::Only(names) => names.contains(&name),
+        }
+    }
+}
+
+/// A source declaration, never part of a model's spawn arguments.
+pub trait AgentKind: Send + Sync + 'static {
+    const NAME: &'static str;
+    const INHERIT: Inheritance = Inheritance::All;
+    const INHERIT_SETTINGS: bool = true;
+    /// Adds a kind's settings layer after inherited settings, before admission.
+    fn settings(_states: &mut crate::States) {}
+    fn make() -> Box<dyn Agent>;
+}

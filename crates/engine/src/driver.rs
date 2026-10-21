@@ -807,6 +807,12 @@ impl Folding {
     }
 
     fn fold(&mut self, e: &Entry) {
+        if let Body::Spawned { intent } = &e.body {
+            let image = spawn::SpawnIntent::from_json(intent).expect("admitted spawn intent");
+            self.states
+                .restore_settings(&image.settings)
+                .expect("admitted settings image");
+        }
         self.states.apply(e);
         self.has_input |= matches!(e.body, Body::Input { .. });
         self.core.load(e);
@@ -989,7 +995,13 @@ impl Actor {
             .as_ref()
             .map_or_else(|| shared.registry.get(), |source| source.registry());
         if self.live.parent.is_some() {
-            newest.inherited().map(Arc::new)
+            let spawn = lock(&self.live.session.spawn);
+            newest
+                .select(
+                    ext::Inheritance::All,
+                    spawn.as_ref().map(|i| i.extensions.as_slice()),
+                )
+                .map(Arc::new)
         } else {
             Ok(newest)
         }

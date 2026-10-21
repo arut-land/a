@@ -788,6 +788,7 @@ name = "ext-subagent"
 version = "0.0.0"
 dependencies = [
  "ext",
+ "ext-compact",
  "llm",
  "protocol",
  "serde",
