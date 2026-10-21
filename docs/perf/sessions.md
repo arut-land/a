@@ -336,3 +336,21 @@ These guarantees target local NTFS with storage that honors flush requests.
 Crash/restart tests establish logical recovery, not persistence under power
 loss. Native Windows CI must execute rename/error handling and new-log tests;
 physical power-cut verification requires a suitable filesystem/storage host.
+
+## Composable spawn authority codecs
+
+On the shared development machine, `CARGO_BUILD_JOBS=3 mise run size`
+measured 3559 KiB before the independent-review fixes and 3527 KiB after
+those fixes and the codec reduction, before merging approval explanations.
+Both measurements use the same shipped release task; no timing claims are
+made under concurrent worktree load.
+
+The persisted authority uses tuples for admitted request fields and frozen
+routing, rather than decoding the public SDK request and its unresolved runner
+and context enums. The protocol owns one image-envelope decoder, shared by the
+transcript and publication reducers; engine authority remains opaque there.
+Awaited fresh and prefix tools share their async body, and prefix capture uses
+sequence keys for both sets. The net reduction is 32 KiB despite the added
+recovery and Lua inheritance logic. This is a shipped-binary comparison, not a
+claim that all 21.6 KiB attributed to the former spawn codecs disappeared.
+No dependencies were added.

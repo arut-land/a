@@ -2287,7 +2287,7 @@ impl Actor {
             .links()
             .iter()
             .rev()
-            .filter_map(|l| l.intent.parse::<spawn::SpawnIntent>().ok())
+            .filter_map(|l| spawn::SpawnIntent::from_json(&l.intent).ok())
             .find(|i| i.call == call)
             .and_then(|i| i.refusal);
         let value = refusal.map_or(value, |r| {
@@ -2336,8 +2336,7 @@ impl Actor {
         if let Some(daemon) = shared.daemon.upgrade() {
             let parent = self.live.id;
             shared.rt.spawn(Box::pin(async move {
-                let refusal = intent
-                    .parse::<spawn::SpawnIntent>()
+                let refusal = spawn::SpawnIntent::from_json(&intent)
                     .ok()
                     .and_then(|i| i.refusal);
                 let result = if cancel.is_set() {
@@ -3008,7 +3007,7 @@ fn bind(registry: &Arc<Registry>, session: &Arc<Session>) -> Arc<Bound<Viewed>> 
     let settings = &session.shared.models.settings;
     let agent = lock(&session.spawn)
         .as_ref()
-        .map(|i| i.request.runner.agent.clone())
+        .map(|i| i.request.agent.clone())
         .or_else(|| settings.agent(&session.workspace));
     let viewed = Arc::new(Viewed {
         session: Arc::clone(session),

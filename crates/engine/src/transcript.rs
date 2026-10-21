@@ -52,17 +52,31 @@ enum ContextFact<'a> {
 fn context_fact(body: &Body) -> Option<ContextFact<'_>> {
     Some(match body {
         Body::Spawned { intent } => ContextFact::Inherited(intent),
-        Body::Input { text, taken: true, .. }
-        | Body::Decision { d: Verdict::OnStop { text }, .. } => ContextFact::User(text),
+        Body::Input {
+            text, taken: true, ..
+        }
+        | Body::Decision {
+            d: Verdict::OnStop { text },
+            ..
+        } => ContextFact::User(text),
         Body::Input { text, .. } => ContextFact::Queued(text),
         Body::Enqueue { envelope } => ContextFact::Queued(&envelope.payload),
         Body::Take { input } => ContextFact::Taken(*input),
         Body::Assistant { text } => ContextFact::Assistant(text),
         Body::Context { text, .. } => ContextFact::Context(text),
         Body::Fired { outcome, .. } => ContextFact::Child(outcome),
-        Body::ModelResult { r#for: None, outcome: Outcome::Done { output }, .. } => ContextFact::Reply(output),
-        Body::ToolCall { tool, id: Some(id), .. } => ContextFact::ToolCall { id, tool },
-        Body::ToolResult { call, outcome, .. } => ContextFact::ToolResult { call: *call, outcome },
+        Body::ModelResult {
+            r#for: None,
+            outcome: Outcome::Done { output },
+            ..
+        } => ContextFact::Reply(output),
+        Body::ToolCall {
+            tool, id: Some(id), ..
+        } => ContextFact::ToolCall { id, tool },
+        Body::ToolResult { call, outcome, .. } => ContextFact::ToolResult {
+            call: *call,
+            outcome,
+        },
         Body::Edit { .. } => ContextFact::Edit,
         _ => return None,
     })
@@ -113,11 +127,7 @@ impl Transcript {
     pub fn apply(&mut self, e: &Entry, fresh: Option<Assistant>) {
         let message = match context_fact(&e.body) {
             Some(ContextFact::Inherited(intent)) => {
-                #[derive(serde::Deserialize)]
-                struct Image {
-                    image: Vec<protocol::Json>,
-                }
-                if let Ok(image) = intent.parse::<Image>() {
+                if let Ok(image) = protocol::publication::SpawnImage::from_json(intent) {
                     let entries = image
                         .image
                         .iter()
@@ -160,7 +170,8 @@ impl Transcript {
                 }
             }
             Some(ContextFact::ToolCall { id, tool }) => {
-                self.calls.insert(CallId(e.seq), (id.to_owned(), tool.to_owned()));
+                self.calls
+                    .insert(CallId(e.seq), (id.to_owned(), tool.to_owned()));
                 return;
             }
             Some(ContextFact::ToolResult { call, outcome }) => {
@@ -318,6 +329,13 @@ pub(crate) fn context_image(entries: &[Entry]) -> Vec<protocol::Json> {
 mod tests {
     use super::*;
     use protocol::{Epoch, Json, Mode, SessionId};
+    fn spawn_image(image: Vec<Json>) -> Json {
+        let intent = crate::tests::spawn_intent(1, "");
+        let mut intent = crate::driver::spawn::SpawnIntent::from_json(&intent).unwrap();
+        intent.image = image;
+        intent.into_json().unwrap()
+    }
+
     #[test]
     fn a_prefix_preserves_on_stop_context() {
         let entries = [entry(
@@ -333,7 +351,7 @@ mod tests {
         let registry = Arc::new(Registry::default());
         let expected = Transcript::of(&entries, registry.clone(), "").into_context();
         let image = context_image(&entries);
-        let intent = Json::encode(&serde_json::json!({"image": image})).unwrap();
+        let intent = spawn_image(image);
         let actual =
             Transcript::of([entry(1, Body::Spawned { intent })], registry, "").into_messages();
         assert_eq!(actual, expected);
@@ -408,7 +426,7 @@ mod tests {
         );
         let registry = Arc::new(Registry::default());
         let expected = Transcript::of(&entries, registry.clone(), "").into_context();
-        let intent = Json::encode(&serde_json::json!({"image": image})).unwrap();
+        let intent = spawn_image(image);
         let child = [entry(1, Body::Spawned { intent })];
         let actual = Transcript::of(&child, registry, "").into_messages();
         assert_eq!(actual, expected);
@@ -497,7 +515,7 @@ mod tests {
             ),
         ];
         let image = context_image(&entries);
-        let intent = Json::encode(&serde_json::json!({"image":image})).unwrap();
+        let intent = spawn_image(image);
         let messages = Transcript::of(
             [entry(1, Body::Spawned { intent })],
             Arc::new(Registry::default()),

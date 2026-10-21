@@ -700,9 +700,7 @@ impl Daemon {
         env: Option<Arc<Environment>>,
         intent: Json,
     ) -> io::Result<()> {
-        let admitted = intent
-            .parse::<driver::spawn::SpawnIntent>()
-            .map_err(io::Error::other)?;
+        let admitted = driver::spawn::SpawnIntent::from_json(&intent).map_err(io::Error::other)?;
         let mut budget = admitted.request.budget;
         budget.timeout = budget
             .timeout

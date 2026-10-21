@@ -7,17 +7,117 @@ use crate::store::Header;
 use ext::{DepthBudget, SpawnRefusal};
 use std::io;
 
-#[derive(Clone, Serialize, Deserialize)]
+#[derive(Clone)]
 pub(crate) struct SpawnIntent {
     pub awaited: bool,
     pub admitted_at: std::time::SystemTime,
     pub call: CallId,
-    pub request: ext::Spawn,
+    pub request: SpawnAuthority,
     pub model: String,
     pub routing: Result<crate::model::FrozenRoute, String>,
     pub installed: Vec<protocol::Installed>,
     pub image: Vec<Json>,
     pub refusal: Option<SpawnRefusal>,
+}
+
+/// The admitted authority needs no request codec or unresolved runner machinery.
+#[derive(Clone)]
+pub(crate) struct SpawnAuthority {
+    pub owner: String,
+    pub purpose: String,
+    pub prompt: String,
+    pub prefix: Option<(SessionId, protocol::Seq)>,
+    pub agent: String,
+    pub role: Json,
+    pub depth: DepthBudget,
+    pub budget: ext::Budget,
+}
+
+impl From<ext::Spawn> for SpawnAuthority {
+    fn from(request: ext::Spawn) -> Self {
+        Self {
+            owner: request.owner().into(),
+            purpose: request.purpose,
+            prompt: request.prompt,
+            prefix: match request.context {
+                ext::ContextSource::Fresh => None,
+                ext::ContextSource::Prefix { session, seq } => Some((session, seq)),
+            },
+            agent: request.runner.agent,
+            role: Json::encode(&request.runner.role).expect("model role encodes"),
+            depth: request.depth,
+            budget: request.budget,
+        }
+    }
+}
+
+impl Serialize for SpawnAuthority {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        (
+            &self.owner,
+            &self.purpose,
+            &self.prompt,
+            &self.prefix,
+            &self.agent,
+            &self.role,
+            self.depth,
+            self.budget,
+        )
+            .serialize(serializer)
+    }
+}
+
+impl<'de> Deserialize<'de> for SpawnAuthority {
+    fn deserialize<D: serde::Deserializer<'de>>(decoder: D) -> Result<Self, D::Error> {
+        let (owner, purpose, prompt, prefix, agent, role, depth, budget) =
+            Deserialize::deserialize(decoder)?;
+        Ok(Self {
+            owner,
+            purpose,
+            prompt,
+            prefix,
+            agent,
+            role,
+            depth,
+            budget,
+        })
+    }
+}
+
+impl SpawnIntent {
+    pub(crate) fn into_json(self) -> Result<Json, serde_json::Error> {
+        protocol::publication::SpawnImage {
+            authority: Json::encode(&(
+                self.awaited,
+                self.admitted_at,
+                self.call,
+                self.request,
+                self.model,
+                self.routing,
+                self.installed,
+                self.refusal,
+            ))?,
+            image: self.image,
+        }
+        .to_json()
+    }
+
+    pub(crate) fn from_json(json: &Json) -> Result<Self, serde_json::Error> {
+        let image = protocol::publication::SpawnImage::from_json(json)?;
+        let (awaited, admitted_at, call, request, model, routing, installed, refusal) =
+            image.authority.parse()?;
+        Ok(Self {
+            awaited,
+            admitted_at,
+            call,
+            request,
+            model,
+            routing,
+            installed,
+            image: image.image,
+            refusal,
+        })
+    }
 }
 
 pub(super) enum SpawnReply {
@@ -37,9 +137,7 @@ impl Actor {
         match reply {
             SpawnReply::Detached(reply) => {
                 if let Some(link) = previous {
-                    let refusal = link
-                        .intent
-                        .parse::<SpawnIntent>()
+                    let refusal = SpawnIntent::from_json(&link.intent)
                         .ok()
                         .and_then(|i| i.refusal);
                     reply.send(refusal.map_or(
@@ -79,9 +177,7 @@ impl Actor {
                         })
                     });
                     if let Some(outcome) = outcome {
-                        let refusal = link
-                            .intent
-                            .parse::<SpawnIntent>()
+                        let refusal = SpawnIntent::from_json(&link.intent)
                             .ok()
                             .and_then(|i| i.refusal);
                         let value = refusal.map_or_else(
@@ -113,7 +209,7 @@ impl Actor {
 
         let frozen = self.freeze_spawn(call, request, awaited);
         let input = frozen.request.prompt.clone();
-        let intent = Json::encode(&frozen).expect("spawn intent encodes");
+        let intent = frozen.into_json().expect("spawn intent encodes");
         let child = SessionId::new();
         if !awaited {
             self.detached.last_mut().unwrap().0 = child;
@@ -132,9 +228,9 @@ impl Actor {
             .links()
             .iter()
             .find(|link| {
-                link.intent.parse::<SpawnIntent>().is_ok_and(|i| {
+                SpawnIntent::from_json(&link.intent).is_ok_and(|i| {
                     i.call == call
-                        && i.request.owner() == request.owner()
+                        && i.request.owner == request.owner()
                         && i.request.purpose == request.purpose
                 })
             })
@@ -218,7 +314,7 @@ impl Actor {
             awaited,
             admitted_at: std::time::SystemTime::now(),
             call,
-            request,
+            request: request.into(),
             model,
             routing,
             installed,
@@ -265,7 +361,7 @@ impl ext::Sessions for Own {
             .and_then(|s| {
                 lock(&s.spawn)
                     .as_ref()
-                    .map(|i| i.request.runner.agent.clone())
+                    .map(|i| i.request.agent.clone())
                     .or_else(|| s.shared.models.settings.agent(&s.workspace))
             })
             .unwrap_or_else(|| ext::LOOP.into());
@@ -348,7 +444,7 @@ pub(super) fn restore(
         let Body::Spawned { intent } = &entries[0].body else {
             return Err(io::Error::other("child has no spawn authority"));
         };
-        Some(intent.parse::<SpawnIntent>().map_err(io::Error::other)?)
+        Some(SpawnIntent::from_json(intent).map_err(io::Error::other)?)
     } else {
         None
     };

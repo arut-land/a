@@ -38,7 +38,10 @@ Context is `Fresh` or `Prefix { session, seq }`, with an inclusive committed
 sequence. Runner selection consists of an agent name and a model role (session,
 fast, or an extension-defined role resolved by the model service). Resolve and
 freeze the concrete routing and extension generation in the spawn intent.
-Future configuration changes must not change admitted work.
+Future configuration changes must not change admitted work. Persist admitted
+authority separately from the public request, using a compact tuple codec. A
+shared protocol image envelope exposes context to transcript and publication
+reducers without requiring them to decode engine authority.
 
 `Awaited<Spawn>` and `Detached<Spawn>` are distinct request types. `Sessions`
 accepts the awaited type to return an `Outcome`; its detached method returns

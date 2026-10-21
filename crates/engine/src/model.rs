@@ -42,10 +42,23 @@ impl Models {
     }
 }
 
-#[derive(Clone, serde::Serialize, serde::Deserialize)]
+#[derive(Clone)]
 pub(crate) struct FrozenRoute {
     spec: String,
     base_url: String,
+}
+
+impl serde::Serialize for FrozenRoute {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        serde::Serialize::serialize(&(&self.spec, &self.base_url), serializer)
+    }
+}
+
+impl<'de> serde::Deserialize<'de> for FrozenRoute {
+    fn deserialize<D: serde::Deserializer<'de>>(decoder: D) -> Result<Self, D::Error> {
+        let (spec, base_url) = serde::Deserialize::deserialize(decoder)?;
+        Ok(Self { spec, base_url })
+    }
 }
 
 impl Models {

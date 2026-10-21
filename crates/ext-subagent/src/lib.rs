@@ -50,23 +50,7 @@ impl Tool for Task {
     const CONCURRENCY: Concurrency = Concurrency::Shared;
 
     async fn call(&self, input: &Prompt, cx: &Cx) -> Result<String, String> {
-        let sessions = cx
-            .service::<dyn Sessions>()
-            .ok_or("this engine runs no child sessions")?;
-        let outcome = sessions
-            .spawn(
-                cx,
-                ext::Spawn::new::<Subagent>(
-                    "task",
-                    input.prompt.clone(),
-                    sessions.runner(),
-                    ext::DepthBudget::new(8),
-                )
-                .awaited(),
-            )
-            .await
-            .map_err(|e| format!("{e:?}"))?;
-        Ok(ext::child_result(&outcome))
+        awaited_task(input, cx, "task", ext::ContextSource::Fresh).await
     }
 
     /// The child's text, as text rather than a JSON string.
@@ -88,28 +72,43 @@ impl Tool for ForkTask {
     const REPLAY: Replay = Replay::Safe;
     const CONCURRENCY: Concurrency = Concurrency::Shared;
     async fn call(&self, input: &Prompt, cx: &Cx) -> Result<String, String> {
-        let sessions = cx
-            .service::<dyn Sessions>()
-            .ok_or("this engine runs no child sessions")?;
-        let mut spawn = ext::Spawn::new::<Subagent>(
+        awaited_task(
+            input,
+            cx,
             "fork_task",
-            input.prompt.clone(),
-            sessions.runner(),
-            ext::DepthBudget::new(8),
-        );
-        spawn.context = ext::ContextSource::Prefix {
-            session: cx.session,
-            seq: cx.call.0,
-        };
-        let outcome = sessions
-            .spawn(cx, spawn.awaited())
-            .await
-            .map_err(|e| format!("{e:?}"))?;
-        Ok(ext::child_result(&outcome))
+            ext::ContextSource::Prefix {
+                session: cx.session,
+                seq: cx.call.0,
+            },
+        )
+        .await
     }
     fn to_model(output: &Json) -> llm::Output {
         Task::to_model(output)
     }
+}
+
+async fn awaited_task(
+    input: &Prompt,
+    cx: &Cx,
+    purpose: &str,
+    context: ext::ContextSource,
+) -> Result<String, String> {
+    let sessions = cx
+        .service::<dyn Sessions>()
+        .ok_or("this engine runs no child sessions")?;
+    let mut spawn = ext::Spawn::new::<Subagent>(
+        purpose,
+        input.prompt.clone(),
+        sessions.runner(),
+        ext::DepthBudget::new(8),
+    );
+    spawn.context = context;
+    let outcome = sessions
+        .spawn(cx, spawn.awaited())
+        .await
+        .map_err(|e| format!("{e:?}"))?;
+    Ok(ext::child_result(&outcome))
 }
 
 /// Detached work keeps running after this call returns its handle.

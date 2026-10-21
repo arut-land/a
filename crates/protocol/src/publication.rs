@@ -13,14 +13,27 @@ pub struct Publication {
 #[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Publications(BTreeMap<u64, Vec<Publication>>);
 
+/// Context is decoded here so reducers need not understand engine authority.
+#[derive(Serialize, Deserialize)]
+pub struct SpawnImage {
+    pub authority: Json,
+    pub image: Vec<Json>,
+}
+
+impl SpawnImage {
+    pub fn from_json(json: &Json) -> Result<Self, serde_json::Error> {
+        json.parse()
+    }
+
+    pub fn to_json(&self) -> Result<Json, serde_json::Error> {
+        Json::encode(self)
+    }
+}
+
 impl Publications {
     pub fn apply(&mut self, entry: &Entry) {
         if let Body::Spawned { intent } = &entry.body {
-            #[derive(Deserialize)]
-            struct Image {
-                image: Vec<Json>,
-            }
-            if let Ok(image) = intent.parse::<Image>() {
+            if let Ok(image) = SpawnImage::from_json(intent) {
                 let mut inherited = Self::default();
                 for encoded in image.image {
                     if let Ok(source) = Entry::from_json(encoded.raw().as_bytes()) {

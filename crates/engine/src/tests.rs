@@ -1,3 +1,4 @@
+use protocol::Decode;
 use std::path::PathBuf;
 use std::time::{Duration, Instant};
 
@@ -416,8 +417,8 @@ fn a_hibernated_session_reloads_only_after_its_actor_has_exited() {
     assert_eq!(asks, Activity::Approval);
 }
 
-fn spawn_intent(call: u64, prompt: &str) -> Json {
-    Json::encode(&crate::driver::spawn::SpawnIntent {
+pub(crate) fn spawn_intent(call: u64, prompt: &str) -> Json {
+    crate::driver::spawn::SpawnIntent {
         awaited: true,
         admitted_at: std::time::SystemTime::now(),
         call: CallId::new(call).unwrap(),
@@ -429,7 +430,8 @@ fn spawn_intent(call: u64, prompt: &str) -> Json {
                 role: ext::ModelRole::Session,
             },
             ext::DepthBudget::new(7),
-        ),
+        )
+        .into(),
         model: "none".into(),
         routing: Err("no model".into()),
         installed: extensions(&ext_policy::Policy::default())
@@ -437,7 +439,8 @@ fn spawn_intent(call: u64, prompt: &str) -> Json {
             .installed(),
         image: Vec::new(),
         refusal: None,
-    })
+    }
+    .into_json()
     .unwrap()
 }
 
@@ -1587,13 +1590,10 @@ fn recursive_children_keep_the_admitted_runner_and_decreasing_budget() {
         let Body::Spawned { intent } = &log[0] else {
             panic!("{log:?}")
         };
-        let value: serde_json::Value = intent.parse().unwrap();
-        assert_eq!(value["request"]["runner"]["agent"], ext_fixtures::ECHO);
-        assert_eq!(
-            value["installed"],
-            serde_json::to_value(daemon.shared.registry.get().installed()).unwrap()
-        );
-        depths.push(value["request"]["depth"].as_u64().unwrap());
+        let value = crate::driver::spawn::SpawnIntent::from_json(&intent).unwrap();
+        assert_eq!(value.request.agent, ext_fixtures::ECHO);
+        assert_eq!(value.installed, daemon.shared.registry.get().installed());
+        depths.push(value.request.depth.remaining());
     }
     depths.sort_unstable();
     assert_eq!(depths, [6, 7]);
@@ -1632,13 +1632,9 @@ fn a_prefix_child_is_admitted_inside_its_unfinished_owning_turn() {
     let Body::Spawned { intent } = &child[0] else {
         panic!("{child:?}")
     };
-    let image: serde_json::Value = intent.parse().unwrap();
+    let image = crate::driver::spawn::SpawnIntent::from_json(&intent).unwrap();
     assert!(
-        image["image"]
-            .as_array()
-            .unwrap()
-            .iter()
-            .any(|e| e["text"] == "before")
+        image.image.iter().any(|e| matches!(Entry::from_json(e.raw().as_bytes()).unwrap().body, Body::Input { text, .. } if text == "before"))
     );
     assert!(
         fired(&bodies(&*daemon.shared.store, parent.session().id))
@@ -1748,10 +1744,10 @@ fn inherited_task_cannot_reset_an_exhausted_depth_budget() {
     for header in headers {
         for body in bodies(&*daemon.shared.store, header.id) {
             if let Body::Link { intent, .. } = body {
-                let value: serde_json::Value = intent.parse().unwrap();
-                if value["refusal"] == "DepthExhausted" {
+                let value = crate::driver::spawn::SpawnIntent::from_json(&intent).unwrap();
+                if value.refusal == Some(ext::SpawnRefusal::DepthExhausted) {
                     exhausted += 1;
-                    assert_eq!(value["request"]["depth"], 0);
+                    assert_eq!(value.request.depth.remaining(), 0);
                 }
             }
         }
