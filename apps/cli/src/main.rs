@@ -588,12 +588,17 @@ fn serve(
         sys::log::discard_stderr()?;
     }
     let listener = if let Some(fd) = listen_fd {
-        sys::Listener::adopt(fd.into(), &home.endpoint())?
+        sys::Listener::adopt(
+            sys::InheritedNumber::from(fd).duplicate()?,
+            &home.endpoint(),
+        )?
     } else {
         home.bind()?
     };
     let start = engine::Start {
-        lock: lock_fd.map(|fd| sys::adopt_lock(fd.into())).transpose()?,
+        lock: lock_fd
+            .map(|fd| sys::adopt_lock(sys::InheritedNumber::from(fd).duplicate()?))
+            .transpose()?,
         reset_breaker,
         logs: detached || listen_fd.is_some(),
     };

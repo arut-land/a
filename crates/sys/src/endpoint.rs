@@ -64,8 +64,8 @@ impl Listener {
     }
 
     /// Adopts the listener our parent bound and passed down.
-    pub fn adopt(passed: Passed, endpoint: &Endpoint) -> io::Result<Self> {
-        imp::adopt(passed, &endpoint.0).map(Self)
+    pub fn adopt(file: std::fs::File, endpoint: &Endpoint) -> io::Result<Self> {
+        imp::adopt(file, &endpoint.0).map(Self)
     }
 }
 
@@ -180,15 +180,13 @@ impl Write for &Stream {
 mod imp {
     use std::fs;
     use std::io;
-    use std::os::fd::{AsFd, FromRawFd};
+    use std::os::fd::OwnedFd;
     use std::os::unix::fs::{DirBuilderExt, MetadataExt};
     use std::os::unix::net::{UnixListener, UnixStream};
     use std::path::{Path, PathBuf};
     use std::time::Duration;
 
     use rustix::process::getuid;
-
-    use crate::proc::Passed;
 
     pub type Listener = UnixListener;
     pub type Stream = UnixStream;
@@ -238,14 +236,21 @@ mod imp {
         listener.set_nonblocking(nonblocking)
     }
 
-    pub fn adopt(Passed(fd): Passed, _endpoint: &Path) -> io::Result<UnixListener> {
-        // SAFETY: the parent (`a` itself) passes the fd number of a
-        // listening socket it bound and left open for us; nothing else in
-        // this process owns that fd. `local_addr` below rejects anything
-        // that is not a Unix socket.
-        let listener = unsafe { UnixListener::from_raw_fd(fd) };
-        listener.local_addr()?;
-        crate::proc::keep(listener.as_fd())?;
+    pub fn adopt(file: fs::File, endpoint: &Path) -> io::Result<UnixListener> {
+        let fd = OwnedFd::from(file);
+        if rustix::net::sockopt::socket_type(&fd)? != rustix::net::SocketType::STREAM {
+            return Err(io::ErrorKind::InvalidInput.into());
+        }
+        let listener = UnixListener::from(fd);
+        if listener.local_addr()?.as_pathname() != Some(endpoint) {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "wrong listener endpoint",
+            ));
+        }
+        // SO_ACCEPTCONN is unavailable on macOS. listen validates that this
+        // bound stream can serve as a listener, and rejects connected sockets.
+        rustix::net::listen(&listener, 128)?;
         Ok(listener)
     }
 

@@ -34,7 +34,12 @@ pub fn passed(handle: &impl AsRawHandle) -> Passed {
     )
 }
 
-pub fn adopt_lock(_passed: Passed) -> io::Result<File> {
+pub fn duplicate(_number: i32) -> io::Result<File> {
+    // Windows startup does not inherit native resources through argv.
+    Err(io::ErrorKind::Unsupported.into())
+}
+
+pub fn adopt_lock(_file: File) -> io::Result<File> {
     Err(io::Error::new(
         io::ErrorKind::InvalidInput,
         "Windows daemon startup claims its own lock",

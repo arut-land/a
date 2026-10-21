@@ -11,8 +11,6 @@ use std::process::{Command, ExitStatus};
 
 use crate::Signal;
 
-#[cfg(unix)]
-pub(crate) use imp::keep;
 pub(crate) use imp::passed;
 #[cfg(unix)]
 pub(crate) use imp::raw;
@@ -84,7 +82,20 @@ impl Group {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Passed(pub(crate) i32);
 
-impl From<i32> for Passed {
+/// An untrusted command-line number. It never owns the resource it names.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct InheritedNumber(i32);
+
+impl InheritedNumber {
+    /// Duplicates through the OS before constructing an owner. The original
+    /// number may belong to another Rust owner and is never closed here.
+    /// Both descriptors are close-on-exec so tools cannot retain daemon locks.
+    pub fn duplicate(self) -> io::Result<File> {
+        imp::duplicate(self.0)
+    }
+}
+
+impl From<i32> for InheritedNumber {
     fn from(raw: i32) -> Self {
         Self(raw)
     }
@@ -123,10 +134,9 @@ pub fn spawn_group(cmd: &mut Command, output: File) -> io::Result<Child> {
     imp::spawn_group(cmd, output)
 }
 
-/// Adopts the locked daemon record our parent passed down: the lock is the
-/// open file's, so it is ours now, and was never free.
-pub fn adopt_lock(passed: Passed) -> io::Result<File> {
-    imp::adopt_lock(passed)
+/// Consumes an owned duplicate of the inherited daemon lock.
+pub fn adopt_lock(file: File) -> io::Result<File> {
+    imp::adopt_lock(file)
 }
 
 /// Leaves the spawning terminal's session so its hangup never reaches us.
@@ -216,7 +226,7 @@ pub fn boot_id() -> Option<&'static str> {
 mod imp {
     use std::fs;
     use std::io;
-    use std::os::fd::{AsFd, AsRawFd, BorrowedFd, FromRawFd, OwnedFd};
+    use std::os::fd::{AsRawFd, BorrowedFd, FromRawFd, OwnedFd};
     use std::process::{Command, ExitStatus};
 
     use rustix::io::{FdFlags, fcntl_getfd, fcntl_setfd};
@@ -286,24 +296,35 @@ mod imp {
         Ok(())
     }
 
-    /// Marks an adopted descriptor close-on-exec again, as our own are.
-    pub fn keep(fd: BorrowedFd<'_>) -> io::Result<()> {
-        fcntl_setfd(fd, fcntl_getfd(fd)? | FdFlags::CLOEXEC)?;
-        Ok(())
+    pub fn duplicate(fd: i32) -> io::Result<fs::File> {
+        // SAFETY: fcntl accepts arbitrary integers and validates them in the
+        // kernel. No BorrowedFd or owner is created from the untrusted input.
+        let duplicate = unsafe { libc::fcntl(fd, libc::F_DUPFD_CLOEXEC, 3) };
+        if duplicate < 0 {
+            return Err(io::Error::last_os_error());
+        }
+        // SAFETY: fcntl returned a new, exclusively owned descriptor.
+        let file = unsafe { fs::File::from_raw_fd(duplicate) };
+        // SAFETY: these raw fcntl calls validate the number in the kernel;
+        // they change only inheritance, never assume ownership of the input.
+        let flags = unsafe { libc::fcntl(fd, libc::F_GETFD) };
+        if flags < 0 {
+            return Err(io::Error::last_os_error());
+        }
+        // SAFETY: fcntl validates fd and only changes its descriptor flags.
+        if unsafe { libc::fcntl(fd, libc::F_SETFD, flags | libc::FD_CLOEXEC) } < 0 {
+            return Err(io::Error::last_os_error());
+        }
+        Ok(file)
     }
 
-    pub fn adopt_lock(Passed(fd): Passed) -> io::Result<fs::File> {
-        // SAFETY: the parent (`a` itself) passes the fd number of the file
-        // it opened and locked for us; nothing else in this process owns
-        // that fd. `metadata` below rejects anything that is not a file.
-        let file = unsafe { fs::File::from_raw_fd(fd) };
+    pub fn adopt_lock(file: fs::File) -> io::Result<fs::File> {
         if !file.metadata()?.is_file() {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidInput,
                 "the lock fd is not a file",
             ));
         }
-        keep(file.as_fd())?;
         Ok(file)
     }
 
