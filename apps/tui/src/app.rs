@@ -328,7 +328,7 @@ impl App {
                 }
             }
             // A streaming reply's rows catch up with its text when drawn.
-            Change::Delta { .. } | Change::Draining => {}
+            Change::Delta { .. } | Change::Activity | Change::Draining => {}
         }
         Vec::new()
     }

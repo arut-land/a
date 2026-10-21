@@ -4,7 +4,9 @@
 //! reach it only through its mailbox, so a log has one writer, entries
 //! commit in the order the kernel numbers them, and no lock is held
 //! across an await. What the driver decides is only how: the kernel
-//! decides what.
+//! decides what. Making durable entries visible also publishes activity
+//! when they cover the current ledger. This boundary is shared by commits,
+//! deferred sync and recovery, including the final sync while draining.
 
 use std::any::Any;
 use std::cell::RefCell;
@@ -30,8 +32,8 @@ use kernel::{
 use protocol::ledger::Ledger;
 use protocol::view::SessionView;
 use protocol::{
-    Author, Body, CallId, DaemonMsg, Entry, Environment, Frame, Json, Mode, Outcome, ReadOnly,
-    Residency, SessionId, SessionSummary, ToolChoice,
+    Activity, Author, Body, CallId, DaemonMsg, Entry, Environment, Frame, Json, Mode, Outcome,
+    ReadOnly, Residency, SessionId, SessionSummary, ToolChoice,
 };
 use rt::{channel, oneshot, or};
 use serde::{Deserialize, Serialize};
@@ -382,6 +384,7 @@ impl Live {
             admissions: Vec::new(),
             flushes: Vec::new(),
             reactions_cancel: Cancel::default(),
+            published_activity: None,
             unsynced: Vec::new(),
             waiting_sync: Vec::new(),
             sync_armed: false,
@@ -664,6 +667,9 @@ struct Actor {
     /// flight, or a call waits on someone. Set before work starts, cleared
     /// after it ends.
     listed: Record,
+    /// The last emitted certification, independent of summary changes and
+    /// of whether the current ledger is eligible for publication.
+    published_activity: Option<(u64, Activity)>,
     /// Entries written and not yet durable, in order, with whoever waits
     /// for each: shown to no one until a sync. A seq a client has seen is
     /// one that survives a power cut, so it is never given out twice.
@@ -917,6 +923,7 @@ impl Actor {
             }
         }
         self.drain_flushes(&mail).await;
+        self.publish();
         if self.since_snapshot >= SNAPSHOT_EVERY {
             self.keep_snapshot().await;
         }
@@ -1368,6 +1375,7 @@ impl Actor {
     fn durable(&mut self, through: u64) {
         self.durable_seq = self.durable_seq.max(through);
         self.show_synced();
+        self.publish();
         self.admit();
     }
 
@@ -1532,10 +1540,6 @@ impl Actor {
         self.durable_seq = loaded.seq;
         let recovered = FrameLog::new(Arc::clone(&loaded.lines), loaded.seq);
         self.live.frames.reloaded(loaded.lines);
-        for entry in recovered.entries_after(self.live.frames.seq()) {
-            let lines = Encoded::of(std::slice::from_ref(&entry)).expect("loaded entry encodes");
-            self.show(std::slice::from_ref(&entry), &lines);
-        }
         self.writer = Some(loaded.writer);
         self.since_snapshot = loaded.read;
         self.core = folding.core;
@@ -1548,6 +1552,11 @@ impl Actor {
         self.replied = None;
         self.snapshot = None;
         self.view = None;
+        for entry in recovered.entries_after(self.live.frames.seq()) {
+            let lines = Encoded::of(std::slice::from_ref(&entry)).expect("loaded entry encodes");
+            self.show(std::slice::from_ref(&entry), &lines);
+        }
+        self.publish();
         let load = Load {
             boot: sys::boot_id(),
             busy: self.live.has_work(),
@@ -1560,6 +1569,7 @@ impl Actor {
                 self.resuming = true;
                 let _ = self.carry(fx).await;
                 self.resuming = false;
+                self.publish();
             }
             // Its log is what it is: the session stops, and loads again
             // when next wanted.
@@ -1848,12 +1858,32 @@ impl Actor {
         }
     }
 
-    /// The summary as the log now says: as many entries as are shown.
-    fn publish(&self) {
-        let ledger = self.core.ledger();
-        let mut summary = lock(&self.live.summary);
-        summary.entries = self.live.frames.seq();
-        summary.activity = ledger.activity();
+    /// Lists the visible prefix and certifies its activity only when the
+    /// whole ledger is visible. Eligibility can change without the summary.
+    fn publish(&mut self) {
+        let seq = self.live.frames.seq();
+        let activity = self.core.ledger().activity();
+        {
+            let mut summary = lock(&self.live.summary);
+            summary.entries = seq;
+            summary.activity = activity;
+        }
+        let current = self.current_activity();
+        if self.published_activity == current {
+            return;
+        }
+        if let Some((seq, activity)) = current
+            && let Ok(frame) = Frame::new(&DaemonMsg::Activity { seq, activity })
+        {
+            lock(&self.live.followers).retain(|c| c.send_after(seq, frame.clone()).is_ok());
+            self.published_activity = current;
+        }
+    }
+
+    fn current_activity(&self) -> Option<(u64, Activity)> {
+        let seq = self.core.ledger().seq();
+        (self.live.frames.seq() == seq && self.durable_seq >= seq)
+            .then(|| (seq, self.core.ledger().activity()))
     }
 
     fn effect(&mut self, effect: Effect) {
@@ -2224,6 +2254,13 @@ impl Actor {
         };
         frames.extend(Frame::new(&attached).ok().map(|f| (cursor, f)));
         frames.extend(snapshot.map(|frame| (seq, frame)));
+        if let Some((seq, activity)) = self.current_activity() {
+            frames.extend(
+                Frame::new(&DaemonMsg::Activity { seq, activity })
+                    .ok()
+                    .map(|f| (seq, f)),
+            );
+        }
         frames.extend(
             Frame::new(&DaemonMsg::Synced { seq })
                 .ok()

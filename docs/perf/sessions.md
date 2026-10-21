@@ -254,3 +254,33 @@ no-Tokio check passed. The supported Miri subset passed its 10 config,
 log and login tests; the new device-domain test also passed separately
 under Miri. The temporary baseline worktree was removed after its size
 measurement.
+
+## Protocol 4 activity with shared flush epochs
+
+The merge of `main` through `9e13330` retains protocol 4's activity frame.
+Current-ledger activity at N is eligible only when the ledger and visible
+frames both end at N and `durable_seq >= N`. The same predicate gates
+live certification and attach, after either snapshot or `since` replay.
+The last emitted certification is tracked separately from the summary;
+an ineligible prefix never replaces it with an earlier durable sequence.
+
+Advancing the durable prefix exposes entries and certifies activity before
+admitting waiting attachments, so an attachment does not receive both its
+initial certification and a duplicate broadcast. Recovery certifies the
+rebuilt ledger, and shutdown publishes again after draining pending epochs.
+Activity retains the outbox's `send_after(N, ...)` ordering. Replay-safe
+admission continues to use `ordered_seq`; publication still requires the
+durable watermark. No additional wire change, dependency or setting was
+introduced beyond main's protocol 4 fixtures and reducer vectors.
+
+The held-flush regression
+`activity_waits_for_the_current_ledgers_flush_on_live_snapshot_and_since_replay`
+checks that speculative idle activity cannot certify a durable prefix of a
+longer ledger, that live and attaching clients receive activity only after
+the last epoch completes, and that snapshot and suffix attaches receive
+one certification each. `final_sync_publishes_activity_after_its_entries`
+covers shutdown's final drain. The pipe renderer regression
+`a_turn_ends_when_idle_arrives_after_its_last_entry` checks that the final
+activity ends the process without querying the daemon. Failed attachments
+retain the durability design's explicit error; reconnect after recovery
+gets activity for the recovered prefix.

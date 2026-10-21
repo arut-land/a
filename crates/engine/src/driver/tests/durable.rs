@@ -917,3 +917,150 @@ fn an_entry_both_generations_reject_does_not_block_adoption() {
         h.finish();
     }
 }
+
+#[test]
+fn final_sync_publishes_activity_after_its_entries() {
+    struct HeldGate;
+    impl Extension for HeldGate {
+        const NAME: &'static str = "held-gate";
+        const VERSION: u32 = 1;
+        fn contribute(&self, r: &mut Registrar) {
+            r.on::<point::Permission>(|_, _| Permission::Ask);
+            r.on::<point::Approve>(|_, _| Answer::Later(ext::Later::new(std::future::pending())));
+        }
+    }
+    let mut fixture = Fixture::new(
+        ext_fixtures::ECHO,
+        Registry::default()
+            .with(&HeldGate)
+            .unwrap()
+            .with(&ext_shell::Shell)
+            .unwrap(),
+        openai(&Script::new(&[])),
+    );
+    let manual = Arc::new(Manual {
+        background: rt::Threads::new(1),
+        captured: AtomicBool::new(false),
+        actor: Mutex::default(),
+    });
+    Arc::get_mut(&mut fixture.0).unwrap().rt = Arc::clone(&manual) as _;
+    let session = fixture.create();
+    let mut actor = lock(&manual.actor).take().unwrap();
+    let (reply, _) = oneshot::channel();
+    session.send(Msg::Request {
+        request: Request::Input {
+            text: "$ true".into(),
+            mode: Mode::Queue,
+        },
+        origin: None,
+        reply,
+    });
+    poll_actor(&mut actor);
+    let call = session
+        .frames
+        .entries()
+        .find(|e| matches!(e.body, Body::ToolCall { .. }))
+        .unwrap()
+        .seq;
+    let outbox = Outbox::new();
+    let (done, _) = oneshot::channel();
+    session.send(Msg::Attach(outbox.clone(), 0, done));
+    poll_actor(&mut actor);
+    let mut view = SessionView::default();
+    while let Some(frame) = outbox.try_next() {
+        view.fold(
+            &protocol::read_frame::<DaemonMsg>(&mut frame.as_bytes())
+                .unwrap()
+                .unwrap(),
+        );
+    }
+    assert!(view.activity.is_some());
+    let before = view.seq;
+    ContextOrigin {
+        fence: session.session.fence.load(Ordering::SeqCst),
+        call: CallId::new(call.get()).unwrap(),
+        cancel: session.session.cancel(CallId::new(call.get()).unwrap()),
+    }
+    .send(
+        &session.session,
+        ContextRequest::Note {
+            note: Note::State {
+                ext: "test".into(),
+                state: "value".into(),
+                data: Json::default(),
+            },
+            done: None,
+        },
+    );
+    poll_actor(&mut actor);
+    assert_eq!(session.frames.seq(), before, "note is deferred");
+    session.send(Msg::Stop);
+    rt::block_on(actor);
+    while let Some(frame) = outbox.try_next() {
+        view.fold(
+            &protocol::read_frame::<DaemonMsg>(&mut frame.as_bytes())
+                .unwrap()
+                .unwrap(),
+        );
+    }
+    assert!(view.seq > before, "final sync published the note");
+    assert!(
+        view.activity.is_some(),
+        "the last visible prefix needs activity"
+    );
+}
+
+#[test]
+fn attaching_behind_a_deferred_write_gets_activity_after_sync_or_recovery() {
+    for failure in [None, Some(SyncFailure::Discard), Some(SyncFailure::Retain)] {
+        let mut h = ManualSession::new();
+        let since = h.session.frames.seq();
+        let mut view = SessionView::from_log(
+            h.session.id,
+            h.session.workspace.clone(),
+            h.session.frames.entries(),
+        );
+        let _note = h.note();
+        h.poll();
+        let outbox = Outbox::new();
+        let (done, _) = oneshot::channel();
+        h.session.send(Msg::Attach(outbox.clone(), since, done));
+        h.poll();
+        while let Some(frame) = outbox.try_next() {
+            view.fold(
+                &protocol::read_frame::<DaemonMsg>(&mut frame.as_bytes())
+                    .unwrap()
+                    .unwrap(),
+            );
+        }
+        assert_eq!(view.activity, None);
+        if let Some(failure) = failure {
+            h.faulty.fail_next_sync(failure);
+        }
+        h.session.send(Msg::Sync);
+        h.poll();
+        if failure.is_some() {
+            let frame = outbox.try_next().expect("failed attach is answered");
+            assert!(matches!(
+                protocol::read_frame::<DaemonMsg>(&mut frame.as_bytes()).unwrap(),
+                Some(DaemonMsg::Error { .. })
+            ));
+            let (done, _) = oneshot::channel();
+            h.session.send(Msg::Attach(outbox.clone(), since, done));
+            h.poll();
+        }
+        while let Some(frame) = outbox.try_next() {
+            view.fold(
+                &protocol::read_frame::<DaemonMsg>(&mut frame.as_bytes())
+                    .unwrap()
+                    .unwrap(),
+            );
+        }
+        let activity = view.activity;
+        h.finish();
+        assert!(
+            activity.is_some(),
+            "sync or recovery must certify the attached prefix"
+        );
+    }
+}

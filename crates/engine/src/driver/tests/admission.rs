@@ -776,6 +776,13 @@ fn submitted_input_is_cancelled_while_its_publication_flush_is_held() {
     }
     feed(
         &mut client,
+        client::EventKind::Msg(DaemonMsg::Activity {
+            seq: before,
+            activity: Activity::Idle,
+        }),
+    );
+    feed(
+        &mut client,
         client::EventKind::Msg(DaemonMsg::Synced { seq: before }),
     );
     let send = |client: &mut client::SessionClient, cmd| {
@@ -923,5 +930,110 @@ fn registry_adoption_waits_for_rest_and_the_complete_durable_prefix() {
             .unwrap()
             .contains("stale generation")
     }));
+    session.halt();
+}
+
+fn messages(outbox: &Outbox) -> impl Iterator<Item = DaemonMsg> + '_ {
+    std::iter::from_fn(|| outbox.try_next()).map(|frame| {
+        protocol::read_frame::<DaemonMsg>(&mut frame.as_bytes())
+            .unwrap()
+            .unwrap()
+    })
+}
+
+#[test]
+fn activity_waits_for_the_current_ledgers_flush_on_live_snapshot_and_since_replay() {
+    let (fixture, faulty, _) = pipeline(Registry::default().with(&Harbor).unwrap());
+    let history: Vec<_> = (1..=SNAPSHOT_GAP + 1)
+        .map(|seq| entry(seq, echo("earlier")))
+        .collect();
+    let session = fixture.start(&history);
+    let before = session.frames.seq();
+    let live = Outbox::new();
+    session.follow(&live, before);
+    while live.try_next().is_some() {}
+    let input = faulty.hold_next_flush();
+    let final_flush = faulty.hold_next_flush();
+    let ack = enqueue(&session, "hello");
+    input.started();
+    session.wait("safe turn awaiting publication", PATIENCE, || {
+        !session.has_work() && positions(&session).0 > before
+    });
+    input.release();
+    final_flush.started();
+    let captured = faulty
+        .entries(session.id)
+        .unwrap()
+        .last()
+        .unwrap()
+        .seq
+        .get();
+    session.wait("input prefix published", PATIENCE, || {
+        session.frames.seq() >= captured
+    });
+    let (ordered, durable) = positions(&session);
+    assert!(ordered > durable);
+    let mut view = SessionView::from_log(session.id, session.workspace.clone(), history);
+    for msg in messages(&live) {
+        assert!(
+            !matches!(msg, DaemonMsg::Activity { .. }),
+            "current idle activity cannot certify an earlier durable prefix: {msg:?}"
+        );
+        view.fold(&msg);
+    }
+    assert_eq!(view.activity, None);
+    let mut replays = Vec::new();
+    for since in [0, before] {
+        let outbox = Outbox::new();
+        let (done, attached) = oneshot::channel();
+        session.send(Msg::Attach(outbox.clone(), since, done));
+        replays.push((since, outbox, attached));
+    }
+    assert_eq!(positions(&session), (ordered, durable));
+    for (_, outbox, _) in &replays {
+        assert!(outbox.try_next().is_none(), "attach waits for durability");
+    }
+    final_flush.release();
+    assert_eq!(rt::block_on(ack), Some(Ok(())));
+    settle(&session);
+    for msg in messages(&live) {
+        if let DaemonMsg::Activity { seq, .. } = &msg {
+            assert!(*seq <= positions(&session).1);
+            assert_eq!(*seq, ordered);
+        }
+        view.fold(&msg);
+    }
+    assert_eq!(view.seq, ordered);
+    assert_eq!(
+        view.activity,
+        Some(Activity::Idle),
+        "flush completion ends the turn"
+    );
+    for (since, outbox, attached) in replays {
+        assert_eq!(rt::block_on(attached), Some(()));
+        let mut snapshot = false;
+        let mut activity = None;
+        let mut certifications = 0;
+        for msg in messages(&outbox) {
+            match msg {
+                DaemonMsg::Snapshot(_) => snapshot = true,
+                DaemonMsg::Activity {
+                    seq,
+                    activity: current,
+                } => {
+                    assert!(seq <= positions(&session).1);
+                    activity = Some((seq, current));
+                    certifications += 1;
+                }
+                _ => {}
+            }
+        }
+        assert_eq!(snapshot, since == 0);
+        assert_eq!(activity, Some((ordered, Activity::Idle)));
+        assert_eq!(
+            certifications, 1,
+            "flush admits attach after certifying live followers"
+        );
+    }
     session.halt();
 }

@@ -38,6 +38,10 @@ fn app(viewport: Viewport, msgs: &[DaemonMsg]) -> (App, SessionId) {
     for msg in msgs {
         app.fold(msg);
     }
+    app.fold(&DaemonMsg::Activity {
+        seq: app.view().seq,
+        activity: app.view().ledger.activity(),
+    });
     (app, session)
 }
 
@@ -354,6 +358,10 @@ fn the_wheel_scrolls_and_new_rows_keep_a_scrolled_view_still() {
             origin: None,
         },
     ));
+    app.fold(&DaemonMsg::Activity {
+        seq: 40,
+        activity: Activity::Idle,
+    });
     let (_, rows) = frame(&mut app, 40, 12);
     assert_eq!(rows[0], top, "the view did not move");
     press(&mut app, Key::Esc);
@@ -425,6 +433,10 @@ fn ctrl_c_interrupts_a_running_call_and_shows_how_it_ended() {
     ));
     let (_, rows) = frame(&mut app, 60, 12);
     find(&rows, "⏺ $ ls  ✗ aborted · killed by SIGTERM");
+    app.fold(&DaemonMsg::Activity {
+        seq: 6,
+        activity: Activity::Idle,
+    });
     assert!(
         press(&mut app, Key::Ctrl('c')).is_none(),
         "clears the input"
@@ -472,6 +484,11 @@ fn ctrl_c_interrupts_a_running_model_call_too() {
             },
         },
     ));
+    assert!(app.client.turn().running);
+    app.fold(&DaemonMsg::Activity {
+        seq: 3,
+        activity: Activity::Idle,
+    });
     assert!(!app.client.turn().running);
 }
 
@@ -1075,6 +1092,11 @@ fn no_timer_runs_unless_a_turn_is_working() {
             card: None,
         },
     ));
+    assert!(busy.working(), "the result alone cannot end the turn");
+    busy.fold(&DaemonMsg::Activity {
+        seq: 6,
+        activity: Activity::Idle,
+    });
     assert!(!busy.working(), "the turn ended; the timer stops with it");
     let (_, rows) = frame(&mut busy, 70, 20);
     assert!(!rows.iter().any(|r| r.contains("Working")), "{rows:#?}");
@@ -1180,7 +1202,7 @@ fn inline_review_expands_finished_cards_without_printing_history_twice() {
 }
 
 #[test]
-fn a_turn_keeps_its_active_time_and_tokens_across_calls_but_not_idle_time() {
+fn a_turn_keeps_its_clock_across_entry_gaps_and_stops_only_at_idle() {
     let (mut app, _) = app(
         Viewport::Full,
         &[
@@ -1210,9 +1232,9 @@ fn a_turn_keeps_its_active_time_and_tokens_across_calls_but_not_idle_time() {
         call:CallId::new(2).unwrap(),
         outcome:Outcome::Done {output:Json::encode(&json!({"message":{"content":[{"type":"text","text":"hi"}]},"usage":{"input":12,"output":3}})).unwrap()},
     }));
-    assert!(!app.working());
-    assert!(app.clock.since.is_none());
-    let elapsed = app.clock.elapsed();
+    assert!(app.working());
+    assert!(app.clock.since.is_some());
+    let elapsed = app.clock.elapsed;
     app.fold(&entry(
         4,
         Body::ToolCall {
@@ -1228,6 +1250,22 @@ fn a_turn_keeps_its_active_time_and_tokens_across_calls_but_not_idle_time() {
     find(&rows, "Working… (3s · ↓ 3 tokens");
     app.fold(&entry(
         5,
+        Body::ToolResult {
+            call: CallId::new(4).unwrap(),
+            outcome: Outcome::Done {
+                output: Json::encode(&0).unwrap(),
+            },
+            card: None,
+        },
+    ));
+    app.fold(&DaemonMsg::Activity {
+        seq: 5,
+        activity: Activity::Idle,
+    });
+    assert!(!app.working());
+    assert!(app.clock.since.is_none());
+    app.fold(&entry(
+        6,
         Body::Input {
             text: "next".into(),
             mode: protocol::Mode::Queue,

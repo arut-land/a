@@ -1,0 +1,1 @@
+{"t":"entry","seq":7,"epoch":0,"kind":"tool_result","call":2,"outcome":{"status":"done","output":{"exit":0,"stderr":"","stdout":"src\n"}},"card":{"title":"$ ls","body":"src\n","note":"exit 0"}}
