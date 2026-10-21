@@ -2895,11 +2895,13 @@ impl ext::Models for Own {
             let (answered, answer) = oneshot::channel();
             let timeout = session.shared.rt.sleep(side.budget.timeout);
             let mail = Arc::clone(&session.mail);
+            let session_id = session.id;
             session.shared.rt.spawn(Box::pin(async move {
                 // Read as the call's own replies are, with nothing streamed.
                 let mut quiet = |_: &str| {};
                 let asked = reply(&model, &request, &cancel, &mut quiet);
-                let (outcome, answer) = sided(first(asked, timeout).await.map(|(r, _)| r));
+                let (outcome, answer) =
+                    sided(session_id, first(asked, timeout).await.map(|(r, _)| r));
                 let _ = mail.send(Msg::Fenced {
                     fence,
                     msg: Box::new(Msg::Step(Event::SideDone { side: id, outcome })),
@@ -2915,8 +2917,11 @@ impl ext::Models for Own {
 
 /// What a side request's reply, or its timing out, is logged as and
 /// answered with.
-fn sided(replied: Option<Replied>) -> (Outcome, Result<llm::Response, llm::Error>) {
-    match replied {
+fn sided(
+    session: SessionId,
+    replied: Option<Replied>,
+) -> (Outcome, Result<llm::Response, llm::Error>) {
+    let (outcome, answer) = match replied {
         Some(Replied::Done(output)) => {
             let answer = llm::Response::from_json(output.raw())
                 .map_err(|e| llm::Error::new(llm::Kind::Decode, e.to_string()));
@@ -2930,7 +2935,7 @@ fn sided(replied: Option<Replied>) -> (Outcome, Result<llm::Response, llm::Error
         }
         Some(Replied::Interrupted(output)) => {
             let error = llm::Error::new(llm::Kind::Incomplete, "the call ended first");
-            (Outcome::Interrupted { output }, Err(error))
+            return (Outcome::Interrupted { output }, Err(error));
         }
         None => {
             let error = llm::Error::new(llm::Kind::Transport, "the side request timed out");
@@ -2939,7 +2944,9 @@ fn sided(replied: Option<Replied>) -> (Outcome, Result<llm::Response, llm::Error
             };
             (failed, Err(error))
         }
-    }
+    };
+    let answer = answer.inspect_err(|error| provider_error(session, error));
+    (outcome, answer)
 }
 
 /// What `work` yields, unless `stop` resolves first.
