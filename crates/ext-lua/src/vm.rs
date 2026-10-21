@@ -862,20 +862,70 @@ struct Admission {
     waiters: std::collections::BTreeMap<u64, Waker>,
 }
 
-struct Permit<'a> {
-    admission: &'a Mutex<Admission>,
+struct Permit {
+    admission: Arc<Mutex<Admission>>,
     id: u64,
     active: bool,
 }
-impl Drop for Permit<'_> {
+impl Drop for Permit {
     fn drop(&mut self) {
-        let mut admission = locked(self.admission);
+        let mut admission = locked(&self.admission);
         admission.waiters.remove(&self.id);
         if self.active {
             admission.active -= 1;
         }
-        let waiters: Vec<_> = admission.waiters.values().cloned().collect();
         drop(admission);
+        self.wake();
+    }
+}
+impl Permit {
+    async fn acquire(
+        admission: Arc<Mutex<Admission>>,
+        id: u64,
+        cx: &Cx,
+        key: usize,
+    ) -> mlua::Result<Arc<Self>> {
+        let inherited = cx.invocation().local(key, || {
+            Arc::new(Mutex::new(std::sync::Weak::<Permit>::new()))
+        });
+        let mut permit = Permit {
+            admission,
+            id,
+            active: false,
+        };
+        let shared = poll_fn(|cx| {
+            if let Some(permit) = locked(&inherited).upgrade() {
+                return Poll::Ready(Ok(Some(permit)));
+            }
+            let mut admission = locked(&permit.admission);
+            if admission.active < 16 {
+                admission.waiters.remove(&id);
+                admission.active += 1;
+                permit.active = true;
+                Poll::Ready(Ok(None))
+            } else if admission.waiters.len() >= 64 && !admission.waiters.contains_key(&id) {
+                Poll::Ready(Err(mlua::Error::runtime("lua execution admission full")))
+            } else {
+                admission.waiters.insert(id, cx.waker().clone());
+                Poll::Pending
+            }
+        })
+        .await?;
+        let candidate = Arc::new(permit);
+        let admitted = shared.unwrap_or_else(|| {
+            let mut inherited = locked(&inherited);
+            inherited.upgrade().unwrap_or_else(|| {
+                *inherited = Arc::downgrade(&candidate);
+                Arc::clone(&candidate)
+            })
+        });
+        drop(candidate);
+        admitted.wake();
+        Ok(admitted)
+    }
+
+    fn wake(&self) {
+        let waiters: Vec<_> = locked(&self.admission).waiters.values().cloned().collect();
         for waker in waiters {
             waker.wake();
         }
@@ -898,25 +948,12 @@ struct LuaTool {
 impl LuaTool {
     async fn execute(&self, input: &Json, cx: &Cx) -> mlua::Result<Json> {
         let id = self.callbacks.next.fetch_add(1, Ordering::Relaxed);
-        let mut permit = Permit {
-            admission: &self.callbacks.admission,
+        let _permit = Permit::acquire(
+            Arc::clone(&self.callbacks.admission),
             id,
-            active: false,
-        };
-        poll_fn(|cx| {
-            let mut admission = locked(permit.admission);
-            if admission.active < 16 {
-                admission.waiters.remove(&id);
-                admission.active += 1;
-                permit.active = true;
-                Poll::Ready(Ok(()))
-            } else if admission.waiters.len() >= 64 && !admission.waiters.contains_key(&id) {
-                Poll::Ready(Err(mlua::Error::runtime("lua execution admission full")))
-            } else {
-                admission.waiters.insert(id, cx.waker().clone());
-                Poll::Pending
-            }
-        })
+            cx,
+            self.lua.globals().to_pointer() as usize,
+        )
         .await?;
         let context = self.lua.create_table()?;
         context.set("session", cx.session.to_string())?;
@@ -1145,11 +1182,12 @@ mod tests {
             "lua-admission",
             Registry::default().with(&Service(false)).unwrap(),
         );
-        let cx = rig.cx();
+        let contexts: Vec<_> = (0..82).map(|_| rig.cx()).collect();
         let input = Json::default();
         let mut context = std::task::Context::from_waker(Waker::noop());
-        let mut calls: Vec<_> = (0..80)
-            .map(|_| Box::pin(module.tools[0].execute(&input, &cx)))
+        let mut calls: Vec<_> = contexts[..80]
+            .iter()
+            .map(|cx| Box::pin(module.tools[0].execute(&input, cx)))
             .collect();
         for call in &mut calls {
             assert!(call.as_mut().poll(&mut context).is_pending());
@@ -1158,14 +1196,14 @@ mod tests {
         assert_eq!(locked(admission).active, 16);
         assert_eq!(locked(admission).waiters.len(), 64);
         assert!(
-            rt::block_on(module.tools[0].execute(&input, &cx))
+            rt::block_on(module.tools[0].execute(&input, &contexts[80]))
                 .unwrap_err()
                 .to_string()
                 .contains("admission full")
         );
         calls.pop();
         assert_eq!(locked(admission).waiters.len(), 63);
-        let mut replacement = Box::pin(module.tools[0].execute(&input, &cx));
+        let mut replacement = Box::pin(module.tools[0].execute(&input, &contexts[81]));
         assert!(replacement.as_mut().poll(&mut context).is_pending());
         drop(calls.remove(0));
         assert!(replacement.as_mut().poll(&mut context).is_pending());
@@ -1175,11 +1213,85 @@ mod tests {
         assert_eq!(locked(admission).active, 0);
         assert!(locked(admission).waiters.is_empty());
         assert!(locked(&module.tools[0].callbacks.calls).is_empty());
-        let mut fresh = Box::pin(module.tools[0].execute(&input, &cx));
+        let mut fresh = Box::pin(module.tools[0].execute(&input, &contexts[0]));
         assert!(fresh.as_mut().poll(&mut context).is_pending());
         assert_eq!(locked(admission).active, 1);
         drop(fresh);
         assert_eq!(locked(admission).active, 0);
+    }
+
+    #[test]
+    fn admitted_owners_leave_capacity_for_their_delegated_calls() {
+        #[derive(Clone)]
+        struct Release(Arc<std::sync::atomic::AtomicBool>);
+        impl Tool for Release {
+            type In = ext::Args;
+            type Out = bool;
+            const NAME: &'static str = "release";
+            const DESCRIPTION: &'static str = "wait for release";
+            async fn call(&self, _: &ext::Args, _: &Cx) -> Result<bool, String> {
+                poll_fn(|_| {
+                    if self.0.load(Ordering::SeqCst) {
+                        Poll::Ready(Ok(true))
+                    } else {
+                        Poll::Pending
+                    }
+                })
+                .await
+            }
+        }
+        impl Extension for Release {
+            const NAME: &'static str = "release";
+            const VERSION: u32 = 1;
+            fn contribute(&self, r: &mut Registrar) {
+                r.tool(self.clone());
+            }
+        }
+        let release = Release(Arc::default());
+        let module = Mod::load(
+            "test",
+            &tool("if input.leaf then return true end; cx.tool('release','release',{}); return cx.tool('leaf','test',{leaf=true})"),
+            &["release".into(), "test".into()],
+            Limits::default(),
+        )
+        .unwrap();
+        let registry = Registry::default()
+            .with(&release)
+            .unwrap()
+            .with_dyn(ext::Tier::User, &module)
+            .unwrap();
+        let rigs: Vec<_> = (0..16)
+            .map(|i| Rig::new(&format!("lua-nested-admission-{i}"), registry.clone()))
+            .collect();
+        let contexts: Vec<_> = rigs.iter().map(Rig::cx).collect();
+        let input = Json::encode(&json!({})).unwrap();
+        let mut calls: Vec<_> = contexts
+            .iter()
+            .map(|cx| Box::pin(module.tools[0].execute(&input, cx)))
+            .collect();
+        let mut context = std::task::Context::from_waker(Waker::noop());
+        for call in &mut calls {
+            assert!(call.as_mut().poll(&mut context).is_pending());
+        }
+        release.0.store(true, Ordering::SeqCst);
+        let completed = calls
+            .iter_mut()
+            .map(|call| match call.as_mut().poll(&mut context) {
+                Poll::Ready(result) => {
+                    assert!(result.unwrap().parse::<bool>().unwrap());
+                    true
+                }
+                Poll::Pending => false,
+            })
+            .filter(|ready| *ready)
+            .count();
+        let admission = locked(&module.tools[0].callbacks.admission);
+        assert!(
+            completed == 16,
+            "all owners await children: {} active owners, {} queued children",
+            admission.active,
+            admission.waiters.len()
+        );
     }
 
     #[test]
