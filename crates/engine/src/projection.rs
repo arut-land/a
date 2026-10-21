@@ -33,9 +33,9 @@ struct Invocation {
 }
 
 impl Invocations {
-    pub(super) fn fold(&mut self, entry: &Entry) {
+    pub(super) fn fold(&mut self, entry: &Entry) -> Option<CallId> {
         if entry.seq.get() <= self.through {
-            return;
+            return None;
         }
         self.through = entry.seq.get();
         match &entry.body {
@@ -54,6 +54,7 @@ impl Invocations {
                         result: None,
                     },
                 );
+                return Some(CallId(entry.seq));
             }
             Body::ToolResult {
                 call,
@@ -74,6 +75,7 @@ impl Invocations {
             }
             _ => {}
         }
+        None
     }
 
     pub(super) fn request(
@@ -129,7 +131,7 @@ impl Actor {
         ticket: super::Ticket,
         result: Result<CallId, String>,
     ) {
-        if let Some((reply, context)) = self.replies.invocations.remove(&ticket) {
+        if let Some((reply, _)) = self.replies.invocations.remove(&ticket) {
             match result {
                 Ok(call) => {
                     if let Some(result) = self
@@ -139,7 +141,6 @@ impl Actor {
                     {
                         reply.send(result.clone());
                     } else {
-                        self.replies.contexts.entry(call).or_insert(context);
                         self.replies.invoked.entry(call).or_default().push(reply);
                     }
                 }
@@ -205,7 +206,7 @@ impl Actor {
             self.projection.transcript = None;
         }
         for e in entries {
-            self.projection.invocations.fold(e);
+            let _ = self.projection.invocations.fold(e);
             if let Body::Answer { call, .. }
             | Body::Decision {
                 call: Some(call),

@@ -332,3 +332,61 @@ fn shared_siblings_cannot_deadlock_on_exclusive_descendants() {
     assert_eq!(log.iter().filter(|e| matches!(&e.body, Body::ToolResult { outcome: Outcome::Failed { error }, .. } if error == "exclusive invocation requires exclusive ancestors")).count(), 2);
     session.halt();
 }
+
+struct InvocationProbe;
+impl Tool for InvocationProbe {
+    type In = ext::Args;
+    type Out = usize;
+    const NAME: &'static str = "invocation_probe";
+    const DESCRIPTION: &'static str = "inspect owned invocation state";
+    const REPLAY: Replay = Replay::Safe;
+    async fn call(&self, args: &ext::Args, cx: &Cx) -> Result<usize, String> {
+        let count = cx.invocation().local(0, || Arc::new(AtomicUsize::new(0)));
+        let current = count.fetch_add(1, Ordering::SeqCst) + 1;
+        if args.args == "leaf" {
+            return Ok(current);
+        }
+        match cx
+            .invoke(
+                "leaf",
+                <Self as Tool>::NAME,
+                &Json::encode(&ext::Args {
+                    args: "leaf".into(),
+                })
+                .unwrap(),
+            )
+            .await
+            .outcome
+        {
+            Outcome::Done { output } => output.parse().map_err(|e| e.to_string()),
+            outcome => Err(format!("unexpected invocation result: {outcome:?}")),
+        }
+    }
+}
+impl Extension for InvocationProbe {
+    const NAME: &'static str = "invocation_probe";
+    const VERSION: u32 = 1;
+    fn contribute(&self, r: &mut Registrar) {
+        r.tool(Self);
+    }
+}
+
+#[test]
+fn ordered_callees_inherit_context_before_the_durable_acknowledgement() {
+    let fixture = Fixture::new(
+        ext_fixtures::ECHO,
+        Registry::default().with(&InvocationProbe).unwrap(),
+        openai(&Script::new(&[])),
+    );
+    let session = fixture.create();
+    session.submit("call invocation_probe {}").unwrap();
+    settle(&session);
+    let log = log_of(&session);
+    let root = log
+        .iter()
+        .find(|entry| matches!(entry.body, Body::ToolCall { invoke: None, .. }))
+        .unwrap()
+        .seq;
+    assert!(log.iter().any(|entry| matches!(&entry.body, Body::ToolResult { call, outcome: Outcome::Done { output }, .. } if call.0 == root && output.parse::<usize>().unwrap() == 2)));
+    session.halt();
+}

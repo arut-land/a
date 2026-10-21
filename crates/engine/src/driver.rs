@@ -810,7 +810,7 @@ impl Folding {
         self.states.apply(e);
         self.has_input |= matches!(e.body, Body::Input { .. });
         self.core.load(e);
-        self.invocations.fold(e);
+        let _ = self.invocations.fold(e);
     }
 }
 
@@ -1505,7 +1505,9 @@ impl Actor {
             match catch_unwind(AssertUnwindSafe(|| context.scope(|| self.core.step(event)))) {
                 Ok(more) => {
                     for entry in &more.appends {
-                        self.projection.invocations.fold(entry);
+                        if let Some(call) = self.projection.invocations.fold(entry) {
+                            self.replies.contexts.insert(call, context.clone());
+                        }
                     }
                     if let Some(done) = done {
                         let entry = more
@@ -1535,10 +1537,9 @@ impl Actor {
                     fx.immediate.extend(more.immediate);
                     fx.admitted.extend(more.admitted);
                     if let Some(mut commit) = more.commit {
-                        if let Some(previous) = fx.commit {
-                            commit.durability = commit.durability.max(previous.durability);
-                            commit.publish |= previous.publish;
-                        }
+                        let previous = fx.commit.unwrap_or(commit);
+                        commit.durability = commit.durability.max(previous.durability);
+                        commit.publish |= previous.publish;
                         fx.commit = Some(commit);
                     }
                 }
