@@ -50,14 +50,15 @@ final class AppModel {
     var notice: String?
 
     init() {
-        // Staging the bundled helper lets the app and CLI share the daemon.
         let helper = Bundle.main.bundleURL.appending(path: "Contents/Helpers/a").path
-        do {
-            let client = try Client(helper: helper)
-            self.client = client
-            list = SessionListStore(client: client)
-        } catch {
-            problem = error.localizedDescription
+        Task {
+            do {
+                let client = try await startClient(helper: helper)
+                self.client = client
+                list = SessionListStore(client: client)
+            } catch {
+                problem = error.localizedDescription
+            }
         }
     }
 

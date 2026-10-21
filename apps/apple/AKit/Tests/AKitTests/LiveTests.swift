@@ -155,3 +155,25 @@ func fork_rekeys_the_cached_store() async throws {
     await reopened.detach()
     await store.detach()
 }
+
+
+@Test
+func apple_startup_does_not_block_the_main_actor() async throws {
+    let started = DispatchSemaphore(value: 0)
+    let release = DispatchSemaphore(value: 0)
+    let startup = Task {
+        try await stageClient {
+            started.signal()
+            release.wait()
+            return 42
+        }
+    }
+    try await stageClient { started.wait() }
+    // The main actor must run this task while staging is still suspended.
+    let heartbeat = Task { @MainActor in
+        await Task.yield()
+        release.signal()
+    }
+    await heartbeat.value
+    #expect(try await startup.value == 42)
+}

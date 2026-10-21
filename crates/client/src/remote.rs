@@ -2,14 +2,14 @@
 //! `A_SCP` overrides `scp`). Installs this build on a host that lacks `a`.
 
 use std::ffi::OsString;
-use std::io::{self, BufRead, BufReader, Read, Write};
-use std::process::{Child, ChildStdin, Command, Stdio};
+use std::io::{self, BufRead, BufReader};
+use std::process::{Command, Stdio};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use protocol::{ClientMsg, read_frame};
 use sys::{Platform, Staged};
 
-use crate::{Connection, Reader, Welcome, WriteTransport, Writer};
+use crate::{Connection, Reader, Transport, Welcome, Writer};
 
 /// What the bridge prints, with its token, once it is connected.
 pub const SYNC: &str = "A-BRIDGE";
@@ -24,9 +24,7 @@ const NOT_FOUND: i32 = 127;
 /// previous install staged, else this build after installing it there.
 pub fn open(host: &str, staged: &Staged) -> io::Result<Connection> {
     let token = token();
-    let found = format!(
-        r#"if command -v a >/dev/null 2>&1; then exec a bridge {token}; elif [ -x "$HOME/.a/runtime/current/a" ]; then exec "$HOME/.a/runtime/current/a" bridge {token}; else exit {NOT_FOUND}; fi"#
-    );
+    let found = find_script(&token);
     if let Some(conn) = bridge(host, &found, &token)? {
         return Ok(conn);
     }
@@ -36,23 +34,30 @@ pub fn open(host: &str, staged: &Staged) -> io::Result<Connection> {
         .ok_or_else(|| io::Error::other(format!("the `a` installed on {host} does not run")))
 }
 
+pub(crate) fn find_script(token: &str) -> String {
+    format!(
+        r#"if command -v a >/dev/null 2>&1; then exec a bridge {token}; elif [ -x "$HOME/.a/runtime/current/a" ]; then exec "$HOME/.a/runtime/current/a" bridge {token}; else exit {NOT_FOUND}; fi"#
+    )
+}
+
 /// Runs `script` on `host` and waits for the sync line; `None` if the shell
 /// found no `a` to run.
 fn bridge(host: &str, script: &str, token: &str) -> io::Result<Option<Connection>> {
-    let mut child = command("A_SSH", "ssh")
-        .arg(host)
-        .arg(sh(script))
-        .stdin(Stdio::piped())
-        .stdout(Stdio::piped())
-        .spawn()?;
-    let stdout: Box<dyn Read + Send> = Box::new(child.stdout.take().expect("piped"));
-    let mut out = BufReader::new(stdout);
+    let mut connection = launch(host, script)?;
+    let out = &mut connection.reader.0;
     let sync = format!("{SYNC} {token}");
     let mut line = Vec::new();
     let remote = loop {
         line.clear();
         if out.read_until(b'\n', &mut line)? == 0 {
-            return match child.wait()?.code() {
+            return match connection
+                .writer
+                .child
+                .as_mut()
+                .expect("bridge child")
+                .wait()?
+                .code()
+            {
                 Some(NOT_FOUND) => Ok(None),
                 _ => Err(io::Error::other(format!(
                     "ssh {host}: the bridge ended before it was ready"
@@ -60,47 +65,34 @@ fn bridge(host: &str, script: &str, token: &str) -> io::Result<Option<Connection
             };
         }
         if line.trim_ascii_end().strip_prefix(sync.as_bytes()) == Some(WITH_ENV) {
-            match read_frame(&mut out)? {
+            match read_frame(out)? {
                 Some(ClientMsg::Environment(env)) => break env,
                 _ => return Err(io::Error::other(format!("ssh {host}: no environment"))),
             }
         }
     };
-    let stdin = child.stdin.take().expect("piped");
-    Ok(Some(Connection {
-        reader: Reader(out),
-        writer: Writer(Box::new(BridgeWriter { stdin, child })),
-        remote: Some(remote),
+    connection.remote = Some(remote);
+    Ok(Some(connection))
+}
+
+pub(crate) fn launch(host: &str, script: &str) -> io::Result<Connection> {
+    let (child, stdin, stdout) =
+        sys::spawn_stdio(command("A_SSH", "ssh").arg(host).arg(sh(script)))?;
+    Ok(Connection {
+        reader: Reader(BufReader::new(Transport::Pipe(stdout))),
+        writer: Writer {
+            io: Some(Transport::Pipe(stdin)),
+            child: Some(child),
+        },
+        remote: None,
         welcome: Welcome::default(),
         commands: Vec::new(),
-    }))
-}
-
-struct BridgeWriter {
-    stdin: ChildStdin,
-    child: Child,
-}
-
-impl Write for BridgeWriter {
-    fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
-        self.stdin.write(bytes)
-    }
-    fn flush(&mut self) -> io::Result<()> {
-        self.stdin.flush()
-    }
-}
-
-impl WriteTransport for BridgeWriter {
-    fn shutdown(&mut self) {
-        // Killing our bridge releases stdout even if the remote daemon is stalled.
-        let _ = self.child.kill();
-        let _ = self.child.wait();
-    }
+    })
 }
 
 /// Copies this build to `~/.a/runtime/<id>/a` on `host`; a host of another
 /// OS or architecture is refused.
-fn install(host: &str, staged: &Staged) -> io::Result<()> {
+pub(crate) fn install(host: &str, staged: &Staged) -> io::Result<()> {
     let uname = command("A_SSH", "ssh")
         .args([host, "uname -sm"])
         .stdin(Stdio::null())
@@ -150,7 +142,7 @@ fn sh(script: &str) -> String {
 }
 
 /// Distinguishes our sync line from anything a login shell could print.
-fn token() -> String {
+pub(crate) fn token() -> String {
     let nanos = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .map_or(0, |d| d.as_nanos());

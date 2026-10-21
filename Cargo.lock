@@ -26,6 +26,7 @@ dependencies = [
  "libc",
  "llm",
  "protocol",
+ "rt",
  "rustix",
  "serde_json",
  "sys",
@@ -348,6 +349,7 @@ version = "0.0.0"
 dependencies = [
  "ext-logging",
  "protocol",
+ "rt",
  "serde_json",
  "sys",
 ]
@@ -2065,6 +2067,7 @@ version = "0.0.0"
 dependencies = [
  "client",
  "protocol",
+ "rt",
  "serde_json",
  "smallvec",
  "smol_str",

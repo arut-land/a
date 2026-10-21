@@ -58,7 +58,7 @@ struct SessionList: View {
         .toolbar {
             Button("New Session", systemImage: "plus") { model.chooseWorkspace() }
         }
-        .task {
+        .task(id: model.client?.build()) {
             await model.list?.follow { model.openRequested() }
         }
     }
