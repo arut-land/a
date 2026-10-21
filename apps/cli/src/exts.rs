@@ -40,6 +40,8 @@ fn linked(config: &Config) -> Result<Registry, Refused> {
     let built = built.with(Tier::Pre, &configured::<ext_prompt::Prompt>(config)?)?;
     #[cfg(feature = "shell")]
     let built = built.with(Tier::Pre, &configured::<ext_shell::Shell>(config)?)?;
+    #[cfg(feature = "mcp")]
+    let built = built.with(Tier::Pre, &configured::<ext_mcp::Mcp>(config)?)?;
     // Needs the shell: without it, this does not compile.
     #[cfg(feature = "edit")]
     let built = built.with(Tier::Pre, &configured::<ext_edit::Edit>(config)?)?;

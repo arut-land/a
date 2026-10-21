@@ -13,6 +13,7 @@ ext.workspace = true
 ext-compact = { workspace = true, optional = true }
 ext-edit = { workspace = true, optional = true }
 ext-fixtures.workspace = true
+ext-mcp = { workspace = true, optional = true }
 ext-lua = { workspace = true, optional = true }
 ext-policy = { workspace = true, optional = true }
 ext-prompt = { workspace = true, optional = true }
@@ -29,9 +30,11 @@ usage-rs.workspace = true
 web = { workspace = true, optional = true }
 
 [features]
-default = ["web", "policy", "prompt", "shell", "edit", "compact", "retry", "settings", "subagent", "title"]
+default = ["mcp", "web", "policy", "prompt", "shell", "edit", "compact", "retry", "settings", "subagent", "title"]
 # User mods; opt-in until quiet-machine startup has been verified.
 lua = ["dep:ext-lua"]
+# Lazy Model Context Protocol servers.
+mcp = ["shell", "dep:ext-mcp"]
 # `a web`; about 110 KiB of the release binary.
 web = ["dep:web"]
 # Which calls wait for the user's approval.
@@ -65,6 +68,7 @@ llm = { workspace = true, features = ["tls-native"] }
 llm = { workspace = true, features = ["tls-rustls"] }
 
 [dev-dependencies]
+ext-mcp = { workspace = true, features = ["fixture"] }
 ext-fixtures = { workspace = true, features = ["on"] }
 
 [target.'cfg(unix)'.dev-dependencies]

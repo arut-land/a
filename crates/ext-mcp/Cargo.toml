@@ -1,0 +1,40 @@
+[package]
+name = "ext-mcp"
+version.workspace = true
+edition.workspace = true
+publish.workspace = true
+autotests = false
+
+[dependencies]
+base64 = { version = "0.23", default-features = false, features = ["alloc"] }
+ext.workspace = true
+ext-derive.workspace = true
+http.workspace = true
+llm = { workspace = true, features = ["ureq"] }
+protocol.workspace = true
+rt.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+sys.workspace = true
+
+[dev-dependencies]
+ext = { workspace = true, features = ["testing"] }
+ext-shell.workspace = true
+ext-policy.workspace = true
+
+[lints]
+workspace = true
+
+[features]
+fixture = []
+
+[[bin]]
+name = "mcp-fixture"
+path = "tests/server.rs"
+required-features = ["fixture"]
+test = false
+
+[[test]]
+name = "client"
+path = "tests/client.rs"
+required-features = ["fixture"]

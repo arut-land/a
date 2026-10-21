@@ -15,6 +15,8 @@ mod home;
 mod hygiene;
 #[cfg(feature = "lua")]
 mod lua;
+#[cfg(feature = "mcp")]
+mod mcp;
 mod pipe;
 mod reactor;
 mod remote;
