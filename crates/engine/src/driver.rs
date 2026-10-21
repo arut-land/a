@@ -1889,6 +1889,8 @@ impl Actor {
     fn retire_contexts(&mut self) {
         self.live.session.fence.fetch_add(1, Ordering::SeqCst);
         self.live.session.cancel_all();
+        // Retirement also cancels the deferred sync task; later writes need a new timer.
+        self.journal.sync_armed = false;
         self.detached.clear();
     }
 
@@ -1910,7 +1912,6 @@ impl Actor {
         self.journal.unsynced.clear();
         self.journal.waiting_sync.clear();
         self.journal.waiting_mutations.clear();
-        self.journal.sync_armed = false;
         self.journal.writer.take();
     }
 
