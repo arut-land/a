@@ -685,6 +685,7 @@ name = "ext-prompt"
 version = "0.0.0"
 dependencies = [
  "ext",
+ "sys",
 ]
 
 [[package]]
@@ -2171,7 +2172,6 @@ version = "0.0.0"
 dependencies = [
  "client",
  "protocol",
- "rustix",
  "serde",
  "serde_json",
  "smallvec",
@@ -2420,6 +2420,7 @@ dependencies = [
  "rt",
  "serde",
  "serde_json",
+ "sys",
  "uuid",
 ]
 

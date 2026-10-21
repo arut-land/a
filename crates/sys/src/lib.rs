@@ -10,6 +10,7 @@
 mod awake;
 pub mod config;
 pub mod crash;
+mod desktop;
 mod endpoint;
 pub mod fs;
 pub mod install;
@@ -23,6 +24,7 @@ mod runtime;
 #[path = "unstaged.rs"]
 mod runtime;
 mod signals;
+pub mod terminal;
 mod workspace;
 
 use std::io;
@@ -30,13 +32,14 @@ use std::path::{Path, PathBuf};
 
 pub use awake::Awake;
 pub use config::Config;
+pub use desktop::open_browser;
 pub use endpoint::{Endpoint, Listener, Stream};
 pub use fs::{read_exact_at, sync_data, write_watch};
 pub use login::login_env;
 pub use platform::{Arch, Os, Platform};
 pub use proc::{
     ExitWatch, Group, Pass, Passed, adopt_lock, boot_id, detach_session, exit_signal, exit_watch,
-    pass, process_started, signal_process,
+    find_bash, pass, process_started, signal_process,
 };
 pub use runtime::{Runtime, Staged, VERSION};
 pub use signals::{Signals, reraise};
