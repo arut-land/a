@@ -32,6 +32,7 @@ pub const RESTART_CAP: u16 = 10;
 /// generation its steps run on.
 pub struct Core {
     registry: Arc<dyn Binding>,
+    generation_context: Option<String>,
     fold: Fold,
     turn: Turn,
     /// Whether the session is a child, which reports as it settles.
@@ -89,6 +90,7 @@ impl Core {
     pub fn restore(registry: Arc<dyn Binding>, ledger: Ledger) -> Self {
         Self {
             fold: Fold::restore(registry.agent(), ledger),
+            generation_context: registry.generation_context(),
             registry,
             turn: Turn::Idle,
             child: false,
@@ -688,8 +690,29 @@ impl Core {
         Some(self.append(fx, body))
     }
 
+    fn publish_generation(&mut self, fx: &mut Effects) {
+        let Some(text) = self.generation_context.as_ref() else {
+            return;
+        };
+        let key = Json::encode(text).expect("context text encodes");
+        if !self.fold.ledger.publications().contains("generation", &key) {
+            let publication = protocol::publication::Publication {
+                namespace: "generation".into(),
+                key,
+            };
+            self.append(
+                fx,
+                Body::Context {
+                    text: text.clone(),
+                    publication: Some(publication),
+                },
+            );
+        }
+    }
+
     /// Has model call `call` prepared again, as attempt `attempt`.
     fn again(&mut self, call: CallId, attempt: u16, fx: &mut Effects) {
+        self.publish_generation(fx);
         let choice = match self.fold.ledger.call(call).map(|open| &open.call) {
             Some(&Call::Model { choice, .. }) => choice,
             _ => ToolChoice::Auto,
@@ -778,7 +801,10 @@ impl Core {
             _ => matches!(self.step_of(call), Some(Step::Awaiting { .. })),
         };
         let running = self.step_of(call) == Some(Step::Running);
-        let ext = matches!(note, Note::State { .. } | Note::Edit { .. });
+        let ext = matches!(
+            note,
+            Note::State { .. } | Note::Publish { .. } | Note::Edit { .. }
+        );
         if !(running || deciding && ext) {
             return;
         }
@@ -795,6 +821,27 @@ impl Core {
             },
             Note::Progress(text) => Body::Progress { call, text },
             Note::State { ext, state, data } => Body::Ext { ext, state, data },
+            Note::Publish {
+                namespace,
+                key,
+                text,
+            } => {
+                if !self.fold.ledger.has_context()
+                    && let Some(text) = self.registry.context()
+                {
+                    self.append(
+                        fx,
+                        Body::Context {
+                            text,
+                            publication: None,
+                        },
+                    );
+                }
+                Body::Context {
+                    text,
+                    publication: Some(protocol::publication::Publication { namespace, key }),
+                }
+            }
             Note::Edit {
                 target,
                 upto,
@@ -985,8 +1032,15 @@ impl Core {
                 if !self.fold.ledger.has_context()
                     && let Some(text) = self.registry.context()
                 {
-                    self.append(fx, Body::Context { text });
+                    self.append(
+                        fx,
+                        Body::Context {
+                            text,
+                            publication: None,
+                        },
+                    );
                 }
+                self.publish_generation(fx);
                 let model = self.registry.model();
                 let body = Body::ModelCall {
                     request: None,
@@ -1167,6 +1221,7 @@ impl Core {
     fn resolve(&mut self, next: Arc<dyn Binding>, fx: &mut Effects) {
         let installed = next.installed();
         let changed = installed != self.registry.installed();
+        self.generation_context = next.generation_context();
         self.registry = next;
         if changed {
             self.append(fx, Body::Extensions { installed });

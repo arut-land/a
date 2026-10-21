@@ -23,6 +23,7 @@ ext-policy = { path = "crates/ext-policy" }
 ext-prompt = { path = "crates/ext-prompt" }
 ext-retry = { path = "crates/ext-retry" }
 ext-settings = { path = "crates/ext-settings" }
+ext-skills = { path = "crates/ext-skills" }
 ext-shell = { path = "crates/ext-shell" }
 ext-subagent = { path = "crates/ext-subagent" }
 ext-title = { path = "crates/ext-title" }

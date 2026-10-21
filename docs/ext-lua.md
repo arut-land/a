@@ -69,6 +69,8 @@ Tool context functions use a dot, not a colon:
 | Function | Result |
 | --- | --- |
 | `cx.state(name)` | This mod's committed fold value, or nil if absent |
+| `cx.publish(key, text)` | Await a context publication whose key and text are one sealed entry |
+| `cx.published(key)` | Whether the publication remains in effective context |
 | `cx.update(name, change)` | Await a durable change; the next read sees it |
 | `cx.progress(text)` | Publish call progress |
 | `cx.tool(name, input)` | Await a granted tool through policy |

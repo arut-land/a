@@ -13,17 +13,18 @@ use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
 /// The protocol this build speaks best.
-pub const PROTO: u32 = 8;
+pub const PROTO: u32 = 9;
 
 /// The oldest protocol this build still speaks: a peer whose range
 /// overlaps `PROTO_MIN..=PROTO` is served at the highest version both speak.
-pub const PROTO_MIN: u32 = 8;
+pub const PROTO_MIN: u32 = 9;
 
 const MAX_FRAME: u32 = 16 * 1024 * 1024;
 
 #[macro_use]
 mod decode;
 pub mod ledger;
+pub mod publication;
 pub mod view;
 
 pub use json::Json;
@@ -222,7 +223,7 @@ kinds! {
         /// agent notes), which the model reads as a user message ahead of the
         /// conversation. Logged once, before the first model call, so the
         /// system prompt stays the same across sessions and cacheable.
-        Context "context" { text: String } = Durable;
+        Context "context" { text: String, publication: Option<publication::Publication> = default } = Durable;
         // ── calls: each intent is logged before the effect it names ────
         /// The committed intent to ask a model for a reply; a retry is an
         /// intent of its own, its `attempt` one more. With `choice` none the

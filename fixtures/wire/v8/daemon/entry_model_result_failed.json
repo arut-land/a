@@ -1,1 +1,1 @@
-{"t":"entry","seq":9,"epoch":0,"kind":"model_result","call":8,"for":4,"outcome":{"status":"failed","error":"rate limited"},"failure":{"opaque":"model failure"}}
+{"t":"entry","seq":9,"epoch":0,"kind":"model_result","call":8,"outcome":{"status":"failed","error":"rate limited"}}

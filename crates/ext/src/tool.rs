@@ -153,6 +153,44 @@ impl Cx {
         }
     }
 
+    /// Seals a typed publication key and its model context in one log entry.
+    pub fn publish<P: crate::Publication>(
+        &self,
+        key: &P::Key,
+        text: String,
+    ) -> BoxFuture<'static, ()> {
+        match Json::encode(key) {
+            Ok(key) => self.publish_erased(P::NAME, key, text),
+            Err(error) => {
+                eprintln!("warning: publication {}: {error}", P::NAME);
+                Box::pin(std::future::ready(()))
+            }
+        }
+    }
+
+    pub fn published<P: crate::Publication>(&self, key: &P::Key) -> bool {
+        let Ok(key) = Json::encode(key) else {
+            return false;
+        };
+        self.published_erased(P::NAME, &key)
+    }
+
+    pub fn publish_erased(
+        &self,
+        namespace: &str,
+        key: Json,
+        text: String,
+    ) -> BoxFuture<'static, ()> {
+        self.host.publish(namespace, key, text)
+    }
+
+    pub fn published_erased(&self, namespace: &str, key: &Json) -> bool {
+        let mut published = false;
+        self.host
+            .states(&mut |states| published = states.publications().contains(namespace, key));
+        published
+    }
+
     /// Reads a fold named at run time, as JSON.
     pub fn state_erased(&self, ext: &str, name: &str) -> Option<Json> {
         let mut value = None;

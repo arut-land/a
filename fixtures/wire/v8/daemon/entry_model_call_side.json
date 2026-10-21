@@ -1,1 +1,1 @@
-{"t":"entry","seq":10,"epoch":0,"kind":"model_call","model":"openai:m","for":8,"purpose":"compact","request":{"opaque":"side intent"}}
+{"t":"entry","seq":10,"epoch":0,"kind":"model_call","model":"openai:m","for":8,"purpose":"compact"}

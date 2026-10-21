@@ -106,7 +106,7 @@ impl Transcript {
                 None => return,
             },
             Body::Assistant { text } => Message::assistant(text.clone()),
-            Body::Context { text } => {
+            Body::Context { text, .. } => {
                 self.messages
                     .insert(self.context, Message::user(text.clone()));
                 self.context += 1;

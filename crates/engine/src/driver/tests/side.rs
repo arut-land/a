@@ -168,6 +168,46 @@ fn a_context_overflow_is_compacted_and_sent_again() {
     assert!(matches!(&messages[0], llm::Message::User(u) if format!("{u:?}").contains("summary")));
 }
 
+struct Index;
+impl Extension for Index {
+    const NAME: &'static str = "index";
+    const VERSION: u32 = 1;
+    fn contribute(&self, r: &mut Registrar) {
+        r.text(ext::Text::generation("index", 0, "available: review"));
+    }
+}
+
+#[test]
+fn a_compaction_retry_republishes_the_index_and_keeps_the_summary() {
+    let http = Flaky::new([
+        Reply::Status(413, &[]),
+        Reply::Events(text_reply()),
+        Reply::Events(text_reply()),
+    ]);
+    let registry = Registry::default()
+        .with(&Index)
+        .unwrap()
+        .with(&ext_compact::Compact::default())
+        .unwrap();
+    let session = fixture(registry, &http).start(&[]);
+    session.submit("hi").unwrap();
+    settle(&session);
+    let log = log_of(&session);
+    session.halt();
+    assert_eq!(http.sent(), 3, "{log:#?}");
+    assert_eq!(
+        log.iter()
+            .filter(|e| matches!(&e.body,
+        Body::Context { text, .. } if text == "available: review"))
+            .count(),
+        2
+    );
+    let bodies = http.bodies();
+    let resent = bodies[2].to_string();
+    assert!(resent.contains("available: review"), "{resent}");
+    assert!(resent.contains("summary of the conversation"), "{resent}");
+}
+
 /// An edit changes what the model sees from then on, and nothing else:
 /// the transcript before it is as it was, and the log keeps every entry.
 #[test]
@@ -799,4 +839,103 @@ fn a_background_result_stays_out_of_context_after_its_intent_is_compacted() {
         Arc::new(Registry::default()),
     );
     assert_eq!(messages, [llm::Message::user("summary")]);
+}
+
+#[test]
+fn compacted_forks_keep_loaded_skills_in_context_and_background_results_out() {
+    let home = std::env::temp_dir().join(format!("a-side-skills-{}", SessionId::new()));
+    let workspace = home.join("ws");
+    let directory = workspace.join(".a/skills/review");
+    std::fs::create_dir_all(&directory).unwrap();
+    let file = directory.join("SKILL.md");
+    std::fs::write(
+        &file,
+        "---\nname: review\ndescription: Review a change\n---\nprivate review instructions",
+    )
+    .unwrap();
+    let release = Flag::default();
+    let base = Registry::default()
+        .with(&Probes)
+        .unwrap()
+        .with(&DelayedSide(release.clone()))
+        .unwrap()
+        .with(&ext_fork::Fork)
+        .unwrap();
+    let loader = ext_skills::Loader::new(&home, ext_skills::Skills::default(), base.clone(), None);
+    let fixture = Fixture::new(
+        "probes",
+        base.with(&loader).unwrap(),
+        openai(&Script::new(&[])),
+    );
+    let header = Header {
+        workspace,
+        ..Fixture::header()
+    };
+    let session = Live::start(&header, &fixture.0, Open::Create, Owner::None).unwrap();
+    let load = |session: &Arc<Live>, expected: &str| {
+        session.submit("/review").unwrap();
+        settle(session);
+        let log = log_of(session);
+        let output = log
+            .iter()
+            .rev()
+            .find_map(|e| match &e.body {
+                Body::ToolResult {
+                    outcome: Outcome::Done { output },
+                    ..
+                } => Some(output),
+                _ => None,
+            })
+            .unwrap();
+        assert_eq!(
+            output.parse::<Value>().unwrap(),
+            serde_json::json!({"Ok": expected})
+        );
+    };
+    load(&session, "loaded");
+    session.submit("background").unwrap();
+    until(&session, "background intent", |log| !sides(log).is_empty());
+    settle(&session);
+    session.submit("edit").unwrap();
+    settle(&session);
+    assert_eq!(
+        transcript(&log_of(&session), u64::MAX, Arc::new(Registry::default())),
+        [llm::Message::user("summary")]
+    );
+    load(&session, "loaded");
+    release.set();
+    until(&session, "background result", |log| {
+        let side = sides(log)[0].0;
+        log.iter()
+            .any(|e| matches!(e.body, Body::ModelResult { call, .. } if call == side))
+    });
+    let original = log_of(&session);
+    session.halt();
+    // Restoration must use the installation image, not rediscover this body.
+    std::fs::remove_file(file).unwrap();
+    let fork = copy_history(
+        &header,
+        original.last().unwrap().seq,
+        SessionId::new(),
+        &fixture.0,
+    )
+    .unwrap();
+    let branch = Live::start(&fork, &fixture.0, Open::Load, Owner::None).unwrap();
+    settle(&branch);
+    load(&branch, "already_loaded");
+    let copied = log_of(&branch);
+    branch.halt();
+    assert_eq!(&copied[..original.len()], &original);
+    let messages = transcript(&copied, u64::MAX, Arc::new(Registry::default()));
+    assert_eq!(messages.len(), 4, "{messages:#?}");
+    assert!(format!("{:?}", messages[0]).contains("private review instructions"));
+    assert_eq!(messages[1], llm::Message::user("summary"));
+    assert_eq!(messages[2], llm::Message::user("/review"));
+    assert_eq!(messages[3], llm::Message::user("/review"));
+    let view = SessionView::from_log(fork.id, fork.workspace, &copied);
+    assert_eq!(view.side("probe"), Some("fixture probe"));
+    drop(branch);
+    drop(session);
+    drop(fixture);
+    std::fs::remove_dir_all(home).unwrap();
 }

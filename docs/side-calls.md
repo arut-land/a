@@ -51,7 +51,12 @@ Duplicate consumers also share intents still awaiting that flush.
 `ModelResult` carries the side owner in its own `for` field, so its
 classification survives removal of the intent by compaction or other edits.
 The transcript excludes side results directly without retaining a table of
-intents. The result records the complete response and usage, or an outcome plus
+intents. Forks copy this classification with the result. Skill publications
+follow a different rule: their identity is sealed with their context text,
+and compaction removes both from effective context. Reloading republishes
+the instructions from the recorded catalog, including in a fork after the
+source files vanish. Neither the catalog image nor side replies become
+model context merely by surviving in history. The result records the complete response and usage, or an outcome plus
 an optional structured `llm::Error` in `failure`. The LLM crate owns error
 decoding. The result crosses a barrier before the awaited consumer is
 released. Duplicate consumers are released by durable publication. A

@@ -167,6 +167,24 @@ impl Host for Recorder {
         Box::pin(std::future::ready(()))
     }
 
+    fn publish(&self, namespace: &str, key: Json, text: String) -> BoxFuture<'static, ()> {
+        let mut log = lock(&self.log);
+        let entry = Entry::new(
+            Seq::new(log.len() as u64 + 1).unwrap(),
+            Epoch(0),
+            Body::Context {
+                text,
+                publication: Some(protocol::publication::Publication {
+                    namespace: namespace.to_owned(),
+                    key,
+                }),
+            },
+        );
+        lock(&self.states).apply(&entry);
+        log.push(entry);
+        Box::pin(std::future::ready(()))
+    }
+
     fn edit(&self, target: Seq, upto: Option<Seq>, replace: Option<Json>) {
         let mut log = lock(&self.log);
         let seq = log.len() as u64 + 1;
@@ -175,7 +193,9 @@ impl Host for Recorder {
             upto,
             replace,
         };
-        log.push(Entry::new(Seq::new(seq).unwrap(), Epoch(0), edit));
+        let entry = Entry::new(Seq::new(seq).unwrap(), Epoch(0), edit);
+        lock(&self.states).apply(&entry);
+        log.push(entry);
     }
 
     fn states(&self, read: &mut dyn FnMut(&States)) {

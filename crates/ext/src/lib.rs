@@ -61,7 +61,7 @@ pub use service::{
 };
 pub use settings::{Configured, Empty, Table};
 pub use shape::{Output, Partials, Streamed, stream};
-pub use state::{DynFold, Fold, Image, States};
+pub use state::{Checkpoint, DynFold, Fold, Image, Publication, States};
 pub use tool::{Args, Callable, Called, Concurrency, Cx, DynTool, Parsed, Replay, SpawnSpec, Tool};
 
 /// A runtime name: of an extension, a tool, an agent. Typed Rust items

@@ -1266,7 +1266,7 @@ fn the_model_gets_the_prompt_and_the_logged_context_first() {
     let log = log_of(&session);
     session.halt();
 
-    let Body::Context { text } = &log[1].body else {
+    let Body::Context { text, .. } = &log[1].body else {
         panic!("{log:#?}")
     };
     assert!(

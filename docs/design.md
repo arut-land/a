@@ -154,6 +154,7 @@ The linked extensions own:
 | `ext-prompt` | System prompt |
 | `ext-policy` | Permission modes, judge and guarded operator floor |
 | `ext-settings` | Model choice fold and model-spec service |
+| `ext-skills` | Skill index and instructions loaded on demand from workspace generations |
 | `ext-retry`, `ext-compact` | Retryable failures; overflow recovery and transcript edits |
 | `ext-subagent` | `task` over owned child sessions |
 | `ext-title` | Titles from a side model call |
@@ -167,7 +168,10 @@ awaited or background execution, committed results, and bounded retries;
 title, compact and the policy judge use it. Compaction edits the model's
 transcript without erasing history. Optional [Lua mods](ext-lua.md) already support tools,
 wire points, folds, text and agents in a bounded sandbox. They do not expose
-every Rust service or decision point. MCP remains planned.
+every Rust service or decision point. [Skills](ext-skills.md) publish a small
+index per adopted generation and load instructions through a typed tool or
+user command. Both index and instructions are ordinary logged context; reload
+adoption waits for rest. MCP remains planned.
 
 ## Runtime, wire and clients
 
@@ -220,6 +224,7 @@ Do not treat a historical result as a current budget pass.
 - [Sessions](perf/sessions.md): whole-log versus snapshot load, retained
   memory and commit costs for the two durability settings.
 - [Lua](perf/lua.md): runtime choice, optional-build cost and sandbox budgets.
+- [Skills](perf/skills.md): frontmatter parser comparison and shipped size.
 
 `mise run size` checks shipped bytes and fixture exclusion. `budgets` checks
 cold first reply, attach latency, idle RSS and quiet shell execution on an
@@ -234,15 +239,14 @@ this does not establish a working Windows daemon.
 **Done:** durable CLI sessions on macOS/Linux; connect-or-spawn, staging,
 drain/reconnect, CRC logs, snapshots, recovery, typed extensions and policy;
 recorded provider codecs; TUI, web and SwiftUI renderers over the client SDK;
-optional Lua mods; child sessions; side model calls for title, compact and
-judge with purpose/outcome logging; conversation-only forks from `(session, seq)`
-with independent copied logs, recorded ancestry, exact Lua generations and
-rest-point validation ([fork semantics](fork.md)). These supersede the original
-M1/M2/M3 schedule: web and remote SSH are already present.
+optional Lua mods; lazy skill instructions; child sessions; side model calls
+for title, compact and judge with purpose/outcome logging; conversation-only
+forks from `(session, seq)` with independent copied logs, recorded ancestry,
+exact extension generations and rest-point validation ([fork semantics](fork.md)).
+These supersede the original M1/M2/M3 schedule: web and remote SSH are already present.
 
 **Next:**
 
-- `ext-skills`: skill discovery and loading on SDK primitives.
 - `ext-mcp`: external tools through the registry and existing policy path.
 - Approval explanations that retain and present why a call needs consent.
 - Audit essential non-derivable facts: exact sent-request identity, runtime

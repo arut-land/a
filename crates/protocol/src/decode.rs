@@ -25,6 +25,7 @@ use serde::{Deserialize, forward_to_deserialize_any};
 use serde_json::{Error, Result};
 
 use crate::ledger::{Ledger, Phase};
+use crate::publication;
 use crate::view::{Item, SessionView, Status, Usage};
 use crate::{
     Activity, Audience, Author, Body, CallId, Caps, Card, ClientDecl, ClientId, ClientMsg,
@@ -249,6 +250,7 @@ macro_rules! same {
 }
 
 same!(
+    publication::Publication,
     String,
     bool,
     u16,
@@ -387,6 +389,7 @@ fn present<'de, D: Deserializer<'de>>(d: D) -> std::result::Result<Option<Json>,
 /// An [`Entry`], or a [`Verdict`] within one.
 #[derive(Deserialize)]
 pub(crate) struct EntryFields {
+    pub(crate) publication: Option<publication::Publication>,
     pub(crate) seq: Option<u64>,
     pub(crate) epoch: Option<u32>,
     pub(crate) kind: Option<Tag>,
