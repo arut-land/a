@@ -95,7 +95,7 @@ impl Record {
     }
 }
 
-/// One field a line: the pid first, so older readers still find it.
+/// The complete current daemon record, one field per line.
 impl fmt::Display for Record {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         let token = self.token.map_or_else(|| "-".to_owned(), |t| t.to_string());
@@ -109,12 +109,29 @@ impl FromStr for Record {
     fn from_str(text: &str) -> io::Result<Self> {
         let bad = || io::Error::new(io::ErrorKind::InvalidData, "unreadable daemon record");
         let mut lines = text.lines().map(str::trim);
-        let pid = lines.next().and_then(|l| l.parse().ok()).ok_or_else(bad)?;
+        let pid = lines
+            .next()
+            .and_then(|l| l.parse().ok())
+            .filter(|&pid| pid > 0)
+            .ok_or_else(bad)?;
+        let started = lines.next().and_then(|l| l.parse().ok()).ok_or_else(bad)?;
+        let token = match lines.next().ok_or_else(bad)? {
+            "-" => None,
+            value => Some(value.parse().map_err(|_| bad())?),
+        };
+        let build = lines
+            .next()
+            .filter(|s| !s.is_empty())
+            .ok_or_else(bad)?
+            .to_owned();
+        if lines.next().is_some() {
+            return Err(bad());
+        }
         Ok(Self {
             pid,
-            started: lines.next().and_then(|l| l.parse().ok()).unwrap_or(0),
-            token: lines.next().and_then(|l| l.parse().ok()),
-            build: lines.next().unwrap_or_default().to_owned(),
+            started,
+            token,
+            build,
         })
     }
 }
@@ -471,11 +488,31 @@ mod tests {
     }
 
     #[test]
+    fn malformed_daemon_records_are_rejected() {
+        for text in [
+            "42",
+            "42\n1",
+            "42\n1\n-",
+            "42\n1\n-\n",
+            "42\nbad\n-\nb1",
+            "42\n1\nbad\nb1",
+            "42\n1\n-\nb1\nextra",
+            "0\n1\n-\nb1",
+            "42\n1\n-\n ",
+        ] {
+            assert!(text.parse::<Record>().is_err(), "{text:?}");
+        }
+        for token in ["-", "123"] {
+            assert!(format!("42\n1\n{token}\nb1\n").parse::<Record>().is_ok());
+        }
+    }
+
+    #[test]
     fn a_record_reads_back_and_knows_its_process() {
         let me = Record::current("b1");
         assert_eq!(me.to_string().parse::<Record>().unwrap(), me);
         assert!(me.is_live());
-        assert_eq!("42".parse::<Record>().unwrap().pid, 42);
+        assert!("42".parse::<Record>().is_err());
         assert!("".parse::<Record>().is_err());
         #[cfg(any(target_os = "linux", target_vendor = "apple"))]
         {
