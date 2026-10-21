@@ -151,6 +151,10 @@ macro_rules! kinds {
         }
 
         const _: () = assert!($crate::decode::distinct($E::TAGS), "two kinds share a tag");
+        const _: () = assert!(
+            $crate::decode::Tag::fits($E::TAGS),
+            "a declared tag exceeds its decoder capacity",
+        );
     };
 
     (@build $E:ident $V:ident $f:ident [$dec:path] $($fields:tt)?) => { return $dec($f) };
@@ -347,6 +351,17 @@ pub(crate) struct Tag {
 
 impl Tag {
     const MAX: usize = 22;
+
+    pub(crate) const fn fits(tags: &[&str]) -> bool {
+        let mut i = 0;
+        while i < tags.len() {
+            if tags[i].is_empty() || tags[i].len() > Self::MAX || tags[i].len() > u8::MAX as usize {
+                return false;
+            }
+            i += 1;
+        }
+        true
+    }
 
     pub(crate) fn as_str(&self) -> &str {
         std::str::from_utf8(&self.bytes[..usize::from(self.len)]).unwrap_or_default()
