@@ -16,6 +16,7 @@ pub(crate) struct Client {
     input: rt::Async<File>,
     output: rt::Async<File>,
     pending: Vec<u8>,
+    scratch: Box<[u8; 8192]>,
     next: u64,
     inflight: Option<u64>,
     group: sys::Group,
@@ -113,6 +114,7 @@ impl Client {
                 output: rt::Async::for_reading(&rt.reactor(), sys::child_output(output))
                     .map_err(|e| io(&e))?,
                 pending: Vec::new(),
+                scratch: Box::new([0; 8192]),
                 next: 0,
                 inflight: None,
                 group,
@@ -179,16 +181,15 @@ impl Client {
             if self.pending.len() > rpc::LIMIT {
                 return Err(Failure::Limit);
             }
-            let mut bytes = [0; 8192];
             let n = self
                 .output
-                .read_with(|mut f| f.read(&mut bytes))
+                .read_with(|mut f| f.read(self.scratch.as_mut()))
                 .await
                 .map_err(|e| io(&e))?;
             if n == 0 {
                 return Err(Failure::Crashed);
             }
-            self.pending.extend_from_slice(&bytes[..n]);
+            self.pending.extend_from_slice(&self.scratch[..n]);
         }
     }
 }

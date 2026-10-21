@@ -41,22 +41,17 @@ impl Incoming {
             self.bytes = self.bytes.checked_sub(bytes).ok_or(Failure::Limit)?;
             if message["method"] == "notifications/progress"
                 && message["params"]["progressToken"] == self.id
+                && let Some(text) = message["params"]["message"].as_str()
             {
-                if let Some(text) = message["params"]["message"].as_str() {
-                    self.progress.pending = Some(
-                        text[..text.floor_char_boundary(PROGRESS_BYTES.min(text.len()))].to_owned(),
-                    );
-                }
+                self.progress.pending = Some(
+                    text[..text.floor_char_boundary(PROGRESS_BYTES.min(text.len()))].to_owned(),
+                );
             }
         }
         Ok(result)
     }
 
-    pub(crate) async fn wait<F: Future + Send>(
-        &mut self,
-        cx: &Cx,
-        future: F,
-    ) -> F::Output
+    pub(crate) async fn wait<F: Future + Send>(&mut self, cx: &Cx, future: F) -> F::Output
     where
         F::Output: Send,
     {
