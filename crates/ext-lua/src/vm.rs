@@ -1,7 +1,9 @@
 use std::future::{Future, poll_fn};
+use std::panic::{AssertUnwindSafe, catch_unwind, resume_unwind};
 use std::pin::pin;
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, PoisonError};
+use std::task::{Poll, Waker};
 use std::time::{Duration, Instant};
 
 use ext::point::ErasedHandler;
@@ -47,7 +49,7 @@ impl Default for Limits {
 struct Budget {
     left: AtomicU64,
     until: Mutex<Instant>,
-    slice: Duration,
+    remaining: Mutex<Duration>,
 }
 
 impl Budget {
@@ -55,12 +57,33 @@ impl Budget {
         Arc::new(Self {
             left: AtomicU64::new(limits.instructions),
             until: Mutex::new(Instant::now() + limits.slice),
-            slice: limits.slice,
+            remaining: Mutex::new(limits.slice),
         })
     }
 
-    fn reset_slice(&self) {
-        *self.until.lock().unwrap_or_else(PoisonError::into_inner) = Instant::now() + self.slice;
+    fn dispatch<T>(
+        self: &Arc<Self>,
+        lua: &Lua,
+        run: impl FnOnce() -> mlua::Result<T>,
+    ) -> mlua::Result<T> {
+        // scope holds the reentrant VM lock: another session cannot inherit this poll's budget.
+        lua.scope(|_| {
+            if lua.app_data_ref::<Arc<Budget>>().is_some() {
+                self.check()?;
+                return run();
+            }
+            let start = Instant::now();
+            *locked(&self.until) = start + *locked(&self.remaining);
+            lua.set_app_data(Arc::clone(self));
+            let result = catch_unwind(AssertUnwindSafe(|| self.check().and_then(|_| run())));
+            lua.remove_app_data::<Arc<Budget>>();
+            let mut remaining = locked(&self.remaining);
+            *remaining = remaining.saturating_sub(start.elapsed());
+            if remaining.is_zero() {
+                return Err(mlua::Error::runtime("lua execution budget exhausted"));
+            }
+            result.unwrap_or_else(|panic| resume_unwind(panic))
+        })
     }
 
     fn check(&self) -> mlua::Result<VmState> {
@@ -69,9 +92,14 @@ impl Budget {
             .try_update(Ordering::Relaxed, Ordering::Relaxed, |left| {
                 left.checked_sub(1000)
             });
-        if left.is_err()
-            || Instant::now() >= *self.until.lock().unwrap_or_else(PoisonError::into_inner)
-        {
+        if left.is_err() {
+            return Err(mlua::Error::runtime("lua execution budget exhausted"));
+        }
+        self.check_time()
+    }
+
+    fn check_time(&self) -> mlua::Result<VmState> {
+        if Instant::now() >= *locked(&self.until) {
             Err(mlua::Error::runtime("lua execution budget exhausted"))
         } else {
             Ok(VmState::Continue)
@@ -379,13 +407,27 @@ impl Mod {
     }
 
     /// Compiles one generation; registration is transactional.
+    /// Tools, hooks and agents share mutable Lua globals across all sessions of
+    /// this generation. Durable per-session state belongs in folds, whose VM is separate.
     pub fn load(
         name: &str,
         source: &str,
         tools: &[String],
         limits: Limits,
     ) -> Result<Self, Refused> {
-        Self::compile(name, source, tools, limits, false)
+        if limits.memory == 0 || limits.instructions < 1000 || limits.slice.is_zero() {
+            return Err(Refused(format!(
+                "lua {name}: lua limits must be positive (at least 1000 instructions)"
+            )));
+        }
+        // Lua's parser does not run instruction hooks. Bound its input before
+        // compilation and check the shared preparation deadline around native work.
+        if source.len() > limits.memory / 4 {
+            return Err(Refused(format!(
+                "lua {name}: lua preparation source exceeds budget"
+            )));
+        }
+        Self::compile(name, source, tools, limits, false, &Budget::new(limits))
             .map_err(|why| Refused(format!("lua {name}: {why}")))
     }
 
@@ -395,15 +437,12 @@ impl Mod {
         tools: &[String],
         limits: Limits,
         fold_only: bool,
+        budget: &Arc<Budget>,
     ) -> mlua::Result<Self> {
-        if limits.memory == 0 || limits.instructions < 1000 || limits.slice.is_zero() {
-            return Err(mlua::Error::runtime(
-                "lua limits must be positive (at least 1000 instructions)",
-            ));
-        }
+        budget.check_time()?;
         let (lua, callbacks) = sandbox(limits)?;
         let made = register(&lua)?;
-        let budget = Budget::new(limits);
+        let hook = Arc::clone(budget);
         let thread = lua.create_thread(
             lua.load(source)
                 .set_name(name)
@@ -412,8 +451,9 @@ impl Mod {
         )?;
         thread.set_hook(
             HookTriggers::new().every_nth_instruction(1000),
-            move |_, _| budget.check(),
+            move |_, _| hook.check(),
         )?;
+        budget.check_time()?;
         thread.resume::<()>(())?;
         let mut made = std::mem::take(&mut *locked(&made));
         let name = Name::from(name);
@@ -484,7 +524,7 @@ impl Mod {
         if !fold_only && !made.folds.is_empty() {
             // Folding happens under the session state lock. Its VM must never
             // share a lock with callbacks that read that session's state.
-            result.folds = Self::compile(&name, source, tools, limits, true)?.folds;
+            result.folds = Self::compile(&name, source, tools, limits, true, budget)?.folds;
         } else if fold_only {
             for spec in made.folds {
                 result.folds.push(Arc::new(LuaFold {
@@ -496,6 +536,7 @@ impl Mod {
                 }));
             }
         }
+        budget.check_time()?;
         Ok(result)
     }
 }
@@ -584,13 +625,25 @@ impl ext::Agent for LuaAgent {
 }
 
 fn sync(lua: &Lua, run: &Function, args: (Value, Value), limits: Limits) -> mlua::Result<Json> {
-    let budget = Budget::new(limits);
-    let thread = lua.create_thread(run.clone())?;
-    thread.set_hook(
-        HookTriggers::new().every_nth_instruction(1000),
-        move |_, _| budget.check(),
-    )?;
-    encode(&thread.resume(args)?)
+    lua.scope(|_| {
+        let budget = lua.app_data_ref::<Arc<Budget>>().map_or_else(
+            || {
+                ext::point::dispatch_local(lua.globals().to_pointer() as usize, || {
+                    Budget::new(limits)
+                })
+            },
+            |budget| Arc::clone(&budget),
+        );
+        budget.dispatch(lua, || {
+            let hook = Arc::clone(&budget);
+            let thread = lua.create_thread(run.clone())?;
+            thread.set_hook(
+                HookTriggers::new().every_nth_instruction(1000),
+                move |_, _| hook.check(),
+            )?;
+            encode(&thread.resume(args)?)
+        })
+    })
 }
 
 struct Hook {
@@ -706,6 +759,7 @@ impl Drop for ActiveCall {
 struct Callbacks {
     calls: Arc<Mutex<std::collections::BTreeMap<u64, Call>>>,
     next: Arc<AtomicU64>,
+    admission: Arc<Mutex<Admission>>,
     update: Function,
     publish: Function,
     published: Function,
@@ -797,11 +851,38 @@ impl Callbacks {
         Ok(Self {
             calls,
             next: Arc::new(AtomicU64::new(0)),
+            admission: Arc::default(),
             update,
             publish,
             published,
             invoke,
         })
+    }
+}
+
+#[derive(Default)]
+struct Admission {
+    active: usize,
+    waiters: std::collections::BTreeMap<u64, Waker>,
+}
+
+struct Permit<'a> {
+    admission: &'a Mutex<Admission>,
+    id: u64,
+    active: bool,
+}
+impl Drop for Permit<'_> {
+    fn drop(&mut self) {
+        let mut admission = locked(self.admission);
+        admission.waiters.remove(&self.id);
+        if self.active {
+            admission.active -= 1;
+        }
+        let waiters: Vec<_> = admission.waiters.values().cloned().collect();
+        drop(admission);
+        for waker in waiters {
+            waker.wake();
+        }
     }
 }
 
@@ -820,6 +901,27 @@ struct LuaTool {
 
 impl LuaTool {
     async fn execute(&self, input: &Json, cx: &Cx) -> mlua::Result<Json> {
+        let id = self.callbacks.next.fetch_add(1, Ordering::Relaxed);
+        let mut permit = Permit {
+            admission: &self.callbacks.admission,
+            id,
+            active: false,
+        };
+        poll_fn(|cx| {
+            let mut admission = locked(permit.admission);
+            if admission.active < 16 {
+                admission.waiters.remove(&id);
+                admission.active += 1;
+                permit.active = true;
+                Poll::Ready(Ok(()))
+            } else if admission.waiters.len() >= 64 && !admission.waiters.contains_key(&id) {
+                Poll::Ready(Err(mlua::Error::runtime("lua execution admission full")))
+            } else {
+                admission.waiters.insert(id, cx.waker().clone());
+                Poll::Pending
+            }
+        })
+        .await?;
         let context = self.lua.create_table()?;
         context.set("session", cx.session.to_string())?;
         let call = Arc::new(cx.clone());
@@ -839,7 +941,6 @@ impl LuaTool {
             })?,
         )?;
         let quota = Quota::new();
-        let id = self.callbacks.next.fetch_add(1, Ordering::Relaxed);
         let active = ActiveCall {
             calls: Arc::clone(&self.callbacks.calls),
             id,
@@ -869,7 +970,10 @@ impl LuaTool {
                 Ok(())
             })?,
         )?;
-        let budget = Budget::new(self.limits);
+        let budget = self
+            .lua
+            .app_data_ref::<Arc<Budget>>()
+            .map_or_else(|| Budget::new(self.limits), |budget| Arc::clone(&budget));
         let hook = Arc::clone(&budget);
         let thread = self.lua.create_thread(self.run.clone())?;
         thread.set_hook(
@@ -878,10 +982,12 @@ impl LuaTool {
         )?;
         let mut work =
             pin!(thread.into_async::<Value>((decode(&self.lua, input)?, Value::Table(context)))?);
-        let value = poll_fn(|cx| {
-            budget.reset_slice();
-            work.as_mut().poll(cx)
-        })
+        let value = poll_fn(
+            |cx| match budget.dispatch(&self.lua, || Ok(work.as_mut().poll(cx))) {
+                Ok(poll) => poll,
+                Err(error) => Poll::Ready(Err(error)),
+            },
+        )
         .await?;
         drop(active);
         drop(call);
@@ -957,6 +1063,189 @@ mod tests {
         format!(
             "a.tool{{name='test',description='test',input={{type='object'}},run=function(input,cx) {body} end}}"
         )
+    }
+
+    #[test]
+    fn callback_chains_share_one_dispatch_budget() {
+        let limits = Limits {
+            instructions: 10_000,
+            slice: Duration::from_secs(1),
+            ..Limits::default()
+        };
+        let source = "for i=1,8 do a.on('input',function(input) if input=='slow' then local n=0; for j=1,1000 do n=n+j end end; return a.null end) end";
+        let module = Mod::load("chain", source, &[], limits).unwrap();
+        let rig = Rig::new(
+            "lua-hook-chain",
+            Registry::default()
+                .with_dyn(ext::Tier::User, &module)
+                .unwrap(),
+        );
+        let cx = rig.cx();
+        assert!(
+            rig.registry
+                .hooks()
+                .input(&cx.point(), "slow".into())
+                .unwrap_err()
+                .contains("budget")
+        );
+        assert_eq!(
+            rig.registry
+                .hooks()
+                .input(&cx.point(), "fast".into())
+                .unwrap()
+                .value,
+            "fast"
+        );
+        let (lua, _) = sandbox(limits).unwrap();
+        let inner = lua
+            .load("return function() local n=0; for i=1,1000 do n=n+i end; return n end")
+            .eval::<Function>()
+            .unwrap();
+        lua.globals()
+            .set(
+                "chain",
+                lua.create_function(move |lua, ()| {
+                    for _ in 0..20 {
+                        sync(lua, &inner, (Value::Nil, Value::Nil), limits)?;
+                    }
+                    Ok(())
+                })
+                .unwrap(),
+            )
+            .unwrap();
+        let run = lua
+            .load("return function() chain(); return true end")
+            .eval::<Function>()
+            .unwrap();
+        assert!(
+            sync(&lua, &run, (Value::Nil, Value::Nil), limits)
+                .unwrap_err()
+                .to_string()
+                .contains("budget")
+        );
+        assert!(lua.app_data_ref::<Arc<Budget>>().is_none());
+        let run = lua
+            .load("return function() return true end")
+            .eval::<Function>()
+            .unwrap();
+        assert!(
+            sync(&lua, &run, (Value::Nil, Value::Nil), limits)
+                .unwrap()
+                .parse::<bool>()
+                .unwrap()
+        );
+    }
+
+    #[test]
+    fn cancelled_lua_waiters_release_admission() {
+        let module = Mod::load(
+            "cancel",
+            &tool("return cx.tool('wait','wait',{args='park'})"),
+            &["wait".into()],
+            Limits::default(),
+        )
+        .unwrap();
+        let rig = Rig::new(
+            "lua-admission",
+            Registry::default().with(&Service(false)).unwrap(),
+        );
+        let cx = rig.cx();
+        let input = Json::default();
+        let mut context = std::task::Context::from_waker(Waker::noop());
+        let mut calls: Vec<_> = (0..80)
+            .map(|_| Box::pin(module.tools[0].execute(&input, &cx)))
+            .collect();
+        for call in &mut calls {
+            assert!(call.as_mut().poll(&mut context).is_pending());
+        }
+        let admission = &module.tools[0].callbacks.admission;
+        assert_eq!(locked(admission).active, 16);
+        assert_eq!(locked(admission).waiters.len(), 64);
+        assert!(
+            rt::block_on(module.tools[0].execute(&input, &cx))
+                .unwrap_err()
+                .to_string()
+                .contains("admission full")
+        );
+        calls.pop();
+        assert_eq!(locked(admission).waiters.len(), 63);
+        let mut replacement = Box::pin(module.tools[0].execute(&input, &cx));
+        assert!(replacement.as_mut().poll(&mut context).is_pending());
+        drop(calls.remove(0));
+        assert!(replacement.as_mut().poll(&mut context).is_pending());
+        assert_eq!(locked(admission).active, 16);
+        drop(replacement);
+        drop(calls);
+        assert_eq!(locked(admission).active, 0);
+        assert!(locked(admission).waiters.is_empty());
+        assert!(locked(&module.tools[0].callbacks.calls).is_empty());
+        let mut fresh = Box::pin(module.tools[0].execute(&input, &cx));
+        assert!(fresh.as_mut().poll(&mut context).is_pending());
+        assert_eq!(locked(admission).active, 1);
+        drop(fresh);
+        assert_eq!(locked(admission).active, 0);
+    }
+
+    #[test]
+    fn fold_replay_has_no_tool_vm_state() {
+        let source = "local transient=0; a.tool{name='test',description='test',input={type='object'},run=function(_,cx) transient=transient+1; cx.update('count',1); return transient end}; a.fold{name='count',initial=0,apply=function(state,change) return state+change+transient end}";
+        let module = Mod::load("test", source, &[], Limits::default()).unwrap();
+        let registry = Registry::default()
+            .with_dyn(ext::Tier::User, &module)
+            .unwrap();
+        let rig = Rig::new("lua-isolation", registry.clone());
+        assert_eq!(rig.done("test", &json!({})), 1);
+        let other = Rig::new("lua-shared-generation", registry);
+        assert_eq!(other.done("test", &json!({})), 2);
+        rig.restart();
+        assert_eq!(rig.done("test", &json!({})), 3);
+        let mut replay = rig.registry.states();
+        replay.replay(rig.log.lock().unwrap().iter());
+        assert_eq!(
+            replay
+                .erased("test", "count")
+                .unwrap()
+                .parse::<u64>()
+                .unwrap(),
+            2
+        );
+    }
+
+    #[test]
+    fn preparation_limits_apply_during_compilation() {
+        let limits = Limits::default();
+        let source = " ".repeat(limits.memory / 4 + 1);
+        assert!(
+            Mod::load("large", &source, &[], limits)
+                .err()
+                .unwrap()
+                .0
+                .contains("preparation source")
+        );
+        let limits = Limits {
+            slice: Duration::from_nanos(1),
+            ..limits
+        };
+        assert!(
+            Mod::load("deadline", "return", &[], limits)
+                .err()
+                .unwrap()
+                .0
+                .contains("budget")
+        );
+        let limits = Limits {
+            instructions: 6_000,
+            slice: Duration::from_secs(1),
+            ..Limits::default()
+        };
+        let source = "local n=0; for i=1,2000 do n=n+i end; a.fold{name='count',initial=0,apply=function(s,c) return s+c end}";
+        assert!(
+            Mod::load("aggregate", source, &[], limits)
+                .err()
+                .unwrap()
+                .0
+                .contains("budget")
+        );
     }
 
     #[test]
@@ -1302,7 +1591,7 @@ mod tests {
         let cx = rig.cx();
         let input = Json::default();
         let mut call = Box::pin(module.tools[0].execute(&input, &cx));
-        let mut context = std::task::Context::from_waker(std::task::Waker::noop());
+        let mut context = std::task::Context::from_waker(Waker::noop());
         assert!(call.as_mut().poll(&mut context).is_pending());
         assert_eq!(locked(&module.tools[0].callbacks.calls).len(), 1);
         drop(call);
@@ -1315,7 +1604,10 @@ mod tests {
         type Out = bool;
         const NAME: &'static str = "wait";
         const DESCRIPTION: &'static str = "wait";
-        async fn call(&self, _: &ext::Args, cx: &Cx) -> Result<bool, String> {
+        async fn call(&self, args: &ext::Args, cx: &Cx) -> Result<bool, String> {
+            if args.args == "park" {
+                return std::future::pending().await;
+            }
             cx.service::<dyn rt::Runtime>()
                 .unwrap()
                 .sleep(Duration::from_millis(60))

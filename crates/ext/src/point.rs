@@ -40,7 +40,9 @@
 //! once by [`points!`], which also makes the [`Hooks`] table that holds
 //! their handlers: a point cannot be added without its slot.
 
-use std::any::Any;
+use std::any::{Any, TypeId};
+use std::cell::RefCell;
+use std::collections::BTreeMap;
 use std::convert::Infallible;
 use std::fmt;
 use std::future::{Future, poll_fn};
@@ -464,6 +466,57 @@ impl Rule for Reaction {
             .filter(|reaction| reaction.work.is_some())
             .collect()
     }
+}
+
+type DispatchLocals = BTreeMap<(TypeId, usize), Box<dyn Any>>;
+thread_local! {
+    static DISPATCH: RefCell<Option<DispatchLocals>> = const { RefCell::new(None) };
+}
+
+struct Dispatch(bool);
+impl Dispatch {
+    fn enter() -> Self {
+        Self(DISPATCH.with_borrow_mut(|locals| {
+            if locals.is_some() {
+                false
+            } else {
+                *locals = Some(BTreeMap::new());
+                true
+            }
+        }))
+    }
+}
+impl Drop for Dispatch {
+    fn drop(&mut self) {
+        if self.0 {
+            let locals = DISPATCH.with_borrow_mut(Option::take);
+            drop(locals);
+        }
+    }
+}
+
+/// State shared by sequential and nested synchronous handlers in one dispatch.
+/// `key` identifies the caller's resource (for example a VM). Outside a dispatch,
+/// state is fresh; no state survives the outermost dispatch, including unwinding.
+/// This scope never spans an await or moves between runtime workers.
+pub fn dispatch_local<T: Any>(key: usize, init: impl FnOnce() -> Arc<T>) -> Arc<T> {
+    let slot = (TypeId::of::<T>(), key);
+    if let Some(value) = DISPATCH.with_borrow(|locals| {
+        locals
+            .as_ref()?
+            .get(&slot)?
+            .downcast_ref::<Arc<T>>()
+            .cloned()
+    }) {
+        return value;
+    }
+    let value = init();
+    DISPATCH.with_borrow_mut(|locals| {
+        if let Some(locals) = locals {
+            locals.insert(slot, Box::new(Arc::clone(&value)));
+        }
+    });
+    value
 }
 
 /// What every handler is given: the session it decides for, and the call
@@ -1070,6 +1123,7 @@ impl Hooks {
         subject: &mut Subject<P>,
         replaced: &mut Replaced<'_, Subject<P>>,
     ) -> Merged<P> {
+        let _dispatch = Dispatch::enter();
         P::Out::merge::<P>(self.handlers::<P>(), cx, facts, subject, replaced)
     }
 
@@ -1239,6 +1293,7 @@ impl Hooks {
     ) -> Asked<T> {
         let handlers = self.handlers::<P>();
         let rest = handlers.get(from..).unwrap_or_default();
+        let _dispatch = Dispatch::enter();
         P::Out::merge::<P>(rest, cx, facts, &mut (), &mut |_, (), ()| {}).from(from)
     }
 
