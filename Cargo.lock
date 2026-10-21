@@ -2172,7 +2172,6 @@ version = "0.0.0"
 dependencies = [
  "client",
  "protocol",
- "serde",
  "serde_json",
  "smallvec",
  "smol_str",

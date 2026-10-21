@@ -9,7 +9,6 @@ client.workspace = true
 protocol.workspace = true
 sys.workspace = true
 
-serde.workspace = true
 serde_json.workspace = true
 unicode-width = { version = "0.2", default-features = false }
 # A span's text inline up to 23 bytes and shared past that, and a row's
