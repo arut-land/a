@@ -33,13 +33,17 @@ come from the attaching client (or daemon when none attached), with
 HTTP currently supports unauthenticated endpoints; OAuth and configured
 HTTP credentials are not implemented. Workspace `.mcp.json` is not read.
 
-The initial model prompt contains only server names and descriptions.
+The shared SDK `Text::generation` path records an index containing only
+server names and descriptions when a session adopts its registry generation.
 `mcp_list {server}` starts just that server and returns tool names and
-short descriptions. `mcp_schema {server, tool}` returns the selected full
-definition. `mcp_call {server, tool, arguments}` executes it. Schemas are
+short descriptions. `mcp_schema {server, tool}` publishes the selected full
+definition as recorded context through `Cx::publish`, then acknowledges
+`loaded` / `already_loaded`. Its typed publication key includes server,
+tool and exact schema content. Replay deduplicates effective publications;
+edits or compaction that hide the context allow it to load again. `mcp_call {server, tool, arguments}` executes it. Schemas are
 fetched with the server's paginated `tools/list`; lists are projected down
-before entering the log/model context. No remote schemas enter the
-initial request. Definitions are fetched afresh rather than cached across
+before entering the log/model context. Only an explicit schema load
+publishes a definition; no remote schemas enter the initial request. Definitions are fetched afresh rather than cached across
 turns, so list changes need no subscription. HTTP calls fetch their
 selected definition to construct required mirrored parameter headers.
 

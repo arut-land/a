@@ -117,7 +117,9 @@ measurement of either contribution. Release artifacts and retained test
 directories were removed, with no remaining test servers or daemons.
 Quiet-machine latency/budgets remain deferred as requested.
 
-`ext-skills` is not present on merged main, so there is no newer shared
-context-publication primitive to adopt yet. MCP continues to use SDK text
-registration and logged loading tools; transport state remains private
-to `ext-mcp`.
+Main subsequently added `ext-skills` and the general publication seam.
+MCP now shares `Text::generation` for its compact index and `Cx::publish`
+for explicit schema loading. Keys include the exact schema, deduplicate
+only while its context is effective, and are restored from the log after
+restart. The frame-budget test includes publication keys and text as well
+as the result card. Transport state remains private to `ext-mcp`.

@@ -72,15 +72,36 @@ fn discovery_is_lazy_and_only_selected_schemas_reach_the_model() {
     assert!(!rig.dir.join("effects").exists());
     assert!(
         rig.registry
-            .system_prompt()
+            .generation_context()
+            .unwrap()
             .contains("fixture: test server")
     );
-    assert!(!rig.registry.system_prompt().contains("inputSchema"));
+    assert!(
+        !rig.registry
+            .generation_context()
+            .unwrap()
+            .contains("inputSchema")
+    );
     let list = rig.done("mcp_list", &json!({"server":"fixture"}));
     assert_eq!(list["ok"][0]["name"], "echo");
     assert!(list["ok"][0].get("inputSchema").is_none());
     let schema = rig.done("mcp_schema", &json!({"server":"fixture","tool":"echo"}));
-    assert_eq!(schema["ok"]["inputSchema"]["type"], "object");
+    assert_eq!(schema["ok"]["loaded"], true);
+    let log = rig.log.lock().unwrap();
+    let definition = log
+        .iter()
+        .find_map(|e| match &e.body {
+            protocol::Body::Context {
+                text,
+                publication: Some(p),
+            } if p.namespace == "mcp-schemas" => {
+                Some(serde_json::from_str::<Value>(text.split_once('\n').unwrap().1).unwrap())
+            }
+            _ => None,
+        })
+        .unwrap();
+    assert_eq!(definition["inputSchema"]["type"], "object");
+    drop(log);
     let result = rig.done(
         "mcp_call",
         &json!({"server":"fixture","tool":"echo","arguments":{"text":"hello"}}),
@@ -249,6 +270,11 @@ fn selected_schemas_and_compact_indexes_fit_with_their_escaped_cards() {
             card: called.card,
         },
     );
+    for publication in rig.log.lock().unwrap().iter() {
+        let frame = protocol::Frame::entry(publication).unwrap();
+        assert!(frame.as_bytes().len() < 4 * 1024 * 1024);
+        assert!(protocol::frame_in(frame.as_bytes()).unwrap().is_some());
+    }
     let frame = protocol::Frame::entry(&entry).unwrap();
     assert!(frame.as_bytes().len() < 4 * 1024 * 1024);
     assert!(protocol::frame_in(frame.as_bytes()).unwrap().is_some());
@@ -290,5 +316,33 @@ fn coalesced_progress_is_published_even_when_the_peer_goes_quiet() {
     let fact: Value = output.parse().unwrap();
     assert_eq!(fact["failed"], "cancelled");
     assert!(rig.progress.lock().unwrap().lines().count() <= 8);
+    finish(&rig);
+}
+
+#[test]
+fn schema_publications_follow_effective_context_across_restart_and_edits() {
+    let rig = rig("publications", Duration::from_secs(10));
+    let input = json!({"server":"fixture","tool":"echo"});
+    assert_eq!(
+        rig.done("mcp_schema", &input)["ok"]["already_loaded"],
+        false
+    );
+    rig.restart();
+    assert_eq!(rig.done("mcp_schema", &input)["ok"]["already_loaded"], true);
+    let target = rig
+        .log
+        .lock()
+        .unwrap()
+        .iter()
+        .find(|e| matches!(e.body, protocol::Body::Context { .. }))
+        .unwrap()
+        .seq;
+    rig.cx().edit(target, None, None);
+    assert_eq!(
+        rig.done("mcp_schema", &input)["ok"]["already_loaded"],
+        false
+    );
+    let count = rig.log.lock().unwrap().iter().filter(|e| matches!(&e.body, protocol::Body::Context { publication: Some(p), .. } if p.namespace == "mcp-schemas")).count();
+    assert_eq!(count, 2);
     finish(&rig);
 }

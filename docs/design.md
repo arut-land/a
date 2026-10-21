@@ -174,8 +174,10 @@ user command. Both index and instructions are ordinary logged context; reload
 adoption waits for rest.
 
 [MCP tools](ext-mcp.md) register through the same SDK and policy path.
-The model initially sees a compact server index; listing tools and fetching
-a selected schema are explicit calls. Stdio servers start on first use,
+The model initially sees a compact server index via `Text::generation`;
+listing tools and loading a selected schema are explicit calls. Schema
+loading uses the same typed `Cx::publish` context primitive as skills,
+including edit-aware deduplication. Stdio servers start on first use,
 one per server per session, with their process groups owned by the daemon.
 All MCP operations are external, unsafe to replay, and admitted only after
 their intent is durable; progress and typed results become logged facts.

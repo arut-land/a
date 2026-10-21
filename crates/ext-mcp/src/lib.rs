@@ -298,7 +298,7 @@ impl Extension for Mcp {
                 discovery::description(&server.description)
             );
         }
-        r.text(Text::system("mcp", 30, index))
+        r.text(Text::generation("mcp-index", 30, index))
             .tool(List(self.clone()))
             .tool(Schema(self.clone()))
             .tool(Call(self.clone()));
@@ -411,20 +411,35 @@ impl Tool for List {
     }
 }
 
+struct ToolSchemas;
+impl ext::Publication for ToolSchemas {
+    const NAME: &'static str = "mcp-schemas";
+    // Content belongs in the identity: a changed remote definition must be
+    // publishable even while an older schema remains in effective context.
+    type Key = (ServerName, ToolName, protocol::Json);
+}
+
 struct Schema(Mcp);
 impl Tool for Schema {
     type In = SchemaInput;
     type Out = ResultFact;
     const NAME: &'static str = "mcp_schema";
-    const DESCRIPTION: &'static str = "Fetch the full schema for one MCP tool before calling it.";
+    const DESCRIPTION: &'static str =
+        "Load one MCP tool schema into recorded context before calling it.";
     async fn call(&self, input: &SchemaInput, cx: &Cx) -> Result<ResultFact, String> {
-        let result = self.0.tools(&input.server, cx).await.and_then(|tools| {
-            tools
-                .into_iter()
+        let result = async {
+            let remote = self.0.tools(&input.server, cx).await?.into_iter()
                 .find(|t| t.name == input.tool)
-                .map(|t| t.definition)
-                .ok_or_else(|| Failure::Protocol("unknown tool".into()))
-        });
+                .ok_or_else(|| Failure::Protocol("unknown tool".into()))?;
+            let definition = protocol::Json::encode(&remote.definition)
+                .map_err(|e| Failure::Protocol(e.to_string()))?;
+            let key = (input.server.clone(), input.tool.clone(), definition);
+            let loaded = cx.published::<ToolSchemas>(&key);
+            if !loaded {
+                cx.publish::<ToolSchemas>(&key, format!("MCP schema {}/{}\n{}", input.server, input.tool, key.2)).await;
+            }
+            Ok(json!({"server":input.server,"tool":input.tool,"loaded":true,"already_loaded":loaded}))
+        }.await;
         Ok(result.into())
     }
     fn present(input: &SchemaInput) -> Option<Card> {
