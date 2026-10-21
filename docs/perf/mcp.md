@@ -157,3 +157,55 @@ e8588e9 mcp: validate identities at config and discovery boundaries
 37992f4 mcp: bound request notifications and coalesce progress
 0beba5f mcp: refuse redirects before resending requests
 ```
+
+## Schema content hash without a C toolchain
+
+Measured on 2026-10-21, aarch64 macOS, Rust nightly-2026-10-17
+(`rustc 1.101.0-nightly 5d8fec066`), with `CARGO_BUILD_JOBS=2` throughout.
+`main` was already merged at `cf292dd`. Both measurements run
+`mise run size`, hence the shipped `cargo build-release --workspace`
+profile: opt-level `s`, fat LTO, one codegen unit, stripped symbols,
+size-optimized rebuilt std, and serde_json at opt-level 3. Only the MCP
+hash dependency and its call site differ in shipped code; test assertions
+are not linked. Exact lengths come from `wc -c target/release/a`.
+
+| SHA-256 implementation | Features | Shipped bytes | KiB (size task) |
+| --- | --- | ---: | ---: |
+| ring 0.17.14 | no defaults; std | 3,877,312 | 3786 |
+| sha2 0.11.1 (RustCrypto) | no defaults | 3,860,784 | 3770 |
+
+Choose **sha2**, saving **16,528 bytes (16.14 KiB)** while retaining full
+SHA-256 collision resistance. Both builds pass the 4096 KiB cap and the
+fixture scan. Sha2 uses Rust implementations and CPU intrinsics, without
+a C build script or Windows SDK headers. The ring baseline reproduces
+`assert.h` missing in `check:windows`; the replacement passes the same
+plain cross-target clippy task.
+
+Already-present alternatives are not suitable substitutes: `crc32c`,
+`rustc-hash` (FxHash), and the small FNV-1a implementations are
+noncryptographic. The lockfile also contains OpenSSL through native TLS
+on other platforms; that is neither a portable pure-Rust dependency nor
+linked by macOS TLS. Ring remains in the lockfile for Linux's existing
+rustls transport, but `cargo tree -i ring --target` shows no users for
+either `aarch64-apple-darwin` or `x86_64-pc-windows-msvc` after this change.
+There was no other portable SHA-256 implementation already linked here.
+
+The preimage remains the exact `protocol::Json` bytes of the remote tool
+definition. Keys remain `(server, tool, "sha256-v1", [u8; 32])`, serialized
+exactly as before. The existing publication test now pins both complete
+keys for its original and changed schemas; it passed with ring before the
+swap. Expected digest bytes were also independently computed with Python
+`hashlib.sha256` over the same compact, sorted-key JSON. No key bytes or
+version change, and no fixture regeneration is needed.
+
+Validation: `mise run check` passed formatting, clippy and all **1168
+tests** (30 skipped); `acceptance` passed all **23 tests**. `check:windows`,
+`machete`, `deny`, `check:no-tokio`, and both `size` runs passed. Windows
+lint also passed with target-specific `CC` and `AR` pointing at nonexistent
+executables. All four black-box budgets passed: cold-start median
+**28.73 ms** against a **2.05 ms** process floor; idle daemon RSS
+**9792 KiB**, client RSS **8624 KiB**, and client CPU **0 ns** over three
+seconds. These are local observations on the shared host, not a controlled
+hash-performance comparison. Attach p99 was **193.54 µs**; the separate
+release quiet-shell budget also passed with **zero runtime wakes** in one
+second.
