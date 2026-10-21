@@ -13,7 +13,7 @@ use crate::{
 pub struct Ledger {
     /// The seq of the last entry folded.
     seq: u64,
-    received: BTreeSet<Seq>,
+    received: Vec<Seq>,
     identities: BTreeMap<String, BTreeSet<(u128, u64)>>,
     outbox: Vec<crate::Envelope>,
     acknowledgements: Vec<(crate::EnvelopeId, Option<crate::InboxRefusal>)>,
@@ -235,7 +235,7 @@ impl Ledger {
                     .or_default()
                     .insert((envelope.id.sender.0.as_u128(), envelope.id.call.0.get()))
                 {
-                    self.received.insert(seq);
+                    self.received.push(seq);
                     self.untaken.push_back(Queued {
                         seq,
                         text: envelope.payload.clone(),
@@ -503,7 +503,7 @@ impl Ledger {
     }
 
     pub fn enqueued(&self, seq: Seq) -> bool {
-        self.received.contains(&seq)
+        self.received.binary_search(&seq).is_ok()
     }
     pub fn received(&self, id: &crate::EnvelopeId) -> bool {
         self.identities
@@ -513,7 +513,7 @@ impl Ledger {
     pub fn inbox_len(&self) -> usize {
         self.untaken
             .iter()
-            .filter(|q| self.received.contains(&q.seq))
+            .filter(|q| self.received.binary_search(&q.seq).is_ok())
             .count()
     }
     pub fn pending_outbox(&self) -> impl Iterator<Item = &crate::Envelope> {
