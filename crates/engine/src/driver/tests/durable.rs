@@ -188,11 +188,12 @@ fn logging_flush_deadline_also_bounds_owned_runtime_shutdown() {
 }
 
 /// The actor runs only when polled by the test; I/O completes inline and
-/// deferred timers never fire, so queued messages define exact bursts.
+/// deferred timers fire only when released, so queued messages define exact bursts.
 struct Manual {
     background: rt::Threads,
     captured: AtomicBool,
     actor: Mutex<Option<rt::BoxFuture<'static, ()>>>,
+    timers: Mutex<Vec<oneshot::Sender<()>>>,
 }
 
 impl rt::Runtime for Manual {
@@ -228,7 +229,11 @@ impl rt::Runtime for Manual {
     }
 
     fn sleep(&self, _: Duration) -> rt::BoxFuture<'static, ()> {
-        Box::pin(std::future::pending())
+        let (release, released) = oneshot::channel();
+        lock(&self.timers).push(release);
+        Box::pin(async move {
+            released.await;
+        })
     }
 }
 
@@ -266,6 +271,7 @@ impl Extension for ControlledSleep {
 struct ManualSession {
     session: Arc<Live>,
     actor: rt::BoxFuture<'static, ()>,
+    runtime: Arc<Manual>,
     faulty: Arc<Faulty>,
     release: oneshot::Sender<()>,
     starts: channel::Receiver<oneshot::Sender<()>>,
@@ -296,6 +302,7 @@ impl ManualSession {
             background: rt::Threads::new(1),
             captured: AtomicBool::new(false),
             actor: Mutex::default(),
+            timers: Mutex::default(),
         });
         Arc::get_mut(&mut fixture.0).unwrap().rt = Arc::clone(&manual) as _;
         let session = fixture.create();
@@ -324,6 +331,7 @@ impl ManualSession {
         Self {
             session,
             actor,
+            runtime: manual,
             faulty,
             release,
             starts,
@@ -654,6 +662,56 @@ impl ManualSession {
                 .unwrap()
         );
     }
+}
+
+#[test]
+fn generation_adoption_rearms_deferred_sync_for_later_mutations() {
+    let mut h = ManualSession::new();
+    let first = h.note();
+    h.poll();
+    let old_timer = lock(&h.session.session.work)
+        .get_mut(&WorkId::Sync)
+        .unwrap()
+        .clone();
+    h.complete();
+    h.poll();
+    assert!(rt::block_on(first).unwrap().is_ok());
+
+    let (started, starts) = channel::unbounded();
+    h.replace(
+        reload_registry(2, 1, false)
+            .with(&ControlledSleep(Arc::new(started), false))
+            .unwrap(),
+    );
+    h.request("sleep 0");
+    let release = rt::block_on(starts.recv()).unwrap();
+    assert!(old_timer.cancel.is_set(), "adoption retires the old timer");
+    h.call = log_of(&h.session)
+        .iter()
+        .rev()
+        .find(|e| matches!(e.body, Body::ToolCall { .. }))
+        .map(|e| CallId(e.seq))
+        .unwrap();
+    let mut acknowledged = h.note();
+    h.poll();
+    let timer = lock(&h.session.session.work)
+        .get_mut(&WorkId::Sync)
+        .cloned()
+        .expect("the new mutation must own a deferred sync");
+    assert!(!timer.cancel.is_set());
+    for release in std::mem::take(&mut *lock(&h.runtime.timers)) {
+        release.send(());
+    }
+    rt::block_on(timer.ended.wait());
+    h.poll();
+    let mut cx = std::task::Context::from_waker(std::task::Waker::noop());
+    assert!(matches!(
+        std::pin::Pin::new(&mut acknowledged).poll(&mut cx),
+        Poll::Ready(Some(Ok(_)))
+    ));
+    assert_eq!(h.value(), 2);
+    release.send(());
+    h.finish();
 }
 
 #[test]
@@ -1069,6 +1127,7 @@ fn final_sync_publishes_activity_after_its_entries() {
         background: rt::Threads::new(1),
         captured: AtomicBool::new(false),
         actor: Mutex::default(),
+        timers: Mutex::default(),
     });
     Arc::get_mut(&mut fixture.0).unwrap().rt = Arc::clone(&manual) as _;
     let session = fixture.create();
