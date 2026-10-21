@@ -3,12 +3,14 @@
 `a` is an agent engine: a per-user daemon that owns durable sessions, and
 clients that attach to them. Pre-release; one binary, `a`. This file is
 what a contributor or an agent needs before changing anything; the design
-is in the docs (`docs/*.md`) and in each crate's `//!` comment.
+is in [docs/design.md](docs/design.md), with per-area docs (`docs/*.md`)
+and each crate's `//!` comment supplying the details.
 
 ## Layout
 
 | Path | What |
 | --- | --- |
+| `docs/design.md` | Canonical as-built design, milestones and open questions |
 | `apps/cli` | The binary `a`: argv (`args.rs`, usage-rs derive is the spec), the daemon's extension list (`exts.rs`), the line REPL, one turn in a pipeline (`once.rs`, docs/cli.md), `a daemon …`, `a bridge`; the black-box tests in `tests/` |
 | `apps/tui` | The terminal client (docs/tui.md) |
 | `apps/web` | `a web`, the browser UI (docs/web.md) |

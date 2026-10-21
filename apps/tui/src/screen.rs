@@ -8,7 +8,7 @@
 
 use std::io::{self, Write};
 use std::ops::Range;
-use std::os::fd::BorrowedFd;
+pub use sys::terminal::Stdout;
 
 use super::app::App;
 use super::render::{Cell, Grid, Viewport};
@@ -318,26 +318,6 @@ fn num(bytes: &mut Vec<u8>, n: u16) {
         }
     }
     bytes.extend_from_slice(&digits[at..]);
-}
-
-/// The terminal, written to directly: each frame is one `write`, where
-/// `io::Stdout`'s line buffer would split one that holds a newline.
-pub struct Stdout(BorrowedFd<'static>);
-
-impl Default for Stdout {
-    fn default() -> Self {
-        Self(rustix::stdio::stdout())
-    }
-}
-
-impl Write for Stdout {
-    fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
-        Ok(rustix::io::write(self.0, buf)?)
-    }
-
-    fn flush(&mut self) -> io::Result<()> {
-        Ok(())
-    }
 }
 
 #[cfg(test)]
