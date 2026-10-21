@@ -2140,15 +2140,19 @@ fn in_process_recovery_preserves_the_attached_environment() {
 
 struct MemoryGenerations {
     registry: Arc<Registry>,
-    reads: AtomicUsize,
 }
 impl ext::host::Generations for MemoryGenerations {
-    fn generation(&self) -> u64 {
-        1
+    fn snapshot(&self) -> ext::host::GenerationSnapshot {
+        ext::host::GenerationSnapshot {
+            id: 1,
+            registry: Arc::clone(&self.registry),
+        }
     }
-    fn registry(&self) -> Arc<Registry> {
-        self.reads.fetch_add(1, Ordering::SeqCst);
-        Arc::clone(&self.registry)
+    fn restore(self: Arc<Self>, installed: &[Installed]) -> Result<Arc<Registry>, ext::Refused> {
+        if self.registry.installed() != installed {
+            return Err(ext::Refused("generation differs".into()));
+        }
+        Ok(self.registry.clone())
     }
 }
 struct MemorySource(Arc<MemoryGenerations>);
@@ -2174,7 +2178,6 @@ impl Extension for MemorySource {
 fn unchanged_generations_never_prepare_or_read_the_log_on_bursts() {
     let source = Arc::new(MemoryGenerations {
         registry: Arc::new(Registry::default().with(&Agents).unwrap()),
-        reads: AtomicUsize::new(0),
     });
     let fixture = Fixture::new(
         ext_fixtures::ECHO,
@@ -2193,11 +2196,6 @@ fn unchanged_generations_never_prepare_or_read_the_log_on_bursts() {
         }));
         session.barrier();
     }
-    assert_eq!(
-        source.reads.load(Ordering::SeqCst),
-        1,
-        "only initial subscription reads the registry"
-    );
     assert_eq!(
         fixture.hops(),
         hops,

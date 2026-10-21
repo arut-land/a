@@ -1,52 +1,37 @@
-//! The extensions `a` links. Each is a crate, and a cargo feature of this
-//! one, so leaving one out of a build leaves it out of the registry; each
-//! registers through the same verbs as any other, can be replaced by one
-//! of the same name, and reads its own `[ext.<name>]` table
-//! ([`Configured`]): this file knows no key of any. What one needs of the
-//! ones before it is checked as this compiles ([`Built`]). `[ext] disable`
-//! leaves one out: it is replaced by an extension of its name that
-//! contributes nothing.
+//! Install order satisfies extension dependencies at compile time through
+//! [`Built`]. Runtime configuration may replace registrations, so the same
+//! dependency checks also apply to disabled and dynamically loaded extensions.
 
 use engine::Config;
 use ext::host::{Built, Registry};
 use ext::{Configured, DynExtension, Name, Refused, Registrar, Table, Tier};
 
-/// The registry of the extensions this build links, in their install
-/// order, each as its `[ext.<name>]` table sets it. The fixtures come only
-/// with the `echo` agent they serve, in a build that has them.
+/// Tiering and dependency validation apply equally to linked and source registrations.
 pub fn registry(config: &Config) -> Result<Registry, Refused> {
     let registry = linked(config)?;
+    let mut layers: Vec<std::sync::Arc<dyn ext::host::GenerationLayer>> = Vec::new();
     #[cfg(feature = "lua")]
-    let lua = if config.ext.disable.iter().any(|name| name == "lua") {
-        None
-    } else {
+    if !config.ext.disable.iter().any(|name| name == "lua") {
         let home = sys::Home::from_env().map_err(|e| Refused(e.to_string()))?;
-        let base = config.clone();
-        Some(ext_lua::Loader::new(
+        layers.push(std::sync::Arc::new(ext_lua::Loader::new(
             home.root(),
             config.ext.clone(),
-            move || linked(&base),
-        )?)
-    };
+        )?));
+    }
     #[cfg(feature = "skills")]
     if !config.ext.disable.iter().any(|name| name == "skills") {
         let home = sys::Home::from_env().map_err(|e| Refused(e.to_string()))?;
-        #[cfg(feature = "lua")]
-        let inner = lua.as_ref().map(ext_lua::Loader::source);
-        #[cfg(not(feature = "lua"))]
-        let inner = None;
         let skills =
             configured::<ext_skills::Skills>(config)?.reserving(client::COMMANDS.iter().flat_map(
                 |command| std::iter::once(command.name).chain(command.aliases.iter().copied()),
             ));
-        let loader = ext_skills::Loader::new(home.root(), skills, registry.clone(), inner);
-        return registry.with_in(Tier::Pre, &loader);
+        layers.push(std::sync::Arc::new(ext_skills::Loader::new(
+            home.root(),
+            skills,
+        )));
     }
-    #[cfg(feature = "lua")]
-    if let Some(lua) = lua {
-        return registry.with_in(Tier::Pre, &lua);
-    }
-    Ok(registry)
+    let coordinator = std::sync::Arc::new(ext::host::Coordinator::new(registry.clone(), layers));
+    registry.with_in(Tier::Pre, &coordinator)
 }
 
 fn linked(config: &Config) -> Result<Registry, Refused> {
@@ -230,7 +215,7 @@ mod tests {
         );
         let extensions: Vec<_> = registry
             .extensions()
-            .filter(|(name, _)| !["lua", "skills-source"].contains(name))
+            .filter(|(name, _)| *name != "generation-source")
             .collect();
         assert_eq!(
             extensions,

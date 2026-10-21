@@ -876,7 +876,13 @@ fn compacted_forks_keep_loaded_skills_in_context_and_background_results_out() {
         .unwrap()
         .with(&ext_fork::Fork)
         .unwrap();
-    let loader = ext_skills::Loader::new(&home, ext_skills::Skills::default(), base.clone(), None);
+    let loader = Arc::new(ext::host::Coordinator::new(
+        base.clone(),
+        vec![Arc::new(ext_skills::Loader::new(
+            &home,
+            ext_skills::Skills::default(),
+        ))],
+    ));
     let fixture = Fixture::new(
         "probes",
         base.with(&loader).unwrap(),
