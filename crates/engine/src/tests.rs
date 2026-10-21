@@ -1477,3 +1477,40 @@ fn a_fork_keeps_the_selected_recorded_environment_without_live_secrets() {
     drop((fork, source, daemon));
     std::fs::remove_dir_all(root).unwrap();
 }
+
+#[test]
+fn a_refused_child_registration_settles_the_parent_once() {
+    trait Required: Send + Sync {}
+    struct Provider;
+    impl Required for Provider {}
+    impl ext::Extension for Provider {
+        const NAME: &'static str = "root-provider";
+        const VERSION: u32 = 1;
+        const INHERIT: bool = false;
+        fn contribute(&self, r: &mut ext::Registrar) {
+            r.provide::<dyn Required>(std::sync::Arc::new(Self));
+        }
+    }
+    struct Consumer;
+    impl ext::Extension for Consumer {
+        const NAME: &'static str = "child-consumer";
+        const VERSION: u32 = 1;
+        type Needs = (ext::Need<dyn Required>, ());
+        fn contribute(&self, _: &mut ext::Registrar) {}
+    }
+    let config = Config {
+        extensions: |config| configured(config)?.with(&Provider)?.with(&Consumer),
+        ..echo()
+    };
+    let (root, home) = home("refused-child");
+    let daemon = Daemon::load(&home, &config).unwrap();
+    let parent = daemon.attach_to(&Target::New, || "/w".into()).unwrap();
+    let id = parent.session().id;
+    parent.session().submit("spawn hi").unwrap();
+    settle(&daemon);
+    let log = bodies(&*daemon.shared.store, id);
+    assert!(matches!(fired(&log).as_slice(), [Outcome::Failed { .. }]));
+    drop(parent);
+    drop(daemon);
+    std::fs::remove_dir_all(root).unwrap();
+}

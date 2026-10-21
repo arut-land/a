@@ -52,7 +52,7 @@ Windows builds and lints, but its daemon platform operations are incomplete.
 
 ### Log and store
 
-The source of truth is `sessions/<id>.jsonl`: a header followed by numbered,
+The source of truth is `sessions/<id>/log.jsonl`: a header followed by numbered,
 epoch-stamped entries. Every line is sealed with CRC32C. On a full scan, an
 unsealed last line is a torn tail and is trimmed. Damage before the tail,
 or a different log format, preserves the file and opens it read-only.
@@ -63,6 +63,9 @@ test memory backend. A writer is moved into one session actor, never shared.
 Local leases issue epochs above the loaded log's epoch; the daemon lock and
 writer ownership enforce exclusion. This is not a cross-host fencing service.
 The derived `sessions.idx` catalog lists sessions without loading their logs.
+Child conversations live recursively below their parent in
+`children/<id>/log.jsonl`; the catalog's ownership headers reconstruct id lookup
+without scanning the directory tree on a clean start.
 
 Calls have durable intents and outcomes. Tool output is structured data;
 model transcripts and client presentation are projections. Approval waits,
@@ -111,7 +114,7 @@ Clients end turns on this certification rather than an entry prefix.
 ### Snapshots and recovery
 
 At rest, fully synced, after enough additional log data, a root session writes
-the ledger and extension fold images to `sessions/derived/<id>.snap`.
+the ledger and extension fold images to `sessions/<id>/derived/log.snap`.
 A neighboring `.idx` records line offsets. A snapshot must match the build
 and extension set, and its covered entry must agree with the log. Otherwise
 load folds the whole log. The indexed prefix avoids a full checksum scan;

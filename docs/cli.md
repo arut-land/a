@@ -61,7 +61,7 @@ a -p "and the tests?" resume        # one more turn in the latest session
 | 141 | stdout's reader went away |
 
 No output format flag: stdout is the reply, and scripts that want the
-structure read the session's log (`$A_HOME/sessions/<id>.jsonl`) or speak
+structure read the session's log (`$A_HOME/sessions/<id>/log.jsonl`) or speak
 the protocol (`a bridge`).
 
 ## Daemon diagnostics

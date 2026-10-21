@@ -2,7 +2,15 @@
 
 This document specifies the conversation primitives for composable agents.
 Side threads and the metrics projection are follow-up work, not part of the
-initial implementation. A conversation owns an ordered log, an inbox and a
+initial implementation.
+
+Implementation status: registration inheritance and nested conversation storage
+are implemented. The spawn request types, prefix-context admission, detached SDK
+API, durable messaging and depth-budget enforcement below remain planned. The
+existing `task` still uses the awaited fresh-child API. This document must not
+be read as claiming that those modes are available yet.
+
+A conversation owns an ordered log, an inbox and a
 runner. Main sessions, child agents and side threads differ in their runner
 and ownership, not in their durability rules.
 

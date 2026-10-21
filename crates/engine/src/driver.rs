@@ -895,6 +895,19 @@ impl Actor {
             .count()
     }
 
+    fn next_registry(&self) -> Result<Arc<Registry>, ext::Refused> {
+        let shared = &self.live.session.shared;
+        let newest = self
+            .source
+            .as_ref()
+            .map_or_else(|| shared.registry.get(), |source| source.registry());
+        if self.live.parent.is_some() {
+            newest.inherited().map(Arc::new)
+        } else {
+            Ok(newest)
+        }
+    }
+
     async fn refresh(&mut self) -> Result<(), ()> {
         if self.phase != Phase::Serving || !self.core.at_rest() {
             return Ok(());
@@ -916,17 +929,8 @@ impl Actor {
         }
         self.generation = number;
         let shared = Arc::clone(&self.live.session.shared);
-        let newest = self
-            .source
-            .as_ref()
-            .map_or_else(|| shared.registry.get(), |source| source.registry());
-        let newest = if self.live.parent.is_some() {
-            match newest.inherited() {
-                Ok(registry) => Arc::new(registry),
-                Err(_) => return Ok(()),
-            }
-        } else {
-            newest
+        let Ok(newest) = self.next_registry() else {
+            return Ok(());
         };
         let bound = bind(&newest, &self.live.session);
         let binding = Arc::clone(&bound) as Arc<dyn Binding>;
@@ -2193,9 +2197,18 @@ impl Actor {
         };
         let env = lock(&self.live.session.env).clone();
         if let Some(daemon) = shared.daemon.upgrade() {
+            let parent = self.live.id;
             shared.rt.spawn(Box::pin(async move {
-                if let Err(e) = daemon.start_child(header, input, env).await {
-                    eprintln!("starting child {}: {e}", child.short());
+                if let Err(error) = daemon.start_child(header, input, env).await {
+                    daemon
+                        .report(
+                            parent,
+                            child,
+                            Outcome::Failed {
+                                error: error.to_string(),
+                            },
+                        )
+                        .await;
                 }
             }));
         }
