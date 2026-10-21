@@ -11,7 +11,7 @@ fn rig(name: &str, timeout: Duration) -> Rig {
     let dir = std::env::temp_dir().join(format!("a-rig-mcp-{name}-{}", std::process::id()));
     let mcp = Mcp::new(
         vec![Server {
-            name: "fixture".into(),
+            name: "fixture".parse().unwrap(),
             description: "test server".into(),
             transport: Transport::Stdio(vec![
                 env!("CARGO_BIN_EXE_mcp-fixture").into(),
@@ -146,7 +146,7 @@ fn cancellation_kills_the_process_even_when_the_server_ignores_it() {
         };
         let cancel = async {
             let reactor = rt::Reactor::AsyncIo;
-            while !rig.dir.join("effects.ready").exists() {
+            while rig.progress.lock().unwrap().as_str() != "waiting" {
                 reactor.sleep(Duration::from_millis(10)).await;
             }
             rig.cancel.set();
@@ -252,5 +252,13 @@ fn selected_schemas_and_compact_indexes_fit_with_their_escaped_cards() {
     let frame = protocol::Frame::entry(&entry).unwrap();
     assert!(frame.as_bytes().len() < 4 * 1024 * 1024);
     assert!(protocol::frame_in(frame.as_bytes()).unwrap().is_some());
+    finish(&rig);
+}
+
+#[test]
+fn invalid_discovered_identities_are_refused_before_publication() {
+    let rig = rig("invalid-name", Duration::from_secs(10));
+    let result = rig.done("mcp_list", &json!({"server":"fixture"}));
+    assert!(result["failed"].get("protocol").is_some());
     finish(&rig);
 }

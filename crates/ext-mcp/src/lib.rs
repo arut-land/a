@@ -4,6 +4,8 @@
 mod discovery;
 mod headers;
 mod incoming;
+mod name;
+pub use name::{ServerName, ToolName};
 mod rpc;
 mod stdio;
 
@@ -21,7 +23,7 @@ use serde_json::{Value, json};
 /// attaching client's non-secret environment; secrets must be explicit.
 #[derive(Clone, Debug)]
 pub struct Server {
-    pub name: String,
+    pub name: ServerName,
     pub description: String,
     pub transport: Transport,
     pub env: BTreeMap<String, String>,
@@ -40,7 +42,12 @@ pub struct Mcp(Arc<Inner>);
 struct Inner {
     servers: Vec<Server>,
     timeout: Duration,
-    clients: Mutex<HashMap<(SessionId, String), stdio::Client>>,
+    clients: Mutex<HashMap<(SessionId, ServerName), stdio::Client>>,
+}
+
+struct RemoteTool {
+    name: ToolName,
+    definition: Value,
 }
 
 fn lock<T>(value: &Mutex<T>) -> MutexGuard<'_, T> {
@@ -54,15 +61,11 @@ impl Mcp {
         }
         let mut names = std::collections::BTreeSet::new();
         for server in &servers {
-            if server.name.is_empty()
-                || server.name.len() > 64
-                || !server
-                    .name
-                    .bytes()
-                    .all(|b| b.is_ascii_alphanumeric() || b == b'-')
-                || !names.insert(&server.name)
-            {
-                return Err(Refused("ext.mcp: server names must be unique ASCII names (letters, digits, hyphens, at most 64 bytes)".into()));
+            if !names.insert(&server.name) {
+                return Err(Refused(format!(
+                    "ext.mcp: duplicate server {}",
+                    server.name
+                )));
             }
             match &server.transport {
                 Transport::Stdio(argv) if argv.first().is_none_or(String::is_empty) => {
@@ -91,7 +94,7 @@ impl Mcp {
 
     async fn request(
         &self,
-        server: &str,
+        server: &ServerName,
         method: &str,
         params: Value,
         cx: &Cx,
@@ -102,7 +105,7 @@ impl Mcp {
 
     async fn request_headers(
         &self,
-        server: &str,
+        server: &ServerName,
         method: &str,
         params: Value,
         headers: http::HeaderMap,
@@ -112,7 +115,7 @@ impl Mcp {
             .0
             .servers
             .iter()
-            .find(|s| s.name == server)
+            .find(|s| &s.name == server)
             .ok_or_else(|| Failure::Configuration(format!("unknown MCP server: {server}")))?;
         let rt = cx
             .service::<dyn rt::Runtime>()
@@ -170,14 +173,14 @@ impl Mcp {
         .await
     }
 
-    fn is_http(&self, name: &str) -> bool {
+    fn is_http(&self, name: &ServerName) -> bool {
         self.0
             .servers
             .iter()
-            .any(|s| s.name == name && matches!(s.transport, Transport::Http(_)))
+            .any(|s| &s.name == name && matches!(s.transport, Transport::Http(_)))
     }
 
-    async fn tools(&self, server: &str, cx: &Cx) -> Result<Vec<Value>, Failure> {
+    async fn tools(&self, server: &ServerName, cx: &Cx) -> Result<Vec<RemoteTool>, Failure> {
         let mut tools = Vec::new();
         let mut budget = discovery::Budget::default();
         let mut cursor = None;
@@ -199,7 +202,8 @@ impl Mcp {
                     .get("name")
                     .and_then(Value::as_str)
                     .ok_or_else(|| Failure::Protocol("tool has no name".into()))?;
-                if !seen.insert(name.to_owned())
+                let name = ToolName::try_from(name.to_owned()).map_err(Failure::Protocol)?;
+                if !seen.insert(name.clone())
                     || !tool.get("inputSchema").is_some_and(Value::is_object)
                 {
                     return Err(Failure::Protocol(
@@ -211,7 +215,10 @@ impl Mcp {
                 {
                     continue;
                 }
-                tools.push(tool);
+                tools.push(RemoteTool {
+                    name,
+                    definition: tool,
+                });
                 if tools.len() > 4096 {
                     return Err(Failure::Limit);
                 }
@@ -232,7 +239,8 @@ impl Configured for Mcp {
     fn configure(table: &impl Table) -> Result<Self, Refused> {
         let mut servers = Vec::new();
         for name in table.list("servers")?.unwrap_or_default() {
-            let argv = table.list(name)?;
+            let name: ServerName = name.parse().map_err(Refused)?;
+            let argv = table.list(&name)?;
             let url_key = format!("{name}_url");
             let url = table.text(&url_key)?;
             let transport = match (argv, url) {
@@ -300,23 +308,23 @@ impl Extension for Mcp {
 #[derive(Deserialize, ext_derive::Schema)]
 pub struct ListInput {
     /// Configured server name.
-    server: String,
+    server: ServerName,
 }
 
 #[derive(Deserialize, ext_derive::Schema)]
 pub struct SchemaInput {
     /// Configured server name.
-    server: String,
+    server: ServerName,
     /// Exact remote tool name.
-    tool: String,
+    tool: ToolName,
 }
 
 #[derive(Deserialize, ext_derive::Schema)]
 pub struct CallInput {
     /// Configured server name.
-    server: String,
+    server: ServerName,
     /// Exact remote tool name; fetch its schema first.
-    tool: String,
+    tool: ToolName,
     /// Arguments conforming to the selected tool's inputSchema.
     arguments: Value,
 }
@@ -389,7 +397,7 @@ impl Tool for List {
                 Value::Array(
                     tools
                         .into_iter()
-                        .map(|t| json!({"name":t["name"],"description":t["description"].as_str().map(discovery::description)}))
+                        .map(|t| json!({"name":t.name,"description":t.definition["description"].as_str().map(discovery::description)}))
                         .collect(),
                 )
             })
@@ -413,7 +421,8 @@ impl Tool for Schema {
         let result = self.0.tools(&input.server, cx).await.and_then(|tools| {
             tools
                 .into_iter()
-                .find(|t| t["name"] == input.tool)
+                .find(|t| t.name == input.tool)
+                .map(|t| t.definition)
                 .ok_or_else(|| Failure::Protocol("unknown tool".into()))
         });
         Ok(result.into())
@@ -445,9 +454,9 @@ impl Tool for Call {
                 let tools = self.0.tools(&input.server, cx).await?;
                 let tool = tools
                     .iter()
-                    .find(|t| t["name"] == input.tool)
+                    .find(|t| t.name == input.tool)
                     .ok_or_else(|| Failure::Protocol("unknown or invalid HTTP tool".into()))?;
-                headers::parameters(&tool["inputSchema"], args)?
+                headers::parameters(&tool.definition["inputSchema"], args)?
             } else {
                 http::HeaderMap::new()
             };

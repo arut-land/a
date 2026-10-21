@@ -56,6 +56,9 @@ fn main() {
             "tools/list" if marker.contains("bounded-escaped") => {
                 json!({"resultType":"complete","tools":[{"name":"echo","description":"é".repeat(2000),"inputSchema":{"type":"object","description":"\u{0000}\n\\".repeat(80_000)}}]})
             }
+            "tools/list" if marker.contains("invalid-name") => {
+                json!({"resultType":"complete","tools":[{"name":"bad\nname","inputSchema":{"type":"object"}}]})
+            }
             "tools/list" => {
                 json!({"resultType":"complete","tools":[{"name":"echo","description":"Echo arguments","inputSchema":{"type":"object","properties":{"text":{"type":"string"}},"required":["text"]}}]})
             }
