@@ -379,6 +379,23 @@ impl Daemon {
         on_drain: &dyn Fn(),
         first: &dyn Fn(&Connection) -> io::Result<Vec<ClientMsg>>,
     ) -> Result<Connection, Error> {
+        self.connect_inner(client, on_drain, first)
+            .inspect_err(|e| {
+                if matches!(e, Error::NotResponding)
+                    && let Endpoint::Local(home) = &self.endpoint
+                    && let Some(daemon) = live_daemon(home)
+                {
+                    note_timeout(home, &daemon, e);
+                }
+            })
+    }
+
+    fn connect_inner(
+        &self,
+        client: Option<ClientId>,
+        on_drain: &dyn Fn(),
+        first: &dyn Fn(&Connection) -> io::Result<Vec<ClientMsg>>,
+    ) -> Result<Connection, Error> {
         // A daemon exiting (idle) as we connect, or draining, gets one more
         // try each.
         for _ in 0..3 {
@@ -636,8 +653,10 @@ pub fn stop(home: &Home) -> io::Result<bool> {
         }
         sys::signal_process(daemon.pid, signal)
     };
+    ext_logging::witness(home, &daemon, ext_logging::Observation::Terminate);
     signal(Signal::Terminate)?;
     if !wait_exited(home, Some(HELLO_TIMEOUT)) {
+        ext_logging::witness(home, &daemon, ext_logging::Observation::Kill);
         signal(Signal::Kill)?;
         wait_exited(home, None);
     }
@@ -708,6 +727,18 @@ pub fn status(home: &Home) -> Result<Option<Status>, Error> {
     let Some(daemon) = live_daemon(home) else {
         return Ok(None);
     };
+    status_of(home, &daemon)
+        .map(Some)
+        .inspect_err(|e| note_timeout(home, &daemon, e))
+}
+
+fn note_timeout(home: &Home, daemon: &Record, error: &Error) {
+    if matches!(error, Error::NotResponding) {
+        ext_logging::witness(home, daemon, ext_logging::Observation::Unresponsive);
+    }
+}
+
+fn status_of(home: &Home, daemon: &Record) -> Result<Status, Error> {
     let (_, mut conn) = reach(home, &daemon.build)?;
     conn.writer.send(&ClientMsg::Status)?;
     let status = conn.reader.until(|msg| match msg {
@@ -726,7 +757,7 @@ pub fn status(home: &Home) -> Result<Option<Status>, Error> {
         }),
         _ => None,
     })?;
-    Ok(Some(status))
+    Ok(status)
 }
 
 /// What a daemon says of itself; see [`status`].
@@ -969,5 +1000,60 @@ mod tests {
         let taken = locked(File::open(&path).unwrap(), Some(Duration::from_millis(500)));
         assert!(taken.is_some());
         fs::remove_dir_all(&root).unwrap();
+    }
+
+    #[test]
+    fn status_timeouts_preserve_a_witness_during_hello_and_reply() {
+        for welcomed in [false, true] {
+            let (root, home) = scratch(if welcomed {
+                "status-reply"
+            } else {
+                "status-hello"
+            });
+            let daemon = Record::current("1.2.3+0123456789abcdef");
+            fs::write(home.daemon_pid_file(), daemon.to_string()).unwrap();
+            let held = File::open(home.daemon_pid_file()).unwrap();
+            held.lock().unwrap();
+            let listener = home.bind().unwrap();
+            let (release, released) = std::sync::mpsc::channel();
+            let peer = thread::spawn(move || {
+                let stream = listener.accept().unwrap();
+                let mut reader = BufReader::new(stream.try_clone().unwrap());
+                assert!(matches!(
+                    read_frame::<ClientMsg>(&mut reader).unwrap(),
+                    Some(ClientMsg::Hello { .. })
+                ));
+                if welcomed {
+                    let mut writer = stream.try_clone().unwrap();
+                    write_frame(
+                        &mut writer,
+                        &DaemonMsg::Welcome {
+                            proto: PROTO,
+                            build: "1.2.3+0123456789abcdef".into(),
+                            caps: Caps::ALL,
+                            commands: Vec::new(),
+                        },
+                    )
+                    .unwrap();
+                    assert!(matches!(
+                        read_frame::<ClientMsg>(&mut reader).unwrap(),
+                        Some(ClientMsg::Status)
+                    ));
+                }
+                let _ = released.recv();
+            });
+            let result = status(&home);
+            let observed = fs::read_to_string(home.run_dir().join("daemon.witness"));
+            release.send(()).unwrap();
+            peer.join().unwrap();
+            drop(held);
+            home.endpoint().remove();
+            fs::remove_dir_all(root).unwrap();
+            assert!(matches!(result, Err(Error::NotResponding)), "{result:?}");
+            let observed: serde_json::Value = serde_json::from_str(&observed.unwrap()).unwrap();
+            assert_eq!(observed["pid"], daemon.pid);
+            assert_eq!(observed["started"], daemon.started);
+            assert_eq!(observed["reason"], "unresponsive");
+        }
     }
 }

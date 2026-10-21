@@ -104,7 +104,10 @@ fn load_registry(
     source: &Arc<dyn ext::host::Generations>,
 ) -> io::Result<Arc<Registry>> {
     let seq = shared.catalog.get(header.id).map_or(0, |r| r.entries);
-    let entries = shared.store.prefix(header.id, seq)?;
+    let entries = shared
+        .store
+        .prefix(header.id, seq)
+        .inspect_err(|e| store_fault(header.id, ext_logging::Operation::Reload, e))?;
     let installed = entries.iter().rev().find_map(|entry| match &entry.body {
         Body::Extensions { installed } => Some(installed.as_slice()),
         _ => None,
@@ -435,8 +438,12 @@ impl Live {
         // A process restart can read cache-resident entries that no client
         // has seen. Replaying them makes the same promise as a live commit.
         if loaded.seq != 0 {
-            loaded.writer.sync()?;
-            rt::block_on(loaded.writer.flushed(&*shared.rt))?;
+            loaded
+                .writer
+                .sync()
+                .inspect_err(|e| store_fault(header.id, ext_logging::Operation::Reload, e))?;
+            rt::block_on(loaded.writer.flushed(&*shared.rt))
+                .inspect_err(|e| store_fault(header.id, ext_logging::Operation::Reload, e))?;
         }
         let Folding {
             mut core,
@@ -459,10 +466,7 @@ impl Live {
         // A log kept as it is is shown, never resumed or stepped: nothing
         // would commit.
         let read_only = loaded.writer.read_only();
-        let first = match read_only {
-            None => core.resumed(&load),
-            Some(_) => Effects::new(),
-        };
+        let first = resumed(&mut core, &load, read_only, open, header.id);
         let live = Arc::new(Self {
             id: header.id,
             workspace: header.workspace.clone(),
@@ -655,11 +659,16 @@ impl Folding {
         let (mut loaded, folding) =
             Self::rebuild(binding, registry, shared, |restore, each| match open {
                 Open::Create => {
-                    let created = shared.store.create(header)?;
+                    let created = shared.store.create(header).inspect_err(|e| {
+                        store_fault(header.id, ext_logging::Operation::Create, e);
+                    })?;
                     shared.catalog.record(Record::new(header.clone()));
                     Ok(created)
                 }
-                Open::Load => shared.store.load(header.id, restore, each),
+                Open::Load => shared
+                    .store
+                    .load(header.id, restore, each)
+                    .inspect_err(|e| store_fault(header.id, ext_logging::Operation::Reload, e)),
             })?;
         if loaded.writer.read_only().is_none()
             && folding.core.ledger().extensions().is_some_and(|installed| {
@@ -973,6 +982,10 @@ impl Actor {
                     .await
             }
             Err(error) => {
+                ext_logging::emit(ext_logging::Fact::AdoptionRejected {
+                    session: self.live.id,
+                    generation: number,
+                });
                 eprintln!("warning: {error}");
                 Ok(())
             }
@@ -1147,6 +1160,9 @@ impl Actor {
                 replied,
                 message,
             } => {
+                if let Replied::Failed(error) = &replied {
+                    provider_error(self.live.id, error);
+                }
                 self.inflight.remove(&call);
                 self.replied = message.map(|m| (call, m));
                 Event::ModelDone { call, replied }
@@ -1307,6 +1323,9 @@ impl Actor {
                 }
                 Err(panic) => {
                     let why = panicked(&*panic);
+                    ext_logging::emit(ext_logging::Fact::KernelPanic {
+                        session: self.live.id,
+                    });
                     eprintln!("session {}: the kernel {why}", self.live.id.short());
                     if self.carry(fx).await.is_ok() {
                         Box::pin(self.resume()).await;
@@ -1517,7 +1536,7 @@ impl Actor {
     fn track(&mut self, through: u64, mut epoch: rt::FlushEpoch) -> io::Result<()> {
         let mut cx = std::task::Context::from_waker(std::task::Waker::noop());
         if let Poll::Ready(result) = std::pin::Pin::new(&mut epoch).poll(&mut cx) {
-            result?;
+            result.inspect_err(|e| store_fault(self.live.id, ext_logging::Operation::Commit, e))?;
             if self.flushes.is_empty() {
                 self.durable(through);
             } else {
@@ -1571,6 +1590,7 @@ impl Actor {
             match pending.result.expect("completed epoch") {
                 Ok(()) => self.durable(pending.through),
                 Err(error) => {
+                    store_fault(self.live.id, ext_logging::Operation::Commit, &error);
                     self.failed(format!("flushing: {error}"), Vec::new()).await;
                     break;
                 }
@@ -1620,24 +1640,8 @@ impl Actor {
     /// cancelled, what was asked is answered that the session stopped, and
     /// the kernel is rebuilt from the committed log, as a load rebuilds it.
     async fn resume(&mut self) {
-        self.live.session.fence.fetch_add(1, Ordering::SeqCst);
-        self.reactions_cancel.set();
-        self.reactions_cancel = Cancel::default();
-        self.live.session.cancel_all();
-        for pending in std::mem::take(&mut self.flushes) {
-            pending.ended.wait().await;
-        }
-        self.admissions.clear();
-        self.transcript = None;
-        lock(&self.live.session.cancels).clear();
-        self.replies.clear();
-        self.sides.clear();
-        self.side_waiters.clear();
-        self.inflight.clear();
-        self.unsynced.clear();
-        self.waiting_sync.clear();
-        self.sync_armed = false;
-        self.writer.take();
+        recovery(self.live.id, ext_logging::Rule::ReloadAfterFault);
+        self.abandon_generation().await;
         self.bound = bind(&self.registry, &self.live.session);
         let bound = Arc::clone(&self.bound) as Arc<dyn Binding>;
         let header = Header {
@@ -1652,7 +1656,10 @@ impl Actor {
                 Folding::open(&header, &shared, Open::Load, &bound, &registry)?;
             // A failed sync may have left complete, readable bytes. They
             // cannot be published until the replacement writer syncs them.
-            loaded.writer.sync()?;
+            loaded
+                .writer
+                .sync()
+                .inspect_err(|e| store_fault(header.id, ext_logging::Operation::Reload, e))?;
             io::Result::Ok((loaded, folding))
         })
         .await;
@@ -1661,6 +1668,7 @@ impl Actor {
                 .writer
                 .flushed(&*self.live.session.shared.rt)
                 .await
+                .inspect_err(|e| store_fault(self.live.id, ext_logging::Operation::Reload, e))
                 .map(|()| (loaded, folding)),
             Err(error) => Err(error),
         };
@@ -1711,10 +1719,36 @@ impl Actor {
             // when next wanted.
             Err(panic) => {
                 let why = panicked(&*panic);
+                ext_logging::emit(ext_logging::Fact::KernelPanic {
+                    session: self.live.id,
+                });
                 eprintln!("session {}: resuming {why}", self.live.id.short());
                 self.phase = Phase::Draining;
             }
         }
+    }
+
+    // Retire the old generation before reopening its log: no waiter or
+    // cancellation owner can cross the recovery boundary.
+    async fn abandon_generation(&mut self) {
+        self.live.session.fence.fetch_add(1, Ordering::SeqCst);
+        self.reactions_cancel.set();
+        self.reactions_cancel = Cancel::default();
+        self.live.session.cancel_all();
+        for pending in std::mem::take(&mut self.flushes) {
+            pending.ended.wait().await;
+        }
+        self.admissions.clear();
+        self.transcript = None;
+        lock(&self.live.session.cancels).clear();
+        self.replies.clear();
+        self.sides.clear();
+        self.side_waiters.clear();
+        self.inflight.clear();
+        self.unsynced.clear();
+        self.waiting_sync.clear();
+        self.sync_armed = false;
+        self.writer.take();
     }
 
     fn owner(&self) -> Owner {
@@ -1779,7 +1813,8 @@ impl Actor {
             self.listed = listed;
         }
         self.writer = Some(writer);
-        let lines = written?;
+        let lines = written
+            .inspect_err(|e| store_fault(self.live.id, ext_logging::Operation::Commit, e))?;
         crate::session_event("commit", self.live.id, || {
             let how = if durable { "synced" } else { "written" };
             format!("{} entries {how}", entries.len())
@@ -1818,6 +1853,11 @@ impl Actor {
         let states = match lock(&self.live.session.state_view()).image() {
             Ok(states) => states,
             Err(e) => {
+                ext_logging::emit(ext_logging::Fact::Fault {
+                    session: Some(self.live.id),
+                    operation: ext_logging::Operation::Snapshot,
+                    kind: ext_logging::Fault(io::ErrorKind::InvalidData),
+                });
                 eprintln!("session {}: snapshot: {e}", self.live.id.short());
                 return;
             }
@@ -1850,7 +1890,10 @@ impl Actor {
                 self.fold_snapshot = Some(snapshot);
                 crate::session_event("snapshot", self.live.id, || format!("at {covers}"));
             }
-            Err(e) => eprintln!("session {}: snapshot: {e}", self.live.id.short()),
+            Err(e) => {
+                store_fault(self.live.id, ext_logging::Operation::Snapshot, &e);
+                eprintln!("session {}: snapshot: {e}", self.live.id.short());
+            }
         }
     }
 
@@ -1902,7 +1945,7 @@ impl Actor {
         })
         .await;
         self.writer = Some(writer);
-        result?;
+        result.inspect_err(|e| store_fault(self.live.id, ext_logging::Operation::Commit, e))?;
         if let Some(epoch) = epoch {
             self.track(self.ordered_seq, epoch)?;
         } else {
@@ -2988,3 +3031,55 @@ impl Failure for (Replied, Option<llm::Assistant>) {
 
 #[cfg(test)]
 mod tests;
+
+fn provider_error(session: SessionId, error: &llm::Error) {
+    use ext_logging::Provider;
+    let kind = match error.kind {
+        llm::Kind::Transport => Provider::Transport,
+        llm::Kind::Auth => Provider::Auth,
+        llm::Kind::RateLimit => Provider::RateLimit,
+        llm::Kind::Quota => Provider::Quota,
+        llm::Kind::ContextOverflow => Provider::ContextOverflow,
+        llm::Kind::InvalidRequest => Provider::InvalidRequest,
+        llm::Kind::ContentFilter => Provider::ContentFilter,
+        llm::Kind::Server => Provider::Server,
+        llm::Kind::Decode => Provider::Decode,
+        llm::Kind::Incomplete => Provider::Incomplete,
+        llm::Kind::Unsupported => Provider::Unsupported,
+        llm::Kind::Other => Provider::Other,
+    };
+    ext_logging::emit(ext_logging::Fact::ProviderError {
+        session,
+        kind,
+        status: error.status,
+        retryable: error.is_retryable(),
+    });
+}
+
+fn store_fault(session: SessionId, operation: ext_logging::Operation, error: &io::Error) {
+    ext_logging::emit(ext_logging::Fact::Fault {
+        session: Some(session),
+        operation,
+        kind: ext_logging::Fault(error.kind()),
+    });
+}
+
+fn resumed(
+    core: &mut Core,
+    load: &Load<'_>,
+    read_only: Option<ReadOnly>,
+    open: Open,
+    session: SessionId,
+) -> Effects {
+    if read_only.is_some() {
+        return Effects::new();
+    }
+    if matches!(open, Open::Load) && load.busy {
+        recovery(session, ext_logging::Rule::ResumeLedger);
+    }
+    core.resumed(load)
+}
+
+fn recovery(session: SessionId, rule: ext_logging::Rule) {
+    ext_logging::emit(ext_logging::Fact::Recovery { session, rule });
+}

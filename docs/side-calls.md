@@ -75,7 +75,13 @@ Known failures are different from an ambiguous crash. `ext-retry` provides
 and capped jittered backoff as its main-request handler. Before another
 attempt, the driver commits a `SideRetry` decision containing the typed
 failure, next attempt number, and delay. All attempts use the same frozen
-request. Side retries do not enter the main `RequestError` handlers: an
+request. Live failures, including attempts followed by a successful retry, also emit
+`ext-logging` provider classifications: session UUID, error kind, status, and
+retryability only. Cancellation and cached replay emit no provider failure.
+Provider messages, bodies, request IDs, prompts, and responses never enter
+daemon diagnostics.
+
+Side retries do not enter the main `RequestError` handlers: an
 overflow while summarising cannot recursively start another compaction.
 A crash during backoff also records interruption instead of repeating.
 

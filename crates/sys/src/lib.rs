@@ -102,7 +102,7 @@ impl Home {
     }
 
     pub fn daemon_log(&self) -> PathBuf {
-        self.logs_dir().join("daemon.log")
+        self.logs_dir().join("daemon.jsonl")
     }
 
     /// The daemon's crash reports; see [`crash`].

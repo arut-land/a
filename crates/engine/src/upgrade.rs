@@ -106,7 +106,13 @@ impl Lifecycle {
     /// Starts the drain once, telling every open connection.
     pub fn drain(&self) {
         if self.draining.set(Instant::now()).is_ok() {
-            eprintln!("a newer build is staged; draining");
+            ext_logging::emit(ext_logging::Fact::Upgrade {
+                to: self
+                    .runtime
+                    .current()
+                    .as_deref()
+                    .map(ext_logging::Build::of),
+            });
             if let Ok(draining) = Frame::new(&DaemonMsg::Draining) {
                 for (_, tx) in &*lock(&self.conns) {
                     let _ = tx.send(draining.clone());

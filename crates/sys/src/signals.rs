@@ -12,7 +12,13 @@ mod imp {
     use crate::Signal;
 
     /// Caught console control events, as [`Signal`]s.
-    pub struct Signals(());
+    pub struct Signals(std::os::windows::io::OwnedHandle);
+
+    impl std::os::windows::io::AsHandle for Signals {
+        fn as_handle(&self) -> std::os::windows::io::BorrowedHandle<'_> {
+            std::os::windows::io::AsHandle::as_handle(&self.0)
+        }
+    }
 
     impl Signals {
         pub fn catch(_signals: &[Signal]) -> io::Result<Self> {

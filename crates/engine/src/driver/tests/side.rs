@@ -499,6 +499,21 @@ fn retry_policy_applies_to_side_calls_without_reentering_compaction() {
     let log = log_of(&session);
     session.halt();
     assert_eq!(http.sent(), 2);
+    let failures: Vec<_> = ext_logging::testing::pending().into_iter().filter(|fact| {
+        matches!(fact, ext_logging::Fact::ProviderError { session: id, .. } if *id == session.id)
+    }).collect();
+    assert!(
+        matches!(
+            failures.as_slice(),
+            [ext_logging::Fact::ProviderError {
+                kind: ext_logging::Provider::RateLimit,
+                status: Some(429),
+                retryable: true,
+                ..
+            }]
+        ),
+        "{failures:?}"
+    );
     assert_eq!(sides(&log).len(), 1);
     let failure = log
         .iter()
@@ -938,4 +953,60 @@ fn compacted_forks_keep_loaded_skills_in_context_and_background_results_out() {
     drop(session);
     drop(fixture);
     std::fs::remove_dir_all(home).unwrap();
+}
+
+#[test]
+fn side_failures_keep_classification_without_provider_content() {
+    let secret = "private provider body, message and request id";
+    for (kind, status, classified) in [
+        (llm::Kind::RateLimit, Some(429), "rate_limit"),
+        (llm::Kind::Auth, Some(401), "auth"),
+        (llm::Kind::Transport, None, "transport"),
+    ] {
+        let session = SessionId::new();
+        let mut error = llm::Error::new(kind, secret);
+        error.status = status;
+        error.body = Some(secret.into());
+        error.request_id = Some(secret.into());
+        assert!(
+            super::super::side::sided(session, Some(Replied::Failed(error)))
+                .1
+                .is_err()
+        );
+        let records: Vec<_> = ext_logging::testing::pending().into_iter().filter(|fact| {
+            matches!(fact, ext_logging::Fact::ProviderError { session: id, .. } if *id == session)
+        }).collect();
+        assert_eq!(records.len(), 1);
+        let text = serde_json::to_string(&records[0]).unwrap();
+        let record: Value = serde_json::from_str(&text).unwrap();
+        assert_eq!(record["provider_error"]["kind"], classified);
+        assert_eq!(
+            record["provider_error"]["status"],
+            serde_json::to_value(status).unwrap()
+        );
+        assert_eq!(record["provider_error"]["retryable"], kind.is_retryable());
+        assert!(!text.contains(secret));
+    }
+    let session = SessionId::new();
+    assert!(super::super::side::sided(session, None).1.is_err());
+    assert!(
+        ext_logging::testing::pending()
+            .iter()
+            .any(|fact| matches!(fact,
+        ext_logging::Fact::ProviderError { session: id, kind: ext_logging::Provider::Transport, .. }
+        if *id == session))
+    );
+}
+
+#[test]
+fn cancellation_is_not_reported_as_a_side_provider_failure() {
+    let session = SessionId::new();
+    assert!(
+        super::super::side::sided(session, Some(Replied::Interrupted(None)))
+            .1
+            .is_err()
+    );
+    assert!(!ext_logging::testing::pending().iter().any(|fact| {
+        matches!(fact, ext_logging::Fact::ProviderError { session: id, .. } if *id == session)
+    }));
 }

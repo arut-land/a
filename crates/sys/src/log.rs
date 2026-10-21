@@ -1,15 +1,8 @@
-//! Size-based rotation for the daemon's log, which is its stderr.
+//! File rotation and stderr redirection at the platform seam.
 
 use std::fs;
 use std::io;
 use std::path::{Path, PathBuf};
-
-/// A log is rotated once it grows past this.
-pub const MAX: u64 = 4 << 20;
-
-/// Rotated logs kept besides the live one: `daemon.log.1` (newest) to
-/// `daemon.log.{KEEP}`.
-pub const KEEP: usize = 2;
 
 /// Moves `path` to `path.1` once it holds more than `max` bytes, shifting
 /// older ones up and dropping the one past `keep`. Returns whether it did.
@@ -40,17 +33,19 @@ fn numbered(path: &Path, n: usize) -> PathBuf {
     PathBuf::from(name)
 }
 
-/// Points this process's stderr at the log `path`, appending. Windows
-/// (`SetStdHandle`) waits for its daemon.
-pub fn redirect_stderr(path: &Path) -> io::Result<()> {
-    if let Some(dir) = path.parent() {
-        fs::create_dir_all(dir)?;
-    }
-    let log = fs::OpenOptions::new()
-        .create(true)
-        .append(true)
-        .open(path)?;
-    stderr_to(&log)
+/// Discards detached daemon stderr: arbitrary library errors and panic
+/// payloads must never enter the typed diagnostic log.
+pub fn discard_stderr() -> io::Result<()> {
+    stderr_to(&fs::OpenOptions::new().write(true).open(null_device())?)
+}
+
+#[cfg(unix)]
+fn null_device() -> &'static str {
+    "/dev/null"
+}
+#[cfg(windows)]
+fn null_device() -> &'static str {
+    "NUL"
 }
 
 #[cfg(unix)]
@@ -62,16 +57,6 @@ fn stderr_to(log: &fs::File) -> io::Result<()> {
 #[cfg(windows)]
 fn stderr_to(_log: &fs::File) -> io::Result<()> {
     Err(io::ErrorKind::Unsupported.into())
-}
-
-/// Rotates `path`, the log [`redirect_stderr`] pointed stderr at, and
-/// points stderr at a fresh one.
-pub fn rotate_stderr(path: &Path) -> io::Result<bool> {
-    let rotated = rotate(path, MAX, KEEP)?;
-    if rotated {
-        redirect_stderr(path)?;
-    }
-    Ok(rotated)
 }
 
 #[cfg(test)]

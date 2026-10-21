@@ -14,7 +14,7 @@ use std::fs::{File, OpenOptions};
 use std::io::{self, Write};
 use std::ops::Deref;
 use std::path::PathBuf;
-use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 use std::time::{Duration, Instant};
 
@@ -22,6 +22,7 @@ use crate::catalog::Catalog;
 use crate::store::{Header, Jsonl};
 use driver::{Attachment, Live, Open, Request, Shared};
 use ext::Flag;
+use ext_logging::{Build, Fact, Fault, Operation, Stop, emit as fact};
 use outbox::Outbox;
 use protocol::{DaemonMsg, Environment, Frame, Mode, Outcome, SessionId, SessionSummary, Target};
 use rt::oneshot;
@@ -88,6 +89,9 @@ impl Config {
     /// cannot be read is reported and passed over.
     pub fn load(home: &Home) -> Self {
         let file = sys::Config::read(&home.config_file()).unwrap_or_else(|e| {
+            fact(Fact::ConfigFallback {
+                kind: Fault(e.kind()),
+            });
             eprintln!("{e}; running with the default [daemon] settings");
             sys::Config::default()
         });
@@ -107,13 +111,19 @@ impl Config {
     /// The extensions' registry; an agent configured by name must be one
     /// of theirs.
     fn registry(&self) -> Result<ext::host::Registry, ext::Refused> {
-        let registry = (self.extensions)(self)?;
+        let registry = (self.extensions)(self).inspect_err(|_| fact(Fact::RegistryRejected))?;
         if let Some(name) = self
             .agent
             .as_deref()
             .filter(|&n| !registry.agents().any(|a| a == n))
         {
+            fact(Fact::RegistryRejected);
             return Err(ext::Refused(format!("no agent named {name} is registered")));
+        }
+        if !registry.warnings().is_empty() {
+            fact(Fact::RegistryWarnings {
+                count: registry.warnings().len(),
+            });
         }
         for warning in registry.warnings() {
             eprintln!("warning: {warning}");
@@ -154,7 +164,7 @@ impl From<sys::config::Daemon> for Config {
 }
 
 /// Where the daemon's events go: nowhere unless built with the `events`
-/// feature (to its log), so emitting them costs nothing.
+/// feature (on stderr), so emitting them costs nothing.
 #[cfg(not(any(test, feature = "events")))]
 static EVENTS: rt::Noop = rt::Noop;
 #[cfg(all(feature = "events", not(test)))]
@@ -214,8 +224,8 @@ struct Daemon {
     /// The connections watching the session list, and the list as they
     /// were last sent it.
     watchers: Mutex<(Vec<Outbox>, Vec<SessionSummary>)>,
-    /// A client asked the daemon to stop.
-    stopping: AtomicBool,
+    /// The first request to stop, whether from a client or a signal.
+    stopping: Mutex<Option<Stop>>,
     /// When it started, in seconds since the Unix epoch.
     started: u64,
 }
@@ -362,7 +372,7 @@ impl Daemon {
             pulse: rt::Notify::new(),
             jobs: rt::Notify::new(),
             watchers: Mutex::default(),
-            stopping: AtomicBool::new(false),
+            stopping: Mutex::new(None),
             started: std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)
                 .map_or(0, |d| d.as_secs()),
@@ -833,7 +843,11 @@ impl Daemon {
                 let shared = Arc::clone(&self.shared);
                 rt::unblock(&*Arc::clone(&shared.rt), move || {
                     if let Err(e) = shared.catalog.clean() {
-                        eprintln!("the session catalog: {e}");
+                        fact(Fact::Fault {
+                            session: None,
+                            operation: Operation::Catalog,
+                            kind: Fault(e.kind()),
+                        });
                     }
                 })
                 .await;
@@ -850,7 +864,9 @@ impl Daemon {
                 false
             });
             if !ended.await {
-                eprintln!("{} sessions still stopping, exiting", ending.len());
+                fact(Fact::ShutdownExpired {
+                    sessions: ending.len(),
+                });
                 return;
             }
         }
@@ -887,15 +903,11 @@ impl Daemon {
                 session: None,
                 detail: String::new(),
             });
-            if let Some(log) = &exit.log
-                && let Err(e) = sys::log::rotate_stderr(log)
-            {
-                eprintln!("rotating the log: {e}");
-            }
             self.hibernate(config.hibernate);
             self.publish_list();
-            if self.stopping.load(Ordering::SeqCst) {
-                exit.now(self, "asked to stop").await;
+            let stopping = *lock(&self.stopping);
+            if let Some(reason) = stopping {
+                exit.now(self, reason).await;
             }
             let draining = life.draining();
             let busy = draining.is_some() || self.has_work();
@@ -914,14 +926,13 @@ impl Daemon {
                 // and its outcome to commit.
                 let settled = stopped.map(|at| at + KILL_GRACE * 2);
                 if !self.has_work() || settled.is_some_and(|at| now >= at) {
-                    exit.now(self, "drained for a newer build").await;
+                    exit.now(self, Stop::Upgrade).await;
                 }
                 next = Some(earliest(next, settled.unwrap_or(began + config.drain)));
             } else if self.idle() {
                 let at = *since.get_or_insert(now) + config.idle;
                 if now >= at {
-                    exit.now(self, &format!("idle for {}s", config.idle.as_secs()))
-                        .await;
+                    exit.now(self, Stop::Idle).await;
                 }
                 next = Some(earliest(next, at));
             } else {
@@ -1006,8 +1017,6 @@ struct Exit {
     home: Home,
     /// The locked pid file; see [`claim`].
     pid: File,
-    /// The log that is our stderr, to rotate.
-    log: Option<PathBuf>,
 }
 
 impl Exit {
@@ -1019,19 +1028,24 @@ impl Exit {
     /// ends any run of them) and releases the pid lock before the process
     /// closes its connections: a client reconnecting on EOF finds the lock
     /// free for the daemon it spawns.
-    async fn now(self, daemon: &Daemon, why: &str) -> ! {
+    async fn now(self, daemon: &Daemon, why: Stop) -> ! {
         self.home.endpoint().remove();
         daemon.shutdown().await;
         if let Err(e) = sys::crash::exited(&self.home, &self.pid) {
-            eprintln!("noting a clean exit: {e}");
+            fact(Fact::Fault {
+                session: None,
+                operation: Operation::Shutdown,
+                kind: Fault(e.kind()),
+            });
         }
-        drop(self.pid);
         event(|| rt::Event {
             name: "exit",
             session: None,
-            detail: why.to_owned(),
+            detail: format!("{why:?}"),
         });
-        eprintln!("{why}, exiting");
+        fact(Fact::Stopped { reason: why });
+        ext_logging::flush(&*daemon.shared.rt).await;
+        drop(self.pid);
         std::process::exit(0)
     }
 }
@@ -1044,8 +1058,6 @@ pub struct Start {
     pub lock: Option<File>,
     /// Serve even after a crash loop, for `a daemon restart`.
     pub reset_breaker: bool,
-    /// Its stderr is `logs/daemon.log`, which it then rotates.
-    pub logs: bool,
 }
 
 /// Runs the daemon, as staged build `build`, until it has been idle for
@@ -1060,6 +1072,30 @@ pub fn serve(
     build: &str,
     start: Start,
 ) -> io::Result<()> {
+    let result = run(listener, home, config, build, start);
+    if let Err(error) = &result {
+        fact(Fact::Fault {
+            session: None,
+            operation: Operation::Startup,
+            kind: Fault(error.kind()),
+        });
+        rt::block_on(ext_logging::flush(&rt::Threads::new(1)));
+    }
+    result
+}
+
+fn run(
+    listener: &Listener,
+    home: &Home,
+    config: &Config,
+    build: &str,
+    start: Start,
+) -> io::Result<()> {
+    let origin = if start.lock.is_some() {
+        ext_logging::Origin::Client
+    } else {
+        ext_logging::Origin::Foreground
+    };
     let pid = match claim(
         home,
         build,
@@ -1082,13 +1118,49 @@ pub fn serve(
         build: build.to_owned(),
         ..config.clone()
     };
+    fact(Fact::Started {
+        build: Build::of(build),
+        reset_breaker: start.reset_breaker,
+        origin,
+    });
+    let signals = sys::Signals::catch(&[
+        sys::Signal::Terminate,
+        sys::Signal::Interrupt,
+        sys::Signal::Hangup,
+    ])?;
     let daemon = Daemon::load(home, &config)?;
+    let signals = rt::Async::for_reading(&daemon.shared.rt.reactor(), signals)?;
+    let signalled = Arc::clone(&daemon);
+    daemon.shared.rt.spawn(Box::pin(async move {
+        let signal = signals
+            .read_with(|s| {
+                s.take()
+                    .into_iter()
+                    .next()
+                    .ok_or_else(|| io::ErrorKind::WouldBlock.into())
+            })
+            .await;
+        let reason = match signal {
+            Ok(sys::Signal::Interrupt) => Stop::Interrupt,
+            Ok(sys::Signal::Hangup) => Stop::Hangup,
+            Ok(_) => Stop::Terminate,
+            Err(e) => {
+                fact(Fact::Fault {
+                    session: None,
+                    operation: Operation::Shutdown,
+                    kind: Fault(e.kind()),
+                });
+                Stop::Terminate
+            }
+        };
+        lock(&signalled.stopping).get_or_insert(reason);
+        signalled.pulse.notify();
+    }));
     let life = Arc::new(Lifecycle::new(build.to_owned(), home.runtime()));
     let (monitor, watch, config) = (Arc::clone(&daemon), Arc::clone(&life), config);
     let exit = Exit {
         home: home.clone(),
         pid,
-        log: start.logs.then(|| home.daemon_log()),
     };
     daemon.shared.rt.spawn(Box::pin(async move {
         monitor.supervise(&watch, &config, exit).await;
@@ -1138,10 +1210,20 @@ fn claim(
         }
         file
     };
+    #[cfg(not(test))]
+    ext_logging::install(
+        &(Arc::new(rt::Threads::new(1)) as rt::Rt),
+        home.daemon_log(),
+    );
+    ext_logging::replay_witness(home);
     if reset {
         sys::crash::reset(home)?;
     }
     if let Some(dead) = sys::crash::reap(home, &mut file)? {
+        fact(Fact::PreviousCrash {
+            pid: dead.pid,
+            build: Build::of(&dead.build),
+        });
         eprintln!(
             "the previous daemon (pid {}) stopped without shutting down",
             dead.pid
@@ -1149,6 +1231,9 @@ fn claim(
     }
     let crashes = sys::crash::Crashes::of(home);
     if crashes.breaker.tripped(limit) {
+        fact(Fact::BreakerTripped {
+            young: crashes.breaker.young(),
+        });
         let report = crashes
             .last
             .map_or_else(String::new, |p| format!("; see {}", p.display()));

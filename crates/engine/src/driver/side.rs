@@ -302,7 +302,7 @@ async fn side_call(
             .unwrap_or(Replied::Interrupted(None))
     };
     let result = first(work, session.shared.rt.sleep(side.budget.timeout)).await;
-    let (outcome, answer) = sided(result);
+    let (outcome, answer) = sided(session.id, result);
     let failure = answer.as_ref().err().and_then(|e| Json::encode(e).ok());
     let (done, committed) = oneshot::channel();
     let _ = session.mail.send(Msg::Fenced {
@@ -397,6 +397,7 @@ async fn run_side(
         let Ok(failure) = Json::encode(error) else {
             return result;
         };
+        super::provider_error(session.id, error);
         let (done, committed) = oneshot::channel();
         let _ = session.mail.send(Msg::Fenced {
             fence,
@@ -433,8 +434,11 @@ fn side_answer(outcome: Outcome, failure: Option<Json>) -> Result<llm::Response,
 
 /// What a side request's reply, or its timing out, is logged as and
 /// answered with.
-fn sided(replied: Option<Replied>) -> (Outcome, Result<llm::Response, llm::Error>) {
-    match replied {
+pub(super) fn sided(
+    session: protocol::SessionId,
+    replied: Option<Replied>,
+) -> (Outcome, Result<llm::Response, llm::Error>) {
+    let (outcome, answer) = match replied {
         Some(Replied::Done(output)) => {
             let answer = llm::Response::from_json(output.raw())
                 .map_err(|e| llm::Error::new(llm::Kind::Decode, e.to_string()));
@@ -448,7 +452,7 @@ fn sided(replied: Option<Replied>) -> (Outcome, Result<llm::Response, llm::Error
         }
         Some(Replied::Interrupted(output)) => {
             let error = llm::Error::new(llm::Kind::Incomplete, "the call ended first");
-            (Outcome::Interrupted { output }, Err(error))
+            return (Outcome::Interrupted { output }, Err(error));
         }
         None => {
             let error = llm::Error::new(llm::Kind::Transport, "the side request timed out");
@@ -457,5 +461,7 @@ fn sided(replied: Option<Replied>) -> (Outcome, Result<llm::Response, llm::Error
             };
             (failed, Err(error))
         }
-    }
+    };
+    let answer = answer.inspect_err(|error| super::provider_error(session, error));
+    (outcome, answer)
 }
