@@ -176,8 +176,8 @@ instantiations. [The provider layer](llm.md) implements Responses, Chat,
 Messages and Gemini with recorded-cassette parity; it runs HTTP via `rt`'s
 blocking pool and leaves retry policy to extensions.
 
-The daemon wire is protocol 3: length-prefixed JSON over the local endpoint
-or bridge stdio. Typed ids and message classes distinguish durable entries,
+The daemon wire is length-prefixed JSON over the local endpoint or bridge
+stdio; `protocol::PROTO` defines the current version. Typed ids and message classes distinguish durable entries,
 ephemeral traffic and control. Hello negotiates a supported version; attach
 replays from a seq or supplies a view snapshot, ends replay with `Synced`,
 then follows live entries. A wire encoding change requires a new version
