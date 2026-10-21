@@ -998,6 +998,9 @@ pub fn serve(
     build: &str,
     start: Start,
 ) -> io::Result<()> {
+    if start.logs {
+        sys::daemon_ready()?;
+    }
     let pid = match claim(
         home,
         build,
@@ -1068,7 +1071,7 @@ fn claim(
             .read(true)
             .write(true)
             .open(home.daemon_pid_file())?;
-        if file.try_lock().is_err() {
+        if sys::fs::try_lock(&file).is_err() {
             return Err(io::Error::new(
                 io::ErrorKind::AddrInUse,
                 "another daemon is running",

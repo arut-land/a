@@ -55,6 +55,11 @@ pub struct Async<T: Source>(Inner<T>);
 
 enum Inner<T: Source> {
     AsyncIo(async_io::Async<T>),
+    #[cfg(windows)]
+    Completion {
+        events: [async_io::os::windows::Waitable<std::os::windows::io::OwnedHandle>; 2],
+        io: T,
+    },
     /// A handle that is signalled, as a process is when it exits.
     #[cfg(windows)]
     Signal(async_io::os::windows::Waitable<T>),
@@ -119,13 +124,30 @@ impl<T: std::os::fd::AsFd> Async<T> {
 }
 
 #[cfg(windows)]
-impl<T: std::os::windows::io::AsHandle> Async<T> {
-    /// A handle's I/O (a named pipe's) completes through IOCP rather than
-    /// turning ready; until the Windows daemon brings that, none registers.
-    pub fn new(_reactor: &Reactor, _io: T) -> io::Result<Self> {
-        Err(io::ErrorKind::Unsupported.into())
+impl<T: sys::CompletionSource> Async<T> {
+    /// Awaits overlapped I/O through async-io's waitable-event support.
+    /// sys owns every submitted buffer until cancellation has completed.
+    pub fn new(reactor: &Reactor, io: T) -> io::Result<Self> {
+        match reactor {
+            Reactor::AsyncIo => {
+                io.nonblocking()?;
+                let [read, write] = io.completion_events()?;
+                Ok(Self(Inner::Completion {
+                    events: [
+                        async_io::os::windows::Waitable::new(read)?,
+                        async_io::os::windows::Waitable::new(write)?,
+                    ],
+                    io,
+                }))
+            }
+            #[cfg(feature = "tokio")]
+            Reactor::Tokio(_) => Err(io::ErrorKind::Unsupported.into()),
+        }
     }
+}
 
+#[cfg(windows)]
+impl<T: std::os::windows::io::AsHandle> Async<T> {
     /// For a handle that is signalled, as a process is when it exits: it
     /// turns readable once it is.
     pub fn for_reading(reactor: &Reactor, io: T) -> io::Result<Self> {
@@ -157,6 +179,8 @@ impl<T: Source> Async<T> {
             Inner::AsyncIo(io) => io.get_ref(),
             #[cfg(windows)]
             Inner::Signal(handle) => handle.get_ref(),
+            #[cfg(windows)]
+            Inner::Completion { io, .. } => io,
             #[cfg(all(unix, feature = "tokio"))]
             Inner::Tokio(fd) => &fd.get_ref().0,
         }
@@ -214,6 +238,8 @@ impl<T: Source> Async<T> {
             Inner::Signal(_) if write => std::future::pending().await,
             #[cfg(windows)]
             Inner::Signal(handle) => handle.ready().await,
+            #[cfg(windows)]
+            Inner::Completion { events, .. } => events[usize::from(write)].ready().await,
             #[cfg(all(unix, feature = "tokio"))]
             Inner::Tokio(fd) => {
                 let mut ready = if write {

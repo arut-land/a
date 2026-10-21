@@ -1,5 +1,6 @@
-//! Durable, private and atomic file operations. Locks need no seam: std's
-//! `File::lock` is `flock` on Unix and `LockFileEx` on Windows.
+//! Durable, private and atomic file operations.
+//! Unix uses flock; Windows locks a byte beyond a record so its contents
+//! remain readable by clients inspecting the daemon identity.
 
 use std::fs::{self, File, OpenOptions};
 use std::io;
@@ -100,7 +101,8 @@ pub fn order_dir(dir: &Path) -> io::Result<()> {
 }
 
 /// Makes the entries of `dir` durable: a file created in it survives a
-/// crash. Windows makes them durable with the file itself.
+/// crash. Windows has no directory flush here; file flushes provide its
+/// filesystem ordering (see docs/perf/sessions.md).
 pub fn sync_dir(dir: &Path) -> io::Result<()> {
     #[cfg(unix)]
     File::open(dir)?.sync_all()?;
@@ -139,7 +141,22 @@ pub fn private_dir(dir: &Path) -> io::Result<()> {
         fs::set_permissions(dir, fs::Permissions::from_mode(0o700))
     }
     #[cfg(windows)]
-    builder.create(dir)
+    {
+        use windows_sys::Win32::Security::{
+            DACL_SECURITY_INFORMATION, PROTECTED_DACL_SECURITY_INFORMATION, SetFileSecurityW,
+        };
+        builder.create(dir)?;
+        let security = crate::windows::Security::user_only()?;
+        let path = crate::windows::wide(dir.as_os_str());
+        // SAFETY: the path and security descriptor remain valid during the call.
+        crate::windows::ok(unsafe {
+            SetFileSecurityW(
+                path.as_ptr(),
+                DACL_SECURITY_INFORMATION | PROTECTED_DACL_SECURITY_INFORMATION,
+                security.descriptor(),
+            )
+        })
+    }
 }
 
 /// Fills `buf` from `file` at `offset`, as one positioned read where the
@@ -228,28 +245,68 @@ pub fn write_watch(path: &Path) -> io::Result<WriteWatch> {
     Ok(WriteWatch { fd, _file: file })
 }
 
-/// Not on Windows yet, where a reader polls.
+/// A directory change notification: writes to any output in this session's
+/// spill directory wake its followers, which recheck their own files.
 #[cfg(windows)]
-pub struct WriteWatch(std::convert::Infallible);
+pub struct WriteWatch(Option<std::os::windows::io::OwnedHandle>);
 
-/// Watches `path` for writes: not on Windows yet, where a reader polls.
 #[cfg(windows)]
 impl std::os::windows::io::AsHandle for WriteWatch {
     fn as_handle(&self) -> std::os::windows::io::BorrowedHandle<'_> {
-        match self.0 {}
+        self.0.as_ref().unwrap().as_handle()
     }
 }
 
 #[cfg(windows)]
-pub fn write_watch(_path: &Path) -> io::Result<WriteWatch> {
-    Err(io::ErrorKind::Unsupported.into())
+impl Drop for WriteWatch {
+    fn drop(&mut self) {
+        use std::os::windows::io::IntoRawHandle;
+        use windows_sys::Win32::Storage::FileSystem::FindCloseChangeNotification;
+        if let Some(handle) = self.0.take() {
+            // SAFETY: notification handles need their matching close API,
+            // after rt has unregistered the wait on this owned source.
+            unsafe { FindCloseChangeNotification(handle.into_raw_handle()) };
+        }
+    }
+}
+
+#[cfg(windows)]
+pub fn write_watch(path: &Path) -> io::Result<WriteWatch> {
+    use windows_sys::Win32::Storage::FileSystem::{
+        FILE_NOTIFY_CHANGE_LAST_WRITE, FILE_NOTIFY_CHANGE_SIZE, FindFirstChangeNotificationW,
+    };
+    let parent = path
+        .parent()
+        .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "output has no directory"))?;
+    let path = crate::windows::wide(parent.as_os_str());
+    // SAFETY: path is NUL-terminated and lives across the call. WriteWatch
+    // uses FindCloseChangeNotification instead of dropping the OwnedHandle.
+    let handle = crate::windows::owned(unsafe {
+        FindFirstChangeNotificationW(
+            path.as_ptr(),
+            0,
+            FILE_NOTIFY_CHANGE_LAST_WRITE | FILE_NOTIFY_CHANGE_SIZE,
+        )
+    })?;
+    Ok(WriteWatch(Some(handle)))
 }
 
 impl WriteWatch {
     /// Takes the writes seen so far, without waiting.
     pub fn clear(&self) {
         #[cfg(windows)]
-        match self.0 {}
+        {
+            use std::os::windows::io::AsRawHandle;
+            use windows_sys::Win32::Storage::FileSystem::FindNextChangeNotification;
+            use windows_sys::Win32::System::Threading::WaitForSingleObject;
+            let handle = self.0.as_ref().unwrap().as_raw_handle();
+            // SAFETY: the watch owns this handle; rearm only after a signal.
+            unsafe {
+                if WaitForSingleObject(handle, 0) == 0 {
+                    FindNextChangeNotification(handle);
+                }
+            }
+        }
         #[cfg(target_os = "linux")]
         {
             let mut buf = [0; 1024];
@@ -339,5 +396,67 @@ mod tests {
             assert!(!readable(20), "what was seen is taken");
         }
         fs::remove_file(&path).unwrap();
+    }
+}
+
+/// Locks a byte beyond the record, so Windows readers can still read its
+/// contents while another process holds the daemon's exclusive lock.
+pub fn lock(file: &File) -> io::Result<()> {
+    #[cfg(unix)]
+    return file.lock();
+    #[cfg(windows)]
+    return windows_lock(file, false);
+}
+
+pub fn try_lock(file: &File) -> io::Result<()> {
+    #[cfg(unix)]
+    return file.try_lock().map_err(io::Error::from);
+    #[cfg(windows)]
+    return windows_lock(file, true);
+}
+
+#[cfg(windows)]
+fn windows_lock(file: &File, nonblocking: bool) -> io::Result<()> {
+    use std::os::windows::io::AsRawHandle;
+    use windows_sys::Win32::Storage::FileSystem::{
+        LOCKFILE_EXCLUSIVE_LOCK, LOCKFILE_FAIL_IMMEDIATELY, LockFileEx,
+    };
+    use windows_sys::Win32::System::IO::OVERLAPPED;
+    // SAFETY: zero initializes the union; the lock byte is far beyond data.
+    let mut operation: OVERLAPPED = unsafe { std::mem::zeroed() };
+    operation.Anonymous.Anonymous.Offset = u32::MAX - 1;
+    operation.Anonymous.Anonymous.OffsetHigh = 0x7fff_ffff;
+    let flags = LOCKFILE_EXCLUSIVE_LOCK
+        | if nonblocking {
+            LOCKFILE_FAIL_IMMEDIATELY
+        } else {
+            0
+        };
+    // SAFETY: daemon records use synchronous handles. LockFileEx completes
+    // before returning, so this stack OVERLAPPED cannot escape the call.
+    crate::windows::ok(unsafe {
+        LockFileEx(file.as_raw_handle(), flags, 0, 1, 0, &raw mut operation)
+    })
+}
+
+#[cfg(test)]
+mod lock_tests {
+    use super::*;
+
+    #[test]
+    fn a_locked_record_remains_readable_and_excludes_other_writers() {
+        let root = std::env::temp_dir().join(format!("a-record-lock-{}", std::process::id()));
+        fs::create_dir_all(&root).unwrap();
+        let path = root.join("record");
+        fs::write(&path, b"daemon identity").unwrap();
+        let held = File::options().read(true).write(true).open(&path).unwrap();
+        lock(&held).unwrap();
+        assert_eq!(fs::read(&path).unwrap(), b"daemon identity");
+        let other = File::options().read(true).write(true).open(&path).unwrap();
+        assert!(try_lock(&other).is_err());
+        drop(held);
+        try_lock(&other).unwrap();
+        drop(other);
+        fs::remove_dir_all(&root).unwrap();
     }
 }

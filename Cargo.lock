@@ -1653,6 +1653,7 @@ dependencies = [
  "notify",
  "rustix",
  "smol",
+ "sys",
  "tokio",
 ]
 
@@ -2040,6 +2041,7 @@ dependencies = [
  "libc",
  "rustix",
  "toml_edit 0.25.17+spec-1.1.0",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]

@@ -61,9 +61,10 @@ fn main() -> ExitCode {
             Some(Cmd::Daemon { action }) => daemon_cmd(&daemon, action),
             Some(Cmd::Serve {
                 listen_fd,
+                detached,
                 lock_fd,
                 reset_breaker,
-            }) => serve(&daemon, listen_fd, lock_fd, reset_breaker),
+            }) => serve(&daemon, listen_fd, lock_fd, reset_breaker, detached),
         };
         done.map(|()| ExitCode::SUCCESS)
     });
@@ -529,20 +530,23 @@ fn serve(
     listen_fd: Option<i32>,
     lock_fd: Option<i32>,
     reset_breaker: bool,
+    detached: bool,
 ) -> io::Result<()> {
     let home = daemon.home()?;
     sys::crash::install(home.crash_dir(), daemon.staged.id.clone());
-    let listener = if let Some(fd) = listen_fd {
+    if detached || listen_fd.is_some() {
         sys::detach_session()?;
         sys::log::redirect_stderr(&home.daemon_log())?;
-        sys::Listener::adopt(fd.into())?
+    }
+    let listener = if let Some(fd) = listen_fd {
+        sys::Listener::adopt(fd.into(), &home.endpoint())?
     } else {
         home.bind()?
     };
     let start = engine::Start {
         lock: lock_fd.map(|fd| sys::adopt_lock(fd.into())).transpose()?,
         reset_breaker,
-        logs: listen_fd.is_some(),
+        logs: detached || listen_fd.is_some(),
     };
     engine::serve(
         &listener,

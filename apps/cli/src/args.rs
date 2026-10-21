@@ -70,6 +70,9 @@ pub enum Cmd {
     Serve {
         #[usage(long)]
         listen_fd: Option<i32>,
+        /// Start without a terminal and acknowledge the listener on stdout.
+        #[usage(long)]
+        detached: bool,
         /// The daemon lock, held for it by the client that started it
         #[usage(long)]
         lock_fd: Option<i32>,

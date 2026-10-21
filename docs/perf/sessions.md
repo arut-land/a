@@ -302,3 +302,22 @@ per-process timeout, completed with zero hangs and zero nonzero exits in
 all three groups. The daemon was stopped through that home and the home
 removed; the fixture build directory and temporary stress script were
 removed. The loop is not committed.
+
+## Windows sync classes
+
+On Windows, Rust's `File::sync_data` and `File::sync_all` both call
+`FlushFileBuffers`. Thus an ordered barrier already requests a file cache
+flush, and `SEPARATE_CACHE_FLUSH` is false: there is no additional shared
+flush epoch or blocking hop. Lazy writes can remain cached until the next
+barrier; publication and unsafe effects still await the durable prefix.
+This is stronger, and potentially more expensive, than Apple's separate
+ordering barrier. No Windows latency measurement has been made here.
+
+There is no portable Windows equivalent of opening a directory and
+`fsync`ing it. `sys::sync_dir` therefore does not issue a directory flush;
+file creation/replacement relies on Windows filesystem metadata ordering
+and the file flush. This does not independently certify directory-entry
+survival on every filesystem or storage controller. Restart/crash acceptance
+checks exercise logical recovery, while power-loss guarantees require a
+native filesystem/storage test. `FlushFileBuffers` also depends on the
+storage device honoring flush requests.

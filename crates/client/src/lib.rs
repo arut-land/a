@@ -584,7 +584,7 @@ pub fn diagnose(home: &Home) -> Diagnosis {
 /// reused.
 fn live_daemon(home: &Home) -> Option<Record> {
     let file = File::open(home.daemon_pid_file()).ok()?;
-    if file.try_lock().is_ok() {
+    if sys::fs::try_lock(&file).is_ok() {
         return None;
     }
     fs::read_to_string(home.daemon_pid_file())
@@ -622,7 +622,7 @@ pub fn stop(home: &Home) -> io::Result<bool> {
     home.endpoint().remove();
     // Stopped on purpose: the record it left is not a crash.
     if let Ok(file) = File::options().write(true).open(home.daemon_pid_file())
-        && file.try_lock().is_ok()
+        && sys::fs::try_lock(&file).is_ok()
     {
         file.set_len(0)?;
     }
@@ -643,12 +643,12 @@ pub fn wait_exited(home: &Home, within: Option<Duration>) -> bool {
 /// `within`: on a helper thread, since a file lock has no timed wait. A
 /// lock taken after the wait is given up is let go at once.
 fn locked(file: File, within: Option<Duration>) -> Option<File> {
-    if file.try_lock().is_ok() {
+    if sys::fs::try_lock(&file).is_ok() {
         return Some(file);
     }
     let (tx, rx) = inbox();
     thread::spawn(move || {
-        if file.lock().is_ok() {
+        if sys::fs::lock(&file).is_ok() {
             // Dropped, and so unlocked, when no one waits any more.
             let _ = tx.send(file);
         }
@@ -793,7 +793,6 @@ const DAEMON_ENV: &[&str] = &[
 /// one's, and is waited on for as long as a hello may take.
 fn connect_or_spawn(home: &Home, reset: bool) -> io::Result<(Stream, bool)> {
     use std::process::{Command, Stdio};
-    use sys::Pass;
 
     let endpoint = home.endpoint();
     if let Ok(stream) = endpoint.connect() {
@@ -826,8 +825,6 @@ fn connect_or_spawn(home: &Home, reset: bool) -> io::Result<(Stream, bool)> {
     let lock = locked(open(home.daemon_pid_file())?, Some(HELLO_TIMEOUT))
         .ok_or_else(|| wedged("the daemon"))?;
 
-    let listener = home.bind()?;
-    let (listen_fd, lock_fd) = (listener.passed(), lock.passed());
     // The daemon leaves this process's session (`setsid`) as it starts, so
     // it outlives this client, its terminal and its app, and opens its own
     // log. Reaped here should it exit first, so a long-lived client (the
@@ -836,8 +833,7 @@ fn connect_or_spawn(home: &Home, reset: bool) -> io::Result<(Stream, bool)> {
         .iter()
         .filter_map(|&name| Some((name, std::env::var_os(name)?)));
     let mut cmd = Command::new(home.runtime().current_exe());
-    cmd.args(["__daemon", "--listen-fd", &listen_fd.to_string()])
-        .args(["--lock-fd", &lock_fd.to_string()])
+    cmd.arg("__daemon")
         .args(reset.then_some("--reset-breaker"))
         .env_clear()
         .envs(inherited)
@@ -845,14 +841,12 @@ fn connect_or_spawn(home: &Home, reset: bool) -> io::Result<(Stream, bool)> {
         .stdin(Stdio::null())
         .stdout(Stdio::null())
         .stderr(Stdio::null());
-    sys::pass(&mut cmd, [listen_fd, lock_fd])?;
-    let mut daemon = cmd.spawn()?;
+    let mut daemon = sys::spawn_daemon(&mut cmd, home, lock)?;
     thread::spawn(move || daemon.wait());
-    drop((listener, lock));
     Ok((endpoint.connect()?, true))
 }
 
-#[cfg(all(test, unix))]
+#[cfg(test)]
 mod tests {
     use super::*;
 
@@ -919,7 +913,7 @@ mod tests {
         };
         fs::write(home.daemon_pid_file(), impostor.to_string()).unwrap();
         let held = File::open(home.daemon_pid_file()).unwrap();
-        held.lock().unwrap();
+        sys::fs::lock(&held).unwrap();
         let stopped = stop(&home);
         let pid = diagnose(&home).pid;
         drop(held);
@@ -937,7 +931,7 @@ mod tests {
         let path = home.daemon_pid_file();
         fs::write(&path, "").unwrap();
         let held = File::open(&path).unwrap();
-        held.lock().unwrap();
+        sys::fs::lock(&held).unwrap();
         // Held throughout the wait: nothing is taken.
         let waited = File::open(&path).unwrap();
         assert!(locked(waited, Some(Duration::from_millis(50))).is_none());
@@ -946,6 +940,7 @@ mod tests {
         drop(held);
         let taken = locked(File::open(&path).unwrap(), Some(Duration::from_millis(500)));
         assert!(taken.is_some());
+        drop(taken);
         fs::remove_dir_all(&root).unwrap();
     }
 }

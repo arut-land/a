@@ -277,7 +277,7 @@ async fn run(input: &Command, cx: &Cx, progress: Partials<String>) -> io::Result
     let child = {
         let mut cmd = process(&spawn);
         cmd.stdout(file.try_clone()?).stderr(file);
-        cmd.spawn()?
+        sys::spawn_group(&mut cmd)?
     };
     let pgid = child.id();
     cx.spawned(pgid, false);
@@ -292,7 +292,7 @@ async fn run(input: &Command, cx: &Cx, progress: Partials<String>) -> io::Result
     let ended = std::fs::read_to_string(&report).ok();
     let _ = std::fs::remove_file(&report);
     let cwd = ended
-        .map(|dir| PathBuf::from(dir.trim_end_matches('\n')))
+        .map(|dir| sys::shell_directory(&dir))
         .filter(|dir| dir.is_absolute() && dir.is_dir())
         .unwrap_or_else(|| dir.clone());
     // `pwd -P` resolves symlinks the starting directory may have.
@@ -331,7 +331,7 @@ fn background(cx: &Cx, spawn: Spawn, log: &Path) -> io::Result<Ran> {
     let (file, log) = create_private(log)?;
     let mut cmd = process(&spawn);
     cmd.stdout(file.try_clone()?).stderr(file);
-    let child = cmd.spawn()?;
+    let child = sys::spawn_group(&mut cmd)?;
     drop(cmd);
     let pgid = child.id();
     cx.own(
@@ -367,7 +367,7 @@ fn spawn(
     }
     let mut script = String::new();
     if let Some(report) = report {
-        let pwd = format!("pwd -P >{}", quote(&report.to_string_lossy()));
+        let pwd = format!("{} >{}", sys::shell_pwd(), quote(&sys::shell_path(report)));
         let _ = writeln!(script, "trap {} EXIT", quote(&pwd));
     }
     // On its own line, so a command ending in a comment or a heredoc
@@ -375,7 +375,7 @@ fn spawn(
     let _ = writeln!(
         script,
         "cd -- {} || exit\n{command}",
-        quote(&dir.to_string_lossy())
+        quote(&sys::shell_path(dir))
     );
     let mut spawn = Spawn {
         argv: [bash.as_str(), "--noprofile", "--norc", "-c", &script]
@@ -398,7 +398,6 @@ pub(crate) fn process(spawn: &Spawn) -> Process {
         .envs(&spawn.env)
         .current_dir(&spawn.cwd)
         .stdin(Stdio::null());
-    sys::Group::lead(&mut cmd);
     cmd
 }
 
