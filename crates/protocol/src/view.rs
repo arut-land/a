@@ -50,6 +50,11 @@ pub struct ViewState {
     calls: Keyed<CallId, ViewCall>,
     queued: VecDeque<Queued>,
     turn: u64,
+    #[serde(
+        default,
+        skip_serializing_if = "crate::publication::Publications::is_empty"
+    )]
+    publications: crate::publication::Publications,
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, serde::Deserialize)]
@@ -74,7 +79,12 @@ impl ViewState {
         self.turn
     }
 
+    pub fn publications(&self) -> &crate::publication::Publications {
+        &self.publications
+    }
+
     fn apply(&mut self, e: &Entry) {
+        self.publications.apply(e);
         match &e.body {
             Body::Input {
                 text, mode, taken, ..

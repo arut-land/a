@@ -5,6 +5,7 @@
 
 use std::path::PathBuf;
 
+use protocol::publication::Publication;
 use protocol::view::{Change, Recap, SessionView, Update};
 use protocol::{
     Audience, Body, CallId, Card, DaemonMsg, Decode, Entry, Environment, Epoch, Json, Mode,
@@ -575,6 +576,20 @@ fn scenarios() -> Vec<(&'static str, Vec<Value>)> {
     ]
     };
     let mut scenarios = vec![
+        ("publication identities survive snapshots and later publications", {
+            let entries: Vec<_> = ["skills", "mcp-schemas"].into_iter().zip(1..).map(|(namespace, seq)| Entry::new(
+                Seq::new(seq).unwrap(), Epoch(0), Body::Context {
+                    text: "instructions or schema".into(),
+                    publication: Some(Publication { namespace: namespace.into(), key: Json::encode(&"loaded-publication").unwrap() }),
+                },
+            )).collect();
+            let view = SessionView::from_log(SESSION, "/w".into(), &entries);
+            vec![attached(), msg(DaemonMsg::Snapshot(Box::new(view.snapshot()))),
+                entry(3, Body::Context { text: "later schema".into(), publication: Some(Publication {
+                    namespace: "mcp-schemas".into(), key: Json::encode(&"later-publication").unwrap(),
+                }) }),
+            ]
+        }),
         ("owned_invocation", vec![
             attached(), entry(1, input("run")),
             entry(2, Body::ToolCall { invoke: None, tool: "owner".into(), input: Json::null(), id: None, card: None, by: Audience::Model }),
@@ -1007,7 +1022,8 @@ fn vectors() {
             let updates: Vec<_> = messages
                 .iter()
                 .filter_map(|m| {
-                    let msg = DaemonMsg::from_json(m.to_string().as_bytes()).unwrap();
+                    let msg = DaemonMsg::from_json(m.to_string().as_bytes())
+                        .unwrap_or_else(|error| panic!("{name}: {m}: {error}"));
                     view.fold(&msg)
                 })
                 .collect();
@@ -1234,4 +1250,102 @@ fn view_snapshots_contain_no_execution_authority() {
         }
         assert!(snapshot.get("ledger").is_none());
     }
+}
+
+#[test]
+fn view_snapshots_preserve_skill_and_mcp_publications() {
+    let session = SESSION;
+    let snapshot = |namespace: Option<&str>| {
+        let entry = Entry::new(
+            Seq::new(1).unwrap(),
+            Epoch(0),
+            Body::Context {
+                text: "published instructions or schema".into(),
+                publication: namespace.map(|namespace| Publication {
+                    namespace: namespace.into(),
+                    key: Json::encode(&"loaded-publication").unwrap(),
+                }),
+            },
+        );
+        let view = SessionView::from_log(session, "/w".into(), [entry]);
+        let encoded = serde_json::to_vec(&DaemonMsg::Snapshot(Box::new(view.snapshot()))).unwrap();
+        let mut reconnected = SessionView::default();
+        reconnected.fold(&DaemonMsg::from_json(&encoded).unwrap());
+        if let Some(namespace) = namespace {
+            assert!(
+                reconnected
+                    .state
+                    .publications()
+                    .contains(namespace, &Json::encode(&"loaded-publication").unwrap())
+            );
+        }
+        let snapshot = serde_json::to_value(reconnected.snapshot()).unwrap();
+        assert!(
+            !snapshot
+                .to_string()
+                .contains("published instructions or schema")
+        );
+        snapshot
+    };
+    let unpublished = snapshot(None);
+    for namespace in ["skills", "mcp-schemas"] {
+        assert_ne!(
+            snapshot(Some(namespace)),
+            unpublished,
+            "reconnected clients must retain effective {namespace} publication identities"
+        );
+    }
+}
+
+#[test]
+fn view_publications_follow_edits_to_inherited_context() {
+    let key = Json::encode(&"loaded-publication").unwrap();
+    let inherited: Vec<_> = ["skills", "mcp-schemas"]
+        .into_iter()
+        .zip(1..)
+        .map(|(namespace, seq)| {
+            Json::encode(&Entry::new(
+                Seq::new(seq).unwrap(),
+                Epoch(0),
+                Body::Context {
+                    text: "execution context".into(),
+                    publication: Some(Publication {
+                        namespace: namespace.into(),
+                        key: key.clone(),
+                    }),
+                },
+            ))
+            .unwrap()
+        })
+        .collect();
+    let spawned = Entry::new(
+        Seq::new(1).unwrap(),
+        Epoch(0),
+        Body::Spawned {
+            intent: protocol::publication::SpawnImage {
+                authority: Json::encode(&"execution authority").unwrap(),
+                image: inherited,
+            }
+            .to_json()
+            .unwrap(),
+        },
+    );
+    let view = SessionView::from_log(SESSION, "/w".into(), [spawned]);
+    let encoded = serde_json::to_vec(&DaemonMsg::Snapshot(Box::new(view.snapshot()))).unwrap();
+    assert!(!String::from_utf8_lossy(&encoded).contains("execution"));
+    let mut restored = SessionView::default();
+    restored.fold(&DaemonMsg::from_json(&encoded).unwrap());
+    for namespace in ["skills", "mcp-schemas"] {
+        assert!(restored.state.publications().contains(namespace, &key));
+    }
+    restored.fold(&DaemonMsg::Entry(Entry::new(
+        Seq::new(2).unwrap(),
+        Epoch(0),
+        Body::Edit {
+            target: Seq::new(1).unwrap(),
+            upto: None,
+            replace: None,
+        },
+    )));
+    assert!(restored.state.publications().is_empty());
 }

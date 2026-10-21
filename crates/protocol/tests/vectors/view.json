@@ -2,6 +2,109 @@
   {
     "frames": [
       "{\"session\":\"00000000-0000-0000-0000-00000000000a\",\"t\":\"attached\",\"workspace\":\"/w\"}",
+      "{\"items\":[],\"seq\":2,\"session\":\"00000000-0000-0000-0000-00000000000a\",\"state\":{\"calls\":[],\"publications\":{\"1\":[{\"key\":\"loaded-publication\",\"namespace\":\"skills\"}],\"2\":[{\"key\":\"loaded-publication\",\"namespace\":\"mcp-schemas\"}]},\"queued\":[],\"turn\":0},\"t\":\"snapshot\",\"workspace\":\"/w\"}",
+      "{\"epoch\":0,\"kind\":\"context\",\"publication\":{\"key\":\"later-publication\",\"namespace\":\"mcp-schemas\"},\"seq\":3,\"t\":\"entry\",\"text\":\"later schema\"}"
+    ],
+    "hash": "e11613cc1c15673d",
+    "messages": [
+      {
+        "session": "00000000-0000-0000-0000-00000000000a",
+        "t": "attached",
+        "workspace": "/w"
+      },
+      {
+        "items": [],
+        "seq": 2,
+        "session": "00000000-0000-0000-0000-00000000000a",
+        "state": {
+          "calls": [],
+          "publications": {
+            "1": [
+              {
+                "key": "loaded-publication",
+                "namespace": "skills"
+              }
+            ],
+            "2": [
+              {
+                "key": "loaded-publication",
+                "namespace": "mcp-schemas"
+              }
+            ]
+          },
+          "queued": [],
+          "turn": 0
+        },
+        "t": "snapshot",
+        "workspace": "/w"
+      },
+      {
+        "epoch": 0,
+        "kind": "context",
+        "publication": {
+          "key": "later-publication",
+          "namespace": "mcp-schemas"
+        },
+        "seq": 3,
+        "t": "entry",
+        "text": "later schema"
+      }
+    ],
+    "name": "publication identities survive snapshots and later publications",
+    "state": {
+      "items": [],
+      "seq": 3,
+      "session": "00000000-0000-0000-0000-00000000000a",
+      "state": {
+        "calls": [],
+        "publications": {
+          "1": [
+            {
+              "key": "loaded-publication",
+              "namespace": "skills"
+            }
+          ],
+          "2": [
+            {
+              "key": "loaded-publication",
+              "namespace": "mcp-schemas"
+            }
+          ],
+          "3": [
+            {
+              "key": "later-publication",
+              "namespace": "mcp-schemas"
+            }
+          ]
+        },
+        "queued": [],
+        "turn": 0
+      },
+      "workspace": "/w"
+    },
+    "updates": [
+      {
+        "change": {
+          "change": "attached",
+          "reset": true,
+          "session": "00000000-0000-0000-0000-00000000000a",
+          "workspace": "/w"
+        },
+        "rev": 1,
+        "seq": 0
+      },
+      {
+        "change": {
+          "change": "snapshot"
+        },
+        "rev": 2,
+        "seq": 2
+      }
+    ]
+  },
+  {
+    "frames": [
+      "{\"session\":\"00000000-0000-0000-0000-00000000000a\",\"t\":\"attached\",\"workspace\":\"/w\"}",
       "{\"epoch\":0,\"kind\":\"input\",\"seq\":1,\"t\":\"entry\",\"taken\":true,\"text\":\"run\"}",
       "{\"epoch\":0,\"input\":null,\"kind\":\"tool_call\",\"seq\":2,\"t\":\"entry\",\"tool\":\"owner\"}",
       "{\"epoch\":0,\"input\":null,\"invoke\":{\"name\":\"lookup\",\"parent\":2},\"kind\":\"tool_call\",\"seq\":3,\"t\":\"entry\",\"tool\":\"lookup\"}",

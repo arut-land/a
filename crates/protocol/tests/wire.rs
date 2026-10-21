@@ -825,6 +825,20 @@ fn daemon_samples() -> Vec<Sample<DaemonMsg>> {
             "snapshot",
             DaemonMsg::Snapshot(Box::new(SessionView::from_log(SESSION, "/w".into(), &log).snapshot())),
         ),
+        sample(
+            "snapshot_publications",
+            DaemonMsg::Snapshot(Box::new(SessionView::from_log(
+                SESSION, "/w".into(),
+                ["skills", "mcp-schemas"].into_iter().zip(1..).map(|(namespace, seq)| Entry::new(
+                    Seq::new(seq).unwrap(), Epoch(0), Body::Context {
+                        text: "instructions or schema".into(),
+                        publication: Some(protocol::publication::Publication {
+                            namespace: namespace.into(), key: protocol::Json::encode(&"loaded-publication").unwrap(),
+                        }),
+                    },
+                )),
+            ).snapshot())),
+        ),
         sample("ack", DaemonMsg::Ack { client_seq: 2 }),
         sample(
             "rejected",
