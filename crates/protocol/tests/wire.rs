@@ -668,7 +668,21 @@ fn daemon_samples() -> Vec<Sample<DaemonMsg>> {
             entry(
                 21,
                 Body::Context {
+                    publication: None,
                     text: "cwd: /w".into(),
+                },
+            ),
+        ),
+        sample(
+            "entry_context_publication",
+            entry(
+                22,
+                Body::Context {
+                    text: "Instructions".into(),
+                    publication: Some(protocol::publication::Publication {
+                        namespace: "example".into(),
+                        key: protocol::Json::encode("guide").unwrap(),
+                    }),
                 },
             ),
         ),

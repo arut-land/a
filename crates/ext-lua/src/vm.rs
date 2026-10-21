@@ -672,6 +672,8 @@ struct Callbacks {
     calls: Arc<Mutex<std::collections::BTreeMap<u64, Call>>>,
     next: Arc<AtomicU64>,
     update: Function,
+    publish: Function,
+    published: Function,
     invoke: Function,
 }
 impl Callbacks {
@@ -696,6 +698,37 @@ impl Callbacks {
                     Ok(())
                 }
             })?;
+        let publications = Arc::clone(&calls);
+        let publish =
+            lua.create_async_function(move |_, (id, key, text): (u64, Value, String)| {
+                let data = locked(&publications).get(&id).cloned();
+                async move {
+                    let data = data.ok_or_else(|| mlua::Error::runtime("call context expired"))?;
+                    let cx = data
+                        .cx
+                        .upgrade()
+                        .ok_or_else(|| mlua::Error::runtime("call context expired"))?;
+                    let key = encode(&key)?;
+                    data.quota.take(key.raw().len() + text.len())?;
+                    cx.publish_erased(&format!("lua:{}", data.owner), key, text)
+                        .await;
+                    Ok(())
+                }
+            })?;
+        let publications = Arc::clone(&calls);
+        let published = lua.create_function(move |_, (id, key): (u64, Value)| {
+            let data = locked(&publications)
+                .get(&id)
+                .cloned()
+                .ok_or_else(|| mlua::Error::runtime("call context expired"))?;
+            let cx = data
+                .cx
+                .upgrade()
+                .ok_or_else(|| mlua::Error::runtime("call context expired"))?;
+            let key = encode(&key)?;
+            data.quota.take(key.raw().len())?;
+            Ok(cx.published_erased(&format!("lua:{}", data.owner), &key))
+        })?;
         let invokes = Arc::clone(&calls);
         let invoke =
             lua.create_async_function(move |lua, (id, name, value): (u64, String, Value)| {
@@ -726,6 +759,8 @@ impl Callbacks {
             calls,
             next: Arc::new(AtomicU64::new(0)),
             update,
+            publish,
+            published,
             invoke,
         })
     }
@@ -781,6 +816,8 @@ impl LuaTool {
             },
         );
         context.set("update", self.callbacks.update.bind(id)?)?;
+        context.set("publish", self.callbacks.publish.bind(id)?)?;
+        context.set("published", self.callbacks.published.bind(id)?)?;
         context.set("tool", self.callbacks.invoke.bind(id)?)?;
         let progress = Arc::downgrade(&call);
         context.set(
@@ -882,6 +919,26 @@ mod tests {
         format!(
             "a.tool{{name='test',description='test',input={{type='object'}},run=function(input,cx) {body} end}}"
         )
+    }
+
+    #[test]
+    fn lua_publications_replay_as_one_context_entry() {
+        let source = tool(
+            "if not cx.published('guide') then cx.publish('guide','instructions') end; return cx.published('guide')",
+        );
+        let rig = Rig::new("lua-publication", registry(&source, &[]));
+        assert_eq!(rig.done("test", &json!({})), true);
+        rig.restart();
+        assert_eq!(rig.done("test", &json!({})), true);
+        let log = rig.log.lock().unwrap();
+        assert_eq!(log.len(), 1);
+        assert!(matches!(
+            &log[0].body,
+            protocol::Body::Context {
+                publication: Some(_),
+                ..
+            }
+        ));
     }
 
     #[test]
@@ -1058,12 +1115,15 @@ mod tests {
             assert!(
                 rig.registry
                     .states()
-                    .restore(&[ext::Image {
-                        ext: "test".into(),
-                        state: "count".into(),
-                        image: json,
-                        rejected: std::collections::BTreeMap::new(),
-                    }])
+                    .restore(&ext::Checkpoint {
+                        folds: vec![ext::Image {
+                            ext: "test".into(),
+                            state: "count".into(),
+                            image: json,
+                            rejected: std::collections::BTreeMap::new(),
+                        }],
+                        ..ext::Checkpoint::default()
+                    })
                     .is_err()
             );
         }

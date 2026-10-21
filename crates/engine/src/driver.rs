@@ -729,7 +729,7 @@ struct Image {
     extensions: Vec<protocol::Installed>,
     has_input: bool,
     ledger: Ledger,
-    states: Vec<ext::Image>,
+    states: ext::Checkpoint,
 }
 
 /// How much log, in bytes, a load may read past the newest snapshot: at
@@ -2324,7 +2324,8 @@ impl Actor {
         if let Some(messages) = transcript.before(call.get()) {
             messages.clone()
         } else {
-            // A call recovery runs after entries it does not see.
+            // Recovery keeps the call's conversation boundary, including later
+            // transcript edits and context republished while preparing it.
             let before = frames
                 .entries()
                 .chain(
@@ -2332,7 +2333,9 @@ impl Actor {
                         .iter()
                         .flat_map(|(entries, _)| entries.iter().cloned()),
                 )
-                .take_while(|e| e.seq < call.0);
+                .filter(|e| {
+                    e.seq < call.0 || matches!(e.body, Body::Context { .. } | Body::Edit { .. })
+                });
             Transcript::of(before, Arc::clone(registry), system).into_messages()
         }
     }
@@ -2814,6 +2817,24 @@ impl Host for Calling {
             done: Some(done),
         };
         self.origin.send(&self.session, note);
+        Box::pin(async move {
+            let _ = committed.await;
+        })
+    }
+
+    fn publish(&self, namespace: &str, key: Json, text: String) -> BoxFuture<'static, ()> {
+        let (done, committed) = oneshot::channel();
+        self.origin.send(
+            &self.session,
+            ContextRequest::Note {
+                note: Note::Publish {
+                    namespace: namespace.to_owned(),
+                    key,
+                    text,
+                },
+                done: Some(done),
+            },
+        );
         Box::pin(async move {
             let _ = committed.await;
         })
