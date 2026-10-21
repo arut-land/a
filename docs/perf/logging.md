@@ -89,3 +89,10 @@ and load failures, classify side-request errors and timeouts without their
 content, verify both status timeout phases leave a witness, and check
 secret panic content and the maximum crash-report shape. Budgets and
 startup timings remain for the coordinator on a quiet machine.
+
+The protocol 9 side-call integration measures **3,284 KiB** (`mise run size`,
+`CARGO_BUILD_JOBS=3`), against the side branch's prior **3,236 KiB** (+48 KiB,
+including main's diagnostics implementation). The integration adds no dependency:
+side attempts and terminal failures use the existing typed provider classifier.
+All 985 workspace tests and 13 acceptance tests pass; Windows lint, machete,
+and no-tokio pass. Startup and budgets remain for the quiet-machine run.

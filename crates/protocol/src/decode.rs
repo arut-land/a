@@ -413,6 +413,9 @@ pub(crate) struct EntryFields {
     #[serde(rename = "for")]
     pub(crate) r#for: Option<u64>,
     pub(crate) purpose: Option<String>,
+    pub(crate) request: Option<Json>,
+    pub(crate) failure: Option<Json>,
+    pub(crate) after_ms: Option<u64>,
     pub(crate) on: Option<Tag>,
     #[serde(default, deserialize_with = "present")]
     pub(crate) ui: Option<Json>,

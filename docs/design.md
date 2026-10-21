@@ -164,9 +164,10 @@ The linked extensions own:
 
 The default loop lives in the SDK and registers through the same machinery.
 `apps/cli/src/exts.rs` assembles the linked extensions. `Models` supports
-budgeted side requests with logged purpose and outcome; title, compact and
-the policy judge use it. Compaction edits the model's transcript without
-erasing history. Optional [Lua mods](ext-lua.md) already support tools,
+[durable side requests](side-calls.md) with role-based routing, explicit
+awaited or background execution, committed results, and bounded retries;
+title, compact and the policy judge use it. Compaction edits the model's
+transcript without erasing history. Optional [Lua mods](ext-lua.md) already support tools,
 wire points, folds, text and agents in a bounded sandbox. They do not expose
 every Rust service or decision point. [Skills](ext-skills.md) publish a small
 index per adopted generation and load instructions through a typed tool or

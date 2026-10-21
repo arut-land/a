@@ -191,21 +191,12 @@ impl Core {
                 }
             }
             Event::Recovered { call, recovered } => self.recovered_later(call, recovered, &mut fx),
-            Event::Side {
-                of,
-                purpose,
-                model,
-                ticket,
-            } => {
-                let side = self.side(of, purpose, model, &mut fx);
-                fx.push(Effect::Side { ticket, side });
-            }
+            Event::Side(event) => self.side_event(event, &mut fx),
             Event::Prepared {
                 call,
                 decisions,
                 answered,
             } => self.prepared(call, decisions, answered, &mut fx),
-            Event::SideDone { side, outcome } => self.side_done(side, outcome, &mut fx),
             Event::ChildSettled { child, outcome } => self.child_settled(child, outcome, &mut fx),
             Event::Registry(registry) => {
                 if self.at_rest() {
@@ -366,6 +357,16 @@ impl Core {
     /// in any state: what waits settles at once, what runs is cancelled and
     /// settles as it reports.
     fn interrupt(&mut self, origin: Option<Author>, fx: &mut Effects) {
+        let sides: Vec<_> = self
+            .fold
+            .ledger
+            .open_calls()
+            .filter_map(|(call, open)| matches!(open.call, Call::Side { .. }).then_some(call))
+            .collect();
+        for side in sides {
+            fx.push(Effect::Cancel { call: side });
+            self.settle(side, Outcome::Interrupted { output: None }, fx);
+        }
         let open = match mem::take(&mut self.turn) {
             Turn::Idle => return,
             stopping @ Turn::Stopping { .. } => {
@@ -557,18 +558,108 @@ impl Core {
         }
     }
 
+    fn side_event(&mut self, event: crate::SideEvent, fx: &mut Effects) {
+        match event {
+            crate::SideEvent::Open {
+                of,
+                purpose,
+                model,
+                request,
+                background,
+                ticket,
+            } => {
+                let side = self.side(of, purpose, model, request, background, fx);
+                fx.push(Effect::Side { ticket, side });
+            }
+            crate::SideEvent::Retry {
+                side,
+                by,
+                attempt,
+                failure,
+                after_ms,
+                ticket,
+            } => self.side_retry(
+                side,
+                &by,
+                Verdict::SideRetry {
+                    attempt,
+                    failure,
+                    after_ms,
+                },
+                ticket,
+                fx,
+            ),
+            crate::SideEvent::Done {
+                side,
+                outcome,
+                failure,
+                ticket,
+            } => self.side_done(side, outcome, failure, ticket, fx),
+        }
+    }
+
+    fn side_retry(
+        &mut self,
+        side: CallId,
+        by: &str,
+        decision: Verdict,
+        ticket: Ticket,
+        fx: &mut Effects,
+    ) {
+        let open = self
+            .fold
+            .ledger
+            .call(side)
+            .is_some_and(|o| matches!(o.call, Call::Side { .. }));
+        if open {
+            self.decide(Some(side), by, decision, fx);
+        }
+        fx.push(Effect::Reply {
+            ticket,
+            result: if open {
+                Ok(())
+            } else {
+                Err("side call closed".into())
+            },
+        });
+    }
+
     /// Logs side request `side`'s outcome, unless it has one.
-    fn side_done(&mut self, side: CallId, outcome: Outcome, fx: &mut Effects) {
-        let open = self.fold.ledger.call(side).map(|open| &open.call);
-        if matches!(open, Some(Call::Side { .. })) {
+    fn side_done(
+        &mut self,
+        side: CallId,
+        outcome: Outcome,
+        failure: Option<Json>,
+        ticket: Ticket,
+        fx: &mut Effects,
+    ) {
+        let owner = self
+            .fold
+            .ledger
+            .call(side)
+            .and_then(|open| match open.call {
+                Call::Side { of } => Some(of),
+                _ => None,
+            });
+        if let Some(of) = owner {
             self.append(
                 fx,
                 Body::ModelResult {
+                    failure,
                     call: side,
+                    r#for: Some(of),
                     outcome,
                 },
             );
         }
+        fx.push(Effect::Reply {
+            ticket,
+            result: if owner.is_some() {
+                Ok(())
+            } else {
+                Err("side call closed".into())
+            },
+        });
     }
 
     /// Logs the intent of a side model request on behalf of call `of`, if
@@ -578,13 +669,18 @@ impl Core {
         of: CallId,
         purpose: String,
         model: String,
+        request: Json,
+        background: bool,
         fx: &mut Effects,
     ) -> Option<CallId> {
-        let owner = self.fold.ledger.call(of)?;
-        if matches!(owner.call, Call::Side { .. }) {
+        let owner = self.fold.ledger.call(of);
+        if owner.is_none() && !background
+            || owner.is_some_and(|o| matches!(o.call, Call::Side { .. }))
+        {
             return None;
         }
         let body = Body::ModelCall {
+            request: Some(request),
             model,
             attempt: 0,
             choice: ToolChoice::Auto,
@@ -947,6 +1043,7 @@ impl Core {
                 self.publish_generation(fx);
                 let model = self.registry.model();
                 let body = Body::ModelCall {
+                    request: None,
                     model,
                     attempt: 0,
                     choice,
@@ -1341,13 +1438,23 @@ impl Core {
             self.append(
                 fx,
                 Body::ModelResult {
+                    r#for: Some(call),
+                    failure: None,
                     call: side,
                     outcome,
                 },
             );
         }
         let body = match self.fold.ledger.call(call).map(|open| &open.call) {
-            Some(Call::Model { .. } | Call::Side { .. }) => Body::ModelResult { call, outcome },
+            Some(kind @ (Call::Model { .. } | Call::Side { .. })) => Body::ModelResult {
+                r#for: match kind {
+                    Call::Side { of } => Some(*of),
+                    _ => None,
+                },
+                failure: None,
+                call,
+                outcome,
+            },
             Some(Call::Tool { .. }) => Body::ToolResult {
                 call,
                 outcome,

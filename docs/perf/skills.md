@@ -84,3 +84,10 @@ against the prior validated **3155 KiB** (+48 KiB, including main's fork work).
 Catalog images add no dependency and preserve the historical generation without
 placing instruction bodies in model context. Startup and budgets remain for
 the coordinator's quiet-machine run.
+
+The side-call merge on protocol **9** measures **3236 KiB** (`mise run size`,
+`CARGO_BUILD_JOBS=3`). The side branch's last validated build was **3072 KiB**;
+this +164 KiB includes the skills implementation and its dependencies from
+main. Against main's **3203 KiB** above, the combined build adds 33 KiB.
+The combined compaction/fork regression links `ext-skills` only as an engine
+dev-dependency; it adds no shipped dependency beyond main's skills feature.

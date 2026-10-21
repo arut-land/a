@@ -143,17 +143,8 @@ pub enum Event {
         call: CallId,
         recovered: Option<(Name, Recover)>,
     },
-    /// An extension asks `model` aside on behalf of open call `of`, for
-    /// `purpose`: logged as a model call of its own under it, its id the
-    /// answer to `ticket` ([`Effect::Side`]).
-    Side {
-        of: CallId,
-        purpose: String,
-        model: String,
-        ticket: Ticket,
-    },
-    /// Side request `side` ended.
-    SideDone { side: CallId, outcome: Outcome },
+    /// A side request changes independently of the main turn.
+    Side(SideEvent),
     /// The request of model call `call` is prepared ([`Effect::Prepare`]):
     /// the `step` point decided `decisions` about it, and a handler
     /// `answered` it in the model's place, if one did. Logged, then the
@@ -171,6 +162,39 @@ pub enum Event {
     /// The environment the session's commands run in from now on, as
     /// logged (secrets redacted): logged unless it is the one last logged.
     Environment(Environment),
+}
+
+/// The durable lifecycle of work outside the main turn.
+#[derive(Debug)]
+pub enum SideEvent {
+    /// An extension asks `model` aside on behalf of open call `of`, for
+    /// `purpose`: logged as a model call of its own under it, its id the
+    /// answer to `ticket` ([`Effect::Side`]).
+    Open {
+        of: CallId,
+        purpose: String,
+        model: String,
+        request: Json,
+        background: bool,
+        ticket: Ticket,
+    },
+    /// A retry of a side request: the failure and delay commit before
+    /// the driver may send again. No main-turn state is involved.
+    Retry {
+        side: CallId,
+        by: String,
+        attempt: u16,
+        failure: Json,
+        after_ms: u64,
+        ticket: Ticket,
+    },
+    /// Side request `side` ended.
+    Done {
+        side: CallId,
+        outcome: Outcome,
+        failure: Option<Json>,
+        ticket: Ticket,
+    },
 }
 
 /// How a model call ended.

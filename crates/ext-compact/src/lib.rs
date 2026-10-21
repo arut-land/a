@@ -133,7 +133,12 @@ fn estimate(request: &llm::Request) -> u64 {
 async fn compact(cx: &Cx, call: CallId) -> Result<String, String> {
     let models = cx.models().ok_or("this engine asks no model aside")?;
     let ask = [llm::Message::user(SUMMARY)].into_iter().collect();
-    let side = Side::new("compact", ask).after_the_conversation();
+    let side = Side::new::<Compact>(
+        "compact",
+        ext::ModelRole::Session,
+        ext::SideContext::BeforeOwner,
+        ask,
+    );
     let reply = models.call(cx, side).await.map_err(|e| e.to_string())?;
     let summary = reply.message.text();
     if summary.trim().is_empty() {
@@ -143,9 +148,10 @@ async fn compact(cx: &Cx, call: CallId) -> Result<String, String> {
     let (Some(first), Some(last)) = (first, last) else {
         return Err("nothing to compact".into());
     };
-    cx.update::<Compacted>(&call.get()).await;
     let text = format!("<summary of the conversation so far>\n{summary}\n</summary>");
     cx.edit(first, Some(last), Some(&text));
+    // A crash may repeat an edit; it must never retain only its completion mark.
+    cx.update::<Compacted>(&call.get()).await;
     Ok(summary)
 }
 

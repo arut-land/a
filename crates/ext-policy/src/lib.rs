@@ -180,8 +180,13 @@ fn judge(cx: &PointCx<'_>, call: ToolUse<'_>) -> Answer<Option<bool>> {
     Answer::Later(Later::new(async move {
         let models = cx.models()?;
         let messages = [llm::Message::system(JUDGE), llm::Message::user(question)];
-        let mut side = Side::new("judge", messages.into_iter().collect());
-        side.budget.max_tokens = 16;
+        let mut side = Side::new::<Policy>(
+            "judge",
+            ext::ModelRole::Fast,
+            ext::SideContext::None,
+            messages.into_iter().collect(),
+        );
+        side.budget.max_tokens = std::num::NonZeroU32::new(16).unwrap();
         let reply = models.call(&cx, side).await.ok()?;
         match reply
             .message

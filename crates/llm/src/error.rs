@@ -2,7 +2,7 @@ use std::fmt;
 use std::time::Duration;
 
 /// Why a call failed, classified so a caller can decide whether to retry.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize)]
 pub enum Kind {
     /// The request never got a reply: connect, TLS, a reset, a timeout.
     Transport,
@@ -36,7 +36,7 @@ impl Kind {
     }
 }
 
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct Error {
     pub kind: Kind,
     pub message: String,
@@ -52,6 +52,10 @@ pub struct Error {
 const QUOTE: usize = 2000;
 
 impl Error {
+    pub fn from_json(json: &str) -> Result<Self, serde_json::Error> {
+        serde_json::from_str(json)
+    }
+
     pub fn new(kind: Kind, message: impl Into<String>) -> Self {
         Self {
             kind,

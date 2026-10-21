@@ -387,6 +387,9 @@ pub fn decision_line(tool: &str, call: Option<CallId>, decision: &Verdict) -> St
         Verdict::PostTool { .. } => format!("rewrote the outcome of call {call}"),
         Verdict::OnStop { text } => format!("continued with: {text}"),
         Verdict::Input { original } => format!("rewrote your input: {original}"),
+        Verdict::SideRetry { attempt, .. } => {
+            format!("retrying side call {call}, attempt {attempt}")
+        }
         Verdict::Retry { attempt, error } => {
             format!("retried call {call} (attempt {attempt}): {error}")
         }

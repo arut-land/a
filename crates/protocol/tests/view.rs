@@ -174,6 +174,7 @@ impl Session {
 
     fn model(&mut self, rng: &mut Rng) {
         let call = self.commit(Body::ModelCall {
+            request: None,
             model: "m".into(),
             attempt: 0,
             choice: protocol::ToolChoice::Auto,
@@ -200,7 +201,12 @@ impl Session {
                 "usage": { "input": 3, "output": 5 },
             });
             let outcome = outcome(rng, &output);
-            self.commit(Body::ModelResult { call, outcome });
+            self.commit(Body::ModelResult {
+                r#for: None,
+                failure: None,
+                call,
+                outcome,
+            });
         }
     }
 
@@ -589,6 +595,7 @@ fn scenarios() -> Vec<(&'static str, Vec<Value>)> {
                 entry(
                     2,
                     Body::ModelCall {
+                        request: None,
                         model: "m".into(),
                         attempt: 0,
                         choice: protocol::ToolChoice::Auto,
@@ -609,6 +616,8 @@ fn scenarios() -> Vec<(&'static str, Vec<Value>)> {
                 entry(
                     3,
                     Body::ModelResult {
+                        r#for: None,
+                        failure: None,
                         call: CallId::new(2).unwrap(),
                         outcome: Outcome::Done {
                             output: Json::encode(&json!({
@@ -816,6 +825,7 @@ fn scenarios() -> Vec<(&'static str, Vec<Value>)> {
             let log = [
                 input("one"),
                 Body::ModelCall {
+                    request: None,
                     model: "m".into(),
                     attempt: 0,
                     choice: protocol::ToolChoice::Auto,
@@ -836,6 +846,7 @@ fn scenarios() -> Vec<(&'static str, Vec<Value>)> {
                 entry(
                     2,
                     Body::ModelCall {
+                        request: None,
                         model: "m".into(),
                         attempt: 0,
                         choice: protocol::ToolChoice::Auto,

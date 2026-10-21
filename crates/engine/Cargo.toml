@@ -42,4 +42,5 @@ ext-prompt.workspace = true
 ext-retry.workspace = true
 ext-settings.workspace = true
 ext-shell.workspace = true
+ext-skills.workspace = true
 ext-subagent.workspace = true

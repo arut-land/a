@@ -544,9 +544,13 @@ fn stale_request<'a>(
             origin.send(
                 session,
                 ContextRequest::Side {
-                    purpose: "stale side".into(),
+                    side: ext::Side::new::<HeldHarbor>(
+                        "stale side",
+                        ext::ModelRole::Session,
+                        ext::SideContext::None,
+                        llm::Messages::default(),
+                    ),
                     model: "none".into(),
-                    conversation: false,
                     reply,
                 },
             );
@@ -582,8 +586,10 @@ fn stale_request<'a>(
         })
     } else {
         Box::pin(async move {
-            let side = ext::Side::new(
+            let side = ext::Side::new::<HeldHarbor>(
                 "stale side",
+                ext::ModelRole::Session,
+                ext::SideContext::None,
                 [llm::Message::user("stale request")].into_iter().collect(),
             );
             let _ = old.models().unwrap().call(old, side).await;
@@ -701,8 +707,10 @@ fn an_unadmitted_side_call_cannot_outlive_its_cancelled_parent() {
     let ack = enqueue(&session, "hello");
     input.started();
     let (cx, release) = started_harbor(&starts);
-    let side = ext::Side::new(
+    let side = ext::Side::new::<HeldHarbor>(
         "cancelled side",
+        ext::ModelRole::Session,
+        ext::SideContext::None,
         [llm::Message::user("Say hi.")].into_iter().collect(),
     );
     let mut answer = cx.models().unwrap().call(&cx, side);
