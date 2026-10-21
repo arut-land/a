@@ -13,6 +13,18 @@ fn send(value: &Value) {
 
 fn main() {
     let marker = std::env::args().nth(1).expect("marker file");
+    if marker == "--descendant" {
+        let marker = std::env::args().nth(2).expect("parent marker");
+        std::fs::write(
+            format!("{marker}.descendant-{}", std::process::id()),
+            "ready",
+        )
+        .unwrap();
+        loop {
+            std::thread::park();
+        }
+    }
+    let mut children = Vec::new();
     writeln!(
         OpenOptions::new()
             .create(true)
@@ -70,6 +82,33 @@ fn main() {
                 )
                 .unwrap();
                 match tool {
+                    "tree" | "tree-wait" => {
+                        let child = std::process::Command::new(std::env::current_exe().unwrap())
+                            .args(["--descendant", &marker])
+                            .stdin(std::process::Stdio::null())
+                            .stdout(std::process::Stdio::null())
+                            .stderr(std::process::Stdio::null())
+                            .spawn()
+                            .unwrap();
+                        let pid = child.id();
+                        children.push(child);
+                        while !std::path::Path::new(&format!("{marker}.descendant-{pid}")).exists()
+                        {
+                            std::thread::sleep(std::time::Duration::from_millis(5));
+                        }
+                        writeln!(
+                            OpenOptions::new().append(true).open(&marker).unwrap(),
+                            "descendant {pid}"
+                        )
+                        .unwrap();
+                        if tool == "tree-wait" {
+                            send(
+                                &json!({"jsonrpc":"2.0","method":"notifications/progress","params":{"progressToken":id,"message":"tree ready"}}),
+                            );
+                            continue;
+                        }
+                        json!({"resultType":"complete","content":[]})
+                    }
                     "progress-pause" => {
                         for message in ["initial\n", "latest\n"] {
                             send(
@@ -127,5 +166,9 @@ fn main() {
             _ => panic!("unexpected method {method}"),
         };
         send(&json!({"jsonrpc":"2.0","id":id,"result":result}));
+    }
+    for mut child in children {
+        let _ = child.kill();
+        let _ = child.wait();
     }
 }

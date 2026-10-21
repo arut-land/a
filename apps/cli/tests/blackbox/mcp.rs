@@ -200,3 +200,46 @@ fn interrupting_an_active_call_kills_its_server() {
         !sys::Group(child).alive()
     });
 }
+
+#[test]
+fn daemon_stop_and_cancellation_kill_server_descendants() {
+    for cancel in [false, true] {
+        let env = configured(if cancel {
+            "mcp-tree-cancel"
+        } else {
+            "mcp-tree-stop"
+        });
+        env.start();
+        let mut conn = env.connect();
+        conn.attach(Target::New, &env.ws);
+        call(&mut conn, if cancel { "tree-wait" } else { "tree" });
+        conn.until(|e| {
+            if cancel {
+                matches!(e.body, Body::Progress { .. })
+            } else {
+                matches!(e.body, Body::ToolResult { .. })
+            }
+        });
+        let server = pid(&env);
+        let child: u32 = fs::read_to_string(env.root.join("effects"))
+            .unwrap()
+            .lines()
+            .find_map(|line| line.strip_prefix("descendant "))
+            .unwrap()
+            .parse()
+            .unwrap();
+        assert_ne!(server, child);
+        assert!(sys::Group(server).members().contains(&child));
+        if cancel {
+            conn.send(&ClientMsg::INTERRUPT);
+            conn.until(|e| matches!(e.body, Body::ToolResult { .. }));
+        } else {
+            env.run(&["daemon", "stop"]);
+        }
+        wait_for(
+            "the server and its descendant to leave their process group",
+            || !sys::Group(server).alive(),
+        );
+        assert!(!sys::Group(server).members().contains(&child));
+    }
+}
