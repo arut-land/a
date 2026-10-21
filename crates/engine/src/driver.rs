@@ -2677,15 +2677,17 @@ impl Host for Calling {
 
     fn publish(&self, namespace: &str, key: Json, text: String) -> BoxFuture<'static, ()> {
         let (done, committed) = oneshot::channel();
-        let _ = self.session.mail.send(Msg::Note {
-            call: self.call,
-            note: Note::Publish {
-                namespace: namespace.to_owned(),
-                key,
-                text,
+        self.origin.send(
+            &self.session,
+            ContextRequest::Note {
+                note: Note::Publish {
+                    namespace: namespace.to_owned(),
+                    key,
+                    text,
+                },
+                done: Some(done),
             },
-            done: Some(done),
-        });
+        );
         Box::pin(async move {
             let _ = committed.await;
         })
