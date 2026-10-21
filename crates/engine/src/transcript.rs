@@ -34,6 +34,40 @@ pub struct Transcript {
     registry: Arc<Registry>,
 }
 
+// Both the live reducer and immutable images admit context through this seam.
+enum ContextFact<'a> {
+    Inherited(&'a protocol::Json),
+    User(&'a str),
+    Queued(&'a str),
+    Taken(Seq),
+    Assistant(&'a str),
+    Context(&'a str),
+    Child(&'a Outcome),
+    Reply(&'a protocol::Json),
+    ToolCall { id: &'a str, tool: &'a str },
+    ToolResult { call: CallId, outcome: &'a Outcome },
+    Edit,
+}
+
+fn context_fact(body: &Body) -> Option<ContextFact<'_>> {
+    Some(match body {
+        Body::Spawned { intent } => ContextFact::Inherited(intent),
+        Body::Input { text, taken: true, .. }
+        | Body::Decision { d: Verdict::OnStop { text }, .. } => ContextFact::User(text),
+        Body::Input { text, .. } => ContextFact::Queued(text),
+        Body::Enqueue { envelope } => ContextFact::Queued(&envelope.payload),
+        Body::Take { input } => ContextFact::Taken(*input),
+        Body::Assistant { text } => ContextFact::Assistant(text),
+        Body::Context { text, .. } => ContextFact::Context(text),
+        Body::Fired { outcome, .. } => ContextFact::Child(outcome),
+        Body::ModelResult { r#for: None, outcome: Outcome::Done { output }, .. } => ContextFact::Reply(output),
+        Body::ToolCall { tool, id: Some(id), .. } => ContextFact::ToolCall { id, tool },
+        Body::ToolResult { call, outcome, .. } => ContextFact::ToolResult { call: *call, outcome },
+        Body::Edit { .. } => ContextFact::Edit,
+        _ => return None,
+    })
+}
+
 impl Transcript {
     /// The transcript of `entries`, on `registry`, that `system` prompts,
     /// as their edits leave it: the entries an `edit` covers stand as its
@@ -77,8 +111,8 @@ impl Transcript {
     /// Folds entry `e`. `fresh` is the message of the reply this daemon
     /// just had, which `e` stores: taken as it is rather than read again.
     pub fn apply(&mut self, e: &Entry, fresh: Option<Assistant>) {
-        let message = match &e.body {
-            Body::Spawned { intent } => {
+        let message = match context_fact(&e.body) {
+            Some(ContextFact::Inherited(intent)) => {
                 #[derive(serde::Deserialize)]
                 struct Image {
                     image: Vec<protocol::Json>,
@@ -97,39 +131,25 @@ impl Transcript {
                 }
                 return;
             }
-            Body::Input {
-                text, taken: true, ..
-            }
-            | Body::Decision {
-                d: Verdict::OnStop { text },
-                ..
-            } => Message::user(text.clone()),
-            Body::Enqueue { envelope } => {
-                self.waiting.insert(e.seq, envelope.payload.clone());
+            Some(ContextFact::User(text)) => Message::user(text.to_owned()),
+            Some(ContextFact::Queued(text)) => {
+                self.waiting.insert(e.seq, text.to_owned());
                 return;
             }
-            Body::Input { text, .. } => {
-                self.waiting.insert(e.seq, text.clone());
-                return;
-            }
-            Body::Take { input } => match self.waiting.remove(input) {
+            Some(ContextFact::Taken(input)) => match self.waiting.remove(&input) {
                 Some(text) => Message::user(text),
                 None => return,
             },
-            Body::Assistant { text } => Message::assistant(text.clone()),
-            Body::Context { text, .. } => {
+            Some(ContextFact::Assistant(text)) => Message::assistant(text.to_owned()),
+            Some(ContextFact::Context(text)) => {
                 self.messages
-                    .insert(self.context, Message::user(text.clone()));
+                    .insert(self.context, Message::user(text.to_owned()));
                 self.context += 1;
                 self.last = e.seq.get();
                 return;
             }
-            Body::Fired { outcome, .. } => Message::user(ext::child_result(outcome)),
-            Body::ModelResult { r#for: Some(_), .. } => return,
-            Body::ModelResult {
-                outcome: Outcome::Done { output },
-                ..
-            } => {
+            Some(ContextFact::Child(outcome)) => Message::user(ext::child_result(outcome)),
+            Some(ContextFact::Reply(output)) => {
                 let reply = match fresh {
                     Some(message) => Ok(message),
                     None => llm::Response::from_json(output.raw()).map(|r| r.message),
@@ -139,14 +159,12 @@ impl Transcript {
                     Err(_) => return,
                 }
             }
-            Body::ToolCall {
-                tool, id: Some(id), ..
-            } => {
-                self.calls.insert(CallId(e.seq), (id.clone(), tool.clone()));
+            Some(ContextFact::ToolCall { id, tool }) => {
+                self.calls.insert(CallId(e.seq), (id.to_owned(), tool.to_owned()));
                 return;
             }
-            Body::ToolResult { call, outcome, .. } => {
-                let Some((id, tool)) = self.calls.remove(call) else {
+            Some(ContextFact::ToolResult { call, outcome }) => {
+                let Some((id, tool)) = self.calls.remove(&call) else {
                     return;
                 };
                 let (output, error) = self.registry.tools().to_model(&tool, outcome);
@@ -160,11 +178,11 @@ impl Transcript {
                 self.last = e.seq.get();
                 // Only a tool message changes to take the result.
                 if let Some(Message::Tool(answers)) = self.messages.last_mut() {
-                    let at = self.answered.partition_point(|&seq| seq < *call);
-                    self.answered.insert(at, *call);
+                    let at = self.answered.partition_point(|&seq| seq < call);
+                    self.answered.insert(at, call);
                     answers.results.insert(at, result);
                 } else {
-                    self.answered = vec![*call];
+                    self.answered = vec![call];
                     self.messages.push(Message::Tool(ToolMessage {
                         results: vec![result],
                     }));
@@ -252,15 +270,15 @@ fn context_edits(
 pub(crate) fn context_image(entries: &[Entry]) -> Vec<protocol::Json> {
     let completed: std::collections::HashSet<_> = entries
         .iter()
-        .filter_map(|e| match e.body {
-            Body::ToolResult { call, .. } => Some(call),
+        .filter_map(|e| match context_fact(&e.body) {
+            Some(ContextFact::ToolResult { call, .. }) => Some(call.0),
             _ => None,
         })
         .collect();
     let taken_inputs: std::collections::HashSet<_> = entries
         .iter()
-        .filter_map(|e| match e.body {
-            Body::Take { input } => Some(input),
+        .filter_map(|e| match context_fact(&e.body) {
+            Some(ContextFact::Taken(input)) => Some(input),
             _ => None,
         })
         .collect();
@@ -268,19 +286,11 @@ pub(crate) fn context_image(entries: &[Entry]) -> Vec<protocol::Json> {
     entries
         .iter()
         .filter_map(|e| {
-            let projected = match e.body {
-                Body::ToolCall { .. } => completed.contains(&CallId(e.seq)),
-                Body::Input { taken, .. } => taken || taken_inputs.contains(&e.seq),
-                Body::Enqueue { .. } => taken_inputs.contains(&e.seq),
-                Body::Take { .. }
-                | Body::Assistant { .. }
-                | Body::Context { .. }
-                | Body::Edit { .. }
-                | Body::ModelResult { r#for: None, .. }
-                | Body::ToolResult { .. }
-                | Body::Fired { .. }
-                | Body::Spawned { .. } => true,
-                _ => false,
+            let projected = match context_fact(&e.body) {
+                Some(ContextFact::ToolCall { .. }) => completed.contains(&e.seq),
+                Some(ContextFact::Queued(_)) => taken_inputs.contains(&e.seq),
+                Some(_) => true,
+                None => false,
             };
             if projected {
                 return Some(protocol::Json::encode(e).expect("context entry encodes"));
@@ -308,6 +318,26 @@ pub(crate) fn context_image(entries: &[Entry]) -> Vec<protocol::Json> {
 mod tests {
     use super::*;
     use protocol::{Epoch, Json, Mode, SessionId};
+    #[test]
+    fn a_prefix_preserves_on_stop_context() {
+        let entries = [entry(
+            1,
+            Body::Decision {
+                call: None,
+                by: "review".into(),
+                d: Verdict::OnStop {
+                    text: "continue with the missing verification".into(),
+                },
+            },
+        )];
+        let registry = Arc::new(Registry::default());
+        let expected = Transcript::of(&entries, registry.clone(), "").into_context();
+        let image = context_image(&entries);
+        let intent = Json::encode(&serde_json::json!({"image": image})).unwrap();
+        let actual =
+            Transcript::of([entry(1, Body::Spawned { intent })], registry, "").into_messages();
+        assert_eq!(actual, expected);
+    }
     fn entry(seq: u64, body: Body) -> Entry {
         Entry::new(Seq::new(seq).unwrap(), Epoch(0), body)
     }
