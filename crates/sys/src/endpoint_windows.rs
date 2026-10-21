@@ -10,8 +10,8 @@ use std::sync::{Arc, Mutex, MutexGuard};
 use std::time::Duration;
 
 use windows_sys::Win32::Foundation::{
-    ERROR_BROKEN_PIPE, ERROR_IO_INCOMPLETE, ERROR_IO_PENDING, ERROR_NO_DATA, ERROR_PIPE_CONNECTED,
-    ERROR_PIPE_NOT_CONNECTED, WAIT_TIMEOUT,
+    ERROR_BROKEN_PIPE, ERROR_IO_INCOMPLETE, ERROR_IO_PENDING, ERROR_LOCK_VIOLATION, ERROR_NO_DATA,
+    ERROR_PIPE_CONNECTED, ERROR_PIPE_NOT_CONNECTED, WAIT_TIMEOUT,
 };
 use windows_sys::Win32::Storage::FileSystem::{
     FILE_FLAG_FIRST_PIPE_INSTANCE, FILE_FLAG_OVERLAPPED, PIPE_ACCESS_DUPLEX, ReadFile, WriteFile,
@@ -283,7 +283,18 @@ pub fn connect(path: &Path) -> io::Result<Stream> {
     // The locked daemon record is also discovery: only its owner writes it.
     // A generation never reuses an old pipe namespace, even if a client
     // keeps an old instance alive after its server has exited.
-    let record: crate::crash::Record = std::fs::read_to_string(path)?.parse()?;
+    // https://learn.microsoft.com/en-us/windows/win32/api/winbase/nf-winbase-createnamedpipew
+    // Process objects can outlive exit while handles remain open. Only a
+    // held record lock vouches for discovery, including during shutdown.
+    let mut owner = OpenOptions::new().read(true).write(true).open(path)?;
+    match crate::fs::try_lock(&owner) {
+        Ok(()) => return Err(io::ErrorKind::NotFound.into()),
+        Err(error) if error.raw_os_error() == Some(ERROR_LOCK_VIOLATION.cast_signed()) => {}
+        Err(error) => return Err(error),
+    }
+    let mut text = String::new();
+    owner.read_to_string(&mut text)?;
+    let record: crate::crash::Record = text.parse()?;
     if record.token.is_none() || !record.is_live() {
         return Err(io::ErrorKind::NotFound.into());
     }
@@ -631,6 +642,34 @@ mod tests {
             client.read_exact(&mut bytes).unwrap();
             assert_eq!(bytes, text);
         }
+    }
+
+    #[test]
+    fn an_unlocked_record_never_discovers_a_retained_generation() {
+        let home = home("unlocked");
+        std::fs::create_dir_all(home.run_dir()).unwrap();
+        let listener = home.bind().unwrap();
+        std::fs::write(
+            home.daemon_pid_file(),
+            crate::crash::Record::current("test").to_string(),
+        )
+        .unwrap();
+        let owner = OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(home.daemon_pid_file())
+            .unwrap();
+        crate::fs::lock(&owner).unwrap();
+        let retained = home.endpoint().connect().unwrap();
+        drop(listener.accept().unwrap());
+        drop(owner);
+        assert_eq!(
+            home.endpoint().connect().unwrap_err().kind(),
+            io::ErrorKind::NotFound
+        );
+        drop(retained);
+        drop(listener);
+        std::fs::remove_dir_all(home.root()).unwrap();
     }
 
     #[test]
