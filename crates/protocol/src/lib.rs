@@ -1400,8 +1400,8 @@ pub enum Class {
     /// Never logged: live progress a later durable fact supersedes, which
     /// may be dropped for a client that is behind.
     Ephemeral,
-    /// About the connection rather than the session: always delivered, in
-    /// order.
+    /// About the connection rather than the session; ordered unless
+    /// [`Frame::replaceable`] permits replacement.
     Control,
 }
 
@@ -1431,6 +1431,14 @@ fn prefix(bytes: &mut [u8]) -> io::Result<()> {
     Ok(())
 }
 
+/// Connection snapshots whose newest value supersedes an unsent value.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Replaceable {
+    Sessions,
+    Status,
+    Settings,
+}
+
 /// A frame encoded once, length prefix included, for any number of peers:
 /// cloning it shares the bytes.
 #[derive(Clone, Debug)]
@@ -1439,6 +1447,7 @@ pub struct Frame {
     /// The entry's seq, for an entry.
     pub seq: Option<u64>,
     pub class: Class,
+    pub replaceable: Option<Replaceable>,
 }
 
 impl Frame {
@@ -1451,7 +1460,14 @@ impl Frame {
             },
             msg,
         )?;
-        Self::finish(bytes, None, msg.class())
+        let mut frame = Self::finish(bytes, None, msg.class())?;
+        frame.replaceable = match msg {
+            DaemonMsg::Sessions { .. } => Some(Replaceable::Sessions),
+            DaemonMsg::Status { .. } => Some(Replaceable::Status),
+            DaemonMsg::Settings { .. } => Some(Replaceable::Settings),
+            _ => None,
+        };
+        Ok(frame)
     }
 
     /// The frame of `DaemonMsg::Entry(entry.clone())`, without the clone:
@@ -1479,6 +1495,7 @@ impl Frame {
             bytes: Arc::from(bytes),
             seq,
             class,
+            replaceable: None,
         })
     }
 

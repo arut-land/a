@@ -302,6 +302,16 @@ impl Outbox {
         if q.closed || (self.following != 0 && self.following != q.follows) {
             return Err(Closed);
         }
+        if let Some(kind) = frame.replaceable {
+            q.frames.retain(|(_, queued)| {
+                if queued.replaceable == Some(kind) {
+                    q.bytes -= queued.as_bytes().len();
+                    false
+                } else {
+                    true
+                }
+            });
+        }
         let len = frame.as_bytes().len();
         if frame.class == Class::Ephemeral
             && (q.frames.len() >= BUDGET.requests - BUDGET.control_reserve
@@ -309,7 +319,17 @@ impl Outbox {
         {
             return Ok(());
         }
-        if !BUDGET.admits(q.bytes.saturating_add(len), q.frames.len(), true) {
+        let reserved = frame.replaceable.is_none() || {
+            let (bytes, requests) = q
+                .frames
+                .iter()
+                .filter(|(_, frame)| frame.class == Class::Ephemeral || frame.replaceable.is_some())
+                .fold((len, 0), |(bytes, requests), (_, frame)| {
+                    (bytes.saturating_add(frame.as_bytes().len()), requests + 1)
+                });
+            BUDGET.admits(bytes, requests, false)
+        };
+        if !reserved || !BUDGET.admits(q.bytes.saturating_add(len), q.frames.len(), true) {
             q.closed = true;
             q.follow = None;
             q.frames.clear();
@@ -535,6 +555,93 @@ mod tests {
             },
         ))
         .unwrap()
+    }
+
+    #[test]
+    fn replaceable_session_lists_preserve_control_capacity() {
+        let outbox = Outbox::new();
+        let mut summary = protocol::SessionSummary {
+            id: protocol::SessionId::new(),
+            workspace: ".".into(),
+            entries: 0,
+            clients: 1,
+            activity: protocol::Activity::Idle,
+            residency: protocol::Residency::Loaded,
+            read_only: None,
+        };
+        for entries in 0..BUDGET.requests as u64 {
+            summary.entries = entries;
+            outbox
+                .send(
+                    Frame::new(&DaemonMsg::Sessions {
+                        sessions: vec![summary.clone()],
+                    })
+                    .unwrap(),
+                )
+                .unwrap();
+        }
+        let latest = Frame::new(&DaemonMsg::Sessions {
+            sessions: Vec::new(),
+        })
+        .unwrap();
+        outbox.send(latest.clone()).unwrap();
+        let q = outbox.queue();
+        assert_eq!(q.frames.len(), 1);
+        assert_eq!(q.frames.back().unwrap().1.as_bytes(), latest.as_bytes());
+    }
+
+    #[test]
+    fn replaceable_status_and_settings_keep_the_latest_prefix_under_saturation() {
+        let outbox = Outbox::new();
+        let mut latest = Vec::new();
+        for prefix in 0..=BUDGET.requests as u64 {
+            latest = [
+                DaemonMsg::Status {
+                    pid: 1,
+                    build: String::new(),
+                    started: 0,
+                    clients: 1,
+                    known: u32::try_from(prefix).unwrap(),
+                },
+                DaemonMsg::Settings {
+                    settings: protocol::HomeSettings::default(),
+                    error: Some(prefix.to_string()),
+                },
+            ]
+            .iter()
+            .map(|msg| Frame::new(msg).unwrap())
+            .collect();
+            for frame in &latest {
+                outbox.send_after(prefix, frame.clone()).unwrap();
+            }
+        }
+        assert_eq!(outbox.queue().frames.len(), 2);
+        for _ in 2..BUDGET.requests - BUDGET.control_reserve {
+            outbox.send(delta()).unwrap();
+        }
+        for client_seq in 0..BUDGET.control_reserve as u64 {
+            outbox
+                .send(Frame::new(&DaemonMsg::Ack { client_seq }).unwrap())
+                .unwrap();
+        }
+        // Replacing at full capacity must preserve the newest ordering fence.
+        for frame in &latest {
+            outbox.send_after(999, frame.clone()).unwrap();
+        }
+        let q = outbox.queue();
+        assert!(!q.closed);
+        assert_eq!(q.frames.len(), BUDGET.requests);
+        assert_eq!(
+            q.bytes,
+            q.frames
+                .iter()
+                .map(|(_, frame)| frame.as_bytes().len())
+                .sum::<usize>()
+        );
+        for ((after, frame), expected) in q.frames.iter().rev().take(2).zip(latest.iter().rev()) {
+            assert_eq!(*after, 999);
+            assert_eq!(frame.as_bytes(), expected.as_bytes());
+        }
     }
 
     #[test]
