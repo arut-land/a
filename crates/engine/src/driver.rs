@@ -1942,34 +1942,7 @@ impl Actor {
                 unreachable!("appends commit in runs")
             }
             Effect::Reply { ticket, result } => self.reply(ticket, result),
-            Effect::Side { ticket, side } => {
-                if let Some(PendingSide {
-                    reply,
-                    messages,
-                    limited,
-                    cancel,
-                    origin,
-                    background,
-                }) = self.sides.remove(&ticket)
-                {
-                    let side = side.filter(|side| {
-                        self.phase == Phase::Serving
-                            && !cancel.is_set()
-                            && (origin.current(&self.live.session)
-                                || background && self.background_owner_succeeded(&origin))
-                            && self.core.ledger().call(*side).is_some()
-                    });
-                    reply.send(side.map_or(Opened::Closed, |id| {
-                        self.inflight.insert(id, InFlight::Side);
-                        Opened::Fresh(SideAdmitted {
-                            id,
-                            messages,
-                            limited,
-                            cancel,
-                        })
-                    }));
-                }
-            }
+            Effect::Side { ticket, side } => self.admit_side(ticket, side),
             Effect::Prepare {
                 call,
                 attempt,

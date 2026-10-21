@@ -56,6 +56,35 @@ impl Actor {
         succeeded
     }
 
+    pub(super) fn admit_side(&mut self, ticket: Ticket, side: Option<CallId>) {
+        if let Some(PendingSide {
+            reply,
+            messages,
+            limited,
+            cancel,
+            origin,
+            background,
+        }) = self.sides.remove(&ticket)
+        {
+            let side = side.filter(|side| {
+                self.phase == Phase::Serving
+                    && !cancel.is_set()
+                    && (origin.current(&self.live.session)
+                        || background && self.background_owner_succeeded(&origin))
+                    && self.core.ledger().call(*side).is_some()
+            });
+            reply.send(side.map_or(Opened::Closed, |id| {
+                self.inflight.insert(id, super::InFlight::Side);
+                Opened::Fresh(SideAdmitted {
+                    id,
+                    messages,
+                    limited,
+                    cancel,
+                })
+            }));
+        }
+    }
+
     pub(super) fn side_fact(
         &mut self,
         side: CallId,
