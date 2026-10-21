@@ -1645,8 +1645,27 @@ mod tests {
         assert!(msg(r#"{"seq":1}"#).is_err());
     }
 
-    /// What `kinds!` declares is all there is: every tag a union's encoder
-    /// writes is one its decoder reads, and back.
+    #[test]
+    fn every_declared_tag_fits_its_decoder() {
+        for tags in [
+            Body::TAGS,
+            WaitOn::TAGS,
+            Verdict::TAGS,
+            ClientMsg::TAGS,
+            DaemonMsg::TAGS,
+        ] {
+            assert!(decode::Tag::fits(tags));
+            for tag in tags {
+                let decoded: decode::Tag = serde_json::from_value(serde_json::json!(tag)).unwrap();
+                assert_eq!(decoded.as_str(), *tag);
+            }
+        }
+        assert!(!decode::Tag::fits(&[""]));
+        assert!(!decode::Tag::fits(&[
+            "a_tag_longer_than_the_decoder_capacity"
+        ]));
+    }
+
     #[test]
     fn every_kind_is_registered_by_construction() {
         for tag in Body::TAGS {
