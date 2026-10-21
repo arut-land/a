@@ -203,20 +203,21 @@ handle, budget, context and inheritance types. The engine owns identities,
 barriers, routing, storage, registry generations and cancellation. Extension
 crates choose modes and policy.
 
-| Mode | Source changes |
+| Mode | Composition or contract work |
 | --- | --- |
-| Fresh awaited task | `ext-subagent/src/lib.rs`: construct awaited fresh spawn |
-| Current-prefix task | Same tool composed with prefix context; transcript capture in `engine/src/transcript.rs` |
-| Detached task | New tool composition using detached spawn and returning a handle |
-| Parent sends while child works | Messaging tool over `Sessions` mailbox capability |
-| Child asks parent | Question tool and correlated reply fold in a new `ext-*` crate |
-| Sibling chat / named channels | Channel policy extension over durable inbox transport |
-| Different agent/model | Spawn constructor selects registered agent and model role |
-| Recursive same agent | Existing task registration inherited; depth budget descends |
-| Root-only extension | One associated const in that extension; registry filtering in `ext/src/host.rs` |
-| Resumable/forkable children | Common store/catalog paths in `engine/src/{store,catalog}.rs`; existing fork policy |
-| Side threads | `ext/src/service.rs`, `engine/src/driver/side.rs`, title extension; common conversation types |
-| Usage/cost views | New metrics fold over protocol call facts and ownership edges |
+| Fresh awaited task | Tool composition: awaited fresh spawn (`ext-subagent`) |
+| Current-prefix task | Tool composition: awaited spawn with prefix context |
+| Detached task | Tool composition: detached spawn returning a conversation handle |
+| Parent sends while child works | Tool composition: `Sessions::send` to a conversation id |
+| Child asks parent | Tool composition: question and correlated reply fold in an `ext-*` crate |
+| Sibling chat | Policy and tool composition over durable inboxes addressed by conversation id |
+| Named channels | Needs SDK contracts for channel identity, admission, membership and recipient snapshots; current destinations are conversation ids |
+| Different agent/model | Tool composition: select a registered agent and model role; runner selection currently supports agents only |
+| Recursive same agent | Tool composition: inherit task registration; depth budget descends |
+| Root-only extension | Rust declaration or Lua `a.inherit(false)` excludes the whole generation |
+| Resumable/forkable children | Common store/catalog paths and existing fork policy |
+| Model-only side threads | Needs SDK runner and lifecycle contracts; current side model calls do not implement conversations |
+| Usage/cost views | Future metrics fold over call facts and ownership edges |
 
 Implementation must prove replay identity, terminal-result uniqueness across
 cancel/reload, inbox order and consumption, inheritance exclusion, exact prefix
