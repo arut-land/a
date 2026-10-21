@@ -1,7 +1,7 @@
 use std::future::{Future, poll_fn};
 use std::panic::{AssertUnwindSafe, catch_unwind, resume_unwind};
 use std::pin::pin;
-use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, PoisonError};
 use std::task::{Poll, Waker};
 use std::time::{Duration, Instant};
@@ -740,6 +740,7 @@ struct Call {
     owner: Name,
     grants: Arc<[String]>,
     quota: Arc<Quota>,
+    permit: Arc<Permit>,
 }
 struct ActiveCall {
     calls: Arc<Mutex<std::collections::BTreeMap<u64, Call>>>,
@@ -834,7 +835,10 @@ impl Callbacks {
                         .ok_or_else(|| mlua::Error::runtime("call context expired"))?;
                     let input = encode(&value)?;
                     data.quota.take(input.raw().len())?;
-                    match cx.invoke(&name, &tool, &input).await.outcome {
+                    data.permit.release();
+                    let called = cx.invoke(&name, &tool, &input).await;
+                    data.permit.acquire().await?;
+                    match called.outcome {
                         Outcome::Done { output } => decode(&lua, &output),
                         Outcome::Failed { error } => Err(mlua::Error::runtime(error)),
                         Outcome::Interrupted { .. } => {
@@ -865,67 +869,44 @@ struct Admission {
 struct Permit {
     admission: Arc<Mutex<Admission>>,
     id: u64,
-    active: bool,
+    active: AtomicBool,
 }
 impl Drop for Permit {
     fn drop(&mut self) {
-        let mut admission = locked(&self.admission);
-        admission.waiters.remove(&self.id);
-        if self.active {
-            admission.active -= 1;
-        }
-        drop(admission);
-        self.wake();
+        self.release();
     }
 }
 impl Permit {
-    async fn acquire(
-        admission: Arc<Mutex<Admission>>,
-        id: u64,
-        cx: &Cx,
-        key: usize,
-    ) -> mlua::Result<Arc<Self>> {
-        let inherited = cx.invocation().local(key, || {
-            Arc::new(Mutex::new(std::sync::Weak::<Permit>::new()))
-        });
-        let mut permit = Permit {
-            admission,
-            id,
-            active: false,
-        };
-        let shared = poll_fn(|cx| {
-            if let Some(permit) = locked(&inherited).upgrade() {
-                return Poll::Ready(Ok(Some(permit)));
+    async fn acquire(&self) -> mlua::Result<()> {
+        poll_fn(|cx| {
+            let mut admission = locked(&self.admission);
+            if self.active.load(Ordering::Relaxed) {
+                return Poll::Ready(Ok(()));
             }
-            let mut admission = locked(&permit.admission);
             if admission.active < 16 {
-                admission.waiters.remove(&id);
+                admission.waiters.remove(&self.id);
                 admission.active += 1;
-                permit.active = true;
-                Poll::Ready(Ok(None))
-            } else if admission.waiters.len() >= 64 && !admission.waiters.contains_key(&id) {
+                self.active.store(true, Ordering::Relaxed);
+                Poll::Ready(Ok(()))
+            } else if admission.waiters.len() >= 64 && !admission.waiters.contains_key(&self.id) {
                 Poll::Ready(Err(mlua::Error::runtime("lua execution admission full")))
             } else {
-                admission.waiters.insert(id, cx.waker().clone());
+                admission.waiters.insert(self.id, cx.waker().clone());
                 Poll::Pending
             }
         })
-        .await?;
-        let candidate = Arc::new(permit);
-        let admitted = shared.unwrap_or_else(|| {
-            let mut inherited = locked(&inherited);
-            inherited.upgrade().unwrap_or_else(|| {
-                *inherited = Arc::downgrade(&candidate);
-                Arc::clone(&candidate)
-            })
-        });
-        drop(candidate);
-        admitted.wake();
-        Ok(admitted)
+        .await
     }
 
-    fn wake(&self) {
-        let waiters: Vec<_> = locked(&self.admission).waiters.values().cloned().collect();
+    fn release(&self) {
+        let mut admission = locked(&self.admission);
+        admission.waiters.remove(&self.id);
+        if !self.active.swap(false, Ordering::Relaxed) {
+            return;
+        }
+        admission.active -= 1;
+        let waiters: Vec<_> = admission.waiters.values().cloned().collect();
+        drop(admission);
         for waker in waiters {
             waker.wake();
         }
@@ -948,13 +929,12 @@ struct LuaTool {
 impl LuaTool {
     async fn execute(&self, input: &Json, cx: &Cx) -> mlua::Result<Json> {
         let id = self.callbacks.next.fetch_add(1, Ordering::Relaxed);
-        let _permit = Permit::acquire(
-            Arc::clone(&self.callbacks.admission),
+        let permit = Arc::new(Permit {
+            admission: Arc::clone(&self.callbacks.admission),
             id,
-            cx,
-            self.lua.globals().to_pointer() as usize,
-        )
-        .await?;
+            active: AtomicBool::new(false),
+        });
+        permit.acquire().await?;
         let context = self.lua.create_table()?;
         context.set("session", cx.session.to_string())?;
         let call = Arc::new(cx.clone());
@@ -985,6 +965,7 @@ impl LuaTool {
                 owner: Arc::clone(&self.owner),
                 grants: Arc::clone(&self.grants),
                 quota: Arc::clone(&quota),
+                permit: Arc::clone(&permit),
             },
         );
         context.set("update", self.callbacks.update.bind(id)?)?;
@@ -1182,40 +1163,53 @@ mod tests {
             "lua-admission",
             Registry::default().with(&Service(false)).unwrap(),
         );
-        let contexts: Vec<_> = (0..82).map(|_| rig.cx()).collect();
+        let cx = rig.cx();
         let input = Json::default();
+        let admission = &module.tools[0].callbacks.admission;
+        let mut held: Vec<_> = (0..16)
+            .map(|id| {
+                Arc::new(Permit {
+                    admission: Arc::clone(admission),
+                    id,
+                    active: AtomicBool::new(false),
+                })
+            })
+            .collect();
+        for permit in &held {
+            rt::block_on(permit.acquire()).unwrap();
+        }
+        module.tools[0].callbacks.next.store(16, Ordering::Relaxed);
         let mut context = std::task::Context::from_waker(Waker::noop());
-        let mut calls: Vec<_> = contexts[..80]
-            .iter()
-            .map(|cx| Box::pin(module.tools[0].execute(&input, cx)))
+        let mut calls: Vec<_> = (0..64)
+            .map(|_| Box::pin(module.tools[0].execute(&input, &cx)))
             .collect();
         for call in &mut calls {
             assert!(call.as_mut().poll(&mut context).is_pending());
         }
-        let admission = &module.tools[0].callbacks.admission;
         assert_eq!(locked(admission).active, 16);
         assert_eq!(locked(admission).waiters.len(), 64);
         assert!(
-            rt::block_on(module.tools[0].execute(&input, &contexts[80]))
+            rt::block_on(module.tools[0].execute(&input, &cx))
                 .unwrap_err()
                 .to_string()
                 .contains("admission full")
         );
         calls.pop();
         assert_eq!(locked(admission).waiters.len(), 63);
-        let mut replacement = Box::pin(module.tools[0].execute(&input, &contexts[81]));
+        let mut replacement = Box::pin(module.tools[0].execute(&input, &cx));
         assert!(replacement.as_mut().poll(&mut context).is_pending());
-        drop(calls.remove(0));
+        drop(held.pop());
         assert!(replacement.as_mut().poll(&mut context).is_pending());
-        assert_eq!(locked(admission).active, 16);
+        assert_eq!(locked(admission).active, 15);
         drop(replacement);
         drop(calls);
+        drop(held);
         assert_eq!(locked(admission).active, 0);
         assert!(locked(admission).waiters.is_empty());
         assert!(locked(&module.tools[0].callbacks.calls).is_empty());
-        let mut fresh = Box::pin(module.tools[0].execute(&input, &contexts[0]));
+        let mut fresh = Box::pin(module.tools[0].execute(&input, &cx));
         assert!(fresh.as_mut().poll(&mut context).is_pending());
-        assert_eq!(locked(admission).active, 1);
+        assert_eq!(locked(admission).active, 0);
         drop(fresh);
         assert_eq!(locked(admission).active, 0);
     }
@@ -1223,7 +1217,7 @@ mod tests {
     #[test]
     fn admitted_owners_leave_capacity_for_their_delegated_calls() {
         #[derive(Clone)]
-        struct Release(Arc<std::sync::atomic::AtomicBool>);
+        struct Release(Arc<AtomicBool>);
         impl Tool for Release {
             type In = ext::Args;
             type Out = bool;

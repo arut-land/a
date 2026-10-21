@@ -139,6 +139,7 @@ impl Actor {
                         .invocations
                         .result(call, self.journal.durable_seq)
                     {
+                        self.replies.contexts.remove(&call);
                         reply.send(result.clone());
                     } else {
                         self.replies.invoked.entry(call).or_default().push(reply);
