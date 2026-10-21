@@ -3,7 +3,7 @@
 The logging API must reject arbitrary text at compile time, keep bounded
 memory and disk, and never wait for disk on a session commit. `ext-logging`
 uses the existing `json`, `rt`, `sys`, `protocol` and serde dependencies;
-it adds no third-party production dependency.
+it adds no new third-party package to the production graph.
 
 We compared `log` 0.4.34 and `tracing` 0.1.44 with `tracing-subscriber`
 0.3.23 (`fmt,json,registry`, defaults off). The standalone probe builds with
@@ -66,3 +66,9 @@ multi-waiter `rt::Notify` is retained for flush waiters only. A deterministic
 test parks the consumer inside waker replacement and requires the complete
 producer admission to finish before releasing it. Final binary size below
 includes this direct dependency and all review fixes.
+
+Crash reports reuse serde and serde_json already in the binary, moving the
+validated numeric build identity into `sys::crash` so the daemon log and
+panic hook share its privacy boundary. Numeric unwind frames replace std's
+debug symbolizer and raw panic formatting; report storage is at most
+20 × 16 KiB, with a fixed 128-frame capture buffer.

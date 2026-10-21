@@ -36,8 +36,16 @@ traces belong elsewhere. The optional `engine/events` stream remains a
 foreground debugging aid on stderr, not a second persistent transcript.
 Detached stderr goes to the null device so arbitrary library diagnostics
 cannot bypass the typed API. A manually launched daemon can still show
-console errors. Existing crash reports under `crash/` remain separate and
-may include panic text; this change does not claim to redact those reports.
+console errors. Crash reports under `crash/` use a separate closed JSON shape: validated
+numeric build identity, pid and time, `panic` or `unclean_exit`, numeric
+callsite fingerprint/line/column, and at most 128 numeric image fingerprints
+and frame offsets. No panic payload, thread name, symbol, image name or source
+path crosses that boundary, including debug builds and reaper reports. The
+panic hook replaces the default formatter. Unix captures numeric frames;
+other platforms currently leave the frame array empty. Fingerprints use the
+same FNV identity scheme as workspace correlation; the build's debug info
+can resolve frame offsets offline. Each report is capped at 16 KiB and the
+newest 20 reports are retained (at most 320 KiB).
 
 Startup facts can enter the bounded queue before configuration is loaded.
 The daemon installs one writer only after acquiring its home lock. A

@@ -33,30 +33,7 @@ pub trait Loggable: sealed::Sealed + Into<Fact> {}
 impl sealed::Sealed for Fact {}
 impl Loggable for Fact {}
 
-/// A staged build's numeric identity, never caller-supplied text.
-#[derive(Clone, Copy, Debug, Serialize)]
-pub struct Build {
-    version: Option<[u32; 3]>,
-    fingerprint: Option<u64>,
-}
-impl Build {
-    pub fn of(id: &str) -> Self {
-        let (version, hash) = id.split_once('+').unwrap_or((id, ""));
-        let version = version
-            .split('.')
-            .map(str::parse)
-            .collect::<Result<Vec<u32>, _>>()
-            .ok()
-            .and_then(|v| v.try_into().ok());
-        let fingerprint = (hash.len() == 16)
-            .then(|| u64::from_str_radix(hash, 16).ok())
-            .flatten();
-        Self {
-            version,
-            fingerprint,
-        }
-    }
-}
+pub use sys::crash::Build;
 
 #[derive(Clone, Copy, Debug, Serialize)]
 #[serde(rename_all = "snake_case")]

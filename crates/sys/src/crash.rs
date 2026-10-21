@@ -18,6 +18,35 @@ use std::str::FromStr;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use crate::Home;
+use serde::{Serialize, Serializer};
+
+/// A staged build's numeric identity, never caller-supplied text.
+#[derive(Clone, Copy, Debug, Serialize)]
+pub struct Build {
+    version: Option<[u32; 3]>,
+    fingerprint: Option<u64>,
+}
+impl Build {
+    pub fn of(id: &str) -> Self {
+        let (version, hash) = id.split_once('+').unwrap_or((id, ""));
+        let mut parts = version.split('.');
+        let version = (|| {
+            let value = [
+                parts.next()?.parse().ok()?,
+                parts.next()?.parse().ok()?,
+                parts.next()?.parse().ok()?,
+            ];
+            parts.next().is_none().then_some(value)
+        })();
+        let fingerprint = (hash.len() == 16)
+            .then(|| u64::from_str_radix(hash, 16).ok())
+            .flatten();
+        Self {
+            version,
+            fingerprint,
+        }
+    }
+}
 
 /// Crash reports kept, newest first.
 const KEEP: usize = 20;
@@ -224,17 +253,15 @@ pub fn reap(home: &Home, pid_file: &mut File) -> io::Result<Option<Record>> {
     if !explained {
         write_report(
             &dir,
-            dead.pid,
-            &format!(
-                "a {} daemon (pid {}) stopped without shutting down\n\
-                 It was killed, or crashed in a way no panic hook sees: a signal, an \
-                 abort, running out of memory. Its log may say more.\n\
-                 started: {}\nnoticed: {}\n",
-                dead.build,
-                dead.pid,
-                dead.started,
-                now()
-            ),
+            &Report {
+                pid: dead.pid,
+                started: Some(dead.started),
+                unix_ms: millis(),
+                build: Build::of(&dead.build),
+                kind: Kind::UncleanExit,
+                callsite: None,
+                frames: Frames::default(),
+            },
         )?;
     }
     let lived = Duration::from_secs(now().saturating_sub(dead.started));
@@ -242,58 +269,94 @@ pub fn reap(home: &Home, pid_file: &mut File) -> io::Result<Option<Record>> {
     Ok(Some(dead))
 }
 
-/// Writes a report on every panic to `dir`, then runs the hook that was
-/// there (which prints to stderr, the daemon's log). A panic a thread
-/// recovers from is reported too: it is a bug either way.
+/// Installs the daemon's content-free panic hook. The default hook formats
+/// arbitrary payloads and paths, so it must not run after this one.
 pub fn install(dir: PathBuf, build: String) {
-    let previous = panic::take_hook();
+    let build = Build::of(&build);
     panic::set_hook(Box::new(move |info| {
-        let _ = write_report(&dir, std::process::id(), &describe(info, &build));
-        previous(info);
+        let _ = write_report(&dir, &describe(info, build));
     }));
 }
 
-fn describe(info: &PanicHookInfo<'_>, build: &str) -> String {
-    let thread = std::thread::current();
-    let message = info
-        .payload()
-        .downcast_ref::<&str>()
-        .copied()
-        .or_else(|| info.payload().downcast_ref::<String>().map(String::as_str))
-        .unwrap_or("(not a string)");
-    let at = info
-        .location()
-        .map_or_else(String::new, ToString::to_string);
-    format!(
-        "a {build} daemon (pid {}) panicked\nthread: {}\nat: {at}\nmessage: {message}\ntime: {}\n\n{}\n",
-        std::process::id(),
-        thread.name().unwrap_or("unnamed"),
-        now(),
-        stack()
-    )
+/// Even an adversarial panic cannot enlarge a report or add text fields.
+pub const MAX_REPORT: usize = 16 << 10;
+const DEEP: usize = 128;
+
+#[derive(Serialize)]
+#[serde(rename_all = "snake_case")]
+enum Kind {
+    Panic,
+    UncleanExit,
 }
 
-/// This thread's stack. A build with a symbolizing std names its frames.
-#[cfg(any(debug_assertions, not(unix)))]
-fn stack() -> String {
-    std::backtrace::Backtrace::force_capture().to_string()
+#[derive(Serialize)]
+struct Callsite {
+    file: u64,
+    line: u32,
+    column: u32,
 }
 
-/// This thread's stack, a frame a line as the image holding its return
-/// address and the offset into it, which the build's debug info names
-/// offline (`atos -o a.dSYM/... -l 0x100000000 <0x100000000 + offset>`,
-/// `addr2line -e a <offset>`). A release std carries no symbolizer, and
-/// std's [`Backtrace`](std::backtrace::Backtrace) would link its demangler
-/// for names it never resolves, and print addresses the image's load slide
-/// leaves meaningless.
-#[cfg(all(unix, not(debug_assertions)))]
-fn stack() -> String {
+#[derive(Clone, Copy, Default, Serialize)]
+struct Frame {
+    image: u64,
+    offset: u64,
+}
+
+struct Frames {
+    frames: [Frame; DEEP],
+    len: usize,
+}
+impl Default for Frames {
+    fn default() -> Self {
+        Self {
+            frames: [Frame::default(); DEEP],
+            len: 0,
+        }
+    }
+}
+impl Serialize for Frames {
+    fn serialize<S: Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        serializer.collect_seq(self.frames[..self.len].iter())
+    }
+}
+
+#[derive(Serialize)]
+struct Report {
+    pid: u32,
+    started: Option<u64>,
+    unix_ms: u128,
+    build: Build,
+    kind: Kind,
+    callsite: Option<Callsite>,
+    frames: Frames,
+}
+
+fn describe(info: &PanicHookInfo<'_>, build: Build) -> Report {
+    Report {
+        pid: std::process::id(),
+        started: None,
+        unix_ms: millis(),
+        build,
+        kind: Kind::Panic,
+        callsite: info.location().map(|at| Callsite {
+            file: crate::fnv1a(at.file().as_bytes()),
+            line: at.line(),
+            column: at.column(),
+        }),
+        frames: stack(),
+    }
+}
+
+#[cfg(not(unix))]
+fn stack() -> Frames {
+    Frames::default()
+}
+
+// No symbolization: only numeric image fingerprints and offsets cross the
+// report boundary, even in debug builds. Build debug info resolves them offline.
+#[cfg(unix)]
+fn stack() -> Frames {
     use std::ffi::{CStr, c_int, c_void};
-    use std::fmt::Write as _;
-
-    /// Frames past it are left out: a crash report is read, not replayed.
-    const DEEP: usize = 128;
-
     unsafe extern "C" {
         fn _Unwind_Backtrace(
             frame: extern "C" fn(*mut c_void, *mut c_void) -> c_int,
@@ -301,48 +364,51 @@ fn stack() -> String {
         ) -> c_int;
         fn _Unwind_GetIP(cx: *mut c_void) -> usize;
     }
-
-    extern "C" fn frame(cx: *mut c_void, ips: *mut c_void) -> c_int {
-        // SAFETY: `ips` is the vector `stack` hands the unwinder, which
-        // calls this on the same thread while `stack` waits.
-        let ips = unsafe { &mut *ips.cast::<Vec<usize>>() };
-        // SAFETY: `cx` is the unwinder's context for the frame it is at.
-        ips.push(unsafe { _Unwind_GetIP(cx) });
-        // _URC_NO_REASON goes on; _URC_END_OF_STACK (5) stops.
-        if ips.len() < DEEP { 0 } else { 5 }
-    }
-
-    let mut ips: Vec<usize> = Vec::with_capacity(DEEP);
-    // SAFETY: `frame` only pushes to `ips`, which outlives the call.
-    unsafe { _Unwind_Backtrace(frame, (&raw mut ips).cast()) };
-    let mut out = String::new();
-    for (n, ip) in ips.into_iter().enumerate() {
+    extern "C" fn frame(cx: *mut c_void, frames: *mut c_void) -> c_int {
+        // SAFETY: the same-thread unwinder borrows this fixed buffer until return.
+        let frames = unsafe { &mut *frames.cast::<Frames>() };
+        // SAFETY: cx is the unwinder's current frame context.
+        let ip = unsafe { _Unwind_GetIP(cx) };
         let mut info = std::mem::MaybeUninit::<libc::Dl_info>::zeroed();
-        // SAFETY: dladdr only reads the address and fills `info`.
+        // SAFETY: dladdr reads the address and fills the output buffer.
         let found = unsafe { libc::dladdr(ip as *const c_void, info.as_mut_ptr()) } != 0;
-        // SAFETY: zeroed, then filled by dladdr; a null name is checked.
+        // SAFETY: zeroed first, then filled by dladdr.
         let info = unsafe { info.assume_init() };
-        let image = (found && !info.dli_fname.is_null())
-            // SAFETY: dladdr's file name is a C string the loader owns.
-            .then(|| unsafe { CStr::from_ptr(info.dli_fname) }.to_string_lossy())
-            .map(|path| path.rsplit('/').next().unwrap_or_default().to_owned());
-        let _ = match image {
-            Some(image) => writeln!(out, "{n:4}: {image} +{:#x}", ip - info.dli_fbase as usize),
-            None => writeln!(out, "{n:4}: {ip:#x}"),
+        let image = if found && !info.dli_fname.is_null() {
+            // SAFETY: the loader owns this NUL-terminated name for this call.
+            crate::fnv1a(unsafe { CStr::from_ptr(info.dli_fname) }.to_bytes())
+        } else {
+            0
         };
+        frames.frames[frames.len] = Frame {
+            image,
+            offset: ip.saturating_sub(info.dli_fbase as usize) as u64,
+        };
+        frames.len += 1;
+        if frames.len < DEEP { 0 } else { 5 }
     }
-    out
+    let mut frames = Frames::default();
+    // SAFETY: the buffer outlives this synchronous call; callback bounds its writes.
+    unsafe { _Unwind_Backtrace(frame, (&raw mut frames).cast()) };
+    frames
 }
 
-/// Writes `text` as a new report named `<unix ms>-<pid>.txt`, keeping the
-/// newest [`KEEP`].
-fn write_report(dir: &Path, pid: u32, text: &str) -> io::Result<PathBuf> {
-    fs::create_dir_all(dir)?;
-    let ms = SystemTime::now()
+fn millis() -> u128 {
+    SystemTime::now()
         .duration_since(UNIX_EPOCH)
-        .map_or(0, |d| d.as_millis());
-    let path = dir.join(format!("{ms}-{pid}.txt"));
-    File::create(&path)?.write_all(text.as_bytes())?;
+        .map_or(0, |d| d.as_millis())
+}
+
+/// The only writer accepts a closed report, never a string or panic payload.
+fn write_report(dir: &Path, report: &Report) -> io::Result<PathBuf> {
+    let mut bytes = serde_json::to_vec(report).map_err(io::Error::other)?;
+    bytes.push(b'\n');
+    if bytes.len() > MAX_REPORT {
+        return Err(io::ErrorKind::InvalidData.into());
+    }
+    fs::create_dir_all(dir)?;
+    let path = dir.join(format!("{}-{}.json", report.unix_ms, report.pid));
+    File::create(&path)?.write_all(&bytes)?;
     let reports = reports(dir);
     for old in &reports[..reports.len().saturating_sub(KEEP)] {
         let _ = fs::remove_file(old);
@@ -366,7 +432,7 @@ pub fn reports(dir: &Path) -> Vec<PathBuf> {
 /// A report's time in Unix milliseconds and the pid it is about, as
 /// `ms << 32 | pid`: ordered as the pair is.
 fn report_key(path: &Path) -> Option<u128> {
-    let stem = path.file_name()?.to_str()?.strip_suffix(".txt")?;
+    let stem = path.file_name()?.to_str()?.strip_suffix(".json")?;
     let (ms, pid) = stem.split_once('-')?;
     let (ms, pid): (u128, u32) = (ms.parse().ok()?, pid.parse().ok()?);
     Some(ms << 32 | u128::from(pid))
@@ -440,7 +506,10 @@ mod tests {
         let crashes = Crashes::of(&home);
         assert!(crashes.breaker.tripped(LIMIT) && !crashes.breaker.tripped(0));
         let report = fs::read_to_string(crashes.last.unwrap()).unwrap();
-        assert!(report.contains("pid 999999") && report.contains("without shutting down"));
+        let report: serde_json::Value = serde_json::from_str(&report).unwrap();
+        assert_eq!(report["pid"], 999999);
+        assert_eq!(report["kind"], "unclean_exit");
+        assert!(!report.to_string().contains("b1"));
         assert_eq!(fs::read_to_string(home.daemon_pid_file()).unwrap(), "");
 
         // One that ran a while is not a loop.
@@ -582,7 +651,16 @@ mod tests {
         let home = home("panic");
         let pid = 999_998;
         let started = now();
-        write_report(&home.crash_dir(), pid, "panicked\n").unwrap();
+        let mut report = Report {
+            pid,
+            started: None,
+            unix_ms: millis(),
+            build: Build::of("1.2.3+0123456789abcdef"),
+            kind: Kind::Panic,
+            callsite: None,
+            frames: Frames::default(),
+        };
+        write_report(&home.crash_dir(), &report).unwrap();
         died(
             &home,
             &Record {
@@ -594,11 +672,45 @@ mod tests {
         );
         let reports = reports(&home.crash_dir());
         assert_eq!(reports.len(), 1);
-        assert_eq!(fs::read_to_string(&reports[0]).unwrap(), "panicked\n");
+        let text = fs::read_to_string(&reports[0]).unwrap();
+        assert_eq!(
+            serde_json::from_str::<serde_json::Value>(&text).unwrap()["kind"],
+            "panic"
+        );
         for n in 0..KEEP + 3 {
-            write_report(&home.crash_dir(), u32::try_from(n).unwrap(), "x").unwrap();
+            report.pid = u32::try_from(n).unwrap();
+            write_report(&home.crash_dir(), &report).unwrap();
         }
         assert_eq!(super::reports(&home.crash_dir()).len(), KEEP);
+        fs::remove_dir_all(home.crash_dir().parent().unwrap()).unwrap();
+    }
+
+    #[test]
+    fn every_report_shape_fits_the_file_cap() {
+        let home = home("cap");
+        let report = Report {
+            pid: u32::MAX,
+            started: Some(u64::MAX),
+            unix_ms: u128::MAX >> 32,
+            build: Build::of("4294967295.4294967295.4294967295+ffffffffffffffff"),
+            kind: Kind::Panic,
+            callsite: Some(Callsite {
+                file: u64::MAX,
+                line: u32::MAX,
+                column: u32::MAX,
+            }),
+            frames: Frames {
+                frames: [Frame {
+                    image: u64::MAX,
+                    offset: u64::MAX,
+                }; DEEP],
+                len: DEEP,
+            },
+        };
+        let path = write_report(&home.crash_dir(), &report).unwrap();
+        let bytes = fs::read(path).unwrap();
+        assert!(bytes.len() <= MAX_REPORT);
+        assert!(serde_json::from_slice::<serde_json::Value>(&bytes).is_ok());
         fs::remove_dir_all(home.crash_dir().parent().unwrap()).unwrap();
     }
 
@@ -608,17 +720,17 @@ mod tests {
     #[test]
     fn panicking_child() {
         if let Some(dir) = std::env::var_os("A_CRASH_TEST_DIR") {
-            install(dir.into(), "b1".into());
+            install(dir.into(), "secret-build-text".into());
             let _ = std::thread::Builder::new()
-                .name("doomed".into())
-                .spawn(|| panic!("boom"))
+                .name("secret-thread-text".into())
+                .spawn(|| panic::panic_any("secret-payload-text".repeat(100_000)))
                 .unwrap()
                 .join();
         }
     }
 
     #[test]
-    fn a_panic_leaves_a_report() {
+    fn panic_content_cannot_enter_a_bounded_report() {
         let home = home("hook");
         let child = std::process::Command::new(std::env::current_exe().unwrap())
             .args(["--exact", "crash::tests::panicking_child", "--nocapture"])
@@ -632,14 +744,18 @@ mod tests {
         );
         fs::remove_dir_all(home.crash_dir().parent().unwrap()).unwrap();
         assert_eq!(reports.len(), 1);
-        for want in [
-            "a b1 daemon",
-            "panicked",
-            "thread: doomed",
-            "message: boom",
-            "crash.rs",
-        ] {
-            assert!(report.contains(want), "{want} in {report}");
+        assert!(report.len() <= MAX_REPORT);
+        for forbidden in ["secret", "crash.rs", "thread", "payload", "/Users/", "\\"] {
+            assert!(!report.contains(forbidden), "{forbidden} in {report}");
+        }
+        let value: serde_json::Value = serde_json::from_str(&report).unwrap();
+        assert_eq!(value["kind"], "panic");
+        assert!(value["build"]["version"].is_null());
+        assert!(value["build"]["fingerprint"].is_null());
+        assert!(value["callsite"]["file"].is_u64());
+        assert!(value["callsite"]["line"].is_u64());
+        for frame in value["frames"].as_array().unwrap() {
+            assert!(frame["image"].is_u64() && frame["offset"].is_u64());
         }
     }
 }
