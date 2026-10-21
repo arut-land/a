@@ -87,7 +87,10 @@ wall-clock timeout covering provider execution, retries, and backoffs.
 The token cap applies per attempt; retries can spend more than one cap.
 This is not a currency or aggregate-token quota.
 
-A side call has its own cancellation registration before execution starts.
+A side call has its own cancellation token registered when its intent is
+created, before that intent waits for durability. Admission consumes that
+same token; draining, cancellation, or a settled side call refuses admission
+without creating a replacement cancellation scope.
 Its owning call's cancellation stops awaited and background work; an
 explicit interrupt also cancels open side calls. A successful owner may
 finish before background work is admitted. Admission still checks its

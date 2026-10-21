@@ -265,6 +265,14 @@ impl Tool for Probe {
     const CONCURRENCY: ext::Concurrency = ext::Concurrency::Shared;
 
     async fn call(&self, args: &ext::Args, cx: &Cx) -> Result<String, String> {
+        if args.args == "edit" {
+            cx.edit(
+                Seq::new(1).unwrap(),
+                Seq::new(cx.call.get() - 1),
+                Some("summary"),
+            );
+            return Ok("edited".into());
+        }
         let side = ext::Side::new::<Probes>(
             "probe",
             ext::ModelRole::Session,
@@ -273,7 +281,15 @@ impl Tool for Probe {
         );
         if args.args == "background" {
             let work = side.background().start(cx.clone()).work.unwrap();
-            cx.service::<dyn rt::Runtime>().unwrap().spawn(work.0);
+            let completed = cx.service::<BackgroundCompletion>().map(|s| s.0.clone());
+            cx.service::<dyn rt::Runtime>()
+                .unwrap()
+                .spawn(Box::pin(async move {
+                    work.0.await;
+                    if let Some(completed) = completed {
+                        completed.set();
+                    }
+                }));
             return Ok("started".into());
         }
         if args.args == "duplicate" {
@@ -652,4 +668,63 @@ fn a_failed_result_commit_cannot_release_a_successful_side_reply() {
             ..
         }
     )));
+}
+
+struct BackgroundCompletion(Flag);
+
+impl Extension for BackgroundCompletion {
+    const NAME: &'static str = "background-completion";
+    const VERSION: u32 = 1;
+    fn contribute(&self, r: &mut Registrar) {
+        r.provide(Arc::new(Self(self.0.clone())));
+    }
+}
+
+#[test]
+fn shutdown_never_admits_a_background_side_call_waiting_for_its_flush() {
+    let faulty = Arc::new(crate::store::Faulty::new(Arc::new(Memory::default())));
+    let http = Flaky::new([Reply::Events(text_reply())]);
+    let completed = Flag::default();
+    let harness = Fixture::on(
+        Arc::clone(&faulty) as _,
+        "probes",
+        Registry::default()
+            .with(&Probes)
+            .unwrap()
+            .with(&BackgroundCompletion(completed.clone()))
+            .unwrap(),
+        Models {
+            http: Arc::clone(&http) as Arc<dyn Http>,
+            ..openai(&Script::new(&[]))
+        },
+    );
+    let session = harness.create();
+    settle(&session);
+    let flush = faulty.hold_next_flush();
+    let (reply, ack) = oneshot::channel();
+    session.send(Msg::Request {
+        request: Request::Input {
+            text: "background".into(),
+            mode: Mode::Queue,
+        },
+        origin: None,
+        reply,
+    });
+    flush.started();
+    session.wait(
+        "background intent ordered after owner finished",
+        PATIENCE,
+        || !session.has_work() && !sides(&faulty.pending(session.id)).is_empty(),
+    );
+    assert_eq!(http.sent(), 0);
+    session.stop();
+    flush.release();
+    rt::block_on(session.ended.wait());
+    let _ = rt::block_on(ack);
+    assert!(rt::block_on(first(completed.wait(), harness.0.rt.sleep(PATIENCE))).is_some());
+    assert_eq!(
+        http.sent(),
+        0,
+        "shutdown must not spend on an unadmitted side call"
+    );
 }

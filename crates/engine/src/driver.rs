@@ -239,6 +239,7 @@ impl ContextOrigin {
 }
 
 struct PendingSide {
+    cancel: Cancel,
     origin: ContextOrigin,
     reply: oneshot::Sender<Opened>,
     messages: llm::Messages,
@@ -1225,6 +1226,18 @@ impl Actor {
         for effect in fx {
             match effect {
                 Effect::Append(entry) => batch.push(entry),
+                Effect::Side { ticket, side } => {
+                    if let Some(id) = side
+                        && let Some(pending) = self.sides.get_mut(&ticket)
+                    {
+                        lock(&self.live.session.cancels).insert(id, pending.cancel.clone());
+                    }
+                    after.push((admission, Effect::Side { ticket, side }));
+                    admission = Admission {
+                        through: 0,
+                        requirement: Requirement::Ordered,
+                    };
+                }
                 Effect::Commit {
                     through: seq,
                     durability: how,
@@ -1932,12 +1945,16 @@ impl Actor {
                     reply,
                     messages,
                     limited,
+                    cancel,
                     ..
                 }) = self.sides.remove(&ticket)
                 {
-                    let side = side.filter(|side| self.core.ledger().call(*side).is_some());
+                    let side = side.filter(|side| {
+                        self.phase == Phase::Serving
+                            && !cancel.is_set()
+                            && self.core.ledger().call(*side).is_some()
+                    });
                     reply.send(side.map_or(Opened::Closed, |id| {
-                        let cancel = self.live.session.cancel(id);
                         self.inflight.insert(id, InFlight::Side);
                         Opened::Fresh(SideAdmitted {
                             id,

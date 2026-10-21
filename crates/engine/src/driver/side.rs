@@ -166,6 +166,7 @@ impl Actor {
         self.sides.insert(
             ticket,
             PendingSide {
+                cancel: Cancel::default(),
                 origin,
                 reply,
                 messages,
