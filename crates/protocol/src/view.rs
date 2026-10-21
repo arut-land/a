@@ -127,6 +127,8 @@ pub enum Item {
     /// A call of a tool, by the model or (`by` the user) a slash command,
     /// whose arguments are its input's `args` ([`Item::args`]).
     Tool {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        invoke: Option<crate::Invocation>,
         call: CallId,
         tool: String,
         input: Json,
@@ -581,6 +583,7 @@ impl SessionView {
                 tool,
                 input,
                 by: Audience::User,
+                invoke: None,
                 ..
             } => return Some(self.command(seq, tool, input)),
             Body::Decision {
@@ -601,8 +604,10 @@ impl SessionView {
                 input,
                 card,
                 by,
+                invoke,
                 ..
             } => Item::Tool {
+                invoke: invoke.clone(),
                 call: CallId(seq),
                 tool: tool.clone(),
                 input: input.clone(),
@@ -806,6 +811,7 @@ impl SessionView {
     /// shown as the command it is.
     fn command(&mut self, seq: Seq, tool: &str, input: &Json) -> Change {
         let item = Item::Tool {
+            invoke: None,
             call: CallId(seq),
             tool: tool.to_owned(),
             input: input.clone(),

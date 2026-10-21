@@ -23,6 +23,7 @@ mod admission;
 mod bench;
 mod durable;
 mod interrupt;
+mod invocation;
 mod later;
 mod log;
 mod parsed;
@@ -863,6 +864,7 @@ fn hook_decisions_are_logged_after_their_call_and_replay_to_the_same_state() {
         [
             &user("$ echo hi"),
             &Body::ToolCall {
+                invoke: None,
                 tool: "bash".into(),
                 input: Json::encode(&json!({ "command": "echo hi" })).unwrap(),
                 id: None,
@@ -911,6 +913,7 @@ fn hook_decisions_are_logged_after_their_call_and_replay_to_the_same_state() {
 #[test]
 fn results_are_logged_in_call_order() {
     let call = |id: &str| Body::ToolCall {
+        invoke: None,
         tool: "sleep".into(),
         input: Json::encode(&json!({ "seconds": 1 })).unwrap(),
         id: Some(id.into()),
@@ -959,6 +962,7 @@ fn a_gate_cut_off_by_a_crash_logs_its_decisions_once() {
         },
     );
     let call = Body::ToolCall {
+        invoke: None,
         tool: "bash".into(),
         input: Json::encode(&json!({ "command": "echo hi" })).unwrap(),
         id: None,
@@ -1205,6 +1209,7 @@ fn slash_commands_are_callables_and_input_hooks_rewrite_or_refuse() {
     session.halt();
 
     let jobs = Body::ToolCall {
+        invoke: None,
         tool: "jobs".into(),
         input: Json::encode(&json!({ "args": "all of them" })).unwrap(),
         id: None,
@@ -1550,6 +1555,7 @@ fn an_unsafe_call_cut_off_reports_the_output_it_committed() {
         openai(&Script::new(&[])),
     );
     let bash = Body::ToolCall {
+        invoke: None,
         tool: "bash".into(),
         input: Json::encode(&json!({ "command": "make" })).unwrap(),
         id: None,
@@ -2066,6 +2072,7 @@ fn one_fsync_per_step() {
         }],
     };
     let bash = Body::ToolCall {
+        invoke: None,
         tool: "bash".into(),
         input: Json::encode(&json!({ "command": "make" })).unwrap(),
         id: None,

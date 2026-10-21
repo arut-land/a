@@ -341,22 +341,21 @@ impl ManualSession {
 
     fn change(&self, data: Json) -> oneshot::Receiver<ext::MutationResult> {
         let (done, waited) = oneshot::channel();
-        ContextOrigin {
-            fence: self.session.session.fence.load(Ordering::SeqCst),
-            call: self.call,
-            cancel: self.session.session.cancel(self.call),
-        }
-        .send(
-            &self.session.session,
-            ContextRequest::Note {
-                note: Note::State {
-                    ext: "test".into(),
-                    state: "value".into(),
-                    data,
+        self.session
+            .session
+            .origin(self.call, self.session.session.fence.load(Ordering::SeqCst))
+            .unwrap()
+            .send(
+                &self.session.session,
+                ContextRequest::Note {
+                    note: Note::State {
+                        ext: "test".into(),
+                        state: "value".into(),
+                        data,
+                    },
+                    done: Some(done),
                 },
-                done: Some(done),
-            },
-        );
+            );
         waited
     }
 
@@ -1105,22 +1104,21 @@ fn final_sync_publishes_activity_after_its_entries() {
     }
     assert!(view.activity.is_some());
     let before = view.seq;
-    ContextOrigin {
-        fence: session.session.fence.load(Ordering::SeqCst),
-        call: CallId::new(call.get()).unwrap(),
-        cancel: session.session.cancel(CallId::new(call.get()).unwrap()),
-    }
-    .send(
-        &session.session,
-        ContextRequest::Note {
-            note: Note::State {
-                ext: "test".into(),
-                state: "value".into(),
-                data: Json::default(),
+    session
+        .session
+        .origin(CallId(call), session.session.fence.load(Ordering::SeqCst))
+        .unwrap()
+        .send(
+            &session.session,
+            ContextRequest::Note {
+                note: Note::State {
+                    ext: "test".into(),
+                    state: "value".into(),
+                    data: Json::default(),
+                },
+                done: None,
             },
-            done: None,
-        },
-    );
+        );
     poll_actor(&mut actor);
     assert_eq!(session.frames.seq(), before, "note is deferred");
     session.send(Msg::Stop);
@@ -1299,11 +1297,7 @@ fn interrupt_revokes_bookkeeping_but_settles_the_completed_effect_once() {
         true,
     );
     let cx = h.context();
-    let settlement = ToolSettlement {
-        call: h.call,
-        fence: h.session.session.fence.load(Ordering::SeqCst),
-        mail: Arc::clone(&h.session.session.mail),
-    };
+    let fence = h.session.session.fence.load(Ordering::SeqCst);
     let output = Json::encode(&serde_json::json!({"aborted": true})).unwrap();
     let change = "completed effect".to_owned();
     h.session.interrupt();
@@ -1317,10 +1311,16 @@ fn interrupt_revokes_bookkeeping_but_settles_the_completed_effect_once() {
     let output = rt::block_on(recording).unwrap();
     assert_eq!(cx.state(|s: &Updates| s.0), 0);
     let outcome = Outcome::Done { output };
-    settlement.finish(Called {
-        outcome: outcome.clone(),
-        card: None,
-    });
+    h.session.session.emit(
+        fence,
+        Completion::Tool {
+            call: h.call,
+            called: Called {
+                outcome: outcome.clone(),
+                card: None,
+            },
+        },
+    );
     h.poll();
     // A delayed duplicate must not overwrite the call's committed outcome.
     h.complete();

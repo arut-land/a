@@ -311,6 +311,7 @@ fn input_samples() -> Vec<Sample<DaemonMsg>> {
             entry(
                 22,
                 Body::ToolCall {
+                    invoke: None,
                     tool: "model".into(),
                     input: protocol::Json::encode(&json!({ "args": "openai:m" })).unwrap(),
                     id: None,
@@ -430,6 +431,7 @@ fn daemon_samples() -> Vec<Sample<DaemonMsg>> {
             seq: Seq::new(2).unwrap(),
             epoch: Epoch(0),
             body: Body::ToolCall {
+                invoke: None,
                 tool: "bash".into(),
                 input: protocol::Json::encode(&json!({ "command": "ls" })).unwrap(),
                 id: None,
@@ -521,11 +523,17 @@ fn daemon_samples() -> Vec<Sample<DaemonMsg>> {
                 workspace: "/w".into(),
             },
         ),
+        sample("entry_tool_invocation", entry(3, Body::ToolCall {
+            invoke: Some(protocol::Invocation { parent: CallId::new(2).unwrap(), name: "lookup".into() }),
+            tool: "bash".into(), input: protocol::Json::encode(&json!({"command":"ls"})).unwrap(),
+            id: None, card: None, by: Audience::Model,
+        })),
         sample(
             "entry_tool_call",
             entry(
                 2,
                 Body::ToolCall {
+                    invoke: None,
                     tool: "bash".into(),
                     input: protocol::Json::encode(&json!({ "command": "ls" })).unwrap(),
                     id: Some("call_1".into()),

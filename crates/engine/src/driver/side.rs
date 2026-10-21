@@ -33,7 +33,7 @@ impl Actor {
         for entry in entries
             .into_iter()
             .chain(self.pending_entries())
-            .filter(|entry| entry.seq > origin.call.0)
+            .filter(|entry| entry.seq > origin.id.0)
         {
             match entry.body {
                 Body::Interrupt { .. } => return false,
@@ -46,7 +46,7 @@ impl Actor {
                     call,
                     outcome: Outcome::Done { .. },
                     ..
-                } if call == origin.call => succeeded = true,
+                } if call == origin.id => succeeded = true,
                 _ => {}
             }
         }
@@ -68,7 +68,7 @@ impl Actor {
                 && !self
                     .core
                     .ledger()
-                    .call(origin.call)
+                    .call(origin.id)
                     .is_some_and(|o| matches!(o.phase, protocol::ledger::Phase::Waiting(_)))
             {
                 cancel.set();
@@ -100,8 +100,7 @@ impl Actor {
         fact: SideFact,
         done: oneshot::Sender<Result<(), String>>,
     ) -> Event {
-        self.tickets += 1;
-        let ticket = Ticket(self.tickets);
+        let ticket = self.ticket();
         self.replies.clients.insert(ticket, done);
         Event::Side(match fact {
             SideFact::Retry {
@@ -133,7 +132,7 @@ impl Actor {
         side: ext::Side,
         reply: oneshot::Sender<Opened>,
     ) -> Option<Event> {
-        let of = origin.call;
+        let of = origin.id;
         if side.is_while_waiting()
             && !self
                 .core
@@ -205,8 +204,7 @@ impl Actor {
             .filter(|(_, o)| matches!(o.call, protocol::ledger::Call::Side { .. }))
             .count()
             >= 4;
-        self.tickets += 1;
-        let ticket = Ticket(self.tickets);
+        let ticket = self.ticket();
         let background = side.is_background();
         self.sides.insert(
             ticket,

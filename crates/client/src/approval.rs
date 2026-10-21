@@ -251,6 +251,7 @@ mod review_tests {
     fn review_text_cannot_erase_the_call_in_a_terminal() {
         let input = Json::encode(&serde_json::json!({"command":"first\nlast"})).unwrap();
         let item = protocol::view::Item::Tool {
+            invoke: None,
             call: CallId::new(1).unwrap(),
             tool: "bash".into(),
             input,

@@ -128,6 +128,7 @@ fn asked_command() -> Vec<DaemonMsg> {
         entry(
             3,
             Body::ToolCall {
+                invoke: None,
                 tool: "bash".into(),
                 input: Json::encode(&json!({"command": "ls"})).unwrap(),
                 id: None,
@@ -901,6 +902,7 @@ fn render_cost() {
         msgs.push(entry(
             seq + 2,
             Body::ToolCall {
+                invoke: None,
                 tool: "bash".into(),
                 input: Json::encode(&json!({"command": "ls"})).unwrap(),
                 id: None,
@@ -1278,6 +1280,7 @@ fn a_turn_keeps_its_clock_across_entry_gaps_and_stops_only_at_idle() {
     app.fold(&entry(
         4,
         Body::ToolCall {
+            invoke: None,
             tool: "bash".into(),
             input: Json::encode(&json!({"command":"true"})).unwrap(),
             id: None,

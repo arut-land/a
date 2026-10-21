@@ -138,6 +138,16 @@ impl Core {
     pub fn step(&mut self, event: Event) -> StepPlan {
         let mut fx = StepPlan::default();
         match event {
+            Event::Invoke {
+                parent,
+                name,
+                tool,
+                input,
+                ticket,
+            } => {
+                let result = self.invoke(parent, name, tool, input, &mut fx);
+                fx.immediate.push(Work::Invocation { ticket, result });
+            }
             Event::Input {
                 text,
                 mode,
@@ -249,6 +259,7 @@ impl Core {
     }
 
     fn finish(&mut self, fx: &mut StepPlan) {
+        self.admit_invocations(fx);
         self.advance(fx);
         self.marks(fx);
         let through = self.fold.ledger.seq();
@@ -278,7 +289,8 @@ impl Core {
                 | Work::Await { .. }
                 | Work::Recover { .. }
                 | Work::Kill { .. } => Some(Requirement::Ordered),
-                Work::Reply { .. }
+                Work::Invocation { .. }
+                | Work::Reply { .. }
                 | Work::Deliver { .. }
                 | Work::Delivery { .. }
                 | Work::Side { .. }
@@ -491,7 +503,7 @@ impl Core {
                             fx.immediate.push(Work::Cancel { call });
                             left.push(call);
                         }
-                        (Step::Awaiting { .. }, _) => {
+                        (Step::Queued { .. } | Step::Awaiting { .. }, _) => {
                             fx.immediate.push(Work::Cancel { call });
                             self.settle(call, self.interrupted(call), fx);
                         }
@@ -878,6 +890,7 @@ impl Core {
         for (by, d) in decisions {
             self.decide(Some(call), &by, d, fx);
         }
+        self.cancel_invocations(call, fx);
         self.close(call);
         self.append(
             fx,
@@ -1222,6 +1235,149 @@ impl Core {
         }
     }
 
+    fn invoke(
+        &mut self,
+        parent: CallId,
+        name: String,
+        tool: String,
+        input: Json,
+        fx: &mut StepPlan,
+    ) -> Result<CallId, String> {
+        if self.step_of(parent) != Some(Step::Running) {
+            return Err("invocation owner is not running".into());
+        }
+        let key = protocol::Invocation { parent, name };
+        if key.name.is_empty() {
+            return Err("invocation needs a name".into());
+        }
+        if let Some(invoked) = self
+            .fold
+            .invocations
+            .iter()
+            .find(|invoked| invoked.key == key)
+        {
+            if invoked.tool != tool || invoked.input != input {
+                return Err("invocation name was already used with different arguments".into());
+            }
+            let call = invoked.call;
+            if invoked.result.is_none() && self.step_of(call).is_none() {
+                self.set_step(call, Step::Queued { recovered: true });
+            }
+            return Ok(call);
+        }
+        let mut root = parent;
+        for depth in 1..=8 {
+            match self.fold.ledger.call(root).map(|open| &open.call) {
+                Some(Call::Tool {
+                    invoke: Some(key), ..
+                }) if depth < 8 => root = key.parent,
+                Some(Call::Tool {
+                    invoke: Some(_), ..
+                }) => return Err("tool delegation is too deep".into()),
+                _ => break,
+            }
+        }
+        if !self.shared(&tool)
+            && self
+                .tool_of(root)
+                .is_some_and(|(tool, _)| self.shared(&tool))
+        {
+            return Err("exclusive invocation requires an exclusive owner".into());
+        }
+        let card = self.registry.read(self.next_seq(), &tool, &input);
+        let call = self.append(
+            fx,
+            Body::ToolCall {
+                invoke: Some(key),
+                tool,
+                input,
+                card,
+                id: None,
+                by: Audience::Model,
+            },
+        );
+        self.set_step(call, Step::Queued { recovered: false });
+        Ok(call)
+    }
+
+    fn admit_invocations(&mut self, fx: &mut StepPlan) {
+        let queued: Vec<_> = match &self.turn {
+            Turn::Acting { open } => open
+                .iter()
+                .filter_map(|(call, step)| {
+                    matches!(step, Step::Queued { .. }).then_some((*call, *step))
+                })
+                .collect(),
+            _ => return,
+        };
+        for (call, step) in queued {
+            let mut ancestors = Vec::new();
+            let mut owner = call;
+            while let Some(Call::Tool {
+                invoke: Some(key), ..
+            }) = self.fold.ledger.call(owner).map(|open| &open.call)
+            {
+                ancestors.push(key.parent);
+                owner = key.parent;
+            }
+            let Some((tool, input)) = self.tool_of(call) else {
+                continue;
+            };
+            let Turn::Acting { open } = &self.turn else {
+                return;
+            };
+            let available = open.iter().all(|(other, step)| {
+                *other == call
+                    || ancestors.contains(other)
+                    || matches!(step, Step::Queued { .. })
+                    || self.shared(&tool)
+                        && self
+                            .tool_of(*other)
+                            .is_some_and(|(tool, _)| self.shared(&tool))
+            });
+            if available {
+                if step == (Step::Queued { recovered: true }) {
+                    let phase = self
+                        .fold
+                        .ledger
+                        .call(call)
+                        .expect("open invocation")
+                        .phase
+                        .clone();
+                    self.reopen(call, &tool, &input, &phase, fx);
+                } else {
+                    self.gate(call, &tool, &input, fx);
+                }
+            }
+        }
+    }
+
+    pub fn invocation_result(&self, call: CallId) -> Option<&ext::Called> {
+        self.fold
+            .invocations
+            .iter()
+            .find(|invoked| invoked.call == call)?
+            .result
+            .as_ref()
+    }
+
+    fn cancel_invocations(&mut self, parent: CallId, fx: &mut StepPlan) {
+        let children: Vec<_> = self
+            .fold
+            .ledger
+            .open_calls()
+            .filter_map(|(call, open)| {
+                matches!(&open.call, Call::Tool { invoke: Some(key), .. } if key.parent == parent)
+                    .then_some(call)
+            })
+            .collect();
+        for call in children {
+            fx.immediate.push(Work::Cancel { call });
+            self.close(call);
+            self.settle(call, self.interrupted(call), fx);
+        }
+    }
+
     /// Logs the intent to call `tool`: its input read by its tool once,
     /// here, for the card and for the run.
     fn call(
@@ -1235,6 +1391,7 @@ impl Core {
         let next = self.next_seq();
         let card = self.registry.read(next, tool, input);
         let body = Body::ToolCall {
+            invoke: None,
             tool: tool.to_owned(),
             input: input.clone(),
             id,
@@ -1455,6 +1612,13 @@ impl Core {
         for (call, kind, phase) in open {
             match kind {
                 Call::Model { attempt, .. } => self.restart(call, attempt, fx),
+                Call::Tool {
+                    invoke: Some(key), ..
+                } => {
+                    if self.fold.ledger.call(key.parent).is_none() {
+                        self.settle(call, self.interrupted(call), fx);
+                    }
+                }
                 Call::Tool { tool, input, .. } => self.reopen(call, &tool, &input, &phase, fx),
                 // Its owner asks again, if it still wants an answer.
                 Call::Side { .. } => self.settle(call, Outcome::Interrupted { output: None }, fx),
@@ -1604,6 +1768,7 @@ impl Core {
     /// still out with it, their ends logged first; one done leaves them to
     /// end as they do.
     fn settle(&mut self, call: CallId, outcome: Outcome, fx: &mut StepPlan) {
+        self.cancel_invocations(call, fx);
         let done = matches!(outcome, Outcome::Done { .. });
         let sides: SmallVec<[CallId; 1]> = (self.fold.ledger.open_calls())
             .filter(|(_, open)| !done && open.call == Call::Side { of: call })

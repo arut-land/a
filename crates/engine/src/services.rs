@@ -12,7 +12,7 @@ impl Session {
             workspace: Arc::clone(&self.workspace),
             env: lock(&self.env).clone(),
             session: self.id,
-            call: origin.call,
+            call: origin.id,
             model: self.model_spec(registry).into(),
             spill: Arc::clone(&self.spill),
             cancel: origin.cancel.clone(),
@@ -189,6 +189,31 @@ impl Calling {
 }
 
 impl Host for Calling {
+    fn invoke(
+        self: Arc<Self>,
+        _: Cx,
+        name: String,
+        tool: String,
+        input: Json,
+    ) -> BoxFuture<'static, super::Called> {
+        let (reply, result) = oneshot::channel();
+        self.origin.send(
+            &self.session,
+            ContextRequest::Invoke {
+                name,
+                tool,
+                input,
+                reply,
+            },
+        );
+        Box::pin(async move {
+            result.await.unwrap_or(super::Called {
+                outcome: super::Outcome::Interrupted { output: None },
+                card: None,
+            })
+        })
+    }
+
     fn spawned(&self, pgid: u32, background: bool) {
         let Some(boot) = sys::boot_id() else { return };
         let boot = boot.to_owned();

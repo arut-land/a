@@ -13,11 +13,11 @@ use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
 /// The protocol this build speaks best.
-pub const PROTO: u32 = 11;
+pub const PROTO: u32 = 12;
 
 /// The oldest protocol this build still speaks: a peer whose range
 /// overlaps `PROTO_MIN..=PROTO` is served at the highest version both speak.
-pub const PROTO_MIN: u32 = 11;
+pub const PROTO_MIN: u32 = 12;
 
 const MAX_FRAME: u32 = 16 * 1024 * 1024;
 
@@ -202,6 +202,13 @@ impl Entry {
     }
 }
 
+/// A name is stable within one parent call, including across recovery.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Invocation {
+    pub parent: CallId,
+    pub name: String,
+}
+
 kinds! {
     /// What an entry records. Each fact is logged once, and anything that
     /// can be computed from facts is a fold over them
@@ -247,6 +254,7 @@ kinds! {
         /// its result goes back. `by` is who called it: the model, unless the
         /// user ran it as a command or an extension did.
         ToolCall "tool_call" {
+            invoke: Option<Invocation> = default,
             tool: String,
             input: Json,
             id: Option<String> = default,
@@ -1855,6 +1863,7 @@ mod tests {
         assert!(matches!(&e.body, Body::ToolResult { card: None, .. }));
         assert_eq!(serde_json::to_string(&e).unwrap(), line);
         let carded = Body::ToolCall {
+            invoke: None,
             tool: "bash".into(),
             input: Json::encode(&serde_json::json!({ "command": "ls" })).unwrap(),
             id: None,

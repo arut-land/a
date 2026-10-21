@@ -162,6 +162,7 @@ impl Session {
         let input: Json =
             Json::encode(&json!({ "command": format!("echo {}", rng.below(10)) })).unwrap();
         let call = self.commit(Body::ToolCall {
+            invoke: None,
             tool: "bash".into(),
             input,
             id: None,
@@ -564,7 +565,7 @@ fn scenarios() -> Vec<(&'static str, Vec<Value>)> {
     let review = |tool: &str, effective: Value| {
         vec![
         attached(),
-        entry(1, Body::ToolCall { tool: tool.into(), input: Json::encode(&json!({"command":"original harmless input"})).unwrap(), id: None, card: Some(Card { title: "shortened title".into(), ..Card::default() }), by: Audience::Model }),
+        entry(1, Body::ToolCall { invoke: None, tool: tool.into(), input: Json::encode(&json!({"command":"original harmless input"})).unwrap(), id: None, card: Some(Card { title: "shortened title".into(), ..Card::default() }), by: Audience::Model }),
         entry(2, Body::Decision { by: "rewrite".into(), call: Some(call(1)), d: Verdict::PreTool { input: Json::encode(&effective).unwrap() } }),
         entry(3, ask(1)),
         msg(DaemonMsg::Activity { seq: 3, activity: protocol::Activity::Approval }),
@@ -574,6 +575,14 @@ fn scenarios() -> Vec<(&'static str, Vec<Value>)> {
     ]
     };
     let mut scenarios = vec![
+        ("owned_invocation", vec![
+            attached(), entry(1, input("run")),
+            entry(2, Body::ToolCall { invoke: None, tool: "owner".into(), input: Json::null(), id: None, card: None, by: Audience::Model }),
+            entry(3, Body::ToolCall { invoke: Some(protocol::Invocation { parent: call(2), name: "lookup".into() }), tool: "lookup".into(), input: Json::null(), id: None, card: None, by: Audience::Model }),
+            entry(4, Body::ToolResult { call: call(3), outcome: echoed(), card: None }),
+            entry(5, Body::ToolResult { call: call(2), outcome: echoed(), card: None }),
+        ]),
+
         ("approval reviews the effective multiline call", review("bash", json!({"command":"printf harmless\nrm -rf /tmp/approval-test-sentinel", "timeout":60000, "extra":"every argument"}))),
         ("approval reviews every edit replacement", review("edit", json!({"path":"/work/deep/config.ini", "edits":[{"old":"allow = false\nkeep = yes", "new":"allow = true\nkeep = yes"}, {"old":"delete = no", "new":"delete = yes"}], "extra":{"flag":true}}))),
         (
@@ -581,6 +590,7 @@ fn scenarios() -> Vec<(&'static str, Vec<Value>)> {
             vec![
                 attached(),
                 entry(1, Body::ToolCall {
+                    invoke: None,
                     tool: "bash".into(), input: Json::encode(&json!({"command":"ls"})).unwrap(),
                     id: None, card: None, by: Audience::Model,
                 }),
@@ -629,6 +639,7 @@ fn scenarios() -> Vec<(&'static str, Vec<Value>)> {
                 entry(
                     1,
                     Body::ToolCall {
+                        invoke: None,
                         tool: "bash".into(),
                         input: Json::encode(&json!({"command":"echo hi"})).unwrap(),
                         id: None,
@@ -712,6 +723,7 @@ fn scenarios() -> Vec<(&'static str, Vec<Value>)> {
                 entry(
                     1,
                     Body::ToolCall {
+                        invoke: None,
                         tool: "bash".into(),
                         input: Json::encode(&json!({ "command": "echo hi" })).unwrap(),
                         id: None,
@@ -840,6 +852,7 @@ fn scenarios() -> Vec<(&'static str, Vec<Value>)> {
                 entry(
                     1,
                     Body::ToolCall {
+                        invoke: None,
                         tool: "bash".into(),
                         input: Json::encode(&json!({ "command": "echo hi" })).unwrap(),
                         id: None,
@@ -870,6 +883,7 @@ fn scenarios() -> Vec<(&'static str, Vec<Value>)> {
                 entry(
                     5,
                     Body::ToolCall {
+                        invoke: None,
                         tool: "jobs".into(),
                         input: Json::encode(&json!({ "args": "" })).unwrap(),
                         id: None,
@@ -892,6 +906,7 @@ fn scenarios() -> Vec<(&'static str, Vec<Value>)> {
         ),
         ("a client that fell behind is caught up with a snapshot", {
             let asked = Body::ToolCall {
+                invoke: None,
                 tool: "bash".into(),
                 input: Json::encode(&json!({ "command": "echo hi" })).unwrap(),
                 id: None,
@@ -1054,6 +1069,7 @@ fn a_recap_tells_what_the_replay_held() {
         entry(
             2,
             Body::ToolCall {
+                invoke: None,
                 tool: "bash".into(),
                 input: Json::encode(&json!({ "command": "ls" })).unwrap(),
                 id: None,

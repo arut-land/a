@@ -102,6 +102,7 @@ fn resume_after_the_terminal_closes_mid_turn_replays_every_entry() {
             },
             taken("sleep 1"),
             Body::ToolCall {
+                invoke: None,
                 tool: "sleep".into(),
                 input: Json::encode(&json!({ "seconds": 1 })).unwrap(),
                 id: None,

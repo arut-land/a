@@ -548,11 +548,15 @@ fn stale_request<'a>(
     if matches!(probe, RetainedProbe::Mailbox) {
         Box::pin(async move {
             // A queued request must be fenced even independently of revocation.
-            let origin = ContextOrigin {
+            let origin = WorkHandle::new(
+                old.call,
                 fence,
-                call: old.call,
-                cancel: Cancel::default(),
-            };
+                Admission {
+                    through: old.call.get(),
+                    requirement: Requirement::Ordered,
+                },
+                Cancel::default(),
+            );
             let (reply, _) = oneshot::channel();
             origin.send(
                 session,

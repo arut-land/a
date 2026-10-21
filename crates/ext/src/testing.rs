@@ -10,7 +10,7 @@ use protocol::{Body, CallId, Entry, Environment, Epoch, Json, Outcome, Seq, Sess
 use serde_json::Value;
 
 use crate::host::{Host, Parts, Registry, Services};
-use crate::{BoxFuture, Cancel, Cx, States};
+use crate::{BoxFuture, Called, Cancel, Cx, Gate, Gating, States};
 
 /// The runtime the calls run on, as the engine provides it.
 static RT: LazyLock<rt::Rt> = LazyLock::new(|| Arc::new(rt::Threads::default()));
@@ -132,7 +132,92 @@ impl Drop for Rig {
     }
 }
 
+impl Recorder {
+    fn append(&self, body: Body) -> crate::MutationResult {
+        let mut log = lock(&self.log);
+        let seq = Seq::new(log.last().map_or(1, |entry| entry.seq.get() + 1)).unwrap();
+        let entry = Entry::new(seq, Epoch(0), body);
+        let mut states = lock(&self.states);
+        states.apply(&entry);
+        let result = states.mutation_result(&entry);
+        log.push(entry);
+        result
+    }
+}
+
 impl Host for Recorder {
+    fn invoke(
+        self: Arc<Self>,
+        cx: Cx,
+        name: String,
+        tool: String,
+        input: Json,
+    ) -> BoxFuture<'static, Called> {
+        Box::pin(async move {
+            let call = CallId(
+                self.append(Body::ToolCall {
+                    invoke: Some(protocol::Invocation {
+                        parent: cx.call,
+                        name,
+                    }),
+                    tool: tool.clone(),
+                    input: input.clone(),
+                    id: None,
+                    card: None,
+                    by: protocol::Audience::Model,
+                })
+                .expect("in-memory intent"),
+            );
+            let child = Parts {
+                workspace: cx.workspace,
+                env: cx.env,
+                session: cx.session,
+                call,
+                model: cx.model,
+                spill: cx.spill,
+                cancel: cx.cancel,
+                services: Arc::clone(&SERVICES),
+            }
+            .cx(self.clone());
+            let gated = match self.registry.hooks().gate(&child.point(), &tool, &input) {
+                Gating::Now(gated) => gated,
+                Gating::Approving(_) => {
+                    return Called::failed("test invocation needs approval".into());
+                }
+            };
+            for (by, d) in gated.decisions {
+                self.append(Body::Decision {
+                    by: by.to_string(),
+                    call: Some(call),
+                    d,
+                })
+                .unwrap();
+            }
+            let mut called = match gated.gate {
+                Gate::Run => {
+                    self.registry
+                        .tools()
+                        .run(&tool, &gated.input, None, &child)
+                        .await
+                }
+                Gate::Refuse(error) => Called::failed(error),
+                Gate::Ask => Called::failed("test invocation needs approval".into()),
+            };
+            called.outcome = self
+                .registry
+                .hooks()
+                .post_tool(&child.point(), (&tool, &gated.input), called.outcome)
+                .value;
+            self.append(Body::ToolResult {
+                call,
+                outcome: called.outcome.clone(),
+                card: called.card.clone(),
+            })
+            .unwrap();
+            called
+        })
+    }
+
     fn spawned(&self, pgid: u32, background: bool) {
         lock(&self.spawned).push((pgid, background));
     }
@@ -157,22 +242,11 @@ impl Host for Recorder {
         state: &str,
         data: Json,
     ) -> BoxFuture<'static, crate::MutationResult> {
-        let mut log = lock(&self.log);
-        let seq = log.len() as u64 + 1;
-        let entry = Entry::new(
-            Seq::new(seq).unwrap(),
-            Epoch(0),
-            Body::Ext {
-                ext: ext.to_owned(),
-                state: state.to_owned(),
-                data,
-            },
-        );
-        let mut states = lock(&self.states);
-        states.apply(&entry);
-        let result = states.mutation_result(&entry);
-        log.push(entry);
-        Box::pin(std::future::ready(result))
+        Box::pin(std::future::ready(self.append(Body::Ext {
+            ext: ext.to_owned(),
+            state: state.to_owned(),
+            data,
+        })))
     }
 
     fn publish(
@@ -181,35 +255,22 @@ impl Host for Recorder {
         key: Json,
         text: String,
     ) -> BoxFuture<'static, crate::MutationResult> {
-        let mut log = lock(&self.log);
-        let entry = Entry::new(
-            Seq::new(log.len() as u64 + 1).unwrap(),
-            Epoch(0),
-            Body::Context {
-                text,
-                publication: Some(protocol::publication::Publication {
-                    namespace: namespace.to_owned(),
-                    key,
-                }),
-            },
-        );
-        lock(&self.states).apply(&entry);
-        let seq = entry.seq;
-        log.push(entry);
-        Box::pin(std::future::ready(Ok(seq)))
+        Box::pin(std::future::ready(self.append(Body::Context {
+            text,
+            publication: Some(protocol::publication::Publication {
+                namespace: namespace.to_owned(),
+                key,
+            }),
+        })))
     }
 
     fn edit(&self, target: Seq, upto: Option<Seq>, replace: Option<Json>) {
-        let mut log = lock(&self.log);
-        let seq = log.len() as u64 + 1;
-        let edit = Body::Edit {
+        self.append(Body::Edit {
             target,
             upto,
             replace,
-        };
-        let entry = Entry::new(Seq::new(seq).unwrap(), Epoch(0), edit);
-        lock(&self.states).apply(&entry);
-        log.push(entry);
+        })
+        .unwrap();
     }
 
     fn states(&self, read: &mut dyn FnMut(&States)) {

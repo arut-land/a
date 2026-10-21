@@ -160,6 +160,7 @@ impl Item {
                 card,
                 by,
                 reason,
+                ..
             } => {
                 let (kind, title) = match by {
                     Audience::User => (

@@ -381,6 +381,7 @@ fn a_call_whose_child_settled_before_a_crash_resumes_with_its_result() {
 #[test]
 fn a_command_cut_off_is_not_run_again() {
     let command = Body::ToolCall {
+        invoke: None,
         tool: "jobs".into(),
         input: Json::encode(&json!({ "args": "" })).unwrap(),
         id: None,

@@ -224,6 +224,7 @@ fn busy_sessions_recover_at_startup() {
     ];
     for (seq, (tool, input)) in (1..).zip(calls) {
         let body = Body::ToolCall {
+            invoke: None,
             tool: tool.into(),
             input: Json::encode(&input).unwrap(),
             id: None,
@@ -282,6 +283,7 @@ fn a_damaged_log_is_shown_and_never_written() {
         })
         .unwrap();
     let call = Body::ToolCall {
+        invoke: None,
         tool: "sleep".into(),
         input: Json::encode(&json!({ "seconds": 0 })).unwrap(),
         id: None,
@@ -631,6 +633,7 @@ fn watches_rearm_after_a_crash_and_fire_once() {
                 origin: None,
             },
             Body::ToolCall {
+                invoke: None,
                 tool: "task".into(),
                 input: Json::encode(&json!({ "prompt": "sleep 0" })).unwrap(),
                 id: None,
@@ -658,6 +661,7 @@ fn watches_rearm_after_a_crash_and_fire_once() {
         origin: None,
     };
     let sleep = || Body::ToolCall {
+        invoke: None,
         tool: "sleep".into(),
         input: Json::encode(&json!({ "seconds": 0 })).unwrap(),
         id: None,
@@ -830,6 +834,7 @@ fn an_orphan_does_not_resume_what_it_was_doing() {
             origin: None,
         },
         Body::ToolCall {
+            invoke: None,
             tool: "sleep".into(),
             input: Json::encode(&json!({ "seconds": 0 })).unwrap(),
             id: None,
@@ -1267,6 +1272,7 @@ fn an_unclean_stop_rebuilds_the_catalog_and_recovers_the_call() {
     ];
     for (seq, (tool, input)) in (1..).zip(calls) {
         let body = Body::ToolCall {
+            invoke: None,
             tool: tool.into(),
             input: Json::encode(&input).unwrap(),
             id: None,

@@ -21,6 +21,7 @@ fn modeled() -> Session {
 /// A call the model made, under its id.
 fn model_tool_call(tool: &str, input: &serde_json::Value, id: &str) -> Body {
     Body::ToolCall {
+        invoke: None,
         tool: tool.to_owned(),
         input: Json::encode(input).unwrap(),
         id: Some(id.to_owned()),
@@ -734,6 +735,7 @@ fn a_failure_no_extension_retries_fails_the_turn() {
 
 fn command(args: &str) -> Body {
     Body::ToolCall {
+        invoke: None,
         tool: "jobs".into(),
         input: Json::encode(&json!({ "args": args })).unwrap(),
         id: None,

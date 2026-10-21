@@ -2,6 +2,237 @@
   {
     "frames": [
       "{\"session\":\"00000000-0000-0000-0000-00000000000a\",\"t\":\"attached\",\"workspace\":\"/w\"}",
+      "{\"epoch\":0,\"kind\":\"input\",\"seq\":1,\"t\":\"entry\",\"taken\":true,\"text\":\"run\"}",
+      "{\"epoch\":0,\"input\":null,\"kind\":\"tool_call\",\"seq\":2,\"t\":\"entry\",\"tool\":\"owner\"}",
+      "{\"epoch\":0,\"input\":null,\"invoke\":{\"name\":\"lookup\",\"parent\":2},\"kind\":\"tool_call\",\"seq\":3,\"t\":\"entry\",\"tool\":\"lookup\"}",
+      "{\"call\":3,\"epoch\":0,\"kind\":\"tool_result\",\"outcome\":{\"output\":{\"exit\":0,\"output\":\"hi\\n\"},\"status\":\"done\"},\"seq\":4,\"t\":\"entry\"}",
+      "{\"call\":2,\"epoch\":0,\"kind\":\"tool_result\",\"outcome\":{\"output\":{\"exit\":0,\"output\":\"hi\\n\"},\"status\":\"done\"},\"seq\":5,\"t\":\"entry\"}"
+    ],
+    "hash": "b7066dc21214db56",
+    "messages": [
+      {
+        "session": "00000000-0000-0000-0000-00000000000a",
+        "t": "attached",
+        "workspace": "/w"
+      },
+      {
+        "epoch": 0,
+        "kind": "input",
+        "seq": 1,
+        "t": "entry",
+        "taken": true,
+        "text": "run"
+      },
+      {
+        "epoch": 0,
+        "input": null,
+        "kind": "tool_call",
+        "seq": 2,
+        "t": "entry",
+        "tool": "owner"
+      },
+      {
+        "epoch": 0,
+        "input": null,
+        "invoke": {
+          "name": "lookup",
+          "parent": 2
+        },
+        "kind": "tool_call",
+        "seq": 3,
+        "t": "entry",
+        "tool": "lookup"
+      },
+      {
+        "call": 3,
+        "epoch": 0,
+        "kind": "tool_result",
+        "outcome": {
+          "output": {
+            "exit": 0,
+            "output": "hi\n"
+          },
+          "status": "done"
+        },
+        "seq": 4,
+        "t": "entry"
+      },
+      {
+        "call": 2,
+        "epoch": 0,
+        "kind": "tool_result",
+        "outcome": {
+          "output": {
+            "exit": 0,
+            "output": "hi\n"
+          },
+          "status": "done"
+        },
+        "seq": 5,
+        "t": "entry"
+      }
+    ],
+    "name": "owned_invocation",
+    "state": {
+      "items": [
+        {
+          "seq": 1,
+          "text": "run",
+          "type": "user"
+        },
+        {
+          "call": 2,
+          "input": null,
+          "outcome": {
+            "output": {
+              "exit": 0,
+              "output": "hi\n"
+            },
+            "status": "done"
+          },
+          "phase": {
+            "settled": "done"
+          },
+          "tool": "owner",
+          "type": "tool"
+        },
+        {
+          "call": 3,
+          "input": null,
+          "invoke": {
+            "name": "lookup",
+            "parent": 2
+          },
+          "outcome": {
+            "output": {
+              "exit": 0,
+              "output": "hi\n"
+            },
+            "status": "done"
+          },
+          "phase": {
+            "settled": "done"
+          },
+          "tool": "lookup",
+          "type": "tool"
+        }
+      ],
+      "ledger": {
+        "acknowledgements": [],
+        "armed": [],
+        "background": [],
+        "clients": [],
+        "context": false,
+        "env": null,
+        "extensions": null,
+        "links": [],
+        "open": [],
+        "outbox": [],
+        "received": [],
+        "seq": 5,
+        "turn": 1,
+        "untaken": [],
+        "watched": []
+      },
+      "seq": 5,
+      "session": "00000000-0000-0000-0000-00000000000a",
+      "workspace": "/w"
+    },
+    "updates": [
+      {
+        "change": {
+          "change": "attached",
+          "reset": true,
+          "session": "00000000-0000-0000-0000-00000000000a",
+          "workspace": "/w"
+        },
+        "rev": 1,
+        "seq": 0
+      },
+      {
+        "change": {
+          "change": "added",
+          "index": 0,
+          "item": {
+            "seq": 1,
+            "text": "run",
+            "type": "user"
+          }
+        },
+        "rev": 2,
+        "seq": 1
+      },
+      {
+        "change": {
+          "change": "added",
+          "index": 1,
+          "item": {
+            "call": 2,
+            "input": null,
+            "outcome": null,
+            "phase": {
+              "gating": {
+                "at": 0
+              }
+            },
+            "tool": "owner",
+            "type": "tool"
+          }
+        },
+        "rev": 3,
+        "seq": 2
+      },
+      {
+        "change": {
+          "change": "added",
+          "index": 2,
+          "item": {
+            "call": 3,
+            "input": null,
+            "invoke": {
+              "name": "lookup",
+              "parent": 2
+            },
+            "outcome": null,
+            "phase": {
+              "gating": {
+                "at": 0
+              }
+            },
+            "tool": "lookup",
+            "type": "tool"
+          }
+        },
+        "rev": 4,
+        "seq": 3
+      },
+      {
+        "change": {
+          "change": "updated",
+          "index": 2,
+          "part": {
+            "part": "outcome"
+          }
+        },
+        "rev": 5,
+        "seq": 4
+      },
+      {
+        "change": {
+          "change": "updated",
+          "index": 1,
+          "part": {
+            "part": "outcome"
+          }
+        },
+        "rev": 6,
+        "seq": 5
+      }
+    ]
+  },
+  {
+    "frames": [
+      "{\"session\":\"00000000-0000-0000-0000-00000000000a\",\"t\":\"attached\",\"workspace\":\"/w\"}",
       "{\"card\":{\"title\":\"shortened title\"},\"epoch\":0,\"input\":{\"command\":\"original harmless input\"},\"kind\":\"tool_call\",\"seq\":1,\"t\":\"entry\",\"tool\":\"bash\"}",
       "{\"by\":\"rewrite\",\"call\":1,\"d\":\"pre_tool\",\"epoch\":0,\"input\":{\"command\":\"printf harmless\\nrm -rf /tmp/approval-test-sentinel\",\"extra\":\"every argument\",\"timeout\":60000},\"kind\":\"decision\",\"seq\":2,\"t\":\"entry\"}",
       "{\"by\":\"policy\",\"call\":1,\"d\":\"permission\",\"epoch\":0,\"kind\":\"decision\",\"permission\":{\"ask\":{\"mode\":{\"mode\":\"ask\"}}},\"seq\":3,\"t\":\"entry\"}",
@@ -10,7 +241,7 @@
       "{\"call\":4,\"epoch\":0,\"for\":1,\"kind\":\"model_result\",\"outcome\":{\"output\":{\"message\":{\"content\":[{\"text\":\"Only lists files.\",\"type\":\"text\"}]}},\"status\":\"done\"},\"seq\":5,\"t\":\"entry\"}",
       "{\"seq\":5,\"t\":\"synced\"}"
     ],
-    "hash": "c24497bad7afaa03",
+    "hash": "25ae3760aa7de266",
     "messages": [
       {
         "session": "00000000-0000-0000-0000-00000000000a",
@@ -172,6 +403,7 @@
                   "input": {
                     "command": "original harmless input"
                   },
+                  "invoke": null,
                   "tool": "bash"
                 }
               },
@@ -334,7 +566,7 @@
       "{\"call\":4,\"epoch\":0,\"for\":1,\"kind\":\"model_result\",\"outcome\":{\"output\":{\"message\":{\"content\":[{\"text\":\"Only lists files.\",\"type\":\"text\"}]}},\"status\":\"done\"},\"seq\":5,\"t\":\"entry\"}",
       "{\"seq\":5,\"t\":\"synced\"}"
     ],
-    "hash": "41658f7366c6e4fc",
+    "hash": "ee9c9dc92d20b0b5",
     "messages": [
       {
         "session": "00000000-0000-0000-0000-00000000000a",
@@ -518,6 +750,7 @@
                   "input": {
                     "command": "original harmless input"
                   },
+                  "invoke": null,
                   "tool": "edit"
                 }
               },
@@ -690,7 +923,7 @@
       "{\"call\":3,\"epoch\":0,\"for\":1,\"kind\":\"model_result\",\"outcome\":{\"output\":{\"message\":{\"content\":[{\"text\":\"Lists files in the current directory.\",\"type\":\"text\"}]}},\"status\":\"done\"},\"seq\":4,\"t\":\"entry\"}",
       "{\"seq\":4,\"t\":\"synced\"}"
     ],
-    "hash": "fccaa509bac67d1e",
+    "hash": "d5867216e70363e7",
     "messages": [
       {
         "session": "00000000-0000-0000-0000-00000000000a",
@@ -817,6 +1050,7 @@
                   "input": {
                     "command": "ls"
                   },
+                  "invoke": null,
                   "tool": "bash"
                 }
               },
@@ -2563,11 +2797,11 @@
       "{\"seq\":2,\"t\":\"synced\"}",
       "{\"call\":2,\"t\":\"delta\",\"text\":\"thinking\"}",
       "{\"session\":\"00000000-0000-0000-0000-00000000000a\",\"t\":\"attached\",\"workspace\":\"/w\"}",
-      "{\"items\":[{\"seq\":1,\"text\":\"one\",\"type\":\"user\"},{\"call\":2,\"model\":\"m\",\"status\":{\"status\":\"running\"},\"text\":\"\",\"type\":\"reply\",\"usage\":null},{\"call\":3,\"input\":{\"command\":\"echo hi\"},\"outcome\":null,\"phase\":{\"waiting\":{\"on\":\"approval\"}},\"reason\":{\"mode\":{\"mode\":\"ask\"}},\"tool\":\"bash\",\"type\":\"tool\"}],\"ledger\":{\"acknowledgements\":[],\"armed\":[],\"background\":[],\"clients\":[],\"context\":false,\"env\":null,\"extensions\":null,\"links\":[],\"open\":[[2,{\"call\":{\"model\":{\"attempt\":0,\"choice\":\"auto\"}},\"phase\":\"running\"}],[3,{\"call\":{\"tool\":{\"by\":\"model\",\"input\":{\"command\":\"echo hi\"},\"tool\":\"bash\"}},\"phase\":{\"waiting\":{\"on\":\"approval\"}}}]],\"outbox\":[],\"received\":[],\"seq\":4,\"turn\":1,\"untaken\":[],\"watched\":[]},\"seq\":4,\"session\":\"00000000-0000-0000-0000-00000000000a\",\"t\":\"snapshot\",\"workspace\":\"/w\"}",
+      "{\"items\":[{\"seq\":1,\"text\":\"one\",\"type\":\"user\"},{\"call\":2,\"model\":\"m\",\"status\":{\"status\":\"running\"},\"text\":\"\",\"type\":\"reply\",\"usage\":null},{\"call\":3,\"input\":{\"command\":\"echo hi\"},\"outcome\":null,\"phase\":{\"waiting\":{\"on\":\"approval\"}},\"reason\":{\"mode\":{\"mode\":\"ask\"}},\"tool\":\"bash\",\"type\":\"tool\"}],\"ledger\":{\"acknowledgements\":[],\"armed\":[],\"background\":[],\"clients\":[],\"context\":false,\"env\":null,\"extensions\":null,\"links\":[],\"open\":[[2,{\"call\":{\"model\":{\"attempt\":0,\"choice\":\"auto\"}},\"phase\":\"running\"}],[3,{\"call\":{\"tool\":{\"by\":\"model\",\"input\":{\"command\":\"echo hi\"},\"invoke\":null,\"tool\":\"bash\"}},\"phase\":{\"waiting\":{\"on\":\"approval\"}}}]],\"outbox\":[],\"received\":[],\"seq\":4,\"turn\":1,\"untaken\":[],\"watched\":[]},\"seq\":4,\"session\":\"00000000-0000-0000-0000-00000000000a\",\"t\":\"snapshot\",\"workspace\":\"/w\"}",
       "{\"seq\":4,\"t\":\"synced\"}",
       "{\"epoch\":0,\"kind\":\"assistant\",\"seq\":5,\"t\":\"entry\",\"text\":\"done\"}"
     ],
-    "hash": "0bcd53cc9665ac47",
+    "hash": "7e562cff872975b2",
     "messages": [
       {
         "session": "00000000-0000-0000-0000-00000000000a",
@@ -2671,6 +2905,7 @@
                     "input": {
                       "command": "echo hi"
                     },
+                    "invoke": null,
                     "tool": "bash"
                   }
                 },
@@ -2780,6 +3015,7 @@
                   "input": {
                     "command": "echo hi"
                   },
+                  "invoke": null,
                   "tool": "bash"
                 }
               },
@@ -2954,7 +3190,7 @@
       "{\"epoch\":0,\"kind\":\"assistant\",\"seq\":29,\"t\":\"entry\",\"text\":\"a38\"}",
       "{\"cwd\":\"/w1\",\"epoch\":0,\"kind\":\"environment\",\"seq\":30,\"t\":\"entry\",\"tty\":false,\"vars\":{}}"
     ],
-    "hash": "32b2d064d66ff86e",
+    "hash": "47dda30ec1f843ef",
     "messages": [
       {
         "session": "00000000-0000-0000-0000-00000000000a",
@@ -3581,6 +3817,7 @@
                   "input": {
                     "command": "echo 3"
                   },
+                  "invoke": null,
                   "tool": "bash"
                 }
               },
@@ -4525,7 +4762,7 @@
       "{\"call\":4,\"epoch\":0,\"for\":1,\"kind\":\"model_result\",\"outcome\":{\"output\":{\"message\":{\"content\":[{\"text\":\"Only lists files.\",\"type\":\"text\"}]}},\"status\":\"done\"},\"seq\":5,\"t\":\"entry\"}",
       "{\"seq\":5,\"t\":\"synced\"}"
     ],
-    "hash": "9d3d2f19a2d6d611",
+    "hash": "15b615a4b71d7e20",
     "messages": [
       {
         "session": "00000000-0000-0000-0000-00000000000a",
@@ -4686,6 +4923,7 @@
                   "input": {
                     "command": "original harmless input"
                   },
+                  "invoke": null,
                   "tool": "bash"
                 }
               },
@@ -4846,7 +5084,7 @@
       "{\"call\":4,\"epoch\":0,\"for\":1,\"kind\":\"model_result\",\"outcome\":{\"output\":{\"message\":{\"content\":[{\"text\":\"Only lists files.\",\"type\":\"text\"}]}},\"status\":\"done\"},\"seq\":5,\"t\":\"entry\"}",
       "{\"seq\":5,\"t\":\"synced\"}"
     ],
-    "hash": "3f9179b1d8d95f1a",
+    "hash": "fe5a6e51bc49a4a7",
     "messages": [
       {
         "session": "00000000-0000-0000-0000-00000000000a",
@@ -5029,6 +5267,7 @@
                   "input": {
                     "command": "original harmless input"
                   },
+                  "invoke": null,
                   "tool": "edit"
                 }
               },

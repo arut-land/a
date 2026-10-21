@@ -21,7 +21,7 @@ pub(super) struct WorkHandle<K = WorkId> {
     pub(super) fence: u64,
     pub(super) admission: Admission,
     pub(super) cancel: Cancel,
-    ended: Flag,
+    pub(super) ended: Flag,
 }
 
 impl<K> WorkHandle<K> {

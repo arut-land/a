@@ -24,6 +24,20 @@ impl Actor {
             view.extend(entries);
         }
         for (e, line) in entries.iter().zip(lines.lines()) {
+            if let Body::ToolResult {
+                call,
+                outcome,
+                card,
+            } = &e.body
+                && let Some(waiters) = self.replies.invoked.remove(call)
+            {
+                for waiter in waiters {
+                    waiter.send(super::Called {
+                        outcome: outcome.clone(),
+                        card: card.clone(),
+                    });
+                }
+            }
             if let Body::ModelResult {
                 call,
                 outcome,
@@ -116,7 +130,7 @@ impl Actor {
             }
             if let Body::ToolResult { call, .. } | Body::ModelResult { call, .. } = &e.body {
                 self.inflight.remove(call);
-                session.forget(*call);
+                session.cancelled(*call);
                 self.bound.settled(*call);
             }
         }

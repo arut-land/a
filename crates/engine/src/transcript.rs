@@ -392,6 +392,7 @@ mod tests {
             entry(
                 4,
                 Body::ToolCall {
+                    invoke: None,
                     tool: "task".into(),
                     input: Json::null(),
                     id: Some("pending".into()),
@@ -486,6 +487,7 @@ mod tests {
             entry(
                 2,
                 Body::ToolCall {
+                    invoke: None,
                     tool: "task".into(),
                     input: Json::null(),
                     id: Some("complete".into()),
@@ -506,6 +508,7 @@ mod tests {
             entry(
                 4,
                 Body::ToolCall {
+                    invoke: None,
                     tool: "task".into(),
                     input: Json::null(),
                     id: Some("pending".into()),

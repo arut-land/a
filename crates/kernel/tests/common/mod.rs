@@ -915,6 +915,7 @@ pub fn said(text: &str) -> Body {
 
 pub fn tool_call(tool: &str, input: Value) -> Body {
     Body::ToolCall {
+        invoke: None,
         tool: tool.to_owned(),
         input: Json::encode(&input).unwrap(),
         id: None,

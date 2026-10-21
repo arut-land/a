@@ -126,6 +126,13 @@ impl Barriers {
 /// What happened, as the driver tells the kernel.
 #[derive(Debug)]
 pub enum Event {
+    Invoke {
+        parent: CallId,
+        name: String,
+        tool: String,
+        input: Json,
+        ticket: Ticket,
+    },
     /// Input from a client: started at once with nothing to wait for,
     /// otherwise queued. A `Steer` goes to the running turn before its next
     /// model call.
@@ -292,7 +299,7 @@ pub enum Note {
 
 /// A client's request, numbered by the driver so the reply finds it. Never
 /// logged.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct Ticket(pub u64);
 
 /// The prefix an effect depends on, independently of its current step's appends.
@@ -305,6 +312,10 @@ pub struct Admission {
 /// What the driver is to do.
 #[derive(Debug, PartialEq)]
 pub enum Work {
+    Invocation {
+        ticket: Ticket,
+        result: Result<CallId, String>,
+    },
     /// Answer request `ticket`, once what it logged is committed.
     Reply {
         ticket: Ticket,
@@ -384,18 +395,8 @@ impl Work {
     /// Whether carrying it out starts work: what a session that is
     /// stopping leaves in its log for the next load.
     pub const fn starts(&self) -> bool {
-        matches!(
-            self,
-            Self::Prepare { .. }
-                | Self::Send { .. }
-                | Self::RunTool { .. }
-                | Self::Resume { .. }
-                | Self::Await { .. }
-                | Self::Recover { .. }
-                | Self::Sleep { .. }
-                | Self::StartChild { .. }
-                | Self::Deliver { .. }
-        )
+        self.starts_call().is_some()
+            || matches!(self, Self::StartChild { .. } | Self::Deliver { .. })
     }
 
     /// The call whose work carrying it out starts, if it starts a call's.
@@ -416,15 +417,7 @@ impl Work {
     /// an owner answered, a child told, a process killed): what the entries
     /// before it must be durable ahead of.
     pub const fn external(&self) -> bool {
-        self.starts()
-            || matches!(
-                self,
-                Self::Reply { .. }
-                    | Self::Side { .. }
-                    | Self::Interrupt { .. }
-                    | Self::Report { .. }
-                    | Self::Kill { .. }
-            )
+        !matches!(self, Self::Cancel { .. } | Self::MarkBusy(_))
     }
 }
 
@@ -464,6 +457,9 @@ pub enum ModelPhase {
 /// Where an open tool call stands, as the kernel drives it.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Step {
+    Queued {
+        recovered: bool,
+    },
     /// Its gate answers later. The first `skip` of the decisions it gives
     /// are logged already; `resumed`, it was gated before a restart and
     /// may have run, so an unsafe one is not run again.

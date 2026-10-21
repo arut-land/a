@@ -125,7 +125,6 @@ pub struct Cx {
     pub cancel: Cancel,
     services: Arc<Services>,
     host: Arc<dyn Host>,
-    delegated: u8,
 }
 
 impl Cx {
@@ -150,7 +149,6 @@ impl Cx {
             cancel,
             services,
             host,
-            delegated: 0,
         }
     }
 
@@ -249,35 +247,18 @@ impl Cx {
         }
     }
 
-    /// Runs a delegated tool through this generation's policy. An ask
-    /// without an extension's approval remains refused; delegation cannot
-    /// grant itself a permission the outer call did not have.
-    pub async fn invoke(&self, tool: &str, input: &Json) -> Called {
-        use crate::{Gate, Gating};
-        if self.delegated >= 8 {
-            return Called::failed("tool delegation is too deep".into());
-        }
-        let mut child = self.clone();
-        child.delegated += 1;
-        let registry = self.host.registry();
-        let gated = match registry.hooks().gate(&self.point(), tool, input) {
-            Gating::Now(gated) => gated,
-            Gating::Approving(_) => return Called::failed("delegated tool needs approval".into()),
-        };
-        match gated.gate {
-            Gate::Run => {
-                let called = registry.tools().run(tool, &gated.input, None, &child).await;
-                Called {
-                    outcome: registry
-                        .hooks()
-                        .post_tool(&child.point(), (tool, &gated.input), called.outcome)
-                        .value,
-                    card: called.card,
-                }
-            }
-            Gate::Ask => Called::failed("delegated tool needs approval".into()),
-            Gate::Refuse(why) => Called::failed(why),
-        }
+    /// Names are unique within this call and reuse their durable result on replay.
+    /// An exclusive callee requires an exclusive outer owner; each callee's
+    /// own replay and concurrency contracts govern its admission.
+    pub async fn invoke(&self, name: &str, tool: &str, input: &Json) -> Called {
+        Arc::clone(&self.host)
+            .invoke(
+                self.clone(),
+                name.to_owned(),
+                tool.to_owned(),
+                input.clone(),
+            )
+            .await
     }
 
     /// Changes what the model sees from here on: the log's entries
@@ -441,7 +422,7 @@ impl fmt::Debug for Parsed {
 }
 
 /// How a call ended: its outcome, and how clients show it.
-#[derive(Debug, PartialEq)]
+#[derive(Clone, Debug, PartialEq)]
 pub struct Called {
     pub outcome: Outcome,
     pub card: Option<Card>,

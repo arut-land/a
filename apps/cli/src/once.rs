@@ -422,6 +422,7 @@ mod tests {
                 origin: None,
             },
             Body::ToolCall {
+                invoke: None,
                 tool: "sleep".into(),
                 input: Json::encode(&0).unwrap(),
                 id: None,

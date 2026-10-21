@@ -690,7 +690,6 @@ struct Call {
     cx: std::sync::Weak<Cx>,
     owner: Name,
     grants: Arc<[String]>,
-    tool: String,
     quota: Arc<Quota>,
 }
 struct ActiveCall {
@@ -769,14 +768,14 @@ impl Callbacks {
             Ok(cx.published_erased(&format!("lua:{}", data.owner), &key))
         })?;
         let invokes = Arc::clone(&calls);
-        let invoke =
-            lua.create_async_function(move |lua, (id, name, value): (u64, String, Value)| {
+        let invoke = lua.create_async_function(
+            move |lua, (id, name, tool, value): (u64, String, String, Value)| {
                 let data = locked(&invokes).get(&id).cloned();
                 async move {
                     let data = data.ok_or_else(|| mlua::Error::runtime("call context expired"))?;
-                    if name == data.tool || !data.grants.contains(&name) {
+                    if !data.grants.contains(&tool) {
                         return Err(mlua::Error::runtime(format!(
-                            "tool capability {name} is not granted"
+                            "tool capability {tool} is not granted"
                         )));
                     }
                     let cx = data
@@ -785,7 +784,7 @@ impl Callbacks {
                         .ok_or_else(|| mlua::Error::runtime("call context expired"))?;
                     let input = encode(&value)?;
                     data.quota.take(input.raw().len())?;
-                    match cx.invoke(&name, &input).await.outcome {
+                    match cx.invoke(&name, &tool, &input).await.outcome {
                         Outcome::Done { output } => decode(&lua, &output),
                         Outcome::Failed { error } => Err(mlua::Error::runtime(error)),
                         Outcome::Interrupted { .. } => {
@@ -793,7 +792,8 @@ impl Callbacks {
                         }
                     }
                 }
-            })?;
+            },
+        )?;
         Ok(Self {
             calls,
             next: Arc::new(AtomicU64::new(0)),
@@ -850,7 +850,6 @@ impl LuaTool {
                 cx: Arc::downgrade(&call),
                 owner: Arc::clone(&self.owner),
                 grants: Arc::clone(&self.grants),
-                tool: self.name.clone(),
                 quota: Arc::clone(&quota),
             },
         );
@@ -1219,7 +1218,7 @@ mod tests {
         let rig = Rig::new(
             "lua-delegated-limits",
             registry(
-                &tool("cx.tool('complex',input); return true"),
+                &tool("cx.tool('complex','complex',input); return true"),
                 &["complex".into()],
             )
             .with(&ComplexResult)
@@ -1291,7 +1290,7 @@ mod tests {
     fn cancelling_a_suspended_call_releases_its_host_handle() {
         let module = Mod::load(
             "cancel",
-            &tool("return cx.tool('wait',{})"),
+            &tool("return cx.tool('wait','wait',{})"),
             &["wait".into()],
             Limits::default(),
         )
@@ -1339,7 +1338,7 @@ mod tests {
 
     #[test]
     fn delegated_effects_require_a_capability_and_policy_and_yield_to_the_runtime() {
-        let source = tool("return cx.tool('wait',{args=''})");
+        let source = tool("return cx.tool('wait','wait',{args=''})");
         let denied = Rig::new(
             "lua-no-grant",
             registry(&source, &[]).with(&Service(false)).unwrap(),

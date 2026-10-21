@@ -7,8 +7,7 @@ impl Actor {
         &mut self,
         reply: oneshot::Sender<Result<(), InboxRefusal>>,
     ) -> Ticket {
-        self.tickets += 1;
-        let ticket = Ticket(self.tickets);
+        let ticket = self.ticket();
         self.replies.deliveries.insert(ticket, reply);
         ticket
     }
@@ -72,7 +71,7 @@ impl Own {
             if !self.1.current(&session) {
                 return Err(InboxRefusal::Interrupted);
             }
-            let envelope = message.envelope(session.id, self.1.call);
+            let envelope = message.envelope(session.id, self.1.id);
             let (reply, result) = oneshot::channel();
             self.1
                 .send(&session, ContextRequest::Send { envelope, reply });

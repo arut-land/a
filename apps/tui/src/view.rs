@@ -401,6 +401,7 @@ mod tests {
 
     fn tool(outcome: Option<Outcome>, phase: Phase) -> Item {
         Item::Tool {
+            invoke: None,
             call: CallId::new(7).unwrap(),
             tool: "bash".into(),
             input: Json::encode(&json!({"command": "ls"})).unwrap(),
@@ -574,6 +575,7 @@ mod tests {
     #[test]
     fn an_edit_card_shows_its_diff() {
         let item = Item::Tool {
+            invoke: None,
             call: CallId::new(7).unwrap(),
             tool: "edit".into(),
             input: Json::encode(&json!({"path": "a.txt", "edits": []})).unwrap(),
@@ -607,6 +609,7 @@ mod tests {
     #[test]
     fn a_slash_command_shows_as_a_card() {
         let mut item = Item::Tool {
+            invoke: None,
             call: CallId::new(4).unwrap(),
             tool: "model".into(),
             input: Json::encode(&serde_json::json!({ "args": "" })).unwrap(),

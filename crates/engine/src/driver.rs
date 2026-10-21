@@ -10,6 +10,7 @@
 
 use std::any::Any;
 use std::cell::RefCell;
+use std::collections::BTreeMap;
 use std::future::{Future, poll_fn};
 use std::io;
 use std::panic::{AssertUnwindSafe, catch_unwind};
@@ -320,6 +321,10 @@ pub enum Request {
 
 enum Completion {
     Event(Event),
+    Tool {
+        call: CallId,
+        called: Called,
+    },
     DeliveryLost {
         ticket: Option<Ticket>,
     },
@@ -380,14 +385,7 @@ enum Msg {
     Position(oneshot::Sender<(u64, u64)>),
 }
 
-/// Context authority stays bound to its call and generation even after
-/// settlement removes that call from the session's cancellation map.
-#[derive(Clone)]
-struct ContextOrigin {
-    fence: u64,
-    call: CallId,
-    cancel: Cancel,
-}
+type ContextOrigin = WorkHandle<CallId>;
 
 impl ContextOrigin {
     fn current(&self, session: &Session) -> bool {
@@ -398,27 +396,6 @@ impl ContextOrigin {
         let _ = session.mail.send(Msg::Context {
             origin: self.clone(),
             request,
-        });
-    }
-}
-
-/// A terminal result belongs to the admitted call, not its revocable context.
-/// Consuming this capability sends at most one result in its generation.
-struct ToolSettlement {
-    call: CallId,
-    fence: u64,
-    mail: Mail,
-}
-
-impl ToolSettlement {
-    fn finish(self, called: Called) {
-        let _ = self.mail.send(Msg::Completed {
-            fence: self.fence,
-            completion: Completion::Event(Event::ToolDone {
-                call: self.call,
-                outcome: called.outcome,
-                card: called.card,
-            }),
         });
     }
 }
@@ -434,6 +411,12 @@ struct PendingSide {
 }
 
 enum ContextRequest {
+    Invoke {
+        name: String,
+        tool: String,
+        input: Json,
+        reply: oneshot::Sender<Called>,
+    },
     Send {
         envelope: protocol::Envelope,
         reply: oneshot::Sender<Result<(), protocol::InboxRefusal>>,
@@ -579,13 +562,13 @@ impl Live {
             bound,
             source,
             generation,
-            inflight: Keyed::default(),
+            inflight: BTreeMap::default(),
             replies: Replies::default(),
             transport_active: false,
             delivery_queue: std::collections::VecDeque::new(),
             detached: Vec::new(),
-            sides: Keyed::default(),
-            side_waiters: Keyed::default(),
+            sides: BTreeMap::default(),
+            side_waiters: BTreeMap::default(),
             waiting_sides: Vec::new(),
             tickets: 0,
             phase: Phase::Serving,
@@ -597,12 +580,8 @@ impl Live {
                 fold_snapshot,
                 ordered_seq: loaded.seq,
                 durable_seq: loaded.seq,
-                flushes: Vec::new(),
-                unsynced: Vec::new(),
-                waiting_sync: Vec::new(),
-                waiting_mutations: Vec::new(),
-                sync_armed: false,
                 since_snapshot: loaded.read,
+                ..Journal::default()
             },
             projection: Projection::default(),
         };
@@ -863,15 +842,15 @@ struct Actor {
     source: Option<Arc<dyn ext::host::Generations>>,
     generation: u64,
 
-    inflight: Keyed<CallId, InFlight>,
+    inflight: BTreeMap<CallId, InFlight>,
 
     replies: Replies,
-    side_waiters: Keyed<CallId, Vec<oneshot::Sender<Opened>>>,
+    side_waiters: BTreeMap<CallId, Vec<oneshot::Sender<Opened>>>,
     detached: Vec<(
         SessionId,
         oneshot::Sender<Result<ext::ConversationHandle, ext::SpawnRefusal>>,
     )>,
-    sides: Keyed<Ticket, PendingSide>,
+    sides: BTreeMap<Ticket, PendingSide>,
     transport_active: bool,
     delivery_queue: std::collections::VecDeque<(protocol::Envelope, Option<Ticket>)>,
 
@@ -895,15 +874,27 @@ struct Actor {
 
 #[derive(Default)]
 struct Replies {
-    clients: Keyed<Ticket, oneshot::Sender<Result<(), String>>>,
-    deliveries: Keyed<Ticket, oneshot::Sender<Result<(), protocol::InboxRefusal>>>,
+    invocations: BTreeMap<Ticket, oneshot::Sender<Called>>,
+    invoked: BTreeMap<CallId, Vec<oneshot::Sender<Called>>>,
+    clients: BTreeMap<Ticket, oneshot::Sender<Result<(), String>>>,
+    deliveries: BTreeMap<Ticket, oneshot::Sender<Result<(), protocol::InboxRefusal>>>,
 }
 
 impl Drop for Replies {
     fn drop(&mut self) {
-        for (_, reply) in self.deliveries.0.drain(..) {
+        for (_, reply) in std::mem::take(&mut self.deliveries) {
             reply.send(Err(protocol::InboxRefusal::Interrupted));
         }
+    }
+}
+
+fn respond<T: Send + 'static>(
+    pending: &mut BTreeMap<Ticket, oneshot::Sender<T>>,
+    ticket: Ticket,
+    result: T,
+) {
+    if let Some(reply) = pending.remove(&ticket) {
+        reply.send(result);
     }
 }
 
@@ -1218,6 +1209,11 @@ impl Actor {
                 }
                 match completion {
                     Completion::Event(event) => event,
+                    Completion::Tool { call, called } => Event::ToolDone {
+                        call,
+                        outcome: called.outcome,
+                        card: called.card,
+                    },
                     Completion::DeliveryLost { ticket } => {
                         self.transport_active = false;
                         if let Some(reply) = ticket.and_then(|t| self.replies.deliveries.remove(&t))
@@ -1322,8 +1318,27 @@ impl Actor {
                 return None;
             }
         }
-        let call = origin.call;
+        let call = origin.id;
         match request {
+            ContextRequest::Invoke {
+                name,
+                tool,
+                input,
+                reply,
+            } => {
+                let ticket = self.ticket();
+                self.replies.invocations.insert(ticket, reply);
+                Some((
+                    Event::Invoke {
+                        parent: call,
+                        name,
+                        tool,
+                        input,
+                        ticket,
+                    },
+                    None,
+                ))
+            }
             ContextRequest::Send { envelope, reply } => {
                 let children: Vec<_> = self.core.ledger().links().iter().map(|l| l.child).collect();
                 let allowed = envelope.id.sender == self.live.id
@@ -1367,13 +1382,9 @@ impl Actor {
             ContextRequest::Own { pgid, ended } => {
                 lock(&session.jobs).push(pgid);
                 let session = Arc::clone(&session);
-                self.live.session.spawn_work(
-                    WorkId::Job(pgid),
-                    Admission {
-                        through: self.journal.ordered_seq,
-                        requirement: Requirement::Ordered,
-                    },
-                    |cancel| {
+                self.live
+                    .session
+                    .spawn_work(WorkId::Job(pgid), origin.admission, |cancel| {
                         Box::pin(async move {
                             let mut ended = pin!(ended);
                             if unless(&cancel, &mut ended).await.is_none() {
@@ -1386,8 +1397,7 @@ impl Actor {
                                 daemon.jobs.notify();
                             }
                         })
-                    },
-                );
+                    });
                 None
             }
         }
@@ -1411,9 +1421,9 @@ impl Actor {
         origin: Option<Author>,
         reply: oneshot::Sender<Result<(), String>>,
     ) -> Event {
-        self.tickets += 1;
-        let ticket = Some(Ticket(self.tickets));
-        self.replies.clients.insert(Ticket(self.tickets), reply);
+        let ticket = self.ticket();
+        self.replies.clients.insert(ticket, reply);
+        let ticket = Some(ticket);
         match request {
             Request::Input { text, mode } => Event::Input {
                 text,
@@ -1561,7 +1571,7 @@ impl Actor {
                     pending.cancel.clone(),
                 );
                 if pending.while_waiting {
-                    self.waiting_sides.push((pending.origin.call, *id));
+                    self.waiting_sides.push((pending.origin.id, *id));
                 }
             }
         }
@@ -1726,7 +1736,7 @@ impl Actor {
         eprintln!("session {}: {why}", self.live.id.short());
         for effect in rest {
             if let Effect::Reply { ticket, .. } = effect {
-                self.reply(ticket, Err(why.clone()));
+                respond(&mut self.replies.clients, ticket, Err(why.clone()));
             }
         }
         // Its log takes nothing: the session stops, and loads again when
@@ -1792,10 +1802,10 @@ impl Actor {
         self.live
             .has_input
             .store(folding.has_input, Ordering::SeqCst);
-        self.projection.transcript = None;
-        self.projection.replied = None;
-        self.projection.snapshot = None;
-        self.projection.view = None;
+        self.projection = Projection {
+            published_activity: self.projection.published_activity.take(),
+            ..Projection::default()
+        };
         let after = self.live.frames.seq();
         let entries = match rt::unblock(&*self.live.session.shared.rt, move || {
             recovered.entries_after(after)
@@ -1869,101 +1879,106 @@ impl Actor {
         self.journal.writer.take();
     }
 
-    fn effect(&mut self, effect: Effect) -> BoxFuture<'_, ()> {
-        Box::pin(async move {
-            let shared = Arc::clone(&self.live.session.shared);
-            // A stopping session starts nothing: what it would have started is
-            // in the log, for its next load.
-            if self.phase == Phase::Draining && effect.starts() {
-                return;
-            }
-            match effect {
-                Effect::Delivery { ticket, result } => {
-                    if let Some(reply) = self.replies.deliveries.remove(&ticket) {
-                        reply.send(result);
-                    }
-                }
-                Effect::Deliver { envelope, ticket } => self.deliver(envelope, ticket),
-                Effect::Reply { ticket, result } => self.reply(ticket, result),
-                Effect::Side { ticket, side } => self.admit_side(ticket, side).await,
-                Effect::Prepare {
-                    call,
-                    attempt,
-                    choice,
-                } => self.prepare(call, attempt, choice).await,
-                Effect::Send { call } => self.send(call),
-                Effect::RunTool { call, tool, input } => {
-                    self.run_tool(call, tool, input, Child::None);
-                }
-                Effect::Resume {
-                    call,
-                    tool,
-                    input,
-                    value,
-                } => self.resume_tool(call, tool, input, value),
-                Effect::Await { call, answer } => {
-                    let gated = self.cancellable(call, answer.0);
-                    self.later(gated, move |gated| Event::Gated { call, gated });
-                }
-                Effect::Recover { call, answer } => {
-                    let recovered = self.cancellable(call, answer.0);
-                    self.later(recovered, move |recovered| Event::Recovered {
-                        call,
-                        recovered,
-                    });
-                }
-                Effect::Sleep { call, after } => {
-                    let slept = self.cancellable(call, shared.rt.sleep(after));
-                    self.later(slept, move |()| Event::Woke { call });
-                }
-                Effect::Cancel { call } => {
-                    self.inflight.remove(&call);
-                    self.live.session.cancelled(call);
-                    self.sides.0.retain(|(_, side)| side.origin.call != call);
-                    for (side, open) in self.core.ledger().open_calls() {
-                        if open.call == (protocol::ledger::Call::Side { of: call }) {
-                            self.live.session.cancelled(side);
+    async fn effect(&mut self, effect: Effect) {
+        let shared = Arc::clone(&self.live.session.shared);
+        // A stopping session starts nothing: what it would have started is
+        // in the log, for its next load.
+        if self.phase == Phase::Draining && effect.starts() {
+            return;
+        }
+        match effect {
+            Effect::Invocation { ticket, result } => {
+                if let Some(reply) = self.replies.invocations.remove(&ticket) {
+                    match result {
+                        Ok(call) => {
+                            if let Some(result) = self.core.invocation_result(call) {
+                                reply.send(result.clone());
+                            } else {
+                                self.replies.invoked.entry(call).or_default().push(reply);
+                            }
                         }
+                        Err(error) => reply.send(Called::failed(error)),
                     }
-                }
-                Effect::StartChild { link, child, input } => self.start_child(link, child, input),
-                Effect::Interrupt { child } => {
-                    lock(&self.live.session.work).cancel(&WorkId::Child(child));
-                    if let Some(daemon) = shared.daemon.upgrade() {
-                        daemon.interrupt(child);
-                    }
-                }
-                Effect::Report { outcome } => {
-                    if let (Some(parent), Some(daemon)) =
-                        (self.live.parent, shared.daemon.upgrade())
-                    {
-                        let child = self.live.id;
-                        self.live.session.spawn_work(
-                            WorkId::Report(child),
-                            Admission {
-                                through: self.journal.durable_seq,
-                                requirement: Requirement::Durable,
-                            },
-                            |cancel| {
-                                Box::pin(async move {
-                                    unless(&cancel, daemon.report(parent.session, child, outcome))
-                                        .await;
-                                })
-                            },
-                        );
-                    }
-                }
-                Effect::Kill { pgid } => {
-                    let _ = sys::Group(pgid).kill();
-                }
-                Effect::MarkBusy(busy) => {
-                    self.live.busy.store(busy, Ordering::SeqCst);
-                    let how = if busy { "busy" } else { "settled" };
-                    crate::session_event(how, self.live.id, String::new);
-                    self.live.touch();
                 }
             }
-        })
+            Effect::Delivery { ticket, result } => {
+                respond(&mut self.replies.deliveries, ticket, result);
+            }
+            Effect::Deliver { envelope, ticket } => self.deliver(envelope, ticket),
+            Effect::Reply { ticket, result } => respond(&mut self.replies.clients, ticket, result),
+            Effect::Side { ticket, side } => self.admit_side(ticket, side).await,
+            Effect::Prepare {
+                call,
+                attempt,
+                choice,
+            } => self.prepare(call, attempt, choice).await,
+            Effect::Send { call } => self.send(call),
+            Effect::RunTool { call, tool, input } => {
+                self.run_tool(call, tool, input, Child::None);
+            }
+            Effect::Resume {
+                call,
+                tool,
+                input,
+                value,
+            } => self.resume_tool(call, tool, input, value),
+            Effect::Await { call, answer } => {
+                self.later(call, answer.0, move |gated| Event::Gated { call, gated });
+            }
+            Effect::Recover { call, answer } => {
+                self.later(call, answer.0, move |recovered| Event::Recovered {
+                    call,
+                    recovered,
+                });
+            }
+            Effect::Sleep { call, after } => {
+                self.later(call, shared.rt.sleep(after), move |()| Event::Woke { call });
+            }
+            Effect::Cancel { call } => {
+                self.inflight.remove(&call);
+                self.live.session.cancelled(call);
+                self.sides.retain(|_, side| side.origin.id != call);
+                for (side, open) in self.core.ledger().open_calls() {
+                    if open.call == (protocol::ledger::Call::Side { of: call }) {
+                        self.live.session.cancelled(side);
+                    }
+                }
+            }
+            Effect::StartChild { link, child, input } => self.start_child(link, child, input),
+            Effect::Interrupt { child } => {
+                lock(&self.live.session.work).cancel(&WorkId::Child(child));
+                if let Some(daemon) = shared.daemon.upgrade() {
+                    daemon.interrupt(child);
+                }
+            }
+            Effect::Report { outcome } => {
+                if let (Some(parent), Some(daemon)) = (self.live.parent, shared.daemon.upgrade()) {
+                    let child = self.live.id;
+                    self.live.session.spawn_work(
+                        WorkId::Report(child),
+                        Admission {
+                            through: self.journal.durable_seq,
+                            requirement: Requirement::Durable,
+                        },
+                        |cancel| {
+                            Box::pin(async move {
+                                unless(&cancel, daemon.report(parent.session, child, outcome))
+                                    .await;
+                            })
+                        },
+                    );
+                }
+            }
+            Effect::Kill { pgid } => {
+                let _ = sys::Group(pgid).kill();
+            }
+            Effect::MarkBusy(busy) => {
+                self.live.busy.store(busy, Ordering::SeqCst);
+                let how = if busy { "busy" } else { "settled" };
+                crate::session_event(how, self.live.id, String::new);
+                self.live.touch();
+            }
+        }
     }
 
     fn resume_tool(&mut self, call: CallId, tool: String, input: Json, value: Json) {
@@ -2099,38 +2114,27 @@ impl Actor {
         }
     }
 
-    fn reply(&mut self, ticket: Ticket, result: Result<(), String>) {
-        if let Some(reply) = self.replies.clients.remove(&ticket) {
-            reply.send(result);
-        }
+    fn ticket(&mut self) -> Ticket {
+        self.tickets += 1;
+        Ticket(self.tickets)
     }
 
-    fn cancellable<T: Send + 'static>(
+    fn later<T: Send + 'static>(
         &mut self,
         call: CallId,
         work: impl Future<Output = T> + Send + 'static,
-    ) -> impl Future<Output = Option<T>> + Send + 'static {
-        let cancel = self.live.session.cancel(call);
-        self.inflight.insert(call, InFlight::Later);
-        async move { unless(&cancel, work).await }
-    }
-
-    /// Steps the event `then` makes of what `work` yields, unless it was
-    /// cancelled.
-    fn later<T: Send + 'static>(
-        &self,
-        work: impl Future<Output = Option<T>> + Send + 'static,
         then: impl FnOnce(T) -> Event + Send + 'static,
     ) {
-        let mail = Arc::clone(&self.live.session.mail);
-        let fence = self.live.session.fence.load(Ordering::SeqCst);
-        self.live.session.shared.rt.spawn(Box::pin(async move {
-            if let Some(done) = work.await {
-                let _ = mail.send(Msg::Completed {
-                    fence,
-                    completion: Completion::Event(then(done)),
-                });
+        let session = Arc::clone(&self.live.session);
+        let handle = session
+            .origin(call, session.fence.load(Ordering::SeqCst))
+            .expect("actor generation");
+        self.inflight.insert(call, InFlight::Later);
+        Arc::clone(&session.shared.rt).spawn(Box::pin(async move {
+            if let Some(done) = unless(&handle.cancel, work).await {
+                session.emit(handle.fence, Completion::Event(then(done)));
             }
+            handle.ended.set();
         }));
     }
 
@@ -2245,11 +2249,7 @@ impl Actor {
             .origin(call, fence)
             .expect("actor generation");
         let cx = self.live.session.cx(origin, &registry);
-        let settlement = ToolSettlement {
-            call,
-            fence,
-            mail: Arc::clone(&self.live.session.mail),
-        };
+        let session = Arc::clone(&self.live.session);
         let id = self.live.id;
         let handle = lock(&self.live.session.work)
             .get(&WorkId::Call(call))
@@ -2261,18 +2261,17 @@ impl Actor {
             .rt
             .spawn(Box::pin(handle.run(async move {
                 let began = crate::stamp();
-                let Called { outcome, card } =
-                    contain(registry.tools().run(&tool, &input, parsed, &cx)).await;
+                let called = contain(registry.tools().run(&tool, &input, parsed, &cx)).await;
                 crate::session_event("effect", id, || {
                     let elapsed = began.map_or(std::time::Duration::ZERO, |t| t.elapsed());
-                    let how = match &outcome {
+                    let how = match &called.outcome {
                         Outcome::Done { .. } => "done",
                         Outcome::Failed { .. } => "failed",
                         Outcome::Interrupted { .. } => "interrupted",
                     };
                     format!("{tool} call {call}: {how} in {elapsed:?}")
                 });
-                settlement.finish(Called { outcome, card });
+                session.emit(fence, Completion::Tool { call, called });
             })));
     }
 }
@@ -2282,42 +2281,6 @@ impl Actor {
 /// change it.
 fn relisted(listed: &Record, now: &Record) -> bool {
     listed.busy != now.busy || listed.activity != now.activity
-}
-
-struct Keyed<K, V>(Vec<(K, V)>);
-
-impl<K, V> Default for Keyed<K, V> {
-    fn default() -> Self {
-        Self(Vec::new())
-    }
-}
-
-impl<K: PartialEq, V> Keyed<K, V> {
-    fn insert(&mut self, key: K, value: V) {
-        self.remove(&key);
-        self.0.push((key, value));
-    }
-
-    fn remove(&mut self, key: &K) -> Option<V> {
-        let at = self.0.iter().position(|(k, _)| k == key)?;
-        Some(self.0.swap_remove(at).1)
-    }
-
-    fn get(&self, key: &K) -> Option<&V> {
-        self.0.iter().find(|(k, _)| k == key).map(|(_, v)| v)
-    }
-
-    fn get_mut(&mut self, key: &K) -> Option<&mut V> {
-        self.0.iter_mut().find(|(k, _)| k == key).map(|(_, v)| v)
-    }
-
-    fn values(&self) -> impl Iterator<Item = &V> {
-        self.0.iter().map(|(_, v)| v)
-    }
-
-    fn clear(&mut self) {
-        self.0.clear();
-    }
 }
 
 /// How many entries behind a client must be to get a snapshot rather than
@@ -2419,31 +2382,13 @@ impl Session {
     }
 
     fn cancel(&self, call: CallId) -> Cancel {
-        let mut work = lock(&self.work);
-        let id = WorkId::Call(call);
-        if let Some(handle) = work.get(&id) {
-            return handle.cancel.clone();
-        }
-        let handle = WorkHandle::new(
-            id.clone(),
-            self.fence.load(Ordering::SeqCst),
-            Admission {
-                through: call.get(),
-                requirement: Requirement::Ordered,
-            },
-            Cancel::default(),
-        );
-        let cancel = handle.cancel.clone();
-        work.insert(handle);
-        cancel
+        self.origin(call, self.fence.load(Ordering::SeqCst))
+            .expect("actor generation")
+            .cancel
     }
 
     fn cancelled(&self, call: CallId) {
         lock(&self.work).cancel(&WorkId::Call(call));
-    }
-
-    fn forget(&self, call: CallId) {
-        self.cancelled(call);
     }
 
     fn cancel_all(&self) {
@@ -2456,25 +2401,24 @@ impl Session {
             return None;
         }
         let id = WorkId::Call(call);
-        let cancel = if let Some(handle) = work.get(&id) {
-            handle.cancel.clone()
-        } else {
-            let cancel = Cancel::default();
+        if work.get(&id).is_none() {
             work.insert(WorkHandle::new(
-                id,
+                id.clone(),
                 fence,
                 Admission {
                     through: call.get(),
                     requirement: Requirement::Ordered,
                 },
-                cancel.clone(),
+                Cancel::default(),
             ));
-            cancel
-        };
-        Some(ContextOrigin {
-            fence,
-            call,
-            cancel,
+        }
+        let handle = work.get(&id).unwrap();
+        Some(WorkHandle {
+            id: call,
+            fence: handle.fence,
+            admission: handle.admission,
+            cancel: handle.cancel.clone(),
+            ended: handle.ended.clone(),
         })
     }
 }

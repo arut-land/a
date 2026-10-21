@@ -6,6 +6,10 @@ pub type Effects = smallvec::SmallVec<[Effect; 4]>;
 
 #[derive(Debug, PartialEq)]
 pub enum Effect {
+    Invocation {
+        ticket: Ticket,
+        result: Result<CallId, String>,
+    },
     Append(Entry),
     Commit {
         through: u64,
@@ -125,6 +129,7 @@ impl Effect {
 impl From<kernel::Work> for Effect {
     fn from(work: kernel::Work) -> Self {
         match work {
+            kernel::Work::Invocation { ticket, result } => Self::Invocation { ticket, result },
             kernel::Work::Reply { ticket, result } => Self::Reply { ticket, result },
             kernel::Work::Side { ticket, side } => Self::Side { ticket, side },
             kernel::Work::Prepare {

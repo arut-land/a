@@ -805,6 +805,7 @@ mod tests {
             Seq::new(seq).unwrap(),
             Epoch(1),
             Body::ToolCall {
+                invoke: None,
                 tool: "bash".into(),
                 input: Json::encode(&serde_json::json!({ "command": "ls" })).unwrap(),
                 id: None,

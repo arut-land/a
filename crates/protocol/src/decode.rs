@@ -254,6 +254,7 @@ macro_rules! same {
 }
 
 same!(
+    crate::Invocation,
     crate::Envelope,
     crate::EnvelopeId,
     crate::InboxRefusal,
@@ -407,6 +408,7 @@ fn present<'de, D: Deserializer<'de>>(d: D) -> std::result::Result<Option<Json>,
 /// An [`Entry`], or a [`Verdict`] within one.
 #[derive(Deserialize)]
 pub(crate) struct EntryFields {
+    pub(crate) invoke: Option<crate::Invocation>,
     pub(crate) envelope: Option<crate::Envelope>,
     pub(crate) envelope_id: Option<crate::EnvelopeId>,
     pub(crate) refusal: Option<crate::InboxRefusal>,
@@ -522,6 +524,7 @@ pub(crate) struct MsgFields {
 /// An [`Item`] of a snapshot.
 #[derive(Deserialize)]
 struct ItemFields {
+    invoke: Option<crate::Invocation>,
     #[serde(rename = "type")]
     ty: Option<Type>,
     seq: Option<u64>,
@@ -669,6 +672,7 @@ impl ItemFields {
                 owner: f.owner.take(),
             },
             Type::Tool => Item::Tool {
+                invoke: f.invoke.take(),
                 call: need(f.call.take(), "call")?,
                 tool: req(f.tool.take(), "tool")?,
                 input: req(f.input.take(), "input")?,

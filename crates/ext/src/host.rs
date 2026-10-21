@@ -25,6 +25,13 @@ pub use crate::point::{Decided, Hooks};
 
 /// The engine, as a running call reaches it.
 pub trait Host: Send + Sync {
+    fn invoke(
+        self: Arc<Self>,
+        cx: Cx,
+        name: String,
+        tool: String,
+        input: Json,
+    ) -> BoxFuture<'static, Called>;
     /// See [`Cx::spawned`].
     fn spawned(&self, pgid: u32, background: bool);
     /// See [`Cx::own`]: the engine runs `ended`, and the session owns

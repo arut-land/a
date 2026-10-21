@@ -102,6 +102,16 @@ struct Recorded {
 }
 
 impl Host for Recorded {
+    fn invoke(
+        self: Arc<Self>,
+        _: Cx,
+        _: String,
+        _: String,
+        _: Json,
+    ) -> BoxFuture<'static, crate::Called> {
+        unreachable!("this fixture does not invoke tools")
+    }
+
     fn spawned(&self, _: u32, _: bool) {}
     fn own(&self, _: u32, _: BoxFuture<'static, ()>) {}
     fn progress(&self, text: &str) {

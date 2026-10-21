@@ -6,6 +6,7 @@ use super::{
     io, lock, oneshot, relisted, store_fault, unless,
 };
 
+#[derive(Default)]
 pub(super) struct Journal {
     /// `None` only while a commit has it on a blocking thread.
     pub(super) writer: Option<Writer>,

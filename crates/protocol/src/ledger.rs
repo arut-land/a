@@ -71,6 +71,7 @@ pub enum Call {
         choice: ToolChoice,
     },
     Tool {
+        invoke: Option<crate::Invocation>,
         tool: String,
         input: Json,
         by: Audience,
@@ -265,11 +266,16 @@ impl Ledger {
     fn track(&mut self, here: CallId, body: &Body) {
         match body {
             Body::ToolCall {
-                tool, input, by, ..
+                tool,
+                input,
+                by,
+                invoke,
+                ..
             } => {
                 self.open(
                     here,
                     Call::Tool {
+                        invoke: invoke.clone(),
                         tool: tool.clone(),
                         input: input.clone(),
                         by: *by,
@@ -351,7 +357,16 @@ impl Ledger {
         };
         // A command the user ran is not the agent's work, nor is a side
         // request an extension made.
-        if !open.by_user() && !matches!(open.call, Call::Side { .. }) {
+        if !open.by_user()
+            && !matches!(
+                open.call,
+                Call::Side { .. }
+                    | Call::Tool {
+                        invoke: Some(_),
+                        ..
+                    }
+            )
+        {
             self.result = Some(outcome.clone());
         }
     }
@@ -598,6 +613,7 @@ impl Open {
             self.call,
             Call::Tool {
                 by: Audience::User,
+                invoke: None,
                 ..
             }
         )
