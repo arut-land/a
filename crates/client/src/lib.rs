@@ -58,6 +58,8 @@ pub enum Error {
     /// The daemon refuses to serve, as it says (after a crash loop).
     Refused(String),
     Fork(protocol::ForkError),
+    /// No additional request was admitted; a pending environment request keeps its latest value.
+    Busy,
     /// The daemon closed the connection.
     Closed,
     /// The socket, `ssh` or the spawn failed.
@@ -94,6 +96,7 @@ impl fmt::Display for Error {
             Self::Fork(reason) => reason.fmt(f),
             Self::NotResponding => f.write_str("the daemon is not responding"),
             Self::Refused(why) | Self::Io(_, why) => f.write_str(why),
+            Self::Busy => f.write_str("the client transport is busy; try again"),
             Self::Closed => f.write_str("the daemon closed the connection"),
         }
     }
@@ -120,6 +123,7 @@ impl From<Error> for io::Error {
             Error::Mismatch { .. } => io::ErrorKind::Unsupported,
             Error::NotResponding => io::ErrorKind::TimedOut,
             Error::Refused(_) | Error::Fork(_) => io::ErrorKind::Other,
+            Error::Busy => io::ErrorKind::WouldBlock,
             Error::Closed => io::ErrorKind::UnexpectedEof,
             Error::Io(kind, _) => *kind,
         };

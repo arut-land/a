@@ -1,8 +1,9 @@
 //! Ordered client I/O owned by one cancellable runtime task.
 
+use std::collections::VecDeque;
 use std::io::{self, Read, Write};
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{Arc, Weak};
+use std::sync::{Arc, Mutex, PoisonError, Weak};
 use std::time::Duration;
 
 use protocol::{ClientId, ClientMsg, DaemonMsg, Decode, Environment};
@@ -74,9 +75,102 @@ enum Request {
     Flush(rt::oneshot::Sender<()>),
 }
 
+const CONTROL_SLOTS: usize = 16;
+// Control traffic cannot consume the reducer's mutation window or interrupt slot.
+const MUTATION_SLOTS: usize = crate::session::UNANSWERED + 1;
+
+#[derive(Default)]
+struct Outbox {
+    state: Mutex<Queued>,
+    ready: rt::Notify,
+}
+
+#[derive(Default)]
+struct Queued {
+    items: VecDeque<(u64, Request)>,
+    closed: bool,
+}
+
+impl Request {
+    fn mutation(&self) -> bool {
+        matches!(self, Self::Io(io) if matches!(&**io, Io::Send(msg) if crate::session::is_mutation(msg)))
+    }
+
+    fn environment(&self) -> bool {
+        matches!(self, Self::Io(io) if matches!(&**io, Io::SendEnvironment | Io::Send(ClientMsg::Environment(_))))
+    }
+}
+
+impl Outbox {
+    fn send(&self, epoch: &AtomicU64, request: Request) -> Result<(), Error> {
+        let mut state = self.state.lock().unwrap_or_else(PoisonError::into_inner);
+        if state.closed {
+            return Err(Error::Closed);
+        }
+        let replace =
+            matches!(&request, Request::Io(io) if matches!(&**io, Io::Connect { .. } | Io::Hangup));
+        if replace {
+            state.items.clear();
+            epoch.fetch_add(1, Ordering::AcqRel);
+        }
+        let coalesced =
+            request.environment() && state.items.iter().any(|(_, item)| item.environment());
+        if coalesced {
+            state.items.retain(|(_, item)| !item.environment());
+        }
+        let mutation = request.mutation();
+        let limit = if mutation {
+            MUTATION_SLOTS
+        } else {
+            CONTROL_SLOTS
+        };
+        if state
+            .items
+            .iter()
+            .filter(|(_, item)| item.mutation() == mutation)
+            .count()
+            == limit
+        {
+            return Err(Error::Busy);
+        }
+        if !matches!(&request, Request::Io(io) if matches!(&**io, Io::Hangup)) {
+            state
+                .items
+                .push_back((epoch.load(Ordering::Acquire), request));
+        }
+        drop(state);
+        self.ready.notify();
+        if coalesced { Err(Error::Busy) } else { Ok(()) }
+    }
+
+    async fn recv(&self) -> Option<(u64, Request)> {
+        loop {
+            let seen = self.ready.count();
+            {
+                let mut state = self.state.lock().unwrap_or_else(PoisonError::into_inner);
+                if let Some(item) = state.items.pop_front() {
+                    return Some(item);
+                }
+                if state.closed {
+                    return None;
+                }
+            }
+            self.ready.until(|| self.ready.count() != seen).await;
+        }
+    }
+
+    fn close(&self) {
+        let mut state = self.state.lock().unwrap_or_else(PoisonError::into_inner);
+        state.closed = true;
+        state.items.clear();
+        drop(state);
+        self.ready.notify();
+    }
+}
+
 struct Handle {
     daemon: Daemon,
-    tx: rt::channel::Sender<(u64, Request)>,
+    tx: Arc<Outbox>,
     stop: Arc<rt::Notify>,
     epoch: Arc<AtomicU64>,
 }
@@ -85,6 +179,7 @@ impl Drop for Handle {
     fn drop(&mut self) {
         self.epoch.fetch_add(1, Ordering::AcqRel);
         self.stop.notify();
+        self.tx.close();
     }
 }
 
@@ -105,7 +200,8 @@ impl Driver {
     }
 
     pub fn start(self, rt: Rt, daemon: Daemon) -> ClientHandle {
-        let (tx, rx) = rt::channel::unbounded();
+        let rx = Arc::new(Outbox::default());
+        let tx = rx.clone();
         let stop = Arc::new(rt::Notify::new());
         let epoch = Arc::new(AtomicU64::new(0));
         let handle = ClientHandle(Arc::new(Handle {
@@ -190,7 +286,7 @@ impl Driver {
         conn: ConnId,
         attach: Attach,
         restart: bool,
-        rx: &rt::channel::Receiver<(u64, Request)>,
+        rx: &Outbox,
         generation: u64,
         handle: &Weak<Handle>,
     ) -> Option<(u64, Request)> {
@@ -387,31 +483,22 @@ impl ClientHandle {
         pump(|io| self.io(io), renderer, effects);
     }
 
-    /// Resolves once all preceding sends reached the transport, or it closed.
+    /// Resolves once preceding, unsuperseded sends reached the transport, or it closed.
     pub async fn flush(&self) -> Result<(), Error> {
         let (done, sent) = rt::oneshot::channel();
-        self.0
-            .tx
-            .send((self.0.epoch.load(Ordering::Acquire), Request::Flush(done)))
-            .map_err(|_| Error::Closed)?;
+        self.0.tx.send(&self.0.epoch, Request::Flush(done))?;
         sent.await.ok_or(Error::Closed)
     }
 
+    /// Busy admits no additional request. A pending environment request still
+    /// takes the latest value; mutations are refused without changing their order.
     pub fn io(&self, io: Io) -> Result<(), Error> {
-        if matches!(io, Io::Hangup | Io::Connect { .. }) {
-            self.0.epoch.fetch_add(1, Ordering::AcqRel);
+        let revokes = matches!(io, Io::Hangup | Io::Connect { .. });
+        let result = self.0.tx.send(&self.0.epoch, Request::Io(Box::new(io)));
+        if revokes {
             self.0.stop.notify();
         }
-        if matches!(io, Io::Hangup) {
-            return Ok(());
-        }
-        self.0
-            .tx
-            .send((
-                self.0.epoch.load(Ordering::Acquire),
-                Request::Io(Box::new(io)),
-            ))
-            .map_err(|_| Error::Closed)
+        result
     }
 }
 
@@ -798,6 +885,104 @@ mod tests {
         }));
         done.recv_timeout(Duration::from_secs(2)).unwrap();
         peer.read_to_end(&mut Vec::new()).unwrap();
+    }
+
+    #[test]
+    fn control_backlog_cannot_consume_the_mutation_window() {
+        let queue = Outbox::default();
+        let epoch = AtomicU64::new(0);
+        for _ in 0..CONTROL_SLOTS {
+            queue
+                .send(&epoch, Request::Io(Box::new(Io::Send(ClientMsg::List))))
+                .unwrap();
+        }
+        assert_eq!(
+            queue.send(&epoch, Request::Io(Box::new(Io::Send(ClientMsg::List)))),
+            Err(Error::Busy)
+        );
+        for seq in 1..=MUTATION_SLOTS {
+            queue
+                .send(
+                    &epoch,
+                    Request::Io(Box::new(Io::Send(ClientMsg::Input {
+                        text: seq.to_string(),
+                        mode: protocol::Mode::default(),
+                        client_seq: Some(seq as u64),
+                    }))),
+                )
+                .unwrap();
+        }
+        assert_eq!(
+            queue.send(&epoch, Request::Io(Box::new(Io::Send(large_input())))),
+            Err(Error::Busy)
+        );
+        for _ in 0..CONTROL_SLOTS {
+            rt::block_on(queue.recv()).unwrap();
+        }
+        for seq in 1..=MUTATION_SLOTS {
+            let (_, Request::Io(io)) = rt::block_on(queue.recv()).unwrap() else {
+                panic!("expected mutation");
+            };
+            assert!(matches!(*io, Io::Send(msg) if msg.client_seq() == Some(seq as u64)));
+        }
+    }
+
+    #[test]
+    fn environment_replacement_keeps_only_the_latest_value() {
+        let queue = Outbox::default();
+        let epoch = AtomicU64::new(0);
+        for (dir, result) in [("first", Ok(())), ("latest", Err(Error::Busy))] {
+            let environment = Environment::new(dir.into(), Vec::new(), false);
+            assert_eq!(
+                queue.send(
+                    &epoch,
+                    Request::Io(Box::new(Io::Send(ClientMsg::Environment(environment))))
+                ),
+                result
+            );
+        }
+        let mut state = queue.state.lock().unwrap();
+        assert_eq!(state.items.len(), 1);
+        let (_, Request::Io(io)) = state.items.pop_front().unwrap() else {
+            panic!("expected environment");
+        };
+        assert!(
+            matches!(*io, Io::Send(ClientMsg::Environment(env)) if env.cwd == std::path::Path::new("latest"))
+        );
+    }
+
+    #[test]
+    fn busy_admission_is_rendered_as_a_client_notice() {
+        struct Notices(Vec<Show>);
+        impl Renderer for Notices {
+            fn show(&mut self, shown: Vec<Show>) -> Vec<Effect> {
+                self.0.extend(shown);
+                Vec::new()
+            }
+        }
+        let mut notices = Notices(Vec::new());
+        pump(
+            |_| Err(Error::Busy),
+            &mut notices,
+            vec![Effect::Io(Io::SendEnvironment)],
+        );
+        assert!(matches!(
+            notices.0.as_slice(),
+            [Show::Notice(Notice::NotSent(Error::Busy))]
+        ));
+    }
+
+    #[test]
+    fn stalled_transport_applies_backpressure_to_environment_refreshes() {
+        let fixture = Fixture::new();
+        let runtime: Rt = Arc::new(rt::Threads::new(1));
+        let (handle, mut peer) = fixture.connect(runtime);
+        handle.io(Io::Send(large_input())).unwrap();
+        peer.read_exact(&mut [0; 4]).unwrap();
+        let refused = (0..4096).any(|_| handle.io(Io::SendEnvironment).is_err());
+        drop(handle);
+        peer.read_to_end(&mut Vec::new()).unwrap();
+        assert!(refused, "a stalled transport accepted every queued refresh");
     }
 
     #[test]

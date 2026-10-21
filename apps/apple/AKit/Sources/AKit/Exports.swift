@@ -49,7 +49,7 @@ nonisolated extension SessionInfo: @retroactive Identifiable {}
 extension ClientError: @retroactive LocalizedError {
     public var errorDescription: String? {
         switch self {
-        case .unavailable(let message), .notResponding(let message), .mismatch(let message, _),
+        case .busy(let message), .unavailable(let message), .notResponding(let message), .mismatch(let message, _),
             .protocol(let message), .notOffered(let message), .invalidArgument(let message):
             message
         case .closed: "The connection to the daemon closed."
