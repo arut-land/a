@@ -48,7 +48,7 @@ pub fn login_env(shell: &OsString, timeout: Duration) -> io::Result<Vec<(OsStrin
         .stdout(Stdio::piped())
         .stderr(Stdio::null());
     crate::Group::lead(&mut command);
-    let mut child = Capture(command.spawn()?);
+    let mut child = Capture(crate::proc::spawn(&mut command)?);
     let mut stdout = child.0.stdout.take().expect("stdout is piped");
     fcntl_setfl(&stdout, fcntl_getfl(&stdout)? | OFlags::NONBLOCK)?;
     let mut out = Vec::new();

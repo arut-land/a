@@ -104,7 +104,7 @@ mod imp {
                 .stdout(Stdio::null())
                 .stderr(Stdio::null());
             crate::Group::lead(&mut cmd);
-            cmd.spawn().ok().map(Self)
+            crate::proc::spawn(&mut cmd).ok().map(Self)
         }
     }
 
