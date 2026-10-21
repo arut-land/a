@@ -56,3 +56,13 @@ Validation used `CARGO_BUILD_JOBS=3`: `mise run check` passed 926 tests
 compile-fail doctest passed. The size task also verified that the shipped
 binary lacks the fixtures. Budgets and startup measurements were not run;
 the coordinator will measure them on a quiet machine.
+
+The review exposed a blocking wake after the queue's `try_lock`. Admission
+now uses `rt::Wakeup`: a coalescing atomic flag and `atomic-waker` 1.1.2,
+already linked through `async-io` (no new package). Its maintained atomic
+registration state lets a producer publish a wake while the consumer is
+suspended inside registration, without waiting for its lock. The existing
+multi-waiter `rt::Notify` is retained for flush waiters only. A deterministic
+test parks the consumer inside waker replacement and requires the complete
+producer admission to finish before releasing it. Final binary size below
+includes this direct dependency and all review fixes.

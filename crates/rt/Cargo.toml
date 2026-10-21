@@ -14,6 +14,8 @@ watch = ["dep:notify"]
 tokio = ["dep:tokio"]
 
 [dependencies]
+# Already linked by async-io; producer wake never waits on registration.
+atomic-waker = "1"
 notify = { version = "8", optional = true }
 async-executor = { version = "1", optional = true }
 # The reactor and timers of every runtime but tokio's: one thread waiting

@@ -203,3 +203,59 @@ fn write_recovery_reports_loss_without_needing_another_batch() {
     assert!(text.contains("\"writes\":1"), "missing loss count: {text}");
 }
 
+#[test]
+fn a_consumer_parked_during_wake_registration_cannot_hold_admission() {
+    use std::future::Future;
+    use std::pin::pin;
+    use std::sync::mpsc;
+    use std::task::{Context, Wake, Waker};
+
+    struct ParkOnDrop {
+        entered: mpsc::Sender<()>,
+        release: Mutex<mpsc::Receiver<()>>,
+    }
+    impl Wake for ParkOnDrop {
+        fn wake(self: Arc<Self>) {}
+    }
+    impl Drop for ParkOnDrop {
+        fn drop(&mut self) {
+            self.entered.send(()).unwrap();
+            self.release.get_mut().unwrap().recv().unwrap();
+        }
+    }
+    let logger = Logger::new();
+    let (entered, waiting) = mpsc::channel();
+    let (release, released) = mpsc::channel();
+    {
+        let waker = Waker::from(Arc::new(ParkOnDrop {
+            entered,
+            release: Mutex::new(released),
+        }));
+        assert!(
+            pin!(logger.0.ready.wait())
+                .as_mut()
+                .poll(&mut Context::from_waker(&waker))
+                .is_pending()
+        );
+    }
+    let consumer = logger.clone();
+    let consumer = std::thread::spawn(move || {
+        let _ = pin!(consumer.0.ready.wait())
+            .as_mut()
+            .poll(&mut Context::from_waker(Waker::noop()));
+    });
+    waiting.recv().unwrap();
+    // The old waker's destructor now parks the consumer inside registration.
+    let producer = logger.clone();
+    let (done, completed) = mpsc::channel();
+    let producer = std::thread::spawn(move || {
+        producer.emit(Fact::RegistryRejected);
+        done.send(()).unwrap();
+    });
+    let admitted = completed.recv_timeout(Duration::from_secs(2));
+    release.send(()).unwrap();
+    consumer.join().unwrap();
+    producer.join().unwrap();
+    admitted.expect("admission must finish before the consumer is released");
+    assert_eq!(logger.0.records.lock().unwrap().len(), 1);
+}

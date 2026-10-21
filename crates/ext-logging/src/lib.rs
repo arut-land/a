@@ -303,7 +303,7 @@ impl Record {
 
 struct Queue {
     records: Mutex<VecDeque<Record>>,
-    ready: rt::Notify,
+    ready: rt::Wakeup,
     drained: rt::Notify,
     submitted: AtomicU64,
     completed: AtomicU64,
@@ -318,7 +318,7 @@ impl Logger {
     fn new() -> Self {
         Self(Arc::new(Queue {
             records: Mutex::new(VecDeque::with_capacity(CAPACITY)),
-            ready: rt::Notify::new(),
+            ready: rt::Wakeup::new(),
             drained: rt::Notify::new(),
             submitted: AtomicU64::new(0),
             completed: AtomicU64::new(0),
@@ -358,7 +358,6 @@ impl Logger {
         let queue = Arc::clone(&self.0);
         let executor = Arc::clone(rt);
         rt.spawn(Box::pin(async move {
-            let mut changed = queue.ready.count();
             let mut failures = 0;
             loop {
                 let batch: Vec<_> = queue.records.lock().unwrap().drain(..).collect();
@@ -366,7 +365,7 @@ impl Logger {
                     if queue.closed.load(Ordering::Acquire) {
                         break;
                     }
-                    queue.ready.changed(&mut changed).await;
+                    queue.ready.wait().await;
                     continue;
                 }
                 let count = batch.len() as u64;

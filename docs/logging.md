@@ -42,8 +42,10 @@ may include panic text; this change does not claim to redact those reports.
 Startup facts can enter the bounded queue before configuration is loaded.
 The daemon installs one writer only after acquiring its home lock. A
 producer tries a fixed 256-record queue and drops on contention or overflow.
-It neither formats nor writes a file, waits for queue space, nor awaits a
-log flush. A separate `rt` runtime drains batches through its blocking pool;
+Admission and wake both avoid consumer-held locks: a coalescing atomic
+flag and `rt::Wakeup` publish the wake even during waiter registration.
+The producer neither formats nor writes a file, waits for queue space,
+nor awaits a log flush. A separate `rt` runtime drains batches through its blocking pool;
 its stalled disk worker cannot occupy the session commit executor. The
 queue and in-flight batch each hold at most 256 fixed-size records. Queue
 losses and failed diagnostic writes are counted in a `lost` record when
