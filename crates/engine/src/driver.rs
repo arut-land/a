@@ -111,17 +111,18 @@ pub(crate) fn copy_history(
     seq: protocol::Seq,
     id: SessionId,
     shared: &Arc<Shared>,
-) -> io::Result<Header> {
-    let mut entries = shared.store.prefix(header.id, seq.get())?;
+) -> Result<Header, protocol::ForkError> {
+    let entries = shared.store.prefix(header.id, seq.get())?;
     let source = shared.source(&header.workspace)?;
     let installed = entries.iter().rev().find_map(|entry| match &entry.body {
         Body::Extensions { installed } => Some(installed.as_slice()),
         _ => None,
     });
-    let registry = recorded_registry(shared, source.as_ref(), installed)?;
+    let registry = recorded_registry(shared, source.as_ref(), installed)
+        .map_err(|_| protocol::ForkError::UnavailableGeneration)?;
     let policy = registry
         .service::<dyn ext::host::HistoryPolicy>()
-        .ok_or_else(|| io::Error::other("fork extension is disabled"))?;
+        .ok_or(protocol::ForkError::Disabled)?;
     let (tx, _rx) = channel::unbounded();
     let session = Arc::new(Session {
         id,
@@ -143,9 +144,19 @@ pub(crate) fn copy_history(
         }
     }
     let binding = bind(&registry, &session);
-    let fact = policy
-        .prepare(binding as Arc<dyn Binding>, &entries, header.id, seq)
-        .map_err(io::Error::other)?;
+    let prefix = ext::host::ValidatedPrefix::prepare(
+        policy,
+        binding as Arc<dyn Binding>,
+        entries,
+        header.id,
+        seq,
+    )?;
+    let (mut entries, parent) = prefix.into_history();
+    let fact = Body::Ext {
+        ext: "fork".into(),
+        state: "parent".into(),
+        data: Json::encode(&parent).map_err(io::Error::other)?,
+    };
     entries.push(Entry::new(
         protocol::Seq::new(seq.get() + 1).ok_or_else(|| io::Error::other("sequence exhausted"))?,
         protocol::Epoch(

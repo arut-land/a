@@ -52,8 +52,8 @@ Extension folds replay only the chosen prefix. Dynamic extension installation
 facts retain portable generation images: Lua source, tool grants and execution
 limits. Replay reconstructs the recorded generation, even after its files
 change or disappear; it never substitutes today's Lua code. Images are part
-of the durable log, not a snapshot cache. A build without the required loader
-refuses that history. Restoring a Lua generation currently scans the prefix
+of the durable log, not a snapshot cache. A build without the required generation opens that history read-only with
+`ReadOnly::Extensions`; it never replaces the recorded generation. Restoring a Lua generation currently scans the prefix
 before using its derived state snapshot. A subsequent explicit Lua reload or
 workspace generation change can adopt a new generation at rest.
 
@@ -61,3 +61,11 @@ The coordinator chose conversation-only semantics for this implementation.
 **Owner confirmation remains open** on that product decision and on whether
 future forks should accept unfinished prefixes by recording interruptions.
 This implementation accepts rest points only.
+
+Fork requests return `ForkError` variants for lookup, sequence, unfinished
+work, owned resources, unavailable generations, disabled policy, viewer,
+shutdown and storage failures. The wire carries `DaemonMsg::ForkRejected`;
+the SDK retains the enum as `client::Error::Fork`. The shared client rule
+renders each refusal once and keeps the source attached. The SDK's
+`ValidatedPrefix` owns the checked entries and typed ancestry; its constructor
+checks continuity and the extension's rest-point policy before import.

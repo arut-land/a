@@ -386,7 +386,9 @@ impl Conn<'_> {
         if matches!(target, protocol::Target::Fork { .. })
             && (self.decl.role == Role::Viewer || decl.role == Role::Viewer)
         {
-            self.error("this client is a viewer".into());
+            self.reply(&DaemonMsg::ForkRejected {
+                reason: protocol::ForkError::Viewer,
+            });
             return;
         }
         let env = if matches!(target, protocol::Target::Fork { .. }) {
@@ -395,7 +397,19 @@ impl Conn<'_> {
             env
         };
         let found = || workspace_of(&workspace, env.as_ref());
-        match self.daemon.resolve(&target, found).await {
+        let resolved = match &target {
+            protocol::Target::Fork { session, seq } => {
+                match self.daemon.fork(session, *seq).await {
+                    Ok(session) => Ok(session),
+                    Err(reason) => {
+                        self.reply(&DaemonMsg::ForkRejected { reason });
+                        return;
+                    }
+                }
+            }
+            _ => self.daemon.resolve(&target, found).await,
+        };
+        match resolved {
             Ok(s) => {
                 self.decl = decl;
                 // Before the replay, so a client that saw itself

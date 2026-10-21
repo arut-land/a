@@ -1312,7 +1312,7 @@ fn a_fork_never_changes_its_source() {
     assert_eq!(copied_entries[..source_entries.len()], source_entries);
     assert!(
         matches!(&copied_entries[source_entries.len()].body, Body::Ext { ext, state, data }
-        if ext == "fork" && state == "parent" && data.parse::<ext_fork::Parent>().unwrap().session == id)
+        if ext == "fork" && state == "parent" && data.parse::<protocol::ForkParent>().unwrap().session == id)
     );
     drop((copied, source, daemon));
     std::fs::remove_dir_all(root).unwrap();
@@ -1412,14 +1412,8 @@ fn a_pending_approval_cannot_be_forked_or_answered_in_a_second_session() {
     assert_eq!(source.session().summary().activity, Activity::Approval);
     let id = source.session().id;
     let before = daemon.shared.store.entries(id).unwrap();
-    let result = daemon.attach_to(
-        &Target::Fork {
-            session: id.to_string(),
-            seq: None,
-        },
-        PathBuf::new,
-    );
-    assert!(result.is_err());
+    let result = rt::block_on(daemon.fork(&id.to_string(), None));
+    assert!(matches!(result, Err(protocol::ForkError::Unfinished)));
     assert_eq!(daemon.shared.store.headers().unwrap().len(), 1);
     assert_eq!(daemon.shared.store.entries(id).unwrap(), before);
     drop((source, daemon));

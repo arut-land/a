@@ -55,6 +55,7 @@ pub enum Error {
     NotResponding,
     /// The daemon refuses to serve, as it says (after a crash loop).
     Refused(String),
+    Fork(protocol::ForkError),
     /// The daemon closed the connection.
     Closed,
     /// The socket, `ssh` or the spawn failed.
@@ -88,6 +89,7 @@ impl fmt::Display for Error {
                     "the daemon speaks {theirs}, this a {mine}; restart the daemon"
                 )
             }
+            Self::Fork(reason) => reason.fmt(f),
             Self::NotResponding => f.write_str("the daemon is not responding"),
             Self::Refused(why) | Self::Io(_, why) => f.write_str(why),
             Self::Closed => f.write_str("the daemon closed the connection"),
@@ -115,7 +117,7 @@ impl From<Error> for io::Error {
         let kind = match &e {
             Error::Mismatch { .. } => io::ErrorKind::Unsupported,
             Error::NotResponding => io::ErrorKind::TimedOut,
-            Error::Refused(_) => io::ErrorKind::Other,
+            Error::Refused(_) | Error::Fork(_) => io::ErrorKind::Other,
             Error::Closed => io::ErrorKind::UnexpectedEof,
             Error::Io(kind, _) => *kind,
         };
@@ -447,7 +449,8 @@ impl Daemon {
         let mut conn = self.connect_as(None, &|| {}, &|conn| Ok(vec![conn.attach(&attach)?]))?;
         let session = conn.reader.until(|msg| match msg {
             DaemonMsg::Attached { session, .. } => Some(Ok(session)),
-            DaemonMsg::Error { message } => Some(Err(io::Error::other(message))),
+            DaemonMsg::ForkRejected { reason } => Some(Err(Error::Fork(reason))),
+            DaemonMsg::Error { message } => Some(Err(Error::Refused(message))),
             _ => None,
         })??;
         conn.writer.send(&ClientMsg::Detach)?;

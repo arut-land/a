@@ -542,7 +542,9 @@ impl Daemon {
     ) -> io::Result<Attachment> {
         match target {
             Target::New => return self.create(workspace()).await,
-            Target::Fork { session, seq } => return self.fork(session, *seq).await,
+            Target::Fork { session, seq } => {
+                return self.fork(session, *seq).await.map_err(io::Error::other);
+            }
             _ => {}
         }
         let slot = self.find(target, workspace)?;
@@ -595,21 +597,33 @@ impl Daemon {
         Ok(slot)
     }
 
-    async fn fork(&self, session: &str, seq: Option<protocol::Seq>) -> io::Result<Attachment> {
-        let source = self.find(&Target::Prefix(session.to_owned()), PathBuf::new)?;
+    async fn fork(
+        &self,
+        session: &str,
+        seq: Option<protocol::Seq>,
+    ) -> Result<Attachment, protocol::ForkError> {
+        let source = self
+            .find(&Target::Prefix(session.to_owned()), PathBuf::new)
+            .map_err(|error| {
+                if error.kind() == io::ErrorKind::NotFound {
+                    protocol::ForkError::SourceNotFound
+                } else {
+                    protocol::ForkError::AmbiguousSource
+                }
+            })?;
         let latest = source.summary().entries;
         let seq = seq.map_or(latest, protocol::Seq::get);
         if seq == 0 || seq > latest {
-            return Err(io::Error::other(
-                "fork sequence is outside the source history",
-            ));
+            return Err(protocol::ForkError::InvalidSequence);
         }
         let header = Header {
             id: SessionId::new(),
             workspace: source.header.workspace.clone(),
             parent: None,
         };
-        let slot = self.new_slot(header)?;
+        let slot = self
+            .new_slot(header)
+            .map_err(|_| protocol::ForkError::ShuttingDown)?;
         let shared = Arc::clone(&self.shared);
         let source_header = source.header.clone();
         let id = slot.header.id;
@@ -623,10 +637,10 @@ impl Daemon {
         })
         .await;
         if let Err(error) = copied {
-            let result = self.started(&slot, Err(error));
+            let _ = self.started(&slot, Err(io::Error::other(error.clone())));
             lock(&self.slots).retain(|known| !Arc::ptr_eq(known, &slot));
             self.pulse.notify();
-            return result.map(|live| live.open());
+            return Err(error);
         }
         Ok(self.start(&slot, Open::Load).await?.open())
     }

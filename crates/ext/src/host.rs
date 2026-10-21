@@ -20,6 +20,7 @@ use crate::{
 };
 
 pub use crate::assemble::Built;
+pub use crate::history::ValidatedPrefix;
 pub use crate::point::{Decided, Hooks};
 
 /// The engine, as a running call reaches it.
@@ -457,15 +458,13 @@ struct By {
 
 /// Policy for importing a conversation prefix into an independent session.
 /// The engine supplies storage and publication; an extension decides which
-/// prefixes may continue and the durable fact recording their origin.
+/// prefixes may continue. `ValidatedPrefix` preserves their checked ancestry.
 pub trait HistoryPolicy: Send + Sync {
-    fn prepare(
+    fn validate(
         &self,
         binding: Arc<dyn Binding>,
         entries: &[protocol::Entry],
-        source: SessionId,
-        seq: Seq,
-    ) -> Result<protocol::Body, Refused>;
+    ) -> Result<(), protocol::ForkError>;
 }
 
 /// An owned workspace subscription. Reads never perform I/O or prepare work.

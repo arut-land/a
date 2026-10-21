@@ -663,7 +663,6 @@ dependencies = [
  "ext",
  "kernel",
  "protocol",
- "serde",
 ]
 
 [[package]]

@@ -2216,7 +2216,7 @@ fn every_recorded_prefix_is_either_copied_exactly_or_refused_without_a_log() {
                 copied += 1;
             }
             Err(error) => {
-                assert!(error.to_string().contains("rest point"), "{error}");
+                assert_eq!(error, protocol::ForkError::Unfinished);
                 assert_eq!(fixture.0.store.headers().unwrap().len(), before);
             }
         }
@@ -2264,7 +2264,7 @@ fn recorded_dynamic_history_is_refused_without_its_loader() {
             Body::Ext {
                 ext: "fork".into(),
                 state: "parent".into(),
-                data: Json::encode(&ext_fork::Parent {
+                data: Json::encode(&protocol::ForkParent {
                     session: SessionId::new(),
                     seq: Seq::new(2).unwrap(),
                 })
@@ -2277,6 +2277,10 @@ fn recorded_dynamic_history_is_refused_without_its_loader() {
     record.entries = entries.len() as u64;
     fixture.0.catalog.record(record);
 
+    assert!(matches!(
+        copy_history(&header, Seq::new(3).unwrap(), SessionId::new(), &fixture.0),
+        Err(protocol::ForkError::UnavailableGeneration)
+    ));
     let live = Live::start(&header, &fixture.0, Open::Load, Owner::None).unwrap();
     settle(&live);
     assert_eq!(live.summary().read_only, Some(ReadOnly::Extensions));
@@ -2286,4 +2290,38 @@ fn recorded_dynamic_history_is_refused_without_its_loader() {
     );
     live.halt();
     assert_eq!(fixture.0.store.entries(header.id).unwrap(), entries);
+}
+
+#[test]
+fn validated_prefixes_reject_sequence_gaps_and_unfinished_work_by_type() {
+    let fixture = Fixture::new(
+        ext_fixtures::ECHO,
+        Registry::default().with(&ext_fork::Fork).unwrap(),
+        openai(&Script::new(&[])),
+    );
+    let session = fixture.create();
+    session.submit("complete").unwrap();
+    settle(&session);
+    let log = log_of(&session);
+    let registry = fixture.0.registry.get();
+    let policy = registry.service::<dyn ext::host::HistoryPolicy>().unwrap();
+    let binding = bind(&registry, &session.session);
+    let mut gap = log.clone();
+    gap.remove(0);
+    let boundary = log.last().unwrap().seq;
+    assert!(matches!(
+        ext::host::ValidatedPrefix::prepare(policy, binding.clone(), gap, session.id, boundary),
+        Err(protocol::ForkError::InvalidSequence)
+    ));
+    let pending: Vec<_> = log
+        .iter()
+        .take_while(|entry| !matches!(entry.body, Body::Assistant { .. }))
+        .cloned()
+        .collect();
+    let boundary = pending.last().unwrap().seq;
+    assert!(matches!(
+        ext::host::ValidatedPrefix::prepare(policy, binding, pending, session.id, boundary),
+        Err(protocol::ForkError::Unfinished)
+    ));
+    session.halt();
 }

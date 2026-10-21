@@ -13,11 +13,11 @@ use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
 /// The protocol this build speaks best.
-pub const PROTO: u32 = 6;
+pub const PROTO: u32 = 7;
 
 /// The oldest protocol this build still speaks: a peer whose range
 /// overlaps `PROTO_MIN..=PROTO` is served at the highest version both speak.
-pub const PROTO_MIN: u32 = 6;
+pub const PROTO_MIN: u32 = 7;
 
 const MAX_FRAME: u32 = 16 * 1024 * 1024;
 
@@ -572,6 +572,56 @@ pub enum Outcome {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         output: Option<String>,
     },
+}
+
+/// The durable ancestry of an independently imported conversation prefix.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ForkParent {
+    pub session: SessionId,
+    pub seq: Seq,
+}
+
+/// Why a conversation prefix could not become an independent session.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ForkError {
+    SourceNotFound,
+    AmbiguousSource,
+    InvalidSequence,
+    Unfinished,
+    OwnedResources,
+    Disabled,
+    UnavailableGeneration,
+    Viewer,
+    ShuttingDown,
+    Storage { message: String },
+}
+
+impl fmt::Display for ForkError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(match self {
+            Self::SourceNotFound => "no matching source session",
+            Self::AmbiguousSource => "source matches several sessions",
+            Self::InvalidSequence => "fork sequence is outside the source history",
+            Self::Unfinished => "fork requires a rest point: unfinished calls, approvals and queued actions cannot be copied",
+            Self::OwnedResources => "fork requires a prefix without owned background processes or child watches",
+            Self::Disabled => "fork extension is disabled",
+            Self::UnavailableGeneration => "recorded extension generation unavailable",
+            Self::Viewer => "this client is a viewer",
+            Self::ShuttingDown => "the daemon is shutting down",
+            Self::Storage { message } => message,
+        })
+    }
+}
+
+impl std::error::Error for ForkError {}
+
+impl From<io::Error> for ForkError {
+    fn from(error: io::Error) -> Self {
+        Self::Storage {
+            message: error.to_string(),
+        }
+    }
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -1143,6 +1193,8 @@ kinds! {
         /// The kernel's activity after a complete burst, ordered after `seq`.
         /// Entries after it invalidate it until the next activity frame.
         Activity "activity" { seq: u64, activity: Activity } = Durable;
+        /// A refused fork, rendered once by the shared client rule.
+        ForkRejected "fork_rejected" { reason: ForkError } = Control;
         Sessions "sessions" { sessions: Vec<SessionSummary> } = Control;
         /// The answer to [`ClientMsg::Status`].
         Status "status" {

@@ -244,7 +244,10 @@ impl Renderer for Page {
         for show in shown {
             match show {
                 Show::View(update) => self.update(update),
-                Show::Notice(notice) => self.error = Some(notice.to_string()),
+                Show::Notice(notice) => {
+                    self.forking = false;
+                    self.error = Some(notice.to_string());
+                }
                 Show::Link if self.ended() => {
                     if let Link::Ended(client::End::Lost(why)) = self.client.link()
                         && self.shown.is_none()

@@ -5,16 +5,9 @@ use std::sync::Arc;
 
 use ext::host::{Binding, HistoryPolicy};
 use ext::{Configured, Extension, Refused, Registrar, Table};
-use protocol::{Body, Entry, Json, Seq, SessionId};
-use serde::{Deserialize, Serialize};
+use protocol::{Entry, ForkError};
 
 pub struct Fork;
-
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
-pub struct Parent {
-    pub session: SessionId,
-    pub seq: Seq,
-}
 
 impl Extension for Fork {
     const NAME: &'static str = "fork";
@@ -32,13 +25,7 @@ impl Configured for Fork {
 }
 
 impl HistoryPolicy for Fork {
-    fn prepare(
-        &self,
-        binding: Arc<dyn Binding>,
-        entries: &[Entry],
-        source: SessionId,
-        seq: Seq,
-    ) -> Result<Body, Refused> {
+    fn validate(&self, binding: Arc<dyn Binding>, entries: &[Entry]) -> Result<(), ForkError> {
         let mut core = kernel::Core::new(binding);
         for entry in entries {
             core.load(entry);
@@ -51,21 +38,11 @@ impl HistoryPolicy for Fork {
                 .iter()
                 .any(|effect| !matches!(effect, kernel::Effect::MarkBusy(false)))
         {
-            return Err(Refused("fork requires a rest point: unfinished calls, approvals and queued actions cannot be copied".into()));
+            return Err(ForkError::Unfinished);
         }
         if !core.ledger().background().is_empty() || core.ledger().armed().next().is_some() {
-            return Err(Refused(
-                "fork requires a prefix without owned background processes or child watches".into(),
-            ));
+            return Err(ForkError::OwnedResources);
         }
-        Ok(Body::Ext {
-            ext: "fork".into(),
-            state: "parent".into(),
-            data: Json::encode(&Parent {
-                session: source,
-                seq,
-            })
-            .map_err(|e| Refused(e.to_string()))?,
-        })
+        Ok(())
     }
 }

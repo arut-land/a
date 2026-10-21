@@ -199,6 +199,7 @@ pub enum Notice {
     RemoteEnv,
     /// The driver could not send a message.
     NotSent(Error),
+    ForkRejected(protocol::ForkError),
 }
 
 impl fmt::Display for Notice {
@@ -213,6 +214,7 @@ impl fmt::Display for Notice {
             Self::RemoteEnv => f.write_str(
                 "the host's environment is captured when `a` connects; reattach to refresh it",
             ),
+            Self::ForkRejected(reason) => reason.fmt(f),
             Self::NotSent(e) => write!(f, "not sent: {e}"),
         }
     }
@@ -494,6 +496,12 @@ impl SessionClient {
 
     fn msg(&mut self, msg: &DaemonMsg, out: &mut Vec<Effect>) {
         match msg {
+            DaemonMsg::ForkRejected { reason } => {
+                out.push(Effect::Show(Show::Notice(Notice::ForkRejected(
+                    reason.clone(),
+                ))));
+                return;
+            }
             DaemonMsg::Attached { session, .. } => {
                 self.opened.target = Target::Id(*session);
                 self.view_current = true;
@@ -802,12 +810,17 @@ mod tests {
         assert!(matches!(sends(&effects)[..], [ClientMsg::Attach {
             target: Target::Fork { session, seq: Some(seq) }, env: None, since: 0, ..
         }] if session == &source.to_string() && seq.get() == 7));
-        client.step(msg(
+        let refused = client.step(msg(
             connection.0,
-            DaemonMsg::Error {
-                message: "requires a rest point".into(),
+            DaemonMsg::ForkRejected {
+                reason: protocol::ForkError::Unfinished,
             },
         ));
+        assert_eq!(
+            notices(&refused),
+            [&Notice::ForkRejected(protocol::ForkError::Unfinished)]
+        );
+        assert_eq!(refused.len(), 1);
         assert!(matches!(client.link(), Link::Live { .. }));
         assert_eq!(client.view().session, Some(source));
         assert!(client.offer().is_ok());
