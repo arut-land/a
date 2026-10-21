@@ -146,7 +146,7 @@ struct CommandLineSettings: View {
             }
             Section("Daemon") {
                 LabeledContent("Status") {
-                    Text(model.daemonPid.map { "running, pid \(String($0))" } ?? "not running")
+                    Text(model.daemonProblem ?? model.daemonPid.map { "running, pid \(String($0))" } ?? "not running")
                 }
                 LabeledContent("Build") {
                     Text(model.client?.build() ?? "—").font(.caption.monospaced()).textSelection(.enabled)

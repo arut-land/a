@@ -47,6 +47,7 @@ final class AppModel {
     private(set) var cliStatus: CliStatus?
     private(set) var cliProblem: String?
     private(set) var daemonPid: UInt32?
+    private(set) var daemonProblem: String?
     /// A message for an alert, such as the outcome of installing the CLI.
     var notice: String?
 
@@ -99,7 +100,12 @@ final class AppModel {
 
     func refreshDaemon() async {
         guard let client else { return }
-        daemonPid = await client.daemonPid()
+        do {
+            daemonPid = try await client.daemonPid()
+            daemonProblem = nil
+        } catch {
+            daemonProblem = error.localizedDescription
+        }
     }
 
     func refreshCli() async {

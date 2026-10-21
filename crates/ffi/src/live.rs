@@ -5,6 +5,7 @@
 
 use std::collections::BTreeMap;
 use std::ffi::OsString;
+use std::future::Future;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex, OnceLock};
 use std::time::Duration;
@@ -37,7 +38,7 @@ async fn blocking<T: Send + 'static>(
 fn diagnosis(
     rt: &dyn rt::Runtime,
     home: Home,
-) -> impl std::future::Future<Output = client::Diagnosis> + Send + 'static {
+) -> impl Future<Output = client::Diagnosis> + Send + 'static {
     rt::unblock(rt, move || client::diagnose(&home))
 }
 

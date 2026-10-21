@@ -177,3 +177,11 @@ func apple_startup_does_not_block_the_main_actor() async throws {
     await heartbeat.value
     #expect(try await startup.value == 42)
 }
+
+
+@Test(.enabled(if: live != nil))
+func daemon_diagnosis_is_fetched_asynchronously() async throws {
+    let client = try Client(helper: live!)
+    _ = try await client.settings()
+    #expect(try await client.daemonPid() != nil)
+}
