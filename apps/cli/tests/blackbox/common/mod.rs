@@ -670,13 +670,38 @@ fn processes(column: &str) -> Vec<(u32, String)> {
 
 /// The names of process `pid`'s threads now.
 pub fn thread_names(pid: u32) -> Vec<String> {
+    thread_states(pid)
+        .into_iter()
+        .map(|(name, _)| name)
+        .collect()
+}
+
+/// Every thread has reached a kernel wait, after the protocol fact the
+/// caller awaits. An empty snapshot cannot certify a live process.
+pub fn threads_parked(pid: u32) -> bool {
+    let states = thread_states(pid);
+    !states.is_empty() && states.iter().all(|(_, parked)| *parked)
+}
+
+fn thread_states(pid: u32) -> Vec<(String, bool)> {
     #[cfg(target_os = "linux")]
     {
         fs::read_dir(format!("/proc/{pid}/task"))
             .unwrap()
             .flatten()
-            .filter_map(|task| fs::read_to_string(task.path().join("comm")).ok())
-            .map(|name| name.trim_end().to_owned())
+            .filter_map(|task| {
+                let status = fs::read_to_string(task.path().join("status")).ok()?;
+                let name = status
+                    .lines()
+                    .find_map(|line| line.strip_prefix("Name:\t"))?;
+                let state = status
+                    .lines()
+                    .find_map(|line| line.strip_prefix("State:\t"))?;
+                Some((
+                    name.to_owned(),
+                    state.starts_with('S') || state.starts_with('I'),
+                ))
+            })
             .collect()
     }
     #[cfg(target_vendor = "apple")]
@@ -719,7 +744,8 @@ pub fn thread_names(pid: u32) -> Vec<String> {
                 };
                 // SAFETY: the kernel NUL-terminates the name.
                 let name = unsafe { CStr::from_ptr(info.pth_name.as_ptr()) };
-                Some(name.to_string_lossy().into_owned())
+                // TH_STATE_WAITING from <mach/thread_info.h>.
+                Some((name.to_string_lossy().into_owned(), info.pth_run_state == 3))
             })
             .collect()
     }

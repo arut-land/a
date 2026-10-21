@@ -3,10 +3,14 @@
 //! and a background job's end is an event rather than something a poll
 //! finds.
 
+use std::io::{Read, Write};
+use std::net::TcpListener;
 use std::time::{Duration, Instant};
 
-use crate::common::{Env, thread_names, threads_and_switches, wait_within};
-use protocol::{Body, Target};
+use crate::common::{
+    Env, READ_TIMEOUT, thread_names, threads_and_switches, threads_parked, wait_for, wait_within,
+};
+use protocol::{Activity, Body, DaemonMsg, Target};
 
 /// What `rt::Threads` names its blocking threads.
 const BLOCKING: &str = "rt-blocking";
@@ -22,6 +26,21 @@ fn blocking_threads_retired(pid: u32) {
     );
 }
 
+/// An entry can precede the activity frame that certifies the turn ended.
+fn wait_idle(conn: &mut crate::common::Conn) {
+    while !matches!(
+        conn.recv(),
+        DaemonMsg::Activity {
+            activity: Activity::Idle,
+            ..
+        }
+    ) {}
+}
+
+fn parked(pid: u32) {
+    wait_for("the daemon's threads to park", || threads_parked(pid));
+}
+
 #[test]
 fn an_idle_daemon_never_wakes() {
     let env = Env::new("idle-wakes");
@@ -30,8 +49,10 @@ fn an_idle_daemon_never_wakes() {
     conn.attach(Target::New, &env.ws);
     conn.input("hello");
     conn.until(|e| matches!(e.body, Body::Assistant { .. }));
+    wait_idle(&mut conn);
     drop(conn);
     blocking_threads_retired(pid);
+    parked(pid);
     let (_, before) = threads_and_switches(pid);
     // The measurement: a window in which nothing happens to the daemon.
     std::thread::sleep(Duration::from_secs(3));
@@ -61,6 +82,7 @@ fn a_running_quiet_command_costs_no_threads() {
     }
     for conn in &mut conns {
         conn.until(|e| matches!(e.body, Body::ToolResult { .. }));
+        wait_idle(conn);
     }
     // Less the blocking threads the log's writes woke, as many as happened
     // to overlap.
@@ -68,21 +90,43 @@ fn a_running_quiet_command_costs_no_threads() {
         .iter()
         .filter(|name| *name != BLOCKING)
         .count();
+    let listener = TcpListener::bind(("127.0.0.1", 0)).unwrap();
+    listener.set_nonblocking(true).unwrap();
+    let port = listener.local_addr().unwrap().port();
     for conn in &mut conns {
-        conn.input("$ sleep 30");
+        conn.input(&format!(
+            "$ exec 3<>/dev/tcp/127.0.0.1/{port}; printf ready >&3; read -r reply <&3"
+        ));
     }
     for conn in &mut conns {
         conn.until(|e| matches!(e.body, Body::ToolProcess { .. }));
     }
+    // Each shell has executed the command and stays alive until released;
+    // neither machine load nor the measurement window can end it early.
+    let mut releases = Vec::new();
+    for _ in 0..CALLS {
+        let mut accepted = None;
+        wait_for("a quiet command to connect", || {
+            accepted = listener.accept().ok();
+            accepted.is_some()
+        });
+        let (mut stream, _) = accepted.unwrap();
+        stream.set_read_timeout(Some(READ_TIMEOUT)).unwrap();
+        let mut ready = [0; 5];
+        stream.read_exact(&mut ready).unwrap();
+        assert_eq!(&ready, b"ready");
+        releases.push(stream);
+    }
     // A blocking thread a command held while it runs would never retire.
     blocking_threads_retired(pid);
+    parked(pid);
     let (running, before) = threads_and_switches(pid);
     let running = usize::try_from(running).unwrap();
     // The measurement window.
     std::thread::sleep(Duration::from_secs(2));
     let (_, after) = threads_and_switches(pid);
     eprintln!(
-        "threads: {idle} with {CALLS} sessions, {running} with {CALLS} `sleep 30` running; \
+        "threads: {idle} with {CALLS} sessions, {running} with {CALLS} gated commands running; \
          {} wakes in 2 s while they run",
         after - before
     );
@@ -92,30 +136,50 @@ fn a_running_quiet_command_costs_no_threads() {
         running - idle
     );
     assert_eq!(after - before, 0, "quiet commands woke the daemon");
+    for stream in &mut releases {
+        stream.write_all(b"done\n").unwrap();
+    }
+    for conn in &mut conns {
+        conn.until(|e| matches!(e.body, Body::ToolResult { .. }));
+        wait_idle(conn);
+    }
     env.cmd(&["daemon", "stop"]).status().unwrap();
 }
 
 #[test]
-fn a_job_end_is_seen_at_once() {
+fn the_last_job_holds_the_daemon_until_it_ends() {
     let env = Env::new("job-exit");
     let config = env.home.config_file();
     let text = std::fs::read_to_string(&config).unwrap();
     std::fs::write(&config, text.replace("idle_secs = 15", "idle_secs = 1")).unwrap();
-    env.start();
+    let pid = env.start();
     let mut conn = env.connect();
     conn.attach(Target::New, &env.ws);
-    conn.input("$ sleep 3 >/dev/null &");
+    let listener = TcpListener::bind(("127.0.0.1", 0)).unwrap();
+    listener.set_nonblocking(true).unwrap();
+    let port = listener.local_addr().unwrap().port();
+    conn.input(&format!(
+        "$ (exec 3<>/dev/tcp/127.0.0.1/{port}; printf ready >&3; read -r reply <&3) &"
+    ));
     conn.until(|e| matches!(e.body, Body::ToolResult { .. }));
+    wait_idle(&mut conn);
+    let mut accepted = None;
+    wait_for("the background job to connect", || {
+        accepted = listener.accept().ok();
+        accepted.is_some()
+    });
+    let (mut release, _) = accepted.unwrap();
+    release.set_read_timeout(Some(READ_TIMEOUT)).unwrap();
+    let mut ready = [0; 5];
+    release.read_exact(&mut ready).unwrap();
+    assert_eq!(&ready, b"ready");
     drop(conn);
-    let started = Instant::now();
-    // The job holds the daemon up; once it ends, the daemon idles out
-    // within its second.
-    env.wait_exited("the daemon to exit");
-    let took = started.elapsed();
-    eprintln!("daemon exit after a 3 s job: {took:?}");
-    // 3 s of job and 1 s of idleness; a poll would add its period.
-    assert!(took >= Duration::from_millis(3500), "{took:?}");
-    assert!(took < Duration::from_millis(4600), "{took:?}");
+    // Retirement takes longer than the idle deadline. Only the job now
+    // holds the daemon, and it cannot end before the test releases it.
+    blocking_threads_retired(pid);
+    parked(pid);
+    release.write_all(b"done\n").unwrap();
+    env.wait_exited("the daemon to exit after its last job");
 }
 
 /// What `rt::Threads` names its async workers.
@@ -140,6 +204,8 @@ fn connections_add_no_threads() {
     let (id, _) = first.attach(Target::New, &env.ws);
     first.input("hello");
     first.until(|e| matches!(e.body, Body::Assistant { .. }));
+    wait_idle(&mut first);
+    parked(pid);
     let one = threads(pid);
     let conns: Vec<_> = (0..100)
         .map(|_| {
@@ -148,6 +214,7 @@ fn connections_add_no_threads() {
             conn
         })
         .collect();
+    parked(pid);
     let hundred = threads(pid);
     eprintln!("daemon threads: {one} with 1 client, {hundred} with 101");
     assert!(
