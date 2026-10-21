@@ -27,6 +27,8 @@ struct Compiler {
     limits: Limits,
 }
 struct Workspace {
+    compiler: Arc<Compiler>,
+    path: PathBuf,
     number: AtomicU64,
     current: Mutex<Arc<Registry>>,
     files: Mutex<Files>,
@@ -100,6 +102,28 @@ impl Generations for Workspace {
     }
     fn registry(&self) -> Arc<Registry> {
         Arc::clone(&lock(&self.current))
+    }
+    fn restore(
+        self: Arc<Self>,
+        installed: &[protocol::Installed],
+    ) -> Result<Arc<Registry>, Refused> {
+        let mut registry = (self.compiler.base)()?;
+        for extension in installed {
+            if let Some(image) = &extension.image {
+                registry = registry.with_dyn(Tier::User, &Mod::restore(&extension.name, image)?)?;
+            }
+        }
+        registry = registry.with(&Reload {
+            workspace: Arc::downgrade(&self),
+            compiler: Arc::clone(&self.compiler),
+            path: self.path.clone(),
+        })?;
+        if registry.installed() != installed {
+            return Err(Refused(
+                "recorded extension generation differs from this build".into(),
+            ));
+        }
+        Ok(Arc::new(registry))
     }
 }
 impl Compiler {
@@ -223,6 +247,8 @@ impl Sources for Source {
             return Ok(workspace);
         }
         let workspace = Arc::new(Workspace {
+            compiler: Arc::clone(&self.compiler),
+            path: path.to_path_buf(),
             number: AtomicU64::new(0),
             current: Mutex::new(Arc::new((self.compiler.base)()?)),
             files: Mutex::default(),
@@ -345,6 +371,33 @@ mod tests {
     use super::*;
 
     #[test]
+    fn recorded_generations_rebuild_their_own_folds_after_source_files_are_deleted() {
+        let root = std::env::temp_dir().join(format!("a-lua-history-{}", std::process::id()));
+        fs::create_dir_all(root.join("ext")).unwrap();
+        let file = root.join("ext/test.lua");
+        fs::write(
+            &file,
+            "a.fold{name='count',initial=0,apply=function(s,c) return s+c end}",
+        )
+        .unwrap();
+        let loader = Loader::new(&root, sys::config::Exts::default(), || {
+            Ok(Registry::default())
+        })
+        .unwrap();
+        let source = loader.0.open(&root, Arc::new(|_| {})).unwrap();
+        let installed = source.registry().installed();
+        fs::remove_file(file).unwrap();
+        let restored = source.restore(&installed).unwrap();
+        let mut states = restored.states();
+        states.fold("test", "count", &protocol::Json::encode(&2).unwrap());
+        states.fold("test", "count", &protocol::Json::encode(&3).unwrap());
+        assert_eq!(states.erased("test", "count").unwrap().raw(), "5");
+        assert_eq!(restored.installed(), installed);
+        drop(restored);
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
     fn workspace_subscriptions_release_their_registries_after_the_last_owner() {
         let root = std::env::temp_dir().join(format!("a-lua-lifetime-{}", std::process::id()));
         fs::create_dir_all(&root).unwrap();
@@ -373,6 +426,8 @@ mod tests {
         .unwrap();
         // Queuing work makes publication order explicit, independently of OS delivery.
         let workspace = Arc::new(Workspace {
+            compiler: Arc::clone(&loader.0.compiler),
+            path: root.clone(),
             number: AtomicU64::new(0),
             current: Mutex::new(Arc::new(Registry::default())),
             files: Mutex::default(),

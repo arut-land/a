@@ -20,6 +20,7 @@ use crate::{
 };
 
 pub use crate::assemble::Built;
+pub use crate::history::{HistoryNamespace, ValidatedPrefix};
 pub use crate::point::{Decided, Hooks};
 
 /// The engine, as a running call reaches it.
@@ -146,6 +147,7 @@ impl Toolset {
 struct Loaded {
     name: Name,
     version: u32,
+    image: Option<Json>,
     tier: Tier,
     made: Arc<Registrar>,
 }
@@ -196,6 +198,7 @@ impl Registry {
         self.install(Loaded {
             name: ext.name(),
             version: ext.version(),
+            image: ext.image(),
             tier,
             made: Arc::new(made),
         })
@@ -438,10 +441,12 @@ impl Registry {
 
     /// The extensions, as a log records them.
     pub fn installed(&self) -> Vec<Installed> {
-        self.extensions()
-            .map(|(name, version)| Installed {
-                name: name.to_owned(),
-                version,
+        self.installed
+            .iter()
+            .map(|loaded| Installed {
+                name: loaded.name.to_string(),
+                version: loaded.version,
+                image: loaded.image.clone(),
             })
             .collect()
     }
@@ -479,6 +484,18 @@ struct By {
     ext: Name,
 }
 
+/// Policy for importing a conversation prefix into an independent session.
+/// The engine supplies storage and publication; an extension decides which
+/// prefixes may continue. `ValidatedPrefix` preserves their checked ancestry.
+pub trait HistoryPolicy: Send + Sync {
+    fn namespace(&self) -> HistoryNamespace;
+    fn validate(
+        &self,
+        binding: Arc<dyn Binding>,
+        entries: &[protocol::Entry],
+    ) -> Result<(), protocol::ForkError>;
+}
+
 /// An owned workspace subscription. Reads never perform I/O or prepare work.
 pub trait Generations: Send + Sync {
     fn generation(&self) -> u64;
@@ -486,6 +503,16 @@ pub trait Generations: Send + Sync {
     /// Registers a weak callback. Mutable sources notify it after publication,
     /// off the async worker, before preparation returns.
     fn subscribe(&self, _changed: Weak<Changed>) {}
+    /// Rebuilds a recorded generation without consulting current source files.
+    fn restore(self: Arc<Self>, installed: &[Installed]) -> Result<Arc<Registry>, Refused> {
+        let registry = self.registry();
+        if registry.installed() != installed {
+            return Err(Refused(
+                "recorded extension generation cannot be restored".into(),
+            ));
+        }
+        Ok(registry)
+    }
 }
 
 pub type Changed = dyn Fn() + Send + Sync;

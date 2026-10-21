@@ -10,6 +10,7 @@ use std::fs::{self, File, OpenOptions};
 use std::io::{self, BufRead, BufReader, Write};
 use std::path::{Path, PathBuf};
 use std::sync::Mutex;
+use std::sync::atomic::{AtomicBool, Ordering};
 
 use protocol::ledger::Ledger;
 use protocol::{Activity, ReadOnly, SessionId, SessionSummary};
@@ -64,6 +65,7 @@ pub struct Catalog {
     /// `None` keeps it in memory only.
     path: Option<PathBuf>,
     state: Mutex<State>,
+    uncertain: AtomicBool,
     /// Each change of a session's busy mark, in order.
     #[cfg(test)]
     pub(crate) marks: Mutex<Vec<bool>>,
@@ -113,6 +115,11 @@ impl Catalog {
         let Some(path) = &self.path else {
             return Ok(());
         };
+        if self.uncertain.load(Ordering::Acquire) {
+            return Err(io::Error::other(
+                "an interrupted import requires catalog rebuild",
+            ));
+        }
         let mut state = lock(&self.state);
         state.file = Some(rewrite(path, &state)?);
         state.lines = state.records.len();
@@ -124,6 +131,7 @@ impl Catalog {
         Self {
             path,
             state: Mutex::new(state),
+            uncertain: AtomicBool::new(false),
             #[cfg(test)]
             marks: Mutex::default(),
         }
@@ -136,6 +144,37 @@ impl Catalog {
 
     pub fn get(&self, id: SessionId) -> Option<Record> {
         lock(&self.state).records.get(&id.0.as_u128()).cloned()
+    }
+
+    /// Publication and cataloguing share one recovery scope. Even an unwind
+    /// after rename leaves the dirty marker for the next startup to rebuild.
+    pub fn import(
+        &self,
+        store: &dyn LogStore,
+        header: &Header,
+        entries: &[protocol::Entry],
+    ) -> io::Result<()> {
+        struct Publishing<'a> {
+            catalog: &'a Catalog,
+            complete: bool,
+        }
+        impl Drop for Publishing<'_> {
+            fn drop(&mut self) {
+                if !self.complete {
+                    self.catalog.uncertain.store(true, Ordering::Release);
+                }
+            }
+        }
+        let mut publishing = Publishing {
+            catalog: self,
+            complete: false,
+        };
+        store.import(header, entries)?;
+        let mut record = Record::new(header.clone());
+        record.entries = entries.last().map_or(0, |entry| entry.seq.get());
+        self.record(record);
+        publishing.complete = true;
+        Ok(())
     }
 
     /// Notes `record`, unless it is what the catalog says already. It

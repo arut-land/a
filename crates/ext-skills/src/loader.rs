@@ -8,7 +8,7 @@ use std::sync::{Arc, Mutex, OnceLock, PoisonError, Weak};
 use ext::host::{Changed, Generations, Prepare, Registry, Sources, Updates};
 use ext::{Extension, Refused, Registrar, Tier};
 
-use crate::{Skill, Skills, parse};
+use crate::{Catalog, Skill, Skills, parse};
 
 /// Composes skills over a base registry and an optional generation source
 /// (for example Lua). Sessions retain their immutable generation until rest.
@@ -73,6 +73,55 @@ impl Generations for Workspace {
     }
     fn registry(&self) -> Arc<Registry> {
         lock(&self.current).registry.clone()
+    }
+    fn restore(
+        self: Arc<Self>,
+        installed: &[protocol::Installed],
+    ) -> Result<Arc<Registry>, Refused> {
+        let recorded = installed
+            .iter()
+            .find(|extension| extension.name == <Skills as Extension>::NAME)
+            .ok_or_else(|| Refused("recorded skills generation is absent".into()))?;
+        let catalog = recorded
+            .image
+            .as_ref()
+            .ok_or_else(|| Refused("recorded skill catalog is absent".into()))?
+            .parse::<BTreeMap<String, Skill>>()
+            .map_err(|e| Refused(e.to_string()))?;
+        // Each layer restores only its own image. The inner source sees the
+        // underlying installation that this overlay replaced, not its catalog.
+        let base = if let Some(inner) = self.inner.get() {
+            let underlying = self
+                .source
+                .base
+                .installed()
+                .into_iter()
+                .find(|extension| extension.name == recorded.name);
+            let installed: Vec<_> = installed
+                .iter()
+                .flat_map(|extension| {
+                    if extension.name == recorded.name {
+                        underlying.clone()
+                    } else {
+                        Some(extension.clone())
+                    }
+                })
+                .collect();
+            inner.clone().restore(&installed)?
+        } else {
+            self.source.base.clone()
+        };
+        let skills = Skills {
+            catalog: Arc::new(catalog),
+            ..self.source.skills.clone()
+        };
+        let registry = (*base).clone().with_dyn(Tier::Pre, &Catalog(skills))?;
+        if registry.installed() != installed {
+            return Err(Refused(
+                "recorded skills generation differs from this build".into(),
+            ));
+        }
+        Ok(Arc::new(registry))
     }
 }
 impl Sources for Source {
@@ -205,7 +254,7 @@ impl Workspace {
             catalog: catalog.clone(),
             ..self.source.skills.clone()
         };
-        let registry = (*base).clone().with_in(Tier::Pre, &skills)?;
+        let registry = (*base).clone().with_dyn(Tier::Pre, &Catalog(skills))?;
         *lock(&self.current) = Published {
             registry: Arc::new(registry),
             catalog: Some(catalog),

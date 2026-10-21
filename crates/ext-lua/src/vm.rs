@@ -20,6 +20,13 @@ pub struct Limits {
     pub slice: Duration,
 }
 
+impl Limits {
+    fn image(self, source: &str, tools: &[String]) -> mlua::Result<Json> {
+        Json::encode(&(source, tools, self.memory, self.instructions, self.slice))
+            .map_err(mlua::Error::external)
+    }
+}
+
 impl Default for Limits {
     fn default() -> Self {
         Self {
@@ -138,6 +145,7 @@ fn encode(value: &Value) -> mlua::Result<Json> {
 pub struct Mod {
     name: Name,
     version: u32,
+    image: Json,
     tools: Vec<Arc<LuaTool>>,
     hooks: Vec<(String, Arc<Hook>)>,
     texts: Vec<Text>,
@@ -318,6 +326,28 @@ fn register(lua: &Lua) -> mlua::Result<Arc<Mutex<Contributions>>> {
 }
 
 impl Mod {
+    pub(crate) fn restore(name: &str, image: &Json) -> Result<Self, Refused> {
+        let (source, tools, memory, instructions, slice): (
+            String,
+            Vec<String>,
+            usize,
+            u64,
+            Duration,
+        ) = image
+            .parse()
+            .map_err(|e| Refused(format!("lua {name}: {e}")))?;
+        Self::load(
+            name,
+            &source,
+            &tools,
+            Limits {
+                memory,
+                instructions,
+                slice,
+            },
+        )
+    }
+
     /// Compiles one generation; registration is transactional.
     pub fn load(
         name: &str,
@@ -361,6 +391,7 @@ impl Mod {
         let mut result = Self {
             name: Arc::clone(&name),
             version: fingerprint(source),
+            image: limits.image(source, tools)?,
             tools: Vec::new(),
             hooks: Vec::new(),
             texts: std::mem::take(&mut made.texts),
@@ -444,6 +475,10 @@ fn fingerprint(source: &str) -> u32 {
 }
 
 impl DynExtension for Mod {
+    fn image(&self) -> Option<Json> {
+        Some(self.image.clone())
+    }
+
     fn name(&self) -> Name {
         Arc::clone(&self.name)
     }

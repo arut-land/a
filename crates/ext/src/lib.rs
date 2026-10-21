@@ -31,6 +31,7 @@ mod agent;
 mod assemble;
 mod ext;
 mod flag;
+mod history;
 pub mod host;
 mod r#loop;
 pub mod point;

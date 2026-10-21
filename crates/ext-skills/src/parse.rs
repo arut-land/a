@@ -47,7 +47,7 @@ pub(crate) fn parse(source: &str, directory: &Path) -> Result<(String, Skill), S
                 header.name,
                 Skill {
                     description,
-                    directory: directory.to_path_buf(),
+                    directory: directory.display().to_string(),
                     body: source[end + line.len()..].to_owned(),
                 },
             ));

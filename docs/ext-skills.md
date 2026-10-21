@@ -85,7 +85,7 @@ before returning, and cloning a registry shares registrations while rebuilding
 its resolved tables. Weak generation subscriptions let derived sources prepare
 before a source reload completes, including explicit `/lua-reload`. `Host` and the kernel only route these operations to
 ordinary `Context` entries. No skills setting or name enters the
-kernel. Protocol 5 adds the optional publication identity to a context entry. Generation context is captured at
+kernel. Protocol 8 includes the optional publication identity to a context entry. Generation context is captured at
 binding, then logged before the first new model call; folding old entries does
 not regenerate it.
 
@@ -130,3 +130,15 @@ may itself be an alias. Unix discovery opens the resolved relative path through
 pinned directory descriptors with `NOFOLLOW`, preventing a concurrent ancestor
 replacement from redirecting the open. Windows checks the opened handle's final
 path before reading. The scan reads no candidate body until these checks pass.
+
+
+Forks replay publication identities and transcript edits only through the selected
+inclusive sequence. A prefix after a load retains that publication; one before
+it has none. `Extensions` installation facts also retain the immutable skill
+catalog image (names, descriptions, base-directory text, and bodies), so the
+fork can load its historical instructions after current files change or vanish.
+Those images are restoration data, not model context: only the index enters
+context until loading is requested. The skills source restores its own layer
+and delegates the underlying recorded installation to Lua when present; neither
+layer decodes the other's images. Restored installation identity is checked
+against the recorded installation before the fork is accepted.

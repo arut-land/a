@@ -22,10 +22,10 @@ pub struct Skills {
     catalog: Arc<BTreeMap<String, Skill>>,
 }
 
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 struct Skill {
     description: String,
-    directory: PathBuf,
+    directory: String,
     body: String,
 }
 
@@ -57,6 +57,23 @@ impl Extension for Skills {
             }));
         }
         r.text(ext::Text::generation("skills-index", 50, self.index()));
+    }
+}
+
+/// The installed overlay carries exactly the immutable catalog it contributes.
+struct Catalog(Skills);
+impl ext::DynExtension for Catalog {
+    fn name(&self) -> ext::Name {
+        ext::Name::from(<Skills as Extension>::NAME)
+    }
+    fn version(&self) -> u32 {
+        <Skills as Extension>::VERSION
+    }
+    fn image(&self) -> Option<protocol::Json> {
+        Some(protocol::Json::encode(&*self.0.catalog).expect("a catalog contains only strings"))
+    }
+    fn contribute(&self, r: &mut Registrar) {
+        Extension::contribute(&self.0, r);
     }
 }
 
@@ -118,8 +135,7 @@ impl Load {
             .ok_or_else(|| LoadError::UnknownSkill { name: name.into() })?;
         let text = format!(
             "Skill {name}\nBase directory: {}\n\n{}",
-            skill.directory.display(),
-            skill.body
+            skill.directory, skill.body
         );
         let key = (name.to_owned(), text.clone());
         let loaded = cx.published::<Instructions>(&key);

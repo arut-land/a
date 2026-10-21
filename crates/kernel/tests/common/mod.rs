@@ -182,6 +182,7 @@ impl Reg {
                 .map(|n| Installed {
                     name: (*n).to_owned(),
                     version: 1,
+                    image: None,
                 })
                 .collect(),
             panics: self.policy == Policy::Panic,
