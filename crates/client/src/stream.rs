@@ -59,7 +59,7 @@ impl ReplyStream {
                     },
                 ..
             } if self.active.take_if(|(id, _)| id == call).is_some() => {
-                events.push(ReplyEvent::End)
+                events.push(ReplyEvent::End);
             }
             Change::Snapshot => {
                 // Historical replies belong to transcript rendering; reconcile only
