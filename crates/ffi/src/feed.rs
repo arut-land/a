@@ -24,8 +24,6 @@ const BUDGET: client::QueueBudget = client::QueueBudget {
     requests: 512,
     control_reserve: 0,
 };
-const KEPT: usize = BUDGET.requests;
-const BYTES: usize = BUDGET.bytes;
 
 impl ViewUpdate {
     #[allow(unexpected_cfgs)]
@@ -59,7 +57,7 @@ impl Feed {
             rev: 0,
             bytes: 0,
             retained_bytes: 0,
-            recent: VecDeque::with_capacity(KEPT),
+            recent: VecDeque::with_capacity(BUDGET.requests),
             producer: StreamProducer::new(BUFFER),
         }
     }
@@ -81,7 +79,7 @@ impl Feed {
         };
         let mut bytes = update.retained_bytes();
         self.retained_bytes = self.retained_bytes.saturating_add(bytes);
-        if bytes > BYTES / BUFFER {
+        if bytes > BUDGET.bytes / BUFFER {
             self.recent.clear();
             self.bytes = 0;
             // The missing revision forces a snapshot before this small notification.
@@ -92,7 +90,7 @@ impl Feed {
             bytes = update.retained_bytes();
         }
         self.producer.push(update.clone());
-        while self.recent.len() >= KEPT || self.bytes + bytes > BYTES {
+        while !BUDGET.admits(self.bytes + bytes, self.recent.len(), false) {
             if let Some(old) = self.recent.pop_front() {
                 self.bytes -= old.retained_bytes();
             }
@@ -242,20 +240,20 @@ mod tests {
         let stream = feed.subscribe();
         feed.publish(ViewChange::Delta {
             call: 1,
-            text: "x".repeat(BYTES),
+            text: "x".repeat(BUDGET.bytes),
         });
-        assert!(feed.bytes < BYTES);
+        assert!(feed.bytes < BUDGET.bytes);
         assert!(matches!(feed.resync(0), Resync::Snapshot { .. }));
         let update = stream.pop_event().unwrap();
         assert_eq!(update.rev, 2);
         assert!(matches!(update.change, ViewChange::Activity));
-        for _ in 0..KEPT * 2 {
+        for _ in 0..BUDGET.requests * 2 {
             feed.publish(ViewChange::Error {
                 message: "x".repeat(16 << 10),
             });
         }
-        assert!(feed.bytes <= BYTES);
-        assert!(feed.recent.len() <= KEPT);
+        assert!(feed.bytes <= BUDGET.bytes);
+        assert!(feed.recent.len() <= BUDGET.requests);
         assert!(matches!(feed.resync(0), Resync::Snapshot { .. }));
     }
 }

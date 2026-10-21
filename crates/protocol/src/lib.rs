@@ -1222,7 +1222,7 @@ impl ClientMsg {
             bytes: None,
             count: size_of::<Self>(),
         };
-        let _ = self.encode(&mut count);
+        let _ = serde_json::to_writer(&mut count, self);
         count.count.max(
             size_of::<Self>()
                 + match self {
@@ -1233,19 +1233,7 @@ impl ClientMsg {
     }
 
     pub fn write_frame(&self, writer: &mut dyn Write) -> io::Result<()> {
-        let mut bytes = Frame::start();
-        self.encode(&mut EncodeTarget {
-            bytes: Some(&mut bytes),
-            count: 0,
-        })?;
-        prefix(&mut bytes)?;
-        writer.write_all(&bytes)?;
-        writer.flush()
-    }
-
-    #[inline(never)]
-    fn encode(&self, writer: &mut EncodeTarget<'_>) -> serde_json::Result<()> {
-        serde_json::to_writer(writer, self)
+        write_frame(writer, self)
     }
 }
 
@@ -1255,13 +1243,8 @@ impl DaemonMsg {
             bytes: None,
             count: size_of::<Self>(),
         };
-        let _ = self.encode(&mut count);
+        let _ = serde_json::to_writer(&mut count, self);
         count.count
-    }
-
-    #[inline(never)]
-    fn encode(&self, writer: &mut EncodeTarget<'_>) -> serde_json::Result<()> {
-        serde_json::to_writer(writer, self)
     }
 }
 
@@ -1412,9 +1395,15 @@ pub enum Class {
 
 /// Writes one frame: a little-endian u32 length followed by a JSON body,
 /// in one write.
-pub fn write_frame<T: Serialize>(w: &mut impl Write, msg: &T) -> io::Result<()> {
+pub fn write_frame<T: Serialize>(w: &mut (impl Write + ?Sized), msg: &T) -> io::Result<()> {
     let mut bytes = Frame::start();
-    serde_json::to_writer(&mut bytes, msg)?;
+    serde_json::to_writer(
+        &mut EncodeTarget {
+            bytes: Some(&mut bytes),
+            count: 0,
+        },
+        msg,
+    )?;
     prefix(&mut bytes)?;
     w.write_all(&bytes)?;
     w.flush()
@@ -1443,10 +1432,13 @@ pub struct Frame {
 impl Frame {
     pub fn new(msg: &DaemonMsg) -> io::Result<Self> {
         let mut bytes = Self::start();
-        msg.encode(&mut EncodeTarget {
-            bytes: Some(&mut bytes),
-            count: 0,
-        })?;
+        serde_json::to_writer(
+            &mut EncodeTarget {
+                bytes: Some(&mut bytes),
+                count: 0,
+            },
+            msg,
+        )?;
         Self::finish(bytes, None, msg.class())
     }
 

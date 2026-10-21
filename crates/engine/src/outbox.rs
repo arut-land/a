@@ -309,7 +309,7 @@ impl Outbox {
         {
             return Ok(());
         }
-        if q.frames.len() >= BUDGET.requests || q.bytes.saturating_add(len) > BUDGET.bytes {
+        if !BUDGET.admits(q.bytes.saturating_add(len), q.frames.len(), true) {
             q.closed = true;
             q.follow = None;
             q.frames.clear();
