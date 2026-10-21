@@ -1,6 +1,6 @@
-//! Drives the built `a` as a black box: each test gets its own `A_HOME`, its
-//! own link to the binary (so its daemons can be told apart from everyone
-//! else's), and a raw protocol connection to inspect what the daemon sends.
+//! Black-box cases use isolated homes and raw protocol connections.
+//! Every case executes the same built binary: executable aliases can be
+//! killed by the host before main. Staged home paths distinguish daemons.
 //! Every process a test starts is in the test's process group, which ends
 //! with the test however the test ends (see [`Group`]).
 
@@ -148,10 +148,7 @@ impl Env {
         let (bin, ws) = (root.join("bin"), root.join("ws"));
         fs::create_dir_all(&bin).unwrap();
         fs::create_dir_all(&ws).unwrap();
-        let exe = bin.join("a");
-        if fs::hard_link(built(), &exe).is_err() {
-            fs::copy(built(), &exe).unwrap();
-        }
+        let exe = built();
         let group = Group::new(&exe, root.join("homes"));
         let env = Self {
             home: Home::from(root.join("home")),
@@ -250,11 +247,11 @@ impl Env {
     /// earlier. As a CLI from another install would be next to the app's.
     pub fn older_build(&self) -> PathBuf {
         let exe = self.root.join("bin").join("a-old");
-        let mut bytes = fs::read(built()).unwrap();
+        let mut bytes = fs::read(&self.exe).unwrap();
         bytes.push(0);
         fs::write(&exe, bytes).unwrap();
         let file = fs::File::options().write(true).open(&exe).unwrap();
-        let built = fs::metadata(built()).unwrap().modified().unwrap();
+        let built = fs::metadata(&self.exe).unwrap().modified().unwrap();
         file.set_modified(built - Duration::from_secs(3600))
             .unwrap();
         file.set_permissions(fs::Permissions::from_mode(0o755))
@@ -797,4 +794,13 @@ pub fn threads_and_switches(pid: u32) -> (u64, u64) {
             u64::try_from(info.pti_csw).unwrap(),
         )
     }
+}
+
+#[test]
+fn every_case_executes_the_same_fixture_without_aliases() {
+    let first = Env::new("fixture-first");
+    let second = Env::new("fixture-second");
+    assert_ne!(first.home.root(), second.home.root());
+    assert_eq!(first.exe, built());
+    assert_eq!(second.exe, first.exe);
 }
