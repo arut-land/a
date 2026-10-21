@@ -18,6 +18,7 @@ use ext::{Configured, Cx, Extension, Need, Refused, Registrar, Spawner, Table, T
 use protocol::{Card, Mark, SessionId};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
+use sha2::{Digest, Sha256};
 
 /// One server's trusted launch settings. Environment entries override the
 /// attaching client's non-secret environment; secrets must be explicit.
@@ -432,8 +433,8 @@ impl Tool for Schema {
                 .ok_or_else(|| Failure::Protocol("unknown tool".into()))?;
             let definition = protocol::Json::encode(&remote.definition)
                 .map_err(|e| Failure::Protocol(e.to_string()))?;
-            let digest = ring::digest::digest(&ring::digest::SHA256, definition.raw().as_bytes());
-            let key = (input.server.clone(), input.tool.clone(), "sha256-v1", <[u8; 32]>::try_from(digest.as_ref()).expect("SHA-256 digest"));
+            let digest: [u8; 32] = Sha256::digest(definition.raw().as_bytes()).into();
+            let key = (input.server.clone(), input.tool.clone(), "sha256-v1", digest);
             let publication = ext::PreparedPublication::new::<ToolSchemas>(&key, format!("MCP schema {}/{}\n{}", input.server, input.tool, definition))
                 .map_err(|e| Failure::Protocol(e.to_string()))?;
             let loaded = cx.published_erased(<ToolSchemas as ext::Publication>::NAME, &publication.key);
@@ -585,6 +586,23 @@ mod publication_tests {
             .collect();
         assert_eq!(publications.len(), 2);
         assert_ne!(publications[0].1, publications[1].1);
+        // Pin the recorded identity independently of the SHA-256 implementation.
+        let digests = [
+            [
+                40, 5, 123, 111, 5, 228, 184, 116, 2, 241, 109, 232, 54, 54, 164, 213, 94, 185,
+                177, 205, 45, 172, 245, 9, 89, 24, 190, 254, 124, 82, 162, 178,
+            ],
+            [
+                112, 13, 100, 48, 87, 34, 15, 104, 211, 223, 217, 5, 227, 219, 210, 98, 250, 179,
+                193, 48, 30, 78, 162, 53, 211, 184, 113, 79, 86, 56, 49, 178,
+            ],
+        ];
+        for ((_, key), digest) in publications.iter().zip(digests) {
+            assert_eq!(
+                key.raw(),
+                json!(["fixture", "echo", "sha256-v1", digest]).to_string()
+            );
+        }
         for (text, key) in publications {
             assert!(text.len() > 5000);
             assert!(key.raw().len() < 200);
