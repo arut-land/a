@@ -159,7 +159,7 @@ copy the executable before the next build, then use the macOS probe:
 CARGO_BUILD_JOBS=2 CARGO_TARGET_DIR=/tmp/a-rss-build \
   mise exec -- cargo build-release -p a --features fixtures
 # Copy /tmp/a-rss-build/release/a to a revision-specific path first.
-python3 docs/perf/idle-rss.py /absolute/path/to/saved/a revision --output target/rss
+mise run perf:idle-rss /absolute/path/to/saved/a revision --output target/rss
 ```
 
 Use the probe from the final tree when measuring old checkouts. It waits for

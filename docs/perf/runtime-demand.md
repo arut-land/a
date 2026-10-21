@@ -78,7 +78,7 @@ its socket, including registration after cancellation.
 
 ## Session measurements
 
-The reproducible harness is [runtime-demand.rs](runtime-demand.rs), compiled
+The reproducible harness is [runtime_demand.rs](../../crates/engine/src/tests/runtime_demand.rs), compiled
 as an ignored engine test. It uses 24 file-backed sessions, each containing
 1,200 assistant entries of approximately 1 KiB. CPU timing covers concurrent
 attach requests through replay, view rebuilding, and snapshot framing.
@@ -88,12 +88,8 @@ There are six samples per worker count, with 2/4/7-worker order reversed
 on alternate rounds. No remote provider is contacted.
 
 ```sh
-A_BENCH_CPU_MIB=32 CARGO_BUILD_JOBS=2 cargo nextest run --release -p engine --lib \
-  -E 'test(tests::runtime_demand::concurrent_session_sizing)' \
-  --run-ignored only --test-threads 1 --no-capture --no-tests fail
-A_BENCH_CPU_MIB=64 CARGO_BUILD_JOBS=2 cargo nextest run --release -p engine --lib \
-  -E 'test(tests::runtime_demand::concurrent_session_sizing)' \
-  --run-ignored only --test-threads 1 --no-capture --no-tests fail
+A_BENCH_CPU_MIB=32 CARGO_BUILD_JOBS=2 mise run perf:runtime-demand
+A_BENCH_CPU_MIB=64 CARGO_BUILD_JOBS=2 mise run perf:runtime-demand
 ```
 
 Independent review measured these medians on the Apple M3 (8 cores,
