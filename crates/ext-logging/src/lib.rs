@@ -69,6 +69,7 @@ pub enum Rule {
 #[derive(Clone, Copy, Debug, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum Operation {
+    Create,
     Commit,
     Reload,
     Snapshot,
@@ -491,6 +492,20 @@ mod tests;
 #[cfg(feature = "testing")]
 pub mod testing {
     use super::{CURRENT, Fact, Logger};
+    /// Startup failures have no actor or installed writer. Inspect admitted
+    /// facts directly in process-isolated tests, without altering admission.
+    pub fn pending() -> Vec<Fact> {
+        CURRENT
+            .get_or_init(Logger::new)
+            .0
+            .records
+            .lock()
+            .unwrap()
+            .iter()
+            .map(|record| record.fact)
+            .collect()
+    }
+
     pub struct Stall(Option<std::sync::mpsc::Sender<()>>);
     impl Drop for Stall {
         fn drop(&mut self) {

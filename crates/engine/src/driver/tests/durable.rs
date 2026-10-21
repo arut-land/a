@@ -1091,3 +1091,33 @@ fn attaching_behind_a_deferred_write_gets_activity_after_sync_or_recovery() {
         );
     }
 }
+
+#[test]
+fn initial_store_failures_keep_the_session_operation_and_kind() {
+    let fixture = Fixture::new(
+        ext_fixtures::ECHO,
+        Registry::default(),
+        openai(&Script::new(&[])),
+    );
+    let existing = Fixture::header();
+    drop(fixture.0.store.create(&existing).unwrap());
+    let missing = Fixture::header();
+    for (header, open, expected) in [
+        (&existing, Open::Create, io::ErrorKind::AlreadyExists),
+        (&missing, Open::Load, io::ErrorKind::NotFound),
+    ] {
+        let error = Live::start(header, &fixture.0, open, Owner::None)
+            .err()
+            .unwrap();
+        assert_eq!(error.kind(), expected);
+        let recorded = ext_logging::testing::pending().into_iter().filter(|fact| {
+            matches!(fact, ext_logging::Fact::Fault { session: Some(id), operation, kind }
+                if *id == header.id && kind.0 == expected && matches!((open, operation),
+                    (Open::Create, ext_logging::Operation::Create) | (Open::Load, ext_logging::Operation::Reload)))
+        }).count();
+        assert_eq!(
+            recorded, 1,
+            "each failed store admission has exactly one fact"
+        );
+    }
+}

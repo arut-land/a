@@ -101,7 +101,10 @@ fn load_registry(
     source: &Arc<dyn ext::host::Generations>,
 ) -> io::Result<Arc<Registry>> {
     let seq = shared.catalog.get(header.id).map_or(0, |r| r.entries);
-    let entries = shared.store.prefix(header.id, seq)?;
+    let entries = shared
+        .store
+        .prefix(header.id, seq)
+        .inspect_err(|e| store_fault(header.id, ext_logging::Operation::Reload, e))?;
     let installed = entries.iter().rev().find_map(|entry| match &entry.body {
         Body::Extensions { installed } => Some(installed.as_slice()),
         _ => None,
@@ -631,11 +634,16 @@ impl Folding {
         let (mut loaded, folding) =
             Self::rebuild(binding, registry, shared, |restore, each| match open {
                 Open::Create => {
-                    let created = shared.store.create(header)?;
+                    let created = shared.store.create(header).inspect_err(|e| {
+                        store_fault(header.id, ext_logging::Operation::Create, e)
+                    })?;
                     shared.catalog.record(Record::new(header.clone()));
                     Ok(created)
                 }
-                Open::Load => shared.store.load(header.id, restore, each),
+                Open::Load => shared
+                    .store
+                    .load(header.id, restore, each)
+                    .inspect_err(|e| store_fault(header.id, ext_logging::Operation::Reload, e)),
             })?;
         if loaded.writer.read_only().is_none()
             && folding.core.ledger().extensions().is_some_and(|installed| {
@@ -1636,7 +1644,10 @@ impl Actor {
                 Folding::open(&header, &shared, Open::Load, &bound, &registry)?;
             // A failed sync may have left complete, readable bytes. They
             // cannot be published until the replacement writer syncs them.
-            loaded.writer.sync()?;
+            loaded
+                .writer
+                .sync()
+                .inspect_err(|e| store_fault(header.id, ext_logging::Operation::Reload, e))?;
             io::Result::Ok((loaded, folding))
         })
         .await;
@@ -1645,13 +1656,13 @@ impl Actor {
                 .writer
                 .flushed(&*self.live.session.shared.rt)
                 .await
+                .inspect_err(|e| store_fault(self.live.id, ext_logging::Operation::Reload, e))
                 .map(|()| (loaded, folding)),
             Err(error) => Err(error),
         };
         let (loaded, folding) = match reloaded {
             Ok(reloaded) => reloaded,
             Err(e) => {
-                store_fault(self.live.id, ext_logging::Operation::Reload, &e);
                 eprintln!("session {}: reloading: {e}", self.live.id.short());
                 self.phase = Phase::Draining;
                 return;
