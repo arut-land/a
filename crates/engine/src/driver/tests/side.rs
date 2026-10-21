@@ -1096,9 +1096,9 @@ fn answering_an_approval_cancels_its_description_without_cancelling_the_tool() {
             .unwrap();
         let shown = view.present(tool);
         assert!(matches!(shown.buttons, protocol::view::Buttons::Approve(_)));
-        assert_eq!(
-            client::approval_text(&shown),
-            "Why: the ask mode requires approval for this tool"
+        assert!(
+            client::approval_text(&shown)
+                .ends_with("Why: the ask mode requires approval for this tool")
         );
         assert!(rt::block_on(first(started.wait(), fixture.0.rt.sleep(PATIENCE))).is_some());
         let call = inbox(&asked)[0];

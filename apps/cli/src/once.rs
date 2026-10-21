@@ -286,16 +286,14 @@ impl Once {
                     Some((
                         tool,
                         item.present().title,
-                        client::approval_text(&view.present(item)),
+                        approval_message(&view.present(item), &id),
                     ))
                 }
                 _ => None,
             });
             match approval {
                 Some((tool, title, explanation)) => eprintln!(
-                    "a: {tool} ({title}) waits for approval in session {id}. {explanation}. The session keeps the \
-                     question open: {answer}, or run with `--mode auto` (A_MODE=auto) to let \
-                     calls through unasked"
+                    "a: {tool} ({title}) waits for approval in session {id}.\n{explanation}"
                 ),
                 None => eprintln!("a: the turn waits for an answer in session {id}: {answer}"),
             }
@@ -308,6 +306,13 @@ impl Once {
             });
         }
     }
+}
+
+fn approval_message(p: &protocol::view::Presented<'_>, id: &str) -> String {
+    client::approval_parts(p).into_iter().map(|part| match part {
+        client::ApprovalPart::Controls { .. } => format!("The session keeps the question open: answer it with `a attach {id}` or in `a web`, or run with `--mode auto` (A_MODE=auto) to let calls through unasked"),
+        part => part.text().unwrap_or_default().to_owned(),
+    }).collect::<Vec<_>>().join("\n")
 }
 
 impl Renderer for Once {
@@ -353,6 +358,7 @@ mod tests {
     use protocol::{
         Activity, Audience, Body, DaemonMsg, Entry, Epoch, Json, Mode, Outcome, Seq, SessionId,
     };
+    use protocol::{Decode, view::SessionView};
 
     fn receive(once: &mut Once, msg: DaemonMsg) {
         let effects = once.client.step(Event {
@@ -528,5 +534,47 @@ mod tests {
         assert_eq!(input(Some("hi"), None), "hi");
         assert_eq!(input(Some("hi"), Some("\n\n")), "hi");
         assert_eq!(input(None, Some("  \n")), "");
+    }
+    #[test]
+    fn every_summary_follows_complete_effective_input_before_controls() {
+        let vectors: serde_json::Value = serde_json::from_str(include_str!(
+            "../../../crates/protocol/tests/vectors/view.json"
+        ))
+        .unwrap();
+        for vector in vectors
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter(|v| v["name"].as_str().unwrap().starts_with("approval reviews "))
+        {
+            let mut view = SessionView::default();
+            for message in vector["messages"].as_array().unwrap() {
+                view.fold(&DaemonMsg::from_json(message.to_string().as_bytes()).unwrap());
+            }
+            let p = view.present(&view.items[0]);
+            let text = approval_message(&p, "id");
+            let reason = text.find("Why:").unwrap();
+            let summary = text.find("Model summary (unverified):").unwrap();
+            assert!(reason < summary && summary < text.find("`a attach id`").unwrap());
+            let markers: &[&str] = if vector["name"].as_str().unwrap().contains("multiline") {
+                &[
+                    "printf harmless\nrm -rf /tmp/approval-test-sentinel",
+                    "60000",
+                    "every argument",
+                ]
+            } else {
+                &[
+                    "/work/deep/config.ini",
+                    "-allow = false",
+                    "+allow = true",
+                    "-delete = no",
+                    "+delete = yes",
+                    "flag",
+                ]
+            };
+            for marker in markers {
+                assert!(text.find(marker).unwrap() < reason, "{marker}: {text}");
+            }
+        }
     }
 }

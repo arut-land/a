@@ -4,6 +4,7 @@
 
 use protocol::view::Item;
 
+use super::super::render::Viewport;
 use super::super::text::Line;
 use super::super::view::{self, Live, Look};
 use super::{App, Rows};
@@ -42,6 +43,7 @@ impl App {
             let look = Look {
                 collapsed: self.collapsed.contains(&item.key()),
                 verbose: self.verbose,
+                deny: self.deny,
             };
             *slot = Some(Rows {
                 width,
@@ -81,6 +83,9 @@ impl App {
             Some(at) => at,
             None => self.bottom_start(width, body),
         };
+        if self.viewport == Viewport::Inline && !self.verbose && i < self.committed {
+            (i, row) = (self.committed, 0);
+        }
         let mut out = Vec::with_capacity(body);
         while out.len() < body && i < self.client.view().items.len() {
             let len = self.rows(i, width).len();

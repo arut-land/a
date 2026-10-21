@@ -4,11 +4,11 @@ use std::fmt::Write as _;
 use std::path::Path;
 
 use client::{End, Link};
-use protocol::view::{Item, Usage, call_title, recap_line};
+use protocol::view::{Item, Usage, recap_line};
 
 use super::super::render::{Canvas, Viewport, ellipsize, fit};
 use super::super::text::{Action, Color, Line, SmolStr, Span, Style, sanitize, width_of, wrap};
-use super::super::view::{ASK, MUTED, USER};
+use super::super::view::{MUTED, USER};
 use super::{App, HELP, Overlay};
 
 /// The input shows at most this many rows; it scrolls past them.
@@ -120,40 +120,7 @@ impl App {
             }
             out.extend(rows);
         }
-        let asked = summary.asked.map(|i| &self.client.view().items[i]);
-        if let Some(Item::Tool {
-            call,
-            tool,
-            input,
-            card,
-            ..
-        }) = asked
-        {
-            let call_text = call_title(tool, input, card.as_ref()).replace('\n', " ");
-            let room = width.saturating_sub("Do you want to proceed? ".len());
-            out.push(Line::from([
-                Span::new("Do you want to proceed? ", ASK),
-                Span::new(ellipsize(&call_text, room), MUTED),
-            ]));
-            let pick = |mark: &'static str, label: &'static str, yes| {
-                let cyan = Style::new().fg(Color::Cyan);
-                Line::from([
-                    Span::button(mark, cyan, Action::Approve(*call, yes)),
-                    Span::button(
-                        label,
-                        if yes == self.deny {
-                            Style::new()
-                        } else {
-                            cyan.bold()
-                        },
-                        Action::Approve(*call, yes),
-                    ),
-                ])
-            };
-            let at = |no: bool| if no == self.deny { "❯ " } else { "  " };
-            out.push(pick(at(false), "1. Yes", true));
-            out.push(pick(at(true), "2. No", false));
-        }
+        let asked = summary.asked.is_some();
         if let Some((text, style)) = &self.flash {
             out.push(Line::plain(ellipsize(text, width), *style));
         }
@@ -166,7 +133,7 @@ impl App {
         let caret_row = out.len() + usize::from(cy) - skip;
         out.extend(rows.into_iter().skip(skip).take(INPUT_ROWS));
         out.push(rule);
-        let hint = if asked.is_some() {
+        let hint = if asked {
             "↑/↓ choose · enter confirms · 1/y yes · 2/n/esc no"
         } else if self.client.turn().running {
             "esc stops it · ? help"
@@ -431,7 +398,7 @@ impl App {
     /// screen; inline, its live rows (at most half the terminal) and what
     /// is under them. Expanded transcript review uses the whole viewport.
     pub fn height(&mut self, w: u16, h: u16) -> u16 {
-        if self.viewport == Viewport::Full || self.verbose {
+        if self.viewport == Viewport::Full || self.verbose || self.client.turn().asking.is_some() {
             return h;
         }
         let width = usize::from(w);
@@ -504,7 +471,13 @@ impl App {
         let (w, _) = canvas.size();
         let (width, rows) = (usize::from(w), usize::from(body));
         let shown = match viewport {
-            Viewport::Inline if !self.verbose => self.live(width, rows),
+            Viewport::Inline
+                if !self.verbose
+                    && self.client.turn().asking.is_none()
+                    && self.anchor.is_none() =>
+            {
+                self.live(width, rows)
+            }
             Viewport::Full | Viewport::Inline => self.window(width, rows),
         };
         // A short transcript sits at the bottom, by the input.

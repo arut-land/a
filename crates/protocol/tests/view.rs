@@ -560,7 +560,21 @@ fn scenarios() -> Vec<(&'static str, Vec<Value>)> {
             })
             .collect::<Vec<_>>()
     };
-    vec![
+    let review = |tool: &str, effective: Value| {
+        vec![
+        attached(),
+        entry(1, Body::ToolCall { tool: tool.into(), input: Json::encode(&json!({"command":"original harmless input"})).unwrap(), id: None, card: Some(Card { title: "shortened title".into(), ..Card::default() }), by: Audience::Model }),
+        entry(2, Body::Decision { by: "rewrite".into(), call: Some(call(1)), d: Verdict::PreTool { input: Json::encode(&effective).unwrap() } }),
+        entry(3, ask(1)),
+        msg(DaemonMsg::Activity { seq: 3, activity: protocol::Activity::Approval }),
+        entry(4, Body::ModelCall { model: "fast".into(), attempt: 0, choice: protocol::ToolChoice::Auto, r#for: Some(call(1)), purpose: Some("approval-description".into()), request: None }),
+        entry(5, Body::ModelResult { call: call(4), r#for: Some(call(1)), failure: None, outcome: Outcome::Done { output: Json::encode(&json!({"message":{"content":[{"type":"text","text":"Only lists files."}]}})).unwrap() } }),
+        msg(DaemonMsg::Synced { seq: 5 }),
+    ]
+    };
+    let mut scenarios = vec![
+        ("approval reviews the effective multiline call", review("bash", json!({"command":"printf harmless\nrm -rf /tmp/approval-test-sentinel", "timeout":60000, "extra":"every argument"}))),
+        ("approval reviews every edit replacement", review("edit", json!({"path":"/work/deep/config.ini", "edits":[{"old":"allow = false\nkeep = yes", "new":"allow = true\nkeep = yes"}, {"old":"delete = no", "new":"delete = yes"}], "extra":{"flag":true}}))),
         (
             "approval reason precedes its optional description",
             vec![
@@ -933,7 +947,36 @@ fn scenarios() -> Vec<(&'static str, Vec<Value>)> {
         }),
         ("generated session 7", generated(7)),
         ("generated session 11", generated(11)),
-    ]
+    ];
+    for (source, name) in [
+        (
+            "approval reviews the effective multiline call",
+            "approval reviews a user multiline call",
+        ),
+        (
+            "approval reviews every edit replacement",
+            "approval reviews a user edit replacement",
+        ),
+    ] {
+        let messages = scenarios
+            .iter()
+            .find(|(name, _)| *name == source)
+            .unwrap()
+            .1
+            .iter()
+            .map(|value| {
+                let mut msg = DaemonMsg::from_json(value.to_string().as_bytes()).unwrap();
+                if let DaemonMsg::Entry(entry) = &mut msg
+                    && let Body::ToolCall { by, .. } = &mut entry.body
+                {
+                    *by = Audience::User;
+                }
+                serde_json::to_value(msg).unwrap()
+            })
+            .collect();
+        scenarios.push((name, messages));
+    }
+    scenarios
 }
 
 /// Folds each vector's messages and compares the updates, the state and
@@ -953,6 +996,7 @@ fn vectors() {
                 .collect();
             json!({
                 "name": name,
+                "frames": messages.iter().map(Value::to_string).collect::<Vec<_>>(),
                 "messages": messages,
                 "updates": updates,
                 "state": view,

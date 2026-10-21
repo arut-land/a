@@ -2,7 +2,7 @@
 //! out from what [`Item::present`] says of each.
 
 use protocol::view::md::{self, Block, Inline};
-use protocol::view::{Buttons, Glyph, Item, Kind, Presented, Shown};
+use protocol::view::{Glyph, Item, Kind, Presented, Shown};
 use protocol::{CallId, Json};
 
 use super::render::ellipsize;
@@ -27,6 +27,7 @@ pub struct Look {
     pub collapsed: bool,
     /// Every card's whole output and input (Ctrl-O).
     pub verbose: bool,
+    pub deny: bool,
 }
 
 /// The colour of a status class.
@@ -279,7 +280,12 @@ fn card(
 ) -> Vec<Line> {
     let toggle = Action::Toggle(key);
     let status = status(p);
-    let body = output_rows(p, input, width, look.verbose);
+    let review = client::approval_parts(p);
+    let body = if review.is_empty() {
+        output_rows(p, input, width, look.verbose)
+    } else {
+        Vec::new()
+    };
     // The dot takes the state's color; the output hangs under it behind `⎿`.
     let marker = "⏺ ";
     let dot = match p.glyph {
@@ -323,28 +329,40 @@ fn card(
     if let Some(first) = out.get_mut(from).and_then(|row| row.spans.first_mut()) {
         first.text = format!("  ⎿  {}", first.text.trim_start_matches(' ')).into();
     }
-    for text in client::approval_text(p).lines() {
-        out.extend(wrap(
-            &[Span::new(sanitize(text), ASK)],
-            width,
-            &[Span::new("     ", MUTED)],
-            &[Span::new("     ", MUTED)],
-        ));
-    }
-    if let Buttons::Approve(call) = p.buttons {
-        out.push(approve_row(call));
+    for part in review {
+        match part {
+            client::ApprovalPart::Controls { call, title } => {
+                out.extend(approve_rows(call, &title, look.deny, width));
+            }
+            part => {
+                for text in part.text().unwrap_or_default().split('\n') {
+                    out.extend(wrap(
+                        &[Span::new(sanitize(text), ASK)],
+                        width,
+                        &[Span::new("     ", MUTED)],
+                        &[Span::new("     ", MUTED)],
+                    ));
+                }
+            }
+        }
     }
     out
 }
 
 /// The row that answers call `call`'s ask.
-fn approve_row(call: CallId) -> Line {
-    Line::from([
-        Span::new("  allow this call?  ", ASK),
-        Span::button("[ y  yes ]", OK.bold(), Action::Approve(call, true)),
-        Span::new("  ", Style::new()),
-        Span::button("[ n  no ]", BAD.bold(), Action::Approve(call, false)),
-    ])
+fn approve_rows(call: CallId, title: &str, deny: bool, width: usize) -> Vec<Line> {
+    let mut rows = vec![Line::plain(
+        ellipsize(&format!("Do you want to proceed? {title}"), width),
+        ASK,
+    )];
+    for (no, label) in [(false, "1. Yes"), (true, "2. No")] {
+        let mark = if no == deny { "❯ " } else { "  " };
+        rows.push(Line::from([
+            Span::button(mark, ASK, Action::Approve(call, !no)),
+            Span::button(label, ASK, Action::Approve(call, !no)),
+        ]));
+    }
+    rows
 }
 
 /// A call's output rows indented under the card's header; a diff colored as one.
@@ -440,7 +458,13 @@ mod tests {
         let item = tool(None, Phase::Waiting(WaitOn::Approval));
         let lines = rows(&item, 60, Look::default());
         assert_eq!(texts(&lines)[1], "⏺ $ ls  ? waiting for approval");
-        let buttons: Vec<_> = lines[2].spans.iter().filter_map(|s| s.action).collect();
+        let mut buttons: Vec<_> = lines
+            .iter()
+            .flat_map(|line| &line.spans)
+            .filter_map(|span| span.action)
+            .filter(|action| matches!(action, Action::Approve(..)))
+            .collect();
+        buttons.dedup();
         let call = CallId::new(7).unwrap();
         assert_eq!(
             buttons,
@@ -469,7 +493,11 @@ mod tests {
                 .iter()
                 .any(|line| line.contains("Why: the classifier requested approval: needs review"))
         );
-        assert!(lines.iter().any(|line| line.contains("allow this call?")));
+        assert!(
+            lines
+                .iter()
+                .any(|line| line.contains("Do you want to proceed?"))
+        );
     }
 
     #[test]

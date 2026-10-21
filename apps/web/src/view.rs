@@ -5,7 +5,7 @@
 //! item says is [`Item::present`]'s; here is only where it goes.
 use hypertext::prelude::*;
 use protocol::view::md::{self, Block, Inline};
-use protocol::view::{Buttons, Glyph, Item, Kind, Presented, SessionView, Shown, recap_line};
+use protocol::view::{Glyph, Item, Kind, Presented, SessionView, Shown, recap_line};
 use protocol::{CallId, SessionId, SessionSummary};
 
 use crate::{http, style};
@@ -199,6 +199,9 @@ pub fn item_row<'a>(item: &'a Item, view: &'a SessionView) -> impl Renderable {
                 Kind::Tool => {
                     ToolCard p=(&p);
                 }
+                Kind::Command if !client::approval_parts(&p).is_empty() => {
+                    ToolCard p=(&p);
+                }
                 Kind::Command => {
                     div style=(style::NOTE) {
                         span style=(style::MONO) { (p.title) }
@@ -277,16 +280,21 @@ fn tool_card<'a>(p: &'a Presented<'a>) -> impl Renderable {
                 span style=(style::MONO) { (p.title) }
                 span style=(status_style(p.glyph)) { (p.status) }
             }
-            @if p.reason.is_some() {
-                div style=(style::NOTE) { @for line in client::approval_text(p).lines() { div { (line) } } }
-            }
-            @if let Buttons::Approve(call) = p.buttons {
-                div style=(style::ASK) {
-                    span { "Run this?" }
-                    button style=(style::BUTTON)
-                        data-on:click={ "@post('/api/approve?call=" (call.get()) "&ok=1')" } { "Approve" }
-                    button style=(style::BUTTON_QUIET)
-                        data-on:click={ "@post('/api/approve?call=" (call.get()) "&ok=0')" } { "Deny" }
+            @for part in client::approval_parts(p) {
+                @match part {
+                    client::ApprovalPart::Call { text } => { pre style=(style::OUTPUT) { (text) } }
+                    client::ApprovalPart::Reason { text } | client::ApprovalPart::UnverifiedSummary { text } => {
+                        pre style=(style::NOTE) { (text) }
+                    }
+                    client::ApprovalPart::Controls { call, .. } => {
+                        div style=(style::ASK) {
+                            span { "Run this?" }
+                            button style=(style::BUTTON)
+                                data-on:click={ "@post('/api/approve?call=" (call.get()) "&ok=1')" } { "Approve" }
+                            button style=(style::BUTTON_QUIET)
+                                data-on:click={ "@post('/api/approve?call=" (call.get()) "&ok=0')" } { "Deny" }
+                        }
+                    }
                 }
             }
             @match &p.body {
@@ -378,4 +386,59 @@ fn group(text: &str) -> Vec<Group<'_>> {
         }
     }
     groups
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use protocol::{DaemonMsg, Decode};
+
+    #[test]
+    fn every_summary_has_complete_effective_input_above_it_and_controls_below() {
+        let vectors: serde_json::Value = serde_json::from_str(include_str!(
+            "../../../crates/protocol/tests/vectors/view.json"
+        ))
+        .unwrap();
+        for vector in vectors
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter(|v| v["name"].as_str().unwrap().starts_with("approval reviews "))
+        {
+            let mut view = SessionView::default();
+            for message in vector["messages"].as_array().unwrap() {
+                view.fold(&DaemonMsg::from_json(message.to_string().as_bytes()).unwrap());
+            }
+            let rendered = html(ItemRow {
+                item: &view.items[0],
+                view: &view,
+            });
+            let reason = rendered.find("Why:").unwrap();
+            let summary = rendered.find("Model summary (unverified):").unwrap();
+            let controls = rendered.find("Run this?").unwrap();
+            assert!(reason < summary && summary < controls);
+            let markers: &[&str] = if vector["name"].as_str().unwrap().contains("multiline") {
+                &[
+                    "printf harmless\nrm -rf /tmp/approval-test-sentinel",
+                    "60000",
+                    "every argument",
+                ]
+            } else {
+                &[
+                    "/work/deep/config.ini",
+                    "-allow = false",
+                    "+allow = true",
+                    "-delete = no",
+                    "+delete = yes",
+                    "flag",
+                ]
+            };
+            for marker in markers {
+                assert!(
+                    rendered.find(marker).unwrap() < reason,
+                    "missing full input: {marker}: {rendered}"
+                );
+            }
+        }
+    }
 }

@@ -116,6 +116,7 @@ pub struct Presented<'a> {
     pub buttons: Buttons,
     pub reason: Option<&'a ApprovalReason>,
     pub description: Option<&'a str>,
+    pub input: Option<(&'a str, &'a Json)>,
 }
 
 /// An item with nothing to say of its state.
@@ -130,6 +131,7 @@ fn plain<'a>(kind: Kind, title: Cow<'a, str>, body: Shown<'a>) -> Presented<'a> 
         buttons: Buttons::None,
         reason: None,
         description: None,
+        input: None,
     }
 }
 
@@ -173,6 +175,7 @@ impl Item {
                 let mut p = plain(kind, title, Shown::None);
                 standing(&mut p, *call, phase, outcome.as_ref(), card.as_ref());
                 p.reason = reason.as_deref();
+                p.input = Some((tool, input));
                 p
             }
             Self::Hook {

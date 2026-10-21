@@ -154,6 +154,8 @@ struct ItemView: View {
             ReplyView(shown: shown, streaming: live(call, status))
         case .tool:
             ToolView(shown: shown, store: store)
+        case .command where !shown.approval.isEmpty:
+            ToolView(shown: shown, store: store)
         case .command:
             VStack(alignment: .leading) {
                 HStack {
@@ -281,15 +283,20 @@ struct ToolView: View {
                     ProgressView().controlSize(.small)
                 }
             }
-            if !shown.explanation.isEmpty {
-                Text(shown.explanation).font(.callout).textSelection(.enabled)
-            }
-            if let call = shown.approve {
-                HStack {
-                    Button("Approve") { Task { await store.approve(call: call, approved: true) } }
-                        .buttonStyle(.borderedProminent)
-                    Button("Deny", role: .destructive) {
-                        Task { await store.approve(call: call, approved: false) }
+            ForEach(Array(shown.approval.enumerated()), id: \.offset) { _, part in
+                switch part {
+                case .call(let text):
+                    Text(text).font(.callout.monospaced()).textSelection(.enabled)
+                        .fixedSize(horizontal: false, vertical: true)
+                case .reason(let text), .unverifiedSummary(let text):
+                    Text(text).font(.callout).textSelection(.enabled)
+                case .controls(let call):
+                    HStack {
+                        Button("Approve") { Task { await store.approve(call: call, approved: true) } }
+                            .buttonStyle(.borderedProminent)
+                        Button("Deny", role: .destructive) {
+                            Task { await store.approve(call: call, approved: false) }
+                        }
                     }
                 }
             }

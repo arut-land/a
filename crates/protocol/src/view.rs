@@ -356,6 +356,25 @@ impl SessionView {
     pub fn present<'a>(&'a self, item: &'a Item) -> Presented<'a> {
         let mut shown = item.present();
         if let Item::Tool {
+            call, tool, input, ..
+        } = item
+        {
+            let effective = self
+                .items
+                .iter()
+                .rev()
+                .find_map(|item| match item {
+                    Item::Hook {
+                        call: Some(owner),
+                        decision: Verdict::PreTool { input },
+                        ..
+                    } if owner == call => Some(input),
+                    _ => None,
+                })
+                .unwrap_or(input);
+            shown.input = Some((tool, effective));
+        }
+        if let Item::Tool {
             call,
             outcome: None,
             ..

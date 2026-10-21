@@ -402,7 +402,7 @@ fn a_tab_streams_replies_and_answers_asks_until_it_closes() {
     events.until("the ask", |p| shown(p).contains("Run this?"));
     assert!(shown(&events.patches).contains("Why: the ask mode requires approval for this tool"));
     events.until("the description", |p| {
-        shown(p).contains("What (model): fixture approval-description")
+        shown(p).contains("Model summary (unverified): fixture approval-description")
     });
     let html = shown(&events.patches);
     let ask = &html[..html.find("Run this?").unwrap()];

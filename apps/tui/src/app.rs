@@ -398,6 +398,7 @@ impl App {
                 if self.editor.is_empty() && asked.is_some() =>
             {
                 self.deny = !self.deny;
+                self.cache.clear();
             }
             Key::Enter if self.editor.is_empty() && asked.is_some() => {
                 let deny = std::mem::take(&mut self.deny);

@@ -482,17 +482,21 @@ fn print_all(lines: &[String]) {
 }
 
 fn description_update(p: &Presented<'_>) -> Option<String> {
-    p.description.map(|_| client::approval_text(p))
+    p.description.map(|_| ask(p))
 }
 
 /// The question a call waiting for approval puts.
 fn ask(p: &Presented<'_>) -> String {
-    format!(
-        "{}\n? {}  {}  [y/n]",
-        client::approval_text(p),
-        p.title,
-        p.status
-    )
+    client::approval_parts(p)
+        .into_iter()
+        .map(|part| match part {
+            client::ApprovalPart::Controls { title, .. } => {
+                format!("? {title}  {}  [y/n]", p.status)
+            }
+            part => part.text().unwrap_or_default().to_owned(),
+        })
+        .collect::<Vec<_>>()
+        .join("\n")
 }
 
 /// The lines an item starts with, as it is added.
@@ -744,5 +748,47 @@ mod approval_tests {
             view.fold(&msg);
         }
         panic!("scenario has no description");
+    }
+    #[test]
+    fn every_summary_follows_complete_effective_input_before_controls() {
+        let vectors: serde_json::Value = serde_json::from_str(include_str!(
+            "../../../crates/protocol/tests/vectors/view.json"
+        ))
+        .unwrap();
+        for vector in vectors
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter(|v| v["name"].as_str().unwrap().starts_with("approval reviews "))
+        {
+            let mut view = SessionView::default();
+            for message in vector["messages"].as_array().unwrap() {
+                view.fold(&DaemonMsg::from_json(message.to_string().as_bytes()).unwrap());
+            }
+            let p = view.present(&view.items[0]);
+            let text = ask(&p);
+            let reason = text.find("Why:").unwrap();
+            let summary = text.find("Model summary (unverified):").unwrap();
+            assert!(reason < summary && summary < text.find("[y/n]").unwrap());
+            let markers: &[&str] = if vector["name"].as_str().unwrap().contains("multiline") {
+                &[
+                    "printf harmless\nrm -rf /tmp/approval-test-sentinel",
+                    "60000",
+                    "every argument",
+                ]
+            } else {
+                &[
+                    "/work/deep/config.ini",
+                    "-allow = false",
+                    "+allow = true",
+                    "-delete = no",
+                    "+delete = yes",
+                    "flag",
+                ]
+            };
+            for marker in markers {
+                assert!(text.find(marker).unwrap() < reason, "{marker}: {text}");
+            }
+        }
     }
 }

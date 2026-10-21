@@ -41,7 +41,7 @@ func aLiveSessionChatsRunsAnApprovedToolAndIsListed() async throws {
     await store.send("$ echo hello")
     try await eventually("the ask") { store.turn.asking != nil }
     let call = store.turn.asking!
-    #expect(store.items.contains { if case .tool(call, _, _, _, let shown) = $0 { shown.approve == call } else { false } })
+    #expect(store.items.contains { if case .tool(call, _, _, _, let shown) = $0 { shown.approval.contains { if case .controls(call: call) = $0 { true } else { false } } } else { false } })
     await store.approve(call: call, approved: true)
     try await eventually("the outcome") {
         store.items.contains {
