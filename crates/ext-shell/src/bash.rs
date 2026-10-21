@@ -296,12 +296,8 @@ async fn run(input: &Command, cx: &Cx, progress: Partials<String>) -> io::Result
         .filter(|dir| dir.is_absolute() && dir.is_dir())
         .unwrap_or_else(|| dir.clone());
     // `pwd -P` resolves symlinks the starting directory may have.
-    if std::fs::canonicalize(&dir).ok().as_ref() != Some(&cwd) {
-        let base = cx.env.as_ref().map(|env| env.cwd.as_path());
-        cx.update::<Cwd>(&Cwd::change(&cwd, base))
-            .await
-            .map_err(io::Error::other)?;
-    }
+    let moved = (std::fs::canonicalize(&dir).ok().as_ref() != Some(&cwd))
+        .then(|| Cwd::change(&cwd, cx.env.as_ref().map(|env| env.cwd.as_path())));
     if done.lingering {
         cx.own(pgid, crate::job::ended(runtime(cx)?.reactor(), pgid, None));
     }
@@ -310,7 +306,7 @@ async fn run(input: &Command, cx: &Cx, progress: Partials<String>) -> io::Result
         truncated,
         full,
     } = done.output;
-    Ok(Ran {
+    let ran = Ran {
         exit: done.status.code(),
         signal: sys::exit_signal(done.status),
         timed_out: (done.stopped == Some(Stop::TimedOut)).then_some(limit),
@@ -323,7 +319,14 @@ async fn run(input: &Command, cx: &Cx, progress: Partials<String>) -> io::Result
         full,
         background: None,
         lingering: done.lingering.then_some(pgid),
-    })
+    };
+    match moved {
+        Some(change) => cx
+            .record_effect::<Cwd, _>(ran, &change)
+            .await
+            .map_err(io::Error::other),
+        None => Ok(ran),
+    }
 }
 
 /// Starts the command with its output going straight to its log, and

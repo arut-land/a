@@ -193,7 +193,7 @@ impl rt::Runtime for Manual {
     }
 }
 
-struct ControlledSleep(Arc<channel::Sender<oneshot::Sender<()>>>);
+struct ControlledSleep(Arc<channel::Sender<oneshot::Sender<()>>>, bool);
 
 impl Tool for ControlledSleep {
     type In = ext_fixtures::Seconds;
@@ -204,9 +204,13 @@ impl Tool for ControlledSleep {
     async fn call(&self, _: &Self::In, cx: &Cx) -> Result<String, String> {
         let (release, released) = oneshot::channel();
         self.0.send(release).ok().unwrap();
-        unless(&cx.cancel, released)
-            .await
-            .ok_or_else(|| "stopped".to_owned())?;
+        if self.1 {
+            released.await;
+        } else {
+            unless(&cx.cancel, released)
+                .await
+                .ok_or_else(|| "stopped".to_owned())?;
+        }
         Ok("released".into())
     }
 }
@@ -216,7 +220,7 @@ impl Extension for ControlledSleep {
     const VERSION: u32 = 1;
 
     fn contribute(&self, r: &mut Registrar) {
-        r.tool(ControlledSleep(self.0.clone()));
+        r.tool(ControlledSleep(self.0.clone(), self.1));
     }
 }
 
@@ -235,12 +239,18 @@ impl ManualSession {
     }
 
     fn with_registry(registry: Registry) -> Self {
+        Self::with_held_settlement(registry, false)
+    }
+
+    fn with_held_settlement(registry: Registry, held: bool) -> Self {
         let faulty = Arc::new(Faulty::new(Arc::new(Memory::default())));
         let (started, starts) = channel::unbounded();
         let mut fixture = Fixture::on(
             Arc::clone(&faulty) as _,
             ext_fixtures::ECHO,
-            registry.with(&ControlledSleep(Arc::new(started))).unwrap(),
+            registry
+                .with(&ControlledSleep(Arc::new(started), held))
+                .unwrap(),
             openai(&Script::new(&[])),
         );
         let manual = Arc::new(Manual {
@@ -406,7 +416,7 @@ fn a_barrier_without_its_flush_neither_publishes_nor_starts_an_external_effect()
         Arc::clone(&faulty) as _,
         ext_fixtures::ECHO,
         Registry::default()
-            .with(&ControlledSleep(Arc::new(started)))
+            .with(&ControlledSleep(Arc::new(started), false))
             .unwrap(),
         openai(&Script::new(&[])),
     );
@@ -685,7 +695,7 @@ fn a_busy_burst_keeps_one_generation_across_completed_calls() {
     let (started, starts) = channel::unbounded();
     h.replace(
         reload_registry(2, 1, false)
-            .with(&ControlledSleep(Arc::new(started)))
+            .with(&ControlledSleep(Arc::new(started), false))
             .unwrap(),
     );
     h.request("sleep 0");
@@ -1240,6 +1250,72 @@ fn revoked_and_unregistered_mutations_are_explicit_failures() {
     h.poll();
     assert_eq!(rt::block_on(revoked), Err(ext::MutationError::Revoked));
     assert_eq!(h.value(), 0);
+    h.finish();
+}
+
+#[test]
+fn interrupt_revokes_bookkeeping_but_settles_the_completed_effect_once() {
+    let mut h = ManualSession::with_held_settlement(
+        Registry::default().with(&CountingState).unwrap(),
+        true,
+    );
+    let cx = h.context();
+    let settlement = ToolSettlement {
+        call: h.call,
+        fence: h.session.session.fence.load(Ordering::SeqCst),
+        mail: Arc::clone(&h.session.session.mail),
+    };
+    let output = Json::encode(&serde_json::json!({"aborted": true})).unwrap();
+    let change = "completed effect".to_owned();
+    h.session.interrupt();
+    h.poll();
+    assert!(cx.cancel.is_set());
+    let mut recording = Box::pin(cx.record_effect::<Updates, _>(output.clone(), &change));
+    let mut task = std::task::Context::from_waker(std::task::Waker::noop());
+    assert!(recording.as_mut().poll(&mut task).is_pending());
+    h.poll();
+    assert!(cx.cancel.is_set());
+    let output = rt::block_on(recording).unwrap();
+    assert_eq!(cx.state(|s: &Updates| s.0), 0);
+    let outcome = Outcome::Done { output };
+    settlement.finish(Called {
+        outcome: outcome.clone(),
+        card: None,
+    });
+    h.poll();
+    // A delayed duplicate must not overwrite the call's committed outcome.
+    h.complete();
+    h.poll();
+    let call = h.call;
+    let kept = h.finish();
+    let results: Vec<_> = kept
+        .iter()
+        .filter_map(|e| match &e.body {
+            Body::ToolResult {
+                call: of, outcome, ..
+            } if *of == call => Some(outcome),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(results, [&outcome]);
+    assert!(!kept.iter().any(|e| matches!(e.body, Body::Ext { .. })));
+}
+
+#[test]
+fn completed_effect_recording_does_not_hide_commit_failure() {
+    let mut h = ManualSession::with_registry(Registry::default().with(&CountingState).unwrap());
+    let cx = h.context();
+    let change = "completed effect".to_owned();
+    let mut recording = Box::pin(cx.record_effect::<Updates, _>("output", &change));
+    let mut task = std::task::Context::from_waker(std::task::Waker::noop());
+    assert!(recording.as_mut().poll(&mut task).is_pending());
+    h.faulty.fail_next_write();
+    h.session.send(Msg::Sync);
+    h.poll();
+    assert_eq!(
+        rt::block_on(recording),
+        Err(ext::MutationError::CommitFailed)
+    );
     h.finish();
 }
 

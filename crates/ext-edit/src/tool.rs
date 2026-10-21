@@ -135,17 +135,18 @@ impl Tool for Edit {
         })
         .await
         .map_err(|e| format!("{shown}: {e}"))?;
-        cx.update::<Seen>(&Seen::change(&path, content.as_bytes()))
-            .await
-            .map_err(|e| e.to_string())?;
-        Ok(Edited {
+        let seen = Seen::change(&path, content.as_bytes());
+        let edited = Edited {
             path,
             created: original.is_none(),
             replaced: input.edits.len(),
             added: diff.added,
             removed: diff.removed,
             diff: diff.text,
-        })
+        };
+        cx.record_effect::<Seen, _>(edited, &seen)
+            .await
+            .map_err(|e| e.to_string())
     }
 
     fn to_model(output: &Json) -> llm::Output {
