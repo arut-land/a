@@ -1732,6 +1732,35 @@ fn detached_messages_wait_for_a_boundary_and_the_parent_hears_once() {
     std::fs::remove_dir_all(root).unwrap();
 }
 
+#[test]
+fn inherited_task_cannot_reset_an_exhausted_depth_budget() {
+    let (root, home) = home("depth-exhaustion");
+    let daemon = Daemon::load(&home, &echo()).unwrap();
+    let parent = daemon.attach_to(&Target::New, || "/w".into()).unwrap();
+    parent
+        .session()
+        .submit(&("spawn ".repeat(10) + "hi"))
+        .unwrap();
+    settle(&daemon);
+    let headers = daemon.shared.store.headers().unwrap();
+    assert_eq!(headers.len(), 9);
+    let mut exhausted = 0;
+    for header in headers {
+        for body in bodies(&*daemon.shared.store, header.id) {
+            if let Body::Link { intent, .. } = body {
+                let value: serde_json::Value = intent.parse().unwrap();
+                if value["refusal"] == "DepthExhausted" {
+                    exhausted += 1;
+                    assert_eq!(value["request"]["depth"], 0);
+                }
+            }
+        }
+    }
+    assert_eq!(exhausted, 1);
+    drop(parent);
+    drop(daemon);
+    std::fs::remove_dir_all(root).unwrap();
+}
 
 #[test]
 fn interrupt_cancels_detached_descendants_after_the_spawning_call_completes() {
