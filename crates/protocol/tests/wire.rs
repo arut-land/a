@@ -621,12 +621,13 @@ fn daemon_samples() -> Vec<Sample<DaemonMsg>> {
             "entry_link",
             entry(
                 15,
-                Body::Link {
+                Body::Link { intent: Default::default(),
                     child: SessionId(Uuid::from_u128(0xc)),
                     input: "look".into(),
                 },
             ),
         ),
+        sample("entry_spawned", entry(1, Body::Spawned { intent: protocol::Json::encode(&json!({"image": []})).unwrap() })),
         sample(
             "entry_watch",
             entry(

@@ -45,6 +45,7 @@ use crate::{Daemon, lock};
 use side::SideFact;
 
 mod side;
+mod spawn;
 
 /// What every session runs with.
 pub struct Shared {
@@ -189,6 +190,7 @@ pub enum Open {
 /// What a session's calls and decision points read: made before its log
 /// is folded, as the kernel's registry binds it.
 struct Session {
+    spawn: Mutex<Option<spawn::SpawnIntent>>,
     fence: AtomicU64,
     id: SessionId,
     workspace: Arc<Path>,
@@ -353,7 +355,7 @@ enum ContextRequest {
     },
     /// Child work is admitted under the originating call, even across polling.
     Child {
-        input: String,
+        request: ext::Spawn,
         reply: oneshot::Sender<Json>,
     },
     /// The actor supplies the side call's authority after committing its intent.
@@ -425,10 +427,22 @@ impl Live {
             || shared.registry.generation(),
             |source| source.generation(),
         );
-        let registry = match (&source, open) {
-            (Some(source), Open::Load) => load_registry(header, shared, source)?,
-            (Some(source), Open::Create) => source.registry(),
-            (None, _) => shared.registry.get(),
+        let image = if matches!(open, Open::Load)
+            && header.parent.is_some()
+            && shared.catalog.get(header.id).is_some_and(|r| r.entries > 0)
+        {
+            spawn::spawn_image(shared.store.prefix(header.id, 1)?)
+        } else {
+            None
+        };
+        let registry = if let Some(image) = &image {
+            recorded_registry(shared, source.as_ref(), Some(&image.installed))?
+        } else {
+            match (&source, open) {
+                (Some(source), Open::Load) => load_registry(header, shared, source)?,
+                (Some(source), Open::Create) => source.registry(),
+                (None, _) => shared.registry.get(),
+            }
         };
         let (tx, rx) = channel::unbounded();
         let registry = if header.parent.is_some() {
@@ -437,6 +451,7 @@ impl Live {
             registry
         };
         let session = Session::new(header, shared, Arc::new(tx), &registry);
+        *lock(&session.spawn) = image;
         let bound = bind(&registry, &session);
         let binding = Arc::clone(&bound) as Arc<dyn Binding>;
         let (mut loaded, folding) = Folding::open(header, shared, open, &binding, &registry)?;
@@ -909,7 +924,10 @@ impl Actor {
     }
 
     async fn refresh(&mut self) -> Result<(), ()> {
-        if self.phase != Phase::Serving || !self.core.at_rest() {
+        if lock(&self.live.session.spawn).is_some()
+            || self.phase != Phase::Serving
+            || !self.core.at_rest()
+        {
             return Ok(());
         }
         let shared = &self.live.session.shared;
@@ -1227,30 +1245,12 @@ impl Actor {
             }
         }
         let call = origin.call;
-        let event = match request {
+        match request {
             ContextRequest::Note { note, done } => return Some((Event::Note { call, note }, done)),
-            ContextRequest::Child { input, reply } => {
-                // Only a running tool call asks; one run again with the
-                // answer it waited on is handed it.
-                let Some(InFlight::Tool(child)) = self.inflight.get_mut(&call) else {
-                    return None;
-                };
-                match std::mem::replace(child, Child::Waiting(reply)) {
-                    Child::Answered(value) => {
-                        let Child::Waiting(reply) = std::mem::replace(child, Child::None) else {
-                            unreachable!()
-                        };
-                        reply.send(value);
-                        return None;
-                    }
-                    Child::None | Child::Waiting(_) => {}
-                }
-                Event::Spawn {
-                    call,
-                    child: SessionId::new(),
-                    input,
-                    wait: true,
-                }
+            ContextRequest::Child { request, reply } => {
+                return self
+                    .open_spawn(call, request, reply)
+                    .map(|event| (event, None));
             }
             ContextRequest::Side { model, side, reply } => {
                 return self
@@ -1270,8 +1270,7 @@ impl Actor {
                 }));
                 return None;
             }
-        };
-        Some((event, None))
+        }
     }
 
     /// What `msg` gets in a session whose log is kept as it is: clients
@@ -2122,16 +2121,29 @@ impl Actor {
                 tool,
                 input,
                 value,
-            } => match self.inflight.get_mut(&call) {
-                // Still running, and waiting for it.
-                Some(InFlight::Tool(child @ Child::Waiting(_))) => {
-                    if let Child::Waiting(reply) = std::mem::replace(child, Child::None) {
-                        reply.send(value);
+            } => {
+                let refusal = self
+                    .core
+                    .ledger()
+                    .links()
+                    .iter()
+                    .filter_map(|l| l.intent.parse::<spawn::SpawnIntent>().ok())
+                    .find(|i| i.call == call)
+                    .and_then(|i| i.refusal);
+                let value = refusal.map_or(value, |r| {
+                    Json::encode(&Result::<Outcome, _>::Err(r)).unwrap()
+                });
+                match self.inflight.get_mut(&call) {
+                    // Still running, and waiting for it.
+                    Some(InFlight::Tool(child @ Child::Waiting(_))) => {
+                        if let Child::Waiting(reply) = std::mem::replace(child, Child::None) {
+                            reply.send(value);
+                        }
                     }
+                    // Run again, from a log that holds the answer.
+                    _ => self.run_tool(call, tool, input, Child::Answered(value)),
                 }
-                // Run again, from a log that holds the answer.
-                _ => self.run_tool(call, tool, input, Child::Answered(value)),
-            },
+            }
             Effect::Await { call, answer } => {
                 let gated = self.cancellable(call, answer.0);
                 self.later(gated, move |gated| Event::Gated { call, gated });
@@ -2195,11 +2207,27 @@ impl Actor {
                 call: link.get(),
             }),
         };
+        let intent = self
+            .core
+            .ledger()
+            .links()
+            .iter()
+            .find(|l| l.seq == link)
+            .map(|l| l.intent.clone())
+            .expect("committed spawn intent");
         let env = lock(&self.live.session.env).clone();
         if let Some(daemon) = shared.daemon.upgrade() {
             let parent = self.live.id;
             shared.rt.spawn(Box::pin(async move {
-                if let Err(error) = daemon.start_child(header, input, env).await {
+                let refusal = intent
+                    .parse::<spawn::SpawnIntent>()
+                    .ok()
+                    .and_then(|i| i.refusal);
+                let result = match refusal {
+                    Some(refusal) => Err(io::Error::other(format!("{refusal:?}"))),
+                    None => daemon.start_child(header, input, env, intent).await,
+                };
+                if let Err(error) = result {
                     daemon
                         .report(
                             parent,
@@ -2618,6 +2646,7 @@ impl Live {
 impl Session {
     fn new(header: &Header, shared: &Arc<Shared>, mail: Mail, registry: &Registry) -> Arc<Self> {
         Arc::new(Self {
+            spawn: Mutex::default(),
             fence: AtomicU64::new(0),
             id: header.id,
             workspace: Arc::from(header.workspace.as_path()),
@@ -2740,6 +2769,9 @@ impl Session {
     /// `ModelSpec` service's word (the session's own choice over the
     /// config layers) if an extension provides it, else the layers'.
     fn model_named(&self) -> Result<(String, String), String> {
+        if let Some(image) = lock(&self.spawn).as_ref() {
+            return Ok((image.model.clone(), "spawn intent".into()));
+        }
         let layers = &self.shared.models.settings;
         let registry = self.shared.registry.get();
         match registry.service::<dyn ext::ModelSpec>() {
@@ -2806,7 +2838,10 @@ impl View for Viewed {
 /// `registry` bound to `session`: what the kernel drives.
 fn bind(registry: &Arc<Registry>, session: &Arc<Session>) -> Arc<Bound<Viewed>> {
     let settings = &session.shared.models.settings;
-    let agent = settings.agent(&session.workspace);
+    let agent = lock(&session.spawn)
+        .as_ref()
+        .map(|i| i.request.runner.agent.clone())
+        .or_else(|| settings.agent(&session.workspace));
     let viewed = Arc::new(Viewed {
         session: Arc::clone(session),
         registry: Arc::clone(registry),
@@ -2938,30 +2973,6 @@ impl ext::Layers for Own {
     fn model(&self, workspace: &Path) -> Result<(String, String), String> {
         let session = self.0.upgrade().ok_or("the session is gone")?;
         ext::Layers::model(&session.shared.models.settings, workspace)
-    }
-}
-
-impl ext::Sessions for Own {
-    /// The child the call started, or starts now; an interrupt of the
-    /// call's turn reaches it first.
-    fn child<'a>(&'a self, _cx: &'a Cx, input: String) -> BoxFuture<'a, Outcome> {
-        Box::pin(async move {
-            let Some(session) = self.0.upgrade() else {
-                return Outcome::Interrupted { output: None };
-            };
-            let (reply, result) = oneshot::channel();
-            if !self.1.current(&session) {
-                return Outcome::Interrupted { output: None };
-            }
-            self.1
-                .send(&session, ContextRequest::Child { input, reply });
-            match result.await {
-                Some(value) => value
-                    .parse()
-                    .unwrap_or(Outcome::Interrupted { output: None }),
-                None => Outcome::Interrupted { output: None },
-            }
-        })
     }
 }
 

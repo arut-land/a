@@ -211,11 +211,16 @@ impl Default for Budget {
 /// Child sessions: a call starts one it owns and waits for what it settles
 /// with. The engine provides it.
 pub trait Sessions: Send + Sync {
+    fn runner(&self) -> crate::Runner;
     /// What a child session started on `input` settles with. The child is
     /// the call's own: started once however often the call runs again (as
     /// recovery runs it), and heard from once. An interrupt of the call's
     /// turn reaches the child first.
-    fn child<'a>(&'a self, cx: &'a Cx, input: String) -> BoxFuture<'a, Outcome>;
+    fn spawn<'a>(
+        &'a self,
+        cx: &'a Cx,
+        request: crate::Awaited<crate::Spawn>,
+    ) -> BoxFuture<'a, Result<Outcome, crate::SpawnRefusal>>;
 }
 
 /// An extension-supplied model transport for side requests, useful for

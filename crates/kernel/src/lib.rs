@@ -131,6 +131,7 @@ pub enum Event {
         call: CallId,
         child: SessionId,
         input: String,
+        intent: Json,
         wait: bool,
     },
     /// The gate of call `call` answered later ([`Answer::Later`]).

@@ -558,7 +558,15 @@ fn stale_request<'a>(
             origin.send(
                 session,
                 ContextRequest::Child {
-                    input: "stale child".into(),
+                    request: ext::Spawn::new::<HeldHarbor>(
+                        "stale",
+                        "stale child".into(),
+                        ext::Runner {
+                            agent: ext::LOOP.into(),
+                            role: ext::ModelRole::Session,
+                        },
+                        ext::DepthBudget::new(1),
+                    ),
                     reply,
                 },
             );
@@ -579,9 +587,22 @@ fn stale_request<'a>(
         })
     } else if matches!(probe, RetainedProbe::Child) {
         Box::pin(async move {
-            old.service::<dyn ext::Sessions>()
+            let _ = old
+                .service::<dyn ext::Sessions>()
                 .unwrap()
-                .child(old, "stale child".into())
+                .spawn(
+                    old,
+                    ext::Spawn::new::<HeldHarbor>(
+                        "stale",
+                        "stale child".into(),
+                        ext::Runner {
+                            agent: ext::LOOP.into(),
+                            role: ext::ModelRole::Session,
+                        },
+                        ext::DepthBudget::new(1),
+                    )
+                    .awaited(),
+                )
                 .await;
         })
     } else {

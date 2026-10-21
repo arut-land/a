@@ -843,7 +843,7 @@
     ]
   },
   {
-    "hash": "c8fe22c5dd26f903",
+    "hash": "ee68e666b82ebfa4",
     "messages": [
       {
         "session": "00000000-0000-0000-0000-00000000000a",
@@ -854,6 +854,7 @@
         "child": "00000000-0000-0000-0000-00000000000c",
         "epoch": 0,
         "input": "sleep 1",
+        "intent": null,
         "kind": "link",
         "seq": 1,
         "t": "entry"
@@ -911,6 +912,7 @@
           {
             "child": "00000000-0000-0000-0000-00000000000c",
             "input": "sleep 1",
+            "intent": null,
             "seq": 1
           }
         ],
@@ -1812,7 +1814,7 @@
     ]
   },
   {
-    "hash": "9836a68da3076432",
+    "hash": "1ad2f9e92171052d",
     "messages": [
       {
         "session": "00000000-0000-0000-0000-00000000000a",
@@ -1827,6 +1829,7 @@
         "child": "00000000-0000-0000-16df-9d6ac76bd322",
         "epoch": 0,
         "input": "go",
+        "intent": null,
         "kind": "link",
         "seq": 1,
         "t": "entry"
@@ -2045,6 +2048,7 @@
         "child": "00000000-0000-0000-8c31-dc059121ada3",
         "epoch": 0,
         "input": "go",
+        "intent": null,
         "kind": "link",
         "seq": 16,
         "t": "entry"
@@ -2152,6 +2156,7 @@
         "child": "00000000-0000-0000-0ceb-9e68e19650bf",
         "epoch": 0,
         "input": "go",
+        "intent": null,
         "kind": "link",
         "seq": 24,
         "t": "entry"
@@ -2375,16 +2380,19 @@
           {
             "child": "00000000-0000-0000-16df-9d6ac76bd322",
             "input": "go",
+            "intent": null,
             "seq": 1
           },
           {
             "child": "00000000-0000-0000-8c31-dc059121ada3",
             "input": "go",
+            "intent": null,
             "seq": 16
           },
           {
             "child": "00000000-0000-0000-0ceb-9e68e19650bf",
             "input": "go",
+            "intent": null,
             "seq": 24
           }
         ],
@@ -2995,7 +3003,7 @@
     ]
   },
   {
-    "hash": "c93e610da369f38d",
+    "hash": "baefe59d9904a388",
     "messages": [
       {
         "session": "00000000-0000-0000-0000-00000000000a",
@@ -3057,6 +3065,7 @@
         "child": "00000000-0000-0000-77d3-d4856d3c62a6",
         "epoch": 0,
         "input": "go",
+        "intent": null,
         "kind": "link",
         "seq": 5,
         "t": "entry"
@@ -3153,6 +3162,7 @@
           {
             "child": "00000000-0000-0000-77d3-d4856d3c62a6",
             "input": "go",
+            "intent": null,
             "seq": 5
           }
         ],

@@ -477,6 +477,10 @@ fn a_parent_hears_from_its_child_exactly_once() {
         [
             Body::Link {
                 child,
+                intent: match &got[3] {
+                    Body::Link { intent, .. } => intent.clone(),
+                    _ => unreachable!(),
+                },
                 input: "hi".into()
             },
             Body::Wait {
@@ -593,6 +597,7 @@ fn watches_rearm_after_a_crash_and_fire_once() {
             },
             Body::Link {
                 child,
+                intent: Default::default(),
                 input: "sleep 0".into(),
             },
             Body::Wait {
@@ -1513,6 +1518,36 @@ fn a_refused_child_registration_settles_the_parent_once() {
     settle(&daemon);
     let log = bodies(&*daemon.shared.store, id);
     assert!(matches!(fired(&log).as_slice(), [Outcome::Failed { .. }]));
+    drop(parent);
+    drop(daemon);
+    std::fs::remove_dir_all(root).unwrap();
+}
+
+#[test]
+fn recursive_children_keep_the_admitted_runner_and_decreasing_budget() {
+    let (root, home) = home("spawn-authority");
+    let daemon = Daemon::load(&home, &echo()).unwrap();
+    let parent = daemon.attach_to(&Target::New, || "/w".into()).unwrap();
+    parent.session().submit("spawn spawn hi").unwrap();
+    settle(&daemon);
+    let headers = daemon.shared.store.headers().unwrap();
+    assert_eq!(headers.len(), 3);
+    let mut depths = Vec::new();
+    for header in headers.iter().filter(|h| h.parent.is_some()) {
+        let log = bodies(&*daemon.shared.store, header.id);
+        let Body::Spawned { intent } = &log[0] else {
+            panic!("{log:?}")
+        };
+        let value: serde_json::Value = intent.parse().unwrap();
+        assert_eq!(value["request"]["runner"]["agent"], ext_fixtures::ECHO);
+        assert_eq!(
+            value["installed"],
+            serde_json::to_value(daemon.shared.registry.get().installed()).unwrap()
+        );
+        depths.push(value["request"]["depth"].as_u64().unwrap());
+    }
+    depths.sort_unstable();
+    assert_eq!(depths, [6, 7]);
     drop(parent);
     drop(daemon);
     std::fs::remove_dir_all(root).unwrap();

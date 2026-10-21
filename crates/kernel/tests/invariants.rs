@@ -357,6 +357,7 @@ fn states() -> Vec<(&'static str, Session)> {
     };
     state("waiting dialog", Reg::echo(), vec![user("$ x"), dialog]);
     let spawn = Event::Spawn {
+        intent: Default::default(),
         call: id(2),
         child: child(),
         input: "go".into(),
@@ -467,6 +468,7 @@ fn the_same_events_give_the_same_log() {
         s.step(user("task go"));
         let (call, input) = (open(&s), "go".into());
         s.step(Event::Spawn {
+            intent: Default::default(),
             call,
             child: child(),
             input,
@@ -727,6 +729,7 @@ fn a_watch_fires_once() {
     let (mut s, _) = Session::resume(Reg::echo().arc(), Vec::new(), &load);
     s.step(user("task go"));
     s.step(Event::Spawn {
+        intent: Default::default(),
         call: id(2),
         child: child(),
         input: "go".into(),

@@ -13,11 +13,11 @@ use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
 /// The protocol this build speaks best.
-pub const PROTO: u32 = 9;
+pub const PROTO: u32 = 10;
 
 /// The oldest protocol this build still speaks: a peer whose range
 /// overlaps `PROTO_MIN..=PROTO` is served at the highest version both speak.
-pub const PROTO_MIN: u32 = 9;
+pub const PROTO_MIN: u32 = 10;
 
 const MAX_FRAME: u32 = 16 * 1024 * 1024;
 
@@ -287,9 +287,10 @@ kinds! {
         /// The committed intent to start session `child` with `input`. Its seq
         /// is the call that owns the child; the child's id is chosen before the
         /// commit, so recovery finds the child instead of making another.
-        Link "link" { child: SessionId, input: String } = Durable;
+        Link "link" { child: SessionId, input: String, intent: Json } = Durable;
         /// A durable watch on `child`: when it settles, its result comes back
         /// as a `fired` under this entry's seq, which is the idempotency key.
+        Spawned "spawned" { intent: Json } = Durable;
         Watch "watch" { child: SessionId } = Durable;
         /// Watch `watch` fired, with its child's result. Logged at most once
         /// per watch.
@@ -1862,6 +1863,7 @@ mod tests {
         let child = SessionId(Uuid::from_u128(1));
         let entries = [
             Body::Link {
+                intent: Default::default(),
                 child,
                 input: "hi".into(),
             },
@@ -1879,7 +1881,7 @@ mod tests {
         assert_eq!(
             json,
             [
-                format!(r#"{{"kind":"link","child":"{id}","input":"hi"}}"#),
+                format!(r#"{{"kind":"link","child":"{id}","input":"hi","intent":null}}"#),
                 format!(r#"{{"kind":"watch","child":"{id}"}}"#),
                 r#"{"kind":"fired","watch":2,"outcome":{"status":"interrupted"}}"#.to_owned(),
             ]

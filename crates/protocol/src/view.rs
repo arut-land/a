@@ -576,7 +576,7 @@ impl SessionView {
                 usage: None,
                 purpose: purpose.clone(),
             },
-            Body::Link { child, input } => Item::Child {
+            Body::Link { child, input, .. } => Item::Child {
                 call: CallId(seq),
                 child: *child,
                 input: input.clone(),

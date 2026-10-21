@@ -316,6 +316,7 @@ fn leftover_processes_of_this_boot_are_killed() {
 #[test]
 fn links_are_rearmed() {
     let link = || Body::Link {
+        intent: Default::default(),
         child: child(),
         input: "go".into(),
     };
@@ -351,6 +352,7 @@ fn a_call_whose_child_settled_before_a_crash_resumes_with_its_result() {
         input("task go"),
         tool_call("task", task.clone()),
         Body::Link {
+            intent: Default::default(),
             child: child(),
             input: "go".into(),
         },

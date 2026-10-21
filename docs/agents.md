@@ -6,9 +6,9 @@ initial implementation.
 
 Implementation status: registration inheritance and nested conversation storage
 are implemented. Typed spawn requests and private depth budgets are defined in
-the SDK. Engine admission, prefix-context admission, detached SDK execution,
-durable messaging and depth-budget enforcement below remain planned. The
-existing `task` still uses the awaited fresh-child API. This document must not
+the SDK, and awaited admission records the runner, extension manifest and
+remaining depth before creating the child. Prefix-context admission, detached
+SDK execution and durable messaging below remain planned. This document must not
 be read as claiming that those modes are available yet.
 
 A conversation owns an ordered log, an inbox and a

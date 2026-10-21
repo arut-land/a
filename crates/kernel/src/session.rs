@@ -172,8 +172,9 @@ impl Core {
                 call,
                 child,
                 input,
+                intent,
                 wait,
-            } => self.spawn(call, child, input, wait, &mut fx),
+            } => self.spawn(call, child, input, intent, wait, &mut fx),
             Event::Gated { call, gated } => {
                 if let Some(Step::Awaiting { skip, resumed }) = self.step_of(call) {
                     self.gated(call, gated, skip, resumed, &mut fx);
@@ -875,6 +876,7 @@ impl Core {
         call: CallId,
         child: SessionId,
         input: String,
+        intent: Json,
         wait: bool,
         fx: &mut Effects,
     ) {
@@ -887,6 +889,7 @@ impl Core {
             Body::Link {
                 child,
                 input: input.clone(),
+                intent,
             },
         );
         if wait {

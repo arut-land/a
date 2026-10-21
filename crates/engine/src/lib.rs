@@ -24,7 +24,10 @@ use driver::{Attachment, Live, Open, Request, Shared};
 use ext::Flag;
 use ext_logging::{Build, Fact, Fault, Operation, Stop, emit as fact};
 use outbox::Outbox;
-use protocol::{DaemonMsg, Environment, Frame, Mode, Outcome, SessionId, SessionSummary, Target};
+use protocol::{
+    Body, DaemonMsg, Entry, Environment, Frame, Json, Mode, Outcome, SessionId, SessionSummary,
+    Target,
+};
 use rt::oneshot;
 use server::reply;
 use sys::{Home, Listener};
@@ -694,12 +697,24 @@ impl Daemon {
         header: Header,
         input: String,
         env: Option<Arc<Environment>>,
+        intent: Json,
     ) -> io::Result<()> {
         let live = if let Some(slot) = self.slot(header.id) {
             self.live(&slot).await?
         } else {
+            let shared = Arc::clone(&self.shared);
+            let imported = header.clone();
+            rt::unblock(&*self.shared.rt, move || {
+                let entry = Entry::new(
+                    protocol::Seq::new(1).unwrap(),
+                    protocol::Epoch(0),
+                    Body::Spawned { intent },
+                );
+                shared.catalog.import(&*shared.store, &imported, &[entry])
+            })
+            .await?;
             let slot = self.new_slot(header)?;
-            self.start(&slot, Open::Create).await?
+            self.start(&slot, Open::Load).await?
         };
         if !live.has_input() {
             if let Some(env) = env {

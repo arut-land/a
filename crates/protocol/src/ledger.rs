@@ -134,6 +134,7 @@ pub struct Queued {
 /// A child session linked, and the input it starts with.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Link {
+    pub intent: Json,
     pub seq: Seq,
     pub child: SessionId,
     pub input: String,
@@ -195,7 +196,12 @@ impl Ledger {
                 self.author(*origin);
                 self.result = Some(Outcome::Interrupted { output: None });
             }
-            Body::Link { child, input } => self.links.push(Link {
+            Body::Link {
+                child,
+                input,
+                intent,
+            } => self.links.push(Link {
+                intent: intent.clone(),
                 seq,
                 child: *child,
                 input: input.clone(),
@@ -218,7 +224,7 @@ impl Ledger {
             Body::Environment(env) => self.env = Some(env.clone()),
             Body::Extensions { installed } => self.extensions = Some(installed.clone()),
             Body::Context { .. } => self.context = true,
-            Body::Ext { .. } | Body::Edit { .. } | Body::Unknown { .. } => {}
+            Body::Spawned { .. } | Body::Ext { .. } | Body::Edit { .. } | Body::Unknown { .. } => {}
         }
     }
 

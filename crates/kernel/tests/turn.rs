@@ -875,6 +875,7 @@ fn a_generation_is_adopted_only_at_rest() {
 
 fn spawn(wait: bool) -> Event {
     Event::Spawn {
+        intent: Default::default(),
         call: id(2),
         child: child(),
         input: "go".into(),
@@ -886,6 +887,7 @@ fn spawned() -> Vec<Effect> {
     vec![append(
         3,
         Body::Link {
+            intent: Default::default(),
             child: child(),
             input: "go".into(),
         },

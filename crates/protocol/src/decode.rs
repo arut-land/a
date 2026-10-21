@@ -389,6 +389,8 @@ fn present<'de, D: Deserializer<'de>>(d: D) -> std::result::Result<Option<Json>,
 /// An [`Entry`], or a [`Verdict`] within one.
 #[derive(Deserialize)]
 pub(crate) struct EntryFields {
+    #[serde(default, deserialize_with = "present")]
+    pub(crate) intent: Option<Json>,
     pub(crate) publication: Option<publication::Publication>,
     pub(crate) seq: Option<u64>,
     pub(crate) epoch: Option<u32>,
