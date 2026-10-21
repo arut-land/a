@@ -51,6 +51,7 @@ pub fn spawn_daemon(cmd: &mut Command, _home: &crate::Home, lock: File) -> io::R
         "WINDIR",
         "USERPROFILE",
         "LOCALAPPDATA",
+        "ProgramFiles",
         "TEMP",
         "TMP",
         "COMSPEC",
