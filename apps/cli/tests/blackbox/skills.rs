@@ -29,7 +29,7 @@ fn command(conn: &mut Conn, text: &str) -> (Value, Vec<Entry>) {
 }
 
 fn bodies(entries: &[Entry]) -> usize {
-    entries.iter().filter(|e| matches!(&e.body, Body::Context { text } if text.contains("private skill instructions"))).count()
+    entries.iter().filter(|e| matches!(&e.body, Body::Context { text, .. } if text.contains("private skill instructions"))).count()
 }
 
 #[test]

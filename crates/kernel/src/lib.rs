@@ -207,9 +207,8 @@ pub enum Note {
     },
     /// A state change and its model context, committed together.
     Publish {
-        ext: String,
-        state: String,
-        data: Json,
+        namespace: String,
+        key: Json,
         text: String,
     },
     /// What the model sees from here on: entries `target..=upto` stand as

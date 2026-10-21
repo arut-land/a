@@ -549,7 +549,7 @@ struct Image {
     extensions: Vec<protocol::Installed>,
     has_input: bool,
     ledger: Ledger,
-    states: Vec<ext::Image>,
+    states: ext::Checkpoint,
 }
 
 /// How much log, in bytes, a load may read past the newest snapshot: at
@@ -2147,14 +2147,13 @@ impl Host for Calling {
         })
     }
 
-    fn publish(&self, ext: &str, state: &str, data: Json, text: String) -> BoxFuture<'static, ()> {
+    fn publish(&self, namespace: &str, key: Json, text: String) -> BoxFuture<'static, ()> {
         let (done, committed) = oneshot::channel();
         let _ = self.session.mail.send(Msg::Note {
             call: self.call,
             note: Note::Publish {
-                ext: ext.to_owned(),
-                state: state.to_owned(),
-                data,
+                namespace: namespace.to_owned(),
+                key,
                 text,
             },
             done: Some(done),

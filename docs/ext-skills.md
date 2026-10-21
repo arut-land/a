@@ -38,15 +38,15 @@ with the normal filesystem tools. Supporting files are neither read nor run by
 this extension. Reading them later follows those tools' ordinary logging and
 policy rules.
 
-A successful load publishes `Body::Context` plus a durable `loaded` fold change
-in one engine commit. The same instructions are published once per session;
+A successful load seals `Body::Context` text and its typed publication key
+in one log entry. A durable prefix therefore contains both or neither. The same instructions are published once per session;
 subsequent loads return `already_loaded`. An edited body or relocated directory
 can be loaded again after adoption. Unknown names return the typed
 `LoadError::UnknownSkill { name }` inside the tool's result and publish nothing.
 Loads are exclusive, so concurrent model requests cannot publish the same
 instructions twice. An interrupted load is unsafe to replay: recovery does not
 rerun it against current files. The transcript reads the recorded context; the
-fold reducer reads only log entries. Neither reopens a skill during replay.
+publication projection reads only log entries. Neither reopens a skill during replay.
 Opening a workspace subscription does prepare current files, independently of
 replaying the recorded conversation.
 
@@ -75,12 +75,12 @@ session. The skills source wraps an optional Lua source; changes from either pro
 and an unsuccessful overlay retains the last working combined generation.
 
 The SDK additions are general: `Text::generation` supplies logged context for
-an immutable registry, `Cx::publish<S>` commits a fold change and its context
+an immutable registry, `Cx::publish<P>` seals a typed key with its context
 before returning, and cloning a registry shares registrations while rebuilding
 its resolved tables. Weak generation subscriptions let derived sources prepare
 before a source reload completes, including explicit `/lua-reload`. `Host` and the kernel only route these operations to
-existing `Ext` and `Context` entries. No skills setting or name enters the
-kernel, and the wire format is unchanged. Generation context is captured at
+ordinary `Context` entries. No skills setting or name enters the
+kernel. Protocol 5 adds the optional publication identity to a context entry. Generation context is captured at
 binding, then logged before the first new model call; folding old entries does
 not regenerate it.
 

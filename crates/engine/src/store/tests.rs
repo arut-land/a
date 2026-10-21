@@ -873,3 +873,26 @@ fn multiline_payloads_survive_reload(store: &dyn LogStore) {
         serde_json::from_str::<serde_json::Value>(text).unwrap()
     );
 }
+
+#[test]
+fn a_publication_and_its_text_survive_every_torn_prefix_together() {
+    let entry = Entry::new(
+        Seq::new(1).unwrap(),
+        Epoch(0),
+        Body::Context {
+            text: "Instructions\nwith a second line".into(),
+            publication: Some(protocol::publication::Publication {
+                namespace: "example".into(),
+                key: Json::encode("guide").unwrap(),
+            }),
+        },
+    );
+    let mut sealed = Vec::new();
+    entry.encode(&mut sealed).unwrap();
+    seal(&mut sealed, 0);
+    for cut in 0..sealed.len() {
+        assert!(!unseal(&mut sealed[..cut].to_vec()), "cut {cut}");
+    }
+    assert!(unseal(&mut sealed));
+    assert_eq!(Entry::from_json(&sealed).unwrap(), entry);
+}

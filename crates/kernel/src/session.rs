@@ -664,19 +664,25 @@ impl Core {
             Note::Progress(text) => Body::Progress { call, text },
             Note::State { ext, state, data } => Body::Ext { ext, state, data },
             Note::Publish {
-                ext,
-                state,
-                data,
+                namespace,
+                key,
                 text,
             } => {
                 if !self.fold.ledger.has_context()
                     && let Some(text) = self.registry.context()
                 {
-                    self.append(fx, Body::Context { text });
+                    self.append(
+                        fx,
+                        Body::Context {
+                            text,
+                            publication: None,
+                        },
+                    );
                 }
-                // A durable prefix cannot remember publication without its text.
-                self.append(fx, Body::Context { text });
-                Body::Ext { ext, state, data }
+                Body::Context {
+                    text,
+                    publication: Some(protocol::publication::Publication { namespace, key }),
+                }
             }
             Note::Edit {
                 target,
@@ -868,10 +874,22 @@ impl Core {
                 if !self.fold.ledger.has_context()
                     && let Some(text) = self.registry.context()
                 {
-                    self.append(fx, Body::Context { text });
+                    self.append(
+                        fx,
+                        Body::Context {
+                            text,
+                            publication: None,
+                        },
+                    );
                 }
                 if let Some(text) = self.generation_context.take() {
-                    self.append(fx, Body::Context { text });
+                    self.append(
+                        fx,
+                        Body::Context {
+                            text,
+                            publication: None,
+                        },
+                    );
                 }
                 let model = self.registry.model();
                 let body = Body::ModelCall {

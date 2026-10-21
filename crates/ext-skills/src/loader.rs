@@ -307,7 +307,7 @@ mod tests {
             .iter()
             .filter_map(|effect| match effect {
                 Effect::Append(entry) => match &entry.body {
-                    Body::Context { text } => Some(text.as_str()),
+                    Body::Context { text, .. } => Some(text.as_str()),
                     _ => None,
                 },
                 _ => None,
@@ -376,7 +376,7 @@ mod tests {
         let old_call = Rig::new("skills-old-call", (*old).clone());
         old_call.done("review", &json!({}));
         assert!(old_call.log.lock().unwrap().iter().any(
-            |e| matches!(&e.body, Body::Context {text} if text.ends_with("old instructions"))
+            |e| matches!(&e.body, Body::Context {text, ..} if text.ends_with("old instructions"))
         ));
         core.step(Event::ToolDone {
             call,
@@ -397,7 +397,7 @@ mod tests {
         new_call.done("review", &json!({}));
         let before = new_call.log.lock().unwrap().clone();
         assert!(before.iter().any(
-            |e| matches!(&e.body, Body::Context {text} if text.ends_with("new instructions"))
+            |e| matches!(&e.body, Body::Context {text, ..} if text.ends_with("new instructions"))
         ));
         new_call.restart();
         new_call.done("review", &json!({}));

@@ -51,13 +51,19 @@ fn instructions_are_published_once_and_replay_uses_only_the_log() {
     let log = rig.log.lock().unwrap().clone();
     assert_eq!(
         log.iter()
-            .filter(|e| matches!(&e.body, Body::Context { text } if text.contains("PRIVATE BODY")))
+            .filter(
+                |e| matches!(&e.body, Body::Context { text, .. } if text.contains("PRIVATE BODY"))
+            )
             .count(),
         1
     );
-    assert!(
-        matches!(&log[1].body, Body::Ext { ext, state, .. } if ext == "skills" && state == "loaded")
-    );
+    assert!(matches!(
+        &log[0].body,
+        Body::Context {
+            publication: Some(_),
+            ..
+        }
+    ));
     rig.restart();
     assert_eq!(
         rig.done("skill", &json!({"name":"review"})),
@@ -77,6 +83,29 @@ fn an_unknown_skill_is_a_typed_error_and_publishes_nothing() {
         json!({"Err":{"unknown_skill":{"name":"missing"}}})
     );
     assert!(rig.log.lock().unwrap().is_empty());
+}
+
+#[test]
+fn a_durable_context_prefix_is_not_published_twice_after_restart() {
+    let rig = Rig::new(
+        "skills-review-prefix",
+        Registry::default().with(&skills()).unwrap(),
+    );
+    rig.done("skill", &json!({"name":"review"}));
+    // A process crash can leave the complete context line without the next marker line.
+    rig.log.lock().unwrap().truncate(1);
+    rig.restart();
+    rig.done("skill", &json!({"name":"review"}));
+    assert_eq!(
+        rig.log
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|e| matches!(&e.body,
+            Body::Context { text, .. } if text.contains("PRIVATE BODY")))
+            .count(),
+        1
+    );
 }
 
 #[test]
@@ -151,7 +180,7 @@ fn explicit_extra_roots_are_opt_in_and_own_roots_override_them() {
             .lock()
             .unwrap()
             .iter()
-            .any(|e| matches!(&e.body, Body::Context{text} if text.ends_with("workspace")))
+            .any(|e| matches!(&e.body, Body::Context{text, ..} if text.ends_with("workspace")))
     );
     let reserved = Loader::new(
         &home,

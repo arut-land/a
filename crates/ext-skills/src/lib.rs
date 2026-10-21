@@ -8,7 +8,7 @@ use std::collections::BTreeMap;
 use std::path::PathBuf;
 use std::sync::Arc;
 
-use ext::{Configured, Cx, Extension, Fold, Refused, Registrar, Schema, Table, Tool};
+use ext::{Configured, Cx, Extension, Publication, Refused, Registrar, Schema, Table, Tool};
 use serde::{Deserialize, Serialize};
 
 pub use loader::Loader;
@@ -48,7 +48,7 @@ impl Extension for Skills {
     const VERSION: u32 = 1;
 
     fn contribute(&self, r: &mut Registrar) {
-        r.fold::<Loaded>().tool(Load(self.catalog.clone()));
+        r.tool(Load(self.catalog.clone()));
         for (name, skill) in &*self.catalog {
             r.dyn_tool(Arc::new(Command {
                 name: name.clone(),
@@ -80,16 +80,10 @@ impl Skills {
     }
 }
 
-#[derive(Default, Serialize, Deserialize)]
-struct Loaded(BTreeMap<String, String>);
-
-impl Fold for Loaded {
-    const NAME: &'static str = "loaded";
-    type Change = (String, String);
-
-    fn apply(&mut self, (name, body): &Self::Change) {
-        self.0.insert(name.clone(), body.clone());
-    }
+struct Instructions;
+impl Publication for Instructions {
+    const NAME: &'static str = "skills";
+    type Key = (String, String);
 }
 
 /// The skill to load, exactly as named by the index.
@@ -127,15 +121,15 @@ impl Load {
             skill.directory.display(),
             skill.body
         );
-        let loaded = cx.state(|loaded: &Loaded| loaded.0.get(name) == Some(&text));
+        let key = (name.to_owned(), text.clone());
+        let loaded = cx.published::<Instructions>(&key);
         if !loaded || !args.is_empty() {
             let mut context = if loaded { String::new() } else { text.clone() };
             if !args.is_empty() {
                 use std::fmt::Write as _;
                 let _ = write!(context, "\nUse skill {name} with these arguments:\n{args}");
             }
-            cx.publish::<Loaded>(&(name.to_owned(), text), context)
-                .await;
+            cx.publish::<Instructions>(&key, context).await;
         }
         Ok(if loaded {
             LoadedSkill::AlreadyLoaded

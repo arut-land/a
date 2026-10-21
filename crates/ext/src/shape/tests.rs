@@ -110,7 +110,7 @@ impl Host for Recorded {
     fn note(&self, _: &str, _: &str, _: Json) -> BoxFuture<'static, ()> {
         Box::pin(std::future::ready(()))
     }
-    fn publish(&self, _: &str, _: &str, _: Json, _: String) -> BoxFuture<'static, ()> {
+    fn publish(&self, _: &str, _: Json, _: String) -> BoxFuture<'static, ()> {
         Box::pin(std::future::ready(()))
     }
 
