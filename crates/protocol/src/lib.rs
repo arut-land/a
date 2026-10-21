@@ -1223,6 +1223,18 @@ impl ClientMsg {
             count: size_of::<Self>(),
         };
         let _ = serde_json::to_writer(&mut count, self);
+        // Reserve the widest sequence before admission, so numbering cannot
+        // increase a mutation's charge in the transport queue.
+        if matches!(
+            self,
+            Self::Input { .. } | Self::Approve { .. } | Self::Interrupt { .. }
+        ) {
+            count.count += self
+                .client_seq()
+                .map_or(br#","client_seq":"#.len() + 20, |seq| {
+                    19 - seq.checked_ilog10().unwrap_or(0) as usize
+                });
+        }
         count.count.max(
             size_of::<Self>()
                 + match self {
@@ -1601,7 +1613,7 @@ mod tests {
         assert_eq!(before, after);
         assert_eq!(
             msg.retained_bytes(),
-            size_of::<ClientMsg>() + after.len() - 4
+            size_of::<ClientMsg>() + after.len() - 4 + 34
         );
         let msg = DaemonMsg::Error {
             message: "\"\n雪".into(),
@@ -1614,6 +1626,21 @@ mod tests {
         let mut text = String::with_capacity(8192);
         text.push('x');
         assert!(ClientMsg::input(text).retained_bytes() >= 8192);
+    }
+
+    #[test]
+    fn numbering_cannot_increase_a_mutations_admission_charge() {
+        for mut msg in [
+            ClientMsg::input("x"),
+            ClientMsg::INTERRUPT,
+            ClientMsg::approve(CallId::new(1).unwrap(), true),
+        ] {
+            let bytes = msg.retained_bytes();
+            for seq in [0, 1, 10, u64::MAX] {
+                *msg.client_seq_mut().unwrap() = Some(seq);
+                assert_eq!(msg.retained_bytes(), bytes, "{msg:?}");
+            }
+        }
     }
 
     #[test]

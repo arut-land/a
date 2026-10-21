@@ -77,6 +77,7 @@ enum Request {
 
 const CONTROL_SLOTS: usize = 16;
 // Control traffic cannot consume the reducer's mutation window or interrupt slot.
+#[cfg(test)]
 const MUTATION_SLOTS: usize = crate::session::UNANSWERED + 1;
 
 #[derive(Default)]
@@ -91,9 +92,20 @@ struct Queued {
     closed: bool,
 }
 
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Admission {
+    Mutation,
+    Metadata,
+}
+
 impl Request {
-    fn mutation(&self) -> bool {
-        matches!(self, Self::Io(io) if matches!(&**io, Io::Send(msg) if crate::session::is_mutation(msg)))
+    fn admission(&self) -> Admission {
+        match self {
+            Self::Io(io) if matches!(&**io, Io::Send(msg) if crate::session::is_mutation(msg)) => {
+                Admission::Mutation
+            }
+            _ => Admission::Metadata,
+        }
     }
 
     fn environment(&self) -> bool {
@@ -122,7 +134,10 @@ impl Outbox {
             },
             Request::Flush(_) => 0,
         };
-        let kept = |item: &Request| !(replace || coalesced && item.environment());
+        let admission = request.admission();
+        let kept = |item: &Request| {
+            !(replace || coalesced && item.environment()) && item.admission() == admission
+        };
         let retained: usize = state
             .items
             .iter()
@@ -130,21 +145,14 @@ impl Outbox {
             .map(|(_, bytes, _)| bytes)
             .sum();
         let control = matches!(&request, Request::Io(io) if matches!(&**io, Io::Send(ClientMsg::Interrupt { .. })));
-        let mutation = request.mutation();
-        let budget = crate::QueueBudget {
-            bytes: crate::session::MUTATION_BUDGET.bytes,
-            requests: if mutation {
-                MUTATION_SLOTS
-            } else {
-                CONTROL_SLOTS + 1
+        let budget = match admission {
+            Admission::Mutation => crate::session::MUTATION_BUDGET,
+            Admission::Metadata => crate::QueueBudget {
+                requests: CONTROL_SLOTS + 1,
+                ..crate::session::MUTATION_BUDGET
             },
-            control_reserve: 1,
         };
-        let requests = state
-            .items
-            .iter()
-            .filter(|(_, _, item)| kept(item) && item.mutation() == mutation)
-            .count();
+        let requests = state.items.iter().filter(|(_, _, item)| kept(item)).count();
         if !budget.admits(retained.saturating_add(bytes), requests, control) {
             return Err(Error::Busy);
         }
@@ -776,6 +784,50 @@ mod tests {
     use std::pin::pin;
     use std::sync::mpsc;
     use std::task::Poll;
+
+    #[test]
+    fn numbered_mutations_always_fit_the_transport_admission() {
+        let queue = Outbox::default();
+        let epoch = AtomicU64::new(0);
+        let env = Environment::new(
+            ".".into(),
+            [("DATA".into(), "x".repeat(10 << 20).into())],
+            false,
+        );
+        queue
+            .send(
+                &epoch,
+                Request::Io(Box::new(Io::Send(ClientMsg::Environment(env)))),
+            )
+            .unwrap();
+        let mut client = crate::SessionClient::new(crate::Env::Keep);
+        client.open(Target::New);
+        client.step(Event {
+            conn: ConnId(1),
+            kind: EventKind::Connected {
+                welcome: crate::Welcome {
+                    proto: protocol::PROTO,
+                    caps: Caps::ALL,
+                },
+                remote: false,
+                commands: Vec::new(),
+            },
+        });
+        let effects = client.offer().unwrap().input("x".repeat(8 << 20)).unwrap();
+        let io = effects
+            .into_iter()
+            .find_map(|effect| match effect {
+                Effect::Io(io @ Io::Send(_)) => Some(io),
+                _ => None,
+            })
+            .unwrap();
+        assert!(matches!(&io, Io::Send(msg) if msg.client_seq() == Some(1)));
+        assert_eq!(
+            queue.send(&epoch, Request::Io(Box::new(io))),
+            Ok(()),
+            "a numbered mutation must not be stranded by a second admission check"
+        );
+    }
 
     #[test]
     fn cancellation_progresses_under_saturation() {
