@@ -147,26 +147,39 @@ fn a_running_quiet_command_costs_no_threads() {
 }
 
 #[test]
-fn a_job_end_is_seen_at_once() {
+fn the_last_job_holds_the_daemon_until_it_ends() {
     let env = Env::new("job-exit");
     let config = env.home.config_file();
     let text = std::fs::read_to_string(&config).unwrap();
     std::fs::write(&config, text.replace("idle_secs = 15", "idle_secs = 1")).unwrap();
-    env.start();
+    let pid = env.start();
     let mut conn = env.connect();
     conn.attach(Target::New, &env.ws);
-    conn.input("$ sleep 3 >/dev/null &");
+    let listener = TcpListener::bind(("127.0.0.1", 0)).unwrap();
+    listener.set_nonblocking(true).unwrap();
+    let port = listener.local_addr().unwrap().port();
+    conn.input(&format!(
+        "$ (exec 3<>/dev/tcp/127.0.0.1/{port}; printf ready >&3; read -r reply <&3) &"
+    ));
     conn.until(|e| matches!(e.body, Body::ToolResult { .. }));
+    wait_idle(&mut conn);
+    let mut accepted = None;
+    wait_for("the background job to connect", || {
+        accepted = listener.accept().ok();
+        accepted.is_some()
+    });
+    let (mut release, _) = accepted.unwrap();
+    release.set_read_timeout(Some(READ_TIMEOUT)).unwrap();
+    let mut ready = [0; 5];
+    release.read_exact(&mut ready).unwrap();
+    assert_eq!(&ready, b"ready");
     drop(conn);
-    let started = Instant::now();
-    // The job holds the daemon up; once it ends, the daemon idles out
-    // within its second.
-    env.wait_exited("the daemon to exit");
-    let took = started.elapsed();
-    eprintln!("daemon exit after a 3 s job: {took:?}");
-    // 3 s of job and 1 s of idleness; a poll would add its period.
-    assert!(took >= Duration::from_millis(3500), "{took:?}");
-    assert!(took < Duration::from_millis(4600), "{took:?}");
+    // Retirement takes longer than the idle deadline. Only the job now
+    // holds the daemon, and it cannot end before the test releases it.
+    blocking_threads_retired(pid);
+    parked(pid);
+    release.write_all(b"done\n").unwrap();
+    env.wait_exited("the daemon to exit after its last job");
 }
 
 /// What `rt::Threads` names its async workers.

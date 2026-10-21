@@ -1023,7 +1023,7 @@ fn watchers_are_sent_the_session_list_as_it_changes() {
         sessions
     };
     let initial = decode(watcher.try_next().expect("the list as it is, at once"));
-    assert!(initial.is_empty());
+    assert_eq!(initial, [] as [SessionSummary; 0]);
     let mut seen = vec![initial];
     let mut until = |pick: &dyn Fn(&[SessionSummary]) -> bool| {
         // Publishing wakes the outbox, after the supervisor's wake event;
