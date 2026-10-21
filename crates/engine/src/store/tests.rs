@@ -977,3 +977,37 @@ fn a_successful_import_survives_a_clean_catalog_restart() {
     drop((catalog, store));
     fs::remove_dir_all(dir).unwrap();
 }
+
+#[test]
+fn a_barrier_write_alone_does_not_survive_a_power_cut() {
+    let memory = Arc::new(Memory::default());
+    let faulty = Faulty::new(Arc::clone(&memory) as _);
+    let header = Header {
+        id: SessionId::new(),
+        workspace: std::env::temp_dir(),
+        parent: None,
+    };
+    let mut loaded = faulty.create(&header).unwrap();
+    let mut entries = [entry(1, 0)];
+    loaded.writer.append(&mut entries, true).unwrap();
+    loaded.writer.sync().unwrap();
+    faulty.cut();
+    assert_eq!(memory.entries(header.id).unwrap(), []);
+}
+
+#[test]
+fn a_read_only_writer_still_flushes_the_prefix_it_will_replay() {
+    let memory = Arc::new(Memory::default());
+    let faulty = Faulty::new(memory.clone());
+    let header = header("/w");
+    let mut loaded = faulty.create(&header).unwrap();
+    let mut entries = [entry(1, 0)];
+    loaded.writer.append(&mut entries, true).unwrap();
+    loaded.writer.keep(ReadOnly::Extensions);
+    let mut forbidden = [entry(2, 0)];
+    assert!(loaded.writer.append(&mut forbidden, true).is_err());
+    loaded.writer.sync().unwrap();
+    rt::block_on(loaded.writer.flushed(&*FLUSH_RT)).unwrap();
+    assert_eq!(memory.entries(header.id).unwrap(), entries);
+    assert_eq!(loaded.writer.read_only(), Some(ReadOnly::Extensions));
+}

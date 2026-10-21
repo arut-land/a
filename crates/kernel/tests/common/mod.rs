@@ -685,7 +685,7 @@ impl Session {
 pub fn barriered(fx: &Effects) {
     let last = fx.iter().rposition(|e| matches!(e, Effect::Append(_)));
     let commits: Vec<usize> = (fx.iter().enumerate())
-        .filter_map(|(i, e)| matches!(e, Effect::Commit(_)).then_some(i))
+        .filter_map(|(i, e)| matches!(e, Effect::Commit { .. }).then_some(i))
         .collect();
     match last {
         None => assert!(commits.is_empty(), "a commit of nothing in {fx:?}"),
@@ -695,9 +695,23 @@ pub fn barriered(fx: &Effects) {
             "one commit after the appends in {fx:?}"
         ),
     }
+    for (index, effect) in fx.iter().enumerate() {
+        if effect.external() {
+            assert!(
+                index > 0 && matches!(fx[index - 1], Effect::Require(_)),
+                "missing admission for {effect:?}"
+            );
+        }
+    }
     if last.is_some() && fx.iter().any(Effect::external) {
         assert!(
-            fx.iter().any(|e| *e == Effect::Commit(Durability::Barrier)),
+            fx.iter().any(|e| matches!(
+                e,
+                Effect::Commit {
+                    durability: Durability::Barrier,
+                    ..
+                }
+            )),
             "an external effect without its barrier in {fx:?}"
         );
     }
@@ -705,7 +719,7 @@ pub fn barriered(fx: &Effects) {
 
 /// `fx` without its commits.
 pub fn uncommitted(mut fx: Effects) -> Effects {
-    fx.retain(|e| !matches!(e, Effect::Commit(_)));
+    fx.retain(|e| !matches!(e, Effect::Commit { .. } | Effect::Require(_)));
     fx
 }
 

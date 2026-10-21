@@ -9,6 +9,7 @@
 
 pub mod channel;
 mod events;
+mod flush;
 mod io;
 mod notify;
 pub mod oneshot;
@@ -29,6 +30,7 @@ use std::thread::{self, Thread};
 use std::time::{Duration, Instant};
 
 pub use events::{Event, EventSink, Noop, Stderr};
+pub use flush::{FlushEpoch, FlushLeader, FlushRequest, Flusher, unblock_flush};
 /// The first of two futures to resolve, the left polled first: every
 /// race in the engine and the extensions is one of these.
 pub use futures_lite::future::or;

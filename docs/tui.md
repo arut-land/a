@@ -137,9 +137,10 @@ a `Style` is the pen (a palette color, attributes: 3 bytes), a `Span` is a
 up to four spans inline; a row clones without allocating. The grid
 (`render.rs`): a `Cell` is one character with the zero-width marks that
 follow it and its pen; `Grid::put` writes a cell a character, as `wrap`
-counted them. The terminal layer: `term.rs` (raw mode through rustix
-termios, the modes, restoring them, the input thread), `keys.rs` (input
-bytes to keys on vte) and `screen.rs` (cells to ANSI). And what a chat
+counted them. The terminal layer: `term.rs` (mode lifecycle and the input
+thread over `sys::terminal`, which owns raw mode, dimensions, input readiness
+and unbuffered output), `keys.rs` (input bytes to keys on vte) and
+`screen.rs` (cells to ANSI). And what a chat
 transcript needs and no widget gives: wrapping cached per item,
 virtualized scrolling from an anchor, clickable spans, and the input
 editor. `ratatui-core` was the grid until October 2026; it came with ten

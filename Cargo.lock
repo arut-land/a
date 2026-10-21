@@ -524,6 +524,7 @@ checksum = "0e9c71c2167ca323c882b99918929403426e2373ea17242ff5653e0d5e1058be"
 name = "engine"
 version = "0.0.0"
 dependencies = [
+ "client",
  "crc32c",
  "ext",
  "ext-compact",
@@ -696,6 +697,7 @@ name = "ext-prompt"
 version = "0.0.0"
 dependencies = [
  "ext",
+ "sys",
 ]
 
 [[package]]
@@ -2182,8 +2184,6 @@ version = "0.0.0"
 dependencies = [
  "client",
  "protocol",
- "rustix",
- "serde",
  "serde_json",
  "smallvec",
  "smol_str",
@@ -2431,6 +2431,7 @@ dependencies = [
  "rt",
  "serde",
  "serde_json",
+ "sys",
  "uuid",
 ]
 

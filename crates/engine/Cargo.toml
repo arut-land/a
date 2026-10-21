@@ -25,6 +25,7 @@ sys.workspace = true
 workspace = true
 
 [dev-dependencies]
+client.workspace = true
 futures-core = { version = "0.3", default-features = false, features = ["std"] }
 http.workspace = true
 serde_yaml_ng = "0.10"

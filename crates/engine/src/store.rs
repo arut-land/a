@@ -31,6 +31,9 @@ pub use lease::{LeaseAuthority, Local};
 #[cfg(test)]
 pub use memory::Memory;
 
+#[cfg(test)]
+static FLUSH_RT: std::sync::LazyLock<rt::Threads> = std::sync::LazyLock::new(rt::Threads::default);
+
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Header {
     pub id: SessionId,
@@ -77,6 +80,7 @@ impl Loaded {
     pub fn append(&mut self, body: protocol::Body) -> io::Result<Entry> {
         let mut entry = [Entry::new(Seq::new(self.seq + 1).unwrap(), Epoch(0), body)];
         self.writer.append(&mut entry, true)?;
+        rt::block_on(self.writer.flushed(&*FLUSH_RT))?;
         let [entry] = entry;
         self.seq = entry.seq.get();
         Ok(entry)
@@ -123,11 +127,16 @@ impl Encoded {
 pub struct Writer {
     pub(crate) log: Box<dyn Log>,
     epoch: u32,
+    kept: Option<ReadOnly>,
 }
 
 impl Writer {
     pub(crate) fn new(log: Box<dyn Log>, epoch: u32) -> Self {
-        Self { log, epoch }
+        Self {
+            log,
+            epoch,
+            kept: None,
+        }
     }
 
     #[cfg(test)]
@@ -137,13 +146,24 @@ impl Writer {
 
     /// Why the log is kept as it is, if it is: then every append fails.
     pub fn read_only(&self) -> Option<ReadOnly> {
-        self.log.read_only()
+        self.kept.or_else(|| self.log.read_only())
     }
 
-    /// Appends `entries`, each stamped with the lease's epoch: durably, or
-    /// only written, to be durable with the next durable append. Returns
-    /// the lines it encoded them as, for whoever shows them.
+    fn writable(&self) -> io::Result<()> {
+        match self.read_only() {
+            Some(why) => Err(io::Error::new(
+                io::ErrorKind::ReadOnlyFilesystem,
+                why.to_string(),
+            )),
+            None => Ok(()),
+        }
+    }
+
+    /// Appends `entries`, each stamped with the lease's epoch, ordered if
+    /// `durable`. Before publishing or starting effects, [`Writer::flushed`]
+    /// completes that promise. Returns the lines encoded for publication.
     pub fn append(&mut self, entries: &mut [Entry], durable: bool) -> io::Result<Encoded> {
+        self.writable()?;
         for e in &mut *entries {
             e.epoch = Epoch(self.epoch);
         }
@@ -156,19 +176,37 @@ impl Writer {
         Ok(lines)
     }
 
-    /// Prevents recovery or future appends when replay cannot honor the log.
+    /// Keeps the backing log for publication flushes while forbidding mutation.
     pub fn keep(&mut self, why: ReadOnly) {
-        self.log = Box::new(Kept(why));
+        self.kept = Some(why);
     }
 
-    /// Makes what was only written durable.
+    /// Orders what was only written, before [`Writer::flushed`].
     pub fn sync(&mut self) -> io::Result<()> {
         self.log.sync()
+    }
+
+    pub fn durable_on_order(&self) -> bool {
+        self.log.durable_on_order()
+    }
+
+    pub fn enroll(&mut self) -> Option<rt::FlushRequest> {
+        self.log.enroll()
+    }
+
+    /// Waits for a cache flush covering the writer's earlier barriers.
+    /// Backends whose barriers already flush return without scheduling work.
+    pub async fn flushed(&mut self, rt: &dyn rt::Runtime) -> io::Result<()> {
+        if let Some(request) = self.enroll() {
+            request.dispatch(rt).await?;
+        }
+        Ok(())
     }
 
     /// Keeps `snapshot` beside the log, for the next load to start from:
     /// it covers entries committed already.
     pub fn snapshot(&mut self, snapshot: &Snapshot) -> io::Result<()> {
+        self.writable()?;
         self.log.snapshot(snapshot)
     }
 
@@ -176,7 +214,8 @@ impl Writer {
     /// down for a test.
     #[cfg(test)]
     pub fn append_raw(&mut self, entries: &[Entry]) -> io::Result<()> {
-        self.log.append_all(entries, &Encoded::of(entries)?)
+        self.log.append_all(entries, &Encoded::of(entries)?)?;
+        rt::block_on(self.flushed(&*FLUSH_RT))
     }
 }
 
@@ -250,11 +289,9 @@ pub trait LogStore: Send + Sync {
 
 /// One session's appender.
 pub trait Log: Send {
-    /// Appends `entries` in order, returning once they are as durable as the
-    /// backend makes anything: a crash afterwards never loses them. A
-    /// backend may make them durable together. After a crash the log holds
-    /// a prefix of them, and after a failure none. `lines` is the entries
-    /// encoded, which a backend stores as they are.
+    /// Appends `entries` in order and passes their write barrier. Once
+    /// [`Log::enroll`] completes, a power cut never loses them. `lines` is
+    /// the entries encoded, which a backend stores as they are.
     fn append_all(&mut self, entries: &[Entry], lines: &Encoded) -> io::Result<()>;
 
     /// Appends `entries` in order, to be read back at once and made
@@ -270,6 +307,15 @@ pub trait Log: Send {
         Ok(())
     }
 
+    fn durable_on_order(&self) -> bool {
+        true
+    }
+
+    /// The cache-flush epoch after the last barrier, where it needs one.
+    fn enroll(&mut self) -> Option<rt::FlushRequest> {
+        None
+    }
+
     /// Keeps `snapshot` for the next load, as it can: a backend that
     /// keeps none has every load fold the log.
     fn snapshot(&mut self, _: &Snapshot) -> io::Result<()> {
@@ -278,23 +324,6 @@ pub trait Log: Send {
 
     fn read_only(&self) -> Option<ReadOnly> {
         None
-    }
-}
-
-/// The appender of a log kept as it is, which a store hands out for a log
-/// it must not change: it refuses every append.
-struct Kept(ReadOnly);
-
-impl Log for Kept {
-    fn append_all(&mut self, _: &[Entry], _: &Encoded) -> io::Result<()> {
-        Err(io::Error::new(
-            io::ErrorKind::ReadOnlyFilesystem,
-            self.0.to_string(),
-        ))
-    }
-
-    fn read_only(&self) -> Option<ReadOnly> {
-        Some(self.0)
     }
 }
 

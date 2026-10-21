@@ -356,7 +356,7 @@ fn spawn(
     env: BTreeMap<String, String>,
     report: Option<&Path>,
 ) -> io::Result<Spawn> {
-    let bash = find_bash(&env).ok_or_else(|| {
+    let bash = sys::find_bash(env.get("PATH").map(String::as_str)).ok_or_else(|| {
         io::Error::new(
             io::ErrorKind::NotFound,
             "bash not found: neither /bin/bash nor bash on PATH",
@@ -421,18 +421,6 @@ fn environment(
     env.insert("A_SESSION_ID".to_owned(), cx.session.to_string());
     env.insert("A_MODEL".to_owned(), cx.model.to_string());
     env
-}
-
-fn find_bash(env: &BTreeMap<String, String>) -> Option<String> {
-    let system = Path::new("/bin/bash");
-    if system.is_file() {
-        return Some(system.display().to_string());
-    }
-    let name = format!("bash{}", std::env::consts::EXE_SUFFIX);
-    std::env::split_paths(env.get("PATH")?)
-        .map(|dir| dir.join(&name))
-        .find(|path| path.is_file())
-        .map(|path| path.display().to_string())
 }
 
 /// `text` as one shell word.
