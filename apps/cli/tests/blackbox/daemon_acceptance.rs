@@ -49,11 +49,16 @@ impl Isolated {
     fn logs(&self) -> std::collections::BTreeMap<String, Vec<u8>> {
         fs::read_dir(self.home.sessions_dir())
             .unwrap()
-            .map(|entry| entry.unwrap().path())
-            .filter(|path| path.extension().is_some_and(|ext| ext == "jsonl"))
+            .map(|entry| entry.unwrap().path().join("log.jsonl"))
+            .filter(|path| path.is_file())
             .map(|path| {
                 (
-                    path.file_name().unwrap().to_string_lossy().into_owned(),
+                    path.parent()
+                        .unwrap()
+                        .file_name()
+                        .unwrap()
+                        .to_string_lossy()
+                        .into_owned(),
                     fs::read(&path).unwrap(),
                 )
             })
