@@ -33,11 +33,14 @@ struct AApp: App {
 final class AppModel {
     private(set) var client: Client?
     private(set) var list: SessionListStore?
-    /// Open sessions by id.
-    private(set) var stores: [String: SessionStore] = [:]
+    private let cache = SessionStoreCache()
+    var stores: [String: SessionStore] { cache.stores }
     /// A new session, until the daemon names it.
     private(set) var draft: SessionStore?
-    var selection: String?
+    var selection: String? {
+        get { cache.selection }
+        set { cache.selection = newValue }
+    }
     var problem: String?
     /// Where "Install Command Line Tool" links `a`.
     var cliDir = FileManager.default.homeDirectoryForCurrentUser.appending(path: ".local/bin")
@@ -47,8 +50,7 @@ final class AppModel {
     var notice: String?
 
     init() {
-        // The bundled `a` (Contents/Helpers), staged like any entry point so
-        // the app and the CLI share one daemon and its sessions.
+        // Staging the bundled helper lets the app and CLI share the daemon.
         let helper = Bundle.main.bundleURL.appending(path: "Contents/Helpers/a").path
         do {
             let client = try Client(helper: helper)
@@ -61,10 +63,8 @@ final class AppModel {
 
     /// Attaches to session `id`, once: its store keeps following it.
     func open(_ id: String) {
-        guard stores[id] == nil, let client else { return }
-        let store = SessionStore(session: Session(client: client))
-        stores[id] = store
-        store.open(.id(id: id))
+        guard let client else { return }
+        cache.open(id, client: client)
     }
 
     func newSession(in workspace: URL) {
@@ -78,7 +78,7 @@ final class AppModel {
     /// Files the draft under its id once it is attached.
     func adoptDraft() {
         guard let draft, let id = draft.sessionId else { return }
-        stores[id] = draft
+        cache.insert(draft, id: id)
         self.draft = nil
         selection = id
     }
