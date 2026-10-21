@@ -149,17 +149,21 @@ impl Pty {
     /// The screen once it shows `text`: looked at again as the child
     /// writes, never on a timer.
     pub fn wait_for(&self, text: &str) -> Screen {
+        self.wait_until(text, |screen| screen.find(text).is_some())
+    }
+
+    pub fn wait_until(&self, what: &str, done: impl Fn(&Screen) -> bool) -> Screen {
         let deadline = Instant::now() + Duration::from_secs(10);
         let mut out = self.sink.lock();
         loop {
             let screen = Screen::parse(&out.bytes, self.cols, self.rows);
-            if screen.find(text).is_some() {
+            if done(&screen) {
                 return screen;
             }
             let left = deadline.saturating_duration_since(Instant::now());
             assert!(
                 left > Duration::ZERO,
-                "timed out waiting for {text:?} on\n{}",
+                "timed out waiting for {what:?} on\n{}",
                 screen.text()
             );
             out = self

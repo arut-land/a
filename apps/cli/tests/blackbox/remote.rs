@@ -42,6 +42,13 @@ fn bridge_speaks_the_protocol_over_stdio() {
     assert!(matches!(recv(), DaemonMsg::Welcome { proto: PROTO, .. }));
     assert!(matches!(recv(), DaemonMsg::Attached { .. }));
     assert!(matches!(recv(), DaemonMsg::Entry(e) if matches!(e.body, Body::Extensions { .. })));
+    assert!(matches!(
+        recv(),
+        DaemonMsg::Activity {
+            seq: 1,
+            activity: protocol::Activity::Idle
+        }
+    ));
     assert!(matches!(recv(), DaemonMsg::Synced { seq: 1 }));
     assert!(matches!(
         recv(),

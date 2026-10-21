@@ -1,5 +1,152 @@
 [
   {
+    "hash": "ba47e388c35a427d",
+    "messages": [
+      {
+        "session": "00000000-0000-0000-0000-00000000000a",
+        "t": "attached",
+        "workspace": "/w"
+      },
+      {
+        "activity": "idle",
+        "seq": 0,
+        "t": "activity"
+      },
+      {
+        "epoch": 0,
+        "kind": "input",
+        "seq": 1,
+        "t": "entry",
+        "taken": true,
+        "text": "hi"
+      },
+      {
+        "activity": "running",
+        "seq": 1,
+        "t": "activity"
+      },
+      {
+        "epoch": 0,
+        "kind": "assistant",
+        "seq": 2,
+        "t": "entry",
+        "text": "hi"
+      },
+      {
+        "activity": "idle",
+        "seq": 1,
+        "t": "activity"
+      },
+      {
+        "activity": "idle",
+        "seq": 2,
+        "t": "activity"
+      },
+      {
+        "seq": 2,
+        "t": "synced"
+      }
+    ],
+    "name": "only a complete burst certifies idle after its final entry",
+    "state": {
+      "items": [
+        {
+          "seq": 1,
+          "text": "hi",
+          "type": "user"
+        },
+        {
+          "seq": 2,
+          "text": "hi",
+          "type": "assistant"
+        }
+      ],
+      "ledger": {
+        "armed": [],
+        "background": [],
+        "clients": [],
+        "context": false,
+        "env": null,
+        "extensions": null,
+        "links": [],
+        "open": [],
+        "seq": 2,
+        "turn": 1,
+        "untaken": [],
+        "watched": []
+      },
+      "seq": 2,
+      "session": "00000000-0000-0000-0000-00000000000a",
+      "workspace": "/w"
+    },
+    "updates": [
+      {
+        "change": {
+          "change": "attached",
+          "reset": true,
+          "session": "00000000-0000-0000-0000-00000000000a",
+          "workspace": "/w"
+        },
+        "rev": 1,
+        "seq": 0
+      },
+      {
+        "change": {
+          "change": "activity"
+        },
+        "rev": 2,
+        "seq": 0
+      },
+      {
+        "change": {
+          "change": "added",
+          "index": 0,
+          "item": {
+            "seq": 1,
+            "text": "hi",
+            "type": "user"
+          }
+        },
+        "rev": 3,
+        "seq": 1
+      },
+      {
+        "change": {
+          "change": "activity"
+        },
+        "rev": 4,
+        "seq": 1
+      },
+      {
+        "change": {
+          "change": "added",
+          "index": 1,
+          "item": {
+            "seq": 2,
+            "text": "hi",
+            "type": "assistant"
+          }
+        },
+        "rev": 5,
+        "seq": 2
+      },
+      {
+        "change": {
+          "change": "activity"
+        },
+        "rev": 6,
+        "seq": 2
+      },
+      {
+        "change": {
+          "change": "synced"
+        },
+        "rev": 7,
+        "seq": 2
+      }
+    ]
+  },
+  {
     "hash": "6c8e00eea9b68da2",
     "messages": [
       {

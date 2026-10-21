@@ -165,7 +165,7 @@ public final class SessionStore {
             self.recap = recap
         case .snapshot(let snapshot):
             items = snapshot
-        case .draining:
+        case .activity, .draining:
             break
         case .mismatch(_, let message):
             problem = message
