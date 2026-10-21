@@ -193,7 +193,9 @@ impl Host for Recorder {
             upto,
             replace,
         };
-        log.push(Entry::new(Seq::new(seq).unwrap(), Epoch(0), edit));
+        let entry = Entry::new(Seq::new(seq).unwrap(), Epoch(0), edit);
+        lock(&self.states).apply(&entry);
+        log.push(entry);
     }
 
     fn states(&self, read: &mut dyn FnMut(&States)) {

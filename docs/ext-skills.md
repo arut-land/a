@@ -40,7 +40,11 @@ policy rules.
 
 A successful load seals `Body::Context` text and its typed publication key
 in one log entry. A durable prefix therefore contains both or neither. The same instructions are published once per session;
-subsequent loads return `already_loaded`. An edited body or relocated directory
+subsequent loads return `already_loaded` while that publication remains in
+the effective transcript. `Edit` ranges, including compaction, invalidate the
+covered publications. A subsequent load restores omitted instructions, and
+the adopted generation's index is restored before the next model request or
+retry. Snapshots retain this same edit-aware projection. An edited body or relocated directory
 can be loaded again after adoption. Unknown names return the typed
 `LoadError::UnknownSkill { name }` inside the tool's result and publish nothing.
 Loads are exclusive, so concurrent model requests cannot publish the same
@@ -66,7 +70,8 @@ as Lua: no calls, asks, children or recovering model call. A busy session keeps
 its tool objects, index and bodies. The next model call after adoption logs the
 current index as ordinary context. Reloads and resumed sessions can record a
 new index; later indices supersede earlier ones. Previously loaded instructions
-stay in the log; load the skill again to adopt its changed body. Deleting a skill
+stay in the log; load the skill again to adopt its changed body. Compaction
+can hide their publication from effective context without removing history. Deleting a skill
 removes it from the next index and command set, without rewriting history.
 A nonexistent workspace can attach without a workspace watcher; reopen it after
 creating its directory to discover workspace skills. Workspace subscriptions

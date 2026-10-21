@@ -109,6 +109,25 @@ fn a_durable_context_prefix_is_not_published_twice_after_restart() {
 }
 
 #[test]
+fn instructions_can_be_reloaded_after_compaction_hides_their_context() {
+    let rig = Rig::new(
+        "skills-review-compact",
+        Registry::default().with(&skills()).unwrap(),
+    );
+    rig.done("skill", &json!({"name":"review"}));
+    rig.cx().edit(
+        protocol::Seq::new(1).unwrap(),
+        protocol::Seq::new(2),
+        Some("summary"),
+    );
+    rig.restart();
+    assert_eq!(
+        rig.done("skill", &json!({"name":"review"})),
+        json!({"Ok":"loaded"})
+    );
+}
+
+#[test]
 fn portable_yaml_is_parsed_and_ambiguous_headers_are_rejected() {
     let root = std::path::Path::new("/skills/review");
     let (name, skill) = parse::parse("---\r\nname: 'review'\r\ndescription: >-\r\n  Review: code\r\n  and tests\r\nmetadata:\r\n  owner: team\r\n---\r\nbody", root).unwrap();

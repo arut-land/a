@@ -2180,7 +2180,8 @@ impl Actor {
         if let Some(messages) = transcript.before(call.get()) {
             messages.clone()
         } else {
-            // A call recovery runs after entries it does not see.
+            // Recovery keeps the call's conversation boundary, including later
+            // transcript edits and context republished while preparing it.
             let before = frames
                 .entries()
                 .chain(
@@ -2188,7 +2189,9 @@ impl Actor {
                         .iter()
                         .flat_map(|(entries, _)| entries.iter().cloned()),
                 )
-                .take_while(|e| e.seq < call.0);
+                .filter(|e| {
+                    e.seq < call.0 || matches!(e.body, Body::Context { .. } | Body::Edit { .. })
+                });
             Transcript::of(before, Arc::clone(registry), system).into_messages()
         }
     }

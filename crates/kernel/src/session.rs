@@ -594,8 +594,29 @@ impl Core {
         Some(self.append(fx, body))
     }
 
+    fn publish_generation(&mut self, fx: &mut Effects) {
+        let Some(text) = self.generation_context.as_ref() else {
+            return;
+        };
+        let key = Json::encode(text).expect("context text encodes");
+        if !self.fold.ledger.publications().contains("generation", &key) {
+            let publication = protocol::publication::Publication {
+                namespace: "generation".into(),
+                key,
+            };
+            self.append(
+                fx,
+                Body::Context {
+                    text: text.clone(),
+                    publication: Some(publication),
+                },
+            );
+        }
+    }
+
     /// Has model call `call` prepared again, as attempt `attempt`.
     fn again(&mut self, call: CallId, attempt: u16, fx: &mut Effects) {
+        self.publish_generation(fx);
         let choice = match self.fold.ledger.call(call).map(|open| &open.call) {
             Some(&Call::Model { choice, .. }) => choice,
             _ => ToolChoice::Auto,
@@ -923,15 +944,7 @@ impl Core {
                         },
                     );
                 }
-                if let Some(text) = self.generation_context.take() {
-                    self.append(
-                        fx,
-                        Body::Context {
-                            text,
-                            publication: None,
-                        },
-                    );
-                }
+                self.publish_generation(fx);
                 let model = self.registry.model();
                 let body = Body::ModelCall {
                     model,
