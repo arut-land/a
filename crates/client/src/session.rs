@@ -312,11 +312,11 @@ impl SessionClient {
                 ..TurnView::default()
             };
         }
-        let ledger = &self.view.ledger;
+        let state = &self.view.state;
         let activity = self.view.activity;
         let running = activity != Some(Activity::Idle);
-        let asking = ledger.inbox().next();
-        let asks = u32::try_from(ledger.inbox().count()).unwrap_or(u32::MAX);
+        let asking = state.inbox().next();
+        let asks = u32::try_from(state.inbox().count()).unwrap_or(u32::MAX);
         TurnView {
             activity,
             running,
@@ -639,7 +639,7 @@ impl Offer<'_> {
     /// Answers the approval call `call` waits for.
     pub fn approve(self, call: CallId, approved: bool) -> Result<Vec<Effect>, Notice> {
         self.view()?;
-        if !self.0.view.ledger.inbox().any(|c| c == call) {
+        if !self.0.view.state.inbox().any(|c| c == call) {
             return Err(Notice::NotAsking(call));
         }
         self.send(ClientMsg::approve(call, approved))

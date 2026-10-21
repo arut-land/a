@@ -19,17 +19,18 @@ pub(super) struct Projection {
     pub(super) published_activity: Option<(u64, Activity)>,
 }
 
-#[derive(Default)]
+#[derive(Clone, Default, serde::Serialize, serde::Deserialize)]
 pub(super) struct Invocations {
     through: u64,
     calls: std::collections::BTreeMap<CallId, Invocation>,
 }
 
+#[derive(Clone, serde::Serialize, serde::Deserialize)]
 struct Invocation {
     key: protocol::Invocation,
     tool: String,
     input: super::Json,
-    result: Option<(protocol::Seq, super::Called)>,
+    result: Option<(protocol::Seq, protocol::Outcome, Option<protocol::Card>)>,
 }
 
 impl Invocations {
@@ -64,13 +65,7 @@ impl Invocations {
                 self.calls
                     .retain(|_, invocation| invocation.key.parent != *call);
                 if let Some(invocation) = self.calls.get_mut(call) {
-                    invocation.result = Some((
-                        entry.seq,
-                        super::Called {
-                            outcome: outcome.clone(),
-                            card: card.clone(),
-                        },
-                    ));
+                    invocation.result = Some((entry.seq, outcome.clone(), card.clone()));
                 }
             }
             _ => {}
@@ -119,9 +114,12 @@ impl Invocations {
             .is_some_and(|invocation| invocation.result.is_some())
     }
 
-    fn result(&self, call: CallId, durable: u64) -> Option<&super::Called> {
-        let (seq, result) = self.calls.get(&call)?.result.as_ref()?;
-        (seq.get() <= durable).then_some(result)
+    fn result(&self, call: CallId, durable: u64) -> Option<super::Called> {
+        let (seq, outcome, card) = self.calls.get(&call)?.result.as_ref()?;
+        (seq.get() <= durable).then(|| super::Called {
+            outcome: outcome.clone(),
+            card: card.clone(),
+        })
     }
 }
 
@@ -140,7 +138,7 @@ impl Actor {
                         .result(call, self.journal.durable_seq)
                     {
                         self.replies.contexts.remove(&call);
-                        reply.send(result.clone());
+                        reply.send(result);
                     } else {
                         self.replies.invoked.entry(call).or_default().push(reply);
                     }
@@ -353,7 +351,7 @@ impl Actor {
                         live.frames.entries().ok()?,
                     ),
                 };
-                let frame = Frame::new(&DaemonMsg::Snapshot(Box::new(view.clone()))).ok();
+                let frame = Frame::new(&DaemonMsg::Snapshot(Box::new(view.snapshot()))).ok();
                 Some((view, frame))
             },
         )
@@ -402,5 +400,81 @@ impl Actor {
         .await?;
         self.projection.transcript = Some(transcript);
         Ok(messages)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use protocol::{Audience, Epoch, Json, Outcome, Seq};
+
+    #[test]
+    fn delegated_results_remain_cached_across_checkpoints() {
+        let parent = CallId::new(1).unwrap();
+        let call = CallId::new(2).unwrap();
+        let input = Json::encode(&"input").unwrap();
+        let mut live = Invocations::default();
+        live.fold(&Entry::new(
+            call.0,
+            Epoch(0),
+            Body::ToolCall {
+                invoke: Some(protocol::Invocation {
+                    parent,
+                    name: "effect".into(),
+                }),
+                tool: "write".into(),
+                input: input.clone(),
+                id: None,
+                card: None,
+                by: Audience::Model,
+            },
+        ));
+        for outcome in [
+            Outcome::Done {
+                output: Json::encode(&"result").unwrap(),
+            },
+            Outcome::Failed {
+                error: "failed".into(),
+            },
+            Outcome::Interrupted {
+                output: Some("partial".into()),
+            },
+        ] {
+            let mut completed = live.clone();
+            completed.fold(&Entry::new(
+                Seq::new(3).unwrap(),
+                Epoch(0),
+                Body::ToolResult {
+                    call,
+                    outcome: outcome.clone(),
+                    card: None,
+                },
+            ));
+            let mut restored: Invocations = Json::encode(&completed).unwrap().parse().unwrap();
+            assert_eq!(
+                restored.request(parent, "effect", "write", &input),
+                Ok(Some(call))
+            );
+            assert!(restored.result(call, 2).is_none());
+            assert_eq!(restored.result(call, 3).unwrap().outcome, outcome);
+            let end = Entry::new(
+                Seq::new(4).unwrap(),
+                Epoch(0),
+                Body::ToolResult {
+                    call: parent,
+                    outcome: Outcome::Interrupted { output: None },
+                    card: None,
+                },
+            );
+            restored.fold(&end);
+            completed.fold(&end);
+            assert_eq!(restored.result(call, 4), completed.result(call, 4));
+            assert!(
+                restored
+                    .request(parent, "effect", "write", &input)
+                    .unwrap()
+                    .is_none()
+            );
+        }
     }
 }

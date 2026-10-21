@@ -187,7 +187,7 @@ mod approval_tests {
         assert!(saw_question);
         let explanation = approval_text(&view.present(&view.items[0]));
         assert!(explanation.ends_with("Why: the ask mode requires approval for this tool\nModel summary (unverified): Lists files in the current directory."));
-        let snapshot = DaemonMsg::Snapshot(Box::new(view.clone()));
+        let snapshot = DaemonMsg::Snapshot(Box::new(view.snapshot()));
         let encoded = serde_json::to_vec(&snapshot).unwrap();
         let mut replay = SessionView::default();
         replay.fold(&DaemonMsg::from_json(&encoded).unwrap());

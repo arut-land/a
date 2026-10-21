@@ -481,7 +481,7 @@ fn a_pending_approval_survives_detach_and_is_re_delivered_on_attach() {
     else {
         unreachable!()
     };
-    assert_eq!(conn.view.ledger.inbox().next(), Some(call));
+    assert_eq!(conn.view.state.inbox().next(), Some(call));
     let listed = env.run(&["ls"]);
     assert!(listed.contains("  approval   loaded  "), "{listed}");
     drop(conn);
@@ -496,7 +496,7 @@ fn a_pending_approval_survives_detach_and_is_re_delivered_on_attach() {
         ..protocol::view::Recap::default()
     };
     assert_eq!(conn.view.recap, Some(recap));
-    assert_eq!(conn.view.ledger.inbox().next(), Some(call));
+    assert_eq!(conn.view.state.inbox().next(), Some(call));
     drop(conn);
 
     env.kill_daemon();
