@@ -651,7 +651,9 @@ fn model_calls_take_credentials_from_the_client_then_the_config() {
         let session = fixture.start(&[]);
         if let Some(key) = client {
             let vars = [("OPENAI_API_KEY".into(), key.into())];
-            session.set_env(Environment::new(dir.clone(), vars, false));
+            session
+                .set_env(Environment::new(dir.clone(), vars, false))
+                .unwrap();
         }
         session.submit("Call the tool, then answer.").unwrap();
         settle(&session);
@@ -2122,7 +2124,7 @@ fn in_process_recovery_preserves_the_attached_environment() {
         [("OPENAI_API_KEY".into(), "client-test-key".into())],
         false,
     ));
-    session.set_env(Arc::clone(&env));
+    session.set_env(Arc::clone(&env)).unwrap();
     session.barrier();
     probe.failing.store(true, Ordering::SeqCst);
     assert!(session.submit("lost").is_err());
@@ -2620,15 +2622,28 @@ fn environment_bursts_retain_one_payload_and_one_mailbox_marker() {
     let mut previous = Weak::new();
     for n in 0..1000 {
         let env = Arc::new(Environment::new(n.to_string().into(), Vec::new(), false));
-        live.set_env(Arc::clone(&env));
+        live.set_env(Arc::clone(&env)).unwrap();
         assert!(previous.upgrade().is_none());
         previous = Arc::downgrade(&env);
     }
+    let oversized = Environment::new(
+        "oversized".into(),
+        [(
+            "DATA".into(),
+            "x".repeat(crate::outbox::BUDGET.bytes).into(),
+        )],
+        false,
+    );
+    assert_eq!(
+        live.set_env(oversized).unwrap_err().kind(),
+        io::ErrorKind::WouldBlock
+    );
     assert!(matches!(rx.try_recv(), Some(Msg::Env)));
     assert!(rx.try_recv().is_none());
     let latest = lock(&live.session.pending_env).take().unwrap();
     assert_eq!(latest.cwd, PathBuf::from("999"));
-    live.set_env(Environment::new("next".into(), Vec::new(), false));
+    live.set_env(Environment::new("next".into(), Vec::new(), false))
+        .unwrap();
     assert!(matches!(rx.try_recv(), Some(Msg::Env)));
     assert!(rx.try_recv().is_none());
     drop(live);

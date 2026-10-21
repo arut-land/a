@@ -640,11 +640,19 @@ impl Live {
 
     /// Runs commands from now on in `env`, the newest client's; its
     /// redacted form is logged unless it is the one logged last.
-    pub fn set_env(&self, env: impl Into<Arc<Environment>>) {
+    pub fn set_env(&self, env: impl Into<Arc<Environment>>) -> io::Result<()> {
+        let env = env.into();
+        if env.retained_bytes() > crate::outbox::BUDGET.bytes {
+            return Err(io::Error::new(
+                io::ErrorKind::WouldBlock,
+                "environment exceeds the queue budget",
+            ));
+        }
         let mut pending = lock(&self.session.pending_env);
-        if pending.replace(env.into()).is_none() {
+        if pending.replace(env).is_none() {
             self.send(Msg::Env);
         }
+        Ok(())
     }
 
     pub(crate) fn settled(&self, child: SessionId, outcome: Outcome) {

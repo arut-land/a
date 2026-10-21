@@ -267,7 +267,7 @@ impl Live {
                 self.driver.pump(&mut self.page, effects);
             }
             self.page.settle();
-            client::yield_now().await;
+            rt::yield_now().await;
         }
     }
 

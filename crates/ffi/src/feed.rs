@@ -14,7 +14,7 @@ use protocol::{Caps, DaemonMsg, Decode};
 use crate::{ClientError, Resync, SessionSnapshot, TITLE, TurnInfo, ViewChange, ViewUpdate};
 
 /// How many updates a stream buffers for a slow reader before it drops.
-const BUFFER: usize = BUDGET.control_reserve;
+const BUFFER: usize = 16;
 
 /// How many recent updates [`Feed::resync`] can hand back. An item crosses
 /// whole once and is patched after, so what they keep is about what the
@@ -22,7 +22,7 @@ const BUFFER: usize = BUDGET.control_reserve;
 const BUDGET: client::QueueBudget = client::QueueBudget {
     bytes: 4 << 20,
     requests: 512,
-    control_reserve: 16,
+    control_reserve: 0,
 };
 const KEPT: usize = BUDGET.requests;
 const BYTES: usize = BUDGET.bytes;

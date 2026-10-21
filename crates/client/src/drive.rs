@@ -17,18 +17,6 @@ use crate::{
 type Sink = dyn Fn(&ClientHandle, Event) + Send + Sync;
 type Origin = dyn Fn() -> io::Result<Environment> + Send + Sync;
 
-pub async fn yield_now() {
-    let mut yielded = false;
-    std::future::poll_fn(|cx| {
-        if std::mem::replace(&mut yielded, true) {
-            return std::task::Poll::Ready(());
-        }
-        cx.waker().wake_by_ref();
-        std::task::Poll::Pending
-    })
-    .await;
-}
-
 /// What renders a session client's [`Show`] effects: an app's screen, a
 /// web page, a feed to another language. Showing may ask the client for
 /// more (a picker opening asks for the list), which comes back as effects.
@@ -121,59 +109,50 @@ impl Outbox {
         }
         let replace =
             matches!(&request, Request::Io(io) if matches!(&**io, Io::Connect { .. } | Io::Hangup));
-        if replace {
-            state.items.clear();
-            epoch.fetch_add(1, Ordering::AcqRel);
-        }
         let coalesced =
             request.environment() && state.items.iter().any(|(_, _, item)| item.environment());
-        if coalesced {
-            state.items.retain(|(_, _, item)| !item.environment());
-        }
         let bytes = match &request {
             Request::Io(io) => match &**io {
-                Io::Send(msg) => {
-                    let mut bytes = crate::ByteCount(0);
-                    serde_json::to_writer(&mut bytes, msg).map_err(io::Error::other)?;
-                    bytes.0
-                }
+                Io::Send(msg) => msg.retained_bytes(),
                 Io::Connect { attach, .. } => match &attach.env {
-                    crate::Env::Given(env) => env
-                        .vars
-                        .iter()
-                        .map(|(key, value)| key.len() + value.len())
-                        .sum(),
+                    crate::Env::Given(env) => env.retained_bytes(),
                     _ => 0,
                 },
                 _ => 0,
             },
             Request::Flush(_) => 0,
         };
-        let retained: usize = state.items.iter().map(|(_, bytes, _)| bytes).sum();
-        let control = matches!(&request, Request::Io(io) if matches!(&**io, Io::Send(ClientMsg::Interrupt { .. })));
-        let budget = crate::QueueBudget::default();
-        let limit = if control {
-            budget.bytes
-        } else {
-            budget.bytes / 2
-        };
-        if bytes > limit.saturating_sub(retained) {
-            return Err(Error::Busy);
-        }
-        let mutation = request.mutation();
-        let limit = if mutation {
-            MUTATION_SLOTS - usize::from(!control)
-        } else {
-            CONTROL_SLOTS
-        };
-        if state
+        let kept = |item: &Request| !(replace || coalesced && item.environment());
+        let retained: usize = state
             .items
             .iter()
-            .filter(|(_, _, item)| item.mutation() == mutation)
-            .count()
-            >= limit
-        {
+            .filter(|(_, _, item)| kept(item))
+            .map(|(_, bytes, _)| bytes)
+            .sum();
+        let control = matches!(&request, Request::Io(io) if matches!(&**io, Io::Send(ClientMsg::Interrupt { .. })));
+        let mutation = request.mutation();
+        let budget = crate::QueueBudget {
+            bytes: crate::session::MUTATION_BUDGET.bytes,
+            requests: if mutation {
+                MUTATION_SLOTS
+            } else {
+                CONTROL_SLOTS + 1
+            },
+            control_reserve: 1,
+        };
+        let requests = state
+            .items
+            .iter()
+            .filter(|(_, _, item)| kept(item) && item.mutation() == mutation)
+            .count();
+        if !budget.admits(retained.saturating_add(bytes), requests, control) {
             return Err(Error::Busy);
+        }
+        if replace {
+            state.items.clear();
+            epoch.fetch_add(1, Ordering::AcqRel);
+        } else if coalesced {
+            state.items.retain(|(_, _, item)| !item.environment());
         }
         if !matches!(&request, Request::Io(io) if matches!(&**io, Io::Hangup)) {
             state
@@ -369,7 +348,7 @@ impl Driver {
                 batch += 1;
                 if batch == crate::PUMP_BATCH {
                     batch = 0;
-                    yield_now().await;
+                    rt::yield_now().await;
                 }
                 match io.recv(&mut buffered).await {
                     Ok(Some(msg)) => {
@@ -388,7 +367,7 @@ impl Driver {
                 batch += 1;
                 if batch == crate::PUMP_BATCH {
                     batch = 0;
-                    yield_now().await;
+                    rt::yield_now().await;
                 }
                 if epoch != generation {
                     return (Error::Closed, Some((epoch, command)));
@@ -724,7 +703,7 @@ impl AsyncConnection {
 
     async fn send(&self, msg: &ClientMsg) -> io::Result<()> {
         let mut bytes = Vec::new();
-        protocol::write_frame(&mut bytes, msg)?;
+        msg.write_frame(&mut bytes)?;
         let mut remaining = bytes.as_slice();
         while !remaining.is_empty() {
             let written = self.writer.write(remaining).await?;
@@ -1025,6 +1004,49 @@ mod tests {
             };
             assert!(matches!(*io, Io::Send(msg) if msg.client_seq() == Some(seq as u64)));
         }
+    }
+
+    #[test]
+    fn rejected_replacements_preserve_queued_work_and_the_connection_epoch() {
+        let queue = Outbox::default();
+        let epoch = AtomicU64::new(0);
+        let send = |io| queue.send(&epoch, Request::Io(Box::new(io)));
+        send(Io::Send(ClientMsg::Environment(Environment::new(
+            "kept".into(),
+            Vec::new(),
+            false,
+        ))))
+        .unwrap();
+        send(Io::Send(ClientMsg::input("durable"))).unwrap();
+        let oversized = Environment::new(
+            "oversized".into(),
+            [(
+                "DATA".into(),
+                "x".repeat(crate::session::MUTATION_BUDGET.bytes).into(),
+            )],
+            false,
+        );
+        assert_eq!(
+            send(Io::Send(ClientMsg::Environment(oversized.clone()))),
+            Err(Error::Busy)
+        );
+        assert_eq!(
+            send(Io::Connect {
+                conn: ConnId(2),
+                attach: Attach::new(Target::New, crate::Env::Given(oversized)),
+                restart: false
+            }),
+            Err(Error::Busy)
+        );
+        assert_eq!(epoch.load(Ordering::Acquire), 0);
+        let state = queue.state.lock().unwrap();
+        assert_eq!(state.items.len(), 2);
+        assert!(
+            matches!(&state.items[0].2, Request::Io(io) if matches!(&**io, Io::Send(ClientMsg::Environment(env)) if env.cwd == std::path::Path::new("kept")))
+        );
+        drop(state);
+        send(Io::Hangup).unwrap();
+        assert_eq!(epoch.load(Ordering::Acquire), 1);
     }
 
     #[test]

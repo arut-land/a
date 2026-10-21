@@ -15,12 +15,7 @@ use protocol::{Class, Decode, Entry, Frame};
 
 use crate::lock;
 
-/// Limits queued metadata; durable overflow closes the connection for replay.
-pub(crate) struct QueueBudget {
-    pub bytes: usize,
-    pub requests: usize,
-    pub control_reserve: usize,
-}
+use protocol::QueueBudget;
 
 pub(crate) const BUDGET: QueueBudget = QueueBudget {
     bytes: 32 << 20,
@@ -36,14 +31,7 @@ pub(super) struct QueuePermit(usize);
 impl QueuePermit {
     pub(super) fn acquire(bytes: usize, control: bool) -> Option<Self> {
         let mut queued = lock(&QUEUED);
-        let budget = &BUDGET;
-        let slots = budget.requests - if control { 0 } else { budget.control_reserve };
-        let limit = if control {
-            budget.bytes
-        } else {
-            budget.bytes / 2
-        };
-        if queued.0 >= slots || bytes > limit.saturating_sub(queued.1) {
+        if !BUDGET.admits(queued.1.saturating_add(bytes), queued.0, control) {
             return None;
         }
         queued.0 += 1;

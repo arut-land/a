@@ -7,22 +7,7 @@ use std::sync::{Arc, Condvar, Mutex, MutexGuard, PoisonError};
 use std::task::{Context, Poll, Waker};
 use std::time::{Duration, Instant};
 
-#[derive(Clone, Copy)]
-pub struct QueueBudget {
-    pub bytes: usize,
-    pub requests: usize,
-    pub control_reserve: usize,
-}
-
-impl Default for QueueBudget {
-    fn default() -> Self {
-        Self {
-            bytes: 32 << 20,
-            requests: 1024,
-            control_reserve: 16,
-        }
-    }
-}
+pub use protocol::QueueBudget;
 
 pub const PUMP_BATCH: usize = 64;
 
@@ -129,22 +114,13 @@ impl<T> Post<T> {
     fn post(&self, item: T, first: bool) -> Result<(), T> {
         let mut queue = self.0.queue();
         let bytes = (self.0.weight)(&item);
-        let reserve = if first {
-            0
-        } else {
-            self.0.budget.control_reserve
-        };
         if !queue.taken
             || queue.ended
-            || queue.first.len() + queue.items.len()
-                >= self.0.budget.requests.saturating_sub(reserve)
-            || bytes
-                > self
-                    .0
-                    .budget
-                    .bytes
-                    .saturating_sub(reserve.saturating_mul(4096))
-                    .saturating_sub(queue.bytes)
+            || !self.0.budget.admits(
+                queue.bytes.saturating_add(bytes),
+                queue.first.len() + queue.items.len(),
+                first,
+            )
         {
             return Err(item);
         }

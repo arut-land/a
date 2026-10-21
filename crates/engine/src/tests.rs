@@ -581,7 +581,7 @@ fn a_child_runs_in_its_parents_environment() {
         vars: vars.map(|(k, v)| (k.into(), v.into())).into(),
         ..Environment::default()
     };
-    parent.session().set_env(env.clone());
+    parent.session().set_env(env.clone()).unwrap();
     parent.session().submit("spawn hi").unwrap();
     settle(&daemon);
     drop(parent);
@@ -1548,14 +1548,17 @@ fn a_fork_keeps_the_selected_recorded_environment_without_live_secrets() {
         ]),
         ..Environment::default()
     };
-    source.session().set_env(old.clone());
+    source.session().set_env(old.clone()).unwrap();
     source.session().submit("first").unwrap();
     settle(&daemon);
     let boundary = source.session().summary().entries;
-    source.session().set_env(Environment {
-        cwd: root.join("new"),
-        ..Environment::default()
-    });
+    source
+        .session()
+        .set_env(Environment {
+            cwd: root.join("new"),
+            ..Environment::default()
+        })
+        .unwrap();
     source.session().submit("second").unwrap();
     settle(&daemon);
     let fork = daemon

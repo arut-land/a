@@ -116,6 +116,7 @@ struct Frames {
     io: Arc<Async<Stream>>,
     buf: Vec<u8>,
     bytes: usize,
+    batch: usize,
 }
 
 impl Frames {
@@ -124,13 +125,19 @@ impl Frames {
             io,
             buf: Vec::new(),
             bytes: 0,
+            batch: 0,
         }
     }
 
     /// The next message; `None` once the client hung up between frames.
     async fn next<T: Decode>(&mut self) -> io::Result<Option<T>> {
         loop {
+            if self.batch >= WRITE_BATCH {
+                self.batch = 0;
+                rt::yield_now().await;
+            }
             if let Some((len, body)) = protocol::frame_in(&self.buf)? {
+                self.batch += len.max(WRITE_BATCH / 64);
                 let msg = T::from_json(body)?;
                 self.bytes = len;
                 self.buf.drain(..len);
@@ -186,6 +193,7 @@ async fn write_out(io: Arc<Async<Stream>>, outbox: Outbox, rt: rt::Rt) {
             return;
         }
         batch.clear();
+        rt::yield_now().await;
     }
     let _ = io.get_ref().shutdown(std::net::Shutdown::Both);
 }
@@ -315,8 +323,7 @@ impl Conn<'_> {
     /// Anything else waits until what was asked before it is answered.
     async fn serve(&mut self, frames: &mut Frames) -> io::Result<()> {
         let mut pending: VecDeque<(Option<u64>, BoxFuture<'static, Answer>)> = VecDeque::new();
-        let mut result = Ok(());
-        loop {
+        let result = loop {
             let next = {
                 let mut next = pin!(frames.next::<ClientMsg>());
                 poll_fn(|cx| {
@@ -333,10 +340,7 @@ impl Conn<'_> {
             };
             let mut msg = match next {
                 Ok(Some(msg)) => msg,
-                ended => {
-                    result = ended.map(|_| ());
-                    break;
-                }
+                ended => break ended.map(|_| ()),
             };
             if let Some(&mut client_seq) = msg.client_seq_mut() {
                 let control = matches!(msg, ClientMsg::Interrupt { .. });
@@ -372,7 +376,10 @@ impl Conn<'_> {
                 }
                 ClientMsg::Declare(decl) => self.decl = decl,
                 ClientMsg::Environment(env) => match &self.attached {
-                    Some(s) => s.session().set_env(env),
+                    Some(s) => s
+                        .session()
+                        .set_env(env)
+                        .unwrap_or_else(|error| self.error(error.to_string())),
                     None => self.error("not attached".into()),
                 },
                 ClientMsg::List => self.reply(&DaemonMsg::Sessions {
@@ -398,13 +405,13 @@ impl Conn<'_> {
                     lock(&self.daemon.stopping).get_or_insert(ext_logging::Stop::Requested);
                     self.daemon.pulse.notify();
                 }
-                ClientMsg::Detach => break,
+                ClientMsg::Detach => break Ok(()),
                 ClientMsg::Hello { .. }
                 | ClientMsg::Input { .. }
                 | ClientMsg::Approve { .. }
                 | ClientMsg::Interrupt { .. } => {}
             }
-        }
+        };
         while let Some((client_seq, answer)) = pending.pop_front() {
             self.answered(client_seq, answer.await);
         }
@@ -451,8 +458,11 @@ impl Conn<'_> {
                 self.decl = decl;
                 // Before the replay, so a client that saw itself
                 // attached knows its environment is recorded.
-                if let Some(env) = env {
-                    s.session().set_env(env);
+                if let Some(env) = env
+                    && let Err(error) = s.session().set_env(env)
+                {
+                    self.error(error.to_string());
+                    return;
                 }
                 s.session().attach(self.outbox.clone(), since).await;
                 session_event("attach", s.session().id, || format!("since {since}"));
@@ -541,5 +551,49 @@ impl Conn<'_> {
             (_, Err((_, message))) => self.error(message),
             (_, Ok(())) => {}
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use rt::Runtime as _;
+
+    #[test]
+    fn ready_incoming_frames_yield_before_reading_another_batch() {
+        let root =
+            std::env::temp_dir().join(format!("a-server-overload-{}", protocol::SessionId::new()));
+        std::fs::create_dir_all(&root).unwrap();
+        let home = sys::Home::from(root.clone());
+        let listener = home.bind().unwrap();
+        let peer = home.endpoint().connect().unwrap();
+        let stream = listener.accept().unwrap();
+        let runtime = rt::Threads::new(1);
+        let mut frames = Frames::new(Arc::new(Async::new(&runtime.reactor(), stream).unwrap()));
+        for _ in 0..65 {
+            ClientMsg::Detach.write_frame(&mut frames.buf).unwrap();
+        }
+        for _ in 0..64 {
+            assert!(matches!(
+                rt::block_on(frames.next::<ClientMsg>()).unwrap(),
+                Some(ClientMsg::Detach)
+            ));
+        }
+        {
+            let mut next = pin!(frames.next::<ClientMsg>());
+            rt::block_on(poll_fn(|cx| {
+                assert!(next.as_mut().poll(cx).is_pending());
+                Poll::Ready(())
+            }));
+            assert!(matches!(
+                rt::block_on(next).unwrap(),
+                Some(ClientMsg::Detach)
+            ));
+        }
+        drop(frames);
+        drop(peer);
+        drop(listener);
+        home.endpoint().remove();
+        std::fs::remove_dir_all(root).unwrap();
     }
 }

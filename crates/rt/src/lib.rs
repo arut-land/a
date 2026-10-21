@@ -29,6 +29,7 @@ pub use flush::{FlushEpoch, FlushLeader, FlushRequest, Flusher, unblock_flush};
 /// The first of two futures to resolve, the left polled first: every
 /// race in the engine and the extensions is one of these.
 pub use futures_lite::future::or;
+pub use futures_lite::future::yield_now;
 pub use io::{Async, Reactor, Source};
 pub use notify::Notify;
 #[cfg(feature = "threads")]

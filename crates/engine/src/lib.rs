@@ -748,7 +748,7 @@ impl Daemon {
         };
         if !live.has_input() {
             if let Some(env) = env {
-                live.set_env(env);
+                live.set_env(env)?;
             }
             let input = Request::Input {
                 text: input,

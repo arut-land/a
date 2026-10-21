@@ -239,6 +239,11 @@ pub struct TurnView {
 
 /// The normal send window; cancellation can reserve one further slot.
 pub(crate) const UNANSWERED: usize = 64;
+pub(crate) const MUTATION_BUDGET: crate::QueueBudget = crate::QueueBudget {
+    bytes: 16 << 20,
+    requests: UNANSWERED + 1,
+    control_reserve: 1,
+};
 
 /// One session's client, sans I/O.
 pub struct SessionClient {
@@ -658,22 +663,18 @@ impl Offer<'_> {
 
     fn send(self, msg: ClientMsg) -> Result<Vec<Effect>, Notice> {
         let control = matches!(msg, ClientMsg::Interrupt { .. });
-        let budget = crate::QueueBudget::default();
         let bytes: usize = self
             .0
             .unanswered
             .iter()
             .chain(&self.0.queued)
-            .map(retained_bytes)
+            .map(ClientMsg::retained_bytes)
             .sum();
-        let limit = if control {
-            budget.bytes
-        } else {
-            budget.bytes / 2
-        };
-        if self.0.unanswered.len() + self.0.queued.len() >= UNANSWERED + usize::from(control)
-            || retained_bytes(&msg) > limit.saturating_sub(bytes)
-        {
+        if !MUTATION_BUDGET.admits(
+            bytes.saturating_add(msg.retained_bytes()),
+            self.0.unanswered.len() + self.0.queued.len(),
+            control,
+        ) {
             return Err(Notice::Backpressure);
         }
         Ok(self.0.send(msg))
@@ -694,14 +695,6 @@ impl Offer<'_> {
             Err(Notice::NothingRunning)
         }
     }
-}
-
-pub(crate) fn retained_bytes(msg: &ClientMsg) -> usize {
-    size_of::<ClientMsg>()
-        + match msg {
-            ClientMsg::Input { text, .. } => text.capacity(),
-            _ => 0,
-        }
 }
 
 pub(crate) const fn is_mutation(msg: &ClientMsg) -> bool {
@@ -773,7 +766,11 @@ mod tests {
             if !connected {
                 client.step(live(1, Caps::ALL));
             }
-            let bytes: usize = client.unanswered.iter().map(retained_bytes).sum();
+            let bytes: usize = client
+                .unanswered
+                .iter()
+                .map(ClientMsg::retained_bytes)
+                .sum();
             assert!(bytes <= crate::QueueBudget::default().bytes);
             client.step(msg(1, DaemonMsg::Ack { client_seq: 1 }));
             assert!(client.offer().unwrap().input("x".repeat(bytes)).is_ok());

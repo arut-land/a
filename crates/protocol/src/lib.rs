@@ -19,6 +19,56 @@ pub const PROTO: u32 = 13;
 /// overlaps `PROTO_MIN..=PROTO` is served at the highest version both speak.
 pub const PROTO_MIN: u32 = 13;
 
+/// Ordinary payloads leave 4 KiB per reserved control slot for cancellation.
+#[derive(Clone, Copy)]
+pub struct QueueBudget {
+    pub bytes: usize,
+    pub requests: usize,
+    pub control_reserve: usize,
+}
+
+impl Default for QueueBudget {
+    fn default() -> Self {
+        Self {
+            bytes: 32 << 20,
+            requests: 1024,
+            control_reserve: 16,
+        }
+    }
+}
+
+impl QueueBudget {
+    pub fn admits(&self, bytes: usize, requests: usize, control: bool) -> bool {
+        let reserve = if control { 0 } else { self.control_reserve };
+        requests < self.requests.saturating_sub(reserve)
+            && bytes <= self.bytes.saturating_sub(reserve.saturating_mul(4096))
+    }
+}
+
+// One writer type keeps counting and buffered serde instantiations shared.
+struct EncodeTarget<'a> {
+    bytes: Option<&'a mut Vec<u8>>,
+    count: usize,
+}
+
+impl Write for EncodeTarget<'_> {
+    fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
+        self.write_all(bytes)?;
+        Ok(bytes.len())
+    }
+    #[inline(never)]
+    fn write_all(&mut self, bytes: &[u8]) -> io::Result<()> {
+        if let Some(out) = &mut self.bytes {
+            out.extend_from_slice(bytes);
+        }
+        self.count += bytes.len();
+        Ok(())
+    }
+    fn flush(&mut self) -> io::Result<()> {
+        Ok(())
+    }
+}
+
 const MAX_FRAME: u32 = 16 * 1024 * 1024;
 
 #[macro_use]
@@ -505,6 +555,20 @@ const SECRET_WORDS: &[&str] = &[
 const SECRET_SUFFIXES: &[&str] = &["_KEY", "_PASS", "_PAT", "_DSN", "_COOKIE"];
 
 impl Environment {
+    pub fn retained_bytes(&self) -> usize {
+        size_of::<Self>()
+            + self.cwd.capacity()
+            + self
+                .vars
+                .iter()
+                .map(|(key, value)| {
+                    2 * size_of::<(String, String)>() + key.capacity() + value.capacity()
+                })
+                .sum::<usize>()
+            + self.redacted.capacity() * size_of::<String>()
+            + self.redacted.iter().map(String::capacity).sum::<usize>()
+    }
+
     /// Captures `vars`, leaving out denied names and anything not UTF-8.
     pub fn new(
         cwd: PathBuf,
@@ -1153,6 +1217,55 @@ kinds! {
 }
 
 impl ClientMsg {
+    pub fn retained_bytes(&self) -> usize {
+        let mut count = EncodeTarget {
+            bytes: None,
+            count: size_of::<Self>(),
+        };
+        let _ = self.encode(&mut count);
+        count.count.max(
+            size_of::<Self>()
+                + match self {
+                    Self::Input { text, .. } => text.capacity(),
+                    _ => 0,
+                },
+        )
+    }
+
+    pub fn write_frame(&self, writer: &mut dyn Write) -> io::Result<()> {
+        let mut bytes = Frame::start();
+        self.encode(&mut EncodeTarget {
+            bytes: Some(&mut bytes),
+            count: 0,
+        })?;
+        prefix(&mut bytes)?;
+        writer.write_all(&bytes)?;
+        writer.flush()
+    }
+
+    #[inline(never)]
+    fn encode(&self, writer: &mut EncodeTarget<'_>) -> serde_json::Result<()> {
+        serde_json::to_writer(writer, self)
+    }
+}
+
+impl DaemonMsg {
+    pub fn retained_bytes(&self) -> usize {
+        let mut count = EncodeTarget {
+            bytes: None,
+            count: size_of::<Self>(),
+        };
+        let _ = self.encode(&mut count);
+        count.count
+    }
+
+    #[inline(never)]
+    fn encode(&self, writer: &mut EncodeTarget<'_>) -> serde_json::Result<()> {
+        serde_json::to_writer(writer, self)
+    }
+}
+
+impl ClientMsg {
     pub const INTERRUPT: Self = Self::Interrupt { client_seq: None };
 
     pub fn input(text: impl Into<String>) -> Self {
@@ -1330,7 +1443,10 @@ pub struct Frame {
 impl Frame {
     pub fn new(msg: &DaemonMsg) -> io::Result<Self> {
         let mut bytes = Self::start();
-        serde_json::to_writer(&mut bytes, msg)?;
+        msg.encode(&mut EncodeTarget {
+            bytes: Some(&mut bytes),
+            count: 0,
+        })?;
         Self::finish(bytes, None, msg.class())
     }
 
@@ -1386,11 +1502,14 @@ impl Entry {
     /// Appends the entry's JSON object to `out`. Encoded here, once, for
     /// the reason [`Decode`] gives.
     pub fn encode(&self, out: &mut Vec<u8>) -> serde_json::Result<()> {
+        let out = &mut EncodeTarget {
+            bytes: Some(out),
+            count: 0,
+        };
         match &self.body {
-            Body::Unknown { raw, .. } => {
-                out.extend_from_slice(raw.raw().as_bytes());
-                Ok(())
-            }
+            Body::Unknown { raw, .. } => out
+                .write_all(raw.raw().as_bytes())
+                .map_err(serde_json::Error::io),
             _ => serde_json::to_writer(out, self),
         }
     }
@@ -1479,6 +1598,46 @@ pub const INBOX_CAPACITY: usize = 128;
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn byte_accounting_and_frames_share_the_same_encoder() {
+        let msg = ClientMsg::input("\"\n雪");
+        let mut before = Vec::new();
+        write_frame(&mut before, &msg).unwrap();
+        let mut after = Vec::new();
+        msg.write_frame(&mut after).unwrap();
+        assert_eq!(before, after);
+        assert_eq!(
+            msg.retained_bytes(),
+            size_of::<ClientMsg>() + after.len() - 4
+        );
+        let msg = DaemonMsg::Error {
+            message: "\"\n雪".into(),
+        };
+        let frame = Frame::new(&msg).unwrap();
+        assert_eq!(
+            msg.retained_bytes(),
+            size_of::<DaemonMsg>() + frame.as_bytes().len() - 4
+        );
+        let mut text = String::with_capacity(8192);
+        text.push('x');
+        assert!(ClientMsg::input(text).retained_bytes() >= 8192);
+    }
+
+    #[test]
+    fn normal_admission_preserves_bytes_and_slots_for_control() {
+        let budget = QueueBudget {
+            bytes: 8192,
+            requests: 3,
+            control_reserve: 1,
+        };
+        assert!(budget.admits(4096, 1, false));
+        assert!(!budget.admits(4097, 1, false));
+        assert!(!budget.admits(1, 2, false));
+        assert!(budget.admits(8192, 2, true));
+        assert!(!budget.admits(8193, 2, true));
+        assert!(!budget.admits(1, 3, true));
+    }
 
     #[test]
     fn a_shared_frame_is_the_frame_written() {
