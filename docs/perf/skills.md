@@ -72,3 +72,8 @@ adds no third-party dependency: metadata rejects devices and FIFOs before open,
 and Unix `O_NONBLOCK` prevents a replacement FIFO from waiting for a writer.
 Containment reuses `rustix`'s existing descriptor-relative filesystem operations
 and the Windows handle path query, adding no dependency or parser change.
+
+After the independent-review fixes and the protocol 4 / flush-epoch main merge,
+`mise run size` measures **3155 KiB**, against **3139 KiB** immediately before
+those fixes (+16 KiB). Publication text and identity now occupy one sealed entry;
+edit-aware projections and bounded regular-file discovery share general seams.
