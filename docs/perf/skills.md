@@ -77,3 +77,10 @@ After the independent-review fixes and the protocol 4 / flush-epoch main merge,
 `mise run size` measures **3155 KiB**, against **3139 KiB** immediately before
 those fixes (+16 KiB). Publication text and identity now occupy one sealed entry;
 edit-aware projections and bounded regular-file discovery share general seams.
+
+After merging fork's protocol 7 work and integrating recorded skill catalogs,
+protocol **8** measures **3203 KiB** (`mise run size`, `CARGO_BUILD_JOBS=3`),
+against the prior validated **3155 KiB** (+48 KiB, including main's fork work).
+Catalog images add no dependency and preserve the historical generation without
+placing instruction bodies in model context. Startup and budgets remain for
+the coordinator's quiet-machine run.
