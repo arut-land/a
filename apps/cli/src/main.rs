@@ -53,6 +53,7 @@ fn main() -> ExitCode {
             }
             Some(Cmd::Ls) => ls(&daemon),
             Some(Cmd::New) => new(&daemon),
+            Some(Cmd::Fork { session }) => fork(&daemon, &session),
             Some(Cmd::Bridge { token }) => client::bridge(
                 daemon.home()?,
                 token.as_deref().unwrap_or(&daemon.staged.id),
@@ -508,6 +509,26 @@ fn ls(daemon: &client::Daemon) -> io::Result<()> {
 
 fn new(daemon: &client::Daemon) -> io::Result<()> {
     let session = daemon.new_session().map_err(|e| wedged(daemon, e))?;
+    sayln!("{}", session.short());
+    Ok(())
+}
+
+fn fork(daemon: &client::Daemon, source: &str) -> io::Result<()> {
+    let (source, seq) = match source.rsplit_once('@') {
+        Some((source, seq)) => (
+            source,
+            Some(
+                seq.parse::<u64>()
+                    .ok()
+                    .and_then(protocol::Seq::new)
+                    .ok_or_else(|| io::Error::other("fork sequence must be a positive integer"))?,
+            ),
+        ),
+        None => (source, None),
+    };
+    let session = daemon
+        .fork_session(source.to_owned(), seq)
+        .map_err(|e| wedged(daemon, e))?;
     sayln!("{}", session.short());
     Ok(())
 }

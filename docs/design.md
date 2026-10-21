@@ -240,14 +240,15 @@ native lane; it cannot run on the Apple development host.
 drain/reconnect, CRC logs, snapshots, recovery, typed extensions and policy;
 recorded provider codecs; TUI, web and SwiftUI renderers over the client SDK;
 optional Lua mods; child sessions; side model calls for title, compact and
-judge with purpose/outcome logging. These supersede the original M1/M2/M3
-schedule: web and remote SSH are already present.
+judge with purpose/outcome logging; conversation-only forks from `(session, seq)`
+with independent copied logs, recorded ancestry, exact Lua generations and
+rest-point validation ([fork semantics](fork.md)). These supersede the original
+M1/M2/M3 schedule: web and remote SSH are already present.
 
 **Next:**
 
 - `ext-skills`: skill discovery and loading on SDK primitives.
 - `ext-mcp`: external tools through the registry and existing policy path.
-- Fork from `(session, seq)`, with explicit history and workspace semantics.
 - Approval explanations that retain and present why a call needs consent.
 - Audit essential non-derivable facts: exact sent-request identity, runtime
   decisions and recovery inputs. Side-call logging exists; it is not proof
@@ -264,9 +265,9 @@ for the distributed design. Each needs its own contract and measurements.
 - What exact facts must a model call retain for reproducible requests across
   configuration, extension and provider changes? A derived transcript alone
   does not establish exact sent bytes.
-- Does fork copy a prefix or reference it, and what isolates simultaneous
-  tool effects in one workspace? A read-only source is not a filesystem
-  checkpoint.
+- The coordinator selected conversation-only forks; owner confirmation remains
+  open. History is copied independently, while files stay shared. Should future
+  forks accept unfinished prefixes by recording interruptions?
 - How much can shared flush epochs amortize the stronger Apple power-loss
   guarantee under realistic concurrent workloads on a quiet machine?
 - When should indexed replay verify all skipped lines? Catalog rebuilds and

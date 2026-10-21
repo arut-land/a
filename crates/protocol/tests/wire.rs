@@ -81,6 +81,19 @@ fn client_samples() -> Vec<Sample<ClientMsg>> {
             },
         ),
         sample(
+            "attach_fork",
+            ClientMsg::Attach {
+                target: Target::Fork {
+                    session: SESSION.to_string(),
+                    seq: Seq::new(7),
+                },
+                workspace: "/ignored".into(),
+                since: 0,
+                env: None,
+                decl: ClientDecl::default(),
+            },
+        ),
+        sample(
             "attach_latest",
             ClientMsg::Attach {
                 target: Target::Latest {
@@ -627,9 +640,17 @@ fn daemon_samples() -> Vec<Sample<DaemonMsg>> {
                     installed: vec![Installed {
                         name: "shell".into(),
                         version: 1,
+                    image: None,
                     }],
                 },
             ),
+        ),
+        sample(
+            "entry_extensions_dynamic",
+            entry(19, Body::Extensions { installed: vec![Installed {
+                name: "counter".into(), version: 7,
+                image: Some(protocol::Json::encode(&json!(["a.text{name='test',text='old'}", [], 4_194_304, 100_000, {"secs":0,"nanos":25_000_000}])).unwrap()),
+            }] }),
         ),
         sample(
             "entry_ext",
@@ -667,6 +688,16 @@ fn daemon_samples() -> Vec<Sample<DaemonMsg>> {
                 activity: Activity::Idle,
             },
         ),
+        sample("fork_source_not_found", DaemonMsg::ForkRejected { reason: protocol::ForkError::SourceNotFound }),
+        sample("fork_ambiguous_source", DaemonMsg::ForkRejected { reason: protocol::ForkError::AmbiguousSource }),
+        sample("fork_invalid_sequence", DaemonMsg::ForkRejected { reason: protocol::ForkError::InvalidSequence }),
+        sample("fork_unfinished", DaemonMsg::ForkRejected { reason: protocol::ForkError::Unfinished }),
+        sample("fork_owned_resources", DaemonMsg::ForkRejected { reason: protocol::ForkError::OwnedResources }),
+        sample("fork_disabled", DaemonMsg::ForkRejected { reason: protocol::ForkError::Disabled }),
+        sample("fork_unavailable_generation", DaemonMsg::ForkRejected { reason: protocol::ForkError::UnavailableGeneration }),
+        sample("fork_viewer", DaemonMsg::ForkRejected { reason: protocol::ForkError::Viewer }),
+        sample("fork_shutting_down", DaemonMsg::ForkRejected { reason: protocol::ForkError::ShuttingDown }),
+        sample("fork_storage", DaemonMsg::ForkRejected { reason: protocol::ForkError::Storage { message: "write failed".into() } }),
         sample("synced", DaemonMsg::Synced { seq: 3 }),
         sample(
             "sessions",
@@ -699,6 +730,7 @@ fn daemon_samples() -> Vec<Sample<DaemonMsg>> {
                 sessions: [
                     ReadOnly::Damaged { seq: 4 },
                     ReadOnly::Format { version: 2 },
+                    ReadOnly::Extensions,
                 ]
                 .map(|why| SessionSummary {
                     id: SESSION,

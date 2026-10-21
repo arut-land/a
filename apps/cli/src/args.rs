@@ -46,6 +46,8 @@ pub enum Cmd {
     },
     /// Attach to a session by id
     Attach { id: String },
+    /// Fork conversation history at a rest point; workspace files stay as they are
+    Fork { session: String },
     /// List sessions
     Ls,
     /// Start a new session without attaching

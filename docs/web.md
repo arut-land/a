@@ -85,3 +85,9 @@ Each live tab's daemon client is a `client::Driver`, with the threads its
 connection takes. Styles repeat per
 item (~200 bytes); a `<style>` block with class names would shrink every
 patch. Neither changes what the page shows.
+
+## Fork a conversation
+
+`/fork [seq]` copies the current conversation at a rest point and switches to it.
+Files stay as they are; this does not rewind or copy the workspace. The fork
+keeps its recorded cwd and environment. See [fork semantics](fork.md).

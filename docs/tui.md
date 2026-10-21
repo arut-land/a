@@ -372,3 +372,9 @@ encoder) is what rustix and vte, linked already, leave to write.
 - The full screen reports the mouse, so selecting text takes the terminal's
   override (Shift-drag in most, Option-drag in iTerm2 and Terminal.app);
   the inline mode leaves the mouse to the terminal.
+
+## Fork a conversation
+
+`/fork [seq]` copies the current conversation at a rest point and switches to it.
+Files stay as they are; this does not rewind or copy the workspace. The fork
+keeps its recorded cwd and environment. See [fork semantics](fork.md).
