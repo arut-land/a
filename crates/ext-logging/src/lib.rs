@@ -373,23 +373,25 @@ impl Logger {
                 let lost = queue.lost.swap(0, Ordering::Relaxed);
                 let (returned, failed, pending) = rt::unblock(&*executor, move || {
                     let (mut pending, mut failed) = (lost, failures);
-                    if (lost != 0 || failures != 0)
+                    for record in batch {
+                        if write_record(&mut write, record).is_err() {
+                            failed += 1;
+                        }
+                    }
+                    // Flush includes the loss count even when recovery was
+                    // in the last batch and no further facts arrive.
+                    if (pending != 0 || failed != 0)
                         && write_record(
                             &mut write,
                             Record::new(Fact::Lost {
-                                queue: lost,
-                                writes: failures,
+                                queue: pending,
+                                writes: failed,
                             }),
                         )
                         .is_ok()
                     {
                         pending = 0;
                         failed = 0;
-                    }
-                    for record in batch {
-                        if write_record(&mut write, record).is_err() {
-                            failed += 1;
-                        }
                     }
                     (write, failed, pending)
                 })

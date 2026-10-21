@@ -177,3 +177,29 @@ fn startup_facts_survive_until_a_writer_is_installed() {
     let text = std::str::from_utf8(&bytes).unwrap();
     assert!(text.contains("config_fallback"), "{text}");
 }
+
+#[test]
+fn write_recovery_reports_loss_without_needing_another_batch() {
+    let rt: rt::Rt = Arc::new(rt::Threads::new(1));
+    let logger = Logger::new();
+    let kept = Arc::new(Mutex::new(Vec::new()));
+    let output = Arc::clone(&kept);
+    logger.emit(Fact::RegistryRejected);
+    logger.emit(Fact::RegistryRejected);
+    let mut fail = true;
+    logger.run(&rt, move |line| {
+        if std::mem::take(&mut fail) {
+            return Err(io::ErrorKind::StorageFull.into());
+        }
+        output.lock().unwrap().extend_from_slice(line);
+        Ok(())
+    });
+    rt::block_on(logger.flush());
+    logger.0.closed.store(true, Ordering::Release);
+    logger.0.ready.notify();
+    let bytes = kept.lock().unwrap();
+    let text = std::str::from_utf8(&bytes).unwrap();
+    assert!(text.contains("registry_rejected"), "the disk recovered");
+    assert!(text.contains("\"writes\":1"), "missing loss count: {text}");
+}
+
