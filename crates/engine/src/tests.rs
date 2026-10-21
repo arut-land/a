@@ -2263,3 +2263,70 @@ mod inheritance {
         std::fs::remove_dir_all(root).unwrap();
     }
 }
+
+#[test]
+fn busy_session_recovery_admits_independent_loads_concurrently() {
+    use std::sync::{Arc, Condvar, Mutex, OnceLock};
+    struct Probe(Mutex<usize>, Condvar, std::sync::atomic::AtomicBool);
+    static PROBE: OnceLock<Arc<Probe>> = OnceLock::new();
+    impl ext::host::Sources for Probe {
+        fn open(
+            &self,
+            _: &std::path::Path,
+            _: ext::host::Prepare,
+        ) -> Result<Arc<dyn ext::host::Generations>, ext::Refused> {
+            let mut entered = self.0.lock().unwrap();
+            *entered += 1;
+            self.1.notify_all();
+            let (entered, _) = self
+                .1
+                .wait_timeout_while(entered, Duration::from_millis(500), |entered| *entered < 2)
+                .unwrap();
+            if *entered < 2 {
+                self.2.store(true, std::sync::atomic::Ordering::SeqCst);
+            }
+            Err(ext::Refused("probe stops before session startup".into()))
+        }
+    }
+    struct Source(Arc<Probe>);
+    impl ext::Extension for Source {
+        const NAME: &'static str = "recovery-probe";
+        const VERSION: u32 = 1;
+        fn contribute(&self, r: &mut ext::Registrar) {
+            r.provide::<dyn ext::host::Sources>(self.0.clone());
+        }
+    }
+    let probe = Arc::new(Probe(Mutex::new(0), Condvar::new(), false.into()));
+    assert!(PROBE.set(probe.clone()).is_ok());
+    let (root, home) = home("recovery-admission");
+    let store = Jsonl::open(home.sessions_dir()).unwrap();
+    let catalog = Catalog::open(home.catalog_file(), &store).unwrap();
+    for _ in 0..2 {
+        let header = Header {
+            id: SessionId::new(),
+            workspace: root.clone(),
+            parent: None,
+        };
+        drop(store.create(&header).unwrap());
+        let mut record = crate::catalog::Record::new(header);
+        record.busy = true;
+        catalog.record(record);
+    }
+    catalog.clean().unwrap();
+    drop((catalog, store));
+    let config = Config {
+        agent: None,
+        extensions: |_| Registry::default().with(&Source(PROBE.get().unwrap().clone())),
+        ..Config::default()
+    };
+    let runtime = Arc::new(rt::Threads::configured(rt::Config::for_cores(4)));
+    let daemon = Daemon::load_on(&home, &config, &runtime).unwrap();
+    drop(daemon);
+    runtime.shutdown();
+    std::fs::remove_dir_all(root).unwrap();
+    assert_eq!(*probe.0.lock().unwrap(), 2);
+    assert!(
+        !probe.2.load(std::sync::atomic::Ordering::SeqCst),
+        "the first cold recovery waits alone despite two available storage workers"
+    );
+}

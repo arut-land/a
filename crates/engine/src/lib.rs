@@ -388,19 +388,22 @@ impl Daemon {
                 .duration_since(std::time::UNIX_EPOCH)
                 .map_or(0, |d| d.as_secs()),
         });
-        // Before any client is served; all are loading before any is
-        // loaded, so a child that reports at once finds its parent; each
-        // loads on the blocking pool, alongside the others.
+        // Mark every slot before scheduling any load, so an immediate child
+        // report finds its parent. Spawn every admission future before waiting:
+        // a slow first load must not hide the others from available workers.
         let busy: Vec<_> = (slots.into_iter().zip(busy))
             .filter_map(|(slot, busy)| (busy && slot.loading()).then_some(slot))
             .collect();
-        let starting: Vec<_> = (busy.iter())
+        let starting: Vec<_> = busy
+            .iter()
             .map(|slot| {
-                let (shared, header) = (Arc::clone(&daemon.shared), slot.header.clone());
-                rt::unblock(&*daemon.shared.rt, move || {
+                let shared = Arc::clone(&daemon.shared);
+                let header = slot.header.clone();
+                let load = rt::unblock(&*daemon.shared.rt, move || {
                     let owner = shared.owner(&header)?;
                     Live::start(&header, &shared, Open::Load, owner)
-                })
+                });
+                rt::spawn(&*daemon.shared.rt, load)
             })
             .collect();
         rt::block_on(async {
@@ -1152,7 +1155,7 @@ pub fn serve(
 }
 
 fn finish_runtime(runtime: &rt::Threads) {
-    let deadline = std::time::Instant::now() + ext_logging::FLUSH_GRACE;
+    let deadline = Instant::now() + ext_logging::FLUSH_GRACE;
     rt::block_on(ext_logging::flush_until(runtime, deadline));
     runtime.shutdown_until(deadline);
 }
