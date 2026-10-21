@@ -1,5 +1,18 @@
 use super::*;
 
+#[test]
+fn complete_arguments_at_the_byte_limit_keep_their_fields() {
+    let mut text = serde_json::json!({"a": 1}).to_string();
+    text.extend(std::iter::repeat_n(
+        ' ',
+        DecodeLimits::default().argument_bytes - text.len(),
+    ));
+    assert_eq!(
+        parse_partial_arguments(&text).get("a"),
+        Some(&Value::from(1))
+    );
+}
+
 /// `at` finds what `Value::pointer` finds for a pointer that escapes
 /// nothing, `null` aside.
 #[test]

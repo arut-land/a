@@ -407,12 +407,16 @@ pub fn parse_partial_arguments(text: &str) -> Map<String, Value> {
     if check_text(text, limits.argument_bytes, limits.depth).is_err() {
         return Map::new();
     }
+    if let Ok(value) = serde_json::from_str(text) {
+        return match value {
+            Value::Object(object) => object,
+            _ => Map::new(),
+        };
+    }
     let Some(repaired) = repair_json(text) else {
         return Map::new();
     };
-    let complete = serde_json::from_str(text)
-        .ok()
-        .or_else(|| serde_json::from_str(&repaired).ok());
+    let complete = serde_json::from_str(&repaired).ok();
     if let Some(value) = complete {
         return match value {
             Value::Object(object) => object,
@@ -433,7 +437,21 @@ fn repair_json(text: &str) -> Option<String> {
     let mut in_string = false;
     let mut chars = text.chars().peekable();
     while let Some(c) = chars.next() {
-        if repaired.len().saturating_add(6) > DecodeLimits::default().argument_bytes {
+        let growth = if !in_string {
+            c.len_utf8()
+        } else {
+            match c {
+                '\\' => match chars.peek() {
+                    Some('"' | '\\' | '/' | 'b' | 'f' | 'n' | 'r' | 't' | 'u') => 2,
+                    Some(_) => 2,
+                    None => 1,
+                },
+                '\n' | '\r' | '\t' => 2,
+                c if c.is_control() => 6,
+                c => c.len_utf8(),
+            }
+        };
+        if repaired.len().saturating_add(growth) > DecodeLimits::default().argument_bytes {
             return None;
         }
         if !in_string {
