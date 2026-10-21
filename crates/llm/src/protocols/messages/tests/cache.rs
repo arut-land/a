@@ -158,6 +158,36 @@ fn manual_caching_without_tools_sends_no_tools() {
     assert_eq!(tail_marker(&body), Some(&json!({"type": "ephemeral"})));
 }
 
+#[test]
+fn cache_marking_preserves_typed_and_hosted_tools() {
+    let hosted = json!({"type": "web_search_20250305", "name": "web_search"});
+    let mut deferred = raw_tool("deferred", None);
+    deferred["defer_loading"] = true.into();
+    for raw in [json!([]), json!([deferred]), json!([hosted])] {
+        for typed in [vec![tool("lookup")], vec![tool("lookup"), tool("add")]] {
+            let expected = cached(json!({"tools": raw}), typed.clone()).expect("encodes");
+            for caching in [
+                json!({"prompt_caching": true}),
+                json!({"static_prefix_cache_ttl": "1h"}),
+            ] {
+                let mut options = caching;
+                options["tools"] = raw.clone();
+                let mut body = cached(options, typed.clone()).expect("encodes");
+                let tools = body["tools"].as_array_mut().expect("tools");
+                let last = tools
+                    .iter_mut()
+                    .rfind(|tool| tool.get("defer_loading") != Some(&Value::Bool(true)))
+                    .expect("a non-deferred tool");
+                assert!(last.get("cache_control").is_some());
+                for tool in tools {
+                    tool.as_object_mut().expect("tool").remove("cache_control");
+                }
+                assert_eq!(body["tools"], expected["tools"]);
+            }
+        }
+    }
+}
+
 /// A top-level `cache_control` that is not an ephemeral marker with a known
 /// TTL is refused, never sent as written.
 #[test]
